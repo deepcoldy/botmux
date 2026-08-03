@@ -164,7 +164,10 @@ describe('tryResolveAsk gating', () => {
       by: 'ou_p2p_user',
     })).toBe('accepted');
     await expect(pending).resolves.toMatchObject({ kind: 'answered', by: 'ou_p2p_user' });
-    expect(checker).toHaveBeenCalledWith('cli_app', 'oc_chat', 'ou_p2p_user', 'p2p');
+    // 卡片点击路径不传 actor（Lark card-action 回调无 sender union/bot 标记）→ 第 5 参恒
+    // undefined，checker 退化为纯 evaluateTalk(openId, chatType)。本用例只关心 chatType
+    // 被转发；显式带上末尾 undefined 以对齐当前签名，而非锁死参数列表。
+    expect(checker).toHaveBeenCalledWith('cli_app', 'oc_chat', 'ou_p2p_user', 'p2p', undefined);
   });
 
   it('returns "stale" for unknown askId', () => {
@@ -699,5 +702,107 @@ describe('自定义回复 findPendingAskByAnchor + submitCustomReply', () => {
     tryResolveAsk({ askId, nonce, selected: 'yes', by: 'ou_owner' });
     await p;
     expect(submitCustomReply({ askId, by: 'ou_owner', text: 'late' })).toBe('already_settled');
+  });
+});
+
+describe('submitCustomReply actor context — bot / union 身份透传给 checker', () => {
+  // 回归 PR #685 复审的同型残留：ask-broker 的 canTalkChecker 被卡片点击和文字作答
+  // 共用，但只拿 open_id/chatType，拿不到 bot/union 身份。文字作答路径（daemon 有完整
+  // 消息事件）必须透传 actor，让 checker 与 dispatcher 外层闸 / quota 复查同源：
+  //   - bot 发送方 → evaluateBotTalk（覆盖团队拉群没带 union_id 的场景）
+  //   - 平台 teamMember 真人 → evaluateTalk 的 memberUnionId 腿
+  // 否则跨部署 team bot / teamMember 真人的文字作答会被 checker 拒。
+
+  it('submitCustomReply 把 actor 原样透传给 checker（卡片点击路径不传，退化为纯 openId）', async () => {
+    const seen: Array<{ openId: string; actor: unknown }> = [];
+    // 模拟真实 daemon checker 的分派：actor.botSender → 只认 union 团队 bot；
+    // 否则认 memberUnionId 团队成员真人。裸 openId（无 actor）→ 谁都不放行。
+    setCanTalkChecker((_app, _chat, openId, _chatType, actor) => {
+      seen.push({ openId, actor });
+      if (actor?.botSender) return actor.senderUnionId === 'on_teambot';
+      return actor?.memberUnionId === 'on_teammember';
+    });
+    const d = mockDispatcher();
+    setCardDispatcher(d);
+    registerAsk(makeInput());
+    await Promise.resolve();
+    await Promise.resolve();
+    const { askId } = d.sendCalls[0]!;
+
+    submitCustomReply({
+      askId, by: 'ou_bot', text: 'x',
+      actor: { botSender: true, senderUnionId: 'on_teambot', memberUnionId: undefined },
+    });
+    expect(seen.at(-1)).toEqual({
+      openId: 'ou_bot',
+      actor: { botSender: true, senderUnionId: 'on_teambot', memberUnionId: undefined },
+    });
+  });
+
+  it('对照①：团队拉群里无 union 的 bot（botSender=true, 无 union）→ 由 checker 的 bot 腿放行', async () => {
+    // 模拟 evaluateBotTalk：botSender 且落在团队拉群（这里用 chatId 判定）→ 放行，不看 union。
+    setCanTalkChecker((_app, chatId, _openId, _chatType, actor) =>
+      actor?.botSender ? chatId === 'oc_chat' : actor?.memberUnionId === 'on_teammember');
+    const d = mockDispatcher();
+    setCardDispatcher(d);
+    const p = registerAsk(makeInput());
+    await Promise.resolve();
+    await Promise.resolve();
+    const { askId } = d.sendCalls[0]!;
+    expect(submitCustomReply({
+      askId, by: 'ou_bot_no_union', text: '拉群里打字答',
+      actor: { botSender: true, senderUnionId: undefined, memberUnionId: undefined },
+    })).toBe('accepted');
+    const r = await p;
+    expect(r.kind).toBe('answered');
+  });
+
+  it('对照②：跨部署 union team bot（botSender=true, 带 union）→ 放行', async () => {
+    setCanTalkChecker((_app, _chat, _openId, _chatType, actor) =>
+      actor?.botSender ? actor.senderUnionId === 'on_teambot' : false);
+    const d = mockDispatcher();
+    setCardDispatcher(d);
+    const p = registerAsk(makeInput());
+    await Promise.resolve();
+    await Promise.resolve();
+    const { askId } = d.sendCalls[0]!;
+    expect(submitCustomReply({
+      askId, by: 'ou_teambot', text: 'union bot 答',
+      actor: { botSender: true, senderUnionId: 'on_teambot', memberUnionId: undefined },
+    })).toBe('accepted');
+    await p;
+  });
+
+  it('对照③：平台 teamMember 真人（botSender=false, 带 memberUnionId）→ 放行（不能被当 bot）', async () => {
+    // 关键：真人走 memberUnionId 腿，不是 senderUnionId（bot 腿）。checker 若丢掉
+    // memberUnionId 就会误拒 teamMember 真人的文字作答。
+    setCanTalkChecker((_app, _chat, _openId, _chatType, actor) =>
+      actor?.botSender ? false : actor?.memberUnionId === 'on_teammember');
+    const d = mockDispatcher();
+    setCardDispatcher(d);
+    const p = registerAsk(makeInput());
+    await Promise.resolve();
+    await Promise.resolve();
+    const { askId } = d.sendCalls[0]!;
+    expect(submitCustomReply({
+      askId, by: 'ou_member', text: 'teamMember 真人答',
+      actor: { botSender: false, senderUnionId: undefined, memberUnionId: 'on_teammember' },
+    })).toBe('accepted');
+    await p;
+  });
+
+  it('对照④（负向）：普通未授权人（无 union / 非成员）→ 仍拒', async () => {
+    setCanTalkChecker((_app, _chat, _openId, _chatType, actor) =>
+      actor?.botSender ? actor.senderUnionId === 'on_teambot' : actor?.memberUnionId === 'on_teammember');
+    const d = mockDispatcher();
+    setCardDispatcher(d);
+    registerAsk(makeInput());
+    await Promise.resolve();
+    await Promise.resolve();
+    const { askId } = d.sendCalls[0]!;
+    expect(submitCustomReply({
+      askId, by: 'ou_stranger', text: '未授权乱答',
+      actor: { botSender: false, senderUnionId: undefined, memberUnionId: undefined },
+    })).toBe('unauthorized');
   });
 });

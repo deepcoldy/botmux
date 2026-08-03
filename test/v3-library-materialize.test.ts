@@ -147,6 +147,70 @@ describe('Saved Workflow compiler', () => {
       rmSync(base, { recursive: true, force: true });
     }
   });
+
+  it('rejects botmux send in a saved goal before publishing or running the workflow', () => {
+    const base = fresh('v3-lib-compile-chat-effect-');
+    try {
+      const runDir = seedSucceededAdHocRun(
+        base,
+        'chat-effect-source',
+        'Write the external record, then run botmux send --mention ou_owner "done"',
+      );
+      expect(() => compileSavedWorkflowFromRun(runDir)).toThrow(/chat-facing side effect/);
+      expect(() => compileSavedWorkflowFromRun(runDir)).toThrow(/hostExecutor feishu-send\/feishu-reply/);
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  it('still loads and materializes a pre-existing revision whose goal has a chat side effect (no brick)', async () => {
+    const root = fresh('v3-lib-legacy-chat-effect-');
+    try {
+      // Simulate a workflow saved BEFORE the lint existed: build the revision
+      // directly through the store (createSavedWorkflow does not run the
+      // authoring policy gate), with a goal node that contains `botmux send`.
+      const compiled = compileSavedWorkflowFromRun(seedSucceededAdHocRun(join(root, 'source')));
+      const legacyRevision = {
+        ...compiled.revision,
+        dagTemplate: {
+          nodes: compiled.revision.dagTemplate.nodes.map((node) =>
+            node.type === 'goal'
+              ? { ...node, goal: `${node.goal ?? ''}；完成后 botmux send --mention ou_owner "done"` }
+              : node),
+        },
+      };
+      await createSavedWorkflow(join(root, 'data'), {
+        displayName: compiled.displayName,
+        owner: OWNER,
+        scope: { kind: 'chat', chatId: BINDING.chatId },
+        revision: legacyRevision,
+        publish: true,
+        workflowId: 'wf_44444444444444444444444444444444',
+      });
+
+      // READ path must not reject it (this is the whole point of修法 A).
+      const loaded = await loadCurrentSavedWorkflow(join(root, 'data'), 'wf_44444444444444444444444444444444', {
+        revision: 'published',
+        requireActive: true,
+      });
+      expect(loaded.revision.payload.dagTemplate.nodes[0]).toMatchObject({ type: 'goal' });
+
+      // And the FROM-DISK revision can still be materialized into a run — this
+      // is the true "load an existing offending workflow then run it" path.
+      const run = materializeSavedWorkflowRun({
+        metadata: loaded.metadata,
+        revision: loaded.revision,
+        context: { initiatorOpenId: OWNER.openId, chatBinding: BINDING },
+        bots: [{ larkAppId: 'cli_test', cliId: 'claude-code', workingDir: '/w' } as any],
+        baseDir: join(root, 'runs'),
+        runId: 'legacy-chat-effect-run',
+      });
+      expect(run).toBeTruthy();
+      expect(existsSync(join(root, 'runs', 'legacy-chat-effect-run'))).toBe(true);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
 });
 
 describe('Saved Workflow materialization + daemon execution', () => {

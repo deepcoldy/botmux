@@ -17,6 +17,12 @@ export interface FederatedBot {
   larkAppId: string;
   botName: string;
   cliId: string;
+  /** Whether this bot has real Feishu transport. A core-only (apiOnly) bot is
+   *  `false` — it has no Feishu identity, so it can be neither a group creator
+   *  nor an invited member cross-deployment. Explicitly true/false on new
+   *  versions; ABSENT means a pre-capability spoke → treated as legacy normal
+   *  (true) for backward compatibility. */
+  larkTransportEnabled?: boolean;
   /** Tenant-stable bot id (used by P2 拉群 to add the bot cross-app). */
   botUnionId?: string;
   capability?: string | null;
@@ -140,6 +146,16 @@ export function syncDeployment(dataDir: string, syncToken: string, bots: Federat
 /** Member deployments of a team (empty if none). */
 export function listFederatedDeployments(dataDir: string, teamId: string): FederatedDeployment[] {
   return readFile(dataDir).teams[teamId] ?? [];
+}
+
+/** Member deployments across ALL hosted teams, each tagged with its teamId. */
+export function listAllFederatedDeployments(dataDir: string): Array<{ teamId: string; deployment: FederatedDeployment }> {
+  const teams = readFile(dataDir).teams;
+  const out: Array<{ teamId: string; deployment: FederatedDeployment }> = [];
+  for (const [teamId, deps] of Object.entries(teams)) {
+    for (const deployment of deps) out.push({ teamId, deployment });
+  }
+  return out;
 }
 
 /** Remove a deployment from a team (leave/kick). Returns true if removed. */

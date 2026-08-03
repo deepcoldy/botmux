@@ -17,6 +17,16 @@ export interface DashboardUrls {
 }
 
 /**
+ * Format a host for use inside a URL. An IPv6 literal (contains ':', e.g. `::1`)
+ * must be wrapped in brackets or `http://::1:7891/` is an invalid URL. IPv4,
+ * hostnames, and already-bracketed literals pass through unchanged.
+ */
+export function formatUrlHost(host: string): string {
+  if (host.includes(':') && !host.startsWith('[')) return `[${host}]`;
+  return host;
+}
+
+/**
  * Builds the dashboard URL(s) for a token.
  *
  * When 远程访问 is enabled AND this machine is bound to the central platform, the
@@ -37,7 +47,7 @@ export interface DashboardUrls {
  * dashboard link being the one place that always stays local.
  */
 export function buildDashboardUrls(opts: { host: string; port: number | string; token?: string }): DashboardUrls {
-  const localOrigin = `http://${opts.host}:${opts.port}`;
+  const localOrigin = `http://${formatUrlHost(String(opts.host))}:${opts.port}`;
   // 对外基址：中心平台优先（远程访问开 + 已绑定），否则自建反代基址 BOTMUX_PUBLIC_URL。
   const platformBase = isRemoteAccessEnabled() ? platformMachineBaseUrl() : null;
   const remoteBase = platformBase ?? publicReverseProxyBaseUrl();

@@ -5,8 +5,14 @@
 // requests. Env knobs drive the failure-path tests:
 //   FAKE_HANG_TURN=1     → never answer turn/start (wedged app-server)
 //   FAKE_DIE_AFTER_MS=N  → exit(1) after N ms (crash → engine onDead)
+//   FAKE_THREAD_CONFIG_FILE=path → write the received thread/start params to path
+//                                  (lets a test assert model/effort forwarding)
+//   FAKE_RESUME_CONFIG_FILE=path → write the received thread/resume params to path
+//                                  (lets a test assert model/effort are SUPPRESSED
+//                                   on resume)
 import { createServer } from 'node:http';
 import { WebSocketServer } from 'ws';
+import { writeFileSync } from 'node:fs';
 
 const listenArg = process.argv[process.argv.indexOf('--listen') + 1] || '';
 const m = listenArg.match(/ws:\/\/127\.0\.0\.1:(\d+)/);
@@ -51,8 +57,18 @@ wss.on('connection', (ws) => {
     const reply = (result) => ws.send(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result }));
     switch (msg.method) {
       case 'initialize': return reply({ ok: true });
-      case 'thread/start': return reply({ thread: { id: 'thread-fake-1' } });
-      case 'thread/resume': return reply({ thread: { id: msg.params?.threadId ?? 'thread-fake-1' } });
+      case 'thread/start': {
+        if (process.env.FAKE_THREAD_CONFIG_FILE) {
+          try { writeFileSync(process.env.FAKE_THREAD_CONFIG_FILE, JSON.stringify(msg.params ?? {})); } catch { /* test-only */ }
+        }
+        return reply({ thread: { id: 'thread-fake-1' } });
+      }
+      case 'thread/resume': {
+        if (process.env.FAKE_RESUME_CONFIG_FILE) {
+          try { writeFileSync(process.env.FAKE_RESUME_CONFIG_FILE, JSON.stringify(msg.params ?? {})); } catch { /* test-only */ }
+        }
+        return reply({ thread: { id: msg.params?.threadId ?? 'thread-fake-1' } });
+      }
       case 'thread/read':
         threadReadAttempt += 1;
         return reply({ thread: {

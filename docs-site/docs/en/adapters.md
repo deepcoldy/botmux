@@ -1,25 +1,42 @@
 # Multi-CLI Adapters
 
-botmux bridges different CLIs through adapters, selected via `cliId` in `bots.json`. One-click switching, process isolation.
+botmux bridges different CLIs / agents through adapters, selected via `cliId` in `bots.json` — one-click switching. **Local adapters each run as their own process** (under the default tmux backend you can `tmux attach` into the real process; explicit pty/zellij/herdr backends differ); a few are integrated over API / remotely (e.g. Mira, riff) and are not local processes.
 
-## Supported CLIs
+**Applies to**: when you want to switch the underlying CLI, or wire up a new tool, and need its `cliId` and whether it takes a `model` param.
+**Doesn't apply**: wrappers / gateways (ccr, aiden x claude, …) don't need a new adapter — see [Wrapper / gateway integration](#wrapper--gateway-integration) below.
 
-| `cliId` | CLI | Supports model param |
-|---------|-----|:--:|
-| `claude-code` | Claude Code (default) | ✅ |
-| `codex` | Codex | ✅ |
-| `codex-app` | Codex App | |
-| `cursor` | Cursor (cursor-agent) | ✅ |
-| `gemini` | Gemini | ✅ |
-| `opencode` | OpenCode | ✅ |
-| `coco` | CoCo / Trae (requires ≥ 0.120.32) | ✅ |
-| `aiden` | Aiden | |
-| `antigravity` | Antigravity (agy) | |
-| `hermes` | Hermes | |
-| `copilot` | GitHub Copilot (copilot) | ✅ |
-| `kiro-cli` | Kiro (kiro-cli) | |
+## Supported CLIs / Agents
 
-> There are also community-contributed integrations such as MTR, ttadk, and Mira. The `model` field only takes effect for adapters that support a model parameter; others ignore it.
+The table lists the current built-in adapters (the **authoritative source** for `cliId`s is [`src/adapters/cli/registry.ts`](https://github.com/deepcoldy/botmux/blob/master/src/adapters/cli/registry.ts), which changes across versions):
+
+| `cliId` | CLI / Agent | Integration | `model` |
+|---------|-----|-----|:--:|
+| `claude-code` | Claude Code (default) | local process | ✅ |
+| `codex` | Codex CLI | local process | ✅ |
+| `codex-app` | Codex App | local process (app-server protocol) | |
+| `gemini` | Gemini | local process | ✅ |
+| `cursor` | Cursor (cursor-agent) | local process | ✅ |
+| `opencode` | OpenCode | local process | ✅ |
+| `antigravity` | Antigravity (agy) | local process | |
+| `copilot` | GitHub Copilot | local process | ✅ |
+| `grok` | Grok (grok-cli) | local process | ✅ |
+| `kimi` | Kimi Code | local process | ✅ |
+| `kiro-cli` | Kiro | local process | |
+| `pi` | Pi | local process | |
+| `oh-my-pi` | Oh-My-Pi (Pi fork) | local process | ✅ |
+| `aiden` | Aiden | local process | |
+| `coco` | CoCo / Trae (requires ≥ 0.120.32) | local process | ✅ |
+| `traex` | TRAE CLI (traex) | local process | ✅ |
+| `mtr` | MTR | local process | |
+| `hermes` | Hermes | local process | |
+| `genius` | Genius | local process | ✅ |
+| `seed` | Seed (Claude Code fork) | local process | ✅ |
+| `relay` | Relay (new release of Seed) | local process | ✅ |
+| `mira` | Mira APP | API / remote | |
+| `mir` | Mir CLI (local mircli + MCP bridge) | local process | |
+| `riff` | riff | cloud agent (API) | |
+
+> The `model` field only takes effect for adapters that support a model parameter; others ignore it. Mir CLI's extra prerequisites (login / miramcp) are in the section below.
 
 ## Mir CLI and MCP Bridge
 
@@ -55,7 +72,7 @@ or disable it only for BotMux:
 MIRCLI_AUTO_START_MIRAMCP=0 botmux start
 ```
 
-## Wrapping a wrapper / gateway integration
+## Wrapper / gateway integration
 
 In many cases you don't run the native CLI directly but wrap it with a gateway / router (internal proxy + SSO, model routing, etc.), such as `ccr`, `ttadk`, `aiden x claude`, `aiden x codex`. In this case you **don't need a new adapter**: `cliId` still holds the real underlying CLI (`claude-code` / `codex` …), and you only swap the launch entry point for a **wrapper script**, pointing to it with `cliPathOverride` (the "CLI executable path override" when editing a bot in `botmux setup` is exactly this).
 

@@ -296,7 +296,7 @@ describe('VC meeting consumer card builder', () => {
       .filter((element: any) => element.tag === 'markdown')
       .map((element: any) => element.content)
       .join('\n');
-    expect(panelMarkdown).toContain('agent：meeting-notes-bot · 角色：`minutes` · 回复：静默 · 受管输出：无');
+    expect(panelMarkdown).toContain('agent：meeting-notes-bot · 角色：`minutes` · 回复：静默 · 群内形式：自动兼容 · 受管输出：无');
     expect(panelMarkdown).toContain('会中文字、会议语音');
     expect(panelMarkdown).toContain('状态：启用中');
     expect(panelMarkdown).toContain('状态：已启用');
@@ -314,8 +314,22 @@ describe('VC meeting consumer card builder', () => {
     const form = elements.find(element => element.tag === 'form');
     expect(form.name).toBe('vc_meeting_consumer_confirm_form');
     expect(form.elements.some((element: any) => element.tag === 'select_static')).toBe(false);
-    expect(form.elements.find((element: any) => element.tag === 'input').name)
-      .toBe('vc_meeting_custom_interval_seconds');
+    const activationContext = form.elements.find(
+      (element: any) => element.name === 'vc_meeting_activation_context',
+    );
+    expect(activationContext).toMatchObject({
+      tag: 'input',
+      input_type: 'multiline_text',
+      rows: 4,
+      max_rows: 8,
+      auto_resize: true,
+      width: 'fill',
+    });
+    expect(activationContext.label.content).toContain('本次会议补充说明');
+    expect(activationContext.placeholder.content).toContain('议程');
+    expect(form.elements.some(
+      (element: any) => element.name === 'vc_meeting_custom_interval_seconds',
+    )).toBe(true);
     const confirm = form.elements.find((element: any) => element.name === 'vc_meeting_consumer_confirm_submit');
     expect(confirm.action_type).toBe('form_submit');
     expect(confirm.value).toEqual({

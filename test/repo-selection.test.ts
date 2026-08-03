@@ -3,12 +3,13 @@
  * which lets a user skip the Lark repo-selection card by naming a path
  * (absolute/relative) or a first-level project name under a scan dir.
  */
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { execSync } from 'node:child_process';
 import { mkdtempSync, mkdirSync, rmSync, realpathSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { resolveRepoSelection } from '../src/core/command-handler.js';
+import { logger } from '../src/utils/logger.js';
 
 function gitInit(dir: string, branch = 'main'): void {
   execSync(`git init -q -b ${branch} "${dir}"`, { stdio: 'pipe' });
@@ -42,6 +43,20 @@ describe('resolveRepoSelection', () => {
     expect(r).not.toBeNull();
     expect(realpathSync(r!.path)).toBe(repo);
     expect(r!.displayName).toBe('botmux (main)');
+  });
+
+  it('does not scan unrelated roots when a candidate directory exists directly', () => {
+    const direct = join(scanDir, 'tmp');
+    mkdirSync(direct);
+    const scanLog = vi.spyOn(logger, 'info').mockImplementation(() => {});
+
+    try {
+      const r = resolveRepoSelection('tmp', [scanDir]);
+      expect(r).toEqual({ path: direct, displayName: 'tmp' });
+      expect(scanLog).not.toHaveBeenCalledWith(expect.stringContaining('Scanned '));
+    } finally {
+      scanLog.mockRestore();
+    }
   });
 
   it('resolves an absolute path to an existing git repo', () => {
@@ -87,6 +102,17 @@ describe('resolveRepoSelection', () => {
     expect(r).not.toBeNull();
     expect(realpathSync(r!.path)).toBe(repo);
     expect(r!.displayName).toBe('app (main)');
+  });
+
+  it('still scans for a nested project matched by basename', () => {
+    const repo = join(scanDir, 'teams', 'platform', 'deep-app');
+    mkdirSync(repo, { recursive: true });
+    gitInit(repo, 'main');
+
+    const r = resolveRepoSelection('deep-app', [scanDir]);
+    expect(r).not.toBeNull();
+    expect(realpathSync(r!.path)).toBe(repo);
+    expect(r!.displayName).toBe('deep-app (main)');
   });
 
   it('falls back to a plain (non-git) directory with a basename label', () => {

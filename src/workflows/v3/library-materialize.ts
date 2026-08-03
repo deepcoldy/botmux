@@ -39,6 +39,7 @@ import { isValidRunId } from './ops-projection.js';
 import {
   computeSavedWorkflowGateDigest,
   computeSavedWorkflowSideEffects,
+  assertNoSavedWorkflowChatSideEffects,
   validateDagTemplate,
   validateSpecTemplate,
   type LoadedSavedWorkflowRevision,
@@ -183,6 +184,10 @@ export function buildSavedWorkflowRevisionBaseline(
   const snapshots = parseFrozenBotSnapshots(loaded.botSnapshots, loaded.dag);
   const normalizedNodes = canonicalizeNodeBots(cloneNodes(loaded.dag.nodes), snapshots);
   const dagTemplate = validateDagTemplate({ nodes: normalizedNodes });
+  // Authoring boundary: a freshly compiled definition must be free of
+  // chat-facing side effects in goal nodes. This does NOT run on the read path
+  // (loadSavedWorkflowRevision), so existing revisions stay loadable.
+  assertNoSavedWorkflowChatSideEffects(dagTemplate);
   const { runId: _runId, ...specWithoutRunId } = loaded.spec;
   const specTemplate = validateSpecTemplate(specWithoutRunId);
   const inputs = opts.inputs ?? {};

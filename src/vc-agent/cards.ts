@@ -374,6 +374,13 @@ function consumerProfileResponseModeLabel(profile: VcMeetingConsumerProfileCardI
   return profile.responseMode === 'silent' ? '静默' : '监听群回复';
 }
 
+function consumerProfileListenerPlacementLabel(profile: VcMeetingConsumerProfileCardItem): string {
+  const placement = profile.listenerDelivery?.placement ?? 'auto';
+  if (placement === 'chat') return '群消息';
+  if (placement === 'topic') return '固定话题';
+  return '自动兼容';
+}
+
 function consumerProfileSinkLabel(profile: VcMeetingConsumerProfileCardItem): string {
   const labels = (profile.ownedSinks ?? []).map((sink) => {
     if (sink === 'meeting_text') return '会中文字';
@@ -439,7 +446,7 @@ function consumerProfileDetailMarkdown(profiles: readonly VcMeetingConsumerProfi
     const activation = consumerProfileActivationLabel(profile);
     return [
       `**${escapeMd(consumerProfileLabel(profile))}**（profile: \`${escapeMd(profile.id)}\`）`,
-      `agent：${escapeMd(consumerProfileAgentLabel(profile))} · 角色：\`${escapeMd(profile.role)}\` · 回复：${escapeMd(consumerProfileResponseModeLabel(profile))} · 受管输出：${escapeMd(consumerProfileSinkLabel(profile))}`,
+      `agent：${escapeMd(consumerProfileAgentLabel(profile))} · 角色：\`${escapeMd(profile.role)}\` · 回复：${escapeMd(consumerProfileResponseModeLabel(profile))} · 群内形式：${escapeMd(consumerProfileListenerPlacementLabel(profile))} · 受管输出：${escapeMd(consumerProfileSinkLabel(profile))}`,
       ...(activation ? [`状态：${escapeMd(activation)}`] : []),
     ].join('\n');
   }).join('\n');
@@ -562,6 +569,7 @@ function consumerSyncIntervalLabel(ms: number | undefined): string {
 }
 
 const CONSUMER_SYNC_INTERVAL_INPUT_NAME = 'vc_meeting_custom_interval_seconds';
+const CONSUMER_ACTIVATION_CONTEXT_INPUT_NAME = 'vc_meeting_activation_context';
 
 function consumerSyncIntervalCustomDefault(ms: number | undefined): string {
   if (!ms || !Number.isFinite(ms)) return '';
@@ -710,6 +718,17 @@ export function buildVcMeetingConsumerCard(input: VcMeetingConsumerCardInput): s
           tag: 'form',
           name: 'vc_meeting_consumer_confirm_form',
           elements: [
+            {
+              tag: 'input',
+              name: CONSUMER_ACTIVATION_CONTEXT_INPUT_NAME,
+              label: { tag: 'plain_text', content: '给 Agent 的本次会议补充说明（可选）' },
+              placeholder: { tag: 'plain_text', content: '可填写议程、重点关注内容或其他背景；仅对本次新启用的角色生效' },
+              input_type: 'multiline_text',
+              rows: 4,
+              max_rows: 8,
+              auto_resize: true,
+              width: 'fill',
+            },
             {
               tag: 'input',
               name: CONSUMER_SYNC_INTERVAL_INPUT_NAME,

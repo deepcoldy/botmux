@@ -223,7 +223,10 @@ describe('vc meeting delivery receiver', () => {
       const harness = receiverHarness(dir);
       await registerActiveMember(harness);
 
-      expect(harness.ensureMemberSession).toHaveBeenCalledWith(projection(), undefined);
+      expect(harness.ensureMemberSession).toHaveBeenCalledWith({
+        ...projection(),
+        outputRoute: { chatId: CHAT_ID, placement: 'auto' },
+      }, undefined);
       expect(getVcMeetingMemberProjection(dir, {
         listenerAppId: LISTENER_APP_ID,
         meetingId: MEETING_ID,
@@ -235,6 +238,7 @@ describe('vc meeting delivery receiver', () => {
         receiverSessionId: SESSION_ID,
         outputChatId: CHAT_ID,
         responseMode: 'silent',
+        outputPlacement: 'auto',
       });
     });
 
@@ -449,6 +453,25 @@ describe('vc meeting delivery receiver', () => {
     expect(trigger.instruction).not.toContain(unsafeRole);
     expect(trigger.instruction).not.toContain('</botmux_role_instructions >');
     expect(trigger.envelope.payload.member.role).toBe(unsafeRole);
+  });
+
+  it('requires the internal skip/publish envelope only for listener-visible automatic output', () => {
+    const request = delivery();
+    request.instructionVersion = 'meeting-consumer-v2';
+    const listener = buildVcMeetingDeliveryTriggerRequest(
+      request,
+      'delivery-key',
+      'listener_thread',
+      'Publish only meaningful changes.',
+    );
+    expect(listener.instruction).toContain('<botmux_role_instructions>\nPublish only meaningful changes.');
+    expect(listener.instruction).toContain('{"decision":"skip"}');
+    expect(listener.instruction).toContain('{"decision":"publish","content":"<message markdown>"}');
+    expect(listener.instruction.indexOf('Final answer transport contract'))
+      .toBeGreaterThan(listener.instruction.indexOf('</botmux_role_instructions>'));
+
+    const silent = buildVcMeetingDeliveryTriggerRequest(request, 'delivery-key', 'silent');
+    expect(silent.instruction).not.toContain('Final answer transport contract');
   });
 
   it('returns the same exact recovery ref when CLI-exit ambiguity precedes worker exit', async () => {

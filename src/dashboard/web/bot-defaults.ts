@@ -30,6 +30,7 @@ export type BotSubstituteMode = {
   targets: BotSubstituteTarget[];
   disclosure: 'prefix' | 'none';
   chats?: string[];
+  excludedChats?: string[];
   replyMode?: 'thread' | 'quote';
   disableControlCard?: boolean;
   /** 话题群支持（缺省 true；显式 false 关）。 */
@@ -59,11 +60,14 @@ export type BotDefaultsRow = {
    *  + no wrapper can enforce it. Drives the capability label under the toggle. */
   readIsolationSupported?: boolean;
   backendType?: string | null;
+  usageDisplay?: 'streaming' | 'footer' | 'off';
+  usageSupported?: boolean;
   disableStreamingCard?: boolean;
   silentTurnReactions?: boolean;
   codexAppCleanInput?: boolean;
   writableTerminalLinkInCard?: boolean;
   privateCard?: boolean;
+  overloadAlert?: boolean;
   botToBotSameDir?: boolean;
   summaryRange?: { limit?: number; sinceHours?: number };
   p2pMode?: string;

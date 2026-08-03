@@ -13,8 +13,13 @@ import { getBotBrand } from '../bot-registry.js';
 import { type Brand, chatAppLink } from '../im/lark/lark-hosts.js';
 import { getSessionTokenUsage, type SessionTokenUsage } from './cost-calculator.js';
 import { getIdentity } from '../im/lark/identity-cache.js';
+import {
+  buildSessionMessagePreview,
+  type SessionMessagePreview,
+} from './session-message-preview.js';
+import { isSuspendableBackendType, resolvePersistentBackendTarget } from './persistent-backend.js';
 
-export interface SessionRow {
+export interface SessionRow extends SessionMessagePreview {
   sessionId: string;
   larkAppId: string;
   botName: string;
@@ -41,6 +46,13 @@ export interface SessionRow {
    *  Absent on rows from older daemons → callers keep the locate behavior. */
   scope?: 'thread' | 'chat';
   title?: string;
+  titleUpdatedAt?: string;
+  /** Informational only; callers must not treat it as authenticated identity. */
+  titleSource?: Session['titleSource'];
+  /** Backend stamped at spawn time. Exposed so external surfaces can filter zmx/tmux/etc. */
+  backendType?: Session['backendType'];
+  /** Persisted backing multiplexer host name, not proof the target is currently live. */
+  backendSessionName?: string;
   /** 看板视图的手动放置（列 id / 列内排序位置），用户拖拽后持久化在 Session 上。
    *  未设置时前端按运行状态推导默认列。 */
   kanbanColumn?: string;
@@ -76,11 +88,23 @@ export interface SessionRow {
   tokenUsage?: SessionTokenUsage | null;
   /** Worker process PID, active rows only. Used by dashboard resource attribution. */
   workerPid?: number;
+  /** Persisted row intentionally kept active but detached from daemon routing
+   *  because exact backing teardown could not be proven. It is rendered as
+   *  dormant (never closed) and remains explicitly closeable for a retry. */
+  quarantined?: boolean;
   /** Adopted external CLI PID, active rows only when the source backend exposed it. */
   adoptCliPid?: number;
   /** Riff AIO Sandbox web terminal link. When set, the dashboard "Web终端"
    *  button opens this URL directly instead of building a local port link. */
   riffAccessUrl?: string;
+  /** Presentation enrichment stamped by the central dashboard read-model:
+   *  bot avatar URL from the live daemon descriptor.
+   *  Absent on older daemons — consumers must fall back. */
+  botAvatarUrl?: string;
+  /** Repo top-level dir name of workingDir, when it is a git repo. */
+  repoName?: string;
+  /** Current branch of workingDir; absent for detached HEAD / non-repo. */
+  gitBranch?: string;
 }
 
 export function feishuChatLink(chatId: string, brand: Brand = 'feishu'): string {
@@ -111,6 +135,7 @@ function sessionTokenUsage(s: Session, workingDir?: string): SessionTokenUsage |
     sessionId: s.sessionId,
     cliSessionId: s.cliSessionId,
     cwd: workingDir ?? s.workingDir,
+    larkAppId: s.larkAppId,
   });
 }
 
@@ -126,6 +151,16 @@ function directChatDisplayName(s: Session, larkAppId?: string): string | undefin
     if (name) return name;
   }
   return undefined;
+}
+
+function backendSessionNameForRow(s: Session): string | undefined {
+  const backendType = s.backendType;
+  if (s.adoptedFrom || !isSuspendableBackendType(backendType)) return undefined;
+  return resolvePersistentBackendTarget(
+    backendType,
+    s.sessionId,
+    s.persistentBackendTarget,
+  ).sessionName;
 }
 
 export function composeRowFromActive(ds: DaemonSession): SessionRow {
@@ -153,6 +188,10 @@ export function composeRowFromActive(ds: DaemonSession): SessionRow {
     lastInputFromBot: ds.session.quoteTargetSenderIsBot === true,
     scope: ds.session.scope,
     title: ds.session.title,
+    titleUpdatedAt: ds.session.titleUpdatedAt,
+    titleSource: ds.session.titleSource,
+    backendType: ds.session.backendType,
+    backendSessionName: backendSessionNameForRow(ds.session),
     kanbanColumn: ds.session.kanbanColumn,
     kanbanPosition: ds.session.kanbanPosition,
     locked: !!ds.session.locked,
@@ -177,6 +216,7 @@ export function composeRowFromActive(ds: DaemonSession): SessionRow {
     tokenUsage: sessionTokenUsage(ds.session, ds.workingDir),
     ...(ds.worker?.pid !== undefined ? { workerPid: ds.worker.pid } : {}),
     ...(ds.adoptedFrom?.originalCliPid !== undefined ? { adoptCliPid: ds.adoptedFrom.originalCliPid } : {}),
+    ...buildSessionMessagePreview(ds.session),
   };
 }
 
@@ -199,6 +239,10 @@ export function composeRowFromClosed(s: Session): SessionRow {
     lastInputFromBot: s.quoteTargetSenderIsBot === true,
     scope: s.scope,
     title: s.title,
+    titleUpdatedAt: s.titleUpdatedAt,
+    titleSource: s.titleSource,
+    backendType: s.backendType,
+    backendSessionName: backendSessionNameForRow(s),
     kanbanColumn: s.kanbanColumn,
     kanbanPosition: s.kanbanPosition,
     locked: !!s.locked,
@@ -206,5 +250,50 @@ export function composeRowFromClosed(s: Session): SessionRow {
     webPort: s.webPort ?? null,
     feishuChatLink: feishuChatLink(s.chatId, getBotBrand(s.larkAppId ?? '')),
     tokenUsage: sessionTokenUsage(s),
+    ...buildSessionMessagePreview(s),
+  };
+}
+
+/**
+ * Project a persisted active row that currently has no DaemonSession runtime.
+ *
+ * This is deliberately not composeRowFromClosed(): `status='active'` remains
+ * the ownership truth when a persistent-backend kill was inconclusive. The
+ * dashboard presents it as dormant, with no terminal port, so operators can
+ * see and explicitly retry closing it without an unsafe resume affordance.
+ */
+export function composeRowFromPersistedActive(s: Session): SessionRow {
+  return {
+    sessionId: s.sessionId,
+    larkAppId: s.larkAppId ?? '',
+    botName: cachedBotName,
+    cliId: s.cliId ?? 'unknown',
+    status: s.queued ? 'idle' : 'dormant',
+    adopt: !!s.adoptedFrom,
+    spawnedAt: sessionCreatedAtMs(s),
+    lastMessageAt: sessionLastActivityAtMs(s),
+    workingDir: s.workingDir,
+    chatId: s.chatId,
+    chatType: s.chatType,
+    chatDisplayName: directChatDisplayName(s, s.larkAppId),
+    rootMessageId: s.rootMessageId,
+    lastInputFromBot: s.quoteTargetSenderIsBot === true,
+    scope: s.scope,
+    title: s.title,
+    titleUpdatedAt: s.titleUpdatedAt,
+    titleSource: s.titleSource,
+    backendType: s.backendType,
+    backendSessionName: backendSessionNameForRow(s),
+    kanbanColumn: s.kanbanColumn,
+    kanbanPosition: s.kanbanPosition,
+    locked: !!s.locked,
+    ownerOpenId: s.ownerOpenId,
+    webPort: null,
+    feishuChatLink: feishuChatLink(s.chatId, getBotBrand(s.larkAppId ?? '')),
+    queued: !!s.queued,
+    hasHistory: !!(s.cliId || s.lastCliInput || s.backendType || s.adoptedFrom),
+    quarantined: !!s.restoreQuarantinedAt,
+    tokenUsage: sessionTokenUsage(s),
+    ...buildSessionMessagePreview(s),
   };
 }

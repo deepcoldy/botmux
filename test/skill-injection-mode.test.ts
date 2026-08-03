@@ -143,6 +143,12 @@ describe('resolveSkillInjectionSupport (dashboard control class)', () => {
 });
 
 describe('built-in skill catalog', () => {
+  function innerText(block: string): string {
+    const match = block.match(/^<botmux_builtin_skills>\n([\s\S]*)\n<\/botmux_builtin_skills>$/);
+    expect(match).not.toBeNull();
+    return match![1];
+  }
+
   it('lists the unconditional built-ins plus ask when the CLI has no hook', () => {
     const entries = builtinSkillEntries({ asksViaHook: false, whiteboardEnabled: false });
     const names = entries.map((e) => e.name);
@@ -179,13 +185,28 @@ describe('built-in skill catalog', () => {
     const block = buildBuiltinSkillCatalogBlock(entries);
     expect(block.startsWith('<botmux_builtin_skills>')).toBe(true);
     expect(block.trimEnd().endsWith('</botmux_builtin_skills>')).toBe(true);
-    expect(block).toContain('botmux skill show <name>');
+    expect(block).toContain('botmux skill show &lt;name&gt;');
     expect(block).toContain('- botmux-send:');
     expect(block).toContain('首次复杂飞书发送前读取');
     expect(block).toContain('JSON.stringify');
     expect(block).toContain('JSON 转义产生的 \\n 当字面量');
     // The compact prompt description must not replace the full/native metadata.
     expect(entries.find((e) => e.name === 'botmux-send')?.description).toContain('向飞书话题发送消息');
+  });
+
+  it('keeps catalog prose as escaped text instead of nested XML-like tags', () => {
+    for (const locale of [undefined, 'en'] as const) {
+      const block = buildBuiltinSkillCatalogBlock([{
+        name: 'botmux-fixture',
+        description: 'Use <fixture> & keep going.',
+        content: '',
+      }], locale);
+
+      expect(innerText(block)).not.toMatch(/[<>]/);
+      expect(block).toContain('&lt;botmux_routing&gt;');
+      expect(block).toContain('botmux skill show &lt;name&gt;');
+      expect(block).toContain('Use &lt;fixture&gt; &amp; keep going.');
+    }
   });
 
   it('renders an empty block for no entries', () => {
@@ -205,6 +226,18 @@ describe('built-in skill catalog', () => {
     expect(zh.trimEnd().endsWith('</botmux_builtin_skills>')).toBe(true);
     expect(zh).toContain('botmux --help');
     expect(builtinSkillHelpPointer('en')).toContain('botmux --help');
+  });
+
+  it('keeps prompt/off help prose as escaped text instead of nested XML-like tags', () => {
+    const zh = builtinSkillHelpPointer();
+    const en = builtinSkillHelpPointer('en');
+
+    expect(innerText(zh)).not.toMatch(/[<>]/);
+    expect(innerText(en)).not.toMatch(/[<>]/);
+    expect(zh).toContain('&lt;botmux_routing&gt;');
+    expect(zh).toContain('botmux &lt;子命令&gt; --help');
+    expect(en).toContain('&lt;botmux_routing&gt;');
+    expect(en).toContain('botmux &lt;cmd&gt; --help');
   });
 });
 
@@ -227,7 +260,7 @@ describe('buildNewTopicPrompt built-in skill delivery (codex)', () => {
   it('prompt mode (default) inlines complex send discovery plus additional skills', () => {
     const p = prompt();
     expect(p).toContain('<botmux_builtin_skills>');
-    expect(p).toContain('botmux skill show <name>');
+    expect(p).toContain('botmux skill show &lt;name&gt;');
     expect(p).toContain('- botmux-schedule:');
     expect(p).toContain('- botmux-send:');
     expect(p).toContain('首次复杂飞书发送前读取');

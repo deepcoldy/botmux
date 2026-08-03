@@ -4,7 +4,7 @@ import { dirname, join } from 'node:path';
 import { readBotsJsonOrEmpty, writeBotsJsonAtomic } from '../setup/bots-store.js';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { logger } from '../utils/logger.js';
-import { normalizeBotConfig, findInvalidAllowedUserEntries, hasOwnerEntry } from '../setup/bot-config-editor.js';
+import { normalizeBotConfig, findInvalidAllowedUserEntries, hasOwnerEntry, isMobileEntry, normalizeMobileEntry } from '../setup/bot-config-editor.js';
 import { tryRegisterApp, type RegisterAppOptions, type RegisterAppResult } from '../setup/register-app.js';
 import {
   validateCredentials,
@@ -1712,11 +1712,19 @@ export class BotOnboardingManager {
     // 关键顺序：先确认 owner, 再决定是否落盘 + 终态。completed 必须意味着「bots.json
     // 里这个 bot 带着至少一个 owner」, 绝不产出空 allowedUsers 的可启动 bot。
     let ownerEntry: string | undefined;
+    // Native ou_ to persist as the resolve-independent fail-safe recipient —
+    // only when the scanner path verifies it belongs to THIS app (below).
+    let ownerOpenId: string | undefined;
     if (result.userOpenId) {
       // registerApp 返回的 open_id 来自扫码链路; 用新 app 自身凭证验证, 失败不
       // fallback 写入该 (常为跨 app 的) ou_——避免把其他 app 视角的 open_id 固化
       // 成 owner, 导致 /grant 和授权卡片一直判 non-owner。
       ownerEntry = await resolveScannerAllowedUser(result.appId, result.appSecret, result.userOpenId, result.brand);
+      // Verified against this app (ownerEntry set) → the native open_id is a
+      // trustworthy owner anchor; store it raw so a boot-time contact-API blip
+      // can't strip our only DM recipient. (Skip on the email path below: no
+      // native open_id there, only an on_/email that still needs resolving.)
+      if (ownerEntry) ownerOpenId = result.userOpenId;
     }
     if (!ownerEntry && sessionEmail) {
       // Web 主路径：创建应用的登录账号邮箱就是 owner（表单第一步已展示并确认），
@@ -1727,7 +1735,7 @@ export class BotOnboardingManager {
     }
 
     if (ownerEntry) {
-      const addedBotIndex = this.persistBot({ ...bot, allowedUsers: [ownerEntry] });
+      const addedBotIndex = this.persistBot({ ...bot, allowedUsers: [ownerEntry], ...(ownerOpenId ? { ownerOpenId } : {}) });
       if (!activationPending) {
         await this.runLiveStart(id, result.appId);
       }
@@ -1790,10 +1798,10 @@ export class BotOnboardingManager {
     const entries = rawEntries.map(e => e.trim()).filter(Boolean);
     const invalid = findInvalidAllowedUserEntries(entries);
     if (invalid.length > 0) {
-      return { ok: false, error: 'invalid_entries', message: `不是完整邮箱、union_id(on_) 或 open_id(ou_)：${invalid.join(', ')}` };
+      return { ok: false, error: 'invalid_entries', message: `不是完整邮箱、手机号（大陆 11 位 / 海外带 + 国家码）、union_id(on_) 或 open_id(ou_)：${invalid.join(', ')}` };
     }
     if (!hasOwnerEntry(entries)) {
-      return { ok: false, error: 'no_owner', message: '至少需要一个完整邮箱、union_id(on_) 或 open_id(ou_) 作为 owner。' };
+      return { ok: false, error: 'no_owner', message: '至少需要一个完整邮箱、手机号（大陆 11 位 / 海外带 + 国家码）、union_id(on_) 或 open_id(ou_) 作为 owner。' };
     }
 
     const appId = typeof pending.larkAppId === 'string' ? pending.larkAppId : '';
@@ -1805,7 +1813,7 @@ export class BotOnboardingManager {
       return {
         ok: false,
         error: 'unusable_owner',
-        message: `以下身份在当前应用里无法解析（可能是其他应用的 open_id，或邮箱不在本企业）：${unusable.join(', ')}。请改用本企业邮箱或 union_id(on_)。`,
+        message: `以下身份在当前应用里无法解析（可能是其他应用的 open_id，或邮箱/手机号不在本企业）：${unusable.join(', ')}。请改用本企业邮箱、手机号或 union_id(on_)。`,
       };
     }
 
@@ -2123,6 +2131,19 @@ async function detectUnusableOwnerEntries(
       } else if (entry.startsWith('on_')) {
         // union_id：无确凿的跨 app 否定信号, 放行。
         continue;
+      } else if (isMobileEntry(entry)) {
+        // 手机号走 batch_get_id 的 `mobiles` 字段（与运行时 resolver 同口径），
+        // 不能落到下面的 emails 分支——否则手机号被当邮箱查, code 0 + 空 user_list
+        // 会把合法手机号误判为「不在本企业」而拒绝（P2）。判定同 email：成功响应
+        // 里没有任何带 user_id 的条目 → 确凿不在本企业。
+        const res = await client.contact.v3.user.batchGetId({
+          params: { user_id_type: 'open_id' },
+          data: { mobiles: [normalizeMobileEntry(entry)], include_resigned: false },
+        });
+        if (res?.code === 0) {
+          const list: any[] = res.data?.user_list ?? [];
+          if (!list.some(u => u?.user_id)) unusable.push(entry);
+        }
       } else {
         const res = await client.contact.v3.user.batchGetId({
           params: { user_id_type: 'open_id' },

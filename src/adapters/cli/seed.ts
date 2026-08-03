@@ -50,7 +50,8 @@ export function createSeedAdapter(pathOverride?: string): CliAdapter {
     id: 'seed',
     // Seed's SuperRelay apiKey lives in `<dataDir>/byted-cloud-auth.json` (NOT
     // under bytedcli); keep it + the bytedcli SSO dir real + writable in the file
-    // sandbox so token refresh / login persist across the overlay.
+    // sandbox so token refresh / login persist (a path not bound real wouldn't
+    // exist in the sandbox and its refreshed token would be lost).
     authPaths: ['~/.local/share/bytedcli', join(dataDir, 'byted-cloud-auth.json')],
     resumeBin: 'seed',
     dataDir,

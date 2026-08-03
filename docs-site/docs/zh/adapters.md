@@ -1,25 +1,42 @@
 # 多 CLI 适配器
 
-botmux 通过适配器桥接不同 CLI，`bots.json` 里用 `cliId` 选择。一键切换，进程隔离。
+botmux 通过适配器桥接不同 CLI / Agent，`bots.json` 里用 `cliId` 选择，一键切换。**本地适配器各自运行进程**（默认 tmux 后端下可 `tmux attach` 进真进程；显式 pty/zellij/herdr 后端另说）；也有少数通过 API / 远端接入的 Agent（如 Mira、riff），不是本地进程。
 
-## 支持的 CLI
+**适用**：想换底层 CLI、或接一个新工具时查 `cliId` 和它是否吃 `model` 参数。
+**不适用**：套 wrapper / 网关（ccr、aiden x claude 等）不需要新适配器——见下方 [套 wrapper / 网关接入](#套-wrapper--网关接入)。
 
-| `cliId` | CLI | 支持 model 参数 |
-|---------|-----|:--:|
-| `claude-code` | Claude Code（默认） | ✅ |
-| `codex` | Codex | ✅ |
-| `codex-app` | Codex App | |
-| `cursor` | Cursor（cursor-agent） | ✅ |
-| `gemini` | Gemini | ✅ |
-| `opencode` | OpenCode | ✅ |
-| `coco` | CoCo / Trae（需 ≥ 0.120.32） | ✅ |
-| `aiden` | Aiden | |
-| `antigravity` | Antigravity（agy） | |
-| `hermes` | Hermes | |
-| `copilot` | GitHub Copilot（copilot） | ✅ |
-| `kiro-cli` | Kiro（kiro-cli） | |
+## 支持的 CLI / Agent
 
-> 还有社区贡献的 MTR、ttadk、Mira 等接入方式。`model` 字段只对支持模型参数的适配器生效，其它会忽略。
+下表为当前内置适配器（`cliId` 的**权威事实源**是 [`src/adapters/cli/registry.ts`](https://github.com/deepcoldy/botmux/blob/master/src/adapters/cli/registry.ts)，随版本增减）：
+
+| `cliId` | CLI / Agent | 接入方式 | 支持 `model` |
+|---------|-----|-----|:--:|
+| `claude-code` | Claude Code（默认） | 本地进程 | ✅ |
+| `codex` | Codex CLI | 本地进程 | ✅ |
+| `codex-app` | Codex App | 本地进程（app-server 协议） | |
+| `gemini` | Gemini | 本地进程 | ✅ |
+| `cursor` | Cursor（cursor-agent） | 本地进程 | ✅ |
+| `opencode` | OpenCode | 本地进程 | ✅ |
+| `antigravity` | Antigravity（agy） | 本地进程 | |
+| `copilot` | GitHub Copilot | 本地进程 | ✅ |
+| `grok` | Grok（grok-cli） | 本地进程 | ✅ |
+| `kimi` | Kimi Code | 本地进程 | ✅ |
+| `kiro-cli` | Kiro | 本地进程 | |
+| `pi` | Pi | 本地进程 | |
+| `oh-my-pi` | Oh-My-Pi（Pi fork） | 本地进程 | ✅ |
+| `aiden` | Aiden | 本地进程 | |
+| `coco` | CoCo / Trae（需 ≥ 0.120.32） | 本地进程 | ✅ |
+| `traex` | TRAE CLI（traex） | 本地进程 | ✅ |
+| `mtr` | MTR | 本地进程 | |
+| `hermes` | Hermes | 本地进程 | |
+| `genius` | Genius | 本地进程 | ✅ |
+| `seed` | Seed（Claude Code fork） | 本地进程 | ✅ |
+| `relay` | Relay（Seed 新版） | 本地进程 | ✅ |
+| `mira` | Mira APP | API / 远端 | |
+| `mir` | Mir CLI（本地 mircli + MCP bridge） | 本地进程 | |
+| `riff` | riff | 云 Agent（API） | |
+
+> `model` 字段只对支持模型参数的适配器生效，其它忽略。Mir CLI 的额外前置（登录 / miramcp）见下方专节。
 
 ## Mir CLI 与 MCP Bridge
 

@@ -413,6 +413,38 @@ describe('relay_confirm button click', () => {
     expect(r?.toast?.type).toBe('success');
   });
 
+  it.each([
+    ['persisted real session', (ds: DaemonSession) => { ds.session.cliId = 'claude-code'; }],
+    ['queued session', (ds: DaemonSession) => { ds.session.queued = true; }],
+    ['adopt session', (ds: DaemonSession) => {
+      ds.adoptedFrom = { source: 'tmux', tmuxTarget: 'ext:0.0', originalCliPid: 42, cwd: '/tmp' } as any;
+    }],
+    ['pending repository choice', (ds: DaemonSession) => { ds.pendingRepo = { prompt: 'pick' } as any; }],
+    ['deferred prompt', (ds: DaemonSession) => { ds.pendingPrompt = 'continue'; }],
+    ['deferred raw input', (ds: DaemonSession) => { ds.pendingRawInput = 'continue'; }],
+  ])('pre-flight blocks a worker-less %s before sending M1', async (_label, protect) => {
+    const sourceDs = makeDs();
+    const targetDs = makeDsInChat({
+      sessionId: 'sess-protected-target',
+      chatId: 'oc_target',
+      scope: 'chat',
+      worker: null,
+      title: 'protected target',
+    });
+    protect(targetDs);
+    const map = new Map<string, DaemonSession>([
+      [sessionKey('om_source_root', LARK_APP_ID), sourceDs],
+      [sessionKey('oc_target', LARK_APP_ID), targetDs],
+    ]);
+
+    const r = await handleCardAction(actionData({ sessionId: 'sess-source-1' }), deps(map), LARK_APP_ID);
+
+    expect(r).toBeUndefined();
+    expect(sendMessageMock).toHaveBeenCalledTimes(1);
+    expect(sendMessageMock.mock.calls[0]?.[2]).toContain('protected target');
+    expect(transferSessionMock).not.toHaveBeenCalled();
+  });
+
   it('cleans up the orphan M1 when transferSession fails after the M1 was sent (race fallback)', async () => {
     const ds = makeDs();
     const map = new Map<string, DaemonSession>();

@@ -19,6 +19,7 @@
  */
 
 import type { EntryResolveStatus } from '../im/lark/client.js';
+import { entryNeedsContactResolve } from '../setup/bot-config-editor.js';
 
 export interface AllowedUsersResolveResultLike {
   resolved: string[];
@@ -65,9 +66,9 @@ export interface ApplyAllowedUsersResolveOutput {
   notice: string | null;
 }
 
-/** Config entries that require a contact resolve (email / union / literal ou_). */
+/** Config entries that require a contact resolve (email / union / literal ou_ / mobile). */
 function needsContactResolve(rawEntries: string[]): boolean {
-  return rawEntries.some(u => u.includes('@') || u.startsWith('on_') || u.startsWith('ou_'));
+  return rawEntries.some(entryNeedsContactResolve);
 }
 
 function entryStatusOf(

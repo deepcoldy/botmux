@@ -136,16 +136,25 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
     // per-bot BOT_HOME via CODEX_HOME redirection. (Read isolation does NOT consult
     // authPaths — that only feeds the bwrap file sandbox below.)
     supportsReadIsolation: true,
-    // Whole ~/.codex kept REAL, not just auth.json: codex opens SQLite state/log
-    // DBs there (state_*.sqlite / logs_*.sqlite). Under the file sandbox the home
-    // is an overlayfs merge, and overlayfs (kernel + fuse) doesn't support the
-    // POSIX fcntl locks SQLite needs — the connection pool blocks ~57s then codex
-    // exits 1 ("pool timed out"). Binding the dir real gives working locks and
-    // keeps login/history persistent (same rationale as auth.json).
+    // Whole ~/.codex kept REAL, not just auth.json: codex writes SQLite state/log
+    // DBs (state_*.sqlite / logs_*.sqlite) + history/sessions there. The file
+    // sandbox is a fresh tmpfs root where ONLY allow-listed paths are bound in.
+    // A single-file carve-out (just auth.json) would technically still let codex
+    // create + fcntl-lock sibling DBs — verified: a fresh tmpfs supports SQLite
+    // byte-range locks and sibling creation just fine — but those live in the
+    // EPHEMERAL tmpfs: they vanish when the sandbox tears down (no persistence)
+    // and the daemon's transcript bridge / resume never sees them (they're not on
+    // the real host path). Binding the whole dir REAL is what keeps login +
+    // history + state persistent across sessions AND visible to the worker's
+    // bridge/resume on the same host path. NOTE this rationale is for the
+    // NON-redirected path; when CLI data is redirected to BOT_HOME the worker
+    // drops this host authPath (authPathsSurvivingCliDataRedirect) — codex then
+    // reads/writes its DBs under CODEX_HOME=BOT_HOME/codex instead, and exposing
+    // the host ~/.codex would only leak history/sessions it never touches.
     authPaths: ['~/.codex'],
     get resolvedBin(): string { return (cachedBin ??= resolveCommand(rawBin)); },
 
-    buildArgs({ sessionId, resume, resumeSessionId, workingDir, model, disableCliBypass, readIsolation, remoteWsUrl, remoteThreadId }) {
+    buildArgs({ sessionId, resume, resumeSessionId, workingDir, model, reasoningEffort, disableCliBypass, bypassHookTrust, readIsolation, remoteWsUrl, remoteThreadId }) {
       // Hybrid RPC input mode: attach this TUI to the botmux-owned app-server
       // thread. User input is delivered out-of-band via JSON-RPC (turn/start,
       // see codex-rpc-engine + worker), so the pane is a pure viewer — no paste
@@ -164,6 +173,21 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
       // is OFF and the outer Seatbelt profile is the sole enforcer.
       const baseArgs = [
         ...(!disableCliBypass ? ['--dangerously-bypass-approvals-and-sandbox'] : []),
+        // Codex 0.14x added a second interactive gate AFTER folder trust: the
+        // botmux-installed UserPromptSubmit + Stop hooks in ~/.codex/hooks.json
+        // must be manually trusted ("Press t to trust"), and every botmux upgrade
+        // rewrites codex-hook.sh → its trusted_hash changes → the gate re-fires. A
+        // botmux-managed plain-TUI pane has no human at its PTY to press `t`, so the
+        // first Lark turn wedges forever. This gate is TUI-only: this branch never
+        // runs for --remote (see the early return above), and the app-server rejects
+        // the flag. (`codex exec` DOES accept it, but botmux never launches exec.)
+        //
+        // This is a SEPARATE knob from the approval/sandbox bypass: the flag trusts
+        // ALL hook sources codex sees (user/project/plugin), not only botmux's, so it
+        // is gated by its own global toggle `bypassHookTrust` (default ON, operator can
+        // disable) — expressing "approvals bypassed, hook-trust review kept". Still
+        // ANDed with `!disableCliBypass`: a restricted bot never gets it regardless.
+        ...(!disableCliBypass && bypassHookTrust ? ['--dangerously-bypass-hook-trust'] : []),
         '--no-alt-screen',
         '-c',
         `shell_environment_policy.set.BOTMUX_SESSION_ID=${JSON.stringify(sessionId)}`,
@@ -192,6 +216,12 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
       if (model && model.trim()) {
         // Codex 接受 `--model <id>` / `-m <id>`，写全名最稳，错的会在 codex 自己启动时报。
         baseArgs.push('--model', model.trim());
+      }
+      if (reasoningEffort) {
+        // Per-turn reasoning effort → codex model_reasoning_effort（进程级 -c 覆盖，
+        // 不动用户全局 config）。Codex 0.145 实测接受 low/medium/high/xhigh（xhigh
+        // 原样回显），故原样透传，不做降级——收敛会静默改变用户请求的档位。
+        baseArgs.push('-c', `model_reasoning_effort=${JSON.stringify(reasoningEffort)}`);
       }
       // Codex app-server can keep its own cwd at $HOME; -C pins fresh agent roots.
       // NOTE: canonicalization of workingDir for the file sandbox is done ONCE in
@@ -312,6 +342,10 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
     // but reject numbered menu choices. This remains necessary for wrappers
     // such as Aiden that cannot forward the startup-update config override.
     readyPattern: /›(?!\s*\d+\.)|\d+% left/,
+    // Codex cold starts can exceed the worker's 15s soft first-prompt timeout.
+    // Wait for the real composer marker so the bare-shell guard does not treat
+    // a still-loading zsh wrapper as a failed launch.
+    deferFirstPromptTimeoutUntilReady: true,
     defaultPassthroughCommands: ['/goal'],
     buildSessionRenameCommand: (title) => `/rename ${title}`,
     systemHints: BOTMUX_SHELL_HINTS,

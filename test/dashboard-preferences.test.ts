@@ -4,13 +4,16 @@ import { stripMentionPrefix } from '../src/dashboard/web/ui.js';
 import {
   DEFAULT_BOARD_ORDER,
   normalizeBoardOrder,
+  normalizeHiddenTableColumns,
   normalizeSessionsViewMode,
   normalizeSkin,
   normalizeThemeMode,
+  readStoredHiddenTableColumns,
   readStoredSessionsViewMode,
   readStoredSessionsShowUnknownChats,
   readStoredSkin,
   resolveThemeMode,
+  writeStoredHiddenTableColumns,
   writeStoredSessionsShowUnknownChats,
 } from '../src/dashboard/web/preferences.js';
 
@@ -132,6 +135,49 @@ describe('sessions board column order', () => {
     const input = [...DEFAULT_BOARD_ORDER];
     const out = normalizeBoardOrder(input)!;
     expect(out).not.toBe(input);
+  });
+});
+
+describe('sessions table column visibility preferences', () => {
+  it('strips fixed columns (select/actions) and non-string entries', () => {
+    expect(normalizeHiddenTableColumns(['botName', 'status', 'chat']))
+      .toEqual(['botName', 'status', 'chat']);
+    expect(normalizeHiddenTableColumns(['select', 'botName', 'actions', 'status']))
+      .toEqual(['botName', 'status']);
+    expect(normalizeHiddenTableColumns(['botName', 42, true, 'status']))
+      .toEqual(['botName', 'status']);
+  });
+
+  it('dedupes entries and returns a fresh array', () => {
+    const input = ['botName', 'status', 'botName'];
+    expect(normalizeHiddenTableColumns(input)).toEqual(['botName', 'status']);
+  });
+
+  it('returns an empty array for invalid input', () => {
+    expect(normalizeHiddenTableColumns(null)).toEqual([]);
+    expect(normalizeHiddenTableColumns(undefined)).toEqual([]);
+    expect(normalizeHiddenTableColumns('botName')).toEqual([]);
+  });
+
+  it('falls back to empty for missing/invalid storage', () => {
+    const make = (value: string | null): Storage =>
+      ({ getItem: () => value }) as unknown as Storage;
+    expect(readStoredHiddenTableColumns(undefined)).toEqual([]);
+    expect(readStoredHiddenTableColumns(make(null))).toEqual([]);
+    expect(readStoredHiddenTableColumns(make('nope'))).toEqual([]);
+    expect(readStoredHiddenTableColumns(make(JSON.stringify(['botName', 'status']))))
+      .toEqual(['botName', 'status']);
+  });
+
+  it('persists hidden columns and strips fixed columns on write', () => {
+    const values = new Map<string, string>();
+    const storage = {
+      getItem: (key: string) => values.get(key) ?? null,
+      setItem: (key: string, value: string) => values.set(key, value),
+    } as unknown as Storage;
+
+    writeStoredHiddenTableColumns(storage, ['botName', 'select', 'status', 'actions']);
+    expect(readStoredHiddenTableColumns(storage)).toEqual(['botName', 'status']);
   });
 });
 

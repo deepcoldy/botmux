@@ -54,6 +54,9 @@ vi.mock('../src/config.js', () => ({
 
 const updateSessionMock = vi.fn();
 vi.mock('../src/services/session-store.js', () => ({
+  registerSessionBridgeSendMarkerCleanupFence: vi.fn(),
+  cleanupSessionBridgeSendMarkers: vi.fn(),
+  cleanupSessionBridgeSendMarkersNow: vi.fn(),
   closeSession: vi.fn(),
   updateSession: (...args: any[]) => updateSessionMock(...args),
 }));
@@ -180,7 +183,9 @@ describe("crash-loop diagnostic terminal (daemon 'claude_exit' handler)", () => 
 
     // First 3 auto-restart in place; the 4th asks the worker to park a
     // diagnostic shell (deferred park) and keeps it alive (no close).
-    expect(worker.send).toHaveBeenCalledWith({ type: 'restart', reason: 'cli_crash' });
+    // auto-restart 捎带最新 per-bot env（本 fixture 的 mock getBot 无 env → null）+
+    // 标记 reason: 'cli_crash' 区分 operator 主动 restart。
+    expect(worker.send).toHaveBeenCalledWith({ type: 'restart', reason: 'cli_crash', env: null });
     expect(worker.send).toHaveBeenCalledWith({ type: 'park_diagnostic' });
     expect(worker.send).not.toHaveBeenCalledWith({ type: 'close' });
     // Survives daemon restart: lazy cold-resume + idle, restart counter reset.

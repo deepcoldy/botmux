@@ -9,6 +9,7 @@
  */
 
 import { config } from '../../config.js';
+import { formatUrlHost } from '../../core/dashboard-url.js';
 import type { V3ProgressView } from '../../workflows/v3/progress-projection.js';
 import type { V3RunSaveActionValue } from './v3-run-save-card.js';
 
@@ -27,7 +28,7 @@ export interface V3ProgressCardOptions {
 const MAX_INLINE_IDS = 5;
 
 export function v3ProgressRunDetailUrl(runId: string): string {
-  return `http://${config.dashboard.externalHost}:${config.dashboard.port}/#/v3/${encodeURIComponent(runId)}`;
+  return `http://${formatUrlHost(config.dashboard.externalHost)}:${config.dashboard.port}/#/v3/${encodeURIComponent(runId)}`;
 }
 
 /** Render one complete Feishu card body from the safe v3 progress projection. */
@@ -105,6 +106,16 @@ export function buildV3ProgressCard(
     if (view.issue.errorClass) parts.push(escapeMd(view.issue.errorClass));
     if (view.issue.errorCode) parts.push(`\`${escapeMd(view.issue.errorCode)}\``);
     appendSection(elements, '⚠️ 错误码', parts.length > 0 ? parts.join(' · ') : 'UNKNOWN');
+  }
+
+  if (view.feishuHostFailed) {
+    appendSection(
+      elements,
+      'Feishu host 节点失败',
+      view.upstreamNonHostFinished
+        ? '上游非 host 节点已完成，失败发生在 Feishu host 节点。该节点可能是通知，也可能是业务交付；请按 DAG 语义核对后再决定是否重试。'
+        : '失败发生在 Feishu host 节点。该节点可能是通知，也可能是业务交付；其它业务节点状态请以节点进度为准。',
+    );
   }
 
   if (view.uncertainHostEffectCount && view.uncertainHostEffectCount > 0) {

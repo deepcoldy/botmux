@@ -1,6 +1,6 @@
 /**
  * Shared helpers for sessions backed by a persistent multiplexer
- * (tmux / herdr / zellij). These backends keep the CLI alive across worker
+ * (tmux / herdr / zellij / zmx). These backends keep the CLI alive across worker
  * exits BY DESIGN (idle-suspend, lazy restore), so several daemon paths must
  * resolve / name / probe / kill the backing session WITHOUT a live worker:
  * the restore-time zombie sweep and terminal wake (session-manager.ts), and
@@ -15,16 +15,32 @@ import { getBot } from '../bot-registry.js';
 import { TmuxBackend } from '../adapters/backend/tmux-backend.js';
 import { HerdrBackend } from '../adapters/backend/herdr-backend.js';
 import { ZellijBackend } from '../adapters/backend/zellij-backend.js';
+import { ZmxBackend } from '../adapters/backend/zmx-backend.js';
 import type { BackendType, PersistentBackendTarget, SessionProbe } from '../adapters/backend/types.js';
 import type { DaemonSession } from './types.js';
 import type { Session } from '../types.js';
 
-export type PersistentBackendType = Extract<BackendType, 'tmux' | 'herdr' | 'zellij'>;
+export type PersistentBackendType = Extract<BackendType, 'tmux' | 'herdr' | 'zellij' | 'zmx'>;
+
+/**
+ * Decide whether a post-kill probe still blocks a cold replacement.
+ *
+ * ZMX owns sessions by labels + frozen PID, so an inconclusive confirmation
+ * must remain fail-closed. The older mux backends only have best-effort
+ * process/session probes: after a successful kill, `unknown` is not proof that
+ * the target survived (notably zellij reports zero live sessions with exit 1).
+ */
+export function shouldRejectPersistentPostKillProbe(
+  backendType: PersistentBackendType,
+  probe: SessionProbe,
+): boolean {
+  return probe === 'exists' || (backendType === 'zmx' && probe === 'unknown');
+}
 
 export function isSuspendableBackendType(
   backendType: BackendType | undefined,
 ): backendType is PersistentBackendType {
-  return backendType === 'tmux' || backendType === 'herdr' || backendType === 'zellij';
+  return backendType === 'tmux' || backendType === 'herdr' || backendType === 'zellij' || backendType === 'zmx';
 }
 
 /**
@@ -132,6 +148,7 @@ export function shutdownBackendDisposition(ds: DaemonSession): 'detach' | 'close
 export function persistentSessionName(backendType: PersistentBackendType, sessionId: string): string {
   if (backendType === 'tmux') return TmuxBackend.sessionName(sessionId);
   if (backendType === 'zellij') return ZellijBackend.sessionName(sessionId);
+  if (backendType === 'zmx') return ZmxBackend.sessionName(sessionId);
   return HerdrBackend.sessionName(sessionId);
 }
 
@@ -186,42 +203,91 @@ export function probePersistentBackendTarget(target: PersistentBackendTarget): S
   return probePersistentSession(target.backendType, target.sessionName);
 }
 
-export function killPersistentBackendTarget(target: PersistentBackendTarget): void {
+/**
+ * `sessionId` is REQUIRED for ZMX: its destruction is identity-verified against
+ * the botmux labels stamped on the session, and `killPersistentSession` refuses
+ * a name-only ZMX kill rather than risk destroying a same-named user session.
+ * Callers that hold the owning session must always pass it through.
+ */
+export function killPersistentBackendTarget(
+  target: PersistentBackendTarget,
+  sessionId?: string,
+): void {
   if (target.backendType === 'herdr' && target.agentName) {
     HerdrBackend.killAgent(target.sessionName, target.agentName);
     return;
   }
-  killPersistentSession(target.backendType, target.sessionName);
+  killPersistentSession(target.backendType, target.sessionName, sessionId);
 }
 
 export function probePersistentSession(backendType: PersistentBackendType, name: string): SessionProbe {
   if (backendType === 'tmux') return TmuxBackend.probeSession(name);
   if (backendType === 'zellij') return ZellijBackend.probeSession(name);
+  if (backendType === 'zmx') return ZmxBackend.probeSession(name);
   return HerdrBackend.probeSession(name);
 }
 
 /**
- * Tri-state liveness of the backend's multiplexer SERVER itself (not one
- * session). The restore path consults this when a session probes 'missing' to
- * tell apart a true solo zombie (server up, this one pane gone → close) from a
- * machine reboot (server gone, every pane wiped at once → keep for lazy resume,
- * since the CLI transcript on disk is still resumable). See
- * TmuxBackend.serverState for the full rationale.
+ * Take one liveness snapshot for a set of backing-session names.
  *
- * herdr has no cheap server-liveness probe, so it returns 'unknown' →
- * the restore gate falls back to the prior (close-on-missing) behaviour for it.
+ * ZMX and Zellij expose all session states in one command, so probing each row
+ * separately would repeatedly scan the same control plane (and makes `botmux
+ * list` quadratic for ZMX). tmux and Herdr keep their established per-session
+ * probes, but duplicate names are still coalesced here.
  */
-export function probePersistentBackendServer(
+export function probePersistentSessions(
   backendType: PersistentBackendType,
-): 'running' | 'down' | 'unknown' {
-  if (backendType === 'tmux') return TmuxBackend.serverState();
-  if (backendType === 'zellij') return ZellijBackend.serverState();
-  return 'unknown';
+  names: Iterable<string>,
+): ReadonlyMap<string, SessionProbe> {
+  const uniqueNames = [...new Set(names)];
+  const result = new Map<string, SessionProbe>();
+
+  if (backendType === 'zmx') {
+    const snapshot = ZmxBackend.probeSessions();
+    for (const name of uniqueNames) {
+      result.set(
+        name,
+        !snapshot.ok
+          ? 'unknown'
+          : snapshot.sessions.includes(name)
+            ? 'exists'
+            : snapshot.unhealthySessions.includes(name)
+              ? 'unknown'
+              : 'missing',
+      );
+    }
+    return result;
+  }
+
+  if (backendType === 'zellij') {
+    const snapshot = ZellijBackend.probeLiveSessions();
+    for (const name of uniqueNames) {
+      result.set(name, !snapshot.ok ? 'unknown' : snapshot.sessions.includes(name) ? 'exists' : 'missing');
+    }
+    return result;
+  }
+
+  for (const name of uniqueNames) {
+    result.set(name, probePersistentSession(backendType, name));
+  }
+  return result;
 }
 
-/** Kill a backing session (each backend's killSession is a no-op when absent). */
-export function killPersistentSession(backendType: PersistentBackendType, name: string): void {
+/**
+ * Kill a backing session. ZMX additionally requires the complete botmux UUID:
+ * its public name contains only eight UUID characters, so name-only deletion
+ * could destroy a different session after a prefix collision.
+ */
+export function killPersistentSession(
+  backendType: PersistentBackendType,
+  name: string,
+  sessionId?: string,
+): void {
   if (backendType === 'tmux') TmuxBackend.killSession(name);
   else if (backendType === 'zellij') ZellijBackend.killSession(name);
+  else if (backendType === 'zmx') {
+    if (!sessionId) throw new Error(`refusing name-only ZMX kill for ${name}`);
+    ZmxBackend.killManagedSession(name, sessionId);
+  }
   else HerdrBackend.killSession(name);
 }

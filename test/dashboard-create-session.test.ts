@@ -15,6 +15,9 @@ import type { DaemonSession } from '../src/core/types.js';
 const store = new Map<string, Session>();
 let sessionSeq = 0;
 vi.mock('../src/services/session-store.js', () => ({
+  registerSessionBridgeSendMarkerCleanupFence: vi.fn(),
+  cleanupSessionBridgeSendMarkers: vi.fn(),
+  cleanupSessionBridgeSendMarkersNow: vi.fn(),
   createSession: vi.fn((chatId: string, rootMessageId: string, title: string, chatType?: 'group' | 'p2p'): Session => {
     const s: Session = {
       sessionId: `sess-${++sessionSeq}`,
@@ -64,14 +67,21 @@ vi.mock('../src/core/worker-pool.js', () => ({
   forkAdoptWorker: vi.fn(),
   adoptSandboxBlocked: vi.fn((botCfg, session) => botCfg?.sandbox === true || botCfg?.readIsolation === true || session?.sandbox === true || process.env.BOTMUX_SANDBOX === '1'),
   killStalePids: vi.fn(),
+  sweepDeadPidMarkers: vi.fn(),
   getCurrentCliVersion: vi.fn(() => 'test-cli-v1'),
   restoreUsageLimitRuntimeState: vi.fn(),
+  setActiveSessionIfActive: vi.fn((map: Map<string, any>, k: string, ds: any) => {
+    if (map.has(k) && map.get(k) !== ds) return false;
+    map.set(k, ds);
+    return true;
+  }),
   setActiveSessionSafe: vi.fn(async (map: Map<string, any>, k: string, ds: any) => {
     map.set(k, ds);
     return { accepted: true };
   }),
   getActiveSessionsRegistry: vi.fn(() => activeRegistryMock),
   isRelayableRealSession: vi.fn((ds: any) => !!ds?.worker || !!ds?.session?.cliId || !!ds?.session?.lastCliInput),
+  isDisposableCommandScratch: vi.fn(() => true),
   closeSession: (...a: any[]) => closeWorkerSessionMock(...a),
   promoteQueuedActivationTail: vi.fn(() => false),
   withActiveSessionKeyLock: vi.fn(async (_map: Map<string, any>, _key: string, action: () => any) => action()),
@@ -665,7 +675,7 @@ describe('spawnDashboardSession — backlog (待办池) parks without starting t
     expect(active.get(sessionKey('oc_healthy_1', APP))?.session.sessionId).toBe(healthy.sessionId);
   });
 
-  it('isolates a tail-promotion write failure, rolls the row back, and restores the later row', async () => {
+  it('isolates a tail-promotion write failure, quarantines the visible owner, and restores the later row', async () => {
     const failed: Session = {
       sessionId: 'failed-tail-promotion', chatId: CHAT, rootMessageId: CHAT, scope: 'chat', larkAppId: APP,
       title: 'bad tail', status: 'active', createdAt: new Date('2026-01-01T00:00:00Z').toISOString(),
@@ -688,7 +698,16 @@ describe('spawnDashboardSession — backlog (待办池) parks without starting t
     const active = new Map<string, DaemonSession>();
     await expect(restoreActiveSessions(active)).resolves.toBeUndefined();
 
-    expect(active.has(sessionKey(CHAT, APP))).toBe(false);
+    // P2 fix: a transient tail-promotion write failure must NOT drop the row
+    // unregistered (invisible orphan that IM /close cannot reach while a later
+    // inbound mints a duplicate). It is registered as a VISIBLE quarantined
+    // owner — anchor-occupied, closeable — and its unpromoted tail is retained
+    // for a fork-boundary retry. The promotion journal itself is rolled back.
+    const registered = active.get(sessionKey(CHAT, APP));
+    expect(registered?.session.sessionId).toBe(failed.sessionId);
+    expect(registered?.quarantinedActivationTailPromotion).toBe(true);
+    // Gate stays up so the old tail head can't be overtaken before its retry.
+    expect(registered?.initialStartPending).toBe(true);
     expect(failed.queuedActivationPending).toBeUndefined();
     expect(failed.queuedActivationTail?.[0]?.cliInput.content).toBe('TAIL_N');
     expect(active.get(sessionKey('oc_healthy_2', APP))?.session.sessionId).toBe(healthy.sessionId);
@@ -919,6 +938,35 @@ describe('spawnDashboardSession — guards', () => {
     expect(active.get(sessionKey(CHAT, APP))).toBe(incumbent);
     expect(closeWorkerSessionMock).not.toHaveBeenCalled();
     expect(forkWorkerMock).not.toHaveBeenCalled();
+  });
+
+  it('refuses before posting a banner when a quarantined persisted row reserves the chat anchor', async () => {
+    store.set('quarantined-session', {
+      sessionId: 'quarantined-session',
+      chatId: CHAT,
+      rootMessageId: 'om_old_task',
+      scope: 'chat',
+      larkAppId: APP,
+      title: 'old task',
+      status: 'active',
+      createdAt: '2026-07-31T00:00:00.000Z',
+      restoreQuarantinedAt: '2026-07-31T00:01:00.000Z',
+    });
+    const active = new Map<string, DaemonSession>();
+
+    const result = await spawnDashboardSession(active, undefined, {
+      larkAppId: APP,
+      chatId: CHAT,
+      content: '不要创建第二条会话',
+      column: 'in_progress',
+      role: 'solo',
+      postBanner: true,
+    });
+
+    expect(result).toEqual({ ok: false, error: 'session_exists' });
+    expect(sendMessageMock).not.toHaveBeenCalled();
+    expect([...store.keys()]).toEqual(['quarantined-session']);
+    expect(active.size).toBe(0);
   });
 });
 

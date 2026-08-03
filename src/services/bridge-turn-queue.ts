@@ -34,6 +34,7 @@ import {
   isMeaningfulQueuedCommand,
   extractTurnStartText,
   isClaudeTurnTerminalEvent,
+  isTranscriptRateLimitEvent,
   type TranscriptEvent,
 } from './claude-transcript.js';
 
@@ -237,6 +238,19 @@ export class BridgeTurnQueue {
         this.handleTurnStart(uuid, ev, sourceJsonlPath);
       } else if (role === 'assistant') {
         if ((ev as any).isSidechain === true) continue;
+        // The rate_limit API-error record (isApiErrorMessage + error:'rate_limit')
+        // is type:"assistant" with a human text block, but it is not a model
+        // reply — the worker surfaces it as a `limited` state via
+        // isTranscriptRateLimitEvent. Skip attribution so its text isn't leaked
+        // to Lark as a final_output. We intentionally do NOT set terminalObserved
+        // here: a rate-limited turn produced no real answer, so let the normal
+        // terminal marker (or retry) close it.
+        //
+        // Other API errors (server_error / authentication_failed / the
+        // terms-acceptance 400 / …) are NOT suppressed: they have no `limited`
+        // surface, so forwarding their text is the user's only signal that the
+        // request failed — matching pre-existing behavior.
+        if (isTranscriptRateLimitEvent(ev)) continue;
         const hasVisibleText = assistantHasVisibleText(ev.message?.content);
         if (hasVisibleText && !this.collecting) {
           // Headless local turn: an assistant boundary arrived without any

@@ -177,6 +177,49 @@ export function validateMentionDecision(args: MentionDecisionArgs): MentionDecis
   };
 }
 
+export interface MentionBackParticipantArgs {
+  /** Session chat type — 'p2p' is inherently 1v1 (no fetch needed). */
+  chatType?: 'group' | 'p2p';
+  /** Real (human) member count from getGroupStats — excludes bots. */
+  userCount: number;
+  /** Bot member count from getGroupStats. */
+  botCount: number;
+}
+
+/**
+ * Should `--mention-back` be blocked because the conversation has more than
+ * two participants (humans + bots)?
+ *
+ * Rationale (symmetric with the inbound @ gate in event-dispatcher.ts, which
+ * only lets an un-@ message through when `userCount <= 1 && botCount <= 1`):
+ * in a true 1v1 (`userCount + botCount <= 2`, e.g. 1 human + 1 bot, or a p2p
+ * DM) the triggerer IS the only counterpart, so auto-@-ing them back is safe
+ * and unambiguous. Once a third party joins, "whoever triggered this turn" is
+ * no longer reliably "who should be addressed" — a bystander's message can
+ * trigger the bot while the substantive reply belongs to someone else. There
+ * we force the model to make an explicit `--mention <ou:Name>` decision rather
+ * than blindly @-ing the last speaker.
+ *
+ * Note: this gates the MODEL-authored `botmux send --mention-back` only — the
+ * clear-headed path where the model chose to reply and can instead pick an
+ * explicit `--mention` in a busy group. The daemon fallback card
+ * (daemonCardFooterRecipientOpenId) is a separate, un-gated path that addresses
+ * the session owner: it fires only when the model made NO routing decision at
+ * all (forgot to send), so there is no reliable "who triggered this turn" to
+ * honour, and guessing the last conversant would mis-@ a peer bot on a purely
+ * local turn. Owner is the safe default there; real bot-to-bot handoffs go
+ * through this explicit `--mention` path.
+ *
+ * p2p short-circuits to `false` (no API round-trip). The caller passes
+ * getGroupStats' worst-case `{999,999}` soft-failure fallback, which yields
+ * `true` here → fail-closed to "make an explicit decision", never a silent
+ * wrong @.
+ */
+export function shouldBlockMentionBackByParticipants(args: MentionBackParticipantArgs): boolean {
+  if (args.chatType === 'p2p') return false;
+  return args.userCount + args.botCount > 2;
+}
+
 /**
  * Agent "raise-hand" attention flag for `botmux send --attention[=kind]`.
  *

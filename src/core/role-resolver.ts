@@ -237,19 +237,58 @@ function roleMetaFilePath(larkAppId: string, chatId: string): string {
   return join(config.session.dataDir, 'roles', larkAppId, `${chatId}.meta.json`);
 }
 
+/** Absolute path to the bot-level default role metadata sidecar (sits next to
+ *  the team role .md, keyed by app only — no chat). */
+function teamRoleMetaFilePath(larkAppId: string): string {
+  return join(config.session.dataDir, 'team-roles', `${larkAppId}.meta.json`);
+}
+
 /**
- * Read the injection mode for a (bot, chat). Defaults to 'every' when no
- * sidecar exists or it can't be parsed — i.e. legacy behavior is the default.
+ * Read the bot-level DEFAULT injection mode (applies to any chat that hasn't set
+ * its own). Defaults to 'every' (legacy) when unset/unparseable. This is the
+ * fallback consulted by readRoleInjectMode — it lets an operator make the bot's
+ * default role inject-once across all its chats from the Bot config page,
+ * without touching each chat individually.
  */
-export function readRoleInjectMode(larkAppId: string, chatId: string): RoleInjectMode {
-  if (!larkAppId || !chatId || !isValidRoleChatId(chatId)) return 'every';
+export function readTeamRoleInjectMode(larkAppId: string): RoleInjectMode {
+  if (!larkAppId) return 'every';
   try {
-    const fp = roleMetaFilePath(larkAppId, chatId);
+    const fp = teamRoleMetaFilePath(larkAppId);
     if (!existsSync(fp)) return 'every';
     const meta = JSON.parse(readFileSync(fp, 'utf-8')) as { inject?: unknown };
     return meta?.inject === 'once' ? 'once' : 'every';
   } catch {
     return 'every';
+  }
+}
+
+/** Persist the bot-level default injection mode. 'every' removes the sidecar. */
+export function writeTeamRoleInjectMode(larkAppId: string, mode: RoleInjectMode): void {
+  const fp = teamRoleMetaFilePath(larkAppId);
+  if (mode === 'once') {
+    mkdirSync(dirname(fp), { recursive: true });
+    atomicWriteFileSync(fp, JSON.stringify({ inject: 'once' }));
+  } else {
+    try { unlinkSync(fp); } catch { /* already absent */ }
+  }
+  logger.info(`[role] team inject mode app=${larkAppId} => ${mode}`);
+}
+
+/**
+ * Read the injection mode for a (bot, chat). A chat that set its own mode via
+ * 角色管理 wins (sidecar present ⇒ 'once'); otherwise we fall back to the
+ * bot-level default (readTeamRoleInjectMode), which itself defaults to 'every'
+ * — so legacy behavior is unchanged until an operator opts a bot into 'once'.
+ */
+export function readRoleInjectMode(larkAppId: string, chatId: string): RoleInjectMode {
+  if (!larkAppId || !chatId || !isValidRoleChatId(chatId)) return 'every';
+  try {
+    const fp = roleMetaFilePath(larkAppId, chatId);
+    if (!existsSync(fp)) return readTeamRoleInjectMode(larkAppId);
+    const meta = JSON.parse(readFileSync(fp, 'utf-8')) as { inject?: unknown };
+    return meta?.inject === 'once' ? 'once' : 'every';
+  } catch {
+    return readTeamRoleInjectMode(larkAppId);
   }
 }
 

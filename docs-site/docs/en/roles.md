@@ -2,6 +2,8 @@
 
 Give each bot an independent persona per group, and form a "team roster" during multi-bot collaboration. The command is `/role`.
 
+> This page covers two related but distinct capabilities: **`/role` personas** (one persona per bot, overridable per group — see below) and **[Role Switch](#role-switch)** (one bot owning multiple full roles, each with independent memory, switched by natural language per topic — an advanced feature).
+
 ## Two-Tier Role (Persona)
 
 | Command | Effect |
@@ -82,3 +84,29 @@ On the **Team** panel of `botmux dashboard`, you can invite **someone else's dep
 - **Team management**: creating a team, generating an invite code, and joining someone else's team are all on the "Team Management" subpage.
 
 > Suitable for multi-person / multi-machine collaboration: everyone runs their own botmux deployment, discovers each other's bots through a team federation, and collaborates in the same Lark group.
+
+## Role Switch
+
+> ⚠️ Advanced feature — requires deploying a "role library" first, and currently supports Claude Code only. Deployment steps are in the [role-system deploy runbook](https://github.com/deepcoldy/botmux/blob/master/docs/roles/deploy-runbook.md); the below covers **how end users use it once deployed**.
+
+Unlike `/role` above (a single persona, overridable per group), **role switch** gives one bot **multiple full roles**, each with its own persona **and independent memory** — switch to "After-sales" and it carries the after-sales persona plus memory accumulated only for after-sales; switch to "PM" and it's a whole different set. Roles take effect **per topic**; new topics start from the default role.
+
+### How to use it (pure natural language, no command to memorize)
+
+| You say | What the bot does |
+|---------|-------------------|
+| "switch role" / "what roles are there" | Lists the roles available to you (shared ones + ones you created), numbered for you to pick |
+| "switch to After-sales" / reply with a number | Confirms, then switches; this topic is now answered by that role, and the card footer shows its name |
+| "new role: Xiaohongshu ops, familiar with our brand voice" | Drafts a persona for your confirmation → creates it → switches to it automatically |
+| "distill knowledge" | Distills the role's recent memory into structured domain knowledge fed back into itself (optionally distilled into a Lark doc for human review) |
+
+The user side is **all natural language** — under the hood the model calls `botmux role switch <role-dir>` (hard-validated by the daemon to stay inside the role library); you neither need to nor should type that command by hand.
+
+### Key points
+
+- **Private + shared (a protocol-layer convention, NOT daemon-enforced isolation)**: role listing and "switch to X" visibility are filtered by the role protocol (`_role-protocol.md`) on the sender's open_id — shared roles plus roles under your own `users/<your open_id>/` are visible and switchable; others' private roles are, by protocol convention, not listed or switchable. ⚠️ This is **protocol-layer behavior, not a security boundary**: the daemon only hard-validates that the target directory stays inside the role-library root `~/botmux-roles`; it does NOT do per-sender directory-level ACL. If you need private roles as hard isolation, add OS-level permissions yourself — do not rely on this protocol convention as a security guarantee.
+- **Independent memory**: one memory bucket per role, shared across groups / topics — the same role gets better at its domain the more it's used.
+- **Context preserved**: switching restarts the process with `--resume`, so the prior conversation carries over, and the new role's persona and memory load automatically at the new session's start.
+- **Distinct from `/cd`**: the slash command `/cd <path>` (see [Slash Commands](/en/slash-commands)) is the general "change working directory and restart", any directory, owner operate permission; role switch stays inside the role library and is driven by the role protocol — they are not the same thing.
+
+> The former command name `botmux cd` is now `botmux role switch` (the old name is kept as a fail-loud error hint and no longer performs a switch). When maintaining an existing deployment, remember to refresh the `_role-protocol.md` in the role library to the new command name.

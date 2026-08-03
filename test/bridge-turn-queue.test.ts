@@ -66,6 +66,45 @@ describe('BridgeTurnQueue', () => {
     expect(q.size()).toBe(0);
   });
 
+  it('does not attribute a rate_limit API-error record as the turn reply', () => {
+    // The rate_limit record is type:"assistant" with a human text block, but
+    // the worker surfaces it as a `limited` state; it must NOT become the
+    // turn's assistantUuids (that would forward the raw error line to Lark).
+    const q = new BridgeTurnQueue();
+    q.mark('t1');
+    const rateErr: TranscriptEvent = {
+      type: 'assistant',
+      uuid: 'rl1',
+      isApiErrorMessage: true,
+      error: 'rate_limit',
+      apiErrorStatus: 429,
+      message: { role: 'assistant', content: [{ type: 'text', text: "You've hit your session limit · resets 10:40pm" }], stop_reason: 'stop_sequence' },
+    };
+    q.ingest([user('u1'), rateErr]);
+    // Turn started (user matched) but collected no real reply → held back,
+    // not emitted with the error text.
+    expect(q.peek()[0]?.assistantUuids ?? []).toEqual([]);
+    expect(q.drainEmittable()).toEqual([]);
+  });
+
+  it('still forwards a non-rate API error (server_error) as the turn text', () => {
+    // server_error / auth failures have no `limited` surface, so their text is
+    // the user's only failure signal — keep attributing them (pre-existing behavior).
+    const q = new BridgeTurnQueue();
+    q.mark('t1');
+    const srvErr: TranscriptEvent = {
+      type: 'assistant',
+      uuid: 'se1',
+      isApiErrorMessage: true,
+      error: 'server_error',
+      message: { role: 'assistant', content: [{ type: 'text', text: 'API Error: 500 internal server error' }], stop_reason: 'stop_sequence' },
+    };
+    q.ingest([user('u1'), srvErr]);
+    const ready = q.drainEmittable();
+    expect(ready.length).toBe(1);
+    expect(ready[0].assistantUuids).toEqual(['se1']);
+  });
+
   it('back-to-back Lark messages without idle: each turn keeps its own uuids', () => {
     const q = new BridgeTurnQueue();
     q.mark('t1');

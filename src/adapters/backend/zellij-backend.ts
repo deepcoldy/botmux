@@ -6,7 +6,8 @@ import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { SessionBackend, SpawnOpts, SessionProbe } from './types.js';
 import { zellijEnv, probeZellijFunctional } from '../../setup/ensure-zellij.js';
-import { resolveUserShell, buildBotmuxEnvAssignments, SHELL_WRAPPER_SCRIPT, shellLaunchArgv } from './tmux-backend.js';
+import { resolveUserShell, buildBotmuxEnvAssignments, shellWrapperScript, shellLaunchArgv } from './tmux-backend.js';
+import { resolveBotmuxWrapperBinDir } from '../../core/botmux-wrapper.js';
 import { logger } from '../../utils/logger.js';
 
 /**
@@ -118,22 +119,6 @@ export class ZellijBackend implements SessionBackend {
     const probe = ZellijBackend.probeLiveSessions();
     if (!probe.ok) return 'unknown';
     return probe.sessions.includes(name) ? 'exists' : 'missing';
-  }
-
-  /**
-   * Tri-state liveness of the zellij SERVER (not a specific session). Mirrors
-   * TmuxBackend.serverState — see that doc for why 'missing' must be
-   * disambiguated before driving a destructive restore-time close.
-   *
-   *   - 'running' — list-sessions succeeded with ≥1 live session.
-   *   - 'down'    — list-sessions succeeded with ZERO live sessions, i.e. nothing
-   *                 survives (a machine reboot wipes every session at once).
-   *   - 'unknown' — list-sessions failed/timed out (can't tell).
-   */
-  static serverState(): 'running' | 'down' | 'unknown' {
-    const probe = ZellijBackend.probeLiveSessions();
-    if (!probe.ok) return 'unknown';
-    return probe.sessions.length > 0 ? 'running' : 'down';
   }
 
   /** Kill + purge a session (so no resurrectable corpse accumulates). */
@@ -327,7 +312,7 @@ export function buildLayoutString(bin: string, args: string[], opts: SpawnOpts):
   // command; the rest are leading args before the wrapper script flags.
   const [cmd, ...launchArgs] = shellLaunchArgv(shellSpec.shell, shellSpec.flags);
   const paneArgs = [
-    ...launchArgs, '-c', SHELL_WRAPPER_SCRIPT, '_',
+    ...launchArgs, '-c', shellWrapperScript(resolveBotmuxWrapperBinDir(opts.env ?? process.env)), '_',
     opts.cwd,
     ...envAssignments,
     bin, ...args,

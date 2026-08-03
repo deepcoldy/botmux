@@ -154,8 +154,9 @@ export function createOpenCodeAdapter(pathOverride?: string): CliAdapter {
   return {
     id: 'opencode',
     // Whole dir kept REAL, not just auth.json: opencode keeps its global SQLite DB
-    // (opencode.db, WAL mode) here, and the sandbox home overlay lacks the POSIX
-    // fcntl locks SQLite needs (same failure as codex, see codex.ts).
+    // (opencode.db, WAL mode) here. Under the deny-by-default file sandbox a path
+    // not in authPaths doesn't exist, so the DB is unreachable / can't get the
+    // POSIX fcntl locks SQLite needs (same failure as codex, see codex.ts).
     authPaths: ['~/.local/share/opencode'],
     get resolvedBin(): string { return (cachedBin ??= resolveCommand(rawBin)); },
 
@@ -198,7 +199,7 @@ export function createOpenCodeAdapter(pathOverride?: string): CliAdapter {
 
     /** Resume 目标预检：id 不在 session 表 → false（worker 落回全新会话并提示），
      *  避免 `Session not found` exit 1 被放大成自动重启 crash-loop。DB 读不了
-     *  （node:sqlite 缺失 / 首次运行 / sandbox overlay 挡住）→ undefined，交给
+     *  （node:sqlite 缺失 / 首次运行 / sandbox 未授权该 DB 路径）→ undefined，交给
      *  worker 的二级重启护栏。 */
     checkResumeTargetExists({ sessionId, cliSessionId }) {
       const sid = isOpenCodeSessionId(cliSessionId) ? cliSessionId : latestOpenCodeSessionForBotmuxSession(sessionId);
@@ -265,7 +266,7 @@ export function createOpenCodeAdapter(pathOverride?: string): CliAdapter {
       }
 
       // DB-backed submit verification + cliSessionId 捕获。node:sqlite 不可用或
-      // DB 缺失（首次运行 / sandbox overlay）→ 维持旧行为：盲发、假定成功。
+      // DB 缺失（首次运行 / sandbox 未授权该 DB 路径）→ 维持旧行为：盲发、假定成功。
       if (baseline === null) return undefined;
 
       for (let attempt = 0; attempt < 3; attempt++) {

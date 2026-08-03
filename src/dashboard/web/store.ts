@@ -39,12 +39,12 @@ class Store {
     }
   }
 
-  upsertSessions(rows: Session[]) {
-    for (const r of rows) this.sessions.set(r.sessionId, r);
-    this.emit();
-  }
-  upsertSchedules(rows: Schedule[]) {
-    for (const r of rows) this.schedules.set(r.id, r);
+  replaceSnapshot(rows: Session[], schedules: Schedule[], scheduleTimeZone?: string) {
+    this.sessions.clear();
+    for (const row of rows) this.sessions.set(row.sessionId, row);
+    this.schedules.clear();
+    for (const schedule of schedules) this.schedules.set(schedule.id, schedule);
+    if (scheduleTimeZone) this.scheduleTimeZone = scheduleTimeZone;
     this.emit();
   }
   applySse(type: string, body: any) {
@@ -99,28 +99,79 @@ class Store {
 export const store = new Store();
 
 export async function bootstrap() {
-  const [s, sch] = await Promise.all([
-    fetch('/api/sessions').then(r => r.json()),
-    fetch('/api/schedules').then(r => r.json()),
-  ]);
-  store.upsertSessions(s.sessions ?? []);
-  store.upsertSchedules(sch.schedules ?? []);
-  if (typeof sch.timezone === 'string') store.setScheduleTimeZone(sch.timezone);
-
+  // Establish SSE before fetching snapshots, then buffer events while each
+  // authoritative snapshot is installed.
+  const buffered: Array<{ type: string; body: any }> = [];
+  let snapshotReady = false;
   const es = new EventSource('/events');
   const types = [
     'session.spawned', 'session.update', 'session.exited',
     'schedule.created', 'schedule.updated', 'schedule.deleted',
     'schedule.fired', 'schedule.timezone', 'bots.changed', 'heartbeat',
   ];
-  for (const t of types) {
-    es.addEventListener(t, e => {
+  for (const type of types) {
+    es.addEventListener(type, e => {
       try {
         const data = JSON.parse((e as MessageEvent).data);
-        store.applySse(t, data.body ?? data);
+        const body = data.body ?? data;
+        if (snapshotReady) store.applySse(type, body);
+        else buffered.push({ type, body });
       } catch { /* skip malformed */ }
     });
   }
+
+  let syncInFlight: Promise<void> | null = null;
+  let requestedReconcile = 0;
+  let completedReconcile = 0;
+  const reconcileSnapshot = (): Promise<void> => {
+    requestedReconcile += 1;
+    if (syncInFlight) return syncInFlight;
+    syncInFlight = (async () => {
+      while (completedReconcile < requestedReconcile) {
+        const generation = requestedReconcile;
+        snapshotReady = false;
+        try {
+          const [s, sch] = await Promise.all([
+            fetch('/api/sessions').then(r => r.json()),
+            fetch('/api/schedules').then(r => r.json()),
+          ]);
+          store.replaceSnapshot(
+            s.sessions ?? [],
+            sch.schedules ?? [],
+            typeof sch.timezone === 'string' ? sch.timezone : undefined,
+          );
+          completedReconcile = generation;
+        } finally {
+          snapshotReady = true;
+          for (const event of buffered.splice(0)) {
+            store.applySse(event.type, event.body);
+          }
+        }
+      }
+    })().finally(() => {
+      syncInFlight = null;
+    });
+    return syncInFlight;
+  };
+
   es.onerror = () => store.setOnline(false);
-  es.onopen = () => store.setOnline(true);
+  es.onopen = () => {
+    store.setOnline(true);
+    // Reconcile on EVERY open, first one included. Constructing an EventSource
+    // does not mean the server-side listener exists yet, so a snapshot taken
+    // before this point can miss whatever happened in that window; a reconnect
+    // can additionally miss deletes, which only a fresh snapshot converges.
+    // reconcileSnapshot coalesces, so overlapping calls collapse into one extra
+    // round instead of a fetch per event.
+    void reconcileSnapshot().catch(() => {
+      // The live stream remains useful; the next open retries the snapshot.
+    });
+  };
+
+  // Never gate the first snapshot on `onopen`: a buffering reverse proxy can
+  // delay the stream indefinitely, and a board with slightly stale rows beats
+  // an empty one. On failure the stream is deliberately left open so
+  // EventSource keeps retrying on its own and the open handler above recovers
+  // without a manual refresh.
+  await reconcileSnapshot();
 }

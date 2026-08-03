@@ -35,24 +35,46 @@ interface InternalPending extends Omit<PendingAsk, 'selections'> {
 const pending = new Map<string, InternalPending>();
 let dispatcher: AskCardDispatcher | null = null;
 
+/** Optional actor context for the talk check. Card-click paths (toggle/submit)
+ *  omit it — Lark card-action callbacks carry no sender union / bot flag, so the
+ *  checker degrades to the human `evaluateTalk(openId, chatType)`. The custom
+ *  text-reply path (submitCustomReply) DOES have the full message event, so it
+ *  passes actor context and the checker dispatches to the same predicate as the
+ *  dispatcher gate / quota recheck (bot → evaluateBotTalk, human → evaluateTalk
+ *  with the teamMember union leg). Without this, a cross-deployment team bot or a
+ *  platform teamMember human answering by text is wrongly rejected. */
+export interface AskAnswerActor {
+  /** Feishu-stamped bot sender (sender_type ∈ app|bot, or a cross-ref sibling). */
+  botSender?: boolean;
+  /** Bot-locked union (evaluateTalk teamBot leg / evaluateBotTalk). */
+  senderUnionId?: string;
+  /** Raw sender union (evaluateTalk teamMember leg — may be a human union). */
+  memberUnionId?: string;
+}
+
 /** IM-side canTalk predicate, wired by the daemon at bootstrap. Lets the broker
  *  honour the bot's canTalk gate without importing Lark types: whoever may
  *  address the bot in this chat may answer its `botmux ask`. Returns false until
- *  wired, so an unwired broker authorizes no one (daemon always wires it). */
-let canTalkChecker: ((larkAppId: string, chatId: string, openId: string, chatType?: 'group' | 'p2p') => boolean) | null = null;
+ *  wired, so an unwired broker authorizes no one (daemon always wires it).
+ *  `actor` carries optional union / bot context (see AskAnswerActor); omitted on
+ *  card-click paths, supplied on the text-reply path. */
+let canTalkChecker:
+  | ((larkAppId: string, chatId: string, openId: string, chatType?: 'group' | 'p2p', actor?: AskAnswerActor) => boolean)
+  | null = null;
 
 /** Wire the canTalk predicate. Called once during daemon bootstrap. */
 export function setCanTalkChecker(
-  fn: (larkAppId: string, chatId: string, openId: string, chatType?: 'group' | 'p2p') => boolean,
+  fn: (larkAppId: string, chatId: string, openId: string, chatType?: 'group' | 'p2p', actor?: AskAnswerActor) => boolean,
 ): void {
   canTalkChecker = fn;
 }
 
 /** A click is authorized iff the clicker may `canTalk` to the bot in this chat.
  *  `botmux ask` is a talk-level interaction (answering the agent's question),
- *  so it follows the canTalk gate — not the stricter canOperate / allowedUsers. */
-function isAuthorizedToAnswer(ask: InternalPending, by: string): boolean {
-  return canTalkChecker?.(ask.larkAppId, ask.chatId, by, ask.chatType) ?? false;
+ *  so it follows the canTalk gate — not the stricter canOperate / allowedUsers.
+ *  `actor` is only supplied by the text-reply path; card clicks omit it. */
+function isAuthorizedToAnswer(ask: InternalPending, by: string, actor?: AskAnswerActor): boolean {
+  return canTalkChecker?.(ask.larkAppId, ask.chatId, by, ask.chatType, actor) ?? false;
 }
 
 /** Window during which a settled ask is still queryable so race-losers get a
@@ -266,18 +288,23 @@ export function submitAsk(args: {
  * 不需要 nonce：调用方（daemon 消息路由）用 `findPendingAskByAnchor` 从在线
  * pending 表按话题 anchor 查到 askId，本身就排除了「重启后的陈旧卡片」场景。
  *
+ * `actor`：文字作答路径拿得到完整消息事件，把 bot / union context 传进来，让 talk
+ * 判定与 dispatcher 外层闸 / quota 复查同源（bot → evaluateBotTalk，人 → evaluateTalk
+ * 的 teamMember union 腿）。不传则退化为纯 open_id 判定（与卡片点击一致）。
+ *
  * 成功返回 `'accepted'`；非法返回对应 AskClickOutcome。
  */
 export function submitCustomReply(args: {
   askId: string;
   by: string;
   text: string;
+  actor?: AskAnswerActor;
 }): AskClickOutcome {
   gcSettled();
   const ask = pending.get(args.askId);
   if (!ask) return 'stale';
   if (ask.settled) return 'already_settled';
-  if (!isAuthorizedToAnswer(ask, args.by)) return 'unauthorized';
+  if (!isAuthorizedToAnswer(ask, args.by, args.actor)) return 'unauthorized';
   const text = args.text.trim();
   if (!text) return 'stale';
 
@@ -439,6 +466,51 @@ export function _pendingCount(): number {
 export function getAskSnapshot(askId: string): PendingAsk | undefined {
   const a = pending.get(askId);
   return a ? snapshot(a) : undefined;
+}
+
+/** List unsettled asks for Desktop / dashboard aggregation (read-only snapshots). */
+export function listPendingAsks(): PendingAsk[] {
+  gcSettled();
+  const out: PendingAsk[] = [];
+  for (const ask of pending.values()) {
+    if (!ask.settled) out.push(snapshot(ask));
+  }
+  return out;
+}
+
+/**
+ * Desktop / trusted-host answer path. Bypasses canTalk (no Feishu openId) —
+ * caller must be authenticated as the local dashboard/desktop operator.
+ */
+export function submitAskFromDesktop(args: {
+  askId: string;
+  /** Selected option keys per question (same shape as submitAsk selections). */
+  selections: ReadonlyArray<ReadonlyArray<string>>;
+  by?: string;
+}): AskClickOutcome {
+  gcSettled();
+  const ask = pending.get(args.askId);
+  if (!ask) return 'stale';
+  if (ask.settled) return 'already_settled';
+
+  const answers = args.selections;
+  for (let i = 0; i < ask.questions.length; i++) {
+    const q = ask.questions[i]!;
+    const sel = answers[i] ?? [];
+    if (!q.multiSelect && sel.length !== 1) return 'stale';
+    for (const key of sel) {
+      if (!q.options.some((o) => o.key === key)) return 'stale';
+    }
+  }
+
+  settle(args.askId, {
+    kind: 'answered',
+    answers,
+    by: args.by ?? 'desktop',
+    comment: null,
+    timedOut: false,
+  });
+  return 'accepted';
 }
 
 /** Read a pending ask by id — for tests only. Returns a snapshot; mutating it

@@ -4,6 +4,10 @@ import {
   CodexAppControlProofDeadline,
   codexAppSignedStateReadiness,
 } from '../src/utils/codex-app-control.js';
+import {
+  CodexRunnerFreshnessInputQueue,
+  type CodexRunnerFreshnessState,
+} from '../src/services/codex-runner-freshness.js';
 
 const workerSource = readFileSync(new URL('../src/worker.ts', import.meta.url), 'utf8');
 
@@ -20,14 +24,19 @@ describe('worker app-runner control-channel wiring', () => {
     const flushEnd = workerSource.indexOf('function sendToPty', flushStart);
     const flush = workerSource.slice(flushStart, flushEnd);
     const reserveIdx = flush.indexOf('codexAppTurnDispatchQueue.reserve(');
-    const writeIdx = flush.indexOf('await cliAdapter.writeStructuredInput(');
+    // The master merge wraps the structured write in runAmbiguousSubmissionTransaction,
+    // so the call is now a `() => targetAdapter.writeStructuredInput!(...)` thunk
+    // (was `await cliAdapter.writeStructuredInput(...)` pre-merge).
+    const writeIdx = flush.indexOf('() => targetAdapter.writeStructuredInput!(');
     expect(reserveIdx).toBeGreaterThan(-1);
     expect(writeIdx).toBeGreaterThan(reserveIdx);
     expect(flush).toContain("result.submissionDisposition === 'untouched'");
     expect(flush).toContain("result.submissionDisposition === 'flushed_invalid'");
     expect(flush).toContain('input buffer is not provably clean');
-    expect(flush).toContain('if (backend && dispatchStillPending) scheduleSubmitFailureNotify(');
+    // Submit-failure notify is now a guarded block (recoveryFailureReason branch +
+    // scheduleSubmitFailureNotify) rather than a single-line call after the merge.
     expect(flush).toContain('if (backend && dispatchStillPending) {');
+    expect(flush).toContain('scheduleSubmitFailureNotify(');
     const safeRetryStart = flush.indexOf('const retryQueuedActivation =');
     const retryTransition = flush.indexOf("retryQueuedActivation ? 'retry' : 'cancel'", safeRetryStart);
     const requeue = flush.indexOf('requeueUnsubmittedQueuedActivation(item);', retryTransition);
@@ -228,5 +237,120 @@ describe('worker app-runner control-channel wiring', () => {
     expect(commitIdx).toBeGreaterThan(destroyIdx);
     expect(ackIdx).toBeGreaterThan(commitIdx);
     expect(handler).toContain("if (finalResult.status === 'accepted') return;");
+  });
+
+  it('holds stale-busy normal and raw input across old idle and releases only at fresh prompt-ready', () => {
+    let state: CodexRunnerFreshnessState = 'stale_waiting_idle';
+    const queue = new CodexRunnerFreshnessInputQueue<string, string>(
+      () => state,
+      next => { state = next; },
+    );
+    const oldRunnerWrites: string[] = [];
+    const replacementWrites: string[] = [];
+    // Model freshness queue hold/release semantics; production flushPending
+    // delivers at most one raw input per invocation before normal inputs.
+    const flush = (writes: string[]): void => {
+      const raw = queue.takeRaw();
+      if (raw) writes.push(`raw:${raw}`);
+      let normal: string | undefined;
+      while ((normal = queue.takeNormal()) !== undefined) writes.push(`normal:${normal}`);
+    };
+
+    queue.enqueueNormal('normal-one');
+    queue.enqueueRaw('/raw-one');
+    flush(oldRunnerWrites);
+    expect(oldRunnerWrites).toEqual([]);
+    expect(queue.normal).toEqual(['normal-one']);
+    expect(queue.raw).toEqual(['/raw-one']);
+
+    // The old busy runner's first idle is consumed as the reload boundary.
+    expect(queue.onPromptReady()).toBe('reload');
+    expect(state).toBe('restarting_fresh');
+    queue.enqueueNormal('normal-during-replacement');
+    queue.enqueueRaw('/raw-during-replacement');
+    flush(oldRunnerWrites);
+    expect(oldRunnerWrites).toEqual([]);
+    expect(queue.normal).toEqual(['normal-one', 'normal-during-replacement']);
+    expect(queue.raw).toEqual(['/raw-one', '/raw-during-replacement']);
+
+    // Only the replacement's prompt-ready makes dequeue possible.
+    expect(queue.onPromptReady()).toBe('publish_ready');
+    expect(state).toBe('current');
+    flush(replacementWrites);
+    expect(replacementWrites).toEqual([
+      'raw:/raw-one',
+      'normal:normal-one',
+      'normal:normal-during-replacement',
+    ]);
+    expect(queue.raw).toEqual(['/raw-during-replacement']);
+    flush(replacementWrites);
+    expect(replacementWrites).toEqual([
+      'raw:/raw-one',
+      'normal:normal-one',
+      'normal:normal-during-replacement',
+      'raw:/raw-during-replacement',
+    ]);
+    expect(queue.normal).toEqual([]);
+    expect(queue.raw).toEqual([]);
+
+    // The worker's actual queue transitions must stay wired to this tested
+    // seam; source loading is intentionally avoided because worker.ts starts
+    // process-wide IPC and runtime services at module evaluation time.
+    expect(workerSource).toContain('freshnessInputQueue.enqueueNormal(next)');
+    expect(workerSource).toContain('freshnessInputQueue.enqueueRaw(msg)');
+    expect(workerSource).toContain('freshnessInputQueue.takeNormal()');
+    expect(workerSource).toContain('freshnessInputQueue.takeRaw()');
+    expect(workerSource).toContain('freshnessInputQueue.onPromptReady()');
+    expect(workerSource).toContain(
+      "restartCliProcess('stale runner reached idle', { immediate: true, preservePending: true })",
+    );
+  });
+
+  it('keeps both input kinds held after replacement failure', () => {
+    let state: CodexRunnerFreshnessState = 'restarting_fresh';
+    const queue = new CodexRunnerFreshnessInputQueue<string, string>(
+      () => state,
+      next => { state = next; },
+    );
+    queue.enqueueNormal('normal-held');
+    queue.enqueueRaw('/raw-held');
+
+    queue.onReplacementFailed();
+    expect(queue.onPromptReady()).toBe('ignore');
+    expect(state).toBe('failed');
+    expect(queue.takeNormal()).toBeUndefined();
+    expect(queue.takeRaw()).toBeUndefined();
+    expect(queue.normal).toEqual(['normal-held']);
+    expect(queue.raw).toEqual(['/raw-held']);
+    expect(workerSource).toContain('freshnessInputQueue.onReplacementFailed()');
+  });
+
+  it('notifies preview observers when the signed Codex App final suppresses on explicit botmux send', () => {
+    // Regression guard for F3: PR #597 moved codex-app finals OFF the master
+    // `if (marker.appTurnId)` OSC branch onto the signed-socket handler
+    // (handleTrustedCodexAppMarker, kind==='final'). That signed suppress path
+    // forwards final_output with suppressDelivery:true, which the daemon
+    // short-circuits WITHOUT calling deliverFinalOutput — the only site that
+    // otherwise marks a run-preview replied. So the signed suppress branch must
+    // itself call notifyExplicitReplyObserved, symmetric with the bridge-fallback
+    // branches — otherwise a run-preview session shows "running" forever after
+    // the model's explicit botmux send.
+    const markerStart = workerSource.indexOf('async function handleTrustedCodexAppMarker(');
+    const markerEnd = workerSource.indexOf('function handleAppRunnerOscMarker(', markerStart);
+    const marker = workerSource.slice(markerStart, markerEnd);
+    const suppressIdx = marker.indexOf('final_output suppressed');
+    expect(suppressIdx).toBeGreaterThan(-1);
+    // Within the signed suppress block, the observer notification must fire
+    // against the FIFO-attributed turnId (before the final_output IPC).
+    const suppressBlock = marker.slice(suppressIdx, suppressIdx + 900);
+    expect(suppressBlock).toMatch(/notifyExplicitReplyObserved\(\s*turnId/);
+    expect(suppressBlock).toContain('explicitReplyMarkerForTurnWindow(gateInput');
+    // The notify precedes the suppressed final_output forward (suppressDelivery).
+    const notifyIdx = marker.indexOf('notifyExplicitReplyObserved(', suppressIdx);
+    const suppressedFinalIdx = marker.indexOf('suppressDelivery: true', suppressIdx);
+    expect(notifyIdx).toBeGreaterThan(-1);
+    expect(suppressedFinalIdx).toBeGreaterThan(notifyIdx);
+    // Both the signed final and the bridge-fallback paths notify — never just one.
+    expect((workerSource.match(/notifyExplicitReplyObserved\(/g) ?? []).length).toBeGreaterThanOrEqual(2);
   });
 });

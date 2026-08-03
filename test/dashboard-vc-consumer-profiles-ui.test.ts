@@ -6,6 +6,7 @@ import {
   VcConsumerProfilesSection,
 } from '../src/dashboard/web/vc-consumer-profiles-section.js';
 import { createDashboardTranslator } from '../src/dashboard/web/i18n.js';
+import { VC_MEETING_CONSUMER_PROFILE_TEMPLATE_CATALOG } from '../src/services/vc-meeting-consumer-profile-templates.js';
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
@@ -46,6 +47,7 @@ function catalogBody(bot: string, over: Json = {}): Json {
       appId: 'app_agent', label: 'Agent', online: true, workingDirReady: true, reliableTurnTerminal: true,
       managedSideEffectIsolation: true,
     }],
+    templateCatalog: VC_MEETING_CONSUMER_PROFILE_TEMPLATE_CATALOG,
     ...over,
   };
 }
@@ -96,13 +98,25 @@ function textInputs(r: TestRenderer.ReactTestRenderer): TestRenderer.ReactTestIn
   return r.root.findAllByType('input').filter(input => input.props.type === 'text');
 }
 
-/** 每张卡两个文本框（id、label）：idInput(n) 取第 n 张卡的 id 输入框。 */
-function idInput(r: TestRenderer.ReactTestRenderer, card: number): TestRenderer.ReactTestInstance {
-  return textInputs(r)[card * 2];
+/** 详情弹窗里固定两个文本框（id、label）。 */
+function idInput(r: TestRenderer.ReactTestRenderer, _card = 0): TestRenderer.ReactTestInstance {
+  return textInputs(r)[0];
 }
 
-function labelInput(r: TestRenderer.ReactTestRenderer, card: number): TestRenderer.ReactTestInstance {
-  return textInputs(r)[card * 2 + 1];
+function labelInput(r: TestRenderer.ReactTestRenderer, _card = 0): TestRenderer.ReactTestInstance {
+  return textInputs(r)[1];
+}
+
+function profileCards(r: TestRenderer.ReactTestRenderer): TestRenderer.ReactTestInstance[] {
+  return r.root.findAllByProps({ className: 'vc-profile-summary-card' });
+}
+
+async function openProfile(r: TestRenderer.ReactTestRenderer, index: number): Promise<void> {
+  await act(async () => { profileCards(r)[index].props.onClick(); });
+}
+
+async function closeProfile(r: TestRenderer.ReactTestRenderer): Promise<void> {
+  await act(async () => { buttonByClass(r, 'vc-profile-dialog-done')!.props.onClick(); });
 }
 
 function buttonByClass(
@@ -119,7 +133,7 @@ function saveButton(r: TestRenderer.ReactTestRenderer): TestRenderer.ReactTestIn
 /** 「新增预设」按钮：className 恰为 vc-profiles-link（remove/reload 带附加类）。 */
 function addButton(r: TestRenderer.ReactTestRenderer): TestRenderer.ReactTestInstance | undefined {
   return r.root.findAllByType('button')
-    .find(button => String(button.props.className ?? '') === 'vc-profiles-link');
+    .find(button => String(button.props.className ?? '').split(' ').includes('vc-profile-add'));
 }
 
 function optionButton(
@@ -135,18 +149,15 @@ function clickOption(button: TestRenderer.ReactTestInstance): Promise<void> {
 }
 
 function setInput(input: TestRenderer.ReactTestInstance, value: string): Promise<void> {
-  return act(async () => { input.props.onChange({ target: { value } }); });
+  return act(async () => { input.props.onChange({ target: { value }, currentTarget: { value } }); });
 }
 
 /** defaultConsumerIds 勾选框：文本恰为 profile id/label 的 vc-profile-check。 */
 function defaultConsumerCheckbox(
   r: TestRenderer.ReactTestRenderer, label: string,
 ): TestRenderer.ReactTestInstance | undefined {
-  const holder = r.root.findAll(node =>
-    node.type === 'label'
-    && String(node.props.className ?? '') === 'vc-profile-check'
-    && textOf(node) === label)[0];
-  return holder?.findByType('input');
+  const card = profileCards(r).find(node => textOf(node).includes(label));
+  return card?.findAllByType('input').find(input => input.props.type === 'checkbox');
 }
 
 function putCalls(fetchMock: ReturnType<typeof vi.fn>): Json[] {
@@ -205,6 +216,7 @@ describe('VcConsumerProfilesSection · 加载与竞态', () => {
     // B 先返回并提交
     gets.get('B')!.resolve(jsonRes(200, catalogBody('B')));
     await flush();
+    await openProfile(r, 0);
     expect(idInput(r, 0).props.value).toBe('B-profile');
 
     // 慢 A 随后返回：token 已过期，必须被丢弃
@@ -239,6 +251,7 @@ describe('VcConsumerProfilesSection · 加载与竞态', () => {
   it('blocks props-driven auto-follow while dirty, then converges after saving', async () => {
     const fetchMock = stubFetchImmediate({ A: catalogBody('A'), B: catalogBody('B') });
     const r = await mount();
+    await openProfile(r, 0);
     await setInput(labelInput(r, 0), 'edited');
 
     // props 变更：dirty → 不自动跟随，不发 GET B
@@ -255,11 +268,47 @@ describe('VcConsumerProfilesSection · 加载与竞态', () => {
       !(call[1] as RequestInit | undefined)?.method
       && new URL(String(call[0]), 'http://h').searchParams.get('listenerBotAppId') === 'B'))
       .toBe(true);
+    await openProfile(r, 0);
     expect(idInput(r, 0).props.value).toBe('B-profile');
   });
 });
 
 describe('VcConsumerProfilesSection · Listener 归属与语义文案', () => {
+  it('shows the built-in library and copies templates into detached editable profiles', async () => {
+    const fetchMock = stubFetchImmediate({ A: catalogBody('A') });
+    const r = await mount();
+
+    expect(r.root.findAllByProps({ className: 'vc-profile-template-card' })).toHaveLength(5);
+    expect(textOf(r.root)).toContain('会议纪要与行动项');
+    expect(textOf(r.root)).toContain('会议主持');
+    expect(textOf(r.root)).toContain('方案评审与风险挑战');
+    expect(textOf(r.root)).toContain('访谈与需求洞察');
+    expect(textOf(r.root)).not.toContain('不联网、不上报使用数据');
+    const openFirstTemplate = async () => {
+      await act(async () => { r.root.findAllByProps({ className: 'vc-profile-template-card' })[0].props.onClick(); });
+      await act(async () => { buttonByClass(r, 'vc-profile-template-use')!.props.onClick(); });
+    };
+    await openFirstTemplate();
+    expect(idInput(r).props.value).toBe('important-sync');
+    expect(labelInput(r).props.value).toBe('会议重要信息同步');
+    expect(r.root.findByType('textarea').props.value).toContain('时间、负责人、范围、状态或结论的修正');
+    await closeProfile(r);
+    await openFirstTemplate();
+    expect(idInput(r).props.value).toBe('important-sync-2');
+
+    await act(async () => { saveButton(r)!.props.onClick(); });
+    await flush();
+    const created = (putCalls(fetchMock)[0].profiles as Json[])[1];
+    expect(created).toMatchObject({
+      id: 'important-sync',
+      agentAppId: 'app_agent',
+      responseMode: 'listener_thread',
+      listenerPlacement: 'topic',
+      permissionPreset: 'observe_only',
+      activityTypes: ['transcript_received', 'chat_received'],
+    });
+  });
+
   it('renders an explicit listener as a read-only configuring target', async () => {
     stubFetchImmediate({ A: catalogBody('A') });
     const r = await mount();
@@ -278,6 +327,7 @@ describe('VcConsumerProfilesSection · Listener 归属与语义文案', () => {
     expect(textOf(r.root.findByProps({ className: 'vc-profiles-section' })))
       .toContain('配置所属 Listener');
 
+    await openProfile(r, 0);
     await setInput(labelInput(r, 0), 'edited');
     confirmMock.mockReturnValueOnce(false);
     await clickOption(optionButton(r, 'Bot B')!);
@@ -288,6 +338,7 @@ describe('VcConsumerProfilesSection · Listener 归属与语义文案', () => {
     await clickOption(optionButton(r, 'Bot B')!);
     await flush();
     expect(fetchMock).toHaveBeenCalledTimes(2);
+    await openProfile(r, 0);
     expect(idInput(r, 0).props.value).toBe('B-profile');
   });
 
@@ -380,7 +431,7 @@ describe('VcConsumerProfilesSection · 保存', () => {
       .some(node => textOf(node).includes('暂时无法生成默认角色'))).toBe(true);
   });
 
-  it('save posts catalog.forBot + revision; id rename & card removal sync defaultConsumerIds', async () => {
+  it('save posts catalog.forBot + revision; id rename & card removal preserve valid multiple defaults', async () => {
     const fetchMock = stubFetchImmediate({
       A: catalogBody('A', {
         defaultMode: 'agents',
@@ -391,17 +442,18 @@ describe('VcConsumerProfilesSection · 保存', () => {
     const r = await mount();
 
     // 删除 scribe 卡：defaultConsumerIds 同步剔除 'scribe'
-    const removeButtons = r.root.findAllByType('button')
-      .filter(button => String(button.props.className ?? '').includes('vc-profile-remove'));
-    await act(async () => { removeButtons[1].props.onClick(); });
+    await openProfile(r, 1);
+    await act(async () => { buttonByClass(r, 'vc-profile-remove')!.props.onClick(); });
 
-    // 新增预设 → 起名 a → 勾为默认 → 改名 b：默认列表必须跟着换成 b
+    // 新增预设 → 起名 a → 勾为默认：保留已有默认；改名 b 后默认 id 跟着更新。
     await act(async () => { addButton(r)!.props.onClick(); });
-    await setInput(idInput(r, 1), 'a');
+    await setInput(idInput(r), 'a');
     await act(async () => {
-      defaultConsumerCheckbox(r, 'a')!.props.onChange({ target: { checked: true } });
+      defaultConsumerCheckbox(r, 'a')!.props.onChange({ currentTarget: { checked: true } });
     });
-    await setInput(idInput(r, 1), 'b');
+    expect(defaultConsumerCheckbox(r, 'minutes')?.props.checked).toBe(true);
+    expect(defaultConsumerCheckbox(r, 'a')?.props.checked).toBe(true);
+    await setInput(idInput(r), 'b');
 
     await act(async () => { saveButton(r)!.props.onClick(); });
     await flush();
@@ -420,6 +472,7 @@ describe('VcConsumerProfilesSection · 保存', () => {
     const put = defer();
     stubFetchImmediate({ A: catalogBody('A') }, () => put.promise);
     const r = await mount();
+    await openProfile(r, 0);
     await setInput(labelInput(r, 0), 'edited');
 
     await act(async () => { saveButton(r)!.props.onClick(); });
@@ -444,6 +497,7 @@ describe('VcConsumerProfilesSection · 保存', () => {
       profiles: [profileDto('A-profile', { label: 'edited' })],
     })));
     await flush();
+    await openProfile(r, 0);
     expect(labelInput(r, 0).props.disabled).toBe(false);
     expect(labelInput(r, 0).props.value).toBe('edited');
     expect(saveButton(r)!.props.disabled).toBe(true); // 保存后回到未 dirty
@@ -455,6 +509,7 @@ describe('VcConsumerProfilesSection · 保存', () => {
       () => jsonRes(409, { ok: false, error: 'config_conflict' }),
     );
     const r = await mount();
+    await openProfile(r, 0);
     await setInput(labelInput(r, 0), 'edited');
     await act(async () => { saveButton(r)!.props.onClick(); });
     await flush();
@@ -469,6 +524,7 @@ describe('VcConsumerProfilesSection · 保存', () => {
     await flush();
     expect(fetchMock.mock.calls.filter(c => !(c[1] as RequestInit | undefined)?.method).length).toBe(2);
     expect(r.root.findAllByProps({ className: 'hint-warn' })).toHaveLength(0);
+    await openProfile(r, 0);
     expect(labelInput(r, 0).props.value).toBe(''); // 服务端版本，丢弃本地冲突稿
   });
 
@@ -482,6 +538,7 @@ describe('VcConsumerProfilesSection · 保存', () => {
       }),
     );
     const r = await mount();
+    await openProfile(r, 0);
     await setInput(labelInput(r, 0), 'edited');
     await act(async () => { saveButton(r)!.props.onClick(); });
     await flush();

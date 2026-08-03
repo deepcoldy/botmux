@@ -2,6 +2,8 @@
 
 Configure bots via `~/.botmux/bots.json`. Run `botmux setup` to create it interactively, or edit it by hand. The file is an array; each element is a bot (in production, one bot maps to one dedicated daemon process).
 
+> **Most fields are optional** — just `larkAppId` / `larkAppSecret` is enough to run; add the rest as needed. **Applies to**: manually tuning CLI / model / working dir / permissions / sandbox, etc.; for everyday config the dashboard's Bot Config page is preferred (it edits the same `bots.json`). Run `botmux restart` to apply changes.
+
 ```json
 [
   {
@@ -46,7 +48,7 @@ There are many fields, listed below grouped by purpose. The vast majority are **
 | `model` | Model name used to launch the CLI (e.g. `claude --model opus`); leave empty to use the CLI default. Multiple bots with the same `cliId` can run different models. Each adapter's `modelChoices` are the candidates offered in `botmux setup` |
 | `cliPathOverride` | Absolute path to the CLI entry point, for wrapping a wrapper / router (ccr, claude-w, aiden-x-claude, etc.) |
 | `disableCliBypass` | When `true`, the CLI's auto-approve / sandbox-bypass flags (`--yolo`, `--dangerously-*`) are not appended automatically; omitted / `false` keeps the original behavior |
-| `backendType` | Session backend, one of `pty` / `tmux` / `herdr` / `zellij`. Leave empty to **auto-detect**: chooses `tmux` if tmux is available, otherwise `pty` (`herdr` and `zellij` are never auto-selected and must be specified explicitly). `tmux` / `herdr` / `zellij` are all persistent sessions and fall back to `pty` automatically if the corresponding binary probe fails (`zellij` requires ≥ 0.44); `pty` attaches directly to the process and does not persist across restarts. See [tmux backend](/en/tmux) |
+| `backendType` | Session backend, one of `pty` / `tmux` / `herdr` / `zellij`. **Leave empty to default to `tmux`** (PTY auto-fallback is retired): when a persistent backend (tmux/herdr/zellij) isn't available on this host it **hard-gates** and posts a card asking you to install it — it does **not** silently downgrade to pty (`zellij` requires ≥ 0.44). `pty` is an explicit fallback only (`backendType:"pty"` or `BACKEND_TYPE=pty`) — attaches directly to the process and **does not survive daemon restarts**. See [tmux backend](/en/tmux) |
 | `launchShell` | Shell used to launch the CLI, overriding the daemon's `$SHELL`: a shell name (`zsh` / `bash` / `sh`) or an absolute path (e.g. `/usr/bin/zsh`). For when the login `$SHELL` (e.g. bash) has an rcfile that `exec`-trampolines into another shell (`exec zsh`), pre-empting the CLI under botmux's `bash -i` launch so the session never starts (bare-shell `parse error`) — pinning it launches under that shell directly, bypassing the skipped rcfile. **Note**: PATH / nvm / pnpm must then live in the chosen shell's rcfiles (e.g. `.zshrc` / `.zprofile`). Empty = use `$SHELL`. Takes effect next session; `tmux` / `zellij` backends only (`pty` execs the CLI directly and is unaffected). Also configurable in the dashboard ("Bot defaults → Launch shell") or via `/config launchShell <value>` |
 | `lang` | The bot's UI language, `zh` / `en`; leave empty to fall back to the `BOTMUX_LANG` / `LANG` environment variable |
 | `customPassthroughCommands` | On top of the fixed passthrough allowlist and the current CLI adapter's default-allowed commands, additionally pass through slash commands to the underlying CLI, e.g. `["/export"]` (Claude Code / Codex default-allow `/goal`). Auto-normalized (a missing `/` is added, lowercased, only `[a-z0-9:_-]` kept, deduplicated); entries that would shadow a botmux daemon command (e.g. `/status`) are dropped and have no effect even if configured. Use `/list-slash-command` to view the full allowlist. See [Slash commands](/en/slash-commands) |
@@ -132,11 +134,14 @@ You can also add it to the corresponding bot entry directly (manual `bots.json` 
 | `sandboxReadonlyPaths` | Extra existing paths mounted read-only inside the sandbox, useful for shared source snapshots, reference repos, or generated docs the bot should inspect but not modify |
 | `sandboxNetwork` | Network policy for sandboxed sessions. Omitted / `true` keeps current network and proxy access; `false` adds `--unshare-net` and blocks normal network egress |
 
+> ZMX cannot enforce the file sandbox or effective read isolation, so configurations that enable those boundaries fail closed; see [ZMX backend boundaries](/en/zmx#unsupported-combinations).
+
 ## Cards and terminal
 
 | Field | Description |
 |------|------|
 | `brandLabel` | Branding text at the bottom of the card. `undefined` = default `botmux` link; `""` = hidden; any other string = rendered as-is (supports markdown). Purely cosmetic, does not affect routing / permissions |
+| `showUsageInCardFooter` | Whether reply-card footers show native Context / Token usage from the Agent CLI. Missing / `true` = show; `false` = hide both metrics. A missing individual metric is still omitted independently. This controls card display only and does not disable the Usage Ledger or other accounting |
 | `disableStreamingCard` | When `true`, no real-time streaming session card is sent at all (the Web Terminal still runs and the final reply still arrives via `botmux send`, there's just no auto-refreshing status card). For users who find the real-time card noisy |
 | `silentTurnReactions` | When `true`, card-off sessions no longer add GoGoGo / DONE reactions to the triggering message. Only affects the lightweight status reactions used when `disableStreamingCard` or `noCardChats` suppresses live cards; defaults to `false` |
 | `receivedReactionEmoji` | Feishu emoji_type for the "received" reaction in card-off sessions; `undefined` = default `GoGoGo` (冲!). Free-form string; a bad value just silently fails to attach (best-effort) |
@@ -185,6 +190,38 @@ Example:
 | Field | Description |
 |------|------|
 | `voice` | The bot's voice-engine override, merged field-by-field on top of the global `voice` block in `~/.botmux/config.json` (per-bot takes precedence). When valid voice credentials are present, a "🔊 Voice summary" button appears on reply cards. See [Voice summary](/en/voice) |
+
+## Meeting listener roles and group placement
+
+`vcMeetingAgent.meetingConsumer.consumerProfiles` defines reusable meeting-listener roles. `responseMode` controls whether automatic model output is authorized; `listenerDelivery.placement` independently controls where authorized output appears:
+
+The Dashboard meeting-role editor includes a local built-in template library: Important information sync, Meeting minutes and action items, Meeting facilitator, Solution review and risk challenge, and Interview and requirement insights. “Use template” copies the selected template into a normal, fully editable profile; later template changes never overwrite user configuration. The catalog has stable template IDs, versions, and source metadata so a community source can use the same model later. This release makes no network request and uploads no usage data, so popularity rankings are intentionally unavailable.
+
+- `silent`: automatic model output stays hidden.
+- `listener_thread`: automatic output may be sent to the listener group and requires `listener.output.request`.
+- placement `auto` (also the default when omitted): preserve legacy session routing.
+- placement `chat`: send every update as a top-level group message.
+- placement `topic`: use the first useful update as a stable topic root and thread later updates under it. Removing and re-enabling the profile starts a new topic.
+
+Automatic `listener_thread` output uses an internal `skip | publish` control protocol. The agent decides whether the current meeting state warrants publication; botmux sends only the `publish` message body and never renders the control JSON in Lark. There is no semantic-fingerprint deduplication or debounce/interval setting: novelty, observation time, and publication timing remain the agent's responsibility under the profile prompt and full meeting context. Malformed envelopes fail closed. Explicit human IM replies keep their existing quote/thread routing and do not use this protocol.
+
+Example generic “important meeting information sync” profile:
+
+```json
+{
+  "id": "important-sync",
+  "agentAppId": "cli_your_agent_app_id",
+  "label": "Important meeting information sync",
+  "role": "important-information-sync",
+  "instructions": "Continuously listen to the meeting. Publish only new information that materially matters to collaborators: confirmed decisions, status changes, explicit blockers or risks, and items people need to know or act on. When discussion has not formed a clear change, do not publish yet; decide whether to keep observing and when to publish from meeting semantics. Ignore discussion process, repetition, small talk, and unconfirmed speculation. Keep each update concise and include owner, deadline, scope, or impact when known. A correction to a previously stated time, owner, scope, status, or conclusion must be published as new information even when most surrounding details remain unchanged. Re-evaluate transcript revisions without repeating unchanged items.",
+  "filter": { "activityTypes": ["transcript_received", "chat_received"] },
+  "responseMode": "listener_thread",
+  "listenerDelivery": { "placement": "topic" },
+  "capabilities": ["listener.output.request", "meeting.read"]
+}
+```
+
+Set `agentAppId` to the bot that executes the role. Add the profile id to `defaultConsumerIds` with `defaultMode: "agents"` to enable it by default, or select it manually from the in-meeting consumer card.
 
 ## Runtime state (auto-maintained, do not edit)
 

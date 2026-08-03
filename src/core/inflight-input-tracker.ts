@@ -51,6 +51,15 @@ export class InflightInputTracker {
     this.carryOver = this.carryOver.filter(candidate => candidate !== item);
   }
 
+  /** Retire one exact write whose transport outcome is ambiguous and must not
+   * be replayed automatically. Other type-ahead items remain tracked. */
+  retire(item: InflightItem): boolean {
+    const index = this.unacked.indexOf(item);
+    if (index < 0) return false;
+    this.unacked.splice(index, 1);
+    return true;
+  }
+
   /** CLI is back at its idle prompt — everything written has been consumed
    *  (answered, steered into the active turn, or drained from the TUI's own
    *  type-ahead queue). Nothing is in flight anymore. */

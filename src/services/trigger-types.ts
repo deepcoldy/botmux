@@ -47,6 +47,17 @@ export interface TriggerRequest {
     waitForFinalOutput?: boolean;
     asyncReturnSessionId?: boolean;
     timeoutMs?: number;
+    /** Connector-owner opt-in: drop the daemon-rendered final_output reply for
+     * this loud trigger's turn. The streaming card / start notice still show;
+     * only the trailing transcript-driven summary is suppressed. */
+    suppressFinalOutput?: boolean;
+    /** Per-turn CLI model override (e.g. a codex model id). Applies only to a
+     *  freshly-spawned session; ignored when folding into an existing worker.
+     *  Empty/omitted → the bot's configured default. */
+    model?: string;
+    /** Per-turn reasoning effort (codex `model_reasoning_effort`). Same
+     *  fresh-spawn-only semantics as `model`. */
+    reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh';
   };
 }
 
@@ -106,11 +117,30 @@ export interface TriggerResponse {
   output?: {
     content: string;
   };
+  /** Per-turn token usage for a completed async turn (codex-app). Present on
+   *  `state:'completed'` when captured; omitted otherwise. Field names mirror the
+   *  caller's TaskTokenUsage. */
+  usage?: {
+    inputTokens: number;
+    outputTokens: number;
+    cacheReadTokens: number;
+    cacheCreateTokens: number;
+  };
   async?: {
     status: TriggerAsyncStatus;
     sessionId?: string;
     completedAt?: string;
   };
+  /** Read-only web-terminal URL for the live session's CLI pane, present only
+   *  while a worker web server is up (typically `state:'running'` and at
+   *  `'completed'` before the session closes). Lets an async caller (e.g. riff's
+   *  in-sandbox task-runner) open a live view of the visible CLI TUI — form C.
+   *  Carries the `?viewToken=` read capability inline; knowing it grants read
+   *  only, never terminal input. Omitted when no live worker terminal exists. */
+  readOnlyUrl?: string;
+  /** The bare read capability behind `readOnlyUrl`'s `?viewToken=`, exposed
+   *  separately for callers that build their own URL. Omitted with readOnlyUrl. */
+  viewToken?: string;
 }
 
 export function isRecord(v: unknown): v is Record<string, unknown> {
@@ -173,6 +203,15 @@ export function validateTriggerRequest(raw: unknown): { ok: true; request: Trigg
     if (typeof options.timeoutMs !== 'number' || !Number.isFinite(options.timeoutMs) || options.timeoutMs < 1000 || options.timeoutMs > 300_000) {
       return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: 'options.timeoutMs must be between 1000 and 300000' } };
     }
+  }
+  if (options.suppressFinalOutput !== undefined && typeof options.suppressFinalOutput !== 'boolean') {
+    return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: 'options.suppressFinalOutput must be a boolean' } };
+  }
+  if (options.model !== undefined && (typeof options.model !== 'string' || options.model.length > 200)) {
+    return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: 'options.model must be a string (<=200 chars)' } };
+  }
+  if (options.reasoningEffort !== undefined && !['low', 'medium', 'high', 'xhigh'].includes(options.reasoningEffort as string)) {
+    return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: 'options.reasoningEffort must be one of low|medium|high|xhigh' } };
   }
   return { ok: true, request: raw as unknown as TriggerRequest };
 }

@@ -1,6 +1,6 @@
 # Common Pitfalls and How to Avoid Them
 
-> High-frequency, battle-tested pitfalls from the community group, sorted by how often they occur and their impact.
+> High-frequency, battle-tested pitfalls from the community group, sorted by how often they occur and their impact. **When something misbehaves after install / upgrade, scan here first** — most are known pitfalls, not new problems; for pure triage steps see [General troubleshooting approach](#general-troubleshooting-approach) at the end.
 
 ## Bot permissions / app creation (most common)
 

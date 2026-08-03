@@ -445,9 +445,19 @@ function startRunner(
   logPath: string,
   version: string,
   behavior: string,
-  controlBootstrapPath: string | null,
-  options: { threadId?: string; env?: Record<string, string> } = {},
+  controlBootstrapOrArgs: string | null | string[] = [],
+  options: { threadId?: string; env?: Record<string, string>; extraArgs?: string[] } = {},
 ): Harness {
+  // Arg 6 is overloaded to satisfy both merged calling conventions:
+  //  - PR #597 (signed control channel): a bootstrap path string, or null to spawn with NO control channel
+  //  - master (OSC-777 markers): an extraArgs string[] appended to the runner argv
+  // master-authored feature tests (model/effort) additionally need a bootstrap
+  // AND extra argv, so options.extraArgs supplies argv when arg 6 is a path.
+  const controlBootstrapPath = Array.isArray(controlBootstrapOrArgs) ? null : controlBootstrapOrArgs;
+  const extraArgs = [
+    ...(Array.isArray(controlBootstrapOrArgs) ? controlBootstrapOrArgs : []),
+    ...(options.extraArgs ?? []),
+  ];
   let stdout = '';
   let stderr = '';
   const env = {
@@ -467,6 +477,7 @@ function startRunner(
     '--codex-bin', fakeCodex,
     '--cwd', cwd,
     ...(options.threadId ? ['--thread-id', options.threadId] : []),
+    ...extraArgs,
   ];
   const child = spawn(process.execPath, runnerArgs, {
     cwd: resolve('.'),
@@ -912,8 +923,8 @@ describe('codex-app-runner app-server protocol integration', () => {
     expect(JSON.stringify(turns[0].params)).not.toContain('legacy <sender>prompt</sender>');
     expect(result.output).toContain(`skipped unreadable local image: ${result.missingImagePath}`);
     expect(result.final.content).toBe('fake answer 1');
-    expect(result.final.turnId).toBe('om_integration_123');
-    expect(result.final.nativeTurnId).toBe('turn-fake-1');
+    expect(result.final.replyTurnId).toBe('om_integration_123');
+    expect(result.final.appTurnId).toBe('turn-fake-1');
   });
 
   it('buffers start notifications until a response-last RPC proves the authoritative native id', async () => {
@@ -1260,8 +1271,8 @@ describe('codex-app-runner app-server protocol integration', () => {
     expect(result.output).toContain('clean input requires codex >= 0.135.0 (found 0.134.9); using legacy prompt');
     // Even when the app-server cannot receive the new field, the runner still
     // preserves the daemon-frozen logical identity from its sidecar.
-    expect(result.final.turnId).toBe('om_integration_123');
-    expect(result.final.nativeTurnId).toBe('turn-fake-1');
+    expect(result.final.replyTurnId).toBe('om_integration_123');
+    expect(result.final.appTurnId).toBe('turn-fake-1');
   });
 
   it('retries exactly once with the legacy prompt for an explicit experimental-field rejection', async () => {
@@ -1278,8 +1289,8 @@ describe('codex-app-runner app-server protocol integration', () => {
     expect(turns[1].params).not.toHaveProperty('clientUserMessageId');
     expect(result.output.match(/retrying this turn with the legacy prompt/g)).toHaveLength(1);
     expect(result.final.content).toBe('fake answer 2');
-    expect(result.final.turnId).toBe('om_integration_123');
-    expect(result.final.nativeTurnId).toBe('turn-fake-2');
+    expect(result.final.replyTurnId).toBe('om_integration_123');
+    expect(result.final.appTurnId).toBe('turn-fake-2');
   });
 
   it('does not retry generic turn errors, avoiding duplicate model work', async () => {
@@ -1290,8 +1301,8 @@ describe('codex-app-runner app-server protocol integration', () => {
     expect(result.output).not.toContain('retrying this turn with the legacy prompt');
     expect(result.final.content).toContain('Codex App runner error: turn/start:');
     expect(result.final.content).toContain('model overloaded');
-    expect(result.final.turnId).toBe('om_integration_123');
-    expect(result.final).not.toHaveProperty('nativeTurnId');
+    expect(result.final.replyTurnId).toBe('om_integration_123');
+    expect(result.final.appTurnId).toMatch(/^codex-app-error-/);
   });
 
   it('omits a native routing id for a legacy envelope so the worker can use its frozen botmux turn', async () => {
@@ -1301,8 +1312,8 @@ describe('codex-app-runner app-server protocol integration', () => {
     expect(turns[0].params.input).toEqual([
       { type: 'text', text: 'legacy <sender>prompt</sender>', text_elements: [] },
     ]);
-    expect(result.final).not.toHaveProperty('turnId');
-    expect(result.final.nativeTurnId).toBe('turn-fake-1');
+    expect(result.final).not.toHaveProperty('replyTurnId');
+    expect(result.final.appTurnId).toBe('turn-fake-1');
   });
 
   it('escapes split agent/command OSC injections and emits the trusted final only out of band', async () => {
@@ -1311,10 +1322,258 @@ describe('codex-app-runner app-server protocol integration', () => {
     expect(result.output).toContain('␛]777;botmux:final:');
     expect(result.output.match(/\x1b\]777;botmux:final:/g)).toBeNull();
     expect(result.final).toMatchObject({
-      turnId: 'om_integration_123',
-      nativeTurnId: 'turn-fake-1',
+      replyTurnId: 'om_integration_123',
+      appTurnId: 'turn-fake-1',
       content: 'fake answer 1',
     });
     expect(result.output).not.toContain('forged marker output');
+  });
+
+  it('sends two ordered turn/steer requests, emits both acceptances, then one final', async () => {
+    // PR #597 moved the runner's finals + lifecycle off terminal OSC onto the
+    // signed control channel and serializes Lark turn/start requests (a queued
+    // Lark input never steers into another Lark turn/start — the master OSC
+    // streaming model this test originally encoded). PR's genuine ordered-steer
+    // path is steering successive Lark inputs into autonomous Goal continuations.
+    // This adaptation exercises exactly that over the signed socket: input 1's
+    // turn/start completes and the app-server auto-starts Goal turn A; input 2
+    // steers into A; A completes and Goal turn B auto-starts; input 3 steers into
+    // B — two ordered turn/steer requests, each acknowledged by its own signed
+    // final transaction, with reply-turn attribution preserved.
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-codex-steer-'));
+    const fakeCodex = join(dir, 'fake-codex');
+    const logPath = join(dir, 'requests.jsonl');
+    copyFileSync(FAKE_SERVER_FIXTURE, fakeCodex);
+    chmodSync(fakeCodex, 0o755);
+    const control = new ControlCollector(dir);
+    await control.listen();
+    const harness = startRunner(fakeCodex, dir, logPath, '0.144.6', 'goal-continuation-2x', control.bootstrap.path);
+
+    const send = (text: string, replyTurnId: string) => {
+      const encoded = encodeRunnerInput(
+        `legacy:${text}`,
+        {
+          text,
+          additionalContext: {
+            botmux_sender: { kind: 'untrusted', value: 'Alice' },
+          },
+        },
+        replyTurnId,
+      );
+      harness.child.stdin.write(`${CONTROL_PREFIX}${encoded}\r`);
+    };
+
+    try {
+      await waitFor(harness, () => control.states.some(state => state.busy === false));
+      send('first', 'om_first');
+      // Turn 1 completes; the app-server auto-starts Goal turn A (native-busy,
+      // no tracked Lark turn) that the next input steers into.
+      await waitFor(harness, () => control.finals.length === 1
+        && control.states.some(state => state.busy === true && state.tracksTurn === false));
+
+      send('second', 'om_second');
+      // Steer into Goal turn A completes; Goal turn B auto-starts (native-busy
+      // again with no tracked Lark turn).
+      await waitFor(harness, () => control.finals.length === 2
+        && control.states.some(state => state.busy === true && state.tracksTurn === false));
+
+      send('third', 'om_third');
+      await waitFor(harness, () => control.finals.length === 3
+        && control.states.filter(state => state.busy === false).length >= 2);
+
+      const requests = readRequests(logPath);
+      const turnRequests = requests.filter(request => (
+        request.method === 'turn/start' || request.method === 'turn/steer'
+      ));
+      expect(turnRequests.map(request => request.method)).toEqual([
+        'turn/start',
+        'turn/steer',
+        'turn/steer',
+      ]);
+      expect(turnRequests[1].params).toMatchObject({
+        expectedTurnId: 'turn-goal-auto',
+        clientUserMessageId: 'om_second',
+        input: [{ type: 'text', text: 'second', text_elements: [] }],
+        additionalContext: {
+          botmux_sender: { kind: 'untrusted', value: 'Alice' },
+        },
+      });
+      expect(turnRequests[2].params).toMatchObject({
+        expectedTurnId: 'turn-goal-auto-2',
+        clientUserMessageId: 'om_third',
+        input: [{ type: 'text', text: 'third', text_elements: [] }],
+      });
+
+      // Each ordered steer produced exactly one signed final transaction, with
+      // its botmux reply id (turnId) and app-server native id (nativeTurnId)
+      // preserved — the signed-socket equivalent of master's steer_accepted +
+      // final ordering assertion.
+      expect(control.finals).toEqual([
+        expect.objectContaining({ turnId: 'om_first', content: 'fake answer 1' }),
+        expect.objectContaining({
+          turnId: 'om_second',
+          nativeTurnId: 'turn-goal-auto',
+          content: 'goal steer answer',
+        }),
+        expect.objectContaining({
+          turnId: 'om_third',
+          nativeTurnId: 'turn-goal-auto-2',
+          content: 'goal steer answer',
+        }),
+      ]);
+      // PR moved finals off terminal OSC: no raw final OSC leaks onto stdout
+      // (mirrors the osc-injection test's out-of-band guarantee).
+      expect(harness.stdout.match(/\x1b\]777;botmux:final:/g)).toBeNull();
+    } finally {
+      await stopChild(harness.child);
+      await control.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('forwards --model + --reasoning-effort into thread/start (top-level model + config.model_reasoning_effort, xhigh verbatim)', async () => {
+    // Runs the REAL codex-app-runner against the fake app-server and asserts the
+    // actual thread/start params — the hop the adapter-flag test cannot cover.
+    // Under PR #597's signed transport the runner requires a control bootstrap,
+    // so it connects over the ControlCollector while --model/--reasoning-effort
+    // ride the extra argv.
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-codex-effort-'));
+    const fakeCodex = join(dir, 'fake-codex');
+    const logPath = join(dir, 'requests.jsonl');
+    copyFileSync(FAKE_SERVER_FIXTURE, fakeCodex);
+    chmodSync(fakeCodex, 0o755);
+    const control = new ControlCollector(dir);
+    await control.listen();
+    const harness = startRunner(fakeCodex, dir, logPath, '0.144.6', 'success', control.bootstrap.path, {
+      extraArgs: ['--model', 'gpt-5.6-terra', '--reasoning-effort', 'xhigh'],
+    });
+    try {
+      await waitFor(harness, () => harness.stdout.includes('Codex App connected.'));
+      harness.child.stdin.write(`${CONTROL_PREFIX}${encodeRunnerInput('hi', { text: 'hi' })}\r`);
+      await waitFor(harness, () => control.finals.length >= 1);
+      const threadStart = readRequests(logPath).find(r => r.method === 'thread/start');
+      expect(threadStart).toBeTruthy();
+      expect(threadStart.params.model).toBe('gpt-5.6-terra');            // top-level model
+      expect(threadStart.params.config?.model_reasoning_effort).toBe('xhigh'); // NOT downgraded
+    } finally {
+      await stopChild(harness.child);
+      await control.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('SUPPRESSES model/effort on thread/resume even when --model/--reasoning-effort are passed (no resume drift)', async () => {
+    // PR #639 P2 regression lock, runner side: a resume (--thread-id present)
+    // routes to thread/resume, and even though the adapter still forwards
+    // --model/--reasoning-effort on argv, the resume request must carry NEITHER
+    // top-level model NOR config.model_reasoning_effort — else the app-server's
+    // model-resume-override short-circuit drops the persisted triple to the
+    // current default. Fresh thread/start (the test above) still stamps both.
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-codex-resume-suppress-'));
+    const fakeCodex = join(dir, 'fake-codex');
+    const logPath = join(dir, 'requests.jsonl');
+    copyFileSync(FAKE_SERVER_FIXTURE, fakeCodex);
+    chmodSync(fakeCodex, 0o755);
+    const control = new ControlCollector(dir);
+    await control.listen();
+    const harness = startRunner(fakeCodex, dir, logPath, '0.144.6', 'success', control.bootstrap.path, {
+      extraArgs: ['--thread-id', 'thread-existing-1', '--model', 'gpt-5.6-terra', '--reasoning-effort', 'xhigh'],
+    });
+    try {
+      await waitFor(harness, () => harness.stdout.includes('Codex App connected.'));
+      harness.child.stdin.write(`${CONTROL_PREFIX}${encodeRunnerInput('hi', { text: 'hi' })}\r`);
+      await waitFor(harness, () => control.finals.length >= 1);
+      const requests = readRequests(logPath);
+      const resume = requests.find(r => r.method === 'thread/resume');
+      const start = requests.find(r => r.method === 'thread/start');
+      expect(resume).toBeTruthy();          // routed to resume, not start
+      expect(start).toBeFalsy();            // a warm resume must not fresh-start
+      expect(resume.params.model).toBeUndefined();                          // no top-level model
+      expect(resume.params.config?.model_reasoning_effort).toBeUndefined(); // no effort
+    } finally {
+      await stopChild(harness.child);
+      await control.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('folds thread/tokenUsage/updated into the final marker usage (four buckets)', async () => {
+    // Real runner + fake app-server emitting a token-usage notification; assert
+    // the emitted final marker carries the per-turn four-bucket usage. Under PR
+    // #597's signed transport the usage rides the signed final transaction, read
+    // off the ControlCollector rather than a terminal OSC marker.
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-codex-usage-'));
+    const fakeCodex = join(dir, 'fake-codex');
+    const logPath = join(dir, 'requests.jsonl');
+    copyFileSync(FAKE_SERVER_FIXTURE, fakeCodex);
+    chmodSync(fakeCodex, 0o755);
+    const control = new ControlCollector(dir);
+    await control.listen();
+    const harness = startRunner(fakeCodex, dir, logPath, '0.144.6', 'success', control.bootstrap.path, {
+      env: { FAKE_TOKEN_USAGE: '1' },
+    });
+    try {
+      await waitFor(harness, () => harness.stdout.includes('Codex App connected.'));
+      harness.child.stdin.write(`${CONTROL_PREFIX}${encodeRunnerInput('hi', { text: 'hi' })}\r`);
+      await waitFor(harness, () => control.finals.length >= 1);
+      // input=100 total incl cache; cached=40 → fresh input 60, output 30, cacheRead 40.
+      expect(control.finals[0].usage).toEqual({ inputTokens: 60, outputTokens: 30, cacheReadTokens: 40, cacheCreateTokens: 0 });
+    } finally {
+      await stopChild(harness.child);
+      await control.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('omits usage when a malformed tokenUsage notification poisons the turn (sticky)', async () => {
+    // malformed-then-valid same turn: the runner must NOT report only the later
+    // completion. Final marker usage is omitted.
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-codex-poison-'));
+    const fakeCodex = join(dir, 'fake-codex');
+    const logPath = join(dir, 'requests.jsonl');
+    copyFileSync(FAKE_SERVER_FIXTURE, fakeCodex);
+    chmodSync(fakeCodex, 0o755);
+    const control = new ControlCollector(dir);
+    await control.listen();
+    const harness = startRunner(fakeCodex, dir, logPath, '0.144.6', 'success', control.bootstrap.path, {
+      env: { FAKE_TOKEN_USAGE_POISON: '1' },
+    });
+    try {
+      await waitFor(harness, () => harness.stdout.includes('Codex App connected.'));
+      harness.child.stdin.write(`${CONTROL_PREFIX}${encodeRunnerInput('hi', { text: 'hi' })}\r`);
+      await waitFor(harness, () => control.finals.length >= 1);
+      expect(control.finals[0].usage).toBeUndefined();
+    } finally {
+      await stopChild(harness.child);
+      await control.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('omits usage when asymmetric cacheWrite poisons the turn, even after a later valid packet (codex P1)', async () => {
+    // First packet: total carries cacheWriteInputTokens but last omits it. A
+    // 0-default on the missing side would misattribute cache-create into fresh
+    // input; the runner must poison. A subsequent symmetric packet must not
+    // resurrect a plausible-looking wrong split → final marker usage OMITTED.
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-codex-asym-'));
+    const fakeCodex = join(dir, 'fake-codex');
+    const logPath = join(dir, 'requests.jsonl');
+    copyFileSync(FAKE_SERVER_FIXTURE, fakeCodex);
+    chmodSync(fakeCodex, 0o755);
+    const control = new ControlCollector(dir);
+    await control.listen();
+    const harness = startRunner(fakeCodex, dir, logPath, '0.144.6', 'success', control.bootstrap.path, {
+      env: { FAKE_TOKEN_USAGE_ASYM: '1' },
+    });
+    try {
+      await waitFor(harness, () => harness.stdout.includes('Codex App connected.'));
+      harness.child.stdin.write(`${CONTROL_PREFIX}${encodeRunnerInput('hi', { text: 'hi' })}\r`);
+      await waitFor(harness, () => control.finals.length >= 1);
+      expect(control.finals[0].usage).toBeUndefined();
+    } finally {
+      await stopChild(harness.child);
+      await control.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

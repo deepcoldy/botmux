@@ -1,4 +1,4 @@
-/** 通用注入通道禁止的命令：改变 daemon 记录所描述状态的命令必须走专用路由（如 botmux cd）。 */
+/** 通用注入通道禁止的命令：改变 daemon 记录所描述状态的命令必须走专用路由（如 `botmux role switch` 的 cd 路由）。 */
 const FORBIDDEN = new Set(['/cd']);
 
 /**

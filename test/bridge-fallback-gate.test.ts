@@ -1,5 +1,8 @@
 import { describe, it, expect } from 'vitest';
 import {
+  BRIDGE_NO_REPLY_SENTINEL,
+  buildBridgeSendMarkerContent,
+  buildBridgeSendPreviewText,
   shouldEmitEmptyCompletedBridgeFallback,
   shouldSuppressBridgeEmit,
   type BridgeSendMarker,
@@ -10,14 +13,103 @@ const turn = (markTimeMs: number | undefined, isLocal: boolean | undefined = fal
 
 const normalise = (text: string) => text.replace(/\s+/g, ' ').trim();
 const markerForContent = (sentAtMs: number, content: string): BridgeSendMarker => {
-  const normalized = normalise(content);
   return {
     sentAtMs,
-    contentLength: normalized.length,
+    ...buildBridgeSendMarkerContent(content),
   } as BridgeSendMarker;
 };
 
+describe('buildBridgeSendMarkerContent', () => {
+  it('keeps normalized length semantics and a newline-preserving dashboard preview', () => {
+    // contentLength stays fingerprint-normalized (gate compares against
+    // normalise(final).length); previewText keeps line breaks AND leading
+    // indentation for display (indented code / nested markdown).
+    expect(buildBridgeSendMarkerContent('  hello\n  bot  ')).toEqual({
+      contentLength: normalise('  hello\n  bot  ').length,
+      previewText: '  hello\n  bot',
+    });
+  });
+
+  it('bounds preview storage without changing the full normalized length', () => {
+    const content = ` ${'x'.repeat(5_000)} `;
+    const marker = buildBridgeSendMarkerContent(content)!;
+    expect(marker.contentLength).toBe(5_000);
+    expect(marker.previewText).toHaveLength(4_000);
+    expect(marker.previewText?.endsWith('…')).toBe(true);
+  });
+
+  it('preserves paragraph / list / code-block structure for Markdown rendering', () => {
+    const reply = 'intro line\n\n- item one\n- item two\n\n```bash\nls -la\n```\n\ndone';
+    const preview = buildBridgeSendPreviewText(reply)!;
+    // Blank-line paragraph breaks, list rows and fenced code all survive so the
+    // dashboard overlay can render them; only fingerprint length is flattened.
+    expect(preview).toContain('\n\n- item one\n- item two');
+    expect(preview).toContain('```bash\nls -la\n```');
+    expect(preview.split('\n').length).toBe(reply.split('\n').length);
+  });
+
+  it('trims trailing line whitespace and boundary blank lines but keeps FIRST-line indentation', () => {
+    // Trailing spaces before a newline go, boundary blank lines collapse, but a
+    // leading indent on the FIRST line survives (indented code / nested list) —
+    // a plain .trim() used to eat it. A lone newline is kept (breaks:true → <br>).
+    expect(buildBridgeSendPreviewText('  spoken   \nreply  ')).toBe('  spoken\nreply');
+    expect(buildBridgeSendPreviewText('    indented code\n    line two')).toBe('    indented code\n    line two');
+    expect(buildBridgeSendPreviewText('\n\n  body\n')).toBe('  body');
+    expect(buildBridgeSendPreviewText('a\n\n\n\nb')).toBe('a\n\nb');
+  });
+
+});
+
 describe('shouldSuppressBridgeEmit', () => {
+  it('non-adopt: exact no-reply sentinel suppresses without a send marker', () => {
+    expect(shouldSuppressBridgeEmit(
+      { ...turn(100), finalText: `  ${BRIDGE_NO_REPLY_SENTINEL}\n` },
+      undefined,
+      [],
+      false,
+    )).toBe(true);
+  });
+
+  it('non-adopt: prose then a standalone sentinel LINE suppresses the whole turn', () => {
+    // The real-world shape: the model explains the silence, then appends the
+    // token on its own trailing line. Full-string exact match let this leak.
+    expect(shouldSuppressBridgeEmit(
+      { ...turn(100), finalText: `Codex acknowledged and is reviewing. Nothing for me to do — no reply needed.\n\n${BRIDGE_NO_REPLY_SENTINEL}` },
+      undefined,
+      [],
+      false,
+    )).toBe(true);
+  });
+
+  it('non-adopt: token inline in a prose sentence is not guessed away', () => {
+    // Last non-empty line is a full sentence (token mid-line), not a bare
+    // sentinel — a normal answer that merely mentions the token.
+    expect(shouldSuppressBridgeEmit(
+      { ...turn(100), finalText: `I will stay silent instead of replying. ${BRIDGE_NO_REPLY_SENTINEL}` },
+      undefined,
+      [],
+      false,
+    )).toBe(false);
+  });
+
+  it('non-adopt: sentinel followed by more prose still posts (not a terminator)', () => {
+    expect(shouldSuppressBridgeEmit(
+      { ...turn(100), finalText: `${BRIDGE_NO_REPLY_SENTINEL}\n\nActually, here is the answer you asked for.` },
+      undefined,
+      [],
+      false,
+    )).toBe(false);
+  });
+
+  it('adopt mode does not interpret the no-reply sentinel', () => {
+    expect(shouldSuppressBridgeEmit(
+      { ...turn(100), finalText: BRIDGE_NO_REPLY_SENTINEL },
+      undefined,
+      [],
+      true,
+    )).toBe(false);
+  });
+
   it('adopt mode never suppresses, even with markers in window', () => {
     const markers: BridgeSendMarker[] = [{ sentAtMs: 150 }];
     expect(shouldSuppressBridgeEmit(turn(100), 200, markers, true)).toBe(false);

@@ -1,19 +1,34 @@
 # Session Adopt
 
-Seamlessly adopt a CLI process that's **already running in your local tmux** into botmux, so you can view progress and interact via Lark on your phone.
+Seamlessly adopt a CLI process that's **already running in your local tmux** into botmux, so you can view progress and interact via Lark on your phone. Typical scenario: Claude Code is running halfway through a task in the tmux on your office computer and you have to leave — send `/adopt` from Lark on your phone and keep watching and sending.
 
 <video src="https://magic-builder.tos-cn-beijing.volces.com/uploads/1780421531476_adopt-video.aud.mp4" controls preload="metadata" style={{width:'100%',borderRadius:'8px'}}></video>
 
 ```
 /adopt              # Scan the local tmux and pop up a selection card
-/adopt 0:2.0        # Adopt the specified tmux pane directly
+/adopt 0:2.0        # Adopt the specified tmux pane directly (session:window.pane)
 ```
 
-## Three actions
+> The selection card lists only sessions for the **CLI this bot is bound to** (a Pi bot won't list Codex/TRAE panes), and excludes botmux's own `bmx-*` persistent sessions.
 
-- **Shared mode**: after adopting, the local terminal (e.g., iTerm2) and Lark sync bidirectionally — the streaming card shows terminal output in real time, and input from the Lark chat box passes straight through to the terminal. The local tmux stays connected the whole time.
-- **One-click adopt-over**: tap "🔄 Adopt Over" on the streaming card, and botmux rebuilds the session with `--resume`, converting it into a standard botmux session.
-- **Safe disconnect**: tap "⏏ Disconnect," and botmux stops observing, leaving the original CLI unaffected.
+## It's a "bridge," not a takeover
+
+Adopt uses a **zero-touch bridge**: botmux only observes the pane out of band (`tmux pipe-pane` to read output, `send-keys` to write input) and **never attaches, zooms, or groups** your local tmux — your session in iTerm2 is unaffected the whole time.
+
+- **Shared mode**: after adopting, the local terminal (e.g., iTerm2) and Lark sync bidirectionally — the streaming card shows terminal output in real time, and input from the Lark chat box passes straight through to the terminal. The local tmux stays connected and untouched throughout.
+- **Safe disconnect**: tap "⏏ Disconnect" on the streaming card (or send `/close`), and botmux stops observing and tears down only its own side's worker — it **never ends your CLI**; the original process keeps running in your local tmux.
+
+> ⚠️ The old "🔄 Adopt Over" button on the card is **retired**: it's no longer rendered in bridge mode, and clicking it on a historical card is a no-op. Full rebuild into a standard botmux session via `--resume` (`/adopt --takeover`) is still on the roadmap and not yet shipped. Today, adopt is always the "shared bridge" form.
+
+## Boundaries and caveats
+
+An adopted session's lifecycle lives **on your machine**, outside botmux's control, so a few hard boundaries apply:
+
+- **Cannot be relayed (`/relay`)**: the CLI runs on your computer and botmux doesn't control its tmux lifecycle, so relay is rejected. To continue in another group, use a new session + handoff.
+- **Cannot resume**: an adopted session doesn't support `--resume` rebuild.
+- **Ends when the CLI exits**: in adopt mode botmux does **not** auto-restart — once the adopted CLI exits on its own, the session ends with it (card frozen, worker reaped) rather than respawning like a persistent session.
+- **Sandbox bots can't adopt**: a sandbox has to wrap a CLI it starts from scratch and can't wrap an already-running process (fail-closed rejection).
+- **Restore after a daemon restart is careful**: on restart botmux first re-validates whether the adopted host CLI is still alive — it only closes the session if the target is confirmed gone; on an inconclusive (transient) probe it keeps the session closed and **re-validates on the next restore pass (e.g. another daemon restart)**, not automatically when the next message arrives.
 
 ## Typical usage
 

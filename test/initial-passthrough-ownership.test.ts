@@ -51,6 +51,19 @@ describe('startInitialPassthroughSession ownership', () => {
     expect(region).toContain('session.ownerUnionId = ownerUnionId;');
     expect(region).toContain('session.creatorOpenId = creatorOpenId;');
   });
+
+  it('hands a registration loser to the current canonical owner via the ownership claim', () => {
+    // PR #597's ownership backbone: startInitialPassthroughSession claims the
+    // routing key through claimNewDaemonSession (compare-and-set). On loss to an
+    // existing owner it routes the inbound to that canonical owner instead of
+    // silently dropping it — the same intent master expressed via
+    // rollbackRejectedSessionAndGetWinner, now expressed through the claim +
+    // routeToCanonicalOwner callback.
+    expect(region).toContain('claimNewDaemonSession(activeSessions, ds)');
+    expect(region).toContain("registration.reason === 'existing_owner'");
+    expect(region).toContain('activeSessions.get(registration.key) === registration.owner');
+    expect(region).toContain('await routeToCanonicalOwner();');
+  });
 });
 
 describe('startInitialPassthroughSession call sites', () => {
@@ -66,8 +79,39 @@ describe('startInitialPassthroughSession call sites', () => {
     expect(calls.length).toBeGreaterThanOrEqual(2);
     for (const call of calls) {
       const body = call.slice(0, call.indexOf('});'));
+      expect(body).toContain('cmd,');
       expect(body).toContain('ownerOpenId:');
       expect(body).toContain('creatorOpenId:');
     }
+  });
+});
+
+describe('registration loser command handoff', () => {
+  it('routes new-topic and thread daemon commands through the ownership claim', () => {
+    // Both the new-topic and thread daemon-command paths claim the routing key
+    // through claimNewDaemonSession(activeSessions, cmdDs). On loss to an
+    // existing owner they still deliver the command (handleCommand) so the
+    // inbound reaches the canonical session — PR #597's ownership backbone
+    // replacing master's rollbackRejectedSessionAndGetWinner here.
+    const claimCalls = src.split('claimNewDaemonSession(activeSessions, cmdDs)').length - 1;
+    expect(claimCalls).toBeGreaterThanOrEqual(2);
+    expect(src).toContain("if (registration.reason !== 'existing_owner') return;");
+    expect(src).toContain(
+      'await handleCommand(cmd, anchor, { ...parsed, content: commandContent }, commandDeps, larkAppId)',
+    );
+    expect(src).toContain(
+      'await handleCommand(cmd, anchor, cmdMessage, commandDeps, larkAppId)',
+    );
+  });
+
+  it('prepared message handoff skips duplicate resolve, identity-learning, and hook effects', () => {
+    const start = src.indexOf('async function handleThreadReply(');
+    const end = src.indexOf('/**\n * 文档评论入口', start);
+    expect(start).toBeGreaterThanOrEqual(0);
+    expect(end).toBeGreaterThan(start);
+    const region = src.slice(start, end);
+    expect(region).toContain('if (!prepared) await resolveNonsupportMessage(data, larkAppId);');
+    expect(region).toContain('if (!prepared) learnFromMentions(larkAppId, parsed.mentions);');
+    expect(region).toMatch(/if \(!prepared\) \{[\s\S]*emitHookEvent\('thread\.reply'/);
   });
 });

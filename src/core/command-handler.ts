@@ -7,7 +7,7 @@ import { join, resolve, basename } from 'node:path';
 import { config } from '../config.js';
 import { buildTerminalUrl } from './terminal-url.js';
 import { getBot, getAllBots, getBotOpenId, getOwnerOpenId, findOncallChat, effectiveDefaultWorkingDir } from '../bot-registry.js';
-import { repoPickerScanOptions } from '../global-config.js';
+import { readGlobalConfig, repoPickerScanOptions } from '../global-config.js';
 import * as sessionStore from '../services/session-store.js';
 import * as scheduleStore from '../services/schedule-store.js';
 import * as scheduler from './scheduler.js';
@@ -15,7 +15,7 @@ import { scanProjects, scanMultipleProjects, describeProjectDir } from '../servi
 import { createRepoWorktree, pushWorktreeBranch } from '../services/git-worktree.js';
 import { worktreeSlugFromContextAI } from '../services/worktree-slug-ai.js';
 import { resolvePairedSpawnBackendType } from './persistent-backend.js';
-import { buildRepoSelectCard, buildAdoptSelectCard, buildCodexAppThreadSelectCard, buildSlashListCard, getCliDisplayName, buildConfigCard } from '../im/lark/card-builder.js';
+import { buildRepoSelectCard, buildAdoptSelectCard, buildCodexAppThreadSelectCard, buildSlashListCard, getCliDisplayName, buildConfigCard, buildAdoptBlockedCard } from '../im/lark/card-builder.js';
 import { handleDashboardCommand } from './dashboard-command/index.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import type { CliId, ResumableSession } from '../adapters/cli/types.js';
@@ -24,7 +24,7 @@ import { chatAppLink, normalizeBrand } from '../im/lark/lark-hosts.js';
 import { claimPairing } from '../services/pairing-store.js';
 import { logger } from '../utils/logger.js';
 import { scheduleTimeZone } from '../utils/timezone.js';
-import { killWorker, suspendWorker, forkWorker, forkAdoptWorker, adoptSandboxBlocked, getCurrentCliVersion, postFreshStreamingCard, postPrivateSnapshotCard, resolvePrivateCardAudience, deliverEphemeralOrReply, deliverWritableTerminalCardTo, closeSession as closeWorkerPoolSession, withActiveSessionKeyLock } from './worker-pool.js';
+import { killWorker, teardownAuthoritativePersistentBackingBeforeClose, suspendWorker, forkWorker, forkAdoptWorker, adoptSandboxBlocked, getCurrentCliVersion, postFreshStreamingCard, postPrivateSnapshotCard, resolvePrivateCardAudience, deliverEphemeralOrReply, deliverWritableTerminalCardTo, closeSession as closeWorkerPoolSession, withActiveSessionKeyLock, requestSessionRestart, isSessionTransferring } from './worker-pool.js';
 import {
   expandHome,
   getSessionWorkingDir,
@@ -35,11 +35,12 @@ import {
   ensureSessionWhiteboard,
   getAvailableBots,
 } from './session-manager.js';
+import { markInitialUserTurnPending } from './initial-user-turn.js';
 import { discoverSlashCommandsForAdapter, listMcpServerNames, supportsFilesystemCommandDiscovery } from './command-discovery.js';
 import { validateWorkingDir } from './working-dir.js';
 import { repinSessionWorkingDir } from './session-cwd.js';
-import { discoverAdoptableSessions, excludeOwnedHerdrAdoptTargets, validateAdoptTarget, adoptTargetKey, adoptTargetLabel, type AdoptableSession } from './session-discovery.js';
-import { discoverAdoptableZellijSessions, validateZellijAdoptTarget, type ZellijAdoptableSession } from './zellij-adopt-discovery.js';
+import { validateAdoptTarget, adoptTargetKey, adoptTargetLabel, type AdoptableSession } from './session-discovery.js';
+import { validateZellijAdoptTarget, type ZellijAdoptableSession } from './zellij-adopt-discovery.js';
 import { listCodexAppThreads, type CodexAppThreadSummary } from '../services/codex-app-threads.js';
 import { generateAuthUrl, getTokenStatus, resolveUserToken, DOC_COMMENT_OAUTH_SCOPES } from '../utils/user-token.js';
 import { DocSubscriptionPermissionError, listDocComments, resolveDocFile, subscribeDocFile, unsubscribeDocFile } from '../im/lark/doc-comment.js';
@@ -115,6 +116,24 @@ export { DAEMON_COMMANDS, PASSTHROUGH_COMMANDS };
  */
 export const SESSIONLESS_DAEMON_COMMANDS = new Set(['/group', '/g', '/list-slash-command', '/slash', '/botconfig', '/dashboard', '/skills', '/vc-auth', '/watch-comment']);
 
+const SLASH_GROUP_NAME_MAX_UTF16_LENGTH = 50;
+
+/** Apply the machine-wide prefix used only by `/group` and `/g`, then keep the
+ *  existing Lark headroom. The legacy limit is measured in UTF-16 code units;
+ *  iterating by code point keeps that limit without slicing an emoji's
+ *  surrogate pair. */
+export function formatSlashGroupName(name: string, prefix = ''): string {
+  const prefixed = prefix && !name.startsWith(prefix) ? `${prefix}${name}` : name;
+  if (prefixed.length <= SLASH_GROUP_NAME_MAX_UTF16_LENGTH) return prefixed;
+
+  let truncated = '';
+  for (const character of prefixed) {
+    if (truncated.length + character.length > SLASH_GROUP_NAME_MAX_UTF16_LENGTH) break;
+    truncated += character;
+  }
+  return `${truncated}…`;
+}
+
 /**
  * Daemon commands that operate on an ALREADY-EXISTING session and must never
  * pre-create one. `/rename` renames the current session — with no session there
@@ -189,20 +208,19 @@ export { validateWorkingDir };
  *   1. Build candidate absolute paths — absolute / `~` taken as-is; relative or
  *      bare names resolved against each scan dir, then the daemon cwd (mirrors
  *      how the card's project list is rooted).
- *   2. Prefer a candidate matching a scanned git project (carries a branch label).
- *   3. For a bare name, also match a scanned project by basename (covers projects
- *      nested deeper than the scan-dir top level).
- *   4. Fall back to any existing directory — lenient like `/cd`, whose trust model
- *      is "owner explicitly chose a dir"; the CLI already runs with full FS access.
+ *   2. Return the first directly existing candidate, describing its git ref
+ *      without scanning unrelated roots. This is lenient like `/cd`, whose trust
+ *      model is "owner explicitly chose a dir"; the CLI already runs with full
+ *      FS access.
+ *   3. Only for a bare name that did not directly resolve, scan projects and
+ *      match by basename (covers projects nested deeper than the scan-dir top
+ *      level).
  * Returns null when nothing resolves to an existing directory.
  */
 export function resolveRepoSelection(
   repoArg: string,
   scanDirs: string[],
 ): { path: string; displayName: string } | null {
-  const existingScanDirs = scanDirs.filter((d) => existsSync(d));
-  const projects = existingScanDirs.length > 0 ? scanMultipleProjects(existingScanDirs) : [];
-
   const isExplicitPath =
     repoArg.startsWith('/') ||
     repoArg.startsWith('~') ||
@@ -217,18 +235,9 @@ export function resolveRepoSelection(
     candidates.push(resolve(expandHome(repoArg))); // daemon-cwd fallback (matches /cd)
   }
 
-  // 1) Exact scanned-project match — preferred, gives the "name (branch)" label.
-  for (const cand of candidates) {
-    const proj = projects.find((p) => resolve(p.path) === cand);
-    if (proj) return { path: proj.path, displayName: `${proj.name} (${proj.branch})` };
-  }
-  // 2) Bare name → match a scanned project by basename.
-  if (!isExplicitPath) {
-    const byName = projects.find((p) => p.name === repoArg);
-    if (byName) return { path: byName.path, displayName: `${byName.name} (${byName.branch})` };
-  }
-  // 3) Lenient fallback: any existing directory. Label it with a git ref when
-  //    it's a repo (covers explicit paths outside the scan roots), else basename.
+  // Direct candidates must win before any recursive scan. Besides avoiding
+  // unnecessary traversal (especially a legacy HOME fallback), describing just
+  // the selected directory preserves the same "name (branch)" label for repos.
   for (const cand of candidates) {
     try {
       if (!statSync(cand).isDirectory()) continue;
@@ -240,6 +249,17 @@ export function resolveRepoSelection(
       ? { path: cand, displayName: `${desc.name} (${desc.branch})` }
       : { path: cand, displayName: basename(cand) };
   }
+
+  // Explicit and relative paths have no basename-search semantics: when their
+  // concrete candidates do not exist, a recursive project scan cannot resolve
+  // them. Bare names alone may refer to a repo nested below a scan root.
+  if (isExplicitPath) return null;
+
+  const existingScanDirs = scanDirs.filter((d) => existsSync(d));
+  const projects = existingScanDirs.length > 0 ? scanMultipleProjects(existingScanDirs) : [];
+  const byName = projects.find((p) => p.name === repoArg);
+  if (byName) return { path: byName.path, displayName: `${byName.name} (${byName.branch})` };
+
   return null;
 }
 
@@ -1191,7 +1211,9 @@ export async function handleTermLinkCommand(
   }
 
   const channel = await deliverWritableTerminalCardTo(ds, senderOpenId);
-  if (channel === 'not_ready') {
+  if (channel === 'unsupported') {
+    await reply(t('cmd.term.unsupported', undefined, loc));
+  } else if (channel === 'not_ready') {
     await reply(t('cmd.term.not_ready', undefined, loc));
   } else if (channel === 'failed') {
     await reply(t('cmd.term.failed', undefined, loc));
@@ -1266,12 +1288,30 @@ export async function handleCommand(
               candidate => candidate.session.sessionId === targetSessionId,
             );
             if (!current) return undefined;
+            // Capture the closed-session card BEFORE closeWorkerPoolSession —
+            // it reads the live session's identity off `current`.
             const card = buildClosedSessionCard(current, localeForBot(current.larkAppId));
-            await closeWorkerPoolSession(targetSessionId);
+            try {
+              // closeWorkerPoolSession proves fail-closed backing teardown
+              // before mutating any registry/store state, throwing when it
+              // cannot verify it. Surface that so the active record is kept
+              // for retry instead of being silently dropped.
+              await closeWorkerPoolSession(targetSessionId);
+            } catch (err) {
+              return { status: 'teardown_failed' as const, err };
+            }
             return { status: 'closed' as const, current, card };
           });
           if (!closed) {
             await sessionReply(rootId, t('cmd.no_active_session', undefined, loc));
+            break;
+          }
+          if (closed.status === 'teardown_failed') {
+            logger.error(`[${logTag}] Refused /close because backing teardown was not verified: ${closed.err}`);
+            await sessionReply(
+              rootId,
+              `⚠️ 会话关闭失败，已保留 active 记录以便重试：${closed.err instanceof Error ? closed.err.message : String(closed.err)}`,
+            );
             break;
           }
           // 「会话已关闭」卡片优先「仅自己可见」：普通群里走 ephemeral 只发给执行
@@ -1309,6 +1349,7 @@ export async function handleCommand(
           sessionId: ds.session.sessionId,
           cliSessionId: ds.session.cliSessionId,
           cwd: ds.session.workingDir,
+          larkAppId: ds.larkAppId ?? ds.session.larkAppId,
         }, { detail: 'summary' });
         await sessionReply(rootId, formatInsightCard(report, loc));
         break;
@@ -1348,41 +1389,32 @@ export async function handleCommand(
 
       case '/restart': {
         if (ds) {
-          const targetSessionId = ds.session.sessionId;
-          const restart = await withBotTurnMutation(ds.larkAppId, async () => {
-            const current = [...activeSessions.values()].find(
-              candidate => candidate.session.sessionId === targetSessionId
-                && candidate.session.status === 'active',
-            );
-            if (!current) return { status: 'gone' as const };
-            if (hasProtectedSessionMutationOwnership(current)) {
-              return { status: 'pending' as const };
-            }
-            const cliName = getCliDisplayName(getBot(current.larkAppId).config.cliId);
-            if (current.worker && !current.worker.killed) {
-              current.worker.send({ type: 'restart', reason: 'operator' } as DaemonToWorker);
-              return { status: 'restarting' as const, cliName };
-            }
-            killWorker(current);
-            return { status: 'terminated' as const, cliName };
-          });
-          if (restart.status === 'pending') {
+          if (ds.adoptedFrom) {
+            await sessionReply(rootId, t('card.action.adopt_no_restart', undefined, loc));
+            break;
+          }
+          // Codex App: an accepted-but-unsettled dispatch still owns the turn
+          // route. requestSessionRestart does not itself gate on dispatch
+          // ownership, so reject here before the coordinator tears the worker
+          // down (mirrors the card-handler restart path).
+          if (hasProtectedSessionMutationOwnership(ds)) {
             await sessionReply(
               rootId,
               '当前 Codex App 仍有未结算消息，暂不能重启；请等待本轮完成或关闭会话。',
             );
             break;
           }
-          if (restart.status === 'gone') {
-            await sessionReply(rootId, t('cmd.no_active_session', undefined, loc));
+          if (isSessionTransferring(ds)) {
+            await sessionReply(rootId, t('cmd.session.transfer_in_progress', undefined, loc));
             break;
           }
-          await sessionReply(
-            rootId,
-            restart.status === 'restarting'
-              ? t('cmd.restart.in_progress', { cliName: restart.cliName }, loc)
-              : t('cmd.restart.terminated', { cliName: restart.cliName }, loc),
-          );
+          const cliName = getCliDisplayName(getBot(ds.larkAppId).config.cliId);
+          requestSessionRestart(ds, {
+            source: 'slash',
+            notify: async status => {
+              await sessionReply(rootId, t(`cmd.restart.${status}`, { cliName }, loc));
+            },
+          });
           logger.info(`[${logTag}] Restart by /restart command`);
         } else {
           await sessionReply(rootId, t('cmd.no_active_session', undefined, loc));
@@ -1398,6 +1430,10 @@ export async function handleCommand(
         }
         if (!ds) {
           await sessionReply(rootId, t('cmd.no_active_session', undefined, loc));
+          break;
+        }
+        if (isSessionTransferring(ds)) {
+          await sessionReply(rootId, t('cmd.session.transfer_in_progress', undefined, loc));
           break;
         }
         // Cheap preflight avoids creating a requested directory when the
@@ -1466,7 +1502,7 @@ export async function handleCommand(
           await sessionReply(rootId, t('cmd.rename.usage', undefined, loc));
           break;
         }
-        const updated = updateSessionTitle(ds.session, rawTitle);
+        const updated = updateSessionTitle(ds.session, rawTitle, 'user');
         if (!updated.ok) {
           await sessionReply(rootId, t('cmd.rename.usage', undefined, loc));
           break;
@@ -1486,7 +1522,6 @@ export async function handleCommand(
         logger.info(`[${logTag}] Session renamed by /rename: ${updated.title} (agentSync=${agentSync.status})`);
         break;
       }
-
       case '/repo': {
         const repoArg = message.content.replace(/^\/repo\s*/, '').trim();
         if (ds && !ds.pendingRepo
@@ -1586,6 +1621,11 @@ export async function handleCommand(
             // first user turn or expose this worker:null owner as scratch.
             const pendingTurnId = current.pendingTurnId
               ?? current.session.pendingRepoSetup?.turnId;
+            // Nothing to submit at all (bare `/repo`: the message IS the
+            // command). The CLI boots idle, so the user's NEXT real message is
+            // its first turn and must carry the full new-topic opening — see
+            // markInitialUserTurnPending below.
+            const emptyStart = !pendingRawInput && !hasBufferedInput;
             forkWorker(
               current,
               pendingRawInput ? '' : (wrappedInput ?? ''),
@@ -1597,6 +1637,11 @@ export async function handleCommand(
             // These source buffers were folded into opening N; clear them but
             // keep the gate so later inbounds enter the exact post-ACK FIFO.
             current.initialStartPending = current.session.queuedActivationPending === true;
+            // Durable, one-shot: an empty-started CLI has never received a real
+            // user turn, so the next business message must be built as a NEW
+            // TOPIC (routing + built-in skill discovery + identity), not a
+            // follow-up. Set after the fork so a throwing fork leaves it clean.
+            if (emptyStart) markInitialUserTurnPending(current);
             publishAttentionPatch(current);
             current.pendingPrompt = undefined;
             current.pendingCodexAppText = undefined;
@@ -1660,6 +1705,18 @@ export async function handleCommand(
             // anchor — expected; `/close` the new one first, or use the
             // command.) Mirrors the `/close` case above.
             //
+            // ZMX close is identity/generation verified and may refuse. Prove
+            // teardown before claiming the card or mutating any state so a
+            // refusal leaves the current session fully retryable.
+            try {
+              teardownAuthoritativePersistentBackingBeforeClose(ds!);
+            } catch (err) {
+              const reason = err instanceof Error ? err.message : String(err);
+              logger.warn(`[${logTag}] Repo switch refused because backing teardown was not proven: ${reason}`);
+              await sessionReply(rootId, t('cmd.repo.switch_close_failed', { error: reason }, loc));
+              return false;
+            }
+
             // Claim any open repo card BEFORE killWorker / await so a concurrent
             // card click cannot double-switch while this text path runs.
             //
@@ -1727,6 +1784,11 @@ export async function handleCommand(
                 current.hasHistory = false;
                 activeSessions.set(key, current);
                 forkWorker(current, '', false);
+                // Brand-new CLI in a brand-new session record: it has never
+                // seen the botmux opening context either, so the next real
+                // business message is its new-topic first turn (same invariant
+                // as the pending path).
+                markInitialUserTurnPending(current);
                 return { ok: true as const, current, closedCard, cardToWithdraw };
               });
             });
@@ -2438,6 +2500,10 @@ export async function handleCommand(
 
       case '/adopt': {
         const adoptArgs = message.content.replace(/^\/adopt\s*/i, '').trim();
+        if (ds && isSessionTransferring(ds)) {
+          await sessionReply(rootId, t('cmd.session.transfer_in_progress', undefined, loc));
+          break;
+        }
         if (ds?.adoptedFrom) {
           const adopted = ds.adoptedFrom;
           const cliName = getCliDisplayName(adopted.cliId ?? 'claude-code');
@@ -2457,32 +2523,39 @@ export async function handleCommand(
         }
 
         const botCliId = botCfgForAdopt?.cliId;
+        const adoptSession = ds?.session;
+        const adoptAnchor = ds ? sessionAnchorId(ds) : undefined;
 
         // Discover every supported backend, but only offer live sessions for
         // this bot's configured CLI. A Pi bot must not show Codex/TRAE panes:
         // adopting one would unexpectedly change the agent behind the bot.
-        const ownedHerdrTargets = [...activeSessions.values()].flatMap(active => {
-          const target = active.session.persistentBackendTarget;
-          return active.session.status === 'active'
-            && !active.adoptedFrom
-            && target?.backendType === 'herdr'
-            && !!target.agentName
-            ? [{ sessionName: target.sessionName, agentName: target.agentName }]
-            : [];
-        });
-        const sessions: Array<AdoptableSession | ZellijAdoptableSession> = [
-          ...excludeOwnedHerdrAdoptTargets(
-            discoverAdoptableSessions(botCliId),
-            ownedHerdrTargets,
-          ),
-          ...discoverAdoptableZellijSessions(botCliId),
-        ];
-
-        // Second filter: sessions resumable from disk (paseo-style import).
-        // Only the bot's OWN CLI is offered (resume needs that CLI's binary).
-        const resumable = botCliId
-          ? await discoverResumableSessionsForBot(botCliId, botCfgForAdopt?.cliPathOverride, activeSessions)
-          : [];
+        // collectAdoptCandidates folds live-pane + disk-resume discovery into
+        // one snapshot; we cache it (by root message id) so the V2 picker's
+        // search / page re-renders don't re-shell-out to tmux each click.
+        const { collectAdoptCandidates, cacheAdoptCandidates } = await import('../services/adopt-picker.js');
+        const candidates = await collectAdoptCandidates(
+          botCliId,
+          botCfgForAdopt?.cliPathOverride,
+          activeSessions,
+          discoverResumableSessionsForBot,
+          ADOPT_RESUME_LIMIT,
+        );
+        const sessions = candidates.sessions;
+        const resumable = candidates.resumable;
+        if (
+          ds
+          && adoptSession
+          && adoptAnchor
+          && (
+            ds.session !== adoptSession
+            || ds.session.status !== 'active'
+            || activeSessions.get(sessionKey(adoptAnchor, ds.larkAppId)) !== ds
+            || isSessionTransferring(ds)
+          )
+        ) {
+          await sessionReply(rootId, t('cmd.session.transfer_in_progress', undefined, loc));
+          break;
+        }
 
         if (sessions.length === 0 && resumable.length === 0) {
           await sessionReply(rootId, t('cmd.adopt.no_sessions', undefined, loc));
@@ -2513,7 +2586,19 @@ export async function handleCommand(
           break;
         }
 
-        const cardJson = buildAdoptSelectCard(sessions, rootId, loc, resumable);
+        // Cache the snapshot so the picker's search / page clicks reuse it
+        // (confirm re-discovers to re-validate the live pane).
+        cacheAdoptCandidates(rootId, candidates, Date.now());
+        const cardJson = buildAdoptSelectCard(
+          sessions,
+          rootId,
+          loc,
+          resumable,
+          undefined,
+          message.senderId,
+          candidates.resumeLimit,
+          botCliId,
+        );
         await sessionReply(rootId, cardJson, 'interactive');
         break;
       }
@@ -2717,15 +2802,15 @@ export async function handleCommand(
           rawArgs = rawArgs.replace(roleProfileArg[0], ' ');
         }
         const firstLine = rawArgs.split(/\r?\n/).map(s => s.trim()).find(Boolean) ?? '';
-        const MAX_NAME = 50; // Lark group names cap around 60; leave headroom for '…'
-        let groupName: string;
+        let baseGroupName: string;
         if (firstLine) {
-          groupName = firstLine.length > MAX_NAME ? firstLine.slice(0, MAX_NAME) + '…' : firstLine;
+          baseGroupName = firstLine;
         } else {
           const now = new Date();
           const ts = `${String(now.getMonth() + 1).padStart(2, '0')}/${String(now.getDate()).padStart(2, '0')} ${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
-          groupName = t('cmd.group.empty_fallback', { ts }, loc);
+          baseGroupName = t('cmd.group.empty_fallback', { ts }, loc);
         }
+        const groupName = formatSlashGroupName(baseGroupName, readGlobalConfig().groupNamePrefix);
 
         // Bots to invite: every @-mentioned bot (creator filtered out internally
         // by the service). Empty mentions → solo group (creator only).
@@ -2938,8 +3023,50 @@ export async function handleCommand(
           const { collectRelayPickerEntries } = await import('../services/relay-picker.js');
           const entries = await collectRelayPickerEntries(activeSessions, myAppId, targetAnchor, operatorOpenId);
           const { buildRelayPickerCard } = await import('../im/lark/card-builder.js');
-          const card = buildRelayPickerCard(entries, targetChatId, targetAnchor, operatorOpenId, loc, undefined, targetScope, targetChatType);
-          await replyAtInvocation(card, 'interactive');
+          // ── Ephemeral (仅邀请者可见) picker ────────────────────────────────
+          // The picker exposes session metadata — title + source-chat name — to
+          // everyone who can see the message. When the bot runs in privateCard
+          // mode we hide it: send the picker as an ephemeral card visible only to
+          // the invoker.
+          //
+          // Gate on group + privateCard + **chat-scope**. The chat-scope clause
+          // is load-bearing: the ephemeral API (`ephemeral/v1/send`) takes a
+          // `chat_id` only — it has NO thread/root anchor — so a thread-scope
+          // target (话题群 / 话题 inside a 普通群 / new-topic·shared) can't keep the
+          // card in its 话题. A 话题群 rejects with 18053 (→ fall back below), but
+          // a 话题 inside a 普通群 SUCCEEDS and the card escapes to the group top
+          // level. This is the same trap `deliverEphemeralOrReply` (worker-pool)
+          // guards against with a REGRESSION test; PR #164 was the original live
+          // fix. Per 申晗 (2026-07-29): 话题内公开可接受 — so thread-scope pickers
+          // stay on the visible in-thread reply (public card in the 话题), and
+          // ephemeral is scoped to flat 普通群 only, mirroring /card & /close
+          // private cards. p2p has no ephemeral option; an unexpected reject
+          // (18053 etc.) still falls back to the visible reply below.
+          const privatePicker = targetChatType === 'group'
+            && targetScope === 'chat'
+            && getBot(myAppId).config.privateCard === true;
+          const card = buildRelayPickerCard(
+            entries, targetChatId, targetAnchor, operatorOpenId, loc, undefined,
+            targetScope, targetChatType, privatePicker ? 'private' : 'public',
+          );
+          if (privatePicker) {
+            const { sendEphemeralCard } = await import('../im/lark/client.js');
+            try {
+              await sendEphemeralCard(myAppId, targetChatId, operatorOpenId, card);
+            } catch (err) {
+              // Ephemeral unavailable here (18053 topic / permission / network):
+              // fall back to the visible reply so the picker still works — the
+              // privacy win is best-effort, correctness is not.
+              logger.warn(`[${logTag}] /relay ephemeral picker failed (${err instanceof Error ? err.message : err}); sending visible picker`);
+              const visibleCard = buildRelayPickerCard(
+                entries, targetChatId, targetAnchor, operatorOpenId, loc, undefined,
+                targetScope, targetChatType, 'public',
+              );
+              await replyAtInvocation(visibleCard, 'interactive');
+            }
+          } else {
+            await replyAtInvocation(card, 'interactive');
+          }
           break;
         }
         const afterFlag = argsLine.replace(/^--create\s*/i, '').trim();
@@ -3387,7 +3514,6 @@ export async function handleCommand(
           t('help.term', undefined, loc),
           t('help.dashboard', undefined, loc),
           t('help.insight', undefined, loc),
-          t('help.land', undefined, loc),
           t('help.subscribe_doc', undefined, loc),
           t('help.watch_comment', undefined, loc),
           t('help.vc', undefined, loc),
@@ -3441,6 +3567,7 @@ export async function handleCommand(
           t('help.grant', undefined, loc),
           t('help.revoke', undefined, loc),
           t('help.vc_auth', undefined, loc),
+          t('help.invite', undefined, loc),
           '',
           t('help.heading_config', undefined, loc),
           t('help.config_get', undefined, loc),
@@ -3474,6 +3601,8 @@ async function handleCodexAppAdoptCommand(
     deps.sessionReply(rid, content, msgType, larkAppId);
   const loc: Locale = localeForBot(ds.larkAppId ?? larkAppId);
   const botCfg = getBot(ds.larkAppId).config;
+  const sourceSession = ds.session;
+  const sourceAnchor = sessionAnchorId(ds);
 
   let threads: CodexAppThreadSummary[];
   try {
@@ -3484,6 +3613,15 @@ async function handleCodexAppAdoptCommand(
     });
   } catch (err: any) {
     await sessionReply(rootId, t('cmd.codex_app_adopt.list_failed', { error: err?.message ?? String(err) }, loc));
+    return;
+  }
+  if (
+    ds.session !== sourceSession
+    || ds.session.status !== 'active'
+    || deps.activeSessions.get(sessionKey(sourceAnchor, ds.larkAppId)) !== ds
+    || isSessionTransferring(ds)
+  ) {
+    await sessionReply(rootId, t('cmd.session.transfer_in_progress', undefined, loc));
     return;
   }
 
@@ -3513,6 +3651,39 @@ function isZellijTarget(t: AdoptableSession | ZellijAdoptableSession): t is Zell
   return 'zellijPaneId' in t;
 }
 
+/**
+ * Refuse a takeover (`/adopt`, Codex App thread, disk resume import) while the
+ * session is still on the first-spawn repo-select gate (`pendingRepo`).
+ *
+ * Adopt/import attaches to an already-running CLI, so it cannot double as a way
+ * to finish that gate — the two states are mutually exclusive by design. Rather
+ * than migrate the pending placeholder in place (which used to leave a
+ * contradictory `adopt` + "待选仓库" session, and risked folding botmux
+ * envelopes into the external CLI), we post a card that explains the refusal
+ * and offers a one-tap "close session". After the user closes it, a fresh
+ * `/adopt` runs as a clean first message (which never enters pendingRepo).
+ *
+ * Returns true when the takeover was blocked (caller must return immediately).
+ * Note pendingRepo is in-memory only, so this can never wrongly fire on a
+ * daemon-restored session.
+ */
+async function blockTakeoverWhilePendingRepo(
+  ds: DaemonSession,
+  sessionReply: (rid: string, content: string, msgType?: string) => Promise<string>,
+): Promise<boolean> {
+  if (!ds.pendingRepo) return false;
+  const loc = localeForBot(ds.larkAppId);
+  const card = buildAdoptBlockedCard(
+    sessionAnchorId(ds),
+    ds.session.sessionId,
+    getBot(ds.larkAppId).config.cliId,
+    loc,
+  );
+  await sessionReply(sessionAnchorId(ds), card, 'interactive');
+  logger.info(`[${tag(ds)}] Takeover refused: session still on pendingRepo gate — posted close-session card`);
+  return true;
+}
+
 export async function startCodexAppThreadSession(
   thread: CodexAppThreadSummary,
   ds: DaemonSession,
@@ -3523,6 +3694,13 @@ export async function startCodexAppThreadSession(
     deps.sessionReply(rid, content, msgType, larkAppId);
   const loc: Locale = localeForBot(ds.larkAppId ?? larkAppId);
   const title = codexAppThreadTitle(thread);
+  if (isSessionTransferring(ds)) {
+    await sessionReply(sessionAnchorId(ds), t('cmd.session.transfer_in_progress', undefined, loc));
+    return;
+  }
+
+  if (await blockTakeoverWhilePendingRepo(ds, sessionReply)) return;
+
   const targetSessionId = ds.session.sessionId;
   const switched = await withBotTurnMutation(ds.larkAppId, async () => {
     const current = [...deps.activeSessions.values()].find(
@@ -3571,6 +3749,10 @@ export async function startAdoptSession(
   const sessionReply = (rid: string, content: string, msgType?: string) =>
     deps.sessionReply(rid, content, msgType, larkAppId);
   const loc: Locale = localeForBot(ds.larkAppId ?? larkAppId);
+  if (isSessionTransferring(ds)) {
+    await sessionReply(sessionAnchorId(ds), t('cmd.session.transfer_in_progress', undefined, loc));
+    return;
+  }
 
   const zellij = isZellijTarget(target);
   if (!zellij && target.source === 'herdr' && target.herdrSessionName && target.herdrAgentName) {
@@ -3599,6 +3781,10 @@ export async function startAdoptSession(
     await sessionReply(sessionAnchorId(ds), t('cmd.adopt.sandbox_blocked', undefined, loc));
     return;
   }
+
+  // A session still on the repo-select gate can't be adopted in place — refuse
+  // and offer a one-tap close so the user retires it and re-adopts cleanly.
+  if (await blockTakeoverWhilePendingRepo(ds, sessionReply)) return;
 
   const valid = zellij
     ? validateZellijAdoptTarget(target.zellijSession, target.zellijPaneId, target.cliPid, target.cliId)
@@ -3661,6 +3847,12 @@ export async function startAdoptSession(
   await sessionReply(adopted.anchor, t('cmd.adopt.success', { cliName, project, pane }, loc));
 }
 
+/** Cap on resume candidates surfaced by the /adopt picker. Kept at the legacy
+ *  20 (per product call: the V2 card is a display change, not a scope change).
+ *  When the cap is hit the card shows a hint pointing at search + the
+ *  `/adopt <id>` direct path, so history beyond the cap is still reachable. */
+export const ADOPT_RESUME_LIMIT = 20;
+
 /** Discover the sessions resumable from disk for `cliId`, excluding any whose
  *  CLI-native id is already live in a botmux session (so a session botmux
  *  already runs isn't offered for re-import). Returns [] when the adapter has
@@ -3669,7 +3861,7 @@ export async function discoverResumableSessionsForBot(
   cliId: CliId,
   cliPathOverride: string | undefined,
   activeSessions: Map<string, DaemonSession>,
-  limit = 20,
+  limit = ADOPT_RESUME_LIMIT,
 ): Promise<ResumableSession[]> {
   let adapter: ReturnType<typeof createCliAdapterSync>;
   try { adapter = createCliAdapterSync(cliId, cliPathOverride); } catch { return []; }
@@ -3708,6 +3900,13 @@ export async function startResumeImportSession(
     deps.sessionReply(rid, content, msgType, larkAppId);
   const loc: Locale = localeForBot(ds.larkAppId ?? larkAppId);
   const project = target.cwd.split('/').pop() || target.cwd;
+  if (isSessionTransferring(ds)) {
+    await sessionReply(sessionAnchorId(ds), t('cmd.session.transfer_in_progress', undefined, loc));
+    return;
+  }
+
+  if (await blockTakeoverWhilePendingRepo(ds, sessionReply)) return;
+
   const targetSessionId = ds.session.sessionId;
   const resumed = await withBotTurnMutation(ds.larkAppId, async () => {
     const current = [...deps.activeSessions.values()].find(

@@ -55,6 +55,9 @@ vi.mock('../src/config.js', () => ({
 }));
 
 vi.mock('../src/services/session-store.js', () => ({
+  registerSessionBridgeSendMarkerCleanupFence: vi.fn(),
+  cleanupSessionBridgeSendMarkers: vi.fn(),
+  cleanupSessionBridgeSendMarkersNow: vi.fn(),
   closeSession: vi.fn(),
   updateSession: vi.fn(),
   createSession: vi.fn(),
@@ -84,6 +87,7 @@ vi.mock('../src/core/worker-pool.js', () => {
   return {
   forkWorker: vi.fn(),
   killWorker: vi.fn(),
+  teardownAuthoritativePersistentBackingBeforeClose: vi.fn(),
   scheduleCardPatch: vi.fn(),
   parkStreamCard: vi.fn(),
   clearUsageLimitState: vi.fn(),
@@ -116,11 +120,8 @@ vi.mock('../src/im/lark/event-dispatcher.js', () => ({
 
 vi.mock('../src/core/session-activity.js', () => ({
   publishAttentionPatch: vi.fn(),
+  publishClosedSessionPatch: vi.fn(),
   announcePendingRepoSession: vi.fn(),
-}));
-
-vi.mock('../src/services/default-worktree.js', () => ({
-  maybeCreateDefaultWorktree: vi.fn(),
 }));
 
 vi.mock('../src/services/frozen-card-store.js', () => ({
@@ -142,6 +143,10 @@ vi.mock('../src/services/worktree-slug-ai.js', () => ({
   }),
 }));
 
+vi.mock('../src/services/default-worktree.js', () => ({
+  maybeCreateDefaultWorktree: vi.fn(async (_appId: string, baseDir: string) => ({ dir: `${baseDir}-wt` })),
+}));
+
 vi.mock('@larksuiteoapi/node-sdk', () => ({
   Client: class { constructor() {} },
   WSClient: class { start() {} },
@@ -152,11 +157,12 @@ vi.mock('@larksuiteoapi/node-sdk', () => ({
 // ─── Imports ──────────────────────────────────────────────────────────────
 
 import { handleCardAction, runAutoWorktreeCommit, type CardHandlerDeps } from '../src/im/lark/card-handler.js';
-import { forkWorker, killWorker, deliverEphemeralOrReply, deliverWriteLinkCard, closeSession as closeWorkerPoolSession, withActiveSessionKeyLock } from '../src/core/worker-pool.js';
+import { forkWorker, killWorker, teardownAuthoritativePersistentBackingBeforeClose, deliverEphemeralOrReply, deliverWriteLinkCard, closeSession as closeWorkerPoolSession, withActiveSessionKeyLock } from '../src/core/worker-pool.js';
 import { buildNewTopicCliInput, getAvailableBots, getSessionWorkingDir } from '../src/core/session-manager.js';
 import { getBot } from '../src/bot-registry.js';
-import { createSession, updateSession } from '../src/services/session-store.js';
+import { createSession, closeSession, updateSession } from '../src/services/session-store.js';
 import { createRepoWorktree, pushWorktreeBranch, removeRepoWorktree } from '../src/services/git-worktree.js';
+import { maybeCreateDefaultWorktree } from '../src/services/default-worktree.js';
 import { applyConfigField } from '../src/services/bot-config-store.js';
 import { deleteMessage } from '../src/im/lark/client.js';
 import { canOperate } from '../src/im/lark/event-dispatcher.js';
@@ -166,7 +172,6 @@ import type { ProjectInfo } from '../src/services/project-scanner.js';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { basename, join } from 'node:path';
-import { maybeCreateDefaultWorktree } from '../src/services/default-worktree.js';
 import {
   __testOnly_resetBotTurnMutationGates,
   withBotTurnMutation,
@@ -272,6 +277,7 @@ beforeEach(() => {
   __testOnly_resetBotTurnMutationGates();
   vi.clearAllMocks();
   vi.mocked(deleteMessage).mockReset().mockResolvedValue(true);
+  vi.mocked(teardownAuthoritativePersistentBackingBeforeClose).mockImplementation(() => undefined);
   vi.mocked(getBot).mockImplementation(() => ({
     config: { larkAppId: APP_ID, larkAppSecret: 'secret', cliId: 'claude-code' },
     resolvedAllowedUsers: [],
@@ -337,6 +343,21 @@ describe('repo select card — plain switch', () => {
     expect(forkWorker).toHaveBeenCalledTimes(1);
   });
 
+  it('mid-session selection publishes the closed preview patch for the displaced session', async () => {
+    const ds = makeDs();
+    const oldSession = ds.session;
+    const { deps } = makeDeps(ds);
+
+    await handleCardAction(makeSelectEvent('repo_switch', '/repos/alpha'), deps, APP_ID);
+
+    // PR #597 routes the displaced-session teardown through the canonical
+    // worker-pool closeSession (atomic under the anchor key lock), which itself
+    // publishes the closed-preview dashboard patch. The card handler no longer
+    // calls sessionStore.closeSession / publishClosedSessionPatch directly.
+    expect(closeWorkerPoolSession).toHaveBeenCalledWith(oldSession.sessionId);
+    expect(closeSession).not.toHaveBeenCalled();
+  });
+
   it('pendingRepo selection forks the CLI with the buffered prompt', async () => {
     const ds = makeDs({
       pendingRepo: true,
@@ -369,6 +390,74 @@ describe('repo select card — plain switch', () => {
     expect(killWorker).not.toHaveBeenCalled();
     // First-spawn (pendingRepo) closes nothing, so no "session closed" card.
     expect(deliverEphemeralOrReply).not.toHaveBeenCalled();
+    // The buffered message IS the first real user turn — nothing left pending.
+    expect(ds.session.initialUserTurnPending).toBeUndefined();
+  });
+
+  // ─── empty start (no buffered user input at all) ─────────────────────────
+  //
+  // Reached when the session was created by a bare `/repo` (the message IS the
+  // command, so pendingPrompt is ''). The CLI must boot idle — NOT with an
+  // empty `<user_message>` opening — and leave a durable marker so the user's
+  // next real message gets the full new-topic opening context.
+
+  it('pendingRepo card selection with nothing buffered boots the CLI idle and marks the first turn pending', async () => {
+    const ds = makeDs({ pendingRepo: true, pendingPrompt: '', worker: null });
+    const { deps } = makeDeps(ds);
+
+    await handleCardAction(makeSelectEvent('repo_switch', '/repos/alpha'), deps, APP_ID);
+
+    expect(forkWorker).toHaveBeenCalledTimes(1);
+    expect(forkWorker).toHaveBeenCalledWith(ds, '', false);
+    // No empty/boilerplate `<user_message>` opening burned on the cold start.
+    expect(buildNewTopicCliInput).not.toHaveBeenCalled();
+    expect(ds.pendingRepo).toBe(false);
+    expect(ds.session.initialUserTurnPending).toBe(true);
+    expect(updateSession).toHaveBeenCalledWith(ds.session);
+  });
+
+  it('skip_repo with nothing buffered marks the first turn pending too', async () => {
+    const ds = makeDs({ pendingRepo: true, pendingPrompt: '', worker: null });
+    const { deps } = makeDeps(ds);
+
+    await handleCardAction(makeSkipEvent(), deps, APP_ID);
+
+    expect(forkWorker).toHaveBeenCalledWith(ds, '', false);
+    expect(ds.session.initialUserTurnPending).toBe(true);
+  });
+
+  it('raw-passthrough cold start does NOT mark the first turn pending', async () => {
+    // `/goal …` owns the first turn (delivered literally on prompt_ready), so
+    // this is not an "empty start awaiting its first user turn".
+    const ds = makeDs({
+      pendingRepo: true,
+      pendingPrompt: '',
+      pendingRawInput: '/goal 发布 onboarding',
+      pendingRawTurnId: 'om_goal_first',
+      worker: null,
+    });
+    const { deps } = makeDeps(ds);
+
+    await handleCardAction(makeSelectEvent('repo_switch', '/repos/alpha'), deps, APP_ID);
+
+    expect(forkWorker).toHaveBeenCalledWith(ds, '', false);
+    expect(ds.pendingRawInput).toBe('/goal 发布 onboarding');
+    expect(ds.session.initialUserTurnPending).toBeUndefined();
+  });
+
+  it('mid-session card switch empty-starts the replacement CLI and marks its first turn pending', async () => {
+    const ds = makeDs({ pendingRepo: false });
+    const { deps } = makeDeps(ds);
+
+    await handleCardAction(makeSelectEvent('repo_switch', '/repos/beta'), deps, APP_ID);
+
+    // Displaced session is torn down through the canonical worker-pool
+    // closeSession (kills the worker internally), not a bare killWorker.
+    expect(closeWorkerPoolSession).toHaveBeenCalledWith('uuid-old');
+    expect(killWorker).not.toHaveBeenCalled();
+    expect(forkWorker).toHaveBeenCalledWith(ds, '', false);
+    expect(ds.hasHistory).toBe(false);
+    expect(ds.session.initialUserTurnPending).toBe(true);
   });
 
   it('pendingRepo selection forwards the complete Codex App sidecar to forkWorker', async () => {
@@ -802,6 +891,31 @@ describe('repo select card — plain switch', () => {
     expect(ds.consumedRepoCardMessageIds).toContain('om_card');
   });
 
+  it('keeps the old ZMX session and repo card active when authoritative teardown is refused', async () => {
+    const ds = makeDs();
+    ds.session.backendType = 'zmx';
+    ds.session.workingDir = '/repos/gamma';
+    const oldSession = ds.session;
+    const { deps, sessionReply } = makeDeps(ds);
+    vi.mocked(teardownAuthoritativePersistentBackingBeforeClose).mockImplementationOnce(() => {
+      throw new Error('ownership probe unavailable');
+    });
+
+    await handleCardAction(makeSelectEvent('repo_switch', '/repos/beta'), deps, APP_ID);
+
+    expect(teardownAuthoritativePersistentBackingBeforeClose).toHaveBeenCalledWith(ds);
+    expect(killWorker).not.toHaveBeenCalled();
+    expect(closeSession).not.toHaveBeenCalled();
+    expect(createSession).not.toHaveBeenCalled();
+    expect(forkWorker).not.toHaveBeenCalled();
+    expect(ds.session).toBe(oldSession);
+    expect(ds.session.status).toBe('active');
+    expect(ds.session.workingDir).toBe('/repos/gamma');
+    expect(ds.repoCardMessageId).toBe('om_card');
+    expect(ds.consumedRepoCardMessageIds).toBeUndefined();
+    expect(sessionReply.mock.calls.map(c => c[1]).join()).toContain('ownership probe unavailable');
+  });
+
   it('mid-session claims the card before confirm await so a second click cannot double kill/fork', async () => {
     // Regression: mid-session used to mark consumed only after sessionReply.
     // Park the "已切换" reply; a second click on the same card must toast and
@@ -977,6 +1091,37 @@ describe('repo select card — worktree open', () => {
     expect(forkWorker).not.toHaveBeenCalled();
     expect(killWorker).not.toHaveBeenCalled();
     expect(ds.worktreeCreating).not.toBe(true);
+  });
+
+  it('runAutoWorktreeCommit bails when pendingRepo was consumed mid-build (e.g. notifier adopt)', async () => {
+    // A takeover (Codex-notifier「继续处理」, etc.) can consume pendingRepo while
+    // the up-to-30s worktree build runs. The late completion must NOT funnel into
+    // commitRepoSelection and kill+replace the just-adopted session.
+    const ds = makeDs({ pendingRepo: true, pendingPrompt: 'hi', worker: { killed: false } as any });
+    const { deps } = makeDeps(ds);
+    const d = deferred<{ dir: string }>();
+    vi.mocked(maybeCreateDefaultWorktree).mockReturnValueOnce(d.promise as any);
+
+    const run = runAutoWorktreeCommit({
+      ds,
+      anchor: ROOT_ID,
+      larkAppId: APP_ID,
+      baseDir: '/repos/alpha',
+      activeSessions: deps.activeSessions,
+      notify: vi.fn(),
+    });
+    await vi.waitFor(() => expect(ds.worktreeCreating).toBe(true));
+
+    // Simulate the takeover consuming pendingRepo while git runs.
+    ds.pendingRepo = false;
+    d.resolve({ dir: '/repos/alpha-wt' });
+    await run;
+
+    // Guard fired: no commit, no fork/kill, workingDir untouched.
+    expect(forkWorker).not.toHaveBeenCalled();
+    expect(killWorker).not.toHaveBeenCalled();
+    expect(ds.workingDir).toBeUndefined();
+    expect(ds.worktreeCreating).toBe(false);
   });
 
   it('double click starts ONE background creation and commits once', async () => {

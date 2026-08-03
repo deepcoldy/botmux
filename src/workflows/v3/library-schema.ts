@@ -14,7 +14,7 @@ import { createHash, randomUUID } from 'node:crypto';
 
 import { canonicalJsonStringify } from '../../utils/canonical-json.js';
 import type { V3Node } from './dag.js';
-import { DagValidationError, validateDag } from './dag.js';
+import { DagValidationError, isGoalNode, isLoopNode, validateDag } from './dag.js';
 import type { Spec } from './contract.js';
 import { SpecValidationError, validateSpec } from './spec.js';
 import { assertSavedWorkflowTemplateBindings } from './template-bindings.js';
@@ -96,6 +96,13 @@ export interface SavedWorkflowSafety {
   /** Hash of the normalized human gates, protecting against silent gate weakening. */
   gateDigest: string;
   sideEffects: Array<{ nodeId: string; kind: string }>;
+}
+
+export interface SavedWorkflowChatSideEffectProblem {
+  nodeId: string;
+  path: string;
+  kind: string;
+  guidance: string;
 }
 
 export interface SavedWorkflowRevisionPayloadV1 {
@@ -401,6 +408,13 @@ export function validateDagTemplate(raw: unknown): V3DagTemplate {
   const botProblems: string[] = [];
   validateDirectBotSelectors(nodes, undefined, 'dagTemplate.nodes', botProblems);
   if (botProblems.length > 0) throw new SavedWorkflowSchemaError(botProblems);
+  // NOTE: the chat-facing side-effect policy lint is deliberately NOT run here.
+  // validateDagTemplate is the structural deserializer shared by the READ path
+  // (loadSavedWorkflowRevision → validateSavedWorkflowRevisionPayload), so
+  // gating it would retroactively brick already-saved revisions that were legal
+  // before the lint existed. The policy check runs only at authoring boundaries
+  // (buildSavedWorkflowRevisionBaseline / validateSavedWorkflowRevisionDraft /
+  // v2 migration) via assertNoSavedWorkflowChatSideEffects.
   return { nodes };
 }
 
@@ -444,6 +458,113 @@ function gateProjection(nodes: V3Node[], prefix = ''): unknown[] {
     if (node.type === 'loop' && node.body) out.push(...gateProjection(node.body.nodes, id));
   }
   return out;
+}
+
+const CHAT_SIDE_EFFECT_PATTERNS: Array<{ kind: string; re: RegExp }> = [
+  { kind: 'botmux-send', re: /\bbotmux\s+(?:send|reply)\b/i },
+  { kind: 'bytedcli-feishu', re: /\bbytedcli\s+feishu\b.*\b(?:send|reply|message|im|chat)\b/i },
+  { kind: 'lark-cli-im', re: /\blark-cli\b.*\b(?:send|reply|message|im|chat)\b/i },
+  { kind: 'feishu-openapi-message', re: /\/open-apis\/im\/v1\/(?:messages|chats)\b/i },
+  { kind: 'feishu-openapi-message', re: /\b(?:feishu|lark)\b.*\bopenapi\b.*\b(?:send|reply|message)\b/i },
+  { kind: 'feishu-openapi-message', re: /\bim\.v1\.message\.(?:create|reply|patch)\b/i },
+];
+
+function collectStrings(value: unknown, path: string, out: Array<{ path: string; value: string }>): void {
+  if (typeof value === 'string') {
+    out.push({ path, value });
+    return;
+  }
+  if (Array.isArray(value)) {
+    value.forEach((item, index) => collectStrings(item, `${path}[${index}]`, out));
+    return;
+  }
+  if (value && typeof value === 'object') {
+    for (const [key, child] of Object.entries(value as Record<string, unknown>)) {
+      collectStrings(child, `${path}.${key}`, out);
+    }
+  }
+}
+
+function pushChatSideEffectProblems(
+  node: V3Node,
+  nodeId: string,
+  where: string,
+  problems: SavedWorkflowChatSideEffectProblem[],
+): void {
+  const strings: Array<{ path: string; value: string }> = [];
+  collectStrings(
+    {
+      goal: node.goal,
+      humanGate: node.humanGate,
+      override: node.override,
+    },
+    where,
+    strings,
+  );
+  for (const item of strings) {
+    for (const pattern of CHAT_SIDE_EFFECT_PATTERNS) {
+      if (!pattern.re.test(item.value)) continue;
+      problems.push({
+        nodeId,
+        path: item.path,
+        kind: pattern.kind,
+        guidance:
+          `Move chat notification out of goal node "${nodeId}": split it into ` +
+          'businessTask (write result.json/final_message.md) plus a hostExecutor ' +
+          'feishu-send/feishu-reply node that reads the upstream result.',
+      });
+      break;
+    }
+  }
+}
+
+export function collectSavedWorkflowChatSideEffectProblems(
+  dagTemplate: V3DagTemplate,
+): SavedWorkflowChatSideEffectProblem[] {
+  const problems: SavedWorkflowChatSideEffectProblem[] = [];
+  const visit = (nodes: V3Node[], prefix: string): void => {
+    for (const node of nodes) {
+      const nodeId = prefix ? `${prefix}.${node.id}` : node.id;
+      if (isGoalNode(node)) {
+        pushChatSideEffectProblems(
+          node,
+          nodeId,
+          prefix ? `dagTemplate.nodes.${prefix}.${node.id}` : `dagTemplate.nodes.${node.id}`,
+          problems,
+        );
+      } else if (isLoopNode(node)) {
+        visit(node.body.nodes, nodeId);
+      }
+    }
+  };
+  visit(dagTemplate.nodes, '');
+  return problems;
+}
+
+export function formatSavedWorkflowChatSideEffectProblems(
+  problems: readonly SavedWorkflowChatSideEffectProblem[],
+): string[] {
+  return problems.map((problem) =>
+    `${problem.path} contains chat-facing side effect (${problem.kind}); ${problem.guidance}`);
+}
+
+/**
+ * Authoring-boundary policy gate. Throw when a to-be-saved DAG template has a
+ * chat-facing side effect in a goal node. This is intentionally NOT part of the
+ * structural deserializer (validateDagTemplate) or the read path
+ * (validateSavedWorkflowRevisionPayload): those are traversed when LOADING an
+ * already-saved revision, and gating them would retroactively brick revisions
+ * that were legal before the lint existed. Callers on the write/compile/publish
+ * side (buildSavedWorkflowRevisionBaseline, validateSavedWorkflowRevisionDraft,
+ * v2→v3 migration) invoke this so a fresh authored definition must be
+ * lint-clean, while old revisions stay loadable/show-able/appendable (and can
+ * be fixed by appending a clean revision).
+ */
+export function assertNoSavedWorkflowChatSideEffects(dagTemplate: V3DagTemplate): void {
+  const chatEffects = formatSavedWorkflowChatSideEffectProblems(
+    collectSavedWorkflowChatSideEffectProblems(dagTemplate),
+  );
+  if (chatEffects.length > 0) throw new SavedWorkflowSchemaError(chatEffects);
 }
 
 function sha256(value: string): string {
@@ -591,6 +712,11 @@ export function validateSavedWorkflowRevisionDraft(raw: unknown): SavedWorkflowR
     createdBy: { openId: 'validation-owner', larkAppId: 'validation-app' },
     ...raw,
   });
+  // Authoring boundary: a new revision draft (e.g. distillation submit) must be
+  // free of chat-facing side effects. Kept here rather than in
+  // validateSavedWorkflowRevisionPayload so the READ path (loadSavedWorkflowRevision)
+  // never applies the policy to already-saved revisions.
+  assertNoSavedWorkflowChatSideEffects(normalized.dagTemplate);
   const {
     workflowId: _workflowId,
     humanVersion: _humanVersion,

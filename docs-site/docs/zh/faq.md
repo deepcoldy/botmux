@@ -2,19 +2,43 @@
 
 > 综合自 README 与社区交流群高频问题，持续补充中。更多坑见 [常见踩坑](/pitfalls)。
 
-## 机器人完全收不到消息怎么办？
+## 「机器人不回复」怎么排查？（最高频问题）
+
+先按**症状**对号入座，不同症状根因不同：
+
+| 症状 | 大概率根因 | 跳转 |
+|------|-----------|------|
+| 发消息**完全没反应**（连表情都没有） | 事件订阅 / 发版 / 长连接没通 | [A. 完全收不到消息](#a-完全收不到消息) |
+| 只有**我（owner）**能触发，别人 @ 弹授权卡 / 不回 | 只配了操作权、没配对话权 | [B. 别人不能用 / 弹授权卡](#b-别人不能用--弹授权卡) |
+| 群里**必须 @ 才回** / 想免 @ 自动回 | 群 @ 策略 | [B. 别人不能用 / 弹授权卡](#b-别人不能用--弹授权卡) |
+| 有 🟡「工作中」但**结果没发出来**（终端里有输出） | 终端 CLI 会话：模型没调 `botmux send`（`codex-app` 是自动转发、属例外） | [C. 终端有输出但没发飞书](#c-终端有输出但没发飞书) |
+| 会话**起不来** / 首条消息报 `zsh: parse error` | 登录 shell 启动文件跳转 | [会话起不来](#会话怎么都起不来--首条消息报-zsh-parse-error) |
+
+### A. 完全收不到消息
 
 按顺序自查（PersonalAgent 默认配好，正常不用动）：
 
 1. **事件订阅**：开放平台 → 事件与回调 → 应订阅 `im.message.receive_v1` + `card.action.trigger`，方式为「长连接 (WebSocket)」，且 daemon 已在跑。
 2. **机器人能力**：开放平台 → 应用功能 → 机器人 应已开通。
-3. **发版**：应用要创建并发布过版本（可用性「仅自己可见」自动通过）。
+3. **发版**：应用要创建并发布过版本（可用性「仅自己可见」自动通过）。改完权限 / 事件**必须重新发版**才生效。
 4. **长连接独占**：确认这个 Bot 没被别的应用同时抢长连接。
 5. 确认后 `botmux restart`（在干净 shell 里）。
 
-## 机器人在终端有输出，但没发到飞书？
+> 想让 agent 帮你自查，见 [常见踩坑 · 排查通用手法](/pitfalls#排查通用手法)（`botmux logs` 找 spawn 命令本地复现 + Web 终端看真实报错）。
 
-终端 stdout ≠ 已发飞书。必须显式执行 `botmux send`（并带 `--mention-back` / `--mention` / `--no-mention` 之一），群里才看得到。模型只 `echo`/`print` 或忘了调 `botmux send` 就不会发出。多行内容用 heredoc，别写成 `"第一行\n第二行"`。
+### B. 别人不能用 / 弹授权卡
+
+botmux 权限分两层（详见 [权限怎么分](#权限怎么分谁能操作)）：**对话权**（谁能问）和**操作权**（谁能 `/cd` `/restart` 点按钮）。默认只有 owner 有对话权，所以别人 @ 会被拒 / 弹授权卡。
+
+- **让整个群都能用**：给 bot 配 `allowedChatGroups`（该群全员可对话），或用 `/grant` 授权指定群。
+- **群 @ 策略**（必须 @ vs 免 @）：默认多人群必须 @；话题内免 @ / 全群免 @ 可在群 @ 策略里配。注意「1 个人 + 1 个 bot」的 1v1 群本来就免 @。
+- **oncall 场景**（每工单一个新群、全员免 @ 直接问）：见 [Oncall 模式](/oncall)。
+
+### C. 终端有输出但没发飞书
+
+**这条只针对需要显式发送的终端 CLI 会话**（Claude Code / Codex CLI / Gemini / CoCo 等）：终端 stdout ≠ 已发飞书，模型必须显式执行 `botmux send`（并带 `--mention-back` / `--mention` / `--no-mention` 之一），群里才看得到。只 `echo`/`print` 或忘调 `botmux send` 就不会发出。多行内容用 heredoc，别写成 `"第一行\n第二行"`。
+
+> ⚠️ **例外：`codex-app`（Codex App app-server 协议）**——它的最终 assistant message 由 botmux **自动转发**回飞书，**常规回复不要调 `botmux send`**（否则会重复发送），仅在中途主动推送 / 发附件 / 跨 bot @ 时才用。
 
 ## `botmux history` 报 400 / 飞书网关 411？
 
@@ -51,7 +75,7 @@
 
 ## daemon 重启会丢上下文吗？
 
-装了 **tmux** 就不会——CLI 进程常驻 tmux session，`botmux restart` 后下次消息自动 re-attach，无需 `--resume`。没装 tmux 则走 pty 模式，重启会重载。
+装了 **tmux** 就不会——tmux 是默认后端，CLI 进程常驻 tmux session，`botmux restart` 后下次消息自动 re-attach，无需 `--resume`。⚠️ 没装 tmux **不会自动降级 pty**，而是硬拦截弹卡让你装 tmux；只有显式 `BACKEND_TYPE=pty`（或 per-bot `backendType:"pty"`）才用 pty，且 pty 会话**不跨 daemon 重启存活**、重启会重载。
 
 ## 会话不关会一直跑吗？有自动回收吗？
 

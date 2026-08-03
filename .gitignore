@@ -36,3 +36,8 @@ build/desktop-node/
 build/desktop-runtime/
 build/icon.png
 src/desktop/assets/*.png
+
+# 内网独立仓 / 网关配置：各自有独立 git 仓，含内网部署信息，
+# 绝不并入这个公开仓。防 `git add .` 误提交。
+platform/
+mcp-gateway/

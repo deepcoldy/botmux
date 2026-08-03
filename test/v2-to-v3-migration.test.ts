@@ -285,4 +285,24 @@ describe('v2 -> v3 Saved Workflow conversion', () => {
       'INERT_GATE_TIMEOUT_DROPPED',
     ]));
   });
+
+  it('fails migration when a legacy goal node prompt carries a chat-facing side effect', () => {
+    const withChatEffect: WorkflowDefinition = {
+      workflowId: 'legacy-chat-effect',
+      version: 1,
+      params: {},
+      nodes: {
+        notify: {
+          type: 'subagent',
+          bot: BOT.larkAppId,
+          prompt: 'Write result.json, then run botmux send --mention ou_owner "done"',
+        },
+      },
+    };
+    const result = convertLegacyWorkflowDefinition({ definition: withChatEffect, bots: [BOT] });
+    expect(result.ok).toBe(false);
+    expect(codes(result)).toContain('V3_DAG_VALIDATION_FAILED');
+    // The graceful migration issue carries the actionable migration guidance.
+    expect(result.issues.some((issue) => /hostExecutor feishu-send\/feishu-reply/.test(issue.message ?? ''))).toBe(true);
+  });
 });

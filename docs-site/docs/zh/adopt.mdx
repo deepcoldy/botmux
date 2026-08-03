@@ -1,19 +1,34 @@
 # 会话接入（Adopt）
 
-把**已经在本地 tmux 里跑着**的 CLI 进程无缝接入 botmux，在手机上通过飞书查看进度和交互。
+把**已经在本地 tmux 里跑着**的 CLI 进程无缝接入 botmux，在手机上通过飞书查看进度和交互。典型场景：公司电脑 tmux 里 Claude Code 写到一半要走，手机飞书发 `/adopt` 就能接着看、接着发。
 
 <video src="https://magic-builder.tos-cn-beijing.volces.com/uploads/1780421531476_adopt-video.aud.mp4" controls preload="metadata" style={{width:'100%',borderRadius:'8px'}}></video>
 
 ```
 /adopt              # 扫描本机 tmux，弹出选择卡片
-/adopt 0:2.0        # 直接接入指定 tmux pane
+/adopt 0:2.0        # 直接接入指定 tmux pane（session:window.pane）
 ```
 
-## 三种动作
+> 选择卡片只列**当前 bot 所绑 CLI** 的会话（Pi bot 不会列出 Codex/TRAE 的 pane），且排除 botmux 自己的 `bmx-*` 常驻会话。
 
-- **共享模式**：接入后，本地终端（如 iTerm2）和飞书双向同步——流式卡片实时显示终端输出，飞书聊天框输入直接透传到终端。本地的 tmux 全程保持连接。
-- **一键接管**：点流式卡片上的「🔄 接管」，botmux 以 `--resume` 重建会话，转为标准 botmux 会话。
-- **安全断开**：点「⏏ 断开」，botmux 退出观察，原 CLI 不受影响。
+## 它是「桥接」，不是接管
+
+adopt 采用**零打扰桥接**：botmux 只旁路观察 pane（`tmux pipe-pane` 读输出、`send-keys` 写输入），**从不 attach、不 zoom、不 group** 你本地的 tmux——你在 iTerm2 里的会话全程不受影响。
+
+- **共享模式**：接入后，本地终端（如 iTerm2）和飞书双向同步——流式卡片实时显示终端输出，飞书聊天框输入直接透传到终端。本地 tmux 全程保持连接、毫发无损。
+- **安全断开**：点流式卡片上的「⏏ 断开」（或发 `/close`），botmux 退出观察、清掉自己这侧的 worker，**绝不结束你的 CLI**——原进程继续在你本地 tmux 里跑。
+
+> ⚠️ 卡片上旧的「🔄 接管」按钮**已停用**：桥接模式下不再渲染，历史卡片点了也是空操作。以 `--resume` 完整重建为标准 botmux 会话的能力（`/adopt --takeover`）仍在路线图上、尚未上线。当前 adopt 始终是「共享桥接」这一种形态。
+
+## 边界与注意
+
+adopt 会话的生命周期在**你的机器上**，不归 botmux 管，因此有几条硬边界：
+
+- **不能接力（`/relay`）**：CLI 在你电脑里跑，botmux 控不了它的 tmux 生命周期，接力会被拒。要换群继续，用新会话 + 交接。
+- **不能 resume**：adopt 会话不支持 `--resume` 重建。
+- **CLI 退出即结束**：adopt 模式下 botmux **不做自动重启**——被接入的 CLI 自己退出后，会话随之结束（卡片冻结、worker 收掉），不会像常驻会话那样重开。
+- **沙盒 bot 不能 adopt**：沙盒要包住一个从头启动的 CLI，无法套在一个已在跑的进程上（fail-closed 拒绝）。
+- **daemon 重启后的恢复很谨慎**：重启时会先核对被接入的宿主 CLI 是否还活着——确认没了才关会话；探测结果不确定（瞬时失败）时保持会话关闭，**要等下一次 restore pass（例如再次重启 daemon）才重新验证**，不会在下一条消息到来时自动复验。
 
 ## 典型用法
 

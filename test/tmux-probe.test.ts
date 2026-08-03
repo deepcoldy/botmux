@@ -1,14 +1,16 @@
 /**
  * Unit tests for TmuxBackend.probeSession() — the tri-state existence probe
- * used by restore's zombie-close decision.
+ * used by restore to decide re-attach ('exists') vs keep-for-lazy-cold-resume
+ * ('missing'/'unknown').
  *
  * The hazard these pin: a probe FAILURE (tmux not on PATH, not executable,
- * hung) must classify as 'unknown', never 'missing' — because restore turns
- * 'missing' into a destructive closeSession(). A shell-string `execSync` leaks
- * the shell's own command-not-found / not-executable exit codes (127 / 126) as
- * clean numeric statuses, which a naive "non-zero status ⇒ missing" rule would
- * misread as "session gone". Running the binary directly via execFileSync keeps
- * those failures as ENOENT/EACCES (no numeric status) ⇒ 'unknown'.
+ * hung) must classify as 'unknown', never 'exists' — so a flaky/unavailable
+ * tmux can't be mistaken for a live pane and drive a bogus re-attach. A
+ * shell-string `execSync` leaks the shell's own command-not-found /
+ * not-executable exit codes (127 / 126) as clean numeric statuses, which a
+ * naive "non-zero status ⇒ missing" rule would misread. Running the binary
+ * directly via execFileSync keeps those failures as ENOENT/EACCES (no numeric
+ * status) ⇒ 'unknown'.
  *
  * Both execSync and execFileSync are mocked per scenario so the test pins the
  * intended CLASSIFICATION regardless of which child_process API the impl uses.
@@ -79,29 +81,6 @@ describe('TmuxBackend.probeSession', () => {
   it('hasSession() stays a conservative boolean wrapper (false on unknown)', () => {
     bothThrow({ status: 127, signal: null }, { code: 'ENOENT', status: null, signal: null });
     expect(TmuxBackend.hasSession(NAME)).toBe(false);
-  });
-});
-
-describe('TmuxBackend.serverState', () => {
-  it('returns "running" when list-sessions succeeds (exit 0 ⇒ server up with ≥1 session)', () => {
-    mockedExecFileSync.mockImplementation((() => '') as any);
-    expect(TmuxBackend.serverState()).toBe('running');
-  });
-
-  it('returns "down" on clean non-zero exit ("no server running")', () => {
-    // This is the host-reboot signal: the whole tmux server is gone.
-    mockedExecFileSync.mockImplementation((() => { throw err({ status: 1, signal: null }); }) as any);
-    expect(TmuxBackend.serverState()).toBe('down');
-  });
-
-  it('returns "unknown" when tmux is not found (ENOENT), NOT "down"', () => {
-    mockedExecFileSync.mockImplementation((() => { throw err({ code: 'ENOENT', status: null, signal: null }); }) as any);
-    expect(TmuxBackend.serverState()).toBe('unknown');
-  });
-
-  it('returns "unknown" on timeout (killed by signal), NOT "down"', () => {
-    mockedExecFileSync.mockImplementation((() => { throw err({ signal: 'SIGTERM', status: null, killed: true }); }) as any);
-    expect(TmuxBackend.serverState()).toBe('unknown');
   });
 });
 

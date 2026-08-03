@@ -25,6 +25,8 @@ import {
   readFirstEventTimestamp,
   findJsonlsContainingExactContent,
   splitTranscriptEventsByCutoff,
+  isTranscriptRateLimitEvent,
+  apiErrorMessageText,
   type TranscriptEvent,
 } from '../src/services/claude-transcript.js';
 
@@ -130,6 +132,57 @@ describe('pickAssistantTextEvents', () => {
       { type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: 'no-uuid' }] } },
     ];
     expect(pickAssistantTextEvents(events)).toEqual([]);
+  });
+
+  it('drops the rate_limit API-error record so its text is not forwarded as a reply', () => {
+    // rate_limit is surfaced as a `limited` state, not an assistant answer.
+    const events: TranscriptEvent[] = [
+      { type: 'assistant', uuid: 'rl', isApiErrorMessage: true, error: 'rate_limit', apiErrorStatus: 429, message: { role: 'assistant', content: [{ type: 'text', text: "You've hit your session limit · resets 10:40pm" }] } },
+    ];
+    expect(pickAssistantTextEvents(events)).toEqual([]);
+  });
+
+  it('still forwards non-rate API errors (server_error / auth) as text — no dedicated surface', () => {
+    // These have no `limited` equivalent, so their text is the user's only
+    // signal that the request failed; must NOT be suppressed.
+    const events: TranscriptEvent[] = [
+      { type: 'assistant', uuid: 'se', isApiErrorMessage: true, error: 'server_error', message: { role: 'assistant', content: [{ type: 'text', text: 'API Error: 500 internal' }] } },
+    ];
+    expect(pickAssistantTextEvents(events).map(e => e.uuid)).toEqual(['se']);
+  });
+});
+
+describe('isTranscriptRateLimitEvent', () => {
+  it('is true for a rate_limit error record', () => {
+    const ev: TranscriptEvent = { type: 'assistant', uuid: 'r', error: 'rate_limit', apiErrorStatus: 429, isApiErrorMessage: true, message: { role: 'assistant', content: [{ type: 'text', text: "You've hit your session limit · resets 10:40pm" }] } };
+    expect(isTranscriptRateLimitEvent(ev)).toBe(true);
+  });
+
+  it('is true when only apiErrorStatus is 429 (defensive)', () => {
+    const ev: TranscriptEvent = { type: 'assistant', uuid: 'r2', apiErrorStatus: 429, isApiErrorMessage: true, message: { role: 'assistant', content: [] } };
+    expect(isTranscriptRateLimitEvent(ev)).toBe(true);
+  });
+
+  it('is false for a normal assistant reply', () => {
+    const ev: TranscriptEvent = { type: 'assistant', uuid: 'ok', message: { role: 'assistant', content: [{ type: 'text', text: 'here is your answer' }] } };
+    expect(isTranscriptRateLimitEvent(ev)).toBe(false);
+  });
+
+  it('is false for other API errors (server_error, auth, terms-400)', () => {
+    for (const error of ['server_error', 'authentication_failed', 'unknown', 'invalid_request']) {
+      const ev: TranscriptEvent = { type: 'assistant', uuid: 'e', error, isApiErrorMessage: true, message: { role: 'assistant', content: [{ type: 'text', text: 'API Error' }] } };
+      expect(isTranscriptRateLimitEvent(ev), `error=${error}`).toBe(false);
+    }
+  });
+
+  it('is false for the system/turn_duration terminal marker', () => {
+    const ev: TranscriptEvent = { type: 'system', subtype: 'turn_duration', uuid: 'td' };
+    expect(isTranscriptRateLimitEvent(ev)).toBe(false);
+  });
+
+  it('apiErrorMessageText recovers the human retry clock from the record text', () => {
+    const ev: TranscriptEvent = { type: 'assistant', uuid: 'r', error: 'rate_limit', message: { role: 'assistant', content: [{ type: 'text', text: "You've hit your session limit · resets 10:40pm (America/Los_Angeles)" }] } };
+    expect(apiErrorMessageText(ev)).toContain('resets 10:40pm');
   });
 });
 

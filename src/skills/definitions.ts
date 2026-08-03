@@ -111,6 +111,36 @@ botmux schedule add "每日11:00" "
 详见 \`botmux-send\` 技能的"顶层广播 / 跨群发布"章节。
 `;
 
+const CHAT_RENAME_SKILL = `---
+name: botmux-chat-rename
+description: 在当前飞书/Lark 群运转过程中修改群名称。用户明确要求改群名，或 AI 判断群目标/关键阶段已明显变化且群名需要同步时触发。只能修改当前会话所在群，执行改名的 bot 必须在群内。
+---
+
+# botmux-chat-rename — 修改当前群名称
+
+用受控命令修改当前会话所在的飞书群名称：
+
+\`\`\`bash
+# 用户明确要求改名
+botmux chat rename "新的群名称"
+
+# AI 根据任务关键阶段主动改名（有 10 分钟防抖）
+botmux chat rename "支付链路排障｜待验证" --proactive
+\`\`\`
+
+规则：
+
+1. 只能修改当前会话所在群，不能指定 chat-id 或切换其他 bot 身份。
+2. 用户明确要求时直接执行；AI 主动改名只用于群目标或关键阶段发生明显变化。
+3. 保持核心主题稳定，优先只调整阶段后缀；不要因细小进度反复改名。
+4. 群名应简短、稳定、可读，不写精确百分比、敏感或评价性措辞。
+5. 不确定群的主要目标、只有临时支线话题、或用户要求不要自动改名时，不主动改名。
+6. 命令输出 JSON。成功后简短告知用户最终名称；失败时说明 error 及可行动的修复方式。
+
+常见错误：\`not_group_chat\`、\`bot_not_in_chat\`、\`invalid_chat_name\`、
+\`permission_denied\`、\`rate_limited\`、\`lark_api_error\`。
+`;
+
 const HISTORY_SKILL = `---
 name: botmux-history
 description: 需要查看当前飞书会话历史消息时触发。话题/thread 会话默认拉话题内消息；普通群 chat-scope 会话拉整群最近 N 条（默认 50，用 --limit 调节）。普通群通过 /t 或 per-bot 配置开出的 thread 会话也按话题内读取。在 thread 内如果需要 thread 外的群聊上下文，用 --scope ambient。适合"看看之前聊了什么"、"最近的消息"、"上下文"类请求。在 CLI 会话内自动推断 session-id。
@@ -246,6 +276,8 @@ description: 向飞书话题发送消息。用户在飞书上阅读看不到终�
 # botmux-send — 向飞书话题发送消息
 
 **核心规则**：用户在飞书上阅读，看不到你的终端输出。想让用户看到的内容**必须**通过 \`botmux send\` 发送。
+
+**发送成功判定 & 不要重发**：\`botmux send\` 退出码为 0（返回 \`{"success":true,...}\`）就代表消息**已经送达**用户——即使你的终端里看不到任何回执，也不用再发一遍。发完 \`botmux send\` 后，本轮「终端没有可见文本、直接安静结束」是正常且预期的。如果之后看到类似「你上一条回复没有可见输出，请继续并产出用户可见回复」这样的提示，那是底层 CLI（Claude Code 等）的误判——**不要重发**，只有当 \`botmux send\` 自己报错（非零退出或打印「发送失败」）时才需要重试。
 
 **格式自动处理**：内容含 markdown 语法时自动用飞书卡片（schema 2.0）发送，原生渲染；纯文本走普通消息。**该用 md 就用 md**——结构化内容（列表、表格、代码块）不要手撸成纯文本。
 
@@ -1474,6 +1506,7 @@ export const ASK_SKILL_NAME = 'botmux-ask';
 export const WHITEBOARD_SKILL_NAME = 'botmux-whiteboard';
 
 export const BUILTIN_SKILLS: SkillDef[] = [
+  { name: 'botmux-chat-rename', content: CHAT_RENAME_SKILL },
   { name: 'botmux-schedule', content: SCHEDULE_SKILL },
   { name: 'botmux-history', content: HISTORY_SKILL },
   { name: 'botmux-quoted', content: QUOTED_SKILL },

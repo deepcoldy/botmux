@@ -10,6 +10,7 @@
     "preview": "rspress preview"
   },
   "devDependencies": {
-    "@rspress/core": "^2.0.13"
+    "@rspress/core": "^2.0.13",
+    "@rspress/plugin-llms": "2.0.13"
   }
 }

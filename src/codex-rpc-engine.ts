@@ -104,6 +104,16 @@ const MARKER_DIR = join(homedir(), '.botmux', 'data', 'codex-rpc-app-servers');
  *  FIRST turn on a cold app-server pays MCP/model-list startup latency. */
 const REQUEST_TIMEOUT_MS = 60_000;
 
+/** Floor for a metadata-poll iteration's per-request budget. Below this, the
+ *  poll deadline is effectively reached: issuing a thread/read with a
+ *  sub-floor client timeout would reliably time out (and REJECT, not return)
+ *  before even a fast response lands, and that rejection would escape the poll
+ *  loop instead of degrading to "not found". Guards waitForThreadPreview /
+ *  waitForThreadUpdatedAfter against a flaky end-of-window request. 50ms is
+ *  comfortably above localhost RPC round-trip yet negligible vs the callers'
+ *  200ms–10s budgets. */
+const MIN_POLL_REQUEST_BUDGET_MS = 50;
+
 export class CodexRpcEngine {
   private child?: ChildProcess;
   private ws?: WebSocket;
@@ -169,21 +179,37 @@ export class CodexRpcEngine {
    *  so RPC mode stays engaged across daemon restarts instead of reverting to
    *  the paste path. */
   async resumeThread(threadId: string): Promise<string> {
-    const params: Json = { ...this.threadParams(), threadId, excludeTurns: true };
+    // forResume=true: a cold resume must NOT re-send ANY model-related override.
+    // The codex/TraeX app-server sees any single override (model OR
+    // model_reasoning_effort) as "caller is pinning config" and early-returns out
+    // of `merge_persisted_resume_metadata`, dropping the rest of the persisted
+    // {model, model_provider, reasoning_effort} triple back to the CURRENT
+    // process default. Re-sending only effort (per-turn override, new in PR #639)
+    // — or even the stable configured model (pre-existing on the shared engine) —
+    // therefore silently drifts model/provider whenever the app-server default
+    // changed between restarts. Verified on codex-cli 0.145.0 + traecli 0.200.19.
+    // The safe path is to send nothing model-related and let the app-server
+    // restore the full persisted triple. Fresh thread/start still stamps both.
+    const params: Json = { ...this.threadParams(true), threadId, excludeTurns: true };
     delete params.serviceName; // resume keeps the original thread's identity
     const r = await this.request('thread/resume', params);
     this.threadId = String(r?.thread?.id ?? threadId);
     return this.threadId;
   }
 
-  private threadParams(): Json {
+  private threadParams(forResume = false): Json {
     const config: Json = {
       // Forward the full env (incl. BOTMUX_SESSION_ID / BOTMUX_LARK_APP_ID) to
       // shell subprocesses so `botmux send` from within codex finds its bot.
       shell_environment_policy: { inherit: 'all', ignore_default_excludes: true },
     };
-    if (this.opts.model) config.model = this.opts.model;
-    if (this.opts.reasoningEffort) config.model_reasoning_effort = this.opts.reasoningEffort;
+    // Only stamp model/effort on a FRESH thread/start. On resume the app-server
+    // owns restoration of the persisted triple (see resumeThread) — sending
+    // either here would trip the app-server's model-resume-override short-circuit.
+    if (!forResume) {
+      if (this.opts.model) config.model = this.opts.model;
+      if (this.opts.reasoningEffort) config.model_reasoning_effort = this.opts.reasoningEffort;
+    }
     return {
       cwd: this.opts.cwd,
       approvalPolicy: 'never',
@@ -237,7 +263,11 @@ export class CodexRpcEngine {
     const deadline = Date.now() + timeoutMs;
     for (;;) {
       const remaining = deadline - Date.now();
-      if (remaining <= 0) return undefined;
+      // A near-expired budget must not issue a doomed tiny-timeout thread/read:
+      // readThreadMetadata rejects (not returns) on request timeout, and that
+      // rejection would escape this poll instead of degrading to "not found".
+      // Below the floor the deadline is effectively reached — return undefined.
+      if (remaining < MIN_POLL_REQUEST_BUDGET_MS) return undefined;
       const { preview } = await this.readThreadMetadata(Math.min(remaining, 2000));
       if (preview) return preview;
       await new Promise(resolve => setTimeout(resolve, Math.min(250, Math.max(1, deadline - Date.now()))));
@@ -249,6 +279,9 @@ export class CodexRpcEngine {
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
       const remaining = deadline - Date.now();
+      // Same near-expiry guard as waitForThreadPreview: don't issue a tiny-timeout
+      // request that would reject and escape; treat sub-floor remaining as done.
+      if (remaining < MIN_POLL_REQUEST_BUDGET_MS) return;
       const { updatedAt } = await this.readThreadMetadata(Math.min(remaining, 2000));
       if (updatedAt !== undefined && updatedAt > baseline) return;
       await new Promise(resolve => setTimeout(resolve, Math.min(250, Math.max(1, deadline - Date.now()))));

@@ -84,12 +84,46 @@ describe('trigger request contract', () => {
     if (!v.ok) expect(v.body.errorCode).toBe('target_required');
   });
 
+  it('accepts a boolean suppressFinalOutput option and rejects non-boolean', () => {
+    const on = request();
+    on.options = { ...on.options, suppressFinalOutput: true };
+    expect(validateTriggerRequest(on).ok).toBe(true);
+
+    const bad = request() as any;
+    bad.options = { ...bad.options, suppressFinalOutput: 'yes' };
+    const v = validateTriggerRequest(bad);
+    expect(v.ok).toBe(false);
+    if (!v.ok) expect(v.body.errorCode).toBe('bad_request');
+  });
+
   it('rejects wait-mode timeout outside the bounded range', () => {
     const req = request();
     req.options = { waitForFinalOutput: true, timeoutMs: 999 };
     const v = validateTriggerRequest(req);
     expect(v.ok).toBe(false);
     if (!v.ok) expect(v.body.errorCode).toBe('bad_request');
+  });
+
+  it('accepts per-turn model + reasoningEffort overrides', () => {
+    const req = request();
+    req.options = { model: 'gpt-5.6-terra', reasoningEffort: 'high' };
+    expect(validateTriggerRequest(req).ok).toBe(true);
+  });
+
+  it('rejects an invalid reasoningEffort value', () => {
+    const req = request();
+    (req.options as any) = { reasoningEffort: 'ultra' };
+    const v = validateTriggerRequest(req);
+    expect(v.ok).toBe(false);
+    if (!v.ok) expect(v.body.errorCode).toBe('bad_request');
+  });
+
+  it('rejects a non-string / over-long model', () => {
+    for (const model of [42, 'x'.repeat(201)]) {
+      const req = request();
+      (req.options as any) = { model };
+      expect(validateTriggerRequest(req).ok).toBe(false);
+    }
   });
 
   it('builds a prompt that labels event data as untrusted', () => {

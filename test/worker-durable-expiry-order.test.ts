@@ -68,7 +68,7 @@ describe('worker durable lease expiry ordering', () => {
       "if (effectiveBackendType === 'riff' && isPromptReady) releaseRawInputRestartGate();",
       release,
     );
-    const wake = restart.indexOf('void flushPending();', riffRawRelease);
+    const guardedWake = restart.indexOf('if (isPromptReady) void flushPending();', riffRawRelease);
 
     expect(restartStart).toBeGreaterThanOrEqual(0);
     expect(restartEnd).toBeGreaterThan(restartStart);
@@ -81,7 +81,19 @@ describe('worker durable lease expiry ordering', () => {
     expect(spawn).toBeGreaterThan(kill);
     expect(release).toBeGreaterThan(spawn);
     expect(riffRawRelease).toBeGreaterThan(release);
-    expect(wake).toBeGreaterThan(riffRawRelease);
+    // A replacement CoCo/Codex process may exist before its TUI input box
+    // exists. Restart completion must not use type-ahead to flush into that
+    // startup window; only a prompt already observed during the restart fence
+    // needs an explicit wake after the fence drops. Assert the wake exists AND
+    // that every flushPending() the restart closure runs is the guarded
+    // `if (isPromptReady)` form — never a bare re-kick that would type-ahead
+    // into the not-yet-ready TUI. Counting both guards against a future edit
+    // reintroducing an unguarded flush anywhere in the closure.
+    expect(guardedWake).toBeGreaterThan(riffRawRelease);
+    const totalFlushes = restart.match(/void flushPending\(\);/g)?.length ?? 0;
+    const guardedFlushes = restart.match(/if \(isPromptReady\) void flushPending\(\);/g)?.length ?? 0;
+    expect(totalFlushes).toBeGreaterThan(0);
+    expect(guardedFlushes).toBe(totalFlushes);
 
     const promptStart = workerSource.indexOf('function markPromptReady(): void');
     const promptEnd = workerSource.indexOf('\nfunction persistCliSessionId(', promptStart);
@@ -112,7 +124,7 @@ describe('worker durable lease expiry ordering', () => {
     const rawGate = rawInput.indexOf(
       'if (cliRestartInProgress || rawInputRestartGate || sessionRenameInFlight',
     );
-    const rawQueue = rawInput.indexOf('pendingRawInputs.push(msg)', rawGate);
+    const rawQueue = rawInput.indexOf('freshnessInputQueue.enqueueRaw(msg)', rawGate);
     const rawDeliver = rawInput.indexOf('await deliverRawInput(msg)', rawQueue);
     expect(rawGate).toBeGreaterThanOrEqual(0);
     expect(rawQueue).toBeGreaterThan(rawGate);

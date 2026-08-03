@@ -17,8 +17,11 @@ import {
   buildSessionClosedCard,
   buildRelayPickerCard,
   buildAdoptSelectCard,
+  adoptLiveKey,
+  buildAdoptBlockedCard,
   buildPrivateSnapshotCard,
   buildConfigCard,
+  buildTuiPromptFailedCard,
   getCliDisplayName,
 } from '../src/im/lark/card-builder.js';
 import type { RelayPickerEntry } from '../src/im/lark/card-builder.js';
@@ -62,14 +65,32 @@ function buttonTexts(actions: any[]): string[] {
     .map((a: any) => a.text.content);
 }
 
+describe('buildTuiPromptFailedCard', () => {
+  it('renders an explicit red terminal state for unconfirmed TUI delivery', () => {
+    const card = parse(buildTuiPromptFailedCard('Input was not delivered', 'en'));
+
+    expect(card.header).toMatchObject({
+      template: 'red',
+      title: { content: 'Failed' },
+    });
+    expect(card.elements[0].text.content).toBe('Input was not delivered');
+  });
+});
+
 function allActions(card: any): any[] {
   return card.elements
     .filter((e: any) => e.tag === 'action')
     .flatMap((e: any) => e.actions ?? []);
 }
 
-describe('buildAdoptSelectCard', () => {
-  it('shows the backend instead of repeating the cwd basename', () => {
+describe('buildAdoptSelectCard (V2 picker)', () => {
+  // Helper: flatten the V2 card body to the markdown text of each session card.
+  const cardTexts = (card: any): string[] =>
+    (card.body?.elements ?? [])
+      .filter((e: any) => e.tag === 'interactive_container')
+      .map((e: any) => (e.elements ?? []).map((x: any) => x.content ?? '').join('\n'));
+
+  it('renders a live session as a card showing CLI / source / path / target, not a dropdown option', () => {
     const card = parse(buildAdoptSelectCard([{
       source: 'herdr',
       herdrSessionName: 'collie',
@@ -79,9 +100,143 @@ describe('buildAdoptSelectCard', () => {
       paneCols: 200,
       paneRows: 50,
     }], 'om_root', 'en'));
-    const option = card.elements[1].actions[0].options[0].text.content;
-    expect(option).toContain('Pi · herdr · collie:w3:p1');
-    expect(option).not.toContain('· botmux ·');
+    // No legacy dropdown any more.
+    const hasSelectStatic = JSON.stringify(card).includes('select_static');
+    expect(hasSelectStatic).toBe(false);
+    const texts = cardTexts(card);
+    expect(texts.length).toBe(1);
+    expect(texts[0]).toContain('Pi');          // CLI name
+    expect(texts[0]).toContain('collie:w3:p1'); // live target label
+  });
+
+  it('renders a resume (history) session card carrying the session id and a resume: key', () => {
+    const card = parse(buildAdoptSelectCard(
+      [],
+      'om_root',
+      'en',
+      [{ cliSessionId: 'codex-rollout-abc123', cwd: '/Users/test/proj', title: 'fix the thing', lastActivityAt: 1_700_000_000_000 }],
+    ));
+    const texts = cardTexts(card);
+    expect(texts.length).toBe(1);
+    expect(texts[0]).toContain('codex-rollout-abc123'); // session id is visible
+    // The selectable container carries a resume: entry_key.
+    const container = card.body.elements.find((e: any) => e.tag === 'interactive_container');
+    expect(container.behaviors[0].value.entry_key).toBe('resume:codex-rollout-abc123');
+  });
+
+  it('shows the confirm button only after an entry is selected', () => {
+    const entry = { cliSessionId: 'sess-xyz', cwd: '/w', title: 't', lastActivityAt: 1 };
+    const unselected = parse(buildAdoptSelectCard([], 'om_root', 'en', [entry]));
+    const hasConfirmBefore = JSON.stringify(unselected).includes('adopt_confirm');
+    expect(hasConfirmBefore).toBe(false);
+    const selected = parse(buildAdoptSelectCard([], 'om_root', 'en', [entry], { selectedKey: 'resume:sess-xyz' }));
+    const hasConfirmAfter = JSON.stringify(selected).includes('adopt_confirm');
+    expect(hasConfirmAfter).toBe(true);
+  });
+
+  it('filters entries by the search query (matches title / cwd / session id)', () => {
+    const resumable = [
+      { cliSessionId: 'aaa', cwd: '/home/alpha', title: 'fix login', lastActivityAt: 3 },
+      { cliSessionId: 'bbb', cwd: '/home/beta', title: 'add cache', lastActivityAt: 2 },
+    ];
+    const card = parse(buildAdoptSelectCard([], 'om_root', 'en', resumable, { searchQuery: 'beta' }));
+    const containers = card.body.elements.filter((e: any) => e.tag === 'interactive_container');
+    expect(containers.length).toBe(1);
+    expect(containers[0].behaviors[0].value.entry_key).toBe('resume:bbb');
+  });
+
+  it('paginates at 5 per page and renders a paginator when there are more', () => {
+    const resumable = Array.from({ length: 7 }, (_, i) => ({
+      cliSessionId: `s${i}`, cwd: `/w${i}`, title: `t${i}`, lastActivityAt: i,
+    }));
+    const page0 = parse(buildAdoptSelectCard([], 'om_root', 'en', resumable, { page: 0 }));
+    const containers0 = page0.body.elements.filter((e: any) => e.tag === 'interactive_container');
+    expect(containers0.length).toBe(5);
+    // A paginator (column_set with adopt_page callbacks) is present.
+    const hasPager = JSON.stringify(page0).includes('adopt_page');
+    expect(hasPager).toBe(true);
+    // Page 1 shows the remaining 2.
+    const page1 = parse(buildAdoptSelectCard([], 'om_root', 'en', resumable, { page: 1 }));
+    const containers1 = page1.body.elements.filter((e: any) => e.tag === 'interactive_container');
+    expect(containers1.length).toBe(2);
+  });
+
+  it('shows a truncation hint when the resume list hit the cap', () => {
+    const resumable = Array.from({ length: 20 }, (_, i) => ({
+      cliSessionId: `s${i}`, cwd: `/w${i}`, title: `t${i}`, lastActivityAt: i,
+    }));
+    const card = parse(buildAdoptSelectCard([], 'om_root', 'en', resumable, undefined, undefined, 20));
+    // The truncation copy mentions the cap number.
+    const text = JSON.stringify(card);
+    expect(text).toContain('20');
+    expect(text.toLowerCase()).toContain('search'); // en copy points at search
+  });
+
+  it('escapes the echoed search query in the no-match message (defuses ![](url) image injection)', () => {
+    // A malicious query rendered raw into a markdown element would fetch an
+    // external image (tracking beacon / SSRF). The no-match copy must escape it.
+    // Needs ≥1 entry that DOESN'T match, so we reach the empty_filtered branch
+    // (an entirely empty list short-circuits to card.adopt.empty first).
+    const resumable = [{ cliSessionId: 'aaa', cwd: '/home/proj', title: 'unrelated', lastActivityAt: 1 }];
+    const card = parse(buildAdoptSelectCard([], 'om_root', 'en', resumable, { searchQuery: '![x](http://evil/beacon)' }));
+    const md = (card.body.elements ?? [])
+      .filter((e: any) => e.tag === 'markdown')
+      .map((e: any) => e.content).join('\n');
+    // The image/link brackets are backslash-escaped, so Lark parses them as
+    // literal text rather than an <img> / <a> — the external fetch never fires.
+    // Escaped form is "!\[x\](…)"; the unescaped "![x](" must NOT survive.
+    expect(md).toContain('\\[x\\]');
+    expect(md).not.toContain('![x](');
+  });
+});
+
+describe('adoptLiveKey (synthetic confirm key)', () => {
+  // Regression guard for the confirm-path match. The card-handler confirm path
+  // re-discovers live sessions and matches `adoptLiveKey(fresh) === entryKey`,
+  // so the key MUST be stable across whatever legitimately shifts between the
+  // render snapshot and the click.
+  const zellijAt = (cliPid: number) => ({
+    zellijSession: 'mywork', zellijPaneId: 'terminal_1', cliPid,
+    cliId: 'codex' as const, sessionId: 'sess', cwd: '/w', paneCols: 80, paneRows: 24,
+  });
+
+  it('zellij key is pid-AGNOSTIC — same (session,paneId), different pid → SAME key', () => {
+    // This is the crux of fix 57dcbebbb: a zellij pane's resolved CLI pid can
+    // shift (wrapper⇄native collapse, re-fork) between render and confirm.
+    // Baking pid into the key would make the confirm match fail and surface a
+    // false "目标已退出". (session, paneId) alone uniquely identifies the pane.
+    expect(adoptLiveKey(zellijAt(111))).toBe(adoptLiveKey(zellijAt(222)));
+    expect(adoptLiveKey(zellijAt(111))).toBe('live:zellij:mywork/terminal_1');
+    expect(adoptLiveKey(zellijAt(111))).not.toContain(':111');
+  });
+
+  it('tmux key stays pid-SENSITIVE (adoptTargetKey includes pid; confirm fast-path parses it)', () => {
+    const tmuxAt = (cliPid: number) => ({
+      source: 'tmux' as const, tmuxTarget: '0:1.0', cliPid,
+      cliId: 'claude-code' as const, sessionId: 's', cwd: '/w', paneCols: 80, paneRows: 24,
+    });
+    expect(adoptLiveKey(tmuxAt(111))).toBe('live:tmux:0:1.0:111');
+    expect(adoptLiveKey(tmuxAt(111))).not.toBe(adoptLiveKey(tmuxAt(222)));
+  });
+});
+
+describe('buildAdoptBlockedCard', () => {
+  it('carries a close-session button bound to the session and a repo-select explanation', () => {
+    const card = parse(buildAdoptBlockedCard('om_root', 'sess-123', 'codex', 'en'));
+    const actions = allActions(card);
+    const closeBtn = actions.find((a: any) => a.value?.action === 'close');
+    expect(closeBtn).toBeDefined();
+    expect(closeBtn.type).toBe('danger');
+    expect(closeBtn.value).toMatchObject({ action: 'close', root_id: 'om_root', session_id: 'sess-123', cli_id: 'codex' });
+    // Body must explain the refusal (waiting on repo selection) so the tap is understood.
+    const body = card.elements.map((e: any) => e.content ?? '').join(' ');
+    expect(body.toLowerCase()).toContain('repository');
+  });
+
+  it('defaults cli_id to claude-code when unknown', () => {
+    const card = parse(buildAdoptBlockedCard('om_root', 'sess-9', undefined, 'en'));
+    const closeBtn = allActions(card).find((a: any) => a.value?.action === 'close');
+    expect(closeBtn.value.cli_id).toBe('claude-code');
   });
 });
 
@@ -161,7 +316,7 @@ describe('getCliDisplayName', () => {
 });
 
 describe('buildConfigCard', () => {
-  it('renders silentTurnReactions as a card-behaviour toggle', () => {
+  it('renders card-behaviour toggles', () => {
     const card = parse(buildConfigCard({
       larkAppId: 'app_cfg',
       botName: 'Config Bot',
@@ -196,6 +351,14 @@ describe('buildConfigCard', () => {
     expect(toggle.value.action).toBe('config_toggle');
     expect(toggle.type).toBe('primary');
     expect(toggle.text.content).toContain('Disable status reactions');
+
+    // usageDisplay is an enum (streaming/footer/off), configured via dashboard
+    // and `/botconfig set` — like skillInjection it is intentionally NOT a
+    // config-card boolean quick-toggle.
+    const usageToggle = allActions(card).find(
+      (a: any) => a.value?.field === 'usageDisplay' || a.value?.field === 'showUsageInCardFooter',
+    );
+    expect(usageToggle).toBeFalsy();
   });
 });
 
@@ -287,6 +450,17 @@ describe('buildSessionCard', () => {
       expect(linkBtn.text.content).toContain('获取操作链接');
       expect(linkBtn.value.root_id).toBe(ROOT);
       expect(linkBtn.value.session_id).toBe(SID);
+    });
+
+    it('keeps native attach and close but hides Web Terminal controls without a URL', () => {
+      enableLocalCliOpen();
+      const card = parse(buildSessionCard(SID, ROOT, '', TITLE, 'codex', false, false, 'en', true));
+      const actions = findActions(card);
+
+      expect(actions.some((a: any) => a.multi_url)).toBe(false);
+      expect(actions.some((a: any) => a.value?.action === 'get_write_link')).toBe(false);
+      expect(actions.some((a: any) => a.value?.action === 'open_local_cli')).toBe(true);
+      expect(actions.some((a: any) => a.value?.action === 'close')).toBe(true);
     });
 
     it('includes Open Codex beside Web Terminal for codex sessions only', () => {
@@ -641,6 +815,67 @@ describe('buildStreamingCard', () => {
     });
   });
 
+  // ── Native usage line (Context / Token) ────────────────────────────────
+
+  describe('usage snapshot on the streaming card body', () => {
+    const USAGE = {
+      context: { usedTokens: 159_816, windowTokens: 258_400, percentUsed: 62 },
+      tokens: { in: 3_739_570, out: 23_299 },
+    };
+
+    it('renders a grey Context / Token line when a usage snapshot is supplied', () => {
+      const card = parse(buildStreamingCard(
+        SID, ROOT, URL, TITLE, CONTENT, 'working', 'codex', 'hidden',
+        undefined, undefined, false, false, 'en', undefined, undefined, false, USAGE,
+      ));
+      const md = card.elements.filter((e: any) => e.tag === 'markdown');
+      const usageEl = md.find((e: any) => typeof e.content === 'string' && e.content.includes('Context'));
+      expect(usageEl).toBeTruthy();
+      expect(usageEl.content).toContain('159.8K/258.4K (62%)');
+      expect(usageEl.content).toContain('↑3.7M');
+      expect(usageEl.content).toContain('↓23.3K');
+      expect(usageEl.content).toContain("color='grey'");
+    });
+
+    it('omits the usage line entirely when no snapshot is supplied', () => {
+      const card = parse(buildStreamingCard(SID, ROOT, URL, TITLE, CONTENT, 'working', 'codex', 'hidden'));
+      const hasUsage = card.elements.some(
+        (e: any) => e.tag === 'markdown' && typeof e.content === 'string'
+          && (e.content.includes('Context') || e.content.includes('Tokens')),
+      );
+      expect(hasUsage).toBe(false);
+    });
+
+    it('renders only the present metric (context missing → cumulative token only)', () => {
+      const card = parse(buildStreamingCard(
+        SID, ROOT, URL, TITLE, CONTENT, 'working', 'codex', 'hidden',
+        undefined, undefined, false, false, 'en', undefined, undefined, false,
+        { context: null, tokens: { in: 1_200, out: 3_400 } },
+      ));
+      const md = card.elements.filter((e: any) => e.tag === 'markdown');
+      // Streaming variant labels cumulative token "Total" (en); no 本轮 line
+      // here because turnTokens was not supplied.
+      const usageEl = md.find((e: any) => typeof e.content === 'string' && e.content.includes('Total'));
+      expect(usageEl).toBeTruthy();
+      expect(usageEl.content).not.toContain('Context');
+      expect(usageEl.content).not.toContain('This turn');
+      expect(usageEl.content).toContain('↑1.2K');
+    });
+
+    it('renders nothing for a fully-empty snapshot (unsupported CLI)', () => {
+      const card = parse(buildStreamingCard(
+        SID, ROOT, URL, TITLE, CONTENT, 'working', 'gemini', 'hidden',
+        undefined, undefined, false, false, 'en', undefined, undefined, false,
+        { context: null, tokens: null },
+      ));
+      const hasUsage = card.elements.some(
+        (e: any) => e.tag === 'markdown' && typeof e.content === 'string'
+          && (e.content.includes('Context') || e.content.includes('Tokens')),
+      );
+      expect(hasUsage).toBe(false);
+    });
+  });
+
   // ── Screenshot display mode ────────────────────────────────────────────
 
   describe('screenshot display mode', () => {
@@ -719,6 +954,22 @@ describe('buildStreamingCard', () => {
       expect(linkBtn).toBeDefined();
       expect(linkBtn.value.root_id).toBe(ROOT);
       expect(linkBtn.value.session_id).toBe(SID);
+    });
+
+    it('hides Web Terminal controls when the backend has no terminal URL', () => {
+      enableLocalCliOpen();
+      const card = parse(buildStreamingCard(
+        SID, ROOT, '', TITLE, '', 'idle', 'codex', 'hidden',
+        undefined, undefined, false, false, 'en', undefined, undefined, true,
+      ));
+      const actions = findActions(card);
+
+      expect(actions.some((a: any) => a.multi_url)).toBe(false);
+      expect(actions.some((a: any) => a.value?.action === 'get_write_link')).toBe(false);
+      // Native local opening (for example `zmx attach`) stays available.
+      expect(actions.some((a: any) => a.value?.action === 'open_local_cli')).toBe(true);
+      expect(actions.some((a: any) => a.value?.action === 'toggle_display')).toBe(true);
+      expect(actions.some((a: any) => a.value?.action === 'close')).toBe(true);
     });
 
     it('should include close button with danger type', () => {
@@ -1201,6 +1452,23 @@ describe('buildRelayPickerCard', () => {
     expect(confirmBtn).toMatch(/接力到本单聊|into this DM/);
   });
 
+  it('carries visibility in interactive values (defaults to public, private when passed)', () => {
+    // Default → public (legacy visible-to-all picker).
+    const pub = parse(buildRelayPickerCard(fixtureEntries(2), 'oc_target', 'oc_target', 'ou_invoker_test'));
+    expect(searchInput(pub).behaviors[0].value.visibility).toBe('public');
+    expect(containers(pub)[0].behaviors[0].value.visibility).toBe('public');
+    // Explicit private → carried on every interactive value (search / select /
+    // page / confirm) so the re-render handler knows to delete+resend an
+    // ephemeral card instead of returning a body for in-place patch.
+    const priv = parse(buildRelayPickerCard(
+      fixtureEntries(2), 'oc_target', 'oc_target', 'ou_invoker_test',
+      undefined, { selectedSessionId: 'sess-1' }, 'chat', 'group', 'private',
+    ));
+    expect(searchInput(priv).behaviors[0].value.visibility).toBe('private');
+    expect(containers(priv)[0].behaviors[0].value.visibility).toBe('private');
+    expect(confirmButton(priv)?.behaviors?.[0]?.value?.visibility).toBe('private');
+  });
+
   it('renders "no relayable sessions" notice when entries empty (form still shown)', () => {
     const card = parse(buildRelayPickerCard([], 'oc_target', 'om_target_root', 'ou_invoker_test'));
     const md = card.body.elements.find((e: any) => e.tag === 'markdown');
@@ -1456,6 +1724,19 @@ describe('buildPrivateSnapshotCard', () => {
     const btns = allButtons(card);
     expect(btns.some((b: any) => b.value?.action === 'open_local_cli')).toBe(false);
     expect(btns.map((b: any) => b.value?.action ?? 'url')).toEqual(['url', 'get_write_link', 'close']);
+  });
+
+  it('keeps the snapshot and close control but hides terminal links when unavailable', () => {
+    const card = parse(buildPrivateSnapshotCard(
+      '', 'my session', 'idle', 'codex', undefined, 'plain zmx history',
+      'sess-9', 'om_anchor', 'en',
+    ));
+    const btns = allButtons(card);
+
+    expect(btns.map((b: any) => b.value?.action ?? 'url')).toEqual(['close']);
+    expect(JSON.stringify(card)).toContain('plain zmx history');
+    expect(JSON.stringify(card)).toContain('static snapshot');
+    expect(JSON.stringify(card)).not.toContain('Open Web Terminal');
   });
 
   it('callback buttons carry root_id/session_id/cli_id for handler resolution', () => {

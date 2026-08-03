@@ -4,19 +4,31 @@ import { createHmac, randomBytes } from 'node:crypto';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { ipcRoute, startIpcServer, setLarkAppId, setIpcAuthSecret, setBotRenamer, setBotAvatarChanger, setExactChatGrantHandler, type IpcServerHandle } from '../src/core/dashboard-ipc-server.js';
+import { ipcRoute, startIpcServer, setLarkAppId, setIpcAuthSecret, setBotRenamer, setBotAvatarChanger, setExactChatGrantHandler, armCoreOnlyReadinessGate, setCoreOnlyReady, __testOnly_resetCoreOnlyReadiness, type IpcServerHandle } from '../src/core/dashboard-ipc-server.js';
 import { cliAuthBind, signCliAuth } from '../src/dashboard/auth.js';
 import { dashboardEventBus } from '../src/core/dashboard-events.js';
 import * as groupsStore from '../src/services/groups-store.js';
+import { setScheduleScope } from '../src/services/schedule-store.js';
+
+// Per-bot schedule stores: the daemon binds the store to its own bot before
+// serving IPC; the schedule endpoints under test assume that binding exists.
+setScheduleScope('cli_ipc_test_bot001');
 import * as larkClient from '../src/im/lark/client.js';
 import * as oncallStore from '../src/services/oncall-store.js';
 import * as sessionStore from '../src/services/session-store.js';
 import * as workerPool from '../src/core/worker-pool.js';
 import * as scheduler from '../src/core/scheduler.js';
+import { clearMessageListenerRunPreviewStore, markMessageListenerRunPreviewReplied } from '../src/services/message-listener-run-preview-store.js';
 import { __testOnly_resetBotRegistry, getBot, loadBotConfigs, registerBot } from '../src/bot-registry.js';
 import { config } from '../src/config.js';
 import { sessionKey } from '../src/core/types.js';
 import { writeRoleFile, writeTeamRoleFile } from '../src/core/role-resolver.js';
+import {
+  _allAskIds,
+  _resetForTest as resetAskBrokerForTest,
+  registerAsk,
+  setCardDispatcher,
+} from '../src/core/ask-broker.js';
 
 // Loopback-HMAC the write-link routes require. Inject a known secret per test
 // (setIpcAuthSecret) and sign with it, so the suite doesn't depend on a real
@@ -101,7 +113,9 @@ afterEach(async () => {
   setLarkAppId('');
   __testOnly_resetBotRegistry();
   setIpcAuthSecret(null);
+  resetAskBrokerForTest();
   setExactChatGrantHandler(null);
+  clearMessageListenerRunPreviewStore();
 });
 
 describe('dashboard IPC server', () => {
@@ -204,6 +218,106 @@ describe('dashboard IPC server', () => {
   });
 });
 
+describe('Desktop ask IPC', () => {
+  it('keeps pending asks behind the trusted-host boundary', async () => {
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+    const base = `http://127.0.0.1:${handle.port}`;
+
+    const pending = await fetch(`${base}/api/asks/pending`);
+    expect(pending.status).toBe(403);
+    expect(await pending.json()).toEqual({ ok: false, error: 'trusted_host_required' });
+
+    const answer = await fetch(`${base}/api/asks/answer`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ askId: 'unknown', selections: [['yes']] }),
+    });
+    expect(answer.status).toBe(403);
+    expect(await answer.json()).toEqual({ ok: false, error: 'trusted_host_required' });
+  });
+
+  it('lists and answers only the selected daemon ask with validated selections', async () => {
+    setCardDispatcher({ send: async () => ({ messageId: 'om_dashboard_ask' }) });
+    const result = registerAsk({
+      larkAppId: 'app-one',
+      chatId: 'oc-chat',
+      rootMessageId: 'om-root',
+      sessionId: 'session-one',
+      questions: [{
+        prompt: '继续吗？',
+        options: [
+          { key: 'yes', label: '继续' },
+          { key: 'no', label: '停止' },
+        ],
+        multiSelect: false,
+      }],
+      timeoutMs: 30_000,
+    });
+    const [askId] = _allAskIds();
+    expect(askId).toBeTruthy();
+
+    setIpcAuthSecret(TEST_IPC_SECRET);
+    handle = await startIpcServer({
+      port: 0,
+      host: '127.0.0.1',
+      authRequired: true,
+    });
+    const base = `http://127.0.0.1:${handle.port}`;
+
+    const pendingPath = '/api/asks/pending';
+    const pending = await fetch(`${base}${pendingPath}`, {
+      headers: trustedHostHeaders('GET', pendingPath, handle.port),
+    });
+    expect(pending.status).toBe(200);
+    expect(await pending.json()).toMatchObject({
+      asks: [{
+        askId,
+        sessionId: 'session-one',
+        larkAppId: 'app-one',
+      }],
+    });
+
+    const answerPath = '/api/asks/answer';
+    const invalid = await fetch(`${base}${answerPath}`, {
+      method: 'POST',
+      headers: {
+        ...trustedHostHeaders('POST', answerPath, handle.port),
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({ askId, selections: [[]] }),
+    });
+    expect(invalid.status).toBe(409);
+    expect(await invalid.json()).toEqual({ ok: false, error: 'stale' });
+
+    const accepted = await fetch(`${base}${answerPath}`, {
+      method: 'POST',
+      headers: {
+        ...trustedHostHeaders('POST', answerPath, handle.port),
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({ askId, selections: [['yes']], by: 'desktop' }),
+    });
+    expect(accepted.status).toBe(200);
+    expect(await accepted.json()).toEqual({ ok: true, outcome: 'accepted' });
+    await expect(result).resolves.toMatchObject({
+      kind: 'answered',
+      answers: [['yes']],
+      by: 'desktop',
+    });
+
+    const duplicate = await fetch(`${base}${answerPath}`, {
+      method: 'POST',
+      headers: {
+        ...trustedHostHeaders('POST', answerPath, handle.port),
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({ askId, selections: [['yes']] }),
+    });
+    expect(duplicate.status).toBe(409);
+    expect(await duplicate.json()).toEqual({ ok: false, error: 'already_settled' });
+  });
+});
+
 describe('PUT /api/bot-card-prefs — Codex App clean history', () => {
   it('is default-off and persists explicit on/off changes immediately', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-codex-clean-'));
@@ -242,6 +356,69 @@ describe('PUT /api/bot-card-prefs — Codex App clean history', () => {
       expect(off.status).toBe(200);
       expect(await off.json()).toMatchObject({ ok: true, codexAppCleanInput: false });
       expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].codexAppCleanInput).toBeUndefined();
+    } finally {
+      if (handle) await handle.close();
+      handle = null;
+      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = prevBotsConfig;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('PUT /api/bot-card-prefs — reply-card usage display mode', () => {
+  it('defaults to streaming and persists explicit footer/off changes immediately', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-usage-display-'));
+    const configPath = join(dir, 'bots.json');
+    const appId = 'test-usage-display-app';
+    const prevBotsConfig = process.env.BOTS_CONFIG;
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      writeFileSync(configPath, JSON.stringify([{
+        larkAppId: appId,
+        larkAppSecret: 'secret',
+        cliId: 'codex',
+      }], null, 2));
+      loadBotConfigs().forEach((c: any) => registerBot(c));
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const base = `http://127.0.0.1:${handle.port}`;
+
+      const initial = await (await fetch(`${base}/api/bot-default-oncall`)).json();
+      expect(initial.usageDisplay).toBe('streaming');
+
+      const footer = await fetch(`${base}/api/bot-card-prefs`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ usageDisplay: 'footer' }),
+      });
+      expect(footer.status).toBe(200);
+      expect(await footer.json()).toMatchObject({ ok: true, usageDisplay: 'footer' });
+      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].usageDisplay).toBe('footer');
+      expect(await (await fetch(`${base}/api/bot-default-oncall`)).json())
+        .toMatchObject({ usageDisplay: 'footer' });
+
+      // Back to the default 'streaming' → key dropped, GET reflects the default.
+      const streaming = await fetch(`${base}/api/bot-card-prefs`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ usageDisplay: 'streaming' }),
+      });
+      expect(streaming.status).toBe(200);
+      expect(await streaming.json()).toMatchObject({ ok: true, usageDisplay: 'streaming' });
+      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].usageDisplay).toBeUndefined();
+      expect(await (await fetch(`${base}/api/bot-default-oncall`)).json())
+        .toMatchObject({ usageDisplay: 'streaming' });
+
+      // 'off' persists verbatim.
+      const off = await fetch(`${base}/api/bot-card-prefs`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ usageDisplay: 'off' }),
+      });
+      expect(off.status).toBe(200);
+      expect(await off.json()).toMatchObject({ ok: true, usageDisplay: 'off' });
+      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].usageDisplay).toBe('off');
     } finally {
       if (handle) await handle.close();
       handle = null;
@@ -550,6 +727,52 @@ describe('GET /api/sessions', () => {
     const body = await res.json();
     expect(Array.isArray(body.sessions)).toBe(true);
   });
+
+  it('shows an unregistered quarantined active row as dormant in list and detail', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-quarantined-'));
+    const prevConfigDataDir = config.session.dataDir;
+    const registry = new Map<string, any>();
+    try {
+      config.session.dataDir = dataDir;
+      sessionStore.init('cli_quarantined');
+      workerPool.setActiveSessionsRegistry(registry);
+
+      const session = sessionStore.createSession('oc_quarantined', 'om_quarantined', '待确认清理', 'group');
+      session.larkAppId = 'cli_quarantined';
+      session.scope = 'thread';
+      session.cliId = 'codex' as any;
+      session.backendType = 'zmx';
+      session.restoreQuarantinedAt = '2026-07-31T00:00:00.000Z';
+      sessionStore.updateSession(session);
+
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const base = `http://127.0.0.1:${handle.port}`;
+      const listRes = await fetch(`${base}/api/sessions`);
+      expect(listRes.status).toBe(200);
+      const listed = (await listRes.json()).sessions.find((row: any) => row.sessionId === session.sessionId);
+      expect(listed).toMatchObject({
+        sessionId: session.sessionId,
+        status: 'dormant',
+        quarantined: true,
+        backendType: 'zmx',
+        webPort: null,
+      });
+      expect(listed).not.toHaveProperty('closedAt');
+
+      const detailRes = await fetch(`${base}/api/sessions/${session.sessionId}`);
+      expect(detailRes.status).toBe(200);
+      expect((await detailRes.json()).session).toMatchObject({
+        sessionId: session.sessionId,
+        status: 'dormant',
+        quarantined: true,
+      });
+    } finally {
+      workerPool.setActiveSessionsRegistry(new Map());
+      sessionStore.init();
+      config.session.dataDir = prevConfigDataDir;
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
 });
 
 describe('GET /api/sessions/:sessionId', () => {
@@ -557,6 +780,74 @@ describe('GET /api/sessions/:sessionId', () => {
     handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
     const res = await fetch(`http://127.0.0.1:${handle.port}/api/sessions/nonexistent-id`);
     expect(res.status).toBe(404);
+  });
+});
+
+describe('GET /api/sessions/:sessionId/usage', () => {
+  it('returns the daemon-cached native usage snapshot for an active Session', async () => {
+    const ds = { session: { sessionId: 's-usage' } } as any;
+    const findSpy = vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue(ds);
+    const usageSpy = vi.spyOn(workerPool, 'getDaemonReplyCardUsageSnapshot').mockReturnValue({
+      context: { usedTokens: 12_345, windowTokens: 100_000, percentUsed: 12 },
+      tokens: { in: 67_890, out: 123 },
+    });
+    try {
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const res = await fetch(`http://127.0.0.1:${handle.port}/api/sessions/s-usage/usage`);
+
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual({
+        usage: {
+          context: { usedTokens: 12_345, windowTokens: 100_000, percentUsed: 12 },
+          tokens: { in: 67_890, out: 123 },
+        },
+      });
+      expect(usageSpy).toHaveBeenCalledWith(ds);
+    } finally {
+      findSpy.mockRestore();
+      usageSpy.mockRestore();
+    }
+  });
+
+  it('returns the card-specific empty snapshot when footer usage is disabled', async () => {
+    const ds = { session: { sessionId: 's-usage-hidden' } } as any;
+    const findSpy = vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue(ds);
+    const rawSpy = vi.spyOn(workerPool, 'getDaemonSessionUsageSnapshot').mockReturnValue({
+      context: { usedTokens: 12_345 },
+      tokens: { in: 67_890, out: 123 },
+    });
+    const cardSpy = vi.spyOn(workerPool, 'getDaemonReplyCardUsageSnapshot').mockReturnValue({
+      context: null,
+      tokens: null,
+    });
+    try {
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const res = await fetch(
+        `http://127.0.0.1:${handle.port}/api/sessions/s-usage-hidden/usage`,
+      );
+
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual({
+        usage: { context: null, tokens: null },
+      });
+      expect(cardSpy).toHaveBeenCalledWith(ds);
+      expect(rawSpy).not.toHaveBeenCalled();
+    } finally {
+      findSpy.mockRestore();
+      rawSpy.mockRestore();
+      cardSpy.mockRestore();
+    }
+  });
+
+  it('returns 404 when the Session is not active', async () => {
+    const findSpy = vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue(undefined);
+    try {
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const res = await fetch(`http://127.0.0.1:${handle.port}/api/sessions/missing/usage`);
+      expect(res.status).toBe(404);
+    } finally {
+      findSpy.mockRestore();
+    }
   });
 });
 
@@ -593,22 +884,45 @@ describe('POST /api/sessions/:sessionId/rename', () => {
       } as any;
       findSpy = vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue(active);
 
-      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
-      const res = await fetch(`http://127.0.0.1:${handle.port}/api/sessions/${session.sessionId}/rename`, {
+      setIpcAuthSecret(TEST_IPC_SECRET);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
+      const renamePath = `/api/sessions/${session.sessionId}/rename`;
+      const res = await fetch(`http://127.0.0.1:${handle.port}${renamePath}`, {
         method: 'POST',
-        headers: { 'content-type': 'application/json' },
+        headers: {
+          'content-type': 'application/json',
+          ...trustedHostHeaders('POST', renamePath, handle.port),
+        },
         body: JSON.stringify({ title: '  New\tTitle\u001b  ' }),
       });
 
       expect(res.status).toBe(200);
-      expect(await res.json()).toEqual({ ok: true, title: 'New Title', agentSync: 'requested' });
-      expect(sessionStore.getSession(session.sessionId)?.title).toBe('New Title');
-      expect(sessionStore.getSession(session.sessionId)?.nativeSessionTitle).toBe('New Title');
-      expect(sessionStore.getSession(session.sessionId)?.nativeSessionTitleUserDefined).toBe(true);
+      const renameResult = await res.json();
+      expect(renameResult).toEqual({
+        ok: true,
+        title: 'New Title',
+        titleUpdatedAt: expect.any(String),
+        titleSource: 'dashboard',
+        agentSync: 'requested',
+      });
+      expect(sessionStore.getSession(session.sessionId)).toMatchObject({
+        title: 'New Title',
+        titleUpdatedAt: renameResult.titleUpdatedAt,
+        titleSource: 'dashboard',
+        nativeSessionTitle: 'New Title',
+        nativeSessionTitleUserDefined: true,
+      });
       expect(send).toHaveBeenCalledWith({ type: 'rename_session', title: 'New Title' });
       expect(events).toContainEqual({
         type: 'session.update',
-        body: { sessionId: session.sessionId, patch: { title: 'New Title' } },
+        body: {
+          sessionId: session.sessionId,
+          patch: {
+            title: 'New Title',
+            titleUpdatedAt: renameResult.titleUpdatedAt,
+            titleSource: 'dashboard',
+          },
+        },
       });
     } finally {
       findSpy?.mockRestore();
@@ -622,8 +936,13 @@ describe('POST /api/sessions/:sessionId/rename', () => {
 
 describe('POST /api/sessions/:sessionId/close', () => {
   it('returns 200 with ok=true even when session does not exist (idempotent)', async () => {
-    handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
-    const res = await fetch(`http://127.0.0.1:${handle.port}/api/sessions/nonexistent/close`, { method: 'POST' });
+    setIpcAuthSecret(TEST_IPC_SECRET);
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
+    const path = '/api/sessions/nonexistent/close';
+    const res = await fetch(`http://127.0.0.1:${handle.port}${path}`, {
+      method: 'POST',
+      headers: trustedHostHeaders('POST', path, handle.port),
+    });
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.ok).toBe(true);
@@ -1141,6 +1460,47 @@ describe('GET /api/events', () => {
       workerPool.setActiveSessionsRegistry(new Map());
     }
   });
+
+  it('replays this-run closed sessions as session.spawned (zombie-close visibility)', async () => {
+    // A restore-time zombie is registered, announced, then immediately
+    // closeSession()'d (evicted from the active Map) — all before a racing
+    // dashboard's SSE subscription exists. By connect time it's gone from the Map,
+    // so the active-only replay can't surface it. The closed-since-process-start
+    // replay must still deliver it as a closed row so the dashboard doesn't lose
+    // it (or keep a stale active entry).
+    const dataDir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-sse-closed-'));
+    const prevDataDir = process.env.SESSION_DATA_DIR;
+    const prevConfigDataDir = config.session.dataDir;
+    const registry = new Map<string, any>();
+    try {
+      config.session.dataDir = dataDir;
+      sessionStore.init();
+      workerPool.setActiveSessionsRegistry(registry); // empty — zombie already evicted
+
+      const session = sessionStore.createSession('oc_zombie', 'om_zombie', 'zombie topic', 'group');
+      session.larkAppId = '';
+      session.scope = 'thread';
+      session.cliId = 'codex' as any;
+      sessionStore.updateSession(session);
+      sessionStore.closeSession(session.sessionId); // closedAt = now ≥ PROCESS_START_MS
+
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const ev = await readSseEvent(
+        `http://127.0.0.1:${handle.port}/api/events`,
+        e => e.type === 'session.spawned' && e.body?.session?.sessionId === session.sessionId,
+      );
+      expect(ev).not.toBeNull();
+      expect(ev!.body.session.status).toBe('closed');
+      expect(typeof ev!.body.session.closedAt).toBe('number');
+    } finally {
+      workerPool.setActiveSessionsRegistry(new Map());
+      sessionStore.init();
+      if (prevDataDir === undefined) delete process.env.SESSION_DATA_DIR;
+      else process.env.SESSION_DATA_DIR = prevDataDir;
+      config.session.dataDir = prevConfigDataDir;
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
 });
 
 describe('GET /api/sessions/:sessionId/write-link', () => {
@@ -1173,6 +1533,23 @@ describe('GET /api/sessions/:sessionId/write-link', () => {
     const res = await fetch(`http://127.0.0.1:${handle.port}/api/sessions/s1/write-link`, { headers: tokenAuthHeaders() });
     expect(res.status).toBe(409);
     expect((await res.json()).error).toBe('terminal_unavailable');
+    spy.mockRestore();
+  });
+
+  it('reports Web Terminal as unsupported for the zmx backend', async () => {
+    setIpcAuthSecret(TEST_IPC_SECRET);
+    const spy = vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue({
+      session: { sessionId: 's-zmx', backendType: 'zmx', webPort: 4321 },
+      workerPort: 4321,
+      workerToken: 'stale-secret',
+      riffAccessUrl: 'https://stale-riff.example',
+    } as any);
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+    const res = await fetch(`http://127.0.0.1:${handle.port}/api/sessions/s-zmx/write-link`, {
+      headers: tokenAuthHeaders(),
+    });
+    expect(res.status).toBe(409);
+    expect((await res.json()).error).toBe('terminal_unsupported');
     spy.mockRestore();
   });
 
@@ -1497,16 +1874,18 @@ describe('PUT /api/bot-substitute-mode', () => {
           targets: [{ userId: 'u_alice', name: 'Alice' }],
           disclosure: 'prefix',
           replyMode: 'quote',
+          excludedChats: ['oc_x', ' oc_y ', '', 'oc_x'],
         }),
       });
 
       expect(res.status).toBe(200);
       expect(await res.json()).toMatchObject({
         ok: true,
-        substituteMode: { replyMode: 'quote' },
+        substituteMode: { replyMode: 'quote', excludedChats: ['oc_x', 'oc_y'] },
       });
       expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].substituteMode).toMatchObject({
         replyMode: 'quote',
+        excludedChats: ['oc_x', 'oc_y'],
       });
     } finally {
       if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
@@ -2169,7 +2548,9 @@ describe('GET /api/groups (Phase B)', () => {
     // dashboard can sort newly-added chats to the top. In this test the
     // store hasn't been init()'d (no daemon), so the value degrades to
     // null instead of failing the request — see chat-first-seen-store.
-    expect(body.chats).toEqual([{ chatId: 'oc_1', name: 'team', oncallChat: null, firstSeenAt: null, hasRole: false, observedBotNames: [] }]);
+    // `hasMessageListener` lets the roles tree mark bots with active listener
+    // configs without issuing one request per chat.
+    expect(body.chats).toEqual([{ chatId: 'oc_1', name: 'team', oncallChat: null, firstSeenAt: null, hasRole: false, hasMessageListener: false, observedBotNames: [] }]);
     spy.mockRestore();
   });
 });
@@ -2421,6 +2802,293 @@ describe('POST /api/groups/transfer-owner', () => {
 });
 
 describe('role profile IPC routes', () => {
+  it('previews message listener matches from recent chat history', async () => {
+    setLarkAppId('cli_listener');
+    registerBot({
+      larkAppId: 'cli_listener',
+      larkAppSecret: 'secret',
+      cliId: 'codex',
+    });
+    const now = Date.now();
+    const historySpy = vi.spyOn(larkClient, 'listChatMessagesUntil').mockImplementation(async (_larkAppId, _chatId, options) => {
+      expect(options?.pageSize).toBe(50);
+      expect(options?.stopAfter?.({ create_time: String(now - 24 * 60 * 60 * 1000 - 60_000) }, 1)).toBe(true);
+      expect(options?.stopAfter?.({ create_time: String(now - 24 * 60 * 60 * 1000 + 60_000) }, 1)).toBe(false);
+      return [
+        {
+          message_id: 'om_ignore',
+          create_time: String(now - 10_000),
+          msg_type: 'text',
+          body: { content: JSON.stringify({ text: 'ignore' }) },
+          sender: { id: 'ou_other', sender_type: 'user', sender_name: 'Other' },
+        },
+        {
+          message_id: 'om_match',
+          create_time: String(now - 5_000),
+          msg_type: 'text',
+          body: { content: JSON.stringify({ text: 'CPU 告警' }) },
+          sender: { id: 'ou_allowed', sender_type: 'user', sender_name: '张三' },
+        },
+      ];
+    });
+    try {
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const base = `http://127.0.0.1:${handle.port}`;
+      const res = await fetch(`${base}/api/message-listeners/oc_alerts/preview`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          limit: 50,
+          listener: {
+            enabled: true,
+            prompt: '分析告警',
+            senderPolicy: {
+              mode: 'include_only',
+              includeSenderOpenIds: ['ou_allowed'],
+              includeSenderTypes: ['user'],
+            },
+            messagePolicy: { includeMsgTypes: ['text'], scope: 'top_level' },
+          },
+        }),
+      });
+
+      expect(res.status).toBe(200);
+      expect(await res.json()).toMatchObject({
+        ok: true,
+        requestedLimit: 20,
+        matches: [{
+          messageId: 'om_match',
+          messageText: 'CPU 告警',
+          senderOpenId: 'ou_allowed',
+          senderName: '张三',
+          senderType: 'user',
+        }],
+      });
+      expect(historySpy).toHaveBeenCalledWith('cli_listener', 'oc_alerts', expect.any(Object));
+    } finally {
+      historySpy.mockRestore();
+    }
+  });
+
+  it('runs message listener preview through the visible listener reply path', async () => {
+    setLarkAppId('cli_listener_run');
+    registerBot({
+      larkAppId: 'cli_listener_run',
+      larkAppSecret: 'secret',
+      cliId: 'codex',
+      workingDir: process.cwd(),
+    });
+    const activeSessions = new Map<string, any>();
+    const now = Date.now();
+    const historySpy = vi.spyOn(larkClient, 'listChatMessagesUntil').mockResolvedValue([
+      {
+        message_id: 'om_match_run',
+        create_time: String(now - 5_000),
+        msg_type: 'text',
+        body: { content: JSON.stringify({ text: 'CPU 告警' }) },
+        sender: { id: 'ou_allowed', sender_type: 'user', sender_name: '张三' },
+      },
+    ]);
+    const inChatSpy = vi.spyOn(groupsStore, 'isInChat').mockResolvedValue(true);
+    const chatModeSpy = vi.spyOn(larkClient, 'getChatMode').mockResolvedValue('topic');
+    const messageChatSpy = vi.spyOn(larkClient, 'getMessageChatId').mockResolvedValue('oc_alerts');
+    const forkSpy = vi.spyOn(workerPool, 'forkWorker').mockImplementation(() => {});
+    try {
+      workerPool.setActiveSessionsRegistry(activeSessions);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const base = `http://127.0.0.1:${handle.port}`;
+      const res = await fetch(`${base}/api/message-listeners/oc_alerts/run-preview`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          limit: 5,
+          listener: {
+            enabled: true,
+            prompt: '分析告警',
+            senderPolicy: {
+              mode: 'include_only',
+              includeSenderOpenIds: ['ou_allowed'],
+              includeSenderTypes: ['user'],
+            },
+            messagePolicy: { includeMsgTypes: ['text'], scope: 'top_level' },
+          },
+        }),
+      });
+
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body).toMatchObject({
+        ok: true,
+        runId: expect.stringMatching(/^mlrp_/),
+        matches: [{ messageId: 'om_match_run', messageText: 'CPU 告警' }],
+        results: [{
+          messageId: 'om_match_run',
+          ok: true,
+          action: 'queued',
+          state: 'triggered',
+          runId: expect.stringMatching(/^mlrp_/),
+          triggerId: expect.stringMatching(/^mlrp_turn_/),
+        }],
+      });
+      expect(body.results[0].runId).toBe(body.runId);
+      expect(messageChatSpy).toHaveBeenCalledWith('cli_listener_run', 'om_match_run');
+      expect(forkSpy).toHaveBeenCalledTimes(1);
+      expect(forkSpy.mock.calls[0][2]).toMatch(/^mlrp_turn_/);
+    } finally {
+      workerPool.setActiveSessionsRegistry(new Map());
+      forkSpy.mockRestore();
+      messageChatSpy.mockRestore();
+      chatModeSpy.mockRestore();
+      inChatSpy.mockRestore();
+      historySpy.mockRestore();
+    }
+  });
+
+  it('does not match or fork a run-preview session for a history message that explicitly @mentions this bot', async () => {
+    setLarkAppId('cli_listener_run');
+    registerBot({
+      larkAppId: 'cli_listener_run',
+      larkAppSecret: 'secret',
+      cliId: 'codex',
+      workingDir: process.cwd(),
+    });
+    getBot('cli_listener_run').botOpenId = 'ou_this_bot';
+    const activeSessions = new Map<string, any>();
+    const now = Date.now();
+    // Same allowed sender + type as the happy path, but the message explicitly
+    // @mentions THIS bot → realtime/poll routing hands it to normal @-routing,
+    // so preview must NOT match it and run-preview must NOT fork a session.
+    const historySpy = vi.spyOn(larkClient, 'listChatMessagesUntil').mockResolvedValue([
+      {
+        message_id: 'om_mention_run',
+        create_time: String(now - 5_000),
+        msg_type: 'text',
+        body: { content: JSON.stringify({ text: '@bot CPU 告警' }) },
+        sender: { id: 'ou_allowed', sender_type: 'user', sender_name: '张三' },
+        // REST message-list shape: mention id is a bare string + id_type (not
+        // the WS object form) — this is what listChatMessagesUntil returns.
+        mentions: [{ key: '@_user_1', id: 'ou_this_bot', id_type: 'open_id', name: 'bot' }],
+      },
+    ]);
+    const inChatSpy = vi.spyOn(groupsStore, 'isInChat').mockResolvedValue(true);
+    const chatModeSpy = vi.spyOn(larkClient, 'getChatMode').mockResolvedValue('topic');
+    const messageChatSpy = vi.spyOn(larkClient, 'getMessageChatId').mockResolvedValue('oc_alerts');
+    const forkSpy = vi.spyOn(workerPool, 'forkWorker').mockImplementation(() => {});
+    try {
+      workerPool.setActiveSessionsRegistry(activeSessions);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const base = `http://127.0.0.1:${handle.port}`;
+      const res = await fetch(`${base}/api/message-listeners/oc_alerts/run-preview`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          limit: 5,
+          listener: {
+            enabled: true,
+            prompt: '分析告警',
+            senderPolicy: {
+              mode: 'include_only',
+              includeSenderOpenIds: ['ou_allowed'],
+              includeSenderTypes: ['user'],
+            },
+            messagePolicy: { includeMsgTypes: ['text'], scope: 'top_level' },
+          },
+        }),
+      });
+
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.ok).toBe(true);
+      expect(body.matches).toEqual([]);
+      expect(body.results).toEqual([]);
+      // The explicit @mention hands off to normal routing → no session spawned.
+      expect(forkSpy).not.toHaveBeenCalled();
+    } finally {
+      workerPool.setActiveSessionsRegistry(new Map());
+      forkSpy.mockRestore();
+      messageChatSpy.mockRestore();
+      chatModeSpy.mockRestore();
+      inChatSpy.mockRestore();
+      historySpy.mockRestore();
+    }
+  });
+
+  it('reports message listener run preview reply lifecycle by run id', async () => {
+    setLarkAppId('cli_listener_status');
+    registerBot({
+      larkAppId: 'cli_listener_status',
+      larkAppSecret: 'secret',
+      cliId: 'codex',
+      workingDir: process.cwd(),
+    });
+    const activeSessions = new Map<string, any>();
+    const now = Date.now();
+    const historySpy = vi.spyOn(larkClient, 'listChatMessagesUntil').mockResolvedValue([
+      {
+        message_id: 'om_match_status',
+        create_time: String(now - 5_000),
+        msg_type: 'text',
+        body: { content: JSON.stringify({ text: 'CPU 告警' }) },
+        sender: { id: 'ou_allowed', sender_type: 'user', sender_name: '张三' },
+      },
+    ]);
+    const inChatSpy = vi.spyOn(groupsStore, 'isInChat').mockResolvedValue(true);
+    const chatModeSpy = vi.spyOn(larkClient, 'getChatMode').mockResolvedValue('topic');
+    const messageChatSpy = vi.spyOn(larkClient, 'getMessageChatId').mockResolvedValue('oc_alerts');
+    const forkSpy = vi.spyOn(workerPool, 'forkWorker').mockImplementation(() => {});
+    try {
+      workerPool.setActiveSessionsRegistry(activeSessions);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const base = `http://127.0.0.1:${handle.port}`;
+      const runRes = await fetch(`${base}/api/message-listeners/oc_alerts/run-preview`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          limit: 5,
+          listener: {
+            enabled: true,
+            prompt: '分析告警',
+            senderPolicy: {
+              mode: 'include_only',
+              includeSenderOpenIds: ['ou_allowed'],
+              includeSenderTypes: ['user'],
+            },
+            messagePolicy: { includeMsgTypes: ['text'], scope: 'top_level' },
+          },
+        }),
+      });
+      expect(runRes.status).toBe(200);
+      const runBody = await runRes.json();
+      const triggerId = runBody.results[0].triggerId;
+
+      markMessageListenerRunPreviewReplied(triggerId, {
+        sessionId: runBody.results[0].sessionId,
+        replyMessageId: 'om_reply_status',
+      });
+
+      const statusRes = await fetch(`${base}/api/message-listeners/oc_alerts/run-preview/${runBody.runId}`);
+      expect(statusRes.status).toBe(200);
+      expect(await statusRes.json()).toMatchObject({
+        ok: true,
+        runId: runBody.runId,
+        results: [{
+          messageId: 'om_match_status',
+          ok: true,
+          state: 'replied',
+          triggerId,
+          replyMessageId: 'om_reply_status',
+        }],
+      });
+    } finally {
+      workerPool.setActiveSessionsRegistry(new Map());
+      forkSpy.mockRestore();
+      messageChatSpy.mockRestore();
+      chatModeSpy.mockRestore();
+      inChatSpy.mockRestore();
+      historySpy.mockRestore();
+    }
+  });
+
   it('returns multiple role snapshots in one daemon request', async () => {
     const dataDir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-role-batch-'));
     const prevDataDir = process.env.SESSION_DATA_DIR;
@@ -2727,6 +3395,164 @@ describe('role profile IPC routes', () => {
       else process.env.SESSION_DATA_DIR = prevDataDir;
       config.session.dataDir = prevConfigDataDir;
       rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('core-only public routes + readiness barrier (behavioral)', () => {
+  afterEach(async () => {
+    __testOnly_resetCoreOnlyReadiness();
+    if (handle) { await handle.close(); handle = null; }
+  });
+
+  it('allowlists ONLY trigger/trigger-result/insight (no HMAC), everything else still 401', async () => {
+    setIpcAuthSecret(TEST_IPC_SECRET);
+    setLarkAppId('local_smoke');
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true, coreOnlyPublicRoutes: true });
+    setCoreOnlyReady(); // past the readiness barrier for this case
+    const base = `http://127.0.0.1:${handle.port}`;
+    // Allowlisted (no auth header) → must NOT be 401 (reaches handler: 400 bad-shape / 200 / 404).
+    const trig = await fetch(`${base}/api/trigger`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' });
+    expect(trig.status).not.toBe(401);
+    const tr = await fetch(`${base}/api/sessions/nope/trigger-result`);
+    expect(tr.status).not.toBe(401);
+    const ins = await fetch(`${base}/api/sessions/nope/insight?detail=conversation`);
+    expect(ins.status).not.toBe(401);
+    // NOT allowlisted (no auth header) → 401.
+    expect((await fetch(`${base}/api/sessions`)).status).toBe(401);
+    expect((await fetch(`${base}/api/asks/pending`)).status).toBe(401);
+    // /api/asks/answer is deliberately excluded from the allowlist → 401.
+    expect((await fetch(`${base}/api/asks/answer`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{"askId":"x","selections":[]}' })).status).toBe(401);
+  });
+
+  it('readiness barrier: control routes AND /healthz return 503 until ready, without a healthz pre-check', async () => {
+    setIpcAuthSecret(TEST_IPC_SECRET);
+    setLarkAppId('local_smoke');
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true, coreOnlyPublicRoutes: true });
+    armCoreOnlyReadinessGate(); // armed, NOT ready
+    const base = `http://127.0.0.1:${handle.port}`;
+    // Directly hit a control route WITHOUT probing /healthz first — must be 503.
+    const early = await fetch(`${base}/api/trigger`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' });
+    expect(early.status).toBe(503);
+    expect((await early.json()).status).toBe('starting');
+    // /healthz also reports starting.
+    const h = await fetch(`${base}/healthz`);
+    expect(h.status).toBe(503);
+    expect((await h.json()).status).toBe('starting');
+    // After release: healthz 200 and the control route reaches its handler (not 503).
+    setCoreOnlyReady();
+    expect((await fetch(`${base}/healthz`)).status).toBe(200);
+    const afterReady = await fetch(`${base}/api/trigger`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' });
+    expect(afterReady.status).not.toBe(503);
+  });
+
+  it('does NOT gate a normal (non-core-only) server: /healthz is unconditional 200', async () => {
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1' }); // no coreOnlyPublicRoutes
+    // Even if some other test armed the gate, a server without coreOnlyPublicRoutes
+    // never 503s its control routes (they require HMAC anyway); /healthz stays 200
+    // because the gate is only consulted for the core-only public surface.
+    const res = await fetch(`http://127.0.0.1:${handle.port}/healthz`);
+    expect(res.status).toBe(200);
+    expect((await res.json()).ok).toBe(true);
+  });
+
+  // Form C: trigger-result carries a read-only web-terminal URL while a live
+  // worker terminal exists, so an async caller (riff's task-runner) can open
+  // the visible CLI TUI in the sandbox browser.
+  it('trigger-result exposes readOnlyUrl + viewToken when a live worker terminal is up (core-only)', async () => {
+    setIpcAuthSecret(TEST_IPC_SECRET);
+    setLarkAppId('local_smoke');
+    setCoreOnlyReady();
+    const prevCoreOnly = process.env.BOTMUX_CORE_ONLY;
+    process.env.BOTMUX_CORE_ONLY = '1';
+    const findSpy = vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue({
+      session: { sessionId: 's-term', chatId: 'http_async_x', larkAppId: 'local_smoke', status: 'open' },
+      chatId: 'http_async_x',
+      larkAppId: 'local_smoke',
+      workerPort: 4321,
+      workerToken: 'write-tok',
+      workerViewToken: 'view-cap-abc',
+      asyncTriggerResults: new Map(),
+    } as any);
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true, coreOnlyPublicRoutes: true });
+    try {
+      const res = await fetch(`http://127.0.0.1:${handle.port}/api/sessions/s-term/trigger-result`);
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(typeof body.readOnlyUrl).toBe('string');
+      // Carries the read capability inline, NOT the write token.
+      expect(body.readOnlyUrl).toContain('viewToken=view-cap-abc');
+      expect(body.readOnlyUrl).not.toContain('write-tok');
+      expect(body.viewToken).toBe('view-cap-abc');
+    } finally {
+      if (prevCoreOnly === undefined) delete process.env.BOTMUX_CORE_ONLY;
+      else process.env.BOTMUX_CORE_ONLY = prevCoreOnly;
+      findSpy.mockRestore();
+    }
+  });
+
+  // codex review concern #1: the readOnlyUrl/viewToken attach must be gated to
+  // core-only. On a normal/mixed fleet trigger-result must NEVER mint a terminal
+  // read-capability into the poll response — even with a live worker terminal —
+  // or an HMAC-authed trigger caller would gain a view token the route never
+  // historically handed out (tokens are minted only on explicit /write-link).
+  it('trigger-result does NOT expose readOnlyUrl on a NON-core-only fleet even with a live worker terminal', async () => {
+    setIpcAuthSecret(TEST_IPC_SECRET);
+    setLarkAppId('local_smoke');
+    const prevCoreOnly = process.env.BOTMUX_CORE_ONLY;
+    delete process.env.BOTMUX_CORE_ONLY; // normal fleet
+    const findSpy = vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue({
+      session: { sessionId: 's-fleet', chatId: 'oc_real_chat', larkAppId: 'local_smoke', status: 'open' },
+      chatId: 'oc_real_chat',
+      larkAppId: 'local_smoke',
+      workerPort: 4321,               // live worker terminal present …
+      workerToken: 'write-tok',
+      workerViewToken: 'view-cap-abc',
+      asyncTriggerResults: new Map(),
+    } as any);
+    // Normal fleet: default server (no coreOnlyPublicRoutes) — trigger-result
+    // is HMAC-gated; authorize with the same unbound token the write-link tests
+    // use so the request reaches the handler.
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+    try {
+      const res = await fetch(`http://127.0.0.1:${handle.port}/api/sessions/s-fleet/trigger-result`, { headers: tokenAuthHeaders() });
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      // … but NO terminal capability is leaked into the poll response.
+      expect(body.readOnlyUrl).toBeUndefined();
+      expect(body.viewToken).toBeUndefined();
+    } finally {
+      if (prevCoreOnly === undefined) delete process.env.BOTMUX_CORE_ONLY;
+      else process.env.BOTMUX_CORE_ONLY = prevCoreOnly;
+      findSpy.mockRestore();
+    }
+  });
+
+  it('trigger-result omits readOnlyUrl when the live session has no worker terminal yet (core-only)', async () => {
+    setIpcAuthSecret(TEST_IPC_SECRET);
+    setLarkAppId('local_smoke');
+    setCoreOnlyReady();
+    const prevCoreOnly = process.env.BOTMUX_CORE_ONLY;
+    process.env.BOTMUX_CORE_ONLY = '1';
+    const findSpy = vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue({
+      session: { sessionId: 's-noterm', chatId: 'http_async_y', larkAppId: 'local_smoke', status: 'open' },
+      chatId: 'http_async_y',
+      larkAppId: 'local_smoke',
+      workerPort: null,          // worker web server not up yet
+      workerViewToken: null,
+      asyncTriggerResults: new Map(),
+    } as any);
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true, coreOnlyPublicRoutes: true });
+    try {
+      const res = await fetch(`http://127.0.0.1:${handle.port}/api/sessions/s-noterm/trigger-result`);
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.readOnlyUrl).toBeUndefined();
+      expect(body.viewToken).toBeUndefined();
+    } finally {
+      if (prevCoreOnly === undefined) delete process.env.BOTMUX_CORE_ONLY;
+      else process.env.BOTMUX_CORE_ONLY = prevCoreOnly;
+      findSpy.mockRestore();
     }
   });
 });

@@ -11,11 +11,18 @@ Manage the daemon and sessions from the terminal.
 | `botmux logs [--lines N]` | View logs |
 | `botmux status` | View daemon status |
 | `botmux upgrade` | Upgrade to the latest version |
-| `botmux list` (alias `ls`) | List all active sessions |
+| `botmux list` (alias `ls`) | Interactively list active sessions; select a managed tmux / ZMX session and press Enter to attach (use `--plain` in scripts) |
 | `botmux delete <id>` (aliases `del`/`rm`) | Close the specified session, with ID prefix matching |
 | `botmux delete all` | Close all active sessions |
 | `botmux delete stopped` | Clean up zombie sessions whose processes have exited |
 | `botmux dashboard` | Print a Web Dashboard URL once (refreshes the token each time) |
+
+When the daemon is online, `botmux delete` first asks the owning daemon to run
+the same lifecycle teardown as `/close`: evict the in-memory active session,
+persist the closed state, and clean up the worker, backend, and subscriptions.
+The local fallback is used only when the owning daemon is confirmed offline. If
+an online daemon rejects the request or IPC fails, the command fails without a
+local hard kill.
 
 ## Auto-Start on Boot
 

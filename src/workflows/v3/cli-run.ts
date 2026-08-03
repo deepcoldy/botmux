@@ -49,6 +49,7 @@ import {
   makeManualCliRunEnvelope,
   publishRunEnvelopeOnce,
   readRunEnvelope,
+  RunEnvelopeConflictError,
   type PublishRunEnvelopeResult,
   type V3ManualCliRunEnvelope,
 } from './run-envelope.js';
@@ -68,7 +69,7 @@ interface V3RunArgs {
 }
 
 /** Default run root: `~/.botmux/v3-runs/<runId>`. */
-function defaultBaseDir(): string {
+export function defaultBaseDir(): string {
   return join(homedir(), '.botmux', 'v3-runs');
 }
 
@@ -189,6 +190,13 @@ export interface AuthorizeManualCliRunOptions {
   defaultBotSelector?: string;
   workingDirOverride?: string;
   now?: Date;
+  /**
+   * Exact canonical request bytes for `botmux goal run`. They are pinned by
+   * run.json beside the DAG/snapshots so a caller-provided runId cannot be
+   * silently reused with a different goal, bot, cwd, or timeout. Hand-authored
+   * `botmux v3 run` leaves this absent.
+   */
+  goalRequestBytes?: string;
 }
 
 export interface AuthorizeManualCliRunResult {
@@ -220,6 +228,18 @@ export function authorizeManualCliRun(opts: AuthorizeManualCliRunOptions): Autho
         expectedRunId: opts.dag.runId,
         allowedSources: ['manual_cli'],
       });
+      const storedGoalRequest = loaded.bytes.goalRequest;
+      if (opts.goalRequestBytes !== undefined) {
+        if (!storedGoalRequest || !storedGoalRequest.equals(Buffer.from(opts.goalRequestBytes, 'utf8'))) {
+          throw new RunEnvelopeConflictError(
+            `runId "${opts.dag.runId}" is already authorized for a different goal-run request`,
+          );
+        }
+      } else if (storedGoalRequest) {
+        throw new RunEnvelopeConflictError(
+          `runId "${opts.dag.runId}" belongs to botmux goal run and cannot be attached through botmux v3 run`,
+        );
+      }
       const envelope = loaded.envelope as V3ManualCliRunEnvelope;
       return {
         dag: loaded.dag,
@@ -247,6 +267,9 @@ export function authorizeManualCliRun(opts: AuthorizeManualCliRunOptions): Autho
       `${JSON.stringify(serializeFrozenBotSnapshots(frozenBotSnapshots), null, 2)}\n`,
       { mode: 0o600 },
     );
+    if (opts.goalRequestBytes !== undefined) {
+      atomicWriteFileSync(join(opts.runDir, 'goal.request.json'), opts.goalRequestBytes, { mode: 0o600 });
+    }
     const now = (opts.now ?? new Date()).toISOString();
     const envelope = makeManualCliRunEnvelope({
       runId: opts.dag.runId,
@@ -255,6 +278,9 @@ export function authorizeManualCliRun(opts: AuthorizeManualCliRunOptions): Autho
       artifacts: {
         dag: artifactRef(opts.runDir, 'dag.json'),
         botSnapshots: artifactRef(opts.runDir, 'bots.snapshot.json'),
+        ...(opts.goalRequestBytes !== undefined
+          ? { goalRequest: artifactRef(opts.runDir, 'goal.request.json') }
+          : {}),
       },
     });
     const publication = publishRunEnvelopeOnce(opts.runDir, envelope);

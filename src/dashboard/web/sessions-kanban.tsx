@@ -1,3 +1,4 @@
+import type React from 'react';
 import {
   useCallback,
   useEffect,
@@ -45,6 +46,7 @@ export interface SessionsKanbanIcons {
   details: string;
   feishu: string;
   history: string;
+  key: string;
   lock: string;
   restart: string;
   terminal: string;
@@ -78,7 +80,8 @@ export interface SessionsKanbanCallbacks {
   onMoveRows: (moves: SessionsKanbanMove[]) => void;
   onNeedTeamBoard: (team: SessionsKanbanTeam) => void;
   onNeedTeams: () => void;
-  onOpenTerminal: (row: any) => void;
+  onOpenTerminal?: (row: any) => void;
+  onOpenWritableTerminal?: (row: any, button: HTMLButtonElement) => void;
   onRename: (row: any, title: string) => void;
   onRestart: (row: any, button: HTMLButtonElement) => void;
   onTeamScope: (scope: { chats: number; sessions: number } | null) => void;
@@ -321,7 +324,7 @@ function CardActButton(props: {
   icon: string;
   label: string;
   onClick: (button: HTMLButtonElement) => void;
-}): JSX.Element {
+}): React.JSX.Element {
   return (
     <button
       type="button"
@@ -342,7 +345,7 @@ function RenameInput(props: {
   row: any;
   onCancel: () => void;
   onCommit: (row: any, title: string) => void;
-}): JSX.Element {
+}): React.JSX.Element {
   const initial = stripMentionPrefix(props.row.title) || '';
   const [value, setValue] = useState(initial);
   const inputRef = useRef<HTMLInputElement | null>(null);
@@ -400,7 +403,7 @@ function KanbanCard(props: {
   onCardKeyDown: (row: any, event: KeyboardEvent<HTMLElement>) => void;
   onDragStartCard: (row: any, event: DragEvent<HTMLElement>) => void;
   onEditDone: () => void;
-}): JSX.Element {
+}): React.JSX.Element {
   const { callbacks, row } = props;
   const title = rowTitle(row);
   const botName = botDisplayName(row);
@@ -428,12 +431,20 @@ function KanbanCard(props: {
         label={t('sessions.history.title')}
         onClick={() => callbacks.onHistory(row)}
       />
-      {row.webPort ? (
+      {row.webPort && callbacks.onOpenTerminal ? (
         <CardActButton
           action="terminal"
           icon={callbacks.icons.terminal}
-          label={t('sessions.openTerminal')}
-          onClick={() => callbacks.onOpenTerminal(row)}
+          label={t('sessions.openReadonlyTerminal')}
+          onClick={() => callbacks.onOpenTerminal?.(row)}
+        />
+      ) : null}
+      {row.webPort && callbacks.onOpenWritableTerminal ? (
+        <CardActButton
+          action="write-link"
+          icon={callbacks.icons.key}
+          label={t('sessions.openWritableTerminal')}
+          onClick={button => callbacks.onOpenWritableTerminal?.(row, button)}
         />
       ) : null}
       {row.feishuChatLink ? (
@@ -550,7 +561,7 @@ function ClusterView(props: {
   expanded: boolean;
   onToggleExpanded: () => void;
   onDragStartCluster: (chatId: string, col: SessionKanbanColumn, event: DragEvent<HTMLElement>) => void;
-}): JSX.Element {
+}): React.JSX.Element {
   const item = props.item;
   if (item.type === 'card') return <KanbanCard {...props.cardProps} row={item.row} />;
   const title = chatDisplayTitle(item.rows[0]) ?? item.chatId;
@@ -586,7 +597,7 @@ function ClusterView(props: {
   );
 }
 
-export function SessionsKanbanView(props: SessionsKanbanProps): JSX.Element {
+export function SessionsKanbanView(props: SessionsKanbanProps): React.JSX.Element {
   const [display, setDisplay] = useState<SessionsKanbanProps>(props);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [drag, setDrag] = useState<{ kind: 'card'; id: string } | { kind: 'cluster'; chatId: string; col: SessionKanbanColumn } | null>(null);

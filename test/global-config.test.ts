@@ -3,13 +3,16 @@ import { chmodSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, s
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import {
+  GROUP_NAME_PREFIX_MAX_LENGTH,
   globalVcMeetingAgentListenerBotAppId,
   globalConfigPath,
   isGlobalVcMeetingAgentEnabled,
+  invalidateGlobalConfigCache,
   mergeDashboardConfig,
   mergeGlobalConfig,
   readGlobalConfig,
   writeCodexNotifierConfig,
+  writeHostOverloadAlertConfig,
 } from '../src/global-config.js';
 import { resolveCodexNotifierConfig } from '../src/features/codex-notifier/config.js';
 
@@ -63,6 +66,20 @@ describe('global dashboard config', () => {
     expect(readGlobalConfig().dashboard).toEqual({ chatBotDiscovery: false });
   });
 
+  it('reads dashboard.noVisibleOutputHint as a boolean (on)', () => {
+    writeFileSync(globalConfigPath(), JSON.stringify({
+      dashboard: { noVisibleOutputHint: true },
+    }));
+    expect(readGlobalConfig().dashboard).toEqual({ noVisibleOutputHint: true });
+  });
+
+  it('drops non-boolean dashboard.noVisibleOutputHint', () => {
+    writeFileSync(globalConfigPath(), JSON.stringify({
+      dashboard: { noVisibleOutputHint: 'yes' },
+    }));
+    expect(readGlobalConfig().dashboard).toBeUndefined();
+  });
+
   it('reads pinned plugin dashboards as a sanitized machine-wide preference', () => {
     writeFileSync(globalConfigPath(), JSON.stringify({
       dashboard: { pinnedPlugins: ['demo-addon', 'bad/id', 'demo-addon', 'agent-chrome'] },
@@ -106,6 +123,40 @@ describe('global dashboard config', () => {
     }));
 
     expect(readGlobalConfig().repoPickerMode).toBe('repos');
+  });
+
+  it('preserves separator whitespace in groupNamePrefix', () => {
+    writeFileSync(globalConfigPath(), JSON.stringify({ groupNamePrefix: '  [AI] ' }));
+    expect(readGlobalConfig().groupNamePrefix).toBe('  [AI] ');
+  });
+
+  it('ignores invalid groupNamePrefix values on the forgiving read path', () => {
+    for (const groupNamePrefix of [
+      42,
+      '   ',
+      'AI\n讨论·',
+      'AI\u0080讨论·',
+      'AI\u0085讨论·',
+      'AI\u009f讨论·',
+      'x'.repeat(GROUP_NAME_PREFIX_MAX_LENGTH + 1),
+    ]) {
+      writeFileSync(globalConfigPath(), JSON.stringify({ groupNamePrefix }));
+      invalidateGlobalConfigCache();
+      expect(readGlobalConfig().groupNamePrefix).toBeUndefined();
+    }
+  });
+
+  it('round-trips and clears groupNamePrefix without losing unknown keys', () => {
+    writeFileSync(globalConfigPath(), JSON.stringify({ futureSetting: 'keep-me' }));
+    mergeGlobalConfig({ groupNamePrefix: 'AI讨论·' });
+    expect(readGlobalConfig().groupNamePrefix).toBe('AI讨论·');
+    expect(JSON.parse(readFileSync(globalConfigPath(), 'utf8')).futureSetting).toBe('keep-me');
+
+    mergeGlobalConfig({ groupNamePrefix: null });
+    const raw = JSON.parse(readFileSync(globalConfigPath(), 'utf8'));
+    expect(readGlobalConfig().groupNamePrefix).toBeUndefined();
+    expect(raw).not.toHaveProperty('groupNamePrefix');
+    expect(raw.futureSetting).toBe('keep-me');
   });
 
   it('drops invalid repoPickerMode values', () => {
@@ -212,6 +263,87 @@ describe('global dashboard config', () => {
     expect(resolveCodexNotifierConfig()).toEqual({
       enabled: false,
       notifyWhen: 'locked_only',
+    });
+  });
+
+  it('keeps hostOverloadAlert absent by default (feature off)', () => {
+    expect(readGlobalConfig().hostOverloadAlert).toBeUndefined();
+  });
+
+  it('reads and sanitizes the machine-wide hostOverloadAlert config', () => {
+    writeFileSync(globalConfigPath(), JSON.stringify({
+      hostOverloadAlert: {
+        enabled: true,
+        targetBotAppId: ' cli_notify ',
+        enterLoadRatio: 2.0,
+        enterMemUsedFrac: 0.8,
+        futureSetting: 'keep-compatible',
+      },
+    }));
+
+    expect(readGlobalConfig().hostOverloadAlert).toEqual({
+      enabled: true,
+      targetBotAppId: 'cli_notify',
+      enterLoadRatio: 2.0,
+      enterMemUsedFrac: 0.8,
+    });
+  });
+
+  it('drops invalid hostOverloadAlert fields (blank target, non-finite / out-of-range thresholds)', () => {
+    writeFileSync(globalConfigPath(), JSON.stringify({
+      hostOverloadAlert: {
+        enabled: 'yes',        // not a boolean → dropped
+        targetBotAppId: '   ',  // blank → dropped
+        enterLoadRatio: -1,     // not positive → dropped
+        enterMemUsedFrac: 1.5,  // > 1 → dropped
+      },
+    }));
+    // Every field was invalid → the whole object collapses to undefined.
+    expect(readGlobalConfig().hostOverloadAlert).toBeUndefined();
+  });
+
+  it('keeps only the valid subset of hostOverloadAlert fields', () => {
+    writeFileSync(globalConfigPath(), JSON.stringify({
+      hostOverloadAlert: {
+        enabled: true,
+        enterLoadRatio: 0,       // not > 0 → dropped
+        enterMemUsedFrac: 0.5,   // valid
+      },
+    }));
+    expect(readGlobalConfig().hostOverloadAlert).toEqual({
+      enabled: true,
+      enterMemUsedFrac: 0.5,
+    });
+  });
+
+  it('writes the full known hostOverloadAlert set (wiping omitted known keys) while keeping future siblings', () => {
+    writeFileSync(globalConfigPath(), JSON.stringify({
+      hostOverloadAlert: {
+        enabled: true,
+        targetBotAppId: 'cli_old',
+        enterLoadRatio: 1.5,
+        futureSetting: { version: 2 },
+      },
+    }));
+
+    // "Full known config" writer (mirrors writeCodexNotifierConfig): every known
+    // key is replaced by exactly what `config` carries — an omitted known key
+    // (here enterLoadRatio) is wiped, not preserved — while unknown siblings stay.
+    writeHostOverloadAlertConfig({
+      enabled: false,
+      targetBotAppId: 'cli_new',
+    });
+    const raw = JSON.parse(readFileSync(globalConfigPath(), 'utf8'));
+
+    expect(raw.hostOverloadAlert).toEqual({
+      enabled: false,
+      targetBotAppId: 'cli_new',
+      futureSetting: { version: 2 },
+    });
+    // The forgiving read exposes only the valid known subset.
+    expect(readGlobalConfig().hostOverloadAlert).toEqual({
+      enabled: false,
+      targetBotAppId: 'cli_new',
     });
   });
 

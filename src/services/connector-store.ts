@@ -47,6 +47,12 @@ export interface ConnectorDefinition {
     /** Custom text may contain `{source}`, resolved from promptEnvelope.sourceName. */
     text?: string;
   };
+  /** When true, the daemon drops the trailing final_output reply for turns this
+   *  webhook fires (the live streaming card / start notice still show). Lets a
+   *  webhook that only needs the bot's in-topic `botmux send` output avoid the
+   *  extra "完成/总结" message. Missing = false. Ignored for wait/async response
+   *  modes, whose whole contract is to return the final output. */
+  suppressFinalOutput?: boolean;
   loggingPolicy: {
     storePayload: boolean;
     storeHeaders: boolean;

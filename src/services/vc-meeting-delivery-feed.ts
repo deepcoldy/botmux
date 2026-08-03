@@ -13,8 +13,9 @@ import {
   type VcMeetingDeliveryEntry,
   type VcMeetingDeliveryRequest,
 } from './vc-meeting-delivery-protocol.js';
+import { VC_MEETING_CONTROLLED_OUTPUT_INSTRUCTION_VERSION } from './vc-meeting-listener-output-protocol.js';
 
-export const VC_MEETING_DELIVERY_INSTRUCTION_VERSION = 'meeting-consumer-v1' as const;
+export const VC_MEETING_DELIVERY_INSTRUCTION_VERSION = VC_MEETING_CONTROLLED_OUTPUT_INSTRUCTION_VERSION;
 
 export interface VcMeetingCanonicalFeedItem {
   /** Canonical listener feed sequence. Gaps are valid after per-member filtering. */

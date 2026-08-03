@@ -24,6 +24,7 @@ import { composeEntries, sortByStatus, paginate, composeDetail } from '../../das
 import type { DaemonClient } from '../../dashboard/daemon-internal-client.js';
 import type { SessionRow } from '../../core/dashboard-rows.js';
 import { config } from '../../config.js';
+import { formatUrlHost } from '../../core/dashboard-url.js';
 import { type Locale, t } from '../../i18n/index.js';
 
 import { terminalMultiUrl } from './card-builder.js';
@@ -568,6 +569,8 @@ function mapTerminalDisabledReason(reasonKey: string | undefined): string | unde
   switch (reasonKey) {
     case 'sessions.action.terminal.noPort':
       return 'card.dashboard.sessions.terminal.disabled.noPort';
+    case 'sessions.action.terminal.unsupported':
+      return 'card.dashboard.sessions.terminal.disabled.unsupported';
     default:
       return undefined;
   }
@@ -592,7 +595,7 @@ function mapResumeDisabledReason(reasonKey: string | undefined): string | undefi
  *  rejected here even if the raw row still has a port value. */
 export function buildSessionTerminalUrl(row: SessionRow): string | null {
   if (row.status === 'closed') return null;
-  const host = config.web.externalHost;
+  const host = formatUrlHost(config.web.externalHost);
   if (typeof row.proxyPort === 'number' && row.proxyPort > 0) {
     return `http://${host}:${row.proxyPort}/s/${encodeURIComponent(row.sessionId)}`;
   }

@@ -1,6 +1,24 @@
-import { copyFileSync, existsSync, mkdirSync, statSync, openSync, readSync, closeSync, readFileSync, readdirSync, readlinkSync, realpathSync } from 'node:fs';
+import { randomBytes } from 'node:crypto';
+import {
+  closeSync,
+  constants as fsConstants,
+  existsSync,
+  fstatSync,
+  lstatSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  readSync,
+  readdirSync,
+  readlinkSync,
+  realpathSync,
+  renameSync,
+  statSync,
+  unlinkSync,
+  writeSync,
+} from 'node:fs';
 import { homedir } from 'node:os';
-import { basename, dirname, join } from 'node:path';
+import { basename, dirname, isAbsolute, join, relative, sep } from 'node:path';
 import { resolveCommand } from './registry.js';
 import { sessionReadyHookCommand } from '../hook-command.js';
 import type { CliAdapter, CliId, PtyHandle } from './types.js';
@@ -86,6 +104,174 @@ export interface ClaudeResumeTargetSyncResult {
   copied: boolean;
 }
 
+const SESSION_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const RESUME_COPY_BUFFER_BYTES = 64 * 1024;
+
+interface ClaudeResumeCandidate {
+  path: string;
+  mtimeMs: number;
+  ctimeMs: number;
+  size: number;
+  dev: number;
+  ino: number;
+}
+
+function isStrictDescendant(root: string, path: string): boolean {
+  const rel = relative(root, path);
+  return rel.length > 0 && rel !== '..' && !rel.startsWith(`..${sep}`) && !isAbsolute(rel);
+}
+
+function lstatIfPresent(path: string): import('node:fs').Stats | undefined {
+  try {
+    return lstatSync(path);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+    throw error;
+  }
+}
+
+function assertSafeResumeTargetLeaf(targetPath: string, projectsRootReal: string): void {
+  const targetStats = lstatIfPresent(targetPath);
+  if (!targetStats) return;
+  if (targetStats.isSymbolicLink() || !targetStats.isFile()) {
+    throw new Error(`unsafe Claude resume target (expected a regular file): ${targetPath}`);
+  }
+  const targetReal = realpathSync(targetPath);
+  if (!isStrictDescendant(projectsRootReal, targetReal)) {
+    throw new Error(`unsafe Claude resume target outside projects root: ${targetPath}`);
+  }
+}
+
+function writeAllSync(fd: number, buffer: Buffer, length: number): void {
+  let offset = 0;
+  while (offset < length) {
+    const written = writeSync(fd, buffer, offset, length - offset);
+    if (written <= 0) throw new Error('short write while syncing Claude resume transcript');
+    offset += written;
+  }
+}
+
+/**
+ * Copy a scanned regular source into a same-directory private temp file, then
+ * atomically replace the target leaf. Source and temp descriptors are pinned
+ * with O_NOFOLLOW + inode checks so a child-planted symlink cannot redirect
+ * the privileged worker between scan and copy.
+ */
+function atomicCopyClaudeResumeTranscript(
+  source: ClaudeResumeCandidate,
+  targetPath: string,
+  projectsRootReal: string,
+): void {
+  const targetDir = dirname(targetPath);
+  mkdirSync(targetDir, { recursive: true });
+  const targetDirStats = lstatSync(targetDir);
+  if (targetDirStats.isSymbolicLink() || !targetDirStats.isDirectory()) {
+    throw new Error(`unsafe Claude resume target directory: ${targetDir}`);
+  }
+  const targetDirReal = realpathSync(targetDir);
+  if (!isStrictDescendant(projectsRootReal, targetDirReal)) {
+    throw new Error(`unsafe Claude resume target directory outside projects root: ${targetDir}`);
+  }
+
+  const resolvedTargetPath = join(targetDirReal, basename(targetPath));
+  assertSafeResumeTargetLeaf(resolvedTargetPath, projectsRootReal);
+
+  const tempPath = join(
+    targetDirReal,
+    `.${basename(targetPath)}.${process.pid}.${randomBytes(8).toString('hex')}.tmp`,
+  );
+  const noFollow = process.platform === 'win32' ? 0 : (fsConstants.O_NOFOLLOW ?? 0);
+  let sourceFd: number | undefined;
+  let tempFd: number | undefined;
+  try {
+    const rescanned = lstatSync(source.path);
+    if (
+      rescanned.isSymbolicLink()
+      || !rescanned.isFile()
+      || rescanned.dev !== source.dev
+      || rescanned.ino !== source.ino
+      || rescanned.size !== source.size
+      || rescanned.mtimeMs !== source.mtimeMs
+      || rescanned.ctimeMs !== source.ctimeMs
+    ) {
+      throw new Error(`unsafe Claude resume source changed after scan: ${source.path}`);
+    }
+    const sourceReal = realpathSync(source.path);
+    if (!isStrictDescendant(projectsRootReal, sourceReal)) {
+      throw new Error(`unsafe Claude resume source outside projects root: ${source.path}`);
+    }
+
+    sourceFd = openSync(source.path, fsConstants.O_RDONLY | noFollow);
+    const openedSource = fstatSync(sourceFd);
+    if (
+      !openedSource.isFile()
+      || openedSource.dev !== source.dev
+      || openedSource.ino !== source.ino
+    ) {
+      throw new Error(`unsafe Claude resume source raced while opening: ${source.path}`);
+    }
+
+    tempFd = openSync(
+      tempPath,
+      fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | noFollow,
+      0o600,
+    );
+    const buffer = Buffer.allocUnsafe(RESUME_COPY_BUFFER_BYTES);
+    let copiedBytes = 0;
+    while (true) {
+      const count = readSync(sourceFd, buffer, 0, buffer.length, null);
+      if (count === 0) break;
+      writeAllSync(tempFd, buffer, count);
+      copiedBytes += count;
+    }
+
+    const sourceAfterCopy = fstatSync(sourceFd);
+    if (
+      sourceAfterCopy.dev !== openedSource.dev
+      || sourceAfterCopy.ino !== openedSource.ino
+      || sourceAfterCopy.size !== openedSource.size
+      || sourceAfterCopy.mtimeMs !== openedSource.mtimeMs
+      || sourceAfterCopy.ctimeMs !== openedSource.ctimeMs
+      || copiedBytes !== openedSource.size
+    ) {
+      throw new Error(`Claude resume source changed while copying: ${source.path}`);
+    }
+    const tempStats = fstatSync(tempFd);
+    if (!tempStats.isFile() || tempStats.nlink !== 1 || tempStats.size !== copiedBytes) {
+      throw new Error(`unsafe Claude resume temporary copy: ${tempPath}`);
+    }
+
+    closeSync(sourceFd);
+    sourceFd = undefined;
+    closeSync(tempFd);
+    tempFd = undefined;
+
+    // Re-check immediately before rename. rename replaces a raced leaf symlink
+    // itself instead of following it, so the destination can never write
+    // through to the symlink target.
+    assertSafeResumeTargetLeaf(resolvedTargetPath, projectsRootReal);
+    const tempPathStats = lstatSync(tempPath);
+    if (
+      tempPathStats.isSymbolicLink()
+      || !tempPathStats.isFile()
+      || tempPathStats.dev !== tempStats.dev
+      || tempPathStats.ino !== tempStats.ino
+    ) {
+      throw new Error(`unsafe Claude resume temporary path changed before rename: ${tempPath}`);
+    }
+    renameSync(tempPath, resolvedTargetPath);
+  } catch (error) {
+    if (sourceFd !== undefined) {
+      try { closeSync(sourceFd); } catch { /* best effort */ }
+    }
+    if (tempFd !== undefined) {
+      try { closeSync(tempFd); } catch { /* best effort */ }
+    }
+    try { unlinkSync(tempPath); } catch { /* absent or already renamed */ }
+    throw error;
+  }
+}
+
 /**
  * Claude stores a session transcript under the hash of the cwd where that
  * session last ran. Botmux's `/cd` deliberately keeps the logical session id,
@@ -98,24 +284,65 @@ export interface ClaudeResumeTargetSyncResult {
  * directory. Copies are retained in older project directories because they are
  * useful native Claude history; choosing the newest candidate on every resume
  * prevents a later `/cd` back to an earlier cwd from reviving a stale branch.
+ *
+ * The Claude data root is writable by the sandboxed CLI while this helper runs
+ * in the unsandboxed worker. Treat every scanned leaf as hostile: UUID-gate the
+ * filename, reject symlink/non-regular source and target entries, enforce
+ * realpath containment, and atomically replace the target via a private temp
+ * inode so copy cannot read or write through a child-planted symlink.
  */
 export function syncClaudeResumeTargetToCwd(
   sessionId: string,
   cwd: string,
   dataDir: string = DEFAULT_CLAUDE_DATA_DIR,
 ): ClaudeResumeTargetSyncResult {
+  if (!SESSION_UUID_RE.test(sessionId)) {
+    throw new Error(`invalid Claude resume session id: ${sessionId}`);
+  }
   const targetPath = claudeJsonlPathForSession(sessionId, cwd, dataDir);
   const projectsDir = join(dataDir, 'projects');
   if (!existsSync(projectsDir)) return { targetPath, copied: false };
 
-  const candidates: Array<{ path: string; mtimeMs: number; size: number }> = [];
+  const dataDirStats = lstatSync(dataDir);
+  if (dataDirStats.isSymbolicLink() || !dataDirStats.isDirectory()) {
+    throw new Error(`unsafe Claude data root: ${dataDir}`);
+  }
+  const dataRootReal = realpathSync(dataDir);
+  const projectsDirStats = lstatSync(projectsDir);
+  if (projectsDirStats.isSymbolicLink() || !projectsDirStats.isDirectory()) {
+    throw new Error(`unsafe Claude projects root: ${projectsDir}`);
+  }
+  const projectsRootReal = realpathSync(projectsDir);
+  if (dirname(projectsRootReal) !== dataRootReal) {
+    throw new Error(`unsafe Claude projects root outside data root: ${projectsDir}`);
+  }
+  assertSafeResumeTargetLeaf(targetPath, projectsRootReal);
+
+  const candidates: ClaudeResumeCandidate[] = [];
   for (const entry of readdirSync(projectsDir, { withFileTypes: true })) {
     if (!entry.isDirectory()) continue;
-    const path = join(projectsDir, entry.name, `${sessionId}.jsonl`);
-    if (!existsSync(path)) continue;
+    const bucketDir = join(projectsDir, entry.name);
+    let bucketReal: string;
     try {
-      const stat = statSync(path);
-      if (stat.isFile()) candidates.push({ path, mtimeMs: stat.mtimeMs, size: stat.size });
+      const bucketStats = lstatSync(bucketDir);
+      if (bucketStats.isSymbolicLink() || !bucketStats.isDirectory()) continue;
+      bucketReal = realpathSync(bucketDir);
+      if (!isStrictDescendant(projectsRootReal, bucketReal)) continue;
+    } catch { continue; }
+    const path = join(projectsDir, entry.name, `${sessionId}.jsonl`);
+    try {
+      const stat = lstatSync(path);
+      if (stat.isSymbolicLink() || !stat.isFile()) continue;
+      const candidateReal = realpathSync(path);
+      if (!isStrictDescendant(projectsRootReal, candidateReal)) continue;
+      candidates.push({
+        path,
+        mtimeMs: stat.mtimeMs,
+        ctimeMs: stat.ctimeMs,
+        size: stat.size,
+        dev: stat.dev,
+        ino: stat.ino,
+      });
     } catch { /* candidate disappeared while scanning */ }
   }
   if (candidates.length === 0) return { targetPath, copied: false };
@@ -124,8 +351,7 @@ export function syncClaudeResumeTargetToCwd(
   const newest = candidates[0];
   if (newest.path === targetPath) return { targetPath, sourcePath: newest.path, copied: false };
 
-  mkdirSync(dirname(targetPath), { recursive: true });
-  copyFileSync(newest.path, targetPath);
+  atomicCopyClaudeResumeTranscript(newest, targetPath, projectsRootReal);
   return { targetPath, sourcePath: newest.path, copied: true };
 }
 
@@ -183,8 +409,6 @@ function makeSubmitFingerprint(content: string, len = 30): string | undefined {
   const collapsed = normaliseForFingerprint(content);
   return collapsed.length > 0 ? collapsed.substring(0, len) : undefined;
 }
-
-const SESSION_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 /** Returns the absolute path to Claude Code's per-process session state file.
  *  Claude writes `{pid, sessionId, cwd, procStart, status, updatedAt, ...}`
@@ -566,7 +790,7 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
      *  the secondary guard).
      *
      *  The `dataDir` parameter carries the EFFECTIVE data root, i.e. after any
-     *  sandbox overlay redirection — the worker mirrors the same calculation
+     *  sandbox data redirection — the worker mirrors the same calculation
      *  into `(backend).claudeJsonlPath = claudeJsonlPathForSession(...)` so
      *  this probe sees the same filesystem the spawned CLI will write to. */
     checkResumeTargetExists({ sessionId, cliSessionId, workingDir, dataDir }) {
@@ -925,6 +1149,9 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
     // `botmux session-ready` 给出启动 selector 边界。worker 收到后清掉旧
     // readyPattern 证据，并等待新 prompt 再投首条消息。
     injectsReadyHook: true,
+    // `/effort` 不在此处——它是全局 PASSTHROUGH_COMMANDS 的成员（所有 CLI 尽力透传，
+    // 且刻意不带冷启动语义）。这里只保留 `/goal`：它是「开启一段目标工作」的命令，需要
+    // 空 topic 冷启动能力（isInitialSessionPassthrough 只认 adapter 层的这个字段）。
     defaultPassthroughCommands: variant.id === 'claude-code' ? ['/goal'] : undefined,
     // Seed shares most of this adapter but has not been verified to expose the
     // same native session-rename command. Keep the capability exact to Claude.

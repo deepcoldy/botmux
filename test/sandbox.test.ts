@@ -11,7 +11,7 @@ import { describe, it, expect } from 'vitest';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { mkdtempSync, existsSync, writeFileSync, readFileSync, symlinkSync, realpathSync } from 'node:fs';
-import { buildRelayHostEnv, validateRelayRequest, materializeOutboxFile, prepareDirectSandbox } from '../src/adapters/backend/sandbox.js';
+import { buildRelayHostEnv, validateRelayRequest, materializeOutboxFile, prepareDirectSandbox, coreOnlyPidNamespaceDegrade, bwrapCanUnsharePid, pidNsDualProbeCanUnshare, __testOnly_resetPidNamespaceProbe } from '../src/adapters/backend/sandbox.js';
 import { createCodexAppAdapter } from '../src/adapters/cli/codex-app.js';
 
 const tmp = () => mkdtempSync(join(tmpdir(), 'sbx-'));
@@ -38,6 +38,74 @@ describe('prepareDirectSandbox platform gate', () => {
       chdir: '/x', home: '/home/u', cliBin: '/usr/bin/true', cliArgs: [],
     });
     expect(r).toBeNull();
+  });
+});
+
+// The pid-namespace degrade (drop --unshare-pid for a nested sandbox that can't
+// mount /proc in a new pid ns) MUST be gated to core-only. On a normal/mixed
+// fleet a sibling transport bot's worker carries LARK_APP_SECRET in its env, so
+// dropping pid isolation would expose it via /proc/<pid>/environ. The gate is
+// BOTMUX_CORE_ONLY=1 && !bwrapCanUnsharePid() — and BOTMUX_CORE_ONLY short-
+// circuits FIRST, so the normal fleet never even runs the probe, never degrades.
+describe('coreOnlyPidNamespaceDegrade gate (credential-safety)', () => {
+  it('is FALSE without BOTMUX_CORE_ONLY, regardless of host pid-ns support (normal fleet keeps --unshare-pid)', () => {
+    const prev = process.env.BOTMUX_CORE_ONLY;
+    delete process.env.BOTMUX_CORE_ONLY;
+    __testOnly_resetPidNamespaceProbe();
+    try {
+      expect(coreOnlyPidNamespaceDegrade()).toBe(false);
+    } finally {
+      if (prev === undefined) delete process.env.BOTMUX_CORE_ONLY;
+      else process.env.BOTMUX_CORE_ONLY = prev;
+      __testOnly_resetPidNamespaceProbe();
+    }
+  });
+
+  it('under BOTMUX_CORE_ONLY, tracks the host probe: degrade IFF the host cannot unshare-pid', () => {
+    const prev = process.env.BOTMUX_CORE_ONLY;
+    process.env.BOTMUX_CORE_ONLY = '1';
+    __testOnly_resetPidNamespaceProbe();
+    try {
+      // On this (non-nested) host the probe should succeed → NO degrade. In a
+      // nested sandbox the same call returns true. We assert the invariant that
+      // degrade === (core-only AND probe-says-cant): here core-only is on, so
+      // the result must be the negation of the raw probe.
+      const canUnshare = bwrapCanUnsharePid();
+      expect(coreOnlyPidNamespaceDegrade()).toBe(!canUnshare);
+    } finally {
+      if (prev === undefined) delete process.env.BOTMUX_CORE_ONLY;
+      else process.env.BOTMUX_CORE_ONLY = prev;
+      __testOnly_resetPidNamespaceProbe();
+    }
+  });
+
+  // codex review concern #2 (P1): a naive probe treats ANY bwrap failure as
+  // "safe to drop --unshare-pid". Three-state classification (success /
+  // clean-nonzero / inconclusive) is load-bearing — a timeout/spawn-error must
+  // NOT be lumped with a clean nonzero exit. Degrade ONLY on the exact nested
+  // signature: full=clean-nonzero (bwrap definitively rejected the pid-ns run)
+  // AND weak=success (accepted it without pid-ns). Everything else fail-closed.
+  describe('pidNsDualProbeCanUnshare (three-state, fail-closed)', () => {
+    it('full success → CAN unshare-pid (no degrade), regardless of weak', () => {
+      expect(pidNsDualProbeCanUnshare('success', 'success')).toBe(true);
+      expect(pidNsDualProbeCanUnshare('success', 'clean-nonzero')).toBe(true);
+      expect(pidNsDualProbeCanUnshare('success', 'inconclusive')).toBe(true);
+    });
+    it('full clean-nonzero + weak success → nested signature → CANNOT unshare-pid (the ONLY degrade case)', () => {
+      expect(pidNsDualProbeCanUnshare('clean-nonzero', 'success')).toBe(false);
+    });
+    it('BOTH clean-nonzero (fake bwrap always exits 1 — codex repro) → bwrap broken, NOT pid-ns → CAN unshare-pid (fail-closed)', () => {
+      expect(pidNsDualProbeCanUnshare('clean-nonzero', 'clean-nonzero')).toBe(true);
+    });
+    it('full INCONCLUSIVE (timeout / spawn-error / signal) + weak success → NOT evidence of pid-ns restriction → CAN unshare-pid (the timeout case codex flagged)', () => {
+      expect(pidNsDualProbeCanUnshare('inconclusive', 'success')).toBe(true);
+      expect(pidNsDualProbeCanUnshare('inconclusive', 'clean-nonzero')).toBe(true);
+      expect(pidNsDualProbeCanUnshare('inconclusive', 'inconclusive')).toBe(true);
+    });
+    it('full clean-nonzero + weak NOT clean-success (nonzero/inconclusive) → do NOT degrade', () => {
+      expect(pidNsDualProbeCanUnshare('clean-nonzero', 'clean-nonzero')).toBe(true);
+      expect(pidNsDualProbeCanUnshare('clean-nonzero', 'inconclusive')).toBe(true);
+    });
   });
 });
 

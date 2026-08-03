@@ -1,7 +1,7 @@
 /**
  * Headless terminal renderer: feeds PTY data into an xterm-headless instance
  * and exposes viewport snapshots for the Feishu streaming card (PNG render,
- * export-text action, ScreenAnalyzer).
+ * export-text action, usage-limit detection).
  *
  * Snapshot semantics match PNG: both read the current viewport
  * [baseY, baseY + rows). This keeps text export and screenshot consistent
@@ -82,6 +82,21 @@ export class TerminalRenderer {
     this.terminal.write(data);
   }
 
+  /**
+   * Feed raw PTY data and wait until xterm has parsed every queued byte through
+   * this write. Callers that inspect the buffer immediately afterwards must use
+   * this barrier: xterm's ordinary write() API is intentionally asynchronous.
+   */
+  writeAndFlush(data: string): Promise<void> {
+    return new Promise((resolve, reject) => {
+      try {
+        this.terminal.write(data, resolve);
+      } catch (error) {
+        reject(error);
+      }
+    });
+  }
+
   /** Reset the change-detection hash so the next snapshot registers as changed. */
   markNewTurn(): void {
     this.lastHash = '';
@@ -97,8 +112,8 @@ export class TerminalRenderer {
   }
 
   /**
-   * Raw viewport snapshot — no line filtering. Used by ScreenAnalyzer which
-   * needs the full screen including ❯ cursor lines.
+   * Raw viewport snapshot — no line filtering. Used by usage-limit detection
+   * and the CoCo picker, which need the full screen including ❯ cursor lines.
    */
   rawSnapshot(): string {
     return this.readViewport(false);

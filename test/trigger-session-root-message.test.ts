@@ -31,6 +31,9 @@ const mockCreateSession = vi.fn();
 const mockUpdateSession = vi.fn();
 const mockCloseSession = vi.fn();
 vi.mock('../src/services/session-store.js', () => ({
+  registerSessionBridgeSendMarkerCleanupFence: vi.fn(),
+  cleanupSessionBridgeSendMarkers: vi.fn(),
+  cleanupSessionBridgeSendMarkersNow: vi.fn(),
   createSession: (...args: any[]) => mockCreateSession(...args),
   updateSession: (...args: any[]) => mockUpdateSession(...args),
   closeSession: (...args: any[]) => mockCloseSession(...args),
@@ -88,6 +91,12 @@ vi.mock('../src/core/worker-pool.js', () => ({
       if (locks.get(key) === tail) locks.delete(key);
     }
   }),
+  setActiveSessionIfActive: (map: Map<string, any>, key: string, ds: any) => {
+    if (map.has(key) && map.get(key) !== ds) return false;
+    map.set(key, ds);
+    return true;
+  },
+  closeSession: vi.fn(async () => ({ ok: true, alreadyClosed: false, known: true })),
 }));
 
 const mockRememberLastCliInput = vi.fn();
@@ -123,6 +132,7 @@ vi.mock('../src/im/lark/card-handler.js', () => ({
 import { buildExternalEventTopicMessage, triggerSessionTurn } from '../src/core/trigger-session.js';
 import { sessionKey } from '../src/core/types.js';
 import { withActiveSessionKeyLock } from '../src/core/worker-pool.js';
+import { resolveSessionReplyTarget } from '../src/core/reply-target.js';
 
 const APP = 'app1';
 const CHAT = 'oc_root_chat';
@@ -215,6 +225,33 @@ describe('triggerSessionTurn rootMessageId target', () => {
 
   it('keeps the localized topic seed by default', () => {
     expect(buildExternalEventTopicMessage(request(), APP)).toBe('外部事件触发：alerts');
+  });
+
+  it('stamps per-turn model + reasoningEffort onto a codex-family session', async () => {
+    mockGetBot.mockReturnValue({
+      config: { larkAppId: APP, cliId: 'codex-app', workingDir: '/tmp' },
+      botName: 'Bot', botOpenId: 'ou_bot',
+    });
+    const req = request();
+    (req.options as any) = { model: 'gpt-5.6-terra', reasoningEffort: 'xhigh' };
+    const activeSessions = new Map<string, DaemonSession>();
+    await triggerSessionTurn(req, { larkAppId: APP, activeSessions });
+    const ds = activeSessions.get(sessionKey(ROOT, APP));
+    // xhigh preserved verbatim (no downgrade — codex 0.145 accepts it)
+    expect(ds?.session.model).toBe('gpt-5.6-terra');
+    expect(ds?.session.reasoningEffort).toBe('xhigh');
+  });
+
+  it('does NOT stamp model/effort onto a non-codex (claude) session', async () => {
+    // Harness default bot is claude-code. The gate must keep the override from
+    // silently changing a non-codex bot's model.
+    const req = request();
+    (req.options as any) = { model: 'claude-opus-4-8', reasoningEffort: 'high' };
+    const activeSessions = new Map<string, DaemonSession>();
+    await triggerSessionTurn(req, { larkAppId: APP, activeSessions });
+    const ds = activeSessions.get(sessionKey(ROOT, APP));
+    expect(ds?.session.model).toBeUndefined();
+    expect(ds?.session.reasoningEffort).toBeUndefined();
   });
 
   it('uses a connector-owned custom topic seed when opening a new topic', async () => {
@@ -346,6 +383,28 @@ describe('triggerSessionTurn rootMessageId target', () => {
     expect(send).not.toHaveBeenCalled();
     expect(ds.session.queuedActivationTail).toBeUndefined();
     expect(mockRememberLastCliInput).not.toHaveBeenCalled();
+  });
+
+  it('fold-in to a live session does NOT overwrite its frozen model/effort', async () => {
+    // A per-turn override only applies to a freshly-created session. Folding into
+    // an existing worker must never rewrite the session's frozen model/effort
+    // (the existing-worker branch returns before the stamp; this locks that in).
+    mockGetBot.mockReturnValue({
+      config: { larkAppId: APP, cliId: 'codex-app', workingDir: '/tmp' },
+      botName: 'Bot', botOpenId: 'ou_bot',
+    });
+    const send = vi.fn();
+    const ds = existingDs({ worker: { killed: false, send } as any });
+    ds.session.model = 'frozen-model';
+    ds.session.reasoningEffort = 'low';
+    const activeSessions = new Map<string, DaemonSession>([[sessionKey(ROOT, APP), ds]]);
+    const req = request();
+    (req.options as any) = { model: 'new-model', reasoningEffort: 'xhigh' };
+    await triggerSessionTurn(req, { larkAppId: APP, activeSessions });
+
+    expect(mockCreateSession).not.toHaveBeenCalled(); // folded in, not new
+    expect(ds.session.model).toBe('frozen-model');
+    expect(ds.session.reasoningEffort).toBe('low');
   });
 
   it('uses an internal stable turn id without changing the public trigger schema', async () => {
@@ -759,5 +818,155 @@ describe('triggerSessionTurn rootMessageId target', () => {
     expect(res).toMatchObject({ ok: false, errorCode: 'target_required' });
     expect(mockGetMessageChatId).not.toHaveBeenCalled();
     expect(mockCreateSession).not.toHaveBeenCalled();
+  });
+});
+
+describe('triggerSessionTurn suppressFinalOutput (loud connector opt-in)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockBotAutoWorktreeEnabled.mockReturnValue(false);
+    mockGetBot.mockReturnValue({
+      config: { larkAppId: APP, cliId: 'claude-code', workingDir: '/tmp' },
+      botName: 'Bot',
+      botOpenId: 'ou_bot',
+    });
+    mockGetMessageChatId.mockResolvedValue(CHAT);
+    mockCreateSession.mockImplementation((chatId: string, rootMessageId: string, title: string, chatType: 'group' | 'p2p') => ({
+      sessionId: 'sess_new', chatId, rootMessageId, title, chatType,
+      status: 'active', createdAt: '2026-06-01T00:00:00.000Z',
+    }));
+  });
+
+  function loudReq(): TriggerRequest {
+    const req = request();
+    req.options = { suppressFinalOutput: true };
+    return req;
+  }
+
+  // Reads the single armed turn id off the session, proving the connector opt-in
+  // actually stamped THIS trigger turn (and only it) into the suppression map.
+  function armedTurnId(ds: DaemonSession): string {
+    const keys = [...(ds.suppressedTriggerFinalTurns?.keys() ?? [])];
+    expect(keys).toHaveLength(1);
+    expect(keys[0]).toMatch(/^trg_/);
+    return keys[0]!;
+  }
+
+  it('path 1 (live worker): arms the trigger turn and stamps it onto sendWorkerInput', async () => {
+    const send = vi.fn();
+    const ds = existingDs({ worker: { killed: false, send } as any });
+    const activeSessions = new Map<string, DaemonSession>([[sessionKey(ROOT, APP), ds]]);
+
+    const res = await triggerSessionTurn(loudReq(), { larkAppId: APP, activeSessions });
+
+    expect(res).toMatchObject({ ok: true, action: 'delivered' });
+    const turnId = armedTurnId(ds);
+    expect(res.triggerId).toBe(turnId);
+    // The turnId must ride the worker input so the worker echoes it on final_output
+    // and the daemon gate can match it.
+    expect(send).toHaveBeenCalledWith(expect.objectContaining({ type: 'message', turnId }));
+  });
+
+  it('path 2 (dormant existing): arms the trigger turn and forks with it as turnId', async () => {
+    const ds = existingDs();
+    const activeSessions = new Map<string, DaemonSession>([[sessionKey(ROOT, APP), ds]]);
+
+    const res = await triggerSessionTurn(loudReq(), { larkAppId: APP, activeSessions });
+
+    expect(res).toMatchObject({ ok: true, action: 'queued' });
+    const turnId = armedTurnId(ds);
+    expect(mockForkWorker).toHaveBeenCalledWith(
+      ds,
+      expect.objectContaining({ content: expect.stringContaining('follow:') }),
+      expect.objectContaining({ resume: true, turnId }),
+    );
+  });
+
+  it('path 3 (auto-worktree staging): arms the trigger turn and defers it via pendingTurnId', async () => {
+    mockBotAutoWorktreeEnabled.mockReturnValue(true);
+    const activeSessions = new Map<string, DaemonSession>();
+
+    await triggerSessionTurn(loudReq(), { larkAppId: APP, activeSessions });
+
+    const ds = activeSessions.get(sessionKey(ROOT, APP))!;
+    const turnId = armedTurnId(ds);
+    // The deferred fork in commitRepoSelection carries pendingTurnId, so the armed
+    // suppression and the eventual fork agree on the turn id.
+    expect(ds.pendingTurnId).toBe(turnId);
+    expect(ds.pendingRepo).toBe(true);
+    expect(mockRunAutoWorktreeCommit).toHaveBeenCalledWith(expect.objectContaining({ ds }));
+  });
+
+  it('path 4 (fresh new session): arms the trigger turn and forks with it as turnId', async () => {
+    const activeSessions = new Map<string, DaemonSession>();
+
+    const res = await triggerSessionTurn(loudReq(), { larkAppId: APP, activeSessions });
+
+    const ds = activeSessions.get(sessionKey(ROOT, APP))!;
+    const turnId = armedTurnId(ds);
+    expect(res.triggerId).toBe(turnId);
+    expect(mockForkWorker).toHaveBeenCalledWith(
+      ds,
+      expect.objectContaining({ content: expect.stringContaining('new:') }),
+      turnId,
+    );
+  });
+
+  it('does not arm suppression and forks loud when the connector opt-in is absent', async () => {
+    const activeSessions = new Map<string, DaemonSession>();
+
+    await triggerSessionTurn(request(), { larkAppId: APP, activeSessions });
+
+    const ds = activeSessions.get(sessionKey(ROOT, APP))!;
+    expect(ds.suppressedTriggerFinalTurns).toBeUndefined();
+    // Loud fork keeps the legacy 2-arg shape (no turnId stamped).
+    expect(mockForkWorker).toHaveBeenCalledWith(ds, { content: expect.stringContaining('new:') });
+  });
+
+  it('N1: waitForFinalOutput never arms suppression even when the option is set', async () => {
+    const ds = existingDs({ worker: { killed: false, send: vi.fn() } as any });
+    const activeSessions = new Map<string, DaemonSession>([[sessionKey(ROOT, APP), ds]]);
+    const req = loudReq();
+    req.options = { suppressFinalOutput: true, waitForFinalOutput: true, timeoutMs: 1000 };
+
+    const promise = triggerSessionTurn(req, { larkAppId: APP, activeSessions });
+    await vi.waitFor(() => expect(ds.pendingWaitPromises?.size).toBe(1));
+    // Arming here would starve the HTTP caller: deliverFinalOutput resolves the
+    // wait promise AFTER the suppression gate, so a suppressed final never returns.
+    expect(ds.suppressedTriggerFinalTurns).toBeUndefined();
+    [...ds.pendingWaitPromises!.values()][0]!.resolve('done');
+    await expect(promise).resolves.toMatchObject({ ok: true, action: 'completed' });
+  });
+
+  it('N1: asyncReturnSessionId never arms suppression even when the option is set', async () => {
+    const ds = existingDs({ worker: { killed: false, send: vi.fn() } as any });
+    const activeSessions = new Map<string, DaemonSession>([[sessionKey(ROOT, APP), ds]]);
+    const req = loudReq();
+    req.options = { suppressFinalOutput: true, asyncReturnSessionId: true };
+
+    await triggerSessionTurn(req, { larkAppId: APP, activeSessions });
+    expect(ds.suppressedTriggerFinalTurns).toBeUndefined();
+  });
+
+  it('P2: a chat-scope session with a fold-back anchor grants the trigger turn that same anchor', async () => {
+    const anchor = { rootMessageId: 'om_shared_topic', turnId: 'om_human', updatedAt: 'x' };
+    const ds = existingDs({
+      scope: 'chat',
+      worker: { killed: false, send: vi.fn() } as any,
+      currentReplyTarget: anchor as any,
+    });
+    ds.session.scope = 'chat';
+    ds.session.currentReplyTarget = anchor as any;
+    ds.session.replyTargets = { om_human: { rootMessageId: 'om_shared_topic', updatedAt: 'x' } };
+    const activeSessions = new Map<string, DaemonSession>([[sessionKey(ROOT, APP), ds]]);
+
+    await triggerSessionTurn(loudReq(), { larkAppId: APP, activeSessions });
+
+    const turnId = armedTurnId(ds);
+    // The synthetic trigger turn inherited the shared-topic anchor, so its
+    // daemon-side sends (streaming card etc.) thread into the topic instead of
+    // leaking to the group top level.
+    expect(ds.session.replyTargets![turnId]).toMatchObject({ rootMessageId: 'om_shared_topic' });
+    expect(resolveSessionReplyTarget(ds, turnId)).toEqual({ mode: 'thread', rootMessageId: 'om_shared_topic' });
   });
 });

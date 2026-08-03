@@ -75,6 +75,19 @@ describe('session terminal href', () => {
     expect(sessionTerminalHref({ sessionId: 'a b', webPort: 3001, proxyPort: 8801 }, platform)).toBe('https://m-1.example.test/s/a%20b');
     expect(sessionTerminalHref({ sessionId: 'abc', webPort: 3001 }, platform)).toBeNull();
   });
+
+  it('resolves a Riff read-only terminal to the local worker log port, never the writable sandbox URL', () => {
+    // riffAccessUrl is the AIO Sandbox WRITE capability (a bearer URL). The
+    // read-only href must align with the Feishu card「Web终端=日志页」and open
+    // the local worker log terminal (webPort); the sandbox link is reachable
+    // only through the authenticated /write-link (🔑「操作链接=AIO」).
+    const riff = { sessionId: 'riff-1', webPort: 3001, riffAccessUrl: 'https://abc123.sandbox.example/term' };
+    expect(sessionTerminalHref(riff, local)).toBe('http://localhost:3001');
+    expect(sessionTerminalHref(riff, local)).not.toContain('sandbox.example');
+    // Without a local webPort there is no read-only entry (returns null rather
+    // than falling back to the writable sandbox URL).
+    expect(sessionTerminalHref({ sessionId: 'riff-2', riffAccessUrl: 'https://abc123.sandbox.example/term' }, local)).toBeNull();
+  });
 });
 
 describe('monitor room frame geometry', () => {

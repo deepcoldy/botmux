@@ -3,7 +3,10 @@
  * `im_turn`. The first canonical output wins; exact crash replays reuse the
  * same provider UUID, while changed replays reuse the first durable output.
  */
-import type { VcMeetingImTurnOrigin } from '../types.js';
+import type {
+  VcMeetingImTurnOrigin,
+  VcMeetingListenerOutputPlacement,
+} from '../types.js';
 import {
   beginVcMeetingAction,
   claimVcMeetingActionAttempt,
@@ -26,6 +29,7 @@ export const VC_MEETING_LISTENER_PROVIDER_DEDUP_SAFE_MS = 55 * 60_000;
 export interface VcMeetingImReplyCanonicalOutput {
   targetChatId: string;
   quoteTargetId?: string;
+  placement?: VcMeetingListenerOutputPlacement;
   msgType: string;
   content: string;
 }
@@ -89,11 +93,18 @@ function canonicalOutputFromRecord(
   if (!nonEmpty(output.targetChatId)
     || !nonEmpty(output.msgType)
     || !nonEmpty(output.content)
-    || (output.quoteTargetId !== undefined && !nonEmpty(output.quoteTargetId))) return undefined;
+    || (output.quoteTargetId !== undefined && !nonEmpty(output.quoteTargetId))
+    || (output.placement !== undefined
+      && output.placement !== 'auto'
+      && output.placement !== 'chat'
+      && output.placement !== 'topic')) return undefined;
   return {
     targetChatId: output.targetChatId,
     ...(typeof output.quoteTargetId === 'string'
       ? { quoteTargetId: output.quoteTargetId }
+      : {}),
+    ...(typeof output.placement === 'string'
+      ? { placement: output.placement as VcMeetingListenerOutputPlacement }
       : {}),
     msgType: output.msgType,
     content: output.content,
@@ -119,7 +130,11 @@ export function prepareVcMeetingImReply(
     || origin.sinkOwnerGeneration < 1
     || !nonEmpty(canonicalOutput.targetChatId)
     || !nonEmpty(canonicalOutput.msgType)
-    || !nonEmpty(canonicalOutput.content)) {
+    || !nonEmpty(canonicalOutput.content)
+    || (canonicalOutput.placement !== undefined
+      && canonicalOutput.placement !== 'auto'
+      && canonicalOutput.placement !== 'chat'
+      && canonicalOutput.placement !== 'topic')) {
     return { kind: 'conflict', reason: 'invalid_origin', detail: 'IM reply origin/output is invalid' };
   }
   if (!isCurrentVcMeetingImTurnOrigin(dataDir, origin, canonicalOutput.targetChatId)) {
@@ -200,7 +215,11 @@ export function prepareVcMeetingDeliveryReply(
     || origin.dispatchAttempt < 1
     || !nonEmpty(canonicalOutput.targetChatId)
     || !nonEmpty(canonicalOutput.msgType)
-    || !nonEmpty(canonicalOutput.content)) {
+    || !nonEmpty(canonicalOutput.content)
+    || (canonicalOutput.placement !== undefined
+      && canonicalOutput.placement !== 'auto'
+      && canonicalOutput.placement !== 'chat'
+      && canonicalOutput.placement !== 'topic')) {
     return { kind: 'conflict', reason: 'invalid_origin', detail: 'delivery reply origin/output is invalid' };
   }
   const lookup = findVcMeetingDeliveryByKey(dataDir, origin.stableTurnId, {
@@ -211,6 +230,7 @@ export function prepareVcMeetingDeliveryReply(
     || lookup.receipt.dispatchAttempt !== origin.dispatchAttempt
     || !['dispatched', 'completed'].includes(lookup.receipt.status)
     || lookup.receipt.responseMode !== 'listener_thread'
+    || (canonicalOutput.placement ?? 'auto') !== (lookup.receipt.outputPlacement ?? 'auto')
     || !Number.isSafeInteger(lookup.receipt.sinkOwnerGeneration)
     || (lookup.receipt.sinkOwnerGeneration ?? 0) < 1) {
     return { kind: 'conflict', reason: 'invalid_origin', detail: 'delivery reply receipt is stale or not listener-visible' };

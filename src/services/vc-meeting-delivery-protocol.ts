@@ -3,6 +3,7 @@ import { canonicalJson, computeInputHash } from '../utils/canonical-input-hash.j
 import type {
   VcMeetingConsumerManagedSink,
   VcMeetingConsumerProfileFilter,
+  VcMeetingListenerOutputPlacement,
 } from '../types.js';
 import { normalizeVcMeetingMemberPolicy } from './vc-meeting-member-policy.js';
 import { normalizeVcMeetingProfileInstructions } from './vc-meeting-profile-instructions.js';
@@ -36,6 +37,7 @@ export type VcMeetingMemberStatus = typeof VC_MEETING_MEMBER_STATUSES[number];
 
 export const VC_MEETING_RESPONSE_MODES = ['silent', 'listener_thread'] as const;
 export type VcMeetingResponseMode = typeof VC_MEETING_RESPONSE_MODES[number];
+export const VC_MEETING_LISTENER_OUTPUT_PLACEMENTS = ['auto', 'chat', 'topic'] as const;
 
 export interface VcMeetingMemberProjectionRequest {
   schemaVersion: typeof VC_MEETING_DELIVERY_SCHEMA_VERSION;
@@ -63,17 +65,25 @@ export interface VcMeetingMemberProjectionRequest {
     ownedSinks?: VcMeetingConsumerManagedSink[];
     sinkOwnerGeneration?: number;
   };
-  outputRoute: { chatId: string };
+  outputRoute: {
+    chatId: string;
+    /** Omitted by pre-feature senders and normalized to `auto`. */
+    placement?: VcMeetingListenerOutputPlacement;
+  };
 }
 
 export type NormalizedVcMeetingMemberProjectionRequest = Omit<
   VcMeetingMemberProjectionRequest,
-  'member'
+  'member' | 'outputRoute'
 > & {
   member: VcMeetingMemberProjectionRequest['member'] & {
     capabilities: string[];
     ownedSinks: VcMeetingConsumerManagedSink[];
     sinkOwnerGeneration: number;
+  };
+  outputRoute: {
+    chatId: string;
+    placement: VcMeetingListenerOutputPlacement;
   };
 };
 
@@ -225,6 +235,11 @@ export function validateVcMeetingMemberProjectionRequest(
     || !(VC_MEETING_RESPONSE_MODES as readonly string[]).includes(raw.member.responseMode)) {
     return badProjectionRequest('member.responseMode is not supported', 'member.responseMode');
   }
+  const placement = raw.outputRoute.placement ?? 'auto';
+  if (typeof placement !== 'string'
+    || !(VC_MEETING_LISTENER_OUTPUT_PLACEMENTS as readonly string[]).includes(placement)) {
+    return badProjectionRequest('outputRoute.placement is not supported', 'outputRoute.placement');
+  }
   const policy = normalizeVcMeetingMemberPolicy({
     memberId: raw.member.memberId as string,
     role: raw.member.role as string,
@@ -272,7 +287,10 @@ export function validateVcMeetingMemberProjectionRequest(
         responseMode: raw.member.responseMode as VcMeetingResponseMode,
         ...policy,
       },
-      outputRoute: { chatId: raw.outputRoute.chatId as string },
+      outputRoute: {
+        chatId: raw.outputRoute.chatId as string,
+        placement: placement as VcMeetingListenerOutputPlacement,
+      },
     },
   };
 }

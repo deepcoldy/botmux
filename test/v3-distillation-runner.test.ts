@@ -12,6 +12,7 @@ import {
 import { spawn } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
+import { probeHostCredentialIsolationMechanism } from '../src/adapters/backend/sandbox.js';
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
@@ -32,6 +33,52 @@ import type { BotSnapshot } from '../src/workflows/v3/contract.js';
 
 const roots: string[] = [];
 const originalAnthropicApiKey = process.env.ANTHROPIC_API_KEY;
+
+// The PID-namespace spec below launches a REAL bwrap-wrapped helper. bwrap
+// being installed is not enough — unprivileged user-namespace creation is
+// disabled on many CI runners (GitHub Actions), where bwrap dies with "setting
+// up uid map: Permission denied" and the helper never writes its pid. Gate on
+// the SAME runtime probe the worker uses so the spec skips (not fails) there,
+// while still exercising the real namespace collapse on capable hosts.
+const bwrapUsable = probeHostCredentialIsolationMechanism().mechanism === 'bwrap';
+
+// Hermeticity guard. runV3DistillationModel reads process.env for provider
+// selection whenever the bot does NOT own provider config (botOwnsProviderConfiguration
+// === false → providerSource = process.env). The no-fallback rule then REJECTS any
+// ambient sensitive/provider key it doesn't recognize (distillation-runner.ts
+// isUnsupportedProviderKey). A dev shell — or the botmux worker that spawns this bot —
+// commonly exports ANTHROPIC_AUTH_TOKEN / CLAUDE_CODE_*TOKEN* / AWS_* / GOOGLE_* etc.,
+// which would trip that check and fail these tests spuriously (observed: 6 red on a
+// box with ANTHROPIC_AUTH_TOKEN + CLAUDE_CODE_*_TOKENS set). This regex is a
+// deliberately CONSERVATIVE SUPERSET of the production rule (it strips ALL
+// CLAUDE_CODE_*, whereas production only flags USE/SKIP/OAUTH or keys containing
+// AUTH/CRED/TOKEN/API_KEY/CERT/KEY/PROVIDER/HOST) — the point is only to clear the
+// ambient provider FAMILY prefixes so each test's OWN explicit re-injection is the
+// sole provider signal. Core provider selection / no-fallback behavior is exercised
+// by the tests' own explicit env, so over-stripping here can't bypass it. Restored
+// afterward so we don't leak into other suites.
+const AMBIENT_PROVIDER_KEY = /^(?:ANTHROPIC_|AWS_|GOOGLE_|AZURE_|CLOUD_ML_REGION|VERTEX_REGION|CLAUDE_CODE_)/;
+const strippedAmbientEnv: Record<string, string> = {};
+
+beforeEach(() => {
+  for (const key of Object.keys(process.env)) {
+    if (AMBIENT_PROVIDER_KEY.test(key)) {
+      strippedAmbientEnv[key] = process.env[key]!;
+      delete process.env[key];
+    }
+  }
+  process.env.ANTHROPIC_API_KEY = 'synthetic-test-api-key';
+});
+
+afterEach(() => {
+  for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
+  if (originalAnthropicApiKey === undefined) delete process.env.ANTHROPIC_API_KEY;
+  else process.env.ANTHROPIC_API_KEY = originalAnthropicApiKey;
+  for (const [key, value] of Object.entries(strippedAmbientEnv)) {
+    process.env[key] = value;
+    delete strippedAmbientEnv[key];
+  }
+});
 
 function hostPortableStockClaudeFixture(scratchParent: string | undefined): string {
   if (!scratchParent) throw new Error('test fixture requires scratchParent');
@@ -63,16 +110,6 @@ function sweepAbandonedV3DistillationScratch(
     ...input,
   });
 }
-
-beforeEach(() => {
-  process.env.ANTHROPIC_API_KEY = 'synthetic-test-api-key';
-});
-
-afterEach(() => {
-  for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
-  if (originalAnthropicApiKey === undefined) delete process.env.ANTHROPIC_API_KEY;
-  else process.env.ANTHROPIC_API_KEY = originalAnthropicApiKey;
-});
 
 function fixture(): { root: string; scratchParent: string } {
   const root = mkdtempSync(join(tmpdir(), 'v3-distill-runner-test-'));
@@ -350,7 +387,7 @@ describe('runV3DistillationModel', () => {
     expect(readdirSync(dirs.scratchParent)).toEqual([]);
   });
 
-  it.skipIf(process.platform !== 'linux')(
+  it.skipIf(process.platform !== 'linux' || !bwrapUsable)(
     'collapses the PID namespace before cleaning scratch',
     async () => {
     const dirs = fixture();

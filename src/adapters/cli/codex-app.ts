@@ -35,8 +35,10 @@ export function createCodexAppAdapter(pathOverride?: string): CliAdapter {
   let cachedCodexBin: string | undefined;
   return {
     id: 'codex-app',
-    // Whole ~/.codex kept REAL (see codex.ts): its SQLite state/log DBs can't get
-    // fcntl locks on the sandbox home overlay, so codex hangs ~57s then exits 1.
+    // Whole ~/.codex kept REAL (see codex.ts): under the deny-by-default file
+    // sandbox a path not in authPaths doesn't exist, so codex can't open its
+    // SQLite state/log DBs and hangs ~57s then exits 1. Binding the dir real
+    // gives working fcntl locks.
     authPaths: ['~/.codex'],
     resolvedBin: process.execPath,
 
@@ -49,7 +51,7 @@ export function createCodexAppAdapter(pathOverride?: string): CliAdapter {
       return [(cachedCodexBin ??= resolveCommand(rawCodexBin))];
     },
 
-    buildArgs({ sessionId, resume, resumeSessionId, workingDir, botName, botOpenId, locale }) {
+    buildArgs({ sessionId, resume, resumeSessionId, workingDir, botName, botOpenId, locale, model, reasoningEffort }) {
       const args = [
         runnerPath(),
         '--session-id', sessionId,
@@ -60,6 +62,10 @@ export function createCodexAppAdapter(pathOverride?: string): CliAdapter {
       pushOpt(args, '--bot-name', botName);
       pushOpt(args, '--bot-open-id', botOpenId);
       pushOpt(args, '--locale', locale);
+      // Per-turn overrides (async trigger API). The runner injects them into the
+      // app-server thread/start (model + config.model_reasoning_effort).
+      pushOpt(args, '--model', model && model.trim() ? model.trim() : undefined);
+      pushOpt(args, '--reasoning-effort', reasoningEffort);
       return args;
     },
 
@@ -70,20 +76,27 @@ export function createCodexAppAdapter(pathOverride?: string): CliAdapter {
       return null;
     },
 
-    async writeInput(pty: PtyHandle, content: string) {
+    async writeInput(pty: PtyHandle, content: string, context) {
       // Chunked + throttled stdin injection — a single send-keys of the whole
       // (potentially ~20KB) control line overruns the pane pty input buffer and
       // gets dropped. See runner-input.ts.
-      return writeRunnerInput(pty, '::botmux-codex-app:', content);
+      return writeRunnerInput(pty, '::botmux-codex-app:', content, undefined, context?.turnId);
     },
 
-    async writeStructuredInput(pty, content, codexAppInput) {
+    async writeStructuredInput(pty, content, codexAppInput, context) {
       // The legacy prompt remains in the control payload as a compatibility
       // fallback. The runner uses the sidecar only on supported app-server
       // versions and never reverse-parses the XML-ish legacy envelope.
-      return writeRunnerInput(pty, '::botmux-codex-app:', content, codexAppInput);
+      return writeRunnerInput(
+        pty,
+        '::botmux-codex-app:',
+        content,
+        codexAppInput,
+        context?.turnId,
+      );
     },
 
+    supportsTypeAhead: true,
     completionPattern: undefined,
     readyPattern: /›/,
     systemHints: [],

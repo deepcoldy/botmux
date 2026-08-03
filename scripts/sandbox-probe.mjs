@@ -139,7 +139,26 @@ check('读 allow-list: .dashboard-port', 'ALLOWED', ['/bin/cat', join(botmuxHome
 check('读 config.json (voice 凭证, codex#1)', 'DENIED', ['/bin/cat', join(botmuxHome, 'config.json')]);
 check('读 .env (daemon 配置, codex#1)', 'DENIED', ['/bin/cat', join(botmuxHome, '.env')]);
 check('读 data/webhook-master.key (AES 主密钥, codex#1)', 'DENIED', ['/bin/cat', join(sessionDataDir, 'webhook-master.key')]);
-check('读写 data/schedules.json (RMW 定时任务, owner 接受泄漏)', 'ALLOWED', ['/bin/cat', join(sessionDataDir, 'schedules.json')]);
+// Schedules are per-bot now: own BOT_HOME store fully mutable (file + RMW
+// sibling lock), sibling stores invisible. The lock-file write is the exact
+// operation the old shared-file grant could NOT cover (schedules.json.lock is
+// a SIBLING path of a single-file rule) — probe it explicitly.
+const ownSchedules = join(botHome, 'schedules.json');
+check('写自己 BOT_HOME 的 schedules.json (per-bot 存储)', 'ALLOWED',
+  ['/bin/sh', '-c', `[ -f '${ownSchedules}' ] || printf '{}' > '${ownSchedules}'; /bin/cat '${ownSchedules}' > /dev/null`]);
+check('建自己 schedules.json.lock (RMW 兄弟锁, 旧共享模型的盲区)', 'ALLOWED',
+  ['/bin/sh', '-c', `/usr/bin/touch '${ownSchedules}.lock' && /bin/rm -f '${ownSchedules}.lock'`]);
+// Only probe a sibling store that really exists — a missing file also fails
+// `cat`, and "absent" must never masquerade as "denied".
+const siblingSchedules = (() => {
+  try {
+    return readdirSync(join(botmuxHome, 'bots'))
+      .filter((n) => n.startsWith('cli_') && n !== APP)
+      .map((n) => join(botmuxHome, 'bots', n, 'schedules.json'))
+      .find((p) => existsSync(p));
+  } catch { return undefined; }
+})();
+if (siblingSchedules) check('读兄弟 bot 的 schedules.json (跨-bot 任务 prompt)', 'DENIED', ['/bin/cat', siblingSchedules]);
 check('读 ~/.botmux/bots.json (敏感)', 'DENIED', ['/bin/cat', join(botmuxHome, 'bots.json')]);
 check('读 ~/.botmux/logs (跨-bot)', 'DENIED', ['/bin/ls', join(botmuxHome, 'logs')]);
 // End-to-end: actually run the botmux CLI inside the sandbox (loads cli.js + reads

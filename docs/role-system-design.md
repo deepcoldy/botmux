@@ -8,6 +8,10 @@
 技术路线：**方案 C（角色 = 工作目录 + Claude Code 原生记忆）**，配套 botmux 代码改动约 300 行：botmux cd/botmux slash 两个命令与 brandLabel 变量替换（见 11.2/11.3）。较 v0.1 的变化：应评审意见从「纯 Skill 方案」切换到 C，原因见第 3 节。v0.3：实测 Claude Code 会话内 /cd（2.1.205）后，切换改为注入式——不重启进程、上下文保留，handoff 机制退役（见 7.1）。v0.4：角色脚注定案为 brandLabel 变量替换 + 通用目录元数据 .botmux-dir.json（与角色解耦）（{cwdName}/{cwdUrl}，见 7.4），§14 跳转目标问题随之关闭。v0.5：知识沉淀升级为「飞书文档审核界面 + 本地运行时真源」双层，pull→merge→push，用户修订可回流（见 §9）。
 </callout>
 
+<!-- 后续变更（不改本 v0.5 快照正文）：角色切换命令名由 `botmux cd <目录>` 改为
+     `botmux role switch <目录>`（第一次上线做干净迭代，未保留 cd 别名）。下文历史正文
+     中出现的 `botmux cd` 语义等同现在的 `botmux role switch`。 -->
+
 # 1. 背景与目标
 
 botmux 飞书机器人（底层 Claude Code）目前的 `/role` 机制只解决「人设注入」，记忆按 (bot, 工作目录) 分桶，与角色无关——同一个 bot 里所有角色共用一份记忆。本方案要达成：
@@ -63,7 +67,7 @@ CLAUDE.md 自动加载：人设+协议+知识索引"]
         M["原生 auto-memory
 自动读写（按 cwd 分桶）"]
     end
-    subgraph store[角色库 ~/botmux-roles/<bot>/]
+    subgraph store[角色库 ~/botmux-roles/&lt;appId&gt;/]
         P[各角色目录：CLAUDE.md + knowledge/]
     end
     U --> S --> C
@@ -94,23 +98,28 @@ flowchart LR
 
 # 5. 角色库目录结构
 
-角色库就是文件系统，一个 bot 一棵树，**角色目录同时就是该角色的工作目录（cwd）**。目录名即角色名（支持中文）：
+角色库就是文件系统，一个 bot 一棵树，**角色目录同时就是该角色的工作目录（cwd）**。
+
+> ⚠️ 两条命名约定以 `docs/roles/deploy-runbook.md` 为准，下面的树只示意层级：
+> **每-bot 目录名 = 该 bot 的 `larkAppId`**（沙盒白名单与 role switch 越界校验的 scoping key）；
+> **角色目录名必须是 ASCII slug**（中文名写在 `.botmux-dir.json` 的 `name`，否则记忆桶按
+> cwd slug 分桶会串台）。
 
 ```text
-~/botmux-roles/<bot名>/
+~/botmux-roles/<appId>/            # 目录名 = larkAppId（沙盒 scoping key）
   _role-protocol.md            ← 共享角色协议（单一来源，各角色 CLAUDE.md @import 引用）
   shared/
-    默认助理/                   ← 默认角色：全员可用，记忆全员共享
+    default/                   ← 默认角色（ASCII slug；中文名在 .botmux-dir.json 的 name）
       CLAUDE.md                ← 人设 + @import 协议 + @import 知识索引
       knowledge/
         INDEX.md               ← 领域知识索引
         <主题>.md               ← 沉淀后的领域知识文档
   users/
     <open_id>/                 ← 用户私有区，按飞书 open_id 归属
-      产品经理/
+      pm/                      ← 同样是 ASCII slug
         CLAUDE.md
         knowledge/ ...
-      售后客服/ ...
+      after-sales/ ...          ← 同上
 ```
 
 <callout emoji="❗">
@@ -246,7 +255,7 @@ bot 每条回复卡片左下角的 brand 位（现为蓝色「botmux」链接）
 # 11. 部署清单
 
 1. **botmux 代码**（两处小改动）：① `src/cli.ts` 加 `case 'cd'` + `cmdCd`（pid marker/env 自识别 session → findDaemon → POST），`src/core/dashboard-ipc-server.ts` 加 `POST /api/sessions/:sessionId/cd` 路由：校验目标在角色库根下 → 更新 session 记录落盘 → CLI 存活则等 idle 向 TUI 注入 `/cd <目录>`（抽为共享「idle 注入队列」模块并顺带暴露通用命令 botmux slash，见 11.1 分层），不存活则留待下条消息冷启动；② `brandLabel` 变量替换：渲染 helper 支持 `{cwdName}`/`{cwd}`/`{cwdUrl}` + 空链接降级，接入 worker-pool.ts 回复卡与 cli.ts botmux send footer，并更新 dashboard 帮助文案（见 7.4）
-2. 创建 `~/botmux-roles/<bot>/` 骨架：\_role-protocol.md、默认角色目录（零人设起步：协议 @import + 一行中性描述）
+2. 创建 `~/botmux-roles/<appId>/` 骨架（目录名 = larkAppId）：\_role-protocol.md、默认角色目录（零人设起步：协议 @import + 一行中性描述）
 3. bots.json：目标 bot 的 `defaultWorkingDir` 指向默认角色目录（新话题即默认角色，零代码）；确认该 bot 没有指向别处的 oncall 绑定；卡片签名（brandLabel）设为 {cwdName}
 4. 确认 bot 具备飞书文档读写能力（lark-cli --as bot 或 app 凭证走 OpenAPI；隔离 bot 用自己的 send-cred 凭证），跑通「建文档→写入→分享给角色主人」一遍
 5. 确认目标 bot 的 Claude Code 版本支持会话内 /cd（本机 2.1.205 实测通过）；把角色库根目录预置为受信目录（复用现有信任种子机制），避免注入 /cd 时弹信任框

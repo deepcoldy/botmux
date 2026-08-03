@@ -27,7 +27,10 @@ export function shouldWriteNow(state: {
   supportsTypeAhead: boolean;
   /** True until the CLI has reached its first ready state (boot / re-attach window). */
   awaitingFirstPrompt: boolean;
+  /** A stale Codex App runner must not receive normal or type-ahead input. */
+  holdForRunnerReload?: boolean;
 }): boolean {
+  if (state.holdForRunnerReload) return false;
   if (state.isPromptReady || state.isFlushing) return true;
   // Type-ahead is only safe after the TUI has booted at least once.
   return state.supportsTypeAhead && !state.awaitingFirstPrompt;

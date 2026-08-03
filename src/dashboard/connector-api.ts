@@ -239,6 +239,7 @@ function normalizeConnectorInput(
         : prior?.promptEnvelope.instruction ? { instruction: prior.promptEnvelope.instruction } : {}),
     },
     topicMessage: topicMessage.value,
+    ...(bool(c.suppressFinalOutput, prior?.suppressFinalOutput ?? false) ? { suppressFinalOutput: true } : {}),
     loggingPolicy: {
       storePayload: bool(loggingPolicy.storePayload, prior?.loggingPolicy.storePayload ?? true),
       storeHeaders: bool(loggingPolicy.storeHeaders, prior?.loggingPolicy.storeHeaders ?? true),

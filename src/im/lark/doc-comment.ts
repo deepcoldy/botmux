@@ -16,7 +16,7 @@
 import { getBotClient, getBot } from '../../bot-registry.js';
 import { resolveUserToken } from '../../utils/user-token.js';
 import { logger } from '../../utils/logger.js';
-import { UserTokenMissingError } from './client.js';
+import { UserTokenMissingError, assertLarkTransport } from './client.js';
 import { type Brand, larkHosts, normalizeBrand } from './lark-hosts.js';
 import type { CommentTriggerMode } from '../../services/doc-subs-store.js';
 
@@ -283,6 +283,11 @@ function buildQuery(params?: DriveCallOpts['params']): string {
  * 空 body 守卫）。返回飞书统一响应体 `{ code, msg, data }`。
  */
 async function driveApiCall(larkAppId: string, opts: DriveCallOpts): Promise<any> {
+  // Bot-level transport boundary: doc-comment has its OWN direct-Feishu drive
+  // API (subscribe/reply/comment/reaction) that bypasses im/lark/client.ts, so
+  // enforce the same apiOnly gate here. A core-only bot has no Feishu tenant
+  // token and no doc surface, so every drive call — read or write — is refused.
+  assertLarkTransport(larkAppId, `driveApiCall ${opts.method} ${opts.path}`);
   const bot = getBot(larkAppId);
   const brand = normalizeBrand(bot.config.brand);
 

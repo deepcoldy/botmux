@@ -15,7 +15,7 @@
  *   part of the output type at all.
  */
 
-import { isLoopNode, type V3Dag } from './dag.js';
+import { isHostNode, isLoopNode, type V3Dag, type V3Node } from './dag.js';
 import type { Spec } from './contract.js';
 import type { StoredEvent, V3ErrorClass } from './journal.js';
 import type { V3NodeStatus } from './orchestrator.js';
@@ -66,6 +66,7 @@ export interface V3ProgressIssue {
   errorClass?: V3ErrorClass;
   /** Included only when it is a bounded machine token, never free text. */
   errorCode?: string;
+  phase?: 'business' | 'hostEffect';
 }
 
 export interface V3ProgressView {
@@ -88,6 +89,8 @@ export interface V3ProgressView {
     refreshedNodeIds: string[];
   };
   issue?: V3ProgressIssue;
+  feishuHostFailed?: boolean;
+  upstreamNonHostFinished?: boolean;
   /** Number only: external payloads and provider errors never enter the card. */
   uncertainHostEffectCount?: number;
   /** Last usable journal timestamp, falling back to run.json.createdAt. */
@@ -206,6 +209,25 @@ function latestIssue(
     : undefined;
 }
 
+function issuePhase(node: V3Node | undefined): V3ProgressIssue['phase'] {
+  return node && isHostNode(node)
+    ? 'hostEffect'
+    : 'business';
+}
+
+function isFeishuHostNode(node: V3Node | undefined): boolean {
+  return !!node && isHostNode(node) && (node.executor === 'feishu-send' || node.executor === 'feishu-reply');
+}
+
+function nonHostWorkFinished(dag: V3Dag, snapshot: ReturnType<typeof materialize>): boolean {
+  return dag.nodes
+    .filter((node) => !isHostNode(node))
+    .every((node) => {
+      const status = snapshot.nodes.get(node.id)?.status;
+      return status === 'done' || status === 'skipped';
+    });
+}
+
 /**
  * Build the stable, privacy-safe progress DTO consumed by the Lark card.
  * Callers must pass the envelope/DAG bytes already verified by
@@ -273,6 +295,9 @@ export function projectV3Progress(input: V3ProgressProjectionInput): V3ProgressV
     ? snapshot.blockedNodeId ?? dag.nodes.find((node) => countKey(snapshot.nodes.get(node.id)?.status) === 'blocked')?.id
     : snapshot.failedNodeId ?? dag.nodes.find((node) => countKey(snapshot.nodes.get(node.id)?.status) === 'failed')?.id;
   const issue = latestIssue(events, outerIds, status, preferredIssueNodeId);
+  const issueNode = issue?.nodeId ? dag.nodes.find((node) => node.id === issue.nodeId) : undefined;
+  if (issue) issue.phase = issuePhase(issueNode);
+  const feishuHostFailed = status === 'failed' && isFeishuHostNode(issueNode);
   const lastTs = usableEventTimestamp(events);
 
   return {
@@ -286,6 +311,8 @@ export function projectV3Progress(input: V3ProgressProjectionInput): V3ProgressV
     loops,
     revisit: { count: revisitCount, refreshedNodeIds },
     ...(issue ? { issue } : {}),
+    ...(feishuHostFailed ? { feishuHostFailed: true } : {}),
+    ...(feishuHostFailed && nonHostWorkFinished(dag, snapshot) ? { upstreamNonHostFinished: true } : {}),
     ...(snapshot.uncertainHostEffects && snapshot.uncertainHostEffects.length > 0
       ? { uncertainHostEffectCount: snapshot.uncertainHostEffects.length }
       : {}),

@@ -90,7 +90,8 @@ import { whiteboardEnabled } from '../../services/whiteboard-store.js';
  *
  *  ## Sandbox
  *  `authPaths: [$GROK_HOME]` (directory) — grok keeps SQLite DBs there
- *  (session_search.sqlite, worktrees.db) which fail under overlayfs fcntl
+ *  (session_search.sqlite, worktrees.db); under the deny-by-default file sandbox
+ *  a path not in authPaths doesn't exist, so they'd be unreachable / lack fcntl
  *  locks.
  */
 export function createGrokAdapter(pathOverride?: string): CliAdapter {
@@ -312,7 +313,10 @@ export function createGrokAdapter(pathOverride?: string): CliAdapter {
     // Busy markers verified on 0.2.93: "⠧ Waiting for response…" spinner
     // during the model phase, and the "Ctrl+c:cancel" shortcut-bar entry
     // through model AND tool phases (idle bar shows Shift+Tab:mode /
-    // Ctrl+x:shortcuts only).
+    // Ctrl+x:shortcuts only). Kept for reattach / first-prompt-timeout
+    // probes — post-submit busy-absent probing is disabled for
+    // reliableTurnTerminal CLIs (worker) because these markers often lag
+    // several seconds after submit and were flipping card-off DONE early.
     busyPattern: /Waiting for response|Ctrl\+c:\s*cancel/i,
     // Routing/identity ride on --rules (injectsSessionContext); no inline hints.
     systemHints: [],

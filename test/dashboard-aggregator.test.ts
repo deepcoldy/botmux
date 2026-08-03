@@ -50,6 +50,65 @@ describe('Aggregator cache merge', () => {
     expect(a.getSchedules().length).toBe(1);
   });
 
+  it('preserves presentation fields when a daemon replays the same working directory', () => {
+    const a = new Aggregator();
+    a.hydrateSessions('appA', [{
+      sessionId: 's1',
+      larkAppId: 'appA',
+      workingDir: '/repo/a',
+      botAvatarUrl: 'https://img.example/a.png',
+      repoName: 'a',
+      gitBranch: 'main',
+    }]);
+    const seen: any[] = [];
+    a.on(event => seen.push(event));
+
+    a.applyEvent('appA', {
+      type: 'session.spawned',
+      body: { session: { sessionId: 's1', workingDir: '/repo/a', status: 'idle' } as any },
+    });
+
+    expect(a.getSession('s1')).toMatchObject({
+      botAvatarUrl: 'https://img.example/a.png',
+      repoName: 'a',
+      gitBranch: 'main',
+      status: 'idle',
+    });
+    expect(seen[0].body.session).toMatchObject({
+      repoName: 'a',
+      gitBranch: 'main',
+    });
+  });
+
+  it('clears stale repository fields immediately when workingDir changes', () => {
+    const a = new Aggregator();
+    a.hydrateSessions('appA', [{
+      sessionId: 's1',
+      larkAppId: 'appA',
+      workingDir: '/repo/a',
+      repoName: 'a',
+      gitBranch: 'main',
+    }]);
+    const seen: any[] = [];
+    a.on(event => seen.push(event));
+
+    a.applyEvent('appA', {
+      type: 'session.update',
+      body: { sessionId: 's1', patch: { workingDir: '/repo/b' } },
+    });
+
+    expect(a.getSession('s1')).toMatchObject({
+      workingDir: '/repo/b',
+      repoName: null,
+      gitBranch: null,
+    });
+    expect(seen[0].body.patch).toMatchObject({
+      workingDir: '/repo/b',
+      repoName: null,
+      gitBranch: null,
+    });
+  });
+
   it('ownerOf returns larkAppId for known sessionId', () => {
     const a = new Aggregator();
     a.applyEvent('appA', {

@@ -1,6 +1,8 @@
 # 5 分钟快速接入
 
-> 💡 **TL;DR**：`npm i -g botmux` → `botmux setup` 扫码建应用、选 CLI、填工作目录 → `botmux start` → `botmux autostart enable` → 拉机器人进群开聊。
+> 💡 **TL;DR**：`npm i -g botmux` → `botmux setup`（**一次飞书扫码**连续建应用 + 配全权限 + 发版）→ `botmux start` → `botmux autostart enable` → 拉机器人进群开聊。
+
+**开始前**：先确认 [前置要求](/prerequisites)（Node ≥ 22、目标 CLI 已装并登录）——这里缺件是「装完连不上」最常见的原因。
 
 ## Step 1 · 安装
 
@@ -8,7 +10,7 @@
 npm install -g botmux
 ```
 
-要求 **Node.js ≥ 22**，且本地已安装并登录好至少一种 AI 编程 CLI（`claude` / `codex` / `cursor-agent` / `gemini` / `opencode` / `coco` / `agy` 等）。推荐安装 **tmux**（≥3.x），装了就自动启用会话常驻。
+要求 **Node.js ≥ 22**，且本地已安装并登录好至少一种 AI 编程 CLI（`claude` / `codex` / `cursor-agent` / `gemini` / `opencode` / `coco` / `agy` 等）。**默认会话后端是 tmux（≥3.x），需装好**——不可用时会硬拦截弹卡、不再自动降级 pty；确需无 tmux 环境才用 `BACKEND_TYPE=pty` 或 per-bot `backendType`（`pty`/`herdr`/`zellij`）等显式后端（riff 是云 Agent，不占本地后端）。
 
 ## Step 2 · 配置（`botmux setup`）
 

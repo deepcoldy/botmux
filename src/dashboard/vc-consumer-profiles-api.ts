@@ -15,6 +15,7 @@ import type {
   VcMeetingConsumerManagedSink,
   VcMeetingConsumerProfileConfig,
   VcMeetingConsumerResponseMode,
+  VcMeetingListenerOutputPlacement,
 } from '../types.js';
 import type { VcMeetingActivityType } from '../vc-agent/types.js';
 import type {
@@ -22,12 +23,14 @@ import type {
   VcMeetingConsumerProfileFieldError,
   VcMeetingConsumerProfilesSnapshot,
 } from '../services/vc-meeting-consumer-profile-store.js';
+import {
+  VC_MEETING_CONSUMER_PROFILE_TEMPLATE_CATALOG,
+  type VcMeetingConsumerProfileTemplateCatalog,
+  type VcMeetingTemplatePermissionPreset,
+} from '../services/vc-meeting-consumer-profile-templates.js';
 
 export type VcMeetingPermissionPreset =
-  | 'observe_only'
-  | 'meeting_text'
-  | 'meeting_voice'
-  | 'meeting_text_voice'
+  | VcMeetingTemplatePermissionPreset
   | 'custom';
 
 export interface VcMeetingConsumerProfileDto {
@@ -37,6 +40,8 @@ export interface VcMeetingConsumerProfileDto {
   instructions?: string;
   activityTypes?: string[];
   responseMode: VcMeetingConsumerResponseMode;
+  /** Omitted by pre-feature clients and normalized to `auto`. */
+  listenerPlacement?: VcMeetingListenerOutputPlacement;
   permissionPreset: VcMeetingPermissionPreset;
 }
 
@@ -59,6 +64,8 @@ export interface VcMeetingConsumerProfilesGetBody {
   defaultConsumerIds: string[];
   profiles: VcMeetingConsumerProfileDto[];
   agentOptions: VcMeetingAgentOptionDto[];
+  /** Versioned, read-only templates. Applying one creates a detached editable profile. */
+  templateCatalog: VcMeetingConsumerProfileTemplateCatalog;
   migrationOffer?: VcMeetingConsumerProfilesSnapshot['migrationOffer'];
 }
 
@@ -174,6 +181,7 @@ export function vcMeetingConsumerProfileToDto(
       ? { activityTypes: [...profile.filter.activityTypes] }
       : {}),
     responseMode: profile.responseMode,
+    listenerPlacement: profile.listenerDelivery?.placement ?? 'auto',
     permissionPreset: deriveVcMeetingPermissionPreset(profile),
   };
 }
@@ -211,6 +219,13 @@ export function vcMeetingConsumerProfilesFromDtos(
     }
     if (dto.responseMode !== 'silent' && dto.responseMode !== 'listener_thread') {
       fieldErrors.push({ path: path('responseMode'), message: '输出方式必须是 silent 或 listener_thread' });
+      return;
+    }
+    const listenerPlacement = dto.listenerPlacement ?? 'auto';
+    if (listenerPlacement !== 'auto'
+      && listenerPlacement !== 'chat'
+      && listenerPlacement !== 'topic') {
+      fieldErrors.push({ path: path('listenerPlacement'), message: '群内呈现必须是 auto、chat 或 topic' });
       return;
     }
     if (!PERMISSION_PRESETS.includes(dto.permissionPreset)) {
@@ -274,6 +289,9 @@ export function vcMeetingConsumerProfilesFromDtos(
         ? { filter: { activityTypes: activityTypes as VcMeetingActivityType[] } }
         : {}),
       responseMode: dto.responseMode,
+      ...(listenerPlacement !== 'auto'
+        ? { listenerDelivery: { placement: listenerPlacement } }
+        : {}),
       capabilities,
       ...(ownedSinks.length > 0 ? { ownedSinks } : {}),
     });
@@ -326,6 +344,7 @@ function snapshotBody(
     defaultConsumerIds: [...snapshot.defaultConsumerIds],
     profiles: snapshot.profiles.map(vcMeetingConsumerProfileToDto),
     agentOptions,
+    templateCatalog: VC_MEETING_CONSUMER_PROFILE_TEMPLATE_CATALOG,
     ...(snapshot.migrationOffer ? { migrationOffer: snapshot.migrationOffer } : {}),
   };
 }

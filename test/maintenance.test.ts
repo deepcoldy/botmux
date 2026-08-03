@@ -201,6 +201,10 @@ describe('detachedRestartEnv', () => {
       BOTMUX_DASHBOARD_PORT: '7991',
       BOTMUX_DAEMON_IPC_BASE_PORT: '7992',
       BOTMUX_DASHBOARD_PUBLIC_READONLY: 'false',
+      // Mirrors DAEMON_ENV_KEYS: a baked BOTMUX_PUBLIC_URL must be stripped too,
+      // else a detached restart keeps the stale proxy base instead of reloading
+      // it from ~/.botmux/.env.
+      BOTMUX_PUBLIC_URL: 'http://stale.proxy.example.com',
       PATH: '/usr/bin',
     };
 

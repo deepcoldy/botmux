@@ -22,6 +22,33 @@ describe('worker pipe initial screen ordering', () => {
     );
   });
 
+  it('fences bridge markers before worker-side close teardown can race fallback reads', () => {
+    const source = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
+    const readMarkersStart = source.indexOf('function readSendMarkers');
+    const readMarkersEnd = source.indexOf('function submitActivityEvidenceSince', readMarkersStart);
+    const readMarkers = source.slice(readMarkersStart, readMarkersEnd);
+    expect(readMarkers).toContain('if (closeRequested) return []');
+    const sendStart = source.indexOf('function send(msg: WorkerToDaemon)');
+    const sendEnd = source.indexOf('function acknowledgeTurnInputCommitted', sendStart);
+    const sendBody = source.slice(sendStart, sendEnd);
+    expect(sendBody).toContain("if (closeRequested && msg.type === 'final_output')");
+
+    const closeCase = source.slice(
+      source.indexOf("case 'close':"),
+      source.indexOf("case 'suspend':", source.indexOf("case 'close':")),
+    );
+    const setCloseIdx = closeCase.indexOf('closeRequested = true;');
+    const ackIdx = closeCase.indexOf("send({ type: 'session_close_ready', sessionId });");
+    const stopBridgeIdx = closeCase.indexOf('stopBridgeWatcher();');
+    const teardownIdx = closeCase.indexOf('backend?.destroySession?.();');
+    const clearIdx = closeCase.indexOf('clearSendMarkers();');
+    expect(setCloseIdx).toBeGreaterThan(-1);
+    expect(ackIdx).toBeGreaterThan(setCloseIdx);
+    expect(stopBridgeIdx).toBeGreaterThan(ackIdx);
+    expect(teardownIdx).toBeGreaterThan(stopBridgeIdx);
+    expect(clearIdx).toBeGreaterThan(teardownIdx);
+  });
+
   it('captures pipe initial screen after idle detector is registered', () => {
     const source = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
     // The inline `const initial = backend.captureCurrentScreen()` was refactored
@@ -49,26 +76,57 @@ describe('worker pipe initial screen ordering', () => {
     expect(source).not.toContain('shouldBeginCodexAppReattachObservation({');
   });
 
-  it('runs a busy-pattern idle probe after each submitted input', () => {
+  it('cold-start argv prompts seed working for card-off; Grok holds busy, quiescence seeds idle', () => {
+    // Grok: argv + SessionStart → hold working until assistant_final.
+    // Pi/Gemini: argv but first ready IS turn end → seed working then idle.
+    // Arming is centralized (not bare preparedInitialPrompt) so Riff is safe.
     const source = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
-    const writeIdx = source.indexOf('result = await cliAdapter.writeStructuredInput(backend, msg, item.codexAppInput);');
-    const probeIdx = source.indexOf('scheduleBusyPatternIdleProbe(`${cliName()} post-submit`);');
+    expect(source).toContain('shouldArmSpawnArgvInitialPromptBusy');
+    expect(source).toContain('shouldTrackArgvBakedFirstPrompt');
+    expect(source).toContain('spawnArgvNeedsWorkingSeed');
+    expect(source).toContain('Spawn argv initial prompt still in flight — reporting working');
+    expect(source).toContain('Argv-baked first prompt completed — seeded working→idle');
+    expect(source).toContain("publishScreenStatus('working', { force: true })");
+    // Synthetic working must not be rewritten by classifyScreenUsageLimit
+    // (rate-limit banner would otherwise collapse seed to limited→limited).
+    expect(source).toContain('opts?.force');
+    // Short-turn fix: flushPending publishes working immediately on submit.
+    expect(source).toContain("// Immediate working for card-off reaction settle");
+  });
+
+  it('runs a busy-pattern idle probe after each submitted input — except reliableTurnTerminal CLIs', () => {
+    const source = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
+    // Attribution and ZMX's recovery journal now wrap the adapter call inside
+    // flushPending. Anchor the literal write there, then confirm the probe is
+    // gated behind `reliableTurnTerminal !== true` (Grok/Codex own idle via
+    // assistant_final; a post-submit "busy absent" probe was flipping card-off
+    // DONE mid-turn because their busy markers lag after submit).
+    const flushStart = source.indexOf('async function flushPending(): Promise<void>');
+    const flushEnd = source.indexOf('function sendToPty(', flushStart);
+    const flush = source.slice(flushStart, flushEnd);
+    const writeIdx = flush.indexOf('() => targetAdapter.writeInput(');
+    const gateIdx = flush.indexOf('if (cliAdapter.reliableTurnTerminal !== true) {', writeIdx);
+    const probeIdx = flush.indexOf('scheduleBusyPatternIdleProbe(`${cliName()} post-submit`);', writeIdx);
     const helperIdx = source.indexOf('function scheduleBusyPatternIdleProbe(source: string): void');
 
     expect(helperIdx).toBeGreaterThan(-1);
     expect(writeIdx).toBeGreaterThan(-1);
-    expect(probeIdx).toBeGreaterThan(writeIdx);
+    expect(gateIdx).toBeGreaterThan(writeIdx);
+    expect(probeIdx).toBeGreaterThan(gateIdx);
+    expect(probeIdx).toBeLessThan(gateIdx + 250);
   });
 
-  it('rechecks busy-pattern adapters when a Lark message is queued while busy', () => {
+  it('rechecks busy-pattern adapters when a Lark message is queued while busy — except reliableTurnTerminal', () => {
     const source = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
     const queueLogIdx = source.indexOf('Queued message (${pendingMessages.length} pending)');
-    const queuedProbeIdx = source.indexOf('scheduleBusyPatternIdleProbe(`${cliName()} queued-message`);');
+    const gateIdx = source.indexOf('if (cliAdapter?.reliableTurnTerminal !== true) {', queueLogIdx);
+    const queuedProbeIdx = source.indexOf('scheduleBusyPatternIdleProbe(`${cliName()} queued-message`);', queueLogIdx);
     const helperIdx = source.indexOf('function scheduleBusyPatternIdleProbe(source: string): void');
 
     expect(helperIdx).toBeGreaterThan(-1);
     expect(queueLogIdx).toBeGreaterThan(-1);
-    expect(queuedProbeIdx).toBeGreaterThan(queueLogIdx);
+    expect(gateIdx).toBeGreaterThan(queueLogIdx);
+    expect(queuedProbeIdx).toBeGreaterThan(gateIdx);
   });
 
   it('rechecks busy-pattern adapters after first prompt timeout fallback unlocks startup', () => {
@@ -115,7 +173,7 @@ describe('worker pipe initial screen ordering', () => {
       sessionReadyCase,
     );
     const resetEvidenceIdx = source.indexOf('idleDetector?.resetReadyEvidence();', waitDecisionIdx);
-    const ptyReadyIdx = source.indexOf('markPromptReadyFromPty();');
+    const ptyReadyIdx = source.indexOf('markPromptReadyFromPty(observedBackend);');
     const screenEvidenceGuardIdx = source.indexOf("if (evidenceSource === 'screen')");
     const signalReleaseIdx = source.indexOf(
       "releaseReadyGate('SessionStart hook', { promptReadyAfterSettle: !waitForPostHookPrompt });",
@@ -189,10 +247,13 @@ describe('worker pipe initial screen ordering', () => {
   });
 
   it('forces the first prompt for non-type-ahead adapters at the hard timeout', () => {
-    // THE HERMES FIX (hard-timeout path): previously the hard cap only logged
-    // "forcing queued message flush" and flushed for type-ahead adapters only;
-    // non-type-ahead adapters (Hermes) never delivered. The release must now
-    // route non-type-ahead adapters to markPromptReady() (which then flushes).
+    // Hard-timeout path (originally "THE HERMES FIX"): previously the hard cap
+    // only logged "forcing queued message flush" and flushed for type-ahead
+    // adapters only; non-type-ahead adapters never delivered. The release must
+    // now route non-type-ahead adapters to markPromptReady() (which then
+    // flushes). (Hermes drove this originally; it no longer arms the gate — see
+    // hermes.ts — but the mechanism still guards any non-type-ahead ready-gated
+    // adapter.)
     const source = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
     const fallbackStart = source.indexOf('const releaseFirstPromptTimeout =');
     const decideIdx = source.indexOf("decideHardTimeoutAction(cliAdapter?.supportsTypeAhead === true)", fallbackStart);
@@ -224,7 +285,10 @@ describe('worker pipe initial screen ordering', () => {
     );
     const readySetIdx = mark.indexOf('isPromptReady = true;');
     const promptReadySendIdx = mark.indexOf("send({ type: 'prompt_ready' });");
-    const idleUpdateIdx = mark.indexOf("usageLimitTracker.classify(content, 'idle')");
+    // The master merge replaced the inline `usageLimitTracker.classify(content,
+    // 'idle')` screen_update with the publishScreenStatus('idle') projection
+    // (classify runs inside it). It still fires AFTER prompt_ready.
+    const idleUpdateIdx = mark.indexOf("publishScreenStatus('idle')");
 
     expect(proofGuardIdx).toBeGreaterThan(-1);
     expect(proofGuardIdx).toBeLessThan(livenessGuardIdx);
@@ -271,7 +335,11 @@ describe('worker pipe initial screen ordering', () => {
     const injectIdx = source.indexOf('childEnv[CODEX_APP_CONTROL_BOOTSTRAP_ENV] = codexAppControlBootstrapPathForSpawn;');
     const spawnIdx = source.indexOf('backend.spawn(spawnBin, spawnArgs');
     const finalizeIdx = source.indexOf('finalizeCodexAppControlGeneration(', spawnIdx);
-    const onDataIdx = source.indexOf('backend.onData(onPtyData);', spawnIdx);
+    // The master merge refactored the post-spawn PTY listener into the
+    // setupBackendHandlers `observedBackend.onData((data) => …)` form (with the
+    // backend!==observedBackend generation fence); the bare `backend.onData(
+    // onPtyData)` now only appears in the earlier adopt early-return paths.
+    const onDataIdx = source.indexOf('observedBackend.onData((data)', spawnIdx);
     const finalizeStart = source.indexOf('function finalizeCodexAppControlGeneration(');
     const finalizeEnd = source.indexOf('function rejectCodexAppControlMarker', finalizeStart);
     const finalize = source.slice(finalizeStart, finalizeEnd);
@@ -305,7 +373,16 @@ describe('worker pipe initial screen ordering', () => {
     expect(source.slice(pluginPrepareIdx, backendSpawnIdx)
       .match(/if \(spawnGeneration !== cliSpawnGeneration\) throw new CliSpawnSupersededError\(\);/g))
       .toHaveLength(2);
-    expect(source).toContain('function killCli(opts: { preservePending?: boolean } = {}): void {\n  cliSpawnGeneration++;');
+    // killCli bumps the spawn generation as its first mutation so an in-flight
+    // async spawn is invalidated before any other teardown runs. The master merge
+    // expanded the signature (added `preserveSandbox?`) and prefixed a rationale
+    // comment, so assert the two invariants instead of an exact concatenation:
+    // the (multi-line) signature exists, and cliSpawnGeneration++ is the first
+    // statement inside the body.
+    const killCliIdx = source.indexOf('function killCli(opts: {');
+    expect(killCliIdx).toBeGreaterThan(-1);
+    const killCliBody = source.slice(source.indexOf('} = {}): void {', killCliIdx));
+    expect(killCliBody.slice(0, 300)).toContain('cliSpawnGeneration++;');
     expect(source.match(/err instanceof CliSpawnSupersededError/g)).toHaveLength(3);
   });
 
@@ -409,7 +486,9 @@ describe('worker pipe initial screen ordering', () => {
     const prepareIdx = source.indexOf('prepareCodexAppControlGeneration(', preflightIdx);
     const finalizeIdx = source.indexOf('finalizeCodexAppControlGeneration(', prepareIdx);
     const failureKillIdx = source.indexOf('killPersistentSession(', finalizeIdx);
-    const onDataIdx = source.indexOf('backend.onData(onPtyData);', finalizeIdx);
+    // Post-merge the PTY listener is the setupBackendHandlers
+    // `observedBackend.onData((data) => …)` form (was `backend.onData(onPtyData)`).
+    const onDataIdx = source.indexOf('observedBackend.onData((data)', finalizeIdx);
 
     expect(preflightIdx).toBeGreaterThan(-1);
     expect(preflightKillIdx).toBeGreaterThan(preflightIdx);
@@ -419,15 +498,36 @@ describe('worker pipe initial screen ordering', () => {
     expect(failureKillIdx).toBeLessThan(onDataIdx);
   });
 
+  it('keys overlapping authoritative screen settles by the idle-edge revision', () => {
+    const source = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
+    const settleStart = source.indexOf('function settleBackendScreenBeforeIdle');
+    const settleEnd = source.indexOf('/** Submission writes', settleStart);
+    const settle = source.slice(settleStart, settleEnd);
+    // Anchor on the async onIdle handler without pinning its parameter list —
+    // upstream has already renamed/extended it once (`(evidenceSource)`), and a
+    // stale anchor silently slices an empty string instead of failing loudly.
+    const idleStart = source.search(/idleDetector\.onIdle\(async \(/);
+    expect(idleStart).toBeGreaterThan(-1);
+    const idleEnd = source.indexOf('observedBackend.onData((data) =>', idleStart);
+    expect(idleEnd).toBeGreaterThan(idleStart);
+    const idle = source.slice(idleStart, idleEnd);
+
+    expect(settle).toContain('existing.revision >= requestedRevision');
+    expect(settle).toContain('if (existing) await existing.promise;');
+    expect(settle).toContain('revision: requestedRevision');
+    expect(idle).toContain('settleBackendScreenBeforeIdle(idleBackend, revisionBeforeSettle)');
+  });
+
   it('honors a true ready signal that arrives AFTER the timeout fallback (slow cold start)', () => {
     // ReadyGate.receive() is one-shot: once the 45s fallback fires, a later
-    // releaseReadyGate from the real signal is skipped entirely. A CLI whose
-    // cold start exceeds READY_SIGNAL_TIMEOUT_MS (Hermes: 2-3 min) would then
-    // never take the authoritative markPromptReady path. The session_ready case
-    // must detect the late arrival (gate armed + already received) and mark
-    // prompt-ready directly for authoritative non-Claude signals. Claude waits
-    // for post-hook prompt evidence instead. Both paths are limited to the
-    // first-prompt phase, so clear/compact SessionStart stays a no-op.
+    // releaseReadyGate from the real signal is skipped entirely. A ready-gated
+    // CLI whose cold start exceeds READY_SIGNAL_TIMEOUT_MS would then never take
+    // the authoritative markPromptReady path. The session_ready case must detect
+    // the late arrival (gate armed + already received) and mark prompt-ready
+    // directly for authoritative non-Claude signals. Claude waits for post-hook
+    // prompt evidence instead. Both paths are limited to the first-prompt phase,
+    // so clear/compact SessionStart stays a no-op. (Hermes drove this originally
+    // via its 2-3 min cold start; it no longer arms the gate — see hermes.ts.)
     const source = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
     const sessionReadyCase = source.indexOf("case 'session_ready'");
     const lateCheckIdx = source.indexOf('readyGate.isArmed && readyGate.isReceived', sessionReadyCase);
@@ -458,6 +558,25 @@ describe('worker pipe initial screen ordering', () => {
     expect(helper).toContain('const tailLineCount = Math.max(12, Math.ceil(lines.length / 3));');
     expect(probe).toContain('cliAdapter.busyPattern.test(busyProbeRegion(content))');
     expect(probe).not.toContain('cliAdapter.busyPattern.test(content)');
+  });
+
+  it('settles an authoritative screen before a busy-pattern probe marks the prompt ready', () => {
+    const source = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
+    const probeStart = source.indexOf('function probeBusyPatternIdle');
+    const probeEnd = source.indexOf('function scheduleReattachIdleProbe', probeStart);
+    const probe = source.slice(probeStart, probeEnd);
+
+    const revisionIdx = probe.indexOf('const revisionBeforeSettle = backendScreenRevision;');
+    const settleIdx = probe.indexOf('settleBackendScreenBeforeIdle(be, revisionBeforeSettle)');
+    const backendFenceIdx = probe.indexOf('backend !== be', settleIdx);
+    const revisionFenceIdx = probe.indexOf('backendScreenRevision !== revisionBeforeSettle', settleIdx);
+    const markIdx = probe.indexOf('markPromptReady();', settleIdx);
+
+    expect(revisionIdx).toBeGreaterThan(-1);
+    expect(settleIdx).toBeGreaterThan(revisionIdx);
+    expect(backendFenceIdx).toBeGreaterThan(settleIdx);
+    expect(revisionFenceIdx).toBeGreaterThan(backendFenceIdx);
+    expect(markIdx).toBeGreaterThan(revisionFenceIdx);
   });
 
   it('limits the reattach idle probe to adapters with a busy marker', () => {

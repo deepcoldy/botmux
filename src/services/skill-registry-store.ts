@@ -1,5 +1,5 @@
 import { closeSync, cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readSync, readdirSync, realpathSync, rmSync, statSync } from 'node:fs';
-import { execFile, execFileSync } from 'node:child_process';
+import { execFile, execFileSync, spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { promisify } from 'node:util';
@@ -977,19 +977,38 @@ function agentbuddyInstallArgs(opts: AgentbuddySource): string[] {
   return [...args, ...flags];
 }
 
+/** agentbuddy uses a SEPARATE download/AI credential from the SSO login cache:
+ *  `whoami`/`login` can report "logged in" while the download cred is expired.
+ *  In that case `skill add` doesn't fail — it prints a device-login URL and
+ *  polls the auth server for authorization (NOT stdin), so on a headless daemon
+ *  it hangs until our timeout. `--strict` only checks the login cache, not this.
+ *  Detect the interactive-auth prompt in the child's output and treat it as a
+ *  fast, actionable failure ("run agentbuddy login on the host") instead of a
+ *  minutes-long "processing" hang. */
+const AGENTBUDDY_LOGIN_PROMPT_RE = /No valid credentials|Waiting for authorization|\/auth\/api\/v1\/(lark|ai)\/login|open this URL|Verification code:/i;
+
+function isAgentbuddyLoginPrompt(text: string): boolean {
+  return AGENTBUDDY_LOGIN_PROMPT_RE.test(text);
+}
+
 function runAgentbuddyCli(args: string[], cwd: string, failCode: string): void {
   const { bin, prefixArgs } = agentbuddyCommand();
   try {
-    execFileSync(bin, [...prefixArgs, ...args], {
+    const out = execFileSync(bin, [...prefixArgs, ...args], {
       cwd,
       encoding: 'utf-8',
       stdio: ['ignore', 'pipe', 'pipe'],
       timeout: agentbuddyTimeoutMs(),
     });
+    // Sync path can't kill mid-stream; if agentbuddy somehow printed a login
+    // prompt yet still exited 0, surface the actionable error anyway.
+    if (isAgentbuddyLoginPrompt(out)) throw new Error('agentbuddy_login_required');
   } catch (err: any) {
+    if (err?.message === 'agentbuddy_login_required') throw err;
     if (err?.code === 'ENOENT') throw new Error('agentbuddy_not_found');
     const stderr = Buffer.isBuffer(err?.stderr) ? err.stderr.toString('utf-8').trim() : String(err?.stderr ?? '').trim();
     const stdout = Buffer.isBuffer(err?.stdout) ? err.stdout.toString('utf-8').trim() : String(err?.stdout ?? '').trim();
+    if (isAgentbuddyLoginPrompt(`${stdout}\n${stderr}`)) throw new Error('agentbuddy_login_required');
     throw new Error(`${failCode}: ${stderr || stdout || err?.message || String(err)}`);
   }
 }
@@ -1109,14 +1128,50 @@ function registerAgentbuddyStaging(
 
 async function runAgentbuddyCliAsync(args: string[], cwd: string, failCode: string): Promise<void> {
   const { bin, prefixArgs } = agentbuddyCommand();
-  try {
-    await execFileAsync(bin, [...prefixArgs, ...args], { cwd, encoding: 'utf-8', timeout: agentbuddyTimeoutMs() });
-  } catch (err: any) {
-    if (err?.code === 'ENOENT') throw new Error('agentbuddy_not_found');
-    const stderr = Buffer.isBuffer(err?.stderr) ? err.stderr.toString('utf-8').trim() : String(err?.stderr ?? '').trim();
-    const stdout = Buffer.isBuffer(err?.stdout) ? err.stdout.toString('utf-8').trim() : String(err?.stdout ?? '').trim();
-    throw new Error(`${failCode}: ${stderr || stdout || err?.message || String(err)}`);
-  }
+  return new Promise<void>((resolve, reject) => {
+    let child: ReturnType<typeof spawn>;
+    try {
+      // detached → own process group, so we can SIGKILL the WHOLE tree. The
+      // configured command is usually a shim (`npx agentbuddy@latest …`), so the
+      // real agentbuddy is a grandchild; killing only the direct child would
+      // leave it alive holding the pipes and polling the auth server.
+      child = spawn(bin, [...prefixArgs, ...args], { cwd, stdio: ['ignore', 'pipe', 'pipe'], detached: true });
+    } catch (err: any) {
+      reject(err?.code === 'ENOENT' ? new Error('agentbuddy_not_found') : err);
+      return;
+    }
+    let out = '';
+    let settled = false;
+    let killedForLogin = false;
+    let timedOut = false;
+    const killTree = () => {
+      try { if (child.pid) process.kill(-child.pid, 'SIGKILL'); } catch { /* group gone */ }
+      try { child.kill('SIGKILL'); } catch { /* already dead */ }
+    };
+    const timer = setTimeout(() => { if (!settled) { timedOut = true; killTree(); } }, agentbuddyTimeoutMs());
+    const finish = (fn: () => void) => { if (settled) return; settled = true; clearTimeout(timer); fn(); };
+    const onData = (chunk: Buffer) => {
+      out += chunk.toString('utf-8');
+      // Kill the moment the interactive-auth prompt appears — it polls the auth
+      // server, not stdin, so it would otherwise hang until the timeout.
+      if (!killedForLogin && isAgentbuddyLoginPrompt(out)) {
+        killedForLogin = true;
+        killTree();
+      }
+    };
+    child.stdout?.on('data', onData);
+    child.stderr?.on('data', onData);
+    child.on('error', (err: any) => finish(() => reject(err?.code === 'ENOENT' ? new Error('agentbuddy_not_found') : err)));
+    // Settle on 'exit' (direct child terminated), NOT 'close' (all stdio EOF):
+    // a killed shim can leave a grandchild holding the pipes so 'close' never
+    // fires. Detecting login → killTree → 'exit' → reject login_required.
+    child.on('exit', (code) => finish(() => {
+      if (killedForLogin || isAgentbuddyLoginPrompt(out)) { reject(new Error('agentbuddy_login_required')); return; }
+      if (timedOut) { reject(new Error(`${failCode}: timed out after ${agentbuddyTimeoutMs()}ms`)); return; }
+      if (code === 0) { resolve(); return; }
+      reject(new Error(`${failCode}: ${out.trim() || `exit ${code}`}`));
+    }));
+  });
 }
 
 export function installAgentbuddySkill(opts: AgentbuddySource, requireSkillName?: string): SkillPackage[] {

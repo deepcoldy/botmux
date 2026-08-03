@@ -87,16 +87,18 @@ describe('tryHandleReplyModeCommand — DM (p2p) session mode', () => {
     expect(handled).toBe(false);
   });
 
-  it('DM `/reply-mode chat` (owner) → applyConfigField p2pMode=chat + dm_updated', async () => {
+  it('DM `/reply-mode chat` (owner) → clears p2pMode to default (null) + dm_updated', async () => {
+    // chat is now the DM default → clearing the field (null) selects it.
     const handled = await tryHandleReplyModeCommand(APP, msg('/reply-mode chat', 'p2p'), USER, true);
     expect(handled).toBe(true);
-    expect(mockApplyConfigField).toHaveBeenCalledWith(APP, expect.objectContaining({ key: 'p2pMode' }), 'chat');
+    expect(mockApplyConfigField).toHaveBeenCalledWith(APP, expect.objectContaining({ key: 'p2pMode' }), null);
     expect(lastReply()).toBe('cmd.reply_mode.dm_updated');
   });
 
-  it('DM `/reply-mode topic` (owner) → clears p2pMode to default (null) + dm_updated', async () => {
+  it('DM `/reply-mode topic` (owner) → applyConfigField p2pMode=thread + dm_updated', async () => {
+    // topic (per-message DM session) is now the explicit opt-out → persists 'thread'.
     await tryHandleReplyModeCommand(APP, msg('/reply-mode topic', 'p2p'), USER, true);
-    expect(mockApplyConfigField).toHaveBeenCalledWith(APP, expect.objectContaining({ key: 'p2pMode' }), null);
+    expect(mockApplyConfigField).toHaveBeenCalledWith(APP, expect.objectContaining({ key: 'p2pMode' }), 'thread');
     expect(lastReply()).toBe('cmd.reply_mode.dm_updated');
   });
 

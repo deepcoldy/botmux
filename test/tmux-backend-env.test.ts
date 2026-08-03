@@ -23,7 +23,7 @@
  * before launching the CLI, preserving the CLI's normal environment.
  */
 import { describe, it, expect, afterEach } from 'vitest';
-import { existsSync, mkdtempSync, writeFileSync, chmodSync, rmSync, readFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, writeFileSync, chmodSync, rmSync, readFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -34,7 +34,7 @@ import {
   NON_INTERACTIVE_SHELL_ENV,
   resolveUserShell,
   resolveShellOverride,
-  SHELL_WRAPPER_SCRIPT,
+  shellWrapperScript,
   shellLaunchArgv,
 } from '../src/adapters/backend/tmux-backend.js';
 
@@ -83,6 +83,16 @@ describe('buildBotmuxEnvAssignments()', () => {
     expect(buildBotmuxEnvAssignments({ BOTMUX: '1' }).some(s => s.startsWith('BOTMUX_OWNER_OPEN_ID='))).toBe(false);
   });
 
+  it('forwards the reply-card usage visibility into persistent CLI panes', () => {
+    const out = buildBotmuxEnvAssignments({
+      BOTMUX: '1',
+      BOTMUX_USAGE_DISPLAY: 'footer',
+      PATH: '/usr/bin',
+    });
+    expect(out).toContain('BOTMUX_USAGE_DISPLAY=footer');
+    expect(out).not.toContain('PATH=/usr/bin');
+  });
+
   it('forwards CLAUDE_CODE_RESUME_TOKEN_THRESHOLD so the resume-summary bypass reaches the tmux pane (issue #62)', () => {
     // The worker injects this for claude-code to suppress Claude Code 2.1.x's
     // blocking resume-summary menu. Under the tmux backend it ONLY reaches the
@@ -123,7 +133,7 @@ describe('buildBotmuxEnvAssignments()', () => {
     expect(out).not.toContain('PATH=/usr/bin');
   });
 
-  it('forwards BOTMUX_READY_COMMAND so Hermes can release the first-prompt ready gate', () => {
+  it('forwards BOTMUX_READY_COMMAND so ready-hook CLIs can release the first-prompt ready gate', () => {
     const out = buildBotmuxEnvAssignments({
       BOTMUX: '1',
       BOTMUX_READY_COMMAND: '"/usr/local/bin/node" "/opt/botmux/dist/cli.js" session-ready',
@@ -389,7 +399,7 @@ describe('shellLaunchArgv end-to-end (startup-only env lifecycle)', () => {
         const argv = shellLaunchArgv('/bin/bash', ['-i']);
         const result = spawnSync(
           argv[0],
-          [...argv.slice(1), '-c', SHELL_WRAPPER_SCRIPT, '_', dir, '/usr/bin/env'],
+          [...argv.slice(1), '-c', shellWrapperScript(join(dir, '.botmux', 'bin')), '_', dir, '/usr/bin/env'],
           { encoding: 'utf-8', env: { HOME: dir, PATH: '/usr/bin:/bin' } },
         );
         expect(result.status).toBe(0);
@@ -546,7 +556,7 @@ describe('resolveShellOverride()', () => {
 
 describe('buildDebugKeepShellScript()', () => {
   it('keeps the wrapper alive after the CLI exits (no `exec` on env)', () => {
-    const s = buildDebugKeepShellScript('/bin/zsh');
+    const s = buildDebugKeepShellScript('/bin/zsh', '/home/u/.botmux/bin');
     // Critical: there must NOT be `exec /usr/bin/env` in the debug variant —
     // otherwise the CLI would replace the shell process and the user would
     // lose the prompt we promised them.
@@ -557,13 +567,13 @@ describe('buildDebugKeepShellScript()', () => {
   });
 
   it('preserves the cd-back-to-cwd guard from the normal script', () => {
-    const s = buildDebugKeepShellScript('/bin/bash');
+    const s = buildDebugKeepShellScript('/bin/bash', '/home/u/.botmux/bin');
     expect(s).toMatch(/^cd -- "\$1" && shift/);
     expect(s).toContain('unset DISABLE_AUTO_UPDATE');
   });
 
   it('emits a clear banner so the user knows the CLI exited, not crashed', () => {
-    const s = buildDebugKeepShellScript('/bin/sh');
+    const s = buildDebugKeepShellScript('/bin/sh', '/home/u/.botmux/bin');
     expect(s).toContain('[botmux debug]');
     expect(s).toContain('Type exit to close the session');
     // status code should be surfaced so a non-zero exit is obvious.
@@ -576,7 +586,7 @@ describe('buildDebugKeepShellScript()', () => {
     // a malformed single-quote in the embedded SCRIPT would make the wrapper
     // line desync. The escape pattern `'\\''` (close-quote, escaped quote,
     // reopen-quote) is the standard POSIX way to embed a single quote.
-    const s = buildDebugKeepShellScript(`/weird/shell/with'apostrophe`);
+    const s = buildDebugKeepShellScript(`/weird/shell/with'apostrophe`, '/home/u/.botmux/bin');
     expect(s).toContain(`'/weird/shell/with'\\''apostrophe'`);
   });
 });
@@ -594,7 +604,7 @@ describe('debug keep-shell wrapper end-to-end', () => {
       // We can't easily verify a true interactive shell from spawnSync (it
       // needs a tty), but we CAN verify the script structure with `sh -n`
       // (syntax-check) and that the CLI-stage portion runs to completion.
-      const script = buildDebugKeepShellScript('/bin/sh');
+      const script = buildDebugKeepShellScript('/bin/sh', '/home/u/.botmux/bin');
       // Syntax-check the script in /bin/sh — guards against typos in the
       // template that no test of buildDebugKeepShellScript alone would catch.
       const syntaxCheck = spawnSync('/bin/sh', ['-n', '-c', script], {
@@ -664,7 +674,10 @@ describe('shell wrapper end-to-end (the contract spawn() builds)', () => {
   const envBin = '/usr/bin/env';
   const hasEnvBin = existsSync(envBin);
   const hasBash = existsSync('/bin/bash');
-  const SCRIPT = SHELL_WRAPPER_SCRIPT;
+  // These tests exercise the wrapper's env-inject / unset / cd contract; the exact
+  // bin dir is irrelevant to them, so bake a fixed placeholder. (Core-only vs shared
+  // bin-dir RESOLUTION is covered by the dedicated scrub-order describe below.)
+  const SCRIPT = shellWrapperScript('/home/u/.botmux/bin');
 
   let tmpDir: string | undefined;
   afterEach(() => {
@@ -922,4 +935,56 @@ describe('shell wrapper end-to-end (the contract spawn() builds)', () => {
       }
     },
   );
+});
+
+describe('shellWrapperScript — host-resolved bin dir survives pane env scrub (codex P1)', () => {
+  const hasSh = existsSync('/bin/sh');
+  let tmp: string | undefined;
+  afterEach(() => { if (tmp) { rmSync(tmp, { recursive: true, force: true }); tmp = undefined; } });
+
+  it.skipIf(!hasSh)('bakes the dedicated bin dir as a literal — hits it even when BOTMUX_CORE_ONLY/SESSION_DATA_DIR are scrubbed AND a hostile shared wrapper is on PATH', () => {
+    tmp = mkdtempSync(join(tmpdir(), 'wrapper-scrub-'));
+    // Hostile shared wrapper (what a same-HOME fleet would have) — prints a sentinel.
+    const sharedBin = join(tmp, '.botmux', 'bin');
+    mkdirSync(sharedBin, { recursive: true });
+    writeFileSync(join(sharedBin, 'botmux'), '#!/bin/sh\necho HOST_WRAPPER_SENTINEL\n', { mode: 0o755 });
+    // Dedicated core-only wrapper (what the daemon writes) — prints a different marker.
+    const dedicatedBin = join(tmp, 'core-only', 'data', 'bin');
+    mkdirSync(dedicatedBin, { recursive: true });
+    writeFileSync(join(dedicatedBin, 'botmux'), '#!/bin/sh\necho DEDICATED_WRAPPER\n', { mode: 0o755 });
+
+    // Host resolves the dedicated dir and bakes it into the script as a literal.
+    const script = shellWrapperScript(dedicatedBin);
+    // Run the pane script exactly as the backend does: argv = [_, cwd, CMD...].
+    // The pane env HAS the hostile shared bin on PATH; even if BOTMUX_CORE_ONLY /
+    // SESSION_DATA_DIR were present they get scrubbed by the script's unset clause —
+    // the baked literal is what matters. We resolve `botmux` via `command -v`.
+    const result = spawnSync('/bin/sh', ['-c', script, '_', tmp, 'sh', '-c', 'command -v botmux; botmux'], {
+      encoding: 'utf-8',
+      env: {
+        HOME: tmp,
+        PATH: `${sharedBin}:/usr/bin:/bin`, // hostile shared wrapper FIRST in inherited PATH
+        BOTMUX_CORE_ONLY: '1',              // present but scrubbed by the script
+        SESSION_DATA_DIR: join(tmp, 'core-only', 'data'),
+      },
+    });
+    const out = `${result.stdout ?? ''}`;
+    // Must resolve + run the DEDICATED wrapper, never the hostile shared sentinel.
+    expect(out).toContain(join(dedicatedBin, 'botmux'));
+    expect(out).toContain('DEDICATED_WRAPPER');
+    expect(out).not.toContain('HOST_WRAPPER_SENTINEL');
+  });
+
+  it.skipIf(!hasSh)('normal fleet: bakes ~/.botmux/bin and resolves it', () => {
+    tmp = mkdtempSync(join(tmpdir(), 'wrapper-normal-'));
+    const sharedBin = join(tmp, '.botmux', 'bin');
+    mkdirSync(sharedBin, { recursive: true });
+    writeFileSync(join(sharedBin, 'botmux'), '#!/bin/sh\necho FLEET_WRAPPER\n', { mode: 0o755 });
+    const script = shellWrapperScript(sharedBin); // normal daemon resolves this
+    const result = spawnSync('/bin/sh', ['-c', script, '_', tmp, 'sh', '-c', 'botmux'], {
+      encoding: 'utf-8',
+      env: { HOME: tmp, PATH: '/usr/bin:/bin' },
+    });
+    expect(`${result.stdout ?? ''}`).toContain('FLEET_WRAPPER');
+  });
 });

@@ -9,7 +9,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   verifyHmac, generateToken, parseCookie, decideDashboardAuth,
-  loadPersistedToken, persistToken, loadDashboardSecret, loadOrCreateDashboardSecret,
+  loadPersistedToken, loadOrCreatePersistedToken, persistToken,
+  loadDashboardSecret, loadOrCreateDashboardSecret,
 } from '../src/dashboard/auth.js';
 
 const SECRET = 'a'.repeat(43); // base64url 32 bytes
@@ -81,6 +82,19 @@ describe('token persistence (survives restart, rotates only on `botmux dashboard
     const tok = generateToken();
     persistToken(tokenPath, tok);
     expect(loadPersistedToken(tokenPath)).toBe(tok);
+  });
+
+  it('loadOrCreatePersistedToken creates and persists a missing token', () => {
+    const tok = loadOrCreatePersistedToken(tokenPath);
+    expect(tok).toMatch(/^[A-Za-z0-9_-]{43}$/);
+    expect(loadPersistedToken(tokenPath)).toBe(tok);
+    expect(statSync(tokenPath).mode & 0o777).toBe(0o600);
+  });
+
+  it('loadOrCreatePersistedToken reuses an existing token without rotating it', () => {
+    persistToken(tokenPath, 'existing-token');
+    expect(loadOrCreatePersistedToken(tokenPath)).toBe('existing-token');
+    expect(loadPersistedToken(tokenPath)).toBe('existing-token');
   });
 
   it('persisted token survives a simulated restart (same file, new process)', () => {

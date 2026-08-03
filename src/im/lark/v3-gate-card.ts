@@ -9,6 +9,7 @@
  */
 
 import { config } from '../../config.js';
+import { formatUrlHost } from '../../core/dashboard-url.js';
 import { DEFAULT_HUMAN_GATE_OPTIONS } from '../../workflows/v3/dag.js';
 import { splitV3HostGatePrompt } from '../../workflows/v3/host-bindings.js';
 
@@ -56,7 +57,7 @@ export function v3GateCardNonce(runId: string, waitId: string): string {
 
 /** v3 run 在 dashboard 的详情页 URL（跟 v0.2 的 #/workflows 对称，走 #/v3）。 */
 export function v3RunDetailUrl(runId: string): string {
-  return `http://${config.dashboard.externalHost}:${config.dashboard.port}/#/v3/${encodeURIComponent(runId)}`;
+  return `http://${formatUrlHost(config.dashboard.externalHost)}:${config.dashboard.port}/#/v3/${encodeURIComponent(runId)}`;
 }
 
 export function buildV3GateCard(input: V3GateCardInput): string {

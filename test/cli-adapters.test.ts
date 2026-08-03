@@ -23,6 +23,7 @@ vi.mock('node:child_process', () => ({
 }));
 
 import { createCliAdapterSync } from '../src/adapters/cli/registry.js';
+import { TERMINAL_CANCEL_COOLDOWN_MS } from '../src/adapters/backend/critical-control-key.js';
 import { createClaudeCodeAdapter } from '../src/adapters/cli/claude-code.js';
 import { createAidenAdapter } from '../src/adapters/cli/aiden.js';
 import { createCocoAdapter } from '../src/adapters/cli/coco.js';
@@ -318,6 +319,45 @@ describe('codex buildArgs', () => {
     expect(args).not.toContain('--codex-bin');
   });
 
+  it('bypasses the interactive hook-trust gate right after the approval/sandbox bypass when the toggle is on', () => {
+    // codex 0.14x adds a "Press t to trust" gate for the botmux-installed
+    // ~/.codex/hooks.json hooks; a headless pane can never press `t`, so without
+    // this flag the first Lark turn wedges. It is a DISTINCT flag from the
+    // approval/sandbox bypass — assert both are present and adjacent.
+    const args = adapter.buildArgs({ sessionId: 'sess-4', resume: false, bypassHookTrust: true });
+    expect(args).toContain('--dangerously-bypass-hook-trust');
+    expect(args.indexOf('--dangerously-bypass-hook-trust'))
+      .toBe(args.indexOf('--dangerously-bypass-approvals-and-sandbox') + 1);
+  });
+
+  // The 4-combo acceptance matrix: the hook-trust flag appears ONLY when the
+  // global toggle is on AND the bot is not restricted. disableCliBypass is the
+  // fail-closed lower bound; the toggle expresses "approvals bypassed, hook-trust
+  // review kept". (The worker passes an explicit bypassHookTrust for codex/traex.)
+  it.each([
+    { toggle: true,  restricted: false, flag: true  },
+    { toggle: true,  restricted: true,  flag: false },
+    { toggle: false, restricted: false, flag: false },
+    { toggle: false, restricted: true,  flag: false },
+  ])('hook-trust matrix: toggle=$toggle restricted=$restricted → flag=$flag', ({ toggle, restricted, flag }) => {
+    const args = adapter.buildArgs({
+      sessionId: 'sess-m', resume: false,
+      bypassHookTrust: toggle, disableCliBypass: restricted,
+    });
+    expect(args.includes('--dangerously-bypass-hook-trust')).toBe(flag);
+    // a restricted bot also loses the approval/sandbox bypass (existing behavior)
+    expect(args.includes('--dangerously-bypass-approvals-and-sandbox')).toBe(!restricted);
+  });
+
+  it('omits the hook-trust flag when the toggle is unset (undefined ⇒ no flag at the adapter layer)', () => {
+    // The worker always sends an explicit boolean; a bare call (no bypassHookTrust)
+    // must NOT emit the flag — the default-ON decision lives in config, not here.
+    const args = adapter.buildArgs({ sessionId: 'sess-4', resume: false });
+    expect(args).not.toContain('--dangerously-bypass-hook-trust');
+    // approval/sandbox bypass is independent and still present
+    expect(args).toContain('--dangerously-bypass-approvals-and-sandbox');
+  });
+
   it('injects botmux session id through Codex shell environment policy', () => {
     const args = adapter.buildArgs({ sessionId: 'sess-4', resume: false });
     const idx = args.indexOf('-c');
@@ -329,6 +369,9 @@ describe('codex buildArgs', () => {
     const args = adapter.buildArgs({
       sessionId: 'sess-rpc', resume: true,
       remoteWsUrl: 'ws://127.0.0.1:9931', remoteThreadId: 'thread-abc',
+      // even with BOTH bypass toggles on, the --remote viewer early-returns before
+      // baseArgs, so neither flag can leak into the pure viewer args
+      bypassHookTrust: true, disableCliBypass: false,
     });
     // pure --remote viewer: no paste-mode bypass flag, no stale resume path
     expect(args).toEqual([
@@ -341,6 +384,9 @@ describe('codex buildArgs', () => {
     expect(args.indexOf('thread-abc')).toBeGreaterThan(cIdx);
     // no interactive-paste bypass flag leaks into the viewer args
     expect(args).not.toContain('--dangerously-bypass-approvals-and-sandbox');
+    // the app-server (behind --remote) rejects --dangerously-bypass-hook-trust and
+    // runs enabled hooks without a trust gate anyway, so it must NOT leak here either
+    expect(args).not.toContain('--dangerously-bypass-hook-trust');
   });
 
   it('traex RPC mode: same --remote viewer args + update-check disabled', () => {
@@ -348,6 +394,7 @@ describe('codex buildArgs', () => {
     const args = traex.buildArgs({
       sessionId: 'sess-rpc', resume: true,
       remoteWsUrl: 'ws://127.0.0.1:9932', remoteThreadId: 'thread-xyz',
+      bypassHookTrust: true,
     });
     expect(args).toEqual([
       '--remote', 'ws://127.0.0.1:9932', 'resume', '--no-alt-screen',
@@ -386,9 +433,10 @@ describe('codex buildArgs', () => {
   });
 
   it('passes the effective working directory as Codex agent root', () => {
-    const args = adapter.buildArgs({ sessionId: 'sess-4', resume: false, workingDir: '/repo/root' });
+    const args = adapter.buildArgs({ sessionId: 'sess-4', resume: false, workingDir: '/repo/root', bypassHookTrust: true });
     expect(args).toEqual([
       '--dangerously-bypass-approvals-and-sandbox',
+      '--dangerously-bypass-hook-trust',
       '--no-alt-screen',
       '-c',
       'shell_environment_policy.set.BOTMUX_SESSION_ID="sess-4"',
@@ -410,6 +458,8 @@ describe('codex buildArgs', () => {
       '-C',
       '/repo/root',
     ]);
+    // a restricted bot must not silently gain hook trust either
+    expect(args).not.toContain('--dangerously-bypass-hook-trust');
   });
 
   it('always disables the startup update picker for botmux-managed launches', () => {
@@ -916,6 +966,38 @@ describe('oh-my-pi buildArgs', () => {
     expect(events).toEqual(['text:524', 'text:524', 'keys:C-c']);
   });
 
+  it('keeps its recovery Ctrl+C outside the backend-injected cancel window', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-07-28T00:00:00.000Z'));
+    try {
+      const isolatedAdapter = createOhMyPiAdapter('/usr/bin/omp');
+      const events: Array<{ key: string; at: number }> = [];
+      const backendCancelAt = Date.now();
+      const pty = {
+        write() {},
+        sendText() { return false; },
+        sendSpecialKeys(...keys: string[]) {
+          events.push({ key: keys.join(','), at: Date.now() });
+          return true;
+        },
+        lastInjectedCancelAt: backendCancelAt,
+      } as PtyHandle & { readonly lastInjectedCancelAt: number };
+
+      const write = isolatedAdapter.writeInput(pty, 'ambiguous paste');
+      await vi.advanceTimersByTimeAsync(TERMINAL_CANCEL_COOLDOWN_MS - 1);
+      expect(events).toEqual([]);
+
+      await vi.advanceTimersByTimeAsync(1);
+      await expect(write).resolves.toEqual({ submitted: false });
+      expect(events).toEqual([{
+        key: 'C-c',
+        at: backendCancelAt + TERMINAL_CANCEL_COOLDOWN_MS,
+      }]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('clears the OMP composer when Enter retries are all dropped', async () => {
     const events: string[] = [];
     const pty = {
@@ -1060,8 +1142,15 @@ describe('hermes buildArgs', () => {
     expect(adapter.passesInitialPromptViaArgs).toBeFalsy();
   });
 
-  it('uses explicit ready signal gate without type-ahead', () => {
-    expect(adapter.injectsReadyHook).toBe(true);
+  it('relies on ❯ readyPattern without ready-gate or type-ahead', () => {
+    // #353 armed the ready-gate via injectsReadyHook on the premise that Hermes
+    // shell-executes BOTMUX_READY_COMMAND at composer-ready. The shipped Hermes
+    // never honored that contract (no composer-ready hook exists), so the gate
+    // always fell through its 45s timeout, delaying the first cold-start message.
+    // Hermes must NOT arm the gate; its ❯ readyPattern (input box up in ~3.6s) is
+    // the earliest reliable readiness signal.
+    expect(adapter.injectsReadyHook).toBeFalsy();
+    expect(adapter.readyPattern?.source).toBe('❯');
     expect(adapter.deferFirstPromptTimeoutUntilReady).toBe(true);
     expect(adapter.supportsTypeAhead).toBeFalsy();
   });
@@ -1259,6 +1348,14 @@ describe('readyPattern', () => {
     expect(adapter.readyPattern!.test('\n  › 2. Skip')).toBe(false);
   });
 
+  it('codex defers the first-prompt timeout until its readyPattern appears', () => {
+    // Codex can cold-start slower than the worker's 15s soft timeout; keep the
+    // first Lark message queued until the composer is visible.
+    const adapter = createCodexAdapter('/bin/codex');
+    expect(adapter.deferFirstPromptTimeoutUntilReady).toBe(true);
+    expect(adapter.supportsTypeAhead).toBe(true);
+  });
+
   it('traex matches prompt and context indicators', () => {
     const adapter = createTraexAdapter('/bin/traex');
     expect(adapter.readyPattern).toBeDefined();
@@ -1350,10 +1447,16 @@ describe('readyPattern', () => {
 });
 
 describe('traex automation trust flags', () => {
-  it('bypasses both permission and hook-review gates for automation by default', () => {
-    const args = createTraexAdapter('/bin/traex').buildArgs({ sessionId: 'traex-goal', resume: false });
+  it('bypasses both permission and hook-review gates for automation when the hook-trust toggle is on', () => {
+    const args = createTraexAdapter('/bin/traex').buildArgs({ sessionId: 'traex-goal', resume: false, bypassHookTrust: true });
     expect(args).toContain('--dangerously-bypass-approvals-and-sandbox');
     expect(args).toContain('--dangerously-bypass-hook-trust');
+  });
+
+  it('keeps the approval bypass but drops hook-trust when the global toggle is off', () => {
+    const args = createTraexAdapter('/bin/traex').buildArgs({ sessionId: 'traex-goal', resume: false, bypassHookTrust: false });
+    expect(args).toContain('--dangerously-bypass-approvals-and-sandbox');
+    expect(args).not.toContain('--dangerously-bypass-hook-trust');
   });
 
   it('does not bypass permissions or hook trust for a restricted bot', () => {
@@ -1361,6 +1464,7 @@ describe('traex automation trust flags', () => {
       sessionId: 'traex-goal',
       resume: false,
       disableCliBypass: true,
+      bypassHookTrust: true, // even with the toggle on, disableCliBypass wins
     });
     expect(args).not.toContain('--dangerously-bypass-approvals-and-sandbox');
     expect(args).not.toContain('--dangerously-bypass-hook-trust');
@@ -1420,6 +1524,10 @@ describe('systemHints', () => {
     const hints = factory().systemHints;
     expect(hints.length).toBeGreaterThan(0);
     expect(hints.some(h => h.includes('botmux send'))).toBe(true);
+  });
+
+  it('traex systemHints declare the exact no-reply protocol', () => {
+    expect(createTraexAdapter('/bin/traex').systemHints.join('\n')).toContain('BOTMUX_NO_REPLY');
   });
 });
 
@@ -1995,16 +2103,29 @@ describe('kiro-cli buildArgs', () => {
 });
 
 describe('traex/coco sandbox authPaths', () => {
-  it('traex keeps the whole ~/.trae/cli real in the sandbox (codex-based, same SQLite lock hazard)', () => {
-    // traex keeps codex-style state_*.sqlite / logs_*.sqlite + rollout sessions
-    // under ~/.trae/cli; the daemon bridge reads them at the REAL path, and the
-    // overlayfs home lacks the fcntl locks SQLite needs (see codex.ts).
+  it('traex keeps ~/.trae/cli real (RW SQLite state) and exposes migration markers READ-ONLY (not the whole ~/.trae)', () => {
+    // authPaths (readWrite) stays scoped to cli/ — widening to the whole ~/.trae
+    // would give a chat-driven sandbox RW to sibling hooks/plugins/skills/config
+    // that other bots execute. The first-run "Legacy TRAE CLI data detected"
+    // migration prompt (which wedges goal-mode's human-less PTY) is instead
+    // silenced by exposing the done-markers READ-ONLY via sandboxReadonlyPaths.
     const adapter = createTraexAdapter('/bin/traex');
     expect(adapter.authPaths).toEqual(['~/.trae/cli']);
+    expect(adapter.sandboxReadonlyPaths?.()).toEqual([
+      '~/.trae/.coco-rollouts-migrated',
+      '~/.trae/.coco-migrated',
+    ]);
   });
 
-  it('coco keeps ~/.trae/cli (shared trae state/SQLite) AND ~/.cache/coco (transcripts the bridge reads) real', () => {
+  it('coco keeps ~/.trae/cli + ~/.cache/coco real (RW) and exposes the same migration markers READ-ONLY', () => {
+    // Coco runs the same traecli binary as traex → same migration prompt; markers
+    // exposed read-only, authPaths NOT widened past cli/ (+ the coco cache the
+    // transcript bridge reads).
     const adapter = createCocoAdapter('/bin/coco');
     expect(adapter.authPaths).toEqual(['~/.trae/cli', '~/.cache/coco']);
+    expect(adapter.sandboxReadonlyPaths?.()).toEqual([
+      '~/.trae/.coco-rollouts-migrated',
+      '~/.trae/.coco-migrated',
+    ]);
   });
 });

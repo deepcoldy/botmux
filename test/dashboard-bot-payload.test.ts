@@ -2,6 +2,26 @@ import { describe, expect, it } from 'vitest';
 import { botDefaultsPayload, botSummaryPayload } from '../src/dashboard/bot-payload.js';
 
 describe('dashboard bot payload helpers', () => {
+  it('keeps every editable Bot Defaults field in the aggregated /api/bots row', () => {
+    const row = botDefaultsPayload(
+      { larkAppId: 'app_contract', botName: 'BotContract', cliId: 'codex', model: 'gpt-5' },
+      {},
+    );
+    const editableFields = [
+      'agentSelectionKey', 'autoGrantRequestCards', 'autoStartOnGroupJoin',
+      'autoStartOnGroupJoinPrompt', 'autoStartOnNewTopic', 'backendType',
+      'botToBotSameDir', 'brandLabel', 'canTalkDaemonCommands', 'codexAppCleanInput',
+      'customPassthroughCommands', 'defaultOncall', 'defaultWorkingDir',
+      'defaultWorkingDirAutoWorktree', 'disableStreamingCard', 'docSubscribeDefaultMode',
+      'env', 'launchShell', 'maxLiveWorkers', 'messageQuotaDefaultLimit', 'model',
+      'overloadAlert', 'p2pMode', 'privateCard', 'regularGroupMentionMode',
+      'regularGroupReplyMode', 'restrictGrantCommands', 'riff', 'sandbox', 'sandboxPaths',
+      'silentTurnReactions', 'skillInjection', 'startupCommands', 'substituteMode',
+      'summaryRange', 'writableTerminalLinkInCard',
+    ];
+    expect(Object.keys(row)).toEqual(expect.arrayContaining(editableFields));
+  });
+
   it('includes authoritative cliId in group roster bot summaries', () => {
     expect(botSummaryPayload({
       larkAppId: 'cli_traex',
@@ -79,11 +99,47 @@ describe('dashboard bot payload helpers', () => {
     });
   });
 
+  it('projects launchShell so the dashboard preserves it after refresh', () => {
+    const daemon = { larkAppId: 'app_shell', botName: 'BotShell', cliId: 'codex' };
+    expect(botDefaultsPayload(daemon, { launchShell: '/usr/bin/zsh' })).toMatchObject({
+      launchShell: '/usr/bin/zsh',
+    });
+    expect(botDefaultsPayload(daemon, {})).toMatchObject({ launchShell: '' });
+    expect(botDefaultsPayload(daemon, { launchShell: ['zsh'] as any })).toMatchObject({
+      launchShell: '',
+    });
+  });
+
+  it('projects docSubscribeDefaultMode so the dashboard preserves it after refresh', () => {
+    const daemon = { larkAppId: 'app_doc', botName: 'BotDoc', cliId: 'claude-code' };
+    expect(botDefaultsPayload(daemon, { docSubscribeDefaultMode: 'all' })).toMatchObject({
+      docSubscribeDefaultMode: 'all',
+    });
+    expect(botDefaultsPayload(daemon, {})).toMatchObject({
+      docSubscribeDefaultMode: 'mention-only',
+    });
+    expect(botDefaultsPayload(daemon, { docSubscribeDefaultMode: 'invalid' })).toMatchObject({
+      docSubscribeDefaultMode: 'mention-only',
+    });
+  });
+
   it('projects Codex App clean history mode as an explicit default-off boolean', () => {
     const daemon = { larkAppId: 'app_codex', botName: 'Codex', cliId: 'codex-app' };
     expect(botDefaultsPayload(daemon, {})).toMatchObject({ codexAppCleanInput: false });
     expect(botDefaultsPayload(daemon, { codexAppCleanInput: true }))
       .toMatchObject({ codexAppCleanInput: true });
+  });
+
+  it('projects the usage-display mode, defaulting to streaming and honoring legacy/off', () => {
+    const daemon = { larkAppId: 'app_usage', botName: 'Usage', cliId: 'codex' };
+    expect(botDefaultsPayload(daemon, {})).toMatchObject({ usageDisplay: 'streaming' });
+    expect(botDefaultsPayload(daemon, { usageDisplay: 'footer' }))
+      .toMatchObject({ usageDisplay: 'footer' });
+    expect(botDefaultsPayload(daemon, { usageDisplay: 'off' }))
+      .toMatchObject({ usageDisplay: 'off' });
+    // Legacy boolean projects to 'off'.
+    expect(botDefaultsPayload(daemon, { showUsageInCardFooter: false }))
+      .toMatchObject({ usageDisplay: 'off' });
   });
 
   it('projects sandboxPaths three tiers, defaulting to null when absent or malformed', () => {

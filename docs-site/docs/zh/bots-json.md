@@ -2,6 +2,8 @@
 
 通过 `~/.botmux/bots.json` 配置机器人。运行 `botmux setup` 交互式创建，或手动编辑。文件是一个数组，每个元素是一个 bot（生产环境一个 bot 对应一个独立 daemon 进程）。
 
+> **多数字段可选**——只填 `larkAppId` / `larkAppSecret` 就能跑起来，其余按需增配。**适用**：想手动调 CLI / 模型 / 工作目录 / 权限 / 沙箱等；日常配置更推荐用 dashboard 的 Bot 配置页（改的是同一份 `bots.json`）。改完 `botmux restart` 生效。
+
 ```json
 [
   {
@@ -46,7 +48,7 @@
 | `model` | 启动 CLI 用的模型名（如 `claude --model opus`）；留空走 CLI 默认。同一 `cliId` 的多个 bot 可跑不同模型。各适配器的 `modelChoices` 是 `botmux setup` 里给出的候选 |
 | `cliPathOverride` | CLI 入口绝对路径，用于套 wrapper / router（ccr、claude-w、aiden-x-claude 等） |
 | `disableCliBypass` | `true` 时不自动追加 CLI 的免审批 / 沙箱绕过参数（`--yolo`、`--dangerously-*`）；缺省 / `false` 保持原行为 |
-| `backendType` | 会话后端，可选 `pty` / `tmux` / `herdr` / `zellij`。留空**自动检测**：tmux 可用选 `tmux`，否则 `pty`（`herdr`、`zellij` 不会被自动选中，需显式指定）。`tmux` / `herdr` / `zellij` 都是持久会话，对应二进制探测失败时自动回落 `pty`（`zellij` 需 ≥ 0.44）；`pty` 直连进程、不跨重启持久。见 [tmux 后端](/tmux) |
+| `backendType` | 会话后端，可选 `pty` / `tmux` / `herdr` / `zellij`。**留空默认 `tmux`**（PTY 已退役自动回落）：tmux/herdr/zellij 这类持久后端在本机不可用时**硬拦截**、弹卡提示安装，**不再静默降级 pty**（`zellij` 需 ≥ 0.44）。`pty` 仅作显式兜底（`backendType:"pty"` 或 `BACKEND_TYPE=pty`）——直连进程、**不跨 daemon 重启存活**。见 [tmux 后端](/tmux) |
 | `launchShell` | 启动 CLI 用的 shell，覆盖 daemon 的 `$SHELL`：填 shell 名（`zsh` / `bash` / `sh`）或绝对路径（如 `/usr/bin/zsh`）。用于登录 `$SHELL`（如 bash）的 rc 文件里有 `exec zsh` 之类跳转、在 botmux 的 `bash -i` 启动里把 CLI 顶掉、导致会话起不来（裸壳里 `parse error`）的场景——指定后直接用它启动、绕开被跳过的 rc。**注意**：PATH / nvm / pnpm 等要放进所选 shell 的 rc（如 `.zshrc` / `.zprofile`）。留空＝用 `$SHELL`。下个会话生效；仅 `tmux` / `zellij` 后端（`pty` 直接 exec CLI，本就不受影响）。也可在 dashboard「机器人默认设置 → 启动 Shell」或 `/config launchShell <值>` 配置 |
 | `lang` | 该 bot 的界面语言 `zh` / `en`；留空回落 `BOTMUX_LANG` / `LANG` 环境变量 |
 | `customPassthroughCommands` | 在固定透传白名单和当前 CLI adapter 默认放行命令之上，额外放行透传给底层 CLI 的 slash 命令，如 `["/export"]`（Claude Code / Codex 的 `/goal` 已默认放行）。自动归一化（缺失的 `/` 自动补、转小写、仅留 `[a-z0-9:_-]`、去重）；会遮蔽 botmux daemon 命令（如 `/status`）的项会被丢弃，配了也不生效。用 `/list-slash-command` 查看完整放行清单。见 [斜杠命令](/slash-commands) |
@@ -132,11 +134,14 @@
 | `sandboxReadonlyPaths` | 在沙盒内额外只读挂载的已存在路径，适合共享源码快照、参考仓库或生成文档等只允许查看、不允许修改的输入 |
 | `sandboxNetwork` | 沙盒会话的网络策略。缺省 / `true` 保留当前网络和代理访问；`false` 添加 `--unshare-net`，阻断普通网络出口 |
 
+> ZMX 无法执行文件沙盒或实际生效的读隔离，开启这些边界的配置组合会 fail closed，详见 [ZMX 后端边界](/zmx#不支持的组合)。
+
 ## 卡片与终端
 
 | 字段 | 说明 |
 |------|------|
 | `brandLabel` | 卡片底部品牌文案。`undefined`=默认 `botmux` 链接；`""`=隐藏；其它字符串=原样渲染（支持 markdown）。纯样式，不影响路由 / 权限 |
+| `showUsageInCardFooter` | 回复卡片页脚是否展示 Agent CLI 原生提供的 Context / Token 用量。缺省 / `true`=展示，`false`=同时隐藏两项；单项数据缺失时仍只省略缺失项。仅控制卡片展示，不停止 Usage Ledger 或其它统计 |
 | `disableStreamingCard` | `true` 时彻底不发实时流式 session 卡片（web 终端仍跑、最终答复仍经 `botmux send` 到达，只是没有自动刷新的状态卡）。给嫌实时卡吵的用户 |
 | `silentTurnReactions` | `true` 时，无卡片会话不再给触发消息添加 GoGoGo / DONE reaction。只影响 `disableStreamingCard` 或 `noCardChats` 关闭实时卡片后的轻量状态提示；默认 `false` |
 | `receivedReactionEmoji` | 无卡片会话「已收到」reaction 的飞书 emoji_type；`undefined`=默认 `GoGoGo`（冲!）。自由字符串，填错只是静默不加表情（best-effort） |
@@ -185,6 +190,42 @@
 | 字段 | 说明 |
 |------|------|
 | `voice` | 该 bot 的语音引擎覆盖，按字段合并到 `~/.botmux/config.json` 的全局 `voice` 块之上（per-bot 优先）。有可用语音凭据时，回复卡片会出现「🔊 语音总结」按钮。见 [语音总结](/voice) |
+
+## 会议监听角色与群内输出形式
+
+`vcMeetingAgent.meetingConsumer.consumerProfiles` 可以定义通用的会议监听角色。`responseMode` 与 `listenerDelivery.placement` 是两个独立维度：
+
+Dashboard 的“会议角色预设”提供本地内置模板库，当前包含“会议重要信息同步”“会议纪要与行动项”“会议主持”“方案评审与风险挑战”“访谈与需求洞察”。点击“使用此模板”会复制出一个普通、可完整编辑的 profile；之后修改模板不会改写用户配置。模板目录带稳定的 `templateId`、版本和来源，未来可以在同一模型上接入社区源。本期不联网、不上传模板使用情况，因此不提供热度或使用量排行。
+
+- `responseMode: "silent"`：自动模型输出不可见；适合只做内部处理或通过受管会议能力执行动作。
+- `responseMode: "listener_thread"`：允许把自动模型输出发到会议监听群，需要 `listener.output.request` capability。
+- `listenerDelivery.placement: "auto"`：兼容旧行为，沿用当前会话的群/话题路由；省略该字段等同于 `auto`。
+- `listenerDelivery.placement: "chat"`：每次同步都作为群顶层消息发送。
+- `listenerDelivery.placement: "topic"`：首条有效同步作为固定话题根消息，后续同步都回复到同一话题；移除并重新启用该 profile 后会开启新话题。
+
+`listener_thread` 的自动输出使用 botmux 内部的 `skip | publish` 控制协议：Agent 判断当前是否值得发布，botmux 只在 `publish` 时把消息正文发到飞书，控制 JSON 本身不会出现在群里。该协议不做语义指纹去重，也不提供 debounce/interval 配置；是否为新信息、是否继续观察以及何时发布，都由 Agent 根据 profile prompt 和完整会议上下文判断。格式异常会 fail closed，不会把模型原始控制文本发到群里。显式人工消息仍按原引用关系回复，不走此协议。
+
+下面是一个“会议重要信息同步”预设。它不包含事故专用结构，只通过 prompt 定义“什么值得同步”，因此也适用于项目评审、发布协调等会议：
+
+```json
+{
+  "id": "important-sync",
+  "agentAppId": "cli_your_agent_app_id",
+  "label": "会议重要信息同步",
+  "role": "important-information-sync",
+  "instructions": "持续监听会议，只发布对群内协作者有实际价值的新信息：已确认的结论或决定、状态变化、明确阻塞或风险、需要群内人员知晓或行动的事项。讨论尚未形成明确变化时先不发布；是否继续观察以及何时发布，由你根据会议语义自行判断。忽略讨论过程、重复表述、寒暄和未经确认的猜测。每次只发布相对上次的新内容，使用简洁中文；有负责人、截止时间或影响范围时一并写明。此前信息的时间、负责人、范围、状态或结论发生修正时，必须作为新信息发布，不能因为其他内容大部分一致而忽略。字幕发生修订时重新判断，但不要重复发布未发生变化的事项。",
+  "filter": {
+    "activityTypes": ["transcript_received", "chat_received"]
+  },
+  "responseMode": "listener_thread",
+  "listenerDelivery": {
+    "placement": "topic"
+  },
+  "capabilities": ["listener.output.request", "meeting.read"]
+}
+```
+
+`agentAppId` 是实际执行该角色的 bot App ID。把 profile id 加入 `defaultConsumerIds`，并将 `defaultMode` 设为 `agents`，可让它在监听开始时默认启用；否则可在会中消费者选择卡片里手动启用。
 
 ## 运行时状态（自动维护，勿手改）
 

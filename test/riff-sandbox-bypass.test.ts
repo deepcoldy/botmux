@@ -47,7 +47,7 @@ describe('reconcileRiffBackendType (finding G — pairing invariant at the spawn
 
 describe('isValidRiffBaseUrl (finding G — fail-fast gate)', () => {
   it('accepts http(s) URLs only', () => {
-    expect(isValidRiffBaseUrl('https://riff-infra-boe.bytedance.net')).toBe(true);
+    expect(isValidRiffBaseUrl('https://riff-boe.example.com')).toBe(true);
     expect(isValidRiffBaseUrl('http://localhost:3000')).toBe(true);
   });
   it('rejects empty / undefined / non-http values (the `{}` config save case)', () => {

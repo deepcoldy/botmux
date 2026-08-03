@@ -13,6 +13,12 @@ export interface PtyHandle {
   /** Send special keys via tmux send-keys, e.g. 'Enter', 'Escape', 'C-c' (tmux mode only).
    *  Returns `false` on an unconfirmed write (see sendText). */
   sendSpecialKeys?(...keys: string[]): void | boolean;
+  /**
+   * Epoch-ms timestamp of the most recent Ctrl+C the backend may have injected.
+   * Snapshot transports record this before an ambiguous send so adapters with
+   * double-Ctrl+C exit gestures can keep their own recovery outside the window.
+   */
+  readonly lastInjectedCancelAt?: number;
   /** Paste text via tmux load-buffer + paste-buffer (auto-brackets if terminal supports it). */
   pasteText?(text: string): void;
   /** Absolute path to Claude Code's session JSONL; set by worker for claude-code adapter.
@@ -45,6 +51,13 @@ export type RunnerSubmissionDisposition =
   | 'untouched'
   | 'flushed_invalid'
   | 'dirty_unknown';
+
+/** Optional per-input correlation metadata. Adapters that do not need it may
+ * ignore it; runner-based adapters use the immutable botmux/Lark turn id to
+ * keep protocol ids separate from reply-routing ids. */
+export interface WriteInputContext {
+  turnId?: string;
+}
 
 /** A session discovered on disk that botmux can resume (import) into a topic —
  *  surfaced by `/adopt`'s second filter. Unlike an AdoptableSession (a live
@@ -110,8 +123,18 @@ export interface CliAdapter {
      *  `--model` flag (or equivalent) inject it here; adapters whose CLI has no
      *  such concept simply ignore the field. Empty / undefined → CLI default. */
     model?: string;
+    /** Optional per-turn reasoning effort (codex `model_reasoning_effort`).
+     *  Only codex/codex-app adapters honor it; others ignore. */
+    reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh';
     /** When true, do not add adapter-default flags that bypass CLI approvals or disable sandboxing. */
     disableCliBypass?: boolean;
+    /** Codex-family only: when true (default from the global `bypassCodexHookTrust`
+     *  toggle, still ANDed with `!disableCliBypass` by the worker), pass
+     *  `--dangerously-bypass-hook-trust` so a headless plain-TUI launch does not
+     *  wedge on Codex 0.14x's interactive "Press t to trust" gate. Undefined ⇒
+     *  treated as false by adapters (the worker always sends an explicit boolean
+     *  for codex/traex). Does NOT apply to `--remote`/app-server/exec paths. */
+    bypassHookTrust?: boolean;
     /** Optional session-scoped skill plugin/root prepared by botmux. */
     skillPluginDir?: string;
     /** True when this session runs under per-bot read isolation (the worker
@@ -206,6 +229,7 @@ export interface CliAdapter {
   writeInput(
     pty: PtyHandle,
     content: string,
+    context?: WriteInputContext,
   ): Promise<void | {
     submitted: boolean;
     cliSessionId?: string;
@@ -225,6 +249,7 @@ export interface CliAdapter {
     pty: PtyHandle,
     content: string,
     codexAppInput: CodexAppTurnInput,
+    context?: WriteInputContext,
   ): Promise<void | {
     submitted: boolean;
     cliSessionId?: string;
@@ -344,12 +369,10 @@ export interface CliAdapter {
   readonly supportsReadIsolation?: boolean;
 
   /** CLI 支持会话内移动工作目录（如 Claude Code ≥2.1.205 的 /cd）。
-   *  true → botmux cd 走 idle 注入（不重启进程）；缺省 → 杀进程冷启动兜底。
-   *  ⚠️ 这是家族级声明，不做运行时版本探测：若部署的二进制过旧（或 fork 变体
-   *  没有会话内 /cd），注入会被 TUI 当 unknown command 静默吞掉——daemon 记录
-   *  已重钉、进程仍留在旧目录，直到下一次 respawn 才收敛（inject_command 已同步
-   *  lastInitConfig.workingDir，任何重启路径都落新目录）。部署前提见
-   *  docs/roles/deploy-runbook.md 第 1 步的版本检查。 */
+   *  ⚠️ 历史能力位，**已从角色切换路由退场**：`botmux role switch` 现统一走「杀 CLI +
+   *  `--resume` 在新 cwd respawn」（适配器无关，见 dashboard-ipc-server 的 cd 路由与
+   *  worker 的 restart case），不再按本字段分流 idle 注入 vs 冷启动。字段保留仅供未来
+   *  可能的会话内移动复用，当前无生产读取点。 */
   readonly supportsSessionCwdMove?: boolean;
 
   /** When true, the worker's soft first-prompt timeout keeps queued input held
@@ -388,15 +411,15 @@ export interface CliAdapter {
   readonly claudeStateJsonPath?: string;
 
   /** Paths (files or dirs) holding THIS CLI's auth / login state that must stay
-   *  REAL + writable inside the file sandbox. The sandbox isolates writes (so the
-   *  agent's project edits are reviewable), but a CLI's token refresh / login
-   *  must PERSIST to the real auth — otherwise the sandboxed CLI loses its login
-   *  (see seed's `bytecloud-auth`). The sandbox binds each existing path rw over
-   *  the isolated overlay so auth reads/refreshes/logins hit the real files.
-   *  `~` is expanded. Default to NARROW (auth only) so session history stays
-   *  isolated — but widen to the CLI's whole state dir when it keeps SQLite DBs
-   *  there (e.g. codex): the overlayfs home lacks the POSIX fcntl locks SQLite
-   *  needs, so a narrow carve-out leaves the CLI unable to start.
+   *  REAL + writable inside the file sandbox. The sandbox isolates the filesystem
+   *  to a deny-by-default whitelist (so the agent only sees the rule paths), but a
+   *  CLI's token refresh / login must PERSIST to the real auth — otherwise the
+   *  sandboxed CLI loses its login (see seed's `bytecloud-auth`). The sandbox binds
+   *  each existing path rw (real host path) so auth reads/refreshes/logins hit the
+   *  real files. `~` is expanded. Default to NARROW (auth only) so session history
+   *  stays out of the sandbox — but widen to the CLI's whole state dir when it keeps
+   *  SQLite DBs there (e.g. codex): only whitelisted paths exist in the sandbox, so
+   *  a narrow carve-out leaves the DB dir absent and the CLI unable to start.
    *  undefined / empty → no carve-out. */
   readonly authPaths?: readonly string[];
 
@@ -412,10 +435,21 @@ export interface CliAdapter {
    *  app-server) is the one that must survive `--tmpfs /run`.
    *
    *  Return ONLY executable paths — never plain path args like the working dir,
-   *  whose parent dir re-bind would shadow the project overlay and widen exposure.
+   *  whose parent dir re-bind would shadow the project bind and widen exposure.
    *  Resolved lazily / read AFTER buildArgs() (so a lazily-resolved bin is cached).
    *  Missing/empty → no extra re-expose. */
   sandboxExtraExecPaths?(): readonly string[];
+
+  /** Absolute paths (files or dirs) this adapter needs visible READ-ONLY inside
+   *  the file sandbox — distinct from `authPaths`, which are bound READ-WRITE.
+   *  Use this for host state the CLI only READS (e.g. traex/coco's first-run
+   *  migration done-markers at the ~/.trae root): exposing them read-only lets
+   *  the CLI see them without widening the writable surface to sibling
+   *  hook/plugin/skill code. Wired into the fs-policy `readonlyRoots` channel
+   *  (→ readOnly rule). `~`-expanded + existence-filtered by the worker, so
+   *  listing a path absent on this host is a no-op. Missing/empty → nothing extra
+   *  exposed. Return ONLY paths safe to reveal read-only (never credentials). */
+  sandboxReadonlyPaths?(): readonly string[];
 
   /** Extra env merged into the spawned child's environment. Used by Claude-family
    *  forks to point the CLI at its data root (e.g. Seed's `CLAUDE_CONFIG_DIR`).

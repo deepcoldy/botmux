@@ -1,6 +1,8 @@
 # 5-minute quick setup
 
-> 💡 **TL;DR**: `npm i -g botmux` → `botmux setup` to scan a QR code and create the app, pick a CLI, fill in the working directory → `botmux start` → `botmux autostart enable` → add the bot to a group and start chatting.
+> 💡 **TL;DR**: `npm i -g botmux` → `botmux setup` (**a single Lark QR scan** creates the app + configures all permissions + publishes) → `botmux start` → `botmux autostart enable` → add the bot to a group and start chatting.
+
+**Before you start**: confirm the [Prerequisites](/en/prerequisites) (Node ≥ 22, target CLI installed and logged in) — a missing prerequisite here is the most common cause of "installed but won't connect."
 
 ## Step 1 · Install
 
@@ -8,7 +10,7 @@
 npm install -g botmux
 ```
 
-Requires **Node.js ≥ 22**, with at least one AI coding CLI already installed and signed in locally (`claude` / `codex` / `cursor-agent` / `gemini` / `opencode` / `coco` / `agy`, etc.). Installing **tmux** (≥3.x) is recommended — once installed, session persistence is enabled automatically.
+Requires **Node.js ≥ 22**, with at least one AI coding CLI already installed and signed in locally (`claude` / `codex` / `cursor-agent` / `gemini` / `opencode` / `coco` / `agy`, etc.). **The default session backend is tmux (≥3.x), so install it** — when it's unavailable botmux hard-gates with a card instead of silently downgrading to pty; only pick an explicit backend (`BACKEND_TYPE=pty` or per-bot `backendType`: `pty`/`herdr`/`zellij`) if you truly need a tmux-free environment (riff is a cloud agent and doesn't occupy a local backend).
 
 ## Step 2 · Configure (`botmux setup`)
 

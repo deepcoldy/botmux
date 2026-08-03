@@ -628,7 +628,11 @@ export async function handleWebhookRoute(
       },
       ...(connector.promptEnvelope.instruction ? { instruction: connector.promptEnvelope.instruction } : {}),
       ...(presentation ? { presentation } : {}),
-      options: { ...(dedupKey ? { dedupKey } : {}), ...responseOptions },
+      options: {
+        ...(dedupKey ? { dedupKey } : {}),
+        ...responseOptions,
+        ...(connector.suppressFinalOutput ? { suppressFinalOutput: true } : {}),
+      },
     };
 
     const result = await dispatchTriggerRequest(trigger, deps, auditMeta());
@@ -679,7 +683,10 @@ export async function handleWebhookRoute(
     },
     ...(connector.promptEnvelope.instruction ? { instruction: connector.promptEnvelope.instruction } : {}),
     ...(presentation ? { presentation } : {}),
-    options: responseOptions,
+    options: {
+      ...responseOptions,
+      ...(connector.suppressFinalOutput ? { suppressFinalOutput: true } : {}),
+    },
   };
 
   const result = await dispatchTriggerRequest(trigger, deps, auditMeta());

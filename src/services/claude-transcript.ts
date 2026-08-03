@@ -28,6 +28,17 @@ export interface TranscriptEvent {
      * reasons such as `end_turn` / `stop_sequence` close the logical turn. */
     stop_reason?: string | null;
   };
+  /** API-error records. When the model call fails, Claude Code writes a
+   *  `type:"assistant"` line with `isApiErrorMessage:true` and a machine
+   *  `error` code (e.g. "rate_limit", "server_error", "authentication_failed",
+   *  "unknown") plus the HTTP `apiErrorStatus`. These carry a human-readable
+   *  text block ("You've hit your session limit · resets 10:40pm"), so they
+   *  must be excluded from assistant-reply forwarding (they are not a model
+   *  answer) and, for rate_limit, routed to usage-limit detection instead. */
+  error?: string;
+  errorDetails?: unknown;
+  isApiErrorMessage?: boolean;
+  apiErrorStatus?: number;
   /** Present on `type:"attachment"` lines. The bridge attribution queue
    *  treats `attachment.type === "queued_command"` as a turn-start signal —
    *  Claude writes one of these the moment it dequeues a type-ahead
@@ -40,6 +51,33 @@ export interface TranscriptEvent {
     prompt?: unknown;
     commandMode?: string;
   };
+}
+
+/**
+ * True when an event is Claude Code's structured rate-limit record: an
+ * `isApiErrorMessage` line whose machine `error` code is "rate_limit" (429).
+ * This is the authoritative "we are rate limited" signal — far more reliable
+ * than scraping the TUI, and it lands exactly at the turn's terminal boundary.
+ * The caller turns this into a `limited` session state via
+ * structuredRateLimitState(); it must NOT be forwarded as an assistant reply.
+ */
+export function isTranscriptRateLimitEvent(ev: TranscriptEvent): boolean {
+  if (!ev || typeof ev !== 'object') return false;
+  return ev.error === 'rate_limit' || ev.apiErrorStatus === 429;
+}
+
+/** Concatenated text blocks of an API-error record, used to recover a human
+ *  retry clock ("... resets 10:40pm") when present. Returns '' if none. */
+export function apiErrorMessageText(ev: TranscriptEvent): string {
+  const content = ev.message?.content;
+  if (typeof content === 'string') return content;
+  if (Array.isArray(content)) {
+    return content
+      .filter((b: any) => b && b.type === 'text' && typeof b.text === 'string')
+      .map((b: any) => b.text)
+      .join(' ');
+  }
+  return '';
 }
 
 /**
@@ -182,6 +220,11 @@ export function pickAssistantTextEvents(events: TranscriptEvent[]): TranscriptEv
   return events.filter(e => {
     if (!e || typeof e !== 'object') return false;
     if ((e as any).isSidechain === true) return false;
+    // The rate_limit API-error record is surfaced as a `limited` state, not a
+    // reply — drop it so its text ("... resets 10:40pm") isn't forwarded as an
+    // assistant answer. Other API errors (server_error / auth / the terms 400)
+    // have no dedicated surface, so they are still forwarded as their text.
+    if (isTranscriptRateLimitEvent(e)) return false;
     const role = e.message?.role ?? e.type;
     if (role !== 'assistant') return false;
     if (!e.uuid) return false;

@@ -13,7 +13,7 @@ vi.mock('../src/utils/logger.js', () => ({
 
 import { RiffBackend, parseRiffRepoName, deriveRiffRepoFromWorkingDir, deriveRiffReposFromDirs } from '../src/adapters/backend/riff-backend.js';
 
-const BASE = 'https://riff-infra-boe.bytedance.net';
+const BASE = 'https://riff-boe.example.com';
 
 type FetchCall = { url: string; init?: RequestInit };
 
@@ -408,13 +408,17 @@ describe('RiffBackend', () => {
   });
 
   describe('repo reuse (复用本地仓库+分支)', () => {
-    it('parseRiffRepoName normalizes internal specs and rejects external hosts', () => {
-      expect(parseRiffRepoName('git@code.byted.org:webinfra/agent-monorepo.git')).toBe('webinfra/agent-monorepo');
-      expect(parseRiffRepoName('https://code.byted.org/webinfra/agent-monorepo.git')).toBe('webinfra/agent-monorepo');
-      expect(parseRiffRepoName('https://code.byted.org/webinfra/agent-monorepo/')).toBe('webinfra/agent-monorepo');
+    it('parseRiffRepoName normalizes git specs to group/repo (host-agnostic; registry validation is server-side)', () => {
+      expect(parseRiffRepoName('git@git.example.com:webinfra/agent-monorepo.git')).toBe('webinfra/agent-monorepo');
+      expect(parseRiffRepoName('https://git.example.com/webinfra/agent-monorepo.git')).toBe('webinfra/agent-monorepo');
+      expect(parseRiffRepoName('https://git.example.com/webinfra/agent-monorepo/')).toBe('webinfra/agent-monorepo');
       expect(parseRiffRepoName('webinfra/agent-monorepo')).toBe('webinfra/agent-monorepo');
-      expect(parseRiffRepoName('git@github.com:deepcoldy/botmux.git')).toBeNull();
-      expect(parseRiffRepoName('https://github.com/deepcoldy/botmux')).toBeNull();
+      // Host is not inspected — any git host parses to group/repo; the riff API
+      // rejects out-of-registry names downstream, not this local parser.
+      expect(parseRiffRepoName('git@github.com:deepcoldy/botmux.git')).toBe('deepcoldy/botmux');
+      expect(parseRiffRepoName('https://github.com/deepcoldy/botmux')).toBe('deepcoldy/botmux');
+      // Non-repo specs still return null.
+      expect(parseRiffRepoName('https://git.example.com/notarepo')).toBeNull();
       expect(parseRiffRepoName('')).toBeNull();
     });
 
@@ -422,7 +426,7 @@ describe('RiffBackend', () => {
       const git = (answers: Record<string, string | null>) => (args: string[]) =>
         answers[args.join(' ')] ?? null;
       const derived = deriveRiffRepoFromWorkingDir('/repo', git({
-        'remote get-url origin': 'git@code.byted.org:webinfra/agent-monorepo.git',
+        'remote get-url origin': 'git@git.example.com:webinfra/agent-monorepo.git',
         'rev-parse --abbrev-ref HEAD': 'feat/x',
         'rev-parse --verify --quiet refs/remotes/origin/feat/x': 'abc123',
         'rev-list --count refs/remotes/origin/feat/x..HEAD': '0',
@@ -435,7 +439,7 @@ describe('RiffBackend', () => {
       const git = (answers: Record<string, string | null>) => (args: string[]) =>
         answers[args.join(' ')] ?? null;
       const derived = deriveRiffRepoFromWorkingDir('/repo', git({
-        'remote get-url origin': 'git@code.byted.org:g/r.git',
+        'remote get-url origin': 'git@git.example.com:g/r.git',
         'rev-parse --abbrev-ref HEAD': 'local-only',
         'status --porcelain': ' M src/a.ts',
       }));
@@ -464,10 +468,14 @@ describe('RiffBackend', () => {
       expect(deriveRiffRepoFromWorkingDir('/home/user', git)).toBeNull();
     });
 
-    it('returns null for non-internal origins and non-git dirs', () => {
+    it('returns null for non-git dirs; external-host origins parse (registry check is server-side)', () => {
       const git = (answers: Record<string, string | null>) => (args: string[]) =>
         answers[args.join(' ')] ?? null;
-      expect(deriveRiffRepoFromWorkingDir('/repo', git({ 'remote get-url origin': 'git@github.com:a/b.git' }))).toBeNull();
+      // Host is no longer gated locally — an external origin parses to group/repo
+      // and is rejected by the riff API's registry, not by this deriver.
+      expect(deriveRiffRepoFromWorkingDir('/repo', git({ 'remote get-url origin': 'git@github.com:a/b.git' }))!.repo)
+        .toEqual({ repoName: 'a/b' });
+      // No origin (not a git repo) still yields null.
       expect(deriveRiffRepoFromWorkingDir('/repo', git({}))).toBeNull();
     });
 
@@ -488,7 +496,7 @@ describe('RiffBackend', () => {
     });
 
     it('ignores stale defaultRepo config — repos come only from config.repos', async () => {
-      const be = makeBackend({ defaultRepo: 'https://code.byted.org/g/r.git', defaultBranch: 'dev', injectStatusLines: false } as any);
+      const be = makeBackend({ defaultRepo: 'https://git.example.com/g/r.git', defaultBranch: 'dev', injectStatusLines: false } as any);
       be.spawn('', [], {} as any);
       be.write('hi');
       await flush();
@@ -633,6 +641,29 @@ describe('RiffBackend', () => {
   });
 
   describe('prompt single @-rule (finding K/2)', () => {
+    it('escapes tag-like tokens in the built-in system prose without rewriting the heredoc', async () => {
+      const be = makeBackend({ injectStatusLines: false });
+      be.spawn('', [], {} as any);
+      be.write('hi');
+      await flush();
+      resolvers.shift()!(taskResponse('task-1'));
+      await flush();
+      const exec = calls.find(c => c.url.includes('/api/task-execute'))!;
+      const prompt = String(JSON.parse(String(exec.init?.body)).config.userPrompt);
+      const system = prompt.slice(
+        prompt.indexOf('<system>'),
+        prompt.indexOf('</system>') + '</system>'.length,
+      );
+      const systemProse = system.replace(/<\/?system>/g, '');
+
+      expect(system).toContain('&lt;message_id&gt;');
+      expect(system).toContain('&lt;open_id&gt;');
+      expect(system).toContain('&lt;sender&gt;');
+      expect(system).toContain("botmux send <<'EOF'");
+      expect(system).not.toContain("botmux send &lt;&lt;'EOF'");
+      expect(systemProse.match(/<[^<>\r\n]+>/g) ?? []).toEqual([]);
+    });
+
     it('payload prompt forbids mention-back and keeps mandatory routing under a custom systemPrompt', async () => {
       const be = makeBackend({ injectStatusLines: false, systemPrompt: '你是 QA 专家，回答尽量简短。' });
       be.spawn('', [], {} as any);
@@ -656,13 +687,13 @@ describe('RiffBackend', () => {
       const lines: string[] = [];
       be.onData(d => lines.push(d));
       (be as any).currentTaskId = 'task-9';
-      (be as any).handleSseEvent('event:init\ndata:{"directAccessUrl":"https://port-8080-v1-SECRETSANDBOXID.cn-north.ai-sandbox-boe.byted.org/?folder=x"}', 'task-9');
+      (be as any).handleSseEvent('event:init\ndata:{"directAccessUrl":"https://port-8080-v1-SECRETSANDBOXID.sandbox.example.com/?folder=x"}', 'task-9');
       const out = lines.join('');
       expect(out).toContain('Sandbox 已就绪');
       // 可写能力编码在唯一子域——hostname 的任何部分都不得出现在群可见输出里
       expect(out).not.toContain('SECRETSANDBOXID');
       expect(out).not.toContain('port-8080');
-      expect(out).not.toContain('byted.org');
+      expect(out).not.toContain('sandbox.example.com');
     });
   });
 
@@ -675,7 +706,7 @@ describe('RiffBackend', () => {
       be.write('hi');
       await flush();
       resolvers.shift()!(taskResponse('task-1', {
-        accessUrl: 'https://riff.bytedance.net/sandbox-access?sessionId=abc&folder=%2Fx',
+        accessUrl: 'https://riff.example.com/sandbox-access?sessionId=abc&folder=%2Fx',
       }));
       await flush();
       expect(urls).toContain(`${BASE}/sandbox-access?sessionId=abc&folder=%2Fx`);
@@ -689,15 +720,15 @@ describe('RiffBackend', () => {
       be.write('hi');
       await flush();
       resolvers.shift()!(taskResponse('task-1', {
-        accessUrl: 'https://riff.bytedance.net/sandbox-access?sessionId=abc',
-        directAccessUrl: 'https://port-8080-v1-abc.cn-north.ai-sandbox-boe.byted.org/?folder=%2Fx',
+        accessUrl: 'https://riff.example.com/sandbox-access?sessionId=abc',
+        directAccessUrl: 'https://port-8080-v1-abc.sandbox.example.com/?folder=%2Fx',
       }));
       await flush();
-      expect(urls[urls.length - 1]).toBe('https://port-8080-v1-abc.cn-north.ai-sandbox-boe.byted.org/?folder=%2Fx');
+      expect(urls[urls.length - 1]).toBe('https://port-8080-v1-abc.sandbox.example.com/?folder=%2Fx');
 
       // A later frontend-only URL must not replace the direct terminal URL.
-      (be as any).updateAccessUrl({ accessUrl: 'https://riff.bytedance.net/sandbox-access?sessionId=late' });
-      expect(urls[urls.length - 1]).toBe('https://port-8080-v1-abc.cn-north.ai-sandbox-boe.byted.org/?folder=%2Fx');
+      (be as any).updateAccessUrl({ accessUrl: 'https://riff.example.com/sandbox-access?sessionId=late' });
+      expect(urls[urls.length - 1]).toBe('https://port-8080-v1-abc.sandbox.example.com/?folder=%2Fx');
     });
 
     it('upgrades to directAccessUrl from a task-detail fetch after an SSE accessUrl', async () => {
@@ -710,17 +741,17 @@ describe('RiffBackend', () => {
         calls.push({ url: u });
         if (u.includes('/api/task-detail')) {
           return Response.json({ success: true, data: { task: {
-            accessUrl: 'https://riff.bytedance.net/sandbox-access?sessionId=z',
-            directAccessUrl: 'https://port-8080-z.cn-north.ai-sandbox-boe.byted.org/',
+            accessUrl: 'https://riff.example.com/sandbox-access?sessionId=z',
+            directAccessUrl: 'https://port-8080-z.sandbox.example.com/',
           } } });
         }
         return pendingSseResponse();
       });
       // Simulate the SSE init event carrying only the frontend accessUrl.
-      (be as any).handleSseEvent('event:init\ndata:{"accessUrl":"https://riff.bytedance.net/sandbox-access?sessionId=z"}', 'task-9');
+      (be as any).handleSseEvent('event:init\ndata:{"accessUrl":"https://riff.example.com/sandbox-access?sessionId=z"}', 'task-9');
       expect(urls[urls.length - 1]).toBe(`${BASE}/sandbox-access?sessionId=z`);
       await flush();
-      expect(urls[urls.length - 1]).toBe('https://port-8080-z.cn-north.ai-sandbox-boe.byted.org/');
+      expect(urls[urls.length - 1]).toBe('https://port-8080-z.sandbox.example.com/');
     });
   });
 });

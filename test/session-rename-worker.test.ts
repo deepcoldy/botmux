@@ -118,7 +118,7 @@ describe('worker native session rename queue', () => {
     expect(region).toContain('if (sessionRenameInFlight) return');
     expect(region).toContain('if (commandLineWritesPending > 0) return');
     expect(region).toContain('const rawInputReady = isPromptReady');
-    expect(region).toContain('await sendRawCommandLineSerially(backend, buildRename(title))');
+    expect(region).toContain('await sendRawCommandLineWithRecoveryFence(backend, buildRename(title))');
     expect(region).toContain('armSessionRenameIdleTimeout()');
     expect(region).toContain("effectiveBackendType === 'riff'");
     expect(renameIdx).toBeGreaterThanOrEqual(0);
@@ -161,16 +161,16 @@ describe('worker native session rename queue', () => {
     // PR #441 起入队条件多了注入围栏（injectionFlushing / barrier），rename 围栏
     // 仍必须在场——只钉本测试关心的三个 restart/rename 因子，不钉整行。
     expect(rawRegion).toContain('if (cliRestartInProgress || rawInputRestartGate || sessionRenameInFlight');
-    expect(rawRegion).toContain('pendingRawInputs.push(msg)');
+    expect(rawRegion).toContain('freshnessInputQueue.enqueueRaw(msg)');
     expect(rawRegion).toContain('await deliverRawInput(msg)');
 
     const flushStart = workerSource.indexOf('async function flushPending()');
     const flushEnd = workerSource.indexOf('\nfunction sendToPty(', flushStart);
     const flushRegion = workerSource.slice(flushStart, flushEnd);
-    expect(flushRegion).toContain('pendingRawInputs.shift()');
+    expect(flushRegion).toContain('freshnessInputQueue.takeRaw()');
     expect(flushRegion).toContain('await deliverRawInput(raw)');
-    expect(workerSource).toContain('await sendRawCommandLineSerially(targetBackend, msg.content)');
+    expect(workerSource).toContain('await sendRawCommandLineWithRecoveryFence(');
     expect(flushRegion.indexOf('await deliverRawInput(raw)'))
-      .toBeLessThan(flushRegion.indexOf('await sendRawCommandLineSerially(backend, buildRename(title))'));
+      .toBeLessThan(flushRegion.indexOf('await sendRawCommandLineWithRecoveryFence(backend, buildRename(title))'));
   });
 });

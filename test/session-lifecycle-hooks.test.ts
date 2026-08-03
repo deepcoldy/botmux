@@ -47,6 +47,9 @@ vi.mock('../src/config.js', () => ({
 }));
 
 vi.mock('../src/services/session-store.js', () => ({
+  registerSessionBridgeSendMarkerCleanupFence: vi.fn(),
+  cleanupSessionBridgeSendMarkers: vi.fn(),
+  cleanupSessionBridgeSendMarkersNow: vi.fn(),
   closeSession: vi.fn(),
   updateSession: vi.fn(),
   updateSessionPid: vi.fn(),
@@ -103,7 +106,12 @@ import {
   emitSessionStateTransitionHook,
   setSessionLifecycleShutdown,
 } from '../src/services/session-lifecycle-hooks.js';
-import { initWorkerPool, __testOnly_setupWorkerHandlers } from '../src/core/worker-pool.js';
+import {
+  detachWorkerForTransfer,
+  initWorkerPool,
+  __testOnly_setupWorkerHandlers,
+} from '../src/core/worker-pool.js';
+import { dashboardEventBus } from '../src/core/dashboard-events.js';
 import type { DaemonSession } from '../src/core/types.js';
 
 function makeFakeWorker() {
@@ -315,6 +323,63 @@ describe('worker-pool lifecycle hook integration', () => {
     }));
   });
 
+  it('routes accepted steer feedback to its exact turn without raising attention', async () => {
+    const sessionReply = vi.fn(async () => 'om_reply');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const worker = makeFakeWorker();
+    const ds = makeDs({ worker });
+    __testOnly_setupWorkerHandlers(ds, worker);
+
+    worker.emit('message', {
+      type: 'steer_accepted',
+      appTurnId: 'app-turn-accepted',
+      turnId: 'om_exact_steer_message',
+    });
+    await flush();
+
+    expect(sessionReply).toHaveBeenCalledWith(
+      'om_root',
+      '收到，引导成功',
+      'text',
+      'app_test',
+      'om_exact_steer_message',
+      undefined,
+    );
+    expect(emitHookEventMock).not.toHaveBeenCalledWith(
+      'session.requires_attention',
+      expect.anything(),
+    );
+  });
+
+  it('ignores accepted steer feedback from a replaced worker generation', async () => {
+    const sessionReply = vi.fn(async () => 'om_reply');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const worker = makeFakeWorker();
+    const replacement = makeFakeWorker();
+    const ds = makeDs({ worker: replacement });
+    __testOnly_setupWorkerHandlers(ds, worker);
+
+    worker.emit('message', {
+      type: 'steer_accepted',
+      appTurnId: 'app-turn-stale',
+      turnId: 'om_stale',
+    });
+    await flush();
+
+    expect(sessionReply).not.toHaveBeenCalled();
+    expect(emitHookEventMock).not.toHaveBeenCalled();
+  });
+
   it('does not emit lifecycle hooks for receiver TUI, notifications, status, or exit', async () => {
     const worker = makeFakeWorker();
     const ds = makeDs({ worker, lastScreenStatus: 'working' });
@@ -352,6 +417,49 @@ describe('worker-pool lifecycle hook integration', () => {
       reason: 'exit_code_1',
       code: 1,
     }));
+  });
+
+  it('suppresses external exit events for an intentional transfer detach', async () => {
+    const onWorkerExit = vi.fn();
+    initWorkerPool({
+      sessionReply: vi.fn(async () => 'om_reply'),
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+      onWorkerExit,
+    });
+    const worker = makeFakeWorker();
+    worker.connected = true;
+    worker.exitCode = null;
+    worker.signalCode = null;
+    worker.send = vi.fn((
+      message: { type: string; requestId?: string },
+      callback?: (error: Error | null) => void,
+    ) => {
+      callback?.(null);
+      if (message.type !== 'detach_for_transfer') return;
+      queueMicrotask(() => {
+        worker.emit('message', {
+          type: 'transfer_detached',
+          requestId: message.requestId,
+        });
+        worker.exitCode = 0;
+        worker.emit('exit', 0, null);
+      });
+    });
+    const ds = makeDs({ worker, lastScreenStatus: 'idle' });
+    __testOnly_setupWorkerHandlers(ds, worker);
+
+    await expect(detachWorkerForTransfer(ds, { timeoutMs: 100 })).resolves.toBe(true);
+
+    expect(onWorkerExit).not.toHaveBeenCalled();
+    expect(emitHookEventMock).not.toHaveBeenCalledWith(
+      'session.exit',
+      expect.anything(),
+    );
+    expect(dashboardEventBus.publish).not.toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'session.exited' }),
+    );
   });
 
   it('forwards exact durable_expiry_ready evidence with worker generation', async () => {

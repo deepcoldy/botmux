@@ -64,6 +64,31 @@ describe('bot-registry grant additions', () => {
     expect(cfgs[3].brandLabel).toBeUndefined();         // non-string ignored
   });
 
+  it('parses usageDisplay as a three-state enum, defaulting to streaming and honoring legacy showUsageInCardFooter', () => {
+    const cfgs = parseBotConfigsFromText(JSON.stringify([
+      { larkAppId: 'usage-default', larkAppSecret: 's' },
+      { larkAppId: 'usage-streaming', larkAppSecret: 's', usageDisplay: 'streaming' },
+      { larkAppId: 'usage-footer', larkAppSecret: 's', usageDisplay: 'footer' },
+      { larkAppId: 'usage-off', larkAppSecret: 's', usageDisplay: 'off' },
+      { larkAppId: 'usage-invalid', larkAppSecret: 's', usageDisplay: 'nonsense' },
+      { larkAppId: 'usage-legacy-off', larkAppSecret: 's', showUsageInCardFooter: false },
+      { larkAppId: 'usage-legacy-on', larkAppSecret: 's', showUsageInCardFooter: true },
+    ]));
+    // Default (unset) and explicit 'streaming' both persist as undefined (default).
+    expect(cfgs[0].usageDisplay).toBeUndefined();
+    expect(cfgs[1].usageDisplay).toBeUndefined();
+    // Non-default modes persist verbatim.
+    expect(cfgs[2].usageDisplay).toBe('footer');
+    expect(cfgs[3].usageDisplay).toBe('off');
+    // Invalid enum falls back to the default (undefined).
+    expect(cfgs[4].usageDisplay).toBeUndefined();
+    // Legacy boolean: false → 'off'; true → default streaming (undefined).
+    expect(cfgs[5].usageDisplay).toBe('off');
+    expect(cfgs[6].usageDisplay).toBeUndefined();
+    // Legacy field is never re-emitted.
+    expect((cfgs[5] as any).showUsageInCardFooter).toBeUndefined();
+  });
+
   it('getOwnerOpenId returns first ou_ in resolvedAllowedUsers', () => {
     registerBot({ larkAppId: 'a2', larkAppSecret: 's', cliId: 'claude-code', allowedUsers: ['x@y.com', 'ou_owner', 'ou_2'] });
     expect(getOwnerOpenId('a2')).toBe('ou_owner');
@@ -123,17 +148,16 @@ describe('bot-registry grant additions', () => {
     expect(parseBotConfigsFromText(JSON.stringify([{ larkAppId: 'ag4', larkAppSecret: 's', autoGrantRequestCards: 'false' }]))[0].autoGrantRequestCards).toBeUndefined();
   });
 
-  it('parses regularGroupReplyMode: keeps chat-topic|new-topic|shared, drops chat/invalid/absent to undefined', () => {
+  it('parses regularGroupReplyMode: keeps chat|new-topic|shared, drops chat-topic/invalid/absent to undefined', () => {
     expect(parseBotConfigsFromText(JSON.stringify([{ larkAppId: 'rg1', larkAppSecret: 's', regularGroupReplyMode: 'new-topic' }]))[0].regularGroupReplyMode).toBe('new-topic');
     expect(parseBotConfigsFromText(JSON.stringify([{ larkAppId: 'rg1b', larkAppSecret: 's', regularGroupReplyMode: 'shared' }]))[0].regularGroupReplyMode).toBe('shared');
     expect(parseBotConfigsFromText(JSON.stringify([{ larkAppId: 'rg1c', larkAppSecret: 's', regularGroupReplyMode: 'topic_alias' }]))[0].regularGroupReplyMode).toBe('shared');
     expect(parseBotConfigsFromText(JSON.stringify([{ larkAppId: 'rg1d', larkAppSecret: 's', regularGroupReplyMode: 'topic' }]))[0].regularGroupReplyMode).toBe('shared');
-    // chat-topic must SURVIVE the load round-trip — regression for the blocker
-    // where the per-bot default loader dropped it back to 'chat' on restart.
-    expect(parseBotConfigsFromText(JSON.stringify([{ larkAppId: 'rg1e', larkAppSecret: 's', regularGroupReplyMode: 'chat-topic' }]))[0].regularGroupReplyMode).toBe('chat-topic');
-    expect(parseBotConfigsFromText(JSON.stringify([{ larkAppId: 'rg1f', larkAppSecret: 's', regularGroupReplyMode: 'chat_topic' }]))[0].regularGroupReplyMode).toBe('chat-topic');
-    // 'chat' is the default → normalized to undefined so bots.json stays clean.
-    for (const bad of ['chat', 'bad', true, 1, undefined]) {
+    // 'chat' must SURVIVE the load round-trip — it is now a NON-default explicit
+    // opt-out (the per-bot default is 'chat-topic'), so it must persist.
+    expect(parseBotConfigsFromText(JSON.stringify([{ larkAppId: 'rg1e', larkAppSecret: 's', regularGroupReplyMode: 'chat' }]))[0].regularGroupReplyMode).toBe('chat');
+    // 'chat-topic' is the default → normalized to undefined so bots.json stays clean.
+    for (const bad of ['chat-topic', 'chat_topic', 'bad', true, 1, undefined]) {
       const c = parseBotConfigsFromText(JSON.stringify([{ larkAppId: 'rg2', larkAppSecret: 's', regularGroupReplyMode: bad }]));
       expect(c[0].regularGroupReplyMode).toBeUndefined();
     }
@@ -156,15 +180,15 @@ describe('bot-registry grant additions', () => {
     expect(cfg.repoPickerMode).toBeUndefined();
   });
 
-	  it('parses p2pMode only as literal chat (else undefined = thread default)', () => {
+	  it('parses p2pMode only as literal thread (else undefined = chat default)', () => {
     const cfgs = parseBotConfigsFromText(JSON.stringify([
       { larkAppId: 'p1', larkAppSecret: 's', p2pMode: 'chat' },
       { larkAppId: 'p2', larkAppSecret: 's', p2pMode: 'thread' },
       { larkAppId: 'p3', larkAppSecret: 's' },
       { larkAppId: 'p4', larkAppSecret: 's', p2pMode: 'invalid' },
     ]));
-    expect(cfgs[0].p2pMode).toBe('chat');
-    expect(cfgs[1].p2pMode).toBeUndefined(); // 'thread' normalizes to undefined
+    expect(cfgs[0].p2pMode).toBeUndefined(); // 'chat' is the default → normalizes to undefined
+    expect(cfgs[1].p2pMode).toBe('thread');  // 'thread' is the explicit opt-out → persists
     expect(cfgs[2].p2pMode).toBeUndefined();
     expect(cfgs[3].p2pMode).toBeUndefined();
   });

@@ -2,6 +2,7 @@ import { execFile } from 'node:child_process';
 import { chmod, lstat, mkdtemp, readdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import type { CliAdapter, CliId } from '../adapters/cli/types.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import { localTerminalCapable } from '../core/local-terminal-opener.js';
@@ -84,6 +85,15 @@ export interface LocalCliOpenerDeps {
 
 const OSASCRIPT = '/usr/bin/osascript';
 const OPEN = '/usr/bin/open';
+// In production this module lives at dist/services/local-cli-opener.js. Source
+// tests/dev daemons import src/services/local-cli-opener.ts instead, but their
+// terminal must still execute the checkout's built dist/cli.js (plain Node
+// cannot execute cli.ts without the tsx loader). Pin this exact install rather
+// than trusting whichever `botmux` happens to come first in the user's PATH.
+const CLI_ENTRYPOINT = fileURLToPath(new URL(
+  import.meta.url.endsWith('.ts') ? '../../dist/cli.js' : '../cli.js',
+  import.meta.url,
+));
 const OPEN_TARGETS = [
   { label: 'iTerm', bundleId: 'com.googlecode.iterm2' },
   { label: 'Terminal.app', bundleId: 'com.apple.Terminal' },
@@ -203,18 +213,43 @@ function safeAttachAtom(value: string | undefined): string | undefined {
 
 function buildManagedAttachCommand(ds: DaemonSession): LocalCliOpenResult {
   const backendType = getSessionPersistentBackendType(ds);
+  if (!backendType) {
+    return fail('unsupported_backend', 'This session backend does not provide a safe local attach command.');
+  }
   const target = persistentBackendTargetForSession(ds);
+  if (!target) {
+    return fail('missing_attach_target', 'This session has no persistent backend attach target.');
+  }
   if (backendType === 'tmux') {
-    return { ok: true, command: `tmux attach-session -t ${shellQuote(`=${target!.sessionName}`)}` };
+    return { ok: true, command: `tmux attach-session -t ${shellQuote(`=${target.sessionName}`)}` };
   }
   if (backendType === 'herdr') {
-    if (target!.backendType === 'herdr' && target!.agentName) {
+    if (target.backendType === 'herdr' && target.agentName) {
       return {
         ok: true,
-        command: `herdr --session ${shellQuote(target!.sessionName)} agent attach ${shellQuote(target!.agentName)}`,
+        command: `herdr --session ${shellQuote(target.sessionName)} agent attach ${shellQuote(target.agentName)}`,
       };
     }
-    return { ok: true, command: `herdr session attach ${shellQuote(target!.sessionName)}` };
+    return { ok: true, command: `herdr session attach ${shellQuote(target.sessionName)}` };
+  }
+  if (backendType === 'zmx') {
+    const socketEnv = ['ZMX_DIR', 'XDG_RUNTIME_DIR', 'TMPDIR']
+      .flatMap((key) => process.env[key] ? [`export ${key}=${shellQuote(process.env[key]!)}`] : []);
+    const prelude = [
+      'unset ZMX_SESSION ZMX_SESSION_PREFIX',
+      ...socketEnv,
+    ].join('; ');
+    const helper = [
+      shellQuote(process.execPath),
+      shellQuote(CLI_ENTRYPOINT),
+      '__zmx-attach-managed',
+      shellQuote(target.sessionName),
+      shellQuote(ds.session.sessionId),
+    ].join(' ');
+    return {
+      ok: true,
+      command: `${prelude}; exec ${helper}`,
+    };
   }
   return fail('unsupported_backend', 'This session backend does not provide a safe local attach command.');
 }

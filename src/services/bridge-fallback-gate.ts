@@ -8,6 +8,14 @@
  * disk and threads them through here.
  *
  * Rules:
+ *   - Non-adopt + no-reply sentinel terminator: suppress the whole turn.
+ *     Botmux-aware models use this explicit protocol when a turn genuinely
+ *     needs no chat response. The signal is the LAST non-empty line of the
+ *     final being exactly `BOTMUX_NO_REPLY` — models almost always explain
+ *     the silence first and then append the token on its own line, so a
+ *     full-string exact match leaked the literal token into Lark. A token
+ *     that only appears inline (mid-sentence, or with prose after it) is
+ *     still a normal answer and is NOT guessed away. See isBridgeNoReplyFinal.
  *   - Adopt mode never suppresses: in /adopt the model in the adopted
  *     session is unaware of botmux, so transcript drain is the ONLY
  *     channel from model to Lark. There's no `botmux send` to compete
@@ -35,10 +43,40 @@ import { normaliseForFingerprint } from './bridge-turn-queue.js';
 const MATERIAL_FINAL_LENGTH_RATIO = 2;
 const MATERIAL_FINAL_MIN_EXTRA_CHARS = 120;
 
+export const BRIDGE_NO_REPLY_SENTINEL = 'BOTMUX_NO_REPLY';
+
+export function isBridgeNoReplyFinal(finalText: string | undefined): boolean {
+  if (finalText === undefined) return false;
+  // Suppress the whole turn when the model's final ENDS WITH a standalone
+  // no-reply sentinel line. We look at the LAST non-empty line only:
+  //   - pure `BOTMUX_NO_REPLY`                       → suppress
+  //   - `<prose>\n\nBOTMUX_NO_REPLY`                 → suppress the whole turn
+  //   - a final whose last non-empty line is prose   → NOT a no-reply signal
+  //     (the token inline in a sentence, or followed by more prose, still posts)
+  // Full-string exact match was too brittle: botmux-aware models almost always
+  // explain the silence first ("...no reply needed.") and then append the token
+  // on its own line, which exact match let leak the literal token into Lark.
+  // Trade-off (accepted): a genuine answer that happens to end with a bare
+  // sentinel line is dropped WHOLE — the product wants a fully silent no-reply
+  // turn over the safer strip-and-forward. The last-non-empty-line rule (not a
+  // substring / endsWith test) keeps that risk to finals the model deliberately
+  // terminated with the sentinel.
+  const lines = finalText.split('\n');
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i].trim();
+    if (line.length === 0) continue;
+    return line === BRIDGE_NO_REPLY_SENTINEL;
+  }
+  return false;
+}
+
 export interface BridgeSendMarker {
   sentAtMs: number;
   messageId?: string;
   contentLength?: number;
+  /** Bounded, whitespace-compacted copy for dashboard session previews.
+   *  The fallback gate still uses contentLength only. */
+  previewText?: string;
 }
 
 export interface BridgeGateInput {
@@ -57,10 +95,40 @@ export interface BridgeGateInput {
   terminalStatus?: 'completed' | 'failed' | 'ambiguous';
 }
 
-export function buildBridgeSendMarkerContent(content: string): Pick<BridgeSendMarker, 'contentLength'> | undefined {
+const BRIDGE_SEND_PREVIEW_MAX_CHARS = 4_000;
+
+/** Bounded, newline-preserving copy of a `botmux send` body for dashboard
+ *  previews. Unlike the fingerprint normaliser (which collapses ALL whitespace
+ *  incl. newlines into single spaces — right for dedup, wrong for display), this
+ *  keeps line breaks so the dashboard can render the reply's Markdown structure
+ *  (paragraphs / lists / code blocks). Horizontal runs of spaces/tabs within a
+ *  line are collapsed and trailing spaces trimmed to keep the stored copy tidy;
+ *  blank-line runs are capped at one to bound size without flattening structure. */
+export function buildBridgeSendPreviewText(content: string): string | undefined {
+  const tidy = String(content ?? '')
+    .replace(/\r\n?/g, '\n')
+    .replace(/[^\S\n]+\n/g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .replace(/^\n+/, '')
+    .replace(/\s+$/, '');
+  if (!tidy) return undefined;
+  return tidy.length > BRIDGE_SEND_PREVIEW_MAX_CHARS
+    ? `${tidy.slice(0, BRIDGE_SEND_PREVIEW_MAX_CHARS - 1)}…`
+    : tidy;
+}
+
+export function buildBridgeSendMarkerContent(
+  content: string,
+): Pick<BridgeSendMarker, 'contentLength' | 'previewText'> | undefined {
   const normalized = normaliseForFingerprint(content);
   if (!normalized) return undefined;
-  return { contentLength: normalized.length };
+  return {
+    // Length stays fingerprint-normalized: the fallback gate compares it against
+    // normalise(finalText).length, so it must not count preview-only newlines.
+    contentLength: normalized.length,
+    // Preview keeps newlines — derive it from the raw body, NOT `normalized`.
+    previewText: buildBridgeSendPreviewText(content),
+  };
 }
 
 type StructuredBridgeSendMarker = BridgeSendMarker & {
@@ -98,6 +166,7 @@ export function shouldSuppressBridgeEmit(
   adoptMode: boolean,
 ): boolean {
   if (adoptMode) return false;
+  if (isBridgeNoReplyFinal(turn.finalText)) return true;
   if (turn.isLocal) return true;
   if (turn.markTimeMs === undefined) return false;
   const lower = turn.markTimeMs;

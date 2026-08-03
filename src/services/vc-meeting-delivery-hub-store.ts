@@ -29,6 +29,7 @@ import { logger } from '../utils/logger.js';
 import type {
   VcMeetingConsumerManagedSink,
   VcMeetingConsumerProfileFilter,
+  VcMeetingListenerOutputPlacement,
 } from '../types.js';
 import {
   isExactVcMeetingLegacyMemberIdentity,
@@ -71,6 +72,8 @@ export interface VcMeetingHubMemberProjectionInput extends VcMeetingHubMemberKey
   joinedAtIngestSeq: number;
   receiverSessionId: string;
   outputChatId: string;
+  /** Omitted by pre-feature callers and normalized to `auto`. */
+  outputPlacement?: VcMeetingListenerOutputPlacement;
 }
 
 /** Metadata-only counterpart of VcMeetingDeliveryEntry. */
@@ -552,6 +555,7 @@ function validMemberRecord(value: unknown): value is VcMeetingHubMemberRecord {
       'joinedAtIngestSeq',
       'receiverSessionId',
       'outputChatId',
+      'outputPlacement',
       'senderAckedThrough',
       'nextDeliverySeq',
       'inFlight',
@@ -579,6 +583,9 @@ function validMemberRecord(value: unknown): value is VcMeetingHubMemberRecord {
     || !isNonNegativeInteger(value.joinedAtIngestSeq)
     || !isNonEmpty(value.receiverSessionId)
     || !isNonEmpty(value.outputChatId)
+    || (value.outputPlacement !== 'auto'
+      && value.outputPlacement !== 'chat'
+      && value.outputPlacement !== 'topic')
     || !isNonNegativeInteger(value.senderAckedThrough)
     || !isPositiveInteger(value.nextDeliverySeq)
     || value.nextDeliverySeq < value.senderAckedThrough + 1
@@ -710,6 +717,7 @@ function normalizePersistedMemberPolicies(value: unknown): void {
         sinkOwnerGeneration: rawRecord.sinkOwnerGeneration,
       });
       if (policy) Object.assign(rawRecord, policy);
+      rawRecord.outputPlacement ??= 'auto';
       const normalizedInstructions = normalizeVcMeetingProfileInstructions(rawRecord.instructions);
       if (normalizedInstructions.ok) {
         if (normalizedInstructions.instructions === undefined) delete rawRecord.instructions;
@@ -818,6 +826,7 @@ function projectionInputValid(input: VcMeetingHubMemberProjectionInput): boolean
       'joinedAtIngestSeq',
       'receiverSessionId',
       'outputChatId',
+      'outputPlacement',
     ])
     && isNonEmpty(input.listenerAppId)
     && isNonEmpty(input.meetingId)
@@ -844,6 +853,9 @@ function projectionInputValid(input: VcMeetingHubMemberProjectionInput): boolean
     && isNonNegativeInteger(input.joinedAtIngestSeq)
     && isNonEmpty(input.receiverSessionId)
     && isNonEmpty(input.outputChatId)
+    && (input.outputPlacement === 'auto'
+      || input.outputPlacement === 'chat'
+      || input.outputPlacement === 'topic')
     && (() => {
       const normalized = normalizeVcMeetingProfileInstructions(input.instructions);
       return normalized.ok && normalized.instructions === input.instructions;
@@ -871,6 +883,7 @@ function projectionContentEquals(
   return streamIdentityEquals(a, b)
     && a.status === b.status
     && a.responseMode === b.responseMode
+    && (a.outputPlacement ?? 'auto') === (b.outputPlacement ?? 'auto')
     && vcMeetingCanonicalStringListsEqual(a.capabilities ?? [], b.capabilities ?? [])
     && vcMeetingCanonicalStringListsEqual(a.ownedSinks ?? [], b.ownedSinks ?? [])
     && a.sinkOwnerGeneration === b.sinkOwnerGeneration;
@@ -898,6 +911,7 @@ export function applyVcMeetingHubMemberProjection(
   input: VcMeetingHubMemberProjectionInput,
   now = Date.now(),
 ): VcMeetingHubProjectionResult {
+  input = { ...input, outputPlacement: input.outputPlacement ?? 'auto' };
   const normalizedInstructions = normalizeVcMeetingProfileInstructions(input.instructions);
   if (!normalizedInstructions.ok) return { ok: false, reason: 'invalid' };
   const policy = normalizeVcMeetingMemberPolicy({

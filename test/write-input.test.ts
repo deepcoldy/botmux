@@ -552,8 +552,8 @@ describe('supportsTypeAhead flag', () => {
     expect(createGeniusAdapter('/bin/genius').supportsTypeAhead).toBe(true);
   });
 
-  it('pi: undefined (uses busy marker probes instead of type-ahead)', () => {
-    expect(createPiAdapter('/bin/pi').supportsTypeAhead).toBeUndefined();
+  it('pi: true (0.80.6+ Message Queue steers submit-while-busy; JSONL transcript boundary makes attribution correct)', () => {
+    expect(createPiAdapter('/bin/pi').supportsTypeAhead).toBe(true);
   });
 
   it('pi: exposes Working... as the explicit busy marker', () => {
@@ -562,7 +562,7 @@ describe('supportsTypeAhead flag', () => {
     expect(adapter.busyPattern?.test('已完成，等待下一条输入')).toBe(false);
   });
 
-  it('pi: does not squash queued botmux turns', () => {
+  it('pi: does not squash queued botmux turns (one card per Lark turn; steer merge reconciled by the bridge queue)', () => {
     expect(createPiAdapter('/bin/pi').mergeQueuedInput).toBeUndefined();
   });
 
@@ -586,6 +586,10 @@ describe('reliableTurnTerminal capability', () => {
     expect(createTraexAdapter('/bin/traex').reliableTurnTerminal).toBe(true);
     expect(createGrokAdapter('/bin/grok').reliableTurnTerminal).toBe(true);
     expect(createCocoAdapter('/bin/coco').reliableTurnTerminal).toBeUndefined();
+    // Pi supports type-ahead but NOT reliableTurnTerminal: it holds no session
+    // fd (append short open/close) and a custom-terminate turn has no on-disk
+    // boundary, so it cannot make the always-on-disk end-of-turn promise
+    // durable delivery requires. Type-ahead does not need it (see pi.ts).
     expect(createPiAdapter('/bin/pi').reliableTurnTerminal).toBeUndefined();
   });
 });
@@ -906,45 +910,56 @@ describe('claude-code writeInput submission confirmation', () => {
   });
 
   it('pid resolver: polls rotated JSONL from its own baseline when append follows pid update', async () => {
-    const cwd = '/tmp/pid-resolver-rotate-delayed';
-    const startSessionId = '99999999-9999-4999-8999-999999999999';
-    const rotatedSessionId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
-    const startPath = makeJsonlForSession('pid-resolver-rotate-delayed', startSessionId, cwd);
-    const rotatedPath = makeJsonlForSession('pid-resolver-rotate-delayed', rotatedSessionId, cwd);
-    // Make the starting transcript larger than the rotated one. A stale
-    // baseByte from startPath would otherwise hide the delayed append.
-    writeFileSync(startPath, `${'x'.repeat(4096)}\n`);
-    writeClaudePidFile(12345, { sessionId: startSessionId, cwd });
+    // Keep the intended 800ms → 850ms ordering deterministic under full-suite
+    // CPU pressure. With scaled real timers the gap is only 2.5ms, so the
+    // shared event loop can cross the tiny observation window before running
+    // the append callback and make this synchronous memfs test flaky.
+    vi.useFakeTimers();
+    try {
+      const cwd = '/tmp/pid-resolver-rotate-delayed';
+      const startSessionId = '99999999-9999-4999-8999-999999999999';
+      const rotatedSessionId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+      const startPath = makeJsonlForSession('pid-resolver-rotate-delayed', startSessionId, cwd);
+      const rotatedPath = makeJsonlForSession('pid-resolver-rotate-delayed', rotatedSessionId, cwd);
+      // Make the starting transcript larger than the rotated one. A stale
+      // baseByte from startPath would otherwise hide the delayed append.
+      writeFileSync(startPath, `${'x'.repeat(4096)}\n`);
+      writeClaudePidFile(12345, { sessionId: startSessionId, cwd });
 
-    const adapter = createClaudeCodeAdapter('/bin/claude');
-    let scheduledAppend = false;
-    const pty: PtyHandle = {
-      claudeJsonlPath: startPath,
-      cliPid: 12345,
-      cliCwd: cwd,
-      write: vi.fn(),
-      sendText: vi.fn(),
-      sendSpecialKeys: vi.fn((key: string) => {
-        if (key !== 'Enter' || scheduledAppend) return;
-        scheduledAppend = true;
-        writeClaudePidFile(12345, { sessionId: rotatedSessionId, cwd });
-        // Scaled to match the adapter's (now BOTMUX_TIME_SCALE-shrunken) confirm
-        // budget — the append must still land WITHIN the poll window, as it does
-        // in production where the real 850ms < the real 4×800ms budget.
-        setTimeout(() => {
-          appendFileSync(
-            rotatedPath,
-            JSON.stringify({ type: 'user', message: { role: 'user', content: 'delayed append after pid rotate' } }) + '\n',
-          );
-        }, 850 * TIME_SCALE);
-      }),
-    };
+      const adapter = createClaudeCodeAdapter('/bin/claude');
+      let scheduledAppend = false;
+      const pty: PtyHandle = {
+        claudeJsonlPath: startPath,
+        cliPid: 12345,
+        cliCwd: cwd,
+        write: vi.fn(),
+        sendText: vi.fn(),
+        sendSpecialKeys: vi.fn((key: string) => {
+          if (key !== 'Enter' || scheduledAppend) return;
+          scheduledAppend = true;
+          writeClaudePidFile(12345, { sessionId: rotatedSessionId, cwd });
+          // Scaled to match the adapter's (now BOTMUX_TIME_SCALE-shrunken)
+          // confirm budget. The append deliberately follows the first 800ms
+          // poll, then lands inside the rotated-path poll window.
+          setTimeout(() => {
+            appendFileSync(
+              rotatedPath,
+              JSON.stringify({ type: 'user', message: { role: 'user', content: 'delayed append after pid rotate' } }) + '\n',
+            );
+          }, 850 * TIME_SCALE);
+        }),
+      };
 
-    const result = await adapter.writeInput(pty, 'delayed append after pid rotate');
+      const resultPromise = adapter.writeInput(pty, 'delayed append after pid rotate');
+      await vi.runAllTimersAsync();
+      const result = await resultPromise;
 
-    expect(result).toEqual({ submitted: true, cliSessionId: rotatedSessionId });
-    expect(pty.claudeJsonlPath).toBe(rotatedPath);
-    expect(pty.sendSpecialKeys).toHaveBeenCalledTimes(1);
+      expect(result).toEqual({ submitted: true, cliSessionId: rotatedSessionId });
+      expect(pty.claudeJsonlPath).toBe(rotatedPath);
+      expect(pty.sendSpecialKeys).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('pid resolver: missing pid file → falls back to fingerprint search', async () => {

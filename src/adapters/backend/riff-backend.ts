@@ -4,6 +4,7 @@ import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import type { SessionBackend, SpawnOpts } from './types.js';
 import { logger } from '../../utils/logger.js';
+import { escapeXmlTagLikeTokens } from '../../utils/xml.js';
 
 /**
  * Fallback system prompt injected into every riff task when no explicit
@@ -27,9 +28,9 @@ const DEFAULT_RIFF_SYSTEM_PROMPT = [
   'Multi-line messages MUST use a heredoc — never `botmux send "line1\\nline2"`, since `\\n` may appear literally in Lark.',
   "Correct multi-line example:\n  botmux send <<'EOF'\n  line 1\n  line 2\n  EOF",
   '',
-  'Helpers: `botmux history` (read this session\'s history), `botmux quoted <message_id>` (fetch a quoted message), `botmux bots list` (list other bots in the group).',
+  escapeXmlTagLikeTokens('Helpers: `botmux history` (read this session\'s history), `botmux quoted <message_id>` (fetch a quoted message), `botmux bots list` (list other bots in the group).'),
   '',
-  '@ decision (mandatory): every `botmux send` MUST explicitly pick one or it errors — `--mention <open_id>` (use the open_id from the <sender> tag of the CURRENT message you are answering) / `--no-mention` (low-priority notes). NEVER use `--mention-back` in this sandbox: the session-recorded sender is frozen at task creation, so on follow-up turns it would @ the wrong person (it is disabled here and will error).',
+  escapeXmlTagLikeTokens('@ decision (mandatory): every `botmux send` MUST explicitly pick one or it errors — `--mention <open_id>` (use the open_id from the <sender> tag of the CURRENT message you are answering) / `--no-mention` (low-priority notes). NEVER use `--mention-back` in this sandbox: the session-recorded sender is frozen at task creation, so on follow-up turns it would @ the wrong person (it is disabled here and will error).'),
   '',
   'When to send: key conclusions, plans (wait for user approval before acting), final results, progress updates. A bare `print`/`echo` does NOT count as a reply.',
   'COMPLETION CONTRACT: a turn is complete ONLY after `botmux send` actually ran and printed ✓ success. Writing the answer solely in your final report/output does NOT reach the user — always run `botmux send` first, then summarize in the report.',
@@ -140,7 +141,7 @@ export function isValidRiffSandboxCluster(v: unknown): v is RiffSandboxCluster {
 }
 
 export interface RiffRepoRef {
-  /** Internal repo name, e.g. 'webinfra/agent-monorepo' (code.byted.org). */
+  /** Internal repo name, e.g. 'webinfra/agent-monorepo' (internal git host). */
   repoName: string;
   /** Branch to pin. Omitted → the repo's default branch. (The riff API
    *  ignores unknown fields like `branch`; `repoBranch` is the real one —
@@ -150,17 +151,18 @@ export interface RiffRepoRef {
 
 /**
  * Normalize a git origin URL / repo spec to riff's internal repoName.
- * Accepts `git@code.byted.org:group/repo.git`, `https://code.byted.org/group/repo(.git)`
- * and bare `group/repo`. Returns null for non-internal hosts (github.com etc.) —
- * the riff API validates repoName against the internal registry and cannot
- * clone external repos.
+ * Accepts SSH (`git@<host>:group/repo.git`) and HTTPS
+ * (`https://<host>/group/repo(.git)`) forms from any host, plus bare
+ * `group/repo`. The host is not inspected here — the riff API validates
+ * repoName against its internal registry and cannot clone external repos, so
+ * an out-of-registry spec is rejected downstream rather than by hostname here.
  */
 export function parseRiffRepoName(spec: string): string | null {
   const s = spec.trim();
   if (!s) return null;
-  let m = /^git@code\.byted\.org:([^/\s]+\/[^/\s]+?)(?:\.git)?$/.exec(s);
+  let m = /^git@[^:/\s]+:([^/\s]+\/[^/\s]+?)(?:\.git)?$/.exec(s);
   if (m) return m[1]!;
-  m = /^https?:\/\/code\.byted\.org\/([^/\s]+\/[^/\s]+?)(?:\.git)?(?:\/)?$/.exec(s);
+  m = /^https?:\/\/[^/\s]+\/([^/\s]+\/[^/\s]+?)(?:\.git)?\/?$/.exec(s);
   if (m) return m[1]!;
   // Bare group/repo (no scheme, no host) — pass through as-is.
   if (/^[\w.-]+\/[\w.-]+$/.test(s)) return s;
@@ -171,7 +173,7 @@ export function parseRiffRepoName(spec: string): string | null {
  * Derive the riff repo ref from a local checkout so a riff task executes
  * against the same repo + branch the botmux session works in (复用本地仓库).
  * All git calls are local (no network). Returns null when the workingDir is
- * not a git repo or its origin is not an internal repo riff can clone.
+ * not a git repo or its origin cannot be parsed into a `group/repo` name.
  * `warnings` surface states the sandbox cannot see (dirty tree, unpushed
  * commits, never-pushed branch) — callers inject them as status lines.
  */

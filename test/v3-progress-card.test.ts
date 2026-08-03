@@ -107,6 +107,29 @@ describe('buildV3ProgressCard', () => {
     expect(text).toContain('不要直接重试');
   });
 
+  it('blocked 的 uncertain Feishu host effect 不显示失败文案', () => {
+    const text = allText(parse(baseView({
+      status: 'blocked',
+      issue: {
+        nodeId: 'notifyOwner',
+        errorClass: 'workerError',
+        errorCode: 'PROVIDER_UNCERTAIN',
+        phase: 'hostEffect',
+      },
+      uncertainHostEffectCount: 1,
+      counts: {
+        total: 2, done: 1, running: 0, waiting: 0, blocked: 1, failed: 0,
+        skipped: 0, cancelled: 0, pending: 0,
+      },
+      currentNodeIds: [],
+      waitingNodeIds: [],
+    })));
+
+    expect(text).toContain('外部效果待核实');
+    expect(text).toContain('1 个外部操作');
+    expect(text).not.toContain('Feishu host 节点失败');
+  });
+
   it('进度把 skipped/cancelled 计为已完成，分母仍是固定外层节点数', () => {
     const card = parse(baseView({
       status: 'succeeded',
@@ -243,6 +266,31 @@ describe('buildV3ProgressCard', () => {
     expect(text).not.toContain('secret token');
     expect(text).not.toContain('do not leak');
     expect(text).not.toContain('/root/');
+  });
+
+  it('Feishu host 失败时只陈述 host 失败和上游状态，不断言业务成功', () => {
+    const text = allText(parse(baseView({
+      status: 'failed',
+      issue: {
+        nodeId: 'notifyOwner',
+        errorClass: 'workerError',
+        errorCode: 'ProviderRateLimited',
+        phase: 'hostEffect',
+      },
+      feishuHostFailed: true,
+      upstreamNonHostFinished: true,
+      counts: {
+        total: 2, done: 1, running: 0, waiting: 0, blocked: 0, failed: 1,
+        skipped: 0, cancelled: 0, pending: 0,
+      },
+    })));
+
+    expect(text).toContain('Feishu host 节点失败');
+    expect(text).toContain('上游非 host 节点已完成');
+    expect(text).toContain('可能是通知，也可能是业务交付');
+    expect(text).not.toContain('业务节点已完成');
+    expect(text).not.toContain('不要误判为业务失败');
+    expect(text).toContain('ProviderRateLimited');
   });
 
   it('节点标识做 markdown/mention 转义，长列表折叠', () => {

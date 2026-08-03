@@ -87,66 +87,75 @@ describe('card-handler grant actions', () => {
     expect(registry.getBot('h1').config.chatGrants).toBeUndefined();
   });
 
-  it('owner grant_chat WITH card id → 同步返回终态卡 patch + 后台 @notify + withdraw + persists', async () => {
+  it('persists duration and free-form quota submitted with the grant button', async () => {
+    const { registry, pending, handler } = await fresh();
+    const nonce = pending.openPending('h1', 'oc_1', 'ou_g');
+    const submitted: any = action('grant_chat', { nonce });
+    submitted.action.form_value = {
+      grant_duration: String(8 * 60 * 60 * 1000),
+      grant_quota: '17',
+    };
+    const before = Date.now();
+    await handler.handleCardAction(submitted, deps, 'h1');
+    const cfg = registry.getBot('h1').config;
+    expect(cfg.quotaState?.['chat:oc_1:ou_g']).toEqual({ limit: 17, used: 0 });
+    const expiresAt = cfg.grantExpiryState?.['chat:oc_1:ou_g']?.expiresAt;
+    expect(expiresAt).toBeGreaterThanOrEqual(before + 8 * 60 * 60 * 1000);
+    expect(expiresAt).toBeLessThanOrEqual(Date.now() + 8 * 60 * 60 * 1000);
+  });
+
+  it('rejects invalid free-form quota without granting access', async () => {
+    const { registry, pending, handler } = await fresh();
+    const nonce = pending.openPending('h1', 'oc_1', 'ou_g');
+    const submitted: any = action('grant_chat', { nonce });
+    submitted.action.form_value = {
+      grant_duration: String(60 * 60 * 1000),
+      grant_quota: 'abc',
+    };
+    const res = await handler.handleCardAction(submitted, deps, 'h1');
+    expect(res?.toast?.type).toBe('error');
+    expect(res?.toast?.content).toBe('消息额度请输入 1–1000 的整数，留空表示不限');
+    expect(registry.getBot('h1').config.chatGrants).toBeUndefined();
+  });
+
+  it('rejects a quota above 1000 with an actionable error', async () => {
+    const { registry, pending, handler } = await fresh();
+    const nonce = pending.openPending('h1', 'oc_1', 'ou_g');
+    const submitted: any = action('grant_chat', { nonce });
+    submitted.action.form_value = {
+      grant_duration: String(60 * 60 * 1000),
+      grant_quota: '10000',
+    };
+    const res = await handler.handleCardAction(submitted, deps, 'h1');
+    expect(res?.toast).toEqual({
+      type: 'error',
+      content: '消息额度请输入 1–1000 的整数，留空表示不限',
+    });
+    expect(registry.getBot('h1').config.chatGrants).toBeUndefined();
+  });
+
+  it('owner grant_chat WITH card id → 就地 patch 原卡为终态(正文 @ 被授权人)，不发通知卡、不撤回', async () => {
     const { registry, pending, handler } = await fresh();
     const nonce = pending.openPending('h1', 'oc_1', 'ou_g');
     const res = await handler.handleCardAction(action('grant_chat', { nonce }, 'om_card'), deps, 'h1');
-    expect(res?.elements).toBeTruthy();           // 同步先回「已授权」终态卡（避免 callback 超时/竞态 → 300000）
-    await flushBackground();                       // 通知 + 撤卡走后台 fire-and-forget
-    expect(replyMock).toHaveBeenCalledWith('h1', 'om_card', expect.stringContaining('ou_g'), 'interactive', true);
-    expect(deleteMock).toHaveBeenCalledWith('h1', 'om_card');
+    // 就地 patch 的终态卡正文直接 @ 被授权人（一张卡既是结果态又 ping 到 ta）
+    expect(res?.body?.elements).toBeTruthy();
+    expect(JSON.stringify(res)).toContain('ou_g');
+    await flushBackground();
+    // 不再单独发通知卡、不再撤回原卡（申晗 2026-07-31：直接在原卡更新即可）
+    expect(replyMock).not.toHaveBeenCalled();
+    expect(deleteMock).not.toHaveBeenCalled();
     expect(registry.getBot('h1').config.chatGrants).toEqual({ oc_1: ['ou_g'] });
     expect(pending.checkNonce('h1', 'oc_1', 'ou_g', nonce)).toBe(false);
   });
 
-  it('卡片在话题里（有 thread_id）→ 线程化回复（reply_in_thread=true）', async () => {
-    const { pending, handler } = await fresh();
-    getMessageDetailMock.mockResolvedValueOnce({ items: [{ thread_id: 'omt_topic' }] });
-    const nonce = pending.openPending('h1', 'oc_1', 'ou_g');
-    await handler.handleCardAction(action('grant_chat', { nonce }, 'om_card'), deps, 'h1');
-    expect(getMessageDetailMock).toHaveBeenCalledWith('h1', 'om_card');
-    expect(replyMock).toHaveBeenCalledWith('h1', 'om_card', expect.stringContaining('ou_g'), 'interactive', true);
-  });
-
-  it('普通群顶层消息（无 thread_id）→ 普通回复落到群里（reply_in_thread=false，不开新话题）', async () => {
-    const { pending, handler } = await fresh();
-    getMessageDetailMock.mockResolvedValueOnce({ items: [{}] });  // 无 thread_id
-    const nonce = pending.openPending('h1', 'oc_1', 'ou_g');
-    await handler.handleCardAction(action('grant_chat', { nonce }, 'om_card'), deps, 'h1');
-    expect(replyMock).toHaveBeenCalledWith('h1', 'om_card', expect.stringContaining('ou_g'), 'interactive', false);
-  });
-
-  it('thread_id 探测失败（API 抛错）→ 退回线程化回复（reply_in_thread=true）', async () => {
-    const { pending, handler } = await fresh();
-    getMessageDetailMock.mockRejectedValueOnce(new Error('lark 500'));
-    const nonce = pending.openPending('h1', 'oc_1', 'ou_g');
-    await handler.handleCardAction(action('grant_chat', { nonce }, 'om_card'), deps, 'h1');
-    expect(replyMock).toHaveBeenCalledWith('h1', 'om_card', expect.stringContaining('ou_g'), 'interactive', true);
-  });
-
-  it('detail.items 为空 → 视为探测失败，退回线程化回复（不误判成普通回复）', async () => {
-    const { pending, handler } = await fresh();
-    getMessageDetailMock.mockResolvedValueOnce({ items: [] });
-    const nonce = pending.openPending('h1', 'oc_1', 'ou_g');
-    await handler.handleCardAction(action('grant_chat', { nonce }, 'om_card'), deps, 'h1');
-    expect(replyMock).toHaveBeenCalledWith('h1', 'om_card', expect.stringContaining('ou_g'), 'interactive', true);
-  });
-
-  it('owner grant_chat WITHOUT card id → fallback in-place card patch, persists', async () => {
+  it('owner grant_chat WITHOUT card id → 同样就地 patch(@ 被授权人)，不撤回', async () => {
     const { registry, pending, handler } = await fresh();
     const nonce = pending.openPending('h1', 'oc_1', 'ou_g');
     const res = await handler.handleCardAction(action('grant_chat', { nonce }), deps, 'h1');
-    expect(res?.elements).toBeTruthy();           // raw card body (dispatcher wraps as patch)
+    expect(res?.body?.elements).toBeTruthy();     // raw card body (dispatcher wraps as patch)
+    expect(JSON.stringify(res)).toContain('ou_g');
     expect(deleteMock).not.toHaveBeenCalled();
-    expect(registry.getBot('h1').config.chatGrants).toEqual({ oc_1: ['ou_g'] });
-  });
-
-  it('withdraw returns false (swallowed SDK error) → fallback patch, still persisted', async () => {
-    const { registry, pending, handler } = await fresh();
-    deleteMock.mockResolvedValueOnce(false);   // production deleteMessage swallows errors → returns false
-    const nonce = pending.openPending('h1', 'oc_1', 'ou_g');
-    const res = await handler.handleCardAction(action('grant_chat', { nonce }, 'om_card'), deps, 'h1');
-    expect(res?.elements).toBeTruthy();           // fell through to in-place patch
     expect(registry.getBot('h1').config.chatGrants).toEqual({ oc_1: ['ou_g'] });
   });
 
@@ -154,20 +163,21 @@ describe('card-handler grant actions', () => {
     const { registry, pending, handler } = await fresh();
     const nonce = pending.openPending('h1', 'oc_1', 'ou_g');
     const res = await handler.handleCardAction(action('grant_deny', { nonce }, 'om_card'), deps, 'h1');
-    expect(res?.elements).toBeTruthy();
+    expect(res?.body?.elements).toBeTruthy();
     expect(deleteMock).not.toHaveBeenCalled();
     expect(pending.isThrottled('h1', 'oc_1', 'ou_g')).toBe(true);
     expect(registry.getBot('h1').config.chatGrants).toBeUndefined();
   });
 
-  it('owner grant_global → writes globalGrants (not chatGrants/allowedUsers), 终态卡 patch + 后台 notify + withdraw', async () => {
+  it('owner grant_global → writes globalGrants (not chatGrants/allowedUsers), 就地 patch 终态卡(@ 被授权人)，不发通知不撤回', async () => {
     const { registry, pending, handler } = await fresh();
     const nonce = pending.openPending('h1', 'oc_1', 'ou_g');
     const res = await handler.handleCardAction(action('grant_global', { nonce }, 'om_card'), deps, 'h1');
-    expect(res?.elements).toBeTruthy();
+    expect(res?.body?.elements).toBeTruthy();
+    expect(JSON.stringify(res)).toContain('ou_g');   // 终态卡正文 @ 被授权人
     await flushBackground();
-    expect(replyMock).toHaveBeenCalledWith('h1', 'om_card', expect.stringContaining('ou_g'), 'interactive', true);
-    expect(deleteMock).toHaveBeenCalledWith('h1', 'om_card');
+    expect(replyMock).not.toHaveBeenCalled();
+    expect(deleteMock).not.toHaveBeenCalled();
     const cfg = registry.getBot('h1').config;
     expect(cfg.globalGrants).toEqual(['ou_g']);
     expect(cfg.chatGrants).toBeUndefined();
@@ -189,16 +199,17 @@ describe('card-handler grant actions', () => {
     return data;
   }
 
-  it('multi grant_chat: 一次授权全部目标 + 终态卡 patch + 后台 @通知全部 + 撤卡 + 清 pending', async () => {
+  it('multi grant_chat: 一次授权全部目标 + 就地 patch 终态卡(@ 全部三人) + 清 pending', async () => {
     const { registry, pending, handler } = await fresh();
     const nonce = pending.openPendingMulti('h1', 'oc_1', ['ou_a', 'ou_b', 'ou_c']);
     const res = await handler.handleCardAction(multiAction('grant_chat', ['ou_a', 'ou_b', 'ou_c'], nonce, 'om_card'), deps, 'h1');
-    expect(res?.elements).toBeTruthy();
+    expect(res?.body?.elements).toBeTruthy();
     await flushBackground();
-    // 通知 @ 了全部三人
-    const notify = replyMock.mock.calls.at(-1)![2] as string;
-    expect(notify).toContain('ou_a'); expect(notify).toContain('ou_b'); expect(notify).toContain('ou_c');
-    expect(deleteMock).toHaveBeenCalledWith('h1', 'om_card');
+    // 就地 patch 的终态卡 @ 了全部三人（不再单独发通知卡、不撤回）
+    const patched = JSON.stringify(res);
+    expect(patched).toContain('ou_a'); expect(patched).toContain('ou_b'); expect(patched).toContain('ou_c');
+    expect(replyMock).not.toHaveBeenCalled();
+    expect(deleteMock).not.toHaveBeenCalled();
     expect(registry.getBot('h1').config.chatGrants).toEqual({ oc_1: ['ou_a', 'ou_b', 'ou_c'] });
     expect(pending.checkNonce('h1', 'oc_1', 'ou_a', nonce)).toBe(false);
     expect(pending.checkNonce('h1', 'oc_1', 'ou_c', nonce)).toBe(false);
@@ -216,7 +227,7 @@ describe('card-handler grant actions', () => {
     const { registry, pending, handler } = await fresh();
     const nonce = pending.openPendingMulti('h1', 'oc_1', ['ou_a', 'ou_b']);
     const res = await handler.handleCardAction(multiAction('grant_deny', ['ou_a', 'ou_b'], nonce, 'om_card'), deps, 'h1');
-    expect(res?.elements).toBeTruthy();
+    expect(res?.body?.elements).toBeTruthy();
     expect(pending.isThrottled('h1', 'oc_1', 'ou_a')).toBe(true);
     expect(pending.isThrottled('h1', 'oc_1', 'ou_b')).toBe(true);
     expect(registry.getBot('h1').config.chatGrants).toBeUndefined();
@@ -237,9 +248,10 @@ describe('card-handler grant actions', () => {
     expect(entries).toEqual([{ openId: 'ou_a', name: '张三' }, { openId: 'ou_bot2', name: 'Codex' }]);
   });
 
-  // 实测 bug：手动 /grant 一个 bot 后，通知卡若 <at> 对方 bot 会唤醒其 daemon 误拉空会话。
+  // 实测 bug：手动 /grant 一个 bot 后，若 <at> 对方 bot 会唤醒其 daemon 误拉空会话。
   // 混合规则：能拿到 bot 名字就用纯文本名字（无 <at>，不唤醒对方），对真人仍 @。
-  it('通知卡：有名字的 bot grantee 用纯文本名字（无 <at>），不唤醒对方 bot', async () => {
+  // 现在 @ 渲染在**就地 patch 的终态卡正文**里（不再单独发通知卡）。
+  it('终态卡 @：有名字的 bot grantee 用纯文本名字（无 <at>），不唤醒对方 bot', async () => {
     const { pending, handler } = await fresh();
     // 默认 isHumanMock=false → ou_bot2 判为 bot。
     const nonce = pending.openPendingMulti('h1', 'oc_1', ['ou_bot2']);
@@ -247,16 +259,15 @@ describe('card-handler grant actions', () => {
       operator: { open_id: 'ou_owner' }, context: { open_message_id: 'om_card' },
       action: { value: { action: 'grant_chat', target_open_ids: ['ou_bot2'], target_names: ['Codex'], chat_id: 'oc_1', nonce } },
     };
-    await handler.handleCardAction(data, deps, 'h1');
-    await flushBackground();
-    const notify = replyMock.mock.calls.at(-1)![2] as string;
-    expect(notify).not.toContain('<at id=ou_bot2');   // 有名字的 bot 不被 <at>
-    expect(notify).toContain('Codex');                 // 纯文本名字保留可读信息
+    const res = await handler.handleCardAction(data, deps, 'h1');
+    const patched = JSON.stringify(res);
+    expect(patched).not.toContain('<at id=ou_bot2');   // 有名字的 bot 不被 <at>
+    expect(patched).toContain('Codex');                 // 纯文本名字保留可读信息
   });
 
   // 名字缺失（target_names 为空）才退回 @ 兜底：飞书据 open_id 展示身份（远比裸 open_id 可读），
   // 代价=可能偶尔触发一次空会话（产品上可接受，边角情况）。
-  it('通知卡：拿不到名字的 bot grantee 用 @ 兜底（而非裸 open_id）', async () => {
+  it('终态卡 @：拿不到名字的 bot grantee 用 @ 兜底（而非裸 open_id）', async () => {
     const { pending, handler } = await fresh();
     // isHumanMock=false → ou_bot2 判为 bot；target_names 缺失 → 名字取不到。
     const nonce = pending.openPendingMulti('h1', 'oc_1', ['ou_bot2']);
@@ -264,13 +275,11 @@ describe('card-handler grant actions', () => {
       operator: { open_id: 'ou_owner' }, context: { open_message_id: 'om_card' },
       action: { value: { action: 'grant_chat', target_open_ids: ['ou_bot2'], target_names: [], chat_id: 'oc_1', nonce } },
     };
-    await handler.handleCardAction(data, deps, 'h1');
-    await flushBackground();
-    const notify = replyMock.mock.calls.at(-1)![2] as string;
-    expect(notify).toContain('<at id=ou_bot2></at>');  // 无名字 → @ 兜底
+    const res = await handler.handleCardAction(data, deps, 'h1');
+    expect(JSON.stringify(res)).toContain('<at id=ou_bot2></at>');  // 无名字 → @ 兜底
   });
 
-  it('通知卡：真人 grantee 仍 @ 点名（真人被 @ 不会自动开会话）', async () => {
+  it('终态卡 @：真人 grantee 仍 @ 点名（真人被 @ 不会自动开会话）', async () => {
     const { pending, handler } = await fresh();
     isHumanMock.mockImplementation(async (_app: string, openId: string) => openId === 'ou_human');
     const nonce = pending.openPendingMulti('h1', 'oc_1', ['ou_human', 'ou_bot2']);
@@ -278,12 +287,11 @@ describe('card-handler grant actions', () => {
       operator: { open_id: 'ou_owner' }, context: { open_message_id: 'om_card' },
       action: { value: { action: 'grant_chat', target_open_ids: ['ou_human', 'ou_bot2'], target_names: ['真人', 'Codex'], chat_id: 'oc_1', nonce } },
     };
-    await handler.handleCardAction(data, deps, 'h1');
-    await flushBackground();
-    const notify = replyMock.mock.calls.at(-1)![2] as string;
-    expect(notify).toContain('<at id=ou_human></at>');  // 真人 → @
-    expect(notify).not.toContain('<at id=ou_bot2');      // bot → 纯文本
-    expect(notify).toContain('Codex');
+    const res = await handler.handleCardAction(data, deps, 'h1');
+    const patched = JSON.stringify(res);
+    expect(patched).toContain('<at id=ou_human></at>');  // 真人 → @
+    expect(patched).not.toContain('<at id=ou_bot2');      // bot → 纯文本
+    expect(patched).toContain('Codex');
   });
 
   it('grant 成功 → 查通讯录确认是真人的目标不登记花名册（避免污染 bot 列表）', async () => {

@@ -43,7 +43,17 @@ const RESERVED_ENV_KEYS = new Set<string>([
   '__OWNER_OPEN_ID',
   'SESSION_DATA_DIR',
   'IS_SANDBOX',
+  // Claude session-identity markers (mirrors CLAUDE_SESSION_MARKER_ENV_KEYS in
+  // utils/child-env.ts): explicitly configuring one would mark the bot's CLI
+  // as a nested Claude child session (CLAUDE_CODE_CHILD_SESSION silently turns
+  // transcript persistence off) or pin a foreign session identity. CLAUDE_EFFORT
+  // stays configurable — it's a behavior knob, not an identity marker.
   'CLAUDECODE',
+  'CLAUDE_CODE_CHILD_SESSION',
+  'CLAUDE_CODE_SESSION_ID',
+  'CLAUDE_CODE_ENTRYPOINT',
+  'CLAUDE_CODE_EXECPATH',
+  'CLAUDE_PID',
   'CLAUDE_CONFIG_DIR',
   'CODEX_HOME',
   // Grok data root: daemon installs hooks/skills and drains transcripts under

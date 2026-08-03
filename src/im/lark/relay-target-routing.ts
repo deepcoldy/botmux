@@ -11,14 +11,14 @@
  * in an independent 话题 instead (anchored on the `/relay` message).
  *
  * Rules (in order):
- *   1. p2p + p2pMode 'chat'  → chat-scope, anchor = chatId (扁平连续 DM; checked
- *      BEFORE the real-thread branch — same precedence as decideRouting, so a
- *      `/relay` typed inside a leftover DM thread still lands in the flat
+ *   1. p2p + p2pMode 'chat' (default) → chat-scope, anchor = chatId (扁平连续 DM;
+ *      checked BEFORE the real-thread branch — same precedence as decideRouting,
+ *      so a `/relay` typed inside a leftover DM thread still lands in the flat
  *      session rather than forking a thread-scope target)
  *   2. real thread reply     → thread-scope, anchor = message.rootId
  *      (`threadId && rootId`; covers 话题群 thread replies, DM 话题内回复, and
  *       any group's in-thread reply)
- *   3. p2p (thread default)  → thread-scope, anchor = message.messageId (the
+ *   3. p2p (explicit thread) → thread-scope, anchor = message.messageId (the
  *      `/relay` message seeds a fresh DM 话题 — same shape as a top-level DM
  *      message in decideRouting)
  *   4. 话题群 top-level       → thread-scope, anchor = message.messageId (seeds 话题)
@@ -42,14 +42,14 @@ export function resolveRelayTargetRouting(input: {
 }): RelayTargetRouting {
   const { larkAppId, chatId, message, chatMode } = input;
 
-  // 私聊 chat 模式（扁平连续）：整段 DM 折进同一个 chat-scope 会话，relay 目标
-  // 也落在同一个 chatId 锚上。必须先于 real-thread 分支 —— 与 decideRouting
+  // 私聊 chat 模式（默认，扁平连续）：整段 DM 折进同一个 chat-scope 会话，relay
+  // 目标也落在同一个 chatId 锚上。必须先于 real-thread 分支 —— 与 decideRouting
   // 同序，否则在 DM 残留 thread 里敲 /relay 会被分流成 thread 目标，破坏
-  // 「连续单聊会话」语义。
+  // 「连续单聊会话」语义。p2pMode 默认 'chat'；只有显式 'thread' 回到每条 DM 独立。
   if (chatMode === 'p2p') {
     let p2pMode: 'thread' | 'chat' | undefined;
-    try { p2pMode = getBot(larkAppId)?.config?.p2pMode; } catch { /* unregistered bot → default thread */ }
-    if (p2pMode === 'chat') return { scope: 'chat', anchor: chatId };
+    try { p2pMode = getBot(larkAppId)?.config?.p2pMode; } catch { /* unregistered bot → default chat */ }
+    if (p2pMode !== 'thread') return { scope: 'chat', anchor: chatId };
   }
 
   // A reply *inside* an existing Lark thread carries both root_id and
@@ -59,8 +59,9 @@ export function resolveRelayTargetRouting(input: {
     return { scope: 'thread', anchor: message.rootId };
   }
 
-  // 私聊默认（thread 模式）顶层消息：/relay 消息本身种一个新 DM 话题 — 跟
-  // decideRouting 对 top-level DM 的处理同款。
+  // 私聊显式 thread 模式顶层消息：/relay 消息本身种一个新 DM 话题 — 跟
+  // decideRouting 对 top-level DM 的处理同款。（默认 chat 已在上面的规则 1 返回，
+  // 走到这里说明 p2pMode 显式为 thread。）
   if (chatMode === 'p2p') {
     return { scope: 'thread', anchor: message.messageId };
   }

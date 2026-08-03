@@ -38,8 +38,8 @@ export function createRelayAdapter(pathOverride?: string): CliAdapter {
     // Relay's SuperRelay apiKey lives in `<configDir>/byted-cloud-auth.json`
     // (NOT under bytedcli), and bytedcli SSO state lives under
     // ~/.local/share/bytedcli — keep BOTH real + writable inside the file sandbox
-    // so token refresh / login persist (else the overlay isolates the refreshed
-    // token and the session 401s on the next refresh).
+    // so token refresh / login persist (else the refreshed token lands somewhere
+    // the sandbox doesn't expose and the session 401s on the next refresh).
     authPaths: ['~/.local/share/bytedcli', join(dataDir, 'byted-cloud-auth.json')],
     resumeBin: 'relay',
     dataDir,

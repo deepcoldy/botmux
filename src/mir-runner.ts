@@ -257,7 +257,7 @@ class MircliClient {
       child.stderr.on('data', chunk => { stderr += chunk.toString('utf8'); });
       child.on('error', err => {
         if (timer) clearTimeout(timer);
-        reject(new Error(`Failed to start mircli (${bin}): ${errorMessage(err)}. Install mircli (curl -fsSL https://tosv.byted.org/obj/juren-cn/mircli/install.sh | bash) or set MIRCLI_BIN.`));
+        reject(new Error(`Failed to start mircli (${bin}): ${errorMessage(err)}. Install mircli (see the mir/mircli internal docs) or set MIRCLI_BIN.`));
       });
       child.on('close', (code, signal) => {
         closed = true;

@@ -11,6 +11,13 @@
  *  typical card width. */
 export const DEFAULT_RENDER_COLS = 160;
 export const DEFAULT_RENDER_ROWS = 50;
+/** ZMX creates botmux-owned sessions without a TTY, so upstream falls back to
+ * a fixed 120x24 until a human `zmx attach` becomes leader. Use that leaderless
+ * default for the display projection only: a local attach can persist a
+ * different geometry, so ZMX history is never authoritative enough to drive
+ * state changes or synthetic keys. */
+export const ZMX_RENDER_COLS = 120;
+export const ZMX_RENDER_ROWS = 24;
 
 /** Hard upper bound on render dimensions — protects snapshot/PNG memory
  *  if a pane is reported as unreasonably wide (or a malformed init
@@ -42,6 +49,7 @@ export interface RenderDimensionConfig {
   adoptMode?: boolean;
   adoptPaneCols?: number;
   adoptPaneRows?: number;
+  backendType?: string;
 }
 
 /** Compute the render dimensions for a session. Adopt mode pegs to the
@@ -61,6 +69,9 @@ export function resolveRenderDimensions(cfg: RenderDimensionConfig): RenderDimen
       cols: clamp(cfg.adoptPaneCols ?? DEFAULT_RENDER_COLS, MIN_RENDER_COLS, MAX_RENDER_COLS),
       rows: clamp(cfg.adoptPaneRows ?? DEFAULT_RENDER_ROWS, MIN_RENDER_ROWS, MAX_RENDER_ROWS),
     };
+  }
+  if (cfg.backendType === 'zmx') {
+    return { cols: ZMX_RENDER_COLS, rows: ZMX_RENDER_ROWS };
   }
   return { cols: DEFAULT_RENDER_COLS, rows: DEFAULT_RENDER_ROWS };
 }

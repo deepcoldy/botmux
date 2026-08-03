@@ -258,6 +258,27 @@ describe('connector-api write routes', () => {
     expect(defaulted.connector.topicMessage).toEqual({ mode: 'default' });
   });
 
+  it('round-trips the suppressFinalOutput toggle via POST and PUT', async () => {
+    const created = await json(await fetch(`${baseUrl}/api/connectors`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        name: 'Quiet alerts',
+        target: { mode: 'fixed', kind: 'turn', botId: 'app1', chatId: 'oc_1' },
+        suppressFinalOutput: true,
+      }),
+    }));
+    expect(created.connector.suppressFinalOutput).toBe(true);
+
+    const id = created.connector.id;
+    const cleared = await json(await fetch(`${baseUrl}/api/connectors/${encodeURIComponent(id)}`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ suppressFinalOutput: false }),
+    }));
+    expect(cleared.connector.suppressFinalOutput).toBeUndefined();
+  });
+
   it('rejects empty and overlong custom topic messages', async () => {
     for (const text of ['   ', 'x'.repeat(201)]) {
       const res = await fetch(`${baseUrl}/api/connectors`, {

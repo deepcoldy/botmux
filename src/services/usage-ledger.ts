@@ -451,6 +451,7 @@ function ledgerArgsForDaemonSession(ds: DaemonSession): Omit<RecordSessionUsageA
     sessionId: s.sessionId,
     cliSessionId: s.cliSessionId,
     cwd: workingDir,
+    larkAppId: ds.larkAppId ?? s.larkAppId,
     fresh: true,
   });
   return {

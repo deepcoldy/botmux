@@ -95,8 +95,25 @@ describe('role injection mode', () => {
     expect(resolveRoleInjection('app1', 'oc_r')).toEqual({ content: 'CHAT', source: 'chat', injectMode: 'once' });
   });
 
-  it('buildFollowUpContent omits the <role> block when mode is "once", keeps it on "every"', async () => {
-    await fresh();
+  it('falls back to the bot-level default injection mode when a chat has none', async () => {
+    const { readRoleInjectMode, readTeamRoleInjectMode, writeTeamRoleInjectMode, writeRoleInjectMode } = await fresh();
+    // bot-level default itself defaults to 'every' (legacy).
+    expect(readTeamRoleInjectMode('appB')).toBe('every');
+    expect(readRoleInjectMode('appB', 'oc_x')).toBe('every');
+    // Opt the whole bot into 'once' → any chat without its own sidecar inherits it.
+    writeTeamRoleInjectMode('appB', 'once');
+    expect(readTeamRoleInjectMode('appB')).toBe('once');
+    expect(readRoleInjectMode('appB', 'oc_x')).toBe('once');
+    expect(readRoleInjectMode('appB', 'oc_y')).toBe('once');
+    // A per-chat sidecar still wins over the bot default.
+    writeRoleInjectMode('appB', 'oc_x', 'once');   // explicit once (same value)
+    expect(readRoleInjectMode('appB', 'oc_x')).toBe('once');
+    // Clearing the bot default returns unset chats to 'every'.
+    writeTeamRoleInjectMode('appB', 'every');       // removes the meta sidecar
+    expect(readRoleInjectMode('appB', 'oc_y')).toBe('every');
+  });
+
+  it('buildFollowUpContent omits the <role> block when mode is "once", keeps it on "every"', async () => {    await fresh();
     const { writeRoleFile, writeRoleInjectMode } = await import('../src/core/role-resolver.js');
     writeRoleFile('app1', 'oc_once', 'ONCE_PERSONA');
     const { buildNewTopicPrompt, buildFollowUpContent } = await import('../src/core/session-manager.js');

@@ -24,6 +24,8 @@ describe('botmux root help workflow surface', () => {
       );
 
       expect(stdout).toContain('workflow save [last|runId] [名称]');
+      expect(stdout).toContain('goal run <goal> [--run-id <id>]');
+      expect(stdout).toContain('同一 run-id 可安全重放终态或接续崩溃运行');
       expect(stdout).toContain('发布当前 Bot 全局版本 / 确认 unsafe lint 请由用户在飞书显式发送');
       expect(stdout).toContain('workflow run <名称|workflowId> [--param key=value ...]');
       expect(stdout).toContain('workflow new|spec-finalize|approve-spec|revise-spec|architect|revise-dag');

@@ -21,6 +21,7 @@ import {
 import {
   computeSavedWorkflowGateDigest,
   computeSavedWorkflowSideEffects,
+  assertNoSavedWorkflowChatSideEffects,
   SAVED_WORKFLOW_PARAM_NAME_RE,
   validateDagTemplate,
   validateSpecTemplate,
@@ -895,6 +896,10 @@ export function convertLegacyWorkflowDefinition(input: {
     try {
       validateDag({ runId: 'legacy-migration-check', nodes });
       normalizedDagTemplate = validateDagTemplate({ nodes });
+      // Authoring boundary: a migrated v2 workflow becomes a NEW v3 definition,
+      // so it must be lint-clean. Surface as a graceful migration issue (not a
+      // crash) exactly like the other v3 DAG constraints.
+      assertNoSavedWorkflowChatSideEffects(normalizedDagTemplate);
     } catch (err) {
       error(
         ctx,

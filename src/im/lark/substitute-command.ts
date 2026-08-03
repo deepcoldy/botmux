@@ -40,6 +40,14 @@ export async function tryHandleSubstituteCommand(
     await reply(t('cmd.substitute.topic_disabled', undefined, loc));
     return true;
   }
+  if (getBot(larkAppId).config.substituteMode?.excludedChats?.includes(chatId)) {
+    // 配置黑名单是硬关闭：dispatcher 里 isSubstituteAllowedChat 命中即短路，
+    // per-chat /substitute on 翻不回来。若仍回 status_on / updated_on 就是假成功
+    // （用户看到“已开启”却静默不代答），所以对 status/on/off 统一回报被屏蔽，
+    // 且不写运行态开关。先于 owner 权限检查：屏蔽状态非敏感，人人可见。
+    await reply(t('cmd.substitute.blocked', undefined, loc));
+    return true;
+  }
 
   const arg = match[1]?.trim().toLowerCase() ?? 'status';
   if (!arg || arg === 'status') {

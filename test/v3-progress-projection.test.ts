@@ -195,6 +195,7 @@ describe('projectV3Progress', () => {
       nodeId: 'research',
       errorClass: 'workerError',
       errorCode: 'AUTH_REQUIRED',
+      phase: 'business',
     });
 
     const retried = projectV3Progress({
@@ -225,7 +226,7 @@ describe('projectV3Progress', () => {
       ],
     });
     expect(failed.status).toBe('failed');
-    expect(failed.issue).toEqual({ nodeId: 'research', errorClass: 'timeout' });
+    expect(failed.issue).toEqual({ nodeId: 'research', errorClass: 'timeout', phase: 'business' });
 
     const succeeded = projectV3Progress({
       envelope: envelope(),
@@ -347,6 +348,150 @@ describe('projectV3Progress', () => {
       granted: 1,
       lastDecision: 'exhausted',
     }]);
+  });
+
+  it('reports a feishu host failure without claiming business success', () => {
+    const hostDag = validateDag({
+      runId: 'notify-run',
+      nodes: [
+        { id: 'businessTask', type: 'goal', goal: 'write result.json', depends: [], inputs: [] },
+        {
+          id: 'notifyOwner',
+          type: 'host',
+          executor: 'feishu-send',
+          depends: ['businessTask'],
+          inputs: [],
+          input: {
+            larkAppId: { $ref: 'context.larkAppId' },
+            chatId: { $ref: 'context.chatId' },
+            content: { $ref: 'businessTask.result.summary' },
+          },
+          humanGate: { prompt: 'Send the final notification' },
+        },
+      ],
+    });
+    const view = projectV3Progress({
+      envelope: envelope('saved_definition', 'notify-run'),
+      dag: hostDag,
+      events: [
+        at(1, { type: 'runStarted', runId: 'notify-run' }),
+        at(2, { type: 'nodeSucceeded', nodeId: 'businessTask', attemptId: '001', manifestPath: '/private/manifest.json' }),
+        at(3, {
+          type: 'nodeFailed',
+          nodeId: 'notifyOwner',
+          attemptId: 'notifyOwner/attempts/001',
+          errorClass: 'workerError',
+          errorCode: 'ProviderRateLimited',
+        }),
+        at(4, { type: 'runFailed', failedNodeId: 'notifyOwner', detail: 'provider text' }),
+      ],
+    });
+
+    expect(view.status).toBe('failed');
+    expect(view.issue).toEqual({
+      nodeId: 'notifyOwner',
+      errorClass: 'workerError',
+      errorCode: 'ProviderRateLimited',
+      phase: 'hostEffect',
+    });
+    expect(view.feishuHostFailed).toBe(true);
+    expect(view.upstreamNonHostFinished).toBe(true);
+    expect(JSON.stringify(view)).not.toContain('businessSuccess');
+    expect(JSON.stringify(view)).not.toContain('notificationFailed');
+  });
+
+  it('does not call an uncertain feishu host effect failed while blocked', () => {
+    const hostDag = validateDag({
+      runId: 'uncertain-host-run',
+      nodes: [
+        { id: 'businessTask', type: 'goal', goal: 'write result.json', depends: [], inputs: [] },
+        {
+          id: 'notifyOwner',
+          type: 'host',
+          executor: 'feishu-send',
+          depends: ['businessTask'],
+          inputs: [],
+          input: {
+            larkAppId: { $ref: 'context.larkAppId' },
+            chatId: { $ref: 'context.chatId' },
+            content: { $ref: 'businessTask.result.summary' },
+          },
+          humanGate: { prompt: 'Send notification' },
+        },
+      ],
+    });
+    const view = projectV3Progress({
+      envelope: envelope('saved_definition', 'uncertain-host-run'),
+      dag: hostDag,
+      events: [
+        at(1, { type: 'runStarted', runId: 'uncertain-host-run' }),
+        at(2, { type: 'nodeSucceeded', nodeId: 'businessTask', attemptId: '001', manifestPath: '/private/manifest.json' }),
+        at(3, {
+          type: 'hostEffectUncertain',
+          nodeId: 'notifyOwner',
+          instanceId: 'notifyOwner#001',
+          attemptId: 'notifyOwner/attempts/001',
+          executor: 'feishu-send',
+          reason: 'providerUncertain',
+          errorCode: 'PROVIDER_UNCERTAIN',
+        }),
+        at(4, { type: 'runBlocked', blockedNodeId: 'notifyOwner' }),
+      ],
+    });
+
+    expect(view.status).toBe('blocked');
+    expect(view.issue).toEqual({
+      nodeId: 'notifyOwner',
+      errorClass: 'workerError',
+      errorCode: 'PROVIDER_UNCERTAIN',
+      phase: 'hostEffect',
+    });
+    expect(view.uncertainHostEffectCount).toBe(1);
+    expect(view.feishuHostFailed).toBeUndefined();
+    expect(view.upstreamNonHostFinished).toBeUndefined();
+  });
+
+  it('does not mislabel a business-delivery feishu host as business success', () => {
+    const hostDag = validateDag({
+      runId: 'send-alert-run',
+      nodes: [
+        { id: 'compose', type: 'goal', goal: 'compose alert payload', depends: [], inputs: [] },
+        {
+          id: 'sendAlert',
+          type: 'host',
+          executor: 'feishu-send',
+          depends: ['compose'],
+          inputs: [],
+          input: {
+            larkAppId: { $ref: 'context.larkAppId' },
+            chatId: { $ref: 'context.chatId' },
+            content: { $ref: 'compose.result.alert' },
+          },
+          humanGate: { prompt: 'Send alert' },
+        },
+      ],
+    });
+    const view = projectV3Progress({
+      envelope: envelope('saved_definition', 'send-alert-run'),
+      dag: hostDag,
+      events: [
+        at(1, { type: 'runStarted', runId: 'send-alert-run' }),
+        at(2, { type: 'nodeSucceeded', nodeId: 'compose', attemptId: '001', manifestPath: '/private/manifest.json' }),
+        at(3, {
+          type: 'nodeFailed',
+          nodeId: 'sendAlert',
+          attemptId: 'sendAlert/attempts/001',
+          errorClass: 'workerError',
+          errorCode: 'ProviderRateLimited',
+        }),
+        at(4, { type: 'runFailed', failedNodeId: 'sendAlert', detail: 'provider text' }),
+      ],
+    });
+
+    expect(view.feishuHostFailed).toBe(true);
+    expect(view.upstreamNonHostFinished).toBe(true);
+    expect(JSON.stringify(view)).not.toContain('businessSuccess');
+    expect(JSON.stringify(view)).not.toContain('notificationFailed');
   });
 
   it('reports revisit refreshes without expanding counts or leaking the reason', () => {

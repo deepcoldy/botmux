@@ -31,31 +31,83 @@ describe('resolveSessionContext()', () => {
     );
   }
 
+  // A genuine worker marker always names the SAME session as the injected
+  // BOTMUX_SESSION_ID (both are written per-spawn for one session); the marker's
+  // only edge is carrying the fresh per-turn turnId/dispatchAttempt the env lacks.
   it('prefers the marker (with its fresh turnId) over the env when ancestry resolves', () => {
-    writeMarker(process.pid, JSON.stringify({ sessionId: 'marker-sid', turnId: 'turn-9' }));
+    writeMarker(process.pid, JSON.stringify({ sessionId: 'env-sid', turnId: 'turn-9' }));
     const ctx = resolveSessionContext(dir, 'env-sid', process.pid);
-    expect(ctx).toEqual({ sessionId: 'marker-sid', turnId: 'turn-9' });
+    expect(ctx).toEqual({ sessionId: 'env-sid', turnId: 'turn-9' });
   });
 
   it('parses a positive integer dispatchAttempt from the marker', () => {
     writeMarker(process.pid, JSON.stringify({
-      sessionId: 'marker-sid',
+      sessionId: 'env-sid',
       turnId: 'turn-9',
       dispatchAttempt: 2,
     }));
     const ctx = resolveSessionContext(dir, 'env-sid', process.pid);
-    expect(ctx).toEqual({ sessionId: 'marker-sid', turnId: 'turn-9', dispatchAttempt: 2 });
+    expect(ctx).toEqual({ sessionId: 'env-sid', turnId: 'turn-9', dispatchAttempt: 2 });
   });
 
   it.each([0, -1, 1.5, '2', Number.MAX_SAFE_INTEGER + 1])(
     'ignores an invalid marker dispatchAttempt (%s)',
     (dispatchAttempt) => {
-      writeMarker(process.pid, JSON.stringify({ sessionId: 'marker-sid', dispatchAttempt }));
+      writeMarker(process.pid, JSON.stringify({ sessionId: 'env-sid', dispatchAttempt }));
       const ctx = resolveSessionContext(dir, 'env-sid', process.pid);
-      expect(ctx?.sessionId).toBe('marker-sid');
+      expect(ctx?.sessionId).toBe('env-sid');
       expect(ctx?.dispatchAttempt).toBeUndefined();
     },
   );
+
+  // ── Recycled-PID misroute guard (the cross-bot leak these fixes address) ──
+  // The kernel recycles PID numbers; a since-exited session's marker file left on
+  // a reused PID must never route THIS process's send into that stale session.
+  it('rejects a legacy marker whose session differs from env (the cross-bot leak) → env fallback', () => {
+    // Reproduces the incident: a June legacy marker (no procStart) on a recycled
+    // low PID named a DIFFERENT bot's long-closed session. The marker walk must
+    // skip it and fall back to the authoritative inherited env session id.
+    writeMarker(process.pid, JSON.stringify({ sessionId: 'stale-other-bot-sid', turnId: null }));
+    const ctx = resolveSessionContext(dir, 'env-sid', process.pid);
+    expect(ctx).toEqual({ sessionId: 'env-sid' });
+  });
+
+  it('rejects a marker whose procStart ≠ the live process (recycled PID with a birth-stamp)', () => {
+    // A newer marker carries procStart; if it disagrees with the live process the
+    // PID was recycled onto us — skip even when it happens to match the env sid.
+    writeMarker(process.pid, JSON.stringify({
+      sessionId: 'env-sid', turnId: 'turn-x', procStart: '1', // 1 tick ≠ any real start
+    }));
+    const ctx = resolveSessionContext(dir, 'env-sid', process.pid);
+    expect(ctx).toEqual({ sessionId: 'env-sid' }); // env fallback, marker's turnId dropped
+  });
+
+  it('honors a marker whose procStart MATCHES the live process (genuine ancestor)', () => {
+    const liveStart = readProcessStartIdentity(process.pid);
+    expect(liveStart).toBeTruthy();
+    writeMarker(process.pid, JSON.stringify({
+      sessionId: 'env-sid', turnId: 'turn-live', procStart: liveStart,
+    }));
+    const ctx = resolveSessionContext(dir, 'env-sid', process.pid);
+    expect(ctx).toEqual({ sessionId: 'env-sid', turnId: 'turn-live' });
+  });
+
+  it('honors a live legacy marker (no procStart) that matches env — zero regression for old-format sessions', () => {
+    // 700+ live sessions in the fleet still carry pre-procStart markers. As long
+    // as the sid matches the inherited env, they stay fully trusted.
+    writeMarker(process.pid, JSON.stringify({ sessionId: 'env-sid', turnId: 'turn-legacy' }));
+    const ctx = resolveSessionContext(dir, 'env-sid', process.pid);
+    expect(ctx).toEqual({ sessionId: 'env-sid', turnId: 'turn-legacy' });
+  });
+
+  it('trusts a live legacy marker when no env is available to contradict it', () => {
+    // host-command-context passes envSessionId=undefined ("am I in a session?").
+    // With nothing to disprove and a live PID, the marker is honored as before.
+    writeMarker(process.pid, JSON.stringify({ sessionId: 'only-marker-sid', turnId: 't' }));
+    const ctx = resolveSessionContext(dir, undefined, process.pid);
+    expect(ctx).toEqual({ sessionId: 'only-marker-sid', turnId: 't' });
+  });
+
 
   it('falls back to BOTMUX_SESSION_ID when the marker walk finds nothing (detached/backgrounded)', () => {
     // No markers dir at all → ancestry walk returns null, the detached case.
@@ -94,9 +146,12 @@ describe('resolveSessionContext()', () => {
     });
   });
 
-  it('does not mix a marker with another session capability', () => {
+  it('rejects a foreign-session marker and uses this session’s own capability snapshot instead', () => {
+    // marker names a DIFFERENT session than env → recycled-PID collision. It must
+    // be skipped, and resolution must land on env-sid's own capability snapshot,
+    // never blending the foreign marker's fields in.
     writeMarker(process.pid, JSON.stringify({
-      sessionId: 'marker-sid',
+      sessionId: 'foreign-sid',
       turnId: 'turn-marker',
       dispatchAttempt: 1,
     }));
@@ -106,9 +161,9 @@ describe('resolveSessionContext()', () => {
       dispatchAttempt: 2,
     });
     expect(resolveSessionContext(dir, 'env-sid', process.pid)).toEqual({
-      sessionId: 'marker-sid',
-      turnId: 'turn-marker',
-      dispatchAttempt: 1,
+      sessionId: 'env-sid',
+      turnId: 'turn-protected',
+      dispatchAttempt: 2,
     });
   });
 

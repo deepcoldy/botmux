@@ -1,4 +1,5 @@
 // Dashboard SPA entry: React chrome + lazy route host + SSE bootstrap.
+import type React from 'react';
 import { createRoot } from 'react-dom/client';
 import { useEffect, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
@@ -30,6 +31,11 @@ import { initFloatingScrollbars } from './floating-scrollbars.js';
 import { initIconTooltips } from './icon-tooltip.js';
 import { PLUGIN_PINS_CHANGED_EVENT } from './plugin-events.js';
 import { updateAndRestartBotmux, type BotmuxUpdatePhase } from './update-action.js';
+import {
+  canonicalDashboardClientShellUrl,
+  dashboardClientShellRedirect,
+  readDashboardClientShell,
+} from './client-shell.js';
 
 type OwnerAvatar = { avatarUrl: string; name?: string };
 type TopbarAttentionNotice = { count: number; time: string; bot: string; reason: string };
@@ -194,13 +200,16 @@ function isActiveNav(item: NavItem, hash: string): boolean {
 }
 
 function sidebarNavItems(): NavItem[] {
-  if (pinnedPluginNavItems.length === 0) return NAV_ITEMS;
-  const pluginIndex = NAV_ITEMS.findIndex(item => item.id === 'plugins');
-  if (pluginIndex < 0) return [...NAV_ITEMS, ...pinnedPluginNavItems];
+  const builtInItems = readDashboardClientShell()
+    ? NAV_ITEMS.filter(item => item.id !== 'workflows')
+    : NAV_ITEMS;
+  if (pinnedPluginNavItems.length === 0) return builtInItems;
+  const pluginIndex = builtInItems.findIndex(item => item.id === 'plugins');
+  if (pluginIndex < 0) return [...builtInItems, ...pinnedPluginNavItems];
   return [
-    ...NAV_ITEMS.slice(0, pluginIndex + 1),
+    ...builtInItems.slice(0, pluginIndex + 1),
     ...pinnedPluginNavItems,
-    ...NAV_ITEMS.slice(pluginIndex + 1),
+    ...builtInItems.slice(pluginIndex + 1),
   ];
 }
 
@@ -277,7 +286,7 @@ function getRouteRoot(): HTMLElement {
   return el;
 }
 
-function ThemeMenuSlot(): JSX.Element {
+function ThemeMenuSlot(): React.JSX.Element {
   useEffect(() => {
     initThemeMenu();
   }, []);
@@ -344,7 +353,7 @@ function dashboardStatusSummary(): TopbarStatusSummary {
   };
 }
 
-function TopbarStatusRow(props: { label: string; value: number; hot?: boolean }): JSX.Element {
+function TopbarStatusRow(props: { label: string; value: number; hot?: boolean }): React.JSX.Element {
   return (
     <div className={`topbar-status-row${props.hot ? ' topbar-status-row-hot' : ''}`}>
       <span>{props.label}</span>
@@ -353,7 +362,7 @@ function TopbarStatusRow(props: { label: string; value: number; hot?: boolean })
   );
 }
 
-function TopbarStatusDonut(props: { summary: TopbarStatusSummary }): JSX.Element {
+function TopbarStatusDonut(props: { summary: TopbarStatusSummary }): React.JSX.Element {
   const { attention, idle, working } = props.summary;
   const total = working + attention + idle;
   const background = total === 0
@@ -378,7 +387,7 @@ function closeThemeMenuFromStatus(): void {
   window.dispatchEvent(new Event(CLOSE_THEME_MENU_EVENT));
 }
 
-function TopbarStatusMenu(props: { summary: TopbarStatusSummary; autoOpen?: boolean }): JSX.Element {
+function TopbarStatusMenu(props: { summary: TopbarStatusSummary; autoOpen?: boolean }): React.JSX.Element {
   const { autoOpen = false, summary } = props;
   const [open, setOpen] = useState(false);
   const [autoDismissed, setAutoDismissed] = useState(false);
@@ -471,7 +480,7 @@ function TopbarStatusMenu(props: { summary: TopbarStatusSummary; autoOpen?: bool
   );
 }
 
-function AuthExpiredOverlay(props: { open: boolean; onClose(): void }): JSX.Element | null {
+function AuthExpiredOverlay(props: { open: boolean; onClose(): void }): React.JSX.Element | null {
   if (!props.open) return null;
   return (
     <div
@@ -522,7 +531,7 @@ async function dashboardInstance(): Promise<string> {
 function TopbarVersionControl(props: {
   status: BotmuxUpdateStatus | null;
   onRefresh(): Promise<boolean>;
-}): JSX.Element | null {
+}): React.JSX.Element | null {
   const { status } = props;
   const [open, setOpen] = useState(false);
   const [phase, setPhase] = useState<TopbarUpdatePhase>('idle');
@@ -961,7 +970,7 @@ function TopbarVersionControl(props: {
   );
 }
 
-function DashboardShell(): JSX.Element {
+function DashboardShell(): React.JSX.Element {
   const statusSummary = dashboardStatusSummary();
   const [botOnboardingOpen, setBotOnboardingOpen] = useState(false);
   const [authExpiredOpen, setAuthExpiredOpen] = useState(false);
@@ -1271,6 +1280,11 @@ async function route(): Promise<void> {
   activeHash = hash;
   renderShell();
 
+  const clientShellRedirect = dashboardClientShellRedirect(hash);
+  if (clientShellRedirect) {
+    window.location.replace(clientShellRedirect);
+    return;
+  }
   if (!isAuthed && MANAGE_ROUTES.some(r => hash.startsWith('#/' + r))) {
     renderAuthRequiredPage(getRouteRoot());
     routeState.rerenderOnUiChange = true;
@@ -1343,6 +1357,10 @@ function initOwnerAvatar(): void {
 }
 
 void (async () => {
+  const canonicalClientShellUrl = canonicalDashboardClientShellUrl(window.location.href);
+  if (canonicalClientShellUrl) {
+    window.history.replaceState(window.history.state, '', canonicalClientShellUrl);
+  }
   ui.init();
   applyShellLocaleFromHash();
   const host = document.getElementById('app-root');

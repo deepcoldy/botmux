@@ -9,7 +9,7 @@
  * the fix (import Apple's bsd.sb base) must keep working across OS updates.
  */
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
-import { execFileSync, spawnSync } from 'node:child_process';
+import { spawnSync } from 'node:child_process';
 import { mkdtempSync, rmSync, writeFileSync, mkdirSync, realpathSync } from 'node:fs';
 import { tmpdir, homedir } from 'node:os';
 import { join, dirname } from 'node:path';
@@ -18,9 +18,14 @@ import { buildFsPolicy, compileToSeatbelt } from '../src/adapters/cli/fs-policy.
 const darwin = process.platform === 'darwin'
   && spawnSync('sh', ['-c', 'command -v sandbox-exec'], { stdio: 'ignore' }).status === 0;
 const d = darwin ? describe : describe.skip;
+// The IOKit probe needs a C toolchain. Decided at collection time so a runner
+// without clang reports SKIPPED — never a green test that silently proved nothing.
+const clangAvailable = darwin
+  && spawnSync('sh', ['-c', 'command -v clang'], { stdio: 'ignore' }).status === 0;
+const iokitIt = clangAvailable ? it : it.skip;
 
 d('Seatbelt three-tier enforcement (real sandbox-exec)', () => {
-  let S: string, profile: string;
+  let S: string, profile: string, policyForProfile: ReturnType<typeof buildFsPolicy>;
   const canonical = (p: string) => { try { return realpathSync(p); } catch { return p; } };
 
   beforeAll(() => {
@@ -43,6 +48,7 @@ d('Seatbelt three-tier enforcement (real sandbox-exec)', () => {
       net: true, writeRegexes: [],
     });
     policy.rules = policy.rules.filter(r => r.access === 'deny' || (() => { try { return require('node:fs').existsSync(r.path); } catch { return false; } })());
+    policyForProfile = policy;
     profile = join(S, 'p.sb');
     writeFileSync(profile, compileToSeatbelt(policy));
   });
@@ -75,5 +81,57 @@ d('Seatbelt three-tier enforcement (real sandbox-exec)', () => {
   it('processes bootstrap under deny-read-default (bsd.sb base): node runs + writes rw', () => {
     expect(allowed('node', '-e', 'process.exit(0)')).toBe(true);
     expect(allowed('node', '-e', `require('fs').writeFileSync(${JSON.stringify(join(S, 'proj/n.txt'))},'ok')`)).toBe(true);
+  });
+
+  /**
+   * `(deny default)` + bsd.sb (which carries NO iokit rule) denies every
+   * IOServiceOpen. The frameworks that need one mostly don't check the failure —
+   * Chromium dies with a bare SIGSEGV inside IOKit, no sandbox diagnostic — so the
+   * grant has to be asserted at the kernel level, not just as profile text.
+   * The probe calls IORegisterForSystemPower (the exact user client Chromium's
+   * power monitor opens) and reports MACH_PORT_NULL as DENIED.
+   */
+  iokitIt('iokit-open is granted (IOServiceOpen works; stripping the grant denies it)', () => {
+    const src = join(S, 'proj/iokit-probe.c');
+    const bin = join(S, 'proj/iokit-probe');
+    writeFileSync(src, [
+      '#include <IOKit/pwr_mgt/IOPMLib.h>',
+      '#include <stdio.h>',
+      'static void cb(void *r, io_service_t s, natural_t t, void *a) { (void)r;(void)s;(void)t;(void)a; }',
+      'int main(void) {',
+      '  IONotificationPortRef np = NULL; io_object_t note = 0;',
+      '  io_connect_t port = IORegisterForSystemPower(NULL, &np, cb, &note);',
+      '  printf("%s\\n", port == MACH_PORT_NULL ? "DENIED" : "OK");',
+      '  return 0;',
+      '}',
+    ].join('\n'));
+    // A compile failure must FAIL, not silently pass: this test is the only
+    // kernel-level proof, and a green "toolchain missing" would be worse than a
+    // red build (the whole bug class here is silent).
+    const cc = spawnSync('clang', ['-framework', 'IOKit', '-framework', 'CoreFoundation', '-o', bin, src], { encoding: 'utf8' });
+    expect(cc.status, `clang failed to build the IOKit probe: ${cc.stderr}`).toBe(0);
+
+    // The probe reports on STDOUT, so the verdict never depends on how a given
+    // macOS surfaces the refusal (exit code vs signal). Anything that stops the
+    // probe from running (spawn error, crash before print) yields neither
+    // OK nor DENIED and fails the assertion — with the details attached.
+    const verdict = (...argv: string[]) => {
+      const r = spawnSync(argv[0], argv.slice(1), { encoding: 'utf8' });
+      const why = `spawn ${argv.join(' ')} → status=${r.status} signal=${r.signal} err=${r.error?.message} stderr=${r.stderr}`;
+      expect(r.error, why).toBeUndefined();
+      expect(['OK', 'DENIED'], why).toContain((r.stdout ?? '').trim());
+      return r.stdout.trim();
+    };
+
+    expect(verdict(bin)).toBe('OK');                                  // sanity: unsandboxed
+    expect(verdict('sandbox-exec', '-f', profile, bin)).toBe('OK');    // the grant works
+
+    // Negative control: the SAME profile minus that one line → the open is refused.
+    const stripped = join(S, 'p-no-iokit.sb');
+    const text = compileToSeatbelt(policyForProfile);
+    const withoutGrant = text.replace(/^\(allow iokit-open\)\r?\n/m, '');
+    expect(withoutGrant).not.toContain('(allow iokit-open)'); // the strip actually happened
+    writeFileSync(stripped, withoutGrant);
+    expect(verdict('sandbox-exec', '-f', stripped, bin)).toBe('DENIED');
   });
 });

@@ -1,7 +1,9 @@
 # 角色系统协议（_role-protocol.md）
 
 > 本文件被每个角色目录的 CLAUDE.md `@import`，是角色行为的单一规则源。
-> 占位符 `<ROLES_ROOT>` = `~/botmux-roles/<bot名>`，部署时替换。
+> 占位符 `<ROLES_ROOT>` = `~/botmux-roles/<appId>`（每-bot 目录名必须 = 该 bot 的
+> `larkAppId`，它是沙盒白名单与 role switch 越界校验的 scoping key，详见
+> `docs/roles/deploy-runbook.md` 第 2 步），部署时替换成实际路径。
 
 ## 你的身份与角色库
 
@@ -24,9 +26,9 @@
 ### 「切到XX」
 1. 校验 XX 在发送者可用集合内（shared + 本人 users 目录），不在则拒绝并列出可用项。
 2. 先用 botmux send 发送确认：`✅ 已切换为「XX」，本话题内生效`。
-3. 最后一步执行：`botmux cd <该角色目录绝对路径>`（此后本轮不得再有任何动作）。
-4. 切换完成后的新会话开场：先读本目录 `memory/MEMORY.md`（若存在于你的记忆目录）——
-   会话内移动不会自动注入已有记忆索引。
+3. 最后一步执行：`botmux role switch <该角色目录绝对路径>`（此后本轮不得再有任何动作）。
+   进程会在新目录用 `--resume` 重启：对话上下文续回，新角色的 CLAUDE.md 与记忆索引在
+   新会话开场即机制性加载，无需手动补读。
 
 ### 「新建角色：<一句话描述>」
 1. 按 role-claude-md-template.md 起草人设，预览给用户确认。
@@ -73,6 +75,6 @@
 
 ## 硬性约束
 
-- `botmux cd` 只能指向角色库内目录（daemon 会硬校验，越界必被拒——不要尝试）。
+- `botmux role switch` 只能指向角色库内目录（daemon 会硬校验，越界必被拒——不要尝试）。
 - 知识文档只用简单 markdown（标题/列表/段落/表格），保证 docx↔md 往返无损。
 - 涉及角色归属判断时以 `<sender open_id>` 为准，不以用户自称为准。
