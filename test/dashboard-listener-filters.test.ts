@@ -18,10 +18,11 @@ describe('dashboard listener filters', () => {
     expect(filterListenerTargets(targets, 'bot_alert').map(target => target.openId)).toEqual(['ou_bot_alert']);
   });
 
-  it('applies listen/ignore through the selected listener set', () => {
+  it('applies listen/ignore through the include allow-list in include_only mode', () => {
     const included = applyListenerFilterState({
+      mode: 'include_only',
       include: ['ou_existing'],
-      exclude: ['ou_beta'],
+      exclude: [],
       targetIds: ['ou_alpha', 'ou_beta'],
       listening: true,
     });
@@ -31,6 +32,7 @@ describe('dashboard listener filters', () => {
     });
 
     const ignored = applyListenerFilterState({
+      mode: 'include_only',
       ...included,
       targetIds: ['ou_alpha'],
       listening: false,
@@ -41,16 +43,76 @@ describe('dashboard listener filters', () => {
     });
   });
 
-  it('derives mixed bulk state for partially selected results', () => {
+  it('applies listen/ignore through the exclude blacklist in all_except_excluded mode', () => {
+    // "ignore" a target => it lands in the exclude list; include stays empty.
+    const ignored = applyListenerFilterState({
+      mode: 'all_except_excluded',
+      include: [],
+      exclude: ['ou_existing'],
+      targetIds: ['ou_bot_alert'],
+      listening: false,
+    });
+    expect(ignored).toEqual({
+      include: [],
+      exclude: ['ou_existing', 'ou_bot_alert'],
+    });
+
+    // "listen" again removes it from the exclude list.
+    const listened = applyListenerFilterState({
+      mode: 'all_except_excluded',
+      ...ignored,
+      targetIds: ['ou_existing'],
+      listening: true,
+    });
+    expect(listened).toEqual({
+      include: [],
+      exclude: ['ou_bot_alert'],
+    });
+  });
+
+  it('derives include_only bulk state from the allow-list', () => {
     expect(listenerTargetStateFor({
+      mode: 'include_only',
       targetIds: ['ou_alpha', 'ou_beta'],
       include: ['ou_alpha'],
       exclude: [],
     })).toBe('mixed');
     expect(listenerTargetStateFor({
+      mode: 'include_only',
+      targetIds: ['ou_alpha', 'ou_beta'],
+      include: [],
+      exclude: [],
+    })).toBe('ignore');
+  });
+
+  it('derives all_except_excluded bulk state from the blacklist (default listen)', () => {
+    // Nothing excluded => everyone is listened to.
+    expect(listenerTargetStateFor({
+      mode: 'all_except_excluded',
+      targetIds: ['ou_alpha', 'ou_beta'],
+      include: [],
+      exclude: [],
+    })).toBe('listen');
+    // Mixed when only some are excluded.
+    expect(listenerTargetStateFor({
+      mode: 'all_except_excluded',
+      targetIds: ['ou_alpha', 'ou_beta'],
+      include: [],
+      exclude: ['ou_alpha'],
+    })).toBe('mixed');
+    // All excluded => ignore.
+    expect(listenerTargetStateFor({
+      mode: 'all_except_excluded',
       targetIds: ['ou_alpha', 'ou_beta'],
       include: [],
       exclude: ['ou_alpha', 'ou_beta'],
     })).toBe('ignore');
+    // Empty target set defaults to the mode's baseline (listen).
+    expect(listenerTargetStateFor({
+      mode: 'all_except_excluded',
+      targetIds: [],
+      include: [],
+      exclude: [],
+    })).toBe('listen');
   });
 });

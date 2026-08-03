@@ -107,6 +107,7 @@ const DEFAULT_LISTENER: MessageListenerData = {
 };
 
 function cloneListener(listener: MessageListenerData | null | undefined): MessageListenerData {
+  const mode = listener?.senderPolicy?.mode === 'all_except_excluded' ? 'all_except_excluded' : 'include_only';
   return {
     enabled: listener?.enabled === true,
     name: listener?.name ?? '',
@@ -114,9 +115,9 @@ function cloneListener(listener: MessageListenerData | null | undefined): Messag
     workingDir: listener?.workingDir ?? '',
     prompt: listener?.prompt ?? '',
     senderPolicy: {
-      mode: 'include_only',
+      mode,
       includeSenderOpenIds: [...(listener?.senderPolicy?.includeSenderOpenIds ?? [])],
-      excludeSenderOpenIds: [],
+      excludeSenderOpenIds: [...(listener?.senderPolicy?.excludeSenderOpenIds ?? [])],
       includeSenderTypes: [...(listener?.senderPolicy?.includeSenderTypes ?? DEFAULT_LISTENER.senderPolicy?.includeSenderTypes ?? [])],
       excludeSenderTypes: [...(listener?.senderPolicy?.excludeSenderTypes ?? [])],
       excludeSelf: listener?.senderPolicy?.excludeSelf !== false,
@@ -140,12 +141,6 @@ function memberDisplayName(member: GroupMemberDisplay | undefined, openId: strin
   return member?.name || openId;
 }
 
-function listenerSenderTypeMatches(member: GroupMemberDisplay, listener: MessageListenerData): boolean {
-  const includeTypes = new Set(listener.senderPolicy?.includeSenderTypes ?? DEFAULT_LISTENER.senderPolicy?.includeSenderTypes ?? []);
-  if (includeTypes.size === 0) return true;
-  return (member.memberType === 'user' || member.memberType === 'bot') && includeTypes.has(member.memberType);
-}
-
 function mergeListenerRunPreviewResults(
   current: MessageListenerRunPreviewResult[] | undefined,
   next: MessageListenerRunPreviewResult[],
@@ -163,19 +158,12 @@ function listenerRunPreviewStateClass(state: MessageListenerRunPreviewState | un
   return 'triggered';
 }
 
-function listenerForEditor(listener: MessageListenerData | null | undefined, members: GroupMemberDisplay[] = []): MessageListenerData {
-  const next = cloneListener(listener ?? DEFAULT_LISTENER);
-  if (listener?.senderPolicy?.mode !== 'all_except_excluded') return next;
-  const excluded = new Set(listener.senderPolicy.excludeSenderOpenIds ?? []);
-  next.senderPolicy = {
-    ...(next.senderPolicy ?? {}),
-    mode: 'include_only',
-    includeSenderOpenIds: members
-      .filter(member => listenerSenderTypeMatches(member, next) && !excluded.has(member.openId))
-      .map(member => member.openId),
-    excludeSenderOpenIds: [],
-  };
-  return next;
+function listenerForEditor(listener: MessageListenerData | null | undefined, _members: GroupMemberDisplay[] = []): MessageListenerData {
+  // Preserve whichever sender mode was persisted (include_only allow-list OR
+  // all_except_excluded blacklist). The blacklist mode is the ONLY way to
+  // listen to a third-party bot whose sender is reported by app_id and cannot
+  // be resolved to an open_id, so we must not silently downgrade it here.
+  return cloneListener(listener ?? DEFAULT_LISTENER);
 }
 
 function useAliveRef() {
@@ -573,29 +561,11 @@ function RolesPage(props: { tab: RolesTab }) {
     });
   }
 
-  function setListenerTargetPolicy(openId: string, listening: boolean): void {
+  function setListenerTargetsPolicyInternal(openIds: string[], listening: boolean): void {
     setEditingListener(prev => {
+      const mode = prev.senderPolicy?.mode === 'all_except_excluded' ? 'all_except_excluded' : 'include_only';
       const next = applyListenerFilterState({
-        include: prev.senderPolicy?.includeSenderOpenIds ?? [],
-        exclude: prev.senderPolicy?.excludeSenderOpenIds ?? [],
-        targetIds: [openId],
-        listening,
-      });
-      return {
-        ...prev,
-        senderPolicy: {
-          ...(prev.senderPolicy ?? {}),
-          mode: 'include_only',
-          includeSenderOpenIds: next.include,
-          excludeSenderOpenIds: next.exclude,
-        },
-      };
-    });
-  }
-
-  function setListenerTargetsPolicy(openIds: string[], listening: boolean): void {
-    setEditingListener(prev => {
-      const current = applyListenerFilterState({
+        mode,
         include: prev.senderPolicy?.includeSenderOpenIds ?? [],
         exclude: prev.senderPolicy?.excludeSenderOpenIds ?? [],
         targetIds: openIds,
@@ -605,18 +575,44 @@ function RolesPage(props: { tab: RolesTab }) {
         ...prev,
         senderPolicy: {
           ...(prev.senderPolicy ?? {}),
-          mode: 'include_only',
-          includeSenderOpenIds: current.include,
-          excludeSenderOpenIds: current.exclude,
+          mode,
+          includeSenderOpenIds: next.include,
+          excludeSenderOpenIds: next.exclude,
         },
       };
     });
   }
 
+  function setListenerTargetPolicy(openId: string, listening: boolean): void {
+    setListenerTargetsPolicyInternal([openId], listening);
+  }
+
+  function setListenerTargetsPolicy(openIds: string[], listening: boolean): void {
+    setListenerTargetsPolicyInternal(openIds, listening);
+  }
+
+  // Switch the sender-matching mode without losing the operator's picks:
+  //   include_only        → allow-list of open_ids (cannot match app_id-only bots)
+  //   all_except_excluded  → listen to everyone (except self + excluded); the
+  //                          only mode that can catch third-party alert bots.
+  function setListenerSenderMode(mode: 'include_only' | 'all_except_excluded'): void {
+    setEditingListener(prev => ({
+      ...prev,
+      senderPolicy: {
+        ...(prev.senderPolicy ?? {}),
+        mode,
+        includeSenderOpenIds: [...(prev.senderPolicy?.includeSenderOpenIds ?? [])],
+        excludeSenderOpenIds: [...(prev.senderPolicy?.excludeSenderOpenIds ?? [])],
+      },
+    }));
+  }
+
   function listenerSavePayload(): MessageListenerData {
     const senderPolicy = editingListener.senderPolicy ?? {};
     const messagePolicy = editingListener.messagePolicy ?? {};
+    const mode = senderPolicy.mode === 'all_except_excluded' ? 'all_except_excluded' : 'include_only';
     const includeSenderOpenIds = [...new Set(senderPolicy.includeSenderOpenIds ?? [])].filter(Boolean);
+    const excludeSenderOpenIds = [...new Set(senderPolicy.excludeSenderOpenIds ?? [])].filter(Boolean);
     const includeSenderTypes = [...new Set(senderPolicy.includeSenderTypes ?? [])].filter((type): type is SenderTypeOption => type === 'user' || type === 'bot');
     const includeMsgTypes = [...new Set(messagePolicy.includeMsgTypes ?? [])].filter(Boolean);
     return {
@@ -626,8 +622,11 @@ function RolesPage(props: { tab: RolesTab }) {
       ...(editingListener.workingDir?.trim() ? { workingDir: editingListener.workingDir.trim() } : {}),
       prompt: editingListener.prompt.trim(),
       senderPolicy: {
-        ...(includeSenderOpenIds.length > 0 ? { includeSenderOpenIds } : {}),
-        mode: 'include_only',
+        mode,
+        // Persist ONLY the list relevant to the active mode so a later mode
+        // switch never resurrects stale open_ids from the other list.
+        ...(mode === 'include_only' && includeSenderOpenIds.length > 0 ? { includeSenderOpenIds } : {}),
+        ...(mode === 'all_except_excluded' && excludeSenderOpenIds.length > 0 ? { excludeSenderOpenIds } : {}),
         ...(includeSenderTypes.length > 0 ? { includeSenderTypes } : {}),
         excludeSelf: senderPolicy.excludeSelf !== false,
       },
@@ -643,7 +642,8 @@ function RolesPage(props: { tab: RolesTab }) {
       flash(setListenerFlash, tr('roles.listenerPromptRequired'), true);
       return null;
     }
-    if ((editingListener.senderPolicy?.includeSenderOpenIds?.length ?? 0) === 0) {
+    if (editingListener.senderPolicy?.mode !== 'all_except_excluded'
+      && (editingListener.senderPolicy?.includeSenderOpenIds?.length ?? 0) === 0) {
       flash(setListenerFlash, tr('roles.listenerSenderRequired'), true);
       return null;
     }
@@ -722,7 +722,8 @@ function RolesPage(props: { tab: RolesTab }) {
       flash(setListenerFlash, tr('roles.listenerPromptRequired'), true);
       return;
     }
-    if ((editingListener.senderPolicy?.includeSenderOpenIds?.length ?? 0) === 0) {
+    if (editingListener.senderPolicy?.mode !== 'all_except_excluded'
+      && (editingListener.senderPolicy?.includeSenderOpenIds?.length ?? 0) === 0) {
       flash(setListenerFlash, tr('roles.listenerSenderRequired'), true);
       return;
     }
@@ -1072,6 +1073,7 @@ function RolesPage(props: { tab: RolesTab }) {
                   onToggleMsgType={toggleListenerMsgType}
                   onSetTargetPolicy={setListenerTargetPolicy}
                   onSetTargetsPolicy={setListenerTargetsPolicy}
+                  onSetSenderMode={setListenerSenderMode}
                   previewLimit={listenerPreviewLimit}
                   previewStatus={listenerPreviewStatus}
                   onPreviewLimitChange={setListenerPreviewLimit}
@@ -1412,6 +1414,7 @@ function MessageListenerEditor(props: {
   onToggleMsgType(msgType: string, checked: boolean): void;
   onSetTargetPolicy(openId: string, listening: boolean): void;
   onSetTargetsPolicy(openIds: string[], listening: boolean): void;
+  onSetSenderMode(mode: 'include_only' | 'all_except_excluded'): void;
   onPreview(): void;
   onRunPreview(): void;
   onPreviewLimitChange(limit: number): void;
@@ -1422,9 +1425,16 @@ function MessageListenerEditor(props: {
   const [selectedTargetIds, setSelectedTargetIds] = useState<Set<string>>(() => new Set());
   const senderTypes = new Set(listener.senderPolicy?.includeSenderTypes ?? []);
   const msgTypes = new Set(listener.messagePolicy?.includeMsgTypes ?? []);
+  const senderMode: 'include_only' | 'all_except_excluded' =
+    listener.senderPolicy?.mode === 'all_except_excluded' ? 'all_except_excluded' : 'include_only';
   const includeIds = new Set(listener.senderPolicy?.includeSenderOpenIds ?? []);
+  const excludeIds = new Set(listener.senderPolicy?.excludeSenderOpenIds ?? []);
+  // Show any configured open_id not present in the live member roster (e.g. a
+  // left member, or a bot only known by open_id) so the operator can still see
+  // and clear it. Which list matters depends on the active mode.
   const configuredUnknownMembers = [
-    ...[...includeIds].filter(openId => !props.memberById.has(openId)),
+    ...[...(senderMode === 'all_except_excluded' ? excludeIds : includeIds)]
+      .filter(openId => !props.memberById.has(openId)),
   ];
   const members = [
     ...props.members.filter(member => member.memberType !== 'bot'),
@@ -1439,8 +1449,9 @@ function MessageListenerEditor(props: {
   const selectedIds = [...selectedTargetIds].filter(id => activeTargets.some(target => target.openId === id));
   const bulkTargetIds = selectedIds.length > 0 ? selectedIds : filteredTargetIds;
   const bulkState = listenerTargetStateFor({
+    mode: senderMode,
     include: [...includeIds],
-    exclude: [],
+    exclude: [...excludeIds],
     targetIds: bulkTargetIds,
   });
 
@@ -1566,6 +1577,34 @@ function MessageListenerEditor(props: {
           />
           <span>{tr('roles.listenerExcludeSelf')}</span>
         </label>
+      </div>
+      <div className="roles-listener-policy-row">
+        <div className="roles-listener-policy">
+          <div className="roles-field-label">{tr('roles.listenerSenderMode')}</div>
+          <div className="roles-listener-target-tabs segmented" role="tablist" aria-label={tr('roles.listenerSenderMode')}>
+            <button
+              type="button"
+              className={senderMode === 'include_only' ? 'active' : ''}
+              aria-pressed={senderMode === 'include_only'}
+              onClick={() => props.onSetSenderMode('include_only')}
+            >
+              {tr('roles.listenerSenderModeInclude')}
+            </button>
+            <button
+              type="button"
+              className={senderMode === 'all_except_excluded' ? 'active' : ''}
+              aria-pressed={senderMode === 'all_except_excluded'}
+              onClick={() => props.onSetSenderMode('all_except_excluded')}
+            >
+              {tr('roles.listenerSenderModeAllExcept')}
+            </button>
+          </div>
+          <small className="roles-listener-scope-help">
+            {senderMode === 'all_except_excluded'
+              ? tr('roles.listenerSenderModeAllExceptHelp')
+              : tr('roles.listenerSenderModeIncludeHelp')}
+          </small>
+        </div>
       </div>
       <label className="roles-listener-field">
         <span className="roles-field-label">{tr('roles.listenerPrompt')}</span>
@@ -1697,8 +1736,9 @@ function MessageListenerEditor(props: {
             <div className="roles-empty">{tr(targetTab === 'bots' ? 'roles.listenerBotsEmpty' : 'roles.listenerMembersEmpty')}</div>
           ) : filteredTargets.map(member => {
             const targetState = listenerTargetStateFor({
+              mode: senderMode,
               include: [...includeIds],
-              exclude: [],
+              exclude: [...excludeIds],
               targetIds: [member.openId],
             });
             return (
