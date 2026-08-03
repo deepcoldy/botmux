@@ -245,6 +245,18 @@ describe('stripWrapperUnsafeArgs', () => {
     ])).toEqual(['--session-id', 'x', '--model', 'm']);
   });
 
+  // Regression: aiden's own launcher injects codex's --dangerously-bypass-hook-trust,
+  // so botmux passing it too made codex's clap see it twice → "cannot be used multiple
+  // times" and spawn aborted. Strip botmux's redundant copy for aiden wrappers.
+  it('strips the codex --dangerously-bypass-hook-trust flag (aiden injects its own)', () => {
+    expect(stripWrapperUnsafeArgs([
+      '--dangerously-bypass-approvals-and-sandbox',
+      '--dangerously-bypass-hook-trust',
+      '--no-alt-screen',
+      '--model', 'm',
+    ])).toEqual(['--dangerously-bypass-approvals-and-sandbox', '--no-alt-screen', '--model', 'm']);
+  });
+
   it('leaves args untouched when nothing is unsafe', () => {
     expect(stripWrapperUnsafeArgs(['resume', 'cid', '--model', 'm'])).toEqual(['resume', 'cid', '--model', 'm']);
   });
@@ -307,6 +319,33 @@ describe('buildWrappedLaunch', () => {
   it('does not strip a user-supplied -c that is not a botmux override (aiden x codex)', () => {
     const out = buildWrappedLaunch('aiden x codex', ['-c', 'model_reasoning_effort="high"', '--model', 'm']);
     expect(out.args).toEqual(['x', 'codex', '-c', 'model_reasoning_effort="high"', '--model', 'm']);
+  });
+
+  // Regression: aiden's launcher injects codex's --dangerously-bypass-hook-trust itself,
+  // so botmux's copy (codex.ts buildArgs, gated by bypassCodexHookTrust) reaching the
+  // launcher made codex see the flag twice → `error: the argument
+  // '--dangerously-bypass-hook-trust' cannot be used multiple times` and spawn aborted.
+  // The approval/sandbox bypass is a distinct flag aiden does NOT inject → kept.
+  it('strips the codex --dangerously-bypass-hook-trust for aiden x codex (aiden injects its own)', () => {
+    const out = buildWrappedLaunch('aiden x codex', [
+      '--dangerously-bypass-approvals-and-sandbox',
+      '--dangerously-bypass-hook-trust',
+      '--no-alt-screen',
+      '-c',
+      'shell_environment_policy.set.BOTMUX_SESSION_ID="sess-4"',
+      '-C',
+      '/repo',
+    ]);
+    expect(out.bin).toBe('aiden');
+    expect(out.args).toEqual([
+      'x',
+      'codex',
+      '--dangerously-bypass-approvals-and-sandbox',
+      '--no-alt-screen',
+      '-C',
+      '/repo',
+    ]);
+    expect(out.args).not.toContain('--dangerously-bypass-hook-trust');
   });
 
   // Regression (only reproduces on cjadk codex): cjadk's `code` subcommand defines
