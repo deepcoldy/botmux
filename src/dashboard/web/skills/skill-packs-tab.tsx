@@ -122,44 +122,52 @@ export function SkillPacksTab(props: SkillPacksTabProps) {
               <button className="bd-button primary" onClick={openCreate}>{tr('skills.packCreate')}</button>
             </div>
           ) : (
-            <div className="skills-pack-list">
-              <button className="bd-button primary skills-pack-create-btn" onClick={openCreate}>
-                + {tr('skills.packCreate')}
+            <div className="skills-pack-grid">
+              <button className="skills-pack-create-tile" onClick={openCreate}>
+                <span className="skills-pack-create-plus">+</span>
+                <span>{tr('skills.packCreate')}</span>
               </button>
               {packs.map(pack => {
                 const health = healthStatus(pack);
                 return (
                   <div className="skills-pack-card" key={pack.id}>
                     <div className="skills-pack-card-head">
-                      <div>
+                      <div className="skills-pack-title">
                         <strong>{pack.name}</strong>
                         <code className="skills-pack-id">{pack.id}</code>
                       </div>
                       <span className={`skills-pack-health skills-pack-health-${health}`}>
-                        {health === 'complete' ? tr('skills.packHealthComplete') :
-                         health === 'missing' ? tr('skills.packHealthMissing', { count: pack.missingSkills?.length ?? 0 }) :
-                         tr('skills.packHealthUnassigned')}
+                        {health === 'complete' ? '✓' :
+                         health === 'missing' ? '!' : '○'}
                       </span>
                     </div>
                     {pack.description && <p className="skills-pack-desc">{pack.description}</p>}
                     <div className="skills-pack-meta">
-                      <span>{tr('skills.skillCount', { count: pack.include.length })}</span>
-                      <span>{tr('skills.packRefCount', { count: pack.references?.length ?? 0 })}</span>
-                      {pack.tags && pack.tags.length > 0 && <span>{pack.tags.join(', ')}</span>}
+                      <span className="skills-pack-meta-item">
+                        <strong>{pack.include.length}</strong> {tr('skills.skillCount', { count: pack.include.length }).replace(/\d+/, '').trim()}
+                      </span>
+                      <span className="skills-pack-meta-item">
+                        <strong>{pack.references?.length ?? 0}</strong> Bot
+                      </span>
                     </div>
+                    {pack.tags && pack.tags.length > 0 && (
+                      <div className="skills-pack-tags">
+                        {pack.tags.map(tag => <span key={tag} className="skills-pack-tag">{tag}</span>)}
+                      </div>
+                    )}
                     {(pack.references?.length ?? 0) > 0 && (
                       <div className="skills-pack-refs">
-                        <small>{tr('skills.packRefs')}: {pack.references!.map(r => r.botName).join(', ')}</small>
+                        {pack.references!.map(r => <span key={r.larkAppId} className="skills-pack-ref-chip">{r.botName}</span>)}
                       </div>
                     )}
                     {(pack.missingSkills?.length ?? 0) > 0 && (
                       <div className="skills-pack-missing">
-                        <small>{tr('skills.packMissing')}: {pack.missingSkills!.join(', ')}</small>
+                        {tr('skills.packMissing')}: {pack.missingSkills!.join(', ')}
                       </div>
                     )}
                     <div className="skills-pack-actions">
-                      <button className="bd-button" onClick={() => openEdit(pack)}>{tr('skills.packEdit')}</button>
-                      <button className="bd-button danger" onClick={() => void handleDelete(pack)}>{tr('skills.remove')}</button>
+                      <button className="bd-button small" onClick={() => openEdit(pack)}>{tr('skills.packEdit')}</button>
+                      <button className="bd-button small danger" onClick={() => void handleDelete(pack)}>{tr('skills.remove')}</button>
                     </div>
                   </div>
                 );
