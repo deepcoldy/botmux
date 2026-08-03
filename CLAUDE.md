@@ -49,6 +49,16 @@ pnpm switch:here && pnpm daemon:restart
 - `im/lark/` — 飞书：事件路由（`event-dispatcher`）、卡片（`card-builder`/`card-handler`）、API（`client`）、消息解析（`message-parser`）
 - `utils/` — `idle-detector`（CLI 空闲检测）、`terminal-renderer`（xterm.js 截屏）、`logger`
 
+## 飞书 owner 身份边界（setup/onboarding 改动必读）
+
+这里曾发生过一次路径回归：Dashboard onboarding 已经防住跨应用复制 owner，后来新增的 scripted `setup add --create-app` 只做格式校验，又绕过了同一条身份边界。以后新增或修改创建 Bot 的入口时，必须遵守以下不变量：
+
+- `ou_`（`open_id`）是 **app-scoped**：只对签发/观察它的飞书应用有效，绝不能从来源 Bot 复制到另一个 Bot。`BOTMUX_OWNER_OPEN_ID` 也只是 `BOTMUX_LARK_APP_ID` 视角下的 session owner，不是当前 turn 的发送者，更不是可跨应用复用的 owner 配置。
+- 跨应用/新建应用的 owner 优先使用完整邮箱、手机号或 `on_`（`union_id`；仍需满足同租户/开发者条件）。新应用创建前，只能通过来源应用转换 daemon 已认证的当前 owner；任意其它 `ou_` 必须在创建应用前拒绝。
+- Dashboard onboarding、交互式 setup、scripted `setup add` 以及后续任何新增入口，都必须复用 `src/setup/owner-identity.ts`，不要只校验格式后直接写 `allowedUsers`。在创建应用前归一化来源 owner，在写 `bots.json` 前用目标应用校验；暂时性网络/scope 错误保持 inconclusive，目标应用明确判定不可用时 fail closed。
+- `BOTMUX_OWNER_OPEN_ID` / `__OWNER_OPEN_ID` 是 daemon 认证的 session 身份。新增 backend / runner / RPC 子进程时，必须通过 `applySessionOwnerEnv` 在可配置 env 合并完成后注入并冻结，不能让 bot/backend 配置覆盖它；ownerless session 必须同时删除两个变量。
+- 回归测试必须覆盖 managed-Agent 场景（source app 的 `BOTMUX_OWNER_OPEN_ID=ou_*` 创建 target app），并验证真人 owner 在目标 Bot 下的 `canOperate`；Bot-to-Bot 消息通、权限 scope 通或参数格式合法，都不能证明 owner 身份正确。
+
 ## 影响范围评估（改前必做）
 
 任何改动落地前，先想清楚它波及的**其它平台、其它 CLI、其它会话类型**——本仓库是多 CLI × 多后端 × 多 IM 的横向架构，一处改动很容易踩到共用代码路径。默认「牵一发动全身」，主动排查回归面，别只测自己那条路。

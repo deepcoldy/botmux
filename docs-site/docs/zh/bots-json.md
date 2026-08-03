@@ -114,7 +114,7 @@
 
 | 字段 | 说明 |
 |------|------|
-| `allowedUsers` | 操作权名单（**完整邮箱**或 `ou_xxx`）。配了 `allowedChatGroups` 时至少要有一个作为 owner |
+| `allowedUsers` | 操作权名单。推荐使用**完整邮箱**、手机号或 `on_xxx`；`ou_xxx` 只能用于签发它的同一应用，禁止跨 Bot 复制。配了 `allowedChatGroups` 时至少要有一个作为 owner |
 | `allowedChatGroups` | 可对话群（`oc_xxx`）。群内任何成员可对话（仅 `canTalk`），敏感操作仍由 `allowedUsers` 控制 |
 | `p2pOpen` | `true` 时允许飞书应用可用范围内的任何用户私聊该 bot（仅 `canTalk`）；群聊不受影响，敏感操作仍只认 `allowedUsers`。建议始终同时配置至少一个 `allowedUsers` owner |
 | `oncallChats` | oncall 绑定，`[{ "chatId": "oc_xxx", "workingDir": "~/projects/foo" }]`。见 [oncall](/oncall) |

@@ -241,7 +241,9 @@ export interface Session {
    *  绝不扫描子目录乱带仓库。任何其它选仓路径都会清除本 stamp。 */
   riffRepoDirs?: string[];
   larkAppId?: string;
-  ownerOpenId?: string;       // topic creator's open_id — for @mention in replies
+  /** Daemon-selected, app-scoped session owner. Frozen for the worker lifetime;
+   *  not the current-turn sender. Absent for ownerless/foreign-bot sessions. */
+  ownerOpenId?: string;       // receives owner-only replies/mentions
   /** Best-effort human-readable chat name. Group sessions use the Lark group
    *  name when available; p2p sessions fall back to the initiating user name. */
   chatDisplayName?: string;

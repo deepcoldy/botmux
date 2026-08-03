@@ -150,7 +150,9 @@ export interface DaemonSession {
   pendingFollowUpTurnId?: string;
   pendingCodexAppFollowUps?: string[]; // matching raw user texts for clean Codex App materialization
   pendingCodexAppFollowUpContexts?: string[]; // matching metadata-only context; never duplicates the raw follow-up text
-  ownerOpenId?: string;          // topic creator's open_id — receives write-enabled terminal link via DM
+  /** Daemon-selected, app-scoped session owner. Frozen for the worker lifetime;
+   *  not the current-turn sender. Absent for ownerless/foreign-bot sessions. */
+  ownerOpenId?: string;          // receives owner-only links and controls write-enabled access
   streamCardId?: string;         // message_id of the streaming card in group (PATCHed with live output)
   streamCardNonce?: string;       // unique nonce for the current streaming card — embedded in button values to distinguish old vs current card
   streamCardPending?: boolean;    // true when a new turn started, next screen_update creates a new card

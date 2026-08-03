@@ -81,6 +81,8 @@ describe('buildPreset — version + guide stamping', () => {
     expect(preset.botmuxPreset).toBe(PRESET_VERSION);
     expect(preset.guide).toBe(PRESET_GUIDE);
     expect(preset.guide).toContain('不包含任何凭证');
+    expect(preset.guide).toContain('daemon 注入的 `BOTMUX_OWNER_OPEN_ID`');
+    expect(preset.guide).toContain('`open_id` 只属于签发它的应用');
   });
 });
 

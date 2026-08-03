@@ -86,6 +86,9 @@ export const SETUP_CLI_USAGE = `botmux setup — 脚本化（非 TUI）用法
   botmux setup add --create-app --allowed-users <owner> [--app-name <name>] [选项]
       首次扫码创建飞书应用；后续有效登录态下确认账号/企业后免扫码添加。
       --app-name 留空自动使用 botmux-N；更换账号用 --switch-account。
+      owner 请用完整邮箱、手机号或 union_id on_xxx；新应用尚不存在，不能
+      预先拥有可用的 open_id ou_xxx。managed Agent 若传入 daemon 注入的
+      当前 session owner，会由来源应用转换为 on_。
       默认继续完成权限、长连接事件、redirect 与发版；可用
       --no-open-platform-auto 跳过后半段自动配置。
 
@@ -95,8 +98,8 @@ export const SETUP_CLI_USAGE = `botmux setup — 脚本化（非 TUI）用法
 
   botmux setup add --app-id <cli_xxx> --app-secret <secret> --allowed-users <owner> [选项]
       使用已有凭证添加机器人。必填：--app-id / --app-secret / --allowed-users。
-      两种 add 方式都要求至少一个完整邮箱、union_id on_xxx 或 open_id ou_xxx
-      作为 owner，写盘前会用凭证换 tenant_access_token 校验；失败不写盘。
+      owner 可用完整邮箱、手机号、union_id on_xxx，或该应用自己签发的
+      open_id ou_xxx；写盘前会用凭证校验，失败不写盘。
 
   botmux setup configure <进程名|AppID> [--switch-account] [--json]
       对已添加的机器人重跑开放平台权限、长连接事件、redirect 与发版。
@@ -125,7 +128,8 @@ export const SETUP_CLI_USAGE = `botmux setup — 脚本化（非 TUI）用法
   --working-dir <dirs>       仓库选择卡片的扫描根目录（逗号分隔多个）
   --default-working-dir <d>  固定默认目录：新话题直接在此目录启动、不弹仓库
                              选择卡片；传 - 清空、回到弹卡模式
-  --allowed-users <a,b>      管理员名单（完整邮箱 / on_xxx / ou_xxx，逗号分隔）
+  --allowed-users <a,b>      管理员名单（推荐完整邮箱 / 手机号 / on_xxx；
+                             ou_xxx 仅限已有目标应用自身，勿跨 Bot 复制）
   --allowed-chat-groups <g>  可对话群 chat_id（oc_xxx，逗号分隔）
   --show-in-team <bool>      平台团队页是否展示（默认 true）
   --brand <feishu|lark>      租户类型（仅 add）
