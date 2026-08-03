@@ -51,9 +51,16 @@ vi.mock('../src/services/session-store.js', () => {
   };
 });
 
-// isForkCapableSession reads getBot(larkAppId).config. Default: a plain
-// claude-code bot (forkable). Individual tests override the cliId via the
-// session row (sessionCliId prefers ds.session.cliId) or via this mock.
+// isForkCapableSession reaches config.codexRpcInputDefault, which reads
+// readGlobalConfig().dashboard?.codexRpcInput. Mock the global-config source
+// (NOT the whole config module — config.daemon.* is read at module load and a
+// stubbed config would break import) so the "codex terminal is forkable" cases
+// assert against a KNOWN global-off state rather than the dev machine's real
+// ~/.botmux/config.json (test-hygiene: avoids environment-dependent drift).
+vi.mock('../src/global-config.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../src/global-config.js')>();
+  return { ...actual, readGlobalConfig: vi.fn(() => ({})) };
+});
 vi.mock('../src/bot-registry.js', () => ({
   getBot: vi.fn(() => ({
     config: { cliId: 'claude-code', larkAppId: 'cli_app_test' },
@@ -159,6 +166,21 @@ describe('isForkCapableSession', () => {
       botName: 'TestBot',
     } as any);
     const ds = makeSourceDs({ cliId: 'codex' });
+    expect(isForkCapableSession(ds)).toBe(false);
+  });
+
+  it('refuses a codex pane SPAWNED under RPC even after the live toggle was turned off (dynamic gate)', () => {
+    // Live config now says terminal (codexRpcInput false, global default false),
+    // but the pane was spawned with RPC=true and does NOT hot-swap its argv — its
+    // thread still lives in the app-server with no forkable rollout. The frozen
+    // spawn-time flag on ds.initConfig must keep it refused.
+    vi.mocked(getBot).mockReturnValue({
+      config: { cliId: 'codex', larkAppId: 'cli_app_test', codexRpcInput: false },
+      botName: 'TestBot',
+    } as any);
+    const ds = makeSourceDs({ cliId: 'codex' }, {
+      initConfig: { type: 'init', codexRpcInput: true } as any,
+    });
     expect(isForkCapableSession(ds)).toBe(false);
   });
 

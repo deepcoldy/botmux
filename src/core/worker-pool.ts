@@ -3330,7 +3330,17 @@ export function isForkCapableSession(ds: DaemonSession): boolean {
   if (!FORK_CAPABLE_CLI_IDS.has(cliId)) return false;
   // Codex terminal mode is forkable; Codex under Hybrid RPC input is not (the
   // thread is an app-server live session, no local rollout to `codex fork`).
-  if (cliId === 'codex' && (botCfg.codexRpcInput === true || config.codexRpcInputDefault)) {
+  //
+  // Read BOTH the live config AND the SPAWN-TIME truth (ds.initConfig): a pane
+  // is committed to RPC-or-terminal at spawn (buildArgs runs once) and does NOT
+  // hot-swap its argv when the global toggle flips later. So a worker started
+  // with codexRpcInput=true that is still running after the operator disables
+  // the global default is STILL an RPC pane (live thread in the app-server) —
+  // the live config alone (both false) would wrongly re-classify it as terminal
+  // and let `/fork` run `codex fork` against a rollout that does not exist.
+  // ORing the frozen init flag closes that window (over-refuse, never leak).
+  const rpcAtSpawn = ds.initConfig?.codexRpcInput === true;
+  if (cliId === 'codex' && (rpcAtSpawn || botCfg.codexRpcInput === true || config.codexRpcInputDefault)) {
     return false;
   }
   return true;
