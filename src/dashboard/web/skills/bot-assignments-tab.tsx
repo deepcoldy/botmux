@@ -12,9 +12,28 @@ interface BotAssignmentsTabProps {
   packs: Array<{ id: string; name: string; include: string[] }>;
 }
 
+type DragItem = { type: 'skill' | 'pack'; id: string };
+
 export function BotAssignmentsTab(props: BotAssignmentsTabProps) {
   const tr = useT();
   const [editingBot, setEditingBot] = useState<BotRow | null>(null);
+  const [dragOverBot, setDragOverBot] = useState<string | null>(null);
+  const [dragItem, setDragItem] = useState<DragItem | null>(null);
+
+  const handleDrop = async (bot: BotRow) => {
+    if (!dragItem) return;
+    setDragOverBot(null);
+    setDragItem(null);
+    const currentSkills = priorityNames(bot.skills);
+    const currentPacks = packIds(bot.skills);
+    if (dragItem.type === 'skill') {
+      if (currentSkills.includes(dragItem.id)) return;
+      await props.onSave(bot.larkAppId, [...currentSkills, dragItem.id], currentPacks);
+    } else {
+      if (currentPacks.includes(dragItem.id)) return;
+      await props.onSave(bot.larkAppId, currentSkills, [...currentPacks, dragItem.id]);
+    }
+  };
 
   return (
     <section className="skills-config-block">
@@ -23,62 +42,111 @@ export function BotAssignmentsTab(props: BotAssignmentsTabProps) {
         count={tr('skills.botCount', { count: props.bots.length })}
         hint={tr('skills.botsHelp')}
       />
-      <article className="bd-card skills-config-card">
-        <div className="skills-bot-table">
-          <table>
-            <thead>
-              <tr>
-                <th>{tr('skills.bot')}</th>
-                <th>{tr('skills.packChips')}</th>
-                <th>{tr('skills.individualSkills')}</th>
-                <th>{tr('skills.finalCount')}</th>
-                <th>{tr('skills.health')}</th>
-                <th></th>
-              </tr>
-            </thead>
-            <tbody>
-              {props.bots.map(bot => {
-                const skillNames = priorityNames(bot.skills);
-                const packNames = packIds(bot.skills);
-                const finalCount = computeFinalCount(bot.skills, props.packs, props.skills);
-                const health = computeBotHealth(bot.skills, props.packs, props.skills);
-                return (
-                  <tr key={bot.larkAppId}>
-                    <td>{bot.botName ?? bot.larkAppId}</td>
-                    <td>
-                      <div className="skills-pack-chips">
-                        {packNames.length === 0 ? <span className="muted">—</span> :
-                          packNames.map(pid => {
-                            const pack = props.packs.find(p => p.id === pid);
-                            return <span key={pid} className="skills-pack-chip">{pack?.name ?? pid}</span>;
-                          })}
-                      </div>
-                    </td>
-                    <td>
-                      {skillNames.length === 0 ? <span className="muted">—</span> :
-                        <span className="skills-skill-chips">
-                          {skillNames.slice(0, 3).map(n => <span key={n} className="skills-skill-chip">{n}</span>)}
-                          {skillNames.length > 3 && <span className="muted">+{skillNames.length - 3}</span>}
-                        </span>}
-                    </td>
-                    <td>{finalCount}</td>
-                    <td>
-                      <span className={`skills-health skills-health-${health.level}`}>
-                        {health.label}
-                      </span>
-                    </td>
-                    <td>
-                      <button className="bd-button" onClick={() => setEditingBot(bot)}>
-                        {tr('skills.select')}
-                      </button>
-                    </td>
-                  </tr>
-                );
-              })}
-            </tbody>
-          </table>
+      <div className="skills-bot-assign-layout">
+        <div className="skills-bot-palette">
+          <p className="skills-bot-palette-hint">{tr('skills.dragHint')}</p>
+          {props.packs.length > 0 && (
+            <div className="skills-bot-palette-group">
+              <span className="skills-bot-palette-label">{tr('skills.packChips')}</span>
+              <div className="skills-bot-palette-items">
+                {props.packs.map(pack => (
+                  <span
+                    key={pack.id}
+                    className="skills-draggable-chip skills-pack-chip"
+                    draggable
+                    onDragStart={() => setDragItem({ type: 'pack', id: pack.id })}
+                    onDragEnd={() => { setDragItem(null); setDragOverBot(null); }}
+                    title={`${pack.name} (${pack.include.length} skills)`}
+                  >
+                    {pack.name}
+                  </span>
+                ))}
+              </div>
+            </div>
+          )}
+          <div className="skills-bot-palette-group">
+            <span className="skills-bot-palette-label">{tr('skills.individualSkills')}</span>
+            <div className="skills-bot-palette-items">
+              {props.skills.map(skill => (
+                <span
+                  key={skill.name}
+                  className="skills-draggable-chip skills-skill-chip"
+                  draggable
+                  onDragStart={() => setDragItem({ type: 'skill', id: skill.name })}
+                  onDragEnd={() => { setDragItem(null); setDragOverBot(null); }}
+                  title={skill.description ?? skill.name}
+                >
+                  {skill.name}
+                </span>
+              ))}
+            </div>
+          </div>
         </div>
-      </article>
+
+        <article className="bd-card skills-config-card skills-bot-table-wrap">
+          <div className="skills-bot-table">
+            <table>
+              <thead>
+                <tr>
+                  <th>{tr('skills.bot')}</th>
+                  <th>{tr('skills.packChips')}</th>
+                  <th>{tr('skills.individualSkills')}</th>
+                  <th>{tr('skills.finalCount')}</th>
+                  <th>{tr('skills.health')}</th>
+                  <th></th>
+                </tr>
+              </thead>
+              <tbody>
+                {props.bots.map(bot => {
+                  const skillNames = priorityNames(bot.skills);
+                  const packNames = packIds(bot.skills);
+                  const finalCount = computeFinalCount(bot.skills, props.packs, props.skills);
+                  const health = computeBotHealth(bot.skills, props.packs, props.skills);
+                  const isDragOver = dragOverBot === bot.larkAppId;
+                  return (
+                    <tr
+                      key={bot.larkAppId}
+                      className={`skills-bot-row${isDragOver ? ' drag-over' : ''}`}
+                      onDragOver={e => { e.preventDefault(); setDragOverBot(bot.larkAppId); }}
+                      onDragLeave={() => setDragOverBot(prev => prev === bot.larkAppId ? null : prev)}
+                      onDrop={e => { e.preventDefault(); void handleDrop(bot); }}
+                    >
+                      <td>{bot.botName ?? bot.larkAppId}</td>
+                      <td>
+                        <div className="skills-pack-chips">
+                          {packNames.length === 0 ? <span className="muted">—</span> :
+                            packNames.map(pid => {
+                              const pack = props.packs.find(p => p.id === pid);
+                              return <span key={pid} className="skills-pack-chip">{pack?.name ?? pid}</span>;
+                            })}
+                        </div>
+                      </td>
+                      <td>
+                        {skillNames.length === 0 ? <span className="muted">—</span> :
+                          <span className="skills-skill-chips">
+                            {skillNames.slice(0, 3).map(n => <span key={n} className="skills-skill-chip">{n}</span>)}
+                            {skillNames.length > 3 && <span className="muted">+{skillNames.length - 3}</span>}
+                          </span>}
+                      </td>
+                      <td>{finalCount}</td>
+                      <td>
+                        <span className={`skills-health skills-health-${health.level}`}>
+                          {health.label}
+                        </span>
+                      </td>
+                      <td>
+                        <button className="bd-button" onClick={() => setEditingBot(bot)}>
+                          {tr('skills.select')}
+                        </button>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        </article>
+      </div>
       {editingBot && (
         <BotAssignmentEditor
           bot={editingBot}
