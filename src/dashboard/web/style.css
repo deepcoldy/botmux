@@ -25812,6 +25812,47 @@ button.ui-refresh-button.is-loading .ui-action-icon {
   border-color: var(--accent, #6c8cff);
 }
 
+/* Skill pack editor: search + select all */
+.skills-pack-include-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 8px;
+}
+.skills-pack-include-head label {
+  font-weight: 600;
+  white-space: nowrap;
+}
+.skills-pack-skill-search {
+  flex: 1;
+  max-width: 240px;
+  padding: 5px 10px;
+  border: 1px solid var(--border, #444);
+  border-radius: 6px;
+  background: var(--input-bg, #1a1a2a);
+  color: var(--text, #eee);
+  font-size: 12px;
+}
+.skills-pack-skill-search:focus {
+  outline: none;
+  border-color: var(--accent, #6c8cff);
+}
+.skills-pack-select-all {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--muted, #999);
+  cursor: pointer;
+  margin-bottom: 8px;
+}
+
+/* Wider dialog for pack editor */
+.skills-pack-editor {
+  width: min(560px, 92vw);
+}
+
 @media (max-width: 620px) {
   .skills-installed-block > .sect-head {
     align-items: center;
