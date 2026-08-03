@@ -2524,6 +2524,10 @@ function sanitizeSkillForDashboard(skill: SkillPackage): SkillPackage {
 
 function dashboardSkillCliIds(): CliId[] {
   const ids = new Set<CliId>();
+  // Always scan all known CLI skill dirs, not just configured bots — users may
+  // want to discover codex/trae/... skills even before creating a bot for them.
+  const allCliIds: CliId[] = ['claude-code', 'seed', 'relay', 'aiden', 'coco', 'codex', 'codex-app', 'cursor', 'gemini', 'genius', 'opencode', 'antigravity', 'mtr', 'hermes', 'mira', 'mir', 'traex', 'pi', 'copilot', 'oh-my-pi', 'kimi', 'grok', 'kiro-cli', 'riff'];
+  for (const cliId of allCliIds) ids.add(cliId);
   try {
     for (const cliId of configuredCliIds().values()) ids.add(cliId as CliId);
   } catch {
