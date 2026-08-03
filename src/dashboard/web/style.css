@@ -25904,6 +25904,67 @@ button.ui-refresh-button.is-loading .ui-action-icon {
   background: var(--hover-bg, rgba(108, 140, 255, 0.08));
 }
 
+/* Bot palette: drag hint, search, tag filters */
+.skills-bot-palette-hint {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 12px;
+  background: rgba(108, 140, 255, 0.08);
+  border: 1px solid rgba(108, 140, 255, 0.2);
+  border-radius: 8px;
+  font-size: 12px;
+  color: var(--text, #ddd);
+  margin: 0 0 14px;
+  line-height: 1.4;
+}
+.skills-drag-icon {
+  font-size: 18px;
+  color: var(--accent, #6c8cff);
+  flex-shrink: 0;
+}
+
+.skills-bot-palette-search {
+  width: 100%;
+  padding: 6px 10px;
+  margin-bottom: 8px;
+  border: 1px solid var(--border, #444);
+  border-radius: 6px;
+  background: var(--input-bg, #1a1a2a);
+  color: var(--text, #eee);
+  font-size: 12px;
+}
+.skills-bot-palette-search:focus {
+  outline: none;
+  border-color: var(--accent, #6c8cff);
+}
+
+.skills-bot-palette-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-bottom: 8px;
+}
+.skills-tag-filter {
+  padding: 2px 8px;
+  border-radius: 10px;
+  font-size: 11px;
+  border: 1px solid var(--border, #444);
+  background: transparent;
+  color: var(--muted, #999);
+  cursor: pointer;
+  transition: all 0.1s;
+}
+.skills-tag-filter:hover {
+  border-color: var(--accent, #6c8cff);
+  color: var(--text, #ddd);
+}
+.skills-tag-filter.active {
+  background: var(--accent, #6c8cff);
+  color: #fff;
+  border-color: var(--accent, #6c8cff);
+}
+
 @media (max-width: 620px) {
   .skills-installed-block > .sect-head {
     align-items: center;
