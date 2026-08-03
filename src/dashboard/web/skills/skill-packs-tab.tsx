@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useT } from '../react-hooks.js';
 import { LoadingState, RefreshIconButton, SectionHeader } from '../dashboard-components.js';
 import type { SkillPackRow, SkillRow, StatusMessage } from './types.js';
@@ -229,6 +229,7 @@ function SkillPackEditor(props: {
   const [selected, setSelected] = useState<Set<string>>(() => new Set(props.pack?.include.map(s => s.replace('skill:', '')) ?? []));
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [skillQuery, setSkillQuery] = useState('');
   const dialogRef = useRef<HTMLDialogElement | null>(null);
 
   useEffect(() => {
@@ -236,10 +237,30 @@ function SkillPackEditor(props: {
     if (dlg && !dlg.open) dlg.showModal();
   }, []);
 
+  const filteredSkills = useMemo(() => {
+    const q = skillQuery.trim().toLowerCase();
+    if (!q) return props.skills;
+    return props.skills.filter(s => `${s.name} ${s.description ?? ''}`.toLowerCase().includes(q));
+  }, [props.skills, skillQuery]);
+
+  const allFilteredSelected = filteredSkills.length > 0 && filteredSkills.every(s => selected.has(s.name));
+
   const toggleSkill = (skillName: string) => {
     setSelected(prev => {
       const next = new Set(prev);
       if (next.has(skillName)) next.delete(skillName); else next.add(skillName);
+      return next;
+    });
+  };
+
+  const toggleAllFiltered = () => {
+    setSelected(prev => {
+      const next = new Set(prev);
+      if (allFilteredSelected) {
+        for (const s of filteredSkills) next.delete(s.name);
+      } else {
+        for (const s of filteredSkills) next.add(s.name);
+      }
       return next;
     });
   };
@@ -294,9 +315,24 @@ function SkillPackEditor(props: {
           <input value={tags} onChange={e => setTags(e.target.value)} placeholder="tag1, tag2" />
         </div>
         <div className="skills-control-block">
-          <label>{tr('skills.packInclude')} ({selected.size})</label>
+          <div className="skills-pack-include-head">
+            <label>{tr('skills.packInclude')} ({selected.size}/{props.skills.length})</label>
+            <input
+              className="skills-pack-skill-search"
+              type="text"
+              placeholder={tr('skills.searchPlaceholder')}
+              value={skillQuery}
+              onChange={e => setSkillQuery(e.target.value)}
+            />
+          </div>
+          {filteredSkills.length > 0 && (
+            <label className="skills-pack-select-all">
+              <input type="checkbox" checked={allFilteredSelected} onChange={toggleAllFiltered} />
+              {allFilteredSelected ? tr('skills.deselectAll') : tr('skills.selectAll')}
+            </label>
+          )}
           <div className="skills-pack-skill-list">
-            {props.skills.map(skill => (
+            {filteredSkills.map(skill => (
               <label key={skill.name} className="skills-pack-skill-item">
                 <input
                   type="checkbox"
@@ -307,6 +343,7 @@ function SkillPackEditor(props: {
                 {skill.description && <small className="skills-pack-skill-desc">{skill.description}</small>}
               </label>
             ))}
+            {filteredSkills.length === 0 && <p className="muted">{tr('skills.noResults')}</p>}
           </div>
         </div>
         <div className="skills-dialog-actions">
