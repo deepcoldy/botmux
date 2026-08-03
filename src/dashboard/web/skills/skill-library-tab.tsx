@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { useT } from '../react-hooks.js';
 import { SectionHeader } from '../dashboard-components.js';
 import type { InstallSkillCandidate, NativeSkillGroup, SkillRow, StatusMessage } from './types.js';
@@ -145,9 +145,17 @@ function InstallWizard(props: {
   const tr = useT();
   const [step, setStep] = useState(1);
   const sourceType = detectSourceType(props.source);
+  const dialogRef = useRef<HTMLDialogElement | null>(null);
+
+  useEffect(() => {
+    const dlg = dialogRef.current;
+    if (dlg && !dlg.open) {
+      try { dlg.showModal(); } catch { /* already open */ }
+    }
+  }, []);
 
   return (
-    <dialog className="bd-dialog skills-install-wizard" open onClose={props.onClose}>
+    <dialog className="bd-dialog skills-install-wizard" ref={dialogRef} onClose={props.onClose}>
       <form method="dialog" onSubmit={e => { e.preventDefault(); }}>
         <h3>{tr('skills.installWizard')}</h3>
         <div className="skills-wizard-steps">
@@ -253,6 +261,14 @@ function PostInstallPackDialog(props: {
   const [name, setName] = useState('');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const dialogRef = useRef<HTMLDialogElement | null>(null);
+
+  useEffect(() => {
+    const dlg = dialogRef.current;
+    if (dlg && !dlg.open) {
+      try { dlg.showModal(); } catch { /* already open */ }
+    }
+  }, []);
 
   const create = async () => {
     if (!id.trim() || !name.trim()) return;
@@ -268,7 +284,7 @@ function PostInstallPackDialog(props: {
   };
 
   return (
-    <dialog className="bd-dialog skills-post-install-pack" open onClose={() => !busy && props.onClose()}>
+    <dialog className="bd-dialog skills-post-install-pack" ref={dialogRef} onClose={() => !busy && props.onClose()}>
       <form method="dialog" onSubmit={event => { event.preventDefault(); void create(); }}>
         <h3>{tr('skills.postInstallPackTitle')}</h3>
         <p>{tr('skills.postInstallPackHelp', { count: props.skillNames.length })}</p>
