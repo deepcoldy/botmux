@@ -652,10 +652,10 @@ describe('DAEMON_COMMANDS set', () => {
   });
 
   it('should have the correct size', () => {
-    // 30 = current master command set without the removed /land command.
+    // 31 = current master command set (30) + /fork (session clone).
     // /subscribe-lark-doc remains
     // as its original per-file API subscription command rather than an alias.
-    expect(DAEMON_COMMANDS.size).toBe(30);
+    expect(DAEMON_COMMANDS.size).toBe(31);
   });
 
   it('contains the /list-slash-command lister and its /slash alias', () => {
