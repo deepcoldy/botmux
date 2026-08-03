@@ -107,7 +107,14 @@ const DEFAULT_LISTENER: MessageListenerData = {
 };
 
 function cloneListener(listener: MessageListenerData | null | undefined): MessageListenerData {
-  const mode = listener?.senderPolicy?.mode === 'all_except_excluded' ? 'all_except_excluded' : 'include_only';
+  // Mirror the backend storage default: persisted configs OMIT `mode` when it
+  // equals 'all_except_excluded' (see message-listener-store sanitize +
+  // bot-registry normalize), so an ABSENT mode means all_except_excluded, NOT
+  // include_only. DEFAULT_LISTENER sets 'include_only' explicitly, so a
+  // brand-new (unsaved) listener still starts on the allow-list. Treating an
+  // absent mode as include_only here is what made the toggle snap back to
+  // "listen to selected only" after saving "listen to all".
+  const mode = listener?.senderPolicy?.mode === 'include_only' ? 'include_only' : 'all_except_excluded';
   return {
     enabled: listener?.enabled === true,
     name: listener?.name ?? '',
