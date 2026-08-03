@@ -312,11 +312,14 @@ function PostInstallPackDialog(props: {
   );
 }
 
-function detectSourceType(source: string): 'github' | 'git' | 'local' | 'agentbuddy' | 'unknown' {
+function detectSourceType(source: string): 'github' | 'git' | 'local' | 'agentbuddy' | 'zip' | 'unknown' {
   const s = source.trim().toLowerCase();
   if (!s) return 'unknown';
-  if (s.startsWith('agentbuddy')) return 'agentbuddy';
+  if (s.includes('agentbuddy')) return 'agentbuddy';
+  if (s.endsWith('.zip') || s.includes('.zip')) return 'zip';
   if (s.includes('github.com')) return 'github';
+  // Any http(s) URL that's not github is treated as a generic git repo
+  if (s.startsWith('http://') || s.startsWith('https://')) return 'git';
   if (s.startsWith('git@') || s.startsWith('git://') || s.endsWith('.git')) return 'git';
   if (s.startsWith('/') || s.startsWith('./') || s.startsWith('~')) return 'local';
   if (s.includes('github')) return 'github';

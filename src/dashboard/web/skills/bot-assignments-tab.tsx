@@ -19,6 +19,25 @@ export function BotAssignmentsTab(props: BotAssignmentsTabProps) {
   const [editingBot, setEditingBot] = useState<BotRow | null>(null);
   const [dragOverBot, setDragOverBot] = useState<string | null>(null);
   const [dragItem, setDragItem] = useState<DragItem | null>(null);
+  const [skillQuery, setSkillQuery] = useState('');
+  const [activeTag, setActiveTag] = useState<string | null>(null);
+
+  const allTags = useMemo(() => {
+    const tags = new Set<string>();
+    for (const skill of props.skills) {
+      for (const tag of skill.tags ?? []) tags.add(tag);
+    }
+    return [...tags].sort();
+  }, [props.skills]);
+
+  const filteredSkills = useMemo(() => {
+    const q = skillQuery.trim().toLowerCase();
+    return props.skills.filter(skill => {
+      if (activeTag && !(skill.tags ?? []).includes(activeTag)) return false;
+      if (!q) return true;
+      return `${skill.name} ${skill.description ?? ''}`.toLowerCase().includes(q);
+    });
+  }, [props.skills, skillQuery, activeTag]);
 
   const handleDrop = async (bot: BotRow) => {
     if (!dragItem) return;
@@ -44,7 +63,10 @@ export function BotAssignmentsTab(props: BotAssignmentsTabProps) {
       />
       <div className="skills-bot-assign-layout">
         <div className="skills-bot-palette">
-          <p className="skills-bot-palette-hint">{tr('skills.dragHint')}</p>
+          <div className="skills-bot-palette-hint">
+            <span className="skills-drag-icon">⤧</span>
+            <span>{tr('skills.dragHint')}</span>
+          </div>
           {props.packs.length > 0 && (
             <div className="skills-bot-palette-group">
               <span className="skills-bot-palette-label">{tr('skills.packChips')}</span>
@@ -66,8 +88,34 @@ export function BotAssignmentsTab(props: BotAssignmentsTabProps) {
           )}
           <div className="skills-bot-palette-group">
             <span className="skills-bot-palette-label">{tr('skills.individualSkills')}</span>
+            <input
+              className="skills-bot-palette-search"
+              type="text"
+              placeholder={tr('skills.searchPlaceholder')}
+              value={skillQuery}
+              onChange={e => setSkillQuery(e.target.value)}
+            />
+            {allTags.length > 0 && (
+              <div className="skills-bot-palette-tags">
+                <button
+                  className={`skills-tag-filter${activeTag === null ? ' active' : ''}`}
+                  onClick={() => setActiveTag(null)}
+                >
+                  {tr('skills.all')}
+                </button>
+                {allTags.map(tag => (
+                  <button
+                    key={tag}
+                    className={`skills-tag-filter${activeTag === tag ? ' active' : ''}`}
+                    onClick={() => setActiveTag(activeTag === tag ? null : tag)}
+                  >
+                    {tag}
+                  </button>
+                ))}
+              </div>
+            )}
             <div className="skills-bot-palette-items">
-              {props.skills.map(skill => (
+              {filteredSkills.map(skill => (
                 <span
                   key={skill.name}
                   className="skills-draggable-chip skills-skill-chip"
@@ -79,6 +127,9 @@ export function BotAssignmentsTab(props: BotAssignmentsTabProps) {
                   {skill.name}
                 </span>
               ))}
+              {filteredSkills.length === 0 && (
+                <span className="muted">{tr('skills.noResults')}</span>
+              )}
             </div>
           </div>
         </div>
