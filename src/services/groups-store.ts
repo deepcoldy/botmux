@@ -179,7 +179,12 @@ function classifyRenameChatError(code: unknown): 'permission_denied' | 'lark_api
  */
 export async function createChat(
   creatorLarkAppId: string,
-  opts: { name?: string; botIds: string[]; userIds?: string[] },
+  opts: {
+    name?: string;
+    botIds: string[];
+    userIds?: string[];
+    groupMessageType?: 'chat' | 'thread';
+  },
 ): Promise<{ chatId: string; invalidBotIds: string[]; invalidUserIds: string[] }> {
   const client = getBotClient(creatorLarkAppId);
   // Filter out the creator from bot_id_list — Lark errors if the inviter
@@ -188,6 +193,7 @@ export async function createChat(
   const userIds = (opts.userIds ?? []).filter(Boolean);
   const data: Record<string, unknown> = {};
   if (opts.name) data.name = opts.name;
+  if (opts.groupMessageType) data.group_message_type = opts.groupMessageType;
   if (otherBots.length > 0) data.bot_id_list = otherBots;
   if (userIds.length > 0) data.user_id_list = userIds;
   const params: Record<string, unknown> = {};

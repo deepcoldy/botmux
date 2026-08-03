@@ -31,6 +31,9 @@ export interface CreateGroupOpts {
    *  (Lark rejects self-invite). May be empty (creator-only chat). */
   larkAppIds: string[];
   name?: string;
+  /** Native Feishu group message mode. `thread` creates a topic group in the
+   * initial chat.create call, avoiding a separate user-authenticated update. */
+  groupMessageType?: 'chat' | 'thread';
   userOpenIds?: string[];
   /** Users to add by union_id (tenant-stable) — used to pull bot OWNERS into a
    *  federated group regardless of which bot they paired through (open_id is
@@ -143,6 +146,7 @@ export async function createGroupWithBots(opts: CreateGroupOpts): Promise<Create
     name: opts.name,
     botIds: [],
     userIds: opts.userOpenIds ?? [],
+    groupMessageType: opts.groupMessageType,
   });
   opts.onChatCreated?.(r.chatId);
   for (let i = 0; i < otherBots.length; i += BOT_BATCH) {

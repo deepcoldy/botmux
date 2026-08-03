@@ -35,6 +35,11 @@ describe('botmux root help workflow surface', () => {
       expect(stdout).toContain('template archive-runs [--commit|--verify <archive>|--retire <archive> --ack-daemon-stopped]');
       expect(stdout).toContain('v2 历史 run 私有静态归档');
       expect(stdout).toContain('原子迁入 quarantine');
+      expect(stdout).toContain('create-group --bot <name> [--bot ...] [--name "群名"]');
+      expect(stdout).toContain('botmux create-group --help');
+      expect(stdout).toContain('chat rename <新群名称>');
+      expect(stdout).toContain('chat send --bot <name> --chat-id <oc_xxx> --markdown-file <path>');
+      expect(stdout).toContain('[--topic]');
       expect(stdout).not.toContain('template <run|resume|cancel|ls|tail|validate|show>');
       expect(stdout).not.toContain('v2 执行兼容面');
       expect(stdout).not.toContain('workflow <run|resume|cancel|ls|tail|validate|show>');

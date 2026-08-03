@@ -79,6 +79,11 @@ d('root-dispatch transport gate — behavioral, tamper-resistant (built CLI)', (
       expect(code, `${cmd} honest exit`).toBe(2);
       expect(out, `${cmd} msg`).toMatch(/unavailable|no Feishu|HTTP control-API/);
     }
+    const chatSend = runCli(['chat', 'send'], {
+      BOTMUX_SESSION_ID: VIRTUAL_SID, BOTMUX_CHAT_ID: 'http_async_behaviorzero', BOTMUX_LARK_APP_ID: 'cli_test_bot',
+    });
+    expect(chatSend.code, 'chat send honest exit').toBe(2);
+    expect(chatSend.out, 'chat send msg').toMatch(/unavailable|no Feishu|HTTP control-API/);
   });
 
   it('TAMPERED env (env -u all BOTMUX_*) with a --session-id target: still refused', () => {

@@ -185,6 +185,20 @@ describe('groups-store wrappers', () => {
     expect(callArgs.data.bot_id_list).toEqual(['cli_other']);
   });
 
+  it('createChat creates a native topic group when groupMessageType is thread', async () => {
+    chatCreateStub.mockResolvedValueOnce({
+      code: 0,
+      data: { chat_id: 'oc_topic', invalid_bot_id_list: [] },
+    });
+    await createChat('cli_creator', {
+      name: 'topic team',
+      botIds: ['cli_creator'],
+      groupMessageType: 'thread',
+    });
+    const callArgs = chatCreateStub.mock.calls[0][0];
+    expect(callArgs.data.group_message_type).toBe('thread');
+  });
+
   it('createChat omits bot_id_list when only creator is in the bot list', async () => {
     chatCreateStub.mockResolvedValueOnce({
       code: 0,

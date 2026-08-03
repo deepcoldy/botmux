@@ -4448,8 +4448,110 @@ async function postSessionCliIpc(
 
 async function cmdChat(argv: string[]): Promise<void> {
   const sub = argv[0] ?? '';
+  if (sub === 'send') {
+    assertTurnTransportOrExit('chat send');
+    const rest = argv.slice(1);
+    if (rest.includes('--help') || rest.includes('-h')) {
+      console.log(`
+botmux chat send — 用指定 Bot 身份向已知飞书群发送顶层 Markdown 卡片
+
+用法:
+  botmux chat send --bot <name|larkAppId> --chat-id <oc_xxx>
+                   --markdown-file <path> [--idempotency-key <key>]
+
+说明:
+  - 不依赖 Botmux Session，适合安装器和已有群的失败恢复。
+  - --bot 必须是该群成员；消息使用该 Bot 的飞书身份发送。
+  - --idempotency-key 最长 50 字节，飞书会在有效期内去重。
+`);
+      return;
+    }
+    const botRef = argValue(rest, '--bot');
+    const chatId = argValue(rest, '--chat-id');
+    const markdownFile = argValue(rest, '--markdown-file');
+    const idempotencyKey = argValue(rest, '--idempotency-key');
+    if (!botRef || !chatId || !markdownFile) {
+      console.error('用法: botmux chat send --bot <name|larkAppId> --chat-id <oc_xxx> --markdown-file <path> [--idempotency-key <key>]');
+      process.exitCode = 2;
+      return;
+    }
+    if (!/^oc_[A-Za-z0-9]+$/.test(chatId)) {
+      console.error(`非法 --chat-id: ${chatId}`);
+      process.exitCode = 2;
+      return;
+    }
+    if (!existsSync(markdownFile)) {
+      console.error(`Markdown 文件不存在: ${markdownFile}`);
+      process.exitCode = 1;
+      return;
+    }
+    const markdown = readFileSync(markdownFile, 'utf-8');
+    if (!markdown.trim()) {
+      console.error('Markdown 文件内容不能为空。');
+      process.exitCode = 2;
+      return;
+    }
+    if (Buffer.byteLength(markdown, 'utf-8') > 256 * 1024) {
+      console.error('Markdown 文件超过 256 KiB。');
+      process.exitCode = 2;
+      return;
+    }
+    if (idempotencyKey && Buffer.byteLength(idempotencyKey, 'utf-8') > 50) {
+      console.error('--idempotency-key 最长 50 字节。');
+      process.exitCode = 2;
+      return;
+    }
+
+    const { registerBot, loadBotConfigs } = await import('./bot-registry.js');
+    const fullConfigs = loadBotConfigs();
+    const dataDir = resolveDataDir();
+    const botInfoPath = join(dataDir, 'bots-info.json');
+    let botInfoEntries: Array<{ larkAppId: string; botName: string | null }> = [];
+    try {
+      if (existsSync(botInfoPath)) botInfoEntries = JSON.parse(readFileSync(botInfoPath, 'utf-8'));
+    } catch { /* invalid bots-info is equivalent to no display-name hints */ }
+    const { resolveBotRefs } = await import('./cli/create-group-resolver.js');
+    const resolved = resolveBotRefs(
+      [botRef],
+      fullConfigs.map(c => ({ larkAppId: c.larkAppId, cliId: c.cliId })),
+      botInfoEntries,
+    );
+    if (resolved.ambiguousWarnings.length > 0) {
+      console.error(`--bot 引用有歧义: ${resolved.ambiguousWarnings.join(' ')}`);
+      process.exitCode = 2;
+      return;
+    }
+    if (resolved.invalid.length > 0 || resolved.larkAppIds.length !== 1) {
+      console.error(`无法解析 --bot ${botRef}`);
+      process.exitCode = 2;
+      return;
+    }
+    const larkAppId = resolved.larkAppIds[0];
+    const cfg = fullConfigs.find(c => c.larkAppId === larkAppId);
+    if (!cfg) {
+      console.error(`未找到 Bot 配置: ${larkAppId}`);
+      process.exitCode = 1;
+      return;
+    }
+    registerBot(cfg);
+    const { sendBotMarkdownToChat } = await import('./services/chat-sender.js');
+    try {
+      const result = await sendBotMarkdownToChat({
+        larkAppId,
+        chatId,
+        markdown,
+        idempotencyKey,
+        brand: cfg.brandLabel,
+      });
+      console.log(JSON.stringify({ ok: true, identity: 'bot', larkAppId, chatId, ...result }));
+    } catch (err: any) {
+      console.error(`Bot 群消息发送失败: ${err?.message ?? err}`);
+      process.exitCode = 1;
+    }
+    return;
+  }
   if (sub !== 'rename') {
-    console.error('用法: botmux chat rename <新群名称> [--proactive]');
+    console.error('用法: botmux chat rename <新群名称> [--proactive] | botmux chat send --help');
     process.exitCode = 2;
     return;
   }
@@ -5333,6 +5435,8 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
 飞书消息（在 CLI 会话内自动推断 session）:
   chat rename <新群名称>               修改当前会话所在群的名称
        --proactive                    标记为 AI 主动改名（应用 10 分钟防抖）
+  chat send --bot <name> --chat-id <oc_xxx> --markdown-file <path>
+                                       用指定 Bot 身份向已知群发送顶层 Markdown 卡片；不依赖 Session
   send [content]                       发消息到当前话题（支持 stdin / --content-file）
        --images <path>                 内联图片（可重复）
        --files <path>                  附件（可重复）
@@ -5396,7 +5500,7 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
   report [...]                         v3/编排场景向上汇报进度或结果（详见 \`botmux report --help\`）
 
 新建飞书群:
-  create-group --bot <name> [--bot ...] [--name "群名"]
+  create-group --bot <name> [--bot ...] [--name "群名"] [--topic]
                                        用指定 bot 起新群；详见 \`botmux create-group --help\`
 
 精确群对话授权（talk-only）:
@@ -8725,7 +8829,7 @@ async function cmdCreateGroup(rest: string[]): Promise<void> {
 botmux create-group — 用一组机器人新建飞书群
 
 用法:
-  botmux create-group --bot <name|larkAppId> [--bot ...] [--name "群名"]
+  botmux create-group --bot <name|larkAppId> [--bot ...] [--name "群名"] [--topic]
                       [--working-dir <path>]
                       [--kickoff-bot <open_id> --kickoff-prompt "文本"]
                       [--json-status]
@@ -8736,6 +8840,7 @@ botmux create-group — 用一组机器人新建飞书群
                   bots.json 中第一个。重名 → 取 bots.json 中第一个匹配，stderr 打 warning。
                   重复 ref → 自动去重保留首次顺序。
   --name <群名>   可选；不传则用飞书默认无名群。
+  --topic         可选；在 chat.create 时直接创建原生话题群，不再先建普通群后二次更新。
   --working-dir <path>
                  可选；创建成功后，把新群为所有成功入群的 bot 绑定到该目录（等价于逐个 /oncall bind），
                  下次在群里开新话题时直接使用该目录，跳过仓库选择卡片。也可写作 --cwd / --dir。
@@ -8772,6 +8877,7 @@ botmux create-group — 用一组机器人新建飞书群
 
   const botRefs = argValues(rest, '--bot');
   const name = argValue(rest, '--name');
+  const topic = rest.includes('--topic');
   const workingDirArg = argValue(rest, '--working-dir', '--cwd', '--dir');
   const kickoffBot = argValue(rest, '--kickoff-bot');
   const kickoffPrompt = argValue(rest, '--kickoff-prompt');
@@ -8890,6 +8996,7 @@ botmux create-group — 用一组机器人新建飞书群
       creatorLarkAppId,
       larkAppIds: resolved.larkAppIds,
       name: name?.trim() || undefined,
+      groupMessageType: topic ? 'thread' : undefined,
       userOpenIds: targetOpenId ? [targetOpenId] : [],
       transferOwnerTo: targetOpenId,
       notifyOwnerOpenId: targetOpenId,

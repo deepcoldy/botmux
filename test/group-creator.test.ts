@@ -87,6 +87,18 @@ describe('createGroupWithBots', () => {
     );
   });
 
+  it('passes native topic mode to chat.create', async () => {
+    mockCreateChat.mockResolvedValue({ chatId: 'oc_topic', invalidBotIds: [], invalidUserIds: [] });
+    await createGroupWithBots({
+      creatorLarkAppId: CREATOR,
+      larkAppIds: [CREATOR, OTHER_BOT],
+      groupMessageType: 'thread',
+    });
+    expect(mockCreateChat).toHaveBeenCalledWith(CREATOR, expect.objectContaining({
+      groupMessageType: 'thread',
+    }));
+  });
+
   it('pulls bot owners into the chat by union_id; reports invalidOwnerUnionIds', async () => {
     mockCreateChat.mockResolvedValue({ chatId: 'oc_fed', invalidBotIds: [], invalidUserIds: [] });
     mockAddUsersByUnionId.mockResolvedValue({ invalidUserIds: ['on_gone'] });
