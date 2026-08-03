@@ -3626,6 +3626,7 @@ export async function handleCommand(
           t('help.introduce', undefined, loc),
           t('help.relay', undefined, loc),
           t('help.relay_create', undefined, loc),
+          t('help.fork', undefined, loc),
           '',
           t('help.heading_login', undefined, loc),
           t('help.login', undefined, loc),

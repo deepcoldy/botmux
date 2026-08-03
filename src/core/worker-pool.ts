@@ -3431,6 +3431,47 @@ export async function forkSession(
   childSession.workingDir = ds.session.workingDir;
   childSession.ownerOpenId = ds.session.ownerOpenId;
   childSession.backendType = ds.session.backendType;
+  // Bot identity on the PERSISTED row. Every other createSession caller sets
+  // this immediately after minting (trigger-session / session-manager /
+  // card-handler / daemon); the fork child must too. The runtime childDs below
+  // carries larkAppId, but if the daemon restarts before the child's first
+  // spawn persists its own cliSessionId, restoreActiveSessions resolves the bot
+  // via `session.larkAppId ?? getAllBots()[0]` — a missing value silently
+  // misattributes the fork to the FIRST bot in the roster (cross-bot identity
+  // bug in a multi-bot fleet), and destabilises sandbox transcript/BOT_HOME
+  // location.
+  childSession.larkAppId = ds.larkAppId;
+  // Frozen launch posture — inherit the source's RECORDED decisions wholesale
+  // rather than letting forkWorker re-derive them for a brand-new row. Two
+  // reasons this is mandatory, not cosmetic:
+  //   • sandbox*: a fresh child row has sandbox===undefined, and forkWorker's
+  //     cold-spawn runs with resume=true → it hits the "resume + no recorded
+  //     decision → sandbox=false" branch meant for pre-sandbox-era legacy
+  //     sessions. A fork of a sandboxed session would therefore run UNSANDBOXED
+  //     (bwrap credential seal — bots.json deny / sibling appsecrets /
+  //     master.key / network deny — silently dropped). This is a security
+  //     escape, so copy the recorded decision and its path lists verbatim.
+  //   • model / reasoningEffort / cliPathOverride / wrapperCli / agentFrozen:
+  //     without these the child's sessionAgentConfig() sees !agentFrozen and
+  //     re-freezes from the CURRENT bot config, silently dropping any per-session
+  //     /model or /effort override the source carried (reasoningEffort has no
+  //     botCfg fallback at all → drops to undefined). Copying the frozen tuple
+  //     keeps the clone's launch identity == the source's.
+  // readIsolation is intentionally NOT copied: it is not a persisted Session
+  // field (forkWorker derives it from botCfg at spawn), and the child runs the
+  // SAME bot, so it is preserved automatically. persistentBackendTarget is also
+  // intentionally NOT inherited — that is the parent's specific pane/Herdr
+  // affinity; the child cold-spawns its own fresh backing.
+  childSession.sandbox = ds.session.sandbox;
+  childSession.sandboxPaths = ds.session.sandboxPaths;
+  childSession.sandboxHidePaths = ds.session.sandboxHidePaths;
+  childSession.sandboxReadonlyPaths = ds.session.sandboxReadonlyPaths;
+  childSession.sandboxNetwork = ds.session.sandboxNetwork;
+  childSession.model = ds.session.model;
+  childSession.reasoningEffort = ds.session.reasoningEffort;
+  childSession.cliPathOverride = ds.session.cliPathOverride;
+  childSession.wrapperCli = ds.session.wrapperCli;
+  childSession.agentFrozen = ds.session.agentFrozen;
   childSession.nativeSessionTitle = childTitle;
   childSession.nativeSessionTitleUserDefined = true;
   sessionStore.updateSession(childSession);
