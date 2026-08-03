@@ -303,8 +303,8 @@ function SkillPackEditor(props: {
                   checked={selected.has(skill.name)}
                   onChange={() => toggleSkill(skill.name)}
                 />
-                <span>{skill.name}</span>
-                {skill.description && <small>{skill.description}</small>}
+                <span className="skills-pack-skill-name">{skill.name}</span>
+                {skill.description && <small className="skills-pack-skill-desc">{skill.description}</small>}
               </label>
             ))}
           </div>
