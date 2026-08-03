@@ -9,107 +9,28 @@ import { SkillPacksTab } from './skills/skill-packs-tab.js';
 import { SkillLibraryTab } from './skills/skill-library-tab.js';
 import { BotAssignmentsTab } from './skills/bot-assignments-tab.js';
 import { DeliverySettingsTab } from './skills/delivery-settings-tab.js';
-import { mergeBotAssignmentSelectors } from './skills/shared.js';
-
-interface SkillRow {
-  name: string;
-  displayName?: string;
-  description?: string;
-  tags?: string[];
-  source?: Record<string, any>;
-  rootDir?: string;
-}
-
-interface NativeSkillGroup {
-  cliId: string;
-  rootDir: string;
-  skills: SkillRow[];
-  label?: string;
-}
-
-interface BotRow {
-  larkAppId: string;
-  botName?: string;
-  online?: boolean;
-  error?: string;
-  skills?: SkillPolicy | null;
-  cliId?: string;
-  skillInjection?: 'global' | 'prompt' | 'off' | null;
-  skillInjectionDefault?: 'global' | 'prompt' | 'off' | null;
-  skillInjectionSupport?: 'dynamic' | 'global' | 'none' | null;
-}
-
-interface SkillPolicy {
-  include?: string[];
-}
-
-interface DashboardRequestError extends Error {
-  status?: number;
-  body?: any;
-}
-
-interface SkillJob {
-  id: string;
-  status: 'running' | 'succeeded' | 'failed';
-  error?: string;
-  skill?: SkillRow;
-  skills?: SkillRow[];
-}
-
-interface InstallSkillCandidate {
-  name: string;
-  path: string;
-  description?: string;
-}
-
-type StatusMessage = { text: string; ok: boolean } | null;
-type DeliveryMode = 'auto' | 'prompt' | 'native';
-type ProjectTrustMode = 'off' | 'all';
+import {
+  discoveryGroupKey,
+  mergeBotAssignmentSelectors,
+  policyConfigured,
+  policyReferenceCount,
+  priorityNames,
+  sourceLabel,
+} from './skills/shared.js';
+import { useSkillsData } from './skills/use-skills-data.js';
+import type {
+  BotRow,
+  DashboardRequestError,
+  DeliveryMode,
+  InstallSkillCandidate,
+  ProjectTrustMode,
+  SkillJob,
+  SkillRemovalReference,
+  SkillRow,
+  StatusMessage,
+} from './skills/types.js';
 
 const INSTALLED_SKILLS_ROWS_PER_PAGE = 2;
-
-interface SkillRemovalReference {
-  name: string;
-  bots: string[];
-}
-
-function nativeLibraryLabel(path: string | undefined, tr: ReturnType<typeof useT>): string | null {
-  const p = String(path ?? '').replace(/\\/g, '/');
-  if (p.includes('/.codex/skills/')) return tr('skills.sourceCodex');
-  if (p.includes('/.claude/skills/')) return tr('skills.sourceClaude');
-  if (p.includes('/.trae/skills/')) return tr('skills.sourceTrae');
-  if (p.includes('/.cursor/skills/')) return tr('skills.sourceCursor');
-  if (p.includes('/.gemini/skills/')) return tr('skills.sourceGemini');
-  if (p.includes('/.config/opencode/skills/')) return tr('skills.sourceOpenCode');
-  return null;
-}
-
-function sourceLabel(skill: SkillRow, tr: ReturnType<typeof useT>): string {
-  const source = skill.source ?? {};
-  if (source.type === 'github') return `github:${source.owner}/${source.repo}/${source.path ?? ''}`;
-  if (source.type === 'git') return `${source.url ?? 'git'}#${source.path ?? ''}`;
-  if (source.type === 'local-link') return nativeLibraryLabel(source.path, tr) ?? tr('skills.sourceLocalLink');
-  if (source.type === 'local-copy') return tr('skills.sourceBotmuxCopy');
-  return String(source.type ?? 'unknown');
-}
-
-function priorityNames(policy?: SkillPolicy | null): string[] {
-  return (policy?.include ?? [])
-    .filter(item => item.startsWith('skill:'))
-    .map(item => item.slice('skill:'.length));
-}
-
-function policyReferenceCount(policy?: SkillPolicy | null): number {
-  return priorityNames(policy).length;
-}
-
-function policyConfigured(policy?: SkillPolicy | null): boolean {
-  return priorityNames(policy).length > 0;
-}
-
-function discoveryGroupKey(group: NativeSkillGroup): string {
-  return `${group.cliId}\n${group.rootDir}`;
-}
 
 function installedSkillsColumnCount(width: number): number {
   if (width >= 1600) return 4;
@@ -743,16 +664,12 @@ function SkillsPage() {
   const timersRef = useRef<Set<number>>(new Set());
   const discoveryDialogRef = useRef<HTMLDialogElement | null>(null);
 
-  const [skills, setSkills] = useState<SkillRow[]>([]);
-  const [nativeSkillGroups, setNativeSkillGroups] = useState<NativeSkillGroup[]>([]);
-  const [bots, setBots] = useState<BotRow[]>([]);
-  const [packs, setPacks] = useState<Array<{ id: string; name: string; include: string[] }>>([]);
-  const [trustProjectSkills, setTrustProjectSkills] = useState<ProjectTrustMode>('off');
-  const [delivery, setDelivery] = useState<DeliveryMode>('auto');
-  const [loadError, setLoadError] = useState<string | null>(null);
-  const [loading, setLoading] = useState(true);
+  const {
+    skills, nativeSkillGroups, bots, packs, trustProjectSkills, delivery,
+    loading, loadError, refresh,
+    setSkills, setBots, setTrustProjectSkills, setDelivery,
+  } = useSkillsData({ apiUnavailableText: tr('skills.apiUnavailable') });
   const [activeTab, setActiveTab] = useState<'packs' | 'library' | 'bots' | 'delivery'>('library');
-  const [refreshKey, setRefreshKey] = useState(0);
 
   const [installSource, setInstallSource] = useState('');
   const [installPath, setInstallPath] = useState('');
@@ -808,69 +725,29 @@ function SkillsPage() {
     timersRef.current.add(id);
   }), []);
 
-  const fetchData = useCallback(async () => {
-    const [skillsRes, botsRes, packsRes] = await Promise.all([
-      fetch('/api/skills'),
-      fetch('/api/bots'),
-      fetch('/api/skill-packs').catch(() => null),
-    ]);
-    const skillsBody = await skillsRes.json().catch(() => ({}));
-    const botsBody = await botsRes.json().catch(() => ({}));
-    const packsBody = packsRes ? await packsRes.json().catch(() => ({})) : {};
-    if (!skillsRes.ok) {
-      const error = skillsBody?.error ?? `skills HTTP ${skillsRes.status}`;
-      throw new Error(error === 'not_found_yet' || error === 'not_found' ? tr('skills.apiUnavailable') : error);
-    }
-    if (!botsRes.ok) throw new Error(botsBody?.error ?? `bots HTTP ${botsRes.status}`);
-    return {
-      skills: Array.isArray(skillsBody.skills) ? skillsBody.skills as SkillRow[] : [],
-      nativeSkillGroups: Array.isArray(skillsBody.nativeSkillGroups) ? skillsBody.nativeSkillGroups as NativeSkillGroup[] : [],
-      bots: Array.isArray(botsBody.bots) ? botsBody.bots as BotRow[] : [],
-      trustProjectSkills: skillsBody.trustProjectSkills === 'all' ? 'all' as const : 'off' as const,
-      delivery: (skillsBody.delivery === 'prompt' || skillsBody.delivery === 'native' ? skillsBody.delivery : 'auto') as DeliveryMode,
-      packs: Array.isArray(packsBody.packs) ? packsBody.packs.map((p: any) => ({ id: p.id, name: p.name, include: p.include ?? [] })) : [],
-    };
-  }, [tr]);
-
-  const refresh = useCallback(async () => {
-    setLoading(true);
-    try {
-      const next = await fetchData();
-      if (!mountedRef.current) return;
-      setSkills(next.skills);
-      setNativeSkillGroups(next.nativeSkillGroups);
-      setBots(next.bots);
-      setPacks(next.packs);
-      setTrustProjectSkills(next.trustProjectSkills);
-      setDelivery(next.delivery);
-      setLoadError(null);
-      setSelectedDiscovered(selected => {
-        const valid = new Set<string>();
-        const installed = new Set(next.skills.map(skill => skill.name));
-        for (const group of next.nativeSkillGroups) {
-          for (const skill of group.skills) {
-            const path = skill.rootDir ?? skill.source?.root ?? '';
-            if (path && !installed.has(skill.name) && selected.has(path)) valid.add(path);
-          }
-        }
-        return valid;
-      });
-    } catch (err: any) {
-      if (!mountedRef.current) return;
-      setLoadError(err?.message ?? String(err));
-    } finally {
-      if (mountedRef.current) setLoading(false);
-    }
-  }, [fetchData]);
-
   useEffect(() => {
     mountedRef.current = true;
-    void refresh();
     return () => {
       mountedRef.current = false;
       clearTimers();
     };
-  }, [clearTimers, refresh]);
+  }, [clearTimers]);
+
+  // Drop native-discovery selections that became invalid after a refresh
+  // (skill got installed, or its group disappeared).
+  useEffect(() => {
+    setSelectedDiscovered(selected => {
+      const valid = new Set<string>();
+      const installed = new Set(skills.map(skill => skill.name));
+      for (const group of nativeSkillGroups) {
+        for (const skill of group.skills) {
+          const path = skill.rootDir ?? skill.source?.root ?? '';
+          if (path && !installed.has(skill.name) && selected.has(path)) valid.add(path);
+        }
+      }
+      return valid.size === selected.size ? selected : valid;
+    });
+  }, [skills, nativeSkillGroups]);
 
   useEffect(() => {
     if (!installedStatus || removingNames.size > 0) return undefined;
@@ -1269,8 +1146,6 @@ function SkillsPage() {
     }
   }
 
-  const handleRefresh = () => { setRefreshKey(k => k + 1); void refresh(); };
-
   const configuredBotCount = bots.filter(bot => policyConfigured(bot.skills)).length;
   const attachedSkillRefCount = bots.reduce((sum, bot) => sum + policyReferenceCount(bot.skills), 0);
 
@@ -1307,8 +1182,8 @@ function SkillsPage() {
           {activeTab === 'packs' && (
             <SkillPacksTab
               skills={skills}
-              onRefresh={handleRefresh}
-              refreshKey={refreshKey}
+              packs={packs}
+              onRefresh={() => void refresh()}
             />
           )}
 

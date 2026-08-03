@@ -1,12 +1,13 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { useT } from '../react-hooks.js';
-import { LoadingState, RefreshIconButton, SectionHeader } from '../dashboard-components.js';
+import { SectionHeader } from '../dashboard-components.js';
 import type { SkillPackRow, SkillRow, StatusMessage } from './types.js';
 
 interface SkillPacksTabProps {
   skills: SkillRow[];
+  /** full pack rows owned by the page-level useSkillsData store */
+  packs: SkillPackRow[];
   onRefresh: () => void;
-  refreshKey: number;
 }
 
 type PackHealth = 'complete' | 'missing' | 'unassigned';
@@ -19,36 +20,15 @@ function healthStatus(pack: SkillPackRow): PackHealth {
 
 export function SkillPacksTab(props: SkillPacksTabProps) {
   const tr = useT();
-  const [packs, setPacks] = useState<SkillPackRow[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
+  // Defensive: page-level store may not have loaded packs yet (or tests may
+  // omit the prop). Fall back to an empty array so length/map never throw.
+  const packs = props.packs ?? [];
+  const skills = props.skills ?? [];
   const [editorOpen, setEditorOpen] = useState(false);
   const [editing, setEditing] = useState<SkillPackRow | null>(null);
   const [status, setStatus] = useState<StatusMessage>(null);
   const [deleteConfirm, setDeleteConfirm] = useState<{ pack: SkillPackRow; references: Array<{ larkAppId: string; botName: string }> } | null>(null);
   const [deleteBusy, setDeleteBusy] = useState(false);
-  const mountedRef = useRef(true);
-
-  const fetchPacks = useCallback(async () => {
-    setLoading(true);
-    setError(null);
-    try {
-      const res = await fetch('/api/skill-packs');
-      const body = await res.json().catch(() => ({}));
-      if (!res.ok) throw new Error(body?.error ?? `HTTP ${res.status}`);
-      if (mountedRef.current) setPacks(Array.isArray(body.packs) ? body.packs : []);
-    } catch (err: any) {
-      if (mountedRef.current) setError(err?.message ?? String(err));
-    } finally {
-      if (mountedRef.current) setLoading(false);
-    }
-  }, []);
-
-  useEffect(() => {
-    mountedRef.current = true;
-    void fetchPacks();
-    return () => { mountedRef.current = false; };
-  }, [fetchPacks, props.refreshKey]);
 
   const openCreate = () => { setEditing(null); setEditorOpen(true); };
   const openEdit = (pack: SkillPackRow) => { setEditing(pack); setEditorOpen(true); };
@@ -57,7 +37,6 @@ export function SkillPacksTab(props: SkillPacksTabProps) {
     setEditorOpen(false);
     setEditing(null);
     setStatus({ text: tr('skills.saved'), ok: true });
-    void fetchPacks();
     props.onRefresh();
   };
 
@@ -71,7 +50,6 @@ export function SkillPacksTab(props: SkillPacksTabProps) {
       const body = await res.json().catch(() => ({}));
       if (res.ok) {
         setStatus({ text: tr('skills.packDeleted', { name: pack.name }), ok: true });
-        void fetchPacks();
         props.onRefresh();
         return;
       }
@@ -95,7 +73,6 @@ export function SkillPacksTab(props: SkillPacksTabProps) {
       if (!res.ok) throw new Error(body?.error ?? `HTTP ${res.status}`);
       setStatus({ text: tr('skills.packDeleted', { name: deleteConfirm.pack.name }), ok: true });
       setDeleteConfirm(null);
-      void fetchPacks();
       props.onRefresh();
     } catch (err: any) {
       setStatus({ text: `${tr('skills.failed')}: ${err?.message ?? err}`, ok: false });
@@ -110,11 +87,9 @@ export function SkillPacksTab(props: SkillPacksTabProps) {
         title={tr('skills.packs')}
         count={tr('skills.packCount', { count: packs.length })}
         hint={tr('skills.packsHelp')}
-      >
-        <RefreshIconButton label={tr('skills.refresh')} onClick={() => void fetchPacks()} />
-      </SectionHeader>
+      />
       {status && <p className={`hint-${status.ok ? 'ok' : 'warn'}`}>{status.text}</p>}
-      {loading ? <LoadingState label={tr('common.loading')} /> : error ? <p className="hint-warn">{error}</p> : (
+      {(
         <div className="bd-card skills-config-card">
           {packs.length === 0 ? (
             <div className="skills-empty-state">
@@ -179,7 +154,7 @@ export function SkillPacksTab(props: SkillPacksTabProps) {
       {editorOpen && (
         <SkillPackEditor
           pack={editing}
-          skills={props.skills}
+          skills={skills}
           onClose={() => { setEditorOpen(false); setEditing(null); }}
           onSaved={handleSaved}
         />
@@ -222,6 +197,7 @@ function SkillPackEditor(props: {
   onSaved: () => void;
 }) {
   const tr = useT();
+  const skills = props.skills ?? [];
   const [id, setId] = useState(props.pack?.id ?? '');
   const [name, setName] = useState(props.pack?.name ?? '');
   const [description, setDescription] = useState(props.pack?.description ?? '');
@@ -239,9 +215,9 @@ function SkillPackEditor(props: {
 
   const filteredSkills = useMemo(() => {
     const q = skillQuery.trim().toLowerCase();
-    if (!q) return props.skills;
-    return props.skills.filter(s => `${s.name} ${s.description ?? ''}`.toLowerCase().includes(q));
-  }, [props.skills, skillQuery]);
+    if (!q) return skills;
+    return skills.filter(s => `${s.name} ${s.description ?? ''}`.toLowerCase().includes(q));
+  }, [skills, skillQuery]);
 
   const allFilteredSelected = filteredSkills.length > 0 && filteredSkills.every(s => selected.has(s.name));
 
@@ -316,7 +292,7 @@ function SkillPackEditor(props: {
         </div>
         <div className="skills-control-block">
           <div className="skills-pack-include-head">
-            <label>{tr('skills.packInclude')} ({selected.size}/{props.skills.length})</label>
+            <label>{tr('skills.packInclude')} ({selected.size}/{skills.length})</label>
             <input
               className="skills-pack-skill-search"
               type="text"
