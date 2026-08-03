@@ -6529,6 +6529,8 @@ dialog.onboarding-dialog::backdrop {
   .sidebar {
     position: static;
     height: auto;
+    /* 窄屏恢复块级流：sidebar 变顶部横向导航条，不需要宽屏那套 flex column 纵向分配。 */
+    display: block;
     padding: 12px;
     border-right: 0;
     border-bottom: 1px solid var(--border);
@@ -7937,6 +7939,10 @@ dialog.onboarding-dialog::backdrop {
   position: sticky;
   top: calc(var(--topbar-height) + 16px);
   height: 100%;
+  /* flex column so 创建按钮常驻顶部、导航区占满剩余高度并在矮屏（异形屏）内部纵向滚动，
+     而不是整块溢出被下面的 overflow:hidden 裁掉且无法滚动。 */
+  display: flex;
+  flex-direction: column;
   margin: 0;
   padding: 12px;
   border: 1px solid var(--border);
@@ -7960,6 +7966,7 @@ dialog.onboarding-dialog::backdrop {
 .sidebar-create-actions {
   display: grid;
   gap: 4px;
+  flex: 0 0 auto;
   margin-bottom: 10px;
   padding-bottom: 10px;
   border-bottom: 1px solid var(--border-soft);
@@ -8019,6 +8026,10 @@ button.sidebar-create-btn:focus-visible {
 
 .sidebar-nav {
   gap: 2px;
+  /* 占满 create-actions 之外的剩余高度；min-height:0 让它能收缩到比内容矮，
+     从而 overflow-y:auto 在矮屏（异形屏）真正触发纵向滚动而不是被父级裁掉。 */
+  flex: 1 1 auto;
+  min-height: 0;
   margin-top: 0;
   overflow-x: hidden;
   overflow-y: auto;
@@ -18365,7 +18376,42 @@ form.dashboard-toolbar > input[type="text"]:focus {
 }
 
 .settings-group-main .settings-group-card {
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  /* Waterfall (masonry) via CSS multi-column so a tall block (e.g. 实验性配置)
+     no longer strands its row-neighbours (本地白板 / 仓库选择) with a big empty
+     gap below — short blocks pack directly under the tall one in the next
+     column. Blocks are independent (no cross-column state), so pure CSS columns
+     are safe here; break-inside:avoid keeps each block whole. Overrides the grid
+     display from the shared .settings-group-card rule above.
+     `columns: <width> <count>` caps at 3 columns but drops to 2/1 when the
+     viewport is too narrow to give each column its min width — otherwise an
+     odd-ratio ("异形屏") narrow-but-wide screen would force 3 skinny columns and
+     the block content (wide toggle labels / field-row controls) overflows into
+     the neighbouring column. */
+  display: block;
+  columns: 300px 3;
+  column-gap: 18px;
+}
+
+.settings-group-main .settings-group-card > .settings-block {
+  break-inside: avoid;
+  /* column layout has no row gap; space blocks with margin instead of grid gap */
+  margin: 0 0 18px;
+  /* avoid the 1px column-fragment wobble some engines show on avoid blocks */
+  display: inline-block;
+  width: 100%;
+}
+
+/* 瀑布流窄列（~1/3 宽）里，label+控件并排的 field-row 放不下：长标题（如
+   「负载进入阈值（load15 / 核数）」）会把 1fr 标题列压到 ~109px，标题文字
+   overflow:visible 溢出盖到右侧 input 上。窄列里改单列堆叠（标题在上、控件占满下一行），
+   与移动端 field-row 的处理一致，彻底消除标题与控件的重叠。 */
+.settings-group-main .settings-group-card .settings-field-row {
+  grid-template-columns: 1fr;
+  gap: 6px 12px;
+  align-items: start;
+}
+.settings-group-main .settings-group-card .settings-field-row .ui-field-title {
+  min-width: 0;
 }
 
 .settings-group-main .settings-vc-block {
@@ -18958,7 +19004,10 @@ input.office-proxy-input[type="text"]:not([type=checkbox]):not([type=radio]):not
     grid-auto-rows: auto;
   }
 
-  .settings-group-main .settings-group-card,
+  .settings-group-main .settings-group-card {
+    column-count: 1;
+  }
+
   .settings-group-ops .settings-group-card {
     grid-template-columns: 1fr;
   }

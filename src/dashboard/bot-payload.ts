@@ -77,6 +77,7 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     regularGroupMentionMode: (j?.regularGroupMentionMode === 'topic' || j?.regularGroupMentionMode === 'never' || j?.regularGroupMentionMode === 'ambient')
       ? j.regularGroupMentionMode
       : 'always',
+    docSubscribeDefaultMode: j?.docSubscribeDefaultMode === 'all' ? 'all' : 'mention-only',
     substituteMode: j?.substituteMode && typeof j.substituteMode === 'object' ? j.substituteMode : null,
     restrictGrantCommands: j?.restrictGrantCommands === true,
     autoGrantRequestCards: j?.autoGrantRequestCards !== false,
@@ -92,6 +93,7 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     startupCommands: typeof j?.startupCommands === 'string' ? j.startupCommands : '',
     customPassthroughCommands: typeof j?.customPassthroughCommands === 'string' ? j.customPassthroughCommands : '',
     canTalkDaemonCommands: typeof j?.canTalkDaemonCommands === 'string' ? j.canTalkDaemonCommands : '',
+    launchShell: typeof j?.launchShell === 'string' ? j.launchShell : '',
     env: typeof j?.env === 'string' ? j.env : '',
     riff: j?.riff && typeof j.riff === 'object' ? j.riff : null,
     skills: j?.skills && typeof j.skills === 'object' ? j.skills : null,

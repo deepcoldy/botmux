@@ -234,6 +234,120 @@ export function sandboxEnabled(): boolean {
 }
 
 /**
+ * Whether this host can run bwrap with a NEW PID namespace + a fresh `/proc`
+ * mount — i.e. `bwrap --unshare-pid --proc /proc`. In a NESTED sandbox (e.g.
+ * riff's AIO sandbox) mounting a fresh procfs inside a new pid namespace is
+ * denied by the kernel: `Can't mount proc on /newroot/proc: Operation not
+ * permitted`. When that happens the file sandbox must degrade (drop
+ * --unshare-pid) rather than fail every spawn — but ONLY in a context where
+ * dropping pid isolation cannot leak a sibling bot's secret via
+ * `/proc/<pid>/environ` (see coreOnlyPidNamespaceDegrade below).
+ *
+ * Probed ONCE per process and cached: it shells out to bwrap and the answer is
+ * a fixed property of the host/namespace we booted in. Returns true when the
+ * probe cannot run at all (bwrap missing) — the caller only consults this to
+ * DECIDE A DEGRADE, and a missing bwrap is handled fail-closed elsewhere; we
+ * must not spuriously degrade the normal fleet on an inconclusive probe.
+ */
+let _canUnsharePid: boolean | undefined;
+
+/** Three-state classification of a single bwrap probe run. The distinction is
+ *  load-bearing: only a `clean-nonzero` (bwrap RAN and returned a real verdict)
+ *  is evidence about namespace support; a `timeout`/spawn-error/signal is
+ *  `inconclusive` and must NEVER be treated as such evidence. */
+export type BwrapProbeOutcome = 'success' | 'clean-nonzero' | 'inconclusive';
+
+/**
+ * Pure decision for the DUAL pid-ns probe — extracted for unit testing.
+ *
+ * We must distinguish "this env forbids a fresh /proc mount inside a NEW pid
+ * namespace" (the real nested-sandbox condition → safe to drop --unshare-pid)
+ * from "bwrap is broken / the probe couldn't run" (must NOT degrade). Two
+ * probes, each classified into THREE states (success / clean-nonzero /
+ * inconclusive):
+ *   - full = `--unshare-user --unshare-pid --proc /proc …` (real sandbox shape)
+ *   - weak = same MINUS `--unshare-pid`
+ *
+ * Degrade IFF `full === 'clean-nonzero' && weak === 'success'` — i.e. bwrap
+ * DEFINITIVELY rejected the run WITH a new pid namespace but ACCEPTED it
+ * WITHOUT one → removing --unshare-pid is precisely the fix (nested signature).
+ * EVERY other combination keeps full isolation (fail-closed):
+ *   - full success → no need to degrade
+ *   - full inconclusive (timeout / spawn error / signal) → NOT evidence of a
+ *     pid-ns restriction, even if weak succeeds → do NOT degrade
+ *   - weak not a clean success (nonzero / inconclusive) → bwrap broken for a
+ *     reason dropping pid-ns won't fix → do NOT degrade
+ *
+ * Returns whether the host CAN keep --unshare-pid (true = no degrade).
+ */
+export function pidNsDualProbeCanUnshare(
+  full: BwrapProbeOutcome,
+  weak: BwrapProbeOutcome,
+): boolean {
+  const degrade = full === 'clean-nonzero' && weak === 'success';
+  return !degrade;
+}
+
+/** Classify a spawnSync result into the three probe states. A spawn error
+ *  (ENOENT), a timeout/kill (`signal` set, e.g. SIGTERM), or a null exit status
+ *  is `inconclusive` — the probe did not yield a real bwrap verdict. A clean
+ *  numeric exit is `success` (0) or `clean-nonzero` (>0). */
+function classifyProbe(r: ReturnType<typeof spawnSync>): BwrapProbeOutcome {
+  if (r.error || r.signal !== null || r.status === null) return 'inconclusive';
+  return r.status === 0 ? 'success' : 'clean-nonzero';
+}
+
+export function bwrapCanUnsharePid(): boolean {
+  if (_canUnsharePid !== undefined) return _canUnsharePid;
+  const lookup = spawnSync('sh', ['-c', 'command -v bwrap'], { encoding: 'utf8' });
+  const located = lookup.status === 0 ? lookup.stdout.trim() : '';
+  if (!located || !isAbsolute(located)) { _canUnsharePid = true; return true; } // inconclusive → don't degrade
+  let executable = located;
+  try { executable = realpathSync(located); } catch { /* fall through to probe */ }
+  // Same SHAPE as the real fs-policy compile (compileToBwrap): --unshare-user
+  // is always present there, and its userns interacts with the proc mount, so
+  // the probe must carry it too or it isn't testing the real condition.
+  const base = ['--dev-bind', '/', '/', '--proc', '/proc', '--unshare-user', '--', '/bin/true'];
+  // FULL: real shape WITH --unshare-pid. Nested pid-ns-restricted sandbox →
+  // clean-nonzero ("Can't mount proc … Operation not permitted"); normal host
+  // → success.
+  const full = classifyProbe(spawnSync(executable, ['--unshare-pid', ...base], { stdio: 'ignore', timeout: 5_000 }));
+  if (full === 'success') { _canUnsharePid = true; return true; } // full works → never degrade
+  // WEAK: same minus --unshare-pid. Only a clean-nonzero full + success weak is
+  // the nested signature; a full timeout/spawn-error (inconclusive) never
+  // degrades even if weak succeeds.
+  const weak = classifyProbe(spawnSync(executable, base, { stdio: 'ignore', timeout: 5_000 }));
+  _canUnsharePid = pidNsDualProbeCanUnshare(full, weak);
+  return _canUnsharePid;
+}
+
+/** Test-only: reset the cached pid-ns probe. */
+export function __testOnly_resetPidNamespaceProbe(): void {
+  _canUnsharePid = undefined;
+}
+
+/**
+ * Whether compileToBwrap should DROP `--unshare-pid` for this spawn. Gated on
+ * BOTH conditions, deliberately conservative (security review):
+ *   1. BOTMUX_CORE_ONLY=1 — core-only synthesizes EXACTLY ONE apiOnly bot
+ *      (bot-registry.maybeSynthesizeCoreOnlyConfig), whose worker carries
+ *      LARK_APP_SECRET='' (no-transport). There is NO sibling worker holding a
+ *      secret in env, so exposing the host pid namespace (a fresh --proc in the
+ *      host pid ns enumerates host processes) cannot leak any bot secret via
+ *      /proc/<pid>/environ. On a normal/mixed fleet a sibling transport bot's
+ *      worker DOES carry the plaintext secret in env (worker-pool.ts:2404), so
+ *      --unshare-pid MUST stay — hence this gate never fires there.
+ *   2. The host actually can't unshare-pid (nested sandbox) — otherwise keep
+ *      full isolation; there's no reason to weaken it when it works.
+ * The on-disk credential seal (fs-policy deny masks) is UNCHANGED regardless;
+ * only the pid-namespace defense-in-depth is dropped, and only where it both
+ * (a) can't work and (b) protects nothing.
+ */
+export function coreOnlyPidNamespaceDegrade(): boolean {
+  return process.env.BOTMUX_CORE_ONLY === '1' && !bwrapCanUnsharePid();
+}
+
+/**
  * Whether a LOCAL sandbox engine applies to this backend at all. riff has NO
  * local CLI process to wrap (execution happens in riff's own remote sandbox);
  * without this bypass the worker's fail-safe "backend not sandboxable" hard
@@ -478,7 +592,7 @@ export function prepareDirectSandbox(opts: {
     try { if (statSync(r.path).isFile()) filePaths.add(r.path); } catch { /* absent → dir-shaped mask */ }
   }
 
-  const compiled = compileToBwrap(opts.policy, { symlinks, emptyDir, emptiesDir: empties, filePaths, chdir: opts.chdir });
+  const compiled = compileToBwrap(opts.policy, { symlinks, emptyDir, emptiesDir: empties, filePaths, chdir: opts.chdir, skipPidNamespace: coreOnlyPidNamespaceDegrade() });
   // The shared empty dir + every empty placeholder file are the ro-bind SOURCES
   // for deny masks: real content hidden + read-only. mode 000 additionally makes
   // the mask unlistable for a NON-root uid (a real deny, not a listable "empty");

@@ -368,10 +368,13 @@ export interface Session {
    * Set true when the idle-worker sweeper suspends this session over the per-bot
    * live cap: the worker AND the backing tmux/herdr/zellij/zmx session (+ CLI) were
    * intentionally killed to reclaim memory, but the session stays `active` and
-   * cold-resumes from its on-disk transcript on the next message. Distinguishes
-   * this deliberate state from a real zombie (pane gone while the server runs):
-   * `restoreActiveSessions` must NOT close a suspended session whose backing
-   * session probes 'missing'. Cleared once a live worker is re-established.
+   * cold-resumes from its on-disk transcript on the next message. Since the
+   * host-reboot fix, NO managed session (suspended or not) is auto-closed just
+   * because its backing probes 'missing' — a resumable transcript is always kept
+   * (see restoreActiveSessions / isSessionStopped). This marker is therefore no
+   * longer a close-guard; it stays as the authoritative "deliberately parked,
+   * expect no worker/pane" signal that drives the `dormant` status label and
+   * skips redundant liveness probes. Cleared once a live worker is re-established.
    */
   suspendedColdResume?: boolean;
   /** CLI used to spawn this session, frozen at creation so bot-level CLI edits only affect new sessions. */

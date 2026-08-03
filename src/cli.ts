@@ -82,7 +82,7 @@ import { scrubClaudeSessionMarkerEnv, scrubSessionCliHomeEnv } from './utils/chi
 import { scheduleTimeZone } from './utils/timezone.js';
 import { expandHomePath, invalidWorkingDirs } from './utils/working-dir.js';
 import { firstPositional } from './cli/arg-utils.js';
-import { isColdResumeDormant, sessionListDisposition } from './cli/session-list-liveness.js';
+import { isColdResumeDormant, isRealManagedSession, sessionListDisposition } from './cli/session-list-liveness.js';
 import {
   attachFrozenManagedZmxSession,
   freezeManagedZmxAttachTarget,
@@ -4173,8 +4173,11 @@ async function cmdList(): Promise<void> {
     const hasPid = !!(s.pid && isProcessAlive(s.pid));
     const hasBackingSession = hasRecoverableBackingSession(s, probeSnapshot);
     const disposition = sessionListDisposition(s, { hasPid, hasBackingSession });
-    if (disposition === 'prune_real') pruned.push(s);
-    else if (disposition === 'prune_scratch') prunedScratch.push(s);
+    // Non-adopt sessions are only ever kept or pruned-as-scratch now: a real
+    // managed session with a missing backing is dormant-recoverable, never
+    // auto-closed by this read command (see sessionListDisposition). Adopt
+    // zombies still reach the `pruned` bucket via the branch above.
+    if (disposition === 'prune_scratch') prunedScratch.push(s);
     else live.push(s);
   }
   const closeNow = async (arr: SessionData[], kind: 'scratch' | 'real'): Promise<number> => {
@@ -4231,7 +4234,6 @@ async function cmdDelete(): Promise<void> {
 
   const sessions = loadSessions();
   const active = [...sessions.values()].filter(s => s.status === 'active');
-  const probeSnapshot = buildBackingProbeSnapshot(active);
 
   if (active.length === 0) {
     console.log('没有活跃会话。');
@@ -4244,18 +4246,22 @@ async function cmdDelete(): Promise<void> {
     toDelete = active;
   } else if (target === 'stopped') {
     toDelete = active.filter(s => {
-      // A deliberately cap-suspended session has neither pid nor backing pane
-      // (that's how its memory is reclaimed) but must cold-resume on the next
-      // message — never a zombie. Mirrors the server-side isSessionStopped guard
-      // and the `list` prune disposition; without it `delete stopped` (which the
-      // overload alert text recommends) would drop a live-but-parked session.
+      // "stopped" = a true zombie the sweep may auto-close. A real managed
+      // session with no live pid is dormant-recoverable, NOT stopped: whether
+      // the CLI merely exited, botmux cap-suspended it, or a host reboot wiped
+      // its backing pane, the on-disk transcript still cold-resumes on the next
+      // message. So a missing backing is NOT a close trigger here — only an
+      // adopted session with a dead external pid, or a disposable scratch that
+      // never became a real CLI session, counts as stopped. Reuses the exact
+      // real-vs-scratch discriminator the server-side isSessionStopped and
+      // `botmux list` prune both use, so the three entry points can't drift.
       if (isColdResumeDormant(s)) return false;
       if (isAdoptedSession(s)) {
         const pid = adoptedCliPid(s);
         return pid ? !isProcessAlive(pid) : !(s.pid && isProcessAlive(s.pid));
       }
       const hasPid = !!(s.pid && isProcessAlive(s.pid));
-      return !hasPid && !hasRecoverableBackingSession(s, probeSnapshot);
+      return !hasPid && !isRealManagedSession(s);
     });
     if (toDelete.length === 0) {
       console.log('没有 stopped 状态的会话。');

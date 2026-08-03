@@ -46,4 +46,21 @@ describe('federation larkTransportEnabled propagation → aggregated roster', ()
     const excluded = roster.bots.filter(b => b.larkTransportEnabled === false).map(b => b.larkAppId);
     expect(excluded).toEqual(['remote_apionly']);
   });
+
+  it('HUB-LOCAL apiOnly bot also carries larkTransportEnabled=false into the roster (via liveBots)', () => {
+    // Regression for the producer-side gap: buildFederatedRoster's LOCAL bot
+    // mapping must propagate transport from liveBots, or a hub's own core-only
+    // bot reaches spokes as undefined (legacy-normal) and slips group filters.
+    const liveBots = [
+      { larkAppId: 'local_normal', botName: 'Normal', cliId: 'claude-code', larkTransportEnabled: true },
+      { larkAppId: 'local_core', botName: 'CoreOnly', cliId: 'claude-code', larkTransportEnabled: false },
+      { larkAppId: 'local_legacy', botName: 'Legacy', cliId: 'claude-code' }, // transport unknown → undefined
+    ];
+    const roster = buildFederatedRoster(dataDir, 'default', undefined, undefined, liveBots);
+    const byId = new Map(roster.bots.map(b => [b.larkAppId, b]));
+    expect(byId.get('local_normal')?.larkTransportEnabled).toBe(true);
+    expect(byId.get('local_core')?.larkTransportEnabled).toBe(false);
+    expect(byId.get('local_legacy')?.larkTransportEnabled).toBeUndefined();
+    expect(roster.bots.filter(b => b.larkTransportEnabled === false).map(b => b.larkAppId)).toEqual(['local_core']);
+  });
 });

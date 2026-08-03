@@ -154,7 +154,7 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
     authPaths: ['~/.codex'],
     get resolvedBin(): string { return (cachedBin ??= resolveCommand(rawBin)); },
 
-    buildArgs({ sessionId, resume, resumeSessionId, forkSession, workingDir, model, reasoningEffort, disableCliBypass, readIsolation, remoteWsUrl, remoteThreadId }) {
+    buildArgs({ sessionId, resume, resumeSessionId, forkSession, workingDir, model, reasoningEffort, disableCliBypass, bypassHookTrust, readIsolation, remoteWsUrl, remoteThreadId }) {
       // Hybrid RPC input mode: attach this TUI to the botmux-owned app-server
       // thread. User input is delivered out-of-band via JSON-RPC (turn/start,
       // see codex-rpc-engine + worker), so the pane is a pure viewer — no paste
@@ -173,6 +173,21 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
       // is OFF and the outer Seatbelt profile is the sole enforcer.
       const baseArgs = [
         ...(!disableCliBypass ? ['--dangerously-bypass-approvals-and-sandbox'] : []),
+        // Codex 0.14x added a second interactive gate AFTER folder trust: the
+        // botmux-installed UserPromptSubmit + Stop hooks in ~/.codex/hooks.json
+        // must be manually trusted ("Press t to trust"), and every botmux upgrade
+        // rewrites codex-hook.sh → its trusted_hash changes → the gate re-fires. A
+        // botmux-managed plain-TUI pane has no human at its PTY to press `t`, so the
+        // first Lark turn wedges forever. This gate is TUI-only: this branch never
+        // runs for --remote (see the early return above), and the app-server rejects
+        // the flag. (`codex exec` DOES accept it, but botmux never launches exec.)
+        //
+        // This is a SEPARATE knob from the approval/sandbox bypass: the flag trusts
+        // ALL hook sources codex sees (user/project/plugin), not only botmux's, so it
+        // is gated by its own global toggle `bypassHookTrust` (default ON, operator can
+        // disable) — expressing "approvals bypassed, hook-trust review kept". Still
+        // ANDed with `!disableCliBypass`: a restricted bot never gets it regardless.
+        ...(!disableCliBypass && bypassHookTrust ? ['--dangerously-bypass-hook-trust'] : []),
         '--no-alt-screen',
         '-c',
         `shell_environment_policy.set.BOTMUX_SESSION_ID=${JSON.stringify(sessionId)}`,

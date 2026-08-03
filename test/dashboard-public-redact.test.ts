@@ -285,4 +285,44 @@ describe('redactSettingsForPublic', () => {
       codexNotifier: { botOptions: ['private malformed option'] },
     })).toEqual({});
   });
+
+  it('removes the complete hostOverloadAlert snapshot (target bot + recipient hints) from tokenless settings', () => {
+    const settings = {
+      publicReadOnly: true,
+      hostOverloadAlert: {
+        enabled: true,
+        targetBotAppId: 'cli_notify',
+        enterLoadRatio: 1.5,
+        enterMemUsedFrac: 0.92,
+        targetDaemonOnline: true,
+        botOptions: [{
+          larkAppId: 'cli_notify',
+          botName: 'Claude',
+          cliId: 'claude',
+          apiOnly: false,
+          recipientConfigured: true,
+          recipientVerified: true,
+          recipientHint: 'b***@example.com',
+        }],
+      },
+    };
+
+    const out = redactSettingsForPublic(settings) as any;
+
+    expect(out.publicReadOnly).toBe(true);
+    expect(out.hostOverloadAlert).toBeUndefined();
+    expect(JSON.stringify(out)).not.toContain('b***@example.com');
+    expect(JSON.stringify(out)).not.toContain('cli_notify');
+    // Non-mutating: authed callers still see the full snapshot.
+    expect(settings.hostOverloadAlert.botOptions[0].recipientHint).toBe('b***@example.com');
+  });
+
+  it('strips BOTH notifier snapshots at once (codexNotifier + hostOverloadAlert)', () => {
+    const out = redactSettingsForPublic({
+      publicReadOnly: false,
+      codexNotifier: { enabled: true, targetBotAppId: 'cli_codex' },
+      hostOverloadAlert: { enabled: true, targetBotAppId: 'cli_notify' },
+    }) as any;
+    expect(out).toEqual({ publicReadOnly: false });
+  });
 });

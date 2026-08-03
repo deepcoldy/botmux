@@ -538,14 +538,6 @@ export class ZmxBackend implements SessionBackend {
     return { state: 'compatible', pid: after.pid, clients: after.clients };
   }
 
-  /** ZMX has one daemon per session rather than one shared server. */
-  static serverState(): 'running' | 'down' | 'unknown' {
-    const probe = ZmxBackend.probeSessions();
-    if (!probe.ok) return 'unknown';
-    if (probe.unhealthySessions.some(s => s.startsWith('bmx-'))) return 'unknown';
-    return probe.sessions.some(s => s.startsWith('bmx-')) ? 'running' : 'down';
-  }
-
   static killSession(name: string): void {
     try {
       execFileSync('zmx', ['kill', name, '--force'], {

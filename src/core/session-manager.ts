@@ -25,7 +25,6 @@ import {
   getSessionPersistentBackendType,
   persistentBackendTargetForSession,
   persistentSessionName,
-  probePersistentBackendServer,
   probePersistentBackendTarget,
   probePersistentSession,
   probePersistentSessions,
@@ -1679,16 +1678,6 @@ export async function restoreActiveSessions(activeSessions: Map<string, DaemonSe
   for (const [backendType, names] of namesByBackend) {
     probeSnapshots.set(backendType, probePersistentSessions(backendType, names));
   }
-  // Server-liveness is sampled ONCE per backend type (cached): a single
-  // `tmux list-sessions` answers for all of that backend's sessions, and a
-  // consistent snapshot avoids a mid-loop race where an early lazy fork could
-  // flip the answer partway through (the loop itself starts no workers).
-  const serverStateCache = new Map<PersistentBackendType, 'running' | 'down' | 'unknown'>();
-  const backendServerState = (bt: PersistentBackendType) => {
-    let s = serverStateCache.get(bt);
-    if (s === undefined) { s = probePersistentBackendServer(bt); serverStateCache.set(bt, s); }
-    return s;
-  };
   for (const { ds, backendType, backendTarget, backendName } of restoreCandidates) {
     // An earlier candidate's mismatch close can await document cleanup, so
     // revalidate exact ownership and worker state for every row before any
@@ -1702,39 +1691,34 @@ export async function restoreActiveSessions(activeSessions: Map<string, DaemonSe
       : probeSnapshots.get(backendType)?.get(backendTarget.sessionName) ?? 'unknown';
     if (probe === 'missing') {
       const tag = ds.session.sessionId.substring(0, 8);
-      // Intentionally cold-resume-suspended (idle-worker sweeper killed the
-      // backing session + CLI to reclaim memory over the per-bot live cap). The
-      // 'missing' backing is EXPECTED here, not a zombie — keep the worker-less
-      // active record so the next message cold-resumes from the transcript
-      // (forkWorker(resume=true) clears the marker once the worker is back).
-      if (ds.session.suspendedColdResume) {
-        logger.info(`[${tag}] ${backendType} session was cap-suspended — keeping active for lazy cold-resume`);
-        continue;
-      }
-      // ZMX is not a shared multiplexer server: every session owns an
-      // independent daemon. Another live ZMX session says nothing about this
-      // one, so "missing" cannot safely drive a destructive zombie close.
-      // Preserve the transcript-backed row and cold-resume on the next message.
-      if (backendType === 'zmx') {
-        logger.warn(`[${tag}] zmx backing session "${backendName}" is missing — keeping active for lazy resume`);
-        continue;
-      }
-      // 'missing' is ambiguous: it means EITHER this one pane is gone while the
-      // server runs (a true solo zombie) OR the whole multiplexer server is down
-      // (e.g. machine reboot) and every pane vanished at once. Only the former is
-      // a zombie to close. On a reboot the CLI transcript on disk is still
-      // resumable, so keep the worker-less active record and let it lazily resume
-      // on the next message (exactly like a pty session) instead of mass-closing
-      // every session — the bug that wiped a full dashboard after a host reboot.
-      if (backendServerState(backendType) === 'down') {
-        logger.warn(`[${tag}] ${backendType} server is down (host reboot?) — keeping "${backendName}" active for lazy resume instead of closing`);
-        continue;
-      }
-      // Server is up (or its state is inconclusive) and this specific pane is
-      // gone — a true zombie. Close it (evicts the active record + marks the
-      // store row closed) so the next message starts a clean session.
-      logger.warn(`[${tag}] ${backendType} backing session "${backendName}" is gone — closing zombie active session`);
-      await closeSession(ds.session.sessionId);
+      // A missing backing pane is NEVER an auto-close trigger for a managed
+      // session. Whatever wiped the pane — a host reboot (whole multiplexer
+      // server gone, every pane at once), the idle-worker sweeper reclaiming
+      // memory over the per-bot cap, or a solo CLI crash — the on-disk CLI
+      // transcript is still resumable, so the worker-less active record is kept
+      // and the next message cold-resumes from it (forkWorker(resume=true); if
+      // the transcript is genuinely gone the worker's resume→fresh fallback
+      // spawns a clean session with a user-visible notice — never a dead end).
+      //
+      // This deliberately mirrors pty (no persistent backend → never probed,
+      // never closed) and zmx (per-session daemon → 'missing' always kept). The
+      // only sessions that leave the active set are: a real `/close` (which
+      // marks the store row 'closed' up front, so it is never even in this
+      // `active` restore set), an adopt target that provably exited (handled in
+      // the adopt branch above — those wrap a foreign process with no transcript
+      // of our own), and a CLI-config mismatch (handled below).
+      //
+      // History: an earlier version gated this on `serverState() === 'down'` to
+      // distinguish a whole-server reboot from a solo zombie, then closed the
+      // "solo zombie". But botmux shares the default tmux socket with the
+      // operator's own terminal, so a co-tenant session reviving the server
+      // before restore ran made every reboot read as N solo zombies → 239
+      // active sessions mass-closed after one host reboot. Closing bought only a
+      // tidier dashboard while risking irreversible session loss, so the whole
+      // close-on-missing path was removed. A TTL sweep (evict long-idle active
+      // rows) is the right tool for dashboard tidiness and is intentionally out
+      // of scope here.
+      logger.info(`[${tag}] ${backendType} backing session "${backendName}" is missing — keeping active for lazy cold-resume (transcript is still resumable)`);
       continue;
     }
     if (probe === 'unknown') {

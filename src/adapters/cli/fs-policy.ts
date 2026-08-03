@@ -900,6 +900,13 @@ export interface CompileBwrapOpts {
   filePaths?: ReadonlySet<string>;
   /** chdir target (the project working dir). */
   chdir: string;
+  /** Drop `--unshare-pid` (keep the fresh `--proc /proc` mount, which works
+   *  without a new pid namespace). Set ONLY in a nested sandbox that can't
+   *  mount proc inside a new pid ns AND where no sibling secret is exposed via
+   *  /proc — see sandbox.coreOnlyPidNamespaceDegrade. The filesystem deny/allow
+   *  masks (the on-disk credential seal) are unaffected; this drops only the
+   *  process-isolation defense-in-depth. Default false = full isolation. */
+  skipPidNamespace?: boolean;
 }
 
 export interface BwrapCompilation {
@@ -1017,7 +1024,18 @@ export function compileToBwrap(policy: FsPolicy, opts: CompileBwrapOpts): BwrapC
   // tmpfs parent becomes unwritable).
   for (const p of remountRo) a.push('--remount-ro', p);
 
-  a.push('--unshare-user', '--unshare-pid', '--unshare-ipc', '--unshare-uts', '--unshare-cgroup-try');
+  // --unshare-pid is the process-isolation half of the sandbox (defense in
+  // depth), NOT the credential seal — that is the FS deny masks above. A NESTED
+  // sandbox can't mount a fresh /proc inside a new pid ns (bwrap: "Can't mount
+  // proc on /newroot/proc: Operation not permitted"), so it is dropped there
+  // via skipPidNamespace. The fresh `--proc /proc` (line above) still mounts
+  // fine WITHOUT a new pid ns. skipPidNamespace is gated (sandbox.coreOnly
+  // PidNamespaceDegrade) to core-only, where no sibling worker holds a secret
+  // in env → dropping pid isolation exposes no /proc/<pid>/environ secret.
+  const unshares = ['--unshare-user'];
+  if (!opts.skipPidNamespace) unshares.push('--unshare-pid');
+  unshares.push('--unshare-ipc', '--unshare-uts', '--unshare-cgroup-try');
+  a.push(...unshares);
   if (!policy.net) a.push('--unshare-net');
   a.push('--die-with-parent', '--new-session', '--chdir', opts.chdir);
   return { args: a, emptyFiles, maskMounts };

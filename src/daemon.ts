@@ -28,8 +28,9 @@ import {
   buildOverloadAlertCard,
   buildOverloadRecoveredCard,
   initialOverloadCardState,
-  DEFAULT_OVERLOAD_THRESHOLDS,
   INITIAL_OVERLOAD_STATE,
+  computeOverloadThresholds,
+  isOverloadAlertTarget,
   type OverloadState,
   type OverloadThresholds,
 } from './core/host-overload-alert.js';
@@ -76,6 +77,7 @@ import * as chatFirstSeenStore from './services/chat-first-seen-store.js';
 import { ensureDefaultOncallBound } from './services/oncall-store.js';
 import * as scheduleStore from './services/schedule-store.js';
 import { migrateSharedSchedulesAtStartup } from './services/schedule-split-migration.js';
+import { migrateOverloadAlertAtStartup } from './services/overload-alert-migration.js';
 import * as messageQueue from './services/message-queue.js';
 import { emitHookEvent, emitHookEventLocal, HOOK_EVENTS, type HookEvent } from './services/hook-runner.js';
 import { setSessionLifecycleShutdown } from './services/session-lifecycle-hooks.js';
@@ -18187,14 +18189,6 @@ function resolvePrimaryOwnerOpenId(larkAppId: string): string | undefined {
   }
 }
 
-/** Parse a positive float env override, falling back to `dflt` when unset/invalid. */
-function envFloat(name: string, dflt: number): number {
-  const raw = process.env[name];
-  if (raw === undefined || raw.trim() === '') return dflt;
-  const n = Number(raw);
-  return Number.isFinite(n) && n >= 0 ? n : dflt;
-}
-
 /**
  * Host-overload thresholds, seeded from module defaults and overridable via env
  * so an operator can tune sensitivity without a code change:
@@ -18206,37 +18200,24 @@ function envFloat(name: string, dflt: number): number {
  * but are inert (reading passes swap=undefined).
  */
 function resolveOverloadThresholds(): OverloadThresholds {
-  const cpuCount = Math.max(1, cpus().length || 1);
-  const enterLoadRatio = envFloat('BOTMUX_OVERLOAD_ENTER_LOAD_RATIO', DEFAULT_OVERLOAD_THRESHOLDS.enterLoadRatio);
-  let exitLoadRatio = envFloat('BOTMUX_OVERLOAD_EXIT_LOAD_RATIO', DEFAULT_OVERLOAD_THRESHOLDS.exitLoadRatio);
-  const enterMemUsedFrac = envFloat('BOTMUX_OVERLOAD_ENTER_MEM_FRAC', DEFAULT_OVERLOAD_THRESHOLDS.enterMemUsedFrac);
-  let exitMemUsedFrac = envFloat('BOTMUX_OVERLOAD_EXIT_MEM_FRAC', DEFAULT_OVERLOAD_THRESHOLDS.exitMemUsedFrac);
-  // Hysteresis only works when the recover line sits STRICTLY below the enter
-  // line. Clamping a misconfigured exit down to *equal* enter is not enough: at
-  // enter == exit the enter test (mem `>=`) and the recover test (mem `<=`) both
-  // fire at the exact threshold, so a reading pinned there flaps entered/
-  // recovered every tick. Force a small gap below enter (5%) and warn.
-  const HYSTERESIS_MARGIN = 0.95; // exit = 95% of enter when misconfigured
-  if (exitLoadRatio >= enterLoadRatio) {
-    const clamped = enterLoadRatio * HYSTERESIS_MARGIN;
-    logger.warn(`[overload] BOTMUX_OVERLOAD_EXIT_LOAD_RATIO (${exitLoadRatio}) >= ENTER (${enterLoadRatio}); clamping exit to ${clamped}`);
-    exitLoadRatio = clamped;
-  }
-  if (exitMemUsedFrac >= enterMemUsedFrac) {
-    const clamped = enterMemUsedFrac * HYSTERESIS_MARGIN;
-    logger.warn(`[overload] BOTMUX_OVERLOAD_EXIT_MEM_FRAC (${exitMemUsedFrac}) >= ENTER (${enterMemUsedFrac}); clamping exit to ${clamped}`);
-    exitMemUsedFrac = clamped;
-  }
-  return {
-    cpuCount,
-    enterLoadRatio,
-    exitLoadRatio,
-    enterMemUsedFrac,
-    exitMemUsedFrac,
-    enterSwapUsedFrac: DEFAULT_OVERLOAD_THRESHOLDS.enterSwapUsedFrac,
-    exitSwapUsedFrac: DEFAULT_OVERLOAD_THRESHOLDS.exitSwapUsedFrac,
-    minReAlertMs: envFloat('BOTMUX_OVERLOAD_MIN_REALERT_MS', DEFAULT_OVERLOAD_THRESHOLDS.minReAlertMs),
-  };
+  // Enter thresholds priority (env > global config > default) + hysteresis-safe
+  // exit derivation live in the pure computeOverloadThresholds() so they can be
+  // unit-tested without importing this side-effectful module. We only gather the
+  // impure inputs (CPU count, persisted config, env strings) here.
+  const cfg = readGlobalConfig().hostOverloadAlert ?? {};
+  return computeOverloadThresholds({
+    cpuCount: cpus().length || 1,
+    configEnterLoadRatio: cfg.enterLoadRatio,
+    configEnterMemUsedFrac: cfg.enterMemUsedFrac,
+    env: {
+      enterLoadRatio: process.env.BOTMUX_OVERLOAD_ENTER_LOAD_RATIO,
+      exitLoadRatio: process.env.BOTMUX_OVERLOAD_EXIT_LOAD_RATIO,
+      enterMemUsedFrac: process.env.BOTMUX_OVERLOAD_ENTER_MEM_FRAC,
+      exitMemUsedFrac: process.env.BOTMUX_OVERLOAD_EXIT_MEM_FRAC,
+      minReAlertMs: process.env.BOTMUX_OVERLOAD_MIN_REALERT_MS,
+    },
+    warn: (message) => logger.warn(message),
+  });
 }
 
 /**
@@ -18509,6 +18490,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // running in a separate node process) so dashboard event bus stays in sync.
   scheduleStore.setScheduleScope(cfg.larkAppId);
   migrateSharedSchedulesAtStartup(botConfigs.map(b => b.larkAppId), botConfigs[0]?.larkAppId ?? cfg.larkAppId);
+  void migrateOverloadAlertAtStartup(botConfigs.map(b => ({ larkAppId: b.larkAppId, apiOnly: b.apiOnly })));
   scheduleStore.startExternalWriteWatcher();
   logger.info(`Bot ${idx}/${botConfigs.length}: ${cfg.larkAppId} (cli: ${cfg.cliId})`)
   setAskCardDispatcher(createLarkAskCardDispatcher());
@@ -19263,26 +19245,30 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     }, 5_000).unref?.();
   }
 
-  // Host-overload watcher. Enabled per-bot via the `overloadAlert` config toggle
-  // (dashboard → Groups & Bots → bot card), NOT hardcoded to the primary daemon:
-  // any one bot can be designated the machine's alerter. load/mem are host-wide,
-  // so if more than one bot has it on, a cross-process file lock keyed on the
-  // overload episode ensures the machine only DMs once per edge (whichever bot's
-  // daemon wins the lock speaks). Reads os.loadavg()[2] + mem every 30s; on a
-  // healthy→overloaded or overloaded→healthy edge it DMs that bot's owner.
-  // Hysteresis + a min re-alert window (see host-overload-alert.ts) keep a load
-  // hovering near the line from spamming. Set BOTMUX_OVERLOAD_ALERT=0 to force
-  // the whole feature off regardless of per-bot config.
+  // Host-overload watcher. Machine-level: enabled via the GLOBAL config
+  // `hostOverloadAlert` (dashboard → Global Settings), which names one "notifier
+  // bot". ONLY that bot's own daemon samples + advances the state machine + DMs
+  // (it runs on this host, so no cross-daemon delivery queue is needed) — other
+  // daemons no-op and keep their state cleared. load/mem are host-wide; the
+  // cross-process episode lock is kept purely as a belt-and-suspenders guard
+  // (e.g. a stale duplicate daemon for the same bot). Reads os.loadavg()[2] +
+  // mem every 30s; on a healthy→overloaded or overloaded→healthy edge it DMs the
+  // notifier bot's admin. Hysteresis + a min re-alert window (see
+  // host-overload-alert.ts) keep a load near the line from spamming. Set
+  // BOTMUX_OVERLOAD_ALERT=0 to force the whole feature off regardless of config.
   if (process.env.BOTMUX_OVERLOAD_ALERT !== '0') {
-    const overloadThresholds = resolveOverloadThresholds();
     let overloadState: OverloadState = INITIAL_OVERLOAD_STATE;
     const overloadTimer = setInterval(() => {
       void (async () => {
       try {
-        // Per-bot热开关：关了就不采样，但 timer 常驻，用户在 web 打开后下个 tick 即生效。
-        let enabled = false;
-        try { enabled = getBot(cfg.larkAppId).config.overloadAlert === true; } catch { enabled = false; }
-        if (!enabled) { overloadState = INITIAL_OVERLOAD_STATE; return; }
+        // Global hot switch + target gating: only the selected notifier bot's
+        // daemon samples. When disabled, or the target is another bot / unset,
+        // reset local state so a later re-enable starts clean (no stale edge).
+        const alertCfg = readGlobalConfig().hostOverloadAlert ?? {};
+        if (!isOverloadAlertTarget(alertCfg, { larkAppId: cfg.larkAppId, apiOnly: cfg.apiOnly })) { overloadState = INITIAL_OVERLOAD_STATE; return; }
+        // Re-read thresholds each tick so live config edits (enter load/mem)
+        // take effect on the next sample without a restart.
+        const overloadThresholds = resolveOverloadThresholds();
 
         const reading = {
           load15: loadavg()[2] ?? 0,
@@ -19293,11 +19279,11 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         overloadState = nextState;
         if (!action) return;
 
-        // Machine-wide de-dup: multiple bots may have the toggle on, but the
-        // host is one machine. Claim a short-lived episode lock so only one bot
-        // DMs per edge. Losing the claim = another bot already alerted this edge.
+        // Belt-and-suspenders de-dup: normally only the target daemon reaches
+        // here, but a stale duplicate daemon for the same bot could double-fire.
+        // Claim a short-lived episode lock so the host DMs once per edge.
         if (!claimOverloadEpisode(action.kind)) {
-          logger.info(`[overload] ${action.kind} edge already claimed by a sibling bot; skipping DM (${cfg.larkAppId})`);
+          logger.info(`[overload] ${action.kind} edge already claimed; skipping DM (${cfg.larkAppId})`);
           return;
         }
         const ownerOpenId = resolvePrimaryOwnerOpenId(cfg.larkAppId);

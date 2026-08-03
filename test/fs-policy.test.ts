@@ -591,6 +591,36 @@ describe('compileToBwrap', () => {
     expect(args).toContain('--chdir');
   });
 
+  it('default: emits --unshare-pid (full process isolation) alongside the fresh --proc mount', () => {
+    const p = buildFsPolicy(ctx({ platform: 'linux', homeDir: '/home/u', botHome: '/home/u/.botmux/bots/cli_self', botmuxHome: '/home/u/.botmux', sessionDataDir: '/home/u/.botmux/data', workingDir: '/home/u/proj' }));
+    const { args } = compileToBwrap(p, opts);
+    expect(args).toContain('--unshare-pid');
+    expect(args).toContain('--unshare-user');
+    expect(args).toContain('--proc');
+  });
+
+  it('skipPidNamespace: drops ONLY --unshare-pid, keeps the fresh --proc mount + every other unshare + the FS masks', () => {
+    const p = buildFsPolicy(ctx({
+      platform: 'linux', homeDir: '/home/u', botHome: '/home/u/.botmux/bots/cli_self',
+      botmuxHome: '/home/u/.botmux', sessionDataDir: '/home/u/.botmux/data', workingDir: '/home/u/proj',
+      userPaths: { deny: ['/home/u/proj/secrets'] },
+    }));
+    const { args } = compileToBwrap(p, { ...opts, skipPidNamespace: true });
+    // The nested-sandbox failure was --unshare-pid + fresh --proc; drop ONLY the
+    // pid unshare. Everything else (incl. the fresh proc mount) stays.
+    expect(args).not.toContain('--unshare-pid');
+    expect(args).toContain('--proc');
+    expect(args).toContain('--unshare-user');   // credential-relevant uid map + best-effort environ block
+    expect(args).toContain('--unshare-ipc');
+    expect(args).toContain('--unshare-uts');
+    expect(args).toContain('--unshare-cgroup-try');
+    // The on-disk credential seal (deny mask) is UNAFFECTED by the pid degrade.
+    const mask = args.indexOf('/home/u/proj/secrets');
+    expect(mask).toBeGreaterThan(-1);
+    expect(args[mask - 1]).toBe('/sbx/empty');
+    expect(args[mask - 2]).toBe('--ro-bind');
+  });
+
   it('deny under an exposed tree masks with a READ-ONLY empty-dir bind (not writable tmpfs); unreachable deny is skipped', () => {
     const p = buildFsPolicy(ctx({
       platform: 'linux', homeDir: '/home/u', botHome: '/home/u/.botmux/bots/cli_self',

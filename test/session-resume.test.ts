@@ -132,7 +132,6 @@ vi.mock('../src/adapters/backend/tmux-backend.js', () => ({
     sessionName: vi.fn((id: string) => `bmx-${id.slice(0, 8)}`),
     hasSession: vi.fn(() => false),
     probeSession: vi.fn(() => 'missing'),
-    serverState: vi.fn(() => 'running'),
   },
 }));
 

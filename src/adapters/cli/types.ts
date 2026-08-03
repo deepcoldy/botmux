@@ -118,6 +118,13 @@ export interface CliAdapter {
     reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh';
     /** When true, do not add adapter-default flags that bypass CLI approvals or disable sandboxing. */
     disableCliBypass?: boolean;
+    /** Codex-family only: when true (default from the global `bypassCodexHookTrust`
+     *  toggle, still ANDed with `!disableCliBypass` by the worker), pass
+     *  `--dangerously-bypass-hook-trust` so a headless plain-TUI launch does not
+     *  wedge on Codex 0.14x's interactive "Press t to trust" gate. Undefined ⇒
+     *  treated as false by adapters (the worker always sends an explicit boolean
+     *  for codex/traex). Does NOT apply to `--remote`/app-server/exec paths. */
+    bypassHookTrust?: boolean;
     /** Optional session-scoped skill plugin/root prepared by botmux. */
     skillPluginDir?: string;
     /** True when this session runs under per-bot read isolation (the worker

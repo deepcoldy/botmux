@@ -39,6 +39,7 @@ import { automateOpenPlatformSetup } from '../../setup/open-platform-automation.
 import { type Brand, larkHosts, normalizeBrand, sdkDomain } from './lark-hosts.js';
 import { tryHandleGrantCommand } from './grant-command.js';
 import { tryHandleInviteCommand } from './invite-command.js';
+import { autoInviteOwnerOnGroupJoin } from '../../services/groups-store.js';
 import { tryHandleReplyModeCommand } from './reply-mode-command.js';
 import { tryHandleSubstituteCommand } from './substitute-command.js';
 import { buildGrantCard } from './card-builder.js';
@@ -3419,6 +3420,11 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
         const operatorOpenId: string | undefined = data?.operator_id?.open_id;
         if (!chatId) return;
         logger.info(`[auto-start:入群] bot added to chat=${chatId.substring(0, 12)} by ${String(operatorOpenId ?? '?').substring(0, 12)}`);
+        // 进群先自动拉 owner（不受任何开工开关影响，失败仅日志）：bot 应始终
+        // 处于 owner 可见的群里。放在 handleBotAdded 之前，让 autoStart 的
+        // D7「群内需有 allowedUser」闸能吃到刚拉进来的 owner。
+        await autoInviteOwnerOnGroupJoin(larkAppId, chatId, operatorOpenId)
+          .catch(err => logger.warn(`[groups] autoInviteOwner error (bot=${larkAppId} chat=${chatId}): ${err?.message ?? err}`));
         await handlers.handleBotAdded?.(chatId, operatorOpenId, larkAppId);
       } catch (err) {
         logger.error(`Error handling bot-added event: ${err}`);

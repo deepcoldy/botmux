@@ -191,7 +191,7 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
     authPaths: ['~/.trae/cli'],
     get resolvedBin(): string { return (cachedBin ??= resolveCommand(rawBin)); },
 
-    buildArgs({ sessionId, resume, resumeSessionId, workingDir, model, disableCliBypass, remoteWsUrl, remoteThreadId }) {
+    buildArgs({ sessionId, resume, resumeSessionId, workingDir, model, disableCliBypass, bypassHookTrust, remoteWsUrl, remoteThreadId }) {
       // Hybrid RPC input mode (codex-family): attach the TUI to the botmux-owned
       // app-server thread; input flows via JSON-RPC (see codex-rpc-engine + worker)
       // instead of a drop-prone paste. TRAE CLI shares codex's --remote/resume
@@ -209,9 +209,11 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
           // "Hooks need review" gate
           // after folder trust. Goal-mode workers have no human at their PTY,
           // so without the automation-specific hook flag they never reach the
-          // prompt and `/goal` is never delivered. Keep it tied to the existing
-          // bypass decision: restricted bots must not gain hook trust.
-          '--dangerously-bypass-hook-trust',
+          // prompt and `/goal` is never delivered. Gated by the same global
+          // `bypassHookTrust` toggle as codex (default ON, operator can disable —
+          // it trusts ALL hook sources, not only botmux's), still ANDed with the
+          // existing bypass decision: restricted bots must not gain hook trust.
+          ...(bypassHookTrust ? ['--dangerously-bypass-hook-trust'] : []),
         ] : []),
         '--no-alt-screen',
         ...goalEnvConfigArgs(),

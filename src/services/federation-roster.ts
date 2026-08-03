@@ -64,6 +64,11 @@ export function buildFederatedRoster(dataDir: string, teamId: string = DEFAULT_T
     cliId: b.cliId,
     capability: b.capability,
     hasTeamRole: b.hasTeamRole,
+    // Hub's OWN local bot: propagate its transport capability (from the live
+    // registry via buildTeamRoster) so a spoke pulling this roster can exclude
+    // core-only bots too — same #668 invariant as remote-dep bots below.
+    // undefined (no liveBots passed / legacy) → caller treats as normal.
+    larkTransportEnabled: b.larkTransportEnabled,
     owner: b.owner ? { unionId: b.owner.unionId, name: b.owner.name } : undefined,
     deployment: { id: localId.deploymentId, name: localId.name, local: true, stale: false },
   }));

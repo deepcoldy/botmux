@@ -1417,6 +1417,13 @@ export interface BotConfig {
    */
   autoStartOnGroupJoinPrompt?: string;
   /**
+   * 进群自动拉 owner。Default (undefined) = ON：本 bot 被加进任何群时，自动把
+   * 自己的 owner（resolvedAllowedUsers 首个 ou_ 用户）拉进群——bot 应始终处于
+   *  owner 可见的群里（不打黑工）。显式 false 关闭（如告警/oncall 类 bot 被
+   * 平台批量拉进大量事件群、不想打扰 owner 的场景）。仅 bots.json 文件配置。
+   */
+  autoInviteOwnerOnGroupAdd?: boolean;
+  /**
    * 主动开工 — 场景②. When true, in a 话题群 (topic mode) every new topic's first
    * message auto-starts a session even without an @mention (the default role +
    * the user's first message form the prompt). No effect in regular groups.
@@ -2549,6 +2556,8 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       // 平台团队展示默认 ON：只有显式 false 有意义/落盘（undefined = 展示）。
       showInTeam: entry.showInTeam === false ? false : undefined,
       autoStartOnGroupJoin: entry.autoStartOnGroupJoin === true || undefined,
+      // Default ON: only an explicit false is meaningful/persisted (undefined = on).
+      autoInviteOwnerOnGroupAdd: entry.autoInviteOwnerOnGroupAdd === false ? false : undefined,
       // Preserve the configured prompt verbatim; trim-to-undefined when blank
       // so an empty string doesn't linger in bots.json.
       autoStartOnGroupJoinPrompt: typeof entry.autoStartOnGroupJoinPrompt === 'string' && entry.autoStartOnGroupJoinPrompt.trim()

@@ -2062,9 +2062,12 @@ export function suspendWorker(ds: DaemonSession, reason = 'suspended_idle'): boo
   // cold-resume from the on-disk transcript. forkWorker(resume=true) builds the
   // CLI's `--resume <cliSessionId>` args, so mark this session as having history
   // (the normal `claude_exit` path that sets this never fires on suspend —
-  // process.exit(0) races it). Also persist `suspendedColdResume` so a daemon
-  // restart treats a 'missing' backing session as a deliberate lazy-resume
-  // rather than a zombie to close. See sweepIdleWorkers + restoreActiveSessions.
+  // process.exit(0) races it). Also persist `suspendedColdResume` to record the
+  // deliberate parked state — since the host-reboot fix, restore keeps ANY
+  // managed session with a 'missing' backing for lazy resume, so this marker no
+  // longer gates that decision; it flags "intentionally parked, expect no
+  // worker/pane" for the dormant status label and skips redundant liveness
+  // probes. See sweepIdleWorkers + restoreActiveSessions.
   ds.hasHistory = true;
   ds.session.suspendedColdResume = true;
   sessionStore.updateSessionPid(ds.session.sessionId, null);
@@ -5508,10 +5511,12 @@ function setupWorkerHandlers(
             // periodic usage refresh must be stopped explicitly on this
             // working→idle boundary — the else branch's killWorker already does.
             clearUsageRefreshTimer(ds);
-            // Survive a daemon restart: mark this as a lazy cold-resume so
-            // restore keeps the session active (re-spawns the CLI on the next
-            // message) instead of zombie-closing it when the real bmx-<sid> is
-            // found missing. ds.hasHistory is already true (set at the top of
+            // Survive a daemon restart: mark this as a deliberate lazy
+            // cold-resume. Restore keeps ANY managed session with a 'missing'
+            // backing active regardless (re-spawns the CLI on the next
+            // message) since the host-reboot fix, so this marker records the
+            // parked state (dormant label + skip redundant probes) rather than
+            // gating the keep. ds.hasHistory is already true (set at the top of
             // claude_exit); forkWorker clears suspendedColdResume on re-spawn.
             ds.session.suspendedColdResume = true;
             sessionStore.updateSession(ds.session);

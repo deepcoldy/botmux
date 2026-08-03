@@ -51,6 +51,18 @@ delete process.env.BOTS_CONFIG;
 // future intentional exposure would be a separate explicit danger switch.)
 process.env.BOTMUX_WORKER_HTTP_HOST = '127.0.0.1';
 delete process.env.BOTMUX_WORKER_HOST; // legacy alias — must not shadow the freeze
+// Freeze the ADVERTISED web-terminal host to loopback too (form C). The line
+// above confines where the worker web server BINDS; this confines the host
+// baked into the read-only terminal URL that buildTerminalUrl() advertises.
+// Without it, config.web.externalHost falls back to getWebExternalHost() →
+// getLocalIp() (a LAN IP like 10.x.x.x), so the URL handed to riff would point
+// at an interface the proxy doesn't even listen on (proxy is 127.0.0.1-only in
+// core-only) — an in-sandbox VNC browser opening that URL would fail to connect.
+// core-only is single-tenant loopback, so the terminal is only ever reached via
+// 127.0.0.1; freeze the advertised host to match the bind. WEB_EXTERNAL_HOST is
+// the env getWebExternalHost() reads first (config.ts:30), so this wins.
+process.env.WEB_EXTERNAL_HOST = '127.0.0.1';
+
 
 // Freeze a DEDICATED state root (codex P1): core-only must never inherit an
 // ambient SESSION_DATA_DIR — a managed turn that spawns `serve --api-only`

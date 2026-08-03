@@ -59,6 +59,22 @@ let tmpDir: string;
 function writeBotsInfo(entries: Array<{ larkAppId: string; botName: string | null }>) {
   writeFileSync(join(tmpDir, 'bots-info.json'), JSON.stringify(entries));
 }
+function writePlatformSync(bots: Array<{ appId: string; name?: string; unionId?: string }>) {
+  writeFileSync(join(tmpDir, 'platform-team-sync.json'), JSON.stringify({
+    rev: 'r1', updatedAt: Date.now(),
+    teams: [{ teamId: 't1', teamName: '大厅', groupChatIds: [], memberUnionIds: [], bots }],
+  }));
+}
+function writeHostedFederations(bots: Array<{ larkAppId: string; botName: string }>) {
+  writeFileSync(join(tmpDir, 'federations.json'), JSON.stringify({ version: 1, teams: {
+    default: [{ deploymentId: 'dep_sg', name: 'sg-box', syncToken: 'x', joinedAt: 1, lastSeenAt: 2, bots }],
+  } }));
+}
+function writeMemberships() {
+  writeFileSync(join(tmpDir, 'federation-memberships.json'), JSON.stringify({
+    'http://hub::default': { hubUrl: 'http://hub', teamId: 'default', teamName: 'a', syncToken: 'tok', deploymentId: 'd', joinedAt: 1 },
+  }));
+}
 
 beforeEach(() => {
   replyMock.mockClear();
@@ -220,8 +236,9 @@ describe('tryHandleInviteCommand — 解析与拉人', () => {
     expect(addBotMock).not.toHaveBeenCalled();
     const out = String(replyMock.mock.calls.at(-1)![2]);
     expect(out).toContain('多个机器人');
-    expect(out).toContain('cli_dup1');
-    expect(out).toContain('cli_dup2');
+    // 本机同名多候选：候选带来源标注（local），与跨源歧义同款格式。
+    expect(out).toContain('cli_dup1(local)');
+    expect(out).toContain('cli_dup2(local)');
   });
 
   it('--app bypasses name resolution (also works for bots outside the roster)', async () => {
@@ -442,5 +459,132 @@ describe('isCommandTargetOnly — app_id 形态本 bot 识别', () => {
       { key: '@_user_2', id: { open_id: 'ou_target' }, name: 'T' },
     ] };
     expect(isCommandTargetOnly(msg, 'ou_me', INVITE, APPID)).toBe(false);
+  });
+});
+
+describe('tryHandleInviteCommand — 团队目录兜底解析（跨部署「同团队」bot）', () => {
+  it('platform team sync hit: name missing from local bots-info still resolves', async () => {
+    writeBotsInfo([]);
+    writePlatformSync([{ appId: 'cli_sg1', name: 'botmux开发者(claude@sg1)' }]);
+    const msg = inviteMessage({ mentions: [
+      { key: '@_user_1', id: { open_id: ME }, name: 'Claude' },
+      { key: '@_user_2', id: { open_id: 'ou_sg1bot' }, name: 'botmux开发者(claude@sg1)' },
+    ] });
+    expect(await tryHandleInviteCommand('b1', msg, OWNER)).toBe(true);
+    expect(addBotMock).toHaveBeenCalledWith('b1', 'oc_1', ['cli_sg1']);
+    const out = String(replyMock.mock.calls.at(-1)![2]);
+    expect(out).toContain('已拉进群');
+    expect(out).toContain('botmux开发者(claude@sg1)');   // 展示名，不退化成裸 appId
+  });
+
+  it('hosted federation member hit resolves', async () => {
+    writeBotsInfo([]);
+    writeHostedFederations([{ larkAppId: 'cli_fedbot', botName: 'Codex远程' }]);
+    const msg = inviteMessage({ mentions: [
+      { key: '@_user_1', id: { open_id: ME }, name: 'Claude' },
+      { key: '@_user_2', id: { open_id: 'ou_fedbot' }, name: 'Codex远程' },
+    ] });
+    expect(await tryHandleInviteCommand('b1', msg, OWNER)).toBe(true);
+    expect(addBotMock).toHaveBeenCalledWith('b1', 'oc_1', ['cli_fedbot']);
+  });
+
+  it('spoke→hub roster hit resolves via HTTP with syncToken', async () => {
+    writeBotsInfo([]);
+    writeMemberships();
+    const fetchStub = vi.fn(async () => ({
+      ok: true, status: 200,
+      json: async () => ({ ok: true, bots: [{ larkAppId: 'cli_sg1', name: 'botmux开发者(claude@sg1)', deployment: { name: 'sg1' } }] }),
+    }));
+    vi.stubGlobal('fetch', fetchStub as any);
+    try {
+      const msg = inviteMessage({ mentions: [
+        { key: '@_user_1', id: { open_id: ME }, name: 'Claude' },
+        { key: '@_user_2', id: { open_id: 'ou_sg1bot' }, name: 'botmux开发者(claude@sg1)' },
+      ] });
+      expect(await tryHandleInviteCommand('b1', msg, OWNER)).toBe(true);
+      expect(addBotMock).toHaveBeenCalledWith('b1', 'oc_1', ['cli_sg1']);
+      const [, init] = fetchStub.mock.calls[0] as any;
+      expect(init.headers.authorization).toBe('Bearer tok');
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it('cross-app same name across team directory → ambiguous with source annotations, nothing added', async () => {
+    writeBotsInfo([]);
+    writePlatformSync([
+      { appId: 'cli_a', name: 'Codex' },
+      { appId: 'cli_b', name: 'codex' },   // 大小写不敏感同名
+    ]);
+    expect(await tryHandleInviteCommand('b1', inviteMessage(), OWNER)).toBe(true);
+    expect(addBotMock).not.toHaveBeenCalled();
+    const out = String(replyMock.mock.calls.at(-1)![2]);
+    expect(out).toContain('多个机器人');
+    expect(out).toContain('cli_a(platform:t1)');
+    expect(out).toContain('cli_b(platform:t1)');
+  });
+
+  it('no team directory sources → unresolved AND no hub HTTP attempted', async () => {
+    writeBotsInfo([]);
+    const fetchStub = vi.fn();
+    vi.stubGlobal('fetch', fetchStub as any);
+    try {
+      expect(await tryHandleInviteCommand('b1', inviteMessage(), OWNER)).toBe(true);
+      expect(addBotMock).not.toHaveBeenCalled();
+      expect(String(replyMock.mock.calls.at(-1)![2])).toContain('无法解析');
+      expect(fetchStub).not.toHaveBeenCalled();
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it('local-only hit with NO team sources resolves without any HTTP', async () => {
+    writeBotsInfo([{ larkAppId: 'cli_codex', botName: 'Codex' }]);
+    // 无 memberships / 平台名册 / 托管联邦 → hasAnyTeamDirectorySource=false → 不发 HTTP。
+    const fetchStub = vi.fn();
+    vi.stubGlobal('fetch', fetchStub as any);
+    try {
+      expect(await tryHandleInviteCommand('b1', inviteMessage(), OWNER)).toBe(true);
+      expect(addBotMock).toHaveBeenCalledWith('b1', 'oc_1', ['cli_codex']);
+      expect(fetchStub).not.toHaveBeenCalled();
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it('local hit + team sources present: STILL consults the directory (cannot assume local is unique), resolves to local when team adds no rival', async () => {
+    writeBotsInfo([{ larkAppId: 'cli_codex', botName: 'Codex' }]);
+    writeMemberships();                              // 有团队源 → 必须查目录核对唯一性
+    const fetchStub = vi.fn(async () => ({ ok: true, status: 200, json: async () => ({ ok: true, bots: [] }) }));
+    vi.stubGlobal('fetch', fetchStub as any);
+    try {
+      expect(await tryHandleInviteCommand('b1', inviteMessage(), OWNER)).toBe(true);
+      expect(addBotMock).toHaveBeenCalledWith('b1', 'oc_1', ['cli_codex']);
+      expect(fetchStub).toHaveBeenCalled();          // 关键：不再因「本机命中」短路跳过团队目录
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it('P1 regression: local name hit + DIFFERENT-app same name in team directory → ambiguous, nothing added (no silent wrong-bot pull)', async () => {
+    // 本机 Codex→cli_local；团队里 Codex→cli_remote（用户 @ 的可能正是远端那个，但
+    // mention 没带 app_id）。修复前：本机恰 1 个候选就静默拉 cli_local。修复后：合并
+    // 去重后有 2 个不同 app → 报歧义，一个都不拉。
+    writeBotsInfo([{ larkAppId: 'cli_local', botName: 'Codex' }]);
+    writePlatformSync([{ appId: 'cli_remote', name: 'Codex' }]);
+    expect(await tryHandleInviteCommand('b1', inviteMessage(), OWNER)).toBe(true);
+    expect(addBotMock).not.toHaveBeenCalled();
+    const out = String(replyMock.mock.calls.at(-1)![2]);
+    expect(out).toContain('多个机器人');
+    expect(out).toContain('cli_local(local)');
+    expect(out).toContain('cli_remote(platform:t1)');
+  });
+
+  it('P1: same appId in both local roster and team directory → deduped to ONE, resolves (not spurious ambiguity)', async () => {
+    // 同一个 app 同时在本机花名册和平台名册出现，不能误报歧义。
+    writeBotsInfo([{ larkAppId: 'cli_codex', botName: 'Codex' }]);
+    writePlatformSync([{ appId: 'cli_codex', name: 'Codex' }]);
+    expect(await tryHandleInviteCommand('b1', inviteMessage(), OWNER)).toBe(true);
+    expect(addBotMock).toHaveBeenCalledWith('b1', 'oc_1', ['cli_codex']);
   });
 });

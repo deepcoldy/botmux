@@ -156,7 +156,7 @@ export const messages: Record<string, string> = {
   'cmd.invite.header': '🤝 /invite 结果：',
   'cmd.invite.ok': '✅ 已拉进群：{names}',
   'cmd.invite.already': '⏭️ 已在群内（跳过）：{names}',
-  'cmd.invite.unresolved': '⚠️ 无法解析（不在本部署花名册，可用 --app cli_xxx 直接指定）：{names}',
+  'cmd.invite.unresolved': '⚠️ 无法解析（本机与团队花名册都查不到，可用 --app cli_xxx 直接指定）：{names}',
   'cmd.invite.ambiguous_item': '⚠️ 名字「{name}」对应多个机器人（{apps}），请改用 --app 指定。',
   'cmd.invite.failed_item': '❌ 拉入失败：{name} —— {reason}',
 

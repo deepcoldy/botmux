@@ -153,7 +153,7 @@ export const messages: Record<string, string> = {
   'cmd.invite.header': '🤝 /invite results:',
   'cmd.invite.ok': '✅ Added to the chat: {names}',
   'cmd.invite.already': '⏭️ Already in the chat (skipped): {names}',
-  'cmd.invite.unresolved': '⚠️ Could not resolve (not in this deployment\'s roster — use --app cli_xxx): {names}',
+  'cmd.invite.unresolved': '⚠️ Could not resolve (not in local or team rosters — use --app cli_xxx): {names}',
   'cmd.invite.ambiguous_item': '⚠️ The name "{name}" matches multiple bots ({apps}) — use --app to pick one.',
   'cmd.invite.failed_item': '❌ Failed to add: {name} — {reason}',
 

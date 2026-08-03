@@ -303,6 +303,13 @@ export const config = {
   // thinking-only nudge as a send failure; it is harmless but unnecessary for the
   // common all-Claude setup, so operators opt in explicitly.
   get noVisibleOutputHint(): boolean { return readGlobalConfig().dashboard?.noVisibleOutputHint === true; },
+  // Live getter: whether to auto-bypass Codex's interactive hook-trust gate for
+  // Codex-family plain-TUI launches. Re-read per spawn so a Settings toggle takes
+  // effect on the next session without a daemon restart (existing panes keep their
+  // argv — argv can't be hot-swapped). Default ON (absent ⇒ true): only an explicit
+  // stored `false` disables it. The daemon ANDs this with each bot's
+  // `!disableCliBypass` before handing it to the adapter (see worker init).
+  get bypassCodexHookTrust(): boolean { return readGlobalConfig().dashboard?.bypassCodexHookTrust !== false; },
 };
 
 // allowedUsers is mutable — daemon resolves email prefixes to open_ids at startup

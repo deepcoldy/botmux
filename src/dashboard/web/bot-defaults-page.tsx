@@ -743,7 +743,7 @@ function BotDefaultsCard(props: {
             <section className="bd-tile">
               <CrossBotSection bot={bot} putCardPref={putCardPref} />
             </section>
-            <section className="bd-tile"><SessionCapSection bot={bot} patchBot={patchBot} putCardPref={putCardPref} /></section>
+            <section className="bd-tile"><SessionCapSection bot={bot} patchBot={patchBot} /></section>
             <section className="bd-tile"><StartupCommandsSection bot={bot} patchBot={patchBot} /></section>
             <section className="bd-tile"><SummaryTriggerSection bot={bot} patchBot={patchBot} /></section>
           </BdTabGrid>
@@ -3081,7 +3081,7 @@ function mentionMode(bot: BotDefaultsRow): string {
     : 'always';
 }
 
-function SessionCapSection(props: { bot: BotDefaultsRow; patchBot: PatchBot; putCardPref(patch: CardPrefPatch): Promise<JsonResponse> }) {
+function SessionCapSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
   const tr = useT();
   const initial = typeof props.bot.maxLiveWorkers === 'number' ? props.bot.maxLiveWorkers : null;
   const logical = Number.isFinite(props.bot.logicalSessionCount) ? Number(props.bot.logicalSessionCount) : 0;
@@ -3092,39 +3092,12 @@ function SessionCapSection(props: { bot: BotDefaultsRow; patchBot: PatchBot; put
   const [input, setInput] = useState(initial == null ? '' : String(initial));
   const [status, setStatus] = useState<StatusMessage>(null);
   const [busy, setBusy] = useState(false);
-  const [overloadAlert, setOverloadAlert] = useState(props.bot.overloadAlert === true);
-  const [overloadBusy, setOverloadBusy] = useState(false);
 
   useEffect(() => {
     const next = typeof props.bot.maxLiveWorkers === 'number' ? props.bot.maxLiveWorkers : null;
     setCap(next);
     setInput(next == null ? '' : String(next));
   }, [props.bot.maxLiveWorkers]);
-
-  useEffect(() => {
-    setOverloadAlert(props.bot.overloadAlert === true);
-  }, [props.bot.overloadAlert]);
-
-  async function saveOverloadAlert(next: boolean): Promise<void> {
-    setOverloadBusy(true);
-    setStatus(null);
-    setOverloadAlert(next); // optimistic
-    try {
-      const res = await props.putCardPref({ overloadAlert: next });
-      if (res.ok && res.body.ok) {
-        props.patchBot(props.bot.larkAppId, { overloadAlert: next });
-        setStatus({ text: `✓ ${tr('botDefaults.cardPrefSaved')}`, ok: true });
-      } else {
-        setOverloadAlert(!next); // revert
-        setStatus({ text: `✗ ${responseErrorText(res)}` });
-      }
-    } catch (e: any) {
-      setOverloadAlert(!next); // revert
-      setStatus({ text: `✗ ${caughtErrorText(e)}` });
-    } finally {
-      setOverloadBusy(false);
-    }
-  }
 
   async function save(value: number | null): Promise<void> {
     setStatus(null);
@@ -3177,14 +3150,6 @@ function SessionCapSection(props: { bot: BotDefaultsRow; patchBot: PatchBot; put
         <button type="button" data-action="off-session-cap" disabled={busy} onClick={() => { setInput(''); void save(null); }}>{tr('botDefaults.maxLiveWorkersOff')}</button>
         <StatusSpan status={status} attr={{ 'data-session-cap-status': '' }} />
       </div>
-      <ToggleRow
-        checked={overloadAlert}
-        disabled={overloadBusy}
-        dataAction="toggle-overload-alert"
-        title={tr('botDefaults.overloadAlert')}
-        help={tr('botDefaults.overloadAlertHelp')}
-        onChange={checked => void saveOverloadAlert(checked)}
-      />
     </section>
   );
 }

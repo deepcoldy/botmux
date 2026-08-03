@@ -8402,8 +8402,19 @@ async function spawnCli(
     model: ttadkGateway ? undefined : cfg.model,
     reasoningEffort: cfg.reasoningEffort,
     disableCliBypass: cfg.disableCliBypass === true,
+    // Codex-family hook-trust bypass: global toggle (default ON) so a headless
+    // plain-TUI launch doesn't wedge on codex 0.14x's "Press t to trust" gate.
+    // The adapter further ANDs this with !disableCliBypass. Read live per spawn.
+    bypassHookTrust: config.bypassCodexHookTrust,
     skillPluginDir: cfg.skillPluginDir,
     readIsolation: willRedirectCliData,
+    // Hybrid Codex RPC input: when engageCodexRpc (which runs BEFORE this spawn)
+    // bound the pane to a botmux-owned app-server thread, these make codex.ts emit
+    // `codex --remote <ws> resume <thread>` (a pure viewer — no bypass flags) instead
+    // of a plain TUI. Dropped by the a0fa71010 sandbox refactor; restored here so the
+    // RPC viewer branch actually triggers and never carries the bypass flags.
+    remoteWsUrl,
+    remoteThreadId,
   });
   // Pi's deferred long-first-prompt command is implemented by a session-scoped
   // extension. Keep its launch args across owned process restarts while the

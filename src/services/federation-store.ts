@@ -148,6 +148,16 @@ export function listFederatedDeployments(dataDir: string, teamId: string): Feder
   return readFile(dataDir).teams[teamId] ?? [];
 }
 
+/** Member deployments across ALL hosted teams, each tagged with its teamId. */
+export function listAllFederatedDeployments(dataDir: string): Array<{ teamId: string; deployment: FederatedDeployment }> {
+  const teams = readFile(dataDir).teams;
+  const out: Array<{ teamId: string; deployment: FederatedDeployment }> = [];
+  for (const [teamId, deps] of Object.entries(teams)) {
+    for (const deployment of deps) out.push({ teamId, deployment });
+  }
+  return out;
+}
+
 /** Remove a deployment from a team (leave/kick). Returns true if removed. */
 export function removeDeployment(dataDir: string, teamId: string, deploymentId: string): boolean {
   const data = readFile(dataDir);

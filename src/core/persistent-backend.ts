@@ -274,26 +274,6 @@ export function probePersistentSessions(
 }
 
 /**
- * Tri-state liveness of the backend's multiplexer SERVER itself (not one
- * session). The restore path consults this when a session probes 'missing' to
- * tell apart a true solo zombie (server up, this one pane gone → close) from a
- * machine reboot (server gone, every pane wiped at once → keep for lazy resume,
- * since the CLI transcript on disk is still resumable). See
- * TmuxBackend.serverState for the full rationale.
- *
- * herdr has no cheap server-liveness probe, so it returns 'unknown' →
- * the restore gate falls back to the prior (close-on-missing) behaviour for it.
- */
-export function probePersistentBackendServer(
-  backendType: PersistentBackendType,
-): 'running' | 'down' | 'unknown' {
-  if (backendType === 'tmux') return TmuxBackend.serverState();
-  if (backendType === 'zellij') return ZellijBackend.serverState();
-  if (backendType === 'zmx') return ZmxBackend.serverState();
-  return 'unknown';
-}
-
-/**
  * Kill a backing session. ZMX additionally requires the complete botmux UUID:
  * its public name contains only eight UUID characters, so name-only deletion
  * could destroy a different session after a prefix collision.

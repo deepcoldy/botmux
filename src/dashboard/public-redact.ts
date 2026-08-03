@@ -121,10 +121,11 @@ export function redactSessionEventForPublic(type: string, body: unknown): unknow
   return body;
 }
 
-/** 匿名只读面板不展示外部 Codex 活动、目标 Bot 或投递运行态。 */
+/** 匿名只读面板不展示外部 Codex 活动、目标 Bot 或投递运行态,也不展示过载
+ *  告警的目标 Bot / 收件人提示。 */
 export function redactSettingsForPublic(settings: unknown): unknown {
   if (!settings || typeof settings !== 'object' || Array.isArray(settings)) return settings;
   const source = settings as Record<string, unknown>;
-  const { codexNotifier: _privateNotifier, ...publicSettings } = source;
+  const { codexNotifier: _privateNotifier, hostOverloadAlert: _privateOverload, ...publicSettings } = source;
   return publicSettings;
 }
