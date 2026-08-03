@@ -160,6 +160,47 @@ Dashboard 的 `Skills` 页也提供同一套管理入口：
 
 Dashboard 的安装/更新会作为后台 job 执行，页面显示处理中状态并轮询结果；慢 Git clone/fetch 不会占住整个 HTTP 请求。
 
+## Skill Pack（专项包）
+
+专项包是一组已安装 Skill 的命名集合，可以一次性分配给多个 bot，避免逐个 bot 重复勾选。专项包只保存 `skill:<name>` 引用，不复制 Skill 文件；修改专项包后，所有引用它的 bot 在新会话中自动使用最新内容。
+
+专项包独立持久化在 `~/.botmux/skills/packs.json`，不写入 `registry.json`，也不需要迁移现有 bot 配置。
+
+### 分配专项包
+
+bot 的 `skills.include` 字段同时接受 `skill:<name>` 和 `pack:<id>`：
+
+```json
+{
+  "skills": {
+    "include": ["pack:sre-oncall", "skill:custom-helper"]
+  }
+}
+```
+
+解析顺序：直接 `skill:*` 引用优先（显式配置拥有最强解释权），然后按 policy 中的顺序展开 `pack:*`，最后按 Skill 名称去重。同一个 Skill 同时被直接引用和专项包引用时，直接引用胜出。
+
+### CLI 管理
+
+```text
+botmux skills pack list
+botmux skills pack show <id>
+botmux skills pack create --id <slug> --name <名称> --skill <name> [--skill <name>]... [--description <说明>] [--tag <标签>]...
+botmux skills pack update <id> [--name <名称>] [--skill <name>]... [--expected-revision <n>]
+botmux skills pack delete <id> [--force]
+```
+
+约束：
+
+- `id` 是稳定 slug（小写字母、数字、连字符），创建后不可修改。
+- `include` 只允许 `skill:*`，不允许嵌套 `pack:*`，至少包含一个 Skill，自动去重。
+- 每次内容更新 `revision` 递增；`update` 可带 `--expected-revision` 做乐观并发控制。
+- 删除被 bot 引用的专项包默认阻止，需 `--force`。删除专项包不会卸载成员 Skill。
+
+### 聊天命令与降级
+
+`/skills attach <name>` / `/skills detach <name>` 只增删 `skill:*` 项，原样保留 `pack:*` 项，不会清空专项包分配。`/skills` 状态输出会同时显示 priority skills 和 packs。
+
 ## Delivery 行为
 
 通用路径是 prompt delivery：botmux 在首轮 prompt 后追加 priority catalog，告诉 agent 先查看这些 skill，并用 `botmux skill show/read/resources` 读取内容。这对 Codex、OpenCode、Gemini、Cursor 等 CLI 都可用，而且不会写入 `~/.codex/skills` 或其他 CLI 全局目录。

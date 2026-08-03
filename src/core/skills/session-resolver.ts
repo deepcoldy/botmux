@@ -1,5 +1,5 @@
 import type { CliId } from '../../adapters/cli/types.js';
-import type { BotSkillPolicy, SessionSkillManifest, SkillPackage } from './types.js';
+import type { BotSkillPolicy, SessionSkillManifest, SkillPackage, SkillPack } from './types.js';
 import { resolveSkillPolicy } from './policy.js';
 
 export function resolveSessionSkillManifest(opts: {
@@ -12,6 +12,7 @@ export function resolveSessionSkillManifest(opts: {
   globalDelivery?: 'auto' | 'prompt' | 'native';
   registrySkills: SkillPackage[];
   projectSkills: SkillPackage[];
+  packs?: Record<string, SkillPack>;
   now?: () => string;
 }): SessionSkillManifest | null {
   const resolved = resolveSkillPolicy({
@@ -22,6 +23,7 @@ export function resolveSessionSkillManifest(opts: {
     globalDelivery: opts.globalDelivery,
     botPolicy: opts.botPolicy,
     workingDir: opts.workingDir,
+    packs: opts.packs,
   });
   if (!resolved.enabled) return null;
   return {
