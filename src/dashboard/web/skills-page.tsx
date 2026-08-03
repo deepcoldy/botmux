@@ -751,7 +751,7 @@ function SkillsPage() {
   const [delivery, setDelivery] = useState<DeliveryMode>('auto');
   const [loadError, setLoadError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
-  const [activeTab, setActiveTab] = useState<'packs' | 'library' | 'bots' | 'delivery'>('packs');
+  const [activeTab, setActiveTab] = useState<'packs' | 'library' | 'bots' | 'delivery'>('library');
   const [refreshKey, setRefreshKey] = useState(0);
 
   const [installSource, setInstallSource] = useState('');
@@ -1283,11 +1283,11 @@ function SkillsPage() {
       {loading ? <LoadingState label={tr('common.loading')} /> : loadError ? <p className="hint-warn">{loadError}</p> : (
         <>
           <div className="skills-tabs" role="tablist">
-            <button role="tab" aria-selected={activeTab === 'packs'} className={activeTab === 'packs' ? 'active' : ''} onClick={() => setActiveTab('packs')}>
-              {tr('skills.tabPacks')}
-            </button>
             <button role="tab" aria-selected={activeTab === 'library'} className={activeTab === 'library' ? 'active' : ''} onClick={() => setActiveTab('library')}>
               {tr('skills.tabLibrary')}
+            </button>
+            <button role="tab" aria-selected={activeTab === 'packs'} className={activeTab === 'packs' ? 'active' : ''} onClick={() => setActiveTab('packs')}>
+              {tr('skills.tabPacks')}
             </button>
             <button role="tab" aria-selected={activeTab === 'bots'} className={activeTab === 'bots' ? 'active' : ''} onClick={() => setActiveTab('bots')}>
               {tr('skills.tabBots')}
