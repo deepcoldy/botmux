@@ -50,6 +50,30 @@ describe('skill policy resolver with packs', () => {
     expect(result.prioritySkills[0].priorityReason).toBe('bot:include');
   });
 
+  it('uses registry precedence consistently for direct and pack selectors', () => {
+    const registry = pkg('shared');
+    const project = { ...pkg('shared'), rootDir: '/repo/.agents/skills/shared' };
+
+    const direct = resolveSkillPolicy({
+      registrySkills: [registry],
+      projectSkills: [project],
+      globalProjectSkills: 'all',
+      botPolicy: { include: ['skill:shared'] },
+      workingDir: '/repo',
+    });
+    const packed = resolveSkillPolicy({
+      registrySkills: [registry],
+      projectSkills: [project],
+      globalProjectSkills: 'all',
+      botPolicy: { include: ['pack:p1'] },
+      workingDir: '/repo',
+      packs: { p1: pack('p1', ['shared']) },
+    });
+
+    expect(direct.prioritySkills[0].rootDir).toBe(registry.rootDir);
+    expect(packed.prioritySkills[0].rootDir).toBe(registry.rootDir);
+  });
+
   it('direct reference always wins even when pack: is listed first in include', () => {
     // Regression: previously the resolver expanded selectors in array order,
     // so a pack listed before a direct skill: would win. Direct must always
