@@ -9,7 +9,7 @@ import { githubGitAuthEnv } from '../core/github-auth.js';
 import { loadSkillPackage } from '../core/skills/package.js';
 import { skillRegistryPath, skillSourcesDir, skillStoreDir } from '../core/skills/registry-paths.js';
 import type { SkillPackage, SkillSource } from '../core/skills/types.js';
-import { assertAllowedGitProtocol, assertNoGitUrlCredentials, assertSafeGitRef, assertSafeGitSkillPath, githubToGitUrl, redactGitUrlCredentials } from '../core/skills/sources.js';
+import { assertAllowedGitProtocol, assertNoGitUrlCredentials, assertSafeGitRef, assertSafeGitSkillPath, formatAgentbuddyIdentifier, githubToGitUrl, redactGitUrlCredentials } from '../core/skills/sources.js';
 import type { AgentbuddySource } from '../core/skills/sources.js';
 
 const DEFAULT_GIT_TIMEOUT_MS = 60_000;
@@ -31,6 +31,10 @@ export interface SkillSourceDiscovery {
   /** True when the source resolves its own skill set (agentbuddy) — the dashboard
    *  installs it directly, skipping the discover-then-select step. */
   directInstall?: boolean;
+  /** True when these candidates only turned up after falling back to a full-depth
+   *  recursive scan. The UI surfaces this so the deeper (slower) scan is visible
+   *  rather than silent. */
+  deepScanned?: boolean;
 }
 
 export interface SkillInstallSelection {
@@ -763,10 +767,24 @@ export async function discoverGitSkillCandidatesAsync(opts: {
   ref?: string;
   path?: string;
   fullDepth?: boolean;
+  /** When a shallow whole-repo scan finds nothing, retry recursively against
+   *  the same checkout instead of cloning the remote a second time. */
+  fallbackToFullDepth?: boolean;
 }): Promise<SkillSourceDiscovery> {
   const checkout = await checkoutTemporaryGitSourceAsync(opts.url, opts.ref);
   try {
-    return discoverCheckedOutGitSource(checkout.sourceDir, checkout.commit, opts);
+    const first = discoverCheckedOutGitSource(checkout.sourceDir, checkout.commit, opts);
+    if (
+      opts.path
+      || opts.fullDepth
+      || !opts.fallbackToFullDepth
+      || first.skills.length > 0
+    ) return first;
+    const second = discoverCheckedOutGitSource(checkout.sourceDir, checkout.commit, {
+      ...opts,
+      fullDepth: true,
+    });
+    return second.skills.length > 0 ? { ...second, deepScanned: true } : first;
   } finally {
     checkout.cleanup();
   }
@@ -1066,13 +1084,6 @@ function findSkillDirs(root: string): string[] {
   return found;
 }
 
-function agentbuddyIdentifier(opts: AgentbuddySource): string {
-  const protocol = opts.protocol ?? 'skill';
-  return opts.collection
-    ? `${protocol}/collection/${opts.collection}`
-    : `${protocol}/${opts.group}/${opts.skill}${opts.version ? `@${opts.version}` : ''}`;
-}
-
 /** Register the skill dir(s) agentbuddy wrote into the staging tree into the
  *  botmux store. Shared by the sync (CLI) and async (dashboard job) install
  *  paths so they stay behaviourally identical.
@@ -1175,7 +1186,7 @@ async function runAgentbuddyCliAsync(args: string[], cwd: string, failCode: stri
 }
 
 export function installAgentbuddySkill(opts: AgentbuddySource, requireSkillName?: string): SkillPackage[] {
-  const identifier = agentbuddyIdentifier(opts);
+  const identifier = formatAgentbuddyIdentifier(opts);
   return withAgentbuddyLockSync(identifier, () => {
     const staging = join(skillSourcesDir(), 'agentbuddy', sourceId(identifier));
     rmSync(staging, { recursive: true, force: true });
@@ -1195,7 +1206,7 @@ export function installAgentbuddySkill(opts: AgentbuddySource, requireSkillName?
  *  behaviour, but awaits the (minutes-long, network-bound) agentbuddy calls off
  *  the daemon event loop instead of blocking it with execFileSync. */
 export async function installAgentbuddySkillAsync(opts: AgentbuddySource, requireSkillName?: string): Promise<SkillPackage[]> {
-  const identifier = agentbuddyIdentifier(opts);
+  const identifier = formatAgentbuddyIdentifier(opts);
   return withAgentbuddyLock(identifier, async () => {
     const staging = join(skillSourcesDir(), 'agentbuddy', sourceId(identifier));
     rmSync(staging, { recursive: true, force: true });
