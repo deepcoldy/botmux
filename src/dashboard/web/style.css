@@ -25967,6 +25967,76 @@ button.ui-refresh-button.is-loading .ui-action-icon {
   border-color: var(--accent);
 }
 
+.skills-unassign-dropzone {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 9px;
+  align-items: center;
+  margin: -2px 0 14px;
+  padding: 10px 11px;
+  border: 1px dashed color-mix(in srgb, var(--danger) 58%, var(--border-soft));
+  border-radius: var(--radius-md);
+  background: color-mix(in srgb, var(--danger) 7%, var(--surface-raised));
+  color: var(--danger);
+  transition: border-color 120ms ease, background 120ms ease, box-shadow 120ms ease, transform 120ms ease;
+}
+.skills-unassign-dropzone.is-active {
+  border-color: var(--danger);
+  background: color-mix(in srgb, var(--danger) 14%, var(--surface-raised));
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--danger) 32%, transparent);
+  transform: translateY(-1px);
+}
+.skills-unassign-dropzone > span:last-child {
+  display: grid;
+  gap: 1px;
+  min-width: 0;
+}
+.skills-unassign-dropzone strong {
+  color: var(--danger);
+  font-size: 12px;
+}
+.skills-unassign-dropzone small {
+  color: var(--muted);
+  font-size: 10.5px;
+  line-height: 1.35;
+}
+.skills-unassign-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  border-radius: var(--radius-full);
+  background: color-mix(in srgb, var(--danger) 12%, transparent);
+  font-size: 15px;
+  font-weight: 800;
+}
+
+.skills-assigned-draggable {
+  display: inline-flex;
+  max-width: 100%;
+  margin: 1px 3px 1px 0;
+  border-radius: var(--radius-full);
+  cursor: grab;
+  user-select: none;
+  vertical-align: middle;
+  transition: box-shadow 120ms ease, opacity 120ms ease, transform 120ms ease;
+}
+.skills-assigned-draggable:hover {
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 24%, transparent);
+  transform: translateY(-1px);
+}
+.skills-assigned-draggable:active,
+.skills-assigned-draggable > button:active {
+  cursor: grabbing;
+}
+.skills-assigned-draggable.is-dragging {
+  opacity: 0.45;
+}
+.skills-assigned-draggable > button {
+  cursor: grab;
+}
+
 /* Skill pack editor: truncate descriptions, make list scrollable */
 .skills-pack-skill-list {
   max-height: 320px;

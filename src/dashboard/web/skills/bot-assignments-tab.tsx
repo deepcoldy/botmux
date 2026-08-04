@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useState, type DragEvent } from 'react';
 import { useT } from '../react-hooks.js';
 import { SectionHeader } from '../dashboard-components.js';
 import { buildSkillGraph, packIds, priorityNames, type BotGraphInfo } from './shared.js';
@@ -22,12 +22,18 @@ interface BotAssignmentsTabProps {
   onOpenSkill?: (name: string) => void;
 }
 
-type DragItem = { type: 'skill' | 'pack'; id: string };
+type DragItem = {
+  type: 'skill' | 'pack';
+  id: string;
+  /** Present only when dragging an existing assignment out of a Bot row. */
+  sourceBotId?: string;
+};
 
 export function BotAssignmentsTab(props: BotAssignmentsTabProps) {
   const tr = useT();
   const [editingBot, setEditingBot] = useState<BotRow | null>(null);
   const [dragOverBot, setDragOverBot] = useState<string | null>(null);
+  const [dragOverRemove, setDragOverRemove] = useState(false);
   const [dragItem, setDragItem] = useState<DragItem | null>(null);
   const [skillQuery, setSkillQuery] = useState('');
   const [activeTag, setActiveTag] = useState<string | null>(null);
@@ -73,7 +79,9 @@ export function BotAssignmentsTab(props: BotAssignmentsTabProps) {
   }, [props.skills, skillQuery, activeTag]);
 
   const handleDrop = async (bot: BotRow) => {
-    if (!dragItem) return;
+    // Existing assignments use the explicit remove zone. Do not silently turn
+    // a drag between Bot rows into copy/move semantics the UI never promises.
+    if (!dragItem || dragItem.sourceBotId) return;
     setDragOverBot(null);
     setDragItem(null);
     const currentSkills = priorityNames(bot.skills);
@@ -86,6 +94,50 @@ export function BotAssignmentsTab(props: BotAssignmentsTabProps) {
       await props.onSave(bot.larkAppId, currentSkills, [...currentPacks, dragItem.id]);
     }
   };
+
+  const handleUnassign = async () => {
+    const item = dragItem;
+    if (!item?.sourceBotId) return;
+    setDragOverRemove(false);
+    setDragOverBot(null);
+    setDragItem(null);
+    const sourceBot = props.bots.find(bot => bot.larkAppId === item.sourceBotId);
+    if (!sourceBot) return;
+    const currentSkills = priorityNames(sourceBot.skills);
+    const currentPacks = packIds(sourceBot.skills);
+    if (item.type === 'skill') {
+      if (!currentSkills.includes(item.id)) return;
+      await props.onSave(
+        sourceBot.larkAppId,
+        currentSkills.filter(name => name !== item.id),
+        currentPacks,
+      );
+    } else {
+      if (!currentPacks.includes(item.id)) return;
+      await props.onSave(
+        sourceBot.larkAppId,
+        currentSkills,
+        currentPacks.filter(id => id !== item.id),
+      );
+    }
+  };
+
+  const clearDragState = () => {
+    setDragItem(null);
+    setDragOverBot(null);
+    setDragOverRemove(false);
+  };
+
+  const startDrag = (event: DragEvent<HTMLElement>, item: DragItem, effect: 'copy' | 'move') => {
+    event.dataTransfer.effectAllowed = effect;
+    // Firefox requires drag data before it will start a native HTML drag.
+    event.dataTransfer.setData('text/plain', item.id);
+    setDragItem(item);
+  };
+
+  const draggedFromBot = dragItem?.sourceBotId
+    ? props.bots.find(bot => bot.larkAppId === dragItem.sourceBotId)
+    : null;
 
   return (
     <section className="skills-config-block">
@@ -100,6 +152,35 @@ export function BotAssignmentsTab(props: BotAssignmentsTabProps) {
             <span className="skills-drag-icon">⤧</span>
             <span>{tr('skills.dragHint')}</span>
           </div>
+          {dragItem?.sourceBotId ? (
+            <div
+              className={`skills-unassign-dropzone${dragOverRemove ? ' is-active' : ''}`}
+              data-action="unassign-dropzone"
+              data-drag-over={dragOverRemove || undefined}
+              role="status"
+              aria-live="polite"
+              onDragOver={event => {
+                event.preventDefault();
+                event.dataTransfer.dropEffect = 'move';
+                setDragOverRemove(true);
+              }}
+              onDragLeave={event => {
+                if (!event.currentTarget.contains(event.relatedTarget as Node)) setDragOverRemove(false);
+              }}
+              onDrop={event => {
+                event.preventDefault();
+                void handleUnassign();
+              }}
+            >
+              <span className="skills-unassign-icon" aria-hidden="true">↩</span>
+              <span>
+                <strong>{tr('skills.unassignDropTitle')}</strong>
+                <small>{tr('skills.unassignDropHint', {
+                  bot: draggedFromBot?.botName ?? dragItem.sourceBotId,
+                })}</small>
+              </span>
+            </div>
+          ) : null}
           {props.packs.length > 0 && (
             <div className="skills-bot-palette-group">
               <span className="skills-bot-palette-label">{tr('skills.packChips')}</span>
@@ -109,8 +190,10 @@ export function BotAssignmentsTab(props: BotAssignmentsTabProps) {
                     key={pack.id}
                     className="skills-draggable-chip skills-pack-chip"
                     draggable
-                    onDragStart={() => setDragItem({ type: 'pack', id: pack.id })}
-                    onDragEnd={() => { setDragItem(null); setDragOverBot(null); }}
+                    data-palette-drag-type="pack"
+                    data-palette-drag-id={pack.id}
+                    onDragStart={event => startDrag(event, { type: 'pack', id: pack.id }, 'copy')}
+                    onDragEnd={clearDragState}
                     title={`${pack.name} (${pack.include.length} skills)`}
                   >
                     {pack.name}
@@ -153,8 +236,10 @@ export function BotAssignmentsTab(props: BotAssignmentsTabProps) {
                   key={skill.name}
                   className="skills-draggable-chip skills-skill-chip"
                   draggable
-                  onDragStart={() => setDragItem({ type: 'skill', id: skill.name })}
-                  onDragEnd={() => { setDragItem(null); setDragOverBot(null); }}
+                  data-palette-drag-type="skill"
+                  data-palette-drag-id={skill.name}
+                  onDragStart={event => startDrag(event, { type: 'skill', id: skill.name }, 'copy')}
+                  onDragEnd={clearDragState}
                   title={skill.description ?? skill.name}
                 >
                   {skill.name}
@@ -194,9 +279,18 @@ export function BotAssignmentsTab(props: BotAssignmentsTabProps) {
                     <tr
                       key={bot.larkAppId}
                       className={`skills-bot-row${isDragOver ? ' drag-over' : ''}${isFocused ? ' skills-bot-row-focus' : ''}`}
-                      onDragOver={e => { e.preventDefault(); setDragOverBot(bot.larkAppId); }}
+                      onDragOver={e => {
+                        if (!dragItem || dragItem.sourceBotId) return;
+                        e.preventDefault();
+                        e.dataTransfer.dropEffect = 'copy';
+                        setDragOverBot(bot.larkAppId);
+                      }}
                       onDragLeave={() => setDragOverBot(prev => prev === bot.larkAppId ? null : prev)}
-                      onDrop={e => { e.preventDefault(); void handleDrop(bot); }}
+                      onDrop={e => {
+                        if (!dragItem || dragItem.sourceBotId) return;
+                        e.preventDefault();
+                        void handleDrop(bot);
+                      }}
                     >
                       <td>{bot.botName ?? bot.larkAppId}</td>
                       <td>
@@ -209,15 +303,30 @@ export function BotAssignmentsTab(props: BotAssignmentsTabProps) {
                               const unknown = !pack && props.packsKnown === false;
                               const missing = !pack && !unknown;
                               return (
-                                <button
+                                <span
                                   key={pid}
-                                  type="button"
-                                  className={`skills-pack-chip${missing ? ' skills-chip-missing' : ''}${unknown ? ' skills-chip-unknown' : ''}`}
-                                  data-action="open-bot-pack"
-                                  title={unknown ? tr('skills.healthUnknown') : undefined}
-                                  disabled={!pack || !props.onOpenPack}
-                                  onClick={() => props.onOpenPack?.(pid)}
-                                >{pack?.name ?? pid}</button>
+                                  className={`skills-assigned-draggable${dragItem?.sourceBotId === bot.larkAppId && dragItem.type === 'pack' && dragItem.id === pid ? ' is-dragging' : ''}`}
+                                  draggable
+                                  data-assigned-drag-type="pack"
+                                  data-assigned-drag-id={pid}
+                                  data-assigned-bot={bot.larkAppId}
+                                  title={tr('skills.dragToRemove')}
+                                  onDragStart={event => startDrag(
+                                    event,
+                                    { type: 'pack', id: pid, sourceBotId: bot.larkAppId },
+                                    'move',
+                                  )}
+                                  onDragEnd={clearDragState}
+                                >
+                                  <button
+                                    type="button"
+                                    className={`skills-pack-chip${missing ? ' skills-chip-missing' : ''}${unknown ? ' skills-chip-unknown' : ''}`}
+                                    data-action="open-bot-pack"
+                                    title={unknown ? tr('skills.healthUnknown') : undefined}
+                                    disabled={!pack || !props.onOpenPack}
+                                    onClick={() => props.onOpenPack?.(pid)}
+                                  >{pack?.name ?? pid}</button>
+                                </span>
                               );
                             })}
                         </div>
@@ -226,14 +335,29 @@ export function BotAssignmentsTab(props: BotAssignmentsTabProps) {
                         {skillNames.length === 0 ? <span className="muted">—</span> :
                           <span className="skills-skill-chips">
                             {skillNames.slice(0, 3).map(n => (
-                              <button
+                              <span
                                 key={n}
-                                type="button"
-                                className="skills-skill-chip"
-                                data-action="open-bot-skill"
-                                disabled={!props.onOpenSkill}
-                                onClick={() => props.onOpenSkill?.(n)}
-                              >{n}</button>
+                                className={`skills-assigned-draggable${dragItem?.sourceBotId === bot.larkAppId && dragItem.type === 'skill' && dragItem.id === n ? ' is-dragging' : ''}`}
+                                draggable
+                                data-assigned-drag-type="skill"
+                                data-assigned-drag-id={n}
+                                data-assigned-bot={bot.larkAppId}
+                                title={tr('skills.dragToRemove')}
+                                onDragStart={event => startDrag(
+                                  event,
+                                  { type: 'skill', id: n, sourceBotId: bot.larkAppId },
+                                  'move',
+                                )}
+                                onDragEnd={clearDragState}
+                              >
+                                <button
+                                  type="button"
+                                  className="skills-skill-chip"
+                                  data-action="open-bot-skill"
+                                  disabled={!props.onOpenSkill}
+                                  onClick={() => props.onOpenSkill?.(n)}
+                                >{n}</button>
+                              </span>
                             ))}
                             {skillNames.length > 3 && <span className="muted">+{skillNames.length - 3}</span>}
                           </span>}
