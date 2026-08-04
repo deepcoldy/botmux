@@ -21,6 +21,15 @@ const packs = [
   { id: 'p2', name: 'Pack 2', include: ['skill:b', 'skill:c'] },
 ];
 
+function dragEvent() {
+  return {
+    dataTransfer: { effectAllowed: '', dropEffect: '', setData: vi.fn() },
+    preventDefault: vi.fn(),
+    relatedTarget: null,
+    currentTarget: { contains: () => false },
+  };
+}
+
 describe('bot assignments tab', () => {
   it('renders a compact table row per bot with pack chips and skill count', () => {
     let renderer!: TestRenderer.ReactTestRenderer;
@@ -38,6 +47,95 @@ describe('bot assignments tab', () => {
     expect(text).toContain('Pack 1');
     // Final count: pack:p1 gives a,b; skill:c gives c; all installed → 3
     expect(text).toContain('3');
+  });
+
+  it('keeps palette-to-Bot drag assignment working', async () => {
+    const onSave = vi.fn(async () => {});
+    let renderer!: TestRenderer.ReactTestRenderer;
+    act(() => {
+      renderer = TestRenderer.create(React.createElement(BotAssignmentsTab, {
+        bots: [bot()],
+        skills,
+        statuses: {},
+        onSave,
+        packs,
+      }));
+    });
+    const root = renderer.root;
+    const palettePack = root.findByProps({
+      'data-palette-drag-type': 'pack',
+      'data-palette-drag-id': 'p1',
+    });
+    const row = root.findAllByType('tr').find((node: any) => String(node.props.className).includes('skills-bot-row'))!;
+
+    act(() => { palettePack.props.onDragStart(dragEvent()); });
+    const overEvent = dragEvent();
+    act(() => { row.props.onDragOver(overEvent); });
+    expect(overEvent.preventDefault).toHaveBeenCalledTimes(1);
+    expect(overEvent.dataTransfer.dropEffect).toBe('copy');
+    await act(async () => { row.props.onDrop(dragEvent()); await Promise.resolve(); });
+
+    expect(onSave).toHaveBeenCalledWith('app-1', [], ['p1']);
+  });
+
+  it('drags an assigned Pack back to the remove zone without touching other selectors', async () => {
+    const onSave = vi.fn(async () => {});
+    let renderer!: TestRenderer.ReactTestRenderer;
+    act(() => {
+      renderer = TestRenderer.create(React.createElement(BotAssignmentsTab, {
+        bots: [bot({ skills: { include: ['pack:p1', 'pack:p2', 'skill:c'] } })],
+        skills,
+        statuses: {},
+        onSave,
+        packs,
+      }));
+    });
+    const root = renderer.root;
+    const assignedPack = root.findByProps({
+      'data-assigned-drag-type': 'pack',
+      'data-assigned-drag-id': 'p1',
+      'data-assigned-bot': 'app-1',
+    });
+
+    expect(root.findAllByProps({ 'data-action': 'unassign-dropzone' })).toHaveLength(0);
+    act(() => { assignedPack.props.onDragStart(dragEvent()); });
+    const dropzone = root.findByProps({ 'data-action': 'unassign-dropzone' });
+    expect(JSON.stringify(renderer.toJSON())).toContain('只会从 Bot 1 移除当前项');
+    const overEvent = dragEvent();
+    act(() => { dropzone.props.onDragOver(overEvent); });
+    expect(overEvent.dataTransfer.dropEffect).toBe('move');
+    expect(root.findByProps({ 'data-action': 'unassign-dropzone' }).props['data-drag-over']).toBe(true);
+    await act(async () => { dropzone.props.onDrop(dragEvent()); await Promise.resolve(); });
+
+    expect(onSave).toHaveBeenCalledTimes(1);
+    expect(onSave).toHaveBeenCalledWith('app-1', ['c'], ['p2']);
+    expect(root.findAllByProps({ 'data-action': 'unassign-dropzone' })).toHaveLength(0);
+  });
+
+  it('drags an assigned direct Skill back to remove while preserving Packs and other Skills', async () => {
+    const onSave = vi.fn(async () => {});
+    let renderer!: TestRenderer.ReactTestRenderer;
+    act(() => {
+      renderer = TestRenderer.create(React.createElement(BotAssignmentsTab, {
+        bots: [bot({ skills: { include: ['pack:p1', 'skill:b', 'skill:c'] } })],
+        skills,
+        statuses: {},
+        onSave,
+        packs,
+      }));
+    });
+    const root = renderer.root;
+    const assignedSkill = root.findByProps({
+      'data-assigned-drag-type': 'skill',
+      'data-assigned-drag-id': 'b',
+      'data-assigned-bot': 'app-1',
+    });
+
+    act(() => { assignedSkill.props.onDragStart(dragEvent()); });
+    const dropzone = root.findByProps({ 'data-action': 'unassign-dropzone' });
+    await act(async () => { dropzone.props.onDrop(dragEvent()); await Promise.resolve(); });
+
+    expect(onSave).toHaveBeenCalledWith('app-1', ['c'], ['p1']);
   });
 
   it('expanded preview labels direct skills as "direct" and pack skills as "pack:<name>"', () => {
