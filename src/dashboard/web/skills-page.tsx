@@ -1,5 +1,5 @@
 import type React from 'react';
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+import { useCallback, useEffect, useId, useMemo, useRef, useState, type ReactNode } from 'react';
 import { createPortal } from 'react-dom';
 import { FieldTitle, Html, LoadingState, RefreshIconButton, SectionHeader } from './dashboard-components.js';
 import { botAvatarHtml } from './ui.js';
@@ -34,15 +34,6 @@ import type {
 } from './skills/types.js';
 
 const INSTALLED_SKILLS_ROWS_PER_PAGE = 2;
-
-/** Clickable examples under the source field. Clicking fills the input so the
- *  supported shapes are discoverable instead of guessed. */
-const INSTALL_SOURCE_EXAMPLES = [
-  'owner/repo',
-  'https://github.com/owner/repo/tree/main',
-  'agentbuddy:group/skill',
-  '/path/to/skill',
-];
 
 function installedSkillsColumnCount(width: number): number {
   if (width >= 1600) return 4;
@@ -128,6 +119,11 @@ interface SkillsInstallPanelProps {
 export function SkillsInstallPanel(props: SkillsInstallPanelProps) {
   const tr = useT();
   const selectionDialogRef = useRef<HTMLDialogElement | null>(null);
+  const sourceHelpRef = useRef<HTMLDivElement | null>(null);
+  const sourceHelpId = useId();
+  const sourceInputId = `${sourceHelpId}-input`;
+  const sourceHelpTitleId = `${sourceHelpId}-title`;
+  const [sourceHelpOpen, setSourceHelpOpen] = useState(false);
   const candidates = props.installCandidates ?? [];
   const selectedInstallSkills = props.selectedInstallSkills ?? new Set<string>();
   const allSelected = candidates.length > 0 && candidates.every(candidate => selectedInstallSkills.has(candidate.name));
@@ -167,6 +163,22 @@ export function SkillsInstallPanel(props: SkillsInstallPanelProps) {
     }
   }, [props.installSelectionOpen, candidates.length]);
 
+  useEffect(() => {
+    if (!sourceHelpOpen || typeof document === 'undefined') return undefined;
+    const closeOnOutsidePointer = (event: PointerEvent) => {
+      if (!sourceHelpRef.current?.contains(event.target as Node)) setSourceHelpOpen(false);
+    };
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setSourceHelpOpen(false);
+    };
+    document.addEventListener('pointerdown', closeOnOutsidePointer);
+    document.addEventListener('keydown', closeOnEscape);
+    return () => {
+      document.removeEventListener('pointerdown', closeOnOutsidePointer);
+      document.removeEventListener('keydown', closeOnEscape);
+    };
+  }, [sourceHelpOpen]);
+
   return (
     <article className="bd-card skills-install-panel">
       {props.showTitle === false ? null : <div className="skills-install-title">
@@ -185,21 +197,69 @@ export function SkillsInstallPanel(props: SkillsInstallPanelProps) {
         </div>
       ) : null}
       <div className="skills-install-grid">
-        <label className="skills-source-label">
-          <FieldTitle
-            help={(
-              <span className="skills-source-help">
-                <span><strong>{tr('skills.sourceHelpRemoteLabel')}</strong>{tr('skills.sourceHelpRemote')}</span>
-                <span><strong>{tr('skills.sourceHelpLocalLabel')}</strong>{tr('skills.sourceHelpLocal')}</span>
-                <span><strong>{tr('skills.sourceHelpAgentbuddyLabel')}</strong>{tr('skills.sourceHelpAgentbuddy')}</span>
-              </span>
-            )}
-            helpLabel={tr('skills.source')}
+        <div className="skills-source-label">
+          <div
+            className="skills-source-heading"
+            ref={sourceHelpRef}
+            onKeyDown={event => {
+              if (event.key === 'Escape') setSourceHelpOpen(false);
+            }}
           >
-            {tr('skills.source')}
-          </FieldTitle>
+            <label htmlFor={sourceInputId}>{tr('skills.source')}</label>
+            <button
+              type="button"
+              className="skills-source-help-trigger"
+              data-action="toggle-source-help"
+              aria-label={tr('skills.sourceHelpOpen')}
+              aria-expanded={sourceHelpOpen}
+              aria-controls={sourceHelpId}
+              aria-haspopup="dialog"
+              onClick={() => setSourceHelpOpen(open => !open)}
+            >?</button>
+            {sourceHelpOpen ? (
+              <aside
+                className="skills-source-help-popover"
+                id={sourceHelpId}
+                role="dialog"
+                aria-labelledby={sourceHelpTitleId}
+                data-source-help-popover
+              >
+                <div className="skills-source-help-head">
+                  <div>
+                    <strong id={sourceHelpTitleId}>{tr('skills.sourceHelpTitle')}</strong>
+                    <span>{tr('skills.sourceHelpIntro')}</span>
+                  </div>
+                  <button
+                    type="button"
+                    className="skills-source-help-close"
+                    data-action="close-source-help"
+                    aria-label={tr('skills.sourceHelpClose')}
+                    onClick={() => setSourceHelpOpen(false)}
+                  >×</button>
+                </div>
+                <div className="skills-source-help-list">
+                  <section>
+                    <strong>{tr('skills.sourceHelpRemoteLabel')}</strong>
+                    <span>{tr('skills.sourceHelpRemote')}</span>
+                    <code>{tr('skills.sourceHelpRemoteExample')}</code>
+                  </section>
+                  <section>
+                    <strong>{tr('skills.sourceHelpLocalLabel')}</strong>
+                    <span>{tr('skills.sourceHelpLocal')}</span>
+                    <code>{tr('skills.sourceHelpLocalExample')}</code>
+                  </section>
+                  <section>
+                    <strong>{tr('skills.sourceHelpAgentbuddyLabel')}</strong>
+                    <span>{tr('skills.sourceHelpAgentbuddy')}</span>
+                    <code>{tr('skills.sourceHelpAgentbuddyExample')}</code>
+                  </section>
+                </div>
+              </aside>
+            ) : null}
+          </div>
           <div className="skills-source-control">
             <input
+              id={sourceInputId}
               type="text"
               data-install="source"
               aria-label={tr('skills.source')}
@@ -208,26 +268,13 @@ export function SkillsInstallPanel(props: SkillsInstallPanelProps) {
               onChange={e => props.onInstallSourceChange(e.currentTarget.value)}
             />
           </div>
-          <div className="skills-source-formats" aria-label={tr('skills.sourceFormats')}>
-            <span>{tr('skills.sourceFormats')}</span>
-            {INSTALL_SOURCE_EXAMPLES.map(example => (
-              <button
-                key={example}
-                type="button"
-                data-action="use-source-example"
-                data-example={example}
-                title={tr('skills.sourceFormatUse')}
-                onClick={() => props.onInstallSourceChange(example)}
-              ><code>{example}</code></button>
-            ))}
-          </div>
           {props.installSource.trim() ? (
             <div className={`skills-source-feedback is-${sourceType}`} data-source-hint={sourceType}>
               <strong>{sourceTypeLabel}</strong>
               <span>{sourcePreflight}</span>
             </div>
           ) : null}
-        </label>
+        </div>
         {/* Advanced options stay folded: the overwhelming majority of installs
             are "paste an address and go". Path/Ref only apply to git sources and
             the depth toggle is a fallback the backend already performs on its

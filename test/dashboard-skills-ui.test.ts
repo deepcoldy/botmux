@@ -157,14 +157,29 @@ describe('dashboard skills install panel', () => {
     expect(advanced.findAllByProps({ 'data-action': 'install' })).toHaveLength(0);
   });
 
-  it('offers clickable source-format examples that fill the input', () => {
-    const onInstallSourceChange = vi.fn();
-    const renderer = renderInstallPanel({ onInstallSourceChange });
-    const examples = renderer.root.findAllByProps({ 'data-action': 'use-source-example' });
+  it('keeps source examples in an accessible help popover instead of the primary form', () => {
+    const renderer = renderInstallPanel();
+    const root = renderer.root;
 
-    expect(examples.length).toBeGreaterThanOrEqual(4);
-    act(() => { examples[0].props.onClick(); });
-    expect(onInstallSourceChange).toHaveBeenCalledWith(examples[0].props['data-example']);
+    expect(root.findAllByProps({ 'data-action': 'use-source-example' })).toHaveLength(0);
+    expect(root.findAllByProps({ 'data-source-help-popover': true })).toHaveLength(0);
+
+    const trigger = root.findByProps({ 'data-action': 'toggle-source-help' });
+    expect(trigger.props['aria-expanded']).toBe(false);
+    expect(trigger.props['aria-haspopup']).toBe('dialog');
+    act(() => { trigger.props.onClick(); });
+
+    const popover = root.findByProps({ 'data-source-help-popover': true });
+    expect(popover.props.role).toBe('dialog');
+    expect(root.findByProps({ 'data-action': 'toggle-source-help' }).props['aria-expanded']).toBe(true);
+    const rendered = JSON.stringify(renderer.toJSON());
+    expect(rendered).toContain('GitHub / Git');
+    expect(rendered).toContain('本机 CLI Skill 目录');
+    expect(rendered).toContain('npm_config_registry=');
+    expect(rendered).toContain('agentbuddy@latest skill add skills.example.com/team/health');
+
+    act(() => { root.findByProps({ 'data-action': 'close-source-help' }).props.onClick(); });
+    expect(root.findAllByProps({ 'data-source-help-popover': true })).toHaveLength(0);
   });
 
   it('keeps multi-skill install selection inside the install confirmation dialog', () => {
