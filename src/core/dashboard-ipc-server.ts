@@ -2486,11 +2486,16 @@ ipcRoute('PUT', '/api/message-listeners/:chatId', async (req, res, p) => {
 
 function dashboardHistoryMessageSender(message: any): { senderOpenId?: string; senderName?: string; senderTypeRaw?: string; senderIdType?: string } {
   const sender = message?.sender ?? {};
-  const senderId = sender.id ?? sender.open_id ?? sender.user_id ?? sender.app_id
+  // Prefer `open_bot_id` (present on bot senders when with_sender_name=true): it
+  // is the bot's per-app open_id, matching /members/bots and the stored sender
+  // filters. Mirrors historyMessageSender in event-dispatcher so preview and the
+  // 30s poll resolve a third-party bot identically. See that fn for detail.
+  const senderId = sender.open_bot_id ?? sender.id ?? sender.open_id ?? sender.user_id ?? sender.app_id
     ?? message?.sender_id?.open_id ?? message?.sender_id?.user_id ?? message?.sender_id?.app_id;
   const senderName = sender.sender_name ?? sender.name ?? sender.user_name ?? message?.sender_name;
-  const senderIdType = sender.id_type ?? sender.sender_id_type;
-  const senderTypeRaw = sender.sender_type ?? message?.sender_type ?? (senderIdType === 'app_id' ? 'app' : undefined);
+  const rawIdType = sender.id_type ?? sender.sender_id_type;
+  const senderIdType = sender.open_bot_id ? 'open_id' : rawIdType;
+  const senderTypeRaw = sender.sender_type ?? message?.sender_type ?? (rawIdType === 'app_id' ? 'app' : undefined);
   return {
     senderOpenId: typeof senderId === 'string' ? senderId : undefined,
     senderName: typeof senderName === 'string' && senderName.trim() ? senderName.trim() : undefined,

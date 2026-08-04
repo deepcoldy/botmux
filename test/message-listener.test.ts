@@ -307,6 +307,43 @@ describe('message listener evaluation', () => {
     expect(withMap[0]).toMatchObject({ messageId: 'om_card', senderName: 'Argos' });
   });
 
+  it('preview matches a third-party bot via sender.open_bot_id without any app_id map', () => {
+    const state = bot({
+      messageListeners: {
+        oc_chat: {
+          enabled: true,
+          prompt: '分析卡片',
+          senderPolicy: {
+            mode: 'include_only',
+            includeSenderOpenIds: ['ou_argos'],
+            includeSenderTypes: ['bot'],
+          },
+          messagePolicy: { includeMsgTypes: ['interactive'], scope: 'top_level' },
+        },
+      },
+    });
+    const messages = [{
+      message_id: 'om_card',
+      create_time: '3000',
+      msg_type: 'interactive',
+      body: { content: JSON.stringify({ header: { title: { content: '告警' } }, body: { elements: [] } }) },
+      // Real Lark shape with with_sender_name=true: bot row carries open_bot_id.
+      sender: { id: 'cli_argos', id_type: 'app_id', sender_type: 'app', sender_name: 'Argos', open_bot_id: 'ou_argos' },
+    }];
+    // Mirror the production extractor: prefer open_bot_id, mark it open_id.
+    const senderForMessage = (m: any) => ({
+      senderOpenId: m.sender.open_bot_id ?? m.sender.id,
+      senderIdType: m.sender.open_bot_id ? 'open_id' : m.sender.id_type,
+      senderTypeRaw: m.sender.sender_type,
+      senderName: m.sender.sender_name,
+    });
+    // No app_id→open_id map needed: open_bot_id already resolves to ou_argos,
+    // so the include-only whitelist matches and identity is NOT unverified.
+    const matches = previewMessageListenerMatches({ bot: state, chatId: 'oc_chat', limit: 5, messages, senderForMessage });
+    expect(matches).toHaveLength(1);
+    expect(matches[0]).toMatchObject({ messageId: 'om_card', senderName: 'Argos' });
+  });
+
   it('preview fails closed for an unresolved bot app_id under an open_id exclusion', () => {
     const state = bot({
       messageListeners: {
