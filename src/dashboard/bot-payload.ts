@@ -71,6 +71,7 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     summaryRange: j?.summaryRange
       ?? summaryRangeFromLegacyContentTriggers(j?.contentTriggers)
       ?? defaultSummaryRangePrefs(),
+    summaryMemory: j?.summaryMemory === true,
     regularGroupReplyMode: (j?.regularGroupReplyMode === 'chat' || j?.regularGroupReplyMode === 'new-topic' || j?.regularGroupReplyMode === 'shared')
       ? j.regularGroupReplyMode
       : 'chat-topic',

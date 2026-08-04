@@ -205,6 +205,18 @@ describe('bot-registry grant additions', () => {
     expect(cfgs[2].summaryRange).toBeUndefined();
   });
 
+  it('parses summaryMemory as a default-off boolean', () => {
+    const cfgs = parseBotConfigsFromText(JSON.stringify([
+      { larkAppId: 'sm1', larkAppSecret: 's', summaryMemory: true },
+      { larkAppId: 'sm2', larkAppSecret: 's', summaryMemory: false },
+      { larkAppId: 'sm3', larkAppSecret: 's', summaryMemory: 'true' },
+    ]));
+
+    expect(cfgs[0].summaryMemory).toBe(true);
+    expect(cfgs[1].summaryMemory).toBeUndefined();
+    expect(cfgs[2].summaryMemory).toBeUndefined();
+  });
+
   it('parses legacy contentTriggers and preserves explicit unlimited history settings', () => {
     const cfgs = parseBotConfigsFromText(JSON.stringify([{
       larkAppId: 'ct1',

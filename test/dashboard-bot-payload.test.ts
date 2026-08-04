@@ -17,7 +17,7 @@ describe('dashboard bot payload helpers', () => {
       'overloadAlert', 'p2pMode', 'privateCard', 'regularGroupMentionMode',
       'regularGroupReplyMode', 'restrictGrantCommands', 'riff', 'sandbox', 'sandboxPaths',
       'silentTurnReactions', 'skillInjection', 'startupCommands', 'substituteMode',
-      'summaryRange', 'writableTerminalLinkInCard',
+      'summaryMemory', 'summaryRange', 'writableTerminalLinkInCard',
     ];
     expect(Object.keys(row)).toEqual(expect.arrayContaining(editableFields));
   });
@@ -240,6 +240,7 @@ describe('dashboard bot payload helpers', () => {
   it('projects dashboard summary range for /api/bots', () => {
     const daemon = { larkAppId: 'app_a', botName: 'BotA', cliId: 'codex' };
     expect(botDefaultsPayload(daemon, {})).toMatchObject({
+      summaryMemory: false,
       summaryRange: {
         limit: 50,
         sinceHours: 24,
@@ -247,7 +248,9 @@ describe('dashboard bot payload helpers', () => {
     });
     expect(botDefaultsPayload(daemon, {
       summaryRange: { limit: 12, sinceHours: 6 },
+      summaryMemory: true,
     })).toMatchObject({
+      summaryMemory: true,
       summaryRange: {
         limit: 12,
         sinceHours: 6,

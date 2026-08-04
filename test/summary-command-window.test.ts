@@ -50,7 +50,7 @@ async function run(range = { limit: 0, sinceHours: 0 }) {
     larkAppId: 'app',
     chatId: 'chat',
     message: trigger,
-    match: { chatKind: 'regularGroup', triggerText: '/summary', range, prompt: 'summarize' },
+    match: { chatKind: 'regularGroup', triggerText: '/summary', range, prompt: 'summarize', summaryMemory: false },
   });
 }
 
@@ -93,5 +93,41 @@ describe('regular-group /summary window (faithful stopper)', () => {
     expect(prompt).toContain('keep-1');
     expect(prompt).toContain('keep-2');
     expect(prompt).not.toContain('drop-old');
+  });
+
+  it('treats text after /summary as a hard boundary and never falls back when missing', async () => {
+    const boundedTrigger = msg('trigger-boundary', '@_bot_a /summary 从错误开始', T, {
+      mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: BOT_OPEN_ID } }],
+    });
+    chatPages.newestFirst = [
+      boundedTrigger,
+      msg('after', '边界后内容', T - 1 * 60 * 60_000),
+      msg('boundary', '从错误开始', T - 2 * 60 * 60_000),
+      msg('before', '边界前旧内容', T - 3 * 60 * 60_000),
+    ];
+
+    const bounded = await buildSummaryCommandPrompt({
+      larkAppId: 'app',
+      chatId: 'chat',
+      message: boundedTrigger,
+      match: { chatKind: 'regularGroup', triggerText: '/summary 从错误开始', range: { limit: 0, sinceHours: 0 }, prompt: 'summarize', summaryMemory: false },
+    });
+    expect(bounded).toContain('window="explicit-boundary"');
+    expect(bounded).toContain('从错误开始');
+    expect(bounded).toContain('边界后内容');
+    expect(bounded).not.toContain('边界前旧内容');
+
+    chatPages.newestFirst = [
+      boundedTrigger,
+      msg('after', '不能擅自扩展进去的内容', T - 1 * 60 * 60_000),
+    ];
+    const missing = await buildSummaryCommandPrompt({
+      larkAppId: 'app',
+      chatId: 'chat',
+      message: boundedTrigger,
+      match: { chatKind: 'regularGroup', triggerText: '/summary 找不到边界', range: { limit: 0, sinceHours: 0 }, prompt: 'summarize', summaryMemory: false },
+    });
+    expect(missing).toContain('explicit boundary not found');
+    expect(missing).not.toContain('不能擅自扩展进去的内容');
   });
 });

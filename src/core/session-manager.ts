@@ -630,6 +630,21 @@ function renderWhiteboardBlock(opts?: { whiteboardId?: string }): string {
   ].join('\n');
 }
 
+function renderSummaryMemoryBlock(larkAppId: string | undefined): string {
+  if (!larkAppId) return '';
+  let enabled = false;
+  try { enabled = getBot(larkAppId).config.summaryMemory === true; } catch { return ''; }
+  if (!enabled) return '';
+  return [
+    '<summary_memory>',
+    '项目根目录可能存在 summary.md。这不是通用长期记忆，而是用户显式通过 /summary 写入当前项目的问题解决记录本。',
+    '处理后续问题时，如果当前项目根目录存在 summary.md，必须先读取；但只有 PSM、环境、任务 ID、节点、错误现象等必要条件全部完全一致，才可以直接复用历史答案。',
+    '如果任一关键条件缺失、不一致或不确定，只能把 summary.md 当排查参考，不能套用结论。',
+    '不要因为本规则主动写 summary.md；只有用户显式触发 /summary 且本 bot 开启记忆时，才按 /summary 指令追加 summary.md。',
+    '</summary_memory>',
+  ].join('\n');
+}
+
 /**
  * Peer count at/below which the `<available_bots>` block inlines the full
  * roster (name + open_id). Above it the block collapses to a one-line pointer
@@ -764,6 +779,7 @@ export function buildNewTopicPrompt(
 
   const roleBlock = renderRoleContextBlock(opts?.larkAppId, opts?.chatId);
   const whiteboardBlock = renderWhiteboardBlock({ whiteboardId: opts?.whiteboardId });
+  const summaryMemoryBlock = renderSummaryMemoryBlock(opts?.larkAppId);
 
   const mentionBlock = renderMentionBlock(mentions);
   const botBlock = renderAvailableBotsBlock(availableBots, mentions, locale);
@@ -793,6 +809,7 @@ export function buildNewTopicPrompt(
     parts.push(`<session_id>${xmlEscape(sessionId)}</session_id>`);
   }
   if (roleBlock) parts.push(roleBlock);
+  if (summaryMemoryBlock) parts.push(summaryMemoryBlock);
   if (whiteboardBlock) parts.push(whiteboardBlock);
 
   parts.push(userBlock);
@@ -858,6 +875,7 @@ export function buildNewTopicCliInput(
   if (cliId !== 'codex-app' || (followUps && followUps.length > 0 && !opts?.codexAppFollowUps)) return { content };
   const roleBlock = renderRoleContextBlock(opts?.larkAppId, opts?.chatId);
   const whiteboardBlock = renderWhiteboardBlock({ whiteboardId: opts?.whiteboardId });
+  const summaryMemoryBlock = renderSummaryMemoryBlock(opts?.larkAppId);
   const senderBlock = renderSenderTag(sender);
   const substitutePolicyBlock = renderSubstitutePolicy(opts?.substituteTrigger);
   const substituteTargetBlock = renderSubstituteTarget(opts?.substituteTrigger);
@@ -868,7 +886,7 @@ export function buildNewTopicCliInput(
     content,
     codexAppInput: buildCodexAppTurnInput({
       text: [opts?.codexAppText ?? userMessage, ...(opts?.codexAppFollowUps ?? [])].join('\n\n'),
-      roleBlock,
+      roleBlock: [roleBlock, summaryMemoryBlock].filter(Boolean).join('\n\n'),
       whiteboardBlock,
       senderBlock,
       substitutePolicyBlock,
@@ -897,6 +915,7 @@ export function buildFollowUpContent(
   const parts: string[] = [];
   const roleBlock = renderRoleContextBlock(opts?.larkAppId, opts?.chatId, { followUp: true });
   const whiteboardBlock = renderWhiteboardBlock({ whiteboardId: opts?.whiteboardId });
+  const summaryMemoryBlock = renderSummaryMemoryBlock(opts?.larkAppId);
   const skipSessionId = opts?.isAdoptMode || (opts?.cliId
     ? createCliAdapterSync(opts.cliId, opts.cliPathOverride).injectsSessionContext
     : false);
@@ -908,6 +927,7 @@ export function buildFollowUpContent(
   // user's text. Per-turn attribution (sender/attachments/mentions) stays after.
   if (!skipSessionId) parts.push(`<session_id>${xmlEscape(sessionId)}</session_id>`);
   if (roleBlock) parts.push(roleBlock);
+  if (summaryMemoryBlock) parts.push(summaryMemoryBlock);
   if (opts?.cliId !== 'mira') {
     // All non-Mira CLIs — including Hermes, which no longer gets reverse
     // send-first guidance (#653) and now shares this standard path — get the
@@ -952,6 +972,7 @@ export function buildFollowUpCliInput(
   if (opts?.cliId !== 'codex-app' || opts.isAdoptMode) return { content: legacyContent };
   const roleBlock = renderRoleContextBlock(opts.larkAppId, opts.chatId, { followUp: true });
   const whiteboardBlock = renderWhiteboardBlock({ whiteboardId: opts.whiteboardId });
+  const summaryMemoryBlock = renderSummaryMemoryBlock(opts.larkAppId);
   const senderBlock = renderSenderTag(opts.sender);
   const substitutePolicyBlock = renderSubstitutePolicy(opts.substituteTrigger);
   const substituteTargetBlock = renderSubstituteTarget(opts.substituteTrigger);
@@ -961,7 +982,7 @@ export function buildFollowUpCliInput(
     content: legacyContent,
     codexAppInput: buildCodexAppTurnInput({
       text: opts.codexAppText ?? content,
-      roleBlock,
+      roleBlock: [roleBlock, summaryMemoryBlock].filter(Boolean).join('\n\n'),
       whiteboardBlock,
       senderBlock,
       substitutePolicyBlock,

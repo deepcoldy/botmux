@@ -438,6 +438,7 @@ function patchCardPrefsFromBody(bot: BotDefaultsRow, body: any): BotDefaultsRow 
     codexAppCleanInput: body.codexAppCleanInput,
     writableTerminalLinkInCard: body.writableTerminalLinkInCard,
     privateCard: body.privateCard,
+    summaryMemory: body.summaryMemory,
     botToBotSameDir: body.botToBotSameDir,
     autoStartOnGroupJoin: body.autoStartOnGroupJoin,
     autoStartOnGroupJoinPrompt: body.autoStartOnGroupJoinPrompt,
@@ -745,7 +746,7 @@ function BotDefaultsCard(props: {
             </section>
             <section className="bd-tile"><SessionCapSection bot={bot} patchBot={patchBot} /></section>
             <section className="bd-tile"><StartupCommandsSection bot={bot} patchBot={patchBot} /></section>
-            <section className="bd-tile"><SummaryTriggerSection bot={bot} patchBot={patchBot} /></section>
+            <section className="bd-tile"><SummaryTriggerSection bot={bot} patchBot={patchBot} putCardPref={putCardPref} /></section>
           </BdTabGrid>
         </div>
         <div
@@ -2411,19 +2412,23 @@ function CrossBotSection(props: { bot: BotDefaultsRow; putCardPref(patch: CardPr
   );
 }
 
-function SummaryTriggerSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
+function SummaryTriggerSection(props: { bot: BotDefaultsRow; patchBot: PatchBot; putCardPref(patch: CardPrefPatch): Promise<JsonResponse> }) {
   const tr = useT();
   const initial = summaryRange(props.bot);
   const [limit, setLimit] = useState(String(initial.limit));
   const [sinceHours, setSinceHours] = useState(String(initial.sinceHours));
+  const [memoryOn, setMemoryOn] = useState(props.bot.summaryMemory === true);
   const [status, setStatus] = useState<StatusMessage>(null);
+  const [memoryStatus, setMemoryStatus] = useState<StatusMessage>(null);
   const [busy, setBusy] = useState(false);
+  const [memoryBusy, setMemoryBusy] = useState(false);
 
   useEffect(() => {
     const next = summaryRange(props.bot);
     setLimit(String(next.limit));
     setSinceHours(String(next.sinceHours));
-  }, [props.bot.summaryRange?.limit, props.bot.summaryRange?.sinceHours]);
+    setMemoryOn(props.bot.summaryMemory === true);
+  }, [props.bot.summaryRange?.limit, props.bot.summaryRange?.sinceHours, props.bot.summaryMemory]);
 
   async function save(): Promise<void> {
     setStatus(null);
@@ -2456,6 +2461,30 @@ function SummaryTriggerSection(props: { bot: BotDefaultsRow; patchBot: PatchBot 
     }
   }
 
+  async function saveMemory(next: boolean): Promise<void> {
+    const prev = memoryOn;
+    setMemoryOn(next);
+    setMemoryStatus(null);
+    setMemoryBusy(true);
+    try {
+      const res = await props.putCardPref({ summaryMemory: next });
+      if (res.ok && res.body.ok) {
+        const saved = res.body.summaryMemory === true;
+        setMemoryOn(saved);
+        props.patchBot(props.bot.larkAppId, { summaryMemory: saved });
+        setMemoryStatus({ text: `✓ ${tr('botDefaults.cardPrefSaved')}`, ok: true });
+      } else {
+        setMemoryOn(prev);
+        setMemoryStatus({ text: `✗ ${responseErrorText(res)}` });
+      }
+    } catch (e: any) {
+      setMemoryOn(prev);
+      setMemoryStatus({ text: `✗ ${caughtErrorText(e)}` });
+    } finally {
+      setMemoryBusy(false);
+    }
+  }
+
   return (
     <section className="bd-section">
       <h3 className="bd-section-title"><FieldTitle help={tr('botDefaults.summaryLimitHelp')}>{tr('botDefaults.sectionSummaryTrigger')}</FieldTitle></h3>
@@ -2473,6 +2502,14 @@ function SummaryTriggerSection(props: { bot: BotDefaultsRow; patchBot: PatchBot 
         <button type="button" className="primary" data-action="save-summary-trigger" disabled={busy} onClick={() => void save()}>{tr('botDefaults.summarySave')}</button>
         <StatusSpan status={status} attr={{ 'data-summary-trigger-status': '' }} />
       </div>
+      <ToggleRow
+        checked={memoryOn}
+        disabled={memoryBusy}
+        title={tr('botDefaults.summaryMemory')}
+        help={tr('botDefaults.summaryMemoryHelp')}
+        onChange={checked => void saveMemory(checked)}
+      />
+      <div className="actions"><StatusSpan status={memoryStatus} attr={{ 'data-summary-memory-status': '' }} /></div>
     </section>
   );
 }

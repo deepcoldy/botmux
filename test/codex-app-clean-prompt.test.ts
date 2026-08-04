@@ -116,6 +116,31 @@ describe('Codex App clean prompt sidecar', () => {
     expect(built.codexAppInput?.additionalContext?.botmux_attachments.value).toContain('/tmp/readme.md');
   });
 
+  it('injects conservative summary.md reuse rules when summary memory is enabled', () => {
+    registerBot({
+      larkAppId: 'summary-memory-prompt',
+      larkAppSecret: 's',
+      cliId: 'codex-app',
+      summaryMemory: true,
+    });
+
+    const opening = buildNewTopicCliInput('继续排查', 'sid-summary-memory', 'codex-app', undefined, undefined, undefined, undefined, undefined, undefined, 'zh', undefined, {
+      larkAppId: 'summary-memory-prompt',
+      chatId: 'chat-summary-memory',
+    });
+    const followUp = buildFollowUpCliInput('后续问题', 'sid-summary-memory', {
+      cliId: 'codex-app',
+      larkAppId: 'summary-memory-prompt',
+      chatId: 'chat-summary-memory',
+    });
+
+    expect(opening.content).toContain('<summary_memory>');
+    expect(opening.content).toContain('只有 PSM、环境、任务 ID、节点、错误现象等必要条件全部完全一致');
+    expect(opening.codexAppInput?.additionalContext?.botmux_role.value).toContain('<summary_memory>');
+    expect(followUp.content).toContain('<summary_memory>');
+    expect(followUp.codexAppInput?.additionalContext?.botmux_role.value).toContain('只能把 summary.md 当排查参考');
+  });
+
   it('does not create a Codex sidecar for any other CLI', () => {
     const built = buildNewTopicCliInput('hello', 'sid', 'claude-code');
     expect(built.codexAppInput).toBeUndefined();
