@@ -90,9 +90,10 @@ Dashboard 安装/更新 job 完成后会通过现有 logger 写入 `[skills:audi
 botmux skills install "agentbuddy skill collection add <uid>"
 botmux skills install "agentbuddy plugin collection add <uid>"
 botmux skills install "agentbuddy skill add <group> --skill <name>"
+botmux skills install "npm_config_registry=\"https://registry.example.com\" npx -y agentbuddy@latest skill add <group>/<name>"
 ```
 
-- 兼容命令前面带的 `npm_config_registry="…" npx agentbuddy@latest …` 前缀（自动剥离）。botmux 用部署机自己配置的 agentbuddy 执行，**域名无关、无需额外配置**。
+- 兼容命令前面带的 `npm_config_registry="…" npx agentbuddy@latest …` 前缀（自动剥离），也兼容 marketplace 常见的 `skill add <group>/<name>` 合并路径。botmux 用部署机自己配置的 agentbuddy 执行，**域名无关、无需额外配置**。
 - 仅接受 `skill` / `plugin` 的 `add` / `collection add` 安装类子命令，其它子命令（publish/remove/login 等）不受理。
 - plugin 命令也会执行，但收进 botmux 的是该 plugin **内含的 SKILL.md**（botmux 是 skill registry；plugin 不含 skill 则无内容可装）。
 - **开源 skills**（vercel-labs 的 `skills` CLI）：也认 `skills add owner/repo` / `npx skills add owner/repo` / `add-skill owner/repo` —— 直接走 botmux 现成的 **GitHub 安装**（无需部署机装 `skills` CLI，公开仓库免鉴权，与贴 GitHub 链接等价）。

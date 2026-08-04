@@ -1,3 +1,4 @@
+import { existsSync } from 'node:fs';
 import { isAbsolute } from 'node:path';
 
 export interface ParsedSkillInstallSource {
@@ -18,6 +19,16 @@ export interface AgentbuddySource {
   group?: string;
   skill?: string;
   version?: string;
+}
+
+/** Stable identifier persisted in the skill registry and rendered back to
+ * users. Keep this formatter beside the parser so every emitted identifier is
+ * guaranteed to have a matching parse form. */
+export function formatAgentbuddyIdentifier(opts: AgentbuddySource): string {
+  const protocol = opts.protocol ?? 'skill';
+  return opts.collection
+    ? `${protocol}/collection/${opts.collection}`
+    : `${protocol}/${opts.group}/${opts.skill}${opts.version ? `@${opts.version}` : ''}`;
 }
 
 function parseMaybeUrl(raw: string): URL | null {
@@ -159,6 +170,7 @@ function assertSafeAgentbuddyGroup(group: string): void {
  *    agentbuddy skill collection add <uid>
  *    agentbuddy plugin collection add <uid>
  *    agentbuddy skill add <group> --skill <name> [--version <v>]
+ *    agentbuddy skill add <group>/<name> [--version <v>]
  *  and tolerates a leading `KEY=VALUE … npx [-y] agentbuddy@latest …` prefix
  *  (the env + runner the site prepends). Only install subcommands (`add`,
  *  `collection add`) of `skill`/`plugin` are accepted — other agentbuddy
@@ -179,10 +191,22 @@ export function parseAgentbuddyCommand(raw: string): AgentbuddySource | null {
     return { protocol, collection: rest[3] };
   }
   // <protocol> add <group> --skill <name> [--version <v>]
+  // <protocol> add <group>/<skill> [--version <v>]
+  //
+  // The second form is the copy-command emitted by the internal marketplace,
+  // commonly with a leading npm_config_registry=... npx -y prefix. Parse the
+  // final path segment as the skill while retaining the existing explicit
+  // --skill form for backwards compatibility.
   if (rest[1] === 'add' && rest[2] && !rest[2].startsWith('-')) {
-    const group = rest[2];
+    let group = rest[2];
     const skillIdx = Math.max(rest.indexOf('--skill'), rest.indexOf('-s'));
-    const skill = skillIdx >= 0 ? rest[skillIdx + 1] : undefined;
+    let skill = skillIdx >= 0 ? rest[skillIdx + 1] : undefined;
+    if (!skill) {
+      const segments = group.split('/');
+      if (segments.length < 2) return null;
+      skill = segments.pop();
+      group = segments.join('/');
+    }
     if (!skill) return null;
     const verIdx = Math.max(rest.indexOf('--version'), rest.indexOf('-v'));
     const version = verIdx >= 0 ? rest[verIdx + 1] : undefined;
@@ -193,6 +217,64 @@ export function parseAgentbuddyCommand(raw: string): AgentbuddySource | null {
   }
   return null;
 }
+
+/** Parse the canonical `agentbuddy:` identifiers documented in
+ *  docs/setup/skills.md, which the dashboard install box accepts directly:
+ *    agentbuddy:collection/<uid>
+ *    agentbuddy:<group>/<skill>[@<version>]
+ *  A leading `skill`/`plugin` segment is always treated as the protocol, for
+ *  both `collection/<uid>` and `<group>/<skill>` — that is the exact shape
+ *  formatAgentbuddyIdentifier() writes into the registry, so a saved source
+ *  re-parses back to the same target (see the round-trip test in
+ *  test/skill-sources.test.ts).
+ *  Consequence, deliberate: a group whose FIRST segment is literally `skill` or
+ *  `plugin` cannot be expressed here — `agentbuddy:skill/health` reads as
+ *  protocol `skill` + an incomplete target and throws. Real groups are
+ *  registry-host prefixed (`skills.example.com/team`), so this does not collide
+ *  in practice; the round-trip guarantee is worth more than that name.
+ *  Throws `invalid_agentbuddy_*` for malformed identifiers (an `agentbuddy:`
+ *  prefix is an explicit intent — it must never fall through to another kind).
+ *  Returns null when `raw` carries no `agentbuddy:` prefix at all. */
+export function parseAgentbuddyIdentifier(raw: string): AgentbuddySource | null {
+  const trimmed = raw.trim();
+  if (!/^agentbuddy:/i.test(trimmed)) return null;
+  const rest = trimmed.slice('agentbuddy:'.length).replace(/^\/+/, '');
+  if (!rest) throw new Error('invalid_agentbuddy_identifier');
+  let segments = rest.split('/').filter((segment) => segment.length > 0);
+  if (segments.length !== rest.split('/').length) throw new Error('invalid_agentbuddy_identifier');
+
+  let protocol: 'skill' | 'plugin' | undefined;
+  // Registry identifiers always carry the protocol for both collections and
+  // individual skills. Strip it before parsing the remaining collection or
+  // group/skill shape so a rendered source round-trips into the same target.
+  if (segments[0] === 'skill' || segments[0] === 'plugin') {
+    protocol = segments[0];
+    segments = segments.slice(1);
+  }
+  // collection/<uid>
+  if (segments[0] === 'collection') {
+    if (segments.length !== 2) throw new Error('invalid_agentbuddy_collection');
+    assertSafeAgentbuddyToken(segments[1], 'collection');
+    return { protocol: protocol ?? 'skill', collection: segments[1] };
+  }
+  // <group>/<skill>[@<version>] — last segment is the skill, the rest the group
+  if (segments.length < 2) throw new Error('invalid_agentbuddy_identifier');
+  const last = segments[segments.length - 1];
+  const at = last.lastIndexOf('@');
+  const skill = at > 0 ? last.slice(0, at) : last;
+  const version = at > 0 ? last.slice(at + 1) : undefined;
+  const group = segments.slice(0, -1).join('/');
+  assertSafeAgentbuddyGroup(group);
+  assertSafeAgentbuddyToken(skill, 'skill');
+  if (version !== undefined) assertSafeAgentbuddyToken(version, 'version', AGENTBUDDY_VERSION_RE);
+  return { protocol: protocol ?? 'skill', group, skill, ...(version ? { version } : {}) };
+}
+
+/** Bare GitHub shorthand: `owner/repo` or `owner/repo/path`. GitHub owners are
+ *  alphanumeric + hyphen, which keeps this from matching most relative paths;
+ *  an existing local directory still wins (checked by the caller) so a real
+ *  relative path is never hijacked. */
+const GITHUB_SHORTHAND_RE = /^[A-Za-z0-9][A-Za-z0-9-]*\/[A-Za-z0-9._-]+(?:\/[\w./-]+)?$/;
 
 /** Recognize the open-source `skills` CLI (vercel-labs/skills) add command and
  *  route its GitHub source into botmux's native GitHub/Git install — no extra
@@ -227,6 +309,13 @@ export function parseSkillInstallSource(raw: string): ParsedSkillInstallSource {
   if (command) {
     return { kind: 'agentbuddy', value: raw, agentbuddy: command };
   }
+  // Canonical `agentbuddy:` identifiers (documented in docs/setup/skills.md).
+  // Throws on malformed input rather than falling through — an explicit scheme
+  // must never be reinterpreted as a local path.
+  const identifier = parseAgentbuddyIdentifier(raw);
+  if (identifier) {
+    return { kind: 'agentbuddy', value: raw, agentbuddy: identifier };
+  }
   const skillsCommand = parseSkillsInstallCommand(raw);
   if (skillsCommand) return skillsCommand;
   if (raw.startsWith('github:')) {
@@ -253,6 +342,32 @@ export function parseSkillInstallSource(raw: string): ParsedSkillInstallSource {
     const value = raw;
     assertAllowedGitProtocol(value);
     return { kind: 'git', value };
+  }
+  // Bare GitHub shorthand (`owner/repo`, `owner/repo/path`). Authoritative here
+  // rather than in the dashboard so the CLI/IM entry points behave identically.
+  // An existing local directory of the same name always wins.
+  if (!isAbsolute(raw) && !/^[.~]/.test(raw) && GITHUB_SHORTHAND_RE.test(raw) && !existsSync(raw)) {
+    const parts = raw.split('/').filter(Boolean);
+    const path = parts.slice(2).join('/') || undefined;
+    if (path) assertSafeGitSkillPath(path);
+    return {
+      kind: 'github',
+      value: `github:${raw}`,
+      github: { owner: parts[0], repo: parts[1], ...(path ? { path } : {}) },
+    };
+  }
+  // Any remaining http(s) URL is a git remote (e.g. a self-hosted GitLab), not
+  // a filesystem path. Previously these fell through to `local` and failed with
+  // a confusing "path not found"; the dashboard papered over it by prefixing
+  // `git+` client-side, which the CLI/IM paths never did.
+  if (/^https?:\/\//i.test(raw)) {
+    assertAllowedGitProtocol(raw);
+    return { kind: 'git', value: raw };
+  }
+  // A scheme we don't handle must fail loudly instead of being treated as a
+  // relative path (`foo://bar` is not a directory).
+  if (/^[A-Za-z][A-Za-z0-9+.-]*:\/\//.test(raw)) {
+    throw new Error('unsupported_skill_source_scheme');
   }
   return { kind: 'local', value: raw };
 }
