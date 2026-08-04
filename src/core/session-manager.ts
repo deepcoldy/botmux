@@ -1248,6 +1248,24 @@ export function shouldAutoForkOnRestore(backendType: BackendType): boolean {
   return backendType !== 'pty';
 }
 
+function isUnstartedTraexRestoreDraft(session: Session, larkAppId: string): boolean {
+  if (
+    session.queued
+    || session.adoptedFrom
+    || session.cliId
+    || session.lastCliInput
+    || session.backendType
+    || session.initialUserTurnPending
+  ) {
+    return false;
+  }
+  try {
+    return getBot(larkAppId).config.cliId === 'traex';
+  } catch {
+    return false;
+  }
+}
+
 const RECOVERY_FORK_BATCH_SIZE = config.daemon.recoveryForkBatchSize ?? 5;
 const RECOVERY_FORK_DELAY_MS = config.daemon.recoveryForkDelayMs ?? 250;
 
@@ -1495,6 +1513,14 @@ export async function restoreActiveSessions(activeSessions: Map<string, DaemonSe
     }
 
     const larkAppId = session.larkAppId ?? getAllBots()[0]?.config.larkAppId ?? '';
+    if (isUnstartedTraexRestoreDraft(session, larkAppId)) {
+      sessionStore.closeSession(session.sessionId);
+      logger.info(
+        `[${session.sessionId.substring(0, 8)}] Closed unstarted TraeX initialization draft during restore; `
+        + 'its runtime-only card state cannot survive daemon restart',
+      );
+      continue;
+    }
     const ds: DaemonSession = {
       session,
       worker: null,

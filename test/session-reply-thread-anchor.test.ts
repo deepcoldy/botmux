@@ -221,6 +221,26 @@ describe('sessionReply chat-scope chokepoint — shared fold-back anchoring', ()
     expect(mocks.sendMessage).not.toHaveBeenCalled();
   });
 
+  it('can force a reply_in_thread target even when chat-scope has no reply target', async () => {
+    seedSharedSession(undefined, undefined);
+
+    await sessionReply(CHAT, '{"card":true}', 'interactive', APP, undefined, {
+      replyInThreadToMessageId: 'om_user_seed',
+    });
+
+    expect(mocks.replyMessage).toHaveBeenCalledTimes(1);
+    expect(mocks.replyMessage).toHaveBeenCalledWith(
+      APP,
+      'om_user_seed',
+      '{"card":true}',
+      'interactive',
+      true,
+      undefined,
+      expect.anything(),
+    );
+    expect(mocks.sendMessage).not.toHaveBeenCalled();
+  });
+
   it('routes a dedicated receiver by exact source session when an ordinary session shares its chat', async () => {
     const ordinary = seedSharedSession({ rootMessageId: 'om_ordinary_topic', turnId: 'turn-ordinary', updatedAt: NOW });
     const receiver = seedReceiverSession();

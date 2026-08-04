@@ -259,7 +259,30 @@ function makeActivePersistentSession(rootMessageId: string, backendType: 'tmux' 
   return s; // left active
 }
 
+function makeUnstartedSession(rootMessageId: string) {
+  const s = sessionStore.createSession('oc_chat1', rootMessageId, 'Unstarted draft', 'group');
+  s.larkAppId = 'app_test';
+  s.scope = 'thread';
+  s.workingDir = '/tmp/proj';
+  sessionStore.updateSession(s);
+  return s;
+}
+
 describe('restoreActiveSessions — persistent-backend zombie-close decision', () => {
+  it('closes unstarted TraeX initialization drafts because their card state is runtime-only', async () => {
+    bot.cliId = 'traex';
+    const draft = makeUnstartedSession('om_traex_draft');
+    const map = new Map<string, DaemonSession>();
+    wp.registry = map;
+
+    await restoreActiveSessions(map);
+
+    expect(map.size).toBe(0);
+    expect(sessionStore.getSession(draft.sessionId)?.status).toBe('closed');
+    expect(closeSession).not.toHaveBeenCalledWith(draft.sessionId);
+    expect(forkWorker).not.toHaveBeenCalled();
+  });
+
   it('shared Herdr restore probes the recorded managed agent, not a derived bmx-* session', async () => {
     const s = makeActivePersistentSession('om_shared_herdr');
     s.backendType = 'herdr';

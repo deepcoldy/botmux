@@ -162,6 +162,17 @@ export function fallbackTurnId(
   return turnId ?? (ds.currentReplyTarget ?? ds.session.currentReplyTarget)?.turnId;
 }
 
+/** Resolve the message id that daemon-side cards should use when they need a
+ * real Lark thread reply target. Plain/quote chat-scope sessions return null;
+ * shared fold-back/chat-topic sessions return their current visible topic anchor. */
+export function resolveThreadReplyRootMessageId(
+  ds: Pick<DaemonSession, 'scope' | 'chatId' | 'session' | 'currentReplyTarget'>,
+  turnId?: string,
+): string | null {
+  const target = resolveSessionReplyTarget(ds, fallbackTurnId(ds, turnId));
+  return target.mode === 'thread' ? target.rootMessageId : null;
+}
+
 export function syncReplyTargetState(ds: DaemonSession, s?: Session): void {
   const source = s ?? ds.session;
   ds.replyThreadAliases = source.replyThreadAliases;

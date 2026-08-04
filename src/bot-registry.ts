@@ -133,8 +133,8 @@ function normalizeChatReplyModeConfig(raw: unknown): ChatReplyMode | undefined {
   const v = raw.trim().toLowerCase();
   if (v === 'chat') return 'chat';
   if (v === 'chat-topic' || v === 'chattopic' || v === 'chat_topic') return 'chat-topic';
-  if (v === 'new-topic' || v === 'newtopic' || v === 'thread') return 'new-topic';
-  if (v === 'topic' || v === 'shared' || v === 'share' || v === 'alias' || v === 'topic-alias' || v === 'topic_alias') return 'shared';
+  if (v === 'topic' || v === 'new-topic' || v === 'newtopic' || v === 'thread') return 'new-topic';
+  if (v === 'shared' || v === 'share' || v === 'alias' || v === 'topic-alias' || v === 'topic_alias') return 'shared';
   return undefined;
 }
 

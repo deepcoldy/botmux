@@ -327,6 +327,288 @@ describe('/rename production routing — must not pre-create a session (review P
     expect(ds?.session.nativeSessionTitle).toBe('[BotMux·Lark] /workflow new 修复首轮授权');
   });
 
+  it('TraeX human new topic returns one initialization card and does not fork before confirmation', async () => {
+    const bot = registerBot({
+      larkAppId: APP,
+      larkAppSecret: 's',
+      cliId: 'traex',
+      allowedUsers: [OWNER],
+      oncallChats: [{ chatId: CHAT, workingDir: '/tmp' }],
+    });
+    bot.resolvedAllowedUsers = [OWNER];
+
+    await handleNewTopic(
+      makeEventData('om_traex_init', '实现统一初始化卡'),
+      makeCtx('om_traex_init', 'om_traex_init'),
+    );
+
+    expect(mocks.forkWorker).not.toHaveBeenCalled();
+    expect(repliedText()).toContain('初始化 TraeX 会话');
+    expect(repliedText()).toContain('Forge Pipeline');
+    const ds = activeSessions.get(sessionKey('om_traex_init', APP));
+    expect(ds?.pendingRepo).toBe(true);
+    expect(ds?.pendingTraexInitialization?.originalPrompt).toBe('实现统一初始化卡');
+    expect(ds?.pendingTraexInitialization?.selection).toMatchObject({
+      kind: 'directory',
+      path: '/tmp',
+    });
+  });
+
+  it('TraeX chat-scope initialization card stays flat when routing has no topic reply target', async () => {
+    const bot = registerBot({
+      larkAppId: APP,
+      larkAppSecret: 's',
+      cliId: 'traex',
+      allowedUsers: [OWNER],
+      oncallChats: [{ chatId: CHAT, workingDir: '/tmp' }],
+    });
+    bot.resolvedAllowedUsers = [OWNER];
+
+    await handleNewTopic(
+      makeEventData('om_traex_flat_seed', '按普通消息初始化'),
+      {
+        chatId: CHAT,
+        messageId: 'om_traex_flat_seed',
+        chatType: 'group' as const,
+        scope: 'chat' as const,
+        anchor: CHAT,
+        larkAppId: APP,
+      },
+    );
+
+    expect(mocks.forkWorker).not.toHaveBeenCalled();
+    expect(mocks.sendMessage).toHaveBeenCalledWith(
+      APP,
+      CHAT,
+      expect.stringContaining('初始化 TraeX 会话'),
+      'interactive',
+      undefined,
+      expect.anything(),
+    );
+    expect(mocks.replyMessage).not.toHaveBeenCalled();
+    const ds = activeSessions.get(sessionKey(CHAT, APP));
+    expect(ds?.pendingTraexInitialization?.originalPrompt).toBe('按普通消息初始化');
+  });
+
+  it('TraeX chat-scope initialization card follows the configured topic reply target', async () => {
+    const bot = registerBot({
+      larkAppId: APP,
+      larkAppSecret: 's',
+      cliId: 'traex',
+      allowedUsers: [OWNER],
+      oncallChats: [{ chatId: CHAT, workingDir: '/tmp' }],
+    });
+    bot.resolvedAllowedUsers = [OWNER];
+
+    await handleNewTopic(
+      makeEventData('om_traex_shared_seed', '在这个新消息下初始化'),
+      {
+        chatId: CHAT,
+        messageId: 'om_traex_shared_seed',
+        chatType: 'group' as const,
+        scope: 'chat' as const,
+        anchor: CHAT,
+        replyRootId: 'om_traex_shared_seed',
+        larkAppId: APP,
+      },
+    );
+
+    expect(mocks.forkWorker).not.toHaveBeenCalled();
+    expect(mocks.replyMessage).toHaveBeenCalledWith(
+      APP,
+      'om_traex_shared_seed',
+      expect.stringContaining('初始化 TraeX 会话'),
+      'interactive',
+      true,
+      undefined,
+      expect.anything(),
+    );
+    expect(mocks.sendMessage).not.toHaveBeenCalled();
+    const ds = activeSessions.get(sessionKey(CHAT, APP));
+    expect(ds?.pendingTraexInitialization?.originalPrompt).toBe('在这个新消息下初始化');
+  });
+
+  it('TraeX chat-scope second new message replaces the unstarted draft and gets its own card', async () => {
+    const bot = registerBot({
+      larkAppId: APP,
+      larkAppSecret: 's',
+      cliId: 'traex',
+      allowedUsers: [OWNER],
+      oncallChats: [{ chatId: CHAT, workingDir: '/tmp' }],
+    });
+    bot.resolvedAllowedUsers = [OWNER];
+
+    await handleNewTopic(
+      makeEventData('om_traex_first_seed', '第一条任务'),
+      {
+        chatId: CHAT,
+        messageId: 'om_traex_first_seed',
+        chatType: 'group' as const,
+        scope: 'chat' as const,
+        anchor: CHAT,
+        larkAppId: APP,
+      },
+    );
+
+    const first = activeSessions.get(sessionKey(CHAT, APP));
+    expect(first?.pendingTraexInitialization?.originalPrompt).toBe('第一条任务');
+    mocks.replyMessage.mockClear();
+    mocks.sendMessage.mockClear();
+
+    await handleThreadReply(
+      makeEventData('om_traex_second_seed', '第二条任务'),
+      {
+        chatId: CHAT,
+        messageId: 'om_traex_second_seed',
+        chatType: 'group' as const,
+        scope: 'chat' as const,
+        anchor: CHAT,
+        larkAppId: APP,
+      },
+    );
+
+    expect(mocks.forkWorker).not.toHaveBeenCalled();
+    expect(mocks.sendMessage).toHaveBeenCalledWith(
+      APP,
+      CHAT,
+      expect.stringContaining('初始化 TraeX 会话'),
+      'interactive',
+      undefined,
+      expect.anything(),
+    );
+    expect(repliedText()).not.toContain('请先在上方初始化卡中确认');
+    const second = activeSessions.get(sessionKey(CHAT, APP));
+    expect(second?.session.sessionId).not.toBe(first?.session.sessionId);
+    expect(second?.session.rootMessageId).toBe('om_traex_second_seed');
+    expect(second?.pendingTraexInitialization?.originalPrompt).toBe('第二条任务');
+  });
+
+  it('TraeX new-topic routed top-level message starts fresh initialization instead of entering old chat worker', async () => {
+    const bot = registerBot({
+      larkAppId: APP,
+      larkAppSecret: 's',
+      cliId: 'traex',
+      allowedUsers: [OWNER],
+      oncallChats: [{ chatId: CHAT, workingDir: '/tmp' }],
+    });
+    bot.resolvedAllowedUsers = [OWNER];
+    const send = vi.fn();
+    const oldDs = seedLiveChatSession(send);
+    oldDs.session.lastCliInput = '$forge-pilot\n旧任务';
+    oldDs.lastCliInput = '$forge-pilot\n旧任务';
+
+    await handleThreadReply(
+      makeEventData('om_traex_live_new_seed', '第二个独立任务'),
+      {
+        chatId: CHAT,
+        messageId: 'om_traex_live_new_seed',
+        chatType: 'group' as const,
+        scope: 'thread' as const,
+        anchor: 'om_traex_live_new_seed',
+        larkAppId: APP,
+      },
+    );
+
+    expect(send).not.toHaveBeenCalled();
+    expect(mocks.forkWorker).not.toHaveBeenCalled();
+    expect(mocks.replyMessage).toHaveBeenCalledWith(
+      APP,
+      'om_traex_live_new_seed',
+      expect.stringContaining('初始化 TraeX 会话'),
+      'interactive',
+      true,
+      undefined,
+      expect.anything(),
+    );
+    expect(activeSessions.get(sessionKey(CHAT, APP))).toBe(oldDs);
+    const fresh = activeSessions.get(sessionKey('om_traex_live_new_seed', APP));
+    expect(fresh?.scope).toBe('thread');
+    expect(fresh?.session.rootMessageId).toBe('om_traex_live_new_seed');
+    expect(fresh?.pendingTraexInitialization?.originalPrompt).toBe('第二个独立任务');
+  });
+
+  it('TraeX chat-scope reply inside the initialization topic still buffers into that draft', async () => {
+    const bot = registerBot({
+      larkAppId: APP,
+      larkAppSecret: 's',
+      cliId: 'traex',
+      allowedUsers: [OWNER],
+      oncallChats: [{ chatId: CHAT, workingDir: '/tmp' }],
+    });
+    bot.resolvedAllowedUsers = [OWNER];
+
+    await handleNewTopic(
+      makeEventData('om_traex_buffer_seed', '初始化中的任务'),
+      {
+        chatId: CHAT,
+        messageId: 'om_traex_buffer_seed',
+        chatType: 'group' as const,
+        scope: 'chat' as const,
+        anchor: CHAT,
+        larkAppId: APP,
+      },
+    );
+
+    const first = activeSessions.get(sessionKey(CHAT, APP));
+    mocks.replyMessage.mockClear();
+    const replyData = makeEventData('om_traex_buffer_reply', '补充要求', 'om_traex_buffer_seed');
+    replyData.message.thread_id = 'om_traex_buffer_seed';
+
+    await handleThreadReply(
+      replyData,
+      {
+        chatId: CHAT,
+        messageId: 'om_traex_buffer_reply',
+        chatType: 'group' as const,
+        scope: 'chat' as const,
+        anchor: CHAT,
+        replyRootId: 'om_traex_buffer_seed',
+        larkAppId: APP,
+      },
+    );
+
+    expect(mocks.forkWorker).not.toHaveBeenCalled();
+    expect(repliedText()).toContain('请先在上方初始化卡中确认');
+    const stillFirst = activeSessions.get(sessionKey(CHAT, APP));
+    expect(stillFirst?.session.sessionId).toBe(first?.session.sessionId);
+    expect(stillFirst?.pendingFollowUps).toContain('补充要求');
+  });
+
+  it('TraeX initialization card send failure does not leave a no-card pending draft', async () => {
+    const bot = registerBot({
+      larkAppId: APP,
+      larkAppSecret: 's',
+      cliId: 'traex',
+      allowedUsers: [OWNER],
+      oncallChats: [{ chatId: CHAT, workingDir: '/tmp' }],
+    });
+    bot.resolvedAllowedUsers = [OWNER];
+    mocks.sendMessage.mockRejectedValueOnce(new Error('card-post-failed'));
+
+    await expect(handleNewTopic(
+      makeEventData('om_traex_card_fail', '这次卡片发送失败'),
+      {
+        chatId: CHAT,
+        messageId: 'om_traex_card_fail',
+        chatType: 'group' as const,
+        scope: 'chat' as const,
+        anchor: CHAT,
+        larkAppId: APP,
+      },
+    )).rejects.toThrow('card-post-failed');
+
+    expect(mocks.forkWorker).not.toHaveBeenCalled();
+    expect(mocks.sendMessage).toHaveBeenCalledWith(
+      APP,
+      CHAT,
+      expect.stringContaining('初始化 TraeX 会话'),
+      'interactive',
+      undefined,
+      expect.anything(),
+    );
+    expect(activeSessions.has(sessionKey(CHAT, APP))).toBe(false);
+  });
+
   it('uses the group name for mention-only sessions on both creation paths', async () => {
     const bot = registerBot({
       larkAppId: APP,
@@ -368,6 +650,51 @@ describe('/rename production routing — must not pre-create a session (review P
 
     expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
     expect(mocks.forkWorker.mock.calls[0]?.[2]).toEqual({ turnId: 'om_workflow_reply' });
+  });
+
+  it('TraeX thread safety-net also waits on the unified initialization card', async () => {
+    const bot = registerBot({
+      larkAppId: APP,
+      larkAppSecret: 's',
+      cliId: 'traex',
+      allowedUsers: [OWNER],
+      oncallChats: [{ chatId: CHAT, workingDir: '/tmp' }],
+    });
+    bot.resolvedAllowedUsers = [OWNER];
+
+    await handleThreadReply(
+      makeEventData('om_traex_reply', '排查初始化问题', 'om_traex_root'),
+      makeCtx('om_traex_root', 'om_traex_reply'),
+    );
+
+    expect(mocks.forkWorker).not.toHaveBeenCalled();
+    expect(repliedText()).toContain('初始化 TraeX 会话');
+    const ds = activeSessions.get(sessionKey('om_traex_root', APP));
+    expect(ds?.pendingTraexInitialization?.originalPrompt).toBe('排查初始化问题');
+  });
+
+  it('TraeX existing Lark thread reply bypasses initialization card and continues directly', async () => {
+    const bot = registerBot({
+      larkAppId: APP,
+      larkAppSecret: 's',
+      cliId: 'traex',
+      allowedUsers: [OWNER],
+      oncallChats: [{ chatId: CHAT, workingDir: '/tmp' }],
+    });
+    bot.resolvedAllowedUsers = [OWNER];
+    const data = makeEventData('om_old_thread_reply', '接力旧话题里未完成的内容', 'om_old_thread_root');
+    data.message.thread_id = 'om_old_thread_root';
+
+    await handleNewTopic(
+      data,
+      makeCtx('om_old_thread_root', 'om_old_thread_reply'),
+    );
+
+    expect(repliedText()).not.toContain('初始化 TraeX 会话');
+    expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
+    expect(mocks.forkWorker.mock.calls[0]?.[2]).toEqual({ turnId: 'om_old_thread_reply' });
+    const ds = activeSessions.get(sessionKey('om_old_thread_root', APP));
+    expect(ds?.pendingTraexInitialization).toBeUndefined();
   });
 
   it('live passthrough binds raw input and reply metadata to the accepted message', async () => {

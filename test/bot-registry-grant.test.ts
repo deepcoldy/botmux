@@ -7,7 +7,7 @@ describe('bot-registry grant additions', () => {
       larkAppId: 'rm1', larkAppSecret: 's',
       chatReplyModes: { oc_1: 'shared', oc_2: 'chat', oc_4: 'new-topic', oc_5: 'topic_alias', oc_6: 'topic', oc_7: 'chat-topic', oc_3: 'bad', '': 'shared' },
     }]));
-    expect(cfgs[0].chatReplyModes).toEqual({ oc_1: 'shared', oc_2: 'chat', oc_4: 'new-topic', oc_5: 'shared', oc_6: 'shared', oc_7: 'chat-topic' });
+    expect(cfgs[0].chatReplyModes).toEqual({ oc_1: 'shared', oc_2: 'chat', oc_4: 'new-topic', oc_5: 'shared', oc_6: 'new-topic', oc_7: 'chat-topic' });
   });
 
   it('parseBotConfigsFromText leaves chatReplyModes undefined when absent/all-invalid', () => {
@@ -152,7 +152,7 @@ describe('bot-registry grant additions', () => {
     expect(parseBotConfigsFromText(JSON.stringify([{ larkAppId: 'rg1', larkAppSecret: 's', regularGroupReplyMode: 'new-topic' }]))[0].regularGroupReplyMode).toBe('new-topic');
     expect(parseBotConfigsFromText(JSON.stringify([{ larkAppId: 'rg1b', larkAppSecret: 's', regularGroupReplyMode: 'shared' }]))[0].regularGroupReplyMode).toBe('shared');
     expect(parseBotConfigsFromText(JSON.stringify([{ larkAppId: 'rg1c', larkAppSecret: 's', regularGroupReplyMode: 'topic_alias' }]))[0].regularGroupReplyMode).toBe('shared');
-    expect(parseBotConfigsFromText(JSON.stringify([{ larkAppId: 'rg1d', larkAppSecret: 's', regularGroupReplyMode: 'topic' }]))[0].regularGroupReplyMode).toBe('shared');
+    expect(parseBotConfigsFromText(JSON.stringify([{ larkAppId: 'rg1d', larkAppSecret: 's', regularGroupReplyMode: 'topic' }]))[0].regularGroupReplyMode).toBe('new-topic');
     // 'chat' must SURVIVE the load round-trip — it is now a NON-default explicit
     // opt-out (the per-bot default is 'chat-topic'), so it must persist.
     expect(parseBotConfigsFromText(JSON.stringify([{ larkAppId: 'rg1e', larkAppSecret: 's', regularGroupReplyMode: 'chat' }]))[0].regularGroupReplyMode).toBe('chat');

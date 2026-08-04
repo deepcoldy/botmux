@@ -275,7 +275,7 @@ export interface Session {
    * for a queued/running turn. */
   vcMeetingImTurnOrigins?: Record<string, VcMeetingImTurnOrigin>;
   /**
-   * Chat-scope reply-thread aliases. In `/reply-mode topic`, a regular-group
+   * Chat-scope reply-thread aliases. In `/reply-mode shared`, a regular-group
    * @mention can ask the SAME chat-scope session/worker to answer inside the
    * @message's Lark thread. Later replies in that thread are folded back to this
    * chat session when their rootMessageId is listed here.

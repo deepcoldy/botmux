@@ -6,12 +6,12 @@
  *   • chat        — flat chat-scope replies in the group. A native Lark topic
  *                    the user opens here folds back into this one chat-scope
  *                    session too (see maybeFoldMentionedRegularGroupThreadToChat).
- *   • topic/shared — 话题展示但复用同一个 session: reuse the bot's existing
+ *   • topic/new-topic — explicit fork mode: each top-level @mention opens a fresh
+ *                    thread-scope session under the trigger (its own worker/cwd/context).
+ *   • shared      — 话题展示但复用同一个 session: reuse the bot's existing
  *                    chat-scope session/worker/cwd, but route this turn's reply
  *                    into the trigger message's thread (#131). A native topic
  *                    seed also folds into the shared session, not an independent one.
- *   • new-topic    — explicit fork mode: each top-level @mention opens a fresh
- *                    thread-scope session under the trigger (its own worker/cwd/context).
  *   • chat-topic   — hybrid (default): top-level @mentions stay flat in the one
  *                    chat-scope session (like `chat`), BUT a native Lark topic the
  *                    user opens runs its own independent thread-scope session (NOT
@@ -37,15 +37,15 @@ export function normalizeChatReplyMode(raw: string | undefined): ChatReplyMode |
   if (!v || v === 'status') return undefined;
   if (v === 'chat') return 'chat';
   if (v === 'chat-topic' || v === 'chattopic' || v === 'chat_topic') return 'chat-topic';
-  if (v === 'new-topic' || v === 'newtopic' || v === 'thread') return 'new-topic';
-  if (v === 'topic' || v === 'shared' || v === 'share' || v === 'alias' || v === 'topic-alias' || v === 'topic_alias') return 'shared';
+  if (v === 'topic' || v === 'new-topic' || v === 'newtopic' || v === 'thread') return 'new-topic';
+  if (v === 'shared' || v === 'share' || v === 'alias' || v === 'topic-alias' || v === 'topic_alias') return 'shared';
   return undefined;
 }
 
 /** Short command-word label for status / confirmation messages. */
-export function replyModeLabel(mode: ChatReplyMode): 'chat' | 'topic' | 'new-topic' | 'chat-topic' {
-  if (mode === 'shared') return 'topic';
-  if (mode === 'new-topic') return 'new-topic';
+export function replyModeLabel(mode: ChatReplyMode): 'chat' | 'topic' | 'shared' | 'chat-topic' {
+  if (mode === 'shared') return 'shared';
+  if (mode === 'new-topic') return 'topic';
   if (mode === 'chat-topic') return 'chat-topic';
   return 'chat';
 }

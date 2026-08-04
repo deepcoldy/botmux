@@ -13,7 +13,7 @@
  * Run:  pnpm vitest run test/reply-target-fallback.test.ts
  */
 import { describe, it, expect } from 'vitest';
-import { beginReplyTargetTurn, fallbackTurnId, isSubstituteTurn, pickTurnReplyTarget, resolveSessionReplyTarget } from '../src/core/reply-target.js';
+import { beginReplyTargetTurn, fallbackTurnId, isSubstituteTurn, pickTurnReplyTarget, resolveSessionReplyTarget, resolveThreadReplyRootMessageId } from '../src/core/reply-target.js';
 import type { DaemonSession } from '../src/core/types.js';
 
 const NOW = new Date().toISOString();
@@ -101,6 +101,35 @@ describe('fallbackTurnId × resolveSessionReplyTarget (the leak fix)', () => {
     });
     const target = resolveSessionReplyTarget(ds, fallbackTurnId(ds as DaemonSession, undefined));
     expect(target).toEqual({ mode: 'quote', rootMessageId: 'om_trigger' });
+  });
+});
+
+describe('resolveThreadReplyRootMessageId', () => {
+  it('daemon-side ask/card with NO turn context uses the shared topic root', () => {
+    const ds = makeDs({
+      currentReplyTarget: { rootMessageId: 'om_topic', turnId: 'turn-1', updatedAt: NOW },
+    });
+    expect(resolveThreadReplyRootMessageId(ds as DaemonSession)).toBe('om_topic');
+  });
+
+  it('explicit stale turn still degrades to flat chat for ask/card routing', () => {
+    const ds = makeDs({
+      currentReplyTarget: { rootMessageId: 'om_topic', turnId: 'turn-1', updatedAt: NOW },
+    });
+    expect(resolveThreadReplyRootMessageId(ds as DaemonSession, 'turn-2')).toBeNull();
+  });
+
+  it('quoteOnly targets are not treated as thread targets for ask/card routing', () => {
+    const ds = makeDs({
+      currentReplyTarget: { rootMessageId: 'om_quote', turnId: 'turn-q', updatedAt: NOW, quoteOnly: true },
+    });
+    expect(resolveThreadReplyRootMessageId(ds as DaemonSession)).toBeNull();
+  });
+
+  it('thread-scope ask/card routing keeps the session root message id', () => {
+    const ds = makeDs({ scope: 'thread' });
+    ds.session.rootMessageId = 'om_root';
+    expect(resolveThreadReplyRootMessageId(ds as DaemonSession)).toBe('om_root');
   });
 });
 

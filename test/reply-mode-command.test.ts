@@ -140,15 +140,15 @@ describe('tryHandleReplyModeCommand — group (tri-state incl. shared)', () => {
     mockGetChatMode.mockResolvedValue('group');
   });
 
-  it('group `/reply-mode topic` (owner) → setChatReplyMode("shared") + updated', async () => {
+  it('group `/reply-mode topic` (owner) → setChatReplyMode("new-topic") + updated', async () => {
     const handled = await tryHandleReplyModeCommand(APP, msg('/reply-mode topic', 'group'), USER, true);
     expect(handled).toBe(true);
-    expect(mockSetChatReplyMode).toHaveBeenCalledWith(APP, 'oc_group', 'shared');
+    expect(mockSetChatReplyMode).toHaveBeenCalledWith(APP, 'oc_group', 'new-topic');
     expect(mockApplyConfigField).not.toHaveBeenCalled(); // group path never touches p2pMode
     expect(lastReply()).toBe('cmd.reply_mode.updated');
   });
 
-  it('group `/reply-mode shared` remains a compatibility alias for topic/shared semantics', async () => {
+  it('group `/reply-mode shared` selects explicit topic-display session reuse', async () => {
     const handled = await tryHandleReplyModeCommand(APP, msg('/reply-mode shared', 'group'), USER, true);
     expect(handled).toBe(true);
     expect(mockSetChatReplyMode).toHaveBeenCalledWith(APP, 'oc_group', 'shared');

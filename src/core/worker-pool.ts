@@ -296,6 +296,10 @@ function syncWorkerDisplayMode(ds: DaemonSession): void {
 
 export interface WorkerSessionReplyOptions {
   uuid?: string;
+  /** Force a Lark `reply_in_thread=true` reply to this exact message id.
+   * Used for daemon-side cards that must create/land in the user's current
+   * topic even when the owning session is chat-scope and has no reply target. */
+  replyInThreadToMessageId?: string;
   quoteMessageId?: string;
   beforeQuoteFallback?: () => void | Promise<void>;
   /** Do not fan meeting-derived content out through user-configured outbound

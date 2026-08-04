@@ -324,7 +324,7 @@ export function submitCustomReply(args: {
  *   - larkAppId 相同（不跨 bot 命中）
  *   - chatId 相同
  *   - thread-scope：ask.rootMessageId === anchor（话题根 message_id）
- *   - chat-scope：ask.rootMessageId === null（anchor 实为 chatId，已由 chatId 命中）
+ *   - flat chat ask：ask.rootMessageId === null（anchor 实为 chatId，已由 chatId 命中）
  *
  * 命中多个时返回最先注册的（实践中同一 anchor 同时最多一个 pending ask，因为发起
  * ask 的 CLI 此刻正阻塞等待结果）。返回 snapshot，改它不影响 broker 状态。

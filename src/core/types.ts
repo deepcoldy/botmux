@@ -10,6 +10,7 @@ import type {
   VcMeetingImTurnOrigin,
 } from '../types.js';
 import type { CliUsageLimitState } from '../utils/cli-usage-limit.js';
+import type { PendingTraexInitialization } from './traex-initialization.js';
 
 /** Frozen card state — cached content for historical streaming cards that can still be toggled. */
 export interface FrozenCard {
@@ -82,6 +83,9 @@ export interface DaemonSession {
    *  其他用户直接读到（绕过 dashboard cookie + loopback-HMAC）。worker 每次 ready
    *  都会重报，daemon 重启后自愈。仅有写权限的 dashboard 视图经 spawn-command 接口取。 */
   spawnCommand?: string;
+  /** TraeX 人工首轮初始化门：统一卡片一次选择仓库、运行方式和首轮提示词。
+   *  只驻内存；daemon 重启后旧卡失效，避免把尚未确认的输入持久化。 */
+  pendingTraexInitialization?: PendingTraexInitialization;
   pendingRepo?: boolean;         // waiting for repo selection before spawning CLI
   /** One in-memory owner is preparing the pending repo's first worker. Kept
    *  separate from worktreeCreating because plain select, skip, and /repo can

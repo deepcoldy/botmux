@@ -106,8 +106,9 @@ import { buildTerminalUrl, setTerminalProxyPort, setTerminalExternalPort } from 
 import { startTerminalProxy, type TerminalProxyHandle } from './core/terminal-proxy.js';
 import type { CliId } from './adapters/cli/types.js';
 import * as scheduler from './core/scheduler.js';
-import { scanProjects, scanMultipleProjects } from './services/project-scanner.js';
+import { scanProjects, scanMultipleProjects, type ProjectInfo } from './services/project-scanner.js';
 import { buildQuotaExhaustedCard, buildRepoSelectCard, buildStreamingCard, getCliDisplayName } from './im/lark/card-builder.js';
+import { buildTraexInitializationCard } from './im/lark/traex-initialization-card.js';
 import { isLocalCliOpenReady } from './services/local-cli-opener.js';
 import { RECEIVED_REACTION_EMOJI_TYPE, SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE } from './core/pending-response.js';
 import { t as tr, botLocale, localeForBot } from './i18n/index.js';
@@ -185,7 +186,7 @@ import { triggerSessionTurn } from './core/trigger-session.js';
 import { claimInitialUserTurn, isInitialUserTurnPending, releaseInitialUserTurn } from './core/initial-user-turn.js';
 import { applyQueuedCodexAppLegacyFallback, mergeQueuedCodexAppTurn } from './core/session-create.js';
 import { findOnlineDaemon, listOnlineDaemons } from './utils/daemon-discovery.js';
-import { beginReplyTargetTurn, fallbackTurnId, isSubstituteTurn, resolveSessionReplyTarget, syncReplyTargetState } from './core/reply-target.js';
+import { beginReplyTargetTurn, fallbackTurnId, isSubstituteTurn, resolveSessionReplyTarget, resolveThreadReplyRootMessageId, syncReplyTargetState } from './core/reply-target.js';
 import { readDeferredTopicBinding } from './core/deferred-topic-binding.js';
 import {
   buildBotmuxLarkNativeSessionTitle,
@@ -2953,6 +2954,10 @@ async function sessionReply(
     ? replyMessage(appId, messageId, body, type, replyInThread, uuid, hookContext, outboundOptions)
     : replyMessage(appId, messageId, body, type, replyInThread, uuid, hookContext);
 
+  if (opts?.replyInThreadToMessageId) {
+    return replyWithHookPolicy(opts.replyInThreadToMessageId, content, msgType, true, opts.uuid);
+  }
+
   // Chat-scope: post a plain message to the chat. No reply_in_thread → keeps
   // the conversation flat in 普通群. The card layer carries chatId in its button
   // values, so handleCardAction routes back via sessionKey(chatId).
@@ -4447,6 +4452,7 @@ function clearPendingRepoStateForNotifierAdopt(ds: DaemonSession): void {
   ds.pendingRepoCommitInFlight = false;
   ds.worktreeCreating = false;
   ds.repoCardMessageId = undefined;
+  ds.pendingTraexInitialization = undefined;
   ds.pendingPrompt = undefined;
   ds.pendingTurnId = undefined;
   ds.pendingRawInput = undefined;
@@ -5082,6 +5088,19 @@ for (const sessionRelayMutation of V3_SESSION_RUN_MUTATIONS) {
 // the request's lifetime is bounded by `body.timeoutMs` which the broker
 // enforces. Default fetch on the CLI side has no read timeout.
 
+function bindAskToActiveSession<T extends object>(
+  payload: T,
+  ds: DaemonSession,
+  originTurnId?: string,
+): T & { sessionId: string; larkAppId: string; chatId: string; rootMessageId: string | null } {
+  return bindSessionScopedIpcIdentity(payload, {
+    sessionId: ds.session.sessionId,
+    larkAppId: ds.larkAppId,
+    chatId: ds.chatId,
+    rootMessageId: resolveThreadReplyRootMessageId(ds, originTurnId),
+  });
+}
+
 ipcRoute('POST', '/api/asks', async (req, res) => {
   let raw: unknown;
   try {
@@ -5093,16 +5112,17 @@ ipcRoute('POST', '/api/asks', async (req, res) => {
   if ('error' in parsed) return jsonRes(res, 400, { ok: false, error: parsed.error });
 
   const askSession = findActiveBySessionId(parsed.sessionId);
+  const body = raw && typeof raw === 'object' && !Array.isArray(raw)
+    ? raw as Record<string, unknown>
+    : {};
+  const claimedTurnId = typeof body.originTurnId === 'string' ? body.originTurnId : undefined;
+  const claimedAttempt = typeof body.originDispatchAttempt === 'number'
+    && Number.isSafeInteger(body.originDispatchAttempt)
+    && body.originDispatchAttempt > 0
+    ? body.originDispatchAttempt
+    : undefined;
   let boundAsk = parsed;
   if (!isTrustedHostIpcRequest(req)) {
-    const body = raw && typeof raw === 'object' && !Array.isArray(raw)
-      ? raw as Record<string, unknown>
-      : {};
-    const claimedAttempt = typeof body.originDispatchAttempt === 'number'
-      && Number.isSafeInteger(body.originDispatchAttempt)
-      && body.originDispatchAttempt > 0
-      ? body.originDispatchAttempt
-      : undefined;
     const verified = authorizeSessionScopedIpc({
       trustedHost: false,
       sessionExists: !!askSession,
@@ -5113,7 +5133,7 @@ ipcRoute('POST', '/api/asks', async (req, res) => {
       claimedCapability: typeof body.originCapability === 'string'
         ? body.originCapability
         : undefined,
-      claimedTurnId: typeof body.originTurnId === 'string' ? body.originTurnId : undefined,
+      claimedTurnId,
       claimedDispatchAttempt: claimedAttempt,
     });
     if (!verified.ok) {
@@ -5125,14 +5145,12 @@ ipcRoute('POST', '/api/asks', async (req, res) => {
     // A session capability authenticates exactly one daemon session; it does
     // not let the caller choose another bot/chat/root. Bind every observable
     // ask route to that authenticated session before registering the card.
-    boundAsk = bindSessionScopedIpcIdentity(parsed, {
-      sessionId: askSession!.session.sessionId,
-      larkAppId: askSession!.larkAppId,
-      chatId: askSession!.chatId,
-      rootMessageId: askSession!.session.scope === 'chat'
-        ? null
-        : askSession!.session.rootMessageId,
-    });
+    boundAsk = bindAskToActiveSession(parsed, askSession!, claimedTurnId);
+  } else if (askSession) {
+    // Trusted-host calls still originate from a specific live session. Route
+    // observable ask cards with the same session-owned reply target as normal
+    // daemon output instead of the static process env captured at spawn time.
+    boundAsk = bindAskToActiveSession(parsed, askSession, claimedTurnId);
   }
   if (askSession?.session.vcMeetingReceiver) {
     // A meeting receiver ask would post a Lark card outside the managed action
@@ -15307,11 +15325,12 @@ function willAutoWorktree(larkAppId: string, pinnedWorkingDir: string | undefine
 function startAutoWorktreePending(ds: DaemonSession, args: {
   anchor: string; baseDir: string; title?: string; prompt: string; operatorOpenId?: string;
 }): void {
+  const replyTurnId = fallbackTurnId(ds, undefined);
   void runAutoWorktreeCommit({
     ds, anchor: args.anchor, larkAppId: ds.larkAppId, baseDir: args.baseDir,
     title: args.title, prompt: args.prompt, operatorOpenId: args.operatorOpenId,
     activeSessions,
-    notify: (m) => sessionReply(args.anchor, m, 'text', ds.larkAppId),
+    notify: (m) => sessionReply(args.anchor, m, 'text', ds.larkAppId, replyTurnId),
   });
   logger.info(`[${tag(ds)}] auto-worktree → pending, building worktree off ${args.baseDir}`);
 }
@@ -16107,6 +16126,61 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
     return;
   }
 
+  // TraeX 人工首轮先走统一初始化卡：仓库、运行方式和可编辑首轮提示词一次确认，
+  // 确认前绝不 fork worker。Bot/监听器/替身/显式 Forge 指令保留既有直达路径，
+  // 避免自动化入口等待一个永远不会发生的人工点击，也保留专家快捷用法。
+  const explicitForgePrompt = /^\s*[$/]forge-(?:pipeline|pilot)\b/i.test(content);
+  const shouldShowTraexInitialization =
+    botCfg.cliId === 'traex'
+    && !isBotSenderType
+    && !messageListener
+    && !substituteTrigger
+    && !workflowGrillPrompt
+    && !explicitForgePrompt
+    && !isExistingLarkThreadReply(parsed);
+  if (shouldShowTraexInitialization) {
+    if (await replyInvalidWorkingDirs(anchor, larkAppId, ds)) return;
+    const scanDirs = getProjectScanDirs(ds).filter(dir => existsSync(dir));
+    const projects = scanDirs.length > 0
+      ? scanMultipleProjects(scanDirs, 3, repoPickerScanOptions())
+      : [];
+    if (projects.length > 0) lastRepoScan.set(chatId, projects);
+    const currentPath = pinnedWorkingDir ?? getSessionWorkingDir(ds);
+    const currentProject = projects.find(project => project.path === currentPath);
+    const pendingTraexInitialization: NonNullable<DaemonSession['pendingTraexInitialization']> = {
+      nonce: randomUUID(),
+      ownerOpenId: senderOpenId,
+      originalPrompt: content,
+      promptPrefix: topicThreadContext + codexAppQuoteContext + codexAppApplicationContext,
+      selection: autoWt && pinnedWorkingDir
+        ? {
+            kind: 'auto-worktree',
+            path: pinnedWorkingDir,
+            label: currentProject?.name ?? pinnedWorkingDir,
+          }
+        : {
+            kind: 'directory',
+            path: currentPath,
+            label: currentProject
+              ? `${currentProject.name} (${currentProject.branch})`
+              : currentPath,
+            pinWorkingDir: !!pinnedWorkingDir,
+          },
+    };
+    await postTraexInitializationCard({
+      ds,
+      anchor,
+      larkAppId,
+      triggerMessageId: messageId,
+      replyRootId,
+      pending: pendingTraexInitialization,
+      projects,
+      logContext: `projects=${projects.length}, cwd=${currentPath}`,
+    });
+    logger.info(`[${tag(ds)}] Waiting for TraeX initialization (projects=${projects.length}, cwd=${currentPath})`);
+    return;
+  }
+
   // Auto-worktree: session is registered PENDING; build the worktree off the
   // critical path, then commitRepoSelection pins it + forks (folding in any
   // messages buffered during creation). detach → return immediately.
@@ -16662,6 +16736,128 @@ interface PreparedThreadReply {
   sender: ResolvedSender | undefined;
 }
 
+function isExistingLarkThreadReply(parsed: Pick<LarkMessage, 'messageId' | 'rootId' | 'threadId'>): boolean {
+  return !!parsed.rootId && !!parsed.threadId && parsed.rootId !== parsed.messageId;
+}
+
+function isTraexInitializationSeedThreadMessage(
+  ds: DaemonSession,
+  parsed: Pick<LarkMessage, 'messageId' | 'rootId' | 'threadId'>,
+  replyRootId?: string,
+): boolean {
+  const seedMessageId = ds.session.rootMessageId;
+  return !!seedMessageId && (
+    parsed.messageId === seedMessageId
+    || parsed.rootId === seedMessageId
+    || parsed.threadId === seedMessageId
+    || replyRootId === seedMessageId
+  );
+}
+
+function shouldReplaceChatScopedTraexInitializationDraft(
+  ds: DaemonSession,
+  parsed: Pick<LarkMessage, 'messageId' | 'rootId' | 'threadId'>,
+  scope: 'thread' | 'chat',
+  replyRootId?: string,
+): boolean {
+  return scope === 'chat'
+    && ds.scope === 'chat'
+    && ds.pendingRepo === true
+    && !!ds.pendingTraexInitialization
+    && !ds.worker
+    && !ds.pendingRepoCommitInFlight
+    && !ds.worktreeCreating
+    && !isTraexInitializationSeedThreadMessage(ds, parsed, replyRootId);
+}
+
+function closeUnstartedTraexInitializationDraft(ds: DaemonSession, reason: string): void {
+  const key = sessionKey(sessionAnchorId(ds), ds.larkAppId);
+  if (activeSessions.get(key) === ds) {
+    activeSessions.delete(key);
+  }
+  ds.pendingRepo = false;
+  ds.pendingTraexInitialization = undefined;
+  ds.repoCardMessageId = undefined;
+  sessionStore.closeSession(ds.session.sessionId);
+  publishClosedSessionPatch(
+    ds.session.sessionId,
+    ds.session.closedAt ? Date.parse(ds.session.closedAt) : undefined,
+  );
+  logger.info(`[${tag(ds)}] Closed unstarted TraeX initialization draft: ${reason}`);
+}
+
+async function postTraexInitializationCard(input: {
+  ds: DaemonSession;
+  anchor: string;
+  larkAppId: string;
+  triggerMessageId: string;
+  replyRootId?: string;
+  pending: NonNullable<DaemonSession['pendingTraexInitialization']>;
+  projects: ProjectInfo[];
+  logContext: string;
+}): Promise<void> {
+  const { ds, anchor, larkAppId, triggerMessageId, replyRootId, pending, projects, logContext } = input;
+  const previousPendingRepo = ds.pendingRepo;
+  const previousPendingTraexInitialization = ds.pendingTraexInitialization;
+  const previousRepoCardMessageId = ds.repoCardMessageId;
+  const previousReplyThreadAliases = ds.replyThreadAliases;
+  const previousCurrentReplyTarget = ds.currentReplyTarget;
+  const previousSessionReplyThreadAliases = ds.session.replyThreadAliases;
+  const previousSessionCurrentReplyTarget = ds.session.currentReplyTarget;
+  const previousSessionReplyTargets = ds.session.replyTargets;
+
+  ds.pendingRepo = true;
+  ds.pendingTraexInitialization = pending;
+  ds.repoCardMessageId = undefined;
+  beginReplyTargetTurn(
+    ds,
+    replyRootId,
+    ds.pendingTurnId ?? triggerMessageId,
+    new Date().toISOString(),
+  );
+  sessionStore.updateSession(ds.session);
+  try {
+    const cardJson = buildTraexInitializationCard({
+      rootId: anchor,
+      pending,
+      projects,
+      locale: localeForBot(larkAppId),
+    });
+    ds.repoCardMessageId = await sessionReply(
+      anchor,
+      cardJson,
+      'interactive',
+      larkAppId,
+      undefined,
+      replyRootId ? { replyInThreadToMessageId: replyRootId } : undefined,
+    );
+  } catch (error) {
+    ds.pendingRepo = previousPendingRepo;
+    ds.pendingTraexInitialization = previousPendingTraexInitialization;
+    ds.repoCardMessageId = previousRepoCardMessageId;
+    ds.replyThreadAliases = previousReplyThreadAliases;
+    ds.currentReplyTarget = previousCurrentReplyTarget;
+    ds.session.replyThreadAliases = previousSessionReplyThreadAliases;
+    ds.session.currentReplyTarget = previousSessionCurrentReplyTarget;
+    ds.session.replyTargets = previousSessionReplyTargets;
+    if (activeSessions.get(sessionKey(anchor, larkAppId)) === ds) {
+      activeSessions.delete(sessionKey(anchor, larkAppId));
+    }
+    sessionStore.closeSession(ds.session.sessionId);
+    publishClosedSessionPatch(
+      ds.session.sessionId,
+      ds.session.closedAt ? Date.parse(ds.session.closedAt) : undefined,
+    );
+    logger.warn(
+      `[${tag(ds)}] Failed to post TraeX initialization card; rolled back pending draft `
+      + `(${logContext}): ${error instanceof Error ? error.message : String(error)}`,
+    );
+    throw error;
+  }
+
+  announcePendingRepoSession(ds);
+}
+
 async function handleThreadReply(
   data: any,
   ctx: RoutingContext,
@@ -17071,7 +17267,20 @@ async function handleThreadReply(
   logger.info(`Reply in ${scope}-scope session ${anchor.substring(0, 12)}: ${content.substring(0, 100)} (resources: ${resources.length})`);
 
   let ds = activeSessions.get(sessionKey(anchor, larkAppId));
-
+  if (ds && shouldReplaceChatScopedTraexInitializationDraft(ds, parsed, scope, replyRootId)) {
+    const previousSessionId = ds.session.sessionId;
+    const previousSeed = ds.session.rootMessageId;
+    closeUnstartedTraexInitializationDraft(
+      ds,
+      `new chat-scope message ${parsed.messageId} should get its own initialization card (previous seed=${previousSeed})`,
+    );
+    logger.info(
+      `[${previousSessionId.substring(0, 8)}] Re-routing chat-scope TraeX message ` +
+      `${parsed.messageId} as a fresh initialization card instead of buffering into ${previousSeed}`,
+    );
+    await handleNewTopic(data, { ...ctx, scope, anchor, messageId: parsed.messageId });
+    return;
+  }
   // If another bot already owns this anchor, ignore unmentioned replies here as a
   // second line of defense. Explicit @mentions are still allowed to spin up/take over.
   // For chat-scope: another bot's session in the same chat is keyed by its own chatId.
@@ -17250,8 +17459,17 @@ async function handleThreadReply(
     // instead of the misleading "pick a repo from the card above".
     const pendingReplyKey = (ds.worktreeCreating || ds.pendingRepoCommitInFlight)
       ? 'daemon.worktree_building_wait'
-      : 'daemon.choose_repo_first';
-    await sessionReply(anchor, tr(pendingReplyKey, undefined, localeForBot(larkAppId)), 'text', larkAppId);
+      : ds.pendingTraexInitialization
+        ? 'daemon.complete_traex_init_first'
+        : 'daemon.choose_repo_first';
+    await sessionReply(
+      anchor,
+      tr(pendingReplyKey, undefined, localeForBot(larkAppId)),
+      'text',
+      larkAppId,
+      undefined,
+      replyRootId ? { replyInThreadToMessageId: replyRootId } : undefined,
+    );
     return;
   }
 
@@ -17395,6 +17613,56 @@ async function handleThreadReply(
           sender: autoCreateSender,
         });
       }
+      return;
+    }
+
+    const explicitForgePrompt = /^\s*[$/]forge-(?:pipeline|pilot)\b/i.test(parsed.content);
+    const shouldShowTraexInitialization =
+      botCfg.cliId === 'traex'
+      && !isForeignBot
+      && !substituteTrigger
+      && !explicitForgePrompt
+      && !isExistingLarkThreadReply(parsed);
+    if (shouldShowTraexInitialization) {
+      if (await replyInvalidWorkingDirs(anchor, larkAppId, newDs)) return;
+      const scanDirs = getProjectScanDirs(newDs).filter(dir => existsSync(dir));
+      const projects = scanDirs.length > 0
+        ? scanMultipleProjects(scanDirs, 3, repoPickerScanOptions())
+        : [];
+      if (projects.length > 0) lastRepoScan.set(autoCreateChatId, projects);
+      const currentPath = pinnedWorkingDir ?? getSessionWorkingDir(newDs);
+      const currentProject = projects.find(project => project.path === currentPath);
+      const pendingTraexInitialization: NonNullable<DaemonSession['pendingTraexInitialization']> = {
+        nonce: randomUUID(),
+        ownerOpenId,
+        originalPrompt: parsed.content,
+        promptPrefix: codexAppMessageContext + codexAppApplicationContext,
+        selection: autoWt && pinnedWorkingDir
+          ? {
+              kind: 'auto-worktree',
+              path: pinnedWorkingDir,
+              label: currentProject?.name ?? pinnedWorkingDir,
+            }
+          : {
+              kind: 'directory',
+              path: currentPath,
+              label: currentProject
+                ? `${currentProject.name} (${currentProject.branch})`
+                : currentPath,
+              pinWorkingDir: !!pinnedWorkingDir,
+            },
+      };
+      await postTraexInitializationCard({
+        ds: newDs,
+        anchor,
+        larkAppId,
+        triggerMessageId: parsed.messageId,
+        replyRootId,
+        pending: pendingTraexInitialization,
+        projects,
+        logContext: `reply auto-create, projects=${projects.length}, cwd=${currentPath}`,
+      });
+      logger.info(`[${tag(newDs)}] Waiting for TraeX initialization after reply auto-create (projects=${projects.length}, cwd=${currentPath})`);
       return;
     }
 

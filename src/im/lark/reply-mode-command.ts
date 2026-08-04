@@ -48,9 +48,9 @@ export async function tryHandleReplyModeCommand(
       await reply(t('cmd.reply_mode.dm_status', { mode: replyModeLabel(cur) }, loc));
       return true;
     }
-    // In DMs, `topic` keeps the old meaning: each message starts its own DM
-    // thread/session. In regular groups, `topic` means topic-display with the
-    // same chat session (handled below by normalizeChatReplyMode → shared).
+    // In DMs and regular groups, `topic` means each top-level message starts its
+    // own thread/session. `shared` is the explicit regular-group mode for
+    // topic-display while reusing the same chat session.
     const mode = arg === 'topic' ? 'new-topic' : normalizeChatReplyMode(arg);
     if (!mode) {
       await reply(t('cmd.reply_mode.dm_usage', undefined, loc));
