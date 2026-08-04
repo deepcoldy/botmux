@@ -149,13 +149,17 @@ function senderOpenIdAllowed(
     // include list, so it simply does not match — already fail-safe.
     return contains(policy?.includeSenderOpenIds, openId);
   }
-  // all_except_excluded: an unverified sender defeats an open_id-based
-  // exclusion (the excluded open_id would never equal an app_id form), so a
-  // blocked bot would leak through on the polled backfill path. Fail closed:
-  // when the operator has ANY open_id exclusion we cannot evaluate for this
-  // sender, refuse rather than assume "not excluded". An empty exclude list
-  // makes no open_id decision, so "listen to all (except self)" still works.
-  if (identityUnverified && (policy?.excludeSenderOpenIds?.length ?? 0) > 0) {
+  // all_except_excluded: an unverified sender (a bot the history API reports by
+  // app_id that we could not canonicalize to an open_id) defeats an open_id
+  // exclusion only when the exclusion itself is expressed in that same
+  // app_id/cli_ form — i.e. the operator excluded a bot we also cannot verify.
+  // In that case fail closed: we cannot prove this unverified bot is NOT the
+  // excluded one. But when EVERY exclusion is an ou_ open_id (users, or bots
+  // resolved to ou_), an unverified cli_ sender can never equal any of them, so
+  // there is no decision to bypass — allow it (this is the "listen to all bots,
+  // just mute these users" case). An empty exclude list trivially allows too.
+  const excludes = policy?.excludeSenderOpenIds ?? [];
+  if (identityUnverified && excludes.some(id => !id.startsWith('ou_'))) {
     return false;
   }
   return !contains(policy?.excludeSenderOpenIds, openId);
