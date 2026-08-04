@@ -15690,6 +15690,18 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
   // enforceMessageQuotaForCliInput 的 botSender 说明。
   const isBotSenderType = data.sender?.sender_type === 'app' || data.sender?.sender_type === 'bot';
   const teamTrustUnionId: string | undefined = isBotSenderType ? senderUnionId : undefined;
+  // A bot-sent new topic (e.g. a message-listener match on a third-party alert
+  // bot's card) must NOT make that bot the session owner: daemon-generated
+  // footers --mention-back the owner, so a bot owner means we @ the alert bot
+  // on every reply — self-poking / re-trigger loops — and leak owner-gated
+  // surfaces (restart/report/cards) to it. Mirror the handleThreadReply +
+  // auto-create paths (isForeignBot → ownerOpenId/ownerUnionId undefined); keep
+  // creatorOpenId + quoteTarget* so botmux report / first-turn quote still work.
+  const isForeignBotSender = isBotSenderType
+    || (!!senderOpenId && senderOpenId !== getBot(larkAppId).botOpenId
+        && isKnownPeerBot(config.session.dataDir, larkAppId, senderOpenId));
+  const ownerOpenIdForSession = isForeignBotSender ? undefined : senderOpenId;
+  const ownerUnionIdForSession = isForeignBotSender ? undefined : senderUnionId;
   const botCfg = getBot(larkAppId).config;
   const listenerPrompt = messageListener ? renderMessageListenerPrompt(messageListener) : undefined;
   if (listenerPrompt) {
@@ -16016,8 +16028,12 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
   const groupChatName = await groupChatNamePromise;
   if (groupChatName) session.chatDisplayName = groupChatName;
   session.larkAppId = larkAppId;
-  session.ownerOpenId = senderOpenId;
-  session.ownerUnionId = senderUnionId;
+  // Foreign-bot senders own nothing (see isForeignBotSender above); owner stays
+  // undefined so footers don't --mention-back the bot. creator/quoteTarget keep
+  // the raw sender so botmux report + first-turn quote still resolve.
+  session.ownerOpenId = ownerOpenIdForSession;
+  session.ownerUnionId = ownerUnionIdForSession;
+  session.creatorOpenId = senderOpenId;
   session.lastCallerOpenId = senderOpenId;
   // First turn of a brand-new topic: seed quoteTarget* so the very first
   // `botmux send` can --mention-back / 引用 the triggering message (chat scope).
@@ -16025,7 +16041,7 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
   // chat-scope首条不引用. Use the event's sender open_id (correct app scope).
   session.quoteTargetId = parsed.messageId;
   session.quoteTargetSenderOpenId = senderOpenId;
-  session.quoteTargetSenderIsBot = parsed.senderType === 'app' || parsed.senderType === 'bot';
+  session.quoteTargetSenderIsBot = isForeignBotSender || parsed.senderType === 'app' || parsed.senderType === 'bot';
   session.lastMessageAt = new Date(now).toISOString();
   session.scope = scope;
   session.nativeSessionTitle = buildBotmuxLarkNativeSessionTitle(
@@ -16069,7 +16085,7 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
     pendingSubstituteTrigger: substituteTrigger,
     pendingSubstituteControlCard: shouldSendSubstituteControlCard,
     pendingSender: newTopicSender,
-    ownerOpenId: senderOpenId,
+    ownerOpenId: ownerOpenIdForSession,
     currentTurnTitle: initialTurnTitle,
     workingDir: pinnedWorkingDir,
   };

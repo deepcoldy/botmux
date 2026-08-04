@@ -1758,7 +1758,16 @@ function historyMessageSender(message: any): {
 
 function larkReceiveEventFromHistoryMessage(message: any, chatId: string): any {
   const { senderOpenId, senderTypeRaw, senderIdType } = historyMessageSender(message);
-  const isAppId = senderIdType === 'app_id' || senderTypeRaw === 'app' || senderTypeRaw === 'bot';
+  // sender_type and the ID DOMAIN are independent axes. A bot sender keeps
+  // sender_type='app', but when we resolved its identity to an open_id (via
+  // sender.open_bot_id, senderIdType==='open_id'), the value MUST go in the
+  // open_id slot — the whole downstream chain (message-parser senderId,
+  // handleNewTopic owner/quote target, --mention-back) reads sender_id.open_id
+  // ONLY. Putting an ou_ into { app_id } both mislabels the field and drops the
+  // identity (senderId becomes ''). Choose the key by domain, not by type.
+  const isBotSenderType = senderIdType === 'app_id' || senderTypeRaw === 'app' || senderTypeRaw === 'bot';
+  const isOpenIdDomain = senderIdType === 'open_id'
+    || (typeof senderOpenId === 'string' && senderOpenId.startsWith('ou_'));
   return {
     message: {
       ...message,
@@ -1767,10 +1776,14 @@ function larkReceiveEventFromHistoryMessage(message: any, chatId: string): any {
       chat_type: message?.chat_type ?? 'group',
     },
     sender: {
-      sender_type: senderTypeRaw ?? (isAppId ? 'app' : 'user'),
-      sender_id: isAppId
-        ? { app_id: senderOpenId }
-        : { open_id: senderOpenId },
+      // Preserve the bot sender_type (talk/quota gates and foreign-bot owner
+      // suppression key off it) even when the id itself is an open_id.
+      sender_type: senderTypeRaw ?? (isBotSenderType ? 'app' : 'user'),
+      sender_id: isOpenIdDomain
+        ? { open_id: senderOpenId }
+        : isBotSenderType
+          ? { app_id: senderOpenId }
+          : { open_id: senderOpenId },
     },
   };
 }

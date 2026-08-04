@@ -942,6 +942,7 @@ function makeHistoryMessage(opts: {
   senderOpenId?: string;
   senderAppId?: string;
   senderType?: string;
+  senderOpenBotId?: string;
   content: string;
   rootId?: string;
   threadId?: string;
@@ -963,6 +964,9 @@ function makeHistoryMessage(opts: {
       id: opts.senderOpenId ?? opts.senderAppId,
       id_type: opts.senderAppId && !opts.senderOpenId ? 'app_id' : 'open_id',
       sender_type: opts.senderType ?? (opts.senderAppId ? 'app' : 'user'),
+      // with_sender_name=true: Lark returns the bot's per-app open_id here even
+      // though id/id_type still describe the app_id form.
+      ...(opts.senderOpenBotId ? { open_bot_id: opts.senderOpenBotId } : {}),
     },
   };
 }
@@ -1670,6 +1674,49 @@ describe('message listener polling backfill', () => {
       expect.objectContaining({ message: expect.objectContaining({ message_id: 'msg-polled-resolved' }) }),
       expect.objectContaining({ messageListener: expect.objectContaining({ msgType: 'interactive' }) }),
     );
+  });
+
+  it('routes a third-party bot resolved via open_bot_id into the open_id slot (not app_id) on the polled path', async () => {
+    // The core downstream contract: message-parser / handleNewTopic read
+    // sender_id.open_id ONLY. A bot whose history row is app_id form but carries
+    // open_bot_id must arrive with its ou_ in the open_id slot, sender_type
+    // still 'app'. Putting it in app_id would drop the identity downstream
+    // (senderId '', no owner, no --mention-back target).
+    setupBotState({
+      allowedUsers: [USER_OPEN_ID],
+      messageListeners: {
+        chat_listener: {
+          enabled: true,
+          prompt: '监听所有 bot',
+          senderPolicy: { mode: 'all_except_excluded', includeSenderTypes: ['bot'] },
+          messagePolicy: { includeMsgTypes: ['interactive'], scope: 'top_level' },
+          replyPolicy: { mode: 'thread', sessionMode: 'per_message' },
+        },
+      },
+    });
+    handlers = makeHandlers();
+    const card = makeHistoryMessage({
+      senderAppId: 'cli_argos',
+      senderOpenBotId: 'ou_argos_open',
+      senderType: 'app',
+      messageType: 'interactive',
+      messageId: 'msg-openbotid',
+      chatId: 'chat_listener',
+      content: JSON.stringify({ title: 'Argos平台报警', elements: [[{ tag: 'text', text: 'x' }]] }),
+      createTime: String(Date.now()),
+    });
+    mockListChatMessagesUntil.mockResolvedValueOnce([card]);
+
+    await __pollMessageListenersOnceForTest(MY_APP_ID, handlers);
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).toHaveBeenCalledTimes(1);
+    const [dispatchedData] = handlers.handleNewTopic.mock.calls[0];
+    expect(dispatchedData.sender.sender_id.open_id).toBe('ou_argos_open');
+    expect(dispatchedData.sender.sender_id.app_id).toBeUndefined();
+    // sender_type stays 'app' so quota/talk gates + foreign-bot owner
+    // suppression still recognise it as a bot.
+    expect(dispatchedData.sender.sender_type).toBe('app');
   });
 
   it('fails closed on the polled path for an unresolvable third-party bot excluded by open_id', async () => {
