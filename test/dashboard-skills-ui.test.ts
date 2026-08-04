@@ -130,19 +130,41 @@ describe('dashboard skills install panel', () => {
     expect(root.findAllByProps({ 'data-install': 'ref' })).toHaveLength(1);
   });
 
-  it('keeps advanced install fields visible beside the install action', () => {
+  it('folds path/ref/scan-depth into advanced options and keeps the install action in the footer', () => {
+    // The source address is the primary input; path, ref and scan depth only
+    // matter for specific source kinds (and the backend already retries with a
+    // deep scan on its own), so they live in a collapsed <details>. Asserting
+    // containment rather than exact depth keeps this robust to wrapper markup.
+    //
+    // NOTE: compare TestInstances via `===` inside expect(), never
+    // `expect(a).toBe(b)` — on failure vitest serializes both cyclic React
+    // trees to build a diff and exhausts the worker's heap.
     const renderer = renderInstallPanel();
     const root = renderer.root;
     const installGrid = root.findByProps({ className: 'skills-install-grid' });
-    const path = installGrid.findByProps({ 'data-install': 'path' });
-    const ref = installGrid.findByProps({ 'data-install': 'ref' });
-    const install = installGrid.findByProps({ 'data-action': 'install' });
+    const advanced = root.findByProps({ 'data-install-advanced': true });
 
-    expect(installGrid.findAllByProps({ 'data-skills-advanced': true })).toHaveLength(0);
-    expect(installGrid.findAllByProps({ className: 'skills-advanced-marker' })).toHaveLength(0);
-    expect(path.parent?.parent).toBe(installGrid);
-    expect(ref.parent?.parent).toBe(installGrid);
-    expect(install.parent?.parent).toBe(installGrid);
+    for (const marker of ['path', 'ref', 'full-depth'] as const) {
+      const field = root.findByProps({ 'data-install': marker });
+      expect(advanced.findAllByProps({ 'data-install': marker })).toHaveLength(1);
+      expect(field !== undefined).toBe(true);
+    }
+
+    // The advanced block itself, and the install action, hang off the grid.
+    expect(installGrid.findAllByProps({ 'data-install-advanced': true })).toHaveLength(1);
+    const install = installGrid.findByProps({ 'data-action': 'install' });
+    expect(String(install.props.className)).toContain('primary');
+    expect(advanced.findAllByProps({ 'data-action': 'install' })).toHaveLength(0);
+  });
+
+  it('offers clickable source-format examples that fill the input', () => {
+    const onInstallSourceChange = vi.fn();
+    const renderer = renderInstallPanel({ onInstallSourceChange });
+    const examples = renderer.root.findAllByProps({ 'data-action': 'use-source-example' });
+
+    expect(examples.length).toBeGreaterThanOrEqual(4);
+    act(() => { examples[0].props.onClick(); });
+    expect(onInstallSourceChange).toHaveBeenCalledWith(examples[0].props['data-example']);
   });
 
   it('keeps multi-skill install selection inside the install confirmation dialog', () => {
