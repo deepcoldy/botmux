@@ -162,6 +162,8 @@
 | 字段 | 说明 |
 |------|------|
 | `summaryRange` | 显式总结命令 `@机器人 /summary` 使用的历史读取范围。`limit` 表示普通群最近 N 条消息，默认 50；`sinceHours` 表示普通群最近 N 小时，默认 24。任一字段设为 `0` 表示该维度不限制。话题群始终读取当前话题/thread 历史，再按总结窗口过滤 |
+| `summaryMemory` | 布尔，默认 `false`（关）。开启后 `@机器人 /summary` 会把本次总结整理成中文「问题解决记录」，追加写入下方 `summaryMemoryPath` 指定的记忆文件，并要求 agent 只写这一个文件、把实际写入的 Markdown 原样回传确认；同时会往后续会话注入一段 `<summary_memory>` 复用提示，让后续问题只有在 PSM、环境、任务 ID、节点、错误现象等关键条件全部完全一致时才直接复用历史结论，否则只当排查参考 |
+| `summaryMemoryPath` | 记忆文件路径，默认 `summary.md`。相对路径由 agent 按「当前项目根目录」解析，绝对路径按原样使用。留空 / 不设时回落到 `summary.md`。仅在 `summaryMemory` 为 `true` 时生效 |
 
 示例：
 
@@ -170,14 +172,18 @@
   "summaryRange": {
     "limit": 50,
     "sinceHours": 24
-  }
+  },
+  "summaryMemory": true,
+  "summaryMemoryPath": "docs/summary.md"
 }
 ```
 
 - 只有显式 `@机器人 /summary` 会触发总结；不 @ 机器人时仍按普通群/话题的既有路由规则处理，不会因为关键词自动唤醒。
-- dashboard 的「/summary 总结范围」保存的就是 `summaryRange`。
+- dashboard 的「/summary 总结范围」保存的就是 `summaryRange`；「开启记忆」开关与「记忆文件路径」输入框分别保存 `summaryMemory` 与 `summaryMemoryPath`。
 - 如果本次触发前存在上一条 `@同一机器人 /summary`，总结窗口只包含上一条之后到本次触发为止的消息；找不到上一条时回退到 `limit` / `sinceHours`。
 - `limit` 与 `sinceHours` 同时也是安全上限；两者都为 `0` 时表示不做该维度限制。
+- **仅当 `summaryMemory` 开启时**，`/summary` 命令后跟随的文字会被当作「硬边界」：只总结从第一条包含该文字的历史消息开始、到本次触发为止的内容；如果配置范围内找不到该边界，则不回退到更宽范围，而是提示未找到边界。`summaryMemory` 关闭时，`/summary` 后的文字仅作为对本次总结的侧重提示，历史窗口仍按 `summaryRange` 读取。
+- 记忆文件由 agent 在其工作目录内写入。如果 bot 开启了 sandbox 且 `summaryMemoryPath` 指向工作目录之外的绝对路径，请自行把该路径（或其父目录）加进 `sandboxPaths.readWrite`，否则写入可能被沙盒拒绝。
 
 ## 旧内容触发配置
 

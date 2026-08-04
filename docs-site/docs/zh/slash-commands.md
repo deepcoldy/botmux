@@ -19,7 +19,7 @@
 | `/dashboard [模块]` | 在飞书里打开 Dashboard 控制卡片（sessions/schedules/groups/settings/help 等） |
 | `/insight` | owner 专用：在当前会话即时回一张「本会话洞察摘要」卡片（聚合指标 + 规则建议；动作 span 明细 / 逐轮对账 / 对话回放在 Dashboard「洞察」页看） |
 | `/vc prepare <会议链接或会议号>` | 将当前普通群设为会议准备群，并在开会后复用同一 Agent 会话 |
-| `@机器人 /summary` | 读取当前话题（或普通群配置范围内）的历史消息并生成总结（默认最近 50 条 / 24 小时） |
+| `@机器人 /summary` | 读取当前话题（或普通群配置范围内）的历史消息并生成总结（默认最近 50 条 / 24 小时）。若该 bot 开启了 `summaryMemory`，总结会追加写入配置的记忆文件（`summaryMemoryPath`，默认 `summary.md`），且 `/summary` 后跟随的文字会作为「只总结从这条起」的硬边界；未开启记忆时，后随文字仅作为本次总结的侧重提示 |
 | `/t <prompt>` `/topic <prompt>` | 普通群内强制开新话题 |
 
 ## 💬 回复模式（`/reply-mode`）

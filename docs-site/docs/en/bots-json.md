@@ -162,6 +162,8 @@ You can also add it to the corresponding bot entry directly (manual `bots.json` 
 | Field | Description |
 |------|------|
 | `summaryRange` | History range used by the explicit `@bot /summary` command. `limit` is the latest N messages in a regular group, defaulting to 50; `sinceHours` is the latest N hours in a regular group, defaulting to 24. Set either field to `0` to remove that limit. Topic groups always read the current topic/thread history, then apply the summary window |
+| `summaryMemory` | Boolean, defaults to `false` (off). When enabled, `@bot /summary` turns the summary into a Chinese "problem-resolution record" appended to the memory file named by `summaryMemoryPath` below, instructs the agent to write only that one file and echo back the exact Markdown written, and injects a `<summary_memory>` reuse hint into later turns so a later question reuses a past conclusion only when key conditions — PSM, environment, task ID, node, error symptom, etc. — match exactly; otherwise the file is treated as reference only |
+| `summaryMemoryPath` | Memory file path, defaults to `summary.md`. A relative path is resolved by the agent against the "current project root"; an absolute path is used as-is. Empty / unset falls back to `summary.md`. Only takes effect when `summaryMemory` is `true` |
 
 Example:
 
@@ -170,14 +172,18 @@ Example:
   "summaryRange": {
     "limit": 50,
     "sinceHours": 24
-  }
+  },
+  "summaryMemory": true,
+  "summaryMemoryPath": "docs/summary.md"
 }
 ```
 
 - Only the explicit `@bot /summary` command triggers a summary. Messages that do not mention the bot still follow the existing group/topic routing rules and are not woken up by keywords.
-- The dashboard "/summary Range" controls this `summaryRange` field.
+- The dashboard "/summary Range" controls this `summaryRange` field; the "Enable memory" toggle and "Memory file path" input save `summaryMemory` and `summaryMemoryPath` respectively.
 - If an earlier `@same bot /summary` exists before the current trigger, the summary window includes only messages after that earlier command and up to the current trigger; otherwise botmux falls back to `limit` / `sinceHours`.
 - `limit` and `sinceHours` are also safety caps. If both are `0`, that dimension is not limited.
+- **Only when `summaryMemory` is enabled**, text following the `/summary` command is treated as a hard boundary: the summary covers only from the first history message containing that text up to the current trigger; if the boundary is not found within the configured range, botmux does not fall back to a wider range but reports that the boundary was not found. When `summaryMemory` is off, text after `/summary` is only a focus hint for the summary and the history window still follows `summaryRange`.
+- The memory file is written by the agent within its working directory. If the bot has sandbox enabled and `summaryMemoryPath` points to an absolute path outside the working directory, add that path (or its parent) to `sandboxPaths.readWrite` yourself, otherwise the write may be denied by the sandbox.
 
 ## Legacy content trigger config
 
