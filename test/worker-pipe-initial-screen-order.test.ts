@@ -421,6 +421,13 @@ describe('worker pipe initial screen ordering', () => {
     expect(herdrBlock).toContain('herdrBe.cliCwd');
   });
 
+  it('wires reasonix cliPid/cliCwd in both immediate and late pid paths', () => {
+    const source = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
+    expect(source).toContain("|| cfg.cliId === 'reasonix'");
+    expect(source).toContain('if (cliPid && cliNeedsPidAndCwd)');
+    expect(source).toContain('if (cliNeedsPidAndCwd)');
+  });
+
   it('wires Herdr adopt snapshots before seeding the initial screen', () => {
     const source = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
     const herdrStart = source.indexOf("cfg.adoptSource === 'herdr'");
