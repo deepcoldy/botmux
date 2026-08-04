@@ -239,7 +239,6 @@ function makeRegularGroupStopper(input: {
     if (triggerId && message?.message_id === triggerId) return false;
     if (ms !== undefined && triggerMs !== undefined && ms >= triggerMs) return false;
     if (matchesExplicitBoundary(message, input.explicitBoundary)) return true;
-    if (input.explicitBoundary) return false;
     if (isPreviousSummaryForThisBot(message, input.botOpenId)) return true;
     kept += 1;
     if (input.range.limit > 0 && kept >= input.range.limit) return true;
@@ -296,7 +295,7 @@ function buildPromptBody(input: {
 }): string {
   const { match, historyText, historyCount, historyWindow, boundaryMs, historyError } = input;
   const scope = match.chatKind === 'topic' ? 'current-thread' : 'regular-group';
-  const explicitBoundary = explicitBoundaryFromTrigger(match.triggerText);
+  const explicitBoundary = match.summaryMemory ? explicitBoundaryFromTrigger(match.triggerText) : undefined;
   const lines = [
     `<summary_command scope="${scope}" summary_memory="${match.summaryMemory ? 'true' : 'false'}">`,
     '<command_message>',
@@ -342,7 +341,7 @@ export async function buildSummaryCommandPrompt(input: {
         });
       }
       const raw = await listThreadMessages(larkAppId, chatId, rootMessageId, 0);
-      const explicitBoundary = explicitBoundaryFromTrigger(match.triggerText);
+      const explicitBoundary = match.summaryMemory ? explicitBoundaryFromTrigger(match.triggerText) : undefined;
       const history = filterHistoryWindow(raw, match.range, message, botOpenId, explicitBoundary);
       return buildPromptBody({
         match,
@@ -354,7 +353,7 @@ export async function buildSummaryCommandPrompt(input: {
       });
     }
 
-    const explicitBoundary = explicitBoundaryFromTrigger(match.triggerText);
+    const explicitBoundary = match.summaryMemory ? explicitBoundaryFromTrigger(match.triggerText) : undefined;
     const raw = await listChatMessagesUntil(larkAppId, chatId, {
       stopAfter: makeRegularGroupStopper({ range: match.range, triggerMessage: message, botOpenId, explicitBoundary }),
     });
