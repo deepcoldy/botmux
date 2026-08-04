@@ -13,7 +13,7 @@ describe('dashboard bot payload helpers', () => {
       'botToBotSameDir', 'brandLabel', 'canTalkDaemonCommands', 'codexAppCleanInput',
       'customPassthroughCommands', 'defaultOncall', 'defaultWorkingDir',
       'defaultWorkingDirAutoWorktree', 'disableStreamingCard', 'docSubscribeDefaultMode',
-      'env', 'launchShell', 'maxLiveWorkers', 'messageQuotaDefaultLimit', 'model',
+      'env', 'launchShell', 'maxLiveWorkers', 'maxSessionRssMiB', 'messageQuotaDefaultLimit', 'model',
       'overloadAlert', 'p2pMode', 'privateCard', 'regularGroupMentionMode',
       'regularGroupReplyMode', 'restrictGrantCommands', 'riff', 'sandbox', 'sandboxPaths',
       'silentTurnReactions', 'skillInjection', 'startupCommands', 'substituteMode',

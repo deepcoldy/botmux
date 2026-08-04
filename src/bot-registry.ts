@@ -1129,6 +1129,14 @@ export interface BotConfig {
    */
   maxLiveWorkers?: number;
   /**
+   * Optional per-session RSS guard, in MiB. When set, this bot's daemon samples
+   * live sessions periodically and suspends idle, resumable sessions whose
+   * worker+CLI process tree exceeds this size. Missing means disabled. This is
+   * deliberately separate from maxLiveWorkers: it catches one runaway CLI even
+   * when the live-session count is still under the cap.
+   */
+  maxSessionRssMiB?: number;
+  /**
    * When true, THIS bot's daemon watches host load/memory and DMs the bot owner
    * when the machine crosses into (and back out of) an overloaded state — a
    * heads-up that botmux session cold-starts may time out and false-die. Host
@@ -2504,6 +2512,10 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       maxLiveWorkers: typeof entry.maxLiveWorkers === 'number'
         && Number.isInteger(entry.maxLiveWorkers) && entry.maxLiveWorkers > 0
         ? entry.maxLiveWorkers
+        : undefined,
+      maxSessionRssMiB: typeof entry.maxSessionRssMiB === 'number'
+        && Number.isInteger(entry.maxSessionRssMiB) && entry.maxSessionRssMiB > 0
+        ? entry.maxSessionRssMiB
         : undefined,
       // Only explicit true persisted (undefined = off), same as restrictGrantCommands.
       overloadAlert: entry.overloadAlert === true || undefined,

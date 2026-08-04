@@ -199,6 +199,7 @@ import { HerdrBackend } from './adapters/backend/herdr-backend.js';
 import { ZellijBackend } from './adapters/backend/zellij-backend.js';
 import { ZmxBackend } from './adapters/backend/zmx-backend.js';
 import { sweepIdleWorkers, DEFAULT_MAX_LIVE_WORKERS } from './core/idle-worker-sweeper.js';
+import { sweepOversizedSessions } from './core/session-rss-guard.js';
 import {
   getSessionPersistentBackendType,
   killPersistentBackendTarget,
@@ -18621,6 +18622,18 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       );
     }
   };
+  const enforceSessionRssGuard = (source: 'periodic'): void => {
+    const maxSessionRssMiB = getBot(cfg.larkAppId).config.maxSessionRssMiB;
+    const suspended = sweepOversizedSessions(activeSessions, { maxSessionRssMiB });
+    for (const item of suspended) {
+      logger.warn(
+        `[session-rss-guard] suspended session ${item.sessionId.slice(0, 8)} `
+        + `rss=${Math.round(item.rssBytes / 1024 / 1024)}MiB `
+        + `threshold=${Math.round(item.thresholdBytes / 1024 / 1024)}MiB `
+        + `pids=${item.pids.join(',')} source=${source}`,
+      );
+    }
+  };
   // Initialise worker pool with daemon callbacks
   initWorkerPool({
     sessionReply,
@@ -19160,6 +19173,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     // Dashboard config edits need no restart; the timer also backstops any
     // missed lifecycle edge. Normal new/resumed sessions enforce immediately.
     enforceLiveSessionCap('periodic');
+    enforceSessionRssGuard('periodic');
   }, 60_000);
   idleWorkerSweepTimer.unref?.();
 
