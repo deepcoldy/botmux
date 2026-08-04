@@ -392,6 +392,13 @@ describe('repo select card — plain switch', () => {
   it('pendingRepo selection forwards the complete Codex App sidecar to forkWorker', async () => {
     const ds = makeDs({ pendingRepo: true, pendingPrompt: 'hello world', worker: null });
     ds.session.cliId = 'codex-app';
+    ds.pendingChatContext = {
+      chatId: CHAT_ID,
+      name: '【Pippit】【BUG】测试群',
+      description: 'https://example.test/issue/detail/123',
+      mode: 'group',
+      fetchStatus: 'ok',
+    };
     const substituteTrigger = {
       target: { userId: 'u_configured' },
       observedMention: { name: 'Observed Person', userId: 'u_configured' },
@@ -418,7 +425,12 @@ describe('repo select card — plain switch', () => {
     expect(vi.mocked(forkWorker).mock.calls[0]).toHaveLength(2);
     expect(vi.mocked(buildNewTopicCliInput).mock.calls[0]![11]).toEqual(expect.objectContaining({
       substituteTrigger,
+      chatContext: expect.objectContaining({
+        chatId: CHAT_ID,
+        description: 'https://example.test/issue/detail/123',
+      }),
     }));
+    expect(ds.pendingChatContext).toBeUndefined();
   });
 
   it('skip_repo also forwards the complete Codex App sidecar to forkWorker', async () => {

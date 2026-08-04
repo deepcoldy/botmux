@@ -15,6 +15,7 @@ import { resolveTeamRoleFile } from '../../core/role-resolver.js';
 import { type Brand, larkHosts, normalizeBrand, sdkDomain } from './lark-hosts.js';
 import { canonicalMobileKey, isMobileEntry, normalizeMobileEntry } from '../../setup/bot-config-editor.js';
 import { stampBotmuxCallbackMarkers } from './callback-button-marker.js';
+import type { ChatContext } from '../../types.js';
 
 type LarkRequestParams = Record<string, string | number | boolean | undefined>;
 
@@ -630,6 +631,55 @@ export async function getChatName(larkAppId: string, chatId: string): Promise<st
     return name.length > 0 ? name : null;
   } catch {
     return null;
+  }
+}
+
+/**
+ * 获取入群自动开工所需的群上下文。群模式、群名和群描述来自同一次
+ * chat.get，失败时保留 unavailable，避免把读取失败误判成字段为空。
+ */
+export async function getChatContext(larkAppId: string, chatId: string): Promise<ChatContext> {
+  const unavailable: ChatContext = {
+    chatId,
+    name: null,
+    description: null,
+    mode: 'unknown',
+    fetchStatus: 'unavailable',
+  };
+  try {
+    const c = getBotClient(larkAppId);
+    const res = await larkGet(c, `/open-apis/im/v1/chats/${encodeURIComponent(chatId)}`);
+    if (res.code !== 0) {
+      logger.warn(`getChatContext(${chatId}) failed: ${res.msg} (code: ${res.code})`);
+      return unavailable;
+    }
+
+    const rawMode = String(res.data?.chat_mode ?? '').toLowerCase();
+    const rawGmt = String(res.data?.group_message_type ?? '').toLowerCase();
+    let mode: ChatMode | 'unknown';
+    if (rawMode === 'p2p') mode = 'p2p';
+    else if (rawMode === 'topic' || rawGmt === 'thread') mode = 'topic';
+    else if (rawMode === 'group') mode = 'group';
+    else mode = 'unknown';
+
+    if (mode !== 'unknown') {
+      chatModeCache.set(`${larkAppId}::${chatId}`, { mode, cachedAt: Date.now() });
+    } else {
+      logger.warn(`getChatContext(${chatId}) unrecognized chat_mode='${rawMode}'`);
+    }
+
+    const name = String(res.data?.name ?? '').trim();
+    const description = String(res.data?.description ?? '').trim();
+    return {
+      chatId,
+      name: name || null,
+      description: description || null,
+      mode,
+      fetchStatus: mode === 'unknown' ? 'unavailable' : 'ok',
+    };
+  } catch (err: any) {
+    logger.warn(`getChatContext(${chatId}) errored: ${err?.message ?? err}`);
+    return unavailable;
   }
 }
 

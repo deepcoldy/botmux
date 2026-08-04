@@ -472,6 +472,15 @@ export interface LarkMention {
   idType?: string;     // e.g. "open_id" or "app_id" from Lark event payloads
 }
 
+/** 首轮输入可携带的聊天元数据。字段值均按不可信业务数据处理。 */
+export interface ChatContext {
+  chatId: string;
+  name: string | null;
+  description: string | null;
+  mode: 'group' | 'topic' | 'p2p' | 'unknown';
+  fetchStatus: 'ok' | 'unavailable';
+}
+
 export interface SubstituteTriggerIdentity {
   name?: string;
   openId?: string;

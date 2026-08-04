@@ -1,6 +1,7 @@
 import type { ChildProcess } from 'node:child_process';
 import type {
   CodexAppTurnInput,
+  ChatContext,
   Session,
   DaemonToWorker,
   LarkAttachment,
@@ -116,6 +117,8 @@ export interface DaemonSession {
    * user message while the first turn waits for repo selection/worktree setup. */
   pendingCodexAppApplicationContext?: string;
   pendingCodexAppMessageContext?: string;
+  /** 入群自动开工首轮使用的群元数据；repo 选择或 auto-worktree 延迟启动时保留。 */
+  pendingChatContext?: ChatContext;
   /** One-shot CLI slash command to send literally after the worker reports
    *  prompt_ready. Used when a new topic starts with an adapter-default
    *  passthrough command such as `/goal`: the CLI must see raw `/...`, not a

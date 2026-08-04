@@ -1535,6 +1535,7 @@ export async function handleCommand(
                     codexAppMessageContext: ds!.pendingCodexAppMessageContext,
                     codexAppFollowUps: ds!.pendingCodexAppFollowUps,
                     codexAppFollowUpContexts: ds!.pendingCodexAppFollowUpContexts,
+                    chatContext: ds!.pendingChatContext,
                   },
                 )
               : { content: '' };
@@ -1579,6 +1580,7 @@ export async function handleCommand(
             ds!.pendingCodexAppText = undefined;
             ds!.pendingCodexAppApplicationContext = undefined;
             ds!.pendingCodexAppMessageContext = undefined;
+            ds!.pendingChatContext = undefined;
             ds!.pendingAttachments = undefined;
             ds!.pendingMentions = undefined;
             ds!.pendingSubstituteTrigger = undefined;

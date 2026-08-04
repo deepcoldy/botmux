@@ -26,7 +26,7 @@ vi.mock('../src/utils/logger.js', () => ({
   logger: { info: vi.fn(), warn: vi.fn(), debug: vi.fn(), error: vi.fn() },
 }));
 
-import { getChatModeStrict, getChatMode } from '../src/im/lark/client.js';
+import { getChatContext, getChatModeStrict, getChatMode } from '../src/im/lark/client.js';
 
 const ok = (data: any) => ({ code: 0, msg: 'success', data });
 
@@ -86,5 +86,51 @@ describe('getChatMode (lenient) — routing unaffected by the strict change', ()
     mockRequest.mockResolvedValueOnce(ok({}));
     // fresh chatId to avoid the module-level cache
     expect(await getChatMode('app', 'oc_lenient_empty')).toBe('group');
+  });
+});
+
+describe('getChatContext', () => {
+  it('reads name, description and mode from one chat.get response', async () => {
+    mockRequest.mockResolvedValueOnce(ok({
+      name: '  【Pippit】【BUG】测试群  ',
+      description: '  https://example.test/issue/detail/123  ',
+      chat_mode: 'group',
+      group_message_type: 'thread',
+    }));
+
+    await expect(getChatContext('app', 'oc_context')).resolves.toEqual({
+      chatId: 'oc_context',
+      name: '【Pippit】【BUG】测试群',
+      description: 'https://example.test/issue/detail/123',
+      mode: 'topic',
+      fetchStatus: 'ok',
+    });
+    expect(mockRequest).toHaveBeenCalledOnce();
+  });
+
+  it('distinguishes empty metadata from an unavailable response', async () => {
+    mockRequest.mockResolvedValueOnce(ok({ chat_mode: 'group', name: '', description: '' }));
+    await expect(getChatContext('app', 'oc_empty_context')).resolves.toMatchObject({
+      name: null,
+      description: null,
+      mode: 'group',
+      fetchStatus: 'ok',
+    });
+
+    mockRequest.mockRejectedValueOnce(new Error('network down'));
+    await expect(getChatContext('app', 'oc_unavailable_context')).resolves.toEqual({
+      chatId: 'oc_unavailable_context',
+      name: null,
+      description: null,
+      mode: 'unknown',
+      fetchStatus: 'unavailable',
+    });
+
+    mockRequest.mockResolvedValueOnce(ok({ name: '只有部分字段' }));
+    await expect(getChatContext('app', 'oc_incomplete_context')).resolves.toMatchObject({
+      name: '只有部分字段',
+      mode: 'unknown',
+      fetchStatus: 'unavailable',
+    });
   });
 });

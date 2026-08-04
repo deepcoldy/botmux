@@ -11,7 +11,13 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } 
 const mocks = vi.hoisted(() => ({
   forkWorker: vi.fn(),
   getAvailableBots: vi.fn(async () => []),
-  getChatMode: vi.fn(async () => 'group' as 'group' | 'topic' | 'p2p'),
+  getChatContext: vi.fn(async (_appId: string, chatId: string) => ({
+    chatId,
+    name: '【Pippit】【BUG】测试群',
+    description: '缺陷：https://example.test/issue/detail/123',
+    mode: 'group' as const,
+    fetchStatus: 'ok' as const,
+  })),
   getProjectScanDirs: vi.fn(() => [] as string[]),
   ensureDefaultOncallBound: vi.fn(async () => undefined),
   downloadResources: vi.fn(async () => ({ attachments: [] as any[], needLogin: false })),
@@ -42,7 +48,7 @@ vi.mock('../src/im/lark/client.js', async () => {
   return {
     ...actual,
     deleteMessage: mocks.deleteMessage,
-    getChatMode: mocks.getChatMode,
+    getChatContext: mocks.getChatContext,
     listChatMemberOpenIds: mocks.listChatMemberOpenIds,
     replyMessage: mocks.replyMessage,
     sendMessage: mocks.sendMessage,
@@ -110,7 +116,13 @@ beforeEach(() => {
   modules.daemon.__testOnly_setAutoStartJoinReadyMaxWaitMs();
   vi.clearAllMocks();
   mocks.forkWorker.mockReset();
-  mocks.getChatMode.mockResolvedValue('group');
+  mocks.getChatContext.mockImplementation(async (_appId: string, chatId: string) => ({
+    chatId,
+    name: '【Pippit】【BUG】测试群',
+    description: '缺陷：https://example.test/issue/detail/123',
+    mode: 'group',
+    fetchStatus: 'ok',
+  }));
   mocks.getProjectScanDirs.mockReturnValue([]);
   mocks.ensureDefaultOncallBound.mockResolvedValue(undefined);
   mocks.downloadResources.mockResolvedValue({ attachments: [], needLogin: false });
@@ -172,6 +184,13 @@ describe('handleBotAdded — 普通群 shared 路由', () => {
       expect.anything(),
       { turnId: seedId },
     );
+    expect(mocks.getChatContext).toHaveBeenCalledOnce();
+    expect(mocks.getChatContext).toHaveBeenCalledWith(appId, chatId);
+    const firstTurn = mocks.forkWorker.mock.calls[0]?.[1];
+    expect(firstTurn.content).toContain('<chat_context source="lark" trust="untrusted" fetch_status="ok">');
+    expect(firstTurn.content).toContain('<name>【Pippit】【BUG】测试群</name>');
+    expect(firstTurn.content).toContain('issue/detail/123');
+    expect(ds?.pendingChatContext).toBeUndefined();
 
     await daemon.__testOnly_sessionReply(chatId, '最终回复', 'text', appId, seedId);
     expect(mocks.replyMessage).toHaveBeenCalledWith(
@@ -212,6 +231,36 @@ describe('handleBotAdded — 普通群 shared 路由', () => {
       expect.anything(),
       { turnId: 'om_join_seed' },
     );
+  });
+
+  it('群元数据读取失败时仍开工，并明确标记 unavailable', async () => {
+    const { daemon, registry } = modules;
+    const appId = 'app_join_context_unavailable';
+    const chatId = 'oc_join_context_unavailable';
+    mocks.getChatContext.mockResolvedValueOnce({
+      chatId,
+      name: null,
+      description: null,
+      mode: 'unknown',
+      fetchStatus: 'unavailable',
+    });
+    registry.registerBot({
+      larkAppId: appId,
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      allowedUsers: ['ou_owner'],
+      autoStartOnGroupJoin: true,
+      autoStartOnGroupJoinPrompt: '开始排查',
+      defaultWorkingDir: tempDir('repo-context-unavailable'),
+      regularGroupReplyMode: 'chat',
+    });
+
+    await daemon.__testOnly_handleBotAdded(chatId, 'ou_owner', appId);
+
+    expect(mocks.forkWorker).toHaveBeenCalledOnce();
+    const firstTurn = mocks.forkWorker.mock.calls[0]?.[1];
+    expect(firstTurn.content).toContain('fetch_status="unavailable"');
+    expect(firstTurn.content).toContain('读取失败，不代表群内没有任务');
   });
 
   it('chat 模式保持群顶层平铺且不创建话题根', async () => {
@@ -265,6 +314,12 @@ describe('handleBotAdded — 普通群 shared 路由', () => {
     const ds = daemon.__testOnly_activeSessions.get(types.sessionKey(chatId, appId));
     expect(ds?.pendingRepo).toBe(true);
     expect(ds?.pendingTurnId).toBe('om_join_seed');
+    expect(ds?.pendingChatContext).toMatchObject({
+      chatId,
+      name: '【Pippit】【BUG】测试群',
+      description: '缺陷：https://example.test/issue/detail/123',
+      fetchStatus: 'ok',
+    });
     expect(ds?.repoCardMessageId).toBe('om_reply');
     expect(mocks.forkWorker).not.toHaveBeenCalled();
     expect(mocks.replyMessage).toHaveBeenCalledWith(
@@ -791,7 +846,13 @@ describe('handleBotAdded — 普通群 shared 路由', () => {
     const seedId = 'om_join_seed';
     const userMessageId = 'om_user_during_topic_join';
     const key = types.sessionKey(seedId, appId);
-    mocks.getChatMode.mockResolvedValue('topic');
+    mocks.getChatContext.mockImplementationOnce(async (_appId: string, targetChatId: string) => ({
+      chatId: targetChatId,
+      name: '话题群',
+      description: null,
+      mode: 'topic',
+      fetchStatus: 'ok',
+    }));
     let releaseAvailableBots!: () => void;
     const availableBotsPending = new Promise<void>((resolve) => {
       releaseAvailableBots = resolve;
@@ -862,7 +923,13 @@ describe('handleBotAdded — 普通群 shared 路由', () => {
   });
 
   it('话题群继续使用 seed 锚定的 thread-scope session', async () => {
-    mocks.getChatMode.mockResolvedValue('topic');
+    mocks.getChatContext.mockImplementationOnce(async (_appId: string, targetChatId: string) => ({
+      chatId: targetChatId,
+      name: '话题群',
+      description: null,
+      mode: 'topic',
+      fetchStatus: 'ok',
+    }));
     const { daemon, registry, types } = modules;
     const appId = 'app_join_topic_group';
     const chatId = 'oc_join_topic_group';

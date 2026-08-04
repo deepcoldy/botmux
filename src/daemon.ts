@@ -44,7 +44,7 @@ import {
 } from './core/cli-runtime-update.js';
 import { sendRestartReportIfPending } from './core/restart-report.js';
 import { statSync } from 'node:fs';
-import { addReaction, deleteMessage, getChatMode, getChatNameAndMode, getMessageChatId, listChatMemberOpenIds, MessageWithdrawnError, replyMessage, resolveAllowedUsersWithMap, sendMessage, sendUserMessage, updateMessage, type EntryResolveStatus } from './im/lark/client.js';
+import { addReaction, deleteMessage, getChatContext, getChatMode, getChatNameAndMode, getMessageChatId, listChatMemberOpenIds, MessageWithdrawnError, replyMessage, resolveAllowedUsersWithMap, sendMessage, sendUserMessage, updateMessage, type EntryResolveStatus } from './im/lark/client.js';
 import { resolveGroupJoinPrompt, waitForAllowedUserInChat } from './core/auto-start.js';
 import {
   loadBotConfigAtIndex,
@@ -4482,6 +4482,7 @@ function clearPendingRepoStateForNotifierAdopt(ds: DaemonSession): void {
   ds.pendingCodexAppText = undefined;
   ds.pendingCodexAppApplicationContext = undefined;
   ds.pendingCodexAppMessageContext = undefined;
+  ds.pendingChatContext = undefined;
   ds.pendingCodexAppFollowUps = undefined;
   ds.pendingCodexAppFollowUpContexts = undefined;
 }
@@ -16410,10 +16411,16 @@ async function handleBotAdded(
     }
 
     const chatType: 'group' = 'group';
-    // forceRefresh: the bot just joined; a 5-min-cached 'group' from before a
-    // conversion to 话题群 would wrongly pick chat-scope and reintroduce the
-    // oc_-id-as-reply-target bug (R1). Fetch fresh.
-    const mode = await getChatMode(larkAppId, chatId, { forceRefresh: true });
+    // 机器人刚入群时直接获取最新群上下文，同一次 chat.get 同时提供路由模式、
+    // 群名和群描述，避免缓存中的旧模式以及首轮缺少业务上下文。getChatContext
+    // 始终直连 API（不读缓存），保留原 forceRefresh 语义：刚入群时一个 5 分钟
+    // 旧缓存的 'group'（在转成话题群之前）会误选 chat-scope 并重现
+    // oc_-id-as-reply-target bug (R1)。
+    const chatContext = await getChatContext(larkAppId, chatId);
+    const mode = chatContext.mode === 'unknown' ? 'group' : chatContext.mode;
+    if (chatContext.mode === 'unknown') {
+      logger.warn(`[auto-start:入群] ${chatId.substring(0, 12)} 群模式未知，按普通群路由`);
+    }
     const promptBody = opts?.forcePrompt ?? resolveGroupJoinPrompt(botCfg.autoStartOnGroupJoinPrompt);
     const title = (promptBody || tr('daemon.auto_start_join_title', undefined, localeForBot(larkAppId))).substring(0, 50);
     // D8 deliberately keeps the legacy prompt empty when no join prompt is
@@ -16473,6 +16480,7 @@ async function handleBotAdded(
       pendingRepo: !pinnedWorkingDir || autoWt,
       pendingPrompt: promptBody,
       pendingCodexAppText: botCfg.cliId === 'codex-app' ? codexAppText : undefined,
+      pendingChatContext: chatContext,
       ownerOpenId: operatorOpenId,
       currentTurnTitle: title,
       workingDir: pinnedWorkingDir,
@@ -16591,7 +16599,7 @@ async function handleBotAdded(
       promptBody, session.sessionId, botCfg.cliId, botCfg.cliPathOverride,
       undefined, undefined, await getAvailableBots(larkAppId, chatId), undefined,
       { name: selfBot.botName, openId: selfBot.botOpenId }, localeForBot(larkAppId), undefined,
-      { larkAppId, chatId, whiteboardId: ds.session.whiteboardId, codexAppText },
+      { larkAppId, chatId, whiteboardId: ds.session.whiteboardId, codexAppText, chatContext },
     );
 
     // Auto-worktree: register PENDING, build worktree off-path, commit+fork later.
@@ -16626,6 +16634,7 @@ async function handleBotAdded(
       rememberLastCliInput(ds, promptBody, prompt);
       forkWorker(ds, prompt, sharedReplyRootId ? { turnId: sharedReplyRootId } : false);
       ds.pendingTurnId = undefined;
+      ds.pendingChatContext = undefined;
       logger.info(`[auto-start:入群] ${chatId.substring(0, 12)} 自动开工（${mode}/${scope}），workingDir=${pinnedWorkingDir}`);
       return;
     }
@@ -16673,6 +16682,7 @@ async function handleBotAdded(
       rememberLastCliInput(ds, promptBody, prompt);
       forkWorker(ds, prompt, sharedReplyRootId ? { turnId: sharedReplyRootId } : false);
       ds.pendingTurnId = undefined;
+      ds.pendingChatContext = undefined;
       logger.info(`[auto-start:入群] ${chatId.substring(0, 12)} 无默认目录且无可选项目，直接开工`);
     }
   } finally {
