@@ -234,6 +234,7 @@ import {
   deriveRiffRepoFromWorkingDir,
   isValidRiffBaseUrl,
   isValidRiffSandboxCluster,
+  type RiffBackendConfig,
 } from './adapters/backend/riff-backend.js';
 import {
   prepareDirectSandbox,
@@ -1305,7 +1306,7 @@ let closeRequested = false;
 let capturedSpawnCommand: string | null = null;
 let deferredTopicOutputTail = '';
 const reportedDeferredTopicRoots = new Set<string>();
-const CLI_DISPLAY_NAMES: Record<string, string> = { 'claude-code': 'Claude', seed: 'Seed', relay: 'Relay', aiden: 'Aiden', coco: 'CoCo', codex: 'Codex', 'codex-app': 'Codex App', cursor: 'Cursor', gemini: 'Gemini', genius: 'Genius', opencode: 'OpenCode', antigravity: 'Antigravity', mtr: 'MTR', hermes: 'Hermes', mira: 'Mira', mir: 'Mir CLI', traex: 'TRAE', pi: 'Pi', copilot: 'Copilot', 'oh-my-pi': 'Oh My Pi', kimi: 'Kimi', grok: 'Grok Build', 'kiro-cli': 'Kiro', riff: 'Riff' };
+const CLI_DISPLAY_NAMES: Record<string, string> = { 'claude-code': 'Claude', seed: 'Seed', relay: 'Relay', aiden: 'Aiden', coco: 'CoCo', codex: 'Codex', 'codex-app': 'Codex App', cursor: 'Cursor', gemini: 'Gemini', genius: 'Genius', opencode: 'OpenCode', antigravity: 'Antigravity', mtr: 'MTR', hermes: 'Hermes', mira: 'Mira', mir: 'Mir CLI', traex: 'TRAE', pi: 'Pi', copilot: 'Copilot', 'oh-my-pi': 'Oh My Pi', kimi: 'Kimi', grok: 'Grok Build', 'kiro-cli': 'Kiro', riff: 'Riff', mojo: 'Mojo' };
 function cliName(): string {
   return (lastInitConfig?.cliRuntime?.source === 'configured'
     ? (lastInitConfig.cliRuntime.displayName?.trim() || lastInitConfig.cliRuntime.id)
@@ -7718,14 +7719,18 @@ async function spawnCli(
     if (!cfg.backendConfig) {
       throw new Error('riff backend requires backendConfig (baseUrl, etc.)');
     }
+    // backendConfig is a union shared with the mojo backend; inside this
+    // riff-only branch the shape is known, so narrow once instead of casting at
+    // each riff-specific field access below.
+    const riffCfg = cfg.backendConfig as RiffBackendConfig;
     // Fail fast on a missing/invalid baseUrl — every config entry point funnels
     // through this spawn gate, and a late `fetch("undefined/api/…")` error is
     // far harder to diagnose than an explicit spawn refusal.
-    if (!isValidRiffBaseUrl(cfg.backendConfig.baseUrl)) {
-      throw new Error(`riff baseUrl 未配置或非法（需 http(s) URL，当前: ${JSON.stringify(cfg.backendConfig.baseUrl ?? null)}）——请在 dashboard 的 Riff 配置中填写`);
+    if (!isValidRiffBaseUrl(riffCfg.baseUrl)) {
+      throw new Error(`riff baseUrl 未配置或非法（需 http(s) URL，当前: ${JSON.stringify(riffCfg.baseUrl ?? null)}）——请在 dashboard 的 Riff 配置中填写`);
     }
-    if (cfg.backendConfig.sandboxCluster !== undefined && !isValidRiffSandboxCluster(cfg.backendConfig.sandboxCluster)) {
-      throw new Error(`riff sandboxCluster 非法（仅支持 boe/cn，当前: ${JSON.stringify(cfg.backendConfig.sandboxCluster)}）——请在 dashboard 的 Riff 配置中重新选择`);
+    if (riffCfg.sandboxCluster !== undefined && !isValidRiffSandboxCluster(riffCfg.sandboxCluster)) {
+      throw new Error(`riff sandboxCluster 非法（仅支持 boe/cn，当前: ${JSON.stringify(riffCfg.sandboxCluster)}）——请在 dashboard 的 Riff 配置中重新选择`);
     }
     const sessionEnv: Record<string, string> = {
       BOTMUX_SESSION_ID: cfg.sessionId,
@@ -7771,7 +7776,7 @@ async function spawnCli(
     sessionEnv.BOTMUX_LARK_LIST_BOTS_API_TIMEOUT_MS = String(chatBotDiscovery.listBotsApiTimeoutMs);
     // Per-bot env (bots.json `env`) takes precedence over session context;
     // explicit riff config.env takes precedence over both.
-    const mergedEnv: Record<string, string> = { ...sessionEnv, ...sanitizePerBotEnv(cfg.env), ...cfg.backendConfig.env };
+    const mergedEnv: Record<string, string> = { ...sessionEnv, ...sanitizePerBotEnv(cfg.env), ...riffCfg.env };
     // Re-freeze the no-transport capability keys AFTER the merge: a stale or
     // attacker-shaped backendConfig.env / per-bot env merges LAST and would
     // otherwise override the frozen values, restoring send capability for a
@@ -7785,11 +7790,11 @@ async function spawnCli(
       mergedEnv.BOTMUX_API_ONLY = '1';
       mergedEnv.BOTMUX_CHAT_ID = cfg.chatId; // host-owned; never from config
     }
-    riffBackendConfig = Object.assign({}, cfg.backendConfig, { env: mergedEnv, resumeParentTaskId: cfg.riffParentTaskId });
+    riffBackendConfig = Object.assign({}, riffCfg, { env: mergedEnv, resumeParentTaskId: cfg.riffParentTaskId });
     // 复用本地仓库+分支：多仓只认会话上的显式 stamp（仓库选择卡多选流按用户
     // 顺序写入 cfg.riffRepoDirs，首仓=primary）；否则仅对 workingDir 本身做单仓
     // 推导——绝不扫描任意非 git 目录的子目录（home/仓库集合目录会乱带仓库）。
-    if (!cfg.backendConfig.repos || cfg.backendConfig.repos.length === 0) {
+    if (!riffCfg.repos || riffCfg.repos.length === 0) {
       const derived = cfg.riffRepoDirs && cfg.riffRepoDirs.length > 0
         ? deriveRiffReposFromDirs(cfg.riffRepoDirs)
         : (() => { const one = deriveRiffRepoFromWorkingDir(cfg.workingDir); return one ? { repos: [one.repo], warnings: one.warnings } : null; })();

@@ -4,6 +4,7 @@ import { resolve } from 'node:path';
 import { homedir } from 'node:os';
 import { underReadIsolation } from './adapters/cli/read-isolation.js';
 import type { BackendType } from './adapters/backend/types.js';
+import type { MojoBackendConfig } from './adapters/backend/mojo-types.js';
 import type { RiffBackendConfig } from './adapters/backend/riff-backend.js';
 import type { CliId } from './adapters/cli/types.js';
 import {
@@ -1156,6 +1157,14 @@ export interface BotConfig {
    * selection, and auth settings for riff's HTTP API.
    */
   riff?: RiffBackendConfig;
+
+  /**
+   * Configuration for the mojo backend (@byted/mojo headless CLI). Optional
+   * even when `backendType` is `'mojo'`: every field has a working default
+   * (`mojo` on PATH + an ambient login is a valid setup). Use it to pin the
+   * model, inject a JWT, or force `--cloud` execution.
+   */
+  mojo?: MojoBackendConfig;
   /**
    * Max simultaneously-LIVE sessions for this bot. When the bot's live session
    * count exceeds this, the idle-worker sweeper suspends its longest-idle,
@@ -2570,6 +2579,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       readDenyExtraPaths: normalizeStringList(entry.readDenyExtraPaths),
       backendType: entry.backendType,
       riff: entry.riff && typeof entry.riff === 'object' ? entry.riff : undefined,
+      mojo: entry.mojo && typeof entry.mojo === 'object' ? entry.mojo : undefined,
       // Positive integer only; ≤0 / non-int / absent → undefined (= no cap).
       maxLiveWorkers: typeof entry.maxLiveWorkers === 'number'
         && Number.isInteger(entry.maxLiveWorkers) && entry.maxLiveWorkers > 0

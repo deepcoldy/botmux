@@ -28,6 +28,7 @@ import { createKimiAdapter } from './kimi.js';
 import { createGrokAdapter } from './grok.js';
 import { createKiroCliAdapter } from './kiro-cli.js';
 import { createRiffAdapter } from './riff.js';
+import { createMojoAdapter } from './mojo.js';
 
 /**
  * The first CLI executable (or nested runner dependency) before shell
@@ -66,6 +67,8 @@ const RAW_CLI_EXECUTABLES: Readonly<Record<CliId, string | undefined>> = {
   'kiro-cli': 'kiro-cli',
   // API-backed; no local executable is required.
   riff: undefined,
+  // Headless CLI invoked per turn by MojoBackend, not spawned by the worker.
+  mojo: undefined,
 };
 
 /** Return the unresolved command without constructing an adapter or spawning a
@@ -159,7 +162,7 @@ export async function createCliAdapter(id: CliId, pathOverride?: string): Promis
   return adapter;
 }
 
-export { createClaudeCodeAdapter, createSeedAdapter, createRelayAdapter, createAidenAdapter, createCocoAdapter, createCodexAdapter, createCodexAppAdapter, createCursorAdapter, createGeminiAdapter, createGeniusAdapter, createOpenCodeAdapter, createAntigravityAdapter, createMtrAdapter, createHermesAdapter, createMiraAdapter, createMirAdapter, createTraexAdapter, createPiAdapter, createCopilotAdapter, createOhMyPiAdapter, createKimiAdapter, createGrokAdapter, createKiroCliAdapter, createRiffAdapter };
+export { createClaudeCodeAdapter, createSeedAdapter, createRelayAdapter, createAidenAdapter, createCocoAdapter, createCodexAdapter, createCodexAppAdapter, createCursorAdapter, createGeminiAdapter, createGeniusAdapter, createOpenCodeAdapter, createAntigravityAdapter, createMtrAdapter, createHermesAdapter, createMiraAdapter, createMirAdapter, createTraexAdapter, createPiAdapter, createCopilotAdapter, createOhMyPiAdapter, createKimiAdapter, createGrokAdapter, createKiroCliAdapter, createRiffAdapter, createMojoAdapter };
 
 /** Synchronous version for use in worker process. */
 export function createCliAdapterSync(id: CliId, pathOverride?: string): CliAdapter {
@@ -188,6 +191,7 @@ export function createCliAdapterSync(id: CliId, pathOverride?: string): CliAdapt
     case 'grok': return createGrokAdapter(pathOverride);
     case 'kiro-cli': return createKiroCliAdapter(pathOverride);
     case 'riff': return createRiffAdapter(pathOverride);
+    case 'mojo': return createMojoAdapter(pathOverride);
     default: throw new Error(`Unknown CLI adapter: ${id}`);
   }
 }

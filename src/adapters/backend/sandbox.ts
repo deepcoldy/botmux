@@ -348,14 +348,15 @@ export function coreOnlyPidNamespaceDegrade(): boolean {
 }
 
 /**
- * Whether a LOCAL sandbox engine applies to this backend at all. riff has NO
- * local CLI process to wrap (execution happens in riff's own remote sandbox);
- * without this bypass the worker's fail-safe "backend not sandboxable" hard
- * error would brick every sandbox-enabled bot the moment it switches to riff.
+ * Whether a LOCAL sandbox engine applies to this backend at all. Remote
+ * backends have NO local CLI process to wrap — execution happens in riff's own
+ * remote sandbox, and for mojo in its `--cloud` sandbox. Without this bypass the
+ * worker's fail-safe "backend not sandboxable" hard error would brick every
+ * sandbox-enabled bot the moment it switches to one of them.
  * Platform is no longer a factor — fs-policy sandboxes darwin AND linux.
  */
 export function localSandboxApplies(backendType: string): boolean {
-  return backendType !== 'riff';
+  return backendType !== 'riff' && backendType !== 'mojo';
 }
 
 /** Top-level dirs that are symlinks on usrmerge distros (/bin → usr/bin …) —

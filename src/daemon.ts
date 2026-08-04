@@ -2602,8 +2602,13 @@ function scheduleDeferredScheduleSettlement(
   // Exact transcript terminal needs only a short filesystem visibility grace.
   // Screen-only adapters use a longer confirmation and re-check that the same
   // turn is still idle before reclaiming the hidden session.
+  // Remote backends (riff / mojo) report their turn boundary over the network,
+  // so allow the same longer grace as the screen-only path instead of the 300ms
+  // local-filesystem one.
+  const remoteTerminal = ds.session.backendType === 'riff'
+    || ds.session.backendType === 'mojo';
   const delayMs = context.source === 'terminal'
-    ? (ds.session.backendType === 'riff' ? 1_500 : 300)
+    ? (remoteTerminal ? 1_500 : 300)
     : 1_500;
   const timer = setTimeout(() => {
     deferredScheduleSettleTimers.delete(sessionId);

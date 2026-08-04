@@ -4203,7 +4203,12 @@ export function forkWorker(
     // Shared Herdr is not derivable from sessionId: preserve the exact host +
     // managed-agent affinity across daemon/worker replacement.
     persistentBackendTarget: ds.session.persistentBackendTarget,
-    backendConfig: botCfg.riff,
+    // One backendConfig channel shared by the remote backends; the selector
+    // picks the shape matching backendType. A mojo bot with no `mojo` block is
+    // valid (all fields optional), so an undefined here is not an error.
+    backendConfig: botCfg.backendType === 'mojo' || agentCfg.cliId === 'mojo'
+      ? botCfg.mojo
+      : botCfg.riff,
     riffParentTaskId: ds.session.riffParentTaskId,
     riffRepoDirs: ds.session.riffRepoDirs,
     deferredScheduleRun: ds.session.deferredScheduleRun,

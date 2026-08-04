@@ -1,4 +1,4 @@
-export type BackendType = 'pty' | 'tmux' | 'herdr' | 'zellij' | 'zmx' | 'riff';
+export type BackendType = 'pty' | 'tmux' | 'herdr' | 'zellij' | 'zmx' | 'riff' | 'mojo';
 
 /**
  * Durable identity of the backing resource owned by one Botmux session.

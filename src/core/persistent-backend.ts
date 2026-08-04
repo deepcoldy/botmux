@@ -98,7 +98,7 @@ export function resolveSpawnBackendType(
  * hardcoded `=== 'riff'` chain in every helper below) is exactly what made this
  * generalization necessary.
  */
-const REMOTE_CLI_IDS: ReadonlySet<string> = new Set(['riff']);
+const REMOTE_CLI_IDS: ReadonlySet<string> = new Set(['riff', 'mojo']);
 
 /** True for a backend that runs the agent off-box (no local PTY to own). */
 export function isRemoteBackendType(type: BackendType): boolean {

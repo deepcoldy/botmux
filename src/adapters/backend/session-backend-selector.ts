@@ -4,6 +4,8 @@ import { resolve } from 'node:path';
 
 import { HerdrBackend } from './herdr-backend.js';
 import { PtyBackend } from './pty-backend.js';
+import { MojoBackend } from './mojo-backend.js';
+import type { MojoBackendConfig } from './mojo-types.js';
 import { RiffBackend, type RiffBackendConfig } from './riff-backend.js';
 import { TmuxBackend } from './tmux-backend.js';
 import { TmuxPipeBackend } from './tmux-pipe-backend.js';
@@ -200,6 +202,10 @@ export function backendSandboxCompatibilityError(opts: {
     opts.backendType === 'pty'
     || opts.backendType === 'tmux'
     || opts.backendType === 'riff'
+    // mojo executes tools in ITS OWN remote cloud sandbox (--cloud), so
+    // botmux's local file sandbox has nothing to isolate here — same rationale
+    // as riff. Blocking it would brick every sandbox-enabled mojo bot.
+    || opts.backendType === 'mojo'
   ) return undefined;
   return `backend "${opts.backendType}" does not support file/read isolation; `
     + 'use tmux/pty or disable sandbox for this bot';
@@ -233,7 +239,7 @@ export interface SelectedSessionBackend {
 export function selectSessionBackend(opts: {
   sessionId: string;
   backendType: BackendType;
-  backendConfig?: RiffBackendConfig;
+  backendConfig?: RiffBackendConfig | MojoBackendConfig;
   /** Canonical local ownership boundary used to keep machine-wide Herdr agent
    * names distinct across independent Botmux data roots/checkouts. */
   herdrOwnershipScope?: string;
@@ -244,12 +250,26 @@ export function selectSessionBackend(opts: {
   /** Host-persistent journal for fail-closed ZMX composer recovery. */
   zmxRecoveryStateDir?: string;
 }): SelectedSessionBackend {
+  if (opts.backendType === 'mojo') {
+    // Unlike riff, an absent config is FINE: every mojo field is optional and
+    // the bare `mojo` binary on PATH with an ambient login is a valid setup.
+    return {
+      backend: new MojoBackend(
+        (opts.backendConfig ?? {}) as MojoBackendConfig,
+        opts.sessionId,
+      ),
+      isTmuxMode: false,
+      isPipeMode: false,
+      isZellijMode: false,
+    };
+  }
+
   if (opts.backendType === 'riff') {
     if (!opts.backendConfig) {
       throw new Error('riff backend requires backendConfig (baseUrl, etc.)');
     }
     return {
-      backend: new RiffBackend(opts.backendConfig, opts.sessionId),
+      backend: new RiffBackend(opts.backendConfig as RiffBackendConfig, opts.sessionId),
       isTmuxMode: false,
       isPipeMode: false,
       isZellijMode: false,

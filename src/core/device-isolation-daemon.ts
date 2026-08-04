@@ -142,7 +142,7 @@ function isPersistentBackend(value: InventoryBackend): value is LocalPersistentB
   return value === 'tmux' || value === 'herdr' || value === 'zellij' || value === 'zmx';
 }
 
-function isLocalBackend(value: InventoryBackend): value is Exclude<BackendType, 'riff'> {
+function isLocalBackend(value: InventoryBackend): value is Exclude<BackendType, 'riff' | 'mojo'> {
   return value === 'pty' || isPersistentBackend(value);
 }
 
@@ -311,7 +311,9 @@ function classifySession(session: DeviceIsolationRuntimeSession): DeviceIsolatio
       return blockerEntry(session, backendType, 'process_identity_unavailable');
     }
   }
-  if (backendType === 'riff') {
+  // Remote backends own no local PID, so there is no local process identity to
+  // prove — riff and mojo are both activation-safe by construction.
+  if (backendType === 'riff' || backendType === 'mojo') {
     return {
       sessionId: session.sessionId,
       backendType,
