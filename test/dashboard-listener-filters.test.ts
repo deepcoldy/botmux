@@ -3,6 +3,7 @@ import {
   applyListenerFilterState,
   filterListenerTargets,
   listenerTargetStateFor,
+  resolveExcludeSenderKinds,
   type ListenerFilterTarget,
 } from '../src/dashboard/web/listener-filters.js';
 
@@ -114,5 +115,47 @@ describe('dashboard listener filters', () => {
       include: [],
       exclude: [],
     })).toBe('listen');
+  });
+});
+
+describe('resolveExcludeSenderKinds — persisted kind must survive a roster failure (review P1)', () => {
+  const roster: Record<string, 'user' | 'bot' | 'unknown'> = {
+    ou_person: 'user',
+    ou_bot_alert: 'bot',
+  };
+  const liveKind = (openId: string) => roster[openId];
+  const emptyRoster = () => undefined;
+
+  it('live roster wins when available', () => {
+    expect(resolveExcludeSenderKinds(['ou_person', 'ou_bot_alert'], liveKind)).toEqual({
+      ou_person: 'user',
+      ou_bot_alert: 'bot',
+    });
+  });
+
+  it('falls back to the persisted kind when the roster is empty/failed', () => {
+    // The exact bug: members API failed (empty roster), user edits only the
+    // prompt and saves. Without the fallback the payload would omit the kind,
+    // the backend would treat ou_person as legacy/unknown, and every unverified
+    // third-party bot would fail-close again.
+    expect(
+      resolveExcludeSenderKinds(['ou_person'], emptyRoster, { ou_person: 'user' }),
+    ).toEqual({ ou_person: 'user' });
+  });
+
+  it('live roster still overrides a stale persisted kind', () => {
+    expect(
+      resolveExcludeSenderKinds(['ou_person'], () => 'bot', { ou_person: 'user' }),
+    ).toEqual({ ou_person: 'bot' });
+  });
+
+  it('a never-identified id stays absent → runtime keeps conservative fail-close', () => {
+    expect(resolveExcludeSenderKinds(['ou_ghost'], emptyRoster, { ou_person: 'user' })).toEqual({});
+    // 'unknown' from the roster is not a definite kind → also absent.
+    expect(resolveExcludeSenderKinds(['ou_maybe'], () => 'unknown')).toEqual({});
+  });
+
+  it('skips empty ids', () => {
+    expect(resolveExcludeSenderKinds(['', 'ou_person'], liveKind)).toEqual({ ou_person: 'user' });
   });
 });

@@ -75,3 +75,33 @@ export function listenerTargetStateFor(input: {
   }
   return states.size === 1 ? [...states][0] : 'mixed';
 }
+
+/**
+ * Resolve the persisted `excludeSenderKinds` map for a save payload.
+ *
+ * The runtime fail-close decision (message-listener `exclusionMayBeUnverifiedBot`)
+ * needs each excluded id's KIND (user/bot). Live roster is authoritative, but a
+ * transient members-list failure must NOT drop an already-persisted kind: the
+ * dashboard swallows load errors to an empty roster and does not gate save on
+ * loading, so a plain unrelated-field save would otherwise emit the exclusion
+ * list WITHOUT its kinds → the backend treats them as legacy/unknown →
+ * every unverified third-party bot fail-closes again (the exact scenario the
+ * all_except_excluded mode exists to fix).
+ *
+ * Precedence: live roster kind → persisted kind → absent. A genuinely
+ * never-identified open_id stays absent so the runtime keeps its conservative
+ * (maybe-a-bot) fail-close.
+ */
+export function resolveExcludeSenderKinds(
+  excludeSenderOpenIds: readonly string[],
+  liveKindOf: (openId: string) => 'user' | 'bot' | 'unknown' | undefined,
+  persistedKinds?: Readonly<Record<string, 'user' | 'bot'>>,
+): Record<string, 'user' | 'bot'> {
+  const out: Record<string, 'user' | 'bot'> = {};
+  for (const openId of excludeSenderOpenIds) {
+    if (!openId) continue;
+    const kind = liveKindOf(openId) ?? persistedKinds?.[openId];
+    if (kind === 'user' || kind === 'bot') out[openId] = kind;
+  }
+  return out;
+}

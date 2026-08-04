@@ -12,6 +12,7 @@ import {
   applyListenerFilterState,
   filterListenerTargets,
   listenerTargetStateFor,
+  resolveExcludeSenderKinds,
 } from './listener-filters.js';
 import { useT } from './react-hooks.js';
 import { mountReactPage, type PageDisposer } from './react-mount.js';
@@ -626,11 +627,17 @@ function RolesPage(props: { tab: RolesTab }) {
     // guessing by id prefix (see message-listener senderOpenIdAllowed). Only
     // ids the current roster resolves to a definite user/bot are recorded;
     // 'unknown' stays absent → runtime treats it conservatively as maybe-a-bot.
-    const excludeSenderKinds: Record<string, 'user' | 'bot'> = {};
-    for (const openId of excludeSenderOpenIds) {
-      const memberType = listenerMemberById.get(openId)?.memberType;
-      if (memberType === 'user' || memberType === 'bot') excludeSenderKinds[openId] = memberType;
-    }
+    // Live roster wins; fall back to the already-persisted kind so a transient
+    // members-list failure (loadMembers swallows errors to an empty array, and
+    // save is not gated on listenerMembersLoading) can't silently drop a known
+    // kind on an unrelated-field save — that would re-fail-close every
+    // unverified third-party bot (the exact scenario this PR fixes). See
+    // resolveExcludeSenderKinds for the precedence contract + regression test.
+    const excludeSenderKinds = resolveExcludeSenderKinds(
+      excludeSenderOpenIds,
+      openId => listenerMemberById.get(openId)?.memberType,
+      senderPolicy.excludeSenderKinds,
+    );
     const includeSenderTypes = [...new Set(senderPolicy.includeSenderTypes ?? [])].filter((type): type is SenderTypeOption => type === 'user' || type === 'bot');
     const includeMsgTypes = [...new Set(messagePolicy.includeMsgTypes ?? [])].filter(Boolean);
     return {
