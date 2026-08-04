@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { useT } from '../react-hooks.js';
 import { SectionHeader } from '../dashboard-components.js';
 import { buildSkillGraph, packIds, priorityNames, type BotGraphInfo } from './shared.js';
@@ -10,6 +10,16 @@ interface BotAssignmentsTabProps {
   statuses: Record<string, StatusMessage>;
   onSave: (appId: string, names: string[], packIds: string[]) => Promise<void>;
   packs: Array<{ id: string; name: string; include: string[] }>;
+  /** false = pack data never loaded; pack-derived health reads "unknown" */
+  packsKnown?: boolean;
+  /** cross-tab arrival: highlight these bots' rows */
+  focusBotIds?: string[] | null;
+  /** cross-tab arrival: prefill palette search + highlight bots resolving this skill */
+  focusSkill?: string | null;
+  onFocusConsumed?: () => void;
+  /** chip click-throughs */
+  onOpenPack?: (packId: string) => void;
+  onOpenSkill?: (name: string) => void;
 }
 
 type DragItem = { type: 'skill' | 'pack'; id: string };
@@ -21,12 +31,28 @@ export function BotAssignmentsTab(props: BotAssignmentsTabProps) {
   const [dragItem, setDragItem] = useState<DragItem | null>(null);
   const [skillQuery, setSkillQuery] = useState('');
   const [activeTag, setActiveTag] = useState<string | null>(null);
+  const [highlightBots, setHighlightBots] = useState<Set<string>>(() => new Set());
+  const [highlightSkill, setHighlightSkill] = useState<string | null>(null);
+
+  // Cross-tab arrival: apply focus context once, then consume the intent so it
+  // doesn't re-apply on later visits. Highlights live in local state.
+  const { focusBotIds, focusSkill, onFocusConsumed } = props;
+  useEffect(() => {
+    if ((focusBotIds?.length ?? 0) === 0 && !focusSkill) return;
+    if (focusBotIds && focusBotIds.length > 0) setHighlightBots(new Set(focusBotIds));
+    if (focusSkill) {
+      setHighlightSkill(focusSkill);
+      setSkillQuery(focusSkill);
+    }
+    onFocusConsumed?.();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [focusBotIds, focusSkill]);
 
   // Single relationship model: per-bot resolution, counts and health all come
   // from the same graph the other skill tables use.
   const graph = useMemo(
-    () => buildSkillGraph(props.skills, props.packs, props.bots),
-    [props.skills, props.packs, props.bots],
+    () => buildSkillGraph(props.skills, props.packs, props.bots, { packsKnown: props.packsKnown !== false }),
+    [props.skills, props.packs, props.bots, props.packsKnown],
   );
 
   const allTags = useMemo(() => {
@@ -162,10 +188,12 @@ export function BotAssignmentsTab(props: BotAssignmentsTabProps) {
                   const finalCount = botInfo?.finalCount ?? 0;
                   const health = botHealthLabel(botInfo, tr);
                   const isDragOver = dragOverBot === bot.larkAppId;
+                  const isFocused = highlightBots.has(bot.larkAppId)
+                    || (highlightSkill != null && (botInfo?.resolved.some(entry => entry.name === highlightSkill) ?? false));
                   return (
                     <tr
                       key={bot.larkAppId}
-                      className={`skills-bot-row${isDragOver ? ' drag-over' : ''}`}
+                      className={`skills-bot-row${isDragOver ? ' drag-over' : ''}${isFocused ? ' skills-bot-row-focus' : ''}`}
                       onDragOver={e => { e.preventDefault(); setDragOverBot(bot.larkAppId); }}
                       onDragLeave={() => setDragOverBot(prev => prev === bot.larkAppId ? null : prev)}
                       onDrop={e => { e.preventDefault(); void handleDrop(bot); }}
@@ -176,18 +204,43 @@ export function BotAssignmentsTab(props: BotAssignmentsTabProps) {
                           {packNames.length === 0 ? <span className="muted">—</span> :
                             packNames.map(pid => {
                               const pack = props.packs.find(p => p.id === pid);
-                              return <span key={pid} className="skills-pack-chip">{pack?.name ?? pid}</span>;
+                              // Unknown ≠ missing: without loaded pack data an
+                              // unresolvable ref renders neutral, not broken.
+                              const unknown = !pack && props.packsKnown === false;
+                              const missing = !pack && !unknown;
+                              return (
+                                <button
+                                  key={pid}
+                                  type="button"
+                                  className={`skills-pack-chip${missing ? ' skills-chip-missing' : ''}${unknown ? ' skills-chip-unknown' : ''}`}
+                                  data-action="open-bot-pack"
+                                  title={unknown ? tr('skills.healthUnknown') : undefined}
+                                  disabled={!pack || !props.onOpenPack}
+                                  onClick={() => props.onOpenPack?.(pid)}
+                                >{pack?.name ?? pid}</button>
+                              );
                             })}
                         </div>
                       </td>
                       <td>
                         {skillNames.length === 0 ? <span className="muted">—</span> :
                           <span className="skills-skill-chips">
-                            {skillNames.slice(0, 3).map(n => <span key={n} className="skills-skill-chip">{n}</span>)}
+                            {skillNames.slice(0, 3).map(n => (
+                              <button
+                                key={n}
+                                type="button"
+                                className="skills-skill-chip"
+                                data-action="open-bot-skill"
+                                disabled={!props.onOpenSkill}
+                                onClick={() => props.onOpenSkill?.(n)}
+                              >{n}</button>
+                            ))}
                             {skillNames.length > 3 && <span className="muted">+{skillNames.length - 3}</span>}
                           </span>}
                       </td>
-                      <td>{finalCount}</td>
+                      <td>{botInfo?.health === 'unknown'
+                        ? <span className="muted" title={tr('skills.healthUnknown')}>—</span>
+                        : finalCount}</td>
                       <td>
                         <span className={`skills-health skills-health-${health.level}`}>
                           {health.label}
@@ -221,10 +274,11 @@ export function BotAssignmentsTab(props: BotAssignmentsTabProps) {
 }
 
 /** Map graph health to a display level + translated label. */
-function botHealthLabel(info: BotGraphInfo | undefined, tr: ReturnType<typeof useT>): { level: 'ok' | 'warn' | 'error'; label: string } {
+function botHealthLabel(info: BotGraphInfo | undefined, tr: ReturnType<typeof useT>): { level: 'ok' | 'warn' | 'error' | 'unknown'; label: string } {
   switch (info?.health) {
     case 'pack_missing': return { level: 'error', label: tr('skills.healthPackMissing') };
     case 'missing': return { level: 'warn', label: tr('skills.healthMissing', { count: info.missingSkills.length }) };
+    case 'unknown': return { level: 'unknown', label: tr('skills.healthUnknown') };
     case 'default': case undefined: return { level: 'ok', label: tr('skills.healthDefault') };
     default: return { level: 'ok', label: tr('skills.healthOk') };
   }

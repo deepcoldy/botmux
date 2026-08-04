@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { buildSkillGraph, danglingSkillNames } from '../src/dashboard/web/skills/shared.js';
+import { buildSkillGraph, danglingSkillNames, selectInstallCandidates } from '../src/dashboard/web/skills/shared.js';
 
 const installed = [{ name: 'deploy' }, { name: 'review' }, { name: 'release' }];
 
@@ -97,5 +97,55 @@ describe('buildSkillGraph', () => {
     const botX = g.bots.get('bot-x')!;
     expect(botX.health).toBe('ok');
     expect(botX.finalCount).toBe(1);
+  });
+});
+
+describe('selectInstallCandidates', () => {
+  const candidates = [{ name: 'alpha' }, { name: 'beta' }];
+
+  it('no target → all candidates preselected', () => {
+    const { selected, targetMissing } = selectInstallCandidates(candidates, null);
+    expect([...selected].sort()).toEqual(['alpha', 'beta']);
+    expect(targetMissing).toBe(false);
+  });
+
+  it('target present → only the target preselected', () => {
+    const { selected, targetMissing } = selectInstallCandidates(candidates, 'beta');
+    expect([...selected]).toEqual(['beta']);
+    expect(targetMissing).toBe(false);
+  });
+
+  it('target absent → NOTHING preselected and targetMissing flagged (wrong-repo guard)', () => {
+    const { selected, targetMissing } = selectInstallCandidates(candidates, 'x-missing');
+    expect(selected.size).toBe(0);
+    expect(targetMissing).toBe(true);
+  });
+});
+
+describe('buildSkillGraph packsKnown semantics', () => {
+  const installedNow = [{ name: 'deploy' }];
+  const botsNow = [
+    { larkAppId: 'pack-bot', skills: { include: ['pack:p1'] } },
+    { larkAppId: 'mixed-bot', skills: { include: ['pack:p1', 'skill:gone'] } },
+    { larkAppId: 'plain-bot', skills: { include: ['skill:deploy'] } },
+  ];
+
+  it('packsKnown=false: unresolvable pack refs → health unknown, never pack_missing', () => {
+    const g = buildSkillGraph(installedNow, [], botsNow, { packsKnown: false });
+    const packBot = g.bots.get('pack-bot')!;
+    expect(packBot.health).toBe('unknown');
+    expect(packBot.missingPacks).toEqual([]);
+  });
+
+  it('packsKnown=false: factual direct-skill issues still win over unknown', () => {
+    const g = buildSkillGraph(installedNow, [], botsNow, { packsKnown: false });
+    expect(g.bots.get('mixed-bot')!.health).toBe('missing');
+    expect(g.bots.get('plain-bot')!.health).toBe('ok');
+  });
+
+  it('packsKnown=true (default): same input → pack_missing (definitive)', () => {
+    const g = buildSkillGraph(installedNow, [], botsNow);
+    expect(g.bots.get('pack-bot')!.health).toBe('pack_missing');
+    expect(g.bots.get('pack-bot')!.missingPacks).toEqual(['p1']);
   });
 });

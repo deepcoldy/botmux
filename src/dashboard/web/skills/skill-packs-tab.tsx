@@ -7,7 +7,18 @@ interface SkillPacksTabProps {
   skills: SkillRow[];
   /** full pack rows owned by the page-level useSkillsData store */
   packs: SkillPackRow[];
+  /** false = pack data never loaded successfully — show "unavailable", not "no packs" */
+  packsKnown?: boolean;
   onRefresh: () => void;
+  /** cross-tab arrival: open this pack's editor once, then consume */
+  focusPackId?: string | null;
+  /** cross-tab arrival: highlight these pack cards (no editor), then consume */
+  focusPackIds?: string[] | null;
+  onFocusConsumed?: () => void;
+  /** chip click-throughs */
+  onOpenBot?: (larkAppId: string) => void;
+  /** redirect to the library install entry, prefilled — never auto-installs */
+  onInstallMissingSkill?: (name: string) => void;
 }
 
 type PackHealth = 'complete' | 'missing' | 'unassigned';
@@ -32,6 +43,27 @@ export function SkillPacksTab(props: SkillPacksTabProps) {
 
   const openCreate = () => { setEditing(null); setEditorOpen(true); };
   const openEdit = (pack: SkillPackRow) => { setEditing(pack); setEditorOpen(true); };
+
+  // Cross-tab arrival: a single focused pack (chip click) opens its editor; a
+  // focus set (overview badge / multi-pack skill) highlights the cards. Either
+  // way the intent is consumed once; highlights live in local state.
+  const [highlightPacks, setHighlightPacks] = useState<Set<string>>(() => new Set());
+  const { focusPackId, focusPackIds, onFocusConsumed } = props;
+  useEffect(() => {
+    if (!focusPackId && (focusPackIds?.length ?? 0) === 0) return;
+    if (focusPackId) {
+      const pack = packs.find(row => row.id === focusPackId);
+      if (pack) {
+        setEditing(pack);
+        setEditorOpen(true);
+      }
+      setHighlightPacks(new Set([focusPackId]));
+    } else if (focusPackIds) {
+      setHighlightPacks(new Set(focusPackIds));
+    }
+    onFocusConsumed?.();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [focusPackId, focusPackIds]);
 
   const handleSaved = () => {
     setEditorOpen(false);
@@ -85,13 +117,18 @@ export function SkillPacksTab(props: SkillPacksTabProps) {
     <section className="skills-config-block">
       <SectionHeader
         title={tr('skills.packs')}
-        count={tr('skills.packCount', { count: packs.length })}
+        count={props.packsKnown === false ? '—' : tr('skills.packCount', { count: packs.length })}
         hint={tr('skills.packsHelp')}
       />
       {status && <p className={`hint-${status.ok ? 'ok' : 'warn'}`}>{status.text}</p>}
       {(
         <div className="bd-card skills-config-card">
-          {packs.length === 0 ? (
+          {props.packsKnown === false && packs.length === 0 ? (
+            <div className="skills-empty-state" data-packs-unknown>
+              <p className="hint-warn">{tr('skills.packsUnknown')}</p>
+              <button className="bd-button" onClick={() => props.onRefresh()}>{tr('skills.refresh')}</button>
+            </div>
+          ) : packs.length === 0 ? (
             <div className="skills-empty-state">
               <p>{tr('skills.packsEmpty')}</p>
               <button className="bd-button primary" onClick={openCreate}>{tr('skills.packCreate')}</button>
@@ -105,7 +142,7 @@ export function SkillPacksTab(props: SkillPacksTabProps) {
               {packs.map(pack => {
                 const health = healthStatus(pack);
                 return (
-                  <div className="skills-pack-card" key={pack.id}>
+                  <div className={`skills-pack-card${highlightPacks.has(pack.id) ? ' skills-pack-card-focus' : ''}`} key={pack.id}>
                     <div className="skills-pack-card-head">
                       <div className="skills-pack-title">
                         <strong>{pack.name}</strong>
@@ -132,12 +169,32 @@ export function SkillPacksTab(props: SkillPacksTabProps) {
                     )}
                     {(pack.references?.length ?? 0) > 0 && (
                       <div className="skills-pack-refs">
-                        {pack.references!.map(r => <span key={r.larkAppId} className="skills-pack-ref-chip">{r.botName}</span>)}
+                        {pack.references!.map(r => (
+                          <button
+                            key={r.larkAppId}
+                            type="button"
+                            className="skills-pack-ref-chip"
+                            data-action="open-pack-bot"
+                            disabled={!props.onOpenBot}
+                            onClick={() => props.onOpenBot?.(r.larkAppId)}
+                          >{r.botName}</button>
+                        ))}
                       </div>
                     )}
                     {(pack.missingSkills?.length ?? 0) > 0 && (
                       <div className="skills-pack-missing">
-                        {tr('skills.packMissing')}: {pack.missingSkills!.join(', ')}
+                        {tr('skills.packMissing')}:{' '}
+                        {pack.missingSkills!.map(name => (
+                          <button
+                            key={name}
+                            type="button"
+                            className="skills-missing-skill-chip"
+                            data-action="install-missing-skill"
+                            title={tr('skills.installMissingHint', { skill: name })}
+                            disabled={!props.onInstallMissingSkill}
+                            onClick={() => props.onInstallMissingSkill?.(name)}
+                          >{name}</button>
+                        ))}
                       </div>
                     )}
                     <div className="skills-pack-actions">

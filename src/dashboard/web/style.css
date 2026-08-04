@@ -10871,6 +10871,11 @@ button.contrast:hover { background: var(--danger-soft); border-color: var(--dang
   position: relative;
 }
 
+.skills-install-anchor {
+  min-width: 0;
+  scroll-margin-top: 18px;
+}
+
 .skills-install-title {
   position: relative;
   display: inline-flex;
@@ -10881,6 +10886,34 @@ button.contrast:hover { background: var(--danger-soft); border-color: var(--dang
 
 .skills-install-title .bd-section-title {
   margin: 0;
+}
+
+.skills-inline-target {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin: 0 0 12px;
+  padding: 9px 11px;
+  border: 1px solid color-mix(in srgb, var(--accent) 42%, var(--border-soft));
+  border-left: 3px solid var(--accent);
+  border-radius: var(--radius-lg);
+  background: color-mix(in srgb, var(--accent) 7%, var(--surface));
+  color: var(--fg);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.skills-inline-target button {
+  flex: none;
+  min-height: 28px;
+  padding: 0 10px;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-full);
+  background: var(--surface);
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 700;
 }
 
 .skills-card-head {
@@ -11006,6 +11039,14 @@ button.contrast:hover { background: var(--danger-soft); border-color: var(--dang
   line-height: 1.35;
 }
 
+.skills-install-field-wide > small {
+  margin-top: -3px;
+  color: var(--faint);
+  font-size: 10.5px;
+  font-weight: 600;
+  line-height: 1.35;
+}
+
 .skills-source-help {
   display: grid;
   gap: 7px;
@@ -11041,10 +11082,69 @@ button.contrast:hover { background: var(--danger-soft); border-color: var(--dang
 
 .skills-install-bottom-row {
   display: grid;
-  grid-template-columns: minmax(0, 1fr);
+  grid-template-columns: minmax(260px, .9fr) minmax(320px, 1.1fr);
   gap: 10px;
   align-items: center;
   min-width: 0;
+}
+
+.skills-install-bottom-row > .skills-local-discovery-panel {
+  grid-column: auto;
+}
+
+.skills-scan-strategy {
+  display: grid;
+  gap: 4px;
+  min-height: var(--button-height);
+  padding: 8px 10px;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-lg);
+  background: color-mix(in srgb, var(--surface-muted) 55%, transparent);
+}
+
+.skills-scan-toggle {
+  display: flex !important;
+  align-items: flex-start;
+  gap: 9px !important;
+  color: var(--fg) !important;
+  cursor: pointer;
+}
+
+.skills-install-grid .skills-scan-toggle > input[type="checkbox"] {
+  width: 16px !important;
+  min-width: 16px !important;
+  max-width: 16px !important;
+  height: 16px !important;
+  min-height: 16px !important;
+  max-height: 16px !important;
+  margin: 1px 0 0 !important;
+  padding: 0 !important;
+  border-radius: 4px !important;
+  accent-color: var(--accent);
+}
+
+.skills-scan-toggle > span {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.skills-scan-toggle strong {
+  color: var(--fg);
+  font-size: 11.5px;
+}
+
+.skills-scan-toggle small,
+.skills-scan-strategy > p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 10.5px;
+  line-height: 1.35;
+}
+
+.skills-scan-strategy > p {
+  padding-left: 25px;
+  color: var(--faint);
 }
 
 .skills-advanced-options {
@@ -16704,7 +16804,7 @@ form.dashboard-toolbar > input[type="text"]:focus {
   display: grid;
   grid-column: 1 / -1;
   grid-row: 3;
-  grid-template-columns: minmax(0, 1fr);
+  grid-template-columns: minmax(260px, .9fr) minmax(320px, 1.1fr);
   gap: 10px;
   align-items: center;
   min-width: 0;
@@ -16737,6 +16837,94 @@ form.dashboard-toolbar > input[type="text"]:focus {
 
 .skills-install-status-row {
   margin: 8px 0 0;
+}
+
+.skills-source-formats {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px 7px;
+  align-items: center;
+  margin-top: 7px;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.skills-source-formats > span {
+  font-weight: 700;
+}
+
+.skills-source-formats code {
+  max-width: 100%;
+  padding: 2px 6px;
+  overflow: hidden;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-full);
+  background: var(--surface-muted);
+  color: var(--fg-muted);
+  font-size: 10px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.skills-source-feedback {
+  display: grid;
+  gap: 2px;
+  margin-top: 7px;
+  padding: 7px 9px;
+  border: 1px solid color-mix(in srgb, var(--accent) 28%, var(--border-soft));
+  border-radius: var(--radius-md);
+  background: color-mix(in srgb, var(--accent) 7%, var(--surface));
+}
+
+.skills-source-feedback strong {
+  color: var(--accent-strong);
+  font-size: 11px;
+}
+
+.skills-source-feedback span {
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.skills-source-feedback.is-unknown {
+  border-color: color-mix(in srgb, var(--warning) 35%, var(--border-soft));
+  background: color-mix(in srgb, var(--warning) 8%, var(--surface));
+}
+
+.skills-source-feedback.is-unknown strong {
+  color: var(--warning);
+}
+
+.skills-install-diagnostic {
+  display: grid;
+  gap: 3px;
+  margin-top: 8px;
+  padding: 9px 11px;
+  border: 1px solid color-mix(in srgb, var(--warning) 34%, var(--border-soft));
+  border-radius: var(--radius-md);
+  background: color-mix(in srgb, var(--warning) 8%, var(--surface));
+}
+
+.skills-install-diagnostic strong {
+  color: var(--warning);
+  font-size: 12px;
+}
+
+.skills-install-diagnostic span {
+  color: var(--fg-muted);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+@media (max-width: 980px) {
+  .skills-page .skills-install-panel .skills-install-bottom-row {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .skills-inline-target {
+    align-items: flex-start;
+  }
 }
 
 .skills-defaults-panel .bd-section-title {
@@ -25599,7 +25787,7 @@ button.ui-refresh-button.is-loading .ui-action-icon {
   justify-content: center;
   gap: 8px;
   min-height: 140px;
-  border: 2px dashed var(--border, #444);
+  border: 2px dashed var(--border);
   border-radius: 12px;
   background: transparent;
   color: var(--muted, #999);
@@ -25608,9 +25796,9 @@ button.ui-refresh-button.is-loading .ui-action-icon {
   font-size: 14px;
 }
 .skills-pack-create-tile:hover {
-  border-color: var(--accent, #6c8cff);
-  color: var(--accent, #6c8cff);
-  background: var(--hover-bg, rgba(108, 140, 255, 0.06));
+  border-color: var(--accent);
+  color: var(--accent);
+  background: var(--accent-soft);
 }
 .skills-pack-create-plus {
   font-size: 28px;
@@ -25625,11 +25813,11 @@ button.ui-refresh-button.is-loading .ui-action-icon {
   padding: 16px;
   border: 1px solid var(--border, #333);
   border-radius: 12px;
-  background: var(--card-bg, #1e1e2e);
+  background: var(--surface-raised);
   transition: border-color 0.15s ease;
 }
 .skills-pack-card:hover {
-  border-color: var(--accent, #6c8cff);
+  border-color: var(--accent);
 }
 
 .skills-pack-card-head {
@@ -25652,8 +25840,8 @@ button.ui-refresh-button.is-loading .ui-action-icon {
 }
 .skills-pack-id {
   font-size: 11px;
-  color: var(--muted, #888);
-  background: var(--code-bg, #2a2a3a);
+  color: var(--muted);
+  background: var(--surface-muted);
   padding: 1px 6px;
   border-radius: 4px;
   align-self: flex-start;
@@ -25700,7 +25888,7 @@ button.ui-refresh-button.is-loading .ui-action-icon {
   color: var(--muted, #999);
 }
 .skills-pack-meta-item strong {
-  color: var(--text, #eee);
+  color: var(--fg);
   font-size: 14px;
   margin-right: 2px;
 }
@@ -25714,7 +25902,7 @@ button.ui-refresh-button.is-loading .ui-action-icon {
   font-size: 11px;
   padding: 1px 8px;
   border-radius: 10px;
-  background: var(--tag-bg, #2a2a3a);
+  background: var(--surface-muted);
   color: var(--muted, #aaa);
 }
 
@@ -25727,8 +25915,8 @@ button.ui-refresh-button.is-loading .ui-action-icon {
   font-size: 11px;
   padding: 1px 8px;
   border-radius: 10px;
-  background: rgba(108, 140, 255, 0.12);
-  color: var(--accent, #6c8cff);
+  background: var(--accent-soft);
+  color: var(--accent);
 }
 
 .skills-pack-missing {
@@ -25770,7 +25958,7 @@ button.ui-refresh-button.is-loading .ui-action-icon {
   padding: 14px;
   border: 1px solid var(--border, #333);
   border-radius: 12px;
-  background: var(--card-bg, #1e1e2e);
+  background: var(--surface-raised);
   max-height: 70vh;
   overflow-y: auto;
 }
@@ -25814,11 +26002,11 @@ button.ui-refresh-button.is-loading .ui-action-icon {
 }
 
 .skills-bot-row.drag-over {
-  background: var(--hover-bg, rgba(108, 140, 255, 0.08));
-  box-shadow: inset 0 0 0 2px var(--accent, #6c8cff);
+  background: var(--accent-soft);
+  box-shadow: inset 0 0 0 2px var(--accent);
 }
 .skills-bot-row.drag-over td {
-  border-color: var(--accent, #6c8cff);
+  border-color: var(--accent);
 }
 
 /* Skill pack editor: truncate descriptions, make list scrollable */
@@ -25839,7 +26027,7 @@ button.ui-refresh-button.is-loading .ui-action-icon {
   transition: background 0.1s;
 }
 .skills-pack-skill-item:hover {
-  background: var(--hover-bg, rgba(255,255,255,0.04));
+  background: var(--accent-soft);
 }
 .skills-pack-skill-item input {
   margin-top: 3px;
@@ -25876,32 +26064,32 @@ button.ui-refresh-button.is-loading .ui-action-icon {
   border-radius: 12px;
   font-size: 12px;
   line-height: 1.6;
-  background: var(--tag-bg, #2a2a3a);
-  color: var(--text, #ddd);
+  background: var(--surface-muted);
+  color: var(--fg);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
   max-width: 160px;
 }
 .skills-pack-chip {
-  background: rgba(108, 140, 255, 0.15);
-  color: var(--accent, #6c8cff);
+  background: var(--accent-soft);
+  color: var(--accent);
 }
 
 /* Draggable chips in palette */
 .skills-draggable-chip {
   padding: 4px 12px;
   font-size: 12px;
-  border: 1px solid var(--border, #444);
-  background: var(--card-bg, #252535);
+  border: 1px solid var(--border);
+  background: var(--surface-raised);
   cursor: grab;
 }
 .skills-draggable-chip.skills-pack-chip {
   border-color: rgba(108, 140, 255, 0.3);
 }
 .skills-draggable-chip:hover {
-  border-color: var(--accent, #6c8cff);
-  background: var(--hover-bg, rgba(108, 140, 255, 0.08));
+  border-color: var(--accent);
+  background: var(--accent-soft);
 }
 
 /* Bot palette: drag hint, search, tag filters */
@@ -25914,13 +26102,13 @@ button.ui-refresh-button.is-loading .ui-action-icon {
   border: 1px solid rgba(108, 140, 255, 0.2);
   border-radius: 8px;
   font-size: 12px;
-  color: var(--text, #ddd);
+  color: var(--fg);
   margin: 0 0 14px;
   line-height: 1.4;
 }
 .skills-drag-icon {
   font-size: 18px;
-  color: var(--accent, #6c8cff);
+  color: var(--accent);
   flex-shrink: 0;
 }
 
@@ -25928,15 +26116,15 @@ button.ui-refresh-button.is-loading .ui-action-icon {
   width: 100%;
   padding: 6px 10px;
   margin-bottom: 8px;
-  border: 1px solid var(--border, #444);
+  border: 1px solid var(--border);
   border-radius: 6px;
-  background: var(--input-bg, #1a1a2a);
-  color: var(--text, #eee);
+  background: var(--surface-muted);
+  color: var(--fg);
   font-size: 12px;
 }
 .skills-bot-palette-search:focus {
   outline: none;
-  border-color: var(--accent, #6c8cff);
+  border-color: var(--accent);
 }
 
 .skills-bot-palette-tags {
@@ -25949,20 +26137,20 @@ button.ui-refresh-button.is-loading .ui-action-icon {
   padding: 2px 8px;
   border-radius: 10px;
   font-size: 11px;
-  border: 1px solid var(--border, #444);
+  border: 1px solid var(--border);
   background: transparent;
   color: var(--muted, #999);
   cursor: pointer;
   transition: all 0.1s;
 }
 .skills-tag-filter:hover {
-  border-color: var(--accent, #6c8cff);
-  color: var(--text, #ddd);
+  border-color: var(--accent);
+  color: var(--fg);
 }
 .skills-tag-filter.active {
-  background: var(--accent, #6c8cff);
+  background: var(--accent);
   color: #fff;
-  border-color: var(--accent, #6c8cff);
+  border-color: var(--accent);
 }
 
 /* Skill pack editor: search + select all */
@@ -25981,15 +26169,15 @@ button.ui-refresh-button.is-loading .ui-action-icon {
   flex: 1;
   max-width: 240px;
   padding: 5px 10px;
-  border: 1px solid var(--border, #444);
+  border: 1px solid var(--border);
   border-radius: 6px;
-  background: var(--input-bg, #1a1a2a);
-  color: var(--text, #eee);
+  background: var(--surface-muted);
+  color: var(--fg);
   font-size: 12px;
 }
 .skills-pack-skill-search:focus {
   outline: none;
-  border-color: var(--accent, #6c8cff);
+  border-color: var(--accent);
 }
 .skills-pack-select-all {
   display: inline-flex;
@@ -26298,7 +26486,7 @@ button.ui-refresh-button.is-loading .ui-action-icon {
 
 .schedule-form-help {
   font-size: 11px;
-  color: var(--text-dim);
+  color: var(--muted);
 }
 
 .schedule-form-help-with-count {
@@ -26354,7 +26542,7 @@ button.ui-refresh-button.is-loading .ui-action-icon {
 }
 
 .schedule-form-error {
-  color: var(--danger, #e5484d);
+  color: var(--danger);
   font-size: 12px;
   margin: 0;
 }
@@ -26397,8 +26585,396 @@ button.ui-refresh-button.is-loading .ui-action-icon {
 }
 
 .schedule-delete-button {
-  color: var(--danger, #e5484d) !important;
-  border-color: color-mix(in srgb, var(--danger, #e5484d) 48%, var(--border-soft)) !important;
+  color: var(--danger) !important;
+  border-color: color-mix(in srgb, var(--danger) 48%, var(--border-soft)) !important;
+}
+
+/* --- Skills page: cross-link chips, issue strip, focus highlights --- */
+/* Chips rendered as <button> for click-through navigation: strip default button chrome */
+button.skills-pack-chip,
+button.skills-skill-chip,
+button.skills-pack-ref-chip,
+.skills-usage-chip,
+.skills-missing-skill-chip {
+  border: none;
+  font-family: inherit;
+  cursor: pointer;
+}
+button.skills-pack-chip:hover:not(:disabled),
+button.skills-skill-chip:hover:not(:disabled),
+button.skills-pack-ref-chip:hover:not(:disabled),
+.skills-usage-chip:hover:not(:disabled) {
+  filter: brightness(1.2);
+  text-decoration: underline;
+}
+button.skills-pack-chip:disabled,
+button.skills-skill-chip:disabled,
+button.skills-pack-ref-chip:disabled,
+.skills-usage-chip:disabled {
+  cursor: default;
+  opacity: 0.7;
+  text-decoration: none;
+}
+.skills-chip-missing {
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+
+.skills-usage-chips {
+  display: inline-flex;
+  gap: 6px;
+  margin-top: 4px;
+}
+.skills-usage-chip {
+  font-size: 11px;
+  padding: 1px 8px;
+  border-radius: 10px;
+  background: var(--surface-muted);
+  color: var(--muted);
+}
+
+.skills-missing-skill-chip {
+  font-size: 11px;
+  padding: 1px 8px;
+  margin: 0 2px;
+  border-radius: 10px;
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+.skills-missing-skill-chip:hover:not(:disabled) {
+  background: var(--danger-soft);
+  text-decoration: underline;
+}
+
+.skills-issue-strip {
+  display: inline-flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+.skills-issue-badge {
+  font-size: 12px;
+  padding: 3px 10px;
+  border-radius: 12px;
+  border: none;
+  font-family: inherit;
+  white-space: nowrap;
+}
+button.skills-issue-badge {
+  cursor: pointer;
+}
+button.skills-issue-badge:hover {
+  filter: brightness(1.2);
+  text-decoration: underline;
+}
+.skills-issue-warn {
+  background: var(--warning-soft);
+  color: var(--warning);
+}
+.skills-issue-info {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+.skills-issue-ok {
+  background: var(--success-soft);
+  color: var(--success);
+}
+
+.skills-bot-row-focus {
+  background: var(--accent-soft);
+  outline: 1px solid rgba(108, 140, 255, 0.35);
+}
+
+.skills-wizard-target-hint {
+  font-size: 12px;
+  padding: 4px 10px;
+  border-radius: 8px;
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+/* Review round: pack card highlight + library name-filter chip */
+.skills-pack-card-focus {
+  outline: 1px solid rgba(108, 140, 255, 0.5);
+  background: var(--accent-soft);
+}
+.skills-library-filter-chip {
+  font-size: 12px;
+  padding: 2px 10px;
+  border: none;
+  border-radius: 12px;
+  font-family: inherit;
+  cursor: pointer;
+  background: var(--accent-soft);
+  color: var(--accent);
+  white-space: nowrap;
+}
+.skills-library-filter-chip:hover {
+  filter: brightness(1.2);
+  text-decoration: underline;
+}
+
+/* Unknown pack-health state (pack API never loaded) */
+.skills-health-unknown {
+  background: var(--surface-muted);
+  color: var(--muted);
+}
+
+/* Neutral chip for unresolvable pack refs (pack data not loaded) */
+.skills-chip-unknown {
+  background: var(--surface-muted);
+  color: var(--muted);
+}
+
+/* Actionable rows for referenced-but-not-installed skills under a filter */
+.skills-missing-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px 12px;
+  margin-bottom: 10px;
+  border: 1px dashed var(--border);
+  border-radius: 8px;
+}
+.skills-missing-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.skills-missing-row-name {
+  font-weight: 600;
+}
+.skills-missing-row button {
+  margin-left: auto;
+  font-size: 12px;
+  padding: 2px 10px;
+}
+
+/* --- Skills dialogs (install wizard / pack editor / post-install) ---------
+   These class names shipped with the pack redesign but never had any CSS, so
+   the dialogs rendered as raw UA-styled markup. Styled here against the real
+   design tokens so they match the rest of the dashboard in both themes. */
+.bd-dialog {
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-lg);
+  background: var(--surface-raised);
+  color: var(--fg);
+  padding: 0;
+  max-width: min(560px, calc(100vw - 32px));
+  width: 100%;
+  box-shadow: var(--modal-shadow);
+}
+.bd-dialog::backdrop {
+  background: var(--modal-backdrop);
+}
+.bd-dialog > form {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding: 20px 22px;
+  margin: 0;
+}
+.bd-dialog h3 {
+  margin: 0;
+  font-size: 16px;
+  font-weight: 650;
+}
+.bd-dialog label {
+  display: block;
+  font-size: 13px;
+  color: var(--muted);
+  margin-bottom: 6px;
+}
+.bd-dialog input[type="text"],
+.bd-dialog input:not([type]),
+.bd-dialog textarea {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 8px 11px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  color: var(--fg);
+  font: inherit;
+}
+.bd-dialog input:focus-visible,
+.bd-dialog textarea:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+.bd-dialog input:disabled {
+  background: var(--surface-muted);
+  color: var(--muted);
+}
+
+/* Wizard step rail: was rendering as run-together text "1.选择来源2.填写详情" */
+.skills-wizard-steps {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+  font-size: 12px;
+  color: var(--muted);
+}
+.skills-wizard-steps span {
+  padding: 3px 10px;
+  border-radius: var(--radius-full);
+  background: var(--surface-muted);
+  border: 1px solid var(--border-soft);
+  white-space: nowrap;
+}
+.skills-wizard-steps span.active {
+  background: var(--accent-soft);
+  border-color: var(--accent);
+  color: var(--accent);
+  font-weight: 600;
+}
+.skills-wizard-source-hint small,
+.skills-wizard-summary {
+  display: block;
+  font-size: 12px;
+  color: var(--muted);
+  line-height: 1.6;
+}
+.skills-wizard-summary p {
+  margin: 2px 0;
+}
+
+.skills-dialog-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  padding-top: 4px;
+  border-top: 1px solid var(--border-soft);
+  margin-top: 2px;
+}
+.skills-dialog-actions button,
+.bd-button {
+  height: var(--button-compact-height);
+  padding: 0 var(--button-padding-x);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-full);
+  background: var(--surface);
+  color: var(--fg);
+  font: inherit;
+  cursor: pointer;
+}
+.skills-dialog-actions button:hover:not(:disabled),
+.bd-button:hover:not(:disabled) {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+.skills-dialog-actions button.primary,
+.bd-button.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--on-accent);
+}
+.skills-dialog-actions button.primary:hover:not(:disabled),
+.bd-button.primary:hover:not(:disabled) {
+  background: var(--accent-strong);
+  border-color: var(--accent-strong);
+}
+.skills-dialog-actions button.danger,
+.bd-button.danger {
+  color: var(--danger);
+  border-color: var(--danger);
+  background: var(--danger-soft);
+}
+.skills-dialog-actions button:disabled,
+.bd-button:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+.bd-button.small {
+  height: 28px;
+  padding: 0 12px;
+  font-size: 12px;
+}
+
+/* Candidate / member pick lists inside dialogs */
+.skills-pack-skill-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  max-height: 260px;
+  overflow: auto;
+  padding: 6px;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+}
+.skills-pack-skill-item {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 6px 8px;
+  border-radius: var(--radius-sm);
+  margin-bottom: 0;
+  color: var(--fg);
+  cursor: pointer;
+}
+.skills-pack-skill-item:hover {
+  background: var(--accent-soft);
+}
+.skills-pack-skill-name {
+  font-weight: 600;
+}
+.skills-pack-skill-desc {
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.skills-pack-include-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  justify-content: space-between;
+}
+.skills-pack-skill-search {
+  max-width: 220px;
+}
+.skills-pack-select-all {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--muted);
+  margin: 6px 0;
+}
+.skills-resolved-preview {
+  max-height: 180px;
+  overflow: auto;
+  font-size: 12px;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-sm);
+  padding: 8px 10px;
+  background: var(--surface-muted);
+}
+.skills-resolved-item {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 2px 0;
+}
+.skills-install-selection-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 6px;
+}
+
+/* Empty states (pack grid / unavailable) */
+.skills-empty-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  padding: 28px 16px;
+  color: var(--muted);
+  text-align: center;
 }
 .feed-group-auth-overlay {
   position: fixed;
