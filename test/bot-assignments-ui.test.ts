@@ -78,6 +78,74 @@ describe('bot assignments tab', () => {
     expect(onSave).toHaveBeenCalledWith('app-1', [], ['p1']);
   });
 
+  it('explains a duplicate drop instead of silently saving or failing', async () => {
+    vi.useFakeTimers();
+    try {
+      const onSave = vi.fn(async () => {});
+      let renderer!: TestRenderer.ReactTestRenderer;
+      act(() => {
+        renderer = TestRenderer.create(React.createElement(BotAssignmentsTab, {
+          bots: [bot({ skills: { include: ['pack:p1'] } })],
+          skills,
+          statuses: {},
+          onSave,
+          packs,
+        }));
+      });
+      const root = renderer.root;
+      const palettePack = root.findByProps({
+        'data-palette-drag-type': 'pack',
+        'data-palette-drag-id': 'p1',
+      });
+      const row = root.findAllByType('tr')
+        .find((node: any) => String(node.props.className).includes('skills-bot-row'))!;
+
+      act(() => { palettePack.props.onDragStart(dragEvent()); });
+      await act(async () => { row.props.onDrop(dragEvent()); await Promise.resolve(); });
+
+      expect(onSave).not.toHaveBeenCalled();
+      expect(JSON.stringify(renderer.toJSON())).toContain('Pack 1 已在该 Bot 的配置中');
+      act(() => { vi.advanceTimersByTime(1600); });
+      expect(JSON.stringify(renderer.toJSON())).not.toContain('Pack 1 已在该 Bot 的配置中');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('keeps the Bot row highlighted while the pointer moves between its children', () => {
+    let renderer!: TestRenderer.ReactTestRenderer;
+    act(() => {
+      renderer = TestRenderer.create(React.createElement(BotAssignmentsTab, {
+        bots: [bot()],
+        skills,
+        statuses: {},
+        onSave: async () => {},
+        packs,
+      }));
+    });
+    const root = renderer.root;
+    const palettePack = root.findByProps({
+      'data-palette-drag-type': 'pack',
+      'data-palette-drag-id': 'p1',
+    });
+    const findRow = () => root.findAllByType('tr')
+      .find((node: any) => String(node.props.className).includes('skills-bot-row'))!;
+
+    act(() => { palettePack.props.onDragStart(dragEvent()); });
+    act(() => { findRow().props.onDragOver(dragEvent()); });
+    expect(findRow().props.className).toContain('drag-over');
+
+    const insideLeave = dragEvent();
+    insideLeave.relatedTarget = {};
+    insideLeave.currentTarget = { contains: () => true };
+    act(() => { findRow().props.onDragLeave(insideLeave); });
+    expect(findRow().props.className).toContain('drag-over');
+
+    const outsideLeave = dragEvent();
+    act(() => { findRow().props.onDragLeave(outsideLeave); });
+    expect(findRow().props.className).not.toContain('drag-over');
+  });
+
   it('does not copy or move an existing assignment when it is dropped on another Bot', async () => {
     const onSave = vi.fn(async () => {});
     let renderer!: TestRenderer.ReactTestRenderer;

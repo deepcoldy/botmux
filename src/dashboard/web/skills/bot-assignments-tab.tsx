@@ -29,12 +29,18 @@ type DragItem = {
   sourceBotId?: string;
 };
 
+type DuplicateDrop = {
+  botId: string;
+  itemLabel: string;
+};
+
 export function BotAssignmentsTab(props: BotAssignmentsTabProps) {
   const tr = useT();
   const [editingBot, setEditingBot] = useState<BotRow | null>(null);
   const [dragOverBot, setDragOverBot] = useState<string | null>(null);
   const [dragOverRemove, setDragOverRemove] = useState(false);
   const [dragItem, setDragItem] = useState<DragItem | null>(null);
+  const [duplicateDrop, setDuplicateDrop] = useState<DuplicateDrop | null>(null);
   const [skillQuery, setSkillQuery] = useState('');
   const [activeTag, setActiveTag] = useState<string | null>(null);
   const [highlightBots, setHighlightBots] = useState<Set<string>>(() => new Set());
@@ -53,6 +59,12 @@ export function BotAssignmentsTab(props: BotAssignmentsTabProps) {
     onFocusConsumed?.();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [focusBotIds, focusSkill]);
+
+  useEffect(() => {
+    if (!duplicateDrop) return;
+    const timer = setTimeout(() => setDuplicateDrop(null), 1600);
+    return () => clearTimeout(timer);
+  }, [duplicateDrop]);
 
   // Single relationship model: per-bot resolution, counts and health all come
   // from the same graph the other skill tables use.
@@ -87,10 +99,19 @@ export function BotAssignmentsTab(props: BotAssignmentsTabProps) {
     const currentSkills = priorityNames(bot.skills);
     const currentPacks = packIds(bot.skills);
     if (dragItem.type === 'skill') {
-      if (currentSkills.includes(dragItem.id)) return;
+      if (currentSkills.includes(dragItem.id)) {
+        setDuplicateDrop({ botId: bot.larkAppId, itemLabel: dragItem.id });
+        return;
+      }
       await props.onSave(bot.larkAppId, [...currentSkills, dragItem.id], currentPacks);
     } else {
-      if (currentPacks.includes(dragItem.id)) return;
+      if (currentPacks.includes(dragItem.id)) {
+        setDuplicateDrop({
+          botId: bot.larkAppId,
+          itemLabel: props.packs.find(pack => pack.id === dragItem.id)?.name ?? dragItem.id,
+        });
+        return;
+      }
       await props.onSave(bot.larkAppId, currentSkills, [...currentPacks, dragItem.id]);
     }
   };
@@ -132,6 +153,7 @@ export function BotAssignmentsTab(props: BotAssignmentsTabProps) {
     event.dataTransfer.effectAllowed = effect;
     // Firefox requires drag data before it will start a native HTML drag.
     event.dataTransfer.setData('text/plain', item.id);
+    setDuplicateDrop(null);
     setDragItem(item);
   };
 
@@ -275,6 +297,7 @@ export function BotAssignmentsTab(props: BotAssignmentsTabProps) {
                   const isDragOver = dragOverBot === bot.larkAppId;
                   const isFocused = highlightBots.has(bot.larkAppId)
                     || (highlightSkill != null && (botInfo?.resolved.some(entry => entry.name === highlightSkill) ?? false));
+                  const duplicateNotice = duplicateDrop?.botId === bot.larkAppId ? duplicateDrop : null;
                   return (
                     <tr
                       key={bot.larkAppId}
@@ -285,7 +308,10 @@ export function BotAssignmentsTab(props: BotAssignmentsTabProps) {
                         e.dataTransfer.dropEffect = 'copy';
                         setDragOverBot(bot.larkAppId);
                       }}
-                      onDragLeave={() => setDragOverBot(prev => prev === bot.larkAppId ? null : prev)}
+                      onDragLeave={event => {
+                        if (event.currentTarget.contains(event.relatedTarget as Node)) return;
+                        setDragOverBot(prev => prev === bot.larkAppId ? null : prev);
+                      }}
                       onDrop={e => {
                         if (!dragItem || dragItem.sourceBotId) return;
                         e.preventDefault();
@@ -371,9 +397,16 @@ export function BotAssignmentsTab(props: BotAssignmentsTabProps) {
                         </span>
                       </td>
                       <td>
-                        <button className="bd-button" onClick={() => setEditingBot(bot)}>
-                          {tr('skills.select')}
-                        </button>
+                        <div className="skills-bot-row-actions">
+                          {duplicateNotice ? (
+                            <span className="skills-duplicate-feedback" role="status" aria-live="polite">
+                              {tr('skills.alreadyAssigned', { item: duplicateNotice.itemLabel })}
+                            </span>
+                          ) : null}
+                          <button className="bd-button" onClick={() => setEditingBot(bot)}>
+                            {tr('skills.select')}
+                          </button>
+                        </div>
                       </td>
                     </tr>
                   );
