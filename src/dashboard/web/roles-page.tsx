@@ -125,6 +125,7 @@ function cloneListener(listener: MessageListenerData | null | undefined): Messag
       mode,
       includeSenderOpenIds: [...(listener?.senderPolicy?.includeSenderOpenIds ?? [])],
       excludeSenderOpenIds: [...(listener?.senderPolicy?.excludeSenderOpenIds ?? [])],
+      ...(listener?.senderPolicy?.excludeSenderKinds ? { excludeSenderKinds: { ...listener.senderPolicy.excludeSenderKinds } } : {}),
       includeSenderTypes: [...(listener?.senderPolicy?.includeSenderTypes ?? DEFAULT_LISTENER.senderPolicy?.includeSenderTypes ?? [])],
       excludeSenderTypes: [...(listener?.senderPolicy?.excludeSenderTypes ?? [])],
       excludeSelf: listener?.senderPolicy?.excludeSelf !== false,
@@ -620,6 +621,16 @@ function RolesPage(props: { tab: RolesTab }) {
     const mode = senderPolicy.mode === 'all_except_excluded' ? 'all_except_excluded' : 'include_only';
     const includeSenderOpenIds = [...new Set(senderPolicy.includeSenderOpenIds ?? [])].filter(Boolean);
     const excludeSenderOpenIds = [...new Set(senderPolicy.excludeSenderOpenIds ?? [])].filter(Boolean);
+    // Persist the sender KIND (user/bot) of each excluded id so the runtime
+    // fail-close decision can tell a muted human from a muted bot without
+    // guessing by id prefix (see message-listener senderOpenIdAllowed). Only
+    // ids the current roster resolves to a definite user/bot are recorded;
+    // 'unknown' stays absent → runtime treats it conservatively as maybe-a-bot.
+    const excludeSenderKinds: Record<string, 'user' | 'bot'> = {};
+    for (const openId of excludeSenderOpenIds) {
+      const memberType = listenerMemberById.get(openId)?.memberType;
+      if (memberType === 'user' || memberType === 'bot') excludeSenderKinds[openId] = memberType;
+    }
     const includeSenderTypes = [...new Set(senderPolicy.includeSenderTypes ?? [])].filter((type): type is SenderTypeOption => type === 'user' || type === 'bot');
     const includeMsgTypes = [...new Set(messagePolicy.includeMsgTypes ?? [])].filter(Boolean);
     return {
@@ -634,6 +645,7 @@ function RolesPage(props: { tab: RolesTab }) {
         // switch never resurrects stale open_ids from the other list.
         ...(mode === 'include_only' && includeSenderOpenIds.length > 0 ? { includeSenderOpenIds } : {}),
         ...(mode === 'all_except_excluded' && excludeSenderOpenIds.length > 0 ? { excludeSenderOpenIds } : {}),
+        ...(mode === 'all_except_excluded' && Object.keys(excludeSenderKinds).length > 0 ? { excludeSenderKinds } : {}),
         ...(includeSenderTypes.length > 0 ? { includeSenderTypes } : {}),
         excludeSelf: senderPolicy.excludeSelf !== false,
       },

@@ -27,6 +27,20 @@ function senderTypes(raw: unknown): Array<'user' | 'bot'> | undefined {
   return values.length > 0 ? [...new Set(values)] : undefined;
 }
 
+function senderKinds(
+  raw: unknown,
+  excludeSenderOpenIds: string[] | undefined,
+): Record<string, 'user' | 'bot'> | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const allowed = excludeSenderOpenIds ? new Set(excludeSenderOpenIds) : undefined;
+  const out: Record<string, 'user' | 'bot'> = {};
+  for (const [key, value] of Object.entries(raw as Record<string, unknown>)) {
+    if (!key || (allowed && !allowed.has(key))) continue;
+    if (value === 'user' || value === 'bot') out[key] = value;
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
 export function sanitizeMessageListenerUpdate(raw: unknown): MessageListenerUpdate | undefined {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
   const entry = raw as Record<string, unknown>;
@@ -45,11 +59,13 @@ export function sanitizeMessageListenerUpdate(raw: unknown): MessageListenerUpda
   const mode = rawSender.mode === 'include_only' ? 'include_only' : 'all_except_excluded';
   const includeSenderOpenIds = stringList(rawSender.includeSenderOpenIds);
   const excludeSenderOpenIds = stringList(rawSender.excludeSenderOpenIds);
+  const excludeSenderKinds = senderKinds(rawSender.excludeSenderKinds, excludeSenderOpenIds);
   const includeSenderTypes = senderTypes(rawSender.includeSenderTypes);
   const excludeSenderTypes = senderTypes(rawSender.excludeSenderTypes);
   if (mode !== 'all_except_excluded') senderPolicy.mode = mode;
   if (includeSenderOpenIds) senderPolicy.includeSenderOpenIds = includeSenderOpenIds;
   if (excludeSenderOpenIds) senderPolicy.excludeSenderOpenIds = excludeSenderOpenIds;
+  if (excludeSenderKinds) senderPolicy.excludeSenderKinds = excludeSenderKinds;
   if (includeSenderTypes) senderPolicy.includeSenderTypes = includeSenderTypes;
   if (excludeSenderTypes) senderPolicy.excludeSenderTypes = excludeSenderTypes;
   if (rawSender.excludeSelf === false) senderPolicy.excludeSelf = false;

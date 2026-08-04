@@ -69,6 +69,13 @@ export interface MessageListenerConfig {
     mode?: 'all_except_excluded' | 'include_only';
     includeSenderOpenIds?: string[];
     excludeSenderOpenIds?: string[];
+    /**
+     * Persisted sender KIND for each exclude id (open_id → 'user' | 'bot'), so
+     * the runtime fail-close decision (all_except_excluded + unverified bot
+     * sender) can tell a muted human from a muted bot WITHOUT guessing by id
+     * prefix. Absent entries fall back to a conservative "maybe a bot".
+     */
+    excludeSenderKinds?: Record<string, 'user' | 'bot'>;
     includeSenderTypes?: MessageListenerSenderType[];
     excludeSenderTypes?: MessageListenerSenderType[];
     /** Default true. */
@@ -813,6 +820,20 @@ function normalizeMessageListenerStringList(raw: unknown): string[] | undefined 
   return values.length > 0 ? [...new Set(values)] : undefined;
 }
 
+function normalizeMessageListenerSenderKinds(
+  raw: unknown,
+  excludeSenderOpenIds: string[] | undefined,
+): Record<string, 'user' | 'bot'> | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const allowed = excludeSenderOpenIds ? new Set(excludeSenderOpenIds) : undefined;
+  const out: Record<string, 'user' | 'bot'> = {};
+  for (const [key, value] of Object.entries(raw as Record<string, unknown>)) {
+    if (!key || (allowed && !allowed.has(key))) continue;
+    if (value === 'user' || value === 'bot') out[key] = value;
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
 function normalizeMessageListenerSenderTypes(raw: unknown): MessageListenerSenderType[] | undefined {
   if (!Array.isArray(raw)) return undefined;
   const values = raw
@@ -838,11 +859,13 @@ function normalizeMessageListenerConfig(raw: unknown, botIndex: number, chatId: 
   const mode = senderRaw.mode === 'include_only' ? 'include_only' : 'all_except_excluded';
   const includeSenderOpenIds = normalizeMessageListenerStringList(senderRaw.includeSenderOpenIds);
   const excludeSenderOpenIds = normalizeMessageListenerStringList(senderRaw.excludeSenderOpenIds);
+  const excludeSenderKinds = normalizeMessageListenerSenderKinds(senderRaw.excludeSenderKinds, excludeSenderOpenIds);
   const includeSenderTypes = normalizeMessageListenerSenderTypes(senderRaw.includeSenderTypes);
   const excludeSenderTypes = normalizeMessageListenerSenderTypes(senderRaw.excludeSenderTypes);
   if (mode !== 'all_except_excluded') senderPolicy.mode = mode;
   if (includeSenderOpenIds) senderPolicy.includeSenderOpenIds = includeSenderOpenIds;
   if (excludeSenderOpenIds) senderPolicy.excludeSenderOpenIds = excludeSenderOpenIds;
+  if (excludeSenderKinds) senderPolicy.excludeSenderKinds = excludeSenderKinds;
   if (includeSenderTypes) senderPolicy.includeSenderTypes = includeSenderTypes;
   if (excludeSenderTypes) senderPolicy.excludeSenderTypes = excludeSenderTypes;
   if (senderRaw.excludeSelf === false) senderPolicy.excludeSelf = false;

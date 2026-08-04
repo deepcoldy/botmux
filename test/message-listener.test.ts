@@ -540,10 +540,12 @@ describe('message listener evaluation', () => {
           prompt: 'listener',
           senderPolicy: {
             mode: 'all_except_excluded',
-            // Operator muted several PEOPLE (ou_) but wants all bots. An
-            // unverified cli_ bot can never equal an ou_ id, so nothing is
-            // being bypassed — it must still trigger.
+            // Operator muted several PEOPLE but wants all bots. Their sender
+            // KIND is persisted as 'user', so an unverified bot is provably not
+            // any of them — nothing is bypassed and it must still trigger.
+            // (Prefix is NOT used to infer this; the recorded kind is.)
             excludeSenderOpenIds: ['ou_person_a', 'ou_person_b'],
+            excludeSenderKinds: { ou_person_a: 'user', ou_person_b: 'user' },
             includeSenderTypes: ['user', 'bot'],
           },
         },
@@ -559,6 +561,65 @@ describe('message listener evaluation', () => {
       senderIdentityUnverified: true,
       explicitlyMentionedThisBot: false,
     })).toBeTruthy();
+  });
+
+  it('fails closed for an unverified bot when a BOT is excluded by ou_ open_id (prefix must not imply user)', () => {
+    const state = bot({
+      messageListeners: {
+        oc_chat: {
+          enabled: true,
+          prompt: 'listener',
+          senderPolicy: {
+            mode: 'all_except_excluded',
+            // The muted entity is a BOT whose config open_id is ou_ form. The
+            // same bot appears in the polled history as an unresolvable cli_.
+            // ou_ !== cli_ is STRING inequality, not ENTITY inequality — the
+            // recorded kind 'bot' means we cannot prove the sender is not it.
+            excludeSenderOpenIds: ['ou_muted_bot'],
+            excludeSenderKinds: { ou_muted_bot: 'bot' },
+            includeSenderTypes: ['user', 'bot'],
+          },
+        },
+      },
+    });
+
+    expect(evaluateMessageListener({
+      bot: state,
+      chatId: 'oc_chat',
+      message: textMessage(),
+      senderOpenId: 'cli_unknown_third_party',
+      senderTypeRaw: 'bot',
+      senderIdentityUnverified: true,
+      explicitlyMentionedThisBot: false,
+    })).toBeUndefined();
+  });
+
+  it('fails closed for an unverified bot when a legacy ou_ exclusion has no recorded kind (conservative)', () => {
+    const state = bot({
+      messageListeners: {
+        oc_chat: {
+          enabled: true,
+          prompt: 'listener',
+          senderPolicy: {
+            mode: 'all_except_excluded',
+            // Legacy config saved before kinds existed: no excludeSenderKinds.
+            // We cannot prove the ou_ entry is a user, so stay conservative.
+            excludeSenderOpenIds: ['ou_legacy_unknown'],
+            includeSenderTypes: ['user', 'bot'],
+          },
+        },
+      },
+    });
+
+    expect(evaluateMessageListener({
+      bot: state,
+      chatId: 'oc_chat',
+      message: textMessage(),
+      senderOpenId: 'cli_unknown_third_party',
+      senderTypeRaw: 'bot',
+      senderIdentityUnverified: true,
+      explicitlyMentionedThisBot: false,
+    })).toBeUndefined();
   });
 
   it('does not match an unverified bot under include-only (allow-list stays fail-safe)', () => {

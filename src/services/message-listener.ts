@@ -136,6 +136,30 @@ function senderTypeAllowed(listener: MessageListenerConfig, type: MessageListene
   return true;
 }
 
+/**
+ * An exclusion entry can "collide" with an unverified bot sender when we cannot
+ * prove the sender is NOT that entry. `ou_` vs `cli_` STRING inequality does not
+ * prove ENTITY inequality — the same bot is `cli_x` in the polled history and
+ * `ou_y` in config. So we classify each exclusion by its persisted sender KIND,
+ * not by id prefix:
+ *   - kind 'user'         → a human; an unverified BOT sender can never be it.
+ *   - kind 'bot'/'unknown'→ could be this unverified bot → fail closed.
+ *   - no kind recorded (legacy config, or an id in app_id/cli_ form) → treat as
+ *     a possible bot and fail closed conservatively. Prefix is only ever used to
+ *     UPGRADE an unknown entry to "definitely a bot", never to downgrade to user.
+ */
+function exclusionMayBeUnverifiedBot(
+  id: string,
+  kinds: Readonly<Record<string, 'user' | 'bot'>> | undefined,
+): boolean {
+  const kind = kinds?.[id];
+  if (kind === 'user') return false;
+  if (kind === 'bot') return true;
+  // No recorded kind: an app_id/cli_ form is certainly a bot; an ou_ (or any
+  // other) form is ambiguous under legacy configs, so stay conservative.
+  return true;
+}
+
 function senderOpenIdAllowed(
   listener: MessageListenerConfig,
   openId: string | undefined,
@@ -149,17 +173,15 @@ function senderOpenIdAllowed(
     // include list, so it simply does not match — already fail-safe.
     return contains(policy?.includeSenderOpenIds, openId);
   }
-  // all_except_excluded: an unverified sender (a bot the history API reports by
-  // app_id that we could not canonicalize to an open_id) defeats an open_id
-  // exclusion only when the exclusion itself is expressed in that same
-  // app_id/cli_ form — i.e. the operator excluded a bot we also cannot verify.
-  // In that case fail closed: we cannot prove this unverified bot is NOT the
-  // excluded one. But when EVERY exclusion is an ou_ open_id (users, or bots
-  // resolved to ou_), an unverified cli_ sender can never equal any of them, so
-  // there is no decision to bypass — allow it (this is the "listen to all bots,
-  // just mute these users" case). An empty exclude list trivially allows too.
+  // all_except_excluded: an unverified bot sender (reported by app_id, not
+  // canonicalized to an open_id) defeats an exclusion when we cannot prove the
+  // sender is NOT that excluded entry. Decide by the exclusion's persisted
+  // sender KIND, never by id prefix: only user-kind exclusions are provably
+  // disjoint from an unverified bot. Any bot/unknown/legacy exclusion fails
+  // closed. When EVERY exclusion is a known user, nothing is being bypassed, so
+  // "listen to all bots, just mute these users" keeps working. Empty list too.
   const excludes = policy?.excludeSenderOpenIds ?? [];
-  if (identityUnverified && excludes.some(id => !id.startsWith('ou_'))) {
+  if (identityUnverified && excludes.some(id => exclusionMayBeUnverifiedBot(id, policy?.excludeSenderKinds))) {
     return false;
   }
   return !contains(policy?.excludeSenderOpenIds, openId);
