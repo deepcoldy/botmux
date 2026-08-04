@@ -5353,6 +5353,7 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
        --video-covers <path>           视频封面图片（可重复，按顺序对应 --videos）
        --card-file <path>              直接发送飞书/Lark interactive 卡片 JSON
        --card-json <json>              直接发送飞书/Lark interactive 卡片 JSON 字符串
+       --owner-only                    发仅发起人可见卡（含「采纳→转全群可见」按钮）；仅普通群聊可用
        --mention <open_id:name>        @提及（可重复）
        --mention-back                  @回本轮触发消息的发送者（open_id 自动取自会话）
        --no-mention                    明确声明本条不@任何人
@@ -7038,6 +7039,11 @@ async function cmdSend(rest: string[]): Promise<void> {
   // @ hard-gate: every reply must explicitly choose one of these.
   const mentionBack = rest.includes('--mention-back');
   const noMention = rest.includes('--no-mention');
+  // --owner-only: send a card only the session owner can see (ephemeral), with an
+  // 采纳 button that publishes the same content to the whole group on click. Only
+  // works in flat 普通群 (chat scope); topic/thread/p2p reject (ephemeral has no
+  // thread anchor) → refuse with a clear hint rather than leaking a visible card.
+  const ownerOnly = rest.includes('--owner-only');
   // --attention[=kind]: raise a hand — post this message AND light the dashboard
   // needs-you column for this session. Parsed specially (not argValue) so a bare
   // `--attention "我卡住了"` doesn't eat the message as the flag value.
@@ -7137,6 +7143,65 @@ async function cmdSend(rest: string[]): Promise<void> {
     }
   }
   if (!contentFile && !customCardRequested) rejectLikelyWindowsStdinMojibake(content);
+
+  // ─── --owner-only: 仅发起人可见卡（采纳后转全群可见）────────────────────────
+  // 自包含分支：直接发 ephemeral 卡后返回，不走下方可见发送 / mention footer /
+  // quote chain 机制（ephemeral 无 thread anchor，也不 quote）。
+  if (ownerOnly) {
+    if (asVoice || images.length > 0 || files.length > 0 || videoAttachments.length > 0) {
+      console.error('botmux send: --owner-only 暂不支持语音 / 图片 / 文件 / 视频，只支持正文或 --card-json 卡片内容');
+      process.exit(2);
+    }
+    if (sendTopLevel || sendInto || overrideChatId || mentionBack || mentionArgs.length > 0) {
+      console.error('botmux send: --owner-only 不与 --top-level / --into / --chat / --mention / --mention-back 混用（卡片仅发起人可见）');
+      process.exit(2);
+    }
+    // ephemeral 只在 flat 普通群 + chat scope 生效（见 client.ts sendEphemeralCard）。
+    if (s.chatType !== 'group' || s.scope !== 'chat') {
+      console.error('botmux send: --owner-only 仅普通群聊可用；话题群 / 单聊不支持仅发起人可见卡');
+      process.exit(2);
+    }
+    const ownerModule = await import('./bot-registry.js');
+    const ownerOpenId = ownerModule.getOwnerOpenId(s.larkAppId!);
+    if (!ownerOpenId) {
+      console.error('botmux send: --owner-only 需要已配置 owner open_id');
+      process.exit(2);
+    }
+    // 内容 elements：--card-json 用其 elements；否则把正文包成 markdown 元素。
+    let contentElements: Array<Record<string, unknown>>;
+    if (customCard) {
+      const els = (customCard as { elements?: unknown }).elements;
+      if (!Array.isArray(els) || els.length === 0) {
+        console.error('botmux send: --owner-only 的 --card-json 必须含非空 elements');
+        process.exit(2);
+      }
+      contentElements = els as Array<Record<string, unknown>>;
+    } else {
+      if (!content.trim()) { console.error('botmux send: --owner-only 没有内容可发送'); process.exit(2); }
+      contentElements = [{ tag: 'markdown', content }];
+    }
+    const nonce = randomBytes(16).toString('hex');
+    const { buildOwnerPublishEphemeralCard, buildOwnerPublishPublicCard } = await import('./im/lark/owner-publish-card.js');
+    const { registerOwnerPublish } = await import('./im/lark/owner-publish-pending.js');
+    const { sendEphemeralCard } = await import('./im/lark/client.js');
+    const { localeForBot } = await import('./i18n/index.js');
+    const loc = localeForBot(s.larkAppId);
+    // 先登记待发布 payload（公开卡 = 原样内容，无按钮），再发私密卡。
+    registerOwnerPublish(nonce, {
+      ownerOpenId,
+      chatId: s.chatId,
+      publishCardJson: buildOwnerPublishPublicCard(contentElements),
+    });
+    const ephemeralCard = buildOwnerPublishEphemeralCard(contentElements, nonce, loc);
+    try {
+      const messageId = await sendEphemeralCard(s.larkAppId!, s.chatId, ownerOpenId, ephemeralCard);
+      console.log(`✓ 已发送仅你可见卡 ${messageId || '(no id)'}｜点「采纳」后转为所有人可见`);
+    } catch (err) {
+      console.error(`botmux send: 发送仅发起人可见卡失败：${err instanceof Error ? err.message : String(err)}`);
+      process.exit(1);
+    }
+    return;
+  }
 
   const managedPayloadError = managedVcSendPayloadError({
     managed: !!vcMeetingManagedSendOrigin,
