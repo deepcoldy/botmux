@@ -10600,6 +10600,7 @@ button.contrast:hover { background: var(--danger-soft); border-color: var(--dang
   align-items: center;
   justify-content: center;
   padding: 20px;
+  overflow: auto;
   background: var(--modal-backdrop);
   backdrop-filter: blur(3px);
 }

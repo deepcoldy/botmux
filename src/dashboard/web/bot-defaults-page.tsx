@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+import { createPortal } from 'react-dom';
 import { openBotOnboarding } from './bot-onboarding.js';
 import {
   agentSelectionKey,
@@ -1173,7 +1174,13 @@ function FeishuLoginModal(props: { onClose(): void; onSuccess(): void }) {
     };
   }, [begin, stopTimer]);
 
-  return (
+  if (typeof document === 'undefined') return null;
+
+  // Portal 到 body：此弹层内联渲染在头像组件的 DOM 里，而该处位于 .app-shell
+  // （height:100dvh + overflow:hidden 的滚动容器）内部——position:fixed 会被这个
+  // 容器约束、把弹层顶到视口下方，用户得滚动才看得到二维码。挂到 body 顶层后
+  // 与 auth-expired-overlay 一致，稳定居中。
+  return createPortal(
     <div
       className="feishu-login-overlay"
       onClick={event => {
@@ -1191,7 +1198,8 @@ function FeishuLoginModal(props: { onClose(): void; onSuccess(): void }) {
           <button type="button" className="primary" data-retry hidden={!retry} onClick={() => void begin()}>{tr('feishuLogin.retry')}</button>
         </div>
       </div>
-    </div>
+    </div>,
+    document.body,
   );
 }
 
