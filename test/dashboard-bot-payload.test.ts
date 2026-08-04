@@ -17,7 +17,7 @@ describe('dashboard bot payload helpers', () => {
       'overloadAlert', 'p2pMode', 'privateCard', 'regularGroupMentionMode',
       'regularGroupReplyMode', 'restrictGrantCommands', 'riff', 'sandbox', 'sandboxPaths',
       'silentTurnReactions', 'skillInjection', 'startupCommands', 'substituteMode',
-      'summaryMemory', 'summaryRange', 'writableTerminalLinkInCard',
+      'summaryMemory', 'summaryMemoryPath', 'summaryRange', 'writableTerminalLinkInCard',
     ];
     expect(Object.keys(row)).toEqual(expect.arrayContaining(editableFields));
   });
@@ -241,6 +241,7 @@ describe('dashboard bot payload helpers', () => {
     const daemon = { larkAppId: 'app_a', botName: 'BotA', cliId: 'codex' };
     expect(botDefaultsPayload(daemon, {})).toMatchObject({
       summaryMemory: false,
+      summaryMemoryPath: 'summary.md',
       summaryRange: {
         limit: 50,
         sinceHours: 24,
@@ -249,8 +250,10 @@ describe('dashboard bot payload helpers', () => {
     expect(botDefaultsPayload(daemon, {
       summaryRange: { limit: 12, sinceHours: 6 },
       summaryMemory: true,
+      summaryMemoryPath: '/tmp/botmux-summary.md',
     })).toMatchObject({
       summaryMemory: true,
+      summaryMemoryPath: '/tmp/botmux-summary.md',
       summaryRange: {
         limit: 12,
         sinceHours: 6,

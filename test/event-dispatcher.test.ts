@@ -806,6 +806,7 @@ function setupBotState(opts?: {
 	  p2pMode?: 'thread' | 'chat';
 	  summaryRange?: { limit?: number; sinceHours?: number };
 	  summaryMemory?: boolean;
+	  summaryMemoryPath?: string;
 	  substituteMode?: {
 	    enabled: boolean;
 	    targets: Array<{ openId?: string; userId?: string; unionId?: string; name?: string }>;
@@ -837,6 +838,7 @@ function setupBotState(opts?: {
 	      p2pMode: opts?.p2pMode,
 	      summaryRange: opts?.summaryRange,
 	      summaryMemory: opts?.summaryMemory,
+	      summaryMemoryPath: opts?.summaryMemoryPath,
 	      substituteMode: opts?.substituteMode,
 	    },
     botOpenId: opts && 'botOpenId' in opts ? opts.botOpenId : MY_OPEN_ID,
@@ -5902,6 +5904,7 @@ describe('im.message.receive_v1 — /summary command', () => {
       allowedUsers: [USER_OPEN_ID],
       summaryRange: { limit: 0, sinceHours: 0 },
       summaryMemory: true,
+      summaryMemoryPath: '/tmp/botmux-summary.md',
     });
     const triggerMs = 100 * 60 * 60_000;
     mockListChatMessagesUntil.mockResolvedValue([
@@ -5942,12 +5945,13 @@ describe('im.message.receive_v1 — /summary command', () => {
 
     const ctx = handlers.handleNewTopic.mock.calls[0][1] as any;
     expect(ctx.promptOverride).toContain('summary_memory="true"');
+    expect(ctx.promptOverride).toContain('summary_memory_path="/tmp/botmux-summary.md"');
     expect(ctx.promptOverride).toContain('window="explicit-boundary"');
     expect(ctx.promptOverride).toContain('<explicit_boundary>');
     expect(ctx.promptOverride).toContain('从 start_pipeline 报错开始');
     expect(ctx.promptOverride).not.toContain('边界前不该写入');
-    expect(ctx.promptOverride).toContain('只允许创建或追加当前项目根目录的 summary.md');
-    expect(ctx.promptOverride).toContain('实际追加到 summary.md 的 Markdown 原样发给用户确认');
+    expect(ctx.promptOverride).toContain('只允许创建或追加 /tmp/botmux-summary.md');
+    expect(ctx.promptOverride).toContain('实际追加到 /tmp/botmux-summary.md 的 Markdown 原样发给用户确认');
     expect(ctx.promptOverride).toContain('不能擅自扩展范围');
   });
 

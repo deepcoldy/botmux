@@ -71,6 +71,7 @@ export type BotDefaultsRow = {
   botToBotSameDir?: boolean;
   summaryRange?: { limit?: number; sinceHours?: number };
   summaryMemory?: boolean;
+  summaryMemoryPath?: string;
   p2pMode?: string;
   regularGroupReplyMode?: string;
   regularGroupMentionMode?: string;

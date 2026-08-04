@@ -12,6 +12,7 @@ export interface SummaryCommandMatch {
   range: SummaryRangePrefs;
   prompt: string;
   summaryMemory: boolean;
+  summaryMemoryPath: string;
 }
 
 export interface SummaryCommandRuntimeContext {
@@ -271,14 +272,15 @@ function summaryInstruction(match: SummaryCommandMatch, explicitBoundary: string
     ? '\n如果 /summary 命令后带了文字，那段文字就是用户指定的总结边界；只能在这个边界内总结，不能擅自扩展范围或补写边界外内容。'
     : '';
   if (!match.summaryMemory) return `${base}${boundaryRule}`;
+  const memoryPath = match.summaryMemoryPath || 'summary.md';
   return [
-    '请基于提供的历史生成中文问题解决记录，并追加写入当前项目根目录的 summary.md。',
+    `请基于提供的历史生成中文问题解决记录，并追加写入配置的记忆文件路径：${memoryPath}。`,
     '必须遵守：',
-    '1. 只允许创建或追加当前项目根目录的 summary.md；不要写入、修改任何其他记忆文件或长期记忆位置。',
+    `1. 只允许创建或追加 ${memoryPath}；如果它是相对路径，按当前项目根目录解析；如果它是绝对路径，按原样使用。不要写入、修改任何其他记忆文件或长期记忆位置。`,
     '2. 不要改业务代码，不要写 AGENTS.md、CLAUDE.md、~/.trae/cli/memories 或其他 memory 文件。',
     '3. 写入的 Markdown 必须包含：总结内容、问题、解决方案、可复用条件。可复用条件里尽量保留 PSM、环境、任务 ID、节点、错误现象等必要匹配条件。',
     '4. 如果 /summary 命令后带了文字，那段文字就是用户指定的总结边界；只能在这个边界内总结，不能擅自扩展范围或补写边界外内容。',
-    '5. 写入后，把实际追加到 summary.md 的 Markdown 原样发给用户确认，不要只说已写入。',
+    `5. 写入后，把实际追加到 ${memoryPath} 的 Markdown 原样发给用户确认，不要只说已写入。`,
     '6. 这不是通用长期记忆，而是一个由用户显式触发、写在项目目录里、严格按条件匹配复用的问题解决记录本。',
     '',
     `原始总结要求：${base}`,
@@ -297,7 +299,7 @@ function buildPromptBody(input: {
   const scope = match.chatKind === 'topic' ? 'current-thread' : 'regular-group';
   const explicitBoundary = match.summaryMemory ? explicitBoundaryFromTrigger(match.triggerText) : undefined;
   const lines = [
-    `<summary_command scope="${scope}" summary_memory="${match.summaryMemory ? 'true' : 'false'}">`,
+    `<summary_command scope="${scope}" summary_memory="${match.summaryMemory ? 'true' : 'false'}" summary_memory_path="${xmlEscape(match.summaryMemoryPath || 'summary.md')}">`,
     '<command_message>',
     xmlEscape(match.triggerText),
     '</command_message>',

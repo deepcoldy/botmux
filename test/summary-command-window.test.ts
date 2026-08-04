@@ -45,12 +45,18 @@ const trigger = msg('trigger', '@_bot_a /summary', T, {
   mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: BOT_OPEN_ID } }],
 });
 
+const DEFAULT_MATCH_BASE = {
+  chatKind: 'regularGroup' as const,
+  prompt: 'summarize',
+  summaryMemoryPath: 'summary.md',
+};
+
 async function run(range = { limit: 0, sinceHours: 0 }) {
   return buildSummaryCommandPrompt({
     larkAppId: 'app',
     chatId: 'chat',
     message: trigger,
-    match: { chatKind: 'regularGroup', triggerText: '/summary', range, prompt: 'summarize', summaryMemory: false },
+    match: { ...DEFAULT_MATCH_BASE, triggerText: '/summary', range, summaryMemory: false },
   });
 }
 
@@ -110,7 +116,7 @@ describe('regular-group /summary window (faithful stopper)', () => {
       larkAppId: 'app',
       chatId: 'chat',
       message: focusTrigger,
-      match: { chatKind: 'regularGroup', triggerText: '/summary 从错误开始', range: { limit: 0, sinceHours: 0 }, prompt: 'summarize', summaryMemory: false },
+      match: { ...DEFAULT_MATCH_BASE, triggerText: '/summary 从错误开始', range: { limit: 0, sinceHours: 0 }, summaryMemory: false },
     });
     expect(prompt).toContain('summary_memory="false"');
     expect(prompt).not.toContain('<explicit_boundary>');
@@ -133,7 +139,7 @@ describe('regular-group /summary window (faithful stopper)', () => {
       larkAppId: 'app',
       chatId: 'chat',
       message: boundedTrigger,
-      match: { chatKind: 'regularGroup', triggerText: '/summary 从错误开始', range: { limit: 0, sinceHours: 0 }, prompt: 'summarize', summaryMemory: true },
+      match: { ...DEFAULT_MATCH_BASE, triggerText: '/summary 从错误开始', range: { limit: 0, sinceHours: 0 }, summaryMemory: true },
     });
     expect(bounded).toContain('window="explicit-boundary"');
     expect(bounded).toContain('从错误开始');
@@ -148,7 +154,7 @@ describe('regular-group /summary window (faithful stopper)', () => {
       larkAppId: 'app',
       chatId: 'chat',
       message: boundedTrigger,
-      match: { chatKind: 'regularGroup', triggerText: '/summary 找不到边界', range: { limit: 0, sinceHours: 0 }, prompt: 'summarize', summaryMemory: true },
+      match: { ...DEFAULT_MATCH_BASE, triggerText: '/summary 找不到边界', range: { limit: 0, sinceHours: 0 }, summaryMemory: true },
     });
     expect(missing).toContain('explicit boundary not found');
     expect(missing).not.toContain('不能擅自扩展进去的内容');
@@ -169,7 +175,7 @@ describe('regular-group /summary window (faithful stopper)', () => {
       larkAppId: 'app',
       chatId: 'chat',
       message: boundedTrigger,
-      match: { chatKind: 'regularGroup', triggerText: '/summary 找不到边界', range: { limit: 2, sinceHours: 0 }, prompt: 'summarize', summaryMemory: true },
+      match: { ...DEFAULT_MATCH_BASE, triggerText: '/summary 找不到边界', range: { limit: 2, sinceHours: 0 }, summaryMemory: true },
     });
     expect(prompt).toContain('explicit boundary not found');
     expect(prompt).not.toContain('scan-1');

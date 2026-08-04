@@ -633,14 +633,21 @@ function renderWhiteboardBlock(opts?: { whiteboardId?: string }): string {
 function renderSummaryMemoryBlock(larkAppId: string | undefined): string {
   if (!larkAppId) return '';
   let enabled = false;
-  try { enabled = getBot(larkAppId).config.summaryMemory === true; } catch { return ''; }
+  let memoryPath = 'summary.md';
+  try {
+    const cfg = getBot(larkAppId).config;
+    enabled = cfg.summaryMemory === true;
+    memoryPath = typeof cfg.summaryMemoryPath === 'string' && cfg.summaryMemoryPath.trim()
+      ? cfg.summaryMemoryPath.trim()
+      : 'summary.md';
+  } catch { return ''; }
   if (!enabled) return '';
   return [
     '<summary_memory>',
-    '项目根目录可能存在 summary.md。这不是通用长期记忆，而是用户显式通过 /summary 写入当前项目的问题解决记录本。',
-    '处理后续问题时，如果当前项目根目录存在 summary.md，必须先读取；但只有 PSM、环境、任务 ID、节点、错误现象等必要条件全部完全一致，才可以直接复用历史答案。',
-    '如果任一关键条件缺失、不一致或不确定，只能把 summary.md 当排查参考，不能套用结论。',
-    '不要因为本规则主动写 summary.md；只有用户显式触发 /summary 且本 bot 开启记忆时，才按 /summary 指令追加 summary.md。',
+    `配置的记忆文件路径是 ${memoryPath}。如果它是相对路径，按当前项目根目录解析；如果它是绝对路径，按原样使用。这不是通用长期记忆，而是用户显式通过 /summary 写入的问题解决记录本。`,
+    `处理后续问题时，如果该路径存在，必须先读取 ${memoryPath}；但只有 PSM、环境、任务 ID、节点、错误现象等必要条件全部完全一致，才可以直接复用历史答案。`,
+    `如果任一关键条件缺失、不一致或不确定，只能把 ${memoryPath} 当排查参考，不能套用结论。`,
+    `不要因为本规则主动写 ${memoryPath}；只有用户显式触发 /summary 且本 bot 开启记忆时，才按 /summary 指令追加该文件。`,
     '</summary_memory>',
   ].join('\n');
 }

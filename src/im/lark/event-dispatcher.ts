@@ -2286,6 +2286,9 @@ async function resolveSummaryCommandMatch(input: {
     range: summaryRangeFromBotConfig(botConfig),
     prompt: DEFAULT_SUMMARY_PROMPT,
     summaryMemory: botConfig.summaryMemory === true,
+    summaryMemoryPath: typeof botConfig.summaryMemoryPath === 'string' && botConfig.summaryMemoryPath.trim()
+      ? botConfig.summaryMemoryPath.trim()
+      : 'summary.md',
   };
 }
 

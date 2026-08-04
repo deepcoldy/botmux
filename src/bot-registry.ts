@@ -1505,6 +1505,8 @@ export interface BotConfig {
   summaryRange?: SummaryRangeConfig;
   /** When true, explicit `@bot /summary` records a conservative project-local summary.md. */
   summaryMemory?: boolean;
+  /** Optional target path for summary memory. Relative paths are resolved by the agent against the current project root; absolute paths are used as configured. */
+  summaryMemoryPath?: string;
   /**
    * Legacy content/keyword trigger config. Kept parseable for config
    * compatibility, but message routing no longer fires non-@ content triggers.
@@ -2438,6 +2440,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       : undefined;
     const summaryRange = normalizeSummaryRange(entry.summaryRange ?? entry.summary);
     const summaryMemory = entry.summaryMemory === true ? true : undefined;
+    const summaryMemoryPath = normalizeNonEmptyString(entry.summaryMemoryPath);
     const contentTriggers = normalizeContentTriggers(entry.contentTriggers, i);
     const messageListeners = normalizeMessageListeners(entry.messageListeners, i);
     const vcMeetingAgent = normalizeVcMeetingAgentConfig(entry.vcMeetingAgent);
@@ -2620,6 +2623,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         : undefined,
       summaryRange,
       summaryMemory,
+      summaryMemoryPath,
       contentTriggers,
       voice,
     });

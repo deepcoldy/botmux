@@ -439,6 +439,7 @@ function patchCardPrefsFromBody(bot: BotDefaultsRow, body: any): BotDefaultsRow 
     writableTerminalLinkInCard: body.writableTerminalLinkInCard,
     privateCard: body.privateCard,
     summaryMemory: body.summaryMemory,
+    summaryMemoryPath: body.summaryMemoryPath,
     botToBotSameDir: body.botToBotSameDir,
     autoStartOnGroupJoin: body.autoStartOnGroupJoin,
     autoStartOnGroupJoinPrompt: body.autoStartOnGroupJoinPrompt,
@@ -2418,6 +2419,7 @@ function SummaryTriggerSection(props: { bot: BotDefaultsRow; patchBot: PatchBot;
   const [limit, setLimit] = useState(String(initial.limit));
   const [sinceHours, setSinceHours] = useState(String(initial.sinceHours));
   const [memoryOn, setMemoryOn] = useState(props.bot.summaryMemory === true);
+  const [memoryPath, setMemoryPath] = useState(summaryMemoryPath(props.bot));
   const [status, setStatus] = useState<StatusMessage>(null);
   const [memoryStatus, setMemoryStatus] = useState<StatusMessage>(null);
   const [busy, setBusy] = useState(false);
@@ -2428,7 +2430,8 @@ function SummaryTriggerSection(props: { bot: BotDefaultsRow; patchBot: PatchBot;
     setLimit(String(next.limit));
     setSinceHours(String(next.sinceHours));
     setMemoryOn(props.bot.summaryMemory === true);
-  }, [props.bot.summaryRange?.limit, props.bot.summaryRange?.sinceHours, props.bot.summaryMemory]);
+    setMemoryPath(summaryMemoryPath(props.bot));
+  }, [props.bot.summaryRange?.limit, props.bot.summaryRange?.sinceHours, props.bot.summaryMemory, props.bot.summaryMemoryPath]);
 
   async function save(): Promise<void> {
     setStatus(null);
@@ -2461,24 +2464,31 @@ function SummaryTriggerSection(props: { bot: BotDefaultsRow; patchBot: PatchBot;
     }
   }
 
-  async function saveMemory(next: boolean): Promise<void> {
+  async function saveMemory(next: boolean, nextPath = memoryPath): Promise<void> {
     const prev = memoryOn;
+    const prevPath = memoryPath;
+    const normalizedPath = normalizeSummaryMemoryPath(nextPath);
     setMemoryOn(next);
+    setMemoryPath(normalizedPath);
     setMemoryStatus(null);
     setMemoryBusy(true);
     try {
-      const res = await props.putCardPref({ summaryMemory: next });
+      const res = await props.putCardPref({ summaryMemory: next, summaryMemoryPath: normalizedPath });
       if (res.ok && res.body.ok) {
         const saved = res.body.summaryMemory === true;
+        const savedPath = summaryMemoryPath({ ...props.bot, summaryMemoryPath: res.body.summaryMemoryPath });
         setMemoryOn(saved);
-        props.patchBot(props.bot.larkAppId, { summaryMemory: saved });
+        setMemoryPath(savedPath);
+        props.patchBot(props.bot.larkAppId, { summaryMemory: saved, summaryMemoryPath: savedPath });
         setMemoryStatus({ text: `✓ ${tr('botDefaults.cardPrefSaved')}`, ok: true });
       } else {
         setMemoryOn(prev);
+        setMemoryPath(prevPath);
         setMemoryStatus({ text: `✗ ${responseErrorText(res)}` });
       }
     } catch (e: any) {
       setMemoryOn(prev);
+      setMemoryPath(prevPath);
       setMemoryStatus({ text: `✗ ${caughtErrorText(e)}` });
     } finally {
       setMemoryBusy(false);
@@ -2509,9 +2519,27 @@ function SummaryTriggerSection(props: { bot: BotDefaultsRow; patchBot: PatchBot;
         help={tr('botDefaults.summaryMemoryHelp')}
         onChange={checked => void saveMemory(checked)}
       />
+      <div className="bd-row bd-summary-limits">
+        <label>
+          <span>{tr('botDefaults.summaryMemoryPath')}</span>
+          <input type="text" data-input="summaryMemoryPath" value={memoryPath} disabled={memoryBusy} onChange={event => setMemoryPath(event.currentTarget.value)} />
+        </label>
+      </div>
+      <div className="actions">
+        <button type="button" className="primary" data-action="save-summary-memory-path" disabled={memoryBusy} onClick={() => void saveMemory(memoryOn, memoryPath)}>{tr('botDefaults.summaryMemoryPathSave')}</button>
+      </div>
       <div className="actions"><StatusSpan status={memoryStatus} attr={{ 'data-summary-memory-status': '' }} /></div>
     </section>
   );
+}
+
+function normalizeSummaryMemoryPath(raw: string): string {
+  const value = raw.trim();
+  return value || 'summary.md';
+}
+
+function summaryMemoryPath(bot: Pick<BotDefaultsRow, 'summaryMemoryPath'>): string {
+  return normalizeSummaryMemoryPath(typeof bot.summaryMemoryPath === 'string' ? bot.summaryMemoryPath : '');
 }
 
 function summaryRange(bot: BotDefaultsRow): { limit: number; sinceHours: number } {
