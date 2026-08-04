@@ -100,7 +100,15 @@ export function resolveExcludeSenderKinds(
   const out: Record<string, 'user' | 'bot'> = {};
   for (const openId of excludeSenderOpenIds) {
     if (!openId) continue;
-    const kind = liveKindOf(openId) ?? persistedKinds?.[openId];
+    // Only a DEFINITE live kind (user|bot) overrides the persisted value. A live
+    // 'unknown' is not nullish, so `?? persisted` would wrongly short-circuit on
+    // it and then get filtered out below — re-erasing a known kind whenever the
+    // members API returns an unknown/absent member_type. Treat 'unknown' like
+    // absent and fall back to the persisted kind.
+    const liveKind = liveKindOf(openId);
+    const kind = liveKind === 'user' || liveKind === 'bot'
+      ? liveKind
+      : persistedKinds?.[openId];
     if (kind === 'user' || kind === 'bot') out[openId] = kind;
   }
   return out;

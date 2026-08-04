@@ -155,6 +155,17 @@ describe('resolveExcludeSenderKinds — persisted kind must survive a roster fai
     expect(resolveExcludeSenderKinds(['ou_maybe'], () => 'unknown')).toEqual({});
   });
 
+  it('a live "unknown" does NOT truncate the persisted-kind fallback (delta review P2)', () => {
+    // members API returned the id but with unknown/absent member_type. 'unknown'
+    // is not nullish, so a naive `live ?? persisted` would keep it and then drop
+    // it via the user|bot filter — re-erasing the known kind. Must fall back.
+    expect(
+      resolveExcludeSenderKinds(['ou_x'], () => 'unknown', { ou_x: 'user' }),
+    ).toEqual({ ou_x: 'user' });
+    // …and with no persisted kind either, still absent → fail-close.
+    expect(resolveExcludeSenderKinds(['ou_x'], () => 'unknown')).toEqual({});
+  });
+
   it('skips empty ids', () => {
     expect(resolveExcludeSenderKinds(['', 'ou_person'], liveKind)).toEqual({ ou_person: 'user' });
   });
