@@ -16,13 +16,14 @@ const updateMessageMock = vi.fn(async () => {});
 const addReactionMock = vi.fn(async () => 'reaction_id');
 const replyToDocCommentMock = vi.fn(async () => {});
 const removeCommentReactionMock = vi.fn(async () => {});
+const deleteMessageMock = vi.fn(async () => true);
 const updateSessionMock = vi.fn();
 vi.mock('../src/im/lark/client.js', () => ({
   updateMessage: (...args: any[]) => updateMessageMock(...args),
   addReaction: (...args: any[]) => addReactionMock(...args),
   removeReaction: vi.fn(async () => {}),
   sendUserMessage: vi.fn(async () => {}),
-  deleteMessage: vi.fn(async () => {}),
+  deleteMessage: (...args: any[]) => deleteMessageMock(...args),
   getChatInfo: vi.fn(),
   MessageWithdrawnError: class MessageWithdrawnError extends Error {
     constructor(id: string) { super(`withdrawn: ${id}`); this.name = 'MessageWithdrawnError'; }
@@ -2074,5 +2075,182 @@ describe('Worker turn_terminal routing', () => {
       turnId: 'om_replacement',
     });
     expect(onCliExit).not.toHaveBeenCalled();
+  });
+});
+
+describe('Completed streaming-card recall', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.clearAllMocks();
+  });
+
+  afterEach(() => {
+    vi.clearAllTimers();
+    vi.useRealTimers();
+  });
+
+  function makeCardDs(turnId = 'turn-1'): DaemonSession {
+    const ds = makeDs();
+    ds.streamCardId = 'om_status_card';
+    ds.streamCardNonce = 'nonce-1';
+    ds.streamCardTurnId = turnId;
+    ds.lastScreenStatus = 'idle';
+    return ds;
+  }
+
+  it('recalls the exact status card after fallback output is delivered and the turn completes', async () => {
+    const sessionReply = vi.fn(async () => 'om_final_reply');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const ds = makeCardDs();
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+
+    (ds.worker as any).emit('message', {
+      ...finalOutputMsg(),
+      sessionId: ds.session.sessionId,
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    (ds.worker as any).emit('message', {
+      type: 'turn_terminal',
+      sessionId: ds.session.sessionId,
+      turnId: 'turn-1',
+      status: 'completed',
+    } satisfies Extract<WorkerToDaemon, { type: 'turn_terminal' }>);
+    await Promise.resolve();
+
+    expect(deleteMessageMock).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1_000);
+
+    expect(deleteMessageMock).toHaveBeenCalledWith('app_test', 'om_status_card');
+    expect(ds.streamCardId).toBeUndefined();
+    expect(ds.streamCardNonce).toBeUndefined();
+    expect(ds.streamCardTurnId).toBeUndefined();
+    expect(ds.recalledStreamCardTurnId).toBe('turn-1');
+
+    // A trailing idle redraw from the completed worker must not recreate the
+    // status card after the withdraw succeeds.
+    (ds.worker as any).emit('message', {
+      type: 'screen_update',
+      content: 'idle after completed turn',
+      status: 'idle',
+      turnId: 'turn-1',
+    } satisfies Extract<WorkerToDaemon, { type: 'screen_update' }>);
+    await Promise.resolve();
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+  });
+
+  it('also recalls after a successful explicit botmux send and completed terminal', async () => {
+    initWorkerPool({
+      sessionReply: vi.fn(async () => 'unused'),
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const ds = makeCardDs('turn-explicit');
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+
+    (ds.worker as any).emit('message', {
+      type: 'explicit_reply_observed',
+      turnId: 'turn-explicit',
+      messageId: 'om_explicit_reply',
+    } satisfies Extract<WorkerToDaemon, { type: 'explicit_reply_observed' }>);
+    (ds.worker as any).emit('message', {
+      type: 'turn_terminal',
+      sessionId: ds.session.sessionId,
+      turnId: 'turn-explicit',
+      status: 'completed',
+    } satisfies Extract<WorkerToDaemon, { type: 'turn_terminal' }>);
+    await Promise.resolve();
+    await vi.advanceTimersByTimeAsync(1_000);
+
+    expect(deleteMessageMock).toHaveBeenCalledWith('app_test', 'om_status_card');
+  });
+
+  it('keeps the card when the turn fails or no result was delivered', async () => {
+    initWorkerPool({
+      sessionReply: vi.fn(async () => 'om_final_reply'),
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const failed = makeCardDs('turn-failed');
+    __testOnly_setupWorkerHandlers(failed, failed.worker as any);
+    (failed.worker as any).emit('message', {
+      type: 'explicit_reply_observed', turnId: 'turn-failed', messageId: 'om_reply',
+    } satisfies Extract<WorkerToDaemon, { type: 'explicit_reply_observed' }>);
+    (failed.worker as any).emit('message', {
+      type: 'turn_terminal', sessionId: failed.session.sessionId,
+      turnId: 'turn-failed', status: 'failed', errorCode: 'cli_failed',
+    } satisfies Extract<WorkerToDaemon, { type: 'turn_terminal' }>);
+
+    const noResult = makeCardDs('turn-no-result');
+    __testOnly_setupWorkerHandlers(noResult, noResult.worker as any);
+    (noResult.worker as any).emit('message', {
+      type: 'turn_terminal', sessionId: noResult.session.sessionId,
+      turnId: 'turn-no-result', status: 'completed',
+    } satisfies Extract<WorkerToDaemon, { type: 'turn_terminal' }>);
+    await Promise.resolve();
+    await vi.advanceTimersByTimeAsync(15_000);
+
+    expect(deleteMessageMock).not.toHaveBeenCalled();
+    expect(failed.streamCardId).toBe('om_status_card');
+    expect(noResult.streamCardId).toBe('om_status_card');
+  });
+
+  it('does not withdraw the old card after a newer turn starts during the grace period', async () => {
+    initWorkerPool({
+      sessionReply: vi.fn(async () => 'unused'),
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const ds = makeCardDs('turn-old');
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+    (ds.worker as any).emit('message', {
+      type: 'explicit_reply_observed', turnId: 'turn-old', messageId: 'om_reply',
+    } satisfies Extract<WorkerToDaemon, { type: 'explicit_reply_observed' }>);
+    (ds.worker as any).emit('message', {
+      type: 'turn_terminal', sessionId: ds.session.sessionId,
+      turnId: 'turn-old', status: 'completed',
+    } satisfies Extract<WorkerToDaemon, { type: 'turn_terminal' }>);
+    await Promise.resolve();
+
+    ds.streamCardPending = true;
+    await vi.advanceTimersByTimeAsync(1_000);
+
+    expect(deleteMessageMock).not.toHaveBeenCalled();
+    expect(ds.streamCardId).toBe('om_status_card');
+  });
+
+  it('retains the card when Lark rejects every recall attempt', async () => {
+    deleteMessageMock
+      .mockResolvedValueOnce(false)
+      .mockResolvedValueOnce(false)
+      .mockResolvedValueOnce(false);
+    initWorkerPool({
+      sessionReply: vi.fn(async () => 'unused'),
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const ds = makeCardDs('turn-recall-fails');
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+    (ds.worker as any).emit('message', {
+      type: 'explicit_reply_observed', turnId: 'turn-recall-fails', messageId: 'om_reply',
+    } satisfies Extract<WorkerToDaemon, { type: 'explicit_reply_observed' }>);
+    (ds.worker as any).emit('message', {
+      type: 'turn_terminal', sessionId: ds.session.sessionId,
+      turnId: 'turn-recall-fails', status: 'completed',
+    } satisfies Extract<WorkerToDaemon, { type: 'turn_terminal' }>);
+    await Promise.resolve();
+    await vi.advanceTimersByTimeAsync(14_000);
+
+    expect(deleteMessageMock).toHaveBeenCalledTimes(3);
+    expect(ds.streamCardId).toBe('om_status_card');
+    expect(ds.recalledStreamCardTurnId).toBeUndefined();
   });
 });

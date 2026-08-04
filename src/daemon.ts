@@ -3957,6 +3957,7 @@ function beginNewTurn(ds: DaemonSession, title: string): void {
   // in. A new turn returns to the config default (noCardChats / disableStreamingCard).
   // Use `/card on` to persistently restore cards for the chat.
   ds.streamingCardForced = undefined;
+  ds.recalledStreamCardTurnId = undefined;
   const previousUsageLimit = ds.usageLimit;
   const previousStatus = ds.lastScreenStatus === 'limited' && previousUsageLimit ? 'limited' : 'idle';
   if (ds.streamCardId && workerHasInitialized(ds)) {
@@ -17562,6 +17563,7 @@ async function handleThreadReply(
     parkStreamCard(ds);
     ds.streamCardId = undefined;
     ds.streamCardNonce = undefined;
+    ds.streamCardTurnId = undefined;
     // This is a new turn even though the worker is currently down. Force the
     // first screen_update from the re-forked worker to POST a fresh card and
     // drop any persisted screenshot from the previous turn. Otherwise a stale
@@ -18014,6 +18016,7 @@ async function handleDocComment(ctx: DocCommentContext): Promise<boolean> {
       parkStreamCard(ds);
       ds.streamCardId = undefined;
       ds.streamCardNonce = undefined;
+      ds.streamCardTurnId = undefined;
       ds.streamCardPending = true;
       ds.currentImageKey = undefined;
       persistStreamCardState(ds);

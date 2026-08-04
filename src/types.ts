@@ -337,6 +337,9 @@ export interface Session {
    *  (rather than a fresh POST) after daemon restart. */
   streamCardId?: string;
   streamCardNonce?: string;
+  /** Exact turn represented by streamCardId. Completion recall uses this
+   *  binding so a late terminal cannot withdraw a newer turn's card. */
+  streamCardTurnId?: string;
   /** Legacy field kept for migrating sessions persisted before displayMode was added. */
   streamExpanded?: boolean;
   /** Card body display mode — 'hidden' | 'screenshot'. */

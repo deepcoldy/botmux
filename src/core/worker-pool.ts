@@ -1014,6 +1014,111 @@ export function recallFrozenCards(ds: DaemonSession): void {
   logger.info(`[${tag(ds)}] Recalled ${targets.length} previous streaming card(s)`);
 }
 
+const COMPLETED_CARD_RECALL_BACKOFF_MS = [1_000, 3_000, 10_000] as const;
+const COMPLETED_CARD_TURN_TTL_MS = 30 * 60_000;
+const COMPLETED_CARD_TURN_MAX = 32;
+
+function pruneStreamCardCompletionTurns(ds: DaemonSession): void {
+  const states = ds.streamCardCompletionTurns;
+  if (!states) return;
+  const cutoff = Date.now() - COMPLETED_CARD_TURN_TTL_MS;
+  for (const [turnId, state] of states) {
+    if (!state.recallTimer && state.updatedAt < cutoff) states.delete(turnId);
+  }
+  if (states.size <= COMPLETED_CARD_TURN_MAX) return;
+  [...states.entries()]
+    .filter(([, state]) => !state.recallTimer)
+    .sort((a, b) => a[1].updatedAt - b[1].updatedAt)
+    .slice(0, states.size - COMPLETED_CARD_TURN_MAX)
+    .forEach(([turnId]) => states.delete(turnId));
+}
+
+function streamCardCompletionState(ds: DaemonSession, turnId: string) {
+  const states = ds.streamCardCompletionTurns ??= new Map();
+  const state = states.get(turnId) ?? { updatedAt: Date.now() };
+  state.updatedAt = Date.now();
+  states.set(turnId, state);
+  pruneStreamCardCompletionTurns(ds);
+  return state;
+}
+
+/**
+ * 撤回已完成轮次的状态卡。终态与结果送达可能以任意顺序到达，因此先按 turn
+ * 汇合两份证据；真正删除前再次校验卡片身份和新轮次状态，避免晚到事件误删新卡。
+ */
+function scheduleCompletedStreamCardRecall(ds: DaemonSession, turnId: string): void {
+  const state = ds.streamCardCompletionTurns?.get(turnId);
+  if (!state?.terminalCompleted || !state.resultDelivered || state.recallTimer) return;
+  if (!ds.streamCardId || ds.streamCardId === CARD_POSTING_SENTINEL) return;
+  if (ds.streamCardTurnId !== turnId || ds.streamCardPending || ds.session.status !== 'active') return;
+
+  const cardId = ds.streamCardId;
+  const attempt = state.recallAttempts ?? 0;
+  const delayMs = COMPLETED_CARD_RECALL_BACKOFF_MS[attempt];
+  if (delayMs === undefined) return;
+  state.recallTimer = setTimeout(async () => {
+    state.recallTimer = undefined;
+    if (ds.streamCardId !== cardId
+      || ds.streamCardTurnId !== turnId
+      || ds.streamCardPending
+      || ds.session.status !== 'active') {
+      return;
+    }
+
+    let recalled = false;
+    try {
+      recalled = await deleteMessage(ds.larkAppId, cardId);
+    } catch (err) {
+      logger.debug(`[${tag(ds)}] Failed to recall completed streaming card: ${err}`);
+    }
+    if (!recalled) {
+      state.recallAttempts = attempt + 1;
+      state.updatedAt = Date.now();
+      scheduleCompletedStreamCardRecall(ds, turnId);
+      return;
+    }
+
+    ds.streamCardId = undefined;
+    ds.streamCardNonce = undefined;
+    ds.streamCardTurnId = undefined;
+    ds.currentImageKey = undefined;
+    ds.recalledStreamCardTurnId = turnId;
+    clearUsageRefreshTimer(ds);
+    if (ds.pendingCardId === cardId) {
+      ds.pendingCardId = undefined;
+      ds.pendingCardJson = undefined;
+    }
+    if (ds.frozenCards) {
+      for (const [nonce, frozen] of ds.frozenCards) {
+        if (frozen.messageId === cardId) ds.frozenCards.delete(nonce);
+      }
+      saveFrozenCards(ds.session.sessionId, ds.frozenCards);
+    }
+    ds.streamCardCompletionTurns?.delete(turnId);
+    persistStreamCardState(ds);
+    logger.info(`[${tag(ds)}] Recalled completed streaming card for turn ${turnId.substring(0, 12)}`);
+  }, delayMs);
+}
+
+function bindStreamCardToTurn(ds: DaemonSession, turnId: string | undefined): void {
+  if (!turnId) return;
+  ds.streamCardTurnId = turnId;
+  if (ds.recalledStreamCardTurnId !== turnId) ds.recalledStreamCardTurnId = undefined;
+  scheduleCompletedStreamCardRecall(ds, turnId);
+}
+
+function markStreamCardTerminalCompleted(ds: DaemonSession, turnId: string): void {
+  const state = streamCardCompletionState(ds, turnId);
+  state.terminalCompleted = true;
+  scheduleCompletedStreamCardRecall(ds, turnId);
+}
+
+function markStreamCardResultDelivered(ds: DaemonSession, turnId: string): void {
+  const state = streamCardCompletionState(ds, turnId);
+  state.resultDelivered = true;
+  scheduleCompletedStreamCardRecall(ds, turnId);
+}
+
 /**
  * Force-post a fresh streaming card for `ds`, bypassing the per-bot
  * `disableStreamingCard` opt-out. Backs the `/card` command: a user can
@@ -1049,6 +1154,7 @@ export async function postFreshStreamingCard(
   // together so a failed /card leaves no orphaned nonce/pending state).
   const prevCardId = ds.streamCardId;
   const prevNonce = ds.streamCardNonce;
+  const prevTurnId = ds.streamCardTurnId;
   const prevPending = ds.streamCardPending;
 
   ds.streamCardNonce = randomBytes(4).toString('hex');
@@ -1074,6 +1180,7 @@ export async function postFreshStreamingCard(
   ds.streamCardId = CARD_POSTING_SENTINEL;
   try {
     ds.streamCardId = await sessionReply(sessionAnchorId(ds), cardJson, 'interactive', ds.larkAppId, ds.currentReplyTarget?.turnId);
+    bindStreamCardToTurn(ds, ds.currentReplyTarget?.turnId);
     // This card is now the live one for the current turn. Clear the new-turn
     // pending flag so the next screen_update PATCHes it instead of POSTing a
     // duplicate (the gate above only suppresses cards when disabled+unforced;
@@ -1092,6 +1199,7 @@ export async function postFreshStreamingCard(
   } catch (err) {
     ds.streamCardId = prevCardId;
     ds.streamCardNonce = prevNonce;
+    ds.streamCardTurnId = prevTurnId;
     ds.streamCardPending = prevPending;
     flushPendingLocalCliOpenReadinessPatch(ds);
     flushPendingRiffUrlPatch(ds);
@@ -1482,6 +1590,7 @@ function flushCardPatch(ds: DaemonSession): void {
         if (ds.streamCardId === cardId) {
           logger.warn(`[${tag(ds)}] Stream card withdrawn, clearing reference`);
           ds.streamCardId = undefined;
+          ds.streamCardTurnId = undefined;
           persistStreamCardState(ds);
         } else {
           logger.debug(`[${tag(ds)}] Stale card ${cardId.substring(0, 12)} withdrawn (current: ${ds.streamCardId?.substring(0, 12) ?? 'none'})`);
@@ -3221,6 +3330,7 @@ export async function transferSession(
   // lives in another chat entirely (the source card was just frozen above).
   ds.session.streamCardId = undefined;
   ds.session.streamCardNonce = undefined;
+  ds.session.streamCardTurnId = undefined;
   ds.session.currentImageKey = undefined;
 
   // Mirror onto runtime DaemonSession.
@@ -3229,6 +3339,7 @@ export async function transferSession(
   ds.scope = targetScope;
   ds.streamCardId = undefined;
   ds.streamCardNonce = undefined;
+  ds.streamCardTurnId = undefined;
   ds.currentImageKey = undefined;
 
   sessionStore.updateSession(ds.session);
@@ -4320,6 +4431,11 @@ function setupWorkerHandlers(
           break;
         }
 
+        if (!ds.streamCardId && msg.turnId && ds.recalledStreamCardTurnId === msg.turnId) {
+          logger.debug(`[${t}] Completed turn card already recalled — skipping trailing ready card`);
+          break;
+        }
+
         // If a previous streaming card survived (e.g. daemon restart), try to
         // PATCH it with the new "starting" state instead of POSTing a fresh card.
         // ds.streamCardPending forces a new card (e.g. mid-session repo switch
@@ -4362,6 +4478,7 @@ function setupWorkerHandlers(
             );
             await updateMessage(ds.larkAppId, restoredCardId, streamCardJson);
             if (!ownsLifecycleMutation()) break;
+            bindStreamCardToTurn(ds, ds.streamCardTurnId ?? msg.turnId ?? ds.currentReplyTarget?.turnId);
             // Worker IPC handlers may run while the direct restore PATCH is in
             // flight. Re-queue readiness after it completes so an older
             // not-ready payload can never overwrite the cli_session_id PATCH.
@@ -4387,6 +4504,7 @@ function setupWorkerHandlers(
             // PATCH failed (withdrawn, expired, etc.) — fall through to POST a fresh card.
             logger.info(`[${t}] Failed to reuse existing streaming card (${err instanceof Error ? err.message : err}), posting new one`);
             ds.streamCardId = undefined;
+            ds.streamCardTurnId = undefined;
             persistStreamCardState(ds);
           }
         }
@@ -4436,6 +4554,7 @@ function setupWorkerHandlers(
             break;
           }
           ds.streamCardId = postedCardId;
+          bindStreamCardToTurn(ds, msg.turnId ?? ds.currentReplyTarget?.turnId);
           // This card IS the current turn's live card — clear the new-turn flag
           // so subsequent screen_updates PATCH it (starting → working) instead of
           // POSTing a second card. Without this, a re-fork that happens while
@@ -4469,6 +4588,7 @@ function setupWorkerHandlers(
           logger.warn(`[${t}] Failed to send streaming card, falling back to static card: ${err}`);
           // Clear sentinel so screen_updates can create a streaming card later
           ds.streamCardId = undefined;
+          ds.streamCardTurnId = undefined;
           clearPendingLocalCliOpenReadinessPatch(ds);
           persistStreamCardState(ds);
           // Fallback: send static session card
@@ -4725,6 +4845,10 @@ function setupWorkerHandlers(
         const turnTitle = ds.currentTurnTitle || ds.session.title || getCliDisplayName(effectiveCliId);
         const mode: DisplayMode = ds.displayMode ?? 'hidden';
 
+        // Completion recall may win a race with the worker's trailing idle
+        // redraw. Do not recreate the just-withdrawn card for the same turn.
+        if (!ds.streamCardId && msg.turnId && ds.recalledStreamCardTurnId === msg.turnId) break;
+
         if (ds.streamCardPending || !ds.streamCardId) {
           // If a POST is already in-flight, drop this update — it will be
           // picked up by subsequent screen_updates once the card ID lands.
@@ -4766,6 +4890,7 @@ function setupWorkerHandlers(
                 return;
               }
               ds.streamCardId = msgId;
+              bindStreamCardToTurn(ds, msg.turnId ?? ds.currentReplyTarget?.turnId);
               persistStreamCardState(ds);
               // New card live — recall any cards parked by previous turns
               // (user message, bot @mention, adopt-bridge new turn, etc.).
@@ -4791,10 +4916,15 @@ function setupWorkerHandlers(
               }
               logger.debug(`[${t}] Failed to create streaming card: ${err}`);
               ds.streamCardId = undefined;
+              ds.streamCardTurnId = undefined;
               clearPendingLocalCliOpenReadinessPatch(ds);
               persistStreamCardState(ds);
             });
         } else {
+          if (!ds.streamCardTurnId) {
+            bindStreamCardToTurn(ds, msg.turnId ?? ds.currentReplyTarget?.turnId);
+            persistStreamCardState(ds);
+          }
           // Same turn — PATCH only on status change. Image PATCHes go through
           // the screenshot_uploaded path; text is no longer a card body mode.
           const statusChanged = prevStatus !== ds.lastScreenStatus;
@@ -5453,6 +5583,7 @@ function setupWorkerHandlers(
       }
 
       case 'explicit_reply_observed': {
+        markStreamCardResultDelivered(ds, msg.turnId);
         if (msg.turnId.startsWith('mlrp_turn_')) {
           markMessageListenerRunPreviewReplied(msg.turnId, {
             sessionId: ds.session.sessionId,
@@ -5537,6 +5668,7 @@ function setupWorkerHandlers(
         } catch (err: any) {
           logger.error(`[${t}] Failed to settle deferred schedule turn ${msg.turnId.substring(0, 8)}: ${err.message}`);
         }
+        if (msg.status === 'completed') markStreamCardTerminalCompleted(ds, msg.turnId);
         break;
       }
 
@@ -5891,6 +6023,7 @@ function deliverFinalOutput(
   if (waitPromise) {
     waitPromise.resolve(msg.content);
     ds.lastBridgeEmittedUuid = finalOutputDedupeKey(ds, msg);
+    markStreamCardResultDelivered(ds, msg.turnId);
     logger.info(`[${t}] Intercepted final_output for Wait Mode HTTP request (turn ${msg.turnId.substring(0, 8)})`);
     return;
   }
@@ -5907,6 +6040,7 @@ function deliverFinalOutput(
     // Stamp the owning bot for cross-bot isolation.
     asyncTriggerStore.recordCompleted(ds.session.sessionId, msg.turnId, msg.content, completedAt, ds.larkAppId, msg.usage);
     ds.lastBridgeEmittedUuid = finalOutputDedupeKey(ds, msg);
+    markStreamCardResultDelivered(ds, msg.turnId);
     logger.info(`[${t}] Captured final_output for Async HTTP request (turn ${msg.turnId.substring(0, 8)})`);
     return;
   }
@@ -5954,6 +6088,7 @@ function deliverFinalOutput(
         // reaction must never retry and duplicate the document comment.
         consumeDocCommentTurn(ds, msg.turnId);
         ds.lastBridgeEmittedUuid = finalOutputDedupeKey(ds, msg);
+        markStreamCardResultDelivered(ds, msg.turnId);
         if (docTurn.reactionId && docTurn.replyId) {
           try {
             await removeCommentReaction(ds.larkAppId,
@@ -6192,6 +6327,7 @@ function deliverFinalOutput(
       if (preparedListenerReply?.kind === 'succeeded' && preparedListenerReply.messageId) {
         recordPrimaryOutput(preparedListenerReply.messageId);
         ds.lastBridgeEmittedUuid = finalOutputDedupeKey(ds, msg);
+        markStreamCardResultDelivered(ds, msg.turnId);
         logger.info(
           `[${t}] VC listener fallback replayed existing provider result `
           + `(turn ${msg.turnId.substring(0, 8)})`,
@@ -6237,6 +6373,7 @@ function deliverFinalOutput(
         finishVcMeetingImReply(config.session.dataDir, preparedListenerReply.ref, messageId);
       }
       ds.lastBridgeEmittedUuid = finalOutputDedupeKey(ds, msg);
+      markStreamCardResultDelivered(ds, msg.turnId);
       logger.info(`[${t}] Bridge final_output forwarded (turn ${msg.turnId.substring(0, 8)}, ${msg.content.length} chars, kind=${msg.kind ?? 'bridge'}, attempt ${attempt + 1})`);
     } catch (err: any) {
       if (!stillCurrent()) return;
