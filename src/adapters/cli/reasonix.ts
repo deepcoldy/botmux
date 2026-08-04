@@ -1,5 +1,5 @@
-import { execFile, execFileSync } from 'node:child_process';
-import { readdirSync, readFileSync, realpathSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { existsSync, readdirSync, readFileSync, realpathSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { resolveCommand } from './registry.js';
@@ -92,8 +92,10 @@ export function pidBelongsToProcessTree(pid: number, rootPid: number, procRoot =
 }
 
 /**
- * Find the session lease owned by the current CLI process tree. The npm
- * launcher may add an intermediate process; bwrap may add a PID namespace.
+ * Find the session lease owned by the current CLI process tree. The lease file
+ * is created at CLI startup, so its stem — the identifier `--resume` accepts —
+ * is available before the first prompt. The npm launcher may add an
+ * intermediate process; bwrap may add a PID namespace.
  */
 export function findSessionStemForCli(sessionsDir: string, cliPid: number): string | undefined {
   let files: string[];
@@ -114,72 +116,25 @@ export function findSessionStemForCli(sessionsDir: string, cliPid: number): stri
   return undefined;
 }
 
-/** Read the timestamp used to correlate a session file with `session list`. */
-export function readSessionMetaCreatedAt(sessionsDir: string, stem: string): string | undefined {
-  try {
-    const meta = JSON.parse(readFileSync(join(sessionsDir, `${stem}.jsonl.meta`), 'utf-8')) as { created_at?: string };
-    return meta.created_at;
-  } catch {
-    return undefined;
-  }
-}
-
-/**
- * Resolve the machine session id owned by cliPid. The lease identifies the
- * session file; its created_at value identifies the corresponding entry in
- * `reasonix session list`. This remains scoped when several sessions share cwd.
- */
-export function captureSessionIdForCli(
-  bin: string,
-  cwd: string,
-  cliPid: number,
-  opts: { tries?: number; delayMs?: number; sessionRoot?: string } = {},
-): Promise<string | undefined> {
-  const { tries = 3, delayMs = 500, sessionRoot } = opts;
-  const sessionsDir = reasonixSessionsDir(cwd, sessionRoot);
-  const attempt = (): Promise<string | undefined> => {
-    const stem = findSessionStemForCli(sessionsDir, cliPid);
-    const metaCreatedAt = stem ? readSessionMetaCreatedAt(sessionsDir, stem) : undefined;
-    if (!metaCreatedAt) return Promise.resolve(undefined);
-    return new Promise((resolve) => {
-      execFile(bin, ['session', 'list', '--json', '--project-root', cwd], { timeout: 8_000 }, (err, stdout) => {
-        if (err) return resolve(undefined);
-        try {
-          const parsed = JSON.parse(stdout) as { sessions?: Array<{ id?: string; created_at?: string }> };
-          const match = (parsed.sessions ?? []).find(s => s.id && s.created_at === metaCreatedAt);
-          if (match?.id) return resolve(match.id);
-          resolve(undefined);
-        } catch {
-          resolve(undefined);
-        }
-      });
-    });
-  };
-  return (async () => {
-    for (let currentTry = 0; currentTry < tries; currentTry++) {
-      const id = await attempt();
-      if (id) return id;
-      if (currentTry + 1 < tries) await delay(delayMs);
-    }
-    return undefined;
-  })();
-}
-
 /**
  * Adapter for the Reasonix Bubble Tea TUI.
  *
  * Reasonix does not emit a stable ready marker after each turn, so input uses
  * the standard quiescence detector. Sessions live under
- * `~/.reasonix/projects/<cwd-hash>/sessions`. After the first input, the lease
- * pid and metadata timestamp are used to capture the opaque machine session id.
- * Restarts use that id with `--resume`. If capture fails, a later restart opens
- * a fresh session because cwd-scoped `--continue` can select another topic's
- * session.
+ * `~/.reasonix/projects/<cwd-hash>/sessions`. The lease pid identifies the
+ * session file owned by this process tree, and its stem — the same identifier
+ * `--resume` accepts, alongside a transcript path or a free-text query — is
+ * persisted as the cliSessionId. `reasonix session list` is deliberately NOT
+ * used: it reports opaque `session_<hmac>` machine ids that only the
+ * `session show|status|recovery` query surface accepts, and it omits a session
+ * until its first turn has been persisted. If capture fails, a later restart
+ * opens a fresh session because cwd-scoped `--continue` can select another
+ * topic's session.
  */
 export function createReasonixAdapter(pathOverride?: string): CliAdapter {
   const rawBin = pathOverride ?? 'reasonix';
   let cachedBin: string | undefined;
-  // A fresh spawn captures its native session id after the first input.
+  // A fresh spawn captures its own session stem on the first input that lands.
   let capturePending = false;
   return {
     id: 'reasonix',
@@ -217,11 +172,33 @@ export function createReasonixAdapter(pathOverride?: string): CliAdapter {
         await delay(1000);
         pty.write('\r');
       }
-      // The first submitted prompt creates the session files needed for capture.
+      // The lease exists from CLI startup, so the stem is already on disk by the
+      // first submit. Stay armed until it resolves: an early miss must be retried
+      // on the next input instead of costing the whole session its resume id.
       if (capturePending && pty.cliCwd && pty.cliPid) {
-        capturePending = false;
-        const cliSessionId = await captureSessionIdForCli(cachedBin ?? rawBin, pty.cliCwd, pty.cliPid);
-        if (cliSessionId) return { submitted: true, cliSessionId };
+        const stem = findSessionStemForCli(reasonixSessionsDir(pty.cliCwd), pty.cliPid);
+        if (stem) {
+          capturePending = false;
+          return { submitted: true, cliSessionId: stem };
+        }
+      }
+    },
+
+    /**
+     * The stem is the transcript file name, so presence is a plain stat. A stem
+     * whose `.jsonl` is absent is genuinely unresumable — before the first turn
+     * persists, only the lease exists and `--resume <stem>` exits 1 with
+     * `no session matches` — so answering false there correctly sends the worker
+     * to a fresh session. Anything unrecognizable stays undefined.
+     */
+    checkResumeTargetExists({ cliSessionId, workingDir }) {
+      if (!cliSessionId || !workingDir) return undefined;
+      // A path or free-text query is not a stem; only stems can be checked here.
+      if (cliSessionId.includes('/')) return undefined;
+      try {
+        return existsSync(join(reasonixSessionsDir(workingDir), `${cliSessionId}.jsonl`));
+      } catch {
+        return undefined;
       }
     },
 

@@ -12,26 +12,41 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-vi.mock('node:child_process', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('node:child_process')>();
-  return { ...actual, execFile: vi.fn(), execFileSync: actual.execFileSync };
-});
-
-import { execFile } from 'node:child_process';
 import {
-  captureSessionIdForCli,
   createReasonixAdapter,
+  findSessionStemForCli,
   isDescendantOf,
   pidBelongsToProcessTree,
   reasonixSessionsDir,
 } from '../src/adapters/cli/reasonix.js';
 import type { PtyHandle } from '../src/adapters/cli/types.js';
 
+// A real Reasonix transcript stem: start timestamp + model slug. `--resume`
+// accepts this, NOT the `session_<hmac>` machine id from `session list --json`.
+const STEM = '20260803-121945.387040142-deepseek-v4-flash';
+
+/** Build a fake `~/.reasonix` tree and return the sessions dir for `cwd`. */
+function makeSessionRoot(): { root: string; cwd: string; sessionsDir: string } {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'reasonix-')));
+  const cwd = join(root, 'project');
+  mkdirSync(cwd);
+  const sessionsDir = reasonixSessionsDir(cwd, join(root, '.reasonix'));
+  mkdirSync(sessionsDir, { recursive: true });
+  return { root, cwd, sessionsDir };
+}
+
+function writeLease(sessionsDir: string, stem: string, pid: number): void {
+  writeFileSync(join(sessionsDir, `${stem}.jsonl.lease.json`), JSON.stringify({ pid }));
+  writeFileSync(join(sessionsDir, `${stem}.jsonl`), '');
+}
+
 describe('Reasonix session capture', () => {
   const children = new Set<ChildProcess>();
+  const originalHome = process.env.HOME;
 
   afterEach(() => {
-    vi.mocked(execFile).mockReset();
+    if (originalHome === undefined) delete process.env.HOME;
+    else process.env.HOME = originalHome;
     for (const child of children) {
       if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
     }
@@ -53,57 +68,108 @@ describe('Reasonix session capture', () => {
     }
   });
 
-  it('matches the lease-owned session when a newer same-cwd session exists', async () => {
-    const root = mkdtempSync(join(tmpdir(), 'reasonix-capture-'));
-    const cwd = join(root, 'project');
-    mkdirSync(cwd);
-    const sessionsDir = reasonixSessionsDir(cwd, root);
-    mkdirSync(sessionsDir, { recursive: true });
-    const currentCreatedAt = '2026-08-03T11:23:44.138167478Z';
-    const newerCreatedAt = '2026-08-03T12:20:02.416748963Z';
-    const child = spawn(process.execPath, ['-e', "process.stdout.write('ready\\n');setInterval(()=>{},1000)"], {
-      stdio: ['ignore', 'pipe', 'ignore'],
-    });
-    children.add(child);
-    if (!child.stdout) throw new Error('child stdout unavailable');
-    await once(child.stdout, 'data');
-    if (!child.pid) throw new Error('child pid unavailable');
-
+  it('picks the lease-owned stem when another session shares the cwd', () => {
+    const { root, sessionsDir } = makeSessionRoot();
     try {
-      writeFileSync(join(sessionsDir, 'current.jsonl.lease.json'), JSON.stringify({ pid: child.pid }));
-      writeFileSync(join(sessionsDir, 'current.jsonl.meta'), JSON.stringify({ created_at: currentCreatedAt }));
-      writeFileSync(join(sessionsDir, 'newer.jsonl.lease.json'), JSON.stringify({ pid: 999_999_999 }));
-      writeFileSync(join(sessionsDir, 'newer.jsonl.meta'), JSON.stringify({ created_at: newerCreatedAt }));
-      vi.mocked(execFile).mockImplementation(((_bin, _args, _opts, callback) => {
-        callback(null, JSON.stringify({
-          sessions: [
-            { id: 'session_newer', created_at: newerCreatedAt },
-            { id: 'session_current', created_at: currentCreatedAt },
-          ],
-        }));
-      }) as any);
+      writeLease(sessionsDir, STEM, process.pid);
+      writeLease(sessionsDir, '20260803-131010.100000000-deepseek-v4-pro', 999_999_999);
 
-      await expect(captureSessionIdForCli('/bin/reasonix', cwd, process.pid, {
-        sessionRoot: root,
-        tries: 1,
-      })).resolves.toBe('session_current');
+      const stem = findSessionStemForCli(sessionsDir, process.pid);
+      expect(stem).toBe(STEM);
+      // Regression guard: `session list --json` ids are unusable with --resume.
+      expect(stem?.startsWith('session_')).toBe(false);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
   });
 
-  it('returns undefined when no lease belongs to the CLI process tree', async () => {
-    const root = mkdtempSync(join(tmpdir(), 'reasonix-capture-'));
-    const cwd = join(root, 'project');
-    mkdirSync(cwd);
-    vi.mocked(execFile).mockImplementation(((_bin, _args, _opts, callback) => {
-      callback(null, JSON.stringify({ sessions: [{ id: 'session_other' }] }));
-    }) as any);
+  it('returns undefined when no lease belongs to the CLI process tree', () => {
+    const { root, sessionsDir } = makeSessionRoot();
     try {
-      await expect(captureSessionIdForCli('/bin/reasonix', cwd, process.pid, {
-        sessionRoot: root,
-        tries: 1,
-      })).resolves.toBeUndefined();
+      writeLease(sessionsDir, STEM, 999_999_999);
+      expect(findSessionStemForCli(sessionsDir, process.pid)).toBeUndefined();
+      expect(findSessionStemForCli(join(root, 'missing'), process.pid)).toBeUndefined();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('stays armed until the lease appears, then captures once', async () => {
+    const { root, cwd, sessionsDir } = makeSessionRoot();
+    const adapter = createReasonixAdapter('/bin/reasonix');
+    const pty = {
+      sendText: vi.fn(() => true),
+      sendSpecialKeys: vi.fn(() => true),
+      cliCwd: cwd,
+      cliPid: process.pid,
+    } as unknown as PtyHandle;
+    try {
+      process.env.HOME = root;
+      adapter.buildArgs({ resume: false, sessionId: 's1', workingDir: cwd } as any);
+
+      // Lease not on disk yet: the capture must not disarm itself.
+      await expect(adapter.writeInput(pty, 'first')).resolves.toBeUndefined();
+
+      writeLease(sessionsDir, STEM, process.pid);
+      await expect(adapter.writeInput(pty, 'second')).resolves.toEqual({
+        submitted: true,
+        cliSessionId: STEM,
+      });
+      // Captured once; later turns report nothing new.
+      await expect(adapter.writeInput(pty, 'third')).resolves.toBeUndefined();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('skips capture when resuming a known session', async () => {
+    const { root, cwd, sessionsDir } = makeSessionRoot();
+    const adapter = createReasonixAdapter('/bin/reasonix');
+    const pty = {
+      sendText: vi.fn(() => true),
+      sendSpecialKeys: vi.fn(() => true),
+      cliCwd: cwd,
+      cliPid: process.pid,
+    } as unknown as PtyHandle;
+    try {
+      process.env.HOME = root;
+      writeLease(sessionsDir, STEM, process.pid);
+      expect(adapter.buildArgs({
+        resume: true,
+        resumeSessionId: STEM,
+        sessionId: 's1',
+        workingDir: cwd,
+      } as any)).toEqual(['--yolo', '--resume', STEM]);
+
+      await expect(adapter.writeInput(pty, 'hello')).resolves.toBeUndefined();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('resolves the resume command from the captured stem', () => {
+    const adapter = createReasonixAdapter('/bin/reasonix');
+    expect(adapter.buildResumeCommand!({ cliSessionId: STEM } as any)).toBe(`reasonix --resume ${STEM}`);
+    expect(adapter.buildResumeCommand!({} as any)).toBeNull();
+  });
+
+  it('probes the transcript file to decide whether a resume target survives', () => {
+    const { root, cwd, sessionsDir } = makeSessionRoot();
+    const adapter = createReasonixAdapter('/bin/reasonix');
+    try {
+      writeFileSync(join(sessionsDir, `${STEM}.jsonl`), '');
+      const check = (opts: Record<string, unknown>) => adapter.checkResumeTargetExists!({
+        sessionId: 's1',
+        ...opts,
+      } as any);
+
+      process.env.HOME = root;
+      expect(check({ cliSessionId: STEM, workingDir: cwd })).toBe(true);
+      expect(check({ cliSessionId: '20260101-000000.000000000-gone', workingDir: cwd })).toBe(false);
+      // Unknown inputs stay undefined so the worker keeps its own judgement.
+      expect(check({ workingDir: cwd })).toBeUndefined();
+      expect(check({ cliSessionId: STEM })).toBeUndefined();
+      expect(check({ cliSessionId: join(sessionsDir, `${STEM}.jsonl`), workingDir: cwd })).toBeUndefined();
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
