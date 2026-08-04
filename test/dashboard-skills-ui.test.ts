@@ -102,11 +102,13 @@ describe('dashboard skills install panel', () => {
         installSource: '',
         installPath: '',
         installRef: '',
+        installFullDepth: false,
         installStatus: null,
         installBusy: false,
         onInstallSourceChange: vi.fn(),
         onInstallPathChange: vi.fn(),
         onInstallRefChange: vi.fn(),
+        onInstallFullDepthChange: vi.fn(),
         onInstall: vi.fn(),
         onOpenNativeDiscovery: vi.fn(),
         ...props,
@@ -165,6 +167,28 @@ describe('dashboard skills install panel', () => {
     expect(root.findAllByProps({ 'data-action': 'confirm-install-selection' })).toHaveLength(1);
     expect(root.findAllByProps({ 'data-action': 'toggle-all-source-skills' })).toHaveLength(1);
     expect(root.findAllByProps({ className: 'skills-candidate-row' })).toHaveLength(2);
+  });
+
+  it('echoes the recognized source type and deploy-host requirements before installation', () => {
+    const renderer = renderInstallPanel({
+      installSource: 'npm_config_registry="https://registry.example.com" npx -y agentbuddy@latest skill add skills.example.com/team/health',
+    });
+    const root = renderer.root;
+
+    expect(root.findAllByProps({ 'data-source-hint': 'agentbuddy' })).toHaveLength(1);
+    expect(JSON.stringify(renderer.toJSON())).toContain('已识别：Agentbuddy 安装命令');
+    expect(JSON.stringify(renderer.toJSON())).toContain('部署机已配置 Agentbuddy CLI');
+  });
+
+  it('renders source-specific troubleshooting after a failed scan or install', () => {
+    const renderer = renderInstallPanel({
+      installSource: 'https://github.com/acme/private-skills',
+      installStatus: { ok: false, text: '安装失败' },
+    });
+    const diagnostic = renderer.root.findByProps({ 'data-install-diagnostic': 'github' });
+
+    expect(diagnostic.findByType('strong').props.children).toBe('安装失败排查');
+    expect(diagnostic.findByType('span').props.children).toContain('私有仓库');
   });
 });
 

@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { useT } from '../react-hooks.js';
-import { SectionHeader } from '../dashboard-components.js';
-import type { InstallSkillCandidate, NativeSkillGroup, SkillRow, StatusMessage } from './types.js';
+import type { SkillGraph } from './shared.js';
+import type { InstallSkillCandidate, NativeSkillGroup, SkillRow, SkillsNavIntent, StatusMessage } from './types.js';
 
 interface SkillLibraryTabProps {
   skills: SkillRow[];
@@ -9,6 +9,7 @@ interface SkillLibraryTabProps {
   installSource: string;
   installPath: string;
   installRef: string;
+  installFullDepth: boolean;
   installStatus: StatusMessage;
   installBusy: boolean;
   installDiscovering: boolean;
@@ -18,6 +19,7 @@ interface SkillLibraryTabProps {
   onInstallSourceChange: (v: string) => void;
   onInstallPathChange: (v: string) => void;
   onInstallRefChange: (v: string) => void;
+  onInstallFullDepthChange: (v: boolean) => void;
   onToggleInstallSkill: (name: string) => void;
   onSelectAllInstallSkills: (selected: boolean) => void;
   onConfirmInstallSelection: () => Promise<string[] | null>;
@@ -25,6 +27,7 @@ interface SkillLibraryTabProps {
   onInstall: () => Promise<string[] | null>;
   onOpenNativeDiscovery: () => void;
   onCreatePack: (input: { id: string; name: string; skillNames: string[] }) => Promise<void>;
+  InstallPanel: React.ComponentType<any>;
   InstalledLibrary: React.ComponentType<any>;
   RemoveDialog: React.ComponentType<any>;
   removingNames: Set<string>;
@@ -38,57 +41,74 @@ interface SkillLibraryTabProps {
   onRequestRemove: (names: string[]) => void;
   onCancelRemoval: () => void;
   onConfirmRemoval: (force: boolean) => void;
+  /** cross-tab navigation context (consumed once on arrival) */
+  navIntent?: SkillsNavIntent | null;
+  onNavIntentConsumed?: () => void;
+  /** missing skill the user came here to install — prefill only, never auto-install */
+  installTargetSkill?: string | null;
+  /** clear the sticky target shown above the single-page install form */
+  onClearInstallTarget?: () => void;
+  /** false = pack data never loaded; usage chips must not claim "0 packs" */
+  packsKnown?: boolean;
+  /** focus the install form for a referenced-but-missing skill */
+  onInstallMissing?: (name: string) => void;
+  graph?: SkillGraph;
+  packNames?: Array<{ id: string; name: string }>;
+  onShowSkillPacks?: (name: string) => void;
+  onShowSkillBots?: (name: string) => void;
 }
 
 export function SkillLibraryTab(props: SkillLibraryTabProps) {
-  const tr = useT();
-  const [wizardOpen, setWizardOpen] = useState(false);
   const [installedForPack, setInstalledForPack] = useState<string[] | null>(null);
+  const installAnchorRef = useRef<HTMLDivElement | null>(null);
+  const { navIntent, onNavIntentConsumed } = props;
 
-  const closeWizard = () => {
-    props.onCloseInstallSelection();
-    setWizardOpen(false);
-  };
+  // Apply an incoming cross-tab intent exactly once: the search prefill is
+  // picked up by InstalledLibrary (child effects run first), then bring the
+  // single-page install form into view without triggering any write.
+  useEffect(() => {
+    if (!navIntent) return;
+    if (navIntent.openInstallWizard) {
+      const anchor = installAnchorRef.current;
+      anchor?.scrollIntoView?.({ behavior: 'smooth', block: 'start' });
+      anchor?.querySelector<HTMLInputElement>('input[data-install="source"]')?.focus();
+    }
+    onNavIntentConsumed?.();
+  }, [navIntent, onNavIntentConsumed]);
 
   const finishInstall = (installed: string[] | null) => {
     if (!installed || installed.length === 0) return;
-    setWizardOpen(false);
     if (installed.length > 1) setInstalledForPack(installed);
   };
 
   return (
     <div className="skills-page-stack">
-      <section className="skills-config-block">
-        <SectionHeader
-          title={tr('skills.install')}
-          hint={tr('skills.installInfo')}
-        >
-          <button className="bd-button" onClick={props.onOpenNativeDiscovery}>{tr('skills.discover')}</button>
-          <button className="bd-button primary" onClick={() => setWizardOpen(true)}>{tr('skills.installWizard')}</button>
-        </SectionHeader>
-        {wizardOpen && (
-          <InstallWizard
-            onClose={closeWizard}
-            onSourceChange={props.onInstallSourceChange}
-            onPathChange={props.onInstallPathChange}
-            onRefChange={props.onInstallRefChange}
-            onInstall={async () => finishInstall(await props.onInstall())}
-            onConfirmSelection={async () => finishInstall(await props.onConfirmInstallSelection())}
-            onCloseSelection={props.onCloseInstallSelection}
-            onToggleSkill={props.onToggleInstallSkill}
-            onSelectAll={props.onSelectAllInstallSkills}
-            source={props.installSource}
-            path={props.installPath}
-            ref={props.installRef}
-            busy={props.installBusy}
-            discovering={props.installDiscovering}
-            status={props.installStatus}
-            selectionOpen={props.installSelectionOpen}
-            candidates={props.installCandidates}
-            selected={props.selectedInstallSkills}
-          />
-        )}
-      </section>
+      <div className="skills-install-anchor" ref={installAnchorRef}>
+        <props.InstallPanel
+          installSource={props.installSource}
+          installPath={props.installPath}
+          installRef={props.installRef}
+          installFullDepth={props.installFullDepth}
+          installTargetSkill={props.installTargetSkill ?? null}
+          installStatus={props.installStatus}
+          installBusy={props.installBusy}
+          installDiscovering={props.installDiscovering}
+          installSelectionOpen={props.installSelectionOpen}
+          installCandidates={props.installCandidates}
+          selectedInstallSkills={props.selectedInstallSkills}
+          onInstallSourceChange={props.onInstallSourceChange}
+          onInstallPathChange={props.onInstallPathChange}
+          onInstallRefChange={props.onInstallRefChange}
+          onInstallFullDepthChange={props.onInstallFullDepthChange}
+          onClearInstallTarget={props.onClearInstallTarget}
+          onToggleInstallSkill={props.onToggleInstallSkill}
+          onSelectAllInstallSkills={props.onSelectAllInstallSkills}
+          onConfirmInstallSelection={() => { void props.onConfirmInstallSelection().then(finishInstall); }}
+          onCloseInstallSelection={props.onCloseInstallSelection}
+          onInstall={() => { void props.onInstall().then(finishInstall); }}
+          onOpenNativeDiscovery={props.onOpenNativeDiscovery}
+        />
+      </div>
 
       {installedForPack && (
         <PostInstallPackDialog
@@ -108,6 +128,14 @@ export function SkillLibraryTab(props: SkillLibraryTabProps) {
         status={props.installedStatus}
         onUpdate={props.onUpdateSkill}
         onRequestRemove={props.onRequestRemove}
+        externalQuery={props.navIntent?.librarySearch ?? null}
+        externalFilterNames={props.navIntent?.libraryFilterSkills ?? null}
+        packsKnown={props.packsKnown}
+        onInstallMissing={props.onInstallMissing}
+        graph={props.graph}
+        packNames={props.packNames}
+        onShowSkillPacks={props.onShowSkillPacks}
+        onShowSkillBots={props.onShowSkillBots}
       />
 
       <props.RemoveDialog
@@ -119,149 +147,6 @@ export function SkillLibraryTab(props: SkillLibraryTabProps) {
         onConfirm={props.onConfirmRemoval}
       />
     </div>
-  );
-}
-
-function InstallWizard(props: {
-  onClose: () => void;
-  onSourceChange: (v: string) => void;
-  onPathChange: (v: string) => void;
-  onRefChange: (v: string) => void;
-  onInstall: () => Promise<void>;
-  onConfirmSelection: () => Promise<void>;
-  onCloseSelection: () => void;
-  onToggleSkill: (name: string) => void;
-  onSelectAll: (selected: boolean) => void;
-  source: string;
-  path: string;
-  ref: string;
-  busy: boolean;
-  discovering: boolean;
-  status: StatusMessage;
-  selectionOpen: boolean;
-  candidates: InstallSkillCandidate[];
-  selected: Set<string>;
-}) {
-  const tr = useT();
-  const [step, setStep] = useState(1);
-  const sourceType = detectSourceType(props.source);
-  const dialogRef = useRef<HTMLDialogElement | null>(null);
-
-  useEffect(() => {
-    const dlg = dialogRef.current;
-    if (dlg && !dlg.open) {
-      try { dlg.showModal(); } catch { /* already open */ }
-    }
-  }, []);
-
-  return (
-    <dialog className="bd-dialog skills-install-wizard" ref={dialogRef} onClose={props.onClose}>
-      <form method="dialog" onSubmit={e => { e.preventDefault(); }}>
-        <h3>{tr('skills.installWizard')}</h3>
-        <div className="skills-wizard-steps">
-          <span className={step >= 1 ? 'active' : ''}>1. {tr('skills.wizSource')}</span>
-          <span className={step >= 2 ? 'active' : ''}>2. {tr('skills.wizDetails')}</span>
-          <span className={step >= 3 ? 'active' : ''}>3. {tr('skills.wizInstall')}</span>
-        </div>
-
-        {step === 1 && (
-          <div className="skills-control-block">
-            <label>{tr('skills.source')}</label>
-            <input
-              autoFocus
-              value={props.source}
-              onChange={e => props.onSourceChange(e.target.value)}
-              placeholder={tr('skills.sourcePlaceholder')}
-            />
-            <div className="skills-wizard-source-hint">
-              {sourceType === 'github' && <small>{tr('skills.sourceHelpRemote')}</small>}
-              {sourceType === 'git' && <small>{tr('skills.sourceHelpRemote')}</small>}
-              {sourceType === 'local' && <small>{tr('skills.sourceHelpLocal')}</small>}
-              {sourceType === 'agentbuddy' && <small>{tr('skills.sourceHelpAgentbuddy')}</small>}
-            </div>
-          </div>
-        )}
-
-        {step === 2 && (
-          <>
-            {(sourceType === 'github' || sourceType === 'git') && (
-              <div className="skills-control-block">
-                <label>{tr('skills.ref')}</label>
-                <input value={props.ref} onChange={e => props.onRefChange(e.target.value)} placeholder={tr('skills.refPlaceholder')} />
-              </div>
-            )}
-            {(sourceType === 'github' || sourceType === 'git') && (
-              <div className="skills-control-block">
-                <label>{tr('skills.path')}</label>
-                <input value={props.path} onChange={e => props.onPathChange(e.target.value)} placeholder={tr('skills.pathPlaceholder')} />
-              </div>
-            )}
-            {sourceType === 'unknown' && <p className="hint-warn">{tr('skills.sourceRequired')}</p>}
-          </>
-        )}
-
-        {step === 3 && (
-          <div className="skills-control-block">
-            <div className="skills-wizard-summary">
-              <p><strong>{tr('skills.source')}:</strong> {props.source || '—'}</p>
-              {props.ref && <p><strong>{tr('skills.ref')}:</strong> {props.ref}</p>}
-              {props.path && <p><strong>{tr('skills.path')}:</strong> {props.path}</p>}
-            </div>
-            {props.discovering && <p className="hint-ok">{tr('skills.scanning')}…</p>}
-            {!props.discovering && !props.selectionOpen && props.status && (
-              <p className={`hint-${props.status.ok ? 'ok' : 'warn'}`}>{props.status.text}</p>
-            )}
-            {props.selectionOpen && (
-              <div className="skills-install-selection">
-                <div className="skills-install-selection-head">
-                  <strong>{tr('skills.installSelectionTitle')}</strong>
-                  <label>
-                    <input
-                      type="checkbox"
-                      checked={props.candidates.length > 0 && props.candidates.every(candidate => props.selected.has(candidate.name))}
-                      onChange={event => props.onSelectAll(event.target.checked)}
-                    />
-                    {tr('skills.selectAllSkills', { count: props.candidates.length })}
-                  </label>
-                </div>
-                <p>{tr('skills.installSelectionHelp', { count: props.candidates.length })}</p>
-                <div className="skills-pack-skill-list">
-                  {props.candidates.map(candidate => (
-                    <label key={candidate.name} className="skills-pack-skill-item">
-                      <input type="checkbox" checked={props.selected.has(candidate.name)} onChange={() => props.onToggleSkill(candidate.name)} />
-                      <span className="skills-pack-skill-name">{candidate.name}</span>
-                      {candidate.description && <small className="skills-pack-skill-desc">{candidate.description}</small>}
-                    </label>
-                  ))}
-                </div>
-              </div>
-            )}
-          </div>
-        )}
-
-        <div className="skills-dialog-actions">
-          <button type="button" className="bd-button" onClick={props.onClose}>{tr('skills.cancel')}</button>
-          {step > 1 && <button type="button" className="bd-button" onClick={() => { props.onCloseSelection(); setStep(s => s - 1); }}>{tr('skills.wizBack')}</button>}
-          {step < 3 && <button type="button" className="bd-button primary" onClick={() => {
-            if (step === 2) {
-              // Run discover when entering step 3 so the user sees a preview
-              void props.onInstall();
-            }
-            setStep(s => s + 1);
-          }} disabled={step === 1 && !props.source.trim()}>{tr('skills.wizNext')}</button>}
-          {step === 3 && (
-            <button
-              type="button"
-              className="bd-button primary"
-              disabled={props.busy || props.discovering || (props.selectionOpen && props.selected.size === 0)}
-              onClick={() => { void (props.selectionOpen ? props.onConfirmSelection() : props.onInstall()); }}
-            >
-              {props.discovering ? tr('skills.scanning') : props.busy ? tr('skills.jobRunning') : props.selectionOpen ? tr('skills.installSelected') : tr('skills.installSubmit')}
-            </button>
-          )}
-        </div>
-      </form>
-    </dialog>
   );
 }
 
@@ -326,16 +211,32 @@ function PostInstallPackDialog(props: {
   );
 }
 
-function detectSourceType(source: string): 'github' | 'git' | 'local' | 'agentbuddy' | 'zip' | 'unknown' {
-  const s = source.trim().toLowerCase();
+/** Visual hint only — the daemon's parseSkillInstallSource() owns the real
+ *  classification. Kept deliberately in sync with it so the wizard never
+ *  promises a source type the backend would reject. Note this is a *hint*: a
+ *  bare `owner/repo` that also exists as a local directory installs from disk,
+ *  which only the daemon (with filesystem access) can know. */
+export function detectSourceType(source: string): 'github' | 'git' | 'local' | 'agentbuddy' | 'unknown' {
+  const s = source.trim();
+  const lower = s.toLowerCase();
   if (!s) return 'unknown';
-  if (s.includes('agentbuddy')) return 'agentbuddy';
-  if (s.endsWith('.zip') || s.includes('.zip')) return 'zip';
-  if (s.includes('github.com')) return 'github';
-  // Any http(s) URL that's not github is treated as a generic git repo
-  if (s.startsWith('http://') || s.startsWith('https://')) return 'git';
-  if (s.startsWith('git@') || s.startsWith('git://') || s.endsWith('.git')) return 'git';
-  if (s.startsWith('/') || s.startsWith('./') || s.startsWith('~')) return 'local';
-  if (s.includes('github')) return 'github';
-  return 'unknown';
+  // agentbuddy only via the canonical `agentbuddy:` scheme or a pasted install
+  // command — NOT any string that happens to contain the word (a repo or local
+  // path named "agentbuddy" is not an agentbuddy source).
+  if (/^agentbuddy:/i.test(s)) return 'agentbuddy';
+  if (/(?:^|\s)(?:npx\s+)?agentbuddy(?:@[\w.-]+)?\s+(?:skill|plugin)\s/i.test(s)) return 'agentbuddy';
+  if (lower.startsWith('github:')) return 'github';
+  // Explicit git schemes are checked before github.com: `git@github.com:o/r.git`
+  // is a git remote to the backend, not a browser URL.
+  if (lower.startsWith('git+') || lower.startsWith('git@') || lower.startsWith('git://')) return 'git';
+  if (lower.includes('github.com')) return 'github';
+  // Any other http(s) URL is handled as a git remote by the backend.
+  if (lower.startsWith('http://') || lower.startsWith('https://')) return 'git';
+  if (lower.endsWith('.git')) return 'git';
+  if (/^[/~.]/.test(s)) return 'local';
+  // Bare `owner/repo[/path]` — GitHub shorthand, the most common paste form.
+  if (/^[A-Za-z0-9][A-Za-z0-9-]*\/[A-Za-z0-9._-]+(?:\/[\w./-]+)?$/.test(s)) return 'github';
+  // The daemon treats every remaining scheme-less value as a local path,
+  // including relative directories. Unsupported URL schemes remain unknown.
+  return s.includes('://') ? 'unknown' : 'local';
 }

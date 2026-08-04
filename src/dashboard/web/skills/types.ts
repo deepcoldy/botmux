@@ -58,6 +58,30 @@ export interface SkillRemovalReference {
   bots: string[];
 }
 
+/** Cross-tab navigation intent: which tab to activate and what context to
+ * carry over (search prefill, focused entity, install target). Consumed once
+ * by the target tab. Missing skills only ever *prefill* the install entry —
+ * never trigger an install. */
+export interface SkillsNavIntent {
+  tab: 'library' | 'packs' | 'bots';
+  /** prefill the installed-library search box */
+  librarySearch?: string;
+  /** library tab: restrict the list to this exact name set (clearable chip) */
+  libraryFilterSkills?: string[];
+  /** open the install wizard (library tab) */
+  openInstallWizard?: boolean;
+  /** preselect this skill among discovered install candidates */
+  installTargetSkill?: string;
+  /** packs tab: open this pack's editor */
+  focusPackId?: string;
+  /** packs tab: highlight these pack cards (no editor) */
+  focusPackIds?: string[];
+  /** bots tab: highlight these bots' rows */
+  focusBotIds?: string[];
+  /** bots tab: prefill palette search / highlight bots resolving this skill */
+  focusSkill?: string;
+}
+
 export interface SkillPackRow {
   id: string;
   name: string;

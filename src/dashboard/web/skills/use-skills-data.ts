@@ -11,6 +11,12 @@ export interface SkillsData {
   delivery: DeliveryMode;
   loading: boolean;
   loadError: string | null;
+  /** non-404 failure loading /api/skill-packs — previous pack data is kept */
+  packsError: string | null;
+  /** true once /api/skill-packs has answered definitively (2xx or 404).
+   * While false, pack-derived health is UNKNOWN: consumers must not render
+   * pack_missing (nor "healthy") from a never-loaded empty array. */
+  packsKnown: boolean;
   refresh: () => Promise<void>;
   /** targeted mutators for optimistic local updates after PUT/DELETE responses */
   setSkills: React.Dispatch<React.SetStateAction<SkillRow[]>>;
@@ -32,6 +38,8 @@ export function useSkillsData(options: { apiUnavailableText: string }): SkillsDa
   const [delivery, setDelivery] = useState<DeliveryMode>('auto');
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
+  const [packsError, setPacksError] = useState<string | null>(null);
+  const [packsKnown, setPacksKnown] = useState(false);
   const apiUnavailableTextRef = useRef(options.apiUnavailableText);
   apiUnavailableTextRef.current = options.apiUnavailableText;
 
@@ -56,7 +64,24 @@ export function useSkillsData(options: { apiUnavailableText: string }): SkillsDa
       setSkills(Array.isArray(skillsBody.skills) ? skillsBody.skills as SkillRow[] : []);
       setNativeSkillGroups(Array.isArray(skillsBody.nativeSkillGroups) ? skillsBody.nativeSkillGroups as NativeSkillGroup[] : []);
       setBots(Array.isArray(botsBody.bots) ? botsBody.bots as BotRow[] : []);
-      setPacks(packsRes?.ok && Array.isArray(packsBody.packs) ? packsBody.packs as SkillPackRow[] : []);
+      // Pack failure semantics: only an explicit 404 (older daemon without the
+      // pack API) means "no packs". Any other failure (network, 401/403, 5xx)
+      // keeps the previous pack data and surfaces packsError — otherwise the
+      // graph would misreport every `pack:` reference as pack_missing.
+      if (packsRes?.ok && Array.isArray(packsBody.packs)) {
+        setPacks(packsBody.packs as SkillPackRow[]);
+        setPacksError(null);
+        setPacksKnown(true);
+      } else if (packsRes?.status === 404) {
+        setPacks([]);
+        setPacksError(null);
+        setPacksKnown(true);
+      } else {
+        // packsKnown deliberately untouched: false if packs never loaded (first
+        // request failed → health must read "unknown"), true if a refresh
+        // failed after a successful load (previous data stays authoritative).
+        setPacksError(packsRes ? (packsBody?.error ?? `HTTP ${packsRes.status}`) : 'network_error');
+      }
       setTrustProjectSkills(skillsBody.trustProjectSkills === 'all' ? 'all' : 'off');
       setDelivery(skillsBody.delivery === 'prompt' || skillsBody.delivery === 'native' ? skillsBody.delivery : 'auto');
       setLoadError(null);
@@ -75,7 +100,7 @@ export function useSkillsData(options: { apiUnavailableText: string }): SkillsDa
 
   return {
     skills, nativeSkillGroups, bots, packs, trustProjectSkills, delivery,
-    loading, loadError, refresh,
+    loading, loadError, packsError, packsKnown, refresh,
     setSkills, setBots, setTrustProjectSkills, setDelivery,
   };
 }

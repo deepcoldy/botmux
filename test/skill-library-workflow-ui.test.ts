@@ -1,6 +1,7 @@
 import React from 'react';
 import TestRenderer, { act } from 'react-test-renderer';
 import { describe, expect, it, vi } from 'vitest';
+import { SkillsInstallPanel } from '../src/dashboard/web/skills-page.js';
 import { SkillLibraryTab } from '../src/dashboard/web/skills/skill-library-tab.js';
 import { DeliverySettingsTab } from '../src/dashboard/web/skills/delivery-settings-tab.js';
 
@@ -15,6 +16,7 @@ function libraryProps(over: Record<string, unknown> = {}) {
     installSource: 'https://github.com/example/skills',
     installPath: '',
     installRef: '',
+    installFullDepth: false,
     installStatus: null,
     installBusy: false,
     installDiscovering: false,
@@ -27,6 +29,7 @@ function libraryProps(over: Record<string, unknown> = {}) {
     onInstallSourceChange: () => {},
     onInstallPathChange: () => {},
     onInstallRefChange: () => {},
+    onInstallFullDepthChange: () => {},
     onToggleInstallSkill: () => {},
     onSelectAllInstallSkills: () => {},
     onConfirmInstallSelection: async () => ['deploy', 'oncall'],
@@ -34,6 +37,7 @@ function libraryProps(over: Record<string, unknown> = {}) {
     onInstall: async () => null,
     onOpenNativeDiscovery: () => {},
     onCreatePack: async () => {},
+    InstallPanel: SkillsInstallPanel,
     InstalledLibrary: Empty,
     RemoveDialog: Empty,
     removingNames: new Set<string>(),
@@ -52,7 +56,7 @@ function libraryProps(over: Record<string, unknown> = {}) {
 }
 
 describe('Skill install to Pack workflow', () => {
-  it('keeps multi-Skill selection inside the wizard and offers a Pack after install', async () => {
+  it('keeps multi-Skill selection in the confirmation dialog and offers a Pack after install', async () => {
     const onConfirmInstallSelection = vi.fn(async () => ['deploy', 'oncall']);
     const onCreatePack = vi.fn(async () => {});
     let renderer!: TestRenderer.ReactTestRenderer;
@@ -64,13 +68,8 @@ describe('Skill install to Pack workflow', () => {
     });
 
     const root = renderer.root;
-    const wizardButton = root.findAllByType('button').find((button: any) => button.props.children === '安装向导');
-    act(() => { wizardButton!.props.onClick(); });
-
-    for (let i = 0; i < 2; i += 1) {
-      const next = root.findAllByType('button').find((button: any) => button.props.children === '下一步');
-      act(() => { next!.props.onClick(); });
-    }
+    expect(root.findAllByProps({ 'data-install': 'source' })).toHaveLength(1);
+    expect(root.findAllByProps({ 'data-install-selection-dialog': true })).toHaveLength(1);
     expect(JSON.stringify(renderer.toJSON())).toContain('deploy');
     expect(JSON.stringify(renderer.toJSON())).toContain('oncall');
 

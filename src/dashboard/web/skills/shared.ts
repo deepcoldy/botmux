@@ -97,7 +97,9 @@ export interface PackGraphInfo {
   botIds: string[];
 }
 
-export type BotHealthLevel = 'ok' | 'default' | 'missing' | 'pack_missing';
+/** 'unknown' = the bot references packs but pack data has never loaded
+ * (packsKnown=false), so pack-derived health cannot be judged either way. */
+export type BotHealthLevel = 'ok' | 'default' | 'missing' | 'pack_missing' | 'unknown';
 
 export interface BotGraphInfo {
   larkAppId: string;
@@ -126,7 +128,9 @@ export function buildSkillGraph(
   installedSkills: Array<Pick<SkillRow, 'name'>>,
   packs: GraphPackInput[],
   bots: Array<Pick<BotRow, 'larkAppId' | 'skills'>>,
+  opts?: { packsKnown?: boolean },
 ): SkillGraph {
+  const packsKnown = opts?.packsKnown !== false;
   const installed = new Set(installedSkills.map(skill => skill.name));
   const skillNodes = new Map<string, SkillUsageInfo>();
   const skillNode = (name: string): SkillUsageInfo => {
@@ -161,6 +165,7 @@ export function buildSkillGraph(
     const resolved = new Map<string, 'direct' | `pack:${string}`>();
     const missingSkills = new Set<string>();
     const missingPacks: string[] = [];
+    let unresolvablePackRefs = false;
     for (const selector of include) {
       if (selector.startsWith('skill:')) {
         const name = selector.slice('skill:'.length);
@@ -172,7 +177,11 @@ export function buildSkillGraph(
         const packId = selector.slice('pack:'.length);
         const pack = packById.get(packId);
         if (!pack) {
-          missingPacks.push(packId);
+          // Only a definitive pack list can prove a reference broken. If pack
+          // data never loaded, this ref is unresolvable — health = unknown,
+          // NOT pack_missing.
+          if (packsKnown) missingPacks.push(packId);
+          else unresolvablePackRefs = true;
           continue;
         }
         const packNode = packNodes.get(packId)!;
@@ -193,6 +202,7 @@ export function buildSkillGraph(
     }
     const health: BotHealthLevel = missingPacks.length > 0 ? 'pack_missing'
       : missingSkills.size > 0 ? 'missing'
+      : unresolvablePackRefs ? 'unknown'
       : include.length === 0 ? 'default'
       : 'ok';
     botNodes.set(bot.larkAppId, {
@@ -211,4 +221,19 @@ export function buildSkillGraph(
 /** All skill names referenced anywhere (packs or bot policies) but not installed. */
 export function danglingSkillNames(graph: SkillGraph): string[] {
   return [...graph.skills.values()].filter(node => !node.installed).map(node => node.name).sort();
+}
+
+/** Decide the default checkbox state for discovered install candidates.
+ * No target → all preselected (existing behavior). With a target: only the
+ * matching candidate — and if the target is absent from the source, select
+ * NOTHING and flag it, so a wrong repo can't be accidentally bulk-installed. */
+export function selectInstallCandidates(
+  candidates: Array<{ name: string }>,
+  targetSkill: string | null | undefined,
+): { selected: Set<string>; targetMissing: boolean } {
+  if (targetSkill) {
+    const found = candidates.some(candidate => candidate.name === targetSkill);
+    return { selected: found ? new Set([targetSkill]) : new Set<string>(), targetMissing: !found };
+  }
+  return { selected: new Set(candidates.map(candidate => candidate.name)), targetMissing: false };
 }
