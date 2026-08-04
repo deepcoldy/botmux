@@ -90,23 +90,46 @@ export function resolveSpawnBackendType(
 }
 
 /**
- * Enforce the `cliId === 'riff' ⇔ backendType === 'riff'` pairing invariant at
- * the ONE spawn chokepoint, so every config entry point (dashboard, `/config
+ * CLIs that are NOT local processes: they have an empty `resolvedBin` and their
+ * backend translates write() into remote API / headless-CLI calls. For each of
+ * these the cliId and the backendType share a name and must stay paired.
+ *
+ * Adding a remote CLI means adding it here — the alternative (another
+ * hardcoded `=== 'riff'` chain in every helper below) is exactly what made this
+ * generalization necessary.
+ */
+const REMOTE_CLI_IDS: ReadonlySet<string> = new Set(['riff']);
+
+/** True for a backend that runs the agent off-box (no local PTY to own). */
+export function isRemoteBackendType(type: BackendType): boolean {
+  return REMOTE_CLI_IDS.has(type);
+}
+
+/**
+ * Enforce the `cliId === <remote> ⇔ backendType === <remote>` pairing invariant
+ * at the ONE spawn chokepoint, so every config entry point (dashboard, `/config
  * set cli|backendType`, `botmux setup`, hand-edited bots.json) converges:
- *   - riff CLI on a local backend → force 'riff' (a pty/tmux spawn would fail
- *     on the empty resolvedBin);
- *   - non-riff CLI on the riff backend → fall back to the daemon default (the
- *     CLI's PTY chunked writes would otherwise fan out into riff tasks).
- * Manual pty/tmux/herdr/zellij overrides for non-riff CLIs pass through.
+ *   - a remote CLI on a local backend → force its own backend (a pty/tmux spawn
+ *     would fail on the empty resolvedBin);
+ *   - a non-remote CLI on a remote backend → fall back to the daemon default
+ *     (the CLI's PTY chunked writes would otherwise fan out into remote tasks).
+ * Manual pty/tmux/herdr/zellij overrides for local CLIs pass through.
+ *
+ * NOTE: kept under its historical name `reconcileRiffBackendType` on purpose —
+ * it is imported by name in several modules and renaming it would bloat this
+ * behaviour-preserving refactor into a cross-cutting rename.
  */
 export function reconcileRiffBackendType(
   cliId: string,
   resolved: BackendType,
   defaultType: BackendType,
 ): BackendType {
-  if (cliId === 'riff') return 'riff';
-  // defaultType 本身被误配成 riff 时兜底到确定可用的本地后端（pty 无外部依赖）。
-  if (resolved === 'riff') return defaultType !== 'riff' ? defaultType : 'pty';
+  // A remote CLI dictates its own backend (same name by construction).
+  if (REMOTE_CLI_IDS.has(cliId)) return cliId as BackendType;
+  // defaultType 本身被误配成远端后端时兜底到确定可用的本地后端（pty 无外部依赖）。
+  if (isRemoteBackendType(resolved)) {
+    return !isRemoteBackendType(defaultType) ? defaultType : 'pty';
+  }
   return resolved;
 }
 
@@ -136,11 +159,12 @@ export function resolvePairedSpawnBackendType(
  * tears down — e.g. detach-preserving a "herdr" session whose real pane is tmux.
  */
 export function shutdownBackendDisposition(ds: DaemonSession): 'detach' | 'close' {
-  // riff：远端任务独立于本地进程存活。daemon shutdown 走 'close' 会经 worker 的
-  // destroySession() 取消远端任务——重启不该杀任务（血缘已持久化，重启后
-  // follow-up 续上，agent 的 botmux send 照常送达）。detach = 仅 SIGTERM worker。
+  // 远端后端（riff / mojo）：远端会话独立于本地进程存活。daemon shutdown 走
+  // 'close' 会经 worker 的 destroySession() 取消远端会话——重启不该杀它（血缘已
+  // 持久化，重启后 follow-up 续上，agent 的 botmux send 照常送达）。
+  // detach = 仅 SIGTERM worker。
   const frozen = ds.initConfig?.backendType ?? ds.session.backendType;
-  if (frozen === 'riff') return 'detach';
+  if (frozen && isRemoteBackendType(frozen)) return 'detach';
   return getSessionPersistentBackendType(ds) ? 'detach' : 'close';
 }
 
