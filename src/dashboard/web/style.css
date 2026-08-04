@@ -26823,3 +26823,138 @@ button.skills-issue-badge:hover {
   color: var(--muted);
   text-align: center;
 }
+
+/* --- 安装 Skill 表单：主输入优先，高级项折叠 ------------------------------
+   旧布局用两列 grid，左列堆 4 个区块、右列只有「仓库内路径」，主按钮被挤到
+   右列中部，视觉上与任何字段都不相关。改为单列：来源输入是主角，路径/Ref/
+   扫描深度收进折叠区，操作按钮回到表单底部。 */
+.skills-install-panel .skills-install-grid {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.skills-install-panel .skills-source-label {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.skills-install-panel .skills-source-control input {
+  width: 100%;
+  box-sizing: border-box;
+}
+
+/* 常用格式：可点击填入 */
+.skills-source-formats {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--muted);
+}
+.skills-source-formats button {
+  border: 1px solid var(--border-soft);
+  background: var(--surface-muted);
+  border-radius: var(--radius-full);
+  padding: 2px 10px;
+  cursor: pointer;
+  font: inherit;
+  color: var(--fg);
+}
+.skills-source-formats button:hover {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+.skills-source-formats code {
+  background: none;
+  padding: 0;
+  font-size: 11.5px;
+}
+
+/* 高级选项折叠区 */
+.skills-install-advanced {
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-sm);
+  background: var(--surface-muted);
+}
+.skills-install-advanced > summary {
+  cursor: pointer;
+  padding: 8px 12px;
+  font-size: 13px;
+  color: var(--muted);
+  list-style-position: inside;
+}
+.skills-install-advanced[open] > summary {
+  border-bottom: 1px solid var(--border-soft);
+  color: var(--fg);
+}
+.skills-install-advanced-body {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 12px;
+  padding: 12px;
+}
+.skills-install-advanced-body .skills-install-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 13px;
+}
+.skills-install-advanced-body .skills-install-field input {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 7px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  color: var(--fg);
+  font: inherit;
+}
+.skills-install-advanced-body small {
+  color: var(--muted);
+  font-size: 11.5px;
+}
+.skills-scan-toggle {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  font-size: 13px;
+}
+.skills-scan-toggle > span {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+/* 操作行：次要入口在左，主操作在右下 */
+.skills-install-panel .skills-install-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding-top: 2px;
+}
+.skills-local-discovery-link {
+  border: none;
+  background: none;
+  padding: 0;
+  font: inherit;
+  font-size: 13px;
+  color: var(--accent);
+  cursor: pointer;
+  text-decoration: underline;
+}
+.skills-install-panel .skills-install-actions .primary {
+  height: var(--button-compact-height);
+  padding: 0 var(--button-padding-x);
+  border: 1px solid var(--accent);
+  border-radius: var(--radius-full);
+  background: var(--accent);
+  color: var(--on-accent);
+  font: inherit;
+  cursor: pointer;
+}
+.skills-install-panel .skills-install-actions .primary:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}

@@ -35,6 +35,15 @@ import type {
 
 const INSTALLED_SKILLS_ROWS_PER_PAGE = 2;
 
+/** Clickable examples under the source field. Clicking fills the input so the
+ *  supported shapes are discoverable instead of guessed. */
+const INSTALL_SOURCE_EXAMPLES = [
+  'owner/repo',
+  'https://github.com/owner/repo/tree/main',
+  'agentbuddy:group/skill',
+  '/path/to/skill',
+];
+
 function installedSkillsColumnCount(width: number): number {
   if (width >= 1600) return 4;
   if (width <= 620) return 1;
@@ -201,10 +210,16 @@ export function SkillsInstallPanel(props: SkillsInstallPanelProps) {
           </div>
           <div className="skills-source-formats" aria-label={tr('skills.sourceFormats')}>
             <span>{tr('skills.sourceFormats')}</span>
-            <code>owner/repo</code>
-            <code>https://github.com/owner/repo/tree/main</code>
-            <code>agentbuddy … skill add group/skill</code>
-            <code>/path/to/skill</code>
+            {INSTALL_SOURCE_EXAMPLES.map(example => (
+              <button
+                key={example}
+                type="button"
+                data-action="use-source-example"
+                data-example={example}
+                title={tr('skills.sourceFormatUse')}
+                onClick={() => props.onInstallSourceChange(example)}
+              ><code>{example}</code></button>
+            ))}
           </div>
           {props.installSource.trim() ? (
             <div className={`skills-source-feedback is-${sourceType}`} data-source-hint={sourceType}>
@@ -213,33 +228,34 @@ export function SkillsInstallPanel(props: SkillsInstallPanelProps) {
             </div>
           ) : null}
         </label>
-        <label className="skills-install-field-wide skills-install-path-field"><span>{tr('skills.path')}</span>
-          <input
-            type="text"
-            data-install="path"
-            placeholder={tr('skills.pathPlaceholder')}
-            value={props.installPath}
-            onChange={e => props.onInstallPathChange(e.currentTarget.value)}
-          />
-          <small>{tr('skills.pathHelpInline')}</small>
-        </label>
-        <label className="skills-install-field-wide skills-install-ref-field"><span>{tr('skills.ref')}</span>
-          <input
-            type="text"
-            data-install="ref"
-            placeholder={tr('skills.refPlaceholder')}
-            value={props.installRef}
-            onChange={e => props.onInstallRefChange(e.currentTarget.value)}
-          />
-          <small>{tr('skills.refHelpInline')}</small>
-        </label>
-        <div className="skills-install-actions">
-          <button type="button" data-action="install" disabled={busy || !props.installSource.trim()} onClick={() => props.onInstall()}>
-            {props.installDiscovering ? tr('skills.scanning') : props.installBusy ? tr('skills.jobRunning') : tr('skills.installSubmit')}
-          </button>
-        </div>
-        <div className="skills-install-bottom-row">
-          <div className="skills-scan-strategy">
+        {/* Advanced options stay folded: the overwhelming majority of installs
+            are "paste an address and go". Path/Ref only apply to git sources and
+            the depth toggle is a fallback the backend already performs on its
+            own, so surfacing all three up front unbalanced the form and buried
+            the primary action. */}
+        <details className="skills-install-advanced" data-install-advanced>
+          <summary>{tr('skills.advancedOptions')}</summary>
+          <div className="skills-install-advanced-body">
+            <label className="skills-install-field"><span>{tr('skills.path')}</span>
+              <input
+                type="text"
+                data-install="path"
+                placeholder={tr('skills.pathPlaceholder')}
+                value={props.installPath}
+                onChange={e => props.onInstallPathChange(e.currentTarget.value)}
+              />
+              <small>{tr('skills.pathHelpInline')}</small>
+            </label>
+            <label className="skills-install-field"><span>{tr('skills.ref')}</span>
+              <input
+                type="text"
+                data-install="ref"
+                placeholder={tr('skills.refPlaceholder')}
+                value={props.installRef}
+                onChange={e => props.onInstallRefChange(e.currentTarget.value)}
+              />
+              <small>{tr('skills.refHelpInline')}</small>
+            </label>
             <label className="skills-scan-toggle">
               <input
                 type="checkbox"
@@ -251,19 +267,23 @@ export function SkillsInstallPanel(props: SkillsInstallPanelProps) {
               <span>
                 <strong>{tr('skills.deepScan')}</strong>
                 <small>{tr('skills.deepScanHelp')}</small>
+                <small className="muted">{tr('skills.autoDeepScanHint')}</small>
               </span>
             </label>
-            <p>{tr('skills.autoDeepScanHint')}</p>
           </div>
-          <div className="skills-local-discovery-panel">
-            <div>
-              <strong>{tr('skills.localDiscoverTitle')}</strong>
-              <span>{tr('skills.localDiscoverHelp')}</span>
-            </div>
-            <button type="button" data-action="open-native-skill-discovery" onClick={() => props.onOpenNativeDiscovery()}>
-              {tr('skills.localDiscover')}
-            </button>
-          </div>
+        </details>
+
+        <div className="skills-install-actions">
+          <button
+            type="button"
+            className="skills-local-discovery-link"
+            data-action="open-native-skill-discovery"
+            title={tr('skills.localDiscoverHelp')}
+            onClick={() => props.onOpenNativeDiscovery()}
+          >{tr('skills.localDiscover')}</button>
+          <button type="button" className="primary" data-action="install" disabled={busy || !props.installSource.trim()} onClick={() => props.onInstall()}>
+            {props.installDiscovering ? tr('skills.scanning') : props.installBusy ? tr('skills.jobRunning') : tr('skills.installSubmit')}
+          </button>
         </div>
       </div>
       {props.installStatus ? (
