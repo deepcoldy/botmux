@@ -21,7 +21,7 @@
  *   botmux whiteboard status|enable|disable|current|list|read|update|write — local project whiteboard
  */
 import { execSync, execFileSync, spawnSync, spawn } from 'node:child_process';
-import { existsSync, mkdirSync, copyFileSync, readFileSync, writeFileSync, renameSync, readdirSync, readlinkSync, appendFileSync, statSync, unlinkSync, rmSync, realpathSync } from 'node:fs';
+import { existsSync, mkdirSync, copyFileSync, readFileSync, writeFileSync, renameSync, readdirSync, readlinkSync, symlinkSync, appendFileSync, statSync, unlinkSync, rmSync, realpathSync } from 'node:fs';
 import { underReadIsolation, sendCredFilePath } from './adapters/cli/read-isolation.js';
 import { atomicWriteFileSync } from './utils/atomic-write.js';
 import { join, dirname, basename, resolve } from 'node:path';
@@ -497,6 +497,47 @@ async function cmdServe(args: string[]): Promise<void> {
   });
 }
 
+/**
+ * pm2-safe interpreter path.
+ *
+ * pm2 (>=6, lib/Common.js) treats ANY interpreter path containing the
+ * substring `node@` as an nvm version handle and tries to `nvm install` it —
+ * so a Homebrew keg-only Node (e.g.
+ * `/home/linuxbrew/.linuxbrew/Cellar/node@22/22.23.1/bin/node`) is misread as
+ * version `22/22.23.1/bin/node`, and every `botmux start/restart` dies with
+ * `Version '22/22.23.1/bin/node' not found`.
+ *
+ * We can't just point at a different existing binary: the keg-only formula's
+ * only paths (Cellar/, opt/, and — when it's not the default — bin/) all
+ * contain `node@`. So when process.execPath carries `node@`, we materialize a
+ * stable `@`-free symlink under ~/.botmux and hand pm2 THAT. The symlink still
+ * resolves to the exact Node that launched this CLI (same version → native
+ * modules like node-pty keep working), but its path no longer trips pm2's
+ * nvm heuristic. Non-Homebrew installs keep using process.execPath verbatim.
+ */
+function pm2SafeInterpreter(): string {
+  const exec = process.execPath;
+  if (!exec.includes('node@')) return exec;
+  const link = join(CONFIG_DIR, 'node-interpreter');
+  try {
+    mkdirSync(CONFIG_DIR, { recursive: true });
+    // Refresh the link if missing or pointing at a stale Node (e.g. after a
+    // Homebrew upgrade bumped the patch version under the same install).
+    let current: string | undefined;
+    try { current = readlinkSync(link); } catch { /* not a symlink / absent */ }
+    if (current !== exec) {
+      try { unlinkSync(link); } catch { /* absent */ }
+      symlinkSync(exec, link);
+    }
+    // Sanity: the link must still resolve to a real node. If anything is off,
+    // fall back to the raw path rather than handing pm2 a dangling symlink.
+    if (realpathSync(link) && !link.includes('node@')) return link;
+  } catch {
+    /* fall through to raw execPath */
+  }
+  return exec;
+}
+
 function ecosystemConfig(activationAppId?: string): string {
   const daemonScript = join(PKG_ROOT, 'dist', 'index-daemon.js');
   const bots = loadBotsJson();
@@ -506,12 +547,15 @@ function ecosystemConfig(activationAppId?: string): string {
     existsSync(ENV_FILE) ? readFileSync(ENV_FILE, 'utf-8') : undefined,
   );
 
+  // Node binary every managed process is pinned to (see pm2SafeInterpreter).
+  const interpreter = pm2SafeInterpreter();
+
   const baseApp = {
     script: daemonScript,
     // Pin every managed core process to the Node that invoked this CLI. This
     // keeps GUI/launchd starts independent from PATH and lets Desktop replace
     // an external fleet without also killing unrelated plugin services.
-    interpreter: process.execPath,
+    interpreter,
     cwd: CONFIG_DIR,
     autorestart: true,
     max_restarts: 10,
@@ -604,7 +648,7 @@ function ecosystemConfig(activationAppId?: string): string {
   apps.push({
     name: 'botmux-dashboard',
     script: join(PKG_ROOT, 'dist', 'dashboard.js'),
-    interpreter: process.execPath,
+    interpreter,
     cwd: PKG_ROOT,
     autorestart: true,
     max_restarts: 10,
