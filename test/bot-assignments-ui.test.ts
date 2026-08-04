@@ -78,6 +78,76 @@ describe('bot assignments tab', () => {
     expect(onSave).toHaveBeenCalledWith('app-1', [], ['p1']);
   });
 
+  it('does not copy or move an existing assignment when it is dropped on another Bot', async () => {
+    const onSave = vi.fn(async () => {});
+    let renderer!: TestRenderer.ReactTestRenderer;
+    act(() => {
+      renderer = TestRenderer.create(React.createElement(BotAssignmentsTab, {
+        bots: [
+          bot({ skills: { include: ['pack:p1'] } }),
+          bot({ larkAppId: 'app-2', botName: 'Bot 2' }),
+        ],
+        skills,
+        statuses: {},
+        onSave,
+        packs,
+      }));
+    });
+    const root = renderer.root;
+    const assignedPack = root.findByProps({
+      'data-assigned-drag-type': 'pack',
+      'data-assigned-drag-id': 'p1',
+      'data-assigned-bot': 'app-1',
+    });
+    const rows = root.findAllByType('tr')
+      .filter((node: any) => String(node.props.className).includes('skills-bot-row'));
+    const targetRow = rows[1]!;
+
+    act(() => { assignedPack.props.onDragStart(dragEvent()); });
+    const overEvent = dragEvent();
+    act(() => { targetRow.props.onDragOver(overEvent); });
+    expect(overEvent.preventDefault).not.toHaveBeenCalled();
+    expect(overEvent.dataTransfer.dropEffect).toBe('');
+    const dropEvent = dragEvent();
+    await act(async () => { targetRow.props.onDrop(dropEvent); await Promise.resolve(); });
+
+    expect(dropEvent.preventDefault).not.toHaveBeenCalled();
+    expect(onSave).not.toHaveBeenCalled();
+  });
+
+  it('writes text/plain drag data for Firefox on palette and assigned drags', () => {
+    let renderer!: TestRenderer.ReactTestRenderer;
+    act(() => {
+      renderer = TestRenderer.create(React.createElement(BotAssignmentsTab, {
+        bots: [bot({ skills: { include: ['skill:b'] } })],
+        skills,
+        statuses: {},
+        onSave: async () => {},
+        packs,
+      }));
+    });
+    const root = renderer.root;
+    const palettePack = root.findByProps({
+      'data-palette-drag-type': 'pack',
+      'data-palette-drag-id': 'p1',
+    });
+    const paletteEvent = dragEvent();
+    act(() => { palettePack.props.onDragStart(paletteEvent); });
+    expect(paletteEvent.dataTransfer.setData).toHaveBeenCalledWith('text/plain', 'p1');
+    expect(paletteEvent.dataTransfer.effectAllowed).toBe('copy');
+    act(() => { palettePack.props.onDragEnd(); });
+
+    const assignedSkill = root.findByProps({
+      'data-assigned-drag-type': 'skill',
+      'data-assigned-drag-id': 'b',
+      'data-assigned-bot': 'app-1',
+    });
+    const assignedEvent = dragEvent();
+    act(() => { assignedSkill.props.onDragStart(assignedEvent); });
+    expect(assignedEvent.dataTransfer.setData).toHaveBeenCalledWith('text/plain', 'b');
+    expect(assignedEvent.dataTransfer.effectAllowed).toBe('move');
+  });
+
   it('drags an assigned Pack back to the remove zone without touching other selectors', async () => {
     const onSave = vi.fn(async () => {});
     let renderer!: TestRenderer.ReactTestRenderer;
