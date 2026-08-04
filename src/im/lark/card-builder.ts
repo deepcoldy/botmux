@@ -210,6 +210,7 @@ const cliDisplayNames: Record<CliId, string> = {
   'grok': 'Grok Build',
   'kiro-cli': 'Kiro',
   'riff': 'Riff',
+  'mojo': 'Mojo',
 };
 
 export function getCliDisplayName(cliId: CliId): string {
