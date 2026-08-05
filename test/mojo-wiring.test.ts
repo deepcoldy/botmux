@@ -15,11 +15,12 @@ vi.mock('../src/utils/logger.js', () => ({
 }));
 
 import { createMojoAdapter } from '../src/adapters/cli/mojo.js';
-import { createCliAdapterSync } from '../src/adapters/cli/registry.js';
+import { createCliAdapterSync, rawCliExecutable } from '../src/adapters/cli/registry.js';
 import { localSandboxApplies } from '../src/adapters/backend/sandbox.js';
 import { buildReproduceCommand } from '../src/adapters/backend/reproduce-command.js';
 import {
   isRemoteBackendType,
+  isRemoteCliId,
   reconcileRiffBackendType,
 } from '../src/core/persistent-backend.js';
 
@@ -96,5 +97,28 @@ describe('mojo backend bypasses local-only machinery', () => {
       args: [],
       cwd: '/tmp',
     })).toBeNull();
+  });
+});
+
+describe('remote CLI id classification', () => {
+  it('recognizes mojo and riff as remote CLI ids', () => {
+    expect(isRemoteCliId('mojo')).toBe(true);
+    expect(isRemoteCliId('riff')).toBe(true);
+    expect(isRemoteCliId('claude-code')).toBe(false);
+    expect(isRemoteCliId(undefined)).toBe(false);
+  });
+});
+
+describe('mojo requires a local binary (unlike riff/mira)', () => {
+  it('declares `mojo` so setup fails fast on a missing install', () => {
+    // MojoBackend spawns the binary once per turn, so a missing install is a
+    // real, user-visible failure — it must NOT be treated like riff/mira, which
+    // are pure HTTP and legitimately have no local command.
+    expect(rawCliExecutable('mojo')).toBe('mojo');
+    expect(rawCliExecutable('riff')).toBeUndefined();
+  });
+
+  it('honours an explicit path override', () => {
+    expect(rawCliExecutable('mojo', '/opt/custom/mojo')).toBe('/opt/custom/mojo');
   });
 });
