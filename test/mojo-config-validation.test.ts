@@ -18,6 +18,7 @@ vi.mock('../src/utils/logger.js', () => ({
 
 import {
   diffMojoSessionIdentity,
+  MOJO_CONTROL_ENV_KEYS,
   MOJO_IDENTITY_KEYS,
   normalizeMojoConfig,
   pickMojoSessionIdentity,
@@ -196,5 +197,72 @@ describe('frozen control-plane identity', () => {
     // excluding credentials from the frozen set.
     const live = pickMojoSessionIdentity({ ...cfg, jwt: 'new-token' });
     expect(diffMojoSessionIdentity(frozen, live)).toEqual([]);
+  });
+});
+
+describe('control-plane env keys are not a back door', () => {
+  it('lists exactly the env vars that mirror frozen identity keys', () => {
+    // X_JWT_TOKEN must NOT be here: a rotated credential has to keep working.
+    expect([...MOJO_CONTROL_ENV_KEYS]).toEqual([
+      'AGENT_BASE_URL', 'MOJO_PPE_ENV', 'AGENT_LOCAL_DAEMON',
+    ]);
+    expect([...MOJO_CONTROL_ENV_KEYS]).not.toContain('X_JWT_TOKEN');
+  });
+
+  it('rejects a control-plane var inside mojo.env, naming the real setting', () => {
+    // Silently stripping would leave the operator believing their endpoint applied.
+    for (const [key, owner] of [
+      ['AGENT_BASE_URL', 'baseUrl'],
+      ['MOJO_PPE_ENV', 'ppeEnv'],
+      ['AGENT_LOCAL_DAEMON', 'localDaemon'],
+    ]) {
+      const r = normalizeMojoConfig({ env: { [key]: 'x' } });
+      expect(r.ok, `${key} must be rejected`).toBe(false);
+      if (!r.ok) expect(r.errors.join()).toContain(owner);
+    }
+  });
+
+  it('still accepts an unrelated env var, and a live JWT', () => {
+    expect(normalizeMojoConfig({ env: { MY_TOKEN: 'x' } }).ok).toBe(true);
+    expect(normalizeMojoConfig({ env: { X_JWT_TOKEN: 'rotated' } }).ok).toBe(true);
+  });
+});
+
+describe('drift logging does not leak credentials', () => {
+  it('reports only the key name for URL-shaped values', () => {
+    // The URL validator accepts userinfo and query strings because they are valid
+    // endpoints, so logging old/new values verbatim would write a password or a
+    // signed token into the daemon log.
+    const frozen = pickMojoSessionIdentity({
+      baseUrl: 'https://user:password@tenant-a.example.com/api?sig=secret-token',
+    });
+    const live = pickMojoSessionIdentity({
+      baseUrl: 'https://other:pw@tenant-b.example.com/api?sig=another-secret',
+    });
+    const drift = diffMojoSessionIdentity(frozen, live);
+
+    expect(drift).toEqual(['baseUrl']);
+    const text = drift.join('\n');
+    for (const secret of ['password', 'secret-token', 'another-secret', 'tenant-a', 'tenant-b']) {
+      expect(text, `must not leak ${secret}`).not.toContain(secret);
+    }
+  });
+
+  it('never leaks a workspace/agent/profile identifier either', () => {
+    const drift = diffMojoSessionIdentity(
+      pickMojoSessionIdentity({ workspaceId: 'ws-secret-a', agentId: 'ag-a', ppeEnv: 'ppe-a' }),
+      pickMojoSessionIdentity({ workspaceId: 'ws-secret-b', agentId: 'ag-b', ppeEnv: 'ppe-b' }),
+    );
+    expect(drift).toEqual(['ppeEnv', 'workspaceId', 'agentId']);
+    expect(drift.join()).not.toContain('secret');
+  });
+
+  it('DOES show boolean transitions — cloud→host is the point of the warning', () => {
+    const drift = diffMojoSessionIdentity(
+      pickMojoSessionIdentity({ cloud: true, localDaemon: false }),
+      pickMojoSessionIdentity({ cloud: false, localDaemon: true }),
+    );
+    expect(drift.join('\n')).toContain('cloud: true → false');
+    expect(drift.join('\n')).toContain('localDaemon: false → true');
   });
 });

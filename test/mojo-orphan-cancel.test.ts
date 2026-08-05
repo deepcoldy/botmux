@@ -358,3 +358,63 @@ describe('control-plane identity is frozen onto the session', () => {
     expect(guard).toBeGreaterThan(legacy);
   });
 });
+
+describe('legacy sessions are migrated at restore, not lazily', () => {
+  const src = readSource('src/core/worker-pool.ts', 'utf-8');
+  const daemonSrc = readSource('src/daemon.ts', 'utf-8');
+
+  it('runs the migration during daemon startup, right after restore', () => {
+    // The lazy path left a window: after a restart but before a session's next
+    // wake, an operator could change the endpoint and the session would adopt THAT
+    // as its original identity. Restore completes before the dispatcher can
+    // deliver a message, so migrating there closes it.
+    const restore = daemonSrc.indexOf('await restoreActiveSessions(activeSessions);');
+    const migrate = daemonSrc.indexOf('migrateMojoSessionIdentities(activeSessions);', restore);
+    expect(restore).toBeGreaterThanOrEqual(0);
+    expect(migrate).toBeGreaterThan(restore);
+  });
+
+  it('persists an empty snapshot so "frozen as unset" is distinguishable', () => {
+    // `undefined` = predates the field; `{}` = frozen with nothing configured.
+    // Skipping the empty case would leave the row permanently un-migrated.
+    const fn = src.indexOf('export function migrateMojoSessionIdentities');
+    expect(fn).toBeGreaterThanOrEqual(0);
+    const region = src.slice(fn, fn + 1800);
+    expect(region).toContain('if (ds.session.mojoIdentity) continue;');
+    expect(region).toContain("sessionMojoConfig(ds, botCfg, { freeze: true })");
+  });
+
+  it('fails closed on a legacy row that already holds a remote lineage', () => {
+    // Such a row already created a session on SOME control plane and nothing
+    // records which, so adopting today's config would pair that lineage with a
+    // possibly different tenant. Dropping the lineage restarts fresh on a known
+    // control plane instead.
+    const fn = src.indexOf('function sessionMojoConfig');
+    const region = src.slice(fn, fn + 2600);
+    const legacy = region.indexOf('if (!ds.session.mojoIdentity)');
+    const lineage = region.indexOf('if (ds.session.riffParentTaskId)', legacy);
+    const drop = region.indexOf('ds.session.riffParentTaskId = undefined;', lineage);
+    expect(legacy).toBeGreaterThanOrEqual(0);
+    expect(lineage).toBeGreaterThan(legacy);
+    expect(drop).toBeGreaterThan(lineage);
+  });
+});
+
+describe('device isolation prefers the frozen identity', () => {
+  const src = readSource('src/core/device-isolation-daemon.ts', 'utf-8');
+
+  it('reads session.mojoIdentity before falling back to live bot config', () => {
+    // Live config would misclassify a session frozen as local (since switched to
+    // cloud) as safe_remote, and vice versa.
+    const fn = src.indexOf('function resolveRemoteExecutionProven');
+    expect(fn).toBeGreaterThanOrEqual(0);
+    const region = src.slice(fn, fn + 1600);
+
+    const fromInit = region.indexOf('if (fromInit) return isMojoFullyRemote(fromInit);');
+    const frozen = region.indexOf('ds.session.mojoIdentity', fromInit);
+    const live = region.indexOf('getBot(ds.larkAppId).config.mojo', frozen);
+    expect(fromInit).toBeGreaterThanOrEqual(0);
+    expect(frozen).toBeGreaterThan(fromInit);
+    expect(live).toBeGreaterThan(frozen);
+  });
+});

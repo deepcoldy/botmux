@@ -52,6 +52,7 @@ node -e '
       X_JWT_TOKEN: process.env.X_JWT_TOKEN,
       WRAPPER_MARK: process.env.WRAPPER_MARK,
       AGENT_BASE_URL: process.env.AGENT_BASE_URL,
+      MOJO_PPE_ENV: process.env.MOJO_PPE_ENV,
     },
   }, null, 2));
 ' -- "$@"
@@ -468,6 +469,49 @@ describe('mojo worker wiring', () => {
     expect(invocation.env.AGENT_BASE_URL).toBe('https://tenant-a.example.com');
     expect(invocation.argv).toContain('--workspace-id');
     expect(invocation.argv[invocation.argv.indexOf('--workspace-id') + 1]).toBe('ws-a');
+  }, 40_000);
+
+  it('does not let per-bot env supply the control plane', async () => {
+    // The freeze covers `baseUrl`/`ppeEnv`, but the mojo CLI also reads them from
+    // env — so a live `env: { AGENT_BASE_URL: <tenant-b> }` was a back door around
+    // it. Worse, the old code only overwrote these CONDITIONALLY (`if (baseUrl)`),
+    // so a session whose frozen snapshot had no baseUrl inherited the live one.
+    const { invocation } = await runWorker({
+      workerEnv: {
+        AGENT_BASE_URL: 'https://ambient-tenant.example.com',
+        MOJO_PPE_ENV: 'ppe-ambient',
+      },
+      botEntry: { env: { UNRELATED: 'kept' }, mojo: { cloud: true } },
+      init: { env: { UNRELATED: 'kept' }, backendConfig: { cloud: true } },
+    });
+    // Config declares neither, so the CLI must fall back to its own defaults
+    // rather than inherit an endpoint from the environment.
+    expect(invocation.env.AGENT_BASE_URL).toBeUndefined();
+    expect(invocation.env.MOJO_PPE_ENV).toBeUndefined();
+    // Unrelated per-bot env is untouched — only control-plane keys are stripped.
+    expect(invocation.env.PER_BOT_TOKEN).toBeUndefined();
+    // And an ambient AGENT_LOCAL_DAEMON cannot enable host execution.
+    expect(invocation.env.AGENT_LOCAL_DAEMON).toBe('0');
+  }, 40_000);
+
+  it('an ambient AGENT_LOCAL_DAEMON=1 cannot enable host execution', async () => {
+    const { invocation } = await runWorker({
+      workerEnv: { AGENT_LOCAL_DAEMON: '1' },
+      botEntry: { mojo: { cloud: true } },
+      init: { backendConfig: { cloud: true } },
+    });
+    // Always written from config, never inherited.
+    expect(invocation.env.AGENT_LOCAL_DAEMON).toBe('0');
+  }, 40_000);
+
+  it('derives the control plane from config, overriding any inherited value', async () => {
+    const { invocation } = await runWorker({
+      workerEnv: { AGENT_BASE_URL: 'https://ambient-tenant.example.com' },
+      botEntry: { mojo: { cloud: true, baseUrl: 'https://configured.example.com', ppeEnv: 'ppe-1' } },
+      init: { backendConfig: { cloud: true, baseUrl: 'https://configured.example.com', ppeEnv: 'ppe-1' } },
+    });
+    expect(invocation.env.AGENT_BASE_URL).toBe('https://configured.example.com');
+    expect(invocation.env.MOJO_PPE_ENV).toBe('ppe-1');
   }, 40_000);
 
   it('refuses to start a locally-executing mojo bot that requested sandbox', async () => {
