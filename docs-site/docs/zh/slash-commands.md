@@ -53,7 +53,9 @@
 
 ## 🔀 透传给底层 CLI
 
-`/compact` `/model` `/clear` `/plugin` `/usage` `/new` `/context` `/cost` `/mcp` `/diff` `/code-review` `/security-review` `/review` `/btw` `/effort` —— 字面送达底层 CLI，交给它的内置命令处理。
+`/compact` `/model` `/clear` `/plugin` `/usage` `/new` `/context` `/cost` `/mcp` `/diff` `/code-review` `/security-review` `/review` `/btw` `/effort` `/fast` —— 字面送达底层 CLI，交给它的内置命令处理。
+
+`/fast` 仅对 Codex 生效：切换 Codex 原生的 service tier 档位，流式卡片会显示只读的 `⚡ <档位>` 徽标，如实反映 Codex 实际运行的档位。在 RPC 输入模式或 Riff 后端上，按键到不了 Codex 执行器，因此 `/fast` 在这些后端会 fail-closed 给出明确提示，而非静默失效。
 
 部分 CLI 还有 adapter 默认放行的命令：Claude Code / Codex 默认放行 `/goal`，因此新话题第一条发 `/goal ...` 也会先启动/选择仓库，再把 `/goal ...` 原样投给 CLI。
 

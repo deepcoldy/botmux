@@ -53,7 +53,9 @@ The group-level setting overrides the dashboard "Bot Config → Regular Group Mo
 
 ## 🔀 Passthrough to the Underlying CLI
 
-`/compact` `/model` `/clear` `/plugin` `/usage` `/new` `/context` `/cost` `/mcp` `/diff` `/code-review` `/security-review` `/review` `/btw` `/effort` — delivered literally to the underlying CLI and handled by its built-in commands.
+`/compact` `/model` `/clear` `/plugin` `/usage` `/new` `/context` `/cost` `/mcp` `/diff` `/code-review` `/security-review` `/review` `/btw` `/effort` `/fast` — delivered literally to the underlying CLI and handled by its built-in commands.
+
+`/fast` is Codex-specific: it toggles Codex's native service tier, and the streaming card shows a read-only `⚡ <tier>` badge reflecting whatever tier Codex actually runs. On RPC-input or Riff backends the keystroke can't reach Codex's executor, so `/fast` fails closed there with a clear notice instead of a silent no-op.
 
 Some CLIs also declare adapter-default passthrough commands: Claude Code and Codex default-allow `/goal`, so a new topic whose first message is `/goal ...` will start/select the repository first and then send `/goal ...` to the CLI literally.
 
