@@ -34,7 +34,7 @@ import {
   type IsolationCapability,
 } from './adapters/cli/read-isolation.js';
 import { buildFsPolicy, compileToSeatbelt, migrateLegacySandboxFields, resolveRedirectedAdapterAuthPaths, FsPolicyConfigError } from './adapters/cli/fs-policy.js';
-import { killPersistentBackendTarget, killPersistentSession, probePersistentBackendTarget, probePersistentSession, shouldRejectPersistentPostKillProbe, type PersistentBackendType } from './core/persistent-backend.js';
+import { isRemoteBackendType, killPersistentBackendTarget, killPersistentSession, probePersistentBackendTarget, probePersistentSession, shouldRejectPersistentPostKillProbe, type PersistentBackendType } from './core/persistent-backend.js';
 import { readProcessStartIdentity } from './core/session-marker.js';
 import { roleLibraryRoot, roleLibrarySubtree } from './core/role-library.js';
 import { drainTranscript, joinAssistantText, trailingAssistantText, findJsonlContainingFingerprint, findJsonlsContainingExactContent, findLatestJsonl, extractLastAssistantTurn, stringifyUserContent, extractTurnStartText, splitTranscriptEventsByCutoff, isTranscriptRateLimitEvent, apiErrorMessageText, type TranscriptEvent } from './services/claude-transcript.js';
@@ -236,6 +236,7 @@ import {
   isValidRiffSandboxCluster,
   type RiffBackendConfig,
 } from './adapters/backend/riff-backend.js';
+import type { MojoBackendConfig } from './adapters/backend/mojo-types.js';
 import {
   prepareDirectSandbox,
   prepareCredentialOnlySandbox,
@@ -7717,6 +7718,37 @@ async function spawnCli(
   // PTY/tmux backends inject these into the child process env directly; riff
   // has no local process, so they go via config.env → the riff API's config.env.
   let riffBackendConfig = cfg.backendConfig;
+  // mojo: build ONE effective config that folds the host-owned session settings
+  // into the mojo-specific block. Without this the backend silently ignores
+  // everything botmux already resolved — repo selection (workingDir), the
+  // dashboard/setup `model`, `disableCliBypass`, `cliPathOverride` and the
+  // persisted session lineage — because MojoBackendConfig only ever saw the
+  // hand-written bots.json `mojo` block.
+  //
+  // Precedence: an explicit value in the `mojo` block wins (it is the more
+  // specific setting), the generic session value is the fallback.
+  if (effectiveBackendType === 'mojo') {
+    const mojoCfg = (cfg.backendConfig ?? {}) as MojoBackendConfig;
+    riffBackendConfig = {
+      ...mojoCfg,
+      // The worker resolves the real binary (wrapperCli / cliPathOverride /
+      // PATH lookup); a bare 'mojo' would ignore an operator's explicit path
+      // even though cli-availability already validated THAT path.
+      bin: mojoCfg.bin ?? cfg.cliPathOverride?.trim() ?? undefined,
+      cwd: mojoCfg.cwd ?? cfg.workingDir,
+      model: mojoCfg.model ?? cfg.model,
+      // Generic opt-out must reach the backend, otherwise `--yolo` is still
+      // appended for a bot explicitly configured to keep CLI approvals.
+      disableCliBypass: mojoCfg.disableCliBypass ?? cfg.disableCliBypass,
+      // Resume the persisted lineage: daemon restart, /relay and worker
+      // rebuilds all arrive with riffParentTaskId set (the shared remote-lineage
+      // channel — see the riff_task_id IPC message, which is emitted by the
+      // generic backend.onTaskId hook and therefore already carries mojo ids).
+      resumeCliSessionId: mojoCfg.resumeCliSessionId ?? cfg.riffParentTaskId,
+    };
+    const resumed = (riffBackendConfig as MojoBackendConfig).resumeCliSessionId;
+    if (resumed) log(`mojo resuming session lineage ${resumed}`);
+  }
   if (effectiveBackendType === 'riff') {
     if (!cfg.backendConfig) {
       throw new Error('riff backend requires backendConfig (baseUrl, etc.)');
@@ -7834,15 +7866,32 @@ async function spawnCli(
   // BOTS_CONFIG. riff runs in its own REMOTE sandbox with no local CLI process —
   // local confinement is meaningless there and must be bypassed on ALL
   // platforms, or a sandbox-enabled bot bricks the moment it switches to riff.
-  const riffRemoteBackend = !localSandboxApplies(effectiveBackendType);
+  // mojo only counts as remote when it provably runs nothing locally
+  // (cloud on, localDaemon off) — otherwise the local sandbox must stay engaged.
+  const remoteBackendFullyOffBox = !localSandboxApplies(
+    effectiveBackendType,
+    effectiveBackendType === 'mojo'
+      ? (riffBackendConfig as MojoBackendConfig | undefined)
+      : undefined,
+  );
+  const riffRemoteBackend = remoteBackendFullyOffBox;
   if (riffRemoteBackend && (cfg.sandbox === true || cfg.readIsolation === true)) {
-    log('Sandbox flag set but backend is riff (remote sandbox, no local process) — local sandbox bypassed');
+    log(`Sandbox flag set but backend is ${effectiveBackendType} (remote sandbox, no local process) — local sandbox bypassed`);
+  }
+  if (effectiveBackendType === 'mojo' && !remoteBackendFullyOffBox
+      && (cfg.sandbox === true || cfg.readIsolation === true)) {
+    // Loud on purpose: this is the combination where a mojo bot DOES execute
+    // locally, so the local sandbox stays on rather than being skipped.
+    log('mojo runs tools locally (cloud not enabled, or localDaemon set) — keeping the local sandbox engaged');
   }
   const sandboxRequested = !riffRemoteBackend
     && (cfg.sandbox === true || cfg.readIsolation === true || sandboxEnabled());
   const backendIsolationGate = backendSandboxCompatibilityError({
     backendType: effectiveBackendType,
     fileSandboxRequested: sandboxRequested,
+    ...(effectiveBackendType === 'mojo'
+      ? { mojoConfig: (riffBackendConfig ?? {}) as MojoBackendConfig }
+      : {}),
     // The unified sandbox request above already includes legacy readIsolation.
     effectiveReadIsolationRequested: false,
   });
@@ -9696,11 +9745,12 @@ async function spawnCli(
     else markPromptReady();
   };
 
-  // Set up idle detection. Riff (remote HTTP backend) has no PTY output and
-  // is marked ready immediately after spawn (see below), so the idle detector
+  // Set up idle detection. Remote backends (riff / mojo) have no PTY output and
+  // are marked ready immediately after spawn (see below), so the idle detector
   // is unnecessary — and without a readyPattern it would fire on every
   // quiescence, repeatedly triggering markPromptReady() and duplicate cards.
-  if (effectiveBackendType !== 'riff') {
+  // (For mojo it is also actively harmful — see MojoBackend.settleTurn.)
+  if (!isRemoteBackendType(effectiveBackendType)) {
     idleDetector = new IdleDetector(cliAdapter);
     idleDetector.onIdle(async (evidenceSource) => {
       log('Prompt detected (idle)');
@@ -9952,12 +10002,12 @@ async function spawnCli(
   };
   setTimeout(() => releaseFirstPromptTimeout(FIRST_PROMPT_TIMEOUT_MS, false), FIRST_PROMPT_TIMEOUT_MS);
 
-  // Riff (and other remote HTTP backends) have no local boot process — the
-  // backend is ready immediately after spawn(). The idle detector never fires
-  // for them (no PTY output), and the first-prompt timeout only flushes for
-  // type-ahead adapters, so isPromptReady would otherwise stay false forever
-  // and the first message would never reach the riff API. Mark ready right away.
-  if (effectiveBackendType === 'riff') {
+  // Remote backends (riff / mojo) have no local boot process — the backend is
+  // ready immediately after spawn(). The idle detector never fires for them (no
+  // PTY output), and the first-prompt timeout only flushes for type-ahead
+  // adapters, so isPromptReady would otherwise stay false until the ~15s
+  // fallback and every first message would be needlessly delayed.
+  if (isRemoteBackendType(effectiveBackendType)) {
     markPromptReady();
   }
 }
@@ -10171,10 +10221,11 @@ async function restartCliProcess(
           void restartCliProcess(reason, { preservePending: true, skipRestartBudget: followup.skipRestartBudget });
           return;
         }
-        // Riff marks itself prompt-ready inside spawnCli(); that early flush is
-        // intentionally held by the restart gate above. Release its raw-input
-        // fence now; other backends keep it until their later markPromptReady().
-        if (effectiveBackendType === 'riff' && isPromptReady) releaseRawInputRestartGate();
+        // Remote backends mark themselves prompt-ready inside spawnCli(); that
+        // early flush is intentionally held by the restart gate above. Release
+        // the raw-input fence now; local backends keep it until their later
+        // markPromptReady().
+        if (isRemoteBackendType(effectiveBackendType) && isPromptReady) releaseRawInputRestartGate();
         // A local replacement process can exist before its TUI input box does.
         // Only re-kick a prompt that became ready while the restart fence was
         // still armed; otherwise markPromptReady() owns the first flush.
@@ -12561,9 +12612,9 @@ process.on('message', async (raw: unknown) => {
       // uses to recover sessions after a reboot kills the tmux server).
       revokeManagedTurnOriginForRestart();
       try {
-        // riff：suspend 语义是「休眠待续」——绝不能 cancel 远端任务（血缘已持久化，
-        // 恢复时 follow-up 续上）；只断流 detach。
-        if (effectiveBackendType === 'riff') backend?.kill();
+        // 远端后端（riff / mojo）：suspend 语义是「休眠待续」——绝不能 cancel 远端
+        // 会话（血缘已持久化，恢复时 follow-up 续上）；只断流 detach。
+        if (isRemoteBackendType(effectiveBackendType)) backend?.kill();
         else (backend?.destroySession ?? backend?.kill)?.call(backend);
       } catch { /* best-effort */ }
       backend = null;

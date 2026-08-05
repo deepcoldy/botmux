@@ -127,6 +127,14 @@ export class MojoBackend implements SessionBackend {
      *  so the trailing whole-segment `text` event isn't printed twice. */
     private streamedThisTurn = false;
     private readonly cliTimeoutMs = 60_000;
+    /**
+     * Captured from spawn(). The worker owns the authoritative cwd + env (the
+     * BOTMUX_* session context, per-bot `env`, credential paths, proxies) and
+     * hands them over exactly once; ignoring them silently drops repo selection,
+     * per-bot tokens and proxy settings. `config` values still win where set, so
+     * an explicit bots.json override remains authoritative.
+     */
+    private spawnOpts: SpawnOpts | null = null;
     private writeChain: Promise<void> = Promise.resolve();
 
     constructor(config: MojoBackendConfig, sessionId: string) {
@@ -140,8 +148,17 @@ export class MojoBackend implements SessionBackend {
 
     // ── SessionBackend surface ───────────────────────────────────────────────
 
-    spawn(_bin: string, _args: string[], _opts: SpawnOpts): void {
-        logger.info(`[mojo] spawn ${this.sessionId} (no persistent process; headless CLI invoked per turn)`);
+    spawn(_bin: string, _args: string[], opts: SpawnOpts): void {
+        // No persistent process is started here — the headless CLI is invoked
+        // once per turn — but the spawn contract is still where the worker hands
+        // over the authoritative cwd/env, so keep them for buildEnv()/runTurn().
+        this.spawnOpts = opts;
+        logger.info(`[mojo] spawn ${this.sessionId} in ${this.resolveCwd() ?? '(inherited cwd)'} (headless CLI invoked per turn)`);
+    }
+
+    /** bots.json `mojo.cwd` wins; otherwise the worker's session working dir. */
+    private resolveCwd(): string | undefined {
+        return this.config.cwd ?? this.spawnOpts?.cwd;
     }
 
     write(data: string): void {
@@ -278,7 +295,7 @@ export class MojoBackend implements SessionBackend {
             this.stdoutTail = '';
 
             const child = spawnProcess(bin, args, {
-                cwd: this.config.cwd,
+                cwd: this.resolveCwd(),
                 env: this.buildEnv(),
                 // stdin MUST be closed: mojo waits on socket-type stdin and an open
                 // pipe makes `-p` block until EOF (observed as a silent hang).
@@ -449,6 +466,17 @@ export class MojoBackend implements SessionBackend {
         this.settleTurn(ev.session_id);
     }
 
+    /**
+     * Fire the turn boundary exactly once.
+     *
+     * This is the ONLY authority on when a mojo turn ends, which is why the
+     * worker must not run its generic IdleDetector for this backend: that
+     * detector infers "done" from ~2s of output quiescence, and a mojo turn goes
+     * quiet for far longer while a tool runs. An early idle would re-arm
+     * prompt-ready mid-turn, flushing queued messages into a session that is
+     * still RUNNING (rejected — see SESSION_BUSY_RE) and attributing the reply
+     * to the wrong turn/card. See the `isRemoteBackendType` gate in worker.ts.
+     */
     private settleTurn(resultSessionId?: string): void {
         if (this.turnSettled) return;
         this.turnSettled = true;
@@ -511,7 +539,17 @@ export class MojoBackend implements SessionBackend {
     }
 
     private buildEnv(): NodeJS.ProcessEnv {
-        const env: NodeJS.ProcessEnv = { ...process.env };
+        // Layering, lowest → highest precedence:
+        //   worker-supplied env (BOTMUX_* session context, redacted process env)
+        //   → per-bot injectEnv (bots.json `env`, already sanitized)
+        //   → bots.json `mojo.env`
+        // Falling back to process.env keeps direct/unit use working when spawn()
+        // was never called.
+        const env: NodeJS.ProcessEnv = {
+            ...(this.spawnOpts?.env ?? process.env),
+            ...(this.spawnOpts?.injectEnv ?? {}),
+            ...(this.config.env ?? {}),
+        };
         // Prefer an injected JWT so the bot never depends on an interactive
         // `mojo auth login` on the host. Verified: X_JWT_TOKEN makes
         // `mojo auth status --json` report mode=jwt / source=env.
@@ -543,7 +581,7 @@ export class MojoBackend implements SessionBackend {
         return new Promise<string>((resolve, reject) => {
             const bin = this.config.bin ?? 'mojo';
             const child = spawnProcess(bin, args, {
-                cwd: this.config.cwd,
+                cwd: this.resolveCwd(),
                 env: this.buildEnv(),
                 stdio: ['ignore', 'pipe', 'pipe'],
             });
@@ -607,5 +645,43 @@ export class MojoBackend implements SessionBackend {
         const normalized = text.replace(/\r?\n/g, '\r\n');
         this.outputBuffer += normalized;
         this.dataCb?.(normalized);
+    }
+}
+
+/**
+ * Cancel a mojo session by id WITHOUT a live backend instance.
+ *
+ * The daemon needs this on the workerless `/close` path: the worker is already
+ * gone, so `MojoBackend.destroySession()` is unreachable, yet the server-side
+ * session must stop consuming cloud sandbox time (and stop an agent that may
+ * still hold injected credentials). Mirrors `cancelRiffTaskById`.
+ *
+ * Best-effort with one retry; a session that already completed cannot be
+ * cancelled and that is not an error worth surfacing.
+ */
+export async function cancelMojoSessionById(
+    config: MojoBackendConfig,
+    sessionId: string,
+): Promise<boolean> {
+    // Reuse the instance's CLI plumbing (env layering, JSON envelope parsing,
+    // timeout) rather than duplicating spawn logic here. The sentinel session id
+    // is only used for logging.
+    const backend = new MojoBackend(config, 'orphan-cancel');
+    const attempt = async (): Promise<void> => {
+        await backend['runCliJson'](['session', 'cancel', sessionId]);
+    };
+    try {
+        await attempt();
+        return true;
+    } catch {
+        try {
+            await attempt();
+            return true;
+        } catch (err: unknown) {
+            logger.warn(
+                `[mojo] orphan session cancel failed (session ${sessionId} may keep running remotely): ${String(err)}`,
+            );
+            return false;
+        }
     }
 }

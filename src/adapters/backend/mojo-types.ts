@@ -44,6 +44,13 @@ export interface MojoBackendConfig {
     ppeEnv?: string;
     /** Persisted mojo session id, restored across daemon restarts. */
     resumeCliSessionId?: string;
+    /**
+     * Extra env for the spawned CLI. Merged ON TOP of the authoritative env the
+     * worker hands to spawn() (which already carries the BOTMUX_* session
+     * context and per-bot `env`), so an explicit value here wins — mirroring how
+     * RiffBackendConfig.env layers over the session context.
+     */
+    env?: Record<string, string>;
 }
 
 /** `mojo auth status --json`. */
