@@ -314,7 +314,9 @@ describe('forkSession — frozen launch posture inheritance', () => {
       },
     );
 
-    expect(result).toEqual({ ok: true, childSessionId: 'child-sess-1' });
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error(result.error);
+    const childSessionId = result.childSessionId;
     const child = vi.mocked(sessionStore.createSession).mock.results[0].value as Session;
     expect(child).toMatchObject({
       title: '🔱 investigate cleanup',
@@ -322,12 +324,12 @@ describe('forkSession — frozen launch posture inheritance', () => {
       larkThreadId: 'omt_child',
       workingDir: '/effective/project',
       lastUserPrompt: 'investigate cleanup',
-      lastCliInput: 'wrapped task for child-sess-1',
+      lastCliInput: `wrapped task for ${childSessionId}`,
     });
-    expect(buildInitialPrompt).toHaveBeenCalledWith('child-sess-1');
+    expect(buildInitialPrompt).toHaveBeenCalledWith(childSessionId);
     expect(forkWorkerSpy).toHaveBeenCalledWith(
       expect.objectContaining({ workingDir: '/effective/project' }),
-      { content: 'wrapped task for child-sess-1' },
+      { content: `wrapped task for ${childSessionId}` },
       { resume: true, turnId: 'om_fork_command' },
     );
   });
