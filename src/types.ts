@@ -736,6 +736,14 @@ export type WorkerToDaemon =
    * CLI input queue. The daemon persists a root-bound receipt only after this
    * acknowledgement; IPC arrival alone is not acceptance. */
   | { type: 'turn_input_committed'; turnId: string }
+  /** Transport-only receipt for ordinary Lark IM delivery. Emitted
+   * synchronously when the live worker's IPC handler claims the exact turn,
+   * before slow startup work; input-queue ownership is acknowledged separately
+   * by turn_input_committed. */
+  | { type: 'turn_input_received'; turnId: string }
+  /** The worker received an ordinary turn but could not place it into its CLI
+   * input queue. This is safe to retry within the same worker generation. */
+  | { type: 'turn_input_rejected'; turnId: string; reason: string }
   /** Transfer-only completion fence. Emitted after the old worker has detached
    * its backend observer and disarmed sandbox teardown, immediately before it
    * exits. The daemon also waits for that child exit before forking replacement. */

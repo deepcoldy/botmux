@@ -113,6 +113,7 @@ import {
 import { readPlatformBinding } from './platform/binding.js';
 import { loadDashboardSecret, loadPersistedToken } from './dashboard/auth.js';
 import { InflightInputTracker } from './core/inflight-input-tracker.js';
+import { InputTurnDeduper } from './core/input-turn-dedupe.js';
 import {
   shouldRunQuietRotation,
   evaluatePidResolverPullback,
@@ -1334,6 +1335,10 @@ function cliName(): string {
 let isPromptReady = false;
 /** Mutex for async flushPending — prevents concurrent flush loops. */
 let isFlushing = false;
+/** An init prompt exists but spawn/RPC policy has not yet established whether
+ * it is argv-baked, RPC-owned, or queued. Concurrent follow-ups may enter the
+ * queue during async init, but must not flush ahead of this first turn. */
+let initialInputOwnershipPending = false;
 /** True from the moment an owned CLI restart begins until the replacement
  * backend has been synchronously installed. Async backends (notably Riff)
  * keep the old backend object alive while destroySession() awaits remote
@@ -1651,6 +1656,13 @@ const freshnessInputQueue = new CodexRunnerFreshnessInputQueue<
   state => { codexRunnerFreshness = state; },
 );
 const pendingMessages = freshnessInputQueue.normal;
+/** Ordinary Lark IM turns may be retransmitted by the daemon when the exact
+ * receipt ACK times out. Fence those retries before any renderer / adapter side
+ * effects so one Lark message can enter the CLI input queue at most once per
+ * worker generation. Durable receiver attempts already have their own lease
+ * protocol and adopt writes have an ambiguity journal, so this gate stays on
+ * non-adopt `om_` turns without dispatchAttempt. */
+const ordinaryImTurnDedupe = new InputTurnDeduper(256);
 /** Correlation ids that this worker actually wrote into the owned Codex App
  * runner. Runner lifecycle/final markers may route only to ids in this bounded
  * local set; model/user display bytes cannot add entries. */
@@ -6726,6 +6738,7 @@ async function flushPending(): Promise<void> {
   // old CLI. Never let a new flush (including one triggered by the old
   // backend's idle/task-done callback) write across that restart boundary.
   if (cliRestartInProgress) return;
+  if (initialInputOwnershipPending) return;
   if (shouldHoldCodexRunnerInput(codexRunnerFreshness)) return;
   if (isFlushing) return;  // while loop in active flush will pick up new messages
   if (!backend || !cliAdapter) return;
@@ -7160,7 +7173,6 @@ function sendToPty(
     vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin;
   } = {},
 ): boolean {
-  if (!cliAdapter) return false;
   const next: PendingCliInput = {
     content,
     turnId,
@@ -7179,6 +7191,7 @@ function sendToPty(
     log(`Queued message while CLI backend is restarting (${pendingMessages.length} pending)`);
     return true;
   }
+  if (!cliAdapter) return false;
   const supportsTypeAhead = pendingInputAllowsTypeAhead(
     cliAdapter.supportsTypeAhead === true,
     durableTurnInFlight,
@@ -11723,7 +11736,24 @@ function send(msg: WorkerToDaemon): void {
 }
 
 function acknowledgeTurnInputCommitted(turnId?: string): void {
-  if (turnId) send({ type: 'turn_input_committed', turnId });
+  if (!turnId) return;
+  ordinaryImTurnDedupe.commit(turnId);
+  send({ type: 'turn_input_committed', turnId });
+}
+
+function acknowledgeTurnInputReceived(turnId?: string): void {
+  if (turnId) send({ type: 'turn_input_received', turnId });
+}
+
+function receiveOrdinaryImTurn(turnId: string): 'new' | 'inflight' | 'committed' {
+  const state = ordinaryImTurnDedupe.begin(turnId);
+  acknowledgeTurnInputReceived(turnId);
+  return state;
+}
+
+function rejectOrdinaryImTurn(turnId: string, reason: string): void {
+  ordinaryImTurnDedupe.release(turnId);
+  send({ type: 'turn_input_rejected', turnId, reason });
 }
 
 function publishLocalProcessAttestation(cliPid?: number): void {
@@ -11823,8 +11853,43 @@ process.on('message', async (raw: unknown) => {
   switch (msg.type) {
     case 'init': {
       const initStartedAtMs = Date.now();
-      if (lastInitConfig) return;  // already initialized
+      const ordinaryImTurnId = !msg.adoptMode
+        && msg.dispatchAttempt === undefined
+        && !!msg.prompt
+        && msg.turnId?.startsWith('om_')
+        ? msg.turnId
+        : undefined;
+      if (lastInitConfig) {
+        // Only an exact retry of this generation's init may be acknowledged.
+        // A different init is still rejected as an invalid re-initialization.
+        if (ordinaryImTurnId && lastInitConfig.turnId === ordinaryImTurnId) {
+          const duplicateState = receiveOrdinaryImTurn(ordinaryImTurnId);
+          if (duplicateState === 'committed') {
+            log(`Re-ACKing committed duplicate init turn ${ordinaryImTurnId.substring(0, 16)}`);
+            acknowledgeTurnInputCommitted(ordinaryImTurnId);
+          } else {
+            log(`Re-ACKing received duplicate init turn ${ordinaryImTurnId.substring(0, 16)}`);
+          }
+        }
+        return;
+      }
+      if (ordinaryImTurnId) {
+        const duplicateState = receiveOrdinaryImTurn(ordinaryImTurnId);
+        // Receipt is the daemon ↔ worker transport boundary. Publish it before
+        // startup work can await a slow backend, plugin gateway, or Codex
+        // metadata read. The later committed ACK keeps its existing meaning.
+        if (duplicateState === 'committed') {
+          log(`Re-ACKing committed duplicate init turn ${ordinaryImTurnId.substring(0, 16)}`);
+          acknowledgeTurnInputCommitted(ordinaryImTurnId);
+          break;
+        }
+        if (duplicateState === 'inflight') {
+          log(`Re-ACKing received duplicate init turn ${ordinaryImTurnId.substring(0, 16)}`);
+          break;
+        }
+      }
       lastInitConfig = msg;
+      initialInputOwnershipPending = !!msg.prompt;
       activeRestartAttemptId = msg.restartAttemptId;
       sessionId = msg.sessionId;
       refreshTerminalViewToken();
@@ -11979,7 +12044,10 @@ process.on('message', async (raw: unknown) => {
           passesInitialPromptViaArgs: cliAdapter?.passesInitialPromptViaArgs === true,
           deferInitialPrompt,
         })) {
-          pendingMessages.push({
+          // Follow-up IPC handlers can run while this async init is awaiting
+          // backend startup. They queue safely behind !backend above, but the
+          // original init prompt must remain first in logical turn order.
+          pendingMessages.unshift({
             content: lastSpawnQueuedInitialPrompt ?? msg.prompt,
             ...(lastSpawnQueuedInitialPromptLogicalContent
               ? { logicalContent: lastSpawnQueuedInitialPromptLogicalContent }
@@ -11995,6 +12063,10 @@ process.on('message', async (raw: unknown) => {
           // it into argv or the RPC engine already accepted it.
           initialInputCommitted = true;
         }
+        // The first turn is now either at queue head or already owned by the
+        // argv/RPC startup path. Only now may an early idle edge drain
+        // follow-ups that arrived while init was awaiting slow startup work.
+        initialInputOwnershipPending = false;
         if (initialInputCommitted) acknowledgeTurnInputCommitted(msg.turnId);
 
         // A backend may become prompt-ready before spawnCli() returns. The
@@ -12021,6 +12093,7 @@ process.on('message', async (raw: unknown) => {
           dispatchAttempt: currentBotmuxDispatchAttempt,
         });
       } catch (err: any) {
+        initialInputOwnershipPending = false;
         await sendFatalWorkerErrorAndExit(err);
         return;
       }
@@ -12029,6 +12102,25 @@ process.on('message', async (raw: unknown) => {
 
     case 'message': {
       const messageAdoptMode = lastInitConfig?.adoptMode === true;
+      const ordinaryImTurnId = !messageAdoptMode
+        && msg.dispatchAttempt === undefined
+        && msg.turnId?.startsWith('om_')
+        ? msg.turnId
+        : undefined;
+      if (ordinaryImTurnId) {
+        const duplicateState = receiveOrdinaryImTurn(ordinaryImTurnId);
+        // ACK process ownership synchronously, before crash recovery or any
+        // other awaited work. Actual queue ownership remains committed below.
+        if (duplicateState === 'committed') {
+          log(`Re-ACKing committed duplicate IM turn ${ordinaryImTurnId.substring(0, 16)}`);
+          acknowledgeTurnInputCommitted(ordinaryImTurnId);
+          break;
+        }
+        if (duplicateState === 'inflight') {
+          log(`Re-ACKing received duplicate IM turn ${ordinaryImTurnId.substring(0, 16)}`);
+          break;
+        }
+      }
       // Adopt IPC handlers can overlap. Delay their turn baseline until the
       // submission mutex is held so a queued message cannot steal attribution
       // from the write/verification already in flight.
@@ -12080,6 +12172,7 @@ process.on('message', async (raw: unknown) => {
           await spawnCli(restartCfg);
           await prepareCodexNativeTitleGeneration(restartCfg, codexRpcEngine);
         } catch (err) {
+          if (ordinaryImTurnId) ordinaryImTurnDedupe.release(ordinaryImTurnId);
           // Pass the message's own attempt (not the stale currentBotmux* from a
           // prior IM turn) so a durable delivery relaunch failure carries the
           // right attribution for the daemon's receipt/lease gate.
@@ -12334,6 +12427,7 @@ process.on('message', async (raw: unknown) => {
           vcMeetingImTurnOrigin: msg.vcMeetingImTurnOrigin,
         });
         if (inputCommitted) acknowledgeTurnInputCommitted(msg.turnId);
+        else if (ordinaryImTurnId) rejectOrdinaryImTurn(ordinaryImTurnId, 'cli_input_unavailable');
       }
       break;
     }

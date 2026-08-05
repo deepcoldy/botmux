@@ -2860,6 +2860,220 @@ const transferInputGates = new WeakMap<DaemonSession, TransferInputGate>();
 // cannot forge an option that bypasses the transfer gate.
 const transferReplacementForkBypass = new WeakSet<DaemonSession>();
 
+const ORDINARY_IM_RECEIPT_TIMEOUT_MS = 2_000;
+const ORDINARY_IM_MAX_ATTEMPTS = 2;
+
+type OrdinaryImDelivery = {
+  key: string;
+  ds: DaemonSession;
+  worker: ChildProcess;
+  workerGeneration: number;
+  message: Extract<DaemonToWorker, { type: 'message' | 'init' }>;
+  turnId: string;
+  attempt: number;
+  timer?: ReturnType<typeof setTimeout>;
+};
+
+/** Exact ordinary-IM turns awaiting the worker's synchronous receipt ACK. The
+ * daemon event has already been claimed by Lark dedup at this point, so losing
+ * this in-memory delivery without retry would permanently drop the message. */
+const pendingOrdinaryImDeliveries = new Map<string, OrdinaryImDelivery>();
+
+function ordinaryImDeliveryKey(ds: DaemonSession, turnId: string, workerGeneration: number): string {
+  return `${ds.session.sessionId}:${workerGeneration}:${turnId}`;
+}
+
+function clearOrdinaryImDelivery(record: OrdinaryImDelivery): void {
+  if (record.timer) clearTimeout(record.timer);
+  record.timer = undefined;
+  if (pendingOrdinaryImDeliveries.get(record.key) === record) {
+    pendingOrdinaryImDeliveries.delete(record.key);
+  }
+}
+
+function clearOrdinaryImDeliveryTimer(record: OrdinaryImDelivery): void {
+  if (record.timer) clearTimeout(record.timer);
+  record.timer = undefined;
+}
+
+function failOrdinaryImDelivery(record: OrdinaryImDelivery, reason: string): void {
+  if (pendingOrdinaryImDeliveries.get(record.key) !== record) return;
+  clearOrdinaryImDelivery(record);
+  logger.error(
+    `[${tag(record.ds)}] Ordinary IM worker delivery failed `
+    + `turn=${record.turnId.substring(0, 16)} generation=${record.workerGeneration} `
+    + `attempts=${record.attempt} reason=${reason}`,
+  );
+  if (record.ds.session.vcMeetingReceiver || isSilentScheduledTurn(record.ds, record.turnId)) return;
+  const loc = botLocale(getBot(record.ds.larkAppId).config);
+  void requireCallbacks().sessionReply(
+    sessionAnchorId(record.ds),
+    tr('worker.input_delivery_failed', { turnId: record.turnId.substring(0, 16) }, loc),
+    'text',
+    record.ds.larkAppId,
+    record.turnId,
+  ).catch(err => logger.error(
+    `[${tag(record.ds)}] Failed to report ordinary IM worker delivery failure: `
+    + `${err instanceof Error ? err.message : String(err)}`,
+  ));
+}
+
+function retryOrFailOrdinaryImDelivery(record: OrdinaryImDelivery, reason: string): void {
+  if (pendingOrdinaryImDeliveries.get(record.key) !== record) return;
+  if (
+    record.attempt < ORDINARY_IM_MAX_ATTEMPTS
+    && record.ds.worker === record.worker
+    && !record.worker.killed
+    && record.ds.workerGeneration === record.workerGeneration
+    && record.ds.session.workerGeneration === record.workerGeneration
+  ) {
+    logger.warn(
+      `[${tag(record.ds)}] Ordinary IM input missing worker receipt; retrying exact turn `
+      + `${record.turnId.substring(0, 16)} on generation ${record.workerGeneration} `
+      + `(reason=${reason})`,
+    );
+    sendOrdinaryImDeliveryAttempt(record);
+    return;
+  }
+  failOrdinaryImDelivery(record, reason);
+}
+
+function sendOrdinaryImDeliveryAttempt(record: OrdinaryImDelivery): boolean {
+  if (pendingOrdinaryImDeliveries.get(record.key) !== record) return false;
+  if (
+    record.ds.worker !== record.worker
+    || record.worker.killed
+    || record.ds.workerGeneration !== record.workerGeneration
+    || record.ds.session.workerGeneration !== record.workerGeneration
+  ) {
+    failOrdinaryImDelivery(record, 'worker_generation_changed');
+    return false;
+  }
+
+  if (record.timer) clearTimeout(record.timer);
+  record.timer = undefined;
+  const attempt = ++record.attempt;
+  try {
+    record.worker.send(record.message, (err) => {
+      if (pendingOrdinaryImDeliveries.get(record.key) !== record || record.attempt !== attempt) return;
+      if (err) {
+        retryOrFailOrdinaryImDelivery(record, `ipc_callback:${err.message}`);
+        return;
+      }
+      logger.info(
+        `[${tag(record.ds)}] Ordinary IM input enqueued to worker IPC `
+        + `turn=${record.turnId.substring(0, 16)} generation=${record.workerGeneration} attempt=${attempt}`,
+      );
+    });
+  } catch (err) {
+    queueMicrotask(() => retryOrFailOrdinaryImDelivery(
+      record,
+      `ipc_throw:${err instanceof Error ? err.message : String(err)}`,
+    ));
+    return true;
+  }
+
+  // The worker ACKs synchronously when its IPC handler claims the exact turn.
+  // Slow CLI startup/processing therefore does not extend this transport-only
+  // timeout; the later committed ACK retains input-queue semantics.
+  if (pendingOrdinaryImDeliveries.get(record.key) === record) {
+    record.timer = setTimeout(() => {
+      retryOrFailOrdinaryImDelivery(record, 'receipt_timeout');
+    }, ORDINARY_IM_RECEIPT_TIMEOUT_MS);
+    record.timer.unref?.();
+  }
+  return true;
+}
+
+function sendOrdinaryImDeliveryTracked(
+  ds: DaemonSession,
+  message: Extract<DaemonToWorker, { type: 'message' | 'init' }>,
+): boolean {
+  const turnId = message.turnId;
+  const worker = ds.worker;
+  const workerGeneration = ds.workerGeneration;
+  if (!turnId || !worker || worker.killed || !Number.isSafeInteger(workerGeneration) || (workerGeneration ?? 0) <= 0) {
+    return false;
+  }
+  const key = ordinaryImDeliveryKey(ds, turnId, workerGeneration!);
+  if (pendingOrdinaryImDeliveries.has(key)) return true;
+  const record: OrdinaryImDelivery = {
+    key,
+    ds,
+    worker,
+    workerGeneration: workerGeneration!,
+    message,
+    turnId,
+    attempt: 0,
+  };
+  pendingOrdinaryImDeliveries.set(key, record);
+  return sendOrdinaryImDeliveryAttempt(record);
+}
+
+function shouldTrackOrdinaryImDelivery(
+  ds: DaemonSession,
+  message: Extract<DaemonToWorker, { type: 'message' | 'init' }>,
+): boolean {
+  return !!message.turnId?.startsWith('om_')
+    && message.dispatchAttempt === undefined
+    && (message.type !== 'init' || (!!message.prompt && !message.adoptMode))
+    && !ds.adoptedFrom
+    && !ds.session.vcMeetingReceiver
+    && Number.isSafeInteger(ds.workerGeneration)
+    && (ds.workerGeneration ?? 0) > 0
+    && ds.session.workerGeneration === ds.workerGeneration;
+}
+
+function acknowledgeOrdinaryImDeliveryReceipt(
+  ds: DaemonSession,
+  turnId: string,
+  workerGeneration: number,
+): void {
+  const key = ordinaryImDeliveryKey(ds, turnId, workerGeneration);
+  const record = pendingOrdinaryImDeliveries.get(key);
+  if (!record) return;
+  clearOrdinaryImDeliveryTimer(record);
+  logger.info(
+    `[${tag(ds)}] Ordinary IM input received by worker `
+    + `turn=${turnId.substring(0, 16)} generation=${workerGeneration} attempt=${record.attempt}`,
+  );
+}
+
+function completeOrdinaryImDelivery(
+  ds: DaemonSession,
+  turnId: string,
+  workerGeneration: number,
+): void {
+  const key = ordinaryImDeliveryKey(ds, turnId, workerGeneration);
+  const record = pendingOrdinaryImDeliveries.get(key);
+  if (record) clearOrdinaryImDelivery(record);
+}
+
+function rejectOrdinaryImDelivery(
+  ds: DaemonSession,
+  turnId: string,
+  workerGeneration: number,
+  reason: string,
+): void {
+  const key = ordinaryImDeliveryKey(ds, turnId, workerGeneration);
+  const record = pendingOrdinaryImDeliveries.get(key);
+  if (!record) return;
+  retryOrFailOrdinaryImDelivery(record, `worker_rejected:${reason}`);
+}
+
+function abandonOrdinaryImDeliveriesForWorker(worker: ChildProcess): void {
+  for (const record of pendingOrdinaryImDeliveries.values()) {
+    if (record.worker === worker) clearOrdinaryImDelivery(record);
+  }
+}
+
+export function __testOnly_resetOrdinaryImDeliveries(): void {
+  for (const record of pendingOrdinaryImDeliveries.values()) {
+    if (record.timer) clearTimeout(record.timer);
+  }
+  pendingOrdinaryImDeliveries.clear();
+}
+
 export function isSessionTransferring(ds: DaemonSession): boolean {
   return transferInputGates.has(ds);
 }
@@ -3029,7 +3243,20 @@ function releaseTransferInputGate(
     while (gate.messages.length > 0) {
       const message = gate.messages[0];
       try {
-        worker.send(message);
+        if (
+          message.type === 'message'
+          && shouldTrackOrdinaryImDelivery(ds, message)
+        ) {
+          // The transfer gate owns buffering/order; once a replacement
+          // generation exists, ordinary IM delivery returns to the same exact
+          // receipt protocol as steady-state input. The watchdog remains valid
+          // after the gate itself settles.
+          if (!sendOrdinaryImDeliveryTracked(ds, message)) {
+            throw new Error('replacement worker rejected tracked IM delivery');
+          }
+        } else {
+          worker.send(message);
+        }
         gate.messages.shift();
       } catch (err) {
         gate.needsWorker = true;
@@ -3802,6 +4029,9 @@ export function sendWorkerInput(
       ? { vcMeetingImTurnOrigin }
       : {}),
   };
+  if (!transferGate && shouldTrackOrdinaryImDelivery(ds, message)) {
+    return sendOrdinaryImDeliveryTracked(ds, message);
+  }
   return sendWorkerSessionInput(ds, message);
 }
 
@@ -4264,7 +4494,6 @@ export function forkWorker(
       sessionStore.updateSession(ds.session);
     }
   }
-  worker.send(initMsg);
   ds.initConfig = initMsg;
 
   // Stamp cliId on the persisted session so the dashboard can show a CLI badge
@@ -4292,6 +4521,11 @@ export function forkWorker(
   setupWorkerHandlers(ds, worker, startupState, workerGeneration);
 
   ds.worker = worker;
+  if (shouldTrackOrdinaryImDelivery(ds, initMsg)) {
+    sendOrdinaryImDeliveryTracked(ds, initMsg);
+  } else {
+    worker.send(initMsg);
+  }
   ds.spawnedAt = Date.now();
   ds.cliVersion = getCurrentCliVersion(runtimeInstallationKey({
     cliId: agentCfg.cliId,
@@ -4594,6 +4828,30 @@ function setupWorkerHandlers(
         sessionStore.updateSession(ds.session);
         break;
       }
+      case 'turn_input_received': {
+        if (
+          ds.worker !== worker
+          || ds.workerGeneration !== workerGeneration
+          || ds.session.workerGeneration !== workerGeneration
+        ) {
+          logger.warn(`[${t}] Ignored turn_input_received from stale worker generation`);
+          break;
+        }
+        acknowledgeOrdinaryImDeliveryReceipt(ds, msg.turnId, workerGeneration);
+        break;
+      }
+      case 'turn_input_rejected': {
+        if (
+          ds.worker !== worker
+          || ds.workerGeneration !== workerGeneration
+          || ds.session.workerGeneration !== workerGeneration
+        ) {
+          logger.warn(`[${t}] Ignored turn_input_rejected from stale worker generation`);
+          break;
+        }
+        rejectOrdinaryImDelivery(ds, msg.turnId, workerGeneration, msg.reason);
+        break;
+      }
       case 'turn_input_committed': {
         // Bind the receipt to the exact live worker generation. A late ACK
         // from a replaced worker cannot make the replacement appear to have
@@ -4606,6 +4864,9 @@ function setupWorkerHandlers(
           logger.warn(`[${t}] Ignored turn_input_committed from stale worker generation`);
           break;
         }
+        // Compatibility/fallback: a commit also proves receipt if the earlier
+        // receipt ACK was delayed or dropped on the reverse IPC channel.
+        completeOrdinaryImDelivery(ds, msg.turnId, workerGeneration);
         if (recordDispatchInputCommit(ds.session, msg.turnId, workerGeneration)) {
           sessionStore.updateSession(ds.session);
           if (msg.turnId.startsWith('mlrp_turn_')) {
@@ -6165,6 +6426,7 @@ function setupWorkerHandlers(
   });
 
   worker.on('exit', (code, signal) => {
+    abandonOrdinaryImDeliveriesForWorker(worker);
     const transferRetirement = transferRetiringWorkers.has(worker);
     transferRetiringWorkers.delete(worker);
     clearLifecycleRetirement(ds, worker);

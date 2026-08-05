@@ -798,6 +798,7 @@ export const messages: Record<string, string> = {
   'worker.crash_diagnostic_terminal': 'The web terminal, where available, preserves the last startup output. Fix the issue, then send a new message to retry.',
   'worker.crash_recent_output': 'Recent terminal output:',
   'worker.start_failed': '⚠️ The {cliName} session failed to start: {reason}\nCheck the Agent/backend settings in Dashboard and the installation environment on the daemon host, then resend your message to retry.',
+  'worker.input_delivery_failed': '⚠️ The Worker could not receive this message. Botmux retried on the same Worker but delivery still did not complete; it stopped before a cross-process retry to avoid duplicate execution. Please resend the message.\nturn: {turnId}',
   'worker.start_exited_early': 'The worker exited before becoming ready (exit code: {code}); see the Botmux logs for details.',
   'worker.tui_submit_failed': '⚠️ The TUI answer could not be confirmed as delivered to {cliName}. The CLI may still be waiting for input; open the local terminal or send a new message to recover.',
   'worker.raw_input_failed': '⚠️ The slash command could not be confirmed as delivered to {cliName}, so the follow-up text in the same message was not submitted. Check the terminal state, then resend.',

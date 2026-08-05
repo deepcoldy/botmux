@@ -440,6 +440,8 @@ describe('transferSession', () => {
     const replacementFork = vi.fn((...args: Parameters<typeof forkWorker>) => {
       lifecycle.push('replacement:fork');
       ds.worker = replacementWorker;
+      ds.workerGeneration = 2;
+      ds.session.workerGeneration = 2;
       return forkWorkerSpy(...args);
     });
     const moving = transferSession(
@@ -466,6 +468,11 @@ describe('transferSession', () => {
       'arrived during transfer',
       'turn-late',
       { dispatchAttempt: 7 },
+    )).toBe(true);
+    expect(sendWorkerInput(
+      ds,
+      'ordinary message during transfer',
+      'om_transfer_late',
     )).toBe(true);
     const rawDuringTransfer = {
       type: 'raw_input' as const,
@@ -504,6 +511,7 @@ describe('transferSession', () => {
       'old:exit',
       'replacement:fork',
       'replacement:message',
+      'replacement:message',
       'replacement:raw_input',
     ]);
     expect(replacementFork).toHaveBeenCalledWith(ds, '', true);
@@ -513,7 +521,16 @@ describe('transferSession', () => {
       turnId: 'turn-late',
       dispatchAttempt: 7,
     }));
-    expect(replacementSend).toHaveBeenNthCalledWith(2, rawDuringTransfer);
+    expect(replacementSend).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({
+        type: 'message',
+        content: 'ordinary message during transfer',
+        turnId: 'om_transfer_late',
+      }),
+      expect.any(Function),
+    );
+    expect(replacementSend).toHaveBeenNthCalledWith(3, rawDuringTransfer);
   });
 
   it('fails safe on detach timeout using hard retirement without ordinary close cleanup', async () => {

@@ -801,6 +801,7 @@ export const messages: Record<string, string> = {
   'worker.crash_diagnostic_terminal': 'Web 终端（若可用）保留了最后一次启动输出，可打开查看；修复问题后发新消息会重新启动。',
   'worker.crash_recent_output': '最近终端输出：',
   'worker.start_failed': '⚠️ {cliName} 会话启动失败：{reason}\n请检查 Dashboard 的 Agent / 后端配置和 daemon 所在机器的安装环境，修复后重发消息即可重试。',
+  'worker.input_delivery_failed': '⚠️ Worker 未能接收这条消息。Botmux 已在同一 Worker 上自动重试，但仍未完成接收；为避免跨进程重复执行，没有继续重投。请重发本条消息。\nturn: {turnId}',
   'worker.start_exited_early': 'worker 在就绪前退出（exit code: {code}）；详细错误可查看 Botmux 日志。',
   'worker.tui_submit_failed': '⚠️ TUI 答案未能确认送达 {cliName}。CLI 可能仍在等待输入；请打开本机终端处理，或发送一条新消息解除并继续。',
   'worker.raw_input_failed': '⚠️ Slash 命令未能确认送达 {cliName}，同一条消息中紧随其后的正文没有继续提交。请检查当前终端状态后重发。',
