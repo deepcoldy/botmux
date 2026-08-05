@@ -7,7 +7,6 @@ import {
   readSync,
   statSync,
 } from 'node:fs';
-import { StringDecoder } from 'node:string_decoder';
 
 export interface JsonlCursor {
   newOffset: number;
@@ -35,8 +34,7 @@ export function scanJsonlFromOffset(path: string, fromOffset: number, opts: Json
   let fd: number | null = null;
   let nextReadOffset = Math.max(0, fromOffset);
   let lineStartOffset = nextReadOffset;
-  let carry = '';
-  const decoder = new StringDecoder('utf8');
+  let carry = Buffer.alloc(0);
   const buf = Buffer.alloc(chunkSize);
 
   try {
@@ -55,27 +53,23 @@ export function scanJsonlFromOffset(path: string, fromOffset: number, opts: Json
       if (bytesRead <= 0) break;
       nextReadOffset += bytesRead;
 
-      const decoded = decoder.write(buf.subarray(0, bytesRead));
-      const text = carry + decoded;
+      const chunk = Buffer.from(buf.subarray(0, bytesRead));
+      const bytes = carry.length > 0 ? Buffer.concat([carry, chunk]) : chunk;
       let searchFrom = 0;
-      let currentLineStart = lineStartOffset;
-      // carry never contains '\n', so newlines can only appear at or after
-      // carry.length — starting there avoids re-scanning a growing carry on
-      // every chunk when a single record spans many chunks.
-      let nl = text.indexOf('\n', carry.length);
+      const currentBufferStartOffset = lineStartOffset;
+      let nl = bytes.indexOf(0x0a, carry.length);
       while (nl >= 0) {
-        const line = text.slice(searchFrom, nl);
-        opts.onLine?.(line, currentLineStart);
-        currentLineStart += Buffer.byteLength(line, 'utf8') + 1;
+        const line = bytes.subarray(searchFrom, nl);
+        opts.onLine?.(line.toString('utf8'), currentBufferStartOffset + searchFrom);
         searchFrom = nl + 1;
-        nl = text.indexOf('\n', searchFrom);
+        nl = bytes.indexOf(0x0a, searchFrom);
       }
-      carry = text.slice(searchFrom);
-      lineStartOffset = currentLineStart;
+      carry = Buffer.from(bytes.subarray(searchFrom));
+      lineStartOffset = currentBufferStartOffset + searchFrom;
     }
     return {
       newOffset: lineStartOffset,
-      pendingTail: carry + decoder.end(),
+      pendingTail: carry.toString('utf8'),
     };
   } catch (error) {
     opts.onError?.(error);

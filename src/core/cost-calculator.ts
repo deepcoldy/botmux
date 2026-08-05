@@ -458,6 +458,10 @@ type CachedUsageKind = UsageKind | 'aiden';
 interface UsageFileCacheEntry {
   mtimeMs: number;
   size: number;
+  dev: number;
+  ino: number;
+  frontierFingerprint: string | null;
+  canReadIncrementally: boolean;
   /** Durable parse frontier: byte offset just past the last complete line.
    *  <= 0 ⇒ the next change forces a full reparse. */
   offset: number;
@@ -481,6 +485,7 @@ export const MAX_USAGE_TRANSCRIPT_BYTES = 64 * 1024 * 1024;
  *  Keep this tight: it is a synchronous dashboard read path, and real 150MiB+
  *  rollouts have many token_count snapshots in the last 4MiB. */
 export const CODEX_USAGE_TRANSCRIPT_TAIL_BYTES = 4 * 1024 * 1024;
+export const USAGE_TRANSCRIPT_FRONTIER_FINGERPRINT_BYTES = 64;
 
 /** Aiden checkpoint paths move as the session progresses (latest.json points
  *  at a new checkpoint id per turn), so positive hits expire quickly too. */
@@ -528,19 +533,25 @@ function openRegularUsageFile(path: string): number | null {
   }
 }
 
-function isJsonlLineBoundary(path: string, offset: number): boolean {
-  if (offset <= 0) return true;
+function readFileProbe(path: string, offset: number, length: number): Buffer | null {
+  if (length <= 0) return Buffer.alloc(0);
   const fd = openRegularUsageFile(path);
-  if (fd === null) return false;
+  if (fd === null) return null;
   try {
-    const buf = Buffer.alloc(1);
-    const read = readSync(fd, buf, 0, 1, offset - 1);
-    return read === 1 && buf[0] === 0x0a;
+    const buf = Buffer.alloc(length);
+    const read = readSync(fd, buf, 0, length, offset);
+    return buf.subarray(0, read);
   } catch {
-    return false;
+    return null;
   } finally {
     closeSync(fd);
   }
+}
+
+function isJsonlLineBoundary(path: string, offset: number): boolean {
+  if (offset <= 0) return true;
+  const probe = readFileProbe(path, offset - 1, 1);
+  return !!probe && probe.length === 1 && probe[0] === 0x0a;
 }
 
 function aggregateHasCodexUsage(agg: TokenUsageAggregate): boolean {
@@ -559,6 +570,71 @@ function ensureUsageFileCacheCapacity(key: string): void {
   }
 }
 
+function usageFileFingerprint(path: string, st: Stats, offset: number): string | null {
+  if (offset <= 0) return null;
+  const len = Math.min(USAGE_TRANSCRIPT_FRONTIER_FINGERPRINT_BYTES, offset);
+  const start = offset - len;
+  const probe = readFileProbe(path, start, len);
+  if (!probe || probe.length !== len) return null;
+  return `${st.dev}:${st.ino}:${start}:${probe.toString('base64')}`;
+}
+
+function isSameUsageFileGeneration(
+  cached: UsageFileCacheEntry,
+  st: Stats,
+  path: string,
+): boolean {
+  if (cached.dev !== st.dev || cached.ino !== st.ino) return false;
+  if (cached.frontierFingerprint === null) return false;
+  return usageFileFingerprint(path, st, cached.offset) === cached.frontierFingerprint;
+}
+
+function canReuseUsageCache(
+  cached: UsageFileCacheEntry,
+  st: Stats,
+  path: string,
+  opts: { validateFingerprint?: boolean } = {},
+): boolean {
+  if (!cached.canReadIncrementally) return false;
+  if (st.size < cached.offset) return false;
+  if (cached.dev !== st.dev || cached.ino !== st.ino) return false;
+  if (!opts.validateFingerprint) return true;
+  return isSameUsageFileGeneration(cached, st, path);
+}
+
+function mergeCodexIndependentMetrics(
+  next: TokenUsageAggregate,
+  previous?: TokenUsageAggregate,
+): TokenUsageAggregate {
+  if (!previous) return next;
+  return {
+    ...next,
+    model: next.model || previous.model,
+    latestCodexUsage: next.latestCodexUsage ?? previous.latestCodexUsage,
+    latestContextUsage: next.latestContextUsage ?? previous.latestContextUsage,
+  };
+}
+
+function cacheUsageRead(
+  key: string,
+  path: string,
+  st: Stats,
+  entry: Omit<UsageFileCacheEntry, 'mtimeMs' | 'size' | 'dev' | 'ino' | 'frontierFingerprint'>,
+  opts: { captureFingerprint?: boolean } = {},
+): void {
+  ensureUsageFileCacheCapacity(key);
+  usageFileCache.set(key, {
+    ...entry,
+    mtimeMs: st.mtimeMs,
+    size: st.size,
+    dev: st.dev,
+    ino: st.ino,
+    frontierFingerprint: opts.captureFingerprint
+      ? usageFileFingerprint(path, st, entry.offset)
+      : null,
+  });
+}
+
 function readOversizedCodexTokenAggregateCached(
   key: string,
   path: string,
@@ -570,7 +646,13 @@ function readOversizedCodexTokenAggregateCached(
   let seenMessageIds: Set<string>;
   let baseOffset: number;
   let dropInitialResidualLine = false;
-  const canReuseCachedOffset = !!cached && cached.offset > 0 && st.size >= cached.offset;
+  const sameGeneration = !!cached && isSameUsageFileGeneration(cached, st, path);
+  const canInheritCachedMetrics = sameGeneration;
+  const canReuseCachedOffset = !!cached
+    && sameGeneration
+    && cached.canReadIncrementally
+    && cached.offset > 0
+    && st.size >= cached.offset;
   const reuseCachedOffset = canReuseCachedOffset
     && st.size - cached.offset <= CODEX_USAGE_TRANSCRIPT_TAIL_BYTES;
 
@@ -614,32 +696,37 @@ function readOversizedCodexTokenAggregateCached(
     foldUsageText('codex', previewAgg, new Set(seenMessageIds), tailText);
   }
 
-  const result = finalizeTokenUsage(previewAgg);
   if (pendingTailIsInitialResidualLine) {
     // The bounded window starts in the middle of a JSONL record and no newline
-    // has arrived yet. Do not persist `baseOffset`: if the writer later appends
-    // only '\n', that residual suffix would otherwise become a fake complete
-    // line on the incremental path.
-    return cached && !reuseCachedOffset
-      ? { agg: cached.previewAgg, result: cached.result }
-      : { agg: previewAgg, result };
+    // has arrived yet. Cache safe stat/throttle metadata only; the stored
+    // offset is not a reusable durable cursor, so any later change reboots from
+    // a bounded tail instead of turning that suffix into a fake complete line.
+    const merged = mergeCodexIndependentMetrics(previewAgg, canInheritCachedMetrics ? cached?.previewAgg : undefined);
+    const mergedResult = finalizeTokenUsage(merged);
+    cacheUsageRead(key, path, st, {
+      offset: baseOffset,
+      state,
+      seenMessageIds,
+      previewAgg: merged,
+      result: mergedResult,
+      parsedAtMs: now,
+      canReadIncrementally: false,
+    }, { captureFingerprint: true });
+    return { agg: merged, result: mergedResult };
   }
-  if (!aggregateHasCodexUsage(previewAgg) && cached && !reuseCachedOffset) {
-    return { agg: cached.previewAgg, result: cached.result };
-  }
-
-  ensureUsageFileCacheCapacity(key);
-  usageFileCache.set(key, {
-    mtimeMs: st.mtimeMs,
-    size: st.size,
+  const merged = mergeCodexIndependentMetrics(previewAgg, canInheritCachedMetrics ? cached?.previewAgg : undefined);
+  const mergedResult = finalizeTokenUsage(merged);
+  const canReadIncrementally = reuseCachedOffset || aggregateHasCodexUsage(previewAgg);
+  cacheUsageRead(key, path, st, {
     offset: baseOffset + completeBytes,
     state,
     seenMessageIds,
-    previewAgg,
-    result,
+    previewAgg: merged,
+    result: mergedResult,
     parsedAtMs: now,
-  });
-  return { agg: previewAgg, result };
+    canReadIncrementally,
+  }, { captureFingerprint: true });
+  return { agg: merged, result: mergedResult };
 }
 
 function readSessionTokenAggregateCached(path: string, kind: CachedUsageKind, opts?: { fresh?: boolean }): UsageReadResult | null {
@@ -664,7 +751,7 @@ function readSessionTokenAggregateCached(path: string, kind: CachedUsageKind, op
 
   const now = Date.now();
   const cached = usageFileCache.get(key);
-  if (cached) {
+  if (cached && cached.dev === st.dev && cached.ino === st.ino) {
     const unchanged = cached.mtimeMs === st.mtimeMs && cached.size === st.size;
     const throttled = !opts?.fresh && now - cached.parsedAtMs < USAGE_REPARSE_MIN_INTERVAL_MS;
     if (unchanged || throttled) {
@@ -694,16 +781,14 @@ function readSessionTokenAggregateCached(path: string, kind: CachedUsageKind, op
     // Checkpoints are rewritten whole — nothing incremental to exploit.
     const result = readTokenUsageFromAidenCheckpoint(path);
     const blank = newTokenUsageAggregate();
-    ensureUsageFileCacheCapacity(key);
-    usageFileCache.set(key, {
-      mtimeMs: st.mtimeMs,
-      size: st.size,
+    cacheUsageRead(key, path, st, {
       offset: -1,
       state: blank,
       seenMessageIds: new Set(),
       previewAgg: blank,
       result,
       parsedAtMs: now,
+      canReadIncrementally: false,
     });
     return { agg: blank, result };
   }
@@ -711,7 +796,9 @@ function readSessionTokenAggregateCached(path: string, kind: CachedUsageKind, op
   let state: TokenUsageAggregate;
   let seenMessageIds: Set<string>;
   let baseOffset: number;
-  if (cached && cached.offset > 0 && st.size >= cached.offset) {
+  if (cached && cached.offset > 0 && canReuseUsageCache(cached, st, path, {
+    validateFingerprint: kind === 'codex',
+  })) {
     // Append-only growth: continue folding from the durable frontier.
     state = cached.state;
     seenMessageIds = cached.seenMessageIds;
@@ -747,17 +834,15 @@ function readSessionTokenAggregateCached(path: string, kind: CachedUsageKind, op
   }
 
   const result = finalizeTokenUsage(previewAgg);
-  ensureUsageFileCacheCapacity(key);
-  usageFileCache.set(key, {
-    mtimeMs: st.mtimeMs,
-    size: st.size,
+  cacheUsageRead(key, path, st, {
     offset: baseOffset + completeBytes,
     state,
     seenMessageIds,
     previewAgg,
     result,
     parsedAtMs: now,
-  });
+    canReadIncrementally: true,
+  }, { captureFingerprint: kind === 'codex' });
   return { agg: previewAgg, result };
 }
 

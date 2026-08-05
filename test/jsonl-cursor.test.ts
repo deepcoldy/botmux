@@ -92,4 +92,45 @@ describe('scanJsonlFromOffset', () => {
       pendingTail: '',
     });
   });
+
+  it('keeps durable byte offsets correct when starting inside a UTF-8 codepoint', () => {
+    const prefix = '中';
+    const firstLine = 'broken-prefix\n';
+    const appendedLine = '{"type":"event_msg"}\n';
+    const text = prefix + firstLine + appendedLine;
+    writeFileSync(path, text, 'utf8');
+
+    const lines: Array<{ line: string; lineStart: number }> = [];
+    const cursor = scanJsonlFromOffset(path, 1, {
+      chunkSize: 2,
+      onLine: (line, lineStart) => lines.push({ line, lineStart }),
+    });
+
+    expect(lines).toHaveLength(2);
+    expect(lines[1]).toEqual({
+      line: '{"type":"event_msg"}',
+      lineStart: Buffer.byteLength(prefix + firstLine, 'utf8'),
+    });
+    expect(cursor).toEqual({
+      newOffset: Buffer.byteLength(text, 'utf8'),
+      pendingTail: '',
+    });
+
+    const nextLine = '{"type":"token_count"}\n';
+    appendFileSync(path, nextLine, 'utf8');
+    const followUpLines: Array<{ line: string; lineStart: number }> = [];
+    const followUpCursor = scanJsonlFromOffset(path, cursor!.newOffset, {
+      chunkSize: 3,
+      onLine: (line, lineStart) => followUpLines.push({ line, lineStart }),
+    });
+
+    expect(followUpLines).toEqual([{
+      line: '{"type":"token_count"}',
+      lineStart: Buffer.byteLength(text, 'utf8'),
+    }]);
+    expect(followUpCursor).toEqual({
+      newOffset: Buffer.byteLength(text + nextLine, 'utf8'),
+      pendingTail: '',
+    });
+  });
 });
