@@ -76,9 +76,13 @@ export function rawCliExecutable(id: CliId, pathOverride?: string): string | und
   return override || RAW_CLI_EXECUTABLES[normalized];
 }
 
-/** Resolve a command name to its absolute path via shell `which`.
+const RESOLVE_COMMAND_SCRIPT = 'command -v -- "$1"';
+
+/** Resolve a command name to its absolute path via a login/interactive shell.
  *  Tries login shell first (-lc), then interactive shell (-ic) for tools
- *  whose installers add PATH entries to .bashrc/.zshrc only. */
+ *  whose installers add PATH entries to .bashrc/.zshrc only. The command is
+ *  passed as positional argv ($1), never interpolated into the shell program:
+ *  spaces and shell metacharacters therefore remain one literal filename. */
 export function resolveCommand(cmd: string): string {
   if (isAbsolute(cmd)) return cmd;
   const shell = process.env.SHELL || '/bin/zsh';
@@ -102,16 +106,16 @@ export function resolveCommand(cmd: string): string {
       // suspend setup (the reported "[1]+ Stopped" with no error). `-ic` is
       // kept so rc-only installs are still found.
       const argv = setsidBin
-        ? [setsidBin, '-w', sh, flags, `which ${cmd}`]
-        : [sh, flags, `which ${cmd}`];
+        ? [setsidBin, '-w', sh, flags, RESOLVE_COMMAND_SCRIPT, 'botmux-resolve-command', cmd]
+        : [sh, flags, RESOLVE_COMMAND_SCRIPT, 'botmux-resolve-command', cmd];
       const result = spawnSync(argv[0]!, argv.slice(1), {
         encoding: 'utf-8',
         timeout: 5_000,
         stdio: ['ignore', 'pipe', 'ignore'],
       });
-      // Rc files may echo banners to stdout before the `which` output, so take
+      // Rc files may echo banners to stdout before the resolver output, so take
       // the LAST absolute line — and only after a clean exit, so a failed
-      // `which` can't let an echoed path-looking line masquerade as a result.
+      // lookup can't let an echoed path-looking line masquerade as a result.
       if (result.status !== 0) continue;
       const lines = (result.stdout ?? '').split(/\r?\n/).map(line => line.trim()).filter(Boolean);
       const found = lines.reverse().find(line => isAbsolute(line));

@@ -16,8 +16,11 @@ import {
   entryForBot,
   filterRoleGroups,
   filterRoleProfiles,
+  formatListenerPreviewTime,
   hashChatId,
   isValidProfileId,
+  previewMessageListener,
+  runMessageListenerPreview,
   saveInjectMode,
   type GroupInfo,
 } from '../src/dashboard/web/roles.js';
@@ -128,6 +131,19 @@ describe('roles helpers', () => {
     expect(entryForBot([], null)).toBeUndefined();
   });
 
+  it('formats listener preview create times as local timestamps', () => {
+    const expected = (() => {
+      const d = new Date(1785139176792);
+      const pad = (value: number) => String(value).padStart(2, '0');
+      return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+    })();
+
+    expect(formatListenerPreviewTime('1785139176792')).toBe(expected);
+    expect(formatListenerPreviewTime('1785139176')).toBe(formatListenerPreviewTime('1785139176000'));
+    expect(formatListenerPreviewTime(undefined)).toBe('');
+    expect(formatListenerPreviewTime('not-a-time')).toBe('');
+  });
+
   it('keeps role write APIs on the existing endpoints and request bodies', async () => {
     const fetchMock = vi.fn(async () => new Response(JSON.stringify({ ok: true }), { status: 200 }));
     vi.stubGlobal('fetch', fetchMock);
@@ -150,5 +166,24 @@ describe('roles helpers', () => {
       force: true,
       preview: false,
     });
+  });
+
+  it('uses listener preview and run endpoints with a capped count', async () => {
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({
+      ok: true,
+      requestedLimit: 20,
+      matches: [{ messageId: 'om_1', messageText: 'alert', msgType: 'text' }],
+    }), { status: 200 }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(previewMessageListener('cli_a', 'oc_chat_a', { enabled: true, prompt: 'listener' } as any, 50))
+      .resolves.toMatchObject({ ok: true, requestedLimit: 20, matches: [{ messageId: 'om_1' }] });
+    await expect(runMessageListenerPreview('cli_a', 'oc_chat_a', { enabled: true, prompt: 'listener' } as any, 3))
+      .resolves.toMatchObject({ ok: true });
+
+    expect(fetchMock.mock.calls[0][0]).toBe('/api/message-listeners/cli_a/oc_chat_a/preview');
+    expect(JSON.parse(String((fetchMock.mock.calls[0][1] as RequestInit).body))).toMatchObject({ limit: 20 });
+    expect(fetchMock.mock.calls[1][0]).toBe('/api/message-listeners/cli_a/oc_chat_a/run-preview');
+    expect(JSON.parse(String((fetchMock.mock.calls[1][1] as RequestInit).body))).toMatchObject({ limit: 3 });
   });
 });

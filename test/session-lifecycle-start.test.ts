@@ -56,6 +56,7 @@ vi.mock('../src/bot-registry.js', () => ({
     botName: 'TestBot',
   })),
   getAllBots: vi.fn(() => []),
+  getLoadedConfigPath: vi.fn(() => '/home/u/.botmux/bots.json'),
   loadBotConfigs: vi.fn(() => [{
     larkAppId: 'app_test',
     larkAppSecret: 'secret',
@@ -76,6 +77,9 @@ vi.mock('../src/config.js', () => ({
 }));
 
 vi.mock('../src/services/session-store.js', () => ({
+  registerSessionBridgeSendMarkerCleanupFence: vi.fn(),
+  cleanupSessionBridgeSendMarkers: vi.fn(),
+  cleanupSessionBridgeSendMarkersNow: vi.fn(),
   closeSession: vi.fn(),
   updateSession: vi.fn(),
   updateSessionPid: vi.fn(),
@@ -229,6 +233,133 @@ describe('persistent backend target handoff', () => {
       backendType: 'herdr',
       persistentBackendTarget: target,
     }));
+  });
+});
+
+describe('CLI runtime session freeze', () => {
+  it('migrates an old agentFrozen session from its own cliPathOverride', () => {
+    vi.mocked(getBot).mockImplementation(() => defaultBot({
+      wrapperCli: undefined,
+      cliRuntime: {
+        id: 'new-codex',
+        displayName: 'New Codex',
+        executable: '/opt/new-codex',
+        update: { provider: 'none' },
+      },
+      cliPathOverride: '/opt/new-codex',
+    }));
+    const ds = makeDs();
+    ds.session.cliId = 'codex';
+    ds.session.cliPathOverride = '/opt/legacy/vendor-codex';
+    ds.session.agentFrozen = true;
+
+    forkWorker(ds, 'resume', true);
+
+    const worker = forkMock.mock.results.at(-1)!.value;
+    const init = vi.mocked(worker.send).mock.calls[0][0];
+    expect(init).toEqual(expect.objectContaining({
+      cliId: 'codex',
+      cliPathOverride: '/opt/legacy/vendor-codex',
+      cliRuntime: {
+        id: 'vendor-codex',
+        displayName: 'vendor-codex',
+        executable: '/opt/legacy/vendor-codex',
+        source: 'legacy-path',
+        update: { provider: 'auto' },
+      },
+    }));
+    expect(ds.session.cliRuntime).toEqual(init.cliRuntime);
+  });
+
+  it('repairs a missing executable shadow from configured and legacy frozen snapshots', () => {
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ wrapperCli: undefined }));
+    for (const source of ['configured', 'legacy-path'] as const) {
+      const executable = `/opt/frozen-${source}`;
+      const ds = makeDs();
+      ds.session.cliId = 'codex';
+      ds.session.agentFrozen = true;
+      ds.session.cliRuntime = {
+        id: `frozen-${source}`,
+        displayName: `Frozen ${source}`,
+        executable,
+        source,
+        update: source === 'configured' ? { provider: 'none' } : { provider: 'auto' },
+      };
+      ds.session.cliPathOverride = undefined;
+
+      forkWorker(ds, 'resume', true);
+
+      const worker = forkMock.mock.results.at(-1)!.value;
+      const init = vi.mocked(worker.send).mock.calls[0][0];
+      expect(init.cliPathOverride).toBe(executable);
+      expect(ds.session.cliPathOverride).toBe(executable);
+    }
+  });
+
+  it('uses the frozen runtime snapshot instead of a stale executable shadow', () => {
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ wrapperCli: undefined }));
+    const ds = makeDs();
+    ds.session.cliId = 'codex';
+    ds.session.agentFrozen = true;
+    ds.session.cliRuntime = {
+      id: 'frozen-vendor',
+      displayName: 'Frozen Vendor',
+      executable: '/opt/frozen-vendor',
+      source: 'configured',
+      update: { provider: 'none' },
+    };
+    ds.session.cliPathOverride = '/opt/stale-other-vendor';
+
+    forkWorker(ds, 'resume', true);
+
+    const worker = forkMock.mock.results.at(-1)!.value;
+    const init = vi.mocked(worker.send).mock.calls[0][0];
+    expect(init.cliPathOverride).toBe('/opt/frozen-vendor');
+    expect(ds.session.cliPathOverride).toBe('/opt/frozen-vendor');
+  });
+
+  it('keeps a newly frozen runtime stable after the bot runtime changes', () => {
+    const bot = defaultBot({
+      wrapperCli: undefined,
+      cliRuntime: {
+        id: 'vendor-codex',
+        displayName: 'VendorCodex',
+        executable: '/opt/vendor-codex',
+        update: { provider: 'self' },
+      },
+      // Parsed BotConfig exposes this compatibility shadow to old call sites.
+      cliPathOverride: '/opt/vendor-codex',
+    });
+    vi.mocked(getBot).mockImplementation(() => bot);
+    const ds = makeDs();
+
+    forkWorker(ds, 'first turn', false);
+    const firstWorker = forkMock.mock.results.at(-1)!.value;
+    const firstInit = vi.mocked(firstWorker.send).mock.calls[0][0];
+    expect(firstInit).toEqual(expect.objectContaining({
+      cliPathOverride: '/opt/vendor-codex',
+      cliRuntime: expect.objectContaining({
+        id: 'vendor-codex',
+        displayName: 'VendorCodex',
+        executable: '/opt/vendor-codex',
+        source: 'configured',
+      }),
+    }));
+
+    bot.config.cliRuntime = {
+      id: 'other-codex',
+      displayName: 'Other Codex',
+      executable: '/opt/other-codex',
+      update: { provider: 'none' },
+    };
+    bot.config.cliPathOverride = '/opt/other-codex';
+    forkWorker(ds, 'resume', true);
+
+    const resumedWorker = forkMock.mock.results.at(-1)!.value;
+    const resumedInit = vi.mocked(resumedWorker.send).mock.calls[0][0];
+    expect(resumedInit.cliRuntime).toEqual(firstInit.cliRuntime);
+    expect(resumedInit.cliPathOverride).toBe('/opt/vendor-codex');
+    expect(ds.session.cliRuntime).toEqual(firstInit.cliRuntime);
   });
 });
 

@@ -9,7 +9,7 @@
  */
 
 import { config } from '../../config.js';
-import { formatUrlHost } from '../../core/dashboard-url.js';
+import { buildV3RunDetailUrl } from '../../core/dashboard-url.js';
 import { DEFAULT_HUMAN_GATE_OPTIONS } from '../../workflows/v3/dag.js';
 import { splitV3HostGatePrompt } from '../../workflows/v3/host-bindings.js';
 
@@ -55,9 +55,11 @@ export function v3GateCardNonce(runId: string, waitId: string): string {
   return `v3gate:${runId}:${waitId}`;
 }
 
-/** v3 run 在 dashboard 的详情页 URL（跟 v0.2 的 #/workflows 对称，走 #/v3）。 */
+/** v3 run 在 dashboard 的详情页 URL（跟 v0.2 的 #/workflows 对称，走 #/v3）。
+ *  远程访问开+已绑定时走平台子域，否则 BOTMUX_PUBLIC_URL / 本地——详见
+ *  {@link buildV3RunDetailUrl}，让远程用户点卡片够得着 SPA 才能触发一键登录。 */
 export function v3RunDetailUrl(runId: string): string {
-  return `http://${formatUrlHost(config.dashboard.externalHost)}:${config.dashboard.port}/#/v3/${encodeURIComponent(runId)}`;
+  return buildV3RunDetailUrl(runId, { host: config.dashboard.externalHost, port: config.dashboard.port });
 }
 
 export function buildV3GateCard(input: V3GateCardInput): string {

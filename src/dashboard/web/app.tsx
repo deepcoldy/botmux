@@ -1,4 +1,5 @@
 // Dashboard SPA entry: React chrome + lazy route host + SSE bootstrap.
+import type React from 'react';
 import { createRoot } from 'react-dom/client';
 import { useEffect, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
@@ -35,6 +36,7 @@ import {
   dashboardClientShellRedirect,
   readDashboardClientShell,
 } from './client-shell.js';
+import { dashboardLoginHref } from './auth-login.js';
 
 type OwnerAvatar = { avatarUrl: string; name?: string };
 type TopbarAttentionNotice = { count: number; time: string; bot: string; reason: string };
@@ -159,7 +161,7 @@ let activeHash = location.hash || '#/';
 let ownerAvatar: OwnerAvatar | null = null;
 let updateBehind = false;
 let latestVersion: string | null = null;
-let updateBadgeKind: 'botmux' | 'codex' | null = null;
+let updateBadgeKind: 'botmux' | 'runtime' | null = null;
 let botmuxUpdateStatus: BotmuxUpdateStatus | null = null;
 let routeRoot: HTMLElement | null = null;
 let appRoot: ReturnType<typeof createRoot> | null = null;
@@ -168,6 +170,7 @@ const routeState = createDashboardRouteState();
 const OWNER_AVATAR_KEY = 'botmux.ownerAvatar.v1';
 const BUSY_STATUSES = new Set(['working', 'analyzing', 'active', 'starting']);
 const AUTH_EXPIRED_EVENT = 'botmux:auth-expired';
+let authLoginBaseUrl: string | undefined;
 
 function icon(children: ReactNode): ReactNode {
   return <svg viewBox="0 0 16 16" aria-hidden="true">{children}</svg>;
@@ -268,7 +271,7 @@ function consumeDesktopShellRouteAction(): boolean {
 
 function updateBadgeTitle(): string {
   const version = latestVersion ? `v${latestVersion}` : '';
-  return updateBadgeKind === 'codex'
+  return updateBadgeKind === 'runtime'
     ? t('update.navRuntimeBadgeTitle', { version })
     : t('update.navBadgeTitle', { version });
 }
@@ -285,7 +288,7 @@ function getRouteRoot(): HTMLElement {
   return el;
 }
 
-function ThemeMenuSlot(): JSX.Element {
+function ThemeMenuSlot(): React.JSX.Element {
   useEffect(() => {
     initThemeMenu();
   }, []);
@@ -352,7 +355,7 @@ function dashboardStatusSummary(): TopbarStatusSummary {
   };
 }
 
-function TopbarStatusRow(props: { label: string; value: number; hot?: boolean }): JSX.Element {
+function TopbarStatusRow(props: { label: string; value: number; hot?: boolean }): React.JSX.Element {
   return (
     <div className={`topbar-status-row${props.hot ? ' topbar-status-row-hot' : ''}`}>
       <span>{props.label}</span>
@@ -361,7 +364,7 @@ function TopbarStatusRow(props: { label: string; value: number; hot?: boolean })
   );
 }
 
-function TopbarStatusDonut(props: { summary: TopbarStatusSummary }): JSX.Element {
+function TopbarStatusDonut(props: { summary: TopbarStatusSummary }): React.JSX.Element {
   const { attention, idle, working } = props.summary;
   const total = working + attention + idle;
   const background = total === 0
@@ -386,7 +389,7 @@ function closeThemeMenuFromStatus(): void {
   window.dispatchEvent(new Event(CLOSE_THEME_MENU_EVENT));
 }
 
-function TopbarStatusMenu(props: { summary: TopbarStatusSummary; autoOpen?: boolean }): JSX.Element {
+function TopbarStatusMenu(props: { summary: TopbarStatusSummary; autoOpen?: boolean }): React.JSX.Element {
   const { autoOpen = false, summary } = props;
   const [open, setOpen] = useState(false);
   const [autoDismissed, setAutoDismissed] = useState(false);
@@ -479,8 +482,13 @@ function TopbarStatusMenu(props: { summary: TopbarStatusSummary; autoOpen?: bool
   );
 }
 
-function AuthExpiredOverlay(props: { open: boolean; onClose(): void }): JSX.Element | null {
+function AuthExpiredOverlay(props: {
+  open: boolean;
+  loginUrl?: string;
+  onClose(): void;
+}): React.JSX.Element | null {
   if (!props.open) return null;
+  const canLogin = !!props.loginUrl;
   return (
     <div
       id="auth-expired-overlay"
@@ -489,9 +497,31 @@ function AuthExpiredOverlay(props: { open: boolean; onClose(): void }): JSX.Elem
       onClick={event => { if (event.target === event.currentTarget) props.onClose(); }}
     >
       <div className="auth-expired-dialog" role="dialog" aria-modal="true" aria-labelledby="auth-expired-title">
-        <h2 id="auth-expired-title">访问链接已失效</h2>
-        <p>当前链接/访问已失效，请使用最新授权链接重新进入（运行 botmux dashboard 获取）。</p>
-        <button id="auth-expired-dismiss" type="button" className="primary" onClick={props.onClose}>知道了</button>
+        <h2 id="auth-expired-title">{canLogin ? '登录 Dashboard' : '访问链接已失效'}</h2>
+        <p>{canLogin
+          ? '当前浏览器尚未登录。点击后将通过 Botmux 平台校验机器 owner 权限，并返回当前页面；无权限账号仍会被拒绝。'
+          : '当前链接/访问已失效，请使用最新授权链接重新进入（运行 botmux dashboard 获取）。'}</p>
+        <div className="auth-expired-actions">
+          {props.loginUrl ? (
+            <a
+              id="dashboard-one-click-login"
+              className="auth-login-link primary"
+              href={props.loginUrl}
+              target="_top"
+              rel="noopener"
+            >
+              一键登录
+            </a>
+          ) : null}
+          <button
+            id="auth-expired-dismiss"
+            type="button"
+            className={canLogin ? 'secondary' : 'primary'}
+            onClick={props.onClose}
+          >
+            {canLogin ? '暂不登录' : '知道了'}
+          </button>
+        </div>
       </div>
     </div>
   );
@@ -530,7 +560,7 @@ async function dashboardInstance(): Promise<string> {
 function TopbarVersionControl(props: {
   status: BotmuxUpdateStatus | null;
   onRefresh(): Promise<boolean>;
-}): JSX.Element | null {
+}): React.JSX.Element | null {
   const { status } = props;
   const [open, setOpen] = useState(false);
   const [phase, setPhase] = useState<TopbarUpdatePhase>('idle');
@@ -969,7 +999,7 @@ function TopbarVersionControl(props: {
   );
 }
 
-function DashboardShell(): JSX.Element {
+function DashboardShell(): React.JSX.Element {
   const statusSummary = dashboardStatusSummary();
   const [botOnboardingOpen, setBotOnboardingOpen] = useState(false);
   const [authExpiredOpen, setAuthExpiredOpen] = useState(false);
@@ -1127,7 +1157,11 @@ function DashboardShell(): JSX.Element {
           </div>
         </div>
       </div>
-      <AuthExpiredOverlay open={authExpiredOpen} onClose={closeAuthExpired} />
+      <AuthExpiredOverlay
+        open={authExpiredOpen}
+        loginUrl={dashboardLoginHref(authLoginBaseUrl, location.hash)}
+        onClose={closeAuthExpired}
+      />
     </>
   );
 }
@@ -1143,7 +1177,11 @@ function setLocale(locale: DashboardLocale): void {
 
 // ── Auth-expiry overlay ──────────────────────────────────────────────────────
 let expiredShown = false;
-export function showAuthExpiredOverlay(): void {
+export function showAuthExpiredOverlay(loginUrl?: string): void {
+  const hasLoginUrl = !!dashboardLoginHref(loginUrl, location.hash);
+  const loginUrlChanged = hasLoginUrl && authLoginBaseUrl !== loginUrl;
+  if (hasLoginUrl) authLoginBaseUrl = loginUrl;
+  if (expiredShown && loginUrlChanged) renderShell();
   if (expiredShown) return;
   expiredShown = true;
   window.dispatchEvent(new Event(AUTH_EXPIRED_EVENT));
@@ -1173,9 +1211,10 @@ window.fetch = async function patchedFetch(
 ): ReturnType<typeof fetch> {
   const res = await origFetch(...args);
   if (res.status === 401) {
+    const loginUrl = res.headers.get('x-botmux-login-url') ?? undefined;
     const method = (args[1]?.method ?? 'GET').toUpperCase();
     const isRead = method === 'GET' || method === 'HEAD';
-    if (isRead && !publicReadOnly) showAuthExpiredOverlay();
+    if (loginUrl || (isRead && !publicReadOnly)) showAuthExpiredOverlay(loginUrl);
     else showReadOnlyToast();
   }
   return res;
@@ -1245,7 +1284,7 @@ async function checkUpdateBadge(force = false): Promise<boolean> {
       latestVersion = String(j.latest);
     } else if (runtime) {
       updateBehind = true;
-      updateBadgeKind = 'codex';
+      updateBadgeKind = 'runtime';
       latestVersion = String(runtime.latest);
     } else {
       updateBehind = false;

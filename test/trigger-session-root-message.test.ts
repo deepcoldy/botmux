@@ -30,6 +30,9 @@ vi.mock('../src/services/oncall-store.js', () => ({
 const mockCreateSession = vi.fn();
 const mockUpdateSession = vi.fn();
 vi.mock('../src/services/session-store.js', () => ({
+  registerSessionBridgeSendMarkerCleanupFence: vi.fn(),
+  cleanupSessionBridgeSendMarkers: vi.fn(),
+  cleanupSessionBridgeSendMarkersNow: vi.fn(),
   createSession: (...args: any[]) => mockCreateSession(...args),
   updateSession: (...args: any[]) => mockUpdateSession(...args),
 }));
@@ -57,6 +60,12 @@ vi.mock('../src/core/worker-pool.js', () => ({
     return true;
   },
   getCurrentCliVersion: vi.fn(() => 'test-cli-version'),
+  setActiveSessionIfActive: (map: Map<string, any>, key: string, ds: any) => {
+    if (map.has(key) && map.get(key) !== ds) return false;
+    map.set(key, ds);
+    return true;
+  },
+  closeSession: vi.fn(async () => ({ ok: true, alreadyClosed: false, known: true })),
 }));
 
 const mockRememberLastCliInput = vi.fn();

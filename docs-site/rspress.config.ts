@@ -38,6 +38,7 @@ const zhSidebar = [
       { text: '本地白板', link: '/whiteboard' },
       { text: '角色与团队', link: '/roles' },
       { text: 'tmux 会话常驻', link: '/tmux' },
+      { text: 'ZMX 会话后端', link: '/zmx' },
       { text: '会话接入 Adopt', link: '/adopt' },
       { text: '会话接力 Relay', link: '/relay' },
       { text: '一键建会话群', link: '/group' },
@@ -52,6 +53,13 @@ const zhSidebar = [
       { text: 'Workflow（实验性）', link: '/workflow' },
       { text: '生命周期 Hooks', link: '/hooks' },
       { text: 'Skill + CLI 交互', link: '/skill-cli' },
+    ],
+  },
+  {
+    text: '开发与扩展',
+    collapsed: false,
+    items: [
+      { text: 'Plugin 开发与市场注册', link: '/plugins' },
     ],
   },
   {
@@ -112,6 +120,7 @@ const enSidebar = [
       { text: 'Local Whiteboard', link: '/en/whiteboard' },
       { text: 'Roles & Teams', link: '/en/roles' },
       { text: 'tmux Session Persistence', link: '/en/tmux' },
+      { text: 'ZMX Session Backend', link: '/en/zmx' },
       { text: 'Adopt a Session', link: '/en/adopt' },
       { text: 'Relay a Session', link: '/en/relay' },
       { text: 'One-Click Session Groups', link: '/en/group' },
@@ -126,6 +135,13 @@ const enSidebar = [
       { text: 'Workflow (Experimental)', link: '/en/workflow' },
       { text: 'Lifecycle Hooks', link: '/en/hooks' },
       { text: 'Skill + CLI Interaction', link: '/en/skill-cli' },
+    ],
+  },
+  {
+    text: 'Development & Extensions',
+    collapsed: false,
+    items: [
+      { text: 'Plugin Development & Market', link: '/en/plugins' },
     ],
   },
   {

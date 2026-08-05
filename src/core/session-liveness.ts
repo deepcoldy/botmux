@@ -1,23 +1,34 @@
 /**
  * Shared "is this session a stopped zombie?" predicate — the same notion the
- * `botmux delete stopped` CLI subcommand uses (dead CLI process + no tmux pane),
- * factored out so the host-overload alert's "清僵尸" button can reuse the exact
- * semantics server-side without duplicating (or drifting from) the CLI logic.
+ * `botmux delete stopped` CLI subcommand and the host-overload "清僵尸" button
+ * use, factored out so they can't drift apart.
  *
- * A zombie = a session the store still marks `active`, but whose CLI process is
- * gone and has no backing tmux session — i.e. nothing is actually running, it's
- * just a stale record holding a slot. Intentionally-suspended sessions are NOT
- * zombies: they're worker-less on purpose and cold-resume on the next message.
- * botmux's own cap-suspend deliberately clears the pid AND destroys the backing
- * CLI/tmux (that's how it reclaims memory), so the pid/tmux probe alone can't
- * tell such a session apart from a true zombie — it would classify the just-
- * suspended session as stopped and let the sweep permanently close it. The
- * persisted `suspendedColdResume` marker is therefore authoritative and short-
- * circuits to "not stopped", matching the CLI `list` prune guard
- * (session-list-liveness.ts). Callers still gate on `status === 'active'`.
+ * The invariant (shared with `botmux list`'s auto-prune, see
+ * cli/session-list-liveness.ts): a missing pid/backing is NEVER, on its own,
+ * grounds to permanently close a REAL managed session. A real managed session
+ * (one that ever ran a CLI, took a turn, or adopted a process) has a resumable
+ * CLI transcript on disk, so whatever removed its live process — a plain CLI
+ * exit, botmux's own idle-worker cap-suspend, or a whole-host reboot that wiped
+ * every multiplexer pane at once — the next message cold-resumes it (and if the
+ * transcript is genuinely gone, the worker's resume→fresh fallback spawns a
+ * clean session with a user-visible notice). It is dormant, not a zombie.
+ *
+ * A zombie here is therefore only a DISPOSABLE SCRATCH: a row that never became
+ * a real CLI session (an unconfirmed /adopt picker, /help, an abandoned /relay
+ * picker) and now has no live process. Adopted sessions are the one case whose
+ * external pid is authoritative — we never spawned a botmux worker and hold no
+ * transcript of our own, so a dead adopted pid IS a real stop.
+ *
+ * Why we no longer probe the multiplexer backing: botmux shares the default
+ * tmux socket with the operator's own terminal, so a co-tenant reviving the
+ * server made a reboot read as N solo zombies → 239 live sessions mass-closed
+ * after a single reboot. The transcript on disk — not a co-tenant-poisoned
+ * "is the pane alive?" probe — is the authoritative recoverability signal.
+ *
+ * Callers still gate on `status === 'active'`.
  */
-import { execFileSync } from 'node:child_process';
 import type { Session } from '../types.js';
+import { isRealManagedSession } from '../cli/session-list-liveness.js';
 
 /** Liveness check for an arbitrary pid without signalling it (signal 0). */
 export function isProcessAlive(pid: number): boolean {
@@ -31,17 +42,6 @@ export function isProcessAlive(pid: number): boolean {
   }
 }
 
-/** True when a `bmx-<prefix>` tmux session exists. Best-effort; tmux missing
- *  or any error → treated as "no pane". */
-export function tmuxSessionExists(name: string): boolean {
-  try {
-    execFileSync('tmux', ['has-session', '-t', name], { stdio: 'ignore', timeout: 3000 });
-    return true;
-  } catch {
-    return false;
-  }
-}
-
 function adoptedCliPid(s: Session): number | undefined {
   const pid = s.adoptedFrom && typeof s.adoptedFrom === 'object'
     ? (s.adoptedFrom as { originalCliPid?: number }).originalCliPid
@@ -50,26 +50,29 @@ function adoptedCliPid(s: Session): number | undefined {
 }
 
 /**
- * True when a session record is a stopped zombie: no live CLI process and no
- * tmux pane. Mirrors cli.ts `delete stopped`. For adopted sessions the original
- * CLI pid is authoritative (we never spawned a botmux worker); for normal
- * sessions, both the recorded worker pid and the `bmx-<id8>` tmux pane must be
- * dead. Caller is responsible for the `status === 'active'` gate.
+ * True when a session record is a stopped zombie: no live process AND it is not
+ * a real managed session that could cold-resume. See the module doc for the
+ * full rationale. For adopted sessions the original CLI pid is authoritative
+ * (we never spawned a botmux worker). Caller is responsible for the
+ * `status === 'active'` gate.
  */
 export function isSessionStopped(s: Session): boolean {
-  // botmux cap-suspended a session on purpose: pid cleared + backing CLI/tmux
-  // destroyed, cold-resumes on the next message. The marker beats the generic
-  // zombie heuristic so the "清僵尸" sweep can't permanently close it.
-  if (s.suspendedColdResume === true) return false;
+  // Adopt: the wrapped foreign CLI's own pid is authoritative — we hold no
+  // transcript of our own to resume, so a dead adopted pid IS a real stop.
   const originalPid = adoptedCliPid(s);
   if (originalPid !== undefined) {
     return !isProcessAlive(originalPid);
   }
-  // A live worker pid alone proves the session isn't a zombie — short-circuit
-  // before touching tmux so the (synchronous, up-to-3s) tmux probe only ever
-  // runs for sessions whose pid is already dead. Keeps counts/sweep from
-  // spawning a tmux child per live session and stalling the daemon loop.
+  // A live worker pid alone proves the session isn't a zombie.
   if (s.pid && isProcessAlive(s.pid)) return false;
-  const hasTmux = tmuxSessionExists(`bmx-${s.sessionId.substring(0, 8)}`);
-  return !hasTmux;
+  // botmux cap-suspended a session on purpose (pid cleared + backing destroyed
+  // to reclaim memory): the marker beats the heuristic. Subsumed by the
+  // real-managed check below, but kept explicit as the authoritative signal.
+  if (s.suspendedColdResume === true) return false;
+  // No live process. A real managed session is dormant-recoverable (transcript
+  // on disk), NOT a closeable zombie — regardless of backend or whether its
+  // multiplexer pane survived. Only a scratch that never became a real CLI
+  // session is a true stop. This is the host-reboot fix: `restoreActiveSessions`
+  // keeps these rows, and the sweep must not re-close them.
+  return !isRealManagedSession(s);
 }

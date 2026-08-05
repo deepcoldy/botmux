@@ -5,6 +5,7 @@
  * 纯内存，daemon 重启清空（重启后旧卡 nonce 自然失效，符合预期）。
  */
 import { randomUUID } from 'node:crypto';
+import { DEFAULT_GRANT_DURATION_MS, DEFAULT_GRANT_QUOTA } from '../../services/grant-policy.js';
 
 const DENY_COOLDOWN_MS = 10 * 60 * 1000;
 /** pending 卡超过此窗口仍未处置即视作废弃（owner 一直没点），可回收。
@@ -14,7 +15,14 @@ const STALE_PENDING_MS = 24 * 60 * 60 * 1000;
  *  最多每分钟跑一次，避免在热路径上对全表做 O(n) 扫描。 */
 const PRUNE_INTERVAL_MS = 60 * 1000;
 
-type Entry = { state: 'pending' | 'denied'; nonce?: string; ts: number; quota?: number; messageData?: any };
+type Entry = {
+  state: 'pending' | 'denied';
+  nonce?: string;
+  ts: number;
+  quota?: number;
+  durationMs?: number;
+  messageData?: any;
+};
 const table = new Map<string, Entry>();
 let lastPrunedAt = 0;
 
@@ -36,26 +44,69 @@ function pruneStale(now: number): void {
 
 /** 开一张待处置的卡，返回 nonce。`quota` 为可选的消息额度（已解析），落授权时透传给 grant-store。
  *  `messageData` 为触发本次授权申请的原始飞书消息事件，授权成功后可重放，让用户无需再 @ 一遍。 */
-export function openPending(larkAppId: string, chatId: string, target: string, quota?: number, messageData?: any): string {
-  return openPendingMulti(larkAppId, chatId, [target], quota, messageData);
+export function openPending(
+  larkAppId: string,
+  chatId: string,
+  target: string,
+  quota: number | undefined = DEFAULT_GRANT_QUOTA,
+  messageData?: any,
+  durationMs: number | undefined = DEFAULT_GRANT_DURATION_MS,
+): string {
+  return openPendingMulti(larkAppId, chatId, [target], quota, messageData, durationMs);
 }
 
 /** owner 一次 /grant 多个目标：同一张卡 → 多个 target 共用同一 nonce，
  *  owner 点一次范围即对全部目标生效。校验时每个 target 独立 checkNonce。
  *  `quota`（若有）对每个 target 各自生效（每人 N 条额度）。
  *  `messageData` 为触发本次授权申请的原始飞书消息事件，授权成功后可重放。 */
-export function openPendingMulti(larkAppId: string, chatId: string, targets: string[], quota?: number, messageData?: any): string {
+export function openPendingMulti(
+  larkAppId: string,
+  chatId: string,
+  targets: string[],
+  quota: number | undefined = DEFAULT_GRANT_QUOTA,
+  messageData?: any,
+  durationMs: number | undefined = DEFAULT_GRANT_DURATION_MS,
+): string {
   const nonce = randomUUID();
   const ts = Date.now();
   pruneStale(ts);
-  for (const target of targets) table.set(key(larkAppId, chatId, target), { state: 'pending', nonce, ts, quota, messageData });
+  for (const target of targets) {
+    table.set(key(larkAppId, chatId, target), { state: 'pending', nonce, ts, quota, durationMs, messageData });
+  }
   return nonce;
 }
 
-/** 回读 pending 上挂的额度（owner 点授权按钮时用）。无 / 非 pending → undefined。 */
-export function getPendingQuota(larkAppId: string, chatId: string, target: string): number | undefined {
+/** 回读 pending 上挂的限制（owner 点授权按钮时用）。 */
+export function getPendingGrantLimits(
+  larkAppId: string,
+  chatId: string,
+  target: string,
+): { quota?: number; durationMs?: number } | undefined {
   const e = table.get(key(larkAppId, chatId, target));
-  return e && e.state === 'pending' ? e.quota : undefined;
+  return e && e.state === 'pending' ? { quota: e.quota, durationMs: e.durationMs } : undefined;
+}
+
+/** 同一张多目标卡共用一组限制；nonce 不匹配时拒绝暂存。 */
+export function updatePendingGrantLimits(
+  larkAppId: string,
+  chatId: string,
+  targets: string[],
+  nonce: string,
+  patch: { quota?: number | null; durationMs?: number | null },
+): boolean {
+  const entries = targets.map(target => table.get(key(larkAppId, chatId, target)));
+  if (entries.some(e => !e || e.state !== 'pending' || e.nonce !== nonce)) return false;
+  for (const e of entries as Entry[]) {
+    if ('quota' in patch) {
+      if (patch.quota === null || patch.quota === undefined) delete e.quota;
+      else e.quota = patch.quota;
+    }
+    if ('durationMs' in patch) {
+      if (patch.durationMs === null || patch.durationMs === undefined) delete e.durationMs;
+      else e.durationMs = patch.durationMs;
+    }
+  }
+  return true;
 }
 
 /** 回读 pending 上挂的原始消息事件（授权成功后重放，让用户无需再 @ 一遍）。无 / 非 pending → undefined。 */

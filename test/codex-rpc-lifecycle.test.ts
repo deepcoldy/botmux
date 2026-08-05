@@ -28,6 +28,18 @@ describe('codexRpcEligible — the eligible base case', () => {
   it('a resume (no prompt but resume + cliSessionId) is eligible', () => {
     expect(codexRpcEligible(baseCfg({ prompt: '', resume: true, cliSessionId: 'thread-1' }))).toBe(true);
   });
+  it('a declared Codex-compatible runtime remains eligible with its executable shadow', () => {
+    expect(codexRpcEligible(baseCfg({
+      cliRuntime: {
+        id: 'vendor-codex',
+        displayName: 'VendorCodex',
+        executable: '/opt/vendor-codex',
+        source: 'configured',
+        update: { provider: 'self' },
+      },
+      cliPathOverride: '/opt/vendor-codex',
+    }))).toBe(true);
+  });
 });
 
 describe('codexRpcEligible — every fail-closed gate degrades to paste', () => {
@@ -53,6 +65,54 @@ describe('codexRpcEligible — every fail-closed gate degrades to paste', () => 
   }
   it('fails closed when BOTMUX_SANDBOX=1 forces sandbox outside InitCfg', () => {
     expect(codexRpcEligible(baseCfg(), { sandboxForced: true })).toBe(false);
+  });
+  it('fails closed for a migrated legacy-path snapshot even when the path shadow matches', () => {
+    expect(codexRpcEligible(baseCfg({
+      cliRuntime: {
+        id: 'vendor-codex',
+        displayName: 'vendor-codex',
+        executable: '/opt/vendor-codex',
+        source: 'legacy-path',
+        update: { provider: 'auto' },
+      },
+      cliPathOverride: '/opt/vendor-codex',
+    }))).toBe(false);
+  });
+  it('fails closed when the structured snapshot and executable shadow disagree', () => {
+    expect(codexRpcEligible(baseCfg({
+      cliRuntime: {
+        id: 'vendor-codex',
+        displayName: 'VendorCodex',
+        executable: '/opt/vendor-codex',
+        source: 'configured',
+        update: { provider: 'none' },
+      },
+      cliPathOverride: '/opt/not-vendor-codex',
+    }))).toBe(false);
+  });
+  it('fails closed when a structured snapshot has no executable shadow', () => {
+    expect(codexRpcEligible(baseCfg({
+      cliRuntime: {
+        id: 'vendor-codex',
+        displayName: 'VendorCodex',
+        executable: '/opt/vendor-codex',
+        source: 'configured',
+        update: { provider: 'none' },
+      },
+      cliPathOverride: undefined,
+    }))).toBe(false);
+  });
+  it('fails closed for a legacy snapshot even when its executable shadow is missing', () => {
+    expect(codexRpcEligible(baseCfg({
+      cliRuntime: {
+        id: 'vendor-codex',
+        displayName: 'vendor-codex',
+        executable: '/opt/vendor-codex',
+        source: 'legacy-path',
+        update: { provider: 'auto' },
+      },
+      cliPathOverride: undefined,
+    }))).toBe(false);
   });
 });
 
@@ -81,6 +141,53 @@ describe('paneRunsRemoteTui — RPC-owned detection via leaf argv (not pane_curr
     expect(paneRunsRemoteTui('bmx-1', probes({
       100: { comm: 'node', argv: ['node', '/n/bin/codex', '--remote', 'ws://x', 'resume', 'tid'] },
     }))).toBe(true);
+  });
+
+  it('matches a configured runtime executable exactly', () => {
+    const runtimeProbes = probes({
+      100: { comm: 'node', argv: ['node', '/opt/bin/vendor-codex', '--remote', 'ws://x', 'resume', 'tid'] },
+    });
+    expect(paneRunsRemoteTui('bmx-1', runtimeProbes, '/opt/bin/vendor-codex')).toBe(true);
+    expect(paneRunsRemoteTui('bmx-1', runtimeProbes, '/opt/bin/codex')).toBe(false);
+    expect(paneRunsRemoteTui('bmx-1', probes({
+      100: { comm: 'node.exe', argv: ['node.exe', 'C:\\tools\\vendor-codex.exe', '--remote'] },
+    }), 'C:\\tools\\vendor-codex.exe')).toBe(true);
+  });
+
+  it('matches a configured runtime in a known Node executable slot, but never in arbitrary program argv', () => {
+    expect(paneRunsRemoteTui('bmx-1', probes({
+      100: {
+        comm: 'node',
+        argv: ['node', '--enable-source-maps', '/opt/bin/vendor-codex', '--remote', 'ws://x', 'resume', 'tid'],
+      },
+    }), '/opt/bin/vendor-codex')).toBe(true);
+
+    // `/opt/bin/vendor-codex` is an argument to unrelated.js, not the program
+    // launched by Node. A broad argv scan would incorrectly claim this pane.
+    expect(paneRunsRemoteTui('bmx-1', probes({
+      100: {
+        comm: 'node',
+        argv: ['node', '/srv/unrelated.js', '/opt/bin/vendor-codex', '--remote'],
+      },
+    }), '/opt/bin/vendor-codex')).toBe(false);
+
+    // Unknown flags may consume the next token. Fail closed instead of guessing
+    // that their value is the executable slot.
+    expect(paneRunsRemoteTui('bmx-1', probes({
+      100: {
+        comm: 'node',
+        argv: ['node', '--require', '/opt/bin/vendor-codex', '/srv/unrelated.js', '--remote'],
+      },
+    }), '/opt/bin/vendor-codex')).toBe(false);
+  });
+
+  it('does not claim stock Codex or a prefix lookalike for a custom runtime', () => {
+    expect(paneRunsRemoteTui('bmx-1', probes({
+      100: { comm: 'codex', argv: ['codex', '--remote', 'ws://x', 'resume', 'tid'] },
+    }), '/opt/bin/vendor-codex')).toBe(false);
+    expect(paneRunsRemoteTui('bmx-1', probes({
+      100: { comm: 'vendor-codex-helper', argv: ['vendor-codex-helper', '--remote', 'ws://x', 'resume', 'tid'] },
+    }), '/opt/bin/vendor-codex')).toBe(false);
   });
 
   it('native paste codex (resume, NO --remote) → not RPC-owned (fail-closed, boundary #3)', () => {

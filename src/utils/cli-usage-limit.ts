@@ -118,6 +118,30 @@ export interface DetectUsageLimitOptions {
   suppressRateKind?: boolean;
 }
 
+/**
+ * Whether a CLI adapter is authoritative for structured rate limits — i.e. it
+ * actually PUBLISHES a `limited` screen_update from its transcript. Only the
+ * Claude family does (via the worker's `maybeEmitStructuredRateLimit` on the
+ * `bridgeJsonlPath` path), and it is exactly the adapters that carry
+ * `claudeDataDir`. When true, the worker passes `suppressRateKind` so the
+ * screen-scan `rate` verdict is suppressed in favor of the structured signal.
+ *
+ * Gate on `claudeDataDir`, NOT `reliableTurnTerminal`: the codexBridgeQueue
+ * CLIs emit NO structured `limited` state, so suppressing their screen `rate`
+ * would drop the Dashboard「需要你」signal + backoff on a real 429. Most of
+ * them (codex / grok / traex) DO set `reliableTurnTerminal`, so gating on that
+ * flag would wrongly suppress them; pi is also codexBridgeQueue-backed but does
+ * not set it — either way, none carry `claudeDataDir`, so all correctly stay
+ * screen-scanning. Extracted as a pure predicate so the split has a direct
+ * unit-test surface (see cli-usage-limit.test.ts) — a future adapter can't
+ * silently re-broaden it.
+ */
+export function isStructuredRateLimitAuthoritative(
+  adapter: { readonly claudeDataDir?: string } | null | undefined,
+): boolean {
+  return !!adapter?.claudeDataDir;
+}
+
 export function detectCliUsageLimit(
   text: string,
   now = new Date(),

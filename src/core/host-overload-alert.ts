@@ -57,6 +57,136 @@ export const DEFAULT_OVERLOAD_THRESHOLDS: Omit<OverloadThresholds, 'cpuCount'> =
   minReAlertMs: 15 * 60_000,
 };
 
+/** Parse a finite float from a raw env string; blank/garbage/failing-`isValid`
+ *  → `fallback`. `isValid` defaults to non-negative (right for exit lines +
+ *  minReAlertMs, where 0 is a legal "off"/"immediate" value); the enter
+ *  thresholds pass stricter predicates (load must be > 0, mem must be in (0,1])
+ *  so a degenerate `enter=0` can't sneak in — at enter=0 the 95% hysteresis
+ *  clamp is still 0, breaking "exit strictly below enter" and (for mem) flapping
+ *  entered/recovered every tick. Shared by {@link computeOverloadThresholds} so
+ *  env-override precedence is testable without a live `process.env`. */
+export function parseOverloadEnvFloat(
+  raw: string | undefined,
+  fallback: number,
+  isValid: (n: number) => boolean = (n) => n >= 0,
+): number {
+  if (raw === undefined || raw.trim() === '') return fallback;
+  const n = Number(raw);
+  return Number.isFinite(n) && isValid(n) ? n : fallback;
+}
+
+/** Validity predicates for the two enter dimensions — exported so tests + the
+ *  config/applier layers can share the exact same rule (single source of truth). */
+export const isValidEnterLoadRatio = (n: number): boolean => Number.isFinite(n) && n > 0;
+export const isValidEnterMemUsedFrac = (n: number): boolean => Number.isFinite(n) && n > 0 && n <= 1;
+
+/**
+ * Should THIS daemon sample host pressure and own the overload alert?
+ *
+ * The alert is machine-level: the global `hostOverloadAlert` config names ONE
+ * notifier bot, and only that bot's own daemon samples + advances the state
+ * machine + DMs (it runs on this host, so no cross-daemon delivery is needed).
+ * Every other daemon must no-op AND reset its local state, so that when the
+ * target later switches TO this bot the state machine starts clean (no stale
+ * "already overloaded" edge from a previous ownership). Pure predicate over the
+ * config + this daemon's identity — the reset is the caller's responsibility.
+ *
+ * FAIL-CLOSED on apiOnly: a core-only (apiOnly) bot has no Feishu transport, so
+ * it can never DM an admin. Even if a hand-edited config or a pre-`apiOnly`-aware
+ * migration names an apiOnly bot as the target, this daemon must NOT sample —
+ * it would advance the state machine and then silently drop every alert. The
+ * migration also excludes apiOnly candidates; this is the runtime backstop for
+ * configs that bypass it.
+ *
+ * @param alertCfg the global `hostOverloadAlert` block (or {} when unset).
+ * @param self this daemon's identity: `larkAppId` + whether it's apiOnly.
+ */
+export function isOverloadAlertTarget(
+  alertCfg: { enabled?: boolean; targetBotAppId?: string } | undefined,
+  self: { larkAppId: string; apiOnly?: boolean } | string,
+): boolean {
+  if (!alertCfg) return false;
+  const selfAppId = typeof self === 'string' ? self : self.larkAppId;
+  const selfApiOnly = typeof self === 'string' ? false : self.apiOnly === true;
+  if (selfApiOnly) return false; // apiOnly bots can't deliver a DM — never sample.
+  return alertCfg.enabled === true
+    && typeof alertCfg.targetBotAppId === 'string'
+    && alertCfg.targetBotAppId === selfAppId;
+}
+
+/** Raw inputs for {@link computeOverloadThresholds}: the host CPU count, the
+ *  operator's enter thresholds from global config (already-parsed numbers or
+ *  undefined), and the relevant `BOTMUX_OVERLOAD_*` env strings. Kept as plain
+ *  data so the priority + hysteresis logic is pure and unit-testable. */
+export interface OverloadThresholdInputs {
+  cpuCount: number;
+  configEnterLoadRatio?: number;
+  configEnterMemUsedFrac?: number;
+  env?: {
+    enterLoadRatio?: string;
+    exitLoadRatio?: string;
+    enterMemUsedFrac?: string;
+    exitMemUsedFrac?: string;
+    minReAlertMs?: string;
+  };
+  /** Optional sink for the hysteresis-clamp warning (daemon passes logger.warn). */
+  warn?: (message: string) => void;
+}
+
+/**
+ * Resolve the effective {@link OverloadThresholds} from env > global config >
+ * built-in default for the ENTER lines, deriving the EXIT lines with hysteresis.
+ *
+ * Precedence (enter load/mem): a valid `BOTMUX_OVERLOAD_ENTER_*` env wins; else
+ * a sane positive config value; else the built-in default. Config values are
+ * re-validated defensively here (finite, positive, mem ≤ 1) so a bad persisted
+ * value can't leak past the resolver.
+ *
+ * Hysteresis: the recover (exit) line MUST sit strictly below the enter line, or
+ * a reading pinned at the threshold flaps entered/recovered every tick (enter
+ * uses `>=`, recover uses `<=`). If a misconfigured exit ≥ enter, clamp it to
+ * 95% of enter and warn. Swap thresholds + minReAlertMs pass through (env or
+ * default). Pure: no `os`, no `process.env`, no clock.
+ */
+export function computeOverloadThresholds(inputs: OverloadThresholdInputs): OverloadThresholds {
+  const cpuCount = Math.max(1, inputs.cpuCount || 1);
+  const env = inputs.env ?? {};
+  // Config enter values are re-validated with the SAME per-dimension predicates
+  // as env (load > 0, mem in (0,1]) so a bad persisted value falls through to
+  // the built-in default instead of poisoning the derived exit line.
+  const cfgEnterLoad = typeof inputs.configEnterLoadRatio === 'number' && isValidEnterLoadRatio(inputs.configEnterLoadRatio)
+    ? inputs.configEnterLoadRatio : DEFAULT_OVERLOAD_THRESHOLDS.enterLoadRatio;
+  const cfgEnterMem = typeof inputs.configEnterMemUsedFrac === 'number' && isValidEnterMemUsedFrac(inputs.configEnterMemUsedFrac)
+    ? inputs.configEnterMemUsedFrac : DEFAULT_OVERLOAD_THRESHOLDS.enterMemUsedFrac;
+  // Enter thresholds: env wins, but only if it passes the strict predicate;
+  // otherwise fall back to the (already-validated) config/default value.
+  const enterLoadRatio = parseOverloadEnvFloat(env.enterLoadRatio, cfgEnterLoad, isValidEnterLoadRatio);
+  let exitLoadRatio = parseOverloadEnvFloat(env.exitLoadRatio, DEFAULT_OVERLOAD_THRESHOLDS.exitLoadRatio);
+  const enterMemUsedFrac = parseOverloadEnvFloat(env.enterMemUsedFrac, cfgEnterMem, isValidEnterMemUsedFrac);
+  let exitMemUsedFrac = parseOverloadEnvFloat(env.exitMemUsedFrac, DEFAULT_OVERLOAD_THRESHOLDS.exitMemUsedFrac);
+  const HYSTERESIS_MARGIN = 0.95; // exit = 95% of enter when misconfigured
+  if (exitLoadRatio >= enterLoadRatio) {
+    const clamped = enterLoadRatio * HYSTERESIS_MARGIN;
+    inputs.warn?.(`[overload] BOTMUX_OVERLOAD_EXIT_LOAD_RATIO (${exitLoadRatio}) >= ENTER (${enterLoadRatio}); clamping exit to ${clamped}`);
+    exitLoadRatio = clamped;
+  }
+  if (exitMemUsedFrac >= enterMemUsedFrac) {
+    const clamped = enterMemUsedFrac * HYSTERESIS_MARGIN;
+    inputs.warn?.(`[overload] BOTMUX_OVERLOAD_EXIT_MEM_FRAC (${exitMemUsedFrac}) >= ENTER (${enterMemUsedFrac}); clamping exit to ${clamped}`);
+    exitMemUsedFrac = clamped;
+  }
+  return {
+    cpuCount,
+    enterLoadRatio,
+    exitLoadRatio,
+    enterMemUsedFrac,
+    exitMemUsedFrac,
+    enterSwapUsedFrac: DEFAULT_OVERLOAD_THRESHOLDS.enterSwapUsedFrac,
+    exitSwapUsedFrac: DEFAULT_OVERLOAD_THRESHOLDS.exitSwapUsedFrac,
+    minReAlertMs: parseOverloadEnvFloat(env.minReAlertMs, DEFAULT_OVERLOAD_THRESHOLDS.minReAlertMs),
+  };
+}
+
 /** A single sampled reading of host pressure. */
 export interface HostReading {
   /** 15-minute load average (os.loadavg()[2]). */

@@ -13,7 +13,7 @@
  *   botmux status         — show daemon status
  *   botmux upgrade|update — upgrade to latest version
  *   botmux device enroll|status|logout — manage the host desktop device credential
- *   botmux list           — interactive session picker (TUI), attach to tmux
+ *   botmux list           — interactive session picker (TUI), attach to managed tmux/ZMX sessions
  *   botmux list --plain   — plain table output (for piping / scripts)
  *   botmux delete <id>    — close a session by ID prefix
  *   botmux delete all     — close all active sessions
@@ -22,6 +22,7 @@
  */
 import { execSync, execFileSync, spawnSync, spawn } from 'node:child_process';
 import { existsSync, mkdirSync, copyFileSync, readFileSync, writeFileSync, renameSync, readdirSync, readlinkSync, appendFileSync, statSync, unlinkSync, rmSync, realpathSync } from 'node:fs';
+import { underReadIsolation, sendCredFilePath } from './adapters/cli/read-isolation.js';
 import { atomicWriteFileSync } from './utils/atomic-write.js';
 import { join, dirname, basename, resolve } from 'node:path';
 import { homedir } from 'node:os';
@@ -76,12 +77,17 @@ import {
 import { interactiveSelect, pickChoice, pickCliSelection } from './setup/interactive-select.js';
 import { buildPreset, serializePreset, presetFilename } from './setup/agent-preset.js';
 import type { CliId } from './adapters/cli/types.js';
+import type { BackendType, PersistentBackendTarget, SessionProbe } from './adapters/backend/types.js';
 import { logger } from './utils/logger.js';
 import { scrubClaudeSessionMarkerEnv, scrubSessionCliHomeEnv } from './utils/child-env.js';
 import { scheduleTimeZone } from './utils/timezone.js';
 import { expandHomePath, invalidWorkingDirs } from './utils/working-dir.js';
 import { firstPositional } from './cli/arg-utils.js';
-import { isColdResumeDormant, sessionListDisposition } from './cli/session-list-liveness.js';
+import { isColdResumeDormant, isRealManagedSession, sessionListDisposition } from './cli/session-list-liveness.js';
+import {
+  attachFrozenManagedZmxSession,
+  freezeManagedZmxAttachTarget,
+} from './cli/zmx-managed-attach.js';
 import { dispatchPrimaryMessage, findStdinAliasAttachment, normalizeInteractiveCardInput, sendFileAttachments, sendVideoAttachments, shouldSendAsPureVideo, validateVideoAttachments } from './cli/send-dispatch.js';
 import { dispatchDeferredTopicSend, type DeferredScheduleRunData } from './cli/deferred-topic-send.js';
 import { resolveDaemonEnv } from './cli/daemon-lifecycle-env.js';
@@ -132,7 +138,10 @@ import {
   whiteboardEnabled,
   whiteboardPath,
 } from './services/whiteboard-store.js';
-import { buildBridgeSendMarkerContent } from './services/bridge-fallback-gate.js';
+import {
+  buildBridgeSendMarkerContent,
+  buildBridgeSendPreviewText,
+} from './services/bridge-fallback-gate.js';
 import { bindRestartLeaseTo, writeManualIntentIfAbsentTo } from './services/restart-intent-store.js';
 import { repairMissingChatScope, stripLegacyPendingCardFields } from './services/session-store.js';
 import {
@@ -164,6 +173,14 @@ import {
   stopExactPm2Process,
   type BotmuxPm2Inspection,
 } from './core/bot-live-control.js';
+import {
+  isSuspendableBackendType,
+  killPersistentBackendTarget,
+  probePersistentBackendTarget,
+  probePersistentSessions,
+  resolvePersistentBackendTarget,
+  type PersistentBackendType,
+} from './core/persistent-backend.js';
 
 // Resolve the CLI's UI locale once from the global config file, so subsequent
 // CLI output (and any t() callers that don't pass an explicit locale) honour
@@ -347,6 +364,12 @@ function pm2Capture(args: string[], home: string = PM2_HOME, timeoutMs = 10_000)
 }
 
 function loadBotsJson(): any[] {
+  // NOTE: this stays FATAL on a read error, deliberately. Several callers treat
+  // an empty list as "nothing references this" and go on to delete things
+  // (plugin dematerialize / uninstall dependency check) — degrading the read to
+  // [] would turn a denied read into silent destructive action. Anything that
+  // must survive an unreadable bots.json has to opt out explicitly, the way
+  // allBotAppIds() and currentBotIsApiOnly() do.
   if (existsSync(BOTS_JSON_FILE)) {
     try {
       return parseBotConfigsJson(readFileSync(BOTS_JSON_FILE, 'utf-8'), BOTS_JSON_FILE);
@@ -399,6 +422,79 @@ function ensureUniqueBotProcessNames(bots: any[]): void {
       process.exit(1);
     }
   }
+}
+
+/**
+ * `botmux serve --api-only` — run a single-process, headless core-only service
+ * in the FOREGROUND (stdio inherited so a launcher can watch the ready line and
+ * the process lifetime IS the service). No pm2, no dashboard, no bots.json, no
+ * Feishu credentials. See src/index-core-only.ts for the full contract.
+ */
+async function cmdServe(args: string[]): Promise<void> {
+  const apiOnly = args.includes('--api-only');
+  if (!apiOnly) {
+    console.error('Usage: botmux serve --api-only [--port <PORT>] [--bot <local_slug>] [--cli <cliId>] [--state-dir <DIR>]');
+    console.error('  Only core-only (--api-only) serving is supported. It runs a headless HTTP');
+    console.error('  control-API service with no Feishu credentials (for riff sandbox / embedding).');
+    process.exit(2);
+  }
+  const getOpt = (flag: string): string | undefined => {
+    const i = args.indexOf(flag);
+    return i >= 0 && i + 1 < args.length ? args[i + 1] : undefined;
+  };
+  const port = getOpt('--port') ?? process.env.BOTMUX_API_PORT;
+  if (!port || !/^\d+$/.test(port) || Number(port) < 1 || Number(port) > 65535) {
+    console.error(`botmux serve --api-only: --port (or BOTMUX_API_PORT) must be a valid port; got: ${port ?? '(unset)'}`);
+    process.exit(2);
+  }
+  const bot = getOpt('--bot') ?? process.env.BOTMUX_API_ONLY_BOT;
+  const cli = getOpt('--cli') ?? process.env.BOTMUX_CORE_CLI;
+  const workingDir = getOpt('--working-dir') ?? process.env.BOTMUX_CORE_WORKING_DIR;
+  const stateDir = getOpt('--state-dir') ?? process.env.BOTMUX_CORE_STATE_DIR;
+
+  const coreScript = join(PKG_ROOT, 'dist', 'index-core-only.js');
+  const child = spawn(process.execPath, [coreScript], {
+    stdio: 'inherit',
+    env: (() => {
+      const e: NodeJS.ProcessEnv = {
+        ...process.env,
+        BOTMUX_CORE_ONLY: '1',
+        BOTMUX_API_PORT: port,
+        // Freeze worker HTTP to loopback here too (defense-in-depth with the
+        // entrypoint) so a stray parent/dotenv 0.0.0.0 never reaches the child.
+        BOTMUX_WORKER_HTTP_HOST: '127.0.0.1',
+        ...(bot ? { BOTMUX_API_ONLY_BOT: bot } : {}),
+        ...(cli ? { BOTMUX_CORE_CLI: cli } : {}),
+        ...(workingDir ? { BOTMUX_CORE_WORKING_DIR: workingDir } : {}),
+        ...(stateDir ? { BOTMUX_CORE_STATE_DIR: stateDir } : {}),
+      };
+      // Never hand an ambient BOTS_CONFIG / legacy worker-host alias / ambient
+      // SESSION_DATA_DIR to the core-only child — the entrypoint freezes/strips
+      // these too, but keep the spawn env clean from the start (codex P1: agent
+      // could read $BOTS_CONFIG; ambient SESSION_DATA_DIR would point at a host
+      // fleet's store). The entrypoint re-derives a dedicated core-only state root.
+      delete e.BOTS_CONFIG;
+      delete e.BOTMUX_WORKER_HOST;
+      delete e.SESSION_DATA_DIR;
+      return e;
+    })(),
+  });
+  // Foreground lifetime tracks the child: forward termination signals and exit
+  // with the child's code so a launcher/supervisor sees an honest status.
+  const forward = (sig: NodeJS.Signals) => { try { child.kill(sig); } catch { /* */ } };
+  process.on('SIGTERM', () => forward('SIGTERM'));
+  process.on('SIGINT', () => forward('SIGINT'));
+  await new Promise<void>((resolve) => {
+    child.on('exit', (code, signal) => {
+      if (signal) { process.exitCode = 1; } else { process.exitCode = code ?? 0; }
+      resolve();
+    });
+    child.on('error', (err) => {
+      console.error(`[core-only] failed to spawn service: ${err.message}`);
+      process.exitCode = 1;
+      resolve();
+    });
+  });
 }
 
 function ecosystemConfig(activationAppId?: string): string {
@@ -1333,9 +1429,9 @@ async function promptEditBotConfig(
   }
 
   printInputHelp('会话后端 backendType', [
-    '可选。pty 更轻量；tmux 支持 adopt 和 Web Terminal 附着；herdr 支持托管持久会话；zellij 为实验后端（需 zellij >= 0.44）。',
+    '可选。pty 更轻量；tmux 支持 adopt 和 Web Terminal 附着；herdr 支持托管持久会话；zmx >= 0.7.0 提供纯文本持久会话 + 本机 attach（无 Web TUI）；zellij 为实验后端（需 zellij >= 0.44）。',
     '选择 traex + herdr 时，可在 Dashboard Settings 中开启 TraeX herdr plugin opt-in 并填写可信插件 spec；默认不会自动安装第三方插件。',
-    '留空保留当前值；输入 - 回到自动检测；接受 pty / tmux / herdr / zellij。',
+    '留空保留当前值；输入 - 回到全局默认（未设置 BACKEND_TYPE 时为 tmux）；接受 pty / tmux / herdr / zellij / zmx。',
   ]);
   input.backendType = await ask(rl, `会话后端 backendType [${formatOptionalValue(bot.backendType)}]: `);
 
@@ -3054,6 +3150,7 @@ interface AdoptedFromData {
   herdrTarget?: string;
   herdrPaneId?: string;
   originalCliPid?: number;
+  sessionId?: string;
   cwd?: string;
   cliId?: string;
 }
@@ -3108,6 +3205,12 @@ interface SessionData {
   // here, so they're typed loosely. Used by cmdList to avoid reporting an
   // unconfirmed /adopt scratch as a crashed CLI session.
   cliId?: string;
+  /** CLI-native resume id when it differs from botmux's Session id. */
+  cliSessionId?: string;
+  backendType?: BackendType;
+  /** Exact persistent host/agent selected by the worker. In particular, Herdr
+   * may own one agent inside a shared host session rather than the host itself. */
+  persistentBackendTarget?: PersistentBackendTarget;
   lastCliInput?: string;
   adoptedFrom?: AdoptedFromData;
   /** Deliberately suspended by the resident-session cap. No process/backing
@@ -3343,6 +3446,7 @@ function formatSessionRow(
   multiBot: boolean,
   botLabels: Map<string, string>,
   cols: { id: number; bot?: number; title: number; dir: number; pid: number; uptime: number; status: number; target: number },
+  probeSnapshot: BackingProbeSnapshot,
 ): { text: string; alive: boolean } {
   const id = padEndDisplay(s.sessionId.substring(0, 8), cols.id);
   const parts = [id];
@@ -3357,13 +3461,13 @@ function formatSessionRow(
   const uptime = formatDuration(Date.now() - new Date(s.createdAt).getTime()).padEnd(cols.uptime);
   const alive = isSessionAliveForList(s);
   const status = padEndDisplay(sessionStatusLabel(s), cols.status);
-  const target = padEndDisplay(truncate(sessionTargetLabel(s), cols.target), cols.target);
+  const target = padEndDisplay(truncate(sessionTargetLabel(s, probeSnapshot), cols.target), cols.target);
   parts.push(title, dir, pid, uptime, status, target);
   return { text: parts.join(' │ '), alive };
 }
 
 /** Print plain session table (non-interactive). */
-function printSessionTable(active: SessionData[]): void {
+function printSessionTable(active: SessionData[], probeSnapshot: BackingProbeSnapshot): void {
   const botConfigs = loadBotConfigsForDisplay();
   const multiBot = botConfigs.length > 1 || new Set(active.map(s => s.larkAppId).filter(Boolean)).size > 1;
   const botLabels = new Map<string, string>();
@@ -3392,22 +3496,12 @@ function printSessionTable(active: SessionData[]): void {
   console.log(separator);
 
   for (const s of active) {
-    const { text } = formatSessionRow(s, multiBot, botLabels, cols);
+    const { text } = formatSessionRow(s, multiBot, botLabels, cols, probeSnapshot);
     console.log(text);
   }
 
   console.log(separator);
   console.log(`共 ${active.length} 个活跃会话`);
-}
-
-/** Check if a tmux session exists. */
-function tmuxSessionExists(name: string): boolean {
-  try {
-    execSync(`tmux has-session -t ${name} 2>/dev/null`, { stdio: 'ignore', env: tmuxEnv() });
-    return true;
-  } catch {
-    return false;
-  }
 }
 
 function applyTmuxWindowSizeLargest(sessionName: string): void {
@@ -3438,7 +3532,7 @@ type SessionDeleteCloseResult =
  *  persistent row, lifecycle hooks, subscriptions, and backend teardown stay
  *  coherent. This legacy local path is safe only when there is no daemon
  *  process whose in-memory state could be stranded. */
-function closeSessionOffline(s: SessionData): void {
+function closeSessionOffline(s: SessionData): SessionDeleteCloseResult {
   const originalPid = adoptedCliPid(s);
   // Adopted sessions own only the botmux worker/viewer, never the user's CLI.
   if (s.pid && s.pid !== originalPid && isProcessAlive(s.pid)) {
@@ -3448,18 +3542,43 @@ function closeSessionOffline(s: SessionData): void {
   // Adopted panes belong to the user. Ordinary bmx-* sessions are botmux-owned
   // and still need direct cleanup when no daemon exists to run killWorker().
   if (!isAdoptedSession(s)) {
-    const tmuxName = `bmx-${s.sessionId.substring(0, 8)}`;
-    try {
-      execSync(`tmux kill-session -t '${tmuxName}' 2>/dev/null`, {
-        stdio: 'ignore',
-        env: tmuxEnv(),
-      });
-    } catch { /* no tmux session */ }
+    if (isSuspendableBackendType(s.backendType)) {
+      const target = resolvePersistentBackendTarget(
+        s.backendType,
+        s.sessionId,
+        s.persistentBackendTarget,
+      );
+      try {
+        killPersistentBackendTarget(target, s.sessionId);
+      } catch (err) {
+        // ZMX destruction is identity-verified against the complete botmux
+        // session UUID and waits for confirmed disappearance. Swallowing an
+        // inconclusive/mismatched kill would hide the sole control row while
+        // its CLI remains alive. Older mux backends retain their historical
+        // best-effort offline-close compatibility.
+        if (target.backendType === 'zmx') {
+          return {
+            ok: false,
+            error: `ZMX 离线删除未完成：${err instanceof Error ? err.message : String(err)}`,
+          };
+        }
+      }
+    } else {
+      // Legacy rows without backendType were historically tmux-backed.
+      const tmuxName = `bmx-${s.sessionId.substring(0, 8)}`;
+      try {
+        execSync(`tmux kill-session -t '${tmuxName}' 2>/dev/null`, {
+          stdio: 'ignore',
+          env: tmuxEnv(),
+        });
+      } catch { /* no tmux session */ }
+    }
   }
 
   s.status = 'closed';
   s.closedAt = new Date().toISOString();
   saveSession(s);
+  return { ok: true, via: 'offline' };
 }
 
 /** Close through the owning daemon whenever it is online. The IPC request is
@@ -3485,8 +3604,7 @@ async function closeSessionForDelete(
   // port); it only keeps larkAppId-less legacy records on the offline fallback,
   // whose saveSession() persists to the legacy file correctly.
   if (!s.larkAppId) {
-    closeSessionOffline(s);
-    return { ok: true, via: 'offline' };
+    return closeSessionOffline(s);
   }
 
   const daemon = online.find(d => d.larkAppId === s.larkAppId);
@@ -3509,8 +3627,7 @@ async function closeSessionForDelete(
     }
   }
 
-  closeSessionOffline(s);
-  return { ok: true, via: 'offline' };
+  return closeSessionOffline(s);
 }
 
 function adoptTargetLabel(s: SessionData): string {
@@ -3549,14 +3666,137 @@ function sessionStatusLabel(s: SessionData): string {
   return s.pid && isProcessAlive(s.pid) ? 'online' : s.pid ? 'stopped' : 'idle';
 }
 
-function sessionTargetLabel(s: SessionData, tmuxName?: string, hasTmux?: boolean): string {
-  if (isAdoptedSession(s)) return adoptTargetLabel(s);
-  if (hasTmux === undefined) {
-    const name = tmuxName ?? `bmx-${s.sessionId.substring(0, 8)}`;
-    hasTmux = tmuxSessionExists(name);
-    tmuxName = name;
+type BackingProbeSnapshot = ReadonlyMap<string, SessionProbe>;
+
+function backingProbeKey(target: PersistentBackendTarget): string {
+  const agentName = target.backendType === 'herdr' ? target.agentName ?? '' : '';
+  return `${target.backendType}\0${target.sessionName}\0${agentName}`;
+}
+
+function sessionPersistentTarget(s: SessionData): PersistentBackendTarget | undefined {
+  if (isSuspendableBackendType(s.backendType)) {
+    return resolvePersistentBackendTarget(
+      s.backendType,
+      s.sessionId,
+      s.persistentBackendTarget,
+    );
   }
-  return hasTmux ? `tmux: ${tmuxName}` : '-';
+  if (s.backendType === undefined) {
+    // Legacy rows predate backend stamping. Only tmux was externally
+    // attachable, and its deterministic target remains the compatibility path.
+    return {
+      backendType: 'tmux',
+      sessionName: `bmx-${s.sessionId.substring(0, 8)}`,
+    };
+  }
+  return undefined;
+}
+
+function persistentTargetDisplay(target: PersistentBackendTarget): string {
+  return target.backendType === 'herdr' && target.agentName
+    ? `${target.sessionName}/${target.agentName}`
+    : target.sessionName;
+}
+
+function buildBackingProbeSnapshot(sessions: readonly SessionData[]): BackingProbeSnapshot {
+  const namesByBackend = new Map<PersistentBackendType, Set<string>>();
+  const directTargets = new Map<string, PersistentBackendTarget>();
+  const add = (target: PersistentBackendTarget) => {
+    if (target.backendType === 'herdr' && target.agentName) {
+      directTargets.set(backingProbeKey(target), target);
+      return;
+    }
+    const backendType = target.backendType;
+    const name = target.sessionName;
+    const names = namesByBackend.get(backendType) ?? new Set<string>();
+    names.add(name);
+    namesByBackend.set(backendType, names);
+  };
+
+  for (const session of sessions) {
+    if (isAdoptedSession(session) || session.backendType === 'pty') continue;
+    const target = sessionPersistentTarget(session);
+    if (target) add(target);
+  }
+
+  const snapshot = new Map<string, SessionProbe>();
+  // Agent-scoped Herdr targets cannot be collapsed into a host-session probe:
+  // the shared host may be healthy after this exact Botmux agent exited.
+  for (const [key, target] of directTargets) {
+    snapshot.set(key, probePersistentBackendTarget(target));
+  }
+  for (const [backendType, names] of namesByBackend) {
+    for (const [name, probe] of probePersistentSessions(backendType, names)) {
+      snapshot.set(backingProbeKey({ backendType, sessionName: name } as PersistentBackendTarget), probe);
+    }
+  }
+  return snapshot;
+}
+
+function backingProbe(
+  snapshot: BackingProbeSnapshot | undefined,
+  target: PersistentBackendTarget,
+): SessionProbe {
+  return snapshot?.get(backingProbeKey(target))
+    ?? probePersistentBackendTarget(target);
+}
+
+function sessionBackingInfo(s: SessionData, snapshot?: BackingProbeSnapshot): {
+  backendType?: BackendType;
+  target?: PersistentBackendTarget;
+  probe: 'exists' | 'missing' | 'unknown';
+  label: string;
+  attachBackend?: 'tmux' | 'zmx';
+} {
+  if (isSuspendableBackendType(s.backendType)) {
+    const target = sessionPersistentTarget(s)!;
+    const probe = backingProbe(snapshot, target);
+    const suffix = probe === 'exists' ? '' : ` (${probe})`;
+    return {
+      backendType: s.backendType,
+      target,
+      probe,
+      label: `${s.backendType}: ${persistentTargetDisplay(target)}${suffix}`,
+      attachBackend: s.backendType === 'tmux' || s.backendType === 'zmx'
+        ? s.backendType
+        : undefined,
+    };
+  }
+  if (s.backendType === 'pty') {
+    return { backendType: 'pty', probe: 'missing', label: 'pty' };
+  }
+  // Legacy rows predate backend stamping. Only tmux was externally attachable.
+  const target = sessionPersistentTarget(s)!;
+  const probe = backingProbe(snapshot, target);
+  return {
+    backendType: 'tmux',
+    target,
+    probe,
+    label: probe === 'exists' ? `tmux: ${target.sessionName}` : '-',
+    attachBackend: 'tmux',
+  };
+}
+
+function sessionTargetLabel(s: SessionData, snapshot?: BackingProbeSnapshot): string {
+  if (isAdoptedSession(s)) return adoptTargetLabel(s);
+  return sessionBackingInfo(s, snapshot).label;
+}
+
+function hasRecoverableBackingSession(s: SessionData, snapshot?: BackingProbeSnapshot): boolean {
+  if (isSuspendableBackendType(s.backendType)) {
+    // Unknown means the backend probe itself was inconclusive; keep the session
+    // rather than closing a potentially recoverable conversation from `list`.
+    // ZMX has one daemon per session. A clean "missing" result cannot
+    // distinguish a host reboot from an individual CLI exit, so keep the
+    // transcript-backed row for lazy resume instead of auto-pruning it.
+    if (s.backendType === 'zmx') return true;
+    const target = sessionPersistentTarget(s)!;
+    const probe = backingProbe(snapshot, target);
+    return probe === 'exists' || probe === 'unknown';
+  }
+  // Legacy sessions created before backendType stamping only had tmux recovery.
+  const target = sessionPersistentTarget(s);
+  return !!target && backingProbe(snapshot, target) === 'exists';
 }
 
 /** Shorten path for display: replace $HOME with ~. */
@@ -3566,7 +3806,7 @@ function shortenPath(p: string): string {
 }
 
 /** Interactive TUI session picker — returns a promise that resolves when done. */
-function interactiveSessionPicker(active: SessionData[]): Promise<void> {
+function interactiveSessionPicker(active: SessionData[], probeSnapshot: BackingProbeSnapshot): Promise<void> {
   const botConfigs = loadBotConfigsForDisplay();
   const multiBot = botConfigs.length > 1 || new Set(active.map(s => s.larkAppId).filter(Boolean)).size > 1;
   const botLabels = new Map<string, string>();
@@ -3603,17 +3843,19 @@ function interactiveSessionPicker(active: SessionData[]): Promise<void> {
     session: SessionData;
     text: string;
     alive: boolean;
-    tmuxName: string;
-    hasTmux: boolean;
+    backendTarget?: PersistentBackendTarget;
+    backingProbe: 'exists' | 'missing' | 'unknown';
+    attachBackend?: 'tmux' | 'zmx';
     isAdopt: boolean;
     targetLabel: string;
     canAttach: boolean;
   }> {
     return active.map(s => {
-      const tmuxName = `bmx-${s.sessionId.substring(0, 8)}`;
       const isAdopt = isAdoptedSession(s);
-      const hasTmux = !isAdopt && tmuxSessionExists(tmuxName);
-      const targetLabel = sessionTargetLabel(s, tmuxName, hasTmux);
+      const backing = isAdopt
+        ? { probe: 'missing' as const, label: adoptTargetLabel(s) }
+        : sessionBackingInfo(s, probeSnapshot);
+      const targetLabel = backing.label;
       // Build row text with shortened dir
       const id = padEndDisplay(s.sessionId.substring(0, 8), cols.id);
       const parts = [id];
@@ -3631,7 +3873,20 @@ function interactiveSessionPicker(active: SessionData[]): Promise<void> {
       const target = padEndDisplay(truncate(targetLabel, cols.target), cols.target);
       parts.push(title, dir, pid, uptime, status, target);
 
-      return { session: s, text: parts.join(' │ '), alive, tmuxName, hasTmux, isAdopt, targetLabel, canAttach: hasTmux && !isAdopt };
+      return {
+        session: s,
+        text: parts.join(' │ '),
+        alive,
+        backendTarget: 'target' in backing ? backing.target : undefined,
+        backingProbe: backing.probe,
+        attachBackend: 'attachBackend' in backing ? backing.attachBackend : undefined,
+        isAdopt,
+        targetLabel,
+        canAttach: !isAdopt
+          && backing.probe === 'exists'
+          && !!('attachBackend' in backing && backing.attachBackend)
+          && !!('target' in backing && backing.target),
+      };
     });
   }
 
@@ -3692,9 +3947,9 @@ function interactiveSessionPicker(active: SessionData[]): Promise<void> {
     const selected = rows[cursor];
     const targetHint = selected.isAdopt
       ? `\x1b[33m${selected.targetLabel}\x1b[0m  \x1b[2mEnter 已禁用；请直接使用原 tmux/zellij/herdr 客户端。\x1b[0m`
-      : selected.hasTmux
-        ? `\x1b[32mtmux: ${selected.tmuxName}\x1b[0m`
-        : `\x1b[2mtmux: 无会话\x1b[0m`;
+      : selected.canAttach
+        ? `\x1b[32m${selected.attachBackend}: ${selected.backendTarget?.sessionName}\x1b[0m`
+        : `\x1b[2m${selected.targetLabel}（不可连接）\x1b[0m`;
     process.stdout.write(`\n  ${targetHint}\n`);
 
     // Flash message or confirmation prompt
@@ -3802,7 +4057,7 @@ function interactiveSessionPicker(active: SessionData[]): Promise<void> {
         return;
       }
 
-      // Enter — attach to tmux
+      // Enter — attach to a managed persistent backend.
       if (key === '\r' || key === '\n') {
         const selected = rows[cursor];
         if (selected.isAdopt) {
@@ -3811,16 +4066,50 @@ function interactiveSessionPicker(active: SessionData[]): Promise<void> {
           return;
         }
         if (!selected.canAttach) {
-          flashMsg = '\x1b[33m该会话没有 tmux，无法连接\x1b[0m';
+          flashMsg = '\x1b[33m该会话没有可连接的持久后端\x1b[0m';
           render();
           return;
         }
-        applyTmuxWindowSizeLargest(selected.tmuxName);
-        cleanup();
-        spawnSync('tmux', ['attach-session', '-t', selected.tmuxName], {
-          stdio: 'inherit',
-          env: tmuxEnv(),
-        });
+        if (selected.attachBackend === 'zmx') {
+          const target = selected.backendTarget;
+          if (!target || target.backendType !== 'zmx') {
+            flashMsg = '\x1b[31mZMX attach target is missing or inconsistent\x1b[0m';
+            render();
+            return;
+          }
+          // First prove both complete Botmux labels while the picker is still
+          // active, then freeze the PTY root generation across terminal
+          // cleanup and re-prove it immediately before attach.
+          const frozen = freezeManagedZmxAttachTarget(
+            target.sessionName,
+            selected.session.sessionId,
+          );
+          if (!frozen.ok) {
+            flashMsg = `\x1b[31m${frozen.message}\x1b[0m`;
+            render();
+            return;
+          }
+          cleanup();
+          const attached = attachFrozenManagedZmxSession(
+            target.sessionName,
+            selected.session.sessionId,
+            frozen.pid,
+          );
+          if (!attached.ok) console.error(attached.message);
+        } else {
+          const target = selected.backendTarget;
+          if (!target || target.backendType !== 'tmux') {
+            flashMsg = '\x1b[31mtmux attach target is missing or inconsistent\x1b[0m';
+            render();
+            return;
+          }
+          cleanup();
+          applyTmuxWindowSizeLargest(target.sessionName);
+          spawnSync('tmux', ['attach-session', '-t', `=${target.sessionName}`], {
+            stdio: 'inherit',
+            env: tmuxEnv(),
+          });
+        }
         resolve();
         return;
       }
@@ -3828,11 +4117,42 @@ function interactiveSessionPicker(active: SessionData[]): Promise<void> {
   });
 }
 
+/**
+ * Internal host-only bridge used by Dashboard "Open CLI" commands. The
+ * generated terminal shell executes this exact checkout's cli.js, keeping all
+ * ZMX ownership checks in TypeScript instead of approximating them with
+ * name-only shell pipelines.
+ */
+function cmdManagedZmxAttach(args: string[]): void {
+  const [name, sessionId, ...extra] = args;
+  if (!name?.trim() || !sessionId?.trim() || extra.length > 0) {
+    console.error('internal usage: __zmx-attach-managed <session-name> <complete-session-id>');
+    process.exitCode = 2;
+    return;
+  }
+  const frozen = freezeManagedZmxAttachTarget(name, sessionId);
+  if (!frozen.ok) {
+    console.error(frozen.message);
+    process.exitCode = 1;
+    return;
+  }
+  const attached = attachFrozenManagedZmxSession(name, sessionId, frozen.pid);
+  if (!attached.ok) {
+    console.error(attached.message);
+    process.exitCode = 1;
+  }
+}
+
 async function cmdList(): Promise<void> {
   const sessions = loadSessions();
   const active = [...sessions.values()].filter(s => s.status === 'active');
+  // One immutable control-plane snapshot per invocation. In particular, ZMX's
+  // full-list probe walks every per-session daemon, so running it once per row
+  // would make a large session list quadratic and amplify socket timeouts.
+  const probeSnapshot = buildBackingProbeSnapshot(active);
 
-  // Auto-prune unrecoverable sessions: process dead and no tmux session.
+  // Auto-prune unrecoverable sessions: process dead and no recoverable backing
+  // session (tmux/herdr/zellij/zmx).
   // Split into two buckets so a never-activated daemon-command scratch (e.g. an
   // unconfirmed /adopt that only posted a picker card, /help, an abandoned
   // /relay picker) isn't reported as a crashed CLI. Such a scratch never forked
@@ -3858,24 +4178,40 @@ async function cmdList(): Promise<void> {
     }
 
     const hasPid = !!(s.pid && isProcessAlive(s.pid));
-    const hasTmux = tmuxSessionExists(`bmx-${s.sessionId.substring(0, 8)}`);
-    const disposition = sessionListDisposition(s, { hasPid, hasBackingSession: hasTmux });
-    if (disposition === 'prune_real') pruned.push(s);
-    else if (disposition === 'prune_scratch') prunedScratch.push(s);
+    const hasBackingSession = hasRecoverableBackingSession(s, probeSnapshot);
+    const disposition = sessionListDisposition(s, { hasPid, hasBackingSession });
+    // Non-adopt sessions are only ever kept or pruned-as-scratch now: a real
+    // managed session with a missing backing is dormant-recoverable, never
+    // auto-closed by this read command (see sessionListDisposition). Adopt
+    // zombies still reach the `pruned` bucket via the branch above.
+    if (disposition === 'prune_scratch') prunedScratch.push(s);
     else live.push(s);
   }
-  const closeNow = (arr: SessionData[]) => {
+  const closeNow = async (arr: SessionData[], kind: 'scratch' | 'real'): Promise<number> => {
+    let closed = 0;
     for (const s of arr) {
-      s.status = 'closed';
-      s.closedAt = new Date().toISOString();
-      saveSession(s);
+      const result = await closeSessionForDelete(s);
+      if (result.ok) {
+        closed++;
+      } else {
+        // Keep it visible: mutating only the store while a possible owner
+        // daemon still has the row in memory lets the next message resurrect
+        // exactly the session auto-prune claimed to close.
+        live.push(s);
+        console.warn(
+          `⚠️ 未自动清理 ${kind === 'scratch' ? '占位' : '会话'} ${s.sessionId.substring(0, 8)}：${result.error}`,
+        );
+      }
     }
+    return closed;
   };
   // Scratches: close silently — they were placeholders, not dead sessions.
-  closeNow(prunedScratch);
+  await closeNow(prunedScratch, 'scratch');
   if (pruned.length > 0) {
-    closeNow(pruned);
-    console.log(`已自动清理 ${pruned.length} 个不可恢复的会话（进程已退出或无可恢复后端）`);
+    const closed = await closeNow(pruned, 'real');
+    if (closed > 0) {
+      console.log(`已自动清理 ${closed} 个不可恢复的会话（进程已退出或无可恢复后端）`);
+    }
   }
 
   // Sort by creation time, newest first
@@ -3888,12 +4224,12 @@ async function cmdList(): Promise<void> {
 
   // Non-TTY (piped output) or explicit --plain flag: plain table
   if (!process.stdout.isTTY || process.argv.includes('--plain')) {
-    printSessionTable(live);
+    printSessionTable(live, probeSnapshot);
     return;
   }
 
   // Interactive TUI
-  await interactiveSessionPicker(live);
+  await interactiveSessionPicker(live, probeSnapshot);
 }
 
 async function cmdDelete(): Promise<void> {
@@ -3917,19 +4253,22 @@ async function cmdDelete(): Promise<void> {
     toDelete = active;
   } else if (target === 'stopped') {
     toDelete = active.filter(s => {
-      // A deliberately cap-suspended session has neither pid nor backing pane
-      // (that's how its memory is reclaimed) but must cold-resume on the next
-      // message — never a zombie. Mirrors the server-side isSessionStopped guard
-      // and the `list` prune disposition; without it `delete stopped` (which the
-      // overload alert text recommends) would drop a live-but-parked session.
+      // "stopped" = a true zombie the sweep may auto-close. A real managed
+      // session with no live pid is dormant-recoverable, NOT stopped: whether
+      // the CLI merely exited, botmux cap-suspended it, or a host reboot wiped
+      // its backing pane, the on-disk transcript still cold-resumes on the next
+      // message. So a missing backing is NOT a close trigger here — only an
+      // adopted session with a dead external pid, or a disposable scratch that
+      // never became a real CLI session, counts as stopped. Reuses the exact
+      // real-vs-scratch discriminator the server-side isSessionStopped and
+      // `botmux list` prune both use, so the three entry points can't drift.
       if (isColdResumeDormant(s)) return false;
       if (isAdoptedSession(s)) {
         const pid = adoptedCliPid(s);
         return pid ? !isProcessAlive(pid) : !(s.pid && isProcessAlive(s.pid));
       }
       const hasPid = !!(s.pid && isProcessAlive(s.pid));
-      const hasTmux = tmuxSessionExists(`bmx-${s.sessionId.substring(0, 8)}`);
-      return !hasPid && !hasTmux;
+      return !hasPid && !isRealManagedSession(s);
     });
     if (toDelete.length === 0) {
       console.log('没有 stopped 状态的会话。');
@@ -4237,24 +4576,19 @@ async function cmdRoleSwitch(argv: string[]): Promise<void> {
  * so SESSION_DATA_DIR / breadcrumb-overridden deployments find the right
  * descriptor directory.
  */
-function listOnlineDaemons(): Array<{
+interface DaemonDescriptorLite {
   ipcPort: number;
   larkAppId: string;
+  pid?: number;
   bootInstanceId?: string;
   workflowIpcProtocol?: string;
   lastHeartbeat?: number;
-}> {
+}
+
+function listDaemonDescriptors(): DaemonDescriptorLite[] {
   const regDir = join(resolveDataDir(), 'dashboard-daemons');
   if (!existsSync(regDir)) return [];
-  const STALE_MS = 90_000;
-  const now = Date.now();
-  const all: Array<{
-    ipcPort: number;
-    larkAppId: string;
-    bootInstanceId?: string;
-    workflowIpcProtocol?: string;
-    lastHeartbeat?: number;
-  }> = [];
+  const all: DaemonDescriptorLite[] = [];
   let names: string[] = [];
   try { names = readdirSync(regDir); } catch { return []; }
   for (const f of names) {
@@ -4262,32 +4596,135 @@ function listOnlineDaemons(): Array<{
     try {
       const d = JSON.parse(readFileSync(join(regDir, f), 'utf-8'));
       if (typeof d?.ipcPort !== 'number' || typeof d?.larkAppId !== 'string') continue;
-      if (now - (d.lastHeartbeat ?? 0) > STALE_MS) continue;
       all.push({
         ipcPort: d.ipcPort,
         larkAppId: d.larkAppId,
+        ...(typeof d.pid === 'number' ? { pid: d.pid } : {}),
         ...(typeof d.bootInstanceId === 'string' && d.bootInstanceId
           ? { bootInstanceId: d.bootInstanceId }
           : {}),
         ...(typeof d.workflowIpcProtocol === 'string' && d.workflowIpcProtocol
           ? { workflowIpcProtocol: d.workflowIpcProtocol }
           : {}),
-        lastHeartbeat: d.lastHeartbeat,
+        ...(typeof d.lastHeartbeat === 'number' ? { lastHeartbeat: d.lastHeartbeat } : {}),
       });
     } catch { /* skip malformed */ }
   }
   return all;
 }
 
-function findDaemon(larkAppId?: string): {
-  ipcPort: number;
-  larkAppId: string;
-  bootInstanceId?: string;
-  workflowIpcProtocol?: string;
-} | null {
+function listOnlineDaemons(): DaemonDescriptorLite[] {
+  const STALE_MS = 90_000;
+  const now = Date.now();
+  return listDaemonDescriptors().filter(d => now - (d.lastHeartbeat ?? 0) <= STALE_MS);
+}
+
+function findDaemon(larkAppId?: string): DaemonDescriptorLite | null {
   const all = listOnlineDaemons();
   if (larkAppId) return all.find(d => d.larkAppId === larkAppId) ?? null;
   return all[0] ?? null;
+}
+
+function normalizeCardUsageSnapshot(value: unknown): CardUsageSnapshot | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const raw = value as Record<string, unknown>;
+  const rawContext = raw.context;
+  const rawTokens = raw.tokens;
+
+  let context: CardUsageSnapshot['context'] = null;
+  if (rawContext && typeof rawContext === 'object' && !Array.isArray(rawContext)) {
+    const c = rawContext as Record<string, unknown>;
+    if (typeof c.usedTokens === 'number'
+      && Number.isFinite(c.usedTokens)
+      && c.usedTokens >= 0) {
+      context = {
+        usedTokens: c.usedTokens,
+        ...(typeof c.windowTokens === 'number'
+          && Number.isFinite(c.windowTokens)
+          && c.windowTokens > 0
+          ? { windowTokens: c.windowTokens }
+          : {}),
+        ...(typeof c.percentUsed === 'number'
+          && Number.isFinite(c.percentUsed)
+          && c.percentUsed >= 0
+          ? { percentUsed: c.percentUsed }
+          : {}),
+      };
+    }
+  }
+
+  let tokens: CardUsageSnapshot['tokens'] = null;
+  if (rawTokens && typeof rawTokens === 'object' && !Array.isArray(rawTokens)) {
+    const u = rawTokens as Record<string, unknown>;
+    if (typeof u.in === 'number'
+      && Number.isFinite(u.in)
+      && u.in >= 0
+      && typeof u.out === 'number'
+      && Number.isFinite(u.out)
+      && u.out >= 0) {
+      tokens = { in: u.in, out: u.out };
+    }
+  }
+
+  return { context, tokens };
+}
+
+/** Prefer the resident daemon's incremental transcript cache. Older/offline
+ * daemons and isolated environments fall back to the local reader; either path
+ * degrades to explicit unavailable facts without blocking the reply. */
+async function readCardUsageSnapshotForSend(
+  session: SessionData,
+  larkAppId: string,
+): Promise<CardUsageSnapshot> {
+  let daemonPort: number | undefined;
+  try {
+    daemonPort =
+      findDaemon(larkAppId)?.ipcPort
+      ?? resolveDaemonIpcPort(undefined, process.env.BOTMUX_DAEMON_IPC_PORT);
+  } catch {
+    // A stale/unreadable daemon registry must not prevent the reply.
+  }
+  if (daemonPort) {
+    try {
+      const path = `/api/sessions/${encodeURIComponent(session.sessionId)}/usage`;
+      const response = await fetchDaemonIpc(daemonPort, path, {
+        method: 'GET',
+        signal: AbortSignal.timeout(1_500),
+      });
+      if (response.ok) {
+        const body = await response.json() as { usage?: unknown };
+        const normalized = normalizeCardUsageSnapshot(body.usage);
+        if (normalized) return normalized;
+      }
+    } catch {
+      // No host secret, old daemon, timeout, or transient IPC failure: use the
+      // same bounded local parser below.
+    }
+  }
+
+  // Old/offline daemon fallback. Sandboxed panes receive this per-bot value
+  // explicitly from the worker because bots.json is intentionally unreadable.
+  // This send path renders into the reply-card FOOTER, so only the 'footer'
+  // display mode surfaces usage here; 'streaming' shows it on the daemon's live
+  // card (absent on this offline fallback) and 'off' shows nothing.
+  if (resolveUsageDisplay(larkAppId) !== 'footer') {
+    return { context: null, tokens: null };
+  }
+
+  try {
+    return getSessionUsageSnapshot({
+      cliId: (session.cliId ?? session.adoptedFrom?.cliId ?? 'unknown') as CliId | 'unknown',
+      sessionId: session.sessionId,
+      cliSessionId: session.cliSessionId ?? session.adoptedFrom?.sessionId,
+      cwd: session.workingDir ?? session.adoptedFrom?.cwd,
+      // BOT_HOME transcript fallback for CLI-data-redirected / sandboxed bots
+      // (parity with the daemon reader and the ledger/dashboard consumers).
+      larkAppId: larkAppId ?? session.larkAppId,
+      fresh: true,
+    });
+  } catch {
+    return { context: null, tokens: null };
+  }
 }
 
 /**
@@ -4719,6 +5156,8 @@ async function cmdResume(): Promise<void> {
     console.error('❌ adopt 接管会话不支持 resume。');
   } else if (errCode === 'deferred_unmaterialized') {
     console.error('❌ 该静默定时轮次未创建话题，隐藏会话只保留审计记录，不能 resume。');
+  } else if (errCode === 'resume_cancelled') {
+    console.error('❌ 恢复过程中会话被关闭，本次 resume 已取消。');
   } else {
     console.error(`❌ 恢复失败: ${errCode}`);
   }
@@ -4819,6 +5258,8 @@ async function cmdTermLink(rest: string[]): Promise<void> {
     console.error('❌ daemon 中该会话非活跃，无法获取可操作终端。');
   } else if (errCode === 'terminal_unavailable') {
     console.error('❌ 该会话终端尚未就绪（worker 未起或缺 token）。等会话起来再试。');
+  } else if (errCode === 'terminal_unsupported') {
+    console.error('❌ 该会话后端不提供 Web 终端；ZMX 会话请在本机运行 botmux list 或 zmx attach。');
   } else if (errCode === 'no_owner') {
     console.error('❌ 该 bot 未配置 owner（allowedUsers 为空 / 全开放模式），没有可私密投递的对象。');
   } else if (errCode === 'delivery_failed') {
@@ -5628,6 +6069,8 @@ async function resolveSessionAppId(sessionIdArg: string | undefined): Promise<{ 
 }
 
 async function cmdHistory(rest: string[]): Promise<void> {
+  // No-transport turn has no Feishu chat history to read — central hard gate.
+  assertTurnTransportOrExit('history');
   // Read isolation: register this bot from its cred file so the Lark client is
   // available without reading the denied bots.json (same as cmdSend).
   await registerSelfFromCredFile();
@@ -5640,6 +6083,9 @@ async function cmdHistory(rest: string[]): Promise<void> {
   const scopeArg = argValue(rest, '--scope') ?? 'session';
   const sessionIdArg = argValue(rest, '--session-id');
   const { sid, larkAppId: appId, session: s } = await resolveSessionAppId(sessionIdArg);
+  // Target-aware gate: a --session-id pointing at a virtual/apiOnly session must
+  // be refused even from a normal turn (env gate above can't see the argument).
+  assertSessionTransportOrExit({ chatId: s.chatId, larkAppId: appId }, 'history');
 
   const validScopes = new Set(['session', 'thread', 'chat', 'ambient']);
   if (!validScopes.has(scopeArg)) {
@@ -5768,6 +6214,8 @@ async function cmdHistory(rest: string[]): Promise<void> {
 
 
 async function cmdQuoted(rest: string[]): Promise<void> {
+  // No-transport turn cannot fetch a quoted Feishu message — central hard gate.
+  assertTurnTransportOrExit('quoted');
   const sessionIdArg = argValue(rest, '--session-id');
   // Positional message_id is required. The id comes verbatim from the
   // `[用户引用了消息 用 botmux quoted om_xxx 查看]` prompt prefix the daemon
@@ -5786,7 +6234,9 @@ async function cmdQuoted(rest: string[]): Promise<void> {
   // bots.json — same as cmdHistory / cmdSend. Missing this was why a sandboxed
   // isolated bot's `botmux quoted` failed "Bot not registered".
   await registerSelfFromCredFile();
-  const { larkAppId: appId } = await resolveSessionAppId(sessionIdArg);
+  const { larkAppId: appId, session: quotedSession } = await resolveSessionAppId(sessionIdArg);
+  // Target-aware gate (see cmdHistory).
+  assertSessionTransportOrExit({ chatId: quotedSession.chatId, larkAppId: appId }, 'quoted');
 
   const { getMessageDetail } = await import('./im/lark/client.js');
   const { expandMergeForward } = await import('./im/lark/merge-forward.js');
@@ -5888,40 +6338,44 @@ function argValues(args: string[], ...flags: string[]): string[] {
 function withCustomCardMentionFooter(
   card: Record<string, unknown>,
   mentionOpenIds: readonly string[],
-  sentToLabel: string,
+  locale?: Locale,
 ): { ok: true; card: Record<string, unknown> } | { ok: false; error: string } {
   if (mentionOpenIds.length === 0) return { ok: true, card };
-  const cloned = JSON.parse(JSON.stringify(card)) as Record<string, unknown>;
-  const body = cloned.body as { elements?: unknown } | undefined;
-  if (!body || !Array.isArray(body.elements)) {
+  const deduped = [...new Set(mentionOpenIds.filter(Boolean))];
+  const cloned = appendReplyCardFooterToV2Card(card, {
+    brand: '',
+    recipientOpenIds: deduped,
+    locale,
+  });
+  if (!cloned) {
     return {
       ok: false,
-      error: '自定义卡片带 --mention/--mention-back 时必须是 schema 2.0 且包含 body.elements；或改用 --no-mention 并在卡片 JSON 内自行处理展示',
+      error: '自定义卡片带 --mention/--mention-back 时必须是 schema 2.0、包含 body.elements，且未占用 botmux_reply_footer 元素 ID；或改用 --no-mention 并在卡片 JSON 内自行处理展示',
     };
   }
-  const deduped = [...new Set(mentionOpenIds.filter(Boolean))];
-  body.elements.push(
-    { tag: 'hr' },
-    {
-      tag: 'markdown',
-      text_size: 'notation_small_v2',
-      content: `<font color='grey'>${sentToLabel}${deduped.map(id => `<at id=${id}></at>`).join(' ')}</font>`,
-    },
-  );
   return { ok: true, card: cloned };
 }
 
 // Card v2 body builder helpers — extracted to im/lark/md-card.ts so the
 // daemon's bridge fallback path can produce identical cards. cmdSend
 // keeps using `buildImageCardElements` from there.
-import { buildImageCardElements, brandFooterSegment, prepareCardMarkdown, type LocalHomeLinkMode } from './im/lark/md-card.js';
+import {
+  appendReplyCardFooterToV2Card,
+  buildImageCardElements,
+  buildReplyCardFooter,
+  prepareCardMarkdown,
+  type CardUsageSnapshot,
+  type LocalHomeLinkMode,
+} from './im/lark/md-card.js';
 import { applyInlineMentions } from './im/lark/inline-mentions.js';
 import { renderBrandTemplate } from './im/lark/brand-template.js';
-import { resolveBrandLabel } from './bot-registry.js';
+import { resolveBrandLabel, resolveUsageDisplay } from './bot-registry.js';
 import { config } from './config.js';
+import { getSessionUsageSnapshot } from './core/cost-calculator.js';
 import {
   resolveQuoteTarget,
   validateMentionDecision,
+  shouldBlockMentionBackByParticipants,
   parseAttentionFlag,
   attentionUsageError,
   managedVcQuoteError,
@@ -6072,6 +6526,137 @@ async function relaySend(
   process.exit(1);
 }
 
+/** True if the running bot (by daemon-injected larkAppId) is core-only
+ *  (apiOnly). Read-only + never throws: used by `botmux send` to refuse early
+ *  with a clear message. Reads bots.json best-effort; an apiOnly bot runs
+ *  non-isolated (no Feishu secret to protect), so bots.json is readable here. */
+function currentBotIsApiOnly(larkAppId: string): boolean {
+  // Under read isolation bots.json is denied ON PURPOSE, so loadBotsJson() below
+  // can only ever answer "no bots at all". Letting that stand would silently turn
+  // this check into a no-op for EVERY sandboxed bot — including the apiOnly ones
+  // it exists to catch — and managedOriginHasNoTransport() (which advertises
+  // itself as tamper-resistant) delegates its verdict here.
+  //
+  // The worker already hands this bot its OWN config through the designed private
+  // channel: <BOT_HOME>/send-cred.json, written host-side, carrying apiOnly. Take
+  // the verdict from there instead of degrading it away. Only valid for our own
+  // appId — a sandboxed bot cannot see (and must not answer for) its siblings.
+  // Absent key = not apiOnly: JSON.stringify drops `apiOnly: undefined`, which is
+  // exactly what the worker writes for a normal transport-enabled bot.
+  if (underReadIsolation()) {
+    // bots.json is denied in here and loadBotsJson() is FATAL on that — never
+    // reach it from the root dispatch gate. This bot's own apiOnly comes from the
+    // designed private channel instead: <BOT_HOME>/send-cred.json, written
+    // host-side by the worker, carrying apiOnly (worker.ts). Absent key = not
+    // apiOnly (JSON.stringify drops `apiOnly: undefined`, which is exactly what
+    // the worker writes for a normal transport-enabled bot).
+    if (process.env.BOTMUX_LARK_APP_ID !== larkAppId) return false; // can't see siblings
+    // Host-owned verdict first: a no-transport bot's own send-cred.json is denied
+    // by fs-policy (`!larkTransport` branch denies <BOT_HOME>/send-cred.json), so
+    // for exactly the bots this gate exists to catch the file read below cannot
+    // succeed. The worker therefore also states it in the env.
+    if (process.env.BOTMUX_API_ONLY === '1') return true;
+    try {
+      const credPath = sendCredFilePath(process.env.SESSION_DATA_DIR as string, larkAppId);
+      return JSON.parse(readFileSync(credPath, 'utf-8'))?.apiOnly === true;
+    } catch {
+      // No readable cred file: we cannot tell. Say "not apiOnly" rather than
+      // crash — the transport boundary still fail-closes downstream
+      // (getBotClient throws for apiOnly, and an apiOnly bot has no secret to
+      // talk to Feishu with in the first place).
+      return false;
+    }
+  }
+  try {
+    return loadBotsJson().some((b: any) => b?.larkAppId === larkAppId && b?.apiOnly === true);
+  } catch {
+    return false;
+  }
+}
+
+/** Central CLI session-transport capability check. A turn has NO Feishu
+ *  transport when either the running bot is core-only (apiOnly) OR the turn runs
+ *  in an HTTP virtual session (BOTMUX_CHAT_ID starts with http_async_ or
+ *  http_wait_). This is the single source of truth every Feishu-touching CLI
+ *  command consults — send/dispatch (writes) AND history/quoted/bots (reads) —
+ *  so a normal bot in a virtual session can't reach Feishu by reloading
+ *  bots.json for a real client (the daemon side is already gated by
+ *  larkTransportEnabled; this closes the non-sandbox local-CLI path). Kept
+ *  read-only and total (never throws). */
+function currentTurnHasNoTransport(): boolean {
+  const chatId = process.env.BOTMUX_CHAT_ID ?? '';
+  if (chatId.startsWith('http_async_') || chatId.startsWith('http_wait_')) return true;
+  const appId = process.env.BOTMUX_LARK_APP_ID;
+  return !!appId && currentBotIsApiOnly(appId);
+}
+
+/** Tamper-resistant managed-origin transport check for the root-dispatch gate.
+ *  Resolves the origin session via the pid-marker ANCESTRY (process.ppid walk),
+ *  NOT the mutable BOTMUX_SESSION_ID env, then loads that session's record and
+ *  judges transport from its chatId + its bot's apiOnly config. So `env -u
+ *  BOTMUX_SESSION_ID -u BOTMUX_CHAT_ID -u BOTMUX_LARK_APP_ID` cannot shed the
+ *  managed no-transport identity. Returns false (not gated) when no managed
+ *  origin resolves — a bare host-operator shell keeps full access. Total; on any
+ *  resolution error falls back to the env-based check (never throws). */
+function managedOriginHasNoTransport(): boolean {
+  try {
+    const ctx = resolveSessionContext(resolveDataDir(), process.env.BOTMUX_SESSION_ID);
+    if (!ctx?.sessionId) {
+      // No managed origin at all (bare operator). Still honor an explicit env
+      // signal if present (daemon-spawned turn whose marker was pruned), but a
+      // truly bare shell has neither → not gated.
+      return !!process.env.BOTMUX_SESSION_ID && currentTurnHasNoTransport();
+    }
+    const s = loadSessions().get(ctx.sessionId);
+    if (!s) {
+      // Marker resolved a session id but no record on disk (riff sandbox etc.) —
+      // fall back to the env view for that same managed turn.
+      return currentTurnHasNoTransport();
+    }
+    const chatId = s.chatId ?? '';
+    if (chatId.startsWith('http_async_') || chatId.startsWith('http_wait_')) return true;
+    return !!s.larkAppId && currentBotIsApiOnly(s.larkAppId);
+  } catch {
+    return !!process.env.BOTMUX_SESSION_ID && currentTurnHasNoTransport();
+  }
+}
+
+/** Refuse a Feishu-touching CLI command for a no-transport turn with a clear,
+ *  actionable message (not a deep client error), then exit. `op` names the
+ *  command for the message. Returns true if it refused+exited is imminent — but
+ *  it calls process.exit(2), so callers just `if (assertTurnTransportOrExit(...)) return;`
+ *  for type-flow clarity; execution never continues past the exit. */
+function assertTurnTransportOrExit(op: string): void {
+  if (!currentTurnHasNoTransport()) return;
+  const chatId = process.env.BOTMUX_CHAT_ID ?? '';
+  const why = chatId.startsWith('http_async_') || chatId.startsWith('http_wait_')
+    ? 'this turn runs in an HTTP control-API session (no Feishu chat)'
+    : 'this is a core-only (apiOnly) bot with no Feishu connection';
+  console.error(
+    `botmux ${op} is unavailable: ${why}.\n` +
+    `Feishu read/write is not possible here — the turn communicates only over the HTTP\n` +
+    `control API (input via trigger, output via trigger-result). Produce your normal answer.`,
+  );
+  process.exit(2);
+}
+
+/** Target-aware variant: gate on the RESOLVED session (its chatId + owning bot's
+ *  apiOnly), not just the calling process env. The env gate can't see a
+ *  `--session-id <other>` argument that targets a different (virtual) session, so
+ *  commands that accept --session-id must call this AFTER resolving the target to
+ *  close the cross-session bypass. Read-only + total (never throws besides exit). */
+function assertSessionTransportOrExit(session: { chatId?: string; larkAppId?: string }, op: string): void {
+  const chatId = session.chatId ?? '';
+  const virtual = chatId.startsWith('http_async_') || chatId.startsWith('http_wait_');
+  const apiOnly = !!session.larkAppId && currentBotIsApiOnly(session.larkAppId);
+  if (!virtual && !apiOnly) return;
+  console.error(
+    `botmux ${op} is unavailable for the target session: ${virtual ? 'it is an HTTP control-API session (no Feishu chat)' : 'its bot is core-only (apiOnly)'}.\n` +
+    `Feishu read/write is not possible for that session.`,
+  );
+  process.exit(2);
+}
+
 /** Under read isolation the CLI is denied bots.json, so `loadBotConfigs()` reads
  *  nothing. The worker instead wrote THIS bot's own secret to a per-bot cred file
  *  (its own is readable; siblings' are denied). Register just this bot from that
@@ -6083,7 +6668,7 @@ async function registerSelfFromCredFile(): Promise<void> {
   const sd = process.env.SESSION_DATA_DIR;
   if (!appId || !sd) return;
   const { sendCredFilePath } = await import('./adapters/cli/read-isolation.js');
-  let cred: { larkAppSecret?: string; brand?: string };
+  let cred: { larkAppSecret?: string; brand?: string; apiOnly?: boolean };
   try {
     // send-cred lives in the bot's BOT_HOME (<BOTMUX_HOME>/bots/<appId>/send-cred.json);
     // sendCredFilePath takes SESSION_DATA_DIR and derives BOTMUX_HOME (its parent).
@@ -6091,13 +6676,24 @@ async function registerSelfFromCredFile(): Promise<void> {
   } catch {
     return; // no cred file → not isolated (or first layer supplies creds elsewhere)
   }
-  if (!cred.larkAppSecret) return;
+  // apiOnly bots legitimately have an empty secret — don't bail on that, but DO
+  // carry the apiOnly flag through so the reconstructed config keeps the
+  // transport boundary (getBotClient throws for apiOnly). A non-apiOnly bot with
+  // no secret is still a no-op (nothing to register).
+  if (!cred.larkAppSecret && cred.apiOnly !== true) return;
   const { registerBot } = await import('./bot-registry.js');
   registerBot({
     larkAppId: appId,
-    larkAppSecret: cred.larkAppSecret,
+    larkAppSecret: cred.larkAppSecret ?? '',
+    apiOnly: cred.apiOnly === true || undefined,
     cliId: 'claude-code',
     brand: cred.brand as 'feishu' | 'lark' | undefined,
+    usageDisplay:
+      process.env.BOTMUX_USAGE_DISPLAY === 'streaming' ||
+      process.env.BOTMUX_USAGE_DISPLAY === 'footer' ||
+      process.env.BOTMUX_USAGE_DISPLAY === 'off'
+        ? (process.env.BOTMUX_USAGE_DISPLAY as import('./bot-registry.js').UsageDisplayMode)
+        : undefined,
   } as import('./bot-registry.js').BotConfig);
 }
 
@@ -6159,9 +6755,16 @@ function riffModeSession(opts: { evenWithLocalSessions?: boolean } = {}): { sess
   const botConfig = {
     larkAppId: appId,
     larkAppSecret: appSecret,
+    apiOnly: process.env.BOTMUX_API_ONLY === '1' || undefined,
     brand,
     cliId: 'riff',
     allowedUsers: [],
+    usageDisplay:
+      process.env.BOTMUX_USAGE_DISPLAY === 'streaming' ||
+      process.env.BOTMUX_USAGE_DISPLAY === 'footer' ||
+      process.env.BOTMUX_USAGE_DISPLAY === 'off'
+        ? (process.env.BOTMUX_USAGE_DISPLAY as import('./bot-registry.js').UsageDisplayMode)
+        : undefined,
   } as unknown as import('./bot-registry.js').BotConfig;
 
   const session: SessionData = {
@@ -6211,6 +6814,10 @@ async function cmdSend(rest: string[]): Promise<void> {
     );
     process.exit(2);
   }
+  // No-transport turn (apiOnly bot OR HTTP virtual session): refuse via the
+  // central session-capability gate — same hard door every Feishu-touching CLI
+  // command consults.
+  assertTurnTransportOrExit('send');
   // Managed output attribution must come from the live process-tree marker,
   // whose turn/attempt is refreshed by the worker. BOTMUX_TURN_ID is a
   // spawn-time fallback and can be stale in a detached child after a later
@@ -6489,6 +7096,11 @@ async function cmdSend(rest: string[]): Promise<void> {
 
   if (!s) { console.error(`未找到 session ${sid}`); process.exit(1); }
   if (!s.larkAppId) { console.error(`session ${sid} 缺少 larkAppId`); process.exit(1); }
+  // Target-aware gate on the RESOLVED source session: `send --session-id <virtual>`
+  // (or an apiOnly bot's session) must be refused even if the ambient env looks
+  // transport-capable, and regardless of any `--chat-id` override — a no-transport
+  // turn may not originate ANY Feishu write. Closes the env-only gap for send.
+  assertSessionTransportOrExit({ chatId: s.chatId, larkAppId: s.larkAppId }, 'send');
   let deferredMaterializedByThisCommand = false;
   let deferredTopicRootMessageIdForOutput: string | undefined;
 
@@ -6690,7 +7302,10 @@ async function cmdSend(rest: string[]): Promise<void> {
         try {
           const markerDir = join(resolveDataDir(), 'turn-sends');
           if (!existsSync(markerDir)) mkdirSync(markerDir, { recursive: true });
-          appendFileSync(join(markerDir, `${sid}.jsonl`), JSON.stringify({ sentAtMs, messageId }) + '\n');
+          const marker: Record<string, unknown> = { sentAtMs, messageId };
+          const previewText = buildBridgeSendPreviewText(content);
+          if (previewText) marker.previewText = previewText;
+          appendFileSync(join(markerDir, `${sid}.jsonl`), JSON.stringify(marker) + '\n');
         } catch { /* best-effort：漏记只多一条兜底，不致命 */ }
       }
       console.error(`✓ 已发送语音 ${messageId} ｜ ${Math.round(out.durationMs / 1000)}s`);
@@ -6756,7 +7371,14 @@ async function cmdSend(rest: string[]): Promise<void> {
       try {
         const markerDir = join(resolveDataDir(), 'turn-sends');
         if (!existsSync(markerDir)) mkdirSync(markerDir, { recursive: true });
-        appendFileSync(join(markerDir, `${sid}.jsonl`), JSON.stringify({ sentAtMs: Date.now(), messageId: `doc:${docTarget.commentId}`, contentLength: content.length }) + '\n');
+        const marker: Record<string, unknown> = {
+          sentAtMs: Date.now(),
+          messageId: `doc:${docTarget.commentId}`,
+          contentLength: content.length,
+        };
+        const previewText = buildBridgeSendPreviewText(content);
+        if (previewText) marker.previewText = previewText;
+        appendFileSync(join(markerDir, `${sid}.jsonl`), JSON.stringify(marker) + '\n');
       } catch { /* best-effort：漏记只多一条兜底 */ }
       // 清理已消费的 per-turn 落点，避免 session 文件无限堆积。
       if (s.docCommentTargets && currentTurnId && s.docCommentTargets[currentTurnId]) {
@@ -6801,6 +7423,46 @@ async function cmdSend(rest: string[]): Promise<void> {
   });
   if (!mentionGate.ok) { console.error(mentionGate.error); process.exit(2); }
 
+  // Register bots so the Lark client works. MUST run before the participant
+  // gate below: that gate calls getGroupStats → getBotClient, which throws
+  // "Bot not registered" in this standalone `botmux send` process (a fresh
+  // process with an empty registry) — getGroupStats would then soft-fail to
+  // {999,999} and wrongly block --mention-back even in a true 1v1. registerBot
+  // is idempotent, so the downstream send path reuses these same clients.
+  // envPinnedRiffBot is re-registered LAST so a remote env credential is never
+  // clobbered by a stale bots.json entry for the same app.
+  const { registerBot, loadBotConfigs, findOncallChatForAnyBot } = await import('./bot-registry.js');
+  try { for (const cfg of loadBotConfigs()) registerBot(cfg); } catch { /* */ }
+  if (envPinnedRiffBot) { try { registerBot(envPinnedRiffBot); } catch { /* */ } }
+
+  // Participant gate for --mention-back: in a true 1v1 the triggerer is the
+  // only counterpart so auto-@-ing them back is unambiguous, but once a third
+  // party joins (humans + bots > 2) "who triggered this turn" is no longer
+  // reliably "who should be addressed". Force an explicit --mention there.
+  // Symmetric with the inbound un-@ gate (event-dispatcher getGroupStats).
+  // Only fetch when mention-back is actually requested AND the chat isn't a p2p
+  // DM (inherently 1v1) — keeps the common send path free of an API round-trip.
+  if (mentionBack && s.chatType !== 'p2p' && s.larkAppId && s.chatId && !sendTopLevel) {
+    try {
+      const { getGroupStats } = await import('./im/lark/event-dispatcher.js');
+      const { userCount, botCount } = await getGroupStats(s.larkAppId, s.chatId);
+      if (shouldBlockMentionBackByParticipants({ chatType: s.chatType, userCount, botCount })) {
+        console.error(
+          `--mention-back 在多人会话（当前 ${userCount} 人 + ${botCount} bot）里不可用：`
+          + '"回复触发这轮的人/bot" 在多方场景可能 @ 错对象。请改用 --mention <ou:Name> 显式点名，'
+          + '或 --no-mention 不 @。',
+        );
+        process.exit(2);
+      }
+    } catch (err: any) {
+      // getGroupStats already soft-fails to {999,999} (→ block) internally, so
+      // reaching here means the dynamic import itself failed. Fail-closed to a
+      // clear error rather than silently letting a possibly-wrong @ through.
+      console.error(`无法确认会话人数以校验 --mention-back：${err?.message ?? err}。请改用 --mention <ou:Name> 或 --no-mention。`);
+      process.exit(2);
+    }
+  }
+
   // --mention-back: @ the sender of the message this turn is replying to
   // (open_id from the session — model needn't know it). Bare-name form so it
   // renders as a trailing <at>.
@@ -6816,11 +7478,6 @@ async function cmdSend(rest: string[]): Promise<void> {
   for (const p of [...videos, ...videoCovers]) {
     if (!statSync(p).isFile()) { console.error(`不是普通文件: ${p}`); process.exit(1); }
   }
-
-  // Register bots so Lark client works
-  const { registerBot, loadBotConfigs, findOncallChatForAnyBot } = await import('./bot-registry.js');
-  try { for (const cfg of loadBotConfigs()) registerBot(cfg); } catch { /* */ }
-  if (envPinnedRiffBot) { try { registerBot(envPinnedRiffBot); } catch { /* */ } }
 
   const { sendMessage, replyMessage, uploadImage, uploadFile, MessageWithdrawnError } = await import('./im/lark/client.js');
   const appId = s.larkAppId!;
@@ -7223,7 +7880,7 @@ async function cmdSend(rest: string[]): Promise<void> {
       const withFooter = withCustomCardMentionFooter(
         customCard,
         mentionFooter,
-        t('card.sent_to', undefined, localeForBot(appId)),
+        localeForBot(appId),
       );
       if (!withFooter.ok) { console.error(`botmux send: ${withFooter.error}`); process.exit(2); }
       customCard = withFooter.card;
@@ -7315,9 +7972,6 @@ async function cmdSend(rest: string[]): Promise<void> {
       // Brand segment honours this bot's configured brandLabel (unset →
       // default botmux, '' → suppressed, else custom). Same resolver/rule as
       // the daemon's card builders so both send paths render identically.
-      const footerParts: string[] = [];
-      const brandSeg = brandFooterSegment(renderBrandTemplate(resolveBrandLabel(appId), s.workingDir));
-      if (brandSeg) footerParts.push(brandSeg);
       // All real mentions land on one footer line: human addressee first, then
       // explicit @ targets (incl. handoff bots), then cc. Ids already inlined in
       // the body prose are skipped. Top-level publish keeps sendTo empty.
@@ -7327,9 +7981,13 @@ async function cmdSend(rest: string[]): Promise<void> {
         cc: footerAddressing.cc,
         inlinedIds: usedIds,
       });
-      if (footerRecipients.length > 0) {
-        footerParts.push(`${t('card.sent_to', undefined, localeForBot(appId))}${footerRecipients.map(id => `<at id=${id}></at>`).join(' ')}`);
-      }
+      const usageSnapshot = await readCardUsageSnapshotForSend(s, appId);
+      const footer = buildReplyCardFooter({
+        brand: renderBrandTemplate(resolveBrandLabel(appId), s.workingDir),
+        recipientOpenIds: footerRecipients,
+        usage: usageSnapshot,
+        locale: localeForBot(appId),
+      });
       // Footer line (brand 个性签名 + 发送给) and the optional 🔊 语音总结 button
       // share ONE row: footer text on the left (weighted, fills), button pinned
       // to the far right (auto width). When voice isn't configured the footer
@@ -7345,9 +8003,7 @@ async function cmdSend(rest: string[]): Promise<void> {
           voiceOn = isVoiceConfigured(appId);
         } catch { /* voice module/config unavailable → no button */ }
       }
-      const footerContent = footerParts.length > 0
-        ? `<font color='grey'>${footerParts.join(' · ')}</font>`
-        : '';
+      const footerContent = footer?.content ?? '';
       if (footerContent || voiceOn) {
         elements.push({ tag: 'hr' });
         if (voiceOn) {
@@ -7359,7 +8015,11 @@ async function cmdSend(rest: string[]): Promise<void> {
             columns: [
               {
                 tag: 'column', width: 'weighted', weight: 1, vertical_align: 'center',
-                elements: [{ tag: 'markdown', text_size: 'notation_small_v2', content: footerContent || ' ' }],
+                elements: [footer?.element ?? {
+                  tag: 'markdown',
+                  text_size: 'notation_small_v2',
+                  content: ' ',
+                }],
               },
               {
                 tag: 'column', width: 'auto', vertical_align: 'center',
@@ -7376,11 +8036,7 @@ async function cmdSend(rest: string[]): Promise<void> {
             ],
           });
         } else {
-          elements.push({
-            tag: 'markdown',
-            text_size: 'notation_small_v2',
-            content: footerContent,
-          });
+          if (footer) elements.push(footer.element);
         }
       }
 
@@ -7536,6 +8192,9 @@ async function cmdDispatch(rest: string[]): Promise<void> {
   --session-id <id>     指定来源会话（默认自动推断）`);
     return;
   }
+  // dispatch opens a real Feishu topic + pulls bots into a chat (a write). A
+  // no-transport turn has no Feishu chat to dispatch into — central hard gate.
+  assertTurnTransportOrExit('dispatch');
 
   process.env.SESSION_DATA_DIR ??= resolveDataDir();
   const sessionIdArg = argValue(rest, '--session-id');
@@ -7597,6 +8256,11 @@ async function cmdDispatch(rest: string[]): Promise<void> {
   const s = sessions.get(sid);
   if (!s) { console.error(`未找到 session ${sid}`); process.exit(1); }
   if (!s.larkAppId) { console.error(`session ${sid} 缺少 larkAppId`); process.exit(1); }
+  // Target-aware gate on the RESOLVED source session: dispatch from a virtual /
+  // apiOnly source turn is refused even with a real --chat-id override (a
+  // no-transport turn may not originate a Feishu topic/write). Closes the
+  // `dispatch --session-id <virtual> --chat-id oc_real` env-only gap.
+  assertSessionTransportOrExit({ chatId: s.chatId, larkAppId: s.larkAppId }, 'dispatch');
 
   const targetChatId = overrideChatId ?? s.chatId;
   if (!targetChatId) { console.error(`session ${sid} 缺少 chatId，且未提供 --chat-id`); process.exit(1); }
@@ -8149,6 +8813,9 @@ botmux create-group — 用一组机器人新建飞书群
 `);
     return;
   }
+  // create-group builds a real Feishu group (cross-bot). A no-transport turn
+  // (apiOnly bot or HTTP virtual session) may not originate one — central gate.
+  assertTurnTransportOrExit('create-group');
 
   process.env.SESSION_DATA_DIR ??= resolveDataDir();
 
@@ -8836,11 +9503,23 @@ async function cmdBots(sub: string, rest: string[]): Promise<void> {
     console.error('用法: botmux bots list [--session-id ID]');
     process.exit(1);
   }
+  // `bots list` reads the Feishu chat roster (listChatBotMembers). A no-transport
+  // turn has no chat roster — central hard gate (also stops the routing prompt
+  // from advertising a Feishu-dependent helper in this context).
+  assertTurnTransportOrExit('bots list');
 
   const sessionIdArg = argValue(rest, '--session-id');
-  // 与 history/quoted 同一前奏：本地会话解析 + riff sandbox env 合成会话兜底
-  //（远端沙箱无 sessions.json/bots.json 时 `botmux bots list` 照常可用）。
+  // 与 history/quoted 同一前奏：先从本 bot 自己的 send-cred 文件注册，让 Lark client
+  // 在**不读被 deny 的 bots.json** 的前提下可用，再做会话解析 + riff sandbox env
+  // 合成会话兜底。漏掉 registerSelfFromCredFile() 时读隔离 bot 的
+  // `botmux bots list` 会在 getBotClient() 上抛 "Bot not registered"，
+  // listChatBotMembers() 把它降级成 legacy discovery（configured 行同样来自
+  // bots.json）→ 返回 `total: 0`。**失败形态是静默的**：沙盒 bot 拿到空花名册会
+  // 按"只 @ mentionable 的"判定群里没人可 @，多 bot 协作直接不发生且不报错。
+  await registerSelfFromCredFile();
   const { sid, larkAppId: resolvedAppId, session: s } = await resolveSessionAppId(sessionIdArg);
+  // Target-aware gate (see cmdHistory).
+  assertSessionTransportOrExit({ chatId: s.chatId, larkAppId: resolvedAppId }, 'bots list');
 
   const appId = resolvedAppId;
   const dataDir = resolveDataDir();
@@ -9924,6 +10603,32 @@ async function runPluginCommandByName(rawCommand: string, commandArgs: string[])
   return true;
 }
 
+// ─── Central root-dispatch transport gate ──────────────────────────────────
+// A MANAGED no-transport turn (a CLI turn the daemon spawned for an apiOnly bot
+// or an HTTP virtual session) must not run ANY Lark-facing command. The managed
+// origin is resolved via the pid-marker ANCESTRY (resolveSessionContext walks
+// process.ppid to a worker-written marker) — NOT the mutable BOTMUX_SESSION_ID
+// env — so `env -u BOTMUX_SESSION_ID … botmux create-group` cannot shed the
+// managed identity. We then load THAT session's record and gate on its chatId +
+// its bot's apiOnly (config, not env), so unsetting BOTMUX_CHAT_ID/LARK_APP_ID
+// also can't flip the verdict. Covers every Feishu-facing verb by construction.
+// A BARE host-operator shell (no ancestry marker, no env session) resolves no
+// managed origin → NOT gated: the operator keeps full access. per-command +
+// daemon-side getBotClient/larkTransportEnabled gates remain authoritative.
+const LARK_FACING_COMMANDS = new Set([
+  'send', 'dispatch', 'create-group', 'history', 'quoted', 'bots', 'grant', 'react', 'thread',
+  'vc-agent', 'report',
+]);
+if (LARK_FACING_COMMANDS.has(command) && managedOriginHasNoTransport()) {
+  console.error(
+    `botmux ${command} is unavailable: this managed turn has no Feishu transport ` +
+    `(core-only apiOnly bot or HTTP control-API session).\n` +
+    `Feishu read/write is not possible for this turn — it communicates only over the HTTP\n` +
+    `control API (input via trigger, output via trigger-result). Produce your normal answer.`,
+  );
+  process.exit(2);
+}
+
 switch (command) {
   case '--version':
   case '-v':      console.log(getVersion()); break;
@@ -9947,6 +10652,7 @@ switch (command) {
     break;
   }
   case 'start':   await cmdStart(); break;
+  case 'serve':   await cmdServe(process.argv.slice(3)); break;
   case 'start-bot': await cmdStartBot(process.argv.slice(3)); break;
   case 'stop-bot': await cmdStopBot(process.argv.slice(3)); break;
   case 'stop':    await cmdStop(); break;
@@ -9969,6 +10675,7 @@ switch (command) {
   }
   case 'list':
   case 'ls':      await cmdList(); break;
+  case '__zmx-attach-managed': cmdManagedZmxAttach(process.argv.slice(3)); break;
   case 'delete':
   case 'del':
   case 'rm':      await cmdDelete(); break;

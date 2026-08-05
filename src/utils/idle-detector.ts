@@ -50,10 +50,11 @@ export class IdleDetector {
     // Check the current chunk too — a single chunk can contain the prompt
     // AND a full status-bar redraw (hundreds of chars), pushing the prompt
     // out of the 500-char outputTail before the check runs.
-    if (this.readyPattern && !this.readySeen) {
-      if (this.readyPattern.test(stripped) || this.readyPattern.test(this.outputTail)) {
-        this.readySeen = true;
-      }
+    const readyMatched = this.readyPattern && (
+      this.readyPattern.test(stripped) || this.readyPattern.test(this.outputTail)
+    );
+    if (readyMatched) {
+      this.readySeen = true;
     }
 
     // Track spinner — but not if it's part of completion marker,

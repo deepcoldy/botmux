@@ -1,4 +1,12 @@
-import { closeSync, existsSync, openSync, readSync, statSync } from 'node:fs';
+import {
+  closeSync,
+  constants,
+  existsSync,
+  fstatSync,
+  openSync,
+  readSync,
+  statSync,
+} from 'node:fs';
 import { StringDecoder } from 'node:string_decoder';
 
 export interface JsonlCursor {
@@ -32,7 +40,13 @@ export function scanJsonlFromOffset(path: string, fromOffset: number, opts: Json
   const buf = Buffer.alloc(chunkSize);
 
   try {
-    fd = openSync(path, 'r');
+    // O_NONBLOCK prevents an untrusted transcript path swapped to a FIFO from
+    // hanging the daemon. Validate the opened fd (rather than only the path)
+    // so directories/devices and the stat→open replacement window fail closed.
+    fd = openSync(path, constants.O_RDONLY | (constants.O_NONBLOCK ?? 0));
+    if (!fstatSync(fd).isFile()) {
+      throw new Error(`JSONL source is not a regular file: ${path}`);
+    }
     while (true) {
       const remaining = endOffset === undefined ? chunkSize : endOffset - nextReadOffset;
       if (remaining <= 0) break;

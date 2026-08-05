@@ -10,12 +10,12 @@ import { localeForBot, t } from '../i18n/index.js';
 import { validateWorkingDir } from './working-dir.js';
 import { buildFollowUpCliInput, buildNewTopicCliInput, ensureSessionWhiteboard, getAvailableBots, rememberLastCliInput } from './session-manager.js';
 import { markSessionActivity } from './session-activity.js';
-import { forkWorker, getCurrentCliVersion, sendWorkerInput } from './worker-pool.js';
+import { closeSession, forkWorker, getCurrentCliVersion, sendWorkerInput, setActiveSessionIfActive } from './worker-pool.js';
 import { armTriggerFinalSuppression, disarmTriggerFinalSuppression, inheritTriggerReplyAnchor } from './trigger-final-suppression.js';
 import { botAutoWorktreeEnabled } from '../services/default-worktree.js';
 import * as messageQueue from '../services/message-queue.js';
 import type { DaemonSession } from './types.js';
-import { sessionKey } from './types.js';
+import { sessionKey, larkTransportEnabled, isHttpVirtualSession } from './types.js';
 import type { TriggerRequest, TriggerResponse } from '../services/trigger-types.js';
 import type { CliTurnPayload } from '../types.js';
 
@@ -351,6 +351,31 @@ export async function triggerSessionTurn(
     return { ok: false, errorCode: 'workflow_trigger_not_implemented', error: 'only turn triggers are implemented in this daemon route' };
   }
 
+  // apiOnly (core-only) fail-closed: a bot with no Feishu transport must never
+  // be steered into a real chat. Enforce the request SHAPE, not just the boot
+  // hint — otherwise a caller could pass a real chatId/rootMessageId (or omit a
+  // response mode) and re-enter the Feishu delivery path. Require an explicit
+  // HTTP response mode; reject real chat/root targets; a supplied sessionId may
+  // only re-address this bot's own existing HTTP virtual session.
+  if (getBot(larkAppId).config.apiOnly === true) {
+    if (!req.options?.waitForFinalOutput && !req.options?.asyncReturnSessionId) {
+      return { ok: false, errorCode: 'bad_request', error: 'apiOnly bot requires an HTTP response mode (waitForFinalOutput or asyncReturnSessionId)' };
+    }
+    if (req.target.rootMessageId) {
+      return { ok: false, errorCode: 'bad_request', error: 'apiOnly bot cannot target a Feishu rootMessageId' };
+    }
+    const targetChatId = typeof req.target.chatId === 'string' ? req.target.chatId.trim() : '';
+    if (targetChatId && !isHttpVirtualSession(targetChatId)) {
+      return { ok: false, errorCode: 'bad_request', error: 'apiOnly bot cannot target a real Feishu chatId' };
+    }
+    if (req.target.sessionId) {
+      const bound = activeBySessionId(deps.activeSessions, req.target.sessionId);
+      if (bound && !isHttpVirtualSession(bound.chatId)) {
+        return { ok: false, errorCode: 'bad_request', error: 'apiOnly bot may only resume its own HTTP virtual session' };
+      }
+    }
+  }
+
   const dryRun = !!req.options?.dryRun;
   const prompt = buildUntrustedEventPrompt(req, triggerId);
   const topicMessage = buildExternalEventTopicMessage(req, larkAppId);
@@ -385,9 +410,9 @@ export async function triggerSessionTurn(
     }
   }
 
-  const isHttpVirtualSession = chatId.startsWith('http_wait_') || chatId.startsWith('http_async_');
+  const httpVirtual = isHttpVirtualSession(chatId);
   let inChat = true;
-  if (!isHttpVirtualSession) {
+  if (!httpVirtual) {
     inChat = await groupsStore.isInChat(larkAppId, chatId);
   }
   if (!inChat) {
@@ -398,8 +423,8 @@ export async function triggerSessionTurn(
   // session per top-level event, so an external event must NOT fold into the
   // group's one chat-scope session. Explicit rootMessageId is a stricter target:
   // it always routes to that thread anchor after daemon-side chat ownership check.
-  const regularGroupMode: ChatReplyMode = isHttpVirtualSession ? 'chat' : resolveRegularGroupMode(larkAppId, chatId);
-  if (!ds && !req.target.sessionId && !rootMessageId && !isHttpVirtualSession
+  const regularGroupMode: ChatReplyMode = httpVirtual ? 'chat' : resolveRegularGroupMode(larkAppId, chatId);
+  if (!ds && !req.target.sessionId && !rootMessageId && !httpVirtual
       && (regularGroupMode !== 'new-topic' || topicMessage === null)) {
     ds = deps.activeSessions.get(sessionKey(chatId, larkAppId));
   }
@@ -553,13 +578,13 @@ export async function triggerSessionTurn(
   }
 
   const bot = getBot(larkAppId);
-  const chatMode: ChatMode = isHttpVirtualSession
+  const chatMode: ChatMode = httpVirtual
     ? 'group'
     : await getChatMode(larkAppId, chatId, { forceRefresh: true });
   let scope: 'thread' | 'chat' = rootMessageId ? 'thread' : 'chat';
   let anchor = rootMessageId || chatId;
   const shouldOpenOwnTopic = !rootMessageId
-    && !isHttpVirtualSession
+    && !httpVirtual
     && externalEventOpensOwnTopic(chatMode, regularGroupMode);
   if (shouldOpenOwnTopic && topicMessage !== null) {
     anchor = await sendMessage(larkAppId, chatId, topicMessage);
@@ -615,7 +640,7 @@ export async function triggerSessionTurn(
   // asyncReturnSessionId）与虚拟会话是程序化「请求-应答」调用，每次一个 worktree 既反直觉又会
   // 泄漏（无回收），一律在基目录直接跑、不建 worktree。commitRepoSelection 会自己 buildNewTopicPrompt /
   // ensureSessionWhiteboard，故此分支跳过上面那套（省一次 getAvailableBots 通讯录往返）。
-  const useAutoWt = !isHttpVirtualSession
+  const useAutoWt = !httpVirtual
     && !req.options?.waitForFinalOutput
     && !req.options?.asyncReturnSessionId
     && !stableTurnId
@@ -643,7 +668,16 @@ export async function triggerSessionTurn(
     // not a hard guarantee — consistent with the 256/TTL best-effort bound.
     if (loudTurnId) newDs.pendingTurnId = loudTurnId;
     armLoudFinalSuppression(newDs);
-    deps.activeSessions.set(sessionKey(anchor, larkAppId), newDs);
+    if (!setActiveSessionIfActive(deps.activeSessions, sessionKey(anchor, larkAppId), newDs)) {
+      disarmLoudFinalSuppression(newDs);
+      await closeSession(session.sessionId);
+      return {
+        ok: false,
+        triggerId,
+        errorCode: 'trigger_failed',
+        error: 'session route is reserved by an active persisted session',
+      };
+    }
     const { runAutoWorktreeCommit } = await import('../im/lark/card-handler.js');
     void runAutoWorktreeCommit({
       ds: newDs, anchor, larkAppId, baseDir: wd.workingDir, title: triggerTitle(req),
@@ -662,6 +696,13 @@ export async function triggerSessionTurn(
   }
 
   ensureSessionWhiteboard(newDs);
+  // Skip the Feishu roster probe (getAvailableBots → listChatBotMembers →
+  // /is_in_chat) for no-transport sessions: an apiOnly bot or an HTTP virtual
+  // chat has no real Lark chat to enumerate, and probing a synthetic id only
+  // adds a failing network round-trip + latency. No peer bots → empty roster.
+  const availableBots = larkTransportEnabled({ chatId, apiOnly: bot.config.apiOnly })
+    ? await getAvailableBots(larkAppId, chatId)
+    : [];
   const promptInput = buildNewTopicCliInput(
     prompt,
     session.sessionId,
@@ -669,7 +710,7 @@ export async function triggerSessionTurn(
     bot.config.cliPathOverride,
     undefined,
     undefined,
-    await getAvailableBots(larkAppId, chatId),
+    availableBots,
     undefined,
     { name: bot.botName, openId: bot.botOpenId },
     localeForBot(larkAppId),
@@ -686,7 +727,15 @@ export async function triggerSessionTurn(
   // Register right before the fork branches (no await between here and forkWorker)
   // so a concurrent inbound message can't observe this session worker-less and
   // race a duplicate re-fork — the set-and-fork atomicity the original path had.
-  deps.activeSessions.set(sessionKey(anchor, larkAppId), newDs);
+  if (!setActiveSessionIfActive(deps.activeSessions, sessionKey(anchor, larkAppId), newDs)) {
+    await closeSession(session.sessionId);
+    return {
+      ok: false,
+      triggerId,
+      errorCode: 'trigger_failed',
+      error: 'session was closed while the trigger was being prepared',
+    };
+  }
   rememberInput(newDs, prompt, promptInput);
 
   if (req.options?.waitForFinalOutput) {

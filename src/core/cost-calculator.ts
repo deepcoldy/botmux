@@ -11,6 +11,11 @@ import {
   resolveSessionTranscriptPath,
 } from '../services/transcript-resolver.js';
 import { scanJsonlFromOffset } from '../services/jsonl-cursor.js';
+import {
+  isMeaningfulQueuedCommand,
+  isMeaningfulUserEvent,
+  type TranscriptEvent,
+} from '../services/claude-transcript.js';
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -28,6 +33,28 @@ export interface SessionTokenUsage extends SessionCost {
   out: number;
 }
 
+/** Latest Context Usage reported by the Agent CLI. A missing window means the
+ * CLI reported usage but not its model's context capacity. `percentUsed`, when
+ * present, is produced by the source parser from native facts and remains
+ * consistent with the displayed measurement; the card renderer never infers
+ * it. */
+export interface SessionContextUsage {
+  usedTokens: number;
+  windowTokens?: number;
+  percentUsed?: number;
+}
+
+/** Card-facing usage snapshot. Context is latest-turn state while Token Usage
+ * is cumulative for the Session; neither value is inferred from the other.
+ * `turnTokens` is the delta for the latest user turn (cumulative since the last
+ * user message) — small, matches what the CLI's own TUI shows for "this turn",
+ * whereas `tokens` is the whole-session cumulative (cache-inclusive, large). */
+export interface SessionUsageSnapshot {
+  context: SessionContextUsage | null;
+  tokens: SessionTokenUsage | null;
+  turnTokens: { in: number; out: number } | null;
+}
+
 export interface SessionTokenUsageQuery {
   cliId?: CliId | 'unknown';
   sessionId: string;
@@ -37,7 +64,7 @@ export interface SessionTokenUsageQuery {
    *  (CLI-data-redirected) bots' transcripts under BOT_HOME. */
   larkAppId?: string;
   /** Bypass the reparse throttle (stat short-circuit and incremental folding
-   *  still apply). Use at low-frequency exact points like ledger snapshots. */
+   *  still apply). Use at low-frequency exact points like ledger/card snapshots. */
   fresh?: boolean;
 }
 
@@ -144,6 +171,33 @@ function extractCodexTokenCountUsage(entry: any): SessionTokenUsage | null {
   };
 }
 
+function extractCodexContextUsage(entry: any): SessionContextUsage | null {
+  if (entry?.type !== 'event_msg' || entry?.payload?.type !== 'token_count') return null;
+  const info = entry.payload?.info;
+  const last = info?.last_token_usage;
+  if (!last || typeof last !== 'object') return null;
+  // Codex's native absolute gauge is last_token_usage.total_tokens. Cached
+  // input is already a subset of input and must never be added again.
+  const totalTokens = pickNum(last, ['total_tokens', 'totalTokens']);
+  const usedTokens = totalTokens > 0
+    ? totalTokens
+    : pickNum(last, ['input_tokens', 'inputTokens']);
+  if (usedTokens <= 0) return null;
+  const windowTokens = pickNum(info, ['model_context_window', 'modelContextWindow']);
+  // This card reports raw Context Usage, so keep the percentage consistent
+  // with the displayed numerator/denominator. Codex's TUI separately exposes
+  // a "user-controllable remaining" meter that subtracts fixed baseline
+  // prompts/tools; that is a different metric and does not belong here.
+  const percentUsed = windowTokens > 0
+    ? Math.round(Math.max(0, Math.min(1, usedTokens / windowTokens)) * 100)
+    : undefined;
+  return {
+    usedTokens,
+    ...(windowTokens > 0 ? { windowTokens } : {}),
+    ...(percentUsed !== undefined ? { percentUsed } : {}),
+  };
+}
+
 interface TokenUsageAggregate {
   inputTokens: number;
   outputTokens: number;
@@ -152,11 +206,17 @@ interface TokenUsageAggregate {
   model: string;
   turns: number;
   latestCodexUsage: SessionTokenUsage | null;
+  latestContextUsage: SessionContextUsage | null;
+  /** Prompt-side (input + cache) and output tokens accumulated for the CURRENT
+   *  user turn — reset when a new user message is seen (Claude). Lets the card
+   *  show a small "this turn" delta alongside the large cumulative total. */
+  turnInputTokens: number;
+  turnOutputTokens: number;
 }
 
 /** Per-CLI transcript dialect. Each kind only counts the events that dialect
  *  defines as billable turns — no cross-CLI guessing on usage-shaped lines. */
-type UsageKind = 'claude' | 'codex' | 'coco' | 'generic';
+type UsageKind = 'claude' | 'codex' | 'coco' | 'pi' | 'generic';
 
 function usageKindForCli(cliId: SessionTokenUsageQuery['cliId']): UsageKind {
   switch (cliId) {
@@ -174,18 +234,52 @@ function usageKindForCli(cliId: SessionTokenUsageQuery['cliId']): UsageKind {
       return 'codex';
     case 'coco':
       return 'coco';
+    case 'pi':
+      return 'pi';
     default:
       return 'generic';
   }
 }
 
 function newTokenUsageAggregate(): TokenUsageAggregate {
-  return { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreateTokens: 0, model: '', turns: 0, latestCodexUsage: null };
+  return {
+    inputTokens: 0,
+    outputTokens: 0,
+    cacheReadTokens: 0,
+    cacheCreateTokens: 0,
+    model: '',
+    turns: 0,
+    latestCodexUsage: null,
+    latestContextUsage: null,
+    turnInputTokens: 0,
+    turnOutputTokens: 0,
+  };
 }
 
 /** Claude Code / Seed: one JSONL line per content block; blocks of the same
  *  turn repeat the same message.id and usage snapshot — count once per id. */
 function foldClaudeLine(agg: TokenUsageAggregate, seenMessageIds: Set<string>, entry: any): void {
+  // A *real* new prompt starts a new user turn → reset the per-turn delta.
+  // Reuse the single source of truth the bridge attribution queue uses
+  // (claude-transcript.ts) so "本轮" agrees with what counts as a turn start:
+  //  - meaningful user prompts reset (isMeaningfulUserEvent excludes
+  //    tool_result continuations, isMeta/isCompactSummary/isSidechain markers,
+  //    slash-command wrappers and empty/synthetic-prefix lines);
+  //  - type-ahead submissions land as `type:'attachment'` queued_command lines,
+  //    NOT `type:'user'` — those are genuine turn starts and must reset too.
+  // Writing a weaker local predicate here would mis-reset on /clear, compaction
+  // and slash wrappers, and miss type-ahead — diverging from the real turn
+  // boundaries the rest of the bridge sees.
+  if (entry?.type === 'user' || entry?.type === 'attachment') {
+    if (
+      isMeaningfulUserEvent(entry as TranscriptEvent)
+      || isMeaningfulQueuedCommand(entry as TranscriptEvent)
+    ) {
+      agg.turnInputTokens = 0;
+      agg.turnOutputTokens = 0;
+    }
+    return;
+  }
   if (entry?.type !== 'assistant') return;
   const msg = entry.message;
   const u = msg?.usage;
@@ -199,6 +293,20 @@ function foldClaudeLine(agg: TokenUsageAggregate, seenMessageIds: Set<string>, e
   agg.outputTokens += num(u.output_tokens);
   agg.cacheReadTokens += num(u.cache_read_input_tokens);
   agg.cacheCreateTokens += num(u.cache_creation_input_tokens);
+  const contextTokens =
+    num(u.input_tokens)
+    + num(u.cache_read_input_tokens)
+    + num(u.cache_creation_input_tokens);
+  // Per-turn delta: prompt side (input, excluding cache_read which just re-reads
+  // the existing context) + output for every assistant step since the last user
+  // message. This matches the small "↑N ↓M this turn" the CLI's own TUI shows.
+  agg.turnInputTokens += num(u.input_tokens) + num(u.cache_creation_input_tokens);
+  agg.turnOutputTokens += num(u.output_tokens);
+  // Synthetic/empty assistant records around compaction must not erase the
+  // last native context measurement.
+  if (contextTokens > 0) {
+    agg.latestContextUsage = { usedTokens: contextTokens };
+  }
   if (!agg.model && typeof msg.model === 'string') agg.model = msg.model;
   agg.turns++;
 }
@@ -207,6 +315,9 @@ function foldClaudeLine(agg: TokenUsageAggregate, seenMessageIds: Set<string>, e
  *  the latest snapshot counts. The active model rides on turn_context /
  *  session_meta payloads (latest wins — sessions can switch models). */
 function foldCodexLine(agg: TokenUsageAggregate, entry: any): void {
+  const contextUsage = extractCodexContextUsage(entry);
+  if (contextUsage) agg.latestContextUsage = contextUsage;
+
   const codexUsage = extractCodexTokenCountUsage(entry);
   if (codexUsage) {
     agg.latestCodexUsage = codexUsage;
@@ -234,9 +345,30 @@ function foldCocoLine(agg: TokenUsageAggregate, entry: any): void {
   agg.turns++;
 }
 
+function foldPiLine(agg: TokenUsageAggregate, seenMessageIds: Set<string>, entry: any): void {
+  if (entry?.type !== 'message' || entry?.message?.role !== 'assistant') return;
+  const msg = entry.message;
+  const u = msg.usage;
+  if (!u || typeof u !== 'object') return;
+  const messageId = typeof msg.id === 'string' ? msg.id : '';
+  if (messageId) {
+    if (seenMessageIds.has(messageId)) return;
+    seenMessageIds.add(messageId);
+  }
+  agg.inputTokens += num(u.input);
+  agg.outputTokens += num(u.output);
+  agg.cacheReadTokens += num(u.cacheRead);
+  agg.cacheCreateTokens += num(u.cacheWrite);
+  if (!agg.model && typeof msg.model === 'string') agg.model = msg.model;
+  agg.turns++;
+}
+
 /** Cursor / TraeX / Antigravity: transcripts whose exact dialect is not yet
  *  pinned down — keep the tolerant multi-shape extraction for them. */
 function foldGenericLine(agg: TokenUsageAggregate, seenMessageIds: Set<string>, entry: any): void {
+  const contextUsage = extractCodexContextUsage(entry);
+  if (contextUsage) agg.latestContextUsage = contextUsage;
+
   const codexUsage = extractCodexTokenCountUsage(entry);
   if (codexUsage) {
     agg.latestCodexUsage = codexUsage;
@@ -266,6 +398,8 @@ function foldUsageLine(kind: UsageKind, agg: TokenUsageAggregate, seenMessageIds
       return foldCodexLine(agg, entry);
     case 'coco':
       return foldCocoLine(agg, entry);
+    case 'pi':
+      return foldPiLine(agg, seenMessageIds, entry);
     case 'generic':
       return foldGenericLine(agg, seenMessageIds, entry);
   }
@@ -558,7 +692,7 @@ function readTokenUsageFromAidenCheckpoint(path: string): SessionTokenUsage | nu
   };
 }
 
-export function getSessionTokenUsage(q: SessionTokenUsageQuery): SessionTokenUsage | null {
+function readSessionUsage(q: SessionTokenUsageQuery): UsageReadResult | null {
   if (q.cliId === 'aiden') {
     const sid = q.cliSessionId || q.sessionId;
     const checkpointPath = cachedTranscriptPathLookup(
@@ -571,11 +705,32 @@ export function getSessionTokenUsage(q: SessionTokenUsageQuery): SessionTokenUsa
       { retryMiss: q.fresh, refreshHit: q.fresh },
     );
     if (!checkpointPath || !existsSync(checkpointPath)) return null;
-    return readSessionTokenUsageFile(checkpointPath, 'aiden', { fresh: q.fresh });
+    return readSessionTokenAggregateCached(checkpointPath, 'aiden', { fresh: q.fresh });
   }
   const resolved = resolveSessionTranscriptPath(q);
   if (!resolved || !existsSync(resolved.path)) return null;
-  return readSessionTokenUsageFile(resolved.path, usageKindForCli(q.cliId), { fresh: q.fresh });
+  return readSessionTokenAggregateCached(resolved.path, usageKindForCli(q.cliId), { fresh: q.fresh });
+}
+
+export function getSessionTokenUsage(q: SessionTokenUsageQuery): SessionTokenUsage | null {
+  return readSessionUsage(q)?.result ?? null;
+}
+
+export function getSessionUsageSnapshot(q: SessionTokenUsageQuery): SessionUsageSnapshot {
+  const read = readSessionUsage(q);
+  const agg = read?.agg;
+  // Per-turn delta only for dialects that track it (Claude family). Codex/coco
+  // fold to a cumulative-only latestCodexUsage and leave turn counters at 0, so
+  // guard on turns>0 AND a positive delta to avoid a misleading "本轮 0".
+  const turnTokens = agg && agg.turns > 0
+    && (agg.turnInputTokens > 0 || agg.turnOutputTokens > 0)
+    ? { in: agg.turnInputTokens, out: agg.turnOutputTokens }
+    : null;
+  return {
+    context: agg?.latestContextUsage ?? null,
+    tokens: read?.result ?? null,
+    turnTokens,
+  };
 }
 
 export function formatNumber(n: number): string {

@@ -40,6 +40,7 @@ export const messages: Record<string, string> = {
   'card.status.limited': '限额已达',
   'card.status.retry_ready': '可重试',
   'card.status.executing': '正在执行…',
+  'card.status.failed': '提交失败',
   'card.status.session_closed': '🛑 会话已关闭',
   'card.status.relay_frozen': '🔄 会话已搬迁',
   'card.status.selected': '已选择',
@@ -59,6 +60,7 @@ export const messages: Record<string, string> = {
   'card.usage_limit.retry_at': '⚠️ 当前已达到 {cliName} 使用限额。请在 {retryLabel} 后再试。',
   'card.usage_limit.retry_ready': '✅ {cliName} 限额预计已刷新。你可以重发上一条任务，或直接发送新消息。',
   'card.private.snapshot_note': '🔒 仅你可见的静态快照（不会实时刷新）。点「打开 Web 终端」查看实时画面。',
+  'card.private.snapshot_note_no_terminal': '🔒 仅你可见的静态快照（不会实时刷新）。当前后端不提供 Web 终端。',
 
   // ─── Repo select card ────────────────────────────────────────────────────
   'card.repo.title': '📁 项目仓库管理',
@@ -90,9 +92,20 @@ export const messages: Record<string, string> = {
   'card.grant.btn_chat': '授权本群对话',
   'card.grant.btn_global': '全局授权对话',
   'card.grant.btn_deny': '拒绝',
-  'card.grant.note': '仅授予对话权（本群或全局）；/restart、/close、终端写入等敏感操作仍仅限 allowedUsers（owner）。',
+  'card.grant.duration_label': '有效期',
+  'card.grant.duration_3600000': '1 小时',
+  'card.grant.duration_28800000': '8 小时',
+  'card.grant.duration_86400000': '1 天',
+  'card.grant.duration_604800000': '7 天',
+  'card.grant.duration_permanent': '永久',
+  'card.grant.quota_label': '消息额度（条）',
+  'card.grant.quota_placeholder': '留空不限',
+  'card.grant.note': '有效期或消息额度任一先到即自动收回授权。仅授予对话权（本群或全局）；/restart、/close、终端写入等敏感操作仍仅限 allowedUsers（owner）。',
   'card.grant.toast_owner_only': '仅 owner 可操作',
   'card.grant.toast_expired': '该授权请求已失效',
+  'card.grant.toast_bad_limit': '授权限制参数无效',
+  'card.grant.toast_bad_quota': '消息额度请输入 1–1000 的整数，留空表示不限',
+  'card.grant.toast_limit_staged': '已更新限制，点击授权后生效',
   'card.grant.toast_no_repo_perm': '无操作权限',
   'card.grant.toast_failed': '授权失败：{reason}',
   'card.grant.result_chat': '✅ 已授权本群使用',
@@ -102,6 +115,9 @@ export const messages: Record<string, string> = {
   'card.grant.notify_chat': '✅ {at} 已获授权在本群使用我，发消息 @ 我即可。',
   'card.grant.notify_global': '✅ {at} 已获全局授权，在任意群发消息 @ 我即可。',
   'card.grant.notify_quota_suffix': '（消息额度 {n} 条，用尽后自动收回授权）',
+  'card.grant.notify_expiry_suffix': '（有效至 {time}）',
+  'card.grant.result_expiry': '有效至：{time}',
+  'card.grant.result_quota': '消息额度：{n} 条',
 
   // 消息额度用尽
   'quota.exhausted_notify': '⚠️ {at} 的消息额度已用尽（{limit}/{limit}），已收回与我的对话授权。如需继续，请联系 owner 重新 /grant。',
@@ -112,7 +128,7 @@ export const messages: Record<string, string> = {
   // /grant、/revoke 命令回执
   'cmd.grant.owner_only': '仅 owner 可使用 /grant。',
   'cmd.grant.usage': '用法：@机器人 /grant @某人 [条数]（授权 ta 在本群与我对话，可一次 @ 多人/多 bot；带数字则给 N 条消息额度）｜@机器人 /grant（授权本群所有成员对话）。仅授对话权，敏感操作仍由 allowedUsers 控制。',
-  'cmd.grant.bad_quota': '⚠️ 额度格式不对。用法：@机器人 /grant @某人 5（给 5 条消息额度，须为正整数）；不带数字则按默认额度 / 无限。',
+  'cmd.grant.bad_quota': '⚠️ 额度格式不对。用法：@机器人 /grant @某人 5（给 5 条消息额度，须为正整数）；不带数字则使用卡片默认额度。',
   'cmd.grant.chat_done': '✅ 已授权本群所有成员与我对话（@ 我即可）。敏感操作仍仅限 allowedUsers。',
   'cmd.grant.chat_already': 'ℹ️ 本群已是授权状态，无需重复授权。',
   'cmd.grant.chat_failed': '⚠️ 授权失败：{reason}',
@@ -133,6 +149,17 @@ export const messages: Record<string, string> = {
   'cmd.revoke.multi_would_open': '⚠️ {name} —— 跳过：ta 是最后的全局授权用户 / owner，撤销会让机器人对所有人开放',
   'cmd.revoke.multi_failed': '⚠️ {name} —— 撤销失败：{reason}',
 
+  // /invite（把群外 bot 拉进本群，owner 专用）
+  'cmd.invite.owner_only': '⚠️ 仅 owner 可以使用 /invite。',
+  'cmd.invite.p2p': '⚠️ 私聊里不能拉机器人，请在群里使用 /invite。',
+  'cmd.invite.usage': '用法：@我 /invite @要拉进群的机器人（可多个），或 @我 /invite --app cli_xxx',
+  'cmd.invite.header': '🤝 /invite 结果：',
+  'cmd.invite.ok': '✅ 已拉进群：{names}',
+  'cmd.invite.already': '⏭️ 已在群内（跳过）：{names}',
+  'cmd.invite.unresolved': '⚠️ 无法解析（本机与团队花名册都查不到，可用 --app cli_xxx 直接指定）：{names}',
+  'cmd.invite.ambiguous_item': '⚠️ 名字「{name}」对应多个机器人（{apps}），请改用 --app 指定。',
+  'cmd.invite.failed_item': '❌ 拉入失败：{name} —— {reason}',
+
   // ─── Adopt card ──────────────────────────────────────────────────────────
   'card.adopt.title': '📡 选择要接入的 CLI 会话',
   'card.adopt.placeholder_select': '选择 CLI 会话',
@@ -140,6 +167,29 @@ export const messages: Record<string, string> = {
   'card.adopt.section_live': '**接管运行中的会话**（观察 tmux / herdr / zellij 里的活进程）',
   'card.adopt.section_resume': '**恢复历史会话**（从磁盘 resume 导入，无需进程在跑）',
   'card.adopt.placeholder_resume': '选择要 resume 的历史会话',
+  // V2 picker (search + card list + pagination), replacing the two dropdowns.
+  'card.adopt.search_placeholder': '🔍 搜索会话（标题/项目/路径/会话 ID）',
+  'card.adopt.empty': '当前没有可接入的会话。\n（运行中：tmux / zellij / herdr 里正在跑的本机 CLI；历史：本 bot 同类 CLI 从磁盘可 resume 的会话。）',
+  'card.adopt.empty_filtered': '没有匹配「{query}」的会话，请换个关键词。',
+  'card.adopt.kind_live': '🟢 运行中',
+  'card.adopt.kind_resume': '🕘 历史',
+  'card.adopt.field_kind': '来源',
+  'card.adopt.field_cli': 'CLI',
+  'card.adopt.field_dir': '路径',
+  'card.adopt.field_session': '会话 ID',
+  'card.adopt.field_time_live': '已运行',
+  'card.adopt.field_time_resume': '最近活动',
+  'card.adopt.field_target': '位置',
+  'card.adopt.selected_tag': '已选中',
+  'card.adopt.hint_pick_first': '点击上方任意会话以选中，再点下方按钮确认接入。',
+  'card.adopt.btn_confirm_live': '确认接管到本话题',
+  'card.adopt.btn_confirm_resume': '确认恢复到本话题',
+  'card.adopt.session_unknown': '（未探测到）',
+  'card.adopt.truncated': '⚠️ 历史会话较多，仅列出最近 {limit} 条，请用上方搜索缩小范围。',
+  'card.adopt.toast_not_invoker': '这张菜单是别人召唤的，请自己发 /adopt 召唤一张。',
+  'card.adopt.toast_no_perm': '你没有该会话的操作权限。',
+  'card.adopt.toast_missing_value': '卡片状态缺失，请重新发送 /adopt。',
+  'card.adopt.toast_no_session': '本话题没有活跃会话，请重新发送 /adopt。',
   'card.codex_app_thread.title': '📱 选择要继续的 Codex App 对话',
   'card.codex_app_thread.subtitle': '从 Codex App 本地历史中恢复一个已有对话；botmux 会用 app-server 协议继续该 thread。',
   'card.codex_app_thread.placeholder_select': '选择 Codex App 对话',
@@ -199,6 +249,7 @@ export const messages: Record<string, string> = {
   'cmd.card.operator_only': '⚠️ 仅授权用户（allowedUsers）可以使用 /card。',
   'cmd.term.operator_only': '⚠️ 仅授权用户（allowedUsers）可以用 /term 获取可操作终端链接。',
   'cmd.term.no_session': '当前话题没有活跃会话，/term 需要一个跑着的会话。',
+  'cmd.term.unsupported': '当前会话后端不提供 Web 终端；ZMX 会话请在本机运行 botmux list 或 zmx attach。',
   'cmd.term.not_ready': '🔒 终端还没就绪，等会话起好后再发 /term。',
   'cmd.term.failed': '⚠️ 可操作链接发送失败（私密卡与 DM 均失败），看 daemon 日志。',
   'cmd.term.sent_dm': '🔑 可操作终端链接已私信发你（不在群里暴露）。',
@@ -228,9 +279,11 @@ export const messages: Record<string, string> = {
   'cmd.substitute.updated_off': '✅ 已关闭当前群替身模式。',
   'cmd.substitute.unsupported': '⚠️ /substitute 仅支持群聊（普通群/话题群）。',
   'cmd.substitute.topic_disabled': '⚠️ 当前 bot 配置已关闭话题群替身支持，群内开关无法单独开启。',
+  'cmd.substitute.blocked': '⚠️ 当前群已被 bot 配置加入替身黑名单，替身不会在此触发，/substitute on 也无法开启。',
   'cmd.substitute.owner_only': '⚠️ 只有 owner/allowedUsers 可以修改替身模式开关。',
   'cmd.substitute.usage': '用法：@我 /substitute status｜on｜off',
   'cmd.restart.in_progress': '🔄 正在重启 {cliName}...',
+  'cmd.session.transfer_in_progress': '⚠️ 会话正在接力中，请等接力完成后再试。',
   'cmd.restart.succeeded': '✅ {cliName} 已恢复就绪。',
   'cmd.restart.failed': '❌ {cliName} 重启失败。',
   'cmd.restart.timed_out': '⌛ {cliName} 重启超时，尚未恢复就绪。',
@@ -265,6 +318,7 @@ export const messages: Record<string, string> = {
   'cmd.repo.card_already_consumed': '✅ 仓库已选定，请忽略旧的选仓卡片',
   'cmd.repo.worktree_created_not_switched': '🌿 worktree 已创建：`{path}`（分支 `{branch}`），但会话状态已变化，未自动切换。需要时可用 `/repo {path}` 打开。',
   'cmd.repo.worktree_switch_failed': '⚠️ worktree 已创建：`{path}`，但自动切换失败：{error}\n可用 `/repo {path}` 手动打开。',
+  'cmd.repo.switch_close_failed': '⚠️ 无法安全关闭当前会话，仓库未切换：{error}',
   // 「仅默认目录」模式开启「自动创建 worktree」后，新会话启动时用（daemon 交互新话题 /
   // dashboard 建会话 / webhook 外部事件三条路复用）。
   'worktree.auto_creating': '🌿 正在为本会话创建独立 worktree（含 git fetch，可能需要几秒）…',
@@ -340,6 +394,8 @@ export const messages: Record<string, string> = {
   'cmd.adopt.pane_not_found': '未找到 tmux pane {pane}',
   'cmd.adopt.target_exited': '⚠️ 目标 CLI 会话已退出',
   'cmd.adopt.sandbox_blocked': '🛡️ 本机器人已开启文件沙盒，无法 /adopt 已在运行的 CLI（沙盒只能在启动时套用，无法事后包裹活进程）。直接发消息会以沙盒方式冷启动一个新 CLI 会话。',
+  'card.adopt_blocked.title': '⚠️ 无法接入：请先关闭当前会话',
+  'card.adopt_blocked.body': '本话题正在等待你选择仓库，无法直接 /adopt 接管已在运行的 CLI。\n\n请点下方「关闭会话」结束当前的选仓会话，然后重新 /adopt 接管你的 CLI（原 CLI 不受影响）。',
   'cmd.adopt.success': '📡 已接入 {cliName} · {project} ({pane})',
   'cmd.adopt.resume_success': '↩️ 已恢复 {cliName} 历史会话 · {project} —「{title}」',
   'cmd.adopt.resume_not_found': '⚠️ 该历史会话已不存在或已被占用（{id}）',
@@ -397,6 +453,7 @@ export const messages: Record<string, string> = {
   'card.config.p2p.thread': '🧵 thread（每条 DM 独立会话）',
   'card.config.p2p.chat': '💬 chat（连续单聊会话，默认）',
   'config.label.disableStreamingCard': '关闭实时卡片',
+  'config.label.usageDisplay': '用量显示位置',
   'config.label.silentTurnReactions': '关闭状态 reaction',
   'config.label.writableTerminalLinkInCard': '卡内嵌可写终端',
   'config.label.privateCard': '私有快照卡',
@@ -467,6 +524,22 @@ export const messages: Record<string, string> = {
   'cmd.relay.report_peer_failed': '• {bot} — 接力失败：{error}',
   'cmd.relay.failed': '⚠️ /relay --create 失败：{error}',
 
+  // ─── /fork（会话分身）─────────────────────────────────────────────────────
+  'cmd.fork.no_bot': '⚠️ 无法确定机器人身份，/fork 取消。',
+  'cmd.fork.no_sender': '⚠️ 无法获取发起人 open_id，/fork 取消。',
+  'cmd.fork.no_session': '⚠️ /fork 必须在一个已有会话的话题里发起。',
+  'cmd.fork.no_source_here': '⚠️ 这里没有可 fork 的活跃会话。/fork 要在**会话所在的那个话题里**发起（就是你平时 @ 机器人聊天的那条话题），不要在群顶层发。',
+  'cmd.fork.not_owner': '⚠️ 只有会话发起人能 fork 它。',
+  'cmd.fork.wrong_bot': '⚠️ fork 只能把当前会话复制给**当前这个机器人**（分身要跑同一个 CLI）。不用 @ 别的机器人；直接 `/fork --create <新群名>` 即可，会默认用当前机器人。',
+  'cmd.fork.unsupported_backend': 'ℹ️ 当前 {cli} 会话暂不支持 fork（目前仅 Claude 系 / Codex 终端模式；Codex App、开启 RPC 的 Codex、纯远端后端走 app-server 活会话，无法字节级复制）。',
+  'cmd.fork.mid_turn': '⚠️ 会话正在处理中（mid-turn），无法 fork。请等它空闲（idle）后再发 /fork。',
+  'cmd.fork.not_started_yet': '⚠️ 会话还没真正跑起来（没选仓库 / CLI 没起 / 无上下文），无法 fork。',
+  'cmd.fork.adopt_not_forkable': '⚠️ 该会话是 /adopt 接入的外部会话，无法 fork。',
+  'cmd.fork.created': '✅ 已创建群「{name}」并 fork 出分身（源会话原样保留继续）\n👉 {link}\n\n分身带着 fork 时刻的完整上下文，去新群 @ 机器人即可继续。',
+  'cmd.fork.failed': '⚠️ /fork --create 失败：{error}',
+  'cmd.fork.picker_pending': 'ℹ️ 本群暂不支持在原地 fork。请用 `/fork --create <新群名> @机器人` —— 会新建一个群、把当前会话 fork 一份分身放进去，源会话保持不动。（在本群原地创建 Branch 的能力后续提供。）',
+  'cmd.fork.orphan_group_left': '⚠️ fork 没成功，但新群「{name}」已经建出来了（我尝试自动解散失败，可能因为群主已转给你）。这个空群可以手动删掉。',
+
   // ─── /schedule ───────────────────────────────────────────────────────────
   'schedule.empty_with_examples': '暂无定时任务。\n\n用法示例：\n/schedule 每日17:50 帮我看看今天AI圈有什么新闻\n/schedule 工作日每天9:00 检查服务状态\n/schedule 每周一10:00 生成周报',
   'schedule.list_header': '定时任务列表 ({count})：',
@@ -501,7 +574,6 @@ export const messages: Record<string, string> = {
   'help.term': '/term       - 获取当前会话的「可操作终端」（带写权限）链接，私密发给 owner（群内仅你可见，话题/单聊回退私信，不在群里暴露）',
   'help.dashboard': '/dashboard [模块] - 在飞书里打开 Dashboard 控制卡片（sessions/schedules/groups/settings/help 等）',
   'help.insight': '/insight    - 查看当前会话的工具调用摘要与风险建议（operator 专用）',
-  'help.land': '/land       - 查看沙盒会话改动 diff，并由 owner 在卡片上确认落盘',
   'help.subscribe_doc': '/subscribe-lark-doc <文档链接|list|off> - 通过飞书 API 订阅文档（需要文档 User Token）',
   'help.watch_comment': '/watch-comment <文档链接|list|off> - 监听文档评论并把 AI 回复发回评论串',
   'help.vc': '/vc prepare <会议链接或会议号> - 将当前普通群设为会议准备群，并在开会后复用同一 Agent 会话',
@@ -522,6 +594,7 @@ export const messages: Record<string, string> = {
   'help.introduce': '/introduce          - 让本群机器人互相登记 open_id，用于协作时精确 @ 对方',
   'help.relay': '/relay              - 选择一个其他群/话题里的活跃会话，接力到当前群/话题',
   'help.relay_create': '/relay --create [群名]  - 新建协作群，并把当前会话接力过去（群里需 @ 目标 bot；私聊直接发即可，新群 = 你 + 本机器人）',
+  'help.fork': '/fork --create <群名>  - 把当前会话「分身」一份到新建群（源会话原样保留继续），分身带完整上下文（仅 Claude 系 / Codex 终端模式）',
   'help.heading_login': '🔐 用户授权：',
   'help.login': '/login              - 飞书用户授权（可下载第三方卡片图片等）',
   'help.login_status': '/login status       - 查看授权状态',
@@ -543,6 +616,7 @@ export const messages: Record<string, string> = {
   'help.grant': '@机器人 /grant @某人   - 授权对方在本群对话（可一次 @ 多人/多 bot）；/grant（不带人）授权本群所有成员对话',
   'help.revoke': '@机器人 /revoke @某人  - 撤销对方本群对话权（可一次 @ 多人/多 bot）；/revoke（不带人）撤销整群授权',
   'help.vc_auth': '/vc-auth @成员     - 会议监听中临时授权本场指令源；/vc-auth revoke @成员 撤销；/vc-auth list 查看',
+  'help.invite': '@机器人 /invite @bot  - 把不在群里的 bot 拉进本群（可一次多个；--app cli_xxx 可直接指定 app）',
   'help.heading_config': '⚙️ 远程改配置（owner 专用，写盘即热更新、无需重启）：',
   'help.config_get': '/botconfig get  - 查看本机器人当前运营配置',
   'help.config_set': '/botconfig set <字段> <值>  - 改 model/cli/lang/开关等；/botconfig help 看全部字段',
@@ -684,6 +758,7 @@ export const messages: Record<string, string> = {
   'card.action.resume_anchor_holder': '（占用者：{short}）',
   'card.action.resume_adopt_unsupported': '⚠️ adopt 接管会话不支持 resume。',
   'card.action.resume_deferred_unmaterialized': '⚠️ 该静默定时轮次未创建话题，隐藏会话只保留审计记录，无法恢复。',
+  'card.action.resume_cancelled': '⚠️ 恢复过程中会话被关闭，本次恢复已取消。',
   'card.action.disconnected': '⏏ 已断开，原 CLI 会话不受影响',
   'card.voice.toast_wait': '🔊 正在生成语音总结，请耐心等待…',
   'card.voice.toast_already': '🔊 这条已经在生成语音啦，请稍候',
@@ -693,8 +768,9 @@ export const messages: Record<string, string> = {
   'card.voice.user_message': '生成语音总结',
   'card.action.takeover_retired': '⚠️ 旧版"接管"按钮已停用。bridge 模式下原 CLI 由 botmux 桥接，无需接管即可在飞书中收到回答。如需 /resume 完整接管能力，请等待 /adopt --takeover 命令上线。',
   'card.action.terminal_not_ready': '⚠️ 终端尚未就绪，请稍后再试。',
+  'card.action.terminal_unsupported': '⚠️ 当前会话后端不提供 Web 终端；ZMX 会话请在本机运行 `botmux list` 或 `zmx attach`。',
   'card.action.local_terminal_opened': '💻 已请求打开本机 {cliName}',
-  'card.action.local_terminal_unsupported': '⚠️ 当前 {cliName} 会话暂不支持本机直开，请使用 Web 终端。',
+  'card.action.local_terminal_unsupported': '⚠️ 当前 {cliName} 会话暂不支持本机直开，请使用该后端支持的终端接入方式。',
   'card.action.local_cli_missing': '⚠️ 本机未找到 {cliName} 可执行文件（{executable}），请先安装或配置 PATH / cliPathOverride。',
   'card.action.local_terminal_failed': '⚠️ 打开本机 CLI 失败：{reason}',
   'card.action.local_terminal_no_permission': '🔒 没有操作权限，无法打开本机 CLI',
@@ -712,6 +788,7 @@ export const messages: Record<string, string> = {
   'card.action.tui_select_title': 'Select options',
   'card.action.tui_custom_input': 'Custom input',
   'card.action.tui_done': 'Done',
+  'card.action.tui_ipc_failed': '⚠️ TUI 操作未发送（worker 可能不可用），请重试。',
   'card.action.continue_using_current_repo': '继续使用当前仓库：{cwd}',
   'card.action.retry_last_task_missing': '⚠️ 找不到上一条任务，无法重发。请直接发送新的消息。',
   'card.action.retry_last_task_unavailable': '⚠️ 当前重试状态已失效。请直接发送新的消息。',
@@ -724,6 +801,11 @@ export const messages: Record<string, string> = {
   'worker.crash_recent_output': '最近终端输出：',
   'worker.start_failed': '⚠️ {cliName} 会话启动失败：{reason}\n请检查 Dashboard 的 Agent / 后端配置和 daemon 所在机器的安装环境，修复后重发消息即可重试。',
   'worker.start_exited_early': 'worker 在就绪前退出（exit code: {code}）；详细错误可查看 Botmux 日志。',
+  'worker.tui_submit_failed': '⚠️ TUI 答案未能确认送达 {cliName}。CLI 可能仍在等待输入；请打开本机终端处理，或发送一条新消息解除并继续。',
+  'worker.raw_input_failed': '⚠️ Slash 命令未能确认送达 {cliName}，同一条消息中紧随其后的正文没有继续提交。请检查当前终端状态后重发。',
+  'worker.raw_input_failed_command_only': '⚠️ Slash 命令未能确认送达 {cliName}。请检查当前终端状态后重发。',
+  'worker.raw_input_failed_recovery': '⚠️ Slash 命令未能确认送达 {cliName}，同一条消息中紧随其后的正文没有继续提交。\n原因：{reason}',
+  'worker.raw_input_failed_command_only_recovery': '⚠️ Slash 命令未能确认送达 {cliName}。\n原因：{reason}',
   'worker.empty_final_completed': '⚠️ {cliName} 已报告本轮处理完成，但 botmux 没有从终端记录里捕获到最终文本，也没有追踪到本轮的回复。若你已经通过改道发送（--top-level / --into / --override-chat）回复过，可忽略本提示；否则请打开 Web 终端查看最后输出，或直接重发消息让会话继续。',
 
   // ─── CLI setup wizard / pm2 lifecycle (no per-bot context) ───────────────
@@ -845,6 +927,7 @@ export const messages: Record<string, string> = {
   'card.dashboard.sessions.confirm.resume.title': '确认恢复会话？',
   'card.dashboard.sessions.confirm.resume.text': '恢复后将重新创建工作进程并继续会话。会话：{title}',
   'card.dashboard.sessions.terminal.disabled.noPort': '会话尚无 Web 终端端口（未启动或已关闭）',
+  'card.dashboard.sessions.terminal.disabled.unsupported': '当前后端不提供 Web 终端',
   'card.dashboard.sessions.resume.disabled.onlyClosed': '仅可恢复已关闭的会话',
 
   // schedules card (PR3 slice 1)
@@ -1028,9 +1111,9 @@ export const messages: Record<string, string> = {
   'settings.openTerminalInFeishu': '飞书内打开 Web 终端',
   'settings.openTerminalInFeishuHelp': '终端链接默认在飞书 webview 打开。',
   'settings.enableLocalCliOpen': '启用本机 CLI 直开',
-  'settings.enableLocalCliOpenHelp': '默认关闭，仅 macOS daemon 可用。附加模式支持当前 tmux / Herdr 会话，尽量保持同一路 I/O/历史和飞书连续性；resume 模式会另起 CLI resume 进程，可能使飞书侧不再跟随该会话。',
+  'settings.enableLocalCliOpenHelp': '默认关闭，仅 macOS daemon 可用。附加模式支持当前 tmux / Herdr / ZMX 会话并进入同一个 CLI；ZMX 本地 attach 使用原生终端，飞书侧仍为纯文本流。resume 模式会另起 CLI resume 进程，可能使飞书侧不再跟随该会话。',
   'settings.localCliOpenMode': '本机 CLI 打开模式',
-  'settings.localCliOpenModeHelp': '默认附加当前会话：managed tmux / Herdr 走精确 attach，adopt 会话只在已有可靠目标时附加；direct resume 适合明确接受飞书连续性风险的本机调试。',
+  'settings.localCliOpenModeHelp': '默认附加当前会话：managed tmux / Herdr / ZMX 走精确 attach，adopt 会话只在已有可靠目标时附加；ZMX 的原生 attach 不代表 botmux 提供 Web TUI。direct resume 适合明确接受飞书连续性风险的本机调试。',
   'settings.localCliOpenModeAttach': '附加当前会话（推荐）',
   'settings.localCliOpenModeResume': '另起 CLI resume',
   'settings.autoUpdate': '每日自动更新',
@@ -1074,10 +1157,20 @@ export const messages: Record<string, string> = {
 
   // Quote hint (injected into the CLI prompt)
   'prompt.quote_hint': '[用户引用了消息 用 botmux quoted {id} 查看]',
+  // Topic context hint — prepended on the first turn of a 普通群 topic whose
+  // root is a different (earlier) message the bot never retained. It's a
+  // *hint*, not the transcript, and carries NO count (zero first-turn network
+  // probe): signals that prior topic context exists and points at
+  // `botmux history` for on-demand retrieval (thread-scope by default).
+  'prompt.topic_context': '[本条是话题内的回复，此话题在你之前已有前情消息（话题根 + 可能的其它回复），你没有留存。需要这些前情时用 `botmux history` 查看（默认读本话题；用 `--limit` 控制条数，`botmux quoted <消息id>` 取某条的附件）。]',
 
   // Markdown / contextual reply card chrome
   'card.you': '你',
   'card.sent_to': '发送给：',
+  'card.usage.context': '上下文',
+  'card.usage.tokens': 'Token',
+  'card.usage.turn': '本轮',
+  'card.usage.total': '累计',
 
   // Adopt preamble card title
   'card.adopt_last_round': '📜 /adopt 前最后一轮',
@@ -1094,8 +1187,14 @@ export const messages: Record<string, string> = {
   'trigger.external_event_clean': '外部事件触发',
 
   // Worker-side submit / notify messages
-  'worker.submit_impossible': '⚠️ 刚才那条消息没有写入 {cliName}，因为当前按键配置无法从终端自动提交。\n原因：{reason}\n请调整 Claude Code Chat keybinding 后重发。\n开头：{preview}',
+  'worker.submit_impossible': '⚠️ 刚才那条消息没有安全写入 {cliName}。\n原因：{reason}\n请处理上述原因并确认终端状态后再试。\n开头：{preview}',
   'worker.submit_unconfirmed': '⚠️ 刚才那条消息发给 {cliName} 后没能确认提交（重试 Enter 后等了 {secs}s 仍未在{transcriptLabel}里看到新记录）。可能卡在输入框里——请去 Web 终端看一下，手动按 Enter 或重发。\n开头：{preview}',
+  'worker.submit_unconfirmed_zmx': '⚠️ 刚才那条消息没能确认写入 {cliName}（等待 {secs}s 后仍无提交证据）。不要直接重发；请在本机运行 botmux list 进入该 ZMX 会话检查输入框。\n开头：{preview}',
+  'worker.zmx_recovery_pending': 'ZMX 控制面暂时无法确认会话身份，自动清理没有执行。不要直接重发；请在本机运行 botmux list 进入会话，检查并按 Ctrl+C 清空输入框，然后用 /restart 重启会话后再试。',
+  'worker.zmx_recovery_unconfirmed': 'ZMX 自动清理 Ctrl+C 的结果无法确认；为避免重复、拼接或截断输入，本会话已停止自动写入。不要直接重发；请在本机运行 botmux list 进入会话检查并手动清空输入框，然后用 /restart 重启会话后再试。',
+  'worker.interrupt_unconfirmed': '⚠️ 中断键 {key} 连续两次未送达 {cliName}，CLI 可能仍在运行；卡片不会把这次操作标成已停止。{recovery}',
+  'worker.interrupt_recovery_zmx': '请在本机运行 botmux list，进入该 ZMX 会话检查并手动中断；如果状态仍不确定，请用 /restart 重启会话。',
+  'worker.interrupt_recovery_web': '请重试，或打开 Web 终端后手动中断。',
   'worker.skill_delivery_failed': '⚠️ 当前 bot 的 Skill delivery 配置阻止了新会话启动：{reason}\n请把 skills.delivery 改为 auto/prompt，或改用支持 native skill delivery 的 CLI 后再重试。',
   'worker.coco_session_dir_gone': '⚠️ 当前 CoCo 进程的会话目录已被删除（可能是 e2e 测试清理或手动 rm），写到 events.jsonl 的内容会落到一个失效 inode 上，桥接读不到。请重启 CoCo 后重新 /adopt。',
 
@@ -1124,16 +1223,6 @@ export const messages: Record<string, string> = {
 
   // Auto-start (joined chat) member-read failure admin DM
   'daemon.auto_start_member_read_failed': '⚠️ botmux「被拉进新群自动开工」已开启，但读取群成员失败，无法判断群里是否有授权用户，自动开工被跳过。\n\n最可能原因：缺少读取群成员的权限（im:chat / 群信息读取），或没有订阅「机器人进群」事件 `im.chat.member.bot.added_v1`。\n\n请到飞书开放平台 → 应用 → 权限管理 / 事件订阅 里补齐，然后 `botmux restart`。\n\n错误详情：{detail}',
-
-  // Sandbox landing (/land) errors
-  'sandbox.no_clone': '该会话没有沙盒改动层（未开沙盒，或改动层已清理）',
-  'sandbox.clone_not_git': '沙盒改动层不可用，暂不支持落盘',
-  'sandbox.nothing_to_land': '没有改动可落盘',
-  'sandbox.target_not_git': '落盘目标目录不存在：{dir}',
-  'sandbox.apply_failed': '落盘失败：{detail}',
-  'sandbox.diff_failed': '读取沙盒改动失败：{detail}',
-  'sandbox.workingdir_not_found': '找不到会话 workingDir',
-  'sandbox.no_changes_left': '沙盒改动层已无改动',
 
   // ─── Dashboard 创建会话（createSession）─────────────────────────────────────
   'cmd.createSession.untitled': '新会话',

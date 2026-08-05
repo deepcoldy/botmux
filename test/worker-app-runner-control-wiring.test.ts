@@ -107,4 +107,22 @@ describe('worker app-runner control-channel wiring', () => {
     expect(queue.raw).toEqual(['/raw-held']);
     expect(workerSource).toContain('freshnessInputQueue.onReplacementFailed()');
   });
+
+  it('notifies preview observers when the MODERN appTurnId final branch suppresses on explicit botmux send', () => {
+    // Regression guard for F3: the modern Codex App (appTurnId) suppress branch
+    // must call notifyExplicitReplyObserved, symmetric with the legacy branch —
+    // otherwise a run-preview session shows "running" forever after the model's
+    // explicit botmux send. Anchor on identity.turnId (unique to the appTurnId
+    // branch; the legacy branch uses a bare `turnId`).
+    const appTurnBranch = workerSource.slice(workerSource.indexOf('if (marker.appTurnId) {'));
+    const suppressIdx = appTurnBranch.indexOf('final_output suppressed');
+    expect(suppressIdx).toBeGreaterThan(-1);
+    // Within the appTurnId suppress block, the very next observer notification
+    // must fire against identity.turnId before emitTurnTerminal returns.
+    const suppressBlock = appTurnBranch.slice(suppressIdx, suppressIdx + 600);
+    expect(suppressBlock).toMatch(/notifyExplicitReplyObserved\(\s*identity\.turnId/);
+    expect(suppressBlock).toContain('explicitReplyMarkerForTurnWindow(gateInput');
+    // Both final branches (legacy + modern) notify — never just one.
+    expect((workerSource.match(/notifyExplicitReplyObserved\(/g) ?? []).length).toBeGreaterThanOrEqual(2);
+  });
 });

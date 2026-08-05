@@ -7,6 +7,7 @@ import {
 } from './ui.js';
 import { CLI_OPTIONS } from '../../setup/bot-config-editor.js';
 import { sessionTerminalHref } from './session-terminal.js';
+import { copyText } from './clipboard.js';
 
 export function tokenCount(value: unknown): number | null {
   return typeof value === 'number' && Number.isFinite(value) ? value : null;
@@ -15,6 +16,89 @@ export function tokenCount(value: unknown): number | null {
 export function formatTokenCount(value: unknown): string {
   const n = tokenCount(value);
   return n === null ? '-' : n.toLocaleString('en-US');
+}
+
+export interface SessionExchangePreview {
+  userText: string;
+  userFullText: string;
+  botText: string;
+  botFullText: string;
+}
+
+function compactPreviewText(value: unknown, limit: number): string {
+  const text = String(value ?? '').replace(/\s+/g, ' ').trim();
+  if (!text) return '';
+  return text.length > limit ? `${text.slice(0, limit - 1)}…` : text;
+}
+
+/** Length-bound while preserving newlines — feeds the overlay, which renders
+ * Markdown. The single-line card summary keeps using compactPreviewText(). */
+function compactMultilinePreview(value: unknown, limit: number): string {
+  const text = String(value ?? '')
+    .replace(/\r\n?/g, '\n')
+    .replace(/[^\S\n]+\n/g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .replace(/^\n+/, '')
+    .replace(/\s+$/, '');
+  if (!text) return '';
+  return text.length > limit ? `${text.slice(0, limit - 1)}…` : text;
+}
+
+/** Latest user/bot exchange for a session card. A bot preview is shown only
+ * when it is newer than the latest user input; otherwise the card communicates
+ * the still-waiting state with the user line alone. */
+export function sessionExchangePreview(row: Record<string, any>): SessionExchangePreview {
+  const userFullText = compactMultilinePreview(
+    row.previewUserFullText
+      ?? row.previewUserText
+      ?? '',
+    4_000,
+  );
+  const botFullText = row.previewBotState === 'replied'
+    ? compactMultilinePreview(row.previewBotFullText ?? row.previewBotText ?? '', 4_000)
+    : '';
+  return {
+    userText: compactPreviewText(userFullText, 120),
+    userFullText,
+    botText: compactPreviewText(botFullText, 220),
+    botFullText,
+  };
+}
+
+/** Reducer backing the session-card preview overlay's open/focus state. The
+ * component drives its `useReducer` with these exact actions (not a parallel
+ * mirror), so this unit-tests the real transitions — in particular the
+ * Escape→refocus race: Escape closes the overlay AND returns focus to the
+ * trigger, whose `focus` action would otherwise reopen it in the same event, so
+ * `escape-refocus` arms a one-shot `suppressFocusOpen` that the immediately
+ * following `focus` consumes instead of opening. */
+export interface PreviewOverlayState {
+  open: boolean;
+  /** One-shot: the next trigger `focus` must NOT open (set by escape-refocus). */
+  suppressFocusOpen: boolean;
+}
+
+export type PreviewOverlayAction = 'open' | 'close' | 'focus' | 'escape-refocus' | 'toggle';
+
+export const previewOverlayInitialState: PreviewOverlayState = { open: false, suppressFocusOpen: false };
+
+export function previewOverlayReducer(state: PreviewOverlayState, action: PreviewOverlayAction): PreviewOverlayState {
+  switch (action) {
+    case 'open':
+      return { open: true, suppressFocusOpen: false };
+    case 'close':
+      return { open: false, suppressFocusOpen: false };
+    case 'toggle':
+      return { open: !state.open, suppressFocusOpen: false };
+    case 'focus':
+      // Consume the one-shot: a refocus armed by Escape does NOT reopen.
+      if (state.suppressFocusOpen) return { open: state.open, suppressFocusOpen: false };
+      return { open: true, suppressFocusOpen: false };
+    case 'escape-refocus':
+      return { open: false, suppressFocusOpen: true };
+    default:
+      return state;
+  }
 }
 
 // CLI 过滤选项从 setup 的单一事实源 CLI_OPTIONS 派生，新增 CLI 自动跟随，
@@ -302,17 +386,12 @@ export async function copySpawnCommand(s: any, btn?: HTMLButtonElement): Promise
       if (r.status !== 401) alert(`${t('sessions.copyCommandFail')}: ${body?.error ?? r.status}`);
       return;
     }
-    try {
-      await navigator.clipboard.writeText(body.command);
+    if (await copyText(body.command, t('sessions.copyCommand'))) {
       if (btn) {
         const prev = btn.textContent;
         btn.textContent = t('sessions.copyCommandDone');
         setTimeout(() => { if (prev !== null) btn.textContent = prev; }, 1500);
       }
-    } catch {
-      // Clipboard API unavailable (non-secure context) — fall back to a prompt
-      // so the user can still select + copy the command manually.
-      window.prompt(t('sessions.copyCommand'), body.command);
     }
   } catch (e) {
     alert(`${t('sessions.copyCommandFail')}: ${e}`);

@@ -584,6 +584,24 @@ describe('buildSessionsDetailCard (slice 2a)', () => {
       expect(json).toContain('Web 终端端口');
     });
 
+    it('terminal: ZMX → button disabled with an unsupported reason, not a temporary no-port hint', () => {
+      const detail = detailFor({
+        sessionId: 'sess_zmx',
+        status: 'idle',
+        backendType: 'zmx',
+        webPort: 7891,
+      });
+      const json = buildSessionsDetailCard(detail, baseOpts);
+      const parsed = JSON.parse(json);
+      const actionRow = (parsed.elements as any[]).find((e: any) => e.tag === 'action');
+      const terminalBtn = (actionRow.actions as any[])[1];
+
+      expect(terminalBtn.disabled).toBe(true);
+      expect(terminalBtn.multi_url).toBeUndefined();
+      expect(json).toContain('当前后端不提供 Web 终端');
+      expect(json).not.toContain('Web 终端端口');
+    });
+
     it('terminal: has webPort → button has multi_url, NOT disabled', () => {
       const detail = detailFor({ sessionId: 'sess_term', status: 'idle' });
       const json = buildSessionsDetailCard(detail, {

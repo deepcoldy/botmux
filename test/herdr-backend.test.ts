@@ -221,6 +221,35 @@ describe('HerdrBackend connection surface', () => {
     expect(herdrCall('session', 'delete', 'work')).toBeUndefined();
   });
 
+  it('killAgents() lists a shared host once and closes only selected live panes', () => {
+    setHerdrResponses([{
+      match: a => a.includes('agent') && a.includes('list'),
+      reply: () => JSON.stringify({ result: { agents: [
+        { name: 'botmux-one', pane_id: '4-1' },
+        { name: 'botmux-two', pane_id: '4-2' },
+        { name: 'botmux-exited', pane_id: '4-4', running: false },
+        { name: 'user-sibling', pane_id: '4-3' },
+      ] } }),
+    }]);
+
+    HerdrBackend.killAgents(
+      'work',
+      new Set(['botmux-one', 'botmux-two', 'botmux-exited', 'already-gone']),
+    );
+
+    const listCalls = mockedExecFileSync.mock.calls.filter(call => {
+      const args = (call[1] as string[]) ?? [];
+      return args.includes('agent') && args.includes('list');
+    });
+    expect(listCalls).toHaveLength(1);
+    expect(herdrCall('--session', 'work', 'pane', 'close', '4-1')).toBeDefined();
+    expect(herdrCall('--session', 'work', 'pane', 'close', '4-2')).toBeDefined();
+    expect(herdrCall('--session', 'work', 'pane', 'close', '4-3')).toBeUndefined();
+    expect(herdrCall('--session', 'work', 'pane', 'close', '4-4')).toBeUndefined();
+    expect(herdrCall('session', 'stop', 'work')).toBeUndefined();
+    expect(herdrCall('session', 'delete', 'work')).toBeUndefined();
+  });
+
   it('ensureServer skips boot poll when session already exists (no spawn, no sleep)', () => {
     setHerdrResponses([
       { match: a => a[0] === 'session' && a[1] === 'list', reply: () => EXISTING_SESSION_REPLY },

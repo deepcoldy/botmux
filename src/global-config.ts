@@ -56,6 +56,20 @@ export interface CodexNotifierGlobalConfig {
   notifyWhen?: CodexNotifierNotifyWhen;
 }
 
+export interface HostOverloadAlertGlobalConfig {
+  /** 机器级过载告警开关。缺省关闭。开启后由所选「通知 Bot」的 daemon 每 30s
+   *  采样整机 load/内存，越过过载线时给该 Bot 的管理员发飞书私信、恢复时再发一条。 */
+  enabled?: boolean;
+  /** 发送过载告警的 Bot App ID；启用时必须显式选择。只有该 Bot 自己的 daemon
+   *  会采样并发送(它就跑在本机),故无需跨 daemon 投递队列。 */
+  targetBotAppId?: string;
+  /** 进入过载的 load 阈值:load15 > cpuCount * 此值。缺省 1.5。退出线按固定
+   *  比例(95%)从它派生,保证 hysteresis(exit < enter)。 */
+  enterLoadRatio?: number;
+  /** 进入过载的已用内存占比阈值(0..1)。缺省 0.92。退出线同样按 95% 派生。 */
+  enterMemUsedFrac?: number;
+}
+
 export interface VcMeetingAgentGlobalConfig {
   /** Machine-wide VC meeting listener kill-switch. Missing means enabled for
    *  backwards compatibility; per-bot vcMeetingAgent.enabled still controls
@@ -90,6 +104,8 @@ export interface GlobalConfig {
   whiteboard?: WhiteboardConfig;
   /** Codex App/CLI 独立任务完成通知。机器级、默认关闭，由 Dashboard 管理。 */
   codexNotifier?: CodexNotifierGlobalConfig;
+  /** 机器过载告警。机器级、默认关闭，由 Dashboard 管理;走所选「通知 Bot」发送。 */
+  hostOverloadAlert?: HostOverloadAlertGlobalConfig;
   /** Machine-wide meeting listener kill-switch. Missing / enabled !== false
    *  preserves legacy behavior; set false to stop accepting new VC meetings
    *  and skip restore/readiness for this host. */
@@ -178,8 +194,9 @@ export interface DashboardGlobalConfig {
   openTerminalInFeishu?: boolean;
   /** Opt in to native "Open <CLI>" buttons on supported desktop hosts.
    *  Default false. When enabled, localCliOpenMode defaults to 'attach' so a
-   *  botmux-managed persistent backend attaches to the same I/O/history and
-   *  preserves Feishu continuity; 'resume' starts a separate CLI resume process
+   *  botmux-managed persistent backend enters the same underlying CLI and
+   *  preserves Feishu continuity. ZMX uses its native local terminal while
+   *  Feishu remains plain text; 'resume' starts a separate CLI resume process
    *  and may break that continuity. */
   enableLocalCliOpen?: boolean;
   /** How native "Open <CLI>" buttons launch on macOS. Missing defaults to
@@ -203,6 +220,20 @@ export interface DashboardGlobalConfig {
    *  see config.ts `codexRpcInputDefault`. A per-bot `codexRpcInput: true` still
    *  force-enables regardless of this global default. */
   codexRpcInput?: boolean;
+  /** Whether botmux auto-bypasses Codex's interactive hook-trust gate ("Press t
+   *  to trust") for Codex-family plain-TUI launches (codex / traex). Codex 0.14x
+   *  gates the botmux-installed ~/.codex/hooks.json behind a manual trust prompt,
+   *  and every botmux upgrade rewrites the hook script → its hash changes → the
+   *  gate re-fires; a botmux-managed pane has no human to press `t`, so the first
+   *  turn wedges. When enabled, the adapter passes `--dangerously-bypass-hook-trust`.
+   *  Default ON (ABSENT ⇒ ON — only an explicit `false` disables): a headless
+   *  fleet needs it to not wedge. This is a SEPARATE knob from the approval/sandbox
+   *  bypass: the flag trusts ALL hook sources codex sees (user/project/plugin), not
+   *  only botmux's, so an operator who does not want project/plugin `.codex/hooks.json`
+   *  auto-trusted can turn it off. Still ANDed with the per-bot `!disableCliBypass`
+   *  fail-closed lower bound (a restricted bot never gets it regardless). Read live
+   *  by the daemon — see config.ts `bypassCodexHookTrust`. */
+  bypassCodexHookTrust?: boolean;
   /** Experimental: inject the "no visible output" anti-resend guidance into the
    *  botmux routing hints. Counters Claude Code (≥2.1.212) thinking-only nudges
    *  that make a model resend after a silent `botmux send`-only turn. Default OFF
@@ -336,6 +367,10 @@ function readDashboard(raw: unknown): DashboardGlobalConfig | undefined {
   const herdrTraexPlugin = readHerdrTraexPlugin(d.herdrTraexPlugin);
   if (herdrTraexPlugin) out.herdrTraexPlugin = herdrTraexPlugin;
   if (typeof d.codexRpcInput === 'boolean') out.codexRpcInput = d.codexRpcInput;
+  // Round-trip an explicit boolean either way. Absent stays absent — the live
+  // getter (config.ts `bypassCodexHookTrust`) treats absent as ON, so we must
+  // preserve a stored `false` to let an operator disable it.
+  if (typeof d.bypassCodexHookTrust === 'boolean') out.bypassCodexHookTrust = d.bypassCodexHookTrust;
   if (typeof d.noVisibleOutputHint === 'boolean') out.noVisibleOutputHint = d.noVisibleOutputHint;
   return Object.keys(out).length > 0 ? out : undefined;
 }
@@ -374,6 +409,31 @@ function readCodexNotifier(raw: unknown): CodexNotifierGlobalConfig | undefined 
   }
   if (value.notifyWhen === 'locked_only' || value.notifyWhen === 'always') {
     out.notifyWhen = value.notifyWhen;
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
+function readHostOverloadAlert(raw: unknown): HostOverloadAlertGlobalConfig | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const value = raw as Record<string, unknown>;
+  const out: HostOverloadAlertGlobalConfig = {};
+  if (typeof value.enabled === 'boolean') out.enabled = value.enabled;
+  if (typeof value.targetBotAppId === 'string' && value.targetBotAppId.trim()) {
+    out.targetBotAppId = value.targetBotAppId.trim();
+  }
+  // Enter thresholds: keep only sane, finite, positive values; the resolver
+  // (daemon side) layers env > config > default and derives the exit lines with
+  // hysteresis, so a missing/garbage value here just falls through to defaults.
+  if (typeof value.enterLoadRatio === 'number' && Number.isFinite(value.enterLoadRatio) && value.enterLoadRatio > 0) {
+    out.enterLoadRatio = value.enterLoadRatio;
+  }
+  if (
+    typeof value.enterMemUsedFrac === 'number'
+    && Number.isFinite(value.enterMemUsedFrac)
+    && value.enterMemUsedFrac > 0
+    && value.enterMemUsedFrac <= 1
+  ) {
+    out.enterMemUsedFrac = value.enterMemUsedFrac;
   }
   return Object.keys(out).length > 0 ? out : undefined;
 }
@@ -451,6 +511,8 @@ export function readGlobalConfig(): GlobalConfig {
   if (whiteboard) out.whiteboard = whiteboard;
   const codexNotifier = readCodexNotifier(raw.codexNotifier);
   if (codexNotifier) out.codexNotifier = codexNotifier;
+  const hostOverloadAlert = readHostOverloadAlert(raw.hostOverloadAlert);
+  if (hostOverloadAlert) out.hostOverloadAlert = hostOverloadAlert;
   const vcMeetingAgent = readVcMeetingAgent(raw.vcMeetingAgent);
   if (vcMeetingAgent) out.vcMeetingAgent = vcMeetingAgent;
   if (typeof raw.httpProxy === 'string' && raw.httpProxy.trim()) out.httpProxy = raw.httpProxy.trim();
@@ -585,6 +647,20 @@ export function writeCodexNotifierConfig(config: CodexNotifierGlobalConfig): Cod
   delete existing.notifyWhen;
   mergeGlobalConfig({ codexNotifier: { ...existing, ...config } as CodexNotifierGlobalConfig });
   return readGlobalConfig().codexNotifier ?? {};
+}
+
+/** 写入机器过载告警的完整已知配置，同时保留配置块内的未来字段。 */
+export function writeHostOverloadAlertConfig(config: HostOverloadAlertGlobalConfig): HostOverloadAlertGlobalConfig {
+  const raw = readRawConfig();
+  const existing = raw.hostOverloadAlert && typeof raw.hostOverloadAlert === 'object' && !Array.isArray(raw.hostOverloadAlert)
+    ? { ...raw.hostOverloadAlert as Record<string, unknown> }
+    : {};
+  delete existing.enabled;
+  delete existing.targetBotAppId;
+  delete existing.enterLoadRatio;
+  delete existing.enterMemUsedFrac;
+  mergeGlobalConfig({ hostOverloadAlert: { ...existing, ...config } as HostOverloadAlertGlobalConfig });
+  return readGlobalConfig().hostOverloadAlert ?? {};
 }
 
 /** Merge only the maintenance sub-config, preserving unknown sibling keys.

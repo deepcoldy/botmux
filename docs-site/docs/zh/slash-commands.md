@@ -1,6 +1,6 @@
 # 斜杠命令
 
-在话题里直接发这些命令即可，由 daemon 拦截处理。botmux 不认识的 `/xxx` 会**原样透传**给底层 CLI（与 CLI 自身的 slash 命令互不冲突）。随时发 `/help` 查看完整清单。
+在话题里直接发这些命令即可，由 daemon 拦截处理。只有[透传章节](#-透传给底层-cli)里白名单内的命令会**原样透传**给底层 CLI；其余 daemon 不认识的 `/xxx` 会被当作普通对话文本按普通消息转发。随时发 `/help` 查看完整清单。
 
 ## 📌 会话管理
 
@@ -13,8 +13,14 @@
 | `/status` | 查看会话信息（运行时间、终端地址等） |
 | `/restart` | 重启 CLI 进程（保留 session 上下文） |
 | `/close` | 关闭会话并发送可恢复卡片（含 CLI 自身 resume 命令） |
+| `/fork --create <群名>` | 把当前会话「分身」一份到新建群（源会话原样保留继续），分身带完整上下文（仅 Claude 系 / Codex 终端模式） |
+| `/rename <标题>` | 重命名当前 Botmux 会话，并同步运行中的 Codex/Claude 原生会话名 |
 | `/card` | 手动召唤当前会话的流式卡片（关流式时也能召唤并恢复实时刷新；私密卡片模式下改发仅授权人可见的静态快照） |
+| `/term` | 获取当前会话的「可操作终端」（带写权限）链接，私密发给 owner（群内仅你可见，话题/单聊回退私信，不在群里暴露） |
+| `/dashboard [模块]` | 在飞书里打开 Dashboard 控制卡片（sessions/schedules/groups/settings/help 等） |
 | `/insight` | owner 专用：在当前会话即时回一张「本会话洞察摘要」卡片（聚合指标 + 规则建议；动作 span 明细 / 逐轮对账 / 对话回放在 Dashboard「洞察」页看） |
+| `/vc prepare <会议链接或会议号>` | 将当前普通群设为会议准备群，并在开会后复用同一 Agent 会话 |
+| `@机器人 /summary` | 读取当前话题（或普通群配置范围内）的历史消息并生成总结（默认最近 50 条 / 24 小时） |
 | `/t <prompt>` `/topic <prompt>` | 普通群内强制开新话题 |
 
 ## 💬 回复模式（`/reply-mode`）
@@ -26,8 +32,8 @@
 | 命令 | 说明 |
 |------|------|
 | `/reply-mode` `/reply-mode status` | 查看当前私聊会话模式 |
-| `/reply-mode chat` | 每个 1:1 私聊内部扁平连续会话（同一 DM 的消息共用一个会话） |
-| `/reply-mode topic` `/reply-mode new-topic` | 每条**顶层** DM 开独立会话/线程（默认）；同一已有 thread 内的回复继续该 thread 会话 |
+| `/reply-mode chat` | 每个 1:1 私聊内部扁平连续会话，同一 DM 的消息共用一个会话（**默认**） |
+| `/reply-mode topic` `/reply-mode new-topic` | 每条**顶层** DM 开独立会话/线程；同一已有 thread 内的回复继续该 thread 会话 |
 
 `shared` / `chat-topic` 依赖群内原生话题，私聊不支持，会被拒绝。
 
@@ -43,9 +49,11 @@
 
 群级设置会覆盖 dashboard「Bot 配置 → 普通群模式」的默认值。
 
+`/substitute [status|on|off]` —— 查看或切换当前群的**替身模式**开关（修改需 owner）。
+
 ## 🔀 透传给底层 CLI
 
-`/compact` `/model` `/clear` `/plugin` `/usage` `/new` `/context` `/cost` `/mcp` `/diff` `/code-review` `/security-review` `/review` `/btw` —— 字面送达底层 CLI，交给它的内置命令处理。
+`/compact` `/model` `/clear` `/plugin` `/usage` `/new` `/context` `/cost` `/mcp` `/diff` `/code-review` `/security-review` `/review` `/btw` `/effort` —— 字面送达底层 CLI，交给它的内置命令处理。
 
 部分 CLI 还有 adapter 默认放行的命令：Claude Code / Codex 默认放行 `/goal`，因此新话题第一条发 `/goal ...` 也会先启动/选择仓库，再把 `/goal ...` 原样投给 CLI。
 
@@ -68,6 +76,7 @@
 |------|------|
 | `/adopt` | 扫描本机 tmux，弹卡片选择要接入的已运行会话 |
 | `/adopt <tmux_pane>` | 直接接入指定 pane（如 `/adopt 0:2.0`） |
+| `/detach` | 断开本话题与 adopt 会话的桥接（原 CLI 不受影响，`/disconnect` 同义） |
 
 ## 🔐 用户授权
 
@@ -113,6 +122,17 @@
 |------|------|
 | `@机器人 /grant @某人` | 授权对方在本群对话；`/grant`（不带人）则授权**本群所有成员**对话 |
 | `@机器人 /revoke @某人` | 撤销对方本群对话权；`/revoke`（不带人）撤销整群授权 |
+| `/vc-auth @成员` | 会议监听中临时授权本场指令源；`/vc-auth revoke @成员` 撤销；`/vc-auth list` 查看 |
+
+## ⚙️ 远程改配置 & 技能（owner 专用）
+
+写盘即热更新，无需重启。
+
+| 命令 | 说明 |
+|------|------|
+| `/botconfig get` | 查看本机器人当前运营配置 |
+| `/botconfig set <字段> <值>` | 改 model/cli/lang/开关等；`/botconfig help` 看全部字段 |
+| `/skills ...` | 查看/管理本 bot 的技能策略（`attach`/`detach` 需 owner） |
 
 ## 🆕 一键新建会话群
 
@@ -135,8 +155,10 @@
 | 命令 | 说明 |
 |------|------|
 | `/workflow <目标>`（= `/workflow new <目标>`） | 发起**即兴 workflow**：bot 拷问澄清需求 → 自动编排成 DAG → 你确认后并发跑完，风险节点执行期弹审批卡 |
-| `/template run <id> [key=value ...]` | 跑一个已存好的 workflow 模板（旧 `/workflow run` 已改名为此） |
-| `/template cancel <runId>` | 取消一个模板 run（旧 `/workflow cancel` 已改名为此） |
+| `/workflow run <名称> [key=value ...]` | 运行一个 Saved Workflow |
+| `/workflow save last [名称]` · `/workflow list\|show\|cancel` | 保存 / 列出 / 查看 / 取消 workflow（v2 资产仅支持离线 `migrate-v3` / `archive-runs`） |
+
+> 旧的 `/template run|cancel` 已退役；现在发 `/template` 只返回退役提示。
 
 详见 [Workflow](/workflow)。
 

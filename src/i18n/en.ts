@@ -37,6 +37,7 @@ export const messages: Record<string, string> = {
   'card.status.limited': 'Limit reached',
   'card.status.retry_ready': 'Ready to retry',
   'card.status.executing': 'Executing…',
+  'card.status.failed': 'Failed',
   'card.status.session_closed': '🛑 Session Closed',
   'card.status.relay_frozen': '🔄 Relayed away',
   'card.status.selected': 'Selected',
@@ -56,6 +57,7 @@ export const messages: Record<string, string> = {
   'card.usage_limit.retry_at': '⚠️ {cliName} usage limit has been reached. Try again after {retryLabel}.',
   'card.usage_limit.retry_ready': '✅ {cliName} usage limit should have reset. Retry the last task, or send a new message.',
   'card.private.snapshot_note': '🔒 Private static snapshot (visible only to you, not live-updating). Tap Open Web Terminal for the live view.',
+  'card.private.snapshot_note_no_terminal': '🔒 Private static snapshot (visible only to you, not live-updating). This backend does not provide a Web Terminal.',
 
   // ─── Repo select card ────────────────────────────────────────────────────
   'card.repo.title': '📁 Project Repository',
@@ -87,9 +89,20 @@ export const messages: Record<string, string> = {
   'card.grant.btn_chat': 'Grant talk in this chat',
   'card.grant.btn_global': 'Grant talk globally',
   'card.grant.btn_deny': 'Deny',
-  'card.grant.note': 'Grants talk access only (this chat or global); /restart, /close, terminal write and other sensitive ops remain limited to allowedUsers (owner).',
+  'card.grant.duration_label': 'Expires after',
+  'card.grant.duration_3600000': '1 hour',
+  'card.grant.duration_28800000': '8 hours',
+  'card.grant.duration_86400000': '1 day',
+  'card.grant.duration_604800000': '7 days',
+  'card.grant.duration_permanent': 'Never',
+  'card.grant.quota_label': 'Message quota',
+  'card.grant.quota_placeholder': 'Blank means unlimited',
+  'card.grant.note': 'Access is revoked when either limit is reached. Grants talk access only (this chat or global); /restart, /close, terminal write and other sensitive ops remain limited to allowedUsers (owner).',
   'card.grant.toast_owner_only': 'Only the owner can do this',
   'card.grant.toast_expired': 'This request has expired',
+  'card.grant.toast_bad_limit': 'Invalid grant limit',
+  'card.grant.toast_bad_quota': 'Enter a whole-number message quota from 1 to 1000, or leave it blank for unlimited',
+  'card.grant.toast_limit_staged': 'Limit updated; it takes effect after you grant access',
   'card.grant.toast_no_repo_perm': 'No permission',
   'card.grant.toast_failed': 'Grant failed: {reason}',
   'card.grant.result_chat': '✅ Granted for this chat',
@@ -99,6 +112,9 @@ export const messages: Record<string, string> = {
   'card.grant.notify_chat': '✅ {at} can now use me in this chat — just @-mention me.',
   'card.grant.notify_global': '✅ {at} now has global access — @-mention me in any chat.',
   'card.grant.notify_quota_suffix': ' (message quota: {n}; access is revoked once used up)',
+  'card.grant.notify_expiry_suffix': ' (expires at {time})',
+  'card.grant.result_expiry': 'Expires at: {time}',
+  'card.grant.result_quota': 'Message quota: {n}',
 
   // Message quota exhausted
   'quota.exhausted_notify': '⚠️ {at} has used up their message quota ({limit}/{limit}); talk access has been revoked. Ask the owner to /grant again to continue.',
@@ -109,7 +125,7 @@ export const messages: Record<string, string> = {
   // /grant, /revoke command replies
   'cmd.grant.owner_only': 'Only the owner can use /grant.',
   'cmd.grant.usage': 'Usage: @bot /grant @someone [N] (let them talk to me in this chat — you can @ several people/bots at once; with a number, grants an N-message quota) | @bot /grant (let every member of this chat talk). Talk-only; sensitive ops stay governed by allowedUsers.',
-  'cmd.grant.bad_quota': '⚠️ Bad quota. Usage: @bot /grant @someone 5 (grant a 5-message quota; must be a positive integer). Omit the number to use the default quota / unlimited.',
+  'cmd.grant.bad_quota': '⚠️ Bad quota. Usage: @bot /grant @someone 5 (grant a 5-message quota; must be a positive integer). Omit the number to use the card default.',
   'cmd.grant.chat_done': '✅ Everyone in this chat can now talk to me (just @-mention me). Sensitive ops still limited to allowedUsers.',
   'cmd.grant.chat_already': 'ℹ️ This chat is already open to talk; nothing to do.',
   'cmd.grant.chat_failed': '⚠️ Grant failed: {reason}',
@@ -130,6 +146,17 @@ export const messages: Record<string, string> = {
   'cmd.revoke.multi_would_open': '⚠️ {name} — skipped: last global allowed user / owner, revoking would open the bot to everyone',
   'cmd.revoke.multi_failed': '⚠️ {name} — revoke failed: {reason}',
 
+  // /invite (pull an out-of-chat bot into this chat, owner only)
+  'cmd.invite.owner_only': '⚠️ Only the owner can use /invite.',
+  'cmd.invite.p2p': '⚠️ Bots cannot be added in a DM — use /invite inside a group chat.',
+  'cmd.invite.usage': 'Usage: @me /invite @bot-to-add (multiple allowed), or @me /invite --app cli_xxx',
+  'cmd.invite.header': '🤝 /invite results:',
+  'cmd.invite.ok': '✅ Added to the chat: {names}',
+  'cmd.invite.already': '⏭️ Already in the chat (skipped): {names}',
+  'cmd.invite.unresolved': '⚠️ Could not resolve (not in local or team rosters — use --app cli_xxx): {names}',
+  'cmd.invite.ambiguous_item': '⚠️ The name "{name}" matches multiple bots ({apps}) — use --app to pick one.',
+  'cmd.invite.failed_item': '❌ Failed to add: {name} — {reason}',
+
   // ─── Adopt card ──────────────────────────────────────────────────────────
   'card.adopt.title': '📡 Choose a CLI session to adopt',
   'card.adopt.placeholder_select': 'Pick a CLI session',
@@ -137,6 +164,29 @@ export const messages: Record<string, string> = {
   'card.adopt.section_live': '**Take over a running session** (observe a live tmux / herdr / zellij process)',
   'card.adopt.section_resume': '**Resume a past session** (import from disk via --resume; no live process needed)',
   'card.adopt.placeholder_resume': 'Pick a past session to resume',
+  // V2 picker (search + card list + pagination), replacing the two dropdowns.
+  'card.adopt.search_placeholder': '🔍 Search sessions (title / project / path / session id)',
+  'card.adopt.empty': 'No sessions available to adopt.\n(Running: local CLIs live in tmux / zellij / herdr; History: sessions of this bot’s CLI resumable from disk.)',
+  'card.adopt.empty_filtered': 'No sessions match “{query}”. Try another keyword.',
+  'card.adopt.kind_live': '🟢 Running',
+  'card.adopt.kind_resume': '🕘 History',
+  'card.adopt.field_kind': 'Source',
+  'card.adopt.field_cli': 'CLI',
+  'card.adopt.field_dir': 'Path',
+  'card.adopt.field_session': 'Session ID',
+  'card.adopt.field_time_live': 'Uptime',
+  'card.adopt.field_time_resume': 'Last active',
+  'card.adopt.field_target': 'Location',
+  'card.adopt.selected_tag': 'selected',
+  'card.adopt.hint_pick_first': 'Click any session above to select it, then click the button below to adopt.',
+  'card.adopt.btn_confirm_live': 'Take over into this topic',
+  'card.adopt.btn_confirm_resume': 'Resume into this topic',
+  'card.adopt.session_unknown': '(not detected)',
+  'card.adopt.truncated': '⚠️ Many past sessions; showing only the {limit} most recent. Use the search box to narrow down.',
+  'card.adopt.toast_not_invoker': 'This menu was summoned by someone else; send /adopt to get your own.',
+  'card.adopt.toast_no_perm': 'You don’t have permission to operate this session.',
+  'card.adopt.toast_missing_value': 'Card state missing; please resend /adopt.',
+  'card.adopt.toast_no_session': 'No active session in this topic; please resend /adopt.',
   'card.codex_app_thread.title': '📱 Choose a Codex App conversation',
   'card.codex_app_thread.subtitle': 'Resume an existing local Codex App thread. botmux will continue it through the app-server protocol.',
   'card.codex_app_thread.placeholder_select': 'Pick a Codex App conversation',
@@ -196,6 +246,7 @@ export const messages: Record<string, string> = {
   'cmd.card.operator_only': '⚠️ Only authorized users (allowedUsers) can use /card.',
   'cmd.term.operator_only': '⚠️ Only authorized users (allowedUsers) can use /term to get the operable terminal link.',
   'cmd.term.no_session': 'No active session in this topic — /term needs a running session.',
+  'cmd.term.unsupported': 'This session backend does not provide a Web Terminal. For ZMX, run botmux list or zmx attach locally.',
   'cmd.term.not_ready': '🔒 Terminal isn’t ready yet; send /term again once the session is up.',
   'cmd.term.failed': '⚠️ Failed to send the operable link (both the private card and DM failed); check the daemon logs.',
   'cmd.term.sent_dm': '🔑 Sent the operable terminal link to your DM (kept out of the group).',
@@ -225,9 +276,11 @@ export const messages: Record<string, string> = {
   'cmd.substitute.updated_off': '✅ Substitute mode disabled for this group.',
   'cmd.substitute.unsupported': '⚠️ /substitute only works in group chats (regular or topic groups).',
   'cmd.substitute.topic_disabled': '⚠️ Substitute mode for topic groups is disabled in this bot configuration; the per-group switch cannot enable it.',
+  'cmd.substitute.blocked': '⚠️ This group is on the substitute block-list in the bot configuration; substitute never fires here and /substitute on cannot enable it.',
   'cmd.substitute.owner_only': '⚠️ Only owner/allowedUsers can change substitute mode.',
   'cmd.substitute.usage': 'Usage: @me /substitute status | on | off',
   'cmd.restart.in_progress': '🔄 Restarting {cliName}…',
+  'cmd.session.transfer_in_progress': '⚠️ This session is being relayed. Try again after the transfer finishes.',
   'cmd.restart.succeeded': '✅ {cliName} is ready again.',
   'cmd.restart.failed': '❌ Failed to restart {cliName}.',
   'cmd.restart.timed_out': '⌛ {cliName} restart timed out before becoming ready.',
@@ -262,6 +315,7 @@ export const messages: Record<string, string> = {
   'cmd.repo.card_already_consumed': '✅ Repo already selected — please ignore the old card',
   'cmd.repo.worktree_created_not_switched': '🌿 Worktree created: `{path}` (branch `{branch}`), but the session changed meanwhile — not switched automatically. Use `/repo {path}` to open it.',
   'cmd.repo.worktree_switch_failed': '⚠️ Worktree created at `{path}`, but switching to it failed: {error}\nUse `/repo {path}` to open it manually.',
+  'cmd.repo.switch_close_failed': '⚠️ Could not safely close the current session; repository was not switched: {error}',
   // Used when 「default-directory-only」mode has「auto-create worktree」on, at new
   // session start (shared by interactive new topic / dashboard create / webhook).
   'worktree.auto_creating': '🌿 Creating an isolated worktree for this session (includes a git fetch, may take a few seconds)…',
@@ -337,6 +391,8 @@ export const messages: Record<string, string> = {
   'cmd.adopt.pane_not_found': 'tmux pane not found: {pane}',
   'cmd.adopt.target_exited': '⚠️ Target CLI session has exited.',
   'cmd.adopt.sandbox_blocked': '🛡️ This bot has the file sandbox enabled and cannot /adopt an already-running CLI (a sandbox can only be applied at spawn time, never retro-fitted around a live process). Just send a message to cold-start a new, sandboxed CLI session instead.',
+  'card.adopt_blocked.title': '⚠️ Cannot adopt: close the current session first',
+  'card.adopt_blocked.body': 'This topic is still waiting for you to pick a repository, so it cannot /adopt an already-running CLI directly.\n\nTap "Close session" below to end the pending repo-select session, then run /adopt again to attach your CLI (your original CLI is left untouched).',
   'cmd.adopt.success': '📡 Adopted {cliName} · {project} ({pane})',
   'cmd.adopt.resume_success': '↩️ Resumed {cliName} session · {project} — “{title}”',
   'cmd.adopt.resume_not_found': '⚠️ That past session no longer exists or is already in use ({id})',
@@ -394,6 +450,7 @@ export const messages: Record<string, string> = {
   'card.config.p2p.thread': '🧵 thread (separate session/DM)',
   'card.config.p2p.chat': '💬 chat (continuous session, default)',
   'config.label.disableStreamingCard': 'Disable live card',
+  'config.label.usageDisplay': 'Usage display',
   'config.label.silentTurnReactions': 'Disable status reactions',
   'config.label.writableTerminalLinkInCard': 'Writable terminal in card',
   'config.label.privateCard': 'Private snapshot card',
@@ -464,6 +521,22 @@ export const messages: Record<string, string> = {
   'cmd.relay.report_peer_failed': '• {bot} — relay failed: {error}',
   'cmd.relay.failed': '⚠️ /relay --create failed: {error}',
 
+  // ─── /fork (session clone) ─────────────────────────────────────────────────
+  'cmd.fork.no_bot': '⚠️ Could not determine the bot identity, /fork cancelled.',
+  'cmd.fork.no_sender': '⚠️ Could not resolve sender open_id, /fork cancelled.',
+  'cmd.fork.no_session': '⚠️ /fork must be invoked inside a thread with an existing session.',
+  'cmd.fork.no_source_here': '⚠️ No active session to fork here. Invoke /fork **inside the thread the session lives in** (the topic where you normally @ the bot), not at the group top level.',
+  'cmd.fork.not_owner': '⚠️ Only the session owner can fork it.',
+  'cmd.fork.wrong_bot': '⚠️ Fork can only clone the current session to **this same bot** (the clone must run the same CLI). No need to @ another bot; just `/fork --create <new group name>` — it defaults to the current bot.',
+  'cmd.fork.unsupported_backend': 'ℹ️ The current {cli} session does not support fork yet (only Claude family / Codex terminal mode; Codex App, RPC-enabled Codex, and pure-remote backends run an app-server live session with no byte-level copy).',
+  'cmd.fork.mid_turn': '⚠️ The session is mid-turn and cannot be forked. Wait until it is idle, then /fork.',
+  'cmd.fork.not_started_yet': '⚠️ The session has not really started (no repo / CLI not up / no context) and cannot be forked.',
+  'cmd.fork.adopt_not_forkable': '⚠️ This session was adopted from an external CLI and cannot be forked.',
+  'cmd.fork.created': '✅ Created group "{name}" and forked a clone (the source session is left running untouched)\n👉 {link}\n\nThe clone carries the full context at fork time — go to the new group and @ the bot to continue.',
+  'cmd.fork.failed': '⚠️ /fork --create failed: {error}',
+  'cmd.fork.picker_pending': 'ℹ️ Forking in place isn\'t supported in this group. Use `/fork --create <new group name> @bot` — it creates a new group and forks a clone of the current session into it, leaving the source untouched. (Creating a Branch in place, in this group, is coming later.)',
+  'cmd.fork.orphan_group_left': '⚠️ Fork did not succeed, but the new group "{name}" was already created (auto-disband failed, likely because ownership was transferred to you). You can delete this empty group manually.',
+
   // ─── /schedule ───────────────────────────────────────────────────────────
   'schedule.empty_with_examples': 'No scheduled tasks yet.\n\nExamples:\n/schedule daily 17:50 summarize today\'s AI news\n/schedule weekdays 9:00 check service status\n/schedule mondays 10:00 generate weekly report',
   'schedule.list_header': 'Scheduled tasks ({count}):',
@@ -498,7 +571,6 @@ export const messages: Record<string, string> = {
   'help.term': '/term       - Get the operable (write-enabled) terminal link for this session, delivered privately to the owner (visible-to-you in-chat, falling back to DM in topic/p2p — never exposed in the group)',
   'help.dashboard': '/dashboard [module] - Open Dashboard control cards in Feishu (sessions/schedules/groups/settings/help, etc.)',
   'help.insight': '/insight    - Show tool-call summary and risk suggestions for this session (operators only)',
-  'help.land': '/land       - Preview sandbox-session diffs and let the owner confirm applying them to disk',
   'help.subscribe_doc': '/subscribe-lark-doc <doc link|list|off> - Subscribe through the Feishu API (requires a doc-scoped User Token)',
   'help.watch_comment': '/watch-comment <doc link|list|off> - Watch doc comments and post AI replies back into their threads',
   'help.vc': '/vc prepare <meeting link or number> - Use the current regular group as a preparation chat and reuse the same Agent session during the meeting',
@@ -519,6 +591,7 @@ export const messages: Record<string, string> = {
   'help.introduce': '/introduce          - Register the bots in this chat with each other by open_id for precise collaboration mentions',
   'help.relay': '/relay              - Pick a live session from another chat/topic and relay it into the current chat/topic',
   'help.relay_create': '/relay --create [name] - Create a collaboration group and relay the current session there (mention target bots in a group; in a DM just send it — new group = you + this bot)',
+  'help.fork': '/fork --create <name>  - Clone the current session into a freshly-created group (the source session keeps running untouched); the clone carries full context (Claude family / Codex terminal only)',
   'help.heading_login': '🔐 User OAuth:',
   'help.login': '/login              - Lark user OAuth (lets you download images etc. from third-party cards)',
   'help.login_status': '/login status       - Show auth status',
@@ -540,6 +613,7 @@ export const messages: Record<string, string> = {
   'help.grant': '@bot /grant @someone   - Let them talk in this chat (you can @ several at once); /grant (no target) opens the whole chat to talk',
   'help.revoke': '@bot /revoke @someone  - Revoke their talk access (you can @ several at once); /revoke (no target) revokes the whole-chat grant',
   'help.vc_auth': '/vc-auth @someone     - Temporarily trust an in-meeting instruction source; /vc-auth revoke @someone revokes; /vc-auth list shows current grants',
+  'help.invite': '@bot /invite @bot   - Pull an out-of-chat bot into this chat (multiple allowed; --app cli_xxx adds by app id)',
   'help.heading_config': '⚙️ Edit config remotely (owner only; written + hot-applied, no restart):',
   'help.config_get': '/botconfig get  - Show this bot\'s current operational config',
   'help.config_set': '/botconfig set <field> <value>  - Change model/cli/lang/toggles; /botconfig help for all fields',
@@ -681,6 +755,7 @@ export const messages: Record<string, string> = {
   'card.action.resume_anchor_holder': ' (holder: {short})',
   'card.action.resume_adopt_unsupported': '⚠️ Adopted sessions cannot be resumed.',
   'card.action.resume_deferred_unmaterialized': '⚠️ This silent scheduled run never created a topic. Its hidden session is audit-only and cannot be resumed.',
+  'card.action.resume_cancelled': '⚠️ The session was closed while resume was committing; resume was cancelled.',
   'card.action.disconnected': '⏏ Disconnected. The original CLI is untouched.',
   'card.voice.toast_wait': '🔊 Generating a voice summary, hang tight…',
   'card.voice.toast_already': '🔊 A voice summary for this reply is already on the way.',
@@ -690,8 +765,9 @@ export const messages: Record<string, string> = {
   'card.voice.user_message': 'Generate a voice summary',
   'card.action.takeover_retired': '⚠️ The old "Take Over" button is retired. In bridge mode, botmux bridges the original CLI so replies still come back to Lark — no takeover needed. Full takeover (`/adopt --takeover`) is on the roadmap.',
   'card.action.terminal_not_ready': '⚠️ Terminal is not ready yet, please try again shortly.',
+  'card.action.terminal_unsupported': '⚠️ This session backend does not provide a Web Terminal. For ZMX, run `botmux list` or `zmx attach` locally.',
   'card.action.local_terminal_opened': '💻 Requested opening local {cliName}.',
-  'card.action.local_terminal_unsupported': '⚠️ This {cliName} session cannot be opened locally yet. Use Web Terminal instead.',
+  'card.action.local_terminal_unsupported': '⚠️ This {cliName} session cannot be opened locally yet. Use a terminal access method supported by this backend.',
   'card.action.local_cli_missing': '⚠️ Could not find the local {cliName} executable ({executable}). Install it or configure PATH / cliPathOverride.',
   'card.action.local_terminal_failed': '⚠️ Failed to open local CLI: {reason}',
   'card.action.local_terminal_no_permission': '🔒 You do not have operate permission, so you cannot open the local CLI.',
@@ -709,6 +785,7 @@ export const messages: Record<string, string> = {
   'card.action.tui_select_title': 'Select options',
   'card.action.tui_custom_input': 'Custom input',
   'card.action.tui_done': 'Done',
+  'card.action.tui_ipc_failed': '⚠️ The TUI action was not sent; the worker may be unavailable. Please try again.',
   'card.action.continue_using_current_repo': 'Keeping current repo: {cwd}',
   'card.action.retry_last_task_missing': '⚠️ Cannot find the last task to retry. Send a new message instead.',
   'card.action.retry_last_task_unavailable': '⚠️ This retry state is no longer active. Send a new message instead.',
@@ -721,6 +798,11 @@ export const messages: Record<string, string> = {
   'worker.crash_recent_output': 'Recent terminal output:',
   'worker.start_failed': '⚠️ The {cliName} session failed to start: {reason}\nCheck the Agent/backend settings in Dashboard and the installation environment on the daemon host, then resend your message to retry.',
   'worker.start_exited_early': 'The worker exited before becoming ready (exit code: {code}); see the Botmux logs for details.',
+  'worker.tui_submit_failed': '⚠️ The TUI answer could not be confirmed as delivered to {cliName}. The CLI may still be waiting for input; open the local terminal or send a new message to recover.',
+  'worker.raw_input_failed': '⚠️ The slash command could not be confirmed as delivered to {cliName}, so the follow-up text in the same message was not submitted. Check the terminal state, then resend.',
+  'worker.raw_input_failed_command_only': '⚠️ The slash command could not be confirmed as delivered to {cliName}. Check the terminal state, then resend.',
+  'worker.raw_input_failed_recovery': '⚠️ The slash command could not be confirmed as delivered to {cliName}, so the follow-up text in the same message was not submitted.\nReason: {reason}',
+  'worker.raw_input_failed_command_only_recovery': '⚠️ The slash command could not be confirmed as delivered to {cliName}.\nReason: {reason}',
   'worker.empty_final_completed': '⚠️ {cliName} reported this turn as completed, but botmux captured no final text from the terminal transcript and saw no tracked reply for this turn. If you already replied via a redirected send (--top-level / --into / --override-chat), you can ignore this. Otherwise open the web terminal to inspect the last output, or resend a message to continue the session.',
 
   // ─── CLI setup wizard / pm2 lifecycle (no per-bot context) ───────────────
@@ -842,6 +924,7 @@ export const messages: Record<string, string> = {
   'card.dashboard.sessions.confirm.resume.title': 'Resume this session?',
   'card.dashboard.sessions.confirm.resume.text': 'Resume will recreate the worker and continue the session. Session: {title}',
   'card.dashboard.sessions.terminal.disabled.noPort': 'Web Terminal port is not available (not started or already closed)',
+  'card.dashboard.sessions.terminal.disabled.unsupported': 'This backend does not provide a Web Terminal',
   'card.dashboard.sessions.resume.disabled.onlyClosed': 'Only closed sessions can be resumed',
 
   // schedules card (PR3 slice 1)
@@ -1025,9 +1108,9 @@ export const messages: Record<string, string> = {
   'settings.openTerminalInFeishu': 'Open Web Terminal in Feishu',
   'settings.openTerminalInFeishuHelp': 'Terminal links open in the Feishu in-app webview by default.',
   'settings.enableLocalCliOpen': 'Enable native CLI opening',
-  'settings.enableLocalCliOpenHelp': 'Off by default and available only when the daemon runs on macOS. Attach mode supports current tmux / Herdr sessions and keeps the same I/O/history when possible; resume mode starts a separate CLI resume process and may stop Feishu from following the session.',
+  'settings.enableLocalCliOpenHelp': 'Off by default and available only when the daemon runs on macOS. Attach mode enters the same CLI in current tmux / Herdr / ZMX sessions; a ZMX local attach uses the native terminal while Lark remains a plain-text stream. Resume mode starts a separate CLI resume process and may stop Feishu from following the session.',
   'settings.localCliOpenMode': 'Native CLI open mode',
-  'settings.localCliOpenModeHelp': 'Defaults to attaching the current session: managed tmux / Herdr use exact attach, adopted sessions attach only when a reliable existing target is known. Direct resume is for local debugging when you accept the Feishu continuity risk.',
+  'settings.localCliOpenModeHelp': 'Defaults to attaching the current session: managed tmux / Herdr / ZMX use exact attach, and adopted sessions attach only when a reliable existing target is known. A native ZMX attach does not mean botmux provides a Web TUI. Direct resume is for local debugging when you accept the Feishu continuity risk.',
   'settings.localCliOpenModeAttach': 'Attach current session (recommended)',
   'settings.localCliOpenModeResume': 'Start CLI resume',
   'settings.autoUpdate': 'Daily auto-update',
@@ -1071,10 +1154,20 @@ export const messages: Record<string, string> = {
 
   // Quote hint (injected into the CLI prompt)
   'prompt.quote_hint': '[User quoted a message — run `botmux quoted {id}` to view it]',
+  // Topic context hint — prepended on the first turn of a regular-group topic
+  // whose root is a different (earlier) message the bot never retained. It's a
+  // *hint*, not the transcript, and carries NO count (zero first-turn network
+  // probe): signals that prior topic context exists and points at
+  // `botmux history` for on-demand retrieval (thread-scope by default).
+  'prompt.topic_context': '[This is a reply inside a topic that already had prior messages before you (the topic root + possibly other replies) which you never retained. Run `botmux history` to read them if you need that context (defaults to this thread; use `--limit` for count, `botmux quoted <message_id>` for a message’s attachments).]',
 
   // Markdown / contextual reply card chrome
   'card.you': 'You',
   'card.sent_to': 'Sent to: ',
+  'card.usage.context': 'Context',
+  'card.usage.tokens': 'Tokens',
+  'card.usage.turn': 'This turn',
+  'card.usage.total': 'Total',
 
   // Adopt preamble card title
   'card.adopt_last_round': '📜 Last exchange before /adopt',
@@ -1091,8 +1184,14 @@ export const messages: Record<string, string> = {
   'trigger.external_event_clean': 'External event',
 
   // Worker-side submit / notify messages
-  'worker.submit_impossible': '⚠️ Your last message was NOT delivered to {cliName}: the current keybinding config can’t auto-submit from the terminal.\nReason: {reason}\nAdjust the Claude Code Chat keybinding, then resend.\nStart: {preview}',
+  'worker.submit_impossible': '⚠️ Your last message was not safely written to {cliName}.\nReason: {reason}\nAddress the reason above and verify the terminal state before trying again.\nStart: {preview}',
   'worker.submit_unconfirmed': '⚠️ Your last message was sent to {cliName} but submission couldn’t be confirmed (after retrying Enter and waiting {secs}s, no new entry showed up in {transcriptLabel}). It may be stuck in the input box — check the Web terminal and press Enter manually or resend.\nStart: {preview}',
+  'worker.submit_unconfirmed_zmx': '⚠️ Your last message could not be confirmed as written to {cliName} after {secs}s. Do not resend it blindly; run botmux list locally, enter the ZMX session, and inspect its composer.\nStart: {preview}',
+  'worker.zmx_recovery_pending': 'The ZMX control plane could not verify the session identity, so automatic cleanup did not run. Do not resend blindly; run botmux list locally, inspect the session, press Ctrl+C to clear the composer, then use /restart before trying again.',
+  'worker.zmx_recovery_unconfirmed': 'The ZMX cleanup Ctrl+C could not be confirmed. To prevent duplicate, concatenated, or truncated input, automatic writes to this session are now blocked. Do not resend blindly; run botmux list locally, inspect and clear the composer, then use /restart before trying again.',
+  'worker.interrupt_unconfirmed': '⚠️ Interrupt key {key} could not be delivered to {cliName} after two attempts. The CLI may still be running, and the card will not claim it stopped. {recovery}',
+  'worker.interrupt_recovery_zmx': 'Run botmux list locally, enter the ZMX session, and inspect and interrupt it manually. If its state is still uncertain, use /restart.',
+  'worker.interrupt_recovery_web': 'Retry, or open the Web Terminal and interrupt it manually.',
   'worker.skill_delivery_failed': '⚠️ This bot’s Skill delivery config blocked the new session: {reason}\nSet skills.delivery to auto/prompt, or switch to a CLI that supports native skill delivery, then retry.',
   'worker.coco_session_dir_gone': '⚠️ The current CoCo session directory was deleted (e2e cleanup or a manual rm). Content written to events.jsonl lands on a stale inode the bridge can’t read. Restart CoCo and run /adopt again.',
 
@@ -1121,16 +1220,6 @@ export const messages: Record<string, string> = {
 
   // Auto-start (joined chat) member-read failure admin DM
   'daemon.auto_start_member_read_failed': '⚠️ botmux “auto-start when added to a new chat” is on, but reading the chat members failed, so it can’t tell whether any authorized user is present — auto-start was skipped.\n\nMost likely cause: missing permission to read chat members (im:chat / chat info), or the “bot added to chat” event `im.chat.member.bot.added_v1` isn’t subscribed.\n\nGo to the Lark Open Platform → your app → Permissions / Event subscriptions to add them, then `botmux restart`.\n\nDetails: {detail}',
-
-  // Sandbox landing (/land) errors
-  'sandbox.no_clone': 'This session has no sandbox change layer (sandbox off, or the layer was cleaned up).',
-  'sandbox.clone_not_git': 'The sandbox change layer is unavailable; landing isn’t supported.',
-  'sandbox.nothing_to_land': 'No changes to land.',
-  'sandbox.target_not_git': 'Landing target directory does not exist: {dir}',
-  'sandbox.apply_failed': 'Landing failed: {detail}',
-  'sandbox.diff_failed': 'Reading sandbox changes failed: {detail}',
-  'sandbox.workingdir_not_found': 'Session workingDir not found',
-  'sandbox.no_changes_left': 'The sandbox change layer has no changes left',
 
   // ─── Dashboard create session ──────────────────────────────────────────────
   'cmd.createSession.untitled': 'New session',

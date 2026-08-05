@@ -58,6 +58,9 @@ vi.mock('../src/bot-registry.js', () => ({
 }));
 
 vi.mock('../src/services/session-store.js', () => ({
+  registerSessionBridgeSendMarkerCleanupFence: vi.fn(),
+  cleanupSessionBridgeSendMarkers: vi.fn(),
+  cleanupSessionBridgeSendMarkersNow: vi.fn(),
   createSession: vi.fn(),
   updateSession: vi.fn(),
 }));
@@ -78,6 +81,7 @@ vi.mock('../src/services/whiteboard-store.js', () => ({
 vi.mock('../src/core/worker-pool.js', () => ({
   forkWorker: vi.fn(),
   killStalePids: vi.fn(),
+  sweepDeadPidMarkers: vi.fn(),
   getActiveSessionsRegistry: vi.fn(() => undefined),
   getCurrentCliVersion: vi.fn(() => '1.0.0'),
 }));
@@ -130,12 +134,16 @@ describe('buildNewTopicPrompt', () => {
     expect(routing).not.toContain('&amp;lt;');
   });
 
-  it('uses final-output routing hints for Hermes instead of normal botmux send guidance', () => {
+  it('gives Hermes the standard botmux-send routing hints like other structured-bridge CLIs', () => {
+    // #365 previously steered Hermes AWAY from `botmux send` (reverse guidance)
+    // as a redundant belt-and-braces on top of the real dedup fix
+    // (preserveMarkTimeMs). That reverse hint weakened multi-agent collaboration
+    // (bridge-forwarded finals can't carry an @mention), so Hermes now uses the
+    // same send-first hints as codex/traex/grok.
     const prompt = buildNewTopicPrompt('hello', SESSION_ID, 'hermes');
-    expect(prompt).toContain('普通文字回复请直接写在 assistant final');
-    expect(prompt).toContain('普通文本答案不要调用 `botmux send`');
-    expect(prompt).not.toContain("botmux send <<'EOF'");
-    expect(prompt).not.toContain('回复必须 botmux send');
+    expect(prompt).toContain('把消息发给用户（唯一方式）');
+    expect(prompt).not.toContain('普通文本答案不要调用 `botmux send`');
+    expect(prompt).not.toContain('botmux 会自动把 final_output 转发到飞书');
   });
 
   it('should NOT embed <session_id> for CLIs with injectsSessionContext (claude-code)', () => {
@@ -423,12 +431,32 @@ describe('buildFollowUpContent', () => {
     }
   });
 
-  it('uses final-output reminder for Hermes follow-ups', () => {
+  it('gives Hermes the standard follow-up reminder like other CLIs (no reverse send guidance)', () => {
+    // #365 previously steered Hermes AWAY from `botmux send` (reverse guidance)
+    // as redundant belt-and-braces on top of the real dedup fix
+    // (preserveMarkTimeMs). That reverse hint weakened multi-agent collaboration
+    // (bridge-forwarded finals can't carry an @mention), so Hermes now shares
+    // the standard path. With the anti-resend toggle OFF (default) that is
+    // exactly #554's BOTMUX_NO_REPLY sentinel baseline — same as codex/traex.
     const content = buildFollowUpContent('hello', SESSION_ID, { cliId: 'hermes' });
 
-    expect(content).toContain('普通文字回复不要调用 `botmux send`');
-    expect(content).toContain('直接把给用户看的答案写在 final');
-    expect(content).not.toContain('回复必须 botmux send');
+    expect(content).toContain('<botmux_reminder>需要回复时必须 botmux send；无需回复时不要解释沉默，final 只输出 BOTMUX_NO_REPLY</botmux_reminder>');
+    expect(content).not.toContain('普通文字回复不要调用 `botmux send`');
+    expect(content).not.toContain('直接把给用户看的答案写在 final');
+  });
+
+  it('routes Hermes through the shared anti-resend branch when noVisibleOutputHint is ON', () => {
+    // Codex-review guard for #653: prove Hermes really lands in the shared
+    // noVisibleOutputHint branch (not a special-cased bypass), so the toggle
+    // reaches it just like every other non-Mira CLI.
+    (config as { noVisibleOutputHint?: boolean }).noVisibleOutputHint = true;
+    try {
+      const content = buildFollowUpContent('hello', SESSION_ID, { cliId: 'hermes' });
+      expect(content).toContain('final 只输出 BOTMUX_NO_REPLY');
+      expect(content).toMatch(/<botmux_reminder>[^<]*别因「无输出」提示重发[^<]*<\/botmux_reminder>/);
+    } finally {
+      delete (config as { noVisibleOutputHint?: boolean }).noVisibleOutputHint;
+    }
   });
 
   it('places the short whiteboard hint before follow-up user content', () => {

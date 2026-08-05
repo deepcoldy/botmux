@@ -454,16 +454,39 @@ export class HerdrBackend implements SessionBackend {
     return agent && !agentRowExited(agent) ? 'exists' : 'missing';
   }
 
-  /** Close only the managed pane, never the surrounding user-owned session. */
-  static killAgent(sessionName: string, agentName: string): void {
+  /**
+   * Close selected managed panes after one agent-list snapshot.
+   *
+   * Startup cleanup can discover many historical rows for the same shared
+   * Herdr host. Listing the host once keeps that sweep proportional to live
+   * hosts + live matching panes instead of issuing one probe/list command per
+   * persisted row.
+   */
+  static killAgents(sessionName: string, agentNames: Iterable<string>): void {
+    const names = new Set(agentNames);
+    if (names.size === 0) return;
     const raw = jsonCommand(
       herdrSessionArgs(sessionName, ['agent', 'list']),
       { timeout: 5000 },
     );
-    const paneId = extractAgents(raw).find((row: any) => row?.name === agentName)?.pane_id;
-    if (typeof paneId === 'string' && paneId) {
+    const paneIds = new Set(
+      extractAgents(raw)
+        .filter((row: any) =>
+          typeof row?.name === 'string'
+          && names.has(row.name)
+          && !agentRowExited(row),
+        )
+        .map((row: any) => row?.pane_id)
+        .filter((paneId: unknown): paneId is string => typeof paneId === 'string' && paneId.length > 0),
+    );
+    for (const paneId of paneIds) {
       runHerdr(herdrSessionArgs(sessionName, ['pane', 'close', paneId]), { timeout: 5000 });
     }
+  }
+
+  /** Close only the managed pane, never the surrounding user-owned session. */
+  static killAgent(sessionName: string, agentName: string): void {
+    HerdrBackend.killAgents(sessionName, [agentName]);
   }
 
   get isReattach(): boolean {

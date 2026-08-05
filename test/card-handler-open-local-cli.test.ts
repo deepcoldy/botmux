@@ -129,6 +129,24 @@ describe('card-handler open_local_cli', () => {
     expect(opener.openLocalCliInIterm).toHaveBeenCalledWith(ds, { cliId: 'codex', mode: 'resume' });
   });
 
+  it('uses the frozen configured runtime name in the success toast', async () => {
+    const { types, opener, handler } = await fresh();
+    const ds = makeDs('codex');
+    ds.session.agentFrozen = true;
+    ds.session.cliRuntime = {
+      id: 'vendor-codex', displayName: 'Vendor Codex', executable: 'vendor-codex',
+      source: 'configured', update: { provider: 'none' },
+    };
+    deps.activeSessions.set(types.sessionKey('om_root', 'h1'), ds);
+    vi.mocked(opener.openLocalCliInIterm).mockReturnValueOnce(new Promise(() => {}) as any);
+
+    const res = await handler.handleCardAction(action('ou_owner', 'codex'), deps, 'h1');
+
+    expect(res?.toast?.type).toBe('success');
+    expect(res.toast.content).toContain('Vendor Codex');
+    expect(res.toast.content).not.toContain('local Codex');
+  });
+
   it('attach mode opens a Herdr-backed CLI outside the direct-resume whitelist when cli_id matches', async () => {
     const { types, opener, terminal, handler } = await fresh();
     vi.mocked(opener.localCliOpenMode).mockReturnValue('attach');

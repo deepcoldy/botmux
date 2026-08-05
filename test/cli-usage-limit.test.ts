@@ -4,7 +4,14 @@ import {
   HARD_RATE_LIMIT_COOLDOWN_MS,
   usageLimitStateKey,
   structuredRateLimitState,
+  isStructuredRateLimitAuthoritative,
 } from '../src/utils/cli-usage-limit.js';
+import { createClaudeCodeAdapter } from '../src/adapters/cli/claude-code.js';
+import { createGeniusAdapter } from '../src/adapters/cli/genius.js';
+import { createCodexAdapter } from '../src/adapters/cli/codex.js';
+import { createGrokAdapter } from '../src/adapters/cli/grok.js';
+import { createTraexAdapter } from '../src/adapters/cli/traex.js';
+import { createPiAdapter } from '../src/adapters/cli/pi.js';
 
 describe('detectCliUsageLimit', () => {
   it('detects Codex usage limit output with a concrete retry time', () => {
@@ -279,5 +286,27 @@ describe('detectCliUsageLimit', () => {
     );
 
     expect(result.limited).toBe(false);
+  });
+});
+
+describe('isStructuredRateLimitAuthoritative — Claude-family only, not all reliableTurnTerminal', () => {
+  // This is the predicate the worker's structuredRateLimitAuthoritative()
+  // delegates to. Testing it directly (not the adapter.claudeDataDir field)
+  // means a regression that re-broadens the gate to reliableTurnTerminal — which
+  // would wrongly suppress screen-rate for codex/grok/traex/pi — turns this red.
+  it('is true for the Claude family (they publish structured limited events)', () => {
+    expect(isStructuredRateLimitAuthoritative(createClaudeCodeAdapter('/bin/claude'))).toBe(true);
+    expect(isStructuredRateLimitAuthoritative(createGeniusAdapter('/bin/genius'))).toBe(true);
+  });
+  it('is false for codexBridgeQueue CLIs (no structured limited emit → keep screen scan)', () => {
+    expect(isStructuredRateLimitAuthoritative(createCodexAdapter('/bin/codex'))).toBe(false);
+    expect(isStructuredRateLimitAuthoritative(createGrokAdapter('/bin/grok'))).toBe(false);
+    expect(isStructuredRateLimitAuthoritative(createTraexAdapter('/bin/traex'))).toBe(false);
+    expect(isStructuredRateLimitAuthoritative(createPiAdapter('/bin/pi'))).toBe(false);
+  });
+  it('is false for null/undefined adapter', () => {
+    expect(isStructuredRateLimitAuthoritative(null)).toBe(false);
+    expect(isStructuredRateLimitAuthoritative(undefined)).toBe(false);
+    expect(isStructuredRateLimitAuthoritative({})).toBe(false);
   });
 });

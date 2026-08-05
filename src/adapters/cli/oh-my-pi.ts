@@ -1,13 +1,13 @@
 import { resolveCommand } from './registry.js';
 import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
 import type { CliAdapter, PtyHandle } from './types.js';
+import { TERMINAL_CANCEL_COOLDOWN_MS } from '../backend/critical-control-key.js';
 
 import { delay } from '../../utils/timing.js';
 
 const OMP_INPUT_CHUNK_CHARS = 512;
 const OMP_INPUT_CHUNK_NEWLINES = 9;
 const OMP_INPUT_THROTTLE_MS = 20;
-const OMP_CLEAR_COOLDOWN_MS = 550;
 const BRACKETED_PASTE_START = '\x1b[200~';
 const BRACKETED_PASTE_END = '\x1b[201~';
 
@@ -95,8 +95,13 @@ export function createOhMyPiAdapter(pathOverride?: string): CliAdapter {
 
   const clearComposer = async (pty: PtyHandle): Promise<boolean> => {
     // OMP treats a second Ctrl+C within 500 ms as exit. Keep recovery clears
-    // outside that window even when consecutive terminal writes fail quickly.
-    const waitMs = OMP_CLEAR_COOLDOWN_MS - (Date.now() - lastClearAttemptAt);
+    // outside that window even when the backend already injected the first one
+    // while recovering an ambiguous ZMX frame.
+    const mostRecentCancelAt = Math.max(
+      lastClearAttemptAt,
+      pty.lastInjectedCancelAt ?? 0,
+    );
+    const waitMs = TERMINAL_CANCEL_COOLDOWN_MS - (Date.now() - mostRecentCancelAt);
     if (waitMs > 0) await delay(waitMs);
     lastClearAttemptAt = Date.now();
     try {

@@ -1,4 +1,5 @@
 import { store } from './store.js';
+import type { CliRuntimeConfig as SharedCliRuntimeConfig } from '../../adapters/cli/runtime.js';
 
 export type CliOption = {
   id: string;
@@ -16,6 +17,10 @@ export type CliOptionsState = {
   ttadkModelSuggestions: string[];
 };
 
+/** Keep the browser payload contract tied to the daemon's canonical schema. */
+export type CliRuntimeConfig = SharedCliRuntimeConfig;
+export type CliRuntimeUpdateProvider = NonNullable<SharedCliRuntimeConfig['update']>['provider'];
+
 export type BotSubstituteTarget = {
   openId?: string;
   userId?: string;
@@ -30,6 +35,7 @@ export type BotSubstituteMode = {
   targets: BotSubstituteTarget[];
   disclosure: 'prefix' | 'none';
   chats?: string[];
+  excludedChats?: string[];
   replyMode?: 'thread' | 'quote';
   disableControlCard?: boolean;
   /** 话题群支持（缺省 true；显式 false 关）。 */
@@ -42,6 +48,10 @@ export type BotDefaultsRow = {
   larkAppId: string;
   botName?: string;
   cliId?: string;
+  /** Absent/null is the built-in runtime. Older dashboard payloads omit it. */
+  cliRuntime?: CliRuntimeConfig | null;
+  /** Legacy path-only executable override, returned only by private Bot Defaults APIs. */
+  cliPathOverride?: string | null;
   wrapperCli?: string | null;
   model?: string;
   agentSelectionKey?: string;
@@ -59,6 +69,8 @@ export type BotDefaultsRow = {
    *  + no wrapper can enforce it. Drives the capability label under the toggle. */
   readIsolationSupported?: boolean;
   backendType?: string | null;
+  usageDisplay?: 'streaming' | 'footer' | 'off';
+  usageSupported?: boolean;
   disableStreamingCard?: boolean;
   silentTurnReactions?: boolean;
   codexAppCleanInput?: boolean;

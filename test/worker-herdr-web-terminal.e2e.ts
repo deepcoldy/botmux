@@ -2,6 +2,7 @@ import { execFileSync, spawn, type ChildProcess } from 'node:child_process';
 import {
   chmodSync,
   existsSync,
+  mkdirSync,
   mkdtempSync,
   readFileSync,
   rmSync,
@@ -9,7 +10,7 @@ import {
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterAll, afterEach, describe, expect, it } from 'vitest';
 import { WebSocket } from 'ws';
 import { HerdrBackend } from '../src/adapters/backend/herdr-backend.js';
 import type { DaemonToWorker, WorkerToDaemon } from '../src/types.js';
@@ -17,6 +18,21 @@ import type { DaemonToWorker, WorkerToDaemon } from '../src/types.js';
 const children = new Set<ChildProcess>();
 const sessions = new Set<string>();
 const tempDirs = new Set<string>();
+// Keep the XDG root short enough for macOS's Unix-domain socket path limit.
+const herdrFixtureRoot = mkdtempSync('/tmp/botmux-herdr-worker-');
+const herdrXdgConfigHome = join(herdrFixtureRoot, 'xdg');
+const herdrConfigDir = join(herdrXdgConfigHome, 'herdr');
+const herdrConfigPath = join(herdrConfigDir, 'config.toml');
+const originalXdgConfigHome = process.env.XDG_CONFIG_HOME;
+const originalHerdrConfigPath = process.env.HERDR_CONFIG_PATH;
+
+mkdirSync(herdrConfigDir, { recursive: true });
+writeFileSync(herdrConfigPath, `[terminal]
+default_shell = "/bin/sh"
+shell_mode = "non_login"
+`);
+process.env.XDG_CONFIG_HOME = herdrXdgConfigHome;
+process.env.HERDR_CONFIG_PATH = herdrConfigPath;
 
 afterEach(() => {
   for (const child of children) {
@@ -27,6 +43,16 @@ afterEach(() => {
   sessions.clear();
   for (const dir of tempDirs) rmSync(dir, { recursive: true, force: true });
   tempDirs.clear();
+});
+
+afterAll(() => {
+  // A fresh worker uses the isolated shared host, not its legacy bmx-* name.
+  HerdrBackend.killSession(HerdrBackend.managedSessionName());
+  if (originalXdgConfigHome === undefined) delete process.env.XDG_CONFIG_HOME;
+  else process.env.XDG_CONFIG_HOME = originalXdgConfigHome;
+  if (originalHerdrConfigPath === undefined) delete process.env.HERDR_CONFIG_PATH;
+  else process.env.HERDR_CONFIG_PATH = originalHerdrConfigPath;
+  rmSync(herdrFixtureRoot, { recursive: true, force: true });
 });
 
 async function waitFor<T>(
@@ -128,8 +154,11 @@ describe('worker Herdr web terminal lifecycle', () => {
       const root = mkdtempSync(join(tmpdir(), 'botmux-herdr-restart-'));
       tempDirs.add(root);
       const sizeLog = join(root, 'sizes.log');
-      const fakeCli = join(root, 'fake-claude');
+      const fakeCli = join(root, 'claude');
       writeFileSync(fakeCli, `#!/bin/bash
+export HERDR_AGENT=claude
+herdr pane report-agent "$HERDR_PANE_ID" \\
+  --source custom:botmux-worker-e2e --agent claude --state idle >/dev/null 2>&1
 record_size() { printf '%s %s\\n' "$$" "$(stty size)" >> '${sizeLog}'; }
 trap record_size WINCH
 record_size
@@ -138,8 +167,7 @@ while :; do sleep 0.1; done
       chmodSync(fakeCli, 0o755);
 
       const sessionId = `hrrst${Date.now().toString(36)}`;
-      const herdrSession = HerdrBackend.sessionName(sessionId);
-      sessions.add(herdrSession);
+      sessions.add(HerdrBackend.managedSessionName());
       const logs: string[] = [];
       const child = spawnWorker(root, sessionId, logs);
       const init: DaemonToWorker = {
@@ -163,7 +191,10 @@ while :; do sleep 0.1; done
       const before = await waitFor(() => {
         const record = latestSizeRecord(sizeLog);
         return record?.size === '36 120' ? record : null;
-      }, 12_000, 'initial browser grid reaches Herdr pane');
+      }, 12_000, 'initial browser grid reaches Herdr pane').catch((err) => {
+        const sizes = existsSync(sizeLog) ? readFileSync(sizeLog, 'utf8') : '<missing>';
+        throw new Error(`${err instanceof Error ? err.message : String(err)}\nsizes:\n${sizes}\nworker:\n${logs.join('')}`);
+      });
 
       child.send({ type: 'restart' } satisfies DaemonToWorker);
       const after = await waitFor(() => {
@@ -191,10 +222,18 @@ while :; do sleep 0.1; done
       const root = mkdtempSync(join(tmpdir(), 'botmux-herdr-adopt-'));
       tempDirs.add(root);
       const trigger = join(root, 'emit-live');
+      const fakeAgent = join(root, 'pi');
+      writeFileSync(fakeAgent, `#!/bin/bash
+export HERDR_AGENT=pi
+herdr pane report-agent "$HERDR_PANE_ID" \\
+  --source custom:botmux-worker-e2e --agent pi --state idle >/dev/null 2>&1
+/bin/bash "$@"
+`);
+      chmodSync(fakeAgent, 0o755);
       const externalSession = `adopt-e2e-${Date.now().toString(36)}`;
       sessions.add(externalSession);
       const external = new HerdrBackend(externalSession);
-      external.spawn('/bin/bash', [
+      external.spawn(fakeAgent, [
         '-lc',
         `echo ADOPT_INITIAL; while [ ! -f '${trigger}' ]; do sleep 0.1; done; `
         + 'echo ADOPT_LIVE_UPDATE; while :; do sleep 1; done',

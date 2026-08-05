@@ -31,6 +31,7 @@ import { createInvite, deleteInvitesForTeam } from '../services/invite-store.js'
 import { removeTeamFederation, removeDeployment } from '../services/federation-store.js';
 import { loadBotConfigs, registerBot, getBot, type BotConfig } from '../bot-registry.js';
 import { setBotCapability, clearBotCapability } from '../services/bot-profile-store.js';
+import { readTeamRoleInjectMode, writeTeamRoleInjectMode, type RoleInjectMode } from '../core/role-resolver.js';
 import { setBotOwner } from '../services/bot-owner-store.js';
 import { setDeploymentOwner } from '../services/deployment-identity.js';
 import { createPairing, getPairingStatus, consumePairing } from '../services/pairing-store.js';
@@ -171,12 +172,25 @@ function botConfigOrder(): string[] {
 /** This deployment's bots, in the shape the hub federates (bots.json order).
  *  Prefer the live daemon registry (authoritative) over bots-info.json. */
 function localBots(dataDir: string, live?: LiveBot[]): FederatedBot[] {
+  // apiOnly (core-only) bots have no Feishu transport → federate that capability
+  // so a hub/remote deployment won't try to invite them as group members. Read
+  // from local config (the source of truth). FAIL-CLOSED: if the config can't be
+  // read we cannot confirm a bot HAS transport, so we federate transport=false
+  // for every bot this round (a remote hub then won't invite any of them —
+  // safe-but-degraded) rather than fail-open and mislabel a core-only bot as
+  // normal. A healthy spoke reads config fine and federates the real per-bot value.
+  let apiOnlyIds = new Set<string>();
+  let configReadable = true;
+  try {
+    apiOnlyIds = new Set(loadBotConfigs().filter(b => b.apiOnly === true).map(b => b.larkAppId));
+  } catch { configReadable = false; }
   return buildTeamRoster(dataDir, undefined, undefined, live).bots.map(b => ({
     larkAppId: b.larkAppId,
     botName: b.name,
     cliId: b.cliId,
     capability: b.capability,
     hasTeamRole: b.hasTeamRole,
+    larkTransportEnabled: configReadable ? !apiOnlyIds.has(b.larkAppId) : false,
     // owner (union_id+name) federated so the hub can pull owners into 拉群
     ownerUnionId: b.owner?.unionId,
     ownerName: b.owner?.name,
@@ -350,7 +364,11 @@ export async function handleFederationSpokeApi(
     if (!localIds.has(larkAppId)) { jsonRes(res, 404, { ok: false, error: 'not_a_local_bot' }); return true; }
     if (field === 'role' && method === 'GET') {
       const fp = teamRolePath(dataDir, larkAppId);
-      jsonRes(res, 200, { ok: true, role: existsSync(fp) ? readFileSync(fp, 'utf-8') : '' });
+      jsonRes(res, 200, {
+        ok: true,
+        role: existsSync(fp) ? readFileSync(fp, 'utf-8') : '',
+        injectMode: readTeamRoleInjectMode(larkAppId),
+      });
       return true;
     }
     if (method === 'PUT') {
@@ -363,8 +381,13 @@ export async function handleFederationSpokeApi(
         const role = String(body?.role ?? '').trim();
         if (role) writeTeamRole(dataDir, larkAppId, role);
         else { try { unlinkSync(teamRolePath(dataDir, larkAppId)); } catch { /* already gone */ } }
+        // Bot-level default injection mode travels with the team role. Only
+        // persist when the caller sends it (older clients omit the field).
+        if (body?.injectMode === 'once' || body?.injectMode === 'every') {
+          writeTeamRoleInjectMode(larkAppId, body.injectMode as RoleInjectMode);
+        }
       }
-      jsonRes(res, 200, { ok: true });
+      jsonRes(res, 200, { ok: true, injectMode: readTeamRoleInjectMode(larkAppId) });
       return true;
     }
     jsonRes(res, 405, { ok: false, error: 'method_not_allowed' });

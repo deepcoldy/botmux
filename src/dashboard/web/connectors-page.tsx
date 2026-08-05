@@ -1,9 +1,11 @@
+import type React from 'react';
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { CreateActionButton, DropdownMenu, FieldTitle, LoadingState, dropdownLabel } from './dashboard-components.js';
 import { jget, jsend } from './dashboard-api.js';
 import { mountReactPage, type PageDisposer } from './react-mount.js';
 import { useT } from './react-hooks.js';
 import { WebhookLogsContent } from './webhook-logs-page.js';
+import { copyText } from './clipboard.js';
 
 interface Connector {
   id: string;
@@ -130,7 +132,7 @@ function ConnectorDropdown<T extends string>(props: {
   value: T;
   options: Array<{ value: T; label: ReactNode; disabled?: boolean }>;
   onChange(value: T): void;
-}): JSX.Element {
+}): React.JSX.Element {
   return (
     <DropdownMenu
       id={props.id}
@@ -156,7 +158,7 @@ function SearchableGroupPicker(props: {
   emptyLabel: string;
   selectedCountLabel(count: number): string;
   onChange(value: string | string[]): void;
-}): JSX.Element {
+}): React.JSX.Element {
   const rootRef = useRef<HTMLDivElement | null>(null);
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState('');
@@ -290,7 +292,7 @@ function formFromConnector(connector: Connector, groups: GroupOpt[]): CreateForm
   };
 }
 
-function ConnectorsSubNav(props: { active: ConnectorsTab }): JSX.Element {
+function ConnectorsSubNav(props: { active: ConnectorsTab }): React.JSX.Element {
   const tr = useT();
   const isWebhooks = props.active === 'webhooks';
   const isLogs = props.active === 'logs';
@@ -621,12 +623,14 @@ function ConnectorsPage(props: { tab: ConnectorsTab }) {
   }
 
   function copyConnectorUrl(connector: Connector): void {
-    void navigator.clipboard?.writeText(webhookUrl(connector.id));
-    setCopiedId(connector.id);
-    if (copyTimerRef.current) clearTimeout(copyTimerRef.current);
-    copyTimerRef.current = setTimeout(() => {
-      if (mountedRef.current) setCopiedId(null);
-    }, 1200);
+    void copyText(webhookUrl(connector.id), tr('connectors.copy')).then(copied => {
+      if (!copied || !mountedRef.current) return;
+      setCopiedId(connector.id);
+      if (copyTimerRef.current) clearTimeout(copyTimerRef.current);
+      copyTimerRef.current = setTimeout(() => {
+        if (mountedRef.current) setCopiedId(null);
+      }, 1200);
+    });
   }
 
   return (

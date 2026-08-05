@@ -1,9 +1,12 @@
+import type React from 'react';
 import {
   Fragment,
   useCallback,
   useEffect,
+  useId,
   useLayoutEffect,
   useMemo,
+  useReducer,
   useRef,
   useState,
   type DragEvent,
@@ -23,6 +26,7 @@ import {
 } from '../session-cleanup.js';
 import { mountReactPage, type PageDisposer } from './react-mount.js';
 import { useStoreSelector, useT } from './react-hooks.js';
+import { copyText } from './clipboard.js';
 import {
   KANBAN_TEAM_STORAGE_KEY,
   normalizeHiddenTableColumns,
@@ -63,17 +67,21 @@ import {
   restartConfirmMessage,
   sessionLocationText,
   sessionLocationTitle,
+  sessionExchangePreview,
   sessionRuntimeCounts,
   sessionSearchText,
   sessionTopicKey,
   sessionStatusText,
   shouldOpenWritableTerminal,
+  previewOverlayReducer,
+  previewOverlayInitialState,
   terminalHref,
   tokenCount,
   type BoardColumnId,
   type PickerBot,
   type SessionTopicGroup,
 } from './sessions.js';
+import { previewMarkdownHtml } from './preview-markdown.js';
 import { addMonitorRoomSessionIds, monitorRoomUrl } from './monitor-room-store.js';
 import { dashboardShellAllowsWebTerminal } from './client-shell.js';
 import { CreateActionButton, DropdownMenu, LoadingState } from './dashboard-components.js';
@@ -203,12 +211,12 @@ function windowStorage(): Storage | undefined {
   return typeof window === 'undefined' ? undefined : window.localStorage;
 }
 
-function StatusBadge(props: { status: unknown }): JSX.Element {
+function StatusBadge(props: { status: unknown }): React.JSX.Element {
   const raw = String(props.status ?? 'unknown');
   return <span className={`status status-${cssToken(raw)}`}>{sessionStatusText(raw)}</span>;
 }
 
-function LockChip(props: { row: any }): JSX.Element | null {
+function LockChip(props: { row: any }): React.JSX.Element | null {
   if (!props.row.locked) return null;
   return <span className="session-lock-badge" title={t('sessions.locked')}>{t('sessions.locked')}</span>;
 }
@@ -222,7 +230,7 @@ function IconActionButton(props: {
   kind?: string;
   disabled?: boolean;
   onClick: (button: HTMLButtonElement) => void;
-}): JSX.Element {
+}): React.JSX.Element {
   const className = props.className ?? `card-act${props.kind ? ` ${props.kind}` : ''}`;
   return (
     <button
@@ -242,7 +250,7 @@ function IconActionButton(props: {
   );
 }
 
-function TerminalControls(props: { row: any; url: string | null }): JSX.Element | null {
+function TerminalControls(props: { row: any; url: string | null }): React.JSX.Element | null {
   if (!props.url || !dashboardShellAllowsWebTerminal()) return null;
   const canOpenWritable = shouldOpenWritableTerminal();
   return (
@@ -276,7 +284,7 @@ function TerminalControls(props: { row: any; url: string | null }): JSX.Element 
   );
 }
 
-function ChatScopeLink(props: { row: any; className?: string }): JSX.Element | null {
+function ChatScopeLink(props: { row: any; className?: string }): React.JSX.Element | null {
   const row = props.row;
   if (row.scope !== 'chat' || !row.feishuChatLink) return null;
   return (
@@ -299,7 +307,7 @@ function SortHeader(props: {
   sortKey: string;
   sortDir: 'asc' | 'desc';
   onSort: (key: string) => void;
-}): JSX.Element {
+}): React.JSX.Element {
   const active = props.sortKey === props.sort;
   return (
     <th
@@ -320,7 +328,12 @@ function sortValue(s: any, key: string): string | number | boolean {
   if (key === 'tokenOut') return tokenCount(s.tokenUsage?.out) ?? -1;
   if (key === 'adopt') return !!s.adopt;
   if (key === 'chat') return sessionLocationText(s).toLowerCase();
+  if (key === 'cliId') return sessionCliDisplayName(s).toLowerCase();
   return String(s[key] ?? '').toLowerCase();
+}
+
+function sessionCliDisplayName(row: any): string {
+  return String(row.runtimeDisplayName ?? row.cliId ?? 'unknown');
 }
 
 function compareRows(a: any, b: any, sortKey: string, sortDir: 'asc' | 'desc'): number {
@@ -378,16 +391,18 @@ function useDialogVisibility(ref: React.RefObject<HTMLDialogElement | null>, ope
   }, [open, ref]);
 }
 
-function CopyButton(props: { value: string }): JSX.Element {
+function CopyButton(props: { value: string }): React.JSX.Element {
   const [copied, setCopied] = useState(false);
   return (
     <button
       type="button"
       data-copy={props.value}
       onClick={() => {
-        void navigator.clipboard.writeText(props.value);
-        setCopied(true);
-        window.setTimeout(() => setCopied(false), 800);
+        void copyText(props.value, t('sessions.copy')).then(didCopy => {
+          if (!didCopy) return;
+          setCopied(true);
+          window.setTimeout(() => setCopied(false), 800);
+        });
       }}
     >
       {copied ? t('sessions.copied') : t('sessions.copy')}
@@ -395,7 +410,7 @@ function CopyButton(props: { value: string }): JSX.Element {
   );
 }
 
-function LocateButton(props: { row: any; locateSession: (row: any) => Promise<boolean> }): JSX.Element {
+function LocateButton(props: { row: any; locateSession: (row: any) => Promise<boolean> }): React.JSX.Element {
   const [cooldown, setCooldown] = useState(0);
   const [busy, setBusy] = useState(false);
   useEffect(() => {
@@ -422,7 +437,7 @@ function LocateButton(props: { row: any; locateSession: (row: any) => Promise<bo
 
 // Icon variant of LocateButton for board/list cards: same React-owned busy+30s
 // cooldown, but renders the pin icon via IconActionButton (no imperative DOM writes).
-function LocateIconButton(props: { row: any; onLocate: (row: any) => Promise<boolean> }): JSX.Element {
+function LocateIconButton(props: { row: any; onLocate: (row: any) => Promise<boolean> }): React.JSX.Element {
   const [cooldown, setCooldown] = useState(0);
   const [busy, setBusy] = useState(false);
   useEffect(() => {
@@ -446,7 +461,7 @@ function LocateIconButton(props: { row: any; onLocate: (row: any) => Promise<boo
   );
 }
 
-export function CliFilterGroup(props: { selected: Set<string>; onToggle: (cli: string, checked: boolean) => void }): JSX.Element {
+export function CliFilterGroup(props: { selected: Set<string>; onToggle: (cli: string, checked: boolean) => void }): React.JSX.Element {
   const checked = CLI_FILTER_OPTIONS.filter(cli => props.selected.has(cli)).length;
   const detailsRef = useRef<HTMLDetailsElement>(null);
   const [query, setQuery] = useState('');
@@ -526,7 +541,7 @@ function SessionsFilters(props: {
   filters: FiltersState;
   idleCleanup: IdleCleanupBarProps;
   setFilters: (updater: (prev: FiltersState) => FiltersState) => void;
-}): JSX.Element {
+}): React.JSX.Element {
   const statusOptions = [
     { value: '', label: t('sessions.anyStatus') },
     ...SESSION_STATUS_OPTIONS.map(status => ({ value: status, label: sessionStatusText(status) })),
@@ -659,7 +674,7 @@ function BulkBar(props: {
   onClose: () => void;
   onAddToMonitorRoom: () => void;
   onLock: (locked: boolean) => void;
-}): JSX.Element {
+}): React.JSX.Element {
   const busy = !!props.closeProgress || !!props.lockProgress;
   const lockText = props.lockProgress?.locked ? `${props.lockProgress.done}/${props.lockProgress.total}` : t('sessions.lockSelected');
   const unlockText = props.lockProgress && !props.lockProgress.locked ? `${props.lockProgress.done}/${props.lockProgress.total}` : t('sessions.unlockSelected');
@@ -682,7 +697,7 @@ function BulkBar(props: {
   );
 }
 
-function IdleCleanupBar(props: IdleCleanupBarProps): JSX.Element {
+function IdleCleanupBar(props: IdleCleanupBarProps): React.JSX.Element {
   const [open, setOpen] = useState(false);
   const [draftHours, setDraftHours] = useState<IdleCleanupHours>(props.hours);
   const [popStyle, setPopStyle] = useState<CSSProperties | undefined>();
@@ -852,7 +867,7 @@ function SessionsTable(props: {
   onSelect: (id: string, selected: boolean) => void;
   onSelectAll: (selected: boolean) => void;
   onSort: (key: string) => void;
-}): JSX.Element {
+}): React.JSX.Element {
   const selectAllRef = useRef<HTMLInputElement | null>(null);
   useLayoutEffect(() => {
     if (selectAllRef.current) selectAllRef.current.indeterminate = props.selectAllIndeterminate;
@@ -891,12 +906,12 @@ function SessionsTable(props: {
   };
 
   // 单元格渲染：按列 id 返回对应的 JSX，隐藏列不渲染。
-  function renderCell(row: any, colId: string): JSX.Element | null {
+  function renderCell(row: any, colId: string): React.JSX.Element | null {
     switch (colId) {
       case 'botName':
         return <td data-label={labels.botName}>{botDisplayName(row)}</td>;
       case 'cliId':
-        return <td data-label={labels.cliId}><span className={`badge cli-${cssToken(row.cliId)}`}>{row.cliId ?? 'unknown'}</span></td>;
+        return <td data-label={labels.cliId}><span className={`badge cli-${cssToken(row.cliId)}`} title={row.runtimeId && row.runtimeId !== row.cliId ? `${row.cliId} / ${row.runtimeId}` : undefined}>{sessionCliDisplayName(row)}</span></td>;
       case 'status':
         return <td data-label={labels.status}><StatusBadge status={row.status} /><LockChip row={row} /></td>;
       case 'chat':
@@ -995,6 +1010,216 @@ function SessionsTable(props: {
   );
 }
 
+type SessionExchangePreviewValue = ReturnType<typeof sessionExchangePreview>;
+
+function SessionExchangePreview(props: { exchange: SessionExchangePreviewValue }): React.JSX.Element | null {
+  const { exchange } = props;
+  const triggerRef = useRef<HTMLDivElement>(null);
+  const tooltipRef = useRef<HTMLDivElement>(null);
+  const hideTimerRef = useRef<number | null>(null);
+  // open + one-shot focus-suppress live in one reducer (see sessions.ts) so the
+  // Escape→refocus race is driven by the SAME transitions the unit tests cover:
+  // Escape closes and arms suppress, and the trigger's refocus consumes it
+  // instead of reopening.
+  const [overlay, dispatch] = useReducer(previewOverlayReducer, previewOverlayInitialState);
+  const open = overlay.open;
+  const [position, setPosition] = useState<{
+    left: number;
+    placement: 'top' | 'bottom';
+    top: number;
+  } | null>(null);
+  const tooltipId = `session-exchange-tooltip-${useId().replace(/[^a-zA-Z0-9_-]/g, '-')}`;
+
+  const clearHide = useCallback(() => {
+    if (hideTimerRef.current === null) return;
+    window.clearTimeout(hideTimerRef.current);
+    hideTimerRef.current = null;
+  }, []);
+  const show = useCallback(() => {
+    clearHide();
+    dispatch('open');
+  }, [clearHide]);
+  const hide = useCallback(() => {
+    clearHide();
+    dispatch('close');
+    setPosition(null);
+  }, [clearHide]);
+  const scheduleHide = useCallback(() => {
+    clearHide();
+    hideTimerRef.current = window.setTimeout(hide, 120);
+  }, [clearHide, hide]);
+  const updatePosition = useCallback(() => {
+    const trigger = triggerRef.current;
+    const tooltip = tooltipRef.current;
+    if (!trigger || !tooltip) return;
+    const triggerRect = trigger.getBoundingClientRect();
+    const tooltipRect = tooltip.getBoundingClientRect();
+    const margin = 12;
+    const gap = 9;
+    const roomAbove = triggerRect.top - margin - gap;
+    const roomBelow = window.innerHeight - triggerRect.bottom - margin - gap;
+    const placement = roomAbove >= tooltipRect.height || roomAbove > roomBelow ? 'top' : 'bottom';
+    const desiredLeft = triggerRect.left + triggerRect.width / 2 - tooltipRect.width / 2;
+    const left = Math.min(
+      Math.max(desiredLeft, margin),
+      Math.max(margin, window.innerWidth - tooltipRect.width - margin),
+    );
+    const desiredTop = placement === 'top'
+      ? triggerRect.top - tooltipRect.height - gap
+      : triggerRect.bottom + gap;
+    const top = Math.min(
+      Math.max(desiredTop, margin),
+      Math.max(margin, window.innerHeight - tooltipRect.height - margin),
+    );
+    setPosition({ left, placement, top });
+  }, []);
+
+  useLayoutEffect(() => {
+    if (!open) return;
+    updatePosition();
+    window.addEventListener('resize', updatePosition);
+    window.addEventListener('scroll', updatePosition, true);
+    return () => {
+      window.removeEventListener('resize', updatePosition);
+      window.removeEventListener('scroll', updatePosition, true);
+    };
+  }, [exchange.botFullText, exchange.userFullText, open, updatePosition]);
+  useEffect(() => () => clearHide(), [clearHide]);
+  useEffect(() => {
+    if (!open) return;
+    const closeOnOutsidePointer = (event: PointerEvent) => {
+      const target = event.target;
+      if (!(target instanceof Node)) return;
+      if (
+        triggerRef.current?.contains(target)
+        || tooltipRef.current?.contains(target)
+      ) return;
+      hide();
+    };
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') hide();
+    };
+    document.addEventListener('pointerdown', closeOnOutsidePointer);
+    document.addEventListener('keydown', closeOnEscape);
+    return () => {
+      document.removeEventListener('pointerdown', closeOnOutsidePointer);
+      document.removeEventListener('keydown', closeOnEscape);
+    };
+  }, [hide, open]);
+
+  if (!exchange.userText && !exchange.botText) return null;
+  return (
+    <>
+      <div className="session-card-exchange-wrap">
+        <div
+          ref={triggerRef}
+          className="session-card-exchange"
+          role="button"
+          tabIndex={0}
+          aria-label={t('sessions.preview.showFull')}
+          aria-haspopup="dialog"
+          aria-controls={open ? tooltipId : undefined}
+          aria-expanded={open}
+          onClick={event => {
+            event.stopPropagation();
+            open ? hide() : show();
+          }}
+          onFocus={() => {
+            // Reducer consumes the one-shot suppress armed by Escape, so a
+            // programmatic refocus after Escape does not reopen the overlay.
+            clearHide();
+            dispatch('focus');
+          }}
+          onBlur={scheduleHide}
+          onPointerEnter={event => {
+            if (event.pointerType !== 'touch') show();
+          }}
+          onPointerLeave={event => {
+            if (event.pointerType !== 'touch') scheduleHide();
+          }}
+          onKeyDown={event => {
+            if (event.key === 'Escape') hide();
+            else if (event.key === 'Enter' || event.key === ' ') {
+              event.preventDefault();
+              open ? hide() : show();
+            }
+          }}
+        >
+          {exchange.userText ? (
+            <div className="session-card-exchange-line">
+              <span>{t('sessions.history.user')}</span>
+              <p>{exchange.userText}</p>
+            </div>
+          ) : null}
+          {exchange.botText ? (
+            <div className="session-card-exchange-line bot">
+              <span>{t('sessions.history.bot')}</span>
+              <p>{exchange.botText}</p>
+            </div>
+          ) : null}
+        </div>
+      </div>
+      {open && typeof document !== 'undefined' ? createPortal(
+        <div
+          ref={tooltipRef}
+          id={tooltipId}
+          className="session-card-exchange-tooltip"
+          role="dialog"
+          aria-label={t('sessions.preview.latestExchange')}
+          data-placement={position?.placement ?? 'top'}
+          style={{
+            left: position?.left ?? -10_000,
+            top: position?.top ?? -10_000,
+            visibility: position ? 'visible' : 'hidden',
+          }}
+          onPointerEnter={clearHide}
+          onPointerLeave={event => {
+            if (event.pointerType !== 'touch') scheduleHide();
+          }}
+          // Keyboard: Tab into a rendered Markdown link keeps the overlay open
+          // (focus entering the panel cancels the trigger's blur-close timer);
+          // it only closes once focus leaves the panel entirely. Escape closes
+          // and returns focus to the trigger.
+          onFocusCapture={clearHide}
+          onBlur={event => {
+            const next = event.relatedTarget as Node | null;
+            if (next && (tooltipRef.current?.contains(next) || triggerRef.current?.contains(next))) return;
+            scheduleHide();
+          }}
+          onKeyDown={event => {
+            if (event.key === 'Escape') {
+              event.stopPropagation();
+              // Close + arm the one-shot suppress, THEN refocus the trigger; its
+              // focus handler dispatches 'focus', which the reducer consumes
+              // (no reopen). Order is race-free because suppress is reducer state.
+              clearHide();
+              dispatch('escape-refocus');
+              setPosition(null);
+              triggerRef.current?.focus();
+            }
+          }}
+        >
+          <div className="session-card-exchange-tooltip-scroll">
+            {exchange.userFullText ? (
+              <div className="session-card-exchange-tooltip-line">
+                <span>{t('sessions.history.user')}</span>
+                <div className="session-card-exchange-md" dangerouslySetInnerHTML={rawHtml(previewMarkdownHtml(exchange.userFullText))} />
+              </div>
+            ) : null}
+            {exchange.botFullText ? (
+              <div className="session-card-exchange-tooltip-line bot">
+                <span>{t('sessions.history.bot')}</span>
+                <div className="session-card-exchange-md" dangerouslySetInnerHTML={rawHtml(previewMarkdownHtml(exchange.botFullText))} />
+              </div>
+            ) : null}
+          </div>
+        </div>,
+        document.body,
+      ) : null}
+    </>
+  );
+}
+
 function BoardCard(props: {
   row: any;
   selected: boolean;
@@ -1005,7 +1230,7 @@ function BoardCard(props: {
   onRestart: (row: any, button?: HTMLButtonElement) => void;
   onLock: (row: any, locked: boolean, button?: HTMLButtonElement) => void;
   onClose: (row: any, button?: HTMLButtonElement) => void;
-}): JSX.Element {
+}): React.JSX.Element {
   const row = props.row;
   const title = stripMentionPrefix(row.title) || row.sessionId;
   const botName = botDisplayName(row);
@@ -1013,6 +1238,7 @@ function BoardCard(props: {
   const term = terminalHref(row);
   const signal = boardSignalLabel(row);
   const repo = repoBasename(row.workingDir);
+  const exchange = sessionExchangePreview(row);
   const onCardClick = (event: MouseEvent<HTMLElement>) => {
     const target = event.target as HTMLElement;
     if (target.closest('a, button, input, label')) return;
@@ -1029,7 +1255,7 @@ function BoardCard(props: {
         <span dangerouslySetInnerHTML={rawHtml(botAvatarHtml({ name: botName, larkAppId: row.larkAppId, size: 'sm' }))} />
         <div className="session-card-title">
           <strong title={String(row.title ?? title)}>{String(title).slice(0, 72)}</strong>
-          <span>{botName} · {chatTitle ?? row.cliId ?? 'unknown'}</span>
+          <span>{botName} · {chatTitle ?? sessionCliDisplayName(row)}</span>
         </div>
         <span className="session-card-status-group">
           <StatusBadge status={row.status} />
@@ -1043,6 +1269,7 @@ function BoardCard(props: {
           {signal ? <span className="session-signal" title={signal}>{signal}</span> : null}
         </div>
       ) : null}
+      <SessionExchangePreview exchange={exchange} />
       <div className="session-card-time">
         <span>{row.agentAttention?.at
           ? `${t('sessions.board.waiting')} ${relTime(attentionWaitSince(row))}`
@@ -1095,7 +1322,7 @@ function BoardView(props: {
   onRestart: (row: any, button?: HTMLButtonElement) => void;
   onLock: (row: any, locked: boolean, button?: HTMLButtonElement) => void;
   onClose: (row: any, button?: HTMLButtonElement) => void;
-}): JSX.Element {
+}): React.JSX.Element {
   useEffect(() => {
     if (!props.hidden && !props.animated) props.onAnimated();
   }, [props.animated, props.hidden, props.onAnimated]);
@@ -1215,7 +1442,7 @@ function topicGroupTitle(group: SessionTopicGroup<SessionRow>): string {
   return group.kind === 'chat' ? t('sessions.topic.wholeChat') : t('sessions.topic.singleSession');
 }
 
-export function TopicGroupsView(props: TopicGroupsViewProps): JSX.Element {
+export function TopicGroupsView(props: TopicGroupsViewProps): React.JSX.Element {
   const groups = useMemo(() => groupSessionsByTopic(props.rows), [props.rows]);
   const relationGroups = useMemo(
     () => new Map(groupSessionsByTopic(props.relationRows ?? props.rows).map(group => [group.key, group])),
@@ -1292,7 +1519,7 @@ export function TopicGroupsView(props: TopicGroupsViewProps): JSX.Element {
   );
 }
 
-function HistoryBubble(props: { message: any; ownerOpenId?: string; groupStart: boolean }): JSX.Element {
+function HistoryBubble(props: { message: any; ownerOpenId?: string; groupStart: boolean }): React.JSX.Element {
   const m = props.message;
   const human = m.senderType === 'user';
   const botSender = m.senderType === 'app' || m.senderType === 'bot';
@@ -1315,7 +1542,7 @@ function HistoryBubble(props: { message: any; ownerOpenId?: string; groupStart: 
   );
 }
 
-function HistoryModal(props: { state: HistoryState | null; onClose: () => void }): JSX.Element {
+function HistoryModal(props: { state: HistoryState | null; onClose: () => void }): React.JSX.Element {
   const dialogRef = useRef<HTMLDialogElement | null>(null);
   useDialogVisibility(dialogRef, !!props.state);
   const row = props.state ? store.sessions.get(props.state.sessionId) : null;
@@ -1377,7 +1604,7 @@ function HistoryModal(props: { state: HistoryState | null; onClose: () => void }
   );
 }
 
-function TerminalNameEditor(props: { row: any; onRename: (row: any, title: string) => void }): JSX.Element {
+function TerminalNameEditor(props: { row: any; onRename: (row: any, title: string) => void }): React.JSX.Element {
   const [editing, setEditing] = useState(false);
   const [value, setValue] = useState('');
   const inputRef = useRef<HTMLInputElement | null>(null);
@@ -1445,13 +1672,13 @@ function TerminalNameEditor(props: { row: any; onRename: (row: any, title: strin
   );
 }
 
-function TerminalModal(props: { state: TerminalState | null; onClose: () => void; onRename: (row: any, title: string) => void }): JSX.Element {
+function TerminalModal(props: { state: TerminalState | null; onClose: () => void; onRename: (row: any, title: string) => void }): React.JSX.Element {
   const dialogRef = useRef<HTMLDialogElement | null>(null);
   useDialogVisibility(dialogRef, !!props.state);
   const row = props.state ? store.sessions.get(props.state.sessionId) : null;
   const readonlyUrl = row ? terminalHref(row) : null;
   const url = props.state?.url ?? readonlyUrl ?? '';
-  const rowCli = row ? String(row.cliId ?? 'unknown') : '';
+  const rowCli = row ? sessionCliDisplayName(row) : '';
   const rowRepo = row ? repoBasename(row.workingDir) : '';
   return (
     <dialog
@@ -1517,7 +1744,7 @@ function TerminalModal(props: { state: TerminalState | null; onClose: () => void
 }
 
 
-function InsightReport(props: { report: any }): JSX.Element {
+function InsightReport(props: { report: any }): React.JSX.Element {
   const rep = props.report;
   if (!rep || rep.status !== 'ok') {
     const msg = rep?.error?.message ? String(rep.error.message) : String(rep?.status ?? 'error');
@@ -1591,7 +1818,7 @@ function InsightReport(props: { report: any }): JSX.Element {
   );
 }
 
-function InsightPanel(props: { row: any }): JSX.Element | null {
+function InsightPanel(props: { row: any }): React.JSX.Element | null {
   const [state, setState] = useState<{ loading: boolean; report?: any; error?: string } | null>(null);
   useEffect(() => setState(null), [props.row.sessionId]);
   if (!ui.authed) return null;
@@ -1628,7 +1855,7 @@ function Drawer(props: {
   closeSession: (row: any, button?: HTMLButtonElement) => Promise<boolean>;
   setSessionLocked: (row: any, locked: boolean, button?: HTMLButtonElement) => Promise<boolean>;
   startSession: (row: any, button?: HTMLButtonElement) => Promise<boolean>;
-}): JSX.Element {
+}): React.JSX.Element {
   const dialogRef = useRef<HTMLDialogElement | null>(null);
   useDialogVisibility(dialogRef, !!props.row);
   const row = props.row;
@@ -1653,7 +1880,7 @@ function Drawer(props: {
             </span>
             <p><code>{row.sessionId}</code> <CopyButton value={row.sessionId} /></p>
           </header>
-          <p><b>{t('sessions.bot')}:</b> {botDisplayName(row)} · <b>{t('sessions.cli')}:</b> {row.cliId ?? '?'}</p>
+          <p><b>{t('sessions.bot')}:</b> {botDisplayName(row)} · <b>{t('sessions.cli')}:</b> {sessionCliDisplayName(row)}</p>
           <p><b>{t('sessions.location')}:</b> {sessionLocationText(row)}</p>
           <p><b>chatId:</b> <code>{row.chatId ?? ''}</code> <CopyButton value={row.chatId ?? ''} /></p>
           <p><b>rootMessageId:</b> <code>{row.rootMessageId ?? ''}</code> <CopyButton value={row.rootMessageId ?? ''} /></p>
@@ -1700,7 +1927,7 @@ function CreateSessionDialog(props: {
   state: CreateSessionState | null;
   onClose: () => void;
   onSuccess: (body: any) => void;
-}): JSX.Element | null {
+}): React.JSX.Element | null {
   const state = props.state;
   useEffect(() => {
     const dialog = props.dialog;
@@ -2167,7 +2394,7 @@ function CreateSessionDialog(props: {
   );
 }
 
-function SessionsPage(): JSX.Element {
+function SessionsPage(): React.JSX.Element {
   useT();
   const storeRows = useStoreSelector(snapshot => [...snapshot.sessions.values()] as SessionRow[]);
   const [revision, setRevision] = useState(0);

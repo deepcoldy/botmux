@@ -42,6 +42,46 @@ describe('normalizeSubstituteMode', () => {
     expect(cfg).not.toHaveProperty('chats');
   });
 
+  it('normalizes and deduplicates the excludedChats blocklist', () => {
+    const cfg = normalizeSubstituteMode({
+      enabled: true,
+      targets: [{ openId: 'ou_alice' }],
+      excludedChats: ['oc_x', ' oc_y ', '', 'oc_x', 'oc_y'],
+    });
+    expect(cfg).toMatchObject({
+      enabled: true,
+      targets: [{ openId: 'ou_alice' }],
+      excludedChats: ['oc_x', 'oc_y'],
+    });
+  });
+
+  it('omits excludedChats when the list is empty', () => {
+    const cfg = normalizeSubstituteMode({
+      enabled: true,
+      targets: [{ openId: 'ou_alice' }],
+      excludedChats: [],
+    });
+    expect(cfg).not.toHaveProperty('excludedChats');
+  });
+
+  it('omits excludedChats when not an array', () => {
+    const cfg = normalizeSubstituteMode({
+      enabled: true,
+      targets: [{ openId: 'ou_alice' }],
+      excludedChats: 'oc_x',
+    });
+    expect(cfg).not.toHaveProperty('excludedChats');
+  });
+
+  it('keeps excludedChats on a disabled config with targets', () => {
+    const cfg = normalizeSubstituteMode({
+      enabled: false,
+      targets: [{ openId: 'ou_alice' }],
+      excludedChats: ['oc_x'],
+    });
+    expect(cfg).toMatchObject({ enabled: false, excludedChats: ['oc_x'] });
+  });
+
   it('defaults replyMode to thread and omits it from output', () => {
     const cfg = normalizeSubstituteMode({
       enabled: true,

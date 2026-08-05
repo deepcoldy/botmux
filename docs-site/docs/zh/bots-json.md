@@ -46,7 +46,8 @@
 | `name` | 进程名后缀，如 `claude-main` → `botmux-claude-main`；留空默认 `botmux-<序号>` |
 | `cliId` | CLI 适配器，默认 `claude-code`。见 [多 CLI 适配器](/adapters) |
 | `model` | 启动 CLI 用的模型名（如 `claude --model opus`）；留空走 CLI 默认。同一 `cliId` 的多个 bot 可跑不同模型。各适配器的 `modelChoices` 是 `botmux setup` 里给出的候选 |
-| `cliPathOverride` | CLI 入口绝对路径，用于套 wrapper / router（ccr、claude-w、aiden-x-claude 等） |
+| `cliRuntime` | Codex 兼容发行版的结构化运行时描述：`{ id, displayName?, executable, update? }`。它复用 `codex` 适配器，但版本、更新源和会话身份都属于该发行版。见 [Codex 兼容发行版](/adapters#codex-兼容发行版) |
+| `cliPathOverride` | 旧版 CLI 入口覆盖，继续兼容 wrapper / router 和存量自定义二进制。新接入的 Codex 兼容发行版优先用 `cliRuntime`。为支持降级到旧版 BotMux，写入端会同时保存一个与 `cliRuntime.executable` 完全相同的兼容影子；不要手工配置不一致的两者 |
 | `disableCliBypass` | `true` 时不自动追加 CLI 的免审批 / 沙箱绕过参数（`--yolo`、`--dangerously-*`）；缺省 / `false` 保持原行为 |
 | `backendType` | 会话后端，可选 `pty` / `tmux` / `herdr` / `zellij`。**留空默认 `tmux`**（PTY 已退役自动回落）：tmux/herdr/zellij 这类持久后端在本机不可用时**硬拦截**、弹卡提示安装，**不再静默降级 pty**（`zellij` 需 ≥ 0.44）。`pty` 仅作显式兜底（`backendType:"pty"` 或 `BACKEND_TYPE=pty`）——直连进程、**不跨 daemon 重启存活**。见 [tmux 后端](/tmux) |
 | `launchShell` | 启动 CLI 用的 shell，覆盖 daemon 的 `$SHELL`：填 shell 名（`zsh` / `bash` / `sh`）或绝对路径（如 `/usr/bin/zsh`）。用于登录 `$SHELL`（如 bash）的 rc 文件里有 `exec zsh` 之类跳转、在 botmux 的 `bash -i` 启动里把 CLI 顶掉、导致会话起不来（裸壳里 `parse error`）的场景——指定后直接用它启动、绕开被跳过的 rc。**注意**：PATH / nvm / pnpm 等要放进所选 shell 的 rc（如 `.zshrc` / `.zprofile`）。留空＝用 `$SHELL`。下个会话生效；仅 `tmux` / `zellij` 后端（`pty` 直接 exec CLI，本就不受影响）。也可在 dashboard「机器人默认设置 → 启动 Shell」或 `/config launchShell <值>` 配置 |
@@ -54,6 +55,32 @@
 | `customPassthroughCommands` | 在固定透传白名单和当前 CLI adapter 默认放行命令之上，额外放行透传给底层 CLI 的 slash 命令，如 `["/export"]`（Claude Code / Codex 的 `/goal` 已默认放行）。自动归一化（缺失的 `/` 自动补、转小写、仅留 `[a-z0-9:_-]`、去重）；会遮蔽 botmux daemon 命令（如 `/status`）的项会被丢弃，配了也不生效。用 `/list-slash-command` 查看完整放行清单。见 [斜杠命令](/slash-commands) |
 | `env` | 该 bot 的进程环境变量 `{ "KEY": "值" }`，注入到这个 bot 的 CLI 进程。最常见用途：让某个 bot 跑 GLM / 第三方 Anthropic·OpenAI 兼容服务商（见下方示例），也可设 `HTTPS_PROXY` 或 CLI 专属开关。值支持字符串 / 数字 / 布尔；`BOTMUX_` / `LARK_APP_` 等 botmux 保留键会被忽略。按**会话**注入（下个新会话生效），不写入共享 tmux server 全局、不会串到别的 bot。也可在 dashboard「机器人默认设置 → 环境变量」配置 |
 | `codexAppCleanInput` | **实验性**，且仅对 Botmux 托管、实际运行 `codex-app` 的 session 生效。设为 `true` 后，Codex App 的可见 / 持久化文本 `UserMessage` 只保留用户原始输入，消息级 Botmux 上下文主要改走 `additionalContext`；默认关闭，从下一次 turn 派发生效，不改已有历史。详见下方说明 |
+
+### Codex 兼容发行版
+
+如果一个独立发行的 CLI 完整保留 Codex 的参数、交互、rollout / resume 和认证语义，不需要为它新增 `cliId`。保留协议适配器 `cliId: "codex"`，再声明具体运行时：
+
+```json
+{
+  "cliId": "codex",
+  "cliPathOverride": "vendor-codex",
+  "cliRuntime": {
+    "id": "vendor-codex",
+    "displayName": "Vendor Codex",
+    "executable": "vendor-codex",
+    "update": { "provider": "npm", "packageName": "@vendor/codex" }
+  }
+}
+```
+
+- `id` 是稳定身份，只能使用字母、数字、`.`、`_`、`-`，最长 64 个字符；改名会被视为切换发行版。
+- `executable` 是一个可执行文件名或路径，不是 shell 命令；不要在里面拼参数。Dashboard 保存时会执行只读的 `--version` 预检，输出需包含可识别的 `X.Y.Z` 版本号。
+- `displayName` 只影响卡片、状态与 Dashboard 展示，省略时使用 `id`。
+- `update.provider` 可选 `auto`、`self`、`npm`、`none`。`auto` 只信任可精确追溯到该二进制的唯一 npm 包；无法确定来源时标记为“未托管”，**绝不拿官方 Codex 的版本号比较**。`self` 才会使用 CLI 自报的结构化 doctor 信息，并要求其中的当前版本与 `--version` 一致；`npm` 必须同时给自己的 `packageName`；`none` 关闭该运行时的更新检查。
+- `cliRuntime` 目前只支持 `cliId: "codex"`，不能和 `wrapperCli` 同时使用。BotMux 写入配置时会生成一个与 `executable` 完全相同的 `cliPathOverride` 降级影子；新版本以 `cliRuntime` 为准，旧版本仍能从影子启动同一二进制。手工配置时也必须像上例一样同时写入这个等值影子；缺失或不相等都会直接校验失败，避免出现只能升级、不能安全降级的配置。wrapper / 网关仍走下面的旧入口覆盖机制。
+- 旧 `cliPathOverride` 配置不会失效；BotMux 会继续启动它，并对更新探测采取同样的安全 `auto` 策略。Dashboard 会把它显示为只读兼容态：只改模型会保留旧入口，显式选择 Official Codex 才会清除，也可选择“自定义兼容版”迁移到 `cliRuntime`。由于旧字段无法证明完整兼容契约，Codex RPC 等增强能力仍保持关闭。
+
+会话创建时会冻结自己的 runtime 快照。只修改模型仅影响新会话；切换 CLI、runtime 或 wrapper 时，BotMux 会立即关闭仍使用旧启动身份的活跃会话，避免它们之后 lazy resume 到错误的发行版。存量会话不会被静默换用另一 runtime。
 
 ### 接入 GLM / 第三方服务商（per-bot env）
 
@@ -134,11 +161,14 @@
 | `sandboxReadonlyPaths` | 在沙盒内额外只读挂载的已存在路径，适合共享源码快照、参考仓库或生成文档等只允许查看、不允许修改的输入 |
 | `sandboxNetwork` | 沙盒会话的网络策略。缺省 / `true` 保留当前网络和代理访问；`false` 添加 `--unshare-net`，阻断普通网络出口 |
 
+> ZMX 无法执行文件沙盒或实际生效的读隔离，开启这些边界的配置组合会 fail closed，详见 [ZMX 后端边界](/zmx#不支持的组合)。
+
 ## 卡片与终端
 
 | 字段 | 说明 |
 |------|------|
 | `brandLabel` | 卡片底部品牌文案。`undefined`=默认 `botmux` 链接；`""`=隐藏；其它字符串=原样渲染（支持 markdown）。纯样式，不影响路由 / 权限 |
+| `showUsageInCardFooter` | 回复卡片页脚是否展示 Agent CLI 原生提供的 Context / Token 用量。缺省 / `true`=展示，`false`=同时隐藏两项；单项数据缺失时仍只省略缺失项。仅控制卡片展示，不停止 Usage Ledger 或其它统计 |
 | `disableStreamingCard` | `true` 时彻底不发实时流式 session 卡片（web 终端仍跑、最终答复仍经 `botmux send` 到达，只是没有自动刷新的状态卡）。给嫌实时卡吵的用户 |
 | `silentTurnReactions` | `true` 时，无卡片会话不再给触发消息添加 GoGoGo / DONE reaction。只影响 `disableStreamingCard` 或 `noCardChats` 关闭实时卡片后的轻量状态提示；默认 `false` |
 | `receivedReactionEmoji` | 无卡片会话「已收到」reaction 的飞书 emoji_type；`undefined`=默认 `GoGoGo`（冲!）。自由字符串，填错只是静默不加表情（best-effort） |

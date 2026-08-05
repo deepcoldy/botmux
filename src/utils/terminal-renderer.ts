@@ -82,6 +82,21 @@ export class TerminalRenderer {
     this.terminal.write(data);
   }
 
+  /**
+   * Feed raw PTY data and wait until xterm has parsed every queued byte through
+   * this write. Callers that inspect the buffer immediately afterwards must use
+   * this barrier: xterm's ordinary write() API is intentionally asynchronous.
+   */
+  writeAndFlush(data: string): Promise<void> {
+    return new Promise((resolve, reject) => {
+      try {
+        this.terminal.write(data, resolve);
+      } catch (error) {
+        reject(error);
+      }
+    });
+  }
+
   /** Reset the change-detection hash so the next snapshot registers as changed. */
   markNewTurn(): void {
     this.lastHash = '';

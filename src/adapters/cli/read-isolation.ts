@@ -306,7 +306,24 @@ export function buildSeatbeltProfile(
 
 // A marker records which confinement capabilities are attached to the live
 // process. Credential-only panes must cold-spawn when a full sandbox is enabled.
-export const ISOLATION_PANE_MARKER_VERSION = 7;
+//
+// BUMP THIS whenever the START-TIME sandbox contract of an isolated CLI changes
+// in a way a still-running process cannot satisfy — warm reattach preserves the
+// live process + its original bwrap mounts/env untouched, so a new mount/env the
+// reattach path relies on but the old process lacks makes reattach unsafe.
+//   · 7 → 8 (#709): isolated CLIs must carry host-injected BOTMUX_READ_ISOLATION
+//     / BOTMUX_API_ONLY env (bots.json EPERM fix). Panes spawned by v3.8.0 have a
+//     v7 marker but a process with NEITHER key, so `botmux` inside them dies on
+//     the denied bots.json read; reattaching leaves the regression unfixed after
+//     a plain `daemon:restart`.
+//   · 8 → 9 (#714): traex/coco now bind ~/.trae migration done-markers read-only
+//     (sandboxReadonlyPaths) so goal-mode stops wedging on the TRAE first-run
+//     migration prompt. That is a new spawn-time mount; a pane predating it warm-
+//     reattaches with the old mount set and still wedges, so it must cold-spawn.
+// #709 (→8) merged first; this PR (#714) rebased on top and takes 9. Numbers stay
+// strictly monotonic — a pane at any intermediate version must be rejected so it
+// cold-spawns under the current contract rather than bypassing a migration.
+export const ISOLATION_PANE_MARKER_VERSION = 9;
 
 export type IsolationCapability = 'credential' | 'read' | 'write';
 
@@ -375,4 +392,32 @@ export function isolatedPaneReattachSafe(
 
 function dedupe(xs: string[]): string[] {
   return Array.from(new Set(xs));
+}
+
+/**
+ * True when this process is a CLI the worker spawned for a bot under READ
+ * ISOLATION (the sandbox), where `~/.botmux/bots.json` is denied ON PURPOSE (it
+ * holds every sibling bot's app secret). Callers use it to tell that EXPECTED
+ * denial apart from a genuine unreadable-config fault.
+ *
+ * The signal is `BOTMUX_READ_ISOLATION`, which the worker sets (and otherwise
+ * explicitly DELETES) on the child env, gated on `sandboxRequested`. It has to
+ * come from the host; two CLI-side guesses were tried and are both wrong:
+ *
+ *   · `SESSION_DATA_DIR` + `BOTMUX_LARK_APP_ID` — injected for EVERY
+ *     worker-spawned CLI, sandboxed or not. Matches ordinary bots, so a real
+ *     "bots.json is unreadable" fault would be silently downgraded to "there are
+ *     no bots" on a normal host.
+ *   · existence of `<BOT_HOME>/send-cred.json` — wrong in BOTH directions: a
+ *     no-transport (apiOnly) bot has its own copy denied by fs-policy
+ *     (`push([`${ctx.botHome}/send-cred.json`], 'deny', 'mandatory')` in the
+ *     `!larkTransport` branch), so a genuinely sandboxed bot reads as
+ *     not-isolated; and the file is never cleaned up, so flipping a bot from
+ *     `sandbox: true` back to `false` leaves a stale one behind that makes an
+ *     ordinary CLI look isolated.
+ *
+ * (Both caught in review, 2026-08-03. Do not "simplify" this back to either.)
+ */
+export function underReadIsolation(): boolean {
+  return process.env.BOTMUX_READ_ISOLATION === '1';
 }

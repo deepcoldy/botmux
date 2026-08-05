@@ -12,6 +12,7 @@ import {
 import { spawn } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
+import { probeHostCredentialIsolationMechanism } from '../src/adapters/backend/sandbox.js';
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
@@ -32,6 +33,14 @@ import type { BotSnapshot } from '../src/workflows/v3/contract.js';
 
 const roots: string[] = [];
 const originalAnthropicApiKey = process.env.ANTHROPIC_API_KEY;
+
+// The PID-namespace spec below launches a REAL bwrap-wrapped helper. bwrap
+// being installed is not enough — unprivileged user-namespace creation is
+// disabled on many CI runners (GitHub Actions), where bwrap dies with "setting
+// up uid map: Permission denied" and the helper never writes its pid. Gate on
+// the SAME runtime probe the worker uses so the spec skips (not fails) there,
+// while still exercising the real namespace collapse on capable hosts.
+const bwrapUsable = probeHostCredentialIsolationMechanism().mechanism === 'bwrap';
 
 // Hermeticity guard. runV3DistillationModel reads process.env for provider
 // selection whenever the bot does NOT own provider config (botOwnsProviderConfiguration
@@ -378,7 +387,7 @@ describe('runV3DistillationModel', () => {
     expect(readdirSync(dirs.scratchParent)).toEqual([]);
   });
 
-  it.skipIf(process.platform !== 'linux')(
+  it.skipIf(process.platform !== 'linux' || !bwrapUsable)(
     'collapses the PID namespace before cleaning scratch',
     async () => {
     const dirs = fixture();

@@ -39,6 +39,10 @@ worker spawnCli
 
 **per-CLI authPaths**：每个适配器用 `authPaths` 声明自己的认证/登录状态目录，沙盒把它们真实 `--bind` 进来，token refresh / login 直接持久化到宿主。默认窄（仅 auth）；CLI 若在 `$HOME` 下放 SQLite DB（codex 系），把整个状态目录加进 `authPaths`（否则该路径不在白名单 → 沙盒里不存在 → DB 打不开或拿不到 fcntl 锁）。macOS 用同一份 policy 经 Seatbelt（`compileToSeatbelt`）落地。
 
+**角色库子树**：开沙盒的 bot 还会拿到 `<角色库根>/<自己 appId>/` 的 `readWrite`。`workingDir` 只覆盖**当前**角色目录，而角色系统要越过它：「有哪些角色 / 切换角色」枚举兄弟角色目录并读各自 `.botmux-dir.json`，「新建角色」写 `users/<openId>/<slug>/` 并复制库根的 `_role-protocol.md`，切换后「沉淀知识」写的是**新**角色目录下的 `knowledge/`。给 `readWrite` 而非 `readOnly` 正是因为最后一条——只读的话枚举和切换都正常，等到写知识才 EPERM。按 appId 限定（不是整个角色库根）：别的 bot 的角色目录、以及其中别的用户的私有角色，仍在白名单外。两道收口：① `botmux-roles` 与 `<appId>` 这**最后两段各自必须是真目录**，任一段是符号链接就不产生规则——否则被预先摆成指向 `~/.ssh` 或别的 bot 角色库的链接时，跟随解析会把链接目标当成本 bot 的子树授 rw（更上层如 `$HOME` 允许是链接，且必须 realpath，否则 canonical 匹配会 fail-open）；② 任何 deny（baseline / 机主 `sandboxPaths.deny` / mandatory）覆盖该子树时这条规则**整条不产生**——source rank 只裁同路径冲突，否则更深的 internal rw 会在被 deny 的库根上重新开个洞。
+
+两件明确不在射程内、也不该只为这条规则加固的：**TOCTOU**（校验后到 spawn/bind 前把目录换成链接）与**挂载点**（末段是 bind/FUSE 挂载点仍算真目录）。两者都需要宿主级写权限，而拿到宿主级写权限的人本来就能改 `bots.json` 关掉沙盒；且策略里每条路径规则（`workingDir`、`botHome`、`cliDataPaths`…）都在同一时点做一次性检查，同样成立。
+
 ## botmux send 中转（关键）
 
 `botmux send` 原本**直连飞书**（读 `bots.json` 拿密钥）。沙盒里没有 `bots.json`，所以：

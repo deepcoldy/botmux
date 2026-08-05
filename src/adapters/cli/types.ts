@@ -10,6 +10,12 @@ export interface PtyHandle {
   /** Send special keys via tmux send-keys, e.g. 'Enter', 'Escape', 'C-c' (tmux mode only).
    *  Returns `false` on a dropped write (see sendText). */
   sendSpecialKeys?(...keys: string[]): void | boolean;
+  /**
+   * Epoch-ms timestamp of the most recent Ctrl+C the backend may have injected.
+   * Snapshot transports record this before an ambiguous send so adapters with
+   * double-Ctrl+C exit gestures can keep their own recovery outside the window.
+   */
+  readonly lastInjectedCancelAt?: number;
   /** Paste text via tmux load-buffer + paste-buffer (auto-brackets if terminal supports it). */
   pasteText?(text: string): void;
   /** Absolute path to Claude Code's session JSONL; set by worker for claude-code adapter.
@@ -88,6 +94,12 @@ export interface CliAdapter {
     workingDir?: string;
     /** CLI-native session id used for resume when it differs from botmux's session id. */
     resumeSessionId?: string;
+    /** When true, resume the `resumeSessionId` transcript but write forward into a
+     *  NEW CLI-native session id instead of the resumed one, leaving the source
+     *  transcript untouched — the native "fork/branch a session" primitive
+     *  (Claude `--fork-session`, `codex fork`). Only meaningful with resume=true
+     *  and a resumeSessionId; adapters whose CLI lacks the primitive ignore it. */
+    forkSession?: boolean;
     initialPrompt?: string;
     botName?: string;
     botOpenId?: string;
@@ -106,6 +118,13 @@ export interface CliAdapter {
     reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh';
     /** When true, do not add adapter-default flags that bypass CLI approvals or disable sandboxing. */
     disableCliBypass?: boolean;
+    /** Codex-family only: when true (default from the global `bypassCodexHookTrust`
+     *  toggle, still ANDed with `!disableCliBypass` by the worker), pass
+     *  `--dangerously-bypass-hook-trust` so a headless plain-TUI launch does not
+     *  wedge on Codex 0.14x's interactive "Press t to trust" gate. Undefined ⇒
+     *  treated as false by adapters (the worker always sends an explicit boolean
+     *  for codex/traex). Does NOT apply to `--remote`/app-server/exec paths. */
+    bypassHookTrust?: boolean;
     /** Optional session-scoped skill plugin/root prepared by botmux. */
     skillPluginDir?: string;
     /** True when this session runs under per-bot read isolation (the worker
@@ -408,6 +427,17 @@ export interface CliAdapter {
    *  Resolved lazily / read AFTER buildArgs() (so a lazily-resolved bin is cached).
    *  Missing/empty → no extra re-expose. */
   sandboxExtraExecPaths?(): readonly string[];
+
+  /** Absolute paths (files or dirs) this adapter needs visible READ-ONLY inside
+   *  the file sandbox — distinct from `authPaths`, which are bound READ-WRITE.
+   *  Use this for host state the CLI only READS (e.g. traex/coco's first-run
+   *  migration done-markers at the ~/.trae root): exposing them read-only lets
+   *  the CLI see them without widening the writable surface to sibling
+   *  hook/plugin/skill code. Wired into the fs-policy `readonlyRoots` channel
+   *  (→ readOnly rule). `~`-expanded + existence-filtered by the worker, so
+   *  listing a path absent on this host is a no-op. Missing/empty → nothing extra
+   *  exposed. Return ONLY paths safe to reveal read-only (never credentials). */
+  sandboxReadonlyPaths?(): readonly string[];
 
   /** Extra env merged into the spawned child's environment. Used by Claude-family
    *  forks to point the CLI at its data root (e.g. Seed's `CLAUDE_CONFIG_DIR`).

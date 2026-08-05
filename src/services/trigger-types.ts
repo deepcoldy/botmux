@@ -131,6 +131,16 @@ export interface TriggerResponse {
     sessionId?: string;
     completedAt?: string;
   };
+  /** Read-only web-terminal URL for the live session's CLI pane, present only
+   *  while a worker web server is up (typically `state:'running'` and at
+   *  `'completed'` before the session closes). Lets an async caller (e.g. riff's
+   *  in-sandbox task-runner) open a live view of the visible CLI TUI — form C.
+   *  Carries the `?viewToken=` read capability inline; knowing it grants read
+   *  only, never terminal input. Omitted when no live worker terminal exists. */
+  readOnlyUrl?: string;
+  /** The bare read capability behind `readOnlyUrl`'s `?viewToken=`, exposed
+   *  separately for callers that build their own URL. Omitted with readOnlyUrl. */
+  viewToken?: string;
 }
 
 export function isRecord(v: unknown): v is Record<string, unknown> {

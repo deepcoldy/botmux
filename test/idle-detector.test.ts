@@ -17,6 +17,7 @@ import { createCocoAdapter } from '../src/adapters/cli/coco.js';
 function makeCli(opts: {
   completionPattern?: RegExp;
   readyPattern?: RegExp;
+  busyPattern?: RegExp;
 } = {}): CliAdapter {
   return {
     id: 'test-cli',
@@ -25,6 +26,7 @@ function makeCli(opts: {
     writeInput: async () => {},
     completionPattern: opts.completionPattern,
     readyPattern: opts.readyPattern,
+    busyPattern: opts.busyPattern,
     systemHints: [],
     altScreen: false,
   };
@@ -180,6 +182,18 @@ describe('IdleDetector: quiescence detection', () => {
 
     // Advance past spinner guard (3000ms) + buffer (200ms)
     vi.advanceTimersByTime(3500);
+    expect(cb).toHaveBeenCalledTimes(1);
+    detector.dispose();
+  });
+
+  it('still reports quiescence after static busy output', () => {
+    const detector = new IdleDetector(makeCli({ busyPattern: /Working\.\.\./ }));
+    const cb = vi.fn();
+    detector.onIdle(cb);
+
+    detector.feed('Tool 3.3s\nWorking...');
+    vi.advanceTimersByTime(10_000);
+
     expect(cb).toHaveBeenCalledTimes(1);
     detector.dispose();
   });

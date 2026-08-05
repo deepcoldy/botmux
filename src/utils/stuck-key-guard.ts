@@ -11,7 +11,7 @@
  *   - fresh capture returns null or throws  → no keys written, send expired
  *   - backend/lifetime changed after capture, OR page type no longer matches
  *     → no keys written, send expired
- *   - write success → send delivered; write returns false or throws → send expired
+ *   - write success → send delivered; write returns false or throws → send failed
  *
  * backend/lifetime are read via getters (not value snapshots) so the guard can
  * re-check LIVE state after `await capture()` — a backend replacement or CLI
@@ -29,7 +29,7 @@ export interface StuckKeyGuardMessage {
 
 export interface StuckKeyGuardResult {
   /** What was sent back to the daemon, if anything. */
-  sent: 'delivered' | 'expired' | 'none';
+  sent: 'delivered' | 'expired' | 'failed' | 'none';
   /** Whether keys were actually written to the backend. */
   wroteKeys: boolean;
 }
@@ -73,6 +73,7 @@ export interface StuckKeyGuardDeps {
   /** Sends a message back to the daemon. */
   sendExpired: (nonce: number, turnId: string | undefined, dispatchAttempt: number | undefined) => void;
   sendDelivered: (nonce: number, turnId: string | undefined, dispatchAttempt: number | undefined) => void;
+  sendFailed: (nonce: number, turnId: string | undefined, dispatchAttempt: number | undefined) => void;
   log: (msg: string) => void;
 }
 
@@ -87,7 +88,21 @@ export async function processStuckWarningTuiKeys(
   deps: StuckKeyGuardDeps,
 ): Promise<StuckKeyGuardResult> {
   const { stuckNonce, stuckPageType, stuckCliLifetime, keys, isFinal } = msg;
-  const { getBackend, getCurrentLifetime, renderCols, renderRows, turnId, dispatchAttempt, capture, match, writeKeys, sendExpired, sendDelivered, log } = deps;
+  const {
+    getBackend,
+    getCurrentLifetime,
+    renderCols,
+    renderRows,
+    turnId,
+    dispatchAttempt,
+    capture,
+    match,
+    writeKeys,
+    sendExpired,
+    sendDelivered,
+    sendFailed,
+    log,
+  } = deps;
 
   // P1-2: validate the CLI lifetime the card was issued for BEFORE doing
   // anything else. If the CLI restarted between card post and click,
@@ -143,6 +158,6 @@ export async function processStuckWarningTuiKeys(
     sendDelivered(stuckNonce, turnId, dispatchAttempt);
     return { sent: 'delivered', wroteKeys: true };
   }
-  sendExpired(stuckNonce, turnId, dispatchAttempt);
-  return { sent: 'expired', wroteKeys: false };
+  sendFailed(stuckNonce, turnId, dispatchAttempt);
+  return { sent: 'failed', wroteKeys: false };
 }

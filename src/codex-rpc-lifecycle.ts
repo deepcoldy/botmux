@@ -2,7 +2,12 @@
 // out of worker.ts (which auto-registers process handlers on import) so the gate
 // and the pane-ownership detection can be unit-tested with injected probes.
 import { execFileSync } from 'node:child_process';
-import { readCmdline, readComm, getChildPids } from './core/session-discovery.js';
+import {
+  getChildPids,
+  processExecutableArgvSlots,
+  readCmdline,
+  readComm,
+} from './core/session-discovery.js';
 import type { DaemonToWorker } from './types.js';
 
 type InitCfg = Extract<DaemonToWorker, { type: 'init' }>;
@@ -21,10 +26,10 @@ export const RPC_CAPABLE_CLIS = new Set(['codex', 'traex']);
  *   - startupCommands: /effort etc. must run in the TUI before the first turn,
  *     but the fresh first turn is sent pre-spawn to persist the rollout — RPC
  *     can't honor that ordering, so fail-closed (P1-4).
- *   - wrapperCli / cliPathOverride: the app-server is launched as `<bin>
- *     app-server`, which a wrapper/alternate launcher won't satisfy the same way
- *     the TUI's buildArgs does — two launchers would diverge, so fail-closed
- *     (P1-2).
+ *   - wrapperCli / legacy cliPathOverride: the app-server is launched as `<bin>
+ *     app-server`, which an ambiguous wrapper/alternate launcher won't satisfy
+ *     the same way the TUI's buildArgs does. A structured compatible runtime is
+ *     the only path override allowed through this gate (P1-2).
  *   - backendType !== 'tmux': the pane-ownership detection + controlled respawn
  *     are only wired for tmux. On herdr/zellij a surviving dead `--remote` pane
  *     would be misjudged as native and reattached, and pty has no persistent
@@ -37,15 +42,32 @@ export interface CodexRpcRuntimeGates {
   sandboxForced?: boolean;
 }
 
+function executableName(value: string): string {
+  const normalized = value.replace(/\\/g, '/').replace(/\/+$/, '');
+  return normalized.slice(normalized.lastIndexOf('/') + 1).toLowerCase();
+}
+
 export function codexRpcEligible(cfg: InitCfg, runtime: CodexRpcRuntimeGates = {}): boolean {
   const wantResume = cfg.resume === true && !!cfg.cliSessionId;
+  // A structured runtime is an explicit declaration that this executable
+  // implements the Codex adapter contract. Legacy path overrides remain
+  // ambiguous wrappers/routers and therefore keep the historical fail-closed
+  // paste behavior.
+  const compatibleRuntimePath = cfg.cliRuntime?.source === 'configured'
+    && typeof cfg.cliPathOverride === 'string'
+    && cfg.cliPathOverride === cfg.cliRuntime.executable;
+  const runtimeExecutableEligible = cfg.cliRuntime?.source === 'configured'
+    ? compatibleRuntimePath
+    : cfg.cliRuntime?.source === 'legacy-path'
+      ? false
+      : !cfg.cliPathOverride;
   return (
     cfg.codexRpcInput === true && RPC_CAPABLE_CLIS.has(cfg.cliId) &&
     cfg.backendType === 'tmux' &&
     cfg.adoptMode !== true && cfg.readIsolation !== true && cfg.sandbox !== true && runtime.sandboxForced !== true &&
     cfg.disableCliBypass !== true &&
     !cfg.startupCommands?.length &&
-    !cfg.wrapperCli && !cfg.cliPathOverride &&
+    !cfg.wrapperCli && runtimeExecutableEligible &&
     (!!cfg.prompt || wantResume)
   );
 }
@@ -268,13 +290,20 @@ function tmuxPanePid(sessionName: string): number | undefined {
  *  daemon-restart resume never force-respawns a possibly-mid-turn native pane.
  *  This is a live-argv check, not a persisted marker, so there is no stale-marker
  *  hazard. Probes are injectable for tests (defaults hit the real OS/tmux). */
-export function paneRunsRemoteTui(persistentSessionName: string, probes: PaneProbes = {}): boolean {
+export function paneRunsRemoteTui(
+  persistentSessionName: string,
+  probes: PaneProbes = {},
+  expectedExecutable?: string,
+): boolean {
   const panePidOf = probes.panePidOf ?? tmuxPanePid;
   const argvOf = probes.argvOf ?? readCmdline;
   const commOf = probes.commOf ?? readComm;
   const childrenOf = probes.childrenOf ?? getChildPids;
   const panePid = panePidOf(persistentSessionName);
   if (panePid === undefined || !Number.isInteger(panePid) || panePid <= 0) return false;
+  const expectedNames = expectedExecutable
+    ? new Set([executableName(expectedExecutable)])
+    : new Set(['codex', 'traex']);
   let frontier = [panePid];
   const seen = new Set<number>();
   for (let depth = 0; depth <= 4 && frontier.length; depth++) {
@@ -284,8 +313,17 @@ export function paneRunsRemoteTui(persistentSessionName: string, probes: PanePro
       seen.add(pid);
       const argv = argvOf(pid);
       if (argv.length) {
-        const comm = commOf(pid) ?? '';
-        const isCodexFamily = /^(codex|traex)/i.test(comm) || argv.some(a => /(?:^|\/)(codex|traex)$/i.test(a));
+        // Probe each process once: /proc can disappear between reads, and
+        // injected probes are allowed to be stateful in tests.
+        const rawComm = commOf(pid) ?? '';
+        const comm = executableName(rawComm);
+        const isCodexFamily = expectedNames.has(comm)
+          // npm-installed CLIs commonly appear behind node flags. Reuse adopt
+          // discovery's constrained executable-slot parser so a known launcher
+          // shape is recognized without letting arbitrary later arguments
+          // establish pane ownership.
+          || processExecutableArgvSlots(rawComm, argv)
+            .some((arg) => expectedNames.has(executableName(arg)));
         if (isCodexFamily && argv.includes('--remote')) return true;
       }
       next.push(...childrenOf(pid));

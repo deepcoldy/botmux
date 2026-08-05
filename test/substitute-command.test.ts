@@ -151,4 +151,48 @@ describe('tryHandleSubstituteCommand', () => {
     expect(lastReply()).toBe('cmd.substitute.topic_disabled');
     expect(mockSetSubstituteEnabledForChat).not.toHaveBeenCalled();
   });
+
+  it('excludedChats blocklist reports blocked instead of a false per-chat success', async () => {
+    mockGetBot.mockReturnValue({
+      config: {
+        substituteMode: {
+          enabled: true,
+          targets: [{ openId: 'ou_sub' }],
+          topicGroups: true,
+          excludedChats: ['oc_group'],
+        },
+      },
+    });
+
+    await tryHandleSubstituteCommand(APP, msg('/substitute status'), USER);
+    expect(lastReply()).toBe('cmd.substitute.blocked');
+
+    await tryHandleSubstituteCommand(APP, msg('/substitute on'), USER);
+    expect(lastReply()).toBe('cmd.substitute.blocked');
+    expect(mockSetSubstituteEnabledForChat).not.toHaveBeenCalled();
+
+    // Blocked check is deliberately before the owner check (屏蔽状态非敏感，人人可见):
+    // a non-operator also sees blocked, not owner_only.
+    mockCanOperate.mockReturnValue(false);
+    await tryHandleSubstituteCommand(APP, msg('/substitute on'), USER);
+    expect(lastReply()).toBe('cmd.substitute.blocked');
+    expect(mockSetSubstituteEnabledForChat).not.toHaveBeenCalled();
+  });
+
+  it('non-blocklisted chats keep working when a blocklist is configured', async () => {
+    mockGetBot.mockReturnValue({
+      config: {
+        substituteMode: {
+          enabled: true,
+          targets: [{ openId: 'ou_sub' }],
+          topicGroups: true,
+          excludedChats: ['oc_other'],
+        },
+      },
+    });
+
+    await tryHandleSubstituteCommand(APP, msg('/substitute on'), USER);
+    expect(mockSetSubstituteEnabledForChat).toHaveBeenCalledWith(APP, 'oc_group', true);
+    expect(lastReply()).toBe('cmd.substitute.updated_on');
+  });
 });

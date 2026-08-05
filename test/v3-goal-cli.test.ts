@@ -355,10 +355,28 @@ describe('botmux goal run — machine terminal contract', () => {
       { cwd: process.cwd(), stdio: 'ignore' },
     );
     children.push(child);
-    for (let index = 0; index < 200 && !existsSync(readyPath); index++) {
+    // Two preconditions before the kill, both polled (no fixed-timing guess):
+    //  1. `ready` — the fixture reached runNode (dispatch happened).
+    //  2. attempt 001's `nodeDispatched` is DURABLE on disk — runNode writes
+    //     `ready` synchronously, but the journal append can still be in flight;
+    //     killing before 001 is flushed would leave nothing to re-drive and the
+    //     recovery assertion (['001','002']) would flake. Wait for the journal
+    //     to actually carry 001 so the SIGKILL lands on a persisted in-flight run.
+    const journalPath = join(base, 'kill9-recover', 'journal.ndjson');
+    const has001 = (): boolean => {
+      if (!existsSync(journalPath)) return false;
+      try {
+        return readJournal(journalPath).some(
+          (event) => event.type === 'nodeDispatched'
+            && event.attemptId === 'goal#001/attempts/001',
+        );
+      } catch { return false; }
+    };
+    for (let index = 0; index < 500 && !(existsSync(readyPath) && has001()); index++) {
       await new Promise((resolve) => setTimeout(resolve, 10));
     }
     expect(existsSync(readyPath)).toBe(true);
+    expect(has001()).toBe(true);
     child.kill('SIGKILL');
     await once(child, 'exit');
 

@@ -2,6 +2,7 @@ import { describe, it, expect, vi } from 'vitest';
 import {
   resolveQuoteTarget,
   validateMentionDecision,
+  shouldBlockMentionBackByParticipants,
   parseAttentionFlag,
   attentionUsageError,
   managedVcQuoteError,
@@ -245,6 +246,38 @@ describe('validateMentionDecision', () => {
 
   it('--top-level exempt from gate', () => {
     expect(validateMentionDecision({ ...base, sendTopLevel: true }).ok).toBe(true);
+  });
+});
+
+describe('shouldBlockMentionBackByParticipants', () => {
+  it('p2p DM never blocks (inherently 1v1), regardless of reported counts', () => {
+    // p2p short-circuits before any count check — caller skips the API fetch.
+    expect(shouldBlockMentionBackByParticipants({ chatType: 'p2p', userCount: 999, botCount: 999 })).toBe(false);
+  });
+
+  it('allows 1 human + 1 bot (true 1v1 group, sum = 2)', () => {
+    expect(shouldBlockMentionBackByParticipants({ chatType: 'group', userCount: 1, botCount: 1 })).toBe(false);
+  });
+
+  it('allows a lone human with no bot yet (sum = 1)', () => {
+    expect(shouldBlockMentionBackByParticipants({ chatType: 'group', userCount: 1, botCount: 0 })).toBe(false);
+  });
+
+  it('blocks 2 humans + 1 bot (sum = 3 > 2)', () => {
+    expect(shouldBlockMentionBackByParticipants({ chatType: 'group', userCount: 2, botCount: 1 })).toBe(true);
+  });
+
+  it('blocks 1 human + 2 bots (multi-bot needs explicit @, sum = 3)', () => {
+    expect(shouldBlockMentionBackByParticipants({ chatType: 'group', userCount: 1, botCount: 2 })).toBe(true);
+  });
+
+  it('getGroupStats soft-failure fallback {999,999} fails closed to blocked', () => {
+    expect(shouldBlockMentionBackByParticipants({ chatType: 'group', userCount: 999, botCount: 999 })).toBe(true);
+  });
+
+  it('undefined chatType (unknown) still counts participants — sum > 2 blocks', () => {
+    expect(shouldBlockMentionBackByParticipants({ userCount: 3, botCount: 0 })).toBe(true);
+    expect(shouldBlockMentionBackByParticipants({ userCount: 1, botCount: 1 })).toBe(false);
   });
 });
 
