@@ -8,6 +8,7 @@ import {
   traexRolloutHasUserInputSince,
   traexHistoryMatchDelta,
   traexHistorySize,
+  traexHistorySidIsOwned,
 } from '../src/services/traex-transcript.js';
 
 const SID = '00000000-0000-7000-8000-000000000001';
@@ -267,5 +268,29 @@ describe('traexHistoryMatchDelta (submit-time history.jsonl verification)', () =
     const body = histLine('eeee5555-0000-7000-8000-000000000055', 'sized');
     writeFileSync(histPath, body);
     expect(traexHistorySize(histPath)).toBe(Buffer.byteLength(body));
+  });
+});
+
+describe('traexHistorySidIsOwned (ownership gate predicate)', () => {
+  const OWNED = 'aaaa1111-0000-7000-8000-000000000001';
+  const FOREIGN = 'ffff0000-0000-7000-8000-00000000000f';
+
+  it('accepts an id present in the owned set (case-insensitive)', () => {
+    const owned = new Set([OWNED.toLowerCase()]);
+    expect(traexHistorySidIsOwned(OWNED, owned)).toBe(true);
+    expect(traexHistorySidIsOwned(OWNED.toUpperCase(), owned)).toBe(true);
+  });
+
+  it('rejects an id NOT in the owned set (foreign sibling pane)', () => {
+    const owned = new Set([OWNED.toLowerCase()]);
+    expect(traexHistorySidIsOwned(FOREIGN, owned)).toBe(false);
+  });
+
+  it('fails closed when the set is undefined (fd enumeration unavailable)', () => {
+    expect(traexHistorySidIsOwned(OWNED, undefined)).toBe(false);
+  });
+
+  it('fails closed on an empty set (pid holds no TRAE rollout)', () => {
+    expect(traexHistorySidIsOwned(OWNED, new Set())).toBe(false);
   });
 });

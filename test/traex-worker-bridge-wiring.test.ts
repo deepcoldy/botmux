@@ -42,6 +42,55 @@ describe('TRAE worker structured-bridge wiring', () => {
     expect(traex).toContain('codexBridgePendingSessionId = cliSessionId;');
   });
 
+  it('gates the history-derived TRAE re-attach on pid-fd ownership (foreign sibling id refused)', () => {
+    // history.jsonl is a global file shared by every TRAE pane under one
+    // TRAE_HOME; a sibling pane's identical text (e.g. a bare adopt-mode reply
+    // with no unique <session_id>) can surface a foreign id. The rotation branch
+    // must refuse to re-attach the bridge to an id THIS pid does not own, and
+    // the ownership check must run BEFORE the bridge is detached/re-attached.
+    const start = workerSource.indexOf('function codexBridgeNotifyCliSessionId');
+    const end = workerSource.indexOf('function maybeFollowGrokSessionRotationViaPid', start);
+    const notify = workerSource.slice(start, end);
+    const traexStart = notify.indexOf('if (structuredBridgeIsTraex())');
+    const traex = notify.slice(traexStart, notify.indexOf('// Grok', traexStart));
+
+    expect(traex).toContain('traexHistorySidOwnedByCurrentPid(cliSessionId)');
+    // Gate must precede the detach/re-attach so an unowned id keeps the binding.
+    expect(traex.indexOf('traexHistorySidOwnedByCurrentPid(cliSessionId)'))
+      .toBeLessThan(traex.indexOf('codexBridgeDetachFile();'));
+    expect(traex).toContain('refusing history-only re-attach');
+  });
+
+  it('resolves the observed TRAE pid from backend.cliPid → child pid → adopt-pending pid', () => {
+    const start = workerSource.indexOf('function currentTraexObservedPid');
+    const end = workerSource.indexOf('\n}\n', start);
+    const body = workerSource.slice(start, end);
+
+    expect(body).toContain('.cliPid');
+    expect(body).toContain('backend?.getChildPid?.()');
+    expect(body).toContain('codexAdoptPendingPid');
+  });
+
+  it('gates the ownership decision through the pure fail-closed predicate', () => {
+    const start = workerSource.indexOf('function traexHistorySidOwnedByCurrentPid');
+    const end = workerSource.indexOf('\n}\n', start);
+    const body = workerSource.slice(start, end);
+
+    expect(body).toContain('currentTraexObservedPid()');
+    expect(body).toContain('findTraexRolloutSetByPid(pid)');
+    expect(body).toContain('traexHistorySidIsOwned(cliSessionId, ownedRollouts)');
+  });
+
+  it('wires fresh-managed TRAE cliPid so writeInput can prove submit ownership', () => {
+    // Without this, backend.cliPid is unset for a normal TRAE PTY/tmux session
+    // and the ownership gate can never admit the session id (only adopt mode,
+    // via adoptCliPid, would). Both the sync and async(zellij) wiring sites must
+    // include traex alongside grok.
+    const matches = workerSource.match(/claudeDataDir \|\| cfg\.cliId === 'grok' \|\| cfg\.cliId === 'traex'/g) ?? [];
+    expect(matches.length).toBeGreaterThanOrEqual(2);
+  });
+
+
   it('follows the adopted TRAE pid so direct local /new rotation is observable', () => {
     expect(workerSource).toContain('maybeFollowTraexSessionRotationViaPid();');
     const start = workerSource.indexOf('function maybeFollowTraexSessionRotationViaPid');

@@ -132,7 +132,7 @@ import {
 import { buildBotmuxLarkNativeSessionTitle } from './core/session-title.js';
 import { drainCodexRollout, findCodexRolloutBySessionId, findCodexRolloutByPid, findCodexRolloutSetByPid, codexHistorySidIsOwned, splitCodexEventsByCutoff, extractLastCodexTurn, codexSessionIdFromRolloutPath, scanCodexThreadSettings, type CodexBridgeEvent, type CodexDrainResult } from './services/codex-transcript.js';
 import { CodexServiceTierTracker, resolveCodexServiceTierSnapshot } from './services/codex-service-tier.js';
-import { drainTraexRollout, findTraexRolloutBySessionId, findTraexRolloutByPid } from './services/traex-transcript.js';
+import { drainTraexRollout, findTraexRolloutBySessionId, findTraexRolloutByPid, findTraexRolloutSetByPid, traexHistorySidIsOwned } from './services/traex-transcript.js';
 import { parseTraexUserInputQuestions } from './services/traex-user-input.js';
 import { cocoEventsPathForSession, drainCocoEvents, findCocoSessionByPid } from './services/coco-transcript.js';
 import { currentHermesStateOffset, drainHermesStateDb, resolveHermesStateDbPath } from './services/hermes-transcript.js';
@@ -3935,6 +3935,37 @@ function codexHistorySidOwnedByCurrentPid(cliSessionId: string): boolean {
   return owned;
 }
 
+/** TRAE counterpart of currentCodexObservedPid: the pid of the TRAE process
+ *  this worker observes (spawned child or adopted pane). Same resolution order
+ *  — the wired backend.cliPid first, then the live pane child pid, then the
+ *  adopt-pending pid (which is populated for TRAE too, see the codex/traex
+ *  branch around line 3674). */
+function currentTraexObservedPid(): number | undefined {
+  return (backend as { cliPid?: number } | null)?.cliPid
+    ?? backend?.getChildPid?.()
+    ?? codexAdoptPendingPid;
+}
+
+/** Ownership gate for binding a TRAE session id that came from the GLOBAL
+ *  history.jsonl (shared by every TRAE pane under one TRAE_HOME). A concurrent
+ *  sibling pane submitting identical text — e.g. a bare "继续" in adopt mode,
+ *  which carries no unique <session_id> — can make writeInput's history match
+ *  surface a FOREIGN session id. Before persisting it (resume target) or
+ *  (re-)attaching the transcript bridge, require the id to be one THIS pid
+ *  actually holds open. FAIL CLOSED: unavailable fd enumeration (undefined set)
+ *  or a non-member id → false, so the caller keeps its current binding. Mirrors
+ *  codexHistorySidOwnedByCurrentPid; the pure decision lives in
+ *  traexHistorySidIsOwned for unit testing without a live pid. */
+function traexHistorySidOwnedByCurrentPid(cliSessionId: string): boolean {
+  const pid = currentTraexObservedPid();
+  const ownedRollouts = pid ? findTraexRolloutSetByPid(pid) : undefined;
+  const owned = traexHistorySidIsOwned(cliSessionId, ownedRollouts);
+  if (!owned) {
+    log(`TRAE session id ${cliSessionId} not owned by pid ${pid ?? '?'} (open rollouts: ${ownedRollouts ? [...ownedRollouts].join(',') || 'none' : 'unknown'})`);
+  }
+  return owned;
+}
+
 /** Called from flushPending after writeInput first returns a cliSessionId.
  *  Tries to locate the rollout file immediately; if it's not on disk yet,
  *  remembers the sid so the 1s poller can keep retrying. */
@@ -3990,6 +4021,15 @@ function codexBridgeNotifyCliSessionId(cliSessionId: string): void {
     if (structuredBridgeIsTraex()) {
       const currentSid = codexSessionIdFromRolloutPath(codexBridgeRolloutPath);
       if (currentSid && currentSid.toLowerCase() === cliSessionId.toLowerCase()) return;
+      // Ownership gate: the reported id came from the GLOBAL history.jsonl, so a
+      // sibling pane's identical text (e.g. a bare adopt-mode reply with no
+      // unique <session_id>) could surface a foreign id. Only rotate the bridge
+      // to a rollout THIS pid holds open; otherwise keep the current binding
+      // (fail closed on unknown/unowned). Mirrors the codex branch above.
+      if (!traexHistorySidOwnedByCurrentPid(cliSessionId)) {
+        log(`Keeping current TRAE bridge ${currentSid ?? '?'} — refusing history-only re-attach to ${cliSessionId}`);
+        return;
+      }
       const next = resolveFileBridgePath('traex', { sessionId: cliSessionId });
       // Close any terminal already committed to the retired rollout before
       // switching. A durable turn is a worker HOL barrier, so a legitimate
@@ -9579,11 +9619,17 @@ async function spawnCli(
   //   - claude-code: ~/.claude/sessions/<pid>.json
   //   - grok: findGrokSessionByPid → preferSessionId against shared
   //     prompt_history (concurrent same-cwd workers must not cross-claim)
+  //   - traex: findTraexRolloutSetByPid → ownership gate for the shared global
+  //     history.jsonl (concurrent same-TRAE_HOME panes must not cross-claim a
+  //     sibling's session id from an identical-text submit). getChildPid() is
+  //     the tmux/pty pane leaf = the traex process (traex has no launcher
+  //     indirection; a rare wrapperCli+traex combo isn't rewired here, so its
+  //     unowned pid just fails closed — no wrong id, only lost id capture).
   // Claude's sessionId is set ONCE at process start (2.1.123); a `--resume`
   // lookup will surface here, but in-pane `/clear` won't. The pinned
   // claudeJsonlPath above is still the initial guess; the resolver corrects
   // it on first write when Claude was started with `--resume`.
-  if (cliPid && (claudeDataDir || cfg.cliId === 'grok')) {
+  if (cliPid && (claudeDataDir || cfg.cliId === 'grok' || cfg.cliId === 'traex')) {
     (backend as TmuxBackend | PtyBackend | ZellijBackend | ZmxBackend).cliPid = cliPid;
     (backend as TmuxBackend | PtyBackend | ZellijBackend | ZmxBackend).cliCwd = cfg.workingDir;
   }
@@ -9613,7 +9659,7 @@ async function spawnCli(
             log(`Failed to write CLI PID marker (async): ${err.message}`);
           }
         }
-        if (claudeDataDir || cfg.cliId === 'grok') {
+        if (claudeDataDir || cfg.cliId === 'grok' || cfg.cliId === 'traex') {
           (backend as TmuxBackend | PtyBackend | ZellijBackend | ZmxBackend).cliPid = pid;
           (backend as TmuxBackend | PtyBackend | ZellijBackend | ZmxBackend).cliCwd = cfg.workingDir;
         }

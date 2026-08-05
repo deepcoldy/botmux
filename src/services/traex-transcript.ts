@@ -302,8 +302,8 @@ export function findTraexRolloutByPid(pid: number): { path: string; cliSessionId
  *  ownership gate for a shared-history.jsonl submit match: only a sid this pid
  *  actually owns is safe to accept, so a concurrent sibling pane's identical
  *  text can't hand back a foreign session id. Empty Set = pid holds no TRAE
- *  rollout; undefined = fd enumeration unavailable (caller must fail open on
- *  the ownership check but the worker's attach gate re-verifies). Mirrors
+ *  rollout; undefined = fd enumeration unavailable (callers must treat undefined
+ *  as "cannot prove ownership" — fail closed, do not bind). Mirrors
  *  findCodexRolloutSetByPid. */
 export function findTraexRolloutSetByPid(pid: number): Set<string> | undefined {
   const targets = traexProcessOpenTargets(pid);
@@ -315,6 +315,22 @@ export function findTraexRolloutSetByPid(pid: number): Set<string> | undefined {
   }
   return set;
 }
+
+/** Pure ownership decision: is `cliSessionId` one of the rollouts the observed
+ *  pid holds open? `ownedRollouts` is the lowercased sid set from
+ *  findTraexRolloutSetByPid (undefined when fd enumeration was unavailable).
+ *  FAIL CLOSED — a missing set or a non-member id returns false so the caller
+ *  never binds the bridge (or persists a resume id) it can't prove the pid owns.
+ *  Extracted so the exact predicate the worker's persist/attach gates use is
+ *  unit-testable without a live pid. Mirrors codexHistorySidIsOwned. */
+export function traexHistorySidIsOwned(
+  cliSessionId: string,
+  ownedRollouts: Set<string> | undefined,
+): boolean {
+  if (!ownedRollouts) return false;
+  return ownedRollouts.has(cliSessionId.toLowerCase());
+}
+
 
 /** Locate the rollout file for a given TRAE session UUID. Filename shape is
  *  identical to Codex: `rollout-<ts>-<sid>.jsonl`, so a suffix match over the

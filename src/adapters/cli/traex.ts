@@ -8,7 +8,7 @@ import {
   traexHistoryMatchDelta,
   traexHistorySize,
   findTraexRolloutSetByPid,
-  type TraexHistorySidFilter,
+  traexHistorySidIsOwned,
 } from '../../services/traex-transcript.js';
 import { discoverRolloutSessions } from '../../services/resumable-session-discovery.js';
 import { delay } from '../../utils/timing.js';
@@ -76,26 +76,26 @@ function withDb<T>(fn: (db: DatabaseSyncLike) => T): T | null {
   }
 }
 
-/** Build the ownership filter for the shared global history.jsonl. When the
- * TRAE pid is known, only accept a same-text history line whose session id is
- * one THIS pid currently holds open — so a concurrent sibling pane's identical
- * text (same TRAE_HOME) can't hand us its foreign session id. The open-rollout
- * set is re-fetched on EVERY match attempt (not snapshotted): a just-started
- * session's owned rollout fd can appear slightly after its history line, and a
- * snapshot would permanently reject it. When the pid is unknown or its rollout
- * set can't be enumerated, fall back to accept-first — preserving single-pane /
- * no-pid submit-confirmation semantics; the worker-side attach gate is the
- * backstop there. Mirrors codex.ts writeInput's acceptSid. */
-function buildHistorySidFilter(cliPid: number | undefined): TraexHistorySidFilter | undefined {
-  if (!cliPid) return undefined;
-  return (sid) => {
-    if (!sid) return false;
-    const owned = findTraexRolloutSetByPid(cliPid);
-    // set unavailable (enumeration failed) → don't block the submit
-    // confirmation; the worker attach gate re-checks ownership.
-    if (!owned) return true;
-    return owned.has(sid.toLowerCase());
-  };
+/** Decide whether a session id surfaced by the history text match is safe to
+ * RETURN to the worker as a candidate for persist / bridge attach.
+ *
+ * Two separable facts: the text match confirms the SUBMIT (a full-content match
+ * in the global submit log — this is ownership-INDEPENDENT and must never be
+ * gated, or a foreign-first line / unknown pid would re-introduce the false
+ * "submission couldn't be confirmed" warning this fix removes). The reported
+ * session id is a weaker signal: history.jsonl is shared by every TRAE pane
+ * under one TRAE_HOME, so a sibling pane's identical text (e.g. a bare "继续" in
+ * adopt mode, which carries no unique <session_id>) can surface a FOREIGN id.
+ *
+ * So we ALWAYS confirm the submit on a text match, but only attach the id when
+ * THIS pid provably holds that rollout open (fail closed on unknown pid /
+ * unavailable enumeration / non-member). The open-rollout set is re-fetched per
+ * call, not snapshotted. TRAE additionally has a worker-side gate
+ * (traexHistorySidOwnedByCurrentPid) whose pid resolution is richer than
+ * pty.cliPid, so the authoritative persist/attach decision still lands there. */
+function traexSidOwnedByPid(cliPid: number | undefined, sid: string | undefined): boolean {
+  if (!cliPid || !sid) return false;
+  return traexHistorySidIsOwned(sid, findTraexRolloutSetByPid(cliPid));
 }
 
 
@@ -265,14 +265,24 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
       const historyPath = traeHistoryPath();
       const baseByte = traexHistorySize(historyPath);
 
-      // Ownership filter for the shared-TRAE_HOME history.jsonl (see
-      // buildHistorySidFilter). Accept-first when the pid is unknown.
       const cliPid = typeof pty.cliPid === 'number' && Number.isInteger(pty.cliPid) && pty.cliPid > 0
         ? pty.cliPid
         : undefined;
-      const acceptSid = buildHistorySidFilter(cliPid);
 
-      const matchNow = () => traexHistoryMatchDelta(historyPath, baseByte, content, acceptSid);
+      // The text match confirms the SUBMIT (a full-content match in the global
+      // submit log). The reported session id is a SEPARATE, weaker signal:
+      // history.jsonl is shared by every TRAE pane under one TRAE_HOME, so a
+      // sibling pane's identical text can surface a foreign id. Only return the
+      // id when THIS pid provably owns that rollout — otherwise confirm the
+      // submit WITHOUT an id so the worker never persists/attaches an unverified
+      // one. traexHistoryMatchDelta is called with no ownership filter: we do
+      // NOT want a foreign-first line to mask our own submit confirmation; we
+      // gate on ownership only for the returned id.
+      const confirmResult = (sid?: string) =>
+        sid && traexSidOwnedByPid(cliPid, sid)
+          ? { submitted: true as const, cliSessionId: sid }
+          : { submitted: true as const };
+      const matchNow = () => traexHistoryMatchDelta(historyPath, baseByte, content);
 
       try {
         if (pty.pasteText) pty.pasteText(content);
@@ -285,28 +295,18 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
 
       for (let attempt = 0; attempt < 3; attempt++) {
         const match = matchNow();
-        if (match.found) {
-          return match.cliSessionId
-            ? { submitted: true, cliSessionId: match.cliSessionId }
-            : { submitted: true };
-        }
+        if (match.found) return confirmResult(match.cliSessionId);
         await delay(800);
         if (!trySendEnter()) return { submitted: false };
       }
       const finalMatch = matchNow();
-      if (finalMatch.found) {
-        return finalMatch.cliSessionId
-          ? { submitted: true, cliSessionId: finalMatch.cliSessionId }
-          : { submitted: true };
-      }
+      if (finalMatch.found) return confirmResult(finalMatch.cliSessionId);
       // In-band budget exhausted. Hand the worker a recheck closure: a slow or
       // busy TRAE may still append our history line after the retries gave up,
       // and the worker re-scans on a delay before warning the user.
       const recheck = () => {
         const late = matchNow();
-        return late.found
-          ? { submitted: true, cliSessionId: late.cliSessionId }
-          : false;
+        return late.found ? confirmResult(late.cliSessionId) : false;
       };
       return { submitted: false, recheck };
     },
