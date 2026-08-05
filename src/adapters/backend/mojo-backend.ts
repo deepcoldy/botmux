@@ -53,7 +53,7 @@ import { logger } from '../../utils/logger.js';
 import type { SessionBackend, SpawnOpts } from './types.js';
 import type {
     MojoAuthStatus,
-    MojoBackendConfig,
+    EffectiveMojoConfig,
     MojoCliEnvelope,
     MojoError,
     MojoLineStyle,
@@ -104,7 +104,7 @@ const SEEN_RESULTS_MAX = 64;
 type MojoChild = ChildProcessByStdio<null, Readable, Readable>;
 
 export class MojoBackend implements SessionBackend {
-    private readonly config: MojoBackendConfig;
+    private readonly config: EffectiveMojoConfig;
     private readonly sessionId: string;
 
     private dataCb: ((data: string) => void) | null = null;
@@ -159,7 +159,7 @@ export class MojoBackend implements SessionBackend {
     private extraCliArgs: string[] = [];
     private writeChain: Promise<void> = Promise.resolve();
 
-    constructor(config: MojoBackendConfig, sessionId: string) {
+    constructor(config: EffectiveMojoConfig, sessionId: string) {
         this.config = config;
         this.sessionId = sessionId;
         // Daemon-restart resume: the persisted mojo session id restores the
@@ -182,11 +182,19 @@ export class MojoBackend implements SessionBackend {
         // — a fully-remote mojo session never requests the local sandbox, and a
         // locally-executing one that does is refused before spawn (see
         // backendSandboxCompatibilityError).
+        // Generic extra args come from the config: the worker deliberately keeps
+        // them out of both the spawn args and the wrapper prefix so they can be
+        // appended AFTER our own flags on every turn (last-value-wins). Fall back
+        // to the spawn args for any caller that has not been updated.
+        this.extraCliArgs = this.config.extraCliArgs
+            ? [...this.config.extraCliArgs]
+            : (args.length > 0 && !this.config.wrapperCli ? [...args] : []);
+
         if (this.config.wrapperCli) {
             this.wrapperResolved = true;
             if (bin) {
-                // buildWrappedLaunch already folded the worker's generic args into
-                // this prefix, so they must NOT be added again below.
+                // The worker resolves the prefix with `[]` for args, so whatever
+                // arrives here is the wrapper itself and nothing else.
                 this.launchPrefix = { bin, args: [...args] };
                 logger.info(`[mojo] launch prefix from wrapperCli: ${bin} ${args.join(' ')}`);
             } else {
@@ -195,12 +203,7 @@ export class MojoBackend implements SessionBackend {
                     `[mojo] wrapperCli="${this.config.wrapperCli}" was configured but the worker `
                     + 'supplied no launch binary — running mojo unwrapped',
                 );
-                this.extraCliArgs = [...args];
             }
-        } else {
-            // No wrapper: `bin` is the adapter's empty resolvedBin and `args` is
-            // whatever the worker's generic pipeline produced.
-            this.extraCliArgs = [...args];
         }
         if (this.extraCliArgs.length > 0) {
             logger.info(`[mojo] extra CLI args applied per turn: ${this.extraCliArgs.join(' ')}`);
@@ -761,7 +764,7 @@ export class MojoBackend implements SessionBackend {
  * cancelled and that is not an error worth surfacing.
  */
 export async function cancelMojoSessionById(
-    config: MojoBackendConfig,
+    config: EffectiveMojoConfig,
     sessionId: string,
 ): Promise<boolean> {
     // Reuse the instance's CLI plumbing (env layering, JSON envelope parsing,

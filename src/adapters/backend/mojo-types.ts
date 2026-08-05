@@ -7,14 +7,17 @@
  * documented in one place.
  */
 
-/** Per-bot config block, surfaced as `bots[].mojo` in bots.json. */
-export interface MojoBackendConfig {
-    /** Override the `mojo` executable (absolute path or PATH lookup name). */
-    bin?: string;
-    /** cwd for the spawned CLI. */
-    cwd?: string;
-    /** `--model`. Invalid values exit 2 with the authoritative list on stderr. */
-    model?: string;
+/**
+ * USER-CONFIGURABLE mojo settings — the `bots[].mojo` block in bots.json,
+ * `/config set mojo` and the dashboard.
+ *
+ * Deliberately contains ONLY settings with no platform-wide equivalent. Anything
+ * botmux already resolves generically (the binary, working dir, model, approval
+ * bypass, launch prefix) lives on the TOP-LEVEL bot config, is frozen onto the
+ * session at creation, and must not have a second entry point here — see
+ * EffectiveMojoConfig for why that matters.
+ */
+export interface MojoConfig {
     /** `--workspace-id`. */
     workspaceId?: string;
     /** `--agent-id`. Only meaningful when creating (not resuming) a session. */
@@ -23,11 +26,6 @@ export interface MojoBackendConfig {
     cloud?: boolean;
     /** `--idle-timeout <sec>`. */
     idleTimeoutSec?: number;
-    /**
-     * Set true to NOT pass `--yolo`. Note this is not a real safety boundary on
-     * the `--cloud` path; see the comment in `buildArgs()`.
-     */
-    disableCliBypass?: boolean;
     /** Default true. When false, `--include-partial` is omitted (no deltas). */
     stream?: boolean;
     /** Prepended to every prompt (botmux routing/identity block). */
@@ -42,26 +40,6 @@ export interface MojoBackendConfig {
     localDaemon?: boolean;
     /** `MOJO_PPE_ENV`. */
     ppeEnv?: string;
-    /** Persisted mojo session id, restored across daemon restarts. */
-    resumeCliSessionId?: string;
-    /**
-     * INTERNAL, not a bots.json field. Mirrors the TOP-LEVEL
-     * `BotConfig.wrapperCli`, which is the single source of truth for the launch
-     * prefix across every CLI.
-     *
-     * It is carried here only so MojoBackend can re-apply the prefix to EVERY
-     * per-turn invocation (unlike a PTY CLI there is no single long-lived process
-     * to wrap once) and so the daemon's workerless cancel path can reconstruct
-     * the same launch.
-     *
-     * Deliberately NOT user-configurable inside the `mojo` block: the worker's
-     * wrapper handling (ttadk gateway injection, sandbox-takes-precedence, cjadk
-     * special-casing) is all built around the top-level field, so a second entry
-     * point would silently diverge — run through one wrapper, cancel through
-     * another. `buildEffectiveMojoConfig` ignores any value found in the block,
-     * and `/config set mojo` rejects it outright.
-     */
-    wrapperCli?: string;
     /**
      * Extra env for the spawned CLI. Merged ON TOP of the authoritative env the
      * worker hands to spawn() (which already carries the BOTMUX_* session
@@ -69,6 +47,78 @@ export interface MojoBackendConfig {
      * RiffBackendConfig.env layers over the session context.
      */
     env?: Record<string, string>;
+}
+
+/**
+ * Keys that are INTERNAL plumbing and must never be accepted from user config.
+ *
+ * Each has a platform-wide source of truth that is frozen onto the session at
+ * creation (`Session.agentFrozen`), so a second entry point inside the `mojo`
+ * block would let live edits override a frozen identity — e.g. cancelling an
+ * orphaned remote session through a binary or wrapper the bot only gained
+ * afterwards, reaching the wrong gateway or tenant.
+ *
+ * bots.json parsing and `/config set mojo` both reject these outright rather
+ * than dropping them silently, because a silent drop reads as "applied".
+ */
+export const MOJO_INTERNAL_CONFIG_KEYS = [
+    'bin',
+    'cwd',
+    'model',
+    'disableCliBypass',
+    'wrapperCli',
+    'resumeCliSessionId',
+    'extraCliArgs',
+] as const;
+
+/** The top-level bot field that owns each internal key, for error messages. */
+export const MOJO_INTERNAL_KEY_OWNER: Readonly<Record<string, string>> = {
+    bin: 'cliPathOverride',
+    cwd: 'workingDir',
+    model: 'model',
+    disableCliBypass: 'disableCliBypass',
+    wrapperCli: 'wrapperCli',
+    resumeCliSessionId: '(managed by botmux)',
+    extraCliArgs: 'CLI_EXTRA_ARGS',
+};
+
+/**
+ * The config MojoBackend actually runs on: user settings PLUS the platform-owned
+ * launch identity resolved by the worker (live session) or reconstructed by the
+ * daemon from the session's FROZEN values (workerless cancel).
+ *
+ * Never built by hand from user input — always via buildEffectiveMojoConfig().
+ */
+export interface EffectiveMojoConfig extends MojoConfig {
+    /**
+     * Resolved `mojo` executable. From the top-level `cliPathOverride` frozen on
+     * the session, not from the mojo block.
+     */
+    bin?: string;
+    /** cwd for the spawned CLI — the session working dir. */
+    cwd?: string;
+    /** `--model`. From the top-level bot model frozen on the session. */
+    model?: string;
+    /** Top-level opt-out of `--yolo`. */
+    disableCliBypass?: boolean;
+    /**
+     * Resolved launch prefix from the top-level `wrapperCli` frozen on the
+     * session. Carried here because MojoBackend must re-apply it to EVERY
+     * per-turn invocation (unlike a PTY CLI there is no single long-lived process
+     * to wrap once) and the daemon's workerless cancel path has no worker to
+     * resolve it from.
+     */
+    wrapperCli?: string;
+    /** Persisted mojo session id, restored across daemon restarts. */
+    resumeCliSessionId?: string;
+    /**
+     * Generic extra CLI args the worker composed for this session (today:
+     * CLI_EXTRA_ARGS). Passed explicitly rather than through spawn() args so
+     * they land AFTER the backend's own flags on every turn — with a wrapper the
+     * worker used to bake them into the prefix, which put them BEFORE and
+     * silently inverted last-value-wins precedence.
+     */
+    extraCliArgs?: string[];
 }
 
 /** `mojo auth status --json`. */
@@ -130,7 +180,7 @@ export type MojoLineStyle = 'info' | 'warn' | 'ok' | 'err' | 'title' | 'plain';
 /**
  * Generic, host-owned session settings that must reach the mojo CLI. They are
  * resolved by botmux (dashboard, `botmux setup`, repo selection, bots.json) and
- * live OUTSIDE the `mojo` block, so a backend that only reads MojoBackendConfig
+ * live OUTSIDE the `mojo` block, so a backend that only reads MojoConfig
  * would silently ignore all of them.
  */
 export interface MojoGenericLaunchInput {
@@ -146,14 +196,16 @@ export interface MojoGenericLaunchInput {
     env?: Record<string, string>;
     /** Persisted remote lineage (Session.riffParentTaskId, shared by riff/mojo). */
     resumeCliSessionId?: string;
-    /** BotConfig.wrapperCli — launch prefix, see MojoBackend.spawn. */
+    /** BotConfig.wrapperCli — launch prefix, see EffectiveMojoConfig. */
     wrapperCli?: string;
+    /** Generic extra CLI args (CLI_EXTRA_ARGS), applied after the backend flags. */
+    extraCliArgs?: readonly string[];
 }
 
 /**
- * Fold the generic session settings into the mojo-specific block, producing the
- * ONE config both the worker (live session) and the daemon (workerless `/close`)
- * must use.
+ * Combine the user's `mojo` block with the platform-owned launch identity into
+ * the ONE config both the worker (live session) and the daemon (workerless
+ * `/close`) run on.
  *
  * Sharing this matters: the daemon cancels an orphaned session WITHOUT a worker,
  * so it never calls spawn() and cannot pick these up from SpawnOpts. Building
@@ -161,44 +213,49 @@ export interface MojoGenericLaunchInput {
  * per-bot JWT could not be cancelled once its worker died — leaving the remote
  * session burning cloud sandbox time while still holding injected credentials.
  *
- * Precedence: an explicit value in the `mojo` block wins (it is the more
- * specific setting); the generic session value is the fallback.
+ * There is no precedence question to answer here: the launch identity has EXACTLY
+ * one source (`generic`, which callers populate from the session's frozen
+ * values). Anything the user put under those keys in the `mojo` block is stripped
+ * — both config entry points reject them, so reaching this function with one set
+ * means a hand-edited file, and honouring it would let a live edit override a
+ * frozen session identity.
  */
 export function buildEffectiveMojoConfig(
-    mojoBlock: MojoBackendConfig | undefined,
+    mojoBlock: MojoConfig | undefined,
     generic: MojoGenericLaunchInput,
-): MojoBackendConfig {
-    const block = mojoBlock ?? {};
-    // `??` throughout: the mojo block is the more specific setting and wins, but
-    // only when actually set — `false` and `''` must not be treated as absent.
-    const merged: MojoBackendConfig = { ...block };
+): EffectiveMojoConfig {
+    const block: Record<string, unknown> = { ...(mojoBlock ?? {}) };
+    for (const key of MOJO_INTERNAL_CONFIG_KEYS) delete block[key];
+    const merged: EffectiveMojoConfig = block as MojoConfig;
 
-    const bin = block.bin ?? emptyToUndefined(generic.cliPathOverride);
+    const bin = emptyToUndefined(generic.cliPathOverride);
     if (bin !== undefined) merged.bin = bin;
 
-    const cwd = block.cwd ?? generic.workingDir;
-    if (cwd !== undefined) merged.cwd = cwd;
+    if (generic.workingDir !== undefined) merged.cwd = generic.workingDir;
 
-    const model = block.model ?? generic.model;
+    const model = emptyToUndefined(generic.model);
     if (model !== undefined) merged.model = model;
 
-    const disableCliBypass = block.disableCliBypass ?? generic.disableCliBypass;
-    if (disableCliBypass !== undefined) merged.disableCliBypass = disableCliBypass;
-
-    // Per-bot env is the LOWER layer: an explicit `mojo.env` entry wins.
-    if (generic.env || block.env) {
-        merged.env = { ...(generic.env ?? {}), ...(block.env ?? {}) };
+    if (generic.disableCliBypass !== undefined) {
+        merged.disableCliBypass = generic.disableCliBypass;
     }
 
-    const resume = block.resumeCliSessionId ?? generic.resumeCliSessionId;
-    if (resume !== undefined) merged.resumeCliSessionId = resume;
+    // Per-bot env is the LOWER layer: an explicit `mojo.env` entry wins. This one
+    // IS a genuine two-source merge — `mojo.env` has no top-level equivalent.
+    if (generic.env || merged.env) {
+        merged.env = { ...(generic.env ?? {}), ...(merged.env ?? {}) };
+    }
 
-    // Top-level ONLY — see MojoBackendConfig.wrapperCli. A value in the block is
-    // dropped here (and rejected at config time) rather than quietly winning,
-    // which would make the run path and the cancel path use different wrappers.
+    if (generic.resumeCliSessionId !== undefined) {
+        merged.resumeCliSessionId = generic.resumeCliSessionId;
+    }
+
     const wrapperCli = emptyToUndefined(generic.wrapperCli);
     if (wrapperCli !== undefined) merged.wrapperCli = wrapperCli;
-    else delete merged.wrapperCli;
+
+    if (generic.extraCliArgs && generic.extraCliArgs.length > 0) {
+        merged.extraCliArgs = [...generic.extraCliArgs];
+    }
 
     return merged;
 }

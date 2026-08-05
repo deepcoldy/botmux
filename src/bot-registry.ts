@@ -4,7 +4,7 @@ import { resolve } from 'node:path';
 import { homedir } from 'node:os';
 import { underReadIsolation } from './adapters/cli/read-isolation.js';
 import type { BackendType } from './adapters/backend/types.js';
-import type { MojoBackendConfig } from './adapters/backend/mojo-types.js';
+import { MOJO_INTERNAL_CONFIG_KEYS, MOJO_INTERNAL_KEY_OWNER, type MojoConfig } from './adapters/backend/mojo-types.js';
 import type { RiffBackendConfig } from './adapters/backend/riff-backend.js';
 import type { CliId } from './adapters/cli/types.js';
 import {
@@ -1164,7 +1164,7 @@ export interface BotConfig {
    * (`mojo` on PATH + an ambient login is a valid setup). Use it to pin the
    * model, inject a JWT, or force `--cloud` execution.
    */
-  mojo?: MojoBackendConfig;
+  mojo?: MojoConfig;
   /**
    * Max simultaneously-LIVE sessions for this bot. When the bot's live session
    * count exceeds this, the idle-worker sweeper suspends its longest-idle,
@@ -2271,6 +2271,27 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
     const entry = parsed[i];
     if (!entry.larkAppId || typeof entry.larkAppId !== 'string') {
       throw new Error(`Bot config [${i}]: larkAppId is required and must be a string`);
+    }
+    // A `mojo` block must not carry the platform-owned launch identity: each of
+    // those keys has a top-level bot field that is FROZEN onto the session at
+    // creation, so a second entry point here would let a live edit override a
+    // frozen identity — e.g. cancelling an orphaned remote session through a
+    // binary or wrapper the bot only gained afterwards, reaching the wrong
+    // gateway or tenant.
+    //
+    // Fail CLOSED at parse time. `/config set mojo` rejects the same keys, but
+    // this is the entry point a hand-edited bots.json goes through, and silently
+    // stripping them there would read to the operator as "applied" — the exact
+    // failure mode of a wrapper that carries auth.
+    if (entry.mojo && typeof entry.mojo === 'object' && !Array.isArray(entry.mojo)) {
+      const offending = MOJO_INTERNAL_CONFIG_KEYS.filter(k => k in (entry.mojo as Record<string, unknown>));
+      if (offending.length > 0) {
+        throw new Error(
+          `Bot config [${i}]: mojo.${offending.join(' / mojo.')} `
+          + `${offending.length > 1 ? 'are' : 'is'} not configurable inside the mojo block — `
+          + `use the top-level ${offending.map(k => `\`${MOJO_INTERNAL_KEY_OWNER[k] ?? k}\``).join(' / ')} instead`,
+        );
+      }
     }
     // apiOnly (core-only) bots drive purely over the HTTP control API and never
     // connect to Feishu, so a real app secret is not required. larkAppId is still

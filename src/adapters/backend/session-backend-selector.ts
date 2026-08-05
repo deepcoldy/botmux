@@ -6,7 +6,7 @@ import { HerdrBackend } from './herdr-backend.js';
 import { PtyBackend } from './pty-backend.js';
 import { MojoBackend } from './mojo-backend.js';
 import { isMojoFullyRemote } from './sandbox.js';
-import type { MojoBackendConfig } from './mojo-types.js';
+import type { EffectiveMojoConfig } from './mojo-types.js';
 import { RiffBackend, type RiffBackendConfig } from './riff-backend.js';
 import { TmuxBackend } from './tmux-backend.js';
 import { TmuxPipeBackend } from './tmux-pipe-backend.js';
@@ -253,7 +253,7 @@ export interface SelectedSessionBackend {
 export function selectSessionBackend(opts: {
   sessionId: string;
   backendType: BackendType;
-  backendConfig?: RiffBackendConfig | MojoBackendConfig;
+  backendConfig?: RiffBackendConfig | EffectiveMojoConfig;
   /** Canonical local ownership boundary used to keep machine-wide Herdr agent
    * names distinct across independent Botmux data roots/checkouts. */
   herdrOwnershipScope?: string;
@@ -269,7 +269,7 @@ export function selectSessionBackend(opts: {
     // the bare `mojo` binary on PATH with an ambient login is a valid setup.
     return {
       backend: new MojoBackend(
-        (opts.backendConfig ?? {}) as MojoBackendConfig,
+        (opts.backendConfig ?? {}) as EffectiveMojoConfig,
         opts.sessionId,
       ),
       isTmuxMode: false,

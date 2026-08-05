@@ -236,7 +236,7 @@ import {
   isValidRiffSandboxCluster,
   type RiffBackendConfig,
 } from './adapters/backend/riff-backend.js';
-import { buildEffectiveMojoConfig, type MojoBackendConfig } from './adapters/backend/mojo-types.js';
+import { buildEffectiveMojoConfig, type EffectiveMojoConfig, type MojoConfig } from './adapters/backend/mojo-types.js';
 import {
   prepareDirectSandbox,
   prepareCredentialOnlySandbox,
@@ -7722,7 +7722,7 @@ async function spawnCli(
   // into the mojo-specific block. Without this the backend silently ignores
   // everything botmux already resolved — repo selection (workingDir), the
   // dashboard/setup `model`, `disableCliBypass`, `cliPathOverride` and the
-  // persisted session lineage — because MojoBackendConfig only ever saw the
+  // persisted session lineage — because EffectiveMojoConfig only ever saw the
   // hand-written bots.json `mojo` block.
   //
   // Precedence: an explicit value in the `mojo` block wins (it is the more
@@ -7731,7 +7731,7 @@ async function spawnCli(
     // Shared with the daemon's workerless `/close` path (see
     // destroyOrphanedBackingSession) so a session that runs on a custom binary /
     // per-bot JWT can still be cancelled after its worker is gone.
-    riffBackendConfig = buildEffectiveMojoConfig(cfg.backendConfig as MojoBackendConfig | undefined, {
+    riffBackendConfig = buildEffectiveMojoConfig(cfg.backendConfig as MojoConfig | undefined, {
       cliPathOverride: cfg.cliPathOverride,
       workingDir: cfg.workingDir,
       model: cfg.model,
@@ -7744,7 +7744,7 @@ async function spawnCli(
       resumeCliSessionId: cfg.riffParentTaskId,
       wrapperCli: cfg.wrapperCli,
     });
-    const resumed = (riffBackendConfig as MojoBackendConfig).resumeCliSessionId;
+    const resumed = (riffBackendConfig as EffectiveMojoConfig).resumeCliSessionId;
     if (resumed) log(`mojo resuming session lineage ${resumed}`);
   }
   if (effectiveBackendType === 'riff') {
@@ -7869,7 +7869,7 @@ async function spawnCli(
   const remoteBackendFullyOffBox = !localSandboxApplies(
     effectiveBackendType,
     effectiveBackendType === 'mojo'
-      ? (riffBackendConfig as MojoBackendConfig | undefined)
+      ? (riffBackendConfig as EffectiveMojoConfig | undefined)
       : undefined,
   );
   const riffRemoteBackend = remoteBackendFullyOffBox;
@@ -7888,7 +7888,7 @@ async function spawnCli(
     backendType: effectiveBackendType,
     fileSandboxRequested: sandboxRequested,
     ...(effectiveBackendType === 'mojo'
-      ? { mojoConfig: (riffBackendConfig ?? {}) as MojoBackendConfig }
+      ? { mojoConfig: (riffBackendConfig ?? {}) as EffectiveMojoConfig }
       : {}),
     // The unified sandbox request above already includes legacy readIsolation.
     effectiveReadIsolationRequested: false,
@@ -9219,6 +9219,21 @@ async function spawnCli(
   // keeps the behaviour intentional rather than ambient. (Codex review note.)
   delete (childEnv as Record<string, string>).CJADK_INTERACTIVE;
 
+  // mojo: hand the generic extra args (CLI_EXTRA_ARGS) to the backend through the
+  // config instead of through spawn args, and keep them OUT of the wrapper prefix.
+  //
+  // buildWrappedLaunch folds whatever it is given into the prefix, i.e. BEFORE the
+  // per-turn flags the backend appends. With last-value-wins parsing that
+  // silently inverted precedence: `CLI_EXTRA_ARGS=--idle-timeout 77` plus
+  // `mojo.idleTimeoutSec=12` produced `--idle-timeout 77 … --idle-timeout 12` and
+  // 12 won, contradicting the documented "extra args can override built-ins".
+  // Carrying them separately lets the backend append them AFTER its own flags on
+  // every turn, which is the same order the no-wrapper path already produced.
+  if (effectiveBackendType === 'mojo' && spawnArgs.length > 0) {
+    (riffBackendConfig as EffectiveMojoConfig).extraCliArgs = [...spawnArgs];
+    log(`mojo extra CLI args deferred to per-turn append: ${spawnArgs.join(' ')}`);
+    spawnArgs = [];
+  }
   if (cfg.wrapperCli && cfg.wrapperCli.trim()) {
     if (sandboxRequested) {
       log(`wrapperCli="${cfg.wrapperCli}" ignored: file sandbox enabled and takes precedence (cannot combine launch prefix with the sandbox wrapper)`);
