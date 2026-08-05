@@ -16,7 +16,8 @@ vi.mock('../src/utils/logger.js', () => ({
 
 import { createMojoAdapter } from '../src/adapters/cli/mojo.js';
 import { createCliAdapterSync, rawCliExecutable } from '../src/adapters/cli/registry.js';
-import { localSandboxApplies } from '../src/adapters/backend/sandbox.js';
+import { isMojoFullyRemote, localSandboxApplies } from '../src/adapters/backend/sandbox.js';
+import { backendSandboxCompatibilityError } from '../src/adapters/backend/session-backend-selector.js';
 import { buildReproduceCommand } from '../src/adapters/backend/reproduce-command.js';
 import {
   isRemoteBackendType,
@@ -82,12 +83,57 @@ describe('remote-backend pairing invariant', () => {
 });
 
 describe('mojo backend bypasses local-only machinery', () => {
-  it('is excluded from the local sandbox engine', () => {
-    // mojo runs tools in its own --cloud sandbox; without the bypass the
-    // worker's fail-closed "backend not sandboxable" check bricks the bot.
-    expect(localSandboxApplies('mojo')).toBe(false);
+  it('bypasses the local sandbox ONLY when mojo provably runs off-box', () => {
+    // riff is always remote (pure HTTP).
     expect(localSandboxApplies('riff')).toBe(false);
     expect(localSandboxApplies('tmux')).toBe(true);
+
+    // mojo spawns its binary locally EVERY turn, so the bypass must be earned:
+    // cloud on + localDaemon off. Anything else keeps the local sandbox engaged
+    // rather than silently skipping it for a bot that asked for sandbox: true.
+    expect(localSandboxApplies('mojo', { cloud: true })).toBe(false);
+    expect(localSandboxApplies('mojo', { cloud: true, localDaemon: false })).toBe(false);
+
+    // Fail-closed cases — each of these previously bypassed the sandbox.
+    expect(localSandboxApplies('mojo', undefined)).toBe(true);
+    expect(localSandboxApplies('mojo', {})).toBe(true);
+    expect(localSandboxApplies('mojo', { cloud: false })).toBe(true);
+    expect(localSandboxApplies('mojo', { cloud: true, localDaemon: true })).toBe(true);
+  });
+
+  it('isMojoFullyRemote treats an unproven config as local', () => {
+    expect(isMojoFullyRemote({ cloud: true })).toBe(true);
+    expect(isMojoFullyRemote(undefined)).toBe(false);
+    expect(isMojoFullyRemote({})).toBe(false);
+    expect(isMojoFullyRemote({ localDaemon: true })).toBe(false);
+    expect(isMojoFullyRemote({ cloud: true, localDaemon: true })).toBe(false);
+  });
+
+  it('refuses to launch a locally-executing mojo bot that requested sandbox', () => {
+    // Fail closed with an actionable message: MojoBackend does not launch its
+    // per-turn child under the sandbox wrapper, so `sandbox: true` cannot be
+    // honoured here and must not be silently ignored.
+    const err = backendSandboxCompatibilityError({
+      backendType: 'mojo',
+      fileSandboxRequested: true,
+      effectiveReadIsolationRequested: false,
+      mojoConfig: { cloud: false },
+    });
+    expect(err).toBeTruthy();
+    expect(err).toContain('mojo.cloud=true');
+
+    // Proven-remote mojo is allowed through, like riff.
+    expect(backendSandboxCompatibilityError({
+      backendType: 'mojo',
+      fileSandboxRequested: true,
+      effectiveReadIsolationRequested: false,
+      mojoConfig: { cloud: true },
+    })).toBeUndefined();
+    expect(backendSandboxCompatibilityError({
+      backendType: 'riff',
+      fileSandboxRequested: true,
+      effectiveReadIsolationRequested: false,
+    })).toBeUndefined();
   });
 
   it('has no local reproduce command', () => {
