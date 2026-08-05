@@ -1,7 +1,7 @@
 /**
  * Session cost calculator — computes token usage from JSONL logs.
  */
-import { existsSync, readFileSync, statSync, type Stats } from 'node:fs';
+import { closeSync, constants, existsSync, fstatSync, openSync, readFileSync, readSync, statSync, type Stats } from 'node:fs';
 import { logger } from '../utils/logger.js';
 import type { CliId } from '../adapters/cli/types.js';
 import { findAidenLatestCheckpointByBotmuxSessionId, findAidenLatestCheckpointBySessionId } from '../services/aiden-checkpoints.js';
@@ -476,6 +476,11 @@ const USAGE_REPARSE_MIN_INTERVAL_MS = 15_000;
 /** Token usage is advisory. Never let dashboard row rendering synchronously
  *  scan pathological multi-GB transcripts. */
 export const MAX_USAGE_TRANSCRIPT_BYTES = 64 * 1024 * 1024;
+/** Codex token_count events are cumulative snapshots, so an oversized cold
+ *  restore only needs a bounded tail window to recover the latest usage card.
+ *  Keep this tight: it is a synchronous dashboard read path, and real 150MiB+
+ *  rollouts have many token_count snapshots in the last 4MiB. */
+export const CODEX_USAGE_TRANSCRIPT_TAIL_BYTES = 4 * 1024 * 1024;
 
 /** Aiden checkpoint paths move as the session progresses (latest.json points
  *  at a new checkpoint id per turn), so positive hits expire quickly too. */
@@ -508,9 +513,133 @@ function foldUsageJsonLine(kind: UsageKind, agg: TokenUsageAggregate, seenMessag
   } catch { /* skip malformed lines */ }
 }
 
+function openRegularUsageFile(path: string): number | null {
+  let fd: number | null = null;
+  try {
+    fd = openSync(path, constants.O_RDONLY | (constants.O_NONBLOCK ?? 0));
+    if (!fstatSync(fd).isFile()) {
+      closeSync(fd);
+      return null;
+    }
+    return fd;
+  } catch {
+    if (fd !== null) closeSync(fd);
+    return null;
+  }
+}
+
+function isJsonlLineBoundary(path: string, offset: number): boolean {
+  if (offset <= 0) return true;
+  const fd = openRegularUsageFile(path);
+  if (fd === null) return false;
+  try {
+    const buf = Buffer.alloc(1);
+    const read = readSync(fd, buf, 0, 1, offset - 1);
+    return read === 1 && buf[0] === 0x0a;
+  } catch {
+    return false;
+  } finally {
+    closeSync(fd);
+  }
+}
+
+function aggregateHasCodexUsage(agg: TokenUsageAggregate): boolean {
+  return !!agg.latestCodexUsage || !!agg.latestContextUsage;
+}
+
 interface UsageReadResult {
   agg: TokenUsageAggregate;
   result: SessionTokenUsage | null;
+}
+
+function ensureUsageFileCacheCapacity(key: string): void {
+  if (usageFileCache.size >= USAGE_FILE_CACHE_MAX_ENTRIES && !usageFileCache.has(key)) {
+    const oldest = usageFileCache.keys().next().value;
+    if (oldest !== undefined) usageFileCache.delete(oldest);
+  }
+}
+
+function readOversizedCodexTokenAggregateCached(
+  key: string,
+  path: string,
+  st: Stats,
+  cached: UsageFileCacheEntry | undefined,
+  now: number,
+): UsageReadResult | null {
+  let state: TokenUsageAggregate;
+  let seenMessageIds: Set<string>;
+  let baseOffset: number;
+  let dropInitialResidualLine = false;
+  const canReuseCachedOffset = !!cached && cached.offset > 0 && st.size >= cached.offset;
+  const reuseCachedOffset = canReuseCachedOffset
+    && st.size - cached.offset <= CODEX_USAGE_TRANSCRIPT_TAIL_BYTES;
+
+  if (reuseCachedOffset) {
+    state = cached.state;
+    seenMessageIds = cached.seenMessageIds;
+    baseOffset = cached.offset;
+  } else {
+    state = newTokenUsageAggregate();
+    seenMessageIds = new Set();
+    baseOffset = Math.max(0, st.size - CODEX_USAGE_TRANSCRIPT_TAIL_BYTES);
+    dropInitialResidualLine = !isJsonlLineBoundary(path, baseOffset);
+  }
+
+  let scanError: unknown = null;
+  let droppedInitialResidualLine = false;
+  const scanned = scanJsonlFromOffset(path, baseOffset, {
+    endOffset: st.size,
+    onLine: (line) => {
+      if (dropInitialResidualLine) {
+        dropInitialResidualLine = false;
+        droppedInitialResidualLine = true;
+        return;
+      }
+      foldUsageJsonLine('codex', state, seenMessageIds, line);
+    },
+    onError: (error) => { scanError = error; },
+  });
+  if (!scanned) {
+    logger.error(`Failed to read oversized Codex transcript tail ${path}: ${scanError instanceof Error ? scanError.message : String(scanError)}`);
+    usageFileCache.delete(key);
+    return null;
+  }
+  const completeBytes = scanned.newOffset - baseOffset;
+
+  let previewAgg = state;
+  const tailText = scanned.pendingTail.trim();
+  const pendingTailIsInitialResidualLine = dropInitialResidualLine && !droppedInitialResidualLine;
+  if (tailText && !pendingTailIsInitialResidualLine) {
+    previewAgg = cloneAggregate(state);
+    foldUsageText('codex', previewAgg, new Set(seenMessageIds), tailText);
+  }
+
+  const result = finalizeTokenUsage(previewAgg);
+  if (pendingTailIsInitialResidualLine) {
+    // The bounded window starts in the middle of a JSONL record and no newline
+    // has arrived yet. Do not persist `baseOffset`: if the writer later appends
+    // only '\n', that residual suffix would otherwise become a fake complete
+    // line on the incremental path.
+    return cached && !reuseCachedOffset
+      ? { agg: cached.previewAgg, result: cached.result }
+      : { agg: previewAgg, result };
+  }
+  if (!aggregateHasCodexUsage(previewAgg) && cached && !reuseCachedOffset) {
+    return { agg: cached.previewAgg, result: cached.result };
+  }
+
+  ensureUsageFileCacheCapacity(key);
+  usageFileCache.set(key, {
+    mtimeMs: st.mtimeMs,
+    size: st.size,
+    offset: baseOffset + completeBytes,
+    state,
+    seenMessageIds,
+    previewAgg,
+    result,
+    parsedAtMs: now,
+  });
+  return { agg: previewAgg, result };
 }
 
 function readSessionTokenAggregateCached(path: string, kind: CachedUsageKind, opts?: { fresh?: boolean }): UsageReadResult | null {
@@ -543,6 +672,10 @@ function readSessionTokenAggregateCached(path: string, kind: CachedUsageKind, op
     }
   }
 
+  if (st.size > MAX_USAGE_TRANSCRIPT_BYTES && kind === 'codex') {
+    return readOversizedCodexTokenAggregateCached(key, path, st, cached, now);
+  }
+
   if (st.size > MAX_USAGE_TRANSCRIPT_BYTES) {
     // Warn once per transcript, not per observed size: an actively-growing
     // oversized file would otherwise re-warn and leak a Set entry every reparse.
@@ -557,15 +690,11 @@ function readSessionTokenAggregateCached(path: string, kind: CachedUsageKind, op
     return { agg: newTokenUsageAggregate(), result: null };
   }
 
-  if (usageFileCache.size >= USAGE_FILE_CACHE_MAX_ENTRIES && !usageFileCache.has(key)) {
-    const oldest = usageFileCache.keys().next().value;
-    if (oldest !== undefined) usageFileCache.delete(oldest);
-  }
-
   if (kind === 'aiden') {
     // Checkpoints are rewritten whole — nothing incremental to exploit.
     const result = readTokenUsageFromAidenCheckpoint(path);
     const blank = newTokenUsageAggregate();
+    ensureUsageFileCacheCapacity(key);
     usageFileCache.set(key, {
       mtimeMs: st.mtimeMs,
       size: st.size,
@@ -618,6 +747,7 @@ function readSessionTokenAggregateCached(path: string, kind: CachedUsageKind, op
   }
 
   const result = finalizeTokenUsage(previewAgg);
+  ensureUsageFileCacheCapacity(key);
   usageFileCache.set(key, {
     mtimeMs: st.mtimeMs,
     size: st.size,

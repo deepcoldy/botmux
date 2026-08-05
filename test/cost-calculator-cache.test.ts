@@ -12,10 +12,11 @@ vi.mock('node:fs', async (importOriginal) => {
   return {
     ...original,
     readFileSync: vi.fn(original.readFileSync),
+    readSync: vi.fn(original.readSync),
   };
 });
 
-import { mkdtempSync, writeFileSync, appendFileSync, rmSync, readFileSync, truncateSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, appendFileSync, rmSync, readFileSync, readSync, statSync, truncateSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -23,12 +24,20 @@ vi.mock('../src/utils/logger.js', () => ({
   logger: { error: vi.fn(), warn: vi.fn(), info: vi.fn(), debug: vi.fn() },
 }));
 
+vi.mock('../src/services/codex-transcript.js', () => ({
+  findCodexRolloutBySessionId: vi.fn(),
+  findCodexSessionIdByBotmuxSessionId: vi.fn(),
+}));
+
 import {
+  CODEX_USAGE_TRANSCRIPT_TAIL_BYTES,
   MAX_USAGE_TRANSCRIPT_BYTES,
+  getSessionUsageSnapshot,
   readSessionTokenUsageFile,
   __resetSessionUsageCachesForTest,
 } from '../src/core/cost-calculator.js';
 import { logger } from '../src/utils/logger.js';
+import { findCodexRolloutBySessionId } from '../src/services/codex-transcript.js';
 
 function claudeLine(id: string | null, input: number, output: number): string {
   return JSON.stringify({
@@ -41,14 +50,63 @@ function claudeLine(id: string | null, input: number, output: number): string {
   });
 }
 
-function codexCountLine(input: number, output: number, cacheRead = 0): string {
+function codexCountLine(
+  input: number,
+  output: number,
+  cacheRead = 0,
+  context?: { used: number; window: number },
+): string {
   return JSON.stringify({
     type: 'event_msg',
     payload: {
       type: 'token_count',
-      info: { total_token_usage: { input_tokens: input, output_tokens: output, cached_input_tokens: cacheRead } },
+      info: {
+        total_token_usage: { input_tokens: input, output_tokens: output, cached_input_tokens: cacheRead },
+        ...(context
+          ? {
+              last_token_usage: { total_tokens: context.used, input_tokens: context.used - output, output_tokens: output },
+              model_context_window: context.window,
+            }
+          : {}),
+      },
     },
   });
+}
+
+function codexModelLine(model: string): string {
+  return JSON.stringify({ type: 'turn_context', payload: { model } });
+}
+
+function writeSparsePrefix(path: string, size: number, lastByte: string): void {
+  writeFileSync(path, '');
+  truncateSync(path, size - 1);
+  appendFileSync(path, lastByte);
+}
+
+function codexSnapshotAtTail(path: string, line: string): { baseOffset: number; finalSize: number } {
+  const finalSize = MAX_USAGE_TRANSCRIPT_BYTES + CODEX_USAGE_TRANSCRIPT_TAIL_BYTES + 1;
+  const baseOffset = finalSize - CODEX_USAGE_TRANSCRIPT_TAIL_BYTES;
+  const lineBytes = Buffer.byteLength(line);
+  expect(lineBytes).toBeLessThan(CODEX_USAGE_TRANSCRIPT_TAIL_BYTES);
+  truncateSync(path, baseOffset - 1);
+  appendFileSync(path, '\n');
+  appendFileSync(path, line);
+  appendFileSync(path, Buffer.alloc(CODEX_USAGE_TRANSCRIPT_TAIL_BYTES - lineBytes, 0x20));
+  return { baseOffset, finalSize };
+}
+
+function expectBoundedTailRead(baseOffset: number): void {
+  const calls = vi.mocked(readSync).mock.calls;
+  expect(calls.length).toBeGreaterThan(0);
+  const positions = calls.map((call) => Number(call[4])).filter(Number.isFinite);
+  expect(Math.min(...positions)).toBe(baseOffset - 1);
+  expect(calls.some((call) => Number(call[3]) === 1 && Number(call[4]) === baseOffset - 1)).toBe(true);
+  const requestedBytes = calls.reduce((sum, call) => sum + Number(call[3]), 0);
+  expect(requestedBytes).toBeLessThanOrEqual(CODEX_USAGE_TRANSCRIPT_TAIL_BYTES + 1);
+}
+
+function fileSize(path: string): number {
+  return statSync(path).size;
 }
 
 let dir: string;
@@ -60,7 +118,9 @@ beforeEach(() => {
   now = 1_000_000_000;
   vi.spyOn(Date, 'now').mockImplementation(() => now);
   vi.mocked(readFileSync).mockClear();
+  vi.mocked(readSync).mockClear();
   vi.mocked(logger.warn).mockClear();
+  vi.mocked(findCodexRolloutBySessionId).mockReset();
 });
 
 afterEach(() => {
@@ -199,6 +259,172 @@ describe('readSessionTokenUsageFile caching', () => {
     });
   });
 
+  it('cold reads an oversized Codex transcript from a bounded tail window', () => {
+    const p = join(dir, 'oversized-codex.jsonl');
+    writeFileSync(p, '');
+    truncateSync(p, MAX_USAGE_TRANSCRIPT_BYTES + 1);
+    appendFileSync(p, [
+      '',
+      codexModelLine('gpt-5.5-codex'),
+      codexCountLine(3_739_570, 23_299, 3_563_008, { used: 160_240, window: 258_400 }),
+      '',
+    ].join('\n'));
+    vi.mocked(findCodexRolloutBySessionId).mockReturnValue(p);
+
+    expect(getSessionUsageSnapshot({
+      cliId: 'codex',
+      sessionId: 'botmux-sid',
+      cliSessionId: 'codex-sid',
+      fresh: true,
+    })).toEqual({
+      context: { usedTokens: 160_240, windowTokens: 258_400, percentUsed: 62 },
+      tokens: {
+        in: 3_739_570,
+        out: 23_299,
+        inputTokens: 176_562,
+        outputTokens: 23_299,
+        cacheReadTokens: 3_563_008,
+        cacheCreateTokens: 0,
+        model: 'gpt-5.5-codex',
+        turns: 0,
+      },
+      turnTokens: null,
+    });
+    expect(readFileSync).not.toHaveBeenCalled();
+    expectBoundedTailRead(fileSize(p) - CODEX_USAGE_TRANSCRIPT_TAIL_BYTES);
+  });
+
+  it('keeps the first Codex tail record when the bounded start is on a line boundary', () => {
+    const p = join(dir, 'codex-tail-line-boundary.jsonl');
+    const firstTailLine = `${codexCountLine(400, 50, 25, { used: 120, window: 1_000 })}\n`;
+    const paddingBytes = CODEX_USAGE_TRANSCRIPT_TAIL_BYTES - Buffer.byteLength(firstTailLine);
+    expect(paddingBytes).toBeGreaterThan(0);
+    writeSparsePrefix(p, MAX_USAGE_TRANSCRIPT_BYTES + 1, '\n');
+    appendFileSync(p, firstTailLine);
+    appendFileSync(p, Buffer.alloc(paddingBytes, 0x20));
+    vi.mocked(findCodexRolloutBySessionId).mockReturnValue(p);
+
+    expect(getSessionUsageSnapshot({
+      cliId: 'codex',
+      sessionId: 'botmux-sid',
+      cliSessionId: 'codex-sid',
+      fresh: true,
+    })).toMatchObject({
+      context: { usedTokens: 120, windowTokens: 1_000, percentUsed: 12 },
+      tokens: { in: 400, out: 50, inputTokens: 375, cacheReadTokens: 25 },
+      turnTokens: null,
+    });
+  });
+
+  it('drops the first Codex tail record when the bounded start is inside a line', () => {
+    const p = join(dir, 'codex-tail-mid-line.jsonl');
+    const residualLine = `${codexCountLine(999_999, 999, 0, { used: 999, window: 1_000 })}\n`;
+    const paddingBytes = CODEX_USAGE_TRANSCRIPT_TAIL_BYTES - Buffer.byteLength(residualLine);
+    expect(paddingBytes).toBeGreaterThan(0);
+    writeSparsePrefix(p, MAX_USAGE_TRANSCRIPT_BYTES + 1, 'x');
+    appendFileSync(p, residualLine);
+    appendFileSync(p, Buffer.alloc(paddingBytes, 0x20));
+    vi.mocked(findCodexRolloutBySessionId).mockReturnValue(p);
+
+    expect(getSessionUsageSnapshot({
+      cliId: 'codex',
+      sessionId: 'botmux-sid',
+      cliSessionId: 'codex-sid',
+      fresh: true,
+    })).toEqual({ context: null, tokens: null, turnTokens: null });
+  });
+
+  it('does not turn an unterminated initial residual tail into a Codex snapshot after only a newline append', () => {
+    const p = join(dir, 'codex-tail-unterminated-residual.jsonl');
+    const residualJson = codexCountLine(999_999, 999, 0, { used: 999, window: 1_000 });
+    const paddingBytes = CODEX_USAGE_TRANSCRIPT_TAIL_BYTES - Buffer.byteLength(residualJson);
+    expect(paddingBytes).toBeGreaterThan(0);
+    writeSparsePrefix(p, MAX_USAGE_TRANSCRIPT_BYTES + 1, 'x');
+    appendFileSync(p, residualJson);
+    appendFileSync(p, Buffer.alloc(paddingBytes, 0x20));
+    vi.mocked(findCodexRolloutBySessionId).mockReturnValue(p);
+
+    expect(getSessionUsageSnapshot({
+      cliId: 'codex',
+      sessionId: 'botmux-sid',
+      cliSessionId: 'codex-sid',
+      fresh: true,
+    })).toEqual({ context: null, tokens: null, turnTokens: null });
+
+    appendFileSync(p, '\n');
+    now += 20_000;
+    expect(getSessionUsageSnapshot({
+      cliId: 'codex',
+      sessionId: 'botmux-sid',
+      cliSessionId: 'codex-sid',
+      fresh: true,
+    })).toEqual({ context: null, tokens: null, turnTokens: null });
+  });
+
+  it('re-bootstraps oversized Codex transcripts when the unread cache delta exceeds the tail budget', () => {
+    const p = join(dir, 'codex-cache-large-delta.jsonl');
+    writeFileSync(p, `${codexCountLine(100, 10, 20, { used: 30, window: 1_000 })}\n`);
+    vi.mocked(findCodexRolloutBySessionId).mockReturnValue(p);
+    expect(getSessionUsageSnapshot({
+      cliId: 'codex',
+      sessionId: 'botmux-sid',
+      cliSessionId: 'codex-sid',
+      fresh: true,
+    })).toMatchObject({
+      context: { usedTokens: 30 },
+      tokens: { in: 100, out: 10 },
+    });
+
+    vi.mocked(readSync).mockClear();
+    const latestLine = `${codexCountLine(500, 60, 200, { used: 240, window: 1_000 })}\n`;
+    const { baseOffset } = codexSnapshotAtTail(p, latestLine);
+    now += 20_000;
+
+    expect(getSessionUsageSnapshot({
+      cliId: 'codex',
+      sessionId: 'botmux-sid',
+      cliSessionId: 'codex-sid',
+      fresh: true,
+    })).toMatchObject({
+      context: { usedTokens: 240, windowTokens: 1_000, percentUsed: 24 },
+      tokens: { in: 500, out: 60, inputTokens: 300, cacheReadTokens: 200 },
+    });
+    expectBoundedTailRead(baseOffset);
+  });
+
+  it('continues incrementally after an oversized Codex cold tail bootstrap when the append is small', () => {
+    const p = join(dir, 'codex-small-append-after-tail.jsonl');
+    writeSparsePrefix(p, MAX_USAGE_TRANSCRIPT_BYTES + 1, '\n');
+    appendFileSync(p, `${codexCountLine(100, 10, 20, { used: 30, window: 1_000 })}\n`);
+    vi.mocked(findCodexRolloutBySessionId).mockReturnValue(p);
+    expect(getSessionUsageSnapshot({
+      cliId: 'codex',
+      sessionId: 'botmux-sid',
+      cliSessionId: 'codex-sid',
+      fresh: true,
+    })).toMatchObject({
+      context: { usedTokens: 30 },
+      tokens: { in: 100, out: 10 },
+    });
+
+    vi.mocked(readSync).mockClear();
+    const appended = `${codexCountLine(150, 20, 50, { used: 70, window: 1_000 })}\n`;
+    appendFileSync(p, appended);
+    now += 20_000;
+
+    expect(getSessionUsageSnapshot({
+      cliId: 'codex',
+      sessionId: 'botmux-sid',
+      cliSessionId: 'codex-sid',
+      fresh: true,
+    })).toMatchObject({
+      context: { usedTokens: 70, windowTokens: 1_000, percentUsed: 7 },
+      tokens: { in: 150, out: 20, inputTokens: 100, cacheReadTokens: 50 },
+    });
+    const requestedBytes = vi.mocked(readSync).mock.calls.reduce((sum, call) => sum + Number(call[3]), 0);
+    expect(requestedBytes).toBeLessThanOrEqual(Buffer.byteLength(appended));
+  });
+
   it('skips oversized transcripts instead of scanning them from byte zero', () => {
     const p = join(dir, 'oversized.jsonl');
     writeFileSync(p, '');
@@ -232,6 +458,26 @@ describe('readSessionTokenUsageFile caching', () => {
     expect(readSessionTokenUsageFile(p, 'coco', { fresh: true })).toBeNull();
 
     expect(logger.warn).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not evict unrelated cached entries for a new non-Codex oversized transcript', () => {
+    const firstPath = join(dir, 'cached-0.jsonl');
+    writeFileSync(firstPath, `${claudeLine('msg_0', 1, 1)}\n`);
+    const first = readSessionTokenUsageFile(firstPath, 'claude');
+    expect(first).toMatchObject({ turns: 1, inputTokens: 1 });
+
+    for (let i = 1; i < 512; i++) {
+      const p = join(dir, `cached-${i}.jsonl`);
+      writeFileSync(p, `${claudeLine(`msg_${i}`, i + 1, 1)}\n`);
+      expect(readSessionTokenUsageFile(p, 'claude')).toMatchObject({ turns: 1 });
+    }
+
+    const oversized = join(dir, 'new-oversized-coco.jsonl');
+    writeFileSync(oversized, '');
+    truncateSync(oversized, MAX_USAGE_TRANSCRIPT_BYTES + 1);
+    expect(readSessionTokenUsageFile(oversized, 'coco')).toBeNull();
+
+    expect(readSessionTokenUsageFile(firstPath, 'claude')).toBe(first);
   });
 
   it('returns null and drops the cache entry when the file disappears', () => {
