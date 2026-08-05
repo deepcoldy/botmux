@@ -348,15 +348,42 @@ export function coreOnlyPidNamespaceDegrade(): boolean {
 }
 
 /**
- * Whether a LOCAL sandbox engine applies to this backend at all. Remote
- * backends have NO local CLI process to wrap — execution happens in riff's own
- * remote sandbox, and for mojo in its `--cloud` sandbox. Without this bypass the
- * worker's fail-safe "backend not sandboxable" hard error would brick every
- * sandbox-enabled bot the moment it switches to one of them.
- * Platform is no longer a factor — fs-policy sandboxes darwin AND linux.
+ * Whether a LOCAL sandbox engine applies to this backend at all.
+ *
+ * riff has NO local CLI process to wrap — execution happens entirely in riff's
+ * own remote sandbox. Without that bypass the worker's fail-safe "backend not
+ * sandboxable" hard error would brick every sandbox-enabled bot the moment it
+ * switches to riff. Platform is no longer a factor — fs-policy sandboxes darwin
+ * AND linux.
+ *
+ * mojo is NOT unconditionally remote, and this is the important asymmetry:
+ * MojoBackend spawns the `mojo` binary locally on every turn. Only with
+ * `cloud: true` do the agent's TOOLS run off-box; `cloud` is optional, and
+ * `localDaemon: true` explicitly opts INTO local execution. Treating mojo as
+ * remote regardless would silently skip the local sandbox for a bot that asked
+ * for `sandbox: true` — a fail-OPEN. So a mojo bypass requires proof of remote
+ * execution, and anything else keeps the local sandbox engaged (fail closed).
  */
-export function localSandboxApplies(backendType: string): boolean {
-  return backendType !== 'riff' && backendType !== 'mojo';
+export function localSandboxApplies(
+  backendType: string,
+  remoteExecution?: { cloud?: boolean; localDaemon?: boolean },
+): boolean {
+  if (backendType === 'riff') return false;
+  if (backendType === 'mojo') {
+    return !isMojoFullyRemote(remoteExecution);
+  }
+  return true;
+}
+
+/**
+ * True only when a mojo session provably executes nothing locally: the cloud
+ * sandbox is on AND the local execution daemon is off. Undefined config is
+ * treated as NOT remote — the safe direction.
+ */
+export function isMojoFullyRemote(
+  cfg?: { cloud?: boolean; localDaemon?: boolean },
+): boolean {
+  return cfg?.cloud === true && cfg.localDaemon !== true;
 }
 
 /** Top-level dirs that are symlinks on usrmerge distros (/bin → usr/bin …) —

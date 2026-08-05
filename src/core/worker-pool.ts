@@ -31,6 +31,7 @@ import { buildStreamingCard, buildPrivateSnapshotCard, buildSessionCard, buildTu
 import { codexServiceTierBadge } from '../services/codex-service-tier.js';
 import { loadFrozenCards, saveFrozenCards } from '../services/frozen-card-store.js';
 import { hashUrlForLog, cancelRiffTaskById } from '../adapters/backend/riff-backend.js';
+import { cancelMojoSessionById } from '../adapters/backend/mojo-backend.js';
 import { logger } from '../utils/logger.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import {
@@ -64,7 +65,7 @@ import {
   isStrongManagedHerdrAgentName,
   managedHerdrAgentName,
 } from '../adapters/backend/session-backend-selector.js';
-import { isSuspendableBackendType, getSessionPersistentBackendType, persistentBackendTargetForSession, persistentSessionName, killPersistentBackendTarget, killPersistentSession, probePersistentBackendTarget, resolvePairedSpawnBackendType, resolvePersistentBackendTarget } from './persistent-backend.js';
+import { isRemoteBackendType, isSuspendableBackendType, getSessionPersistentBackendType, persistentBackendTargetForSession, persistentSessionName, killPersistentBackendTarget, killPersistentSession, probePersistentBackendTarget, resolvePairedSpawnBackendType, resolvePersistentBackendTarget } from './persistent-backend.js';
 import { getBot, getAllBots, loadBotConfigs, resolveBrandLabel, getLoadedConfigPath, resolveUsageDisplay } from '../bot-registry.js';
 import { RestartCoordinator, type RestartObserver } from './restart-coordinator.js';
 import { runtimeBuildIdentity } from '../utils/runtime-build-id.js';
@@ -118,7 +119,7 @@ function daemonCardLocalHomeLinkMode(ds: DaemonSession): LocalHomeLinkMode {
   // worker after riff reconciliation; fall back to persisted session metadata
   // while restoring sessions that do not yet have an initConfig.
   const backendType = ds.initConfig?.backendType ?? ds.session.backendType;
-  return backendType === 'riff'
+  return (backendType !== undefined && isRemoteBackendType(backendType))
     || ds.session.sandbox === true
     || ds.initConfig?.readIsolation === true
     || sandboxEnabled()
@@ -1855,12 +1856,16 @@ export function killWorker(ds: DaemonSession): void {
   const w = ds.worker;
   trackLifecycleRetirement(ds, w);
   armCloseFence(ds, w);
-  // riff：worker close 分支要有界 await 远端 task-cancel（destroySession 5s×2 重试，
-  // 外层 race 8s）。默认 2s SIGTERM backstop 会在取消发出前掐死进程，已关闭话题
-  // 的远端任务照跑——冻结为 riff 的会话放宽到 24s（层级：destroy 20s < worker 22s
-  // < SIGTERM 24s < SIGKILL 29s；正常路径 worker 自行 exit，不会等满）。
+  // 远端后端（riff / mojo）：worker close 分支要有界 await 远端会话取消。默认 2s
+  // SIGTERM backstop 会在取消发出前掐死进程，已关闭话题的远端会话照跑——冻结为
+  // 远端后端的会话放宽到 24s（层级：destroy 20s < worker 22s < SIGTERM 24s <
+  // SIGKILL 29s；正常路径 worker 自行 exit，不会等满）。
+  // mojo 的 destroySession 走 `mojo session cancel`，CLI 超时上限 60s，因此同样
+  // 需要这段宽限——2s 内它连子进程都还没退。
   const closeFrozenType = ds.initConfig?.backendType ?? ds.session.backendType;
-  armWorkerKillBackstop(w, tag(ds), closeFrozenType === 'riff' ? 24_000 : WORKER_SIGTERM_BACKSTOP_MS);
+  const closeNeedsRemoteGrace = closeFrozenType !== undefined
+    && isRemoteBackendType(closeFrozenType);
+  armWorkerKillBackstop(w, tag(ds), closeNeedsRemoteGrace ? 24_000 : WORKER_SIGTERM_BACKSTOP_MS);
   ds.worker = null;
   ds.workerPort = null;
   ds.workerToken = null;
@@ -2137,14 +2142,23 @@ function destroyOrphanedBackingSession(ds: DaemonSession): void {
   // riff：worker 已死时 /close 仍要取消持久化血缘指向的远端任务——否则已关闭
   // 话题的远端 agent 继续拿着注入凭证发消息。fire-and-forget（内部有界+重试）。
   const frozenType = ds.initConfig?.backendType ?? ds.session.backendType;
-  if (frozenType === 'riff') {
-    const taskId = ds.session.riffParentTaskId;
-    if (taskId) {
+  if (frozenType === 'riff' || frozenType === 'mojo') {
+    // Both remote backends persist their lineage in the same field.
+    const remoteId = ds.session.riffParentTaskId;
+    if (remoteId) {
       try {
-        const riffCfg = getBot(ds.larkAppId).config.riff;
-        if (riffCfg?.baseUrl) {
-          void cancelRiffTaskById(riffCfg, taskId).then((ok) => {
-            if (ok) logger.info(`[${tag(ds)}] killWorker: orphan riff task ${taskId} cancelled`);
+        const botCfg = getBot(ds.larkAppId).config;
+        if (frozenType === 'riff') {
+          if (botCfg.riff?.baseUrl) {
+            void cancelRiffTaskById(botCfg.riff, remoteId).then((ok) => {
+              if (ok) logger.info(`[${tag(ds)}] killWorker: orphan riff task ${remoteId} cancelled`);
+            });
+          }
+        } else {
+          // mojo needs no baseUrl gate — the CLI resolves its own endpoint, and
+          // an absent `mojo` config block is a valid setup.
+          void cancelMojoSessionById(botCfg.mojo ?? {}, remoteId).then((ok) => {
+            if (ok) logger.info(`[${tag(ds)}] killWorker: orphan mojo session ${remoteId} cancelled`);
           });
         }
       } catch { /* bot deregistered — nothing to cancel with */ }

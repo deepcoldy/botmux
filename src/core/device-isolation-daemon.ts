@@ -14,7 +14,9 @@ import type {
   SessionProbe,
 } from '../adapters/backend/types.js';
 import { deviceCredentialIsolationMarkerPath } from '../adapters/cli/read-isolation.js';
+import { getBot } from '../bot-registry.js';
 import { config } from '../config.js';
+import { isMojoFullyRemote } from '../adapters/backend/sandbox.js';
 import { readSecureHostFileSync } from '../platform/secure-host-file.js';
 import * as sessionStore from '../services/session-store.js';
 import type { Session } from '../types.js';
@@ -74,6 +76,17 @@ export interface DeviceIsolationRuntimeSession {
     cli?: ProcessIdentity;
     workerGeneration?: number;
   };
+  /**
+   * Remote backends only. True when this session provably executes NOTHING on
+   * this host, so there is no local process identity to prove.
+   *
+   * riff is always true. mojo is NOT: it spawns its binary locally every turn,
+   * and only `cloud: true` (without `localDaemon`) moves the agent's tools
+   * off-box. Left undefined the session is treated as locally-executing, which
+   * is the safe direction — an unproven claim must never authorize credential
+   * activation around a possibly-live local child.
+   */
+  remoteExecutionProven?: boolean;
   /** Opaque production handle. It is deliberately excluded from generation. */
   source?: DaemonSession;
 }
@@ -140,6 +153,31 @@ let transaction: ActivationTransaction | null = null;
 
 function isPersistentBackend(value: InventoryBackend): value is LocalPersistentBackend {
   return value === 'tmux' || value === 'herdr' || value === 'zellij' || value === 'zmx';
+}
+
+/**
+ * Does this session provably execute nothing on this host?
+ *
+ * riff: always (pure HTTP). mojo: only with `cloud` on and `localDaemon` off —
+ * it spawns the binary locally every turn otherwise. Reading the live bot config
+ * is deliberate: the frozen backendType alone cannot answer this, and guessing
+ * `true` would be the fail-open direction.
+ */
+function resolveRemoteExecutionProven(ds: DaemonSession): boolean {
+  const backendType = ds.initConfig?.backendType ?? ds.session.backendType;
+  if (backendType === 'riff') return true;
+  if (backendType !== 'mojo') return false;
+  const fromInit = ds.initConfig?.backendConfig as
+    { cloud?: boolean; localDaemon?: boolean } | undefined;
+  // Prefer the config frozen onto the live worker; fall back to bot config for
+  // sessions restored without an initConfig.
+  if (fromInit) return isMojoFullyRemote(fromInit);
+  try {
+    return isMojoFullyRemote(getBot(ds.larkAppId).config.mojo);
+  } catch {
+    // Bot deregistered — no proof available, so assume local (fail closed).
+    return false;
+  }
 }
 
 function isLocalBackend(value: InventoryBackend): value is Exclude<BackendType, 'riff' | 'mojo'> {
@@ -223,6 +261,7 @@ function defaultRuntimeSessions(): DeviceIsolationRuntimeSession[] {
       adopted: !!(ds.adoptedFrom || ds.initConfig?.adoptMode || ds.session.adoptedFrom),
       frozenBackend: ds.initConfig?.backendType ?? ds.session.backendType,
       ...(persistentBackendTarget ? { persistentBackendTarget } : {}),
+      remoteExecutionProven: resolveRemoteExecutionProven(ds),
       workerPresent,
       ...(ds.workerGeneration !== undefined ? { workerGeneration: ds.workerGeneration } : {}),
       ...(workerPid && workerStart ? { worker: { pid: workerPid, procStart: workerStart } } : {}),
@@ -311,9 +350,13 @@ function classifySession(session: DeviceIsolationRuntimeSession): DeviceIsolatio
       return blockerEntry(session, backendType, 'process_identity_unavailable');
     }
   }
-  // Remote backends own no local PID, so there is no local process identity to
-  // prove — riff and mojo are both activation-safe by construction.
-  if (backendType === 'riff' || backendType === 'mojo') {
+  // A remote backend owns no local PID, so there is no local process identity to
+  // prove. riff always qualifies. mojo qualifies ONLY with proof that nothing
+  // runs here (cloud on, localDaemon off) — otherwise it falls through to the
+  // local path below, where a live worker must still supply process identity.
+  // Treating an unproven mojo session as safe_remote would let credential
+  // activation proceed while a local `mojo` child is mid-turn.
+  if (backendType === 'riff' || (backendType === 'mojo' && session.remoteExecutionProven === true)) {
     return {
       sessionId: session.sessionId,
       backendType,

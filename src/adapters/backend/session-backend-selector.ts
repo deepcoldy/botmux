@@ -5,6 +5,7 @@ import { resolve } from 'node:path';
 import { HerdrBackend } from './herdr-backend.js';
 import { PtyBackend } from './pty-backend.js';
 import { MojoBackend } from './mojo-backend.js';
+import { isMojoFullyRemote } from './sandbox.js';
 import type { MojoBackendConfig } from './mojo-types.js';
 import { RiffBackend, type RiffBackendConfig } from './riff-backend.js';
 import { TmuxBackend } from './tmux-backend.js';
@@ -194,6 +195,8 @@ export function backendSandboxCompatibilityError(opts: {
    * isolation. The worker passes false because its unified sandbox request
    * already folds in the legacy readIsolation flag on every host. */
   effectiveReadIsolationRequested: boolean;
+  /** mojo only: proof-of-remote inputs (cloud / localDaemon). */
+  mojoConfig?: { cloud?: boolean; localDaemon?: boolean };
 }): string | undefined {
   const isolationRequested =
     opts.fileSandboxRequested || opts.effectiveReadIsolationRequested;
@@ -202,11 +205,22 @@ export function backendSandboxCompatibilityError(opts: {
     opts.backendType === 'pty'
     || opts.backendType === 'tmux'
     || opts.backendType === 'riff'
-    // mojo executes tools in ITS OWN remote cloud sandbox (--cloud), so
-    // botmux's local file sandbox has nothing to isolate here — same rationale
-    // as riff. Blocking it would brick every sandbox-enabled mojo bot.
-    || opts.backendType === 'mojo'
   ) return undefined;
+  if (opts.backendType === 'mojo') {
+    // A fully-remote mojo session (cloud on, localDaemon off) executes nothing
+    // locally, so there is nothing for botmux's local sandbox to confine —
+    // same rationale as riff, and blocking it would brick sandbox-enabled bots.
+    //
+    // But mojo spawns its binary locally every turn, so with cloud off (or
+    // localDaemon on) the tools DO touch this host. MojoBackend does not launch
+    // that child under the sandbox wrapper, so honouring `sandbox: true` here is
+    // impossible — fail CLOSED with an actionable message rather than running
+    // unisolated while the user believes they are sandboxed.
+    if (isMojoFullyRemote(opts.mojoConfig)) return undefined;
+    return 'backend "mojo" only bypasses the local sandbox when it runs fully '
+      + 'remotely; set mojo.cloud=true (and leave mojo.localDaemon off) to keep '
+      + 'execution off this host, or disable sandbox for this bot';
+  }
   return `backend "${opts.backendType}" does not support file/read isolation; `
     + 'use tmux/pty or disable sandbox for this bot';
 }
