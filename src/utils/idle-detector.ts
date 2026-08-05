@@ -20,14 +20,14 @@ export class IdleDetector {
   private idleCallback: ((source: IdleEvidenceSource) => void) | null = null;
   private busyCallback: (() => void) | null = null;
   private completionPattern: RegExp | undefined;
-  private busyPattern: RegExp | undefined;
+  private idleToBusyPattern: RegExp | undefined;
   private busyTransitionArmed = false;
   private readyPattern: RegExp | undefined;
   private readySeen = false;
 
   constructor(cli: CliAdapter) {
     this.completionPattern = cli.completionPattern;
-    this.busyPattern = cli.busyPattern;
+    this.idleToBusyPattern = cli.idleToBusyPattern;
     this.readyPattern = cli.readyPattern;
   }
 
@@ -54,14 +54,17 @@ export class IdleDetector {
     const stripped = this.stripAnsi(data);
     this.outputTail = (this.outputTail + stripped).slice(-500);
 
-    // Only a CLI-specific marker may turn a previously reported idle cycle
-    // back into busy. Plain PTY activity can be a resize/cursor repaint and is
-    // therefore insufficient evidence. Keep the edge armed across chunks so a
-    // split status line can still match, then emit at most once per cycle.
+    // Only an explicitly opted-in CLI marker may turn a previously reported
+    // idle cycle back into busy. Plain PTY activity — and legacy busyPattern
+    // matches — can be a transcript redraw, so they are insufficient evidence.
+    // Keep the edge armed across chunks, then emit at most once per cycle.
     if (
       this.busyTransitionArmed
-      && this.busyPattern
-      && (this.busyPattern.test(stripped) || this.busyPattern.test(this.outputTail))
+      && this.idleToBusyPattern
+      && (
+        this.idleToBusyPattern.test(stripped)
+        || this.idleToBusyPattern.test(this.outputTail)
+      )
     ) {
       this.busyTransitionArmed = false;
       this.busyCallback?.();

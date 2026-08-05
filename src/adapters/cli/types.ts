@@ -295,10 +295,15 @@ export interface CliAdapter {
   readonly completionPattern?: RegExp;
 
   /** Busy marker regex — matches when the CLI is explicitly rendering a
-   *  still-running state. IdleDetector uses it to recover an idle→working edge
-   *  when local/autonomous work starts without botmux input. Reattach screen
-   *  probes also use its absence as evidence that a persistent session is idle. */
+   *  still-running state. Used for re-attached persistent sessions where there
+   *  may be no new PTY output: if the current screen does NOT match this marker,
+   *  the worker may safely let quiescence mark the session idle. */
   readonly busyPattern?: RegExp;
+
+  /** Opt-in positive marker for an idle→working edge observed in PTY output.
+   *  Kept separate from busyPattern because transcript/full-screen redraws may
+   *  contain old busy text; existing adapters remain opt-out by default. */
+  readonly idleToBusyPattern?: RegExp;
 
   /** Ready marker regex — matches when the CLI's input prompt is rendered and
    *  functional.  When set, the idle detector suppresses quiescence-based idle

@@ -1333,6 +1333,24 @@ describe('busyPattern', () => {
   });
 });
 
+describe('idleToBusyPattern', () => {
+  it('codex explicitly opts into idle→busy recovery with the strict active marker', () => {
+    const adapter = createCodexAdapter('/bin/codex');
+    const busy = adapter.idleToBusyPattern;
+    expect(busy).toBeDefined();
+    expect(busy!.test('• Working (18s • esc to interrupt)')).toBe(true);
+    expect(busy!.test('Working through the implementation')).toBe(false);
+  });
+
+  it.each([
+    ['pi', createPiAdapter('/bin/pi')],
+    ['genius', createGeniusAdapter('/bin/genius')],
+    ['grok', createGrokAdapter('/bin/grok')],
+  ])('%s keeps legacy busyPattern semantics and does not opt in', (_name, adapter) => {
+    expect(adapter.idleToBusyPattern).toBeUndefined();
+  });
+});
+
 describe('readyPattern', () => {
   it('claude-code matches prompt indicator', () => {
     const adapter = createClaudeCodeAdapter('/bin/claude');
