@@ -24,6 +24,8 @@ import type { DaemonToWorker, WorkerToDaemon } from '../src/types.js';
 interface Invocation {
   argv: string[];
   cwd: string;
+  /** Path of the binary that actually executed (`$0`). */
+  self: string;
   env: Record<string, string | undefined>;
 }
 
@@ -31,20 +33,24 @@ interface Invocation {
  * Write a fake `mojo` that dumps its invocation, then emits a minimal valid
  * stream (init + result) so the turn settles like a real one.
  */
-function writeFakeMojo(dir: string, dumpPath: string): string {
-  const bin = join(dir, 'mojo');
+function writeFakeMojo(dir: string, fileName = 'mojo'): string {
+  const bin = join(dir, fileName);
+  // `self` is how the cliPathOverride / wrapper assertions know WHICH binary ran.
   writeFileSync(bin, `#!/usr/bin/env bash
+export SELF="$0"
 node -e '
   const fs = require("fs");
   fs.writeFileSync(process.env.MOJO_DUMP, JSON.stringify({
     argv: process.argv.slice(1),
     cwd: process.cwd(),
+    self: process.env.SELF,
     env: {
       PER_BOT_TOKEN: process.env.PER_BOT_TOKEN,
       MOJO_BLOCK_ONLY: process.env.MOJO_BLOCK_ONLY,
       BOTMUX_SESSION_ID: process.env.BOTMUX_SESSION_ID,
       AGENT_LOCAL_DAEMON: process.env.AGENT_LOCAL_DAEMON,
       X_JWT_TOKEN: process.env.X_JWT_TOKEN,
+      WRAPPER_MARK: process.env.WRAPPER_MARK,
     },
   }, null, 2));
 ' -- "$@"
@@ -52,7 +58,6 @@ echo '{"type":"system","subtype":"init","session_id":"sid-fake-1"}'
 echo '{"type":"result","status":"ok","result":"ok","session_id":"sid-fake-1","warnings":[]}'
 `);
   chmodSync(bin, 0o755);
-  void dumpPath;
   return bin;
 }
 
@@ -70,6 +75,8 @@ async function waitFor(
 }
 
 interface RunResult {
+  /** Absolute path of the fake binary written for this run. */
+  bin: string;
   invocation: Invocation;
   logs: string;
   messages: WorkerToDaemon[];
@@ -82,10 +89,16 @@ async function runWorker(opts: {
   init?: Partial<DaemonToWorker & { type: 'init' }>;
   /** Wait this long for the invocation dump (the point of the ready-gate test). */
   timeoutMs?: number;
+  /** Name the fake binary something other than `mojo` (path-override tests). */
+  binName?: string;
+  /** Extra env for the worker process itself (ambient-vs-per-bot tests). */
+  workerEnv?: Record<string, string>;
+  /** Point cliPathOverride at the fake binary written for this run. */
+  cliPathOverrideFromBin?: boolean;
 }): Promise<RunResult> {
   const root = mkdtempSync(join(tmpdir(), 'botmux-mojo-worker-'));
   const dump = join(root, 'invocation.json');
-  const bin = writeFakeMojo(root, dump);
+  const bin = writeFakeMojo(root, opts.binName ?? 'mojo');
   let child: ChildProcess | undefined;
   const logs: string[] = [];
   const messages: WorkerToDaemon[] = [];
@@ -98,6 +111,7 @@ async function runWorker(opts: {
       larkAppSecret: 'secret',
       cliId: 'mojo',
       backendType: 'mojo',
+      ...(opts.cliPathOverrideFromBin ? { cliPathOverride: bin } : {}),
       ...(opts.botEntry ?? {}),
     }]));
 
@@ -113,8 +127,10 @@ async function runWorker(opts: {
         LARK_APP_ID: appId,
         LARK_APP_SECRET: 'secret',
         MOJO_DUMP: dump,
+        SELF: '',
         // Keep the fake binary discoverable even when no explicit path is set.
         PATH: `${root}:${process.env.PATH ?? ''}`,
+        ...(opts.workerEnv ?? {}),
       },
       stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
     });
@@ -133,6 +149,7 @@ async function runWorker(opts: {
       prompt: 'hello mojo',
       larkAppId: appId,
       larkAppSecret: 'secret',
+      ...(opts.cliPathOverrideFromBin ? { cliPathOverride: bin } : {}),
       ...(opts.init ?? {}),
     } as DaemonToWorker;
     child.send(init);
@@ -143,6 +160,7 @@ async function runWorker(opts: {
       () => `mojo was never invoked\n${logs.join('')}`,
     );
     return {
+      bin,
       invocation: JSON.parse(readFileSync(dump, 'utf-8')) as Invocation,
       logs: logs.join(''),
       messages,
@@ -151,7 +169,6 @@ async function runWorker(opts: {
   } finally {
     if (child && child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
     rmSync(root, { recursive: true, force: true });
-    void bin;
   }
 }
 
@@ -165,7 +182,7 @@ describe('mojo worker wiring', () => {
     expect(elapsedMs).toBeLessThan(12_000);
   }, 40_000);
 
-  it('passes the session working dir, per-bot env, model and cliPathOverride through', async () => {
+  it('passes the session working dir, per-bot env and model through', async () => {
     const { invocation } = await runWorker({
       botEntry: {
         model: 'gpt-5.5-2026-04-24',
@@ -225,6 +242,67 @@ describe('mojo worker wiring', () => {
     expect(invocation.argv[invocation.argv.indexOf('-r') + 1]).toBe('sid-persisted-42');
   }, 40_000);
 
+  it('runs the binary pinned by cliPathOverride, not a bare `mojo` from PATH', async () => {
+    // The install check validates the OVERRIDE path, so running a different
+    // binary at turn time would make that check meaningless.
+    const { invocation, bin } = await runWorker({
+      binName: 'mojo-custom',
+      botEntry: { mojo: { cloud: true } },
+      init: { backendConfig: { cloud: true } },
+      cliPathOverrideFromBin: true,
+    });
+    expect(invocation.self).toBe(bin);
+    expect(invocation.self).toContain('mojo-custom');
+  }, 40_000);
+
+  it('lets a per-bot JWT win over the daemon ambient X_JWT_TOKEN', async () => {
+    // buildEnv() used to read process.env directly AFTER merging, so the host
+    // token overrode the per-bot one and the bot ran as the wrong identity.
+    const { invocation } = await runWorker({
+      workerEnv: { X_JWT_TOKEN: 'ambient-jwt' },
+      botEntry: { env: { X_JWT_TOKEN: 'per-bot-jwt' }, mojo: { cloud: true } },
+      init: {
+        env: { X_JWT_TOKEN: 'per-bot-jwt' },
+        backendConfig: { cloud: true },
+      },
+    });
+    expect(invocation.env.X_JWT_TOKEN).toBe('per-bot-jwt');
+  }, 40_000);
+
+  it('still uses the ambient JWT when the bot supplies none', async () => {
+    const { invocation } = await runWorker({
+      workerEnv: { X_JWT_TOKEN: 'ambient-jwt' },
+      botEntry: { mojo: { cloud: true } },
+      init: { backendConfig: { cloud: true } },
+    });
+    expect(invocation.env.X_JWT_TOKEN).toBe('ambient-jwt');
+  }, 40_000);
+
+  it('lets an explicit mojo.jwt win over both', async () => {
+    const { invocation } = await runWorker({
+      workerEnv: { X_JWT_TOKEN: 'ambient-jwt' },
+      botEntry: { env: { X_JWT_TOKEN: 'per-bot-jwt' }, mojo: { cloud: true, jwt: 'block-jwt' } },
+      init: {
+        env: { X_JWT_TOKEN: 'per-bot-jwt' },
+        backendConfig: { cloud: true, jwt: 'block-jwt' },
+      },
+    });
+    expect(invocation.env.X_JWT_TOKEN).toBe('block-jwt');
+  }, 40_000);
+
+  it('re-applies the wrapperCli launch prefix on every turn', async () => {
+    // A PTY CLI is wrapped once for the life of its process; mojo is invoked per
+    // turn, so dropping the prefix meant the worker logged "Launch prefix: …"
+    // while actually running an unwrapped mojo.
+    const { invocation } = await runWorker({
+      botEntry: { wrapperCli: 'env WRAPPER_MARK=wrapped mojo', mojo: { cloud: true } },
+      init: { wrapperCli: 'env WRAPPER_MARK=wrapped mojo', backendConfig: { cloud: true } },
+    });
+    expect(invocation.env.WRAPPER_MARK).toBe('wrapped');
+    // The prompt must still arrive — the prefix wraps, it does not replace.
+    expect(invocation.argv).toContain('hello mojo');
+  }, 40_000);
+
   it('refuses to start a locally-executing mojo bot that requested sandbox', async () => {
     // cloud is NOT set here, so tools would run on this host while the user
     // believes the sandbox is active. Fail closed rather than silently skipping.
@@ -241,7 +319,7 @@ describe('mojo worker wiring', () => {
         backendType: 'mojo',
         sandbox: true,
       }]));
-      writeFakeMojo(root, join(root, 'unused.json'));
+      writeFakeMojo(root);
 
       const errors: string[] = [];
       child = spawn(process.execPath, ['--import', 'tsx', resolve('src/worker.ts')], {
