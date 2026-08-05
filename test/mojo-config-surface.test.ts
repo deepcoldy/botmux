@@ -71,7 +71,7 @@ describe('mojo config surface', () => {
     const store = await loaded({
       cliId: 'mojo',
       backendType: 'mojo',
-      mojo: { jwt: 'super-secret-token-value', model: 'gpt-5.5-2026-04-24', cloud: true },
+      mojo: { jwt: 'super-secret-token-value', workspaceId: 'ws-visible', cloud: true },
     });
     const snap = store.getConfigSnapshot('app_default');
     expect(snap.ok).toBe(true);
@@ -83,7 +83,7 @@ describe('mojo config surface', () => {
     expect(row!.value).not.toContain('super-secret-token-value');
     expect(row!.value).toContain('jwt=••••');
     // Non-secret fields stay visible so the row is still useful for debugging.
-    expect(row!.value).toContain('model=gpt-5.5-2026-04-24');
+    expect(row!.value).toContain('workspaceId=ws-visible');
   });
 
   it('exposes mojo as a settable backendType and config field', async () => {
@@ -97,25 +97,41 @@ describe('mojo config surface', () => {
     expect(store.settableFieldKeys()).toContain('mojo');
   });
 
-  it('rejects wrapperCli inside the mojo block instead of silently dropping it', async () => {
-    // wrapperCli has one home: the top-level bot field the worker's wrapper
-    // handling is built around. A second copy would let the run path and the
-    // workerless cancel path use different wrappers. Rejecting visibly matters —
-    // a silent drop reads to the operator as "applied".
+  it('rejects every platform-owned launch key inside the mojo block', async () => {
+    // Each of these has a top-level bot field that is FROZEN onto the session, so
+    // a second copy here would let a live edit override a frozen identity.
+    // Rejecting visibly matters — a silent drop reads to the operator as
+    // "applied", which is exactly wrong when the wrapper carries auth.
     const store = await loaded();
     const spec = store.findConfigField('mojo');
     expect(spec).toBeDefined();
 
-    const rejected = store.coerceConfigValue(
-      spec!,
-      JSON.stringify({ cloud: true, wrapperCli: 'env X=1 mojo' }),
-    );
-    expect(rejected.ok).toBe(false);
-    if (!rejected.ok) expect(rejected.reason).toBe('mojo_wrapper_cli_top_level_only');
+    for (const key of ['bin', 'cwd', 'model', 'disableCliBypass', 'wrapperCli', 'resumeCliSessionId']) {
+      const rejected = store.coerceConfigValue(
+        spec!,
+        JSON.stringify({ cloud: true, [key]: key === 'disableCliBypass' ? true : 'x' }),
+      );
+      expect(rejected.ok, `mojo.${key} must be rejected`).toBe(false);
+      if (!rejected.ok) expect(rejected.reason).toContain(key);
+    }
 
-    // The same block without wrapperCli is accepted.
-    const accepted = store.coerceConfigValue(spec!, JSON.stringify({ cloud: true }));
+    // A block with only mojo-specific settings is accepted.
+    const accepted = store.coerceConfigValue(
+      spec!,
+      JSON.stringify({ cloud: true, workspaceId: 'ws-1', idleTimeoutSec: 30 }),
+    );
     expect(accepted.ok).toBe(true);
+  });
+
+  it('fails bots.json parsing closed on a hand-edited internal key', async () => {
+    // The config-command path is not the only entry point: this is what a
+    // hand-edited bots.json goes through, and silently stripping there is what
+    // review found (parse succeeds, wrapper retained in memory, then dropped).
+    writeConfig({ cliId: 'mojo', backendType: 'mojo', mojo: { cloud: true, wrapperCli: 'env X=1 mojo' } });
+    const { registry } = await freshModules();
+    expect(() => registry.loadBotConfigs()).toThrow(/mojo\.wrapperCli/);
+    // The error must point at the field that DOES own it.
+    expect(() => registry.loadBotConfigs()).toThrow(/top-level/);
   });
 
   it('renders an empty / absent mojo block without leaking undefined', async () => {

@@ -20,7 +20,7 @@ vi.mock('../src/utils/logger.js', () => ({
 }));
 
 import { MojoBackend } from '../src/adapters/backend/mojo-backend.js';
-import type { MojoBackendConfig } from '../src/adapters/backend/mojo-types.js';
+import type { EffectiveMojoConfig } from '../src/adapters/backend/mojo-types.js';
 
 let binDir: string;
 
@@ -41,7 +41,7 @@ interface TurnOutcome {
 function runTurn(
   bin: string,
   prompt = 'hi',
-  extra: Partial<MojoBackendConfig> = {},
+  extra: Partial<EffectiveMojoConfig> = {},
 ): Promise<TurnOutcome> {
   return new Promise((resolve, reject) => {
     const backend = new MojoBackend({ bin, ...extra }, 'session-under-test');

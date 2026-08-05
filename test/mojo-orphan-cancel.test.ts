@@ -67,33 +67,57 @@ beforeEach(() => { root = realpathSync(mkdtempSync(join(tmpdir(), 'botmux-mojo-o
 afterEach(() => { rmSync(root, { recursive: true, force: true }); });
 
 describe('buildEffectiveMojoConfig', () => {
-  it('folds generic session settings in, with the mojo block winning', () => {
+  it('takes the launch identity ONLY from the generic (frozen) source', () => {
+    // Previously the block won for bin/model, which let a live `mojo.bin` added
+    // after session creation override the FROZEN cliPathOverride — the workerless
+    // cancel would then run a different binary than the one that created the
+    // remote session. Both config entry points now reject these keys, so a value
+    // reaching here means a hand-edited file and must be ignored, not honoured.
     const cfg = buildEffectiveMojoConfig(
-      { model: 'block-model', bin: '/block/mojo' },
       {
-        cliPathOverride: '/generic/mojo',
-        workingDir: '/generic/dir',
-        model: 'generic-model',
+        bin: '/live/new-mojo',
+        model: 'live-model',
+        wrapperCli: 'env FROM_BLOCK=1 mojo',
+        disableCliBypass: false,
+        cwd: '/live/dir',
+      } as never,
+      {
+        cliPathOverride: '/frozen/session-mojo',
+        model: 'frozen-model',
+        workingDir: '/frozen/dir',
         disableCliBypass: true,
+        wrapperCli: 'env FROM_TOP=1 mojo',
       },
     );
-    // More specific block values win…
-    expect(cfg.bin).toBe('/block/mojo');
-    expect(cfg.model).toBe('block-model');
-    // …and generic values fill the gaps.
-    expect(cfg.cwd).toBe('/generic/dir');
+    expect(cfg.bin).toBe('/frozen/session-mojo');
+    expect(cfg.model).toBe('frozen-model');
+    expect(cfg.cwd).toBe('/frozen/dir');
     expect(cfg.disableCliBypass).toBe(true);
+    expect(cfg.wrapperCli).toBe('env FROM_TOP=1 mojo');
   });
 
-  it('uses generic values when the mojo block is absent entirely', () => {
-    const cfg = buildEffectiveMojoConfig(undefined, {
-      cliPathOverride: '/generic/mojo',
-      workingDir: '/generic/dir',
-      model: 'generic-model',
-    });
-    expect(cfg.bin).toBe('/generic/mojo');
-    expect(cfg.cwd).toBe('/generic/dir');
-    expect(cfg.model).toBe('generic-model');
+  it('drops internal keys entirely when the generic source has none', () => {
+    // Not "block wins because generic is absent" — the block is never a source
+    // for these, so the result must be undefined rather than the live value.
+    const cfg = buildEffectiveMojoConfig(
+      { bin: '/live/new-mojo', model: 'live-model', wrapperCli: 'env X=1 mojo' } as never,
+      {},
+    );
+    expect(cfg.bin).toBeUndefined();
+    expect(cfg.model).toBeUndefined();
+    expect(cfg.wrapperCli).toBeUndefined();
+  });
+
+  it('keeps genuinely mojo-specific block settings', () => {
+    const cfg = buildEffectiveMojoConfig(
+      { cloud: true, workspaceId: 'ws-1', idleTimeoutSec: 30, jwt: 'j' },
+      { workingDir: '/dir' },
+    );
+    expect(cfg.cloud).toBe(true);
+    expect(cfg.workspaceId).toBe('ws-1');
+    expect(cfg.idleTimeoutSec).toBe(30);
+    expect(cfg.jwt).toBe('j');
+    expect(cfg.cwd).toBe('/dir');
   });
 
   it('layers env with the mojo block on top of per-bot env', () => {
@@ -110,9 +134,10 @@ describe('buildEffectiveMojoConfig', () => {
     expect(buildEffectiveMojoConfig(undefined, { wrapperCli: '  ' }).wrapperCli).toBeUndefined();
   });
 
-  it('preserves an explicit disableCliBypass:false instead of dropping it', () => {
-    // `??` (not `||`) matters here — `false` is a real, meaningful value.
-    const cfg = buildEffectiveMojoConfig({ disableCliBypass: false }, { disableCliBypass: true });
+  it('preserves an explicit generic disableCliBypass:false', () => {
+    // `!== undefined` (not `||`) matters here — `false` is a real, meaningful
+    // value meaning "do add --yolo", and must not be treated as absent.
+    const cfg = buildEffectiveMojoConfig(undefined, { disableCliBypass: false });
     expect(cfg.disableCliBypass).toBe(false);
   });
 });

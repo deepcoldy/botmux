@@ -321,17 +321,38 @@ describe('mojo worker wiring', () => {
     expect(invocation.argv[invocation.argv.length - 1]).toContain('hello mojo');
   }, 40_000);
 
-  it('does not launch a wrapper declared only inside the mojo block', async () => {
-    // The worker builds the prefix from the TOP-LEVEL wrapperCli only, so a block
-    // value must not take effect on the run path either. Paired with the
-    // cancel-path test in mojo-orphan-cancel.test.ts, this pins that both paths
-    // agree — the divergence review found was run-bare / cancel-wrapped.
+  it('does not launch a wrapper smuggled in through the mojo block', async () => {
+    // bots.json parsing now rejects this outright, so the only way it can still
+    // reach a worker is a stale/forged init payload. It must not take effect there
+    // either — paired with the cancel-path test in mojo-orphan-cancel.test.ts,
+    // this pins that both paths agree (review found run-bare / cancel-wrapped).
+    // NOTE: botEntry deliberately omits it, or loadBotConfigs would throw.
     const { invocation } = await runWorker({
-      botEntry: { mojo: { cloud: true, wrapperCli: 'env WRAPPER_MARK=nested mojo' } },
+      botEntry: { mojo: { cloud: true } },
       init: { backendConfig: { cloud: true, wrapperCli: 'env WRAPPER_MARK=nested mojo' } },
     });
     expect(invocation.env.WRAPPER_MARK).toBeUndefined();
   }, 40_000);
+
+  it('lets CLI_EXTRA_ARGS override a built-in flag, wrapper or not', async () => {
+    // With a wrapper, buildWrappedLaunch used to fold the extra args into the
+    // PREFIX, i.e. before the backend's own flags — so with last-value-wins
+    // parsing the built-in won, contradicting the documented precedence.
+    for (const wrapperCli of [undefined, 'env WRAPPER_MARK=wrapped mojo']) {
+      const { invocation } = await runWorker({
+        workerEnv: { CLI_EXTRA_ARGS: '--idle-timeout 77' },
+        botEntry: { mojo: { cloud: true, idleTimeoutSec: 12 }, ...(wrapperCli ? { wrapperCli } : {}) },
+        init: { backendConfig: { cloud: true, idleTimeoutSec: 12 }, ...(wrapperCli ? { wrapperCli } : {}) },
+      });
+      const flags = invocation.argv.filter(a => a === '--idle-timeout');
+      expect(flags.length, `wrapperCli=${String(wrapperCli)}`).toBe(2);
+      // LAST occurrence must be the operator's override.
+      const lastIdx = invocation.argv.lastIndexOf('--idle-timeout');
+      expect(invocation.argv[lastIdx + 1], `wrapperCli=${String(wrapperCli)}`).toBe('77');
+      // And the wrapper still applies when configured.
+      if (wrapperCli) expect(invocation.env.WRAPPER_MARK).toBe('wrapped');
+    }
+  }, 60_000);
 
   it('refuses to start a locally-executing mojo bot that requested sandbox', async () => {
     // cloud is NOT set here, so tools would run on this host while the user
