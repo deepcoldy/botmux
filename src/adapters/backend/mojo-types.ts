@@ -356,6 +356,123 @@ function emptyToUndefined(value: string | undefined): string | undefined {
     return trimmed ? trimmed : undefined;
 }
 
+/**
+ * CLI flags that carry platform-owned decisions: the control plane, the execution
+ * mode, the approval bypass, the model, and the resume lineage.
+ *
+ * `CLI_EXTRA_ARGS` is appended AFTER the backend's own flags so an operator can
+ * override behaviour knobs (that is the documented contract), but with
+ * last-value-wins parsing that also let it override these — making env a second
+ * entry point for the very identity that is frozen per session. They are rejected
+ * instead.
+ *
+ * Long forms only: the mojo CLI has no short aliases for any of these, and
+ * `-r` is covered separately because it is the resume lineage.
+ */
+const MOJO_RESERVED_CLI_FLAGS: ReadonlySet<string> = new Set([
+    '--workspace-id',
+    '--agent-id',
+    '--cloud',
+    '--no-cloud',
+    '--model',
+    '--yolo',
+    '--no-yolo',
+    '--resume',
+    '-r',
+    '--continue',
+    '-c',
+    '--background',
+    '--output-format',
+    '--include-partial',
+]);
+
+/**
+ * Reject platform-owned flags in operator-supplied extra args.
+ *
+ * Handles `--flag value`, `--flag=value` and the bare boolean form, since all
+ * three reach the CLI identically. Returns the offending flags, empty when clean.
+ */
+export function findReservedMojoCliFlags(args: readonly string[]): string[] {
+    const offending: string[] = [];
+    for (const arg of args) {
+        if (!arg.startsWith('-')) continue;
+        // `--flag=value` and `--flag value` are the same flag to the CLI.
+        const flag = arg.includes('=') ? arg.slice(0, arg.indexOf('=')) : arg;
+        if (MOJO_RESERVED_CLI_FLAGS.has(flag) && !offending.includes(flag)) {
+            offending.push(flag);
+        }
+    }
+    return offending;
+}
+
+/**
+ * Can this mojo session prove it executes nothing locally?
+ *
+ * A launch prefix (wrapperCli) breaks the proof: it runs BEFORE the binary and
+ * can rewrite the very environment the decision depends on — `env
+ * AGENT_LOCAL_DAEMON=1 mojo` re-enables host execution after buildEnv() set it to
+ * 0, and buildEnv cannot defend against it because the prefix is applied later.
+ * Inspecting the wrapper string is not enough either: a wrapper may be a script
+ * that sets the variable internally.
+ *
+ * So a wrapper makes the session unprovable, and the local sandbox stays engaged.
+ */
+export function isMojoFullyRemote(
+    cfg?: { cloud?: boolean; localDaemon?: boolean; wrapperCli?: string },
+): boolean {
+    if (cfg?.cloud !== true) return false;
+    if (cfg.localDaemon === true) return false;
+    if (cfg.wrapperCli?.trim()) return false;
+    return true;
+}
+
+/**
+ * The subset of `mojo` settings that may change on a LIVE session: credentials
+ * and behaviour knobs. Explicitly NOT the control plane — that stays frozen.
+ *
+ * Exists because the config is otherwise read once at worker init, so a rotated
+ * JWT never reached an existing session's per-turn CLI invocations, contradicting
+ * the "credentials stay live" contract.
+ */
+export const MOJO_LIVE_PATCH_KEYS = [
+    'jwt',
+    'jwtEnv',
+    'env',
+    'stream',
+    'systemPrompt',
+    'idleTimeoutSec',
+] as const;
+
+export type MojoLivePatch = Pick<MojoConfig, typeof MOJO_LIVE_PATCH_KEYS[number]>;
+
+/**
+ * Extract the live-updatable subset. Absent keys are omitted so the receiver can
+ * distinguish "unchanged" from "explicitly cleared".
+ */
+export function pickMojoLivePatch(cfg: MojoConfig | undefined): MojoLivePatch {
+    const out: Record<string, unknown> = {};
+    if (!cfg) return out;
+    for (const key of MOJO_LIVE_PATCH_KEYS) {
+        const value = (cfg as Record<string, unknown>)[key];
+        if (value !== undefined) out[key] = value;
+    }
+    return out;
+}
+
+/** True when a live patch differs from what the backend currently holds. */
+export function mojoLivePatchDiffers(current: MojoConfig, patch: MojoLivePatch): boolean {
+    for (const key of MOJO_LIVE_PATCH_KEYS) {
+        const a = (current as Record<string, unknown>)[key];
+        const b = (patch as Record<string, unknown>)[key];
+        if (key === 'env') {
+            if (JSON.stringify(a ?? {}) !== JSON.stringify(b ?? {})) return true;
+            continue;
+        }
+        if (a !== b) return true;
+    }
+    return false;
+}
+
 /** Outcome of validating a raw `mojo` config block. */
 export type MojoConfigNormalizeResult =
     | { ok: true; value: MojoConfig }

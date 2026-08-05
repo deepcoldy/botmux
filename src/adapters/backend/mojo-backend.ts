@@ -51,9 +51,10 @@ import { locateOnPath } from '../cli/registry.js';
 import { buildWrappedLaunch } from '../../setup/cli-selection.js';
 import { logger } from '../../utils/logger.js';
 import type { SessionBackend, SpawnOpts } from './types.js';
-import { MOJO_CONTROL_ENV_KEYS } from './mojo-types.js';
+import { findReservedMojoCliFlags, MOJO_CONTROL_ENV_KEYS, MOJO_LIVE_PATCH_KEYS } from './mojo-types.js';
 import type {
     MojoAuthStatus,
+    MojoLivePatch,
     EffectiveMojoConfig,
     MojoCliEnvelope,
     MojoError,
@@ -105,7 +106,8 @@ const SEEN_RESULTS_MAX = 64;
 type MojoChild = ChildProcessByStdio<null, Readable, Readable>;
 
 export class MojoBackend implements SessionBackend {
-    private readonly config: EffectiveMojoConfig;
+    /** Mutable: applyLivePatch rotates credentials without a refork. */
+    private config: EffectiveMojoConfig;
     private readonly sessionId: string;
 
     private dataCb: ((data: string) => void) | null = null;
@@ -187,9 +189,22 @@ export class MojoBackend implements SessionBackend {
         // them out of both the spawn args and the wrapper prefix so they can be
         // appended AFTER our own flags on every turn (last-value-wins). Fall back
         // to the spawn args for any caller that has not been updated.
-        this.extraCliArgs = this.config.extraCliArgs
+        const requestedExtraArgs = this.config.extraCliArgs
             ? [...this.config.extraCliArgs]
             : (args.length > 0 && !this.config.wrapperCli ? [...args] : []);
+        // Defence in depth: the worker already refuses these, but this backend is
+        // also constructed by the daemon's cancel path. A reserved flag reaching
+        // here would override the frozen control plane, so drop it loudly rather
+        // than letting it through.
+        const reservedExtra = findReservedMojoCliFlags(requestedExtraArgs);
+        if (reservedExtra.length > 0) {
+            logger.warn(
+                `[mojo] ignoring platform-owned flag(s) in extra CLI args: ${reservedExtra.join(' ')}`,
+            );
+            this.extraCliArgs = [];
+        } else {
+            this.extraCliArgs = requestedExtraArgs;
+        }
 
         if (this.config.wrapperCli) {
             this.wrapperResolved = true;
@@ -272,6 +287,37 @@ export class MojoBackend implements SessionBackend {
                 this.emitLine(`❌ mojo 执行失败：${this.fmtErr(err)}`, 'err');
                 this.settleTurn();
             });
+    }
+
+    /**
+     * Rotate credentials / behaviour knobs on a LIVE session, without a refork.
+     *
+     * Needed because the config is otherwise read once at worker init, so every
+     * subsequent per-turn CLI invocation kept using the ORIGINAL JWT — a rotated
+     * token never took effect, contradicting the documented "credentials stay
+     * live" contract (the control plane is the part that is deliberately frozen).
+     *
+     * Only the live-updatable subset is accepted; anything else is ignored, so
+     * this can never become a back door for changing the control plane.
+     */
+    applyLivePatch(patch: MojoLivePatch): void {
+        const next: Record<string, unknown> = { ...this.config };
+        const changed: string[] = [];
+        for (const key of MOJO_LIVE_PATCH_KEYS) {
+            const incoming = (patch as Record<string, unknown>)[key];
+            if (incoming === undefined) continue;
+            const current = next[key];
+            const differs = key === 'env'
+                ? JSON.stringify(current ?? {}) !== JSON.stringify(incoming ?? {})
+                : current !== incoming;
+            if (!differs) continue;
+            next[key] = incoming;
+            changed.push(key);
+        }
+        if (changed.length === 0) return;
+        this.config = next as EffectiveMojoConfig;
+        // Names only — `jwt` and `env` values are credentials.
+        logger.info(`[mojo] applied live config patch: ${changed.join(', ')}`);
     }
 
     resize(_cols: number, _rows: number): void { /* no terminal to resize */ }

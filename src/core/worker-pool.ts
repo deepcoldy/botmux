@@ -36,8 +36,11 @@ import {
   buildEffectiveMojoConfig,
   diffMojoSessionIdentity,
   MOJO_IDENTITY_KEYS,
+  mojoLivePatchDiffers,
+  pickMojoLivePatch,
   pickMojoSessionIdentity,
   type MojoConfig,
+  type MojoLivePatch,
 } from '../adapters/backend/mojo-types.js';
 import { sanitizePerBotEnv } from './per-bot-env.js';
 import { logger } from '../utils/logger.js';
@@ -74,6 +77,7 @@ import {
   managedHerdrAgentName,
 } from '../adapters/backend/session-backend-selector.js';
 import { isRemoteBackendType, isSuspendableBackendType, getSessionPersistentBackendType, persistentBackendTargetForSession, persistentSessionName, killPersistentBackendTarget, killPersistentSession, probePersistentBackendTarget, resolvePairedSpawnBackendType, resolvePersistentBackendTarget } from './persistent-backend.js';
+import { freezeMojoIdentityForSession } from './mojo-session-identity.js';
 import { getBot, getAllBots, loadBotConfigs, resolveBrandLabel, getLoadedConfigPath, resolveUsageDisplay } from '../bot-registry.js';
 import { RestartCoordinator, type RestartObserver } from './restart-coordinator.js';
 import { runtimeBuildIdentity } from '../utils/runtime-build-id.js';
@@ -928,6 +932,9 @@ function sessionAgentConfig(
   };
 }
 
+
+export { freezeMojoIdentityForSession } from './mojo-session-identity.js';
+
 /**
  * Freeze the control-plane identity of every restored mojo session at daemon
  * startup, instead of waiting for each one's next worker fork.
@@ -956,9 +963,8 @@ export function migrateMojoSessionIdentities(activeSessions: Map<string, DaemonS
       // later re-registration can migrate it.
       continue;
     }
-    // freeze:true persists the snapshot (including an empty one, which is what
-    // distinguishes "frozen with nothing set" from "never frozen").
-    sessionMojoConfig(ds, botCfg, { freeze: true });
+    void botCfg;
+    freezeMojoIdentityForSession(ds.session, ds.larkAppId);
     migrated += 1;
   }
   if (migrated > 0) {
@@ -1015,43 +1021,70 @@ function frozenSessionLaunchIdentity(
  * mutates session state; a session that predates this field then simply runs on
  * live config, exactly as it did before.
  */
+/**
+ * Resolve the mojo config a session must run on, plus whether its remote lineage
+ * may still be used.
+ *
+ * Returns an explicit state rather than a bare config, because "we have a config"
+ * and "this lineage is safe to resume/cancel" are different questions and
+ * conflating them is what let a cancel reach the wrong tenant:
+ *   - `usable`      — identity is frozen (or freshly frozen); lineage is trusted
+ *   - `quarantined` — legacy row with a remote lineage but no frozen identity.
+ *                     Nothing records which control plane holds it, so it must not
+ *                     be resumed or cancelled automatically.
+ *   - `none`        — legacy row with no lineage at all; nothing at risk.
+ *
+ * Identity (cloud / localDaemon / baseUrl / ppeEnv / workspaceId / agentId) comes
+ * from the FROZEN snapshot; credentials (jwt / jwtEnv / env) and behaviour knobs
+ * stay LIVE so a rotated token takes effect and no plaintext JWT is persisted.
+ *
+ * `freeze` is false on read-only paths (workerless cancel) so teardown never
+ * mutates session state.
+ */
 function sessionMojoConfig(
   ds: DaemonSession,
   botCfg: { mojo?: MojoConfig },
   opts: { freeze: boolean },
-): MojoConfig {
+): { config: MojoConfig; lineage: 'usable' | 'quarantined' | 'none' } {
   const live = botCfg.mojo ?? {};
   const liveIdentity = pickMojoSessionIdentity(live);
 
   if (!ds.session.mojoIdentity) {
     // Legacy row, never frozen. `undefined` means "predates this field"; an empty
     // object means "frozen with nothing configured" and is NOT this branch — which
-    // is why migrateMojoSessionIdentities persists `{}` rather than skipping it.
-    //
-    // A row carrying a remote lineage has ALREADY created a session on some
-    // control plane, and nothing on disk records which one. Adopting today's
-    // config would silently pair that lineage with a possibly different
-    // tenant/workspace, so drop the lineage instead: the next message starts a
-    // fresh session on the current (known) control plane. Correctness over
-    // convenience — the alternative resumes, or cancels, against the wrong tenant.
-    if (ds.session.riffParentTaskId) {
-      logger.warn(
-        `[${tag(ds)}] mojo session has a remote lineage but no frozen control plane `
-        + '(created before this field existed). Dropping the lineage so the next '
-        + 'message starts fresh on the current configuration, rather than resuming '
-        + 'it against a control plane we cannot verify.',
-      );
-      ds.session.riffParentTaskId = undefined;
+    // is why the migration persists `{}` rather than skipping it.
+    const lineage = ds.session.riffParentTaskId ?? ds.session.mojoQuarantinedLineage;
+    if (lineage) {
+      // QUARANTINE, do not delete. The id is the only record of a remote session
+      // that is still running somewhere; keeping it allows manual inspection and
+      // cleanup, and lets the user be told their context was parked. Deleting it
+      // would lose that silently.
       if (opts.freeze) {
-        ds.session.mojoIdentity = liveIdentity;
-        sessionStore.updateSession(ds.session);
+        if (ds.session.mojoQuarantinedLineage !== lineage
+            || ds.session.riffParentTaskId !== undefined
+            || !ds.session.mojoIdentity) {
+          ds.session.mojoQuarantinedLineage = lineage;
+          // Cleared from the ACTIVE slot so no resume path picks it up, while the
+          // value itself survives under the quarantine key.
+          ds.session.riffParentTaskId = undefined;
+          ds.session.mojoIdentity = liveIdentity;
+          sessionStore.updateSession(ds.session);
+        }
+        logger.warn(
+          `[${tag(ds)}] mojo session has a remote lineage but no frozen control plane `
+          + '(created before this field existed). Parked it as quarantined: it will not '
+          + 'be resumed or cancelled automatically, because cancelling through the '
+          + 'current configuration could reach a different tenant. The next message '
+          + 'starts a fresh session on the current control plane.',
+        );
       }
-      return live;
+      return { config: live, lineage: 'quarantined' };
     }
-    if (!opts.freeze) return live;
-    ds.session.mojoIdentity = liveIdentity;
-    sessionStore.updateSession(ds.session);
-    return live;
+    if (opts.freeze) {
+      ds.session.mojoIdentity = liveIdentity;
+      sessionStore.updateSession(ds.session);
+    }
+    return { config: live, lineage: 'none' };
   }
 
   const frozen = ds.session.mojoIdentity;
@@ -1072,7 +1105,13 @@ function sessionMojoConfig(
     if (value === undefined) delete merged[key];
     else merged[key] = value;
   }
-  return merged as MojoConfig;
+  return {
+    config: merged as MojoConfig,
+    // A previously quarantined row keeps its quarantine even once an identity has
+    // been frozen: the frozen value describes TODAY's control plane, not the one
+    // that created the parked lineage.
+    lineage: ds.session.mojoQuarantinedLineage ? 'quarantined' : 'usable',
+  };
 }
 
 function loadKnownBotOpenIdsForApp(larkAppId: string): Set<string> {
@@ -2331,7 +2370,20 @@ function destroyOrphanedBackingSession(ds: DaemonSession): void {
           // reach the endpoint/tenant that CREATED the remote session, so the
           // frozen control plane matters here as much as the frozen binary.
           const frozenMojo = sessionMojoConfig(ds, botCfg, { freeze: false });
-          const launchCfg = buildEffectiveMojoConfig(frozenMojo, {
+          // A quarantined lineage must NOT be cancelled: nothing records which
+          // control plane holds it, so cancelling through the current config could
+          // reach a different tenant. Note the caller captured `remoteId` BEFORE
+          // this call, so clearing the field would not have stopped it — the
+          // explicit state is what makes the refusal reliable.
+          if (frozenMojo.lineage === 'quarantined') {
+            logger.warn(
+              `[${tag(ds)}] killWorker: NOT cancelling mojo session ${remoteId} — `
+              + 'its control plane is unverifiable (quarantined). It is preserved on the '
+              + 'session for manual cleanup.',
+            );
+            return;
+          }
+          const launchCfg = buildEffectiveMojoConfig(frozenMojo.config, {
             cliPathOverride: frozenLaunch.cliPathOverride,
             workingDir: ds.session.workingDir ?? botCfg.defaultWorkingDir ?? botCfg.workingDir,
             env: botCfg.env ? sanitizePerBotEnv(botCfg.env) : undefined,
@@ -3995,8 +4047,34 @@ export function sendWorkerInput(
     ...(vcMeetingImTurnOrigin
       ? { vcMeetingImTurnOrigin }
       : {}),
+    ...(mojoLivePatchForSession(ds) ?? {}),
   };
   return sendWorkerSessionInput(ds, message);
+}
+
+/**
+ * Credential / behaviour patch to ride along with a turn, so a live mojo session
+ * picks up a rotated JWT without a refork.
+ *
+ * Only sent when it actually differs from what the worker was given at init,
+ * keeping the common path free of redundant payload. Returns undefined for
+ * non-mojo sessions and when nothing changed.
+ *
+ * The control plane is NOT included — it stays frozen for the session's lifetime.
+ */
+function mojoLivePatchForSession(ds: DaemonSession): { mojoLivePatch: MojoLivePatch } | undefined {
+  const backendType = ds.initConfig?.backendType ?? ds.session.backendType;
+  if (backendType !== 'mojo') return undefined;
+  let liveMojo: MojoConfig | undefined;
+  try {
+    liveMojo = getBot(ds.larkAppId).config.mojo;
+  } catch {
+    return undefined;
+  }
+  const patch = pickMojoLivePatch(liveMojo);
+  const atInit = (ds.initConfig?.backendConfig ?? {}) as MojoConfig;
+  if (!mojoLivePatchDiffers(atInit, patch)) return undefined;
+  return { mojoLivePatch: patch };
 }
 
 export function forkWorker(
@@ -4407,7 +4485,7 @@ export function forkWorker(
     // or resume it against a different tenant/workspace than the one holding its
     // remote session.
     backendConfig: botCfg.backendType === 'mojo' || agentCfg.cliId === 'mojo'
-      ? sessionMojoConfig(ds, botCfg, { freeze: true })
+      ? sessionMojoConfig(ds, botCfg, { freeze: true }).config
       : botCfg.riff,
     riffParentTaskId: ds.session.riffParentTaskId,
     riffRepoDirs: ds.session.riffRepoDirs,

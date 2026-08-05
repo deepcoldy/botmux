@@ -34,6 +34,7 @@ import {
 } from './persistent-backend.js';
 import type { PersistentBackendTarget } from '../adapters/backend/types.js';
 import { adoptTargetLabel, validateAdoptTargetState } from './session-discovery.js';
+import { freezeMojoIdentityForSession } from './mojo-session-identity.js';
 import { getBot, getAllBots, getOwnerOpenId, findOncallChat, effectiveDefaultWorkingDir } from '../bot-registry.js';
 import type { BotConfig } from '../bot-registry.js';
 import type { CliId } from '../adapters/cli/types.js';
@@ -1393,6 +1394,13 @@ export async function restoreActiveSessions(activeSessions: Map<string, DaemonSe
       logger.debug(`[${session.sessionId.substring(0, 8)}] Already registered by live runtime during restore; skipping snapshot row`);
       continue;
     }
+    // Freeze the mojo control plane BEFORE this row becomes visible in the active
+    // map. The dispatcher is already live during restore, so a row registered
+    // first could be woken — or `/close`d — while still reading live bot config,
+    // pairing a lineage created on one tenant with another. Idempotent and cheap
+    // for non-mojo rows.
+    freezeMojoIdentityForSession(session, session.larkAppId ?? getAllBots()[0]?.config.larkAppId ?? '');
+
     // Restored sessions persisted before the scope field was added default to
     // 'thread' — that matches the legacy thread-only behaviour.
     const scope: 'thread' | 'chat' = session.scope === 'chat' ? 'chat' : 'thread';
@@ -2033,6 +2041,13 @@ export async function resumeSession(
   session.closedAt = undefined;
   session.lastMessageAt = new Date().toISOString();
   sessionStore.updateSession(session);
+
+  // Same reason as in restoreActiveSessions: freeze the mojo control plane BEFORE
+  // this row is registered, so it can never be woken or cancelled while still
+  // resolving against live bot config. This is the second path that re-registers
+  // a legacy row, and startup migration does not cover it (the row may have been
+  // closed then, or created after boot).
+  freezeMojoIdentityForSession(session, larkAppId);
 
   const now = Date.now();
   const ds: DaemonSession = {

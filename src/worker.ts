@@ -236,7 +236,7 @@ import {
   isValidRiffSandboxCluster,
   type RiffBackendConfig,
 } from './adapters/backend/riff-backend.js';
-import { buildEffectiveMojoConfig, normalizeMojoConfig, type EffectiveMojoConfig } from './adapters/backend/mojo-types.js';
+import { buildEffectiveMojoConfig, findReservedMojoCliFlags, normalizeMojoConfig, pickMojoLivePatch, type EffectiveMojoConfig, type MojoLivePatch } from './adapters/backend/mojo-types.js';
 import {
   prepareDirectSandbox,
   prepareCredentialOnlySandbox,
@@ -9242,6 +9242,20 @@ async function spawnCli(
   // Carrying them separately lets the backend append them AFTER its own flags on
   // every turn, which is the same order the no-wrapper path already produced.
   if (effectiveBackendType === 'mojo' && spawnArgs.length > 0) {
+    // Refuse platform-owned flags. Extra args are appended AFTER the backend's
+    // own flags so an operator can override behaviour knobs — but with
+    // last-value-wins that also let CLI_EXTRA_ARGS override the control-plane
+    // identity frozen on the session (`--workspace-id`, `--agent-id`, `--cloud`),
+    // the approval bypass (`--yolo`) or the resume lineage (`-r`). Fail closed
+    // rather than silently dropping them: a dropped flag reads as applied.
+    const reserved = findReservedMojoCliFlags(spawnArgs);
+    if (reserved.length > 0) {
+      throw new Error(
+        `CLI_EXTRA_ARGS may not set ${reserved.join(' / ')} for a mojo bot — `
+        + 'these are platform-owned (control plane frozen per session, approval '
+        + 'bypass, resume lineage). Configure them through the bot settings instead.',
+      );
+    }
     (riffBackendConfig as EffectiveMojoConfig).extraCliArgs = [...spawnArgs];
     log(`mojo extra CLI args deferred to per-turn append: ${spawnArgs.join(' ')}`);
     spawnArgs = [];
@@ -10035,6 +10049,29 @@ async function spawnCli(
   if (isRemoteBackendType(effectiveBackendType)) {
     markPromptReady();
   }
+}
+
+/**
+ * Hand a credential/behaviour patch to a live MojoBackend.
+ *
+ * Validated first: the daemon is trusted, but this arrives over IPC and a stale
+ * or malformed payload must not reach the backend. Non-mojo backends ignore it.
+ */
+function applyMojoLivePatch(patch: MojoLivePatch | undefined): void {
+  if (!patch || effectiveBackendType !== 'mojo') return;
+  // Duck-typed rather than `instanceof`: importing MojoBackend as a value here
+  // would pull the backend module into the worker's eager import graph for every
+  // CLI, and the capability check is what actually matters.
+  const current = backend as (SessionBackend & { applyLivePatch?: (p: MojoLivePatch) => void }) | null;
+  if (typeof current?.applyLivePatch !== 'function') return;
+  // Reuse the full validator: it rejects unknown keys, internal launch-identity
+  // keys and wrong types, so a patch can never widen into the control plane.
+  const validated = normalizeMojoConfig(patch);
+  if (!validated.ok) {
+    log(`Ignoring invalid mojo live patch: ${validated.errors.join('; ')}`);
+    return;
+  }
+  current.applyLivePatch(pickMojoLivePatch(validated.value));
 }
 
 function killCli(opts: {
@@ -11847,6 +11884,10 @@ process.on('message', async (raw: unknown) => {
     }
 
     case 'message': {
+      // Rotate mojo credentials before the turn runs. The config is otherwise
+      // read once at init, so a rotated JWT never reached an existing session's
+      // per-turn CLI invocations. Control-plane fields are not part of the patch.
+      applyMojoLivePatch(msg.mojoLivePatch);
       const messageAdoptMode = lastInitConfig?.adoptMode === true;
       // Adopt IPC handlers can overlap. Delay their turn baseline until the
       // submission mutex is held so a queued message cannot steal attribution

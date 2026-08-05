@@ -18,6 +18,7 @@
  * daemon-side watcher re-executes the send OUTSIDE the sandbox with real
  * credentials. No Feishu credential ever enters the sandbox.
  */
+import { isMojoFullyRemote } from './mojo-types.js';
 import { mkdirSync, existsSync, writeFileSync, chmodSync, readdirSync, readFileSync, rmSync, rmdirSync, unlinkSync, statSync, lstatSync, readlinkSync, realpathSync, openSync, fstatSync, readSync, writeSync, closeSync, constants as fsConstants } from 'node:fs';
 import { atomicWriteFileSync } from '../../utils/atomic-write.js';
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
@@ -366,7 +367,7 @@ export function coreOnlyPidNamespaceDegrade(): boolean {
  */
 export function localSandboxApplies(
   backendType: string,
-  remoteExecution?: { cloud?: boolean; localDaemon?: boolean },
+  remoteExecution?: { cloud?: boolean; localDaemon?: boolean; wrapperCli?: string },
 ): boolean {
   if (backendType === 'riff') return false;
   if (backendType === 'mojo') {
@@ -375,16 +376,6 @@ export function localSandboxApplies(
   return true;
 }
 
-/**
- * True only when a mojo session provably executes nothing locally: the cloud
- * sandbox is on AND the local execution daemon is off. Undefined config is
- * treated as NOT remote — the safe direction.
- */
-export function isMojoFullyRemote(
-  cfg?: { cloud?: boolean; localDaemon?: boolean },
-): boolean {
-  return cfg?.cloud === true && cfg.localDaemon !== true;
-}
 
 /** Top-level dirs that are symlinks on usrmerge distros (/bin → usr/bin …) —
  *  replicated inside the tmpfs root so `#!/bin/sh` etc. resolve. */
@@ -1185,3 +1176,7 @@ export function startOutboxWatcher(
   timer.unref?.();
   return () => clearInterval(timer);
 }
+
+// Single definition, re-exported for the callers that historically imported it
+// from here. See mojo-types.ts for why a wrapperCli voids the proof.
+export { isMojoFullyRemote };
