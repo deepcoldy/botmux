@@ -165,6 +165,81 @@ export function traexRolloutHasUserInputSince(
   );
 }
 
+// -- history.jsonl submit-confirmation (submit-time truth) ------------------
+//
+// TRAE writes ~/.trae/cli/history.jsonl at SUBMIT time — one JSON line
+// {session_id, ts, text} per successful user submit, byte-identical to Codex's
+// format. This is the correct submit-confirmation source: a type-ahead message
+// parked while a turn runs is logged here immediately, whereas the per-session
+// rollout only records it when the running turn dequeues it (which can exceed
+// the worker's confirmation deadline → false "submission couldn't be confirmed"
+// warning). Because history.jsonl is a single global file shared by every TRAE
+// pane under one TRAE_HOME, a same-text line may be written by a concurrent
+// sibling pane; callers pass an `acceptSid` ownership filter to skip a foreign
+// pane's line. Mirrors the codex.ts writeInput verification path exactly.
+
+export interface TraexHistoryMatch {
+  found: boolean;
+  cliSessionId?: string;
+}
+
+/** Optional ownership filter for a shared-history match: accept a same-text
+ *  line only when its session id is one the owning pid actually holds open.
+ *  Re-evaluated on every call so a lazily-opened owned rollout fd that appears
+ *  AFTER its history line can still be accepted on a later poll. */
+export type TraexHistorySidFilter = (cliSessionId: string | undefined) => boolean;
+
+function readTraexHistorySid(parsed: unknown): string | undefined {
+  return parsed && typeof parsed === 'object' && typeof (parsed as any).session_id === 'string'
+    ? (parsed as any).session_id
+    : undefined;
+}
+
+/** Scan the byte delta appended to history.jsonl since `fromByte` for a line
+ *  whose decoded `text` exactly matches `expectedText` (newline-normalised).
+ *  Never parses a non-newline-terminated tail, so a half-written line can't
+ *  manufacture a false match — a later poll sees the completed entry. */
+export function traexHistoryMatchDelta(
+  path: string,
+  fromByte: number,
+  expectedText: string,
+  acceptSid?: TraexHistorySidFilter,
+): TraexHistoryMatch {
+  if (!existsSync(path)) return { found: false };
+  let size: number;
+  try { size = statSync(path).size; } catch { return { found: false }; }
+  if (size <= fromByte) return { found: false };
+  const len = size - fromByte;
+  const buf = Buffer.alloc(len);
+  const fd = openSync(path, 'r');
+  try { readSync(fd, buf, 0, len, fromByte); } finally { closeSync(fd); }
+  const delta = buf.toString('utf8');
+  // Drop a trailing partial line (no newline yet) — it may still be mid-write.
+  const lines = delta.endsWith('\n') ? delta.split('\n') : delta.split('\n').slice(0, -1);
+  const expected = normaliseInputText(expectedText);
+  for (const line of lines) {
+    if (line.length === 0) continue;
+    let parsed: any;
+    try { parsed = JSON.parse(line); } catch { continue; }
+    if (typeof parsed?.text !== 'string') continue;
+    if (normaliseInputText(parsed.text) !== expected) continue;
+    const cliSessionId = readTraexHistorySid(parsed);
+    // Skip a same-text line owned by a DIFFERENT pane (shared-TRAE_HOME
+    // collision). Keep scanning — the owned line may be later in this delta
+    // or arrive on a later poll.
+    if (acceptSid && !acceptSid(cliSessionId)) continue;
+    return { found: true, cliSessionId };
+  }
+  return { found: false };
+}
+
+/** Current byte size of history.jsonl (0 when absent), captured before a paste
+ *  so the confirmation scan only considers lines this submit appends. */
+export function traexHistorySize(path: string): number {
+  if (!path || !existsSync(path)) return 0;
+  try { return statSync(path).size; } catch { return 0; }
+}
+
 function matchTraexRolloutPath(target: string): { path: string; cliSessionId: string } | undefined {
   if (!target.endsWith('.jsonl')) return undefined;
   // Accept both the default layout (~/.trae/cli/sessions/...) and any
@@ -180,41 +255,65 @@ function matchTraexRolloutPath(target: string): { path: string; cliSessionId: st
   return { path: target, cliSessionId: sid };
 }
 
+/** Enumerate the file paths a pid holds open (Linux /proc, else lsof). Shared
+ *  by findTraexRolloutByPid (single) and findTraexRolloutSetByPid (ownership
+ *  set) so both derive from one source. Returns undefined when enumeration is
+ *  unavailable — callers treat that as "cannot prove ownership". */
+function traexProcessOpenTargets(pid: number): string[] | undefined {
+  if (!Number.isInteger(pid) || pid <= 0) return undefined;
+  if (IS_LINUX) {
+    const fdDir = `/proc/${pid}/fd`;
+    if (!existsSync(fdDir)) return undefined;
+    let entries: string[];
+    try { entries = readdirSync(fdDir); } catch { return undefined; }
+    const targets: string[] = [];
+    for (const fd of entries) {
+      try { targets.push(readlinkSync(join(fdDir, fd))); } catch { continue; }
+    }
+    return targets;
+  }
+  let out: string;
+  try {
+    out = execSync(`lsof -p ${pid} -Fn`, { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] });
+  } catch {
+    return undefined;
+  }
+  const targets: string[] = [];
+  for (const line of out.split('\n')) {
+    if (line.startsWith('n/')) targets.push(line.slice(1));
+  }
+  return targets;
+}
+
 /** Find the rollout file an externally-running TRAE process has open.
  *  Same /proc/<pid>/fd strategy as findCodexRolloutByPid, but with a
  *  TRAE-specific path matcher so we never bind to a sibling Codex pane. */
 export function findTraexRolloutByPid(pid: number): { path: string; cliSessionId: string } | undefined {
-  if (!Number.isInteger(pid) || pid <= 0) return undefined;
-  if (IS_LINUX) {
-    const fdDir = `/proc/${pid}/fd`;
-    if (existsSync(fdDir)) {
-      let entries: string[];
-      try { entries = readdirSync(fdDir); } catch { return undefined; }
-      for (const fd of entries) {
-        let target: string;
-        try { target = readlinkSync(join(fdDir, fd)); } catch { continue; }
-        const hit = matchTraexRolloutPath(target);
-        if (hit) return hit;
-      }
-      return undefined;
-    }
-  }
-  let out: string;
-  try {
-    out = execSync(`lsof -p ${pid} -Fn`, {
-      encoding: 'utf-8',
-      stdio: ['pipe', 'pipe', 'pipe'],
-    });
-  } catch {
-    return undefined;
-  }
-  for (const line of out.split('\n')) {
-    if (!line.startsWith('n/')) continue;
-    const target = line.slice(1);
+  const targets = traexProcessOpenTargets(pid);
+  if (!targets) return undefined;
+  for (const target of targets) {
     const hit = matchTraexRolloutPath(target);
     if (hit) return hit;
   }
   return undefined;
+}
+
+/** Lowercased set of TRAE session ids whose rollout the pid holds open. The
+ *  ownership gate for a shared-history.jsonl submit match: only a sid this pid
+ *  actually owns is safe to accept, so a concurrent sibling pane's identical
+ *  text can't hand back a foreign session id. Empty Set = pid holds no TRAE
+ *  rollout; undefined = fd enumeration unavailable (caller must fail open on
+ *  the ownership check but the worker's attach gate re-verifies). Mirrors
+ *  findCodexRolloutSetByPid. */
+export function findTraexRolloutSetByPid(pid: number): Set<string> | undefined {
+  const targets = traexProcessOpenTargets(pid);
+  if (!targets) return undefined;
+  const set = new Set<string>();
+  for (const target of targets) {
+    const hit = matchTraexRolloutPath(target);
+    if (hit) set.add(hit.cliSessionId.toLowerCase());
+  }
+  return set;
 }
 
 /** Locate the rollout file for a given TRAE session UUID. Filename shape is

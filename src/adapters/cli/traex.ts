@@ -3,8 +3,13 @@ import { createRequire } from 'node:module';
 import { resolveCommand } from './registry.js';
 import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
 import type { CliAdapter, PtyHandle } from './types.js';
-import { traeStateDbPath, traeSessionsRoot } from '../../services/traex-paths.js';
-import { traexRolloutHasUserInputSince } from '../../services/traex-transcript.js';
+import { traeStateDbPath, traeSessionsRoot, traeHistoryPath } from '../../services/traex-paths.js';
+import {
+  traexHistoryMatchDelta,
+  traexHistorySize,
+  findTraexRolloutSetByPid,
+  type TraexHistorySidFilter,
+} from '../../services/traex-transcript.js';
 import { discoverRolloutSessions } from '../../services/resumable-session-discovery.js';
 import { delay } from '../../utils/timing.js';
 
@@ -71,70 +76,28 @@ function withDb<T>(fn: (db: DatabaseSyncLike) => T): T | null {
   }
 }
 
-interface ThreadSnapshot {
-  id: string;
-  updatedAtMs: number;
-  rolloutPath: string;
-  rolloutOffset: number;
+/** Build the ownership filter for the shared global history.jsonl. When the
+ * TRAE pid is known, only accept a same-text history line whose session id is
+ * one THIS pid currently holds open — so a concurrent sibling pane's identical
+ * text (same TRAE_HOME) can't hand us its foreign session id. The open-rollout
+ * set is re-fetched on EVERY match attempt (not snapshotted): a just-started
+ * session's owned rollout fd can appear slightly after its history line, and a
+ * snapshot would permanently reject it. When the pid is unknown or its rollout
+ * set can't be enumerated, fall back to accept-first — preserving single-pane /
+ * no-pid submit-confirmation semantics; the worker-side attach gate is the
+ * backstop there. Mirrors codex.ts writeInput's acceptSid. */
+function buildHistorySidFilter(cliPid: number | undefined): TraexHistorySidFilter | undefined {
+  if (!cliPid) return undefined;
+  return (sid) => {
+    if (!sid) return false;
+    const owned = findTraexRolloutSetByPid(cliPid);
+    // set unavailable (enumeration failed) → don't block the submit
+    // confirmation; the worker attach gate re-checks ownership.
+    if (!owned) return true;
+    return owned.has(sid.toLowerCase());
+  };
 }
 
-interface SubmitSnapshot {
-  newestUpdatedAtMs: number;
-  byId: Map<string, ThreadSnapshot>;
-}
-
-function currentFileSize(path: string): number {
-  if (!path || !existsSync(path)) return 0;
-  try { return statSync(path).size; } catch { return 0; }
-}
-
-/** Snapshot recent SQLite thread rows and each rollout's complete byte size
- * before touching the PTY. The DB is an index; the rollout delta below is the
- * actual submit proof. `null` means verification is unavailable and callers
- * must fail closed before writing any bytes. */
-function snapRecentThreads(): SubmitSnapshot | null {
-  return withDb((db) => {
-    const rows = db.prepare(
-      'SELECT id, COALESCE(updated_at_ms, 0) AS updatedAtMs, rollout_path AS rolloutPath ' +
-      'FROM threads ORDER BY updated_at_ms DESC LIMIT 64',
-    ).all() as Array<Omit<ThreadSnapshot, 'rolloutOffset'>>;
-    const byId = new Map<string, ThreadSnapshot>();
-    let newestUpdatedAtMs = 0;
-    for (const row of rows) {
-      if (!row.id || !row.rolloutPath) continue;
-      newestUpdatedAtMs = Math.max(newestUpdatedAtMs, Number(row.updatedAtMs) || 0);
-      byId.set(row.id, {
-        id: row.id,
-        updatedAtMs: Number(row.updatedAtMs) || 0,
-        rolloutPath: row.rolloutPath,
-        rolloutOffset: currentFileSize(row.rolloutPath),
-      });
-    }
-    return { newestUpdatedAtMs, byId };
-  });
-}
-
-/** Resolve the session whose rollout gained this exact role=user record.
- * Works for the first prompt, later prompts in the same thread, and a freshly
- * rotated thread. Sibling processes can update SQLite concurrently, but their
- * rollout delta cannot match our full prompt accidentally. */
-function detectSubmittedThread(before: SubmitSnapshot, expectedText: string): { found: boolean; cliSessionId?: string } {
-  return withDb((db) => {
-    const rows = db.prepare(
-      'SELECT id, COALESCE(updated_at_ms, 0) AS updatedAtMs, rollout_path AS rolloutPath ' +
-      'FROM threads WHERE COALESCE(updated_at_ms, 0) >= ? ORDER BY updated_at_ms DESC LIMIT 64',
-    ).all(before.newestUpdatedAtMs) as Array<Omit<ThreadSnapshot, 'rolloutOffset'>>;
-    for (const r of rows) {
-      if (!r.id || !r.rolloutPath) continue;
-      const prior = before.byId.get(r.id);
-      const fromOffset = prior?.rolloutPath === r.rolloutPath ? prior.rolloutOffset : 0;
-      if (traexRolloutHasUserInputSince(r.rolloutPath, fromOffset, expectedText)) {
-        return { found: true, cliSessionId: r.id };
-      }
-    }
-    return { found: false };
-  }) ?? { found: false };
-}
 
 /** Scan threads backwards for the most recent thread whose first_user_message
  *  references the botmux session id. Used by buildArgs(resume) and
@@ -287,17 +250,29 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
         }
       };
 
-      // Reliable delivery requires an attributable submit. Refuse before the
-      // paste if the SQLite session/path index cannot be read; writing first
-      // and discovering that verification is unavailable would make replay
-      // ambiguous and could execute the same action twice.
-      const beforeSnap = snapRecentThreads();
-      if (!beforeSnap) {
-        return {
-          submitted: false,
-          failureReason: 'TRAE SQLite 提交验证不可用，已在写入前安全拒绝。',
-        };
-      }
+      // Submit confirmation polls the global submit log history.jsonl, NOT the
+      // per-session rollout. TRAE is a type-ahead CLI: a message pasted while a
+      // turn is running is PARKED in TRAE's queue and only written to the
+      // rollout when the running turn dequeues it — which can exceed the
+      // worker's confirmation deadline and fire a false "submission couldn't be
+      // confirmed" warning even though TRAE received it. history.jsonl is
+      // written at SUBMIT time (verified empirically on traecli 0.200.19: a
+      // mid-turn follow-up appears here in ~1s while the rollout lags past 20s),
+      // so it confirms parked submits immediately. This mirrors the codex
+      // adapter, which polls its identically-shaped history.jsonl for the same
+      // reason. history.jsonl is created lazily on the first submit, so an
+      // absent file just means baseByte=0 and the first appended line matches.
+      const historyPath = traeHistoryPath();
+      const baseByte = traexHistorySize(historyPath);
+
+      // Ownership filter for the shared-TRAE_HOME history.jsonl (see
+      // buildHistorySidFilter). Accept-first when the pid is unknown.
+      const cliPid = typeof pty.cliPid === 'number' && Number.isInteger(pty.cliPid) && pty.cliPid > 0
+        ? pty.cliPid
+        : undefined;
+      const acceptSid = buildHistorySidFilter(cliPid);
+
+      const matchNow = () => traexHistoryMatchDelta(historyPath, baseByte, content, acceptSid);
 
       try {
         if (pty.pasteText) pty.pasteText(content);
@@ -309,7 +284,7 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
       if (!trySendEnter()) return { submitted: false };
 
       for (let attempt = 0; attempt < 3; attempt++) {
-        const match = detectSubmittedThread(beforeSnap, content);
+        const match = matchNow();
         if (match.found) {
           return match.cliSessionId
             ? { submitted: true, cliSessionId: match.cliSessionId }
@@ -318,14 +293,17 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
         await delay(800);
         if (!trySendEnter()) return { submitted: false };
       }
-      const finalMatch = detectSubmittedThread(beforeSnap, content);
+      const finalMatch = matchNow();
       if (finalMatch.found) {
         return finalMatch.cliSessionId
           ? { submitted: true, cliSessionId: finalMatch.cliSessionId }
           : { submitted: true };
       }
+      // In-band budget exhausted. Hand the worker a recheck closure: a slow or
+      // busy TRAE may still append our history line after the retries gave up,
+      // and the worker re-scans on a delay before warning the user.
       const recheck = () => {
-        const late = detectSubmittedThread(beforeSnap, content);
+        const late = matchNow();
         return late.found
           ? { submitted: true, cliSessionId: late.cliSessionId }
           : false;
