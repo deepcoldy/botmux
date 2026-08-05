@@ -25,6 +25,7 @@ import {
   compactGroupsMatrix,
   createGroupsMatrixSnapshot,
   enrichSessionsWithGroupNames,
+  roleWriteShouldInvalidate,
   type GroupsMatrix,
 } from './dashboard/groups-matrix-snapshot.js';
 import {
@@ -3993,14 +3994,25 @@ const server = createServer(async (req, res) => {
           headers: { 'content-type': 'application/json' },
           body: raw,
         });
+        const upstreamText = await upstream.text();
+        let upstreamJson: any = null;
+        try { upstreamJson = JSON.parse(upstreamText); } catch { /* leave null */ }
+        // 写角色会翻转群矩阵里的 hasRole → 失效快照，避免 roles 页「已配置」
+        // 徽标最多陈旧 30s（对齐 oncall bind/unbind、建群/加 bot 的失效）。
+        if (roleWriteShouldInvalidate(upstream.ok, upstreamJson)) groupsMatrixSnapshot.invalidate();
         res.writeHead(upstream.status, { 'content-type': 'application/json' });
-        res.end(await upstream.text());
+        res.end(upstreamText);
         return;
       }
       if (req.method === 'DELETE') {
         const upstream = await proxyToDaemon(larkAppId, `/api/roles/${encodeURIComponent(chatId)}`, { method: 'DELETE' });
+        const upstreamText = await upstream.text();
+        let upstreamJson: any = null;
+        try { upstreamJson = JSON.parse(upstreamText); } catch { /* leave null */ }
+        // 删角色会把 hasRole 翻回 false — 失效快照让徽标立即刷新，不等 30s TTL。
+        if (roleWriteShouldInvalidate(upstream.ok, upstreamJson)) groupsMatrixSnapshot.invalidate();
         res.writeHead(upstream.status, { 'content-type': 'application/json' });
-        res.end(await upstream.text());
+        res.end(upstreamText);
         return;
       }
     }
@@ -4085,8 +4097,15 @@ const server = createServer(async (req, res) => {
         headers: { 'content-type': 'application/json' },
         body: raw,
       });
+      const upstreamText = await upstream.text();
+      let upstreamJson: any = null;
+      try { upstreamJson = JSON.parse(upstreamText); } catch { /* leave null */ }
+      // 只有真正改写了角色文件（changed:true）才失效缓存：preview、被拒
+      // （chat_role_exists）、missing_entry 都不动 hasRole，跟着失效只会白白
+      // 打穿 30s 快照、把 PR 的 fan-out 优化抵消掉（判定在 roleWriteShouldInvalidate）。
+      if (roleWriteShouldInvalidate(upstream.ok, upstreamJson)) groupsMatrixSnapshot.invalidate();
       res.writeHead(upstream.status, { 'content-type': 'application/json' });
-      res.end(await upstream.text());
+      res.end(upstreamText);
       return;
     }
 

@@ -44,6 +44,33 @@ function optionalTrimmedString(value: unknown): string | undefined {
   return typeof value === "string" && value.trim() ? value.trim() : undefined;
 }
 
+/**
+ * Decide whether a role write (PUT/DELETE `/api/roles/:chatId`, or
+ * `POST /api/role-profiles/:id/apply`) actually mutated the `hasRole` matrix
+ * and should therefore invalidate the groups snapshot.
+ *
+ * `hasRole` (per bot × chat) feeds the roles-page「已配置/未配置」badge and the
+ * groups card, so a stale snapshot leaves the badge wrong for up to the 30s TTL
+ * — and the refresh button can't fix it (it hits `/api/groups` without
+ * `refresh=1`). We invalidate on every successful write, mirroring the oncall
+ * bind/unbind path, with one exception: responses that explicitly report
+ * `changed: false` (the `apply` route's `preview` mode, and no-op/refused
+ * applies) did NOT touch any role file, so invalidating there would just punch
+ * through the cache on the common preview click and undo the fan-out savings
+ * this snapshot exists to provide.
+ */
+export function roleWriteShouldInvalidate(upstreamOk: boolean, body: unknown): boolean {
+  if (!upstreamOk) return false;
+  if (body && typeof body === "object" && !Array.isArray(body)) {
+    const rec = body as Record<string, unknown>;
+    if (rec.ok === false) return false;
+    // `apply` reports changed:false for preview / already-applied / missing;
+    // PUT/DELETE omit the field entirely (undefined !== false) → still invalidate.
+    if (rec.changed === false) return false;
+  }
+  return true;
+}
+
 export function compactGroupsMatrix(matrix: GroupsMatrix): CompactGroupsSnapshot {
   return {
     chats: matrix.chats.flatMap((chat) => {

@@ -4,6 +4,7 @@ import {
   compactGroupsMatrix,
   createGroupsMatrixSnapshot,
   enrichSessionsWithGroupNames,
+  roleWriteShouldInvalidate,
   type GroupsMatrix,
 } from "../src/dashboard/groups-matrix-snapshot.js";
 
@@ -109,5 +110,48 @@ describe("groups presentation projection", () => {
       { sessionId: "g2", chatId: "oc_release", chatType: "group", chatDisplayName: "Pinned name" },
       { sessionId: "p1", chatId: "oc_dm", chatType: "p2p", chatDisplayName: "Alice" },
     ]);
+  });
+});
+
+describe("roleWriteShouldInvalidate", () => {
+  // ── invalidate: a role file was actually written / deleted ──────────────
+  it("invalidates on a PUT/DELETE style success that omits `changed`", () => {
+    // Daemon role PUT returns {ok:true}; DELETE returns {ok:true,existed}.
+    // Neither carries `changed`, so undefined !== false → invalidate.
+    expect(roleWriteShouldInvalidate(true, { ok: true })).toBe(true);
+    expect(roleWriteShouldInvalidate(true, { ok: true, existed: true })).toBe(true);
+  });
+
+  it("invalidates when apply reports a real write (changed:true)", () => {
+    expect(roleWriteShouldInvalidate(true, { ok: true, changed: true, byteLength: 42 })).toBe(true);
+  });
+
+  it("invalidates even when the body is not JSON (defensive default)", () => {
+    // proxied text bodies parse to a string; a successful write we can't
+    // inspect should still refresh the badge rather than leave it stale.
+    expect(roleWriteShouldInvalidate(true, "OK")).toBe(true);
+    expect(roleWriteShouldInvalidate(true, null)).toBe(true);
+  });
+
+  // ── do NOT invalidate: nothing changed → busting the cache would just
+  //    punch through the 30s snapshot on the common preview click ─────────
+  it("does not invalidate on apply preview (ok:true but changed:false)", () => {
+    expect(
+      roleWriteShouldInvalidate(true, { ok: true, preview: true, changed: false, wouldOverwrite: true }),
+    ).toBe(false);
+  });
+
+  it("does not invalidate when apply is a no-op / missing entry (changed:false)", () => {
+    expect(roleWriteShouldInvalidate(true, { ok: false, error: "missing_entry", changed: false })).toBe(false);
+  });
+
+  it("does not invalidate on an application-level failure (ok:false)", () => {
+    expect(roleWriteShouldInvalidate(true, { ok: false, error: "content_required" })).toBe(false);
+  });
+
+  it("does not invalidate when the HTTP call failed (e.g. 409 chat_role_exists / 500)", () => {
+    // upstream.ok is false for 4xx/5xx — never invalidate regardless of body.
+    expect(roleWriteShouldInvalidate(false, { ok: false, error: "chat_role_exists" })).toBe(false);
+    expect(roleWriteShouldInvalidate(false, { ok: true })).toBe(false);
   });
 });
