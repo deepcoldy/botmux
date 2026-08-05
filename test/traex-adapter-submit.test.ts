@@ -85,10 +85,10 @@ function ptyThatNeverCommits(cliPid?: number): PtyHandle & {
 }
 
 /** A PTY whose Enter appends the SAME pasted text TWICE — first under a foreign
- *  sibling's session id, THEN under the owned one. Models the shared-history
- *  collision where a sibling pane's identical text lands first in history.jsonl
- *  but our own owned line follows. The adapter must skip the foreign line and
- *  return the owned id. */
+ *  sibling's session id, THEN under the owned one (both in the same callback, so
+ *  both are present by the adapter's first probe). The adapter must skip the
+ *  foreign line and return the owned id. See ptyForeignNowOwnedLater for the
+ *  harder async-timing variant. */
 function ptyForeignThenOwned(foreignSid: string, ownedSid: string, cliPid?: number): PtyHandle & {
   pasteText: ReturnType<typeof vi.fn>;
   sendSpecialKeys: ReturnType<typeof vi.fn>;
@@ -105,6 +105,36 @@ function ptyForeignThenOwned(foreignSid: string, ownedSid: string, cliPid?: numb
         mkdirSync(join(traeHome, 'cli'), { recursive: true });
         appendFileSync(historyPath, historyLine(foreignSid, pasted));  // sibling first
         appendFileSync(historyPath, historyLine(ownedSid, pasted));    // ours next
+      }
+    }),
+  };
+}
+
+/** The hard async-timing variant: on Enter the FOREIGN line lands immediately,
+ *  but the OWNED line is written by a timer strictly AFTER the adapter's first
+ *  poll (delayMs). This reproduces Codex's reproduction — a matcher that settles
+ *  on the first any-text sighting would return {submitted:true} with no id at
+ *  ~200ms and never re-scan for the owned line. The adapter must keep polling
+ *  (enumeration available) until the owned line surfaces, then return ownedSid. */
+function ptyForeignNowOwnedLater(
+  foreignSid: string, ownedSid: string, cliPid: number, delayMs: number,
+): PtyHandle & { pasteText: ReturnType<typeof vi.fn>; sendSpecialKeys: ReturnType<typeof vi.fn>; timers: NodeJS.Timeout[] } {
+  let pasted = '';
+  let committed = false;
+  const timers: NodeJS.Timeout[] = [];
+  return {
+    write: vi.fn(),
+    cliPid,
+    timers,
+    pasteText: vi.fn((text: string) => { pasted = text; }),
+    sendSpecialKeys: vi.fn((key: string) => {
+      if (key === 'Enter' && !committed) {
+        committed = true;
+        mkdirSync(join(traeHome, 'cli'), { recursive: true });
+        appendFileSync(historyPath, historyLine(foreignSid, pasted));  // foreign lands now
+        timers.push(setTimeout(() => {
+          appendFileSync(historyPath, historyLine(ownedSid, pasted));   // owned lands later
+        }, delayMs));
       }
     }),
   };
@@ -231,6 +261,26 @@ describe.sequential('TRAE adapter submit verification (history.jsonl)', () => {
     const pty = ptyForeignThenOwned(SID_2, SID_1, ownedPid);
 
     const result = await adapter.writeInput(pty, 'duplicate text foreign-first');
+
+    expect(result).toEqual({ submitted: true, cliSessionId: SID_1 });
+  });
+
+  it('keeps polling past a foreign-first sighting until the OWNED line lands later (async timing)', async () => {
+    // Codex's timing reproduction: on Enter the foreign line lands immediately,
+    // the owned line ~400ms later — strictly after the adapter's first probe. A
+    // matcher that settled on the first any-text sighting would return
+    // {submitted:true} with NO id at ~200ms and never re-scan. Enumeration is
+    // available (real owning pid), so the adapter must keep polling until the
+    // owned line surfaces and return SID_1. Run at REAL time (no BOTMUX_TIME_SCALE)
+    // so the 200ms+800ms cadence spans the 400ms owned-line timer.
+    delete process.env.BOTMUX_TIME_SCALE;
+    const ownedPid = spawnRolloutHolder(SID_1);
+    await new Promise(r => setTimeout(r, 150));
+    const adapter = createTraexAdapter('/bin/traex');
+    const pty = ptyForeignNowOwnedLater(SID_2, SID_1, ownedPid, 400);
+
+    const result = await adapter.writeInput(pty, 'duplicate text owned-later');
+    for (const t of pty.timers) clearTimeout(t);
 
     expect(result).toEqual({ submitted: true, cliSessionId: SID_1 });
   });

@@ -76,27 +76,12 @@ function withDb<T>(fn: (db: DatabaseSyncLike) => T): T | null {
   }
 }
 
-/** Decide whether a session id surfaced by the history text match is safe to
- * RETURN to the worker as a candidate for persist / bridge attach.
- *
- * Two separable facts: the text match confirms the SUBMIT (a full-content match
- * in the global submit log — this is ownership-INDEPENDENT and must never be
- * gated, or a foreign-first line / unknown pid would re-introduce the false
- * "submission couldn't be confirmed" warning this fix removes). The reported
- * session id is a weaker signal: history.jsonl is shared by every TRAE pane
- * under one TRAE_HOME, so a sibling pane's identical text (e.g. a bare "继续" in
- * adopt mode, which carries no unique <session_id>) can surface a FOREIGN id.
- *
- * So we ALWAYS confirm the submit on a text match, but only attach the id when
- * THIS pid provably holds that rollout open (fail closed on unknown pid /
- * unavailable enumeration / non-member). The open-rollout set is re-fetched per
- * call, not snapshotted. TRAE additionally has a worker-side gate
- * (traexHistorySidOwnedByCurrentPid) whose pid resolution is richer than
- * pty.cliPid, so the authoritative persist/attach decision still lands there. */
-function traexSidOwnedByPid(cliPid: number | undefined, sid: string | undefined): boolean {
-  if (!cliPid || !sid) return false;
-  return traexHistorySidIsOwned(sid, findTraexRolloutSetByPid(cliPid));
-}
+/** Adapter-side session-id ownership uses findTraexRolloutSetByPid +
+ * traexHistorySidIsOwned directly in writeInput (kept as raw three-state so the
+ * enumeration-unavailable case can fast-degrade). The authoritative persist /
+ * bridge-attach decision additionally re-checks worker-side via
+ * traexHistorySidOwnedByCurrentPid, whose pid resolution is richer than
+ * pty.cliPid (and covers the sandbox bwrap-supervisor case). */
 
 
 /** Scan threads backwards for the most recent thread whose first_user_message
@@ -277,23 +262,20 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
       //  - SESSION ID: history.jsonl is shared by every TRAE pane under one
       //    TRAE_HOME, so a sibling's identical text can surface a foreign id.
       //    Return the id ONLY when this pid provably owns that rollout.
-      // When a pid is enumerable, PREFER the owned scan: ownedMatch() passes an
-      // ownership filter so a foreign-first line is skipped and scanning
-      // continues to our own line (Codex's foreign-first→owned-later case). Only
-      // if no owned line is found do we fall back to the unfiltered any-text scan
-      // to confirm the submit without an id. Without a pid, there's nothing to
-      // own, so we just confirm the submit.
-      const ownedFilter = (sid: string | undefined): boolean => traexSidOwnedByPid(cliPid, sid);
-      const ownedMatch = () => cliPid
-        ? traexHistoryMatchDelta(historyPath, baseByte, content, ownedFilter)
-        : { found: false as const };
+      //
+      // The three states of findTraexRolloutSetByPid are kept DISTINCT (not
+      // flattened through a boolean helper) because they drive different waits:
+      //   • undefined  → fd enumeration unavailable (no pid / not on Linux /
+      //     proc unreadable): we can never prove ownership, so there is no point
+      //     polling for an owned line — confirm the submit on any-text at once.
+      //   • Set (maybe empty) → enumeration works; an owned line may simply not
+      //     be on disk yet. KEEP polling for it and do NOT let a foreign-first
+      //     any-text hit end the loop early (a sibling's identical line can land
+      //     on poll N while our owned line appears on poll N+k — returning
+      //     no-SID on the first foreign sighting would permanently drop our id).
+      const ownedMatch = (owned: Set<string> | undefined) =>
+        traexHistoryMatchDelta(historyPath, baseByte, content, (sid) => traexHistorySidIsOwned(sid ?? '', owned));
       const anyMatch = () => traexHistoryMatchDelta(historyPath, baseByte, content);
-      // A confirmed submit: prefer the owned sid, else confirm without one.
-      const resolveConfirmed = () => {
-        const owned = ownedMatch();
-        if (owned.found && owned.cliSessionId) return { submitted: true as const, cliSessionId: owned.cliSessionId };
-        return anyMatch().found ? { submitted: true as const } : null;
-      };
 
       try {
         if (pty.pasteText) pty.pasteText(content);
@@ -304,18 +286,45 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
       await delay(200);
       if (!trySendEnter()) return { submitted: false };
 
+      // `sawAnyText` remembers that the submit is proven (an any-text line
+      // exists) even while we keep polling for the OWNED line. Once set, no
+      // further Enter is needed — the message is in TRAE's log — so the loop only
+      // waits for the owned rollout to surface.
+      let sawAnyText = false;
+      // Prefer an owned id whenever enumeration is possible. Returns a final
+      // result to return now, or null to keep waiting. `final` relaxes the
+      // owned-wait: at budget end / on the worker recheck, confirm on any-text.
+      const resolve = (final: boolean) => {
+        const owned = cliPid ? findTraexRolloutSetByPid(cliPid) : undefined;
+        if (owned !== undefined) {
+          const m = ownedMatch(owned);
+          if (m.found && m.cliSessionId) return { submitted: true as const, cliSessionId: m.cliSessionId };
+          // Enumeration works but no owned line yet. Note submit evidence but
+          // keep waiting for the owned id — unless the budget is spent.
+          if (anyMatch().found) sawAnyText = true;
+          return final && sawAnyText ? { submitted: true as const } : null;
+        }
+        // Enumeration unavailable — can't prove ownership, so confirm the submit
+        // on any-text as soon as it appears (no owned line to wait for).
+        if (anyMatch().found) return { submitted: true as const };
+        return null;
+      };
+
       for (let attempt = 0; attempt < 3; attempt++) {
-        const confirmed = resolveConfirmed();
+        const confirmed = resolve(false);
         if (confirmed) return confirmed;
         await delay(800);
-        if (!trySendEnter()) return { submitted: false };
+        // Only re-Enter while the submit is still unproven; once any-text is
+        // seen the message is committed and we're merely waiting for the owned
+        // rollout fd, so another Enter would risk a duplicate submit.
+        if (!sawAnyText && !trySendEnter()) return { submitted: false };
       }
-      const finalConfirmed = resolveConfirmed();
+      const finalConfirmed = resolve(true);
       if (finalConfirmed) return finalConfirmed;
       // In-band budget exhausted. Hand the worker a recheck closure: a slow or
       // busy TRAE may still append our history line after the retries gave up,
       // and the worker re-scans on a delay before warning the user.
-      const recheck = () => resolveConfirmed() ?? false;
+      const recheck = () => resolve(true) ?? false;
       return { submitted: false, recheck };
     },
 
