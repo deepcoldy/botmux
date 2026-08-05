@@ -341,6 +341,10 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
     },
 
     completionPattern: undefined,
+    // Codex redraws this status line while a turn is active. Require both text
+    // anchors on one line so transcript prose or an idle composer cannot revive
+    // a completed Lark card.
+    busyPattern: /Working[^\r\n]{0,160}esc to interrupt/i,
     // Codex's update picker also renders `› 1. Update now`; a bare /›/ treats
     // that menu as the composer and lets botmux's queued first message select
     // the update. Keep accepting the composer marker anywhere in a TUI redraw,

@@ -1322,6 +1322,17 @@ describe('completionPattern', () => {
   });
 });
 
+describe('busyPattern', () => {
+  it('codex matches the active Working status but not idle or single-anchor text', () => {
+    const busy = createCodexAdapter('/bin/codex').busyPattern;
+    expect(busy).toBeDefined();
+    expect(busy!.test('• Working (18s • esc to interrupt)')).toBe(true);
+    expect(busy!.test('› Ask anything                                      97% left')).toBe(false);
+    expect(busy!.test('Working through the implementation')).toBe(false);
+    expect(busy!.test('press esc to interrupt')).toBe(false);
+  });
+});
+
 describe('readyPattern', () => {
   it('claude-code matches prompt indicator', () => {
     const adapter = createClaudeCodeAdapter('/bin/claude');

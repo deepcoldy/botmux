@@ -369,6 +369,31 @@ describe('worker pipe initial screen ordering', () => {
     expect(probe).not.toContain('cliAdapter.busyPattern.test(content)');
   });
 
+  it('restores working from an explicit post-idle busy edge in spawn and adopt modes', () => {
+    const source = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
+    const helperStart = source.indexOf('function wireIdleDetectorBusyTransition(');
+    const helperEnd = source.indexOf('function setupAdoptIdleDetection', helperStart);
+    const helper = source.slice(helperStart, helperEnd);
+
+    expect(helperStart).toBeGreaterThan(-1);
+    expect(helper).toContain('detector.onBusy(() => {');
+    expect(helper).toContain('if (!isPromptReady) return;');
+    expect(helper).toContain('isPromptReady = false;');
+    expect(helper).toContain("publishScreenStatus('working', { force: true });");
+    expect(helper).not.toContain('idleDetector?.reset()');
+    expect(helper).not.toContain('detector.reset()');
+
+    const adoptStart = source.indexOf('function setupAdoptIdleDetection');
+    const adoptEnd = source.indexOf('function seedBackendScreen', adoptStart);
+    const adopt = source.slice(adoptStart, adoptEnd);
+    expect(adopt).toContain('wireIdleDetectorBusyTransition(idleDetector, `${label} adopt mode`);');
+
+    const spawnStart = source.indexOf('// Set up idle detection.');
+    const spawnEnd = source.indexOf('observedBackend.onData((data) =>', spawnStart);
+    const spawn = source.slice(spawnStart, spawnEnd);
+    expect(spawn).toContain('wireIdleDetectorBusyTransition(idleDetector, `${cliName()} PTY`);');
+  });
+
   it('settles an authoritative screen before a busy-pattern probe marks the prompt ready', () => {
     const source = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
     const probeStart = source.indexOf('function probeBusyPatternIdle');
