@@ -1,7 +1,6 @@
 /**
  * Session cost calculator — computes token usage from JSONL logs.
  */
-import { createHash } from 'node:crypto';
 import { closeSync, constants, existsSync, fstatSync, openSync, readFileSync, readSync, statSync, type Stats } from 'node:fs';
 import { logger } from '../utils/logger.js';
 import type { CliId } from '../adapters/cli/types.js';
@@ -224,20 +223,15 @@ type UsageKind = 'claude' | 'codex' | 'coco' | 'pi' | 'generic';
 
 interface UsageSourceRecord {
   offset: number;
-  byteLength: number;
-  sha256: string;
 }
 
 const CODEX_USAGE_SOURCE_RECORD_MAX_BYTES = 64 * 1024;
 
 function sourceRecordForLine(line: string, lineStart: number | undefined): UsageSourceRecord | null {
   if (lineStart === undefined || lineStart < 0) return null;
-  const raw = Buffer.from(line, 'utf8');
-  if (raw.length > CODEX_USAGE_SOURCE_RECORD_MAX_BYTES) return null;
+  if (Buffer.byteLength(line, 'utf8') > CODEX_USAGE_SOURCE_RECORD_MAX_BYTES) return null;
   return {
     offset: lineStart,
-    byteLength: raw.length,
-    sha256: createHash('sha256').update(raw).digest('hex'),
   };
 }
 
@@ -496,8 +490,9 @@ function finalizeTokenUsage(aggregate: TokenUsageAggregate): SessionTokenUsage |
 // Dashboard row composition calls into this on every /api/sessions render and
 // on worker status transitions. Transcripts can be tens of MB, so the reader
 // (a) short-circuits on unchanged stat, (b) reparses a changing file at most
-// once per throttle interval, and (c) for append-only JSONL folds only the
-// newly appended bytes instead of rereading the whole file.
+// once per throttle interval, (c) folds non-Codex append-only JSONL from the
+// durable frontier, and (d) for Codex changes replays the bounded tracked
+// source interval or falls back to a normal rebuild / oversized tail rebuild.
 
 type CachedUsageKind = UsageKind | 'aiden';
 
@@ -507,7 +502,6 @@ interface UsageFileCacheEntry {
   size: number;
   dev: number;
   ino: number;
-  frontierFingerprint: string | null;
   canReadIncrementally: boolean;
   /** Durable parse frontier: byte offset just past the last complete line.
    *  <= 0 ⇒ the next change forces a full reparse. */
@@ -532,7 +526,7 @@ export const MAX_USAGE_TRANSCRIPT_BYTES = 64 * 1024 * 1024;
  *  Keep this tight: it is a synchronous dashboard read path, and real 150MiB+
  *  rollouts have many token_count snapshots in the last 4MiB. */
 export const CODEX_USAGE_TRANSCRIPT_TAIL_BYTES = 4 * 1024 * 1024;
-export const USAGE_TRANSCRIPT_FRONTIER_FINGERPRINT_BYTES = 64;
+const CODEX_USAGE_REPLAY_BYTES = 4 * 1024 * 1024;
 
 /** Aiden checkpoint paths move as the session progresses (latest.json points
  *  at a new checkpoint id per turn), so positive hits expire quickly too. */
@@ -617,15 +611,6 @@ function ensureUsageFileCacheCapacity(key: string): void {
   }
 }
 
-function usageFileFingerprintFromFd(fd: number, st: Stats, offset: number): string | null {
-  if (offset <= 0) return null;
-  const len = Math.min(USAGE_TRANSCRIPT_FRONTIER_FINGERPRINT_BYTES, offset);
-  const start = offset - len;
-  const probe = readFdProbe(fd, start, len);
-  if (!probe || probe.length !== len) return null;
-  return `${st.dev}:${st.ino}:${start}:${probe.toString('base64')}`;
-}
-
 function canReuseUsageCache(
   cached: UsageFileCacheEntry,
   st: Stats,
@@ -635,78 +620,30 @@ function canReuseUsageCache(
   return cached.dev === st.dev && cached.ino === st.ino;
 }
 
-function mergeCodexIndependentMetrics(
-  next: TokenUsageAggregate,
-  previous?: TokenUsageAggregate,
-  sourceValid?: {
-    latestCodexUsage: boolean;
-    latestContextUsage: boolean;
-    model: boolean;
-  },
-): TokenUsageAggregate {
-  if (!previous) return next;
-  const inheritModel = !next.model && !!previous.model && !!sourceValid?.model;
-  const inheritCodexUsage = !next.latestCodexUsage && !!previous.latestCodexUsage && !!sourceValid?.latestCodexUsage;
-  const inheritContextUsage = !next.latestContextUsage && !!previous.latestContextUsage && !!sourceValid?.latestContextUsage;
-  return {
-    ...next,
-    model: next.model || (inheritModel ? previous.model : ''),
-    modelSource: next.model ? next.modelSource : (inheritModel ? previous.modelSource : null),
-    latestCodexUsage: next.latestCodexUsage ?? (inheritCodexUsage ? previous.latestCodexUsage : null),
-    latestCodexUsageSource: next.latestCodexUsage ? next.latestCodexUsageSource : (inheritCodexUsage ? previous.latestCodexUsageSource : null),
-    latestContextUsage: next.latestContextUsage ?? (inheritContextUsage ? previous.latestContextUsage : null),
-    latestContextUsageSource: next.latestContextUsage ? next.latestContextUsageSource : (inheritContextUsage ? previous.latestContextUsageSource : null),
-  };
-}
-
-function sourceRecordKey(source: UsageSourceRecord): string {
-  return `${source.offset}:${source.byteLength}:${source.sha256}`;
-}
-
-function validateSourceRecord(fd: number, source: UsageSourceRecord | null | undefined, cache: Map<string, boolean>): boolean {
-  if (!source) return false;
-  if (source.byteLength <= 0 || source.byteLength > CODEX_USAGE_SOURCE_RECORD_MAX_BYTES) return false;
-  const key = sourceRecordKey(source);
-  const cached = cache.get(key);
-  if (cached !== undefined) return cached;
-  const raw = readFdProbe(fd, source.offset, source.byteLength);
-  let valid = raw !== null && raw.length === source.byteLength;
-  if (valid && raw) valid = createHash('sha256').update(raw).digest('hex') === source.sha256;
-  if (valid) {
-    const terminator = readFdProbe(fd, source.offset + source.byteLength, 1);
-    valid = !!terminator && terminator.length === 1 && terminator[0] === 0x0a;
-  }
-  cache.set(key, valid);
-  return valid;
-}
-
-function validateCodexSourceRecords(
-  fd: number,
-  previous?: TokenUsageAggregate,
-): { latestCodexUsage: boolean; latestContextUsage: boolean; model: boolean } {
-  const cache = new Map<string, boolean>();
-  return {
-    latestCodexUsage: validateSourceRecord(fd, previous?.latestCodexUsageSource, cache),
-    latestContextUsage: validateSourceRecord(fd, previous?.latestContextUsageSource, cache),
-    model: validateSourceRecord(fd, previous?.modelSource, cache),
-  };
-}
-
-function canReuseCodexAggregate(
+function earliestCodexReplaySourceOffset(
   previous: TokenUsageAggregate | undefined,
-  sourceValid: { latestCodexUsage: boolean; latestContextUsage: boolean; model: boolean } | undefined,
-): boolean {
-  if (!previous || !sourceValid) return false;
-  if (previous.latestCodexUsage && !sourceValid.latestCodexUsage) return false;
-  if (previous.latestContextUsage && !sourceValid.latestContextUsage) return false;
-  if (previous.model && !sourceValid.model) return false;
-  return true;
+): number | null {
+  if (!previous) return null;
+  const offsets: number[] = [];
+  if (previous.latestCodexUsage) {
+    if (!previous.latestCodexUsageSource) return null;
+    offsets.push(previous.latestCodexUsageSource.offset);
+  }
+  if (previous.latestContextUsage) {
+    if (!previous.latestContextUsageSource) return null;
+    offsets.push(previous.latestContextUsageSource.offset);
+  }
+  if (previous.model) {
+    if (!previous.modelSource) return null;
+    offsets.push(previous.modelSource.offset);
+  }
+  return offsets.length > 0 ? Math.min(...offsets) : null;
 }
 
 function cacheUsageRead(
   key: string,
   st: Stats,
-  entry: Omit<UsageFileCacheEntry, 'mtimeMs' | 'ctimeMs' | 'size' | 'dev' | 'ino' | 'frontierFingerprint'>,
+  entry: Omit<UsageFileCacheEntry, 'mtimeMs' | 'ctimeMs' | 'size' | 'dev' | 'ino'>,
 ): void {
   ensureUsageFileCacheCapacity(key);
   usageFileCache.set(key, {
@@ -716,25 +653,6 @@ function cacheUsageRead(
     size: st.size,
     dev: st.dev,
     ino: st.ino,
-    frontierFingerprint: null,
-  });
-}
-
-function cacheUsageReadWithFrontierFingerprint(
-  key: string,
-  st: Stats,
-  entry: Omit<UsageFileCacheEntry, 'mtimeMs' | 'ctimeMs' | 'size' | 'dev' | 'ino' | 'frontierFingerprint'>,
-  frontierFingerprint: string | null,
-): void {
-  ensureUsageFileCacheCapacity(key);
-  usageFileCache.set(key, {
-    ...entry,
-    mtimeMs: st.mtimeMs,
-    ctimeMs: st.ctimeMs,
-    size: st.size,
-    dev: st.dev,
-    ino: st.ino,
-    frontierFingerprint,
   });
 }
 
@@ -775,32 +693,33 @@ function readCodexTokenAggregateCached(
   let baseOffset: number;
   let dropInitialResidualLine = false;
   const previousAgg = cached?.previewAgg ? cloneAggregate(cached.previewAgg) : undefined;
-  // The frontier fingerprint only proves the durable cursor still points at
-  // the same byte frontier. Cached Codex metrics are inherited only after each
-  // metric's own source JSONL record passes validation below.
-  const cursorContinuityValid = !!cached
+  const sameOpenFileAsCache = !!cached
     && cached.dev === fdStat.dev
-    && cached.ino === fdStat.ino
-    && cached.frontierFingerprint !== null
-    && usageFileFingerprintFromFd(fd, fdStat, cached.offset) === cached.frontierFingerprint;
-  const canInheritCachedMetrics = cursorContinuityValid
-    ? validateCodexSourceRecords(fd, previousAgg)
-    : undefined;
-  const canReuseCachedAggregate = canReuseCodexAggregate(previousAgg, canInheritCachedMetrics);
-  const canReuseCachedOffset = !!cached
-    && cursorContinuityValid
-    && canReuseCachedAggregate
+    && cached.ino === fdStat.ino;
+  const canConsiderReplay = !!cached
+    && sameOpenFileAsCache
     && cached.canReadIncrementally
     && cached.offset > 0
     && fdStat.size >= cached.offset;
-  const reuseCachedOffset = canReuseCachedOffset
-    && fdStat.size - cached.offset <= CODEX_USAGE_TRANSCRIPT_TAIL_BYTES;
   const oversized = fdStat.size > MAX_USAGE_TRANSCRIPT_BYTES;
+  const candidateReplayBaseOffset = canConsiderReplay
+    ? earliestCodexReplaySourceOffset(previousAgg)
+    : null;
+  const candidateReplaySpan = candidateReplayBaseOffset === null
+    ? Number.POSITIVE_INFINITY
+    : fdStat.size - candidateReplayBaseOffset;
+  const replayBaseOffset = candidateReplaySpan <= CODEX_USAGE_REPLAY_BYTES
+    && candidateReplayBaseOffset !== null
+    && isJsonlLineBoundaryFd(fd, candidateReplayBaseOffset)
+    ? candidateReplayBaseOffset
+    : null;
+  const replaySpan = replayBaseOffset === null ? Number.POSITIVE_INFINITY : fdStat.size - replayBaseOffset;
+  const reuseTrackedReplay = replayBaseOffset !== null && replaySpan <= CODEX_USAGE_REPLAY_BYTES;
 
-  if (reuseCachedOffset) {
-    state = cloneAggregate(cached.state);
-    seenMessageIds = new Set(cached.seenMessageIds);
-    baseOffset = cached.offset;
+  if (reuseTrackedReplay) {
+    state = newTokenUsageAggregate();
+    seenMessageIds = new Set();
+    baseOffset = replayBaseOffset;
   } else {
     state = newTokenUsageAggregate();
     seenMessageIds = new Set();
@@ -839,7 +758,6 @@ function readCodexTokenAggregateCached(
   }
 
   const nextOffset = pendingTailIsInitialResidualLine ? baseOffset : baseOffset + completeBytes;
-  const nextFingerprint = usageFileFingerprintFromFd(fd, fdStat, nextOffset);
   let endStat: Stats;
   try {
     endStat = fstatSync(fd);
@@ -891,34 +809,32 @@ function readCodexTokenAggregateCached(
     // has arrived yet. Cache safe stat/throttle metadata only; the stored
     // offset is not a reusable durable cursor, so any later change reboots from
     // a bounded tail instead of turning that suffix into a fake complete line.
-    const merged = mergeCodexIndependentMetrics(previewAgg, previousAgg, canInheritCachedMetrics);
-    const mergedResult = finalizeTokenUsage(merged);
-    cacheUsageReadWithFrontierFingerprint(key, fdStat, {
+    const result = finalizeTokenUsage(previewAgg);
+    cacheUsageRead(key, fdStat, {
       offset: nextOffset,
       state,
       seenMessageIds,
-      previewAgg: merged,
-      result: mergedResult,
+      previewAgg,
+      result,
       parsedAtMs: now,
       canReadIncrementally: false,
-    }, nextFingerprint);
+    });
     closeSync(fd);
-    return { agg: merged, result: mergedResult };
+    return { agg: previewAgg, result };
   }
-  const merged = mergeCodexIndependentMetrics(previewAgg, previousAgg, canInheritCachedMetrics);
-  const mergedResult = finalizeTokenUsage(merged);
-  const canReadIncrementally = reuseCachedOffset || aggregateHasCodexUsage(previewAgg);
-  cacheUsageReadWithFrontierFingerprint(key, fdStat, {
+  const result = finalizeTokenUsage(previewAgg);
+  const canReadIncrementally = aggregateHasCodexUsage(previewAgg);
+  cacheUsageRead(key, fdStat, {
     offset: nextOffset,
     state,
     seenMessageIds,
-    previewAgg: merged,
-    result: mergedResult,
+    previewAgg,
+    result,
     parsedAtMs: now,
     canReadIncrementally,
-  }, nextFingerprint);
+  });
   closeSync(fd);
-  return { agg: merged, result: mergedResult };
+  return { agg: previewAgg, result };
 }
 
 function readSessionTokenAggregateCached(path: string, kind: CachedUsageKind, opts?: { fresh?: boolean }): UsageReadResult | null {

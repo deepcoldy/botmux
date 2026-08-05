@@ -7,13 +7,6 @@
  * Run:  pnpm vitest run test/cost-calculator-cache.test.ts
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-vi.mock('node:crypto', async (importOriginal) => {
-  const original = await importOriginal<typeof import('node:crypto')>();
-  return {
-    ...original,
-    createHash: vi.fn(original.createHash),
-  };
-});
 vi.mock('node:fs', async (importOriginal) => {
   const original = await importOriginal<typeof import('node:fs')>();
   return {
@@ -26,7 +19,6 @@ vi.mock('node:fs', async (importOriginal) => {
   };
 });
 
-import { createHash } from 'node:crypto';
 import { closeSync, constants, fstatSync, mkdtempSync, openSync, writeFileSync, appendFileSync, rmSync, readFileSync, readSync, renameSync, statSync, truncateSync, utimesSync, writeSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -43,13 +35,14 @@ vi.mock('../src/services/codex-transcript.js', () => ({
 import {
   CODEX_USAGE_TRANSCRIPT_TAIL_BYTES,
   MAX_USAGE_TRANSCRIPT_BYTES,
-  USAGE_TRANSCRIPT_FRONTIER_FINGERPRINT_BYTES,
   getSessionUsageSnapshot,
   readSessionTokenUsageFile,
   __resetSessionUsageCachesForTest,
 } from '../src/core/cost-calculator.js';
 import { logger } from '../src/utils/logger.js';
 import { findCodexRolloutBySessionId } from '../src/services/codex-transcript.js';
+
+const TEST_FRONTIER_BYTES = 64;
 
 function claudeLine(id: string | null, input: number, output: number): string {
   return JSON.stringify({
@@ -153,22 +146,39 @@ function expectBoundedTailRead(baseOffset: number): void {
   expect(calls.some((call) => Number(call[3]) === 1 && Number(call[4]) === baseOffset - 1)).toBe(true);
   const requestedBytes = calls.reduce((sum, call) => sum + Number(call[3]), 0);
   expect(requestedBytes).toBeLessThanOrEqual(
-    CODEX_USAGE_TRANSCRIPT_TAIL_BYTES + 1 + USAGE_TRANSCRIPT_FRONTIER_FINGERPRINT_BYTES,
+    CODEX_USAGE_TRANSCRIPT_TAIL_BYTES + 1,
   );
 }
 
-function expectLargeDeltaBoundedTailRead(baseOffset: number, sourceValidationBytes: number): void {
+function expectLargeDeltaBoundedTailRead(baseOffset: number): void {
   const calls = vi.mocked(readSync).mock.calls;
   expect(calls.length).toBeGreaterThan(0);
   expect(calls.some((call) => Number(call[3]) === 1 && Number(call[4]) === baseOffset - 1)).toBe(true);
   const requestedBytes = calls.reduce((sum, call) => sum + Number(call[3]), 0);
   expect(requestedBytes).toBeLessThanOrEqual(
-    sourceValidationBytes
-    + USAGE_TRANSCRIPT_FRONTIER_FINGERPRINT_BYTES
-    + 1
-    + CODEX_USAGE_TRANSCRIPT_TAIL_BYTES
-    + USAGE_TRANSCRIPT_FRONTIER_FINGERPRINT_BYTES,
+    1
+    + CODEX_USAGE_TRANSCRIPT_TAIL_BYTES,
   );
+}
+
+function expectCodexTrackedReplayRead(replayOffset: number, replayBytes: number): void {
+  const calls = vi.mocked(readSync).mock.calls;
+  expect(calls.length).toBeGreaterThan(0);
+  const requestedBytes = calls.reduce((sum, call) => sum + Number(call[3]), 0);
+  if (replayOffset > 0) {
+    expect(calls.some((call) => Number(call[3]) === 1 && Number(call[4]) === replayOffset - 1)).toBe(true);
+  }
+  const positions = calls.map((call) => Number(call[4])).filter(Number.isFinite);
+  expect(Math.min(...positions)).toBe(replayOffset > 0 ? replayOffset - 1 : replayOffset);
+  expect(calls.some((call) => Number(call[4]) === replayOffset && Number(call[3]) > 1)).toBe(true);
+  expect(requestedBytes).toBeLessThanOrEqual(
+    (replayOffset > 0 ? 1 : 0)
+    + replayBytes,
+  );
+}
+
+function requestedBytes(): number {
+  return vi.mocked(readSync).mock.calls.reduce((sum, call) => sum + Number(call[3]), 0);
 }
 
 function fileSize(path: string): number {
@@ -208,7 +218,6 @@ beforeEach(() => {
   now = 1_000_000_000;
   vi.spyOn(Date, 'now').mockImplementation(() => now);
   vi.mocked(fstatSync).mockClear();
-  vi.mocked(createHash).mockClear();
   vi.mocked(openSync).mockClear();
   vi.mocked(readFileSync).mockClear();
   vi.mocked(readSync).mockClear();
@@ -407,13 +416,7 @@ describe('readSessionTokenUsageFile caching', () => {
       },
       turnTokens: null,
     });
-    const requestedBytes = vi.mocked(readSync).mock.calls.reduce((sum, call) => sum + Number(call[3]), 0);
-    expect(requestedBytes).toBeLessThanOrEqual(
-      Buffer.byteLength(initialLine)
-      + USAGE_TRANSCRIPT_FRONTIER_FINGERPRINT_BYTES
-      + Buffer.byteLength(appended)
-      + USAGE_TRANSCRIPT_FRONTIER_FINGERPRINT_BYTES,
-    );
+    expectCodexTrackedReplayRead(0, fileSize(p));
   });
 
   it('cold reads an oversized Codex transcript from a bounded tail window', () => {
@@ -451,7 +454,7 @@ describe('readSessionTokenUsageFile caching', () => {
     expectBoundedTailRead(fileSize(p) - CODEX_USAGE_TRANSCRIPT_TAIL_BYTES);
   });
 
-  it('hashes Codex source records only for lines that update tracked metrics', () => {
+  it('ignores non-metric Codex lines while tracking metric source records', () => {
     const p = join(dir, 'codex-lazy-source-hash.jsonl');
     writeFileSync(p, [
       JSON.stringify({ type: 'event_msg', payload: { type: 'notice', message: 'ignored' } }),
@@ -466,9 +469,6 @@ describe('readSessionTokenUsageFile caching', () => {
       inputTokens: 80,
       cacheReadTokens: 20,
     });
-    expect(createHash).toHaveBeenCalledTimes(1);
-
-    vi.mocked(createHash).mockClear();
     const ignoredOnly = join(dir, 'codex-ignored-only.jsonl');
     writeFileSync(ignoredOnly, [
       JSON.stringify({ type: 'event_msg', payload: { type: 'notice', message: 'ignored' } }),
@@ -477,7 +477,6 @@ describe('readSessionTokenUsageFile caching', () => {
     ].join('\n'));
 
     expect(readSessionTokenUsageFile(ignoredOnly, 'codex', { fresh: true })).toBeNull();
-    expect(createHash).not.toHaveBeenCalled();
   });
 
   it('keeps the first Codex tail record when the bounded start is on a line boundary', () => {
@@ -556,7 +555,7 @@ describe('readSessionTokenUsageFile caching', () => {
     })).toEqual({ context: null, tokens: null, turnTokens: null });
   });
 
-  it('caches a no-snapshot Codex tail over an existing snapshot without enabling incremental reuse', () => {
+  it('does not inherit cached Codex metrics when a large tail has no snapshot', () => {
     const p = join(dir, 'codex-large-delta-no-snapshot.jsonl');
     writeOversizedCodexSnapshot(p, `${codexCountLine(100, 10, 20, { used: 30, window: 1_000 })}\n`);
     vi.mocked(findCodexRolloutBySessionId).mockReturnValue(p);
@@ -577,10 +576,7 @@ describe('readSessionTokenUsageFile caching', () => {
       sessionId: 'botmux-sid',
       cliSessionId: 'codex-sid',
       fresh: true,
-    })).toMatchObject({
-      context: { usedTokens: 30 },
-      tokens: { in: 100, out: 10 },
-    });
+    })).toEqual({ context: null, tokens: null, turnTokens: null });
 
     vi.mocked(readSync).mockClear();
     expect(getSessionUsageSnapshot({
@@ -588,14 +584,11 @@ describe('readSessionTokenUsageFile caching', () => {
       sessionId: 'botmux-sid',
       cliSessionId: 'codex-sid',
       fresh: true,
-    })).toMatchObject({
-      context: { usedTokens: 30 },
-      tokens: { in: 100, out: 10 },
-    });
+    })).toEqual({ context: null, tokens: null, turnTokens: null });
     expect(vi.mocked(readSync)).not.toHaveBeenCalled();
   });
 
-  it('preserves cached cumulative tokens when a large Codex tail only has context', () => {
+  it('drops cached cumulative tokens when a large Codex tail only has context', () => {
     const p = join(dir, 'codex-context-only-large-delta.jsonl');
     writeOversizedCodexSnapshot(p, `${codexCountLine(100, 10, 20, { used: 30, window: 1_000 })}\n`);
     vi.mocked(findCodexRolloutBySessionId).mockReturnValue(p);
@@ -619,15 +612,12 @@ describe('readSessionTokenUsageFile caching', () => {
       fresh: true,
     })).toMatchObject({
       context: { usedTokens: 240, windowTokens: 1_000, percentUsed: 24 },
-      tokens: { in: 100, out: 10, inputTokens: 80, cacheReadTokens: 20 },
+      tokens: null,
     });
-    expect(readSessionTokenUsageFile(p, 'codex', { fresh: true })).toMatchObject({
-      in: 100,
-      out: 10,
-    });
+    expect(readSessionTokenUsageFile(p, 'codex', { fresh: true })).toBeNull();
   });
 
-  it('preserves cached context when a large Codex tail only has cumulative tokens', () => {
+  it('drops cached context when a large Codex tail only has cumulative tokens', () => {
     const p = join(dir, 'codex-cumulative-only-large-delta.jsonl');
     writeOversizedCodexSnapshot(p, `${codexCountLine(100, 10, 20, { used: 30, window: 1_000 })}\n`);
     vi.mocked(findCodexRolloutBySessionId).mockReturnValue(p);
@@ -650,7 +640,7 @@ describe('readSessionTokenUsageFile caching', () => {
       cliSessionId: 'codex-sid',
       fresh: true,
     })).toMatchObject({
-      context: { usedTokens: 30, windowTokens: 1_000, percentUsed: 3 },
+      context: null,
       tokens: { in: 500, out: 60, inputTokens: 300, cacheReadTokens: 200 },
     });
   });
@@ -713,7 +703,7 @@ describe('readSessionTokenUsageFile caching', () => {
       context: { usedTokens: 240, windowTokens: 1_000, percentUsed: 24 },
       tokens: { in: 500, out: 60, inputTokens: 300, cacheReadTokens: 200 },
     });
-    expectLargeDeltaBoundedTailRead(baseOffset, Buffer.byteLength(initialLine));
+    expectLargeDeltaBoundedTailRead(baseOffset);
   });
 
   it('continues incrementally after an oversized Codex cold tail bootstrap when the append is small', () => {
@@ -746,13 +736,8 @@ describe('readSessionTokenUsageFile caching', () => {
       context: { usedTokens: 70, windowTokens: 1_000, percentUsed: 7 },
       tokens: { in: 150, out: 20, inputTokens: 100, cacheReadTokens: 50 },
     });
-    const requestedBytes = vi.mocked(readSync).mock.calls.reduce((sum, call) => sum + Number(call[3]), 0);
-    expect(requestedBytes).toBeLessThanOrEqual(
-      Buffer.byteLength(initialLine)
-      + USAGE_TRANSCRIPT_FRONTIER_FINGERPRINT_BYTES
-      + Buffer.byteLength(appended)
-      + USAGE_TRANSCRIPT_FRONTIER_FINGERPRINT_BYTES,
-    );
+    const replayOffset = fileSize(p) - Buffer.byteLength(initialLine) - Buffer.byteLength(appended);
+    expectCodexTrackedReplayRead(replayOffset, fileSize(p) - replayOffset);
   });
 
   it('rebuilds Codex usage when a same-size transcript is rename-replaced', () => {
@@ -911,7 +896,7 @@ describe('readSessionTokenUsageFile caching', () => {
     let replaced = false;
     vi.mocked(readSync).mockImplementation((fd, buffer, offset, length, position) => {
       const bytesRead = (realReadSync as typeof readSync)(fd, buffer, offset, length, position);
-      if (!replaced && length === USAGE_TRANSCRIPT_FRONTIER_FINGERPRINT_BYTES) {
+      if (!replaced && length > 1) {
         renameSync(replacement, p);
         replaced = true;
       }
@@ -989,8 +974,8 @@ describe('readSessionTokenUsageFile caching', () => {
     const p = join(dir, 'codex-source-front-rewrite-same-size.jsonl');
     const oldLine = `${codexCountLine(100, 10, 20, { used: 30, window: 1_000 })}\n`;
     const newLine = oldLine.replace('"input_tokens":100', '"input_tokens":999');
-    expect(Buffer.from(newLine).subarray(-USAGE_TRANSCRIPT_FRONTIER_FINGERPRINT_BYTES).equals(
-      Buffer.from(oldLine).subarray(-USAGE_TRANSCRIPT_FRONTIER_FINGERPRINT_BYTES),
+    expect(Buffer.from(newLine).subarray(-TEST_FRONTIER_BYTES).equals(
+      Buffer.from(oldLine).subarray(-TEST_FRONTIER_BYTES),
     )).toBe(true);
     const { finalSize } = writeOversizedCodexSnapshot(p, oldLine);
     const firstStat = statSync(p);
@@ -1010,13 +995,113 @@ describe('readSessionTokenUsageFile caching', () => {
     });
   });
 
+  it('replays the scanned Codex interval when a later metric is written between an unchanged source and frontier', () => {
+    const p = join(dir, 'codex-middle-rewrite-between-source-and-frontier.jsonl');
+    const oldModelLine = codexModelLine('old-model');
+    const oldTokenLine = codexCountLine(100, 10, 20, { used: 30, window: 1_000 });
+    const newTokenLine = codexCountLine(999, 11, 30, { used: 240, window: 1_000 });
+    const newModelLine = codexModelLine('new-model');
+    const oldTokenOffset = Buffer.byteLength(`${oldModelLine}\n`, 'utf8');
+    const newTokenOffset = Buffer.byteLength(`${oldModelLine}\n${oldTokenLine}\n`, 'utf8');
+    const newModelOffset = newTokenOffset + Buffer.byteLength(`${newTokenLine}\n`, 'utf8');
+    const inertLineFor = (line: string) => {
+      const prefix = '{"x":"';
+      const suffix = '"}';
+      const targetBytes = Buffer.byteLength(line, 'utf8');
+      const fixedBytes = Buffer.byteLength(prefix + suffix, 'utf8');
+      expect(targetBytes).toBeGreaterThan(fixedBytes);
+      return prefix + 'x'.repeat(targetBytes - fixedBytes) + suffix;
+    };
+    const inertTokenLine = inertLineFor(newTokenLine);
+    const inertModelLine = inertLineFor(newModelLine);
+    expect(Buffer.byteLength(inertTokenLine)).toBe(Buffer.byteLength(newTokenLine));
+    expect(Buffer.byteLength(inertModelLine)).toBe(Buffer.byteLength(newModelLine));
+    writeFileSync(p, [
+      oldModelLine,
+      oldTokenLine,
+      inertTokenLine,
+      inertModelLine,
+      JSON.stringify({ type: 'event_msg', payload: { type: 'notice', padding: 'stable-tail'.repeat(32) } }),
+      '',
+    ].join('\n'));
+    vi.mocked(findCodexRolloutBySessionId).mockReturnValue(p);
+    const firstStat = statSync(p);
+    expect(getSessionUsageSnapshot({
+      cliId: 'codex',
+      sessionId: 'botmux-sid',
+      cliSessionId: 'codex-sid',
+      fresh: true,
+    })).toMatchObject({
+      context: { usedTokens: 30, windowTokens: 1_000, percentUsed: 3 },
+      tokens: {
+        in: 100,
+        out: 10,
+        model: 'old-model',
+      },
+      turnTokens: null,
+    });
+    expect(readSessionTokenUsageFile(p, 'codex', { fresh: true })).toMatchObject({
+      in: 100,
+      out: 10,
+      model: 'old-model',
+    });
+
+    const oldSource = readBytesAt(p, oldTokenOffset, Buffer.byteLength(oldTokenLine));
+    const oldFrontier = readBytesAt(
+      p,
+      fileSize(p) - TEST_FRONTIER_BYTES,
+      TEST_FRONTIER_BYTES,
+    );
+    sleepSync(5);
+    writeBytesAt(p, newTokenOffset, newTokenLine);
+    writeBytesAt(p, newModelOffset, newModelLine);
+    const secondStat = statSync(p);
+    expect(secondStat.ino).toBe(firstStat.ino);
+    expect(secondStat.size).toBe(firstStat.size);
+    expect(secondStat.ctimeMs).toBeGreaterThanOrEqual(firstStat.ctimeMs);
+    expect(readBytesAt(p, oldTokenOffset, Buffer.byteLength(oldTokenLine))).toEqual(oldSource);
+    expect(readBytesAt(
+      p,
+      fileSize(p) - TEST_FRONTIER_BYTES,
+      TEST_FRONTIER_BYTES,
+    )).toEqual(oldFrontier);
+    now += 20_000;
+
+    vi.mocked(readSync).mockClear();
+    expect(getSessionUsageSnapshot({
+      cliId: 'codex',
+      sessionId: 'botmux-sid',
+      cliSessionId: 'codex-sid',
+      fresh: true,
+    })).toMatchObject({
+      context: { usedTokens: 240, windowTokens: 1_000, percentUsed: 24 },
+      tokens: {
+        in: 999,
+        out: 11,
+        inputTokens: 969,
+        cacheReadTokens: 30,
+        model: 'new-model',
+      },
+      turnTokens: null,
+    });
+    expectCodexTrackedReplayRead(0, fileSize(p));
+    vi.mocked(readSync).mockClear();
+    expect(readSessionTokenUsageFile(p, 'codex', { fresh: true })).toMatchObject({
+      in: 999,
+      out: 11,
+      inputTokens: 969,
+      cacheReadTokens: 30,
+      model: 'new-model',
+    });
+  });
+
   it('does not return stale Codex usage when a front-rewritten source record grows slightly but keeps its frontier', () => {
     const p = join(dir, 'codex-source-front-rewrite-grow.jsonl');
     const oldLine = `${codexCountLine(100, 10, 20, { used: 30, window: 1_000 })}\n`;
     const newLine = oldLine.replace('"input_tokens":100', '"input_tokens":999');
     expect(Buffer.byteLength(newLine)).toBe(Buffer.byteLength(oldLine));
-    expect(Buffer.from(newLine).subarray(-USAGE_TRANSCRIPT_FRONTIER_FINGERPRINT_BYTES).equals(
-      Buffer.from(oldLine).subarray(-USAGE_TRANSCRIPT_FRONTIER_FINGERPRINT_BYTES),
+    expect(Buffer.from(newLine).subarray(-TEST_FRONTIER_BYTES).equals(
+      Buffer.from(oldLine).subarray(-TEST_FRONTIER_BYTES),
     )).toBe(true);
     const finalSize = MAX_USAGE_TRANSCRIPT_BYTES + CODEX_USAGE_TRANSCRIPT_TAIL_BYTES + 1;
     const leadBytes = 512;
@@ -1025,11 +1110,11 @@ describe('readSessionTokenUsageFile caching', () => {
     const firstStat = statSync(p);
     expect(readSessionTokenUsageFile(p, 'codex', { fresh: true })).toMatchObject({ in: 100, out: 10 });
 
-    const frontierOffset = lineOffset + Buffer.byteLength(oldLine) - USAGE_TRANSCRIPT_FRONTIER_FINGERPRINT_BYTES;
-    const oldFrontier = readBytesAt(p, frontierOffset, USAGE_TRANSCRIPT_FRONTIER_FINGERPRINT_BYTES);
+    const frontierOffset = lineOffset + Buffer.byteLength(oldLine) - TEST_FRONTIER_BYTES;
+    const oldFrontier = readBytesAt(p, frontierOffset, TEST_FRONTIER_BYTES);
     writeBytesAt(p, lineOffset, newLine);
     appendFileSync(p, Buffer.alloc(128, 0x20));
-    expect(readBytesAt(p, frontierOffset, USAGE_TRANSCRIPT_FRONTIER_FINGERPRINT_BYTES)).toEqual(oldFrontier);
+    expect(readBytesAt(p, frontierOffset, TEST_FRONTIER_BYTES)).toEqual(oldFrontier);
     const secondStat = statSync(p);
     expect(secondStat.ino).toBe(firstStat.ino);
     now += 20_000;
@@ -1040,6 +1125,107 @@ describe('readSessionTokenUsageFile caching', () => {
       inputTokens: 979,
       cacheReadTokens: 20,
     });
+  });
+
+  it('replays a tracked Codex interval when a middle rewrite is followed by a small append', () => {
+    const p = join(dir, 'codex-middle-rewrite-small-append.jsonl');
+    const oldTokenLine = codexCountLine(100, 10, 20, { used: 30, window: 1_000 });
+    const newTokenLine = codexCountLine(999, 11, 30, { used: 240, window: 1_000 });
+    const inertLine = '{"x":"' + 'x'.repeat(Buffer.byteLength(newTokenLine) - Buffer.byteLength('{"x":""}')) + '"}';
+    expect(Buffer.byteLength(inertLine)).toBe(Buffer.byteLength(newTokenLine));
+    writeFileSync(p, [
+      oldTokenLine,
+      inertLine,
+      JSON.stringify({ type: 'event_msg', payload: { type: 'notice', padding: 'stable-tail'.repeat(32) } }),
+      '',
+    ].join('\n'));
+    const firstStat = statSync(p);
+    expect(readSessionTokenUsageFile(p, 'codex', { fresh: true })).toMatchObject({ in: 100, out: 10 });
+
+    const oldFrontier = readBytesAt(
+      p,
+      fileSize(p) - TEST_FRONTIER_BYTES,
+      TEST_FRONTIER_BYTES,
+    );
+    sleepSync(5);
+    const newTokenOffset = Buffer.byteLength(`${oldTokenLine}\n`, 'utf8');
+    writeBytesAt(p, newTokenOffset, newTokenLine);
+    const appended = `${codexModelLine('new-model')}\n`;
+    appendFileSync(p, appended);
+    const secondStat = statSync(p);
+    expect(secondStat.ino).toBe(firstStat.ino);
+    expect(secondStat.size).toBe(firstStat.size + Buffer.byteLength(appended));
+    expect(readBytesAt(
+      p,
+      fileSize(p) - Buffer.byteLength(appended) - TEST_FRONTIER_BYTES,
+      TEST_FRONTIER_BYTES,
+    )).toEqual(oldFrontier);
+    now += 20_000;
+
+    vi.mocked(readSync).mockClear();
+    expect(readSessionTokenUsageFile(p, 'codex', { fresh: true })).toMatchObject({
+      in: 999,
+      out: 11,
+      inputTokens: 969,
+      cacheReadTokens: 30,
+      model: 'new-model',
+    });
+    expectCodexTrackedReplayRead(0, fileSize(p));
+  });
+
+  it('falls back to a normal rebuild when the tracked replay boundary is rejected', () => {
+    const p = join(dir, 'codex-normal-boundary-rejected.jsonl');
+    const prefixLine = JSON.stringify({ type: 'event_msg', payload: { type: 'notice', message: 'prefix' } });
+    const oldTokenLine = codexCountLine(100, 10, 20, { used: 30, window: 1_000 });
+    const newTokenLine = codexCountLine(999, 11, 30, { used: 240, window: 1_000 });
+    const oldSourceOffset = Buffer.byteLength(`${prefixLine}\n`, 'utf8');
+    writeFileSync(p, `${prefixLine}\n${oldTokenLine}\n`);
+    expect(readSessionTokenUsageFile(p, 'codex', { fresh: true })).toMatchObject({ in: 100, out: 10 });
+
+    vi.mocked(readSync).mockClear();
+    writeBytesAt(p, oldSourceOffset - 1, ' ');
+    appendFileSync(p, `\n${newTokenLine}\n`);
+    now += 20_000;
+
+    expect(readSessionTokenUsageFile(p, 'codex', { fresh: true })).toMatchObject({
+      in: 999,
+      out: 11,
+      inputTokens: 969,
+      cacheReadTokens: 30,
+    });
+    expect(requestedBytes()).toBe(fileSize(p) + 1);
+  });
+
+  it('falls back to an oversized tail rebuild when the tracked replay boundary is rejected', () => {
+    const p = join(dir, 'codex-oversized-boundary-rejected.jsonl');
+    const prefixLine = JSON.stringify({ type: 'event_msg', payload: { type: 'notice', padding: 'p'.repeat(1024) } });
+    const oldTokenLine = `${codexCountLine(100, 10, 20, { used: 30, window: 1_000 })}\n`;
+    const newTokenLine = codexCountLine(999, 11, 30, { used: 240, window: 1_000 });
+    const finalSize = MAX_USAGE_TRANSCRIPT_BYTES + CODEX_USAGE_TRANSCRIPT_TAIL_BYTES + 1;
+    const baseOffset = finalSize - CODEX_USAGE_TRANSCRIPT_TAIL_BYTES;
+    const oldSourceOffset = baseOffset + Buffer.byteLength(`${prefixLine}\n`, 'utf8');
+    writeFileSync(p, '');
+    truncateSync(p, baseOffset - 1);
+    appendFileSync(p, `\n${prefixLine}\n${oldTokenLine}`);
+    appendFileSync(p, Buffer.alloc(finalSize - fileSize(p), 0x20));
+    expect(readSessionTokenUsageFile(p, 'codex', { fresh: true })).toMatchObject({ in: 100, out: 10 });
+
+    vi.mocked(readSync).mockClear();
+    writeBytesAt(p, oldSourceOffset - 1, ' ');
+    appendFileSync(p, `\n${newTokenLine}\n`);
+    const tailBaseOffset = fileSize(p) - CODEX_USAGE_TRANSCRIPT_TAIL_BYTES;
+    expect(fileSize(p) - oldSourceOffset).toBeLessThanOrEqual(CODEX_USAGE_TRANSCRIPT_TAIL_BYTES);
+    now += 20_000;
+
+    expect(readSessionTokenUsageFile(p, 'codex', { fresh: true })).toMatchObject({
+      in: 999,
+      out: 11,
+      inputTokens: 969,
+      cacheReadTokens: 30,
+    });
+    expect(vi.mocked(readSync).mock.calls.some((call) => Number(call[3]) === 1 && Number(call[4]) === oldSourceOffset - 1)).toBe(true);
+    expect(vi.mocked(readSync).mock.calls.some((call) => Number(call[3]) === 1 && Number(call[4]) === tailBaseOffset - 1)).toBe(true);
+    expect(requestedBytes()).toBe(CODEX_USAGE_TRANSCRIPT_TAIL_BYTES + 2);
   });
 
   it('rebuilds Codex usage when the same inode is rewritten and grows slightly', () => {
