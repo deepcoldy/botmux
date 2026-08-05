@@ -47,6 +47,8 @@
  */
 import { spawn as spawnProcess, type ChildProcessByStdio } from 'node:child_process';
 import type { Readable } from 'node:stream';
+import { locateOnPath } from '../cli/registry.js';
+import { buildWrappedLaunch } from '../../setup/cli-selection.js';
 import { logger } from '../../utils/logger.js';
 import type { SessionBackend, SpawnOpts } from './types.js';
 import type {
@@ -135,6 +137,17 @@ export class MojoBackend implements SessionBackend {
      * an explicit bots.json override remains authoritative.
      */
     private spawnOpts: SpawnOpts | null = null;
+    /**
+     * Resolved launch PREFIX from BotConfig.wrapperCli (e.g. `env VAR=x mojo`,
+     * a ttadk gateway). The worker resolves the prefix into a real bin + args and
+     * passes them to spawn(); a PTY CLI is wrapped once for the life of its
+     * process, but mojo is invoked per turn, so the prefix must be re-applied to
+     * EVERY invocation. Null when no wrapper is configured, in which case the
+     * plain binary is used.
+     */
+    private launchPrefix: { bin: string; args: string[] } | null = null;
+    /** Guard so the config-side wrapper resolution is attempted at most once. */
+    private wrapperResolved = false;
     private writeChain: Promise<void> = Promise.resolve();
 
     constructor(config: MojoBackendConfig, sessionId: string) {
@@ -148,12 +161,73 @@ export class MojoBackend implements SessionBackend {
 
     // ── SessionBackend surface ───────────────────────────────────────────────
 
-    spawn(_bin: string, _args: string[], opts: SpawnOpts): void {
+    spawn(bin: string, args: string[], opts: SpawnOpts): void {
         // No persistent process is started here — the headless CLI is invoked
         // once per turn — but the spawn contract is still where the worker hands
         // over the authoritative cwd/env, so keep them for buildEnv()/runTurn().
         this.spawnOpts = opts;
+
+        // A launch prefix only ever reaches us from wrapperCli: the mojo adapter's
+        // resolvedBin is '' and its buildArgs() returns [], and the sandbox
+        // wrappers (which also rewrite spawnBin) are unreachable for this backend
+        // — a fully-remote mojo session never requests the local sandbox, and a
+        // locally-executing one that does is refused before spawn (see
+        // backendSandboxCompatibilityError).
+        if (this.config.wrapperCli) {
+            this.wrapperResolved = true;
+            if (bin) {
+                this.launchPrefix = { bin, args: [...args] };
+                logger.info(`[mojo] launch prefix from wrapperCli: ${bin} ${args.join(' ')}`);
+            } else {
+                // Never claim a wrapper was applied while running the bare binary.
+                logger.warn(
+                    `[mojo] wrapperCli="${this.config.wrapperCli}" was configured but the worker `
+                    + 'supplied no launch binary — running mojo unwrapped',
+                );
+            }
+        }
         logger.info(`[mojo] spawn ${this.sessionId} in ${this.resolveCwd() ?? '(inherited cwd)'} (headless CLI invoked per turn)`);
+    }
+
+    /**
+     * Resolve the executable + leading args for one invocation, re-applying the
+     * wrapperCli prefix when present.
+     *
+     * The prefix normally arrives pre-resolved from the worker via spawn(). The
+     * daemon's workerless cancel path never calls spawn(), so when a wrapper is
+     * configured but unresolved we resolve it here from the config — otherwise
+     * `/close` would run an unwrapped binary that a wrapper-dependent setup
+     * (e.g. a gateway that injects auth) cannot reach.
+     */
+    private resolveLaunch(cliArgs: string[]): { bin: string; args: string[] } {
+        const prefix = this.launchPrefix ?? this.resolveConfiguredWrapper();
+        if (prefix) {
+            return { bin: prefix.bin, args: [...prefix.args, ...cliArgs] };
+        }
+        return { bin: this.config.bin ?? 'mojo', args: cliArgs };
+    }
+
+    /** Lazily resolve (and memoize) `config.wrapperCli` when spawn() never ran. */
+    private resolveConfiguredWrapper(): { bin: string; args: string[] } | null {
+        if (this.wrapperResolved) return this.launchPrefix;
+        this.wrapperResolved = true;
+        const wrapperCli = this.config.wrapperCli?.trim();
+        if (!wrapperCli) return null;
+        try {
+            // cliArgs is [] on purpose: the mojo adapter bakes nothing into launch
+            // args, so this yields the PREFIX only, and the per-turn args are
+            // appended by resolveLaunch.
+            const launch = buildWrappedLaunch(wrapperCli, [], b => locateOnPath(b) ?? b);
+            if (!launch.bin) return null;
+            this.launchPrefix = { bin: launch.bin, args: launch.args };
+            logger.info(`[mojo] launch prefix resolved from config: ${launch.bin} ${launch.args.join(' ')}`);
+            return this.launchPrefix;
+        } catch (err: unknown) {
+            // Never let an unusable wrapper turn teardown into a crash — but do
+            // not pretend it was applied either.
+            logger.warn(`[mojo] could not resolve wrapperCli "${wrapperCli}": ${String(err)}`);
+            return null;
+        }
     }
 
     /** bots.json `mojo.cwd` wins; otherwise the worker's session working dir. */
@@ -288,8 +362,7 @@ export class MojoBackend implements SessionBackend {
      *  RUNNING (caller should retry), `false` once the turn is accounted for. */
     private runTurn(prompt: string): Promise<boolean> {
         return new Promise<boolean>((resolve, reject) => {
-            const bin = this.config.bin ?? 'mojo';
-            const args = this.buildArgs(prompt);
+            const { bin, args } = this.resolveLaunch(this.buildArgs(prompt));
             this.turnSettled = false;
             this.streamedThisTurn = false;
             this.stdoutTail = '';
@@ -553,7 +626,13 @@ export class MojoBackend implements SessionBackend {
         // Prefer an injected JWT so the bot never depends on an interactive
         // `mojo auth login` on the host. Verified: X_JWT_TOKEN makes
         // `mojo auth status --json` report mode=jwt / source=env.
-        const jwt = this.config.jwt ?? process.env[this.config.jwtEnv ?? 'X_JWT_TOKEN'];
+        //
+        // Read from the ALREADY-MERGED env, never from process.env: the daemon's
+        // ambient X_JWT_TOKEN is the lowest layer of that merge, so reaching back
+        // to process.env here would let the host's token override a per-bot one
+        // and silently run the bot as the wrong identity.
+        const jwtKey = this.config.jwtEnv ?? 'X_JWT_TOKEN';
+        const jwt = this.config.jwt ?? env[jwtKey];
         if (jwt) env.X_JWT_TOKEN = jwt;
         if (this.config.baseUrl) env.AGENT_BASE_URL = this.config.baseUrl;
         // A bot host must not run a local execution daemon on behalf of chat users.
@@ -579,8 +658,8 @@ export class MojoBackend implements SessionBackend {
 
     private runCli(args: string[]): Promise<string> {
         return new Promise<string>((resolve, reject) => {
-            const bin = this.config.bin ?? 'mojo';
-            const child = spawnProcess(bin, args, {
+            const launch = this.resolveLaunch(args);
+            const child = spawnProcess(launch.bin, launch.args, {
                 cwd: this.resolveCwd(),
                 env: this.buildEnv(),
                 stdio: ['ignore', 'pipe', 'pipe'],

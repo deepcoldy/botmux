@@ -236,7 +236,7 @@ import {
   isValidRiffSandboxCluster,
   type RiffBackendConfig,
 } from './adapters/backend/riff-backend.js';
-import type { MojoBackendConfig } from './adapters/backend/mojo-types.js';
+import { buildEffectiveMojoConfig, type MojoBackendConfig } from './adapters/backend/mojo-types.js';
 import {
   prepareDirectSandbox,
   prepareCredentialOnlySandbox,
@@ -7728,24 +7728,22 @@ async function spawnCli(
   // Precedence: an explicit value in the `mojo` block wins (it is the more
   // specific setting), the generic session value is the fallback.
   if (effectiveBackendType === 'mojo') {
-    const mojoCfg = (cfg.backendConfig ?? {}) as MojoBackendConfig;
-    riffBackendConfig = {
-      ...mojoCfg,
-      // The worker resolves the real binary (wrapperCli / cliPathOverride /
-      // PATH lookup); a bare 'mojo' would ignore an operator's explicit path
-      // even though cli-availability already validated THAT path.
-      bin: mojoCfg.bin ?? cfg.cliPathOverride?.trim() ?? undefined,
-      cwd: mojoCfg.cwd ?? cfg.workingDir,
-      model: mojoCfg.model ?? cfg.model,
-      // Generic opt-out must reach the backend, otherwise `--yolo` is still
-      // appended for a bot explicitly configured to keep CLI approvals.
-      disableCliBypass: mojoCfg.disableCliBypass ?? cfg.disableCliBypass,
-      // Resume the persisted lineage: daemon restart, /relay and worker
-      // rebuilds all arrive with riffParentTaskId set (the shared remote-lineage
-      // channel — see the riff_task_id IPC message, which is emitted by the
-      // generic backend.onTaskId hook and therefore already carries mojo ids).
-      resumeCliSessionId: mojoCfg.resumeCliSessionId ?? cfg.riffParentTaskId,
-    };
+    // Shared with the daemon's workerless `/close` path (see
+    // destroyOrphanedBackingSession) so a session that runs on a custom binary /
+    // per-bot JWT can still be cancelled after its worker is gone.
+    riffBackendConfig = buildEffectiveMojoConfig(cfg.backendConfig as MojoBackendConfig | undefined, {
+      cliPathOverride: cfg.cliPathOverride,
+      workingDir: cfg.workingDir,
+      model: cfg.model,
+      disableCliBypass: cfg.disableCliBypass,
+      env: cfg.env ? sanitizePerBotEnv(cfg.env) : undefined,
+      // Resume the persisted lineage: daemon restart, /relay and worker rebuilds
+      // all arrive with riffParentTaskId set (the shared remote-lineage channel —
+      // see the riff_task_id IPC message, emitted by the generic
+      // backend.onTaskId hook and therefore already carrying mojo ids).
+      resumeCliSessionId: cfg.riffParentTaskId,
+      wrapperCli: cfg.wrapperCli,
+    });
     const resumed = (riffBackendConfig as MojoBackendConfig).resumeCliSessionId;
     if (resumed) log(`mojo resuming session lineage ${resumed}`);
   }

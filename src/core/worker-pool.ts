@@ -32,6 +32,8 @@ import { codexServiceTierBadge } from '../services/codex-service-tier.js';
 import { loadFrozenCards, saveFrozenCards } from '../services/frozen-card-store.js';
 import { hashUrlForLog, cancelRiffTaskById } from '../adapters/backend/riff-backend.js';
 import { cancelMojoSessionById } from '../adapters/backend/mojo-backend.js';
+import { buildEffectiveMojoConfig } from '../adapters/backend/mojo-types.js';
+import { sanitizePerBotEnv } from './per-bot-env.js';
 import { logger } from '../utils/logger.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import {
@@ -2157,7 +2159,21 @@ function destroyOrphanedBackingSession(ds: DaemonSession): void {
         } else {
           // mojo needs no baseUrl gate — the CLI resolves its own endpoint, and
           // an absent `mojo` config block is a valid setup.
-          void cancelMojoSessionById(botCfg.mojo ?? {}, remoteId).then((ok) => {
+          //
+          // Build the SAME effective config the worker would (shared helper): a
+          // bare `botCfg.mojo` carries neither the pinned binary
+          // (cliPathOverride) nor the per-bot env holding the JWT, so a bot that
+          // ran fine on a custom path/identity would fail to cancel here — the
+          // remote session then keeps burning cloud sandbox time while still
+          // holding injected credentials. Session cwd is not persisted for a dead
+          // worker, so fall back to the bot's configured working dir.
+          const launchCfg = buildEffectiveMojoConfig(botCfg.mojo, {
+            cliPathOverride: botCfg.cliPathOverride,
+            workingDir: ds.session.workingDir ?? botCfg.defaultWorkingDir ?? botCfg.workingDir,
+            env: botCfg.env ? sanitizePerBotEnv(botCfg.env) : undefined,
+            wrapperCli: botCfg.wrapperCli,
+          });
+          void cancelMojoSessionById(launchCfg, remoteId).then((ok) => {
             if (ok) logger.info(`[${tag(ds)}] killWorker: orphan mojo session ${remoteId} cancelled`);
           });
         }

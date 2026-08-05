@@ -45,6 +45,12 @@ export interface MojoBackendConfig {
     /** Persisted mojo session id, restored across daemon restarts. */
     resumeCliSessionId?: string;
     /**
+     * Launch prefix (BotConfig.wrapperCli), resolved by the worker into a real
+     * bin + args. MojoBackend re-applies it to EVERY per-turn invocation, since
+     * unlike a PTY CLI there is no single long-lived process to wrap once.
+     */
+    wrapperCli?: string;
+    /**
      * Extra env for the spawned CLI. Merged ON TOP of the authoritative env the
      * worker hands to spawn() (which already carries the BOTMUX_* session
      * context and per-bot `env`), so an explicit value here wins — mirroring how
@@ -108,3 +114,81 @@ export interface MojoCliEnvelope {
 
 /** Line styles understood by `emitLine`. */
 export type MojoLineStyle = 'info' | 'warn' | 'ok' | 'err' | 'title' | 'plain';
+
+/**
+ * Generic, host-owned session settings that must reach the mojo CLI. They are
+ * resolved by botmux (dashboard, `botmux setup`, repo selection, bots.json) and
+ * live OUTSIDE the `mojo` block, so a backend that only reads MojoBackendConfig
+ * would silently ignore all of them.
+ */
+export interface MojoGenericLaunchInput {
+    /** BotConfig.cliPathOverride — an operator-pinned mojo binary. */
+    cliPathOverride?: string;
+    /** Session working dir (repo selection writes this). */
+    workingDir?: string;
+    /** BotConfig.model / dashboard model picker. */
+    model?: string;
+    /** BotConfig.disableCliBypass — keep the CLI's own approvals. */
+    disableCliBypass?: boolean;
+    /** Per-bot env (bots.json `env`), already sanitized by the caller. */
+    env?: Record<string, string>;
+    /** Persisted remote lineage (Session.riffParentTaskId, shared by riff/mojo). */
+    resumeCliSessionId?: string;
+    /** BotConfig.wrapperCli — launch prefix, see MojoBackend.spawn. */
+    wrapperCli?: string;
+}
+
+/**
+ * Fold the generic session settings into the mojo-specific block, producing the
+ * ONE config both the worker (live session) and the daemon (workerless `/close`)
+ * must use.
+ *
+ * Sharing this matters: the daemon cancels an orphaned session WITHOUT a worker,
+ * so it never calls spawn() and cannot pick these up from SpawnOpts. Building
+ * the config only in the worker meant a bot running fine on a custom binary /
+ * per-bot JWT could not be cancelled once its worker died — leaving the remote
+ * session burning cloud sandbox time while still holding injected credentials.
+ *
+ * Precedence: an explicit value in the `mojo` block wins (it is the more
+ * specific setting); the generic session value is the fallback.
+ */
+export function buildEffectiveMojoConfig(
+    mojoBlock: MojoBackendConfig | undefined,
+    generic: MojoGenericLaunchInput,
+): MojoBackendConfig {
+    const block = mojoBlock ?? {};
+    // `??` throughout: the mojo block is the more specific setting and wins, but
+    // only when actually set — `false` and `''` must not be treated as absent.
+    const merged: MojoBackendConfig = { ...block };
+
+    const bin = block.bin ?? emptyToUndefined(generic.cliPathOverride);
+    if (bin !== undefined) merged.bin = bin;
+
+    const cwd = block.cwd ?? generic.workingDir;
+    if (cwd !== undefined) merged.cwd = cwd;
+
+    const model = block.model ?? generic.model;
+    if (model !== undefined) merged.model = model;
+
+    const disableCliBypass = block.disableCliBypass ?? generic.disableCliBypass;
+    if (disableCliBypass !== undefined) merged.disableCliBypass = disableCliBypass;
+
+    // Per-bot env is the LOWER layer: an explicit `mojo.env` entry wins.
+    if (generic.env || block.env) {
+        merged.env = { ...(generic.env ?? {}), ...(block.env ?? {}) };
+    }
+
+    const resume = block.resumeCliSessionId ?? generic.resumeCliSessionId;
+    if (resume !== undefined) merged.resumeCliSessionId = resume;
+
+    const wrapperCli = block.wrapperCli ?? emptyToUndefined(generic.wrapperCli);
+    if (wrapperCli !== undefined) merged.wrapperCli = wrapperCli;
+
+    return merged;
+}
+
+/** Treat a blank/whitespace-only override as unset. */
+function emptyToUndefined(value: string | undefined): string | undefined {
+    const trimmed = value?.trim();
+    return trimmed ? trimmed : undefined;
+}
