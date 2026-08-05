@@ -2547,4 +2547,54 @@ describe('role profile IPC routes', () => {
       rmSync(dataDir, { recursive: true, force: true });
     }
   });
+
+  it('reports `changed` so the dashboard only invalidates on real hasRole mutations', async () => {
+    // The groups-matrix snapshot keys off `changed` to avoid busting its 30s
+    // cache on no-op writes. A content PUT / real DELETE flip hasRole
+    // (changed:true); an injectMode-only PUT and a delete-not-found do NOT
+    // (changed:false) — otherwise the common inject-mode toggle would punch
+    // through the cache and re-fan-out across every daemon.
+    const prevDataDir = process.env.SESSION_DATA_DIR;
+    const prevConfigDataDir = config.session.dataDir;
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-role-changed-ipc-'));
+    config.session.dataDir = dataDir;
+    setLarkAppId('cli_profile');
+    try {
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const base = `http://127.0.0.1:${handle.port}`;
+
+      // Content PUT writes the role file → changed:true.
+      const putContent = await fetch(`${base}/api/roles/oc_changed`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ content: '# Role\nhello' }),
+      });
+      expect(putContent.status).toBe(200);
+      expect(await putContent.json()).toMatchObject({ ok: true, changed: true });
+
+      // injectMode-only PUT touches just the .meta.json sidecar → changed:false.
+      const putMode = await fetch(`${base}/api/roles/oc_changed`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ injectMode: 'once' }),
+      });
+      expect(putMode.status).toBe(200);
+      expect(await putMode.json()).toMatchObject({ ok: true, changed: false });
+
+      // DELETE that removed the existing file → changed:true.
+      const delExisting = await fetch(`${base}/api/roles/oc_changed`, { method: 'DELETE' });
+      expect(delExisting.status).toBe(200);
+      expect(await delExisting.json()).toMatchObject({ ok: true, existed: true, changed: true });
+
+      // DELETE with nothing to remove → changed:false.
+      const delMissing = await fetch(`${base}/api/roles/oc_changed`, { method: 'DELETE' });
+      expect(delMissing.status).toBe(200);
+      expect(await delMissing.json()).toMatchObject({ ok: true, existed: false, changed: false });
+    } finally {
+      if (prevDataDir === undefined) delete process.env.SESSION_DATA_DIR;
+      else process.env.SESSION_DATA_DIR = prevDataDir;
+      config.session.dataDir = prevConfigDataDir;
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
 });

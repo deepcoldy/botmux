@@ -115,26 +115,34 @@ describe("groups presentation projection", () => {
 
 describe("roleWriteShouldInvalidate", () => {
   // ── invalidate: a role file was actually written / deleted ──────────────
-  it("invalidates on a PUT/DELETE style success that omits `changed`", () => {
-    // Daemon role PUT returns {ok:true}; DELETE returns {ok:true,existed}.
-    // Neither carries `changed`, so undefined !== false → invalidate.
-    expect(roleWriteShouldInvalidate(true, { ok: true })).toBe(true);
-    expect(roleWriteShouldInvalidate(true, { ok: true, existed: true })).toBe(true);
-  });
-
-  it("invalidates when apply reports a real write (changed:true)", () => {
+  it("invalidates when the daemon reports a real role-file write (changed:true)", () => {
+    // PUT with content → {ok:true,changed:true}; DELETE that removed a file →
+    // {ok:true,existed:true,changed:true}; apply real write → {ok:true,changed:true}.
+    expect(roleWriteShouldInvalidate(true, { ok: true, changed: true })).toBe(true);
+    expect(roleWriteShouldInvalidate(true, { ok: true, existed: true, changed: true })).toBe(true);
     expect(roleWriteShouldInvalidate(true, { ok: true, changed: true, byteLength: 42 })).toBe(true);
   });
 
-  it("invalidates even when the body is not JSON (defensive default)", () => {
-    // proxied text bodies parse to a string; a successful write we can't
-    // inspect should still refresh the badge rather than leave it stale.
+  it("invalidates a success that omits `changed` (fail-safe: refresh when unsure)", () => {
+    // A proxied text body we can't introspect, or any writer that doesn't emit
+    // `changed`, should still refresh the badge rather than leave it stale.
+    expect(roleWriteShouldInvalidate(true, { ok: true })).toBe(true);
     expect(roleWriteShouldInvalidate(true, "OK")).toBe(true);
     expect(roleWriteShouldInvalidate(true, null)).toBe(true);
   });
 
   // ── do NOT invalidate: nothing changed → busting the cache would just
-  //    punch through the 30s snapshot on the common preview click ─────────
+  //    punch through the 30s snapshot on a common no-op ─────────────────────
+  it("does not invalidate an injectMode-only PUT (changed:false, hasRole untouched)", () => {
+    // saveInjectMode() sends {injectMode} with no content → daemon writes only
+    // the .meta.json sidecar and reports changed:false.
+    expect(roleWriteShouldInvalidate(true, { ok: true, changed: false })).toBe(false);
+  });
+
+  it("does not invalidate a DELETE that removed nothing (existed/changed:false)", () => {
+    expect(roleWriteShouldInvalidate(true, { ok: true, existed: false, changed: false })).toBe(false);
+  });
+
   it("does not invalidate on apply preview (ok:true but changed:false)", () => {
     expect(
       roleWriteShouldInvalidate(true, { ok: true, preview: true, changed: false, wouldOverwrite: true }),
@@ -152,6 +160,6 @@ describe("roleWriteShouldInvalidate", () => {
   it("does not invalidate when the HTTP call failed (e.g. 409 chat_role_exists / 500)", () => {
     // upstream.ok is false for 4xx/5xx — never invalidate regardless of body.
     expect(roleWriteShouldInvalidate(false, { ok: false, error: "chat_role_exists" })).toBe(false);
-    expect(roleWriteShouldInvalidate(false, { ok: true })).toBe(false);
+    expect(roleWriteShouldInvalidate(false, { ok: true, changed: true })).toBe(false);
   });
 });

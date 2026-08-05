@@ -52,24 +52,30 @@ function optionalTrimmedString(value: unknown): string | undefined {
  * `hasRole` (per bot × chat) feeds the roles-page「已配置/未配置」badge and the
  * groups card, so a stale snapshot leaves the badge wrong for up to the 30s TTL
  * — and the refresh button can't fix it (it hits `/api/groups` without
- * `refresh=1`). We invalidate on every successful write, mirroring the oncall
- * bind/unbind path, with one exception: responses that explicitly report
- * `changed: false` (the `apply` route's `preview` mode, and no-op/refused
- * applies) did NOT touch any role file, so invalidating there would just punch
- * through the cache on the common preview click and undo the fan-out savings
- * this snapshot exists to provide.
+ * `refresh=1`). We invalidate on every successful write EXCEPT when the daemon
+ * reports `changed: false`, which means the role FILE was not touched:
+ *   - `apply` preview mode, and no-op / refused applies;
+ *   - an injectMode-only PUT (writes just the `.meta.json` sidecar — `hasRole`
+ *     is unchanged, so the common inject-mode toggle must not bust the cache);
+ *   - a DELETE that removed nothing (`existed:false`).
+ * Invalidating in those cases would punch through the 30s snapshot and undo the
+ * fan-out savings this cache exists to provide. Responses that omit `changed`
+ * entirely (e.g. a proxied text body we can't parse) still invalidate — a
+ * successful write we can't introspect should refresh rather than stay stale.
  */
 export function roleWriteShouldInvalidate(upstreamOk: boolean, body: unknown): boolean {
   if (!upstreamOk) return false;
   if (body && typeof body === "object" && !Array.isArray(body)) {
     const rec = body as Record<string, unknown>;
     if (rec.ok === false) return false;
-    // `apply` reports changed:false for preview / already-applied / missing;
-    // PUT/DELETE omit the field entirely (undefined !== false) → still invalidate.
+    // changed:false = daemon confirmed the role file was untouched (preview /
+    // injectMode-only / delete-not-found). Absent field (undefined !== false)
+    // → still invalidate, keeping the fail-safe "refresh when unsure" default.
     if (rec.changed === false) return false;
   }
   return true;
 }
+
 
 export function compactGroupsMatrix(matrix: GroupsMatrix): CompactGroupsSnapshot {
   return {

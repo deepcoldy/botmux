@@ -2251,7 +2251,12 @@ ipcRoute('PUT', '/api/roles/:chatId', async (req, res, p) => {
   try {
     if (hasContentField) writeRoleFile(cachedLarkAppId, p.chatId, content);
     if (injectMode !== undefined) writeRoleInjectMode(cachedLarkAppId, p.chatId, injectMode);
-    jsonRes(res, 200, { ok: true });
+    // `changed` reflects whether the role FILE (→ hasRole in the groups matrix)
+    // was written. An injectMode-only PUT touches just the .meta.json sidecar and
+    // leaves hasRole untouched, so it reports changed:false — the dashboard uses
+    // this to avoid needlessly busting its 30s groups-matrix snapshot on the
+    // common inject-mode toggle.
+    jsonRes(res, 200, { ok: true, changed: hasContentField });
   } catch (e) {
     jsonRes(res, 500, { ok: false, error: String(e) });
   }
@@ -2262,7 +2267,9 @@ ipcRoute('DELETE', '/api/roles/:chatId', async (_req, res, p) => {
   if (!isValidRoleChatId(p.chatId)) return jsonRes(res, 400, { ok: false, error: 'invalid_chat_id' });
   const existed = deleteRoleFile(cachedLarkAppId, p.chatId);
   deleteRoleInjectMode(cachedLarkAppId, p.chatId);
-  jsonRes(res, 200, { ok: true, existed });
+  // `changed` mirrors `existed`: a DELETE that removed nothing didn't flip
+  // hasRole, so the dashboard skips invalidating its groups-matrix snapshot.
+  jsonRes(res, 200, { ok: true, existed, changed: existed });
 });
 
 // ─── Role profile management (dashboard) ──────────────────────────────────
