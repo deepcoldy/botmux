@@ -236,7 +236,7 @@ import {
   isValidRiffSandboxCluster,
   type RiffBackendConfig,
 } from './adapters/backend/riff-backend.js';
-import { buildEffectiveMojoConfig, type EffectiveMojoConfig, type MojoConfig } from './adapters/backend/mojo-types.js';
+import { buildEffectiveMojoConfig, normalizeMojoConfig, type EffectiveMojoConfig } from './adapters/backend/mojo-types.js';
 import {
   prepareDirectSandbox,
   prepareCredentialOnlySandbox,
@@ -7718,20 +7718,32 @@ async function spawnCli(
   // PTY/tmux backends inject these into the child process env directly; riff
   // has no local process, so they go via config.env → the riff API's config.env.
   let riffBackendConfig = cfg.backendConfig;
-  // mojo: build ONE effective config that folds the host-owned session settings
-  // into the mojo-specific block. Without this the backend silently ignores
-  // everything botmux already resolved — repo selection (workingDir), the
-  // dashboard/setup `model`, `disableCliBypass`, `cliPathOverride` and the
-  // persisted session lineage — because EffectiveMojoConfig only ever saw the
-  // hand-written bots.json `mojo` block.
+  // mojo: combine the user's `mojo` block with the platform-owned launch identity
+  // into the ONE EffectiveMojoConfig the backend runs on. Without this the backend
+  // silently ignores everything botmux already resolved — repo selection
+  // (workingDir), the dashboard/setup `model`, `disableCliBypass`,
+  // `cliPathOverride` and the persisted session lineage.
   //
-  // Precedence: an explicit value in the `mojo` block wins (it is the more
-  // specific setting), the generic session value is the fallback.
+  // There is NO precedence question: the launch identity has exactly one source
+  // (the top-level bot fields, frozen onto the session). The `mojo` block is not
+  // a fallback for those keys — both config entry points reject them, and the
+  // builder strips any that slip through. Do not reintroduce a `block ?? generic`
+  // merge here; that was the double-entry-point bug.
   if (effectiveBackendType === 'mojo') {
+    // Defensive third gate. Both config doors already validate, but the IPC
+    // payload could be stale (written by an older daemon) or malformed, and the
+    // failure mode is a security one: `localDaemon: "false"` satisfies the
+    // sandbox check's `!== true` while being truthy when building the child env,
+    // i.e. isolation skipped AND host execution enabled. Refuse to launch rather
+    // than run in that state.
+    const validated = normalizeMojoConfig(cfg.backendConfig);
+    if (!validated.ok) {
+      throw new Error(`mojo config is invalid: ${validated.errors.join('; ')}`);
+    }
     // Shared with the daemon's workerless `/close` path (see
     // destroyOrphanedBackingSession) so a session that runs on a custom binary /
     // per-bot JWT can still be cancelled after its worker is gone.
-    riffBackendConfig = buildEffectiveMojoConfig(cfg.backendConfig as MojoConfig | undefined, {
+    riffBackendConfig = buildEffectiveMojoConfig(validated.value, {
       cliPathOverride: cfg.cliPathOverride,
       workingDir: cfg.workingDir,
       model: cfg.model,

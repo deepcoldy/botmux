@@ -83,6 +83,64 @@ export const MOJO_INTERNAL_KEY_OWNER: Readonly<Record<string, string>> = {
 };
 
 /**
+ * Control-plane fields that decide WHERE and AS WHOM a session executes:
+ * cloud-vs-host execution, the API endpoint, the PPE profile, and the
+ * workspace/agent it is routed to.
+ *
+ * These are frozen onto the session at creation (see MojoSessionIdentity). A live
+ * bot edit must never retroactively move an existing session between execution
+ * modes or tenants — a cold resume would otherwise resume, or a `/close` cancel,
+ * against a different endpoint than the one that created the remote session.
+ *
+ * Credentials (`jwt` / `jwtEnv` / `env`) are deliberately NOT here: they must
+ * stay live so a rotated token takes effect, and a plaintext JWT must not be
+ * persisted into session state.
+ */
+export const MOJO_IDENTITY_KEYS = [
+    'cloud',
+    'localDaemon',
+    'baseUrl',
+    'ppeEnv',
+    'workspaceId',
+    'agentId',
+] as const;
+
+/** The frozen control-plane identity, persisted on the session. */
+export type MojoSessionIdentity = Pick<MojoConfig, typeof MOJO_IDENTITY_KEYS[number]>;
+
+/**
+ * Pick just the control-plane identity out of a (already normalized) config.
+ * Absent keys are omitted rather than stored as undefined, so the frozen record
+ * stays a faithful snapshot of what was actually configured.
+ */
+export function pickMojoSessionIdentity(cfg: MojoConfig | undefined): MojoSessionIdentity {
+    const out: Record<string, unknown> = {};
+    if (!cfg) return out;
+    for (const key of MOJO_IDENTITY_KEYS) {
+        const value = (cfg as Record<string, unknown>)[key];
+        if (value !== undefined) out[key] = value;
+    }
+    return out;
+}
+
+/**
+ * Human-readable diff of two frozen identities, for the log line explaining why
+ * a session kept its original control plane. Empty array = identical.
+ */
+export function diffMojoSessionIdentity(
+    frozen: MojoSessionIdentity,
+    live: MojoSessionIdentity,
+): string[] {
+    const changes: string[] = [];
+    for (const key of MOJO_IDENTITY_KEYS) {
+        const a = (frozen as Record<string, unknown>)[key];
+        const b = (live as Record<string, unknown>)[key];
+        if (a !== b) changes.push(`${key}: ${JSON.stringify(a)} → ${JSON.stringify(b)}`);
+    }
+    return changes;
+}
+
+/**
  * The config MojoBackend actually runs on: user settings PLUS the platform-owned
  * launch identity resolved by the worker (live session) or reconstructed by the
  * daemon from the session's FROZEN values (workerless cancel).
@@ -264,4 +322,120 @@ export function buildEffectiveMojoConfig(
 function emptyToUndefined(value: string | undefined): string | undefined {
     const trimmed = value?.trim();
     return trimmed ? trimmed : undefined;
+}
+
+/** Outcome of validating a raw `mojo` config block. */
+export type MojoConfigNormalizeResult =
+    | { ok: true; value: MojoConfig }
+    | { ok: false; errors: string[] };
+
+/** Field-name → validator, so unknown keys are rejected rather than passed through. */
+const MOJO_FIELD_VALIDATORS: Readonly<Record<keyof MojoConfig, (v: unknown) => string | undefined>> = {
+    workspaceId: nonEmptyString,
+    agentId: nonEmptyString,
+    cloud: strictBoolean,
+    idleTimeoutSec: positiveInteger,
+    stream: strictBoolean,
+    systemPrompt: plainString,
+    jwt: nonEmptyString,
+    jwtEnv: envVarName,
+    baseUrl: httpUrl,
+    localDaemon: strictBoolean,
+    ppeEnv: nonEmptyString,
+    env: stringMap,
+};
+
+function strictBoolean(v: unknown): string | undefined {
+    // The reason this is strict rather than coerced: `localDaemon: "false"` used
+    // to satisfy `!== true` in the sandbox check (bypassing the local sandbox)
+    // while being truthy in buildEnv (setting AGENT_LOCAL_DAEMON=1). That
+    // combination skips isolation AND enables host execution.
+    return typeof v === 'boolean' ? undefined : 'must be a boolean (true/false, not a string)';
+}
+
+function positiveInteger(v: unknown): string | undefined {
+    return typeof v === 'number' && Number.isInteger(v) && v > 0
+        ? undefined
+        : 'must be a positive integer';
+}
+
+function plainString(v: unknown): string | undefined {
+    return typeof v === 'string' ? undefined : 'must be a string';
+}
+
+function nonEmptyString(v: unknown): string | undefined {
+    if (typeof v !== 'string') return 'must be a string';
+    return v.trim() ? undefined : 'must not be empty';
+}
+
+function envVarName(v: unknown): string | undefined {
+    if (typeof v !== 'string') return 'must be a string';
+    return /^[A-Za-z_][A-Za-z0-9_]*$/.test(v)
+        ? undefined
+        : 'must be a valid environment variable name';
+}
+
+function httpUrl(v: unknown): string | undefined {
+    if (typeof v !== 'string' || !v.trim()) return 'must be a non-empty string';
+    let parsed: URL;
+    try {
+        parsed = new URL(v);
+    } catch {
+        return 'must be a valid URL';
+    }
+    return parsed.protocol === 'http:' || parsed.protocol === 'https:'
+        ? undefined
+        : 'must be an http(s) URL';
+}
+
+function stringMap(v: unknown): string | undefined {
+    if (!v || typeof v !== 'object' || Array.isArray(v)) return 'must be a JSON object';
+    for (const [k, val] of Object.entries(v as Record<string, unknown>)) {
+        if (typeof val !== 'string') return `value for "${k}" must be a string`;
+    }
+    return undefined;
+}
+
+/**
+ * Validate a raw `mojo` block from ANY entry point (bots.json, `/config set
+ * mojo`, dashboard, or a defensive check before it reaches the worker).
+ *
+ * Fails closed on: unknown keys (typos like `cluod` would silently disable the
+ * cloud sandbox), internal launch-identity keys (they have top-level owners and
+ * are frozen on the session), and wrong types.
+ *
+ * Type strictness is a SECURITY requirement here, not tidiness — see
+ * strictBoolean for the concrete fail-open it prevents.
+ */
+export function normalizeMojoConfig(raw: unknown): MojoConfigNormalizeResult {
+    if (raw === undefined || raw === null) return { ok: true, value: {} };
+    if (typeof raw !== 'object' || Array.isArray(raw)) {
+        return { ok: false, errors: ['mojo must be a JSON object'] };
+    }
+
+    const errors: string[] = [];
+    const value: Record<string, unknown> = {};
+    const internal = new Set<string>(MOJO_INTERNAL_CONFIG_KEYS);
+
+    for (const [key, val] of Object.entries(raw as Record<string, unknown>)) {
+        if (internal.has(key)) {
+            errors.push(
+                `mojo.${key} is not configurable inside the mojo block — `
+                + `use the top-level \`${MOJO_INTERNAL_KEY_OWNER[key] ?? key}\` instead`,
+            );
+            continue;
+        }
+        const validate = MOJO_FIELD_VALIDATORS[key as keyof MojoConfig];
+        if (!validate) {
+            errors.push(`mojo.${key} is not a recognized setting`);
+            continue;
+        }
+        // An explicit `undefined` (from JSON round-trips) means "unset", not invalid.
+        if (val === undefined) continue;
+        const problem = validate(val);
+        if (problem) errors.push(`mojo.${key} ${problem}`);
+        else value[key] = val;
+    }
+
+    return errors.length > 0 ? { ok: false, errors } : { ok: true, value: value as MojoConfig };
 }

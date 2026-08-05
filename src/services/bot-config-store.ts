@@ -8,7 +8,7 @@
  * 聊天通道会被 IM 侧记录，引导新 bot / 换密钥仍走本机 `botmux setup`。授权额度
  * （grants / quota）由既有 `/grant` 负责，不在此重复。
  */
-import { MOJO_INTERNAL_CONFIG_KEYS } from '../adapters/backend/mojo-types.js';
+import { normalizeMojoConfig } from '../adapters/backend/mojo-types.js';
 import type { BotConfig } from '../bot-registry.js';
 import { getBot, readBotSkillPolicy } from '../bot-registry.js';
 import { republishResolvedAllowedUsersDescriptor, scheduleAllowedUsersResolveRetryFromMutation } from '../bot-registry.js';
@@ -319,7 +319,7 @@ export type CoerceResult =
   | { ok: true; value: unknown }
   // A few reasons carry detail (e.g. which keys were rejected), so this is a
   // union of literals plus those prefixed forms rather than a closed literal set.
-  | { ok: false; reason: 'invalid_bool' | 'invalid_enum' | 'invalid_cli' | 'invalid_dir' | 'invalid_number' | 'invalid_json' | 'reserved_env' | 'empty' | 'too_long' | `mojo_internal_key_top_level_only:${string}` };
+  | { ok: false; reason: 'invalid_bool' | 'invalid_enum' | 'invalid_cli' | 'invalid_dir' | 'invalid_number' | 'invalid_json' | 'reserved_env' | 'empty' | 'too_long' | `invalid_mojo_config: ${string}` };
 
 /**
  * 把一个**原始**字段值（来自卡片下拉/输入或别处）按字段 kind 解析校验成可落盘的
@@ -378,23 +378,14 @@ export function coerceConfigValue(spec: ConfigFieldSpec, raw: unknown): CoerceRe
           return Object.keys(sanitized).length ? { ok: true, value: sanitized } : { ok: false, reason: 'invalid_json' };
         }
         if (spec.configKey === 'mojo') {
-          if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-            return { ok: false, reason: 'invalid_json' };
+          // Same SHARED normalizer as the bots.json parser, so the two config
+          // doors cannot drift: unknown keys, internal launch-identity keys and
+          // wrong types are all rejected, and the reason is surfaced verbatim.
+          const normalized = normalizeMojoConfig(parsed);
+          if (!normalized.ok) {
+            return { ok: false, reason: `invalid_mojo_config: ${normalized.errors.join('; ')}` };
           }
-          // The platform-owned launch identity (binary / cwd / model / bypass /
-          // wrapper / lineage) has exactly one home: the top-level bot fields,
-          // which are FROZEN onto the session at creation. A second copy here
-          // would let a live edit override a frozen identity. Reject visibly
-          // rather than dropping it silently — a silent drop reads as "applied".
-          //
-          // Same key list as the bots.json parser (shared constant) so the two
-          // entry points cannot drift apart.
-          const internal = MOJO_INTERNAL_CONFIG_KEYS
-            .filter(k => k in (parsed as Record<string, unknown>));
-          if (internal.length > 0) {
-            return { ok: false, reason: `mojo_internal_key_top_level_only:${internal.join(',')}` };
-          }
-          return { ok: true, value: parsed };
+          return { ok: true, value: normalized.value };
         }
         return { ok: true, value: parsed };
       } catch {

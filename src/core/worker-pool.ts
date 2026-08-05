@@ -32,7 +32,13 @@ import { codexServiceTierBadge } from '../services/codex-service-tier.js';
 import { loadFrozenCards, saveFrozenCards } from '../services/frozen-card-store.js';
 import { hashUrlForLog, cancelRiffTaskById } from '../adapters/backend/riff-backend.js';
 import { cancelMojoSessionById } from '../adapters/backend/mojo-backend.js';
-import { buildEffectiveMojoConfig } from '../adapters/backend/mojo-types.js';
+import {
+  buildEffectiveMojoConfig,
+  diffMojoSessionIdentity,
+  MOJO_IDENTITY_KEYS,
+  pickMojoSessionIdentity,
+  type MojoConfig,
+} from '../adapters/backend/mojo-types.js';
 import { sanitizePerBotEnv } from './per-bot-env.js';
 import { logger } from '../utils/logger.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
@@ -952,6 +958,59 @@ function frozenSessionLaunchIdentity(
     cliPathOverride: ds.session.cliPathOverride ?? botCfg.cliPathOverride,
     wrapperCli: ds.session.wrapperCli ?? botCfg.wrapperCli,
   };
+}
+
+/**
+ * Resolve the mojo config a session must run on, freezing its control-plane
+ * identity the first time and honouring that snapshot forever after.
+ *
+ * Split by purpose:
+ *   - identity (cloud / localDaemon / baseUrl / ppeEnv / workspaceId / agentId)
+ *     comes from the FROZEN snapshot. A live edit must not move an existing
+ *     session between execution modes or tenants — a cold resume would continue,
+ *     and `/close` would cancel, against an endpoint that never created it.
+ *   - credentials (jwt / jwtEnv / env) and behaviour knobs (stream /
+ *     systemPrompt / idleTimeoutSec) stay LIVE, so a rotated token takes effect
+ *     and no plaintext JWT is persisted into session state.
+ *
+ * `freeze` is false on read-only paths (workerless cancel) so teardown never
+ * mutates session state; a session that predates this field then simply runs on
+ * live config, exactly as it did before.
+ */
+function sessionMojoConfig(
+  ds: DaemonSession,
+  botCfg: { mojo?: MojoConfig },
+  opts: { freeze: boolean },
+): MojoConfig {
+  const live = botCfg.mojo ?? {};
+  const liveIdentity = pickMojoSessionIdentity(live);
+
+  if (!ds.session.mojoIdentity) {
+    if (!opts.freeze) return live;
+    ds.session.mojoIdentity = liveIdentity;
+    sessionStore.updateSession(ds.session);
+    return live;
+  }
+
+  const frozen = ds.session.mojoIdentity;
+  const drift = diffMojoSessionIdentity(frozen, liveIdentity);
+  if (drift.length > 0) {
+    // Loud on purpose: the operator changed the control plane and this session is
+    // deliberately NOT following, which is otherwise invisible.
+    logger.warn(
+      `[${tag(ds)}] mojo control-plane config changed after session creation; `
+      + `keeping the frozen identity (${drift.join(', ')}). `
+      + 'Start a new session to use the new configuration.',
+    );
+  }
+  // Live credentials/behaviour, frozen identity.
+  const merged: Record<string, unknown> = { ...live };
+  for (const key of MOJO_IDENTITY_KEYS) {
+    const value = (frozen as Record<string, unknown>)[key];
+    if (value === undefined) delete merged[key];
+    else merged[key] = value;
+  }
+  return merged as MojoConfig;
 }
 
 function loadKnownBotOpenIdsForApp(larkAppId: string): Set<string> {
@@ -2206,7 +2265,11 @@ function destroyOrphanedBackingSession(ds: DaemonSession): void {
           // not persisted for a dead worker, so that one falls back to the bot's
           // configured working dir.
           const frozenLaunch = frozenSessionLaunchIdentity(ds, botCfg);
-          const launchCfg = buildEffectiveMojoConfig(botCfg.mojo, {
+          // freeze:false — teardown must not mutate session state. Cancel has to
+          // reach the endpoint/tenant that CREATED the remote session, so the
+          // frozen control plane matters here as much as the frozen binary.
+          const frozenMojo = sessionMojoConfig(ds, botCfg, { freeze: false });
+          const launchCfg = buildEffectiveMojoConfig(frozenMojo, {
             cliPathOverride: frozenLaunch.cliPathOverride,
             workingDir: ds.session.workingDir ?? botCfg.defaultWorkingDir ?? botCfg.workingDir,
             env: botCfg.env ? sanitizePerBotEnv(botCfg.env) : undefined,
@@ -4275,8 +4338,14 @@ export function forkWorker(
     // One backendConfig channel shared by the remote backends; the selector
     // picks the shape matching backendType. A mojo bot with no `mojo` block is
     // valid (all fields optional), so an undefined here is not an error.
+    //
+    // mojo goes through sessionMojoConfig so the control-plane identity frozen at
+    // creation survives a cold resume: without it, editing the bot between two
+    // messages would silently move a live session from cloud to host execution,
+    // or resume it against a different tenant/workspace than the one holding its
+    // remote session.
     backendConfig: botCfg.backendType === 'mojo' || agentCfg.cliId === 'mojo'
-      ? botCfg.mojo
+      ? sessionMojoConfig(ds, botCfg, { freeze: true })
       : botCfg.riff,
     riffParentTaskId: ds.session.riffParentTaskId,
     riffRepoDirs: ds.session.riffRepoDirs,

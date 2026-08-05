@@ -351,13 +351,17 @@ export class MojoBackend implements SessionBackend {
         // Consequence worth stating plainly: a mojo bot's blast radius is bounded
         // by --cloud, NOT by per-tool approval. Do not run one against a host
         // filesystem you care about.
-        if (!this.config.disableCliBypass) args.push('--yolo');
+        if (this.config.disableCliBypass !== true) args.push('--yolo');
         if (this.cliSessionId) args.push('-r', this.cliSessionId);
         if (this.config.model?.trim()) args.push('--model', this.config.model.trim());
         if (this.config.workspaceId) args.push('--workspace-id', this.config.workspaceId);
         if (this.config.agentId && !this.cliSessionId) args.push('--agent-id', this.config.agentId);
         // Run in the cloud sandbox instead of touching the bot host's filesystem.
-        if (this.config.cloud) args.push('--cloud');
+        // `=== true` to stay in lockstep with isMojoFullyRemote(), which decides
+        // the sandbox bypass. A truthy check here could add --cloud for a value
+        // the sandbox logic does NOT accept as proof of remote execution (or vice
+        // versa), and the two disagreeing is exactly what produces a fail-open.
+        if (this.config.cloud === true) args.push('--cloud');
         if (this.config.idleTimeoutSec) args.push('--idle-timeout', String(this.config.idleTimeoutSec));
         // Before the positional prompt, which must stay last. Placed after our own
         // flags so an operator's CLI_EXTRA_ARGS can override them.
@@ -661,7 +665,13 @@ export class MojoBackend implements SessionBackend {
         if (jwt) env.X_JWT_TOKEN = jwt;
         if (this.config.baseUrl) env.AGENT_BASE_URL = this.config.baseUrl;
         // A bot host must not run a local execution daemon on behalf of chat users.
-        env.AGENT_LOCAL_DAEMON = this.config.localDaemon ? '1' : '0';
+        // `=== true`, NOT truthy: this value also drives the sandbox bypass
+        // decision via isMojoFullyRemote(), which compares strictly. A truthy
+        // check here made the string "false" mean "local execution ON" while the
+        // sandbox check read it as "not local, safe to bypass" — isolation off and
+        // host execution on at once. Config is validated upstream; matching the
+        // comparison keeps the two in agreement even if something slips through.
+        env.AGENT_LOCAL_DAEMON = this.config.localDaemon === true ? '1' : '0';
         // Never let an interactive upgrade prompt pollute the NDJSON stream.
         env.MOJO_NO_UPDATE = '1';
         if (this.config.ppeEnv) env.MOJO_PPE_ENV = this.config.ppeEnv;
