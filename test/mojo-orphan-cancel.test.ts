@@ -251,12 +251,18 @@ describe('daemon wires the shared builder into the workerless path', () => {
     expect(start).toBeGreaterThanOrEqual(0);
     const region = src.slice(start, start + 3000);
 
-    const builder = region.indexOf('buildEffectiveMojoConfig(botCfg.mojo');
-    const call = region.indexOf('cancelMojoSessionById(launchCfg');
-    expect(builder).toBeGreaterThanOrEqual(0);
+    // The block also goes through sessionMojoConfig first, so the cancel reaches
+    // the endpoint/tenant that CREATED the remote session rather than whatever the
+    // bot points at now.
+    const frozen = region.indexOf("sessionMojoConfig(ds, botCfg, { freeze: false })");
+    const builder = region.indexOf('buildEffectiveMojoConfig(frozenMojo', frozen);
+    const call = region.indexOf('cancelMojoSessionById(launchCfg', builder);
+    expect(frozen).toBeGreaterThanOrEqual(0);
+    expect(builder).toBeGreaterThan(frozen);
     expect(call).toBeGreaterThan(builder);
-    // The bare block must not be handed to the cancel helper.
+    // Neither the bare block nor the live config may reach the cancel helper.
     expect(region).not.toContain('cancelMojoSessionById(botCfg.mojo');
+    expect(region).not.toContain('buildEffectiveMojoConfig(botCfg.mojo');
   });
 
   it('feeds the generic settings a dead worker cannot recover from SpawnOpts', () => {
@@ -301,5 +307,54 @@ describe('workerless cancel uses the FROZEN launch identity', () => {
     // which is what would resurrect a later-added wrapper.
     const frozenBranch = region.slice(region.indexOf('if (ds.session.agentFrozen)'), region.indexOf('// Legacy'));
     expect(frozenBranch).not.toContain('botCfg.');
+  });
+});
+
+describe('control-plane identity is frozen onto the session', () => {
+  const src = readSource('src/core/worker-pool.ts', 'utf-8');
+
+  it('routes both the spawn and the cancel path through sessionMojoConfig', () => {
+    // Exercising this for real needs a full DaemonSession plus registry, and the
+    // property being protected is precisely that the LIVE config is not used.
+    const fn = src.indexOf('function sessionMojoConfig');
+    expect(fn).toBeGreaterThanOrEqual(0);
+
+    // Cold resume / worker (re)spawn: freeze on first use, honour it after.
+    expect(src).toContain('sessionMojoConfig(ds, botCfg, { freeze: true })');
+    // Teardown must not mutate session state.
+    expect(src).toContain('sessionMojoConfig(ds, botCfg, { freeze: false })');
+    // The live block must not reach the backend config channel directly.
+    expect(src).not.toContain('? botCfg.mojo\n');
+  });
+
+  it('applies the frozen identity over live values, key by key', () => {
+    const fn = src.indexOf('function sessionMojoConfig');
+    const region = src.slice(fn, fn + 2600);
+    // Live credentials/behaviour are kept…
+    expect(region).toContain('...live');
+    // …while every identity key is overwritten from the frozen snapshot, including
+    // deleting a key that was NOT set at creation (otherwise a newly-added baseUrl
+    // or workspaceId would leak into an existing session).
+    expect(region).toContain('for (const key of MOJO_IDENTITY_KEYS)');
+    expect(region).toContain('delete merged[key]');
+  });
+
+  it('warns when the operator changed the control plane mid-session', () => {
+    const fn = src.indexOf('function sessionMojoConfig');
+    const region = src.slice(fn, fn + 2600);
+    // Silently not following a config change would be its own surprise.
+    expect(region).toContain('diffMojoSessionIdentity');
+    expect(region).toContain('logger.warn');
+  });
+
+  it('does not freeze on the read-only path for a legacy session', () => {
+    const fn = src.indexOf('function sessionMojoConfig');
+    const region = src.slice(fn, fn + 2600);
+    // A session predating this field must keep working, and teardown must never
+    // write to the session store.
+    const legacy = region.indexOf('if (!ds.session.mojoIdentity)');
+    const guard = region.indexOf('if (!opts.freeze) return live;', legacy);
+    expect(legacy).toBeGreaterThanOrEqual(0);
+    expect(guard).toBeGreaterThan(legacy);
   });
 });

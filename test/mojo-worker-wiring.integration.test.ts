@@ -51,6 +51,7 @@ node -e '
       AGENT_LOCAL_DAEMON: process.env.AGENT_LOCAL_DAEMON,
       X_JWT_TOKEN: process.env.X_JWT_TOKEN,
       WRAPPER_MARK: process.env.WRAPPER_MARK,
+      AGENT_BASE_URL: process.env.AGENT_BASE_URL,
     },
   }, null, 2));
 ' -- "$@"
@@ -321,17 +322,61 @@ describe('mojo worker wiring', () => {
     expect(invocation.argv[invocation.argv.length - 1]).toContain('hello mojo');
   }, 40_000);
 
-  it('does not launch a wrapper smuggled in through the mojo block', async () => {
-    // bots.json parsing now rejects this outright, so the only way it can still
-    // reach a worker is a stale/forged init payload. It must not take effect there
-    // either — paired with the cancel-path test in mojo-orphan-cancel.test.ts,
-    // this pins that both paths agree (review found run-bare / cancel-wrapped).
-    // NOTE: botEntry deliberately omits it, or loadBotConfigs would throw.
-    const { invocation } = await runWorker({
-      botEntry: { mojo: { cloud: true } },
-      init: { backendConfig: { cloud: true, wrapperCli: 'env WRAPPER_MARK=nested mojo' } },
-    });
-    expect(invocation.env.WRAPPER_MARK).toBeUndefined();
+  it('refuses a wrapper smuggled in through the mojo block', async () => {
+    // Previously this was silently dropped (run bare, cancel wrapped). Both config
+    // doors now reject it, and the worker's defensive gate refuses a stale/forged
+    // init payload carrying it — a wrapper that provides auth must never be
+    // reported as applied while running unwrapped.
+    const root = realpathSync(mkdtempSync(join(tmpdir(), 'botmux-mojo-blockwrap-')));
+    let child: ChildProcess | undefined;
+    const logs: string[] = [];
+    try {
+      const appId = 'app_mojo_blockwrap';
+      const botsPath = join(root, 'bots.json');
+      writeFileSync(botsPath, JSON.stringify([{
+        larkAppId: appId, larkAppSecret: 'secret',
+        cliId: 'mojo', backendType: 'mojo', mojo: { cloud: true },
+      }]));
+      writeFakeMojo(root);
+
+      const errors: string[] = [];
+      child = spawn(process.execPath, ['--import', 'tsx', resolve('src/worker.ts')], {
+        cwd: resolve('.'),
+        env: {
+          ...process.env,
+          HOME: root, SESSION_DATA_DIR: root, BOTS_CONFIG: botsPath,
+          BOTMUX_SESSION_ID: 'sid-mojo-blockwrap',
+          LARK_APP_ID: appId, LARK_APP_SECRET: 'secret',
+          PATH: `${root}:${process.env.PATH ?? ''}`,
+        },
+        stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+      });
+      child.stdout?.on('data', c => logs.push(c.toString()));
+      child.stderr?.on('data', c => logs.push(c.toString()));
+      child.on('message', raw => {
+        const msg = raw as WorkerToDaemon;
+        if (msg.type === 'error') errors.push(msg.message);
+      });
+
+      child.send({
+        type: 'init',
+        sessionId: 'sid-mojo-blockwrap', chatId: 'oc_x', rootMessageId: 'om_x',
+        workingDir: root, cliId: 'mojo', backendType: 'mojo',
+        backendConfig: { cloud: true, wrapperCli: 'env WRAPPER_MARK=nested mojo' } as never,
+        prompt: 'should not run', larkAppId: appId, larkAppSecret: 'secret',
+      } as DaemonToWorker);
+
+      await waitFor(
+        () => errors.length > 0,
+        20_000,
+        () => `expected a fail-closed wrapper error\n${logs.join('')}`,
+      );
+      // The error must name the top-level field that DOES own it.
+      expect(errors.join('\n')).toContain('wrapperCli');
+    } finally {
+      if (child && child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+      rmSync(root, { recursive: true, force: true });
+    }
   }, 40_000);
 
   it('lets CLI_EXTRA_ARGS override a built-in flag, wrapper or not', async () => {
@@ -353,6 +398,77 @@ describe('mojo worker wiring', () => {
       if (wrapperCli) expect(invocation.env.WRAPPER_MARK).toBe('wrapped');
     }
   }, 60_000);
+
+  it('refuses to launch on a stringified boolean instead of failing open', async () => {
+    // The security case: `localDaemon: "false"` satisfied the sandbox check's
+    // strict `!== true` (so local isolation was bypassed) while being truthy when
+    // the child env was built (so AGENT_LOCAL_DAEMON=1). Isolation off, host
+    // execution on. The worker now refuses rather than launching in that state.
+    const root = realpathSync(mkdtempSync(join(tmpdir(), 'botmux-mojo-badcfg-')));
+    let child: ChildProcess | undefined;
+    const logs: string[] = [];
+    try {
+      const appId = 'app_mojo_badcfg';
+      const botsPath = join(root, 'bots.json');
+      // bots.json intentionally holds a VALID block — this exercises the worker's
+      // defensive gate against a stale/malformed IPC payload, which is the path
+      // the two config doors cannot cover.
+      writeFileSync(botsPath, JSON.stringify([{
+        larkAppId: appId, larkAppSecret: 'secret',
+        cliId: 'mojo', backendType: 'mojo', mojo: { cloud: true },
+      }]));
+      writeFakeMojo(root);
+
+      const errors: string[] = [];
+      child = spawn(process.execPath, ['--import', 'tsx', resolve('src/worker.ts')], {
+        cwd: resolve('.'),
+        env: {
+          ...process.env,
+          HOME: root, SESSION_DATA_DIR: root, BOTS_CONFIG: botsPath,
+          BOTMUX_SESSION_ID: 'sid-mojo-badcfg',
+          LARK_APP_ID: appId, LARK_APP_SECRET: 'secret',
+          PATH: `${root}:${process.env.PATH ?? ''}`,
+        },
+        stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+      });
+      child.stdout?.on('data', c => logs.push(c.toString()));
+      child.stderr?.on('data', c => logs.push(c.toString()));
+      child.on('message', raw => {
+        const msg = raw as WorkerToDaemon;
+        if (msg.type === 'error') errors.push(msg.message);
+      });
+
+      child.send({
+        type: 'init',
+        sessionId: 'sid-mojo-badcfg', chatId: 'oc_x', rootMessageId: 'om_x',
+        workingDir: root, cliId: 'mojo', backendType: 'mojo',
+        backendConfig: { cloud: true, localDaemon: 'false' } as never,
+        prompt: 'should not run', larkAppId: appId, larkAppSecret: 'secret',
+      } as DaemonToWorker);
+
+      await waitFor(
+        () => errors.length > 0,
+        20_000,
+        () => `expected a fail-closed config error\n${logs.join('')}`,
+      );
+      expect(errors.join('\n')).toContain('localDaemon');
+    } finally {
+      if (child && child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 40_000);
+
+  it('routes to the configured control plane', async () => {
+    // Baseline for the freeze test below: baseUrl reaches the child as
+    // AGENT_BASE_URL, so a tenant switch is observable end to end.
+    const { invocation } = await runWorker({
+      botEntry: { mojo: { cloud: true, baseUrl: 'https://tenant-a.example.com', workspaceId: 'ws-a' } },
+      init: { backendConfig: { cloud: true, baseUrl: 'https://tenant-a.example.com', workspaceId: 'ws-a' } },
+    });
+    expect(invocation.env.AGENT_BASE_URL).toBe('https://tenant-a.example.com');
+    expect(invocation.argv).toContain('--workspace-id');
+    expect(invocation.argv[invocation.argv.indexOf('--workspace-id') + 1]).toBe('ws-a');
+  }, 40_000);
 
   it('refuses to start a locally-executing mojo bot that requested sandbox', async () => {
     // cloud is NOT set here, so tools would run on this host while the user
