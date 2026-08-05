@@ -148,6 +148,15 @@ export class MojoBackend implements SessionBackend {
     private launchPrefix: { bin: string; args: string[] } | null = null;
     /** Guard so the config-side wrapper resolution is attempted at most once. */
     private wrapperResolved = false;
+    /**
+     * Generic CLI args the worker composed for this session (today: CLI_EXTRA_ARGS,
+     * e.g. `--timeout 77`). The mojo adapter's buildArgs() returns [], so anything
+     * arriving here came from the worker's shared arg pipeline and must be applied
+     * to every turn — dropping it made the flag work with a wrapper configured
+     * (buildWrappedLaunch folds spawnArgs into the prefix) but silently vanish
+     * without one.
+     */
+    private extraCliArgs: string[] = [];
     private writeChain: Promise<void> = Promise.resolve();
 
     constructor(config: MojoBackendConfig, sessionId: string) {
@@ -176,6 +185,8 @@ export class MojoBackend implements SessionBackend {
         if (this.config.wrapperCli) {
             this.wrapperResolved = true;
             if (bin) {
+                // buildWrappedLaunch already folded the worker's generic args into
+                // this prefix, so they must NOT be added again below.
                 this.launchPrefix = { bin, args: [...args] };
                 logger.info(`[mojo] launch prefix from wrapperCli: ${bin} ${args.join(' ')}`);
             } else {
@@ -184,7 +195,15 @@ export class MojoBackend implements SessionBackend {
                     `[mojo] wrapperCli="${this.config.wrapperCli}" was configured but the worker `
                     + 'supplied no launch binary — running mojo unwrapped',
                 );
+                this.extraCliArgs = [...args];
             }
+        } else {
+            // No wrapper: `bin` is the adapter's empty resolvedBin and `args` is
+            // whatever the worker's generic pipeline produced.
+            this.extraCliArgs = [...args];
+        }
+        if (this.extraCliArgs.length > 0) {
+            logger.info(`[mojo] extra CLI args applied per turn: ${this.extraCliArgs.join(' ')}`);
         }
         logger.info(`[mojo] spawn ${this.sessionId} in ${this.resolveCwd() ?? '(inherited cwd)'} (headless CLI invoked per turn)`);
     }
@@ -337,6 +356,9 @@ export class MojoBackend implements SessionBackend {
         // Run in the cloud sandbox instead of touching the bot host's filesystem.
         if (this.config.cloud) args.push('--cloud');
         if (this.config.idleTimeoutSec) args.push('--idle-timeout', String(this.config.idleTimeoutSec));
+        // Before the positional prompt, which must stay last. Placed after our own
+        // flags so an operator's CLI_EXTRA_ARGS can override them.
+        args.push(...this.extraCliArgs);
         args.push(this.decorate(prompt));
         return args;
     }

@@ -45,9 +45,21 @@ export interface MojoBackendConfig {
     /** Persisted mojo session id, restored across daemon restarts. */
     resumeCliSessionId?: string;
     /**
-     * Launch prefix (BotConfig.wrapperCli), resolved by the worker into a real
-     * bin + args. MojoBackend re-applies it to EVERY per-turn invocation, since
-     * unlike a PTY CLI there is no single long-lived process to wrap once.
+     * INTERNAL, not a bots.json field. Mirrors the TOP-LEVEL
+     * `BotConfig.wrapperCli`, which is the single source of truth for the launch
+     * prefix across every CLI.
+     *
+     * It is carried here only so MojoBackend can re-apply the prefix to EVERY
+     * per-turn invocation (unlike a PTY CLI there is no single long-lived process
+     * to wrap once) and so the daemon's workerless cancel path can reconstruct
+     * the same launch.
+     *
+     * Deliberately NOT user-configurable inside the `mojo` block: the worker's
+     * wrapper handling (ttadk gateway injection, sandbox-takes-precedence, cjadk
+     * special-casing) is all built around the top-level field, so a second entry
+     * point would silently diverge — run through one wrapper, cancel through
+     * another. `buildEffectiveMojoConfig` ignores any value found in the block,
+     * and `/config set mojo` rejects it outright.
      */
     wrapperCli?: string;
     /**
@@ -181,8 +193,12 @@ export function buildEffectiveMojoConfig(
     const resume = block.resumeCliSessionId ?? generic.resumeCliSessionId;
     if (resume !== undefined) merged.resumeCliSessionId = resume;
 
-    const wrapperCli = block.wrapperCli ?? emptyToUndefined(generic.wrapperCli);
+    // Top-level ONLY — see MojoBackendConfig.wrapperCli. A value in the block is
+    // dropped here (and rejected at config time) rather than quietly winning,
+    // which would make the run path and the cancel path use different wrappers.
+    const wrapperCli = emptyToUndefined(generic.wrapperCli);
     if (wrapperCli !== undefined) merged.wrapperCli = wrapperCli;
+    else delete merged.wrapperCli;
 
     return merged;
 }

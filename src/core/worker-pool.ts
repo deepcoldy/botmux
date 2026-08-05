@@ -922,6 +922,38 @@ function sessionAgentConfig(
   };
 }
 
+/**
+ * READ-ONLY frozen launch identity, for teardown paths that must not mutate the
+ * session (sessionAgentConfig freezes and writes to the session store).
+ *
+ * Reads the values frozen at session creation, exactly like a live spawn would.
+ * Only a legacy session that was never frozen (`agentFrozen` unset) falls back to
+ * the live bot config, mirroring sessionAgentConfig's back-fill.
+ *
+ * This matters for cancelling an orphaned remote session: the remote session was
+ * created through THIS session's wrapper/binary, so cancelling it through a
+ * wrapper the bot gained later can hit the wrong gateway or tenant. And because
+ * `agentFrozen=true` with `wrapperCli=undefined` explicitly means "frozen as
+ * no-wrapper", inheriting a later-added wrapper would break that contract.
+ */
+function frozenSessionLaunchIdentity(
+  ds: DaemonSession,
+  botCfg: { cliPathOverride?: string; wrapperCli?: string },
+): { cliPathOverride?: string; wrapperCli?: string } {
+  if (ds.session.agentFrozen) {
+    return {
+      cliPathOverride: ds.session.cliPathOverride,
+      wrapperCli: ds.session.wrapperCli,
+    };
+  }
+  // Legacy, never frozen: it was launching off the live bot config, so that is
+  // the faithful reconstruction.
+  return {
+    cliPathOverride: ds.session.cliPathOverride ?? botCfg.cliPathOverride,
+    wrapperCli: ds.session.wrapperCli ?? botCfg.wrapperCli,
+  };
+}
+
 function loadKnownBotOpenIdsForApp(larkAppId: string): Set<string> {
   const dataDir = config.session.dataDir;
   let crossRef: Record<string, string> = {};
@@ -2165,13 +2197,20 @@ function destroyOrphanedBackingSession(ds: DaemonSession): void {
           // (cliPathOverride) nor the per-bot env holding the JWT, so a bot that
           // ran fine on a custom path/identity would fail to cancel here — the
           // remote session then keeps burning cloud sandbox time while still
-          // holding injected credentials. Session cwd is not persisted for a dead
-          // worker, so fall back to the bot's configured working dir.
+          // holding injected credentials.
+          //
+          // The launch IDENTITY (binary + wrapper) must come from the values
+          // FROZEN on the session, not from live bot config: the remote session
+          // was created through those, so cancelling through a wrapper the bot
+          // gained afterwards can reach the wrong gateway/tenant. Session cwd is
+          // not persisted for a dead worker, so that one falls back to the bot's
+          // configured working dir.
+          const frozenLaunch = frozenSessionLaunchIdentity(ds, botCfg);
           const launchCfg = buildEffectiveMojoConfig(botCfg.mojo, {
-            cliPathOverride: botCfg.cliPathOverride,
+            cliPathOverride: frozenLaunch.cliPathOverride,
             workingDir: ds.session.workingDir ?? botCfg.defaultWorkingDir ?? botCfg.workingDir,
             env: botCfg.env ? sanitizePerBotEnv(botCfg.env) : undefined,
-            wrapperCli: botCfg.wrapperCli,
+            wrapperCli: frozenLaunch.wrapperCli,
           });
           void cancelMojoSessionById(launchCfg, remoteId).then((ok) => {
             if (ok) logger.info(`[${tag(ds)}] killWorker: orphan mojo session ${remoteId} cancelled`);

@@ -316,7 +316,7 @@ export async function setBotAllowedUsers(
 
 export type CoerceResult =
   | { ok: true; value: unknown }
-  | { ok: false; reason: 'invalid_bool' | 'invalid_enum' | 'invalid_cli' | 'invalid_dir' | 'invalid_number' | 'invalid_json' | 'reserved_env' | 'empty' | 'too_long' };
+  | { ok: false; reason: 'invalid_bool' | 'invalid_enum' | 'invalid_cli' | 'invalid_dir' | 'invalid_number' | 'invalid_json' | 'reserved_env' | 'mojo_wrapper_cli_top_level_only' | 'empty' | 'too_long' };
 
 /**
  * 把一个**原始**字段值（来自卡片下拉/输入或别处）按字段 kind 解析校验成可落盘的
@@ -373,6 +373,20 @@ export function coerceConfigValue(spec: ConfigFieldSpec, raw: unknown): CoerceRe
           if (reserved.length > 0) return { ok: false, reason: 'reserved_env' };
           const sanitized = sanitizePerBotEnv(parsed);
           return Object.keys(sanitized).length ? { ok: true, value: sanitized } : { ok: false, reason: 'invalid_json' };
+        }
+        if (spec.configKey === 'mojo') {
+          if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+            return { ok: false, reason: 'invalid_json' };
+          }
+          // `wrapperCli` has exactly one home: the TOP-LEVEL bot field, which the
+          // worker's wrapper handling (ttadk gateway, sandbox precedence, cjadk)
+          // is built around. Accepting a second copy here would let the run path
+          // and the workerless cancel path use DIFFERENT wrappers. Reject visibly
+          // rather than dropping it silently — a silent drop reads as "applied".
+          if ('wrapperCli' in (parsed as Record<string, unknown>)) {
+            return { ok: false, reason: 'mojo_wrapper_cli_top_level_only' };
+          }
+          return { ok: true, value: parsed };
         }
         return { ok: true, value: parsed };
       } catch {
