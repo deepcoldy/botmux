@@ -143,6 +143,7 @@ import {
   getDaemonStreamingCardUsageSnapshot,
   isSessionTransferring,
   type WorkerSessionReplyOptions,
+  migrateMojoSessionIdentities,
 } from './core/worker-pool.js';
 import { AbortDeadlineError, hasExactSafeJsonKeys, ipcRoute, isTrustedHostIpcRequest, JsonBodyTooLargeError, jsonRes, readJsonBody, runWithAbortDeadline, setBotName, setLarkAppId, startIpcServer, setBotRenamer, setBotAvatarChanger, armCoreOnlyReadinessGate, setCoreOnlyReady } from './core/dashboard-ipc-server.js';
 import { setDeviceIsolationDaemonIdentity } from './core/device-isolation-daemon.js';
@@ -19099,6 +19100,13 @@ export async function startDaemon(botIndex?: number): Promise<void> {
 
   // Restore active sessions from previous run
   await restoreActiveSessions(activeSessions);
+
+  // Freeze the control plane of restored mojo sessions NOW, not at their next
+  // worker fork. Restore completes before the dispatcher can deliver a message,
+  // so this closes the window where an operator edits the bot's endpoint/workspace
+  // between the restart and a session's next wake — which would otherwise let that
+  // session adopt the NEW control plane as its original identity.
+  migrateMojoSessionIdentities(activeSessions);
 
   // Now that activeSessions is populated, release the forward-followup flush
   // barrier. Persisted seeds were loaded into the buffer at dispatcher startup

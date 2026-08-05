@@ -929,6 +929,44 @@ function sessionAgentConfig(
 }
 
 /**
+ * Freeze the control-plane identity of every restored mojo session at daemon
+ * startup, instead of waiting for each one's next worker fork.
+ *
+ * The lazy path left a window: after a restart but before a session was next
+ * woken, an operator could change the bot's endpoint/workspace, and the session
+ * would then adopt THAT as its "original" identity — pairing a remote lineage
+ * created on tenant A with tenant B. Migrating during restore closes it, because
+ * restore runs before the dispatcher can deliver a message.
+ *
+ * A legacy row that already holds a remote lineage cannot be migrated safely (no
+ * record of its original control plane), so sessionMojoConfig drops that lineage;
+ * this pass reuses the same helper so both entry points behave identically.
+ */
+export function migrateMojoSessionIdentities(activeSessions: Map<string, DaemonSession>): void {
+  let migrated = 0;
+  for (const ds of activeSessions.values()) {
+    const backendType = ds.initConfig?.backendType ?? ds.session.backendType;
+    if (backendType !== 'mojo') continue;
+    if (ds.session.mojoIdentity) continue;
+    let botCfg;
+    try {
+      botCfg = getBot(ds.larkAppId).config;
+    } catch {
+      // Bot deregistered — no config to freeze from. Leave the row untouched so a
+      // later re-registration can migrate it.
+      continue;
+    }
+    // freeze:true persists the snapshot (including an empty one, which is what
+    // distinguishes "frozen with nothing set" from "never frozen").
+    sessionMojoConfig(ds, botCfg, { freeze: true });
+    migrated += 1;
+  }
+  if (migrated > 0) {
+    logger.info(`[mojo] froze the control-plane identity of ${migrated} restored session(s)`);
+  }
+}
+
+/**
  * READ-ONLY frozen launch identity, for teardown paths that must not mutate the
  * session (sessionAgentConfig freezes and writes to the session store).
  *
@@ -986,6 +1024,30 @@ function sessionMojoConfig(
   const liveIdentity = pickMojoSessionIdentity(live);
 
   if (!ds.session.mojoIdentity) {
+    // Legacy row, never frozen. `undefined` means "predates this field"; an empty
+    // object means "frozen with nothing configured" and is NOT this branch — which
+    // is why migrateMojoSessionIdentities persists `{}` rather than skipping it.
+    //
+    // A row carrying a remote lineage has ALREADY created a session on some
+    // control plane, and nothing on disk records which one. Adopting today's
+    // config would silently pair that lineage with a possibly different
+    // tenant/workspace, so drop the lineage instead: the next message starts a
+    // fresh session on the current (known) control plane. Correctness over
+    // convenience — the alternative resumes, or cancels, against the wrong tenant.
+    if (ds.session.riffParentTaskId) {
+      logger.warn(
+        `[${tag(ds)}] mojo session has a remote lineage but no frozen control plane `
+        + '(created before this field existed). Dropping the lineage so the next '
+        + 'message starts fresh on the current configuration, rather than resuming '
+        + 'it against a control plane we cannot verify.',
+      );
+      ds.session.riffParentTaskId = undefined;
+      if (opts.freeze) {
+        ds.session.mojoIdentity = liveIdentity;
+        sessionStore.updateSession(ds.session);
+      }
+      return live;
+    }
     if (!opts.freeze) return live;
     ds.session.mojoIdentity = liveIdentity;
     sessionStore.updateSession(ds.session);

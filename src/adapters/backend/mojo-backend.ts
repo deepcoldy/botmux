@@ -51,6 +51,7 @@ import { locateOnPath } from '../cli/registry.js';
 import { buildWrappedLaunch } from '../../setup/cli-selection.js';
 import { logger } from '../../utils/logger.js';
 import type { SessionBackend, SpawnOpts } from './types.js';
+import { MOJO_CONTROL_ENV_KEYS } from './mojo-types.js';
 import type {
     MojoAuthStatus,
     EffectiveMojoConfig,
@@ -663,18 +664,33 @@ export class MojoBackend implements SessionBackend {
         const jwtKey = this.config.jwtEnv ?? 'X_JWT_TOKEN';
         const jwt = this.config.jwt ?? env[jwtKey];
         if (jwt) env.X_JWT_TOKEN = jwt;
+
+        // ── Control plane: config is the ONLY source ──────────────────────────
+        // Drop every inherited control-plane variable BEFORE re-deriving it. The
+        // mojo CLI reads its endpoint/profile/execution mode from env, so leaving
+        // an inherited value in place is a back door around the frozen identity:
+        // a live `env: { AGENT_BASE_URL: <tenant-b> }` would move an existing
+        // session to another tenant even though `baseUrl` itself is frozen. Note
+        // these were previously only CONDITIONALLY overwritten (`if (baseUrl)`),
+        // so a session whose frozen snapshot had no baseUrl silently inherited it.
+        //
+        // Unconditional delete also means "frozen as unset" is honoured: the CLI
+        // falls back to its own default instead of a value the operator added
+        // after this session was created.
+        for (const key of MOJO_CONTROL_ENV_KEYS) delete env[key];
+
         if (this.config.baseUrl) env.AGENT_BASE_URL = this.config.baseUrl;
+        if (this.config.ppeEnv) env.MOJO_PPE_ENV = this.config.ppeEnv;
         // A bot host must not run a local execution daemon on behalf of chat users.
         // `=== true`, NOT truthy: this value also drives the sandbox bypass
         // decision via isMojoFullyRemote(), which compares strictly. A truthy
         // check here made the string "false" mean "local execution ON" while the
         // sandbox check read it as "not local, safe to bypass" — isolation off and
-        // host execution on at once. Config is validated upstream; matching the
-        // comparison keeps the two in agreement even if something slips through.
+        // host execution on at once. Always written (never inherited), so an
+        // ambient AGENT_LOCAL_DAEMON=1 cannot enable host execution either.
         env.AGENT_LOCAL_DAEMON = this.config.localDaemon === true ? '1' : '0';
         // Never let an interactive upgrade prompt pollute the NDJSON stream.
         env.MOJO_NO_UPDATE = '1';
-        if (this.config.ppeEnv) env.MOJO_PPE_ENV = this.config.ppeEnv;
         return env;
     }
 

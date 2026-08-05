@@ -167,12 +167,21 @@ function resolveRemoteExecutionProven(ds: DaemonSession): boolean {
   const backendType = ds.initConfig?.backendType ?? ds.session.backendType;
   if (backendType === 'riff') return true;
   if (backendType !== 'mojo') return false;
+  // Precedence, most to least authoritative:
+  //   1. the config frozen onto the LIVE worker (what is actually executing)
+  //   2. the session's frozen control-plane identity — the single source of truth
+  //      for a workerless session. Reading live bot config here would misclassify
+  //      a session frozen as local (but since switched to cloud) as safe_remote,
+  //      and vice versa.
+  //   3. live bot config, ONLY for a legacy row that was never frozen
   const fromInit = ds.initConfig?.backendConfig as
     { cloud?: boolean; localDaemon?: boolean } | undefined;
-  // Prefer the config frozen onto the live worker; fall back to bot config for
-  // sessions restored without an initConfig.
   if (fromInit) return isMojoFullyRemote(fromInit);
+  if (ds.session.mojoIdentity) return isMojoFullyRemote(ds.session.mojoIdentity);
   try {
+    // Legacy migration branch only. Reached when the session predates
+    // `mojoIdentity` AND has not been through migrateMojoSessionIdentities yet
+    // (e.g. the bot was deregistered at restore time).
     return isMojoFullyRemote(getBot(ds.larkAppId).config.mojo);
   } catch {
     // Bot deregistered — no proof available, so assume local (fail closed).

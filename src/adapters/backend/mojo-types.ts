@@ -105,6 +105,23 @@ export const MOJO_IDENTITY_KEYS = [
     'agentId',
 ] as const;
 
+/**
+ * Environment variables that carry the SAME control-plane decisions as the frozen
+ * identity keys. They exist because the mojo CLI reads its endpoint/profile from
+ * env, which makes `env` a back door around the freeze: a live
+ * `env: { AGENT_BASE_URL: ... }` would move an existing session to another tenant
+ * even though `baseUrl` itself is frozen.
+ *
+ * buildEnv() therefore DELETES all of these after merging and re-derives them
+ * from the (frozen) config alone. `X_JWT_TOKEN` is deliberately absent: a rotated
+ * credential must keep taking effect.
+ */
+export const MOJO_CONTROL_ENV_KEYS = [
+    'AGENT_BASE_URL',
+    'MOJO_PPE_ENV',
+    'AGENT_LOCAL_DAEMON',
+] as const;
+
 /** The frozen control-plane identity, persisted on the session. */
 export type MojoSessionIdentity = Pick<MojoConfig, typeof MOJO_IDENTITY_KEYS[number]>;
 
@@ -124,8 +141,16 @@ export function pickMojoSessionIdentity(cfg: MojoConfig | undefined): MojoSessio
 }
 
 /**
- * Human-readable diff of two frozen identities, for the log line explaining why
- * a session kept its original control plane. Empty array = identical.
+ * Which control-plane keys differ between the frozen snapshot and live config,
+ * for the log line explaining why a session kept its original control plane.
+ * Empty array = identical.
+ *
+ * Returns KEY NAMES ONLY, never values. `baseUrl` is a URL that may legitimately
+ * carry userinfo (`https://user:pass@host`) or a signed query
+ * (`?sig=<token>`) — the URL validator allows both, because they are valid
+ * endpoints — so logging old/new values verbatim would write credentials into the
+ * daemon log. The key name is all an operator needs to know what changed; the
+ * value is already in their own config.
  */
 export function diffMojoSessionIdentity(
     frozen: MojoSessionIdentity,
@@ -135,7 +160,14 @@ export function diffMojoSessionIdentity(
     for (const key of MOJO_IDENTITY_KEYS) {
         const a = (frozen as Record<string, unknown>)[key];
         const b = (live as Record<string, unknown>)[key];
-        if (a !== b) changes.push(`${key}: ${JSON.stringify(a)} → ${JSON.stringify(b)}`);
+        if (a === b) continue;
+        // Booleans are not secrets and the transition is the whole point
+        // (cloud→host execution is the dangerous one), so those are shown.
+        changes.push(
+            typeof a === 'boolean' || typeof b === 'boolean'
+                ? `${key}: ${String(a)} → ${String(b)}`
+                : key,
+        );
     }
     return changes;
 }
@@ -390,8 +422,19 @@ function httpUrl(v: unknown): string | undefined {
 
 function stringMap(v: unknown): string | undefined {
     if (!v || typeof v !== 'object' || Array.isArray(v)) return 'must be a JSON object';
+    const control = new Set<string>(MOJO_CONTROL_ENV_KEYS);
     for (const [k, val] of Object.entries(v as Record<string, unknown>)) {
         if (typeof val !== 'string') return `value for "${k}" must be a string`;
+        // Reject rather than silently strip: buildEnv() removes these anyway, and
+        // an operator who sets AGENT_BASE_URL here would otherwise believe their
+        // endpoint took effect while the session kept its frozen one.
+        if (control.has(k)) {
+            const owner = k === 'AGENT_BASE_URL' ? 'baseUrl'
+                : k === 'MOJO_PPE_ENV' ? 'ppeEnv'
+                    : 'localDaemon';
+            return `must not set ${k} — it is control-plane state frozen per session; `
+                + `use the \`${owner}\` setting instead`;
+        }
     }
     return undefined;
 }
