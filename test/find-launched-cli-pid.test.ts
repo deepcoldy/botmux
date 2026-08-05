@@ -59,6 +59,24 @@ describe('findLaunchedCliPid()', () => {
     expect(findLaunchedCliPid(1, 'codex', 6, { childrenOf: (pid) => t[pid] ?? [], commOf: (pid) => c[pid] })).toBe(2);
   });
 
+  it('descends bwrap --unshare-pid supervisor → intermediate → traex leaf (sandbox)', () => {
+    // Empirically observed shape: node-pty/tmux launches `bwrap`, which forks an
+    // intermediate then execs traex in a new pid ns. getChildPid() returns the
+    // bwrap supervisor (500); the real traex leaf (502) holds the rollout fd and
+    // is host-visible via ps -A ppid links. The BFS must reach it.
+    const t: Record<number, number[]> = { 500: [501], 501: [502], 502: [] };
+    const c: Record<number, string> = { 500: 'bwrap', 501: 'bwrap', 502: 'traex' };
+    expect(findLaunchedCliPid(500, 'traex', 6, { childrenOf: (pid) => t[pid] ?? [], commOf: (pid) => c[pid] })).toBe(502);
+  });
+
+  it('returns null when bwrap has not yet exec\'d traex (bounded retry re-runs)', () => {
+    // At spawn, bwrap may not have forked the leaf yet — findLaunchedCliPid
+    // returns null and the caller's bounded retry re-runs on a later tick.
+    const t: Record<number, number[]> = { 500: [501], 501: [] };
+    const c: Record<number, string> = { 500: 'bwrap', 501: 'bwrap' };
+    expect(findLaunchedCliPid(500, 'traex', 6, { childrenOf: (pid) => t[pid] ?? [], commOf: (pid) => c[pid] })).toBeNull();
+  });
+
   it('terminates on cycles in the reported tree (seen guard)', () => {
     const cyc: Record<number, number[]> = { 1: [2], 2: [1] }; // 2 points back to 1
     const c: Record<number, string> = { 1: 'node', 2: 'sh' };

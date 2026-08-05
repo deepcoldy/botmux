@@ -269,20 +269,31 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
         ? pty.cliPid
         : undefined;
 
-      // The text match confirms the SUBMIT (a full-content match in the global
-      // submit log). The reported session id is a SEPARATE, weaker signal:
-      // history.jsonl is shared by every TRAE pane under one TRAE_HOME, so a
-      // sibling pane's identical text can surface a foreign id. Only return the
-      // id when THIS pid provably owns that rollout — otherwise confirm the
-      // submit WITHOUT an id so the worker never persists/attaches an unverified
-      // one. traexHistoryMatchDelta is called with no ownership filter: we do
-      // NOT want a foreign-first line to mask our own submit confirmation; we
-      // gate on ownership only for the returned id.
-      const confirmResult = (sid?: string) =>
-        sid && traexSidOwnedByPid(cliPid, sid)
-          ? { submitted: true as const, cliSessionId: sid }
-          : { submitted: true as const };
-      const matchNow = () => traexHistoryMatchDelta(historyPath, baseByte, content);
+      // Two separable facts, matched with two different scans:
+      //  - SUBMIT confirmation: any full-content match in the global submit log,
+      //    ownership-INDEPENDENT (a foreign-first line or unknown pid must never
+      //    suppress it, or the false "submission couldn't be confirmed" warning
+      //    this fix removes would come back).
+      //  - SESSION ID: history.jsonl is shared by every TRAE pane under one
+      //    TRAE_HOME, so a sibling's identical text can surface a foreign id.
+      //    Return the id ONLY when this pid provably owns that rollout.
+      // When a pid is enumerable, PREFER the owned scan: ownedMatch() passes an
+      // ownership filter so a foreign-first line is skipped and scanning
+      // continues to our own line (Codex's foreign-first→owned-later case). Only
+      // if no owned line is found do we fall back to the unfiltered any-text scan
+      // to confirm the submit without an id. Without a pid, there's nothing to
+      // own, so we just confirm the submit.
+      const ownedFilter = (sid: string | undefined): boolean => traexSidOwnedByPid(cliPid, sid);
+      const ownedMatch = () => cliPid
+        ? traexHistoryMatchDelta(historyPath, baseByte, content, ownedFilter)
+        : { found: false as const };
+      const anyMatch = () => traexHistoryMatchDelta(historyPath, baseByte, content);
+      // A confirmed submit: prefer the owned sid, else confirm without one.
+      const resolveConfirmed = () => {
+        const owned = ownedMatch();
+        if (owned.found && owned.cliSessionId) return { submitted: true as const, cliSessionId: owned.cliSessionId };
+        return anyMatch().found ? { submitted: true as const } : null;
+      };
 
       try {
         if (pty.pasteText) pty.pasteText(content);
@@ -294,20 +305,17 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
       if (!trySendEnter()) return { submitted: false };
 
       for (let attempt = 0; attempt < 3; attempt++) {
-        const match = matchNow();
-        if (match.found) return confirmResult(match.cliSessionId);
+        const confirmed = resolveConfirmed();
+        if (confirmed) return confirmed;
         await delay(800);
         if (!trySendEnter()) return { submitted: false };
       }
-      const finalMatch = matchNow();
-      if (finalMatch.found) return confirmResult(finalMatch.cliSessionId);
+      const finalConfirmed = resolveConfirmed();
+      if (finalConfirmed) return finalConfirmed;
       // In-band budget exhausted. Hand the worker a recheck closure: a slow or
       // busy TRAE may still append our history line after the retries gave up,
       // and the worker re-scans on a delay before warning the user.
-      const recheck = () => {
-        const late = matchNow();
-        return late.found ? confirmResult(late.cliSessionId) : false;
-      };
+      const recheck = () => resolveConfirmed() ?? false;
       return { submitted: false, recheck };
     },
 

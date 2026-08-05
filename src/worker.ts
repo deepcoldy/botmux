@@ -1183,6 +1183,11 @@ let lastSpawnEffectiveCliSessionId: string | undefined;
 let lastSpawnDeferInitialPrompt = false;
 let lastSpawnQueuedInitialPrompt: string | undefined;
 let lastSpawnQueuedInitialPromptLogicalContent: string | undefined;
+// True when this session runs under an outer bwrap supervisor (file sandbox OR
+// Linux credential-only bwrap) — both make getChildPid() the supervisor, not the
+// CLI leaf. credentialOnlyBwrap needs host probes so it can't be recomputed from
+// cfg at gate-check time; capture the spawn-time verdict for currentTraexObservedPid.
+let lastSpawnOuterBwrapActive = false;
 /**
  * True only when {@link shouldArmSpawnArgvInitialPromptBusy} says so: argv-
  * baked first prompt + SessionStart ready (Grok-class). First markPromptReady
@@ -3658,18 +3663,21 @@ function codexBridgeStartTimer(): void {
           cwd: lastInitConfig?.workingDir,
           pid: codexAdoptPendingPid,
         });
-        // Codex defense-in-depth: resolveFileBridgePath resolves sessionId-first,
-        // so a pending sid that is actually a shared-CODEX_HOME sibling's would
-        // resolve to that foreign rollout. Only attach when the resolved rollout's
-        // sid is one the observed pid actually holds open. This poller re-runs
-        // every 1s, so a lazily-opened owned fd is picked up on a later tick.
-        // Skip the gate only when we have no pid to prove ownership with (keeps
-        // the sid/pid resolution working for non-adopt / pid-less flows).
-        const attachOk = !(structuredBridgeIsCodex() && lastInitConfig?.adoptMode && path && currentCodexObservedPid())
-          || (() => {
-            const sid = codexSessionIdFromRolloutPath(path!);
-            return !!sid && codexHistorySidOwnedByCurrentPid(sid);
-          })();
+        // Codex/TRAE defense-in-depth: resolveFileBridgePath resolves
+        // sessionId-first, so a pending sid that is actually a shared-home
+        // sibling's (CODEX_HOME / TRAE_HOME) would resolve to that foreign
+        // rollout. Only attach when the resolved rollout's sid is one the
+        // observed pid actually holds open. This poller re-runs every 1s, so a
+        // lazily-opened owned fd is picked up on a later tick. Skip the gate
+        // only when we have no pid to prove ownership with (keeps the sid/pid
+        // resolution working for non-adopt / pid-less flows).
+        const codexAttachGated = structuredBridgeIsCodex() && lastInitConfig?.adoptMode && path && currentCodexObservedPid();
+        const traexAttachGated = structuredBridgeIsTraex() && lastInitConfig?.adoptMode && path && currentTraexObservedPid();
+        const attachOk = codexAttachGated
+          ? (() => { const sid = codexSessionIdFromRolloutPath(path!); return !!sid && codexHistorySidOwnedByCurrentPid(sid); })()
+          : traexAttachGated
+            ? (() => { const sid = codexSessionIdFromRolloutPath(path!); return !!sid && traexHistorySidOwnedByCurrentPid(sid); })()
+            : true;
         if (path && attachOk) {
           if (codexAdoptPendingPid && (lastInitConfig?.cliId === 'codex' || lastInitConfig?.cliId === 'traex')) {
             const discoveredSessionId = codexSessionIdFromRolloutPath(path);
@@ -3935,15 +3943,32 @@ function codexHistorySidOwnedByCurrentPid(cliSessionId: string): boolean {
   return owned;
 }
 
+/** Resolve the pid that actually holds a TRAE rollout open, given a candidate
+ *  that may be a bwrap supervisor. Under the file sandbox, botmux launches
+ *  `bwrap --unshare-pid -- traex`, so the tmux pane leaf / getChildPid() is the
+ *  bwrap process — its /proc/<pid>/fd holds no rollout, and the ownership gate
+ *  would always fail. The real traex leaf is host-visible across the pid ns
+ *  (ps -A ppid links), so a comm-based BFS descends to it. Outside the sandbox
+ *  (or if traex hasn't been forked yet) the candidate already is the leaf, so
+ *  we return it unchanged — fail closed to the launcher pid rather than guess. */
+function resolveTraexOwnershipPid(candidatePid: number, sandbox: boolean): number {
+  if (!sandbox || !candidatePid) return candidatePid;
+  return findLaunchedCliPid(candidatePid, 'traex') ?? candidatePid;
+}
+
 /** TRAE counterpart of currentCodexObservedPid: the pid of the TRAE process
  *  this worker observes (spawned child or adopted pane). Same resolution order
  *  — the wired backend.cliPid first, then the live pane child pid, then the
  *  adopt-pending pid (which is populated for TRAE too, see the codex/traex
- *  branch around line 3674). */
+ *  branch around line 3674). backend.cliPid is already sandbox-resolved at wire
+ *  time; the getChildPid() fallback is not, so descend it here too (no-op
+ *  outside the sandbox / when already a leaf). */
 function currentTraexObservedPid(): number | undefined {
-  return (backend as { cliPid?: number } | null)?.cliPid
-    ?? backend?.getChildPid?.()
-    ?? codexAdoptPendingPid;
+  const wired = (backend as { cliPid?: number } | null)?.cliPid;
+  if (wired) return wired;
+  const child = backend?.getChildPid?.();
+  if (child) return resolveTraexOwnershipPid(child, lastSpawnOuterBwrapActive);
+  return codexAdoptPendingPid;
 }
 
 /** Ownership gate for binding a TRAE session id that came from the GLOBAL
@@ -4136,6 +4161,19 @@ function codexBridgeNotifyCliSessionId(cliSessionId: string): void {
   if (structuredBridgeIsCodex() && lastInitConfig?.adoptMode && currentCodexObservedPid()) {
     if (!codexHistorySidOwnedByCurrentPid(cliSessionId)) {
       log(`Codex initial-attach refused for unverified session ${cliSessionId}; keeping poller armed on pid ${currentCodexObservedPid()}`);
+      codexBridgePendingSessionId = undefined;
+      codexBridgeStartTimer();
+      return;
+    }
+  }
+  // TRAE INITIAL attach: same shared-history.jsonl hazard as codex above. The
+  // TRAE adapter only returns an owned sid, but keep a defense-in-depth gate so
+  // a foreign sid from any other path can't first-attach the bridge in adopt
+  // mode. Fail closed identically: keep the poller armed on the adopt pid rather
+  // than pinning an unverified sid (which would wedge the bridge).
+  if (structuredBridgeIsTraex() && lastInitConfig?.adoptMode && currentTraexObservedPid()) {
+    if (!traexHistorySidOwnedByCurrentPid(cliSessionId)) {
+      log(`TRAE initial-attach refused for unverified session ${cliSessionId}; keeping poller armed on pid ${currentTraexObservedPid()}`);
       codexBridgePendingSessionId = undefined;
       codexBridgeStartTimer();
       return;
@@ -9615,6 +9653,36 @@ async function spawnCli(
   if (cliPid) startWrapperRealPidResolve(cliPid);
   if (cliPid) observeCursorCliSessionId(cliPid);
 
+  // File sandbox / Linux credential-only bwrap launches `bwrap --unshare-pid --
+  // traex`, so the pane leaf (getChildPid) is the bwrap SUPERVISOR — its
+  // /proc/<pid>/fd holds no rollout and the TRAE ownership gate can never admit
+  // a session id (fresh sandbox TRAE then never captures its SID, the bridge
+  // never attaches, and because reliableTurnTerminal disables screen-idle the
+  // durable turn can wedge — it does NOT self-heal). The real traex leaf is
+  // host-visible across the pid ns (ps -A ppid links), so BFS-descend to it and
+  // rewire backend.cliPid. Bounded retry (not one-shot): bwrap may not have
+  // forked traex yet at spawn. Reuses scheduleWrapperRealCliPid's stale-backend
+  // guard so a mid-retry worker restart can't rewire the new session. Gated on
+  // outerBwrapActive — sandboxRequested OR the Linux credential-only bwrap path,
+  // both of which produce an outer supervisor pid. */
+  const outerBwrapActive = sandboxRequested || credentialOnlyBwrap;
+  lastSpawnOuterBwrapActive = outerBwrapActive;
+  const startTraexSandboxPidResolve = (launcherPid: number): void => {
+    if (cfg.cliId !== 'traex' || !outerBwrapActive) return;
+    scheduleWrapperRealCliPid(launcherPid, {
+      findRealPid: (lp) => findLaunchedCliPid(lp, 'traex'),
+      getBackend: () => backend,
+      getChildPid: () => backend?.getChildPid?.(),
+      applyRealPid: (realPid) => {
+        log(`TRAE sandbox: resolved real traex leaf pid ${realPid} under bwrap supervisor ${launcherPid}; rewiring ownership pid`);
+        (backend as TmuxBackend | PtyBackend | ZellijBackend | ZmxBackend).cliPid = realPid;
+        (backend as TmuxBackend | PtyBackend | ZellijBackend | ZmxBackend).cliCwd = cfg.workingDir;
+        publishLocalProcessAttestation(realPid);
+      },
+      schedule: (fn, ms) => { setTimeout(fn, ms); },
+    });
+  };
+
   // Wire pid + cwd so adapters' writeInput can bind submits to this process:
   //   - claude-code: ~/.claude/sessions/<pid>.json
   //   - grok: findGrokSessionByPid → preferSessionId against shared
@@ -9622,16 +9690,24 @@ async function spawnCli(
   //   - traex: findTraexRolloutSetByPid → ownership gate for the shared global
   //     history.jsonl (concurrent same-TRAE_HOME panes must not cross-claim a
   //     sibling's session id from an identical-text submit). getChildPid() is
-  //     the tmux/pty pane leaf = the traex process (traex has no launcher
-  //     indirection; a rare wrapperCli+traex combo isn't rewired here, so its
-  //     unowned pid just fails closed — no wrong id, only lost id capture).
+  //     normally the traex process itself, EXCEPT under the file sandbox: bwrap
+  //     runs `--unshare-pid -- traex`, so the pane leaf is the bwrap supervisor
+  //     and /proc/<bwrap>/fd holds no rollout. resolveTraexOwnershipPid() BFS-
+  //     descends to the real traex leaf (host-visible across the pid ns via
+  //     `ps -A` ppid links) so the ownership gate can actually admit the id;
+  //     it fails closed to the launcher pid when no leaf is found yet (the async
+  //     retry below re-resolves once bwrap has forked traex).
   // Claude's sessionId is set ONCE at process start (2.1.123); a `--resume`
   // lookup will surface here, but in-pane `/clear` won't. The pinned
   // claudeJsonlPath above is still the initial guess; the resolver corrects
   // it on first write when Claude was started with `--resume`.
   if (cliPid && (claudeDataDir || cfg.cliId === 'grok' || cfg.cliId === 'traex')) {
-    (backend as TmuxBackend | PtyBackend | ZellijBackend | ZmxBackend).cliPid = cliPid;
+    // TRAE under outer bwrap: best-effort immediate resolve (leaf may already be
+    // forked), then a bounded retry below covers the not-yet-forked case.
+    const wiredPid = cfg.cliId === 'traex' ? resolveTraexOwnershipPid(cliPid, outerBwrapActive) : cliPid;
+    (backend as TmuxBackend | PtyBackend | ZellijBackend | ZmxBackend).cliPid = wiredPid;
     (backend as TmuxBackend | PtyBackend | ZellijBackend | ZmxBackend).cliCwd = cfg.workingDir;
+    if (cfg.cliId === 'traex' && outerBwrapActive) startTraexSandboxPidResolve(cliPid);
   }
 
   // Async pid fallback: tmux/pty resolve the CLI pid synchronously above, but
@@ -9660,8 +9736,10 @@ async function spawnCli(
           }
         }
         if (claudeDataDir || cfg.cliId === 'grok' || cfg.cliId === 'traex') {
-          (backend as TmuxBackend | PtyBackend | ZellijBackend | ZmxBackend).cliPid = pid;
+          const wiredPid = cfg.cliId === 'traex' ? resolveTraexOwnershipPid(pid, outerBwrapActive) : pid;
+          (backend as TmuxBackend | PtyBackend | ZellijBackend | ZmxBackend).cliPid = wiredPid;
           (backend as TmuxBackend | PtyBackend | ZellijBackend | ZmxBackend).cliCwd = cfg.workingDir;
+          if (cfg.cliId === 'traex' && outerBwrapActive) startTraexSandboxPidResolve(pid);
         }
         // wrapperCli under a late-pid backend (zellij): `pid` here is still the
         // LAUNCHER. Kick the descendant resolver so the bridge gets the real CLI

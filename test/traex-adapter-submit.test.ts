@@ -84,6 +84,32 @@ function ptyThatNeverCommits(cliPid?: number): PtyHandle & {
   return { write: vi.fn(), cliPid, pasteText: vi.fn(), sendSpecialKeys: vi.fn() };
 }
 
+/** A PTY whose Enter appends the SAME pasted text TWICE — first under a foreign
+ *  sibling's session id, THEN under the owned one. Models the shared-history
+ *  collision where a sibling pane's identical text lands first in history.jsonl
+ *  but our own owned line follows. The adapter must skip the foreign line and
+ *  return the owned id. */
+function ptyForeignThenOwned(foreignSid: string, ownedSid: string, cliPid?: number): PtyHandle & {
+  pasteText: ReturnType<typeof vi.fn>;
+  sendSpecialKeys: ReturnType<typeof vi.fn>;
+} {
+  let pasted = '';
+  let committed = false;
+  return {
+    write: vi.fn(),
+    cliPid,
+    pasteText: vi.fn((text: string) => { pasted = text; }),
+    sendSpecialKeys: vi.fn((key: string) => {
+      if (key === 'Enter' && !committed) {
+        committed = true;
+        mkdirSync(join(traeHome, 'cli'), { recursive: true });
+        appendFileSync(historyPath, historyLine(foreignSid, pasted));  // sibling first
+        appendFileSync(historyPath, historyLine(ownedSid, pasted));    // ours next
+      }
+    }),
+  };
+}
+
 describe.sequential('TRAE adapter submit verification (history.jsonl)', () => {
   beforeEach(() => {
     previousTraeHome = process.env.TRAE_HOME;
@@ -192,6 +218,21 @@ describe.sequential('TRAE adapter submit verification (history.jsonl)', () => {
 
     expect(result).toEqual({ submitted: true });
     expect((result as any).cliSessionId).toBeUndefined();
+  });
+
+  it('returns the OWNED id when a foreign sibling line is written first, ours later', async () => {
+    // Codex regression: an unfiltered matcher returns at the FIRST matching line,
+    // so a foreign-first line would mask our owned line and drop the id even
+    // though we own a later one. With an enumerable pid, the owned scan skips the
+    // foreign line and keeps scanning to ours — returning SID_1, not undefined.
+    const ownedPid = spawnRolloutHolder(SID_1);
+    await new Promise(r => setTimeout(r, 150));
+    const adapter = createTraexAdapter('/bin/traex');
+    const pty = ptyForeignThenOwned(SID_2, SID_1, ownedPid);
+
+    const result = await adapter.writeInput(pty, 'duplicate text foreign-first');
+
+    expect(result).toEqual({ submitted: true, cliSessionId: SID_1 });
   });
 
   it('withholds the id when fd enumeration is unavailable (pid not running)', async () => {

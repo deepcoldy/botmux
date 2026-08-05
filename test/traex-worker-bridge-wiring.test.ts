@@ -90,6 +90,53 @@ describe('TRAE worker structured-bridge wiring', () => {
     expect(matches.length).toBeGreaterThanOrEqual(2);
   });
 
+  it('gates the TRAE INITIAL bridge attach on pid-fd ownership (adopt mode)', () => {
+    // The initial-attach path (no prior rollout bound) must refuse a foreign
+    // shared-history sid, mirroring the codex initial-attach gate. Fail closed:
+    // keep the poller armed rather than pinning an unverified sid.
+    expect(workerSource).toContain('TRAE initial-attach refused for unverified session');
+    const idx = workerSource.indexOf('TRAE initial-attach refused');
+    const ctx = workerSource.slice(workerSource.lastIndexOf('if (structuredBridgeIsTraex()', idx), idx + 200);
+    expect(ctx).toContain("lastInitConfig?.adoptMode && currentTraexObservedPid()");
+    expect(ctx).toContain('traexHistorySidOwnedByCurrentPid(cliSessionId)');
+  });
+
+  it('gates the TRAE adopt poller attach on resolved-rollout ownership', () => {
+    // The 1s poller resolves a pending sid to a rollout path (sessionId-first),
+    // so a shared-TRAE_HOME sibling sid would resolve to a foreign rollout.
+    // attachOk must verify the resolved rollout's sid is pid-owned before
+    // attaching (and before it persists the discovered sid for traex).
+    expect(workerSource).toContain('traexAttachGated');
+    const idx = workerSource.indexOf('const codexAttachGated');
+    const ctx = workerSource.slice(idx, idx + 700);
+    expect(ctx).toContain("structuredBridgeIsTraex() && lastInitConfig?.adoptMode");
+    expect(ctx).toContain('traexHistorySidOwnedByCurrentPid(sid)');
+  });
+
+  it('resolves the real traex leaf under an outer bwrap supervisor (sandbox pid)', () => {
+    // Under the file sandbox / credential-only bwrap, getChildPid() is the bwrap
+    // supervisor, not traex. resolveTraexOwnershipPid BFS-descends to the leaf so
+    // the ownership gate can admit the id; gated on outerBwrapActive (sandbox OR
+    // credential-only bwrap, since both produce an outer supervisor).
+    const start = workerSource.indexOf('function resolveTraexOwnershipPid');
+    const body = workerSource.slice(start, workerSource.indexOf('\n}\n', start));
+    expect(body).toContain("findLaunchedCliPid(candidatePid, 'traex')");
+    expect(workerSource).toContain('const outerBwrapActive = sandboxRequested || credentialOnlyBwrap;');
+  });
+
+  it('drives the sandbox leaf resolver as a BOUNDED RETRY (leaf may not be forked yet)', () => {
+    // One-shot resolution loses the common case where bwrap has not exec'd traex
+    // at wire time. startTraexSandboxPidResolve reuses scheduleWrapperRealCliPid
+    // (the same bounded-retry + stale-backend guard as the wrapperCli resolver),
+    // and both the sync and zellij-async wiring sites kick it.
+    const start = workerSource.indexOf('const startTraexSandboxPidResolve');
+    const body = workerSource.slice(start, start + 900);
+    expect(body).toContain('scheduleWrapperRealCliPid(launcherPid');
+    expect(body).toContain("findLaunchedCliPid(lp, 'traex')");
+    const kicks = workerSource.match(/if \(cfg\.cliId === 'traex' && outerBwrapActive\) startTraexSandboxPidResolve\(/g) ?? [];
+    expect(kicks.length).toBeGreaterThanOrEqual(2);
+  });
+
 
   it('follows the adopted TRAE pid so direct local /new rotation is observable', () => {
     expect(workerSource).toContain('maybeFollowTraexSessionRotationViaPid();');
