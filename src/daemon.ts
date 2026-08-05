@@ -15373,14 +15373,14 @@ function isInitialSessionPassthrough(larkAppId: string, cmd: string): boolean {
 /** `/fast` is a passthrough keystroke to Codex's native tier toggle — it only
  *  reaches the executor on a real paste TUI. In RPC input mode the pane is a
  *  pure viewer (turns go over JSON-RPC, keystrokes never reach the app-server),
- *  and the Riff backend turns the text+Enter into two remote task writes. On
- *  those backends the toggle is a silent no-op (or worse), so fail closed:
+ *  and a remote backend (riff / mojo) turns the text+Enter into two independent
+ *  remote turns. On those backends the toggle is a silent no-op (or worse), so fail closed:
  *  reject with a clear message instead of pretending it worked. The read-only
  *  card badge is unaffected — it reflects whatever tier Codex actually runs. */
 function fastToggleUnsupportedBackend(ds: DaemonSession | undefined): boolean {
   if (!ds) return false;
   const backendType = ds.initConfig?.backendType ?? ds.session.backendType;
-  if (backendType === 'riff') return true;
+  if (backendType === 'riff' || backendType === 'mojo') return true;
   return ds.initConfig?.codexRpcInput === true;
 }
 

@@ -1603,11 +1603,12 @@ async function runStartupCommands(): Promise<void> {
   if (!cmds || cmds.length === 0) return;
   if (lastInitConfig?.adoptMode) return;
   if (!backend) return;
-  // riff：generic startupCommands 是 PTY 语义（sendRawCommandLine = write 文本 +
-  // 200ms 后 write 回车），对 RiffBackend 每条会裂成两个远端任务并打乱血缘。
-  // riff 的初始化命令走自己的 riff.setupCommands（沙箱内执行），这里必须跳过。
-  if (effectiveBackendType === 'riff') {
-    log(`Skipping ${cmds.length} generic startup command(s) — riff backend uses riff.setupCommands instead`);
+  // 远端后端：generic startupCommands 是 PTY 语义（sendRawCommandLine = write 文本 +
+  // 200ms 后 write 回车），对 riff/mojo 每条会裂成两个独立远端 turn 并打乱血缘。
+  // riff 的初始化命令走自己的 riff.setupCommands（沙箱内执行）；mojo 无对应机制，
+  // 其环境准备由 --cloud 沙箱镜像负责。两者这里都必须跳过。
+  if (effectiveBackendType === 'riff' || effectiveBackendType === 'mojo') {
+    log(`Skipping ${cmds.length} generic startup command(s) — ${effectiveBackendType} backend has no PTY to drive`);
     return;
   }
   log(`Running ${cmds.length} startup command(s) before first prompt`);
@@ -4786,10 +4787,10 @@ function sendTermActionOnce(target: SessionBackend, key: TermActionKey): void | 
 }
 
 async function handleTermAction(key: TermActionKey): Promise<void> {
-  // riff：没有远端终端可驱动——把控制字符 write 进 RiffBackend 会变成一个内容为
-  // ANSI 序列的 follow-up 任务（^C 也不会 cancel 任务），必须整体拒绝。
-  if (effectiveBackendType === 'riff') {
-    log(`term_action '${key}' ignored — riff backend has no local terminal to drive`);
+  // 远端后端：没有终端可驱动——把控制字符 write 进 riff/mojo 会变成一个内容为
+  // ANSI 序列的 follow-up turn（^C 也不会 cancel 远端执行），必须整体拒绝。
+  if (effectiveBackendType === 'riff' || effectiveBackendType === 'mojo') {
+    log(`term_action '${key}' ignored — ${effectiveBackendType} backend has no local terminal to drive`);
     return;
   }
   if (!backend) return;
@@ -6605,10 +6606,11 @@ async function flushPending(): Promise<void> {
   const sessionRenameReady = isPromptReady && pendingSessionRename !== null;
   const rawInputReady = isPromptReady && pendingRawInputs.length > 0;
   let supportedSessionRenameReady = sessionRenameReady;
-  if (sessionRenameReady && (!cliAdapter.buildSessionRenameCommand || effectiveBackendType === 'riff')) {
+  const renameOnRemoteBackend = effectiveBackendType === 'riff' || effectiveBackendType === 'mojo';
+  if (sessionRenameReady && (!cliAdapter.buildSessionRenameCommand || renameOnRemoteBackend)) {
     pendingSessionRename = null;
     supportedSessionRenameReady = false;
-    log(`Ignoring native session rename — unsupported by ${cliName()}${effectiveBackendType === 'riff' ? ' on riff backend' : ''}`);
+    log(`Ignoring native session rename — unsupported by ${cliName()}${renameOnRemoteBackend ? ` on ${effectiveBackendType} backend` : ''}`);
     if (pendingMessages.length === 0 && pendingRawInputs.length === 0) return;
   }
   if (!isPromptReady && pendingMessages.length === 0) return;

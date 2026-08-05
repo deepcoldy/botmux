@@ -72,7 +72,7 @@ import * as scheduler from './scheduler.js';
 import { listActiveSessions, findActiveBySessionId, closeSession, getActiveSessionsRegistry, transferSession, deliverWriteLinkCardToOwners, forkWorker, suspendWorker, killWorker, latestPerBotEnvForRestart, getDaemonReplyCardUsageSnapshot, sessionSupportsWebTerminal, sendWorkerSessionInput, isSessionTransferring } from './worker-pool.js';
 import { listOnlineDaemons } from '../utils/daemon-discovery.js';
 import { isSessionStopped } from './session-liveness.js';
-import { isSuspendableBackendType } from './persistent-backend.js';
+import { isRemoteBackendType, isRemoteCliId, isSuspendableBackendType } from './persistent-backend.js';
 import { getChatMode, replyMessage, sendMessage, resolveUnionIdFromOpenId, listThreadMessages, listChatMessages, listChatMessagesUntil, listChatBotMembers, getUserProfile, getUserProfileStrict, resolveAllowedUsersWithMap, type ChatBotMember } from '../im/lark/client.js';
 import { parseApiMessage, cardContentHasUpgradeFallback, resolveMergedCardContent, messageMentionsBot } from '../im/lark/message-parser.js';
 import { resumeSession, spawnDashboardSession, activateQueuedSession, closeCliMismatchedSessionsForBot, suspendActiveSessionsForBot } from './session-manager.js';
@@ -3386,13 +3386,14 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
       delete entry.readIsolation;
       readIsolationCleared = true;
     }
-    // cliId=riff → backendType 自动设为 riff（否则 spawn 走 pty 后端找不到本地二进制）。
-    if (selected.cliId === 'riff') {
-      entry.backendType = 'riff';
-    } else if (entry.backendType === 'riff') {
-      // 从 riff 切回其它 CLI：清掉这个自动配对的 backend override，回落 daemon
-      // 默认后端——否则新 CLI 会跑在 RiffBackend 上（PTY 分块输入被当成一串 riff
-      // 任务）。手动的 pty/tmux/herdr/zellij override 不受影响（它们不会是 riff）。
+    // 远端 CLI（riff / mojo）→ backendType 自动设为同名后端（否则 spawn 走 pty
+    // 后端，而它们的 resolvedBin 是空串）。
+    if (isRemoteCliId(selected.cliId)) {
+      entry.backendType = selected.cliId as typeof entry.backendType;
+    } else if (entry.backendType && isRemoteBackendType(entry.backendType)) {
+      // 从远端 CLI 切回其它 CLI：清掉这个自动配对的 backend override，回落 daemon
+      // 默认后端——否则新 CLI 会跑在远端 Backend 上（PTY 分块输入被当成一串远端
+      // turn）。手动的 pty/tmux/herdr/zellij override 不受影响（它们不是远端后端）。
       delete entry.backendType;
     }
     return { write: true, result: null };
@@ -3407,9 +3408,9 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
   else bot.config.wrapperCli = undefined;
   bot.config.model = model || undefined;
   if (readIsolationCleared) bot.config.readIsolation = false;
-  if (selected.cliId === 'riff') {
-    bot.config.backendType = 'riff';
-  } else if (bot.config.backendType === 'riff') {
+  if (isRemoteCliId(selected.cliId)) {
+    bot.config.backendType = selected.cliId as typeof bot.config.backendType;
+  } else if (bot.config.backendType && isRemoteBackendType(bot.config.backendType)) {
     bot.config.backendType = undefined;
   }
 

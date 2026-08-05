@@ -105,6 +105,12 @@ export function isRemoteBackendType(type: BackendType): boolean {
   return REMOTE_CLI_IDS.has(type);
 }
 
+/** True for a CLI whose backend is remote. By construction the cliId and its
+ *  backendType share a name, so callers pairing the two can reuse the id. */
+export function isRemoteCliId(cliId: string | undefined): boolean {
+  return cliId !== undefined && REMOTE_CLI_IDS.has(cliId);
+}
+
 /**
  * Enforce the `cliId === <remote> ⇔ backendType === <remote>` pairing invariant
  * at the ONE spawn chokepoint, so every config entry point (dashboard, `/config

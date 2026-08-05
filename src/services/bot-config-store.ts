@@ -91,8 +91,9 @@ export const CONFIG_FIELDS: readonly ConfigFieldSpec[] = [
   { key: 'canTalkDaemonCommands', configKey: 'canTalkDaemonCommands', kind: 'stringList', effect: 'immediate', clearable: true, parseList: parseCanTalkDaemonCommandsInput, hint: '把列出的 daemon 命令权限从 canOperate（仅管理员）降到 canTalk（对话放行即可用），如 /status /help；仅认 daemon 命令，透传命令无效；unset 回全部仅管理员' },
   { key: 'startupCommands', configKey: 'startupCommands', kind: 'stringList', effect: 'next-session', clearable: true, parseList: parseStartupCommandsInput, hint: '开会话后、首条消息前自动发给 CLI 的命令（逗号/换行分隔，可带参数，如 /effort ultracode）；unset 回不发' },
   { key: 'env', configKey: 'env', kind: 'json', effect: 'next-session', clearable: true, hint: 'per-bot 环境变量 JSON（如 {"ANTHROPIC_BASE_URL":"…","ANTHROPIC_AUTH_TOKEN":"…"} 让本 bot 走 GLM/第三方服务商，或设 HTTPS_PROXY）；注入到本 bot 的 CLI 进程，下个会话生效；值不显示（脱敏）；unset 清除' },
-  { key: 'backendType', configKey: 'backendType', kind: 'enum', effect: 'next-session', clearable: true, enumValues: ['pty', 'tmux', 'herdr', 'zellij', 'zmx', 'riff'], hint: '会话后端类型：pty=本地 PTY 子进程（默认）｜tmux=tmux 会话｜herdr=herdr 终端复用｜zellij=zellij 多路复用｜zmx=ZMX >=0.7.0 纯文本持久会话（无 Web TUI）｜riff=远程 riff agent 服务；选 riff 时需配置 riff 字段；unset 回 pty' },
+  { key: 'backendType', configKey: 'backendType', kind: 'enum', effect: 'next-session', clearable: true, enumValues: ['pty', 'tmux', 'herdr', 'zellij', 'zmx', 'riff', 'mojo'], hint: '会话后端类型：pty=本地 PTY 子进程（默认）｜tmux=tmux 会话｜herdr=herdr 终端复用｜zellij=zellij 多路复用｜zmx=ZMX >=0.7.0 纯文本持久会话（无 Web TUI）｜riff=远程 riff agent 服务｜mojo=远程 mojo agent（headless mojo CLI）；选 riff 时需配置 riff 字段，mojo 字段可选；unset 回 pty' },
   { key: 'riff', configKey: 'riff', kind: 'json', effect: 'next-session', clearable: true, hint: 'riff 后端配置 JSON（baseUrl/agent/model/jwt 等），仅 backendType=riff 时生效；unset 清除' },
+  { key: 'mojo', configKey: 'mojo', kind: 'json', effect: 'next-session', clearable: true, hint: 'mojo 后端配置 JSON（model/cloud/jwt/workspaceId 等，全部可选），仅 backendType=mojo 时生效；unset 清除' },
 ];
 
 /** 大小写不敏感地按 key 找字段 spec。 */
@@ -129,9 +130,11 @@ function formatFieldValue(spec: ConfigFieldSpec, value: unknown): string {
     const keys = obj ? Object.keys(obj) : [];
     return keys.length ? keys.map(k => `${k}=••••`).join(', ') : '∅';
   }
-  // riff 配置可含 secret（jwt / env 值）。聊天可见渲染（/config get、配置卡）
+  // riff / mojo 配置可含 secret（jwt / env 值）。聊天可见渲染（/config get、配置卡）
   // 与 applyConfigField 的变更日志都走本函数——结构可见、值打码。
-  if (spec.configKey === 'riff') {
+  // ⚠️ 漏掉任一个都会让它落进下面的通用 json 分支被 JSON.stringify 原样输出，
+  // 即把 jwt 明文发到聊天里。新增带 secret 的后端配置块时必须同步加进来。
+  if (spec.configKey === 'riff' || spec.configKey === 'mojo') {
     const obj = value && typeof value === 'object' && !Array.isArray(value)
       ? (value as Record<string, unknown>) : null;
     if (!obj || Object.keys(obj).length === 0) return '∅';

@@ -67,8 +67,11 @@ const RAW_CLI_EXECUTABLES: Readonly<Record<CliId, string | undefined>> = {
   'kiro-cli': 'kiro-cli',
   // API-backed; no local executable is required.
   riff: undefined,
-  // Headless CLI invoked per turn by MojoBackend, not spawned by the worker.
-  mojo: undefined,
+  // The worker never spawns this (MojoBackend shells out per turn), but the
+  // binary DOES have to exist locally — unlike riff/mira, which are pure HTTP.
+  // Declaring it lets `botmux setup` fail fast on a missing install instead of
+  // letting the first IM message die with ENOENT.
+  mojo: 'mojo',
 };
 
 /** Return the unresolved command without constructing an adapter or spawning a
