@@ -469,7 +469,8 @@ export async function commitRepoSelection(
       const needsPromptContext = !ds.pendingRawInput ||
         (ds.pendingPrompt?.trim().length ?? 0) > 0 ||
         (ds.pendingAttachments?.length ?? 0) > 0 ||
-        (ds.pendingFollowUps?.length ?? 0) > 0;
+        (ds.pendingFollowUps?.length ?? 0) > 0 ||
+        ds.pendingChatContext !== undefined;
       const availableBots = needsPromptContext
         ? await getAvailableBots(ds.larkAppId, ds.chatId)
         : [];
@@ -484,7 +485,8 @@ export async function commitRepoSelection(
       const hasBufferedInput =
         pendingPrompt.trim().length > 0 ||
         (ds.pendingAttachments?.length ?? 0) > 0 ||
-        (ds.pendingFollowUps?.length ?? 0) > 0;
+        (ds.pendingFollowUps?.length ?? 0) > 0 ||
+        ds.pendingChatContext !== undefined;
       // Nothing to submit at all (session created by a bare `/repo`, i.e. the
       // message IS the command). Boot the CLI idle instead of burning an empty
       // `<user_message>` opening on it, and mark the session so the user's NEXT

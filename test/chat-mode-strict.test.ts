@@ -130,7 +130,7 @@ describe('getChatContext', () => {
     await expect(getChatContext('app', 'oc_incomplete_context')).resolves.toMatchObject({
       name: '只有部分字段',
       mode: 'unknown',
-      fetchStatus: 'unavailable',
+      fetchStatus: 'ok',
     });
   });
 });

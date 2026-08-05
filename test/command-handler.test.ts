@@ -2791,6 +2791,36 @@ describe('handleCommand', () => {
       expect(ds.session.initialUserTurnPending).toBeUndefined();
     });
 
+    it('submits chat context when bare /repo follows an empty group-join prompt', async () => {
+      const ds = makeDaemonSession({
+        pendingRepo: true,
+        pendingPrompt: '',
+        pendingTurnId: 'om_group_join',
+        pendingChatContext: {
+          chatId: CHAT_ID,
+          name: '【Pippit】【BUG】测试群',
+          description: 'https://example.test/issue/detail/123',
+          mode: 'group',
+          fetchStatus: 'ok',
+        },
+      });
+      const deps = makeDeps(ds);
+
+      await handleCommand('/repo', ROOT_ID, makeLarkMessage('/repo'), deps, LARK_APP_ID);
+
+      expect(buildNewTopicCliInput).toHaveBeenCalled();
+      expect((buildNewTopicCliInput as ReturnType<typeof vi.fn>).mock.calls[0][0]).toBe('');
+      expect((buildNewTopicCliInput as ReturnType<typeof vi.fn>).mock.calls[0][11]).toMatchObject({
+        chatContext: { chatId: CHAT_ID },
+      });
+      expect(forkWorker).toHaveBeenCalledWith(
+        ds,
+        { content: 'WRAPPED:' },
+        { turnId: 'om_group_join' },
+      );
+      expect(ds.session.initialUserTurnPending).toBeUndefined();
+    });
+
     it('forwards the pending substitute trigger and complete Codex App sidecar', async () => {
       mockCodexAppBot();
       const substituteTrigger = {

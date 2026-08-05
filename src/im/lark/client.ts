@@ -675,7 +675,7 @@ export async function getChatContext(larkAppId: string, chatId: string): Promise
       name: name || null,
       description: description || null,
       mode,
-      fetchStatus: mode === 'unknown' ? 'unavailable' : 'ok',
+      fetchStatus: 'ok',
     };
   } catch (err: any) {
     logger.warn(`getChatContext(${chatId}) errored: ${err?.message ?? err}`);
