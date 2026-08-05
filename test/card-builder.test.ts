@@ -21,6 +21,7 @@ import {
   buildAdoptBlockedCard,
   buildPrivateSnapshotCard,
   buildConfigCard,
+  buildForkPanelCard,
   buildTuiPromptFailedCard,
   buildSlashListCard,
   getCliDisplayName,
@@ -408,6 +409,40 @@ describe('buildConfigCard', () => {
       (a: any) => a.value?.field === 'usageDisplay' || a.value?.field === 'showUsageInCardFooter',
     );
     expect(usageToggle).toBeFalsy();
+  });
+});
+
+describe('buildForkPanelCard', () => {
+  it('renders an actionable row for each child and normalizes multiline tasks', () => {
+    const card = parse(buildForkPanelCard([
+      { instruction: 'investigate\ncleanup', status: 'active', link: 'https://example.test/thread/1' },
+      { instruction: 'ship fix', status: 'closed', link: 'https://example.test/thread/2' },
+    ], 'en'));
+    const table = card.body.elements.find((element: any) => element.tag === 'table');
+
+    expect(table.rows).toEqual([
+      {
+        instruction: 'investigate cleanup',
+        status: '🟢 running',
+        link: '[open](https://example.test/thread/1)',
+      },
+      {
+        instruction: 'ship fix',
+        status: '⚪ closed',
+        link: '[open](https://example.test/thread/2)',
+      },
+    ]);
+  });
+
+  it('renders an explicit empty state for /forklist', () => {
+    const card = parse(buildForkPanelCard([], 'en'));
+
+    expect(card.body.elements).toEqual([
+      {
+        tag: 'markdown',
+        content: 'This session has no forked tasks yet. Use `/fork <task>` to create one.',
+      },
+    ]);
   });
 });
 

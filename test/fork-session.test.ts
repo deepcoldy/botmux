@@ -288,6 +288,50 @@ describe('forkSession — frozen launch posture inheritance', () => {
     expect(child.cliSessionId).toBe('cli-native-src-abc');
   });
 
+  it('seeds a topic fork with its task metadata, effective cwd, and first turn', async () => {
+    const src = makeSourceDs(
+      { workingDir: '/persisted/project' },
+      { workingDir: '/effective/project' },
+    );
+    registry.set(sessionKey('om_source_root', 'cli_app_test'), src);
+    const buildInitialPrompt = vi.fn((childSessionId: string) => ({
+      content: `wrapped task for ${childSessionId}`,
+    }));
+
+    const result = await forkSession(
+      src.session.sessionId,
+      'oc_child',
+      'om_child_root',
+      'group',
+      'thread',
+      {
+        forkWorkerImpl: forkWorkerSpy as any,
+        childTitle: '🔱 investigate cleanup',
+        forkTaskText: 'investigate cleanup',
+        larkThreadId: 'omt_child',
+        buildInitialPrompt,
+        turnId: 'om_fork_command',
+      },
+    );
+
+    expect(result).toEqual({ ok: true, childSessionId: 'child-sess-1' });
+    const child = vi.mocked(sessionStore.createSession).mock.results[0].value as Session;
+    expect(child).toMatchObject({
+      title: '🔱 investigate cleanup',
+      forkTaskText: 'investigate cleanup',
+      larkThreadId: 'omt_child',
+      workingDir: '/effective/project',
+      lastUserPrompt: 'investigate cleanup',
+      lastCliInput: 'wrapped task for child-sess-1',
+    });
+    expect(buildInitialPrompt).toHaveBeenCalledWith('child-sess-1');
+    expect(forkWorkerSpy).toHaveBeenCalledWith(
+      expect.objectContaining({ workingDir: '/effective/project' }),
+      { content: 'wrapped task for child-sess-1' },
+      { resume: true, turnId: 'om_fork_command' },
+    );
+  });
+
   it('cold-spawns the child worker with resume=true and never touches the source', async () => {
     const src = makeSourceDs();
     registry.set(sessionKey('om_source_root', 'cli_app_test'), src);
