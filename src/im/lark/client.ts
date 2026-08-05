@@ -951,6 +951,37 @@ export async function getMessageChatId(
   }
 }
 
+/** Resolve the `omt_...` topic id for an `om_...` topic-root message. Topic
+ *  routing itself keeps using the root message id; this helper is only for
+ *  client AppLinks. */
+export async function getMessageThreadId(
+  larkAppId: string,
+  messageId: string,
+  options?: LarkRequestOptions,
+): Promise<string | null> {
+  try {
+    const detail = await getMessageDetail(larkAppId, messageId, {
+      userCardContent: false,
+      ...options,
+    });
+    const candidates = [
+      detail?.items?.[0]?.thread_id,
+      detail?.thread_id,
+      detail?.message?.thread_id,
+    ];
+    for (const value of candidates) {
+      if (typeof value === 'string' && value.trim()) return value.trim();
+    }
+    return null;
+  } catch (err) {
+    if (options?.signal?.aborted) {
+      throw options.signal.reason instanceof Error ? options.signal.reason : err;
+    }
+    logger.debug(`[message] failed to resolve thread_id for ${messageId.substring(0, 12)}: ${err instanceof Error ? err.message : err}`);
+    return null;
+  }
+}
+
 export async function downloadMessageResource(larkAppId: string, messageId: string, fileKey: string, type: 'image' | 'file', savePath: string): Promise<void> {
   // apiOnly hard-gate BEFORE the app→user token fallback. Without this, the
   // App Token attempt (getBotClient) throws LarkTransportDisabledError, gets

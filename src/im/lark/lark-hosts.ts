@@ -67,3 +67,14 @@ export function sdkDomain(brand: Brand = 'feishu'): string {
 export function chatAppLink(chatId: string, brand: Brand = 'feishu'): string {
   return `https://${larkHosts(brand).applink}/client/chat/open?openChatId=${encodeURIComponent(chatId)}`;
 }
+
+/** Build an AppLink for a topic inside a topic group. `threadId` is the
+ *  `omt_...` topic id, not the `om_...` root-message id used for routing.
+ *  Lark's own message AppLinks use `thread_position=-1`; large positive values
+ *  stop opening once a topic grows beyond the client's clamp range. */
+export function threadAppLink(chatId: string, threadId: string, brand: Brand = 'feishu'): string {
+  const host = larkHosts(brand).applink;
+  const chat = encodeURIComponent(chatId);
+  const thread = encodeURIComponent(threadId);
+  return `https://${host}/client/thread/open?open_chat_id=${chat}&open_thread_id=${thread}&openchatid=${chat}&openthreadid=${thread}&thread_position=-1`;
+}

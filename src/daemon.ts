@@ -15892,13 +15892,13 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
         fireSessionlessCommandDetached(cmd, anchor, { ...parsed, content: commandContent, chatId }, larkAppId);
         return;
       }
-      // `/rename` renames an EXISTING session; a brand-new topic has none. Route
+      // These commands operate on an EXISTING session; a brand-new topic has none. Route
       // straight to handleCommand (its `!ds` branch replies no_active_session)
       // so the pre-create block below doesn't spawn a worker:null phantom
       // session just to rename it. Same phantom-session concern as the /card
       // and /term special cases, but UNLIKE those (which carry their own
       // permission gates inside their handlers) this branch MUST stay after
-      // the canOperate gate above — the /rename handler itself has no gate.
+      // the canOperate gate above — their handlers do not repeat that gate.
       if (EXISTING_SESSION_ONLY_DAEMON_COMMANDS.has(cmd)) {
         await handleCommand(cmd, anchor, { ...parsed, content: commandContent }, commandDeps, larkAppId);
         return;

@@ -432,6 +432,66 @@ export function buildSessionClosedCard(
   return JSON.stringify(card);
 }
 
+/** Parent-topic panel for `/fork <task>`. Links and live/closed state are
+ *  resolved by the command layer; this function only renders the card. */
+export function buildForkPanelCard(
+  children: Array<{ instruction: string; status: 'active' | 'closed'; link: string }>,
+  locale?: Locale,
+): string {
+  if (children.length === 0) {
+    return JSON.stringify({
+      schema: '2.0',
+      config: { update_multi: true },
+      header: {
+        template: 'purple',
+        title: { tag: 'plain_text', content: t('card.fork_panel.title', undefined, locale) },
+      },
+      body: {
+        direction: 'vertical',
+        elements: [{ tag: 'markdown', content: t('card.fork_panel.empty', undefined, locale) }],
+      },
+    });
+  }
+
+  const rows = children.map(child => ({
+    instruction: child.instruction.replace(/\s*\n+\s*/g, ' ').slice(0, 300) || '—',
+    status: child.status === 'active'
+      ? t('card.fork_panel.running', undefined, locale)
+      : t('card.fork_panel.done', undefined, locale),
+    link: `[${t('card.fork_panel.goto', undefined, locale)}](${child.link})`,
+  }));
+  return JSON.stringify({
+    schema: '2.0',
+    config: { update_multi: true },
+    header: {
+      template: 'purple',
+      title: { tag: 'plain_text', content: t('card.fork_panel.title', undefined, locale) },
+    },
+    body: {
+      direction: 'vertical',
+      elements: [{
+        tag: 'table',
+        page_size: 10,
+        row_height: 'low',
+        header_style: {
+          text_align: 'left',
+          text_size: 'normal',
+          background_style: 'grey',
+          text_color: 'default',
+          bold: true,
+          lines: 1,
+        },
+        columns: [
+          { name: 'instruction', display_name: t('card.fork_panel.col_instruction', undefined, locale), data_type: 'text', width: 'auto' },
+          { name: 'status', display_name: t('card.fork_panel.col_status', undefined, locale), data_type: 'text', width: '90px' },
+          { name: 'link', display_name: t('card.fork_panel.col_link', undefined, locale), data_type: 'lark_md', width: '90px' },
+        ],
+        rows,
+      }],
+    },
+  });
+}
+
 /** Collapse whitespace and clip a discovered-command description for a table cell. */
 function clipDesc(desc?: string): string {
   if (!desc) return '—';

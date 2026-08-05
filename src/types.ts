@@ -359,6 +359,17 @@ export interface Session {
    *  Purely informational — surfaced in UI/pickers so a fork is distinguishable
    *  from its parent. Does not affect routing or lifecycle. */
   forkedFrom?: string;
+  /** Child botmux session ids created from this session through `/fork <task>`.
+   *  Used only for lineage display; routing and lifecycle stay independent. */
+  forkChildSessionIds?: string[];
+  /** Original task text for a fork hosted in a topic-group sub-topic. */
+  forkTaskText?: string;
+  /** Latest parent-topic fork panel message. The panel is re-posted at the
+   *  bottom after each fork so it remains visible. */
+  forkPanelCardId?: string;
+  /** Lark topic id (`omt_...`) for deep links. Session routing still uses the
+   *  topic root message id (`om_...`). */
+  larkThreadId?: string;
   /** One-shot fork intent for the child's FIRST spawn: resume `cliSessionId`
    *  (the source's CLI-native transcript) but write forward into a new CLI-minted
    *  id via the native fork primitive (Claude `--fork-session` / `codex fork`).

@@ -15,13 +15,13 @@ import { scanProjects, scanMultipleProjects, describeProjectDir } from '../servi
 import { createRepoWorktree, pushWorktreeBranch } from '../services/git-worktree.js';
 import { worktreeSlugFromContextAI } from '../services/worktree-slug-ai.js';
 import { resolvePairedSpawnBackendType } from './persistent-backend.js';
-import { buildRepoSelectCard, buildAdoptSelectCard, buildCodexAppThreadSelectCard, buildSlashListCard, getCliDisplayName, buildConfigCard, buildAdoptBlockedCard } from '../im/lark/card-builder.js';
+import { buildRepoSelectCard, buildAdoptSelectCard, buildCodexAppThreadSelectCard, buildSlashListCard, getCliDisplayName, buildConfigCard, buildForkPanelCard, buildAdoptBlockedCard } from '../im/lark/card-builder.js';
 import { handleDashboardCommand } from './dashboard-command/index.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import type { CliId, ResumableSession } from '../adapters/cli/types.js';
 import { resolveCliRuntime, runtimeInstallationKey } from '../adapters/cli/runtime.js';
-import { deleteMessage, sendMessage, sendUserMessage, replyMessage, listChatBotMembers, resolveUserUnionId, getChatModeStrict, uploadFile, UserTokenMissingError } from '../im/lark/client.js';
-import { chatAppLink, normalizeBrand } from '../im/lark/lark-hosts.js';
+import { deleteMessage, sendMessage, sendUserMessage, replyMessage, listChatBotMembers, resolveUserUnionId, getChatModeStrict, getMessageThreadId, uploadFile, UserTokenMissingError } from '../im/lark/client.js';
+import { chatAppLink, threadAppLink, normalizeBrand } from '../im/lark/lark-hosts.js';
 import { claimPairing } from '../services/pairing-store.js';
 import { logger } from '../utils/logger.js';
 import { scheduleTimeZone } from '../utils/timezone.js';
@@ -139,15 +139,14 @@ export function formatSlashGroupName(name: string, prefix = ''): string {
 
 /**
  * Daemon commands that operate on an ALREADY-EXISTING session and must never
- * pre-create one. `/rename` renames the current session — with no session there
- * is nothing to rename, so the daemon routes must skip their generic
+ * pre-create one. With no real session to operate on, the daemon routes must skip their generic
  * "createSession + activeSessions.set(worker:null)" pre-create block and let
- * handleCommand's `!ds` branch reply no_active_session. Without this, `/rename`
+ * handleCommand's `!ds` branch reply no_active_session. Without this, one of these commands
  * in a brand-new topic (or a thread with no session) would spawn a phantom
- * worker:null session just to rename it, polluting the dashboard. (Same class
+ * worker:null session just to handle it, polluting the dashboard. (Same class
  * of fix as the `/card` / `/term` special cases in daemon.ts.)
  */
-export const EXISTING_SESSION_ONLY_DAEMON_COMMANDS = new Set(['/rename']);
+export const EXISTING_SESSION_ONLY_DAEMON_COMMANDS = new Set(['/rename', '/fork', '/forklist']);
 
 export function resolveAdapterDefaultPassthroughCommands(larkAppId?: string): string[] {
   if (!larkAppId) return [];
@@ -196,7 +195,7 @@ export interface SlashCommandInvocation {
   content: string;
 }
 
-const MULTILINE_COMMANDS = new Set(['/schedule', '/role']);
+const MULTILINE_COMMANDS = new Set(['/schedule', '/role', '/fork']);
 
 // `validateWorkingDir` now lives in ./working-dir.js (leaf module the CLI can
 // import without the daemon graph); re-exported here for existing callers.
@@ -3371,8 +3370,8 @@ export async function handleCommand(
       case '/fork': {
         // Session fork (Bot 分身): non-destructive copy of a running session
         // into a SECOND independent session at a new anchor; source untouched.
-        // PR1 scope: `--create <群名> @bot` (fork to a freshly-created group).
-        // The no-arg picker (fork into the current group) is a follow-up.
+        // `/fork <task>` hosts it in a new sub-topic of the same topic group;
+        // `/fork --create <name>` keeps the existing new-group destination.
         const argsLine = message.content.replace(/^\/fork\s*/i, '').trim();
         const forkAppId = larkAppId ?? ds?.larkAppId;
         if (!forkAppId) {
@@ -3403,22 +3402,8 @@ export async function handleCommand(
           break;
         }
 
-        if (!/^--create\b/i.test(argsLine)) {
-          // No-arg picker path ("fork into an existing group you pick") is not
-          // built yet. Don't reuse the no-session copy — the user often DOES
-          // have a session here (that's exactly the confusing case). Tell them
-          // the picker is pending and point at the working --create form.
-          await sessionReply(rootId, t('cmd.fork.picker_pending', undefined, loc));
-          break;
-        }
-
-        // ── /fork --create <群名> @bot ──────────────────────────────────────
-        const afterFlag = argsLine.replace(/^--create\s*/i, '').trim();
-
         // Front guards (fork needs a clean, real, idle source — same as relay).
-        // These MUST run before createGroupWithBots, otherwise a refusal (e.g.
-        // /fork typed at a chat top-level where ds is an empty scratch, while
-        // the real session lives in a 话题) leaves an orphan empty group.
+        // These MUST run before creating either a topic root or a new group.
         if (ds.session.adoptedFrom) {
           await sessionReply(rootId, t('cmd.fork.adopt_not_forkable', undefined, loc));
           break;
@@ -3442,6 +3427,55 @@ export async function handleCommand(
           await sessionReply(rootId, t('cmd.fork.mid_turn', undefined, loc));
           break;
         }
+
+        if (!/^--create\b/i.test(argsLine)) {
+          if (!argsLine) {
+            await sessionReply(rootId, t('cmd.fork.subtopic_usage', undefined, loc));
+            break;
+          }
+          if (ds.scope !== 'thread' || !ds.session.rootMessageId?.startsWith('om_')) {
+            await sessionReply(rootId, t('cmd.fork.subtopic_thread_only', undefined, loc));
+            break;
+          }
+          let chatMode: string | undefined;
+          try {
+            chatMode = await getChatModeStrict(forkAppId, ds.chatId);
+          } catch {
+            // Treat an unknown mode as unsupported: sending a top-level message
+            // to a regular group would not create the isolated topic we promise.
+          }
+          if (chatMode !== 'topic') {
+            await sessionReply(rootId, t('cmd.fork.subtopic_thread_only', undefined, loc));
+            break;
+          }
+
+          const result = await startForkSubtopicSession(argsLine, ds, message, forkAppId);
+          if (!result.ok) {
+            const errKey = result.error === 'worker_busy' ? 'cmd.fork.mid_turn'
+              : result.error === 'adopt_not_forkable' ? 'cmd.fork.adopt_not_forkable'
+              : result.error === 'fork_unsupported_backend' ? 'cmd.fork.unsupported_backend'
+              : result.error === 'not_started_yet' ? 'cmd.fork.not_started_yet'
+              : undefined;
+            if (errKey === 'cmd.fork.unsupported_backend') {
+              const cliName = getCliDisplayName((ds.session.cliId ?? getBot(forkAppId).config.cliId ?? 'claude-code') as CliId);
+              await sessionReply(rootId, t(errKey, { cli: cliName }, loc));
+            } else if (errKey) {
+              await sessionReply(rootId, t(errKey, undefined, loc));
+            } else {
+              await sessionReply(rootId, t('cmd.fork.failed', { error: result.error }, loc));
+            }
+            if (result.orphanTopic) {
+              await sessionReply(rootId, t('cmd.fork.orphan_topic_left', undefined, loc));
+            }
+            break;
+          }
+          await sessionReply(rootId, t('cmd.fork.subtopic_created', { link: result.link }, loc));
+          logger.info(`[${logTag}] /fork sub-topic completed: child=${result.childSessionId.substring(0, 8)} anchor=${result.anchorId.substring(0, 12)} (source ${ds.session.sessionId.substring(0, 8)} untouched)`);
+          break;
+        }
+
+        // ── /fork --create <群名> @bot ──────────────────────────────────────
+        const afterFlag = argsLine.replace(/^--create\s*/i, '').trim();
 
         // Resolve the bot to invite into the new group. Fork copies THIS
         // session's transcript, so the child MUST run the same bot as the
@@ -3553,6 +3587,15 @@ export async function handleCommand(
 
         await sessionReply(rootId, t('cmd.fork.created', { name: forkGroupName, link: forkInviteLink }, loc));
         logger.info(`[${logTag}] /fork --create completed: chat=${forkChatId} child=${forkResult.childSessionId.substring(0, 8)} bot=${targetBotAppId} (source ${ds.session.sessionId.substring(0, 8)} untouched)`);
+        break;
+      }
+
+      case '/forklist': {
+        if (!ds) {
+          await sessionReply(rootId, t('cmd.fork.no_session', undefined, loc));
+          break;
+        }
+        await upsertForkPanelCard(ds, loc, { allowEmpty: true });
         break;
       }
 
@@ -3681,6 +3724,7 @@ export async function handleCommand(
           t('help.relay', undefined, loc),
           t('help.relay_create', undefined, loc),
           t('help.fork', undefined, loc),
+          t('help.forklist', undefined, loc),
           '',
           t('help.heading_login', undefined, loc),
           t('help.login', undefined, loc),
@@ -4029,4 +4073,166 @@ export async function startResumeImportSession(
 
   const cliName = sessionCliDisplayName(ds);
   await sessionReply(sessionAnchorId(ds), t('cmd.adopt.resume_success', { cliName, project, title: target.title || target.cliSessionId.slice(0, 8) }, loc));
+}
+
+type ForkSubtopicResult =
+  | { ok: true; childSessionId: string; anchorId: string; link: string }
+  | { ok: false; error: string; orphanTopic: boolean };
+
+/** Fork the current session into a new sub-topic of the same topic group.
+ *  The session copy itself stays in worker-pool's generic `forkSession()`;
+ *  this layer only creates the Lark destination, supplies the first task turn,
+ *  and records display-only lineage for the parent panel. */
+export async function startForkSubtopicSession(
+  taskText: string,
+  parentDs: DaemonSession,
+  message: LarkMessage,
+  larkAppId?: string,
+): Promise<ForkSubtopicResult> {
+  const appId = parentDs.larkAppId ?? larkAppId;
+  if (!appId) return { ok: false, error: 'missing_lark_app_id', orphanTopic: false };
+
+  const loc: Locale = localeForBot(appId);
+  const bot = getBot(appId);
+  const botCfg = bot.config;
+  const parentSession = parentDs.session;
+  const chatId = parentDs.chatId;
+  const brand = normalizeBrand(botCfg.brand);
+  const taskTitle = taskText.split(/\r?\n/).map(line => line.trim()).find(Boolean)?.slice(0, 60)
+    ?? taskText.slice(0, 60);
+
+  let parentThreadId = parentSession.larkThreadId ?? message.threadId;
+  if (!parentThreadId) {
+    parentThreadId = (await getMessageThreadId(appId, parentSession.rootMessageId)) ?? undefined;
+  }
+  if (parentThreadId && parentSession.larkThreadId !== parentThreadId) {
+    parentSession.larkThreadId = parentThreadId;
+    sessionStore.updateSession(parentSession);
+  }
+  const parentLink = parentThreadId
+    ? threadAppLink(chatId, parentThreadId, brand)
+    : chatAppLink(chatId, brand);
+
+  const senderIsBot = message.senderType === 'app' || message.senderType === 'bot';
+  const localeKey = loc === 'en' ? 'en_us' : 'zh_cn';
+  const seedPost = JSON.stringify({
+    [localeKey]: {
+      title: `${t('cmd.fork.badge', undefined, loc)} ${taskText.replace(/\s*\n+\s*/g, ' ').slice(0, 300)}`,
+      content: [[
+        ...(senderIsBot ? [] : [{ tag: 'at', user_id: message.senderId }]),
+        {
+          tag: 'text',
+          text: `${senderIsBot ? '' : ' '}${t('cmd.fork.seed_parent_line', { title: parentSession.title || '' }, loc)} `,
+        },
+        { tag: 'a', text: t('cmd.fork.seed_back_link', undefined, loc), href: parentLink },
+      ]],
+    },
+  });
+  const anchorId = await sendMessage(appId, chatId, seedPost, 'post');
+  const childThreadId = (await getMessageThreadId(appId, anchorId)) ?? undefined;
+
+  const childIntro = t('cmd.fork.child_intro', {
+    parentTitle: parentSession.title || '',
+    parentSessionId: parentSession.sessionId,
+    parentRootId: parentSession.rootMessageId,
+  }, loc);
+  const availableBots = await getAvailableBots(appId, chatId);
+  const childCliId = parentSession.cliId ?? botCfg.cliId;
+  const { forkSession } = await import('./worker-pool.js');
+  const forkResult = await forkSession(
+    parentSession.sessionId,
+    chatId,
+    anchorId,
+    'group',
+    'thread',
+    {
+      childTitle: `${t('cmd.fork.badge', undefined, loc)} ${taskTitle}`,
+      forkTaskText: taskText,
+      larkThreadId: childThreadId,
+      turnId: message.messageId,
+      buildInitialPrompt: childSessionId => buildNewTopicCliInput(
+        `${childIntro}\n\n${taskText}`,
+        childSessionId,
+        childCliId,
+        botCfg.cliPathOverride,
+        undefined,
+        undefined,
+        availableBots,
+        undefined,
+        { name: bot.botName, openId: bot.botOpenId },
+        loc,
+        undefined,
+        { larkAppId: appId, chatId },
+      ),
+    },
+  );
+
+  if (!forkResult.ok) {
+    const orphanTopic = !await deleteMessage(appId, anchorId);
+    return { ok: false, error: forkResult.error, orphanTopic };
+  }
+
+  if (!parentSession.forkChildSessionIds?.includes(forkResult.childSessionId)) {
+    parentSession.forkChildSessionIds = [
+      ...(parentSession.forkChildSessionIds ?? []),
+      forkResult.childSessionId,
+    ];
+    sessionStore.updateSession(parentSession);
+  }
+  await upsertForkPanelCard(parentDs, loc);
+
+  return {
+    ok: true,
+    childSessionId: forkResult.childSessionId,
+    anchorId,
+    link: childThreadId ? threadAppLink(chatId, childThreadId, brand) : chatAppLink(chatId, brand),
+  };
+}
+
+/** Re-post the parent session's fork panel at the bottom of the topic. Reading
+ *  each child row from the store keeps `/forklist` status current without
+ *  coupling child lifecycle to its parent. */
+async function upsertForkPanelCard(
+  parentDs: DaemonSession,
+  loc: Locale,
+  opts?: { allowEmpty?: boolean },
+): Promise<void> {
+  const appId = parentDs.larkAppId;
+  const chatId = parentDs.chatId;
+  const brand = normalizeBrand(getBot(appId).config.brand);
+  const children = (parentDs.session.forkChildSessionIds ?? [])
+    .map(sessionId => sessionStore.getSession(sessionId))
+    .filter((session): session is NonNullable<ReturnType<typeof sessionStore.getSession>> => !!session)
+    .map(session => ({
+      instruction: session.forkTaskText ?? session.title,
+      status: (session.status === 'active' ? 'active' : 'closed') as 'active' | 'closed',
+      link: session.larkThreadId
+        ? threadAppLink(chatId, session.larkThreadId, brand)
+        : chatAppLink(chatId, brand),
+    }));
+  if (children.length === 0 && !opts?.allowEmpty) return;
+
+  const staleCardId = parentDs.session.forkPanelCardId;
+  if (staleCardId) {
+    try {
+      await deleteMessage(appId, staleCardId);
+    } catch {
+      // It may already be withdrawn or past Lark's recall window. Posting the
+      // fresh panel is still more useful than keeping the command silent.
+    }
+  }
+
+  try {
+    const cardId = await replyMessage(
+      appId,
+      parentDs.session.rootMessageId,
+      buildForkPanelCard(children, loc),
+      'interactive',
+      true,
+    );
+    parentDs.session.forkPanelCardId = cardId;
+    sessionStore.updateSession(parentDs.session);
+  } catch (err) {
+    logger.warn(`[fork-panel] failed to post panel card: ${err instanceof Error ? err.message : err}`);
+  }
 }
