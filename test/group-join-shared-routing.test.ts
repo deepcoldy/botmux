@@ -190,6 +190,7 @@ describe('handleBotAdded — 普通群 shared 路由', () => {
     expect(firstTurn.content).toContain('<chat_context source="lark" trust="untrusted" fetch_status="ok">');
     expect(firstTurn.content).toContain('<name>【Pippit】【BUG】测试群</name>');
     expect(firstTurn.content).toContain('issue/detail/123');
+    expect(firstTurn.content).not.toContain('<chat_mode>');
     expect(ds?.pendingChatContext).toBeUndefined();
 
     await daemon.__testOnly_sessionReply(chatId, '最终回复', 'text', appId, seedId);

@@ -500,7 +500,6 @@ function renderChatContextBlock(chatContext?: ChatContext): string {
     `  <chat_id>${xmlEscape(chatContext.chatId)}</chat_id>`,
     `  <name${nameTruncated}>${xmlEscape(name.text)}</name>`,
     `  <description${descriptionTruncated}>${xmlEscape(description.text)}</description>`,
-    `  <chat_mode>${chatContext.mode}</chat_mode>`,
     '</chat_context>',
   ].join('\n');
 }
