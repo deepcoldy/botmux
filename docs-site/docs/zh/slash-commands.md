@@ -20,8 +20,12 @@
 | `/dashboard [模块]` | 在飞书里打开 Dashboard 控制卡片（sessions/schedules/groups/settings/help 等） |
 | `/insight` | owner 专用：在当前会话即时回一张「本会话洞察摘要」卡片（聚合指标 + 规则建议；动作 span 明细 / 逐轮对账 / 对话回放在 Dashboard「洞察」页看） |
 | `/vc prepare <会议链接或会议号>` | 将当前普通群设为会议准备群，并在开会后复用同一 Agent 会话 |
-| `@机器人 /summary` | 读取当前话题（或普通群配置范围内）的历史消息并生成总结（默认最近 50 条 / 24 小时） |
+| `@机器人 /summary` | 读取当前话题（或普通群配置范围内）的历史消息并生成总结（默认最近 50 条 / 24 小时）。若该 bot 开启了 `summaryMemory`，总结会追加写入配置的记忆文件（`summaryMemoryPath`，默认 `summary.md`），且 `/summary` 后跟随的文字会作为「只总结从这条起」的硬边界；未开启记忆时，后随文字仅作为本次总结的侧重提示 |
 | `/t <prompt>` `/topic <prompt>` | 普通群内强制开新话题 |
+| `/issue` | 打开 Issue Board 看板卡片，直接在卡片上领取 botmux 平台任务：选好仓库后自动建群、拉你进去、绑定平台任务并开工。需要本机已绑定平台，且发起人在该 bot 的 `allowedUsers` 里；卡片只有发起人能操作 |
+| `/issue status` | 在任务群里发，查这个群绑着哪条平台任务、现在什么状态：平台状态 / 领取人 / 本机绑定 / 有没有回写还堵在发件箱里。只读，同样限该 bot 的 `allowedUsers` |
+| `/issue done` | 在任务群里发，**验收通过**，把任务推到平台终态。agent 交付只能到「待验收」，标完成是人的决策。完成后 claim 被平台清掉，这条领取不能再释放。同样限该 bot 的 `allowedUsers` |
+| `/issue release` | 在领取任务时建出来的那个群里发，把任务退回平台「待领取」，别人可以重新领。群和会话**不会自动解散**，对话记录保留。同样限该 bot 的 `allowedUsers` |
 
 ## 💬 回复模式（`/reply-mode`）
 
@@ -53,7 +57,9 @@
 
 ## 🔀 透传给底层 CLI
 
-`/compact` `/model` `/clear` `/plugin` `/usage` `/new` `/context` `/cost` `/mcp` `/diff` `/code-review` `/security-review` `/review` `/btw` `/effort` —— 字面送达底层 CLI，交给它的内置命令处理。
+`/compact` `/model` `/clear` `/plugin` `/usage` `/new` `/context` `/cost` `/mcp` `/diff` `/code-review` `/security-review` `/review` `/btw` `/effort` `/fast` —— 字面送达底层 CLI，交给它的内置命令处理。
+
+`/fast` 仅对 Codex 生效：切换 Codex 原生的 service tier 档位，流式卡片会显示只读的 `⚡ <档位>` 徽标，如实反映 Codex 实际运行的档位。在 RPC 输入模式或 Riff 后端上，按键到不了 Codex 执行器，因此 `/fast` 在这些后端会 fail-closed 给出明确提示，而非静默失效。
 
 部分 CLI 还有 adapter 默认放行的命令：Claude Code / Codex 默认放行 `/goal`，因此新话题第一条发 `/goal ...` 也会先启动/选择仓库，再把 `/goal ...` 原样投给 CLI。
 

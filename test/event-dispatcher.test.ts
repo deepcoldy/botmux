@@ -805,6 +805,8 @@ function setupBotState(opts?: {
 	  chatReplyModes?: Record<string, 'chat' | 'new-topic' | 'shared' | 'chat-topic'>;
 	  p2pMode?: 'thread' | 'chat';
 	  summaryRange?: { limit?: number; sinceHours?: number };
+	  summaryMemory?: boolean;
+	  summaryMemoryPath?: string;
 	  substituteMode?: {
 	    enabled: boolean;
 	    targets: Array<{ openId?: string; userId?: string; unionId?: string; name?: string }>;
@@ -835,6 +837,8 @@ function setupBotState(opts?: {
 	      chatReplyModes: opts?.chatReplyModes,
 	      p2pMode: opts?.p2pMode,
 	      summaryRange: opts?.summaryRange,
+	      summaryMemory: opts?.summaryMemory,
+	      summaryMemoryPath: opts?.summaryMemoryPath,
 	      substituteMode: opts?.substituteMode,
 	    },
     botOpenId: opts && 'botOpenId' in opts ? opts.botOpenId : MY_OPEN_ID,
@@ -5940,6 +5944,62 @@ describe('im.message.receive_v1 — /summary command', () => {
     const ctx = handlers.handleNewTopic.mock.calls[0][1] as any;
     expect(ctx.promptOverride).toContain('很久以前的消息');
     expect(ctx.promptOverride).toContain('最近消息');
+  });
+
+  it('adds project summary.md memory instructions and explicit command boundary when enabled', async () => {
+    setupBotState({
+      allowedUsers: [USER_OPEN_ID],
+      summaryRange: { limit: 0, sinceHours: 0 },
+      summaryMemory: true,
+      summaryMemoryPath: '/tmp/botmux-summary.md',
+    });
+    const triggerMs = 100 * 60 * 60_000;
+    mockListChatMessagesUntil.mockResolvedValue([
+      {
+        message_id: 'before-boundary',
+        msg_type: 'text',
+        body: { content: JSON.stringify({ text: '边界前不该写入 summary.md 的旧内容' }) },
+        sender: { id: 'ou_old', sender_type: 'user' },
+        create_time: String(triggerMs - 3 * 60 * 60_000),
+      },
+      {
+        message_id: 'boundary',
+        msg_type: 'text',
+        body: { content: JSON.stringify({ text: '从 start_pipeline 报错开始' }) },
+        sender: { id: 'ou_boundary', sender_type: 'user' },
+        create_time: String(triggerMs - 2 * 60 * 60_000),
+      },
+      {
+        message_id: 'incident',
+        msg_type: 'text',
+        body: { content: JSON.stringify({ text: 'PSM ad.qa.demo 在 PPE 节点 start_pipeline 报错' }) },
+        sender: { id: 'ou_fresh', sender_type: 'user' },
+        create_time: String(triggerMs - 60 * 60_000),
+      },
+    ]);
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@_bot_a /summary 从 start_pipeline 报错开始' }),
+      mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+      messageId: 'msg-summary-memory',
+      chatId: 'chat-summary-memory',
+      chatType: 'group',
+    });
+    (event.message as any).create_time = String(triggerMs);
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    const ctx = handlers.handleNewTopic.mock.calls[0][1] as any;
+    expect(ctx.promptOverride).toContain('summary_memory="true"');
+    expect(ctx.promptOverride).toContain('summary_memory_path="/tmp/botmux-summary.md"');
+    expect(ctx.promptOverride).toContain('window="explicit-boundary"');
+    expect(ctx.promptOverride).toContain('<explicit_boundary>');
+    expect(ctx.promptOverride).toContain('从 start_pipeline 报错开始');
+    expect(ctx.promptOverride).not.toContain('边界前不该写入');
+    expect(ctx.promptOverride).toContain('只允许创建或追加 /tmp/botmux-summary.md');
+    expect(ctx.promptOverride).toContain('实际追加到 /tmp/botmux-summary.md 的 Markdown 原样发给用户确认');
+    expect(ctx.promptOverride).toContain('不能擅自扩展范围');
   });
 
   it('summarizes regular group history after the previous @this bot /summary', async () => {

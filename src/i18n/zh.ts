@@ -573,6 +573,7 @@ export const messages: Record<string, string> = {
   'help.card': '/card       - 手动弹出当前会话的流式卡片（关流式时也能临时召唤，并恢复实时刷新；开了私密卡片则改发仅授权人可见的静态快照）',
   'help.term': '/term       - 获取当前会话的「可操作终端」（带写权限）链接，私密发给 owner（群内仅你可见，话题/单聊回退私信，不在群里暴露）',
   'help.dashboard': '/dashboard [模块] - 在飞书里打开 Dashboard 控制卡片（sessions/schedules/groups/settings/help 等）',
+  'help.issue': '/issue      - 打开 Issue Board 看板，直接在卡片上领取平台任务（自动建群并开工）；任务群里可发 `/issue status` 查现状、`/issue done` 验收完成、`/issue release` 退回待领取',
   'help.insight': '/insight    - 查看当前会话的工具调用摘要与风险建议（operator 专用）',
   'help.subscribe_doc': '/subscribe-lark-doc <文档链接|list|off> - 通过飞书 API 订阅文档（需要文档 User Token）',
   'help.watch_comment': '/watch-comment <文档链接|list|off> - 监听文档评论并把 AI 回复发回评论串',
@@ -865,6 +866,7 @@ export const messages: Record<string, string> = {
   'daemon.download_failed_need_login': '⚠️ 部分图片/文件下载失败（缺少 User Token）。请在话题中发送 /login 授权后重新发送。',
   'daemon.foreign_bot_mention_prefix': '[来自 {botName} 的 @mention]',
   'daemon.cmd_needs_active_cli': '{cmd} 需要活跃的 CLI 进程，当前话题无运行中的会话。',
+  'daemon.fast_unsupported_backend': '⚠️ 这个会话的后端下 /fast 切不了 Codex 档位（RPC 输入模式 / Riff 的对话不走终端，按键到不了执行端）。卡片徽标仍会如实反映 Codex 实际运行的档位。',
   'daemon.enriched_mentions_label': '消息中的 @mention：',
   'daemon.choose_repo_first': '请先在上方卡片中选择仓库，您的消息已暂存，选择后会自动发送。',
   'daemon.worktree_building_wait': '正在创建 worktree（含 git fetch，可能需要几秒），您的消息已暂存，创建完成后会自动一并发送。',
@@ -1186,6 +1188,7 @@ export const messages: Record<string, string> = {
   'trigger.external_event_clean': '外部事件触发',
 
   // Worker-side submit / notify messages
+  'worker.codex_composer_conflict': '已 adopt 的 Codex 终端输入框里已有未提交的本地草稿。botmux 保留了草稿，没有把这条飞书消息拼到后面。请先提交或清空本地草稿，再重发飞书消息。',
   'worker.submit_impossible': '⚠️ 刚才那条消息没有安全写入 {cliName}。\n原因：{reason}\n请处理上述原因并确认终端状态后再试。\n开头：{preview}',
   'worker.submit_unconfirmed': '⚠️ 刚才那条消息发给 {cliName} 后没能确认提交（重试 Enter 后等了 {secs}s 仍未在{transcriptLabel}里看到新记录）。可能卡在输入框里——请去 Web 终端看一下，手动按 Enter 或重发。\n开头：{preview}',
   'worker.submit_unconfirmed_zmx': '⚠️ 刚才那条消息没能确认写入 {cliName}（等待 {secs}s 后仍无提交证据）。不要直接重发；请在本机运行 botmux list 进入该 ZMX 会话检查输入框。\n开头：{preview}',

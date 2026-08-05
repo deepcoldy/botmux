@@ -28,6 +28,7 @@ import { persistStreamCardState, rememberLastCliInput } from './session-manager.
 import { fallbackTurnId, isSubstituteTurn } from './reply-target.js';
 import { updateMessage, deleteMessage, sendEphemeralCard, sendUserMessage, addReaction, removeReaction, getMessageChatId, MessageWithdrawnError } from '../im/lark/client.js';
 import { buildStreamingCard, buildPrivateSnapshotCard, buildSessionCard, buildTuiPromptCard, buildTuiPromptResolvedCard, buildTuiPromptFailedCard, buildRelayedFrozenCard, getCliDisplayName } from '../im/lark/card-builder.js';
+import { codexServiceTierBadge } from '../services/codex-service-tier.js';
 import { loadFrozenCards, saveFrozenCards } from '../services/frozen-card-store.js';
 import { hashUrlForLog, cancelRiffTaskById } from '../adapters/backend/riff-backend.js';
 import { logger } from '../utils/logger.js';
@@ -579,6 +580,7 @@ function scheduleLocalCliOpenReadinessPatch(ds: DaemonSession): void {
     isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
     getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId),
     sessionRuntimeDisplayName(ds, botCfg),
+    codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
   );
   scheduleCardPatch(ds, cardJson);
 }
@@ -587,6 +589,52 @@ function flushPendingLocalCliOpenReadinessPatch(ds: DaemonSession): void {
   if (!ds.pendingLocalCliButtonRefresh) return;
   ds.pendingLocalCliButtonRefresh = undefined;
   scheduleLocalCliOpenReadinessPatch(ds);
+}
+
+/** PATCH a live card when rollout settings change, even if the PTY is static. */
+function scheduleCodexServiceTierPatch(ds: DaemonSession): void {
+  if (ds.session.vcMeetingReceiver || streamingCardDisabled(ds) || ds.suppressRecoveryCard) {
+    ds.pendingCodexTierCardRefresh = undefined;
+    return;
+  }
+  if (ds.streamCardNonce && ds.parkedStreamCardNonce === ds.streamCardNonce) {
+    ds.pendingCodexTierCardRefresh = undefined;
+    return;
+  }
+  if (ds.streamCardId === CARD_POSTING_SENTINEL) {
+    ds.pendingCodexTierCardRefresh = true;
+    return;
+  }
+  if (!ds.streamCardId || !ds.workerPort) {
+    ds.pendingCodexTierCardRefresh = undefined;
+    return;
+  }
+  ds.pendingCodexTierCardRefresh = undefined;
+  const botCfg = getBot(ds.larkAppId).config;
+  const effectiveCliId = sessionCliId(ds, botCfg);
+  const status = ds.usageLimit ? 'limited' : (ds.lastScreenStatus ?? 'starting');
+  const cardJson = buildStreamingCard(
+    ds.session.sessionId,
+    sessionAnchorId(ds),
+    buildTerminalUrl(ds),
+    ds.currentTurnTitle || ds.session.title || getCliDisplayName(effectiveCliId),
+    ds.lastScreenContent ?? '',
+    status,
+    effectiveCliId,
+    ds.displayMode ?? 'hidden',
+    ds.streamCardNonce,
+    ds.currentImageKey,
+    !!ds.adoptedFrom,
+    false,
+    localeForBot(ds.larkAppId),
+    status === 'limited' ? ds.usageLimit : undefined,
+    writableTerminalLinkFor(ds),
+    isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
+    getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId),
+    sessionRuntimeDisplayName(ds, botCfg),
+    codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
+  );
+  scheduleCardPatch(ds, cardJson);
 }
 
 /** How often the live streaming card is re-PATCHed with fresh usage while a
@@ -659,8 +707,18 @@ export function refreshStreamingCardUsage(ds: DaemonSession): void {
     // the total/turn usage actually climbs on-screen every interval.
     getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId, { fresh: true }),
     sessionRuntimeDisplayName(ds, botCfg),
+    // Keep the Fast tier badge alive across the periodic refresh: this render
+    // path fires every 12s while a turn works, so omitting it would drop the
+    // ⚡ badge until the next status-edge PATCH.
+    codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
   );
   scheduleCardPatch(ds, cardJson);
+}
+
+function flushPendingCodexServiceTierPatch(ds: DaemonSession): void {
+  if (!ds.pendingCodexTierCardRefresh) return;
+  ds.pendingCodexTierCardRefresh = undefined;
+  scheduleCodexServiceTierPatch(ds);
 }
 
 /** Bring the periodic usage refresh in line with current state — arm when the
@@ -734,6 +792,7 @@ export function scheduleRiffAccessUrlPatch(ds: DaemonSession): void {
     isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
     getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId),
     sessionRuntimeDisplayName(ds, botCfg),
+    codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
   );
   scheduleCardPatch(ds, cardJson);
 }
@@ -960,6 +1019,7 @@ function scheduleUsageLimitCardPatch(ds: DaemonSession): void {
     isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
     getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId),
     sessionRuntimeDisplayName(ds, bot.config),
+    codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
   );
   scheduleCardPatch(ds, cardJson);
 }
@@ -1049,6 +1109,7 @@ export const CARD_POSTING_SENTINEL = '__posting__';
 export function parkStreamCard(ds: DaemonSession): void {
   if (!ds.streamCardId || ds.streamCardId === CARD_POSTING_SENTINEL) return;
   if (!ds.streamCardNonce) return;
+  ds.parkedStreamCardNonce = ds.streamCardNonce;
   if (!ds.frozenCards) ds.frozenCards = loadFrozenCards(ds.session.sessionId);
   ds.frozenCards.set(ds.streamCardNonce, {
     messageId: ds.streamCardId,
@@ -1056,6 +1117,13 @@ export function parkStreamCard(ds: DaemonSession): void {
     title: ds.currentTurnTitle ?? '',
     displayMode: ds.displayMode ?? 'hidden',
     imageKey: ds.currentImageKey,
+    ...(() => {
+      const badge = codexServiceTierBadge(
+        sessionCliId(ds, getBot(ds.larkAppId).config),
+        ds.codexServiceTier,
+      );
+      return badge ? { codexServiceTierBadge: badge } : {};
+    })(),
   });
   saveFrozenCards(ds.session.sessionId, ds.frozenCards);
 }
@@ -1152,6 +1220,7 @@ export async function postFreshStreamingCard(
     isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
     getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId),
     sessionRuntimeDisplayName(ds, botCfg),
+    codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
   );
   ds.streamCardId = CARD_POSTING_SENTINEL;
   try {
@@ -1161,10 +1230,12 @@ export async function postFreshStreamingCard(
     // duplicate (the gate above only suppresses cards when disabled+unforced;
     // /card forces them on, so a stale pending flag would otherwise re-POST).
     ds.streamCardPending = false;
+    ds.parkedStreamCardNonce = undefined;
     persistStreamCardState(ds);
     recallFrozenCards(ds);
     flushPendingLocalCliOpenReadinessPatch(ds);
     flushPendingRiffUrlPatch(ds);
+    flushPendingCodexServiceTierPatch(ds);
     // Manual /card during a working turn lands a live card whose subsequent
     // screen_updates are working→working (no status edge) — arm the periodic
     // usage refresh here, now that the real id is committed and pending cleared.
@@ -1177,6 +1248,7 @@ export async function postFreshStreamingCard(
     ds.streamCardPending = prevPending;
     flushPendingLocalCliOpenReadinessPatch(ds);
     flushPendingRiffUrlPatch(ds);
+    flushPendingCodexServiceTierPatch(ds);
     // Rolled back to the prior card identity — re-sync so a restored still-live
     // working card keeps (or resumes) its refresh rather than losing the timer.
     syncUsageRefreshTimer(ds);
@@ -4360,6 +4432,11 @@ function setupWorkerHandlers(
   ) {
     throw new Error('worker generation reservation changed before IPC setup');
   }
+  // Tier authority belongs to this exact worker generation. Start unknown and
+  // wait for the new worker's rollout-bound observation; this also clears a
+  // Codex badge before a role switch starts a non-Codex worker.
+  ds.codexServiceTier = undefined;
+  ds.pendingCodexTierCardRefresh = undefined;
   const handlerSession = ds.session;
   const handlerAnchor = sessionAnchorId(ds);
   const handlerLarkAppId = ds.larkAppId;
@@ -4683,6 +4760,7 @@ function setupWorkerHandlers(
             // undefined and fall back to 'starting' (unchanged behavior).
             const initStatus = ds.usageLimit ? 'limited' : (ds.lastScreenStatus ?? 'starting');
             const localCliReadyAtBuild = isLocalCliOpenReady(ds, { cliId: effectiveCliId });
+            const codexTierAtBuild = ds.codexServiceTier;
             const streamCardJson = buildStreamingCard(
               ds.session.sessionId,
               sessionAnchorId(ds),
@@ -4702,14 +4780,19 @@ function setupWorkerHandlers(
               localCliReadyAtBuild,
               getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId),
               sessionRuntimeDisplayName(ds, botCfg),
+              codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
             );
             await updateMessage(ds.larkAppId, restoredCardId, streamCardJson);
             if (!ownsLifecycleMutation()) break;
+            ds.parkedStreamCardNonce = undefined;
             // Worker IPC handlers may run while the direct restore PATCH is in
             // flight. Re-queue readiness after it completes so an older
             // not-ready payload can never overwrite the cli_session_id PATCH.
             if (!localCliReadyAtBuild && isLocalCliOpenReady(ds, { cliId: effectiveCliId })) {
               scheduleLocalCliOpenReadinessPatch(ds);
+            }
+            if (ds.codexServiceTier !== codexTierAtBuild) {
+              scheduleCodexServiceTierPatch(ds);
             }
             persistStreamCardState(ds);
             // Re-sync worker's display mode (it starts fresh in 'hidden')
@@ -4773,6 +4856,7 @@ function setupWorkerHandlers(
             isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
             getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId),
             sessionRuntimeDisplayName(ds, botCfg),
+            codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
           );
           const postedCardId = await scopedReply(streamCardJson, 'interactive', msg.turnId);
           if (!ownsLifecycleMutation()) {
@@ -4789,6 +4873,7 @@ function setupWorkerHandlers(
           // recallFrozenCards can't withdraw it). Mirrors the screen_update POST
           // branch which clears the flag after posting.
           ds.streamCardPending = false;
+          ds.parkedStreamCardNonce = undefined;
           persistStreamCardState(ds);
           // Re-sync worker's display mode (it starts fresh in 'hidden')
           syncWorkerDisplayMode(ds);
@@ -4798,6 +4883,7 @@ function setupWorkerHandlers(
           recallFrozenCards(ds);
           flushPendingLocalCliOpenReadinessPatch(ds);
           flushPendingRiffUrlPatch(ds);
+          flushPendingCodexServiceTierPatch(ds);
           // Fresh ready POST: if this turn is already `working` (e.g. relay
           // resume where the CLI kept running), arm here — same authorized arm
           // point as the reuse branch, now that streamCardId is the real id.
@@ -4814,6 +4900,7 @@ function setupWorkerHandlers(
           // Clear sentinel so screen_updates can create a streaming card later
           ds.streamCardId = undefined;
           clearPendingLocalCliOpenReadinessPatch(ds);
+          ds.pendingCodexTierCardRefresh = undefined;
           persistStreamCardState(ds);
           // Fallback: send static session card
           try {
@@ -4984,6 +5071,22 @@ function setupWorkerHandlers(
         break;
       }
 
+      case 'codex_service_tier': {
+        if (
+          ds.worker !== worker
+          || ds.workerGeneration !== workerGeneration
+          || ds.session.workerGeneration !== workerGeneration
+        ) {
+          logger.warn(`[${t}] Ignored codex_service_tier from stale worker generation`);
+          break;
+        }
+        ds.codexServiceTier = effectiveCliId === 'codex'
+          ? (msg.snapshot ?? undefined)
+          : undefined;
+        scheduleCodexServiceTierPatch(ds);
+        break;
+      }
+
       case 'screen_update': {
         if (!ownsLifecycleMutation()) break;
         // Wait for worker init, independently of Web Terminal availability.
@@ -5109,6 +5212,7 @@ function setupWorkerHandlers(
             isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
             getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId),
             sessionRuntimeDisplayName(ds, botCfg),
+            codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
           );
           // Mark POST in-flight so subsequent screen_updates are dropped,
           // not POSTed as duplicate cards.
@@ -5121,6 +5225,7 @@ function setupWorkerHandlers(
                 return;
               }
               ds.streamCardId = msgId;
+              ds.parkedStreamCardNonce = undefined;
               persistStreamCardState(ds);
               // New card live — recall any cards parked by previous turns
               // (user message, bot @mention, adopt-bridge new turn, etc.).
@@ -5129,7 +5234,8 @@ function setupWorkerHandlers(
               // thread.
               recallFrozenCards(ds);
               flushPendingLocalCliOpenReadinessPatch(ds);
-          flushPendingRiffUrlPatch(ds);
+              flushPendingRiffUrlPatch(ds);
+              flushPendingCodexServiceTierPatch(ds);
               // New-turn POST is the FIRST working screen_update of the turn —
               // the else (same-turn PATCH) branch never runs for it, so arm the
               // periodic usage refresh here (once the real card id exists, not
@@ -5147,6 +5253,7 @@ function setupWorkerHandlers(
               logger.debug(`[${t}] Failed to create streaming card: ${err}`);
               ds.streamCardId = undefined;
               clearPendingLocalCliOpenReadinessPatch(ds);
+              ds.pendingCodexTierCardRefresh = undefined;
               persistStreamCardState(ds);
             });
         } else {
@@ -5177,6 +5284,7 @@ function setupWorkerHandlers(
               fresh: ds.lastScreenStatus === 'idle',
             }),
             sessionRuntimeDisplayName(ds, botCfg),
+            codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
           );
           scheduleCardPatch(ds, cardJson, msg.turnId);
           // Keep the live usage climbing during a long working phase; stop once
@@ -5232,6 +5340,7 @@ function setupWorkerHandlers(
           isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
           getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId, { fresh: ds.lastScreenStatus === 'idle' }),
           sessionRuntimeDisplayName(ds, botCfg),
+          codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
         );
         scheduleCardPatch(ds, cardJson);
         break;
@@ -5602,6 +5711,7 @@ function setupWorkerHandlers(
               isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
               getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId, { fresh: true }),
               sessionRuntimeDisplayName(ds, botCfg),
+              codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
             );
             scheduleCardPatch(ds, frozenCard);
           }
@@ -5645,6 +5755,7 @@ function setupWorkerHandlers(
               isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
               getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId, { fresh: true }),
               sessionRuntimeDisplayName(ds, botCfg),
+              codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
             );
             scheduleCardPatch(ds, frozenCard);
           }

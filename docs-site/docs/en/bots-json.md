@@ -189,6 +189,8 @@ You can also add it to the corresponding bot entry directly (manual `bots.json` 
 | Field | Description |
 |------|------|
 | `summaryRange` | History range used by the explicit `@bot /summary` command. `limit` is the latest N messages in a regular group, defaulting to 50; `sinceHours` is the latest N hours in a regular group, defaulting to 24. Set either field to `0` to remove that limit. Topic groups always read the current topic/thread history, then apply the summary window |
+| `summaryMemory` | Boolean, defaults to `false` (off). When enabled, `@bot /summary` turns the summary into a Chinese "problem-resolution record" appended to the memory file named by `summaryMemoryPath` below, instructs the agent to write only that one file and echo back the exact Markdown written, and injects a `<summary_memory>` reuse hint into later turns so a later question reuses a past conclusion only when key conditions — PSM, environment, task ID, node, error symptom, etc. — match exactly; otherwise the file is treated as reference only |
+| `summaryMemoryPath` | Memory file path, defaults to `summary.md`. A relative path is resolved by the agent against the "current project root"; an absolute path is used as-is. Empty / unset falls back to `summary.md`. Only takes effect when `summaryMemory` is `true` |
 
 Example:
 
@@ -197,14 +199,18 @@ Example:
   "summaryRange": {
     "limit": 50,
     "sinceHours": 24
-  }
+  },
+  "summaryMemory": true,
+  "summaryMemoryPath": "docs/summary.md"
 }
 ```
 
 - Only the explicit `@bot /summary` command triggers a summary. Messages that do not mention the bot still follow the existing group/topic routing rules and are not woken up by keywords.
-- The dashboard "/summary Range" controls this `summaryRange` field.
+- The dashboard "/summary Range" controls this `summaryRange` field; the "Enable memory" toggle and "Memory file path" input save `summaryMemory` and `summaryMemoryPath` respectively.
 - If an earlier `@same bot /summary` exists before the current trigger, the summary window includes only messages after that earlier command and up to the current trigger; otherwise botmux falls back to `limit` / `sinceHours`.
-- `limit` and `sinceHours` are also safety caps. If both are `0`, that dimension is not limited.
+- `limit` and `sinceHours` are safety caps for the default (no explicit boundary) summary window. If both are `0`, that dimension is not limited. **An explicit boundary intentionally takes precedence over these caps**: when `summaryMemory` is on and `/summary` carries boundary text, botmux honors the user's explicit "start from this message" intent and includes everything from the matched boundary onward — in a regular group `limit` still bounds the scan, but a boundary older than `sinceHours`, and any arbitrarily old boundary in a topic group, is accepted and may exceed the default configured range. If you do not want a bot to read in very old content, the reliable approach is to omit the boundary text; in a regular group you can also lower `limit` to bound the scan (but `sinceHours`, and any boundary in a topic group, are not constrained by the configured range).
+- **Only when `summaryMemory` is enabled**, text following the `/summary` command is treated as a hard boundary: it locates the **most recent** message before the trigger that contains that text and summarizes only from there up to the current trigger; if the boundary is not found in the scanned history, botmux does not fall back to a wider range but hands the agent a "boundary not found" error together with an empty history (the memory write instruction still runs). When `summaryMemory` is off, text after `/summary` is only a focus hint for the summary and the history window still follows `summaryRange`.
+- The memory file is written by the agent within its working directory. If the bot has sandbox enabled and `summaryMemoryPath` points outside the working directory (an absolute path, or a relative path that escapes via `../`), add the file's **existing parent directory** to `sandboxPaths.readWrite`; the worker filters out paths that do not yet exist at spawn time, and a new memory file usually does not exist yet, so adding only the file path itself is dropped (unless the file is pre-created). Otherwise the write may be denied by the sandbox.
 
 ## Legacy content trigger config
 

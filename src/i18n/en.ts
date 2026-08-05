@@ -570,6 +570,7 @@ export const messages: Record<string, string> = {
   'help.card': '/card       - Manually post the streaming card for this session (summons it even when streaming is off, and resumes live updates; with private-card mode on, sends a static snapshot visible only to authorized users instead)',
   'help.term': '/term       - Get the operable (write-enabled) terminal link for this session, delivered privately to the owner (visible-to-you in-chat, falling back to DM in topic/p2p — never exposed in the group)',
   'help.dashboard': '/dashboard [module] - Open Dashboard control cards in Feishu (sessions/schedules/groups/settings/help, etc.)',
+  'help.issue': '/issue      - Open the Issue Board and claim a platform task right from the card (auto-creates a group and starts work); inside the task group use `/issue status` to inspect, `/issue done` to accept, `/issue release` to hand it back',
   'help.insight': '/insight    - Show tool-call summary and risk suggestions for this session (operators only)',
   'help.subscribe_doc': '/subscribe-lark-doc <doc link|list|off> - Subscribe through the Feishu API (requires a doc-scoped User Token)',
   'help.watch_comment': '/watch-comment <doc link|list|off> - Watch doc comments and post AI replies back into their threads',
@@ -862,6 +863,7 @@ export const messages: Record<string, string> = {
   'daemon.download_failed_need_login': '⚠️ Some images/files failed to download (missing User Token). Send `/login` in this topic to authorize, then resend.',
   'daemon.foreign_bot_mention_prefix': '[@mention from {botName}]',
   'daemon.cmd_needs_active_cli': '{cmd} needs an active CLI process; no running session in this topic.',
+  'daemon.fast_unsupported_backend': "⚠️ /fast can't toggle Codex's tier on this session's backend (RPC input mode / Riff runs turns off the terminal, so the keystroke never reaches the executor). The card badge still reflects the tier Codex is actually running.",
   'daemon.enriched_mentions_label': '@mentions in this message:',
   'daemon.choose_repo_first': 'Pick a repo from the card above first — your message is queued and will be sent once a repo is chosen.',
   'daemon.worktree_building_wait': 'Creating a worktree (includes a git fetch, may take a few seconds) — your message is queued and will be sent together once it is ready.',
@@ -1183,6 +1185,7 @@ export const messages: Record<string, string> = {
   'trigger.external_event_clean': 'External event',
 
   // Worker-side submit / notify messages
+  'worker.codex_composer_conflict': 'The adopted Codex terminal already has an unsubmitted local draft. botmux left that draft untouched and did not append the Lark message. Submit or clear the local draft, then resend the Lark message.',
   'worker.submit_impossible': '⚠️ Your last message was not safely written to {cliName}.\nReason: {reason}\nAddress the reason above and verify the terminal state before trying again.\nStart: {preview}',
   'worker.submit_unconfirmed': '⚠️ Your last message was sent to {cliName} but submission couldn’t be confirmed (after retrying Enter and waiting {secs}s, no new entry showed up in {transcriptLabel}). It may be stuck in the input box — check the Web terminal and press Enter manually or resend.\nStart: {preview}',
   'worker.submit_unconfirmed_zmx': '⚠️ Your last message could not be confirmed as written to {cliName} after {secs}s. Do not resend it blindly; run botmux list locally, enter the ZMX session, and inspect its composer.\nStart: {preview}',

@@ -123,13 +123,15 @@ import {
   type PidFollowResult,
 } from './services/bridge-rotation-policy.js';
 import { CodexBridgeQueue } from './services/codex-bridge-queue.js';
+import { detectCodexComposerState } from './services/codex-composer-state.js';
 import {
   generateCodexAppThreadTitle,
   readCodexAppThreadMetadata,
   setCodexAppThreadName,
 } from './services/codex-app-threads.js';
 import { buildBotmuxLarkNativeSessionTitle } from './core/session-title.js';
-import { drainCodexRollout, findCodexRolloutBySessionId, findCodexRolloutByPid, splitCodexEventsByCutoff, extractLastCodexTurn, codexSessionIdFromRolloutPath, type CodexBridgeEvent } from './services/codex-transcript.js';
+import { drainCodexRollout, findCodexRolloutBySessionId, findCodexRolloutByPid, findCodexRolloutSetByPid, codexHistorySidIsOwned, splitCodexEventsByCutoff, extractLastCodexTurn, codexSessionIdFromRolloutPath, scanCodexThreadSettings, type CodexBridgeEvent, type CodexDrainResult } from './services/codex-transcript.js';
+import { CodexServiceTierTracker, resolveCodexServiceTierSnapshot } from './services/codex-service-tier.js';
 import { drainTraexRollout, findTraexRolloutBySessionId, findTraexRolloutByPid } from './services/traex-transcript.js';
 import { parseTraexUserInputQuestions } from './services/traex-user-input.js';
 import { cocoEventsPathForSession, drainCocoEvents, findCocoSessionByPid } from './services/coco-transcript.js';
@@ -1136,6 +1138,18 @@ function seedAndTrustClaudeState(statePath: string, workingDir: string, log: (m:
       } catch { data = {}; }
     }
     if (!data.projects || typeof data.projects !== 'object') data.projects = {};
+    // Onboarding gate: Claude Code holds the FIRST launch on a one-time
+    // theme/onboarding selection until `hasCompletedOnboarding:true` is on the
+    // top level of .claude.json. The seed above copies it from the host's
+    // global ~/.claude.json — but a CLEAN environment (fresh sandbox, e.g.
+    // core-only in riff, or any box that never ran Claude globally) has no
+    // global file to copy it from, so the redirected CLAUDE_CONFIG_DIR session
+    // would stick on that first-frame selection until a human clears it once.
+    // Force it here (idempotent, top-level) so a headless/programmatic first
+    // launch never blocks on interactive onboarding — same intent as the
+    // per-cwd trust-dialog acceptance below. If the seed/global already set it,
+    // this is a no-op.
+    data.hasCompletedOnboarding = true;
     let canonical = workingDir;
     try { canonical = realpathSync(workingDir); } catch { /* cwd may not exist yet */ }
     const entry = data.projects[canonical] && typeof data.projects[canonical] === 'object'
@@ -2239,6 +2253,13 @@ let codexBridgeBaselineDone = false;
 const codexBridgeQueue = new CodexBridgeQueue();
 let codexBridgeWatcher: FSWatcher | null = null;
 let codexBridgeTimer: NodeJS.Timeout | null = null;
+/** Settings are observed on the same append-only cursor as bridge output.
+ *  The tracker owns rollout-generation clear/update semantics and publishes a
+ *  dedicated IPC event, independent of PTY redraw frequency. */
+const codexServiceTierTracker = new CodexServiceTierTracker(
+  resolveCodexServiceTierSnapshot,
+  snapshot => send({ type: 'codex_service_tier', snapshot }),
+);
 let hermesBridgeOffset = 0;
 let hermesBridgeBaselineDone = false;
 let hermesBridgeDbPath: string | undefined;
@@ -3637,7 +3658,19 @@ function codexBridgeStartTimer(): void {
           cwd: lastInitConfig?.workingDir,
           pid: codexAdoptPendingPid,
         });
-        if (path) {
+        // Codex defense-in-depth: resolveFileBridgePath resolves sessionId-first,
+        // so a pending sid that is actually a shared-CODEX_HOME sibling's would
+        // resolve to that foreign rollout. Only attach when the resolved rollout's
+        // sid is one the observed pid actually holds open. This poller re-runs
+        // every 1s, so a lazily-opened owned fd is picked up on a later tick.
+        // Skip the gate only when we have no pid to prove ownership with (keeps
+        // the sid/pid resolution working for non-adopt / pid-less flows).
+        const attachOk = !(structuredBridgeIsCodex() && lastInitConfig?.adoptMode && path && currentCodexObservedPid())
+          || (() => {
+            const sid = codexSessionIdFromRolloutPath(path!);
+            return !!sid && codexHistorySidOwnedByCurrentPid(sid);
+          })();
+        if (path && attachOk) {
           if (codexAdoptPendingPid && (lastInitConfig?.cliId === 'codex' || lastInitConfig?.cliId === 'traex')) {
             const discoveredSessionId = codexSessionIdFromRolloutPath(path);
             if (discoveredSessionId) persistCliSessionId(discoveredSessionId);
@@ -3733,6 +3766,7 @@ function mtrBridgeIngest(): void {
 
 function codexBridgeAttach(rolloutPath: string, mode: 'baseline-existing' | 'baseline-existing-skip-tail' | 'fresh-empty' | 'split-live'): void {
   codexBridgeRolloutPath = rolloutPath;
+  if (structuredBridgeIsCodex()) codexServiceTierTracker.bind(rolloutPath);
   if (mode === 'fresh-empty') {
     // Brand-new session OR late-attach right after first submit. Either
     // way we want to ingest from offset 0 — pending turns marked before
@@ -3759,6 +3793,12 @@ function codexBridgeAttach(rolloutPath: string, mode: 'baseline-existing' | 'bas
     codexBridgeOffset = result.newOffset;
     codexBridgePendingTail = result.pendingTail;
     codexBridgeBaselineDone = true;
+    if (structuredBridgeIsCodex()) {
+      codexServiceTierTracker.observe(
+        rolloutPath,
+        (result as CodexDrainResult).latestThreadSettings,
+      );
+    }
     log(`Codex bridge split-live: ${rolloutPath} (history=${history.length}, live=${live.length}, cutoff=${cutoff}, offset=${codexBridgeOffset})`);
     maybeEmitCodexAdoptPreamble(history);
   } else if (mode === 'split-live') {
@@ -3790,6 +3830,13 @@ function codexBridgeAttach(rolloutPath: string, mode: 'baseline-existing' | 'bas
     codexBridgePendingTail = '';
     codexBridgeBaselineDone = true;
     log(`Codex bridge transcript not yet present at ${rolloutPath}; treating as fresh`);
+  }
+  if (
+    structuredBridgeIsCodex()
+    && mode !== 'fresh-empty'
+    && mode !== 'split-live'
+  ) {
+    codexServiceTierTracker.observe(rolloutPath, scanCodexThreadSettings(rolloutPath));
   }
   try {
     codexBridgeWatcher = fsWatch(rolloutPath, { persistent: false }, () => {
@@ -3854,12 +3901,90 @@ function codexBridgeDetachFile(): void {
   codexBridgeBaselineDone = false;
 }
 
+/** Resolve the pid of the Codex process this worker observes (spawned child or
+ *  adopted pane), mirroring the grok/traex pid-follow resolution order. */
+function currentCodexObservedPid(): number | undefined {
+  return (backend as { cliPid?: number } | null)?.cliPid
+    ?? backend?.getChildPid?.()
+    ?? codexAdoptPendingPid;
+}
+
+/** Ownership gate for binding a Codex bridge to a session id that came from the
+ *  GLOBAL history.jsonl. That file is shared by every Codex pane under one
+ *  CODEX_HOME, so a concurrent sibling pane submitting identical text can make
+ *  writeInput's history match return a FOREIGN session id. Before attaching (or
+ *  re-attaching) to such an id we require it to be one THIS pid actually holds
+ *  open. findCodexRolloutSetByPid returns every open rollout (it does NOT
+ *  collapse the legitimate parent+sibling multi-rollout case to undefined the
+ *  way findCodexRolloutByPid does), so membership admits the authoritative id
+ *  and rejects a foreign one. FAIL CLOSED: an unavailable fd enumeration
+ *  (undefined) or a non-member id returns false → caller must not bind.
+ *
+ *  The pure decision (sid ∈ owned set) lives in codexHistorySidIsOwned so it can
+ *  be unit-tested without spawning a worker; this wrapper only supplies the live
+ *  pid + fd-set. BOTH production attach entry points (the notify re-attach branch
+ *  AND the initial-attach guard) call this one wrapper — there is no parallel
+ *  decision copy that could drift. */
+function codexHistorySidOwnedByCurrentPid(cliSessionId: string): boolean {
+  const pid = currentCodexObservedPid();
+  const ownedRollouts = pid ? findCodexRolloutSetByPid(pid) : undefined;
+  const owned = codexHistorySidIsOwned(cliSessionId, ownedRollouts);
+  if (!owned) {
+    log(`Codex session id ${cliSessionId} not owned by pid ${pid ?? '?'} (open rollouts: ${ownedRollouts ? [...ownedRollouts].join(',') || 'none' : 'unknown'})`);
+  }
+  return owned;
+}
+
 /** Called from flushPending after writeInput first returns a cliSessionId.
  *  Tries to locate the rollout file immediately; if it's not on disk yet,
  *  remembers the sid so the 1s poller can keep retrying. */
 function codexBridgeNotifyCliSessionId(cliSessionId: string): void {
   if (!codexBridgeFallbackActive()) return;
   if (codexBridgeRolloutPath) {
+    // A Codex process can keep its parent and sibling-agent rollouts open at
+    // the same time. Pre-submit pid discovery therefore may have attached an
+    // adopted pane to an unverified sibling transcript. writeInput returns a
+    // visible-session id, but that id comes from the GLOBAL history.jsonl
+    // (one file shared by every Codex pane under a CODEX_HOME): a concurrent
+    // sibling pane submitting identical text can make writeInput return the
+    // WRONG (foreign) session id. So the reported id is only a CANDIDATE —
+    // gate the re-attach on pid fd ownership below.
+    //
+    // Not draining the retired rollout before detach is safe here (NOT because
+    // "the old path is proven foreign" — Codex /new · /clear · /resume are
+    // legitimate same-process rotations): prepareAdoptWrite() ran
+    // codexBridgeIngest() before this turn's mark+write, codexBridgeDetachFile()
+    // preserves codexBridgeQueue (already-ingested terminals survive the
+    // re-attach), and a rotated-away rollout is quiescent before the next prompt
+    // is submitted — so there is no post-ingest window in which a legitimate
+    // terminal is appended to the old path and lost.
+    if (structuredBridgeIsCodex()) {
+      const currentSid = codexSessionIdFromRolloutPath(codexBridgeRolloutPath);
+      if (currentSid?.toLowerCase() === cliSessionId.toLowerCase()) return;
+      // Ownership gate: only re-attach to a session id THIS pid actually holds
+      // open (admits the real parent+sibling multi-rollout case, rejects a
+      // foreign id from another pane's identical-text history line). Fail
+      // closed: keep the current binding when unowned/unknown.
+      if (!codexHistorySidOwnedByCurrentPid(cliSessionId)) {
+        log(`Keeping current Codex bridge ${currentSid ?? '?'} — refusing history-only re-attach to ${cliSessionId}`);
+        return;
+      }
+      const pid = currentCodexObservedPid();
+      const next = resolveFileBridgePath('codex', { sessionId: cliSessionId });
+      if (next && next !== codexBridgeRolloutPath) {
+        const attachMode = lastInitConfig?.adoptMode ? 'split-live' : 'fresh-empty';
+        log(`Codex session binding corrected ${currentSid ?? '?'} → ${cliSessionId} (pid ${pid} owns it); re-attaching bridge to ${next}`);
+        codexBridgeDetachFile();
+        codexBridgePendingSessionId = undefined;
+        codexBridgeAttach(next, attachMode);
+      } else if (!next) {
+        log(`Codex session binding corrected ${currentSid ?? '?'} → ${cliSessionId} (pid ${pid} owns it); waiting for rollout`);
+        codexBridgeDetachFile();
+        codexBridgePendingSessionId = cliSessionId;
+        codexBridgeStartTimer();
+      }
+      return;
+    }
     // Already attached — first-attach-wins for most CLIs. Exceptions: TRAE
     // and Grok can rotate their native session in the same process.
     if (structuredBridgeIsTraex()) {
@@ -3957,6 +4082,25 @@ function codexBridgeNotifyCliSessionId(cliSessionId: string): void {
     }
     return;
   }
+  // Codex INITIAL attach (no prior rollout bound). The multi-fd adopt case
+  // reaches here with codexBridgeRolloutPath still unset: findCodexRolloutByPid
+  // returned undefined (ambiguous parent+sibling), so the adopt block armed the
+  // poller instead of attaching. The cliSessionId is normally already
+  // source-filtered by the codex adapter (writeInput only returns an owned sid),
+  // but keep a defense-in-depth ownership gate here too so a sid from any other
+  // path can't first-attach the shared-history foreign session. Fail closed:
+  // when the sid isn't provably owned, DON'T pin it as pending (that would wedge
+  // the bridge — the poller's pid fallback stays ambiguous→undefined forever and
+  // the owned line never re-triggers this callback). Keep the adopt pid pending
+  // so the poller can bind once a uniquely-owned rollout appears.
+  if (structuredBridgeIsCodex() && lastInitConfig?.adoptMode && currentCodexObservedPid()) {
+    if (!codexHistorySidOwnedByCurrentPid(cliSessionId)) {
+      log(`Codex initial-attach refused for unverified session ${cliSessionId}; keeping poller armed on pid ${currentCodexObservedPid()}`);
+      codexBridgePendingSessionId = undefined;
+      codexBridgeStartTimer();
+      return;
+    }
+  }
   const path = resolveFileBridgePath(lastInitConfig?.cliId, {
     sessionId: cliSessionId,
     cwd: lastInitConfig?.workingDir,
@@ -4021,6 +4165,12 @@ function codexBridgeIngest(opts: { signalIdle?: boolean } = {}): void {
   const result = structuredBridgeIngestPath(codexBridgeRolloutPath, codexBridgeOffset);
   codexBridgeOffset = result.newOffset;
   codexBridgePendingTail = result.pendingTail;
+  if (structuredBridgeIsCodex()) {
+    codexServiceTierTracker.observe(
+      codexBridgeRolloutPath,
+      (result as CodexDrainResult).latestThreadSettings,
+    );
+  }
   if (result.events.length > 0) lastStructuredBridgeActivityAtMs = Date.now();
   codexBridgeQueue.ingest(result.events);
   // Transcript-driven idle: an `assistant_final` event is the CLI declaring
@@ -4172,6 +4322,7 @@ function stopCodexBridge(): void {
     clearInterval(codexBridgeTimer);
     codexBridgeTimer = null;
   }
+  codexServiceTierTracker.detach();
   codexBridgeRolloutPath = undefined;
   codexBridgeOffset = 0;
   codexBridgePendingTail = '';
@@ -5586,6 +5737,13 @@ function adapterInputHandle(target: SessionBackend): PtyHandle {
   return target instanceof ZmxBackend
     ? strictInputHandle(target)
     : target;
+}
+
+function codexAdoptComposerConflict(target: SessionBackend): string | undefined {
+  if (lastInitConfig?.cliId !== 'codex' || !lastInitConfig.adoptMode) return undefined;
+  const state = detectCodexComposerState(target.captureInputState?.());
+  if (state !== 'draft') return undefined;
+  return t('worker.codex_composer_conflict');
 }
 
 let ambiguousSubmissionWriteTail: Promise<void> = Promise.resolve();
@@ -11853,6 +12011,21 @@ process.on('message', async (raw: unknown) => {
             const submissionBackend = backend;
             const submissionAdapter = cliAdapter;
             let recoveryFailureReason: string | undefined;
+            const composerConflict = codexAdoptComposerConflict(submissionBackend);
+            if (composerConflict) {
+              log('Refused Codex adopt input because the local composer contains an unsubmitted draft');
+              scheduleSubmitFailureNotify(
+                content,
+                undefined,
+                'submit history',
+                undefined,
+                composerConflict,
+                turnSeq,
+                msg,
+                'failed',
+              );
+              return;
+            }
             try {
               const transaction = await runAmbiguousSubmissionTransaction(
                 submissionBackend,

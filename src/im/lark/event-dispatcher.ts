@@ -2300,11 +2300,16 @@ async function resolveSummaryCommandMatch(input: {
   if (!triggerText) return undefined;
   const chatKind = await classifySummaryChatKind(input);
   if (!chatKind) return undefined;
+  const botConfig = getBot(input.larkAppId).config;
   return {
     chatKind,
     triggerText,
-    range: summaryRangeFromBotConfig(getBot(input.larkAppId).config),
+    range: summaryRangeFromBotConfig(botConfig),
     prompt: DEFAULT_SUMMARY_PROMPT,
+    summaryMemory: botConfig.summaryMemory === true,
+    summaryMemoryPath: typeof botConfig.summaryMemoryPath === 'string' && botConfig.summaryMemoryPath.trim()
+      ? botConfig.summaryMemoryPath.trim()
+      : 'summary.md',
   };
 }
 

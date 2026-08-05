@@ -117,7 +117,7 @@ export { DAEMON_COMMANDS, PASSTHROUGH_COMMANDS };
  * card buttons routable, but for these that record is a phantom conversation
  * that pollutes the dashboard's session list. Handle them without a session.
  */
-export const SESSIONLESS_DAEMON_COMMANDS = new Set(['/group', '/g', '/list-slash-command', '/slash', '/botconfig', '/dashboard', '/skills', '/vc-auth', '/watch-comment']);
+export const SESSIONLESS_DAEMON_COMMANDS = new Set(['/group', '/g', '/list-slash-command', '/slash', '/botconfig', '/dashboard', '/skills', '/vc-auth', '/watch-comment', '/issue']);
 
 const SLASH_GROUP_NAME_MAX_UTF16_LENGTH = 50;
 
@@ -2037,6 +2037,45 @@ export async function handleCommand(
         break;
       }
 
+      // Issue Board：`/issue` 出看板卡片，后续都在卡片上就地操作（见 issue-command）。
+      // 权限门（allowedUsers + invoker lock）在 handler 里，命令入口和每次回调各跑一遍。
+      case '/issue': {
+        const appId = larkAppId ?? ds?.larkAppId;
+        if (!appId) {
+          await sessionReply(rootId, t('cmd.config.no_bot', undefined, loc));
+          break;
+        }
+        const sub = message.content.replace(/^\/issue\s*/i, '').trim().split(/\s+/, 1)[0]?.toLowerCase();
+        const { handleIssueCommand, handleIssueDone, handleIssueRelease, handleIssueStatus } =
+          await import('../im/lark/issue-command.js');
+        const { buildIssueCommandDeps } = await import('../im/lark/issue-command-deps.js');
+
+        // 这三个子命令都在**领取时建出来的那个群里**发，锚点从当前会话推。两个候选按
+        // sessionAnchorId 的语义给（拉群 → chatId，话题 → rootMessageId），由 handler 依次试。
+        const anchors = [message.chatId, rootId];
+        if (sub === 'release' || sub === 'done') {
+          const handler = sub === 'done' ? handleIssueDone : handleIssueRelease;
+          const rel = await handler(appId, message.senderId, anchors, buildIssueCommandDeps());
+          await sessionReply(rootId, rel.toast.content);
+          logger.info(`[${logTag}] Issue ${sub} handled: ${rel.toast.type}`);
+          break;
+        }
+
+        if (sub === 'status') {
+          const st = await handleIssueStatus(appId, message.senderId, anchors, buildIssueCommandDeps());
+          if ('card' in st) await sessionReply(rootId, st.card, 'interactive');
+          else await sessionReply(rootId, st.toast.content);
+          logger.info(`[${logTag}] Issue status handled: ${'card' in st ? 'card' : 'toast'}`);
+          break;
+        }
+
+        const r = await handleIssueCommand(appId, message.senderId, buildIssueCommandDeps());
+        if ('card' in r) await sessionReply(rootId, r.card, 'interactive');
+        else await sessionReply(rootId, r.toast.content);
+        logger.info(`[${logTag}] Issue command handled: ${'card' in r ? 'card' : 'toast'}`);
+        break;
+      }
+
       case '/skills': {
         const appId = larkAppId ?? ds?.larkAppId;
         if (!appId) {
@@ -3652,6 +3691,7 @@ export async function handleCommand(
           t('help.card', undefined, loc),
           t('help.term', undefined, loc),
           t('help.dashboard', undefined, loc),
+          t('help.issue', undefined, loc),
           t('help.insight', undefined, loc),
           t('help.subscribe_doc', undefined, loc),
           t('help.watch_comment', undefined, loc),

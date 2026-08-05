@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, writeFileSync, appendFileSync, rmSync, statSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { drainCodexRollout, codexSessionIdFromRolloutPath, findCodexRolloutBySessionId, findCodexSessionIdByBotmuxSessionId, splitCodexEventsByCutoff, extractLastCodexTurn, type CodexBridgeEvent } from '../src/services/codex-transcript.js';
+import { drainCodexRollout, codexSessionIdFromRolloutPath, findCodexRolloutBySessionId, findCodexSessionIdByBotmuxSessionId, codexHistorySidIsOwned, splitCodexEventsByCutoff, extractLastCodexTurn, scanCodexThreadSettings, type CodexBridgeEvent } from '../src/services/codex-transcript.js';
 
 let dir: string;
 let path: string;
@@ -99,6 +99,42 @@ describe('findCodexRolloutBySessionId', () => {
       else process.env.CODEX_HOME = prevCodexHome;
       rmSync(codexHome, { recursive: true, force: true });
     }
+  });
+});
+
+describe('codexHistorySidIsOwned (pure attach-ownership decision)', () => {
+  // This is the exact predicate BOTH worker attach entry points (notify
+  // re-attach + initial-attach guard) consult via codexHistorySidOwnedByCurrentPid.
+  // Testing it directly proves "owned B is selected, foreign A is rejected"
+  // without a live worker — and without a parallel copy of the decision.
+  const OWNED = 'aaaaaaaa-aaaa-7aaa-8aaa-aaaaaaaaaaaa';
+  const SIBLING = 'bbbbbbbb-bbbb-7bbb-8bbb-bbbbbbbbbbbb';
+  const FOREIGN = 'cccccccc-cccc-7ccc-8ccc-cccccccccccc';
+
+  it('accepts an owned sid (single-rollout pid)', () => {
+    expect(codexHistorySidIsOwned(OWNED, new Set([OWNED]))).toBe(true);
+  });
+
+  it('accepts EITHER owned sid in the parent+sibling multi-rollout case', () => {
+    const owned = new Set([OWNED, SIBLING]);
+    expect(codexHistorySidIsOwned(OWNED, owned)).toBe(true);
+    expect(codexHistorySidIsOwned(SIBLING, owned)).toBe(true);
+  });
+
+  it('rejects a foreign sid (shared-CODEX_HOME sibling pane collision)', () => {
+    expect(codexHistorySidIsOwned(FOREIGN, new Set([OWNED, SIBLING]))).toBe(false);
+  });
+
+  it('is case-insensitive on the sid', () => {
+    expect(codexHistorySidIsOwned(OWNED.toUpperCase(), new Set([OWNED]))).toBe(true);
+  });
+
+  it('fails closed when the owned set is unavailable (fd enumeration failed)', () => {
+    expect(codexHistorySidIsOwned(OWNED, undefined)).toBe(false);
+  });
+
+  it('fails closed against an empty owned set (pid holds no rollout yet)', () => {
+    expect(codexHistorySidIsOwned(OWNED, new Set())).toBe(false);
   });
 });
 
@@ -426,5 +462,113 @@ describe('drainCodexRollout', () => {
     const r2 = drainCodexRollout(path, r1.newOffset);
     expect(r2.events).toHaveLength(1);
     expect(r2.events[0].text).toBe('s');
+  });
+});
+
+function threadSettingsApplied(serviceTier: string, ts = '2026-04-29T07:00:00.000Z', model = 'gpt-5.6-sol') {
+  return {
+    timestamp: ts,
+    type: 'event_msg',
+    payload: {
+      type: 'thread_settings_applied',
+      thread_settings: {
+        model,
+        model_provider_id: 'byteseed',
+        service_tier: serviceTier,
+      },
+    },
+  };
+}
+
+describe('Codex thread settings observation', () => {
+  it('returns undefined when the rollout has no applied-settings record yet', () => {
+    writeFileSync(path,
+      ev(userResponseItem('hi')) + ev(assistantFinalResponseItem('hello')));
+    expect(scanCodexThreadSettings(path)).toBeUndefined();
+  });
+
+  it('returns undefined for a missing / empty rollout file', () => {
+    expect(scanCodexThreadSettings(join(dir, 'does-not-exist.jsonl'))).toBeUndefined();
+    writeFileSync(path, '');
+    expect(scanCodexThreadSettings(path)).toBeUndefined();
+  });
+
+  it('reads the applied model and service tier', () => {
+    writeFileSync(path,
+      ev(threadSettingsApplied('default')) + ev(userResponseItem('hi')));
+    expect(scanCodexThreadSettings(path)).toEqual({
+      model: 'gpt-5.6-sol',
+      serviceTier: 'default',
+    });
+  });
+
+  it('returns the LATEST applied tier when the session switched mid-way', () => {
+    writeFileSync(path,
+      ev(threadSettingsApplied('default', '2026-04-29T07:00:00.000Z')) +
+      ev(userResponseItem('go fast')) +
+      ev(threadSettingsApplied('priority', '2026-04-29T07:05:00.000Z')) +
+      ev(assistantFinalResponseItem('done')));
+    expect(scanCodexThreadSettings(path)).toEqual({
+      model: 'gpt-5.6-sol',
+      serviceTier: 'priority',
+    });
+  });
+
+  it('ignores non-settings lines and tolerates malformed json', () => {
+    writeFileSync(path,
+      'not json at all\n' +
+      ev(userResponseItem('hi')) +
+      ev(threadSettingsApplied('priority')) +
+      'still garbage\n');
+    expect(scanCodexThreadSettings(path)?.serviceTier).toBe('priority');
+  });
+
+  it('does not confuse a settings event that carries no service_tier', () => {
+    writeFileSync(path, ev({
+      timestamp: '2026-04-29T07:00:00.000Z',
+      type: 'event_msg',
+      payload: { type: 'thread_settings_applied', thread_settings: { model: 'x' } },
+    }));
+    expect(scanCodexThreadSettings(path)).toBeUndefined();
+  });
+
+  it('reports the latest settings from the newly appended byte range', () => {
+    writeFileSync(path,
+      ev(threadSettingsApplied('default')) + ev(userResponseItem('first')));
+    const first = drainCodexRollout(path, 0);
+    expect(first.latestThreadSettings).toEqual({
+      model: 'gpt-5.6-sol',
+      serviceTier: 'default',
+    });
+
+    // Both toggles can land between two 1s bridge polls. The final executor
+    // state must still be observed even when no PTY screen update follows.
+    appendFileSync(path,
+      ev(threadSettingsApplied('priority', '2026-04-29T07:01:00.000Z'))
+      + ev(threadSettingsApplied('default', '2026-04-29T07:01:00.100Z')));
+    const second = drainCodexRollout(path, first.newOffset);
+
+    expect(second.events).toEqual([]);
+    expect(second.latestThreadSettings).toEqual({
+      model: 'gpt-5.6-sol',
+      serviceTier: 'default',
+    });
+  });
+
+  it('reverse-scans across chunk and UTF-8 boundaries without loading the whole rollout', () => {
+    const latest = ev(threadSettingsApplied('priority', '2026-04-29T07:05:00.000Z'));
+    // 900 trailing bytes force the preceding settings line to straddle the
+    // scanner's 1024-byte read boundary. Earlier multi-byte content exercises
+    // the byte-oriented carry path as well.
+    writeFileSync(path,
+      ev(threadSettingsApplied('default'))
+      + ev(userResponseItem('边界'.repeat(800)))
+      + latest
+      + `${'x'.repeat(899)}\n`);
+
+    expect(scanCodexThreadSettings(path, { chunkBytes: 1024 })).toEqual({
+      model: 'gpt-5.6-sol',
+      serviceTier: 'priority',
+    });
   });
 });

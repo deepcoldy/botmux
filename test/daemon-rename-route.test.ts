@@ -402,6 +402,99 @@ describe('/rename production routing — must not pre-create a session (review P
     expect(mocks.updateSession).toHaveBeenCalledWith(ds.session);
   });
 
+  it('routes Codex /fast verbatim to a live session but never cold-starts one', async () => {
+    const bot = registerBot({
+      larkAppId: APP,
+      larkAppSecret: 's',
+      cliId: 'codex',
+      allowedUsers: [OWNER],
+      oncallChats: [{ chatId: CHAT, workingDir: '/tmp' }],
+    });
+    bot.resolvedAllowedUsers = [OWNER];
+
+    // Live session: /fast is forwarded verbatim as a passthrough keystroke.
+    const send = vi.fn();
+    const live = seedLiveChatSession(send);
+    live.session.cliId = 'codex';
+    await handleThreadReply(
+      makeEventData('om_fast_live', '/fast', 'om_fast_reply_root'),
+      {
+        chatId: CHAT,
+        messageId: 'om_fast_live',
+        chatType: 'group',
+        scope: 'chat',
+        anchor: CHAT,
+        replyRootId: 'om_fast_reply_root',
+        larkAppId: APP,
+      },
+    );
+    expect(send).toHaveBeenCalledWith({
+      type: 'raw_input',
+      content: '/fast',
+      turnId: 'om_fast_live',
+    });
+
+    // Cold (no existing session): /fast is a tier toggle, not "start work", so
+    // owner policy is it must NOT cold-start a session — reply requires-session,
+    // create nothing, fork nothing. (Regression guard: an earlier revision had
+    // /fast in the codex adapter default and would spawn a worker here.)
+    activeSessions.clear();
+    mocks.forkWorker.mockClear();
+    mocks.replyMessage.mockClear();
+    await handleThreadReply(
+      makeEventData('om_fast_cold', '/fast', 'om_fast_cold_root'),
+      makeCtx('om_fast_cold_root', 'om_fast_cold'),
+    );
+    expect(activeSessions.get(sessionKey('om_fast_cold_root', APP))).toBeUndefined();
+    expect(mocks.forkWorker).not.toHaveBeenCalled();
+    expect(mocks.createSession).not.toHaveBeenCalled();
+    // Rejected without spawning — the exact copy ("needs an active CLI" vs
+    // "requires an existing session") is not what this guards; the point is
+    // no cold-start.
+    expect(repliedText()).toMatch(/需要活跃的 CLI 进程|需要在已有会话内使用/);
+  });
+
+  it('fails closed on /fast for RPC-input / Riff backends (no raw_input, clear reply)', async () => {
+    const bot = registerBot({
+      larkAppId: APP,
+      larkAppSecret: 's',
+      cliId: 'codex',
+      allowedUsers: [OWNER],
+      oncallChats: [{ chatId: CHAT, workingDir: '/tmp' }],
+    });
+    bot.resolvedAllowedUsers = [OWNER];
+
+    // A codex session whose backend can't receive the /fast keystroke: Riff runs
+    // turns off the terminal (text+CR would become two remote tasks); RPC input
+    // mode's pane is a pure viewer. Either way the toggle can't reach the
+    // executor, so /fast must be rejected — never delivered as a no-op/junk.
+    for (const setup of [
+      (ds: any) => { ds.session.backendType = 'riff'; },
+      (ds: any) => { ds.initConfig = { type: 'init', codexRpcInput: true }; },
+    ]) {
+      activeSessions.clear();
+      mocks.replyMessage.mockClear();
+      const send = vi.fn();
+      const ds = seedLiveChatSession(send);
+      ds.session.cliId = 'codex';
+      setup(ds);
+      await handleThreadReply(
+        makeEventData('om_fast_fc', '/fast', 'om_fast_fc_root'),
+        {
+          chatId: CHAT,
+          messageId: 'om_fast_fc',
+          chatType: 'group',
+          scope: 'chat',
+          anchor: CHAT,
+          replyRootId: 'om_fast_fc_root',
+          larkAppId: APP,
+        },
+      );
+      expect(send).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'raw_input' }));
+      expect(repliedText()).toMatch(/切不了 Codex 档位|can't toggle/);
+    }
+  });
+
   it('pending raw same-caller follow-up rotates both staged turns to the latest message', async () => {
     const anchor = 'om_pending_raw_root';
     const ds = seedPendingRawSession(anchor);

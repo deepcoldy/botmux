@@ -39,5 +39,8 @@ src/desktop/assets/*.png
 
 # 内网独立仓 / 网关配置：各自有独立 git 仓，含内网部署信息，
 # 绝不并入这个公开仓。防 `git add .` 误提交。
-platform/
-mcp-gateway/
+# 必须用 `/` 锚定到仓库根：不锚定的 `platform/` 会连 `src/platform/`（隧道绑定、
+# 设备注册这些正经源码）一起吃掉——已跟踪的文件不受影响，但**新增**文件会被
+# 静默忽略，`git add` 只报一行提示，很容易漏提交。
+/platform/
+/mcp-gateway/

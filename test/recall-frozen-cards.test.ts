@@ -374,6 +374,8 @@ describe('restoreUsageLimitRuntimeState', () => {
       { context: null, tokens: null, turnTokens: null },
       // 18th arg: no configured runtime display name for this Claude fixture.
       undefined,
+      // 19th arg: Codex Fast tier badge — undefined for this non-Codex fixture.
+      undefined,
     );
     expect(updateMessageMock).toHaveBeenCalledWith(APP_ID, 'om_live_limit', '{}');
   });
@@ -455,6 +457,10 @@ describe('parkStreamCard', () => {
     ds.currentTurnTitle = 'Some turn';
     ds.displayMode = 'screenshot';
     ds.currentImageKey = 'img_key_xyz';
+    ds.session.cliId = 'codex';
+    ds.codexServiceTier = {
+      model: 'gpt-5.6-sol', serviceTier: 'priority', nonDefault: true,
+    };
 
     parkStreamCard(ds);
 
@@ -465,8 +471,24 @@ describe('parkStreamCard', () => {
     expect(entry?.title).toBe('Some turn');
     expect(entry?.displayMode).toBe('screenshot');
     expect(entry?.imageKey).toBe('img_key_xyz');
+    expect(entry?.codexServiceTierBadge).toBe('⚡ priority');
+    expect(ds.parkedStreamCardNonce).toBe('nonce_live');
     expect(saveFrozenCardsMock).toHaveBeenCalledTimes(1);
     expect(saveFrozenCardsMock).toHaveBeenCalledWith(SESSION_ID, ds.frozenCards);
+  });
+
+  it('does not leak a stale Codex tier snapshot into a non-Codex frozen card', () => {
+    const ds = makeDs();
+    ds.streamCardId = 'om_live';
+    ds.streamCardNonce = 'nonce_live';
+    ds.session.cliId = 'claude-code';
+    ds.codexServiceTier = {
+      model: 'gpt-5.6-sol', serviceTier: 'priority', nonDefault: true,
+    };
+
+    parkStreamCard(ds);
+
+    expect(ds.frozenCards?.get('nonce_live')?.codexServiceTierBadge).toBeUndefined();
   });
 
   it('is a no-op when streamCardId is missing', () => {
