@@ -13,7 +13,7 @@
  * Run:  pnpm vitest run test/mojo-worker-wiring.integration.test.ts
  */
 import { spawn, type ChildProcess } from 'node:child_process';
-import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 
@@ -96,7 +96,9 @@ async function runWorker(opts: {
   /** Point cliPathOverride at the fake binary written for this run. */
   cliPathOverrideFromBin?: boolean;
 }): Promise<RunResult> {
-  const root = mkdtempSync(join(tmpdir(), 'botmux-mojo-worker-'));
+  // realpathSync: macOS os.tmpdir() is a symlink (/var → /private/var); the child
+  // reports the resolved path, so normalize here to keep cwd assertions portable.
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'botmux-mojo-worker-')));
   const dump = join(root, 'invocation.json');
   const bin = writeFakeMojo(root, opts.binName ?? 'mojo');
   let child: ChildProcess | undefined;
@@ -303,10 +305,38 @@ describe('mojo worker wiring', () => {
     expect(invocation.argv).toContain('hello mojo');
   }, 40_000);
 
+  it('applies CLI_EXTRA_ARGS even with no wrapper configured', async () => {
+    // The mojo adapter's buildArgs() returns [], so anything reaching spawn()
+    // came from the worker's shared arg pipeline. Dropping it made the flag work
+    // WITH a wrapper (buildWrappedLaunch folds spawnArgs into the prefix) and
+    // vanish without one — a config-dependent inconsistency.
+    const { invocation } = await runWorker({
+      workerEnv: { CLI_EXTRA_ARGS: '--timeout 77' },
+      botEntry: { mojo: { cloud: true } },
+      init: { backendConfig: { cloud: true } },
+    });
+    expect(invocation.argv).toContain('--timeout');
+    expect(invocation.argv[invocation.argv.indexOf('--timeout') + 1]).toBe('77');
+    // The positional prompt must stay LAST.
+    expect(invocation.argv[invocation.argv.length - 1]).toContain('hello mojo');
+  }, 40_000);
+
+  it('does not launch a wrapper declared only inside the mojo block', async () => {
+    // The worker builds the prefix from the TOP-LEVEL wrapperCli only, so a block
+    // value must not take effect on the run path either. Paired with the
+    // cancel-path test in mojo-orphan-cancel.test.ts, this pins that both paths
+    // agree — the divergence review found was run-bare / cancel-wrapped.
+    const { invocation } = await runWorker({
+      botEntry: { mojo: { cloud: true, wrapperCli: 'env WRAPPER_MARK=nested mojo' } },
+      init: { backendConfig: { cloud: true, wrapperCli: 'env WRAPPER_MARK=nested mojo' } },
+    });
+    expect(invocation.env.WRAPPER_MARK).toBeUndefined();
+  }, 40_000);
+
   it('refuses to start a locally-executing mojo bot that requested sandbox', async () => {
     // cloud is NOT set here, so tools would run on this host while the user
     // believes the sandbox is active. Fail closed rather than silently skipping.
-    const root = mkdtempSync(join(tmpdir(), 'botmux-mojo-sbx-'));
+    const root = realpathSync(mkdtempSync(join(tmpdir(), 'botmux-mojo-sbx-')));
     let child: ChildProcess | undefined;
     const logs: string[] = [];
     try {

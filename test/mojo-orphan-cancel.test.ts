@@ -10,7 +10,7 @@
  *
  * Run:  pnpm vitest run test/mojo-orphan-cancel.test.ts
  */
-import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { readFileSync as readSource } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -61,7 +61,9 @@ function readDump(dumpPath: string): Dump {
   return JSON.parse(readFileSync(dumpPath, 'utf-8')) as Dump;
 }
 
-beforeEach(() => { root = mkdtempSync(join(tmpdir(), 'botmux-mojo-orphan-')); });
+// realpathSync: on macOS os.tmpdir() is a symlink (/var → /private/var), so a
+// child process reports the RESOLVED cwd and a raw comparison would fail there.
+beforeEach(() => { root = realpathSync(mkdtempSync(join(tmpdir(), 'botmux-mojo-orphan-'))); });
 afterEach(() => { rmSync(root, { recursive: true, force: true }); });
 
 describe('buildEffectiveMojoConfig', () => {
@@ -172,6 +174,35 @@ describe('workerless orphan cancel', () => {
     }
   }, 30_000);
 
+  it('does NOT apply a wrapper that exists only in the mojo block', async () => {
+    // This is the exact divergence review reproduced: the worker builds its prefix
+    // from the top-level wrapperCli only, but the cancel path resolves the prefix
+    // from config — so a block-only wrapper meant "run bare, cancel wrapped",
+    // potentially cancelling through a different gateway/tenant than the one that
+    // created the remote session. buildEffectiveMojoConfig now drops it.
+    const dump = join(root, 'cancel-block-wrapper.json');
+    writeRecordingMojo('mojo');
+    process.env.MOJO_DUMP = dump;
+    const pathBefore = process.env.PATH;
+    process.env.PATH = `${root}:${pathBefore ?? ''}`;
+    try {
+      const cfg = buildEffectiveMojoConfig(
+        // A hand-edited bots.json could still contain this; `/config set mojo`
+        // rejects it outright.
+        { wrapperCli: 'env WRAPPER_MARK=nested mojo' } as never,
+        { cliPathOverride: join(root, 'mojo') },
+      );
+      expect(cfg.wrapperCli).toBeUndefined();
+
+      const ok = await cancelMojoSessionById(cfg, 'sid-orphan-4');
+      expect(ok).toBe(true);
+      expect(readDump(dump).env.WRAPPER_MARK).toBeUndefined();
+    } finally {
+      process.env.PATH = pathBefore;
+      delete process.env.MOJO_DUMP;
+    }
+  }, 30_000);
+
   it('reports failure (and does not throw) when the binary is missing', async () => {
     const ok = await cancelMojoSessionById(
       { bin: join(root, 'definitely-not-here') },
@@ -209,5 +240,41 @@ describe('daemon wires the shared builder into the workerless path', () => {
     for (const field of ['cliPathOverride', 'workingDir', 'env', 'wrapperCli']) {
       expect(region).toContain(`${field}:`);
     }
+  });
+});
+
+describe('workerless cancel uses the FROZEN launch identity', () => {
+  const src = readSource('src/core/worker-pool.ts', 'utf-8');
+
+  it('reads cliPathOverride/wrapperCli from the session, not live bot config', () => {
+    // Session semantics: cliId/cliPathOverride/wrapperCli/model are frozen at
+    // creation (see Session.agentFrozen) so later bot edits never retroactively
+    // change a live session. The remote session was created through the FROZEN
+    // wrapper/binary, so cancelling through whatever the bot has now can hit the
+    // wrong gateway or tenant. Crucially, `agentFrozen=true` with
+    // `wrapperCli=undefined` means "frozen as no-wrapper" and must NOT inherit a
+    // wrapper the bot gained afterwards.
+    const start = src.indexOf('function destroyOrphanedBackingSession');
+    expect(start).toBeGreaterThanOrEqual(0);
+    const region = src.slice(start, start + 3000);
+
+    const frozen = region.indexOf('frozenSessionLaunchIdentity(ds, botCfg)');
+    expect(frozen).toBeGreaterThanOrEqual(0);
+    expect(region.indexOf('cliPathOverride: frozenLaunch.cliPathOverride')).toBeGreaterThan(frozen);
+    expect(region.indexOf('wrapperCli: frozenLaunch.wrapperCli')).toBeGreaterThan(frozen);
+    // The live bot values must not be read for the launch identity.
+    expect(region).not.toContain('cliPathOverride: botCfg.cliPathOverride');
+    expect(region).not.toContain('wrapperCli: botCfg.wrapperCli');
+  });
+
+  it('gates on agentFrozen so only never-frozen legacy sessions fall back', () => {
+    const start = src.indexOf('function frozenSessionLaunchIdentity');
+    expect(start).toBeGreaterThanOrEqual(0);
+    const region = src.slice(start, start + 1200);
+    expect(region).toContain('ds.session.agentFrozen');
+    // Frozen branch returns the session values verbatim — no `??` bot fallback,
+    // which is what would resurrect a later-added wrapper.
+    const frozenBranch = region.slice(region.indexOf('if (ds.session.agentFrozen)'), region.indexOf('// Legacy'));
+    expect(frozenBranch).not.toContain('botCfg.');
   });
 });

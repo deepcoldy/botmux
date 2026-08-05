@@ -97,6 +97,27 @@ describe('mojo config surface', () => {
     expect(store.settableFieldKeys()).toContain('mojo');
   });
 
+  it('rejects wrapperCli inside the mojo block instead of silently dropping it', async () => {
+    // wrapperCli has one home: the top-level bot field the worker's wrapper
+    // handling is built around. A second copy would let the run path and the
+    // workerless cancel path use different wrappers. Rejecting visibly matters —
+    // a silent drop reads to the operator as "applied".
+    const store = await loaded();
+    const spec = store.findConfigField('mojo');
+    expect(spec).toBeDefined();
+
+    const rejected = store.coerceConfigValue(
+      spec!,
+      JSON.stringify({ cloud: true, wrapperCli: 'env X=1 mojo' }),
+    );
+    expect(rejected.ok).toBe(false);
+    if (!rejected.ok) expect(rejected.reason).toBe('mojo_wrapper_cli_top_level_only');
+
+    // The same block without wrapperCli is accepted.
+    const accepted = store.coerceConfigValue(spec!, JSON.stringify({ cloud: true }));
+    expect(accepted.ok).toBe(true);
+  });
+
   it('renders an empty / absent mojo block without leaking undefined', async () => {
     const store = await loaded({ cliId: 'mojo', backendType: 'mojo' });
     const snap = store.getConfigSnapshot('app_default');
