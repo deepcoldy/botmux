@@ -18,9 +18,13 @@ vi.mock('../src/utils/logger.js', () => ({
 
 import {
   diffMojoSessionIdentity,
+  findReservedMojoCliFlags,
   MOJO_CONTROL_ENV_KEYS,
   MOJO_IDENTITY_KEYS,
+  MOJO_LIVE_PATCH_KEYS,
+  mojoLivePatchDiffers,
   normalizeMojoConfig,
+  pickMojoLivePatch,
   pickMojoSessionIdentity,
 } from '../src/adapters/backend/mojo-types.js';
 import { isMojoFullyRemote, localSandboxApplies } from '../src/adapters/backend/sandbox.js';
@@ -264,5 +268,94 @@ describe('drift logging does not leak credentials', () => {
     );
     expect(drift.join('\n')).toContain('cloud: true → false');
     expect(drift.join('\n')).toContain('localDaemon: false → true');
+  });
+});
+
+describe('a launch prefix voids the remote-execution proof', () => {
+  it('treats a wrapperCli session as NOT provably remote', () => {
+    // buildEnv() sets AGENT_LOCAL_DAEMON=0, but the wrapper runs AFTER it and can
+    // rewrite the very input the decision depends on:
+    //   wrapperCli = "env AGENT_LOCAL_DAEMON=1 mojo"
+    // re-enables host execution while the local sandbox was already skipped on the
+    // strength of "provably remote". Inspecting the string is not enough either —
+    // a wrapper can be a script that sets it internally.
+    expect(isMojoFullyRemote({ cloud: true })).toBe(true);
+    expect(isMojoFullyRemote({ cloud: true, wrapperCli: 'env AGENT_LOCAL_DAEMON=1 mojo' })).toBe(false);
+    // Any wrapper at all, not just an obviously hostile one.
+    expect(isMojoFullyRemote({ cloud: true, wrapperCli: 'ttadk mojo' })).toBe(false);
+    // Blank/whitespace is not a wrapper.
+    expect(isMojoFullyRemote({ cloud: true, wrapperCli: '   ' })).toBe(true);
+  });
+
+  it('keeps the local sandbox engaged for a wrapped mojo session', () => {
+    expect(localSandboxApplies('mojo', { cloud: true })).toBe(false);
+    expect(localSandboxApplies('mojo', { cloud: true, wrapperCli: 'env X=1 mojo' })).toBe(true);
+  });
+});
+
+describe('reserved CLI flags', () => {
+  it('catches every spelling that reaches the CLI identically', () => {
+    expect(findReservedMojoCliFlags(['--workspace-id', 'b'])).toEqual(['--workspace-id']);
+    expect(findReservedMojoCliFlags(['--workspace-id=b'])).toEqual(['--workspace-id']);
+    expect(findReservedMojoCliFlags(['--cloud'])).toEqual(['--cloud']);
+    expect(findReservedMojoCliFlags(['--no-cloud'])).toEqual(['--no-cloud']);
+    expect(findReservedMojoCliFlags(['-r', 'sid'])).toEqual(['-r']);
+    expect(findReservedMojoCliFlags(['--yolo', '--agent-id=x']))
+      .toEqual(['--yolo', '--agent-id']);
+  });
+
+  it('leaves genuine behaviour overrides alone', () => {
+    expect(findReservedMojoCliFlags(['--idle-timeout', '77'])).toEqual([]);
+    expect(findReservedMojoCliFlags(['--timeout=30'])).toEqual([]);
+    expect(findReservedMojoCliFlags([])).toEqual([]);
+  });
+
+  it('does not mistake a positional value for a flag', () => {
+    // A prompt or path that happens to contain a reserved word must not trip it.
+    expect(findReservedMojoCliFlags(['please use --workspace-id carefully'])).toEqual([]);
+  });
+
+  it('reports each offending flag once', () => {
+    expect(findReservedMojoCliFlags(['--cloud', '--cloud'])).toEqual(['--cloud']);
+  });
+});
+
+describe('live credential patch', () => {
+  it('carries credentials and behaviour knobs, never the control plane', () => {
+    expect([...MOJO_LIVE_PATCH_KEYS]).toEqual([
+      'jwt', 'jwtEnv', 'env', 'stream', 'systemPrompt', 'idleTimeoutSec',
+    ]);
+    for (const identityKey of MOJO_IDENTITY_KEYS) {
+      expect([...MOJO_LIVE_PATCH_KEYS], `${identityKey} must stay frozen`)
+        .not.toContain(identityKey);
+    }
+  });
+
+  it('extracts only the live subset', () => {
+    expect(pickMojoLivePatch({
+      jwt: 'token', env: { A: 'b' }, cloud: true, baseUrl: 'https://x.example.com',
+    })).toEqual({ jwt: 'token', env: { A: 'b' } });
+  });
+
+  it('detects a rotated JWT as a real change', () => {
+    expect(mojoLivePatchDiffers({ jwt: 'old' }, { jwt: 'new' })).toBe(true);
+    expect(mojoLivePatchDiffers({ jwt: 'same' }, { jwt: 'same' })).toBe(false);
+  });
+
+  it('compares env by value, not by reference', () => {
+    // A fresh object with identical contents must not look like a change, or every
+    // turn would carry a redundant patch.
+    expect(mojoLivePatchDiffers({ env: { A: 'b' } }, { env: { A: 'b' } })).toBe(false);
+    expect(mojoLivePatchDiffers({ env: { A: 'b' } }, { env: { A: 'c' } })).toBe(true);
+    expect(mojoLivePatchDiffers({}, { env: {} })).toBe(false);
+  });
+
+  it('does not report a control-plane change as a live change', () => {
+    // Changing the endpoint must NOT be delivered to a live session — it is
+    // frozen, and a patch is not the escape hatch.
+    expect(mojoLivePatchDiffers(
+      { baseUrl: 'https://tenant-a.example.com' },
+      pickMojoLivePatch({ baseUrl: 'https://tenant-b.example.com' }),
+    )).toBe(false);
   });
 });

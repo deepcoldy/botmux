@@ -9,7 +9,7 @@
  *
  * Run:  pnpm vitest run test/mojo-backend.test.ts
  */
-import { chmodSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -248,5 +248,58 @@ describe('MojoBackend NDJSON framing', () => {
     // A late duplicate result (or a process exit after settle) must not re-fire.
     p.feed('{"type":"result","status":"ok","result":"y","session_id":"s","warnings":[]}\n');
     expect(p.done).toBe(1);
+  });
+});
+
+describe('MojoBackend.applyLivePatch', () => {
+  /** Records X_JWT_TOKEN for EVERY invocation, so turn 2 can be compared to turn 1. */
+  function jwtRecordingMojo(dumpPath: string): string {
+    const p = join(binDir, 'mojo');
+    writeFileSync(p, `#!/usr/bin/env bash
+echo "$X_JWT_TOKEN" >> ${dumpPath}
+echo '{"type":"system","subtype":"init","session_id":"sid-jwt"}'
+echo '{"type":"result","status":"ok","result":"ok","session_id":"sid-jwt","warnings":[]}'
+`);
+    chmodSync(p, 0o755);
+    return p;
+  }
+
+  it('a rotated JWT reaches the NEXT turn without a refork', async () => {
+    // The bug: config was read once at worker init, so every later per-turn
+    // invocation kept using the original token — a rotated credential never took
+    // effect, contradicting the "credentials stay live" contract.
+    const dump = join(binDir, 'jwts.txt');
+    const bin = jwtRecordingMojo(dump);
+    const backend = new MojoBackend({ bin, jwt: 'original-token' }, 'session-jwt');
+
+    const turn = () => new Promise<void>((resolveTurn) => {
+      backend.onTaskDone(() => resolveTurn());
+      backend.write('hi');
+    });
+
+    backend.spawn('', [], {} as never);
+    await turn();
+    backend.applyLivePatch({ jwt: 'rotated-token' });
+    await turn();
+
+    const seen = readFileSync(dump, 'utf-8').trim().split('\n');
+    expect(seen).toEqual(['original-token', 'rotated-token']);
+  }, 30_000);
+
+  it('ignores control-plane keys in a patch', () => {
+    // A patch must never become the escape hatch for the frozen control plane.
+    const backend = new MojoBackend({ cloud: true, baseUrl: 'https://tenant-a.example.com' }, 's');
+    backend.applyLivePatch({ jwt: 'x', ...{ baseUrl: 'https://tenant-b.example.com', cloud: false } } as never);
+    const cfg = (backend as unknown as { config: Record<string, unknown> }).config;
+    expect(cfg.baseUrl).toBe('https://tenant-a.example.com');
+    expect(cfg.cloud).toBe(true);
+    expect(cfg.jwt).toBe('x');
+  });
+
+  it('is a no-op when nothing actually changed', () => {
+    const backend = new MojoBackend({ jwt: 'same' }, 's');
+    const before = { ...(backend as unknown as { config: Record<string, unknown> }).config };
+    backend.applyLivePatch({ jwt: 'same' });
+    expect((backend as unknown as { config: Record<string, unknown> }).config).toEqual(before);
   });
 });

@@ -514,6 +514,84 @@ describe('mojo worker wiring', () => {
     expect(invocation.env.MOJO_PPE_ENV).toBe('ppe-1');
   }, 40_000);
 
+  it('refuses CLI_EXTRA_ARGS that override the frozen control plane', async () => {
+    // Extra args are appended AFTER the backend's flags so an operator can
+    // override behaviour knobs — but last-value-wins meant they could also
+    // override --workspace-id / --agent-id / --cloud / --yolo / -r, making env a
+    // second entry point for the identity that is frozen per session.
+    for (const extra of [
+      '--workspace-id workspace-b',
+      '--workspace-id=workspace-b',
+      '--agent-id other-agent',
+      '--cloud',
+      '--yolo',
+      '-r some-other-session',
+      '--model other-model',
+    ]) {
+      const root = realpathSync(mkdtempSync(join(tmpdir(), 'botmux-mojo-resv-')));
+      let child: ChildProcess | undefined;
+      const logs: string[] = [];
+      try {
+        const appId = 'app_mojo_reserved';
+        const botsPath = join(root, 'bots.json');
+        writeFileSync(botsPath, JSON.stringify([{
+          larkAppId: appId, larkAppSecret: 'secret',
+          cliId: 'mojo', backendType: 'mojo',
+          mojo: { cloud: true, workspaceId: 'workspace-a' },
+        }]));
+        writeFakeMojo(root);
+
+        const errors: string[] = [];
+        child = spawn(process.execPath, ['--import', 'tsx', resolve('src/worker.ts')], {
+          cwd: resolve('.'),
+          env: {
+            ...process.env,
+            HOME: root, SESSION_DATA_DIR: root, BOTS_CONFIG: botsPath,
+            BOTMUX_SESSION_ID: 'sid-mojo-resv',
+            LARK_APP_ID: appId, LARK_APP_SECRET: 'secret',
+            PATH: `${root}:${process.env.PATH ?? ''}`,
+            CLI_EXTRA_ARGS: extra,
+          },
+          stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+        });
+        child.stdout?.on('data', c => logs.push(c.toString()));
+        child.stderr?.on('data', c => logs.push(c.toString()));
+        child.on('message', raw => {
+          const msg = raw as WorkerToDaemon;
+          if (msg.type === 'error') errors.push(msg.message);
+        });
+
+        child.send({
+          type: 'init',
+          sessionId: 'sid-mojo-resv', chatId: 'oc_x', rootMessageId: 'om_x',
+          workingDir: root, cliId: 'mojo', backendType: 'mojo',
+          backendConfig: { cloud: true, workspaceId: 'workspace-a' },
+          prompt: 'should not run', larkAppId: appId, larkAppSecret: 'secret',
+        } as DaemonToWorker);
+
+        await waitFor(
+          () => errors.length > 0,
+          20_000,
+          () => `expected a refusal for CLI_EXTRA_ARGS="${extra}"\n${logs.join('')}`,
+        );
+        expect(errors.join('\n'), extra).toMatch(/CLI_EXTRA_ARGS|platform-owned/);
+      } finally {
+        if (child && child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+        rmSync(root, { recursive: true, force: true });
+      }
+    }
+  }, 120_000);
+
+  it('still accepts a non-reserved CLI_EXTRA_ARGS flag', async () => {
+    // The refusal must not break the legitimate override contract.
+    const { invocation } = await runWorker({
+      workerEnv: { CLI_EXTRA_ARGS: '--idle-timeout 77' },
+      botEntry: { mojo: { cloud: true } },
+      init: { backendConfig: { cloud: true } },
+    });
+    expect(invocation.argv).toContain('--idle-timeout');
+  }, 40_000);
+
   it('refuses to start a locally-executing mojo bot that requested sandbox', async () => {
     // cloud is NOT set here, so tools would run on this host while the user
     // believes the sandbox is active. Fail closed rather than silently skipping.
