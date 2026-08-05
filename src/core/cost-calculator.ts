@@ -1,6 +1,7 @@
 /**
  * Session cost calculator — computes token usage from JSONL logs.
  */
+import { createHash } from 'node:crypto';
 import { closeSync, constants, existsSync, fstatSync, openSync, readFileSync, readSync, statSync, type Stats } from 'node:fs';
 import { logger } from '../utils/logger.js';
 import type { CliId } from '../adapters/cli/types.js';
@@ -10,7 +11,7 @@ import {
   cachedTranscriptPathLookup,
   resolveSessionTranscriptPath,
 } from '../services/transcript-resolver.js';
-import { scanJsonlFromOffset } from '../services/jsonl-cursor.js';
+import { scanJsonlFromFd, scanJsonlFromOffset } from '../services/jsonl-cursor.js';
 import {
   isMeaningfulQueuedCommand,
   isMeaningfulUserEvent,
@@ -207,6 +208,9 @@ interface TokenUsageAggregate {
   turns: number;
   latestCodexUsage: SessionTokenUsage | null;
   latestContextUsage: SessionContextUsage | null;
+  latestCodexUsageSource: UsageSourceRecord | null;
+  latestContextUsageSource: UsageSourceRecord | null;
+  modelSource: UsageSourceRecord | null;
   /** Prompt-side (input + cache) and output tokens accumulated for the CURRENT
    *  user turn — reset when a new user message is seen (Claude). Lets the card
    *  show a small "this turn" delta alongside the large cumulative total. */
@@ -217,6 +221,27 @@ interface TokenUsageAggregate {
 /** Per-CLI transcript dialect. Each kind only counts the events that dialect
  *  defines as billable turns — no cross-CLI guessing on usage-shaped lines. */
 type UsageKind = 'claude' | 'codex' | 'coco' | 'pi' | 'generic';
+
+interface UsageSourceRecord {
+  offset: number;
+  byteLength: number;
+  sha256: string;
+}
+
+const CODEX_USAGE_SOURCE_RECORD_MAX_BYTES = 64 * 1024;
+
+function sourceRecordForLine(line: string, lineStart: number | undefined): UsageSourceRecord | null {
+  if (lineStart === undefined || lineStart < 0) return null;
+  const raw = Buffer.from(line, 'utf8');
+  if (raw.length > CODEX_USAGE_SOURCE_RECORD_MAX_BYTES) return null;
+  return {
+    offset: lineStart,
+    byteLength: raw.length,
+    sha256: createHash('sha256').update(raw).digest('hex'),
+  };
+}
+
+type UsageSourceRecordGetter = () => UsageSourceRecord | null;
 
 function usageKindForCli(cliId: SessionTokenUsageQuery['cliId']): UsageKind {
   switch (cliId) {
@@ -251,6 +276,9 @@ function newTokenUsageAggregate(): TokenUsageAggregate {
     turns: 0,
     latestCodexUsage: null,
     latestContextUsage: null,
+    latestCodexUsageSource: null,
+    latestContextUsageSource: null,
+    modelSource: null,
     turnInputTokens: 0,
     turnOutputTokens: 0,
   };
@@ -314,17 +342,29 @@ function foldClaudeLine(agg: TokenUsageAggregate, seenMessageIds: Set<string>, e
 /** Codex rollouts report cumulative totals via event_msg/token_count; only
  *  the latest snapshot counts. The active model rides on turn_context /
  *  session_meta payloads (latest wins — sessions can switch models). */
-function foldCodexLine(agg: TokenUsageAggregate, entry: any): void {
+function foldCodexLine(agg: TokenUsageAggregate, entry: any, getSource: UsageSourceRecordGetter): void {
   const contextUsage = extractCodexContextUsage(entry);
-  if (contextUsage) agg.latestContextUsage = contextUsage;
+  let source: UsageSourceRecord | null | undefined;
+  const sourceForTrackedMetric = () => {
+    source ??= getSource();
+    return source;
+  };
+  if (contextUsage) {
+    agg.latestContextUsage = contextUsage;
+    agg.latestContextUsageSource = sourceForTrackedMetric();
+  }
 
   const codexUsage = extractCodexTokenCountUsage(entry);
   if (codexUsage) {
     agg.latestCodexUsage = codexUsage;
+    agg.latestCodexUsageSource = sourceForTrackedMetric();
     return;
   }
   const m = entry?.payload?.model ?? entry?.payload?.collaboration_mode?.settings?.model;
-  if (typeof m === 'string' && m) agg.model = m;
+  if (typeof m === 'string' && m) {
+    agg.model = m;
+    agg.modelSource = sourceForTrackedMetric();
+  }
 }
 
 /** CoCo events: only assistant messages with response_meta.usage count; the
@@ -390,12 +430,18 @@ function foldGenericLine(agg: TokenUsageAggregate, seenMessageIds: Set<string>, 
   agg.turns++;
 }
 
-function foldUsageLine(kind: UsageKind, agg: TokenUsageAggregate, seenMessageIds: Set<string>, entry: any): void {
+function foldUsageLine(
+  kind: UsageKind,
+  agg: TokenUsageAggregate,
+  seenMessageIds: Set<string>,
+  entry: any,
+  getSource?: UsageSourceRecordGetter,
+): void {
   switch (kind) {
     case 'claude':
       return foldClaudeLine(agg, seenMessageIds, entry);
     case 'codex':
-      return foldCodexLine(agg, entry);
+      return foldCodexLine(agg, entry, getSource ?? (() => null));
     case 'coco':
       return foldCocoLine(agg, entry);
     case 'pi':
@@ -414,7 +460,7 @@ function readTokenUsageAggregate(path: string, kind: UsageKind): TokenUsageAggre
   try {
     let scanError: unknown = null;
     const scanned = scanJsonlFromOffset(path, 0, {
-      onLine: (line) => foldUsageJsonLine(kind, agg, seenMessageIds, line),
+      onLine: (line, lineStart) => foldUsageJsonLine(kind, agg, seenMessageIds, line, lineStart),
       onError: (error) => { scanError = error; },
     });
     if (!scanned) throw scanError instanceof Error ? scanError : new Error('scan failed');
@@ -457,6 +503,7 @@ type CachedUsageKind = UsageKind | 'aiden';
 
 interface UsageFileCacheEntry {
   mtimeMs: number;
+  ctimeMs: number;
   size: number;
   dev: number;
   ino: number;
@@ -511,46 +558,46 @@ function foldUsageText(kind: UsageKind, agg: TokenUsageAggregate, seenMessageIds
   }
 }
 
-function foldUsageJsonLine(kind: UsageKind, agg: TokenUsageAggregate, seenMessageIds: Set<string>, line: string): void {
+function foldUsageJsonLine(
+  kind: UsageKind,
+  agg: TokenUsageAggregate,
+  seenMessageIds: Set<string>,
+  line: string,
+  lineStart?: number,
+): void {
   if (!line.trim()) return;
   try {
-    foldUsageLine(kind, agg, seenMessageIds, JSON.parse(line));
+    const entry = JSON.parse(line);
+    if (kind !== 'codex') {
+      foldUsageLine(kind, agg, seenMessageIds, entry);
+      return;
+    }
+    let sourceCalculated = false;
+    let source: UsageSourceRecord | null = null;
+    foldUsageLine(kind, agg, seenMessageIds, entry, () => {
+      if (!sourceCalculated) {
+        source = sourceRecordForLine(line, lineStart);
+        sourceCalculated = true;
+      }
+      return source;
+    });
   } catch { /* skip malformed lines */ }
 }
 
-function openRegularUsageFile(path: string): number | null {
-  let fd: number | null = null;
-  try {
-    fd = openSync(path, constants.O_RDONLY | (constants.O_NONBLOCK ?? 0));
-    if (!fstatSync(fd).isFile()) {
-      closeSync(fd);
-      return null;
-    }
-    return fd;
-  } catch {
-    if (fd !== null) closeSync(fd);
-    return null;
-  }
-}
-
-function readFileProbe(path: string, offset: number, length: number): Buffer | null {
+function readFdProbe(fd: number, offset: number, length: number): Buffer | null {
   if (length <= 0) return Buffer.alloc(0);
-  const fd = openRegularUsageFile(path);
-  if (fd === null) return null;
   try {
     const buf = Buffer.alloc(length);
     const read = readSync(fd, buf, 0, length, offset);
     return buf.subarray(0, read);
   } catch {
     return null;
-  } finally {
-    closeSync(fd);
   }
 }
 
-function isJsonlLineBoundary(path: string, offset: number): boolean {
+function isJsonlLineBoundaryFd(fd: number, offset: number): boolean {
   if (offset <= 0) return true;
-  const probe = readFileProbe(path, offset - 1, 1);
+  const probe = readFdProbe(fd, offset - 1, 1);
   return !!probe && probe.length === 1 && probe[0] === 0x0a;
 }
 
@@ -570,119 +617,214 @@ function ensureUsageFileCacheCapacity(key: string): void {
   }
 }
 
-function usageFileFingerprint(path: string, st: Stats, offset: number): string | null {
+function usageFileFingerprintFromFd(fd: number, st: Stats, offset: number): string | null {
   if (offset <= 0) return null;
   const len = Math.min(USAGE_TRANSCRIPT_FRONTIER_FINGERPRINT_BYTES, offset);
   const start = offset - len;
-  const probe = readFileProbe(path, start, len);
+  const probe = readFdProbe(fd, start, len);
   if (!probe || probe.length !== len) return null;
   return `${st.dev}:${st.ino}:${start}:${probe.toString('base64')}`;
-}
-
-function isSameUsageFileGeneration(
-  cached: UsageFileCacheEntry,
-  st: Stats,
-  path: string,
-): boolean {
-  if (cached.dev !== st.dev || cached.ino !== st.ino) return false;
-  if (cached.frontierFingerprint === null) return false;
-  return usageFileFingerprint(path, st, cached.offset) === cached.frontierFingerprint;
 }
 
 function canReuseUsageCache(
   cached: UsageFileCacheEntry,
   st: Stats,
-  path: string,
-  opts: { validateFingerprint?: boolean } = {},
 ): boolean {
   if (!cached.canReadIncrementally) return false;
   if (st.size < cached.offset) return false;
-  if (cached.dev !== st.dev || cached.ino !== st.ino) return false;
-  if (!opts.validateFingerprint) return true;
-  return isSameUsageFileGeneration(cached, st, path);
+  return cached.dev === st.dev && cached.ino === st.ino;
 }
 
 function mergeCodexIndependentMetrics(
   next: TokenUsageAggregate,
   previous?: TokenUsageAggregate,
+  sourceValid?: {
+    latestCodexUsage: boolean;
+    latestContextUsage: boolean;
+    model: boolean;
+  },
 ): TokenUsageAggregate {
   if (!previous) return next;
+  const inheritModel = !next.model && !!previous.model && !!sourceValid?.model;
+  const inheritCodexUsage = !next.latestCodexUsage && !!previous.latestCodexUsage && !!sourceValid?.latestCodexUsage;
+  const inheritContextUsage = !next.latestContextUsage && !!previous.latestContextUsage && !!sourceValid?.latestContextUsage;
   return {
     ...next,
-    model: next.model || previous.model,
-    latestCodexUsage: next.latestCodexUsage ?? previous.latestCodexUsage,
-    latestContextUsage: next.latestContextUsage ?? previous.latestContextUsage,
+    model: next.model || (inheritModel ? previous.model : ''),
+    modelSource: next.model ? next.modelSource : (inheritModel ? previous.modelSource : null),
+    latestCodexUsage: next.latestCodexUsage ?? (inheritCodexUsage ? previous.latestCodexUsage : null),
+    latestCodexUsageSource: next.latestCodexUsage ? next.latestCodexUsageSource : (inheritCodexUsage ? previous.latestCodexUsageSource : null),
+    latestContextUsage: next.latestContextUsage ?? (inheritContextUsage ? previous.latestContextUsage : null),
+    latestContextUsageSource: next.latestContextUsage ? next.latestContextUsageSource : (inheritContextUsage ? previous.latestContextUsageSource : null),
   };
+}
+
+function sourceRecordKey(source: UsageSourceRecord): string {
+  return `${source.offset}:${source.byteLength}:${source.sha256}`;
+}
+
+function validateSourceRecord(fd: number, source: UsageSourceRecord | null | undefined, cache: Map<string, boolean>): boolean {
+  if (!source) return false;
+  if (source.byteLength <= 0 || source.byteLength > CODEX_USAGE_SOURCE_RECORD_MAX_BYTES) return false;
+  const key = sourceRecordKey(source);
+  const cached = cache.get(key);
+  if (cached !== undefined) return cached;
+  const raw = readFdProbe(fd, source.offset, source.byteLength);
+  let valid = raw !== null && raw.length === source.byteLength;
+  if (valid && raw) valid = createHash('sha256').update(raw).digest('hex') === source.sha256;
+  if (valid) {
+    const terminator = readFdProbe(fd, source.offset + source.byteLength, 1);
+    valid = !!terminator && terminator.length === 1 && terminator[0] === 0x0a;
+  }
+  cache.set(key, valid);
+  return valid;
+}
+
+function validateCodexSourceRecords(
+  fd: number,
+  previous?: TokenUsageAggregate,
+): { latestCodexUsage: boolean; latestContextUsage: boolean; model: boolean } {
+  const cache = new Map<string, boolean>();
+  return {
+    latestCodexUsage: validateSourceRecord(fd, previous?.latestCodexUsageSource, cache),
+    latestContextUsage: validateSourceRecord(fd, previous?.latestContextUsageSource, cache),
+    model: validateSourceRecord(fd, previous?.modelSource, cache),
+  };
+}
+
+function canReuseCodexAggregate(
+  previous: TokenUsageAggregate | undefined,
+  sourceValid: { latestCodexUsage: boolean; latestContextUsage: boolean; model: boolean } | undefined,
+): boolean {
+  if (!previous || !sourceValid) return false;
+  if (previous.latestCodexUsage && !sourceValid.latestCodexUsage) return false;
+  if (previous.latestContextUsage && !sourceValid.latestContextUsage) return false;
+  if (previous.model && !sourceValid.model) return false;
+  return true;
 }
 
 function cacheUsageRead(
   key: string,
-  path: string,
   st: Stats,
-  entry: Omit<UsageFileCacheEntry, 'mtimeMs' | 'size' | 'dev' | 'ino' | 'frontierFingerprint'>,
-  opts: { captureFingerprint?: boolean } = {},
+  entry: Omit<UsageFileCacheEntry, 'mtimeMs' | 'ctimeMs' | 'size' | 'dev' | 'ino' | 'frontierFingerprint'>,
 ): void {
   ensureUsageFileCacheCapacity(key);
   usageFileCache.set(key, {
     ...entry,
     mtimeMs: st.mtimeMs,
+    ctimeMs: st.ctimeMs,
     size: st.size,
     dev: st.dev,
     ino: st.ino,
-    frontierFingerprint: opts.captureFingerprint
-      ? usageFileFingerprint(path, st, entry.offset)
-      : null,
+    frontierFingerprint: null,
   });
 }
 
-function readOversizedCodexTokenAggregateCached(
+function cacheUsageReadWithFrontierFingerprint(
+  key: string,
+  st: Stats,
+  entry: Omit<UsageFileCacheEntry, 'mtimeMs' | 'ctimeMs' | 'size' | 'dev' | 'ino' | 'frontierFingerprint'>,
+  frontierFingerprint: string | null,
+): void {
+  ensureUsageFileCacheCapacity(key);
+  usageFileCache.set(key, {
+    ...entry,
+    mtimeMs: st.mtimeMs,
+    ctimeMs: st.ctimeMs,
+    size: st.size,
+    dev: st.dev,
+    ino: st.ino,
+    frontierFingerprint,
+  });
+}
+
+function readCodexTokenAggregateCached(
   key: string,
   path: string,
   st: Stats,
   cached: UsageFileCacheEntry | undefined,
   now: number,
+  retryOnRace = true,
 ): UsageReadResult | null {
+  let fd: number | null = null;
+  let fdStat: Stats;
+  try {
+    fd = openSync(path, constants.O_RDONLY | (constants.O_NONBLOCK ?? 0));
+    fdStat = fstatSync(fd);
+    if (!fdStat.isFile()) {
+      closeSync(fd);
+      usageFileCache.delete(key);
+      return { agg: newTokenUsageAggregate(), result: null };
+    }
+  } catch (error) {
+    if (fd !== null) closeSync(fd);
+    logger.error(`Failed to open Codex transcript ${path}: ${error instanceof Error ? error.message : String(error)}`);
+    usageFileCache.delete(key);
+    return null;
+  }
+  if (fdStat.dev !== st.dev || fdStat.ino !== st.ino || fdStat.size !== st.size) {
+    closeSync(fd);
+    usageFileCache.delete(key);
+    if (retryOnRace) {
+      return readCodexTokenAggregateCached(key, path, fdStat, undefined, now, false);
+    }
+    return { agg: newTokenUsageAggregate(), result: null };
+  }
   let state: TokenUsageAggregate;
   let seenMessageIds: Set<string>;
   let baseOffset: number;
   let dropInitialResidualLine = false;
-  const sameGeneration = !!cached && isSameUsageFileGeneration(cached, st, path);
-  const canInheritCachedMetrics = sameGeneration;
+  const previousAgg = cached?.previewAgg ? cloneAggregate(cached.previewAgg) : undefined;
+  // The frontier fingerprint only proves the durable cursor still points at
+  // the same byte frontier. Cached Codex metrics are inherited only after each
+  // metric's own source JSONL record passes validation below.
+  const cursorContinuityValid = !!cached
+    && cached.dev === fdStat.dev
+    && cached.ino === fdStat.ino
+    && cached.frontierFingerprint !== null
+    && usageFileFingerprintFromFd(fd, fdStat, cached.offset) === cached.frontierFingerprint;
+  const canInheritCachedMetrics = cursorContinuityValid
+    ? validateCodexSourceRecords(fd, previousAgg)
+    : undefined;
+  const canReuseCachedAggregate = canReuseCodexAggregate(previousAgg, canInheritCachedMetrics);
   const canReuseCachedOffset = !!cached
-    && sameGeneration
+    && cursorContinuityValid
+    && canReuseCachedAggregate
     && cached.canReadIncrementally
     && cached.offset > 0
-    && st.size >= cached.offset;
+    && fdStat.size >= cached.offset;
   const reuseCachedOffset = canReuseCachedOffset
-    && st.size - cached.offset <= CODEX_USAGE_TRANSCRIPT_TAIL_BYTES;
+    && fdStat.size - cached.offset <= CODEX_USAGE_TRANSCRIPT_TAIL_BYTES;
+  const oversized = fdStat.size > MAX_USAGE_TRANSCRIPT_BYTES;
 
   if (reuseCachedOffset) {
-    state = cached.state;
-    seenMessageIds = cached.seenMessageIds;
+    state = cloneAggregate(cached.state);
+    seenMessageIds = new Set(cached.seenMessageIds);
     baseOffset = cached.offset;
   } else {
     state = newTokenUsageAggregate();
     seenMessageIds = new Set();
-    baseOffset = Math.max(0, st.size - CODEX_USAGE_TRANSCRIPT_TAIL_BYTES);
-    dropInitialResidualLine = !isJsonlLineBoundary(path, baseOffset);
+    baseOffset = oversized ? Math.max(0, fdStat.size - CODEX_USAGE_TRANSCRIPT_TAIL_BYTES) : 0;
+    dropInitialResidualLine = oversized && !isJsonlLineBoundaryFd(fd, baseOffset);
   }
 
   let scanError: unknown = null;
   let droppedInitialResidualLine = false;
-  const scanned = scanJsonlFromOffset(path, baseOffset, {
-    endOffset: st.size,
-    onLine: (line) => {
+  const scanned = scanJsonlFromFd(fd, baseOffset, {
+    endOffset: fdStat.size,
+    onLine: (line, lineStart) => {
       if (dropInitialResidualLine) {
         dropInitialResidualLine = false;
         droppedInitialResidualLine = true;
         return;
       }
-      foldUsageJsonLine('codex', state, seenMessageIds, line);
+      foldUsageJsonLine('codex', state, seenMessageIds, line, lineStart);
     },
     onError: (error) => { scanError = error; },
   });
   if (!scanned) {
-    logger.error(`Failed to read oversized Codex transcript tail ${path}: ${scanError instanceof Error ? scanError.message : String(scanError)}`);
+    logger.error(`Failed to read Codex transcript slice ${path}: ${scanError instanceof Error ? scanError.message : String(scanError)}`);
+    closeSync(fd);
     usageFileCache.delete(key);
     return null;
   }
@@ -696,36 +838,86 @@ function readOversizedCodexTokenAggregateCached(
     foldUsageText('codex', previewAgg, new Set(seenMessageIds), tailText);
   }
 
+  const nextOffset = pendingTailIsInitialResidualLine ? baseOffset : baseOffset + completeBytes;
+  const nextFingerprint = usageFileFingerprintFromFd(fd, fdStat, nextOffset);
+  let endStat: Stats;
+  try {
+    endStat = fstatSync(fd);
+  } catch {
+    closeSync(fd);
+    usageFileCache.delete(key);
+    return { agg: newTokenUsageAggregate(), result: null };
+  }
+  if (
+    endStat.dev !== fdStat.dev
+    || endStat.ino !== fdStat.ino
+    || endStat.size !== fdStat.size
+    || endStat.mtimeMs !== fdStat.mtimeMs
+    || endStat.ctimeMs !== fdStat.ctimeMs
+  ) {
+    closeSync(fd);
+    usageFileCache.delete(key);
+    if (retryOnRace) {
+      return readCodexTokenAggregateCached(key, path, endStat, undefined, now, false);
+    }
+    return { agg: newTokenUsageAggregate(), result: null };
+  }
+
+  let pathStat: Stats;
+  try {
+    pathStat = statSync(path);
+  } catch {
+    closeSync(fd);
+    usageFileCache.delete(key);
+    return { agg: newTokenUsageAggregate(), result: null };
+  }
+  if (
+    pathStat.dev !== fdStat.dev
+    || pathStat.ino !== fdStat.ino
+    || pathStat.size !== fdStat.size
+    || pathStat.mtimeMs !== fdStat.mtimeMs
+    || pathStat.ctimeMs !== fdStat.ctimeMs
+  ) {
+    closeSync(fd);
+    usageFileCache.delete(key);
+    if (retryOnRace) {
+      return readCodexTokenAggregateCached(key, path, pathStat, undefined, now, false);
+    }
+    return { agg: newTokenUsageAggregate(), result: null };
+  }
+
   if (pendingTailIsInitialResidualLine) {
     // The bounded window starts in the middle of a JSONL record and no newline
     // has arrived yet. Cache safe stat/throttle metadata only; the stored
     // offset is not a reusable durable cursor, so any later change reboots from
     // a bounded tail instead of turning that suffix into a fake complete line.
-    const merged = mergeCodexIndependentMetrics(previewAgg, canInheritCachedMetrics ? cached?.previewAgg : undefined);
+    const merged = mergeCodexIndependentMetrics(previewAgg, previousAgg, canInheritCachedMetrics);
     const mergedResult = finalizeTokenUsage(merged);
-    cacheUsageRead(key, path, st, {
-      offset: baseOffset,
+    cacheUsageReadWithFrontierFingerprint(key, fdStat, {
+      offset: nextOffset,
       state,
       seenMessageIds,
       previewAgg: merged,
       result: mergedResult,
       parsedAtMs: now,
       canReadIncrementally: false,
-    }, { captureFingerprint: true });
+    }, nextFingerprint);
+    closeSync(fd);
     return { agg: merged, result: mergedResult };
   }
-  const merged = mergeCodexIndependentMetrics(previewAgg, canInheritCachedMetrics ? cached?.previewAgg : undefined);
+  const merged = mergeCodexIndependentMetrics(previewAgg, previousAgg, canInheritCachedMetrics);
   const mergedResult = finalizeTokenUsage(merged);
   const canReadIncrementally = reuseCachedOffset || aggregateHasCodexUsage(previewAgg);
-  cacheUsageRead(key, path, st, {
-    offset: baseOffset + completeBytes,
+  cacheUsageReadWithFrontierFingerprint(key, fdStat, {
+    offset: nextOffset,
     state,
     seenMessageIds,
     previewAgg: merged,
     result: mergedResult,
     parsedAtMs: now,
     canReadIncrementally,
-  }, { captureFingerprint: true });
+  }, nextFingerprint);
+  closeSync(fd);
   return { agg: merged, result: mergedResult };
 }
 
@@ -739,8 +931,11 @@ function readSessionTokenAggregateCached(path: string, kind: CachedUsageKind, op
   }
 
   if (!st) {
-    // Unstat-able (file gone, or mocked fs in unit tests): parse directly, uncached.
     usageFileCache.delete(key);
+    if (kind === 'codex') {
+      return { agg: newTokenUsageAggregate(), result: null };
+    }
+    // Unstat-able (file gone, or mocked fs in unit tests): parse directly, uncached.
     if (kind === 'aiden') {
       const result = readTokenUsageFromAidenCheckpoint(path);
       return result ? { agg: newTokenUsageAggregate(), result } : null;
@@ -752,15 +947,15 @@ function readSessionTokenAggregateCached(path: string, kind: CachedUsageKind, op
   const now = Date.now();
   const cached = usageFileCache.get(key);
   if (cached && cached.dev === st.dev && cached.ino === st.ino) {
-    const unchanged = cached.mtimeMs === st.mtimeMs && cached.size === st.size;
+    const unchanged = cached.mtimeMs === st.mtimeMs && cached.ctimeMs === st.ctimeMs && cached.size === st.size;
     const throttled = !opts?.fresh && now - cached.parsedAtMs < USAGE_REPARSE_MIN_INTERVAL_MS;
     if (unchanged || throttled) {
       return { agg: cached.previewAgg, result: cached.result };
     }
   }
 
-  if (st.size > MAX_USAGE_TRANSCRIPT_BYTES && kind === 'codex') {
-    return readOversizedCodexTokenAggregateCached(key, path, st, cached, now);
+  if (kind === 'codex') {
+    return readCodexTokenAggregateCached(key, path, st, cached, now);
   }
 
   if (st.size > MAX_USAGE_TRANSCRIPT_BYTES) {
@@ -781,7 +976,7 @@ function readSessionTokenAggregateCached(path: string, kind: CachedUsageKind, op
     // Checkpoints are rewritten whole — nothing incremental to exploit.
     const result = readTokenUsageFromAidenCheckpoint(path);
     const blank = newTokenUsageAggregate();
-    cacheUsageRead(key, path, st, {
+    cacheUsageRead(key, st, {
       offset: -1,
       state: blank,
       seenMessageIds: new Set(),
@@ -796,9 +991,7 @@ function readSessionTokenAggregateCached(path: string, kind: CachedUsageKind, op
   let state: TokenUsageAggregate;
   let seenMessageIds: Set<string>;
   let baseOffset: number;
-  if (cached && cached.offset > 0 && canReuseUsageCache(cached, st, path, {
-    validateFingerprint: kind === 'codex',
-  })) {
+  if (cached && cached.offset > 0 && canReuseUsageCache(cached, st)) {
     // Append-only growth: continue folding from the durable frontier.
     state = cached.state;
     seenMessageIds = cached.seenMessageIds;
@@ -812,7 +1005,7 @@ function readSessionTokenAggregateCached(path: string, kind: CachedUsageKind, op
   let scanError: unknown = null;
   const scanned = scanJsonlFromOffset(path, baseOffset, {
     endOffset: st.size,
-    onLine: (line) => foldUsageJsonLine(kind, state, seenMessageIds, line),
+    onLine: (line, lineStart) => foldUsageJsonLine(kind, state, seenMessageIds, line, lineStart),
     onError: (error) => { scanError = error; },
   });
   if (!scanned) {
@@ -834,7 +1027,7 @@ function readSessionTokenAggregateCached(path: string, kind: CachedUsageKind, op
   }
 
   const result = finalizeTokenUsage(previewAgg);
-  cacheUsageRead(key, path, st, {
+  cacheUsageRead(key, st, {
     offset: baseOffset + completeBytes,
     state,
     seenMessageIds,
@@ -842,7 +1035,7 @@ function readSessionTokenAggregateCached(path: string, kind: CachedUsageKind, op
     result,
     parsedAtMs: now,
     canReadIncrementally: true,
-  }, { captureFingerprint: kind === 'codex' });
+  });
   return { agg: previewAgg, result };
 }
 

@@ -7,6 +7,13 @@
  * Run:  pnpm vitest run test/cost-calculator-cache.test.ts
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+vi.mock('node:crypto', async (importOriginal) => {
+  const original = await importOriginal<typeof import('node:crypto')>();
+  return {
+    ...original,
+    createHash: vi.fn(original.createHash),
+  };
+});
 vi.mock('node:fs', async (importOriginal) => {
   const original = await importOriginal<typeof import('node:fs')>();
   return {
@@ -15,10 +22,12 @@ vi.mock('node:fs', async (importOriginal) => {
     openSync: vi.fn(original.openSync),
     readFileSync: vi.fn(original.readFileSync),
     readSync: vi.fn(original.readSync),
+    statSync: vi.fn(original.statSync),
   };
 });
 
-import { constants, fstatSync, mkdtempSync, openSync, writeFileSync, appendFileSync, rmSync, readFileSync, readSync, renameSync, statSync, truncateSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { closeSync, constants, fstatSync, mkdtempSync, openSync, writeFileSync, appendFileSync, rmSync, readFileSync, readSync, renameSync, statSync, truncateSync, utimesSync, writeSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -110,6 +119,18 @@ function codexSnapshotAtTailSize(path: string, line: string, finalSize: number):
   return { baseOffset, finalSize };
 }
 
+function codexSnapshotInsideTail(path: string, line: string, leadBytes: number, finalSize: number): { lineOffset: number; finalSize: number } {
+  const baseOffset = finalSize - CODEX_USAGE_TRANSCRIPT_TAIL_BYTES;
+  const lineOffset = baseOffset + leadBytes;
+  const lineBytes = Buffer.byteLength(line);
+  expect(lineBytes + leadBytes).toBeLessThan(CODEX_USAGE_TRANSCRIPT_TAIL_BYTES);
+  truncateSync(path, lineOffset - 1);
+  appendFileSync(path, '\n');
+  appendFileSync(path, line);
+  appendFileSync(path, Buffer.alloc(finalSize - lineOffset - lineBytes, 0x20));
+  return { lineOffset, finalSize };
+}
+
 function codexSnapshotAtTail(path: string, line: string): { baseOffset: number; finalSize: number } {
   return codexSnapshotAtTailSize(path, line, MAX_USAGE_TRANSCRIPT_BYTES + CODEX_USAGE_TRANSCRIPT_TAIL_BYTES + 1);
 }
@@ -136,13 +157,14 @@ function expectBoundedTailRead(baseOffset: number): void {
   );
 }
 
-function expectLargeDeltaBoundedTailRead(baseOffset: number): void {
+function expectLargeDeltaBoundedTailRead(baseOffset: number, sourceValidationBytes: number): void {
   const calls = vi.mocked(readSync).mock.calls;
   expect(calls.length).toBeGreaterThan(0);
   expect(calls.some((call) => Number(call[3]) === 1 && Number(call[4]) === baseOffset - 1)).toBe(true);
   const requestedBytes = calls.reduce((sum, call) => sum + Number(call[3]), 0);
   expect(requestedBytes).toBeLessThanOrEqual(
-    USAGE_TRANSCRIPT_FRONTIER_FINGERPRINT_BYTES
+    sourceValidationBytes
+    + USAGE_TRANSCRIPT_FRONTIER_FINGERPRINT_BYTES
     + 1
     + CODEX_USAGE_TRANSCRIPT_TAIL_BYTES
     + USAGE_TRANSCRIPT_FRONTIER_FINGERPRINT_BYTES,
@@ -151,6 +173,30 @@ function expectLargeDeltaBoundedTailRead(baseOffset: number): void {
 
 function fileSize(path: string): number {
   return statSync(path).size;
+}
+
+function readBytesAt(path: string, offset: number, length: number): Buffer {
+  const fd = openSync(path, 'r');
+  try {
+    const buf = Buffer.alloc(length);
+    const read = readSync(fd, buf, 0, length, offset);
+    return Buffer.from(buf.subarray(0, read));
+  } finally {
+    closeSync(fd);
+  }
+}
+
+function writeBytesAt(path: string, offset: number, content: string): void {
+  const fd = openSync(path, 'r+');
+  try {
+    writeSync(fd, Buffer.from(content), 0, Buffer.byteLength(content), offset);
+  } finally {
+    closeSync(fd);
+  }
+}
+
+function sleepSync(ms: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
 
 let dir: string;
@@ -162,9 +208,11 @@ beforeEach(() => {
   now = 1_000_000_000;
   vi.spyOn(Date, 'now').mockImplementation(() => now);
   vi.mocked(fstatSync).mockClear();
+  vi.mocked(createHash).mockClear();
   vi.mocked(openSync).mockClear();
   vi.mocked(readFileSync).mockClear();
   vi.mocked(readSync).mockClear();
+  vi.mocked(statSync).mockClear();
   vi.mocked(logger.warn).mockClear();
   vi.mocked(findCodexRolloutBySessionId).mockReset();
 });
@@ -324,6 +372,50 @@ describe('readSessionTokenUsageFile caching', () => {
     });
   });
 
+  it('keeps normal-size Codex appends incremental instead of rereading from byte zero', () => {
+    const p = join(dir, 'codex-normal-size-incremental.jsonl');
+    const initialLine = `${codexCountLine(100, 10, 20, { used: 30, window: 1_000 })}\n`;
+    writeFileSync(p, initialLine);
+    appendFileSync(p, `${'x'.repeat(2 * 1024 * 1024)}\n`);
+    expect(readSessionTokenUsageFile(p, 'codex', { fresh: true })).toMatchObject({
+      in: 100,
+      out: 10,
+    });
+
+    vi.mocked(readSync).mockClear();
+    const appended = `${codexCountLine(150, 20, 50, { used: 70, window: 1_000 })}\n`;
+    appendFileSync(p, appended);
+    vi.mocked(findCodexRolloutBySessionId).mockReturnValue(p);
+    now += 20_000;
+
+    expect(getSessionUsageSnapshot({
+      cliId: 'codex',
+      sessionId: 'botmux-sid',
+      cliSessionId: 'codex-sid',
+      fresh: true,
+    })).toEqual({
+      context: { usedTokens: 70, windowTokens: 1_000, percentUsed: 7 },
+      tokens: {
+        in: 150,
+        out: 20,
+        inputTokens: 100,
+        outputTokens: 20,
+        cacheReadTokens: 50,
+        cacheCreateTokens: 0,
+        model: '',
+        turns: 0,
+      },
+      turnTokens: null,
+    });
+    const requestedBytes = vi.mocked(readSync).mock.calls.reduce((sum, call) => sum + Number(call[3]), 0);
+    expect(requestedBytes).toBeLessThanOrEqual(
+      Buffer.byteLength(initialLine)
+      + USAGE_TRANSCRIPT_FRONTIER_FINGERPRINT_BYTES
+      + Buffer.byteLength(appended)
+      + USAGE_TRANSCRIPT_FRONTIER_FINGERPRINT_BYTES,
+    );
+  });
+
   it('cold reads an oversized Codex transcript from a bounded tail window', () => {
     const p = join(dir, 'oversized-codex.jsonl');
     writeFileSync(p, '');
@@ -357,6 +449,35 @@ describe('readSessionTokenUsageFile caching', () => {
     });
     expect(readFileSync).not.toHaveBeenCalled();
     expectBoundedTailRead(fileSize(p) - CODEX_USAGE_TRANSCRIPT_TAIL_BYTES);
+  });
+
+  it('hashes Codex source records only for lines that update tracked metrics', () => {
+    const p = join(dir, 'codex-lazy-source-hash.jsonl');
+    writeFileSync(p, [
+      JSON.stringify({ type: 'event_msg', payload: { type: 'notice', message: 'ignored' } }),
+      JSON.stringify({ type: 'event_msg', payload: { type: 'other', info: { total_token_usage: { input_tokens: 1 } } } }),
+      codexCountLine(100, 10, 20, { used: 30, window: 1_000 }),
+      '',
+    ].join('\n'));
+
+    expect(readSessionTokenUsageFile(p, 'codex', { fresh: true })).toMatchObject({
+      in: 100,
+      out: 10,
+      inputTokens: 80,
+      cacheReadTokens: 20,
+    });
+    expect(createHash).toHaveBeenCalledTimes(1);
+
+    vi.mocked(createHash).mockClear();
+    const ignoredOnly = join(dir, 'codex-ignored-only.jsonl');
+    writeFileSync(ignoredOnly, [
+      JSON.stringify({ type: 'event_msg', payload: { type: 'notice', message: 'ignored' } }),
+      JSON.stringify({ type: 'session_meta', payload: { cwd: dir } }),
+      '',
+    ].join('\n'));
+
+    expect(readSessionTokenUsageFile(ignoredOnly, 'codex', { fresh: true })).toBeNull();
+    expect(createHash).not.toHaveBeenCalled();
   });
 
   it('keeps the first Codex tail record when the bounded start is on a line boundary', () => {
@@ -565,7 +686,8 @@ describe('readSessionTokenUsageFile caching', () => {
 
   it('re-bootstraps oversized Codex transcripts when the unread cache delta exceeds the tail budget', () => {
     const p = join(dir, 'codex-cache-large-delta.jsonl');
-    writeOversizedCodexSnapshot(p, `${codexCountLine(100, 10, 20, { used: 30, window: 1_000 })}\n`);
+    const initialLine = `${codexCountLine(100, 10, 20, { used: 30, window: 1_000 })}\n`;
+    writeOversizedCodexSnapshot(p, initialLine);
     vi.mocked(findCodexRolloutBySessionId).mockReturnValue(p);
     expect(getSessionUsageSnapshot({
       cliId: 'codex',
@@ -591,13 +713,14 @@ describe('readSessionTokenUsageFile caching', () => {
       context: { usedTokens: 240, windowTokens: 1_000, percentUsed: 24 },
       tokens: { in: 500, out: 60, inputTokens: 300, cacheReadTokens: 200 },
     });
-    expectLargeDeltaBoundedTailRead(baseOffset);
+    expectLargeDeltaBoundedTailRead(baseOffset, Buffer.byteLength(initialLine));
   });
 
   it('continues incrementally after an oversized Codex cold tail bootstrap when the append is small', () => {
     const p = join(dir, 'codex-small-append-after-tail.jsonl');
+    const initialLine = `${codexCountLine(100, 10, 20, { used: 30, window: 1_000 })}\n`;
     writeSparsePrefix(p, MAX_USAGE_TRANSCRIPT_BYTES + 1, '\n');
-    appendFileSync(p, `${codexCountLine(100, 10, 20, { used: 30, window: 1_000 })}\n`);
+    appendFileSync(p, initialLine);
     vi.mocked(findCodexRolloutBySessionId).mockReturnValue(p);
     expect(getSessionUsageSnapshot({
       cliId: 'codex',
@@ -625,7 +748,8 @@ describe('readSessionTokenUsageFile caching', () => {
     });
     const requestedBytes = vi.mocked(readSync).mock.calls.reduce((sum, call) => sum + Number(call[3]), 0);
     expect(requestedBytes).toBeLessThanOrEqual(
-      USAGE_TRANSCRIPT_FRONTIER_FINGERPRINT_BYTES
+      Buffer.byteLength(initialLine)
+      + USAGE_TRANSCRIPT_FRONTIER_FINGERPRINT_BYTES
       + Buffer.byteLength(appended)
       + USAGE_TRANSCRIPT_FRONTIER_FINGERPRINT_BYTES,
     );
@@ -648,6 +772,36 @@ describe('readSessionTokenUsageFile caching', () => {
       out: 90,
       inputTokens: 699,
       cacheReadTokens: 300,
+    });
+  });
+
+  it('does not use unchanged cache when ctime changes after same-size rewrite with restored mtime', () => {
+    const p = join(dir, 'codex-ctime-same-size-rewrite.jsonl');
+    const oldLine = `${codexCountLine(100, 10, 20, { used: 30, window: 1_000 })}\n`;
+    const newLine = oldLine.replace('"input_tokens":100', '"input_tokens":999');
+    expect(Buffer.byteLength(newLine)).toBe(Buffer.byteLength(oldLine));
+    writeFileSync(p, oldLine);
+    expect(readSessionTokenUsageFile(p, 'codex', { fresh: true })).toMatchObject({ in: 100, out: 10 });
+    const firstStat = statSync(p);
+
+    let secondStat = firstStat;
+    for (let attempt = 0; attempt < 10 && secondStat.ctimeMs === firstStat.ctimeMs; attempt++) {
+      sleepSync(10);
+      writeFileSync(p, oldLine);
+      writeFileSync(p, newLine);
+      utimesSync(p, firstStat.atime, firstStat.mtime);
+      secondStat = statSync(p);
+    }
+    expect(secondStat.ino).toBe(firstStat.ino);
+    expect(secondStat.size).toBe(firstStat.size);
+    expect(secondStat.ctimeMs).not.toBe(firstStat.ctimeMs);
+    now += 20_000;
+
+    expect(readSessionTokenUsageFile(p, 'codex', { fresh: true })).toMatchObject({
+      in: 999,
+      out: 10,
+      inputTokens: 979,
+      cacheReadTokens: 20,
     });
   });
 
@@ -730,6 +884,86 @@ describe('readSessionTokenUsageFile caching', () => {
     });
   });
 
+  it('does not merge cached cumulative tokens when the path is replaced between generation validation and scan', () => {
+    const p = join(dir, 'codex-toctou-replace-before-scan.jsonl');
+    writeOversizedCodexSnapshot(
+      p,
+      `${codexCountLine(100, 10, 20, { used: 30, window: 1_000 })}\n`,
+    );
+    vi.mocked(findCodexRolloutBySessionId).mockReturnValue(p);
+    expect(getSessionUsageSnapshot({
+      cliId: 'codex',
+      sessionId: 'botmux-sid',
+      cliSessionId: 'codex-sid',
+      fresh: true,
+    })).toMatchObject({
+      context: { usedTokens: 30 },
+      tokens: { in: 100, out: 10 },
+    });
+
+    appendLargeCodexDelta(p, JSON.stringify({ type: 'event_msg', payload: { type: 'notice' } }));
+    const replacement = join(dir, 'codex-toctou-replace-before-scan-new.jsonl');
+    writeFileSync(replacement, '');
+    codexSnapshotAtTailSize(replacement, `${codexContextLine(240, 1_000)}\n`, fileSize(p));
+
+    now += 20_000;
+    const realReadSync = vi.mocked(readSync).getMockImplementation()!;
+    let replaced = false;
+    vi.mocked(readSync).mockImplementation((fd, buffer, offset, length, position) => {
+      const bytesRead = (realReadSync as typeof readSync)(fd, buffer, offset, length, position);
+      if (!replaced && length === USAGE_TRANSCRIPT_FRONTIER_FINGERPRINT_BYTES) {
+        renameSync(replacement, p);
+        replaced = true;
+      }
+      return bytesRead;
+    });
+
+    const snapshot = getSessionUsageSnapshot({
+      cliId: 'codex',
+      sessionId: 'botmux-sid',
+      cliSessionId: 'codex-sid',
+      fresh: true,
+    });
+    expect(snapshot.tokens).toBeNull();
+    expect(snapshot.turnTokens).toBeNull();
+    if (snapshot.context) {
+      expect(snapshot.context).toEqual({ usedTokens: 240, windowTokens: 1_000, percentUsed: 24 });
+    }
+    expect(replaced).toBe(true);
+  });
+
+  it('does not inherit a cached Codex metric when its source line terminator is overwritten', () => {
+    const p = join(dir, 'codex-source-terminator-overwrite.jsonl');
+    const line = `${codexCountLine(100, 10, 20, { used: 30, window: 1_000 })}\n`;
+    const { baseOffset } = writeOversizedCodexSnapshot(p, line);
+    vi.mocked(findCodexRolloutBySessionId).mockReturnValue(p);
+    expect(getSessionUsageSnapshot({
+      cliId: 'codex',
+      sessionId: 'botmux-sid',
+      cliSessionId: 'codex-sid',
+      fresh: true,
+    })).toMatchObject({
+      context: { usedTokens: 30 },
+      tokens: { in: 100, out: 10 },
+    });
+
+    writeBytesAt(p, baseOffset + Buffer.byteLength(line) - 1, 'x');
+    appendLargeCodexDelta(p, codexContextLine(240, 1_000));
+    now += 20_000;
+
+    const snapshot = getSessionUsageSnapshot({
+      cliId: 'codex',
+      sessionId: 'botmux-sid',
+      cliSessionId: 'codex-sid',
+      fresh: true,
+    });
+    expect(snapshot).toMatchObject({
+      context: { usedTokens: 240, windowTokens: 1_000, percentUsed: 24 },
+      tokens: null,
+      turnTokens: null,
+    });
+  });
+
   it('rebuilds Codex usage when the same inode is rewritten to the same size', () => {
     const p = join(dir, 'codex-same-inode-same-size.jsonl');
     const firstLine = `${codexCountLine(100, 10, 20, { used: 30, window: 1_000 })}\n`;
@@ -748,6 +982,63 @@ describe('readSessionTokenUsageFile caching', () => {
       out: 70,
       inputTokens: 477,
       cacheReadTokens: 300,
+    });
+  });
+
+  it('rebuilds Codex usage when only the front of the cached source record changes and its frontier stays unchanged', () => {
+    const p = join(dir, 'codex-source-front-rewrite-same-size.jsonl');
+    const oldLine = `${codexCountLine(100, 10, 20, { used: 30, window: 1_000 })}\n`;
+    const newLine = oldLine.replace('"input_tokens":100', '"input_tokens":999');
+    expect(Buffer.from(newLine).subarray(-USAGE_TRANSCRIPT_FRONTIER_FINGERPRINT_BYTES).equals(
+      Buffer.from(oldLine).subarray(-USAGE_TRANSCRIPT_FRONTIER_FINGERPRINT_BYTES),
+    )).toBe(true);
+    const { finalSize } = writeOversizedCodexSnapshot(p, oldLine);
+    const firstStat = statSync(p);
+    expect(readSessionTokenUsageFile(p, 'codex', { fresh: true })).toMatchObject({ in: 100, out: 10 });
+
+    codexSnapshotAtTail(p, newLine);
+    truncateSync(p, finalSize);
+    const secondStat = statSync(p);
+    expect(secondStat.ino).toBe(firstStat.ino);
+    now += 20_000;
+
+    expect(readSessionTokenUsageFile(p, 'codex', { fresh: true })).toMatchObject({
+      in: 999,
+      out: 10,
+      inputTokens: 979,
+      cacheReadTokens: 20,
+    });
+  });
+
+  it('does not return stale Codex usage when a front-rewritten source record grows slightly but keeps its frontier', () => {
+    const p = join(dir, 'codex-source-front-rewrite-grow.jsonl');
+    const oldLine = `${codexCountLine(100, 10, 20, { used: 30, window: 1_000 })}\n`;
+    const newLine = oldLine.replace('"input_tokens":100', '"input_tokens":999');
+    expect(Buffer.byteLength(newLine)).toBe(Buffer.byteLength(oldLine));
+    expect(Buffer.from(newLine).subarray(-USAGE_TRANSCRIPT_FRONTIER_FINGERPRINT_BYTES).equals(
+      Buffer.from(oldLine).subarray(-USAGE_TRANSCRIPT_FRONTIER_FINGERPRINT_BYTES),
+    )).toBe(true);
+    const finalSize = MAX_USAGE_TRANSCRIPT_BYTES + CODEX_USAGE_TRANSCRIPT_TAIL_BYTES + 1;
+    const leadBytes = 512;
+    writeFileSync(p, '');
+    const { lineOffset } = codexSnapshotInsideTail(p, oldLine, leadBytes, finalSize);
+    const firstStat = statSync(p);
+    expect(readSessionTokenUsageFile(p, 'codex', { fresh: true })).toMatchObject({ in: 100, out: 10 });
+
+    const frontierOffset = lineOffset + Buffer.byteLength(oldLine) - USAGE_TRANSCRIPT_FRONTIER_FINGERPRINT_BYTES;
+    const oldFrontier = readBytesAt(p, frontierOffset, USAGE_TRANSCRIPT_FRONTIER_FINGERPRINT_BYTES);
+    writeBytesAt(p, lineOffset, newLine);
+    appendFileSync(p, Buffer.alloc(128, 0x20));
+    expect(readBytesAt(p, frontierOffset, USAGE_TRANSCRIPT_FRONTIER_FINGERPRINT_BYTES)).toEqual(oldFrontier);
+    const secondStat = statSync(p);
+    expect(secondStat.ino).toBe(firstStat.ino);
+    now += 20_000;
+
+    expect(readSessionTokenUsageFile(p, 'codex', { fresh: true })).toMatchObject({
+      in: 999,
+      out: 10,
+      inputTokens: 979,
+      cacheReadTokens: 20,
     });
   });
 
@@ -800,6 +1091,52 @@ describe('readSessionTokenUsageFile caching', () => {
     expect(vi.mocked(openSync).mock.calls.some(([, flags]) => {
       return typeof flags === 'number' && (flags & constants.O_NONBLOCK) === constants.O_NONBLOCK;
     })).toBe(true);
+  });
+
+  it('fails closed when the final fd stability check cannot fstat the open transcript', () => {
+    const p = join(dir, 'codex-final-fstat-fail.jsonl');
+    writeOversizedCodexSnapshot(p, `${codexCountLine(100, 10, 20, { used: 30, window: 1_000 })}\n`);
+    vi.mocked(findCodexRolloutBySessionId).mockReturnValue(p);
+    const realFstatSync = vi.mocked(fstatSync).getMockImplementation()!;
+    let calls = 0;
+    vi.mocked(fstatSync).mockImplementation((fd) => {
+      calls++;
+      if (calls === 2) throw new Error('fstat boom');
+      return realFstatSync(fd);
+    });
+
+    expect(getSessionUsageSnapshot({
+      cliId: 'codex',
+      sessionId: 'botmux-sid',
+      cliSessionId: 'codex-sid',
+      fresh: true,
+    })).toEqual({ context: null, tokens: null, turnTokens: null });
+    expect(calls).toBeGreaterThanOrEqual(2);
+  });
+
+  it('fails closed instead of falling back to a path scan when the initial Codex stat fails', () => {
+    const p = join(dir, 'codex-initial-stat-fails.jsonl');
+    writeFileSync(p, '');
+    truncateSync(p, MAX_USAGE_TRANSCRIPT_BYTES + 128 * 1024);
+    appendFileSync(p, `\n${codexCountLine(100, 10, 20, { used: 30, window: 1_000 })}\n`);
+
+    const realStatSync = vi.mocked(statSync).getMockImplementation()!;
+    vi.mocked(statSync).mockImplementation((pathLike, options) => {
+      if (pathLike === p) throw new Error('stat boom');
+      return realStatSync(pathLike, options as any);
+    });
+
+    expect(readSessionTokenUsageFile(p, 'codex', { fresh: true })).toBeNull();
+    expect(openSync).not.toHaveBeenCalled();
+    expect(readSync).not.toHaveBeenCalled();
+
+    vi.mocked(statSync).mockImplementation(realStatSync);
+    expect(readSessionTokenUsageFile(p, 'codex', { fresh: true })).toMatchObject({
+      in: 100,
+      out: 10,
+      inputTokens: 80,
+      cacheReadTokens: 20,
+    });
   });
 
   it('skips oversized transcripts instead of scanning them from byte zero', () => {
