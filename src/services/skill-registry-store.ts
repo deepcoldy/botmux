@@ -31,9 +31,8 @@ export interface SkillSourceDiscovery {
   /** True when the source resolves its own skill set (agentbuddy) — the dashboard
    *  installs it directly, skipping the discover-then-select step. */
   directInstall?: boolean;
-  /** True when these candidates only turned up after falling back to a full-depth
-   *  recursive scan. The UI surfaces this so the deeper (slower) scan is visible
-   *  rather than silent. */
+  /** True when discovery fell back to a full-depth recursive scan. The UI
+   *  surfaces this so the deeper (slower) scan is visible rather than silent. */
   deepScanned?: boolean;
 }
 
@@ -294,7 +293,10 @@ function walkSkillDirs(parentDir: string, dir: string, out: DiscoveredSkillCandi
   }
 }
 
-export function discoverLocalSkillCandidates(rootDir: string, opts: { fullDepth?: boolean } = {}): SkillSourceDiscovery {
+export function discoverLocalSkillCandidates(
+  rootDir: string,
+  opts: { fullDepth?: boolean; fallbackToFullDepth?: boolean } = {},
+): SkillSourceDiscovery {
   const requestedDir = resolve(rootDir);
   const sourceDir = realpathSync(requestedDir);
   const candidates: DiscoveredSkillCandidate[] = [];
@@ -308,20 +310,28 @@ export function discoverLocalSkillCandidates(rootDir: string, opts: { fullDepth?
   // immediate children instead of looking for a redundant skills/skills layer.
   // Check both the requested and canonical paths so a symlink named `skills`
   // still gets the expected behavior after realpath resolution.
-  if (basename(requestedDir) === 'skills' || basename(sourceDir) === 'skills') {
-    for (const child of listChildDirs(sourceDir)) {
+  let shallowMayBeIncomplete = false;
+  const scanShallowRoot = (libraryRoot: string): void => {
+    for (const child of listChildDirs(libraryRoot)) {
       const candidate = candidateFromDir(sourceDir, child);
       if (candidate) candidates.push(candidate);
+      else shallowMayBeIncomplete = true;
     }
+  };
+  if (basename(requestedDir) === 'skills' || basename(sourceDir) === 'skills') {
+    scanShallowRoot(sourceDir);
   }
   for (const relativeRoot of ['skills', '.agents/skills', '.botmux/skills']) {
-    for (const child of listChildDirs(join(sourceDir, relativeRoot))) {
-      const candidate = candidateFromDir(sourceDir, child);
-      if (candidate) candidates.push(candidate);
-    }
+    scanShallowRoot(join(sourceDir, relativeRoot));
   }
-  if (opts.fullDepth) walkSkillDirs(sourceDir, sourceDir, candidates, 0);
-  return { skills: dedupeAndSortCandidates(candidates) };
+  const useFallback = !opts.fullDepth
+    && opts.fallbackToFullDepth
+    && (candidates.length === 0 || shallowMayBeIncomplete);
+  if (opts.fullDepth || useFallback) walkSkillDirs(sourceDir, sourceDir, candidates, 0);
+  return {
+    skills: dedupeAndSortCandidates(candidates),
+    ...(useFallback ? { deepScanned: true } : {}),
+  };
 }
 
 function selectDiscoveredSkills(
@@ -350,7 +360,10 @@ export function installLocalSkillsFromSource(
   opts: { link: boolean } & SkillInstallSelection,
 ): SkillPackage[] {
   const sourceDir = resolve(rootDir);
-  const discovery = discoverLocalSkillCandidates(sourceDir, { fullDepth: opts.fullDepth });
+  const discovery = discoverLocalSkillCandidates(sourceDir, {
+    fullDepth: opts.fullDepth,
+    fallbackToFullDepth: !opts.fullDepth,
+  });
   return selectDiscoveredSkills(discovery.skills, opts).map(candidate => {
     const skillDir = candidate.path === '.' ? sourceDir : join(sourceDir, candidate.path);
     return installLocalSkill(skillDir, { link: opts.link });
@@ -682,7 +695,7 @@ async function checkoutGitSourceAsync(url: string, refValue: string | undefined)
 function discoverCheckedOutGitSource(
   sourceDir: string,
   commit: string,
-  opts: { path?: string; fullDepth?: boolean },
+  opts: { path?: string; fullDepth?: boolean; fallbackToFullDepth?: boolean },
 ): SkillSourceDiscovery {
   if (opts.path) {
     const candidate = candidateFromDir(sourceDir, gitSkillDir(sourceDir, opts.path));
@@ -690,7 +703,10 @@ function discoverCheckedOutGitSource(
   }
   return {
     commit,
-    skills: discoverLocalSkillCandidates(sourceDir, { fullDepth: opts.fullDepth }).skills,
+    ...discoverLocalSkillCandidates(sourceDir, {
+      fullDepth: opts.fullDepth,
+      fallbackToFullDepth: opts.fallbackToFullDepth,
+    }),
   };
 }
 
@@ -773,18 +789,7 @@ export async function discoverGitSkillCandidatesAsync(opts: {
 }): Promise<SkillSourceDiscovery> {
   const checkout = await checkoutTemporaryGitSourceAsync(opts.url, opts.ref);
   try {
-    const first = discoverCheckedOutGitSource(checkout.sourceDir, checkout.commit, opts);
-    if (
-      opts.path
-      || opts.fullDepth
-      || !opts.fallbackToFullDepth
-      || first.skills.length > 0
-    ) return first;
-    const second = discoverCheckedOutGitSource(checkout.sourceDir, checkout.commit, {
-      ...opts,
-      fullDepth: true,
-    });
-    return second.skills.length > 0 ? { ...second, deepScanned: true } : first;
+    return discoverCheckedOutGitSource(checkout.sourceDir, checkout.commit, opts);
   } finally {
     checkout.cleanup();
   }
@@ -805,24 +810,43 @@ function installGitSkillLocked(opts: {
   ref?: string;
   sourceOverride?: SkillSource;
 }): SkillPackage {
-  const { sourceDir, ref, commit } = checkoutGitSource(opts.url, opts.ref);
+  const checkout = checkoutGitSource(opts.url, opts.ref);
+  return persistInstalledGitSkills([
+    copyGitSkillFromCheckout({ ...opts, ...checkout }),
+  ])[0];
+}
+
+function copyGitSkillFromCheckout(opts: {
+  sourceDir: string;
+  url: string;
+  path: string;
+  ref: string;
+  commit: string;
+  sourceOverride?: SkillSource;
+}): SkillPackage {
   const source: SkillSource = opts.sourceOverride
     ? opts.sourceOverride.type === 'git' || opts.sourceOverride.type === 'github'
-      ? { ...opts.sourceOverride, commit }
+      ? { ...opts.sourceOverride, commit: opts.commit }
       : opts.sourceOverride
-    : { type: 'git', url: opts.url, path: opts.path, ref, commit };
-  const skillDir = gitSkillDir(sourceDir, opts.path);
+    : { type: 'git', url: opts.url, path: opts.path, ref: opts.ref, commit: opts.commit };
+  const skillDir = gitSkillDir(opts.sourceDir, opts.path);
   const provisional = loadSkillPackage(skillDir, { source });
   const rootDir = join(skillStoreDir(), provisional.name);
   rmSync(rootDir, { recursive: true, force: true });
   mkdirSync(dirname(rootDir), { recursive: true });
   cpSync(skillDir, rootDir, { recursive: true });
-  const pkg = loadSkillPackage(rootDir, { source, id: provisional.id });
+  return loadSkillPackage(rootDir, { source, id: provisional.id });
+}
+
+function persistInstalledGitSkills(packages: SkillPackage[]): SkillPackage[] {
   const now = new Date().toISOString();
   const registry = readSkillRegistry();
-  registry.skills[pkg.name] = { ...pkg, installedAt: now, updatedAt: now };
+  const installed = packages.map((pkg) => {
+    registry.skills[pkg.name] = { ...pkg, installedAt: now, updatedAt: now };
+    return registry.skills[pkg.name];
+  });
   writeSkillRegistry(registry);
-  return registry.skills[pkg.name];
+  return installed;
 }
 
 export async function installGitSkillAsync(opts: {
@@ -840,24 +864,10 @@ async function installGitSkillAsyncLocked(opts: {
   ref?: string;
   sourceOverride?: SkillSource;
 }): Promise<SkillPackage> {
-  const { sourceDir, ref, commit } = await checkoutGitSourceAsync(opts.url, opts.ref);
-  const source: SkillSource = opts.sourceOverride
-    ? opts.sourceOverride.type === 'git' || opts.sourceOverride.type === 'github'
-      ? { ...opts.sourceOverride, commit }
-      : opts.sourceOverride
-    : { type: 'git', url: opts.url, path: opts.path, ref, commit };
-  const skillDir = gitSkillDir(sourceDir, opts.path);
-  const provisional = loadSkillPackage(skillDir, { source });
-  const rootDir = join(skillStoreDir(), provisional.name);
-  rmSync(rootDir, { recursive: true, force: true });
-  mkdirSync(dirname(rootDir), { recursive: true });
-  cpSync(skillDir, rootDir, { recursive: true });
-  const pkg = loadSkillPackage(rootDir, { source, id: provisional.id });
-  const now = new Date().toISOString();
-  const registry = readSkillRegistry();
-  registry.skills[pkg.name] = { ...pkg, installedAt: now, updatedAt: now };
-  writeSkillRegistry(registry);
-  return registry.skills[pkg.name];
+  const checkout = await checkoutGitSourceAsync(opts.url, opts.ref);
+  return persistInstalledGitSkills([
+    copyGitSkillFromCheckout({ ...opts, ...checkout }),
+  ])[0];
 }
 
 function sourceOverrideForCandidate(source: SkillSource | undefined, candidate: DiscoveredSkillCandidate): SkillSource | undefined {
@@ -874,14 +884,17 @@ export function installGitSkillsFromSource(opts: {
 } & SkillInstallSelection): SkillPackage[] {
   return withGitSourceLockSync(opts.url, () => {
     const checkout = checkoutGitSource(opts.url, opts.ref);
-    const discovery = discoverCheckedOutGitSource(checkout.sourceDir, checkout.commit, { fullDepth: opts.fullDepth });
+    const discovery = discoverCheckedOutGitSource(checkout.sourceDir, checkout.commit, {
+      fullDepth: opts.fullDepth,
+      fallbackToFullDepth: !opts.fullDepth,
+    });
     const selected = selectDiscoveredSkills(discovery.skills, opts);
-    return selected.map(candidate => installGitSkillLocked({
+    return persistInstalledGitSkills(selected.map(candidate => copyGitSkillFromCheckout({
+      ...checkout,
       url: opts.url,
       path: candidate.path,
-      ref: opts.ref,
       sourceOverride: sourceOverrideForCandidate(opts.sourceOverride, candidate),
-    }));
+    })));
   });
 }
 
@@ -892,18 +905,17 @@ export async function installGitSkillsFromSourceAsync(opts: {
 } & SkillInstallSelection): Promise<SkillPackage[]> {
   return withGitSourceLock(opts.url, async () => {
     const checkout = await checkoutGitSourceAsync(opts.url, opts.ref);
-    const discovery = discoverCheckedOutGitSource(checkout.sourceDir, checkout.commit, { fullDepth: opts.fullDepth });
+    const discovery = discoverCheckedOutGitSource(checkout.sourceDir, checkout.commit, {
+      fullDepth: opts.fullDepth,
+      fallbackToFullDepth: !opts.fullDepth,
+    });
     const selected = selectDiscoveredSkills(discovery.skills, opts);
-    const installed: SkillPackage[] = [];
-    for (const candidate of selected) {
-      installed.push(await installGitSkillAsyncLocked({
-        url: opts.url,
-        path: candidate.path,
-        ref: opts.ref,
-        sourceOverride: sourceOverrideForCandidate(opts.sourceOverride, candidate),
-      }));
-    }
-    return installed;
+    return persistInstalledGitSkills(selected.map(candidate => copyGitSkillFromCheckout({
+      ...checkout,
+      url: opts.url,
+      path: candidate.path,
+      sourceOverride: sourceOverrideForCandidate(opts.sourceOverride, candidate),
+    })));
   });
 }
 

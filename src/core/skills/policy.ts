@@ -109,28 +109,28 @@ export function resolveSkillPolicy(input: SkillPolicyInput): SkillPolicyResult {
       continue;
     }
     for (const member of pack.include) {
-      if (!member.startsWith('skill:')) {
+      if (typeof member !== 'string' || !/^skill:.+$/.test(member)) {
         diagnostics.push({
-            level: 'warn',
-            code: 'pack_invalid',
-            message: `Skill pack "${packId}" contains a non-skill selector: ${member}`,
-          });
-          continue;
-        }
-        const skillName = skillNameFromSelector(member);
-        const skill = candidateByName.get(skillName);
-        if (!skill) {
-          diagnostics.push({
-            level: 'warn',
-            code: 'pack_skill_missing',
-            message: `Skill pack "${packId}" references missing skill: ${skillName}`,
-            skillName,
-          });
-          continue;
-        }
-        raw.push({ ...skill, priorityReason: `bot:pack:${packId}` });
+          level: 'warn',
+          code: 'pack_invalid',
+          message: `Skill pack "${packId}" contains a non-skill selector: ${String(member)}`,
+        });
+        continue;
       }
+      const skillName = skillNameFromSelector(member);
+      const skill = candidateByName.get(skillName);
+      if (!skill) {
+        diagnostics.push({
+          level: 'warn',
+          code: 'pack_skill_missing',
+          message: `Skill pack "${packId}" references missing skill: ${skillName}`,
+          skillName,
+        });
+        continue;
+      }
+      raw.push({ ...skill, priorityReason: `bot:pack:${packId}` });
     }
+  }
 
   for (const skill of pluginSkills) {
     const reason = skill.source.type === 'plugin' ? `plugin:${skill.source.pluginId}` : 'plugin';

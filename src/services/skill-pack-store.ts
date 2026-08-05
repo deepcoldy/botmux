@@ -50,18 +50,57 @@ function emptyRegistry(): SkillPackRegistryFile {
   return { schemaVersion: 1, packs: {} };
 }
 
+function normalizeStoredTimestamp(value: unknown): string {
+  if (typeof value !== 'string' || !value.trim() || Number.isNaN(Date.parse(value))) {
+    throw new SkillPackStoreError({ code: 'SKILL_PACK_INVALID', reason: 'timestamps must be date strings' });
+  }
+  return value;
+}
+
+function normalizeStoredPack(key: string, raw: unknown): SkillPack | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const value = raw as Record<string, unknown>;
+  try {
+    const id = validateId(value.id);
+    if (id !== key || validateId(key) !== key) return undefined;
+    const revision = value.revision;
+    if (!Number.isSafeInteger(revision) || (revision as number) < 1) {
+      throw new SkillPackStoreError({ code: 'SKILL_PACK_INVALID', reason: 'revision must be a positive integer' });
+    }
+    return {
+      id,
+      name: validateName(value.name),
+      description: validateDescription(value.description),
+      tags: normalizeTags(value.tags),
+      include: normalizeInclude(value.include),
+      revision: revision as number,
+      createdAt: normalizeStoredTimestamp(value.createdAt),
+      updatedAt: normalizeStoredTimestamp(value.updatedAt),
+    };
+  } catch {
+    return undefined;
+  }
+}
+
 export function readSkillPackRegistry(): SkillPackRegistryFile {
   const file = skillPackRegistryPath();
   if (!existsSync(file)) return emptyRegistry();
   try {
-    const parsed = JSON.parse(readFileSync(file, 'utf-8'));
-    const packs = parsed?.packs && typeof parsed.packs === 'object' && !Array.isArray(parsed.packs)
-      ? parsed.packs
-      : {};
-    return { schemaVersion: 1, packs: packs as Record<string, SkillPack> };
+    const parsed = JSON.parse(readFileSync(file, 'utf-8')) as unknown;
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return emptyRegistry();
+    const registry = parsed as Record<string, unknown>;
+    if (registry.schemaVersion !== 1 || !registry.packs || typeof registry.packs !== 'object' || Array.isArray(registry.packs)) {
+      return emptyRegistry();
+    }
+    const packs: Record<string, SkillPack> = {};
+    for (const [key, raw] of Object.entries(registry.packs as Record<string, unknown>)) {
+      const pack = normalizeStoredPack(key, raw);
+      if (pack) packs[key] = pack;
+    }
+    return { schemaVersion: 1, packs };
   } catch {
-    // A corrupt packs.json must not take down the whole skill pipeline; treat
-    // it as empty so bots keep working (packs simply resolve to nothing).
+    // Malformed JSON or an unreadable file must not take down the whole skill
+    // pipeline; bots keep working and invalid packs resolve to nothing.
     return emptyRegistry();
   }
 }
