@@ -104,25 +104,6 @@ export function parseDashboardSkillInstallRequest(body: Record<string, unknown>)
   return { kind: 'github', owner: gh.owner, repo: gh.repo, ...(path ? { path } : {}), ref, skillNames, all, fullDepth };
 }
 
-/** Shallow discovery only looks at the source root, `skills/*`, `.agents/skills/*`
- *  and `.botmux/skills/*` — one level under each. Real-world collections nest a
- *  category in between (`skills/<category>/<skill>/SKILL.md`, e.g.
- *  mattpocock/skills), so a whole-repo import found nothing and reported "no
- *  skills" even though the repo is full of them. `fullDepth` already existed but
- *  no caller could reach it from the dashboard. Retry once with the recursive
- *  scan before giving up, and mark the result so the UI can say so. */
-async function discoverWithDeepScanFallback(
-  shallow: () => Promise<SkillSourceDiscovery> | SkillSourceDiscovery,
-  deep: () => Promise<SkillSourceDiscovery> | SkillSourceDiscovery,
-  explicitFullDepth: boolean,
-): Promise<SkillSourceDiscovery> {
-  if (explicitFullDepth) return await deep();
-  const first = await shallow();
-  if (first.skills.length > 0) return first;
-  const second = await deep();
-  return second.skills.length > 0 ? { ...second, deepScanned: true } : first;
-}
-
 export async function discoverDashboardSkills(request: DashboardSkillInstallRequest): Promise<SkillSourceDiscovery> {
   // agentbuddy resolves its own skill set — tell the UI to install directly.
   // Covers the canonical `agentbuddy:` identifiers and pasted agentbuddy
@@ -130,11 +111,10 @@ export async function discoverDashboardSkills(request: DashboardSkillInstallRequ
   // for them, so they are classified as git remotes like any other URL.
   if (request.kind === 'agentbuddy') return { skills: [], directInstall: true };
   if (request.kind === 'local') {
-    return discoverWithDeepScanFallback(
-      () => discoverLocalSkillCandidates(request.value, { fullDepth: false }),
-      () => discoverLocalSkillCandidates(request.value, { fullDepth: true }),
-      request.fullDepth,
-    );
+    return discoverLocalSkillCandidates(request.value, {
+      fullDepth: request.fullDepth,
+      fallbackToFullDepth: !request.fullDepth,
+    });
   }
   const url = request.kind === 'git' ? request.url : githubToGitUrl(request.owner, request.repo);
   return discoverGitSkillCandidatesAsync({

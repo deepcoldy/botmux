@@ -1,5 +1,6 @@
 import { existsSync } from 'node:fs';
 import { isAbsolute } from 'node:path';
+import { extractSkillsInstallCommandSource } from './install-command.js';
 
 export interface ParsedSkillInstallSource {
   kind: 'local' | 'git' | 'github' | 'agentbuddy';
@@ -284,14 +285,7 @@ const GITHUB_SHORTHAND_RE = /^[A-Za-z0-9][A-Za-z0-9-]*\/[A-Za-z0-9._-]+(?:\/[\w.
  *  where <owner/repo> is a GitHub shorthand or a GitHub/Git URL. Returns null
  *  for anything that isn't such a command. */
 export function parseSkillsInstallCommand(raw: string): ParsedSkillInstallSource | null {
-  const tokens = raw.trim().split(/\s+/).filter(Boolean);
-  const binIdx = tokens.findIndex((t) => t === 'skills' || t === 'add-skill' || t.startsWith('skills@'));
-  if (binIdx < 0) return null;
-  const bin = tokens[binIdx];
-  const rest = tokens.slice(binIdx + 1).filter((t) => t !== '-y' && t !== '--yes');
-  const source = rest[0] === 'add'
-    ? rest[1]
-    : (bin === 'add-skill' && rest[0] && !rest[0].startsWith('-') ? rest[0] : undefined);
+  const source = extractSkillsInstallCommandSource(raw);
   if (!source) return null;
   // Bare owner/repo[/path] → GitHub shorthand; explicit URLs pass through.
   const hasScheme = source.includes('://') || /^[A-Za-z0-9._-]+@[^/]+:/.test(source);

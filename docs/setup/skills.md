@@ -96,7 +96,7 @@ botmux skills install "npm_config_registry=\"https://registry.example.com\" npx 
 - 兼容命令前面带的 `npm_config_registry="…" npx agentbuddy@latest …` 前缀（自动剥离），也兼容 marketplace 常见的 `skill add <group>/<name>` 合并路径。botmux 用部署机自己配置的 agentbuddy 执行，**域名无关、无需额外配置**。
 - 仅接受 `skill` / `plugin` 的 `add` / `collection add` 安装类子命令，其它子命令（publish/remove/login 等）不受理。
 - plugin 命令也会执行，但收进 botmux 的是该 plugin **内含的 SKILL.md**（botmux 是 skill registry；plugin 不含 skill 则无内容可装）。
-- **开源 skills**（vercel-labs 的 `skills` CLI）：也认 `skills add owner/repo` / `npx skills add owner/repo` / `add-skill owner/repo` —— 直接走 botmux 现成的 **GitHub 安装**（无需部署机装 `skills` CLI，公开仓库免鉴权，与贴 GitHub 链接等价）。
+- **开源 skills**（vercel-labs 的 `skills` CLI）：也认 `skills add owner/repo` / `npx skills add owner/repo` / `add-skill owner/repo`，包括 source 前后的 `-g` / `--global` 和带引号 source —— 这些粘贴命令统一走 botmux 自己的 **GitHub 安装**（无需部署机装 `skills` CLI，公开仓库免鉴权，与贴 GitHub 链接等价；`-g` 仅作输入兼容，安装位置仍由 botmux registry 管理）。
 
 - 需要部署机装好 `agentbuddy` 并登录一次（`agentbuddy login`），凭证缓存后复用；未安装/未登录时返回 `agentbuddy_not_found` / `agentbuddy_command_failed`（dashboard 会提示去安装/登录）。
 - agentbuddy 自解析 skill 集合，安装/更新不走 discover-then-select；同一 identifier 的并发安装/更新会串行化，避免互相清空暂存目录。
@@ -139,7 +139,7 @@ bot 级配置只表达“这个 bot 优先披露哪些 Skill”。注入方式�
 
 字段含义：
 
-- `include`: priority skill 列表，只支持 `skill:<name>`。这些 Skill 会优先披露给该 bot；底层 CLI 原生 Skill 发现机制保持原样。
+- `include`: priority selector 列表，支持直接引用 `skill:<name>` 和专项包引用 `pack:<id>`。直接引用始终先于专项包展开，因此同一 Skill 同时出现时以直接引用为准；底层 CLI 原生 Skill 发现机制保持原样。
 - 全局工作区 Skill：`off | all`，决定解析 priority skill 时是否把当前工作区 `.agents/skills` 和 `.botmux/skills` 纳入候选。旧配置里的 `trusted` 会作为 `all` 的兼容别名读取，并在解析诊断里提示 deprecated；当前没有单独的项目 trust store。
 - 全局 delivery：`auto | prompt | native`。`auto` 会优先使用可用 native 投递，否则走 prompt；`native` 在目标 CLI 不支持时会阻止新会话启动并报配置错误。
 

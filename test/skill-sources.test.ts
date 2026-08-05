@@ -322,6 +322,24 @@ describe('skill install sources', () => {
       });
     });
 
+    it('accepts global flags around the source and shell-quoted sources', () => {
+      for (const command of [
+        'skills add -g vercel-labs/agent-browser',
+        'skills add --global vercel-labs/agent-browser',
+        'skills add vercel-labs/agent-browser -g',
+        'npx -y skills@latest add -g vercel-labs/agent-browser',
+        'add-skill -g vercel-labs/agent-browser',
+        'add-skill vercel-labs/agent-browser --global',
+        'skills add "vercel-labs/agent-browser"',
+        "skills add 'vercel-labs/agent-browser'",
+      ]) {
+        expect(parseSkillsInstallCommand(command)).toMatchObject({
+          kind: 'github',
+          github: { owner: 'vercel-labs', repo: 'agent-browser' },
+        });
+      }
+    });
+
     it('passes GitHub / git URLs through', () => {
       expect(parseSkillsInstallCommand('skills add https://github.com/acme/skills')).toMatchObject({
         kind: 'github', github: { owner: 'acme', repo: 'skills' },
@@ -332,6 +350,7 @@ describe('skill install sources', () => {
     it('ignores non-add / non-command inputs', () => {
       expect(parseSkillsInstallCommand('skills list')).toBeNull();
       expect(parseSkillsInstallCommand('skills add')).toBeNull();
+      expect(parseSkillsInstallCommand('skills add "unterminated')).toBeNull();
       expect(parseSkillsInstallCommand('just some text')).toBeNull();
     });
   });

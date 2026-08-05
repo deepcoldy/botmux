@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
@@ -124,5 +124,42 @@ describe('skill pack store', () => {
     const reloaded = readSkillPackRegistry();
     expect(reloaded.packs['rt']).toBeDefined();
     expect(reloaded.packs['rt'].include).toEqual(['skill:x']);
+  });
+
+  it('drops semantically invalid stored packs while preserving valid siblings', () => {
+    const dir = join(home, '.botmux', 'skills');
+    mkdirSync(dir, { recursive: true });
+    const timestamp = '2026-01-01T00:00:00.000Z';
+    writeFileSync(join(dir, 'packs.json'), JSON.stringify({
+      schemaVersion: 1,
+      packs: {
+        valid: {
+          id: 'valid',
+          name: 'Valid',
+          include: ['skill:a'],
+          revision: 1,
+          createdAt: timestamp,
+          updatedAt: timestamp,
+        },
+        'invalid-member': {
+          id: 'invalid-member',
+          name: 'Invalid member',
+          include: [123],
+          revision: 1,
+          createdAt: timestamp,
+          updatedAt: timestamp,
+        },
+        'invalid-revision': {
+          id: 'invalid-revision',
+          name: 'Invalid revision',
+          include: ['skill:a'],
+          revision: 0,
+          createdAt: timestamp,
+          updatedAt: timestamp,
+        },
+      },
+    }));
+
+    expect(Object.keys(readSkillPackRegistry().packs)).toEqual(['valid']);
   });
 });

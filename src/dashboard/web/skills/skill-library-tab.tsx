@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
+import { extractSkillsInstallCommandSource } from '../../../core/skills/install-command.js';
 import { useT } from '../react-hooks.js';
 import type { SkillGraph } from './shared.js';
 import type { InstallSkillCandidate, NativeSkillGroup, SkillRow, SkillsNavIntent, StatusMessage } from './types.js';
@@ -225,6 +226,8 @@ export function detectSourceType(source: string): 'github' | 'git' | 'local' | '
   // path named "agentbuddy" is not an agentbuddy source).
   if (/^agentbuddy:/i.test(s)) return 'agentbuddy';
   if (/(?:^|\s)(?:npx\s+)?agentbuddy(?:@[\w.-]+)?\s+(?:skill|plugin)\s/i.test(s)) return 'agentbuddy';
+  const skillsCommandSource = extractSkillsInstallCommandSource(s);
+  if (skillsCommandSource) return detectSourceType(skillsCommandSource);
   if (lower.startsWith('github:')) return 'github';
   // Explicit git schemes are checked before github.com: `git@github.com:o/r.git`
   // is a git remote to the backend, not a browser URL.

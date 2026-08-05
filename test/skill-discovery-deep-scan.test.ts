@@ -1,9 +1,9 @@
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { discoverLocalSkillCandidates } from '../src/services/skill-registry-store.js';
-import { discoverDashboardSkills, parseDashboardSkillInstallRequest } from '../src/dashboard/skill-install-request.js';
+import { discoverDashboardSkills, installDashboardSkill, parseDashboardSkillInstallRequest } from '../src/dashboard/skill-install-request.js';
 
 /** Regression guard for whole-repo imports. Real skill collections nest a
  *  category directory (`skills/<category>/<skill>/SKILL.md`, e.g.
@@ -12,16 +12,21 @@ import { discoverDashboardSkills, parseDashboardSkillInstallRequest } from '../s
  *  found" for those repos because it never passed fullDepth. */
 const tempDirs: string[] = [];
 
+function addSkill(root: string, relativeSkillDir: string, name: string): void {
+  const dir = join(root, relativeSkillDir);
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, 'SKILL.md'), `---\nname: ${name}\ndescription: ${name}\n---\n# ${name}\n`);
+}
+
 function makeRepo(relativeSkillDir: string): string {
   const root = mkdtempSync(join(tmpdir(), 'botmux-scan-'));
   tempDirs.push(root);
-  const dir = join(root, relativeSkillDir);
-  mkdirSync(dir, { recursive: true });
-  writeFileSync(join(dir, 'SKILL.md'), '---\nname: grill-me\ndescription: Grill me\n---\n# grill me\n');
+  addSkill(root, relativeSkillDir, 'grill-me');
   return root;
 }
 
 afterEach(() => {
+  vi.unstubAllEnvs();
   while (tempDirs.length > 0) rmSync(tempDirs.pop()!, { recursive: true, force: true });
 });
 
@@ -39,7 +44,17 @@ describe('discovery deep-scan fallback', () => {
     expect(result.deepScanned).toBe(true);
   });
 
-  it('does not deep-scan (or flag) when the shallow scan already found skills', async () => {
+  it('deep-scans a mixed shallow + categorized layout so no skill is silently omitted', async () => {
+    const root = makeRepo(join('skills', 'flat'));
+    addSkill(root, join('skills', 'productivity', 'nested'), 'nested');
+
+    const result = await discoverDashboardSkills(parseDashboardSkillInstallRequest({ source: root }));
+
+    expect(result.skills.map(skill => skill.name).sort()).toEqual(['grill-me', 'nested']);
+    expect(result.deepScanned).toBe(true);
+  });
+
+  it('does not deep-scan (or flag) when the shallow scan is complete', async () => {
     const root = makeRepo(join('skills', 'alpha'));
     const result = await discoverDashboardSkills(parseDashboardSkillInstallRequest({ source: root }));
     expect(result.skills.length).toBeGreaterThan(0);
@@ -52,5 +67,20 @@ describe('discovery deep-scan fallback', () => {
     expect(result.skills.length).toBeGreaterThan(0);
     // Not a fallback — the caller asked for it, so no "we had to dig" marker.
     expect(result.deepScanned).not.toBe(true);
+  });
+
+  it('direct install without prior discovery uses the same deep-scan fallback', async () => {
+    const root = makeRepo(join('skills', 'flat'));
+    addSkill(root, join('skills', 'productivity', 'nested'), 'nested');
+    const home = mkdtempSync(join(tmpdir(), 'botmux-scan-home-'));
+    tempDirs.push(home);
+    vi.stubEnv('HOME', home);
+
+    const installed = await installDashboardSkill(parseDashboardSkillInstallRequest({
+      source: root,
+      skillNames: ['nested'],
+    }));
+
+    expect(installed.map(skill => skill.name)).toEqual(['nested']);
   });
 });

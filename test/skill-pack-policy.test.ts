@@ -152,4 +152,22 @@ describe('skill policy resolver with packs', () => {
     expect(result.prioritySkills.map((s) => s.name)).toEqual(['a']);
     expect(result.diagnostics.some((d) => d.code === 'pack_not_found')).toBe(true);
   });
+
+  it('does not throw when a caller supplies non-string pack members', () => {
+    const corrupted = {
+      ...pack('p1', ['a']),
+      include: [123, 'pack:nested', 'skill:a'],
+    } as unknown as SkillPack;
+
+    const result = resolveSkillPolicy({
+      registrySkills: [pkg('a')],
+      projectSkills: [],
+      botPolicy: { include: ['pack:p1'] },
+      workingDir: '/repo',
+      packs: { p1: corrupted },
+    });
+
+    expect(result.prioritySkills.map((skill) => skill.name)).toEqual(['a']);
+    expect(result.diagnostics.filter((diagnostic) => diagnostic.code === 'pack_invalid')).toHaveLength(2);
+  });
 });

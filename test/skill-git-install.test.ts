@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os';
 
 import {
   discoverGitSkillCandidates,
+  discoverGitSkillCandidatesAsync,
   installGitSkill,
   installGitSkillAsync,
   installGitSkillsFromSourceAsync,
@@ -244,12 +245,32 @@ describe('git skill install', () => {
   });
 
   it('removes the throwaway checkout after async dashboard discovery', async () => {
-    const { discoverGitSkillCandidatesAsync } = await import('../src/services/skill-registry-store.js');
-
     const discovered = await discoverGitSkillCandidatesAsync({ url: repo, ref: 'HEAD' });
 
     expect(discovered.skills.map(skill => skill.name)).toEqual(['deploy']);
     expect(readdirSync(join(home, '.botmux', 'skills', 'sources'))).toEqual([]);
+  });
+
+  it('keeps mixed shallow and nested candidates during fallback discovery', async () => {
+    write(join(repo, 'skills', 'category', 'nested', 'SKILL.md'), '---\nname: nested\n---\n# Nested');
+    run('git', ['add', '.'], repo);
+    run('git', ['commit', '-m', 'add nested skill'], repo);
+
+    const discovered = await discoverGitSkillCandidatesAsync({
+      url: repo,
+      ref: 'HEAD',
+      fallbackToFullDepth: true,
+    });
+
+    expect(discovered.skills.map(skill => skill.name).sort()).toEqual(['deploy', 'nested']);
+    expect(discovered.deepScanned).toBe(true);
+
+    const installed = await installGitSkillsFromSourceAsync({
+      url: repo,
+      ref: 'HEAD',
+      skillNames: ['nested'],
+    });
+    expect(installed.map(skill => skill.name)).toEqual(['nested']);
   });
 
   it('installs the only discovered skill from a repository root', async () => {
@@ -277,6 +298,20 @@ describe('git skill install', () => {
       url: repo,
       path: 'skills/review',
     });
+  });
+
+  it('reuses one checkout for an async multi-skill install', async () => {
+    write(join(repo, 'skills', 'review', 'SKILL.md'), '---\nname: review\n---\n# Review');
+    run('git', ['add', '.'], repo);
+    run('git', ['commit', '-m', 'add review skill'], repo);
+    const { url, logFile } = installGithubGitShim(home, repo, 'cached-fetch');
+
+    const packages = await installGitSkillsFromSourceAsync({ url, ref: 'HEAD', all: true });
+
+    expect(packages.map(pkg => pkg.name).sort()).toEqual(['deploy', 'review']);
+    const attempts = readFileSync(logFile, 'utf8').trim().split(/\r?\n/);
+    expect(attempts.filter(line => line === 'https-authenticated-clone')).toHaveLength(1);
+    expect(attempts.filter(line => line === 'https-authenticated-fetch')).toHaveLength(1);
   });
 
   it('updates an installed git skill from its recorded source', () => {
