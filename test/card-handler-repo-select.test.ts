@@ -217,6 +217,17 @@ function makeManualEvent(path: string, operator = OWNER) {
   };
 }
 
+function makeSearchEvent(query: string, operator = OWNER) {
+  return {
+    operator: { open_id: operator },
+    action: {
+      value: { action: 'repo_search_submit', root_id: ROOT_ID },
+      form_value: { repo_search_query: query },
+    },
+    context: { open_message_id: 'om_card' },
+  };
+}
+
 function makeSkipEvent(operator = OWNER) {
   return {
     operator: { open_id: operator },
@@ -1453,6 +1464,94 @@ describe('repo select card — worktree open', () => {
     expect(ds.workingDir).toBe('/repos/alpha-feat-one');
   });
 
+  it('repo search filters the complete scan case-insensitively and replaces the live card', async () => {
+    const ds = makeDs({ pendingRepo: true, pendingPrompt: 'hi', worker: null, repoCardMessageId: 'om_card' });
+    const projects: ProjectInfo[] = [
+      ...PROJECTS,
+      { name: 'hidden-project', path: '/repos/team/hidden', type: 'repo', branch: 'feature/Search-Needle' },
+    ];
+    const { deps, sessionReply } = makeDeps(ds, projects);
+    sessionReply.mockResolvedValueOnce('om_search_result');
+
+    const res = await handleCardAction(makeSearchEvent('search-needle'), deps, APP_ID);
+
+    const interactiveCall = sessionReply.mock.calls.find(c => c[2] === 'interactive');
+    expect(interactiveCall).toBeDefined();
+    const card = JSON.parse(interactiveCall![1] as string);
+    const switchOptions = card.elements
+      .find((element: any) => element.tag === 'action')
+      .actions.find((element: any) => element.tag === 'select_static')
+      .options;
+    expect(switchOptions).toHaveLength(1);
+    expect(switchOptions[0].value).toBe('/repos/team/hidden');
+    expect(ds.repoCardMessageId).toBe('om_search_result');
+    expect(canOperate).not.toHaveBeenCalled(); // pending-session owner exception
+    expect(res?.toast?.content).toContain('1');
+    await new Promise<void>(resolve => setImmediate(resolve));
+    expect(deleteMessage).toHaveBeenCalledWith(APP_ID, 'om_card');
+  });
+
+  it('repo search with no matches preserves the live card', async () => {
+    const ds = makeDs({ pendingRepo: true, pendingPrompt: 'hi', worker: null, repoCardMessageId: 'om_card' });
+    const { deps, sessionReply } = makeDeps(ds);
+
+    const res = await handleCardAction(makeSearchEvent('does-not-exist'), deps, APP_ID);
+
+    expect(res?.toast?.type).toBe('error');
+    expect(res?.toast?.content).toContain('does-not-exist');
+    expect(sessionReply).not.toHaveBeenCalled();
+    expect(deleteMessage).not.toHaveBeenCalled();
+    expect(ds.repoCardMessageId).toBe('om_card');
+  });
+
+  it('repo search rejects a stale card before sending a replacement', async () => {
+    const ds = makeDs({ pendingRepo: true, pendingPrompt: 'hi', worker: null, repoCardMessageId: 'om_live_card' });
+    const { deps, sessionReply } = makeDeps(ds);
+    const event = makeSearchEvent('alpha');
+    event.context.open_message_id = 'om_stale_card';
+
+    const res = await handleCardAction(event, deps, APP_ID);
+
+    expect(res?.toast?.content).toMatch(/仓库已选定|ignore the old card/i);
+    expect(sessionReply).not.toHaveBeenCalled();
+    expect(deleteMessage).not.toHaveBeenCalled();
+    expect(ds.repoCardMessageId).toBe('om_live_card');
+  });
+
+  it('repo search delivery failure keeps the old card active and retriable', async () => {
+    const ds = makeDs({ pendingRepo: true, pendingPrompt: 'hi', worker: null, repoCardMessageId: 'om_card' });
+    const { deps, sessionReply } = makeDeps(ds);
+    sessionReply.mockRejectedValueOnce(new Error('socket hang up'));
+
+    const res = await handleCardAction(makeSearchEvent('alpha'), deps, APP_ID);
+
+    expect(res?.toast?.type).toBe('error');
+    expect(res?.toast?.content).toContain('/repo');
+    expect(deleteMessage).not.toHaveBeenCalled();
+    expect(ds.repoCardMessageId).toBe('om_card');
+    expect(ds.pendingRepo).toBe(true);
+  });
+
+  it('repo search withdraws a late replacement when the old card is selected in flight', async () => {
+    const ds = makeDs({ pendingRepo: true, pendingPrompt: 'hi', worker: null, repoCardMessageId: 'om_card' });
+    const { deps, sessionReply } = makeDeps(ds);
+    const sent = deferred<string>();
+    sessionReply.mockImplementation(async (_root, _content, msgType) =>
+      msgType === 'interactive' ? sent.promise : 'om_confirm');
+
+    const searching = handleCardAction(makeSearchEvent('alpha'), deps, APP_ID);
+    await vi.waitFor(() => expect(sessionReply.mock.calls.some(call => call[2] === 'interactive')).toBe(true));
+    await handleCardAction(makeSelectEvent('repo_switch', '/repos/alpha'), deps, APP_ID);
+    sent.resolve('om_late_search');
+    const res = await searching;
+
+    expect(res?.toast?.content).toMatch(/仓库已选定|ignore the old card/i);
+    expect(ds.pendingRepo).toBe(false);
+    expect(ds.repoCardMessageId).toBeUndefined();
+    await new Promise<void>(resolve => setImmediate(resolve));
+    expect(deleteMessage).toHaveBeenCalledWith(APP_ID, 'om_late_search');
+  });
+
   it('worktree_toggle_mode flips the persisted picker mode and re-sends a fresh repo card', async () => {
     // Callback open_message_id must match the live posted card.
     const ds = makeDs({ pendingRepo: true, pendingPrompt: 'hi', worker: null, repoCardMessageId: 'om_card' });
@@ -1468,16 +1567,19 @@ describe('repo select card — worktree open', () => {
     expect(res?.toast?.type).toBe('info');
     // persisted the flipped mode (config undefined → true)
     expect(vi.mocked(applyConfigField)).toHaveBeenCalledWith('app_test', expect.objectContaining({ configKey: 'worktreeMultiPicker' }), true);
-    // withdrew the old card and posted a fresh interactive repo card
-    expect(vi.mocked(deleteMessage)).toHaveBeenCalledWith('app_test', 'om_card');
+    // posted a fresh interactive repo card before withdrawing the old one
     const interactiveCall = sessionReply.mock.calls.find(c => c[2] === 'interactive');
     expect(interactiveCall).toBeDefined();
+    expect(ds.repoCardMessageId).toBe('om_reply');
+    expect(sessionReply.mock.invocationCallOrder[0]).toBeLessThan(vi.mocked(applyConfigField).mock.invocationCallOrder[0]);
+    await new Promise<void>(resolve => setImmediate(resolve));
+    expect(vi.mocked(deleteMessage)).toHaveBeenCalledWith('app_test', 'om_card');
     expect(createRepoWorktree).not.toHaveBeenCalled();
     expect(forkWorker).not.toHaveBeenCalled();
     expect(ds.worktreeCreating).not.toBe(true);
   });
 
-  it('worktree_toggle_mode clears the withdrawn card id and returns recovery guidance when replacement delivery fails', async () => {
+  it('worktree_toggle_mode keeps the old card active when replacement delivery fails', async () => {
     const ds = makeDs({ pendingRepo: true, pendingPrompt: 'hi', worker: null, repoCardMessageId: 'om_card' });
     const { deps, sessionReply } = makeDeps(ds);
     sessionReply.mockRejectedValueOnce(new Error('socket hang up'));
@@ -1489,11 +1591,79 @@ describe('repo select card — worktree open', () => {
 
     const res = await handleCardAction(event, deps, APP_ID);
 
-    expect(deleteMessage).toHaveBeenCalledWith(APP_ID, 'om_card');
-    expect(ds.repoCardMessageId).toBeUndefined();
+    expect(deleteMessage).not.toHaveBeenCalled();
+    expect(ds.repoCardMessageId).toBe('om_card');
     expect(res?.toast?.type).toBe('error');
     expect(res?.toast?.content).toContain('/repo');
     expect(ds.pendingRepo).toBe(true);
+    expect(applyConfigField).not.toHaveBeenCalled();
+  });
+
+  it('worktree_toggle_mode keeps the old card when config persistence fails after delivery', async () => {
+    const ds = makeDs({ pendingRepo: true, pendingPrompt: 'hi', worker: null, repoCardMessageId: 'om_card' });
+    const { deps, sessionReply } = makeDeps(ds);
+    sessionReply.mockResolvedValueOnce('om_uncommitted_mode');
+    vi.mocked(applyConfigField).mockResolvedValueOnce({ ok: false, reason: 'disk unavailable' });
+    const event = {
+      operator: { open_id: OWNER },
+      action: { value: { action: 'worktree_toggle_mode', root_id: ROOT_ID } },
+      context: { open_message_id: 'om_card' },
+    };
+
+    const res = await handleCardAction(event, deps, APP_ID);
+
+    expect(res?.toast?.type).toBe('error');
+    expect(res?.toast?.content).toContain('disk unavailable');
+    expect(ds.repoCardMessageId).toBe('om_card');
+    await new Promise<void>(resolve => setImmediate(resolve));
+    expect(deleteMessage).toHaveBeenCalledWith(APP_ID, 'om_uncommitted_mode');
+    expect(deleteMessage).not.toHaveBeenCalledWith(APP_ID, 'om_card');
+  });
+
+  it('worktree_toggle_mode also withdraws the delivered card when config persistence throws', async () => {
+    const ds = makeDs({ pendingRepo: true, pendingPrompt: 'hi', worker: null, repoCardMessageId: 'om_card' });
+    const { deps, sessionReply } = makeDeps(ds);
+    sessionReply.mockResolvedValueOnce('om_uncommitted_throw');
+    vi.mocked(applyConfigField).mockRejectedValueOnce(new Error('write exploded'));
+    const event = {
+      operator: { open_id: OWNER },
+      action: { value: { action: 'worktree_toggle_mode', root_id: ROOT_ID } },
+      context: { open_message_id: 'om_card' },
+    };
+
+    const res = await handleCardAction(event, deps, APP_ID);
+
+    expect(res?.toast?.content).toContain('write exploded');
+    expect(ds.repoCardMessageId).toBe('om_card');
+    await new Promise<void>(resolve => setImmediate(resolve));
+    expect(deleteMessage).toHaveBeenCalledWith(APP_ID, 'om_uncommitted_throw');
+    expect(deleteMessage).not.toHaveBeenCalledWith(APP_ID, 'om_card');
+  });
+
+  it('worktree_toggle_mode does not persist or revive a late card after repo selection wins', async () => {
+    const ds = makeDs({ pendingRepo: true, pendingPrompt: 'hi', worker: null, repoCardMessageId: 'om_card' });
+    const { deps, sessionReply } = makeDeps(ds);
+    const sent = deferred<string>();
+    sessionReply.mockImplementation(async (_root, _content, msgType) =>
+      msgType === 'interactive' ? sent.promise : 'om_confirm');
+    const event = {
+      operator: { open_id: OWNER },
+      action: { value: { action: 'worktree_toggle_mode', root_id: ROOT_ID } },
+      context: { open_message_id: 'om_card' },
+    };
+
+    const toggling = handleCardAction(event, deps, APP_ID);
+    await vi.waitFor(() => expect(sessionReply.mock.calls.some(call => call[2] === 'interactive')).toBe(true));
+    await handleCardAction(makeSelectEvent('repo_switch', '/repos/alpha'), deps, APP_ID);
+    sent.resolve('om_late_toggle');
+    const res = await toggling;
+
+    expect(res?.toast?.content).toMatch(/仓库已选定|ignore the old card/i);
+    expect(applyConfigField).not.toHaveBeenCalled();
+    expect(ds.pendingRepo).toBe(false);
+    expect(ds.repoCardMessageId).toBeUndefined();
+    await new Promise<void>(resolve => setImmediate(resolve));
+    expect(deleteMessage).toHaveBeenCalledWith(APP_ID, 'om_late_toggle');
   });
 
   it('worktree_toggle_mode rejects a stale/wrong card id before flipping config', async () => {

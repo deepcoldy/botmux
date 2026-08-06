@@ -29,6 +29,7 @@ import type { RelayPickerEntry } from '../src/im/lark/card-builder.js';
 import type { ProjectInfo } from '../src/services/project-scanner.js';
 import { LOCAL_CLI_IDS } from '../src/services/local-cli-opener.js';
 import { globalConfigPath, mergeDashboardConfig } from '../src/global-config.js';
+import { stampBotmuxCallbackMarkers } from '../src/im/lark/callback-button-marker.js';
 
 // The terminal button's URL wrapping now depends on the global dashboard
 // setting `openTerminalInFeishu` (read via readGlobalConfig at build time):
@@ -53,6 +54,22 @@ afterEach(() => {
 
 function parse(json: string): any {
   return JSON.parse(json);
+}
+
+function repoRequestDataBytes(cardJson: string): { reply: number; create: number } {
+  const content = stampBotmuxCallbackMarkers(cardJson);
+  return {
+    reply: Buffer.byteLength(JSON.stringify({
+      msg_type: 'interactive',
+      content,
+      reply_in_thread: true,
+    }), 'utf-8'),
+    create: Buffer.byteLength(JSON.stringify({
+      receive_id: `oc_${'x'.repeat(61)}`,
+      msg_type: 'interactive',
+      content,
+    }), 'utf-8'),
+  };
 }
 
 function findActions(card: any): any[] {
@@ -1225,7 +1242,10 @@ describe('buildRepoSelectCard', () => {
     });
 
     it.each([false, true])('keeps a large repo card within transport headroom and preserves recovery actions (multi=%s)', (multiPicker) => {
-      const manyProjects: ProjectInfo[] = Array.from({ length: 500 }, (_, i) => ({
+      // Mirrors the 132-project live scan that previously produced a 16.7 KiB
+      // SDK request and was reset by the gateway despite the inner card being
+      // below the old 22 KiB cap.
+      const manyProjects: ProjectInfo[] = Array.from({ length: 132 }, (_, i) => ({
         name: `project-${i}-${'x'.repeat(48)}`,
         path: `/workspace/${i}/${'nested/'.repeat(8)}project-${i}`,
         type: i % 2 === 0 ? 'repo' : 'worktree',
@@ -1236,10 +1256,10 @@ describe('buildRepoSelectCard', () => {
       const card = parse(json);
       const switchSelect = deepFind(card, 'select_static').find((sel: any) => sel.value?.key === 'repo_switch');
       const noteContent = deepFind(card, 'note')[0]?.elements?.[0]?.content ?? '';
+      const requestBytes = repoRequestDataBytes(json);
 
-      // 30 KB is the complete-message limit; keep several KB available for
-      // the Lark reply envelope rather than merely squeezing under the limit.
-      expect(Buffer.byteLength(json, 'utf-8')).toBeLessThanOrEqual(24_000);
+      expect(requestBytes.reply).toBeLessThanOrEqual(12_000);
+      expect(requestBytes.create).toBeLessThanOrEqual(12_000);
       expect(switchSelect.options.length).toBeGreaterThan(0);
       expect(switchSelect.options.length).toBeLessThan(manyProjects.length);
       expect(deepFind(card, 'button').some((b: any) => b.value?.action === 'skip_repo')).toBe(true);
@@ -1248,19 +1268,21 @@ describe('buildRepoSelectCard', () => {
       expect(noteContent).toContain('/repo');
     });
 
-    it('shrinks UTF-8-heavy options by serialized bytes, not only by the option-count cap', () => {
+    it('budgets UTF-8 and JSON escaping in the final request, not only the inner card', () => {
       const longProjects: ProjectInfo[] = Array.from({ length: 40 }, (_, i) => ({
-        name: `项目-${i}-${'超长名称'.repeat(80)}`,
-        path: `/workspace/${i}/${'嵌套路径/'.repeat(80)}project`,
+        name: `项目-\\"${i}-${'超长名称'.repeat(80)}`,
+        path: `/workspace/\\"${i}/${'嵌套路径\\"/'.repeat(80)}project`,
         type: 'worktree',
-        branch: `feature/${'分支'.repeat(80)}-${i}`,
+        branch: `feature/\\"${'分支'.repeat(80)}-${i}`,
       }));
 
       const json = buildRepoSelectCard(longProjects, '/workspace/current', 'om_root', 'zh');
       const card = parse(json);
       const switchSelect = deepFind(card, 'select_static').find((sel: any) => sel.value?.key === 'repo_switch');
+      const requestBytes = repoRequestDataBytes(json);
 
-      expect(Buffer.byteLength(json, 'utf-8')).toBeLessThanOrEqual(24_000);
+      expect(requestBytes.reply).toBeLessThanOrEqual(12_000);
+      expect(requestBytes.create).toBeLessThanOrEqual(12_000);
       expect(switchSelect.options.length).toBeGreaterThan(0);
       expect(switchSelect.options.length).toBeLessThan(longProjects.length);
       expect(deepFind(card, 'button').some((b: any) => b.value?.action === 'skip_repo')).toBe(true);
@@ -1321,20 +1343,32 @@ describe('buildRepoSelectCard', () => {
   // ── Element structure ─────────────────────────────────────────────────
 
   describe('element structure', () => {
-    it('single mode (default): 6 elements — dir+skip, switch, worktree row, manual form, note', () => {
+    it('single mode (default): includes search before the switch and recovery controls', () => {
       const card = parse(buildRepoSelectCard(projects));
-      expect(card.elements).toHaveLength(6);
+      expect(card.elements).toHaveLength(7);
       expect(card.elements[0].tag).toBe('column_set'); // 当前工作目录 + 直接开启会话
       expect(card.elements[1].tag).toBe('hr');
-      expect(card.elements[2].tag).toBe('action');     // 选择仓库并切换 dropdown
-      expect(card.elements[3].tag).toBe('column_set'); // worktree dropdown + 🔀 多仓库 toggle (one row)
-      expect(card.elements[4].tag).toBe('form');       // manual entry
-      expect(card.elements[5].tag).toBe('note');
+      expect(card.elements[2].name).toBe('repo_search_form');
+      expect(card.elements[3].tag).toBe('action');     // 选择仓库并切换 dropdown
+      expect(card.elements[4].tag).toBe('column_set'); // worktree dropdown + 🔀 多仓库 toggle (one row)
+      expect(card.elements[5].name).toBe('repo_manual_form');
+      expect(card.elements[6].tag).toBe('note');
+    });
+
+    it('search form submits project, branch, or path queries', () => {
+      const card = parse(buildRepoSelectCard(projects, undefined, 'om_root'));
+      const form = card.elements.find((e: any) => e.tag === 'form' && e.name === 'repo_search_form');
+      const input = deepFind({ elements: [form] }, 'input')[0];
+      const button = deepFind({ elements: [form] }, 'button')[0];
+
+      expect(input.name).toBe('repo_search_query');
+      expect(button.action_type).toBe('form_submit');
+      expect(button.value).toEqual({ action: 'repo_search_submit', root_id: 'om_root' });
     });
 
     it('single mode: worktree dropdown weight-fills + toggle button auto-right in ONE column_set (mirrors manual row, no wrap)', () => {
       const card = parse(buildRepoSelectCard(projects, undefined, 'om_root'));
-      const row = card.elements[3];
+      const row = card.elements[4];
       expect(row.tag).toBe('column_set');
       expect(row.flex_mode).toBe('none');                       // forces one line on mobile too
       expect(row.columns[0].width).toBe('weighted');            // dropdown fills, like the manual input
@@ -1394,8 +1428,8 @@ describe('buildRepoSelectCard', () => {
         { name: 'beta', path: '/home/user/beta', type: 'worktree', branch: 'feat-x' },
       ];
       const card = parse(buildRepoSelectCard(onlyWorktrees));
-      // column_set(dir+skip), hr, switch action, form, note — worktree action dropped, form stays
-      expect(card.elements.map((e: any) => e.tag)).toEqual(['column_set', 'hr', 'action', 'form', 'note']);
+      // Search and manual recovery stay even when the worktree action is omitted.
+      expect(card.elements.map((e: any) => e.tag)).toEqual(['column_set', 'hr', 'form', 'action', 'form', 'note']);
     });
   });
 
