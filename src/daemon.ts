@@ -15445,14 +15445,31 @@ function deliverPassthroughToExistingSession(
 export const __testOnly_deliverPassthroughToExistingSession =
   deliverPassthroughToExistingSession;
 
-/** Post the first-spawn repo picker without blindly retrying an interactive
- * card after an uncertain transport failure. The pending input stays buffered;
- * a small text reply gives the user deterministic `/repo` recovery instead. */
+const RETRYABLE_REPO_CARD_TRANSPORT_CODES = new Set([
+  'EPIPE',
+  'ECONNRESET',
+  'ECONNABORTED',
+  'ETIMEDOUT',
+]);
+
+function isRetryableRepoCardTransportError(err: unknown): boolean {
+  const code = typeof (err as any)?.code === 'string' ? (err as any).code : '';
+  if (RETRYABLE_REPO_CARD_TRANSPORT_CODES.has(code)) return true;
+  const message = err instanceof Error ? err.message : String(err);
+  return /socket hang up|\b(?:EPIPE|ECONNRESET|ECONNABORTED|ETIMEDOUT)\b/i.test(message);
+}
+
+/** Post the first-spawn repo picker. A long synchronous repo scan can leave the
+ * SDK's keep-alive socket stale, so retry one transient transport failure with
+ * the same provider UUID. Lark deduplicates a first request that committed but
+ * lost its response; if both attempts fail, keep the pending input buffered and
+ * send the deterministic `/repo` text recovery instead. */
 async function postPendingRepoSelectCard(
   ds: DaemonSession,
   anchor: string,
   projects: import('./services/project-scanner.js').ProjectInfo[],
 ): Promise<string | undefined> {
+  const deliveryUuid = `repo-picker:${ds.session.sessionId}`;
   try {
     const cardJson = buildRepoSelectCard(
       projects,
@@ -15461,7 +15478,13 @@ async function postPendingRepoSelectCard(
       localeForBot(ds.larkAppId),
       getBot(ds.larkAppId).config.worktreeMultiPicker,
     );
-    return await sessionReply(anchor, cardJson, 'interactive', ds.larkAppId);
+    try {
+      return await sessionReply(anchor, cardJson, 'interactive', ds.larkAppId, undefined, { uuid: deliveryUuid });
+    } catch (err) {
+      if (!isRetryableRepoCardTransportError(err)) throw err;
+      logger.warn(`[${tag(ds)}] Repo selection card transport failed; retrying with stable UUID: ${err instanceof Error ? err.message : err}`);
+      return await sessionReply(anchor, cardJson, 'interactive', ds.larkAppId, undefined, { uuid: deliveryUuid });
+    }
   } catch (err) {
     ds.repoCardMessageId = undefined;
     logger.warn(`[${tag(ds)}] Repo selection card delivery failed: ${err instanceof Error ? err.message : err}`);

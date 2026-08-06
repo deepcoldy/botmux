@@ -329,12 +329,48 @@ describe('handleBotAdded — 普通群 shared 路由', () => {
       expect.any(String),
       'interactive',
       true,
-      undefined,
+      expect.stringMatching(/^repo-picker:[0-9a-f-]{36}$/),
       expect.anything(),
     );
   });
 
-  it('首次仓库卡发送失败后保留待选输入，并在后续消息中给出文本恢复路径', async () => {
+  it('仓库卡遇到陈旧连接时使用同一个 UUID 重发且不产生文本兜底', async () => {
+    const { daemon, registry, types } = modules;
+    const appId = 'app_join_repo_card_retry';
+    const chatId = 'oc_join_repo_card_retry';
+    const scanDir = tempDir('scan-repo-card-retry');
+    mocks.getProjectScanDirs.mockReturnValue([scanDir]);
+    mocks.scanMultipleProjects.mockReturnValue([{
+      name: 'botmux',
+      path: scanDir,
+      type: 'repo',
+      branch: 'master',
+    }]);
+    mocks.replyMessage
+      .mockRejectedValueOnce(Object.assign(new Error('write EPIPE'), { code: 'EPIPE' }))
+      .mockResolvedValueOnce('om_repo_retry');
+    registry.registerBot({
+      larkAppId: appId,
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      allowedUsers: ['ou_owner'],
+      autoStartOnGroupJoin: true,
+      autoStartOnGroupJoinPrompt: '开始排查',
+      regularGroupReplyMode: 'shared',
+    });
+
+    await daemon.__testOnly_handleBotAdded(chatId, 'ou_owner', appId);
+
+    const ds = daemon.__testOnly_activeSessions.get(types.sessionKey(chatId, appId));
+    expect(ds?.pendingRepo).toBe(true);
+    expect(ds?.repoCardMessageId).toBe('om_repo_retry');
+    expect(mocks.replyMessage).toHaveBeenCalledTimes(2);
+    expect(mocks.replyMessage.mock.calls[0]?.[5]).toMatch(/^repo-picker:[0-9a-f-]{36}$/);
+    expect(mocks.replyMessage.mock.calls[1]?.[5]).toBe(mocks.replyMessage.mock.calls[0]?.[5]);
+    expect(mocks.replyMessage.mock.calls.every(call => call[3] === 'interactive')).toBe(true);
+  });
+
+  it('仓库卡两次传输失败后保留待选输入，并在后续消息中给出文本恢复路径', async () => {
     const { daemon, registry, types } = modules;
     const appId = 'app_join_repo_card_failure';
     const chatId = 'oc_join_repo_card_failure';
@@ -348,7 +384,8 @@ describe('handleBotAdded — 普通群 shared 路由', () => {
     }]);
     mocks.replyMessage
       .mockRejectedValueOnce(new Error('socket hang up'))
-      .mockResolvedValue('om_recovery_text');
+      .mockRejectedValueOnce(Object.assign(new Error('write EPIPE'), { code: 'EPIPE' }))
+      .mockResolvedValueOnce('om_recovery_text');
     registry.registerBot({
       larkAppId: appId,
       larkAppSecret: 's',
@@ -366,7 +403,8 @@ describe('handleBotAdded — 普通群 shared 路由', () => {
     expect(ds?.pendingPrompt).toContain('开始排查');
     expect(ds?.repoCardMessageId).toBeUndefined();
     expect(mocks.forkWorker).not.toHaveBeenCalled();
-    expect(String(mocks.replyMessage.mock.calls[1]?.[2])).toContain('/repo <项目名|路径>');
+    expect(mocks.replyMessage.mock.calls[1]?.[5]).toBe(mocks.replyMessage.mock.calls[0]?.[5]);
+    expect(String(mocks.replyMessage.mock.calls[2]?.[2])).toContain('/repo <项目名|路径>');
 
     const followUpMessageId = 'om_after_repo_card_failure';
     await daemon.__testOnly_handleThreadReply(

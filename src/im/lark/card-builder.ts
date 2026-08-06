@@ -1002,11 +1002,13 @@ export function buildPrivateSnapshotCard(
  * Returns a JSON string suitable for msg_type: 'interactive'.
  */
 // Live traffic shows the gateway dropping interactive request-data near 16 KiB.
-// Budget the actual SDK `data` JSON (including callback markers and content's
-// second JSON escaping), with room left for transport framing and headers.
+// Budget the actual SDK `data` JSON (including callback markers, the stable
+// delivery UUID, and content's second JSON escaping), with room left for
+// transport framing and headers.
 const REPO_SELECT_REQUEST_DATA_MAX_BYTES = 12_000;
 const REPO_SELECT_CARD_MAX_OPTIONS = 40;
 const REPO_SELECT_BUDGET_RECEIVE_ID = `oc_${'x'.repeat(61)}`;
+const REPO_SELECT_BUDGET_UUID = 'x'.repeat(50);
 
 function repoSelectRequestDataBytes(cardJson: string): number {
   const stamped = stampBotmuxCallbackMarkers(cardJson);
@@ -1014,11 +1016,13 @@ function repoSelectRequestDataBytes(cardJson: string): number {
     msg_type: 'interactive',
     content: stamped,
     reply_in_thread: true,
+    uuid: REPO_SELECT_BUDGET_UUID,
   }), 'utf-8');
   const createBytes = Buffer.byteLength(JSON.stringify({
     receive_id: REPO_SELECT_BUDGET_RECEIVE_ID,
     msg_type: 'interactive',
     content: stamped,
+    uuid: REPO_SELECT_BUDGET_UUID,
   }), 'utf-8');
   return Math.max(replyBytes, createBytes);
 }

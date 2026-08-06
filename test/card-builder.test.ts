@@ -63,11 +63,13 @@ function repoRequestDataBytes(cardJson: string): { reply: number; create: number
       msg_type: 'interactive',
       content,
       reply_in_thread: true,
+      uuid: 'x'.repeat(50),
     }), 'utf-8'),
     create: Buffer.byteLength(JSON.stringify({
       receive_id: `oc_${'x'.repeat(61)}`,
       msg_type: 'interactive',
       content,
+      uuid: 'x'.repeat(50),
     }), 'utf-8'),
   };
 }
