@@ -61,14 +61,17 @@ function cleanTitleLine(raw: string): string {
  *  still looks like prose — never let over-filtering blank a real answer. */
 export function sanitizeTitleOutput(stdout: string, maxLen: number): string | null {
   const all = stdout.split('\n').map(l => l.trim()).filter(Boolean);
+  // Obvious non-answers in ANY pass: dividers, bare numbers, hook chatter,
+  // lines with no letter/digit at all.
+  const junk = (l: string) =>
+    !/[\p{L}\p{N}]/u.test(l) || /^[-=—_\s]+$/.test(l) || /^\d[\d,.\s]*$/.test(l) || /^hook:/i.test(l);
   const strict = all
     // codex exec progress lines look like "[2026-08-05T…] tokens used: 123" —
     // drop bracketed/log-ish lines so the answer line survives as the last one.
-    .filter(l => !/^\[.*\]/.test(l) && !/^(tokens used|thinking|codex$|user$)/i.test(l));
-  const lenient = all
-    // Lenient fallback: exclude only obvious non-answers (dividers, pure
-    // numbers/punctuation, hook chatter) — keep anything prose-like.
-    .filter(l => /[\p{L}\p{N}]/u.test(l) && !/^[-=—_\s]+$/.test(l) && !/^\d[\d,.\s]*$/.test(l) && !/^hook:/i.test(l));
+    .filter(l => !junk(l) && !/^\[.*\]/.test(l) && !/^(tokens used|thinking|codex$|user$)/i.test(l));
+  // Lenient fallback: keep anything prose-like, including bracket-prefixed
+  // lines the strict pass dropped (unpredicted "[ts] answer" shapes).
+  const lenient = all.filter(l => !junk(l));
   const raw = strict.length ? strict[strict.length - 1]
     // The lenient pick may still carry a bracketed log prefix — strip it so a
     // "[ts] answer" line yields the answer, not the timestamp.
