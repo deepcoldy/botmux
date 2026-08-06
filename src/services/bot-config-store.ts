@@ -85,7 +85,7 @@ export const CONFIG_FIELDS: readonly ConfigFieldSpec[] = [
   { key: 'disableCliBypass', configKey: 'disableCliBypass', kind: 'boolean', effect: 'next-session', clearable: false, hint: '不加 CLI 审批/sandbox 绕过参数 on|off' },
   { key: 'codexAppCleanInput', configKey: 'codexAppCleanInput', kind: 'boolean', effect: 'immediate', clearable: false, hint: '实验性：Codex App 用户气泡只保留真实输入，Botmux 元数据走隐藏上下文；默认 off，从下一次 turn 派发生效，不改已有历史' },
   { key: 'restrictGrantCommands', configKey: 'restrictGrantCommands', kind: 'boolean', effect: 'immediate', clearable: false, hint: '被授权人仅能纯对话、拦截斜杠命令 on|off' },
-  { key: 'p2pMode', configKey: 'p2pMode', kind: 'enum', effect: 'immediate', clearable: true, enumValues: ['thread', 'chat'], hint: '私聊单聊模式 thread|chat；默认 chat=扁平连续会话，thread=每条 DM 独立会话（chat/unset 回默认）' },
+  { key: 'p2pMode', configKey: 'p2pMode', kind: 'enum', effect: 'immediate', clearable: true, enumValues: ['thread', 'chat', 'group'], hint: '私聊单聊模式 thread|chat|group；默认 chat=扁平连续会话，thread=每条 DM 独立会话，group=每条 DM 自动建专属会话群（chat/unset 回默认）' },
   { key: 'maxLiveWorkers', configKey: 'maxLiveWorkers', kind: 'number', effect: 'immediate', clearable: true, hint: '最大常驻会话数；超过后最久未用的会话自动休眠（退出后台进程和 CLI、回收内存，下条消息冷恢复）；unset=默认 30' },
   { key: 'customPassthroughCommands', configKey: 'customPassthroughCommands', kind: 'stringList', effect: 'immediate', clearable: true, hint: '额外放行透传给 CLI 的 slash 命令（逗号/空格分隔，如 /goal /export）；unset 回仅内置白名单' },
   { key: 'canTalkDaemonCommands', configKey: 'canTalkDaemonCommands', kind: 'stringList', effect: 'immediate', clearable: true, parseList: parseCanTalkDaemonCommandsInput, hint: '把列出的 daemon 命令权限从 canOperate（仅管理员）降到 canTalk（对话放行即可用），如 /status /help；仅认 daemon 命令，透传命令无效；unset 回全部仅管理员' },
@@ -397,7 +397,7 @@ export interface ConfigCardData {
   model: string | null;
   modelChoices: string[];
   lang: string | null;
-  /** 私聊单聊模式 p2pMode（'chat' | 'thread'）；null = 未设（默认 chat）。 */
+  /** 私聊单聊模式 p2pMode（'chat' | 'thread' | 'group'）；null = 未设（默认 chat）。 */
   p2pMode: string | null;
   brandLabel: string | null;
   defaultWorkingDir: string | null;

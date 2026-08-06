@@ -1011,6 +1011,67 @@ export interface VcMeetingRealtimeVoiceConfig {
   testSpeakOnStartText?: string;
 }
 
+/**
+ * Per-bot settings for p2pMode='group' session groups (each top-level DM
+ * message births a dedicated 1-user+1-bot group hosting the conversation).
+ * Everything is optional; effective defaults in parentheses.
+ */
+export interface SessionGroupConfig {
+  /** Group-name generation. */
+  naming?: {
+    /**
+     * 'ai-summary' (default): create with a truncated placeholder name, then
+     * asynchronously ask the bot's own CLI (one-shot headless call) for a
+     * short title and rename the chat when it lands. Falls back to the
+     * placeholder on failure/timeout.
+     * 'truncate': placeholder only — zero cost, zero delay.
+     */
+    mode?: 'ai-summary' | 'truncate';
+    /** Max title length in characters for the AI summary (12). */
+    maxLen?: number;
+  };
+  /**
+   * Optional fixed group-name prefix. Empty/undefined (default) = no prefix.
+   * Only needed as the match key for the rule-based feed-group mode (PR2).
+   */
+  namePrefix?: string;
+  /** Template working dir bound to each new session group (defaultWorkingDir). */
+  workingDir?: string;
+  /** Send a DM receipt linking the freshly-created group (true). */
+  dmReceipt?: boolean;
+  /**
+   * What to do with the group when its session is closed:
+   * 'keep' (default) — leave the group and registry entry; a later message in
+   * the group resumes the closed session (same-group resume). 'disband' /
+   * 'archive' are reserved for a follow-up PR and currently behave as 'keep'.
+   */
+  onClose?: 'keep' | 'disband' | 'archive';
+  /**
+   * Session-group tagging.
+   * 'chat-tag' (default) — tenant chat tags (企业自定义群标签): a property of
+   *   the GROUP itself, applied with the bot's own tenant token. Zero user
+   *   OAuth; needs the im:tag:write + im:biz_entity_tag_relation:write tenant
+   *   scopes enabled for the app.
+   * 'feed-group' — the owner's personal sidebar 消息分组 (feed group). Needs a
+   *   one-time user OAuth (im:feed_group_v1) — kept as an opt-in because it
+   *   touches the user's personal sidebar data.
+   * 'off' — no tagging.
+   */
+  tag?: {
+    mode?: 'chat-tag' | 'feed-group' | 'off';
+    /** Tag / feed-group display name (default: Botmux群会话). */
+    name?: string;
+  };
+  /**
+   * Distinctive built-in group avatar for session groups — the zero-permission
+   * visual marker (works on tenants without the chat-tag catalog).
+   * 'auto' (default) applies it at birth; 'off' keeps Feishu's default avatar.
+   */
+  avatar?: 'auto' | 'off';
+  /** Reserved (PR3): auto-dispose after N idle days; 0/undefined = off. */
+  idleDays?: number;
+}
+
 export interface BotConfig {
   larkAppId: string;
   larkAppSecret: string;
@@ -1402,9 +1463,19 @@ export interface BotConfig {
    *     keeps 1:1 chatter out of one long-running CLI process.
    *   - 'chat': route DMs as one flat, continuous chat-scoped session (all
    *     messages share the same context, similar to Hermes/OpenClaw).
-   * Editable at runtime via `/botconfig p2pMode chat|thread` (owner/admin).
+   *   - 'group': every top-level DM message births a dedicated 1-user+1-bot
+   *     "session group" that hosts the conversation (the bot keeps chat
+   *     ownership; the group is registered in session-groups-store and the
+   *     session lands chat-scope inside it). Falls back to 'thread' behavior
+   *     when group creation fails.
+   * Editable at runtime via `/botconfig p2pMode chat|thread|group` (owner/admin).
    */
-  p2pMode?: 'thread' | 'chat';
+  p2pMode?: 'thread' | 'chat' | 'group';
+  /**
+   * Settings for p2pMode='group' session groups. All fields optional; see
+   * SessionGroupConfig for defaults. Ignored under other p2pModes.
+   */
+  sessionGroup?: SessionGroupConfig;
   /** chat_id list: chats where the live streaming card is suppressed (status falls back to master's pending-card morph). Written by `/card off|on`. */
   noCardChats?: string[];
   /**
@@ -2633,10 +2704,13 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         ? entry.receivedReactionEmoji.trim() : undefined,
       doneReactionEmoji: typeof entry.doneReactionEmoji === 'string' && entry.doneReactionEmoji.trim()
         ? entry.doneReactionEmoji.trim() : undefined,
-      // Default is now 'chat' (flat continuous DM session). Only 'thread' is
-      // meaningful and persists; 'chat' (and anything else) normalizes to
-      // undefined so bots.json stays clean.
-      p2pMode: entry.p2pMode === 'thread' ? 'thread' : undefined,
+      // Default is now 'chat' (flat continuous DM session). Only 'thread' and
+      // 'group' are meaningful and persist; 'chat' (and anything else)
+      // normalizes to undefined so bots.json stays clean.
+      p2pMode: entry.p2pMode === 'thread' ? 'thread' : entry.p2pMode === 'group' ? 'group' : undefined,
+      sessionGroup: entry.sessionGroup && typeof entry.sessionGroup === 'object'
+        ? entry.sessionGroup as SessionGroupConfig
+        : undefined,
       noCardChats: Array.isArray(entry.noCardChats)
         ? entry.noCardChats.filter((x: any): x is string => typeof x === 'string' && x.trim().length > 0).map((x: string) => x.trim())
         : undefined,
