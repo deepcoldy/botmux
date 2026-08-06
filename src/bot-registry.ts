@@ -21,6 +21,7 @@ import { sanitizePerBotEnv } from './core/per-bot-env.js';
 import { normalizeSubstituteMode } from './services/substitute-mode-normalize.js';
 import { normalizePluginIdList } from './core/plugins/ids.js';
 import { normalizeVcMeetingProfileInstructions } from './services/vc-meeting-profile-instructions.js';
+import { isGrantDurationOption } from './services/grant-policy.js';
 import type {
   VcMeetingConsumerAgentConfig,
   VcMeetingConsumerConfig,
@@ -1275,6 +1276,11 @@ export interface BotConfig {
    */
   messageQuota?: { defaultLimit?: number };
   /**
+   * 新建 per-user 授权卡的默认有限时长（毫秒）。缺省使用产品默认 1 小时；
+   * 已存在授权和已经生成的 pending 卡不受后续配置变更影响。
+   */
+  grantDefaultDurationMs?: number;
+  /**
    * scope-aware 消息额度计数（运行时状态，随授权一起持久化进 bots.json）。
    * key = `chat:${chatId}:${openId}` | `global:${openId}`，value = { limit, used }。
    * 仅在 /grant 带额度（显式数字，或开启 default 时取 default）时建记录；
@@ -2402,6 +2408,11 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       if (typeof d === 'number' && Number.isInteger(d) && d > 0) messageQuota = { defaultLimit: d };
     }
 
+    // 新授权默认有效期：只接受授权卡已有的四个有限选项；非法/缺省回落产品默认 1 小时。
+    const grantDefaultDurationMs = isGrantDurationOption(entry.grantDefaultDurationMs)
+      ? entry.grantDefaultDurationMs
+      : undefined;
+
     // quotaState：scope-aware 计数。逐项校验 key 形如 `chat:*:*` / `global:*`，
     // value 为 { limit, used } 正整数（used 允许 0）。非法项丢弃；全空 → undefined。
     let quotaState: { [k: string]: { limit: number; used: number } } | undefined;
@@ -2603,6 +2614,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       // 只落显式 true（undefined = 关），与 restrictGrantCommands 同款，保持 bots.json 干净。
       p2pOpen: entry.p2pOpen === true || undefined,
       messageQuota,
+      grantDefaultDurationMs,
       quotaState,
       grantExpiryState,
       restrictGrantCommands: entry.restrictGrantCommands === true || undefined,

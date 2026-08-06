@@ -23206,6 +23206,20 @@ dialog select[multiple]:hover:not(:disabled) {
 }
 .bot-defaults-page .toggle-row .switch {
   margin-top: 0;
+  transition: background 140ms ease, transform 100ms ease;
+}
+.bot-defaults-page .toggle-row:active:not(:has(input:disabled)) .switch {
+  transform: scale(0.96);
+}
+.bot-defaults-page .toggle-row input:focus-visible + .switch {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
+}
+.bot-defaults-page .toggle-row:has(input:disabled) {
+  cursor: not-allowed;
+}
+.bot-defaults-page .toggle-row input:disabled ~ .toggle-tx {
+  color: var(--faint);
 }
 
 .bot-defaults-page .bd-tile :where(input[type="text"], input[type="number"], textarea) {
@@ -23286,6 +23300,117 @@ dialog select[multiple]:hover:not(:disabled) {
   min-width: 0;
   height: 100%;
   margin: 0;
+}
+
+.bot-defaults-page .bd-grant-defaults {
+  margin-top: 16px;
+}
+
+.bot-defaults-page .bd-grant-defaults > .actions {
+  justify-content: flex-end;
+}
+
+.bot-defaults-page .bd-field-error {
+  display: block;
+  margin-top: 6px;
+  color: var(--danger);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.bot-defaults-page .bd-grant-defaults input[aria-invalid="true"] {
+  border-color: var(--danger);
+}
+
+.bot-defaults-page .bd-card-settings {
+  display: grid;
+  gap: 16px;
+  margin-top: 12px;
+}
+
+.bot-defaults-page .bd-card-setting-group {
+  min-width: 0;
+}
+
+.bot-defaults-page .bd-card-setting-group + .bd-card-setting-group {
+  padding-top: 16px;
+  border-top: 1px solid color-mix(in srgb, var(--border-soft) 82%, transparent);
+}
+
+.bot-defaults-page .bd-card-setting-heading {
+  margin: 0 0 8px;
+  color: var(--fg);
+  font-size: 12px;
+  font-weight: 700;
+  line-height: 1.35;
+}
+
+.bot-defaults-page .bd-card-setting-copy {
+  margin: -2px 0 8px;
+  color: var(--muted);
+  font-size: 11.5px;
+  line-height: 1.5;
+}
+
+.bot-defaults-page .bd-card-settings .toggle-row {
+  min-width: 0;
+  margin: 0;
+}
+
+.bot-defaults-page .bd-card-settings .toggle-tx small {
+  display: block;
+  overflow: visible;
+  margin-top: 3px;
+  color: var(--muted);
+  font-size: 11.5px;
+  line-height: 1.45;
+  -webkit-box-orient: initial;
+  -webkit-line-clamp: unset;
+}
+
+.bot-defaults-page .bd-card-primary-toggle {
+  padding: 4px 0;
+}
+
+.bot-defaults-page .bd-card-dependent {
+  display: grid;
+  gap: 7px;
+  margin: 8px 0 0 48px;
+  padding: 10px 12px;
+  border-left: 2px solid color-mix(in srgb, var(--accent) 58%, var(--border-soft));
+  border-radius: 0 var(--radius-md) var(--radius-md) 0;
+  background: color-mix(in srgb, var(--accent) 5%, transparent);
+}
+
+.bot-defaults-page .bd-card-dependent[hidden] {
+  display: none;
+}
+
+.bot-defaults-page .bd-card-dependent .toggle-row {
+  padding: 0;
+}
+
+.bot-defaults-page .bd-card-mode-note {
+  margin: 0 0 0 48px;
+  color: var(--muted);
+  font-size: 11.5px;
+  line-height: 1.5;
+}
+
+.bot-defaults-page .bd-card-setting-group > .bd-row {
+  margin-top: 0;
+}
+
+.bot-defaults-page .bd-card-control-list {
+  display: grid;
+  gap: 10px;
+  margin-top: 10px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .bot-defaults-page .toggle-row .switch {
+    transition: none;
+  }
 }
 
 .bot-defaults-page .bd-substitute-target-list {
@@ -23388,6 +23513,10 @@ dialog select[multiple]:hover:not(:disabled) {
 @media (max-width: 720px) {
   .bot-defaults-page .bd-toggle-grid {
     grid-template-columns: 1fr;
+  }
+
+  .bot-defaults-page .bd-card-dependent {
+    margin-left: 0;
   }
 
   .bot-defaults-page .bd-runtime-fields {

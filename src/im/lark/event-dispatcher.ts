@@ -1632,14 +1632,16 @@ async function maybeSendGrantRequestCard(
   const shortRequester = `${requesterOpenId.slice(0, 10)}…${requesterOpenId.slice(-4)}`;
   const name = mentionName ?? observedName ?? profileName ?? shortRequester;
   // 把原始消息事件挂在 pending 上：授权成功后可重放，用户无需再 @ 一遍。
-  const quota = getBot(larkAppId).config.messageQuota?.defaultLimit ?? DEFAULT_GRANT_QUOTA;
+  const botConfig = getBot(larkAppId).config;
+  const quota = botConfig.messageQuota?.defaultLimit ?? DEFAULT_GRANT_QUOTA;
+  const durationMs = botConfig.grantDefaultDurationMs ?? DEFAULT_GRANT_DURATION_MS;
   const nonce = openPending(
     larkAppId,
     chatId,
     requesterOpenId,
     quota,
     messageData,
-    DEFAULT_GRANT_DURATION_MS,
+    durationMs,
   );
   const card = buildGrantCard(
     {
@@ -1649,7 +1651,7 @@ async function maybeSendGrantRequestCard(
       nonce,
       mode: 'request',
       quota,
-      durationMs: DEFAULT_GRANT_DURATION_MS,
+      durationMs,
     },
     localeForBot(larkAppId),
   );

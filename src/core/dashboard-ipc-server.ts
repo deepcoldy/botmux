@@ -3013,6 +3013,7 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
     restrictGrantCommands: grantPrefs.restrictGrantCommands,
     autoGrantRequestCards: grantPrefs.autoGrantRequestCards,
     messageQuotaDefaultLimit: grantPrefs.messageQuotaDefaultLimit,
+    grantDefaultDurationMs: grantPrefs.grantDefaultDurationMs,
     p2pMode,
     skillInjection,
     skillInjectionSupport,
@@ -3169,7 +3170,8 @@ ipcRoute('PUT', '/api/bot-summary-trigger', async (req, res) => {
 // Per-bot 授权偏好。Body 任意子集：
 //   • restrictGrantCommands: boolean       — 限制被授权人只能纯对话
 //   • autoGrantRequestCards: boolean       — 未授权 @ 被挡住时是否发 grant 申请卡
-//   • messageQuotaDefaultLimit: number|null — 卡片默认额度覆盖（null = 产品默认 3 条）
+//   • messageQuotaDefaultLimit: number|null — 卡片/Oncall 额度覆盖（null = 卡片内置 3 条、Oncall 不限）
+//   • grantDefaultDurationMs: number|null   — 新授权默认有限时长（null = 产品默认 1 小时）
 ipcRoute('PUT', '/api/bot-grant-prefs', async (req, res) => {
   if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
   let raw: unknown;
@@ -3179,14 +3181,27 @@ ipcRoute('PUT', '/api/bot-grant-prefs', async (req, res) => {
   if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
     return jsonRes(res, 400, { ok: false, error: 'no_valid_fields' });
   }
-  const body = raw as { restrictGrantCommands?: unknown; autoGrantRequestCards?: unknown; messageQuotaDefaultLimit?: unknown };
+  const body = raw as {
+    restrictGrantCommands?: unknown;
+    autoGrantRequestCards?: unknown;
+    messageQuotaDefaultLimit?: unknown;
+    grantDefaultDurationMs?: unknown;
+  };
 
-  const patch: { restrictGrantCommands?: boolean; autoGrantRequestCards?: boolean; messageQuotaDefaultLimit?: number | null } = {};
+  const patch: {
+    restrictGrantCommands?: boolean;
+    autoGrantRequestCards?: boolean;
+    messageQuotaDefaultLimit?: number | null;
+    grantDefaultDurationMs?: number | null;
+  } = {};
   if (typeof body.restrictGrantCommands === 'boolean') patch.restrictGrantCommands = body.restrictGrantCommands;
   if (typeof body.autoGrantRequestCards === 'boolean') patch.autoGrantRequestCards = body.autoGrantRequestCards;
-  // null（含 JSON null）= 关闭默认额度；number = 设定（store 内再校验正整数）。
+  // null（含 JSON null）= 恢复内置额度策略；number = 设定覆盖值（store 内校验 1–1000）。
   if (body.messageQuotaDefaultLimit === null) patch.messageQuotaDefaultLimit = null;
   else if (typeof body.messageQuotaDefaultLimit === 'number') patch.messageQuotaDefaultLimit = body.messageQuotaDefaultLimit;
+  // null = 恢复产品默认 1 小时；number 由 store 按卡片有限选项白名单校验。
+  if (body.grantDefaultDurationMs === null) patch.grantDefaultDurationMs = null;
+  else if (typeof body.grantDefaultDurationMs === 'number') patch.grantDefaultDurationMs = body.grantDefaultDurationMs;
   if (Object.keys(patch).length === 0) return jsonRes(res, 400, { ok: false, error: 'no_valid_fields' });
 
   const r = await grantPrefsStore.updateBotGrantPrefs(cachedLarkAppId, patch);

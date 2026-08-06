@@ -150,7 +150,7 @@ import {
 } from '../src/vc-agent/push-source.js';
 // grant-pending is a real (unmocked) module-level table; reset it per test so the
 // grant-card throttle state never leaks across cases (it backs the @blocked card path).
-import { _resetForTest as _resetGrantPending } from '../src/im/lark/grant-pending.js';
+import { getPendingGrantLimits, _resetForTest as _resetGrantPending } from '../src/im/lark/grant-pending.js';
 import { logger } from '../src/utils/logger.js';
 import { config } from '../src/config.js';
 
@@ -801,6 +801,7 @@ function setupBotState(opts?: {
 	  regularGroupMentionMode?: 'always' | 'topic' | 'never' | 'ambient';
 	  autoStartOnNewTopic?: boolean;
 	  autoGrantRequestCards?: boolean;
+	  grantDefaultDurationMs?: number;
 	  messageListeners?: Record<string, unknown>;
 	  chatReplyModes?: Record<string, 'chat' | 'new-topic' | 'shared' | 'chat-topic'>;
 	  p2pMode?: 'thread' | 'chat';
@@ -833,6 +834,7 @@ function setupBotState(opts?: {
       regularGroupMentionMode: opts?.regularGroupMentionMode,
       autoStartOnNewTopic: opts?.autoStartOnNewTopic,
       autoGrantRequestCards: opts?.autoGrantRequestCards,
+	      grantDefaultDurationMs: opts?.grantDefaultDurationMs,
 	      messageListeners: opts?.messageListeners,
 	      chatReplyModes: opts?.chatReplyModes,
 	      p2pMode: opts?.p2pMode,
@@ -2077,6 +2079,36 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
       expect.stringContaining(OTHER_BOT_OPEN_ID),
       'interactive',
     );
+  });
+
+  it('uses the configured finite duration for both an automatic grant card and its pending state', async () => {
+    setupBotState({
+      allowedUsers: ['ou_owner'],
+      grantDefaultDurationMs: 8 * 60 * 60 * 1000,
+    });
+    mockGetOwnerOpenId.mockReturnValue('ou_owner');
+    mockGetChatMode.mockResolvedValueOnce('group');
+    mockReadFileSync.mockReturnValue('{}');
+    const event = makeBotMessageEvent({
+      senderOpenId: OTHER_BOT_OPEN_ID,
+      senderType: 'bot',
+      content: JSON.stringify({
+        zh_cn: { content: [[{ tag: 'at', user_id: MY_OPEN_ID }]] },
+      }),
+      rootId: undefined,
+    });
+    event.message.root_id = undefined as any;
+    handlers.isSessionOwner.mockReturnValue(false);
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    const [, , content, msgType] = mockReplyMessage.mock.calls.at(-1)!;
+    expect(msgType).toBe('interactive');
+    expect(content).toContain(`"initial_option":"${8 * 60 * 60 * 1000}"`);
+    expect(getPendingGrantLimits(MY_APP_ID, 'chat-001', OTHER_BOT_OPEN_ID)).toMatchObject({
+      durationMs: 8 * 60 * 60 * 1000,
+    });
   });
 
   it('routes an unknown external bot @mention when the chat is 整群授权 (allowedChatGroups)', async () => {

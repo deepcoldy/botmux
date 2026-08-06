@@ -164,6 +164,7 @@ describe('BotOnboardingManager', () => {
     });
     const bots = JSON.parse(readFileSync(join(dir, 'bots.json'), 'utf-8'));
     expect(bots[0]).toMatchObject({ larkAppId: 'cli_web_owner', allowedUsers: ['on_creator'] });
+    expect(bots[0]).not.toHaveProperty('disableStreamingCard');
     rmSync(dir, { recursive: true, force: true });
   });
 
