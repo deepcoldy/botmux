@@ -885,9 +885,20 @@ export interface SessionGroupConfig {
    * 'archive' are reserved for a follow-up PR and currently behave as 'keep'.
    */
   onClose?: 'keep' | 'disband' | 'archive';
-  /** Reserved (PR2): sidebar feed-group tag management. */
-  feedGroup?: {
-    mode?: 'explicit' | 'rule' | 'off';
+  /**
+   * Session-group tagging.
+   * 'chat-tag' (default) — tenant chat tags (企业自定义群标签): a property of
+   *   the GROUP itself, applied with the bot's own tenant token. Zero user
+   *   OAuth; needs the im:tag:write + im:biz_entity_tag_relation:write tenant
+   *   scopes enabled for the app.
+   * 'feed-group' — the owner's personal sidebar 消息分组 (feed group). Needs a
+   *   one-time user OAuth (im:feed_group_v1) — kept as an opt-in because it
+   *   touches the user's personal sidebar data.
+   * 'off' — no tagging.
+   */
+  tag?: {
+    mode?: 'chat-tag' | 'feed-group' | 'off';
+    /** Tag / feed-group display name (default: Botmux群会话). */
     name?: string;
   };
   /** Reserved (PR3): auto-dispose after N idle days; 0/undefined = off. */

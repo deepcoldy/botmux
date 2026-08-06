@@ -1,26 +1,25 @@
 /**
- * Sidebar feed-group tagging for session groups (p2pMode='group').
+ * Session-group tagging (p2pMode='group').
  *
- * Feishu "消息分组" (feed groups, ofg_xxx) are PER-USER sidebar tags — the
- * API only accepts a user_access_token, so tagging runs under the bot owner's
- * OAuth token (utils/user-token, the same store /login fills). Everything is
- * best-effort: a missing/expired token or an app without the feed-group
- * scopes degrades to "group created, not tagged" with a log line, plus a
- * throttled DM nudge to the owner containing a ready-to-click auth link.
+ * Default mode `chat-tag` — tenant chat tags (企业自定义群标签): the tag is a
+ * property of the GROUP itself, applied with the bot's own tenant token via
+ * `im/v2/tags` + `im/v2/biz_entity_tag_relation`. No user OAuth involved; the
+ * app just needs the `im:tag:write` and `im:biz_entity_tag_relation:write`
+ * tenant scopes (setup/lark-scopes.json lists both). When a scope is missing
+ * the bot DMs the owner a ready-to-click console enable link (throttled).
  *
- * Flow per birth (explicit mode, the default):
- *   1. ensure the configured feed group exists (create type=normal on first
- *      use; rename when the configured name changed) — cached per app+user in
- *      `${dataDir}/feed-group-cache-${appId}.json`
- *   2. batch_add_item the freshly-born chat into it
+ * Opt-in mode `feed-group` — the owner's personal sidebar 消息分组 (feed
+ * group, ofg_xxx). Feishu only accepts a user_access_token there, so it runs
+ * under the owner's OAuth token (utils/user-token) and nudges for
+ * authorization when missing. Kept opt-in because it writes to the user's
+ * personal sidebar data.
  *
- * Console prerequisite: the bot app must have the `im:feed_group_v1:write` /
- * `im:feed_group_v1:read` user scopes enabled (开放平台 → 权限管理), same as
- * any other user-scope feature. Both are listed in setup/lark-scopes.json.
+ * Everything is best-effort and fire-and-forget: failures degrade to
+ * "group created, not tagged" with a log line — never block a birth.
  */
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'node:fs';
 import { join, dirname } from 'node:path';
-import { getBot } from '../bot-registry.js';
+import { getBot, getBotClient } from '../bot-registry.js';
 import { config } from '../config.js';
 import { resolveUserToken, generateAuthUrl, FEED_GROUP_OAUTH_SCOPES } from '../utils/user-token.js';
 import { larkHosts, normalizeBrand } from '../im/lark/lark-hosts.js';
@@ -28,16 +27,20 @@ import { sendUserMessage } from '../im/lark/client.js';
 import { t, localeForBot } from '../i18n/index.js';
 import { logger } from '../utils/logger.js';
 
-const DEFAULT_FEED_GROUP_NAME = 'Botmux群会话';
-/** Re-nudge the owner about missing auth at most once per this window. */
-const AUTH_NUDGE_INTERVAL_MS = 24 * 60 * 60 * 1000;
+const DEFAULT_TAG_NAME = 'Botmux群会话';
+/** Re-nudge the owner about missing scope/auth at most once per this window. */
+const NUDGE_INTERVAL_MS = 24 * 60 * 60 * 1000;
 
-interface FeedGroupCache {
-  /** ofg_xxx id of the feed group we manage. */
+interface TagCache {
+  /** Tenant chat-tag id (chat-tag mode). */
+  chatTagId?: string;
+  /** The name chatTagId was created/renamed with (rename detection). */
+  chatTagName?: string;
+  /** ofg_xxx feed-group id (feed-group mode). */
   groupId?: string;
-  /** The name groupId was created/renamed with (rename detection). */
+  /** The name groupId was created/renamed with. */
   name?: string;
-  /** Epoch ms of the last missing-auth DM nudge (throttle). */
+  /** Epoch ms of the last owner nudge (throttle, shared by both modes). */
   lastAuthNudgeAt?: number;
 }
 
@@ -45,30 +48,151 @@ function cachePath(appId: string): string {
   return join(config.session.dataDir, `feed-group-cache-${appId}.json`);
 }
 
-function loadCache(appId: string): FeedGroupCache {
+function loadCache(appId: string): TagCache {
   try {
     const fp = cachePath(appId);
-    if (existsSync(fp)) return JSON.parse(readFileSync(fp, 'utf-8')) as FeedGroupCache;
+    if (existsSync(fp)) return JSON.parse(readFileSync(fp, 'utf-8')) as TagCache;
   } catch { /* corrupted cache → start fresh */ }
   return {};
 }
 
-function saveCache(appId: string, cache: FeedGroupCache): void {
+function saveCache(appId: string, cache: TagCache): void {
   try {
     const fp = cachePath(appId);
     mkdirSync(dirname(fp), { recursive: true });
     writeFileSync(fp, JSON.stringify(cache, null, 2), 'utf-8');
   } catch (err) {
-    logger.warn(`[feed-group] cache persist failed: ${err}`);
+    logger.warn(`[session-tag] cache persist failed: ${err}`);
   }
 }
+
+function nudgeThrottled(appId: string): boolean {
+  const cache = loadCache(appId);
+  const now = Date.now();
+  if (cache.lastAuthNudgeAt && now - cache.lastAuthNudgeAt < NUDGE_INTERVAL_MS) return true;
+  cache.lastAuthNudgeAt = now;
+  saveCache(appId, cache);
+  return false;
+}
+
+// ─── chat-tag mode (tenant token via the bot's SDK client) ───────────────────
+
+interface TenantApiResult {
+  ok: boolean;
+  code?: number;
+  msg?: string;
+  data?: any;
+  /** The scope named in a 99991672 access-denied error, if any. */
+  missingScope?: string;
+}
+
+async function tenantApi(
+  larkAppId: string,
+  method: 'POST' | 'PATCH',
+  url: string,
+  data: unknown,
+): Promise<TenantApiResult> {
+  try {
+    const client = getBotClient(larkAppId);
+    const res: any = await (client as any).request({ method, url, data });
+    const code = typeof res?.code === 'number' ? res.code : 0;
+    if (code === 0) return { ok: true, code, data: res?.data };
+    return { ok: false, code, msg: res?.msg };
+  } catch (err: any) {
+    // SDK throws on non-2xx; the Lark error body rides on err.response.data.
+    const body = err?.response?.data;
+    const code = typeof body?.code === 'number' ? body.code : undefined;
+    const msg = body?.msg ?? err?.message ?? String(err);
+    const missingScope = code === 99991672
+      ? /\[([a-z0-9_:.]+)\]/i.exec(String(msg))?.[1]
+      : undefined;
+    return { ok: false, code, msg, missingScope };
+  }
+}
+
+/** Console one-click enable link for a missing tenant scope (the same URL
+ *  Feishu embeds in its 99991672 error message). */
+function scopeEnableLink(host: string, appId: string, scope: string): string {
+  const consoleHost = host.replace('open-apis', '').replace(/\/$/, '');
+  return `${consoleHost}/app/${appId}/auth?q=${encodeURIComponent(scope)}&op_from=openapi&token_type=tenant`;
+}
+
+async function maybeNudgeScope(larkAppId: string, ownerOpenId: string, scope: string): Promise<void> {
+  if (nudgeThrottled(larkAppId)) return;
+  try {
+    const cfg = getBot(larkAppId).config;
+    const host = larkHosts(normalizeBrand(cfg.brand)).openApi;
+    const loc = localeForBot(larkAppId);
+    await sendUserMessage(
+      larkAppId,
+      ownerOpenId,
+      t('sg.tag_scope_nudge', { scope, url: scopeEnableLink(host, cfg.larkAppId, scope) }, loc),
+      'text',
+    );
+    logger.info(`[session-tag] sent scope nudge (${scope}) to owner ${ownerOpenId.substring(0, 12)}`);
+  } catch (err) {
+    logger.warn(`[session-tag] scope nudge failed: ${err}`);
+  }
+}
+
+/** Ensure the tenant chat tag exists (create / rename), returning its id. */
+async function ensureChatTag(larkAppId: string, name: string, ownerOpenId: string): Promise<string | null> {
+  const cache = loadCache(larkAppId);
+  if (cache.chatTagId && cache.chatTagName === name) return cache.chatTagId;
+
+  if (cache.chatTagId && cache.chatTagName !== name) {
+    const patched = await tenantApi(larkAppId, 'PATCH',
+      `/open-apis/im/v2/tags/${encodeURIComponent(cache.chatTagId)}`,
+      { patch_tag: { name } });
+    if (patched.ok || patched.data?.patch_tag_fail_reason?.duplicate_id) {
+      cache.chatTagId = patched.data?.patch_tag_fail_reason?.duplicate_id ?? cache.chatTagId;
+      cache.chatTagName = name;
+      saveCache(larkAppId, cache);
+      return cache.chatTagId!;
+    }
+    logger.warn(`[session-tag] tag rename failed (keeping old name): code=${patched.code} ${patched.msg}`);
+    return cache.chatTagId; // stale name still tags correctly
+  }
+
+  const created = await tenantApi(larkAppId, 'POST', '/open-apis/im/v2/tags', {
+    create_tag: { tag_type: 'tenant', name },
+  });
+  const id = created.data?.id ?? created.data?.create_tag_fail_reason?.duplicate_id;
+  if (id) {
+    cache.chatTagId = id;
+    cache.chatTagName = name;
+    saveCache(larkAppId, cache);
+    logger.info(`[session-tag] chat tag "${name}" → ${id}`);
+    return id;
+  }
+  logger.warn(`[session-tag] create tag "${name}" failed: code=${created.code} ${created.msg}`);
+  if (created.missingScope) void maybeNudgeScope(larkAppId, ownerOpenId, created.missingScope);
+  return null;
+}
+
+async function tagViaChatTag(larkAppId: string, chatId: string, ownerOpenId: string, name: string): Promise<void> {
+  const tagId = await ensureChatTag(larkAppId, name, ownerOpenId);
+  if (!tagId) return;
+  const bound = await tenantApi(larkAppId, 'POST', '/open-apis/im/v2/biz_entity_tag_relation', {
+    tag_biz_type: 'chat',
+    biz_entity_id: chatId,
+    tag_ids: [tagId],
+  });
+  if (!bound.ok) {
+    logger.warn(`[session-tag] bind ${chatId.substring(0, 12)} failed: code=${bound.code} ${bound.msg}`);
+    if (bound.missingScope) void maybeNudgeScope(larkAppId, ownerOpenId, bound.missingScope);
+    return;
+  }
+  logger.info(`[session-tag] tagged ${chatId.substring(0, 12)} with chat tag "${name}" (${tagId})`);
+}
+
+// ─── feed-group mode (owner user token) — opt-in ─────────────────────────────
 
 interface LarkApiResult {
   ok: boolean;
   code?: number;
   msg?: string;
   data?: any;
-  /** True when the failure is an authorization/scope problem — auth nudge material. */
   authProblem?: boolean;
 }
 
@@ -91,7 +215,6 @@ async function callFeedGroupApi(
     const json: any = await res.json().catch(() => ({}));
     const code = typeof json.code === 'number' ? json.code : (res.ok ? 0 : res.status);
     if (code === 0) return { ok: true, code, data: json.data };
-    // 99991672 / 99991679: scope not authorized; 20027: app scope not opened.
     const authProblem = [99991672, 99991679, 20027, 20005].includes(code) || res.status === 401 || res.status === 403;
     return { ok: false, code, msg: json.msg ?? res.statusText, authProblem };
   } catch (err: any) {
@@ -99,13 +222,8 @@ async function callFeedGroupApi(
   }
 }
 
-/** Throttled owner DM: "authorize feed-group tagging" with a click-through link. */
 async function maybeNudgeOwnerForAuth(larkAppId: string, ownerOpenId: string, reason: string): Promise<void> {
-  const cache = loadCache(larkAppId);
-  const now = Date.now();
-  if (cache.lastAuthNudgeAt && now - cache.lastAuthNudgeAt < AUTH_NUDGE_INTERVAL_MS) return;
-  cache.lastAuthNudgeAt = now;
-  saveCache(larkAppId, cache);
+  if (nudgeThrottled(larkAppId)) return;
   try {
     const cfg = getBot(larkAppId).config;
     const { authUrl } = generateAuthUrl(
@@ -121,84 +239,88 @@ async function maybeNudgeOwnerForAuth(larkAppId: string, ownerOpenId: string, re
       t('sg.tag_auth_nudge', { reason, url: authUrl }, loc),
       'text',
     );
-    logger.info(`[feed-group] sent auth nudge to owner ${ownerOpenId.substring(0, 12)} (${reason})`);
+    logger.info(`[session-tag] sent auth nudge to owner ${ownerOpenId.substring(0, 12)} (${reason})`);
   } catch (err) {
-    logger.warn(`[feed-group] auth nudge failed: ${err}`);
+    logger.warn(`[session-tag] auth nudge failed: ${err}`);
   }
 }
 
+async function tagViaFeedGroup(larkAppId: string, chatId: string, ownerOpenId: string, name: string): Promise<void> {
+  const cfg = getBot(larkAppId).config;
+  const brand = normalizeBrand(cfg.brand);
+  const host = larkHosts(brand).openApi;
+
+  const userToken = await resolveUserToken(cfg.larkAppId, cfg.larkAppSecret, brand);
+  if (!userToken) {
+    logger.info(`[session-tag] no user token for ${larkAppId}; skip feed-group tagging ${chatId.substring(0, 12)}`);
+    void maybeNudgeOwnerForAuth(larkAppId, ownerOpenId, 'no_token');
+    return;
+  }
+
+  const cache = loadCache(larkAppId);
+  if (!cache.groupId) {
+    const created = await callFeedGroupApi(host, userToken, 'POST', '/open-apis/im/v1/groups', {
+      feed_group_creator: { type: 'normal', name },
+    });
+    if (!created.ok) {
+      logger.warn(`[session-tag] feed group create "${name}" failed: code=${created.code} ${created.msg}`);
+      if (created.authProblem) void maybeNudgeOwnerForAuth(larkAppId, ownerOpenId, `code_${created.code}`);
+      return;
+    }
+    cache.groupId = created.data?.group_id;
+    cache.name = name;
+    saveCache(larkAppId, cache);
+    logger.info(`[session-tag] created feed group "${name}" → ${cache.groupId}`);
+  } else if (cache.name !== name) {
+    const renamed = await callFeedGroupApi(host, userToken, 'PUT',
+      `/open-apis/im/v1/groups/${encodeURIComponent(cache.groupId)}`, {
+        feed_group_updater: { name, update_fields: [1] },
+      });
+    if (renamed.ok) {
+      cache.name = name;
+      saveCache(larkAppId, cache);
+    } else {
+      logger.warn(`[session-tag] feed group rename failed (keeping old name): code=${renamed.code} ${renamed.msg}`);
+    }
+  }
+  if (!cache.groupId) return;
+
+  const added = await callFeedGroupApi(host, userToken, 'POST',
+    `/open-apis/im/v1/groups/${encodeURIComponent(cache.groupId)}/batch_add_item`, {
+      items: [{ feed_id: chatId, feed_type: 'chat' }],
+    });
+  if (!added.ok) {
+    logger.warn(`[session-tag] feed group add ${chatId.substring(0, 12)} failed: code=${added.code} ${added.msg}`);
+    if (added.authProblem) void maybeNudgeOwnerForAuth(larkAppId, ownerOpenId, `code_${added.code}`);
+    return;
+  }
+  const failed = added.data?.failed_items;
+  if (Array.isArray(failed) && failed.length > 0) {
+    logger.warn(`[session-tag] feed group add ${chatId.substring(0, 12)} partially failed: ${JSON.stringify(failed)}`);
+    return;
+  }
+  logger.info(`[session-tag] tagged ${chatId.substring(0, 12)} into feed group "${cache.name}" (${cache.groupId})`);
+}
+
+// ─── entry point ─────────────────────────────────────────────────────────────
+
 /**
- * Tag one freshly-born session group into the configured sidebar feed group.
+ * Tag one freshly-born session group per the bot's `sessionGroup.tag` config.
  * Fire-and-forget from the birth flow — never throws.
  */
 export async function tagSessionGroup(larkAppId: string, chatId: string, ownerOpenId: string): Promise<void> {
   try {
     const cfg = getBot(larkAppId).config;
-    const fg = cfg.sessionGroup?.feedGroup ?? {};
-    const mode = fg.mode ?? 'explicit';
+    const tag = cfg.sessionGroup?.tag ?? {};
+    const mode = tag.mode ?? 'chat-tag';
     if (mode === 'off') return;
-    if (mode === 'rule') {
-      // Rule-based groups auto-collect by name prefix — nothing to do per birth.
+    const name = tag.name?.trim() || DEFAULT_TAG_NAME;
+    if (mode === 'feed-group') {
+      await tagViaFeedGroup(larkAppId, chatId, ownerOpenId, name);
       return;
     }
-    const name = fg.name?.trim() || DEFAULT_FEED_GROUP_NAME;
-    const brand = normalizeBrand(cfg.brand);
-    const host = larkHosts(brand).openApi;
-
-    const userToken = await resolveUserToken(cfg.larkAppId, cfg.larkAppSecret, brand);
-    if (!userToken) {
-      logger.info(`[feed-group] no user token for ${larkAppId}; skip tagging ${chatId.substring(0, 12)}`);
-      void maybeNudgeOwnerForAuth(larkAppId, ownerOpenId, 'no_token');
-      return;
-    }
-
-    // 1. Ensure the feed group exists (create once; rename when config changed).
-    const cache = loadCache(larkAppId);
-    if (!cache.groupId) {
-      const created = await callFeedGroupApi(host, userToken, 'POST', '/open-apis/im/v1/groups', {
-        feed_group_creator: { type: 'normal', name },
-      });
-      if (!created.ok) {
-        logger.warn(`[feed-group] create "${name}" failed: code=${created.code} ${created.msg}`);
-        if (created.authProblem) void maybeNudgeOwnerForAuth(larkAppId, ownerOpenId, `code_${created.code}`);
-        return;
-      }
-      cache.groupId = created.data?.group_id;
-      cache.name = name;
-      saveCache(larkAppId, cache);
-      logger.info(`[feed-group] created "${name}" → ${cache.groupId}`);
-    } else if (cache.name !== name) {
-      const renamed = await callFeedGroupApi(host, userToken, 'PUT',
-        `/open-apis/im/v1/groups/${encodeURIComponent(cache.groupId)}`, {
-          feed_group_updater: { name, update_fields: [1] },
-        });
-      if (renamed.ok) {
-        cache.name = name;
-        saveCache(larkAppId, cache);
-        logger.info(`[feed-group] renamed ${cache.groupId} → "${name}"`);
-      } else {
-        logger.warn(`[feed-group] rename failed (keeping old name): code=${renamed.code} ${renamed.msg}`);
-      }
-    }
-    if (!cache.groupId) return;
-
-    // 2. Add the chat into the feed group.
-    const added = await callFeedGroupApi(host, userToken, 'POST',
-      `/open-apis/im/v1/groups/${encodeURIComponent(cache.groupId)}/batch_add_item`, {
-        items: [{ feed_id: chatId, feed_type: 'chat' }],
-      });
-    if (!added.ok) {
-      logger.warn(`[feed-group] add ${chatId.substring(0, 12)} failed: code=${added.code} ${added.msg}`);
-      if (added.authProblem) void maybeNudgeOwnerForAuth(larkAppId, ownerOpenId, `code_${added.code}`);
-      return;
-    }
-    const failed = added.data?.failed_items;
-    if (Array.isArray(failed) && failed.length > 0) {
-      logger.warn(`[feed-group] add ${chatId.substring(0, 12)} partially failed: ${JSON.stringify(failed)}`);
-      return;
-    }
-    logger.info(`[feed-group] tagged ${chatId.substring(0, 12)} into "${cache.name}" (${cache.groupId})`);
+    await tagViaChatTag(larkAppId, chatId, ownerOpenId, name);
   } catch (err) {
-    logger.warn(`[feed-group] tagging ${chatId.substring(0, 12)} threw: ${err}`);
+    logger.warn(`[session-tag] tagging ${chatId.substring(0, 12)} threw: ${err}`);
   }
 }
