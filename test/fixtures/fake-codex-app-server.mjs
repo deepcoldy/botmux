@@ -43,6 +43,10 @@ let goalTurn = null;
 let reconciledTurn = null;
 let activeTurn;
 let steerCount = 0;
+/** For steer-group-mismatch: the clientIds actually sent (root + steers), so the
+ *  fixture can emit a full-items terminal turn that OMITS one — exercising the
+ *  runner's B5 group-aware identity defense (must fail closed). */
+let groupClientIds = [];
 
 if (logPath) {
   appendFileSync(logPath, JSON.stringify({
@@ -175,8 +179,29 @@ function completeTurn(request) {
     if ((behavior === 'goal-continuation'
         || behavior === 'goal-continuation-2x'
         || behavior === 'goal-steer-race'
+        || behavior === 'goal-autocomplete'
         || behavior === 'start-response-last-goal') && turnAttempt === 1) {
       startGoalContinuation(threadId, 'turn-goal-auto');
+      // goal-autocomplete: the autonomous Goal finishes on its own (no steer),
+      // exercising the B3 gate — a non-steerable input parked behind it must
+      // start its OWN turn only after this completion, never merge into it.
+      if (behavior === 'goal-autocomplete') {
+        setTimeout(() => {
+          const finishedGoal = goalTurn;
+          if (!finishedGoal) return;
+          goalTurn = null;
+          notify('turn/completed', {
+            threadId: finishedGoal.threadId,
+            turn: {
+              id: finishedGoal.id,
+              status: 'completed',
+              itemsView: 'full',
+              error: null,
+              items: finishedGoal.items,
+            },
+          });
+        }, 200);
+      }
     }
     if (responseLast) respond(request.id, { turn: { id: turnId } });
   };
@@ -373,18 +398,50 @@ function handle(request) {
   }
   if (request.method === 'turn/steer') {
     // THEIRS: explicit steer scenario drives a pending turn/start (activeTurn)
-    // to completion after the 2nd steer.
-    if (behavior === 'steer') {
+    // to completion after the 2nd steer. steer-started-first completes after 1.
+    if (behavior === 'steer' || behavior === 'steer-started-first') {
       if (!activeTurn || request.params.expectedTurnId !== activeTurn.turnId) {
         reject(request.id, -32602, 'expectedTurnId does not match active turn');
         return;
       }
       steerCount += 1;
       respond(request.id, { turnId: activeTurn.turnId });
-      if (steerCount >= 2) {
+      const completeAfter = behavior === 'steer-started-first' ? 1 : 2;
+      if (steerCount >= completeAfter) {
         emitTurnCompletion(activeTurn.threadId, activeTurn.turnId, activeTurn.outputSchema);
         activeTurn = undefined;
       }
+      return;
+    }
+    if (behavior === 'steer-group-mismatch') {
+      if (!activeTurn || request.params.expectedTurnId !== activeTurn.turnId) {
+        reject(request.id, -32602, 'expectedTurnId does not match active turn');
+        return;
+      }
+      steerCount += 1;
+      groupClientIds.push(request.params.clientUserMessageId ?? null);
+      respond(request.id, { turnId: activeTurn.turnId });
+      // Complete after the 1st steer with a full-items terminal turn that
+      // deliberately OMITS the follow-up member's user item (only the root's is
+      // present). The runner's B5 defense must detect the missing member and
+      // fail closed rather than mis-attribute the answer to a partial group.
+      const { threadId, turnId } = activeTurn;
+      notify('turn/completed', {
+        threadId,
+        turn: {
+          id: turnId,
+          status: 'completed',
+          itemsView: 'full',
+          error: null,
+          items: [
+            { id: 'user-root', type: 'userMessage', clientId: groupClientIds[0], content: [] },
+            { id: 'message-final', type: 'agentMessage', phase: 'final_answer', text: 'group answer' },
+            // NOTE: the follow-up member's user item (groupClientIds[1]) is
+            // intentionally absent → B5 "member missing from terminal turn".
+          ],
+        },
+      });
+      activeTurn = undefined;
       return;
     }
     // OURS: goal-mode steer targets an autonomous goal turn (goalTurn).
@@ -460,12 +517,43 @@ function handle(request) {
     reject(request.id, -32000, 'model overloaded');
     return;
   }
-  if (behavior === 'steer') {
+  if (behavior === 'steer' || behavior === 'steer-group-mismatch') {
     const threadId = request.params.threadId;
     const turnId = `turn-fake-${turnAttempt}`;
     activeTurn = { threadId, turnId, outputSchema: request.params.outputSchema };
+    if (behavior === 'steer-group-mismatch') {
+      groupClientIds = [request.params.clientUserMessageId ?? null];
+    }
     respond(request.id, { turn: { id: turnId } });
     notify('turn/started', { threadId, turn: { id: turnId } });
+    return;
+  }
+  if (behavior === 'steer-started-first') {
+    // B1 (exact-started-before-response): emit turn/started carrying the exact
+    // root clientId in full items BEFORE responding to turn/start. This proves
+    // the canonical native id via exact match while the start response is still
+    // pending, so a follow-up may steer during that window. The turn stays open
+    // and completes after the 1st steer (like 'steer').
+    const threadId = request.params.threadId;
+    const turnId = `turn-fake-${turnAttempt}`;
+    activeTurn = { threadId, turnId, outputSchema: request.params.outputSchema };
+    notify('turn/started', {
+      threadId,
+      turn: {
+        id: turnId,
+        status: 'inProgress',
+        itemsView: 'full',
+        items: [{
+          id: `user-${turnAttempt}`,
+          type: 'userMessage',
+          clientId: request.params.clientUserMessageId ?? null,
+          content: request.params.input,
+        }],
+      },
+    });
+    // Small delay before the response so the runner observes turn/started (and
+    // can steer) strictly before the start response returns.
+    setTimeout(() => respond(request.id, { turn: { id: turnId } }), 120);
     return;
   }
   completeTurn(request);

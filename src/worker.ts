@@ -6500,6 +6500,19 @@ async function handleTrustedCodexAppMarker(
       + ` replyTurn=${shortCorrelationId(event.replyTurnId)}`
       + `${event.queueLength !== undefined ? ` queue=${event.queueLength}` : ''}`,
     );
+    // An authenticated `fatal` lifecycle is a control-plane kill, NOT an
+    // informational steer-correlation event (B2): the runner fenced its
+    // generation on an unknown turn/start|turn/steer outcome and will emit no
+    // final for the in-doubt turn. Tear the generation down so no recovered
+    // prepared frame is replayed and no ready is published. This MUST run before
+    // the replyTurnId gate below — a fatal carries no replyTurnId, so gating on
+    // it would (wrongly) swallow the kill as informational.
+    if (event.kind === 'fatal') {
+      failCodexAppControlGeneration(
+        `Codex App runner fenced its generation (${event.operation}/${event.category})`,
+      );
+      return false;
+    }
     if (!event.replyTurnId || !submittedCodexAppReplyTurnIds.has(event.replyTurnId)) return true;
     if (event.kind === 'steer_attempt') {
       rememberBoundedMap(pendingCodexAppSteerAckIds, event.replyTurnId, event.appTurnId);

@@ -970,7 +970,7 @@ describe('codex-app-runner app-server protocol integration', () => {
 
       harness.child.stdin.write(`${CONTROL_PREFIX}${encodeRunnerInput('confirm legacy', {
         text: 'confirm exact', clientUserMessageId: 'om_response_last_confirm',
-      })}\r`);
+      }, 'om_response_last_confirm', true)}\r`);
       await waitFor(harness, () => control.finals.length === 2
         && control.states.filter(state => state.busy === false).length >= 2);
 
@@ -1023,7 +1023,9 @@ describe('codex-app-runner app-server protocol integration', () => {
         control.finals.length === 1
         && control.states.some(state => state.busy === true && state.tracksTurn === false)
       ));
-      harness.child.stdin.write(`${CONTROL_PREFIX}${encodeRunnerInput('confirm legacy', sidecar('confirm', 'om_goal_confirm'))}\r`);
+      // The follow-up steers into the autonomous Goal turn — under the B3 gate
+      // that requires an explicit daemon steer authorization (codexAppSteerable).
+      harness.child.stdin.write(`${CONTROL_PREFIX}${encodeRunnerInput('confirm legacy', sidecar('confirm', 'om_goal_confirm'), 'om_goal_confirm', true)}\r`);
       await waitFor(harness, () => control.finals.length === 2
         && control.states.filter(state => state.busy === false).length >= 2);
 
@@ -1063,6 +1065,181 @@ describe('codex-app-runner app-server protocol integration', () => {
     }
   });
 
+  it('does NOT steer a non-steerable input into an autonomous Goal; it waits and starts its own turn after the Goal completes (B3 gate)', async () => {
+    // B3: only a daemon-authorized (codexAppSteerable) input may steer into an
+    // active autonomous Goal continuation. A missing/false-flag input (a special
+    // sink — HTTP wait / doc-comment / receiver — or any non-plain-interactive
+    // turn) must NOT be merged into the Goal (which would mis-deliver its output
+    // to the Goal's completion). It stays serial: parked while the Goal is
+    // native-busy, then started as its OWN turn/start once the Goal completes.
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-codex-b3-serial-'));
+    const fakeCodex = join(dir, 'fake-codex');
+    const logPath = join(dir, 'requests.jsonl');
+    copyFileSync(FAKE_SERVER_FIXTURE, fakeCodex);
+    chmodSync(fakeCodex, 0o755);
+    const control = new ControlCollector(dir);
+    await control.listen();
+    const harness = startRunner(fakeCodex, dir, logPath, '0.144.1', 'goal-autocomplete', control.bootstrap.path);
+    try {
+      await waitFor(harness, () => control.states.some(state => state.busy === false));
+      // Turn 1 completes and auto-starts Goal turn A (native-busy). The Goal
+      // self-completes ~200ms later (goal-autocomplete fixture).
+      harness.child.stdin.write(`${CONTROL_PREFIX}${encodeRunnerInput('first legacy', {
+        text: 'first', clientUserMessageId: 'om_b3_a',
+      })}\r`);
+      await waitFor(harness, () => control.finals.length === 1
+        && control.states.some(state => state.busy === true && state.tracksTurn === false));
+
+      // A NON-steerable follow-up arrives while the Goal is native-busy (no flag).
+      harness.child.stdin.write(`${CONTROL_PREFIX}${encodeRunnerInput('serial follow', {
+        text: 'serial follow', clientUserMessageId: 'om_b3_serial',
+      })}\r`);
+
+      // It must produce its own final via a second turn/start — never a steer.
+      await waitFor(harness, () => control.finals.length === 2
+        && control.states.filter(state => state.busy === false).length >= 2);
+
+      const requests = readRequests(logPath);
+      // Zero turn/steer: the non-flag input was NOT merged into the Goal.
+      expect(requests.filter(r => r.method === 'turn/steer')).toHaveLength(0);
+      // Two turn/start: the root, then the parked input as its own turn.
+      const starts = requests.filter(r => r.method === 'turn/start');
+      expect(starts).toHaveLength(2);
+      expect(starts[1].params).toMatchObject({
+        clientUserMessageId: 'om_b3_serial',
+        input: [{ type: 'text', text: 'serial follow', text_elements: [] }],
+      });
+      // The follow-up's final is its own answer, not the Goal's autonomous text.
+      expect(control.finals[1]).toMatchObject({ turnId: 'om_b3_serial' });
+      expect(control.finals[1].content).not.toContain('autonomous goal text before Lark input');
+    } finally {
+      await stopChild(harness.child);
+      await control.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('steers a follow-up into a start turn proven by an exact turn/started BEFORE the start response returns (B1 start-response-last)', async () => {
+    // B1: the app-server may publish an exact-client `turn/started` before it
+    // replies to `turn/start`. That exact match proves the canonical native id,
+    // so a follow-up must be able to steer into the SAME turn during the pending
+    // start response — startResponsePending and steerInFlight are separate. The
+    // steer-started-first fixture emits turn/started (full items with the root
+    // clientId) then delays the start response 120ms and holds the turn open,
+    // completing after one steer. If the driver waited for the start response
+    // before proving canonical, no turn/steer would be emitted (the follow-up
+    // would serialize) — so a single turn/steer here IS the checkpoint.
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-codex-started-first-'));
+    const fakeCodex = join(dir, 'fake-codex');
+    const logPath = join(dir, 'requests.jsonl');
+    copyFileSync(FAKE_SERVER_FIXTURE, fakeCodex);
+    chmodSync(fakeCodex, 0o755);
+    const control = new ControlCollector(dir);
+    await control.listen();
+    const harness = startRunner(fakeCodex, dir, logPath, '0.144.6', 'steer-started-first', control.bootstrap.path);
+
+    const send = (text: string, replyTurnId: string) => {
+      const encoded = encodeRunnerInput(
+        `legacy:${text}`,
+        { text, clientUserMessageId: replyTurnId },
+        replyTurnId,
+        true,
+      );
+      harness.child.stdin.write(`${CONTROL_PREFIX}${encoded}\r`);
+    };
+
+    try {
+      await waitFor(harness, () => control.states.some(state => state.busy === false));
+      // Root: turn/started (exact clientId) arrives ~immediately; the start
+      // response is delayed 120ms. Wait until the runner logged the turn/start
+      // request so the follow-up races the pending response.
+      send('root', 'om_sr_root');
+      await waitFor(harness, () => readRequests(logPath).some(r => r.method === 'turn/start'));
+      // Follow-up arrives while the root start response is STILL pending.
+      send('follow', 'om_sr_follow');
+
+      // One native completion → two finals (root superseded + follow-up real).
+      await waitFor(harness, () => control.finals.length === 2
+        && control.states.filter(state => state.busy === false).length >= 2);
+
+      const requests = readRequests(logPath);
+      // The follow-up steered into the pending-response turn: 1 start + 1 steer.
+      expect(requests.filter(r => r.method === 'turn/start')).toHaveLength(1);
+      const steers = requests.filter(r => r.method === 'turn/steer');
+      expect(steers).toHaveLength(1);
+      expect(steers[0].params).toMatchObject({
+        expectedTurnId: 'turn-fake-1',
+        clientUserMessageId: 'om_sr_follow',
+      });
+      expect(control.finals).toEqual([
+        expect.objectContaining({ turnId: 'om_sr_root', content: '', disposition: 'steer_superseded' }),
+        expect.objectContaining({ turnId: 'om_sr_follow', content: 'fake answer 1' }),
+      ]);
+      // steer lifecycle emitted for the follow-up.
+      const accepted = control.markers
+        .filter(m => m.kind === 'lifecycle' && m.payload.kind === 'steer_accepted')
+        .map(m => m.payload.replyTurnId);
+      expect(accepted).toEqual(['om_sr_follow']);
+    } finally {
+      await stopChild(harness.child);
+      await control.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('fails closed when a steered group terminal turn omits a member (B5 group-aware identity defense)', async () => {
+    // B5: when the canonical completion carries itemsView:'full', EVERY steered
+    // member that sent a clientId must appear exactly once in strictly-increasing
+    // order. The steer-group-mismatch fixture completes with full items that omit
+    // the follow-up member's user item — the runner must fail closed (identity
+    // conflict diagnostic + error final) rather than mis-attribute a partial
+    // group's answer. Never silently fall back to streamed text for a mismatch.
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-codex-b5-mismatch-'));
+    const fakeCodex = join(dir, 'fake-codex');
+    const logPath = join(dir, 'requests.jsonl');
+    copyFileSync(FAKE_SERVER_FIXTURE, fakeCodex);
+    chmodSync(fakeCodex, 0o755);
+    const control = new ControlCollector(dir);
+    await control.listen();
+    const harness = startRunner(fakeCodex, dir, logPath, '0.144.6', 'steer-group-mismatch', control.bootstrap.path);
+
+    const send = (text: string, replyTurnId: string) => {
+      const encoded = encodeRunnerInput(
+        `legacy:${text}`,
+        { text, clientUserMessageId: replyTurnId },
+        replyTurnId,
+        true,
+      );
+      harness.child.stdin.write(`${CONTROL_PREFIX}${encoded}\r`);
+    };
+
+    try {
+      await waitFor(harness, () => control.states.some(state => state.busy === false));
+      send('root', 'om_b5_root');
+      await waitFor(harness, () => readRequests(logPath).some(r => r.method === 'turn/start'));
+      send('follow', 'om_b5_follow');
+
+      // Two finals still expand (group settled fail-closed), and the settlement
+      // is a diagnostic conflict — the answer is the error, NOT 'group answer'.
+      await waitFor(harness, () => control.finals.length === 2
+        && control.states.filter(state => state.busy === false).length >= 2);
+
+      // A fail-closed diagnostic was emitted (native_turn_identity_conflict).
+      const diagnostics = control.markers.filter(m => m.kind === 'diagnostic');
+      expect(diagnostics.length).toBeGreaterThanOrEqual(1);
+      expect(diagnostics[0].payload.code).toBe('native_turn_identity_conflict');
+      // The real (last) final carries the fail-closed error, never the model text
+      // of a group we could not verify.
+      const realFinal = control.finals[control.finals.length - 1];
+      expect(realFinal.content).toContain('Codex App turn failed');
+      expect(realFinal.content).not.toContain('group answer');
+    } finally {
+      await stopChild(harness.child);
+      await control.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('falls back to turn/start only after an explicit stale expected-turn rejection', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'botmux-codex-runner-steer-race-'));
     const fakeCodex = join(dir, 'fake-codex');
@@ -1081,7 +1258,7 @@ describe('codex-app-runner app-server protocol integration', () => {
         && control.states.some(state => state.busy === true && state.tracksTurn === false));
       harness.child.stdin.write(`${CONTROL_PREFIX}${encodeRunnerInput('confirm legacy', {
         text: 'confirm exact', clientUserMessageId: 'om_race_confirm',
-      })}\r`);
+      }, 'om_race_confirm', true)}\r`);
       await waitFor(harness, () => control.finals.length === 2
         && control.states.filter(state => state.busy === false).length >= 2);
 
@@ -1440,6 +1617,9 @@ describe('codex-app-runner app-server protocol integration', () => {
           },
         },
         replyTurnId,
+        // Plain interactive Lark inputs are daemon-authorized to steer; under the
+        // B3 gate a Goal-continuation steer requires this explicit positive.
+        true,
       );
       harness.child.stdin.write(`${CONTROL_PREFIX}${encoded}\r`);
     };
