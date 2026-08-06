@@ -58,13 +58,13 @@ export function appendDispatchReportProtocol(brief: string, dispatchRootId: stri
     + '把结果回报给原始主编排会话；不要在本话题 @ 主bot（那会另起一个没有上下文的新会话）。';
 }
 
-/** Ask the assignee to publish completion in the topic where it received the task. */
+/** Additionally ask the assignee to leave a human-visible copy in the task topic. */
 export function appendDispatchCompletionProtocol(brief: string): string {
   return brief.trimEnd()
-    + '\n\n— 完成回报 —\n'
-    + '完成后直接在收到任务的原话题运行 '
+    + '\n\n— 原话题留档 —\n'
+    + '除上述 botmux report 回注外，完成后还需在收到任务的原话题运行 '
     + '`botmux send --no-mention "子项目完成 + 产出位置/摘要"` '
-    + '回复最终交付；不要 @ 主 bot，不要新开话题。';
+    + '额外留一份人可见的最终交付；不要 @ 主 bot，不要新开话题。';
 }
 
 /**

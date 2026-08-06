@@ -19,7 +19,7 @@ Give each bot an independent persona per group, and form a "team roster" during 
 - Role content is Markdown, injected into the CLI's system prompt, with a maximum of about 4096 bytes.
 - Role resolution stays exactly: **this-group role > default role > none**.
 
-Role Management also exposes a per-group, per-bot **topic task reporting mode** switch. It is off by default and keeps the existing completion report. When enabled, tasks dispatched by the current bot in that group instead ask the assignee to run `botmux send --no-mention "subtask complete + output location/summary"` in the topic where the task was received, without mentioning the dispatching bot or opening another topic. `--standby` sends no task, so it receives no task instruction.
+Role Management also exposes a per-group, per-bot **topic task reporting** switch. It is off by default. When enabled, tasks dispatched by the current bot in that group still ask the assignee to run `botmux report` so completion is injected into the orchestrator's existing session, and additionally ask it to run `botmux send --no-mention "subtask complete + output location/summary"` in the topic where the task was received to leave a human-visible final-delivery copy, without mentioning the dispatching bot or opening another topic. `--standby` sends no task, so it receives no task instruction.
 
 > 💡 The most intuitive way to set the **default role** is on the **Bot Config** page of `botmux dashboard` — every bot card has a "**Default Role**" editor (it writes to the same config as `/role team set`; it's a bot-level global default persona, so it fits better under Bot Config). The **Team** panel only provides a **read-only view** entry; do all editing on the Bot Config page.
 

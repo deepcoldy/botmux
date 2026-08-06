@@ -8392,10 +8392,12 @@ async function cmdDispatch(rest: string[]): Promise<void> {
   const sameTopicSendEnabled = readRoleDispatchCompletionEnabled(appId, targetChatId);
   const exactReportRootEnabled = parsedBotApps.length > 0 && legacyBots.length === 0;
   const briefWithCompletionProtocol = (dispatchRootId: string): string => {
-    if (sameTopicSendEnabled) return appendDispatchCompletionProtocol(brief);
-    return exactReportRootEnabled
+    const withReport = exactReportRootEnabled
       ? appendDispatchReportProtocol(brief, dispatchRootId)
       : appendLegacyDispatchReportProtocol(brief);
+    return sameTopicSendEnabled
+      ? appendDispatchCompletionProtocol(withReport)
+      : withReport;
   };
   let built;
   try {
@@ -8717,7 +8719,7 @@ async function cmdReport(rest: string[]): Promise<void> {
     }
     let response: Response;
     try {
-      response = await fetch(`http://127.0.0.1:${daemon.ipcPort}/api/trigger`, {
+      response = await fetchDaemonIpc(daemon.ipcPort, '/api/trigger', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({

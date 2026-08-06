@@ -113,7 +113,7 @@ describe('dispatch completion switch wiring', () => {
       .toThrow('valid om_ root id');
   });
 
-  it('adds only a same-topic botmux send completion command', () => {
+  it('adds a same-topic botmux send copy after the report protocol', () => {
     const plain = buildDispatchMessages({
       title: '任务',
       brief: '完成实现并自测',
@@ -122,35 +122,46 @@ describe('dispatch completion switch wiring', () => {
     expect(plain.threadContent.flat().map(node => node.tag === 'text' ? node.text : '').join('\n'))
       .not.toContain('botmux send');
 
-    const completion = appendDispatchCompletionProtocol('完成实现并自测');
+    const completion = appendDispatchCompletionProtocol(
+      appendDispatchReportProtocol('完成实现并自测', 'om_seed_exact'),
+    );
+    expect(completion).toContain('botmux report --dispatch-root om_seed_exact');
     expect(completion).toContain('botmux send --no-mention');
+    expect(completion).toContain('除上述 botmux report 回注外');
     expect(completion).toContain('不要 @ 主 bot，不要新开话题');
   });
 
-  it('preserves the default report path and switches to same-topic send only when enabled', () => {
+  it('always preserves report and adds same-topic send only when enabled', () => {
     const source = readFileSync(new URL('../src/cli.ts', import.meta.url), 'utf8');
     const start = source.indexOf('async function cmdDispatch');
     const end = source.indexOf('async function cmdReport', start);
     const dispatch = source.slice(start, end);
 
     const configRead = dispatch.indexOf('readRoleDispatchCompletionEnabled(appId, targetChatId)');
-    const sendBranch = dispatch.indexOf(
-      'if (sameTopicSendEnabled) return appendDispatchCompletionProtocol(brief);',
-      configRead,
-    );
-    const exactDefault = dispatch.indexOf('appendDispatchReportProtocol(brief, dispatchRootId)', sendBranch);
+    const exactDefault = dispatch.indexOf('appendDispatchReportProtocol(brief, dispatchRootId)', configRead);
     const legacyDefault = dispatch.indexOf('appendLegacyDispatchReportProtocol(brief)', exactDefault);
-    const intoBrief = dispatch.indexOf('brief: intoRoot ? briefWithCompletionProtocol(intoRoot) : brief', legacyDefault);
+    const sendBranch = dispatch.indexOf('appendDispatchCompletionProtocol(withReport)', legacyDefault);
+    const intoBrief = dispatch.indexOf('brief: intoRoot ? briefWithCompletionProtocol(intoRoot) : brief', sendBranch);
     const standbyGuard = dispatch.indexOf('if (!standby) {', intoBrief);
     const seededKickoff = dispatch.indexOf('brief: briefWithCompletionProtocol(seedId)', standbyGuard);
 
     expect(configRead).toBeGreaterThanOrEqual(0);
-    expect(sendBranch).toBeGreaterThan(configRead);
-    expect(exactDefault).toBeGreaterThan(sendBranch);
+    expect(exactDefault).toBeGreaterThan(configRead);
     expect(legacyDefault).toBeGreaterThan(exactDefault);
-    expect(intoBrief).toBeGreaterThan(legacyDefault);
+    expect(sendBranch).toBeGreaterThan(legacyDefault);
+    expect(intoBrief).toBeGreaterThan(sendBranch);
     expect(standbyGuard).toBeGreaterThan(intoBrief);
     expect(seededKickoff).toBeGreaterThan(standbyGuard);
+  });
+
+  it('authenticates the exact report callback through daemon IPC', () => {
+    const source = readFileSync(new URL('../src/cli.ts', import.meta.url), 'utf8');
+    const start = source.indexOf('async function cmdReport');
+    const end = source.indexOf('\nasync function ', start + 1);
+    const report = source.slice(start, end);
+
+    expect(report).toContain("fetchDaemonIpc(daemon.ipcPort, '/api/trigger'");
+    expect(report).not.toContain('fetch(`http://127.0.0.1:${daemon.ipcPort}/api/trigger`');
   });
 
   it('renders dispatch save feedback inside its own dashboard setting row', () => {
