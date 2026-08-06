@@ -300,6 +300,11 @@ export interface CliAdapter {
    *  the worker may safely let quiescence mark the session idle. */
   readonly busyPattern?: RegExp;
 
+  /** Opt-in positive marker for an idle→working edge observed in PTY output.
+   *  Kept separate from busyPattern because transcript/full-screen redraws may
+   *  contain old busy text; existing adapters remain opt-out by default. */
+  readonly idleToBusyPattern?: RegExp;
+
   /** Ready marker regex — matches when the CLI's input prompt is rendered and
    *  functional.  When set, the idle detector suppresses quiescence-based idle
    *  until this pattern appears in the PTY output.  Checked every cycle (reset

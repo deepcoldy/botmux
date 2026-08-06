@@ -74,6 +74,13 @@ export interface MessageListenerConfig {
     mode?: 'all_except_excluded' | 'include_only';
     includeSenderOpenIds?: string[];
     excludeSenderOpenIds?: string[];
+    /**
+     * Persisted sender KIND for each exclude id (open_id → 'user' | 'bot'), so
+     * the runtime fail-close decision (all_except_excluded + unverified bot
+     * sender) can tell a muted human from a muted bot WITHOUT guessing by id
+     * prefix. Absent entries fall back to a conservative "maybe a bot".
+     */
+    excludeSenderKinds?: Record<string, 'user' | 'bot'>;
     includeSenderTypes?: MessageListenerSenderType[];
     excludeSenderTypes?: MessageListenerSenderType[];
     /** Default true. */
@@ -818,6 +825,20 @@ function normalizeMessageListenerStringList(raw: unknown): string[] | undefined 
   return values.length > 0 ? [...new Set(values)] : undefined;
 }
 
+function normalizeMessageListenerSenderKinds(
+  raw: unknown,
+  excludeSenderOpenIds: string[] | undefined,
+): Record<string, 'user' | 'bot'> | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const allowed = excludeSenderOpenIds ? new Set(excludeSenderOpenIds) : undefined;
+  const out: Record<string, 'user' | 'bot'> = {};
+  for (const [key, value] of Object.entries(raw as Record<string, unknown>)) {
+    if (!key || (allowed && !allowed.has(key))) continue;
+    if (value === 'user' || value === 'bot') out[key] = value;
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
 function normalizeMessageListenerSenderTypes(raw: unknown): MessageListenerSenderType[] | undefined {
   if (!Array.isArray(raw)) return undefined;
   const values = raw
@@ -843,11 +864,13 @@ function normalizeMessageListenerConfig(raw: unknown, botIndex: number, chatId: 
   const mode = senderRaw.mode === 'include_only' ? 'include_only' : 'all_except_excluded';
   const includeSenderOpenIds = normalizeMessageListenerStringList(senderRaw.includeSenderOpenIds);
   const excludeSenderOpenIds = normalizeMessageListenerStringList(senderRaw.excludeSenderOpenIds);
+  const excludeSenderKinds = normalizeMessageListenerSenderKinds(senderRaw.excludeSenderKinds, excludeSenderOpenIds);
   const includeSenderTypes = normalizeMessageListenerSenderTypes(senderRaw.includeSenderTypes);
   const excludeSenderTypes = normalizeMessageListenerSenderTypes(senderRaw.excludeSenderTypes);
   if (mode !== 'all_except_excluded') senderPolicy.mode = mode;
   if (includeSenderOpenIds) senderPolicy.includeSenderOpenIds = includeSenderOpenIds;
   if (excludeSenderOpenIds) senderPolicy.excludeSenderOpenIds = excludeSenderOpenIds;
+  if (excludeSenderKinds) senderPolicy.excludeSenderKinds = excludeSenderKinds;
   if (includeSenderTypes) senderPolicy.includeSenderTypes = includeSenderTypes;
   if (excludeSenderTypes) senderPolicy.excludeSenderTypes = excludeSenderTypes;
   if (senderRaw.excludeSelf === false) senderPolicy.excludeSelf = false;
@@ -1520,6 +1543,10 @@ export interface BotConfig {
   docRepoMap?: Record<string, string>;
   /** Per-bot range for explicit `@bot /summary`; defaults to 50 messages / 24h. */
   summaryRange?: SummaryRangeConfig;
+  /** When true, explicit `@bot /summary` records a conservative project-local summary.md. */
+  summaryMemory?: boolean;
+  /** Optional target path for summary memory. Relative paths are resolved by the agent against the current project root; absolute paths are used as configured. */
+  summaryMemoryPath?: string;
   /**
    * Legacy content/keyword trigger config. Kept parseable for config
    * compatibility, but message routing no longer fires non-@ content triggers.
@@ -2473,6 +2500,8 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       ? normalizePluginIdList(entry.plugins) ?? []
       : undefined;
     const summaryRange = normalizeSummaryRange(entry.summaryRange ?? entry.summary);
+    const summaryMemory = entry.summaryMemory === true ? true : undefined;
+    const summaryMemoryPath = normalizeNonEmptyString(entry.summaryMemoryPath);
     const contentTriggers = normalizeContentTriggers(entry.contentTriggers, i);
     const messageListeners = normalizeMessageListeners(entry.messageListeners, i);
     const vcMeetingAgent = normalizeVcMeetingAgentConfig(entry.vcMeetingAgent);
@@ -2657,6 +2686,8 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
           )
         : undefined,
       summaryRange,
+      summaryMemory,
+      summaryMemoryPath,
       contentTriggers,
       voice,
     });

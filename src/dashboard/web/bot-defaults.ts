@@ -79,6 +79,8 @@ export type BotDefaultsRow = {
   overloadAlert?: boolean;
   botToBotSameDir?: boolean;
   summaryRange?: { limit?: number; sinceHours?: number };
+  summaryMemory?: boolean;
+  summaryMemoryPath?: string;
   p2pMode?: string;
   regularGroupReplyMode?: string;
   regularGroupMentionMode?: string;

@@ -2493,11 +2493,16 @@ ipcRoute('PUT', '/api/message-listeners/:chatId', async (req, res, p) => {
 
 function dashboardHistoryMessageSender(message: any): { senderOpenId?: string; senderName?: string; senderTypeRaw?: string; senderIdType?: string } {
   const sender = message?.sender ?? {};
-  const senderId = sender.id ?? sender.open_id ?? sender.user_id ?? sender.app_id
+  // Prefer `open_bot_id` (present on bot senders when with_sender_name=true): it
+  // is the bot's per-app open_id, matching /members/bots and the stored sender
+  // filters. Mirrors historyMessageSender in event-dispatcher so preview and the
+  // 30s poll resolve a third-party bot identically. See that fn for detail.
+  const senderId = sender.open_bot_id ?? sender.id ?? sender.open_id ?? sender.user_id ?? sender.app_id
     ?? message?.sender_id?.open_id ?? message?.sender_id?.user_id ?? message?.sender_id?.app_id;
   const senderName = sender.sender_name ?? sender.name ?? sender.user_name ?? message?.sender_name;
-  const senderIdType = sender.id_type ?? sender.sender_id_type;
-  const senderTypeRaw = sender.sender_type ?? message?.sender_type ?? (senderIdType === 'app_id' ? 'app' : undefined);
+  const rawIdType = sender.id_type ?? sender.sender_id_type;
+  const senderIdType = sender.open_bot_id ? 'open_id' : rawIdType;
+  const senderTypeRaw = sender.sender_type ?? message?.sender_type ?? (rawIdType === 'app_id' ? 'app' : undefined);
   return {
     senderOpenId: typeof senderId === 'string' ? senderId : undefined,
     senderName: typeof senderName === 'string' && senderName.trim() ? senderName.trim() : undefined,
@@ -2566,7 +2571,7 @@ async function collectMessageListenerPreviewMatches(
   });
   const candidateBotAppIds = collectListenerBotAppIds(messages, dashboardHistoryMessageSender);
   const appIdToOpenId = await buildListenerBotAppIdToOpenId(larkAppId, chatId, candidateBotAppIds);
-  return previewMessageListenerMatches({
+  const matches = previewMessageListenerMatches({
     bot: previewBot,
     chatId,
     messages,
@@ -2579,6 +2584,20 @@ async function collectMessageListenerPreviewMatches(
     // spawn a session for a message live routing never sends to the listener).
     explicitlyMentionedThisBot: (message) => messageMentionsBot(message, larkAppId, bot.botOpenId),
   });
+  // The listener matcher extracts card text from the SIMPLIFIED history view,
+  // which drops button jump URLs. The live delivery path (handleNewTopic) fixes
+  // this by re-extracting after resolveNonsupportMessage merges the card's two
+  // representations. Preview/run-preview do NOT go through handleNewTopic, so
+  // apply the equivalent merge here: run-preview spawns REAL turns off
+  // match.messageText, and preview display should show the same links the live
+  // listener will. Only interactive cards need it; a resolver miss keeps the
+  // match-time text. Resolve concurrently — each match is an independent fetch.
+  await Promise.all(matches.map(async (match) => {
+    if (match.msgType !== 'interactive') return;
+    const merged = await resolveMergedCardContent(larkAppId, match.messageId).catch(() => null);
+    if (merged?.text?.trim()) match.messageText = merged.text;
+  }));
+  return matches;
 }
 
 function publicMessageListenerMatch(match: MessageListenerPreviewMatch): Record<string, unknown> {
@@ -3016,7 +3035,7 @@ ipcRoute('PUT', '/api/bot-card-prefs', async (req, res) => {
     botToBotSameDir?: unknown;
     autoStartOnGroupJoin?: unknown; autoStartOnGroupJoinPrompt?: unknown; autoStartOnNewTopic?: unknown;
     regularGroupReplyMode?: unknown; regularGroupMentionMode?: unknown; docSubscribeDefaultMode?: unknown;
-    overloadAlert?: unknown;
+    overloadAlert?: unknown; summaryMemory?: unknown; summaryMemoryPath?: unknown;
   };
   try { body = await readJsonBody(req); }
   catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
@@ -3028,7 +3047,7 @@ ipcRoute('PUT', '/api/bot-card-prefs', async (req, res) => {
     autoStartOnGroupJoin?: boolean; autoStartOnGroupJoinPrompt?: string; autoStartOnNewTopic?: boolean;
     regularGroupReplyMode?: ChatReplyMode; regularGroupMentionMode?: 'always' | 'topic' | 'never' | 'ambient';
     docSubscribeDefaultMode?: 'mention-only' | 'all';
-    overloadAlert?: boolean;
+    overloadAlert?: boolean; summaryMemory?: boolean; summaryMemoryPath?: string;
   } = {};
   if (body.usageDisplay === 'streaming' || body.usageDisplay === 'footer' || body.usageDisplay === 'off') patch.usageDisplay = body.usageDisplay;
   if (typeof body.disableStreamingCard === 'boolean') patch.disableStreamingCard = body.disableStreamingCard;
@@ -3038,6 +3057,8 @@ ipcRoute('PUT', '/api/bot-card-prefs', async (req, res) => {
   if (typeof body.writableTerminalLinkInCard === 'boolean') patch.writableTerminalLinkInCard = body.writableTerminalLinkInCard;
   if (typeof body.privateCard === 'boolean') patch.privateCard = body.privateCard;
   if (typeof body.overloadAlert === 'boolean') patch.overloadAlert = body.overloadAlert;
+  if (typeof body.summaryMemory === 'boolean') patch.summaryMemory = body.summaryMemory;
+  if (typeof body.summaryMemoryPath === 'string') patch.summaryMemoryPath = body.summaryMemoryPath;
   if (typeof body.autoStartOnGroupJoin === 'boolean') patch.autoStartOnGroupJoin = body.autoStartOnGroupJoin;
   if (typeof body.autoStartOnGroupJoinPrompt === 'string') patch.autoStartOnGroupJoinPrompt = body.autoStartOnGroupJoinPrompt;
   if (typeof body.autoStartOnNewTopic === 'boolean') patch.autoStartOnNewTopic = body.autoStartOnNewTopic;

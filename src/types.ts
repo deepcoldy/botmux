@@ -3,6 +3,7 @@ import type { BotSkillPolicy } from './core/skills/types.js';
 import type { RiffBackendConfig } from './adapters/backend/riff-backend.js';
 import type { CliUsageLimitState } from './utils/cli-usage-limit.js';
 import type { VcMeetingActivityType } from './vc-agent/types.js';
+import type { CodexServiceTierSnapshot } from './services/codex-service-tier.js';
 
 /** Managed meeting sinks supported by the first multi-consumer slice. */
 export type VcMeetingConsumerManagedSink = 'meeting_text' | 'meeting_voice';
@@ -735,6 +736,14 @@ export type WorkerToDaemon =
    * CLI input queue. The daemon persists a root-bound receipt only after this
    * acknowledgement; IPC arrival alone is not acceptance. */
   | { type: 'turn_input_committed'; turnId: string }
+  /** Transport-only receipt for ordinary Lark IM delivery. Emitted
+   * synchronously when the live worker's IPC handler claims the exact turn,
+   * before slow startup work; input-queue ownership is acknowledged separately
+   * by turn_input_committed. */
+  | { type: 'turn_input_received'; turnId: string }
+  /** The worker received an ordinary turn but could not place it into its CLI
+   * input queue. This is safe to retry within the same worker generation. */
+  | { type: 'turn_input_rejected'; turnId: string; reason: string }
   /** Transfer-only completion fence. Emitted after the old worker has detached
    * its backend observer and disarmed sandbox teardown, immediately before it
    * exits. The daemon also waits for that child exit before forking replacement. */
@@ -766,6 +775,9 @@ export type WorkerToDaemon =
    *  daemon 收到后才结束 `botmux session-ready` HTTP 请求。 */
   | { type: 'session_ready_ack'; requestId: string }
   | { type: 'screen_update'; content: string; status: ScreenStatus; usageLimit?: CliUsageLimitState; turnId?: string; dispatchAttempt?: number }
+  /** Executor-observed Codex tier, bound to this worker + rollout generation.
+   * `null` explicitly clears any previous generation's snapshot. */
+  | { type: 'codex_service_tier'; snapshot: CodexServiceTierSnapshot | null }
   | { type: 'error'; message: string; turnId?: string; dispatchAttempt?: number }
   | { type: 'bridge_source_session'; bridge: 'hermes'; sourceSessionId: string }
   /** Worker observed a successful explicit `botmux send` for this turn, so

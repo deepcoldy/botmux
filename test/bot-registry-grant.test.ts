@@ -205,6 +205,25 @@ describe('bot-registry grant additions', () => {
     expect(cfgs[2].summaryRange).toBeUndefined();
   });
 
+  it('parses summaryMemory as a default-off boolean', () => {
+    const cfgs = parseBotConfigsFromText(JSON.stringify([
+      { larkAppId: 'sm1', larkAppSecret: 's', summaryMemory: true, summaryMemoryPath: 'docs/summary.md' },
+      { larkAppId: 'sm2', larkAppSecret: 's', summaryMemory: false, summaryMemoryPath: '/tmp/botmux-summary.md' },
+      { larkAppId: 'sm3', larkAppSecret: 's', summaryMemory: 'true' },
+      { larkAppId: 'sm4', larkAppSecret: 's', summaryMemory: true, summaryMemoryPath: '   ' },
+      { larkAppId: 'sm5', larkAppSecret: 's', summaryMemory: true, summaryMemoryPath: 123 },
+    ]));
+
+    expect(cfgs[0].summaryMemory).toBe(true);
+    expect(cfgs[0].summaryMemoryPath).toBe('docs/summary.md');
+    expect(cfgs[1].summaryMemory).toBeUndefined();
+    expect(cfgs[1].summaryMemoryPath).toBe('/tmp/botmux-summary.md');
+    expect(cfgs[2].summaryMemory).toBeUndefined();
+    expect(cfgs[2].summaryMemoryPath).toBeUndefined();
+    expect(cfgs[3].summaryMemoryPath).toBeUndefined();
+    expect(cfgs[4].summaryMemoryPath).toBeUndefined();
+  });
+
   it('parses legacy contentTriggers and preserves explicit unlimited history settings', () => {
     const cfgs = parseBotConfigsFromText(JSON.stringify([{
       larkAppId: 'ct1',

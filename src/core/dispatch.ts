@@ -14,6 +14,7 @@
  * (cli.ts) performs the actual sendMessage + replyMessage.
  */
 
+import type { SessionReplyTarget } from './reply-target.js';
 export { resolveSendTarget } from './reply-target.js';
 
 export interface DispatchBot {
@@ -224,6 +225,125 @@ export function findSubBotTopic(input: {
   return null;
 }
 
+/** A quote reply references a root but does not enter that root's thread. */
+export function threadRootForReachability(target: SessionReplyTarget): string | undefined {
+  return target.mode === 'thread' ? target.rootMessageId : undefined;
+}
+
+type ReachabilitySession = {
+  status: 'active' | 'closed';
+  scope?: 'thread' | 'chat';
+  chatId: string;
+  rootMessageId: string;
+  larkAppId?: string;
+  deferredScheduleRun?: unknown;
+  vcMeetingReceiver?: unknown;
+};
+
+/**
+ * Identify active chat sessions whose bot is still configured to fold a
+ * mention back into that shared session. Mode lookup failures fail closed.
+ */
+export async function foldableChatSessionAppIds(input: {
+  sessions: Iterable<ReachabilitySession>;
+  targetChatId: string;
+  outboundMode: SessionReplyTarget['mode'];
+  resolveMode: (larkAppId: string, chatId: string) => 'chat' | 'shared' | 'new-topic' | 'chat-topic' | undefined;
+  resolveChatMode: (chatId: string) => Promise<'group' | 'topic' | 'p2p' | 'unknown' | undefined>;
+}): Promise<Set<string>> {
+  const candidates = new Set<string>();
+  for (const session of input.sessions) {
+    if (session.status !== 'active'
+      || session.scope !== 'chat'
+      || !session.larkAppId
+      || session.chatId !== input.targetChatId
+      // These chat-scoped sessions deliberately use isolated routing keys and
+      // can never be reached through the ordinary (chatId, appId) slot.
+      || session.deferredScheduleRun
+      || session.vcMeetingReceiver) continue;
+    candidates.add(session.larkAppId);
+  }
+
+  const appIds = new Set<string>();
+  if (candidates.size === 0) return appIds;
+  // Topology belongs to the chat, not to an individual bot. Resolve it once
+  // through the sending bot's authenticated client.
+  let chatMode: 'group' | 'topic' | 'p2p' | 'unknown' | undefined;
+  try {
+    chatMode = await input.resolveChatMode(input.targetChatId);
+  } catch { /* lookup failure → retain advisory */ }
+  if (chatMode !== 'group') return appIds;
+
+  for (const larkAppId of candidates) {
+    try {
+      const mode = input.resolveMode(larkAppId, input.targetChatId);
+      // chat-topic reuses the chat session for top-level/quote delivery, but
+      // deliberately keeps a real Lark topic isolated. new-topic never folds
+      // a new mention back into a leftover chat session.
+      if (mode === 'chat'
+        || mode === 'shared'
+        || (mode === 'chat-topic' && input.outboundMode !== 'thread')) {
+        appIds.add(larkAppId);
+      }
+    } catch { /* unknown bot/mode → retain advisory */ }
+  }
+  return appIds;
+}
+
+/**
+ * Resolve sender-scoped open_ids for bots that already have an active session
+ * at the current conversation anchor. These peers are reachable here, so an
+ * older dispatch record for the same bot must not be presented as the target.
+ */
+export function activeConversationBotOpenIds(input: {
+  sessions: Iterable<ReachabilitySession>;
+  targetChatId: string;
+  outboundRootMessageId?: string;
+  foldableChatAppIds?: Set<string>;
+  botEntries: Array<{ larkAppId: string; botName: string | null }>;
+  crossRef: Record<string, string>;
+}): Set<string> {
+  const activeAppIds = new Set<string>();
+  for (const session of input.sessions) {
+    if (session.status !== 'active'
+      || !session.larkAppId
+      || session.chatId !== input.targetChatId) continue;
+    // A chat-scope peer is reachable from any message in the same group:
+    // mentions inside a topic fold back into that peer's shared chat session.
+    // A thread-scope peer is reachable only when this send actually lands in
+    // the same thread root.
+    const here = session.scope === 'chat'
+      ? input.foldableChatAppIds?.has(session.larkAppId) === true
+      : !!input.outboundRootMessageId
+        && session.rootMessageId === input.outboundRootMessageId;
+    if (here) activeAppIds.add(session.larkAppId);
+  }
+
+  const openIds = new Set<string>();
+  const entries = Array.isArray(input.botEntries)
+    ? input.botEntries.filter((entry): entry is { larkAppId: string; botName: string | null } =>
+        !!entry
+        && typeof entry === 'object'
+        && typeof entry.larkAppId === 'string'
+        && (entry.botName === null || typeof entry.botName === 'string'))
+    : [];
+  const crossRef = input.crossRef && typeof input.crossRef === 'object'
+    ? input.crossRef
+    : {};
+  for (const entry of entries) {
+    if (!entry.botName || !activeAppIds.has(entry.larkAppId)) continue;
+    // crossRef is keyed by display name. When several apps share that name,
+    // the value cannot prove which app it represents; fail closed and retain
+    // the old-topic hint instead of silencing it for the wrong bot.
+    const sameNameEntries = entries.filter(candidate =>
+      candidate.botName?.toLowerCase() === entry.botName!.toLowerCase());
+    if (sameNameEntries.length !== 1) continue;
+    const openId = crossRef[entry.botName];
+    if (typeof openId === 'string' && openId) openIds.add(openId);
+  }
+  return openIds;
+}
+
 /**
  * Resolve where a `botmux report` should go + who to @, so report-back works
  * even when the orchestrator is on a DIFFERENT machine.
@@ -418,20 +538,21 @@ export function acceptedDispatchBotAppIds(input: {
  * a dispatched sub-bot in an active topic that is NOT reachable in the current
  * conversation (so @-ing it here would spawn a context-less session), else null.
  *
- * The bot I'm replying to (`quoteTargetSenderOpenId`) is reachable right here, so
- * it's never treated as off-topic — that's the boundary that stops the guard from
- * blocking a normal reply to a bot conversing with me. Callers block (explicit
- * --mention) or drop (prose injection) on a non-null result, and skip the whole
- * check under `--anyway`.
+ * The bot I'm replying to (`quoteTargetSenderOpenId`) and bots in
+ * `reachableOpenIds` are reachable right here, so an unrelated older dispatch
+ * topic is never recommended for them.
  */
 export function offTopicSubBotTopic(input: {
   mentionOpenId: string;
   quoteTargetSenderOpenId?: string;
+  reachableOpenIds?: Set<string>;
   chatId: string;
   registry: Record<string, { orchChatId?: string; bots?: string[] }>;
   activeSeeds: Set<string>;
 }): string | null {
-  if (!input.mentionOpenId || input.mentionOpenId === input.quoteTargetSenderOpenId) return null;
+  if (!input.mentionOpenId
+    || input.mentionOpenId === input.quoteTargetSenderOpenId
+    || input.reachableOpenIds?.has(input.mentionOpenId)) return null;
   return findSubBotTopic({
     mentionOpenId: input.mentionOpenId,
     chatId: input.chatId,

@@ -10,6 +10,7 @@ import type {
   VcMeetingImTurnOrigin,
 } from '../types.js';
 import type { CliUsageLimitState } from '../utils/cli-usage-limit.js';
+import type { CodexServiceTierSnapshot } from '../services/codex-service-tier.js';
 
 /** Frozen card state — cached content for historical streaming cards that can still be toggled. */
 export interface FrozenCard {
@@ -22,6 +23,10 @@ export interface FrozenCard {
   displayMode?: DisplayMode;
   /** Latest uploaded image_key for the frozen card (only when displayMode === 'screenshot'). */
   imageKey?: string;
+  /** Rendered service-tier badge (`⚡ priority`) captured at freeze time so a
+   *  recalled Codex card keeps its per-turn tier instead of being re-decorated
+   *  with the session's current tier. Absent = no badge. */
+  codexServiceTierBadge?: string;
 }
 
 /** Resolve effective display mode for a frozen card.
@@ -192,6 +197,13 @@ export interface DaemonSession {
   currentImageKey?: string;
   lastScreenContent?: string;    // last screen_update content — used to freeze card at idle
   lastScreenStatus?: StreamStatus;  // last screen_update status
+  /** Executor-observed Codex settings for this worker/rollout generation. */
+  codexServiceTier?: CodexServiceTierSnapshot;
+  /** Tier change arrived while a card POST was in-flight. */
+  pendingCodexTierCardRefresh?: boolean;
+  /** The currently referenced card has been frozen/parked for handoff. Tier
+   * updates belong to the successor card and must not rewrite this snapshot. */
+  parkedStreamCardNonce?: string;
   /** Riff AIO Sandbox web terminal link. When set, buildTerminalUrl returns
    *  this URL directly (bypassing the local terminal proxy) so the dashboard
    *  "Web终端" button opens the riff sandbox. In-memory only — re-sent by the

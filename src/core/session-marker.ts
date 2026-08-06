@@ -2,6 +2,15 @@ import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { readManagedOriginCapability } from './managed-origin-capability.js';
+import {
+  readLinuxBootIdentity,
+  readProcessStartIdentity,
+} from '../utils/process-identity.js';
+
+export {
+  readLinuxBootIdentity,
+  readProcessStartIdentity,
+} from '../utils/process-identity.js';
 
 export interface AncestorSessionContext {
   sessionId: string;
@@ -22,56 +31,6 @@ export class SessionMarkerAuthenticationError extends Error {
   constructor(message: string) {
     super(message);
     this.name = 'SessionMarkerAuthenticationError';
-  }
-}
-
-const LINUX_BOOT_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-
-/** Kernel-generated identity that changes on every Linux boot. */
-export function readLinuxBootIdentity(): string | undefined {
-  if (process.platform !== 'linux') return undefined;
-  try {
-    const bootId = readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim();
-    return LINUX_BOOT_ID_RE.test(bootId) ? bootId.toLowerCase() : undefined;
-  } catch {
-    return undefined;
-  }
-}
-
-/**
- * Stable process-birth identity used to reject stale marker files after PID
- * reuse. Linux exposes start ticks in /proc; macOS/other Unix falls back to
- * ps(1)'s process start timestamp so mutating commands remain cross-platform.
- */
-export function readProcessStartIdentity(pid: number): string | undefined {
-  if (!Number.isInteger(pid) || pid <= 1) return undefined;
-  if (process.platform === 'linux') {
-    try {
-      const raw = readFileSync(`/proc/${pid}/stat`, 'utf8');
-      const closeParen = raw.lastIndexOf(')');
-      if (closeParen >= 0) {
-        const fields = raw.slice(closeParen + 2).trim().split(/\s+/);
-        if (fields[19]) return fields[19];
-      }
-    } catch { /* disappeared or unreadable: never fall through to ambient ps */ }
-    return undefined;
-  }
-  const ps = systemPsBin();
-  if (!ps) return undefined;
-  try {
-    const started = execFileSync(
-      ps,
-      ['-o', 'lstart=', '-p', String(pid)],
-      {
-        encoding: 'utf-8',
-        timeout: 2000,
-        stdio: ['ignore', 'pipe', 'ignore'],
-        env: { PATH: '/usr/bin:/bin', LANG: 'C' },
-      },
-    ).trim();
-    return started || undefined;
-  } catch {
-    return undefined;
   }
 }
 

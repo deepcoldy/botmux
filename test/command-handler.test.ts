@@ -652,10 +652,10 @@ describe('DAEMON_COMMANDS set', () => {
   });
 
   it('should have the correct size', () => {
-    // 31 = current master command set (30) + /fork (session clone).
-    // /subscribe-lark-doc remains
+    // 32 = current master command set (30) + /fork (session clone)
+    // + /issue (Issue Board 领取). /subscribe-lark-doc remains
     // as its original per-file API subscription command rather than an alias.
-    expect(DAEMON_COMMANDS.size).toBe(31);
+    expect(DAEMON_COMMANDS.size).toBe(32);
   });
 
   it('contains the /list-slash-command lister and its /slash alias', () => {
@@ -1039,6 +1039,22 @@ describe('PASSTHROUGH_COMMANDS set', () => {
     expect(PASSTHROUGH_COMMANDS.has('/goal')).toBe(false);
     expect(resolvePassthroughCommands('app-1').has('/goal')).toBe(true);
     expect(resolvePassthroughCommands('app-2').has('/goal')).toBe(true);
+  });
+
+  it('forwards /fast as a global passthrough WITHOUT cold-start (not adapter-scoped)', () => {
+    // /fast is a tier toggle, not "start a unit of work": it lives in the global
+    // PASSTHROUGH_COMMANDS (forwarded to Codex on an existing session), and is
+    // deliberately NOT in any adapter's defaultPassthroughCommands — so a bare
+    // /fast in an empty topic must not cold-start a session (owner policy).
+    // Regression guard: an earlier revision put /fast in the codex adapter
+    // default, which both broke that no-cold-start policy and (before that) a
+    // revision that removed /fast from every set left it never reaching Codex.
+    expect(PASSTHROUGH_COMMANDS.has('/fast')).toBe(true);
+    expect(resolvePassthroughCommands('app-2').has('/fast')).toBe(true); // codex
+    expect(resolvePassthroughCommands('app-1').has('/fast')).toBe(true); // claude-code (harmless unknown-command)
+    expect(resolvePassthroughCommands(undefined).has('/fast')).toBe(true);
+    expect(resolveAdapterDefaultPassthroughCommands('app-2')).not.toContain('/fast'); // no cold-start
+    expect(resolveAdapterDefaultPassthroughCommands('app-1')).not.toContain('/fast');
   });
 
   it('exposes /effort globally to every CLI (best-effort passthrough)', () => {

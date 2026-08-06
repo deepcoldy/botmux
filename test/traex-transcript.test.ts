@@ -6,6 +6,9 @@ import { CodexBridgeQueue } from '../src/services/codex-bridge-queue.js';
 import {
   drainTraexRollout,
   traexRolloutHasUserInputSince,
+  traexHistoryMatchDelta,
+  traexHistorySize,
+  traexHistorySidIsOwned,
 } from '../src/services/traex-transcript.js';
 
 const SID = '00000000-0000-7000-8000-000000000001';
@@ -183,5 +186,111 @@ describe('traexRolloutHasUserInputSince', () => {
     expect(traexRolloutHasUserInputSince(path, baseline, 'same thread, later prompt')).toBe(true);
     expect(traexRolloutHasUserInputSince(path, baseline, 'same thread, old prompt')).toBe(false);
     expect(traexRolloutHasUserInputSince(path, baseline, 'same thread')).toBe(false);
+  });
+});
+
+describe('traexHistoryMatchDelta (submit-time history.jsonl verification)', () => {
+  let histPath: string;
+
+  function histLine(sessionId: string, text: string): string {
+    return `${JSON.stringify({ session_id: sessionId, ts: 1785900000, text })}\n`;
+  }
+
+  beforeEach(() => {
+    histPath = join(dir, 'history.jsonl');
+  });
+
+  it('confirms a submit appended after baseByte and returns its session_id', () => {
+    const base = histLine('aaaa1111-0000-7000-8000-000000000001', 'earlier turn');
+    writeFileSync(histPath, base);
+    const baseByte = Buffer.byteLength(base);
+    // The follow-up botmux would paste while a turn is running: parked by TRAE
+    // but written to history.jsonl immediately at submit time.
+    appendFileSync(histPath, histLine('bbbb2222-0000-7000-8000-000000000002', '<session_id>x</session_id>\n\n<user_message>\nfollow-up while busy\n</user_message>'));
+
+    const match = traexHistoryMatchDelta(histPath, baseByte, '<session_id>x</session_id>\n\n<user_message>\nfollow-up while busy\n</user_message>');
+    expect(match.found).toBe(true);
+    expect(match.cliSessionId).toBe('bbbb2222-0000-7000-8000-000000000002');
+  });
+
+  it('never matches a line at or before baseByte (only the new submit)', () => {
+    const base = histLine('aaaa1111-0000-7000-8000-000000000001', 'earlier turn');
+    writeFileSync(histPath, base);
+    const baseByte = Buffer.byteLength(base);
+    expect(traexHistoryMatchDelta(histPath, baseByte, 'earlier turn').found).toBe(false);
+  });
+
+  it('returns not-found when the file is absent (lazy-created on first submit)', () => {
+    expect(traexHistoryMatchDelta(join(dir, 'nope.jsonl'), 0, 'anything').found).toBe(false);
+  });
+
+  it('normalises CRLF/CR so a paste round-tripped through TRAE still matches', () => {
+    writeFileSync(histPath, '');
+    appendFileSync(histPath, histLine('cccc3333-0000-7000-8000-000000000003', 'line one\nline two'));
+    // Expected text arrives with CRLF from the caller; the stored text is LF.
+    const match = traexHistoryMatchDelta(histPath, 0, 'line one\r\nline two');
+    expect(match.found).toBe(true);
+    expect(match.cliSessionId).toBe('cccc3333-0000-7000-8000-000000000003');
+  });
+
+  it('ignores a trailing partial (non-newline-terminated) line until it completes', () => {
+    writeFileSync(histPath, '');
+    // Half-written line — no trailing newline. Must NOT match yet.
+    const partial = JSON.stringify({ session_id: 'dddd4444-0000-7000-8000-000000000004', ts: 1785900001, text: 'mid write' });
+    writeFileSync(histPath, partial);
+    expect(traexHistoryMatchDelta(histPath, 0, 'mid write').found).toBe(false);
+    // Completed with a newline on a later poll — now it matches.
+    writeFileSync(histPath, partial + '\n');
+    expect(traexHistoryMatchDelta(histPath, 0, 'mid write').found).toBe(true);
+  });
+
+  it('with an ownership filter, skips a sibling pane\'s identical text and accepts only the owned session', () => {
+    writeFileSync(histPath, '');
+    const foreignSid = 'ffff0000-0000-7000-8000-00000000000f';
+    const ownedSid = '11110000-0000-7000-8000-000000000011';
+    // Same exact text submitted by two panes sharing one TRAE_HOME; the
+    // sibling's line lands first.
+    appendFileSync(histPath, histLine(foreignSid, 'duplicate text'));
+    appendFileSync(histPath, histLine(ownedSid, 'duplicate text'));
+
+    const acceptOwned = (sid: string | undefined) => sid?.toLowerCase() === ownedSid.toLowerCase();
+    const match = traexHistoryMatchDelta(histPath, 0, 'duplicate text', acceptOwned);
+    expect(match.found).toBe(true);
+    expect(match.cliSessionId).toBe(ownedSid);
+
+    // If the ONLY line is a foreign pane's, the owned filter rejects it.
+    writeFileSync(histPath, histLine(foreignSid, 'only foreign'));
+    expect(traexHistoryMatchDelta(histPath, 0, 'only foreign', acceptOwned).found).toBe(false);
+  });
+
+  it('traexHistorySize returns 0 for an absent file and the byte size otherwise', () => {
+    expect(traexHistorySize(join(dir, 'absent.jsonl'))).toBe(0);
+    const body = histLine('eeee5555-0000-7000-8000-000000000055', 'sized');
+    writeFileSync(histPath, body);
+    expect(traexHistorySize(histPath)).toBe(Buffer.byteLength(body));
+  });
+});
+
+describe('traexHistorySidIsOwned (ownership gate predicate)', () => {
+  const OWNED = 'aaaa1111-0000-7000-8000-000000000001';
+  const FOREIGN = 'ffff0000-0000-7000-8000-00000000000f';
+
+  it('accepts an id present in the owned set (case-insensitive)', () => {
+    const owned = new Set([OWNED.toLowerCase()]);
+    expect(traexHistorySidIsOwned(OWNED, owned)).toBe(true);
+    expect(traexHistorySidIsOwned(OWNED.toUpperCase(), owned)).toBe(true);
+  });
+
+  it('rejects an id NOT in the owned set (foreign sibling pane)', () => {
+    const owned = new Set([OWNED.toLowerCase()]);
+    expect(traexHistorySidIsOwned(FOREIGN, owned)).toBe(false);
+  });
+
+  it('fails closed when the set is undefined (fd enumeration unavailable)', () => {
+    expect(traexHistorySidIsOwned(OWNED, undefined)).toBe(false);
+  });
+
+  it('fails closed on an empty set (pid holds no TRAE rollout)', () => {
+    expect(traexHistorySidIsOwned(OWNED, new Set())).toBe(false);
   });
 });

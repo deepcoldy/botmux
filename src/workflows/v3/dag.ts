@@ -3,8 +3,8 @@
  *
  * The v3 runtime (LLM-driven workflow) loads a hand-written `dag.json`,
  * validates it, and walks it in topological order with deps gating.  This
- * module is the *schema half* of the engine: pure data + validation, no IO
- * side effects beyond reading the file in `loadDag`.
+ * module is the *schema half* of the engine: pure data + validation. Node.js
+ * filesystem loading lives in `dag-loader.ts`.
  *
  * Deliberately standalone from v0.2's `definition.ts` — v3 nodes are a much
  * smaller surface (goal / host, no loop / decision / fanout) and coupling the
@@ -12,7 +12,6 @@
  * `docs/design/2026-06-01-v3-mvp-engine-split.md` §3 for the authored shape.
  */
 
-import { readFileSync } from 'node:fs';
 import { collectV3HostBindingRefs, V3HostBindingError } from './host-bindings.js';
 
 // ─── Schema ──────────────────────────────────────────────────────────────
@@ -1510,27 +1509,6 @@ function normInputs(v: unknown, id: string, problems: string[]): V3InputRef[] {
     });
   }
   return out;
-}
-
-// ─── Loader ─────────────────────────────────────────────────────────────
-
-/** Read + JSON.parse + validate a `dag.json` at `path`.  Throws
- *  `DagValidationError` on a malformed graph and a plain `Error` on read /
- *  parse failure (so callers can distinguish "bad file" from "bad graph"). */
-export function loadDag(path: string): V3Dag {
-  let raw: string;
-  try {
-    raw = readFileSync(path, 'utf-8');
-  } catch (err) {
-    throw new Error(`v3: cannot read dag.json at ${path}: ${err instanceof Error ? err.message : String(err)}`);
-  }
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(raw);
-  } catch (err) {
-    throw new Error(`v3: dag.json at ${path} is not valid JSON: ${err instanceof Error ? err.message : String(err)}`);
-  }
-  return validateDag(parsed);
 }
 
 // ─── Topological order ─────────────────────────────────────────────────

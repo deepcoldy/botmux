@@ -116,6 +116,51 @@ describe('Codex App clean prompt sidecar', () => {
     expect(built.codexAppInput?.additionalContext?.botmux_attachments.value).toContain('/tmp/readme.md');
   });
 
+  it('injects conservative summary.md reuse rules when summary memory is enabled', () => {
+    registerBot({
+      larkAppId: 'summary-memory-prompt',
+      larkAppSecret: 's',
+      cliId: 'codex-app',
+      summaryMemory: true,
+      summaryMemoryPath: 'docs/incident-summary.md',
+    });
+
+    const opening = buildNewTopicCliInput('继续排查', 'sid-summary-memory', 'codex-app', undefined, undefined, undefined, undefined, undefined, undefined, 'zh', undefined, {
+      larkAppId: 'summary-memory-prompt',
+      chatId: 'chat-summary-memory',
+    });
+    const followUp = buildFollowUpCliInput('后续问题', 'sid-summary-memory', {
+      cliId: 'codex-app',
+      larkAppId: 'summary-memory-prompt',
+      chatId: 'chat-summary-memory',
+    });
+
+    expect(opening.content).toContain('<summary_memory>');
+    expect(opening.content).toContain('只有 PSM、环境、任务 ID、节点、错误现象等必要条件全部完全一致');
+    expect(opening.content).toContain('docs/incident-summary.md');
+    expect(opening.codexAppInput?.additionalContext?.botmux_role.value).toContain('<summary_memory>');
+    expect(followUp.content).toContain('<summary_memory>');
+    expect(followUp.codexAppInput?.additionalContext?.botmux_role.value).toContain('只能把 docs/incident-summary.md 当排查参考');
+  });
+
+  it('allows an absolute summary memory path in the prompt contract', () => {
+    registerBot({
+      larkAppId: 'summary-memory-absolute-path',
+      larkAppSecret: 's',
+      cliId: 'codex-app',
+      summaryMemory: true,
+      summaryMemoryPath: '/tmp/botmux/summary.md',
+    });
+
+    const built = buildNewTopicCliInput('继续排查', 'sid-summary-abs', 'codex-app', undefined, undefined, undefined, undefined, undefined, undefined, 'zh', undefined, {
+      larkAppId: 'summary-memory-absolute-path',
+      chatId: 'chat-summary-abs',
+    });
+
+    expect(built.content).toContain('/tmp/botmux/summary.md');
+    expect(built.content).toContain('如果它是相对路径，按当前项目根目录解析；如果它是绝对路径，按原样使用');
+  });
+
   it('does not create a Codex sidecar for any other CLI', () => {
     const built = buildNewTopicCliInput('hello', 'sid', 'claude-code');
     expect(built.codexAppInput).toBeUndefined();

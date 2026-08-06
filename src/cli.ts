@@ -34,7 +34,7 @@ import { validateWorkingDir } from './core/working-dir.js';
 import { resolveSessionContext } from './core/session-marker.js';
 import { resolveBotmuxDataDir } from './core/data-dir.js';
 import { dashboardSecretPath } from './core/dashboard-secret.js';
-import { acceptedDispatchBotAppIds, appendDispatchReportProtocol, appendLegacyDispatchReportProtocol, parseDispatchBotSpec, buildDispatchMessages, buildRepoPrimeText, buildReportContent, eligibleAutoMentionAliases, findDispatchRegistryEntry, offTopicSubBotTopic, resolveReportTarget, resolveSendTarget } from './core/dispatch.js';
+import { acceptedDispatchBotAppIds, activeConversationBotOpenIds, appendDispatchReportProtocol, appendLegacyDispatchReportProtocol, parseDispatchBotSpec, buildDispatchMessages, buildRepoPrimeText, buildReportContent, eligibleAutoMentionAliases, findDispatchRegistryEntry, foldableChatSessionAppIds, offTopicSubBotTopic, resolveReportTarget, resolveSendTarget, threadRootForReachability } from './core/dispatch.js';
 import { pickTurnReplyTarget } from './core/reply-target.js';
 import { recordDispatchRegistryEntry } from './core/dispatch-registry.js';
 import { enableAutostart, disableAutostart, autostartStatus, refreshAutostart } from './autostart.js';
@@ -89,7 +89,8 @@ import {
   freezeManagedZmxAttachTarget,
 } from './cli/zmx-managed-attach.js';
 import { dispatchPrimaryMessage, findStdinAliasAttachment, normalizeInteractiveCardInput, sendFileAttachments, sendVideoAttachments, shouldSendAsPureVideo, validateVideoAttachments } from './cli/send-dispatch.js';
-import { dispatchDeferredTopicSend, type DeferredScheduleRunData } from './cli/deferred-topic-send.js';
+import { dispatchDeferredTopicSend, reusableDeferredTopicRoot, type DeferredScheduleRunData } from './cli/deferred-topic-send.js';
+import { readDeferredTopicBinding } from './core/deferred-topic-binding.js';
 import { resolveDaemonEnv } from './cli/daemon-lifecycle-env.js';
 import { buildPm2SpawnCommand } from './cli/pm2-command.js';
 import { callDashboard, type DashboardEndpoint, type DashboardResult } from './cli/dashboard-endpoint.js';
@@ -7431,7 +7432,8 @@ async function cmdSend(rest: string[]): Promise<void> {
   // is idempotent, so the downstream send path reuses these same clients.
   // envPinnedRiffBot is re-registered LAST so a remote env credential is never
   // clobbered by a stale bots.json entry for the same app.
-  const { registerBot, loadBotConfigs, findOncallChatForAnyBot } = await import('./bot-registry.js');
+  const { registerBot, loadBotConfigs, findOncallChatForAnyBot, getBot } = await import('./bot-registry.js');
+  const { resolveRegularGroupMode } = await import('./services/chat-reply-mode-store.js');
   try { for (const cfg of loadBotConfigs()) registerBot(cfg); } catch { /* */ }
   if (envPinnedRiffBot) { try { registerBot(envPinnedRiffBot); } catch { /* */ } }
 
@@ -7479,7 +7481,7 @@ async function cmdSend(rest: string[]): Promise<void> {
     if (!statSync(p).isFile()) { console.error(`不是普通文件: ${p}`); process.exit(1); }
   }
 
-  const { sendMessage, replyMessage, uploadImage, uploadFile, MessageWithdrawnError } = await import('./im/lark/client.js');
+  const { sendMessage, replyMessage, uploadImage, uploadFile, MessageWithdrawnError, getChatModeStrict } = await import('./im/lark/client.js');
   const appId = s.larkAppId!;
   // Effective target chat for top-level mode (defaults to session's chat)
   const targetChatId = overrideChatId ?? s.chatId;
@@ -7487,6 +7489,49 @@ async function cmdSend(rest: string[]): Promise<void> {
   // reply_in_thread, otherwise Lark would force every reply into a fresh
   // topic — defeating the whole point of chat-scope routing.
   const isChatScope = s.scope === 'chat';
+  // Compute the actual outbound anchor before the advisory guard. A chat-scope
+  // sender can still reply into a per-turn topic, so sender scope alone does
+  // not describe which peer sessions are reachable.
+  const sendTarget = resolveSendTarget({ into: sendInto, topLevel: sendTopLevel, chatScope: isChatScope, chatId: targetChatId, rootMessageId: s.rootMessageId, replyTargetRootId: turnReplyTarget?.rootMessageId, replyTargetTurnId: turnReplyTarget?.turnId, replyTargetQuoteOnly: turnReplyTarget?.quoteOnly, currentTurnId });
+  const dataDir = resolveDataDir();
+  const deferredBinding = !sendInto && (!overrideChatId || overrideChatId === s.chatId)
+    ? readDeferredTopicBinding(dataDir, s.sessionId)
+    : undefined;
+  const deferredRoot = reusableDeferredTopicRoot({
+    session: s as SessionData & { larkAppId: string },
+    binding: deferredBinding,
+    explicitTopLevel: sendTopLevel,
+    reuseBoundRootWhenTopLevel: deferredMaterializedByThisCommand,
+  });
+  const reachabilityTarget = deferredRoot
+    ? { mode: 'thread' as const, rootMessageId: deferredRoot }
+    : sendTarget;
+
+  // Load the sender-scoped bot identity map once. Besides prose @Name
+  // injection below, it lets the sub-bot hint recognize peers that already
+  // have an active session in THIS conversation.
+  let botEntries: BotMentionEntry[] = [];
+  let crossRef: Record<string, string> = {};
+  try {
+    const botInfoPath = join(dataDir, 'bots-info.json');
+    const parsedBotEntries = existsSync(botInfoPath)
+      ? JSON.parse(readFileSync(botInfoPath, 'utf-8'))
+      : [];
+    botEntries = Array.isArray(parsedBotEntries)
+      ? parsedBotEntries.filter((entry): entry is BotMentionEntry =>
+          !!entry
+          && typeof entry === 'object'
+          && typeof entry.larkAppId === 'string'
+          && (entry.botName === null || typeof entry.botName === 'string'))
+      : [];
+    const crossRefPath = join(dataDir, `bot-openids-${appId}.json`);
+    const parsedCrossRef = existsSync(crossRefPath)
+      ? JSON.parse(readFileSync(crossRefPath, 'utf-8'))
+      : {};
+    crossRef = parsedCrossRef && typeof parsedCrossRef === 'object' && !Array.isArray(parsedCrossRef)
+      ? parsedCrossRef
+      : {};
+  } catch { /* best-effort identity map */ }
 
   // ── Footgun guard: orchestrator → sub-bot ──
   // A dispatched sub-bot's session lives in its sub-topic; @-ing it from the main
@@ -7496,22 +7541,47 @@ async function cmdSend(rest: string[]): Promise<void> {
   // `@OtherSubBot` can't slip past after this explicit guard already ran.
   let dispatchReg: Record<string, { orchChatId?: string; bots?: string[] }> = {};
   try {
-    const regPath = join(resolveDataDir(), 'orchestrate-dispatch.json');
+    const regPath = join(dataDir, 'orchestrate-dispatch.json');
     if (existsSync(regPath)) dispatchReg = JSON.parse(readFileSync(regPath, 'utf-8'));
   } catch { /* no/!corrupt registry → no guard */ }
   const dispatchActiveSeeds = new Set<string>();
+  let allSessions: SessionData[] = [];
   if (Object.keys(dispatchReg).length > 0) {
-    for (const sess of loadSessions().values()) {
-      if (sess.status === 'active' && sess.scope !== 'chat' && sess.rootMessageId) {
+    allSessions = [...loadSessions().values()];
+    for (const sess of allSessions) {
+      if (sess.status !== 'active') continue;
+      if (sess.scope !== 'chat' && sess.rootMessageId) {
         dispatchActiveSeeds.add(sess.rootMessageId);
       }
     }
   }
+  // An active chat-scope session can outlive a /reply-mode switch. Verify the
+  // target bot's current effective mode before assuming mentions still fold
+  // back into that old session.
+  const foldableChatAppIds = await foldableChatSessionAppIds({
+    sessions: allSessions,
+    targetChatId,
+    outboundMode: reachabilityTarget.mode,
+    resolveMode: (larkAppId, chatId) => {
+      getBot(larkAppId); // unknown target bot must fail closed
+      return resolveRegularGroupMode(larkAppId, chatId);
+    },
+    resolveChatMode: chatId => getChatModeStrict(appId, chatId),
+  });
+  const reachableOpenIds = activeConversationBotOpenIds({
+    sessions: allSessions,
+    targetChatId,
+    outboundRootMessageId: threadRootForReachability(reachabilityTarget),
+    foldableChatAppIds,
+    botEntries,
+    crossRef,
+  });
   // Sub-topic seed if `openId` is a dispatched sub-bot in an active topic that is
-  // NOT reachable in the current conversation; else null. The bot I'm replying to
-  // here (quoteTargetSenderOpenId) is reachable, so it's never treated as off-topic.
+  // NOT reachable in the current conversation; else null. Both the bot I'm
+  // replying to and any peer with an active session at this conversation anchor
+  // are reachable, so an unrelated old dispatch topic must not be recommended.
   const offTopicSubBotSeed = (openId: string): string | null =>
-    offTopicSubBotTopic({ mentionOpenId: openId, quoteTargetSenderOpenId: replyTargetSenderOpenId, chatId: targetChatId, registry: dispatchReg, activeSeeds: dispatchActiveSeeds });
+    offTopicSubBotTopic({ mentionOpenId: openId, quoteTargetSenderOpenId: replyTargetSenderOpenId, reachableOpenIds, chatId: targetChatId, registry: dispatchReg, activeSeeds: dispatchActiveSeeds });
   // Explicit --mention / --mention-back of an off-topic sub-bot → block + point to
   // the right command (--anyway overrides). Prose @Name injection is filtered
   // (dropped, not blocked) at its own site below.
@@ -7541,9 +7611,9 @@ async function cmdSend(rest: string[]): Promise<void> {
     rootMessageId: s.rootMessageId,
     title: s.title,
   };
-  // Dispatch helper: top-level / chat-scope send vs reply-in-thread, single
-  // decision point. Used for file attachments (always plain in chat scope).
-  const sendTarget = resolveSendTarget({ into: sendInto, topLevel: sendTopLevel, chatScope: isChatScope, chatId: targetChatId, rootMessageId: s.rootMessageId, replyTargetRootId: turnReplyTarget?.rootMessageId, replyTargetTurnId: turnReplyTarget?.turnId, replyTargetQuoteOnly: turnReplyTarget?.quoteOnly, currentTurnId });
+  // Ordinary delivery uses the nominal target. Deferred delivery gets first
+  // refusal below; the advisory mirrors its existing binding in
+  // `reachabilityTarget` above so both paths agree about the effective root.
   const dispatch = async (
     content: string,
     msgType: string,
@@ -7769,16 +7839,7 @@ async function cmdSend(rest: string[]): Promise<void> {
     // "获取群组中其他机器人和用户@当前机器人的消息"权限），不再走任何本地
     // 转发——botmux 历史上为绕过 Lark 不投递跨 bot 事件搞过 signal-file，
     // 那套已经在该权限上线后整体下线。
-    let botEntries: BotMentionEntry[] = [];
-    let crossRef: Record<string, string> = {};
     try {
-      const dataDir = resolveDataDir();
-      const botInfoPath = join(dataDir, 'bots-info.json');
-      botEntries = existsSync(botInfoPath) ? JSON.parse(readFileSync(botInfoPath, 'utf-8')) : [];
-      const crossRefPath = join(dataDir, `bot-openids-${appId}.json`);
-      crossRef = existsSync(crossRefPath)
-        ? JSON.parse(readFileSync(crossRefPath, 'utf-8'))
-        : {};
       // --no-mention 显式不 @ 任何人：跳过正文 @BotName 的自动注入，否则正文里
       // 出现的 @名字 仍会被注入成 <at>，破坏 --no-mention 语义、还可能误触发对方
       // bot（正是要避免的循环 @）。botEntries/crossRef 仍需加载供 footer 寻址用。
@@ -8465,22 +8526,19 @@ async function cmdDispatch(rest: string[]): Promise<void> {
 }
 
 /**
- * `botmux report` — a dispatched sub-bot reports progress/completion back to the
- * orchestrator that dispatched it.
+ * `botmux report` — delivery / progress report.
  *
- * In 多话题协作模式 the sub-bot lives in its own sub-topic, where the orchestrator
- * has no session; @-ing the orchestrator there would spawn a fresh, context-less
- * one (the reported #1 bug). Instead this routes the report INTO the orchestrator's own
- * thread (recorded by `botmux dispatch` in orchestrate-dispatch.json) and @-s the
- * orchestrator there, so its existing, context-rich session is the one that wakes.
- *
- * Coords: orchestrator open_id = the sub-bot session's quoteTargetSenderOpenId
- * (the dispatcher of the turn that opened this sub-topic); orchestrator thread =
- * the registry entry keyed by this sub-bot's session.rootMessageId (== the seed).
+ * Two paths:
+ * 1) Platform Issue 领取群：session 有活跃 issue binding → enqueue+write `in_review`
+ *    (待验收). This is what kickoff means by 「完成后执行 botmux report」.
+ * 2) 多话题协作：dispatched sub-bot reports back to the orchestrator session.
+ *    The sub-bot lives in its own sub-topic where the orchestrator has no session;
+ *    @-ing the orchestrator there would spawn a fresh context-less one. Instead this
+ *    routes INTO the orchestrator's thread (orchestrate-dispatch.json) and @-s it there.
  */
 async function cmdReport(rest: string[]): Promise<void> {
   if (rest.includes('--help') || rest.includes('-h')) {
-    console.log(`botmux report — 把子项目进展/完成回报给派活的主编排会话
+    console.log(`botmux report — 交付回报（issue 待验收 / 多话题协作回主编排）
 
 用法:
   botmux report "子项目X 完成，产出在 …"
@@ -8488,9 +8546,10 @@ async function cmdReport(rest: string[]): Promise<void> {
   botmux report --content-file <path>
 
 说明:
-  「多话题协作模式」里你（子 bot）干完后不要在本话题 @ 主bot——本话题没有主bot的会话，
-  @ 会另起一个无上下文的新会话。本命令把回报发回主编排会话所在的话题、并 @ 主编排 bot，
-  使其带完整上下文继续聚合。仅在被 botmux dispatch 派活的子项目会话里可用。
+  1) 平台 Issue 领取群：本会话绑定了平台 issue 时，把 issue 推到「待验收」(in_review)。
+     kickoff 里「完成后执行 botmux report」指的就是这条路径。
+  2) 多话题协作：被 botmux dispatch 派活的子话题里，把回报发回主编排会话并 @ 主 bot
+     （不要在子话题里 @ 主 bot——会另起无上下文会话）。
 
 选项:
   --content-file <path>  从文件读取回报内容
@@ -8528,13 +8587,98 @@ async function cmdReport(rest: string[]): Promise<void> {
 
   const sid = sessionIdArg ?? findAncestorSessionId();
   if (!sid) {
-    console.error('无法推断 session-id。请在被 dispatch 派活的会话里运行，或传 --session-id <id>。');
+    console.error('无法推断 session-id。请在 issue 领取群 / 被 dispatch 派活的会话里运行，或传 --session-id <id>。');
     process.exit(1);
   }
   const sessions = loadSessions();
   const s = sessions.get(sid);
   if (!s) { console.error(`未找到 session ${sid}`); process.exit(1); }
   if (!s.larkAppId) { console.error(`session ${sid} 缺少 larkAppId`); process.exit(1); }
+
+  // ── Issue Board 交付：绑定了平台 issue 的领取群 → 推 in_review（待验收）────────
+  // 优先于 dispatch 路径：领取群没有 creatorOpenId，走 dispatch 会硬失败。
+  // 显式 --dispatch-root 时仍走协作回报（避免 issue 群里误 dispatch 被静默改道）。
+  if (!explicitDispatchRoot) {
+    try {
+      const dataDir = resolveDataDir();
+      const { findActiveBindingForSession, reportIssueInReview } = await import('./services/issue-report.js');
+      const binding = findActiveBindingForSession(dataDir, {
+        chatId: s.chatId,
+        rootMessageId: s.rootMessageId,
+      });
+      if (binding) {
+        const { writeIssueStatus, findIssueById } = await import('./platform/issue-client.js');
+        const result = await reportIssueInReview(
+          {
+            dataDir,
+            writeStatus: (issueId, args) => writeIssueStatus(issueId, args) as any,
+            fetchIssue: (teamId, issueId) => findIssueById(teamId, issueId),
+          },
+          binding.anchorId,
+        );
+        if (!result.ok) {
+          if (result.reason === 'platform') {
+            console.error(
+              result.permanent
+                ? `issue 交付失败（${result.detail}）。平台明确拒绝，重试不会好转——去平台看看这条任务还在不在、领取有没有被收回。`
+                : `issue 交付失败（${result.detail}）。可稍后重试同一 botmux report。`,
+            );
+          } else if (result.reason === 'detached') {
+            // 重试没有意义：平台上这条 claim 已经不是本机的了。
+            console.error(
+              `issue 交付失败：平台上这个任务的领取已不属于本机（被回收、租约过期或已被别人领走），`
+              + `交付没有落地。去平台看看任务 ${binding.issueId} 的状态。`,
+            );
+          } else {
+            console.error(`issue 交付失败：${result.reason}`);
+          }
+          process.exit(1);
+        }
+        // 交付说明必须发回群里：平台的 /status 只收状态、不收正文（没有 note 字段），
+        // 这段文字在平台上无处可放。不发的话验收的人只看到状态变成「待验收」，完全不知道
+        // 交付了什么，而 stdout 只有 agent 自己看得到。
+        let delivered = false;
+        try {
+          const { registerBot, loadBotConfigs } = await import('./bot-registry.js');
+          await registerSelfFromCredFile();
+          try { for (const cfg of loadBotConfigs()) registerBot(cfg); } catch { /* 已注册/读不到 */ }
+          const { buildIssueDeliveryCard } = await import('./im/lark/issue-card.js');
+          const { issueDetailUrl } = await import('./services/issue-claim-flow.js');
+          const { sendMessage: larkSend } = await import('./im/lark/client.js');
+          const url = issueDetailUrl(binding.platformBaseUrl, result.issueId);
+          await larkSend(
+            s.larkAppId!,
+            binding.chatId ?? binding.anchorId,
+            buildIssueDeliveryCard({
+              issueId: result.issueId,
+              report: content,
+              alreadyInReview: result.alreadyInReview,
+              ...(url ? { issueUrl: url } : {}),
+            }),
+            'interactive',
+          );
+          delivered = true;
+        } catch (e: any) {
+          // 状态已经写成功了，播报失败不该让整条命令失败——但要如实说出来，
+          // 否则 agent 以为交付说明已经送达。
+          console.error(`交付说明未能发回群里（状态已是待验收）：${e?.message ?? e}`);
+        }
+        console.log(JSON.stringify({
+          success: true,
+          delivery: 'issue-in-review',
+          issueId: result.issueId,
+          anchorId: binding.anchorId,
+          alreadyInReview: result.alreadyInReview,
+          reportPostedToChat: delivered,
+          reportPreview: content.trim().slice(0, 200),
+        }));
+        return;
+      }
+    } catch (err: any) {
+      console.error(`issue 交付异常: ${err?.message ?? err}`);
+      process.exit(1);
+    }
+  }
 
   // Resolve where the report goes + who to @. Same-machine: the dispatch registry
   // (keyed by this sub-bot's thread root) carries the orchestrator's exact coords.

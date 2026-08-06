@@ -805,6 +805,8 @@ function setupBotState(opts?: {
 	  chatReplyModes?: Record<string, 'chat' | 'new-topic' | 'shared' | 'chat-topic'>;
 	  p2pMode?: 'thread' | 'chat';
 	  summaryRange?: { limit?: number; sinceHours?: number };
+	  summaryMemory?: boolean;
+	  summaryMemoryPath?: string;
 	  substituteMode?: {
 	    enabled: boolean;
 	    targets: Array<{ openId?: string; userId?: string; unionId?: string; name?: string }>;
@@ -835,6 +837,8 @@ function setupBotState(opts?: {
 	      chatReplyModes: opts?.chatReplyModes,
 	      p2pMode: opts?.p2pMode,
 	      summaryRange: opts?.summaryRange,
+	      summaryMemory: opts?.summaryMemory,
+	      summaryMemoryPath: opts?.summaryMemoryPath,
 	      substituteMode: opts?.substituteMode,
 	    },
     botOpenId: opts && 'botOpenId' in opts ? opts.botOpenId : MY_OPEN_ID,
@@ -942,6 +946,7 @@ function makeHistoryMessage(opts: {
   senderOpenId?: string;
   senderAppId?: string;
   senderType?: string;
+  senderOpenBotId?: string;
   content: string;
   rootId?: string;
   threadId?: string;
@@ -963,6 +968,9 @@ function makeHistoryMessage(opts: {
       id: opts.senderOpenId ?? opts.senderAppId,
       id_type: opts.senderAppId && !opts.senderOpenId ? 'app_id' : 'open_id',
       sender_type: opts.senderType ?? (opts.senderAppId ? 'app' : 'user'),
+      // with_sender_name=true: Lark returns the bot's per-app open_id here even
+      // though id/id_type still describe the app_id form.
+      ...(opts.senderOpenBotId ? { open_bot_id: opts.senderOpenBotId } : {}),
     },
   };
 }
@@ -1670,6 +1678,49 @@ describe('message listener polling backfill', () => {
       expect.objectContaining({ message: expect.objectContaining({ message_id: 'msg-polled-resolved' }) }),
       expect.objectContaining({ messageListener: expect.objectContaining({ msgType: 'interactive' }) }),
     );
+  });
+
+  it('routes a third-party bot resolved via open_bot_id into the open_id slot (not app_id) on the polled path', async () => {
+    // The core downstream contract: message-parser / handleNewTopic read
+    // sender_id.open_id ONLY. A bot whose history row is app_id form but carries
+    // open_bot_id must arrive with its ou_ in the open_id slot, sender_type
+    // still 'app'. Putting it in app_id would drop the identity downstream
+    // (senderId '', no owner, no --mention-back target).
+    setupBotState({
+      allowedUsers: [USER_OPEN_ID],
+      messageListeners: {
+        chat_listener: {
+          enabled: true,
+          prompt: '监听所有 bot',
+          senderPolicy: { mode: 'all_except_excluded', includeSenderTypes: ['bot'] },
+          messagePolicy: { includeMsgTypes: ['interactive'], scope: 'top_level' },
+          replyPolicy: { mode: 'thread', sessionMode: 'per_message' },
+        },
+      },
+    });
+    handlers = makeHandlers();
+    const card = makeHistoryMessage({
+      senderAppId: 'cli_argos',
+      senderOpenBotId: 'ou_argos_open',
+      senderType: 'app',
+      messageType: 'interactive',
+      messageId: 'msg-openbotid',
+      chatId: 'chat_listener',
+      content: JSON.stringify({ title: 'Argos平台报警', elements: [[{ tag: 'text', text: 'x' }]] }),
+      createTime: String(Date.now()),
+    });
+    mockListChatMessagesUntil.mockResolvedValueOnce([card]);
+
+    await __pollMessageListenersOnceForTest(MY_APP_ID, handlers);
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).toHaveBeenCalledTimes(1);
+    const [dispatchedData] = handlers.handleNewTopic.mock.calls[0];
+    expect(dispatchedData.sender.sender_id.open_id).toBe('ou_argos_open');
+    expect(dispatchedData.sender.sender_id.app_id).toBeUndefined();
+    // sender_type stays 'app' so quota/talk gates + foreign-bot owner
+    // suppression still recognise it as a bot.
+    expect(dispatchedData.sender.sender_type).toBe('app');
   });
 
   it('fails closed on the polled path for an unresolvable third-party bot excluded by open_id', async () => {
@@ -5893,6 +5944,62 @@ describe('im.message.receive_v1 — /summary command', () => {
     const ctx = handlers.handleNewTopic.mock.calls[0][1] as any;
     expect(ctx.promptOverride).toContain('很久以前的消息');
     expect(ctx.promptOverride).toContain('最近消息');
+  });
+
+  it('adds project summary.md memory instructions and explicit command boundary when enabled', async () => {
+    setupBotState({
+      allowedUsers: [USER_OPEN_ID],
+      summaryRange: { limit: 0, sinceHours: 0 },
+      summaryMemory: true,
+      summaryMemoryPath: '/tmp/botmux-summary.md',
+    });
+    const triggerMs = 100 * 60 * 60_000;
+    mockListChatMessagesUntil.mockResolvedValue([
+      {
+        message_id: 'before-boundary',
+        msg_type: 'text',
+        body: { content: JSON.stringify({ text: '边界前不该写入 summary.md 的旧内容' }) },
+        sender: { id: 'ou_old', sender_type: 'user' },
+        create_time: String(triggerMs - 3 * 60 * 60_000),
+      },
+      {
+        message_id: 'boundary',
+        msg_type: 'text',
+        body: { content: JSON.stringify({ text: '从 start_pipeline 报错开始' }) },
+        sender: { id: 'ou_boundary', sender_type: 'user' },
+        create_time: String(triggerMs - 2 * 60 * 60_000),
+      },
+      {
+        message_id: 'incident',
+        msg_type: 'text',
+        body: { content: JSON.stringify({ text: 'PSM ad.qa.demo 在 PPE 节点 start_pipeline 报错' }) },
+        sender: { id: 'ou_fresh', sender_type: 'user' },
+        create_time: String(triggerMs - 60 * 60_000),
+      },
+    ]);
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@_bot_a /summary 从 start_pipeline 报错开始' }),
+      mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+      messageId: 'msg-summary-memory',
+      chatId: 'chat-summary-memory',
+      chatType: 'group',
+    });
+    (event.message as any).create_time = String(triggerMs);
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    const ctx = handlers.handleNewTopic.mock.calls[0][1] as any;
+    expect(ctx.promptOverride).toContain('summary_memory="true"');
+    expect(ctx.promptOverride).toContain('summary_memory_path="/tmp/botmux-summary.md"');
+    expect(ctx.promptOverride).toContain('window="explicit-boundary"');
+    expect(ctx.promptOverride).toContain('<explicit_boundary>');
+    expect(ctx.promptOverride).toContain('从 start_pipeline 报错开始');
+    expect(ctx.promptOverride).not.toContain('边界前不该写入');
+    expect(ctx.promptOverride).toContain('只允许创建或追加 /tmp/botmux-summary.md');
+    expect(ctx.promptOverride).toContain('实际追加到 /tmp/botmux-summary.md 的 Markdown 原样发给用户确认');
+    expect(ctx.promptOverride).toContain('不能擅自扩展范围');
   });
 
   it('summarizes regular group history after the previous @this bot /summary', async () => {

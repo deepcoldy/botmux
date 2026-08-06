@@ -21,6 +21,43 @@ afterEach(() => {
 });
 
 describe('v3 ephemeral pool', () => {
+  it('honors the host-neutral attempt lease before resolving credentials or spawning', async () => {
+    const worker = new ScriptedWorker();
+    const factory = factoryFor(worker);
+    const controller = new AbortController();
+    controller.abort('lease-cancelled');
+    const req = request();
+    req.attemptLease = { attemptId: req.attemptId, signal: controller.signal };
+    const pool = createEphemeralPool({
+      factory,
+      workerPath: '/tmp/worker.js',
+      resolveLarkAppSecret: () => {
+        throw new Error('must not resolve credentials for an aborted lease');
+      },
+    });
+
+    await expect(pool.runNode(req)).resolves.toMatchObject({
+      status: 'cancelled',
+      cancelReason: 'lease-cancelled',
+    });
+    expect(factory.lastOpts).toBeUndefined();
+  });
+
+  it('rejects an attempt lease whose durable id disagrees with the request', async () => {
+    const req = request();
+    req.attemptLease = {
+      attemptId: 'different/attempts/001',
+      signal: new AbortController().signal,
+    };
+    const pool = createEphemeralPool({
+      factory: factoryFor(new ScriptedWorker()),
+      workerPath: '/tmp/worker.js',
+      resolveLarkAppSecret: () => 'secret',
+    });
+
+    await expect(pool.runNode(req)).rejects.toThrow(/attempt lease .* does not match request/);
+  });
+
   it('spawns a goal-mode worker with frozen bot snapshot and resolves after final_output', async () => {
     const worker = new ScriptedWorker();
     const factory = factoryFor(worker);

@@ -37,6 +37,9 @@ vi.mock('../src/im/lark/card-builder.js', () => ({
     type: 'streaming',
     readUrl: args[2],
     localCliReady: args[15] === true,
+    // Signature tail after the master merge: 15 localCliReady, 16 usage,
+    // 17 runtimeDisplayName, 18 serviceTierBadge.
+    serviceTierBadge: args[18],
   })),
   buildSessionCard: vi.fn(() => '{"type":"session"}'),
   buildTuiPromptCard: vi.fn(() => '{}'),
@@ -222,6 +225,105 @@ describe('Worker ready: set_display_mode re-sync', () => {
       agentName: 'botmux-sid-read',
     });
     expect(sessionStore.updateSession).toHaveBeenCalledWith(ds.session);
+  });
+
+  it('patches a static Codex card when executor tier changes without a screen update', async () => {
+    const fakeWorker = makeFakeWorker();
+    const ds = makeDs({
+      worker: fakeWorker,
+      workerPort: 9999,
+      streamCardId: 'om_static_card',
+      streamCardPending: false,
+    });
+    ds.session.cliId = 'codex';
+
+    __testOnly_setupWorkerHandlers(ds, fakeWorker);
+    fakeWorker.emit('message', {
+      type: 'codex_service_tier',
+      snapshot: {
+        model: 'gpt-5.6-sol', serviceTier: 'priority', nonDefault: true,
+      },
+    });
+    await flush();
+    expect(ds.codexServiceTier?.nonDefault).toBe(true);
+    expect(JSON.parse(updateMessageMock.mock.calls.at(-1)![2])).toMatchObject({ serviceTierBadge: '⚡ priority' });
+
+    fakeWorker.emit('message', {
+      type: 'codex_service_tier',
+      snapshot: {
+        model: 'gpt-5.6-sol', serviceTier: 'default', nonDefault: false,
+      },
+    });
+    await flush();
+    expect(ds.codexServiceTier?.nonDefault).toBe(false);
+    expect(JSON.parse(updateMessageMock.mock.calls.at(-1)![2]).serviceTierBadge).toBeUndefined();
+  });
+
+  it('clears tier state at worker-generation setup and ignores stale-worker updates', async () => {
+    const staleWorker = makeFakeWorker();
+    const replacement = makeFakeWorker();
+    const ds = makeDs({
+      worker: staleWorker,
+      workerPort: 9999,
+      streamCardId: 'om_static_card',
+      codexServiceTier: {
+        model: 'gpt-5.6-sol', serviceTier: 'priority', nonDefault: true,
+      },
+    });
+    ds.session.cliId = 'claude-code';
+
+    __testOnly_setupWorkerHandlers(ds, staleWorker);
+    expect(ds.codexServiceTier).toBeUndefined();
+    ds.worker = replacement;
+    staleWorker.emit('message', {
+      type: 'codex_service_tier',
+      snapshot: {
+        model: 'gpt-5.6-sol', serviceTier: 'priority', nonDefault: true,
+      },
+    });
+    await flush();
+
+    expect(ds.codexServiceTier).toBeUndefined();
+    expect(updateMessageMock).not.toHaveBeenCalled();
+  });
+
+  it('does not rewrite a frozen card when teardown clears the live tier', async () => {
+    const fakeWorker = makeFakeWorker();
+    const ds = makeDs({
+      worker: fakeWorker,
+      workerPort: 9999,
+      streamCardId: 'om_frozen_card',
+      streamCardNonce: 'nonce_frozen',
+      parkedStreamCardNonce: 'nonce_frozen',
+    });
+    ds.session.cliId = 'codex';
+
+    __testOnly_setupWorkerHandlers(ds, fakeWorker);
+    updateMessageMock.mockClear();
+    fakeWorker.emit('message', { type: 'codex_service_tier', snapshot: null });
+    await flush();
+
+    expect(ds.codexServiceTier).toBeUndefined();
+    expect(updateMessageMock).not.toHaveBeenCalled();
+  });
+
+  it('does not retain a pending tier refresh when no live card exists', async () => {
+    const fakeWorker = makeFakeWorker();
+    const ds = makeDs({ worker: fakeWorker, workerPort: null, streamCardId: undefined });
+    ds.session.cliId = 'codex';
+
+    __testOnly_setupWorkerHandlers(ds, fakeWorker);
+    ds.pendingCodexTierCardRefresh = true;
+    fakeWorker.emit('message', {
+      type: 'codex_service_tier',
+      snapshot: {
+        model: 'gpt-5.6-sol', serviceTier: 'priority', nonDefault: true,
+      },
+    });
+    await flush();
+
+    expect(ds.pendingCodexTierCardRefresh).toBeUndefined();
+    expect(updateMessageMock).not.toHaveBeenCalled();
   });
 
   it('POST path forwards ready.turnId to sessionReply for initial alias cards', async () => {

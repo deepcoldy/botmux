@@ -8,7 +8,7 @@ import { ProxyAgent } from 'proxy-agent';
 import { readFileSync, mkdirSync, existsSync } from 'node:fs';
 import { atomicWriteFileSync } from '../../utils/atomic-write.js';
 import { join } from 'node:path';
-import { getBot, getAllBots, findOncallChat, getOwnerOpenId, type BotState } from '../../bot-registry.js';
+import { getBot, getAllBots, findOncallChat, getOwnerOpenId, loadBotConfigs, type BotState } from '../../bot-registry.js';
 import { config, isVcMeetingAgentGloballyEnabled, vcMeetingAgentGlobalListenerBotAppId } from '../../config.js';
 import { getChatInfo, getChatMode, getCachedChatMode, getUserProfile, listChatMessagesUntil, resolveSiblingBotBySenderOpenId, replyMessage, sendMessage, sendUserMessage, isHumanOpenId, updateMessage } from './client.js';
 import { logger } from '../../utils/logger.js';
@@ -21,7 +21,7 @@ import { recordObservedBots, listObservedBots } from '../../services/observed-bo
 import { isTeamBot, recordTeamBot } from '../../services/team-bots-store.js';
 import { isTeamGroupChat } from '../../services/team-groups-store.js';
 import { isPlatformTeamBot, isPlatformHallChat, isPlatformTeamMemberChat } from '../../services/platform-team-store.js';
-import { recordBotUnionId, recordBotUnionIdFromMentions } from '../../services/bot-union-ids-store.js';
+import { getBotUnionId, recordBotUnionId, recordBotUnionIdFromMentions } from '../../services/bot-union-ids-store.js';
 import { getDocSubscription, putDocSubscription, removeDocSubscription, listAllDocSubscriptions, type DocSubscription } from '../../services/doc-subs-store.js';
 import { getDocComment, isBotAuthoredReply, hasBotSentinel, commentTriggerAllowed, BOT_REPLY_SENTINEL } from './doc-comment.js';
 import {
@@ -829,6 +829,40 @@ export function isKnownPeerBot(dataDir: string, larkAppId: string, senderOpenId:
 }
 
 /**
+ * Auth-grade local sibling check for the narrow `/repo` exception.
+ *
+ * Cross-ref proves only "this receiver has seen this sender open_id as some
+ * peer" and may be stale or name-poisoned. For authorization we additionally
+ * require the Lark-stamped sender union_id to match exactly one currently
+ * configured, transport-enabled sibling app's learned own union_id.
+ */
+export function isVerifiedLocalSiblingBot(
+  dataDir: string,
+  larkAppId: string,
+  senderOpenId: string | undefined,
+  senderUnionId: string | undefined,
+): boolean {
+  const openId = (senderOpenId ?? '').trim();
+  const unionId = (senderUnionId ?? '').trim();
+  if (!openId || !unionId) return false;
+
+  if (!isKnownPeerBot(dataDir, larkAppId, openId)) return false;
+
+  let matchingConfiguredSiblings = 0;
+  try {
+    for (const cfg of loadBotConfigs()) {
+      const appId = (cfg.larkAppId ?? '').trim();
+      if (!appId || appId === larkAppId || cfg.apiOnly === true) continue;
+      if (getBotUnionId(dataDir, appId) === unionId) matchingConfiguredSiblings += 1;
+      if (matchingConfiguredSiblings > 1) return false;
+    }
+  } catch {
+    return false;
+  }
+  return matchingConfiguredSiblings === 1;
+}
+
+/**
  * Should a FOREIGN bot sender be trusted to collaborate (route/spawn a session)
  * WITHOUT `/grant`, because it's a teammate? Two trust sources, both rooted in
  * tenant-stable identity or team-controlled group membership — never a name:
@@ -1512,6 +1546,10 @@ export function canOperate(
  * union_id 的情况）；否则「团队拉群里外部 bot 能 talk 却执行不了降权到 canTalk 的命令
  * （如 /status）」——单一 talk 谓词在这道 daemon 命令闸继续分叉。不传（人的路径）→
  * 原样走 canTalk / evaluateTalk，语义不变。canOperate 那段人/bot 通用，不受影响。
+ *
+ * `/repo` 另有一个更窄的同部署 sibling bot 例外：仅当飞书事件把发送方盖章为 bot，
+ * receiver cross-ref 命中 sender open_id，且 sender union_id 精确匹配当前仍配置的唯一
+ * 本机 sibling app 已学习的自身 union_id 时放行；不把 sibling 提升为 canOperate，也不把其他 daemon 命令降权。
  */
 export function canRunDaemonCommand(
   larkAppId: string,
@@ -1522,8 +1560,13 @@ export function canRunDaemonCommand(
   memberUnionId?: string | undefined,
   chatType?: 'p2p' | 'group',
   botSender?: boolean,
+  larkStampedBotSender?: boolean,
 ): boolean {
   if (canOperate(larkAppId, chatId, senderOpenId, senderUnionId)) return true;
+  if (cmd === '/repo' && larkStampedBotSender === true
+    && isVerifiedLocalSiblingBot(config.session.dataDir, larkAppId, senderOpenId, senderUnionId)) {
+    return true;
+  }
   const list = getBot(larkAppId).config.canTalkDaemonCommands;
   if (!list?.includes(cmd)) return false;
   return botSender
@@ -1735,12 +1778,20 @@ function historyMessageSender(message: any): {
   senderIdType?: string;
 } {
   const sender = message?.sender ?? {};
-  const senderId = sender.id ?? sender.open_id ?? sender.user_id ?? sender.app_id
+  // A bot sender is reported by app_id (cli_) in `sender.id`, but with
+  // `with_sender_name=true` (which listChatMessagesUntil always sets) Lark also
+  // returns `sender.open_bot_id` — the bot's per-app open_id, IDENTICAL to what
+  // /members/bots reports and to what the dashboard bot-picker stores. Prefer it
+  // so a third-party bot resolves to the same ou_ the include/exclude lists use
+  // (otherwise it stays an unresolvable cli_ and never matches an open_id list).
+  const senderId = sender.open_bot_id ?? sender.id ?? sender.open_id ?? sender.user_id ?? sender.app_id
     ?? message?.sender_id?.open_id ?? message?.sender_id?.user_id ?? message?.sender_id?.app_id;
-  const senderIdType = sender.id_type ?? sender.sender_id_type;
+  const rawIdType = sender.id_type ?? sender.sender_id_type;
+  // open_bot_id is an open_id even though the row's id_type still says app_id.
+  const senderIdType = sender.open_bot_id ? 'open_id' : rawIdType;
   const inferredType = sender.sender_type
     ?? message?.sender_type
-    ?? (senderIdType === 'app_id' ? 'app' : undefined);
+    ?? (rawIdType === 'app_id' ? 'app' : undefined);
   return {
     senderOpenId: typeof senderId === 'string' ? senderId : undefined,
     senderTypeRaw: typeof inferredType === 'string' ? inferredType : undefined,
@@ -1750,7 +1801,16 @@ function historyMessageSender(message: any): {
 
 function larkReceiveEventFromHistoryMessage(message: any, chatId: string): any {
   const { senderOpenId, senderTypeRaw, senderIdType } = historyMessageSender(message);
-  const isAppId = senderIdType === 'app_id' || senderTypeRaw === 'app' || senderTypeRaw === 'bot';
+  // sender_type and the ID DOMAIN are independent axes. A bot sender keeps
+  // sender_type='app', but when we resolved its identity to an open_id (via
+  // sender.open_bot_id, senderIdType==='open_id'), the value MUST go in the
+  // open_id slot — the whole downstream chain (message-parser senderId,
+  // handleNewTopic owner/quote target, --mention-back) reads sender_id.open_id
+  // ONLY. Putting an ou_ into { app_id } both mislabels the field and drops the
+  // identity (senderId becomes ''). Choose the key by domain, not by type.
+  const isBotSenderType = senderIdType === 'app_id' || senderTypeRaw === 'app' || senderTypeRaw === 'bot';
+  const isOpenIdDomain = senderIdType === 'open_id'
+    || (typeof senderOpenId === 'string' && senderOpenId.startsWith('ou_'));
   return {
     message: {
       ...message,
@@ -1759,10 +1819,14 @@ function larkReceiveEventFromHistoryMessage(message: any, chatId: string): any {
       chat_type: message?.chat_type ?? 'group',
     },
     sender: {
-      sender_type: senderTypeRaw ?? (isAppId ? 'app' : 'user'),
-      sender_id: isAppId
-        ? { app_id: senderOpenId }
-        : { open_id: senderOpenId },
+      // Preserve the bot sender_type (talk/quota gates and foreign-bot owner
+      // suppression key off it) even when the id itself is an open_id.
+      sender_type: senderTypeRaw ?? (isBotSenderType ? 'app' : 'user'),
+      sender_id: isOpenIdDomain
+        ? { open_id: senderOpenId }
+        : isBotSenderType
+          ? { app_id: senderOpenId }
+          : { open_id: senderOpenId },
     },
   };
 }
@@ -2279,11 +2343,16 @@ async function resolveSummaryCommandMatch(input: {
   if (!triggerText) return undefined;
   const chatKind = await classifySummaryChatKind(input);
   if (!chatKind) return undefined;
+  const botConfig = getBot(input.larkAppId).config;
   return {
     chatKind,
     triggerText,
-    range: summaryRangeFromBotConfig(getBot(input.larkAppId).config),
+    range: summaryRangeFromBotConfig(botConfig),
     prompt: DEFAULT_SUMMARY_PROMPT,
+    summaryMemory: botConfig.summaryMemory === true,
+    summaryMemoryPath: typeof botConfig.summaryMemoryPath === 'string' && botConfig.summaryMemoryPath.trim()
+      ? botConfig.summaryMemoryPath.trim()
+      : 'summary.md',
   };
 }
 

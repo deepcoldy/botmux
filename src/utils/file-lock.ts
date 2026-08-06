@@ -38,7 +38,10 @@ import {
 } from 'node:fs';
 import { createHash, randomUUID } from 'node:crypto';
 import { basename, dirname, join } from 'node:path';
-import { readLinuxBootIdentity, readProcessStartIdentity } from '../core/session-marker.js';
+import {
+  readLinuxBootIdentity,
+  readProcessStartIdentity,
+} from './process-identity.js';
 import { logger } from './logger.js';
 
 const MAX_WAIT_MS = 5_000;

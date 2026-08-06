@@ -65,6 +65,10 @@ export interface BotCardPrefs {
   regularGroupMentionMode: 'always' | 'topic' | 'never' | 'ambient';
   /** 文档订阅新订阅默认评论触发范围（default 'mention-only'）。 */
   docSubscribeDefaultMode: 'mention-only' | 'all';
+  /** Explicit /summary records a project-local summary.md when enabled. */
+  summaryMemory: boolean;
+  /** Target path for summary memory. Relative paths resolve against the current project root. */
+  summaryMemoryPath: string;
 }
 
 /** Current card prefs for a bot (`usageDisplay` defaults to 'streaming';
@@ -88,6 +92,8 @@ export function getBotCardPrefs(larkAppId: string): BotCardPrefs {
       regularGroupMentionMode: c.regularGroupMentionMode === 'topic' || c.regularGroupMentionMode === 'never' || c.regularGroupMentionMode === 'ambient'
         ? c.regularGroupMentionMode : 'always',
       docSubscribeDefaultMode: c.docSubscribeDefaultMode === 'all' ? 'all' : 'mention-only',
+      summaryMemory: c.summaryMemory === true,
+      summaryMemoryPath: typeof c.summaryMemoryPath === 'string' && c.summaryMemoryPath.trim() ? c.summaryMemoryPath.trim() : 'summary.md',
     };
   } catch {
     return {
@@ -105,6 +111,8 @@ export function getBotCardPrefs(larkAppId: string): BotCardPrefs {
       regularGroupReplyMode: 'chat-topic',
       regularGroupMentionMode: 'always',
       docSubscribeDefaultMode: 'mention-only',
+      summaryMemory: false,
+      summaryMemoryPath: 'summary.md',
     };
   }
 }
@@ -183,6 +191,8 @@ export async function updateBotCardPrefs(
     applyMode(entry, 'regularGroupReplyMode', patch.regularGroupReplyMode);
     applyMention(entry, 'regularGroupMentionMode', patch.regularGroupMentionMode);
     applyDocMode(entry, 'docSubscribeDefaultMode', patch.docSubscribeDefaultMode);
+    apply(entry, 'summaryMemory', patch.summaryMemory);
+    applyStr(entry, 'summaryMemoryPath', patch.summaryMemoryPath);
     return {
       write: true,
       result: {
@@ -204,6 +214,8 @@ export async function updateBotCardPrefs(
           ? entry.regularGroupMentionMode
           : 'always',
         docSubscribeDefaultMode: entry.docSubscribeDefaultMode === 'all' ? 'all' : 'mention-only',
+        summaryMemory: entry.summaryMemory === true,
+        summaryMemoryPath: typeof entry.summaryMemoryPath === 'string' && entry.summaryMemoryPath.trim() ? entry.summaryMemoryPath.trim() : 'summary.md',
       },
     };
   });
@@ -260,6 +272,12 @@ export async function updateBotCardPrefs(
   if (patch.docSubscribeDefaultMode !== undefined) {
     bot.config.docSubscribeDefaultMode = patch.docSubscribeDefaultMode === 'all' ? 'all' : undefined;
   }
+  if (patch.summaryMemory !== undefined) {
+    bot.config.summaryMemory = patch.summaryMemory || undefined;
+  }
+  if (patch.summaryMemoryPath !== undefined) {
+    bot.config.summaryMemoryPath = patch.summaryMemoryPath.trim() ? patch.summaryMemoryPath.trim() : undefined;
+  }
   logger.info(
     `[card-prefs:${larkAppId}] usageDisplay=${r.result.usageDisplay} ` +
     `disableStreamingCard=${r.result.disableStreamingCard} ` +
@@ -270,6 +288,7 @@ export async function updateBotCardPrefs(
     `autoStartOnGroupJoin=${r.result.autoStartOnGroupJoin} autoStartOnNewTopic=${r.result.autoStartOnNewTopic} ` +
     `regularGroupReplyMode=${r.result.regularGroupReplyMode} regularGroupMentionMode=${r.result.regularGroupMentionMode} ` +
     `botToBotSameDir=${r.result.botToBotSameDir} docSubscribeDefaultMode=${r.result.docSubscribeDefaultMode} ` +
+    `summaryMemory=${r.result.summaryMemory} summaryMemoryPath=${r.result.summaryMemoryPath} ` +
     `autoStartOnGroupJoinPrompt.len=${r.result.autoStartOnGroupJoinPrompt.length}`,
   );
   return { ok: true, prefs: r.result };

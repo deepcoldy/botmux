@@ -56,7 +56,7 @@ import { isValidRunId } from './ops-projection.js';
 import { readJournal } from './journal.js';
 import { materialize } from './state.js';
 import { readGrillState } from './grill-state.js';
-import { loadDag } from './dag.js';
+import { loadDag } from './dag-loader.js';
 import { validateSpec } from './spec.js';
 import { parseFrozenBotSnapshots } from './bot-resolve.js';
 
