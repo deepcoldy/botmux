@@ -45,6 +45,11 @@ import {
   type TeamGroupCreateResult,
   type TeamGroupOwnerTransferResult,
 } from './federated-group-core.js';
+import {
+  deliverFederatedDispatchReport,
+  type FederationDispatchReportInput,
+} from './federation-api.js';
+import { recordFederationDispatchRoute } from '../core/dispatch-registry.js';
 
 export interface OwnerCandidate { unionId: string; name: string }
 
@@ -196,6 +201,97 @@ function localBots(dataDir: string, live?: LiveBot[]): FederatedBot[] {
     ownerName: b.owner?.name,
     // botUnionId: not needed — 拉群 adds bots by app_id (larkAppId), see docs
   }));
+}
+
+function teamIdsForChat(dataDir: string, chatId: string): string[] {
+  return [...new Set(listTeamGroups(dataDir).filter(group => group.chatId === chatId).map(group => group.teamId))];
+}
+
+export async function registerFederatedDispatchRoute(input: {
+  dataDir: string;
+  targetChatId: string;
+  dispatchRoot: string;
+  fetcher?: Fetcher;
+}): Promise<{ registered: boolean; error?: string }> {
+  const memberships = listMemberships(input.dataDir);
+  let registered = false;
+  for (const teamId of teamIdsForChat(input.dataDir, input.targetChatId)) {
+    const remote = memberships.filter(membership => membership.teamId === teamId);
+    if (remote.length === 0) {
+      if (!getTeam(input.dataDir, teamId)) continue;
+      try {
+        await recordFederationDispatchRoute(
+          join(input.dataDir, 'orchestrate-dispatch.json'),
+          teamId,
+          input.dispatchRoot,
+          getDeploymentIdentity(input.dataDir).deploymentId,
+        );
+      } catch (error: any) {
+        return { registered: false, error: error?.message ?? 'dispatch_registry_unavailable' };
+      }
+      registered = true;
+      continue;
+    }
+    for (const membership of remote) {
+      try {
+        const response = await fetchWithTimeout(input.fetcher ?? fetch, `${membership.hubUrl}/api/federation/dispatch-route`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json', authorization: `Bearer ${membership.syncToken}` },
+          body: JSON.stringify({ dispatchRoot: input.dispatchRoot }),
+        });
+        const body = await response.json().catch(() => ({} as any));
+        if (!response.ok || body?.ok !== true) return { registered: false, error: body?.error ?? `hub_${response.status}` };
+        registered = true;
+      } catch (error) {
+        return { registered: false, error: hubError(error).error };
+      }
+    }
+    try {
+      await recordFederationDispatchRoute(
+        join(input.dataDir, 'orchestrate-dispatch.json'),
+        teamId,
+        input.dispatchRoot,
+        getDeploymentIdentity(input.dataDir).deploymentId,
+      );
+    } catch (error: any) {
+      return { registered: false, error: error?.message ?? 'dispatch_registry_unavailable' };
+    }
+  }
+  return { registered };
+}
+
+export async function submitFederatedDispatchReport(input: {
+  dataDir: string;
+  targetChatId: string;
+  report: FederationDispatchReportInput;
+  fetcher?: Fetcher;
+  proxyToDaemon?: (larkAppId: string, daemonPath: string, init: RequestInit) => Promise<Response>;
+}): Promise<{ ok: boolean; body: any }> {
+  const memberships = listMemberships(input.dataDir);
+  for (const teamId of teamIdsForChat(input.dataDir, input.targetChatId)) {
+    const remote = memberships.filter(membership => membership.teamId === teamId);
+    if (remote.length === 0 && getTeam(input.dataDir, teamId)) {
+      const result = await deliverFederatedDispatchReport(input.dataDir, teamId, input.report, input);
+      if (result.status === 404 && result.body?.error === 'route_not_found') continue;
+      return { ok: result.status >= 200 && result.status < 300 && result.body?.ok === true, body: result.body };
+    }
+    for (const membership of remote) {
+      let response: Response;
+      try {
+        response = await fetchWithTimeout(input.fetcher ?? fetch, `${membership.hubUrl}/api/federation/dispatch-report`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json', authorization: `Bearer ${membership.syncToken}` },
+          body: JSON.stringify(input.report),
+        });
+      } catch (error) {
+        return { ok: false, body: { ok: false, error: hubError(error).error } };
+      }
+      const body = await response.json().catch(() => ({ ok: false, error: `hub_${response.status}` }));
+      if (response.status === 404 && body?.error === 'route_not_found') continue;
+      return { ok: response.ok && body?.ok === true, body };
+    }
+  }
+  return { ok: false, body: { ok: false, error: 'route_not_found' } };
 }
 
 /** 上报给团队看板的会话裁剪行所需的最小字段（来源 SessionRow）。 */

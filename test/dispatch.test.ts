@@ -10,7 +10,7 @@
  * Run: pnpm vitest run test/dispatch.test.ts
  */
 import { describe, it, expect } from 'vitest';
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { findAncestorSessionContext } from '../src/core/session-marker.js';
@@ -23,6 +23,7 @@ import {
   buildDispatchMessages,
   buildRepoPrimeText,
   buildReportContent,
+  buildDispatchReportTrigger,
   findDispatchRegistryEntry,
   findSubBotTopic,
   eligibleAutoMentionAliases,
@@ -858,5 +859,68 @@ describe('botmux send turn marker context', () => {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+describe('cross-team dispatch report routing', () => {
+  const cliSource = readFileSync(join(import.meta.dirname, '../src/cli.ts'), 'utf-8');
+
+  it('本机回报通过鉴权 IPC 注入准确的主编排 Session', () => {
+    const trigger = buildDispatchReportTrigger({
+      dispatchRoot: 'om_seed',
+      report: 'done',
+      sourceSessionId: 'worker-session',
+      sourceBotAppId: 'cli_worker',
+      orchAppId: 'cli_orchestrator',
+      orchSessionId: 'orchestrator-session',
+    });
+    expect(trigger.target).toEqual({ kind: 'turn', botId: 'cli_orchestrator', sessionId: 'orchestrator-session' });
+
+    const localReport = cliSource.slice(cliSource.indexOf('if (entry?.orchAppId && entry?.orchSessionId)'));
+    expect(localReport).toContain("fetchDaemonIpc(daemon.ipcPort, '/api/trigger'");
+    expect(localReport).not.toContain("fetch(`http://127.0.0.1:${daemon.ipcPort}/api/trigger`");
+  });
+
+  it('精确 root 全部未命中时失败且不退化到群顶部', () => {
+    expect(findDispatchRegistryEntry({
+      registry: {},
+      dispatchRootId: 'om_missing',
+      rootMessageId: 'om_worker',
+    })).toBeUndefined();
+
+    const exactMiss = cliSource.slice(
+      cliSource.indexOf('if (explicitDispatchRoot && registryMatch?.key !== explicitDispatchRoot)'),
+      cliSource.indexOf('// Same-host dispatches carry the exact source session.'),
+    );
+    expect(exactMiss).toContain('submitFederatedDispatchReport');
+    expect(exactMiss).toContain('process.exit(1)');
+    expect(exactMiss).toContain('return;');
+    expect(exactMiss).not.toMatch(/sendMessage|replyMessage|resolveReportTarget/);
+  });
+
+  it('跨机器派发简报携带不可变的精确 root', () => {
+    const brief = appendDispatchReportProtocol('完成任务', 'om_seed_immutable');
+    expect(brief).toContain('botmux report --dispatch-root om_seed_immutable');
+    expect(brief).not.toMatch(/@\S+.*botmux report/);
+
+    const kickoff = cliSource.slice(
+      cliSource.indexOf('let federationRouteRegistered = false;'),
+      cliSource.indexOf('// 3. Kickoff'),
+    );
+    expect(kickoff.indexOf('registerFederatedDispatchRoute')).toBeLessThan(kickoff.indexOf('buildDispatchMessages'));
+    expect(kickoff).toContain('localExactReportRootEnabled || federationRouteRegistered');
+  });
+
+  it('保持同机派发普通非团队会话与 Issue report 行为', () => {
+    const entry = { orchChatId: 'oc_orch', orchScope: 'thread', orchRoot: 'om_orch', orchSessionId: 'sid_orch' };
+    expect(findDispatchRegistryEntry({ registry: { om_seed: entry }, rootMessageId: 'om_seed' }))
+      .toEqual({ key: 'om_seed', entry });
+    expect(resolveReportTarget({ sessionChatId: 'oc_worker', creatorOpenId: 'ou_orch' }))
+      .toEqual({ orchChatId: 'oc_worker', orchScope: 'chat', orchRoot: '', orchOpenId: 'ou_orch' });
+
+    const issuePath = cliSource.indexOf('reportIssueInReview');
+    const federationPath = cliSource.indexOf('submitFederatedDispatchReport', issuePath);
+    expect(cliSource.slice(cliSource.lastIndexOf('if (!explicitDispatchRoot)', issuePath), issuePath)).toContain('if (!explicitDispatchRoot)');
+    expect(issuePath).toBeLessThan(federationPath);
   });
 });

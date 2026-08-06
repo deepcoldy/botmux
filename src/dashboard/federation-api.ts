@@ -10,12 +10,13 @@
  * then pushes bots + pulls the aggregated roster with it. See docs/federation-design.md.
  */
 import type { IncomingMessage, ServerResponse } from 'node:http';
+import { join } from 'node:path';
 import { config } from '../config.js';
 import { jsonRes } from './http.js';
 import { consumeInvite } from '../services/invite-store.js';
 import { getTeam } from '../services/team-store.js';
 import {
-  registerDeployment, syncDeployment, getDeploymentByToken, removeDeploymentByToken,
+  registerDeployment, syncDeployment, getDeploymentByToken, removeDeploymentByToken, listFederatedDeployments,
   type FederatedBot,
 } from '../services/federation-store.js';
 import { buildFederatedRoster } from '../services/federation-roster.js';
@@ -31,6 +32,8 @@ import { findMembershipByDelegationToken } from '../services/federation-membersh
 import { buildTeamRoster, type LiveBot } from '../services/team-roster.js';
 import { getDeploymentIdentity } from '../services/deployment-identity.js';
 import {
+  fetchWithTimeout,
+  hubError,
   orchestrateFederatedGroup,
   type Fetcher,
   type TeamGroupCreateResult,
@@ -38,6 +41,12 @@ import {
 } from './federated-group-core.js';
 import { addUsersToChatByUnionId } from '../services/groups-store.js';
 import { loadBotConfigs, registerBot, getBot } from '../bot-registry.js';
+import { buildDispatchReportTrigger } from '../core/dispatch.js';
+import {
+  findFederationDispatchRoute,
+  readDispatchRegistryEntry,
+  recordFederationDispatchRoute,
+} from '../core/dispatch-registry.js';
 
 /** Ensure a Lark client exists for larkAppId in THIS (dashboard) process, which
  *  has no bot registry — register on demand from bots.json (carries the secret).
@@ -149,6 +158,90 @@ export interface FederationApiDeps {
   /** Add owners to an existing chat via one of OUR local bots (defaults to
    *  ensure-client + addUsersToChatByUnionId). Test seam. Returns the rejected ids. */
   addOwners?: (viaLarkAppId: string, chatId: string, ownerUnionIds: string[]) => Promise<{ invalidUserIds: string[] }>;
+  proxyToDaemon?: (larkAppId: string, daemonPath: string, init: RequestInit) => Promise<Response>;
+}
+
+export interface FederationDispatchReportInput {
+  dispatchRoot: string;
+  report: string;
+  sourceSessionId: string;
+  sourceBotAppId: string;
+}
+
+function reportInput(body: any): FederationDispatchReportInput | null {
+  const input = {
+    dispatchRoot: String(body?.dispatchRoot ?? '').trim(),
+    report: String(body?.report ?? '').trim(),
+    sourceSessionId: String(body?.sourceSessionId ?? '').trim(),
+    sourceBotAppId: String(body?.sourceBotAppId ?? '').trim(),
+  };
+  return /^om_[A-Za-z0-9_-]{1,128}$/.test(input.dispatchRoot)
+    && !!input.report && !!input.sourceSessionId && !!input.sourceBotAppId
+    ? input
+    : null;
+}
+
+export async function deliverFederatedDispatchReport(
+  dataDir: string,
+  teamId: string,
+  input: FederationDispatchReportInput,
+  deps: Pick<FederationApiDeps, 'fetcher' | 'proxyToDaemon'>,
+): Promise<{ status: number; body: any }> {
+  const regPath = join(dataDir, 'orchestrate-dispatch.json');
+  let route;
+  try {
+    route = findFederationDispatchRoute(regPath, teamId, input.dispatchRoot);
+  } catch {
+    return { status: 500, body: { ok: false, error: 'dispatch_registry_unavailable' } };
+  }
+  if (!route) return { status: 404, body: { ok: false, error: 'route_not_found' } };
+
+  if (route.originDeploymentId === getDeploymentIdentity(dataDir).deploymentId) {
+    let entry: any;
+    try { entry = readDispatchRegistryEntry(regPath, input.dispatchRoot); }
+    catch { return { status: 500, body: { ok: false, error: 'dispatch_registry_unavailable' } }; }
+    if (!entry?.orchAppId || !entry?.orchSessionId) {
+      return { status: 404, body: { ok: false, error: 'session_route_not_found' } };
+    }
+    if (!deps.proxyToDaemon) return { status: 503, body: { ok: false, error: 'daemon_proxy_unavailable' } };
+    let upstream: Response;
+    try {
+      upstream = await deps.proxyToDaemon(entry.orchAppId, '/api/trigger', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(buildDispatchReportTrigger({
+          ...input,
+          orchAppId: entry.orchAppId,
+          orchSessionId: entry.orchSessionId,
+          sourceName: entry.title,
+        })),
+      });
+    } catch (error: any) {
+      return { status: 502, body: { ok: false, error: error?.message ?? 'daemon_offline' } };
+    }
+    const body = await upstream.json().catch(() => ({ ok: false, error: `daemon_http_${upstream.status}` }));
+    if (body?.ok === true) body.target = { ...body.target, kind: 'turn', sessionId: entry.orchSessionId };
+    return { status: upstream.status, body };
+  }
+
+  const origin = listFederatedDeployments(dataDir, teamId)
+    .find(deployment => deployment.deploymentId === route.originDeploymentId);
+  if (!origin?.callbackUrl || !origin.delegationToken) {
+    return { status: 502, body: { ok: false, error: 'origin_deployment_unavailable' } };
+  }
+  let upstream: Response;
+  try {
+    upstream = await fetchWithTimeout(deps.fetcher ?? fetch, `${origin.callbackUrl}/api/federation/delegate-dispatch-report`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${origin.delegationToken}` },
+      body: JSON.stringify({ teamId, ...input }),
+    });
+  } catch (error) {
+    const failure = hubError(error);
+    return { status: failure.status, body: { ok: false, error: failure.error } };
+  }
+  const body = await upstream.json().catch(() => ({ ok: false, error: `origin_http_${upstream.status}` }));
+  return { status: upstream.status, body };
 }
 
 export async function handleFederationApi(
@@ -161,6 +254,85 @@ export async function handleFederationApi(
   if (!path.startsWith('/api/federation/')) return false;
   const dataDir = deps.dataDir ?? config.session.dataDir;
   const method = req.method ?? 'GET';
+
+  if (path === '/api/federation/dispatch-route' && method === 'POST') {
+    let body: any;
+    try { body = await readBody(req); } catch { jsonRes(res, 400, { ok: false, error: 'bad_json' }); return true; }
+    const token = bearerOnly(req);
+    if (!token) { jsonRes(res, 401, { ok: false, error: 'token_required' }); return true; }
+    const found = getDeploymentByToken(dataDir, token);
+    if (!found) { jsonRes(res, 403, { ok: false, error: 'unknown_token' }); return true; }
+    const dispatchRoot = String(body?.dispatchRoot ?? '').trim();
+    if (!/^om_[A-Za-z0-9_-]{1,128}$/.test(dispatchRoot)) { jsonRes(res, 400, { ok: false, error: 'bad_dispatch_root' }); return true; }
+    try {
+      await recordFederationDispatchRoute(
+        join(dataDir, 'orchestrate-dispatch.json'),
+        found.teamId,
+        dispatchRoot,
+        found.deployment.deploymentId,
+      );
+    } catch (error: any) {
+      jsonRes(res, 409, { ok: false, error: error?.message ?? 'dispatch_route_conflict' }); return true;
+    }
+    jsonRes(res, 200, { ok: true, teamId: found.teamId });
+    return true;
+  }
+
+  if (path === '/api/federation/dispatch-report' && method === 'POST') {
+    let body: any;
+    try { body = await readBody(req); } catch { jsonRes(res, 400, { ok: false, error: 'bad_json' }); return true; }
+    const token = bearerOnly(req);
+    if (!token) { jsonRes(res, 401, { ok: false, error: 'token_required' }); return true; }
+    const found = getDeploymentByToken(dataDir, token);
+    if (!found) { jsonRes(res, 403, { ok: false, error: 'unknown_token' }); return true; }
+    const input = reportInput(body);
+    if (!input) { jsonRes(res, 400, { ok: false, error: 'bad_report' }); return true; }
+    const result = await deliverFederatedDispatchReport(dataDir, found.teamId, input, deps);
+    jsonRes(res, result.status, result.body);
+    return true;
+  }
+
+  if (path === '/api/federation/delegate-dispatch-report' && method === 'POST') {
+    let body: any;
+    try { body = await readBody(req); } catch { jsonRes(res, 400, { ok: false, error: 'bad_json' }); return true; }
+    const token = bearerOnly(req);
+    if (!token) { jsonRes(res, 401, { ok: false, error: 'token_required' }); return true; }
+    const membership = findMembershipByDelegationToken(dataDir, token);
+    const teamId = String(body?.teamId ?? '').trim();
+    if (!membership || membership.teamId !== teamId) { jsonRes(res, 403, { ok: false, error: 'unknown_token' }); return true; }
+    const input = reportInput(body);
+    if (!input) { jsonRes(res, 400, { ok: false, error: 'bad_report' }); return true; }
+    let route;
+    try {
+      route = findFederationDispatchRoute(join(dataDir, 'orchestrate-dispatch.json'), membership.teamId, input.dispatchRoot);
+    } catch { jsonRes(res, 500, { ok: false, error: 'dispatch_registry_unavailable' }); return true; }
+    if (route?.originDeploymentId !== getDeploymentIdentity(dataDir).deploymentId) {
+      jsonRes(res, 404, { ok: false, error: 'route_not_found' }); return true;
+    }
+    let entry: any;
+    try { entry = readDispatchRegistryEntry(join(dataDir, 'orchestrate-dispatch.json'), input.dispatchRoot); }
+    catch { jsonRes(res, 500, { ok: false, error: 'dispatch_registry_unavailable' }); return true; }
+    if (!entry?.orchAppId || !entry?.orchSessionId) { jsonRes(res, 404, { ok: false, error: 'session_route_not_found' }); return true; }
+    if (!deps.proxyToDaemon) { jsonRes(res, 503, { ok: false, error: 'daemon_proxy_unavailable' }); return true; }
+    try {
+      const upstream = await deps.proxyToDaemon(entry.orchAppId, '/api/trigger', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(buildDispatchReportTrigger({
+          ...input,
+          orchAppId: entry.orchAppId,
+          orchSessionId: entry.orchSessionId,
+          sourceName: entry.title,
+        })),
+      });
+      const upstreamBody = await upstream.json().catch(() => ({ ok: false, error: `daemon_http_${upstream.status}` }));
+      if (upstreamBody?.ok === true) upstreamBody.target = { ...upstreamBody.target, kind: 'turn', sessionId: entry.orchSessionId };
+      jsonRes(res, upstream.status, upstreamBody);
+    } catch (error: any) {
+      jsonRes(res, 502, { ok: false, error: error?.message ?? 'daemon_offline' });
+    }
+    return true;
+  }
 
   // Spoke registers via an invite → issued a syncToken bound to the team.
   if (path === '/api/federation/join' && method === 'POST') {
