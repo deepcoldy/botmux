@@ -1280,9 +1280,19 @@ describe('handleCommand', () => {
         }),
       );
       const options = vi.mocked(forkSession).mock.calls[0][5]!;
+      expect(options).toMatchObject({
+        senderOpenId: 'ou_sender',
+        senderIsBot: false,
+      });
       expect(options.buildInitialPrompt?.('child-sess-1')).toEqual({
         content: expect.stringContaining(task),
       });
+      const initialPromptCall = vi.mocked(buildNewTopicCliInput).mock.calls.at(-1)!;
+      expect(initialPromptCall[10]).toEqual({ openId: 'ou_sender', type: 'user' });
+      const actualSessionManager = await vi.importActual<typeof import('../src/core/session-manager.js')>(
+        '../src/core/session-manager.js',
+      );
+      expect(actualSessionManager.renderSenderTag(initialPromptCall[10])).toContain('open_id="ou_sender"');
       expect(ds.session.forkChildSessionIds).toEqual(['child-sess-1']);
       expect(deps.sessionReply).toHaveBeenCalledWith(
         ROOT_ID,
@@ -1309,6 +1319,51 @@ describe('handleCommand', () => {
       );
 
       expect(result).toEqual({ ok: false, error: 'worker_busy', orphanTopic: true });
+      expect(deleteMessage).toHaveBeenCalledWith(LARK_APP_ID, 'card-msg-id');
+    });
+
+    it('turns a topic creation exception into a user-visible failure', async () => {
+      vi.mocked(sendMessage).mockRejectedValueOnce(new Error('lark unavailable'));
+      const ds = makeDaemonSession({
+        scope: 'thread',
+        lastScreenStatus: 'idle',
+        session: makeSession({ cliSessionId: 'cli-parent-1', scope: 'thread' }),
+      });
+      const deps = makeDeps(ds);
+
+      await handleCommand(
+        '/fork',
+        ROOT_ID,
+        makeLarkMessage('/fork 继续排查', { threadId: 'omt_parent' }),
+        deps,
+        LARK_APP_ID,
+      );
+
+      expect(deps.sessionReply).toHaveBeenCalledWith(
+        ROOT_ID,
+        expect.stringContaining('topic_creation_failed'),
+        undefined,
+        LARK_APP_ID,
+        'msg_001',
+      );
+      expect(deleteMessage).not.toHaveBeenCalled();
+    });
+
+    it('recalls the created topic when forkSession throws unexpectedly', async () => {
+      vi.mocked(forkSession).mockRejectedValueOnce(new Error('spawn exploded'));
+      const ds = makeDaemonSession({
+        scope: 'thread',
+        session: makeSession({ cliSessionId: 'cli-parent-1', scope: 'thread' }),
+      });
+
+      const result = await startForkSubtopicSession(
+        '继续排查',
+        ds,
+        makeLarkMessage('/fork 继续排查', { threadId: 'omt_parent' }),
+        LARK_APP_ID,
+      );
+
+      expect(result).toEqual({ ok: false, error: 'fork_subtopic_failed', orphanTopic: false });
       expect(deleteMessage).toHaveBeenCalledWith(LARK_APP_ID, 'card-msg-id');
     });
   });

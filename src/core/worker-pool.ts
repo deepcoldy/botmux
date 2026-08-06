@@ -3703,7 +3703,7 @@ export async function transferSession(
  *  byte-level fork we can reproduce — they are refused. Riff / other pure-remote
  *  backends have no local rollout to fork either. */
 const FORK_CAPABLE_CLI_IDS: ReadonlySet<CliId> = new Set<CliId>([
-  'claude-code', 'seed', 'relay', 'aiden', 'codex',
+  'claude-code', 'seed', 'relay', 'codex',
 ]);
 
 /** True when this session can be byte-level forked via a CLI-native primitive.
@@ -3763,6 +3763,8 @@ export async function forkSession(
     larkThreadId?: string;
     buildInitialPrompt?: (childSessionId: string) => string | CliTurnPayload;
     turnId?: string;
+    senderOpenId?: string;
+    senderIsBot?: boolean;
   },
 ): Promise<{ ok: true; childSessionId: string } | { ok: false; error: string }> {
   if ((targetChatType as string) !== 'group' && (targetChatType as string) !== 'p2p') {
@@ -3831,6 +3833,10 @@ export async function forkSession(
   childSession.forkedFrom = ds.session.sessionId;
   childSession.forkTaskText = opts?.forkTaskText;
   childSession.larkThreadId = opts?.larkThreadId;
+  childSession.lastCallerOpenId = opts?.senderOpenId;
+  childSession.quoteTargetId = opts?.turnId;
+  childSession.quoteTargetSenderOpenId = opts?.senderOpenId;
+  childSession.quoteTargetSenderIsBot = opts?.senderIsBot;
   childSession.pendingForkSession = true;
   childSession.cliSessionId = srcCliSessionId;
   childSession.cliId = ds.session.cliId;
@@ -3875,6 +3881,9 @@ export async function forkSession(
   childSession.sandboxNetwork = ds.session.sandboxNetwork;
   childSession.model = ds.session.model;
   childSession.reasoningEffort = ds.session.reasoningEffort;
+  childSession.cliRuntime = ds.session.cliRuntime
+    ? { ...ds.session.cliRuntime, update: { ...ds.session.cliRuntime.update } }
+    : undefined;
   childSession.cliPathOverride = ds.session.cliPathOverride;
   childSession.wrapperCli = ds.session.wrapperCli;
   childSession.agentFrozen = ds.session.agentFrozen;

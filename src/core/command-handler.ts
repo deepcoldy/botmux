@@ -87,6 +87,7 @@ import {
   writeRoleProfileEntry,
 } from '../services/role-profile-store.js';
 import type { LarkMessage, DaemonToWorker } from '../types.js';
+import type { ResolvedSender } from '../im/lark/identity-cache.js';
 import { sessionKey, sessionAnchorId, markRepoCardConsumed, claimCurrentRepoCard } from './types.js';
 import type { DaemonSession } from './types.js';
 import { t, localeForBot, type Locale } from '../i18n/index.js';
@@ -4140,93 +4141,140 @@ export async function startForkSubtopicSession(
   const brand = normalizeBrand(botCfg.brand);
   const taskTitle = taskText.split(/\r?\n/).map(line => line.trim()).find(Boolean)?.slice(0, 60)
     ?? taskText.slice(0, 60);
-
-  let parentThreadId = parentSession.larkThreadId ?? message.threadId;
-  if (!parentThreadId) {
-    parentThreadId = (await getMessageThreadId(appId, parentSession.rootMessageId)) ?? undefined;
-  }
-  if (parentThreadId && parentSession.larkThreadId !== parentThreadId) {
-    parentSession.larkThreadId = parentThreadId;
-    sessionStore.updateSession(parentSession);
-  }
-  const parentLink = parentThreadId
-    ? threadAppLink(chatId, parentThreadId, brand)
-    : chatAppLink(chatId, brand);
-
   const senderIsBot = message.senderType === 'app' || message.senderType === 'bot';
-  const localeKey = loc === 'en' ? 'en_us' : 'zh_cn';
-  const seedPost = JSON.stringify({
-    [localeKey]: {
-      title: `${t('cmd.fork.badge', undefined, loc)} ${taskText.replace(/\s*\n+\s*/g, ' ').slice(0, 300)}`,
-      content: [[
-        ...(senderIsBot ? [] : [{ tag: 'at', user_id: message.senderId }]),
-        {
-          tag: 'text',
-          text: `${senderIsBot ? '' : ' '}${t('cmd.fork.seed_parent_line', { title: parentSession.title || '' }, loc)} `,
-        },
-        { tag: 'a', text: t('cmd.fork.seed_back_link', undefined, loc), href: parentLink },
-      ]],
-    },
-  });
-  const anchorId = await sendMessage(appId, chatId, seedPost, 'post');
-  const childThreadId = (await getMessageThreadId(appId, anchorId)) ?? undefined;
-
-  const childIntro = t('cmd.fork.child_intro', {
-    parentTitle: parentSession.title || '',
-    parentSessionId: parentSession.sessionId,
-    parentRootId: parentSession.rootMessageId,
-  }, loc);
-  const availableBots = await getAvailableBots(appId, chatId);
-  const childCliId = parentSession.cliId ?? botCfg.cliId;
-  const { forkSession } = await import('./worker-pool.js');
-  const forkResult = await forkSession(
-    parentSession.sessionId,
-    chatId,
-    anchorId,
-    'group',
-    'thread',
-    {
-      childTitle: `${t('cmd.fork.badge', undefined, loc)} ${taskTitle}`,
-      forkTaskText: taskText,
-      larkThreadId: childThreadId,
-      turnId: message.messageId,
-      buildInitialPrompt: childSessionId => buildNewTopicCliInput(
-        `${childIntro}\n\n${taskText}`,
-        childSessionId,
-        childCliId,
-        botCfg.cliPathOverride,
-        undefined,
-        undefined,
-        availableBots,
-        undefined,
-        { name: bot.botName, openId: bot.botOpenId },
-        loc,
-        undefined,
-        { larkAppId: appId, chatId },
-      ),
-    },
-  );
-
-  if (!forkResult.ok) {
-    const orphanTopic = !await deleteMessage(appId, anchorId);
-    return { ok: false, error: forkResult.error, orphanTopic };
-  }
-
-  if (!parentSession.forkChildSessionIds?.includes(forkResult.childSessionId)) {
-    parentSession.forkChildSessionIds = [
-      ...(parentSession.forkChildSessionIds ?? []),
-      forkResult.childSessionId,
-    ];
-    sessionStore.updateSession(parentSession);
-  }
-  await upsertForkPanelCard(parentDs, loc);
-
-  return {
-    ok: true,
-    childSessionId: forkResult.childSessionId,
-    anchorId,
-    link: childThreadId ? threadAppLink(chatId, childThreadId, brand) : chatAppLink(chatId, brand),
+  const triggerSender: ResolvedSender = {
+    openId: message.senderId,
+    type: senderIsBot ? 'bot' : 'user',
+    ...(message.senderName ? { name: message.senderName } : {}),
   };
+  let anchorId: string | undefined;
+
+  const recallAnchor = async (): Promise<boolean> => {
+    if (!anchorId) return true;
+    try {
+      return await deleteMessage(appId, anchorId);
+    } catch (err) {
+      logger.warn(
+        `[${parentSession.sessionId.substring(0, 8)}] /fork sub-topic recall failed: `
+        + `${err instanceof Error ? err.message : String(err)}`,
+      );
+      return false;
+    }
+  };
+
+  try {
+    let parentThreadId = parentSession.larkThreadId ?? message.threadId;
+    if (!parentThreadId) {
+      parentThreadId = (await getMessageThreadId(appId, parentSession.rootMessageId)) ?? undefined;
+    }
+    if (parentThreadId && parentSession.larkThreadId !== parentThreadId) {
+      parentSession.larkThreadId = parentThreadId;
+      sessionStore.updateSession(parentSession);
+    }
+    const parentLink = parentThreadId
+      ? threadAppLink(chatId, parentThreadId, brand)
+      : chatAppLink(chatId, brand);
+
+    const localeKey = loc === 'en' ? 'en_us' : 'zh_cn';
+    const seedPost = JSON.stringify({
+      [localeKey]: {
+        title: `${t('cmd.fork.badge', undefined, loc)} ${taskText.replace(/\s*\n+\s*/g, ' ').slice(0, 300)}`,
+        content: [[
+          ...(senderIsBot ? [] : [{ tag: 'at', user_id: message.senderId }]),
+          {
+            tag: 'text',
+            text: `${senderIsBot ? '' : ' '}${t('cmd.fork.seed_parent_line', { title: parentSession.title || '' }, loc)} `,
+          },
+          { tag: 'a', text: t('cmd.fork.seed_back_link', undefined, loc), href: parentLink },
+        ]],
+      },
+    });
+    anchorId = await sendMessage(appId, chatId, seedPost, 'post');
+    const childThreadId = (await getMessageThreadId(appId, anchorId)) ?? undefined;
+
+    const childIntro = t('cmd.fork.child_intro', {
+      parentTitle: parentSession.title || '',
+      parentSessionId: parentSession.sessionId,
+      parentRootId: parentSession.rootMessageId,
+    }, loc);
+    const availableBots = await getAvailableBots(appId, chatId);
+    const childCliId = parentSession.cliId ?? botCfg.cliId;
+    const { forkSession } = await import('./worker-pool.js');
+    const forkResult = await forkSession(
+      parentSession.sessionId,
+      chatId,
+      anchorId,
+      'group',
+      'thread',
+      {
+        childTitle: `${t('cmd.fork.badge', undefined, loc)} ${taskTitle}`,
+        forkTaskText: taskText,
+        larkThreadId: childThreadId,
+        turnId: message.messageId,
+        senderOpenId: triggerSender.openId,
+        senderIsBot,
+        buildInitialPrompt: childSessionId => buildNewTopicCliInput(
+          `${childIntro}\n\n${taskText}`,
+          childSessionId,
+          childCliId,
+          botCfg.cliPathOverride,
+          undefined,
+          undefined,
+          availableBots,
+          undefined,
+          { name: bot.botName, openId: bot.botOpenId },
+          loc,
+          triggerSender,
+          { larkAppId: appId, chatId },
+        ),
+      },
+    );
+
+    if (!forkResult.ok) {
+      const orphanTopic = !await recallAnchor();
+      return { ok: false, error: forkResult.error, orphanTopic };
+    }
+
+    if (!parentSession.forkChildSessionIds?.includes(forkResult.childSessionId)) {
+      parentSession.forkChildSessionIds = [
+        ...(parentSession.forkChildSessionIds ?? []),
+        forkResult.childSessionId,
+      ];
+      try {
+        sessionStore.updateSession(parentSession);
+      } catch (err) {
+        logger.warn(
+          `[${parentSession.sessionId.substring(0, 8)}] /fork parent lineage update failed: `
+          + `${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    }
+    try {
+      await upsertForkPanelCard(parentDs, loc);
+    } catch (err) {
+      logger.warn(
+        `[${parentSession.sessionId.substring(0, 8)}] /fork panel refresh failed: `
+        + `${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+
+    return {
+      ok: true,
+      childSessionId: forkResult.childSessionId,
+      anchorId,
+      link: childThreadId ? threadAppLink(chatId, childThreadId, brand) : chatAppLink(chatId, brand),
+    };
+  } catch (err) {
+    logger.error(
+      `[${parentSession.sessionId.substring(0, 8)}] /fork sub-topic failed: `
+      + `${err instanceof Error ? err.message : String(err)}`,
+    );
+    return {
+      ok: false,
+      error: anchorId ? 'fork_subtopic_failed' : 'topic_creation_failed',
+      orphanTopic: anchorId ? !await recallAnchor() : false,
+    };
+  }
 }
 
 /** Re-post the parent session's fork panel at the bottom of the topic. Reading
