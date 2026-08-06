@@ -376,6 +376,7 @@ import { createGroupWithBots } from './services/group-creator.js';
 import { addBotToChat, isInChat } from './services/groups-store.js';
 import { initSessionGroups, isSessionGroup, getSessionGroup, touchSessionGroup } from './services/session-groups-store.js';
 import { maybeBirthSessionGroup } from './core/session-group-birth.js';
+import { scheduleSessionGroupTitle } from './services/session-group-title.js';
 import { setChatReplyMode } from './services/chat-reply-mode-store.js';
 import {
   hasVcMeetingEndedTombstone,
@@ -15857,6 +15858,16 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
   }
 
   learnFromMentions(larkAppId, parsed.mentions);
+
+  // 会话群自愈命名：出生时 AI 命名失败（CLI 抖动/超时/当时无模板）的群会停在
+  // 截断占位名——任意后续文本消息触发一次补跑（title 服务内 in-flight 去重 +
+  // titled 标记幂等），把偶发失败自动治愈，而不是永远留疤。
+  if (ctxChatType === 'group' && isSessionGroup(ctxChatId)) {
+    const sgEntry = getSessionGroup(ctxChatId);
+    if (sgEntry && !sgEntry.titled && parsed.content.trim() && !parsed.content.trim().startsWith('/')) {
+      scheduleSessionGroupTitle({ larkAppId, chatId: ctxChatId, userText: parsed.content });
+    }
+  }
 
   // Foreign bot @mention prefix: when sender is another botmux bot，把内容包成
   // [来自 X 的 @mention]\n<原文> 喂给 worker，让 CLI 知道这是另一个 bot 发的——

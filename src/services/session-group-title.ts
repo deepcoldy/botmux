@@ -31,9 +31,15 @@ const DEFAULT_MAX_LEN = 12;
 const ONE_SHOT_ARGV: Record<string, string[]> = {
   'claude-code': ['claude', '-p'],
   codex: ['codex', 'exec', '--skip-git-repo-check'],
+  // TRAE CLI is a codex fork — same exec surface and bare-answer stdout.
+  traex: ['traex', 'exec', '--skip-git-repo-check'],
   opencode: ['opencode', 'run'],
   gemini: ['gemini', '-p'],
 };
+
+/** One in-flight title job per chat — birth and the heal-on-activity path
+ *  (handleThreadReply) can otherwise race duplicate CLI calls. */
+const inFlightTitles = new Set<string>();
 
 export function buildTitlePrompt(text: string, maxLen: number, locale: string): string {
   const excerpt = text.replace(/\s+/g, ' ').trim().slice(0, 500);
@@ -92,6 +98,8 @@ export function scheduleSessionGroupTitle(opts: {
   userText: string;
 }): void {
   const { larkAppId, chatId, userText } = opts;
+  if (inFlightTitles.has(chatId)) return;
+  inFlightTitles.add(chatId);
   void (async () => {
     try {
       const cfg = getBot(larkAppId).config;
@@ -164,6 +172,8 @@ export function scheduleSessionGroupTitle(opts: {
       logger.info(`[session-group] titled chat=${chatId.substring(0, 12)} "${finalName}"`);
     } catch (err) {
       logger.info(`[session-group] AI title failed for chat=${chatId.substring(0, 12)} (placeholder kept): ${err}`);
+    } finally {
+      inFlightTitles.delete(chatId);
     }
   })();
 }
