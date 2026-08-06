@@ -38,8 +38,11 @@ interface TagCache {
   chatTagName?: string;
   /** ofg_xxx feed-group id (feed-group mode). */
   groupId?: string;
-  /** The name groupId was created/renamed with. */
+  /** The ACTUAL name groupId carries (may be the conflict-fallback name). */
   name?: string;
+  /** The configured name `name` was derived from — rename detection compares
+   *  against THIS, so a conflict fallback (`name·bot`) doesn't ping-pong. */
+  configuredName?: string;
   /** Epoch ms of the last owner nudge (throttle, shared by both modes). */
   lastAuthNudgeAt?: number;
 }
@@ -294,36 +297,54 @@ async function tagViaFeedGroup(larkAppId: string, chatId: string, ownerOpenId: s
     }
   }
   if (!cache.groupId) {
-    const created = await callFeedGroupApi(host, userToken, 'POST', '/open-apis/im/v1/groups', {
-      feed_group_creator: { type: 'normal', name },
+    const createGroup = (groupName: string) => callFeedGroupApi(host, userToken, 'POST', '/open-apis/im/v1/groups', {
+      feed_group_creator: { type: 'normal', name: groupName },
     });
-    if (!created.ok) {
-      // 230001 + "name already exists"：分组名用户级全局唯一，但操作权限按创建
-      // 应用隔离——本 app 的 list 看不到、也建不了同名组（典型：换 app 重装 /
-      // 曾用别的应用建过同名分组）。指名道姓提示，而不是留一个含糊的 param 错误。
-      if (created.code === 230001 && /already exists/i.test(String(created.msg ?? ''))) {
+    const isNameTaken = (r: LarkApiResult) =>
+      !r.ok && r.code === 230001 && /already exists/i.test(String(r.msg ?? ''));
+
+    let actualName = name;
+    let created = await createGroup(name);
+    if (isNameTaken(created)) {
+      // 分组名用户级全局唯一，但操作权限按创建应用隔离——本 app 的 list 看不到、
+      // 也建不了同名组（典型：多个 bot 应用都用默认名 / 换 app 重装）。自动退避
+      // 为「名字·bot 显示名」，让每个 bot 各持一个分组而不是静默失败。
+      const bot = getBot(larkAppId);
+      const botLabel = (bot.botName ?? cfg.displayName ?? cfg.cliId ?? larkAppId.slice(-6)).trim();
+      const fallbackName = `${name}·${botLabel}`;
+      if (fallbackName !== name) {
         logger.warn(
-          `[session-tag] feed group name "${name}" is taken by ANOTHER app's group (feed groups are `
-          + 'per-user unique by name but per-app operable). Rename sessionGroup.tag.name or delete '
-          + 'the old group from the app that created it.',
+          `[session-tag] feed group name "${name}" is taken by another app's group (per-user unique, `
+          + `per-app operable); falling back to "${fallbackName}"`,
         );
-        return;
+        actualName = fallbackName;
+        // 退避名也可能已由本 app 早先建过（cache 丢失场景）——先查再建。
+        const existingFallback = await findFeedGroupByName(host, userToken, fallbackName);
+        created = existingFallback
+          ? { ok: true, code: 0, data: { group_id: existingFallback } }
+          : await createGroup(fallbackName);
       }
-      logger.warn(`[session-tag] feed group create "${name}" failed: code=${created.code} ${created.msg}`);
+    }
+    if (!created.ok) {
+      logger.warn(`[session-tag] feed group create "${actualName}" failed: code=${created.code} ${created.msg}`);
       if (created.authProblem) void maybeNudgeOwnerForAuth(larkAppId, ownerOpenId, `code_${created.code}`);
       return;
     }
     cache.groupId = created.data?.group_id;
-    cache.name = name;
+    cache.name = actualName;
+    cache.configuredName = name;
     saveCache(larkAppId, cache);
-    logger.info(`[session-tag] created feed group "${name}" → ${cache.groupId}`);
-  } else if (cache.name !== name) {
+    logger.info(`[session-tag] feed group "${actualName}" → ${cache.groupId}`);
+  } else if ((cache.configuredName ?? cache.name) !== name) {
+    // 配置名变更才触发改名；对比 configuredName 而非实际名，避免退避名（name·bot）
+    // 与配置名的固有差异导致每次建群都空转一次 rename。
     const renamed = await callFeedGroupApi(host, userToken, 'PUT',
       `/open-apis/im/v1/groups/${encodeURIComponent(cache.groupId)}`, {
         feed_group_updater: { name, update_fields: [1] },
       });
     if (renamed.ok) {
       cache.name = name;
+      cache.configuredName = name;
       saveCache(larkAppId, cache);
     } else {
       logger.warn(`[session-tag] feed group rename failed (keeping old name): code=${renamed.code} ${renamed.msg}`);
