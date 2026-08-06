@@ -965,6 +965,10 @@ export type WorkerToDaemon =
       };
       /** The model already delivered through botmux send; settle without fallback output. */
       suppressDelivery?: boolean;
+      /** Ordered-steer N-final expansion (codex-app): a `steer_superseded` member
+       *  is durably settled (advances the FIFO) but never delivered and carries no
+       *  usage — only the group's final real member delivers. Absent = ordinary final. */
+      disposition?: 'steer_superseded';
       /** Per-turn token usage (codex-app). Daemon persists it with the async
        *  trigger result so trigger-result's completed state can report it. */
       usage?: {

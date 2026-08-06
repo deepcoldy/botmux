@@ -1240,6 +1240,156 @@ describe('codex-app-runner app-server protocol integration', () => {
     }
   });
 
+  it('fails closed when a grown group receives a NON-canonical completion and history has only a root-only turn (R3-B3)', async () => {
+    // R3-B3: a group that grew past its root (root + 1 accepted steer) receives a
+    // completion under a DIFFERENT native id (non-canonical). That completion must
+    // NOT close the group; the runner does a group-aware bounded-history reconcile
+    // and finds only a root-only turn (no full ordered group) → fail closed. The
+    // follow-up's real final must never carry the foreign/partial content, and no
+    // single-root reconcile may expand a follower final from a turn missing it.
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-codex-b3r-noncanon-'));
+    const fakeCodex = join(dir, 'fake-codex');
+    const logPath = join(dir, 'requests.jsonl');
+    copyFileSync(FAKE_SERVER_FIXTURE, fakeCodex);
+    chmodSync(fakeCodex, 0o755);
+    const control = new ControlCollector(dir);
+    await control.listen();
+    const harness = startRunner(fakeCodex, dir, logPath, '0.144.6', 'steer-noncanonical', control.bootstrap.path);
+
+    const send = (text: string, replyTurnId: string) => {
+      harness.child.stdin.write(`${CONTROL_PREFIX}${encodeRunnerInput(
+        `legacy:${text}`,
+        { text, clientUserMessageId: replyTurnId },
+        replyTurnId,
+        true,
+      )}\r`);
+    };
+
+    try {
+      await waitFor(harness, () => control.states.some(state => state.busy === false));
+      send('root', 'om_nc_root');
+      await waitFor(harness, () => readRequests(logPath).some(r => r.method === 'turn/start'));
+      send('follow', 'om_nc_follow');
+
+      // Two finals expand (group settled fail-closed), and the settlement is a
+      // diagnostic conflict — never the foreign root-only answer.
+      await waitFor(harness, () => control.finals.length === 2
+        && control.states.filter(state => state.busy === false).length >= 2);
+
+      const diagnostics = control.markers.filter(m => m.kind === 'diagnostic');
+      expect(diagnostics.length).toBeGreaterThanOrEqual(1);
+      expect(diagnostics[0].payload.code).toBe('native_turn_identity_conflict');
+      const realFinal = control.finals[control.finals.length - 1];
+      expect(realFinal.content).toContain('Codex App turn failed');
+      expect(realFinal.content).not.toContain('foreign root-only answer');
+    } finally {
+      await stopChild(harness.child);
+      await control.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('protocol-fences with ZERO finals when a pre-response completion (id A) is contradicted by a late start response (id B) (R3-B2)', async () => {
+    // R3-B2: an exact-client full-items turn/completed arrives under id A before
+    // the start response; the runner upgrades it to canonical identity proof
+    // (bind A + proof + require the late response to match). The late response
+    // returns a DIFFERENT id B → protocol anomaly whose true turn is unknown:
+    // fence the generation with ZERO finals, never bind B or emit A's content.
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-codex-b2r-mismatch-'));
+    const fakeCodex = join(dir, 'fake-codex');
+    const logPath = join(dir, 'requests.jsonl');
+    copyFileSync(FAKE_SERVER_FIXTURE, fakeCodex);
+    chmodSync(fakeCodex, 0o755);
+    const control = new ControlCollector(dir);
+    await control.listen();
+    const harness = startRunner(fakeCodex, dir, logPath, '0.144.6', 'completion-before-response-mismatch', control.bootstrap.path);
+
+    try {
+      await waitFor(harness, () => control.states.some(state => state.busy === false));
+      harness.child.stdin.write(`${CONTROL_PREFIX}${encodeRunnerInput(
+        'legacy:root',
+        { text: 'root', clientUserMessageId: 'om_b2_root' },
+        'om_b2_root',
+        true,
+      )}\r`);
+
+      // A signed fatal lifecycle (fence) is emitted; wait for it.
+      await waitFor(harness, () => control.markers.some(
+        m => m.kind === 'lifecycle' && m.payload.kind === 'fatal',
+      ));
+      // Give any (erroneous) final a chance to appear, then assert ZERO finals.
+      await new Promise(resolve => setTimeout(resolve, 300));
+
+      expect(control.finals).toHaveLength(0);
+      const fatals = control.markers.filter(
+        m => m.kind === 'lifecycle' && m.payload.kind === 'fatal',
+      );
+      expect(fatals.length).toBeGreaterThanOrEqual(1);
+      expect(fatals[0].payload.operation).toBe('turn/start');
+      // No final ever carried A's content or bound B.
+      expect(control.finals.some((f: any) => f.content?.includes('answer under id A'))).toBe(false);
+      expect(control.finals.some((f: any) => f.nativeTurnId === 'turn-response-B')).toBe(false);
+    } finally {
+      await stopChild(harness.child);
+      await control.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('fences (never a lone root failure final) when a start RPC drops AFTER exact-started proof + an accepted follow-up (R3-B1)', async () => {
+    // R3-B1: the runner proves canonical via an exact turn/started, accepts a
+    // follow-up steer (group grows to 2, follow-up shifted from the queue), then
+    // the start RPC transport-drops with the turn/start still pending. Positive
+    // evidence exists, so the runner MUST fence — a lone root failure final would
+    // strand the already-accepted follow-up in the worker FIFO (poison). Assert
+    // a signed fatal is emitted and NO single "root failure" final leaks.
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-codex-b1r-drop-'));
+    const fakeCodex = join(dir, 'fake-codex');
+    const logPath = join(dir, 'requests.jsonl');
+    copyFileSync(FAKE_SERVER_FIXTURE, fakeCodex);
+    chmodSync(fakeCodex, 0o755);
+    const control = new ControlCollector(dir);
+    await control.listen();
+    const harness = startRunner(fakeCodex, dir, logPath, '0.144.6', 'steer-then-drop', control.bootstrap.path);
+
+    const send = (text: string, replyTurnId: string) => {
+      harness.child.stdin.write(`${CONTROL_PREFIX}${encodeRunnerInput(
+        `legacy:${text}`,
+        { text, clientUserMessageId: replyTurnId },
+        replyTurnId,
+        true,
+      )}\r`);
+    };
+
+    try {
+      await waitFor(harness, () => control.states.some(state => state.busy === false));
+      send('root', 'om_drop_root');
+      await waitFor(harness, () => readRequests(logPath).some(r => r.method === 'turn/start'));
+      // Follow-up steers into the proven turn; the fixture accepts it, then drops.
+      send('follow', 'om_drop_follow');
+
+      // The dropped start RPC → transport error → fence (signed fatal).
+      await waitFor(harness, () => control.markers.some(
+        m => m.kind === 'lifecycle' && m.payload.kind === 'fatal',
+      ));
+      await new Promise(resolve => setTimeout(resolve, 300));
+
+      // A steer WAS accepted (positive evidence the follow-up landed).
+      expect(readRequests(logPath).filter(r => r.method === 'turn/steer')).toHaveLength(1);
+      // Fenced: NO lone root failure final. (Zero finals — the fence tore the
+      // generation down before any N-final expansion.)
+      expect(control.finals).toHaveLength(0);
+      const fatals = control.markers.filter(
+        m => m.kind === 'lifecycle' && m.payload.kind === 'fatal',
+      );
+      expect(fatals[0].payload.operation).toBe('turn/start');
+    } finally {
+      await stopChild(harness.child);
+      await control.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('falls back to turn/start only after an explicit stale expected-turn rejection', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'botmux-codex-runner-steer-race-'));
     const fakeCodex = join(dir, 'fake-codex');

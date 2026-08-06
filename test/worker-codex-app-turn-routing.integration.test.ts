@@ -454,6 +454,123 @@ describe('Codex App worker queued-turn attribution', () => {
       await stopChild(child);
     }
   }, 25_000);
+
+  it('expands an ordered steered group into N final_output IPCs: N−1 superseded (empty, suppressed, no usage) + 1 real', async () => {
+    // Blocking 1 end-to-end through the worker: two follow-ups steer into an open
+    // turn/start (the `steer` fixture holds the turn open until the 2nd steer,
+    // then completes). The worker must expand the one native completion into
+    // three final_output IPCs — the first two carry disposition:'steer_superseded'
+    // with empty content + suppressDelivery:true + NO usage (durable FIFO advance,
+    // never delivered), and the last carries the real answer. This is the cross
+    // hop the runner-only test cannot cover: it proves the worker forwards the
+    // superseded disposition, suppresses delivery, and orders the FIFO commits.
+    const root = mkdtempSync(join(tmpdir(), 'botmux-worker-codex-superseded-'));
+    tempDirs.add(root);
+    const fakeCodex = join(root, 'fake-codex');
+    const requestLog = join(root, 'requests.jsonl');
+    copyFileSync(resolve('test/fixtures/fake-codex-app-server.mjs'), fakeCodex);
+    chmodSync(fakeCodex, 0o755);
+
+    const sessionId = `codex-superseded-${process.pid}-${Date.now()}`;
+    const logs: string[] = [];
+    const messages: WorkerToDaemon[] = [];
+    const nodeOptions = [process.env.NODE_OPTIONS, '--import=tsx'].filter(Boolean).join(' ');
+    const child = spawn(process.execPath, ['--import', 'tsx', resolve('src/worker.ts')], {
+      cwd: resolve('.'),
+      env: {
+        ...process.env,
+        HOME: root,
+        NODE_ENV: 'test',
+        NODE_OPTIONS: nodeOptions,
+        BOTMUX_TEST_CODEX_APP_RUNNER_PATH: resolve('src/codex-app-runner.ts'),
+        SESSION_DATA_DIR: root,
+        BOTMUX_SESSION_ID: sessionId,
+        LARK_APP_ID: 'app_worker_superseded',
+        LARK_APP_SECRET: 'secret',
+        FAKE_CODEX_LOG: requestLog,
+        FAKE_CODEX_VERSION: '0.136.0',
+        // Holds turn/start open; completes after the 2nd steer.
+        FAKE_CODEX_BEHAVIOR: 'steer',
+      },
+      stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+    });
+    children.add(child);
+    child.stdout?.on('data', chunk => logs.push(chunk.toString()));
+    child.stderr?.on('data', chunk => logs.push(chunk.toString()));
+    let firstSent = false;
+    child.on('message', raw => {
+      const message = raw as WorkerToDaemon;
+      messages.push(message);
+      if (message.type === 'error') logs.push(`[worker-ipc-error] ${message.message}\n`);
+      // After the runner is ready, queue both steerable follow-ups. They steer
+      // into the still-open root turn/start before its final.
+      if (message.type === 'ready' && !firstSent) {
+        firstSent = true;
+        child.send({
+          type: 'message',
+          content: '<user_message>follow one</user_message>',
+          codexAppInput: { text: 'follow one', clientUserMessageId: 'om_sup_2' },
+          turnId: 'om_sup_2',
+          codexAppSteerable: true,
+        } as DaemonToWorker);
+        child.send({
+          type: 'message',
+          content: '<user_message>follow two</user_message>',
+          codexAppInput: { text: 'follow two', clientUserMessageId: 'om_sup_3' },
+          turnId: 'om_sup_3',
+          codexAppSteerable: true,
+        } as DaemonToWorker);
+      }
+    });
+
+    const init: DaemonToWorker = {
+      type: 'init',
+      sessionId,
+      chatId: 'oc_worker_superseded',
+      rootMessageId: 'om_worker_superseded_root',
+      workingDir: resolve('.'),
+      cliId: 'codex-app',
+      cliPathOverride: fakeCodex,
+      backendType: 'pty',
+      prompt: '<user_message>root turn</user_message>',
+      promptCodexAppInput: { text: 'root turn', clientUserMessageId: 'om_sup_1' },
+      larkAppId: 'app_worker_superseded',
+      larkAppSecret: 'secret',
+      turnId: 'om_sup_1',
+      codexAppSteerable: true,
+    };
+
+    try {
+      child.send(init);
+      await waitFor(child, logs, () => (
+        messages.filter(message => message.type === 'final_output').length >= 3
+      ));
+      const finals = messages.filter(
+        (message): message is Extract<WorkerToDaemon, { type: 'final_output' }> => message.type === 'final_output',
+      );
+      // Three finals in strict FIFO order: root + follow one superseded, follow
+      // two real. Superseded carry empty content + suppressDelivery + no usage.
+      expect(finals.map(f => ({
+        turnId: f.turnId,
+        content: f.content,
+        suppressDelivery: (f as any).suppressDelivery === true,
+        disposition: (f as any).disposition,
+        hasUsage: f.usage !== undefined,
+      }))).toEqual([
+        { turnId: 'om_sup_1', content: '', suppressDelivery: true, disposition: 'steer_superseded', hasUsage: false },
+        { turnId: 'om_sup_2', content: '', suppressDelivery: true, disposition: 'steer_superseded', hasUsage: false },
+        { turnId: 'om_sup_3', content: 'fake answer 1', suppressDelivery: false, disposition: undefined, hasUsage: false },
+      ]);
+      // One turn/start + two turn/steer (ordered steer, not three serial starts).
+      const turnMethods = readRequests(requestLog)
+        .filter(r => r.method === 'turn/start' || r.method === 'turn/steer')
+        .map(r => r.method);
+      expect(turnMethods).toEqual(['turn/start', 'turn/steer', 'turn/steer']);
+      expect(logs.join('')).not.toContain('rejected final marker');
+    } finally {
+      await stopChild(child);
+    }
+  }, 25_000);
 });
 
 describe('Codex App worker replacement durable handoff', () => {

@@ -6660,10 +6660,32 @@ async function handleTrustedCodexAppMarker(
 
   if (kind === 'final' && typeof payload.content === 'string') {
     const finalContent = payload.content;
+    // Blocking 1 N-final expansion: a `steer_superseded` disposition marks one of
+    // the first N−1 members of an ordered steered group. It advances the worker
+    // FIFO (durable settlement) but is NEVER delivered, carries no usage, and does
+    // NOT clear completion-awaiting or publish ready — only the LAST (real) final
+    // of the group does that. Validate the contract strictly: any other
+    // disposition value, or a superseded final with content/usage or without an
+    // awaited completion, is a malformed control record → reject (fail closed).
+    const disposition = payload.disposition;
+    const isSuperseded = disposition === 'steer_superseded';
+    if (disposition !== undefined && !isSuperseded) {
+      rejectCodexAppControlMarker(`unknown final disposition ${String(disposition)}`);
+      return false;
+    }
+    if (isSuperseded
+        && (lastInitConfig?.cliId !== 'codex-app'
+          || finalContent !== ''
+          || payload.usage !== undefined
+          || !codexAppCompletionAwaitingFinal)) {
+      rejectCodexAppControlMarker('invalid steer_superseded final (content/usage/awaiting contract)');
+      return false;
+    }
     // Forward the runner's four-bucket token usage on the final_output IPC so
     // the daemon's async-trigger sink (worker-pool recordCompleted) can persist
     // it. normalizeFinalUsage validates non-negative integers and drops a
     // malformed/partial packet — never let a compromised runner poison usage.
+    // A superseded final never carries usage (validated above).
     const finalUsage = normalizeFinalUsage(payload.usage);
     const startedAtMs = typeof payload.startedAtMs === 'number' && Number.isFinite(payload.startedAtMs)
       ? payload.startedAtMs
@@ -6699,15 +6721,11 @@ async function handleTrustedCodexAppMarker(
         dispatchId: codexAppDispatchId,
         handle: codexAppDispatchHandle,
       } = settlement);
-      if (!codexAppCompletionAwaitingFinal) {
-        // turn/start failures emit a final transaction without an app-server
-        // completed activity edge. Close exactly one liveness slot here.
-        codexAppTurnLiveness.completeCurrent(completedAtMs);
-      }
-      codexAppCompletionAwaitingFinal = false;
-      // A terminal prompt may already have been observed, but ready waits for
-      // the later signed state{busy:false}. The runner sequences that state
-      // after this complete final transaction.
+      // Liveness slot retirement + completion-awaiting clearing happen AFTER the
+      // durable commit below (a persist/commit failure must not retire a slot or
+      // clear awaiting), and are disposition-aware: a superseded member retires
+      // exactly one extra logical slot but keeps awaiting=true / never publishes
+      // ready; only the real final clears awaiting. See the post-commit block.
     } else {
       // Mira/Mir retain their terminal OSC control path and do not use the
       // Codex App serial dispatch FIFO.
@@ -6767,15 +6785,19 @@ async function handleTrustedCodexAppMarker(
     if (codexAppDispatchId) {
       if (!control || codexAppDispatchHandle === undefined) return false;
       const requestId = randomBytes(16).toString('hex');
+      // A superseded member is durably settled but NEVER delivered: force empty
+      // content + suppressDelivery so the daemon persists the FIFO advance without
+      // deliverFinalOutput, and tag the disposition so the sink is explicit.
       const persisted = await waitForCodexAppDaemonPersistence(requestId, () => send({
         type: 'final_output',
-        content: suppressDelivery ? '' : finalContent,
+        content: (suppressDelivery || isSuperseded) ? '' : finalContent,
         lastUuid: turnId,
         turnId,
         ...(replyTurnId ? { replyTurnId } : {}),
         ...(finalUsage ? { usage: finalUsage } : {}),
         ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
-        ...(suppressDelivery ? { suppressDelivery: true } : {}),
+        ...((suppressDelivery || isSuperseded) ? { suppressDelivery: true } : {}),
+        ...(isSuperseded ? { disposition: 'steer_superseded' as const } : {}),
         codexAppSettlement: {
           requestId,
           generation: control.generation,
@@ -6784,6 +6806,8 @@ async function handleTrustedCodexAppMarker(
         },
       }));
       if (!persisted || !codexAppTurnDispatchQueue.commitExactHead(codexAppDispatchHandle)) {
+        // Persist/commit failed: do NOT retire a liveness slot or clear awaiting
+        // (codex step 5) — the generation may replay this exact transaction.
         return false;
       }
       codexAppGenerationCommits = [
@@ -6816,8 +6840,45 @@ async function handleTrustedCodexAppMarker(
         ...(finalUsage ? { usage: finalUsage } : {}),
         ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
       });
+      } else if (isSuperseded) {
+        // A superseded member still emits a final_output so the daemon (and any
+        // async-trigger/observer sink) records the FIFO advance — but with empty
+        // content + suppressDelivery + the disposition tag so it is persisted and
+        // NEVER delivered. Without this the member would be invisible downstream.
+        send({
+          type: 'final_output',
+          content: '',
+          lastUuid: turnId,
+          turnId,
+          ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
+          suppressDelivery: true,
+          disposition: 'steer_superseded' as const,
+        });
       } else if (!finalContent) {
         log(`${cliName()} empty final settled for botmux turn ${turnId.substring(0, 12)}`);
+      }
+    }
+    // Post-commit liveness (codex-app only; runs only after a successful durable
+    // or fallback commit — a failed commit returned above without touching state):
+    if (lastInitConfig?.cliId === 'codex-app') {
+      if (isSuperseded) {
+        // A superseded member retires exactly ONE extra logical liveness slot
+        // (worker flush created N slots for the group; the single native
+        // activity:completed already retired the first). Keep awaiting-final TRUE
+        // and never publish ready — the group's real final is still to come. This
+        // is "retire a logical slot", NOT "close the native completion gate".
+        codexAppTurnLiveness.completeCurrent(completedAtMs);
+        // codexAppCompletionAwaitingFinal intentionally left true.
+      } else {
+        if (!codexAppCompletionAwaitingFinal) {
+          // turn/start failures emit a final transaction without an app-server
+          // completed activity edge. Close exactly one liveness slot here.
+          codexAppTurnLiveness.completeCurrent(completedAtMs);
+        }
+        // The real final of the group clears awaiting; the runner sequences the
+        // signed state{busy:false} after this complete final transaction, so
+        // ready publishes there (never here).
+        codexAppCompletionAwaitingFinal = false;
       }
     }
     emitTurnTerminal(turnId, 'completed', undefined, dispatchAttempt);
@@ -13435,6 +13496,11 @@ process.on('message', async (raw: unknown) => {
             queuedActivationToken: msg.queuedActivationToken,
             vcMeetingImTurnOrigin: msg.vcMeetingImTurnOrigin,
             codexAppInput: msg.promptCodexAppInput,
+            // Thread the root's steer authorization so ordered pre-final steer can
+            // fold follow-ups into THIS turn (the runner's canSteer requires the
+            // group root — accepted[0] — to be steerable). Without this the first
+            // turn of a codex-app session could never absorb a follow-up steer.
+            ...(msg.codexAppSteerable ? { codexAppSteerable: true } : {}),
           });
           initialInputCommitted = true;
         } else if (msg.cliId === 'codex-app') {

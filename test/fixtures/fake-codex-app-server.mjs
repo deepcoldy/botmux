@@ -444,6 +444,61 @@ function handle(request) {
       activeTurn = undefined;
       return;
     }
+    if (behavior === 'steer-noncanonical') {
+      if (!activeTurn || request.params.expectedTurnId !== activeTurn.turnId) {
+        reject(request.id, -32602, 'expectedTurnId does not match active turn');
+        return;
+      }
+      steerCount += 1;
+      groupClientIds.push(request.params.clientUserMessageId ?? null);
+      respond(request.id, { turnId: activeTurn.turnId });
+      // Complete after the 1st steer, but emit turn/completed under a DIFFERENT
+      // native id than the steered turn (non-canonical), whose full items contain
+      // only the ROOT clientId — not the follow-up. The runner must NOT close the
+      // group on this non-canonical completion; its bounded-history reconcile then
+      // finds only a root-only turn (no full ordered group) → fail closed, never
+      // expanding the follow-up's final from foreign/partial content.
+      const { threadId } = activeTurn;
+      reconciledTurn = {
+        id: 'turn-history-root-only',
+        status: 'completed',
+        itemsView: 'full',
+        error: null,
+        items: [
+          { id: 'user-root', type: 'userMessage', clientId: groupClientIds[0], content: [] },
+          { id: 'message-final', type: 'agentMessage', phase: 'final_answer', text: 'foreign root-only answer' },
+        ],
+      };
+      notify('turn/completed', {
+        threadId,
+        turn: {
+          id: 'turn-foreign-noncanonical',
+          status: 'completed',
+          itemsView: 'full',
+          error: null,
+          items: [
+            { id: 'user-root', type: 'userMessage', clientId: groupClientIds[0], content: [] },
+            { id: 'message-final', type: 'agentMessage', phase: 'final_answer', text: 'foreign root-only answer' },
+          ],
+        },
+      });
+      activeTurn = undefined;
+      return;
+    }
+    if (behavior === 'steer-then-drop') {
+      if (!activeTurn || request.params.expectedTurnId !== activeTurn.turnId) {
+        reject(request.id, -32602, 'expectedTurnId does not match active turn');
+        return;
+      }
+      // Accept the steer (group grows to 2), then reject the ORIGINAL pending
+      // turn/start with an explicit RPC error. The runner must fence on this
+      // start failure because positive evidence already exists — NOT synthesize a
+      // lone root failure final.
+      respond(request.id, { turnId: activeTurn.turnId });
+      const startId = activeTurn.startRequestId;
+      setTimeout(() => reject(startId, -32000, 'model overloaded after steer'), 30);
+      return;
+    }
     // OURS: goal-mode steer targets an autonomous goal turn (goalTurn).
     if (!goalTurn || request.params.expectedTurnId !== goalTurn.id) {
       reject(request.id, -32000, 'expected turn is not active');
@@ -517,11 +572,11 @@ function handle(request) {
     reject(request.id, -32000, 'model overloaded');
     return;
   }
-  if (behavior === 'steer' || behavior === 'steer-group-mismatch') {
+  if (behavior === 'steer' || behavior === 'steer-group-mismatch' || behavior === 'steer-noncanonical') {
     const threadId = request.params.threadId;
     const turnId = `turn-fake-${turnAttempt}`;
     activeTurn = { threadId, turnId, outputSchema: request.params.outputSchema };
-    if (behavior === 'steer-group-mismatch') {
+    if (behavior === 'steer-group-mismatch' || behavior === 'steer-noncanonical') {
       groupClientIds = [request.params.clientUserMessageId ?? null];
     }
     respond(request.id, { turn: { id: turnId } });
@@ -554,6 +609,59 @@ function handle(request) {
     // Small delay before the response so the runner observes turn/started (and
     // can steer) strictly before the start response returns.
     setTimeout(() => respond(request.id, { turn: { id: turnId } }), 120);
+    return;
+  }
+  if (behavior === 'completion-before-response-mismatch') {
+    // R3-B2: emit a full-items turn/completed under id A (containing the root
+    // clientId) BEFORE the start response, then respond with a DIFFERENT id B.
+    // The runner upgrades the exact pre-response completion to canonical proof
+    // (id A); the late response B ≠ A must protocol-fence with ZERO finals and
+    // never bind B or emit A's content.
+    const threadId = request.params.threadId;
+    notify('turn/completed', {
+      threadId,
+      turn: {
+        id: 'turn-completion-A',
+        status: 'completed',
+        itemsView: 'full',
+        error: null,
+        items: [
+          { id: 'user-A', type: 'userMessage', clientId: request.params.clientUserMessageId ?? null, content: request.params.input },
+          { id: 'message-A', type: 'agentMessage', phase: 'final_answer', text: 'answer under id A' },
+        ],
+      },
+    });
+    setTimeout(() => respond(request.id, { turn: { id: 'turn-response-B' } }), 120);
+    return;
+  }
+  if (behavior === 'steer-then-drop') {
+    // R3-B1: prove canonical via an exact turn/started BEFORE the start response,
+    // accept ONE steer (group grows to 2 members), then reject the ORIGINAL
+    // turn/start with an explicit RPC error. Even though the RPC "definitively"
+    // failed, positive evidence (exact-started proof + accepted follow-up) exists,
+    // so the runner MUST fence (0 finals / full N-final) — a lone root failure
+    // final would strand the already-accepted follow-up in the FIFO. This is
+    // distinct from a transport drop (which fences via the non-RPC path); it
+    // proves the positiveEvidence branch specifically.
+    const threadId = request.params.threadId;
+    const turnId = `turn-fake-${turnAttempt}`;
+    activeTurn = { threadId, turnId, outputSchema: request.params.outputSchema, startRequestId: request.id };
+    notify('turn/started', {
+      threadId,
+      turn: {
+        id: turnId,
+        status: 'inProgress',
+        itemsView: 'full',
+        items: [{
+          id: `user-${turnAttempt}`,
+          type: 'userMessage',
+          clientId: request.params.clientUserMessageId ?? null,
+          content: request.params.input,
+        }],
+      },
+    });
+    // The original turn/start is answered later — as an explicit RPC error — from
+    // the turn/steer handler, after the steer is accepted.
     return;
   }
   completeTurn(request);

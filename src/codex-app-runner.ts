@@ -1029,27 +1029,21 @@ function handleNotification(msg: JsonObject, replayedAfterResponse = false): voi
       if (queue.length > 0 && nativeActiveTurnId === undefined) void drainQueue();
       return;
     }
-    if (turn.nativeTurnId && completedId === turn.nativeTurnId) {
-      // Blocking 1 completion barrier — engaged ONLY when a steer is genuinely
-      // in play: a steer RPC is racing this completion, or the group already
-      // grew past its root via an accepted steer. In both cases the completion
-      // must settle the whole ordered group (N-final expansion) rather than the
-      // single-turn path. A steerable turn that never actually steered (1 member,
-      // no in-flight RPC — including the start-response-last buffering window,
-      // where canonical is not yet proven) stays on the unchanged, proven
-      // exact/reconcile path below and finalizes as a 1-member group. This keeps
-      // every existing scenario (single start, Goal steer, response-last) on code
-      // that already has tests, narrowing the new path to true multi-member work.
-      const steerInPlay = turn.steerInFlight !== undefined || (turn.accepted?.length ?? 0) > 1;
-      if (steerInPlay && turn.accepted?.[0]?.input.codexAppSteerable === true) {
-        turn.completionSeen = true;
-        turn.steeringClosed = true;
+    // Group mode (R3): a steerable root that actually began ordered-steer work
+    // routes EVERY completion through group-aware settlement — never the
+    // single-turn completeActiveTurnFromNative / single-root reconcile, which
+    // finalizeAcceptedGroup would then wrongly expand into N finals from a turn
+    // that does not contain the whole group.
+    if (inGroupMode(turn)) {
+      turn.completionSeen = true;
+      turn.steeringClosed = true;
+      // A steer RPC racing this completion, or a still-pending root start
+      // response, is a barrier: buffer and let that continuation settle the group
+      // once it appends its member / binds canonical. (canonical-only barrier.)
+      const isCanonical = turn.canonicalNativeTurnId !== undefined
+        && completedId === turn.canonicalNativeTurnId;
+      if (isCanonical) {
         turn.terminalCompletion = nativeTurn;
-        // Do not settle while a steer RPC is racing OR the root start response is
-        // still pending (B1): both are barriers. The steer continuation, or the
-        // late start response's replay of this buffered completion, settles the
-        // group once its own await resolves. Settling now could expand the group
-        // before the in-flight member appends (dropping its final).
         if (turn.steerInFlight || turn.startResponsePending) {
           emitLifecycle({ kind: 'completion_race', appTurnId: completedId, category: 'steer_in_flight' });
           return;
@@ -1057,9 +1051,43 @@ function handleNotification(msg: JsonObject, replayedAfterResponse = false): voi
         settleSteeredCompletion(turn, nativeTurn);
         return;
       }
+      // A NON-canonical completion cannot itself close the group. If a steer is
+      // still racing / the start response is pending, wait for that continuation
+      // (it may prove the canonical id). Otherwise scan bounded history for the
+      // one terminal turn that contains the full ordered group; fail closed
+      // (identity error, no foreign text) on 0 / multiple / partial matches.
+      if (turn.steerInFlight || turn.startResponsePending) {
+        emitLifecycle({ kind: 'completion_race', appTurnId: completedId ?? '', category: 'steer_in_flight' });
+        return;
+      }
+      void reconcileSteeredGroupFromHistory(turn, completedId);
+      return;
+    }
+    if (turn.nativeTurnId && completedId === turn.nativeTurnId) {
       const exact = turn.clientUserMessageId
         ? exactClientItemIndexes(nativeTurn, turn.clientUserMessageId)
         : [];
+      // R3-B2: an exact-client completion arriving BEFORE the start response is
+      // upgraded to canonical identity proof — atomically bind the canonical id,
+      // set an independent proof, and require a late start response to match it.
+      // Until that atomic upgrade, the completion is only a candidate (buffered);
+      // it must never single-turn-settle here in a way a late response could then
+      // silently overwrite. Only a steerable root can upgrade (Goal steer / plain
+      // legacy keep the original single-turn behavior below).
+      if (exact.length === 1
+          && !turn.requestAccepted
+          && turn.startResponsePending
+          && turn.accepted?.[0]?.input.codexAppSteerable === true
+          && typeof completedId === 'string') {
+        turn.canonicalNativeTurnId = completedId;
+        turn.identityProof = 'exact_started';
+        turn.candidateCompletions = [...(turn.candidateCompletions ?? []), nativeTurn];
+        turn.completionSeen = true;
+        turn.steeringClosed = true;
+        turn.terminalCompletion = nativeTurn;
+        emitLifecycle({ kind: 'completion_race', appTurnId: completedId, category: 'steer_in_flight' });
+        return;
+      }
       if (exact.length === 1) {
         completeActiveTurnFromNative(turn, nativeTurn, exact[0]);
         return;
@@ -1081,6 +1109,27 @@ function handleNotification(msg: JsonObject, replayedAfterResponse = false): voi
     const exact = turn.clientUserMessageId
       ? exactClientItemIndexes(nativeTurn, turn.clientUserMessageId)
       : [];
+    // R3-B2: an exact-client full-items completion arriving BEFORE the start
+    // response binds nativeTurnId is upgraded to canonical identity proof for a
+    // steerable root (atomic: bind canonical id + independent proof + buffer as
+    // candidate + require the late response to match). It must NOT single-turn
+    // settle here — a late response with a different id would otherwise be unable
+    // to correct an already-settled wrong attribution. The response path fences
+    // on id mismatch and settles the buffered candidate on match.
+    if (exact.length === 1
+        && !turn.requestAccepted
+        && turn.startResponsePending
+        && turn.accepted?.[0]?.input.codexAppSteerable === true
+        && typeof completedId === 'string') {
+      turn.canonicalNativeTurnId = completedId;
+      turn.identityProof = 'exact_started';
+      turn.candidateCompletions = [...(turn.candidateCompletions ?? []), nativeTurn];
+      turn.completionSeen = true;
+      turn.steeringClosed = true;
+      turn.terminalCompletion = nativeTurn;
+      emitLifecycle({ kind: 'completion_race', appTurnId: completedId, category: 'steer_in_flight' });
+      return;
+    }
     if (exact.length === 1) {
       completeActiveTurnFromNative(turn, nativeTurn, exact[0]);
       return;
@@ -1295,6 +1344,20 @@ function fenceUnknown(
 }
 
 /**
+ * Whether this turn is in "group mode": a steerable root that has actually begun
+ * ordered-steer work (grew past its root, has a steer RPC in flight, or already
+ * closed steering with an accepted member). In group mode EVERY completion and
+ * failure path must be group-aware — a single-turn settle (completeActiveTurnFromNative
+ * / single-root reconcile) followed by finalizeAcceptedGroup's N-final expansion
+ * would mis-map a foreign/partial turn's content onto the last follower. A bare
+ * steerable root that never steered is NOT in group mode (stays single-turn).
+ */
+function inGroupMode(turn: ActiveTurn): boolean {
+  return turn.accepted?.[0]?.input.codexAppSteerable === true
+    && (turn.steerInFlight !== undefined || (turn.accepted?.length ?? 0) > 1);
+}
+
+/**
  * Whether the runner may steer `head` into the active native turn right now.
  * Mirrors codex's canSteer contract (Blocking 1): the group must be open, its
  * canonical native id proven, no steer in flight, and BOTH the root and the
@@ -1317,49 +1380,63 @@ function canSteer(turn: ActiveTurn, head: QueuedInput): boolean {
 }
 
 /**
- * Settle a steered group's canonical `turn/completed` (decision B: an accepted
- * `turn/steer` — or the root's start — is the group authorization). Resolves
+ * Verify a candidate terminal turn contains the full ordered steered-group
+ * subsequence: EVERY member that actually sent a clientUserMessageId appears
+ * exactly once, and those user-item indexes are strictly increasing in accepted
+ * order. Returns the LAST member's item index on success (to rebuild the real
+ * answer from it), or a reason string on failure. When no member sent a
+ * clientId, or the turn has no full items, returns { lastIndex: -1 } (caller
+ * trusts streamed text — matches the single-turn contract).
+ */
+function verifyGroupSubsequence(
+  turn: ActiveTurn,
+  nativeTurn: JsonObject,
+): { lastIndex: number } | { reason: string } {
+  const sentIdMembers = (turn.accepted ?? []).filter(m => m.clientUserMessageId);
+  if (nativeTurn?.itemsView !== 'full' || sentIdMembers.length === 0) return { lastIndex: -1 };
+  let previousIndex = -1;
+  for (const member of sentIdMembers) {
+    const indexes = exactClientItemIndexes(nativeTurn, member.clientUserMessageId!);
+    if (indexes.length !== 1 || indexes[0] <= previousIndex) {
+      return {
+        reason: indexes.length === 0
+          ? 'steered group member missing from terminal turn items'
+          : indexes.length > 1
+            ? 'steered group member appears more than once in terminal turn'
+            : 'steered group members are out of order in terminal turn',
+      };
+    }
+    previousIndex = indexes[0];
+  }
+  return { lastIndex: previousIndex };
+}
+
+/**
+ * Settle a steered group against a terminal turn already proven to be its
+ * canonical completion (completedId === canonicalNativeTurnId). Resolves
  * `turn.done` exactly once; runTurn then expands the group into N finals.
  *
- * B5 group-aware identity defense: when the terminal turn carries
- * `itemsView:'full'`, EVERY member that actually sent a clientUserMessageId must
- * appear exactly once, and those members' user-item indexes must be strictly
- * increasing (the ordered subsequence we steered). The real answer is rebuilt
- * from the LAST accepted member's user item so a prior member's agent text is
- * never mistaken for the final reply. Any violation (missing / duplicate /
- * out-of-order member, or a completion whose id we cannot map to this group)
- * fails closed via reportIdentityConflict — never silently fall back to
- * streamed text for a mismatched completion. A completion with no full items
- * (the app-server did not echo them) trusts the streamed finalText, matching
- * the single-turn contract.
+ * B5 group-aware identity defense: EVERY member that sent a clientUserMessageId
+ * must appear exactly once in strictly-increasing order (verifyGroupSubsequence);
+ * the real answer is rebuilt from the LAST member's user item so a prior
+ * member's agent text is never mistaken for the final reply. Any violation fails
+ * closed via reportIdentityConflict — the settled final then carries an explicit
+ * identity error, never foreign model text.
  */
 function settleSteeredCompletion(turn: ActiveTurn, nativeTurn: JsonObject): void {
   if (activeTurn !== turn || turn.completed) return;
-  const members = turn.accepted ?? [];
-  const sentIdMembers = members.filter(m => m.clientUserMessageId);
-  if (nativeTurn?.itemsView === 'full' && sentIdMembers.length > 0) {
-    // Each member that sent a clientId must map to exactly one user item; the
-    // indexes must be strictly increasing in accepted order (the subsequence we
-    // steered). Otherwise a foreign completion / reordering is being misattributed.
-    let previousIndex = -1;
-    for (const member of sentIdMembers) {
-      const indexes = exactClientItemIndexes(nativeTurn, member.clientUserMessageId!);
-      if (indexes.length !== 1 || indexes[0] <= previousIndex) {
-        reportIdentityConflict(
-          turn,
-          typeof nativeTurn?.id === 'string' ? nativeTurn.id : undefined,
-          indexes.length === 0
-            ? 'steered group member missing from terminal turn items'
-            : indexes.length > 1
-              ? 'steered group member appears more than once in terminal turn'
-              : 'steered group members are out of order in terminal turn',
-        );
-        return;
-      }
-      previousIndex = indexes[0];
-    }
+  const verdict = verifyGroupSubsequence(turn, nativeTurn);
+  if ('reason' in verdict) {
+    reportIdentityConflict(
+      turn,
+      typeof nativeTurn?.id === 'string' ? nativeTurn.id : undefined,
+      verdict.reason,
+    );
+    return;
+  }
+  if (verdict.lastIndex >= 0) {
     // Rebuild the real answer from the LAST accepted member's user item.
-    turn.finalText = rebuildReconciledFinal(nativeTurn, previousIndex);
+    turn.finalText = rebuildReconciledFinal(nativeTurn, verdict.lastIndex);
     turn.allAgentText = '';
   }
   turn.terminalCompletion = nativeTurn;
@@ -1371,6 +1448,83 @@ function settleSteeredCompletion(turn: ActiveTurn, nativeTurn: JsonObject): void
   emitTurnActivity(turn, 'completed', true);
   turn.resolveDone();
 }
+
+/**
+ * Group-aware bounded-history reconcile (codex R3 boundary): a group-mode turn
+ * received a completion whose native id is NOT its canonical id. A non-canonical
+ * completion cannot itself close the group — instead scan bounded history for the
+ * ONE terminal turn that contains the full ordered group subsequence. Only a
+ * unique complete match settles (rebuilding the real answer from its last
+ * member). Zero / multiple / partial (root-only) matches fail closed with an
+ * explicit identity error that carries NO foreign model text — never expand a
+ * follower final from a turn that does not contain the whole group.
+ */
+async function reconcileSteeredGroupFromHistory(
+  turn: ActiveTurn,
+  observedNativeTurnId?: string,
+): Promise<void> {
+  if (turn.reconciliation || turn.completed) return turn.reconciliation;
+  if (!threadId) {
+    reportIdentityConflict(turn, observedNativeTurnId, 'steered group reconcile has no thread');
+    return;
+  }
+  const epoch = turn.epoch;
+  const deadlineAtMs = Date.now() + RECONCILIATION_TIMEOUT_MS;
+  turn.reconciliation = (async () => {
+    const matches: Array<{ turn: JsonObject; lastIndex: number }> = [];
+    let cursor: string | null | undefined;
+    for (let page = 0; page < RECONCILIATION_PAGE_LIMIT; page++) {
+      const remaining = deadlineAtMs - Date.now();
+      if (remaining <= 0) break;
+      const result = await client.request('thread/turns/list', {
+        threadId,
+        ...(cursor ? { cursor } : {}),
+        limit: RECONCILIATION_PAGE_SIZE,
+        sortDirection: 'desc',
+        itemsView: 'full',
+      }, { timeoutMs: remaining });
+      for (const candidate of Array.isArray(result?.data) ? result.data : []) {
+        if (!isTerminalNativeTurn(candidate)) continue;
+        const verdict = verifyGroupSubsequence(turn, candidate);
+        // Only a turn containing the FULL ordered group counts. A root-only turn
+        // yields a 'reason' (later members missing) and is skipped, never matched.
+        if ('lastIndex' in verdict && verdict.lastIndex >= 0) {
+          matches.push({ turn: candidate, lastIndex: verdict.lastIndex });
+        }
+      }
+      cursor = typeof result?.nextCursor === 'string' ? result.nextCursor : null;
+      if (!cursor) break;
+    }
+    if (activeTurn !== turn || turn.epoch !== epoch || turn.completed) return;
+    if (matches.length === 1) {
+      const { turn: matched, lastIndex } = matches[0];
+      turn.finalText = rebuildReconciledFinal(matched, lastIndex);
+      turn.allAgentText = '';
+      turn.terminalCompletion = matched;
+      if (typeof matched?.id === 'string' && nativeActiveTurnId === matched.id) {
+        nativeActiveTurnId = undefined;
+      }
+      turn.completed = true;
+      turn.phase = 'closing';
+      emitTurnActivity(turn, 'completed', true);
+      turn.resolveDone();
+      return;
+    }
+    reportIdentityConflict(
+      turn,
+      observedNativeTurnId,
+      matches.length === 0
+        ? 'steered group: no terminal turn contains the full ordered group'
+        : 'steered group: multiple terminal turns match the full group',
+    );
+  })().catch(err => {
+    if (activeTurn === turn && !turn.completed) {
+      reportIdentityConflict(turn, observedNativeTurnId, `steered group history lookup failed: ${asError(err).message}`);
+    }
+  });
+  await turn.reconciliation;
+}
+
 
 /**
  * Opportunistically admit the queue head as a pre-final `turn/steer` into the
@@ -1643,19 +1797,31 @@ async function runTurn(message: QueuedInput): Promise<void> {
           || !built.structured
           || (!expectedSteerTurnId && turn.serverStarted)
           || !isCleanInputCapabilityError(err)) {
-        // B1/B2: a turn/start whose acceptance is genuinely UNKNOWN must fence
-        // the generation (signed unknown_outcome+fatal), never synthesize a
-        // failure final that would advance the worker FIFO past an in-doubt turn.
-        // An explicit server error response (any AppServerRpcError, e.g. -32000
-        // "model overloaded") definitively proves the turn did NOT run → stays
-        // on the throw→failure-final path. Only a non-RPC failure (timeout or
-        // transport drop) on an unstarted, unaccepted start request leaves
-        // acceptance genuinely UNKNOWN and must fence.
-        const ambiguousStart = !expectedSteerTurnId
-          && !turn.serverStarted
-          && !turn.requestAccepted
-          && !(err instanceof AppServerRpcError);
-        if (ambiguousStart) {
+        // R3-B1 fail-closed on positive evidence: once ANY evidence exists that
+        // this native turn may have started or grown — an exact `turn/started`
+        // proof, a server-started edge, or an already-accepted follow-up (group
+        // grew past its root) — a start-RPC failure of ANY kind (even an explicit
+        // RPC error) must FENCE, never synthesize a failure final. Synthesizing a
+        // single root failure would (a) misreport an actually-started turn and
+        // (b) if a follow-up was already steer-accepted and shifted, settle only
+        // the root and strand the follow-up in the worker FIFO (poison). The
+        // durable recovery contract has no authoritative response record proving
+        // this generation can safely continue, so we tear it down.
+        const positiveEvidence = turn.serverStarted
+          || turn.identityProof !== undefined
+          || turn.canonicalNativeTurnId !== undefined
+          || (turn.accepted?.length ?? 0) > 1;
+        if (positiveEvidence) {
+          fenceUnknown('turn/start', err instanceof AppServerRpcError ? 'rpc' : 'transport', turn);
+          if (!turn.completed) { turn.completed = true; turn.resolveDone(); }
+          return;
+        }
+        // No positive evidence yet. A non-RPC failure (timeout / transport drop)
+        // leaves acceptance genuinely UNKNOWN → fence. An explicit server error
+        // response (any AppServerRpcError, e.g. -32000 "model overloaded")
+        // definitively proves the turn did NOT run → stays on the
+        // throw→failure-final path (a clean, safely-attributed failure).
+        if (!(err instanceof AppServerRpcError)) {
           fenceUnknown('turn/start', 'transport', turn);
           if (!turn.completed) { turn.completed = true; turn.resolveDone(); }
           return;
@@ -1721,19 +1887,21 @@ async function runTurn(message: QueuedInput): Promise<void> {
   // completion buffered during the RPC (completion-before-response) must set
   // completionSeen / close steering here so the kick below sees a closed group
   // and refuses — otherwise we would steer into an already-completed turn.
-  // B1+B4: if a canonical completion was buffered as a barrier while this start
-  // response was pending (steered group, completion_race), settle the group now
-  // that the response resolved and startResponsePending is cleared. This is the
-  // late-response replay for the multi-member path (the single-turn pending
-  // completion replay below does not cover a steered group). Guard on
-  // completionSeen + a grown group (>1 member) so only a genuinely-buffered
-  // steered completion settles here; the 1-member path stays below.
-  if (!turn.completed
-      && turn.completionSeen
-      && turn.terminalCompletion
-      && !turn.steerInFlight
-      && (turn.accepted?.length ?? 0) > 1) {
-    settleSteeredCompletion(turn, turn.terminalCompletion);
+  // B1+B4 / R3-B2: if a completion was buffered as a barrier while this start
+  // response was pending — either a grown steered group (completion_race), or a
+  // single steerable root whose exact-completion was upgraded to canonical proof
+  // before the response — settle it now that the response resolved and matched
+  // the canonical id. settleSteeredCompletion verifies the ordered group
+  // subsequence (1-member is a valid group) and fails closed on any mismatch, so
+  // a foreign/partial buffered completion can never expand a wrong final.
+  const settleBufferedCanonical = !turn.completed
+    && turn.completionSeen
+    && turn.terminalCompletion
+    && !turn.steerInFlight
+    && turn.accepted?.[0]?.input.codexAppSteerable === true
+    && ((turn.accepted?.length ?? 0) > 1 || turn.identityProof === 'exact_started');
+  if (settleBufferedCanonical) {
+    settleSteeredCompletion(turn, turn.terminalCompletion!);
   }
   const pendingNotifications = turn.pendingNotifications.splice(0);
   for (const notification of pendingNotifications) {
