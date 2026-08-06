@@ -1,7 +1,6 @@
 import * as Lark from '@larksuiteoapi/node-sdk';
 import { readFileSync, existsSync, statSync } from 'node:fs';
 import { resolve } from 'node:path';
-import { homedir } from 'node:os';
 import { underReadIsolation } from './adapters/cli/read-isolation.js';
 import type { BackendType } from './adapters/backend/types.js';
 import type { RiffBackendConfig } from './adapters/backend/riff-backend.js';
@@ -18,6 +17,7 @@ import type { BotSkillPolicy, SkillSelector } from './core/skills/types.js';
 import { normalizeStartupCommandList } from './core/startup-commands.js';
 import { DAEMON_COMMANDS } from './core/passthrough-commands.js';
 import { sanitizePerBotEnv } from './core/per-bot-env.js';
+import { resolveBotmuxConfigDir } from './core/config-dir.js';
 import { normalizeSubstituteMode } from './services/substitute-mode-normalize.js';
 import { normalizePluginIdList } from './core/plugins/ids.js';
 import { normalizeVcMeetingProfileInstructions } from './services/vc-meeting-profile-instructions.js';
@@ -1932,7 +1932,7 @@ export function normalizeUsageDisplay(entry: {
 function botsConfigDiskPath(): string | null {
   const env = process.env.BOTS_CONFIG;
   if (env) { const r = resolve(env); return existsSync(r) ? r : null; }
-  const d = resolve(homedir(), '.botmux', 'bots.json');
+  const d = resolve(resolveBotmuxConfigDir(), 'bots.json');
   return existsSync(d) ? d : null;
 }
 
@@ -2073,7 +2073,7 @@ function maybeSynthesizeCoreOnlyConfig(): BotConfig[] | null {
   // validation + normalization as a file-loaded one (apiOnly secret exemption,
   // cliId check, defaults). Pin loadedConfigPath to the default in-root path.
   const configs = parseBotConfigsFromText(JSON.stringify([entry]));
-  loadedConfigPath = resolve(homedir(), '.botmux', 'bots.json');
+  loadedConfigPath = resolve(resolveBotmuxConfigDir(), 'bots.json');
   return configs;
 }
 
@@ -2089,8 +2089,8 @@ function resolveBotConfigPath(): string {
     return resolved;
   }
 
-  // 2. ~/.botmux/bots.json
-  const defaultPath = resolve(homedir(), '.botmux', 'bots.json');
+  // 2. <config dir>/bots.json (BOTMUX_CONFIG_DIR, else ~/.botmux)
+  const defaultPath = resolve(resolveBotmuxConfigDir(), 'bots.json');
   if (existsSync(defaultPath)) {
     loadedConfigPath = defaultPath;
     return defaultPath;

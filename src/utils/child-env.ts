@@ -166,6 +166,13 @@ export const BOTMUX_INJECTED_ENV_KEYS = [
   // v3 host effects / schedule delivery need chatType inside the pane.
   'BOTMUX_CHAT_TYPE',
   'BOTMUX_LARK_APP_ID',
+  // Config root this fleet's registry lives under. Injected so a CLI child can
+  // find the SAME bots.json the daemon loaded even when the daemon runs under a
+  // non-default HOME (`HOME=~/alt botmux start`): the child inherits cwd and the
+  // BOTMUX_* family but never HOME, so without this it resolves the *default*
+  // ~/.botmux, misses its own appId, and every `botmux send` from inside that
+  // session fails "Bot not registered". A path, not a credential.
+  'BOTMUX_CONFIG_DIR',
   'BOTMUX_ROOT_MESSAGE_ID',
   // Session owner (standard name; `__OWNER_OPEN_ID` above is the legacy
   // channel). Custom CLI wrappers read it for per-user permission isolation.
