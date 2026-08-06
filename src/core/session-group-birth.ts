@@ -20,6 +20,7 @@ import { getBot } from '../bot-registry.js';
 import { createGroupWithBots } from '../services/group-creator.js';
 import { registerSessionGroup } from '../services/session-groups-store.js';
 import { scheduleSessionGroupTitle } from '../services/session-group-title.js';
+import { tagSessionGroup } from '../services/feed-group-tagger.js';
 import { sendMessage, replyMessage } from '../im/lark/client.js';
 import { extractMessageTextForRouting, type RoutingContext } from '../im/lark/event-dispatcher.js';
 import { t, localeForBot, type Locale } from '../i18n/index.js';
@@ -79,32 +80,51 @@ export async function maybeBirthSessionGroup(
     registerSessionGroup(newChatId, { ownerOpenId: senderOpenId, lastSessionId: '' });
 
     // Intro message: quote the user's DM text so the group is self-explaining.
+    // Its message_id becomes the turn's IN-GROUP anchor (ctx.messageId below):
+    // the streaming card / replies quote THIS message, keeping every output in
+    // the group — anchoring on the original DM message would leak them to the DM.
     const excerpt = trimmed
       ? Array.from(trimmed).slice(0, 500).join('')
       : t('sg.intro_no_text', undefined, locale);
-    await sendMessage(
-      larkAppId,
-      newChatId,
-      `📥 <at user_id="${senderOpenId}"></at> ${t('sg.intro', undefined, locale)}\n${excerpt}`,
-      'text',
-    ).catch(err => logger.warn(`[session-group] intro message failed for ${newChatId.substring(0, 12)}: ${err}`));
-
-    // DM receipt with the group link (default on).
-    if (sg.dmReceipt !== false) {
-      const link = `https://applink.feishu.cn/client/chat/open?openChatId=${newChatId}`;
-      await replyMessage(
+    let introMessageId: string | undefined;
+    try {
+      introMessageId = await sendMessage(
         larkAppId,
-        messageId,
-        t('sg.receipt', { link }, locale),
-      ).catch(err => logger.warn(`[session-group] DM receipt failed: ${err}`));
+        newChatId,
+        `📥 <at user_id="${senderOpenId}"></at> ${t('sg.intro', undefined, locale)}\n${excerpt}`,
+        'text',
+      );
+    } catch (err) {
+      logger.warn(`[session-group] intro message failed for ${newChatId.substring(0, 12)}: ${err}`);
     }
+
+    // DM receipt (default on): a share_chat 群名片 card — tap to jump into the
+    // group. Falls back to a plain text link when share_chat is rejected.
+    if (sg.dmReceipt !== false) {
+      try {
+        await replyMessage(larkAppId, messageId, JSON.stringify({ chat_id: newChatId }), 'share_chat');
+      } catch (err) {
+        logger.info(`[session-group] share_chat receipt failed (${err}); falling back to link text`);
+        const link = `https://applink.feishu.cn/client/chat/open?openChatId=${newChatId}`;
+        await replyMessage(
+          larkAppId,
+          messageId,
+          t('sg.receipt', { link }, locale),
+        ).catch(err2 => logger.warn(`[session-group] DM receipt failed: ${err2}`));
+      }
+    }
+
+    // Sidebar tag (feedGroup, explicit mode) — fire-and-forget, degrades to
+    // untagged with an owner auth nudge when the user token/scope is missing.
+    void tagSessionGroup(larkAppId, newChatId, senderOpenId);
 
     // T1 of two-phase naming: async AI title → rename (fire-and-forget).
     scheduleSessionGroupTitle({ larkAppId, chatId: newChatId, userText: trimmed });
 
     logger.info(
       `[session-group] born chat=${newChatId.substring(0, 12)} for dm=${dmChatId.substring(0, 12)} ` +
-      `msg=${messageId.substring(0, 12)} name="${placeholder}" workingDir=${workingDir ?? '-'}`,
+      `msg=${messageId.substring(0, 12)} intro=${introMessageId?.substring(0, 12) ?? '-'} ` +
+      `name="${placeholder}" workingDir=${workingDir ?? '-'}`,
     );
 
     return {
@@ -113,6 +133,11 @@ export async function maybeBirthSessionGroup(
       chatType: 'group',
       scope: 'chat',
       anchor: newChatId,
+      // Re-anchor the turn on the in-group intro message so the first turn's
+      // reply target lives in the group. Fall back to the DM message id when
+      // the intro failed to send (replies then degrade to the DM, but the
+      // session itself still lives in the group).
+      messageId: introMessageId ?? messageId,
       replyRootId: undefined,
       sessionGroupBirth: true,
     };

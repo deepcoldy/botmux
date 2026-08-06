@@ -15457,7 +15457,10 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
   // `botmux send` can --mention-back / 引用 the triggering message (chat scope).
   // Without this the first reply hits hasQuoteTargetSender=false (exit 2) and
   // chat-scope首条不引用. Use the event's sender open_id (correct app scope).
-  session.quoteTargetId = parsed.messageId;
+  // Keyed off ctx.messageId (== parsed.messageId except for session-group
+  // births, where ctx re-anchors the turn on the in-group intro message so
+  // quotes stay in the group instead of leaking to the source DM).
+  session.quoteTargetId = messageId;
   session.quoteTargetSenderOpenId = senderOpenId;
   session.quoteTargetSenderIsBot = parsed.senderType === 'app' || parsed.senderType === 'bot';
   session.lastMessageAt = new Date(now).toISOString();

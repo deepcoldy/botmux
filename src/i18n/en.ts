@@ -1143,4 +1143,5 @@ export const messages: Record<string, string> = {
   'sg.receipt': '✅ Created a dedicated group for this conversation — continue there: {link}',
   'sg.birth_failed': '⚠️ Group creation failed ({error}); falling back to a DM topic for this conversation.',
   'sg.cmd_unsupported': '⚠️ {cmd} is not supported in session groups: they are auto-created and managed by the bot with a fixed continuous-session mode.',
+  'sg.tag_auth_nudge': '🏷️ Session group created, but the sidebar tag could not be applied ({reason}): feed groups are your personal data and need a one-time authorization. Authorize here (incremental, existing grants unaffected):\n{url}\n\nOnce authorized, new session groups are tagged automatically. If the link errors on permissions, enable the im:feed_group_v1 scopes for this app in the developer console first.',
 };

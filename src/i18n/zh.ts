@@ -1146,4 +1146,5 @@ export const messages: Record<string, string> = {
   'sg.receipt': '✅ 已为本次会话创建专属群，后续请在群里继续：{link}',
   'sg.birth_failed': '⚠️ 建群失败（{error}），本次会话回退为私聊话题。',
   'sg.cmd_unsupported': '⚠️ 会话群不支持 {cmd}：会话群由 bot 自动创建和管理，固定为连续会话模式。',
+  'sg.tag_auth_nudge': '🏷️ 会话群已创建，但侧边栏标签还挂不上（{reason}）：标签是你的个人数据，需要你授权一次「消息分组」权限。点此授权（增量，不影响已有权限）：\n{url}\n\n授权后新建的会话群会自动进入标签分组。若链接打开报权限错误，说明应用还没开通 im:feed_group_v1 权限，需在开放平台后台启用后重试。',
 };

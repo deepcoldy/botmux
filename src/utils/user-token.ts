@@ -223,6 +223,17 @@ export const DOC_COMMENT_OAUTH_SCOPES = [
 ];
 
 /**
+ * 会话群标签（p2pMode=group + feedGroup）专用的额外 OAuth scope。飞书「消息分组」
+ * 是用户个人侧边栏数据，只认 user_access_token —— 与 DOC_COMMENT_OAUTH_SCOPES
+ * 同理**不进**通用 /login 的 DEFAULT_SCOPES。使用前需在开发者后台为该 app 启用
+ * 这两个用户 scope（见 setup/lark-scopes.json）。
+ */
+export const FEED_GROUP_OAUTH_SCOPES = [
+  'im:feed_group_v1:write',  // 创建/改名标签、把会话群挂进标签
+  'im:feed_group_v1:read',   // 查询标签与成员（校验/去重）
+];
+
+/**
  * Generate an OAuth authorization URL. Returns the URL and stores pending state.
  * Called by /login command handler.
  */

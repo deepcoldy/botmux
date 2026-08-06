@@ -254,6 +254,8 @@
       "im:chat:moderation:write_only",
       "im:chat:read",
       "im:chat:update",
+      "im:feed_group_v1:read",
+      "im:feed_group_v1:write",
       "im:message",
       "im:message.group_msg:get_as_user",
       "im:message.p2p_msg:get_as_user",
