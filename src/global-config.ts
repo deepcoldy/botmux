@@ -453,6 +453,10 @@ export function readGlobalConfig(): GlobalConfig {
   const vcMeetingAgent = readVcMeetingAgent(raw.vcMeetingAgent);
   if (vcMeetingAgent) out.vcMeetingAgent = vcMeetingAgent;
   if (typeof raw.httpProxy === 'string' && raw.httpProxy.trim()) out.httpProxy = raw.httpProxy.trim();
+  // Lenient http(s) origin check; resolveOAuthRedirectUri re-validates shape.
+  if (typeof raw.oauthRedirectBase === 'string' && /^https?:\/\//.test(raw.oauthRedirectBase.trim())) {
+    out.oauthRedirectBase = raw.oauthRedirectBase.trim();
+  }
   const skills = readGlobalSkills(raw.skills);
   if (skills) out.skills = skills;
   const plugins = normalizePluginIdList(raw.plugins);
