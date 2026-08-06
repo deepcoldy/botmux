@@ -168,6 +168,16 @@ describe('dispatch report switch wiring', () => {
     expect(seededKickoff).toBeGreaterThan(standbyGuard);
   });
 
+  it('authenticates the exact report callback through daemon IPC', () => {
+    const source = readFileSync(new URL('../src/cli.ts', import.meta.url), 'utf8');
+    const start = source.indexOf('async function cmdReport');
+    const end = source.indexOf('\nasync function ', start + 1);
+    const report = source.slice(start, end);
+
+    expect(report).toContain("fetchDaemonIpc(daemon.ipcPort, '/api/trigger'");
+    expect(report).not.toContain('fetch(`http://127.0.0.1:${daemon.ipcPort}/api/trigger`');
+  });
+
   it('renders dispatch save feedback inside its own dashboard setting row', () => {
     const source = readFileSync(new URL('../src/dashboard/web/roles-page.tsx', import.meta.url), 'utf8');
     const injectStart = source.indexOf("tr('roles.injectModeLabel')");

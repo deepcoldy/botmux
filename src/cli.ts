@@ -8727,7 +8727,7 @@ async function cmdReport(rest: string[]): Promise<void> {
     }
     let response: Response;
     try {
-      response = await fetch(`http://127.0.0.1:${daemon.ipcPort}/api/trigger`, {
+      response = await fetchDaemonIpc(daemon.ipcPort, '/api/trigger', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({
