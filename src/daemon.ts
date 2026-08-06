@@ -15451,6 +15451,7 @@ const RETRYABLE_REPO_CARD_TRANSPORT_CODES = new Set([
   'ECONNABORTED',
   'ETIMEDOUT',
 ]);
+const REPO_CARD_TRANSPORT_RETRY_DELAY_MS = 100;
 
 function isRetryableRepoCardTransportError(err: unknown): boolean {
   const code = typeof (err as any)?.code === 'string' ? (err as any).code : '';
@@ -15483,6 +15484,13 @@ async function postPendingRepoSelectCard(
     } catch (err) {
       if (!isRetryableRepoCardTransportError(err)) throw err;
       logger.warn(`[${tag(ds)}] Repo selection card transport failed; retrying with stable UUID: ${err instanceof Error ? err.message : err}`);
+      // The failed socket is removed from the shared Agent on a later event-loop
+      // turn. An immediate retry can pick it again and fail within the same 2ms.
+      await new Promise<void>(resolve => setTimeout(resolve, REPO_CARD_TRANSPORT_RETRY_DELAY_MS));
+      if (!ds.pendingRepo || !ownsCurrentRoute(ds, ds.larkAppId)) {
+        logger.info(`[${tag(ds)}] Repo selection card retry skipped because the pending route changed during backoff`);
+        return undefined;
+      }
       return await sessionReply(anchor, cardJson, 'interactive', ds.larkAppId, undefined, { uuid: deliveryUuid });
     }
   } catch (err) {

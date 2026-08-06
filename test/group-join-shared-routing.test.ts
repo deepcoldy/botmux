@@ -334,7 +334,7 @@ describe('handleBotAdded — 普通群 shared 路由', () => {
     );
   });
 
-  it('仓库卡遇到陈旧连接时使用同一个 UUID 重发且不产生文本兜底', async () => {
+  it('仓库卡遇到陈旧连接时让出事件循环，再使用同一个 UUID 重发', async () => {
     const { daemon, registry, types } = modules;
     const appId = 'app_join_repo_card_retry';
     const chatId = 'oc_join_repo_card_retry';
@@ -346,9 +346,18 @@ describe('handleBotAdded — 普通群 shared 路由', () => {
       type: 'repo',
       branch: 'master',
     }]);
+    let staleSocketsDrained = false;
     mocks.replyMessage
-      .mockRejectedValueOnce(Object.assign(new Error('write EPIPE'), { code: 'EPIPE' }))
-      .mockResolvedValueOnce('om_repo_retry');
+      .mockImplementationOnce(async () => {
+        setTimeout(() => { staleSocketsDrained = true; }, 0);
+        throw Object.assign(new Error('write EPIPE'), { code: 'EPIPE' });
+      })
+      .mockImplementationOnce(async () => {
+        if (!staleSocketsDrained) {
+          throw Object.assign(new Error('write EPIPE'), { code: 'EPIPE' });
+        }
+        return 'om_repo_retry';
+      });
     registry.registerBot({
       larkAppId: appId,
       larkAppSecret: 's',
@@ -368,6 +377,43 @@ describe('handleBotAdded — 普通群 shared 路由', () => {
     expect(mocks.replyMessage.mock.calls[0]?.[5]).toMatch(/^repo-picker:[0-9a-f-]{36}$/);
     expect(mocks.replyMessage.mock.calls[1]?.[5]).toBe(mocks.replyMessage.mock.calls[0]?.[5]);
     expect(mocks.replyMessage.mock.calls.every(call => call[3] === 'interactive')).toBe(true);
+  });
+
+  it('仓库卡退避期间待选状态被消费时不再发送陈旧卡片', async () => {
+    const { daemon, registry, types } = modules;
+    const appId = 'app_join_repo_card_retry_consumed';
+    const chatId = 'oc_join_repo_card_retry_consumed';
+    const scanDir = tempDir('scan-repo-card-retry-consumed');
+    mocks.getProjectScanDirs.mockReturnValue([scanDir]);
+    mocks.scanMultipleProjects.mockReturnValue([{
+      name: 'botmux',
+      path: scanDir,
+      type: 'repo',
+      branch: 'master',
+    }]);
+    mocks.replyMessage.mockImplementationOnce(async () => {
+      setTimeout(() => {
+        const ds = daemon.__testOnly_activeSessions.get(types.sessionKey(chatId, appId));
+        if (ds) ds.pendingRepo = false;
+      }, 0);
+      throw Object.assign(new Error('write EPIPE'), { code: 'EPIPE' });
+    });
+    registry.registerBot({
+      larkAppId: appId,
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      allowedUsers: ['ou_owner'],
+      autoStartOnGroupJoin: true,
+      autoStartOnGroupJoinPrompt: '开始排查',
+      regularGroupReplyMode: 'shared',
+    });
+
+    await daemon.__testOnly_handleBotAdded(chatId, 'ou_owner', appId);
+
+    const ds = daemon.__testOnly_activeSessions.get(types.sessionKey(chatId, appId));
+    expect(ds?.pendingRepo).toBe(false);
+    expect(ds?.repoCardMessageId).toBeUndefined();
+    expect(mocks.replyMessage).toHaveBeenCalledTimes(1);
   });
 
   it('仓库卡两次传输失败后保留待选输入，并在后续消息中给出文本恢复路径', async () => {
