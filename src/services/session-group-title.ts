@@ -21,7 +21,9 @@ import { updateSessionTitle } from '../core/session-title.js';
 import { localeForBot } from '../i18n/index.js';
 import { logger } from '../utils/logger.js';
 
-const TITLE_TIMEOUT_MS = 15_000;
+// Generous: one-shot CLIs pay cold-start + API latency (codex regularly
+// exceeds 15s); the rename is async so a slow title costs nothing visible.
+const TITLE_TIMEOUT_MS = 45_000;
 const DEFAULT_MAX_LEN = 12;
 
 /** Per-cliId one-shot print-mode argv template. `argv[0]` is replaced by
@@ -41,21 +43,37 @@ export function buildTitlePrompt(text: string, maxLen: number, locale: string): 
   return `用不超过${maxLen}个字总结下面这条请求，作为会话标题。只输出标题本身，不要引号、句号或任何解释：\n\n${excerpt}`;
 }
 
-/** Extract a plausible title from one-shot CLI stdout: last non-empty line
- *  (codex/opencode prepend progress logs; claude/gemini print the bare
- *  answer), stripped of quotes/markdown and length-capped. */
-export function sanitizeTitleOutput(stdout: string, maxLen: number): string | null {
-  const lines = stdout.split('\n').map(l => l.trim()).filter(Boolean)
-    // codex exec progress lines look like "[2026-08-05T…] tokens used: 123" —
-    // drop bracketed/log-ish lines so the answer line survives as the last one.
-    .filter(l => !/^\[.*\]/.test(l) && !/^(tokens used|thinking|codex$|user$)/i.test(l));
-  const raw = lines.length ? lines[lines.length - 1] : '';
-  const cleaned = raw
+/** Strip decoration from a candidate title line. */
+function cleanTitleLine(raw: string): string {
+  return raw
     .replace(/^["'“”‘’`#*\s]+/, '')
     // Trailing quotes/backticks and sentence punctuation interleave (e.g.
     // `标题"。`) — strip them as one class so the order can't matter.
     .replace(/["'“”‘’`。.!！?？\s]+$/, '')
     .trim();
+}
+
+/** Extract a plausible title from one-shot CLI stdout: last non-empty line
+ *  (codex/opencode prepend progress logs; claude/gemini print the bare
+ *  answer), stripped of quotes/markdown and length-capped. Two passes: a
+ *  strict pass drops known log-line shapes; if that filters EVERYTHING (an
+ *  output shape we didn't predict), a lenient pass takes the last line that
+ *  still looks like prose — never let over-filtering blank a real answer. */
+export function sanitizeTitleOutput(stdout: string, maxLen: number): string | null {
+  const all = stdout.split('\n').map(l => l.trim()).filter(Boolean);
+  const strict = all
+    // codex exec progress lines look like "[2026-08-05T…] tokens used: 123" —
+    // drop bracketed/log-ish lines so the answer line survives as the last one.
+    .filter(l => !/^\[.*\]/.test(l) && !/^(tokens used|thinking|codex$|user$)/i.test(l));
+  const lenient = all
+    // Lenient fallback: exclude only obvious non-answers (dividers, pure
+    // numbers/punctuation, hook chatter) — keep anything prose-like.
+    .filter(l => /[\p{L}\p{N}]/u.test(l) && !/^[-=—_\s]+$/.test(l) && !/^\d[\d,.\s]*$/.test(l) && !/^hook:/i.test(l));
+  const raw = strict.length ? strict[strict.length - 1]
+    // The lenient pick may still carry a bracketed log prefix — strip it so a
+    // "[ts] answer" line yields the answer, not the timestamp.
+    : lenient.length ? lenient[lenient.length - 1].replace(/^\[[^\]]*\]\s*/, '') : '';
+  const cleaned = cleanTitleLine(raw);
   if (!cleaned) return null;
   // Hard cap: maxLen is advisory to the model; enforce a generous ceiling so
   // a slightly-long but good title still beats the placeholder.
@@ -119,7 +137,9 @@ export function scheduleSessionGroupTitle(opts: {
 
       const title = sanitizeTitleOutput(stdout, maxLen);
       if (!title) {
-        logger.info(`[session-group] AI title empty for chat=${chatId.substring(0, 12)}; keeping placeholder`);
+        // Log the raw head — an unpredicted output shape is invisible otherwise.
+        const rawHead = stdout.replace(/\s+/g, ' ').trim().slice(0, 200);
+        logger.info(`[session-group] AI title empty for chat=${chatId.substring(0, 12)}; keeping placeholder (raw: "${rawHead}")`);
         return;
       }
       const prefix = sg.namePrefix ?? '';

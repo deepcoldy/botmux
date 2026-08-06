@@ -123,6 +123,17 @@ describe('sanitizeTitleOutput', () => {
     expect(sanitizeTitleOutput('\n  \n', 12)).toBeNull();
   });
 
+  it('lenient fallback recovers when every line matches the strict log filter', () => {
+    // Unpredicted shape: the answer itself carries a bracketed prefix.
+    const out = '[2026-08-06T07:34:19] codex\n[2026-08-06T07:34:19] 问候会话\n';
+    expect(sanitizeTitleOutput(out, 12)).toBe('问候会话');
+  });
+
+  it('lenient fallback skips dividers, bare numbers and hook chatter', () => {
+    const out = '[a] x\n--------\nhook: Stop\n6,518\n[b] 排查combine接口\n';
+    expect(sanitizeTitleOutput(out, 12)).toBe('排查combine接口');
+  });
+
   it('caps runaway output length', () => {
     const long = 'x'.repeat(200);
     const got = sanitizeTitleOutput(long, 12)!;
