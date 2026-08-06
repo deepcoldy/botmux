@@ -8303,9 +8303,8 @@ button.dashboard-version-chip:hover,
   color: var(--fg);
 }
 .dashboard-version-popover {
-  position: absolute;
-  top: calc(100% + 8px);
-  left: 0;
+  position: fixed;
+  z-index: 1601;
   display: flex;
   flex-direction: column;
   width: min(340px, calc(100vw - 32px));
@@ -12923,7 +12922,6 @@ dialog :where(input:not([type=checkbox], [type=radio]), select, textarea) {
   }
   .dashboard-version-control { margin-left: 33px; }
   .dashboard-version-popover {
-    left: -33px;
     width: min(340px, calc(100vw - 24px));
   }
   .topbar-left {

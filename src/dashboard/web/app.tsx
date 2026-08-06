@@ -1,5 +1,6 @@
 // Dashboard SPA entry: React chrome + lazy route host + SSE bootstrap.
 import type React from 'react';
+import { createPortal } from 'react-dom';
 import { createRoot } from 'react-dom/client';
 import { useEffect, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
@@ -578,6 +579,8 @@ function TopbarVersionControl(props: {
   const reconnectTimerRef = useRef<number | null>(null);
   const rootRef = useRef<HTMLDivElement>(null);
   const triggerRef = useRef<HTMLButtonElement>(null);
+  const popoverRef = useRef<HTMLElement>(null);
+  const [popoverPosition, setPopoverPosition] = useState<{ top: number; left: number } | null>(null);
 
   const clearReconnectTimer = () => {
     if (reconnectTimerRef.current === null) return;
@@ -608,12 +611,39 @@ function TopbarVersionControl(props: {
     if (!open) setRollbackOpen(false);
   }, [open]);
 
+  useEffect(() => {
+    if (!open) {
+      setPopoverPosition(null);
+      return;
+    }
+
+    const updatePopoverPosition = () => {
+      const trigger = triggerRef.current;
+      if (!trigger) return;
+      const rect = trigger.getBoundingClientRect();
+      const maxWidth = Math.min(340, Math.max(0, window.innerWidth - 32));
+      const left = Math.max(16, Math.min(rect.left, window.innerWidth - maxWidth - 16));
+      setPopoverPosition({ top: rect.bottom + 8, left });
+    };
+
+    updatePopoverPosition();
+    window.addEventListener('resize', updatePopoverPosition);
+    // The trigger can move when any ancestor scrolls, not just the window.
+    document.addEventListener('scroll', updatePopoverPosition, true);
+    return () => {
+      window.removeEventListener('resize', updatePopoverPosition);
+      document.removeEventListener('scroll', updatePopoverPosition, true);
+    };
+  }, [open]);
+
   useEffect(() => () => clearReconnectTimer(), []);
 
   useEffect(() => {
     if (!open) return;
     const closeOnPointerDown = (event: PointerEvent) => {
-      if (!rootRef.current?.contains(event.target as Node)) setOpen(false);
+      const target = event.target as Node;
+      if (rootRef.current?.contains(target) || popoverRef.current?.contains(target)) return;
+      setOpen(false);
     };
     const closeOnEscape = (event: KeyboardEvent) => {
       if (event.key !== 'Escape') return;
@@ -818,12 +848,14 @@ function TopbarVersionControl(props: {
               aria-hidden="true"
             >{versionSignal.symbol}</span>}
       </button>
-      {open ? (
+      {open && popoverPosition && typeof document !== 'undefined' ? createPortal((
         <section
+          ref={popoverRef}
           className="dashboard-version-popover"
           role="dialog"
           aria-modal="false"
           aria-labelledby="dashboard-version-title"
+          style={{ top: popoverPosition.top, left: popoverPosition.left }}
         >
           <header className="dashboard-version-popover-head">
             <strong id="dashboard-version-title">{t('update.current')}</strong>
@@ -994,7 +1026,7 @@ function TopbarVersionControl(props: {
             </footer>
           ) : null}
         </section>
-      ) : null}
+      ), document.body) : null}
     </div>
   );
 }
