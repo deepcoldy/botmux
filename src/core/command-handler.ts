@@ -1291,6 +1291,7 @@ export async function handleCommand(
           // Capture the closed-session card BEFORE killWorker/closeSession —
           // it reads the live session's identity off `ds`.
           const card = buildClosedSessionCard(ds, loc);
+          const scanCardToWithdraw = ds.repoScanCardMessageId;
           const activeKey = sessionKey(rootId, larkAppId!);
           try {
             await closeSession(ds.session.sessionId);
@@ -1303,6 +1304,11 @@ export async function handleCommand(
             break;
           }
           if (activeSessions.get(activeKey) === ds) activeSessions.delete(activeKey);
+          ds.repoScanCardMessageId = undefined;
+          if (scanCardToWithdraw) {
+            void deleteMessage(ds.larkAppId, scanCardToWithdraw)
+              .catch(err => logger.debug(`[${logTag}] Repo scan card withdraw after /close failed: ${err}`));
+          }
           // 「会话已关闭」卡片优先「仅自己可见」：普通群里走 ephemeral 只发给执行
           // /close 的本人；话题群不支持 ephemeral(18053) 时回退为正常的群内可见回复
           // ——与流式卡片上「关闭会话」按钮的送达方式保持一致。
@@ -1598,8 +1604,10 @@ export async function handleCommand(
             // best-effort; stale card clicks must be rejected via this mark even
             // if sessionReply throws or deleteMessage lags/fails.
             const cardToWithdraw = ds!.repoCardMessageId;
+            const scanCardToWithdraw = ds!.repoScanCardMessageId;
             markRepoCardConsumed(ds!, cardToWithdraw);
             ds!.repoCardMessageId = undefined;
+            ds!.repoScanCardMessageId = undefined;
 
             // Hold the claim through confirmation + best-effort card withdraw.
             try {
@@ -1609,6 +1617,9 @@ export async function handleCommand(
             }
             if (cardToWithdraw) {
               try { await deleteMessage(ds!.larkAppId, cardToWithdraw); } catch { /* best-effort */ }
+            }
+            if (scanCardToWithdraw) {
+              try { await deleteMessage(ds!.larkAppId, scanCardToWithdraw); } catch { /* best-effort */ }
             }
           } finally {
             ds!.pendingRepoCommitInFlight = false;

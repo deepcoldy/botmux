@@ -611,8 +611,10 @@ export async function commitRepoSelection(
       // release (and so a sessionReply throw that jumps to finally still leaves
       // the card locally invalid).
       const cardToWithdraw = cardMessageId ?? ds.repoCardMessageId;
+      const scanCardToWithdraw = ds.repoScanCardMessageId;
       markRepoCardConsumed(ds, cardToWithdraw);
       ds.repoCardMessageId = undefined;
+      ds.repoScanCardMessageId = undefined;
 
       // Hold the claim through confirmation. Card withdrawal is deferred until
       // after the callback can ACK; stale clicks are blocked by the local
@@ -630,6 +632,7 @@ export async function commitRepoSelection(
         logger.warn(`[${tag(ds)}] Confirm reply after pending repo commit failed: ${e instanceof Error ? e.message : e}`);
       }
       deferRepoCardWithdraw(larkAppId, cardToWithdraw);
+      deferRepoCardWithdraw(larkAppId, scanCardToWithdraw);
     } finally {
       ds.pendingRepoCommitInFlight = false;
     }

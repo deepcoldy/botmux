@@ -11,6 +11,10 @@ const mocks = vi.hoisted(() => {
   delete process.env.BOTMUX_LARK_APP_ID;
 
   let sessionSeq = 0;
+  let outboundMessageSeq = 0;
+  const nextOutboundMessageId = (msgType: string | undefined, fallback: string) => (
+    msgType === 'interactive' ? `om_interactive_${++outboundMessageSeq}` : fallback
+  );
   const scanDeferreds: Array<{
     promise: Promise<any[]>;
     resolve: (projects: any[]) => void;
@@ -29,6 +33,7 @@ const mocks = vi.hoisted(() => {
 
   return {
     addReaction: vi.fn(async () => 'reaction_received'),
+    closeSession: vi.fn(async () => ({ ok: true, alreadyClosed: false, known: true })),
     createSession: vi.fn((chatId: string, rootMessageId: string, title: string, chatType?: 'group' | 'p2p') => ({
       sessionId: `sess-repo-scan-${++sessionSeq}`,
       chatId,
@@ -45,7 +50,9 @@ const mocks = vi.hoisted(() => {
     getChatMode: vi.fn(async () => 'group' as 'group' | 'topic' | 'p2p'),
     getChatNameAndMode: vi.fn(async () => ({ name: null, mode: 'group' as const })),
     getProjectScanDirs: vi.fn(() => ['/tmp']),
-    replyMessage: vi.fn(async () => 'om_reply'),
+    nextOutboundMessageId,
+    replyMessage: vi.fn(async (...args: any[]) => nextOutboundMessageId(args[3], 'om_reply')),
+    resetOutboundMessageSeq: () => { outboundMessageSeq = 0; },
     resolveSender: vi.fn(async (_appId: string, openId: string | undefined, senderType: string | undefined) => (
       openId
         ? { openId, type: senderType === 'app' || senderType === 'bot' ? 'bot' as const : 'user' as const }
@@ -53,7 +60,7 @@ const mocks = vi.hoisted(() => {
     )),
     scanDeferreds,
     scanMultipleProjectsAsync,
-    sendMessage: vi.fn(async () => 'om_top'),
+    sendMessage: vi.fn(async (...args: any[]) => nextOutboundMessageId(args[3], 'om_top')),
     updateSession: vi.fn(),
   };
 });
@@ -107,7 +114,11 @@ vi.mock('../src/services/project-scanner-async.js', () => ({
 
 vi.mock('../src/core/worker-pool.js', async () => {
   const actual = await vi.importActual<any>('../src/core/worker-pool.js');
-  return { ...actual, forkWorker: (...args: any[]) => mocks.forkWorker(...args) };
+  return {
+    ...actual,
+    closeSession: (...args: any[]) => mocks.closeSession(...args),
+    forkWorker: (...args: any[]) => mocks.forkWorker(...args),
+  };
 });
 
 import { __testOnly_resetBotRegistry, registerBot } from '../src/bot-registry.js';
@@ -171,7 +182,12 @@ async function startPendingScan(anchor: string, text = '请分析这个需求') 
   await vi.waitFor(() => expect(mocks.scanMultipleProjectsAsync).toHaveBeenCalledTimes(1));
   const ds = activeSessions.get(sessionKey(anchor, APP));
   expect(ds).toBeDefined();
-  return { route, ds: ds!, scan: mocks.scanDeferreds[0]! };
+  return {
+    route,
+    ds: ds!,
+    scan: mocks.scanDeferreds[0]!,
+    progressMessageId: ds!.repoScanCardMessageId,
+  };
 }
 
 async function waitForScanFinish(ds: { repoScanInFlight?: boolean }): Promise<void> {
@@ -181,6 +197,15 @@ async function waitForScanFinish(ds: { repoScanInFlight?: boolean }): Promise<vo
 describe('first-mention async repo scan routing', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mocks.resetOutboundMessageSeq();
+    mocks.replyMessage.mockReset();
+    mocks.replyMessage.mockImplementation(async (...args: any[]) => (
+      mocks.nextOutboundMessageId(args[3], 'om_reply')
+    ));
+    mocks.sendMessage.mockReset();
+    mocks.sendMessage.mockImplementation(async (...args: any[]) => (
+      mocks.nextOutboundMessageId(args[3], 'om_top')
+    ));
     mocks.scanDeferreds.length = 0;
     activeSessions.clear();
     __resetAnchorQueues();
@@ -195,12 +220,15 @@ describe('first-mention async repo scan routing', () => {
     bot.resolvedAllowedUsers = [OWNER];
   });
 
-  it('reports scan progress before the child resolves, then posts the picker without consuming pendingRepo', async () => {
-    const { route, ds, scan } = await startPendingScan('om_scan_projects');
+  it('posts scan progress before the child resolves, then replaces it with the picker', async () => {
+    const { route, ds, scan, progressMessageId } = await startPendingScan('om_scan_projects');
     await route;
 
-    expect(outboundText()).toContain('正在扫描仓库');
-    expect(outboundCalls('interactive')).toHaveLength(0);
+    expect(progressMessageId).toBeDefined();
+    expect(ds.repoScanCardMessageId).toBe(progressMessageId);
+    expect(outboundCalls('interactive')).toHaveLength(1);
+    expect(outboundCalls('interactive')[0]?.[5]).toMatch(/^repo-scan:/);
+    expect(outboundText()).toBe('');
     expect(mocks.forkWorker).not.toHaveBeenCalled();
     expect(ds.pendingRepo).toBe(true);
     expect(ds.repoScanInFlight).toBe(true);
@@ -209,16 +237,64 @@ describe('first-mention async repo scan routing', () => {
     await route;
     await waitForScanFinish(ds);
 
-    expect(outboundCalls('interactive')).toHaveLength(1);
-    expect(ds.repoCardMessageId).toBe('om_reply');
+    const interactive = outboundCalls('interactive');
+    expect(interactive).toHaveLength(2);
+    expect(interactive[1]?.[5]).toMatch(/^repo-picker:/);
+    expect(interactive[1]?.[5]).not.toBe(interactive[0]?.[5]);
+    expect(ds.repoCardMessageId).toBeDefined();
+    expect(ds.repoCardMessageId).not.toBe(progressMessageId);
+    expect(ds.repoScanCardMessageId).toBeUndefined();
+    expect(mocks.deleteMessage).toHaveBeenCalledWith(APP, progressMessageId);
     expect(ds.pendingRepo).toBe(true);
     expect(ds.repoScanInFlight).toBe(false);
     expect(mocks.forkWorker).not.toHaveBeenCalled();
   });
 
+  it('falls back to scan text after a non-transient progress POST failure, then still posts the picker', async () => {
+    mocks.replyMessage.mockRejectedValueOnce(new Error('provider rejected progress card'));
+
+    const { route, ds, scan, progressMessageId } = await startPendingScan('om_scan_progress_fallback');
+    await route;
+
+    expect(progressMessageId).toBeUndefined();
+    expect(outboundText()).toContain('正在扫描仓库');
+    expect(outboundCalls('interactive')).toHaveLength(1);
+    expect(outboundCalls('interactive')[0]?.[5]).toMatch(/^repo-scan:/);
+
+    scan.resolve([project('fallback-picker')]);
+    await waitForScanFinish(ds);
+
+    const interactive = outboundCalls('interactive');
+    expect(interactive).toHaveLength(2);
+    expect(interactive[1]?.[5]).toMatch(/^repo-picker:/);
+    expect(ds.repoCardMessageId).toBeDefined();
+    expect(ds.repoScanCardMessageId).toBeUndefined();
+    expect(ds.pendingRepo).toBe(true);
+    expect(mocks.forkWorker).not.toHaveBeenCalled();
+  });
+
+  it('retries a transient progress POST failure with the same stable UUID', async () => {
+    mocks.replyMessage.mockRejectedValueOnce(Object.assign(new Error('write EPIPE'), { code: 'EPIPE' }));
+
+    const { route, ds, scan, progressMessageId } = await startPendingScan('om_scan_progress_retry');
+    await route;
+
+    const progressAttempts = outboundCalls('interactive');
+    expect(progressAttempts).toHaveLength(2);
+    expect(progressAttempts[1]?.[5]).toBe(progressAttempts[0]?.[5]);
+    expect(progressMessageId).toBeDefined();
+    expect(ds.repoScanCardMessageId).toBe(progressMessageId);
+    expect(outboundText()).toBe('');
+
+    scan.resolve([]);
+    await waitForScanFinish(ds);
+    expect(ds.repoScanCardMessageId).toBeUndefined();
+    expect(mocks.deleteMessage).toHaveBeenCalledWith(APP, progressMessageId);
+  });
+
   it('buffers a same-user follow-up during the scan and still posts the picker after resolution', async () => {
     const anchor = 'om_scan_followup_root';
-    const { route, ds, scan } = await startPendingScan(anchor, '首轮请求');
+    const { route, ds, scan, progressMessageId } = await startPendingScan(anchor, '首轮请求');
     await route;
 
     await handleThreadReply(
@@ -227,17 +303,19 @@ describe('first-mention async repo scan routing', () => {
     );
 
     expect(ds.pendingFollowUps).toEqual(['扫描期间补充']);
-    expect(outboundText().match(/正在扫描仓库/g)?.length).toBe(2);
-    expect(outboundCalls('interactive')).toHaveLength(0);
+    expect(outboundText()).toBe('');
+    expect(outboundCalls('interactive')).toHaveLength(1);
     expect(mocks.forkWorker).not.toHaveBeenCalled();
 
     scan.resolve([project('flow_android')]);
     await route;
     await waitForScanFinish(ds);
 
-    expect(outboundCalls('interactive')).toHaveLength(1);
+    expect(outboundCalls('interactive')).toHaveLength(2);
     expect(ds.pendingRepo).toBe(true);
     expect(ds.pendingFollowUps).toEqual(['扫描期间补充']);
+    expect(ds.repoScanCardMessageId).toBeUndefined();
+    expect(mocks.deleteMessage).toHaveBeenCalledWith(APP, progressMessageId);
     expect(mocks.forkWorker).not.toHaveBeenCalled();
   });
 
@@ -249,6 +327,7 @@ describe('first-mention async repo scan routing', () => {
     );
     await vi.waitFor(() => expect(mocks.scanMultipleProjectsAsync).toHaveBeenCalledTimes(1));
     const ds = activeSessions.get(sessionKey(anchor, APP))!;
+    const progressMessageId = ds.repoScanCardMessageId;
     await first;
     expect(ds.repoScanInFlight).toBe(true);
 
@@ -261,12 +340,15 @@ describe('first-mention async repo scan routing', () => {
     );
 
     expect(ds.pendingFollowUps).toEqual(['扫描期间的排队补充']);
-    expect(outboundText().match(/正在扫描仓库/g)?.length).toBe(2);
+    expect(outboundText()).toBe('');
+    expect(outboundCalls('interactive')).toHaveLength(1);
 
     mocks.scanDeferreds[0]!.resolve([project('serialized-flow')]);
     await waitForScanFinish(ds);
 
-    expect(outboundCalls('interactive')).toHaveLength(1);
+    expect(outboundCalls('interactive')).toHaveLength(2);
+    expect(ds.repoScanCardMessageId).toBeUndefined();
+    expect(mocks.deleteMessage).toHaveBeenCalledWith(APP, progressMessageId);
     expect(mocks.forkWorker).not.toHaveBeenCalled();
   });
 
@@ -281,20 +363,22 @@ describe('first-mention async repo scan routing', () => {
     },
   ])('drops a late scan result when $name', async ({ invalidate }) => {
     const anchor = `om_late_${mocks.scanDeferreds.length}_${Math.random().toString(36).slice(2)}`;
-    const { route, ds, scan } = await startPendingScan(anchor);
+    const { route, ds, scan, progressMessageId } = await startPendingScan(anchor);
 
     invalidate(anchor, ds);
     scan.resolve([project('late-project')]);
     await route;
     await waitForScanFinish(ds);
 
-    expect(outboundCalls('interactive')).toHaveLength(0);
+    expect(outboundCalls('interactive')).toHaveLength(1);
+    expect(ds.repoScanCardMessageId).toBeUndefined();
+    expect(mocks.deleteMessage).toHaveBeenCalledWith(APP, progressMessageId);
     expect(mocks.forkWorker).not.toHaveBeenCalled();
     expect(ds.repoScanInFlight).toBe(false);
   });
 
   it('keeps the pending input recoverable with /repo when the scan child rejects', async () => {
-    const { route, ds, scan } = await startPendingScan('om_scan_reject', '不能丢的首轮请求');
+    const { route, ds, scan, progressMessageId } = await startPendingScan('om_scan_reject', '不能丢的首轮请求');
 
     scan.reject(new Error('scanner child crashed'));
     await route;
@@ -304,13 +388,15 @@ describe('first-mention async repo scan routing', () => {
     expect(ds.pendingPrompt).toContain('不能丢的首轮请求');
     expect(ds.repoScanInFlight).toBe(false);
     expect(outboundText()).toContain('/repo');
-    expect(outboundCalls('interactive')).toHaveLength(0);
+    expect(outboundCalls('interactive')).toHaveLength(1);
+    expect(ds.repoScanCardMessageId).toBeUndefined();
+    expect(mocks.deleteMessage).toHaveBeenCalledWith(APP, progressMessageId);
     expect(mocks.forkWorker).not.toHaveBeenCalled();
   });
 
   it('lets bare /repo consume the pending turn while the child is scanning and never reforks', async () => {
     const anchor = 'om_scan_bare_repo';
-    const { route, ds, scan } = await startPendingScan(anchor, '直接开始的首轮请求');
+    const { route, ds, scan, progressMessageId } = await startPendingScan(anchor, '直接开始的首轮请求');
 
     await handleThreadReply(
       makeEventData('om_scan_bare_repo_command', '/repo', anchor),
@@ -318,6 +404,8 @@ describe('first-mention async repo scan routing', () => {
     );
 
     expect(ds.pendingRepo).toBe(false);
+    expect(ds.repoScanCardMessageId).toBeUndefined();
+    expect(mocks.deleteMessage).toHaveBeenCalledWith(APP, progressMessageId);
     expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
 
     scan.resolve([project('late-after-bare-repo')]);
@@ -325,21 +413,97 @@ describe('first-mention async repo scan routing', () => {
     await waitForScanFinish(ds);
 
     expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
-    expect(outboundCalls('interactive')).toHaveLength(0);
+    expect(outboundCalls('interactive')).toHaveLength(1);
     expect(ds.repoScanInFlight).toBe(false);
+  });
+
+  it('withdraws scan progress on /close and ignores the late child result', async () => {
+    const anchor = 'om_scan_close';
+    const { route, ds, scan, progressMessageId } = await startPendingScan(anchor, '关闭前的首轮请求');
+
+    await handleThreadReply(
+      makeEventData('om_scan_close_command', '/close', anchor),
+      makeCtx(anchor, 'om_scan_close_command'),
+    );
+
+    expect(mocks.closeSession).toHaveBeenCalledWith(ds.session.sessionId);
+    expect(activeSessions.has(sessionKey(anchor, APP))).toBe(false);
+    expect(ds.repoScanCardMessageId).toBeUndefined();
+    expect(mocks.deleteMessage).toHaveBeenCalledWith(APP, progressMessageId);
+
+    scan.resolve([project('late-after-close')]);
+    await route;
+    await waitForScanFinish(ds);
+
+    expect(outboundCalls('interactive').some(call => String(call[5]).startsWith('repo-picker:'))).toBe(false);
+    expect(mocks.forkWorker).not.toHaveBeenCalled();
+  });
+
+  it('keeps scan progress active when /close is refused', async () => {
+    mocks.closeSession.mockRejectedValueOnce(new Error('teardown ownership not proven'));
+    const anchor = 'om_scan_close_refused';
+    const { ds, scan, progressMessageId } = await startPendingScan(anchor, '关闭失败后继续等待');
+
+    await handleThreadReply(
+      makeEventData('om_scan_close_refused_command', '/close', anchor),
+      makeCtx(anchor, 'om_scan_close_refused_command'),
+    );
+
+    expect(activeSessions.get(sessionKey(anchor, APP))).toBe(ds);
+    expect(ds.repoScanCardMessageId).toBe(progressMessageId);
+    expect(mocks.deleteMessage).not.toHaveBeenCalledWith(APP, progressMessageId);
+
+    scan.resolve([project('after-refused-close')]);
+    await waitForScanFinish(ds);
+    expect(ds.repoCardMessageId).toBeDefined();
+    expect(ds.repoScanCardMessageId).toBeUndefined();
+  });
+
+  it('keeps the pending turn recoverable when picker delivery fails with a stable retry UUID', async () => {
+    const { route, ds, scan, progressMessageId } = await startPendingScan(
+      'om_scan_picker_delivery_failure',
+      '卡片失败也不能丢的请求',
+    );
+    await route;
+    mocks.replyMessage
+      .mockRejectedValueOnce(Object.assign(new Error('write EPIPE'), { code: 'EPIPE' }))
+      .mockRejectedValueOnce(Object.assign(new Error('socket hang up'), { code: 'ECONNRESET' }));
+
+    scan.resolve([project('picker-delivery-failure')]);
+    await waitForScanFinish(ds);
+
+    const pickerAttempts = outboundCalls('interactive')
+      .filter(call => String(call[5]).startsWith('repo-picker:'));
+    expect(pickerAttempts).toHaveLength(2);
+    expect(pickerAttempts[1]?.[5]).toBe(pickerAttempts[0]?.[5]);
+    expect(outboundText()).toContain('/repo');
+    expect(ds.pendingRepo).toBe(true);
+    expect(ds.pendingPrompt).toContain('卡片失败也不能丢的请求');
+    expect(ds.repoCardMessageId).toBeUndefined();
+    expect(ds.repoScanCardMessageId).toBeUndefined();
+    expect(mocks.deleteMessage).toHaveBeenCalledWith(APP, progressMessageId);
+    expect(mocks.forkWorker).not.toHaveBeenCalled();
   });
 
   it.each([
     {
-      name: 'the route is consumed',
-      invalidate: (ds: any) => { ds.pendingRepo = false; },
+      name: 'a newer picker consumes the route',
+      invalidate: (ds: any) => {
+        ds.pendingRepo = false;
+        ds.repoCardMessageId = 'om_new_picker';
+      },
+      expectedRepoCardMessageId: 'om_new_picker',
     },
     {
       name: 'a repo commit takes ownership',
       invalidate: (ds: any) => { ds.pendingRepoCommitInFlight = true; },
+      expectedRepoCardMessageId: undefined,
     },
-  ])('does not post stale /repo recovery text when $name during card delivery', async ({ invalidate }) => {
-    const { route, ds, scan } = await startPendingScan('om_scan_card_delivery_race');
+  ])('does not disturb newer route state when $name during card delivery', async ({
+    invalidate,
+    expectedRepoCardMessageId,
+  }) => {
+    const { route, ds, scan, progressMessageId } = await startPendingScan('om_scan_card_delivery_race');
     await route;
     let rejectCard!: (error: unknown) => void;
     const cardDelivery = new Promise<string>((_resolve, reject) => {
@@ -350,19 +514,21 @@ describe('first-mention async repo scan routing', () => {
     ));
 
     scan.resolve([project('delivery-race')]);
-    await vi.waitFor(() => expect(outboundCalls('interactive')).toHaveLength(1));
+    await vi.waitFor(() => expect(outboundCalls('interactive')).toHaveLength(2));
     invalidate(ds);
     rejectCard(new Error('provider rejected the card'));
     await waitForScanFinish(ds);
 
     expect(outboundText()).not.toContain('/repo');
-    expect(ds.repoCardMessageId).toBeUndefined();
+    expect(ds.repoCardMessageId).toBe(expectedRepoCardMessageId);
+    expect(ds.repoScanCardMessageId).toBeUndefined();
+    expect(mocks.deleteMessage).toHaveBeenCalledWith(APP, progressMessageId);
     expect(mocks.forkWorker).not.toHaveBeenCalled();
   });
 
   it('folds a follow-up buffered during an empty scan into the only first worker fork', async () => {
     const anchor = 'om_empty_scan_root';
-    const { route, ds, scan } = await startPendingScan(anchor, '首轮请求');
+    const { route, ds, scan, progressMessageId } = await startPendingScan(anchor, '首轮请求');
 
     await handleThreadReply(
       makeEventData('om_empty_scan_followup', '扫描期间补充', anchor),
@@ -380,6 +546,8 @@ describe('first-mention async repo scan routing', () => {
     expect(options).toEqual({ turnId: 'om_empty_scan_followup' });
     expect(ds.pendingRepo).toBe(false);
     expect(ds.pendingFollowUps).toBeUndefined();
-    expect(outboundCalls('interactive')).toHaveLength(0);
+    expect(outboundCalls('interactive')).toHaveLength(1);
+    expect(ds.repoScanCardMessageId).toBeUndefined();
+    expect(mocks.deleteMessage).toHaveBeenCalledWith(APP, progressMessageId);
   });
 });

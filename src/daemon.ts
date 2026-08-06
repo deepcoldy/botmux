@@ -109,7 +109,7 @@ import { runtimeInstallationKey } from './adapters/cli/runtime.js';
 import * as scheduler from './core/scheduler.js';
 import { scanProjects, scanMultipleProjects } from './services/project-scanner.js';
 import { scanMultipleProjectsAsync } from './services/project-scanner-async.js';
-import { buildQuotaExhaustedCard, buildRepoSelectCard, buildStreamingCard, getCliDisplayName } from './im/lark/card-builder.js';
+import { buildQuotaExhaustedCard, buildRepoScanProgressCard, buildRepoSelectCard, buildStreamingCard, getCliDisplayName } from './im/lark/card-builder.js';
 import { codexServiceTierBadge } from './services/codex-service-tier.js';
 import { sessionConfiguredRuntimeDisplayName } from './core/cli-runtime-display.js';
 import { isLocalCliOpenReady } from './services/local-cli-opener.js';
@@ -4464,10 +4464,12 @@ function notifierAdoptWouldDropInput(ds: DaemonSession): boolean {
  * their input was cancelled on both the success and failure card.
  */
 function clearPendingRepoStateForNotifierAdopt(ds: DaemonSession): void {
+  const scanCardToWithdraw = ds.repoScanCardMessageId;
   ds.pendingRepo = false;
   ds.repoScanInFlight = false;
   ds.pendingRepoCommitInFlight = false;
   ds.worktreeCreating = false;
+  ds.repoScanCardMessageId = undefined;
   ds.repoCardMessageId = undefined;
   ds.pendingPrompt = undefined;
   ds.pendingTurnId = undefined;
@@ -4487,6 +4489,11 @@ function clearPendingRepoStateForNotifierAdopt(ds: DaemonSession): void {
   ds.pendingChatContext = undefined;
   ds.pendingCodexAppFollowUps = undefined;
   ds.pendingCodexAppFollowUpContexts = undefined;
+  if (scanCardToWithdraw) {
+    void deleteMessage(ds.larkAppId, scanCardToWithdraw).catch(err => {
+      logger.debug(`[${tag(ds)}] Repo scan card withdraw after notifier adopt failed: ${err}`);
+    });
+  }
 }
 
 async function adoptCodexNotifierEvent(
@@ -15496,7 +15503,6 @@ async function postPendingRepoSelectCard(
       return await sessionReply(anchor, cardJson, 'interactive', ds.larkAppId, undefined, { uuid: deliveryUuid });
     }
   } catch (err) {
-    ds.repoCardMessageId = undefined;
     logger.warn(`[${tag(ds)}] Repo selection card delivery failed: ${err instanceof Error ? err.message : err}`);
     if (!ds.pendingRepo || ds.pendingRepoCommitInFlight ||
         (ds.worker && !ds.worker.killed) || !ownsCurrentRoute(ds, ds.larkAppId)) {
@@ -15521,14 +15527,52 @@ function pendingRepoScanStillOwnsRoute(
   ds: DaemonSession,
   anchor: string,
   sessionId: string,
+  scanCardMessageId: string | undefined,
 ): boolean {
   return activeSessions.get(sessionKey(anchor, ds.larkAppId)) === ds
     && ds.session.sessionId === sessionId
     && ds.session.status === 'active'
     && ds.pendingRepo === true
     && ds.repoScanInFlight === true
+    && ds.repoScanCardMessageId === scanCardMessageId
     && !ds.pendingRepoCommitInFlight
     && !(ds.worker && !ds.worker.killed);
+}
+
+function deleteRepoScanProgressMessage(ds: DaemonSession, messageId: string): void {
+  void (async () => {
+    try {
+      if (await deleteMessage(ds.larkAppId, messageId)) return;
+      await new Promise<void>(resolve => setTimeout(resolve, REPO_CARD_TRANSPORT_RETRY_DELAY_MS));
+      if (await deleteMessage(ds.larkAppId, messageId)) return;
+      logger.warn(`[${tag(ds)}] Repo scan progress card withdrawal failed twice`);
+    } catch (err) {
+      logger.warn(`[${tag(ds)}] Repo scan progress card withdrawal failed: ${err instanceof Error ? err.message : err}`);
+    }
+  })();
+}
+
+function withdrawRepoScanProgressCard(ds: DaemonSession, messageId: string | undefined): void {
+  if (!messageId || ds.repoScanCardMessageId !== messageId) return;
+  ds.repoScanCardMessageId = undefined;
+  deleteRepoScanProgressMessage(ds, messageId);
+}
+
+async function postPendingRepoScanProgressCard(
+  ds: DaemonSession,
+  anchor: string,
+  scanSessionId: string,
+): Promise<string> {
+  const cardJson = buildRepoScanProgressCard(localeForBot(ds.larkAppId));
+  const deliveryUuid = `repo-scan:${scanSessionId}`;
+  try {
+    return await sessionReply(anchor, cardJson, 'interactive', ds.larkAppId, undefined, { uuid: deliveryUuid });
+  } catch (err) {
+    if (!isRetryableRepoCardTransportError(err)) throw err;
+    logger.warn(`[${tag(ds)}] Repo scan progress card transport failed; retrying with stable UUID: ${err instanceof Error ? err.message : err}`);
+    await new Promise<void>(resolve => setTimeout(resolve, REPO_CARD_TRANSPORT_RETRY_DELAY_MS));
+    return sessionReply(anchor, cardJson, 'interactive', ds.larkAppId, undefined, { uuid: deliveryUuid });
+  }
 }
 
 async function startInitialPassthroughSession(args: {
@@ -16279,20 +16323,36 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
   const scanDirs = getProjectScanDirs(ds).filter(d => existsSync(d));
   if (scanDirs.length > 0) {
     const scanSessionId = ds.session.sessionId;
+    let repoScanCardMessageId: string | undefined;
     ds.repoScanInFlight = true;
     announcePendingRepoSession(ds);
     try {
-      await sessionReply(
-        anchor,
-        tr('daemon.repo_scan_in_progress', undefined, localeForBot(larkAppId)),
-        'text',
-        larkAppId,
-      );
+      repoScanCardMessageId = (await postPendingRepoScanProgressCard(ds, anchor, scanSessionId)) || undefined;
+      if (!pendingRepoScanStillOwnsRoute(ds, anchor, scanSessionId, undefined)) {
+        ds.repoScanInFlight = false;
+        if (repoScanCardMessageId) deleteRepoScanProgressMessage(ds, repoScanCardMessageId);
+        logger.info(`[${tag(ds)}] Withdrawing late repo scan progress card because the pending route changed during delivery`);
+        return;
+      }
+      ds.repoScanCardMessageId = repoScanCardMessageId;
     } catch (err) {
-      logger.warn(`[${tag(ds)}] Repo scan progress reply failed: ${err instanceof Error ? err.message : err}`);
+      logger.warn(`[${tag(ds)}] Repo scan progress card failed: ${err instanceof Error ? err.message : err}`);
+      if (pendingRepoScanStillOwnsRoute(ds, anchor, scanSessionId, undefined)) {
+        try {
+          await sessionReply(
+            anchor,
+            tr('daemon.repo_scan_in_progress', undefined, localeForBot(larkAppId)),
+            'text',
+            larkAppId,
+          );
+        } catch (fallbackErr) {
+          logger.warn(`[${tag(ds)}] Repo scan progress text fallback failed: ${fallbackErr instanceof Error ? fallbackErr.message : fallbackErr}`);
+        }
+      }
     }
-    if (!pendingRepoScanStillOwnsRoute(ds, anchor, scanSessionId)) {
+    if (!pendingRepoScanStillOwnsRoute(ds, anchor, scanSessionId, repoScanCardMessageId)) {
       ds.repoScanInFlight = false;
+      withdrawRepoScanProgressCard(ds, repoScanCardMessageId);
       logger.info(`[${tag(ds)}] Repo scan skipped because the pending route changed before launch`);
       return;
     }
@@ -16307,7 +16367,8 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
           projects = await scanMultipleProjectsAsync(scanDirs, 3, repoPickerScanOptions());
         } catch (err) {
           logger.warn(`[${tag(ds)}] Isolated repo scan failed: ${err instanceof Error ? err.message : err}`);
-          if (pendingRepoScanStillOwnsRoute(ds, anchor, scanSessionId)) {
+          if (pendingRepoScanStillOwnsRoute(ds, anchor, scanSessionId, repoScanCardMessageId)) {
+            withdrawRepoScanProgressCard(ds, repoScanCardMessageId);
             try {
               await sessionReply(
                 anchor,
@@ -16321,7 +16382,8 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
           }
           return;
         }
-        if (!pendingRepoScanStillOwnsRoute(ds, anchor, scanSessionId)) {
+        if (!pendingRepoScanStillOwnsRoute(ds, anchor, scanSessionId, repoScanCardMessageId)) {
+          withdrawRepoScanProgressCard(ds, repoScanCardMessageId);
           logger.info(`[${tag(ds)}] Discarding late repo scan result because the pending route changed`);
           return;
         }
@@ -16329,13 +16391,15 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
         if (projects.length > 0) {
           lastRepoScan.set(chatId, projects);
           const repoCardMessageId = await postPendingRepoSelectCard(ds, anchor, projects);
-          if (!pendingRepoScanStillOwnsRoute(ds, anchor, scanSessionId)) {
+          if (!pendingRepoScanStillOwnsRoute(ds, anchor, scanSessionId, repoScanCardMessageId)) {
             if (repoCardMessageId) void deleteMessage(larkAppId, repoCardMessageId);
+            withdrawRepoScanProgressCard(ds, repoScanCardMessageId);
             if (lastRepoScan.get(chatId) === projects) lastRepoScan.delete(chatId);
             logger.info(`[${tag(ds)}] Withdrawing late repo card because the pending route changed during delivery`);
             return;
           }
           ds.repoCardMessageId = repoCardMessageId;
+          withdrawRepoScanProgressCard(ds, repoScanCardMessageId);
           logger.info(`[${tag(ds)}] Waiting for repo selection (${projects.length} projects)`);
           return;
         }
@@ -16373,7 +16437,8 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
         }
       } catch (err) {
         logger.warn(`[${tag(ds)}] Detached repo scan completion failed: ${err instanceof Error ? err.message : err}`);
-        if (pendingRepoScanStillOwnsRoute(ds, anchor, scanSessionId)) {
+        if (pendingRepoScanStillOwnsRoute(ds, anchor, scanSessionId, repoScanCardMessageId)) {
+          withdrawRepoScanProgressCard(ds, repoScanCardMessageId);
           try {
             await sessionReply(
               anchor,
@@ -17518,6 +17583,9 @@ async function handleThreadReply(
         codexAppApplicationContext,
       );
     }
+    // The progress card already says that messages are queued. Keep buffering
+    // silently instead of posting the same scan notice for every follow-up.
+    if (ds.repoScanInFlight && ds.repoScanCardMessageId) return;
     // Auto-worktree pending (worktreeCreating) has no repo card to point at — the
     // message IS buffered (folded on commit), so just say "hold on, building worktree"
     // instead of the misleading "pick a repo from the card above".

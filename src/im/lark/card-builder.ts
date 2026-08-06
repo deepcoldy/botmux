@@ -1075,6 +1075,21 @@ function worktreeMultiForm(worktreeOptions: Array<{ text: { tag: 'plain_text'; c
   };
 }
 
+/** Lightweight placeholder shown while the first repository scan runs. */
+export function buildRepoScanProgressCard(locale?: Locale): string {
+  return JSON.stringify({
+    config: { wide_screen_mode: true },
+    header: {
+      template: 'blue',
+      title: { tag: 'plain_text', content: t('card.repo.title', undefined, locale) },
+    },
+    elements: [{
+      tag: 'div',
+      text: { tag: 'lark_md', content: t('daemon.repo_scan_in_progress', undefined, locale) },
+    }],
+  });
+}
+
 /** Repo selection card. `multiPicker` (persisted per-bot via worktreeMultiPicker)
  *  flips the worktree control between an instant single-select dropdown (false)
  *  and the inline multi-select form (true). */

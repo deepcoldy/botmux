@@ -13,6 +13,7 @@ import { dirname, join } from 'node:path';
 import {
   buildSessionCard,
   buildStreamingCard,
+  buildRepoScanProgressCard,
   buildRepoSelectCard,
   buildSessionClosedCard,
   buildRelayPickerCard,
@@ -84,6 +85,20 @@ function buttonTexts(actions: any[]): string[] {
     .filter((a: any) => a.tag === 'button')
     .map((a: any) => a.text.content);
 }
+
+describe('buildRepoScanProgressCard', () => {
+  it('renders a lightweight inert repository scan placeholder', () => {
+    const card = parse(buildRepoScanProgressCard('zh'));
+
+    expect(card.header).toMatchObject({
+      template: 'blue',
+      title: { content: '📁 项目仓库管理' },
+    });
+    expect(card.elements[0].text.content).toContain('正在扫描仓库');
+    expect(JSON.stringify(card)).not.toContain('form');
+    expect(JSON.stringify(card)).not.toContain('button');
+  });
+});
 
 describe('buildTuiPromptFailedCard', () => {
   it('renders an explicit red terminal state for unconfirmed TUI delivery', () => {
