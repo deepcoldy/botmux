@@ -942,12 +942,15 @@ describe('refreshListenerCardTextFromResolved (Bug1: daemon re-extract on resolv
     expect(match.messageText).toBe(before);
   });
 
-  it('end-to-end: a REST-merged button URL reaches the rendered listener prompt', () => {
+  it('integration (refresh→render): a merged card button URL reaches the rendered listener prompt', () => {
     // Ties the two stages the daemon runs back-to-back: refresh the match off the
     // resolved (merged) card, then render the observed-message prompt. Proves the
     // recovered button URL actually survives into the string fed to the CLI —
     // the exact bug's user-visible fix. Mirrors handleNewTopic's ordering
-    // (refreshListenerCardTextFromResolved → renderMessageListenerPrompt).
+    // (refreshListenerCardTextFromResolved → renderMessageListenerPrompt). The
+    // merged card is supplied as a fixture (this is not a daemon-boot / live-REST
+    // e2e); it locks the refresh→render contract, i.e. the link is not dropped
+    // again before the prompt is rendered.
     const match = cardMatch({ prompt: '分析命中的告警并按需处理' });
     // The card content AFTER resolveNonsupportMessage merged the full structured
     // representation (this is what daemon holds when it re-extracts).
