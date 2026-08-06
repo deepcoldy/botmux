@@ -314,10 +314,12 @@ async function tagViaFeedGroup(larkAppId: string, chatId: string, ownerOpenId: s
     if (isNameTaken(created)) {
       // 分组名用户级全局唯一，但操作权限按创建应用隔离——本 app 的 list 看不到、
       // 也建不了同名组（典型：多个 bot 应用都用默认名 / 换 app 重装）。自动退避
-      // 为「名字·bot 显示名」，让每个 bot 各持一个分组而不是静默失败。
+      // 为「<bot 显示名>会话」：关键区分信息前置——侧边栏宽度只显示前几个字，
+      // 「配置名·bot名」的后缀式命名会把 bot 名截没（实测反馈）。
       const bot = getBot(larkAppId);
-      const botLabel = (bot.botName ?? cfg.displayName ?? cfg.cliId ?? larkAppId.slice(-6)).trim();
-      const fallbackName = `${name}·${botLabel}`;
+      const rawLabel = (bot.botName ?? cfg.displayName ?? cfg.cliId ?? larkAppId.slice(-6)).trim();
+      const botLabel = Array.from(rawLabel).slice(0, 12).join('');
+      const fallbackName = localeForBot(larkAppId) === 'en' ? `${botLabel} chats` : `${botLabel}会话`;
       if (fallbackName !== name) {
         logger.warn(
           `[session-tag] feed group name "${name}" is taken by another app's group (per-user unique, `
