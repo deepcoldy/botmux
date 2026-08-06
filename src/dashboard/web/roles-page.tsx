@@ -52,6 +52,7 @@ import {
   roleKey,
   ROLE_WARN_BYTES,
   saveInjectMode,
+  saveDispatchReportEnabled,
   saveMessageListener,
   saveProfileEntry,
   saveRole,
@@ -234,11 +235,14 @@ function RolesPage(props: { tab: RolesTab }) {
   const [selectedRole, setSelectedRole] = useState<RoleData | null>(null);
   const [editingContent, setEditingContent] = useState('');
   const [editingInjectMode, setEditingInjectMode] = useState<RoleInjectMode>('every');
+  const [editingDispatchReportEnabled, setEditingDispatchReportEnabled] = useState(false);
   const [roleSaving, setRoleSaving] = useState(false);
   const [roleDeleting, setRoleDeleting] = useState(false);
   const [injectSaving, setInjectSaving] = useState(false);
+  const [dispatchReportSaving, setDispatchReportSaving] = useState(false);
   const [roleFlash, setRoleFlash] = useState<FlashState>(null);
   const [injectFlash, setInjectFlash] = useState<FlashState>(null);
+  const [dispatchReportFlash, setDispatchReportFlash] = useState<FlashState>(null);
   const [groupEditorSection, setGroupEditorSection] = useState<GroupEditorSection>('role');
   const [selectedListener, setSelectedListener] = useState<MessageListenerData | null>(null);
   const [editingListener, setEditingListener] = useState<MessageListenerData>(() => cloneListener(DEFAULT_LISTENER));
@@ -426,6 +430,7 @@ function RolesPage(props: { tab: RolesTab }) {
     setSelectedBotId(botId);
     setRoleFlash(null);
     setInjectFlash(null);
+    setDispatchReportFlash(null);
     setListenerFlash(null);
     applyLoadedListener(null);
     const role = await loadRole(botId, groupId);
@@ -433,6 +438,7 @@ function RolesPage(props: { tab: RolesTab }) {
     setSelectedRole(role);
     setEditingContent(role.content ?? '');
     setEditingInjectMode(role.injectMode === 'once' ? 'once' : 'every');
+    setEditingDispatchReportEnabled(role.dispatchReportEnabled === true);
     await loadListenerForSelection(botId, groupId, serial);
   }
 
@@ -447,6 +453,7 @@ function RolesPage(props: { tab: RolesTab }) {
       setSelectedRole(role);
       setEditingContent(role.content ?? '');
       setEditingInjectMode(role.injectMode === 'once' ? 'once' : 'every');
+      setEditingDispatchReportEnabled(role.dispatchReportEnabled === true);
       await loadListenerForSelection(selectedBotId, selectedGroupId, serial);
     }
   }
@@ -455,12 +462,24 @@ function RolesPage(props: { tab: RolesTab }) {
     if (!selectedGroupId || !selectedBotId) return;
     setRoleSaving(true);
     try {
-      const ok = await saveRole(selectedBotId, selectedGroupId, editingContent, editingInjectMode);
+      const ok = await saveRole(
+        selectedBotId,
+        selectedGroupId,
+        editingContent,
+        editingInjectMode,
+        editingDispatchReportEnabled,
+      );
       if (!alive.current) return;
       if (ok) {
         const snapshot = await refreshGroups();
         if (!alive.current) return;
-        setSelectedRole(prev => prev ? { ...prev, content: editingContent, hasRole: true, injectMode: editingInjectMode } : prev);
+        setSelectedRole(prev => prev ? {
+          ...prev,
+          content: editingContent,
+          hasRole: true,
+          injectMode: editingInjectMode,
+          dispatchReportEnabled: editingDispatchReportEnabled,
+        } : prev);
         void refreshRoleContext(snapshot.groups, profiles);
         flash(setRoleFlash, tr('roles.saved'));
       } else {
@@ -486,6 +505,7 @@ function RolesPage(props: { tab: RolesTab }) {
         setSelectedRole(null);
         setEditingContent('');
         setEditingInjectMode('every');
+        setEditingDispatchReportEnabled(false);
         void refreshRoleContext(snapshot.groups, profiles);
       }
     } finally {
@@ -505,6 +525,21 @@ function RolesPage(props: { tab: RolesTab }) {
       flash(setInjectFlash, ok ? tr('roles.saved') : tr('roles.saveFailed'), !ok);
     } finally {
       if (alive.current) setInjectSaving(false);
+    }
+  }
+
+  async function handleDispatchReportEnabledChange(enabled: boolean): Promise<void> {
+    if (!selectedGroupId || !selectedBotId) return;
+    const prev = editingDispatchReportEnabled;
+    setEditingDispatchReportEnabled(enabled);
+    setDispatchReportSaving(true);
+    try {
+      const ok = await saveDispatchReportEnabled(selectedBotId, selectedGroupId, enabled);
+      if (!alive.current) return;
+      if (!ok) setEditingDispatchReportEnabled(prev);
+      flash(setDispatchReportFlash, ok ? tr('roles.saved') : tr('roles.saveFailed'), !ok);
+    } finally {
+      if (alive.current) setDispatchReportSaving(false);
     }
   }
 
@@ -1068,6 +1103,22 @@ function RolesPage(props: { tab: RolesTab }) {
                     />
                     <span className="roles-editor-inject-hint">{tr('roles.injectModeHint')}</span>
                     <Flash flash={injectFlash} />
+                  </div>
+                  <div className="roles-editor-inject">
+                    <span className="roles-field-label">{tr('roles.dispatchReportLabel')}</span>
+                    <label className="filter-toggle roles-listener-enabled">
+                      <input
+                        id="roles-editor-dispatch-report-enabled"
+                        type="checkbox"
+                        checked={editingDispatchReportEnabled}
+                        disabled={dispatchReportSaving}
+                        onChange={event => void handleDispatchReportEnabledChange(event.currentTarget.checked)}
+                      />
+                      <span className="filter-toggle-switch" aria-hidden="true"></span>
+                      <span className="filter-toggle-label">{tr('roles.dispatchReportEnabled')}</span>
+                    </label>
+                    <span className="roles-editor-inject-hint">{tr('roles.dispatchReportHint')}</span>
+                    <Flash flash={dispatchReportFlash} />
                   </div>
                   <textarea
                     id="roles-editor-textarea"

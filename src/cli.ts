@@ -34,7 +34,7 @@ import { validateWorkingDir } from './core/working-dir.js';
 import { resolveSessionContext } from './core/session-marker.js';
 import { resolveBotmuxDataDir } from './core/data-dir.js';
 import { dashboardSecretPath } from './core/dashboard-secret.js';
-import { acceptedDispatchBotAppIds, activeConversationBotOpenIds, appendDispatchReportProtocol, appendLegacyDispatchReportProtocol, parseDispatchBotSpec, buildDispatchMessages, buildRepoPrimeText, buildReportContent, eligibleAutoMentionAliases, findDispatchRegistryEntry, foldableChatSessionAppIds, offTopicSubBotTopic, resolveReportTarget, resolveSendTarget, threadRootForReachability } from './core/dispatch.js';
+import { acceptedDispatchBotAppIds, activeConversationBotOpenIds, appendDispatchReportProtocol, parseDispatchBotSpec, buildDispatchMessages, buildRepoPrimeText, buildReportContent, eligibleAutoMentionAliases, findDispatchRegistryEntry, foldableChatSessionAppIds, offTopicSubBotTopic, resolveReportTarget, resolveSendTarget, threadRootForReachability } from './core/dispatch.js';
 import { pickTurnReplyTarget } from './core/reply-target.js';
 import { recordDispatchRegistryEntry } from './core/dispatch-registry.js';
 import { enableAutostart, disableAutostart, autostartStatus, refreshAutostart } from './autostart.js';
@@ -8388,13 +8388,25 @@ async function cmdDispatch(rest: string[]): Promise<void> {
 
   const bots = [...legacyBots, ...appBots]
     .filter((bot, index, all) => all.findIndex(candidate => candidate.openId === bot.openId) === index);
-  // Only an all-local stable-app dispatch can rely on this host's registry being
-  // visible to every receiver. Legacy or mixed --bot dispatches may cross hosts,
-  // so keep their context-derived compatibility report protocol.
-  const exactReportRootEnabled = parsedBotApps.length > 0 && legacyBots.length === 0;
-  const briefWithReportProtocol = (dispatchRootId: string): string => exactReportRootEnabled
+  const { readRoleDispatchReportEnabled } = await import('./core/role-resolver.js');
+  const exactReportTarget = readRoleDispatchReportEnabled(appId, targetChatId)
+    && parsedBotApps.length > 0
+    && legacyBots.length === 0;
+  let exactIntoReportRoot = !intoRoot;
+  if (intoRoot && exactReportTarget) {
+    const regPath = join(resolveDataDir(), 'orchestrate-dispatch.json');
+    let registry: Record<string, any> = {};
+    try {
+      const parsed: unknown = existsSync(regPath) ? JSON.parse(readFileSync(regPath, 'utf-8')) : {};
+      if (parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        registry = parsed as Record<string, any>;
+      }
+    } catch { /* fail closed */ }
+    exactIntoReportRoot = findDispatchRegistryEntry({ registry, dispatchRootId: intoRoot })?.key === intoRoot;
+  }
+  const briefWithReportProtocol = (dispatchRootId: string): string => exactReportTarget && exactIntoReportRoot
     ? appendDispatchReportProtocol(brief, dispatchRootId)
-    : appendLegacyDispatchReportProtocol(brief);
+    : brief;
   let built;
   try {
     built = buildDispatchMessages({

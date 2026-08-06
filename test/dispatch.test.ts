@@ -10,7 +10,7 @@
  * Run: pnpm vitest run test/dispatch.test.ts
  */
 import { describe, it, expect } from 'vitest';
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { findAncestorSessionContext } from '../src/core/session-marker.js';
@@ -120,6 +120,65 @@ describe('appendDispatchReportProtocol', () => {
     const legacy = appendLegacyDispatchReportProtocol('跨机器任务');
     expect(legacy).toContain('botmux report "子项目完成 + 产出位置/摘要"');
     expect(legacy).not.toContain('--dispatch-root');
+  });
+});
+
+describe('dispatch report switch wiring', () => {
+  it('keeps the brief free of a completion command unless the exact helper is applied', () => {
+    const plain = buildDispatchMessages({
+      title: '任务',
+      brief: '完成实现并自测',
+      bots: [{ openId: 'ou_assignee' }],
+    });
+    expect(plain.threadContent.flat().map(node => node.tag === 'text' ? node.text : '').join('\n'))
+      .not.toContain('botmux report');
+
+    const exact = appendDispatchReportProtocol('完成实现并自测', 'om_seed_exact');
+    expect(exact).toContain('botmux report --dispatch-root om_seed_exact');
+  });
+
+  it('gates CLI injection on the saved switch, stable app targets, and an exact registry hit', () => {
+    const source = readFileSync(new URL('../src/cli.ts', import.meta.url), 'utf8');
+    const start = source.indexOf('async function cmdDispatch');
+    const end = source.indexOf('async function cmdReport', start);
+    const dispatch = source.slice(start, end);
+
+    const configRead = dispatch.indexOf('readRoleDispatchReportEnabled(appId, targetChatId)');
+    const stableTargets = dispatch.indexOf('&& parsedBotApps.length > 0', configRead);
+    const noLegacyTargets = dispatch.indexOf('&& legacyBots.length === 0', stableTargets);
+    const intoGuard = dispatch.indexOf('if (intoRoot && exactReportTarget)', noLegacyTargets);
+    const exactRegistryHit = dispatch.indexOf(
+      'findDispatchRegistryEntry({ registry, dispatchRootId: intoRoot })?.key === intoRoot',
+      intoGuard,
+    );
+    const safeBranch = dispatch.indexOf(
+      'exactReportTarget && exactIntoReportRoot\n    ? appendDispatchReportProtocol(brief, dispatchRootId)\n    : brief',
+      exactRegistryHit,
+    );
+    const standbyGuard = dispatch.indexOf('if (!standby) {', safeBranch);
+    const seededKickoff = dispatch.indexOf('brief: briefWithReportProtocol(seedId)', standbyGuard);
+
+    expect(configRead).toBeGreaterThanOrEqual(0);
+    expect(stableTargets).toBeGreaterThan(configRead);
+    expect(noLegacyTargets).toBeGreaterThan(stableTargets);
+    expect(intoGuard).toBeGreaterThan(noLegacyTargets);
+    expect(exactRegistryHit).toBeGreaterThan(intoGuard);
+    expect(safeBranch).toBeGreaterThan(exactRegistryHit);
+    expect(standbyGuard).toBeGreaterThan(safeBranch);
+    expect(seededKickoff).toBeGreaterThan(standbyGuard);
+  });
+
+  it('renders dispatch save feedback inside its own dashboard setting row', () => {
+    const source = readFileSync(new URL('../src/dashboard/web/roles-page.tsx', import.meta.url), 'utf8');
+    const injectStart = source.indexOf("tr('roles.injectModeLabel')");
+    const reportStart = source.indexOf("tr('roles.dispatchReportLabel')", injectStart);
+    const textareaStart = source.indexOf('<textarea', reportStart);
+    const injectRow = source.slice(injectStart, reportStart);
+    const reportRow = source.slice(reportStart, textareaStart);
+
+    expect(injectRow).toContain('<Flash flash={injectFlash} />');
+    expect(injectRow).not.toContain('dispatchReportFlash');
+    expect(reportRow).toContain('<Flash flash={dispatchReportFlash} />');
   });
 });
 
