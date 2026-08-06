@@ -1148,4 +1148,6 @@ export const messages: Record<string, string> = {
   'sg.cmd_unsupported': '⚠️ 会话群不支持 {cmd}：会话群由 bot 自动创建和管理，固定为连续会话模式。',
   'sg.tag_auth_nudge': '🏷️ 会话群已创建，但侧边栏分组还挂不上（{reason}）：消息分组是你的个人数据，需要你授权一次。点此授权：\n{url}\n\n⚠️ 授权完成后浏览器会跳到一个打不开的本机回调地址（127.0.0.1）——这是正常的，请把浏览器地址栏的完整链接复制发给我即可完成授权。也可以在 Dashboard 改用「群标签」模式（无需任何授权）。',
   'sg.tag_scope_nudge': '🏷️ 会话群已创建，但群标签还打不上：应用缺少「{scope}」租户权限。点此一键开通（管理员，无需授权流程，即时生效）：\n{url}\n\n开通后新建的会话群会自动打上标签。',
+  'cmd.login.tags_title': '🏷️ 会话群标签授权（消息分组）',
+  'cmd.login.tags_footer': '授权后，新建的会话群会自动进入侧边栏「Botmux群会话」分组（一次授权长期有效，token 自动续期）。',
 };

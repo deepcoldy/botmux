@@ -42,7 +42,7 @@ import { repinSessionWorkingDir } from './session-cwd.js';
 import { discoverAdoptableSessions, excludeOwnedHerdrAdoptTargets, validateAdoptTarget, adoptTargetKey, adoptTargetLabel, type AdoptableSession } from './session-discovery.js';
 import { discoverAdoptableZellijSessions, validateZellijAdoptTarget, type ZellijAdoptableSession } from './zellij-adopt-discovery.js';
 import { listCodexAppThreads, type CodexAppThreadSummary } from '../services/codex-app-threads.js';
-import { generateAuthUrl, getTokenStatus, resolveUserToken, DOC_COMMENT_OAUTH_SCOPES } from '../utils/user-token.js';
+import { generateAuthUrl, getTokenStatus, resolveUserToken, DOC_COMMENT_OAUTH_SCOPES, FEED_GROUP_OAUTH_SCOPES } from '../utils/user-token.js';
 import { DocSubscriptionPermissionError, listDocComments, resolveDocFile, subscribeDocFile, unsubscribeDocFile } from '../im/lark/doc-comment.js';
 import { parseDocWatchCommand } from './doc-watch-command.js';
 import { parseVcMeetingPrepareCommand } from './vc-meeting-prepare-command.js';
@@ -1997,6 +1997,29 @@ export async function handleCommand(
         }
         if (subCmd === 'status' || subCmd === '状态') {
           await sessionReply(rootId, getTokenStatus(botCfg2.larkAppId, normalizeBrand(botCfg2.brand)));
+          break;
+        }
+        // `/login tags` — 会话群侧边栏分组（feed group）专项授权：追加
+        // im:feed_group_v1 scope（与 /subscribe-lark-doc 的专项 scope 同款模式，
+        // 不污染通用 /login）。授权完成后 feed-group 标签模式全自动挂载。
+        if (subCmd === 'tags' || subCmd === 'tag' || subCmd === '标签') {
+          const { authUrl: tagAuthUrl } = generateAuthUrl(
+            botCfg2.larkAppId,
+            botCfg2.larkAppSecret,
+            normalizeBrand(botCfg2.brand),
+            FEED_GROUP_OAUTH_SCOPES,
+          );
+          await sessionReply(rootId, [
+            t('cmd.login.tags_title', undefined, loc),
+            '',
+            t('cmd.login.step1', undefined, loc),
+            tagAuthUrl,
+            '',
+            t('cmd.login.step2', undefined, loc),
+            t('cmd.login.step3', undefined, loc),
+            '',
+            t('cmd.login.tags_footer', undefined, loc),
+          ].join('\n'));
           break;
         }
         const { authUrl } = generateAuthUrl(botCfg2.larkAppId, botCfg2.larkAppSecret, normalizeBrand(botCfg2.brand));

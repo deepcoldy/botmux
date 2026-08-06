@@ -1145,4 +1145,6 @@ export const messages: Record<string, string> = {
   'sg.cmd_unsupported': '⚠️ {cmd} is not supported in session groups: they are auto-created and managed by the bot with a fixed continuous-session mode.',
   'sg.tag_auth_nudge': '🏷️ Session group created, but the sidebar feed group could not be applied ({reason}): feed groups are your personal data and need a one-time authorization:\n{url}\n\n⚠️ After authorizing, the browser lands on an unreachable localhost callback (127.0.0.1) — this is expected: copy the full URL from the address bar and send it back to me to finish. Alternatively switch to the zero-auth "chat tag" mode in the Dashboard.',
   'sg.tag_scope_nudge': '🏷️ Session group created, but the chat tag could not be applied: the app is missing the "{scope}" tenant scope. One-click enable (admin, no auth flow, effective immediately):\n{url}\n\nOnce enabled, new session groups are tagged automatically.',
+  'cmd.login.tags_title': '🏷️ Session-group tag authorization (feed groups)',
+  'cmd.login.tags_footer': 'Once authorized, new session groups automatically join the sidebar feed group (one-time authorization, token auto-refreshes).',
 };
