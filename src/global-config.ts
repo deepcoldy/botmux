@@ -99,6 +99,13 @@ export interface GlobalConfig {
    *  so hosts behind a proxy must set this (or the env vars, which we read as a
    *  fallback). Form: `http://host:port` or `http://user:pass@host:port`. */
   httpProxy?: string;
+  /** OAuth redirect base for user authorization (/login). When set (e.g.
+   *  `http://10.1.2.3:7891`, typically this host's dashboard origin), auth
+   *  links redirect to `<base>/oauth/callback`, which the dashboard receives
+   *  and completes automatically — the zero-copy-paste flow for daemons that
+   *  do NOT run on the user's own machine. Missing → the legacy
+   *  `http://127.0.0.1:9768/callback` paste-back flow. */
+  oauthRedirectBase?: string;
   /** Machine-wide user skill registry policy. Skill package storage itself lives under
    *  ~/.botmux/skills and is managed by services/skill-registry-store.ts. */
   skills?: GlobalSkillConfig;

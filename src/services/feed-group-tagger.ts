@@ -245,6 +245,31 @@ async function maybeNudgeOwnerForAuth(larkAppId: string, ownerOpenId: string, re
   }
 }
 
+/** Find an existing feed group by exact name (paged; capped at 3 pages).
+ *  Reuse-before-create keeps multi-bot / reinstall setups from spawning
+ *  duplicate same-name sidebar groups — feed groups have no server-side
+ *  name-dedup of their own. */
+async function findFeedGroupByName(brandHost: string, userToken: string, name: string): Promise<string | null> {
+  let pageToken = '';
+  for (let page = 0; page < 3; page++) {
+    try {
+      const qs = new URLSearchParams({ page_size: '50', ...(pageToken ? { page_token: pageToken } : {}) });
+      const res = await fetch(`${brandHost}/open-apis/im/v1/groups?${qs}`, {
+        headers: { Authorization: `Bearer ${userToken}` },
+      });
+      const json: any = await res.json().catch(() => ({}));
+      if (json.code !== 0) return null;
+      const hit = (json.data?.groups ?? []).find((g: any) => g?.name === name && g?.group_id);
+      if (hit) return hit.group_id as string;
+      if (!json.data?.has_more || !json.data?.page_token) return null;
+      pageToken = json.data.page_token;
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
 async function tagViaFeedGroup(larkAppId: string, chatId: string, ownerOpenId: string, name: string): Promise<void> {
   const cfg = getBot(larkAppId).config;
   const brand = normalizeBrand(cfg.brand);
@@ -258,6 +283,16 @@ async function tagViaFeedGroup(larkAppId: string, chatId: string, ownerOpenId: s
   }
 
   const cache = loadCache(larkAppId);
+  if (!cache.groupId) {
+    // Reuse an existing same-name group first (multi-bot / reinstall dedup).
+    const existing = await findFeedGroupByName(host, userToken, name);
+    if (existing) {
+      cache.groupId = existing;
+      cache.name = name;
+      saveCache(larkAppId, cache);
+      logger.info(`[session-tag] reusing existing feed group "${name}" → ${existing}`);
+    }
+  }
   if (!cache.groupId) {
     const created = await callFeedGroupApi(host, userToken, 'POST', '/open-apis/im/v1/groups', {
       feed_group_creator: { type: 'normal', name },

@@ -2494,6 +2494,46 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    // OAuth 回调接收页（/oauth/callback）— 也在 cookie/token gate 之前：飞书
+    // authorize 跳回来的浏览器请求不带 dashboard token（redirect_uri 固定），
+    // 挡在门外用户就只能回到人肉贴 URL 的旧流程。安全面：URL 里只有一次性
+    // code + 随机 state；处理方仍要求 state 命中某个 daemon 进程的 pending
+    // 表（5 分钟过期、一次即焚）并用 app_secret 换 token——本页面自身不持有
+    // 任何敏感能力，等价于把「用户手工回贴」自动化。
+    if (req.method === 'GET' && url.pathname === '/oauth/callback') {
+      const page = (title: string, body: string, ok: boolean) => {
+        res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+        res.end(`<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1"><title>${title}</title><body style="font-family:system-ui;display:flex;align-items:center;justify-content:center;min-height:90vh;background:#f5f6f8"><div style="text-align:center;padding:32px 40px;background:#fff;border-radius:16px;box-shadow:0 4px 24px rgba(0,0,0,.08)"><div style="font-size:56px">${ok ? '✅' : '❌'}</div><h2 style="margin:12px 0 8px">${title}</h2><p style="color:#666;max-width:420px">${body}</p></div></body>`);
+      };
+      if (!url.searchParams.get('code') || !url.searchParams.get('state')) {
+        page('回调参数缺失', '未收到授权码。请回到 Dashboard 重新发起授权。', false);
+        return;
+      }
+      // state 只在生成链接的那个 daemon 进程内存里，逐个询问在线 daemon。
+      let outcome: { ok: boolean; message: string } | null = null;
+      for (const d of registry.list()) {
+        try {
+          const r = await fetchDaemonIpc(d.ipcPort, '/api/oauth-callback', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ url: url.toString() }),
+          });
+          const j: any = await r.json().catch(() => null);
+          if (j?.matched) { outcome = { ok: !!j.ok, message: String(j.message ?? '') }; break; }
+        } catch { /* daemon offline mid-iteration — try the next */ }
+      }
+      if (!outcome) {
+        page('授权未完成', '没有找到等待中的授权请求（可能已超时，链接有效期 5 分钟）。请回到 Dashboard 重新点击授权。', false);
+        return;
+      }
+      page(
+        outcome.ok ? '授权完成' : '授权失败',
+        outcome.ok ? '已完成授权，本页可以关闭。回到 Dashboard 即可看到状态更新。' : outcome.message,
+        outcome.ok,
+      );
+      return;
+    }
+
     // CLI rotate (HMAC + loopback only) — for `botmux dashboard`. Mints a fresh
     // token, invalidating any previously-issued link.
     if (req.method === 'POST' && url.pathname === '/__cli/rotate') {
@@ -4612,6 +4652,24 @@ const server = createServer(async (req, res) => {
       res.writeHead(upstream.status, { 'content-type': 'application/json' });
       res.end(await upstream.text());
       return;
+    }
+
+    // 会话群标签授权（Dashboard 一站式）：GET status / POST auth-link，
+    // 均代理到对应 bot 的 daemon（state 必须驻留在生成链接的进程内）。
+    let mBotTagAuth: RegExpMatchArray | null;
+    if (mBotTagAuth = url.pathname.match(/^\/api\/bots\/([^/]+)\/session-group-tag-(status|auth)$/)) {
+      const appId = decodeURIComponent(mBotTagAuth[1]);
+      const kind = mBotTagAuth[2];
+      if ((kind === 'status' && req.method === 'GET') || (kind === 'auth' && req.method === 'POST')) {
+        const upstream = await proxyToDaemon(appId, `/api/session-group-tag-${kind}`, {
+          method: req.method,
+          headers: { 'content-type': 'application/json' },
+          ...(req.method === 'POST' ? { body: '{}' } : {}),
+        });
+        res.writeHead(upstream.status, { 'content-type': 'application/json' });
+        res.end(await upstream.text());
+        return;
+      }
     }
 
     // PUT /api/bots/:appId/p2p-mode — proxy to that bot's daemon. Body

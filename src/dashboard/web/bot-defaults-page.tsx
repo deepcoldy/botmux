@@ -2251,6 +2251,7 @@ function SessionModeSection(props: {
         </div>
         <div className="actions"><StatusSpan status={p2pStatus} attr={{ 'data-p2p-status': '' }} /></div>
       </div>
+      {p2p === 'group' && <SessionGroupTagRow bot={props.bot} />}
       <div className="bd-row">
         <div className="bd-field">
           <FieldTitle help={tr('botDefaults.regularGroupModeHelp')}>{tr('botDefaults.regularGroupMode')}</FieldTitle>
@@ -2722,6 +2723,78 @@ function SubstituteModeSection(props: { bot: BotDefaultsRow; patchBot: PatchBot 
 
 function normalizeP2pMode(value: unknown): 'thread' | 'chat' | 'group' {
   return value === 'thread' ? 'thread' : value === 'group' ? 'group' : 'chat';
+}
+
+/** 会话群标签授权行（p2pMode=group 时显示）：状态徽标 + 一键授权。
+ *  点击授权 → 新标签页打开飞书授权 → 飞书回跳 dashboard /oauth/callback
+ *  自动完成 → 本行轮询到 authorized 后徽标变绿。 */
+function SessionGroupTagRow(props: { bot: BotDefaultsRow }) {
+  const tr = useT();
+  const [status, setStatus] = useState<{ authorized: boolean; tagMode?: string } | null>(null);
+  const [authBusy, setAuthBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  const fetchStatus = async (): Promise<boolean> => {
+    try {
+      const res = await sendJson('GET', `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/session-group-tag-status`);
+      if (res.ok && res.body.ok) {
+        setStatus({ authorized: !!res.body.authorized, tagMode: res.body.tagMode });
+        return !!res.body.authorized;
+      }
+    } catch { /* transient */ }
+    return false;
+  };
+
+  useEffect(() => { void fetchStatus(); }, [props.bot.larkAppId]);
+
+  async function startAuth(): Promise<void> {
+    setAuthBusy(true);
+    setErr(null);
+    try {
+      const res = await sendJson('POST', `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/session-group-tag-auth`, {});
+      if (!res.ok || !res.body.ok || !res.body.authUrl) {
+        setErr(responseErrorText(res));
+        return;
+      }
+      window.open(res.body.authUrl, '_blank', 'noopener');
+      // 轮询授权结果：3s × 60 次（授权链接 5 分钟有效期同量级）。
+      for (let i = 0; i < 60; i++) {
+        await new Promise(r => setTimeout(r, 3000));
+        if (await fetchStatus()) return;
+      }
+      setErr(tr('botDefaults.sgTagAuthTimeout'));
+    } catch (e: any) {
+      setErr(caughtErrorText(e));
+    } finally {
+      setAuthBusy(false);
+    }
+  }
+
+  const authorized = status?.authorized === true;
+  return (
+    <div className="bd-row" data-session-group-tag-row>
+      <div className="bd-field">
+        <FieldTitle help={tr('botDefaults.sgTagHelp')}>{tr('botDefaults.sgTag')}</FieldTitle>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+          <span data-sg-tag-state={authorized ? 'authorized' : 'unauthorized'}>
+            {authorized ? `🟢 ${tr('botDefaults.sgTagAuthorized')}` : `⚪ ${tr('botDefaults.sgTagUnauthorized')}`}
+          </span>
+          {!authorized && (
+            <button
+              type="button"
+              className="primary"
+              data-action="session-group-tag-auth"
+              disabled={authBusy}
+              onClick={() => void startAuth()}
+            >
+              {authBusy ? tr('botDefaults.sgTagAuthWaiting') : tr('botDefaults.sgTagAuthStart')}
+            </button>
+          )}
+          {err && <span className="status-error">✗ {err}</span>}
+        </div>
+      </div>
+    </div>
+  );
 }
 
 function regularGroupMode(bot: BotDefaultsRow): string {

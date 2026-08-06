@@ -131,6 +131,8 @@ import {
   type SessionRow,
 } from './dashboard-rows.js';
 import { getBotBrand, getBot, loadBotConfigs, readBotSkillPolicy, getBotTuiSlashAllow } from '../bot-registry.js';
+import { generateAuthUrl, tryHandleCallbackUrl, getFeedGroupAuthStatus, FEED_GROUP_OAUTH_SCOPES } from '../utils/user-token.js';
+import { normalizeBrand } from '../im/lark/lark-hosts.js';
 import { normalizeKanbanColumn, normalizeKanbanPosition, normalizeSessionTitle } from './session-board.js';
 import { validateSlashInjection } from './slash-inject.js';
 import { validateRoleLibraryPath } from './role-library.js';
@@ -2798,6 +2800,53 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
     availabilityWarning,
     requiredCommand: availability.command,
   });
+});
+
+// ─── 会话群标签授权（feed-group OAuth，Dashboard 一站式流程）────────────────
+// POST /api/oauth-callback {url} — dashboard 的 /oauth/callback 接收页把回调
+// URL 广播给各 daemon；state 在本进程 pendingLogins 里的那个完成 code→token
+// 交换，其它 daemon 返回 matched:false 让 dashboard 继续尝试下一个。
+ipcRoute('POST', '/api/oauth-callback', async (req, res) => {
+  let body: { url?: unknown };
+  try { body = await readJsonBody<{ url?: unknown }>(req); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  if (typeof body.url !== 'string' || !body.url.trim()) {
+    return jsonRes(res, 400, { ok: false, error: 'url_required' });
+  }
+  const result = await tryHandleCallbackUrl(body.url.trim());
+  if (!result) return jsonRes(res, 200, { ok: false, matched: false, message: 'not a callback url' });
+  jsonRes(res, 200, { ok: result.ok, matched: result.matched, message: result.message });
+});
+
+// POST /api/session-group-tag-auth — 生成带 feed-group scope 的授权链接。
+// state 存本 daemon 进程内存，回调必须经由上面的 /api/oauth-callback 回到
+// 同一进程完成，故链接生成与回调处理都放 IPC 侧。
+ipcRoute('POST', '/api/session-group-tag-auth', async (_req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  try {
+    const cfg = getBot(cachedLarkAppId).config;
+    const { authUrl } = generateAuthUrl(
+      cfg.larkAppId,
+      cfg.larkAppSecret,
+      normalizeBrand(cfg.brand),
+      FEED_GROUP_OAUTH_SCOPES,
+    );
+    jsonRes(res, 200, { ok: true, authUrl });
+  } catch (e: any) {
+    jsonRes(res, 500, { ok: false, error: e?.message ?? String(e) });
+  }
+});
+
+// GET /api/session-group-tag-status — 标签授权状态（Dashboard 徽标）。
+ipcRoute('GET', '/api/session-group-tag-status', async (_req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  try {
+    const cfg = getBot(cachedLarkAppId).config;
+    const status = getFeedGroupAuthStatus(cfg.larkAppId, normalizeBrand(cfg.brand));
+    jsonRes(res, 200, { ok: true, ...status, tagMode: cfg.sessionGroup?.tag?.mode ?? 'chat-tag' });
+  } catch (e: any) {
+    jsonRes(res, 500, { ok: false, error: e?.message ?? String(e) });
+  }
 });
 
 // Per-bot 私聊单聊模式 p2pMode。Body `{ p2pMode: 'chat' | 'thread' | 'group' }`:

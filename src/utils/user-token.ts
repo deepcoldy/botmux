@@ -15,6 +15,7 @@ import { homedir } from 'node:os';
 import { randomBytes } from 'node:crypto';
 import { logger } from './logger.js';
 import { type Brand, larkHosts } from '../im/lark/lark-hosts.js';
+import { readGlobalConfig } from '../global-config.js';
 
 // ─── Token paths ──────────────────────────────────────────────────────────────
 
@@ -234,12 +235,27 @@ export const FEED_GROUP_OAUTH_SCOPES = [
 ];
 
 /**
+ * Resolve the OAuth redirect_uri. With global-config `oauthRedirectBase` set
+ * (typically the host's dashboard origin), auth flows redirect to the
+ * dashboard's `/oauth/callback` receiver and complete automatically; without
+ * it, the legacy localhost paste-back address is used. The chosen URI must be
+ * registered in the app's console redirect-URL whitelist either way.
+ */
+export function resolveOAuthRedirectUri(): string {
+  try {
+    const base = readGlobalConfig().oauthRedirectBase?.trim().replace(/\/+$/, '');
+    if (base && /^https?:\/\//.test(base)) return `${base}/oauth/callback`;
+  } catch { /* fall through to legacy */ }
+  return `http://127.0.0.1:${DEFAULT_PORT}/callback`;
+}
+
+/**
  * Generate an OAuth authorization URL. Returns the URL and stores pending state.
  * Called by /login command handler.
  */
 export function generateAuthUrl(appId: string, appSecret: string, brand: Brand = 'feishu', extraScopes: string[] = []): { authUrl: string; state: string } {
   const state = randomBytes(32).toString('hex');
-  const redirectUri = `http://127.0.0.1:${DEFAULT_PORT}/callback`;
+  const redirectUri = resolveOAuthRedirectUri();
 
   // 基础 scope + 调用方按需追加（去重）。文档订阅入口会带 DOC_COMMENT_OAUTH_SCOPES。
   const scope = [...new Set([...DEFAULT_SCOPES.split(' '), ...extraScopes])].join(' ');
@@ -270,6 +286,54 @@ export function generateAuthUrl(appId: string, appSecret: string, brand: Brand =
   }
 
   return { authUrl, state };
+}
+
+/** Structured callback outcome for programmatic receivers (dashboard IPC).
+ *  `matched=false` means the state belongs to another daemon process — the
+ *  caller should try the next one rather than reporting failure. */
+export interface CallbackHandleResult {
+  matched: boolean;
+  ok: boolean;
+  message: string;
+}
+
+/**
+ * Structured variant of handleCallbackUrl. Returns null when the URL is not a
+ * callback at all; `{matched:false}` when the state is not pending in THIS
+ * process (another daemon may own it).
+ */
+export async function tryHandleCallbackUrl(url: string): Promise<CallbackHandleResult | null> {
+  const hasCode = /[?&]code=([^&]+)/.test(url);
+  const hasState = /[?&]state=([^&]+)/.test(url);
+  if (!hasCode || !hasState) return null;
+  const state = decodeURIComponent(/[?&]state=([^&]+)/.exec(url)![1]);
+  if (!pendingLogins.has(state)) {
+    return { matched: false, ok: false, message: 'state not pending in this process' };
+  }
+  const message = await handleCallbackUrl(url);
+  if (message === null) return null;
+  return { matched: true, ok: message.startsWith('✅'), message };
+}
+
+/**
+ * Feed-group authorization status for the dashboard's session-group tag UI:
+ * authorized = a stored token for this app carries the feed-group write scope
+ * and is still usable (valid or refreshable).
+ */
+export function getFeedGroupAuthStatus(appId: string, brand: Brand = 'feishu'): { authorized: boolean; expiresAt?: string } {
+  try {
+    const loaded = loadTokenForApp(appId, brand);
+    if (!loaded) return { authorized: false };
+    const token = loaded.token;
+    const scopes = (token.scope ?? '').split(/\s+/);
+    if (!scopes.includes('im:feed_group_v1:write')) return { authorized: false };
+    const refreshable = token.refresh_expires_at && new Date(token.refresh_expires_at) > new Date();
+    const valid = token.expires_at && new Date(token.expires_at) > new Date();
+    if (!valid && !refreshable) return { authorized: false };
+    return { authorized: true, expiresAt: token.refresh_expires_at || token.expires_at };
+  } catch {
+    return { authorized: false };
+  }
 }
 
 /**
