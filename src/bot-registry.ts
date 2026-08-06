@@ -901,6 +901,12 @@ export interface SessionGroupConfig {
     /** Tag / feed-group display name (default: Botmux群会话). */
     name?: string;
   };
+  /**
+   * Distinctive built-in group avatar for session groups — the zero-permission
+   * visual marker (works on tenants without the chat-tag catalog).
+   * 'auto' (default) applies it at birth; 'off' keeps Feishu's default avatar.
+   */
+  avatar?: 'auto' | 'off';
   /** Reserved (PR3): auto-dispose after N idle days; 0/undefined = off. */
   idleDays?: number;
 }

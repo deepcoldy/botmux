@@ -21,6 +21,7 @@ import { createGroupWithBots } from '../services/group-creator.js';
 import { registerSessionGroup } from '../services/session-groups-store.js';
 import { scheduleSessionGroupTitle } from '../services/session-group-title.js';
 import { tagSessionGroup } from '../services/feed-group-tagger.js';
+import { applySessionGroupAvatar } from '../services/session-group-avatar.js';
 import { sendMessage, replyMessage } from '../im/lark/client.js';
 import { extractMessageTextForRouting, type RoutingContext } from '../im/lark/event-dispatcher.js';
 import { t, localeForBot, type Locale } from '../i18n/index.js';
@@ -114,9 +115,11 @@ export async function maybeBirthSessionGroup(
       }
     }
 
-    // Sidebar tag (feedGroup, explicit mode) — fire-and-forget, degrades to
-    // untagged with an owner auth nudge when the user token/scope is missing.
+    // Session-group tagging + avatar branding — both fire-and-forget and
+    // best-effort (tag degrades per mode/tenant support; avatar degrades to
+    // the default Feishu group avatar).
     void tagSessionGroup(larkAppId, newChatId, senderOpenId);
+    void applySessionGroupAvatar(larkAppId, newChatId);
 
     // T1 of two-phase naming: async AI title → rename (fire-and-forget).
     scheduleSessionGroupTitle({ larkAppId, chatId: newChatId, userText: trimmed });
