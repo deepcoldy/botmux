@@ -2455,7 +2455,11 @@ ipcRoute('PUT', '/api/roles/:chatId', async (req, res, p) => {
     if (hasContentField) writeRoleFile(cachedLarkAppId, p.chatId, content);
     if (injectMode !== undefined) writeRoleInjectMode(cachedLarkAppId, p.chatId, injectMode);
     if (dispatchCompletionEnabled !== undefined) writeRoleDispatchCompletionEnabled(cachedLarkAppId, p.chatId, dispatchCompletionEnabled);
-    jsonRes(res, 200, { ok: true });
+    // `changed` reflects whether the role FILE (→ hasRole in the groups matrix)
+    // was written. A metadata-only PUT touches just the .meta.json sidecar and
+    // leaves hasRole untouched, so it reports changed:false — the dashboard uses
+    // this to avoid needlessly busting its 30s groups-matrix snapshot.
+    jsonRes(res, 200, { ok: true, changed: hasContentField });
   } catch (e) {
     jsonRes(res, 500, { ok: false, error: String(e) });
   }
@@ -2466,7 +2470,9 @@ ipcRoute('DELETE', '/api/roles/:chatId', async (_req, res, p) => {
   if (!isValidRoleChatId(p.chatId)) return jsonRes(res, 400, { ok: false, error: 'invalid_chat_id' });
   const existed = deleteRoleFile(cachedLarkAppId, p.chatId);
   deleteRoleMeta(cachedLarkAppId, p.chatId);
-  jsonRes(res, 200, { ok: true, existed });
+  // `changed` mirrors `existed`: a DELETE that removed nothing didn't flip
+  // hasRole, so the dashboard skips invalidating its groups-matrix snapshot.
+  jsonRes(res, 200, { ok: true, existed, changed: existed });
 });
 
 ipcRoute('GET', '/api/message-listeners/:chatId', async (_req, res, p) => {
@@ -2576,7 +2582,7 @@ async function collectMessageListenerPreviewMatches(
   });
   const candidateBotAppIds = collectListenerBotAppIds(messages, dashboardHistoryMessageSender);
   const appIdToOpenId = await buildListenerBotAppIdToOpenId(larkAppId, chatId, candidateBotAppIds);
-  return previewMessageListenerMatches({
+  const matches = previewMessageListenerMatches({
     bot: previewBot,
     chatId,
     messages,
@@ -2589,6 +2595,20 @@ async function collectMessageListenerPreviewMatches(
     // spawn a session for a message live routing never sends to the listener).
     explicitlyMentionedThisBot: (message) => messageMentionsBot(message, larkAppId, bot.botOpenId),
   });
+  // The listener matcher extracts card text from the SIMPLIFIED history view,
+  // which drops button jump URLs. The live delivery path (handleNewTopic) fixes
+  // this by re-extracting after resolveNonsupportMessage merges the card's two
+  // representations. Preview/run-preview do NOT go through handleNewTopic, so
+  // apply the equivalent merge here: run-preview spawns REAL turns off
+  // match.messageText, and preview display should show the same links the live
+  // listener will. Only interactive cards need it; a resolver miss keeps the
+  // match-time text. Resolve concurrently — each match is an independent fetch.
+  await Promise.all(matches.map(async (match) => {
+    if (match.msgType !== 'interactive') return;
+    const merged = await resolveMergedCardContent(larkAppId, match.messageId).catch(() => null);
+    if (merged?.text?.trim()) match.messageText = merged.text;
+  }));
+  return matches;
 }
 
 function publicMessageListenerMatch(match: MessageListenerPreviewMatch): Record<string, unknown> {

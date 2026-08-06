@@ -73,6 +73,9 @@ const CLI_COMM_MAP: Record<string, CliId> = {
   // grok adopt 分支（transcript bridge / by-pid 绑定都依赖这个入口）。
   grok: 'grok',
   'kiro-cli': 'kiro-cli',
+  // The npm launcher appears as node/reasonix.js before its native child starts.
+  reasonix: 'reasonix',
+  'reasonix.js': 'reasonix',
 };
 
 /** Interpreters and native launchers that may hide the CLI identity in argv.

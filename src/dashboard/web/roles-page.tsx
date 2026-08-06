@@ -140,7 +140,12 @@ function cloneListener(listener: MessageListenerData | null | undefined): Messag
 }
 
 function listenerHasConfig(listener: MessageListenerData | null): boolean {
-  return listener?.enabled === true && listener.prompt.trim().length > 0;
+  // A persisted listener is worth loading into the editor whenever it carries a
+  // prompt — INCLUDING a disabled draft (enabled:false + non-empty prompt). The
+  // backend persists such drafts (see messageListenerConfigFromUpdate); gating
+  // on enabled here would reset the editor to blank on reload and make the saved
+  // draft look lost. Runtime matching still requires enabled===true elsewhere.
+  return !!listener && listener.prompt.trim().length > 0;
 }
 
 function groupHasAnyRoleOrListener(group: GroupInfo): boolean {
@@ -775,18 +780,28 @@ function RolesPage(props: { tab: RolesTab }) {
 
   async function handleSaveListener(): Promise<void> {
     if (!selectedGroupId || !selectedBotId) return;
-    if (!editingListener.enabled) {
+    // Disabled + blank prompt = clear the listener entirely (mirrors the backend
+    // messageListenerConfigFromUpdate: nothing worth persisting → delete). A
+    // disabled draft WITH a prompt falls through and is saved as-is (enabled:false),
+    // so turning the toggle off then Save no longer discards the typed content.
+    if (!editingListener.enabled && !editingListener.prompt.trim()) {
       await handleDeleteListener(false);
       return;
     }
-    if (!editingListener.prompt.trim()) {
-      flash(setListenerFlash, tr('roles.listenerPromptRequired'), true);
-      return;
-    }
-    if (editingListener.senderPolicy?.mode !== 'all_except_excluded'
-      && (editingListener.senderPolicy?.includeSenderOpenIds?.length ?? 0) === 0) {
-      flash(setListenerFlash, tr('roles.listenerSenderRequired'), true);
-      return;
+    // Prompt + sender requirements only gate an ENABLED listener (it will match
+    // live messages). A disabled draft never matches at runtime, so an
+    // incomplete sender policy is fine to persist and re-editing later can
+    // complete it before enabling.
+    if (editingListener.enabled) {
+      if (!editingListener.prompt.trim()) {
+        flash(setListenerFlash, tr('roles.listenerPromptRequired'), true);
+        return;
+      }
+      if (editingListener.senderPolicy?.mode !== 'all_except_excluded'
+        && (editingListener.senderPolicy?.includeSenderOpenIds?.length ?? 0) === 0) {
+        flash(setListenerFlash, tr('roles.listenerSenderRequired'), true);
+        return;
+      }
     }
     setListenerSaving(true);
     try {
@@ -1047,7 +1062,7 @@ function RolesPage(props: { tab: RolesTab }) {
                         type="button"
                         id="roles-listener-delete"
                         className="danger"
-                        style={{ display: selectedListener?.enabled ? '' : 'none' }}
+                        style={{ display: selectedListener ? '' : 'none' }}
                         disabled={listenerDeleting}
                         onClick={() => void handleDeleteListener()}
                       >

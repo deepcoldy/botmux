@@ -22,6 +22,13 @@ import { DaemonRegistry, botsRosterSignature } from './dashboard/registry.js';
 import { Aggregator, subscribeDaemon } from './dashboard/aggregator.js';
 import { createSessionPresentationCoordinator } from './dashboard/session-presentation.js';
 import {
+  compactGroupsMatrix,
+  createGroupsMatrixSnapshot,
+  enrichSessionsWithGroupNames,
+  roleWriteShouldInvalidate,
+  type GroupsMatrix,
+} from './dashboard/groups-matrix-snapshot.js';
+import {
   parseDashboardAskAnswerRequest,
   proxyDashboardAskAnswer,
 } from './dashboard/desktop-asks.js';
@@ -310,6 +317,16 @@ mkdirSync(REGISTRY_DIR, { recursive: true });
 const registry = new DaemonRegistry(REGISTRY_DIR);
 const aggregator = new Aggregator();
 const sessionPresentation = createSessionPresentationCoordinator(aggregator, getGitRepoInfo);
+const groupsMatrixSnapshot = createGroupsMatrixSnapshot(buildGroupsMatrix, {
+  onRefreshError: error => logger.warn(`[dashboard] groups matrix refresh failed: ${String(error)}`),
+});
+let groupsRosterSignature = botsRosterSignature(registry.list());
+registry.on((online) => {
+  const next = botsRosterSignature(online);
+  if (next === groupsRosterSignature) return;
+  groupsRosterSignature = next;
+  groupsMatrixSnapshot.invalidate();
+});
 
 // Keep Git-derived fields in the central read-model so REST snapshots and SSE
 // share one row shape. Idle/limited turn boundaries force a branch refresh
@@ -1217,6 +1234,7 @@ const groupsActionDeps: GroupsActionDeps = {
   proxyToDaemon,
   closeSessionsMatching,
   fetch: fetchDaemonUrl,
+  invalidateGroups: () => groupsMatrixSnapshot.invalidate(),
 };
 
 // ─── PR2 C8: Route B internal API (`/__daemon/*`) ───────────────────────────
@@ -1238,7 +1256,7 @@ const daemonInternalApi = createDaemonInternalApi({
   getSessions: () => aggregator.getSessions(),
   getSchedules: () => aggregator.getSchedules(),
   resolveDashboardSettings,
-  buildGroupsMatrix,
+  buildGroupsMatrix: () => groupsMatrixSnapshot.get(),
   settingsApplierDeps: settingsWriteApplierDeps,
   groupsActionDeps,
   proxyToDaemon,
@@ -2149,6 +2167,7 @@ async function createTeamGroup(args: { name: string; larkAppIds: string[]; userO
     if (!upstream.ok || !parsed?.ok || typeof parsed.chatId !== 'string') {
       return { ok: false, error: parsed?.error ?? `group_create_http_${upstream.status}` };
     }
+    groupsMatrixSnapshot.invalidate();
     return {
       ok: true,
       chatId: parsed.chatId,
@@ -2186,6 +2205,7 @@ async function transferTeamGroupOwner(args: {
         transferError: parsed?.error ?? `owner_transfer_http_${upstream.status}`,
       };
     }
+    groupsMatrixSnapshot.invalidate();
     return {
       ownerTransferredTo: parsed.ownerTransferredTo ?? null,
       transferError: parsed.transferError ?? null,
@@ -2243,6 +2263,7 @@ async function createLifecycleGroupForWebhook(
   if (!upstream.ok || !parsed?.ok || typeof parsed.chatId !== 'string') {
     throw new Error(parsed?.error ?? `group_create_http_${upstream.status}`);
   }
+  groupsMatrixSnapshot.invalidate();
   return { chatId: parsed.chatId, creatorLarkAppId: parsed.creator ?? pick.creatorLarkAppId };
 }
 
@@ -2252,7 +2273,7 @@ async function createLifecycleGroupForWebhook(
  * always returns the raw (unscrubbed) view — the browser route applies its
  * `redactGroupsForPublic` scrub on top when the caller is unauthed.
  */
-async function buildGroupsMatrix(): Promise<{ chats: any[]; bots: any[] }> {
+async function buildGroupsMatrix(): Promise<GroupsMatrix> {
   const out = new Map<string, any>();
   const cliIds = configuredCliIds();
   const onlineBots = [...registry.list()]
@@ -2854,12 +2875,13 @@ const server = createServer(async (req, res) => {
       // raw appId as botName — resolve through the live registry so consumers
       // (dashboard, HD2D office tab) always see the human-facing name.
       const names = new Map([...registry.list()].map(d => [d.larkAppId, d.botName] as const));
-      const sessions = aggregator.getSessions().map(s => {
+      groupsMatrixSnapshot.warm();
+      const sessions = enrichSessionsWithGroupNames(aggregator.getSessions().map(s => {
         const n = names.get(s.larkAppId);
         return n && n !== s.larkAppId && (!s.botName || s.botName === s.larkAppId)
           ? { ...s, botName: n }
           : s;
-      });
+      }), groupsMatrixSnapshot.peekPresentation());
       return jsonRes(res, 200, {
         sessions: authed ? sessions : redactSessionsForPublic(sessions),
       });
@@ -4112,7 +4134,12 @@ const server = createServer(async (req, res) => {
       // route and the Route B `/__daemon/groups-matrix` endpoint return the
       // same matrix shape. Public-read carve-out: oncall bindings carry
       // workingDir (repo/customer paths) so we scrub when unauthed.
-      const matrix = await buildGroupsMatrix();
+      const matrix = await groupsMatrixSnapshot.get({
+        force: authed && url.searchParams.get('refresh') === '1',
+      });
+      if (url.searchParams.get('view') === 'compact') {
+        return jsonRes(res, 200, compactGroupsMatrix(matrix));
+      }
       return jsonRes(res, 200, {
         chats: authed ? matrix.chats : redactGroupsForPublic(matrix.chats),
         bots: matrix.bots,
@@ -4154,14 +4181,25 @@ const server = createServer(async (req, res) => {
           headers: { 'content-type': 'application/json' },
           body: raw,
         });
+        const upstreamText = await upstream.text();
+        let upstreamJson: any = null;
+        try { upstreamJson = JSON.parse(upstreamText); } catch { /* leave null */ }
+        // 写角色会翻转群矩阵里的 hasRole → 失效快照，避免 roles 页「已配置」
+        // 徽标最多陈旧 30s（对齐 oncall bind/unbind、建群/加 bot 的失效）。
+        if (roleWriteShouldInvalidate(upstream.ok, upstreamJson)) groupsMatrixSnapshot.invalidate();
         res.writeHead(upstream.status, { 'content-type': 'application/json' });
-        res.end(await upstream.text());
+        res.end(upstreamText);
         return;
       }
       if (req.method === 'DELETE') {
         const upstream = await proxyToDaemon(larkAppId, `/api/roles/${encodeURIComponent(chatId)}`, { method: 'DELETE' });
+        const upstreamText = await upstream.text();
+        let upstreamJson: any = null;
+        try { upstreamJson = JSON.parse(upstreamText); } catch { /* leave null */ }
+        // 删角色会把 hasRole 翻回 false — 失效快照让徽标立即刷新，不等 30s TTL。
+        if (roleWriteShouldInvalidate(upstream.ok, upstreamJson)) groupsMatrixSnapshot.invalidate();
         res.writeHead(upstream.status, { 'content-type': 'application/json' });
-        res.end(await upstream.text());
+        res.end(upstreamText);
         return;
       }
     }
@@ -4326,8 +4364,15 @@ const server = createServer(async (req, res) => {
         headers: { 'content-type': 'application/json' },
         body: raw,
       });
+      const upstreamText = await upstream.text();
+      let upstreamJson: any = null;
+      try { upstreamJson = JSON.parse(upstreamText); } catch { /* leave null */ }
+      // 只有真正改写了角色文件（changed:true）才失效缓存：preview、被拒
+      // （chat_role_exists）、missing_entry 都不动 hasRole，跟着失效只会白白
+      // 打穿 30s 快照、把 PR 的 fan-out 优化抵消掉（判定在 roleWriteShouldInvalidate）。
+      if (roleWriteShouldInvalidate(upstream.ok, upstreamJson)) groupsMatrixSnapshot.invalidate();
       res.writeHead(upstream.status, { 'content-type': 'application/json' });
-      res.end(await upstream.text());
+      res.end(upstreamText);
       return;
     }
 
@@ -5093,6 +5138,7 @@ const server = createServer(async (req, res) => {
           upstreamJson.autoInvitedOpenId = autoInvited;
         }
       }
+      if (upstream.ok && upstreamJson?.ok) groupsMatrixSnapshot.invalidate();
       res.writeHead(upstream.status, { 'content-type': 'application/json' });
       res.end(upstreamJson ? JSON.stringify(upstreamJson) : upstreamText);
       return;
@@ -5176,6 +5222,7 @@ const server = createServer(async (req, res) => {
         if (!groupUpstream.ok || !groupResp?.ok || typeof groupResp.chatId !== 'string') {
           return jsonRes(res, 502, { ok: false, error: groupResp?.error ?? `group_create_http_${groupUpstream.status}` });
         }
+        groupsMatrixSnapshot.invalidate();
       } catch {
         return jsonRes(res, 502, { ok: false, error: 'group_create_proxy_failed' });
       }

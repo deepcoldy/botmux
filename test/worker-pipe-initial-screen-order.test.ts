@@ -500,6 +500,14 @@ describe('worker pipe initial screen ordering', () => {
     expect(herdrBlock).toContain('herdrBe.cliCwd');
   });
 
+  it('wires reasonix cliPid/cliCwd in both immediate and late pid paths', () => {
+    const source = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
+    // reasonix joins the inline pid/cwd-wiring condition alongside grok/traex at
+    // BOTH sites (synchronous tmux/pty resolve + async zellij late-pid fallback).
+    const matches = source.match(/cfg\.cliId === 'grok' \|\| cfg\.cliId === 'traex' \|\| cfg\.cliId === 'reasonix'/g) ?? [];
+    expect(matches.length).toBeGreaterThanOrEqual(2);
+  });
+
   it('wires Herdr adopt snapshots before seeding the initial screen', () => {
     const source = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
     const herdrStart = source.indexOf("cfg.adoptSource === 'herdr'");

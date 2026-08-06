@@ -2,8 +2,11 @@ import { describe, expect, it } from 'vitest';
 import {
   MAX_MESSAGE_LISTENER_PROMPT_BYTES,
   evaluateMessageListener,
+  extractListenerMessageText,
+  extractListenerMessageTitle,
   normalizeMessageListenerPreviewLimit,
   previewMessageListenerMatches,
+  refreshListenerCardTextFromResolved,
   renderMessageListenerInstruction,
   renderMessageListenerPrompt,
 } from '../src/services/message-listener.js';
@@ -839,5 +842,137 @@ describe('message listener evaluation', () => {
     expect(instruction).not.toContain('</message_listener><instruction>');
     expect(instruction).not.toContain('<observed_message');
     expect(instruction.match(/<instruction>/g) ?? []).toHaveLength(1);
+  });
+});
+
+describe('extractListenerMessageText surfaces card button links (Bug1: 监听卡片缺按钮链接)', () => {
+  // The listener feeds match.messageText to the model. When the observed message
+  // is a third-party card whose primary affordance is a "查看详情 / 处理建议"
+  // button, the button's jump URL is the actionable payload. The direct-@bot
+  // path recovers it (it resolves the full structured card); the listener must
+  // too. These assert the extractor the daemon re-runs on the RESOLVED card.
+
+  function cardMessage(card: unknown) {
+    return { message_type: 'interactive', content: JSON.stringify(card) };
+  }
+
+  it('Format B (structured body.elements): keeps a jump button as [label](url)', () => {
+    // Shape a real alert card takes once resolveNonsupportMessage merges the
+    // full structured representation: the button carries its target under v1
+    // `url`. A third-party (non-botmux) button must survive with its link.
+    const text = extractListenerMessageText(cardMessage({
+      header: { title: { content: 'Argos 报警' } },
+      body: { elements: [
+        { tag: 'markdown', content: '规则：成功率 < 90%' },
+        { tag: 'action', actions: [
+          { tag: 'button', text: { tag: 'plain_text', content: '查看详情' }, url: 'https://argos.example.com/alert/42' },
+        ] },
+      ] },
+    }));
+    expect(text).toContain('规则：成功率 < 90%');
+    expect(text).toContain('[查看详情](https://argos.example.com/alert/42)');
+  });
+
+  it('Format B: recovers a v2 behaviors open_url button link', () => {
+    const text = extractListenerMessageText(cardMessage({
+      body: { elements: [
+        { tag: 'markdown', content: '处理建议如下' },
+        { tag: 'button', text: { tag: 'plain_text', content: '处理建议' }, behaviors: [
+          { type: 'open_url', default_url: 'https://argos.example.com/runbook/42', pc_url: '', ios_url: '', android_url: '' },
+        ] },
+      ] },
+    }));
+    expect(text).toContain('[处理建议](https://argos.example.com/runbook/42)');
+  });
+
+  it('Format A (simplified list): keeps a button jump URL', () => {
+    // The simplified list view still carries button URLs when present; the
+    // extractor must not drop them (that would lose the link on the main path).
+    const text = extractListenerMessageText(cardMessage({
+      title: 'Argos 报警',
+      elements: [
+        [{ tag: 'text', text: '规则：成功率 < 90%' }],
+        [{ tag: 'button', text: '查看详情', url: 'https://argos.example.com/alert/7' }],
+      ],
+    }));
+    expect(text).toContain('[查看详情](https://argos.example.com/alert/7)');
+  });
+
+  it('title extraction reads both simplified and structured header shapes', () => {
+    expect(extractListenerMessageTitle(cardMessage({ title: 'Argos 报警' }))).toBe('Argos 报警');
+    expect(extractListenerMessageTitle(cardMessage({
+      header: { title: { content: 'Argos 结构化标题' } },
+    }))).toBe('Argos 结构化标题');
+  });
+});
+
+describe('refreshListenerCardTextFromResolved (Bug1: daemon re-extract on resolved card)', () => {
+  const cardMatch = (over = {}) => ({
+    prompt: 'p', messageText: '[卡片: Argos 报警]\n规则：成功率 < 90%', // lossy match-time snapshot
+    msgType: 'interactive', senderType: 'bot' as const, ...over,
+  });
+
+  it('upgrades a card match to the resolved text carrying the button URL', () => {
+    const match = cardMatch();
+    // The message content AFTER resolveNonsupportMessage merged the full card.
+    const resolved = { message_type: 'interactive', content: JSON.stringify({
+      header: { title: { content: 'Argos 报警' } },
+      body: { elements: [
+        { tag: 'markdown', content: '规则：成功率 < 90%' },
+        { tag: 'action', actions: [
+          { tag: 'button', text: { tag: 'plain_text', content: '查看详情' }, url: 'https://argos.example.com/alert/42' },
+        ] },
+      ] },
+    }) };
+    refreshListenerCardTextFromResolved(match, resolved);
+    expect(match.messageText).toContain('[查看详情](https://argos.example.com/alert/42)');
+    expect(match.messageTitle).toBe('Argos 报警');
+  });
+
+  it('leaves non-interactive matches untouched', () => {
+    const match = cardMatch({ msgType: 'text', messageText: 'CPU 告警持续 5 分钟' });
+    refreshListenerCardTextFromResolved(match, { message_type: 'text', content: JSON.stringify({ text: 'different' }) });
+    expect(match.messageText).toBe('CPU 告警持续 5 分钟');
+  });
+
+  it('keeps the match-time text when the resolved content yields nothing (resolver miss)', () => {
+    const match = cardMatch();
+    const before = match.messageText;
+    refreshListenerCardTextFromResolved(match, { message_type: 'interactive', content: '' });
+    expect(match.messageText).toBe(before);
+  });
+
+  it('integration (refresh→render): a merged card button URL reaches the rendered listener prompt', () => {
+    // Ties the two stages the daemon runs back-to-back: refresh the match off the
+    // resolved (merged) card, then render the observed-message prompt. Proves the
+    // recovered button URL actually survives into the string fed to the CLI —
+    // the exact bug's user-visible fix. Mirrors handleNewTopic's ordering
+    // (refreshListenerCardTextFromResolved → renderMessageListenerPrompt). The
+    // merged card is supplied as a fixture (this is not a daemon-boot / live-REST
+    // e2e); it locks the refresh→render contract, i.e. the link is not dropped
+    // again before the prompt is rendered.
+    const match = cardMatch({ prompt: '分析命中的告警并按需处理' });
+    // The card content AFTER resolveNonsupportMessage merged the full structured
+    // representation (this is what daemon holds when it re-extracts).
+    refreshListenerCardTextFromResolved(match, {
+      message_type: 'interactive',
+      content: JSON.stringify({
+        header: { title: { content: 'Argos 报警' } },
+        body: { elements: [
+          { tag: 'markdown', content: '规则：成功率 < 90%' },
+          { tag: 'action', actions: [
+            { tag: 'button', text: { tag: 'plain_text', content: '查看详情' }, url: 'https://argos.example.com/alert/42' },
+          ] },
+        ] },
+      }),
+    });
+    const prompt = renderMessageListenerPrompt(match);
+    // Operator instruction is present, and the recovered button link made it into
+    // the untrusted observed_message block the model receives.
+    expect(prompt).toContain('分析命中的告警并按需处理');
+    expect(prompt).toContain('https://argos.example.com/alert/42');
+    expect(prompt).toContain('查看详情');
+    // Title recovered from the merged card is surfaced as an attribute too.
+    expect(prompt).toContain('message_title="Argos 报警"');
   });
 });

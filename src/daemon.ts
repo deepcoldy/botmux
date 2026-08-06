@@ -195,7 +195,7 @@ import {
   extractBotmuxLarkNativeSessionTitlePrompt,
 } from './core/session-title.js';
 import { settleDeferredScheduleRun } from './core/deferred-schedule-settlement.js';
-import { renderMessageListenerPrompt } from './services/message-listener.js';
+import { renderMessageListenerPrompt, refreshListenerCardTextFromResolved } from './services/message-listener.js';
 import { sweepOrphanSandboxes } from './adapters/backend/sandbox.js';
 import { TmuxBackend } from './adapters/backend/tmux-backend.js';
 import { HerdrBackend } from './adapters/backend/herdr-backend.js';
@@ -15737,6 +15737,9 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
   const ownerOpenIdForSession = isForeignBotSender ? undefined : senderOpenId;
   const ownerUnionIdForSession = isForeignBotSender ? undefined : senderUnionId;
   const botCfg = getBot(larkAppId).config;
+  // Upgrade a card match's text/title from the resolved message (button URLs the
+  // simplified match-time view dropped). See refreshListenerCardTextFromResolved.
+  if (messageListener) refreshListenerCardTextFromResolved(messageListener, data.message);
   const listenerPrompt = messageListener ? renderMessageListenerPrompt(messageListener) : undefined;
   if (listenerPrompt) {
     content = listenerPrompt;

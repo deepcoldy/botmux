@@ -19,6 +19,7 @@ import {
   type FsRule,
 } from '../src/adapters/cli/fs-policy.js';
 import { createCodexAppAdapter } from '../src/adapters/cli/codex-app.js';
+import { createReasonixAdapter } from '../src/adapters/cli/reasonix.js';
 
 const ctx = (o: Partial<FsPolicyContext> = {}): FsPolicyContext => ({
   platform: 'darwin',
@@ -103,6 +104,27 @@ describe('mergeFsRules + accessForPath (the policy semantics)', () => {
 });
 
 describe('buildFsPolicy', () => {
+  it('reasonix state root is read-write so identity, sessions, leases and skills persist in sandbox', () => {
+    const adapter = createReasonixAdapter('/usr/bin/reasonix');
+    const p = buildFsPolicy(ctx({
+      platform: 'linux',
+      homeDir: '/home/u',
+      botHome: '/home/u/.botmux/bots/cli_self',
+      botmuxHome: '/home/u/.botmux',
+      sessionDataDir: '/home/u/.botmux/data',
+      workingDir: '/home/u/proj',
+      redirectedCliData: false,
+      authPaths: adapter.authPaths?.map(path => path.replace(/^~/, '/home/u')),
+    }));
+    for (const path of [
+      '/home/u/.reasonix/machine-id.key',
+      '/home/u/.reasonix/projects/-home-u-proj/sessions/s.jsonl.lease.json',
+      '/home/u/.reasonix/skills/botmux-send/SKILL.md',
+    ]) {
+      expect(accessForPath(p.rules, path).access).toBe('readWrite');
+    }
+  });
+
   it('darwin baseline: system ro, scratch rw, crown jewels denied, lark-cli store denied', () => {
     const p = buildFsPolicy(ctx());
     expect(accessForPath(p.rules, '/System/Library/Frameworks/x').access).toBe('readOnly');

@@ -332,6 +332,97 @@ describe('PUT /api/bot-card-prefs — Codex App clean history', () => {
   });
 });
 
+describe('PUT/GET /api/message-listeners/:chatId — disabled draft persistence (Bug2: 二刷消失)', () => {
+  it('persists a disabled listener that still has a prompt, and GET returns it after reload', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-listener-draft-'));
+    const configPath = join(dir, 'bots.json');
+    const appId = 'test-listener-draft-app';
+    const chatId = 'oc_draft_chat';
+    const prevBotsConfig = process.env.BOTS_CONFIG;
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      writeFileSync(configPath, JSON.stringify([{
+        larkAppId: appId,
+        larkAppSecret: 'secret',
+        cliId: 'claude',
+      }], null, 2));
+      loadBotConfigs().forEach((c: any) => registerBot(c));
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const base = `http://127.0.0.1:${handle.port}`;
+
+      // Save with the toggle OFF but a real prompt typed in — the exact action
+      // that used to silently drop everything.
+      const put = await fetch(`${base}/api/message-listeners/${chatId}`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ enabled: false, name: '告警监听草稿', prompt: '分析命中的告警消息' }),
+      });
+      expect(put.status).toBe(200);
+      const putBody = await put.json();
+      expect(putBody).toMatchObject({ ok: true });
+      expect(putBody.listener).toMatchObject({ enabled: false, prompt: '分析命中的告警消息', name: '告警监听草稿' });
+
+      // It must survive on disk (this is what the reload reads back).
+      const persisted = JSON.parse(readFileSync(configPath, 'utf-8'))[0].messageListeners?.[chatId];
+      expect(persisted).toBeTruthy();
+      expect(persisted.enabled).toBe(false);
+      expect(persisted.prompt).toBe('分析命中的告警消息');
+
+      // GET (the "二刷" / reload) returns the draft, not null.
+      const get = await (await fetch(`${base}/api/message-listeners/${chatId}`)).json();
+      expect(get.listener).toMatchObject({ enabled: false, prompt: '分析命中的告警消息', name: '告警监听草稿' });
+    } finally {
+      if (handle) await handle.close();
+      handle = null;
+      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = prevBotsConfig;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('clears the entry when a disabled update carries a blank prompt', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-listener-clear-'));
+    const configPath = join(dir, 'bots.json');
+    const appId = 'test-listener-clear-app';
+    const chatId = 'oc_clear_chat';
+    const prevBotsConfig = process.env.BOTS_CONFIG;
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      writeFileSync(configPath, JSON.stringify([{
+        larkAppId: appId,
+        larkAppSecret: 'secret',
+        cliId: 'claude',
+        messageListeners: {
+          [chatId]: { enabled: true, prompt: '旧配置', messagePolicy: { scope: 'top_level' }, replyPolicy: { mode: 'thread', sessionMode: 'per_message' } },
+        },
+      }], null, 2));
+      loadBotConfigs().forEach((c: any) => registerBot(c));
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const base = `http://127.0.0.1:${handle.port}`;
+
+      const put = await fetch(`${base}/api/message-listeners/${chatId}`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ enabled: false, prompt: '   ' }),
+      });
+      expect(put.status).toBe(200);
+      expect(await put.json()).toMatchObject({ ok: true, listener: null });
+      // Entry removed from disk, and (being the only one) messageListeners dropped.
+      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].messageListeners).toBeUndefined();
+      const get = await (await fetch(`${base}/api/message-listeners/${chatId}`)).json();
+      expect(get.listener).toBeNull();
+    } finally {
+      if (handle) await handle.close();
+      handle = null;
+      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = prevBotsConfig;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
 describe('PUT /api/bot-card-prefs — reply-card usage display mode', () => {
   it('defaults to streaming and persists explicit footer/off changes immediately', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-usage-display-'));
@@ -3355,6 +3446,56 @@ describe('role profile IPC routes', () => {
 
       const role = await fetch(`${base}/api/roles/oc_empty`);
       expect(await role.json()).toMatchObject({ chatId: 'oc_empty', content: null, hasRole: false });
+    } finally {
+      if (prevDataDir === undefined) delete process.env.SESSION_DATA_DIR;
+      else process.env.SESSION_DATA_DIR = prevDataDir;
+      config.session.dataDir = prevConfigDataDir;
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+
+  it('reports `changed` so the dashboard only invalidates on real hasRole mutations', async () => {
+    // The groups-matrix snapshot keys off `changed` to avoid busting its 30s
+    // cache on no-op writes. A content PUT / real DELETE flip hasRole
+    // (changed:true); an injectMode-only PUT and a delete-not-found do NOT
+    // (changed:false) — otherwise the common inject-mode toggle would punch
+    // through the cache and re-fan-out across every daemon.
+    const prevDataDir = process.env.SESSION_DATA_DIR;
+    const prevConfigDataDir = config.session.dataDir;
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-role-changed-ipc-'));
+    config.session.dataDir = dataDir;
+    setLarkAppId('cli_profile');
+    try {
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const base = `http://127.0.0.1:${handle.port}`;
+
+      // Content PUT writes the role file → changed:true.
+      const putContent = await fetch(`${base}/api/roles/oc_changed`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ content: '# Role\nhello' }),
+      });
+      expect(putContent.status).toBe(200);
+      expect(await putContent.json()).toMatchObject({ ok: true, changed: true });
+
+      // injectMode-only PUT touches just the .meta.json sidecar → changed:false.
+      const putMode = await fetch(`${base}/api/roles/oc_changed`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ injectMode: 'once' }),
+      });
+      expect(putMode.status).toBe(200);
+      expect(await putMode.json()).toMatchObject({ ok: true, changed: false });
+
+      // DELETE that removed the existing file → changed:true.
+      const delExisting = await fetch(`${base}/api/roles/oc_changed`, { method: 'DELETE' });
+      expect(delExisting.status).toBe(200);
+      expect(await delExisting.json()).toMatchObject({ ok: true, existed: true, changed: true });
+
+      // DELETE with nothing to remove → changed:false.
+      const delMissing = await fetch(`${base}/api/roles/oc_changed`, { method: 'DELETE' });
+      expect(delMissing.status).toBe(200);
+      expect(await delMissing.json()).toMatchObject({ ok: true, existed: false, changed: false });
     } finally {
       if (prevDataDir === undefined) delete process.env.SESSION_DATA_DIR;
       else process.env.SESSION_DATA_DIR = prevDataDir;
