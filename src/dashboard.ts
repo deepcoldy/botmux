@@ -4615,8 +4615,9 @@ const server = createServer(async (req, res) => {
     }
 
     // PUT /api/bots/:appId/p2p-mode — proxy to that bot's daemon. Body
-    // `{ p2pMode: 'chat' | 'thread' }` ('thread' = per-message DM session;
-    // anything else clears back to the flat continuous chat default).
+    // `{ p2pMode: 'chat' | 'thread' | 'group' }` ('thread' = per-message DM
+    // session; 'group' = per-message dedicated session group; anything else
+    // clears back to the flat continuous chat default).
     let mBotP2pMode: RegExpMatchArray | null;
     if (req.method === 'PUT' && (mBotP2pMode = url.pathname.match(/^\/api\/bots\/([^/]+)\/p2p-mode$/))) {
       const appId = decodeURIComponent(mBotP2pMode[1]);

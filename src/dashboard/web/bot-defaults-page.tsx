@@ -2157,7 +2157,7 @@ function SessionModeSection(props: {
   putCardPref(patch: CardPrefPatch): Promise<JsonResponse>;
 }) {
   const tr = useT();
-  const [p2p, setP2p] = useState(props.bot.p2pMode === 'thread' ? 'thread' : 'chat');
+  const [p2p, setP2p] = useState(normalizeP2pMode(props.bot.p2pMode));
   const [regular, setRegular] = useState(regularGroupMode(props.bot));
   const [mention, setMention] = useState(mentionMode(props.bot));
   const [docMode, setDocMode] = useState(props.bot.docSubscribeDefaultMode === 'all' ? 'all' : 'mention-only');
@@ -2168,7 +2168,7 @@ function SessionModeSection(props: {
   const [docStatus, setDocStatus] = useState<StatusMessage>(null);
 
   useEffect(() => {
-    setP2p(props.bot.p2pMode === 'thread' ? 'thread' : 'chat');
+    setP2p(normalizeP2pMode(props.bot.p2pMode));
     setRegular(regularGroupMode(props.bot));
     setMention(mentionMode(props.bot));
     setDocMode(props.bot.docSubscribeDefaultMode === 'all' ? 'all' : 'mention-only');
@@ -2180,14 +2180,14 @@ function SessionModeSection(props: {
   ]);
 
   async function saveP2p(next: string): Promise<void> {
-    const mode = next === 'chat' ? 'chat' : 'thread';
+    const mode = normalizeP2pMode(next);
     setP2p(mode);
     setBusy('p2p');
     setP2pStatus(null);
     try {
       const res = await sendJson('PUT', `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/p2p-mode`, { p2pMode: mode });
       if (res.ok && res.body.ok) {
-        props.patchBot(props.bot.larkAppId, { p2pMode: res.body.p2pMode === 'thread' ? 'thread' : 'chat' });
+        props.patchBot(props.bot.larkAppId, { p2pMode: normalizeP2pMode(res.body.p2pMode) });
         setP2pStatus({ text: `✓ ${tr('botDefaults.cardPrefSaved')}`, ok: true });
       } else {
         setP2pStatus({ text: `✗ ${responseErrorText(res)}` });
@@ -2212,9 +2212,10 @@ function SessionModeSection(props: {
     }
   }
 
-  const p2pOptions: DropdownFieldOption<'thread' | 'chat'>[] = [
+  const p2pOptions: DropdownFieldOption<'thread' | 'chat' | 'group'>[] = [
     { value: 'thread', label: tr('botDefaults.p2pThread') },
     { value: 'chat', label: tr('botDefaults.p2pChat') },
+    { value: 'group', label: tr('botDefaults.p2pGroup') },
   ];
   const regularOptions: DropdownFieldOption<string>[] = [
     { value: 'chat', label: tr('botDefaults.regularGroupModeChat') },
@@ -2717,6 +2718,10 @@ function SubstituteModeSection(props: { bot: BotDefaultsRow; patchBot: PatchBot 
       </div>
     </section>
   );
+}
+
+function normalizeP2pMode(value: unknown): 'thread' | 'chat' | 'group' {
+  return value === 'thread' ? 'thread' : value === 'group' ? 'group' : 'chat';
 }
 
 function regularGroupMode(bot: BotDefaultsRow): string {

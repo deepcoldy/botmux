@@ -220,7 +220,7 @@ export const messages: Record<string, string> = {
   'cmd.reply_mode.failed': '⚠️ 切换失败：{reason}',
   'cmd.reply_mode.dm_status': '当前私聊会话模式：{mode}\n可用命令：/reply-mode chat｜topic',
   'cmd.reply_mode.dm_updated': '✅ 已切换私聊会话模式为：{mode}',
-  'cmd.reply_mode.dm_usage': '用法（私聊）：/reply-mode chat｜topic\nchat=整段 DM 共用一个连续会话（默认）；topic=每条消息各自起独立会话。',
+  'cmd.reply_mode.dm_usage': '用法（私聊）：/reply-mode chat｜topic｜group\nchat=整段 DM 共用一个连续会话（默认）；topic=每条消息各自起独立会话；group=每条消息自动创建专属会话群并在群里对话。',
   'cmd.reply_mode.dm_shared_unsupported': '⚠️ shared / chat-topic 仅对普通群有意义；私聊只支持 chat｜topic。',
   'cmd.substitute.status_on': '当前群替身模式：已开启（默认）。群里 @ 到配置的替身对象时，我会代答。',
   'cmd.substitute.status_off': '当前群替身模式：已关闭。可用 @我 /substitute on 重新开启。',
@@ -1138,4 +1138,12 @@ export const messages: Record<string, string> = {
   'cmd.createSession.lead_preamble_no_subs': '（本群暂无其它可协作的 sub bot）',
   'cmd.createSession.lead_preamble_outro': '由你决定何时、给谁分配什么。下面是用户分配的整体工作：',
   'cmd.createSession.collab_note': '本群还有 {peers} 在和你一起并行处理同一个任务，注意协作、别重复劳动。',
+
+  // ─── 会话群模式（p2pMode=group）───────────────────────────────────────────
+  'sg.placeholder_untitled': '新会话',
+  'sg.intro': '发起的私聊会话：',
+  'sg.intro_no_text': '（非文本消息）',
+  'sg.receipt': '✅ 已为本次会话创建专属群，后续请在群里继续：{link}',
+  'sg.birth_failed': '⚠️ 建群失败（{error}），本次会话回退为私聊话题。',
+  'sg.cmd_unsupported': '⚠️ 会话群不支持 {cmd}：会话群由 bot 自动创建和管理，固定为连续会话模式。',
 };

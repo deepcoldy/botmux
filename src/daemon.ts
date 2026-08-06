@@ -168,6 +168,7 @@ import {
   rememberLastCliInput,
   ensureTerminalWorkerPort,
   ensureSessionWhiteboard,
+  resumeSession,
 } from './core/session-manager.js';
 import { triggerSessionTurn } from './core/trigger-session.js';
 import { claimInitialUserTurn, isInitialUserTurnPending, releaseInitialUserTurn } from './core/initial-user-turn.js';
@@ -373,6 +374,8 @@ import {
 } from './vc-agent/realtime/index.js';
 import { createGroupWithBots } from './services/group-creator.js';
 import { addBotToChat, isInChat } from './services/groups-store.js';
+import { initSessionGroups, isSessionGroup, getSessionGroup, touchSessionGroup } from './services/session-groups-store.js';
+import { maybeBirthSessionGroup } from './core/session-group-birth.js';
 import { setChatReplyMode } from './services/chat-reply-mode-store.js';
 import {
   hasVcMeetingEndedTombstone,
@@ -15035,6 +15038,44 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
   // routing into thread-scope so the bot's first reply seeds a Lark thread.
   let scope = ctx.scope;
   let anchor = ctx.anchor;
+
+  // ─── p2pMode='group'：会话群出生 ────────────────────────────────────────
+  // group 模式下，顶层 DM 消息在任何会话机制启动前先改道：建一个专属会话群
+  //（bot 保留群主），把本轮 context 重写到新群（chat-scope）后递归。返回 null
+  // 表示跳过/失败（斜杠命令、建群失败已私聊提示），落回旧的 DM 话题行为。
+  // sessionGroupBirth 防递归；scope/anchor 形状约束保证只有全新顶层种子会出生
+  //（回复旧 DM 话题的消息仍归原会话）。
+  if (
+    chatType === 'p2p'
+    && getBot(larkAppId).config.p2pMode === 'group'
+    && !ctx.sessionGroupBirth
+    && !substituteTrigger
+    && scope === 'thread'
+    && anchor === messageId
+  ) {
+    const reborn = await maybeBirthSessionGroup(data, ctx);
+    if (reborn) return handleNewTopic(data, reborn);
+  }
+
+  // ─── 会话群同群续聊 ─────────────────────────────────────────────────────
+  // 会话群里的新消息发现登记的会话已关闭时，自动 resume 原会话（与话题内续聊
+  // 同款体验），而不是新开 CLI。恢复失败则照常走全新会话。
+  if (chatType === 'group' && scope === 'chat' && !ctx.sessionGroupBirth) {
+    const sgEntry = getSessionGroup(chatId);
+    if (sgEntry?.lastSessionId) {
+      const prevSession = sessionStore.getSession(sgEntry.lastSessionId);
+      if (prevSession?.status === 'closed') {
+        const resumed = await resumeSession(sgEntry.lastSessionId, activeSessions);
+        if (resumed.ok) {
+          touchSessionGroup(chatId);
+          logger.info(`[session-group] resumed session=${sgEntry.lastSessionId.substring(0, 8)} in chat=${chatId.substring(0, 12)}`);
+          return handleThreadReply(data, ctx);
+        }
+        logger.warn(`[session-group] resume failed (${resumed.error}) chat=${chatId.substring(0, 12)}; spawning fresh session`);
+      }
+    }
+  }
+
   const numberer = createImgNumberer();
   let forwardSeedContent = '';
   let forwardSeedResources: MessageResource[] = [];
@@ -15399,6 +15440,11 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
   // routing keys off chatId via sessionAnchorId(), so any value works.
   const rootIdForStore = scope === 'thread' ? anchor : messageId;
   const session = sessionStore.createSession(chatId, rootIdForStore, parsed.content.substring(0, 50), chatType);
+  // Session-group registry: point the group at its (new) resident session so
+  // same-group resume and the async AI title can find it.
+  if (chatType === 'group' && isSessionGroup(chatId)) {
+    touchSessionGroup(chatId, session.sessionId);
+  }
   const now = Date.now();
   setDirectChatDisplayNameFromSender(session, chatType, newTopicSender);
   const groupChatName = await groupChatNamePromise;
@@ -17450,6 +17496,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   catch (err) { logger.warn(`[hook] startup ensureCliEnv failed for ${cfg.cliId}: ${err instanceof Error ? err.message : String(err)}`); }
   sessionStore.init(cfg.larkAppId);
   chatFirstSeenStore.init(cfg.larkAppId);
+  initSessionGroups(cfg.larkAppId);
   const ambiguousOnBoot = reconcileVcMeetingDeliveriesOnBoot(
     config.session.dataDir,
     { receiverBootId: getDaemonBootId(), agentAppId: cfg.larkAppId },
