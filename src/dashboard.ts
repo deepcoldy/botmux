@@ -2666,7 +2666,7 @@ const server = createServer(async (req, res) => {
     // Federation HUB endpoints — cross-deployment, self-authed by invite code /
     // syncToken, so mounted before the token gate (like webhook/team routes).
     // createTeamGroup injected for the delegate-group path (hub→spoke 拉群).
-    if (await handleFederationApi(req, res, url, { createTeamGroup, transferTeamGroupOwner, liveBots })) {
+    if (await handleFederationApi(req, res, url, { createTeamGroup, transferTeamGroupOwner, liveBots, proxyToDaemon })) {
       return;
     }
 

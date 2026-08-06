@@ -14,7 +14,8 @@ vi.mock('../src/config.js', () => ({ config: {
   dashboard: { externalHost: 'localhost', port: 7891 },
 } }));
 
-import { handleFederationSpokeApi, resolveOwnerCandidatesFromAllowedUsers, autoBindOwnerIfUnambiguous } from '../src/dashboard/federation-spoke-api.js';
+import { handleFederationSpokeApi, resolveOwnerCandidatesFromAllowedUsers, autoBindOwnerIfUnambiguous, submitFederatedDispatchReport } from '../src/dashboard/federation-spoke-api.js';
+import { handleFederationApi } from '../src/dashboard/federation-api.js';
 import { listMemberships, addMembership } from '../src/services/federation-membership-store.js';
 import { getDeploymentIdentity } from '../src/services/deployment-identity.js';
 import { consumeInvite } from '../src/services/invite-store.js';
@@ -22,6 +23,8 @@ import { DEFAULT_TEAM_ID } from '../src/services/team-store.js';
 import { registerDeployment, listFederatedDeployments } from '../src/services/federation-store.js';
 import { setBotOwner, getBotOwner } from '../src/services/bot-owner-store.js';
 import { claimPairing } from '../src/services/pairing-store.js';
+import { recordTeamGroup } from '../src/services/team-groups-store.js';
+import { recordDispatchRegistryEntry, recordFederationDispatchRoute } from '../src/core/dispatch-registry.js';
 
 function url(p: string) { return new URL('http://x' + p); }
 
@@ -563,5 +566,68 @@ describe('handleFederationSpokeApi', () => {
     expect(json(res).hubRevoked).toBe(true);
     expect(leaveFetcher).toHaveBeenCalled();
     expect(listMemberships(dataDir).length).toBe(0);
+  });
+
+  it('DevBox 本机缺 route 时经 hub 回注原始主编排 Session', async () => {
+    const hubDir = mkdtempSync(join(tmpdir(), 'botmux-report-hub-'));
+    const teamId = 'team-report';
+    const chatId = 'oc_cross_team';
+    const dispatchRoot = 'om_cross_team';
+    const workerDeploymentId = getDeploymentIdentity(dataDir).deploymentId;
+    const { syncToken } = registerDeployment(hubDir, teamId, {
+      deploymentId: workerDeploymentId,
+      name: 'DevBox',
+      bots: [],
+    });
+    addMembership(dataDir, {
+      hubUrl: 'http://hub:7891',
+      teamId,
+      teamName: 'report team',
+      syncToken,
+      deploymentId: workerDeploymentId,
+    });
+    recordTeamGroup(dataDir, teamId, chatId);
+
+    const hubDeploymentId = getDeploymentIdentity(hubDir).deploymentId;
+    await recordDispatchRegistryEntry(join(hubDir, 'orchestrate-dispatch.json'), dispatchRoot, {
+      orchAppId: 'cli_orchestrator',
+      orchSessionId: 'session_original',
+      title: 'original task',
+    });
+    await recordFederationDispatchRoute(
+      join(hubDir, 'orchestrate-dispatch.json'), teamId, dispatchRoot, hubDeploymentId,
+    );
+
+    const proxyToDaemon = vi.fn(async (_appId: string, _path: string, init: RequestInit) => {
+      const trigger = JSON.parse(String(init.body));
+      expect(trigger.target.sessionId).toBe('session_original');
+      return jsonResp(200, { ok: true, triggerId: 'trigger-hub' });
+    });
+    const fetcher = vi.fn(async (u: any, init: any) => {
+      expect(String(u)).toBe('http://hub:7891/api/federation/dispatch-report');
+      expect(init.headers.authorization).toBe(`Bearer ${syncToken}`);
+      const req: any = makeReq('POST', '/api/federation/dispatch-report', JSON.parse(init.body));
+      req.headers = init.headers;
+      const res = makeRes();
+      await handleFederationApi(req, res, new URL(String(u)), {
+        dataDir: hubDir,
+        proxyToDaemon: proxyToDaemon as any,
+      });
+      return jsonResp(res.statusCode, json(res));
+    });
+
+    const result = await submitFederatedDispatchReport({
+      dataDir,
+      targetChatId: chatId,
+      report: {
+        dispatchRoot,
+        report: 'done',
+        sourceSessionId: 'worker-session',
+        sourceBotAppId: 'cli_worker',
+      },
+      fetcher: fetcher as any,
+    });
+    expect(result).toMatchObject({ ok: true, body: { target: { sessionId: 'session_original' } } });
+    expect(proxyToDaemon).toHaveBeenCalledWith('cli_orchestrator', '/api/trigger', expect.any(Object));
   });
 });
