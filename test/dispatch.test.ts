@@ -20,6 +20,7 @@ import {
   appendDispatchCompletionProtocol,
   appendDispatchReportProtocol,
   appendLegacyDispatchReportProtocol,
+  buildDispatchCompletionBrief,
   parseDispatchBotSpec,
   buildDispatchMessages,
   buildRepoPrimeText,
@@ -131,27 +132,22 @@ describe('dispatch completion switch wiring', () => {
     expect(completion).toContain('不要 @ 主 bot，不要新开话题');
   });
 
-  it('always preserves report and adds same-topic send only when enabled', () => {
-    const source = readFileSync(new URL('../src/cli.ts', import.meta.url), 'utf8');
-    const start = source.indexOf('async function cmdDispatch');
-    const end = source.indexOf('async function cmdReport', start);
-    const dispatch = source.slice(start, end);
+  it.each([
+    { exact: false, send: false, exactReport: false, sameTopicSend: false },
+    { exact: false, send: true, exactReport: false, sameTopicSend: true },
+    { exact: true, send: false, exactReport: true, sameTopicSend: false },
+    { exact: true, send: true, exactReport: true, sameTopicSend: true },
+  ])('combines report and same-topic send protocols: %o', ({ exact, send, exactReport, sameTopicSend }) => {
+    const result = buildDispatchCompletionBrief({
+      brief: '完成实现并自测',
+      dispatchRootId: 'om_seed_exact',
+      exactReportRootEnabled: exact,
+      sameTopicSendEnabled: send,
+    });
 
-    const configRead = dispatch.indexOf('readRoleDispatchCompletionEnabled(appId, targetChatId)');
-    const exactDefault = dispatch.indexOf('appendDispatchReportProtocol(brief, dispatchRootId)', configRead);
-    const legacyDefault = dispatch.indexOf('appendLegacyDispatchReportProtocol(brief)', exactDefault);
-    const sendBranch = dispatch.indexOf('appendDispatchCompletionProtocol(withReport)', legacyDefault);
-    const intoBrief = dispatch.indexOf('brief: intoRoot ? briefWithCompletionProtocol(intoRoot) : brief', sendBranch);
-    const standbyGuard = dispatch.indexOf('if (!standby) {', intoBrief);
-    const seededKickoff = dispatch.indexOf('brief: briefWithCompletionProtocol(seedId)', standbyGuard);
-
-    expect(configRead).toBeGreaterThanOrEqual(0);
-    expect(exactDefault).toBeGreaterThan(configRead);
-    expect(legacyDefault).toBeGreaterThan(exactDefault);
-    expect(sendBranch).toBeGreaterThan(legacyDefault);
-    expect(intoBrief).toBeGreaterThan(sendBranch);
-    expect(standbyGuard).toBeGreaterThan(intoBrief);
-    expect(seededKickoff).toBeGreaterThan(standbyGuard);
+    expect(result.includes('botmux report --dispatch-root om_seed_exact')).toBe(exactReport);
+    expect(result.includes('botmux report "子项目完成 + 产出位置/摘要"')).toBe(!exactReport);
+    expect(result.includes('botmux send --no-mention')).toBe(sameTopicSend);
   });
 
   it('authenticates the exact report callback through daemon IPC', () => {

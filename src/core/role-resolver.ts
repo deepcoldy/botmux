@@ -347,14 +347,6 @@ export function writeRoleDispatchCompletionEnabled(
   logger.info(`[role] dispatch completion chat=${chatId} app=${larkAppId} => ${enabled}`);
 }
 
-/** Remove the injection-mode sidecar (used when a chat role is deleted). */
-export function deleteRoleInjectMode(larkAppId: string, chatId: string): void {
-  if (!isValidRoleChatId(chatId)) return;
-  const meta = readRoleMeta(larkAppId, chatId);
-  delete meta.inject;
-  writeRoleMeta(larkAppId, chatId, meta);
-}
-
 /** Remove all per-chat role metadata when the chat role is deleted. */
 export function deleteRoleMeta(larkAppId: string, chatId: string): void {
   if (!isValidRoleChatId(chatId)) return;

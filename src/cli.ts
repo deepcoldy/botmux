@@ -34,7 +34,7 @@ import { validateWorkingDir } from './core/working-dir.js';
 import { resolveSessionContext } from './core/session-marker.js';
 import { resolveBotmuxDataDir } from './core/data-dir.js';
 import { dashboardSecretPath } from './core/dashboard-secret.js';
-import { acceptedDispatchBotAppIds, activeConversationBotOpenIds, appendDispatchCompletionProtocol, appendDispatchReportProtocol, appendLegacyDispatchReportProtocol, parseDispatchBotSpec, buildDispatchMessages, buildRepoPrimeText, buildReportContent, eligibleAutoMentionAliases, findDispatchRegistryEntry, foldableChatSessionAppIds, offTopicSubBotTopic, resolveReportTarget, resolveSendTarget, threadRootForReachability } from './core/dispatch.js';
+import { acceptedDispatchBotAppIds, activeConversationBotOpenIds, buildDispatchCompletionBrief, parseDispatchBotSpec, buildDispatchMessages, buildRepoPrimeText, buildReportContent, eligibleAutoMentionAliases, findDispatchRegistryEntry, foldableChatSessionAppIds, offTopicSubBotTopic, resolveReportTarget, resolveSendTarget, threadRootForReachability } from './core/dispatch.js';
 import { pickTurnReplyTarget } from './core/reply-target.js';
 import { recordDispatchRegistryEntry } from './core/dispatch-registry.js';
 import { enableAutostart, disableAutostart, autostartStatus, refreshAutostart } from './autostart.js';
@@ -8391,14 +8391,12 @@ async function cmdDispatch(rest: string[]): Promise<void> {
   const { readRoleDispatchCompletionEnabled } = await import('./core/role-resolver.js');
   const sameTopicSendEnabled = readRoleDispatchCompletionEnabled(appId, targetChatId);
   const exactReportRootEnabled = parsedBotApps.length > 0 && legacyBots.length === 0;
-  const briefWithCompletionProtocol = (dispatchRootId: string): string => {
-    const withReport = exactReportRootEnabled
-      ? appendDispatchReportProtocol(brief, dispatchRootId)
-      : appendLegacyDispatchReportProtocol(brief);
-    return sameTopicSendEnabled
-      ? appendDispatchCompletionProtocol(withReport)
-      : withReport;
-  };
+  const briefWithCompletionProtocol = (dispatchRootId: string): string => buildDispatchCompletionBrief({
+    brief,
+    dispatchRootId,
+    exactReportRootEnabled,
+    sameTopicSendEnabled,
+  });
   let built;
   try {
     built = buildDispatchMessages({

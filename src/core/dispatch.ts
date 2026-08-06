@@ -67,6 +67,20 @@ export function appendDispatchCompletionProtocol(brief: string): string {
     + '额外留一份人可见的最终交付；不要 @ 主 bot，不要新开话题。';
 }
 
+export function buildDispatchCompletionBrief(input: {
+  brief: string;
+  dispatchRootId: string;
+  exactReportRootEnabled: boolean;
+  sameTopicSendEnabled: boolean;
+}): string {
+  const withReport = input.exactReportRootEnabled
+    ? appendDispatchReportProtocol(input.brief, input.dispatchRootId)
+    : appendLegacyDispatchReportProtocol(input.brief);
+  return input.sameTopicSendEnabled
+    ? appendDispatchCompletionProtocol(withReport)
+    : withReport;
+}
+
 /**
  * Parse a `--bot` spec `openId[:name[:role]]` into a {@link DispatchBot}.
  * Mirrors the `--mention "open_id:Display Name"` convention, with an optional
