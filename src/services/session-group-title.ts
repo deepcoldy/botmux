@@ -88,7 +88,7 @@ export function scheduleSessionGroupTitle(opts: {
       if (cfg.cliPathOverride?.trim()) argv[0] = cfg.cliPathOverride.trim();
       const prompt = buildTitlePrompt(userText, maxLen, localeForBot(larkAppId));
 
-      const stdout = await new Promise<string>((resolve, reject) => {
+      const runOnce = () => new Promise<string>((resolve, reject) => {
         const env = { ...process.env };
         delete env.BOTMUX_SESSION_ID; // never let the one-shot inherit a session identity
         execFile(argv[0], [...argv.slice(1), prompt], {
@@ -96,11 +96,26 @@ export function scheduleSessionGroupTitle(opts: {
           maxBuffer: 1024 * 1024,
           cwd: tmpdir(),
           env,
-        }, (err, out) => {
-          if (err && !out) return reject(err);
+        }, (err, out, errOut) => {
+          if (err && !out) {
+            // Surface stderr — execFile's bare "Command failed: …" hides the
+            // actual CLI error (API failures, auth, rate limits).
+            const detail = String(errOut ?? '').trim().split('\n').slice(-2).join(' ').slice(0, 200);
+            return reject(new Error(`${err.message.split('\n')[0]}${detail ? ` | stderr: ${detail}` : ''}`));
+          }
           resolve(String(out ?? ''));
         });
       });
+      // One-shot CLI calls fail transiently (API hiccups, cold start races) —
+      // a single spaced retry recovers most of them without delaying much.
+      let stdout: string;
+      try {
+        stdout = await runOnce();
+      } catch (firstErr) {
+        logger.info(`[session-group] AI title attempt 1 failed for chat=${chatId.substring(0, 12)} (retrying): ${firstErr}`);
+        await new Promise(r => setTimeout(r, 3000));
+        stdout = await runOnce();
+      }
 
       const title = sanitizeTitleOutput(stdout, maxLen);
       if (!title) {
