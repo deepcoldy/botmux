@@ -38,6 +38,26 @@ export interface DispatchMessages {
   mentionedOpenIds: string[];
 }
 
+const DISPATCH_ROOT_ID_RE = /^om_[A-Za-z0-9_-]{1,128}$/;
+
+/** Compatibility protocol for legacy/cross-machine `--bot` dispatches. */
+export function appendLegacyDispatchReportProtocol(brief: string): string {
+  return brief.trimEnd()
+    + '\n\n— 完成回报 —\n'
+    + '干完后在本话题运行 `botmux report "子项目完成 + 产出位置/摘要"` '
+    + '把结果回报给主编排会话；不要在本话题 @ 主bot（那会另起一个没有上下文的新会话）。';
+}
+
+/** Bind a stable local dispatch to its exact report destination. */
+export function appendDispatchReportProtocol(brief: string, dispatchRootId: string): string {
+  const root = dispatchRootId.trim();
+  if (!DISPATCH_ROOT_ID_RE.test(root)) throw new Error('dispatch report protocol requires a valid om_ root id');
+  return brief.trimEnd()
+    + '\n\n— 完成回报 —\n'
+    + `干完后在本话题运行 \`botmux report --dispatch-root ${root} "子项目完成 + 产出位置/摘要"\` `
+    + '把结果回报给原始主编排会话；不要在本话题 @ 主bot（那会另起一个没有上下文的新会话）。';
+}
+
 /** Ask the assignee to publish completion in the topic where it received the task. */
 export function appendDispatchCompletionProtocol(brief: string): string {
   return brief.trimEnd()

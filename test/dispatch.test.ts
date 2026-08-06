@@ -18,6 +18,8 @@ import {
   acceptedDispatchBotAppIds,
   activeConversationBotOpenIds,
   appendDispatchCompletionProtocol,
+  appendDispatchReportProtocol,
+  appendLegacyDispatchReportProtocol,
   parseDispatchBotSpec,
   buildDispatchMessages,
   buildRepoPrimeText,
@@ -102,6 +104,15 @@ describe('buildDispatchMessages', () => {
 });
 
 describe('dispatch completion switch wiring', () => {
+  it('keeps both existing report protocols available for the default path', () => {
+    expect(appendDispatchReportProtocol('本机任务', 'om_seed_exact'))
+      .toContain('botmux report --dispatch-root om_seed_exact');
+    expect(appendLegacyDispatchReportProtocol('兼容任务'))
+      .toContain('botmux report "子项目完成 + 产出位置/摘要"');
+    expect(() => appendDispatchReportProtocol('错误目标', 'oc_chat'))
+      .toThrow('valid om_ root id');
+  });
+
   it('adds only a same-topic botmux send completion command', () => {
     const plain = buildDispatchMessages({
       title: '任务',
@@ -116,23 +127,29 @@ describe('dispatch completion switch wiring', () => {
     expect(completion).toContain('不要 @ 主 bot，不要新开话题');
   });
 
-  it('gates CLI injection only on the saved per-bot, per-chat switch', () => {
+  it('preserves the default report path and switches to same-topic send only when enabled', () => {
     const source = readFileSync(new URL('../src/cli.ts', import.meta.url), 'utf8');
     const start = source.indexOf('async function cmdDispatch');
     const end = source.indexOf('async function cmdReport', start);
     const dispatch = source.slice(start, end);
 
     const configRead = dispatch.indexOf('readRoleDispatchCompletionEnabled(appId, targetChatId)');
-    const safeBranch = dispatch.indexOf(
-      'completionEnabled\n    ? appendDispatchCompletionProtocol(brief)\n    : brief',
+    const sendBranch = dispatch.indexOf(
+      'if (sameTopicSendEnabled) return appendDispatchCompletionProtocol(brief);',
       configRead,
     );
-    const standbyGuard = dispatch.indexOf('if (!standby) {', safeBranch);
-    const seededKickoff = dispatch.indexOf('brief: briefWithCompletionProtocol()', standbyGuard);
+    const exactDefault = dispatch.indexOf('appendDispatchReportProtocol(brief, dispatchRootId)', sendBranch);
+    const legacyDefault = dispatch.indexOf('appendLegacyDispatchReportProtocol(brief)', exactDefault);
+    const intoBrief = dispatch.indexOf('brief: intoRoot ? briefWithCompletionProtocol(intoRoot) : brief', legacyDefault);
+    const standbyGuard = dispatch.indexOf('if (!standby) {', intoBrief);
+    const seededKickoff = dispatch.indexOf('brief: briefWithCompletionProtocol(seedId)', standbyGuard);
 
     expect(configRead).toBeGreaterThanOrEqual(0);
-    expect(safeBranch).toBeGreaterThan(configRead);
-    expect(standbyGuard).toBeGreaterThan(safeBranch);
+    expect(sendBranch).toBeGreaterThan(configRead);
+    expect(exactDefault).toBeGreaterThan(sendBranch);
+    expect(legacyDefault).toBeGreaterThan(exactDefault);
+    expect(intoBrief).toBeGreaterThan(legacyDefault);
+    expect(standbyGuard).toBeGreaterThan(intoBrief);
     expect(seededKickoff).toBeGreaterThan(standbyGuard);
   });
 

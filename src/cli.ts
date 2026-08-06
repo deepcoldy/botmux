@@ -34,7 +34,7 @@ import { validateWorkingDir } from './core/working-dir.js';
 import { resolveSessionContext } from './core/session-marker.js';
 import { resolveBotmuxDataDir } from './core/data-dir.js';
 import { dashboardSecretPath } from './core/dashboard-secret.js';
-import { acceptedDispatchBotAppIds, activeConversationBotOpenIds, appendDispatchCompletionProtocol, parseDispatchBotSpec, buildDispatchMessages, buildRepoPrimeText, buildReportContent, eligibleAutoMentionAliases, findDispatchRegistryEntry, foldableChatSessionAppIds, offTopicSubBotTopic, resolveReportTarget, resolveSendTarget, threadRootForReachability } from './core/dispatch.js';
+import { acceptedDispatchBotAppIds, activeConversationBotOpenIds, appendDispatchCompletionProtocol, appendDispatchReportProtocol, appendLegacyDispatchReportProtocol, parseDispatchBotSpec, buildDispatchMessages, buildRepoPrimeText, buildReportContent, eligibleAutoMentionAliases, findDispatchRegistryEntry, foldableChatSessionAppIds, offTopicSubBotTopic, resolveReportTarget, resolveSendTarget, threadRootForReachability } from './core/dispatch.js';
 import { pickTurnReplyTarget } from './core/reply-target.js';
 import { recordDispatchRegistryEntry } from './core/dispatch-registry.js';
 import { enableAutostart, disableAutostart, autostartStatus, refreshAutostart } from './autostart.js';
@@ -8389,15 +8389,19 @@ async function cmdDispatch(rest: string[]): Promise<void> {
   const bots = [...legacyBots, ...appBots]
     .filter((bot, index, all) => all.findIndex(candidate => candidate.openId === bot.openId) === index);
   const { readRoleDispatchCompletionEnabled } = await import('./core/role-resolver.js');
-  const completionEnabled = readRoleDispatchCompletionEnabled(appId, targetChatId);
-  const briefWithCompletionProtocol = (): string => completionEnabled
-    ? appendDispatchCompletionProtocol(brief)
-    : brief;
+  const sameTopicSendEnabled = readRoleDispatchCompletionEnabled(appId, targetChatId);
+  const exactReportRootEnabled = parsedBotApps.length > 0 && legacyBots.length === 0;
+  const briefWithCompletionProtocol = (dispatchRootId: string): string => {
+    if (sameTopicSendEnabled) return appendDispatchCompletionProtocol(brief);
+    return exactReportRootEnabled
+      ? appendDispatchReportProtocol(brief, dispatchRootId)
+      : appendLegacyDispatchReportProtocol(brief);
+  };
   let built;
   try {
     built = buildDispatchMessages({
       title: title.trim() || '子项目',
-      brief: intoRoot ? briefWithCompletionProtocol() : brief,
+      brief: intoRoot ? briefWithCompletionProtocol(intoRoot) : brief,
       bots,
     });
   } catch (err: any) {
@@ -8480,7 +8484,7 @@ async function cmdDispatch(rest: string[]): Promise<void> {
       // resident chat-scope session's mutable latest reply alias.
       const kickoffBuilt = buildDispatchMessages({
         title: title.trim() || '子项目',
-        brief: briefWithCompletionProtocol(),
+        brief: briefWithCompletionProtocol(seedId),
         bots,
       });
       const kickoffBriefJson = JSON.stringify({ zh_cn: { title: '', content: kickoffBuilt.threadContent } });

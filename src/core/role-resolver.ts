@@ -329,7 +329,7 @@ export function writeRoleInjectMode(larkAppId: string, chatId: string, mode: Rol
   logger.info(`[role] inject mode chat=${chatId} app=${larkAppId} => ${mode}`);
 }
 
-/** Whether this bot asks dispatched tasks in this chat to reply with completion. */
+/** Whether dispatch completion switches from the default report protocol to same-topic send. */
 export function readRoleDispatchCompletionEnabled(larkAppId: string, chatId: string): boolean {
   if (!larkAppId || !chatId || !isValidRoleChatId(chatId)) return false;
   return readRoleMeta(larkAppId, chatId).dispatchCompletionEnabled === true;
