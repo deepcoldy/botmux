@@ -1223,6 +1223,49 @@ describe('buildRepoSelectCard', () => {
       expect(selectStatic.options[1].text.content).not.toContain('当前');
       expect(selectStatic.options[2].text.content).not.toContain('当前');
     });
+
+    it.each([false, true])('keeps a large repo card within transport headroom and preserves recovery actions (multi=%s)', (multiPicker) => {
+      const manyProjects: ProjectInfo[] = Array.from({ length: 500 }, (_, i) => ({
+        name: `project-${i}-${'x'.repeat(48)}`,
+        path: `/workspace/${i}/${'nested/'.repeat(8)}project-${i}`,
+        type: i % 2 === 0 ? 'repo' : 'worktree',
+        branch: `feature/${i}-${'b'.repeat(36)}`,
+      }));
+
+      const json = buildRepoSelectCard(manyProjects, '/workspace/current', 'om_root', 'zh', multiPicker);
+      const card = parse(json);
+      const switchSelect = deepFind(card, 'select_static').find((sel: any) => sel.value?.key === 'repo_switch');
+      const noteContent = deepFind(card, 'note')[0]?.elements?.[0]?.content ?? '';
+
+      // 30 KB is the complete-message limit; keep several KB available for
+      // the Lark reply envelope rather than merely squeezing under the limit.
+      expect(Buffer.byteLength(json, 'utf-8')).toBeLessThanOrEqual(24_000);
+      expect(switchSelect.options.length).toBeGreaterThan(0);
+      expect(switchSelect.options.length).toBeLessThan(manyProjects.length);
+      expect(deepFind(card, 'button').some((b: any) => b.value?.action === 'skip_repo')).toBe(true);
+      expect(deepFind(card, 'input').some((input: any) => input.name === 'repo_manual_path')).toBe(true);
+      expect(noteContent).toContain('仅显示部分');
+      expect(noteContent).toContain('/repo');
+    });
+
+    it('shrinks UTF-8-heavy options by serialized bytes, not only by the option-count cap', () => {
+      const longProjects: ProjectInfo[] = Array.from({ length: 40 }, (_, i) => ({
+        name: `项目-${i}-${'超长名称'.repeat(80)}`,
+        path: `/workspace/${i}/${'嵌套路径/'.repeat(80)}project`,
+        type: 'worktree',
+        branch: `feature/${'分支'.repeat(80)}-${i}`,
+      }));
+
+      const json = buildRepoSelectCard(longProjects, '/workspace/current', 'om_root', 'zh');
+      const card = parse(json);
+      const switchSelect = deepFind(card, 'select_static').find((sel: any) => sel.value?.key === 'repo_switch');
+
+      expect(Buffer.byteLength(json, 'utf-8')).toBeLessThanOrEqual(24_000);
+      expect(switchSelect.options.length).toBeGreaterThan(0);
+      expect(switchSelect.options.length).toBeLessThan(longProjects.length);
+      expect(deepFind(card, 'button').some((b: any) => b.value?.action === 'skip_repo')).toBe(true);
+      expect(deepFind(card, 'input').some((input: any) => input.name === 'repo_manual_path')).toBe(true);
+    });
   });
 
   // ── rootMessageId ──────────────────────────────────────────────────────

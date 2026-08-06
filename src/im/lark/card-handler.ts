@@ -3004,7 +3004,17 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       // a missing/already-gone card is fine — we post the fresh one regardless.
       if (ds.repoCardMessageId && ds.larkAppId) { try { await deleteMessage(ds.larkAppId, ds.repoCardMessageId); } catch { /* card already gone */ } }
       const newCard = buildRepoSelectCard(projects, getSessionWorkingDir(ds), rootId, locDs, next);
-      ds.repoCardMessageId = await sessionReply(rootId, newCard, 'interactive');
+      // The old card has been withdrawn. Clear its id before the network await
+      // so a failed refresh cannot leave pending state pointing at a card that
+      // no longer exists; daemon's next pending reply will offer `/repo` text
+      // recovery when this id is absent.
+      ds.repoCardMessageId = undefined;
+      try {
+        ds.repoCardMessageId = await sessionReply(rootId, newCard, 'interactive');
+      } catch (err) {
+        logger.warn(`[${tag(ds)}] Repo picker mode changed but replacement card failed: ${err instanceof Error ? err.message : err}`);
+        return { toast: { type: 'error', content: t('card.repo.refresh_failed', undefined, locDs) } };
+      }
       return { toast: { type: 'info', content: t(next ? 'card.repo.toast_worktree_mode_switched' : 'card.repo.toast_worktree_mode_switched_back', undefined, locDs) } };
     }
 

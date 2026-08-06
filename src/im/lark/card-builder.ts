@@ -1000,6 +1000,13 @@ export function buildPrivateSnapshotCard(
  * Build a Feishu interactive card with a dropdown selector for projects.
  * Returns a JSON string suitable for msg_type: 'interactive'.
  */
+// Feishu caps the complete message payload at 30 KB. Keep the card body well
+// below that so the reply envelope (root id, msg_type, etc.) still has room.
+// The option-count cap prevents an unbounded first serialization; the byte
+// check below is authoritative for long project names and paths.
+const REPO_SELECT_CARD_MAX_BYTES = 22_000;
+const REPO_SELECT_CARD_MAX_OPTIONS = 40;
+
 /** The worktree multi-select form element (multi_select + branch input + submit),
  *  inlined into the repo card when the bot is in multi-repo-picker mode. */
 function worktreeMultiForm(worktreeOptions: Array<{ text: { tag: 'plain_text'; content: string }; value: string }>, rootMessageId?: string, locale?: Locale): any {
@@ -1053,7 +1060,7 @@ function worktreeMultiForm(worktreeOptions: Array<{ text: { tag: 'plain_text'; c
  *  and the inline multi-select form (true). */
 export function buildRepoSelectCard(projects: ProjectInfo[], currentPath?: string, rootMessageId?: string, locale?: Locale, multiPicker?: boolean): string {
   const currentMarker = t('card.repo.current_marker', undefined, locale);
-  const options = projects.map((p, i) => {
+  const options = projects.slice(0, REPO_SELECT_CARD_MAX_OPTIONS).map((p, i) => {
     const currentTag = p.path === currentPath ? currentMarker : '';
     const typeTag = p.type === 'worktree' ? ' [worktree]' : '';
     return {
@@ -1067,10 +1074,17 @@ export function buildRepoSelectCard(projects: ProjectInfo[], currentPath?: strin
   // worktrees of the same repo would just duplicate the list.
   const worktreeOptions = projects
     .filter(p => p.type === 'repo')
+    .slice(0, REPO_SELECT_CARD_MAX_OPTIONS)
     .map(p => ({
       text: { tag: 'plain_text' as const, content: `${p.name} (${p.branch})` },
       value: p.path,
     }));
+  const totalWorktreeOptions = projects.filter(p => p.type === 'repo').length;
+
+  const note = {
+    tag: 'note',
+    elements: [{ tag: 'lark_md', content: '' }],
+  };
 
   const card = {
     config: { wide_screen_mode: true },
@@ -1246,19 +1260,41 @@ export function buildRepoSelectCard(projects: ProjectInfo[], currentPath?: strin
           },
         ],
       },
-      {
-        tag: 'note',
-        elements: [
-          {
-            tag: 'lark_md',
-            content: t('card.repo.note', undefined, locale),
-          },
-        ],
-      },
+      note,
     ],
   };
 
-  return JSON.stringify(card);
+  const serialize = (): string => {
+    const limited = options.length < projects.length || worktreeOptions.length < totalWorktreeOptions;
+    const limitNote = limited
+      ? `${t('card.repo.list_limited', {
+        shown: options.length,
+        total: projects.length,
+        worktreeShown: worktreeOptions.length,
+        worktreeTotal: totalWorktreeOptions,
+      }, locale)}\n`
+      : '';
+    note.elements[0].content = `${limitNote}${t('card.repo.note', undefined, locale)}`;
+    return JSON.stringify(card);
+  };
+
+  let json = serialize();
+  while (Buffer.byteLength(json, 'utf-8') > REPO_SELECT_CARD_MAX_BYTES
+    && (options.length > 0 || worktreeOptions.length > 0)) {
+    // Remove the larger trailing option first. Both dropdowns remain useful for
+    // ordinary scans, while unusually long values converge on the manual path.
+    const switchBytes = options.length > 0
+      ? Buffer.byteLength(JSON.stringify(options[options.length - 1]), 'utf-8')
+      : -1;
+    const worktreeBytes = worktreeOptions.length > 0
+      ? Buffer.byteLength(JSON.stringify(worktreeOptions[worktreeOptions.length - 1]), 'utf-8')
+      : -1;
+    if (worktreeBytes >= switchBytes) worktreeOptions.pop();
+    else options.pop();
+    json = serialize();
+  }
+
+  return json;
 }
 
 // ─── 群内授权卡片 ─────────────────────────────────────────────────────────────

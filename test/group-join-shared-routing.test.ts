@@ -334,6 +334,70 @@ describe('handleBotAdded — 普通群 shared 路由', () => {
     );
   });
 
+  it('首次仓库卡发送失败后保留待选输入，并在后续消息中给出文本恢复路径', async () => {
+    const { daemon, registry, types } = modules;
+    const appId = 'app_join_repo_card_failure';
+    const chatId = 'oc_join_repo_card_failure';
+    const scanDir = tempDir('scan-repo-card-failure');
+    mocks.getProjectScanDirs.mockReturnValue([scanDir]);
+    mocks.scanMultipleProjects.mockReturnValue([{
+      name: 'botmux',
+      path: scanDir,
+      type: 'repo',
+      branch: 'master',
+    }]);
+    mocks.replyMessage
+      .mockRejectedValueOnce(new Error('socket hang up'))
+      .mockResolvedValue('om_recovery_text');
+    registry.registerBot({
+      larkAppId: appId,
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      allowedUsers: ['ou_owner'],
+      autoStartOnGroupJoin: true,
+      autoStartOnGroupJoinPrompt: '开始排查',
+      regularGroupReplyMode: 'shared',
+    });
+
+    await daemon.__testOnly_handleBotAdded(chatId, 'ou_owner', appId);
+
+    const ds = daemon.__testOnly_activeSessions.get(types.sessionKey(chatId, appId));
+    expect(ds?.pendingRepo).toBe(true);
+    expect(ds?.pendingPrompt).toContain('开始排查');
+    expect(ds?.repoCardMessageId).toBeUndefined();
+    expect(mocks.forkWorker).not.toHaveBeenCalled();
+    expect(String(mocks.replyMessage.mock.calls[1]?.[2])).toContain('/repo <项目名|路径>');
+
+    const followUpMessageId = 'om_after_repo_card_failure';
+    await daemon.__testOnly_handleThreadReply(
+      {
+        sender: { sender_id: { open_id: 'ou_owner' }, sender_type: 'user' },
+        message: {
+          message_id: followUpMessageId,
+          chat_id: chatId,
+          chat_type: 'group',
+          message_type: 'text',
+          content: JSON.stringify({ text: '继续补充约束' }),
+          create_time: String(Date.now()),
+        },
+      },
+      {
+        chatId,
+        messageId: followUpMessageId,
+        chatType: 'group',
+        scope: 'chat',
+        anchor: chatId,
+        replyRootId: followUpMessageId,
+        larkAppId: appId,
+      },
+    );
+
+    expect(ds?.pendingFollowUps?.some(item => item.includes('继续补充约束'))).toBe(true);
+    const followUpRecovery = String(mocks.replyMessage.mock.calls.at(-1)?.[2]);
+    expect(followUpRecovery).toContain('/repo <项目名|路径>');
+    expect(followUpRecovery).not.toContain('上方卡片');
+  });
+
   it('losing registration leaves no shared seed message or orphaned first turn', async () => {
     const { daemon, registry, types } = modules;
     const appId = 'app_join_shared_race';

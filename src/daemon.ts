@@ -15445,6 +15445,40 @@ function deliverPassthroughToExistingSession(
 export const __testOnly_deliverPassthroughToExistingSession =
   deliverPassthroughToExistingSession;
 
+/** Post the first-spawn repo picker without blindly retrying an interactive
+ * card after an uncertain transport failure. The pending input stays buffered;
+ * a small text reply gives the user deterministic `/repo` recovery instead. */
+async function postPendingRepoSelectCard(
+  ds: DaemonSession,
+  anchor: string,
+  projects: import('./services/project-scanner.js').ProjectInfo[],
+): Promise<string | undefined> {
+  try {
+    const cardJson = buildRepoSelectCard(
+      projects,
+      getSessionWorkingDir(ds),
+      anchor,
+      localeForBot(ds.larkAppId),
+      getBot(ds.larkAppId).config.worktreeMultiPicker,
+    );
+    return await sessionReply(anchor, cardJson, 'interactive', ds.larkAppId);
+  } catch (err) {
+    ds.repoCardMessageId = undefined;
+    logger.warn(`[${tag(ds)}] Repo selection card delivery failed: ${err instanceof Error ? err.message : err}`);
+    try {
+      await sessionReply(
+        anchor,
+        tr('daemon.repo_card_unavailable', undefined, localeForBot(ds.larkAppId)),
+        'text',
+        ds.larkAppId,
+      );
+    } catch (fallbackErr) {
+      logger.warn(`[${tag(ds)}] Repo selection text fallback failed: ${fallbackErr instanceof Error ? fallbackErr.message : fallbackErr}`);
+    }
+    return undefined;
+  }
+}
+
 async function startInitialPassthroughSession(args: {
   larkAppId: string;
   chatId: string;
@@ -15598,8 +15632,7 @@ async function startInitialPassthroughSession(args: {
   const projects = scanDirs.length > 0 ? scanMultipleProjects(scanDirs, 3, repoPickerScanOptions()) : [];
   if (projects.length > 0) {
     lastRepoScan.set(chatId, projects);
-    const cardJson = buildRepoSelectCard(projects, getSessionWorkingDir(ds), anchor, localeForBot(larkAppId), getBot(larkAppId).config.worktreeMultiPicker);
-    ds.repoCardMessageId = await sessionReply(anchor, cardJson, 'interactive', larkAppId);
+    ds.repoCardMessageId = await postPendingRepoSelectCard(ds, anchor, projects);
     announcePendingRepoSession(ds);
     logger.info(`[${tag(ds)}] Waiting for repo selection before initial raw passthrough (${projects.length} projects)`);
     return;
@@ -16198,9 +16231,7 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
   }
   if (projects.length > 0) {
     lastRepoScan.set(chatId, projects);
-    const currentCwd = getSessionWorkingDir(ds);
-    const cardJson = buildRepoSelectCard(projects, currentCwd, anchor, localeForBot(larkAppId), getBot(larkAppId).config.worktreeMultiPicker);
-    ds.repoCardMessageId = await sessionReply(anchor, cardJson, 'interactive', larkAppId);
+    ds.repoCardMessageId = await postPendingRepoSelectCard(ds, anchor, projects);
     announcePendingRepoSession(ds);
     logger.info(`[${tag(ds)}] Waiting for repo selection (${projects.length} projects)`);
   } else {
@@ -16648,14 +16679,13 @@ async function handleBotAdded(
     const projects = scanDirs.length > 0 ? scanMultipleProjects(scanDirs, 3, repoPickerScanOptions()) : [];
     if (projects.length > 0) {
       lastRepoScan.set(chatId, projects);
-      const cardJson = buildRepoSelectCard(projects, getSessionWorkingDir(ds), anchor, localeForBot(larkAppId), getBot(larkAppId).config.worktreeMultiPicker);
       // The repo card itself belongs under the shared join seed. Arm the target
       // immediately before its single network await; pendingRepo already makes
       // this a stable buffered state for normal inbound/scheduler paths.
       armSharedReplyTarget();
-      const repoCardMessageId = await sessionReply(anchor, cardJson, 'interactive', larkAppId);
+      const repoCardMessageId = await postPendingRepoSelectCard(ds, anchor, projects);
       if (joinBootstrapWasTakenOver()) {
-        void deleteMessage(larkAppId, repoCardMessageId);
+        if (repoCardMessageId) void deleteMessage(larkAppId, repoCardMessageId);
         // If another entry actually started this same ds, its output still owns
         // the shared seed we just armed. Preserve that root; closed/replaced
         // candidates may withdraw it.
@@ -17337,7 +17367,9 @@ async function handleThreadReply(
     // instead of the misleading "pick a repo from the card above".
     const pendingReplyKey = (ds.worktreeCreating || ds.pendingRepoCommitInFlight)
       ? 'daemon.worktree_building_wait'
-      : 'daemon.choose_repo_first';
+      : ds.repoCardMessageId
+        ? 'daemon.choose_repo_first'
+        : 'daemon.repo_card_unavailable';
     await sessionReply(anchor, tr(pendingReplyKey, undefined, localeForBot(larkAppId)), 'text', larkAppId);
     return;
   }
@@ -17521,9 +17553,7 @@ async function handleThreadReply(
     }
     if (projects.length > 0) {
       lastRepoScan.set(autoCreateChatId, projects);
-      const currentCwd = getSessionWorkingDir(newDs);
-      const cardJson = buildRepoSelectCard(projects, currentCwd, anchor, localeForBot(larkAppId), getBot(larkAppId).config.worktreeMultiPicker);
-      newDs.repoCardMessageId = await sessionReply(anchor, cardJson, 'interactive', larkAppId);
+      newDs.repoCardMessageId = await postPendingRepoSelectCard(newDs, anchor, projects);
       announcePendingRepoSession(newDs);
       logger.info(`[${tag(newDs)}] Waiting for repo selection (${projects.length} projects)`);
     } else {

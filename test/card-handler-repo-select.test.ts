@@ -1477,6 +1477,25 @@ describe('repo select card — worktree open', () => {
     expect(ds.worktreeCreating).not.toBe(true);
   });
 
+  it('worktree_toggle_mode clears the withdrawn card id and returns recovery guidance when replacement delivery fails', async () => {
+    const ds = makeDs({ pendingRepo: true, pendingPrompt: 'hi', worker: null, repoCardMessageId: 'om_card' });
+    const { deps, sessionReply } = makeDeps(ds);
+    sessionReply.mockRejectedValueOnce(new Error('socket hang up'));
+    const event = {
+      operator: { open_id: OWNER },
+      action: { value: { action: 'worktree_toggle_mode', root_id: ROOT_ID } },
+      context: { open_message_id: 'om_card' },
+    };
+
+    const res = await handleCardAction(event, deps, APP_ID);
+
+    expect(deleteMessage).toHaveBeenCalledWith(APP_ID, 'om_card');
+    expect(ds.repoCardMessageId).toBeUndefined();
+    expect(res?.toast?.type).toBe('error');
+    expect(res?.toast?.content).toContain('/repo');
+    expect(ds.pendingRepo).toBe(true);
+  });
+
   it('worktree_toggle_mode rejects a stale/wrong card id before flipping config', async () => {
     const ds = makeDs({ pendingRepo: true, pendingPrompt: 'hi', worker: null, repoCardMessageId: 'om_live_card' });
     const { deps } = makeDeps(ds);
