@@ -38,33 +38,13 @@ export interface DispatchMessages {
   mentionedOpenIds: string[];
 }
 
-const DISPATCH_ROOT_ID_RE = /^om_[A-Za-z0-9_-]{1,128}$/;
-
-/** Compatibility protocol for legacy/cross-machine `--bot` dispatches. */
-export function appendLegacyDispatchReportProtocol(brief: string): string {
+/** Ask the assignee to publish completion in the topic where it received the task. */
+export function appendDispatchCompletionProtocol(brief: string): string {
   return brief.trimEnd()
     + '\n\n— 完成回报 —\n'
-    + '干完后在本话题运行 `botmux report "子项目完成 + 产出位置/摘要"` '
-    + '把结果回报给主编排会话；不要在本话题 @ 主bot（那会另起一个没有上下文的新会话）。';
-}
-
-/**
- * Freeze the report destination into the exact dispatched turn.
- *
- * A regular-group resident can reuse one chat-scoped CLI session for several
- * dispatch topics. Session-level `currentReplyTarget` is therefore mutable and
- * cannot identify an older in-flight turn once a newer assignment arrives. The
- * kickoff itself is immutable, so embed the seed in the command the resident is
- * instructed to run; `botmux report` can then select the matching registry row
- * without guessing from the session's latest alias.
- */
-export function appendDispatchReportProtocol(brief: string, dispatchRootId: string): string {
-  const root = dispatchRootId.trim();
-  if (!DISPATCH_ROOT_ID_RE.test(root)) throw new Error('dispatch report protocol requires a valid om_ root id');
-  return brief.trimEnd()
-    + '\n\n— 完成回报 —\n'
-    + `干完后在本话题运行 \`botmux report --dispatch-root ${root} "子项目完成 + 产出位置/摘要"\` `
-    + '把结果回报给原始主编排会话；不要在本话题 @ 主bot（那会另起一个没有上下文的新会话）。';
+    + '完成后直接在收到任务的原话题运行 '
+    + '`botmux send --no-mention "子项目完成 + 产出位置/摘要"` '
+    + '回复最终交付；不要 @ 主 bot，不要新开话题。';
 }
 
 /**

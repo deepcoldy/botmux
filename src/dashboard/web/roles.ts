@@ -33,7 +33,7 @@ export interface RoleData {
   byteLength: number;
   hasRole: boolean;
   injectMode?: RoleInjectMode;
-  dispatchReportEnabled?: boolean;
+  dispatchCompletionEnabled?: boolean;
   effectiveContent?: string | null;
   effectiveSource?: string;
   hasEffectiveRole?: boolean;
@@ -258,12 +258,12 @@ export async function saveRole(
   chatId: string,
   content: string,
   injectMode: RoleInjectMode,
-  dispatchReportEnabled: boolean,
+  dispatchCompletionEnabled: boolean,
 ): Promise<boolean> {
   const r = await fetch(`/api/roles/${encodeURIComponent(larkAppId)}/${encodeURIComponent(chatId)}`, {
     method: 'PUT',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ content, injectMode, dispatchReportEnabled }),
+    body: JSON.stringify({ content, injectMode, dispatchCompletionEnabled }),
   });
   return r.ok;
 }
@@ -279,15 +279,15 @@ export async function saveInjectMode(larkAppId: string, chatId: string, injectMo
   return r.ok;
 }
 
-export async function saveDispatchReportEnabled(
+export async function saveDispatchCompletionEnabled(
   larkAppId: string,
   chatId: string,
-  dispatchReportEnabled: boolean,
+  dispatchCompletionEnabled: boolean,
 ): Promise<boolean> {
   const r = await fetch(`/api/roles/${encodeURIComponent(larkAppId)}/${encodeURIComponent(chatId)}`, {
     method: 'PUT',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ dispatchReportEnabled }),
+    body: JSON.stringify({ dispatchCompletionEnabled }),
   });
   return r.ok;
 }

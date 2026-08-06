@@ -95,36 +95,36 @@ describe('role injection mode', () => {
     expect(resolveRoleInjection('app1', 'oc_r')).toEqual({ content: 'CHAT', source: 'chat', injectMode: 'once' });
   });
 
-  it('stores the dispatch report switch per bot + chat without clobbering injection mode', async () => {
+  it('stores the dispatch completion switch per bot + chat without clobbering injection mode', async () => {
     const {
       deleteRoleMeta,
-      readRoleDispatchReportEnabled,
+      readRoleDispatchCompletionEnabled,
       readRoleInjectMode,
-      writeRoleDispatchReportEnabled,
+      writeRoleDispatchCompletionEnabled,
       writeRoleInjectMode,
     } = await fresh();
     const metaPath = join(dataDir, 'roles', 'app1', 'oc_dispatch.meta.json');
 
-    expect(readRoleDispatchReportEnabled('app1', 'oc_dispatch')).toBe(false);
+    expect(readRoleDispatchCompletionEnabled('app1', 'oc_dispatch')).toBe(false);
     writeRoleInjectMode('app1', 'oc_dispatch', 'once');
-    writeRoleDispatchReportEnabled('app1', 'oc_dispatch', true);
+    writeRoleDispatchCompletionEnabled('app1', 'oc_dispatch', true);
     expect(readRoleInjectMode('app1', 'oc_dispatch')).toBe('once');
-    expect(readRoleDispatchReportEnabled('app1', 'oc_dispatch')).toBe(true);
+    expect(readRoleDispatchCompletionEnabled('app1', 'oc_dispatch')).toBe(true);
 
-    writeRoleDispatchReportEnabled('app1', 'oc_dispatch', false);
+    writeRoleDispatchCompletionEnabled('app1', 'oc_dispatch', false);
     expect(readRoleInjectMode('app1', 'oc_dispatch')).toBe('once');
-    expect(readRoleDispatchReportEnabled('app1', 'oc_dispatch')).toBe(false);
+    expect(readRoleDispatchCompletionEnabled('app1', 'oc_dispatch')).toBe(false);
 
-    writeRoleDispatchReportEnabled('app1', 'oc_dispatch', true);
+    writeRoleDispatchCompletionEnabled('app1', 'oc_dispatch', true);
     deleteRoleMeta('app1', 'oc_dispatch');
     expect(existsSync(metaPath)).toBe(false);
     expect(readRoleInjectMode('app1', 'oc_dispatch')).toBe('every');
-    expect(readRoleDispatchReportEnabled('app1', 'oc_dispatch')).toBe(false);
+    expect(readRoleDispatchCompletionEnabled('app1', 'oc_dispatch')).toBe(false);
   });
 
   it('treats damaged or non-object role metadata as empty', async () => {
     const {
-      readRoleDispatchReportEnabled,
+      readRoleDispatchCompletionEnabled,
       readRoleInjectMode,
       writeRoleInjectMode,
     } = await fresh();
@@ -134,7 +134,7 @@ describe('role injection mode', () => {
     for (const invalid of ['null', '[]', '{']) {
       writeFileSync(metaPath, invalid);
       expect(readRoleInjectMode('app1', 'oc_invalid_meta')).toBe('every');
-      expect(readRoleDispatchReportEnabled('app1', 'oc_invalid_meta')).toBe(false);
+      expect(readRoleDispatchCompletionEnabled('app1', 'oc_invalid_meta')).toBe(false);
     }
   });
 

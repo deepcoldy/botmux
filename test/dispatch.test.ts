@@ -17,8 +17,7 @@ import { findAncestorSessionContext } from '../src/core/session-marker.js';
 import {
   acceptedDispatchBotAppIds,
   activeConversationBotOpenIds,
-  appendDispatchReportProtocol,
-  appendLegacyDispatchReportProtocol,
+  appendDispatchCompletionProtocol,
   parseDispatchBotSpec,
   buildDispatchMessages,
   buildRepoPrimeText,
@@ -102,93 +101,52 @@ describe('buildDispatchMessages', () => {
   });
 });
 
-describe('appendDispatchReportProtocol', () => {
-  it('freezes a distinct exact report root into each dispatched turn', () => {
-    const first = appendDispatchReportProtocol('第一单', 'om_seed_first');
-    const second = appendDispatchReportProtocol('第二单', 'om_seed_second');
-    expect(first).toContain('botmux report --dispatch-root om_seed_first');
-    expect(first).not.toContain('om_seed_second');
-    expect(second).toContain('botmux report --dispatch-root om_seed_second');
-    expect(second).not.toContain('om_seed_first');
-  });
-
-  it('rejects a non-message root instead of injecting an ambiguous command', () => {
-    expect(() => appendDispatchReportProtocol('x', 'oc_chat')).toThrow('valid om_ root id');
-  });
-
-  it('keeps the root-free compatibility command for legacy cross-machine dispatches', () => {
-    const legacy = appendLegacyDispatchReportProtocol('跨机器任务');
-    expect(legacy).toContain('botmux report "子项目完成 + 产出位置/摘要"');
-    expect(legacy).not.toContain('--dispatch-root');
-  });
-});
-
-describe('dispatch report switch wiring', () => {
-  it('keeps the brief free of a completion command unless the exact helper is applied', () => {
+describe('dispatch completion switch wiring', () => {
+  it('adds only a same-topic botmux send completion command', () => {
     const plain = buildDispatchMessages({
       title: '任务',
       brief: '完成实现并自测',
       bots: [{ openId: 'ou_assignee' }],
     });
     expect(plain.threadContent.flat().map(node => node.tag === 'text' ? node.text : '').join('\n'))
-      .not.toContain('botmux report');
+      .not.toContain('botmux send');
 
-    const exact = appendDispatchReportProtocol('完成实现并自测', 'om_seed_exact');
-    expect(exact).toContain('botmux report --dispatch-root om_seed_exact');
+    const completion = appendDispatchCompletionProtocol('完成实现并自测');
+    expect(completion).toContain('botmux send --no-mention');
+    expect(completion).toContain('不要 @ 主 bot，不要新开话题');
   });
 
-  it('gates CLI injection on the saved switch, stable app targets, and an exact registry hit', () => {
+  it('gates CLI injection only on the saved per-bot, per-chat switch', () => {
     const source = readFileSync(new URL('../src/cli.ts', import.meta.url), 'utf8');
     const start = source.indexOf('async function cmdDispatch');
     const end = source.indexOf('async function cmdReport', start);
     const dispatch = source.slice(start, end);
 
-    const configRead = dispatch.indexOf('readRoleDispatchReportEnabled(appId, targetChatId)');
-    const stableTargets = dispatch.indexOf('&& parsedBotApps.length > 0', configRead);
-    const noLegacyTargets = dispatch.indexOf('&& legacyBots.length === 0', stableTargets);
-    const intoGuard = dispatch.indexOf('if (intoRoot && exactReportTarget)', noLegacyTargets);
-    const exactRegistryHit = dispatch.indexOf(
-      'findDispatchRegistryEntry({ registry, dispatchRootId: intoRoot })?.key === intoRoot',
-      intoGuard,
-    );
+    const configRead = dispatch.indexOf('readRoleDispatchCompletionEnabled(appId, targetChatId)');
     const safeBranch = dispatch.indexOf(
-      'exactReportTarget && exactIntoReportRoot\n    ? appendDispatchReportProtocol(brief, dispatchRootId)\n    : brief',
-      exactRegistryHit,
+      'completionEnabled\n    ? appendDispatchCompletionProtocol(brief)\n    : brief',
+      configRead,
     );
     const standbyGuard = dispatch.indexOf('if (!standby) {', safeBranch);
-    const seededKickoff = dispatch.indexOf('brief: briefWithReportProtocol(seedId)', standbyGuard);
+    const seededKickoff = dispatch.indexOf('brief: briefWithCompletionProtocol()', standbyGuard);
 
     expect(configRead).toBeGreaterThanOrEqual(0);
-    expect(stableTargets).toBeGreaterThan(configRead);
-    expect(noLegacyTargets).toBeGreaterThan(stableTargets);
-    expect(intoGuard).toBeGreaterThan(noLegacyTargets);
-    expect(exactRegistryHit).toBeGreaterThan(intoGuard);
-    expect(safeBranch).toBeGreaterThan(exactRegistryHit);
+    expect(safeBranch).toBeGreaterThan(configRead);
     expect(standbyGuard).toBeGreaterThan(safeBranch);
     expect(seededKickoff).toBeGreaterThan(standbyGuard);
-  });
-
-  it('authenticates the exact report callback through daemon IPC', () => {
-    const source = readFileSync(new URL('../src/cli.ts', import.meta.url), 'utf8');
-    const start = source.indexOf('async function cmdReport');
-    const end = source.indexOf('\nasync function ', start + 1);
-    const report = source.slice(start, end);
-
-    expect(report).toContain("fetchDaemonIpc(daemon.ipcPort, '/api/trigger'");
-    expect(report).not.toContain('fetch(`http://127.0.0.1:${daemon.ipcPort}/api/trigger`');
   });
 
   it('renders dispatch save feedback inside its own dashboard setting row', () => {
     const source = readFileSync(new URL('../src/dashboard/web/roles-page.tsx', import.meta.url), 'utf8');
     const injectStart = source.indexOf("tr('roles.injectModeLabel')");
-    const reportStart = source.indexOf("tr('roles.dispatchReportLabel')", injectStart);
-    const textareaStart = source.indexOf('<textarea', reportStart);
-    const injectRow = source.slice(injectStart, reportStart);
-    const reportRow = source.slice(reportStart, textareaStart);
+    const completionStart = source.indexOf("tr('roles.dispatchCompletionLabel')", injectStart);
+    const textareaStart = source.indexOf('<textarea', completionStart);
+    const injectRow = source.slice(injectStart, completionStart);
+    const completionRow = source.slice(completionStart, textareaStart);
 
     expect(injectRow).toContain('<Flash flash={injectFlash} />');
-    expect(injectRow).not.toContain('dispatchReportFlash');
-    expect(reportRow).toContain('<Flash flash={dispatchReportFlash} />');
+    expect(injectRow).not.toContain('dispatchCompletionFlash');
+    expect(completionRow).toContain('<Flash flash={dispatchCompletionFlash} />');
   });
 });
 

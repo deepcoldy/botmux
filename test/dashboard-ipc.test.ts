@@ -3072,7 +3072,7 @@ describe('role profile IPC routes', () => {
     }
   });
 
-  it('round-trips and deletes the dispatch report switch per bot + chat', async () => {
+  it('round-trips and deletes the dispatch completion switch per bot + chat', async () => {
     const dataDir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-role-dispatch-'));
     const prevDataDir = process.env.SESSION_DATA_DIR;
     const prevConfigDataDir = config.session.dataDir;
@@ -3088,35 +3088,35 @@ describe('role profile IPC routes', () => {
       const initial = await fetch(roleUrl);
       expect(await initial.json()).toMatchObject({
         chatId: 'oc_dispatch',
-        dispatchReportEnabled: false,
+        dispatchCompletionEnabled: false,
       });
 
       const enabled = await fetch(roleUrl, {
         method: 'PUT',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ content: '# Dispatcher', injectMode: 'once', dispatchReportEnabled: true }),
+        body: JSON.stringify({ content: '# Dispatcher', injectMode: 'once', dispatchCompletionEnabled: true }),
       });
       expect(enabled.status).toBe(200);
       expect(await (await fetch(roleUrl)).json()).toMatchObject({
         injectMode: 'once',
-        dispatchReportEnabled: true,
+        dispatchCompletionEnabled: true,
       });
 
       const disabled = await fetch(roleUrl, {
         method: 'PUT',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ dispatchReportEnabled: false }),
+        body: JSON.stringify({ dispatchCompletionEnabled: false }),
       });
       expect(disabled.status).toBe(200);
       expect(await (await fetch(roleUrl)).json()).toMatchObject({
         injectMode: 'once',
-        dispatchReportEnabled: false,
+        dispatchCompletionEnabled: false,
       });
 
       await fetch(roleUrl, {
         method: 'PUT',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ dispatchReportEnabled: true }),
+        body: JSON.stringify({ dispatchCompletionEnabled: true }),
       });
       expect(existsSync(metaPath)).toBe(true);
       const deleted = await fetch(roleUrl, { method: 'DELETE' });
@@ -3125,7 +3125,7 @@ describe('role profile IPC routes', () => {
       expect(await (await fetch(roleUrl)).json()).toMatchObject({
         content: null,
         injectMode: 'every',
-        dispatchReportEnabled: false,
+        dispatchCompletionEnabled: false,
       });
     } finally {
       if (prevDataDir === undefined) delete process.env.SESSION_DATA_DIR;

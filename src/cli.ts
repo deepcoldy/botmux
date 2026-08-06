@@ -34,7 +34,7 @@ import { validateWorkingDir } from './core/working-dir.js';
 import { resolveSessionContext } from './core/session-marker.js';
 import { resolveBotmuxDataDir } from './core/data-dir.js';
 import { dashboardSecretPath } from './core/dashboard-secret.js';
-import { acceptedDispatchBotAppIds, activeConversationBotOpenIds, appendDispatchReportProtocol, parseDispatchBotSpec, buildDispatchMessages, buildRepoPrimeText, buildReportContent, eligibleAutoMentionAliases, findDispatchRegistryEntry, foldableChatSessionAppIds, offTopicSubBotTopic, resolveReportTarget, resolveSendTarget, threadRootForReachability } from './core/dispatch.js';
+import { acceptedDispatchBotAppIds, activeConversationBotOpenIds, appendDispatchCompletionProtocol, parseDispatchBotSpec, buildDispatchMessages, buildRepoPrimeText, buildReportContent, eligibleAutoMentionAliases, findDispatchRegistryEntry, foldableChatSessionAppIds, offTopicSubBotTopic, resolveReportTarget, resolveSendTarget, threadRootForReachability } from './core/dispatch.js';
 import { pickTurnReplyTarget } from './core/reply-target.js';
 import { recordDispatchRegistryEntry } from './core/dispatch-registry.js';
 import { enableAutostart, disableAutostart, autostartStatus, refreshAutostart } from './autostart.js';
@@ -8388,30 +8388,16 @@ async function cmdDispatch(rest: string[]): Promise<void> {
 
   const bots = [...legacyBots, ...appBots]
     .filter((bot, index, all) => all.findIndex(candidate => candidate.openId === bot.openId) === index);
-  const { readRoleDispatchReportEnabled } = await import('./core/role-resolver.js');
-  const exactReportTarget = readRoleDispatchReportEnabled(appId, targetChatId)
-    && parsedBotApps.length > 0
-    && legacyBots.length === 0;
-  let exactIntoReportRoot = !intoRoot;
-  if (intoRoot && exactReportTarget) {
-    const regPath = join(resolveDataDir(), 'orchestrate-dispatch.json');
-    let registry: Record<string, any> = {};
-    try {
-      const parsed: unknown = existsSync(regPath) ? JSON.parse(readFileSync(regPath, 'utf-8')) : {};
-      if (parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)) {
-        registry = parsed as Record<string, any>;
-      }
-    } catch { /* fail closed */ }
-    exactIntoReportRoot = findDispatchRegistryEntry({ registry, dispatchRootId: intoRoot })?.key === intoRoot;
-  }
-  const briefWithReportProtocol = (dispatchRootId: string): string => exactReportTarget && exactIntoReportRoot
-    ? appendDispatchReportProtocol(brief, dispatchRootId)
+  const { readRoleDispatchCompletionEnabled } = await import('./core/role-resolver.js');
+  const completionEnabled = readRoleDispatchCompletionEnabled(appId, targetChatId);
+  const briefWithCompletionProtocol = (): string => completionEnabled
+    ? appendDispatchCompletionProtocol(brief)
     : brief;
   let built;
   try {
     built = buildDispatchMessages({
       title: title.trim() || '子项目',
-      brief: intoRoot ? briefWithReportProtocol(intoRoot) : brief,
+      brief: intoRoot ? briefWithCompletionProtocol() : brief,
       bots,
     });
   } catch (err: any) {
@@ -8494,7 +8480,7 @@ async function cmdDispatch(rest: string[]): Promise<void> {
       // resident chat-scope session's mutable latest reply alias.
       const kickoffBuilt = buildDispatchMessages({
         title: title.trim() || '子项目',
-        brief: briefWithReportProtocol(seedId),
+        brief: briefWithCompletionProtocol(),
         bots,
       });
       const kickoffBriefJson = JSON.stringify({ zh_cn: { title: '', content: kickoffBuilt.threadContent } });
@@ -8727,7 +8713,7 @@ async function cmdReport(rest: string[]): Promise<void> {
     }
     let response: Response;
     try {
-      response = await fetchDaemonIpc(daemon.ipcPort, '/api/trigger', {
+      response = await fetch(`http://127.0.0.1:${daemon.ipcPort}/api/trigger`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({

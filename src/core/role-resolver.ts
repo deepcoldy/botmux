@@ -233,7 +233,7 @@ export type RoleInjectMode = 'every' | 'once';
 
 interface RoleMeta {
   inject?: 'once';
-  dispatchReportEnabled?: true;
+  dispatchCompletionEnabled?: true;
 }
 
 /** Absolute path to the per-chat role metadata sidecar. */
@@ -251,7 +251,7 @@ function readRoleMeta(larkAppId: string, chatId: string): RoleMeta {
     const raw = meta as Record<string, unknown>;
     return {
       ...(raw.inject === 'once' ? { inject: 'once' as const } : {}),
-      ...(raw.dispatchReportEnabled === true ? { dispatchReportEnabled: true as const } : {}),
+      ...(raw.dispatchCompletionEnabled === true ? { dispatchCompletionEnabled: true as const } : {}),
     };
   } catch {
     return {};
@@ -329,22 +329,22 @@ export function writeRoleInjectMode(larkAppId: string, chatId: string, mode: Rol
   logger.info(`[role] inject mode chat=${chatId} app=${larkAppId} => ${mode}`);
 }
 
-/** Whether this bot asks locally dispatched tasks in this chat to report completion. */
-export function readRoleDispatchReportEnabled(larkAppId: string, chatId: string): boolean {
+/** Whether this bot asks dispatched tasks in this chat to reply with completion. */
+export function readRoleDispatchCompletionEnabled(larkAppId: string, chatId: string): boolean {
   if (!larkAppId || !chatId || !isValidRoleChatId(chatId)) return false;
-  return readRoleMeta(larkAppId, chatId).dispatchReportEnabled === true;
+  return readRoleMeta(larkAppId, chatId).dispatchCompletionEnabled === true;
 }
 
-export function writeRoleDispatchReportEnabled(
+export function writeRoleDispatchCompletionEnabled(
   larkAppId: string,
   chatId: string,
   enabled: boolean,
 ): void {
   const meta = readRoleMeta(larkAppId, chatId);
-  if (enabled) meta.dispatchReportEnabled = true;
-  else delete meta.dispatchReportEnabled;
+  if (enabled) meta.dispatchCompletionEnabled = true;
+  else delete meta.dispatchCompletionEnabled;
   writeRoleMeta(larkAppId, chatId, meta);
-  logger.info(`[role] dispatch report chat=${chatId} app=${larkAppId} => ${enabled}`);
+  logger.info(`[role] dispatch completion chat=${chatId} app=${larkAppId} => ${enabled}`);
 }
 
 /** Remove the injection-mode sidecar (used when a chat role is deleted). */
