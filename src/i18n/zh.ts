@@ -884,6 +884,7 @@ export const messages: Record<string, string> = {
   'daemon.fast_unsupported_backend': '⚠️ 这个会话的后端下 /fast 切不了 Codex 档位（RPC 输入模式 / Riff 的对话不走终端，按键到不了执行端）。卡片徽标仍会如实反映 Codex 实际运行的档位。',
   'daemon.enriched_mentions_label': '消息中的 @mention：',
   'daemon.choose_repo_first': '请先在上方卡片中选择仓库，您的消息已暂存，选择后会自动发送。',
+  'daemon.repo_scan_in_progress': '正在扫描仓库，您的消息已暂存。扫描完成后会自动显示选择卡或直接开始，无需再次 @。',
   'daemon.repo_card_unavailable': '仓库选择卡当前不可用，您的消息仍已暂存。请回复 `/repo <项目名|路径>` 选择仓库，或直接回复 `/repo` 使用当前工作目录继续。',
   'daemon.worktree_building_wait': '正在创建 worktree（含 git fetch，可能需要几秒），您的消息已暂存，创建完成后会自动一并发送。',
 

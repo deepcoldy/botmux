@@ -883,6 +883,7 @@ export const messages: Record<string, string> = {
   'daemon.fast_unsupported_backend': "⚠️ /fast can't toggle Codex's tier on this session's backend (RPC input mode / Riff runs turns off the terminal, so the keystroke never reaches the executor). The card badge still reflects the tier Codex is actually running.",
   'daemon.enriched_mentions_label': '@mentions in this message:',
   'daemon.choose_repo_first': 'Pick a repo from the card above first — your message is queued and will be sent once a repo is chosen.',
+  'daemon.repo_scan_in_progress': 'Scanning repositories now. Your message is queued; the picker will appear or work will start automatically when the scan finishes. No need to @ me again.',
   'daemon.repo_card_unavailable': 'The repository picker card is unavailable, but your message is still queued. Reply `/repo <name|path>` to choose a repository, or reply `/repo` to continue in the current working directory.',
   'daemon.worktree_building_wait': 'Creating a worktree (includes a git fetch, may take a few seconds) — your message is queued and will be sent together once it is ready.',
 

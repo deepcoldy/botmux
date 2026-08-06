@@ -108,6 +108,7 @@ import type { CliId } from './adapters/cli/types.js';
 import { runtimeInstallationKey } from './adapters/cli/runtime.js';
 import * as scheduler from './core/scheduler.js';
 import { scanProjects, scanMultipleProjects } from './services/project-scanner.js';
+import { scanMultipleProjectsAsync } from './services/project-scanner-async.js';
 import { buildQuotaExhaustedCard, buildRepoSelectCard, buildStreamingCard, getCliDisplayName } from './im/lark/card-builder.js';
 import { codexServiceTierBadge } from './services/codex-service-tier.js';
 import { sessionConfiguredRuntimeDisplayName } from './core/cli-runtime-display.js';
@@ -213,7 +214,7 @@ import {
   type PersistentBackendType,
 } from './core/persistent-backend.js';
 import type { PersistentBackendTarget } from './adapters/backend/types.js';
-import { handleCardAction, runAutoWorktreeCommit } from './im/lark/card-handler.js';
+import { commitRepoSelection, handleCardAction, runAutoWorktreeCommit } from './im/lark/card-handler.js';
 import { setIssueActivate } from './im/lark/issue-command-deps.js';
 import { startIssueOutboxPump } from './services/issue-outbox-pump.js';
 import type { CardActionData, CardHandlerDeps } from './im/lark/card-handler.js';
@@ -4464,6 +4465,7 @@ function notifierAdoptWouldDropInput(ds: DaemonSession): boolean {
  */
 function clearPendingRepoStateForNotifierAdopt(ds: DaemonSession): void {
   ds.pendingRepo = false;
+  ds.repoScanInFlight = false;
   ds.pendingRepoCommitInFlight = false;
   ds.worktreeCreating = false;
   ds.repoCardMessageId = undefined;
@@ -15496,6 +15498,11 @@ async function postPendingRepoSelectCard(
   } catch (err) {
     ds.repoCardMessageId = undefined;
     logger.warn(`[${tag(ds)}] Repo selection card delivery failed: ${err instanceof Error ? err.message : err}`);
+    if (!ds.pendingRepo || ds.pendingRepoCommitInFlight ||
+        (ds.worker && !ds.worker.killed) || !ownsCurrentRoute(ds, ds.larkAppId)) {
+      logger.info(`[${tag(ds)}] Repo selection text fallback skipped because the pending route changed`);
+      return undefined;
+    }
     try {
       await sessionReply(
         anchor,
@@ -15508,6 +15515,20 @@ async function postPendingRepoSelectCard(
     }
     return undefined;
   }
+}
+
+function pendingRepoScanStillOwnsRoute(
+  ds: DaemonSession,
+  anchor: string,
+  sessionId: string,
+): boolean {
+  return activeSessions.get(sessionKey(anchor, ds.larkAppId)) === ds
+    && ds.session.sessionId === sessionId
+    && ds.session.status === 'active'
+    && ds.pendingRepo === true
+    && ds.repoScanInFlight === true
+    && !ds.pendingRepoCommitInFlight
+    && !(ds.worker && !ds.worker.killed);
 }
 
 async function startInitialPassthroughSession(args: {
@@ -16256,27 +16277,131 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
   // Show repo selection card
   if (await replyInvalidWorkingDirs(anchor, larkAppId, ds)) return;
   const scanDirs = getProjectScanDirs(ds).filter(d => existsSync(d));
-  let projects: import('./services/project-scanner.js').ProjectInfo[] = [];
   if (scanDirs.length > 0) {
-    projects = scanMultipleProjects(scanDirs, 3, repoPickerScanOptions());
-  }
-  if (projects.length > 0) {
-    lastRepoScan.set(chatId, projects);
-    ds.repoCardMessageId = await postPendingRepoSelectCard(ds, anchor, projects);
+    const scanSessionId = ds.session.sessionId;
+    ds.repoScanInFlight = true;
     announcePendingRepoSession(ds);
-    logger.info(`[${tag(ds)}] Waiting for repo selection (${projects.length} projects)`);
-  } else {
-    // No projects found — skip repo selection, spawn directly
-    ds.pendingRepo = false;
-    const selfBot = getBot(larkAppId);
-    ensureSessionWhiteboard(ds);
-    const prompt = buildNewTopicCliInput(promptContent, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, chatId), undefined, { name: selfBot.botName, openId: selfBot.botOpenId }, localeForBot(larkAppId), newTopicSender, { larkAppId, chatId, whiteboardId: ds.session.whiteboardId, substituteTrigger, codexAppText: codexAppVisibleText, codexAppApplicationContext, codexAppMessageContext });
-    await noteTurnReceived(ds, messageId, content, newTopicSender, messageId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
-    rememberLastCliInput(ds, promptContent, prompt);
-    forkWorker(ds, prompt, { turnId: messageId });
-    ds.pendingTurnId = undefined;
-    logger.info(`Session ${session.sessionId} ready (no projects to select), total active: ${getActiveCount()}`);
+    try {
+      await sessionReply(
+        anchor,
+        tr('daemon.repo_scan_in_progress', undefined, localeForBot(larkAppId)),
+        'text',
+        larkAppId,
+      );
+    } catch (err) {
+      logger.warn(`[${tag(ds)}] Repo scan progress reply failed: ${err instanceof Error ? err.message : err}`);
+    }
+    if (!pendingRepoScanStillOwnsRoute(ds, anchor, scanSessionId)) {
+      ds.repoScanInFlight = false;
+      logger.info(`[${tag(ds)}] Repo scan skipped because the pending route changed before launch`);
+      return;
+    }
+
+    // The pending session and visible progress reply are now stable. Detach the
+    // expensive scan so the per-anchor serializer can release immediately;
+    // follow-ups and `/repo`/`/close` may then consume the same pending buffer.
+    void (async () => {
+      try {
+        let projects: import('./services/project-scanner.js').ProjectInfo[];
+        try {
+          projects = await scanMultipleProjectsAsync(scanDirs, 3, repoPickerScanOptions());
+        } catch (err) {
+          logger.warn(`[${tag(ds)}] Isolated repo scan failed: ${err instanceof Error ? err.message : err}`);
+          if (pendingRepoScanStillOwnsRoute(ds, anchor, scanSessionId)) {
+            try {
+              await sessionReply(
+                anchor,
+                tr('daemon.repo_card_unavailable', undefined, localeForBot(larkAppId)),
+                'text',
+                larkAppId,
+              );
+            } catch (fallbackErr) {
+              logger.warn(`[${tag(ds)}] Repo scan recovery reply failed: ${fallbackErr instanceof Error ? fallbackErr.message : fallbackErr}`);
+            }
+          }
+          return;
+        }
+        if (!pendingRepoScanStillOwnsRoute(ds, anchor, scanSessionId)) {
+          logger.info(`[${tag(ds)}] Discarding late repo scan result because the pending route changed`);
+          return;
+        }
+
+        if (projects.length > 0) {
+          lastRepoScan.set(chatId, projects);
+          const repoCardMessageId = await postPendingRepoSelectCard(ds, anchor, projects);
+          if (!pendingRepoScanStillOwnsRoute(ds, anchor, scanSessionId)) {
+            if (repoCardMessageId) void deleteMessage(larkAppId, repoCardMessageId);
+            if (lastRepoScan.get(chatId) === projects) lastRepoScan.delete(chatId);
+            logger.info(`[${tag(ds)}] Withdrawing late repo card because the pending route changed during delivery`);
+            return;
+          }
+          ds.repoCardMessageId = repoCardMessageId;
+          logger.info(`[${tag(ds)}] Waiting for repo selection (${projects.length} projects)`);
+          return;
+        }
+
+        // A successful empty scan retains the old direct-start behavior. Reuse
+        // the pending commit transaction so messages buffered while the child
+        // was scanning are folded into the first turn instead of being dropped.
+        await commitRepoSelection(
+          {
+            ds,
+            rootId: anchor,
+            larkAppId,
+            operatorOpenId: senderOpenId,
+            activeSessions,
+            sessionReply: (rid, replyContent, msgType, turnId) =>
+              sessionReply(rid, replyContent, msgType, larkAppId, turnId),
+          },
+          getSessionWorkingDir(ds),
+          getSessionWorkingDir(ds),
+          {
+            suppressConfirmReply: true,
+            pinWorkingDir: false,
+            beforePendingFork: () => noteTurnReceived(
+              ds,
+              messageId,
+              content,
+              newTopicSender,
+              messageId,
+              substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined,
+            ),
+          },
+        );
+        if (ds.worker && !ds.worker.killed) {
+          logger.info(`Session ${session.sessionId} ready (no projects to select), total active: ${getActiveCount()}`);
+        }
+      } catch (err) {
+        logger.warn(`[${tag(ds)}] Detached repo scan completion failed: ${err instanceof Error ? err.message : err}`);
+        if (pendingRepoScanStillOwnsRoute(ds, anchor, scanSessionId)) {
+          try {
+            await sessionReply(
+              anchor,
+              tr('daemon.repo_card_unavailable', undefined, localeForBot(larkAppId)),
+              'text',
+              larkAppId,
+            );
+          } catch (fallbackErr) {
+            logger.warn(`[${tag(ds)}] Repo scan completion recovery reply failed: ${fallbackErr instanceof Error ? fallbackErr.message : fallbackErr}`);
+          }
+        }
+      } finally {
+        ds.repoScanInFlight = false;
+      }
+    })();
+    return;
   }
+
+  // No scan roots found — preserve the original immediate-start path.
+  ds.pendingRepo = false;
+  const selfBot = getBot(larkAppId);
+  ensureSessionWhiteboard(ds);
+  const prompt = buildNewTopicCliInput(promptContent, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, chatId), undefined, { name: selfBot.botName, openId: selfBot.botOpenId }, localeForBot(larkAppId), newTopicSender, { larkAppId, chatId, whiteboardId: ds.session.whiteboardId, substituteTrigger, codexAppText: codexAppVisibleText, codexAppApplicationContext, codexAppMessageContext });
+  await noteTurnReceived(ds, messageId, content, newTopicSender, messageId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
+  rememberLastCliInput(ds, promptContent, prompt);
+  forkWorker(ds, prompt, { turnId: messageId });
+  ds.pendingTurnId = undefined;
+  logger.info(`Session ${session.sessionId} ready (no projects to select), total active: ${getActiveCount()}`);
 }
 
 // 主动开工 — 场景①: in-flight lock so two near-simultaneous `bot.added` events
@@ -17398,9 +17523,11 @@ async function handleThreadReply(
     // instead of the misleading "pick a repo from the card above".
     const pendingReplyKey = (ds.worktreeCreating || ds.pendingRepoCommitInFlight)
       ? 'daemon.worktree_building_wait'
-      : ds.repoCardMessageId
-        ? 'daemon.choose_repo_first'
-        : 'daemon.repo_card_unavailable';
+      : ds.repoScanInFlight
+        ? 'daemon.repo_scan_in_progress'
+        : ds.repoCardMessageId
+          ? 'daemon.choose_repo_first'
+          : 'daemon.repo_card_unavailable';
     await sessionReply(anchor, tr(pendingReplyKey, undefined, localeForBot(larkAppId)), 'text', larkAppId);
     return;
   }

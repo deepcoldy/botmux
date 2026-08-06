@@ -437,6 +437,9 @@ export async function commitRepoSelection(
     confirmReplyText?: string;
     pinWorkingDir?: boolean;
     riffRepoDirs?: string[];
+    /** Preserve route-specific acknowledgement work immediately before the
+     * pending input snapshot + fork. No pending input snapshot precedes it. */
+    beforePendingFork?: () => Promise<void>;
   },
 ): Promise<void> {
   const { ds, rootId, cardMessageId, larkAppId, operatorOpenId, activeSessions, sessionReply } = ctx;
@@ -489,6 +492,15 @@ export async function commitRepoSelection(
           !ds.pendingRepo || (ds.worker && !ds.worker.killed)) {
         logger.warn(`[${tag(ds)}] Session changed while preparing the pending-CLI prompt (${commitGenSessionId} → ${ds.session.sessionId}, active=${sessionStillActive()}, pending=${!!ds.pendingRepo}, worker=${!!ds.worker}) — aborting this fork`);
         return;
+      }
+
+      if (opts?.beforePendingFork) {
+        await opts.beforePendingFork();
+        if (!sessionStillActive() || ds.session.sessionId !== commitGenSessionId ||
+            !ds.pendingRepo || (ds.worker && !ds.worker.killed)) {
+          logger.warn(`[${tag(ds)}] Session changed during pending-CLI acknowledgement — aborting this fork`);
+          return;
+        }
       }
 
       const pendingPrompt = ds.pendingPrompt ?? '';
