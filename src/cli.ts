@@ -34,7 +34,7 @@ import { validateWorkingDir } from './core/working-dir.js';
 import { resolveSessionContext } from './core/session-marker.js';
 import { resolveBotmuxDataDir } from './core/data-dir.js';
 import { dashboardSecretPath } from './core/dashboard-secret.js';
-import { acceptedDispatchBotAppIds, activeConversationBotOpenIds, appendDispatchReportProtocol, appendLegacyDispatchReportProtocol, parseDispatchBotSpec, buildDispatchMessages, buildRepoPrimeText, buildReportContent, eligibleAutoMentionAliases, findDispatchRegistryEntry, foldableChatSessionAppIds, offTopicSubBotTopic, resolveReportTarget, resolveSendTarget, threadRootForReachability } from './core/dispatch.js';
+import { acceptedDispatchBotAppIds, activeConversationBotOpenIds, buildDispatchCompletionBrief, parseDispatchBotSpec, buildDispatchMessages, buildRepoPrimeText, buildReportContent, eligibleAutoMentionAliases, findDispatchRegistryEntry, foldableChatSessionAppIds, offTopicSubBotTopic, resolveReportTarget, resolveSendTarget, threadRootForReachability } from './core/dispatch.js';
 import { pickTurnReplyTarget } from './core/reply-target.js';
 import { recordDispatchRegistryEntry } from './core/dispatch-registry.js';
 import { enableAutostart, disableAutostart, autostartStatus, refreshAutostart } from './autostart.js';
@@ -8388,18 +8388,20 @@ async function cmdDispatch(rest: string[]): Promise<void> {
 
   const bots = [...legacyBots, ...appBots]
     .filter((bot, index, all) => all.findIndex(candidate => candidate.openId === bot.openId) === index);
-  // Only an all-local stable-app dispatch can rely on this host's registry being
-  // visible to every receiver. Legacy or mixed --bot dispatches may cross hosts,
-  // so keep their context-derived compatibility report protocol.
+  const { readRoleDispatchCompletionEnabled } = await import('./core/role-resolver.js');
+  const sameTopicSendEnabled = readRoleDispatchCompletionEnabled(appId, targetChatId);
   const exactReportRootEnabled = parsedBotApps.length > 0 && legacyBots.length === 0;
-  const briefWithReportProtocol = (dispatchRootId: string): string => exactReportRootEnabled
-    ? appendDispatchReportProtocol(brief, dispatchRootId)
-    : appendLegacyDispatchReportProtocol(brief);
+  const briefWithCompletionProtocol = (dispatchRootId: string): string => buildDispatchCompletionBrief({
+    brief,
+    dispatchRootId,
+    exactReportRootEnabled,
+    sameTopicSendEnabled,
+  });
   let built;
   try {
     built = buildDispatchMessages({
       title: title.trim() || '子项目',
-      brief: intoRoot ? briefWithReportProtocol(intoRoot) : brief,
+      brief: intoRoot ? briefWithCompletionProtocol(intoRoot) : brief,
       bots,
     });
   } catch (err: any) {
@@ -8482,7 +8484,7 @@ async function cmdDispatch(rest: string[]): Promise<void> {
       // resident chat-scope session's mutable latest reply alias.
       const kickoffBuilt = buildDispatchMessages({
         title: title.trim() || '子项目',
-        brief: briefWithReportProtocol(seedId),
+        brief: briefWithCompletionProtocol(seedId),
         bots,
       });
       const kickoffBriefJson = JSON.stringify({ zh_cn: { title: '', content: kickoffBuilt.threadContent } });
@@ -8715,7 +8717,7 @@ async function cmdReport(rest: string[]): Promise<void> {
     }
     let response: Response;
     try {
-      response = await fetch(`http://127.0.0.1:${daemon.ipcPort}/api/trigger`, {
+      response = await fetchDaemonIpc(daemon.ipcPort, '/api/trigger', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({

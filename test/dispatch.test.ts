@@ -10,15 +10,17 @@
  * Run: pnpm vitest run test/dispatch.test.ts
  */
 import { describe, it, expect } from 'vitest';
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { findAncestorSessionContext } from '../src/core/session-marker.js';
 import {
   acceptedDispatchBotAppIds,
   activeConversationBotOpenIds,
+  appendDispatchCompletionProtocol,
   appendDispatchReportProtocol,
   appendLegacyDispatchReportProtocol,
+  buildDispatchCompletionBrief,
   parseDispatchBotSpec,
   buildDispatchMessages,
   buildRepoPrimeText,
@@ -102,24 +104,73 @@ describe('buildDispatchMessages', () => {
   });
 });
 
-describe('appendDispatchReportProtocol', () => {
-  it('freezes a distinct exact report root into each dispatched turn', () => {
-    const first = appendDispatchReportProtocol('第一单', 'om_seed_first');
-    const second = appendDispatchReportProtocol('第二单', 'om_seed_second');
-    expect(first).toContain('botmux report --dispatch-root om_seed_first');
-    expect(first).not.toContain('om_seed_second');
-    expect(second).toContain('botmux report --dispatch-root om_seed_second');
-    expect(second).not.toContain('om_seed_first');
+describe('dispatch completion switch wiring', () => {
+  it('keeps both existing report protocols available for the default path', () => {
+    expect(appendDispatchReportProtocol('本机任务', 'om_seed_exact'))
+      .toContain('botmux report --dispatch-root om_seed_exact');
+    expect(appendLegacyDispatchReportProtocol('兼容任务'))
+      .toContain('botmux report "子项目完成 + 产出位置/摘要"');
+    expect(() => appendDispatchReportProtocol('错误目标', 'oc_chat'))
+      .toThrow('valid om_ root id');
   });
 
-  it('rejects a non-message root instead of injecting an ambiguous command', () => {
-    expect(() => appendDispatchReportProtocol('x', 'oc_chat')).toThrow('valid om_ root id');
+  it('adds a same-topic botmux send copy after the report protocol', () => {
+    const plain = buildDispatchMessages({
+      title: '任务',
+      brief: '完成实现并自测',
+      bots: [{ openId: 'ou_assignee' }],
+    });
+    expect(plain.threadContent.flat().map(node => node.tag === 'text' ? node.text : '').join('\n'))
+      .not.toContain('botmux send');
+
+    const completion = appendDispatchCompletionProtocol(
+      appendDispatchReportProtocol('完成实现并自测', 'om_seed_exact'),
+    );
+    expect(completion).toContain('botmux report --dispatch-root om_seed_exact');
+    expect(completion).toContain('botmux send --no-mention');
+    expect(completion).toContain('除上述 botmux report 回注外');
+    expect(completion).toContain('不要 @ 主 bot，不要新开话题');
   });
 
-  it('keeps the root-free compatibility command for legacy cross-machine dispatches', () => {
-    const legacy = appendLegacyDispatchReportProtocol('跨机器任务');
-    expect(legacy).toContain('botmux report "子项目完成 + 产出位置/摘要"');
-    expect(legacy).not.toContain('--dispatch-root');
+  it.each([
+    { exact: false, send: false, exactReport: false, sameTopicSend: false },
+    { exact: false, send: true, exactReport: false, sameTopicSend: true },
+    { exact: true, send: false, exactReport: true, sameTopicSend: false },
+    { exact: true, send: true, exactReport: true, sameTopicSend: true },
+  ])('combines report and same-topic send protocols: %o', ({ exact, send, exactReport, sameTopicSend }) => {
+    const result = buildDispatchCompletionBrief({
+      brief: '完成实现并自测',
+      dispatchRootId: 'om_seed_exact',
+      exactReportRootEnabled: exact,
+      sameTopicSendEnabled: send,
+    });
+
+    expect(result.includes('botmux report --dispatch-root om_seed_exact')).toBe(exactReport);
+    expect(result.includes('botmux report "子项目完成 + 产出位置/摘要"')).toBe(!exactReport);
+    expect(result.includes('botmux send --no-mention')).toBe(sameTopicSend);
+  });
+
+  it('authenticates the exact report callback through daemon IPC', () => {
+    const source = readFileSync(new URL('../src/cli.ts', import.meta.url), 'utf8');
+    const start = source.indexOf('async function cmdReport');
+    const end = source.indexOf('\nasync function ', start + 1);
+    const report = source.slice(start, end);
+
+    expect(report).toContain("fetchDaemonIpc(daemon.ipcPort, '/api/trigger'");
+    expect(report).not.toContain('fetch(`http://127.0.0.1:${daemon.ipcPort}/api/trigger`');
+  });
+
+  it('renders dispatch save feedback inside its own dashboard setting row', () => {
+    const source = readFileSync(new URL('../src/dashboard/web/roles-page.tsx', import.meta.url), 'utf8');
+    const injectStart = source.indexOf("tr('roles.injectModeLabel')");
+    const completionStart = source.indexOf("tr('roles.dispatchCompletionLabel')", injectStart);
+    const textareaStart = source.indexOf('<textarea', completionStart);
+    const injectRow = source.slice(injectStart, completionStart);
+    const completionRow = source.slice(completionStart, textareaStart);
+
+    expect(injectRow).toContain('<Flash flash={injectFlash} />');
+    expect(injectRow).not.toContain('dispatchCompletionFlash');
+    expect(completionRow).toContain('<Flash flash={dispatchCompletionFlash} />');
   });
 });
 

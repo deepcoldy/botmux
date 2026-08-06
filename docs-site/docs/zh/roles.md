@@ -19,6 +19,8 @@
 - Role 内容是 Markdown，注入到 CLI 的 system prompt，最大约 4096 字节。
 - Role 解析顺序始终是：**本群 Role > 默认角色 > 无**。
 
+角色管理还提供按「群 + bot」生效的**话题任务回报**开关，默认关闭。开启后，当前 bot 在该群通过 `botmux dispatch` 派发任务时，子 bot 完成后仍会执行 `botmux report` 把结果回注到主编排的现有会话；同时还会在收到任务的原话题运行 `botmux send --no-mention "子项目完成 + 产出位置/摘要"` 额外留一份人可见的最终交付，不会 @ 主 bot 或新开话题。`--standby` 不发送任务，因此不会注入任务指令。
+
 > 💡 **默认角色**最直观的设置方式是在 `botmux dashboard` 的 **Bot 配置** 页——每个 bot 卡片都有「**默认角色**」编辑器（和 `/role team set` 写的是同一份配置；它是 bot 级的全局默认人设，放在 Bot 配置更合适）。**团队**面板里只做**只读查看**入口，编辑统一去 Bot 配置页。
 
 ![Dashboard Bot 配置 — 默认角色编辑器](https://magic-builder.tos-cn-beijing.volces.com/uploads/1780051089378_default-role-shot.png)

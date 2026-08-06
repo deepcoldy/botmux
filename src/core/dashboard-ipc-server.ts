@@ -84,7 +84,7 @@ import { locateLimiter } from './dashboard-locate.js';
 import { buildTerminalUrl } from './terminal-url.js';
 import { dashboardEventBus } from './dashboard-events.js';
 import { validateWorkingDir } from './working-dir.js';
-import { isValidRoleChatId, resolveRole, resolveRoleFile, writeRoleFile, deleteRoleFile, readRoleInjectMode, writeRoleInjectMode, deleteRoleInjectMode, type RoleInjectMode } from './role-resolver.js';
+import { isValidRoleChatId, resolveRole, resolveRoleFile, writeRoleFile, deleteRoleFile, readRoleInjectMode, writeRoleInjectMode, deleteRoleMeta, readRoleDispatchCompletionEnabled, writeRoleDispatchCompletionEnabled, type RoleInjectMode } from './role-resolver.js';
 import {
   deleteRoleProfileEntry,
   deleteRoleProfileIfEmpty,
@@ -2386,9 +2386,9 @@ ipcRoute('DELETE', '/api/oncall/:chatId', async (_req, res, p) => {
 
 // ─── Role management (dashboard) ───────────────────────────────────────────
 // POST   /api/roles/batch   body: {chatIds: string[]} → role snapshots
-// GET    /api/roles/:chatId  → { chatId, content, byteLength, injectMode, effectiveContent, effectiveSource }
-// PUT    /api/roles/:chatId  body: {content?, injectMode?} → write role file and/or injection mode
-// DELETE /api/roles/:chatId  → remove role file (and injection-mode sidecar)
+// GET    /api/roles/:chatId  → role, injection, and dispatch-completion settings
+// PUT    /api/roles/:chatId  body: {content?, injectMode?, dispatchCompletionEnabled?}
+// DELETE /api/roles/:chatId  → remove role file and metadata
 
 const MAX_ROLE_BATCH_CHAT_IDS = 1_000;
 
@@ -2401,6 +2401,7 @@ function dashboardRolePayload(larkAppId: string, chatId: string): Record<string,
     byteLength: content ? Buffer.byteLength(content, 'utf-8') : 0,
     hasRole: content !== null,
     injectMode: readRoleInjectMode(larkAppId, chatId),
+    dispatchCompletionEnabled: readRoleDispatchCompletionEnabled(larkAppId, chatId),
     effectiveContent: effective.content,
     effectiveSource: effective.source,
     effectiveByteLength: effective.content ? Buffer.byteLength(effective.content, 'utf-8') : 0,
@@ -2433,28 +2434,31 @@ ipcRoute('GET', '/api/roles/:chatId', async (_req, res, p) => {
 ipcRoute('PUT', '/api/roles/:chatId', async (req, res, p) => {
   if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
   if (!isValidRoleChatId(p.chatId)) return jsonRes(res, 400, { ok: false, error: 'invalid_chat_id' });
-  let body: { content?: unknown; injectMode?: unknown };
-  try { body = await readJsonBody<{ content?: string; injectMode?: string }>(req); }
+  let body: { content?: unknown; injectMode?: unknown; dispatchCompletionEnabled?: unknown };
+  try { body = await readJsonBody<{ content?: string; injectMode?: string; dispatchCompletionEnabled?: boolean }>(req); }
   catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
   // injectMode is a per-chat setting that can be updated on its own (no content)
   // — e.g. toggling "inject once" for a chat whose effective role is the team
   // default. Only 'every'/'once' are accepted; anything else is ignored.
   const injectMode: RoleInjectMode | undefined =
     body.injectMode === 'once' ? 'once' : body.injectMode === 'every' ? 'every' : undefined;
+  const dispatchCompletionEnabled = typeof body.dispatchCompletionEnabled === 'boolean'
+    ? body.dispatchCompletionEnabled
+    : undefined;
   const hasContentField = typeof body.content === 'string';
   const content = hasContentField ? (body.content as string).trim() : '';
-  if (!hasContentField && injectMode === undefined) {
-    return jsonRes(res, 400, { ok: false, error: 'content_or_inject_mode_required' });
+  if (!hasContentField && injectMode === undefined && dispatchCompletionEnabled === undefined) {
+    return jsonRes(res, 400, { ok: false, error: 'role_setting_required' });
   }
   if (hasContentField && !content) return jsonRes(res, 400, { ok: false, error: 'content_required' });
   try {
     if (hasContentField) writeRoleFile(cachedLarkAppId, p.chatId, content);
     if (injectMode !== undefined) writeRoleInjectMode(cachedLarkAppId, p.chatId, injectMode);
+    if (dispatchCompletionEnabled !== undefined) writeRoleDispatchCompletionEnabled(cachedLarkAppId, p.chatId, dispatchCompletionEnabled);
     // `changed` reflects whether the role FILE (→ hasRole in the groups matrix)
-    // was written. An injectMode-only PUT touches just the .meta.json sidecar and
+    // was written. A metadata-only PUT touches just the .meta.json sidecar and
     // leaves hasRole untouched, so it reports changed:false — the dashboard uses
-    // this to avoid needlessly busting its 30s groups-matrix snapshot on the
-    // common inject-mode toggle.
+    // this to avoid needlessly busting its 30s groups-matrix snapshot.
     jsonRes(res, 200, { ok: true, changed: hasContentField });
   } catch (e) {
     jsonRes(res, 500, { ok: false, error: String(e) });
@@ -2465,7 +2469,7 @@ ipcRoute('DELETE', '/api/roles/:chatId', async (_req, res, p) => {
   if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
   if (!isValidRoleChatId(p.chatId)) return jsonRes(res, 400, { ok: false, error: 'invalid_chat_id' });
   const existed = deleteRoleFile(cachedLarkAppId, p.chatId);
-  deleteRoleInjectMode(cachedLarkAppId, p.chatId);
+  deleteRoleMeta(cachedLarkAppId, p.chatId);
   // `changed` mirrors `existed`: a DELETE that removed nothing didn't flip
   // hasRole, so the dashboard skips invalidating its groups-matrix snapshot.
   jsonRes(res, 200, { ok: true, existed, changed: existed });

@@ -1,7 +1,7 @@
 // test/dashboard-ipc.test.ts
 import { describe, it, expect, afterEach, vi } from 'vitest';
 import { createHmac, randomBytes } from 'node:crypto';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { ipcRoute, startIpcServer, setLarkAppId, setIpcAuthSecret, setBotRenamer, setBotAvatarChanger, setExactChatGrantHandler, armCoreOnlyReadinessGate, setCoreOnlyReady, __testOnly_resetCoreOnlyReadiness, type IpcServerHandle } from '../src/core/dashboard-ipc-server.js';
@@ -3154,6 +3154,69 @@ describe('role profile IPC routes', () => {
         effectiveContent: '# Default reviewer\nUse concise bullets.',
         effectiveSource: 'team',
         hasEffectiveRole: true,
+      });
+    } finally {
+      if (prevDataDir === undefined) delete process.env.SESSION_DATA_DIR;
+      else process.env.SESSION_DATA_DIR = prevDataDir;
+      config.session.dataDir = prevConfigDataDir;
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+
+  it('round-trips and deletes the dispatch completion switch per bot + chat', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-role-dispatch-'));
+    const prevDataDir = process.env.SESSION_DATA_DIR;
+    const prevConfigDataDir = config.session.dataDir;
+    try {
+      process.env.SESSION_DATA_DIR = dataDir;
+      config.session.dataDir = dataDir;
+      setLarkAppId('cli_source');
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const base = `http://127.0.0.1:${handle.port}`;
+      const roleUrl = `${base}/api/roles/oc_dispatch`;
+      const metaPath = join(dataDir, 'roles', 'cli_source', 'oc_dispatch.meta.json');
+
+      const initial = await fetch(roleUrl);
+      expect(await initial.json()).toMatchObject({
+        chatId: 'oc_dispatch',
+        dispatchCompletionEnabled: false,
+      });
+
+      const enabled = await fetch(roleUrl, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ content: '# Dispatcher', injectMode: 'once', dispatchCompletionEnabled: true }),
+      });
+      expect(enabled.status).toBe(200);
+      expect(await (await fetch(roleUrl)).json()).toMatchObject({
+        injectMode: 'once',
+        dispatchCompletionEnabled: true,
+      });
+
+      const disabled = await fetch(roleUrl, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ dispatchCompletionEnabled: false }),
+      });
+      expect(disabled.status).toBe(200);
+      expect(await (await fetch(roleUrl)).json()).toMatchObject({
+        injectMode: 'once',
+        dispatchCompletionEnabled: false,
+      });
+
+      await fetch(roleUrl, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ dispatchCompletionEnabled: true }),
+      });
+      expect(existsSync(metaPath)).toBe(true);
+      const deleted = await fetch(roleUrl, { method: 'DELETE' });
+      expect(deleted.status).toBe(200);
+      expect(existsSync(metaPath)).toBe(false);
+      expect(await (await fetch(roleUrl)).json()).toMatchObject({
+        content: null,
+        injectMode: 'every',
+        dispatchCompletionEnabled: false,
       });
     } finally {
       if (prevDataDir === undefined) delete process.env.SESSION_DATA_DIR;
