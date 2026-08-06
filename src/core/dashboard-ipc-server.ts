@@ -1849,6 +1849,7 @@ ipcRoute('POST', '/api/sessions/:sessionId/locate', async (_req, res, params) =>
 export interface ScheduleRow {
   id: string;
   name: string;
+  schedule: string;
   parsed: ParsedSchedule;
   prompt: string;
   workingDir: string;
@@ -1875,6 +1876,7 @@ function composeScheduleRow(t: ScheduledTask): ScheduleRow {
   return {
     id: t.id,
     name: t.name,
+    schedule: t.schedule,
     parsed: t.parsed,
     prompt: t.prompt,
     workingDir: t.workingDir,

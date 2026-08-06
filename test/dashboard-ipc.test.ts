@@ -1652,6 +1652,34 @@ describe('GET /api/schedules', () => {
     const body = await res.json();
     expect(Array.isArray(body.schedules)).toBe(true);
   });
+
+  it('includes raw schedule so the edit form can prefill the schedule field', async () => {
+    setLarkAppId('cli_ipc_test_bot001');
+    const add = scheduler.addTask({
+      name: 'AI 工作环境巡检',
+      schedule: '10 0,12 * * *',
+      prompt: '执行一次巡检',
+      workingDir: '/tmp',
+      chatId: 'oc_schedule',
+      larkAppId: 'cli_ipc_test_bot001',
+      executionPosition: 'topic',
+      rootMessageId: 'om_schedule_root',
+      chatType: 'topic_group',
+    });
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+
+    const res = await fetch(`http://127.0.0.1:${handle.port}/api/schedules`);
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    const row = body.schedules.find((s: any) => s.id === add.id);
+
+    expect(row).toMatchObject({
+      id: add.id,
+      name: 'AI 工作环境巡检',
+      schedule: '10 0,12 * * *',
+      parsed: { display: '10 0,12 * * *' },
+    });
+  });
 });
 
 describe('POST /api/schedules execution position', () => {
