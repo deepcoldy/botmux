@@ -235,6 +235,15 @@ async function dmAdmin(larkAppId: string, adminOpenId: string, content: string, 
  *
  * Returns `true` if scopes were successfully applied (caller should stop),
  * `false` to fall through to the manual DM warning.
+ *
+ * `opts.disableQrLogin` — when the only thing missing is a non-critical scope,
+ *   we still try to grab it (the automation imports the full manifest), but must
+ *   NOT pop a second QR code if the cached session is gone. Passing this makes a
+ *   missing/expired session fail cleanly (reason `invalid_session`) instead of
+ *   prompting a login.
+ * `opts.silent` — suppress the admin success DM (used for the opt-in / optional
+ *   path so a bot that never asked for the feature isn't pinged; the log line is
+ *   enough). Failures are always silent here regardless.
  */
 async function tryAutoFixScopes(
   larkAppId: string,
@@ -242,15 +251,18 @@ async function tryAutoFixScopes(
   brand: Brand,
   missingCritical: { name: string; desc: string }[],
   missingOptional: { name: string; desc: string }[],
+  opts?: { disableQrLogin?: boolean; silent?: boolean },
 ): Promise<boolean> {
   if (brand !== 'feishu') return false;
 
   try {
-    logger.info(`[${larkAppId}] attempting auto-fix for ${missingCritical.length} missing scopes via Open Platform...`);
+    const totalMissing = missingCritical.length + missingOptional.length;
+    logger.info(`[${larkAppId}] attempting auto-fix for ${totalMissing} missing scopes via Open Platform...`);
     const result = await automateOpenPlatformSetup({
       appId: bot.config.larkAppId,
       brand,
       maxWaitMs: 60_000,
+      disableQrLogin: opts?.disableQrLogin,
       onStatus: (msg) => logger.info(`[${larkAppId}] auto-fix: ${msg}`),
       onQrCode: (info) => {
         logger.warn(
@@ -270,27 +282,31 @@ async function tryAutoFixScopes(
         `version ${result.versionId ?? 'n/a'} published, ` +
         `${result.subscribedEventCount} events subscribed`,
       );
+      // opt-in / optional-only path: succeeded silently, no admin DM (a bot that
+      // never enabled the feature must not be pinged just because a non-critical
+      // scope was topped up in the background). The log line above is the record.
+      if (opts?.silent) return true;
       // Notify admin that auto-fix worked — even if im:message was missing before,
       // the newly published version should now have it.
       const adminOpenId = getAdminOpenId(bot);
       if (adminOpenId) {
-        const missingList = missingCritical.map(s => `• ${s.desc} (\`${s.name}\`)`).join('\n');
-        const optionalNote = missingOptional.length > 0
-          ? `\n\n另有 ${missingOptional.length} 项可选权限未开通：${missingOptional.map(s => s.name).join('、')}`
-          : '';
+        const fixedList = [...missingCritical, ...missingOptional];
+        const missingList = fixedList.map(s => `• ${s.desc} (\`${s.name}\`)`).join('\n');
         await dmAdmin(
           larkAppId,
           adminOpenId,
           `✅ botmux 已自动为机器人 "${bot.botName ?? larkAppId}" 修复了缺失的权限：\n\n${missingList}\n\n` +
           `${scopeDetail}，新版本已发布。\n` +
-          `权限变更可能需要 1-2 分钟生效。如仍有问题执行 \`botmux restart\`。${optionalNote}`,
-          `auto-fixed ${missingCritical.length} scopes`,
+          `权限变更可能需要 1-2 分钟生效。如仍有问题执行 \`botmux restart\`。`,
+          `auto-fixed ${fixedList.length} scopes`,
         );
       }
       return true;
     }
 
-    // Auto-fix failed — log reason and fall through to manual DM.
+    // Auto-fix failed — log reason. Critical path falls through to a manual
+    // deep-link DM; the silent optional-scope top-up path does NOT DM (it just
+    // leaves the opt-in scope ungranted), so don't claim a DM fallback there.
     const reasons: Record<string, string> = {
       missing_session: '无可用的 Feishu Web session',
       invalid_session: 'Web session 已失效',
@@ -305,11 +321,12 @@ async function tryAutoFixScopes(
     };
     logger.warn(
       `[${larkAppId}] auto-fix not possible (${result.reason}: ${reasons[result.reason] ?? result.message}). ` +
-      `Falling back to manual deep-link DM.`,
+      (opts?.silent ? 'Leaving opt-in scope ungranted (no DM).' : 'Falling back to manual deep-link DM.'),
     );
     return false;
   } catch (err: any) {
-    logger.warn(`[${larkAppId}] auto-fix error: ${err?.message ?? err} — falling back to manual DM`);
+    logger.warn(`[${larkAppId}] auto-fix error: ${err?.message ?? err}` +
+      (opts?.silent ? ' — leaving opt-in scope ungranted (no DM)' : ' — falling back to manual DM'));
     return false;
   }
 }
@@ -480,6 +497,23 @@ export async function checkRequiredScopes(larkAppId: string): Promise<void> {
     const missingOptional = BOTMUX_REQUIRED_SCOPES.filter(s => !s.critical && !grantedScopes.has(s.name));
 
     if (missingCritical.length === 0) {
+      // All critical scopes present. If an opt-in feature added a non-critical
+      // scope that isn't granted yet, top it up SILENTLY — but only when a cached
+      // Feishu web session already exists (disableQrLogin makes a missing session
+      // fail cleanly with no second QR code and no DM). This makes `botmux restart`
+      // actually pick up newly-declared optional scopes (e.g. the foreign-bot
+      // group-message scope) without the admin having to visit the Open Platform,
+      // while a bot with nothing missing — or no web session — behaves exactly as
+      // before (no API call / no prompt / no nag).
+      if (missingOptional.length > 0 && brand === 'feishu') {
+        const toppedUp = await tryAutoFixScopes(larkAppId, bot, brand, [], missingOptional,
+          { disableQrLogin: true, silent: true });
+        if (toppedUp) {
+          logger.info(`[${larkAppId}] auto-topped-up ${missingOptional.length} optional scope(s): ${missingOptional.map(s => s.name).join('、')}`);
+          return;
+        }
+        logger.debug(`[${larkAppId}] optional scope(s) missing (${missingOptional.map(s => s.name).join('、')}); no cached web session to auto-apply — leaving to opt-in feature owner`);
+      }
       logger.info(`[${larkAppId}] all critical scopes granted (${BOTMUX_REQUIRED_SCOPES.filter(s => s.critical).length} checked)`);
       return;
     }
@@ -2783,8 +2817,98 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
           })).catch(err => logger.error(`Error handling bot message listener event: ${err}`));
           return;
         }
-        // Foreign bot: only route on @mention of us.
-        if (!isBotMentioned(larkAppId, message, undefined)) return;
+        // Foreign bot: only route on @mention of us — with one exception.
+        //
+        // 主动开工 — 场景② (bot sender): 「话题群新话题自动开工」(autoStartOnNewTopic)
+        // 覆盖到「其他机器人开的新话题」。人分支在 3271 对非 @ 的话题群新话题种子做
+        // 同一判定；bot 消息走本分支，若不在这里补一个等价出口，就会在下面这行 return
+        // 掉——所以 bot 开的新话题永远到不了人分支的场景②。判定复用同一个纯函数
+        // shouldAutoStartOnNewTopic（形态门：thread-scope + anchor===本消息 + 无会话
+        // 占用，天然只认「全新话题种子」，不认话题内回复，故不会自我循环——回复锚定在
+        // 话题根 anchor≠messageId），并要求飞书真的把这条非 @ 的 bot 消息推过来
+        //（依赖 im:message.group_msg.include_bot:read scope；缺则事件根本不到，静默降级）。
+        // sender 受授权门约束（与人分支 + 下游 enforceMessageQuotaForCliInput 同源）：
+        // 授权/peer/团队/oncall/开放腿放行的 sender 才自动开工，restricted 下未授权陌生
+        // bot 改发授权卡（详见下方 autoTopic 分支）。
+        //
+        // 收到 im:message.group_msg.include_bot:read 推来的「其他用户/机器人发的群消息」后，
+        // 只有满足形态门才免 @ 自动开工；否则保持原有「未 @ 即忽略」语义。
+        if (!isBotMentioned(larkAppId, message, undefined)) {
+          if (getBot(larkAppId).config.autoStartOnNewTopic === true && chatType === 'group') {
+            const seedDecision = await decideRoutingWithSource(larkAppId, message);
+            // P3 — 镜像人分支「话题群 → 普通群 (reverse conversion)」那道 forceRefresh
+            // 守卫：decideRoutingWithSource 判 topic-chat 种子靠的是**缓存** chat_mode
+            //（5min TTL）。管理员把话题群翻回普通群后缓存可能仍是 'topic'，于是一条本该
+            // 是普通群顶层的 bot 消息被误判成话题种子，起 thread-scope 会话把回复裹进
+            //「其实已是普通群」的新 Lark 话题。无真实 thread_id（= 种子形态，非既有话题内
+            // 回复，权威信号不会 stale）时用 forceRefresh 再确认；飞书现在报 'group' 就当
+            // 它不是话题种子（降级），不自动开工。这道 API 往返只落在「已呈现 topic 种子
+            // 形态的 opt-in 候选」上——与人分支同样的成本取舍（宁可多一次调用，也不用
+            // 一个 5min 错建 session 的窗口换省一次调用）。
+            let seedIsTopicChat = seedDecision.source === 'topic-chat';
+            if (seedIsTopicChat && !message.thread_id) {
+              const freshMode = await getChatMode(larkAppId, chatId, { forceRefresh: true });
+              if (freshMode === 'group') {
+                logger.info(
+                  `[chat-mode-converted] ${chatId.substring(0, 12)} chat_mode flipped 'topic' → 'group'; ` +
+                  `跳过 bot 新话题自动开工 msg=${messageId.substring(0, 12)}`,
+                );
+                seedIsTopicChat = false;
+              }
+            }
+            // 与人分支同源：只有真正的话题群顶层种子（source==='topic-chat' 且经 forceRefresh
+            // 复核仍是话题群）才是自动开工候选；普通群 /t / 新话题模式产生的同形
+            // {thread, anchor=msg} 不算。
+            const seedScope = seedIsTopicChat ? seedDecision.scope : 'chat';
+            const seedAnchor = seedIsTopicChat ? seedDecision.anchor : chatId;
+            const seedOwnsSession = seedScope === 'thread'
+              ? (handlers.isSessionOwner?.(seedAnchor, larkAppId) ?? false)
+              : false;
+            const autoTopic = shouldAutoStartOnNewTopic({
+              enabled: true,
+              scope: seedScope,
+              anchor: seedAnchor,
+              messageId,
+              chatType,
+              ownsSession: seedOwnsSession,
+            });
+            // Sender 授权门（与人分支 + 下游 enforceMessageQuotaForCliInput 一致）：
+            // 自动开工最终仍要经 handleNewTopic 里的 enforceMessageQuotaForCliInput →
+            // evaluateBotTalk 复查，restricted 模式（配了 allowlist）下未授权的陌生 bot
+            // 会在那里被静默 drop、session 根本不建。所以在这里**先判同一个谓词**：
+            //   • allowed → 正常免 @ 自动开工（open 模式 / oncall / 整群授权 / peer /
+            //     团队 bot 等任一放行腿命中，与人/下游同源）。
+            //   • !allowed（restricted 下的陌生 bot）→ 不建 session，改发一次授权申请卡
+            //     给 owner（节流复用 maybeSendGrantRequestCard 内的 isThrottled），让
+            //     owner 决定是否把它加进 allowlist——与人分支 @bot 被挡时的 not_allowed
+            //     体验一致、可发现，而不是静默吞掉。
+            // 只在「真未授权」发卡；已授权但额度耗尽是另一回事（走下游 quota exhausted
+            // 语义），不在这里混。授权卡的申请对象是触发 bot 的 open_id，但审批/操作权限
+            // 仍只归 owner；此刻不建 session，绝不把触发 bot 写成 owner，也不 --mention-back
+            // 回唤它（dispatchHumanMessage 那条才建 session，本分支只发卡后 return）。
+            if (autoTopic) {
+              const seedBotTalk = evaluateBotTalk(larkAppId, chatId, senderOpenId, senderUnionId);
+              if (!seedBotTalk.allowed) {
+                logger.info(
+                  `[auto-start:新话题] ${chatId.substring(0, 12)} 其他机器人开新话题但未授权（restricted）→ 发授权卡不自动开工 ` +
+                  `msg=${messageId.substring(0, 12)} sender=${senderOpenId?.substring(0, 12) ?? '-'}`,
+                );
+                await maybeSendGrantRequestCard(larkAppId, message, chatId, senderOpenId, data)
+                  .catch(err => logger.error(`Error sending grant card for foreign-bot new topic: ${err}`));
+                return;
+              }
+              logger.info(
+                `[auto-start:新话题] ${chatId.substring(0, 12)} 其他机器人开新话题免@自动开工 ` +
+                `msg=${messageId.substring(0, 12)} sender=${senderOpenId?.substring(0, 12) ?? '-'} reason=${seedBotTalk.reason}`,
+              );
+              const seedCtx: RoutingContext = { chatId, messageId, chatType, larkAppId, scope: seedScope, anchor: seedAnchor };
+              await dispatchHumanMessage({ data, ctx: seedCtx, ownsSession: false })
+                .catch(err => logger.error(`Error auto-starting on foreign-bot new topic: ${err}`));
+              return;
+            }
+          }
+          return;
+        }
         const decision = await decideRoutingWithSource(larkAppId, message);
         const ctx = { scope: decision.scope, anchor: decision.anchor };
         // Honor `/t` / `/topic` from bot senders too, aligning with the human
