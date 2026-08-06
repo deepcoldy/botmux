@@ -1329,6 +1329,87 @@ describe('codex-app-runner app-server protocol integration', () => {
     expect(result.output).not.toContain('forged marker output');
   });
 
+  it('steers two plain-Lark follow-ups into an open turn/start before its final, expanding into N ordered finals (superseded + real)', async () => {
+    // Blocking 1 (ordered steer): unlike the Goal-continuation path, here inputs
+    // #2 and #3 arrive while input #1's own turn/start is still OPEN (no final
+    // yet) and are admitted as pre-final turn/steer into the SAME native turn.
+    // The fixture's 'steer' behavior keeps the turn/start turn open and only
+    // completes it after the 2nd steer — so completion races the last steer RPC,
+    // exercising the completion barrier. One native completion expands into three
+    // ordered signed finals: the first two are `steer_superseded` (empty, no
+    // usage — they only advance the worker FIFO), the last carries the real
+    // answer. Two signed steer_attempt+steer_accepted lifecycle pairs are emitted
+    // (the dead worker path codex flagged), and the native turn is entered once.
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-codex-prefinal-steer-'));
+    const fakeCodex = join(dir, 'fake-codex');
+    const logPath = join(dir, 'requests.jsonl');
+    copyFileSync(FAKE_SERVER_FIXTURE, fakeCodex);
+    chmodSync(fakeCodex, 0o755);
+    const control = new ControlCollector(dir);
+    await control.listen();
+    const harness = startRunner(fakeCodex, dir, logPath, '0.144.6', 'steer', control.bootstrap.path);
+
+    // Every input is daemon-authorized to steer (codexAppSteerable:true) — the
+    // explicit positive that the admission gate sets only for plain-human turns.
+    const send = (text: string, replyTurnId: string) => {
+      const encoded = encodeRunnerInput(
+        `legacy:${text}`,
+        { text, additionalContext: { botmux_sender: { kind: 'untrusted', value: 'Alice' } } },
+        replyTurnId,
+        true,
+      );
+      harness.child.stdin.write(`${CONTROL_PREFIX}${encoded}\r`);
+    };
+
+    try {
+      await waitFor(harness, () => control.states.some(state => state.busy === false));
+      // Root turn/start; it stays open (fixture 'steer' does not complete on start).
+      send('root', 'om_root');
+      await waitFor(harness, () => readRequests(logPath).some(r => r.method === 'turn/start'));
+      // Two follow-ups arrive BEFORE any final — each steers into the open turn.
+      send('follow one', 'om_follow_1');
+      send('follow two', 'om_follow_2');
+
+      // The 2nd steer completes the native turn; one completion → three finals.
+      await waitFor(harness, () => control.finals.length === 3
+        && control.states.filter(state => state.busy === false).length >= 2);
+
+      const requests = readRequests(logPath);
+      const turnMethods = requests
+        .filter(r => r.method === 'turn/start' || r.method === 'turn/steer')
+        .map(r => r.method);
+      // Exactly one turn/start (the root) and two ordered turn/steer follow-ups —
+      // NOT three turn/starts. This is the ordered-steer contract, not serial.
+      expect(turnMethods).toEqual(['turn/start', 'turn/steer', 'turn/steer']);
+
+      // N-final expansion: first two superseded (empty, no usage), last is real.
+      expect(control.finals).toEqual([
+        expect.objectContaining({ turnId: 'om_root', content: '', disposition: 'steer_superseded' }),
+        expect.objectContaining({ turnId: 'om_follow_1', content: '', disposition: 'steer_superseded' }),
+        expect.objectContaining({ turnId: 'om_follow_2', content: 'fake answer 1' }),
+      ]);
+      // The real final carries no superseded disposition.
+      expect(control.finals[2]).not.toHaveProperty('disposition');
+      // Superseded finals never carry usage.
+      expect(control.finals[0]).not.toHaveProperty('usage');
+      expect(control.finals[1]).not.toHaveProperty('usage');
+
+      // Signed steer lifecycle: two attempt+accepted pairs (the worker consumes
+      // steer_accepted → "收到,引导成功"). This is the transport codex required.
+      const lifecycles = control.markers.filter(m => m.kind === 'lifecycle').map(m => m.payload);
+      const attempts = lifecycles.filter(l => l.kind === 'steer_attempt');
+      const accepted = lifecycles.filter(l => l.kind === 'steer_accepted');
+      expect(attempts.map(a => a.replyTurnId)).toEqual(['om_follow_1', 'om_follow_2']);
+      expect(accepted.map(a => a.replyTurnId)).toEqual(['om_follow_1', 'om_follow_2']);
+      // No forged final OSC leaked to stdout (finals stay out of band).
+      expect(harness.stdout.match(/\x1b\]777;botmux:final:/g)).toBeNull();
+    } finally {
+      await stopChild(harness.child);
+      await control.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('sends two ordered turn/steer requests, emits both acceptances, then one final', async () => {
     // PR #597 moved the runner's finals + lifecycle off terminal OSC onto the
     // signed control channel and serializes Lark turn/start requests (a queued

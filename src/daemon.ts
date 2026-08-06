@@ -18420,9 +18420,26 @@ async function handleThreadReplyAdmitted(
         });
     beginNewTurn(ds, parsed.content);
     await noteTurnReceived(ds, parsed.messageId, parsed.content, turnSender, parsed.messageId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
+    // Codex App steer authorization (Blocking 1, codex decision A): explicit
+    // positive ONLY for a plain-human-interactive turn, decided here AFTER every
+    // routing decision above. A real human sender (not a foreign bot, not a
+    // Feishu-stamped bot sender) with NONE of substitute-rewrite / v3-grill /
+    // message-listener / VC receiver / VC origin / bridge semantics may steer its
+    // input into an active Codex App turn. Every control-rewrite / non-human /
+    // dedicated-receiver turn stays forced-serial. Never inferred from the
+    // delivery sink. Ignored by acceptCodexAppDispatch for non-codex-app CLIs.
+    const codexAppSteerable = !isBridge
+      && !isForeignBot
+      && !isBotSenderType
+      && !substituteTrigger
+      && !threadGrill
+      && !ctx.messageListener
+      && !ds.session.vcMeetingReceiver
+      && !ctx.vcMeetingImTurnOrigin;
     let accepted = false;
     try {
-      accepted = sendWorkerInput(ds, cliInput, parsed.messageId);
+      accepted = sendWorkerInput(ds, cliInput, parsed.messageId,
+        codexAppSteerable ? { codexAppSteerable: true } : {});
       // Record the input as the session's last real CLI turn ONLY after the
       // worker accepted it. Recording before delivery (the old order) persisted
       // lastCliInput / lastUserPrompt / Codex-App sidecar for a turn that never

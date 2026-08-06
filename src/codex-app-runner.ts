@@ -83,6 +83,49 @@ interface ActiveTurn {
   itemText: Map<string, string>;
   done: Promise<void>;
   resolveDone: () => void;
+  // ─── Blocking 1 ordered-steer driver (codex decision A/B/C) ──────────────
+  // These extend the single-turn model into "one native turn carries an ordered
+  // accepted group". They are optional/defaulted so the existing single-input
+  // start / Goal-continuation paths behave exactly as before until the driver
+  // wires pre-final Lark steer. See drive()/canSteer().
+  /** Lifecycle phase of the active native turn. */
+  phase?: 'starting' | 'open' | 'closing' | 'fenced';
+  /** How the canonical native id was proven (guards premature steer/bind). */
+  identityProof?: 'exact_started' | 'start_response' | 'goal_snapshot';
+  /** Root + only matching-steer-accepted members, in strict inbound order.
+   * The last member's reply id owns the real final; earlier members expand to
+   * `steer_superseded` finals at native completion. */
+  accepted?: Dispatch[];
+  /** Proven canonical native turn id (distinct from the transient nativeTurnId
+   * hint until an exact `turn/started` or start-response binds it). */
+  canonicalNativeTurnId?: string;
+  /** A start-response is outstanding. SEPARATE from steerInFlight: per codex, a
+   * start-response may overlap with a steer once an exact `turn/started` proved
+   * the canonical id. */
+  startResponsePending?: boolean;
+  /** New steer admission is closed (completion seen or a definite rejection). */
+  steeringClosed?: boolean;
+  /** The authoritative terminal `turn/completed` payload, once observed for the
+   * proven canonical id. */
+  terminalCompletion?: JsonObject;
+  /** Completions observed before the canonical id was proven; replayed on bind. */
+  candidateCompletions?: JsonObject[];
+  /** The single in-flight steer RPC (at most one), and the id it targets. */
+  steerInFlight?: { dispatch: Dispatch; expectedTurnId: string };
+  /** The canonical native `turn/completed` has been observed. Distinct from
+   * `completed` (which means the logical group has settled + done resolved): a
+   * completion seen while a steer RPC is still in flight is buffered here as a
+   * barrier and only settles the group after the steer response resolves. */
+  completionSeen?: boolean;
+}
+
+/** One admitted input tracked inside an ActiveTurn's ordered accepted group. */
+interface Dispatch {
+  input: QueuedInput;
+  replyTurnId?: string;
+  /** The client id actually sent to app-server (legacy inputs may omit it). */
+  clientUserMessageId?: string;
+  receivedAtMs: number;
 }
 
 interface QueuedInput {
@@ -94,6 +137,16 @@ interface QueuedInput {
    * clientUserMessageId (when structured is supported) and onto the final
    * marker as both PR's `turnId` and master's `replyTurnId`. */
   replyTurnId?: string;
+  /** Explicit positive (from the daemon admission gate, decision A): this
+   * plain-human-interactive input may `turn/steer` into an already-active Codex
+   * App turn. Missing/false ⇒ forced serial (starts its own turn only when the
+   * runner is idle). Never inferred here — copied verbatim from the decoded
+   * control line's `codexAppSteerable`. */
+  codexAppSteerable?: true;
+  /** Wall-clock at which the runner dequeued this control line. Used as the real
+   * final's startedAtMs for a multi-member steered group so an early
+   * botmux-send marker cannot suppress the true answer. */
+  receivedAtMs?: number;
 }
 
 const output = new RunnerControlWriter();
@@ -517,21 +570,31 @@ function emitMarker(kind: string, payload: JsonObject): void {
   flushControlQueue();
 }
 
-function emitFinalMarker(payload: JsonObject): void {
+function emitFinalMarker(
+  payload: JsonObject,
+  opts: { disposition?: 'steer_superseded'; drainUsage?: boolean } = {},
+): void {
+  // Usage draining is caller-controlled so an N-final expansion of one native
+  // completion does not let the FIRST (superseded) transaction steal the usage:
+  // only the LAST real final drains the accumulator. Default (no opts) drains,
+  // preserving every existing single-final caller. A `steer_superseded`
+  // transaction never carries usage and never drains.
+  const superseded = opts.disposition === 'steer_superseded';
+  const drainUsage = superseded ? false : (opts.drainUsage ?? true);
   // Attach this turn's token usage (if the accumulator saw coherent totals) and
   // drain its accumulator. Keyed by the codex native turn id; omitted when no
   // usage was observed / a protocol anomaly was detected — never zeros.
   const usageKey = typeof payload.nativeTurnId === 'string' && payload.nativeTurnId.length > 0
     ? payload.nativeTurnId
     : undefined;
-  const acc = usageKey ? usageAccumulators.get(usageKey) : undefined;
+  const acc = usageKey && drainUsage ? usageAccumulators.get(usageKey) : undefined;
   const usage = acc?.result() ?? undefined;
   if (acc?.warning && !usage) {
     // Surface a protocol anomaly rather than silently omitting usage — a
     // regression/negative-baseline should be visible in the runner log.
     writeLine(`[codex-app] token usage dropped for turn ${usageKey ?? '?'}: ${acc.warning}`);
   }
-  if (usageKey) usageAccumulators.delete(usageKey);
+  if (usageKey && drainUsage) usageAccumulators.delete(usageKey);
 
   // Dual-name the turn identity so both protocol vocabularies ride the same
   // signed final transaction:
@@ -566,6 +629,7 @@ function emitFinalMarker(payload: JsonObject): void {
     appTurnId,
     ...(replyTurnId ? { replyTurnId } : {}),
     ...(usage ? { usage } : {}),
+    ...(superseded ? { disposition: 'steer_superseded' } : {}),
   });
   for (let index = 0; index < total; index++) {
     const start = index * CODEX_APP_CONTROL_FINAL_CHUNK_BYTES;
@@ -593,6 +657,13 @@ let nativeActiveTurnId: string | undefined;
 const queue: QueuedInput[] = [];
 let inputBuffer = '';
 let processing = false;
+/** At most one pre-final Lark `turn/steer` admission runs at a time (checkpoint:
+ * startResponsePending ≠ steerInFlight — this guards ONLY the steer RPC). */
+let steerAdmitting = false;
+/** An unknown turn/start|turn/steer outcome fenced the generation. Stops all
+ * dequeue / steer / final / idle-state emission until the process is torn down
+ * (the worker's authenticated `fatal` lifecycle fails the control generation). */
+let generationFenced = false;
 let runnerReady = false;
 let cleanInputUnsupported = false;
 let codexVersionChecked = false;
@@ -678,6 +749,7 @@ function makeTurn(clientUserMessageId: string | undefined, requestKind: 'start' 
     finalText: '',
     allAgentText: '',
     itemText: new Map(),
+    phase: 'starting',
     done,
     resolveDone,
   };
@@ -941,6 +1013,23 @@ function handleNotification(msg: JsonObject, replayedAfterResponse = false): voi
       return;
     }
     if (turn.nativeTurnId && completedId === turn.nativeTurnId) {
+      // Blocking 1 completion barrier: a steerable group closes steering the
+      // instant its canonical completion is seen. If a steer RPC is still
+      // racing, buffer the completion and let the steer continuation settle it
+      // (it appends the accepted member first, then finds completionSeen). A
+      // non-steerable turn (every existing path: single start, Goal steer)
+      // falls through to the unchanged exact/reconcile logic below.
+      if (turn.accepted?.[0]?.input.codexAppSteerable === true) {
+        turn.completionSeen = true;
+        turn.steeringClosed = true;
+        turn.terminalCompletion = nativeTurn;
+        if (turn.steerInFlight) {
+          emitLifecycle({ kind: 'completion_race', appTurnId: completedId, category: 'steer_in_flight' });
+          return;
+        }
+        settleSteeredCompletion(turn, nativeTurn);
+        return;
+      }
       const exact = turn.clientUserMessageId
         ? exactClientItemIndexes(nativeTurn, turn.clientUserMessageId)
         : [];
@@ -1123,6 +1212,233 @@ async function ensureThread(startupDeadlineAtMs?: number): Promise<string> {
   return startedThreadId;
 }
 
+/** Emit a signed lifecycle marker (steer_attempt / steer_accepted / completion_race
+ *  / unknown_outcome / fatal ...). The worker relays steer_accepted back to the
+ *  daemon as a "收到,引导成功" edge and treats fatal as a control-generation kill. */
+function emitLifecycle(event: JsonObject): void {
+  emitMarker('lifecycle', { atMs: Date.now(), ...event });
+}
+
+/**
+ * Fence the runner generation on an UNKNOWN turn/start|turn/steer outcome
+ * (transport / rpc / protocol — never a definite rejection). This is a
+ * control-plane action, not a log line: it emits a signed unknown_outcome + a
+ * signed fatal so the worker calls failCodexAppControlGeneration, and it stops
+ * every subsequent dequeue / steer / final / idle emission. It NEVER emits a
+ * failure final — guessing a final would advance the worker FIFO past a turn
+ * whose true disposition is unknown.
+ */
+function fenceUnknown(
+  operation: 'turn/start' | 'turn/steer',
+  category: 'transport' | 'rpc' | 'protocol',
+  turn: ActiveTurn | null,
+): void {
+  if (generationFenced) return;
+  generationFenced = true;
+  if (turn) turn.phase = 'fenced';
+  emitLifecycle({ kind: 'unknown_outcome', operation, category });
+  emitLifecycle({ kind: 'fatal', operation, category });
+  writeLine(`[codex-app] fenced generation on unknown ${operation} outcome (${category})`);
+}
+
+/**
+ * Whether the runner may steer `head` into the active native turn right now.
+ * Mirrors codex's canSteer contract (Blocking 1): the group must be open, its
+ * canonical native id proven, no steer in flight, and BOTH the root and the
+ * follow-up head explicitly authorized by the daemon admission gate. A Goal
+ * root additionally requires its own matching steer to have been accepted.
+ */
+function canSteer(turn: ActiveTurn, head: QueuedInput): boolean {
+  return !generationFenced
+    && !turn.completed
+    && turn.phase !== 'fenced'
+    && turn.phase !== 'closing'
+    && !turn.steeringClosed
+    && !turn.steerInFlight
+    && !steerAdmitting
+    && turn.canonicalNativeTurnId !== undefined
+    && turn.accepted !== undefined
+    && turn.accepted.length > 0
+    && turn.accepted[0].input.codexAppSteerable === true
+    && head.codexAppSteerable === true;
+}
+
+/**
+ * Settle a steered group's canonical `turn/completed` (decision B: a member's
+ * accepted `turn/steer` — or the root's start — is the group authorization, so
+ * we do NOT run per-clientId exact reconciliation for a grown group). Resolves
+ * `turn.done` exactly once; runTurn then expands the group into N finals.
+ *
+ * When the terminal completion carries `itemsView:'full'`, prefer the answer
+ * rebuilt from the LAST accepted member's user item so a prior member's agent
+ * text is never mistaken for the final reply. Otherwise the streamed finalText
+ * accumulated during the turn is authoritative.
+ */
+function settleSteeredCompletion(turn: ActiveTurn, nativeTurn: JsonObject): void {
+  if (activeTurn !== turn || turn.completed) return;
+  const lastMember = turn.accepted?.at(-1);
+  if (lastMember?.clientUserMessageId && nativeTurn?.itemsView === 'full') {
+    const indexes = exactClientItemIndexes(nativeTurn, lastMember.clientUserMessageId);
+    if (indexes.length === 1) {
+      turn.finalText = rebuildReconciledFinal(nativeTurn, indexes[0]);
+      turn.allAgentText = '';
+    }
+  }
+  turn.terminalCompletion = nativeTurn;
+  if (typeof nativeTurn?.id === 'string' && nativeActiveTurnId === nativeTurn.id) {
+    nativeActiveTurnId = undefined;
+  }
+  turn.completed = true;
+  turn.phase = 'closing';
+  emitTurnActivity(turn, 'completed', true);
+  turn.resolveDone();
+}
+
+/**
+ * Opportunistically admit the queue head as a pre-final `turn/steer` into the
+ * active steerable group (Blocking 1). Kicked from enqueueLine, from runTurn
+ * once the root's canonical id is proven, and re-kicked after each success to
+ * chain successive follow-ups. At most one steer RPC runs at a time
+ * (steerAdmitting + steerInFlight). The queue head is shifted ONLY after the
+ * steer is accepted; a definite rejection closes steering; an unknown outcome
+ * fences the generation (never falls back to a fresh start that would reorder).
+ */
+async function tryAdmitSteer(): Promise<void> {
+  const turn = activeTurn;
+  if (!turn) return;
+  const head = queue[0];
+  if (!head || !canSteer(turn, head)) return;
+  steerAdmitting = true;
+  const expectedTurnId = turn.canonicalNativeTurnId!;
+  const replyTurnId = head.replyTurnId;
+  const version = head.codexAppInput ? detectedCodexVersion() : undefined;
+  const requestClientId = head.codexAppInput
+    && !cleanInputUnsupported
+    && supportsClientUserMessageId(version)
+    && replyTurnId
+    ? replyTurnId
+    : head.codexAppInput?.clientUserMessageId;
+  const dispatch: Dispatch = {
+    input: head,
+    ...(replyTurnId ? { replyTurnId } : {}),
+    ...(requestClientId ? { clientUserMessageId: requestClientId } : {}),
+    receivedAtMs: head.receivedAtMs ?? Date.now(),
+  };
+  turn.steerInFlight = { dispatch, expectedTurnId };
+  const built = buildCodexAppTurnStartParams({
+    threadId: threadId!,
+    cwd: args.cwd,
+    legacyContent: head.content,
+    codexAppInput: head.codexAppInput,
+    codexVersion: version,
+    structuredDisabled: cleanInputUnsupported,
+  });
+  if (built.structured && requestClientId) built.params.clientUserMessageId = requestClientId;
+  // steer_attempt/steer_accepted share appTurnId (the canonical native id) so the
+  // worker can correlate them; replyTurnId selects the follow-up's reply routing.
+  emitLifecycle({
+    kind: 'steer_attempt',
+    appTurnId: expectedTurnId,
+    ...(replyTurnId ? { replyTurnId } : {}),
+  });
+  let result: any;
+  try {
+    const { input, clientUserMessageId, additionalContext } = built.params;
+    result = await client.request('turn/steer', {
+      threadId: threadId!,
+      input,
+      expectedTurnId,
+      ...(clientUserMessageId ? { clientUserMessageId } : {}),
+      ...(additionalContext ? { additionalContext } : {}),
+    });
+  } catch (err) {
+    turn.steerInFlight = undefined;
+    steerAdmitting = false;
+    if (isExplicitExpectedTurnInactive(err)) {
+      // Definite rejection: the head did NOT land. Do not shift/append. Close
+      // steering; once this native turn completes the head starts its own turn.
+      turn.steeringClosed = true;
+      emitLifecycle({ kind: 'steer_rejected_fallback', appTurnId: expectedTurnId, category: 'definite_rejection' });
+      if (turn.completionSeen && turn.terminalCompletion) settleSteeredCompletion(turn, turn.terminalCompletion);
+      return;
+    }
+    // Unknown outcome (transport/rpc/protocol): fence — never guess a final.
+    const category = err instanceof AppServerRpcError ? 'rpc' : 'transport';
+    fenceUnknown('turn/steer', category, turn);
+    if (!turn.completed) { turn.completed = true; turn.resolveDone(); }
+    return;
+  }
+  // Only `result.turnId === expectedTurnId` proves acceptance into this group.
+  if (result?.turnId !== expectedTurnId) {
+    turn.steerInFlight = undefined;
+    steerAdmitting = false;
+    fenceUnknown('turn/steer', 'protocol', turn);
+    if (!turn.completed) { turn.completed = true; turn.resolveDone(); }
+    return;
+  }
+  // Confirm the in-flight head is still the exact queue head, then shift + append.
+  if (queue[0] === head) queue.shift();
+  turn.accepted!.push(dispatch);
+  turn.steerInFlight = undefined;
+  steerAdmitting = false;
+  emitLifecycle({
+    kind: 'steer_accepted',
+    appTurnId: expectedTurnId,
+    ...(replyTurnId ? { replyTurnId } : {}),
+  });
+  // A completion may have arrived while this steer was in flight (barrier): settle
+  // now that the group is final. Otherwise chain the next queued follow-up.
+  if (turn.completionSeen && turn.terminalCompletion) {
+    settleSteeredCompletion(turn, turn.terminalCompletion);
+    return;
+  }
+  void tryAdmitSteer();
+}
+
+/**
+ * Emit the final transaction(s) for a completed native turn, expanding the
+ * ordered `accepted` group into N signed finals (Blocking 1, decision A/B/C).
+ *
+ * - N === 1 (every existing path: single start, Goal-steer root, legacy): emits
+ *   exactly one final, byte-identical to the pre-driver single-final contract.
+ * - N > 1 (a plain-Lark root that absorbed pre-final `turn/steer` follow-ups):
+ *   the FIRST N−1 members get an empty `steer_superseded` final (no content, no
+ *   usage, not delivered — only advances the worker FIFO); the LAST member owns
+ *   the real model answer + usage. The real final's startedAtMs is the last
+ *   accepted dispatch's receivedAtMs so an early botmux-send marker from before
+ *   the follow-up arrived cannot suppress the true answer.
+ *
+ * A fenced turn (unknown outcome) emits ZERO finals — the signed fatal lifecycle
+ * already tore the generation down; guessing a final would advance the FIFO.
+ */
+function finalizeAcceptedGroup(turn: ActiveTurn): void {
+  if (turn.phase === 'fenced') return;
+  const group = turn.accepted && turn.accepted.length > 0
+    ? turn.accepted
+    : [{ input: { content: '' }, receivedAtMs: turn.startedAtMs } as Dispatch];
+  const finalText = (turn.finalText || turn.allAgentText).trim();
+  const completedAtMs = Date.now();
+  const lastIndex = group.length - 1;
+  for (let index = 0; index < group.length; index++) {
+    const dispatch = group[index];
+    const isReal = index === lastIndex;
+    const replyTurnId = dispatch.replyTurnId;
+    emitFinalMarker({
+      ...(replyTurnId ? { turnId: replyTurnId } : {}),
+      ...(turn.nativeTurnId ? { nativeTurnId: turn.nativeTurnId } : {}),
+      content: isReal ? finalText : '',
+      // The real answer's clock starts at the LAST accepted dispatch so a
+      // botmux-send marker emitted before the follow-up landed cannot race
+      // ahead and suppress it. A single-member group keeps the turn's own
+      // startedAtMs (byte-identical to the pre-driver contract).
+      startedAtMs: isReal
+        ? (group.length > 1 ? dispatch.receivedAtMs : turn.startedAtMs)
+        : turn.startedAtMs,
+      completedAtMs,
+    }, isReal ? {} : { disposition: 'steer_superseded' });
+  }
+}
+
 async function runTurn(message: QueuedInput): Promise<void> {
   const tid = await ensureThread();
   // The botmux/Lark reply identity is the top-level replyTurnId (which already
@@ -1142,6 +1458,15 @@ async function runTurn(message: QueuedInput): Promise<void> {
     : message.codexAppInput?.clientUserMessageId;
   let expectedSteerTurnId = nativeActiveTurnId;
   const turn = makeTurn(requestClientId, expectedSteerTurnId ? 'steer' : 'start');
+  // The root dispatch is accepted[0]. Follow-up Lark inputs that win a pre-final
+  // turn/steer are appended by the steer-admission path; at native completion
+  // finalizeAcceptedGroup expands the group into N signed finals.
+  turn.accepted = [{
+    input: message,
+    ...(replyTurnId ? { replyTurnId } : {}),
+    ...(requestClientId ? { clientUserMessageId: requestClientId } : {}),
+    receivedAtMs: message.receivedAtMs ?? turn.startedAtMs,
+  }];
   if (expectedSteerTurnId) {
     turn.nativeTurnId = expectedSteerTurnId;
     turn.serverStarted = true;
@@ -1239,6 +1564,22 @@ async function runTurn(message: QueuedInput): Promise<void> {
   }
   turn.nativeTurnId = result.turn?.id ?? result.turnId ?? turn.nativeTurnId;
   turn.requestAccepted = true;
+  // The root request is accepted → its native id is now canonical for the group,
+  // so pre-final follow-up steers may bind against it (canSteer). A plain start
+  // is proven by its start-response; a Goal-continuation root is proven by the
+  // accepted matching steer (identityProof left as the Goal snapshot). An exact
+  // `turn/started` may already have upgraded identityProof to 'exact_started'.
+  if (!turn.completed && turn.nativeTurnId) {
+    turn.canonicalNativeTurnId = turn.nativeTurnId;
+    if (!turn.identityProof) {
+      turn.identityProof = turn.requestKind === 'steer' ? 'goal_snapshot' : 'start_response';
+    }
+    if (turn.phase === undefined || turn.phase === 'starting') turn.phase = 'open';
+  }
+  // A follow-up may have arrived during the root's turn/start RPC, before the
+  // canonical id was proven (canSteer refused it then). Now that the group is
+  // open, kick admission so it steers instead of waiting for the next enqueue.
+  void tryAdmitSteer();
   // A response may arrive after its turn completed or after a Goal
   // continuation B already started. Never resurrect the completed lifecycle,
   // and never let late response A overwrite the newer global lifecycle. If A
@@ -1278,23 +1619,14 @@ async function runTurn(message: QueuedInput): Promise<void> {
   }
   await turn.done;
 
-  const finalText = (turn.finalText || turn.allAgentText).trim();
-  const completedAtMs = Date.now();
-  // Every dequeued runner input gets one complete final transaction, including
-  // an empty model answer. Without that zero-chunk boundary the worker cannot
-  // advance its attribution FIFO safely before the next queued turn finishes.
-  // clientUserMessageId is the daemon-frozen botmux/Lark turn identity. The
-  // app-server generates a different id for the same logical turn; exposing
-  // that native id as `turnId` breaks daemon wait maps, VC suppression and
-  // reply routing. When no structured sidecar exists, omit turnId so the
-  // worker resolves it from its own FIFO head.
-  emitFinalMarker({
-    ...(replyTurnId ? { turnId: replyTurnId } : {}),
-    ...(turn.nativeTurnId ? { nativeTurnId: turn.nativeTurnId } : {}),
-    content: finalText,
-    startedAtMs: turn.startedAtMs,
-    completedAtMs,
-  });
+  // Expand the ordered accepted group into N signed finals (N===1 for every
+  // pre-driver path — single start, Goal-steer root, legacy — byte-identical to
+  // the old single-final contract). clientUserMessageId is the daemon-frozen
+  // botmux/Lark turn identity; the app-server generates a different native id
+  // for the same logical turn, exposing which as `turnId` would break daemon
+  // wait maps / VC suppression / reply routing. When no structured sidecar
+  // exists, turnId is omitted so the worker resolves it from its own FIFO head.
+  finalizeAcceptedGroup(turn);
   writeLine();
   activeTurn = null;
 }
@@ -1358,7 +1690,23 @@ function enqueueLine(line: string): void {
         const replyTurnId = typeof decoded.replyTurnId === 'string' && decoded.replyTurnId.length > 0
           ? decoded.replyTurnId
           : codexAppInput?.clientUserMessageId;
-        queue.push({ content: decoded.content, codexAppInput, ...(replyTurnId ? { replyTurnId } : {}) });
+        // Explicit positive only: the daemon admission gate (decision A) sets
+        // `true` solely for a plain-human-interactive turn. Any other value is
+        // treated as absent → forced serial, never a silent steer authorization.
+        const codexAppSteerable = decoded.codexAppSteerable === true;
+        queue.push({
+          content: decoded.content,
+          codexAppInput,
+          ...(replyTurnId ? { replyTurnId } : {}),
+          ...(codexAppSteerable ? { codexAppSteerable: true } : {}),
+          receivedAtMs: Date.now(),
+        });
+        // If a steerable group is active, opportunistically steer this head into
+        // it (pre-final). Otherwise fall through to the serial drain, which
+        // starts it as its own turn once the runner is idle. drainQueue's
+        // `await runTurn(root)` keeps the root active until its group settles, so
+        // a head consumed by tryAdmitSteer is never double-processed by drain.
+        void tryAdmitSteer();
         void drainQueue();
       }
     } catch (err: any) {

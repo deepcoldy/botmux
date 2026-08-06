@@ -80,7 +80,14 @@ export function createCodexAppAdapter(pathOverride?: string): CliAdapter {
       // Chunked + throttled stdin injection — a single send-keys of the whole
       // (potentially ~20KB) control line overruns the pane pty input buffer and
       // gets dropped. See runner-input.ts.
-      return writeRunnerInput(pty, '::botmux-codex-app:', content, undefined, context?.turnId);
+      return writeRunnerInput(
+        pty,
+        '::botmux-codex-app:',
+        content,
+        undefined,
+        context?.turnId,
+        context?.codexAppSteerable,
+      );
     },
 
     async writeStructuredInput(pty, content, codexAppInput, context) {
@@ -93,6 +100,7 @@ export function createCodexAppAdapter(pathOverride?: string): CliAdapter {
         content,
         codexAppInput,
         context?.turnId,
+        context?.codexAppSteerable,
       );
     },
 

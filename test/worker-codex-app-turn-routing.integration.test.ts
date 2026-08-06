@@ -300,6 +300,160 @@ describe('Codex App worker queued-turn attribution', () => {
       await stopChild(child);
     }
   }, 25_000);
+
+  // Blocking 2 (codex review 4849144576): the runner aggregates four-bucket
+  // token usage into the signed final marker, but the worker's final_output IPC
+  // dropped it — so the daemon async-trigger sink (worker-pool recordCompleted,
+  // which reads msg.usage) always saw undefined. This is the cross-layer hop
+  // that runner-only and daemon-only tests each miss. Assert the whole chain:
+  // fake app-server tokenUsage → runner signed final → worker final_output.usage.
+  it('forwards the runner signed final four-bucket usage onto the final_output IPC', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-worker-codex-usage-'));
+    tempDirs.add(root);
+    const fakeCodex = join(root, 'fake-codex');
+    const requestLog = join(root, 'requests.jsonl');
+    copyFileSync(resolve('test/fixtures/fake-codex-app-server.mjs'), fakeCodex);
+    chmodSync(fakeCodex, 0o755);
+
+    const sessionId = `codex-usage-${process.pid}-${Date.now()}`;
+    const logs: string[] = [];
+    const messages: WorkerToDaemon[] = [];
+    const nodeOptions = [process.env.NODE_OPTIONS, '--import=tsx'].filter(Boolean).join(' ');
+    const child = spawn(process.execPath, ['--import', 'tsx', resolve('src/worker.ts')], {
+      cwd: resolve('.'),
+      env: {
+        ...process.env,
+        HOME: root,
+        NODE_ENV: 'test',
+        NODE_OPTIONS: nodeOptions,
+        BOTMUX_TEST_CODEX_APP_RUNNER_PATH: resolve('src/codex-app-runner.ts'),
+        SESSION_DATA_DIR: root,
+        BOTMUX_SESSION_ID: sessionId,
+        LARK_APP_ID: 'app_worker_usage',
+        LARK_APP_SECRET: 'secret',
+        FAKE_CODEX_LOG: requestLog,
+        FAKE_CODEX_VERSION: '0.136.0',
+        FAKE_CODEX_BEHAVIOR: 'success',
+        FAKE_TOKEN_USAGE: '1',
+      },
+      stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+    });
+    children.add(child);
+    child.stdout?.on('data', chunk => logs.push(chunk.toString()));
+    child.stderr?.on('data', chunk => logs.push(chunk.toString()));
+    child.on('message', raw => {
+      const message = raw as WorkerToDaemon;
+      messages.push(message);
+      if (message.type === 'error') logs.push(`[worker-ipc-error] ${message.message}\n`);
+    });
+
+    const init: DaemonToWorker = {
+      type: 'init',
+      sessionId,
+      chatId: 'oc_worker_usage',
+      rootMessageId: 'om_worker_usage_root',
+      workingDir: resolve('.'),
+      cliId: 'codex-app',
+      cliPathOverride: fakeCodex,
+      backendType: 'pty',
+      prompt: '<user_message>usage turn</user_message>',
+      promptCodexAppInput: { text: 'usage turn', clientUserMessageId: 'om_worker_usage_1' },
+      larkAppId: 'app_worker_usage',
+      larkAppSecret: 'secret',
+      turnId: 'om_worker_usage_1',
+    };
+
+    try {
+      child.send(init);
+      await waitFor(child, logs, () => messages.some(message => message.type === 'final_output'));
+      const final = messages.find(
+        (message): message is Extract<WorkerToDaemon, { type: 'final_output' }> => message.type === 'final_output',
+      );
+      // fixture total inputTokens=100, cachedInputTokens=40, outputTokens=30,
+      // cacheWriteInputTokens=0 → runner four buckets: fresh input 60, output 30,
+      // cacheRead 40, cacheCreate 0. The worker MUST forward this verbatim.
+      expect(final?.usage).toEqual({
+        inputTokens: 60,
+        outputTokens: 30,
+        cacheReadTokens: 40,
+        cacheCreateTokens: 0,
+      });
+    } finally {
+      await stopChild(child);
+    }
+  }, 25_000);
+
+  // Blocking 2 companion: a malformed/poisoned tokenUsage packet must leave the
+  // final_output usage absent (normalizeFinalUsage drops non-integer/negative),
+  // never forwarding a partial/garbage count the daemon would persist.
+  it('omits final_output usage when the runner saw a poisoned tokenUsage packet', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-worker-codex-usage-poison-'));
+    tempDirs.add(root);
+    const fakeCodex = join(root, 'fake-codex');
+    const requestLog = join(root, 'requests.jsonl');
+    copyFileSync(resolve('test/fixtures/fake-codex-app-server.mjs'), fakeCodex);
+    chmodSync(fakeCodex, 0o755);
+
+    const sessionId = `codex-usage-poison-${process.pid}-${Date.now()}`;
+    const logs: string[] = [];
+    const messages: WorkerToDaemon[] = [];
+    const nodeOptions = [process.env.NODE_OPTIONS, '--import=tsx'].filter(Boolean).join(' ');
+    const child = spawn(process.execPath, ['--import', 'tsx', resolve('src/worker.ts')], {
+      cwd: resolve('.'),
+      env: {
+        ...process.env,
+        HOME: root,
+        NODE_ENV: 'test',
+        NODE_OPTIONS: nodeOptions,
+        BOTMUX_TEST_CODEX_APP_RUNNER_PATH: resolve('src/codex-app-runner.ts'),
+        SESSION_DATA_DIR: root,
+        BOTMUX_SESSION_ID: sessionId,
+        LARK_APP_ID: 'app_worker_usage',
+        LARK_APP_SECRET: 'secret',
+        FAKE_CODEX_LOG: requestLog,
+        FAKE_CODEX_VERSION: '0.136.0',
+        FAKE_CODEX_BEHAVIOR: 'success',
+        FAKE_TOKEN_USAGE_POISON: '1',
+      },
+      stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+    });
+    children.add(child);
+    child.stdout?.on('data', chunk => logs.push(chunk.toString()));
+    child.stderr?.on('data', chunk => logs.push(chunk.toString()));
+    child.on('message', raw => {
+      const message = raw as WorkerToDaemon;
+      messages.push(message);
+      if (message.type === 'error') logs.push(`[worker-ipc-error] ${message.message}\n`);
+    });
+
+    const init: DaemonToWorker = {
+      type: 'init',
+      sessionId,
+      chatId: 'oc_worker_usage',
+      rootMessageId: 'om_worker_usage_root',
+      workingDir: resolve('.'),
+      cliId: 'codex-app',
+      cliPathOverride: fakeCodex,
+      backendType: 'pty',
+      prompt: '<user_message>usage poison turn</user_message>',
+      promptCodexAppInput: { text: 'usage poison turn', clientUserMessageId: 'om_worker_usage_p1' },
+      larkAppId: 'app_worker_usage',
+      larkAppSecret: 'secret',
+      turnId: 'om_worker_usage_p1',
+    };
+
+    try {
+      child.send(init);
+      await waitFor(child, logs, () => messages.some(message => message.type === 'final_output'));
+      const final = messages.find(
+        (message): message is Extract<WorkerToDaemon, { type: 'final_output' }> => message.type === 'final_output',
+      );
+      expect(final).toBeDefined();
+      expect(final?.usage).toBeUndefined();
+    } finally {
+      await stopChild(child);
+    }
+  }, 25_000);
 });
 
 describe('Codex App worker replacement durable handoff', () => {

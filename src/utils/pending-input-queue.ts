@@ -10,6 +10,9 @@ export interface PendingCliInput {
   replyTurnId?: string;
   dispatchAttempt?: number;
   codexAppDispatchId?: string;
+  /** Explicit positive steer authorization copied from the daemon ledger entry
+   * (plain-human-interactive turns only). Missing/false ⇒ forced serial. */
+  codexAppSteerable?: true;
   queuedActivationToken?: string;
   vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin;
   codexAppInput?: CodexAppTurnInput;

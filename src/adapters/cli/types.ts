@@ -57,6 +57,8 @@ export type RunnerSubmissionDisposition =
  * keep protocol ids separate from reply-routing ids. */
 export interface WriteInputContext {
   turnId?: string;
+  /** codex-app only: this turn is authorized to steer into an active turn. */
+  codexAppSteerable?: true;
 }
 
 /** A session discovered on disk that botmux can resume (import) into a topic —

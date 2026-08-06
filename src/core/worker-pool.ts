@@ -3794,6 +3794,7 @@ function acceptCodexAppDispatch(
     replyTargetSenderOpenId?: string;
     replyTargetSenderIsBot?: boolean;
     queuedActivationToken?: string;
+    codexAppSteerable?: true;
   },
   turnId: string | undefined,
   dispatchAttempt: number | undefined,
@@ -3823,6 +3824,7 @@ function acceptCodexAppDispatch(
         ? { replyTargetSenderIsBot: payload.replyTargetSenderIsBot }
         : {}),
       deliverySink: codexAppDeliverySinkForTurn(ds, turnId, dispatchAttempt),
+      ...(payload.codexAppSteerable ? { codexAppSteerable: true } : {}),
       ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
       content: payload.content,
       ...(payload.codexAppInput ? { codexAppInput: payload.codexAppInput } : {}),
@@ -4086,6 +4088,10 @@ export function sendWorkerInput(
   turnId?: string,
   opts: {
     dispatchAttempt?: number;
+    /** Explicit positive steer authorization (plain-human-interactive only).
+     * Persisted on the accepted ledger entry and forwarded to the worker so the
+     * serial runner may steer this turn into an active one. */
+    codexAppSteerable?: true;
   } = {},
 ): boolean {
   const transferGate = transferInputGates.get(ds);
@@ -4171,6 +4177,7 @@ export function sendWorkerInput(
       ...(replyContext.replyTargetSenderIsBot !== undefined
         ? { replyTargetSenderIsBot: replyContext.replyTargetSenderIsBot }
         : {}),
+      ...(opts.codexAppSteerable ? { codexAppSteerable: true } : {}),
     },
     effectiveTurnId,
     opts.dispatchAttempt,
@@ -4189,6 +4196,7 @@ export function sendWorkerInput(
     ...(replyTurnId ? { replyTurnId } : {}),
     ...(opts.dispatchAttempt !== undefined ? { dispatchAttempt: opts.dispatchAttempt } : {}),
     ...(codexAppDispatchId ? { codexAppDispatchId } : {}),
+    ...(opts.codexAppSteerable ? { codexAppSteerable: true } : {}),
     ...(vcMeetingImTurnOrigin
       ? { vcMeetingImTurnOrigin }
       : {}),

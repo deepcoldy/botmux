@@ -290,6 +290,7 @@ import { resolveCodexAppFinalTurnIdentity } from './adapters/cli/codex-app-turn.
 import { RunnerControlDecoder } from './adapters/cli/runner-control-channel.js';
 import {
   normalizeCodexAppLifecycleEvent,
+  normalizeFinalUsage,
 } from './services/codex-app-runner-protocol.js';
 import {
   hasMatchingManagedOriginCapability,
@@ -6646,6 +6647,11 @@ async function handleTrustedCodexAppMarker(
 
   if (kind === 'final' && typeof payload.content === 'string') {
     const finalContent = payload.content;
+    // Forward the runner's four-bucket token usage on the final_output IPC so
+    // the daemon's async-trigger sink (worker-pool recordCompleted) can persist
+    // it. normalizeFinalUsage validates non-negative integers and drops a
+    // malformed/partial packet — never let a compromised runner poison usage.
+    const finalUsage = normalizeFinalUsage(payload.usage);
     const startedAtMs = typeof payload.startedAtMs === 'number' && Number.isFinite(payload.startedAtMs)
       ? payload.startedAtMs
       : undefined;
@@ -6754,6 +6760,7 @@ async function handleTrustedCodexAppMarker(
         lastUuid: turnId,
         turnId,
         ...(replyTurnId ? { replyTurnId } : {}),
+        ...(finalUsage ? { usage: finalUsage } : {}),
         ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
         ...(suppressDelivery ? { suppressDelivery: true } : {}),
         codexAppSettlement: {
@@ -6793,6 +6800,7 @@ async function handleTrustedCodexAppMarker(
         content: finalContent,
         lastUuid: turnId,
         turnId,
+        ...(finalUsage ? { usage: finalUsage } : {}),
         ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
       });
       } else if (!finalContent) {
@@ -8172,7 +8180,7 @@ async function flushPending(): Promise<void> {
               adapterInputHandle(targetBackend),
               msg,
               item.codexAppInput!,
-              { turnId: item.turnId },
+              { turnId: item.turnId, ...(item.codexAppSteerable ? { codexAppSteerable: true } : {}) },
             ),
             settleVerifiableSubmissionForJournal,
             prepareNormalWrite,
@@ -8188,7 +8196,7 @@ async function flushPending(): Promise<void> {
             () => targetAdapter.writeInput(
               adapterInputHandle(targetBackend),
               msg,
-              { turnId: item.turnId },
+              { turnId: item.turnId, ...(item.codexAppSteerable ? { codexAppSteerable: true } : {}) },
             ),
             settleVerifiableSubmissionForJournal,
             prepareNormalWrite,
@@ -8458,6 +8466,7 @@ function sendToPty(
     codexAppInput?: CodexAppTurnInput;
     dispatchAttempt?: number;
     codexAppDispatchId?: string;
+    codexAppSteerable?: true;
     queuedActivationToken?: string;
     replyTurnId?: string;
     vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin;
@@ -8469,6 +8478,7 @@ function sendToPty(
     turnId,
     ...(opts.replyTurnId ? { replyTurnId: opts.replyTurnId } : {}),
     ...(opts.codexAppDispatchId ? { codexAppDispatchId: opts.codexAppDispatchId } : {}),
+    ...(opts.codexAppSteerable ? { codexAppSteerable: true } : {}),
     ...(opts.queuedActivationToken ? { queuedActivationToken: opts.queuedActivationToken } : {}),
     ...(opts.codexAppInput ? { codexAppInput: opts.codexAppInput } : {}),
     ...(opts.dispatchAttempt !== undefined ? { dispatchAttempt: opts.dispatchAttempt } : {}),
@@ -13378,6 +13388,9 @@ process.on('message', async (raw: unknown) => {
             replyTurnId: entry.replyTurnId,
             dispatchAttempt: entry.dispatchAttempt,
             codexAppDispatchId: entry.dispatchId,
+            // COPY the frozen steer authorization from the ledger entry; never
+            // recompute it on recovery (codex decision A).
+            ...(entry.codexAppSteerable ? { codexAppSteerable: true as const } : {}),
             queuedActivationToken: entry.queuedActivationToken
               ?? (recoveredAcceptedEntries.length === 1
                 ? msg.queuedActivationToken
@@ -13755,6 +13768,7 @@ process.on('message', async (raw: unknown) => {
           codexAppInput,
           dispatchAttempt: msg.dispatchAttempt,
           codexAppDispatchId: msg.codexAppDispatchId,
+          ...(msg.codexAppSteerable ? { codexAppSteerable: true } : {}),
           queuedActivationToken: msg.queuedActivationToken,
           replyTurnId: msg.replyTurnId,
           vcMeetingImTurnOrigin: msg.vcMeetingImTurnOrigin,

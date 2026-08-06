@@ -10,6 +10,10 @@ export interface CodexAppRunnerInput {
   codexAppInput?: CodexAppTurnInput;
   /** Immutable botmux/Lark message id used only for reply routing. */
   replyTurnId?: string;
+  /** Explicit positive: this plain-human-interactive turn may `turn/steer` into
+   * an already-active Codex App turn. Missing/false ⇒ forced serial (start its
+   * own turn only when the runner is idle). */
+  codexAppSteerable?: true;
 }
 
 export interface CodexAppFinalMarker {
@@ -120,9 +124,15 @@ export function decodeCodexAppRunnerInput(line: string): CodexAppRunnerInput | u
   if (!isRecord(value) || value.type !== 'message' || typeof value.content !== 'string') {
     return undefined;
   }
-  const allowedKeys = new Set(['type', 'content', 'codexAppInput', 'replyTurnId']);
+  const allowedKeys = new Set(['type', 'content', 'codexAppInput', 'replyTurnId', 'codexAppSteerable']);
   if (Object.keys(value).some(key => !allowedKeys.has(key))) return undefined;
   if (value.replyTurnId !== undefined && optionalLifecycleId(value.replyTurnId) === undefined) {
+    return undefined;
+  }
+  // Explicit positive only: the wire carries `true` or omits the field. Any
+  // other value is a malformed control line and rejects the whole input rather
+  // than silently downgrading a steer authorization.
+  if (value.codexAppSteerable !== undefined && value.codexAppSteerable !== true) {
     return undefined;
   }
   if (value.codexAppInput !== undefined && !isCodexAppTurnInput(value.codexAppInput)) {
@@ -139,6 +149,7 @@ export function decodeCodexAppRunnerInput(line: string): CodexAppRunnerInput | u
     content: value.content,
     ...(codexAppInput ? { codexAppInput } : {}),
     ...(replyTurnId ? { replyTurnId } : {}),
+    ...(value.codexAppSteerable === true ? { codexAppSteerable: true } : {}),
   };
 }
 
@@ -158,7 +169,7 @@ export function normalizeAppRunnerFinalMarker(payload: unknown): CodexAppFinalMa
 /** Accept the four-bucket usage only when every field is a non-negative integer
  *  (a token count), else drop it (daemon omits usage rather than persisting a
  *  negative/fractional/partial value that a compromised or buggy runner sent). */
-function normalizeFinalUsage(raw: unknown): CodexAppFinalMarker['usage'] | undefined {
+export function normalizeFinalUsage(raw: unknown): CodexAppFinalMarker['usage'] | undefined {
   if (!isRecord(raw)) return undefined;
   const keys = ['inputTokens', 'outputTokens', 'cacheReadTokens', 'cacheCreateTokens'] as const;
   const out = {} as NonNullable<CodexAppFinalMarker['usage']>;
