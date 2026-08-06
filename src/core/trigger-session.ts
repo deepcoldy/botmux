@@ -605,14 +605,19 @@ export async function triggerSessionTurn(
   // changes the model of a Claude/Gemini/CoCo bot, and a fold-in to an existing
   // worker never reaches here. reasoningEffort is codex-only regardless (other
   // adapters ignore it); model is gated here so it can't leak to non-codex CLIs.
+  //
+  // The model override lands on the in-memory DaemonSession below, NOT on the
+  // persisted session record: the documented semantics are per-trigger, and a
+  // persisted copy used to survive every later resume and outrank the bot's
+  // configured model forever (see sessionAgentConfig).
   const isCodexFamily = bot.config.cliId === 'codex' || bot.config.cliId === 'codex-app';
-  if (isCodexFamily) {
-    if (typeof req.options?.model === 'string' && req.options.model.trim()) {
-      session.model = req.options.model.trim();
-    }
-    if (req.options?.reasoningEffort) {
-      session.reasoningEffort = req.options.reasoningEffort;
-    }
+  const triggerModelOverride = isCodexFamily
+    && typeof req.options?.model === 'string'
+    && req.options.model.trim()
+    ? req.options.model.trim()
+    : undefined;
+  if (isCodexFamily && req.options?.reasoningEffort) {
+    session.reasoningEffort = req.options.reasoningEffort;
   }
   sessionStore.updateSession(session);
 
@@ -632,6 +637,7 @@ export async function triggerSessionTurn(
     lastMessageAt: now,
     hasHistory: false,
     workingDir: wd.workingDir,
+    ...(triggerModelOverride ? { spawnModelOverride: triggerModelOverride } : {}),
   };
 
   // 仅默认目录 + auto-worktree：chat 驱动的 webhook 开新会话且落在本 bot 自己的默认目录时，走

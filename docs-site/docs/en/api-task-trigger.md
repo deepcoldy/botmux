@@ -58,7 +58,8 @@ Hard constraints (all validated; violations return 400):
 - **`options.timeoutMs` range `[1000, 300000]`** (1s–5min); out of range returns 400. Defaults to 120000.
 - **`options.model`** / **`options.reasoningEffort`** (optional, **codex / codex-app bots only**): override the model and reasoning level for this trigger.
   - `model`: a codex model id (≤200 chars); `reasoningEffort`: `low` / `medium` / `high` / `xhigh` (passed to codex verbatim — no downgrade).
-  - **Fresh-session only**: frozen only when this trigger **creates a new session**; a fold-in to an existing worker does not rewrite it.
+  - **Fresh-session only**: recorded only when this trigger **creates a new session**; a fold-in to an existing worker does not rewrite it.
+  - `model` is **held in memory, never persisted**: it applies to every launch of that session within this daemon's lifetime and is not restored after a daemon restart — later launches use the bot's configured model. `reasoningEffort` is still persisted with the session.
   - **Scoped to the codex family**: ignored when the target bot is not codex/codex-app (never changes a Claude/Gemini/CoCo bot's model).
 
 ### Sync mode (waitForFinalOutput)

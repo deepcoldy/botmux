@@ -388,13 +388,21 @@ export interface Session {
   cliPathOverride?: string;
   /** Optional wrapper launcher frozen at creation, e.g. `ttadk codex` or `aiden x claude`. */
   wrapperCli?: string;
-  /** Optional model frozen at creation so historical sessions resume with their original model. */
+  /**
+   * @deprecated Historical record only — NO LONGER WRITTEN, and no longer the
+   * launch source of truth. Sessions used to freeze the bot's model here at
+   * creation, which made a long-running session ignore the model configured in
+   * the dashboard forever; the model is now resolved from the live bot config on
+   * every spawn (see resolveSessionLaunchModel). Kept because old rows carry it
+   * and it remains the only sane value for a session pinned to a CLI the bot no
+   * longer uses.
+   */
   model?: string;
   /** Optional codex reasoning effort frozen at creation (per-turn API override).
    *  Only meaningful for codex/codex-app; injected as model_reasoning_effort at spawn. */
   reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh';
   /**
-   * True once `cliId`/`cliPathOverride`/`wrapperCli`/`model` have been frozen for
+   * True once `cliId`/`cliPathOverride`/`wrapperCli` have been frozen for
    * this session (see `sessionAgentConfig`). Gates the one-time freeze so it runs
    * exactly once — on a fresh start, or on the first resume of a session created
    * before these fields existed (back-filling the still-missing ones from the live

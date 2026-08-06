@@ -25,6 +25,7 @@ import {
   markMessageListenerRunPreviewRunning,
 } from '../services/message-listener-run-preview-store.js';
 import { persistStreamCardState, rememberLastCliInput } from './session-manager.js';
+import { resolveSessionLaunchModel } from './session-model.js';
 import { fallbackTurnId, isSubstituteTurn } from './reply-target.js';
 import { updateMessage, deleteMessage, sendEphemeralCard, sendUserMessage, addReaction, removeReaction, getMessageChatId, MessageWithdrawnError } from '../im/lark/client.js';
 import { buildStreamingCard, buildPrivateSnapshotCard, buildSessionCard, buildTuiPromptCard, buildTuiPromptResolvedCard, buildTuiPromptFailedCard, buildRelayedFrozenCard, getCliDisplayName } from '../im/lark/card-builder.js';
@@ -871,12 +872,20 @@ function sessionAgentConfig(
   ds: DaemonSession,
   botCfg: { cliId: CliId; cliRuntime?: CliRuntimeConfig; cliPathOverride?: string; wrapperCli?: string; model?: string },
 ): { cliId: CliId; cliRuntime?: CliRuntimeSnapshot; cliPathOverride?: string; wrapperCli?: string; model?: string; reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' } {
-  // Freeze the agent launch config (cli / runtime / cliPath / wrapper / model) onto the
+  // Freeze the agent launch config (cli / runtime / cliPath / wrapper) onto the
   // session the first time a worker forks, so later bot-level edits never
   // retroactively change a live session — same discipline as `sandbox`.
   //
+  // `model` is deliberately NOT part of the frozen set (see the return below):
+  // swapping the CLI *distribution* under a live conversation is what this
+  // freeze protects against (a `ttadk codex` wrapper degrading to bare `codex`
+  // loses its gateway), whereas the model is an explicit, human-chosen bot
+  // setting whose whole point is to take effect. Freezing it made a long
+  // session ignore the model configured in the dashboard forever, i.e. an
+  // inherited default silently outranked a later explicit choice.
+  //
   // Gated on `agentFrozen`, NOT on `resume`: a session created before these
-  // fields existed has `cliId` stamped historically but no frozen wrapper/model,
+  // fields existed has `cliId` stamped historically but no frozen wrapper,
   // yet it was launching off the live bot config — so its first post-upgrade
   // resume must back-fill the still-missing fields from botCfg to keep launching
   // identically (e.g. a `ttadk codex` wrapper bot must not silently drop to bare
@@ -902,7 +911,6 @@ function sessionAgentConfig(
       ?? runtimePathOverride(runtime)
       ?? botCfg.cliPathOverride;
     ds.session.wrapperCli = ds.session.wrapperCli ?? botCfg.wrapperCli;
-    ds.session.model = ds.session.model ?? botCfg.model;
     ds.session.agentFrozen = true;
     sessionStore.updateSession(ds.session);
   } else {
@@ -938,7 +946,8 @@ function sessionAgentConfig(
     cliRuntime: ds.session.cliRuntime,
     cliPathOverride: ds.session.cliPathOverride,
     wrapperCli: ds.session.wrapperCli,
-    model: ds.session.model,
+    // Resolved at EVERY spawn, resume included — see resolveSessionLaunchModel.
+    model: resolveSessionLaunchModel(ds, botCfg),
     reasoningEffort: ds.session.reasoningEffort,
   };
 }
@@ -3904,12 +3913,15 @@ export async function forkSession(
   //     (bwrap credential seal — bots.json deny / sibling appsecrets /
   //     master.key / network deny — silently dropped). This is a security
   //     escape, so copy the recorded decision and its path lists verbatim.
-  //   • model / reasoningEffort / cliPathOverride / wrapperCli / agentFrozen:
+  //   • reasoningEffort / cliPathOverride / wrapperCli / agentFrozen:
   //     without these the child's sessionAgentConfig() sees !agentFrozen and
   //     re-freezes from the CURRENT bot config, silently dropping any per-session
-  //     /model or /effort override the source carried (reasoningEffort has no
-  //     botCfg fallback at all → drops to undefined). Copying the frozen tuple
-  //     keeps the clone's launch identity == the source's.
+  //     /effort override the source carried (reasoningEffort has no botCfg
+  //     fallback at all → drops to undefined). Copying the frozen tuple keeps
+  //     the clone's launch identity == the source's. `model` is NOT part of that
+  //     tuple any more — it is resolved from the live bot config at every spawn,
+  //     so the clone matches the source automatically (same bot); an explicit
+  //     per-trigger override rides along on the runtime childDs below instead.
   // readIsolation is intentionally NOT copied: it is not a persisted Session
   // field (forkWorker derives it from botCfg at spawn), and the child runs the
   // SAME bot, so it is preserved automatically. persistentBackendTarget is also
@@ -3920,7 +3932,6 @@ export async function forkSession(
   childSession.sandboxHidePaths = ds.session.sandboxHidePaths;
   childSession.sandboxReadonlyPaths = ds.session.sandboxReadonlyPaths;
   childSession.sandboxNetwork = ds.session.sandboxNetwork;
-  childSession.model = ds.session.model;
   childSession.reasoningEffort = ds.session.reasoningEffort;
   childSession.cliPathOverride = ds.session.cliPathOverride;
   childSession.wrapperCli = ds.session.wrapperCli;
@@ -3951,6 +3962,9 @@ export async function forkSession(
     streamCardNonce: undefined,
     displayMode: ds.displayMode ?? 'hidden',
     suppressRecoveryCard: false,
+    // Explicit per-trigger model override travels with the runtime session, so a
+    // fork of a trigger session launches on the same model the caller asked for.
+    ...(ds.spawnModelOverride ? { spawnModelOverride: ds.spawnModelOverride } : {}),
   };
 
   if (activeSessionsRegistry) {

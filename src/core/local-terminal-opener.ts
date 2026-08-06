@@ -2,6 +2,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import { homedir } from 'node:os';
 import { delimiter } from 'node:path';
 import type { DaemonSession } from './types.js';
+import { resolveSessionLaunchModel } from './session-model.js';
 import { getBot } from '../bot-registry.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import type { CliId } from '../adapters/cli/types.js';
@@ -56,7 +57,10 @@ function effectiveCliConfig(ds: DaemonSession): EffectiveCliConfig {
     cliId: (ds.session.cliId ?? ds.initConfig?.cliId ?? botCfg?.cliId ?? 'claude-code') as CliId,
     cliPathOverride: ds.session.cliPathOverride ?? ds.initConfig?.cliPathOverride ?? botCfg?.cliPathOverride,
     wrapperCli: ds.session.wrapperCli ?? ds.initConfig?.wrapperCli ?? botCfg?.wrapperCli,
-    model: ds.session.model ?? ds.initConfig?.model ?? botCfg?.model,
+    // The model is not frozen onto the session: prefer what this session was
+    // actually spawned with (initConfig), then what botmux would launch next
+    // (live bot config — see resolveSessionLaunchModel).
+    model: ds.initConfig?.model ?? resolveSessionLaunchModel(ds, botCfg),
   };
 }
 

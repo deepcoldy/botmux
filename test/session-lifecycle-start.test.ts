@@ -1911,14 +1911,16 @@ describe('forkWorker session agent config freeze', () => {
     }));
   });
 
-  it('records cli wrapper and model on fresh sessions before spawning', () => {
+  it('records cli wrapper on fresh sessions and launches with the live bot model (model NOT frozen)', () => {
     const ds = makeDs();
 
     forkWorker(ds, 'hello', false);
 
     expect(ds.session.cliId).toBe('codex');
     expect(ds.session.wrapperCli).toBe('ttadk codex');
-    expect(ds.session.model).toBe('glm-5.1');
+    // The model is resolved per spawn from the bot config — freezing it here is
+    // what used to make a dashboard model change ineffective on long sessions.
+    expect(ds.session.model).toBeUndefined();
     const worker = forkMock.mock.results.at(-1)!.value;
     expect(worker.send).toHaveBeenCalledWith(expect.objectContaining({
       type: 'init',
@@ -1928,7 +1930,7 @@ describe('forkWorker session agent config freeze', () => {
     }));
   });
 
-  it('fills wrapper and model on fresh sessions that already stamped cliId', () => {
+  it('fills wrapper on fresh sessions that already stamped cliId', () => {
     const ds = makeDs();
     ds.session.cliId = 'codex' as any;
 
@@ -1936,7 +1938,7 @@ describe('forkWorker session agent config freeze', () => {
 
     expect(ds.session.cliId).toBe('codex');
     expect(ds.session.wrapperCli).toBe('ttadk codex');
-    expect(ds.session.model).toBe('glm-5.1');
+    expect(ds.session.model).toBeUndefined();
     const worker = forkMock.mock.results.at(-1)!.value;
     expect(worker.send).toHaveBeenCalledWith(expect.objectContaining({
       type: 'init',
@@ -1946,7 +1948,7 @@ describe('forkWorker session agent config freeze', () => {
     }));
   });
 
-  it('resumes a frozen session with its recorded cli/wrapper/model, ignoring bot config changes', () => {
+  it('resumes a frozen session with its recorded cli/wrapper, and keeps its own model when the bot moved to another CLI', () => {
     const ds = makeDs();
     // A session that was already frozen on a prior spawn: bot config has since
     // been switched (codex/ttadk/glm-5.1), but the frozen session must not budge.
@@ -1962,14 +1964,59 @@ describe('forkWorker session agent config freeze', () => {
       type: 'init',
       cliId: 'claude-code',
       wrapperCli: 'aiden x claude',
+      // The bot now runs codex with `glm-5.1`: that model belongs to ANOTHER
+      // CLI, so this claude-code session keeps the model it was launched with
+      // instead of being handed a foreign model id.
       model: 'opus',
       resume: true,
     }));
   });
 
-  it('back-fills wrapper/model from bot config on the first resume of a legacy (pre-freeze) session', () => {
-    // Created before agentFrozen/wrapperCli/model existed: cliId was stamped
-    // historically, but wrapper/model are absent and it has no freeze marker.
+  // ── THE regression this whole change exists for: a long-lived session whose
+  //    frozen CLI still matches the bot must pick up the model configured in the
+  //    dashboard on its next resume. Restoring the `session.model` freeze (or
+  //    preferring the recorded value over botCfg) flips this red. ──
+  it('resumes a frozen session with the CURRENT bot model, ignoring the model it recorded', () => {
+    const ds = makeDs();
+    ds.session.cliId = 'codex' as any;          // same CLI the bot still runs
+    ds.session.wrapperCli = 'ttadk codex';
+    ds.session.model = 'stale-frozen-model';    // written by an older botmux
+    ds.session.agentFrozen = true;
+
+    forkWorker(ds, '', true);
+
+    const worker = forkMock.mock.results.at(-1)!.value;
+    expect(worker.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'init',
+      cliId: 'codex',
+      model: 'glm-5.1',
+      resume: true,
+    }));
+    // …and the stale record is left untouched (no migration, nothing to undo).
+    expect(ds.session.model).toBe('stale-frozen-model');
+  });
+
+  // ── An EXPLICIT per-trigger override (trigger API options.model) still wins
+  //    over the bot config — that is the only thing that outranks it now. ──
+  it('prefers an explicit per-trigger model override over the bot config', () => {
+    const ds = makeDs();
+    ds.session.cliId = 'codex' as any;
+    ds.session.agentFrozen = true;
+    (ds as any).spawnModelOverride = 'gpt-5.6-terra';
+
+    forkWorker(ds, '', true);
+
+    const worker = forkMock.mock.results.at(-1)!.value;
+    expect(worker.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'init',
+      model: 'gpt-5.6-terra',
+      resume: true,
+    }));
+  });
+
+  it('back-fills the wrapper from bot config on the first resume of a legacy (pre-freeze) session', () => {
+    // Created before agentFrozen/wrapperCli existed: cliId was stamped
+    // historically, but the wrapper is absent and it has no freeze marker.
     // The bot launches via a `ttadk codex` wrapper — the first post-upgrade resume
     // must restore that wrapper, not silently relaunch as bare `codex`.
     const ds = makeDs();
@@ -1978,7 +2025,7 @@ describe('forkWorker session agent config freeze', () => {
     forkWorker(ds, '', true);
 
     expect(ds.session.wrapperCli).toBe('ttadk codex');
-    expect(ds.session.model).toBe('glm-5.1');
+    expect(ds.session.model).toBeUndefined();
     expect(ds.session.agentFrozen).toBe(true);
     const worker = forkMock.mock.results.at(-1)!.value;
     expect(worker.send).toHaveBeenCalledWith(expect.objectContaining({
