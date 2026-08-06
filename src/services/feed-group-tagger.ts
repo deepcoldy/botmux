@@ -298,6 +298,17 @@ async function tagViaFeedGroup(larkAppId: string, chatId: string, ownerOpenId: s
       feed_group_creator: { type: 'normal', name },
     });
     if (!created.ok) {
+      // 230001 + "name already exists"：分组名用户级全局唯一，但操作权限按创建
+      // 应用隔离——本 app 的 list 看不到、也建不了同名组（典型：换 app 重装 /
+      // 曾用别的应用建过同名分组）。指名道姓提示，而不是留一个含糊的 param 错误。
+      if (created.code === 230001 && /already exists/i.test(String(created.msg ?? ''))) {
+        logger.warn(
+          `[session-tag] feed group name "${name}" is taken by ANOTHER app's group (feed groups are `
+          + 'per-user unique by name but per-app operable). Rename sessionGroup.tag.name or delete '
+          + 'the old group from the app that created it.',
+        );
+        return;
+      }
       logger.warn(`[session-tag] feed group create "${name}" failed: code=${created.code} ${created.msg}`);
       if (created.authProblem) void maybeNudgeOwnerForAuth(larkAppId, ownerOpenId, `code_${created.code}`);
       return;
