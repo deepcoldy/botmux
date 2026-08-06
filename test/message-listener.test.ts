@@ -941,4 +941,35 @@ describe('refreshListenerCardTextFromResolved (Bug1: daemon re-extract on resolv
     refreshListenerCardTextFromResolved(match, { message_type: 'interactive', content: '' });
     expect(match.messageText).toBe(before);
   });
+
+  it('end-to-end: a REST-merged button URL reaches the rendered listener prompt', () => {
+    // Ties the two stages the daemon runs back-to-back: refresh the match off the
+    // resolved (merged) card, then render the observed-message prompt. Proves the
+    // recovered button URL actually survives into the string fed to the CLI —
+    // the exact bug's user-visible fix. Mirrors handleNewTopic's ordering
+    // (refreshListenerCardTextFromResolved → renderMessageListenerPrompt).
+    const match = cardMatch({ prompt: '分析命中的告警并按需处理' });
+    // The card content AFTER resolveNonsupportMessage merged the full structured
+    // representation (this is what daemon holds when it re-extracts).
+    refreshListenerCardTextFromResolved(match, {
+      message_type: 'interactive',
+      content: JSON.stringify({
+        header: { title: { content: 'Argos 报警' } },
+        body: { elements: [
+          { tag: 'markdown', content: '规则：成功率 < 90%' },
+          { tag: 'action', actions: [
+            { tag: 'button', text: { tag: 'plain_text', content: '查看详情' }, url: 'https://argos.example.com/alert/42' },
+          ] },
+        ] },
+      }),
+    });
+    const prompt = renderMessageListenerPrompt(match);
+    // Operator instruction is present, and the recovered button link made it into
+    // the untrusted observed_message block the model receives.
+    expect(prompt).toContain('分析命中的告警并按需处理');
+    expect(prompt).toContain('https://argos.example.com/alert/42');
+    expect(prompt).toContain('查看详情');
+    // Title recovered from the merged card is surfaced as an attribute too.
+    expect(prompt).toContain('message_title="Argos 报警"');
+  });
 });
