@@ -105,7 +105,8 @@ async function tenantApi(
     // SDK throws on non-2xx; the Lark error body rides on err.response.data.
     const body = err?.response?.data;
     const code = typeof body?.code === 'number' ? body.code : undefined;
-    const msg = body?.msg ?? err?.message ?? String(err);
+    const detail = typeof body?.error?.message === 'string' ? body.error.message : '';
+    const msg = [body?.msg ?? err?.message ?? String(err), detail].filter(Boolean).join(' | ');
     const missingScope = code === 99991672
       ? /\[([a-z0-9_:.]+)\]/i.exec(String(msg))?.[1]
       : undefined;
@@ -219,7 +220,12 @@ async function callFeedGroupApi(
     const code = typeof json.code === 'number' ? json.code : (res.ok ? 0 : res.status);
     if (code === 0) return { ok: true, code, data: json.data };
     const authProblem = [99991672, 99991679, 20027, 20005].includes(code) || res.status === 401 || res.status === 403;
-    return { ok: false, code, msg: json.msg ?? res.statusText, authProblem };
+    // Feishu puts the actionable detail in error.message (e.g. 230001 is just
+    // "param is invalid" while error.message says "name already exists") —
+    // merge both so callers can branch on the real reason.
+    const detail = typeof json.error?.message === 'string' ? json.error.message : '';
+    const msg = [json.msg ?? res.statusText, detail].filter(Boolean).join(' | ');
+    return { ok: false, code, msg, authProblem };
   } catch (err: any) {
     return { ok: false, msg: err?.message ?? String(err) };
   }
