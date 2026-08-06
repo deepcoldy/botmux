@@ -214,6 +214,8 @@ import {
 } from './core/persistent-backend.js';
 import type { PersistentBackendTarget } from './adapters/backend/types.js';
 import { handleCardAction, runAutoWorktreeCommit } from './im/lark/card-handler.js';
+import { setIssueActivate } from './im/lark/issue-command-deps.js';
+import { startIssueOutboxPump } from './services/issue-outbox-pump.js';
 import type { CardActionData, CardHandlerDeps } from './im/lark/card-handler.js';
 import {
   parseWorkflowGrillTrigger,
@@ -15877,7 +15879,7 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
       // which left a hole once per-chat grants flow through canTalk.
       // canRunDaemonCommand = canOperate ∪（cmd ∈ canTalkDaemonCommands && canTalk）：
       // bot 可通过名单把选定命令（如 /status）降到 canTalk；未配置时与 canOperate 全等。
-      if (!canRunDaemonCommand(larkAppId, chatId, senderOpenId, teamTrustUnionId, cmd, senderUnionId, chatType, isBotSenderType)) {
+      if (!canRunDaemonCommand(larkAppId, chatId, senderOpenId, teamTrustUnionId, cmd, senderUnionId, chatType, isBotSenderType, isBotSenderType)) {
         await sessionReply(anchor, tr('daemon.cmd_allowed_users_only', { cmd }, localeForBot(larkAppId)), 'text', larkAppId);
         return;
       }
@@ -16341,10 +16343,26 @@ async function warnGroupJoinScopeOnce(larkAppId: string, detail: string): Promis
  * in a 话题群 is the known stale-session bug (every reply would wrap into a new
  * topic, and later messages route elsewhere).
  */
-async function handleBotAdded(chatId: string, operatorOpenId: string | undefined, larkAppId: string): Promise<void> {
+async function handleBotAdded(
+  chatId: string,
+  operatorOpenId: string | undefined,
+  larkAppId: string,
+  opts?: {
+    /**
+     * 强制开工并指定首轮 prompt（Issue Board 领取用）。
+     *
+     * 复用这里而不是另写一条建会话路径：下面那套 CAS 注册 + ready 屏障 + 接管检测是
+     * 有状态的竞态协议，平行实现迟早对不齐。带上它就绕过 `autoStartOnGroupJoin` 开关
+     * ——领取是人明确点出来的动作，不该再受"主动开工"这个全局偏好左右。
+     * D7（群里必须有 allowedUser）等其余前置检查一律照常跑。
+     */
+    forcePrompt?: string;
+  },
+): Promise<void> {
   const bot = getBot(larkAppId);
   const botCfg = bot.config;
-  if (botCfg.autoStartOnGroupJoin !== true) {
+  const forced = typeof opts?.forcePrompt === 'string';
+  if (!forced && botCfg.autoStartOnGroupJoin !== true) {
     logger.debug(`[auto-start:入群] ${chatId.substring(0, 12)} 开关未开，忽略`);
     return;
   }
@@ -16393,7 +16411,7 @@ async function handleBotAdded(chatId: string, operatorOpenId: string | undefined
     // conversion to 话题群 would wrongly pick chat-scope and reintroduce the
     // oc_-id-as-reply-target bug (R1). Fetch fresh.
     const mode = await getChatMode(larkAppId, chatId, { forceRefresh: true });
-    const promptBody = resolveGroupJoinPrompt(botCfg.autoStartOnGroupJoinPrompt);
+    const promptBody = opts?.forcePrompt ?? resolveGroupJoinPrompt(botCfg.autoStartOnGroupJoinPrompt);
     const title = (promptBody || tr('daemon.auto_start_join_title', undefined, localeForBot(larkAppId))).substring(0, 50);
     // D8 deliberately keeps the legacy prompt empty when no join prompt is
     // configured, so the agent can inspect group context without receiving a
@@ -17009,7 +17027,7 @@ async function handleThreadReply(
       // (see spawn-path gate above). Denies chat-granted users management commands.
       // canRunDaemonCommand：canTalkDaemonCommands 名单内的命令降到 canTalk，
       // 与 new-topic 路径的统一闸同款（未配置时与 canOperate 全等）。
-      if (!canRunDaemonCommand(larkAppId, effectiveThreadChatId, threadSenderOpenId, threadTeamTrustUnionId, cmd, threadSenderUnionId, ctxChatType, isBotSenderType || isForeignBot)) {
+      if (!canRunDaemonCommand(larkAppId, effectiveThreadChatId, threadSenderOpenId, threadTeamTrustUnionId, cmd, threadSenderUnionId, ctxChatType, isBotSenderType || isForeignBot, isBotSenderType)) {
         sessionReply(anchor, tr('daemon.cmd_allowed_users_only', { cmd }, localeForBot(larkAppId)), 'text', larkAppId);
         return;
       }
@@ -18381,6 +18399,34 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   if (tmuxEnvScrub.failed.length > 0) {
     logger.warn(`[tmux] failed to scrub server-global env key(s): ${tmuxEnvScrub.failed.join(', ')}`);
   }
+
+  // Issue Board 领取的「激活」入口。
+  //
+  // 复用 handleBotAdded 而不是另写建会话逻辑：那套 CAS 注册 + ready 屏障 + 接管检测是有
+  // 状态的竞态协议，平行实现迟早对不齐（普通群 vs 话题群锚点判定错了就是已知的
+  // stale-session bug）。领取侧只需要"强制开工 + 指定首轮 prompt"。
+  //
+  // 注意这里**不发任何 @ 消息**：飞书不会把应用自己发的消息推回给它自己，而领取场景里
+  // 建群者与承接者是同一个 bot，代发那条路也不通。botmux 自己就是 daemon，直接建会话即可。
+  setIssueActivate(async ({ chatId, larkAppId, prompt }) => {
+    await handleBotAdded(chatId, undefined, larkAppId, { forcePrompt: prompt });
+    const anchorKey = groupJoinAnchorByChat.get(`${larkAppId}:${chatId}`);
+    if (!anchorKey || !activeSessions.has(anchorKey)) {
+      // handleBotAdded 内部有多处静默早返回（去重、D7 未过、成员拉取失败…）。
+      // 抛出来让领取流程停在 activate 阶段，而不是谎报成功——群和 binding 都已就绪，
+      // 补一次激活即可。
+      throw new Error('session_not_started');
+    }
+    return anchorKey;
+  });
+
+  // Issue Board 发件箱后台泵 + 启动解卡。
+  //
+  // 各处回写失败时都写着「行留在 outbox 里，pump 会接着重投」——在这之前没有任何东西会
+  // 重投，那句话是假的。后果不是晚同步：in_progress 那次写只要失败一次，5 分钟后平台就把
+  // 任务打成 needs_attention(claim_activate_timeout)，而那是单向门，群里的活直接废掉。
+  // 同时启动时把卡在 inflight 的行退回待发，否则崩溃一次就永久堵死该 binding 的串行队列。
+  startIssueOutboxPump({ dataDir: config.session.dataDir });
 
   // 首次启动时后台尝试安装 CJK 字体（Debian/Ubuntu），避免截图中文显示豆腐块。
   // 不阻塞：首张截图可能仍是豆腐块，装完重启 daemon 即可正常。

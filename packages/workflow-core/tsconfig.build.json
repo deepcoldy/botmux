@@ -1,0 +1,15 @@
+{
+  "extends": "../../tsconfig.json",
+  "compilerOptions": {
+    "composite": false,
+    "declaration": true,
+    "declarationMap": false,
+    "emitDeclarationOnly": true,
+    "noCheck": true,
+    "outDir": "./dist/types",
+    "rootDir": "../..",
+    "sourceMap": false,
+    "tsBuildInfoFile": "./dist/workflow-core.tsbuildinfo"
+  },
+  "include": ["src/**/*.ts"]
+}

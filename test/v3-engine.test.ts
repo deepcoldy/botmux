@@ -13,12 +13,12 @@ import { join } from 'node:path';
 
 import {
   validateDag,
-  loadDag,
   topologicalOrder,
   isGoalNode,
   DagValidationError,
   type V3Dag,
 } from '../src/workflows/v3/dag.js';
+import { loadDag } from '../src/workflows/v3/dag-loader.js';
 import { decideNext, findSinks, type V3RunState, type V3EdgeRunState } from '../src/workflows/v3/orchestrator.js';
 import { appendEvent, readJournal } from '../src/workflows/v3/journal.js';
 import { materialize, writeState, readState } from '../src/workflows/v3/state.js';

@@ -4,8 +4,11 @@ import { resolveCommand } from './registry.js';
 import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
 import type { CliAdapter, PtyHandle } from './types.js';
 import { codexHistoryPath, codexHome, codexSessionsRoot } from '../../services/codex-paths.js';
+import { findCodexRolloutSetByPid } from '../../services/codex-transcript.js';
 import { discoverRolloutSessions } from '../../services/resumable-session-discovery.js';
 import { delay, scaleMs } from '../../utils/timing.js';
+
+const CODEX_ACTIVE_BUSY_PATTERN = /Working[^\r\n]{0,160}esc to interrupt/i;
 
 /** Global submit log — Codex appends one JSON line here on every successful
  *  user submit across all sessions. Far better than the per-session rollout
@@ -35,7 +38,19 @@ function historyTextMatches(actual: string, expected: string): boolean {
   return actual === expected || normaliseHistoryText(actual) === normaliseHistoryText(expected);
 }
 
-function matchHistoryDelta(path: string, fromByte: number, expectedText: string): HistoryMatch {
+/** Optional ownership filter for a history match. `history.jsonl` is a single
+ *  global file shared by every Codex pane under one CODEX_HOME, so a concurrent
+ *  sibling pane submitting identical text can land its line first. When a filter
+ *  is supplied, a same-text line is only accepted if `acceptSid(sid)` is true —
+ *  a foreign sibling's line is skipped and scanning continues for the owned one.
+ *  The filter is re-evaluated on every call (not snapshotted) so a lazily-opened
+ *  owned rollout fd that appears AFTER its history line can still be accepted on
+ *  a later poll. */
+type HistorySidFilter = (cliSessionId: string | undefined) => boolean;
+
+function matchHistoryDelta(
+  path: string, fromByte: number, expectedText: string, acceptSid?: HistorySidFilter,
+): HistoryMatch {
   if (!existsSync(path)) return { found: false };
   let size: number;
   try { size = statSync(path).size; } catch { return { found: false }; }
@@ -54,7 +69,12 @@ function matchHistoryDelta(path: string, fromByte: number, expectedText: string)
     try {
       const parsed = JSON.parse(line);
       if (typeof parsed?.text === 'string' && historyTextMatches(parsed.text, expectedText)) {
-        return { found: true, cliSessionId: readCliSessionId(parsed) };
+        const cliSessionId = readCliSessionId(parsed);
+        // Skip a same-text line owned by a DIFFERENT pane (shared-CODEX_HOME
+        // collision). Keep scanning — the owned line may be later in this delta
+        // or arrive on a subsequent poll.
+        if (acceptSid && !acceptSid(cliSessionId)) continue;
+        return { found: true, cliSessionId };
       }
     } catch {
       // Ignore partial/non-JSON lines. A later poll will see the completed
@@ -65,11 +85,11 @@ function matchHistoryDelta(path: string, fromByte: number, expectedText: string)
 }
 
 async function waitForHistoryAppend(
-  path: string, fromByte: number, expectedText: string, timeoutMs: number,
+  path: string, fromByte: number, expectedText: string, timeoutMs: number, acceptSid?: HistorySidFilter,
 ): Promise<HistoryMatch> {
   const deadline = Date.now() + scaleMs(timeoutMs);
   while (Date.now() < deadline) {
-    const match = matchHistoryDelta(path, fromByte, expectedText);
+    const match = matchHistoryDelta(path, fromByte, expectedText, acceptSid);
     if (match.found) return match;
     await delay(100);
   }
@@ -296,6 +316,31 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
       const historyPath = codexHistoryPath();
       const baseByte = currentFileSize(historyPath);
 
+      // Ownership filter for the shared global history.jsonl. When we know the
+      // Codex PID, only accept a same-text history line whose session id is one
+      // THIS pid currently holds open — so a concurrent sibling pane's identical
+      // text (same CODEX_HOME) can't hand us its foreign session id. Re-fetch the
+      // open-rollout set on EVERY match attempt (not once at baseByte): the owned
+      // rollout fd for a just-started session can appear slightly after its
+      // history line, and a snapshot would permanently reject it. When the pid is
+      // unknown (no PtyHandle.cliPid) or its rollout set can't be read, fall back
+      // to accept-first — preserving the original submit-confirmation semantics
+      // for single-pane sessions and no-pid callers; the worker-side attach gate
+      // is the backstop there.
+      const cliPid = typeof pty.cliPid === 'number' && Number.isInteger(pty.cliPid) && pty.cliPid > 0
+        ? pty.cliPid
+        : undefined;
+      const acceptSid: HistorySidFilter | undefined = cliPid
+        ? (sid) => {
+            if (!sid) return false;
+            const owned = findCodexRolloutSetByPid(cliPid);
+            // set unavailable (enumeration failed) → don't block the submit
+            // confirmation; the worker attach gate re-checks ownership.
+            if (!owned) return true;
+            return owned.has(sid.toLowerCase());
+          }
+        : undefined;
+
       try {
         if (pty.pasteText) {
           // tmux mode: load-buffer + paste-buffer -d -p. The `-p` flag emits
@@ -313,7 +358,7 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
       if (!trySendEnter()) return { submitted: false };
 
       for (let attempt = 0; attempt < 3; attempt++) {
-        const match = await waitForHistoryAppend(historyPath, baseByte, content, 800);
+        const match = await waitForHistoryAppend(historyPath, baseByte, content, 800, acceptSid);
         if (match.found) {
           return match.cliSessionId
             ? { submitted: true, cliSessionId: match.cliSessionId }
@@ -321,7 +366,7 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
         }
         if (!trySendEnter()) return { submitted: false };
       }
-      const match = await waitForHistoryAppend(historyPath, baseByte, content, 800);
+      const match = await waitForHistoryAppend(historyPath, baseByte, content, 800, acceptSid);
       if (match.found) {
         return match.cliSessionId
           ? { submitted: true, cliSessionId: match.cliSessionId }
@@ -332,7 +377,7 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
       // initial prompt) may still append our marker after the retries gave
       // up, and the worker re-scans on a delay before warning the user.
       const recheck = () => {
-        const late = matchHistoryDelta(historyPath, baseByte, content);
+        const late = matchHistoryDelta(historyPath, baseByte, content, acceptSid);
         return late.found
           ? { submitted: true, cliSessionId: late.cliSessionId }
           : false;
@@ -341,6 +386,11 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
     },
 
     completionPattern: undefined,
+    // Codex redraws this status line while a turn is active. Require both text
+    // anchors on one line so transcript prose or an idle composer cannot revive
+    // a completed Lark card.
+    busyPattern: CODEX_ACTIVE_BUSY_PATTERN,
+    idleToBusyPattern: CODEX_ACTIVE_BUSY_PATTERN,
     // Codex's update picker also renders `› 1. Update now`; a bare /›/ treats
     // that menu as the composer and lets botmux's queued first message select
     // the update. Keep accepting the composer marker anywhere in a TUI redraw,

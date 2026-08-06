@@ -658,10 +658,10 @@ describe('DAEMON_COMMANDS set', () => {
   });
 
   it('should have the correct size', () => {
-    // 32 = current master command set (30) + /fork + /forklist.
-    // /subscribe-lark-doc remains
+    // 33 = current master command set (32) + /forklist.
+    // /fork and /issue remain first-class daemon commands. /subscribe-lark-doc remains
     // as its original per-file API subscription command rather than an alias.
-    expect(DAEMON_COMMANDS.size).toBe(32);
+    expect(DAEMON_COMMANDS.size).toBe(33);
   });
 
   it('contains the /list-slash-command lister and its /slash alias', () => {

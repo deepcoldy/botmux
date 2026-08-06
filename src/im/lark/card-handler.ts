@@ -1235,6 +1235,18 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     });
   }
 
+  // ─── `/issue` Issue Board callbacks ──────────────────────────────────
+  // 权限门（allowedUsers + invoker lock）在 handleIssueCardAction 里，每次回调都重跑。
+  if (
+    typeof value?.action === 'string' &&
+    value.action.startsWith('issue_') &&
+    larkAppId
+  ) {
+    const { handleIssueCardAction } = await import('./issue-command.js');
+    const { buildIssueCommandDeps } = await import('./issue-command-deps.js');
+    return handleIssueCardAction(data, larkAppId, buildIssueCommandDeps());
+  }
+
   // ─── `/dashboard overview` callbacks ─────────────────────────────────
   // Goto buttons rebuild the TARGET card by re-fetching the corresponding
   // dedicated Route B endpoint (sessions-list / schedules-list /

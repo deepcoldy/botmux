@@ -875,12 +875,14 @@ export function extractCardContent(rawContent: string, numberer?: ImgNumberer): 
           }
           const textNodes: string[] = [];
           const buttons: string[] = [];
-          let hasFooterProof = false;
+          let inSignedFooter = false;
           for (const node of paragraph) {
+            if (inSignedFooter) continue;
             if (node.tag === 'text') { if (node.text) textNodes.push(node.text); }
             else if (node.tag === 'a') {
               if (isBotmuxFooterMarkerAnchor(node.href, node.text)) {
-                hasFooterProof = true;
+                inSignedFooter = true;
+                continue;
               }
               // Keep the href so links survive — Format A separates text/href,
               // and dropping href loses real content (规则配置/详情/Trace 链接).
@@ -924,7 +926,19 @@ export function extractCardContent(rawContent: string, numberer?: ImgNumberer): 
             }
           }
           const line = textNodes.join('').trim();
-          if (line && !hasFooterProof) parts.push(line);
+          if (line) {
+            if (inSignedFooter) {
+              const lastBreak = line.lastIndexOf('\n');
+              if (lastBreak >= 0) {
+                const beforeFooter = line.slice(0, lastBreak).trim();
+                if (beforeFooter) parts.push(beforeFooter);
+              }
+              // No newline before the signed marker means the whole paragraph is
+              // footer chrome (brand/usage/recipient). Keep nothing.
+            } else {
+              parts.push(line);
+            }
+          }
           if (buttons.length) parts.push(buttons.join(' '));
         }
       } else {
@@ -1232,14 +1246,15 @@ function extractElementText(el: any, parts: string[], imgLabel: (key: string) =>
   const tag = el.tag;
 
   // The public element id alone is not ownership proof: third-party cards may
-  // collide with it. New botmux footers carry all four invariants together.
+  // collide with it. New botmux footers carry the id plus the exact reserved
+  // marker; unexpected large text stays visible rather than being stripped.
   const elementText = el.text?.content ?? el.content;
   if (
     el.element_id === REPLY_CARD_FOOTER_ELEMENT_ID
     && tag === 'markdown'
-    && el.text_size === 'notation_small_v2'
+    && (el.text_size === undefined || el.text_size === 'notation_small_v2')
     && typeof elementText === 'string'
-    && isSignedFormatBFooterLine(elementText)
+    && hasExactMarkerMarkdown(elementText)
   ) {
     return;
   }

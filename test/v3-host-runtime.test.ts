@@ -82,6 +82,36 @@ const approveGate: NonNullable<V3RuntimeDeps['resolveGate']> = async () => ({
 });
 
 describe('v3 host runtime', () => {
+  it('delegates prepared host authorization to the injected host policy', async () => {
+    const base = mkdtempSync(join(tmpdir(), 'v3-host-policy-'));
+    try {
+      const invoke = vi.fn(async () => ({ output: {}, externalRefs: {} }));
+      const hostExecutorPolicy = vi.fn();
+      await expect(runWorkflow(dag('host-policy'), {
+        ...deps(fakeRegistry(invoke)),
+        hostExecutorPolicy,
+      }, {
+        baseDir: base,
+        gateMode: 'suspend',
+        executionContext: runtimeData,
+      })).resolves.toMatchObject({ reason: 'awaitingGate' });
+
+      expect(hostExecutorPolicy).toHaveBeenCalledWith({
+        nodeId: 'send',
+        executor: 'feishu-send',
+        input: {
+          larkAppId: 'cli_test',
+          chatId: 'oc_test',
+          content: 'hello Ada',
+        },
+        executionContext: runtimeData,
+      });
+      expect(invoke).not.toHaveBeenCalled();
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+
   it('freezes before gate and invokes only after approval, without worker dispatch/fence', async () => {
     const base = mkdtempSync(join(tmpdir(), 'v3-host-runtime-'));
     try {

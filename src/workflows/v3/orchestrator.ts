@@ -14,8 +14,7 @@
  */
 
 import { isLoopNode, loopInstanceId, topologicalOrder, type V3Dag, type V3Node } from './dag.js';
-import type { V3RunFailureReason } from './journal.js';
-import type { V3LoopRef } from './journal.js';
+import type { V3LoopRef, V3RunFailureReason } from './event-contract.js';
 
 // ─── Run state (materialized from the journal by state.ts) ──────────────────
 

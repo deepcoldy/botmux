@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, writeFileSync, appendFileSync, rmSync, statSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { drainCodexRollout, codexSessionIdFromRolloutPath, findCodexRolloutBySessionId, findCodexSessionIdByBotmuxSessionId, splitCodexEventsByCutoff, extractLastCodexTurn, scanCodexThreadSettings, type CodexBridgeEvent } from '../src/services/codex-transcript.js';
+import { drainCodexRollout, codexSessionIdFromRolloutPath, findCodexRolloutBySessionId, findCodexSessionIdByBotmuxSessionId, codexHistorySidIsOwned, splitCodexEventsByCutoff, extractLastCodexTurn, scanCodexThreadSettings, type CodexBridgeEvent } from '../src/services/codex-transcript.js';
 
 let dir: string;
 let path: string;
@@ -99,6 +99,42 @@ describe('findCodexRolloutBySessionId', () => {
       else process.env.CODEX_HOME = prevCodexHome;
       rmSync(codexHome, { recursive: true, force: true });
     }
+  });
+});
+
+describe('codexHistorySidIsOwned (pure attach-ownership decision)', () => {
+  // This is the exact predicate BOTH worker attach entry points (notify
+  // re-attach + initial-attach guard) consult via codexHistorySidOwnedByCurrentPid.
+  // Testing it directly proves "owned B is selected, foreign A is rejected"
+  // without a live worker — and without a parallel copy of the decision.
+  const OWNED = 'aaaaaaaa-aaaa-7aaa-8aaa-aaaaaaaaaaaa';
+  const SIBLING = 'bbbbbbbb-bbbb-7bbb-8bbb-bbbbbbbbbbbb';
+  const FOREIGN = 'cccccccc-cccc-7ccc-8ccc-cccccccccccc';
+
+  it('accepts an owned sid (single-rollout pid)', () => {
+    expect(codexHistorySidIsOwned(OWNED, new Set([OWNED]))).toBe(true);
+  });
+
+  it('accepts EITHER owned sid in the parent+sibling multi-rollout case', () => {
+    const owned = new Set([OWNED, SIBLING]);
+    expect(codexHistorySidIsOwned(OWNED, owned)).toBe(true);
+    expect(codexHistorySidIsOwned(SIBLING, owned)).toBe(true);
+  });
+
+  it('rejects a foreign sid (shared-CODEX_HOME sibling pane collision)', () => {
+    expect(codexHistorySidIsOwned(FOREIGN, new Set([OWNED, SIBLING]))).toBe(false);
+  });
+
+  it('is case-insensitive on the sid', () => {
+    expect(codexHistorySidIsOwned(OWNED.toUpperCase(), new Set([OWNED]))).toBe(true);
+  });
+
+  it('fails closed when the owned set is unavailable (fd enumeration failed)', () => {
+    expect(codexHistorySidIsOwned(OWNED, undefined)).toBe(false);
+  });
+
+  it('fails closed against an empty owned set (pid holds no rollout yet)', () => {
+    expect(codexHistorySidIsOwned(OWNED, new Set())).toBe(false);
   });
 });
 

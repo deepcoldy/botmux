@@ -36,7 +36,7 @@ import {
 } from './grill-state.js';
 import { finalizeSpec, validateSpec, SpecValidationError } from './spec.js';
 import { runArchitect as realRunArchitect, type RunArchitectInput, type RunArchitectResult } from './architect.js';
-import { loadDag } from './dag.js';
+import { loadDag } from './dag-loader.js';
 import { isValidRunId } from './ops-projection.js';
 import {
   botToSnapshot,

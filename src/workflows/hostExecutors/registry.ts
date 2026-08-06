@@ -1,4 +1,8 @@
-import type { ProviderReconciler } from '../shared/provider-reconciler.js';
+import type {
+  HostExecutorRegistry,
+  ProviderReconciler,
+  RegisteredHostExecutor,
+} from '../v3/runtime-host-contract.js';
 import {
   botmuxScheduleExecutor,
   botmuxScheduleReconciler,
@@ -13,14 +17,10 @@ import {
   parseFeishuReplyInput,
 } from './feishu-reply.js';
 import { feishuImReconciler } from './feishu-im.js';
-import type { SideEffectingExecutor } from './types.js';
-
-export type RegisteredHostExecutor<Input = unknown, Output = unknown> = {
-  executor: SideEffectingExecutor<Input, Output>;
-  parseInput(input: unknown): Input;
-};
-
-export type HostExecutorRegistry = Map<string, RegisteredHostExecutor>;
+export type {
+  HostExecutorRegistry,
+  RegisteredHostExecutor,
+} from '../v3/runtime-host-contract.js';
 
 export function createDefaultHostExecutorRegistry(): HostExecutorRegistry {
   return new Map([
