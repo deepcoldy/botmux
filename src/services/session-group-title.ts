@@ -120,7 +120,7 @@ export function scheduleSessionGroupTitle(opts: {
       const runOnce = () => new Promise<string>((resolve, reject) => {
         const env = { ...process.env };
         delete env.BOTMUX_SESSION_ID; // never let the one-shot inherit a session identity
-        execFile(argv[0], [...argv.slice(1), prompt], {
+        const child = execFile(argv[0], [...argv.slice(1), prompt], {
           timeout: TITLE_TIMEOUT_MS,
           maxBuffer: 1024 * 1024,
           cwd: tmpdir(),
@@ -134,6 +134,13 @@ export function scheduleSessionGroupTitle(opts: {
           }
           resolve(String(out ?? ''));
         });
+        // CRITICAL: close stdin. codex-family CLIs (codex/traex) treat a piped
+        // stdin as "additional input" and BLOCK reading it until EOF — with
+        // execFile's default open pipe they hang to the timeout and get killed
+        // ("Reading additional input from stdin..."). A TTY stdin (manual
+        // testing) skips that path, which is why this only bites under the
+        // daemon. Closing stdin is a no-op for CLIs that never read it.
+        child.stdin?.end();
       });
       // One-shot CLI calls fail transiently (API hiccups, cold start races) —
       // a single spaced retry recovers most of them without delaying much.
