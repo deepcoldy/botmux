@@ -1078,7 +1078,7 @@ function worktreeMultiForm(worktreeOptions: Array<{ text: { tag: 'plain_text'; c
 /** Repo selection card. `multiPicker` (persisted per-bot via worktreeMultiPicker)
  *  flips the worktree control between an instant single-select dropdown (false)
  *  and the inline multi-select form (true). */
-export function buildRepoSelectCard(projects: ProjectInfo[], currentPath?: string, rootMessageId?: string, locale?: Locale, multiPicker?: boolean): string {
+export function buildRepoSelectCard(projects: ProjectInfo[], currentPath?: string, rootMessageId?: string, locale?: Locale, multiPicker?: boolean, displayIndexByPath?: ReadonlyMap<string, number>): string {
   const currentMarker = t('card.repo.current_marker', undefined, locale);
   const currentPathText = {
     tag: 'lark_md',
@@ -1088,7 +1088,7 @@ export function buildRepoSelectCard(projects: ProjectInfo[], currentPath?: strin
     const currentTag = p.path === currentPath ? currentMarker : '';
     const typeTag = p.type === 'worktree' ? ' [worktree]' : '';
     return {
-      text: { tag: 'plain_text' as const, content: `${i + 1}. ${p.name} (${p.branch})${typeTag}${currentTag}` },
+      text: { tag: 'plain_text' as const, content: `${displayIndexByPath?.get(p.path) ?? i + 1}. ${p.name} (${p.branch})${typeTag}${currentTag}` },
       value: p.path,
     };
   });

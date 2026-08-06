@@ -3005,6 +3005,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       const query = String(action?.form_value?.repo_search_query ?? '').trim();
       const normalizedQuery = query.toLowerCase();
       const projects = lastRepoScan.get(ds.chatId) ?? [];
+      const displayIndexByPath = new Map(projects.map((project, index) => [project.path, index + 1]));
       const matches = normalizedQuery
         ? projects.filter(project => [project.name, project.branch, project.path]
           .some(field => field.toLowerCase().includes(normalizedQuery)))
@@ -3020,6 +3021,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         rootId,
         locDs,
         getBot(ds.larkAppId).config.worktreeMultiPicker === true,
+        displayIndexByPath,
       );
       try {
         const newCardMessageId = await sessionReply(rootId, newCard, 'interactive');

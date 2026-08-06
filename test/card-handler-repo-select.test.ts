@@ -1464,12 +1464,14 @@ describe('repo select card — worktree open', () => {
     expect(ds.workingDir).toBe('/repos/alpha-feat-one');
   });
 
-  it('repo search filters the complete scan case-insensitively and replaces the live card', async () => {
+  it('repo search preserves the full-scan number and path contract used by /repo 57', async () => {
     const ds = makeDs({ pendingRepo: true, pendingPrompt: 'hi', worker: null, repoCardMessageId: 'om_card' });
-    const projects: ProjectInfo[] = [
-      ...PROJECTS,
-      { name: 'hidden-project', path: '/repos/team/hidden', type: 'repo', branch: 'feature/Search-Needle' },
-    ];
+    const projects: ProjectInfo[] = Array.from({ length: 60 }, (_, index) => ({
+      name: index === 56 ? 'hidden-project' : `project-${index + 1}`,
+      path: `/repos/project-${index + 1}`,
+      type: 'repo',
+      branch: index === 56 ? 'feature/Search-Needle' : 'main',
+    }));
     const { deps, sessionReply } = makeDeps(ds, projects);
     sessionReply.mockResolvedValueOnce('om_search_result');
 
@@ -1482,8 +1484,11 @@ describe('repo select card — worktree open', () => {
       .find((element: any) => element.tag === 'action')
       .actions.find((element: any) => element.tag === 'select_static')
       .options;
+    const displayNumber = Number(switchOptions[0]?.text.content.match(/^(\d+)\./)?.[1]);
     expect(switchOptions).toHaveLength(1);
-    expect(switchOptions[0].value).toBe('/repos/team/hidden');
+    expect(displayNumber).toBe(57);
+    expect(switchOptions[0].value).toBe('/repos/project-57');
+    expect(deps.lastRepoScan.get(CHAT_ID)?.[displayNumber - 1]?.path).toBe(switchOptions[0].value);
     expect(ds.repoCardMessageId).toBe('om_search_result');
     expect(canOperate).not.toHaveBeenCalled(); // pending-session owner exception
     expect(res?.toast?.content).toContain('1');
