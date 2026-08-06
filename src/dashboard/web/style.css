@@ -8221,8 +8221,7 @@ button.sidebar-create-btn:focus-visible {
 }
 .dashboard-version-control {
   position: relative;
-  /* Keep the version popover above the app-wide custom scrollbar layer. */
-  z-index: 1600;
+  z-index: 2;
   width: max-content;
   margin: -2px 0 0 37px;
 }

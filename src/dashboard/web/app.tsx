@@ -611,6 +611,21 @@ function TopbarVersionControl(props: {
     if (!open) setRollbackOpen(false);
   }, [open]);
 
+  // A portaled dialog is no longer the next DOM sibling of the trigger. Move
+  // focus into it once after mounting so keyboard users do not skip the whole
+  // dialog when pressing Tab. Do not depend on the actual coordinates: scroll
+  // updates must never steal focus from a user interacting with the popover.
+  useEffect(() => {
+    if (!open || !popoverPosition) return;
+    const frame = window.requestAnimationFrame(() => {
+      const firstFocusable = popoverRef.current?.querySelector<HTMLElement>(
+        'button:not([disabled]), a[href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
+      );
+      firstFocusable?.focus();
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [open, popoverPosition !== null]);
+
   useEffect(() => {
     if (!open) {
       setPopoverPosition(null);

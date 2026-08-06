@@ -15,7 +15,10 @@ describe('dashboard version popover layering regression', () => {
     expect(app).toContain('trigger.getBoundingClientRect()');
     expect(app).toContain("document.addEventListener('scroll', updatePopoverPosition, true)");
     expect(app).toContain('popoverRef.current?.contains(target)');
+    expect(app).toContain('firstFocusable?.focus()');
+    expect(app).toContain('window.requestAnimationFrame');
     expect(css).toMatch(/\.dashboard-version-popover\s*\{[\s\S]*?position:\s*fixed;[\s\S]*?z-index:\s*1601;/);
+    expect(css).toMatch(/\.dashboard-version-control\s*\{[\s\S]*?z-index:\s*2;/);
   });
 
   it('clamps the portal horizontally instead of relying on the old topbar offset', () => {
