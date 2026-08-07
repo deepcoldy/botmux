@@ -267,9 +267,21 @@ CLI 本地的 session store 这些判据一个都没有，要按 daemon 拉一�
 `adopt`、`backendType`，**足够完整复刻**路由的分支顺序（adopt → 无 worker →
 不可挂起 backend → busy → 挂起）。每个 daemon 只拉一次。
 
-拉不到时（daemon 不在线 / 非 2xx / 返回非 JSON）预告降级为**"未知"**并在结尾打一行
-warning，不猜一个确定结论 —— dry-run 不该因为某个 daemon 抽风而失败，但也不该
-把"读不到"伪装成"已确认"。
+**"读不到"要分成两种，不能混成一个"未知"**（这是 live 验证才暴露出来的 —— 单测和
+两轮 codex 都没看出来，因为它只在真实多 bot 环境里显形）：
+
+- **daemon 不在线**（`findDaemon()` 为空）→ 结果是**确定可知**的：真实循环在发请求
+  之前就会因为同一个条件跳过。预告成"将跳过（daemon 不在线）"。
+  实测本机 516 个目标里有 20 个属于此类（`cli_listener_status` / `cli_listener_run`
+  这两个伪 app id 下的 Message Listener Preview 会话），报"未知"是实打实的信息损失。
+- **daemon 在线但 `/api/sessions` 读失败**（非 2xx / 非 JSON）→ 这才是真未知，
+  预告为"未知"并在结尾打一行 warning。
+
+同理，真实循环里排在 daemon 查找**之前**的那道
+`!s.larkAppId && online.length > 1` 跳过，dry-run 也要照抄，否则这类会被误报。
+
+原则不变：dry-run 不该因为某个 daemon 抽风而失败，但也绝不该把"读不到"伪装成
+"已确认"——反过来，把**本来可确定**的结果报成"未知"同样是失职。
 
 ### 5.5 `src/worker.ts` + `src/types.ts`：挂起前 flush 输出
 
