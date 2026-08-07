@@ -1289,6 +1289,56 @@ describe('codex-app-runner app-server protocol integration', () => {
     }
   });
 
+  it('settles a grown group from the UNIQUE full-group history turn, making its id the final/native authority and preserving a newer Goal C (R4-B3)', async () => {
+    // R4-B3: a grown group (root + accepted follow-up) gets a NON-canonical
+    // completion; bounded history holds exactly ONE turn (turn-B-full) with both
+    // clientIds in order. The runner must settle from it — the REAL final for the
+    // last member carries nativeTurnId=turn-B-full and the answer rebuilt from the
+    // last member's item ('authoritative B answer'). A newer autonomous Goal C
+    // started after the completion must NOT be cleared by the CAS (native-busy
+    // stays true → the runner still advertises busy for C).
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-codex-r4b3-'));
+    const fakeCodex = join(dir, 'fake-codex');
+    const logPath = join(dir, 'requests.jsonl');
+    copyFileSync(FAKE_SERVER_FIXTURE, fakeCodex);
+    chmodSync(fakeCodex, 0o755);
+    const control = new ControlCollector(dir);
+    await control.listen();
+    const harness = startRunner(fakeCodex, dir, logPath, '0.144.6', 'steer-group-history-match', control.bootstrap.path);
+
+    const send = (text: string, replyTurnId: string) => {
+      harness.child.stdin.write(`${CONTROL_PREFIX}${encodeRunnerInput(
+        `legacy:${text}`, { text, clientUserMessageId: replyTurnId }, replyTurnId, true,
+      )}\r`);
+    };
+
+    try {
+      await waitFor(harness, () => control.states.some(state => state.busy === false));
+      send('root', 'om_gh_root');
+      await waitFor(harness, () => readRequests(logPath).some(r => r.method === 'turn/start'));
+      send('follow', 'om_gh_follow');
+
+      // Two finals (root superseded + follow real), settled from turn-B-full.
+      await waitFor(harness, () => control.finals.length === 2);
+      const realFinal = control.finals[control.finals.length - 1];
+      // Authority switched to the matched history turn.
+      expect(realFinal.turnId).toBe('om_gh_follow');
+      expect(realFinal.nativeTurnId).toBe('turn-B-full');
+      expect(realFinal.content).toBe('authoritative B answer');
+      // The superseded first member is empty (never carries the intermediate text).
+      expect(control.finals[0]).toMatchObject({ turnId: 'om_gh_root', content: '', disposition: 'steer_superseded' });
+      // Goal C survived the CAS: the runner still reports native-busy (busy:true,
+      // tracksTurn:false) AFTER the group settled — C was not cleared.
+      await waitFor(harness, () => control.states.some(
+        state => state.busy === true && state.tracksTurn === false,
+      ));
+    } finally {
+      await stopChild(harness.child);
+      await control.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('protocol-fences with ZERO finals when a pre-response completion (id A) is contradicted by a late start response (id B) (R3-B2)', async () => {
     // R3-B2: an exact-client full-items turn/completed arrives under id A before
     // the start response; the runner upgrades it to canonical identity proof
@@ -1329,6 +1379,64 @@ describe('codex-app-runner app-server protocol integration', () => {
       // No final ever carried A's content or bound B.
       expect(control.finals.some((f: any) => f.content?.includes('answer under id A'))).toBe(false);
       expect(control.finals.some((f: any) => f.nativeTurnId === 'turn-response-B')).toBe(false);
+    } finally {
+      await stopChild(harness.child);
+      await control.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('first-proof-wins: a pre-response exact completion (id A) then a contradicting exact turn/started (id B) fences with ZERO finals (R4-B2)', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-codex-r4b2-cs-'));
+    const fakeCodex = join(dir, 'fake-codex');
+    const logPath = join(dir, 'requests.jsonl');
+    copyFileSync(FAKE_SERVER_FIXTURE, fakeCodex);
+    chmodSync(fakeCodex, 0o755);
+    const control = new ControlCollector(dir);
+    await control.listen();
+    const harness = startRunner(fakeCodex, dir, logPath, '0.144.6', 'completion-A-started-B', control.bootstrap.path);
+    try {
+      await waitFor(harness, () => control.states.some(state => state.busy === false));
+      harness.child.stdin.write(`${CONTROL_PREFIX}${encodeRunnerInput(
+        'legacy:root', { text: 'root', clientUserMessageId: 'om_cs_root' }, 'om_cs_root', true,
+      )}\r`);
+      await waitFor(harness, () => control.markers.some(
+        m => m.kind === 'lifecycle' && m.payload.kind === 'fatal',
+      ));
+      await new Promise(resolve => setTimeout(resolve, 300));
+      expect(control.finals).toHaveLength(0);
+      const fatals = control.markers.filter(m => m.kind === 'lifecycle' && m.payload.kind === 'fatal');
+      expect(fatals[0].payload.category).toBe('protocol');
+      expect(control.finals.some((f: any) => f.content?.includes('answer under id A'))).toBe(false);
+    } finally {
+      await stopChild(harness.child);
+      await control.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('first-proof-wins: an exact turn/started (id A) then a contradicting exact completion (id B) fences with ZERO finals (R4-B2)', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-codex-r4b2-sc-'));
+    const fakeCodex = join(dir, 'fake-codex');
+    const logPath = join(dir, 'requests.jsonl');
+    copyFileSync(FAKE_SERVER_FIXTURE, fakeCodex);
+    chmodSync(fakeCodex, 0o755);
+    const control = new ControlCollector(dir);
+    await control.listen();
+    const harness = startRunner(fakeCodex, dir, logPath, '0.144.6', 'started-A-completion-B', control.bootstrap.path);
+    try {
+      await waitFor(harness, () => control.states.some(state => state.busy === false));
+      harness.child.stdin.write(`${CONTROL_PREFIX}${encodeRunnerInput(
+        'legacy:root', { text: 'root', clientUserMessageId: 'om_sc_root' }, 'om_sc_root', true,
+      )}\r`);
+      await waitFor(harness, () => control.markers.some(
+        m => m.kind === 'lifecycle' && m.payload.kind === 'fatal',
+      ));
+      await new Promise(resolve => setTimeout(resolve, 300));
+      expect(control.finals).toHaveLength(0);
+      const fatals = control.markers.filter(m => m.kind === 'lifecycle' && m.payload.kind === 'fatal');
+      expect(fatals[0].payload.category).toBe('protocol');
+      expect(control.finals.some((f: any) => f.content?.includes('answer under id B'))).toBe(false);
     } finally {
       await stopChild(harness.child);
       await control.close();

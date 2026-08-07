@@ -4139,6 +4139,10 @@ export function sendWorkerInput(
           ...(normalized.codexAppInput
             ? { codexAppInput: normalized.codexAppInput }
             : {}),
+          // R4-B1: freeze the admission-time steer authorization into the queued
+          // tail's frozen payload so promote/repark/restore COPY it verbatim
+          // (admission computed once; never re-inferred downstream).
+          ...(opts.codexAppSteerable ? { codexAppSteerable: true } : {}),
         },
         turnId: queuedTurnId,
         ...(opts.dispatchAttempt !== undefined
@@ -4299,6 +4303,10 @@ export function promoteQueuedActivationTail(
         ...(replyContext.replyTargetSenderIsBot !== undefined
           ? { replyTargetSenderIsBot: replyContext.replyTargetSenderIsBot }
           : {}),
+        // R4-B1: COPY the frozen steer authorization from the promoted tail
+        // entry's payload onto the accept-ledger (admission computed once; never
+        // re-inferred at promote time).
+        ...(exactInput.codexAppSteerable ? { codexAppSteerable: true } : {}),
       },
       head.turnId,
       head.dispatchAttempt,
@@ -4574,6 +4582,12 @@ export function forkWorker(
 
   const promptPayload = typeof promptInput === 'string' ? { content: promptInput } : promptInput;
   const prompt = promptPayload.content;
+  // R4-B1: the frozen steer authorization rides on the CliTurnPayload (computed
+  // once by the daemon at admission, COPIED here). A bare-string promptInput or a
+  // system/recovery opening carries no flag ⇒ forced serial. Never re-inferred.
+  const initCodexAppSteerable = typeof promptInput === 'object'
+    && promptInput !== null
+    && promptInput.codexAppSteerable === true;
   let resume = false;
   let initTurnId: string | undefined;
   let initDispatchAttempt: number | undefined;
@@ -4917,6 +4931,9 @@ export function forkWorker(
     ds.session.queuedActivationInput = {
       content: prompt,
       ...(promptCodexAppInput ? { codexAppInput: promptCodexAppInput } : {}),
+      // R4-B1: preserve the frozen steer authorization when re-parking N+1 behind
+      // a recovery fork (COPY, never re-infer).
+      ...(initCodexAppSteerable ? { codexAppSteerable: true } : {}),
     };
     ds.session.queuedActivationTurnId = initAttributionTurnId;
     ds.session.queuedActivationDispatchAttempt = initDispatchAttempt;
@@ -4945,6 +4962,10 @@ export function forkWorker(
               ? { replyTargetSenderIsBot: initReplyContext.replyTargetSenderIsBot }
               : {}),
           } : {}),
+          // R4-B1: COPY the frozen steer authorization onto the fork's
+          // accept-ledger entry so a recovered/opening first turn is steerable
+          // exactly as the daemon admitted it (admission computed once; COPIED).
+          ...(initCodexAppSteerable ? { codexAppSteerable: true } : {}),
         },
         initAttributionTurnId,
         initDispatchAttempt,
@@ -5157,6 +5178,10 @@ export function forkWorker(
     ...(initReplyTurnId ? { replyTurnId: initReplyTurnId } : {}),
     dispatchAttempt: initDispatchAttempt,
     ...(codexAppDispatchId ? { codexAppDispatchId } : {}),
+    // R4-B1: COPY the frozen steer authorization onto the first-turn init so the
+    // worker can fold follow-ups into this opening turn (canSteer requires the
+    // group root to be steerable). System/recovery openings carry no flag.
+    ...(initCodexAppSteerable ? { codexAppSteerable: true as const } : {}),
     ...(codexAppRecoveredDispatches.length > 0
       ? { codexAppRecoveredDispatches }
       : {}),
@@ -7194,6 +7219,29 @@ function setupWorkerHandlers(
           if (!preview.ok) {
             acknowledge(false, preview.error);
             break;
+          }
+          // R4-B4 defense-in-depth: a `steer_superseded` settlement silently
+          // advances the FIFO without delivering, so it is ONLY legitimate for a
+          // genuine plain-Lark steerable head. Reject (ACK=false, no pop, no
+          // receiver completion, no mutation) BEFORE the commit block below if the
+          // settled entry is not steerable, not a Lark sink, or belongs to a VC /
+          // durable-receiver / special channel — a mixed/stale/forged runner must
+          // never use superseded to swallow an independent waiter's turn.
+          if (msg.disposition === 'steer_superseded') {
+            const entry = preview.settledEntry;
+            const supersededHeadOk = entry.codexAppSteerable === true
+              && (entry.deliverySink === undefined || entry.deliverySink === 'lark')
+              && entry.vcMeetingImTurnOrigin === undefined
+              && ds.session.vcMeetingReceiver === undefined;
+            if (!supersededHeadOk) {
+              logger.warn(
+                `[${t}] Rejected steer_superseded for non-steerable/special head `
+                + `(turn ${msg.turnId.substring(0, 8)}, sink=${entry.deliverySink ?? 'legacy'}, `
+                + `steerable=${entry.codexAppSteerable === true})`,
+              );
+              acknowledge(false, 'superseded_head_not_plain_lark_steerable');
+              break;
+            }
           }
           const key = `${ds.session.sessionId}:${settlement.generation}:${settlement.seq}`;
           let inFlight = codexAppFinalSettlementInFlight.get(key);

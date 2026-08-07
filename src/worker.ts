@@ -6721,6 +6721,20 @@ async function handleTrustedCodexAppMarker(
         dispatchId: codexAppDispatchId,
         handle: codexAppDispatchHandle,
       } = settlement);
+      // R4-B4 worker-side defense-in-depth: a superseded settlement is only valid
+      // for a steerable exact head that STILL has a successor reservation
+      // (remaining > 0). A single forged superseded on the only head would
+      // otherwise silently commit it, and the real final would then find no
+      // pending turn. Reject before any commit — the reservation, logical slot,
+      // and awaiting-final all stay untouched (settleFinal used consume:false).
+      if (isSuperseded
+          && (settlement.codexAppSteerable !== true || settlement.remaining <= 0)) {
+        rejectCodexAppControlMarker(
+          `steer_superseded head not steerable / has no successor `
+          + `(steerable=${settlement.codexAppSteerable === true}, remaining=${settlement.remaining})`,
+        );
+        return false;
+      }
       // Liveness slot retirement + completion-awaiting clearing happen AFTER the
       // durable commit below (a persist/commit failure must not retire a slot or
       // clear awaiting), and are disposition-aware: a superseded member retires
@@ -8198,6 +8212,9 @@ async function flushPending(): Promise<void> {
             item.codexAppDispatchId,
             false,
             item.replyTurnId,
+            // R4-B4: COPY the frozen steer authorization onto the reservation so a
+            // superseded settlement can verify the exact head is a steerable turn.
+            item.codexAppSteerable ? true : undefined,
           )
         : undefined;
       if (tracksCodexAppLiveness && item.codexAppDispatchId && codexAppFrozenTurnId) {

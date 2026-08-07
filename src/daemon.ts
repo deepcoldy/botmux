@@ -18348,6 +18348,23 @@ async function handleThreadReplyAdmitted(
   messageQueue.appendMessage(anchor, parsed);
   publishSessionMessagePreviewPatch(ds);
 
+  // Codex App steer authorization (Blocking 1, decision A) — computed ONCE here,
+  // BEFORE the live-worker / worker-null branch split (R4-B1), so every opening
+  // path (live message, queued-tail admit, cold refork) COPIES the same frozen
+  // value. Explicit positive ONLY for a plain-human-interactive turn: a real
+  // human sender (not a foreign bot, not a Feishu-stamped bot sender) with NONE
+  // of substitute-rewrite / v3-grill / message-listener / VC receiver / VC
+  // origin / bridge semantics. Never inferred from the delivery sink; ignored by
+  // acceptCodexAppDispatch for non-codex-app CLIs.
+  const codexAppSteerable = !ds.adoptedFrom
+    && !isForeignBot
+    && !isBotSenderType
+    && !substituteTrigger
+    && !threadGrill
+    && !ctx.messageListener
+    && !ds.session.vcMeetingReceiver
+    && !ctx.vcMeetingImTurnOrigin;
+
   // Send message to worker via IPC
   if (ds.worker && !ds.worker.killed) {
     const dsBotCfgForMsg = getBot(ds.larkAppId).config;
@@ -18420,22 +18437,8 @@ async function handleThreadReplyAdmitted(
         });
     beginNewTurn(ds, parsed.content);
     await noteTurnReceived(ds, parsed.messageId, parsed.content, turnSender, parsed.messageId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
-    // Codex App steer authorization (Blocking 1, codex decision A): explicit
-    // positive ONLY for a plain-human-interactive turn, decided here AFTER every
-    // routing decision above. A real human sender (not a foreign bot, not a
-    // Feishu-stamped bot sender) with NONE of substitute-rewrite / v3-grill /
-    // message-listener / VC receiver / VC origin / bridge semantics may steer its
-    // input into an active Codex App turn. Every control-rewrite / non-human /
-    // dedicated-receiver turn stays forced-serial. Never inferred from the
-    // delivery sink. Ignored by acceptCodexAppDispatch for non-codex-app CLIs.
-    const codexAppSteerable = !isBridge
-      && !isForeignBot
-      && !isBotSenderType
-      && !substituteTrigger
-      && !threadGrill
-      && !ctx.messageListener
-      && !ds.session.vcMeetingReceiver
-      && !ctx.vcMeetingImTurnOrigin;
+    // Codex App steer authorization was computed ONCE before the branch split
+    // above (R4-B1); reuse the same frozen value here for the live-worker path.
     let accepted = false;
     try {
       accepted = sendWorkerInput(ds, cliInput, parsed.messageId,
@@ -18516,6 +18519,11 @@ async function handleThreadReplyAdmitted(
           codexAppApplicationContext,
           codexAppMessageContext,
         });
+        // R4-B1: freeze the admission-time steer authorization onto the queued
+        // opening payload so the worker-null re-fork path carries it exactly like
+        // the live-worker path (admission computed once at line ~18431; COPIED
+        // here, never re-inferred). System/recovery openings keep it absent.
+        if (codexAppSteerable) currentFollowUp.codexAppSteerable = true;
         admitQueuedActivationTail(ds, {
           userPrompt: promptContent,
           cliInput: currentFollowUp,
@@ -18692,6 +18700,13 @@ async function handleThreadReplyAdmitted(
       if (ds.adoptedFrom) {
         forkAdoptWorker(ds, { prompt: wrappedInput.content, turnId: parsed.messageId });
       } else {
+        // R4-B1: freeze the admission-time steer authorization onto this opening
+        // payload — but ONLY for a genuine interactive current turn, never a
+        // queued-dashboard / durable-tail SYSTEM opening (those own the first
+        // turn and are forced-serial). Admission computed once (~18431); COPIED.
+        if (codexAppSteerable && !queuedDashboardTurn && !queuedHasDurableTail) {
+          wrappedInput.codexAppSteerable = true;
+        }
         forkWorker(ds, wrappedInput, {
           // See `hadPriorCliInput` above — an opening on a CLI that never took any
           // input cold-spawns rather than `--resume`-ing an empty session.

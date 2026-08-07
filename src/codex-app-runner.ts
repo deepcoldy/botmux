@@ -90,8 +90,10 @@ interface ActiveTurn {
   // wires pre-final Lark steer. See drive()/canSteer().
   /** Lifecycle phase of the active native turn. */
   phase?: 'starting' | 'open' | 'closing' | 'fenced';
-  /** How the canonical native id was proven (guards premature steer/bind). */
-  identityProof?: 'exact_started' | 'start_response' | 'goal_snapshot';
+  /** How the canonical native id was proven (guards premature steer/bind).
+   * exact_started / exact_completed are the two exact-client proofs; they are
+   * first-proof-wins (a later exact proof with a DIFFERENT id fences). */
+  identityProof?: 'exact_started' | 'exact_completed' | 'start_response' | 'goal_snapshot';
   /** Root + only matching-steer-accepted members, in strict inbound order.
    * The last member's reply id owns the real final; earlier members expand to
    * `steer_superseded` finals at native completion. */
@@ -108,8 +110,6 @@ interface ActiveTurn {
   /** The authoritative terminal `turn/completed` payload, once observed for the
    * proven canonical id. */
   terminalCompletion?: JsonObject;
-  /** Completions observed before the canonical id was proven; replayed on bind. */
-  candidateCompletions?: JsonObject[];
   /** The single in-flight steer RPC (at most one), and the id it targets. */
   steerInFlight?: { dispatch: Dispatch; expectedTurnId: string };
   /** The canonical native `turn/completed` has been observed. Distinct from
@@ -977,14 +977,13 @@ function handleNotification(msg: JsonObject, replayedAfterResponse = false): voi
       const exact = turn.clientUserMessageId
         ? exactClientItemIndexes(params.turn, turn.clientUserMessageId)
         : [];
-      // B1: an exact-client `turn/started` proves the canonical native id even
-      // before the turn/start response returns. Bind it, mark identityProof so a
-      // late start response must match (fenced otherwise), open the group, and
-      // kick admission — a follow-up can now steer during the pending response.
-      if (!turn.nativeTurnId && exact.length === 1) {
-        turn.nativeTurnId = startedId;
-        turn.canonicalNativeTurnId = startedId;
-        turn.identityProof = 'exact_started';
+      // B1/R4-B2: an exact-client `turn/started` proves the canonical native id
+      // even before the turn/start response returns. First-proof-wins: bind only
+      // if canonical is unset OR already this id; a different already-proven
+      // canonical fences (contradiction). Same id opens the group + kicks.
+      if (exact.length === 1) {
+        if (!proveCanonicalExact(turn, startedId, 'exact_started')) return;
+        if (!turn.nativeTurnId) turn.nativeTurnId = startedId;
         if (turn.phase === undefined || turn.phase === 'starting') turn.phase = 'open';
       }
       if (turn.nativeTurnId === startedId) {
@@ -992,7 +991,8 @@ function handleNotification(msg: JsonObject, replayedAfterResponse = false): voi
         emitTurnActivity(turn, 'progress', true);
         // Kick only when the canonical id is proven exact (not a bare id echo)
         // so a follow-up steers into the proven turn during a pending response.
-        if (turn.identityProof === 'exact_started' && !turn.completed) void tryAdmitSteer();
+        if ((turn.identityProof === 'exact_started' || turn.identityProof === 'exact_completed')
+            && !turn.completed) void tryAdmitSteer();
         return;
       }
       // app-server is allowed to publish turn/started before replying to
@@ -1079,9 +1079,9 @@ function handleNotification(msg: JsonObject, replayedAfterResponse = false): voi
           && turn.startResponsePending
           && turn.accepted?.[0]?.input.codexAppSteerable === true
           && typeof completedId === 'string') {
-        turn.canonicalNativeTurnId = completedId;
-        turn.identityProof = 'exact_started';
-        turn.candidateCompletions = [...(turn.candidateCompletions ?? []), nativeTurn];
+        // R4-B2 first-proof-wins: a prior exact proof for a DIFFERENT id fences;
+        // same id is idempotent. Never overwrite an already-proven canonical.
+        if (!proveCanonicalExact(turn, completedId, 'exact_completed')) return;
         turn.completionSeen = true;
         turn.steeringClosed = true;
         turn.terminalCompletion = nativeTurn;
@@ -1092,9 +1092,6 @@ function handleNotification(msg: JsonObject, replayedAfterResponse = false): voi
         completeActiveTurnFromNative(turn, nativeTurn, exact[0]);
         return;
       }
-      // A captured Goal turn can finish while turn/steer is still in flight.
-      // Until the RPC succeeds, native-id equality proves only that the old
-      // autonomous work completed; it does not prove this Lark input landed.
       if (!turn.requestAccepted) {
         turn.pendingCompletions.push(nativeTurn);
         return;
@@ -1121,9 +1118,9 @@ function handleNotification(msg: JsonObject, replayedAfterResponse = false): voi
         && turn.startResponsePending
         && turn.accepted?.[0]?.input.codexAppSteerable === true
         && typeof completedId === 'string') {
-      turn.canonicalNativeTurnId = completedId;
-      turn.identityProof = 'exact_started';
-      turn.candidateCompletions = [...(turn.candidateCompletions ?? []), nativeTurn];
+      // R4-B2 first-proof-wins: a prior exact proof for a DIFFERENT id fences;
+      // same id is idempotent. Never overwrite an already-proven canonical.
+      if (!proveCanonicalExact(turn, completedId, 'exact_completed')) return;
       turn.completionSeen = true;
       turn.steeringClosed = true;
       turn.terminalCompletion = nativeTurn;
@@ -1344,6 +1341,31 @@ function fenceUnknown(
 }
 
 /**
+ * First-proof-wins canonical binding for an exact-client proof (R4-B2). The
+ * FIRST exact `turn/started` or exact `turn/completed` to prove the canonical
+ * native id wins; any LATER exact proof carrying a DIFFERENT id is a protocol
+ * anomaly (the app-server contradicted itself) → fence. The same id is
+ * idempotent. Returns true if the caller may proceed (proof accepted / already
+ * bound to same id), false if it fenced (caller must stop).
+ */
+function proveCanonicalExact(
+  turn: ActiveTurn,
+  id: string,
+  proof: 'exact_started' | 'exact_completed',
+): boolean {
+  if (turn.canonicalNativeTurnId === undefined) {
+    turn.canonicalNativeTurnId = id;
+    turn.identityProof = proof;
+    return true;
+  }
+  if (turn.canonicalNativeTurnId === id) return true; // idempotent, same proof id
+  // A different exact id after canonical was already proven: contradiction.
+  fenceUnknown('turn/start', 'protocol', turn);
+  if (!turn.completed) { turn.completed = true; turn.resolveDone(); }
+  return false;
+}
+
+/**
  * Whether this turn is in "group mode": a steerable root that has actually begun
  * ordered-steer work (grew past its root, has a steer RPC in flight, or already
  * closed steering with an accepted member). In group mode EVERY completion and
@@ -1501,8 +1523,20 @@ async function reconcileSteeredGroupFromHistory(
       turn.finalText = rebuildReconciledFinal(matched, lastIndex);
       turn.allAgentText = '';
       turn.terminalCompletion = matched;
-      if (typeof matched?.id === 'string' && nativeActiveTurnId === matched.id) {
-        nativeActiveTurnId = undefined;
+      // R4-B3: the matched turn is now the authoritative native identity for this
+      // group — the final marker, native id, and usage drain must all key off
+      // matched.id, not the stale pre-history canonical. Compare-and-clear the OLD
+      // canonical from the global native-busy slot ONLY if it is still the head
+      // there; if a newer autonomous Goal C has since claimed nativeActiveTurnId,
+      // leave C untouched (never clear/overwrite a newer lifecycle).
+      if (typeof matched?.id === 'string') {
+        const priorCanonical = turn.canonicalNativeTurnId;
+        if (priorCanonical !== undefined && nativeActiveTurnId === priorCanonical) {
+          nativeActiveTurnId = undefined;
+        }
+        turn.nativeTurnId = matched.id;
+        turn.canonicalNativeTurnId = matched.id;
+        if (nativeActiveTurnId === matched.id) nativeActiveTurnId = undefined;
       }
       turn.completed = true;
       turn.phase = 'closing';
@@ -1797,6 +1831,10 @@ async function runTurn(message: QueuedInput): Promise<void> {
           || !built.structured
           || (!expectedSteerTurnId && turn.serverStarted)
           || !isCleanInputCapabilityError(err)) {
+        // Nit: the fenced RPC's operation reflects what we actually sent — a Goal
+        // root steers (expectedSteerTurnId set), a plain root starts — so the
+        // signed unknown_outcome/fatal diagnostic is accurate.
+        const fenceOperation: 'turn/start' | 'turn/steer' = expectedSteerTurnId ? 'turn/steer' : 'turn/start';
         // R3-B1 fail-closed on positive evidence: once ANY evidence exists that
         // this native turn may have started or grown — an exact `turn/started`
         // proof, a server-started edge, or an already-accepted follow-up (group
@@ -1812,7 +1850,7 @@ async function runTurn(message: QueuedInput): Promise<void> {
           || turn.canonicalNativeTurnId !== undefined
           || (turn.accepted?.length ?? 0) > 1;
         if (positiveEvidence) {
-          fenceUnknown('turn/start', err instanceof AppServerRpcError ? 'rpc' : 'transport', turn);
+          fenceUnknown(fenceOperation, err instanceof AppServerRpcError ? 'rpc' : 'transport', turn);
           if (!turn.completed) { turn.completed = true; turn.resolveDone(); }
           return;
         }
@@ -1822,7 +1860,7 @@ async function runTurn(message: QueuedInput): Promise<void> {
         // definitively proves the turn did NOT run → stays on the
         // throw→failure-final path (a clean, safely-attributed failure).
         if (!(err instanceof AppServerRpcError)) {
-          fenceUnknown('turn/start', 'transport', turn);
+          fenceUnknown(fenceOperation, 'transport', turn);
           if (!turn.completed) { turn.completed = true; turn.resolveDone(); }
           return;
         }
@@ -1845,11 +1883,11 @@ async function runTurn(message: QueuedInput): Promise<void> {
     }
   }
   const responseNativeId = result.turn?.id ?? result.turnId ?? turn.nativeTurnId;
-  // B1 late start response: if an exact `turn/started` already proved a canonical
-  // id (identityProof==='exact_started'), the start response MUST match it — a
-  // divergent id is a protocol anomaly whose true turn is unknown → fence, never
-  // bind a second id. Otherwise the start response is what proves canonical.
-  if (turn.identityProof === 'exact_started'
+  // B1/R4-B2 late start response: if an exact proof (turn/started OR completed)
+  // already bound a canonical id, the start response MUST match it — a divergent
+  // id is a protocol anomaly whose true turn is unknown → fence, never bind a
+  // second id. Otherwise the start response is what proves canonical.
+  if ((turn.identityProof === 'exact_started' || turn.identityProof === 'exact_completed')
       && turn.canonicalNativeTurnId
       && responseNativeId
       && responseNativeId !== turn.canonicalNativeTurnId) {
@@ -1894,12 +1932,21 @@ async function runTurn(message: QueuedInput): Promise<void> {
   // the canonical id. settleSteeredCompletion verifies the ordered group
   // subsequence (1-member is a valid group) and fails closed on any mismatch, so
   // a foreign/partial buffered completion can never expand a wrong final.
+  // R4-B2 defense-in-depth: the buffered terminal's id MUST equal the proven
+  // canonical id before we settle from it — a first-proof-wins violation upstream
+  // would otherwise let terminal A's content ship under a different native id.
+  const bufferedTerminalMatchesCanonical = turn.terminalCompletion !== undefined
+    && (typeof turn.terminalCompletion.id !== 'string'
+      || turn.terminalCompletion.id === turn.canonicalNativeTurnId);
   const settleBufferedCanonical = !turn.completed
     && turn.completionSeen
     && turn.terminalCompletion
     && !turn.steerInFlight
+    && bufferedTerminalMatchesCanonical
     && turn.accepted?.[0]?.input.codexAppSteerable === true
-    && ((turn.accepted?.length ?? 0) > 1 || turn.identityProof === 'exact_started');
+    && ((turn.accepted?.length ?? 0) > 1
+      || turn.identityProof === 'exact_started'
+      || turn.identityProof === 'exact_completed');
   if (settleBufferedCanonical) {
     settleSteeredCompletion(turn, turn.terminalCompletion!);
   }

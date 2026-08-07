@@ -485,6 +485,44 @@ function handle(request) {
       activeTurn = undefined;
       return;
     }
+    if (behavior === 'steer-group-history-match') {
+      if (!activeTurn || request.params.expectedTurnId !== activeTurn.turnId) {
+        reject(request.id, -32602, 'expectedTurnId does not match active turn');
+        return;
+      }
+      steerCount += 1;
+      groupClientIds.push(request.params.clientUserMessageId ?? null);
+      respond(request.id, { turnId: activeTurn.turnId });
+      // Group grew to 2 (root + this follow-up). Emit a NON-canonical completion
+      // (different id), and seed history with the UNIQUE full-group turn
+      // 'turn-B-full' containing BOTH clientIds in order. The runner's
+      // group-history reconcile must settle from turn-B-full, making its id the
+      // authoritative native id (final/native/usage), and rebuild the answer from
+      // the LAST member. Also start a Goal C so the test can assert CAS-clear does
+      // NOT wipe a newer autonomous lifecycle.
+      const { threadId } = activeTurn;
+      reconciledTurn = {
+        id: 'turn-B-full',
+        status: 'completed',
+        itemsView: 'full',
+        error: null,
+        items: [
+          { id: 'user-root', type: 'userMessage', clientId: groupClientIds[0], content: [] },
+          { id: 'message-mid', type: 'agentMessage', phase: 'final_answer', text: 'intermediate' },
+          { id: 'user-follow', type: 'userMessage', clientId: groupClientIds[1], content: [] },
+          { id: 'message-final', type: 'agentMessage', phase: 'final_answer', text: 'authoritative B answer' },
+        ],
+      };
+      notify('turn/completed', {
+        threadId,
+        turn: { id: 'turn-foreign-noncanonical', status: 'completed' },
+      });
+      // A newer autonomous Goal C claims native-busy AFTER the non-canonical
+      // completion — the CAS-clear must leave C intact.
+      startGoalContinuation(threadId, 'turn-goal-C');
+      activeTurn = undefined;
+      return;
+    }
     if (behavior === 'steer-then-drop') {
       if (!activeTurn || request.params.expectedTurnId !== activeTurn.turnId) {
         reject(request.id, -32602, 'expectedTurnId does not match active turn');
@@ -572,11 +610,11 @@ function handle(request) {
     reject(request.id, -32000, 'model overloaded');
     return;
   }
-  if (behavior === 'steer' || behavior === 'steer-group-mismatch' || behavior === 'steer-noncanonical') {
+  if (behavior === 'steer' || behavior === 'steer-group-mismatch' || behavior === 'steer-noncanonical' || behavior === 'steer-group-history-match') {
     const threadId = request.params.threadId;
     const turnId = `turn-fake-${turnAttempt}`;
     activeTurn = { threadId, turnId, outputSchema: request.params.outputSchema };
-    if (behavior === 'steer-group-mismatch' || behavior === 'steer-noncanonical') {
+    if (behavior === 'steer-group-mismatch' || behavior === 'steer-noncanonical' || behavior === 'steer-group-history-match') {
       groupClientIds = [request.params.clientUserMessageId ?? null];
     }
     respond(request.id, { turn: { id: turnId } });
@@ -632,6 +670,67 @@ function handle(request) {
       },
     });
     setTimeout(() => respond(request.id, { turn: { id: 'turn-response-B' } }), 120);
+    return;
+  }
+  if (behavior === 'completion-A-started-B') {
+    // R4-B2 crossing 1: exact completion A proves canonical=A; then an exact
+    // turn/started B (DIFFERENT id) arrives → first-proof-wins must fence (a later
+    // exact proof contradicting canonical). 0 finals.
+    const threadId = request.params.threadId;
+    const clientId = request.params.clientUserMessageId ?? null;
+    notify('turn/completed', {
+      threadId,
+      turn: {
+        id: 'turn-A',
+        status: 'completed',
+        itemsView: 'full',
+        error: null,
+        items: [
+          { id: 'user-A', type: 'userMessage', clientId, content: request.params.input },
+          { id: 'message-A', type: 'agentMessage', phase: 'final_answer', text: 'answer under id A' },
+        ],
+      },
+    });
+    setTimeout(() => notify('turn/started', {
+      threadId,
+      turn: {
+        id: 'turn-B',
+        status: 'inProgress',
+        itemsView: 'full',
+        items: [{ id: 'user-B', type: 'userMessage', clientId, content: request.params.input }],
+      },
+    }), 40);
+    // Never respond to turn/start — the contradiction fence fires first.
+    return;
+  }
+  if (behavior === 'started-A-completion-B') {
+    // R4-B2 crossing 2: exact turn/started A proves canonical=A; then an exact
+    // turn/completed B (DIFFERENT id) arrives → first-proof-wins must fence. 0 finals.
+    const threadId = request.params.threadId;
+    const clientId = request.params.clientUserMessageId ?? null;
+    notify('turn/started', {
+      threadId,
+      turn: {
+        id: 'turn-A',
+        status: 'inProgress',
+        itemsView: 'full',
+        items: [{ id: 'user-A', type: 'userMessage', clientId, content: request.params.input }],
+      },
+    });
+    setTimeout(() => notify('turn/completed', {
+      threadId,
+      turn: {
+        id: 'turn-B',
+        status: 'completed',
+        itemsView: 'full',
+        error: null,
+        items: [
+          { id: 'user-B', type: 'userMessage', clientId, content: request.params.input },
+          { id: 'message-B', type: 'agentMessage', phase: 'final_answer', text: 'answer under id B' },
+        ],
+      },
+    }), 40);
+    // Never respond to turn/start — the contradiction fence fires first.
     return;
   }
   if (behavior === 'steer-then-drop') {

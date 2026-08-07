@@ -15,6 +15,10 @@ export interface CodexAppTurnDispatchReservation {
   replyTurnId?: string;
   dispatchAttempt?: number;
   recovered?: boolean;
+  /** Frozen steer authorization COPIED from the daemon-admitted head (R4-B4).
+   * A `steer_superseded` settlement is only legitimate for a steerable head; the
+   * worker checks this on the settled reservation before forwarding. */
+  codexAppSteerable?: true;
 }
 
 export type CodexAppTurnDispatchSettlement =
@@ -26,6 +30,7 @@ export type CodexAppTurnDispatchSettlement =
       replyTurnId?: string;
       dispatchAttempt?: number;
       nativeTurnId?: string;
+      codexAppSteerable?: true;
       remaining: number;
     }
   | {
@@ -47,6 +52,7 @@ export class CodexAppTurnDispatchQueue {
     dispatchId?: string,
     recovered = false,
     replyTurnId?: string,
+    codexAppSteerable?: true,
   ): CodexAppTurnDispatchReservation {
     if (!turnId) throw new Error('Codex App dispatch turn id must be non-empty');
     const reservation = {
@@ -56,6 +62,7 @@ export class CodexAppTurnDispatchQueue {
       ...(replyTurnId ? { replyTurnId } : {}),
       ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
       ...(recovered ? { recovered: true } : {}),
+      ...(codexAppSteerable ? { codexAppSteerable: true as const } : {}),
     };
     this.queue.push(reservation);
     return { ...reservation };
@@ -176,6 +183,7 @@ export class CodexAppTurnDispatchQueue {
         ? { dispatchAttempt: head.dispatchAttempt }
         : {}),
       ...(nativeTurnId ? { nativeTurnId } : {}),
+      ...(head.codexAppSteerable ? { codexAppSteerable: true as const } : {}),
       remaining: this.queue.length - (consume ? 0 : 1),
     };
   }

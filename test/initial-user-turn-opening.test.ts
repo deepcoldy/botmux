@@ -377,6 +377,53 @@ describe('empty-started session — first real business turn must use the new-to
       .toContain('ou_owner');
   });
 
+  it('live worker: a plain human Codex App turn is admitted as steerable (R4-B1 production wiring, not hand-injected)', async () => {
+    const anchor = 'om_steer_live_root';
+    registerBot({
+      larkAppId: APP,
+      larkAppSecret: 's',
+      cliId: 'codex-app',
+      allowedUsers: [OWNER],
+      oncallChats: [{ chatId: CHAT, workingDir: '/tmp' }],
+    }).resolvedAllowedUsers = [OWNER];
+    seedEmptyStarted(anchor, { cliId: 'codex-app' });
+
+    await handleThreadReply(
+      makeEventData('om_steer_live_msg', '第一条真实交互消息', anchor),
+      makeCtx(anchor, 'om_steer_live_msg'),
+    );
+
+    // The daemon computes codexAppSteerable and passes it as sendWorkerInput's
+    // 4th arg (opts) — this is the production path the worker init COPY depends
+    // on. The test does NOT hand-inject the flag anywhere.
+    const opts = mocks.sendWorkerInput.mock.calls[0]?.[3];
+    expect(opts?.codexAppSteerable).toBe(true);
+  });
+
+  it('worker-null refork: a plain human Codex App opening carries the frozen steerable flag on the fork payload (R4-B1)', async () => {
+    const anchor = 'om_steer_cold_root';
+    registerBot({
+      larkAppId: APP,
+      larkAppSecret: 's',
+      cliId: 'codex-app',
+      allowedUsers: [OWNER],
+      oncallChats: [{ chatId: CHAT, workingDir: '/tmp' }],
+    }).resolvedAllowedUsers = [OWNER];
+    seedEmptyStarted(anchor, { live: false, hasHistory: true, cliId: 'codex-app' });
+
+    await handleThreadReply(
+      makeEventData('om_steer_cold_msg', '冷启后的第一条真实交互消息', anchor),
+      makeCtx(anchor, 'om_steer_cold_msg'),
+    );
+
+    // The worker-null re-fork opening must carry the frozen steer authorization
+    // on the CliTurnPayload handed to forkWorker (the gap codex flagged: the
+    // production init path never set it, only the hand-injected test did).
+    expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
+    const openingPayload = mocks.forkWorker.mock.calls[0]?.[1] as any;
+    expect(openingPayload?.codexAppSteerable).toBe(true);
+  });
+
   // ─── worker-null / refork ───────────────────────────────────────────────────
 
   it('worker-null refork: opens with new-topic context and does NOT resume a never-used CLI', async () => {

@@ -454,6 +454,100 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     },
   );
 
+  it.each([
+    { name: 'non-steerable head', steerable: false, sink: 'lark' as const },
+    { name: 'steerable but non-lark (http_wait) head', steerable: true, sink: 'http_wait' as const },
+    { name: 'steerable but non-lark (doc_comment) head', steerable: true, sink: 'doc_comment' as const },
+  ])(
+    'R4-B4: rejects a steer_superseded settlement on a $name (ACK false, no pop, no mutation)',
+    async ({ steerable, sink }) => {
+      const sessionReply = vi.fn(async () => 'om_forbidden');
+      initWorkerPool({
+        sessionReply,
+        getSessionWorkingDir: () => '/tmp',
+        getActiveCount: () => 1,
+        closeSession: vi.fn(),
+      });
+      const ds = makeDs();
+      ds.adoptedFrom = undefined;
+      ds.session.cliId = 'codex-app';
+      // Two entries so the head has a successor — isolate the steerable/sink
+      // rejection from the "no successor" rule (that is a separate worker check).
+      const headEntry: any = {
+        dispatchId: 'dispatch-sup-head', turnId: 'turn-sup-head', state: 'prepared',
+        content: 'superseded head', deliverySink: sink,
+        ...(steerable ? { codexAppSteerable: true } : {}),
+      };
+      ds.session.codexAppDispatchLedger = [
+        headEntry,
+        { dispatchId: 'dispatch-sup-next', turnId: 'turn-sup-next', state: 'accepted', content: 'next', deliverySink: 'lark', codexAppSteerable: true },
+      ];
+      __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+
+      (ds.worker as any).emit('message', {
+        type: 'final_output', sessionId: ds.session.sessionId,
+        content: '', lastUuid: 'uuid-sup-head', turnId: 'turn-sup-head',
+        suppressDelivery: true,
+        disposition: 'steer_superseded',
+        codexAppSettlement: {
+          requestId: 'settle-sup-head', generation: 'gen-sup', seq: 1, dispatchId: 'dispatch-sup-head',
+        },
+      } satisfies Extract<WorkerToDaemon, { type: 'final_output' }>);
+
+      // ACK false, no delivery, and the ledger head is NOT popped (no mutation).
+      await vi.waitFor(() => expect((ds.worker as any).send).toHaveBeenCalledWith(
+        expect.objectContaining({
+          type: 'codex_app_dispatch_persisted',
+          requestId: 'settle-sup-head',
+          ok: false,
+        }),
+      ));
+      expect(sessionReply).not.toHaveBeenCalled();
+      expect(ds.session.codexAppDispatchLedger?.[0]?.dispatchId).toBe('dispatch-sup-head');
+      expect(ds.session.codexAppDispatchLedger?.length).toBe(2);
+    },
+  );
+
+  it('R4-B4: commits a steer_superseded settlement on a steerable Lark head with a successor (ACK true, pop, no delivery)', async () => {
+    const sessionReply = vi.fn(async () => 'om_forbidden');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const ds = makeDs();
+    ds.adoptedFrom = undefined;
+    ds.session.cliId = 'codex-app';
+    ds.session.codexAppDispatchLedger = [
+      { dispatchId: 'dispatch-ok-head', turnId: 'turn-ok-head', state: 'prepared', content: 'superseded', deliverySink: 'lark', codexAppSteerable: true },
+      { dispatchId: 'dispatch-ok-next', turnId: 'turn-ok-next', state: 'accepted', content: 'real', deliverySink: 'lark', codexAppSteerable: true },
+    ];
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+
+    (ds.worker as any).emit('message', {
+      type: 'final_output', sessionId: ds.session.sessionId,
+      content: '', lastUuid: 'uuid-ok-head', turnId: 'turn-ok-head',
+      suppressDelivery: true,
+      disposition: 'steer_superseded',
+      codexAppSettlement: {
+        requestId: 'settle-ok-head', generation: 'gen-ok', seq: 1, dispatchId: 'dispatch-ok-head',
+      },
+    } satisfies Extract<WorkerToDaemon, { type: 'final_output' }>);
+
+    // ACK true, ledger head popped (durable FIFO advanced), but never delivered.
+    await vi.waitFor(() => expect((ds.worker as any).send).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: 'codex_app_dispatch_persisted',
+        requestId: 'settle-ok-head',
+        ok: true,
+      }),
+    ));
+    expect(sessionReply).not.toHaveBeenCalled();
+    await vi.waitFor(() => expect(ds.session.codexAppDispatchLedger?.length).toBe(1));
+    expect(ds.session.codexAppDispatchLedger?.[0]?.dispatchId).toBe('dispatch-ok-next');
+  });
+
   it('still resolves a live HTTP wait sink without posting to Lark', async () => {
     const sessionReply = vi.fn(async () => 'om_forbidden');
     const resolveWait = vi.fn();

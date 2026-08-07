@@ -720,6 +720,11 @@ export interface CodexAppGenerationCommit {
 export interface CliTurnPayload {
   content: string;
   codexAppInput?: CodexAppTurnInput;
+  /** Frozen steer authorization (codex-app ordered pre-final steer). Computed
+   * ONCE by the daemon at admission (real human interactive turn only) and COPIED
+   * verbatim into every opening/queued/fork/restore path — never re-inferred
+   * downstream, never derived from the delivery sink. Absent ⇒ forced serial. */
+  codexAppSteerable?: true;
 }
 
 /** Exact ordered successor retained behind an adapter-ACKed activation. */
