@@ -13,14 +13,15 @@ function reportCommandSource(): string {
 }
 
 describe('botmux report daemon IPC auth wiring', () => {
-  it('uses the authenticated daemon client for same-host orchestrator injection', () => {
+  it('uses the authenticated daemon client when the host secret is available', () => {
     const source = reportCommandSource();
 
     expect(source).toContain(
-      "response = await fetchDaemonIpc(daemon.ipcPort, '/api/trigger', {",
+      "response = await fetchDaemonIpc(targetDaemon.ipcPort, '/api/trigger', {",
     );
+    expect(source).toContain('}, hostSecret);');
     expect(source).not.toContain(
-      'response = await fetch(`http://127.0.0.1:${daemon.ipcPort}/api/trigger`',
+      'response = await fetch(`http://127.0.0.1:${targetDaemon.ipcPort}/api/trigger`',
     );
   });
 });
