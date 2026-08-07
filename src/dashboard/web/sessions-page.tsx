@@ -1973,6 +1973,15 @@ function CreateSessionDialog(props: {
   const [botQuery, setBotQuery] = useState('');
   const [keepOpen, setKeepOpen] = useState(() => readStoredCreateKeepOpen(windowStorage()));
   const [keptSuccess, setKeptSuccess] = useState<any>(null);
+  const [feedGroups, setFeedGroups] = useState<Array<{ groupId: string; name: string }>>([]);
+  const [feedGroupAppId, setFeedGroupAppId] = useState('');
+  const [feedGroupId, setFeedGroupId] = useState('');
+  const [newFeedGroupName, setNewFeedGroupName] = useState('');
+  const [feedGroupError, setFeedGroupError] = useState('');
+  const [feedGroupLoading, setFeedGroupLoading] = useState(false);
+  const [feedGroupAuthSubmitting, setFeedGroupAuthSubmitting] = useState(false);
+  const [feedGroupAuthUrl, setFeedGroupAuthUrl] = useState('');
+  const [feedGroupCallbackUrl, setFeedGroupCallbackUrl] = useState('');
   const [mentionTrigger, setMentionTrigger] = useState<MentionTrigger | null>(null);
   const [mentionIndex, setMentionIndex] = useState(0);
   const contentRef = useRef<HTMLTextAreaElement>(null);
@@ -1992,10 +2001,89 @@ function CreateSessionDialog(props: {
     setSubmitting(false);
     setBotQuery('');
     setKeptSuccess(null);
+    setFeedGroupId('');
+    setNewFeedGroupName('');
+    setFeedGroupError('');
+    setFeedGroupAuthUrl('');
+    setFeedGroupCallbackUrl('');
     setMentionTrigger(null);
     setMentionIndex(0);
     nextImageOrdinalRef.current = 1;
   }, [state]);
+
+  useEffect(() => {
+    if (!feedGroupAuthUrl) return;
+    let alive = true;
+    const timer = window.setInterval(() => {
+      void fetch('/api/feed-groups')
+        .then(async response => {
+          const body = await response.json().catch(() => ({}));
+          if (!response.ok || !body.ok || !alive) return;
+          setFeedGroups(Array.isArray(body.groups) ? body.groups : []);
+          setFeedGroupAppId(typeof body.larkAppId === 'string' ? body.larkAppId : '');
+          setFeedGroupError('');
+          setFeedGroupAuthUrl('');
+          setFeedGroupCallbackUrl('');
+        })
+        .catch(() => { /* remote/manual fallback remains visible */ });
+    }, 1_000);
+    return () => { alive = false; window.clearInterval(timer); };
+  }, [feedGroupAuthUrl]);
+
+  useEffect(() => {
+    if (!state || state.loading || state.success) return;
+    let alive = true;
+    setFeedGroupLoading(true);
+    void fetch('/api/feed-groups')
+      .then(async response => {
+        const body = await response.json().catch(() => ({}));
+        if (!response.ok || !body.ok) throw new Error(body.message ?? body.error ?? `HTTP ${response.status}`);
+        if (!alive) return;
+        setFeedGroups(Array.isArray(body.groups) ? body.groups : []);
+        setFeedGroupAppId(typeof body.larkAppId === 'string' ? body.larkAppId : '');
+        setFeedGroupError('');
+      })
+      .catch(error => { if (alive) setFeedGroupError(error instanceof Error ? error.message : String(error)); })
+      .finally(() => { if (alive) setFeedGroupLoading(false); });
+    return () => { alive = false; };
+  }, [state]);
+
+  const openFeedGroupLogin = async (): Promise<void> => {
+    const query = feedGroupAppId ? `?larkAppId=${encodeURIComponent(feedGroupAppId)}` : '';
+    const response = await fetch(`/api/feed-groups/auth-url${query}`);
+    const body = await response.json().catch(() => ({}));
+    if (!response.ok || !body.authUrl) {
+      alert(body.error ?? `HTTP ${response.status}`);
+      return;
+    }
+    setFeedGroupAuthUrl(String(body.authUrl));
+    setFeedGroupCallbackUrl('');
+  };
+
+  const completeFeedGroupLogin = async (callbackUrl: string): Promise<void> => {
+    setFeedGroupAuthSubmitting(true);
+    try {
+      const response = await fetch('/api/feed-groups/oauth-callback', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ callbackUrl: callbackUrl.trim() }),
+      });
+      const body = await response.json().catch(() => ({}));
+      if (!response.ok || !body.ok) throw new Error(body.message ?? body.error ?? `HTTP ${response.status}`);
+      const groupsResponse = await fetch('/api/feed-groups');
+      const groupsBody = await groupsResponse.json().catch(() => ({}));
+      if (!groupsResponse.ok || !groupsBody.ok) throw new Error(groupsBody.message ?? groupsBody.error ?? `HTTP ${groupsResponse.status}`);
+      setFeedGroups(Array.isArray(groupsBody.groups) ? groupsBody.groups : []);
+      setFeedGroupAppId(typeof groupsBody.larkAppId === 'string' ? groupsBody.larkAppId : '');
+      setFeedGroupError('');
+      setFeedGroupAuthUrl('');
+      setFeedGroupCallbackUrl('');
+    } catch (error) {
+      alert(error instanceof Error ? error.message : String(error));
+    } finally {
+      setFeedGroupAuthSubmitting(false);
+    }
+  };
 
   if (!state) return null;
   if (state.success) {
@@ -2156,6 +2244,9 @@ function CreateSessionDialog(props: {
           leadLarkAppId: mode === 'lead' ? leadLarkAppId : undefined,
           name: name.trim() || undefined,
           bindWorkingDir: bindWorkingDir.trim() || undefined,
+          feedGroupId: feedGroupId || undefined,
+          newFeedGroupName: newFeedGroupName.trim() || undefined,
+          feedGroupAppId: (feedGroupId || newFeedGroupName.trim()) ? feedGroupAppId : undefined,
           images: images.map(image => ({
             name: image.name,
             mimeType: image.mimeType,
@@ -2317,6 +2408,25 @@ function CreateSessionDialog(props: {
           <label><input type="radio" name="mode" value="all" checked={mode === 'all'} onChange={() => setMode('all')} /> {t('sessions.create.modeAll')}</label>
           <small>{t('sessions.create.modeHelp')}</small>
         </fieldset>
+        {feedGroupAuthUrl ? (
+          <div className="feed-group-auth-overlay">
+            <section className="feed-group-auth-card" role="dialog" aria-modal="true" aria-labelledby="session-feed-group-auth-title">
+              <h3 id="session-feed-group-auth-title">授权飞书标签</h3>
+              <p>点击下面的按钮，在飞书页面确认授权。如果 BotMux 与浏览器在同一台电脑，确认后会自动完成授权。如果 BotMux 运行在远程虚拟机上，浏览器会因无法访问本机地址 <code>127.0.0.1:9768</code> 而显示“无法访问”；此时请复制地址栏中的完整链接并粘贴到下方。</p>
+              <button type="button" className="primary feed-group-auth-open" onClick={() => window.open(feedGroupAuthUrl, '_blank', 'noopener')}>跳转飞书授权</button>
+              <label>
+                <span>请把点击授权后的完整链接粘贴在这里</span>
+                <input type="url" value={feedGroupCallbackUrl} placeholder="http://127.0.0.1:9768/callback?code=…&state=…" onChange={event => setFeedGroupCallbackUrl(event.currentTarget.value)} />
+              </label>
+              <div className="actions">
+                <button type="button" onClick={() => { setFeedGroupAuthUrl(''); setFeedGroupCallbackUrl(''); }}>取消</button>
+                <button type="button" className="primary" disabled={!feedGroupCallbackUrl.trim() || feedGroupAuthSubmitting} onClick={() => void completeFeedGroupLogin(feedGroupCallbackUrl)}>
+                  {feedGroupAuthSubmitting ? '正在完成授权…' : '完成授权'}
+                </button>
+              </div>
+            </section>
+          </div>
+        ) : null}
         <fieldset className="cs-lead-row" hidden={mode !== 'lead'}>
           <legend>{t('sessions.create.lead')}</legend>
           <select name="lead" disabled={leadOptions.length === 0} value={leadOptions.includes(lead) ? lead : ''} onChange={event => setLead(event.currentTarget.value)}>
@@ -2351,6 +2461,36 @@ function CreateSessionDialog(props: {
               <span>{t('sessions.create.groupName')}</span>
               <input className="cs-pill-input" type="text" name="name" maxLength={60} placeholder={t('sessions.create.groupNamePlaceholder')} value={name} onChange={event => setName(event.currentTarget.value)} />
             </label>
+            <fieldset className="cs-feed-group">
+              <legend>飞书标签（可选）</legend>
+              <select
+                value={feedGroupId}
+                disabled={feedGroupLoading || !!feedGroupError}
+                onChange={event => { setFeedGroupId(event.currentTarget.value); if (event.currentTarget.value) setNewFeedGroupName(''); }}
+              >
+                <option value="">点击选择已有标签（可选）</option>
+                {feedGroups.map(group => <option key={group.groupId} value={group.groupId}>{group.name}</option>)}
+              </select>
+              <input
+                type="text"
+                value={newFeedGroupName}
+                maxLength={60}
+                placeholder="或输入新标签名称"
+                disabled={!!feedGroupId || feedGroupLoading || !!feedGroupError}
+                onChange={event => setNewFeedGroupName(event.currentTarget.value.trimStart())}
+              />
+              <small>点击下拉框可选择已有标签，将新建群聊归入该标签；也可以输入名称创建新标签。</small>
+              {feedGroupLoading ? <small>正在读取飞书标签…</small> : null}
+              {feedGroupError ? (
+                <div className="cs-warn">
+                  <small>{feedGroupError}</small>{' '}
+                  <button type="button" disabled={feedGroupAuthSubmitting} onClick={() => void openFeedGroupLogin()}>
+                    {feedGroupAuthSubmitting ? '正在完成授权…' : '立即授权'}
+                  </button>
+                  <small> 授权后会弹窗提示你粘贴回调地址。</small>
+                </div>
+              ) : null}
+            </fieldset>
             <label className="cs-advanced-field">
               <span>{t('sessions.create.workingDir')}</span>
               <input className="cs-pill-input" type="text" name="bindWorkingDir" placeholder="e.g. ~/projects/foo" value={bindWorkingDir} onChange={event => setBindWorkingDir(event.currentTarget.value)} />
