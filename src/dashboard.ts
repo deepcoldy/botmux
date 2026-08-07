@@ -3636,10 +3636,14 @@ const server = createServer(async (req, res) => {
       if (missing.length > 0) return jsonRes(res, 400, { ok: false, error: 'skill_not_installed', missing });
 
       const referencesBySkill = await dashboardSkillReferencesMany(names);
-      const references = names.map(name => ({ name, refs: referencesBySkill.get(name) ?? { bots: [] } }));
+      const references = names.map(name => ({ name, refs: referencesBySkill.get(name) ?? { bots: [], packs: [] } }));
       const affectedSkills = references
-        .filter(item => item.refs.bots.length > 0)
-        .map(item => ({ name: item.name, affectedBots: item.refs.bots }));
+        .filter(item => item.refs.bots.length > 0 || item.refs.packs.length > 0)
+        .map(item => ({
+          name: item.name,
+          affectedBots: item.refs.bots,
+          affectedPacks: item.refs.packs,
+        }));
       if (body.force !== true && affectedSkills.length > 0) {
         return jsonRes(res, 409, {
           ok: false,
@@ -3763,11 +3767,12 @@ const server = createServer(async (req, res) => {
       const force = url.searchParams.get('force') === '1';
       if (!readSkillRegistry().skills[name]) return jsonRes(res, 400, { ok: false, error: 'skill_not_installed' });
       const refs = await dashboardSkillReferences(name);
-      if (!force && refs.bots.length > 0) {
+      if (!force && (refs.bots.length > 0 || refs.packs.length > 0)) {
         return jsonRes(res, 409, {
           ok: false,
           error: 'skill_in_use',
           affectedBots: refs.bots,
+          affectedPacks: refs.packs,
         });
       }
       const r = removeInstalledSkill(name);
@@ -3775,6 +3780,7 @@ const server = createServer(async (req, res) => {
       return jsonRes(res, 200, {
         ok: true,
         affectedBots: refs.bots,
+        affectedPacks: refs.packs,
         ...dashboardSkillsPayload(),
       });
     }

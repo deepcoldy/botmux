@@ -14,6 +14,7 @@ import {
   danglingSkillNames,
   discoveryGroupKey,
   mergeBotAssignmentSelectors,
+  packIds,
   policyConfigured,
   priorityNames,
   selectInstallCandidates,
@@ -812,6 +813,7 @@ export function RemoveSkillsDialog(props: {
   const force = props.references.length > 0;
   const visibleNames = names.slice(0, 3);
   const referencedBotCount = new Set(props.references.flatMap(reference => reference.bots)).size;
+  const referencedPackCount = new Set(props.references.flatMap(reference => reference.packs)).size;
 
   useEffect(() => {
     const dialog = dialogRef.current;
@@ -847,8 +849,12 @@ export function RemoveSkillsDialog(props: {
               : tr('skills.removeManyTitle', { count: names.length })}</h3>
           <p>{force
             ? names.length === 1
-              ? tr('skills.removeInUseOneHelp', { count: referencedBotCount })
-              : tr('skills.removeInUseManyHelp', { count: referencedBotCount })
+              ? referencedPackCount > 0
+                ? tr('skills.removeInUseOneHelpWithPacks', { botCount: referencedBotCount, packCount: referencedPackCount })
+                : tr('skills.removeInUseOneHelp', { count: referencedBotCount })
+              : referencedPackCount > 0
+                ? tr('skills.removeInUseManyHelpWithPacks', { botCount: referencedBotCount, packCount: referencedPackCount })
+                : tr('skills.removeInUseManyHelp', { count: referencedBotCount })
             : names.length === 1
               ? tr('skills.removeOnePermanentHelp')
               : tr('skills.removePermanentHelp')}</p>
@@ -867,7 +873,14 @@ export function RemoveSkillsDialog(props: {
               <strong>{tr('skills.removeReferencesDetail')}</strong>
               <ul>
                 {props.references.map(reference => (
-                  <li key={reference.name}><strong>{reference.name}</strong><span>{reference.bots.join(', ')}</span></li>
+                  <li key={reference.name}>
+                    <strong>{reference.name}</strong>
+                    <span>
+                      {reference.bots.join(', ')}
+                      {reference.bots.length > 0 && reference.packs.length > 0 ? ' · ' : ''}
+                      {reference.packs.length > 0 ? `${tr('skills.packChips')}: ${reference.packs.join(', ')}` : ''}
+                    </span>
+                  </li>
                 ))}
               </ul>
             </div>
@@ -940,7 +953,7 @@ export function SkillsPage() {
 
   const [globalBusy, setGlobalBusy] = useState<'project' | 'delivery' | null>(null);
   const [skillBusy, setSkillBusy] = useState<string | null>(null);
-  const [botBusy, setBotBusy] = useState<string | null>(null);
+  const [busyBotIds, setBusyBotIds] = useState<Set<string>>(() => new Set());
   const [botStatuses, setBotStatuses] = useState<Record<string, StatusMessage>>({});
   const [installedStatus, setInstalledStatus] = useState<StatusMessage>(null);
   const [pendingRemoval, setPendingRemoval] = useState<string[] | null>(null);
@@ -948,6 +961,12 @@ export function SkillsPage() {
   const [removalReferences, setRemovalReferences] = useState<SkillRemovalReference[]>([]);
   const [removalError, setRemovalError] = useState<string | null>(null);
   const [removingNames, setRemovingNames] = useState<Set<string>>(() => new Set());
+  const botsRef = useRef(bots);
+  const botAssignmentQueuesRef = useRef(new Map<string, Promise<void>>());
+
+  useEffect(() => {
+    botsRef.current = bots;
+  }, [bots]);
 
   const installedNames = useMemo(() => new Set(skills.map(skill => skill.name)), [skills]);
   const activeDiscoveryGroup = useMemo(() => {
@@ -1355,7 +1374,10 @@ export function SkillsPage() {
             const bots = Array.isArray(item?.affectedBots)
               ? item.affectedBots.map((bot: any) => bot?.botName || bot?.larkAppId || '').filter(Boolean)
               : referencingBotLabels(name);
-            return name ? { name, bots } : null;
+            const packs = Array.isArray(item?.affectedPacks)
+              ? item.affectedPacks.filter((pack: unknown): pack is string => typeof pack === 'string')
+              : [];
+            return name ? { name, bots, packs } : null;
           }).filter((item: SkillRemovalReference | null): item is SkillRemovalReference => item !== null)
           : [];
         setRemovalReferences(references);
@@ -1372,15 +1394,30 @@ export function SkillsPage() {
     }
   }
 
-  async function setBotAssignment(appId: string, skillNames: string[], packIdsList: string[]): Promise<void> {
-    const busyKey = `${appId}:set`;
-    setBotBusy(busyKey);
+  function enqueueBotAssignment(appId: string, operation: () => Promise<void>): Promise<void> {
+    const previous = botAssignmentQueuesRef.current.get(appId) ?? Promise.resolve();
+    setBusyBotIds(current => new Set(current).add(appId));
+    const task = previous.catch(() => undefined).then(operation);
+    botAssignmentQueuesRef.current.set(appId, task);
+    return task.finally(() => {
+      if (botAssignmentQueuesRef.current.get(appId) !== task) return;
+      botAssignmentQueuesRef.current.delete(appId);
+      if (!mountedRef.current) return;
+      setBusyBotIds(current => {
+        const next = new Set(current);
+        next.delete(appId);
+        return next;
+      });
+    });
+  }
+
+  async function persistBotAssignment(appId: string, skillNames: string[], packIdsList: string[]): Promise<void> {
     setBotStatuses(statuses => ({ ...statuses, [appId]: null }));
     try {
       // Single merge-write: direct skills + packs are saved together to avoid two
       // full-policy PUTs racing and silently overwriting each other. Unknown
       // selectors (e.g. set via CLI) are retained for forward/downgrade compat.
-      const currentBot = bots.find(bot => bot.larkAppId === appId);
+      const currentBot = botsRef.current.find(bot => bot.larkAppId === appId);
       const mergedInclude = mergeBotAssignmentSelectors(currentBot?.skills, skillNames, packIdsList);
       const body = await jsonRequest(`/api/bots/${encodeURIComponent(appId)}/skills`, {
         method: 'PUT',
@@ -1390,7 +1427,11 @@ export function SkillsPage() {
         }),
       });
       if (!mountedRef.current) return;
-      setBots(rows => rows.map(bot => bot.larkAppId === appId ? { ...bot, skills: body.skills ?? null } : bot));
+      const updateBot = (rows: BotRow[]) => rows.map(bot => (
+        bot.larkAppId === appId ? { ...bot, skills: body.skills ?? null } : bot
+      ));
+      botsRef.current = updateBot(botsRef.current);
+      setBots(updateBot);
       setBotStatuses(statuses => ({
         ...statuses,
         [appId]: { text: tr('skills.policySaved'), ok: true },
@@ -1403,9 +1444,32 @@ export function SkillsPage() {
         }));
       }
       throw err;
-    } finally {
-      if (mountedRef.current) setBotBusy(null);
     }
+  }
+
+  function setBotAssignment(appId: string, skillNames: string[], packIdsList: string[]): Promise<void> {
+    return enqueueBotAssignment(appId, () => persistBotAssignment(appId, skillNames, packIdsList));
+  }
+
+  function mutateBotAssignment(
+    appId: string,
+    selector: `skill:${string}` | `pack:${string}`,
+    present: boolean,
+  ): Promise<void> {
+    return enqueueBotAssignment(appId, async () => {
+      const currentBot = botsRef.current.find(bot => bot.larkAppId === appId);
+      const skillNames = priorityNames(currentBot?.skills);
+      const packIdsList = packIds(currentBot?.skills);
+      const [kind, value] = selector.split(':', 2) as ['skill' | 'pack', string];
+      const update = (values: string[]) => present
+        ? [...new Set([...values, value])]
+        : values.filter(item => item !== value);
+      await persistBotAssignment(
+        appId,
+        kind === 'skill' ? update(skillNames) : skillNames,
+        kind === 'pack' ? update(packIdsList) : packIdsList,
+      );
+    });
   }
 
   async function setBotInjection(appId: string, value: 'global' | 'prompt' | 'off'): Promise<void> {
@@ -1608,6 +1672,8 @@ export function SkillsPage() {
               skills={skills}
               statuses={botStatuses}
               onSave={setBotAssignment}
+              onMutate={mutateBotAssignment}
+              busyBotIds={busyBotIds}
               packs={packs}
               packsKnown={packsKnown}
               focusBotIds={navIntent?.tab === 'bots' ? navIntent.focusBotIds ?? null : null}

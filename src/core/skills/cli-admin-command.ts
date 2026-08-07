@@ -227,13 +227,17 @@ function runDiscover(args: string[]): AdminCommandResult {
   const parsed = parseSkillInstallSource(source);
   let discovery: ReturnType<typeof discoverLocalSkillCandidates>;
   if (parsed.kind === 'local') {
-    discovery = discoverLocalSkillCandidates(parsed.value, { fullDepth });
+    discovery = discoverLocalSkillCandidates(parsed.value, {
+      fullDepth,
+      fallbackToFullDepth: !fullDepth,
+    });
   } else if (parsed.kind === 'git') {
     discovery = discoverGitSkillCandidates({
       url: parsed.value,
       ref: argValue(args, '--ref'),
       path: argValue(args, '--path'),
       fullDepth,
+      fallbackToFullDepth: !fullDepth,
     });
   } else {
     const gh = parsed.github;
@@ -243,6 +247,7 @@ function runDiscover(args: string[]): AdminCommandResult {
       ref: argValue(args, '--ref') ?? gh.ref,
       path: argValue(args, '--path') ?? gh.path,
       fullDepth,
+      fallbackToFullDepth: !fullDepth,
     });
   }
   if (hasFlag(args, '--json')) return { code: 0, stdout: JSON.stringify(discovery, null, 2) + '\n', stderr: '' };
@@ -466,7 +471,7 @@ export function runSkillsAdminCommand(args: string[]): AdminCommandResult {
       if (!name) return { code: 2, stdout: '', stderr: 'usage: botmux skills remove <name> [--force]\n' };
       if (!readSkillRegistry().skills[name]) return { code: 1, stdout: '', stderr: 'skill_not_installed\n' };
       const refs = findSkillReferences(name);
-      if (!hasFlag(args, '--force') && refs.bots.length > 0) {
+      if (!hasFlag(args, '--force') && (refs.bots.length > 0 || refs.packs.length > 0)) {
         return { code: 1, stdout: '', stderr: formatSkillReferenceWarning(refs) };
       }
       const result = removeInstalledSkill(name);

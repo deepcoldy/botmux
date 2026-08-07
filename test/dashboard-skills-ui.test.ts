@@ -318,7 +318,7 @@ describe('installed Skills library', () => {
     act(() => {
       renderer = TestRenderer.create(React.createElement(RemoveSkillsDialog, {
         names: ['apple-design'],
-        references: [{ name: 'apple-design', bots: ['设计 Bot', '开发 Bot'] }],
+        references: [{ name: 'apple-design', bots: ['设计 Bot', '开发 Bot'], packs: [] }],
         busy: false,
         error: null,
         onCancel: vi.fn(),
@@ -332,5 +332,23 @@ describe('installed Skills library', () => {
     expect(root.findAllByType('button').map(node => node.children.join(''))).toContain('仍要删除');
     expect(root.findByType('li').findByType('span').children.join('')).toBe('设计 Bot, 开发 Bot');
     expect(root.findAllByType('ul')).toHaveLength(1);
+  });
+
+  it('shows pack references in the forced removal confirmation', () => {
+    let renderer!: TestRenderer.ReactTestRenderer;
+    act(() => {
+      renderer = TestRenderer.create(React.createElement(RemoveSkillsDialog, {
+        names: ['apple-design'],
+        references: [{ name: 'apple-design', bots: [], packs: ['design-pack'] }],
+        busy: false,
+        error: null,
+        onCancel: vi.fn(),
+        onConfirm: vi.fn(),
+      }));
+    });
+
+    const text = JSON.stringify(renderer.toJSON());
+    expect(text).toContain('1 个 Skill Pack 引用');
+    expect(text).toContain('design-pack');
   });
 });

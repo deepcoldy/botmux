@@ -65,6 +65,7 @@ describe('botmux skills admin command', () => {
     run('git', ['config', 'user.name', 'botmux'], repo);
     write(join(repo, 'skills', 'deploy', 'SKILL.md'), '---\nname: deploy\n---\n# Deploy');
     write(join(repo, 'skills', 'review', 'SKILL.md'), '---\nname: review\ndescription: Review code\n---\n# Review');
+    write(join(repo, 'plugins', 'p', 'skills', 'nested', 'SKILL.md'), '---\nname: nested\n---\n# Nested');
     run('git', ['add', '.'], repo);
     run('git', ['commit', '-m', 'add skills'], repo);
     const source = `git+file://${repo}`;
@@ -73,6 +74,7 @@ describe('botmux skills admin command', () => {
     expect(discovered.code).toBe(0);
     expect(discovered.stdout).toContain('deploy\tskills/deploy');
     expect(discovered.stdout).toContain('review\tskills/review\tReview code');
+    expect(discovered.stdout).toContain('nested\tplugins/p/skills/nested');
 
     const blocked = runSkillsAdminCommand(['install', source, '--ref', 'HEAD']);
     expect(blocked.code).toBe(1);
@@ -106,6 +108,25 @@ describe('botmux skills admin command', () => {
     expect(blocked.code).toBe(1);
     expect(blocked.stderr).toContain('skill_in_use');
     expect(blocked.stderr).toContain('ops-bot');
+    expect(readSkillRegistry().skills.deploy).toBeDefined();
+
+    expect(runSkillsAdminCommand(['remove', 'deploy', '--force']).stdout).toContain('removed deploy');
+    expect(readSkillRegistry().skills.deploy).toBeUndefined();
+  });
+
+  it('requires --force when removing a skill referenced only by a pack', () => {
+    const dir = join(src, 'deploy');
+    write(join(dir, 'SKILL.md'), '---\nname: deploy\n---\n# Deploy');
+    runSkillsAdminCommand(['install', dir]);
+    expect(runSkillsAdminCommand([
+      'pack', 'create', '--id', 'ops', '--name', 'Ops', '--skill', 'deploy',
+    ]).code).toBe(0);
+
+    const blocked = runSkillsAdminCommand(['remove', 'deploy']);
+
+    expect(blocked.code).toBe(1);
+    expect(blocked.stderr).toContain('skill_in_use');
+    expect(blocked.stderr).toContain('packs: ops');
     expect(readSkillRegistry().skills.deploy).toBeDefined();
 
     expect(runSkillsAdminCommand(['remove', 'deploy', '--force']).stdout).toContain('removed deploy');

@@ -78,6 +78,96 @@ describe('bot assignments tab', () => {
     expect(onSave).toHaveBeenCalledWith('app-1', [], ['p1']);
   });
 
+  it('uses a selector mutation for drag assignment when the parent provides one', async () => {
+    const onSave = vi.fn(async () => {});
+    const onMutate = vi.fn(async () => {});
+    let renderer!: TestRenderer.ReactTestRenderer;
+    act(() => {
+      renderer = TestRenderer.create(React.createElement(BotAssignmentsTab, {
+        bots: [bot()],
+        skills,
+        statuses: {},
+        onSave,
+        onMutate,
+        packs,
+      }));
+    });
+    const root = renderer.root;
+    const palettePack = root.findByProps({
+      'data-palette-drag-type': 'pack',
+      'data-palette-drag-id': 'p1',
+    });
+    const row = root.findAllByType('tr')
+      .find((node: any) => String(node.props.className).includes('skills-bot-row'))!;
+
+    act(() => { palettePack.props.onDragStart(dragEvent()); });
+    await act(async () => { row.props.onDrop(dragEvent()); await Promise.resolve(); });
+
+    expect(onMutate).toHaveBeenCalledWith('app-1', 'pack:p1', true);
+    expect(onSave).not.toHaveBeenCalled();
+  });
+
+  it('disables an in-flight Bot row and its assigned drag handles', () => {
+    let renderer!: TestRenderer.ReactTestRenderer;
+    act(() => {
+      renderer = TestRenderer.create(React.createElement(BotAssignmentsTab, {
+        bots: [bot({ skills: { include: ['pack:p1'] } })],
+        skills,
+        statuses: {},
+        onSave: async () => {},
+        busyBotIds: new Set(['app-1']),
+        packs,
+      }));
+    });
+    const root = renderer.root;
+    const paletteSkill = root.findByProps({
+      'data-palette-drag-type': 'skill',
+      'data-palette-drag-id': 'a',
+    });
+    const row = root.findAllByType('tr')
+      .find((node: any) => String(node.props.className).includes('skills-bot-row'))!;
+    const assignedPack = root.findByProps({
+      'data-assigned-drag-type': 'pack',
+      'data-assigned-drag-id': 'p1',
+      'data-assigned-bot': 'app-1',
+    });
+
+    expect(row.props['aria-busy']).toBe(true);
+    expect(assignedPack.props.draggable).toBe(false);
+    act(() => { paletteSkill.props.onDragStart(dragEvent()); });
+    const overEvent = dragEvent();
+    act(() => { row.props.onDragOver(overEvent); });
+    expect(overEvent.preventDefault).not.toHaveBeenCalled();
+  });
+
+  it('renders row-level failure feedback and consumes a rejected drop promise', async () => {
+    const onMutate = vi.fn(async () => { throw new Error('save failed'); });
+    let renderer!: TestRenderer.ReactTestRenderer;
+    act(() => {
+      renderer = TestRenderer.create(React.createElement(BotAssignmentsTab, {
+        bots: [bot()],
+        skills,
+        statuses: { 'app-1': { text: '失败：save failed', ok: false } },
+        onSave: async () => {},
+        onMutate,
+        packs,
+      }));
+    });
+    const root = renderer.root;
+    const palettePack = root.findByProps({
+      'data-palette-drag-type': 'pack',
+      'data-palette-drag-id': 'p1',
+    });
+    const row = root.findAllByType('tr')
+      .find((node: any) => String(node.props.className).includes('skills-bot-row'))!;
+
+    act(() => { palettePack.props.onDragStart(dragEvent()); });
+    await act(async () => { row.props.onDrop(dragEvent()); await Promise.resolve(); });
+
+    expect(onMutate).toHaveBeenCalledTimes(1);
+    expect(JSON.stringify(renderer.toJSON())).toContain('失败：save failed');
+  });
+
   it('explains a duplicate drop instead of silently saving or failing', async () => {
     vi.useFakeTimers();
     try {

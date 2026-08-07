@@ -9,6 +9,12 @@ interface BotAssignmentsTabProps {
   skills: SkillRow[];
   statuses: Record<string, StatusMessage>;
   onSave: (appId: string, names: string[], packIds: string[]) => Promise<void>;
+  onMutate?: (
+    appId: string,
+    selector: `skill:${string}` | `pack:${string}`,
+    present: boolean,
+  ) => Promise<void>;
+  busyBotIds?: ReadonlySet<string>;
   packs: Array<{ id: string; name: string; include: string[] }>;
   /** false = pack data never loaded; pack-derived health reads "unknown" */
   packsKnown?: boolean;
@@ -103,7 +109,11 @@ export function BotAssignmentsTab(props: BotAssignmentsTabProps) {
         setDuplicateDrop({ botId: bot.larkAppId, itemLabel: dragItem.id });
         return;
       }
-      await props.onSave(bot.larkAppId, [...currentSkills, dragItem.id], currentPacks);
+      if (props.onMutate) {
+        await props.onMutate(bot.larkAppId, `skill:${dragItem.id}`, true);
+      } else {
+        await props.onSave(bot.larkAppId, [...currentSkills, dragItem.id], currentPacks);
+      }
     } else {
       if (currentPacks.includes(dragItem.id)) {
         setDuplicateDrop({
@@ -112,7 +122,11 @@ export function BotAssignmentsTab(props: BotAssignmentsTabProps) {
         });
         return;
       }
-      await props.onSave(bot.larkAppId, currentSkills, [...currentPacks, dragItem.id]);
+      if (props.onMutate) {
+        await props.onMutate(bot.larkAppId, `pack:${dragItem.id}`, true);
+      } else {
+        await props.onSave(bot.larkAppId, currentSkills, [...currentPacks, dragItem.id]);
+      }
     }
   };
 
@@ -128,18 +142,26 @@ export function BotAssignmentsTab(props: BotAssignmentsTabProps) {
     const currentPacks = packIds(sourceBot.skills);
     if (item.type === 'skill') {
       if (!currentSkills.includes(item.id)) return;
-      await props.onSave(
-        sourceBot.larkAppId,
-        currentSkills.filter(name => name !== item.id),
-        currentPacks,
-      );
+      if (props.onMutate) {
+        await props.onMutate(sourceBot.larkAppId, `skill:${item.id}`, false);
+      } else {
+        await props.onSave(
+          sourceBot.larkAppId,
+          currentSkills.filter(name => name !== item.id),
+          currentPacks,
+        );
+      }
     } else {
       if (!currentPacks.includes(item.id)) return;
-      await props.onSave(
-        sourceBot.larkAppId,
-        currentSkills,
-        currentPacks.filter(id => id !== item.id),
-      );
+      if (props.onMutate) {
+        await props.onMutate(sourceBot.larkAppId, `pack:${item.id}`, false);
+      } else {
+        await props.onSave(
+          sourceBot.larkAppId,
+          currentSkills,
+          currentPacks.filter(id => id !== item.id),
+        );
+      }
     }
   };
 
@@ -191,7 +213,7 @@ export function BotAssignmentsTab(props: BotAssignmentsTabProps) {
               }}
               onDrop={event => {
                 event.preventDefault();
-                void handleUnassign();
+                void handleUnassign().catch(() => undefined);
               }}
             >
               <span className="skills-unassign-icon" aria-hidden="true">↩</span>
@@ -298,12 +320,15 @@ export function BotAssignmentsTab(props: BotAssignmentsTabProps) {
                   const isFocused = highlightBots.has(bot.larkAppId)
                     || (highlightSkill != null && (botInfo?.resolved.some(entry => entry.name === highlightSkill) ?? false));
                   const duplicateNotice = duplicateDrop?.botId === bot.larkAppId ? duplicateDrop : null;
+                  const status = props.statuses[bot.larkAppId] ?? null;
+                  const busy = props.busyBotIds?.has(bot.larkAppId) === true;
                   return (
                     <tr
                       key={bot.larkAppId}
-                      className={`skills-bot-row${isDragOver ? ' drag-over' : ''}${isFocused ? ' skills-bot-row-focus' : ''}`}
+                      className={`skills-bot-row${isDragOver ? ' drag-over' : ''}${isFocused ? ' skills-bot-row-focus' : ''}${busy ? ' is-busy' : ''}`}
+                      aria-busy={busy}
                       onDragOver={e => {
-                        if (!dragItem || dragItem.sourceBotId) return;
+                        if (busy || !dragItem || dragItem.sourceBotId) return;
                         e.preventDefault();
                         e.dataTransfer.dropEffect = 'copy';
                         setDragOverBot(bot.larkAppId);
@@ -313,9 +338,9 @@ export function BotAssignmentsTab(props: BotAssignmentsTabProps) {
                         setDragOverBot(prev => prev === bot.larkAppId ? null : prev);
                       }}
                       onDrop={e => {
-                        if (!dragItem || dragItem.sourceBotId) return;
+                        if (busy || !dragItem || dragItem.sourceBotId) return;
                         e.preventDefault();
-                        void handleDrop(bot);
+                        void handleDrop(bot).catch(() => undefined);
                       }}
                     >
                       <td>{bot.botName ?? bot.larkAppId}</td>
@@ -332,16 +357,18 @@ export function BotAssignmentsTab(props: BotAssignmentsTabProps) {
                                 <span
                                   key={pid}
                                   className={`skills-assigned-draggable${dragItem?.sourceBotId === bot.larkAppId && dragItem.type === 'pack' && dragItem.id === pid ? ' is-dragging' : ''}`}
-                                  draggable
+                                  draggable={!busy}
                                   data-assigned-drag-type="pack"
                                   data-assigned-drag-id={pid}
                                   data-assigned-bot={bot.larkAppId}
                                   title={tr('skills.dragToRemove')}
-                                  onDragStart={event => startDrag(
-                                    event,
-                                    { type: 'pack', id: pid, sourceBotId: bot.larkAppId },
-                                    'move',
-                                  )}
+                                  onDragStart={event => {
+                                    if (!busy) startDrag(
+                                      event,
+                                      { type: 'pack', id: pid, sourceBotId: bot.larkAppId },
+                                      'move',
+                                    );
+                                  }}
                                   onDragEnd={clearDragState}
                                 >
                                   <button
@@ -364,16 +391,18 @@ export function BotAssignmentsTab(props: BotAssignmentsTabProps) {
                               <span
                                 key={n}
                                 className={`skills-assigned-draggable${dragItem?.sourceBotId === bot.larkAppId && dragItem.type === 'skill' && dragItem.id === n ? ' is-dragging' : ''}`}
-                                draggable
+                                draggable={!busy}
                                 data-assigned-drag-type="skill"
                                 data-assigned-drag-id={n}
                                 data-assigned-bot={bot.larkAppId}
                                 title={tr('skills.dragToRemove')}
-                                onDragStart={event => startDrag(
-                                  event,
-                                  { type: 'skill', id: n, sourceBotId: bot.larkAppId },
-                                  'move',
-                                )}
+                                onDragStart={event => {
+                                  if (!busy) startDrag(
+                                    event,
+                                    { type: 'skill', id: n, sourceBotId: bot.larkAppId },
+                                    'move',
+                                  );
+                                }}
                                 onDragEnd={clearDragState}
                               >
                                 <button
@@ -403,7 +432,16 @@ export function BotAssignmentsTab(props: BotAssignmentsTabProps) {
                               {tr('skills.alreadyAssigned', { item: duplicateNotice.itemLabel })}
                             </span>
                           ) : null}
-                          <button className="bd-button" onClick={() => setEditingBot(bot)}>
+                          {status ? (
+                            <span
+                              className={`oncall-status ${status.ok ? 'hint-ok' : 'hint-warn-inline'}`}
+                              role="status"
+                              aria-live="polite"
+                            >{status.text}</span>
+                          ) : busy ? (
+                            <span className="oncall-status" role="status" aria-live="polite">{tr('skills.saving')}</span>
+                          ) : null}
+                          <button className="bd-button" disabled={busy} onClick={() => setEditingBot(bot)}>
                             {tr('skills.select')}
                           </button>
                         </div>
@@ -488,7 +526,10 @@ function BotAssignmentEditor(props: {
 
   return (
     <dialog className="bd-dialog skills-bot-editor" open onClose={props.onClose}>
-      <form method="dialog" data-action="save-bot-assignment" onSubmit={e => { e.preventDefault(); void save(); }}>
+      <form method="dialog" data-action="save-bot-assignment" onSubmit={e => {
+        e.preventDefault();
+        void save().catch(() => undefined);
+      }}>
         <h3>{tr('skills.botEdit')}: {props.bot.botName ?? props.bot.larkAppId}</h3>
         {props.status && <p className={`hint-${props.status.ok ? 'ok' : 'warn'}`}>{props.status.text}</p>}
 

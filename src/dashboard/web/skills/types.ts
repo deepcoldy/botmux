@@ -56,6 +56,7 @@ export type ProjectTrustMode = 'off' | 'all';
 export interface SkillRemovalReference {
   name: string;
   bots: string[];
+  packs: string[];
 }
 
 /** Cross-tab navigation intent: which tab to activate and what context to
