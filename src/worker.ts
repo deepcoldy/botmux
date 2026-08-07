@@ -131,7 +131,7 @@ import {
   setCodexAppThreadName,
 } from './services/codex-app-threads.js';
 import { buildBotmuxLarkNativeSessionTitle } from './core/session-title.js';
-import { drainCodexRollout, findCodexRolloutBySessionId, findCodexRolloutByPid, findCodexRolloutSetByPid, codexHistorySidIsOwned, splitCodexEventsByCutoff, extractLastCodexTurn, codexSessionIdFromRolloutPath, scanCodexThreadSettings, type CodexBridgeEvent, type CodexDrainResult } from './services/codex-transcript.js';
+import { drainCodexRollout, findCodexRolloutBySessionId, findCodexRolloutByPid, findCodexRolloutSetByPid, codexHistorySidIsOwned, splitCodexEventsByCutoff, extractLastCodexTurn, codexSessionIdFromRolloutPath, scanCodexThreadSettings, readLatestCodexRuntime, type CodexBridgeEvent, type CodexDrainResult } from './services/codex-transcript.js';
 import { CodexServiceTierTracker, resolveCodexServiceTierSnapshot } from './services/codex-service-tier.js';
 import { drainTraexRollout, findTraexRolloutBySessionId, findTraexRolloutByPid, findTraexRolloutSetByPid, readLatestTraexRuntime, traexHistorySidIsOwned, type TraexDrainResult, type TraexRuntimeSnapshot } from './services/traex-transcript.js';
 import { parseTraexUserInputQuestions } from './services/traex-user-input.js';
@@ -3839,10 +3839,14 @@ function codexBridgeAttach(rolloutPath: string, mode: 'baseline-existing' | 'bas
     codexBridgePendingTail = result.pendingTail;
     codexBridgeBaselineDone = true;
     if (structuredBridgeIsCodex()) {
-      codexServiceTierTracker.observe(
-        rolloutPath,
-        (result as CodexDrainResult).latestThreadSettings,
-      );
+      const codex = result as CodexDrainResult;
+      codexServiceTierTracker.observe(rolloutPath, codex.latestThreadSettings);
+      // Reuse this drain's turn_context observation — split-live already read
+      // the whole rollout above, so no second full-file scan is needed.
+      publishActiveRuntime({
+        model: codex.latestModel,
+        reasoningEffort: codex.latestReasoningEffort,
+      });
     }
     // Reuse this drain's runtime observation instead of a second full-file
     // scan — split-live already read the whole rollout above.
@@ -3891,6 +3895,11 @@ function codexBridgeAttach(rolloutPath: string, mode: 'baseline-existing' | 'bas
     && mode !== 'split-live'
   ) {
     codexServiceTierTracker.observe(rolloutPath, scanCodexThreadSettings(rolloutPath));
+    // Codex baseline modes cursor to the tail without draining, so seed the
+    // active runtime (model/effort from turn_context) via a bounded backward
+    // read — same as TRAE below. split-live already published from its own
+    // drain; fresh-empty has no history and picks it up on first live ingest.
+    publishActiveRuntime(readLatestCodexRuntime(rolloutPath));
   }
   // TRAE baseline modes only cursor to the tail without draining, so seed the
   // active runtime from a bounded backward read. split-live already published
@@ -4308,10 +4317,12 @@ function codexBridgeIngest(opts: { signalIdle?: boolean } = {}): void {
     });
   }
   if (structuredBridgeIsCodex()) {
-    codexServiceTierTracker.observe(
-      codexBridgeRolloutPath,
-      (result as CodexDrainResult).latestThreadSettings,
-    );
+    const codex = result as CodexDrainResult;
+    codexServiceTierTracker.observe(codexBridgeRolloutPath, codex.latestThreadSettings);
+    publishActiveRuntime({
+      model: codex.latestModel ?? publishedActiveRuntime.model,
+      reasoningEffort: codex.latestReasoningEffort ?? publishedActiveRuntime.reasoningEffort,
+    });
   }
   if (result.events.length > 0) lastStructuredBridgeActivityAtMs = Date.now();
   codexBridgeQueue.ingest(result.events);

@@ -5550,14 +5550,13 @@ function setupWorkerHandlers(
         ds.codexServiceTier = effectiveCliId === 'codex'
           ? (msg.snapshot ?? undefined)
           : undefined;
-        // Codex has no active_runtime channel (that path is TRAE-gated), but
-        // its thread_settings_applied snapshot carries the executor-confirmed
-        // model/effort — surface them through the same in-memory fields the
-        // card reads so an in-session /model or /effort switch is reflected.
-        if (effectiveCliId === 'codex') {
-          ds.activeModel = ds.codexServiceTier?.model?.trim() || undefined;
-          ds.activeReasoningEffort = ds.codexServiceTier?.reasoningEffort?.trim() || undefined;
-        }
+        // Model/effort now flow through the active_runtime channel (Codex
+        // publishes them from every turn_context, same as TRAE), so this
+        // handler is scoped to the ⚡ service-tier badge only and must NOT
+        // also write activeModel/activeReasoningEffort — doing so would race
+        // the active_runtime writer and, since thread_settings_applied is not
+        // emitted in many sessions, could clobber the good value with a stale
+        // one.
         scheduleCodexServiceTierPatch(ds);
         break;
       }

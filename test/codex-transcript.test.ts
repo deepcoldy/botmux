@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, writeFileSync, appendFileSync, rmSync, statSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { drainCodexRollout, codexSessionIdFromRolloutPath, findCodexRolloutBySessionId, findCodexSessionIdByBotmuxSessionId, codexHistorySidIsOwned, splitCodexEventsByCutoff, extractLastCodexTurn, scanCodexThreadSettings, type CodexBridgeEvent } from '../src/services/codex-transcript.js';
+import { drainCodexRollout, codexSessionIdFromRolloutPath, findCodexRolloutBySessionId, findCodexSessionIdByBotmuxSessionId, codexHistorySidIsOwned, splitCodexEventsByCutoff, extractLastCodexTurn, scanCodexThreadSettings, readLatestCodexRuntime, type CodexBridgeEvent } from '../src/services/codex-transcript.js';
 
 let dir: string;
 let path: string;
@@ -608,3 +608,98 @@ describe('Codex thread settings observation', () => {
     });
   });
 });
+
+function turnContext(opts: {
+  model?: string;
+  effort?: string;
+  settingsModel?: string;
+  settingsEffort?: string;
+  ts?: string;
+} = {}) {
+  const payload: any = { turn_id: `turn-${opts.ts ?? 'x'}` };
+  if (opts.model !== undefined) payload.model = opts.model;
+  if (opts.effort !== undefined) payload.effort = opts.effort;
+  if (opts.settingsModel !== undefined || opts.settingsEffort !== undefined) {
+    payload.collaboration_mode = {
+      settings: {
+        ...(opts.settingsModel !== undefined ? { model: opts.settingsModel } : {}),
+        ...(opts.settingsEffort !== undefined ? { reasoning_effort: opts.settingsEffort } : {}),
+      },
+    };
+  }
+  return {
+    timestamp: opts.ts ?? '2026-04-29T07:00:00.000Z',
+    type: 'turn_context',
+    payload,
+  };
+}
+
+describe('Codex turn_context runtime (drain)', () => {
+  it('surfaces model + effort from a turn_context (the per-turn source)', () => {
+    writeFileSync(path, ev(turnContext({ model: 'gpt-5.6-sol', effort: 'xhigh' })));
+    const r = drainCodexRollout(path, 0);
+    expect(r.latestModel).toBe('gpt-5.6-sol');
+    expect(r.latestReasoningEffort).toBe('xhigh');
+  });
+
+  it('falls back to collaboration_mode.settings for model/effort', () => {
+    writeFileSync(path, ev(turnContext({ settingsModel: 'gpt-5.6-sol', settingsEffort: 'high' })));
+    const r = drainCodexRollout(path, 0);
+    expect(r.latestModel).toBe('gpt-5.6-sol');
+    expect(r.latestReasoningEffort).toBe('high');
+  });
+
+  it('is latest-wins across multiple turn_context records (independent /model, /effort)', () => {
+    writeFileSync(path,
+      ev(turnContext({ model: 'gpt-5.6-sol', effort: 'low', ts: '2026-04-29T07:00:00.000Z' }))
+      + ev(userResponseItem('switch'))
+      + ev(turnContext({ model: 'gpt-5.6-pro', effort: 'xhigh', ts: '2026-04-29T07:01:00.000Z' })));
+    const r = drainCodexRollout(path, 0);
+    expect(r.latestModel).toBe('gpt-5.6-pro');
+    expect(r.latestReasoningEffort).toBe('xhigh');
+  });
+
+  it('leaves runtime undefined when no turn_context appears', () => {
+    writeFileSync(path, ev(userResponseItem('hi')) + ev(assistantFinalResponseItem('yo')));
+    const r = drainCodexRollout(path, 0);
+    expect(r.latestModel).toBeUndefined();
+    expect(r.latestReasoningEffort).toBeUndefined();
+  });
+
+  it('reports runtime only from the newly appended byte range on an incremental drain', () => {
+    writeFileSync(path, ev(turnContext({ model: 'gpt-5.6-sol', effort: 'low' })));
+    const first = drainCodexRollout(path, 0);
+    expect(first.latestReasoningEffort).toBe('low');
+    appendFileSync(path,
+      ev(userResponseItem('go'))
+      + ev(turnContext({ model: 'gpt-5.6-sol', effort: 'xhigh', ts: '2026-04-29T07:02:00.000Z' })));
+    const second = drainCodexRollout(path, first.newOffset);
+    expect(second.latestReasoningEffort).toBe('xhigh');
+  });
+});
+
+describe('readLatestCodexRuntime (attach bootstrap)', () => {
+  it('returns {} for a missing / empty rollout', () => {
+    expect(readLatestCodexRuntime(join(dir, 'nope.jsonl'))).toEqual({});
+    writeFileSync(path, '');
+    expect(readLatestCodexRuntime(path)).toEqual({});
+  });
+
+  it('reads the newest turn_context model + effort near the tail', () => {
+    writeFileSync(path,
+      ev(turnContext({ model: 'gpt-5.6-sol', effort: 'low', ts: '2026-04-29T07:00:00.000Z' }))
+      + ev(userResponseItem('later'))
+      + ev(turnContext({ model: 'gpt-5.6-pro', effort: 'xhigh', ts: '2026-04-29T07:09:00.000Z' })));
+    expect(readLatestCodexRuntime(path)).toEqual({ model: 'gpt-5.6-pro', reasoningEffort: 'xhigh' });
+  });
+
+  it('excludes a non-newline-terminated trailing partial (crash mid-write)', () => {
+    writeFileSync(path,
+      ev(turnContext({ model: 'gpt-5.6-sol', effort: 'xhigh' }))
+      + JSON.stringify(turnContext({ model: 'half-written', effort: 'garbage' })));
+    // The half-written last line has no trailing \n → excluded; the prior
+    // complete record wins.
+    expect(readLatestCodexRuntime(path)).toEqual({ model: 'gpt-5.6-sol', reasoningEffort: 'xhigh' });
+  });
+});
+
