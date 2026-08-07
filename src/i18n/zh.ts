@@ -452,6 +452,7 @@ export const messages: Record<string, string> = {
   'card.config.p2p.placeholder': '私聊模式',
   'card.config.p2p.thread': '🧵 thread（每条 DM 独立会话）',
   'card.config.p2p.chat': '💬 chat（连续单聊会话，默认）',
+  'card.config.p2p.group': '👥 group（每条 DM 自动建专属会话群）',
   'config.label.disableStreamingCard': '关闭实时卡片',
   'config.label.usageDisplay': '用量显示位置',
   'config.label.silentTurnReactions': '关闭状态 reaction',

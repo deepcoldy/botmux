@@ -4959,14 +4959,23 @@ const server = createServer(async (req, res) => {
     // 会话群标签授权（Dashboard 一站式）：GET status / POST auth-link，
     // 均代理到对应 bot 的 daemon（state 必须驻留在生成链接的进程内）。
     let mBotTagAuth: RegExpMatchArray | null;
-    if (mBotTagAuth = url.pathname.match(/^\/api\/bots\/([^/]+)\/session-group-tag-(status|auth)$/)) {
+    if (mBotTagAuth = url.pathname.match(/^\/api\/bots\/([^/]+)\/session-group-tag-(status|auth|config)$/)) {
       const appId = decodeURIComponent(mBotTagAuth[1]);
       const kind = mBotTagAuth[2];
-      if ((kind === 'status' && req.method === 'GET') || (kind === 'auth' && req.method === 'POST')) {
+      const methodOk = (kind === 'status' && req.method === 'GET')
+        || (kind === 'auth' && req.method === 'POST')
+        || (kind === 'config' && req.method === 'PUT');
+      if (methodOk) {
+        let body: string | undefined;
+        if (req.method !== 'GET') {
+          const chunks: Buffer[] = [];
+          for await (const c of req) chunks.push(c as Buffer);
+          body = Buffer.concat(chunks).toString('utf8') || '{}';
+        }
         const upstream = await proxyToDaemon(appId, `/api/session-group-tag-${kind}`, {
           method: req.method,
           headers: { 'content-type': 'application/json' },
-          ...(req.method === 'POST' ? { body: '{}' } : {}),
+          ...(body !== undefined ? { body } : {}),
         });
         res.writeHead(upstream.status, { 'content-type': 'application/json' });
         res.end(await upstream.text());

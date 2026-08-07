@@ -18,6 +18,8 @@
  */
 import { getBot } from '../bot-registry.js';
 import { createGroupWithBots } from '../services/group-creator.js';
+import { deleteChat } from '../services/groups-store.js';
+import { unbindOncall } from '../services/oncall-store.js';
 import { registerSessionGroup } from '../services/session-groups-store.js';
 import { scheduleSessionGroupTitle } from '../services/session-group-title.js';
 import { tagSessionGroup } from '../services/feed-group-tagger.js';
@@ -74,7 +76,14 @@ export async function maybeBirthSessionGroup(
     if (!newChatId) throw new Error('chat.create returned no chatId');
     if (result.invalidUserIds.includes(senderOpenId)) {
       // The group exists but the user could not be invited — useless as a
-      // conversation home; fall back rather than talk into the void.
+      // conversation home. Disband it and revoke the oncall binding BEFORE
+      // falling back, so the failed birth leaves no orphan bot-owned chat
+      // behind (PR review). Best-effort: cleanup failures only log.
+      await deleteChat(larkAppId, newChatId)
+        .then(r => { if (!r.ok) logger.warn(`[session-group] orphan chat ${newChatId.substring(0, 12)} disband failed: ${r.error}`); })
+        .catch(err => logger.warn(`[session-group] orphan chat disband threw: ${err}`));
+      await unbindOncall(larkAppId, newChatId)
+        .catch(err => logger.warn(`[session-group] orphan oncall unbind threw: ${err}`));
       throw new Error(`user invite rejected (${senderOpenId.substring(0, 12)}…)`);
     }
 
@@ -136,11 +145,14 @@ export async function maybeBirthSessionGroup(
       chatType: 'group',
       scope: 'chat',
       anchor: newChatId,
-      // Re-anchor the turn on the in-group intro message so the first turn's
-      // reply target lives in the group. Fall back to the DM message id when
-      // the intro failed to send (replies then degrade to the DM, but the
-      // session itself still lives in the group).
-      messageId: introMessageId ?? messageId,
+      // `messageId` stays the ORIGINAL DM message id: resource keys /
+      // merge-forward sub-messages belong to it, so downloads must keep using
+      // it. The in-group intro message rides separately as the REPLY anchor
+      // (quote target / session rootMessageId) so the first turn's outputs
+      // land in the group. When the intro failed to send the anchor is left
+      // unset and replies degrade to the DM, but the session still lives in
+      // the group.
+      replyAnchorMessageId: introMessageId,
       replyRootId: undefined,
       sessionGroupBirth: true,
     };

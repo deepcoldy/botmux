@@ -39,7 +39,7 @@ import {
   removeSessionGroup,
   listSessionGroups,
 } from '../src/services/session-groups-store.js';
-import { sanitizeTitleOutput, buildTitlePrompt } from '../src/services/session-group-title.js';
+import { sanitizeTitleOutput, buildTitlePrompt, buildOneShotEnv, resolveOneShotCommand } from '../src/services/session-group-title.js';
 
 beforeEach(() => {
   tempDir = mkdtempSync(join(tmpdir(), 'session-groups-store-test-'));
@@ -138,6 +138,65 @@ describe('sanitizeTitleOutput', () => {
     const long = 'x'.repeat(200);
     const got = sanitizeTitleOutput(long, 12)!;
     expect(got.length).toBeLessThanOrEqual(24);
+  });
+});
+
+describe('buildOneShotEnv (PR review P2: child-env security boundary)', () => {
+  it('strips daemon-only secrets and session markers from the inherited env', () => {
+    process.env.LARK_APP_SECRET = 'daemon-secret';
+    process.env.GITHUB_TOKEN = 'daemon-gh-token';
+    process.env.BOTMUX_SESSION_ID = 'sess-123';
+    process.env.TMUX = '/tmp/tmux-socket';
+    try {
+      const env = buildOneShotEnv(undefined);
+      expect(env.LARK_APP_SECRET).toBeUndefined();
+      expect(env.GITHUB_TOKEN).toBeUndefined();
+      expect(env.BOTMUX_SESSION_ID).toBeUndefined();
+      expect(env.TMUX).toBeUndefined();
+    } finally {
+      delete process.env.LARK_APP_SECRET;
+      delete process.env.GITHUB_TOKEN;
+      delete process.env.BOTMUX_SESSION_ID;
+      delete process.env.TMUX;
+    }
+  });
+
+  it('layers the per-bot provider env on top (multi-provider correctness)', () => {
+    const env = buildOneShotEnv({ ANTHROPIC_BASE_URL: 'https://proxy.example', ANTHROPIC_AUTH_TOKEN: 'bot-token' });
+    expect(env.ANTHROPIC_BASE_URL).toBe('https://proxy.example');
+    expect(env.ANTHROPIC_AUTH_TOKEN).toBe('bot-token');
+    // Inherited harmless vars still flow through (PATH etc.).
+    expect(env.PATH).toBeDefined();
+  });
+
+  it('per-bot env cannot smuggle reserved botmux keys past the sanitizer', () => {
+    // PATH deliberately IS overridable per bot (same as the worker path);
+    // reserved BOTMUX_* identity keys are not.
+    const env = buildOneShotEnv({ BOTMUX_SESSION_ID: 'evil' } as any);
+    expect(env.BOTMUX_SESSION_ID).toBeUndefined();
+  });
+});
+
+describe('resolveOneShotCommand (PR review: launcher precedence parity)', () => {
+  const template = ['claude', '-p'] as const;
+
+  it('wrapperCli replaces the default bin and keeps template mode args', () => {
+    expect(resolveOneShotCommand({ wrapperCli: 'aiden x claude' }, template))
+      .toEqual(['aiden', 'x', 'claude', '-p']);
+  });
+
+  it('wrapperCli wins over cliPathOverride (same as the formal spawn path)', () => {
+    expect(resolveOneShotCommand({ wrapperCli: 'ccr code', cliPathOverride: '/opt/claude' }, template))
+      .toEqual(['ccr', 'code', '-p']);
+  });
+
+  it('cliPathOverride replaces the bin when no wrapper is set', () => {
+    expect(resolveOneShotCommand({ cliPathOverride: '/usr/local/bin/traex' }, ['traex', 'exec', '--skip-git-repo-check']))
+      .toEqual(['/usr/local/bin/traex', 'exec', '--skip-git-repo-check']);
+  });
+
+  it('falls back to the template verbatim', () => {
+    expect(resolveOneShotCommand({}, template)).toEqual(['claude', '-p']);
   });
 });
 

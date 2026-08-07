@@ -1749,6 +1749,12 @@ export interface RoutingContext {
    *  re-homed this turn from a DM into a freshly-created session group —
    *  prevents the birth logic from re-triggering on the rewritten context. */
   sessionGroupBirth?: boolean;
+  /** Session-group birth only: the in-group intro message id used as the
+   *  turn's REPLY anchor (quote target / session rootMessageId), so the first
+   *  turn's outputs land in the group. `messageId` stays the ORIGINAL inbound
+   *  DM message id — resource downloads and merge-forward expansion must keep
+   *  using it (the resource keys belong to the source message, PR review P1). */
+  replyAnchorMessageId?: string;
   larkAppId: string;
 }
 
