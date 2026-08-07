@@ -15053,6 +15053,9 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
     && !substituteTrigger
     && scope === 'thread'
     && anchor === messageId
+    // 「话题内发送 + 同时发送到会话」的消息 root_id 为空但带 thread_id——
+    // 语境属于既有话题，绝不当全新会话建群（回退 thread 旧行为）。
+    && !data?.message?.thread_id
   ) {
     const reborn = await maybeBirthSessionGroup(data, ctx);
     if (reborn) return handleNewTopic(data, reborn);
