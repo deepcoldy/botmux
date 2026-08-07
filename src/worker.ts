@@ -12961,7 +12961,7 @@ process.on('message', async (raw: unknown) => {
 });
 
 // 预加载层会在正式处理器注册前暂存冷启动消息；现在按到达顺序交还。
-process.emit(WORKER_IPC_HANDLER_READY_EVENT);
+(process as NodeJS.EventEmitter).emit(WORKER_IPC_HANDLER_READY_EVENT);
 
 // ─── Cleanup ─────────────────────────────────────────────────────────────────
 
