@@ -527,14 +527,13 @@ export const MAX_USAGE_TRANSCRIPT_BYTES = 64 * 1024 * 1024;
  *  snapshot in the last 4MiB, so this window is the common-case fast path. */
 export const CODEX_USAGE_TRANSCRIPT_TAIL_BYTES = 4 * 1024 * 1024;
 const CODEX_USAGE_REPLAY_BYTES = 4 * 1024 * 1024;
-/** When a single huge turn (e.g. one giant tool output) pushes the latest
- *  token_count snapshot out of the first tail window, widen the window one
- *  step at a time and re-scan until both the cumulative and context metrics
- *  are recovered. This keeps the card showing the TRUE latest usage instead of
- *  collapsing to null. Bounded so the synchronous dashboard read never walks an
- *  unbounded prefix: past this budget we stop widening and fail closed (yield
- *  whatever the bounded window found, without inheriting a possibly-stale value
- *  across an unverifiable generation boundary). */
+/** When the last tail window is missing a metric (a single huge turn can push
+ *  the newest token_count snapshot — or the model line — out of it), do ONE
+ *  bounded widen to this size and re-scan that whole window. It is the width of
+ *  the single widened pass, NOT a cumulative ladder: the worst-case synchronous
+ *  dashboard read is `tail + this`, and past it we fail closed (yield whatever
+ *  the widened window found, never inheriting a possibly-stale value across an
+ *  unverifiable generation boundary). */
 export const CODEX_USAGE_MAX_BACKSCAN_BYTES = 32 * 1024 * 1024;
 
 /** Aiden checkpoint paths move as the session progresses (latest.json points
@@ -608,9 +607,12 @@ function aggregateHasCodexUsage(agg: TokenUsageAggregate): boolean {
   return !!agg.latestCodexUsage || !!agg.latestContextUsage;
 }
 
-/** Both independent Codex metrics recovered. Used to decide when a widening
- *  back-scan can stop: they may live on different lines, so a window that only
- *  caught one is not yet complete. */
+/** The two cumulative-usage metrics recovered. Used to decide when the bounded
+ *  widen can stop: cumulative and context can sit on different lines, so a
+ *  window that caught only one is not complete. Model is handled separately
+ *  (see the model back-fill below) — it is a stable session-level attribute, so
+ *  gating the (bounded) widen on it would force a re-scan for every rollout that
+ *  simply never re-emits a model line inside the tail window. */
 function aggregateHasAllCodexMetrics(agg: TokenUsageAggregate): boolean {
   return !!agg.latestCodexUsage && !!agg.latestContextUsage;
 }
@@ -811,33 +813,54 @@ function readCodexTokenAggregateCached(
     }
     ({ state, seenMessageIds, scanned, completeBytes, previewAgg, pendingTailIsInitialResidualLine } = win);
   } else {
-    // Oversized cold/bounded read: start at the last tail window and widen it
-    // one step at a time until BOTH independent metrics are recovered (they can
-    // sit on different lines) — or we hit the file head or the back-scan budget.
-    // This recovers the true latest usage even when a single >4MiB turn pushed
-    // the newest snapshot out of the first window, instead of collapsing to null.
-    let win: WindowScan | null = null;
-    let step = 0;
-    for (;;) {
-      const windowBytes = CODEX_USAGE_TRANSCRIPT_TAIL_BYTES * (step + 1);
-      baseOffset = Math.max(0, fdStat.size - windowBytes);
-      const attempt = scanFromWindow(baseOffset, false);
-      if (!attempt) {
-        closeSync(fd);
-        usageFileCache.delete(key);
-        return null;
+    // Oversized cold/bounded read. Fast path: scan the last tail window. If the
+    // three independent metrics (cumulative / context / model) are not all on
+    // that window — a single >4MiB turn can push the newest snapshot, or the
+    // model line, out of it — do ONE bounded widen to the back-scan budget and
+    // re-scan that whole window. A single widened pass (not a 4/8/.../32 ladder)
+    // keeps the worst-case synchronous read at tail + budget instead of their
+    // sum, while still recovering the true latest usage. Each pass scans from a
+    // fresh state; Codex token_count is cumulative (latest wins), so re-folding
+    // older lines first and letting the newest snapshot overwrite last is exact.
+    baseOffset = Math.max(0, fdStat.size - CODEX_USAGE_TRANSCRIPT_TAIL_BYTES);
+    let win = scanFromWindow(baseOffset, false);
+    if (!win) {
+      closeSync(fd);
+      usageFileCache.delete(key);
+      return null;
+    }
+    if (!aggregateHasAllCodexMetrics(win.previewAgg) && baseOffset > 0) {
+      const widenedBaseOffset = Math.max(0, fdStat.size - CODEX_USAGE_MAX_BACKSCAN_BYTES);
+      if (widenedBaseOffset < baseOffset) {
+        const widened = scanFromWindow(widenedBaseOffset, false);
+        if (!widened) {
+          closeSync(fd);
+          usageFileCache.delete(key);
+          return null;
+        }
+        baseOffset = widenedBaseOffset;
+        win = widened;
       }
-      win = attempt;
-      if (
-        aggregateHasAllCodexMetrics(attempt.previewAgg)
-        || baseOffset === 0
-        || windowBytes >= CODEX_USAGE_MAX_BACKSCAN_BYTES
-      ) {
-        break;
-      }
-      step += 1;
     }
     ({ state, seenMessageIds, scanned, completeBytes, previewAgg, pendingTailIsInitialResidualLine } = win);
+  }
+
+  // Model back-fill: the model rides on turn_context/session_meta lines and is
+  // a stable session-level attribute, but a bounded window may not re-include
+  // one (a long final turn can push the last model line out of it). A fresh
+  // per-window scan would then ship an empty model to the ledger ("unknown").
+  // Carry the model forward from the SAME open file's cached read (dev+ino) —
+  // model only, never the usage numbers, and only to fill an empty value, so a
+  // genuine in-window model always wins and no stale token counts are inherited.
+  if (
+    oversized
+    && !reuseTrackedReplay
+    && !previewAgg.model
+    && sameOpenFileAsCache
+    && previousAgg?.model
+  ) {
+    if (previewAgg === state) previewAgg = cloneAggregate(state);
+    previewAgg.model = previousAgg.model;
   }
 
   const nextOffset = pendingTailIsInitialResidualLine ? baseOffset : baseOffset + completeBytes;

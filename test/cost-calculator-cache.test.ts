@@ -587,9 +587,10 @@ describe('readSessionTokenUsageFile caching', () => {
     });
   });
 
-  it('widens the back-scan across several windows to recover a snapshot far from the tail', () => {
-    // Snapshot sits ~10MiB from EOF (past 2 tail windows), buried behind a big
-    // non-snapshot burst. The reader must widen past the first windows to find it.
+  it('widens the back-scan to recover a snapshot past the fast-path tail window', () => {
+    // Snapshot sits ~10MiB from EOF (outside the 4MiB fast-path window) behind a
+    // big non-snapshot burst. The fast path misses, so the reader does one
+    // bounded widen to the back-scan budget and recovers it.
     const p = join(dir, 'codex-backscan-multi-window.jsonl');
     const snapshot = `${codexCountLine(321, 32, 100, { used: 210, window: 1_000 })}\n`;
     const finalSize = MAX_USAGE_TRANSCRIPT_BYTES + 12 * 1024 * 1024;
@@ -610,6 +611,50 @@ describe('readSessionTokenUsageFile caching', () => {
     })).toMatchObject({
       context: { usedTokens: 210, windowTokens: 1_000, percentUsed: 21 },
       tokens: { in: 321, out: 32, inputTokens: 221, cacheReadTokens: 100 },
+    });
+  });
+
+  it('carries the model forward when a large tail window recovers usage but no model line', () => {
+    // Model rides on turn_context lines and is a stable session attribute. Warm
+    // read captures model; a later >4MiB burst + a new tail token_count (with NO
+    // model line) must recover the usage AND keep the model, not ship "" to the
+    // ledger. (Regression for the widen dropping model — usage-only back-fill.)
+    const p = join(dir, 'codex-model-carry-forward.jsonl');
+    const finalSize = MAX_USAGE_TRANSCRIPT_BYTES + CODEX_USAGE_TRANSCRIPT_TAIL_BYTES + 1;
+    const baseOffset = finalSize - CODEX_USAGE_TRANSCRIPT_TAIL_BYTES;
+    writeFileSync(p, '');
+    truncateSync(p, baseOffset - 1);
+    appendFileSync(p, '\n');
+    appendFileSync(p, `${codexModelLine('gpt-5-codex')}\n`);
+    appendFileSync(p, `${codexCountLine(100, 10, 20, { used: 30, window: 1_000 })}\n`);
+    appendFileSync(p, Buffer.alloc(finalSize - fileSize(p), 0x20));
+    vi.mocked(findCodexRolloutBySessionId).mockReturnValue(p);
+    expect(getSessionUsageSnapshot({
+      cliId: 'codex',
+      sessionId: 'botmux-sid',
+      cliSessionId: 'codex-sid',
+      fresh: true,
+    })).toMatchObject({ tokens: { in: 100, out: 10, model: 'gpt-5-codex' } });
+
+    // >4MiB non-snapshot burst then a new token_count with NO model line.
+    let appended = 0;
+    let i = 0;
+    while (appended < CODEX_USAGE_TRANSCRIPT_TAIL_BYTES + 8192) {
+      const line = `${JSON.stringify({ type: 'event_msg', payload: { type: 'agent_message', text: `t${i++}` } })}\n`;
+      appendFileSync(p, line);
+      appended += Buffer.byteLength(line);
+    }
+    appendFileSync(p, `${codexCountLine(500, 60, 200, { used: 240, window: 1_000 })}\n`);
+    now += 20_000;
+
+    expect(getSessionUsageSnapshot({
+      cliId: 'codex',
+      sessionId: 'botmux-sid',
+      cliSessionId: 'codex-sid',
+      fresh: true,
+    })).toMatchObject({
+      context: { usedTokens: 240, windowTokens: 1_000, percentUsed: 24 },
+      tokens: { in: 500, out: 60, model: 'gpt-5-codex' },
     });
   });
 
@@ -642,6 +687,13 @@ describe('readSessionTokenUsageFile caching', () => {
       ...vi.mocked(readSync).mock.calls.map((call) => Number(call[4])).filter(Number.isFinite),
     );
     expect(minReadPos).toBeGreaterThan(snapshotOffset);
+    // Worst-case synchronous read is a single fast-path tail window plus ONE
+    // bounded widen — NOT a 4/8/.../32 ladder (which would total 144MiB). Pin
+    // the ceiling so a future change cannot silently reintroduce cumulative
+    // re-scans. Chunk/probe overhead is tiny next to the multi-MiB windows.
+    expect(requestedBytes()).toBeLessThanOrEqual(
+      CODEX_USAGE_TRANSCRIPT_TAIL_BYTES + CODEX_USAGE_MAX_BACKSCAN_BYTES + 64 * 1024,
+    );
   });
 
   it('does not inherit warm Codex usage across a burst that exceeds the back-scan budget', () => {
