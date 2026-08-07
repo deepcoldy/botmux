@@ -144,6 +144,8 @@ import { admitQueuedActivationTail } from '../src/core/worker-pool.js';
 import type { DaemonSession } from '../src/core/types.js';
 import { getDocSubscription, putDocSubscription, removeDocSubscription } from '../src/services/doc-subs-store.js';
 import { config } from '../src/config.js';
+import { mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { join } from 'node:path';
 
 const APP = 'rename_route_app';
 const CHAT = 'oc_rename_route_chat';
@@ -465,6 +467,79 @@ describe('/rename production routing — must not pre-create a session (review P
     expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
     const openingPayload = mocks.forkWorker.mock.calls[0]?.[1] as any;
     expect(openingPayload?.codexAppSteerable).toBeUndefined();
+  });
+
+  it('R7-B1 (production wiring): a known-peer bot open_id masquerading as sender_type:user is forced-serial via the new-topic isKnownPeerBot cross-ref (not just the helper truth table)', async () => {
+    // codex R7 delta: initial-user-turn-opening only hand-feeds
+    // {humanSender:false,isForeignBot:true} to the helper; it never exercises the
+    // NEW-TOPIC production wiring at daemon.ts:16811/16814 that calls
+    // isKnownPeerBot(config.session.dataDir, larkAppId, senderOpenId). This test
+    // seeds a REAL bot-openid cross-ref, drives handleNewTopic with a sender whose
+    // sender_type is (anomalously) 'user' but whose open_id IS a known peer bot,
+    // forces the fork, and asserts the opening stays serial. Deleting either
+    // isKnownPeerBot call turns this red (senderType==='user' alone would then set
+    // humanSender true and authorize steer).
+    const PEER_OPEN_ID = 'ou_known_peer_bot';
+    // Seed the real cross-ref file the production helper reads.
+    mkdirSync(config.session.dataDir, { recursive: true });
+    const crossRefPath = join(config.session.dataDir, `bot-openids-${APP}.json`);
+    writeFileSync(crossRefPath, JSON.stringify({ PeerBot: PEER_OPEN_ID }), 'utf-8');
+    try {
+      const bot = registerBot({
+        larkAppId: APP,
+        larkAppSecret: 's',
+        cliId: 'codex-app',
+        allowedUsers: [OWNER, PEER_OPEN_ID],
+        defaultWorkingDir: '/tmp',
+      });
+      bot.resolvedAllowedUsers = [OWNER, PEER_OPEN_ID];
+
+      // Anomalous: sender_type says 'user' (so isBotSenderType is FALSE — the
+      // bot-sender fact alone would NOT catch this), but the open_id is a
+      // registered peer bot. Only the isKnownPeerBot cross-ref wiring keeps it
+      // serial.
+      const peerEvent = makeEventData('om_kp_new', 'known-peer masquerading as user');
+      peerEvent.sender = { sender_id: { open_id: PEER_OPEN_ID }, sender_type: 'user' };
+      await handleNewTopic(peerEvent, makeCtx('om_kp_new', 'om_kp_new'));
+
+      expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
+      const openingPayload = mocks.forkWorker.mock.calls[0]?.[1] as any;
+      expect(openingPayload?.codexAppSteerable).toBeUndefined();
+    } finally {
+      rmSync(crossRefPath, { force: true });
+    }
+  });
+
+  it('R7-B1 (production wiring, positive control): a genuine human sender_type:user NOT in the cross-ref DOES authorize steer via handleNewTopic — proving the cross-ref is the discriminator', async () => {
+    // Positive counterpart to the known-peer test: same seeded cross-ref, but a
+    // real human whose open_id is NOT a peer bot. This must fork WITH steer
+    // authorization — proving the serial result above is specifically the
+    // isKnownPeerBot match, not some unrelated gate suppressing everything.
+    const PEER_OPEN_ID = 'ou_known_peer_bot';
+    const HUMAN_OPEN_ID = 'ou_real_human_new';
+    mkdirSync(config.session.dataDir, { recursive: true });
+    const crossRefPath = join(config.session.dataDir, `bot-openids-${APP}.json`);
+    writeFileSync(crossRefPath, JSON.stringify({ PeerBot: PEER_OPEN_ID }), 'utf-8');
+    try {
+      const bot = registerBot({
+        larkAppId: APP,
+        larkAppSecret: 's',
+        cliId: 'codex-app',
+        allowedUsers: [OWNER, HUMAN_OPEN_ID],
+        defaultWorkingDir: '/tmp',
+      });
+      bot.resolvedAllowedUsers = [OWNER, HUMAN_OPEN_ID];
+
+      const humanEvent = makeEventData('om_human_new', '第一条真人交互消息');
+      humanEvent.sender = { sender_id: { open_id: HUMAN_OPEN_ID }, sender_type: 'user' };
+      await handleNewTopic(humanEvent, makeCtx('om_human_new', 'om_human_new'));
+
+      expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
+      const openingPayload = mocks.forkWorker.mock.calls[0]?.[1] as any;
+      expect(openingPayload?.codexAppSteerable).toBe(true);
+    } finally {
+      rmSync(crossRefPath, { force: true });
+    }
   });
 
   it('uses the group name for mention-only sessions on both creation paths', async () => {
@@ -804,36 +879,53 @@ describe('/rename production routing — must not pre-create a session (review P
     expect(ds.initialStartPending).toBe(false);
   });
 
-  it('R7 coalesced-serial: buffered follow-ups fold into one serial turn — NO steerable even when every clean-input gate decision is true', async () => {
+  it.each([
+    { label: 'one buffered', bufs: ['BUFFERED_ONE'], turnIds: ['om_buf_1'], gates: [true] },
+    { label: 'two buffered', bufs: ['BUFFERED_ONE', 'BUFFERED_TWO'], turnIds: ['om_buf_1', 'om_buf_2'], gates: [true, true] },
+  ])('R7 coalesced-serial ($label): folds into one serial turn — NO steerable at ALL THREE layers even when every clean-input gate decision is true', async ({ bufs, turnIds, gates }) => {
     // codex ruling: coalescing N buffered opening-window messages into one prompt
     // / one ledger reservation / one final loses per-message identity, so the
     // batch is FORCED-SERIAL by construction. The clean-input feature gate
     // (pendingCodexAppFollowUpGateAccepted) is NOT a steer authorization and must
-    // never derive codexAppSteerable — even when all true.
+    // never derive codexAppSteerable — even when ALL true, whether one message or
+    // many. Assert all THREE layers stay clean so a future single-message
+    // fast-path special-case, or a ledger-side mis-derivation (replacement restore
+    // then authorize), would translate into a red test.
     const anchor = 'om_coalesced_root';
     const ds = seedThreadSession(anchor, 'coalesced serial');
     Object.assign(ds.session, { cliId: 'codex-app', workingDir: '/tmp' });
     ds.workingDir = '/tmp';
     ds.worker = { killed: false, send: vi.fn() } as any;
-    ds.pendingFollowUps = ['BUFFERED_ONE', 'BUFFERED_TWO'];
-    ds.pendingFollowUpTurnIds = ['om_buf_1', 'om_buf_2'];
-    ds.pendingCodexAppFollowUps = ['BUFFERED_ONE', 'BUFFERED_TWO'];
-    ds.pendingCodexAppFollowUpContexts = ['', ''];
+    ds.pendingFollowUps = [...bufs];
+    ds.pendingFollowUpTurnIds = [...turnIds];
+    ds.pendingCodexAppFollowUps = [...bufs];
+    ds.pendingCodexAppFollowUpContexts = bufs.map(() => '');
     // Every buffered message was clean-input-accepted (all true) — must NOT leak
-    // into a steer authorization.
-    ds.pendingCodexAppFollowUpGateAccepted = [true, true];
+    // into a steer authorization at any layer.
+    ds.pendingCodexAppFollowUpGateAccepted = [...gates];
 
     expect(releaseQueuedActivationReservation(ds)).toBe(true);
 
-    // The coalesced follow-up is delivered to the worker as ONE serial message
-    // with NO steer authorization — even though every clean-input gate decision
-    // was true. (release admits then promotes+sends the coalesced tail, so assert
-    // on the actual worker IPC payload, the authoritative delivered form.)
+    // release admits the coalesced tail then promotes+sends it. After that, the
+    // three durable/live surfaces all persist on ds — assert steerable is absent
+    // on each:
+    //   (1) the promoted queuedActivationInput payload (frozen opening input),
+    //   (2) the accepted codexAppDispatchLedger entry for this coalesced turn,
+    //   (3) the actual worker IPC message (authoritative delivered form).
+    // Layer 1: promoted opening input.
+    expect(ds.session.queuedActivationInput).toBeTruthy();
+    expect((ds.session.queuedActivationInput as any).codexAppSteerable).toBeUndefined();
+    // Layer 2: accepted dispatch ledger entry (the coalesced turn's token entry).
+    const ledger = ds.session.codexAppDispatchLedger ?? [];
+    const coalescedEntry = ledger.find(e => e.queuedActivationToken !== undefined);
+    expect(coalescedEntry).toBeTruthy();
+    expect((coalescedEntry as any).codexAppSteerable).toBeUndefined();
+    // Layer 3: the worker IPC that delivered it.
     const send = vi.mocked(ds.worker!.send);
     const msg = send.mock.calls.map(c => c[0] as any).find(m => m?.type === 'message');
     expect(msg).toBeTruthy();
     expect(msg.content).toContain('BUFFERED_ONE');
-    expect(msg.content).toContain('BUFFERED_TWO');
+    if (bufs.length > 1) expect(msg.content).toContain('BUFFERED_TWO');
     expect(msg.codexAppSteerable).toBeUndefined();
   });
 

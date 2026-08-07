@@ -867,15 +867,17 @@ describe('Codex App worker replacement durable handoff', () => {
       .toHaveLength(2);
   }, 40_000);
 
-  it('R7-B2: worker durable superseded expansion — each member persists (codexAppSettlement), commits only after ACK, retires its liveness slot, and never wedges', async () => {
+  it('R7-B2: worker durable superseded expansion — each member persists (codexAppSettlement), commits only after ACK, clears awaiting on the real final, and a genuine second cycle runs (no wedge)', async () => {
     // WORKER-SIDE of the round-trip (the daemon-side ledger preview/store/ACK is
     // proven separately in bridge-final-output-retry via setupWorkerHandlers).
     // Here the ACK is a deterministic stand-in so we can assert the WORKER's real
     // behaviour: each member carries a codexAppDispatchId → the worker calls
     // waitForCodexAppDaemonPersistence and commits ONLY after the ACK; the group
-    // expands to N final_output (first N−1 superseded); and — critically — a 4th
-    // turn afterwards starts and finals cleanly, proving the FIFO/liveness did not
-    // wedge. The `steer` fixture holds turn 1 open until its 2nd steer.
+    // expands to N final_output (first N−1 superseded); the REAL final clears
+    // codexAppCompletionAwaitingFinal (proven by a fresh prompt_ready AND a genuine
+    // second start→steer→final cycle afterwards — a stuck awaiting would have
+    // fenced the signed idle instead). The `steer` fixture holds each turn open
+    // until steered (global steerCount ≥2 completes a held turn on one steer).
     const root = mkdtempSync(join(tmpdir(), 'botmux-worker-codex-sup-rt-'));
     tempDirs.add(root);
     const fakeCodex = join(root, 'fake-codex');
@@ -888,6 +890,7 @@ describe('Codex App worker replacement durable handoff', () => {
     const logs: string[] = [];
     const messages: WorkerToDaemon[] = [];
     let followsSent = false;
+    let secondCycleSent = false;
     const worker = spawnWorker(
       root, sessionId, fakeCodex, requestLog, 'steer', logs, messages,
       (message, child) => {
@@ -923,6 +926,35 @@ describe('Codex App worker replacement durable handoff', () => {
             codexAppInput: { text: 'follow two', clientUserMessageId: 'om_rt_3' },
             turnId: 'om_rt_3',
             codexAppDispatchId: 'dispatch-rt-3',
+            codexAppSteerable: true,
+          } as DaemonToWorker);
+        }
+        // codex R7 delta (BEST proof): once the group's REAL final settled and the
+        // runner republished prompt_ready, drive a genuine SECOND cycle — a fresh
+        // native turn/start plus one steer to close it (global steerCount is
+        // already ≥2, so a single steer completes the fixture's held turn). This
+        // proves the runner did not merely emit ready but actually STARTS and
+        // SETTLES a new native turn after the group — impossible if awaiting stayed
+        // true (the signed idle would have fenced before this prompt_ready).
+        if (message.type === 'prompt_ready'
+          && !secondCycleSent
+          && messages.some(m => m.type === 'final_output' && (m as any).disposition === undefined)
+          && child.connected) {
+          secondCycleSent = true;
+          child.send({
+            type: 'message',
+            content: '<user_message>cycle two open</user_message>',
+            codexAppInput: { text: 'cycle two open', clientUserMessageId: 'om_rt_4' },
+            turnId: 'om_rt_4',
+            codexAppDispatchId: 'dispatch-rt-4',
+            codexAppSteerable: true,
+          } as DaemonToWorker);
+          child.send({
+            type: 'message',
+            content: '<user_message>cycle two close</user_message>',
+            codexAppInput: { text: 'cycle two close', clientUserMessageId: 'om_rt_5' },
+            turnId: 'om_rt_5',
+            codexAppDispatchId: 'dispatch-rt-5',
             codexAppSteerable: true,
           } as DaemonToWorker);
         }
@@ -977,6 +1009,47 @@ describe('Codex App worker replacement durable handoff', () => {
       // No wedge / mis-commit: no rejected final and no FIFO-empty error.
       expect(logs.join('')).not.toContain('rejected final marker');
       expect(logs.join('')).not.toContain('no_pending_turn');
+      // BLOCKING (codex R7 delta): the 3 terminals above fire unconditionally at
+      // the post-commit block, so they do NOT prove the LAST final cleared
+      // codexAppCompletionAwaitingFinal. The real proof of "awaiting cleared and
+      // the runner can start again" is a NEW prompt_ready AFTER the group's real
+      // final: only the real final clears awaiting (worker.ts:6895), which lets the
+      // runner sequence signed state{busy:false} → markPromptReady. If awaiting
+      // stayed true, that signed idle would instead FENCE
+      // ("published idle before the required final transaction", worker.ts:6588)
+      // and NO further prompt_ready would ever be emitted — the session wedges.
+      await waitFor(worker, logs, () => {
+        const lastRealFinalIdx = messages.findLastIndex(
+          m => m.type === 'final_output' && (m as any).disposition === undefined
+            && (m as any).turnId === 'om_rt_3');
+        const readyAfter = messages.findIndex(
+          (m, i) => i > lastRealFinalIdx && m.type === 'prompt_ready');
+        return lastRealFinalIdx >= 0 && readyAfter > lastRealFinalIdx;
+      }, 15_000);
+      const groupRealFinalIdx = messages.findLastIndex(
+        m => m.type === 'final_output' && (m as any).disposition === undefined
+          && (m as any).turnId === 'om_rt_3');
+      const readyIdxs = messages
+        .map((m, i) => (m.type === 'prompt_ready' ? i : -1))
+        .filter(i => i >= 0);
+      expect(readyIdxs.some(i => i > groupRealFinalIdx)).toBe(true);
+      // BEST proof (codex R7 delta): the post-group prompt_ready actually lets a
+      // genuine SECOND cycle run — a fresh native turn/start (om_rt_4) that is then
+      // steered closed (om_rt_5), producing a real final + completed terminal for
+      // om_rt_5. This is the "real independent turn afterwards" codex asked for:
+      // it can only happen if awaiting was cleared and the FIFO/liveness reset.
+      await waitFor(worker, logs, () =>
+        messages.some(m => m.type === 'final_output'
+          && (m as any).disposition === undefined
+          && (m as any).turnId === 'om_rt_5')
+        && messages.some(m => m.type === 'turn_terminal'
+          && (m as any).status === 'completed'
+          && (m as any).turnId === 'om_rt_5'), 20_000);
+      // A genuinely NEW native turn/start ran for the second cycle (not just more
+      // steers into the first) — the request log shows a 2nd turn/start.
+      const startCount = readRequests(requestLog)
+        .filter(r => r.method === 'turn/start').length;
+      expect(startCount).toBeGreaterThanOrEqual(2);
     } finally {
       await stopChild(worker);
     }

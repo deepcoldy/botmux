@@ -661,6 +661,13 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     } satisfies Extract<WorkerToDaemon, { type: 'final_output' }>);
     await vi.advanceTimersByTimeAsync(10);
     await vi.waitFor(() => expect(sessionReply).toHaveBeenCalledTimes(1)); // real member delivered
+    // codex R7 delta: assert the daemon returns the REAL final's persistence ACK
+    // too (not only the superseded head's settle-grp-1). Without this, a daemon
+    // that forgets to ACK the last member would still drain the ledger + deliver
+    // to Lark here, but the real worker would hang forever in
+    // waitForCodexAppDaemonPersistence — invisible to a delivery-only assertion.
+    await vi.waitFor(() => expect((ds.worker as any).send).toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'codex_app_dispatch_persisted', requestId: 'settle-grp-2', ok: true })));
     await vi.waitFor(() => expect(ds.session.codexAppDispatchLedger ?? []).toEqual([]));
   });
 
