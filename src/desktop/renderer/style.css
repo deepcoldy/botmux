@@ -272,7 +272,9 @@ input:disabled {
   color: var(--text);
   font-size: 13px;
   font-weight: 650;
-  line-height: 1.2;
+  /* Exactly the switch height, so the status line and the launch-at-login
+     row that shares this line have identical vertical centers. */
+  line-height: 16px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -418,10 +420,11 @@ input:disabled {
   margin-top: 0;
   padding: 0;
   color: var(--muted);
-  /* Sits beside the 13px/650 runtime status; match its tone one notch smaller. */
+  /* Sits beside the 13px/650 runtime status; match its tone one notch smaller,
+     on the same exact 16px line box so both text centers coincide. */
   font-size: 12px;
   font-weight: 650;
-  line-height: 1.2;
+  line-height: 16px;
   cursor: pointer;
 }
 
