@@ -64,6 +64,25 @@ describe('cmdSend hook context wiring', () => {
     expect(cliSource).toMatch(/mentions\.push\(\{ open_id: replyTargetSenderOpenId, name: '' \}\)/);
   });
 
+  it('gates the legacy global quote-sender fallback on NO currentTurnId — an exact-turn miss never borrows the advanced global slot (#750 cross-turn guard)', () => {
+    // The reply-target sender chain is: VC → #597 frozen dispatch → exact
+    // turnReplyTarget.senderOpenId → (ONLY when no currentTurnId) legacy global
+    // s.quoteTargetSenderOpenId. The last hop MUST be gated on `currentTurnId`:
+    // with a turnId, an exact-turn map miss/eviction resolves to NO sender, never
+    // the global latest slot (which may have advanced to a DIFFERENT turn B). An
+    // unconditional `?? s.quoteTargetSenderOpenId` would re-introduce the
+    // cross-turn --mention-back bug #750 fixed (A evicted, global sender = B →
+    // B wrongly @-ed as A's reply target). This is a precise structural guard;
+    // pickTurnReplyTarget's own hit already enforces quoteTargetId===currentTurnId.
+    // frozen dispatch and exact-turn hops precede the gated legacy fallback.
+    expect(cliSource).toContain('?? frozenTurnDispatch?.replyTargetSenderOpenId');
+    expect(cliSource).toContain('?? turnReplyTarget?.senderOpenId');
+    // The legacy global slot is reachable ONLY behind the no-turn gate — assert
+    // the exact gated form and FORBID any unconditional `?? s.quoteTargetSenderOpenId`.
+    expect(cliSource).toContain('?? (currentTurnId ? undefined : s.quoteTargetSenderOpenId)');
+    expect(cliSource).not.toMatch(/\?\?\s*s\.quoteTargetSenderOpenId\s*;/);
+  });
+
   it('prefers the current Codex App ledger entry over mutable shared-chat reply state', () => {
     expect(cliSource).toContain(
       'originSession?.codexAppDispatchLedger',

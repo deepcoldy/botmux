@@ -7965,7 +7965,14 @@ async function cmdSend(rest: string[]): Promise<void> {
   const replyTargetSenderOpenId = explicitVcMeetingImOrigin?.replyTargetSenderOpenId
     ?? frozenTurnDispatch?.replyTargetSenderOpenId
     ?? turnReplyTarget?.senderOpenId
-    ?? s.quoteTargetSenderOpenId;
+    // #750 exact-turn contract: the global latest-slot quote sender may ONLY be
+    // borrowed as a legacy fallback when there is NO currentTurnId (true
+    // legacy/no-turn send). With a turnId, an exact-turn map miss/eviction must
+    // resolve to NO sender — never the global slot, which may have advanced to a
+    // DIFFERENT turn B and would mis-@ B as A's --mention-back (the cross-turn
+    // bug #750 fixed). pickTurnReplyTarget already enforces
+    // quoteTargetId===currentTurnId for its own hit.
+    ?? (currentTurnId ? undefined : s.quoteTargetSenderOpenId);
 
   // @ hard-gate (config.send.requireMentionDecision, default on): force the
   // model to make an explicit @ decision before sending. --top-level publish
