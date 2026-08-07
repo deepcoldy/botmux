@@ -984,10 +984,16 @@ describe('Codex App worker replacement durable handoff', () => {
         { turnId: 'om_rt_2', disposition: 'steer_superseded', suppress: true },
         { turnId: 'om_rt_3', disposition: undefined, suppress: false },
       ]);
-      // One turn/start + two turn/steer (ordered steer through the durable path).
-      const turnMethods = readRequests(requestLog)
+      // The group's ordered steer is deterministically the FIRST three request
+      // log entries (root turn/start → steer om_rt_2 → steer om_rt_3), appended
+      // before anything else. Assert it as a PREFIX, not an exact-equals: the
+      // post-group prompt_ready triggers a second cycle whose turn/start+turn/steer
+      // race into this same log, so an exact-equals here could observe 4–5 entries
+      // and flake. The COMPLETE method sequence is asserted at the end of the test,
+      // once the second cycle has fully settled (deterministic total, no race).
+      const groupTurnMethods = readRequests(requestLog)
         .filter(r => r.method === 'turn/start' || r.method === 'turn/steer').map(r => r.method);
-      expect(turnMethods).toEqual(['turn/start', 'turn/steer', 'turn/steer']);
+      expect(groupTurnMethods.slice(0, 3)).toEqual(['turn/start', 'turn/steer', 'turn/steer']);
       // Each member reached a completed terminal — i.e. the worker ran
       // commitExactHead after each ACK and retired the member's liveness slot.
       // This (3 completed terminals for the 3 durable settlements, in order) is
@@ -1046,10 +1052,22 @@ describe('Codex App worker replacement durable handoff', () => {
           && (m as any).status === 'completed'
           && (m as any).turnId === 'om_rt_5'), 20_000);
       // A genuinely NEW native turn/start ran for the second cycle (not just more
-      // steers into the first) — the request log shows a 2nd turn/start.
-      const startCount = readRequests(requestLog)
-        .filter(r => r.method === 'turn/start').length;
-      expect(startCount).toBeGreaterThanOrEqual(2);
+      // steers into the first). Assert the COMPLETE, deterministic request-method
+      // sequence once the second cycle has fully settled (no race now — the second
+      // cycle's final already arrived above): the group is start+steer+steer, then
+      // the second cycle opens a fresh start and needs only ONE steer to close it
+      // (the fixture's global steerCount is already ≥2, so a held turn completes on
+      // the first steer). Total: [start, steer, steer, start, steer].
+      await waitFor(worker, logs, () =>
+        readRequests(requestLog)
+          .filter(r => r.method === 'turn/start' || r.method === 'turn/steer')
+          .length >= 5, 15_000);
+      const allTurnMethods = readRequests(requestLog)
+        .filter(r => r.method === 'turn/start' || r.method === 'turn/steer').map(r => r.method);
+      expect(allTurnMethods).toEqual([
+        'turn/start', 'turn/steer', 'turn/steer', // the ordered-steer group
+        'turn/start', 'turn/steer',               // the genuine second cycle
+      ]);
     } finally {
       await stopChild(worker);
     }
