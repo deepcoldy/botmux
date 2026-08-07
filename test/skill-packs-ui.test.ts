@@ -2,7 +2,7 @@ import React from 'react';
 import TestRenderer, { act } from 'react-test-renderer';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { SkillPacksTab } from '../src/dashboard/web/skills/skill-packs-tab.js';
-import type { SkillPackRow } from '../src/dashboard/web/skills/types.js';
+import type { SkillPackRow, SkillRow } from '../src/dashboard/web/skills/types.js';
 
 (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -113,5 +113,35 @@ describe('skill packs tab', () => {
 
     const forceDeleteCalls = fetchMock.mock.calls.filter((c: any) => c[1]?.method === 'DELETE' && c[0].includes('force=1'));
     expect(forceDeleteCalls.length).toBe(1);
+  });
+
+  it('shows missing members in the editor and lets the user remove them', async () => {
+    const fetchMock = mockFetch((_url, init) => init?.method === 'PUT'
+      ? jsonRes(200, { ok: true })
+      : jsonRes(500, { error: 'unexpected_fetch' }));
+    const installed: SkillRow[] = [
+      { name: 'a', tags: [], rootDir: '/a', entrypoint: 'SKILL.md', source: { type: 'user', root: '/a' } },
+    ];
+    let renderer!: TestRenderer.ReactTestRenderer;
+    await act(async () => {
+      renderer = TestRenderer.create(React.createElement(SkillPacksTab, {
+        skills: installed,
+        packs: [pack({ include: ['skill:a', 'skill:missing'], missingSkills: ['missing'] })],
+        onRefresh: () => {},
+      }));
+    });
+
+    const edit = renderer.root.findAllByType('button')
+      .find((button: any) => String(button.props.className).includes('small') && !String(button.props.className).includes('danger'))!;
+    act(() => { edit.props.onClick(); });
+    const missing = renderer.root.findByProps({ 'data-missing-skill': 'missing' });
+    act(() => { missing.findByType('input').props.onChange(); });
+    const editorForm = renderer.root.findAllByType('form')
+      .find((form: any) => form.props['data-action'] === undefined)!;
+    await act(async () => { await editorForm.props.onSubmit({ preventDefault: () => {} }); });
+    await flush();
+
+    const put = fetchMock.mock.calls.find((call: any) => call[1]?.method === 'PUT');
+    expect(JSON.parse(String(put?.[1]?.body)).include).toEqual(['skill:a']);
   });
 });

@@ -116,6 +116,19 @@ describe('skill policy resolver with packs', () => {
     expect(result.diagnostics.some((d) => d.code === 'pack_not_found')).toBe(true);
   });
 
+  it('does not resolve inherited Object properties as packs', () => {
+    const result = resolveSkillPolicy({
+      registrySkills: [pkg('a')],
+      projectSkills: [],
+      botPolicy: { include: ['pack:constructor'] },
+      workingDir: '/repo',
+      packs: {},
+    });
+    expect(result.prioritySkills).toEqual([]);
+    expect(result.diagnostics.map((diagnostic) => diagnostic.code)).toContain('pack_not_found');
+    expect(result.diagnostics.map((diagnostic) => diagnostic.code)).not.toContain('pack_invalid');
+  });
+
   it('emits pack_skill_missing when a pack references an uninstalled skill', () => {
     const result = resolveSkillPolicy({
       registrySkills: [pkg('a')],

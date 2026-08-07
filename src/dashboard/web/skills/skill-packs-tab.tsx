@@ -155,12 +155,8 @@ export function SkillPacksTab(props: SkillPacksTabProps) {
                     </div>
                     {pack.description && <p className="skills-pack-desc">{pack.description}</p>}
                     <div className="skills-pack-meta">
-                      <span className="skills-pack-meta-item">
-                        <strong>{pack.include.length}</strong> {tr('skills.skillCount', { count: pack.include.length }).replace(/\d+/, '').trim()}
-                      </span>
-                      <span className="skills-pack-meta-item">
-                        <strong>{pack.references?.length ?? 0}</strong> Bot
-                      </span>
+                      <span className="skills-pack-meta-item">{tr('skills.skillCount', { count: pack.include.length })}</span>
+                      <span className="skills-pack-meta-item">{tr('skills.packRefCount', { count: pack.references?.length ?? 0 })}</span>
                     </div>
                     {pack.tags && pack.tags.length > 0 && (
                       <div className="skills-pack-tags">
@@ -264,6 +260,11 @@ function SkillPackEditor(props: {
   const [error, setError] = useState<string | null>(null);
   const [skillQuery, setSkillQuery] = useState('');
   const dialogRef = useRef<HTMLDialogElement | null>(null);
+  const installedSkillNames = useMemo(() => new Set(skills.map(skill => skill.name)), [skills]);
+  const missingSelected = useMemo(
+    () => [...selected].filter(skillName => !installedSkillNames.has(skillName)).sort(),
+    [installedSkillNames, selected],
+  );
 
   useEffect(() => {
     const dlg = dialogRef.current;
@@ -333,7 +334,7 @@ function SkillPackEditor(props: {
         {error && <p className="hint-warn">{error}</p>}
         <div className="skills-control-block">
           <label>{tr('skills.packId')}</label>
-          <input value={id} onChange={e => setId(e.target.value)} disabled={!!props.pack} placeholder="my-pack-slug" />
+          <input value={id} onChange={e => setId(e.target.value)} disabled={!!props.pack} placeholder={tr('skills.packIdPlaceholder')} />
         </div>
         <div className="skills-control-block">
           <label>{tr('skills.packName')}</label>
@@ -345,11 +346,11 @@ function SkillPackEditor(props: {
         </div>
         <div className="skills-control-block">
           <label>{tr('skills.packTags')}</label>
-          <input value={tags} onChange={e => setTags(e.target.value)} placeholder="tag1, tag2" />
+          <input value={tags} onChange={e => setTags(e.target.value)} placeholder={tr('skills.packTagsPlaceholder')} />
         </div>
         <div className="skills-control-block">
           <div className="skills-pack-include-head">
-            <label>{tr('skills.packInclude')} ({selected.size}/{skills.length})</label>
+            <label>{tr('skills.packInclude')} ({selected.size}/{skills.length + missingSelected.length})</label>
             <input
               className="skills-pack-skill-search"
               type="text"
@@ -363,6 +364,18 @@ function SkillPackEditor(props: {
               <input type="checkbox" checked={allFilteredSelected} onChange={toggleAllFiltered} />
               {allFilteredSelected ? tr('skills.deselectAll') : tr('skills.selectAll')}
             </label>
+          )}
+          {missingSelected.length > 0 && (
+            <div className="skills-pack-missing-editor">
+              <small className="muted">{tr('skills.packMissing')}</small>
+              {missingSelected.map(skillName => (
+                <label key={skillName} className="skills-pack-skill-item skills-pack-skill-missing" data-missing-skill={skillName}>
+                  <input type="checkbox" checked onChange={() => toggleSkill(skillName)} />
+                  <span className="skills-pack-skill-name">{skillName}</span>
+                  <small className="skills-pack-skill-desc">{tr('skills.packMissing')}</small>
+                </label>
+              ))}
+            </div>
           )}
           <div className="skills-pack-skill-list">
             {filteredSkills.map(skill => (

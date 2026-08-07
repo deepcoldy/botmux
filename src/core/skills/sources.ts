@@ -53,7 +53,11 @@ export function redactGitUrlCredentials(raw: string): string {
 export function assertNoGitUrlCredentials(raw: string): void {
   const url = parseMaybeUrl(raw);
   if (!url) return;
-  if ((url.protocol === 'http:' || url.protocol === 'https:') && (url.username || url.password)) {
+  const httpUserInfo = (url.protocol === 'http:' || url.protocol === 'https:') && !!url.username;
+  // Preserve standard ssh://git@host URLs: the SSH username selects an account
+  // and is not a secret. Passwords embedded in any supported URL protocol are
+  // credentials and must never reach the registry.
+  if (httpUserInfo || url.password) {
     throw new Error('git_url_credentials_not_allowed');
   }
 }

@@ -54,7 +54,7 @@ function policyReferencesSkillViaPack(
   if (!packs) return false;
   const selector = directSkillSelector(skillName);
   for (const packId of packIdsInPolicy(policy)) {
-    const pack = packs[packId];
+    const pack = Object.hasOwn(packs, packId) ? packs[packId] : undefined;
     if (pack && Array.isArray(pack.include) && pack.include.includes(selector)) return true;
   }
   return false;

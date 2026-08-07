@@ -83,26 +83,46 @@ function normalizeStoredPack(key: string, raw: unknown): SkillPack | undefined {
 }
 
 export function readSkillPackRegistry(): SkillPackRegistryFile {
+  return readSkillPackRegistryInternal(false);
+}
+
+/** Read-time callers stay tolerant so a damaged optional registry cannot take
+ * down session startup. Mutations must fail closed, however: treating an
+ * existing malformed file as empty and then writing it back would erase every
+ * recoverable pack on the next create/update/delete. */
+function readSkillPackRegistryInternal(strict: boolean): SkillPackRegistryFile {
   const file = skillPackRegistryPath();
   if (!existsSync(file)) return emptyRegistry();
+  let parsed: unknown;
   try {
-    const parsed = JSON.parse(readFileSync(file, 'utf-8')) as unknown;
-    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return emptyRegistry();
-    const registry = parsed as Record<string, unknown>;
-    if (registry.schemaVersion !== 1 || !registry.packs || typeof registry.packs !== 'object' || Array.isArray(registry.packs)) {
-      return emptyRegistry();
-    }
-    const packs: Record<string, SkillPack> = {};
-    for (const [key, raw] of Object.entries(registry.packs as Record<string, unknown>)) {
-      const pack = normalizeStoredPack(key, raw);
-      if (pack) packs[key] = pack;
-    }
-    return { schemaVersion: 1, packs };
+    parsed = JSON.parse(readFileSync(file, 'utf-8')) as unknown;
   } catch {
     // Malformed JSON or an unreadable file must not take down the whole skill
     // pipeline; bots keep working and invalid packs resolve to nothing.
+    if (strict) {
+      throw new SkillPackStoreError({ code: 'SKILL_PACK_INVALID', reason: 'existing packs registry is unreadable or malformed' });
+    }
     return emptyRegistry();
   }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    if (strict) throw new SkillPackStoreError({ code: 'SKILL_PACK_INVALID', reason: 'existing packs registry must be an object' });
+    return emptyRegistry();
+  }
+  const registry = parsed as Record<string, unknown>;
+  if (registry.schemaVersion !== 1 || !registry.packs || typeof registry.packs !== 'object' || Array.isArray(registry.packs)) {
+    if (strict) throw new SkillPackStoreError({ code: 'SKILL_PACK_INVALID', reason: 'existing packs registry schema is invalid' });
+    return emptyRegistry();
+  }
+  const packs: Record<string, SkillPack> = {};
+  for (const [key, raw] of Object.entries(registry.packs as Record<string, unknown>)) {
+    const pack = normalizeStoredPack(key, raw);
+    if (!pack) {
+      if (strict) throw new SkillPackStoreError({ code: 'SKILL_PACK_INVALID', reason: `stored pack "${key}" is invalid` });
+      continue;
+    }
+    packs[key] = pack;
+  }
+  return { schemaVersion: 1, packs };
 }
 
 function writeSkillPackRegistry(registry: SkillPackRegistryFile): void {
@@ -114,7 +134,7 @@ function withSkillPackMutation<T>(mutate: (registry: SkillPackRegistryFile) => T
   const file = skillPackRegistryPath();
   mkdirSync(dirname(file), { recursive: true });
   return withFileLockSync(file, () => {
-    const registry = readSkillPackRegistry();
+    const registry = readSkillPackRegistryInternal(true);
     const result = mutate(registry);
     writeSkillPackRegistry(registry);
     return result;
@@ -193,13 +213,14 @@ export function listSkillPacks(): SkillPack[] {
 }
 
 export function getSkillPack(id: string): SkillPack | undefined {
-  return readSkillPackRegistry().packs[id];
+  const packs = readSkillPackRegistry().packs;
+  return Object.hasOwn(packs, id) ? packs[id] : undefined;
 }
 
 export function createSkillPack(input: SkillPackInput): SkillPack {
   const id = validateId(input.id);
   return withSkillPackMutation((registry) => {
-    if (registry.packs[id]) {
+    if (Object.hasOwn(registry.packs, id)) {
       throw new SkillPackStoreError({ code: 'SKILL_PACK_ID_CONFLICT', id });
     }
     const now = new Date().toISOString();
@@ -220,8 +241,8 @@ export function createSkillPack(input: SkillPackInput): SkillPack {
 
 export function updateSkillPack(id: string, input: SkillPackUpdateInput): SkillPack {
   return withSkillPackMutation((registry) => {
+    if (!Object.hasOwn(registry.packs, id)) throw new SkillPackStoreError({ code: 'SKILL_PACK_NOT_FOUND', id });
     const existing = registry.packs[id];
-    if (!existing) throw new SkillPackStoreError({ code: 'SKILL_PACK_NOT_FOUND', id });
     if (input.expectedRevision !== undefined && input.expectedRevision !== existing.revision) {
       throw new SkillPackStoreError({ code: 'SKILL_PACK_REVISION_CONFLICT', id, current: existing.revision });
     }
@@ -241,7 +262,7 @@ export function updateSkillPack(id: string, input: SkillPackUpdateInput): SkillP
 
 export function deleteSkillPack(id: string): void {
   withSkillPackMutation((registry) => {
-    if (!registry.packs[id]) throw new SkillPackStoreError({ code: 'SKILL_PACK_NOT_FOUND', id });
+    if (!Object.hasOwn(registry.packs, id)) throw new SkillPackStoreError({ code: 'SKILL_PACK_NOT_FOUND', id });
     delete registry.packs[id];
   });
 }
@@ -249,9 +270,9 @@ export function deleteSkillPack(id: string): void {
 export function cloneSkillPack(id: string, newId: string): SkillPack {
   const targetId = validateId(newId);
   return withSkillPackMutation((registry) => {
+    if (!Object.hasOwn(registry.packs, id)) throw new SkillPackStoreError({ code: 'SKILL_PACK_NOT_FOUND', id });
     const source = registry.packs[id];
-    if (!source) throw new SkillPackStoreError({ code: 'SKILL_PACK_NOT_FOUND', id });
-    if (registry.packs[targetId]) {
+    if (Object.hasOwn(registry.packs, targetId)) {
       throw new SkillPackStoreError({ code: 'SKILL_PACK_ID_CONFLICT', id: targetId });
     }
     const now = new Date().toISOString();

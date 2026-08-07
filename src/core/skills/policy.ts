@@ -91,7 +91,9 @@ export function resolveSkillPolicy(input: SkillPolicyInput): SkillPolicyResult {
   }
   for (const selector of packSelectors) {
     const packId = selector.slice('pack:'.length);
-    const pack = input.packs?.[packId];
+    const pack = input.packs && Object.hasOwn(input.packs, packId)
+      ? input.packs[packId]
+      : undefined;
     if (!pack) {
       diagnostics.push({
         level: 'warn',
