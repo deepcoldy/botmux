@@ -7,7 +7,7 @@ import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
 import { readFileSync, readdirSync, mkdirSync, existsSync, realpathSync, unlinkSync } from 'node:fs';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { ensureSkills, ensureAskSkill, ensurePluginSkills, ensureWhiteboardSkill, removeGlobalBotmuxSkills } from '../skills/installer.js';
 import { shouldInstallGlobalSkills } from '../skills/injection-mode.js';
 import { whiteboardEnabled } from '../services/whiteboard-store.js';
@@ -76,6 +76,12 @@ const DAEMON_BOOT_ID = randomUUID();
 const restartCoordinator = new RestartCoordinator();
 const lifecycleRetiringWorkers = new WeakMap<DaemonSession, Set<ChildProcess>>();
 const transferRetiringWorkers = new WeakSet<ChildProcess>();
+
+/** 在完整 Worker 模块加载前接住首条 IPC，避免冷启动耗时被误判为投递失败。 */
+function workerForkExecArgv(): string[] {
+  const preloadPath = join(__dirname, '..', 'worker-ipc-preload.js');
+  return [...process.execArgv, '--import', pathToFileURL(preloadPath).href];
+}
 
 function trackLifecycleRetirement(ds: DaemonSession, worker: ChildProcess): void {
   let workers = lifecycleRetiringWorkers.get(ds);
@@ -4385,6 +4391,7 @@ export function forkWorker(
   const worker = fork(workerPath, [], {
     windowsHide: true,
     stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+    execArgv: workerForkExecArgv(),
     cwd,
     env: {
       ...forkEnv,
@@ -7236,6 +7243,7 @@ export function forkAdoptWorker(ds: DaemonSession, opts?: { restoredFromMetadata
   const worker = fork(workerPath, [], {
     windowsHide: true,
     stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+    execArgv: workerForkExecArgv(),
     cwd: adoptCwd,
     env: {
       ...forkEnv,
