@@ -17009,7 +17009,24 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
   if (!registration.accepted) {
     if (registration.reason === 'existing_owner'
       && activeSessions.get(registration.key) === registration.owner) {
-      await handleThreadReplyAdmitted(data, { ...ctx, scope, anchor });
+      // Registration-race loser → reroute to the canonical owner. Pass the FULLY
+      // PREPARED reply (merged seed+follow-up structured mentions, resources,
+      // attachments, resolved sender, pre-extracted post @s) so the winner rebinds
+      // the turn with the COMPLETE window. Rerouting bare `handleThreadReplyAdmitted
+      // (data, ctx)` would re-parse only `data` and drop the forward seed's
+      // structured message.mentions[] (post @s alone are not enough) — under-
+      // counting the turn-window and mis-releasing --mention-back. Direct-admitted
+      // (not handleThreadReply) so we don't re-enter the #597 admission lock.
+      await handleThreadReplyAdmitted(data, { ...ctx, scope, anchor }, {
+        parsed,
+        resources,
+        attachments,
+        quotaChecked: true,
+        queueAlreadyAppended: false,
+        senderResolved: true,
+        sender: newTopicSender,
+        postParticipantMentions: newTopicPostAt,
+      });
     }
     return;
   }
@@ -17599,7 +17616,12 @@ interface PreparedThreadReply {
   resources: MessageResource[];
   attachments: LarkAttachment[];
   quotaChecked: true;
-  queueAlreadyAppended: true;
+  /** Whether the inbound was already appended to the canonical anchor's queue.
+   *  A registration-race loser reroutes to the canonical existing-owner, which
+   *  appends there itself (handleThreadReplyAdmitted ~18695), so the loser passes
+   *  `false` — it never appended to that queue. (Currently advisory: the append
+   *  is unconditional, but the field must not assert a false fact.) */
+  queueAlreadyAppended: boolean;
   senderResolved: true;
   sender: ResolvedSender | undefined;
   /** Post inline-@ participants already extracted from the current AND
@@ -18621,7 +18643,23 @@ async function handleThreadReplyAdmitted(
     if (!registration.accepted) {
       if (registration.reason === 'existing_owner'
         && activeSessions.get(registration.key) === registration.owner) {
-        await handleThreadReplyAdmitted(data, ctx);
+        // Second CAS loser (auto-create). Reroute to the canonical owner with the
+        // SAME fully-prepared reply — NOT a bare re-parse. On a double-race
+        // (new-topic scratch → auto-create → auto-create loses again) a raw
+        // reroute here would drop the seed's structured mentions + post @s that
+        // survived the first prepared handoff. `parsed` already holds the merged
+        // seed+follow-up mentions; autoCreatePostAt already folds
+        // prepared.postParticipantMentions ?? forward-seed post @s.
+        await handleThreadReplyAdmitted(data, ctx, {
+          parsed,
+          resources,
+          attachments,
+          quotaChecked: true,
+          queueAlreadyAppended: false,
+          senderResolved: true,
+          sender: autoCreateSender,
+          postParticipantMentions: autoCreatePostAt,
+        });
       }
       return;
     }

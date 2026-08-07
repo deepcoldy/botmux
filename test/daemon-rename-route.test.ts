@@ -612,6 +612,40 @@ describe('/rename production routing — must not pre-create a session (review P
     expect(repliedText()).toContain(`Session: ${incumbent.session.sessionId}`);
   });
 
+  it('registration-race loser reroute preserves the forward-seed STRUCTURED @mentions in the canonical owner window (#750 seed under-count guard)', async () => {
+    // codex merge blocking: a new-topic that loses the CAS reroutes to the
+    // canonical owner via handleThreadReplyAdmitted with a fully PREPARED reply.
+    // The prepared `parsed` must carry the MERGED seed+follow-up structured
+    // mentions — a bare re-parse of `data` would only see the follow-up's
+    // message.mentions[] and DROP the forward seed's structured @OtherBot
+    // (collectPostAtMentions recovers post rich-text @s, NOT message.mentions[]),
+    // under-counting the turn window and mis-releasing --mention-back.
+    const anchor = 'om_seed_mention_owner';
+    const OTHER_BOT = 'ou_other_bot_seed';
+    const incumbent = seedThreadSession(anchor, 'canonical owner');
+
+    // Incoming new-topic: follow-up message @self (ou_bot) + a forward seed whose
+    // structured message.mentions[] contains @OtherBot. The incoming loses the CAS
+    // to the incumbent and reroutes to it.
+    const followUp = makeEventData('om_seed_followup', '@@_user_1 补充', anchor);
+    followUp.message.mentions = [{ key: '@_user_1', name: 'TestBot', id: { open_id: 'ou_bot' } }];
+    const seed = makeEventData('om_seed_root', '@@_user_1 原始转发', anchor);
+    seed.message.mentions = [{ key: '@_user_1', name: 'OtherBot', id: { open_id: OTHER_BOT } }];
+    const ctx = { ...makeCtx(anchor, 'om_seed_followup'), forwardSeedData: seed };
+
+    await handleNewTopic(followUp, ctx);
+
+    // Rerouted to the incumbent (CAS loser).
+    expect(activeSessions.get(sessionKey(anchor, APP))).toBe(incumbent);
+    // The canonical owner's per-turn participant window must still include the
+    // seed's structured @OtherBot — proving the prepared reroute carried the
+    // merged mentions rather than re-parsing only the follow-up.
+    const entry = incumbent.session.replyTargets?.['om_seed_followup'];
+    expect(entry).toBeTruthy();
+    const participantIds = (entry?.participants ?? []).map(p => p.openId);
+    expect(participantIds).toContain(OTHER_BOT);
+  });
+
   it('new topic: passes the accepted Lark message id into the first worker', async () => {
     await handleNewTopic(
       makeEventData('om_workflow_new', '/workflow new 修复首轮授权'),
