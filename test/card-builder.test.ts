@@ -21,6 +21,7 @@ import {
   buildAdoptBlockedCard,
   buildPrivateSnapshotCard,
   buildConfigCard,
+  buildConfigQuotaCard,
   buildForkPanelCard,
   buildTuiPromptFailedCard,
   buildSlashListCard,
@@ -366,8 +367,7 @@ describe('buildSlashListCard', () => {
 });
 
 describe('buildConfigCard', () => {
-  it('renders card-behaviour toggles', () => {
-    const card = parse(buildConfigCard({
+  const configData = (quota: number | null) => ({
       larkAppId: 'app_cfg',
       botName: 'Config Bot',
       cliId: 'codex',
@@ -382,7 +382,7 @@ describe('buildConfigCard', () => {
       customPassthroughCommands: null,
       startupCommands: null,
       teamRole: null,
-      quota: null,
+      quota,
       admins: 1,
       booleans: [
         { key: 'disableStreamingCard', on: false },
@@ -394,7 +394,10 @@ describe('buildConfigCard', () => {
         { key: 'disableCliBypass', on: false },
         { key: 'restrictGrantCommands', on: false },
       ],
-    }, 'en'));
+    });
+
+  it('renders card-behaviour toggles', () => {
+    const card = parse(buildConfigCard(configData(null), 'en'));
 
     const toggle = allActions(card).find((a: any) => a.value?.field === 'silentTurnReactions');
     expect(toggle).toBeTruthy();
@@ -409,6 +412,65 @@ describe('buildConfigCard', () => {
       (a: any) => a.value?.field === 'usageDisplay' || a.value?.field === 'showUsageInCardFooter',
     );
     expect(usageToggle).toBeFalsy();
+  });
+
+  it('describes the built-in grant-card and Oncall quota defaults', () => {
+    const card = parse(buildConfigCard(configData(null), 'en'));
+    const quotaEdit = allActions(card).find((a: any) => a.value?.action === 'config_quota_open');
+    const text = card.elements
+      .filter((element: any) => element.tag === 'div')
+      .map((element: any) => element.text?.content ?? '')
+      .join('\n');
+
+    expect(quotaEdit.text.content).toBe('Set message quota');
+    expect(text).toContain('Default: grant card 3 / Oncall unlimited');
+    expect(allActions(card).some((a: any) => a.value?.action === 'config_quota')).toBe(false);
+  });
+
+  it.each([3, 12, 1000])('shows the arbitrary current quota %i without a fixed-options select', current => {
+    const card = parse(buildConfigCard(configData(current), 'en'));
+    const text = card.elements
+      .filter((element: any) => element.tag === 'div')
+      .map((element: any) => element.text?.content ?? '')
+      .join('\n');
+
+    expect(text).toContain(`grant cards and Oncall use ${current} messages per person`);
+    expect(allActions(card).some((a: any) => a.value?.action === 'config_quota')).toBe(false);
+  });
+
+  it('explains a legacy quota above the supported range without placing it in a select', () => {
+    const card = parse(buildConfigCard(configData(5000), 'en'));
+    const text = card.elements
+      .filter((element: any) => element.tag === 'div')
+      .map((element: any) => element.text?.content ?? '')
+      .join('\n');
+
+    expect(text).toContain('new grant cards use at most 1000, while Oncall still uses 5000');
+    expect(allActions(card).some((a: any) => a.value?.action === 'config_quota')).toBe(false);
+  });
+
+  it('renders a free-input quota card for the 1–1000 range', () => {
+    const card = parse(buildConfigQuotaCard(configData(12), 'en'));
+    const form = card.elements.find((element: any) => element.tag === 'form');
+    const input = form.elements.find((element: any) => element.tag === 'input');
+    const save = form.elements.find((element: any) => element.value?.action === 'config_quota_save');
+
+    expect(input).toMatchObject({ name: 'messageQuota', default_value: '12' });
+    expect(input.placeholder.content).toContain('1–1000');
+    expect(save.action_type).toBe('form_submit');
+  });
+
+  it('leaves the legacy quota input blank while retaining the compatibility explanation', () => {
+    const card = parse(buildConfigQuotaCard(configData(5000), 'en'));
+    const form = card.elements.find((element: any) => element.tag === 'form');
+    const input = form.elements.find((element: any) => element.tag === 'input');
+    const text = card.elements
+      .filter((element: any) => element.tag === 'div')
+      .map((element: any) => element.text?.content ?? '')
+      .join('\n');
+
+    expect(input.default_value).toBe('');
+    expect(text).toContain('new grant cards use at most 1000, while Oncall still uses 5000');
   });
 });
 

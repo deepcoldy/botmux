@@ -15,6 +15,7 @@ import {
   DEFAULT_GRANT_DURATION_MS,
   DEFAULT_GRANT_QUOTA,
   GRANT_DURATION_OPTIONS,
+  MAX_GRANT_QUOTA,
 } from '../../services/grant-policy.js';
 
 /** select_static 里代表「清回默认 / 未设置」的哨兵值（model / lang 下拉用）。 */
@@ -44,7 +45,7 @@ function configSubheader(secKey: string, locale?: Locale): any {
 /**
  * 交互配置卡片：`/botconfig`（裸）返回它。按配置页逻辑分区（运行 / 卡片行为 / 主动开工 /
  * 安全·授权），cli·model·lang 用下拉，布尔字段用切换按钮（i18n 文案 + ✅/⬜️），消息额度
- * 用下拉。点一下即改并就地刷新（见 card-handler 的 config_set / config_toggle / config_quota）。
+ * 展示当前值并通过独立输入卡修改。即时项在卡片回调后刷新。
  * 只吃纯数据 {@link ConfigCardData}，不反向依赖 store，避免循环依赖。
  */
 export function buildConfigCard(data: ConfigCardData, locale?: Locale): string {
@@ -102,15 +103,32 @@ export function buildConfigCard(data: ConfigCardData, locale?: Locale): string {
     elements.push({ tag: 'hr' });
     elements.push(configSubheader(g.sec, locale));
     elements.push({ tag: 'action', actions: btns });
-    // 安全·授权区附带「消息额度」下拉。
+    // 安全·授权区展示当前额度，自由输入放在独立子卡。
+    // v1 form 不能被卡片 patch 稳定重渲染，否则切换其它开关可能变空卡。
     if (g.sec === 'card.config.sec.security') {
-      const qOpts = [
-        { text: t('card.config.quota_off', undefined, locale), value: 'off' },
-        ...['5', '10', '20', '50', '100'].map(n => ({ text: n, value: n })),
-      ];
+      const legacyQuota = data.quota != null && data.quota > MAX_GRANT_QUOTA;
+      elements.push({
+        tag: 'div',
+        text: {
+          tag: 'lark_md',
+          content: data.quota == null
+            ? t('card.config.quota_off', undefined, locale)
+            : legacyQuota
+              ? t('card.config.quota_legacy_note', {
+                quota: data.quota,
+                cardQuota: MAX_GRANT_QUOTA,
+              }, locale)
+              : t('card.config.quota_value', { quota: data.quota }, locale),
+        },
+      });
       elements.push({
         tag: 'action',
-        actions: [configSelect(t('card.config.quota_label', undefined, locale), data.quota == null ? 'off' : String(data.quota), qOpts, { action: 'config_quota', ...locVal })],
+        actions: [{
+          tag: 'button',
+          text: { tag: 'plain_text', content: t('card.config.quota_edit', undefined, locale) },
+          type: 'default',
+          value: { action: 'config_quota_open', ...locVal },
+        }],
       });
     }
   }
@@ -132,6 +150,58 @@ export function buildConfigCard(data: ConfigCardData, locale?: Locale): string {
   return JSON.stringify({
     config: { wide_screen_mode: true },
     header: { template: 'blue', title: { tag: 'plain_text', content: t('card.config.title', { name: data.botName }, locale) } },
+    elements,
+  });
+}
+
+/**
+ * 消息额度输入子卡：接受 1–1000 的任意整数，留空恢复内置策略。
+ * 使用独立新卡承载 v1 form，避免主配置卡的开关 patch 到含 form 的卡体。
+ */
+export function buildConfigQuotaCard(data: ConfigCardData, locale?: Locale): string {
+  const locVal: Record<string, string> = locale ? { loc: locale } : {};
+  const legacyQuota = data.quota != null && data.quota > MAX_GRANT_QUOTA;
+  const elements: any[] = [
+    { tag: 'div', text: { tag: 'lark_md', content: t('card.config.quota_input_note', undefined, locale) } },
+  ];
+  if (legacyQuota) {
+    elements.push({
+      tag: 'div',
+      text: {
+        tag: 'lark_md',
+        content: t('card.config.quota_legacy_note', {
+          quota: data.quota ?? '',
+          cardQuota: MAX_GRANT_QUOTA,
+        }, locale),
+      },
+    });
+  }
+  elements.push({
+    tag: 'form',
+    name: 'config_quota_form',
+    elements: [
+      {
+        tag: 'input',
+        name: 'messageQuota',
+        default_value: legacyQuota || data.quota == null ? '' : String(data.quota),
+        placeholder: { tag: 'plain_text', content: t('card.config.quota_input_placeholder', undefined, locale) },
+      },
+      {
+        tag: 'button',
+        text: { tag: 'plain_text', content: t('card.config.save', undefined, locale) },
+        type: 'primary',
+        name: 'config_quota_save',
+        action_type: 'form_submit',
+        value: { action: 'config_quota_save', ...locVal },
+      },
+    ],
+  });
+  return JSON.stringify({
+    config: { wide_screen_mode: true },
+    header: {
+      template: 'blue',
+      title: { tag: 'plain_text', content: t('card.config.quota_input_title', { name: data.botName }, locale) },
+    },
     elements,
   });
 }

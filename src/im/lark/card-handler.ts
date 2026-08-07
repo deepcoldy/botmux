@@ -9,7 +9,7 @@ import { config } from '../../config.js';
 import { getBot, getAllBots, getOwnerOpenId } from '../../bot-registry.js';
 import { canOperate, canTalk } from './event-dispatcher.js';
 import { updateMessage, deleteMessage, replyMessage, sendMessage, sendUserMessage, sendEphemeralCard, getMessageDetail, isHumanOpenId, resolveUserUnionId as defaultResolveUserUnionId } from './client.js';
-import { buildSessionCard, buildStreamingCard, buildTuiPromptCard, buildTuiPromptProcessingCard, buildGrantResultCard, getCliDisplayName, truncateContent, buildConfigCard, buildConfigTextCard, CONFIG_UNSET, buildRepoSelectCard } from './card-builder.js';
+import { buildSessionCard, buildStreamingCard, buildTuiPromptCard, buildTuiPromptProcessingCard, buildGrantResultCard, getCliDisplayName, truncateContent, buildConfigCard, buildConfigQuotaCard, buildConfigTextCard, CONFIG_UNSET, buildRepoSelectCard } from './card-builder.js';
 import { codexServiceTierBadge } from '../../services/codex-service-tier.js';
 import {
   findConfigField,
@@ -18,6 +18,7 @@ import {
   getConfigCardData,
 } from '../../services/bot-config-store.js';
 import { updateBotGrantPrefs } from '../../services/grant-prefs-store.js';
+import { MAX_GRANT_QUOTA } from '../../services/grant-policy.js';
 import { writeTeamRoleFile, deleteTeamRoleFile } from '../../core/role-resolver.js';
 import { addChatGrant, addGlobalGrant } from '../../services/grant-store.js';
 import {
@@ -1383,8 +1384,11 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     return JSON.parse(cardJson);
   }
 
-  // ─── /botconfig 交互卡片：切换布尔开关 / 选择 cli·model·lang / 消息额度，就地刷新 ──
-  const CONFIG_CARD_ACTIONS = ['config_toggle', 'config_set', 'config_quota', 'config_text_open', 'config_text_save'];
+  // ─── /botconfig 交互卡片：切换布尔开关 / 选择 cli·model·lang / 编辑自由输入项 ──
+  const CONFIG_CARD_ACTIONS = [
+    'config_toggle', 'config_set', 'config_quota', 'config_quota_open',
+    'config_quota_save', 'config_text_open', 'config_text_save',
+  ];
   if (value?.action && larkAppId && CONFIG_CARD_ACTIONS.includes(value.action)) {
     // 卡片携带的渲染语言（`/botconfig en` 的覆盖）优先；缺省回落 bot 默认。
     const vLoc = (value as any)?.loc;
@@ -1451,11 +1455,55 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       return { toast: { type: 'success', content: `✓ ${spec.key} = ${r.newText}` } };
     }
 
-    // 消息额度（grant-prefs，非 CONFIG_FIELDS 字段）：'off' = 关闭，正整数 = 设定。
+    // 消息额度使用独立私信子卡自由输入，与 Dashboard 的 1–1000 语义一致。
+    if (value.action === 'config_quota_open') {
+      const d = getConfigCardData(larkAppId, modelChoices);
+      if (!d) return { toast: { type: 'error', content: t('cmd.config.no_bot', undefined, loc) } };
+      try {
+        await sendUserMessage(larkAppId, operatorOpenId!, buildConfigQuotaCard(d, loc), 'interactive');
+        return { toast: { type: 'success', content: t('card.config.quota_sent', undefined, loc) } };
+      } catch {
+        return { toast: { type: 'error', content: t('card.config.quota_send_fail', undefined, loc) } };
+      }
+    }
+    if (value.action === 'config_quota_save') {
+      const fv: Record<string, string> = (action as any)?.form_value ?? {};
+      const raw = String(fv.messageQuota ?? '').trim();
+      let limit: number | null = null;
+      if (raw) {
+        const n = Number(raw);
+        if (!/^\d+$/.test(raw) || !Number.isSafeInteger(n) || n < 1 || n > MAX_GRANT_QUOTA) {
+          return { toast: { type: 'error', content: t('card.config.quota_invalid', undefined, loc) } };
+        }
+        limit = n;
+      }
+      const qr = await updateBotGrantPrefs(larkAppId, { messageQuotaDefaultLimit: limit });
+      if (!qr.ok) return { toast: { type: 'error', content: t('cmd.config.write_failed', { reason: qr.reason }, loc) } };
+      return {
+        toast: {
+          type: 'success',
+          content: limit == null
+            ? t('card.config.quota_saved_default', undefined, loc)
+            : t('card.config.quota_saved', { quota: limit }, loc),
+        },
+      };
+    }
+
+    // 兼容已发出的旧版下拉卡：'off' = 恢复内置策略，正整数 = 设定。
     if (value.action === 'config_quota') {
       const raw = (action as any)?.option ?? '';
-      const n = raw === 'off' ? null : Number(raw);
-      const limit = n && Number.isInteger(n) && n > 0 ? n : null;
+      // legacy 是只读初始项，用来让历史 >1000 额度仍能生成合法下拉卡。
+      if (raw === 'legacy') {
+        return { toast: { type: 'info', content: t('card.config.quota_legacy_unchanged', undefined, loc) }, ...reRender() };
+      }
+      let limit: number | null = null;
+      if (raw !== 'off') {
+        const n = Number(raw);
+        if (!/^\d+$/.test(raw) || !Number.isSafeInteger(n) || n < 1 || n > MAX_GRANT_QUOTA) {
+          return { toast: { type: 'error', content: t('card.config.quota_invalid', undefined, loc) } };
+        }
+        limit = n;
+      }
       const qr = await updateBotGrantPrefs(larkAppId, { messageQuotaDefaultLimit: limit });
       if (!qr.ok) return { toast: { type: 'error', content: t('cmd.config.write_failed', { reason: qr.reason }, loc) } };
       return { toast: { type: 'success', content: `✓ quota = ${limit ?? 'off'}` }, ...reRender() };
