@@ -5926,9 +5926,17 @@ async function cmdSuspend(): Promise<void> {
   // 一个 daemon 抽风而失败。
   const daemonRows = new Map<number, Map<string, any> | null>();
   let dryRunDegraded = false;
-  const rowOf = async (sessionId: string, larkAppId?: string): Promise<any | undefined> => {
+  // daemon 不在线是**确定可知**的结果，不是未知：真实循环在发请求之前就会因
+  // findDaemon() 为空而跳过。只有「daemon 在线但 /api/sessions 读不到」才是真未知。
+  // 早期版本把这两种混成一个 undefined，于是 listener 那类伪 app id（无对应 daemon）
+  // 的会话被报成「未知」——实测 20/516 条这样的信息损失，而它们的真实结果是"跳过"。
+  type Lookup =
+    | { kind: 'row'; row: any | undefined }
+    | { kind: 'no_daemon'; larkAppId?: string }
+    | { kind: 'unreadable' };
+  const lookupRow = async (sessionId: string, larkAppId?: string): Promise<Lookup> => {
     const daemon = findDaemon(larkAppId);
-    if (!daemon) { dryRunDegraded = true; return undefined; }
+    if (!daemon) return { kind: 'no_daemon', larkAppId };
     if (!daemonRows.has(daemon.ipcPort)) {
       try {
         const res = await fetchDaemonIpc(daemon.ipcPort, '/api/sessions', { method: 'GET' });
@@ -5939,8 +5947,8 @@ async function cmdSuspend(): Promise<void> {
       } catch { daemonRows.set(daemon.ipcPort, null); }
     }
     const map = daemonRows.get(daemon.ipcPort);
-    if (!map) { dryRunDegraded = true; return undefined; }
-    return map.get(sessionId);
+    if (!map) { dryRunDegraded = true; return { kind: 'unreadable' }; }
+    return { kind: 'row', row: map.get(sessionId) };
   };
   // 复刻 dashboard-ipc-server 的 suspend 路由分支顺序。行拿不到时返回 undefined
   // （预告降级为"未知"），绝不猜一个确定的结论。
@@ -5951,8 +5959,13 @@ async function cmdSuspend(): Promise<void> {
   // 为一个 dry-run 预告给 SessionRow 加字段不成比例；如果以后行里有了该状态，
   // 在 adopt 之前补一条分支即可。
   const SUSPENDABLE_BACKENDS = new Set(['tmux', 'herdr', 'zellij', 'zmx']);
-  const predictSuspend = (row: any): 'defer' | 'suspend' | 'no_worker' | 'refuse' | undefined => {
-    if (!row) return undefined;
+  type Prediction = 'defer' | 'suspend' | 'no_worker' | 'refuse' | 'skip_no_daemon' | 'unknown';
+  const predictSuspend = (lk: Lookup): Prediction => {
+    if (lk.kind === 'no_daemon') return 'skip_no_daemon';
+    if (lk.kind === 'unreadable') return 'unknown';
+    const row = lk.row;
+    // 会话在本地 store 里是 active，但 daemon 的行里没有它——判不出走哪条分支。
+    if (!row) return 'unknown';
     if (row.adopt) return 'refuse';                          // adopt_suspend_unsupported
     if (row.status === 'dormant' || row.status === 'closed') return 'no_worker';
     if (!SUSPENDABLE_BACKENDS.has(row.backendType)) return 'refuse';  // backend_not_suspendable
@@ -5963,13 +5976,23 @@ async function cmdSuspend(): Promise<void> {
   for (const s of matched) {
     const label = `${s.sessionId.substring(0, 8)}  ${s.title ?? ''}`.trimEnd();
     if (dryRun) {
-      const predicted = predictSuspend(await rowOf(s.sessionId, s.larkAppId));
+      // 真实循环的第一道跳过在发请求之前，dry-run 也要照抄，否则这类会被误报。
+      if (!s.larkAppId && online.length > 1) {
+        console.log(`· 将跳过（缺 larkAppId，多 daemon 无法判定归属）: ${label}`);
+        skipped++;
+        continue;
+      }
+      const predicted = predictSuspend(await lookupRow(s.sessionId, s.larkAppId));
       switch (predicted) {
         case 'defer': console.log(`· 将排队（正在回复，完成后自动挂起）: ${label}`); deferred++; break;
         case 'suspend': console.log(`· 将挂起: ${label}`); break;
         case 'no_worker': console.log(`· 将跳过（本就无存活 CLI）: ${label}`); skipped++; break;
         case 'refuse': console.log(`· 将拒绝（adopt / 不可挂起 backend）: ${label}`); failed++; break;
-        default: console.log(`? 未知（daemon 状态读不到，无法预告）: ${label}`); break;
+        case 'skip_no_daemon':
+          console.log(`· 将跳过（daemon 不在线${s.larkAppId ? `: ${s.larkAppId}` : ''}）: ${label}`);
+          skipped++;
+          break;
+        default: console.log(`? 未知（daemon 在线但状态读不到，无法预告）: ${label}`); break;
       }
       continue;
     }
@@ -6011,7 +6034,7 @@ async function cmdSuspend(): Promise<void> {
 
   if (dryRun) {
     if (dryRunDegraded) {
-      console.log('\n⚠️  部分会话的 daemon 状态读不到（daemon 不在线或 /api/sessions 失败），这些预告标为「未知」而非猜测。');
+      console.log('\n⚠️  部分会话所属 daemon 在线但 /api/sessions 读失败，这些预告标为「未知」而非猜测。');
     }
     console.log(`DRY-RUN：共 ${matched.length} 个目标${deferred ? `（其中 ${deferred} 个正在回复，会排队）` : ''}，未执行。`);
     return;
