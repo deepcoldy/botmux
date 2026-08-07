@@ -52,6 +52,15 @@ body {
   background:
     linear-gradient(180deg, rgba(17, 24, 39, 0.72), rgba(7, 9, 15, 0.98)),
     var(--bg);
+  /* Native app chrome: labels, pills, and buttons are controls, not copyable
+     text. Diagnostic text re-enables selection below. */
+  user-select: none;
+}
+
+.runtime-meta,
+.version-line,
+.log-output {
+  user-select: text;
 }
 
 button,
@@ -273,8 +282,10 @@ input:disabled {
 }
 
 .runtime-actions {
-  display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  /* Only state-relevant actions are visible (start vs stop/restart), so the
+     row flexes to share space among whichever buttons are shown. */
+  display: flex;
+  flex-wrap: wrap;
   gap: 4px;
   padding: 4px;
   border: 1px solid var(--border-soft);
@@ -287,6 +298,7 @@ input:disabled {
   align-items: center;
   justify-content: center;
   gap: 4px;
+  flex: 1 1 0;
   min-width: 0;
   height: 28px;
   padding: 0 6px;
@@ -361,7 +373,7 @@ input:disabled {
 }
 
 .runtime-action-takeover {
-  grid-column: 1 / -1;
+  flex: 1 1 100%;
   min-height: 30px;
   justify-content: center;
   padding: 0 10px;
@@ -389,29 +401,83 @@ input:disabled {
 }
 
 .login-row {
-  display: grid;
-  grid-template-columns: 14px minmax(0, auto);
-  gap: 6px;
+  display: flex;
+  gap: 7px;
   align-items: center;
   min-width: 0;
   margin-top: 0;
   padding: 0;
   color: var(--muted);
   font-size: 12px;
+  cursor: pointer;
 }
 
+.login-row:has(input:disabled) {
+  cursor: not-allowed;
+}
+
+/* The real checkbox stays in the tree for the label/a11y wiring; the switch
+   track next to it is the visible control (macOS-style sliding toggle). */
 .login-row input {
-  width: 14px;
-  height: 14px;
+  position: absolute;
+  width: 1px;
+  height: 1px;
   margin: 0;
-  accent-color: var(--accent);
+  opacity: 0;
+  pointer-events: none;
 }
 
-.login-row span {
+.login-switch {
+  flex: 0 0 26px;
+  position: relative;
+  width: 26px;
+  height: 16px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.14);
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.09);
+  transition: background 160ms ease, box-shadow 160ms ease;
+}
+
+.login-switch::after {
+  content: "";
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.35);
+  transition: transform 160ms ease;
+}
+
+.login-row input:checked ~ .login-switch {
+  background: linear-gradient(120deg, var(--accent), var(--info));
+  box-shadow: none;
+}
+
+.login-row input:checked ~ .login-switch::after {
+  transform: translateX(10px);
+}
+
+.login-row input:disabled ~ .login-switch {
+  opacity: 0.55;
+}
+
+.login-row input:focus-visible ~ .login-switch {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.login-label {
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.login-row[data-enabled="true"] .login-label {
+  color: var(--text);
 }
 
 .version-line {
@@ -478,27 +544,28 @@ input:disabled {
 }
 
 .topbar-status {
-  justify-content: flex-end;
+  /* Read-only summary lives on the left; interactive actions right-align. */
+  justify-content: flex-start;
 }
 
 .status-pill {
   display: inline-flex;
   align-items: center;
-  gap: 8px;
+  gap: 6px;
   min-width: 0;
-  height: 32px;
-  padding: 0 10px;
-  border: 1px solid rgba(255, 255, 255, 0.08);
+  height: 26px;
+  padding: 0 11px;
+  border: 1px solid var(--border-soft);
   border-radius: 999px;
-  background: rgba(255, 255, 255, 0.045);
+  background: rgba(255, 255, 255, 0.03);
   color: var(--muted);
-  font-size: 12px;
-  font-weight: 700;
+  font-size: 11px;
+  font-weight: 650;
 }
 
 .status-pill strong {
   color: var(--accent-strong);
-  font-size: 15px;
+  font-size: 13px;
 }
 
 .topbar-actions {
@@ -536,10 +603,15 @@ input:disabled {
 .topbar-actions > a,
 .logs-actions button {
   height: 32px;
+  padding: 0 13px;
   border: 1px solid var(--border);
   border-radius: 999px;
   background: rgba(255, 255, 255, 0.045);
   color: var(--text);
+  /* Buttons inherit the 16px document size otherwise; the rest of the shell
+     chrome (sidebar nav, pills, locale toggle) sits at 12-13px. */
+  font-size: 12px;
+  font-weight: 650;
 }
 
 .topbar-actions > button:hover:not(:disabled),
@@ -552,7 +624,6 @@ input:disabled {
 .topbar-actions > a {
   display: inline-flex;
   align-items: center;
-  padding: 0 14px;
   text-decoration: none;
 }
 
