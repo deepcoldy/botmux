@@ -1,10 +1,16 @@
 /**
  * Cross-boundary contract tests for the mojo backend.
  *
- * These are the five scenarios round-11 review reproduced as failing probes. They
- * live here permanently: every one of them passed a unit-level suite while being
- * broken in production, because each involves a COMBINATION — queueing, restart,
- * durable suppression, PATH layering — that a single-call test cannot reach.
+ * The cross-boundary scenarios review reproduced as failing probes (rounds 10 and
+ * 11). They live here permanently: every one of them passed a unit-level suite
+ * while being broken in production, because each involves a COMBINATION —
+ * queueing, restart, lifecycle teardown, env layering — that a single-call test
+ * cannot reach.
+ *
+ * Each test states which fix it isolates. Two of them (2 and 2b) look similar on
+ * purpose: 2 covers a clear that rides the queue during a rebuild, 2b covers a
+ * clear that settled BEFORE the rebuild, and only 2b fails if the
+ * post-respawn credential restore is removed.
  *
  * Run:  pnpm vitest run test/mojo-cross-boundary.test.ts
  */
@@ -164,7 +170,80 @@ describe('mojo cross-boundary contracts', () => {
     } finally { teardown(h); }
   });
 
-  it('3. an ambient wrapper must not shadow a per-bot one', async () => {
+  it('2b. a lifecycle cancel after a respawn must not use a revived credential', async () => {
+    // Isolates fix 2 (restoreMojoLivePatchAfterRespawn), which test 2 cannot:
+    // there the clear rides on the queue item, so fix 1 alone saves it.
+    //
+    // Here the clear FULLY SETTLES first, then the backend is rebuilt, and the
+    // next thing to touch the credential is a lifecycle op (`/close` →
+    // destroySession → `mojo session cancel`) that carries no patch of its own.
+    // The replacement backend is constructed from the init config, so without
+    // carrying the credential state forward it cancels the remote session as the
+    // OLD identity — exactly the case review reproduced.
+    const h = bootWorker({ mojo: { jwtEnv: 'MY_JWT', env: { MY_JWT: 'stale-A' } } });
+    try {
+      h.child.send({
+        type: 'init',
+        sessionId: 'sid-xb', chatId: 'oc_x', rootMessageId: 'om_x',
+        workingDir: h.root, cliId: 'mojo', backendType: 'mojo',
+        backendConfig: { cloud: true, jwtEnv: 'MY_JWT', env: { MY_JWT: 'stale-A' } },
+        prompt: 'turn one', larkAppId: 'app_xb', larkAppSecret: 'secret',
+      } as DaemonToWorker);
+      await waitFor(() => lines(h.dump).length >= 1, 25_000, () => `turn one never ran\n${h.logs.join('')}`);
+      expect(lines(h.dump)[0]).toBe('[stale-A]');
+
+      // 1. Clear, and let the turn settle COMPLETELY before restarting.
+      h.child.send({ type: 'message', content: 'clear me', mojoLivePatch: { jwt: null } } as DaemonToWorker);
+      await waitFor(() => lines(h.dump).length >= 2, 30_000, () => `clear turn never ran\n${h.logs.join('')}`);
+      expect(lines(h.dump)[1]).toBe('[]');
+      const settled = lines(h.dump).length;
+
+      // 2. Rebuild the backend. Count respawns: 'Spawning fresh CLI' is also
+      //    logged at init, so includes() would be a vacuous precondition.
+      const spawnsBefore = (h.logs.join('').match(/Spawning fresh CLI/g) ?? []).length;
+      h.child.send({ type: 'restart' } as DaemonToWorker);
+      await waitFor(
+        () => (h.logs.join('').match(/Spawning fresh CLI/g) ?? []).length > spawnsBefore,
+        40_000,
+        () => `restart never respawned the backend\n${h.logs.join('')}`,
+      );
+
+      // 3. Let the restart's own teardown finish first. It cancels via the OLD
+      //    backend (already cleared), so counting it as progress is what made an
+      //    earlier version of this test pass vacuously.
+      await waitFor(
+        () => h.logs.join('').includes('cancelled session'),
+        30_000,
+        () => `restart teardown never cancelled\n${h.logs.join('')}`,
+      );
+      const afterTeardown = lines(h.dump).length;
+
+      // 4. A turn on the REPLACEMENT backend carrying no patch of its own. This
+      //    is what revives the credential without the restore, and it also gives
+      //    the new backend a session id so the close below can actually cancel.
+      h.child.send({ type: 'message', content: 'after respawn' } as DaemonToWorker);
+      await waitFor(
+        () => lines(h.dump).length > afterTeardown,
+        30_000,
+        () => `post-respawn turn never ran\n${h.logs.join('')}`,
+      );
+      const afterTurn = lines(h.dump).length;
+
+      // 5. Now the lifecycle op review asked for, on a backend that has a remote
+      //    session to cancel.
+      h.child.send({ type: 'close' } as DaemonToWorker);
+      await waitFor(
+        () => lines(h.dump).length > afterTurn,
+        30_000,
+        () => `close never reached the CLI\n${lines(h.dump).join(' ')}\n${h.logs.join('')}`,
+      );
+
+      // Index-free: every credential use from the clear onwards must be empty.
+      expect(lines(h.dump).slice(1)).not.toContain('[stale-A]');
+    } finally { teardown(h); }
+  });
+
+  it('3. wrapper resolution honours all three env layers, mojo.env highest', async () => {
     // buildWrappedLaunch resolved through locateOnPath, which reads the DAEMON's
     // env, so a per-bot PATH was ignored for the wrapper binary and the child ran
     // the ambient install instead.
@@ -174,9 +253,12 @@ describe('mojo cross-boundary contracts', () => {
     // depending on a fixture shell's nested PATH lookup would test the fixture.
     const h = bootWorker({});
     const perBot = realpathSync(mkdtempSync(join(tmpdir(), 'botmux-mojo-perbot-')));
+    // THREE layers, because that is where the bug lived: the launcher merged only
+    // ambient + bot env, so the highest-precedence `mojo.env.PATH` never won.
+    const mojoDir = realpathSync(mkdtempSync(join(tmpdir(), 'botmux-mojo-mojoenv-')));
     try {
-      // Same wrapper name in both places; only the per-bot one may be chosen.
-      for (const dir of [h.root, perBot]) {
+      // Same wrapper name in all three places; only mojo.env's may be chosen.
+      for (const dir of [h.root, perBot, mojoDir]) {
         const w = join(dir, 'mywrap');
         writeFileSync(w, '#!/usr/bin/env bash\nexec "$@"\n');
         chmodSync(w, 0o755);
@@ -188,7 +270,7 @@ describe('mojo cross-boundary contracts', () => {
         workingDir: h.root, cliId: 'mojo', backendType: 'mojo',
         wrapperCli: 'mywrap mojo',
         env: { PATH: `${perBot}:${h.root}` },
-        backendConfig: { cloud: true },
+        backendConfig: { cloud: true, env: { PATH: `${mojoDir}:${perBot}:${h.root}` } },
         prompt: 'wrapped turn', larkAppId: 'app_xb', larkAppSecret: 'secret',
       } as DaemonToWorker);
 
@@ -198,10 +280,13 @@ describe('mojo cross-boundary contracts', () => {
         () => `wrapper prefix never resolved\n${h.logs.join('')}`,
       );
       const all = h.logs.join('');
-      expect(all).toContain(`Launch prefix: spawning ${join(perBot, 'mywrap')}`);
-      // The ambient install must not appear as the chosen prefix.
+      // mojo.env is the highest layer, so its wrapper must win over BOTH the
+      // bot-level and the ambient one.
+      expect(all).toContain(`Launch prefix: spawning ${join(mojoDir, 'mywrap')}`);
+      expect(all).not.toContain(`Launch prefix: spawning ${join(perBot, 'mywrap')}`);
       expect(all).not.toContain(`Launch prefix: spawning ${join(h.root, 'mywrap')}`);
     } finally {
+      rmSync(mojoDir, { recursive: true, force: true });
       rmSync(perBot, { recursive: true, force: true });
       teardown(h);
     }
