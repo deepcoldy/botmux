@@ -406,7 +406,9 @@ describe('desktop dashboard embed', () => {
     expect(html).toContain('footer-meta-row');
     expect(html).toContain('开机启动 App');
     expect(styleSource).toContain('grid-template-columns: minmax(0, 1fr)');
-    expect(styleSource).toContain('text-align: left');
+    // The bottom version line centers under evenly spaced footer rows.
+    expect(styleSource).toContain('justify-content: space-between');
+    expect(styleSource).toContain('text-align: center');
     expect(styleSource).toContain('-webkit-line-clamp: 2');
   });
 
@@ -443,6 +445,9 @@ describe('desktop dashboard embed', () => {
     expect(html).toMatch(/<input id="login-toggle" type="checkbox" role="switch"/);
     expect(html).toContain('class="login-switch"');
     expect(html).toContain('id="login-label"');
+    // The switch shares the status row: status reads left, switch right-aligns.
+    expect(html).toMatch(/<div class="runtime-line">[\s\S]*id="login-row"[\s\S]*?<\/div>\n\s*<div class="runtime-actions/);
+    expect(styleSource).toContain('grid-template-columns: 10px minmax(0, 1fr) auto');
     expect(styleSource).toContain('.login-row input:checked ~ .login-switch');
     expect(styleSource).toContain('.login-row input:focus-visible ~ .login-switch');
     expect(styleSource).toContain('.login-row[data-enabled="true"] .login-label');

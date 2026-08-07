@@ -211,8 +211,11 @@ input:disabled {
 }
 
 .sidebar-foot {
-  display: grid;
-  gap: 8px;
+  /* Three rows — status line, action group, version — spaced evenly. */
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  gap: 9px;
   flex: 0 0 auto;
   margin-top: 10px;
   padding: 10px 6px 0;
@@ -220,10 +223,17 @@ input:disabled {
 }
 
 .runtime-line {
+  /* Status reads left, the launch-at-login switch right-aligns on the same line. */
   display: grid;
-  grid-template-columns: 10px minmax(0, 1fr);
+  grid-template-columns: 10px minmax(0, 1fr) auto;
   gap: 8px;
   align-items: center;
+}
+
+.runtime-line > .login-row {
+  /* Multi-line runtime meta grows the row; keep the switch level with the
+     first (status) line instead of drifting to the vertical middle. */
+  align-self: start;
 }
 
 .status-dot {
@@ -402,13 +412,16 @@ input:disabled {
 
 .login-row {
   display: flex;
-  gap: 7px;
+  gap: 6px;
   align-items: center;
   min-width: 0;
   margin-top: 0;
   padding: 0;
   color: var(--muted);
+  /* Sits beside the 13px/650 runtime status; match its tone one notch smaller. */
   font-size: 12px;
+  font-weight: 650;
+  line-height: 1.2;
   cursor: pointer;
 }
 
@@ -487,7 +500,7 @@ input:disabled {
   color: var(--faint);
   font-size: 10.5px;
   line-height: 1.2;
-  text-align: left;
+  text-align: center;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
