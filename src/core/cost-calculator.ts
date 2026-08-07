@@ -813,15 +813,21 @@ function readCodexTokenAggregateCached(
     }
     ({ state, seenMessageIds, scanned, completeBytes, previewAgg, pendingTailIsInitialResidualLine } = win);
   } else {
-    // Oversized cold/bounded read. Fast path: scan the last tail window. If the
-    // three independent metrics (cumulative / context / model) are not all on
-    // that window — a single >4MiB turn can push the newest snapshot, or the
-    // model line, out of it — do ONE bounded widen to the back-scan budget and
-    // re-scan that whole window. A single widened pass (not a 4/8/.../32 ladder)
-    // keeps the worst-case synchronous read at tail + budget instead of their
-    // sum, while still recovering the true latest usage. Each pass scans from a
-    // fresh state; Codex token_count is cumulative (latest wins), so re-folding
-    // older lines first and letting the newest snapshot overwrite last is exact.
+    // Oversized cold/bounded read. Fast path: scan the last tail window. Widen
+    // ONCE to the back-scan budget and re-scan that whole window when the fast
+    // path is incomplete — either the two usage metrics (cumulative/context)
+    // are not both present, or this session is KNOWN to carry a model (the
+    // cached read had one) but the fast window has none. A single >4MiB turn can
+    // push the newest token_count — or a just-switched model line — out of the
+    // tail window; the widen recovers the true latest of all of them. A single
+    // widened pass (not a 4/8/.../32 ladder) keeps the worst-case synchronous
+    // read at tail + budget, not their sum. Each pass scans from a fresh state;
+    // Codex token_count/model are latest-wins, so re-folding older lines first
+    // and letting the newest overwrite last is exact. Model is NOT inherited
+    // from cache: a widen that still finds none fails closed to empty rather
+    // than risk shipping a stale model (which mis-prices the ledger) after an
+    // append-only model switch.
+    const cachedHadModel = sameOpenFileAsCache && !!previousAgg?.model;
     baseOffset = Math.max(0, fdStat.size - CODEX_USAGE_TRANSCRIPT_TAIL_BYTES);
     let win = scanFromWindow(baseOffset, false);
     if (!win) {
@@ -829,7 +835,9 @@ function readCodexTokenAggregateCached(
       usageFileCache.delete(key);
       return null;
     }
-    if (!aggregateHasAllCodexMetrics(win.previewAgg) && baseOffset > 0) {
+    const fastPathIncomplete = !aggregateHasAllCodexMetrics(win.previewAgg)
+      || (cachedHadModel && !win.previewAgg.model);
+    if (fastPathIncomplete && baseOffset > 0) {
       const widenedBaseOffset = Math.max(0, fdStat.size - CODEX_USAGE_MAX_BACKSCAN_BYTES);
       if (widenedBaseOffset < baseOffset) {
         const widened = scanFromWindow(widenedBaseOffset, false);
@@ -843,24 +851,6 @@ function readCodexTokenAggregateCached(
       }
     }
     ({ state, seenMessageIds, scanned, completeBytes, previewAgg, pendingTailIsInitialResidualLine } = win);
-  }
-
-  // Model back-fill: the model rides on turn_context/session_meta lines and is
-  // a stable session-level attribute, but a bounded window may not re-include
-  // one (a long final turn can push the last model line out of it). A fresh
-  // per-window scan would then ship an empty model to the ledger ("unknown").
-  // Carry the model forward from the SAME open file's cached read (dev+ino) —
-  // model only, never the usage numbers, and only to fill an empty value, so a
-  // genuine in-window model always wins and no stale token counts are inherited.
-  if (
-    oversized
-    && !reuseTrackedReplay
-    && !previewAgg.model
-    && sameOpenFileAsCache
-    && previousAgg?.model
-  ) {
-    if (previewAgg === state) previewAgg = cloneAggregate(state);
-    previewAgg.model = previousAgg.model;
   }
 
   const nextOffset = pendingTailIsInitialResidualLine ? baseOffset : baseOffset + completeBytes;

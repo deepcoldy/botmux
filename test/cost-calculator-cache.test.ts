@@ -614,12 +614,13 @@ describe('readSessionTokenUsageFile caching', () => {
     });
   });
 
-  it('carries the model forward when a large tail window recovers usage but no model line', () => {
-    // Model rides on turn_context lines and is a stable session attribute. Warm
-    // read captures model; a later >4MiB burst + a new tail token_count (with NO
-    // model line) must recover the usage AND keep the model, not ship "" to the
-    // ledger. (Regression for the widen dropping model — usage-only back-fill.)
-    const p = join(dir, 'codex-model-carry-forward.jsonl');
+  it('widens to recover the model when the cached read had one but the tail window does not', () => {
+    // Model rides on turn_context lines. Warm read captured a model, so the
+    // session is known to carry one; when a >4MiB burst pushes it (and the last
+    // model line) out of the fast tail window, the widen must re-scan far enough
+    // to recover the model — not ship "" to the ledger, and not inherit it
+    // blindly (see the model-switch test for why inheritance is wrong).
+    const p = join(dir, 'codex-model-widen-recover.jsonl');
     const finalSize = MAX_USAGE_TRANSCRIPT_BYTES + CODEX_USAGE_TRANSCRIPT_TAIL_BYTES + 1;
     const baseOffset = finalSize - CODEX_USAGE_TRANSCRIPT_TAIL_BYTES;
     writeFileSync(p, '');
@@ -655,6 +656,49 @@ describe('readSessionTokenUsageFile caching', () => {
     })).toMatchObject({
       context: { usedTokens: 240, windowTokens: 1_000, percentUsed: 24 },
       tokens: { in: 500, out: 60, model: 'gpt-5-codex' },
+    });
+  });
+
+  it('recovers the SWITCHED model (not the stale one) when a burst pushes it out of the tail window', () => {
+    // Append-only model switch: old-model → new-model, then a >4MiB burst pushes
+    // new-model out of the fast tail window, then EOF token_count with no model.
+    // The widen must recover new-model (latest wins); inheriting the cached
+    // old-model would mis-price the ledger — worse than "unknown".
+    const p = join(dir, 'codex-model-switch.jsonl');
+    const finalSize = MAX_USAGE_TRANSCRIPT_BYTES + CODEX_USAGE_TRANSCRIPT_TAIL_BYTES + 1;
+    const baseOffset = finalSize - CODEX_USAGE_TRANSCRIPT_TAIL_BYTES;
+    writeFileSync(p, '');
+    truncateSync(p, baseOffset - 1);
+    appendFileSync(p, '\n');
+    appendFileSync(p, `${codexModelLine('old-model')}\n`);
+    appendFileSync(p, `${codexCountLine(100, 10, 20, { used: 30, window: 1_000 })}\n`);
+    appendFileSync(p, Buffer.alloc(finalSize - fileSize(p), 0x20));
+    vi.mocked(findCodexRolloutBySessionId).mockReturnValue(p);
+    expect(getSessionUsageSnapshot({
+      cliId: 'codex',
+      sessionId: 'botmux-sid',
+      cliSessionId: 'codex-sid',
+      fresh: true,
+    })).toMatchObject({ tokens: { in: 100, out: 10, model: 'old-model' } });
+
+    appendFileSync(p, `${codexModelLine('new-model')}\n`);
+    let appended = 0;
+    let i = 0;
+    while (appended < CODEX_USAGE_TRANSCRIPT_TAIL_BYTES + 8192) {
+      const line = `${JSON.stringify({ type: 'event_msg', payload: { type: 'agent_message', text: `t${i++}` } })}\n`;
+      appendFileSync(p, line);
+      appended += Buffer.byteLength(line);
+    }
+    appendFileSync(p, `${codexCountLine(500, 60, 200, { used: 240, window: 1_000 })}\n`);
+    now += 20_000;
+
+    expect(getSessionUsageSnapshot({
+      cliId: 'codex',
+      sessionId: 'botmux-sid',
+      cliSessionId: 'codex-sid',
+      fresh: true,
+    })).toMatchObject({
+      tokens: { in: 500, out: 60, model: 'new-model' },
     });
   });
 
