@@ -33,6 +33,7 @@ vi.mock('../src/services/codex-transcript.js', () => ({
 }));
 
 import {
+  CODEX_USAGE_MAX_BACKSCAN_BYTES,
   CODEX_USAGE_TRANSCRIPT_TAIL_BYTES,
   MAX_USAGE_TRANSCRIPT_BYTES,
   getSessionUsageSnapshot,
@@ -555,7 +556,7 @@ describe('readSessionTokenUsageFile caching', () => {
     })).toEqual({ context: null, tokens: null, turnTokens: null });
   });
 
-  it('does not inherit cached Codex metrics when a large tail has no snapshot', () => {
+  it('recovers usage by widening the back-scan when a large Codex tail has no snapshot', () => {
     const p = join(dir, 'codex-large-delta-no-snapshot.jsonl');
     writeOversizedCodexSnapshot(p, `${codexCountLine(100, 10, 20, { used: 30, window: 1_000 })}\n`);
     vi.mocked(findCodexRolloutBySessionId).mockReturnValue(p);
@@ -569,6 +570,10 @@ describe('readSessionTokenUsageFile caching', () => {
       tokens: { in: 100, out: 10 },
     });
 
+    // A single >4MiB non-snapshot burst (e.g. one huge tool output) pushes the
+    // only token_count snapshot out of the first tail window. Rather than
+    // collapsing the usage card to null, the reader widens the back-scan until
+    // it recovers the true latest usage from the earlier snapshot.
     appendLargeCodexDelta(p, JSON.stringify({ type: 'event_msg', payload: { type: 'notice' } }));
     now += 20_000;
     expect(getSessionUsageSnapshot({
@@ -576,7 +581,53 @@ describe('readSessionTokenUsageFile caching', () => {
       sessionId: 'botmux-sid',
       cliSessionId: 'codex-sid',
       fresh: true,
-    })).toEqual({ context: null, tokens: null, turnTokens: null });
+    })).toMatchObject({
+      context: { usedTokens: 30, windowTokens: 1_000, percentUsed: 3 },
+      tokens: { in: 100, out: 10 },
+    });
+  });
+
+  it('widens the back-scan across several windows to recover a snapshot far from the tail', () => {
+    // Snapshot sits ~10MiB from EOF (past 2 tail windows), buried behind a big
+    // non-snapshot burst. The reader must widen past the first windows to find it.
+    const p = join(dir, 'codex-backscan-multi-window.jsonl');
+    const snapshot = `${codexCountLine(321, 32, 100, { used: 210, window: 1_000 })}\n`;
+    const finalSize = MAX_USAGE_TRANSCRIPT_BYTES + 12 * 1024 * 1024;
+    const snapshotOffset = finalSize - 10 * 1024 * 1024;
+    writeFileSync(p, '');
+    truncateSync(p, snapshotOffset - 1);
+    appendFileSync(p, '\n');
+    appendFileSync(p, snapshot);
+    appendFileSync(p, Buffer.alloc(finalSize - fileSize(p), 0x20));
+    expect(fileSize(p)).toBe(finalSize);
+    vi.mocked(findCodexRolloutBySessionId).mockReturnValue(p);
+
+    expect(getSessionUsageSnapshot({
+      cliId: 'codex',
+      sessionId: 'botmux-sid',
+      cliSessionId: 'codex-sid',
+      fresh: true,
+    })).toMatchObject({
+      context: { usedTokens: 210, windowTokens: 1_000, percentUsed: 21 },
+      tokens: { in: 321, out: 32, inputTokens: 221, cacheReadTokens: 100 },
+    });
+  });
+
+  it('bounds the back-scan and does not walk the whole file when no snapshot is within budget', () => {
+    // The only snapshot is further from EOF than the back-scan budget. The read
+    // must stop widening at CODEX_USAGE_MAX_BACKSCAN_BYTES (never scanning back
+    // to the snapshot) and, with no cached value to fall back to, yield null.
+    const p = join(dir, 'codex-backscan-budget-exceeded.jsonl');
+    const snapshot = `${codexCountLine(777, 70, 50, { used: 300, window: 1_000 })}\n`;
+    const finalSize = MAX_USAGE_TRANSCRIPT_BYTES + CODEX_USAGE_MAX_BACKSCAN_BYTES + 8 * 1024 * 1024;
+    const snapshotOffset = finalSize - CODEX_USAGE_MAX_BACKSCAN_BYTES - 4 * 1024 * 1024;
+    writeFileSync(p, '');
+    truncateSync(p, snapshotOffset - 1);
+    appendFileSync(p, '\n');
+    appendFileSync(p, snapshot);
+    appendFileSync(p, Buffer.alloc(finalSize - fileSize(p), 0x20));
+    expect(fileSize(p)).toBe(finalSize);
+    vi.mocked(findCodexRolloutBySessionId).mockReturnValue(p);
 
     vi.mocked(readSync).mockClear();
     expect(getSessionUsageSnapshot({
@@ -585,10 +636,49 @@ describe('readSessionTokenUsageFile caching', () => {
       cliSessionId: 'codex-sid',
       fresh: true,
     })).toEqual({ context: null, tokens: null, turnTokens: null });
-    expect(vi.mocked(readSync)).not.toHaveBeenCalled();
+    // Never reads at or before the snapshot: the deepest read stays within the
+    // bounded back-scan budget from EOF.
+    const minReadPos = Math.min(
+      ...vi.mocked(readSync).mock.calls.map((call) => Number(call[4])).filter(Number.isFinite),
+    );
+    expect(minReadPos).toBeGreaterThan(snapshotOffset);
   });
 
-  it('drops cached cumulative tokens when a large Codex tail only has context', () => {
+  it('does not inherit warm Codex usage across a burst that exceeds the back-scan budget', () => {
+    // Warm cache holds in=555. A later burst larger than the whole back-scan
+    // budget leaves no snapshot reachable within budget. We must NOT resurrect
+    // the stale value across what could be a rewritten generation — the bounded
+    // rebuild yields null rather than a possibly-invalid inherited value. (This
+    // is the fail-closed boundary; the common warm case is recovered by the
+    // back-scan itself, exercised in the widening tests above.)
+    const p = join(dir, 'codex-backscan-budget-no-inherit.jsonl');
+    writeOversizedCodexSnapshot(p, `${codexCountLine(555, 55, 30, { used: 400, window: 1_000 })}\n`);
+    vi.mocked(findCodexRolloutBySessionId).mockReturnValue(p);
+    expect(getSessionUsageSnapshot({
+      cliId: 'codex',
+      sessionId: 'botmux-sid',
+      cliSessionId: 'codex-sid',
+      fresh: true,
+    })).toMatchObject({ tokens: { in: 555, out: 55 } });
+
+    let appended = 0;
+    let i = 0;
+    while (appended < CODEX_USAGE_MAX_BACKSCAN_BYTES + 8 * 1024 * 1024) {
+      const line = `${JSON.stringify({ type: 'event_msg', payload: { type: 'agent_message', text: `t${i++}` } })}\n`;
+      appendFileSync(p, line);
+      appended += Buffer.byteLength(line);
+    }
+    now += 20_000;
+
+    expect(getSessionUsageSnapshot({
+      cliId: 'codex',
+      sessionId: 'botmux-sid',
+      cliSessionId: 'codex-sid',
+      fresh: true,
+    })).toEqual({ context: null, tokens: null, turnTokens: null });
+  });
+
+  it('recovers earlier cumulative tokens by widening the back-scan when a large Codex tail only has context', () => {
     const p = join(dir, 'codex-context-only-large-delta.jsonl');
     writeOversizedCodexSnapshot(p, `${codexCountLine(100, 10, 20, { used: 30, window: 1_000 })}\n`);
     vi.mocked(findCodexRolloutBySessionId).mockReturnValue(p);
@@ -605,6 +695,9 @@ describe('readSessionTokenUsageFile caching', () => {
     appendLargeCodexDelta(p, codexContextLine(240, 1_000));
     now += 20_000;
 
+    // The tail window only carries the new context snapshot; the cumulative
+    // metric lives on the earlier line, so the reader widens the back-scan and
+    // keeps the true latest of BOTH instead of dropping cumulative tokens.
     expect(getSessionUsageSnapshot({
       cliId: 'codex',
       sessionId: 'botmux-sid',
@@ -612,12 +705,11 @@ describe('readSessionTokenUsageFile caching', () => {
       fresh: true,
     })).toMatchObject({
       context: { usedTokens: 240, windowTokens: 1_000, percentUsed: 24 },
-      tokens: null,
+      tokens: { in: 100, out: 10 },
     });
-    expect(readSessionTokenUsageFile(p, 'codex', { fresh: true })).toBeNull();
   });
 
-  it('drops cached context when a large Codex tail only has cumulative tokens', () => {
+  it('recovers earlier context by widening the back-scan when a large Codex tail only has cumulative tokens', () => {
     const p = join(dir, 'codex-cumulative-only-large-delta.jsonl');
     writeOversizedCodexSnapshot(p, `${codexCountLine(100, 10, 20, { used: 30, window: 1_000 })}\n`);
     vi.mocked(findCodexRolloutBySessionId).mockReturnValue(p);
@@ -634,13 +726,16 @@ describe('readSessionTokenUsageFile caching', () => {
     appendLargeCodexDelta(p, codexCountLine(500, 60, 200));
     now += 20_000;
 
+    // The tail window only carries the new cumulative snapshot; the context
+    // metric lives on the earlier line, so the reader widens the back-scan and
+    // recovers the true latest of BOTH metrics instead of dropping context.
     expect(getSessionUsageSnapshot({
       cliId: 'codex',
       sessionId: 'botmux-sid',
       cliSessionId: 'codex-sid',
       fresh: true,
     })).toMatchObject({
-      context: null,
+      context: { usedTokens: 30, windowTokens: 1_000, percentUsed: 3 },
       tokens: { in: 500, out: 60, inputTokens: 300, cacheReadTokens: 200 },
     });
   });

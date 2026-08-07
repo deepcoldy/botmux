@@ -10,7 +10,7 @@ import {
   cachedTranscriptPathLookup,
   resolveSessionTranscriptPath,
 } from '../services/transcript-resolver.js';
-import { scanJsonlFromFd, scanJsonlFromOffset } from '../services/jsonl-cursor.js';
+import { scanJsonlFromFd, scanJsonlFromOffset, type JsonlCursor } from '../services/jsonl-cursor.js';
 import {
   isMeaningfulQueuedCommand,
   isMeaningfulUserEvent,
@@ -522,11 +522,20 @@ const USAGE_REPARSE_MIN_INTERVAL_MS = 15_000;
  *  scan pathological multi-GB transcripts. */
 export const MAX_USAGE_TRANSCRIPT_BYTES = 64 * 1024 * 1024;
 /** Codex token_count events are cumulative snapshots, so an oversized cold
- *  restore only needs a bounded tail window to recover the latest usage card.
- *  Keep this tight: it is a synchronous dashboard read path, and real 150MiB+
- *  rollouts have many token_count snapshots in the last 4MiB. */
+ *  restore starts from a bounded tail window and recovers the latest usage
+ *  card from it. Real 150MiB+ rollouts almost always carry a token_count
+ *  snapshot in the last 4MiB, so this window is the common-case fast path. */
 export const CODEX_USAGE_TRANSCRIPT_TAIL_BYTES = 4 * 1024 * 1024;
 const CODEX_USAGE_REPLAY_BYTES = 4 * 1024 * 1024;
+/** When a single huge turn (e.g. one giant tool output) pushes the latest
+ *  token_count snapshot out of the first tail window, widen the window one
+ *  step at a time and re-scan until both the cumulative and context metrics
+ *  are recovered. This keeps the card showing the TRUE latest usage instead of
+ *  collapsing to null. Bounded so the synchronous dashboard read never walks an
+ *  unbounded prefix: past this budget we stop widening and fail closed (yield
+ *  whatever the bounded window found, without inheriting a possibly-stale value
+ *  across an unverifiable generation boundary). */
+export const CODEX_USAGE_MAX_BACKSCAN_BYTES = 32 * 1024 * 1024;
 
 /** Aiden checkpoint paths move as the session progresses (latest.json points
  *  at a new checkpoint id per turn), so positive hits expire quickly too. */
@@ -597,6 +606,13 @@ function isJsonlLineBoundaryFd(fd: number, offset: number): boolean {
 
 function aggregateHasCodexUsage(agg: TokenUsageAggregate): boolean {
   return !!agg.latestCodexUsage || !!agg.latestContextUsage;
+}
+
+/** Both independent Codex metrics recovered. Used to decide when a widening
+ *  back-scan can stop: they may live on different lines, so a window that only
+ *  caught one is not yet complete. */
+function aggregateHasAllCodexMetrics(agg: TokenUsageAggregate): boolean {
+  return !!agg.latestCodexUsage && !!agg.latestContextUsage;
 }
 
 interface UsageReadResult {
@@ -690,8 +706,7 @@ function readCodexTokenAggregateCached(
   }
   let state: TokenUsageAggregate;
   let seenMessageIds: Set<string>;
-  let baseOffset: number;
-  let dropInitialResidualLine = false;
+  let baseOffset = 0;
   const previousAgg = cached?.previewAgg ? cloneAggregate(cached.previewAgg) : undefined;
   const sameOpenFileAsCache = !!cached
     && cached.dev === fdStat.dev
@@ -716,45 +731,113 @@ function readCodexTokenAggregateCached(
   const replaySpan = replayBaseOffset === null ? Number.POSITIVE_INFINITY : fdStat.size - replayBaseOffset;
   const reuseTrackedReplay = replayBaseOffset !== null && replaySpan <= CODEX_USAGE_REPLAY_BYTES;
 
+  // Scan one [from, size) window into a fresh aggregate. Codex token_count is a
+  // cumulative snapshot (latest wins), so a wider window that re-includes older
+  // lines re-folds them first and the newest snapshot still overwrites last —
+  // scanning from a fresh state each time keeps that correctness without any
+  // double counting. Returns null only on read failure.
+  interface WindowScan {
+    state: TokenUsageAggregate;
+    seenMessageIds: Set<string>;
+    scanned: JsonlCursor;
+    completeBytes: number;
+    previewAgg: TokenUsageAggregate;
+    pendingTailIsInitialResidualLine: boolean;
+  }
+  const scanFromWindow = (from: number, knownLineBoundary: boolean): WindowScan | null => {
+    const windowState = newTokenUsageAggregate();
+    const windowSeen = new Set<string>();
+    // Replay/full-file reads start on a proven line boundary (offset 0, or an
+    // offset already validated by isJsonlLineBoundaryFd), so they need no extra
+    // probe. Only a widened bounded-tail window lands at an arbitrary byte and
+    // must drop the partial leading record.
+    let dropResidual = !knownLineBoundary && from > 0 && !isJsonlLineBoundaryFd(fd, from);
+    let droppedResidual = false;
+    let windowScanError: unknown = null;
+    const windowScanned = scanJsonlFromFd(fd, from, {
+      endOffset: fdStat.size,
+      onLine: (line, lineStart) => {
+        if (dropResidual) {
+          dropResidual = false;
+          droppedResidual = true;
+          return;
+        }
+        foldUsageJsonLine('codex', windowState, windowSeen, line, lineStart);
+      },
+      onError: (error) => { windowScanError = error; },
+    });
+    if (!windowScanned) {
+      logger.error(`Failed to read Codex transcript slice ${path}: ${windowScanError instanceof Error ? windowScanError.message : String(windowScanError)}`);
+      return null;
+    }
+    let windowPreview = windowState;
+    const windowTail = windowScanned.pendingTail.trim();
+    const residualTailPending = dropResidual && !droppedResidual;
+    if (windowTail && !residualTailPending) {
+      windowPreview = cloneAggregate(windowState);
+      foldUsageText('codex', windowPreview, new Set(windowSeen), windowTail);
+    }
+    return {
+      state: windowState,
+      seenMessageIds: windowSeen,
+      scanned: windowScanned,
+      completeBytes: windowScanned.newOffset - from,
+      previewAgg: windowPreview,
+      pendingTailIsInitialResidualLine: residualTailPending,
+    };
+  };
+
+  let scanned: JsonlCursor;
+  let completeBytes: number;
+  let previewAgg: TokenUsageAggregate;
+  let pendingTailIsInitialResidualLine: boolean;
+
   if (reuseTrackedReplay) {
-    state = newTokenUsageAggregate();
-    seenMessageIds = new Set();
     baseOffset = replayBaseOffset;
+    const win = scanFromWindow(baseOffset, true);
+    if (!win) {
+      closeSync(fd);
+      usageFileCache.delete(key);
+      return null;
+    }
+    ({ state, seenMessageIds, scanned, completeBytes, previewAgg, pendingTailIsInitialResidualLine } = win);
+  } else if (!oversized) {
+    baseOffset = 0;
+    const win = scanFromWindow(baseOffset, true);
+    if (!win) {
+      closeSync(fd);
+      usageFileCache.delete(key);
+      return null;
+    }
+    ({ state, seenMessageIds, scanned, completeBytes, previewAgg, pendingTailIsInitialResidualLine } = win);
   } else {
-    state = newTokenUsageAggregate();
-    seenMessageIds = new Set();
-    baseOffset = oversized ? Math.max(0, fdStat.size - CODEX_USAGE_TRANSCRIPT_TAIL_BYTES) : 0;
-    dropInitialResidualLine = oversized && !isJsonlLineBoundaryFd(fd, baseOffset);
-  }
-
-  let scanError: unknown = null;
-  let droppedInitialResidualLine = false;
-  const scanned = scanJsonlFromFd(fd, baseOffset, {
-    endOffset: fdStat.size,
-    onLine: (line, lineStart) => {
-      if (dropInitialResidualLine) {
-        dropInitialResidualLine = false;
-        droppedInitialResidualLine = true;
-        return;
+    // Oversized cold/bounded read: start at the last tail window and widen it
+    // one step at a time until BOTH independent metrics are recovered (they can
+    // sit on different lines) — or we hit the file head or the back-scan budget.
+    // This recovers the true latest usage even when a single >4MiB turn pushed
+    // the newest snapshot out of the first window, instead of collapsing to null.
+    let win: WindowScan | null = null;
+    let step = 0;
+    for (;;) {
+      const windowBytes = CODEX_USAGE_TRANSCRIPT_TAIL_BYTES * (step + 1);
+      baseOffset = Math.max(0, fdStat.size - windowBytes);
+      const attempt = scanFromWindow(baseOffset, false);
+      if (!attempt) {
+        closeSync(fd);
+        usageFileCache.delete(key);
+        return null;
       }
-      foldUsageJsonLine('codex', state, seenMessageIds, line, lineStart);
-    },
-    onError: (error) => { scanError = error; },
-  });
-  if (!scanned) {
-    logger.error(`Failed to read Codex transcript slice ${path}: ${scanError instanceof Error ? scanError.message : String(scanError)}`);
-    closeSync(fd);
-    usageFileCache.delete(key);
-    return null;
-  }
-  const completeBytes = scanned.newOffset - baseOffset;
-
-  let previewAgg = state;
-  const tailText = scanned.pendingTail.trim();
-  const pendingTailIsInitialResidualLine = dropInitialResidualLine && !droppedInitialResidualLine;
-  if (tailText && !pendingTailIsInitialResidualLine) {
-    previewAgg = cloneAggregate(state);
-    foldUsageText('codex', previewAgg, new Set(seenMessageIds), tailText);
+      win = attempt;
+      if (
+        aggregateHasAllCodexMetrics(attempt.previewAgg)
+        || baseOffset === 0
+        || windowBytes >= CODEX_USAGE_MAX_BACKSCAN_BYTES
+      ) {
+        break;
+      }
+      step += 1;
+    }
+    ({ state, seenMessageIds, scanned, completeBytes, previewAgg, pendingTailIsInitialResidualLine } = win);
   }
 
   const nextOffset = pendingTailIsInitialResidualLine ? baseOffset : baseOffset + completeBytes;
