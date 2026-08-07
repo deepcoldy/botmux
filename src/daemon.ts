@@ -15469,17 +15469,26 @@ function isRetryableRepoCardTransportError(err: unknown): boolean {
   return /socket hang up|\b(?:EPIPE|ECONNRESET|ECONNABORTED|ETIMEDOUT)\b/i.test(message);
 }
 
-/** Post the first-spawn repo picker. A long synchronous repo scan can leave the
- * SDK's keep-alive socket stale, so retry one transient transport failure with
- * the same provider UUID. Lark deduplicates a first request that committed but
- * lost its response; if both attempts fail, keep the pending input buffered and
- * send the deterministic `/repo` text recovery instead. */
+/** Deliver the first-spawn repo picker. When a shared scan-progress card already
+ * exists, PATCH that same message in place; otherwise POST a new picker with a
+ * stable provider UUID. Retry one transient transport failure after allowing the
+ * SDK's stale keep-alive socket to drain. If both attempts fail, keep the pending
+ * input buffered and send the deterministic `/repo` text recovery instead. */
 async function postPendingRepoSelectCard(
   ds: DaemonSession,
   anchor: string,
   projects: import('./services/project-scanner.js').ProjectInfo[],
+  existingMessageId?: string,
 ): Promise<string | undefined> {
   const deliveryUuid = `repo-picker:${ds.session.sessionId}`;
+  const clearProvisionalRepoCard = (): void => {
+    if (existingMessageId && ds.repoCardMessageId === existingMessageId) {
+      ds.repoCardMessageId = undefined;
+    }
+  };
+  const pendingCommitOwnsExistingCard = (): boolean => existingMessageId !== undefined
+    && ds.pendingRepoCommitInFlight === true
+    && ds.repoCardMessageId === existingMessageId;
   try {
     const cardJson = buildRepoSelectCard(
       projects,
@@ -15488,22 +15497,55 @@ async function postPendingRepoSelectCard(
       localeForBot(ds.larkAppId),
       getBot(ds.larkAppId).config.worktreeMultiPicker,
     );
+    const deliver = async (): Promise<string> => {
+      if (existingMessageId) {
+        // Feishu can render the patched picker before the PATCH response reaches
+        // us. Authorize that same message before awaiting so an immediate click
+        // is not rejected as stale; every failure path below rolls it back only
+        // if no newer route/card has replaced it.
+        ds.repoCardMessageId = existingMessageId;
+        await updateMessage(ds.larkAppId, existingMessageId, cardJson);
+        return existingMessageId;
+      }
+      return sessionReply(anchor, cardJson, 'interactive', ds.larkAppId, undefined, { uuid: deliveryUuid });
+    };
     try {
-      return await sessionReply(anchor, cardJson, 'interactive', ds.larkAppId, undefined, { uuid: deliveryUuid });
+      return await deliver();
     } catch (err) {
       if (!isRetryableRepoCardTransportError(err)) throw err;
-      logger.warn(`[${tag(ds)}] Repo selection card transport failed; retrying with stable UUID: ${err instanceof Error ? err.message : err}`);
+      logger.warn(`[${tag(ds)}] Repo selection card transport failed; retrying ${existingMessageId ? 'same-message PATCH' : 'with stable UUID'}: ${err instanceof Error ? err.message : err}`);
       // The failed socket is removed from the shared Agent on a later event-loop
       // turn. An immediate retry can pick it again and fail within the same 2ms.
       await new Promise<void>(resolve => setTimeout(resolve, REPO_CARD_TRANSPORT_RETRY_DELAY_MS));
-      if (!ds.pendingRepo || !ownsCurrentRoute(ds, ds.larkAppId)) {
+      if (pendingCommitOwnsExistingCard()) {
+        logger.info(`[${tag(ds)}] Repo selection card retry skipped because a pending commit took over`);
+        return existingMessageId;
+      }
+      if (!ds.pendingRepo || !ownsCurrentRoute(ds, ds.larkAppId)
+          || (existingMessageId !== undefined && (
+            ds.repoScanCardMessageId !== existingMessageId
+            || ds.repoCardMessageId !== existingMessageId
+          ))) {
+        clearProvisionalRepoCard();
         logger.info(`[${tag(ds)}] Repo selection card retry skipped because the pending route changed during backoff`);
         return undefined;
       }
-      return await sessionReply(anchor, cardJson, 'interactive', ds.larkAppId, undefined, { uuid: deliveryUuid });
+      return await deliver();
     }
   } catch (err) {
     logger.warn(`[${tag(ds)}] Repo selection card delivery failed: ${err instanceof Error ? err.message : err}`);
+    if (pendingCommitOwnsExistingCard()) {
+      logger.info(`[${tag(ds)}] Repo selection text fallback skipped because a pending commit took over`);
+      return existingMessageId;
+    }
+    const newerRepoCardTookOver = existingMessageId !== undefined
+      && ds.repoCardMessageId !== undefined
+      && ds.repoCardMessageId !== existingMessageId;
+    clearProvisionalRepoCard();
+    if (newerRepoCardTookOver) {
+      logger.info(`[${tag(ds)}] Repo selection text fallback skipped because a newer picker took over`);
+      return undefined;
+    }
     if (!ds.pendingRepo || ds.pendingRepoCommitInFlight ||
         (ds.worker && !ds.worker.killed) || !ownsCurrentRoute(ds, ds.larkAppId)) {
       logger.info(`[${tag(ds)}] Repo selection text fallback skipped because the pending route changed`);
@@ -16390,16 +16432,50 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
 
         if (projects.length > 0) {
           lastRepoScan.set(chatId, projects);
-          const repoCardMessageId = await postPendingRepoSelectCard(ds, anchor, projects);
-          if (!pendingRepoScanStillOwnsRoute(ds, anchor, scanSessionId, repoScanCardMessageId)) {
-            if (repoCardMessageId) void deleteMessage(larkAppId, repoCardMessageId);
+          const repoCardMessageId = await postPendingRepoSelectCard(ds, anchor, projects, repoScanCardMessageId);
+          const pendingRouteStillOwned = pendingRepoScanStillOwnsRoute(
+            ds,
+            anchor,
+            scanSessionId,
+            repoScanCardMessageId,
+          );
+          const pickerHandoffStillOwned = repoScanCardMessageId === undefined
+            || ds.repoCardMessageId === repoScanCardMessageId
+            || (repoCardMessageId === undefined && ds.repoCardMessageId === undefined);
+          if (!pendingRouteStillOwned || !pickerHandoffStillOwned) {
+            const pendingCommitTookOver = repoScanCardMessageId !== undefined
+              && repoCardMessageId === repoScanCardMessageId
+              && ds.pendingRepoCommitInFlight === true
+              && ds.repoCardMessageId === repoScanCardMessageId;
+            if (pendingCommitTookOver) {
+              ds.repoScanCardMessageId = undefined;
+              logger.info(`[${tag(ds)}] Repo picker handoff completed under the pending commit`);
+              return;
+            }
+            const newerPendingPickerTookOver = pendingRouteStillOwned
+              && ds.repoCardMessageId !== undefined
+              && ds.repoCardMessageId !== repoScanCardMessageId;
+            if (repoCardMessageId && repoCardMessageId !== repoScanCardMessageId) {
+              void deleteMessage(larkAppId, repoCardMessageId);
+            }
             withdrawRepoScanProgressCard(ds, repoScanCardMessageId);
-            if (lastRepoScan.get(chatId) === projects) lastRepoScan.delete(chatId);
-            logger.info(`[${tag(ds)}] Withdrawing late repo card because the pending route changed during delivery`);
+            if (repoScanCardMessageId && ds.repoCardMessageId === repoScanCardMessageId) {
+              ds.repoCardMessageId = undefined;
+            }
+            if (!newerPendingPickerTookOver && lastRepoScan.get(chatId) === projects) {
+              lastRepoScan.delete(chatId);
+            }
+            logger.info(`[${tag(ds)}] Withdrawing late repo card because the pending route or picker changed during delivery`);
             return;
           }
           ds.repoCardMessageId = repoCardMessageId;
-          withdrawRepoScanProgressCard(ds, repoScanCardMessageId);
+          if (repoCardMessageId && repoCardMessageId === repoScanCardMessageId) {
+            // The shared progress message is now the active picker. Transfer its
+            // authorization role without withdrawing the message users can see.
+            ds.repoScanCardMessageId = undefined;
+          } else {
+            withdrawRepoScanProgressCard(ds, repoScanCardMessageId);
+          }
           logger.info(`[${tag(ds)}] Waiting for repo selection (${projects.length} projects)`);
           return;
         }

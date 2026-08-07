@@ -61,6 +61,7 @@ const mocks = vi.hoisted(() => {
     scanDeferreds,
     scanMultipleProjectsAsync,
     sendMessage: vi.fn(async (...args: any[]) => nextOutboundMessageId(args[3], 'om_top')),
+    updateMessage: vi.fn(async () => undefined),
     updateSession: vi.fn(),
   };
 });
@@ -80,6 +81,7 @@ vi.mock('../src/im/lark/client.js', async () => {
     getChatNameAndMode: mocks.getChatNameAndMode,
     replyMessage: mocks.replyMessage,
     sendMessage: mocks.sendMessage,
+    updateMessage: mocks.updateMessage,
   };
 });
 
@@ -122,7 +124,8 @@ vi.mock('../src/core/worker-pool.js', async () => {
 });
 
 import { __testOnly_resetBotRegistry, registerBot } from '../src/bot-registry.js';
-import { sessionKey } from '../src/core/types.js';
+import { isActiveRepoCard, sessionKey } from '../src/core/types.js';
+import { commitRepoSelection } from '../src/im/lark/card-handler.js';
 import { __resetAnchorQueues, serializeByAnchor } from '../src/utils/anchor-serializer.js';
 import {
   __testOnly_activeSessions as activeSessions,
@@ -206,6 +209,8 @@ describe('first-mention async repo scan routing', () => {
     mocks.sendMessage.mockImplementation(async (...args: any[]) => (
       mocks.nextOutboundMessageId(args[3], 'om_top')
     ));
+    mocks.updateMessage.mockReset();
+    mocks.updateMessage.mockResolvedValue(undefined);
     mocks.scanDeferreds.length = 0;
     activeSessions.clear();
     __resetAnchorQueues();
@@ -220,14 +225,16 @@ describe('first-mention async repo scan routing', () => {
     bot.resolvedAllowedUsers = [OWNER];
   });
 
-  it('posts scan progress before the child resolves, then replaces it with the picker', async () => {
+  it('posts one scan card, then updates that message in place to the picker', async () => {
     const { route, ds, scan, progressMessageId } = await startPendingScan('om_scan_projects');
     await route;
 
     expect(progressMessageId).toBeDefined();
     expect(ds.repoScanCardMessageId).toBe(progressMessageId);
+    const progressPost = outboundCalls('interactive')[0]!;
     expect(outboundCalls('interactive')).toHaveLength(1);
-    expect(outboundCalls('interactive')[0]?.[5]).toMatch(/^repo-scan:/);
+    expect(progressPost[5]).toMatch(/^repo-scan:/);
+    expect(JSON.parse(progressPost[2]).config.update_multi).toBe(true);
     expect(outboundText()).toBe('');
     expect(mocks.forkWorker).not.toHaveBeenCalled();
     expect(ds.pendingRepo).toBe(true);
@@ -237,17 +244,126 @@ describe('first-mention async repo scan routing', () => {
     await route;
     await waitForScanFinish(ds);
 
-    const interactive = outboundCalls('interactive');
-    expect(interactive).toHaveLength(2);
-    expect(interactive[1]?.[5]).toMatch(/^repo-picker:/);
-    expect(interactive[1]?.[5]).not.toBe(interactive[0]?.[5]);
-    expect(ds.repoCardMessageId).toBeDefined();
-    expect(ds.repoCardMessageId).not.toBe(progressMessageId);
+    expect(outboundCalls('interactive')).toHaveLength(1);
+    expect(mocks.updateMessage).toHaveBeenCalledWith(APP, progressMessageId, expect.any(String));
+    expect(JSON.parse(mocks.updateMessage.mock.calls[0]![2]).config.update_multi).toBe(true);
+    expect(ds.repoCardMessageId).toBe(progressMessageId);
     expect(ds.repoScanCardMessageId).toBeUndefined();
-    expect(mocks.deleteMessage).toHaveBeenCalledWith(APP, progressMessageId);
+    expect(mocks.deleteMessage).not.toHaveBeenCalledWith(APP, progressMessageId);
     expect(ds.pendingRepo).toBe(true);
     expect(ds.repoScanInFlight).toBe(false);
     expect(mocks.forkWorker).not.toHaveBeenCalled();
+  });
+
+  it('authorizes the same message while its picker PATCH response is pending', async () => {
+    const { route, ds, scan, progressMessageId } = await startPendingScan('om_scan_patch_pending');
+    await route;
+    let resolveUpdate!: () => void;
+    mocks.updateMessage.mockImplementationOnce(() => new Promise<void>((resolve) => {
+      resolveUpdate = resolve;
+    }));
+
+    scan.resolve([project('patch-pending')]);
+    await vi.waitFor(() => expect(mocks.updateMessage).toHaveBeenCalledTimes(1));
+
+    expect(ds.repoCardMessageId).toBe(progressMessageId);
+    expect(ds.repoScanCardMessageId).toBe(progressMessageId);
+    expect(isActiveRepoCard(ds, progressMessageId)).toBe(true);
+    expect(ds.pendingRepo).toBe(true);
+
+    resolveUpdate();
+    await waitForScanFinish(ds);
+    expect(ds.repoCardMessageId).toBe(progressMessageId);
+    expect(ds.repoScanCardMessageId).toBeUndefined();
+  });
+
+  it('does not overwrite a newer picker created while the original PATCH response is pending', async () => {
+    const { route, ds, scan, progressMessageId } = await startPendingScan('om_scan_patch_takeover');
+    await route;
+    let resolveUpdate!: () => void;
+    mocks.updateMessage.mockImplementationOnce(() => new Promise<void>((resolve) => {
+      resolveUpdate = resolve;
+    }));
+
+    scan.resolve([project('patch-takeover')]);
+    await vi.waitFor(() => expect(mocks.updateMessage).toHaveBeenCalledTimes(1));
+    ds.repoCardMessageId = 'om_new_picker';
+    resolveUpdate();
+    await waitForScanFinish(ds);
+
+    expect(ds.repoCardMessageId).toBe('om_new_picker');
+    expect(ds.repoScanCardMessageId).toBeUndefined();
+    expect(ds.pendingRepo).toBe(true);
+    expect(mocks.deleteMessage).toHaveBeenCalledWith(APP, progressMessageId);
+  });
+
+  it('does not fall back to /repo when a newer picker wins before the original PATCH fails', async () => {
+    const { route, ds, scan, progressMessageId } = await startPendingScan('om_scan_patch_failed_takeover');
+    await route;
+    let rejectUpdate!: (error: unknown) => void;
+    mocks.updateMessage.mockImplementationOnce(() => new Promise<void>((_resolve, reject) => {
+      rejectUpdate = reject;
+    }));
+
+    scan.resolve([project('patch-failed-takeover')]);
+    await vi.waitFor(() => expect(mocks.updateMessage).toHaveBeenCalledTimes(1));
+    ds.repoCardMessageId = 'om_new_picker';
+    rejectUpdate(new Error('late provider rejection'));
+    await waitForScanFinish(ds);
+
+    expect(ds.repoCardMessageId).toBe('om_new_picker');
+    expect(ds.repoScanCardMessageId).toBeUndefined();
+    expect(outboundText()).not.toContain('/repo');
+    expect(mocks.deleteMessage).toHaveBeenCalledWith(APP, progressMessageId);
+  });
+
+  it('keeps the patched picker retryable when its pending commit later fails', async () => {
+    const { route, ds, scan, progressMessageId } = await startPendingScan('om_scan_patch_commit_takeover');
+    await route;
+    let resolveUpdate!: () => void;
+    mocks.updateMessage.mockImplementationOnce(() => new Promise<void>((resolve) => {
+      resolveUpdate = resolve;
+    }));
+    let resolveBots!: (bots: any[]) => void;
+    mocks.getAvailableBots.mockImplementationOnce(() => new Promise<any[]>((resolve) => {
+      resolveBots = resolve;
+    }));
+    mocks.forkWorker.mockImplementationOnce(() => { throw new Error('fork boom'); });
+
+    scan.resolve([project('patch-commit-takeover')]);
+    await vi.waitFor(() => expect(mocks.updateMessage).toHaveBeenCalledTimes(1));
+    expect(ds.repoCardMessageId).toBe(progressMessageId);
+    const commitResult = commitRepoSelection(
+      {
+        ds,
+        rootId: 'om_scan_patch_commit_takeover',
+        cardMessageId: progressMessageId,
+        larkAppId: APP,
+        operatorOpenId: OWNER,
+        activeSessions,
+        sessionReply: async () => 'om_commit_reply',
+      },
+      '/tmp/patch-commit-takeover',
+      'patch-commit-takeover',
+    ).then(() => undefined, error => error);
+    await vi.waitFor(() => expect(ds.pendingRepoCommitInFlight).toBe(true));
+
+    resolveUpdate();
+    await waitForScanFinish(ds);
+    expect(ds.repoCardMessageId).toBe(progressMessageId);
+    expect(ds.repoScanCardMessageId).toBeUndefined();
+    expect(mocks.deleteMessage).not.toHaveBeenCalledWith(APP, progressMessageId);
+
+    resolveBots([]);
+    const commitError = await commitResult;
+
+    expect(commitError).toEqual(expect.objectContaining({ message: 'fork boom' }));
+    expect(ds.pendingRepoCommitInFlight).toBe(false);
+    expect(ds.pendingRepo).toBe(true);
+    expect(ds.repoCardMessageId).toBe(progressMessageId);
+    expect(ds.repoScanCardMessageId).toBeUndefined();
+    expect(isActiveRepoCard(ds, progressMessageId)).toBe(true);
+    expect(mocks.deleteMessage).not.toHaveBeenCalledWith(APP, progressMessageId);
   });
 
   it('falls back to scan text after a non-transient progress POST failure, then still posts the picker', async () => {
@@ -267,6 +383,7 @@ describe('first-mention async repo scan routing', () => {
     const interactive = outboundCalls('interactive');
     expect(interactive).toHaveLength(2);
     expect(interactive[1]?.[5]).toMatch(/^repo-picker:/);
+    expect(mocks.updateMessage).not.toHaveBeenCalled();
     expect(ds.repoCardMessageId).toBeDefined();
     expect(ds.repoScanCardMessageId).toBeUndefined();
     expect(ds.pendingRepo).toBe(true);
@@ -311,11 +428,13 @@ describe('first-mention async repo scan routing', () => {
     await route;
     await waitForScanFinish(ds);
 
-    expect(outboundCalls('interactive')).toHaveLength(2);
+    expect(outboundCalls('interactive')).toHaveLength(1);
+    expect(mocks.updateMessage).toHaveBeenCalledWith(APP, progressMessageId, expect.any(String));
     expect(ds.pendingRepo).toBe(true);
     expect(ds.pendingFollowUps).toEqual(['扫描期间补充']);
+    expect(ds.repoCardMessageId).toBe(progressMessageId);
     expect(ds.repoScanCardMessageId).toBeUndefined();
-    expect(mocks.deleteMessage).toHaveBeenCalledWith(APP, progressMessageId);
+    expect(mocks.deleteMessage).not.toHaveBeenCalledWith(APP, progressMessageId);
     expect(mocks.forkWorker).not.toHaveBeenCalled();
   });
 
@@ -346,9 +465,11 @@ describe('first-mention async repo scan routing', () => {
     mocks.scanDeferreds[0]!.resolve([project('serialized-flow')]);
     await waitForScanFinish(ds);
 
-    expect(outboundCalls('interactive')).toHaveLength(2);
+    expect(outboundCalls('interactive')).toHaveLength(1);
+    expect(mocks.updateMessage).toHaveBeenCalledWith(APP, progressMessageId, expect.any(String));
+    expect(ds.repoCardMessageId).toBe(progressMessageId);
     expect(ds.repoScanCardMessageId).toBeUndefined();
-    expect(mocks.deleteMessage).toHaveBeenCalledWith(APP, progressMessageId);
+    expect(mocks.deleteMessage).not.toHaveBeenCalledWith(APP, progressMessageId);
     expect(mocks.forkWorker).not.toHaveBeenCalled();
   });
 
@@ -455,27 +576,25 @@ describe('first-mention async repo scan routing', () => {
 
     scan.resolve([project('after-refused-close')]);
     await waitForScanFinish(ds);
-    expect(ds.repoCardMessageId).toBeDefined();
+    expect(mocks.updateMessage).toHaveBeenCalledWith(APP, progressMessageId, expect.any(String));
+    expect(ds.repoCardMessageId).toBe(progressMessageId);
     expect(ds.repoScanCardMessageId).toBeUndefined();
+    expect(mocks.deleteMessage).not.toHaveBeenCalledWith(APP, progressMessageId);
   });
 
-  it('keeps the pending turn recoverable when picker delivery fails with a stable retry UUID', async () => {
+  it('keeps the pending turn recoverable when the in-place picker update fails', async () => {
     const { route, ds, scan, progressMessageId } = await startPendingScan(
       'om_scan_picker_delivery_failure',
       '卡片失败也不能丢的请求',
     );
     await route;
-    mocks.replyMessage
-      .mockRejectedValueOnce(Object.assign(new Error('write EPIPE'), { code: 'EPIPE' }))
-      .mockRejectedValueOnce(Object.assign(new Error('socket hang up'), { code: 'ECONNRESET' }));
+    mocks.updateMessage.mockRejectedValueOnce(new Error('provider rejected picker update'));
 
     scan.resolve([project('picker-delivery-failure')]);
     await waitForScanFinish(ds);
 
-    const pickerAttempts = outboundCalls('interactive')
-      .filter(call => String(call[5]).startsWith('repo-picker:'));
-    expect(pickerAttempts).toHaveLength(2);
-    expect(pickerAttempts[1]?.[5]).toBe(pickerAttempts[0]?.[5]);
+    expect(mocks.updateMessage).toHaveBeenCalledWith(APP, progressMessageId, expect.any(String));
+    expect(outboundCalls('interactive')).toHaveLength(1);
     expect(outboundText()).toContain('/repo');
     expect(ds.pendingRepo).toBe(true);
     expect(ds.pendingPrompt).toContain('卡片失败也不能丢的请求');
@@ -483,6 +602,84 @@ describe('first-mention async repo scan routing', () => {
     expect(ds.repoScanCardMessageId).toBeUndefined();
     expect(mocks.deleteMessage).toHaveBeenCalledWith(APP, progressMessageId);
     expect(mocks.forkWorker).not.toHaveBeenCalled();
+  });
+
+  it('retries a transient in-place update once before falling back to /repo', async () => {
+    const { route, ds, scan, progressMessageId } = await startPendingScan(
+      'om_scan_picker_update_retry',
+      '重试失败也不能丢的请求',
+    );
+    await route;
+    mocks.updateMessage
+      .mockRejectedValueOnce(Object.assign(new Error('write EPIPE'), { code: 'EPIPE' }))
+      .mockRejectedValueOnce(Object.assign(new Error('socket hang up'), { code: 'ECONNRESET' }));
+
+    scan.resolve([project('picker-update-retry')]);
+    await waitForScanFinish(ds);
+
+    expect(mocks.updateMessage).toHaveBeenCalledTimes(2);
+    expect(mocks.updateMessage).toHaveBeenNthCalledWith(1, APP, progressMessageId, expect.any(String));
+    expect(mocks.updateMessage).toHaveBeenNthCalledWith(2, APP, progressMessageId, expect.any(String));
+    expect(outboundCalls('interactive')).toHaveLength(1);
+    expect(outboundText()).toContain('/repo');
+    expect(ds.pendingRepo).toBe(true);
+    expect(ds.pendingPrompt).toContain('重试失败也不能丢的请求');
+    expect(ds.repoCardMessageId).toBeUndefined();
+    expect(ds.repoScanCardMessageId).toBeUndefined();
+    expect(mocks.deleteMessage).toHaveBeenCalledWith(APP, progressMessageId);
+    expect(mocks.forkWorker).not.toHaveBeenCalled();
+  });
+
+  it('keeps the same picker active when a transient in-place update retry succeeds', async () => {
+    const { route, ds, scan, progressMessageId } = await startPendingScan('om_scan_picker_retry_success');
+    await route;
+    mocks.updateMessage
+      .mockRejectedValueOnce(Object.assign(new Error('write EPIPE'), { code: 'EPIPE' }))
+      .mockResolvedValueOnce(undefined);
+
+    scan.resolve([project('picker-retry-success')]);
+    await waitForScanFinish(ds);
+
+    expect(mocks.updateMessage).toHaveBeenCalledTimes(2);
+    expect(ds.repoCardMessageId).toBe(progressMessageId);
+    expect(ds.repoScanCardMessageId).toBeUndefined();
+    expect(outboundText()).not.toContain('/repo');
+    expect(mocks.deleteMessage).not.toHaveBeenCalledWith(APP, progressMessageId);
+  });
+
+  it('rolls back provisional picker authorization when the route changes during retry backoff', async () => {
+    const { route, ds, scan, progressMessageId } = await startPendingScan('om_scan_picker_retry_race');
+    await route;
+    mocks.updateMessage.mockRejectedValueOnce(Object.assign(new Error('write EPIPE'), { code: 'EPIPE' }));
+
+    scan.resolve([project('picker-retry-race')]);
+    await vi.waitFor(() => expect(mocks.updateMessage).toHaveBeenCalledTimes(1));
+    expect(ds.repoCardMessageId).toBe(progressMessageId);
+    ds.pendingRepo = false;
+    await waitForScanFinish(ds);
+
+    expect(mocks.updateMessage).toHaveBeenCalledTimes(1);
+    expect(ds.repoCardMessageId).toBeUndefined();
+    expect(ds.repoScanCardMessageId).toBeUndefined();
+    expect(outboundText()).not.toContain('/repo');
+    expect(mocks.deleteMessage).toHaveBeenCalledWith(APP, progressMessageId);
+  });
+
+  it('does not retry or overwrite a newer picker that takes over during retry backoff', async () => {
+    const { route, ds, scan, progressMessageId } = await startPendingScan('om_scan_picker_retry_takeover');
+    await route;
+    mocks.updateMessage.mockRejectedValueOnce(Object.assign(new Error('write EPIPE'), { code: 'EPIPE' }));
+
+    scan.resolve([project('picker-retry-takeover')]);
+    await vi.waitFor(() => expect(mocks.updateMessage).toHaveBeenCalledTimes(1));
+    ds.repoCardMessageId = 'om_new_picker';
+    await waitForScanFinish(ds);
+
+    expect(mocks.updateMessage).toHaveBeenCalledTimes(1);
+    expect(ds.repoCardMessageId).toBe('om_new_picker');
+    expect(ds.repoScanCardMessageId).toBeUndefined();
+    expect(outboundText()).not.toContain('/repo');
+    expect(mocks.deleteMessage).toHaveBeenCalledWith(APP, progressMessageId);
   });
 
   it.each([
@@ -494,29 +691,22 @@ describe('first-mention async repo scan routing', () => {
       },
       expectedRepoCardMessageId: 'om_new_picker',
     },
-    {
-      name: 'a repo commit takes ownership',
-      invalidate: (ds: any) => { ds.pendingRepoCommitInFlight = true; },
-      expectedRepoCardMessageId: undefined,
-    },
-  ])('does not disturb newer route state when $name during card delivery', async ({
+  ])('does not disturb newer route state when $name during card update', async ({
     invalidate,
     expectedRepoCardMessageId,
   }) => {
     const { route, ds, scan, progressMessageId } = await startPendingScan('om_scan_card_delivery_race');
     await route;
-    let rejectCard!: (error: unknown) => void;
-    const cardDelivery = new Promise<string>((_resolve, reject) => {
-      rejectCard = reject;
+    let rejectUpdate!: (error: unknown) => void;
+    const cardUpdate = new Promise<void>((_resolve, reject) => {
+      rejectUpdate = reject;
     });
-    mocks.replyMessage.mockImplementation((...args: any[]) => (
-      args[3] === 'interactive' ? cardDelivery : Promise.resolve('om_reply')
-    ));
+    mocks.updateMessage.mockImplementation(() => cardUpdate);
 
     scan.resolve([project('delivery-race')]);
-    await vi.waitFor(() => expect(outboundCalls('interactive')).toHaveLength(2));
+    await vi.waitFor(() => expect(mocks.updateMessage).toHaveBeenCalledTimes(1));
     invalidate(ds);
-    rejectCard(new Error('provider rejected the card'));
+    rejectUpdate(new Error('provider rejected the card update'));
     await waitForScanFinish(ds);
 
     expect(outboundText()).not.toContain('/repo');

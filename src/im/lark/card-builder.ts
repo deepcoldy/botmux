@@ -1078,7 +1078,7 @@ function worktreeMultiForm(worktreeOptions: Array<{ text: { tag: 'plain_text'; c
 /** Lightweight placeholder shown while the first repository scan runs. */
 export function buildRepoScanProgressCard(locale?: Locale): string {
   return JSON.stringify({
-    config: { wide_screen_mode: true },
+    config: { wide_screen_mode: true, update_multi: true },
     header: {
       template: 'blue',
       title: { tag: 'plain_text', content: t('card.repo.title', undefined, locale) },
@@ -1126,7 +1126,7 @@ export function buildRepoSelectCard(projects: ProjectInfo[], currentPath?: strin
   };
 
   const card = {
-    config: { wide_screen_mode: true },
+    config: { wide_screen_mode: true, update_multi: true },
     header: {
       template: 'blue',
       title: { tag: 'plain_text', content: t('card.repo.title', undefined, locale) },

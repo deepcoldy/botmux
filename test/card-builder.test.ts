@@ -90,6 +90,7 @@ describe('buildRepoScanProgressCard', () => {
   it('renders a lightweight inert repository scan placeholder', () => {
     const card = parse(buildRepoScanProgressCard('zh'));
 
+    expect(card.config).toMatchObject({ wide_screen_mode: true, update_multi: true });
     expect(card.header).toMatchObject({
       template: 'blue',
       title: { content: '📁 项目仓库管理' },
@@ -1164,9 +1165,10 @@ describe('buildRepoSelectCard', () => {
     expect(() => JSON.parse(json)).not.toThrow();
   });
 
-  it('should have wide_screen_mode config', () => {
+  it('builds a shared card that can be updated in place', () => {
     const card = parse(buildRepoSelectCard(projects));
     expect(card.config.wide_screen_mode).toBe(true);
+    expect(card.config.update_multi).toBe(true);
   });
 
   it('should have blue header with project management title', () => {
