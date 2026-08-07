@@ -2725,20 +2725,25 @@ function normalizeP2pMode(value: unknown): 'thread' | 'chat' | 'group' {
   return value === 'thread' ? 'thread' : value === 'group' ? 'group' : 'chat';
 }
 
-/** 会话群标签授权行（p2pMode=group 时显示）：状态徽标 + 一键授权。
- *  点击授权 → 新标签页打开飞书授权 → 飞书回跳 dashboard /oauth/callback
- *  自动完成 → 本行轮询到 authorized 后徽标变绿。 */
+/** 会话群标签行（p2pMode=group 时显示）：tag mode 选择器 + 按模式分支的
+ *  授权 UI（PR review：授权行必须与实际 tagMode 一致）。
+ *  - chat-tag（默认）：应用租户身份打企业群标签，无需用户授权 → 不显示授权按钮
+ *  - feed-group：个人侧边栏分组，需一次 OAuth → 显示状态徽标 + 一键授权
+ *  - off：不打标签
+ *  一键授权 → 新标签页打开飞书授权 → 回跳 dashboard /oauth/callback 自动完成
+ *  → 本行轮询到 authorized 后徽标变绿。 */
 function SessionGroupTagRow(props: { bot: BotDefaultsRow }) {
   const tr = useT();
-  const [status, setStatus] = useState<{ authorized: boolean; tagMode?: string } | null>(null);
+  const [status, setStatus] = useState<{ authorized: boolean; tagMode: string } | null>(null);
   const [authBusy, setAuthBusy] = useState(false);
+  const [modeBusy, setModeBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
 
   const fetchStatus = async (): Promise<boolean> => {
     try {
       const res = await sendJson('GET', `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/session-group-tag-status`);
       if (res.ok && res.body.ok) {
-        setStatus({ authorized: !!res.body.authorized, tagMode: res.body.tagMode });
+        setStatus({ authorized: !!res.body.authorized, tagMode: String(res.body.tagMode ?? 'chat-tag') });
         return !!res.body.authorized;
       }
     } catch { /* transient */ }
@@ -2746,6 +2751,23 @@ function SessionGroupTagRow(props: { bot: BotDefaultsRow }) {
   };
 
   useEffect(() => { void fetchStatus(); }, [props.bot.larkAppId]);
+
+  async function saveMode(next: string): Promise<void> {
+    setModeBusy(true);
+    setErr(null);
+    try {
+      const res = await sendJson('PUT', `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/session-group-tag-config`, { mode: next });
+      if (res.ok && res.body.ok) {
+        setStatus(s => ({ authorized: s?.authorized ?? false, tagMode: String(res.body.tagMode) }));
+      } else {
+        setErr(responseErrorText(res));
+      }
+    } catch (e: any) {
+      setErr(caughtErrorText(e));
+    } finally {
+      setModeBusy(false);
+    }
+  }
 
   async function startAuth(): Promise<void> {
     setAuthBusy(true);
@@ -2770,25 +2792,46 @@ function SessionGroupTagRow(props: { bot: BotDefaultsRow }) {
     }
   }
 
+  const tagMode = status?.tagMode ?? 'chat-tag';
   const authorized = status?.authorized === true;
+  const modeOptions: DropdownFieldOption<string>[] = [
+    { value: 'chat-tag', label: tr('botDefaults.sgTagModeChatTag') },
+    { value: 'feed-group', label: tr('botDefaults.sgTagModeFeedGroup') },
+    { value: 'off', label: tr('botDefaults.sgTagModeOff') },
+  ];
   return (
     <div className="bd-row" data-session-group-tag-row>
       <div className="bd-field">
         <FieldTitle help={tr('botDefaults.sgTagHelp')}>{tr('botDefaults.sgTag')}</FieldTitle>
         <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
-          <span data-sg-tag-state={authorized ? 'authorized' : 'unauthorized'}>
-            {authorized ? `🟢 ${tr('botDefaults.sgTagAuthorized')}` : `⚪ ${tr('botDefaults.sgTagUnauthorized')}`}
-          </span>
-          {!authorized && (
-            <button
-              type="button"
-              className="primary"
-              data-action="session-group-tag-auth"
-              disabled={authBusy}
-              onClick={() => void startAuth()}
-            >
-              {authBusy ? tr('botDefaults.sgTagAuthWaiting') : tr('botDefaults.sgTagAuthStart')}
-            </button>
+          <DropdownField
+            dataInput="sessionGroupTagMode"
+            ariaLabel={tr('botDefaults.sgTag')}
+            value={tagMode}
+            disabled={modeBusy || !status}
+            options={modeOptions}
+            onChange={next => void saveMode(next)}
+          />
+          {tagMode === 'chat-tag' && (
+            <span data-sg-tag-state="tenant">{tr('botDefaults.sgTagChatTagNote')}</span>
+          )}
+          {tagMode === 'feed-group' && (
+            <>
+              <span data-sg-tag-state={authorized ? 'authorized' : 'unauthorized'}>
+                {authorized ? `🟢 ${tr('botDefaults.sgTagAuthorized')}` : `⚪ ${tr('botDefaults.sgTagUnauthorized')}`}
+              </span>
+              {!authorized && (
+                <button
+                  type="button"
+                  className="primary"
+                  data-action="session-group-tag-auth"
+                  disabled={authBusy}
+                  onClick={() => void startAuth()}
+                >
+                  {authBusy ? tr('botDefaults.sgTagAuthWaiting') : tr('botDefaults.sgTagAuthStart')}
+                </button>
+              )}
+            </>
           )}
           {err && <span className="status-error">✗ {err}</span>}
         </div>

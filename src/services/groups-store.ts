@@ -149,6 +149,32 @@ export async function transferChatOwner(
 }
 
 /**
+ * Disband a chat the calling bot OWNS. Used by the session-group birth flow
+ * to clean up an orphan group when the initiating user's invite was rejected
+ * — the group can never serve as a conversation home, so leaving it behind
+ * would strand an empty bot-owned chat in the tenant (PR review).
+ *
+ * Calls DELETE /open-apis/im/v1/chats/:chat_id (owner-only).
+ */
+export async function deleteChat(
+  larkAppId: string,
+  chatId: string,
+): Promise<{ ok: true } | { ok: false; error: string }> {
+  const client = getBotClient(larkAppId);
+  try {
+    const res: any = await (client as any).im.v1.chat.delete({
+      path: { chat_id: chatId },
+    });
+    if (res.code !== 0 && res.code !== undefined) {
+      return { ok: false, error: `${res.msg ?? 'unknown'} (code: ${res.code})` };
+    }
+    return { ok: true };
+  } catch (e: any) {
+    return { ok: false, error: e?.message ?? String(e) };
+  }
+}
+
+/**
  * Rename a chat. Used by the session-group flow (p2pMode='group') to apply
  * the async AI-generated title onto the group's placeholder name — the bot
  * keeps ownership of session groups precisely so this call stays permitted.

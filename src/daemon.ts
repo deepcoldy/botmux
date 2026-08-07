@@ -15035,6 +15035,11 @@ function mergeVcMeetingApplicationContext(
 
 async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
   const { chatId, messageId, chatType, larkAppId, replyRootId, substituteTrigger } = ctx;
+  // Session-group birth re-homes the turn into the new group: replies/quotes
+  // anchor on the in-group intro message, while `messageId` (the ORIGINAL
+  // inbound message) keeps serving resource downloads / merge-forward
+  // expansion / dedup — their keys belong to the source message.
+  const replyAnchorId = ctx.replyAnchorMessageId ?? messageId;
   // scope/anchor are mutable here: `/t` / `/topic` may flip a 普通群 chat-scope
   // routing into thread-scope so the bot's first reply seeds a Lark thread.
   let scope = ctx.scope;
@@ -15045,7 +15050,10 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
   //（bot 保留群主），把本轮 context 重写到新群（chat-scope）后递归。返回 null
   // 表示跳过/失败（斜杠命令、建群失败已私聊提示），落回旧的 DM 话题行为。
   // sessionGroupBirth 防递归；scope/anchor 形状约束保证只有全新顶层种子会出生
-  //（回复旧 DM 话题的消息仍归原会话）。
+  //（回复旧 DM 话题的消息仍归原会话）。thread_id 检查兜住「话题内发送 + 同时
+  // 发送到会话」的消息形态：它的事件 root_id 为空（顶层形态）但携带 thread_id
+  // ——语境属于既有话题，绝不能当全新会话去建群；放行后按旧 thread 行为在
+  // 原 DM 落话题（用户实测反馈的误建群场景）。
   if (
     chatType === 'p2p'
     && getBot(larkAppId).config.p2pMode === 'group'
@@ -15442,7 +15450,9 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
   // disconnect click silently no-ops.
   // For chat-scope, rootMessageId stores the seed message_id (audit only);
   // routing keys off chatId via sessionAnchorId(), so any value works.
-  const rootIdForStore = scope === 'thread' ? anchor : messageId;
+  // Session-group births store the in-group intro (reply anchor) here so the
+  // audit trail points at a message that actually lives in the session's chat.
+  const rootIdForStore = scope === 'thread' ? anchor : replyAnchorId;
   const session = sessionStore.createSession(chatId, rootIdForStore, parsed.content.substring(0, 50), chatType);
   // Session-group registry: point the group at its (new) resident session so
   // same-group resume and the async AI title can find it.
@@ -15461,10 +15471,11 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
   // `botmux send` can --mention-back / 引用 the triggering message (chat scope).
   // Without this the first reply hits hasQuoteTargetSender=false (exit 2) and
   // chat-scope首条不引用. Use the event's sender open_id (correct app scope).
-  // Keyed off ctx.messageId (== parsed.messageId except for session-group
-  // births, where ctx re-anchors the turn on the in-group intro message so
-  // quotes stay in the group instead of leaking to the source DM).
-  session.quoteTargetId = messageId;
+  // Keyed off the REPLY anchor (== messageId except for session-group births,
+  // where it is the in-group intro message so quotes stay in the group instead
+  // of leaking to the source DM — while messageId itself keeps serving
+  // resource/merge-forward lookups against the original inbound message).
+  session.quoteTargetId = replyAnchorId;
   session.quoteTargetSenderOpenId = senderOpenId;
   session.quoteTargetSenderIsBot = parsed.senderType === 'app' || parsed.senderType === 'bot';
   session.lastMessageAt = new Date(now).toISOString();

@@ -14,6 +14,8 @@
 import { execFile } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { getBot } from '../bot-registry.js';
+import { redactChildEnv } from '../utils/child-env.js';
+import { sanitizePerBotEnv } from '../core/per-bot-env.js';
 import { updateChatName } from './groups-store.js';
 import { getSessionGroup, markSessionGroupTitled, touchSessionGroup } from './session-groups-store.js';
 import * as sessionStore from './session-store.js';
@@ -40,6 +42,48 @@ const ONE_SHOT_ARGV: Record<string, string[]> = {
 /** One in-flight title job per chat — birth and the heal-on-activity path
  *  (handleThreadReply) can otherwise race duplicate CLI calls. */
 const inFlightTitles = new Set<string>();
+
+/**
+ * Child env for the one-shot title call — the SAME security boundary as every
+ * other CLI child the daemon spawns (PR review P2): `redactChildEnv` strips
+ * daemon-only secrets (LARK_APP_SECRET, GITHUB_TOKEN, tmux client vars, Claude
+ * session markers) and `sanitizePerBotEnv(cfg.env)` layers the bot's own
+ * provider environment (base URL / auth token) on top so multi-provider bots
+ * title through their own account instead of the daemon's. Exported for the
+ * env-boundary regression tests.
+ */
+/**
+ * Resolve the one-shot argv with the SAME launcher precedence as the formal
+ * CLI spawn path (PR review): `wrapperCli` (space-split tokens whose first
+ * token replaces the default bin — enterprise gateways like `aiden x claude`)
+ * wins over `cliPathOverride` (which registerBot enforces as an exact shadow
+ * of cliRuntime.executable, so runtime configs are covered transitively), and
+ * the template's default bin is the fallback. The template's own flags/mode
+ * args are preserved in every branch; a wrapper that cannot run the CLI's
+ * print mode fails the exec and degrades to the placeholder title like any
+ * other one-shot failure. Exported for tests.
+ */
+export function resolveOneShotCommand(
+  cfg: { wrapperCli?: string; cliPathOverride?: string },
+  template: readonly string[],
+): string[] {
+  const wrapper = cfg.wrapperCli?.trim();
+  if (wrapper) return [...wrapper.split(/\s+/), ...template.slice(1)];
+  const override = cfg.cliPathOverride?.trim();
+  if (override) return [override, ...template.slice(1)];
+  return [...template];
+}
+
+export function buildOneShotEnv(botEnv: unknown): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = {
+    ...redactChildEnv(process.env),
+    ...sanitizePerBotEnv(botEnv),
+  };
+  // Never let the one-shot inherit a botmux session identity (redundant with
+  // the marker scrub above, kept as an explicit invariant).
+  delete env.BOTMUX_SESSION_ID;
+  return env;
+}
 
 export function buildTitlePrompt(text: string, maxLen: number, locale: string): string {
   const excerpt = text.replace(/\s+/g, ' ').trim().slice(0, 500);
@@ -113,13 +157,11 @@ export function scheduleSessionGroupTitle(opts: {
         logger.info(`[session-group] no one-shot template for cliId=${cfg.cliId}; keeping placeholder title`);
         return;
       }
-      const argv = [...template];
-      if (cfg.cliPathOverride?.trim()) argv[0] = cfg.cliPathOverride.trim();
+      const argv = resolveOneShotCommand(cfg, template);
       const prompt = buildTitlePrompt(userText, maxLen, localeForBot(larkAppId));
 
       const runOnce = () => new Promise<string>((resolve, reject) => {
-        const env = { ...process.env };
-        delete env.BOTMUX_SESSION_ID; // never let the one-shot inherit a session identity
+        const env = buildOneShotEnv(cfg.env);
         const child = execFile(argv[0], [...argv.slice(1), prompt], {
           timeout: TITLE_TIMEOUT_MS,
           maxBuffer: 1024 * 1024,

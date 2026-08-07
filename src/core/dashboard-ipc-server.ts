@@ -2849,6 +2849,38 @@ ipcRoute('GET', '/api/session-group-tag-status', async (_req, res) => {
   }
 });
 
+// PUT /api/session-group-tag-config — 会话群标签模式（Dashboard tag mode
+// selector，PR review：授权行必须与实际 tagMode 一致）。Body `{ mode }`：
+// 'chat-tag'（默认，应用租户身份，无需用户授权）| 'feed-group'（个人侧边栏
+// 分组，需一次 OAuth）| 'off'。写 bots.json 的 sessionGroup.tag.mode 并热更
+// 内存注册表，与 /botconfig 同一持久化通道。
+ipcRoute('PUT', '/api/session-group-tag-config', async (req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  let body: { mode?: unknown };
+  try { body = await readJsonBody<{ mode?: unknown }>(req); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  const mode = body.mode === 'chat-tag' || body.mode === 'feed-group' || body.mode === 'off'
+    ? body.mode : undefined;
+  if (!mode) return jsonRes(res, 400, { ok: false, error: 'invalid_mode' });
+  try {
+    const bot = getBot(cachedLarkAppId);
+    const r = await rmwBotEntry(cachedLarkAppId, (entry: any) => {
+      if (!entry.sessionGroup || typeof entry.sessionGroup !== 'object') entry.sessionGroup = {};
+      if (!entry.sessionGroup.tag || typeof entry.sessionGroup.tag !== 'object') entry.sessionGroup.tag = {};
+      entry.sessionGroup.tag.mode = mode;
+      return { write: true, result: mode };
+    });
+    if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
+    bot.config.sessionGroup = {
+      ...(bot.config.sessionGroup ?? {}),
+      tag: { ...(bot.config.sessionGroup?.tag ?? {}), mode },
+    };
+    jsonRes(res, 200, { ok: true, tagMode: mode });
+  } catch (e: any) {
+    jsonRes(res, 500, { ok: false, error: e?.message ?? String(e) });
+  }
+});
+
 // Per-bot 私聊单聊模式 p2pMode。Body `{ p2pMode: 'chat' | 'thread' | 'group' }`:
 //   • 'chat'（默认）    → 私聊走扁平连续 chat-scope 会话
 //   • 'thread'          → 显式回到每条 DM 独立 thread-scope 会话
