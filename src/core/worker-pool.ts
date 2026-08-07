@@ -4547,6 +4547,11 @@ export function forkWorker(
         ...(gatedDispatchAttempt !== undefined
           ? { dispatchAttempt: gatedDispatchAttempt }
           : {}),
+        // R6-B3 (transfer-gate sibling): sendWorkerInput reads steer
+        // authorization from OPTS, not the payload. A steerable opening/refork
+        // rerouted through the transfer gate must carry the flag here too, or it
+        // silently downgrades true → false like the direct-route branch did.
+        ...(gatedPrompt.codexAppSteerable === true ? { codexAppSteerable: true as const } : {}),
       });
     } else {
       transferGate.needsWorker = true;
