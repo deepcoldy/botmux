@@ -106,17 +106,6 @@ export const MOJO_IDENTITY_KEYS = [
 ] as const;
 
 /**
- * Environment variables that carry the SAME control-plane decisions as the frozen
- * identity keys. They exist because the mojo CLI reads its endpoint/profile from
- * env, which makes `env` a back door around the freeze: a live
- * `env: { AGENT_BASE_URL: ... }` would move an existing session to another tenant
- * even though `baseUrl` itself is frozen.
- *
- * buildEnv() therefore DELETES all of these after merging and re-derives them
- * from the (frozen) config alone. `X_JWT_TOKEN` is deliberately absent: a rotated
- * credential must keep taking effect.
- */
-/**
  * The child's effective environment, layered lowest → highest precedence:
  *
  *   base (worker-supplied session env / process env)
@@ -145,6 +134,17 @@ export function buildEffectiveChildEnv(layers: {
     };
 }
 
+/**
+ * Environment variables that carry the SAME control-plane decisions as the frozen
+ * identity keys. They exist because the mojo CLI reads its endpoint/profile from
+ * env, which makes `env` a back door around the freeze: a live
+ * `env: { AGENT_BASE_URL: ... }` would move an existing session to another tenant
+ * even though `baseUrl` itself is frozen.
+ *
+ * buildEnv() therefore DELETES all of these after merging and re-derives them
+ * from the (frozen) config alone. `X_JWT_TOKEN` is deliberately absent: a rotated
+ * credential must keep taking effect.
+ */
 export const MOJO_CONTROL_ENV_KEYS = [
     'AGENT_BASE_URL',
     'MOJO_PPE_ENV',

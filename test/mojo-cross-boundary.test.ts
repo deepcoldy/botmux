@@ -58,6 +58,9 @@ interface Harness {
   dump: string;
   child: ChildProcess;
   logs: string[];
+  /** WorkerToDaemon IPC messages, so a test can fence on a real readiness
+   *  signal (`restart_result`) instead of grepping stdout for a log line. */
+  msgs: Array<{ type: string; status?: string; category?: string }>;
 }
 
 function bootWorker(opts: { mojo?: Record<string, unknown>; appId?: string }): Harness {
@@ -83,9 +86,11 @@ function bootWorker(opts: { mojo?: Record<string, unknown>; appId?: string }): H
     },
     stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
   });
+  const msgs: Array<{ type: string; status?: string; category?: string }> = [];
   child.stdout?.on('data', c => logs.push(c.toString()));
   child.stderr?.on('data', c => logs.push(c.toString()));
-  return { root, dump, child, logs };
+  child.on('message', (m) => msgs.push(m as { type: string }));
+  return { root, dump, child, logs, msgs };
 }
 
 function teardown(h: Harness): void {
@@ -196,26 +201,24 @@ describe('mojo cross-boundary contracts', () => {
       h.child.send({ type: 'message', content: 'clear me', mojoLivePatch: { jwt: null } } as DaemonToWorker);
       await waitFor(() => lines(h.dump).length >= 2, 30_000, () => `clear turn never ran\n${h.logs.join('')}`);
       expect(lines(h.dump)[1]).toBe('[]');
-      const settled = lines(h.dump).length;
-
-      // 2. Rebuild the backend. Count respawns: 'Spawning fresh CLI' is also
-      //    logged at init, so includes() would be a vacuous precondition.
-      const spawnsBefore = (h.logs.join('').match(/Spawning fresh CLI/g) ?? []).length;
+      // 2. Rebuild the backend and fence on the worker's own IPC, not a stdout
+      //    grep ('Spawning fresh CLI' is also logged at init, so includes() would
+      //    be a vacuous precondition). A bare `restart` emits no `restart_result`
+      //    (that is only sent for an attemptId-carrying restart), so the fence is
+      //    the readiness handshake a fresh backend re-emits: attestation followed
+      //    by prompt_ready. Counted, so the init handshake cannot satisfy it.
+      const readyBefore = h.msgs.filter(m => m.type === 'local_process_attestation').length;
       h.child.send({ type: 'restart' } as DaemonToWorker);
       await waitFor(
-        () => (h.logs.join('').match(/Spawning fresh CLI/g) ?? []).length > spawnsBefore,
+        () => h.msgs.filter(m => m.type === 'local_process_attestation').length > readyBefore
+          && h.msgs.some(m => m.type === 'prompt_ready'),
         40_000,
-        () => `restart never respawned the backend\n${h.logs.join('')}`,
+        () => `restart never re-emitted the readiness handshake: `
+          + `${JSON.stringify(h.msgs.map(m => m.type))}\n${h.logs.join('')}`,
       );
-
-      // 3. Let the restart's own teardown finish first. It cancels via the OLD
-      //    backend (already cleared), so counting it as progress is what made an
-      //    earlier version of this test pass vacuously.
-      await waitFor(
-        () => h.logs.join('').includes('cancelled session'),
-        30_000,
-        () => `restart teardown never cancelled\n${h.logs.join('')}`,
-      );
+      // The restart's own teardown cancels via the OLD backend (already cleared),
+      // so it must not be counted as progress — that is what made an earlier
+      // version of this test pass vacuously.
       const afterTeardown = lines(h.dump).length;
 
       // 4. A turn on the REPLACEMENT backend carrying no patch of its own. This
