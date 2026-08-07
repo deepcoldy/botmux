@@ -11,6 +11,7 @@ import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { randomBytes } from 'node:crypto';
 import { logger } from './utils/logger.js';
+import { gracefulProcessExitCode } from './pm2-graceful-exit.js';
 import { config, isWildcardBindHost } from './config.js';
 import { listenWithProbe } from './utils/listen-with-probe.js';
 import {
@@ -21,6 +22,13 @@ import {
 import { DaemonRegistry, botsRosterSignature } from './dashboard/registry.js';
 import { Aggregator, subscribeDaemon } from './dashboard/aggregator.js';
 import { createSessionPresentationCoordinator } from './dashboard/session-presentation.js';
+import {
+  compactGroupsMatrix,
+  createGroupsMatrixSnapshot,
+  enrichSessionsWithGroupNames,
+  roleWriteShouldInvalidate,
+  type GroupsMatrix,
+} from './dashboard/groups-matrix-snapshot.js';
 import {
   parseDashboardAskAnswerRequest,
   proxyDashboardAskAnswer,
@@ -66,7 +74,11 @@ import { checkCliAvailability } from './setup/cli-availability.js';
 import { invalidWorkingDirs } from './utils/working-dir.js';
 import { invalidateGlobalConfigCache, mergeDashboardConfig, mergeGlobalConfig, readGlobalConfig, type MaintenanceConfig, type RepoPickerMode, type WhiteboardConfig } from './global-config.js';
 import { hostLocalTimeZone, scheduleTimeZone } from './utils/timezone.js';
-import { buildDashboardUrls, type DashboardUrls } from './core/dashboard-url.js';
+import {
+  buildDashboardUrls,
+  buildPlatformDashboardLoginUrl,
+  type DashboardUrls,
+} from './core/dashboard-url.js';
 import { resolveBotmuxDataDir } from './core/data-dir.js';
 import { dashboardSecretPath } from './core/dashboard-secret.js';
 import { getGitRepoInfo } from './core/session-row-enrichment.js';
@@ -95,7 +107,11 @@ import {
   UnsupportedGlobalInstallError,
   type GlobalInstallPlan,
 } from './utils/global-install.js';
-import { listCliRuntimeUpdateEntries } from './core/cli-runtime-update.js';
+import {
+  filterCliRuntimeUpdateEntriesForTargets,
+  listCliRuntimeUpdateEntries,
+  selectCodexRuntimeUpdateTargets,
+} from './core/cli-runtime-update.js';
 import {
   claimRestartLease,
   clearRestartIntent,
@@ -302,6 +318,16 @@ mkdirSync(REGISTRY_DIR, { recursive: true });
 const registry = new DaemonRegistry(REGISTRY_DIR);
 const aggregator = new Aggregator();
 const sessionPresentation = createSessionPresentationCoordinator(aggregator, getGitRepoInfo);
+const groupsMatrixSnapshot = createGroupsMatrixSnapshot(buildGroupsMatrix, {
+  onRefreshError: error => logger.warn(`[dashboard] groups matrix refresh failed: ${String(error)}`),
+});
+let groupsRosterSignature = botsRosterSignature(registry.list());
+registry.on((online) => {
+  const next = botsRosterSignature(online);
+  if (next === groupsRosterSignature) return;
+  groupsRosterSignature = next;
+  groupsMatrixSnapshot.invalidate();
+});
 
 // Keep Git-derived fields in the central read-model so REST snapshots and SSE
 // share one row shape. Idle/limited turn boundaries force a branch refresh
@@ -1209,6 +1235,7 @@ const groupsActionDeps: GroupsActionDeps = {
   proxyToDaemon,
   closeSessionsMatching,
   fetch: fetchDaemonUrl,
+  invalidateGroups: () => groupsMatrixSnapshot.invalidate(),
 };
 
 // ─── PR2 C8: Route B internal API (`/__daemon/*`) ───────────────────────────
@@ -1230,7 +1257,7 @@ const daemonInternalApi = createDaemonInternalApi({
   getSessions: () => aggregator.getSessions(),
   getSchedules: () => aggregator.getSchedules(),
   resolveDashboardSettings,
-  buildGroupsMatrix,
+  buildGroupsMatrix: () => groupsMatrixSnapshot.get(),
   settingsApplierDeps: settingsWriteApplierDeps,
   groupsActionDeps,
   proxyToDaemon,
@@ -2022,10 +2049,15 @@ function configuredCliIds(): Map<string, string> {
   }
 }
 
-function configuredBotAgentFields(): Map<string, { cliId?: string; wrapperCli?: string; model?: string }> {
+function configuredBotAgentFields(): Map<string, { cliId?: string; cliRuntime?: BotConfig['cliRuntime']; cliPathOverride?: string; wrapperCli?: string; model?: string }> {
   try {
     return new Map(loadBotConfigs().map(b => [b.larkAppId, {
       cliId: b.cliId,
+      cliRuntime: b.cliRuntime,
+      // loadBotConfigs mirrors structured runtime.executable into this legacy
+      // field in memory. Only forward a genuine path-only config to the private
+      // Bot Defaults endpoint.
+      cliPathOverride: b.cliRuntime ? undefined : b.cliPathOverride,
       wrapperCli: b.wrapperCli,
       model: b.model,
     }]));
@@ -2034,15 +2066,17 @@ function configuredBotAgentFields(): Map<string, { cliId?: string; wrapperCli?: 
   }
 }
 
-function withConfiguredCliId<T extends { larkAppId: string; cliId?: string; wrapperCli?: string; model?: string }>(
+function withConfiguredCliId<T extends { larkAppId: string; cliId?: string; cliRuntime?: BotConfig['cliRuntime']; cliPathOverride?: string; wrapperCli?: string; model?: string }>(
   bot: T,
-  ids: Map<string, string> | Map<string, { cliId?: string; wrapperCli?: string; model?: string }>,
-): T & { cliId?: string; wrapperCli?: string; model?: string } {
+  ids: Map<string, string> | Map<string, { cliId?: string; cliRuntime?: BotConfig['cliRuntime']; cliPathOverride?: string; wrapperCli?: string; model?: string }>,
+): T & { cliId?: string; cliRuntime?: BotConfig['cliRuntime']; cliPathOverride?: string; wrapperCli?: string; model?: string } {
   const raw = ids.get(bot.larkAppId);
   const fallback = typeof raw === 'string' ? { cliId: raw } : raw;
   return {
     ...bot,
     cliId: bot.cliId || fallback?.cliId,
+    cliRuntime: bot.cliRuntime || fallback?.cliRuntime,
+    cliPathOverride: bot.cliPathOverride || fallback?.cliPathOverride,
     wrapperCli: bot.wrapperCli || fallback?.wrapperCli,
     model: bot.model || fallback?.model,
   };
@@ -2134,6 +2168,7 @@ async function createTeamGroup(args: { name: string; larkAppIds: string[]; userO
     if (!upstream.ok || !parsed?.ok || typeof parsed.chatId !== 'string') {
       return { ok: false, error: parsed?.error ?? `group_create_http_${upstream.status}` };
     }
+    groupsMatrixSnapshot.invalidate();
     return {
       ok: true,
       chatId: parsed.chatId,
@@ -2171,6 +2206,7 @@ async function transferTeamGroupOwner(args: {
         transferError: parsed?.error ?? `owner_transfer_http_${upstream.status}`,
       };
     }
+    groupsMatrixSnapshot.invalidate();
     return {
       ownerTransferredTo: parsed.ownerTransferredTo ?? null,
       transferError: parsed.transferError ?? null,
@@ -2228,6 +2264,7 @@ async function createLifecycleGroupForWebhook(
   if (!upstream.ok || !parsed?.ok || typeof parsed.chatId !== 'string') {
     throw new Error(parsed?.error ?? `group_create_http_${upstream.status}`);
   }
+  groupsMatrixSnapshot.invalidate();
   return { chatId: parsed.chatId, creatorLarkAppId: parsed.creator ?? pick.creatorLarkAppId };
 }
 
@@ -2237,7 +2274,7 @@ async function createLifecycleGroupForWebhook(
  * always returns the raw (unscrubbed) view — the browser route applies its
  * `redactGroupsForPublic` scrub on top when the caller is unauthed.
  */
-async function buildGroupsMatrix(): Promise<{ chats: any[]; bots: any[] }> {
+async function buildGroupsMatrix(): Promise<GroupsMatrix> {
   const out = new Map<string, any>();
   const cliIds = configuredCliIds();
   const onlineBots = [...registry.list()]
@@ -2706,7 +2743,12 @@ const server = createServer(async (req, res) => {
     const authed = !!presentedToken && presentedToken === activeToken && !!activeToken;
 
     if (decision.kind === 'deny401') {
-      res.writeHead(401, { 'content-type': 'text/html; charset=utf-8' });
+      const loginUrl = buildPlatformDashboardLoginUrl();
+      res.writeHead(401, {
+        'content-type': 'text/html; charset=utf-8',
+        'cache-control': 'no-store',
+        ...(loginUrl ? { 'x-botmux-login-url': loginUrl } : {}),
+      });
       res.end('<h1>Token expired</h1><p>Run <code>botmux dashboard</code> to get a fresh URL.</p>');
       return;
     }
@@ -2834,12 +2876,13 @@ const server = createServer(async (req, res) => {
       // raw appId as botName — resolve through the live registry so consumers
       // (dashboard, HD2D office tab) always see the human-facing name.
       const names = new Map([...registry.list()].map(d => [d.larkAppId, d.botName] as const));
-      const sessions = aggregator.getSessions().map(s => {
+      groupsMatrixSnapshot.warm();
+      const sessions = enrichSessionsWithGroupNames(aggregator.getSessions().map(s => {
         const n = names.get(s.larkAppId);
         return n && n !== s.larkAppId && (!s.botName || s.botName === s.larkAppId)
           ? { ...s, botName: n }
           : s;
-      });
+      }), groupsMatrixSnapshot.peekPresentation());
       return jsonRes(res, 200, {
         sessions: authed ? sessions : redactSessionsForPublic(sessions),
       });
@@ -3028,9 +3071,26 @@ const server = createServer(async (req, res) => {
       // 2.86.0) is NOT flagged behind — exactly the canary case we want.
       const latestResult = await cachedLatestVersion(url.searchParams.get('refresh') === '1');
       const latest = latestResult.value;
-      const cliUpdates = listCliRuntimeUpdateEntries(config.session.dataDir).map((entry) => ({
+      let configuredUpdateTargets: ReturnType<typeof selectCodexRuntimeUpdateTargets> = [];
+      try {
+        configuredUpdateTargets = selectCodexRuntimeUpdateTargets(
+          loadBotConfigs(),
+          (cliPathOverride) => createCliAdapterSync('codex', cliPathOverride).resolvedBin,
+        );
+      } catch {
+        // Config unreadable or an adapter unavailable: fail closed and hide
+        // persisted badges whose continued relevance cannot be established.
+      }
+      const cliUpdates = filterCliRuntimeUpdateEntriesForTargets(
+        listCliRuntimeUpdateEntries(config.session.dataDir),
+        configuredUpdateTargets,
+      ).map((entry) => ({
         cliId: entry.cliId,
+        runtimeId: entry.runtimeId,
+        displayName: entry.displayName,
         binPath: entry.binPath,
+        provider: entry.provider,
+        managed: entry.managed,
         current: entry.current,
         latest: entry.latest,
         updateAvailable: entry.updateAvailable,
@@ -4075,7 +4135,12 @@ const server = createServer(async (req, res) => {
       // route and the Route B `/__daemon/groups-matrix` endpoint return the
       // same matrix shape. Public-read carve-out: oncall bindings carry
       // workingDir (repo/customer paths) so we scrub when unauthed.
-      const matrix = await buildGroupsMatrix();
+      const matrix = await groupsMatrixSnapshot.get({
+        force: authed && url.searchParams.get('refresh') === '1',
+      });
+      if (url.searchParams.get('view') === 'compact') {
+        return jsonRes(res, 200, compactGroupsMatrix(matrix));
+      }
       return jsonRes(res, 200, {
         chats: authed ? matrix.chats : redactGroupsForPublic(matrix.chats),
         bots: matrix.bots,
@@ -4117,14 +4182,25 @@ const server = createServer(async (req, res) => {
           headers: { 'content-type': 'application/json' },
           body: raw,
         });
+        const upstreamText = await upstream.text();
+        let upstreamJson: any = null;
+        try { upstreamJson = JSON.parse(upstreamText); } catch { /* leave null */ }
+        // 写角色会翻转群矩阵里的 hasRole → 失效快照，避免 roles 页「已配置」
+        // 徽标最多陈旧 30s（对齐 oncall bind/unbind、建群/加 bot 的失效）。
+        if (roleWriteShouldInvalidate(upstream.ok, upstreamJson)) groupsMatrixSnapshot.invalidate();
         res.writeHead(upstream.status, { 'content-type': 'application/json' });
-        res.end(await upstream.text());
+        res.end(upstreamText);
         return;
       }
       if (req.method === 'DELETE') {
         const upstream = await proxyToDaemon(larkAppId, `/api/roles/${encodeURIComponent(chatId)}`, { method: 'DELETE' });
+        const upstreamText = await upstream.text();
+        let upstreamJson: any = null;
+        try { upstreamJson = JSON.parse(upstreamText); } catch { /* leave null */ }
+        // 删角色会把 hasRole 翻回 false — 失效快照让徽标立即刷新，不等 30s TTL。
+        if (roleWriteShouldInvalidate(upstream.ok, upstreamJson)) groupsMatrixSnapshot.invalidate();
         res.writeHead(upstream.status, { 'content-type': 'application/json' });
-        res.end(await upstream.text());
+        res.end(upstreamText);
         return;
       }
     }
@@ -4289,8 +4365,15 @@ const server = createServer(async (req, res) => {
         headers: { 'content-type': 'application/json' },
         body: raw,
       });
+      const upstreamText = await upstream.text();
+      let upstreamJson: any = null;
+      try { upstreamJson = JSON.parse(upstreamText); } catch { /* leave null */ }
+      // 只有真正改写了角色文件（changed:true）才失效缓存：preview、被拒
+      // （chat_role_exists）、missing_entry 都不动 hasRole，跟着失效只会白白
+      // 打穿 30s 快照、把 PR 的 fan-out 优化抵消掉（判定在 roleWriteShouldInvalidate）。
+      if (roleWriteShouldInvalidate(upstream.ok, upstreamJson)) groupsMatrixSnapshot.invalidate();
       res.writeHead(upstream.status, { 'content-type': 'application/json' });
-      res.end(await upstream.text());
+      res.end(upstreamText);
       return;
     }
 
@@ -4449,6 +4532,15 @@ const server = createServer(async (req, res) => {
             ...d,
             botName: d.botName ?? j.botName,
             cliId: j.cliId || d.cliId,
+            // New daemons return explicit null for Official/no legacy path.
+            // Respect that instead of reviving a stale fallback descriptor;
+            // older daemons omit the fields and still use bots.json fallback.
+            cliRuntime: Object.prototype.hasOwnProperty.call(j, 'cliRuntime')
+              ? j.cliRuntime ?? undefined
+              : d.cliRuntime,
+            cliPathOverride: Object.prototype.hasOwnProperty.call(j, 'cliPathOverride')
+              ? j.cliPathOverride ?? undefined
+              : d.cliPathOverride,
             wrapperCli: j.wrapperCli || d.wrapperCli,
             model: j.model || d.model,
           }, j);
@@ -5047,6 +5139,7 @@ const server = createServer(async (req, res) => {
           upstreamJson.autoInvitedOpenId = autoInvited;
         }
       }
+      if (upstream.ok && upstreamJson?.ok) groupsMatrixSnapshot.invalidate();
       res.writeHead(upstream.status, { 'content-type': 'application/json' });
       res.end(upstreamJson ? JSON.stringify(upstreamJson) : upstreamText);
       return;
@@ -5130,6 +5223,7 @@ const server = createServer(async (req, res) => {
         if (!groupUpstream.ok || !groupResp?.ok || typeof groupResp.chatId !== 'string') {
           return jsonRes(res, 502, { ok: false, error: groupResp?.error ?? `group_create_http_${groupUpstream.status}` });
         }
+        groupsMatrixSnapshot.invalidate();
       } catch {
         return jsonRes(res, 502, { ok: false, error: 'group_create_proxy_failed' });
       }
@@ -5539,9 +5633,9 @@ function shutdown(): void {
   resourceMonitor.stop();
   platformTunnel?.stop();
   debugTerminalManager.shutdown();
-  server.close(() => process.exit(0));
+  server.close(() => process.exit(gracefulProcessExitCode()));
   // Hard-exit fallback after 5s
-  setTimeout(() => process.exit(0), 5_000).unref();
+  setTimeout(() => process.exit(gracefulProcessExitCode()), 5_000).unref();
 }
 process.on('SIGTERM', shutdown);
 process.on('SIGINT', shutdown);

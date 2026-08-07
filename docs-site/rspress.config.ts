@@ -50,9 +50,17 @@ const zhSidebar = [
       { text: 'Dashboard 管控面', link: '/dashboard' },
       { text: '接入点（Webhook）', link: '/webhook' },
       { text: 'API 编程式触发任务', link: '/api-task-trigger' },
+      { text: 'Core-only API 控制', link: '/api-core-only' },
       { text: 'Workflow（实验性）', link: '/workflow' },
       { text: '生命周期 Hooks', link: '/hooks' },
       { text: 'Skill + CLI 交互', link: '/skill-cli' },
+    ],
+  },
+  {
+    text: '开发与扩展',
+    collapsed: false,
+    items: [
+      { text: 'Plugin 开发与市场注册', link: '/plugins' },
     ],
   },
   {
@@ -125,9 +133,17 @@ const enSidebar = [
       { text: 'Dashboard', link: '/en/dashboard' },
       { text: 'Webhook Ingress', link: '/en/webhook' },
       { text: 'Programmatic Task Trigger API', link: '/en/api-task-trigger' },
+      { text: 'Core-only API Control', link: '/en/api-core-only' },
       { text: 'Workflow (Experimental)', link: '/en/workflow' },
       { text: 'Lifecycle Hooks', link: '/en/hooks' },
       { text: 'Skill + CLI Interaction', link: '/en/skill-cli' },
+    ],
+  },
+  {
+    text: 'Development & Extensions',
+    collapsed: false,
+    items: [
+      { text: 'Plugin Development & Market', link: '/en/plugins' },
     ],
   },
   {

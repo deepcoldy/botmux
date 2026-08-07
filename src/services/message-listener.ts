@@ -123,6 +123,30 @@ export function extractListenerMessageText(message: any): string {
   return '';
 }
 
+/**
+ * Refresh a card match's observed text/title from the (now-resolved) message.
+ *
+ * The listener match is computed during filtering, off the SIMPLIFIED card the
+ * WS/history API first delivers — that view drops button jump URLs and lazy
+ * sub-card bodies. The live delivery path (daemon handleNewTopic) later runs
+ * resolveNonsupportMessage(data), merging the card's two representations
+ * (server-rendered + structured body.elements, incl. button open_url) into
+ * `message.content` — the same depth the direct-@bot path uses. Re-extracting
+ * here lets the model receive the button links, not the lossy match-time
+ * snapshot. Only interactive cards can differ (plain text/post already carried
+ * full content at match time). Fail-safe: a resolver miss (cross-tenant, REST
+ * unavailable) leaves `message.content` as the simplified view and yields the
+ * SAME text as match time, so guarding on a non-empty result never blanks a
+ * match — it only ever upgrades. Mutates `match` in place.
+ */
+export function refreshListenerCardTextFromResolved(match: MessageListenerMatch, message: any): void {
+  if (match.msgType !== 'interactive') return;
+  const text = extractListenerMessageText(message);
+  if (text.trim()) match.messageText = text;
+  const title = extractListenerMessageTitle(message);
+  if (title?.trim()) match.messageTitle = title;
+}
+
 function contains(list: readonly string[] | undefined, value: string | undefined): boolean {
   return !!value && !!list && list.includes(value);
 }
@@ -133,6 +157,30 @@ function senderTypeAllowed(listener: MessageListenerConfig, type: MessageListene
     return false;
   }
   if (policy?.excludeSenderTypes?.includes(type)) return false;
+  return true;
+}
+
+/**
+ * An exclusion entry can "collide" with an unverified bot sender when we cannot
+ * prove the sender is NOT that entry. `ou_` vs `cli_` STRING inequality does not
+ * prove ENTITY inequality — the same bot is `cli_x` in the polled history and
+ * `ou_y` in config. So we classify each exclusion by its persisted sender KIND,
+ * not by id prefix:
+ *   - kind 'user'         → a human; an unverified BOT sender can never be it.
+ *   - kind 'bot'/'unknown'→ could be this unverified bot → fail closed.
+ *   - no kind recorded (legacy config, or an id in app_id/cli_ form) → treat as
+ *     a possible bot and fail closed conservatively. Prefix is only ever used to
+ *     UPGRADE an unknown entry to "definitely a bot", never to downgrade to user.
+ */
+function exclusionMayBeUnverifiedBot(
+  id: string,
+  kinds: Readonly<Record<string, 'user' | 'bot'>> | undefined,
+): boolean {
+  const kind = kinds?.[id];
+  if (kind === 'user') return false;
+  if (kind === 'bot') return true;
+  // No recorded kind: an app_id/cli_ form is certainly a bot; an ou_ (or any
+  // other) form is ambiguous under legacy configs, so stay conservative.
   return true;
 }
 
@@ -149,13 +197,15 @@ function senderOpenIdAllowed(
     // include list, so it simply does not match — already fail-safe.
     return contains(policy?.includeSenderOpenIds, openId);
   }
-  // all_except_excluded: an unverified sender defeats an open_id-based
-  // exclusion (the excluded open_id would never equal an app_id form), so a
-  // blocked bot would leak through on the polled backfill path. Fail closed:
-  // when the operator has ANY open_id exclusion we cannot evaluate for this
-  // sender, refuse rather than assume "not excluded". An empty exclude list
-  // makes no open_id decision, so "listen to all (except self)" still works.
-  if (identityUnverified && (policy?.excludeSenderOpenIds?.length ?? 0) > 0) {
+  // all_except_excluded: an unverified bot sender (reported by app_id, not
+  // canonicalized to an open_id) defeats an exclusion when we cannot prove the
+  // sender is NOT that excluded entry. Decide by the exclusion's persisted
+  // sender KIND, never by id prefix: only user-kind exclusions are provably
+  // disjoint from an unverified bot. Any bot/unknown/legacy exclusion fails
+  // closed. When EVERY exclusion is a known user, nothing is being bypassed, so
+  // "listen to all bots, just mute these users" keeps working. Empty list too.
+  const excludes = policy?.excludeSenderOpenIds ?? [];
+  if (identityUnverified && excludes.some(id => exclusionMayBeUnverifiedBot(id, policy?.excludeSenderKinds))) {
     return false;
   }
   return !contains(policy?.excludeSenderOpenIds, openId);

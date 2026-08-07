@@ -15,6 +15,7 @@ import {
   type BotConfigEditInput,
 } from './bot-config-editor.js';
 import { CLI_SELECT_OPTIONS, resolveCliSelection } from './cli-selection.js';
+import type { CliRuntimeConfig } from '../adapters/cli/runtime.js';
 
 /** add / edit 共用的 bot 字段 flag（原始字符串，'-' 表示清空，语义同 TUI 编辑）。 */
 export interface SetupBotFlags {
@@ -26,6 +27,8 @@ export interface SetupBotFlags {
   /** CLI 选择键：cliId 或网关键（aiden-x-claude / ttadk-x-codex …），见 CLI_SELECT_OPTIONS。 */
   cli?: string;
   cliPath?: string;
+  /** JSON CliRuntimeConfig, or '-' to clear it. */
+  cliRuntime?: string;
   wrapperCli?: string;
   model?: string;
   backend?: string;
@@ -67,6 +70,7 @@ const BOT_FIELD_FLAGS: Record<string, keyof SetupBotFlags> = {
   '--app-secret': 'appSecret',
   '--cli': 'cli',
   '--cli-path': 'cliPath',
+  '--cli-runtime': 'cliRuntime',
   '--wrapper-cli': 'wrapperCli',
   '--model': 'model',
   '--backend': 'backend',
@@ -118,6 +122,8 @@ export const SETUP_CLI_USAGE = `botmux setup — 脚本化（非 TUI）用法
   --cli <key>                CLI 适配器：cliId 或网关键（claude-code / codex /
                              aiden-x-claude / ttadk-x-codex …）
   --cli-path <path>          CLI 可执行文件路径覆盖
+  --cli-runtime <JSON|->     Codex-compatible runtime 描述；JSON 含 id、
+                             displayName、executable、update，传 - 清空
   --wrapper-cli <prefix>     通用启动前缀（如 "aiden x claude"），覆盖 --cli 推导值
   --model <m>                CLI 模型名
   --backend <b>              会话后端 pty | tmux | herdr | zellij | zmx
@@ -192,6 +198,23 @@ function parseBotFieldFlags(
     positional.push(token);
   }
   return { flags, json, yes, createApp, compatibilityMode, switchAccount, openPlatformAuto, openPlatformAutoSpecified, positional };
+}
+
+/** Parse only the JSON envelope here; structural validation remains centralized
+ * in applyBotConfigEdits -> normalizeCliRuntimeConfig so add/edit/TUI callers
+ * cannot drift onto different runtime rules. */
+function parseCliRuntimeFlag(raw: string | undefined): CliRuntimeConfig | null | undefined {
+  if (raw === undefined) return undefined;
+  const value = raw.trim();
+  if (value === '-') return null;
+  if (!value) throw new Error('--cli-runtime 必须是 JSON 对象或 -');
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(value);
+  } catch (err) {
+    throw new Error(`--cli-runtime 不是合法 JSON: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  return parsed as CliRuntimeConfig;
 }
 
 /** 解析 `botmux setup` 的脚本化子命令 argv。非法输入抛 Error（message 面向用户）。 */
@@ -303,6 +326,7 @@ export function buildBotFromAddFlags(flags: SetupBotFlags): Record<string, any> 
 
   const input: BotConfigEditInput = {
     name: flags.name,
+    cliRuntime: parseCliRuntimeFlag(flags.cliRuntime),
     cliPathOverride: flags.cliPath,
     model: flags.model,
     backendType: flags.backend,
@@ -343,8 +367,12 @@ export function editInputFromFlags(flags: SetupBotFlags): BotConfigEditInput {
     const sel = resolveCliSelection(flags.cli.trim());
     input.cliChoice = sel.cliId;
     input.wrapperCli = sel.wrapperCli ?? null;
+    // An explicit CLI selection means its built-in/wrapper distribution.
+    // `--cli-runtime` below can replace this null with a custom descriptor.
+    input.cliRuntime = null;
   }
   if (flags.wrapperCli !== undefined) input.wrapperCli = flags.wrapperCli;
+  if (flags.cliRuntime !== undefined) input.cliRuntime = parseCliRuntimeFlag(flags.cliRuntime);
   if (flags.cliPath !== undefined) input.cliPathOverride = flags.cliPath;
   if (flags.model !== undefined) input.model = flags.model;
   if (flags.backend !== undefined) input.backendType = flags.backend;

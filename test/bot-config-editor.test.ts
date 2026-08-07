@@ -238,6 +238,140 @@ describe('applyBotConfigEdits', () => {
     expect(out.wrapperCli).toBe('aiden x claude');
   });
 
+  it('sets and normalizes cliRuntime with an equal downgrade path shadow', () => {
+    const out = applyBotConfigEdits({
+      larkAppId: 'app',
+      larkAppSecret: 'secret',
+      cliId: 'codex',
+      cliPathOverride: '/opt/old/codex',
+    }, {
+      cliRuntime: {
+        id: 'vendor-codex',
+        displayName: 'VendorCodex',
+        executable: 'vendor-codex',
+        update: { provider: 'auto' },
+      },
+    });
+
+    expect(out.cliRuntime).toMatchObject({
+      id: 'vendor-codex',
+      displayName: 'VendorCodex',
+      executable: 'vendor-codex',
+      update: { provider: 'auto' },
+    });
+    expect(out.cliPathOverride).toBe('vendor-codex');
+  });
+
+  it('implements cliRuntime tri-state and keeps it when the edit omits the field', () => {
+    const base = {
+      larkAppId: 'app',
+      larkAppSecret: 'secret',
+      cliId: 'codex',
+      cliRuntime: {
+        id: 'vendor-codex',
+        displayName: 'VendorCodex',
+        executable: 'vendor-codex',
+        update: { provider: 'none' },
+      },
+    };
+    const kept = applyBotConfigEdits(base, { model: 'gpt-5' });
+    expect(kept.cliRuntime).toEqual(base.cliRuntime);
+    expect(kept.cliPathOverride).toBe('vendor-codex');
+    const cleared = applyBotConfigEdits(kept, { cliRuntime: null });
+    expect(cleared.cliRuntime).toBeUndefined();
+    expect(cleared.cliPathOverride).toBeUndefined();
+  });
+
+  it('treats an empty interactive cliPathOverride answer as preserve', () => {
+    const base = {
+      larkAppId: 'app',
+      larkAppSecret: 'secret',
+      cliId: 'codex',
+      cliRuntime: {
+        id: 'vendor-codex',
+        displayName: 'VendorCodex',
+        executable: 'vendor-codex',
+        update: { provider: 'none' as const },
+      },
+      cliPathOverride: 'vendor-codex',
+    };
+
+    const out = applyBotConfigEdits(base, {
+      model: 'gpt-5',
+      cliPathOverride: '   ',
+    });
+
+    expect(out.cliRuntime).toEqual(base.cliRuntime);
+    expect(out.cliPathOverride).toBe('vendor-codex');
+    expect(out.model).toBe('gpt-5');
+  });
+
+  it('lets an explicit legacy cliPathOverride replace cliRuntime', () => {
+    const out = applyBotConfigEdits({
+      larkAppId: 'app',
+      larkAppSecret: 'secret',
+      cliId: 'codex',
+      cliRuntime: {
+        id: 'vendor-codex',
+        executable: 'vendor-codex',
+        update: { provider: 'none' },
+      },
+    }, { cliPathOverride: '/opt/legacy/codex' });
+    expect(out.cliRuntime).toBeUndefined();
+    expect(out.cliPathOverride).toBe('/opt/legacy/codex');
+  });
+
+  it('clears a stale Codex runtime when switching to a non-Codex adapter', () => {
+    const out = applyBotConfigEdits({
+      larkAppId: 'app',
+      larkAppSecret: 'secret',
+      cliId: 'codex',
+      cliRuntime: {
+        id: 'vendor-codex',
+        executable: 'vendor-codex',
+        update: { provider: 'none' },
+      },
+    }, { cliChoice: 'claude-code' });
+    expect(out.cliId).toBe('claude-code');
+    expect(out.cliRuntime).toBeUndefined();
+    expect(out.cliPathOverride).toBeUndefined();
+  });
+
+  it('does not strand a runtime shadow when TUI switches to a non-Codex adapter with a blank path answer', () => {
+    const out = applyBotConfigEdits({
+      larkAppId: 'app',
+      larkAppSecret: 'secret',
+      cliId: 'codex',
+      cliRuntime: {
+        id: 'vendor-codex',
+        executable: 'vendor-codex',
+        update: { provider: 'none' },
+      },
+      cliPathOverride: 'vendor-codex',
+    }, { cliChoice: 'claude-code', cliPathOverride: '' });
+
+    expect(out.cliId).toBe('claude-code');
+    expect(out.cliRuntime).toBeUndefined();
+    expect(out.cliPathOverride).toBeUndefined();
+  });
+
+  it('rejects an explicit runtime combined with another executable source', () => {
+    const base = { larkAppId: 'app', larkAppSecret: 'secret', cliId: 'codex' };
+    const cliRuntime = { id: 'vendor-codex', executable: 'vendor-codex' };
+    expect(() => applyBotConfigEdits(base, {
+      cliRuntime,
+      cliPathOverride: '/opt/legacy/codex',
+    })).toThrow(/conflicts with cliPathOverride/);
+    expect(() => applyBotConfigEdits(base, {
+      cliRuntime,
+      wrapperCli: 'gateway codex',
+    })).toThrow(/cannot be combined with wrapperCli/);
+    expect(() => applyBotConfigEdits(base, {
+      cliChoice: 'claude-code',
+      cliRuntime,
+    })).toThrow(/only for cliId "codex"/);
+  });
+
   it('edits and clears allowedChatGroups', () => {
     const edited = applyBotConfigEdits({
       larkAppId: 'app',

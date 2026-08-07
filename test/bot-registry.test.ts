@@ -228,6 +228,118 @@ describe('parseBotConfigsFromText — brand', () => {
     }
   });
 
+  it('requires a persisted downgrade shadow for cliRuntime configs', () => {
+    expect(() => mod.parseBotConfigsFromText(JSON.stringify([
+      {
+        larkAppId: 'runtime-without-shadow-app',
+        larkAppSecret: 's',
+        cliId: 'codex',
+        cliRuntime: {
+          id: 'vendor-codex',
+          executable: 'vendor-codex',
+        },
+      },
+    ]))).toThrow(/cliPathOverride is required as an exact downgrade shadow/);
+  });
+
+  it('normalizes cliRuntime with its persisted legacy path shadow', () => {
+    const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([
+      {
+        larkAppId: 'runtime-app',
+        larkAppSecret: 's',
+        cliId: 'codex',
+        cliPathOverride: 'vendor-codex',
+        cliRuntime: {
+          id: 'vendor-codex',
+          displayName: 'VendorCodex',
+          executable: 'vendor-codex',
+          update: { provider: 'auto' },
+        },
+      },
+    ]));
+
+    expect(cfg.cliRuntime).toMatchObject({
+      id: 'vendor-codex',
+      displayName: 'VendorCodex',
+      executable: 'vendor-codex',
+      update: { provider: 'auto' },
+    });
+    expect(cfg.cliPathOverride).toBe('vendor-codex');
+  });
+
+  it('keeps legacy cliPathOverride configs unchanged when cliRuntime is absent', () => {
+    const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([
+      {
+        larkAppId: 'legacy-runtime-app',
+        larkAppSecret: 's',
+        cliId: 'codex',
+        cliPathOverride: '/opt/custom/codex',
+      },
+    ]));
+    expect(cfg.cliRuntime).toBeUndefined();
+    expect(cfg.cliPathOverride).toBe('/opt/custom/codex');
+  });
+
+  it('accepts only an exactly-equal persisted downgrade shadow', () => {
+    const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([
+      {
+        larkAppId: 'shadowed-runtime-app',
+        larkAppSecret: 's',
+        cliId: 'codex',
+        cliPathOverride: 'vendor-codex',
+        cliRuntime: {
+          id: 'vendor-codex',
+          executable: 'vendor-codex',
+          update: { provider: 'none' },
+        },
+      },
+    ]));
+    expect(cfg.cliRuntime?.id).toBe('vendor-codex');
+    expect(cfg.cliPathOverride).toBe('vendor-codex');
+
+    expect(() => mod.parseBotConfigsFromText(JSON.stringify([
+      {
+        larkAppId: 'conflicting-runtime-app',
+        larkAppSecret: 's',
+        cliId: 'codex',
+        cliPathOverride: '/opt/custom/codex',
+        cliRuntime: {
+          id: 'vendor-codex',
+          executable: 'vendor-codex',
+          update: { provider: 'none' },
+        },
+      },
+    ]))).toThrow(/must exactly match cliRuntime\.executable/);
+  });
+
+  it('rejects cliRuntime outside the plain Codex adapter contract', () => {
+    const runtime = { id: 'vendor-codex', executable: 'vendor-codex' };
+    expect(() => mod.parseBotConfigsFromText(JSON.stringify([{
+      larkAppId: 'wrong-adapter-runtime-app',
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      cliRuntime: runtime,
+    }]))).toThrow(/only for cliId "codex"/);
+    expect(() => mod.parseBotConfigsFromText(JSON.stringify([{
+      larkAppId: 'wrapped-runtime-app',
+      larkAppSecret: 's',
+      cliId: 'codex',
+      wrapperCli: 'gateway codex',
+      cliRuntime: runtime,
+    }]))).toThrow(/cannot be combined with wrapperCli/);
+  });
+
+  it('strictly validates a configured cliRuntime instead of silently dropping malformed input', () => {
+    expect(() => mod.parseBotConfigsFromText(JSON.stringify([
+      {
+        larkAppId: 'invalid-runtime-app',
+        larkAppSecret: 's',
+        cliId: 'codex',
+        cliRuntime: { id: 'vendor-codex' },
+      },
+    ]))).toThrow(/cliRuntime|executable/);
+  });
+
   it('effectiveBotDisplayName prefers displayName > probed botName > larkAppId', () => {
     const state = mod.registerBot({ larkAppId: 'app_x', larkAppSecret: 's', cliId: 'claude-code' } as any);
     expect(mod.effectiveBotDisplayName(state)).toBe('app_x');

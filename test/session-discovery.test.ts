@@ -373,6 +373,88 @@ describe('discoverAdoptableSessions', () => {
     expect(results[1]!.paneRows).toBe(50);
   });
 
+  it('matches a configured Codex-compatible executable exactly without hiding legacy defaults', () => {
+    const fixture = {
+      paneLines: 'fork:0.0 1000\nofficial:0.0 2000\nclaude:0.0 3000\n',
+      commMap: { 1000: 'zsh', 1001: 'vendorCodex', 2000: 'codex', 3000: 'claude' },
+      childMap: { 1000: [1001] },
+      cwdMap: { 1001: '/workspace/fork', 2000: '/workspace/official', 3000: '/workspace/claude' },
+      dimsMap: {
+        'fork:0.0': '100 30',
+        'official:0.0': '120 40',
+        'claude:0.0': '140 50',
+      },
+    };
+    setupMocks(fixture);
+
+    const custom = discoverAdoptableSessions('codex', '/opt/Vendor Codex/vendorCodex');
+    expect(custom).toHaveLength(1);
+    expect(custom[0]).toMatchObject({ tmuxTarget: 'fork:0.0', cliPid: 1001, cliId: 'codex' });
+
+    // Omitting the executable takes the untouched static path: official Codex
+    // and Claude are still classified normally, while the unknown fork is not.
+    setupMocks(fixture);
+    expect(discoverAdoptableSessions().map(s => [s.tmuxTarget, s.cliId])).toEqual([
+      ['official:0.0', 'codex'],
+      ['claude:0.0', 'claude-code'],
+    ]);
+  });
+
+  it('discovers a configured Codex-compatible executable in a known Node launcher slot', () => {
+    setupMocks({
+      paneLines: 'fork:0.0 1000\n',
+      commMap: { 1000: 'zsh', 1001: 'node' },
+      childMap: { 1000: [1001] },
+      cmdlineMap: {
+        1001: ['node', '--enable-source-maps', '/opt/vendorCodex'],
+      },
+      cwdMap: { 1001: '/workspace/fork' },
+      dimsMap: { 'fork:0.0': '100 30' },
+    });
+
+    expect(discoverAdoptableSessions('codex', '/opt/vendorCodex')).toEqual([
+      expect.objectContaining({
+        tmuxTarget: 'fork:0.0',
+        cliPid: 1001,
+        cliId: 'codex',
+        cwd: '/workspace/fork',
+      }),
+    ]);
+  });
+
+  it('does not adopt a generic launcher when the custom executable appears only in program argv', () => {
+    setupMocks({
+      paneLines: 'unrelated:0.0 1000\n',
+      commMap: { 1000: 'zsh', 1001: 'node' },
+      childMap: { 1000: [1001] },
+      cmdlineMap: { 1001: ['node', '/srv/unrelated.js', '/opt/vendorCodex'] },
+      cwdMap: { 1001: '/workspace/unrelated' },
+      dimsMap: { 'unrelated:0.0': '100 30' },
+    });
+
+    expect(discoverAdoptableSessions('codex', '/opt/vendorCodex')).toEqual([]);
+  });
+
+  it('uses the same exact executable filter in the single-pane confirm path', () => {
+    setupMocks({
+      paneLines: 'fork:0.0 1000\nofficial:0.0 2000\n',
+      commMap: { 1000: 'vendorCodex', 2000: 'codex' },
+      cwdMap: { 1000: '/workspace/fork', 2000: '/workspace/official' },
+      dimsMap: { 'fork:0.0': '100 30', 'official:0.0': '120 40' },
+    });
+
+    expect(discoverAdoptableSessionByTarget(
+      'fork:0.0',
+      'codex',
+      '/opt/vendorCodex',
+    )).toMatchObject({ cliPid: 1000, cliId: 'codex' });
+    expect(discoverAdoptableSessionByTarget(
+      'official:0.0',
+      'codex',
+      '/opt/vendorCodex',
+    )).toBeUndefined();
+  });
+
   it('should bind a Codex rollout opened by the native child below its Node launcher', () => {
     const cliSessionId = '019f829a-3c55-75c3-b408-bb44fd88c067';
     setupMocks({
@@ -1079,6 +1161,24 @@ describe('validateAdoptTarget', () => {
 
     const result = validateAdoptTarget(tmuxTarget('mysession:0.0', 1001));
     expect(result).toBe(true);
+  });
+
+  it('revalidates a custom Codex runtime by exact executable basename', () => {
+    setupMocks({
+      paneLines: 'fork:0.0 1000\nofficial:0.0 2000\n',
+      commMap: { 1000: 'vendorCodex', 2000: 'codex' },
+      cwdMap: {},
+      dimsMap: {},
+    });
+
+    expect(validateAdoptTarget(
+      tmuxTarget('fork:0.0', 1000, 'codex'),
+      '/opt/vendorCodex',
+    )).toBe(true);
+    expect(validateAdoptTarget(
+      tmuxTarget('official:0.0', 2000, 'codex'),
+      '/opt/vendorCodex',
+    )).toBe(false);
   });
 
   it('should return false when pane no longer exists', () => {

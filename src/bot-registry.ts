@@ -6,6 +6,10 @@ import { underReadIsolation } from './adapters/cli/read-isolation.js';
 import type { BackendType } from './adapters/backend/types.js';
 import type { RiffBackendConfig } from './adapters/backend/riff-backend.js';
 import type { CliId } from './adapters/cli/types.js';
+import {
+  normalizeCliRuntimeConfig,
+  type CliRuntimeConfig,
+} from './adapters/cli/runtime.js';
 import { logger } from './utils/logger.js';
 import { isLocale, setBotLookup, type Locale } from './i18n/index.js';
 import type { VoiceConfig } from './services/voice/types.js';
@@ -136,6 +140,13 @@ export interface MessageListenerConfig {
     mode?: 'all_except_excluded' | 'include_only';
     includeSenderOpenIds?: string[];
     excludeSenderOpenIds?: string[];
+    /**
+     * Persisted sender KIND for each exclude id (open_id → 'user' | 'bot'), so
+     * the runtime fail-close decision (all_except_excluded + unverified bot
+     * sender) can tell a muted human from a muted bot WITHOUT guessing by id
+     * prefix. Absent entries fall back to a conservative "maybe a bot".
+     */
+    excludeSenderKinds?: Record<string, 'user' | 'bot'>;
     includeSenderTypes?: MessageListenerSenderType[];
     excludeSenderTypes?: MessageListenerSenderType[];
     /** Default true. */
@@ -880,6 +891,20 @@ function normalizeMessageListenerStringList(raw: unknown): string[] | undefined 
   return values.length > 0 ? [...new Set(values)] : undefined;
 }
 
+function normalizeMessageListenerSenderKinds(
+  raw: unknown,
+  excludeSenderOpenIds: string[] | undefined,
+): Record<string, 'user' | 'bot'> | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const allowed = excludeSenderOpenIds ? new Set(excludeSenderOpenIds) : undefined;
+  const out: Record<string, 'user' | 'bot'> = {};
+  for (const [key, value] of Object.entries(raw as Record<string, unknown>)) {
+    if (!key || (allowed && !allowed.has(key))) continue;
+    if (value === 'user' || value === 'bot') out[key] = value;
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
 function normalizeMessageListenerSenderTypes(raw: unknown): MessageListenerSenderType[] | undefined {
   if (!Array.isArray(raw)) return undefined;
   const values = raw
@@ -905,11 +930,13 @@ function normalizeMessageListenerConfig(raw: unknown, botIndex: number, chatId: 
   const mode = senderRaw.mode === 'include_only' ? 'include_only' : 'all_except_excluded';
   const includeSenderOpenIds = normalizeMessageListenerStringList(senderRaw.includeSenderOpenIds);
   const excludeSenderOpenIds = normalizeMessageListenerStringList(senderRaw.excludeSenderOpenIds);
+  const excludeSenderKinds = normalizeMessageListenerSenderKinds(senderRaw.excludeSenderKinds, excludeSenderOpenIds);
   const includeSenderTypes = normalizeMessageListenerSenderTypes(senderRaw.includeSenderTypes);
   const excludeSenderTypes = normalizeMessageListenerSenderTypes(senderRaw.excludeSenderTypes);
   if (mode !== 'all_except_excluded') senderPolicy.mode = mode;
   if (includeSenderOpenIds) senderPolicy.includeSenderOpenIds = includeSenderOpenIds;
   if (excludeSenderOpenIds) senderPolicy.excludeSenderOpenIds = excludeSenderOpenIds;
+  if (excludeSenderKinds) senderPolicy.excludeSenderKinds = excludeSenderKinds;
   if (includeSenderTypes) senderPolicy.includeSenderTypes = includeSenderTypes;
   if (excludeSenderTypes) senderPolicy.excludeSenderTypes = excludeSenderTypes;
   if (senderRaw.excludeSelf === false) senderPolicy.excludeSelf = false;
@@ -1084,6 +1111,19 @@ export interface BotConfig {
    */
   displayName?: string;
   cliId: CliId;
+  /**
+   * Optional distribution identity for a CLI that is protocol-compatible with
+   * {@link cliId} but ships as an independent executable/release stream (for
+   * example a Codex-compatible fork). The adapter remains selected by cliId;
+   * this descriptor owns product identity, executable and update provenance.
+   *
+   * `cliPathOverride` remains readable for legacy configs. A configured runtime
+   * is exposed through cliPathOverride in memory as a compatibility shadow so
+   * existing adapter call sites keep launching the selected executable while
+   * the runtime rollout migrates them to the structured descriptor.
+   */
+  cliRuntime?: CliRuntimeConfig;
+  /** @deprecated Prefer cliRuntime.executable for newly configured runtimes. */
   cliPathOverride?: string;
   /**
    * 通用启动前缀（按空格拆 token）：worker spawn 时把启动命令拼成
@@ -1569,6 +1609,10 @@ export interface BotConfig {
   docRepoMap?: Record<string, string>;
   /** Per-bot range for explicit `@bot /summary`; defaults to 50 messages / 24h. */
   summaryRange?: SummaryRangeConfig;
+  /** When true, explicit `@bot /summary` records a conservative project-local summary.md. */
+  summaryMemory?: boolean;
+  /** Optional target path for summary memory. Relative paths are resolved by the agent against the current project root; absolute paths are used as configured. */
+  summaryMemoryPath?: string;
   /**
    * Legacy content/keyword trigger config. Kept parseable for config
    * compatibility, but message routing no longer fires non-@ content triggers.
@@ -2349,6 +2393,27 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       continue;
     }
 
+    // cliRuntime is the canonical successor to cliPathOverride. New writers
+    // also persist an exactly-equal path shadow so a rollback to an older
+    // BotMux still launches the same distribution. Any unequal pair would make
+    // old and new versions disagree, so it fails closed below.
+    const entryCliId = entry.cliId ?? 'claude-code';
+    if (entry.cliRuntime !== undefined && entryCliId !== 'codex') {
+      throw new Error(`Bot config [${i}]: cliRuntime is currently supported only for cliId "codex"`);
+    }
+    if (entry.cliRuntime !== undefined && typeof entry.wrapperCli === 'string' && entry.wrapperCli.trim()) {
+      throw new Error(`Bot config [${i}]: cliRuntime cannot be combined with wrapperCli`);
+    }
+    const cliRuntime = entry.cliRuntime === undefined
+      ? undefined
+      : normalizeCliRuntimeConfig(entry.cliRuntime, `Bot config [${i}].cliRuntime`);
+    if (cliRuntime && entry.cliPathOverride === undefined) {
+      throw new Error(`Bot config [${i}]: cliPathOverride is required as an exact downgrade shadow of cliRuntime.executable`);
+    }
+    if (cliRuntime && entry.cliPathOverride !== cliRuntime.executable) {
+      throw new Error(`Bot config [${i}]: cliPathOverride must exactly match cliRuntime.executable`);
+    }
+
     // Parse workingDirs from comma-separated workingDir if workingDirs not explicitly set
     let workingDirs = entry.workingDirs;
     if (!workingDirs && entry.workingDir) {
@@ -2539,6 +2604,8 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       ? normalizePluginIdList(entry.plugins) ?? []
       : undefined;
     const summaryRange = normalizeSummaryRange(entry.summaryRange ?? entry.summary);
+    const summaryMemory = entry.summaryMemory === true ? true : undefined;
+    const summaryMemoryPath = normalizeNonEmptyString(entry.summaryMemoryPath);
     const contentTriggers = normalizeContentTriggers(entry.contentTriggers, i);
     const messageListeners = normalizeMessageListeners(entry.messageListeners, i);
     const vcMeetingAgent = normalizeVcMeetingAgentConfig(entry.vcMeetingAgent);
@@ -2575,7 +2642,10 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       brand: entry.brand === 'lark' ? 'lark' : undefined,
       name: typeof entry.name === 'string' && entry.name.trim() ? entry.name.trim() : undefined,
       displayName: typeof entry.displayName === 'string' && entry.displayName.trim() ? entry.displayName.trim() : undefined,
-      cliId: entry.cliId ?? 'claude-code',
+      cliId: entryCliId,
+      cliRuntime,
+      // Compatibility shadow: writers persist it for downgrade safety and the
+      // loader requires an exact match so every accepted config is rollback-safe.
       cliPathOverride: entry.cliPathOverride,
       wrapperCli: typeof entry.wrapperCli === 'string' && entry.wrapperCli.trim()
         ? entry.wrapperCli.trim()
@@ -2720,6 +2790,8 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
           )
         : undefined,
       summaryRange,
+      summaryMemory,
+      summaryMemoryPath,
       contentTriggers,
       voice,
     });

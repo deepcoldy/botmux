@@ -231,11 +231,22 @@ describe('opencode writeInput DB verification', () => {
 
   it('skips verification for slash commands (TUI command palette, no user row)', async () => {
     openDb().close();
-    const pty = stubPty();
+    const events: string[] = [];
+    const pty: PtyHandle & { enters: number } = {
+      enters: 0,
+      write(_data: string) {},
+      sendText(text: string) { events.push(`text:${text}`); },
+      pasteText(text: string) { events.push(`paste:${text}`); },
+      sendSpecialKeys(...keys: string[]) {
+        events.push(`key:${keys.join('+')}`);
+        pty.enters++;
+      },
+    };
     const adapter = createOpenCodeAdapter();
     const result = await adapter.writeInput(pty, '/help');
     expect(result).toBeUndefined();
     expect(pty.enters).toBe(1);  // 无重试 Enter，避免误触面板
+    expect(events).toEqual(['text:/help', 'key:Enter']);
   });
 
   it('stays blind (undefined) when the DB is missing', async () => {
@@ -243,5 +254,30 @@ describe('opencode writeInput DB verification', () => {
     const adapter = createOpenCodeAdapter();
     const result = await adapter.writeInput(pty, 'no db yet');
     expect(result).toBeUndefined();
+  });
+
+  it('pastes multi-line prompts so OpenCode can use its bracketed-paste path', async () => {
+    const db = openDb();
+    seedSession(db, { id: 'ses_target' });
+    const content = `<botmux_routing>\n${'hint\n'.repeat(200)}</botmux_routing>\n\n<user_message>\nhello\n</user_message>`;
+    const events: string[] = [];
+    const pty: PtyHandle & { enters: number } = {
+      enters: 0,
+      write(_data: string) {},
+      sendText(text: string) { events.push(`text:${text.length}`); },
+      pasteText(text: string) { events.push(`paste:${text.length}`); },
+      sendSpecialKeys(...keys: string[]) {
+        events.push(`key:${keys.join('+')}`);
+        pty.enters++;
+        if (pty.enters === 1) seedUserPart(db, 'ses_target', content, Date.now());
+      },
+    };
+
+    const adapter = createOpenCodeAdapter();
+    const result = await adapter.writeInput(pty, content);
+    db.close();
+
+    expect(result).toMatchObject({ submitted: true, cliSessionId: 'ses_target' });
+    expect(events).toEqual([`paste:${content.length}`, 'key:Enter']);
   });
 });

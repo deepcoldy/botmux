@@ -47,6 +47,8 @@ const herdrProbe = vi.hoisted(() => ({ result: 'exists' as 'exists' | 'missing' 
 // Mutable bot-side wrapperCli for the wrapper-axis mismatch tests.
 const bot = vi.hoisted(() => ({
   cliId: 'claude-code' as import('../src/adapters/cli/types.js').CliId,
+  cliRuntime: undefined as import('../src/adapters/cli/runtime.js').CliRuntimeConfig | undefined,
+  cliPathOverride: undefined as string | undefined,
   wrapperCli: undefined as string | undefined,
 }));
 
@@ -173,7 +175,15 @@ vi.mock('../src/core/worker-pool.js', () => ({
 
 vi.mock('../src/bot-registry.js', () => ({
   getBot: vi.fn(() => ({
-    config: { larkAppId: 'app_test', cliId: bot.cliId, wrapperCli: bot.wrapperCli, workingDir: '~', workingDirs: ['~'] },
+    config: {
+      larkAppId: 'app_test',
+      cliId: bot.cliId,
+      cliRuntime: bot.cliRuntime,
+      cliPathOverride: bot.cliPathOverride,
+      wrapperCli: bot.wrapperCli,
+      workingDir: '~',
+      workingDirs: ['~'],
+    },
     botName: 'TestBot',
     botOpenId: 'ou_test',
     resolvedAllowedUsers: [],
@@ -279,6 +289,8 @@ beforeEach(() => {
   zmxSnapshot.unhealthySessions = [];
   herdrProbe.result = 'exists';
   bot.cliId = 'claude-code';
+  bot.cliRuntime = undefined;
+  bot.cliPathOverride = undefined;
   bot.wrapperCli = undefined;
   vi.mocked(closeSession).mockClear();
   vi.mocked(forkWorker).mockClear();
@@ -903,6 +915,88 @@ describe('closeCliMismatchedSessionsForBot — runtime CLI hot-switch sweep', ()
 
     expect(await closeCliMismatchedSessionsForBot('app_test')).toBe(1);
     expect(sessionStore.getSession(s.sessionId)!.status).toBe('closed');
+  });
+
+  it('closes runtime identity mismatches and describes both distributions in the warning', async () => {
+    bot.cliId = 'codex';
+    bot.cliRuntime = {
+      id: 'current-codex',
+      displayName: 'Current Codex',
+      executable: '/opt/current-codex',
+      update: { provider: 'none' },
+    };
+    bot.cliPathOverride = '/opt/current-codex';
+    const s = makeActivePersistentSession('om_rt_runtime_mismatch');
+    s.agentFrozen = true;
+    s.cliRuntime = {
+      id: 'frozen-codex',
+      displayName: 'Frozen Codex',
+      executable: '/opt/frozen-codex',
+      source: 'configured',
+      update: { provider: 'self' },
+    };
+    s.cliPathOverride = '/opt/frozen-codex';
+    sessionStore.updateSession(s);
+    registerDs(s);
+
+    expect(await closeCliMismatchedSessionsForBot('app_test')).toBe(1);
+    expect(sessionStore.getSession(s.sessionId)!.status).toBe('closed');
+    const warnings = vi.mocked(logger.warn).mock.calls.flat().join('\n');
+    expect(warnings).toContain('session=Frozen Codex');
+    expect(warnings).toContain('bot=Current Codex');
+  });
+
+  it('closes an old frozen path when its source differs from a configured runtime with the same id', async () => {
+    bot.cliId = 'codex';
+    bot.cliRuntime = {
+      id: 'vendor-codex',
+      displayName: 'VendorCodex',
+      executable: '/opt/new-location/vendor-codex',
+      update: { provider: 'self' },
+    };
+    bot.cliPathOverride = '/opt/new-location/vendor-codex';
+    const s = makeActivePersistentSession('om_rt_legacy_runtime_match');
+    s.agentFrozen = true;
+    s.cliPathOverride = '/opt/old-location/vendor-codex';
+    sessionStore.updateSession(s);
+    registerDs(s);
+
+    expect(await closeCliMismatchedSessionsForBot('app_test')).toBe(1);
+    expect(closeSession).toHaveBeenCalledWith(s.sessionId);
+    expect(sessionStore.getSession(s.sessionId)!.status).toBe('closed');
+  });
+
+  it('does not treat a legacy executable named codex as the official runtime', async () => {
+    bot.cliId = 'codex';
+    bot.cliRuntime = undefined;
+    bot.cliPathOverride = undefined;
+    const s = makeActivePersistentSession('om_rt_legacy_codex');
+    s.agentFrozen = true;
+    s.cliPathOverride = 'codex';
+    sessionStore.updateSession(s);
+    registerDs(s);
+
+    expect(await closeCliMismatchedSessionsForBot('app_test')).toBe(1);
+    expect(closeSession).toHaveBeenCalledWith(s.sessionId);
+    expect(sessionStore.getSession(s.sessionId)!.status).toBe('closed');
+  });
+
+  it('does not compare runtime identity before a legacy session is agentFrozen', async () => {
+    bot.cliId = 'codex';
+    bot.cliRuntime = {
+      id: 'current-codex',
+      executable: '/opt/current-codex',
+      update: { provider: 'none' },
+    };
+    bot.cliPathOverride = '/opt/current-codex';
+    const s = makeActivePersistentSession('om_rt_unfrozen_runtime');
+    s.cliPathOverride = '/opt/legacy-codex';
+    sessionStore.updateSession(s);
+    registerDs(s);
+
+    expect(await closeCliMismatchedSessionsForBot('app_test')).toBe(0);
+    expect(closeSession).not.toHaveBeenCalledWith(s.sessionId);
+    expect(sessionStore.getSession(s.sessionId)!.status).toBe('active');
   });
 
   it('defers a CLI-mismatch close during relay and resweeps after the gate settles', async () => {

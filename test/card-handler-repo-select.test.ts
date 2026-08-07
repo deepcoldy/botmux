@@ -384,6 +384,14 @@ describe('repo select card — plain switch', () => {
       { content: 'mock-prompt' },
       { turnId: 'om_initial_turn' },
     );
+    // Merge-artifact guard: the buffered-prompt commit must read the bot roster
+    // EXACTLY ONCE across the whole transaction. A prior merge left master's
+    // pre-fetch (needsPromptContext → getAvailableBots) AND HEAD's inline
+    // buildNewTopicCliInput re-fetch both live, so the same repo commit read the
+    // roster twice — extra calls plus a snapshot that could straddle the CAS
+    // guard. Assert the full-transaction count (not just "not called while the
+    // first Promise is pending") so any re-introduced double-read turns red.
+    expect(getAvailableBots).toHaveBeenCalledTimes(1);
     expect(ds.pendingTurnId).toBeUndefined();
     expect(ds.session.riffRepoDirs).toBeUndefined();
     expect(sessionReply.mock.calls.map(c => c[1]).join()).toContain('已选择');
@@ -461,8 +469,15 @@ describe('repo select card — plain switch', () => {
   });
 
   it('pendingRepo selection forwards the complete Codex App sidecar to forkWorker', async () => {
-    const ds = makeDs({ pendingRepo: true, pendingPrompt: 'hello world', worker: null });
+    const ds = makeDs({ pendingRepo: true, pendingPrompt: '', pendingTurnId: 'om_group_join', worker: null });
     ds.session.cliId = 'codex-app';
+    ds.pendingChatContext = {
+      chatId: CHAT_ID,
+      name: '【Pippit】【BUG】测试群',
+      description: 'https://example.test/issue/detail/123',
+      mode: 'group',
+      fetchStatus: 'ok',
+    };
     const substituteTrigger = {
       target: { userId: 'u_configured' },
       observedMention: { name: 'Observed Person', userId: 'u_configured' },
@@ -470,7 +485,7 @@ describe('repo select card — plain switch', () => {
     };
     ds.pendingSubstituteTrigger = substituteTrigger;
     const codexAppInput = {
-      text: 'hello world',
+      text: '',
       additionalContext: {
         botmux_substitute_policy: { kind: 'application' as const, value: 'fixed policy' },
         botmux_substitute_target: { kind: 'untrusted' as const, value: 'observed identity' },
@@ -486,10 +501,15 @@ describe('repo select card — plain switch', () => {
       content: 'mock-prompt',
       codexAppInput,
     });
-    expect(vi.mocked(forkWorker).mock.calls[0]![2]).toBe(false);
+    expect(vi.mocked(forkWorker).mock.calls[0]![2]).toEqual({ turnId: 'om_group_join' });
     expect(vi.mocked(buildNewTopicCliInput).mock.calls[0]![11]).toEqual(expect.objectContaining({
       substituteTrigger,
+      chatContext: expect.objectContaining({
+        chatId: CHAT_ID,
+        description: 'https://example.test/issue/detail/123',
+      }),
     }));
+    expect(ds.pendingChatContext).toBeUndefined();
   });
 
   it('skip_repo also forwards the complete Codex App sidecar to forkWorker', async () => {
@@ -1293,6 +1313,41 @@ describe('repo select card — worktree open', () => {
     expect(replies).toContain('fork boom');
     // NOT a creation failure — retrying as one would trip "already exists".
     expect(replies).not.toContain('创建 worktree 失败');
+  });
+
+  it('auto-worktree completion submits chat context for an empty group-join prompt', async () => {
+    const ds = makeDs({
+      pendingRepo: true,
+      pendingPrompt: '',
+      pendingTurnId: 'om_group_join_worktree',
+      worker: null,
+    });
+    ds.pendingChatContext = {
+      chatId: CHAT_ID,
+      name: '【Pippit】【BUG】测试群',
+      description: 'https://example.test/issue/detail/123',
+      mode: 'group',
+      fetchStatus: 'ok',
+    };
+    const { deps } = makeDeps(ds);
+    vi.mocked(createRepoWorktree).mockResolvedValue({
+      path: '/repos/alpha-wt-1', branch: 'wt/1', baseRef: 'origin/master',
+    });
+
+    await handleCardAction(makeSelectEvent('repo_worktree', '/repos/alpha'), deps, APP_ID);
+    await vi.waitFor(() => expect(ds.worktreeCreating).toBe(false));
+
+    expect(buildNewTopicCliInput).toHaveBeenCalled();
+    expect(vi.mocked(buildNewTopicCliInput).mock.calls[0]![0]).toBe('');
+    expect(vi.mocked(buildNewTopicCliInput).mock.calls[0]![11]).toMatchObject({
+      chatContext: { chatId: CHAT_ID },
+    });
+    expect(forkWorker).toHaveBeenCalledWith(
+      ds,
+      { content: 'mock-prompt' },
+      { turnId: 'om_group_join_worktree' },
+    );
+    expect(ds.session.initialUserTurnPending).toBeUndefined();
   });
 
   it('creation failure replies an error and releases the in-flight lock', async () => {

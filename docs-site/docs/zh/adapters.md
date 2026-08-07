@@ -3,7 +3,7 @@
 botmux 通过适配器桥接不同 CLI / Agent，`bots.json` 里用 `cliId` 选择，一键切换。**本地适配器各自运行进程**（默认 tmux 后端下可 `tmux attach` 进真进程；显式 pty/zellij/herdr 后端另说）；也有少数通过 API / 远端接入的 Agent（如 Mira、riff），不是本地进程。
 
 **适用**：想换底层 CLI、或接一个新工具时查 `cliId` 和它是否吃 `model` 参数。
-**不适用**：套 wrapper / 网关（ccr、aiden x claude 等）不需要新适配器——见下方 [套 wrapper / 网关接入](#套-wrapper--网关接入)。
+**不适用**：严格兼容 Codex 的独立发行版、或套 wrapper / 网关（ccr、aiden x claude 等）不需要新适配器——分别见下方 [Codex 兼容发行版](#codex-兼容发行版) 与 [套 wrapper / 网关接入](#套-wrapper--网关接入)。
 
 ## 支持的 CLI / Agent
 
@@ -71,6 +71,14 @@ mircli mcp status
 ```bash
 MIRCLI_AUTO_START_MIRAMCP=0 botmux start
 ```
+
+## Codex 兼容发行版
+
+BotMux 把“协议能力”和“发行版身份”分开：`cliId: "codex"` 选择 Codex 协议适配器，`cliRuntime` 选择真正运行、独立发版的二进制。这样兼容分支可以复用模型参数、resume、空闲检测与受控 RPC，而不会被当成官方 Codex 检查版本。
+
+适合 `cliRuntime` 的 CLI 必须是**严格兼容分支**：接受 BotMux 传给 Codex 的参数，保留相同的交互状态和 rollout / resume 语义，并使用兼容的认证 / home 布局。如果它修改了参数、TUI 状态机、会话存储或协议，就应贡献一个真实适配器，而不是声明兼容。
+
+完整配置与更新 provider 说明见 [`bots.json` 的 Codex 兼容发行版章节](/bots-json#codex-兼容发行版)。Dashboard 的 Bot 默认设置也可以配置并预检 runtime。旧 `cliPathOverride` 继续兼容，但不会自动开启需要明确兼容声明的 Codex RPC 能力。
 
 ## 套 wrapper / 网关接入
 

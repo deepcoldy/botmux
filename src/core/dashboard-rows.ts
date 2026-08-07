@@ -8,6 +8,7 @@
 import type { DaemonSession } from './types.js';
 import type { Session, StreamStatus } from '../types.js';
 import type { CliId } from '../adapters/cli/types.js';
+import { basename } from 'node:path';
 import { getTerminalAdvertisedPort } from './terminal-url.js';
 import { getBotBrand } from '../bot-registry.js';
 import { type Brand, chatAppLink } from '../im/lark/lark-hosts.js';
@@ -24,6 +25,10 @@ export interface SessionRow extends SessionMessagePreview {
   larkAppId: string;
   botName: string;
   cliId: CliId | 'unknown';
+  /** Concrete distribution identity frozen on the session. Older path-only
+   * sessions expose a basename-derived legacy identity. */
+  runtimeId?: string;
+  runtimeDisplayName?: string;
   status: StreamStatus | 'closed' | 'dormant';
   adopt: boolean;
   spawnedAt: number;
@@ -163,12 +168,24 @@ function backendSessionNameForRow(s: Session): string | undefined {
   ).sessionName;
 }
 
+function sessionRuntimeFields(s: Session): Pick<SessionRow, 'runtimeId' | 'runtimeDisplayName'> {
+  if (s.cliRuntime) {
+    return { runtimeId: s.cliRuntime.id, runtimeDisplayName: s.cliRuntime.displayName };
+  }
+  if (s.cliPathOverride) {
+    const legacyName = basename(s.cliPathOverride.replace(/\\/g, '/'));
+    if (legacyName) return { runtimeId: legacyName, runtimeDisplayName: legacyName };
+  }
+  return {};
+}
+
 export function composeRowFromActive(ds: DaemonSession): SessionRow {
   return {
     sessionId: ds.session.sessionId,
     larkAppId: ds.larkAppId,
     botName: cachedBotName,
     cliId: ds.session.cliId ?? 'unknown',
+    ...sessionRuntimeFields(ds.session),
     // 待办池(queued)会话 CLI 没起，不该算「忙」——报 'idle' 免得 overview 的忙碌
     // 计数/小圆点把它当在跑。看板列由 deriveKanbanColumn 按手动 backlog 定，不受此影响。
     // For every other session, process residency is authoritative: suspension
@@ -226,6 +243,7 @@ export function composeRowFromClosed(s: Session): SessionRow {
     larkAppId: s.larkAppId ?? '',
     botName: cachedBotName,
     cliId: s.cliId ?? 'unknown',
+    ...sessionRuntimeFields(s),
     status: 'closed',
     adopt: !!s.adoptedFrom,
     spawnedAt: sessionCreatedAtMs(s),
@@ -268,6 +286,7 @@ export function composeRowFromPersistedActive(s: Session): SessionRow {
     larkAppId: s.larkAppId ?? '',
     botName: cachedBotName,
     cliId: s.cliId ?? 'unknown',
+    ...sessionRuntimeFields(s),
     status: s.queued ? 'idle' : 'dormant',
     adopt: !!s.adoptedFrom,
     spawnedAt: sessionCreatedAtMs(s),

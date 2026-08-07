@@ -65,6 +65,11 @@ export function redactSchedulesForPublic(schedules: unknown[]): unknown[] {
 const PRIVATE_SESSION_FIELDS = new Set([
   'gitBranch',
   'riffAccessUrl',
+  // Concrete distribution identity is operator configuration, not anonymous
+  // watch-board data. Public rows retain protocol-level `cliId`, which is
+  // sufficient for the existing fallback label.
+  'runtimeId',
+  'runtimeDisplayName',
   'previewUserText',
   'previewBotText',
   'previewUserFullText',

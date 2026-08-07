@@ -34,7 +34,7 @@ import { validateWorkingDir } from './core/working-dir.js';
 import { resolveSessionContext } from './core/session-marker.js';
 import { resolveBotmuxDataDir } from './core/data-dir.js';
 import { dashboardSecretPath } from './core/dashboard-secret.js';
-import { acceptedDispatchBotAppIds, appendDispatchReportProtocol, appendLegacyDispatchReportProtocol, parseDispatchBotSpec, buildDispatchMessages, buildRepoPrimeText, buildReportContent, eligibleAutoMentionAliases, findDispatchRegistryEntry, offTopicSubBotTopic, resolveReportTarget, resolveSendTarget } from './core/dispatch.js';
+import { acceptedDispatchBotAppIds, activeConversationBotOpenIds, appendDispatchReportProtocol, appendLegacyDispatchReportProtocol, parseDispatchBotSpec, buildDispatchMessages, buildRepoPrimeText, buildReportContent, eligibleAutoMentionAliases, findDispatchRegistryEntry, foldableChatSessionAppIds, offTopicSubBotTopic, resolveReportPlacement, resolveReportRecipient, resolveReportTarget, resolveSendTarget, threadRootForReachability } from './core/dispatch.js';
 import { pickTurnReplyTarget } from './core/reply-target.js';
 import { recordDispatchRegistryEntry } from './core/dispatch-registry.js';
 import { enableAutostart, disableAutostart, autostartStatus, refreshAutostart } from './autostart.js';
@@ -92,9 +92,11 @@ import {
   freezeManagedZmxAttachTarget,
 } from './cli/zmx-managed-attach.js';
 import { dispatchPrimaryMessage, findStdinAliasAttachment, normalizeInteractiveCardInput, sendFileAttachments, sendVideoAttachments, shouldSendAsPureVideo, validateVideoAttachments } from './cli/send-dispatch.js';
-import { dispatchDeferredTopicSend, type DeferredScheduleRunData } from './cli/deferred-topic-send.js';
+import { dispatchDeferredTopicSend, reusableDeferredTopicRoot, type DeferredScheduleRunData } from './cli/deferred-topic-send.js';
+import { readDeferredTopicBinding } from './core/deferred-topic-binding.js';
 import { resolveDaemonEnv } from './cli/daemon-lifecycle-env.js';
 import { buildPm2SpawnCommand } from './cli/pm2-command.js';
+import { pm2ManagedExitConfig } from './pm2-graceful-exit.js';
 import { callDashboard, type DashboardEndpoint, type DashboardResult } from './cli/dashboard-endpoint.js';
 import { globalInstallUpdateLockTargetIn, installLatestBotmuxSync } from './core/maintenance.js';
 import {
@@ -507,6 +509,7 @@ function ecosystemConfig(activationAppId?: string): string {
     process.env,
     existsSync(ENV_FILE) ? readFileSync(ENV_FILE, 'utf-8') : undefined,
   );
+  const managedExit = pm2ManagedExitConfig();
 
   const baseApp = {
     script: daemonScript,
@@ -518,14 +521,14 @@ function ecosystemConfig(activationAppId?: string): string {
     autorestart: true,
     max_restarts: 10,
     restart_delay: 3000,
-    // A graceful daemon shutdown exits 0 (SIGTERM/SIGINT → drain → process.exit(0)).
-    // Tell pm2 that exit 0 is intentional so it does NOT autorestart the daemon
+    // A graceful PM2-managed shutdown exits with a dedicated sentinel code.
+    // Tell pm2 that only this code is intentional so it does NOT autorestart the daemon
     // while `botmux restart` is tearing the fleet down — otherwise pm2 revives
     // each daemon (after restart_delay) the instant our parallel SIGTERM drains
     // it, and re-deleting those revivals one-by-one re-serializes the teardown
-    // (~13s of churn for 31 bots). Crashes (non-zero exit / killed by signal)
-    // are NOT in this list, so genuine crash-autorestart is preserved.
-    stop_exit_codes: [0],
+    // (~13s of churn for 31 bots). Do not use 0 here: PM2 normalizes a signal
+    // exit's null code to 0, which would suppress autorestart after SIGKILL.
+    stop_exit_codes: managedExit.stopExitCodes,
     // pm2's default kill_timeout (1.6s) is SHORTER than the daemon's own
     // SHUTDOWN_GRACE_MS (3s), so any daemon pm2 has to signal directly gets
     // SIGKILL'd mid-drain → orphaned (ppid=1) workers. Give pm2 headroom past
@@ -586,6 +589,7 @@ function ecosystemConfig(activationAppId?: string): string {
       out_file: join(LOG_DIR, `daemon-${i}-out.log`),
       env: {
         ...daemonEnv,
+        ...managedExit.env,
         SESSION_DATA_DIR: DATA_DIR,
         BOTMUX_BOT_INDEX: String(i),
         BOTMUX_LARK_APP_ID: appId,
@@ -611,15 +615,16 @@ function ecosystemConfig(activationAppId?: string): string {
     autorestart: true,
     max_restarts: 10,
     restart_delay: 3000,
-    // Same rationale as the bot daemons: don't let pm2 revive on graceful exit-0
+    // Same rationale as the bot daemons: don't let pm2 revive on graceful exit
     // during a fleet teardown, and don't SIGKILL mid-shutdown. (See baseApp.)
-    stop_exit_codes: [0],
+    stop_exit_codes: managedExit.stopExitCodes,
     kill_timeout: 3500,
     error_file: join(LOG_DIR, 'dashboard-error.log'),
     out_file: join(LOG_DIR, 'dashboard-out.log'),
     merge_logs: true,
     env: {
       ...daemonEnv,
+      ...managedExit.env,
       // MUST match the bot daemons' SESSION_DATA_DIR: the dashboard shares
       // pairings/federations/memberships with them via {dataDir}/*.json. Without
       // it the dashboard falls back to an install-relative ../data and reads a
@@ -4041,16 +4046,34 @@ function sessionBackingInfo(s: SessionData, snapshot?: BackingProbeSnapshot): {
   if (s.backendType === 'pty') {
     return { backendType: 'pty', probe: 'missing', label: 'pty' };
   }
-  // Legacy rows predate backend stamping. Only tmux was externally attachable.
-  const target = sessionPersistentTarget(s)!;
-  const probe = backingProbe(snapshot, target);
-  return {
-    backendType: 'tmux',
-    target,
-    probe,
-    label: probe === 'exists' ? `tmux: ${target.sessionName}` : '-',
-    attachBackend: 'tmux',
-  };
+  if (s.backendType === 'riff') {
+    // Riff runs the CLI on a remote sandbox, not a local multiplexer pane: there
+    // is nothing to probe, attach to, or name as a PersistentBackendTarget
+    // (sessionPersistentTarget returns undefined for it, by design). Surface a
+    // stable label and report the nonexistent local backing as missing — exactly
+    // like pty — so it never slips into the legacy tmux branch and dereferences an
+    // undefined target.
+    return { backendType: 'riff', probe: 'missing', label: 'riff' };
+  }
+  if (s.backendType === undefined) {
+    // Legacy rows predate backend stamping. Only tmux was externally attachable,
+    // so its deterministic target remains the compatibility path.
+    const target = sessionPersistentTarget(s)!;
+    const probe = backingProbe(snapshot, target);
+    return {
+      backendType: 'tmux',
+      target,
+      probe,
+      label: probe === 'exists' ? `tmux: ${target.sessionName}` : '-',
+      attachBackend: 'tmux',
+    };
+  }
+  // Exhaustiveness guard: every BackendType must be classified above. A future
+  // non-suspendable backend added to BackendType will fail to compile here rather
+  // than silently inheriting the legacy tmux target (the Riff crash's root cause).
+  const _exhaustive: never = s.backendType;
+  void _exhaustive;
+  return { probe: 'missing', label: '-' };
 }
 
 function sessionTargetLabel(s: SessionData, snapshot?: BackingProbeSnapshot): string {
@@ -5694,7 +5717,7 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
                                        v2 历史 run 私有静态归档；retire 在维护窗双验后原子迁入 quarantine
   （完整参数见 \`botmux workflow help\` / \`botmux template help\`）
   dispatch --bot <name> [...]          多话题编排：开子话题并把 bot 派进去（详见 \`botmux dispatch --help\`）
-  report [...]                         v3/编排场景向上汇报进度或结果（详见 \`botmux report --help\`）
+  report [...]                         交接 Review / 进展 / 结果并继承会话位置（详见 \`botmux report --help\`）
 
 新建飞书群:
   create-group --bot <name> [--bot ...] [--name "群名"]
@@ -7850,7 +7873,8 @@ async function cmdSend(rest: string[]): Promise<void> {
   // is idempotent, so the downstream send path reuses these same clients.
   // envPinnedRiffBot is re-registered LAST so a remote env credential is never
   // clobbered by a stale bots.json entry for the same app.
-  const { registerBot, loadBotConfigs, findOncallChatForAnyBot } = await import('./bot-registry.js');
+  const { registerBot, loadBotConfigs, findOncallChatForAnyBot, getBot } = await import('./bot-registry.js');
+  const { resolveRegularGroupMode } = await import('./services/chat-reply-mode-store.js');
   try { for (const cfg of loadBotConfigs()) registerBot(cfg); } catch { /* */ }
   if (envPinnedRiffBot) { try { registerBot(envPinnedRiffBot); } catch { /* */ } }
 
@@ -7898,7 +7922,7 @@ async function cmdSend(rest: string[]): Promise<void> {
     if (!statSync(p).isFile()) { console.error(`不是普通文件: ${p}`); process.exit(1); }
   }
 
-  const { sendMessage, replyMessage, uploadImage, uploadFile, MessageWithdrawnError } = await import('./im/lark/client.js');
+  const { sendMessage, replyMessage, uploadImage, uploadFile, MessageWithdrawnError, getChatModeStrict } = await import('./im/lark/client.js');
   const appId = s.larkAppId!;
   // Effective target chat for top-level mode (defaults to session's chat)
   const targetChatId = overrideChatId ?? s.chatId;
@@ -7906,6 +7930,54 @@ async function cmdSend(rest: string[]): Promise<void> {
   // reply_in_thread, otherwise Lark would force every reply into a fresh
   // topic — defeating the whole point of chat-scope routing.
   const isChatScope = s.scope === 'chat';
+  // Compute the actual outbound anchor before the advisory guard. A chat-scope
+  // sender can still reply into a per-turn topic, so sender scope alone does
+  // not describe which peer sessions are reachable.
+  // #597: a frozen per-turn reply target (from a Codex App dispatch) overrides
+  // the nominal resolveSendTarget in chat scope so a steered/dispatched turn
+  // replies to its own origin, not the session's latest human quote target.
+  const sendTarget = !sendInto && !sendTopLevel && !overrideChatId && frozenTurnReplyTarget
+    ? frozenTurnReplyTarget
+    : resolveSendTarget({ into: sendInto, topLevel: sendTopLevel, chatScope: isChatScope, chatId: targetChatId, rootMessageId: s.rootMessageId, replyTargetRootId: turnReplyTarget?.rootMessageId, replyTargetTurnId: turnReplyTarget?.turnId, replyTargetQuoteOnly: turnReplyTarget?.quoteOnly, currentTurnId });
+  const dataDir = resolveDataDir();
+  const deferredBinding = !sendInto && (!overrideChatId || overrideChatId === s.chatId)
+    ? readDeferredTopicBinding(dataDir, s.sessionId)
+    : undefined;
+  const deferredRoot = reusableDeferredTopicRoot({
+    session: s as SessionData & { larkAppId: string },
+    binding: deferredBinding,
+    explicitTopLevel: sendTopLevel,
+    reuseBoundRootWhenTopLevel: deferredMaterializedByThisCommand,
+  });
+  const reachabilityTarget = deferredRoot
+    ? { mode: 'thread' as const, rootMessageId: deferredRoot }
+    : sendTarget;
+
+  // Load the sender-scoped bot identity map once. Besides prose @Name
+  // injection below, it lets the sub-bot hint recognize peers that already
+  // have an active session in THIS conversation.
+  let botEntries: BotMentionEntry[] = [];
+  let crossRef: Record<string, string> = {};
+  try {
+    const botInfoPath = join(dataDir, 'bots-info.json');
+    const parsedBotEntries = existsSync(botInfoPath)
+      ? JSON.parse(readFileSync(botInfoPath, 'utf-8'))
+      : [];
+    botEntries = Array.isArray(parsedBotEntries)
+      ? parsedBotEntries.filter((entry): entry is BotMentionEntry =>
+          !!entry
+          && typeof entry === 'object'
+          && typeof entry.larkAppId === 'string'
+          && (entry.botName === null || typeof entry.botName === 'string'))
+      : [];
+    const crossRefPath = join(dataDir, `bot-openids-${appId}.json`);
+    const parsedCrossRef = existsSync(crossRefPath)
+      ? JSON.parse(readFileSync(crossRefPath, 'utf-8'))
+      : {};
+    crossRef = parsedCrossRef && typeof parsedCrossRef === 'object' && !Array.isArray(parsedCrossRef)
+      ? parsedCrossRef
+      : {};
+  } catch { /* best-effort identity map */ }
 
   // ── Footgun guard: orchestrator → sub-bot ──
   // A dispatched sub-bot's session lives in its sub-topic; @-ing it from the main
@@ -7915,22 +7987,47 @@ async function cmdSend(rest: string[]): Promise<void> {
   // `@OtherSubBot` can't slip past after this explicit guard already ran.
   let dispatchReg: Record<string, { orchChatId?: string; bots?: string[] }> = {};
   try {
-    const regPath = join(resolveDataDir(), 'orchestrate-dispatch.json');
+    const regPath = join(dataDir, 'orchestrate-dispatch.json');
     if (existsSync(regPath)) dispatchReg = JSON.parse(readFileSync(regPath, 'utf-8'));
   } catch { /* no/!corrupt registry → no guard */ }
   const dispatchActiveSeeds = new Set<string>();
+  let allSessions: SessionData[] = [];
   if (Object.keys(dispatchReg).length > 0) {
-    for (const sess of loadSessions().values()) {
-      if (sess.status === 'active' && sess.scope !== 'chat' && sess.rootMessageId) {
+    allSessions = [...loadSessions().values()];
+    for (const sess of allSessions) {
+      if (sess.status !== 'active') continue;
+      if (sess.scope !== 'chat' && sess.rootMessageId) {
         dispatchActiveSeeds.add(sess.rootMessageId);
       }
     }
   }
+  // An active chat-scope session can outlive a /reply-mode switch. Verify the
+  // target bot's current effective mode before assuming mentions still fold
+  // back into that old session.
+  const foldableChatAppIds = await foldableChatSessionAppIds({
+    sessions: allSessions,
+    targetChatId,
+    outboundMode: reachabilityTarget.mode,
+    resolveMode: (larkAppId, chatId) => {
+      getBot(larkAppId); // unknown target bot must fail closed
+      return resolveRegularGroupMode(larkAppId, chatId);
+    },
+    resolveChatMode: chatId => getChatModeStrict(appId, chatId),
+  });
+  const reachableOpenIds = activeConversationBotOpenIds({
+    sessions: allSessions,
+    targetChatId,
+    outboundRootMessageId: threadRootForReachability(reachabilityTarget),
+    foldableChatAppIds,
+    botEntries,
+    crossRef,
+  });
   // Sub-topic seed if `openId` is a dispatched sub-bot in an active topic that is
-  // NOT reachable in the current conversation; else null. The bot I'm replying to
-  // here (quoteTargetSenderOpenId) is reachable, so it's never treated as off-topic.
+  // NOT reachable in the current conversation; else null. Both the bot I'm
+  // replying to and any peer with an active session at this conversation anchor
+  // are reachable, so an unrelated old dispatch topic must not be recommended.
   const offTopicSubBotSeed = (openId: string): string | null =>
-    offTopicSubBotTopic({ mentionOpenId: openId, quoteTargetSenderOpenId: replyTargetSenderOpenId, chatId: targetChatId, registry: dispatchReg, activeSeeds: dispatchActiveSeeds });
+    offTopicSubBotTopic({ mentionOpenId: openId, quoteTargetSenderOpenId: replyTargetSenderOpenId, reachableOpenIds, chatId: targetChatId, registry: dispatchReg, activeSeeds: dispatchActiveSeeds });
   // Explicit --mention / --mention-back of an off-topic sub-bot → block + point to
   // the right command (--anyway overrides). Prose @Name injection is filtered
   // (dropped, not blocked) at its own site below.
@@ -7960,11 +8057,11 @@ async function cmdSend(rest: string[]): Promise<void> {
     rootMessageId: s.rootMessageId,
     title: s.title,
   };
-  // Dispatch helper: top-level / chat-scope send vs reply-in-thread, single
-  // decision point. Used for file attachments (always plain in chat scope).
-  const sendTarget = !sendInto && !sendTopLevel && !overrideChatId && frozenTurnReplyTarget
-    ? frozenTurnReplyTarget
-    : resolveSendTarget({ into: sendInto, topLevel: sendTopLevel, chatScope: isChatScope, chatId: targetChatId, rootMessageId: s.rootMessageId, replyTargetRootId: turnReplyTarget?.rootMessageId, replyTargetTurnId: turnReplyTarget?.turnId, replyTargetQuoteOnly: turnReplyTarget?.quoteOnly, currentTurnId });
+  // Ordinary delivery uses the nominal target. Deferred delivery gets first
+  // refusal below; the advisory mirrors its existing binding in
+  // `reachabilityTarget` above so both paths agree about the effective root.
+  // (sendTarget itself is defined once above, carrying #597's frozen per-turn
+  // reply-target override.)
   const dispatch = async (
     content: string,
     msgType: string,
@@ -8192,16 +8289,7 @@ async function cmdSend(rest: string[]): Promise<void> {
     // "获取群组中其他机器人和用户@当前机器人的消息"权限），不再走任何本地
     // 转发——botmux 历史上为绕过 Lark 不投递跨 bot 事件搞过 signal-file，
     // 那套已经在该权限上线后整体下线。
-    let botEntries: BotMentionEntry[] = [];
-    let crossRef: Record<string, string> = {};
     try {
-      const dataDir = resolveDataDir();
-      const botInfoPath = join(dataDir, 'bots-info.json');
-      botEntries = existsSync(botInfoPath) ? JSON.parse(readFileSync(botInfoPath, 'utf-8')) : [];
-      const crossRefPath = join(dataDir, `bot-openids-${appId}.json`);
-      crossRef = existsSync(crossRefPath)
-        ? JSON.parse(readFileSync(crossRefPath, 'utf-8'))
-        : {};
       // --no-mention 显式不 @ 任何人：跳过正文 @BotName 的自动注入，否则正文里
       // 出现的 @名字 仍会被注入成 <at>，破坏 --no-mention 语义、还可能误触发对方
       // bot（正是要避免的循环 @）。botEntries/crossRef 仍需加载供 footer 寻址用。
@@ -8895,42 +8983,69 @@ async function cmdDispatch(rest: string[]): Promise<void> {
 }
 
 /**
- * `botmux report` — a dispatched sub-bot reports progress/completion back to the
- * orchestrator that dispatched it.
+ * `botmux report` — delivery / progress report, then hand Review/progress/results
+ * back to the stable recipient.
  *
- * In 多话题协作模式 the sub-bot lives in its own sub-topic, where the orchestrator
- * has no session; @-ing the orchestrator there would spawn a fresh, context-less
- * one (the reported #1 bug). Instead this routes the report INTO the orchestrator's own
- * thread (recorded by `botmux dispatch` in orchestrate-dispatch.json) and @-s the
- * orchestrator there, so its existing, context-rich session is the one that wakes.
- *
- * Coords: orchestrator open_id = the sub-bot session's quoteTargetSenderOpenId
- * (the dispatcher of the turn that opened this sub-topic); orchestrator thread =
- * the registry entry keyed by this sub-bot's session.rootMessageId (== the seed).
+ * Two paths:
+ * 1) Platform Issue 领取群：session 有活跃 issue binding → enqueue+write `in_review`
+ *    (待验收). This is what kickoff means by 「完成后执行 botmux report」.
+ * 2) 交接回报：recipient and placement are separate decisions. Registry-backed
+ *    multi-topic dispatches keep their exact orchestrator-session route. Ordinary
+ *    development handoffs inherit the executing turn's visible position with the
+ *    same turn-id gate as `botmux send`, so a later turn cannot reuse a stale
+ *    topic anchor.
  */
 async function cmdReport(rest: string[]): Promise<void> {
   if (rest.includes('--help') || rest.includes('-h')) {
-    console.log(`botmux report — 把子项目进展/完成回报给派活的主编排会话
+    console.log(`botmux report — 交付回报（issue 待验收 / 交接 Review·进展·结果并保持自然会话位置）
 
 用法:
-  botmux report "子项目X 完成，产出在 …"
-  botmux report --dispatch-root <om_seed> "子项目X 完成，产出在 …"
   botmux report --content-file <path>
+  botmux report --into <om_root> --content-file <path>
+  botmux report --top-level "子项目X 完成，产出在 …"
+  botmux report --dispatch-root <om_seed> "子项目X 完成，产出在 …"
+  botmux report "子项目X 完成，产出在 …" --legacy-dispatch
 
 说明:
-  「多话题协作模式」里你（子 bot）干完后不要在本话题 @ 主bot——本话题没有主bot的会话，
-  @ 会另起一个无上下文的新会话。本命令把回报发回主编排会话所在的话题、并 @ 主编排 bot，
-  使其带完整上下文继续聚合。仅在被 botmux dispatch 派活的子项目会话里可用。
+  1) 平台 Issue 领取群：本会话绑定了平台 issue 时，把 issue 推到「待验收」(in_review)。
+     kickoff 里「完成后执行 botmux report」指的就是这条路径。
+  2) 交接 / 协作回报：接收者与消息落点独立解析——接收者仍是原 Reviewer / orchestrator；
+     消息默认依次采用显式 --into / --top-level、dispatch 注册表、legacy dispatch 兼容回退、
+     当前轮次位置，最后才回退到会话默认位置。
+     当前轮次在群顶层就留在群顶层，在话题里就留在原话题；过期轮次的话题目标会被忽略。
+     dispatch 注册表命中时仍回到原主编排会话，并唤醒其已有上下文。
+     legacy / 跨机器 dispatch 没有本机注册表时仍回退群顶层，避免在子话题唤醒无上下文会话。
+
+  代码 Review 交接建议明确写出：首次 Review / 复审、MR、本轮改动、验证、风险，
+  以及希望 Reviewer 采取的动作。
 
 选项:
   --content-file <path>  从文件读取回报内容
+  --into <root_id>       显式发进指定话题（覆盖默认落点）
+  --top-level            显式发到当前群顶层（覆盖默认落点）
   --dispatch-root <id>   dispatch 注入的精确 seed；优先且不命中时 fail closed
+  --legacy-dispatch      legacy / 跨机器 dispatch 自动注入的兼容标记
   --session-id <id>      指定来源会话（默认自动推断）`);
     return;
   }
 
   process.env.SESSION_DATA_DIR ??= resolveDataDir();
   const sessionIdArg = argValue(rest, '--session-id');
+  if (flagPresentButValueMissing(rest, '--into')) {
+    console.error('--into 需要一个 om_ 话题根消息 id。');
+    process.exit(1);
+  }
+  const explicitInto = argValue(rest, '--into')?.trim();
+  if (explicitInto && !/^om_[A-Za-z0-9_-]{1,128}$/.test(explicitInto)) {
+    console.error('--into 必须是有效的 om_ 话题根消息 id。');
+    process.exit(1);
+  }
+  const explicitTopLevel = rest.includes('--top-level');
+  const legacyDispatch = rest.includes('--legacy-dispatch');
+  if (explicitInto && explicitTopLevel) {
+    console.error('--into 与 --top-level 不能同时使用。');
+    process.exit(1);
+  }
   if (flagPresentButValueMissing(rest, '--dispatch-root')) {
     console.error('--dispatch-root 需要一个 om_ 消息 id。');
     process.exit(1);
@@ -8947,7 +9062,7 @@ async function cmdReport(rest: string[]): Promise<void> {
     if (!existsSync(contentFile)) { console.error(`文件不存在: ${contentFile}`); process.exit(1); }
     content = readFileSync(contentFile, 'utf-8');
   } else {
-    const pos = positionals(rest);
+    const pos = positionals(rest, ['--top-level', '--legacy-dispatch']);
     content = pos.length ? pos.join(' ') : await readStdin();
   }
   if (!contentFile) rejectLikelyWindowsStdinMojibake(content);
@@ -8956,44 +9071,165 @@ async function cmdReport(rest: string[]): Promise<void> {
     process.exit(1);
   }
 
-  const sid = sessionIdArg ?? findAncestorSessionId();
+  // The process-tree marker carries the executing turn. Do not revive the
+  // spawn-time BOTMUX_TURN_ID here: it is stale in a long-lived or detached
+  // CLI and could make an old topic target look current.
+  const reportContext = resolveSessionContext(
+    resolveDataDir(),
+    process.env.BOTMUX_SESSION_ID,
+  );
+  const sid = sessionIdArg ?? reportContext?.sessionId;
   if (!sid) {
-    console.error('无法推断 session-id。请在被 dispatch 派活的会话里运行，或传 --session-id <id>。');
+    console.error('无法推断 session-id。请在当前 Botmux 会话（issue 领取群 / 被 dispatch 派活的会话）里运行，或传 --session-id <id>。');
     process.exit(1);
   }
+  const currentTurnId = reportContext?.sessionId === sid
+    ? reportContext.turnId
+    : undefined;
   const sessions = loadSessions();
   const s = sessions.get(sid);
   if (!s) { console.error(`未找到 session ${sid}`); process.exit(1); }
   if (!s.larkAppId) { console.error(`session ${sid} 缺少 larkAppId`); process.exit(1); }
 
-  // Resolve where the report goes + who to @. Same-machine: the dispatch registry
-  // (keyed by this sub-bot's thread root) carries the orchestrator's exact coords.
-  // CROSS-MACHINE: the orchestrator is on another machine, so its registry isn't
-  // on THIS one — resolveReportTarget falls back to this sub-bot's own session
-  // (report top-level into its chat, @ the dispatcher via creatorOpenId). See
-  // resolveReportTarget / Session.creatorOpenId.
+  // ── Issue Board 交付：绑定了平台 issue 的领取群 → 推 in_review（待验收）────────
+  // 优先于 dispatch 路径：领取群没有 creatorOpenId，走 dispatch 会硬失败。
+  // 显式 --dispatch-root 时仍走协作回报（避免 issue 群里误 dispatch 被静默改道）。
+  if (!explicitDispatchRoot) {
+    try {
+      const dataDir = resolveDataDir();
+      const { findActiveBindingForSession, reportIssueInReview } = await import('./services/issue-report.js');
+      const binding = findActiveBindingForSession(dataDir, {
+        chatId: s.chatId,
+        rootMessageId: s.rootMessageId,
+      });
+      if (binding) {
+        const { writeIssueStatus, findIssueById } = await import('./platform/issue-client.js');
+        const result = await reportIssueInReview(
+          {
+            dataDir,
+            writeStatus: (issueId, args) => writeIssueStatus(issueId, args) as any,
+            fetchIssue: (teamId, issueId) => findIssueById(teamId, issueId),
+          },
+          binding.anchorId,
+        );
+        if (!result.ok) {
+          if (result.reason === 'platform') {
+            console.error(
+              result.permanent
+                ? `issue 交付失败（${result.detail}）。平台明确拒绝，重试不会好转——去平台看看这条任务还在不在、领取有没有被收回。`
+                : `issue 交付失败（${result.detail}）。可稍后重试同一 botmux report。`,
+            );
+          } else if (result.reason === 'detached') {
+            // 重试没有意义：平台上这条 claim 已经不是本机的了。
+            console.error(
+              `issue 交付失败：平台上这个任务的领取已不属于本机（被回收、租约过期或已被别人领走），`
+              + `交付没有落地。去平台看看任务 ${binding.issueId} 的状态。`,
+            );
+          } else {
+            console.error(`issue 交付失败：${result.reason}`);
+          }
+          process.exit(1);
+        }
+        // 交付说明必须发回群里：平台的 /status 只收状态、不收正文（没有 note 字段），
+        // 这段文字在平台上无处可放。不发的话验收的人只看到状态变成「待验收」，完全不知道
+        // 交付了什么，而 stdout 只有 agent 自己看得到。
+        let delivered = false;
+        try {
+          const { registerBot, loadBotConfigs } = await import('./bot-registry.js');
+          await registerSelfFromCredFile();
+          try { for (const cfg of loadBotConfigs()) registerBot(cfg); } catch { /* 已注册/读不到 */ }
+          const { buildIssueDeliveryCard } = await import('./im/lark/issue-card.js');
+          const { issueDetailUrl } = await import('./services/issue-claim-flow.js');
+          const { sendMessage: larkSend } = await import('./im/lark/client.js');
+          const url = issueDetailUrl(binding.platformBaseUrl, result.issueId);
+          await larkSend(
+            s.larkAppId!,
+            binding.chatId ?? binding.anchorId,
+            buildIssueDeliveryCard({
+              issueId: result.issueId,
+              report: content,
+              alreadyInReview: result.alreadyInReview,
+              ...(url ? { issueUrl: url } : {}),
+            }),
+            'interactive',
+          );
+          delivered = true;
+        } catch (e: any) {
+          // 状态已经写成功了，播报失败不该让整条命令失败——但要如实说出来，
+          // 否则 agent 以为交付说明已经送达。
+          console.error(`交付说明未能发回群里（状态已是待验收）：${e?.message ?? e}`);
+        }
+        console.log(JSON.stringify({
+          success: true,
+          delivery: 'issue-in-review',
+          issueId: result.issueId,
+          anchorId: binding.anchorId,
+          alreadyInReview: result.alreadyInReview,
+          reportPostedToChat: delivered,
+          reportPreview: content.trim().slice(0, 200),
+        }));
+        return;
+      }
+    } catch (err: any) {
+      console.error(`issue 交付异常: ${err?.message ?? err}`);
+      process.exit(1);
+    }
+  }
+
+  // Recipient and visible placement are independent. creatorOpenId remains the
+  // stable Reviewer/orchestrator identity; current-turn routing controls where
+  // an ordinary report appears.
+  const reportRecipient = resolveReportRecipient({
+    creatorOpenId: s.creatorOpenId,
+    ownerOpenId: s.ownerOpenId,
+    quoteTargetSenderOpenId: s.quoteTargetSenderOpenId,
+  });
+  const turnReplyTarget = pickTurnReplyTarget(s, currentTurnId);
+  const validatedTurnReplyTarget = currentTurnId
+    && turnReplyTarget?.turnId === currentTurnId
+    ? turnReplyTarget
+    : undefined;
+
+  // Same-machine dispatches retain their exact orchestrator registry route.
+  // A chat-scope target may participate only when it belongs to this executing
+  // turn; historical aliases have no turn id and are intentionally ignored.
   const regPath = join(resolveDataDir(), 'orchestrate-dispatch.json');
   let reg: Record<string, any> = {};
   try { if (existsSync(regPath)) reg = JSON.parse(readFileSync(regPath, 'utf-8')); } catch { /* */ }
   const registryMatch = findDispatchRegistryEntry({
     registry: reg,
     dispatchRootId: explicitDispatchRoot,
+    sessionScope: s.scope ?? 'thread',
     rootMessageId: s.rootMessageId,
-    currentReplyTargetRootId: s.currentReplyTarget?.rootMessageId,
-    replyThreadAliases: s.replyThreadAliases,
+    currentReplyTargetRootId: validatedTurnReplyTarget?.rootMessageId,
+    currentReplyTargetTurnId: validatedTurnReplyTarget?.turnId,
+    currentTurnId,
   });
   if (explicitDispatchRoot && registryMatch?.key !== explicitDispatchRoot) {
     console.error(`精确 dispatch root ${explicitDispatchRoot} 在本机注册表中不存在；为避免串到其他 PM 会话，本次回报已停止。`);
     process.exit(1);
   }
   const entry = registryMatch?.entry as any;
+  const dispatchCoords = resolveReportTarget({
+    registryEntry: entry,
+    sessionChatId: s.chatId,
+  });
+  const registryTarget = registryMatch
+    ? dispatchCoords.orchScope !== 'chat' && dispatchCoords.orchRoot
+      ? { mode: 'thread' as const, rootMessageId: dispatchCoords.orchRoot }
+      : dispatchCoords.orchChatId
+        ? { mode: 'plain' as const, chatId: dispatchCoords.orchChatId }
+        : undefined
+    : undefined;
+  const hasExplicitPlacement = !!explicitInto || explicitTopLevel;
 
   // Same-host dispatches carry the exact source session. Inject the report into
   // that live PM context through its own daemon instead of trying to make the
   // resident app post into the PM's source chat (which may be a P2P the
   // resident app cannot access). The report body remains untrusted envelope
-  // data; only the fixed consolidation instruction is trusted.
-  if (entry?.orchAppId && entry?.orchSessionId) {
+  // data; only the fixed consolidation instruction is trusted. An explicit
+  // visible placement overrides this registry delivery by design.
+  if (!hasExplicitPlacement && entry?.orchAppId && entry?.orchSessionId) {
     const daemon = findDaemon(entry.orchAppId);
     if (!daemon) {
       console.error('主编排 Bot daemon 不在线；回报未发送，可稍后重试同一 botmux report。');
@@ -9044,24 +9280,42 @@ async function cmdReport(rest: string[]): Promise<void> {
       delivery: 'orchestrator-session',
       reportedTo: entry.orchSessionId,
       viaRegistry: true,
+      recipient: {
+        kind: 'orchestrator-session',
+        botAppId: entry.orchAppId,
+        sessionId: entry.orchSessionId,
+        ...(reportRecipient ? { openId: reportRecipient } : {}),
+      },
+      placementSource: 'dispatch-registry',
+      messageTarget: {
+        mode: 'orchestrator-session',
+        sessionId: entry.orchSessionId,
+        botAppId: entry.orchAppId,
+      },
       triggerId: triggerBody.triggerId,
     }));
     return;
   }
 
-  const tgt = resolveReportTarget({
-    registryEntry: entry,
-    sessionChatId: s.chatId,
-    creatorOpenId: s.creatorOpenId,
-    ownerOpenId: s.ownerOpenId,
-    quoteTargetSenderOpenId: s.quoteTargetSenderOpenId,
-  });
-  if (!tgt.orchOpenId || !tgt.orchChatId) {
+  if (!reportRecipient) {
     console.error(
-      '找不到主编排坐标：本会话没记录派活者（creatorOpenId/ownerOpenId 都空）或缺 chatId——大概不是被 botmux dispatch 派活的会话。\n' +
-      '若确需回报，请改用 `botmux send` 或显式 @ 对应的人/ bot。');
+      '找不到 Review / 回报接收者：本会话没有 creatorOpenId、ownerOpenId 或可用的历史发送者。\n' +
+      '若确需交接，请改用 `botmux send --mention <open_id:名字>` 明确指定接收者。');
     process.exit(1);
   }
+  const placement = resolveReportPlacement({
+    into: explicitInto,
+    topLevel: explicitTopLevel,
+    registryTarget,
+    legacyDispatch,
+    chatScope: (s.scope ?? 'thread') === 'chat',
+    chatId: s.chatId,
+    rootMessageId: s.rootMessageId,
+    replyTargetRootId: validatedTurnReplyTarget?.rootMessageId,
+    replyTargetTurnId: validatedTurnReplyTarget?.turnId,
+    replyTargetQuoteOnly: validatedTurnReplyTarget?.quoteOnly,
+    currentTurnId,
+  });
 
   const { registerBot, loadBotConfigs } = await import('./bot-registry.js');
   try { for (const cfg of loadBotConfigs()) registerBot(cfg); } catch { /* */ }
@@ -9069,25 +9323,36 @@ async function cmdReport(rest: string[]): Promise<void> {
   const { sendMessage, replyMessage } = await import('./im/lark/client.js');
   const appId = s.larkAppId!;
 
-  const paras = buildReportContent({ orchOpenId: tgt.orchOpenId, content });
+  const paras = buildReportContent({ orchOpenId: reportRecipient, content });
   const postJson = JSON.stringify({ zh_cn: { title: '', content: paras } });
 
   try {
     let msgId: string;
-    if (tgt.orchScope === 'chat' || !tgt.orchRoot) {
-      // Orchestrator at chat scope, or cross-machine fallback → post top-level
-      // into the chat (the sub-topic's chat = the orchestrator's chat).
-      msgId = await sendMessage(appId, tgt.orchChatId, postJson, 'post');
+    if (placement.target.mode === 'plain') {
+      msgId = await sendMessage(appId, placement.target.chatId, postJson, 'post');
     } else {
-      // Same-machine thread-scope orchestrator → reply into its thread so its
-      // existing context-rich session (anchored on orchRoot) receives the report.
-      msgId = await replyMessage(appId, tgt.orchRoot, postJson, 'post', true);
+      msgId = await replyMessage(
+        appId,
+        placement.target.rootMessageId,
+        postJson,
+        'post',
+        placement.target.mode === 'thread',
+      );
     }
+    const messageTarget = placement.target.mode === 'plain'
+      ? { mode: 'top-level', chatId: placement.target.chatId }
+      : { mode: placement.target.mode, rootMessageId: placement.target.rootMessageId };
     console.log(JSON.stringify({
       success: true,
-      reportedTo: tgt.orchRoot || tgt.orchChatId,
-      orchestrator: tgt.orchOpenId,
+      delivery: 'lark-message',
+      reportedTo: placement.target.mode === 'plain'
+        ? placement.target.chatId
+        : placement.target.rootMessageId,
+      orchestrator: reportRecipient,
+      recipient: { kind: 'mention', openId: reportRecipient },
       viaRegistry: !!registryMatch,
+      placementSource: placement.source,
+      messageTarget,
       messageId: msgId,
     }));
   } catch (err: any) {

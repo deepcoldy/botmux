@@ -15,12 +15,13 @@ import { scanProjects, scanMultipleProjects, describeProjectDir } from '../servi
 import { createRepoWorktree, pushWorktreeBranch } from '../services/git-worktree.js';
 import { worktreeSlugFromContextAI } from '../services/worktree-slug-ai.js';
 import { resolvePairedSpawnBackendType } from './persistent-backend.js';
-import { buildRepoSelectCard, buildAdoptSelectCard, buildCodexAppThreadSelectCard, buildSlashListCard, getCliDisplayName, buildConfigCard, buildAdoptBlockedCard } from '../im/lark/card-builder.js';
+import { buildRepoSelectCard, buildAdoptSelectCard, buildCodexAppThreadSelectCard, buildSlashListCard, getCliDisplayName, buildConfigCard, buildForkPanelCard, buildAdoptBlockedCard } from '../im/lark/card-builder.js';
 import { handleDashboardCommand } from './dashboard-command/index.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import type { CliId, ResumableSession } from '../adapters/cli/types.js';
-import { deleteMessage, sendMessage, sendUserMessage, replyMessage, listChatBotMembers, resolveUserUnionId, getChatModeStrict, uploadFile, UserTokenMissingError } from '../im/lark/client.js';
-import { chatAppLink, normalizeBrand } from '../im/lark/lark-hosts.js';
+import { resolveCliRuntime, runtimeInstallationKey } from '../adapters/cli/runtime.js';
+import { deleteMessage, sendMessage, sendUserMessage, replyMessage, listChatBotMembers, resolveUserUnionId, getChatModeStrict, getMessageThreadId, uploadFile, UserTokenMissingError } from '../im/lark/client.js';
+import { chatAppLink, threadAppLink, normalizeBrand } from '../im/lark/lark-hosts.js';
 import { claimPairing } from '../services/pairing-store.js';
 import { logger } from '../utils/logger.js';
 import { scheduleTimeZone } from '../utils/timezone.js';
@@ -86,7 +87,8 @@ import {
   writeRoleProfileEntry,
 } from '../services/role-profile-store.js';
 import type { LarkMessage, DaemonToWorker, CodexAppTurnInput } from '../types.js';
-import { activeSessionKey, sessionKey, sessionAnchorId, markRepoCardConsumed } from './types.js';
+import type { ResolvedSender } from '../im/lark/identity-cache.js';
+import { activeSessionKey, sessionKey, sessionAnchorId, markRepoCardConsumed, claimCurrentRepoCard } from './types.js';
 import type { DaemonSession } from './types.js';
 import { t, localeForBot, type Locale } from '../i18n/index.js';
 import { runSkillsImCommand } from './skills/im-command.js';
@@ -95,6 +97,10 @@ import { updateSessionTitle } from './session-title.js';
 import { requestAgentSessionRename } from './session-rename.js';
 import { hasProtectedSessionMutationOwnership } from './session-mutation-guard.js';
 import { withBotTurnMutation } from './bot-turn-mutation-gate.js';
+import {
+  configuredRuntimeDisplayName,
+  sessionConfiguredRuntimeDisplayName,
+} from './cli-runtime-display.js';
 
 // ─── Exported constants ──────────────────────────────────────────────────────
 
@@ -114,7 +120,7 @@ export { DAEMON_COMMANDS, PASSTHROUGH_COMMANDS };
  * card buttons routable, but for these that record is a phantom conversation
  * that pollutes the dashboard's session list. Handle them without a session.
  */
-export const SESSIONLESS_DAEMON_COMMANDS = new Set(['/group', '/g', '/list-slash-command', '/slash', '/botconfig', '/dashboard', '/skills', '/vc-auth', '/watch-comment']);
+export const SESSIONLESS_DAEMON_COMMANDS = new Set(['/group', '/g', '/list-slash-command', '/slash', '/botconfig', '/dashboard', '/skills', '/vc-auth', '/watch-comment', '/issue']);
 
 const SLASH_GROUP_NAME_MAX_UTF16_LENGTH = 50;
 
@@ -136,15 +142,14 @@ export function formatSlashGroupName(name: string, prefix = ''): string {
 
 /**
  * Daemon commands that operate on an ALREADY-EXISTING session and must never
- * pre-create one. `/rename` renames the current session — with no session there
- * is nothing to rename, so the daemon routes must skip their generic
+ * pre-create one. With no real session to operate on, the daemon routes must skip their generic
  * "createSession + activeSessions.set(worker:null)" pre-create block and let
- * handleCommand's `!ds` branch reply no_active_session. Without this, `/rename`
+ * handleCommand's `!ds` branch reply no_active_session. Without this, one of these commands
  * in a brand-new topic (or a thread with no session) would spawn a phantom
- * worker:null session just to rename it, polluting the dashboard. (Same class
+ * worker:null session just to handle it, polluting the dashboard. (Same class
  * of fix as the `/card` / `/term` special cases in daemon.ts.)
  */
-export const EXISTING_SESSION_ONLY_DAEMON_COMMANDS = new Set(['/rename']);
+export const EXISTING_SESSION_ONLY_DAEMON_COMMANDS = new Set(['/rename', '/fork', '/forklist']);
 
 export function resolveAdapterDefaultPassthroughCommands(larkAppId?: string): string[] {
   if (!larkAppId) return [];
@@ -193,7 +198,7 @@ export interface SlashCommandInvocation {
   content: string;
 }
 
-const MULTILINE_COMMANDS = new Set(['/schedule', '/role']);
+const MULTILINE_COMMANDS = new Set(['/schedule', '/role', '/fork']);
 
 // `validateWorkingDir` now lives in ./working-dir.js (leaf module the CLI can
 // import without the daemon graph); re-exported here for existing callers.
@@ -352,6 +357,13 @@ function botDisplayName(larkAppId: string): string {
   } catch {
     return larkAppId;
   }
+}
+
+function sessionCliDisplayName(ds: DaemonSession): string {
+  const botCfg = getBot(ds.larkAppId).config;
+  const configured = sessionConfiguredRuntimeDisplayName(ds.session, botCfg.cliRuntime);
+  if (configured) return configured;
+  return getCliDisplayName(ds.session.cliId ?? botCfg.cliId);
 }
 
 function formatUptime(ms: number): string {
@@ -1408,7 +1420,7 @@ export async function handleCommand(
             await sessionReply(rootId, t('cmd.session.transfer_in_progress', undefined, loc));
             break;
           }
-          const cliName = getCliDisplayName(getBot(ds.larkAppId).config.cliId);
+          const cliName = sessionCliDisplayName(ds);
           requestSessionRestart(ds, {
             source: 'slash',
             notify: async status => {
@@ -1508,7 +1520,7 @@ export async function handleCommand(
           break;
         }
         const agentSync = requestAgentSessionRename(ds, updated.title);
-        const cliName = getCliDisplayName(agentSync.cliId ?? ds.session.cliId ?? 'claude-code');
+        const cliName = sessionCliDisplayName(ds);
         if (agentSync.status === 'requested') {
           await sessionReply(rootId, t('cmd.rename.updated_requested', { title: updated.title, cliName }, loc));
         } else if (agentSync.status === 'not_running') {
@@ -1561,7 +1573,8 @@ export async function handleCommand(
             const hasBufferedInput = pendingPrompt.trim().length > 0
               || current.pendingCodexAppText !== undefined
               || (current.pendingAttachments?.length ?? 0) > 0
-              || (current.pendingFollowUps?.length ?? 0) > 0;
+              || (current.pendingFollowUps?.length ?? 0) > 0
+              || current.pendingChatContext !== undefined;
             let wrappedInput: { content: string; codexAppInput?: CodexAppTurnInput } | undefined;
             if (hasBufferedInput) {
               const { buildNewTopicCliInput: buildInput, ensureSessionWhiteboard, getAvailableBots } = await import('./session-manager.js');
@@ -1594,6 +1607,7 @@ export async function handleCommand(
                   codexAppMessageContext: current.pendingCodexAppMessageContext,
                   codexAppFollowUps: current.pendingCodexAppFollowUps,
                   codexAppFollowUpContexts: current.pendingCodexAppFollowUpContexts,
+                  chatContext: current.pendingChatContext,
                 },
               );
             }
@@ -1647,6 +1661,7 @@ export async function handleCommand(
             current.pendingCodexAppText = undefined;
             current.pendingCodexAppApplicationContext = undefined;
             current.pendingCodexAppMessageContext = undefined;
+            current.pendingChatContext = undefined;
             current.pendingAttachments = undefined;
             current.pendingMentions = undefined;
             current.pendingSubstituteTrigger = undefined;
@@ -2034,23 +2049,53 @@ export async function handleCommand(
           const alive = ds.worker && !ds.worker.killed;
           const idle = formatUptime(Date.now() - ds.lastMessageAt);
           const termUrl = ds.workerPort ? buildTerminalUrl(ds) : '-';
+          const botCfg = getBot(ds.larkAppId).config;
+          const migratedFrozenRuntime = ds.session.agentFrozen && !ds.session.cliRuntime
+            ? resolveCliRuntime({
+                cliId: ds.session.cliId ?? botCfg.cliId,
+                cliPathOverride: ds.session.cliPathOverride,
+                context: 'status session cliRuntime',
+              })
+            : undefined;
+          const effectiveRuntime = ds.session.cliRuntime
+            ?? migratedFrozenRuntime
+            ?? (!ds.session.agentFrozen ? botCfg.cliRuntime : undefined);
+          const effectivePath = ds.session.agentFrozen
+            ? ds.session.cliPathOverride
+            : ds.session.cliPathOverride ?? botCfg.cliPathOverride;
+          const runtimeName = configuredRuntimeDisplayName(effectiveRuntime)
+            ?? getCliDisplayName(ds.session.cliId ?? botCfg.cliId);
+          const latestRuntimeVersion = getCurrentCliVersion(runtimeInstallationKey({
+            cliId: ds.session.cliId ?? botCfg.cliId,
+            cliRuntime: effectiveRuntime,
+            cliPathOverride: effectivePath,
+          }));
           const lines = [
             `Session: ${ds.session.sessionId}`,
             `Status: ${alive ? t('cmd.status.running', undefined, loc) : t('cmd.status.waiting', undefined, loc)}`,
             `Terminal: ${termUrl}`,
             `CWD: ${getSessionWorkingDir(ds)}`,
-            `${getCliDisplayName(getBot(ds.larkAppId).config.cliId)}: v${ds.cliVersion}${ds.cliVersion !== getCurrentCliVersion() ? ` (latest: v${getCurrentCliVersion()})` : ''}`,
+            `${runtimeName}: v${ds.cliVersion}${latestRuntimeVersion !== 'unknown' && ds.cliVersion !== latestRuntimeVersion ? ` (latest: v${latestRuntimeVersion})` : ''}`,
             ...(alive ? [`Uptime: ${formatUptime(Date.now() - ds.spawnedAt)}`] : []),
             `Last message: ${idle} ago`,
             `Active sessions: ${getActiveCount()}`,
           ];
           await sessionReply(rootId, lines.join('\n'));
         } else {
-          const fallbackCliName = larkAppId ? getCliDisplayName(getBot(larkAppId).config.cliId) : 'CLI';
+          const fallbackCfg = larkAppId ? getBot(larkAppId).config : undefined;
+          const fallbackCliName = configuredRuntimeDisplayName(fallbackCfg?.cliRuntime)
+            ?? (fallbackCfg ? getCliDisplayName(fallbackCfg.cliId) : 'CLI');
+          const fallbackVersion = fallbackCfg
+            ? getCurrentCliVersion(runtimeInstallationKey({
+                cliId: fallbackCfg.cliId,
+                cliRuntime: fallbackCfg.cliRuntime,
+                cliPathOverride: fallbackCfg.cliPathOverride,
+              }))
+            : getCurrentCliVersion();
           await sessionReply(rootId, t('cmd.status.fallback_no_session', {
             count: getActiveCount(),
             cliName: fallbackCliName,
-            version: getCurrentCliVersion(),
+            version: fallbackVersion,
           }, loc));
         }
         break;
@@ -2092,6 +2137,45 @@ export async function handleCommand(
         }
         await handleConfigCommand(message, rootId, appId, deps);
         logger.info(`[${logTag}] Config command handled`);
+        break;
+      }
+
+      // Issue Board：`/issue` 出看板卡片，后续都在卡片上就地操作（见 issue-command）。
+      // 权限门（allowedUsers + invoker lock）在 handler 里，命令入口和每次回调各跑一遍。
+      case '/issue': {
+        const appId = larkAppId ?? ds?.larkAppId;
+        if (!appId) {
+          await sessionReply(rootId, t('cmd.config.no_bot', undefined, loc));
+          break;
+        }
+        const sub = message.content.replace(/^\/issue\s*/i, '').trim().split(/\s+/, 1)[0]?.toLowerCase();
+        const { handleIssueCommand, handleIssueDone, handleIssueRelease, handleIssueStatus } =
+          await import('../im/lark/issue-command.js');
+        const { buildIssueCommandDeps } = await import('../im/lark/issue-command-deps.js');
+
+        // 这三个子命令都在**领取时建出来的那个群里**发，锚点从当前会话推。两个候选按
+        // sessionAnchorId 的语义给（拉群 → chatId，话题 → rootMessageId），由 handler 依次试。
+        const anchors = [message.chatId, rootId];
+        if (sub === 'release' || sub === 'done') {
+          const handler = sub === 'done' ? handleIssueDone : handleIssueRelease;
+          const rel = await handler(appId, message.senderId, anchors, buildIssueCommandDeps());
+          await sessionReply(rootId, rel.toast.content);
+          logger.info(`[${logTag}] Issue ${sub} handled: ${rel.toast.type}`);
+          break;
+        }
+
+        if (sub === 'status') {
+          const st = await handleIssueStatus(appId, message.senderId, anchors, buildIssueCommandDeps());
+          if ('card' in st) await sessionReply(rootId, st.card, 'interactive');
+          else await sessionReply(rootId, st.toast.content);
+          logger.info(`[${logTag}] Issue status handled: ${'card' in st ? 'card' : 'toast'}`);
+          break;
+        }
+
+        const r = await handleIssueCommand(appId, message.senderId, buildIssueCommandDeps());
+        if ('card' in r) await sessionReply(rootId, r.card, 'interactive');
+        else await sessionReply(rootId, r.toast.content);
+        logger.info(`[${logTag}] Issue command handled: ${'card' in r ? 'card' : 'toast'}`);
         break;
       }
 
@@ -2506,7 +2590,7 @@ export async function handleCommand(
         }
         if (ds?.adoptedFrom) {
           const adopted = ds.adoptedFrom;
-          const cliName = getCliDisplayName(adopted.cliId ?? 'claude-code');
+          const cliName = sessionCliDisplayName(ds);
           const project = adopted.cwd ? (adopted.cwd.split('/').pop() || adopted.cwd) : '';
           const label = project ? `${cliName} · ${project}` : cliName;
           await sessionReply(rootId, t('cmd.adopt.already_adopted', { label, pane: adoptTargetLabel(adopted) }, loc));
@@ -2539,6 +2623,7 @@ export async function handleCommand(
           activeSessions,
           discoverResumableSessionsForBot,
           ADOPT_RESUME_LIMIT,
+          botCfgForAdopt?.cliRuntime?.executable,
         );
         const sessions = candidates.sessions;
         const resumable = candidates.resumable;
@@ -2598,6 +2683,9 @@ export async function handleCommand(
           message.senderId,
           candidates.resumeLimit,
           botCliId,
+          ds
+            ? sessionConfiguredRuntimeDisplayName(ds.session, getBot(ds.larkAppId).config.cliRuntime)
+            : configuredRuntimeDisplayName(botCfgForAdopt?.cliRuntime),
         );
         await sessionReply(rootId, cardJson, 'interactive');
         break;
@@ -3422,6 +3510,238 @@ export async function handleCommand(
         break;
       }
 
+      case '/fork': {
+        // Session fork (Bot 分身): non-destructive copy of a running session
+        // into a SECOND independent session at a new anchor; source untouched.
+        // `/fork <task>` hosts it in a new sub-topic of the same topic group;
+        // `/fork --create <name>` keeps the existing new-group destination.
+        const argsLine = message.content.replace(/^\/fork\s*/i, '').trim();
+        const forkAppId = larkAppId ?? ds?.larkAppId;
+        if (!forkAppId) {
+          await sessionReply(rootId, t('cmd.fork.no_bot', undefined, loc));
+          break;
+        }
+        if (!ds) {
+          await sessionReply(rootId, t('cmd.fork.no_session', undefined, loc));
+          break;
+        }
+        const forkSenderOpenId = message.senderId;
+        if (!forkSenderOpenId) {
+          await sessionReply(rootId, t('cmd.fork.no_sender', undefined, loc));
+          break;
+        }
+        // Owner-only.
+        if (ds.session.ownerOpenId && ds.session.ownerOpenId !== forkSenderOpenId) {
+          await sessionReply(rootId, t('cmd.fork.not_owner', undefined, loc));
+          break;
+        }
+        // Capability gate — refuse non-forkable backends up front with a clear,
+        // typed message (mirrors the design doc §4 refusal). Cheap check before
+        // we create any group.
+        const { isForkCapableSession } = await import('./worker-pool.js');
+        if (!isForkCapableSession(ds)) {
+          const cliName = getCliDisplayName((ds.session.cliId ?? getBot(forkAppId).config.cliId ?? 'claude-code') as CliId);
+          await sessionReply(rootId, t('cmd.fork.unsupported_backend', { cli: cliName }, loc));
+          break;
+        }
+
+        // Front guards (fork needs a clean, real, idle source — same as relay).
+        // These MUST run before creating either a topic root or a new group.
+        if (ds.session.adoptedFrom) {
+          await sessionReply(rootId, t('cmd.fork.adopt_not_forkable', undefined, loc));
+          break;
+        }
+        if (ds.pendingRepo) {
+          await sessionReply(rootId, t('cmd.fork.not_started_yet', undefined, loc));
+          break;
+        }
+        // Real, resumable source session? A bare /fork scratch (worker:null, no
+        // persisted CLI markers) is not forkable — most commonly this fires when
+        // /fork was invoked at the group top-level while the session lives in a
+        // 话题 (thread-scope). Refuse BEFORE creating any group.
+        const { isRelayableRealSession: forkIsRealSession } = await import('./worker-pool.js');
+        if (!forkIsRealSession(ds)) {
+          await sessionReply(rootId, t('cmd.fork.no_source_here', undefined, loc));
+          break;
+        }
+        // Idle check up front — mid-turn source can't be forked cleanly.
+        const forkSt = ds.lastScreenStatus;
+        if (ds.worker && !ds.worker.killed && forkSt !== 'idle' && forkSt !== 'limited') {
+          await sessionReply(rootId, t('cmd.fork.mid_turn', undefined, loc));
+          break;
+        }
+
+        if (!/^--create\b/i.test(argsLine)) {
+          if (!argsLine) {
+            await sessionReply(rootId, t('cmd.fork.subtopic_usage', undefined, loc));
+            break;
+          }
+          if (ds.scope !== 'thread' || !ds.session.rootMessageId?.startsWith('om_')) {
+            await sessionReply(rootId, t('cmd.fork.subtopic_thread_only', undefined, loc));
+            break;
+          }
+          let chatMode: string | undefined;
+          try {
+            chatMode = await getChatModeStrict(forkAppId, ds.chatId);
+          } catch {
+            // Treat an unknown mode as unsupported: sending a top-level message
+            // to a regular group would not create the isolated topic we promise.
+          }
+          if (chatMode !== 'topic') {
+            await sessionReply(rootId, t('cmd.fork.subtopic_thread_only', undefined, loc));
+            break;
+          }
+
+          const result = await startForkSubtopicSession(argsLine, ds, message, forkAppId);
+          if (!result.ok) {
+            const errKey = result.error === 'worker_busy' ? 'cmd.fork.mid_turn'
+              : result.error === 'adopt_not_forkable' ? 'cmd.fork.adopt_not_forkable'
+              : result.error === 'fork_unsupported_backend' ? 'cmd.fork.unsupported_backend'
+              : result.error === 'not_started_yet' ? 'cmd.fork.not_started_yet'
+              : undefined;
+            if (errKey === 'cmd.fork.unsupported_backend') {
+              const cliName = getCliDisplayName((ds.session.cliId ?? getBot(forkAppId).config.cliId ?? 'claude-code') as CliId);
+              await sessionReply(rootId, t(errKey, { cli: cliName }, loc));
+            } else if (errKey) {
+              await sessionReply(rootId, t(errKey, undefined, loc));
+            } else {
+              await sessionReply(rootId, t('cmd.fork.failed', { error: result.error }, loc));
+            }
+            if (result.orphanTopic) {
+              await sessionReply(rootId, t('cmd.fork.orphan_topic_left', undefined, loc));
+            }
+            break;
+          }
+          await sessionReply(rootId, t('cmd.fork.subtopic_created', { link: result.link }, loc));
+          logger.info(`[${logTag}] /fork sub-topic completed: child=${result.childSessionId.substring(0, 8)} anchor=${result.anchorId.substring(0, 12)} (source ${ds.session.sessionId.substring(0, 8)} untouched)`);
+          break;
+        }
+
+        // ── /fork --create <群名> @bot ──────────────────────────────────────
+        const afterFlag = argsLine.replace(/^--create\s*/i, '').trim();
+
+        // Resolve the bot to invite into the new group. Fork copies THIS
+        // session's transcript, so the child MUST run the same bot as the
+        // source — i.e. the invited bot is always this bot. Therefore:
+        //   • no @mention → default to the current bot (the common "fork myself
+        //     to a new group" case — no need to @ the bot you're already talking to);
+        //   • an explicit @mention → must resolve to THIS bot, else refuse.
+        const forkSourceIsP2p = ds.chatType === 'p2p';
+        const targetBotAppId = forkAppId;
+        let targetBotName = botDisplayName(forkAppId);
+        if (!forkSourceIsP2p) {
+          const forkMentions = message.mentions ?? [];
+          const knownBotNames = globalKnownBotNames();
+          const forkBotMentions = forkMentions.filter(m => m.name && knownBotNames.has(m.name.toLowerCase()));
+          // Only validate WHEN the user explicitly @'d a bot. An explicit
+          // mention that resolves to a DIFFERENT bot is a real error (fork can't
+          // hand this session's transcript to another CLI). No mention → just
+          // use the current bot.
+          if (forkBotMentions.length > 0) {
+            const firstBot = forkBotMentions[0];
+            const myOpenId = getBotOpenId(forkAppId);
+            const myName = getBot(forkAppId).botName?.toLowerCase();
+            const mentionIsThisBot =
+              (!!myOpenId && firstBot.openId === myOpenId) ||
+              (!myOpenId && !!myName && firstBot.name?.toLowerCase() === myName);
+            if (!mentionIsThisBot) {
+              await sessionReply(rootId, t('cmd.fork.wrong_bot', undefined, loc));
+              break;
+            }
+          }
+        }
+
+        // Group name = first non-empty line after --create (mention text stripped).
+        let forkRawArgs = afterFlag;
+        for (const m of (message.mentions ?? [])) {
+          if (m.name) forkRawArgs = forkRawArgs.split(`@${m.name}`).join(' ');
+        }
+        const forkFirstLine = forkRawArgs.split(/\r?\n/).map(s => s.trim()).find(Boolean) ?? '';
+        const FORK_MAX_NAME = 50;
+        let forkGroupName: string;
+        if (forkFirstLine) {
+          forkGroupName = forkFirstLine.length > FORK_MAX_NAME ? forkFirstLine.slice(0, FORK_MAX_NAME) + '…' : forkFirstLine;
+        } else {
+          const src = ds.session.title || ds.session.sessionId.substring(0, 8);
+          forkGroupName = `🔱 ${src}`.slice(0, FORK_MAX_NAME);
+        }
+
+        // Create the new chat (single bot + the invoking user).
+        let forkChatId: string;
+        let forkInviteLink: string;
+        try {
+          const { createGroupWithBots } = await import('../services/group-creator.js');
+          const result = await createGroupWithBots({
+            creatorLarkAppId: forkAppId,
+            larkAppIds: [targetBotAppId],
+            name: forkGroupName,
+            userOpenIds: [forkSenderOpenId],
+            transferOwnerTo: forkSenderOpenId,
+          });
+          forkChatId = result.chatId;
+          const applink = chatAppLink(result.chatId, normalizeBrand(getBot(forkAppId).config.brand));
+          forkInviteLink = result.shareLink ?? applink;
+        } catch (err: any) {
+          logger.error(`[${logTag}] /fork --create: createGroup failed: ${err?.message ?? err}`);
+          await sessionReply(rootId, t('cmd.fork.failed', { error: err?.message ?? String(err) }, loc));
+          break;
+        }
+
+        // Fork the session into the new chat (chat-scope, group). The new chat
+        // is empty by construction, so no target-anchor conflict. Source is
+        // never touched.
+        const { forkSession } = await import('./worker-pool.js');
+        const forkResult = await forkSession(ds.session.sessionId, forkChatId, forkChatId, 'group', 'chat');
+        if (!forkResult.ok) {
+          // Residual-orphan cleanup: the front guards already ran before
+          // createGroupWithBots, so this only fires on a narrow TOCTOU race
+          // (source went busy / closed in the sub-second between guard and
+          // fork). Best-effort disband the just-created empty group so a failed
+          // fork never leaves an orphan chat. May fail if ownership already
+          // transferred to the user (transferOwnerTo) — then we just tell them.
+          let orphanCleaned = false;
+          try {
+            const { disbandChat } = await import('../services/groups-store.js');
+            const dis = await disbandChat(forkAppId, forkChatId);
+            orphanCleaned = dis.ok;
+            if (!dis.ok) logger.warn(`[${logTag}] /fork --create: orphan group ${forkChatId} disband failed: ${dis.error}`);
+          } catch (e: any) {
+            logger.warn(`[${logTag}] /fork --create: orphan group ${forkChatId} disband threw: ${e?.message ?? e}`);
+          }
+          const errKey = forkResult.error === 'worker_busy' ? 'cmd.fork.mid_turn'
+            : forkResult.error === 'adopt_not_forkable' ? 'cmd.fork.adopt_not_forkable'
+            : forkResult.error === 'fork_unsupported_backend' ? 'cmd.fork.unsupported_backend'
+            : forkResult.error === 'not_started_yet' ? 'cmd.fork.not_started_yet'
+            : undefined;
+          if (errKey === 'cmd.fork.unsupported_backend') {
+            const cliName = getCliDisplayName((ds.session.cliId ?? getBot(forkAppId).config.cliId ?? 'claude-code') as CliId);
+            await sessionReply(rootId, t(errKey, { cli: cliName }, loc));
+          } else if (errKey) {
+            await sessionReply(rootId, t(errKey, undefined, loc));
+          } else {
+            await sessionReply(rootId, t('cmd.fork.failed', { error: forkResult.error }, loc));
+          }
+          if (!orphanCleaned) {
+            await sessionReply(rootId, t('cmd.fork.orphan_group_left', { name: forkGroupName }, loc));
+          }
+          logger.warn(`[${logTag}] /fork --create: forkSession failed (${forkResult.error}); new chat ${forkChatId} ${orphanCleaned ? 'disbanded' : 'LEFT (disband failed)'}`);
+          break;
+        }
+
+        await sessionReply(rootId, t('cmd.fork.created', { name: forkGroupName, link: forkInviteLink }, loc));
+        logger.info(`[${logTag}] /fork --create completed: chat=${forkChatId} child=${forkResult.childSessionId.substring(0, 8)} bot=${targetBotAppId} (source ${ds.session.sessionId.substring(0, 8)} untouched)`);
+        break;
+      }
+
+      case '/forklist': {
+        if (!ds) {
+          await sessionReply(rootId, t('cmd.fork.no_session', undefined, loc));
+          break;
+        }
+        await upsertForkPanelCard(ds, loc, { allowEmpty: true });
+        break;
+      }
+
       case '/card': {
         // Existing-session path. New topics route /card via handleCardCommand at
         // the router (so no phantom session is created). off/on work without a
@@ -3460,7 +3780,9 @@ export async function handleCommand(
           ? getBot(ds.larkAppId).config
           : (larkAppId ? getBot(larkAppId).config : getAllBots()[0]?.config);
         const cliId = botCfg?.cliId ?? 'claude-code';
-        const cliName = getCliDisplayName(cliId);
+        const cliName = ds
+          ? sessionCliDisplayName(ds)
+          : configuredRuntimeDisplayName(botCfg?.cliRuntime) ?? getCliDisplayName(cliId);
         const workingDir = getSessionWorkingDir(ds);
         const builtin = [...PASSTHROUGH_COMMANDS];
         const adapterDefaults = resolveAdapterDefaultPassthroughCommands(larkAppId);
@@ -3496,7 +3818,10 @@ export async function handleCommand(
       case '/help': {
         const helpAppId = ds?.larkAppId ?? larkAppId;
         const botCfg = ds ? getBot(ds.larkAppId).config : (helpAppId ? getBot(helpAppId).config : getAllBots()[0]?.config);
-        const cliName = getCliDisplayName(botCfg?.cliId ?? 'claude-code');
+        const cliName = ds
+          ? sessionCliDisplayName(ds)
+          : configuredRuntimeDisplayName(botCfg?.cliRuntime)
+            ?? getCliDisplayName(botCfg?.cliId ?? 'claude-code');
         const passthroughCommands = [...resolvePassthroughCommands(helpAppId)];
         const help = [
           t('help.heading_session', undefined, loc),
@@ -3513,6 +3838,7 @@ export async function handleCommand(
           t('help.card', undefined, loc),
           t('help.term', undefined, loc),
           t('help.dashboard', undefined, loc),
+          t('help.issue', undefined, loc),
           t('help.insight', undefined, loc),
           t('help.subscribe_doc', undefined, loc),
           t('help.watch_comment', undefined, loc),
@@ -3541,6 +3867,8 @@ export async function handleCommand(
           t('help.introduce', undefined, loc),
           t('help.relay', undefined, loc),
           t('help.relay_create', undefined, loc),
+          t('help.fork', undefined, loc),
+          t('help.forklist', undefined, loc),
           '',
           t('help.heading_login', undefined, loc),
           t('help.login', undefined, loc),
@@ -3777,7 +4105,11 @@ export async function startAdoptSession(
   // bridge/adopt session. Covers both real host-process adopt entries
   // (`/adopt <pane>` and the adopt_select card, which both route here). Checks
   // the live bot flag AND the session's frozen sandbox decision (union).
-  if (adoptSandboxBlocked(getBot(ds.larkAppId ?? larkAppId).config, ds.session)) {
+  const adoptBotCfg = getBot(ds.larkAppId ?? larkAppId).config;
+  const adoptRuntimeExecutable = ds.session.agentFrozen
+    ? ds.session.cliRuntime?.source === 'configured' ? ds.session.cliRuntime.executable : undefined
+    : adoptBotCfg.cliRuntime?.executable;
+  if (adoptSandboxBlocked(adoptBotCfg, ds.session)) {
     await sessionReply(sessionAnchorId(ds), t('cmd.adopt.sandbox_blocked', undefined, loc));
     return;
   }
@@ -3787,8 +4119,14 @@ export async function startAdoptSession(
   if (await blockTakeoverWhilePendingRepo(ds, sessionReply)) return;
 
   const valid = zellij
-    ? validateZellijAdoptTarget(target.zellijSession, target.zellijPaneId, target.cliPid, target.cliId)
-    : validateAdoptTarget(target);
+    ? validateZellijAdoptTarget(
+      target.zellijSession,
+      target.zellijPaneId,
+      target.cliPid,
+      target.cliId,
+      adoptRuntimeExecutable,
+    )
+    : validateAdoptTarget(target, adoptRuntimeExecutable);
   if (!valid) {
     await sessionReply(sessionAnchorId(ds), t('cmd.adopt.target_exited', undefined, loc));
     return;
@@ -3843,8 +4181,8 @@ export async function startAdoptSession(
     return;
   }
 
-  const cliName = getCliDisplayName(target.cliId);
-  await sessionReply(adopted.anchor, t('cmd.adopt.success', { cliName, project, pane }, loc));
+  const cliName = sessionCliDisplayName(ds);
+  await sessionReply(sessionAnchorId(ds), t('cmd.adopt.success', { cliName, project, pane }, loc));
 }
 
 /** Cap on resume candidates surfaced by the /adopt picker. Kept at the legacy
@@ -3940,6 +4278,215 @@ export async function startResumeImportSession(
     return;
   }
 
-  const cliName = getCliDisplayName(getBot(ds.larkAppId).config.cliId);
-  await sessionReply(resumed.anchor, t('cmd.adopt.resume_success', { cliName, project, title: target.title || target.cliSessionId.slice(0, 8) }, loc));
+  const cliName = sessionCliDisplayName(ds);
+  await sessionReply(sessionAnchorId(ds), t('cmd.adopt.resume_success', { cliName, project, title: target.title || target.cliSessionId.slice(0, 8) }, loc));
+}
+
+type ForkSubtopicResult =
+  | { ok: true; childSessionId: string; anchorId: string; link: string }
+  | { ok: false; error: string; orphanTopic: boolean };
+
+/** Fork the current session into a new sub-topic of the same topic group.
+ *  The session copy itself stays in worker-pool's generic `forkSession()`;
+ *  this layer only creates the Lark destination, supplies the first task turn,
+ *  and records display-only lineage for the parent panel. */
+export async function startForkSubtopicSession(
+  taskText: string,
+  parentDs: DaemonSession,
+  message: LarkMessage,
+  larkAppId?: string,
+): Promise<ForkSubtopicResult> {
+  const appId = parentDs.larkAppId ?? larkAppId;
+  if (!appId) return { ok: false, error: 'missing_lark_app_id', orphanTopic: false };
+
+  const loc: Locale = localeForBot(appId);
+  const bot = getBot(appId);
+  const botCfg = bot.config;
+  const parentSession = parentDs.session;
+  const chatId = parentDs.chatId;
+  const brand = normalizeBrand(botCfg.brand);
+  const taskTitle = taskText.split(/\r?\n/).map(line => line.trim()).find(Boolean)?.slice(0, 60)
+    ?? taskText.slice(0, 60);
+  const senderIsBot = message.senderType === 'app' || message.senderType === 'bot';
+  const triggerSender: ResolvedSender = {
+    openId: message.senderId,
+    type: senderIsBot ? 'bot' : 'user',
+    ...(message.senderName ? { name: message.senderName } : {}),
+  };
+  let anchorId: string | undefined;
+
+  const recallAnchor = async (): Promise<boolean> => {
+    if (!anchorId) return true;
+    try {
+      return await deleteMessage(appId, anchorId);
+    } catch (err) {
+      logger.warn(
+        `[${parentSession.sessionId.substring(0, 8)}] /fork sub-topic recall failed: `
+        + `${err instanceof Error ? err.message : String(err)}`,
+      );
+      return false;
+    }
+  };
+
+  try {
+    let parentThreadId = parentSession.larkThreadId ?? message.threadId;
+    if (!parentThreadId) {
+      parentThreadId = (await getMessageThreadId(appId, parentSession.rootMessageId)) ?? undefined;
+    }
+    if (parentThreadId && parentSession.larkThreadId !== parentThreadId) {
+      parentSession.larkThreadId = parentThreadId;
+      sessionStore.updateSession(parentSession);
+    }
+    const parentLink = parentThreadId
+      ? threadAppLink(chatId, parentThreadId, brand)
+      : chatAppLink(chatId, brand);
+
+    const localeKey = loc === 'en' ? 'en_us' : 'zh_cn';
+    const seedPost = JSON.stringify({
+      [localeKey]: {
+        title: `${t('cmd.fork.badge', undefined, loc)} ${taskText.replace(/\s*\n+\s*/g, ' ').slice(0, 300)}`,
+        content: [[
+          ...(senderIsBot ? [] : [{ tag: 'at', user_id: message.senderId }]),
+          {
+            tag: 'text',
+            text: `${senderIsBot ? '' : ' '}${t('cmd.fork.seed_parent_line', { title: parentSession.title || '' }, loc)} `,
+          },
+          { tag: 'a', text: t('cmd.fork.seed_back_link', undefined, loc), href: parentLink },
+        ]],
+      },
+    });
+    anchorId = await sendMessage(appId, chatId, seedPost, 'post');
+    const childThreadId = (await getMessageThreadId(appId, anchorId)) ?? undefined;
+
+    const childIntro = t('cmd.fork.child_intro', {
+      parentTitle: parentSession.title || '',
+      parentSessionId: parentSession.sessionId,
+      parentRootId: parentSession.rootMessageId,
+    }, loc);
+    const availableBots = await getAvailableBots(appId, chatId);
+    const childCliId = parentSession.cliId ?? botCfg.cliId;
+    const { forkSession } = await import('./worker-pool.js');
+    const forkResult = await forkSession(
+      parentSession.sessionId,
+      chatId,
+      anchorId,
+      'group',
+      'thread',
+      {
+        childTitle: `${t('cmd.fork.badge', undefined, loc)} ${taskTitle}`,
+        forkTaskText: taskText,
+        larkThreadId: childThreadId,
+        turnId: message.messageId,
+        senderOpenId: triggerSender.openId,
+        senderIsBot,
+        buildInitialPrompt: childSessionId => buildNewTopicCliInput(
+          `${childIntro}\n\n${taskText}`,
+          childSessionId,
+          childCliId,
+          botCfg.cliPathOverride,
+          undefined,
+          undefined,
+          availableBots,
+          undefined,
+          { name: bot.botName, openId: bot.botOpenId },
+          loc,
+          triggerSender,
+          { larkAppId: appId, chatId },
+        ),
+      },
+    );
+
+    if (!forkResult.ok) {
+      const orphanTopic = !await recallAnchor();
+      return { ok: false, error: forkResult.error, orphanTopic };
+    }
+
+    if (!parentSession.forkChildSessionIds?.includes(forkResult.childSessionId)) {
+      parentSession.forkChildSessionIds = [
+        ...(parentSession.forkChildSessionIds ?? []),
+        forkResult.childSessionId,
+      ];
+      try {
+        sessionStore.updateSession(parentSession);
+      } catch (err) {
+        logger.warn(
+          `[${parentSession.sessionId.substring(0, 8)}] /fork parent lineage update failed: `
+          + `${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    }
+    try {
+      await upsertForkPanelCard(parentDs, loc);
+    } catch (err) {
+      logger.warn(
+        `[${parentSession.sessionId.substring(0, 8)}] /fork panel refresh failed: `
+        + `${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+
+    return {
+      ok: true,
+      childSessionId: forkResult.childSessionId,
+      anchorId,
+      link: childThreadId ? threadAppLink(chatId, childThreadId, brand) : chatAppLink(chatId, brand),
+    };
+  } catch (err) {
+    logger.error(
+      `[${parentSession.sessionId.substring(0, 8)}] /fork sub-topic failed: `
+      + `${err instanceof Error ? err.message : String(err)}`,
+    );
+    return {
+      ok: false,
+      error: anchorId ? 'fork_subtopic_failed' : 'topic_creation_failed',
+      orphanTopic: anchorId ? !await recallAnchor() : false,
+    };
+  }
+}
+
+/** Re-post the parent session's fork panel at the bottom of the topic. Reading
+ *  each child row from the store keeps `/forklist` status current without
+ *  coupling child lifecycle to its parent. */
+async function upsertForkPanelCard(
+  parentDs: DaemonSession,
+  loc: Locale,
+  opts?: { allowEmpty?: boolean },
+): Promise<void> {
+  const appId = parentDs.larkAppId;
+  const chatId = parentDs.chatId;
+  const brand = normalizeBrand(getBot(appId).config.brand);
+  const children = (parentDs.session.forkChildSessionIds ?? [])
+    .map(sessionId => sessionStore.getSession(sessionId))
+    .filter((session): session is NonNullable<ReturnType<typeof sessionStore.getSession>> => !!session)
+    .map(session => ({
+      instruction: session.forkTaskText ?? session.title,
+      status: (session.status === 'active' ? 'active' : 'closed') as 'active' | 'closed',
+      link: session.larkThreadId
+        ? threadAppLink(chatId, session.larkThreadId, brand)
+        : chatAppLink(chatId, brand),
+    }));
+  if (children.length === 0 && !opts?.allowEmpty) return;
+
+  const staleCardId = parentDs.session.forkPanelCardId;
+  if (staleCardId) {
+    try {
+      await deleteMessage(appId, staleCardId);
+    } catch {
+      // It may already be withdrawn or past Lark's recall window. Posting the
+      // fresh panel is still more useful than keeping the command silent.
+    }
+  }
+
+  try {
+    const cardId = await replyMessage(
+      appId,
+      parentDs.session.rootMessageId,
+      buildForkPanelCard(children, loc),
+      'interactive',
+      true,
+    );
+    parentDs.session.forkPanelCardId = cardId;
+    sessionStore.updateSession(parentDs.session);
+  } catch (err) {
+    logger.warn(`[fork-panel] failed to post panel card: ${err instanceof Error ? err.message : err}`);
+  }
 }

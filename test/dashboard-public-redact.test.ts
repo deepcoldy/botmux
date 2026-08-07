@@ -189,6 +189,32 @@ describe('session presentation redaction', () => {
     expect(updateBody.patch.gitBranch).toBe('issue/CUSTOMER-456');
   });
 
+  it('keeps concrete CLI runtime identity private in REST rows and SSE bodies', () => {
+    const runtimeSession = {
+      sessionId: 's-runtime',
+      cliId: 'codex',
+      runtimeId: 'internal-vendor-codex',
+      runtimeDisplayName: 'Internal Vendor Codex',
+      status: 'working',
+    };
+
+    const [rest] = redactSessionsForPublic([runtimeSession]) as any[];
+    expect(rest).toEqual({ sessionId: 's-runtime', cliId: 'codex', status: 'working' });
+
+    const spawned = redactSessionEventForPublic('session.spawned', { session: runtimeSession }) as any;
+    expect(spawned.session).toEqual({ sessionId: 's-runtime', cliId: 'codex', status: 'working' });
+
+    const updated = redactSessionEventForPublic('session.update', {
+      sessionId: 's-runtime',
+      patch: {
+        runtimeId: 'internal-vendor-codex',
+        runtimeDisplayName: 'Internal Vendor Codex',
+        status: 'idle',
+      },
+    }) as any;
+    expect(updated.patch).toEqual({ status: 'idle' });
+  });
+
   it('strips the Riff sandbox write URL from anonymous REST rows without mutating authenticated data', () => {
     // riffAccessUrl is a bearer WRITE capability (the unique sandbox subdomain
     // IS the credential). An anonymous read-only visitor must never receive it,

@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { createRequire } from 'node:module';
 import { spawnSync } from 'node:child_process';
 import { buildPm2SpawnCommand } from '../../cli/pm2-command.js';
+import { stripPm2GracefulExitMarker } from '../../pm2-graceful-exit.js';
 
 const require = createRequire(import.meta.url);
 const BOTMUX_HOME = join(homedir(), '.botmux');
@@ -28,7 +29,12 @@ function pm2Bin(): string {
 
 function pm2Env(extra?: Record<string, string>): NodeJS.ProcessEnv {
   mkdirSync(PLUGIN_PM2_HOME, { recursive: true });
-  const inherited = { ...process.env };
+  // Strip the daemon/dashboard graceful-exit sentinel before it rides
+  // process.env into a plugin PM2 app (esp. with `pm2 start --update-env`):
+  // the plugin service is an arbitrary long-lived process that could launch a
+  // foreground botmux, which would then exit 90 on a clean stop. See
+  // stripPm2GracefulExitMarker.
+  const inherited = stripPm2GracefulExitMarker(process.env);
   delete inherited.kill_timeout;
   return { ...inherited, ...(extra ?? {}), PM2_HOME: PLUGIN_PM2_HOME };
 }

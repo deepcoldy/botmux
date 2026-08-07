@@ -116,6 +116,15 @@ export interface SessionBackend {
    */
   settleCurrentScreen?(): Promise<boolean>;
   captureViewport?(): string;
+  /**
+   * Plain current viewport plus the real terminal cursor. Adopt-mode input
+   * guards use this to detect an unsubmitted local composer draft before a
+   * remote message is written into the same TUI.
+   */
+  captureInputState?(): {
+    viewport: string;
+    cursor: { x: number; y: number };
+  } | null;
   getPaneSize?(): { cols: number; rows: number } | null;
   /**
    * Remote sandbox access URL — backends that run on a remote sandbox (e.g.

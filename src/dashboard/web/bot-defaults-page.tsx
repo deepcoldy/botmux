@@ -13,6 +13,8 @@ import {
   resolveSubstituteTarget,
   selectedCliOption,
   type BotDefaultsRow,
+  type CliRuntimeConfig,
+  type CliRuntimeUpdateProvider,
   type BotSubstituteMode,
   type BotSubstituteTarget,
   type CliOptionsState,
@@ -43,6 +45,50 @@ type JsonResponse = {
   status: number;
   body: any;
 };
+
+type RuntimeMode = 'official' | 'legacy' | 'custom';
+type RuntimeDraft = {
+  mode: RuntimeMode;
+  id: string;
+  displayName: string;
+  executable: string;
+  legacyPath: string;
+  updateProvider: CliRuntimeUpdateProvider;
+  packageName: string;
+};
+
+function runtimeDraftFromBot(bot: Pick<BotDefaultsRow, 'cliRuntime' | 'cliPathOverride'>): RuntimeDraft {
+  const runtime = bot.cliRuntime;
+  if (!runtime || typeof runtime !== 'object') {
+    const legacyPath = typeof bot.cliPathOverride === 'string' ? bot.cliPathOverride.trim() : '';
+    return {
+      mode: legacyPath ? 'legacy' : 'official',
+      id: '',
+      displayName: '',
+      // Carry the path into the custom form so migrating a legacy entry does
+      // not require retyping it; the legacy state itself remains read-only.
+      executable: legacyPath,
+      legacyPath,
+      updateProvider: 'auto',
+      packageName: '',
+    };
+  }
+  const provider = runtime.update?.provider;
+  const updateProvider: CliRuntimeUpdateProvider = provider === 'self' || provider === 'npm' || provider === 'none'
+    ? provider
+    : 'auto';
+  return {
+    mode: 'custom',
+    id: typeof runtime.id === 'string' ? runtime.id : '',
+    displayName: typeof runtime.displayName === 'string' ? runtime.displayName : '',
+    executable: typeof runtime.executable === 'string' ? runtime.executable : '',
+    legacyPath: '',
+    updateProvider,
+    packageName: runtime.update?.provider === 'npm' && typeof runtime.update.packageName === 'string'
+      ? runtime.update.packageName
+      : '',
+  };
+}
 
 type BotProfileRoleItem = {
   profileId: string;
@@ -438,6 +484,8 @@ function patchCardPrefsFromBody(bot: BotDefaultsRow, body: any): BotDefaultsRow 
     codexAppCleanInput: body.codexAppCleanInput,
     writableTerminalLinkInCard: body.writableTerminalLinkInCard,
     privateCard: body.privateCard,
+    summaryMemory: body.summaryMemory,
+    summaryMemoryPath: body.summaryMemoryPath,
     botToBotSameDir: body.botToBotSameDir,
     autoStartOnGroupJoin: body.autoStartOnGroupJoin,
     autoStartOnGroupJoinPrompt: body.autoStartOnGroupJoinPrompt,
@@ -745,7 +793,7 @@ function BotDefaultsCard(props: {
             </section>
             <section className="bd-tile"><SessionCapSection bot={bot} patchBot={patchBot} /></section>
             <section className="bd-tile"><StartupCommandsSection bot={bot} patchBot={patchBot} /></section>
-            <section className="bd-tile"><SummaryTriggerSection bot={bot} patchBot={patchBot} /></section>
+            <section className="bd-tile"><SummaryTriggerSection bot={bot} patchBot={patchBot} putCardPref={putCardPref} /></section>
           </BdTabGrid>
         </div>
         <div
@@ -1204,8 +1252,13 @@ export function BotAgentSection(props: {
   const tr = useT();
   const { bot, cliState, patchBot } = props;
   const initialKey = agentSelectionKey(bot, props.sessionFallback);
+  const runtimeConfigKey = JSON.stringify([bot.cliRuntime ?? null, bot.cliPathOverride ?? null]);
   const [cliKey, setCliKey] = useState(initialKey);
+  const [cliSelectionTouched, setCliSelectionTouched] = useState(false);
   const [model, setModel] = useState(typeof bot.model === 'string' ? bot.model : '');
+  const [runtimeDraft, setRuntimeDraft] = useState<RuntimeDraft>(() => runtimeDraftFromBot(bot));
+  const [runtimeTouched, setRuntimeTouched] = useState(false);
+  const [runtimeStatus, setRuntimeStatus] = useState<StatusMessage>(null);
   const [agentStatus, setAgentStatus] = useState<StatusMessage>(null);
   const [agentBusy, setAgentBusy] = useState(false);
   const [skillValue, setSkillValue] = useState(skillInjectionResolved(bot));
@@ -1214,13 +1267,18 @@ export function BotAgentSection(props: {
 
   useEffect(() => {
     setCliKey(agentSelectionKey(bot, props.sessionFallback));
+    setCliSelectionTouched(false);
     setModel(typeof bot.model === 'string' ? bot.model : '');
+    setRuntimeDraft(runtimeDraftFromBot(bot));
+    setRuntimeTouched(false);
     setSkillValue(skillInjectionResolved(bot));
   }, [
     bot.agentSelectionKey,
     bot.cliId,
     bot.larkAppId,
     bot.model,
+    runtimeConfigKey,
+    bot.wrapperCli,
     bot.skillInjection,
     bot.skillInjectionDefault,
     props.sessionFallback,
@@ -1236,7 +1294,16 @@ export function BotAgentSection(props: {
       : tr('botDefaults.agentModelPlaceholder');
 
   function updateCli(nextKey: string): void {
+    const previousKey = cliKey;
     setCliKey(nextKey);
+    setCliSelectionTouched(true);
+    if (nextKey !== previousKey && (nextKey !== 'codex' || previousKey !== 'codex')) {
+      setRuntimeDraft(runtimeDraftFromBot({ cliRuntime: null, cliPathOverride: null }));
+      // If the user leaves Codex and comes back before saving, the visible
+      // Official state is intentional and must clear the old runtime/path.
+      setRuntimeTouched(true);
+      setRuntimeStatus(null);
+    }
     const nextOption = selectedCliOption(cliState.options, nextKey);
     const isTtadk = nextOption?.gateway === 'ttadk';
     const acceptsModel = isTtadk && nextOption.acceptsModel !== false;
@@ -1249,26 +1316,108 @@ export function BotAgentSection(props: {
     }
   }
 
+  function updateRuntimeMode(mode: RuntimeMode): void {
+    setRuntimeDraft(current => ({ ...current, mode }));
+    setRuntimeTouched(true);
+    setRuntimeStatus(null);
+    setAgentStatus(null);
+  }
+
+  function updateRuntimeDraft(patch: Partial<Omit<RuntimeDraft, 'mode'>>): void {
+    setRuntimeDraft(current => ({ ...current, ...patch }));
+    setRuntimeTouched(true);
+    setRuntimeStatus(null);
+    setAgentStatus(null);
+  }
+
   async function saveAgent(): Promise<void> {
     setAgentStatus(null);
+    setRuntimeStatus(null);
+    let cliRuntime: CliRuntimeConfig | null | undefined;
+    if (runtimeTouched) cliRuntime = null;
+    if (runtimeTouched && cliKey === 'codex' && runtimeDraft.mode === 'custom') {
+      const id = runtimeDraft.id.trim();
+      const executable = runtimeDraft.executable.trim();
+      const displayName = runtimeDraft.displayName.trim();
+      const packageName = runtimeDraft.packageName.trim();
+      if (!id || !executable) {
+        const text = tr('botDefaults.runtimeRequired');
+        setAgentStatus({ text });
+        setRuntimeStatus({ text });
+        return;
+      }
+      if (runtimeDraft.updateProvider === 'npm' && !packageName) {
+        const text = tr('botDefaults.runtimePackageRequired');
+        setAgentStatus({ text });
+        setRuntimeStatus({ text });
+        return;
+      }
+      cliRuntime = {
+        id,
+        ...(displayName ? { displayName } : {}),
+        executable,
+        update: runtimeDraft.updateProvider === 'npm'
+          ? { provider: 'npm', packageName }
+          : { provider: runtimeDraft.updateProvider },
+      };
+    }
     setAgentBusy(true);
     try {
-      const res = await sendJson('PUT', `/api/bots/${encodeURIComponent(bot.larkAppId)}/agent`, { cliId: cliKey, model });
+      const body = {
+        cliId: cliKey,
+        model,
+        ...(runtimeTouched ? { cliRuntime } : {}),
+      };
+      const res = await sendJson('PUT', `/api/bots/${encodeURIComponent(bot.larkAppId)}/agent`, body);
       if (res.ok && res.body.ok) {
+        const closedCount = Number.isInteger(res.body.closedMismatchedSessions) && res.body.closedMismatchedSessions > 0
+          ? res.body.closedMismatchedSessions as number
+          : 0;
+        const closedText = closedCount > 0
+          ? tr('botDefaults.agentClosedCount', { count: closedCount })
+          : '';
         setAgentStatus(res.body.availabilityWarning
-          ? { text: `⚠️ ${res.body.availabilityWarning}` }
-          : { text: `✓ ${tr('botDefaults.agentSaved')}`, ok: true });
+          ? { text: `⚠️ ${res.body.availabilityWarning}${closedText ? ` · ${closedText}` : ''}` }
+          : { text: `✓ ${closedText || tr('botDefaults.agentSaved')}`, ok: true });
         patchBot(bot.larkAppId, {
           cliId: res.body.cliId,
+          cliRuntime: res.body.cliRuntime === undefined
+            ? runtimeTouched ? cliRuntime ?? null : bot.cliRuntime ?? null
+            : res.body.cliRuntime,
+          cliPathOverride: res.body.cliPathOverride === undefined
+            ? runtimeTouched ? null : bot.cliPathOverride ?? null
+            : res.body.cliPathOverride,
           wrapperCli: res.body.wrapperCli ?? null,
           model: res.body.model ?? '',
           agentSelectionKey: res.body.selectionKey ?? cliKey,
         });
+        setRuntimeTouched(false);
+        if (cliRuntime) {
+          const probe = res.body.runtimeProbe;
+          if (probe && typeof probe.version === 'string') {
+            setRuntimeStatus({
+              text: tr('botDefaults.runtimeProbeOk', {
+                version: probe.version,
+                provider: typeof probe.updateProvider === 'string' ? probe.updateProvider : runtimeDraft.updateProvider,
+              }),
+              ok: true,
+            });
+          } else {
+            setRuntimeStatus({ text: tr('botDefaults.runtimeProbeMissing') });
+          }
+        }
       } else {
-        setAgentStatus({ text: `✗ ${responseErrorText(res)}` });
+        const detail = typeof res.body?.message === 'string' && res.body.message
+          ? res.body.message
+          : responseErrorText(res);
+        const text = `✗ ${detail}`;
+        setAgentStatus({ text });
+        if (cliKey === 'codex' && runtimeDraft.mode === 'custom') setRuntimeStatus({ text });
       }
     } catch (e: any) {
-      setAgentStatus({ text: `✗ ${caughtErrorText(e)}` });
+      const text = `✗ ${caughtErrorText(e)}`;
+      setAgentStatus({ text });
+      if (cliKey === 'codex' && runtimeDraft.mode === 'custom') setRuntimeStatus({ text });
     } finally {
       setAgentBusy(false);
     }
@@ -1288,6 +1437,7 @@ export function BotAgentSection(props: {
       if (res.ok && res.body.ok) {
         patchBot(bot.larkAppId, {
           cliId: res.body.cliId,
+          cliRuntime: res.body.cliRuntime ?? null,
           wrapperCli: res.body.wrapperCli ?? null,
           model: res.body.model ?? '',
           agentSelectionKey: res.body.selectionKey ?? 'riff',
@@ -1322,12 +1472,19 @@ export function BotAgentSection(props: {
   }
 
   const siSupport = bot.skillInjectionSupport === 'dynamic' ? 'dynamic' : bot.skillInjectionSupport === 'global' ? 'global' : 'none';
+  const isRiff = cliKey === 'riff';
+  // Old dashboard payloads can omit agentSelectionKey while still carrying a
+  // legacy wrapperCli. Keep the custom-runtime editor hidden until the user
+  // explicitly selects bare Codex; structured runtimes and wrappers cannot mix.
+  const isBareCodex = cliKey === 'codex' && (!bot.wrapperCli || cliSelectionTouched);
+  const usesAlternativeCodexExecutable = isBareCodex && runtimeDraft.mode !== 'official';
+
   // 与添加机器人弹窗一致：按名称首字母排序，便于在 20+ 个 CLI 里定位。
   const cliOptions = [...cliState.options]
     .sort((a, b) => a.label.localeCompare(b.label, 'en', { sensitivity: 'base' }))
     .map(option => ({
       value: option.id,
-      label: option.available === false
+      label: option.available === false && !(option.id === 'codex' && usesAlternativeCodexExecutable)
         ? tr('botDefaults.agentMissingOption', { label: option.label, command: option.command ?? option.id })
         : `${option.label}（${option.id}）`,
     }));
@@ -1341,8 +1498,12 @@ export function BotAgentSection(props: {
     { value: 'global', label: tr('botDefaults.skillInjectionGlobal') },
     { value: 'off', label: tr('botDefaults.skillInjectionOff') },
   ];
-
-  const isRiff = cliKey === 'riff';
+  const runtimeProviderOptions: DropdownFieldOption<CliRuntimeUpdateProvider>[] = [
+    { value: 'auto', label: tr('botDefaults.runtimeProviderAuto') },
+    { value: 'self', label: tr('botDefaults.runtimeProviderSelf') },
+    { value: 'npm', label: tr('botDefaults.runtimeProviderNpm') },
+    { value: 'none', label: tr('botDefaults.runtimeProviderNone') },
+  ];
 
   return (
     <section className="bd-section">
@@ -1359,13 +1520,129 @@ export function BotAgentSection(props: {
             searchable
             onChange={updateCli}
           />
-          {option?.available === false ? (
+          {option?.available === false && !usesAlternativeCodexExecutable ? (
             <small className="hint-warn">
               {tr('botDefaults.agentMissingHint', { command: option.command ?? cliKey })}
             </small>
           ) : null}
         </div>
       </div>
+      {isBareCodex ? (
+        <div className="bd-codex-runtime" data-codex-runtime="">
+          <div className="bd-runtime-heading">
+            <FieldTitle help={tr('botDefaults.runtimeHelp')}>{tr('botDefaults.runtimeTitle')}</FieldTitle>
+          </div>
+          <div className="bd-runtime-mode" role="group" aria-label={tr('botDefaults.runtimeTitle')}>
+            <button
+              type="button"
+              data-action="runtime-official"
+              aria-pressed={runtimeDraft.mode === 'official'}
+              disabled={agentBusy}
+              onClick={() => updateRuntimeMode('official')}
+            >
+              {tr('botDefaults.runtimeOfficial')}
+            </button>
+            <button
+              type="button"
+              data-action="runtime-custom"
+              aria-pressed={runtimeDraft.mode === 'custom'}
+              disabled={agentBusy}
+              onClick={() => updateRuntimeMode('custom')}
+            >
+              {tr('botDefaults.runtimeCustom')}
+            </button>
+          </div>
+          <input type="hidden" data-input="agentRuntimeMode" value={runtimeDraft.mode} readOnly />
+          <p className="bd-runtime-note">
+            {tr(runtimeDraft.mode === 'official'
+              ? 'botDefaults.runtimeOfficialNote'
+              : runtimeDraft.mode === 'legacy'
+                ? 'botDefaults.runtimeLegacyNote'
+                : 'botDefaults.runtimeCustomNote')}
+          </p>
+          {runtimeDraft.mode === 'legacy' ? (
+            <div className="bd-runtime-fields" data-runtime-legacy="">
+              <label className="bd-runtime-wide">
+                <span>{tr('botDefaults.runtimeLegacyPath')}</span>
+                <input
+                  type="text"
+                  value={runtimeDraft.legacyPath}
+                  readOnly
+                  aria-readonly="true"
+                  data-input="agentRuntimeLegacyPath"
+                />
+              </label>
+            </div>
+          ) : null}
+          {runtimeDraft.mode === 'custom' ? (
+            <div className="bd-runtime-fields">
+              <label>
+                <FieldTitle help={tr('botDefaults.runtimeIdHelp')}>{tr('botDefaults.runtimeId')}</FieldTitle>
+                <input
+                  type="text"
+                  data-input="agentRuntimeId"
+                  value={runtimeDraft.id}
+                  disabled={agentBusy}
+                  autoComplete="off"
+                  onChange={event => updateRuntimeDraft({ id: event.currentTarget.value })}
+                />
+              </label>
+              <label>
+                <span>{tr('botDefaults.runtimeDisplayName')}</span>
+                <input
+                  type="text"
+                  data-input="agentRuntimeDisplayName"
+                  placeholder={tr('botDefaults.runtimeDisplayNamePlaceholder')}
+                  value={runtimeDraft.displayName}
+                  disabled={agentBusy}
+                  autoComplete="off"
+                  onChange={event => updateRuntimeDraft({ displayName: event.currentTarget.value })}
+                />
+              </label>
+              <label className="bd-runtime-wide">
+                <FieldTitle help={tr('botDefaults.runtimeExecutableHelp')}>{tr('botDefaults.runtimeExecutable')}</FieldTitle>
+                <input
+                  type="text"
+                  data-input="agentRuntimeExecutable"
+                  value={runtimeDraft.executable}
+                  disabled={agentBusy}
+                  autoCapitalize="none"
+                  autoComplete="off"
+                  spellCheck={false}
+                  onChange={event => updateRuntimeDraft({ executable: event.currentTarget.value })}
+                />
+              </label>
+              <div className="bd-field">
+                <span>{tr('botDefaults.runtimeUpdateProvider')}</span>
+                <DropdownField
+                  dataInput="agentRuntimeUpdateProvider"
+                  ariaLabel={tr('botDefaults.runtimeUpdateProvider')}
+                  value={runtimeDraft.updateProvider}
+                  disabled={agentBusy}
+                  options={runtimeProviderOptions}
+                  onChange={updateProvider => updateRuntimeDraft({ updateProvider })}
+                />
+              </div>
+              {runtimeDraft.updateProvider === 'npm' ? (
+                <label>
+                  <FieldTitle help={tr('botDefaults.runtimePackageHelp')}>{tr('botDefaults.runtimePackageName')}</FieldTitle>
+                  <input
+                    type="text"
+                    data-input="agentRuntimePackageName"
+                    value={runtimeDraft.packageName}
+                    disabled={agentBusy}
+                    autoCapitalize="none"
+                    autoComplete="off"
+                    spellCheck={false}
+                    onChange={event => updateRuntimeDraft({ packageName: event.currentTarget.value })}
+                  />
+                </label>
+              ) : null}
+            </div>
+          ) : null}
+          <StatusSpan status={runtimeStatus} attr={{ 'data-runtime-status': '' }} />
+        </div>
+      ) : null}
       {!isRiff && (
         <div className="bd-row">
           <label>
@@ -2411,19 +2688,25 @@ function CrossBotSection(props: { bot: BotDefaultsRow; putCardPref(patch: CardPr
   );
 }
 
-function SummaryTriggerSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
+function SummaryTriggerSection(props: { bot: BotDefaultsRow; patchBot: PatchBot; putCardPref(patch: CardPrefPatch): Promise<JsonResponse> }) {
   const tr = useT();
   const initial = summaryRange(props.bot);
   const [limit, setLimit] = useState(String(initial.limit));
   const [sinceHours, setSinceHours] = useState(String(initial.sinceHours));
+  const [memoryOn, setMemoryOn] = useState(props.bot.summaryMemory === true);
+  const [memoryPath, setMemoryPath] = useState(summaryMemoryPath(props.bot));
   const [status, setStatus] = useState<StatusMessage>(null);
+  const [memoryStatus, setMemoryStatus] = useState<StatusMessage>(null);
   const [busy, setBusy] = useState(false);
+  const [memoryBusy, setMemoryBusy] = useState(false);
 
   useEffect(() => {
     const next = summaryRange(props.bot);
     setLimit(String(next.limit));
     setSinceHours(String(next.sinceHours));
-  }, [props.bot.summaryRange?.limit, props.bot.summaryRange?.sinceHours]);
+    setMemoryOn(props.bot.summaryMemory === true);
+    setMemoryPath(summaryMemoryPath(props.bot));
+  }, [props.bot.summaryRange?.limit, props.bot.summaryRange?.sinceHours, props.bot.summaryMemory, props.bot.summaryMemoryPath]);
 
   async function save(): Promise<void> {
     setStatus(null);
@@ -2456,6 +2739,37 @@ function SummaryTriggerSection(props: { bot: BotDefaultsRow; patchBot: PatchBot 
     }
   }
 
+  async function saveMemory(next: boolean, nextPath = memoryPath): Promise<void> {
+    const prev = memoryOn;
+    const prevPath = memoryPath;
+    const normalizedPath = normalizeSummaryMemoryPath(nextPath);
+    setMemoryOn(next);
+    setMemoryPath(normalizedPath);
+    setMemoryStatus(null);
+    setMemoryBusy(true);
+    try {
+      const res = await props.putCardPref({ summaryMemory: next, summaryMemoryPath: normalizedPath });
+      if (res.ok && res.body.ok) {
+        const saved = res.body.summaryMemory === true;
+        const savedPath = summaryMemoryPath({ ...props.bot, summaryMemoryPath: res.body.summaryMemoryPath });
+        setMemoryOn(saved);
+        setMemoryPath(savedPath);
+        props.patchBot(props.bot.larkAppId, { summaryMemory: saved, summaryMemoryPath: savedPath });
+        setMemoryStatus({ text: `✓ ${tr('botDefaults.cardPrefSaved')}`, ok: true });
+      } else {
+        setMemoryOn(prev);
+        setMemoryPath(prevPath);
+        setMemoryStatus({ text: `✗ ${responseErrorText(res)}` });
+      }
+    } catch (e: any) {
+      setMemoryOn(prev);
+      setMemoryPath(prevPath);
+      setMemoryStatus({ text: `✗ ${caughtErrorText(e)}` });
+    } finally {
+      setMemoryBusy(false);
+    }
+  }
+
   return (
     <section className="bd-section">
       <h3 className="bd-section-title"><FieldTitle help={tr('botDefaults.summaryLimitHelp')}>{tr('botDefaults.sectionSummaryTrigger')}</FieldTitle></h3>
@@ -2473,8 +2787,34 @@ function SummaryTriggerSection(props: { bot: BotDefaultsRow; patchBot: PatchBot 
         <button type="button" className="primary" data-action="save-summary-trigger" disabled={busy} onClick={() => void save()}>{tr('botDefaults.summarySave')}</button>
         <StatusSpan status={status} attr={{ 'data-summary-trigger-status': '' }} />
       </div>
+      <ToggleRow
+        checked={memoryOn}
+        disabled={memoryBusy}
+        title={tr('botDefaults.summaryMemory')}
+        help={tr('botDefaults.summaryMemoryHelp')}
+        onChange={checked => void saveMemory(checked)}
+      />
+      <div className="bd-row bd-summary-limits">
+        <label>
+          <span>{tr('botDefaults.summaryMemoryPath')}</span>
+          <input type="text" data-input="summaryMemoryPath" value={memoryPath} disabled={memoryBusy} onChange={event => setMemoryPath(event.currentTarget.value)} />
+        </label>
+      </div>
+      <div className="actions">
+        <button type="button" className="primary" data-action="save-summary-memory-path" disabled={memoryBusy} onClick={() => void saveMemory(memoryOn, memoryPath)}>{tr('botDefaults.summaryMemoryPathSave')}</button>
+      </div>
+      <div className="actions"><StatusSpan status={memoryStatus} attr={{ 'data-summary-memory-status': '' }} /></div>
     </section>
   );
+}
+
+function normalizeSummaryMemoryPath(raw: string): string {
+  const value = raw.trim();
+  return value || 'summary.md';
+}
+
+function summaryMemoryPath(bot: Pick<BotDefaultsRow, 'summaryMemoryPath'>): string {
+  return normalizeSummaryMemoryPath(typeof bot.summaryMemoryPath === 'string' ? bot.summaryMemoryPath : '');
 }
 
 function summaryRange(bot: BotDefaultsRow): { limit: number; sinceHours: number } {

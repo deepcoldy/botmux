@@ -28,6 +28,7 @@ import { createKimiAdapter } from './kimi.js';
 import { createGrokAdapter } from './grok.js';
 import { createKiroCliAdapter } from './kiro-cli.js';
 import { createRiffAdapter } from './riff.js';
+import { createReasonixAdapter } from './reasonix.js';
 
 /**
  * The first CLI executable (or nested runner dependency) before shell
@@ -66,6 +67,7 @@ const RAW_CLI_EXECUTABLES: Readonly<Record<CliId, string | undefined>> = {
   'kiro-cli': 'kiro-cli',
   // API-backed; no local executable is required.
   riff: undefined,
+  reasonix: 'reasonix',
 };
 
 /** Return the unresolved command without constructing an adapter or spawning a
@@ -76,9 +78,13 @@ export function rawCliExecutable(id: CliId, pathOverride?: string): string | und
   return override || RAW_CLI_EXECUTABLES[normalized];
 }
 
-/** Resolve a command name to its absolute path via shell `which`.
+const RESOLVE_COMMAND_SCRIPT = 'command -v -- "$1"';
+
+/** Resolve a command name to its absolute path via a login/interactive shell.
  *  Tries login shell first (-lc), then interactive shell (-ic) for tools
- *  whose installers add PATH entries to .bashrc/.zshrc only. */
+ *  whose installers add PATH entries to .bashrc/.zshrc only. The command is
+ *  passed as positional argv ($1), never interpolated into the shell program:
+ *  spaces and shell metacharacters therefore remain one literal filename. */
 export function resolveCommand(cmd: string): string {
   if (isAbsolute(cmd)) return cmd;
   const shell = process.env.SHELL || '/bin/zsh';
@@ -102,16 +108,16 @@ export function resolveCommand(cmd: string): string {
       // suspend setup (the reported "[1]+ Stopped" with no error). `-ic` is
       // kept so rc-only installs are still found.
       const argv = setsidBin
-        ? [setsidBin, '-w', sh, flags, `which ${cmd}`]
-        : [sh, flags, `which ${cmd}`];
+        ? [setsidBin, '-w', sh, flags, RESOLVE_COMMAND_SCRIPT, 'botmux-resolve-command', cmd]
+        : [sh, flags, RESOLVE_COMMAND_SCRIPT, 'botmux-resolve-command', cmd];
       const result = spawnSync(argv[0]!, argv.slice(1), {
         encoding: 'utf-8',
         timeout: 5_000,
         stdio: ['ignore', 'pipe', 'ignore'],
       });
-      // Rc files may echo banners to stdout before the `which` output, so take
+      // Rc files may echo banners to stdout before the resolver output, so take
       // the LAST absolute line — and only after a clean exit, so a failed
-      // `which` can't let an echoed path-looking line masquerade as a result.
+      // lookup can't let an echoed path-looking line masquerade as a result.
       if (result.status !== 0) continue;
       const lines = (result.stdout ?? '').split(/\r?\n/).map(line => line.trim()).filter(Boolean);
       const found = lines.reverse().find(line => isAbsolute(line));
@@ -155,7 +161,7 @@ export async function createCliAdapter(id: CliId, pathOverride?: string): Promis
   return adapter;
 }
 
-export { createClaudeCodeAdapter, createSeedAdapter, createRelayAdapter, createAidenAdapter, createCocoAdapter, createCodexAdapter, createCodexAppAdapter, createCursorAdapter, createGeminiAdapter, createGeniusAdapter, createOpenCodeAdapter, createAntigravityAdapter, createMtrAdapter, createHermesAdapter, createMiraAdapter, createMirAdapter, createTraexAdapter, createPiAdapter, createCopilotAdapter, createOhMyPiAdapter, createKimiAdapter, createGrokAdapter, createKiroCliAdapter, createRiffAdapter };
+export { createClaudeCodeAdapter, createSeedAdapter, createRelayAdapter, createAidenAdapter, createCocoAdapter, createCodexAdapter, createCodexAppAdapter, createCursorAdapter, createGeminiAdapter, createGeniusAdapter, createOpenCodeAdapter, createAntigravityAdapter, createMtrAdapter, createHermesAdapter, createMiraAdapter, createMirAdapter, createTraexAdapter, createPiAdapter, createCopilotAdapter, createOhMyPiAdapter, createKimiAdapter, createGrokAdapter, createKiroCliAdapter, createRiffAdapter, createReasonixAdapter };
 
 /** Synchronous version for use in worker process. */
 export function createCliAdapterSync(id: CliId, pathOverride?: string): CliAdapter {
@@ -184,6 +190,7 @@ export function createCliAdapterSync(id: CliId, pathOverride?: string): CliAdapt
     case 'grok': return createGrokAdapter(pathOverride);
     case 'kiro-cli': return createKiroCliAdapter(pathOverride);
     case 'riff': return createRiffAdapter(pathOverride);
+    case 'reasonix': return createReasonixAdapter(pathOverride);
     default: throw new Error(`Unknown CLI adapter: ${id}`);
   }
 }

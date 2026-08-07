@@ -63,7 +63,7 @@ export async function fetchGroupsSnapshot(options: FetchGroupsSnapshotOptions = 
   const seq = ++requestSeq;
   latestRequestSeq = seq;
   const request = (async () => {
-    const r = await fetch('/api/groups');
+    const r = await fetch(options.force ? '/api/groups?refresh=1' : '/api/groups');
     const body = await r.json().catch(() => ({}));
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
     const snapshot = normalizeGroupsSnapshot(body);

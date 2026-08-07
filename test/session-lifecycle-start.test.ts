@@ -137,6 +137,7 @@ vi.mock('@larksuiteoapi/node-sdk', () => ({
 
 import { __testOnly_resetSessionLifecycleHooks } from '../src/services/session-lifecycle-hooks.js';
 import {
+  __testOnly_resetOrdinaryImDeliveries,
   forkAdoptWorker,
   forkWorker,
   initWorkerPool,
@@ -210,8 +211,10 @@ function defaultBot(overrides: Record<string, unknown> = {}) {
 }
 
 beforeEach(() => {
+  vi.useRealTimers();
   vi.clearAllMocks();
   vi.mocked(sessionStore.updateSession).mockImplementation(() => undefined);
+  __testOnly_resetOrdinaryImDeliveries();
   vi.mocked(getBot).mockImplementation(() => defaultBot());
   __testOnly_resetSessionLifecycleHooks();
   forkMock.mockImplementation(() => makeFakeWorker());
@@ -220,6 +223,225 @@ beforeEach(() => {
     getSessionWorkingDir: () => '/repo',
     getActiveCount: () => 1,
     closeSession: vi.fn(),
+  });
+});
+
+describe('ordinary IM worker receipt acknowledgement', () => {
+  it('clears the watchdog when the exact live worker generation receives the turn', async () => {
+    vi.useFakeTimers();
+    const sessionReply = vi.fn(async () => 'om_reply');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const ds = makeDs();
+    forkWorker(ds, 'hello', false);
+    const worker = forkMock.mock.results.at(-1)!.value;
+
+    expect(sendWorkerInput(ds, 'business turn', 'om_business')).toBe(true);
+    worker.emit('message', { type: 'turn_input_received', turnId: 'om_business' });
+    await vi.advanceTimersByTimeAsync(5_000);
+
+    const businessSends = vi.mocked(worker.send).mock.calls
+      .map(call => call[0])
+      .filter(message => message?.type === 'message' && message?.turnId === 'om_business');
+    expect(businessSends).toHaveLength(1);
+    expect(sessionReply).not.toHaveBeenCalled();
+  });
+
+  it('retries the exact turn once and reports a visible failure when no receipt ACK arrives', async () => {
+    vi.useFakeTimers();
+    const sessionReply = vi.fn(async () => 'om_failure');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const ds = makeDs();
+    forkWorker(ds, 'hello', false);
+    const worker = forkMock.mock.results.at(-1)!.value;
+
+    expect(sendWorkerInput(ds, 'business turn', 'om_business')).toBe(true);
+    await vi.advanceTimersByTimeAsync(2_000);
+    let businessSends = vi.mocked(worker.send).mock.calls
+      .map(call => call[0])
+      .filter(message => message?.type === 'message' && message?.turnId === 'om_business');
+    expect(businessSends).toHaveLength(2);
+
+    await vi.advanceTimersByTimeAsync(2_000);
+    await Promise.resolve();
+    expect(sessionReply).toHaveBeenCalledWith(
+      'om_root',
+      expect.stringContaining('Worker 未能接收'),
+      'text',
+      'app_test',
+      'om_business',
+    );
+    businessSends = vi.mocked(worker.send).mock.calls
+      .map(call => call[0])
+      .filter(message => message?.type === 'message' && message?.turnId === 'om_business');
+    expect(businessSends).toHaveLength(2);
+  });
+
+  it('retries immediately when the parent IPC callback rejects the enqueue', async () => {
+    vi.useFakeTimers();
+    const sessionReply = vi.fn(async () => 'om_failure');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const ds = makeDs();
+    forkWorker(ds, 'hello', false);
+    const worker = forkMock.mock.results.at(-1)!.value;
+    vi.mocked(worker.send).mockImplementation((message: any, callback?: (err?: Error | null) => void) => {
+      if (message?.type === 'message') callback?.(new Error('channel closed'));
+    });
+
+    expect(sendWorkerInput(ds, 'business turn', 'om_business')).toBe(true);
+    await vi.runAllTicks();
+
+    const businessSends = vi.mocked(worker.send).mock.calls
+      .map(call => call[0])
+      .filter(message => message?.type === 'message' && message?.turnId === 'om_business');
+    expect(businessSends).toHaveLength(2);
+    expect(sessionReply).toHaveBeenCalledWith(
+      'om_root',
+      expect.stringContaining('Worker 未能接收'),
+      'text',
+      'app_test',
+      'om_business',
+    );
+  });
+
+  it('retries a turn that the worker received but could not enqueue', async () => {
+    vi.useFakeTimers();
+    const sessionReply = vi.fn(async () => 'om_failure');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const ds = makeDs();
+    forkWorker(ds, 'hello', false);
+    const worker = forkMock.mock.results.at(-1)!.value;
+
+    expect(sendWorkerInput(ds, 'business turn', 'om_business')).toBe(true);
+    worker.emit('message', { type: 'turn_input_received', turnId: 'om_business' });
+    worker.emit('message', {
+      type: 'turn_input_rejected',
+      turnId: 'om_business',
+      reason: 'cli_input_unavailable',
+    });
+    let businessSends = vi.mocked(worker.send).mock.calls
+      .map(call => call[0])
+      .filter(message => message?.type === 'message' && message?.turnId === 'om_business');
+    expect(businessSends).toHaveLength(2);
+
+    worker.emit('message', { type: 'turn_input_received', turnId: 'om_business' });
+    worker.emit('message', {
+      type: 'turn_input_rejected',
+      turnId: 'om_business',
+      reason: 'cli_input_unavailable',
+    });
+    await Promise.resolve();
+
+    expect(sessionReply).toHaveBeenCalledWith(
+      'om_root',
+      expect.stringContaining('Worker 未能接收'),
+      'text',
+      'app_test',
+      'om_business',
+    );
+    businessSends = vi.mocked(worker.send).mock.calls
+      .map(call => call[0])
+      .filter(message => message?.type === 'message' && message?.turnId === 'om_business');
+    expect(businessSends).toHaveLength(2);
+  });
+
+  it('ignores a stale worker ACK and fails the original generation visibly', async () => {
+    vi.useFakeTimers();
+    const sessionReply = vi.fn(async () => 'om_failure');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const ds = makeDs();
+    forkWorker(ds, 'first', false);
+    const firstWorker = forkMock.mock.results.at(-1)!.value;
+    expect(sendWorkerInput(ds, 'business turn', 'om_business')).toBe(true);
+
+    forkWorker(ds, 'replacement', { resume: true });
+    firstWorker.emit('message', { type: 'turn_input_received', turnId: 'om_business' });
+    await vi.advanceTimersByTimeAsync(2_000);
+    await Promise.resolve();
+
+    expect(sessionReply).toHaveBeenCalledWith(
+      'om_root',
+      expect.stringContaining('Worker 未能接收'),
+      'text',
+      'app_test',
+      'om_business',
+    );
+  });
+
+  it('tracks a cold-start init turn and retries when the worker never receives it', async () => {
+    vi.useFakeTimers();
+    const sessionReply = vi.fn(async () => 'om_failure');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const ds = makeDs();
+
+    forkWorker(ds, 'cold start', 'om_kickoff');
+    const worker = forkMock.mock.results.at(-1)!.value;
+    await vi.advanceTimersByTimeAsync(4_000);
+    await Promise.resolve();
+
+    const initSends = vi.mocked(worker.send).mock.calls
+      .map(call => call[0])
+      .filter(message => message?.type === 'init' && message?.turnId === 'om_kickoff');
+    expect(initSends).toHaveLength(2);
+    expect(sessionReply).toHaveBeenCalledWith(
+      'om_root',
+      expect.stringContaining('Worker 未能接收'),
+      'text',
+      'app_test',
+      'om_kickoff',
+    );
+  });
+
+  it('does not mistake slow startup for delivery failure after init is received', async () => {
+    vi.useFakeTimers();
+    const sessionReply = vi.fn(async () => 'om_failure');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const ds = makeDs();
+
+    forkWorker(ds, 'cold start', 'om_kickoff');
+    const worker = forkMock.mock.results.at(-1)!.value;
+    worker.emit('message', { type: 'turn_input_received', turnId: 'om_kickoff' });
+    await vi.advanceTimersByTimeAsync(10_000);
+
+    const initSends = vi.mocked(worker.send).mock.calls
+      .map(call => call[0])
+      .filter(message => message?.type === 'init' && message?.turnId === 'om_kickoff');
+    expect(initSends).toHaveLength(1);
+    expect(sessionReply).not.toHaveBeenCalled();
   });
 });
 
@@ -242,6 +464,133 @@ describe('persistent backend target handoff', () => {
       backendType: 'herdr',
       persistentBackendTarget: target,
     }));
+  });
+});
+
+describe('CLI runtime session freeze', () => {
+  it('migrates an old agentFrozen session from its own cliPathOverride', () => {
+    vi.mocked(getBot).mockImplementation(() => defaultBot({
+      wrapperCli: undefined,
+      cliRuntime: {
+        id: 'new-codex',
+        displayName: 'New Codex',
+        executable: '/opt/new-codex',
+        update: { provider: 'none' },
+      },
+      cliPathOverride: '/opt/new-codex',
+    }));
+    const ds = makeDs();
+    ds.session.cliId = 'codex';
+    ds.session.cliPathOverride = '/opt/legacy/vendor-codex';
+    ds.session.agentFrozen = true;
+
+    forkWorker(ds, 'resume', true);
+
+    const worker = forkMock.mock.results.at(-1)!.value;
+    const init = vi.mocked(worker.send).mock.calls[0][0];
+    expect(init).toEqual(expect.objectContaining({
+      cliId: 'codex',
+      cliPathOverride: '/opt/legacy/vendor-codex',
+      cliRuntime: {
+        id: 'vendor-codex',
+        displayName: 'vendor-codex',
+        executable: '/opt/legacy/vendor-codex',
+        source: 'legacy-path',
+        update: { provider: 'auto' },
+      },
+    }));
+    expect(ds.session.cliRuntime).toEqual(init.cliRuntime);
+  });
+
+  it('repairs a missing executable shadow from configured and legacy frozen snapshots', () => {
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ wrapperCli: undefined }));
+    for (const source of ['configured', 'legacy-path'] as const) {
+      const executable = `/opt/frozen-${source}`;
+      const ds = makeDs();
+      ds.session.cliId = 'codex';
+      ds.session.agentFrozen = true;
+      ds.session.cliRuntime = {
+        id: `frozen-${source}`,
+        displayName: `Frozen ${source}`,
+        executable,
+        source,
+        update: source === 'configured' ? { provider: 'none' } : { provider: 'auto' },
+      };
+      ds.session.cliPathOverride = undefined;
+
+      forkWorker(ds, 'resume', true);
+
+      const worker = forkMock.mock.results.at(-1)!.value;
+      const init = vi.mocked(worker.send).mock.calls[0][0];
+      expect(init.cliPathOverride).toBe(executable);
+      expect(ds.session.cliPathOverride).toBe(executable);
+    }
+  });
+
+  it('uses the frozen runtime snapshot instead of a stale executable shadow', () => {
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ wrapperCli: undefined }));
+    const ds = makeDs();
+    ds.session.cliId = 'codex';
+    ds.session.agentFrozen = true;
+    ds.session.cliRuntime = {
+      id: 'frozen-vendor',
+      displayName: 'Frozen Vendor',
+      executable: '/opt/frozen-vendor',
+      source: 'configured',
+      update: { provider: 'none' },
+    };
+    ds.session.cliPathOverride = '/opt/stale-other-vendor';
+
+    forkWorker(ds, 'resume', true);
+
+    const worker = forkMock.mock.results.at(-1)!.value;
+    const init = vi.mocked(worker.send).mock.calls[0][0];
+    expect(init.cliPathOverride).toBe('/opt/frozen-vendor');
+    expect(ds.session.cliPathOverride).toBe('/opt/frozen-vendor');
+  });
+
+  it('keeps a newly frozen runtime stable after the bot runtime changes', () => {
+    const bot = defaultBot({
+      wrapperCli: undefined,
+      cliRuntime: {
+        id: 'vendor-codex',
+        displayName: 'VendorCodex',
+        executable: '/opt/vendor-codex',
+        update: { provider: 'self' },
+      },
+      // Parsed BotConfig exposes this compatibility shadow to old call sites.
+      cliPathOverride: '/opt/vendor-codex',
+    });
+    vi.mocked(getBot).mockImplementation(() => bot);
+    const ds = makeDs();
+
+    forkWorker(ds, 'first turn', false);
+    const firstWorker = forkMock.mock.results.at(-1)!.value;
+    const firstInit = vi.mocked(firstWorker.send).mock.calls[0][0];
+    expect(firstInit).toEqual(expect.objectContaining({
+      cliPathOverride: '/opt/vendor-codex',
+      cliRuntime: expect.objectContaining({
+        id: 'vendor-codex',
+        displayName: 'VendorCodex',
+        executable: '/opt/vendor-codex',
+        source: 'configured',
+      }),
+    }));
+
+    bot.config.cliRuntime = {
+      id: 'other-codex',
+      displayName: 'Other Codex',
+      executable: '/opt/other-codex',
+      update: { provider: 'none' },
+    };
+    bot.config.cliPathOverride = '/opt/other-codex';
+    forkWorker(ds, 'resume', true);
+
+    const resumedWorker = forkMock.mock.results.at(-1)!.value;
+    const resumedInit = vi.mocked(resumedWorker.send).mock.calls[0][0];
+    expect(resumedInit.cliRuntime).toEqual(firstInit.cliRuntime);
+    expect(resumedInit.cliPathOverride).toBe('/opt/vendor-codex');
+    expect(ds.session.cliRuntime).toEqual(firstInit.cliRuntime);
   });
 });
 

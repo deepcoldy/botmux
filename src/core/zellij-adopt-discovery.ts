@@ -52,8 +52,8 @@ function canonPath(p: string | undefined): string | undefined {
   return out.length > 1 && out.endsWith('/') ? out.slice(0, -1) : out;
 }
 
-function cliIdForProc(pid: number, filterCliId?: CliId): CliId | undefined {
-  return cliIdFromCommArgv(readComm(pid), readCmdline(pid), filterCliId);
+function cliIdForProc(pid: number, filterCliId?: CliId, filterExecutable?: string): CliId | undefined {
+  return cliIdFromCommArgv(readComm(pid), readCmdline(pid), filterCliId, filterExecutable);
 }
 
 /** BFS the process tree under rootPid collecting every known CLI process with
@@ -67,6 +67,7 @@ function findAllClisUnder(
   rootPid: number,
   maxDepth: number,
   filterCliId?: CliId,
+  filterExecutable?: string,
 ): Array<{ pid: number; cliId: CliId; cwd?: string }> {
   const found: Array<{ pid: number; cliId: CliId; cwd?: string }> = [];
   const parentOf = new Map<number, number>();
@@ -74,7 +75,7 @@ function findAllClisUnder(
   for (let depth = 0; depth <= maxDepth && current.length > 0; depth++) {
     const next: number[] = [];
     for (const pid of current) {
-      const cliId = cliIdForProc(pid, filterCliId);
+      const cliId = cliIdForProc(pid, filterCliId, filterExecutable);
       if (cliId) found.push({ pid, cliId, cwd: canonPath(readCwd(pid)) });
       for (const ch of getChildPids(pid)) { parentOf.set(ch, pid); next.push(ch); }
     }
@@ -199,8 +200,12 @@ function resolveSessionId(cliId: CliId, pid: number): { sessionId?: string; star
 /**
  * Scan all live zellij sessions for adoptable CLIs. Skips bmx-* (botmux's own).
  * @param filterCliId only return sessions matching this CLI type.
+ * @param filterExecutable for a custom Codex runtime, require this executable's basename exactly.
  */
-export function discoverAdoptableZellijSessions(filterCliId?: CliId): ZellijAdoptableSession[] {
+export function discoverAdoptableZellijSessions(
+  filterCliId?: CliId,
+  filterExecutable?: string,
+): ZellijAdoptableSession[] {
   const results: ZellijAdoptableSession[] = [];
 
   for (const session of listLiveSessions()) {
@@ -236,7 +241,7 @@ export function discoverAdoptableZellijSessions(filterCliId?: CliId): ZellijAdop
     for (let i = 0; i < terminals.length; i++) {
       // findAllClisUnder collapses the node-wrapper chain to the native CLI;
       // a bare shell pane yields none and is skipped.
-      const clis = findAllClisUnder(children[i]!, 4, filterCliId);
+      const clis = findAllClisUnder(children[i]!, 4, filterCliId, filterExecutable);
       if (clis.length === 0) continue;
       const cli = clis[0]!;
 
@@ -267,10 +272,16 @@ export function discoverAdoptableZellijSessions(filterCliId?: CliId): ZellijAdop
  *  `filterCliId` MUST mirror discovery's filter: a generic-named `agent` (Cursor)
  *  is only recognized as a CLI under the 'cursor' filter, so without it the
  *  expected pid is never re-identified and a live session looks exited. */
-export function validateZellijAdoptTarget(session: string, paneId: string, expectedPid: number, filterCliId?: CliId): boolean {
+export function validateZellijAdoptTarget(
+  session: string,
+  paneId: string,
+  expectedPid: number,
+  filterCliId?: CliId,
+  filterExecutable?: string,
+): boolean {
   const serverPid = findServerPid(session);
   if (!serverPid) return false;
-  const clis = findAllClisUnder(serverPid, 4, filterCliId);
+  const clis = findAllClisUnder(serverPid, 4, filterCliId, filterExecutable);
   if (!clis.some(c => c.pid === expectedPid)) return false;
   // And the pane must still exist.
   return paneDimensions(session, paneId) !== undefined;

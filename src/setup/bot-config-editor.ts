@@ -1,4 +1,8 @@
 import type { CliId } from '../adapters/cli/types.js';
+import {
+  normalizeCliRuntimeConfig,
+  type CliRuntimeConfig,
+} from '../adapters/cli/runtime.js';
 import { sanitizePerBotEnv } from '../core/per-bot-env.js';
 
 export const CLI_ID_CHOICES: Record<string, CliId> = {
@@ -28,6 +32,7 @@ export const CLI_ID_CHOICES: Record<string, CliId> = {
   '22': 'grok',
   '23': 'kiro-cli',
   '24': 'riff',
+  '25': 'reasonix',
 };
 
 const VALID_CLI_IDS: ReadonlySet<string> = new Set(Object.values(CLI_ID_CHOICES));
@@ -62,6 +67,7 @@ const CLI_DISPLAY_LABELS: Record<CliId, string> = {
   'grok': 'Grok Build',
   'kiro-cli': 'Kiro',
   'riff': 'Riff',
+  'reasonix': 'Reasonix',
 };
 
 /**
@@ -187,6 +193,13 @@ export interface BotConfigEditInput {
   larkAppSecret?: string;
   cliChoice?: string;
   cliPathOverride?: string;
+  /**
+   * Structured compatible-runtime edit. Three states:
+   *   - undefined -> preserve current value
+   *   - object    -> validate/set it and write an equal legacy path shadow
+   *   - null      -> clear it and its equal legacy path shadow
+   */
+  cliRuntime?: CliRuntimeConfig | null;
   /**
    * 通用启动前缀（如 "aiden x claude"）。三态：
    *   - undefined → 不动
@@ -435,7 +448,53 @@ export function applyBotConfigEdits<T extends Record<string, any>>(
   const cliId = resolveCliId(input.cliChoice);
   if (cliId) out.cliId = cliId;
 
-  applyOptionalString(out, 'cliPathOverride', input.cliPathOverride);
+  // The edit API keeps one explicit executable source. Persisted structured
+  // runtimes additionally carry an equal cliPathOverride shadow so rolling
+  // back to a pre-cliRuntime BotMux still launches the same distribution.
+  // Interactive setup always supplies the path prompt as a string; an empty
+  // answer means "preserve", not "replace the structured runtime with its
+  // legacy shadow". Only a non-empty value (including "-" for clear) is an
+  // actual path edit.
+  const cliPathOverrideEdited = input.cliPathOverride !== undefined
+    && input.cliPathOverride.trim().length > 0;
+  if (input.cliRuntime !== undefined && input.cliRuntime !== null && cliPathOverrideEdited) {
+    throw new Error('cliRuntime conflicts with cliPathOverride; configure only one executable source');
+  }
+  const explicitlySettingRuntime = input.cliRuntime !== undefined && input.cliRuntime !== null;
+  if (input.cliRuntime === null) {
+    const oldRuntimeExecutable = out.cliRuntime && typeof out.cliRuntime === 'object'
+      ? out.cliRuntime.executable
+      : undefined;
+    delete out.cliRuntime;
+    if (oldRuntimeExecutable && out.cliPathOverride === oldRuntimeExecutable) delete out.cliPathOverride;
+  } else if (input.cliRuntime !== undefined) {
+    out.cliRuntime = normalizeCliRuntimeConfig(input.cliRuntime, 'cliRuntime');
+    out.cliPathOverride = out.cliRuntime.executable;
+  }
+  if (cliPathOverrideEdited) {
+    applyOptionalString(out, 'cliPathOverride', input.cliPathOverride);
+    delete out.cliRuntime;
+  }
+
+  // The first supported custom-runtime family is Codex. Switching a bot to a
+  // different adapter must not strand a stale Codex distribution descriptor
+  // that a later edit or old client could accidentally revive.
+  if (out.cliId !== 'codex') {
+    if (explicitlySettingRuntime) throw new Error('cliRuntime is currently supported only for cliId "codex"');
+    const oldRuntimeExecutable = out.cliRuntime && typeof out.cliRuntime === 'object'
+      ? out.cliRuntime.executable
+      : undefined;
+    delete out.cliRuntime;
+    if (oldRuntimeExecutable && out.cliPathOverride === oldRuntimeExecutable) delete out.cliPathOverride;
+  }
+
+  if (out.cliRuntime) {
+    out.cliRuntime = normalizeCliRuntimeConfig(out.cliRuntime, 'cliRuntime');
+    if (out.cliPathOverride !== undefined && out.cliPathOverride !== out.cliRuntime.executable) {
+      throw new Error('cliPathOverride must exactly match cliRuntime.executable when both are present');
+    }
+    out.cliPathOverride = out.cliRuntime.executable;
+  }
 
   // wrapperCli 三态：null = 清空，string = 设置（空 / "-" 也清空），undefined = 不动。
   if (input.wrapperCli === null) {
@@ -444,6 +503,9 @@ export function applyBotConfigEdits<T extends Record<string, any>>(
     const v = input.wrapperCli.trim();
     if (!v || v === '-') delete out.wrapperCli;
     else out.wrapperCli = v;
+  }
+  if (out.cliRuntime && out.wrapperCli) {
+    throw new Error('cliRuntime cannot be combined with wrapperCli');
   }
 
   // Model 字段：null = 清空，string = 设置，undefined = 不动。

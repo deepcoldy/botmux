@@ -343,6 +343,38 @@ describe('ResourceMonitorService', () => {
     expect(svc.current().botmux?.cpuPct).toBe(10);
   });
 
+  it('does not charge a recycled pid with the previous occupant’s lifetime CPU', () => {
+    let tick = 0;
+    const svc = createResourceMonitorService({
+      intervalMs: 10_000,
+      // pid 20 is the session's worker in both samples, but the second sample's process
+      // was born later: it is a different process that happens to hold the same pid.
+      sampleProcfs: () => tick++ === 0
+        ? sample([
+          { pid: 10, ppid: 1, rssBytes: 10, cpuTicks: 10, startTicks: 500, cmd: 'botmux' },
+          { pid: 20, ppid: 10, rssBytes: 20, cpuTicks: 10, startTicks: 600, cmd: 'worker' },
+        ], 100, 80)
+        : sample([
+          { pid: 10, ppid: 1, rssBytes: 10, cpuTicks: 20, startTicks: 500, cmd: 'botmux' },
+          { pid: 20, ppid: 10, rssBytes: 20, cpuTicks: 90, startTicks: 999, cmd: 'worker' },
+        ], 200, 150),
+      listSessions: () => [{ sessionId: 's1', larkAppId: 'app', botName: 'bot', status: 'working', workerPid: 20 }],
+      listDaemons: () => [{ larkAppId: 'app', botName: 'bot', pid: 10 }],
+      listBotmuxPids: () => [10],
+      readCliMarkers: () => new Map(),
+      nowMs: () => tick * 10_000,
+    });
+
+    svc.sampleOnce();
+    svc.sampleOnce();
+
+    // Diffing 90 against the old occupant's 10 over a host delta of 100 would report
+    // 80% for a process that has barely run. The birth mismatch must skip the pair.
+    expect(svc.current().sessions[0].current.cpuPct).toBe(0);
+    // pid 10 kept its identity, so its own delta is still reported.
+    expect(svc.current().bots[0].daemon.cpuPct).toBe(10);
+  });
+
   it('marks CPU unavailable until the second supported sample has a usable delta', () => {
     let tick = 0;
     const svc = createResourceMonitorService({

@@ -163,6 +163,22 @@ function nativeResumeId(ds: DaemonSession): string | undefined {
   return ds.adoptedFrom?.sessionId ?? ds.session.adoptedFrom?.sessionId ?? ds.session.cliSessionId;
 }
 
+function frozenRuntimeExecutable(ds: DaemonSession, cliId: LocalCliId): string | undefined {
+  // Runtime executable replacement is a Codex-compatible-runtime capability,
+  // not a generic interpretation of legacy path snapshots from other adapters.
+  if (cliId !== 'codex') return undefined;
+  const runtime = ds.session.cliRuntime;
+  if (runtime) {
+    return runtime.source === 'configured' || runtime.source === 'legacy-path'
+      ? runtime.executable
+      : undefined;
+  }
+  // Sessions frozen by an older botmux may predate cliRuntime snapshots and
+  // carry only their historical path. Never borrow the live bot's runtime.
+  const legacyPath = ds.session.cliPathOverride;
+  return legacyPath?.trim() ? legacyPath : undefined;
+}
+
 function adoptedMetadata(ds: DaemonSession): AdoptedMetadata | undefined {
   return ds.adoptedFrom ?? ds.session.adoptedFrom;
 }
@@ -174,6 +190,20 @@ function quoteKnownResumeCommand(cliId: LocalCliId, raw: string): string | null 
   const sid = raw.slice(prefix.length).trim();
   if (!sid) return null;
   return `${RESUME_COMMAND_PREFIXES[cliId]} ${shellQuote(sid)}`;
+}
+
+function replaceFrozenResumeExecutable(
+  cliId: LocalCliId,
+  command: string,
+  executable: string | undefined,
+): string {
+  // Codex-compatible runtimes currently exist only for the Codex adapter.
+  // Resume with the executable frozen into this session instead of whichever
+  // distribution happens to provide the host's current `codex` command.
+  if (cliId !== 'codex' || !executable) return command;
+  const officialPrefix = 'codex ';
+  if (!command.startsWith(officialPrefix)) return command;
+  return `${shellQuote(executable)} ${command.slice(officialPrefix.length)}`;
 }
 
 export function buildItermAppleScript(command: string, tellTarget: string = ITERM_TARGETS[0]): string {
@@ -296,15 +326,17 @@ function buildLocalCliResumeCommand(
   const workingDir = sessionWorkingDir(ds);
   if (!workingDir) return fail('missing_working_dir', 'Session working directory is missing.');
 
-  const adapter = opts.adapterFactory?.(cliId) ?? createCliAdapterSync(cliId);
+  const runtimeExecutable = frozenRuntimeExecutable(ds, cliId);
+  const adapter = opts.adapterFactory?.(cliId) ?? createCliAdapterSync(cliId, runtimeExecutable);
   const rawResume = adapter.buildResumeCommand?.({
     sessionId: ds.session.sessionId,
     cliSessionId: nativeResumeId(ds),
   });
   if (!rawResume) return fail('missing_resume_id', `${cliId} does not have a resumable session id yet.`);
 
-  const resumeCommand = quoteKnownResumeCommand(cliId, rawResume);
-  if (!resumeCommand) return fail('missing_resume_id', `${cliId} returned an unsupported resume command.`);
+  const quotedResumeCommand = quoteKnownResumeCommand(cliId, rawResume);
+  if (!quotedResumeCommand) return fail('missing_resume_id', `${cliId} returned an unsupported resume command.`);
+  const resumeCommand = replaceFrozenResumeExecutable(cliId, quotedResumeCommand, runtimeExecutable);
 
   return { ok: true, command: `cd ${shellQuote(workingDir)} && ${resumeCommand}` };
 }

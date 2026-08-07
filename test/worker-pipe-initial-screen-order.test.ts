@@ -141,6 +141,60 @@ describe('worker pipe initial screen ordering', () => {
     expect(probeIdx).toBeGreaterThan(releaseIdx);
   });
 
+  it('keeps polling an argv-baked Pi turn while its authoritative viewport is busy', () => {
+    const source = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
+    const fallbackStart = source.indexOf('const releaseFirstPromptTimeout =');
+    const releaseIdx = source.indexOf('awaitingFirstPrompt = false;', fallbackStart);
+    const deferIdx = source.indexOf('deferPromptReadyWhileBusy(`${cliName()} first-prompt-timeout`, backend)', releaseIdx);
+    const directProbeIdx = source.indexOf('probeBusyPatternIdle(`${cliName()} first-prompt-timeout`, backend)', releaseIdx);
+    const helperStart = source.indexOf('function scheduleBusyPatternIdleProbe(source: string): void');
+    const helperEnd = source.indexOf('async function spawnCli(', helperStart);
+    const helper = source.slice(helperStart, helperEnd);
+
+    expect(deferIdx).toBeGreaterThan(releaseIdx);
+    expect(directProbeIdx).toBeGreaterThan(deferIdx);
+    expect(helper).not.toContain('IDLE_PROBE_MAX_ATTEMPTS');
+  });
+
+  it('never arms the uncapped busy probe on a non-authoritative backend (ZMX)', () => {
+    // Regression for the ZMX lifecycle leak: with IDLE_PROBE_MAX_ATTEMPTS removed
+    // the probe re-arms on `!isPromptReady` forever. probeBusyPatternIdle() bails
+    // at the authoritative gate every tick and can never mark ready on ZMX, and
+    // an alt-screen CLI's busy→idle redraw arrives as a screen-resync that is
+    // deliberately NOT fed to IdleDetector — so nothing else flips isPromptReady.
+    // The arm gate MUST short-circuit before scheduling the first tick, or a live
+    // worker logs a skip line every IDLE_PROBE_INTERVAL_MS with no terminator.
+    const source = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
+    const helperStart = source.indexOf('function scheduleBusyPatternIdleProbe(source: string): void');
+    const helperEnd = source.indexOf('async function spawnCli(', helperStart);
+    const helper = source.slice(helperStart, helperEnd);
+    const guardIdx = helper.indexOf('if (!backendScreenEvidenceIsAuthoritativeForMutation()) return;');
+    const firstArmIdx = helper.indexOf('busyPatternIdleProbeTimer = setTimeout(tick, IDLE_PROBE_INTERVAL_MS);');
+
+    // The authoritative guard exists and precedes any timer arm.
+    expect(guardIdx).toBeGreaterThan(-1);
+    expect(firstArmIdx).toBeGreaterThan(-1);
+    expect(guardIdx).toBeLessThan(firstArmIdx);
+    // The cap is gone (unbounded re-arm), which is exactly why the guard is load-bearing.
+    expect(helper).not.toContain('IDLE_PROBE_MAX_ATTEMPTS');
+  });
+
+  it('defers screen-idle completion when the authoritative viewport remains busy', () => {
+    const source = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
+    const idleStart = source.search(/idleDetector\.onIdle\(async \(/);
+    const idleEnd = source.indexOf('observedBackend.onData((data) =>', idleStart);
+    const idle = source.slice(idleStart, idleEnd);
+    const deferIdx = idle.indexOf("deferPromptReadyWhileBusy(`${cliName()} screen-idle`, idleBackend)");
+    const drainIdx = idle.indexOf('drainBridgesThenMarkReady(evidenceSource);');
+    const adoptStart = source.indexOf('function setupAdoptIdleDetection');
+    const adoptEnd = source.indexOf('function seedBackendScreen', adoptStart);
+    const adopt = source.slice(adoptStart, adoptEnd);
+
+    expect(deferIdx).toBeGreaterThan(-1);
+    expect(deferIdx).toBeLessThan(drainIdx);
+    expect(adopt).toContain("deferPromptReadyWhileBusy(`${label} adopt-idle`, backend)");
+  });
+
   it('gates the first-prompt soft timeout through shouldReleaseFirstPromptTimeout with a hard cap', () => {
     // Pin the defer-then-hard-cap structure, not just the probe ordering. Without
     // this, reverting the closure to an unconditional 15s force-flush (the exact
@@ -560,6 +614,31 @@ describe('worker pipe initial screen ordering', () => {
     expect(probe).not.toContain('cliAdapter.busyPattern.test(content)');
   });
 
+  it('restores working from an explicit post-idle busy edge in spawn and adopt modes', () => {
+    const source = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
+    const helperStart = source.indexOf('function wireIdleDetectorBusyTransition(');
+    const helperEnd = source.indexOf('function setupAdoptIdleDetection', helperStart);
+    const helper = source.slice(helperStart, helperEnd);
+
+    expect(helperStart).toBeGreaterThan(-1);
+    expect(helper).toContain('detector.onBusy(() => {');
+    expect(helper).toContain('if (!isPromptReady) return;');
+    expect(helper).toContain('isPromptReady = false;');
+    expect(helper).toContain("publishScreenStatus('working', { force: true });");
+    expect(helper).not.toContain('idleDetector?.reset()');
+    expect(helper).not.toContain('detector.reset()');
+
+    const adoptStart = source.indexOf('function setupAdoptIdleDetection');
+    const adoptEnd = source.indexOf('function seedBackendScreen', adoptStart);
+    const adopt = source.slice(adoptStart, adoptEnd);
+    expect(adopt).toContain('wireIdleDetectorBusyTransition(idleDetector, `${label} adopt mode`);');
+
+    const spawnStart = source.indexOf('// Set up idle detection.');
+    const spawnEnd = source.indexOf('observedBackend.onData((data) =>', spawnStart);
+    const spawn = source.slice(spawnStart, spawnEnd);
+    expect(spawn).toContain('wireIdleDetectorBusyTransition(idleDetector, `${cliName()} PTY`);');
+  });
+
   it('settles an authoritative screen before a busy-pattern probe marks the prompt ready', () => {
     const source = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
     const probeStart = source.indexOf('function probeBusyPatternIdle');
@@ -664,6 +743,14 @@ describe('worker pipe initial screen ordering', () => {
     expect(herdrBlock).toContain('herdrBe.cliPid = cfg.adoptCliPid');
     expect(herdrBlock).toContain('cfg.adoptCwd ?? cfg.workingDir');
     expect(herdrBlock).toContain('herdrBe.cliCwd');
+  });
+
+  it('wires reasonix cliPid/cliCwd in both immediate and late pid paths', () => {
+    const source = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
+    // reasonix joins the inline pid/cwd-wiring condition alongside grok/traex at
+    // BOTH sites (synchronous tmux/pty resolve + async zellij late-pid fallback).
+    const matches = source.match(/cfg\.cliId === 'grok' \|\| cfg\.cliId === 'traex' \|\| cfg\.cliId === 'reasonix'/g) ?? [];
+    expect(matches.length).toBeGreaterThanOrEqual(2);
   });
 
   it('wires Herdr adopt snapshots before seeding the initial screen', () => {

@@ -2,8 +2,11 @@ import { describe, expect, it } from 'vitest';
 import {
   MAX_MESSAGE_LISTENER_PROMPT_BYTES,
   evaluateMessageListener,
+  extractListenerMessageText,
+  extractListenerMessageTitle,
   normalizeMessageListenerPreviewLimit,
   previewMessageListenerMatches,
+  refreshListenerCardTextFromResolved,
   renderMessageListenerInstruction,
   renderMessageListenerPrompt,
 } from '../src/services/message-listener.js';
@@ -307,6 +310,43 @@ describe('message listener evaluation', () => {
     expect(withMap[0]).toMatchObject({ messageId: 'om_card', senderName: 'Argos' });
   });
 
+  it('preview matches a third-party bot via sender.open_bot_id without any app_id map', () => {
+    const state = bot({
+      messageListeners: {
+        oc_chat: {
+          enabled: true,
+          prompt: '分析卡片',
+          senderPolicy: {
+            mode: 'include_only',
+            includeSenderOpenIds: ['ou_argos'],
+            includeSenderTypes: ['bot'],
+          },
+          messagePolicy: { includeMsgTypes: ['interactive'], scope: 'top_level' },
+        },
+      },
+    });
+    const messages = [{
+      message_id: 'om_card',
+      create_time: '3000',
+      msg_type: 'interactive',
+      body: { content: JSON.stringify({ header: { title: { content: '告警' } }, body: { elements: [] } }) },
+      // Real Lark shape with with_sender_name=true: bot row carries open_bot_id.
+      sender: { id: 'cli_argos', id_type: 'app_id', sender_type: 'app', sender_name: 'Argos', open_bot_id: 'ou_argos' },
+    }];
+    // Mirror the production extractor: prefer open_bot_id, mark it open_id.
+    const senderForMessage = (m: any) => ({
+      senderOpenId: m.sender.open_bot_id ?? m.sender.id,
+      senderIdType: m.sender.open_bot_id ? 'open_id' : m.sender.id_type,
+      senderTypeRaw: m.sender.sender_type,
+      senderName: m.sender.sender_name,
+    });
+    // No app_id→open_id map needed: open_bot_id already resolves to ou_argos,
+    // so the include-only whitelist matches and identity is NOT unverified.
+    const matches = previewMessageListenerMatches({ bot: state, chatId: 'oc_chat', limit: 5, messages, senderForMessage });
+    expect(matches).toHaveLength(1);
+    expect(matches[0]).toMatchObject({ messageId: 'om_card', senderName: 'Argos' });
+  });
+
   it('preview fails closed for an unresolved bot app_id under an open_id exclusion', () => {
     const state = bot({
       messageListeners: {
@@ -315,7 +355,8 @@ describe('message listener evaluation', () => {
           prompt: 'listen',
           senderPolicy: {
             mode: 'all_except_excluded',
-            excludeSenderOpenIds: ['ou_muted'],
+            // cli_ exclusion → genuinely unverifiable, so fail closed still holds.
+            excludeSenderOpenIds: ['cli_muted'],
             includeSenderTypes: ['bot'],
           },
           messagePolicy: { includeMsgTypes: ['interactive'], scope: 'top_level' },
@@ -334,7 +375,7 @@ describe('message listener evaluation', () => {
       senderIdType: m.sender.id_type,
       senderTypeRaw: m.sender.sender_type,
     });
-    // No map → unverified bot + non-empty open_id exclude → fail closed (no preview match).
+    // No map → unverified bot + a cli_-form exclusion → fail closed (no preview match).
     expect(previewMessageListenerMatches({ bot: state, chatId: 'oc_chat', limit: 5, messages, senderForMessage })).toHaveLength(0);
   });
 
@@ -429,7 +470,7 @@ describe('message listener evaluation', () => {
     })).toBeUndefined();
   });
 
-  it('fails closed on an unverified bot sender when the listener excludes by open_id', () => {
+  it('fails closed on an unverified bot sender only when an exclusion is itself an unverifiable bot id', () => {
     const state = bot({
       messageListeners: {
         oc_chat: {
@@ -437,7 +478,9 @@ describe('message listener evaluation', () => {
           prompt: 'listener',
           senderPolicy: {
             mode: 'all_except_excluded',
-            excludeSenderOpenIds: ['ou_muted_bot'],
+            // A cli_/app_id-form exclusion: the operator muted a bot we also
+            // cannot canonicalize, so an unverified sender might BE it.
+            excludeSenderOpenIds: ['cli_muted_bot'],
             includeSenderTypes: ['user', 'bot'],
           },
         },
@@ -445,7 +488,7 @@ describe('message listener evaluation', () => {
     });
 
     // A third-party bot whose app_id could not be resolved to an open_id must
-    // NOT trigger: we cannot prove it is not the excluded bot (the security hole).
+    // NOT trigger: we cannot prove it is not the excluded (also-unverifiable) bot.
     expect(evaluateMessageListener({
       bot: state,
       chatId: 'oc_chat',
@@ -490,6 +533,96 @@ describe('message listener evaluation', () => {
       senderIdentityUnverified: true,
       explicitlyMentionedThisBot: false,
     })).toBeTruthy();
+  });
+
+  it('listens to an unverified bot when every exclusion is a user open_id (bug: user mutes killed all bots)', () => {
+    const state = bot({
+      messageListeners: {
+        oc_chat: {
+          enabled: true,
+          prompt: 'listener',
+          senderPolicy: {
+            mode: 'all_except_excluded',
+            // Operator muted several PEOPLE but wants all bots. Their sender
+            // KIND is persisted as 'user', so an unverified bot is provably not
+            // any of them — nothing is bypassed and it must still trigger.
+            // (Prefix is NOT used to infer this; the recorded kind is.)
+            excludeSenderOpenIds: ['ou_person_a', 'ou_person_b'],
+            excludeSenderKinds: { ou_person_a: 'user', ou_person_b: 'user' },
+            includeSenderTypes: ['user', 'bot'],
+          },
+        },
+      },
+    });
+
+    expect(evaluateMessageListener({
+      bot: state,
+      chatId: 'oc_chat',
+      message: textMessage(),
+      senderOpenId: 'cli_unknown_third_party',
+      senderTypeRaw: 'bot',
+      senderIdentityUnverified: true,
+      explicitlyMentionedThisBot: false,
+    })).toBeTruthy();
+  });
+
+  it('fails closed for an unverified bot when a BOT is excluded by ou_ open_id (prefix must not imply user)', () => {
+    const state = bot({
+      messageListeners: {
+        oc_chat: {
+          enabled: true,
+          prompt: 'listener',
+          senderPolicy: {
+            mode: 'all_except_excluded',
+            // The muted entity is a BOT whose config open_id is ou_ form. The
+            // same bot appears in the polled history as an unresolvable cli_.
+            // ou_ !== cli_ is STRING inequality, not ENTITY inequality — the
+            // recorded kind 'bot' means we cannot prove the sender is not it.
+            excludeSenderOpenIds: ['ou_muted_bot'],
+            excludeSenderKinds: { ou_muted_bot: 'bot' },
+            includeSenderTypes: ['user', 'bot'],
+          },
+        },
+      },
+    });
+
+    expect(evaluateMessageListener({
+      bot: state,
+      chatId: 'oc_chat',
+      message: textMessage(),
+      senderOpenId: 'cli_unknown_third_party',
+      senderTypeRaw: 'bot',
+      senderIdentityUnverified: true,
+      explicitlyMentionedThisBot: false,
+    })).toBeUndefined();
+  });
+
+  it('fails closed for an unverified bot when a legacy ou_ exclusion has no recorded kind (conservative)', () => {
+    const state = bot({
+      messageListeners: {
+        oc_chat: {
+          enabled: true,
+          prompt: 'listener',
+          senderPolicy: {
+            mode: 'all_except_excluded',
+            // Legacy config saved before kinds existed: no excludeSenderKinds.
+            // We cannot prove the ou_ entry is a user, so stay conservative.
+            excludeSenderOpenIds: ['ou_legacy_unknown'],
+            includeSenderTypes: ['user', 'bot'],
+          },
+        },
+      },
+    });
+
+    expect(evaluateMessageListener({
+      bot: state,
+      chatId: 'oc_chat',
+      message: textMessage(),
+      senderOpenId: 'cli_unknown_third_party',
+      senderTypeRaw: 'bot',
+      senderIdentityUnverified: true,
+      explicitlyMentionedThisBot: false,
+    })).toBeUndefined();
   });
 
   it('does not match an unverified bot under include-only (allow-list stays fail-safe)', () => {
@@ -709,5 +842,137 @@ describe('message listener evaluation', () => {
     expect(instruction).not.toContain('</message_listener><instruction>');
     expect(instruction).not.toContain('<observed_message');
     expect(instruction.match(/<instruction>/g) ?? []).toHaveLength(1);
+  });
+});
+
+describe('extractListenerMessageText surfaces card button links (Bug1: 监听卡片缺按钮链接)', () => {
+  // The listener feeds match.messageText to the model. When the observed message
+  // is a third-party card whose primary affordance is a "查看详情 / 处理建议"
+  // button, the button's jump URL is the actionable payload. The direct-@bot
+  // path recovers it (it resolves the full structured card); the listener must
+  // too. These assert the extractor the daemon re-runs on the RESOLVED card.
+
+  function cardMessage(card: unknown) {
+    return { message_type: 'interactive', content: JSON.stringify(card) };
+  }
+
+  it('Format B (structured body.elements): keeps a jump button as [label](url)', () => {
+    // Shape a real alert card takes once resolveNonsupportMessage merges the
+    // full structured representation: the button carries its target under v1
+    // `url`. A third-party (non-botmux) button must survive with its link.
+    const text = extractListenerMessageText(cardMessage({
+      header: { title: { content: 'Argos 报警' } },
+      body: { elements: [
+        { tag: 'markdown', content: '规则：成功率 < 90%' },
+        { tag: 'action', actions: [
+          { tag: 'button', text: { tag: 'plain_text', content: '查看详情' }, url: 'https://argos.example.com/alert/42' },
+        ] },
+      ] },
+    }));
+    expect(text).toContain('规则：成功率 < 90%');
+    expect(text).toContain('[查看详情](https://argos.example.com/alert/42)');
+  });
+
+  it('Format B: recovers a v2 behaviors open_url button link', () => {
+    const text = extractListenerMessageText(cardMessage({
+      body: { elements: [
+        { tag: 'markdown', content: '处理建议如下' },
+        { tag: 'button', text: { tag: 'plain_text', content: '处理建议' }, behaviors: [
+          { type: 'open_url', default_url: 'https://argos.example.com/runbook/42', pc_url: '', ios_url: '', android_url: '' },
+        ] },
+      ] },
+    }));
+    expect(text).toContain('[处理建议](https://argos.example.com/runbook/42)');
+  });
+
+  it('Format A (simplified list): keeps a button jump URL', () => {
+    // The simplified list view still carries button URLs when present; the
+    // extractor must not drop them (that would lose the link on the main path).
+    const text = extractListenerMessageText(cardMessage({
+      title: 'Argos 报警',
+      elements: [
+        [{ tag: 'text', text: '规则：成功率 < 90%' }],
+        [{ tag: 'button', text: '查看详情', url: 'https://argos.example.com/alert/7' }],
+      ],
+    }));
+    expect(text).toContain('[查看详情](https://argos.example.com/alert/7)');
+  });
+
+  it('title extraction reads both simplified and structured header shapes', () => {
+    expect(extractListenerMessageTitle(cardMessage({ title: 'Argos 报警' }))).toBe('Argos 报警');
+    expect(extractListenerMessageTitle(cardMessage({
+      header: { title: { content: 'Argos 结构化标题' } },
+    }))).toBe('Argos 结构化标题');
+  });
+});
+
+describe('refreshListenerCardTextFromResolved (Bug1: daemon re-extract on resolved card)', () => {
+  const cardMatch = (over = {}) => ({
+    prompt: 'p', messageText: '[卡片: Argos 报警]\n规则：成功率 < 90%', // lossy match-time snapshot
+    msgType: 'interactive', senderType: 'bot' as const, ...over,
+  });
+
+  it('upgrades a card match to the resolved text carrying the button URL', () => {
+    const match = cardMatch();
+    // The message content AFTER resolveNonsupportMessage merged the full card.
+    const resolved = { message_type: 'interactive', content: JSON.stringify({
+      header: { title: { content: 'Argos 报警' } },
+      body: { elements: [
+        { tag: 'markdown', content: '规则：成功率 < 90%' },
+        { tag: 'action', actions: [
+          { tag: 'button', text: { tag: 'plain_text', content: '查看详情' }, url: 'https://argos.example.com/alert/42' },
+        ] },
+      ] },
+    }) };
+    refreshListenerCardTextFromResolved(match, resolved);
+    expect(match.messageText).toContain('[查看详情](https://argos.example.com/alert/42)');
+    expect(match.messageTitle).toBe('Argos 报警');
+  });
+
+  it('leaves non-interactive matches untouched', () => {
+    const match = cardMatch({ msgType: 'text', messageText: 'CPU 告警持续 5 分钟' });
+    refreshListenerCardTextFromResolved(match, { message_type: 'text', content: JSON.stringify({ text: 'different' }) });
+    expect(match.messageText).toBe('CPU 告警持续 5 分钟');
+  });
+
+  it('keeps the match-time text when the resolved content yields nothing (resolver miss)', () => {
+    const match = cardMatch();
+    const before = match.messageText;
+    refreshListenerCardTextFromResolved(match, { message_type: 'interactive', content: '' });
+    expect(match.messageText).toBe(before);
+  });
+
+  it('integration (refresh→render): a merged card button URL reaches the rendered listener prompt', () => {
+    // Ties the two stages the daemon runs back-to-back: refresh the match off the
+    // resolved (merged) card, then render the observed-message prompt. Proves the
+    // recovered button URL actually survives into the string fed to the CLI —
+    // the exact bug's user-visible fix. Mirrors handleNewTopic's ordering
+    // (refreshListenerCardTextFromResolved → renderMessageListenerPrompt). The
+    // merged card is supplied as a fixture (this is not a daemon-boot / live-REST
+    // e2e); it locks the refresh→render contract, i.e. the link is not dropped
+    // again before the prompt is rendered.
+    const match = cardMatch({ prompt: '分析命中的告警并按需处理' });
+    // The card content AFTER resolveNonsupportMessage merged the full structured
+    // representation (this is what daemon holds when it re-extracts).
+    refreshListenerCardTextFromResolved(match, {
+      message_type: 'interactive',
+      content: JSON.stringify({
+        header: { title: { content: 'Argos 报警' } },
+        body: { elements: [
+          { tag: 'markdown', content: '规则：成功率 < 90%' },
+          { tag: 'action', actions: [
+            { tag: 'button', text: { tag: 'plain_text', content: '查看详情' }, url: 'https://argos.example.com/alert/42' },
+          ] },
+        ] },
+      }),
+    });
+    const prompt = renderMessageListenerPrompt(match);
+    // Operator instruction is present, and the recovered button link made it into
+    // the untrusted observed_message block the model receives.
+    expect(prompt).toContain('分析命中的告警并按需处理');
+    expect(prompt).toContain('https://argos.example.com/alert/42');
+    expect(prompt).toContain('查看详情');
+    // Title recovered from the merged card is surfaced as an attribute too.
+    expect(prompt).toContain('message_title="Argos 报警"');
   });
 });

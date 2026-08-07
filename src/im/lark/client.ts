@@ -15,6 +15,7 @@ import { resolveTeamRoleFile } from '../../core/role-resolver.js';
 import { type Brand, larkHosts, normalizeBrand, sdkDomain } from './lark-hosts.js';
 import { canonicalMobileKey, isMobileEntry, normalizeMobileEntry } from '../../setup/bot-config-editor.js';
 import { stampBotmuxCallbackMarkers } from './callback-button-marker.js';
+import type { ChatContext } from '../../types.js';
 
 type LarkRequestParams = Record<string, string | number | boolean | undefined>;
 
@@ -634,6 +635,55 @@ export async function getChatName(larkAppId: string, chatId: string): Promise<st
 }
 
 /**
+ * 获取入群自动开工所需的群上下文。群模式、群名和群描述来自同一次
+ * chat.get，失败时保留 unavailable，避免把读取失败误判成字段为空。
+ */
+export async function getChatContext(larkAppId: string, chatId: string): Promise<ChatContext> {
+  const unavailable: ChatContext = {
+    chatId,
+    name: null,
+    description: null,
+    mode: 'unknown',
+    fetchStatus: 'unavailable',
+  };
+  try {
+    const c = getBotClient(larkAppId);
+    const res = await larkGet(c, `/open-apis/im/v1/chats/${encodeURIComponent(chatId)}`);
+    if (res.code !== 0) {
+      logger.warn(`getChatContext(${chatId}) failed: ${res.msg} (code: ${res.code})`);
+      return unavailable;
+    }
+
+    const rawMode = String(res.data?.chat_mode ?? '').toLowerCase();
+    const rawGmt = String(res.data?.group_message_type ?? '').toLowerCase();
+    let mode: ChatMode | 'unknown';
+    if (rawMode === 'p2p') mode = 'p2p';
+    else if (rawMode === 'topic' || rawGmt === 'thread') mode = 'topic';
+    else if (rawMode === 'group') mode = 'group';
+    else mode = 'unknown';
+
+    if (mode !== 'unknown') {
+      chatModeCache.set(`${larkAppId}::${chatId}`, { mode, cachedAt: Date.now() });
+    } else {
+      logger.warn(`getChatContext(${chatId}) unrecognized chat_mode='${rawMode}'`);
+    }
+
+    const name = String(res.data?.name ?? '').trim();
+    const description = String(res.data?.description ?? '').trim();
+    return {
+      chatId,
+      name: name || null,
+      description: description || null,
+      mode,
+      fetchStatus: 'ok',
+    };
+  } catch (err: any) {
+    logger.warn(`getChatContext(${chatId}) errored: ${err?.message ?? err}`);
+    return unavailable;
+  }
+}
+
+/**
  * One-shot fetch of both the chat's display name AND its mode (普通群 /
  * 话题群 / p2p) — saves a duplicate API call when the caller wants both
  * (the /relay picker needs name for display and mode for the type tag).
@@ -947,6 +997,37 @@ export async function getMessageChatId(
       throw options.signal.reason instanceof Error ? options.signal.reason : err;
     }
     logger.debug(`[message] failed to resolve chat_id for ${messageId.substring(0, 12)}: ${err instanceof Error ? err.message : err}`);
+    return null;
+  }
+}
+
+/** Resolve the `omt_...` topic id for an `om_...` topic-root message. Topic
+ *  routing itself keeps using the root message id; this helper is only for
+ *  client AppLinks. */
+export async function getMessageThreadId(
+  larkAppId: string,
+  messageId: string,
+  options?: LarkRequestOptions,
+): Promise<string | null> {
+  try {
+    const detail = await getMessageDetail(larkAppId, messageId, {
+      userCardContent: false,
+      ...options,
+    });
+    const candidates = [
+      detail?.items?.[0]?.thread_id,
+      detail?.thread_id,
+      detail?.message?.thread_id,
+    ];
+    for (const value of candidates) {
+      if (typeof value === 'string' && value.trim()) return value.trim();
+    }
+    return null;
+  } catch (err) {
+    if (options?.signal?.aborted) {
+      throw options.signal.reason instanceof Error ? options.signal.reason : err;
+    }
+    logger.debug(`[message] failed to resolve thread_id for ${messageId.substring(0, 12)}: ${err instanceof Error ? err.message : err}`);
     return null;
   }
 }

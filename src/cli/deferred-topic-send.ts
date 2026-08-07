@@ -27,6 +27,34 @@ export interface DeferredTopicSendResult {
   materializedNow?: boolean;
 }
 
+export function deferredTopicBindingMatches(
+  session: DeferredTopicSendSession,
+  binding: DeferredTopicBinding,
+): boolean {
+  const run = session.deferredScheduleRun;
+  return !!run
+    && binding.sessionId === session.sessionId
+    && binding.turnId === run.turnId
+    && binding.chatId === session.chatId
+    && binding.larkAppId === session.larkAppId
+    && binding.routingAnchor === run.routingAnchor;
+}
+
+/** Existing deferred runs reply into their materialized topic before the
+ * nominal send target is considered. Mirror that precedence for advisory
+ * reachability without materializing a new topic. */
+export function reusableDeferredTopicRoot(input: {
+  session: DeferredTopicSendSession;
+  binding: DeferredTopicBinding | undefined;
+  explicitTopLevel: boolean;
+  reuseBoundRootWhenTopLevel?: boolean;
+}): string | undefined {
+  const { binding } = input;
+  if (!binding || !deferredTopicBindingMatches(input.session, binding)) return undefined;
+  if (input.explicitTopLevel && !input.reuseBoundRootWhenTopLevel) return undefined;
+  return binding.rootMessageId;
+}
+
 /** Route one `botmux send` effect for a lazily-materialized schedule topic.
  * The per-session file lock spans the provider request so two concurrent CLI
  * processes cannot both create a root. A stable provider UUID (sessionId)
@@ -50,12 +78,7 @@ export async function dispatchDeferredTopicSend(opts: {
   return withDeferredTopicBindingLock(opts.dataDir, opts.session.sessionId, async () => {
     const existing = readDeferredTopicBinding(opts.dataDir, opts.session.sessionId);
     if (existing) {
-      if (
-        existing.turnId !== run.turnId
-        || existing.chatId !== opts.session.chatId
-        || existing.larkAppId !== opts.session.larkAppId
-        || existing.routingAnchor !== run.routingAnchor
-      ) {
+      if (!deferredTopicBindingMatches(opts.session, existing)) {
         throw new Error('deferred topic binding identity mismatch');
       }
       if (opts.explicitTopLevel && !opts.reuseBoundRootWhenTopLevel) return { handled: false };

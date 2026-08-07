@@ -1,0 +1,83 @@
+{
+  "name": "botmux-workflow-core",
+  "version": "0.0.0",
+  "description": "Daemon-independent Workflow v3 schema, scheduler, control policy, and host contracts",
+  "type": "module",
+  "sideEffects": false,
+  "main": "./dist/cjs/index.cjs",
+  "module": "./dist/esm/index.js",
+  "types": "./dist/types/packages/workflow-core/src/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/types/packages/workflow-core/src/index.d.ts",
+      "import": "./dist/esm/index.js",
+      "require": "./dist/cjs/index.cjs"
+    },
+    "./schema": {
+      "types": "./dist/types/packages/workflow-core/src/schema.d.ts",
+      "import": "./dist/esm/schema.js",
+      "require": "./dist/cjs/schema.cjs"
+    },
+    "./engine": {
+      "types": "./dist/types/packages/workflow-core/src/engine.d.ts",
+      "import": "./dist/esm/engine.js",
+      "require": "./dist/cjs/engine.cjs"
+    },
+    "./control": {
+      "types": "./dist/types/packages/workflow-core/src/control.d.ts",
+      "import": "./dist/esm/control.js",
+      "require": "./dist/cjs/control.cjs"
+    },
+    "./gate-policy": {
+      "types": "./dist/types/packages/workflow-core/src/gate-policy.d.ts",
+      "import": "./dist/esm/gate-policy.js",
+      "require": "./dist/cjs/gate-policy.cjs"
+    },
+    "./host-contract": {
+      "types": "./dist/types/packages/workflow-core/src/host-contract.d.ts",
+      "import": "./dist/esm/host-contract.js",
+      "require": "./dist/cjs/host-contract.cjs"
+    },
+    "./runtime": {
+      "types": "./dist/types/packages/workflow-core/src/runtime.d.ts",
+      "import": "./dist/esm/runtime.js",
+      "require": "./dist/cjs/runtime.cjs"
+    },
+    "./events": {
+      "types": "./dist/types/packages/workflow-core/src/events.d.ts",
+      "import": "./dist/esm/events.js",
+      "require": "./dist/cjs/events.cjs"
+    },
+    "./host-bindings": {
+      "types": "./dist/types/packages/workflow-core/src/host-bindings.d.ts",
+      "import": "./dist/esm/host-bindings.js",
+      "require": "./dist/cjs/host-bindings.cjs"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist/",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "node ../../scripts/build-workflow-core-package.mjs",
+    "test": "pnpm run build && node ../../scripts/test-workflow-core-package.mjs",
+    "pack:local": "pnpm run build && node ../../scripts/pack-workflow-core-package.mjs",
+    "prepare": "pnpm run build",
+    "prepublishOnly": "pnpm run test"
+  },
+  "publishConfig": {
+    "registry": "https://registry.npmjs.org/",
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "devDependencies": {
+    "@types/node": "22.19.19",
+    "esbuild": "0.28.0",
+    "typescript": "5.9.3"
+  },
+  "license": "MIT"
+}

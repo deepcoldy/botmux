@@ -83,6 +83,32 @@ describe('attention signals', () => {
     expect(quiet.tuiPromptActive).toBe(false);
   });
 
+  it('projects the frozen runtime identity without changing the adapter id', () => {
+    const ds = makeDs();
+    ds.session.cliId = 'codex';
+    ds.session.cliRuntime = {
+      id: 'vendor-codex',
+      displayName: 'Vendor Codex',
+      executable: '/opt/vendor-codex',
+      source: 'configured',
+      update: { provider: 'none' },
+    };
+    expect(composeRowFromActive(ds)).toMatchObject({
+      cliId: 'codex',
+      runtimeId: 'vendor-codex',
+      runtimeDisplayName: 'Vendor Codex',
+    });
+
+    const legacy = structuredClone(ds.session);
+    delete legacy.cliRuntime;
+    legacy.cliPathOverride = 'C:\\tools\\legacy-codex.exe';
+    expect(composeRowFromClosed(legacy)).toMatchObject({
+      cliId: 'codex',
+      runtimeId: 'legacy-codex.exe',
+      runtimeDisplayName: 'legacy-codex.exe',
+    });
+  });
+
   it('composeRowFromActive marks restored workerless active sessions as dormant', () => {
     expect(composeRowFromActive(makeDs()).status).toBe('dormant');
     expect(composeRowFromActive(makeDs({ worker: {} as any })).status).toBe('starting');

@@ -1,4 +1,5 @@
 import { store } from './store.js';
+import type { CliRuntimeConfig as SharedCliRuntimeConfig } from '../../adapters/cli/runtime.js';
 
 export type CliOption = {
   id: string;
@@ -15,6 +16,10 @@ export type CliOptionsState = {
   ttadkModelDefault: string;
   ttadkModelSuggestions: string[];
 };
+
+/** Keep the browser payload contract tied to the daemon's canonical schema. */
+export type CliRuntimeConfig = SharedCliRuntimeConfig;
+export type CliRuntimeUpdateProvider = NonNullable<SharedCliRuntimeConfig['update']>['provider'];
 
 export type BotSubstituteTarget = {
   openId?: string;
@@ -43,6 +48,10 @@ export type BotDefaultsRow = {
   larkAppId: string;
   botName?: string;
   cliId?: string;
+  /** Absent/null is the built-in runtime. Older dashboard payloads omit it. */
+  cliRuntime?: CliRuntimeConfig | null;
+  /** Legacy path-only executable override, returned only by private Bot Defaults APIs. */
+  cliPathOverride?: string | null;
   wrapperCli?: string | null;
   model?: string;
   agentSelectionKey?: string;
@@ -70,6 +79,8 @@ export type BotDefaultsRow = {
   overloadAlert?: boolean;
   botToBotSameDir?: boolean;
   summaryRange?: { limit?: number; sinceHours?: number };
+  summaryMemory?: boolean;
+  summaryMemoryPath?: string;
   p2pMode?: string;
   regularGroupReplyMode?: string;
   regularGroupMentionMode?: string;

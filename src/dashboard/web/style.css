@@ -4209,6 +4209,30 @@ td code,
   justify-self: center;
 }
 
+.auth-expired-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 8px;
+}
+
+.auth-login-link {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 34px;
+  padding: 0 18px;
+  border-radius: var(--radius-lg);
+  background: var(--accent);
+  color: var(--on-accent);
+  font-size: 13px;
+  text-decoration: none;
+}
+
+.auth-login-link:hover {
+  filter: brightness(.96);
+}
+
 .checkbox-row {
   display: flex;
   flex-wrap: wrap;
@@ -7430,7 +7454,13 @@ dialog.onboarding-dialog::backdrop {
 .roles-listener-members {
   display: flex;
   flex-direction: column;
-  min-height: 0;
+  /* Do not let this box shrink: it is a flex child of the listener editor and
+     the whole form (.roles-editor-form) is the scroll container. With the old
+     `min-height:0` it collapsed to ~0 on shorter viewports (≲800px tall) and,
+     combined with `overflow:hidden`, clipped the member rows entirely — the
+     picker looked empty and the wheel had nothing to reveal. Keeping its full
+     content height lets the form overflow and scroll normally. */
+  flex-shrink: 0;
   border: 1px solid var(--border-soft);
   border-radius: var(--radius-lg);
   overflow: hidden;
@@ -8273,9 +8303,8 @@ button.dashboard-version-chip:hover,
   color: var(--fg);
 }
 .dashboard-version-popover {
-  position: absolute;
-  top: calc(100% + 8px);
-  left: 0;
+  position: fixed;
+  z-index: 1601;
   display: flex;
   flex-direction: column;
   width: min(340px, calc(100vw - 32px));
@@ -12894,7 +12923,6 @@ dialog :where(input:not([type=checkbox], [type=radio]), select, textarea) {
   }
   .dashboard-version-control { margin-left: 33px; }
   .dashboard-version-popover {
-    left: -33px;
     width: min(340px, calc(100vw - 24px));
   }
   .topbar-left {
@@ -22893,6 +22921,105 @@ dialog select[multiple]:hover:not(:disabled) {
   line-height: 1.35;
 }
 
+.bot-defaults-page .bd-codex-runtime {
+  display: grid;
+  gap: 10px;
+  margin-top: 14px;
+  padding-top: 14px;
+  border-top: 1px solid color-mix(in srgb, var(--border-soft) 82%, transparent);
+}
+
+.bot-defaults-page .bd-runtime-heading {
+  color: var(--fg);
+  font-size: 12px;
+  font-weight: 700;
+  line-height: 1.35;
+}
+
+.bot-defaults-page .bd-runtime-mode {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 4px;
+  padding: 4px;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-lg);
+  background: var(--surface-muted);
+}
+
+.bot-defaults-page .bd-runtime-mode > button {
+  min-width: 0;
+  min-height: var(--button-height);
+  padding: 0 12px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-md);
+  background: transparent;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+  line-height: 1.2;
+  box-shadow: none;
+}
+
+.bot-defaults-page .bd-runtime-mode > button[aria-pressed="true"] {
+  border-color: color-mix(in srgb, var(--accent) 46%, var(--border-soft));
+  background: var(--surface);
+  color: var(--accent-strong);
+}
+
+.bot-defaults-page .bd-runtime-mode > button:hover:not(:disabled),
+.bot-defaults-page .bd-runtime-mode > button:focus-visible {
+  border-color: var(--accent);
+  color: var(--accent-strong);
+  outline: none;
+}
+
+.bot-defaults-page .bd-runtime-mode > button:active:not(:disabled) {
+  transform: scale(.99);
+}
+
+.bot-defaults-page .bd-runtime-note {
+  margin: -2px 0 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.bot-defaults-page .bd-runtime-fields {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+  min-width: 0;
+}
+
+.bot-defaults-page .bd-runtime-fields > :where(label, .bd-field) {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+}
+
+.bot-defaults-page .bd-runtime-fields > :where(label, .bd-field) > span {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1.35;
+}
+
+.bot-defaults-page .bd-runtime-fields > .bd-runtime-wide {
+  grid-column: 1 / -1;
+}
+
+.bot-defaults-page .bd-codex-runtime > .oncall-status {
+  display: block;
+  margin-top: 2px;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.bot-defaults-page .bd-codex-runtime > .oncall-status:empty {
+  display: none;
+}
+
 .bot-defaults-page .bd-field-title,
 .bot-defaults-page .toggle-tx .bd-field-title,
 .bot-defaults-page :where(.bd-section-title, .bd-subsection-title) .bd-field-title,
@@ -23206,6 +23333,14 @@ dialog select[multiple]:hover:not(:disabled) {
 @media (max-width: 720px) {
   .bot-defaults-page .bd-toggle-grid {
     grid-template-columns: 1fr;
+  }
+
+  .bot-defaults-page .bd-runtime-fields {
+    grid-template-columns: 1fr;
+  }
+
+  .bot-defaults-page .bd-runtime-fields > .bd-runtime-wide {
+    grid-column: auto;
   }
 
   .bot-defaults-page .bd-substitute-target-row {

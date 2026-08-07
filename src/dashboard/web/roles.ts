@@ -48,6 +48,7 @@ export interface MessageListenerData {
     mode?: 'all_except_excluded' | 'include_only';
     includeSenderOpenIds?: string[];
     excludeSenderOpenIds?: string[];
+    excludeSenderKinds?: Record<string, 'user' | 'bot'>;
     includeSenderTypes?: Array<'user' | 'bot'>;
     excludeSenderTypes?: Array<'user' | 'bot'>;
     excludeSelf?: boolean;

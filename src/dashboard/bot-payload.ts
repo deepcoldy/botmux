@@ -1,12 +1,16 @@
 import { defaultSummaryRangePrefs, summaryRangeFromLegacyContentTriggers } from '../services/summary-range-store.js';
 import { selectionKeyForBot } from '../setup/cli-selection.js';
 import { normalizeUsageDisplay } from '../bot-registry.js';
+import type { CliRuntimeConfig } from '../adapters/cli/runtime.js';
 
 export interface DashboardBotDescriptor {
   larkAppId: string;
   botName?: string | null;
   botAvatarUrl?: string;
   cliId?: string;
+  cliRuntime?: CliRuntimeConfig;
+  /** Legacy executable override. Private Bot Defaults payload only. */
+  cliPathOverride?: string;
   wrapperCli?: string;
   model?: string;
 }
@@ -25,6 +29,8 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     larkAppId: bot.larkAppId,
     botName: bot.botName,
     ...(bot.cliId ? { cliId: bot.cliId } : {}),
+    ...(bot.cliRuntime ? { cliRuntime: bot.cliRuntime } : {}),
+    ...(bot.cliPathOverride ? { cliPathOverride: bot.cliPathOverride } : {}),
     ...(bot.wrapperCli ? { wrapperCli: bot.wrapperCli } : {}),
     ...(bot.model ? { model: bot.model } : {}),
     // 「修改 CLI」下拉的当前选中项（cliId+wrapperCli → 选择键），wrapper 网关形态
@@ -71,6 +77,8 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     summaryRange: j?.summaryRange
       ?? summaryRangeFromLegacyContentTriggers(j?.contentTriggers)
       ?? defaultSummaryRangePrefs(),
+    summaryMemory: j?.summaryMemory === true,
+    summaryMemoryPath: typeof j?.summaryMemoryPath === 'string' && j.summaryMemoryPath.trim() ? j.summaryMemoryPath.trim() : 'summary.md',
     regularGroupReplyMode: (j?.regularGroupReplyMode === 'chat' || j?.regularGroupReplyMode === 'new-topic' || j?.regularGroupReplyMode === 'shared')
       ? j.regularGroupReplyMode
       : 'chat-topic',

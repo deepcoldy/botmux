@@ -68,6 +68,24 @@ describe('parseSetupCommand', () => {
     });
   });
 
+  it('parses --cli-runtime as an add/edit field without changing legacy flags', () => {
+    const runtime = JSON.stringify({
+      id: 'vendor-codex',
+      displayName: 'VendorCodex',
+      executable: 'vendor-codex',
+      update: { provider: 'auto' },
+    });
+    expect(parseSetupCommand(['add', '--cli', 'codex', '--cli-runtime', runtime])).toMatchObject({
+      action: 'add',
+      flags: { cli: 'codex', cliRuntime: runtime },
+    });
+    expect(parseSetupCommand(['edit', 'botmux-0', '--cli-runtime=-'])).toMatchObject({
+      action: 'edit',
+      selector: 'botmux-0',
+      flags: { cliRuntime: '-' },
+    });
+  });
+
   it('parses --open-platform-auto with last-one-wins against --no-open-platform-auto', () => {
     const on = parseSetupCommand(['add', '--open-platform-auto']);
     expect(on).toMatchObject({ action: 'add', openPlatformAuto: true });
@@ -188,6 +206,42 @@ describe('buildBotFromAddFlags', () => {
     expect(bot.wrapperCli).toBe('aiden x claude');
   });
 
+  it('builds a Codex-compatible runtime from --cli-runtime JSON', () => {
+    const runtime = JSON.stringify({
+      id: 'vendor-codex',
+      displayName: 'VendorCodex',
+      executable: 'vendor-codex',
+      update: { provider: 'auto' },
+    });
+    const bot = buildBotFromAddFlags({ ...REQUIRED, cli: 'codex', cliRuntime: runtime });
+    expect(bot.cliRuntime).toMatchObject({
+      id: 'vendor-codex',
+      displayName: 'VendorCodex',
+      executable: 'vendor-codex',
+      update: { provider: 'auto' },
+    });
+    expect(bot.cliPathOverride).toBe('vendor-codex');
+  });
+
+  it('rejects malformed --cli-runtime JSON and invalid runtime structure', () => {
+    expect(() => buildBotFromAddFlags({ ...REQUIRED, cli: 'codex', cliRuntime: '{bad' }))
+      .toThrow(/--cli-runtime 不是合法 JSON/);
+    expect(() => buildBotFromAddFlags({ ...REQUIRED, cli: 'codex', cliRuntime: '{"id":"vendor-codex"}' }))
+      .toThrow(/cliRuntime|executable/);
+  });
+
+  it('keeps path-only setup backwards-compatible but rejects two executable sources', () => {
+    const runtime = JSON.stringify({ id: 'vendor-codex', executable: 'vendor-codex', update: { provider: 'none' } });
+    expect(buildBotFromAddFlags({ ...REQUIRED, cli: 'codex', cliPath: '/opt/legacy/codex' }))
+      .toMatchObject({ cliId: 'codex', cliPathOverride: '/opt/legacy/codex' });
+    expect(() => buildBotFromAddFlags({
+      ...REQUIRED,
+      cli: 'codex',
+      cliRuntime: runtime,
+      cliPath: '/opt/legacy/codex',
+    })).toThrow(/cliRuntime conflicts with cliPathOverride/);
+  });
+
   it('lets an explicit --wrapper-cli override the --cli derived prefix, and "-" clear it', () => {
     const overridden = buildBotFromAddFlags({ ...REQUIRED, cli: 'aiden-x-claude', wrapperCli: 'ccr code' });
     expect(overridden.wrapperCli).toBe('ccr code');
@@ -241,10 +295,11 @@ describe('editInputFromFlags', () => {
   });
 
   it('clears wrapperCli when switching to a plain cli, keeps it for gateway keys', () => {
-    expect(editInputFromFlags({ cli: 'codex' })).toEqual({ cliChoice: 'codex', wrapperCli: null });
+    expect(editInputFromFlags({ cli: 'codex' })).toEqual({ cliChoice: 'codex', wrapperCli: null, cliRuntime: null });
     expect(editInputFromFlags({ cli: 'ttadk-x-codex' })).toEqual({
       cliChoice: 'codex',
       wrapperCli: 'ttadk codex',
+      cliRuntime: null,
     });
   });
 
@@ -252,12 +307,46 @@ describe('editInputFromFlags', () => {
     expect(editInputFromFlags({ cli: 'codex', wrapperCli: 'cjadk codex' })).toEqual({
       cliChoice: 'codex',
       wrapperCli: 'cjadk codex',
+      cliRuntime: null,
     });
   });
 
   it('passes tri-state clears through and rejects brand on edit', () => {
     expect(editInputFromFlags({ defaultWorkingDir: '-' })).toEqual({ defaultWorkingDir: '-' });
     expect(() => editInputFromFlags({ brand: 'lark' })).toThrow(/--brand 仅在 add 时可指定/);
+  });
+
+  it('maps --cli-runtime JSON and clear into the editor tri-state', () => {
+    const runtime = JSON.stringify({
+      id: 'vendor-codex',
+      executable: 'vendor-codex',
+      update: { provider: 'none' },
+    });
+    expect(editInputFromFlags({ cliRuntime: runtime })).toEqual({
+      cliRuntime: {
+        id: 'vendor-codex',
+        executable: 'vendor-codex',
+        update: { provider: 'none' },
+      },
+    });
+    expect(editInputFromFlags({ cliRuntime: '-' })).toEqual({ cliRuntime: null });
+  });
+
+  it('clears a stored runtime when an edit switches to a non-Codex CLI', () => {
+    const base = {
+      larkAppId: 'cli_x',
+      larkAppSecret: 's',
+      cliId: 'codex',
+      cliRuntime: {
+        id: 'vendor-codex',
+        executable: 'vendor-codex',
+        update: { provider: 'none' },
+      },
+    };
+    const updated = applyBotConfigEdits(base, editInputFromFlags({ cli: 'claude-code' }));
+    expect(updated.cliId).toBe('claude-code');
+    expect(updated.cliRuntime).toBeUndefined();
+    expect(updated.cliPathOverride).toBeUndefined();
   });
 });
 

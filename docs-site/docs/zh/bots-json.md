@@ -46,7 +46,8 @@
 | `name` | 进程名后缀，如 `claude-main` → `botmux-claude-main`；留空默认 `botmux-<序号>` |
 | `cliId` | CLI 适配器，默认 `claude-code`。见 [多 CLI 适配器](/adapters) |
 | `model` | 启动 CLI 用的模型名（如 `claude --model opus`）；留空走 CLI 默认。同一 `cliId` 的多个 bot 可跑不同模型。各适配器的 `modelChoices` 是 `botmux setup` 里给出的候选 |
-| `cliPathOverride` | CLI 入口绝对路径，用于套 wrapper / router（ccr、claude-w、aiden-x-claude 等） |
+| `cliRuntime` | Codex 兼容发行版的结构化运行时描述：`{ id, displayName?, executable, update? }`。它复用 `codex` 适配器，但版本、更新源和会话身份都属于该发行版。见 [Codex 兼容发行版](/adapters#codex-兼容发行版) |
+| `cliPathOverride` | 旧版 CLI 入口覆盖，继续兼容 wrapper / router 和存量自定义二进制。新接入的 Codex 兼容发行版优先用 `cliRuntime`。为支持降级到旧版 BotMux，写入端会同时保存一个与 `cliRuntime.executable` 完全相同的兼容影子；不要手工配置不一致的两者 |
 | `disableCliBypass` | `true` 时不自动追加 CLI 的免审批 / 沙箱绕过参数（`--yolo`、`--dangerously-*`）；缺省 / `false` 保持原行为 |
 | `backendType` | 会话后端，可选 `pty` / `tmux` / `herdr` / `zellij`。**留空默认 `tmux`**（PTY 已退役自动回落）：tmux/herdr/zellij 这类持久后端在本机不可用时**硬拦截**、弹卡提示安装，**不再静默降级 pty**（`zellij` 需 ≥ 0.44）。`pty` 仅作显式兜底（`backendType:"pty"` 或 `BACKEND_TYPE=pty`）——直连进程、**不跨 daemon 重启存活**。见 [tmux 后端](/tmux) |
 | `launchShell` | 启动 CLI 用的 shell，覆盖 daemon 的 `$SHELL`：填 shell 名（`zsh` / `bash` / `sh`）或绝对路径（如 `/usr/bin/zsh`）。用于登录 `$SHELL`（如 bash）的 rc 文件里有 `exec zsh` 之类跳转、在 botmux 的 `bash -i` 启动里把 CLI 顶掉、导致会话起不来（裸壳里 `parse error`）的场景——指定后直接用它启动、绕开被跳过的 rc。**注意**：PATH / nvm / pnpm 等要放进所选 shell 的 rc（如 `.zshrc` / `.zprofile`）。留空＝用 `$SHELL`。下个会话生效；仅 `tmux` / `zellij` 后端（`pty` 直接 exec CLI，本就不受影响）。也可在 dashboard「机器人默认设置 → 启动 Shell」或 `/config launchShell <值>` 配置 |
@@ -54,6 +55,32 @@
 | `customPassthroughCommands` | 在固定透传白名单和当前 CLI adapter 默认放行命令之上，额外放行透传给底层 CLI 的 slash 命令，如 `["/export"]`（Claude Code / Codex 的 `/goal` 已默认放行）。自动归一化（缺失的 `/` 自动补、转小写、仅留 `[a-z0-9:_-]`、去重）；会遮蔽 botmux daemon 命令（如 `/status`）的项会被丢弃，配了也不生效。用 `/list-slash-command` 查看完整放行清单。见 [斜杠命令](/slash-commands) |
 | `env` | 该 bot 的进程环境变量 `{ "KEY": "值" }`，注入到这个 bot 的 CLI 进程。最常见用途：让某个 bot 跑 GLM / 第三方 Anthropic·OpenAI 兼容服务商（见下方示例），也可设 `HTTPS_PROXY` 或 CLI 专属开关。值支持字符串 / 数字 / 布尔；`BOTMUX_` / `LARK_APP_` 等 botmux 保留键会被忽略。按**会话**注入（下个新会话生效），不写入共享 tmux server 全局、不会串到别的 bot。也可在 dashboard「机器人默认设置 → 环境变量」配置 |
 | `codexAppCleanInput` | **实验性**，且仅对 Botmux 托管、实际运行 `codex-app` 的 session 生效。设为 `true` 后，Codex App 的可见 / 持久化文本 `UserMessage` 只保留用户原始输入，消息级 Botmux 上下文主要改走 `additionalContext`；默认关闭，从下一次 turn 派发生效，不改已有历史。详见下方说明 |
+
+### Codex 兼容发行版
+
+如果一个独立发行的 CLI 完整保留 Codex 的参数、交互、rollout / resume 和认证语义，不需要为它新增 `cliId`。保留协议适配器 `cliId: "codex"`，再声明具体运行时：
+
+```json
+{
+  "cliId": "codex",
+  "cliPathOverride": "vendor-codex",
+  "cliRuntime": {
+    "id": "vendor-codex",
+    "displayName": "Vendor Codex",
+    "executable": "vendor-codex",
+    "update": { "provider": "npm", "packageName": "@vendor/codex" }
+  }
+}
+```
+
+- `id` 是稳定身份，只能使用字母、数字、`.`、`_`、`-`，最长 64 个字符；改名会被视为切换发行版。
+- `executable` 是一个可执行文件名或路径，不是 shell 命令；不要在里面拼参数。Dashboard 保存时会执行只读的 `--version` 预检，输出需包含可识别的 `X.Y.Z` 版本号。
+- `displayName` 只影响卡片、状态与 Dashboard 展示，省略时使用 `id`。
+- `update.provider` 可选 `auto`、`self`、`npm`、`none`。`auto` 只信任可精确追溯到该二进制的唯一 npm 包；无法确定来源时标记为“未托管”，**绝不拿官方 Codex 的版本号比较**。`self` 才会使用 CLI 自报的结构化 doctor 信息，并要求其中的当前版本与 `--version` 一致；`npm` 必须同时给自己的 `packageName`；`none` 关闭该运行时的更新检查。
+- `cliRuntime` 目前只支持 `cliId: "codex"`，不能和 `wrapperCli` 同时使用。BotMux 写入配置时会生成一个与 `executable` 完全相同的 `cliPathOverride` 降级影子；新版本以 `cliRuntime` 为准，旧版本仍能从影子启动同一二进制。手工配置时也必须像上例一样同时写入这个等值影子；缺失或不相等都会直接校验失败，避免出现只能升级、不能安全降级的配置。wrapper / 网关仍走下面的旧入口覆盖机制。
+- 旧 `cliPathOverride` 配置不会失效；BotMux 会继续启动它，并对更新探测采取同样的安全 `auto` 策略。Dashboard 会把它显示为只读兼容态：只改模型会保留旧入口，显式选择 Official Codex 才会清除，也可选择“自定义兼容版”迁移到 `cliRuntime`。由于旧字段无法证明完整兼容契约，Codex RPC 等增强能力仍保持关闭。
+
+会话创建时会冻结自己的 runtime 快照。只修改模型仅影响新会话；切换 CLI、runtime 或 wrapper 时，BotMux 会立即关闭仍使用旧启动身份的活跃会话，避免它们之后 lazy resume 到错误的发行版。存量会话不会被静默换用另一 runtime。
 
 ### 接入 GLM / 第三方服务商（per-bot env）
 
@@ -162,6 +189,8 @@
 | 字段 | 说明 |
 |------|------|
 | `summaryRange` | 显式总结命令 `@机器人 /summary` 使用的历史读取范围。`limit` 表示普通群最近 N 条消息，默认 50；`sinceHours` 表示普通群最近 N 小时，默认 24。任一字段设为 `0` 表示该维度不限制。话题群始终读取当前话题/thread 历史，再按总结窗口过滤 |
+| `summaryMemory` | 布尔，默认 `false`（关）。开启后 `@机器人 /summary` 会把本次总结整理成中文「问题解决记录」，追加写入下方 `summaryMemoryPath` 指定的记忆文件，并要求 agent 只写这一个文件、把实际写入的 Markdown 原样回传确认；同时会往后续会话注入一段 `<summary_memory>` 复用提示，让后续问题只有在 PSM、环境、任务 ID、节点、错误现象等关键条件全部完全一致时才直接复用历史结论，否则只当排查参考 |
+| `summaryMemoryPath` | 记忆文件路径，默认 `summary.md`。相对路径由 agent 按「当前项目根目录」解析，绝对路径按原样使用。留空 / 不设时回落到 `summary.md`。仅在 `summaryMemory` 为 `true` 时生效 |
 
 示例：
 
@@ -170,14 +199,18 @@
   "summaryRange": {
     "limit": 50,
     "sinceHours": 24
-  }
+  },
+  "summaryMemory": true,
+  "summaryMemoryPath": "docs/summary.md"
 }
 ```
 
 - 只有显式 `@机器人 /summary` 会触发总结；不 @ 机器人时仍按普通群/话题的既有路由规则处理，不会因为关键词自动唤醒。
-- dashboard 的「/summary 总结范围」保存的就是 `summaryRange`。
+- dashboard 的「/summary 总结范围」保存的就是 `summaryRange`；「开启记忆」开关与「记忆文件路径」输入框分别保存 `summaryMemory` 与 `summaryMemoryPath`。
 - 如果本次触发前存在上一条 `@同一机器人 /summary`，总结窗口只包含上一条之后到本次触发为止的消息；找不到上一条时回退到 `limit` / `sinceHours`。
-- `limit` 与 `sinceHours` 同时也是安全上限；两者都为 `0` 时表示不做该维度限制。
+- `limit` 与 `sinceHours` 是默认（无显式边界）总结窗口的安全上限；两者都为 `0` 时表示不做该维度限制。**显式边界按设计优先于该上限**：当 `summaryMemory` 开启且 `/summary` 带了边界文字时，botmux 尊重用户「从这条起」的明确意图，从命中的边界消息起全部纳入——普通群里 `limit` 仍约束扫描量，但比 `sinceHours` 更早的边界、以及话题群里任意早的边界都会被接受，可能超出默认配置范围。若不希望某个 bot 读入过旧内容，最可靠的做法是不要带边界文字；普通群还可以调低 `limit` 约束扫描量（但 `sinceHours`、以及话题群里的边界都不受配置范围约束）。
+- **仅当 `summaryMemory` 开启时**，`/summary` 命令后跟随的文字会被当作「硬边界」：在触发前的历史里定位**最近一条**包含该文字的消息，只总结从这条到本次触发为止的内容；如果扫描到的历史里找不到该边界，则不回退到更宽范围，而是把「未找到边界」错误与空历史一起交给 agent（此时记忆写入指令仍会执行）。`summaryMemory` 关闭时，`/summary` 后的文字仅作为对本次总结的侧重提示，历史窗口仍按 `summaryRange` 读取。
+- 记忆文件由 agent 在其工作目录内写入。如果 bot 开启了 sandbox，且 `summaryMemoryPath` 指向工作目录之外（绝对路径，或用 `../` 逃出工作目录的相对路径），请把该文件**已存在的父目录**加进 `sandboxPaths.readWrite`；worker 在 spawn 时会过滤掉尚不存在的路径，而新记忆文件通常还不存在，所以只加文件本身会被丢弃（除非文件已预先创建）。否则写入可能被沙盒拒绝。
 
 ## 旧内容触发配置
 

@@ -98,11 +98,15 @@ interface InstallEntry { binPath: string; root: string; kind: InstallKind }
 interface NodeCheck { version: string; major: number; required: number; ok: boolean }
 interface CliRuntimeUpdateStatus {
   cliId: 'codex';
+  runtimeId: string;
+  displayName: string;
   binPath: string;
+  provider: 'internal' | 'auto' | 'self' | 'npm';
+  managed: boolean;
   current: string | null;
   latest: string | null;
   updateAvailable: boolean;
-  updateCommand: string;
+  updateCommand: string | null;
   installTarget?: string;
   lastCheckedAt: number;
 }
@@ -1543,13 +1547,15 @@ function CliRuntimeUpdates(props: { entries: CliRuntimeUpdateStatus[] }) {
       <strong>{tr('update.runtimeTitle')}</strong>
       <ul>
         {props.entries.map(entry => (
-          <li key={`${entry.cliId}:${entry.binPath}`} className={entry.updateAvailable ? 'is-behind' : ''}>
+          <li key={`${entry.runtimeId}:${entry.binPath}`} className={entry.updateAvailable ? 'is-behind' : ''}>
             <div className="cli-runtime-update-head">
-              <span>Codex</span>
+              <span>{entry.displayName}</span>
               {entry.updateAvailable && entry.latest ? (
                 <span className="update-badge update-badge-new">
                   {tr('update.runtimeAvailable', { current: entry.current ?? '?', latest: entry.latest })}
                 </span>
+              ) : !entry.managed ? (
+                <span className="hint-warn-inline">{tr('update.runtimeUnmanaged')}</span>
               ) : entry.latest ? (
                 <span className="update-badge update-badge-ok">{tr('update.upToDate')}</span>
               ) : (
@@ -1557,7 +1563,7 @@ function CliRuntimeUpdates(props: { entries: CliRuntimeUpdateStatus[] }) {
               )}
             </div>
             <code>{entry.binPath}</code>
-            {entry.updateAvailable ? (
+            {entry.updateAvailable && entry.updateCommand ? (
               <small>{tr('update.runtimeCommand')}: <code>{entry.updateCommand}</code></small>
             ) : null}
           </li>

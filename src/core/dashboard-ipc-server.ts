@@ -1,5 +1,6 @@
 // src/core/dashboard-ipc-server.ts
 import { createServer, type IncomingMessage, type ServerResponse, type Server } from 'node:http';
+import { execFileSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
@@ -26,6 +27,7 @@ import type { BackendType } from '../adapters/backend/types.js';
 import * as cardPrefsStore from '../services/card-prefs-store.js';
 import * as substituteModeStore from '../services/substitute-mode-store.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
+import { normalizeCliRuntimeConfig, type CliRuntimeConfig } from '../adapters/cli/runtime.js';
 import { evaluateReadIsolationGate } from '../adapters/cli/read-isolation.js';
 
 /** Whether read isolation can actually be ENFORCED for this bot right now — the
@@ -77,6 +79,7 @@ import { resumeSession, spawnDashboardSession, activateQueuedSession, closeCliMi
 import { parseSpawnRequest } from './session-create.js';
 import { cleanupMaterializedDashboardImages, materializeDashboardImages } from './dashboard-images.js';
 import { getCliDisplayName } from '../im/lark/card-builder.js';
+import { sessionConfiguredRuntimeDisplayName } from './cli-runtime-display.js';
 import { locateLimiter } from './dashboard-locate.js';
 import { buildTerminalUrl } from './terminal-url.js';
 import { dashboardEventBus } from './dashboard-events.js';
@@ -840,7 +843,9 @@ function postRestartNotice(ds: DaemonSession, fresh: boolean): void {
   // bypass sessionReply's gate). Best-effort path; a silent skip is correct.
   if (!larkTransportEnabled({ chatId: ds.chatId, apiOnly: getBot(ds.larkAppId).config.apiOnly })) return;
   const loc = localeForBot(ds.larkAppId);
-  const cliName = getCliDisplayName(ds.session.cliId ?? 'claude-code');
+  const botCfg = getBot(ds.larkAppId).config;
+  const cliName = sessionConfiguredRuntimeDisplayName(ds.session, botCfg.cliRuntime)
+    ?? getCliDisplayName(ds.session.cliId ?? botCfg.cliId ?? 'claude-code');
   const text = fresh
     ? t('card.action.restarted_fresh', { cliName }, loc)
     : t('cmd.restart.in_progress', { cliName }, loc);
@@ -1854,7 +1859,9 @@ ipcRoute('POST', '/api/sessions/:sessionId/resume', async (req, res, params) => 
   // (reply_in_thread=true), chat-scope posts a plain message to the chat (any
   // reply_in_thread call would silently get rejected or land on a stale root).
   const cliId = ds.session.cliId;
-  const cliName = getCliDisplayName(cliId ?? 'claude-code');
+  const botCfg = ds.larkAppId ? getBot(ds.larkAppId).config : undefined;
+  const cliName = sessionConfiguredRuntimeDisplayName(ds.session, botCfg?.cliRuntime)
+    ?? getCliDisplayName(cliId ?? botCfg?.cliId ?? 'claude-code');
   const notice = JSON.stringify({ text: `🔄 会话已通过命令行恢复，发条消息继续与 ${cliName} 对话。` });
   if (ds.larkAppId && !sessionTransportDisabled(ds)) {
     if (ds.scope === 'chat' && ds.chatId) {
@@ -2071,6 +2078,7 @@ ipcRoute('POST', '/api/sessions/:sessionId/locate', async (_req, res, params) =>
 export interface ScheduleRow {
   id: string;
   name: string;
+  schedule: string;
   parsed: ParsedSchedule;
   prompt: string;
   workingDir: string;
@@ -2097,6 +2105,7 @@ function composeScheduleRow(t: ScheduledTask): ScheduleRow {
   return {
     id: t.id,
     name: t.name,
+    schedule: t.schedule,
     parsed: t.parsed,
     prompt: t.prompt,
     workingDir: t.workingDir,
@@ -2672,7 +2681,12 @@ ipcRoute('PUT', '/api/roles/:chatId', async (req, res, p) => {
   try {
     if (hasContentField) writeRoleFile(cachedLarkAppId, p.chatId, content);
     if (injectMode !== undefined) writeRoleInjectMode(cachedLarkAppId, p.chatId, injectMode);
-    jsonRes(res, 200, { ok: true });
+    // `changed` reflects whether the role FILE (→ hasRole in the groups matrix)
+    // was written. An injectMode-only PUT touches just the .meta.json sidecar and
+    // leaves hasRole untouched, so it reports changed:false — the dashboard uses
+    // this to avoid needlessly busting its 30s groups-matrix snapshot on the
+    // common inject-mode toggle.
+    jsonRes(res, 200, { ok: true, changed: hasContentField });
   } catch (e) {
     jsonRes(res, 500, { ok: false, error: String(e) });
   }
@@ -2683,7 +2697,9 @@ ipcRoute('DELETE', '/api/roles/:chatId', async (_req, res, p) => {
   if (!isValidRoleChatId(p.chatId)) return jsonRes(res, 400, { ok: false, error: 'invalid_chat_id' });
   const existed = deleteRoleFile(cachedLarkAppId, p.chatId);
   deleteRoleInjectMode(cachedLarkAppId, p.chatId);
-  jsonRes(res, 200, { ok: true, existed });
+  // `changed` mirrors `existed`: a DELETE that removed nothing didn't flip
+  // hasRole, so the dashboard skips invalidating its groups-matrix snapshot.
+  jsonRes(res, 200, { ok: true, existed, changed: existed });
 });
 
 ipcRoute('GET', '/api/message-listeners/:chatId', async (_req, res, p) => {
@@ -2715,11 +2731,16 @@ ipcRoute('PUT', '/api/message-listeners/:chatId', async (req, res, p) => {
 
 function dashboardHistoryMessageSender(message: any): { senderOpenId?: string; senderName?: string; senderTypeRaw?: string; senderIdType?: string } {
   const sender = message?.sender ?? {};
-  const senderId = sender.id ?? sender.open_id ?? sender.user_id ?? sender.app_id
+  // Prefer `open_bot_id` (present on bot senders when with_sender_name=true): it
+  // is the bot's per-app open_id, matching /members/bots and the stored sender
+  // filters. Mirrors historyMessageSender in event-dispatcher so preview and the
+  // 30s poll resolve a third-party bot identically. See that fn for detail.
+  const senderId = sender.open_bot_id ?? sender.id ?? sender.open_id ?? sender.user_id ?? sender.app_id
     ?? message?.sender_id?.open_id ?? message?.sender_id?.user_id ?? message?.sender_id?.app_id;
   const senderName = sender.sender_name ?? sender.name ?? sender.user_name ?? message?.sender_name;
-  const senderIdType = sender.id_type ?? sender.sender_id_type;
-  const senderTypeRaw = sender.sender_type ?? message?.sender_type ?? (senderIdType === 'app_id' ? 'app' : undefined);
+  const rawIdType = sender.id_type ?? sender.sender_id_type;
+  const senderIdType = sender.open_bot_id ? 'open_id' : rawIdType;
+  const senderTypeRaw = sender.sender_type ?? message?.sender_type ?? (rawIdType === 'app_id' ? 'app' : undefined);
   return {
     senderOpenId: typeof senderId === 'string' ? senderId : undefined,
     senderName: typeof senderName === 'string' && senderName.trim() ? senderName.trim() : undefined,
@@ -2788,7 +2809,7 @@ async function collectMessageListenerPreviewMatches(
   });
   const candidateBotAppIds = collectListenerBotAppIds(messages, dashboardHistoryMessageSender);
   const appIdToOpenId = await buildListenerBotAppIdToOpenId(larkAppId, chatId, candidateBotAppIds);
-  return previewMessageListenerMatches({
+  const matches = previewMessageListenerMatches({
     bot: previewBot,
     chatId,
     messages,
@@ -2801,6 +2822,20 @@ async function collectMessageListenerPreviewMatches(
     // spawn a session for a message live routing never sends to the listener).
     explicitlyMentionedThisBot: (message) => messageMentionsBot(message, larkAppId, bot.botOpenId),
   });
+  // The listener matcher extracts card text from the SIMPLIFIED history view,
+  // which drops button jump URLs. The live delivery path (handleNewTopic) fixes
+  // this by re-extracting after resolveNonsupportMessage merges the card's two
+  // representations. Preview/run-preview do NOT go through handleNewTopic, so
+  // apply the equivalent merge here: run-preview spawns REAL turns off
+  // match.messageText, and preview display should show the same links the live
+  // listener will. Only interactive cards need it; a resolver miss keeps the
+  // match-time text. Resolve concurrently — each match is an independent fetch.
+  await Promise.all(matches.map(async (match) => {
+    if (match.msgType !== 'interactive') return;
+    const merged = await resolveMergedCardContent(larkAppId, match.messageId).catch(() => null);
+    if (merged?.text?.trim()) match.messageText = merged.text;
+  }));
+  return matches;
 }
 
 function publicMessageListenerMatch(match: MessageListenerPreviewMatch): Record<string, unknown> {
@@ -3080,12 +3115,22 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
     skillInjectionSupport = resolveSkillInjectionSupport(cfg.cliId, cfg.cliPathOverride);
   } catch { /* unset → machine default; support → none */ }
   let cliId = '';
+  let cliRuntime: CliRuntimeConfig | null = null;
+  let cliPathOverride: string | null = null;
   let wrapperCli: string | null = null;
   let model: string | null = null;
   let agentSelectionKey = '';
   try {
     const cfg = getBot(cachedLarkAppId).config;
     cliId = cfg.cliId;
+    cliRuntime = cfg.cliRuntime ?? null;
+    // Parsed structured runtimes mirror their executable into cliPathOverride
+    // for legacy adapter call sites. Expose only a genuine legacy path here so
+    // the Dashboard can render an explicit migration state instead of
+    // misclassifying every structured runtime as legacy.
+    cliPathOverride = !cfg.cliRuntime && typeof cfg.cliPathOverride === 'string' && cfg.cliPathOverride.trim()
+      ? cfg.cliPathOverride
+      : null;
     wrapperCli = typeof cfg.wrapperCli === 'string' && cfg.wrapperCli.trim() ? cfg.wrapperCli : null;
     model = typeof cfg.model === 'string' && cfg.model.trim() ? cfg.model : null;
     agentSelectionKey = selectionKeyForBot(cliId, wrapperCli ?? undefined);
@@ -3158,6 +3203,8 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
     displayName,
     larkBotName,
     cliId,
+    cliRuntime,
+    cliPathOverride,
     wrapperCli,
     model,
     agentSelectionKey,
@@ -3226,7 +3273,7 @@ ipcRoute('PUT', '/api/bot-card-prefs', async (req, res) => {
     botToBotSameDir?: unknown;
     autoStartOnGroupJoin?: unknown; autoStartOnGroupJoinPrompt?: unknown; autoStartOnNewTopic?: unknown;
     regularGroupReplyMode?: unknown; regularGroupMentionMode?: unknown; docSubscribeDefaultMode?: unknown;
-    overloadAlert?: unknown;
+    overloadAlert?: unknown; summaryMemory?: unknown; summaryMemoryPath?: unknown;
   };
   try { body = await readJsonBody(req); }
   catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
@@ -3238,7 +3285,7 @@ ipcRoute('PUT', '/api/bot-card-prefs', async (req, res) => {
     autoStartOnGroupJoin?: boolean; autoStartOnGroupJoinPrompt?: string; autoStartOnNewTopic?: boolean;
     regularGroupReplyMode?: ChatReplyMode; regularGroupMentionMode?: 'always' | 'topic' | 'never' | 'ambient';
     docSubscribeDefaultMode?: 'mention-only' | 'all';
-    overloadAlert?: boolean;
+    overloadAlert?: boolean; summaryMemory?: boolean; summaryMemoryPath?: string;
   } = {};
   if (body.usageDisplay === 'streaming' || body.usageDisplay === 'footer' || body.usageDisplay === 'off') patch.usageDisplay = body.usageDisplay;
   if (typeof body.disableStreamingCard === 'boolean') patch.disableStreamingCard = body.disableStreamingCard;
@@ -3248,6 +3295,8 @@ ipcRoute('PUT', '/api/bot-card-prefs', async (req, res) => {
   if (typeof body.writableTerminalLinkInCard === 'boolean') patch.writableTerminalLinkInCard = body.writableTerminalLinkInCard;
   if (typeof body.privateCard === 'boolean') patch.privateCard = body.privateCard;
   if (typeof body.overloadAlert === 'boolean') patch.overloadAlert = body.overloadAlert;
+  if (typeof body.summaryMemory === 'boolean') patch.summaryMemory = body.summaryMemory;
+  if (typeof body.summaryMemoryPath === 'string') patch.summaryMemoryPath = body.summaryMemoryPath;
   if (typeof body.autoStartOnGroupJoin === 'boolean') patch.autoStartOnGroupJoin = body.autoStartOnGroupJoin;
   if (typeof body.autoStartOnGroupJoinPrompt === 'string') patch.autoStartOnGroupJoinPrompt = body.autoStartOnGroupJoinPrompt;
   if (typeof body.autoStartOnNewTopic === 'boolean') patch.autoStartOnNewTopic = body.autoStartOnNewTopic;
@@ -3468,7 +3517,7 @@ ipcRoute('PUT', '/api/bot-avatar', async (req, res) => {
   jsonRes(res, status, { ok: false, error: changed.reason, message: changed.message });
 });
 
-// Per-bot agent launch settings. Body `{ cliId, model }` where `cliId` is the
+// Per-bot agent launch settings. Body `{ cliId, model, cliRuntime? }` where `cliId` is the
 // dashboard selection key (plain adapter id or a wrapper option such as
 // `ttadk-x-codex`). Changes affect the next spawned CLI session; existing
 // sessions frozen on a different cliId/wrapperCli are closed immediately, so
@@ -3477,8 +3526,8 @@ ipcRoute('PUT', '/api/bot-avatar', async (req, res) => {
 ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
   if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
   const larkAppId = cachedLarkAppId;
-  let body: { cliId?: unknown; model?: unknown };
-  try { body = await readJsonBody<{ cliId?: unknown; model?: unknown }>(req); }
+  let body: { cliId?: unknown; model?: unknown; cliRuntime?: unknown };
+  try { body = await readJsonBody<{ cliId?: unknown; model?: unknown; cliRuntime?: unknown }>(req); }
   catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
 
   const key = typeof body.cliId === 'string' && body.cliId.trim() ? body.cliId.trim() : '';
@@ -3491,11 +3540,70 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
   }
   const model = typeof body.model === 'string' ? body.model.trim() : '';
   const currentBotConfig = getBot(larkAppId).config;
+  const runtimeFieldPresent = Object.prototype.hasOwnProperty.call(body, 'cliRuntime');
+  const currentSelectionKey = selectionKeyForBot(currentBotConfig.cliId, currentBotConfig.wrapperCli);
+  const selectionChanged = key !== currentSelectionKey;
+  let nextRuntime: CliRuntimeConfig | undefined;
+  let nextLegacyPath: string | undefined;
+  if (runtimeFieldPresent) {
+    if (body.cliRuntime !== null) {
+      if (selected.cliId !== 'codex') {
+        return jsonRes(res, 400, { ok: false, error: 'runtime_requires_codex' });
+      }
+      if (selected.wrapperCli) {
+        return jsonRes(res, 400, { ok: false, error: 'runtime_wrapper_conflict' });
+      }
+      try {
+        nextRuntime = normalizeCliRuntimeConfig(body.cliRuntime, 'cliRuntime');
+      } catch (err) {
+        return jsonRes(res, 400, {
+          ok: false,
+          error: 'invalid_cli_runtime',
+          message: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+    // null explicitly means built-in runtime; both structured and legacy
+    // executable overrides are cleared.
+  } else if (!selectionChanged) {
+    // Old dashboard clients know only `{cliId, model}`. Preserve the runtime on
+    // same-agent saves so editing a model cannot silently erase new config.
+    nextRuntime = currentBotConfig.cliRuntime;
+    nextLegacyPath = nextRuntime ? undefined : currentBotConfig.cliPathOverride;
+  }
+  const effectivePath = nextRuntime?.executable ?? nextLegacyPath;
   const availability = checkCliAvailability({
     cliId: selected.cliId,
     wrapperCli: selected.wrapperCli,
-    cliPathOverride: currentBotConfig.cliPathOverride,
+    cliPathOverride: effectivePath,
   });
+  let runtimeProbe: { version: string; updateProvider: string } | undefined;
+  if (runtimeFieldPresent && nextRuntime) {
+    if (!availability.available) {
+      return jsonRes(res, 400, {
+        ok: false,
+        error: 'runtime_unavailable',
+        message: availability.reason ?? 'runtime executable is unavailable',
+      });
+    }
+    try {
+      const raw = execFileSync(availability.resolvedPath ?? nextRuntime.executable, ['--version'], {
+        encoding: 'utf8',
+        timeout: 5_000,
+        stdio: ['ignore', 'pipe', 'pipe'],
+        maxBuffer: 2 * 1024 * 1024,
+      }).trim();
+      const version = raw.match(/\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?/)?.[0];
+      if (!version) throw new Error(`无法识别 --version 输出：${raw.slice(0, 120)}`);
+      runtimeProbe = { version, updateProvider: nextRuntime.update?.provider ?? 'auto' };
+    } catch (err) {
+      return jsonRes(res, 400, {
+        ok: false,
+        error: 'runtime_version_probe_failed',
+        message: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
   // Existing Bot edits remain saveable (operators may intentionally configure
   // first and install second), but the response is explicit so Dashboard never
   // claims a missing Agent was saved successfully without qualification.
@@ -3528,10 +3636,22 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
     entry.cliId = selected.cliId;
     if (selected.wrapperCli) entry.wrapperCli = selected.wrapperCli;
     else delete entry.wrapperCli;
+    if (nextRuntime) {
+      entry.cliRuntime = nextRuntime;
+      // Downgrade shadow: older BotMux versions ignore cliRuntime but retain
+      // cliPathOverride, so a rollback still launches this distribution.
+      entry.cliPathOverride = nextRuntime.executable;
+    } else if (nextLegacyPath) {
+      entry.cliPathOverride = nextLegacyPath;
+      delete entry.cliRuntime;
+    } else {
+      delete entry.cliRuntime;
+      delete entry.cliPathOverride;
+    }
     if (model) entry.model = model;
     else delete entry.model;
     if (entry.readIsolation === true &&
-        !readIsolationEnforceableFor({ cliId: selected.cliId, cliPathOverride: entry.cliPathOverride, wrapperCli: selected.wrapperCli })) {
+        !readIsolationEnforceableFor({ cliId: selected.cliId, cliPathOverride: effectivePath, wrapperCli: selected.wrapperCli })) {
       delete entry.readIsolation;
       readIsolationCleared = true;
     }
@@ -3550,6 +3670,8 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
 
     const bot = getBot(larkAppId);
     bot.config.cliId = selected.cliId;
+    bot.config.cliRuntime = nextRuntime;
+    bot.config.cliPathOverride = nextRuntime?.executable ?? nextLegacyPath;
     if (selected.wrapperCli) bot.config.wrapperCli = selected.wrapperCli;
     else bot.config.wrapperCli = undefined;
     bot.config.model = model || undefined;
@@ -3568,6 +3690,8 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
     jsonRes(res, 200, {
       ok: true,
       cliId: selected.cliId,
+      cliRuntime: nextRuntime ?? null,
+      cliPathOverride: nextRuntime ? null : nextLegacyPath ?? null,
       wrapperCli: selected.wrapperCli ?? null,
       model: model || null,
       selectionKey,
@@ -3581,6 +3705,7 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
       agentAvailable: availability.available,
       availabilityWarning,
       requiredCommand: availability.command,
+      runtimeProbe,
     });
   });
 });

@@ -21,7 +21,9 @@
  *
  * Run:  pnpm vitest run test/daemon-rename-route.test.ts
  */
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
 
 const mocks = vi.hoisted(() => {
   // Isolate every sessionStore/config read-write under a per-process temp dir
@@ -29,12 +31,15 @@ const mocks = vi.hoisted(() => {
   // and make sure hook events run the local (no-op, nothing configured) path
   // instead of forwarding to a live daemon when the test itself runs inside a
   // botmux session shell.
-  process.env.SESSION_DATA_DIR = `${process.env.TMPDIR ?? '/tmp'}/botmux-rename-route-${process.pid}`;
+  const dataDir = `${process.env.TMPDIR ?? '/tmp'}/botmux-rename-route-${process.pid}`;
+  process.env.SESSION_DATA_DIR = dataDir;
+  process.env.BOTS_CONFIG = `${dataDir}/bots.json`;
   delete process.env.BOTMUX_SESSION_ID;
   delete process.env.BOTMUX_LARK_APP_ID;
   let seq = 0;
   const sessions = new Map<string, any>();
   return {
+    dataDir,
     replyMessage: vi.fn(async () => 'om_reply'),
     sendMessage: vi.fn(async () => 'om_top'),
     getChatMode: vi.fn(async () => 'group' as 'group' | 'topic' | 'p2p'),
@@ -77,6 +82,16 @@ vi.mock('@larksuiteoapi/node-sdk', () => {
   class FakeClient { constructor(public opts: Record<string, unknown>) {} }
   return { Client: FakeClient };
 });
+
+vi.mock('node-pty', () => ({
+  spawn: vi.fn(() => ({
+    onData: vi.fn(),
+    onExit: vi.fn(),
+    write: vi.fn(),
+    resize: vi.fn(),
+    kill: vi.fn(),
+  })),
+}));
 
 vi.mock('../src/im/lark/client.js', async () => {
   const actual = await vi.importActual<any>('../src/im/lark/client.js');
@@ -126,6 +141,7 @@ vi.mock('../src/im/lark/identity-cache.js', async () => {
 
 import { registerBot } from '../src/bot-registry.js';
 import { sessionAnchorId, sessionKey } from '../src/core/types.js';
+import { recordBotUnionId } from '../src/services/bot-union-ids-store.js';
 import {
   __testOnly_activeSessions as activeSessions,
   __testOnly_claimNewDaemonSession as claimNewDaemonSession,
@@ -150,7 +166,24 @@ import { join } from 'node:path';
 const APP = 'rename_route_app';
 const CHAT = 'oc_rename_route_chat';
 const OWNER = 'ou_owner';
+const PEER = 'ou_peer_bot';
+const PEER_UNION = 'on_peer_bot';
 const NOW = new Date().toISOString();
+const repoFixtureDirs: string[] = [];
+
+function makeRepoFixtureDir(): string {
+  const root = join(mocks.dataDir, 'repo-fixtures');
+  mkdirSync(root, { recursive: true });
+  const dir = mkdtempSync(join(root, 'repo-'));
+  repoFixtureDirs.push(dir);
+  return dir;
+}
+
+function cleanupRepoFixtureDirs(): void {
+  for (const dir of repoFixtureDirs.splice(0)) {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
 
 function makeEventData(messageId: string, text: string, rootId?: string): any {
   return {
@@ -174,6 +207,84 @@ function makeMentionOnlyEventData(messageId: string, rootId?: string): any {
     id: { open_id: 'ou_bot' },
   }];
   return data;
+}
+
+function makePeerRepoEventData(
+  messageId: string,
+  senderType: 'app' | 'bot' | 'user',
+  rootId?: string,
+  senderUnionId: string | null = PEER_UNION,
+): any {
+  const data = makeEventData(messageId, '/repo', rootId);
+  data.sender = {
+    sender_id: {
+      open_id: PEER,
+      ...(typeof senderUnionId === 'string' ? { union_id: senderUnionId } : {}),
+    },
+    sender_type: senderType,
+  };
+  return data;
+}
+
+function makePeerRepoEventDataWithSplitFooter(
+  messageId: string,
+  rootId?: string,
+): any {
+  const repoPath = makeRepoFixtureDir();
+  return {
+    sender: { sender_id: { open_id: PEER, union_id: PEER_UNION }, sender_type: 'app' },
+    message: {
+      message_id: messageId,
+      root_id: rootId,
+      chat_id: CHAT,
+      message_type: 'interactive',
+      content: JSON.stringify({
+        elements: [[
+          { tag: 'text', text: `/repo ${repoPath}\n` },
+          { tag: 'a', text: 'botmux', href: 'https://github.com/deepcoldy/botmux' },
+          { tag: 'text', text: "<font color='grey'> </font>" },
+          { tag: 'a', text: '·', href: 'https://github.com/deepcoldy/bot%6Dux#reply-card-footer-v1' },
+          { tag: 'text', text: "<font color='grey'> 发送给：</font>" },
+          { tag: 'at', user_name: 'jihong traex' },
+        ]],
+      }),
+      create_time: String(Date.now()),
+    },
+  };
+}
+
+function makePeerRepoEventDataWithV2FooterElement(
+  messageId: string,
+  rootId?: string,
+): any {
+  const repoPath = makeRepoFixtureDir();
+  return {
+    sender: { sender_id: { open_id: PEER, union_id: PEER_UNION }, sender_type: 'app' },
+    message: {
+      message_id: messageId,
+      root_id: rootId,
+      chat_id: CHAT,
+      message_type: 'interactive',
+      content: JSON.stringify({
+        schema: '2.0',
+        body: {
+          elements: [
+            { tag: 'markdown', content: `/repo ${repoPath}` },
+            { tag: 'hr' },
+            {
+              element_id: 'botmux_reply_footer',
+              tag: 'markdown',
+              content: '[botmux](https://github.com/deepcoldy/botmux)'
+                + "<font color='grey'> </font>"
+                + '[·](https://github.com/deepcoldy/bot%6Dux#reply-card-footer-v1)'
+                + "<font color='grey'> 发送给：</font><at id=ou_owner></at>",
+            },
+          ],
+        },
+      }),
+      create_time: String(Date.now()),
+    },
+  };
 }
 
 function makeCtx(anchor: string, messageId: string): any {
@@ -212,6 +323,58 @@ function seedThreadSession(anchor: string, title: string): DaemonSession {
     },
   } as unknown as DaemonSession;
   activeSessions.set(sessionKey(anchor, APP), ds);
+  return ds;
+}
+
+function seedLiveChatSession(send = vi.fn()): DaemonSession {
+  const ds = {
+    scope: 'chat',
+    chatId: CHAT,
+    chatType: 'group',
+    larkAppId: APP,
+    worker: { killed: false, send },
+    workerPort: null,
+    workerToken: null,
+    spawnedAt: Date.now(),
+    cliVersion: '1.0.0',
+    lastMessageAt: Date.now(),
+    hasHistory: false,
+    ownerOpenId: OWNER,
+    currentReplyTarget: {
+      rootMessageId: 'om_stale_root',
+      turnId: 'om_stale_turn',
+      updatedAt: NOW,
+    },
+    session: {
+      sessionId: 'sess-live-chat-' + Math.random().toString(36).slice(2),
+      chatId: CHAT,
+      rootMessageId: 'om_original_root',
+      title: 'live chat',
+      status: 'active',
+      createdAt: NOW,
+      larkAppId: APP,
+      scope: 'chat',
+      quoteTargetId: 'om_stale_quote',
+      quoteTargetSenderOpenId: 'ou_stale_caller',
+      lastCallerOpenId: 'ou_stale_caller',
+      currentReplyTarget: {
+        rootMessageId: 'om_stale_root',
+        turnId: 'om_stale_turn',
+        updatedAt: NOW,
+      },
+    },
+  } as unknown as DaemonSession;
+  activeSessions.set(sessionKey(CHAT, APP), ds);
+  return ds;
+}
+
+function seedPendingRawSession(anchor: string): DaemonSession {
+  const ds = seedThreadSession(anchor, 'pending raw');
+  ds.pendingRepo = true;
+  ds.pendingPrompt = '';
+  ds.pendingRawInput = '/goal start';
+  ds.pendingRawTurnId = 'om_initial_raw';
+  ds.pendingSender = { openId: OWNER, type: 'user' };
   return ds;
 }
 
@@ -265,6 +428,60 @@ function repliedText(): string {
     .join('\n');
 }
 
+function crossRefPath(): string {
+  return join(mocks.dataDir, `bot-openids-${APP}.json`);
+}
+
+function botsInfoPath(): string {
+  return join(mocks.dataDir, 'bots-info.json');
+}
+
+function botsConfigPath(): string {
+  return join(mocks.dataDir, 'bots.json');
+}
+
+function botUnionIdsPath(): string {
+  return join(mocks.dataDir, 'bot-union-ids.json');
+}
+
+function seedSiblingCrossRef(): void {
+  mkdirSync(mocks.dataDir, { recursive: true });
+  writeFileSync(crossRefPath(), JSON.stringify({ Codex: PEER }));
+}
+
+function seedConfiguredSiblingIdentity(): void {
+  writeFileSync(botsConfigPath(), JSON.stringify([
+    { larkAppId: APP, larkAppSecret: 's', cliId: 'claude-code', allowedUsers: [OWNER] },
+    { larkAppId: 'repo_sibling_route', larkAppSecret: 's', cliId: 'codex' },
+  ]));
+  writeFileSync(botsInfoPath(), JSON.stringify([
+    { larkAppId: APP, botOpenId: 'ou_receiver_self', botName: 'Receiver', cliId: 'claude-code' },
+    { larkAppId: 'repo_sibling_route', botOpenId: 'ou_peer_self', botName: 'Codex', cliId: 'codex' },
+  ]));
+  recordBotUnionId(mocks.dataDir, 'repo_sibling_route', PEER_UNION);
+}
+
+function resetRouteTestState(): void {
+  vi.clearAllMocks();
+  mocks.replyMessage.mockResolvedValue('om_reply');
+  mocks.sendMessage.mockResolvedValue('om_top');
+  mocks.getChatMode.mockResolvedValue('group');
+  mocks.getChatNameAndMode.mockResolvedValue({ name: null, mode: 'group' });
+  activeSessions.clear();
+  rmSync(crossRefPath(), { force: true });
+  rmSync(botsConfigPath(), { force: true });
+  rmSync(botsInfoPath(), { force: true });
+  rmSync(botUnionIdsPath(), { force: true });
+  const bot = registerBot({
+    larkAppId: APP,
+    larkAppSecret: 's',
+    cliId: 'claude-code',
+    allowedUsers: [OWNER],
+    oncallChats: [{ chatId: CHAT, workingDir: '/tmp' }],
+  });
+  bot.resolvedAllowedUsers = [OWNER];
+}
+
 describe('/rename production routing — must not pre-create a session (review P1)', () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -281,6 +498,12 @@ describe('/rename production routing — must not pre-create a session (review P
     mocks.downloadResources.mockResolvedValue({ attachments: [], needLogin: false });
     activeSessions.clear();
     resetDocCommentClaims();
+    // master: clear per-bot store files so a seeded cross-ref / bots config from
+    // one test can't leak into the next (see the known-peer + /fast tests).
+    rmSync(crossRefPath(), { force: true });
+    rmSync(botsConfigPath(), { force: true });
+    rmSync(botsInfoPath(), { force: true });
+    rmSync(botUnionIdsPath(), { force: true });
     const bot = registerBot({
       larkAppId: APP,
       larkAppSecret: 's',
@@ -288,6 +511,10 @@ describe('/rename production routing — must not pre-create a session (review P
       allowedUsers: [OWNER],
     });
     bot.resolvedAllowedUsers = [OWNER];
+  });
+
+  afterEach(() => {
+    rmSync(crossRefPath(), { force: true });
   });
 
   it('new topic: `/rename Foo` replies no-active-session and creates NOTHING', async () => {
@@ -928,6 +1155,139 @@ describe('/rename production routing — must not pre-create a session (review P
     if (bufs.length > 1) expect(msg.content).toContain('BUFFERED_TWO');
     expect(msg.codexAppSteerable).toBeUndefined();
   });
+
+  it('routes Codex /fast verbatim to a live session but never cold-starts one', async () => {
+    const bot = registerBot({
+      larkAppId: APP,
+      larkAppSecret: 's',
+      cliId: 'codex',
+      allowedUsers: [OWNER],
+      oncallChats: [{ chatId: CHAT, workingDir: '/tmp' }],
+    });
+    bot.resolvedAllowedUsers = [OWNER];
+
+    // Live session: /fast is forwarded verbatim as a passthrough keystroke.
+    const send = vi.fn();
+    const live = seedLiveChatSession(send);
+    live.session.cliId = 'codex';
+    await handleThreadReply(
+      makeEventData('om_fast_live', '/fast', 'om_fast_reply_root'),
+      {
+        chatId: CHAT,
+        messageId: 'om_fast_live',
+        chatType: 'group',
+        scope: 'chat',
+        anchor: CHAT,
+        replyRootId: 'om_fast_reply_root',
+        larkAppId: APP,
+      },
+    );
+    expect(send).toHaveBeenCalledWith({
+      type: 'raw_input',
+      content: '/fast',
+      turnId: 'om_fast_live',
+    });
+
+    // Cold (no existing session): /fast is a tier toggle, not "start work", so
+    // owner policy is it must NOT cold-start a session — reply requires-session,
+    // create nothing, fork nothing. (Regression guard: an earlier revision had
+    // /fast in the codex adapter default and would spawn a worker here.)
+    activeSessions.clear();
+    mocks.forkWorker.mockClear();
+    mocks.replyMessage.mockClear();
+    await handleThreadReply(
+      makeEventData('om_fast_cold', '/fast', 'om_fast_cold_root'),
+      makeCtx('om_fast_cold_root', 'om_fast_cold'),
+    );
+    expect(activeSessions.get(sessionKey('om_fast_cold_root', APP))).toBeUndefined();
+    expect(mocks.forkWorker).not.toHaveBeenCalled();
+    expect(mocks.createSession).not.toHaveBeenCalled();
+    // Rejected without spawning — the exact copy ("needs an active CLI" vs
+    // "requires an existing session") is not what this guards; the point is
+    // no cold-start.
+    expect(repliedText()).toMatch(/需要活跃的 CLI 进程|需要在已有会话内使用/);
+  });
+
+  it('fails closed on /fast for RPC-input / Riff backends (no raw_input, clear reply)', async () => {
+    const bot = registerBot({
+      larkAppId: APP,
+      larkAppSecret: 's',
+      cliId: 'codex',
+      allowedUsers: [OWNER],
+      oncallChats: [{ chatId: CHAT, workingDir: '/tmp' }],
+    });
+    bot.resolvedAllowedUsers = [OWNER];
+
+    // A codex session whose backend can't receive the /fast keystroke: Riff runs
+    // turns off the terminal (text+CR would become two remote tasks); RPC input
+    // mode's pane is a pure viewer. Either way the toggle can't reach the
+    // executor, so /fast must be rejected — never delivered as a no-op/junk.
+    for (const setup of [
+      (ds: any) => { ds.session.backendType = 'riff'; },
+      (ds: any) => { ds.initConfig = { type: 'init', codexRpcInput: true }; },
+    ]) {
+      activeSessions.clear();
+      mocks.replyMessage.mockClear();
+      const send = vi.fn();
+      const ds = seedLiveChatSession(send);
+      ds.session.cliId = 'codex';
+      setup(ds);
+      await handleThreadReply(
+        makeEventData('om_fast_fc', '/fast', 'om_fast_fc_root'),
+        {
+          chatId: CHAT,
+          messageId: 'om_fast_fc',
+          chatType: 'group',
+          scope: 'chat',
+          anchor: CHAT,
+          replyRootId: 'om_fast_fc_root',
+          larkAppId: APP,
+        },
+      );
+      expect(send).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'raw_input' }));
+      expect(repliedText()).toMatch(/切不了 Codex 档位|can't toggle/);
+    }
+  });
+
+  it('pending raw follow-up keeps the raw root identity and durably stages an exact successor', async () => {
+    // codex ruling (merge migration): #597 replaced master's "coalesce raw root +
+    // follow-up into one raw_input IPC and rotate both turn ids" model with a
+    // 1-input:1-durable-owner FIFO. In the `pendingRepo && hasOpening` branch a
+    // same-caller raw follow-up is staged as an INDEPENDENT, persisted, exact-
+    // turn-id queuedActivationTail successor — the raw root keeps its own
+    // om_initial_raw id (rotating it would erase the exact provenance #597
+    // guarantees), and the follow-up is NOT dropped back into the legacy
+    // pendingFollowUps source buffer. This test migrates the old
+    // "don't-lose/cross-follow-up" safety goal onto the new model and closes the
+    // entry blind spot (does the pendingRepo raw root actually stage a durable
+    // successor?) that 723/789 don't cover.
+    const anchor = 'om_pending_raw_root';
+    const ds = seedPendingRawSession(anchor);
+    const messageId = 'om_pending_raw_followup';
+
+    await handleThreadReply(
+      makeEventData(messageId, '补充同一个人的要求', anchor),
+      makeCtx(anchor, messageId),
+    );
+
+    // Raw root identity is preserved — never rotated onto the follow-up.
+    expect(ds.pendingRawTurnId).toBe('om_initial_raw');
+    // The follow-up does NOT fall back into the legacy source buffer.
+    expect(ds.pendingFollowUpTurnId).toBeUndefined();
+    expect(ds.pendingFollowUps).toBeUndefined();
+    // It is durably staged as exactly one exact-turn-id successor carrying the
+    // follow-up content.
+    const tail = ds.session.queuedActivationTail ?? [];
+    expect(tail).toHaveLength(1);
+    expect(tail[0]?.turnId).toBe(messageId);
+    expect(
+      (tail[0]?.userPrompt ?? '') + (tail[0]?.cliInput?.content ?? ''),
+    ).toContain('补充同一个人的要求');
+    // The latest global quote pointer still advances (per-turn frozen context /
+    // ledger carries the actual delivery identity).
+    expect(ds.session.quoteTargetId).toBe(messageId);
+  });
+
 
   it('atomically claims a fresh queued refork so a concurrent reply buffers behind its owner', async () => {
     const anchor = 'om_fresh_queued_claim_root';
@@ -1574,5 +1934,197 @@ describe('document comment canonical ownership and single-flight delivery', () =
     expect(mocks.forkWorker).toHaveBeenCalledTimes(2);
 
     removeDocSubscription(config.session.dataDir, APP, fileToken);
+  });
+});
+
+describe('/repo trusted sibling production routing', () => {
+  beforeEach(() => {
+    resetRouteTestState();
+    seedSiblingCrossRef();
+    seedConfiguredSiblingIdentity();
+  });
+
+  afterEach(() => {
+    cleanupRepoFixtureDirs();
+    rmSync(crossRefPath(), { force: true });
+    rmSync(botsConfigPath(), { force: true });
+    rmSync(botsInfoPath(), { force: true });
+    rmSync(botUnionIdsPath(), { force: true });
+  });
+
+  it.each(['app', 'bot'] as const)('new topic: sender_type=%s sibling /repo reaches repo launch path', async (senderType) => {
+    const messageId = `om_repo_new_${senderType}`;
+
+    await handleNewTopic(
+      makePeerRepoEventData(messageId, senderType),
+      makeCtx(messageId, messageId),
+    );
+
+    const ds = activeSessions.get(sessionKey(messageId, APP));
+    expect(repliedText()).not.toContain('仅 allowedUsers 可执行');
+    expect(mocks.createSession).toHaveBeenCalledTimes(1);
+    expect(ds).toBeTruthy();
+    expect(ds?.ownerOpenId).toBe(PEER);
+    expect(ds?.pendingRepo).toBe(false);
+    expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
+    expect(mocks.forkWorker.mock.calls[0]?.[0]).toBe(ds);
+  });
+
+  it('new topic: rejects stamped sibling /repo when sender union is missing or wrong', async () => {
+    await handleNewTopic(
+      makePeerRepoEventData('om_repo_new_missing_union', 'app', undefined, null),
+      makeCtx('om_repo_new_missing_union', 'om_repo_new_missing_union'),
+    );
+    expect(repliedText()).toContain('仅 allowedUsers 可执行');
+    expect(mocks.createSession).not.toHaveBeenCalled();
+    expect(mocks.forkWorker).not.toHaveBeenCalled();
+
+    resetRouteTestState();
+    seedSiblingCrossRef();
+    seedConfiguredSiblingIdentity();
+    await handleNewTopic(
+      makePeerRepoEventData('om_repo_new_wrong_union', 'bot', undefined, 'on_wrong_peer_bot'),
+      makeCtx('om_repo_new_wrong_union', 'om_repo_new_wrong_union'),
+    );
+    expect(repliedText()).toContain('仅 allowedUsers 可执行');
+    expect(mocks.createSession).not.toHaveBeenCalled();
+    expect(mocks.forkWorker).not.toHaveBeenCalled();
+  });
+
+  it.each(['app', 'bot'] as const)('thread reply: sender_type=%s sibling /repo reaches repo launch path', async (senderType) => {
+    const rootId = `om_repo_root_${senderType}`;
+    const messageId = `om_repo_reply_${senderType}`;
+
+    await handleThreadReply(
+      makePeerRepoEventData(messageId, senderType, rootId),
+      makeCtx(rootId, messageId),
+    );
+
+    const ds = activeSessions.get(sessionKey(rootId, APP));
+    expect(repliedText()).not.toContain('仅 allowedUsers 可执行');
+    expect(mocks.createSession).toHaveBeenCalledTimes(1);
+    expect(ds).toBeTruthy();
+    expect(ds?.ownerOpenId).toBe(PEER);
+    expect(ds?.session.creatorOpenId).toBe(PEER);
+    expect(ds?.pendingRepo).toBe(false);
+    expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
+    expect(mocks.forkWorker.mock.calls[0]?.[0]).toBe(ds);
+  });
+
+  it('thread reply: strips live split-font footer before /repo command routing', async () => {
+    const rootId = 'om_repo_root_split_footer';
+    const messageId = 'om_repo_reply_split_footer';
+
+    await handleThreadReply(
+      makePeerRepoEventDataWithSplitFooter(messageId, rootId),
+      makeCtx(rootId, messageId),
+    );
+
+    const ds = activeSessions.get(sessionKey(rootId, APP));
+    expect(repliedText()).not.toContain('仅 allowedUsers 可执行');
+    expect(mocks.createSession).toHaveBeenCalledTimes(1);
+    expect(ds).toBeTruthy();
+    expect(ds?.ownerOpenId).toBe(PEER);
+    expect(ds?.pendingRepo).toBe(false);
+    expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
+    expect(mocks.forkWorker.mock.calls[0]?.[0]).toBe(ds);
+    expect(mocks.forkWorker.mock.calls[0]?.[1]).toBe('');
+  });
+
+  it('thread reply: strips v2 footer element without text_size before /repo command routing', async () => {
+    const rootId = 'om_repo_root_v2_footer';
+    const messageId = 'om_repo_reply_v2_footer';
+
+    await handleThreadReply(
+      makePeerRepoEventDataWithV2FooterElement(messageId, rootId),
+      makeCtx(rootId, messageId),
+    );
+
+    const ds = activeSessions.get(sessionKey(rootId, APP));
+    expect(repliedText()).not.toContain('仅 allowedUsers 可执行');
+    expect(mocks.createSession).toHaveBeenCalledTimes(1);
+    expect(ds).toBeTruthy();
+    expect(ds?.ownerOpenId).toBe(PEER);
+    expect(ds?.pendingRepo).toBe(false);
+    expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
+    expect(mocks.forkWorker.mock.calls[0]?.[0]).toBe(ds);
+    expect(mocks.forkWorker.mock.calls[0]?.[1]).toBe('');
+  });
+
+  it('thread reply: rejects stamped sibling /repo when sender union is missing or wrong', async () => {
+    await handleThreadReply(
+      makePeerRepoEventData('om_repo_reply_missing_union', 'app', 'om_repo_root_missing_union', null),
+      makeCtx('om_repo_root_missing_union', 'om_repo_reply_missing_union'),
+    );
+    expect(repliedText()).toContain('仅 allowedUsers 可执行');
+    expect(mocks.createSession).not.toHaveBeenCalled();
+    expect(mocks.forkWorker).not.toHaveBeenCalled();
+
+    resetRouteTestState();
+    seedSiblingCrossRef();
+    seedConfiguredSiblingIdentity();
+    await handleThreadReply(
+      makePeerRepoEventData('om_repo_reply_wrong_union', 'bot', 'om_repo_root_wrong_union', 'on_wrong_peer_bot'),
+      makeCtx('om_repo_root_wrong_union', 'om_repo_reply_wrong_union'),
+    );
+    expect(repliedText()).toContain('仅 allowedUsers 可执行');
+    expect(mocks.createSession).not.toHaveBeenCalled();
+    expect(mocks.forkWorker).not.toHaveBeenCalled();
+  });
+
+  it('thread reply: rejects cross-ref-only /repo when sender is not Lark-stamped as a bot', async () => {
+    await handleThreadReply(
+      makePeerRepoEventData('om_repo_reply_user_stamp', 'user', 'om_repo_root_user_stamp'),
+      makeCtx('om_repo_root_user_stamp', 'om_repo_reply_user_stamp'),
+    );
+
+    expect(repliedText()).toContain('仅 allowedUsers 可执行');
+    expect(mocks.createSession).not.toHaveBeenCalled();
+    expect(mocks.forkWorker).not.toHaveBeenCalled();
+  });
+
+  it('thread reply: rejects stale sibling identity for an app no longer in the current config', async () => {
+    resetRouteTestState();
+    seedSiblingCrossRef();
+    writeFileSync(botsConfigPath(), JSON.stringify([
+      { larkAppId: APP, larkAppSecret: 's', cliId: 'claude-code', allowedUsers: [OWNER] },
+    ]));
+    writeFileSync(botsInfoPath(), JSON.stringify([
+      { larkAppId: APP, botOpenId: 'ou_receiver_self', botName: 'Receiver', cliId: 'claude-code' },
+      { larkAppId: 'removed_sibling_app', botOpenId: 'ou_peer_self', botName: 'Codex', cliId: 'codex' },
+    ]));
+    recordBotUnionId(mocks.dataDir, 'removed_sibling_app', PEER_UNION);
+
+    await handleThreadReply(
+      makePeerRepoEventData('om_repo_reply_removed_app', 'bot', 'om_repo_root_removed_app'),
+      makeCtx('om_repo_root_removed_app', 'om_repo_reply_removed_app'),
+    );
+
+    expect(repliedText()).toContain('仅 allowedUsers 可执行');
+    expect(mocks.createSession).not.toHaveBeenCalled();
+    expect(mocks.forkWorker).not.toHaveBeenCalled();
+  });
+
+  it('thread reply: rejects registry-only sibling identity that is absent from current config', async () => {
+    resetRouteTestState();
+    seedSiblingCrossRef();
+    registerBot({ larkAppId: 'registry_only_route', larkAppSecret: 's', cliId: 'codex' });
+    writeFileSync(botsConfigPath(), JSON.stringify([
+      { larkAppId: APP, larkAppSecret: 's', cliId: 'claude-code', allowedUsers: [OWNER] },
+    ]));
+    writeFileSync(botsInfoPath(), JSON.stringify([
+      { larkAppId: APP, botOpenId: 'ou_receiver_self', botName: 'Receiver', cliId: 'claude-code' },
+      { larkAppId: 'registry_only_route', botOpenId: 'ou_peer_self', botName: 'Codex', cliId: 'codex' },
+    ]));
+    recordBotUnionId(mocks.dataDir, 'registry_only_route', PEER_UNION);
+
+    await handleThreadReply(
+      makePeerRepoEventData('om_repo_reply_registry_only', 'bot', 'om_repo_root_registry_only'),
+      makeCtx('om_repo_root_registry_only', 'om_repo_reply_registry_only'),
+    );
+
+    expect(repliedText()).toContain('仅 allowedUsers 可执行');
+    expect(mocks.createSession).not.toHaveBeenCalled();
+    expect(mocks.forkWorker).not.toHaveBeenCalled();
   });
 });

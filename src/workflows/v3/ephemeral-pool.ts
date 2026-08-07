@@ -28,6 +28,7 @@ import {
   type WorkerSessionInfo,
 } from './contract.js';
 import { workflowSandboxInitFields } from '../shared/sandbox-policy.js';
+import { stripPm2GracefulExitMarker } from '../../pm2-graceful-exit.js';
 import {
   armV3AttemptWorkerFence,
   bindV3AttemptWorkerFence,
@@ -82,6 +83,12 @@ async function runNodeImpl(
   req: RunNodeRequest,
   deps: RunNodeInternalDeps,
 ): Promise<RunNodeResult> {
+  if (req.attemptLease && req.attemptLease.attemptId !== req.attemptId) {
+    throw new Error(
+      `v3 pool: attempt lease "${req.attemptLease.attemptId}" does not match request "${req.attemptId}"`,
+    );
+  }
+  const cancelSignal = req.attemptLease?.signal ?? req.cancelSignal;
   const manifestPath = req.env[GOAL_ENV.MANIFEST_PATH] ?? join(req.attemptDir, 'manifest.json');
   const ptyLogPath = join(req.attemptDir, 'pty.log');
   if (!req.workerFence) await mkdir(req.attemptDir, { recursive: true });
@@ -93,9 +100,9 @@ async function runNodeImpl(
     });
   // A durable run cancel may beat this dispatch into the pool. Never resolve
   // credentials or fork a worker for an already-aborted attempt.
-  if (req.cancelSignal?.aborted) {
+  if (cancelSignal?.aborted) {
     closeV3ArmedFenceWithoutSpawn(req.attemptDir, armedFence, 'pre_aborted');
-    return { status: 'cancelled', manifestPath, cancelReason: req.cancelSignal.reason };
+    return { status: 'cancelled', manifestPath, cancelReason: cancelSignal.reason };
   }
   let secret: string | undefined;
   try {
@@ -104,9 +111,9 @@ async function runNodeImpl(
     closeV3ArmedFenceWithoutSpawn(req.attemptDir, armedFence, 'setup_failed');
     throw err;
   }
-  if (req.cancelSignal?.aborted) {
+  if (cancelSignal?.aborted) {
     closeV3ArmedFenceWithoutSpawn(req.attemptDir, armedFence, 'pre_aborted');
-    return { status: 'cancelled', manifestPath, cancelReason: req.cancelSignal.reason };
+    return { status: 'cancelled', manifestPath, cancelReason: cancelSignal.reason };
   }
   if (!secret) {
     closeV3ArmedFenceWithoutSpawn(req.attemptDir, armedFence, 'secret_missing');
@@ -121,9 +128,9 @@ async function runNodeImpl(
     throw err;
   }
 
-  if (req.cancelSignal?.aborted) {
+  if (cancelSignal?.aborted) {
     closeV3ArmedFenceWithoutSpawn(req.attemptDir, armedFence, 'pre_aborted');
-    return { status: 'cancelled', manifestPath, cancelReason: req.cancelSignal.reason };
+    return { status: 'cancelled', manifestPath, cancelReason: cancelSignal.reason };
   }
 
   const cwd = expandWorkflowWorkingDir(req.botSnapshot.workingDir) ?? process.cwd();
@@ -134,7 +141,12 @@ async function runNodeImpl(
       workerPath: deps.workerPath,
       cwd,
       env: {
-        ...process.env,
+        // v3 ephemeral workers fork straight from the daemon here (not via
+        // workerForkEnv), so strip the PM2 graceful-exit sentinel to keep the
+        // "only daemon/dashboard carry the marker" invariant — harmless today
+        // (the worker doesn't read the graceful helper and its CLI children go
+        // through redactChildEnv), but this keeps the boundary honest.
+        ...stripPm2GracefulExitMarker(process.env),
         ...req.env,
         [GOAL_ENV.V3_MARKER]: '1',
         BOTMUX_WORKFLOW: '1',
@@ -311,7 +323,7 @@ async function runNodeImpl(
     function onAbort(): void {
       if (settled || cancelRequested) return;
       cancelRequested = true;
-      cancelReason = req.cancelSignal?.reason;
+      cancelReason = cancelSignal?.reason;
       pendingResult = undefined;
       clearTimeout(hardDeadline);
       if (quiesceTimer) {
@@ -339,9 +351,9 @@ async function runNodeImpl(
       }, deps.cancelGraceMs);
     }
 
-    if (req.cancelSignal) {
-      if (req.cancelSignal.aborted) setImmediate(onAbort);
-      else req.cancelSignal.addEventListener('abort', onAbort);
+    if (cancelSignal) {
+      if (cancelSignal.aborted) setImmediate(onAbort);
+      else cancelSignal.addEventListener('abort', onAbort);
     }
 
     function armQuiesce(): void {
@@ -441,7 +453,7 @@ async function runNodeImpl(
       clearTimeout(hardDeadline);
       if (quiesceTimer) clearTimeout(quiesceTimer);
       if (manifestTimer) clearTimeout(manifestTimer);
-      req.cancelSignal?.removeEventListener('abort', onAbort);
+      cancelSignal?.removeEventListener('abort', onAbort);
       if (cancelRequested) {
         settled = true;
         void appendLine(stderrPath(req), `[v3] worker closed after cancellation code=${code ?? 'null'}`);

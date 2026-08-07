@@ -805,6 +805,8 @@ function setupBotState(opts?: {
 	  chatReplyModes?: Record<string, 'chat' | 'new-topic' | 'shared' | 'chat-topic'>;
 	  p2pMode?: 'thread' | 'chat';
 	  summaryRange?: { limit?: number; sinceHours?: number };
+	  summaryMemory?: boolean;
+	  summaryMemoryPath?: string;
 	  substituteMode?: {
 	    enabled: boolean;
 	    targets: Array<{ openId?: string; userId?: string; unionId?: string; name?: string }>;
@@ -835,6 +837,8 @@ function setupBotState(opts?: {
 	      chatReplyModes: opts?.chatReplyModes,
 	      p2pMode: opts?.p2pMode,
 	      summaryRange: opts?.summaryRange,
+	      summaryMemory: opts?.summaryMemory,
+	      summaryMemoryPath: opts?.summaryMemoryPath,
 	      substituteMode: opts?.substituteMode,
 	    },
     botOpenId: opts && 'botOpenId' in opts ? opts.botOpenId : MY_OPEN_ID,
@@ -942,6 +946,7 @@ function makeHistoryMessage(opts: {
   senderOpenId?: string;
   senderAppId?: string;
   senderType?: string;
+  senderOpenBotId?: string;
   content: string;
   rootId?: string;
   threadId?: string;
@@ -963,6 +968,9 @@ function makeHistoryMessage(opts: {
       id: opts.senderOpenId ?? opts.senderAppId,
       id_type: opts.senderAppId && !opts.senderOpenId ? 'app_id' : 'open_id',
       sender_type: opts.senderType ?? (opts.senderAppId ? 'app' : 'user'),
+      // with_sender_name=true: Lark returns the bot's per-app open_id here even
+      // though id/id_type still describe the app_id form.
+      ...(opts.senderOpenBotId ? { open_bot_id: opts.senderOpenBotId } : {}),
     },
   };
 }
@@ -1670,6 +1678,49 @@ describe('message listener polling backfill', () => {
       expect.objectContaining({ message: expect.objectContaining({ message_id: 'msg-polled-resolved' }) }),
       expect.objectContaining({ messageListener: expect.objectContaining({ msgType: 'interactive' }) }),
     );
+  });
+
+  it('routes a third-party bot resolved via open_bot_id into the open_id slot (not app_id) on the polled path', async () => {
+    // The core downstream contract: message-parser / handleNewTopic read
+    // sender_id.open_id ONLY. A bot whose history row is app_id form but carries
+    // open_bot_id must arrive with its ou_ in the open_id slot, sender_type
+    // still 'app'. Putting it in app_id would drop the identity downstream
+    // (senderId '', no owner, no --mention-back target).
+    setupBotState({
+      allowedUsers: [USER_OPEN_ID],
+      messageListeners: {
+        chat_listener: {
+          enabled: true,
+          prompt: '监听所有 bot',
+          senderPolicy: { mode: 'all_except_excluded', includeSenderTypes: ['bot'] },
+          messagePolicy: { includeMsgTypes: ['interactive'], scope: 'top_level' },
+          replyPolicy: { mode: 'thread', sessionMode: 'per_message' },
+        },
+      },
+    });
+    handlers = makeHandlers();
+    const card = makeHistoryMessage({
+      senderAppId: 'cli_argos',
+      senderOpenBotId: 'ou_argos_open',
+      senderType: 'app',
+      messageType: 'interactive',
+      messageId: 'msg-openbotid',
+      chatId: 'chat_listener',
+      content: JSON.stringify({ title: 'Argos平台报警', elements: [[{ tag: 'text', text: 'x' }]] }),
+      createTime: String(Date.now()),
+    });
+    mockListChatMessagesUntil.mockResolvedValueOnce([card]);
+
+    await __pollMessageListenersOnceForTest(MY_APP_ID, handlers);
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).toHaveBeenCalledTimes(1);
+    const [dispatchedData] = handlers.handleNewTopic.mock.calls[0];
+    expect(dispatchedData.sender.sender_id.open_id).toBe('ou_argos_open');
+    expect(dispatchedData.sender.sender_id.app_id).toBeUndefined();
+    // sender_type stays 'app' so quota/talk gates + foreign-bot owner
+    // suppression still recognise it as a bot.
+    expect(dispatchedData.sender.sender_type).toBe('app');
   });
 
   it('fails closed on the polled path for an unresolvable third-party bot excluded by open_id', async () => {
@@ -5767,6 +5818,233 @@ describe('im.message.receive_v1 — 主动开工 场景② (autoStartOnNewTopic)
   });
 });
 
+describe('im.message.receive_v1 — 主动开工 场景② (autoStartOnNewTopic, bot sender / 其他机器人开的新话题)', () => {
+  let handlers: ReturnType<typeof makeHandlers>;
+
+  beforeEach(() => {
+    capturedHandlers = {};
+    __resetAnchorQueues();
+    __resetEventClaimsForTest();
+    _resetGrantPending();
+    mockReplyMessage.mockClear();
+    mockResolveSiblingBot.mockReset();
+    mockResolveSiblingBot.mockResolvedValue({ ok: false, reason: 'default_no_sibling' });
+    mockGetOwnerOpenId.mockReset();
+    mockGetOwnerOpenId.mockReturnValue('ou_owner');
+    mockGetChatMode.mockReset();
+    mockGetChatMode.mockResolvedValue('topic');
+    handlers = makeHandlers();
+    handlers.isSessionOwner.mockReturnValue(false);
+  });
+
+  /** setupBotState with a non-empty allowlist (limited / restricted mode) that
+   *  excludes the foreign bot. In restricted mode the auto-start branch's
+   *  `evaluateBotTalk` gate decides the outcome, so `knownPeer` DOES matter here:
+   *    knownPeer=true  → cross-ref seeded → isKnownPeerBot → evaluateBotTalk allows
+   *                      → 自动开工;
+   *    knownPeer=false → 完全陌生、未授权 bot → evaluateBotTalk rejects → 不建 session、
+   *                      发授权卡.
+   *  (In open mode — no allowlist — evaluateBotTalk's open leg allows anyone, so a
+   *   stranger triggers regardless; that path is covered by a separate open-mode test.) */
+  function setupAutoTopicBotSender(enabled: boolean, knownPeer: boolean) {
+    setupBotState({ allowedUsers: ['ou_owner'], autoStartOnNewTopic: enabled });
+    mockReadFileSync.mockReturnValue(knownPeer ? JSON.stringify({ SiblingBot: OTHER_BOT_OPEN_ID }) : '{}');
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+  }
+
+  /** A topic-group top-level seed FROM ANOTHER BOT: no root_id / thread_id so
+   *  decideRouting lands on {scope:'thread', anchor:messageId, source:'topic-chat'}. */
+  function makeBotTopicSeed(messageId: string, chatId: string) {
+    const event = makeBotMessageEvent({
+      senderOpenId: OTHER_BOT_OPEN_ID,
+      senderType: 'bot',
+      content: JSON.stringify({ text: '我先起个新话题看看这个仓库' }),
+      messageId,
+      chatId,
+      chatType: 'group',
+      rootId: undefined,
+    });
+    event.message.root_id = undefined as any;
+    event.message.thread_id = undefined as any;
+    return event;
+  }
+
+  it('已知 peer bot 开新话题（未 @）+ 开关开 → 自动开工', async () => {
+    setupAutoTopicBotSender(true, true);
+    const event = makeBotTopicSeed('msg-bot-seed-1', 'chat-bot-topic-1');
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).toHaveBeenCalledWith(event, expect.objectContaining({
+      scope: 'thread',
+      anchor: 'msg-bot-seed-1',
+      larkAppId: MY_APP_ID,
+    }));
+    // 未弹授权卡（走的是自动开工，不是 @blocked 授权路径）
+    expect(mockReplyMessage).not.toHaveBeenCalled();
+  });
+
+  it('已知 peer bot 开新话题（未 @）+ 开关关 → 不触发', async () => {
+    setupAutoTopicBotSender(false, true);
+    const event = makeBotTopicSeed('msg-bot-seed-off', 'chat-bot-topic-off');
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+  });
+
+  it('restricted 模式陌生外部 bot（无 cross-ref、非授权）开新话题（未 @）→ 不建 session，发一次授权卡', async () => {
+    // 授权门：restricted（配了 allowlist）下未授权的陌生 bot 开新话题，不自动开工——
+    // 与人分支 + 下游 enforceMessageQuotaForCliInput 的 evaluateBotTalk 一致（否则真实
+    // daemon 会在建 session 前静默 drop）。改为像人分支 @blocked 那样给 owner 发授权卡。
+    setupAutoTopicBotSender(true, false); // limited mode（allowedUsers=[owner]）+ 无 cross-ref = 陌生非授权 bot
+    const event = makeBotTopicSeed('msg-bot-seed-stranger', 'chat-bot-topic-stranger');
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    // 不建 session（既不 handleNewTopic 也不 handleThreadReply）
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+    // 发了授权申请卡（maybeSendGrantRequestCard → replyMessage interactive）
+    expect(mockReplyMessage).toHaveBeenCalledTimes(1);
+    expect(mockReplyMessage).toHaveBeenCalledWith(MY_APP_ID, 'msg-bot-seed-stranger', expect.any(String), 'interactive');
+  });
+
+  it('restricted 模式陌生 bot 连发两条新话题 → 授权卡去重（节流），只发一次', async () => {
+    setupAutoTopicBotSender(true, false);
+    const e1 = makeBotTopicSeed('msg-bot-dup-1', 'chat-bot-dup');
+    const e2 = makeBotTopicSeed('msg-bot-dup-2', 'chat-bot-dup');
+
+    await capturedHandlers['im.message.receive_v1'](e1);
+    await flushEventWork();
+    await capturedHandlers['im.message.receive_v1'](e2);
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    // 同 (chat, sender) 在节流窗口内只发一次卡（isThrottled 复用人分支同款节流表）
+    expect(mockReplyMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it('open 模式（空 allowlist，默认态）陌生 bot 开新话题（未 @）→ 自动开工（open 腿放行，无需授权卡）', async () => {
+    // open 模式（没配任何 allowlist）下 evaluateBotTalk 走 open 腿放行任意 sender →
+    // 直接自动开工，不发卡。证明触发面随授权配置而变，与人分支同源。
+    setupBotState({ autoStartOnNewTopic: true }); // 无 allowedUsers / chatGroups / grants
+    mockReadFileSync.mockReturnValue('{}');       // 无 cross-ref → 完全陌生的外部 bot
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+    const event = makeBotTopicSeed('msg-bot-open-unknown', 'chat-bot-open-unknown');
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).toHaveBeenCalledWith(event, expect.objectContaining({
+      scope: 'thread',
+      anchor: 'msg-bot-open-unknown',
+      larkAppId: MY_APP_ID,
+    }));
+    expect(mockReplyMessage).not.toHaveBeenCalled();
+  });
+
+  it('peer bot 话题内回复（有 root_id+thread_id，非新话题种子）→ 不触发（形态门 = 防自我循环的核心）', async () => {
+    // 这是「自动开工的产物是回复到话题内，不会再触发自动开工」的直接证据：
+    // 一条带 root_id+thread_id 的 bot 回复走 real-thread 分支（anchor=root≠messageId），
+    // shouldAutoStartOnNewTopic 的 anchor===messageId 形态门为假 → 绝不自动开工。
+    setupAutoTopicBotSender(true, true);
+    const event = makeBotMessageEvent({
+      senderOpenId: OTHER_BOT_OPEN_ID,
+      senderType: 'bot',
+      content: JSON.stringify({ text: '这是我在已有话题里的一条后续回复' }),
+      messageId: 'msg-bot-reply',
+      chatId: 'chat-bot-topic-reply',
+      chatType: 'group',
+      rootId: 'root-existing-topic',
+      threadId: 'root-existing-topic',
+    });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+  });
+
+  it('普通群 peer bot 消息（chat_mode=group，未 @）+ 开关开 → 不触发（非 topic-chat 种子）', async () => {
+    setupBotState({ allowedUsers: ['ou_owner'], autoStartOnNewTopic: true });
+    mockReadFileSync.mockReturnValue(JSON.stringify({ SiblingBot: OTHER_BOT_OPEN_ID }));
+    mockGetChatMode.mockReset();
+    mockGetChatMode.mockResolvedValue('group');
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+    const event = makeBotTopicSeed('msg-bot-plain', 'chat-bot-plain');
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+  });
+
+  it('peer bot @ 到本 bot 的新话题 → 走原有 @ 路径（未被自动开工分支吞掉）', async () => {
+    // 回归保护：@ 到本 bot 时不进自动开工分支（isBotMentioned 为真），
+    // 仍按既有 bot-to-bot @mention 逻辑路由（bot @ 路径无条件走 handleThreadReply，
+    // 见 dispatcher 的 "Bot-to-bot @mention detected" 分支）。
+    setupAutoTopicBotSender(true, true);
+    const event = makeBotMessageEvent({
+      senderOpenId: OTHER_BOT_OPEN_ID,
+      senderType: 'bot',
+      content: JSON.stringify({ zh_cn: { content: [[{ tag: 'at', user_id: MY_OPEN_ID }, { tag: 'text', text: ' 帮我看下' }]] } }),
+      messageId: 'msg-bot-at-seed',
+      chatId: 'chat-bot-at-seed',
+      chatType: 'group',
+      rootId: undefined,
+    });
+    event.message.root_id = undefined as any;
+    event.message.thread_id = undefined as any;
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    // @ 到本 bot → 既有 bot @mention 路径（handleThreadReply, anchor=种子 msgId），
+    // 而不是被本次新增的「未 @ 自动开工」分支处理（那条分支的 return 出口在 isBotMentioned 为真时不进入）。
+    expect(handlers.handleThreadReply).toHaveBeenCalledWith(event, expect.objectContaining({
+      scope: 'thread',
+      anchor: 'msg-bot-at-seed',
+      larkAppId: MY_APP_ID,
+    }));
+    expect(mockReplyMessage).not.toHaveBeenCalled();
+  });
+
+  it('P3: chat_mode 缓存 topic 但 forceRefresh 报 group（话题群翻回普通群窗口内）→ 不触发', async () => {
+    // decideRoutingWithSource 用缓存 chat_mode 判 topic-chat 种子；管理员翻回普通群后
+    // 缓存仍可能是 'topic'。新分支镜像人分支：无真实 thread_id 时用 forceRefresh 复核，
+    // 现在报 'group' → 当它不是话题种子，不自动开工（防在已是普通群里错建 thread 会话）。
+    setupAutoTopicBotSender(true, true); // cross-ref 有无都不影响触发，此处隔离出 chat_mode 这一维
+    // 按 forceRefresh 参数分支（而非调用次序）：缓存读返回 'topic' 让 decideRouting 判成
+    // topic 种子；带 {forceRefresh:true} 的复核返回 'group'。这样即便去掉复核那次调用、
+    // 或调用次序变了，测试也不会假绿——它锁的是「本分支必须用 forceRefresh 复核并尊重
+    // 其 'group' 结论」这条语义本身。
+    mockGetChatMode.mockReset();
+    mockGetChatMode.mockImplementation(
+      async (_appId: string, _chatId: string, options?: { forceRefresh?: boolean }) =>
+        options?.forceRefresh ? 'group' : 'topic',
+    );
+    const event = makeBotTopicSeed('msg-bot-flipped-group', 'chat-bot-flipped-group');
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+    // 明确断言这条 forceRefresh 复核真的发生过（否则「删掉 options / 不复核」会假绿）。
+    const forceRefreshCalls = mockGetChatMode.mock.calls.filter(
+      ([, , options]) => (options as { forceRefresh?: boolean } | undefined)?.forceRefresh === true,
+    );
+    expect(forceRefreshCalls.length).toBeGreaterThanOrEqual(1);
+  });
+});
+
 describe('im.message.receive_v1 — /summary command', () => {
   let handlers: ReturnType<typeof makeHandlers>;
 
@@ -5893,6 +6171,62 @@ describe('im.message.receive_v1 — /summary command', () => {
     const ctx = handlers.handleNewTopic.mock.calls[0][1] as any;
     expect(ctx.promptOverride).toContain('很久以前的消息');
     expect(ctx.promptOverride).toContain('最近消息');
+  });
+
+  it('adds project summary.md memory instructions and explicit command boundary when enabled', async () => {
+    setupBotState({
+      allowedUsers: [USER_OPEN_ID],
+      summaryRange: { limit: 0, sinceHours: 0 },
+      summaryMemory: true,
+      summaryMemoryPath: '/tmp/botmux-summary.md',
+    });
+    const triggerMs = 100 * 60 * 60_000;
+    mockListChatMessagesUntil.mockResolvedValue([
+      {
+        message_id: 'before-boundary',
+        msg_type: 'text',
+        body: { content: JSON.stringify({ text: '边界前不该写入 summary.md 的旧内容' }) },
+        sender: { id: 'ou_old', sender_type: 'user' },
+        create_time: String(triggerMs - 3 * 60 * 60_000),
+      },
+      {
+        message_id: 'boundary',
+        msg_type: 'text',
+        body: { content: JSON.stringify({ text: '从 start_pipeline 报错开始' }) },
+        sender: { id: 'ou_boundary', sender_type: 'user' },
+        create_time: String(triggerMs - 2 * 60 * 60_000),
+      },
+      {
+        message_id: 'incident',
+        msg_type: 'text',
+        body: { content: JSON.stringify({ text: 'PSM ad.qa.demo 在 PPE 节点 start_pipeline 报错' }) },
+        sender: { id: 'ou_fresh', sender_type: 'user' },
+        create_time: String(triggerMs - 60 * 60_000),
+      },
+    ]);
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@_bot_a /summary 从 start_pipeline 报错开始' }),
+      mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+      messageId: 'msg-summary-memory',
+      chatId: 'chat-summary-memory',
+      chatType: 'group',
+    });
+    (event.message as any).create_time = String(triggerMs);
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    const ctx = handlers.handleNewTopic.mock.calls[0][1] as any;
+    expect(ctx.promptOverride).toContain('summary_memory="true"');
+    expect(ctx.promptOverride).toContain('summary_memory_path="/tmp/botmux-summary.md"');
+    expect(ctx.promptOverride).toContain('window="explicit-boundary"');
+    expect(ctx.promptOverride).toContain('<explicit_boundary>');
+    expect(ctx.promptOverride).toContain('从 start_pipeline 报错开始');
+    expect(ctx.promptOverride).not.toContain('边界前不该写入');
+    expect(ctx.promptOverride).toContain('只允许创建或追加 /tmp/botmux-summary.md');
+    expect(ctx.promptOverride).toContain('实际追加到 /tmp/botmux-summary.md 的 Markdown 原样发给用户确认');
+    expect(ctx.promptOverride).toContain('不能擅自扩展范围');
   });
 
   it('summarizes regular group history after the previous @this bot /summary', async () => {

@@ -524,6 +524,8 @@ describe('transferSession', () => {
     const replacementFork = vi.fn((...args: Parameters<typeof forkWorker>) => {
       lifecycle.push('replacement:fork');
       ds.worker = replacementWorker;
+      ds.workerGeneration = 2;
+      ds.session.workerGeneration = 2;
       return forkWorkerSpy(...args);
     });
     const moving = transferSession(
@@ -550,6 +552,11 @@ describe('transferSession', () => {
       'arrived during transfer',
       'turn-late',
       { dispatchAttempt: 7 },
+    )).toBe(true);
+    expect(sendWorkerInput(
+      ds,
+      'ordinary message during transfer',
+      'om_transfer_late',
     )).toBe(true);
     const rawDuringTransfer = {
       type: 'raw_input' as const,
@@ -588,6 +595,7 @@ describe('transferSession', () => {
       'old:exit',
       'replacement:fork',
       'replacement:message',
+      'replacement:message',
       'replacement:raw_input',
     ]);
     expect(replacementFork).toHaveBeenCalledWith(ds, '', true);
@@ -597,7 +605,16 @@ describe('transferSession', () => {
       turnId: 'turn-late',
       dispatchAttempt: 7,
     }));
-    expect(replacementSend).toHaveBeenNthCalledWith(2, rawDuringTransfer);
+    expect(replacementSend).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({
+        type: 'message',
+        content: 'ordinary message during transfer',
+        turnId: 'om_transfer_late',
+      }),
+      expect.any(Function),
+    );
+    expect(replacementSend).toHaveBeenNthCalledWith(3, rawDuringTransfer);
   });
 
   it('fails safe on detach timeout using hard retirement without ordinary close cleanup', async () => {
@@ -638,6 +655,58 @@ describe('transferSession', () => {
       expect.anything(),
     );
     expect(ds.worker).toBeNull();
+    expect(ds.chatId).toBe('oc_source');
+    expect(ds.session.rootMessageId).toBe('om_source_root');
+  });
+
+  it('force-kills a worker that ACKs the detach but never self-exits (node-pty exit wedge), completing the transfer', async () => {
+    // The production bug: the worker runs killCli + sends transfer_detached in
+    // ~9ms, then process.exit(0) wedges in node-pty's native teardown (an open
+    // web-terminal client PTY blocks the reader-thread join; the JS loop is
+    // already stopped so the worker cannot self-kill). The daemon must not sit
+    // out the whole fence waiting for an exit that never comes on its own — once
+    // the ACK proves the observer detached, it force-kills the disposable
+    // process. Here the worker ACKs but ONLY exits when SIGKILLed by the daemon.
+    let oldWorker: any;
+    const send = vi.fn((
+      message: { type: string; requestId?: string },
+      callback?: (error: Error | null) => void,
+    ) => {
+      callback?.(null);
+      // ACK the detach on the next tick, but deliberately do NOT emit 'exit' —
+      // simulate the wedged process.exit(0). Only the daemon's SIGKILL ends it.
+      if (message.type === 'detach_for_transfer') {
+        queueMicrotask(() => oldWorker.emit('message', {
+          type: 'transfer_detached',
+          requestId: message.requestId,
+        }));
+      }
+    });
+    const kill = vi.fn((signal: NodeJS.Signals) => {
+      oldWorker.signalCode = signal;
+      oldWorker.emit('exit', null, signal);
+      return true;
+    });
+    oldWorker = Object.assign(new EventEmitter(), {
+      killed: false,
+      connected: true,
+      exitCode: null,
+      signalCode: null,
+      send,
+      kill,
+    }) as any;
+    const ds = makeDs({ worker: oldWorker, lastScreenStatus: 'idle' });
+    registry.set(sessionKey('om_source_root', 'cli_app_test'), ds);
+
+    // No manual exit emission — the daemon's post-ACK kill is the ONLY thing
+    // that can end this worker. If the fix regressed, this would hang until the
+    // full fence and return false.
+    const completed = await detachWorkerForTransfer(ds);
+
+    expect(completed).toBe(true);
+    expect(kill).toHaveBeenCalledWith('SIGKILL');
+    expect(ds.worker).toBeNull();
+    // Source routing untouched by the detach itself (transferSession rewrites it).
     expect(ds.chatId).toBe('oc_source');
     expect(ds.session.rootMessageId).toBe('om_source_root');
   });

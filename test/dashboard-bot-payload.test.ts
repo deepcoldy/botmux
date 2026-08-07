@@ -4,36 +4,73 @@ import { botDefaultsPayload, botSummaryPayload } from '../src/dashboard/bot-payl
 describe('dashboard bot payload helpers', () => {
   it('keeps every editable Bot Defaults field in the aggregated /api/bots row', () => {
     const row = botDefaultsPayload(
-      { larkAppId: 'app_contract', botName: 'BotContract', cliId: 'codex', model: 'gpt-5' },
+      {
+        larkAppId: 'app_contract',
+        botName: 'BotContract',
+        cliId: 'codex',
+        cliRuntime: { id: 'vendor-codex', executable: 'vendor-codex' },
+        model: 'gpt-5',
+      },
       {},
     );
     const editableFields = [
       'agentSelectionKey', 'autoGrantRequestCards', 'autoStartOnGroupJoin',
       'autoStartOnGroupJoinPrompt', 'autoStartOnNewTopic', 'backendType',
-      'botToBotSameDir', 'brandLabel', 'canTalkDaemonCommands', 'codexAppCleanInput',
+      'botToBotSameDir', 'brandLabel', 'canTalkDaemonCommands', 'cliRuntime', 'codexAppCleanInput',
       'customPassthroughCommands', 'defaultOncall', 'defaultWorkingDir',
       'defaultWorkingDirAutoWorktree', 'disableStreamingCard', 'docSubscribeDefaultMode',
       'env', 'launchShell', 'maxLiveWorkers', 'messageQuotaDefaultLimit', 'model',
       'overloadAlert', 'p2pMode', 'privateCard', 'regularGroupMentionMode',
       'regularGroupReplyMode', 'restrictGrantCommands', 'riff', 'sandbox', 'sandboxPaths',
       'silentTurnReactions', 'skillInjection', 'startupCommands', 'substituteMode',
-      'summaryRange', 'writableTerminalLinkInCard',
+      'summaryMemory', 'summaryMemoryPath', 'summaryRange', 'writableTerminalLinkInCard',
     ];
     expect(Object.keys(row)).toEqual(expect.arrayContaining(editableFields));
   });
 
-  it('includes authoritative cliId in group roster bot summaries', () => {
+  it('keeps executable runtime details out of public group roster summaries', () => {
+    const cliRuntime = {
+      id: 'vendor-codex',
+      displayName: 'Vendor Codex',
+      executable: 'vendor-codex',
+      update: { provider: 'auto' as const },
+    };
     expect(botSummaryPayload({
-      larkAppId: 'cli_traex',
-      botName: 'TraeX',
+      larkAppId: 'cli_vendor',
+      botName: 'Vendor Bot',
       botAvatarUrl: 'https://example.test/avatar.png',
-      cliId: 'traex',
+      cliId: 'codex',
+      cliRuntime,
+      cliPathOverride: '/private/legacy/vendor-codex',
     })).toEqual({
-      larkAppId: 'cli_traex',
-      botName: 'TraeX',
+      larkAppId: 'cli_vendor',
+      botName: 'Vendor Bot',
       botAvatarUrl: 'https://example.test/avatar.png',
-      cliId: 'traex',
+      cliId: 'codex',
     });
+  });
+
+  it('carries a legacy path only in the private Bot Defaults payload', () => {
+    const daemon = {
+      larkAppId: 'cli_legacy',
+      cliId: 'codex',
+      cliPathOverride: '/private/legacy/vendor-codex',
+    };
+    expect(botDefaultsPayload(daemon, {})).toMatchObject({
+      cliPathOverride: '/private/legacy/vendor-codex',
+    });
+    expect(botSummaryPayload(daemon)).toEqual({
+      larkAppId: 'cli_legacy',
+      botName: undefined,
+      cliId: 'codex',
+    });
+  });
+
+  it('keeps cliRuntime in both success and degraded Bot Defaults rows', () => {
+    const cliRuntime = { id: 'vendor-codex', executable: 'vendor-codex' };
+    const daemon = { larkAppId: 'cli_vendor', cliId: 'codex', cliRuntime };
+    expect(botDefaultsPayload(daemon, {})).toMatchObject({ cliRuntime });
+    expect(botDefaultsPayload(daemon, undefined, 'offline')).toMatchObject({ cliRuntime, error: 'offline' });
   });
 
   it('includes authoritative cliId in /api/bots success and error rows', () => {
@@ -240,6 +277,8 @@ describe('dashboard bot payload helpers', () => {
   it('projects dashboard summary range for /api/bots', () => {
     const daemon = { larkAppId: 'app_a', botName: 'BotA', cliId: 'codex' };
     expect(botDefaultsPayload(daemon, {})).toMatchObject({
+      summaryMemory: false,
+      summaryMemoryPath: 'summary.md',
       summaryRange: {
         limit: 50,
         sinceHours: 24,
@@ -247,7 +286,11 @@ describe('dashboard bot payload helpers', () => {
     });
     expect(botDefaultsPayload(daemon, {
       summaryRange: { limit: 12, sinceHours: 6 },
+      summaryMemory: true,
+      summaryMemoryPath: '/tmp/botmux-summary.md',
     })).toMatchObject({
+      summaryMemory: true,
+      summaryMemoryPath: '/tmp/botmux-summary.md',
       summaryRange: {
         limit: 12,
         sinceHours: 6,

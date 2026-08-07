@@ -4,10 +4,12 @@ import {
   BOTMUX_INJECTED_ENV_KEYS,
   CLAUDE_SESSION_MARKER_ENV_KEYS,
   redactChildEnv,
+  REDACTED_CHILD_ENV_KEYS,
   scrubClaudeSessionMarkerEnv,
   scrubSessionCliHomeEnv,
   SESSION_CLI_HOME_ENV_KEYS,
 } from '../src/utils/child-env.js';
+import { PM2_GRACEFUL_EXIT_CODE_ENV } from '../src/pm2-graceful-exit.js';
 
 describe('redactChildEnv()', () => {
   it('truly removes leaked keys — absent, not present-with-"undefined"', () => {
@@ -64,6 +66,28 @@ describe('redactChildEnv()', () => {
     expect(out.KEEP).toBe('v');
   });
 
+  it('removes the PM2 graceful-exit sentinel so a foreground CLI child exits 0, not 90', () => {
+    // pm2 bakes BOTMUX_PM2_GRACEFUL_EXIT_CODE=90 into the daemon env so ONLY the
+    // daemon/dashboard cores exit with the sentinel on graceful stop. Left in a
+    // session's CLI-child env, a foreground `botmux serve --api-only` / `daemon`
+    // launched from inside that session would exit 90 on a clean Ctrl+C
+    // (gracefulProcessExitCode reads this key) — a supervisor reads non-zero as
+    // a crash. redactChildEnv must strip it at the child boundary.
+    const out = redactChildEnv({
+      [PM2_GRACEFUL_EXIT_CODE_ENV]: '90',
+      KEEP: 'v',
+    });
+    expect(PM2_GRACEFUL_EXIT_CODE_ENV in out).toBe(false);
+    expect(out.KEEP).toBe('v');
+  });
+
+  it('pins the redacted sentinel key to PM2_GRACEFUL_EXIT_CODE_ENV (drift guard)', () => {
+    // The key is a string literal in REDACTED_CHILD_ENV_KEYS (matching its
+    // neighbors) rather than an import, so guard against the two definitions
+    // drifting apart if the env var is ever renamed.
+    expect(REDACTED_CHILD_ENV_KEYS).toContain(PM2_GRACEFUL_EXIT_CODE_ENV);
+  });
+
   it('real node-pty child does NOT inherit a redacted var (not the string "undefined")', async () => {
     // End-to-end guard for the actual leak vector Codex found: a spawned child
     // must see the redacted var as genuinely UNSET. `${VAR+x}` expands to empty
@@ -71,11 +95,16 @@ describe('redactChildEnv()', () => {
     // 'undefined'". Run against the real bundled node-pty + /bin/sh.
     const pty = await import('node-pty');
     const prev = process.env.LARK_APP_ID;
+    const prevSentinel = process.env[PM2_GRACEFUL_EXIT_CODE_ENV];
     process.env.LARK_APP_ID = 'cli_parent_must_not_leak';
+    // Simulate a PM2-managed daemon's env carrying the graceful-exit sentinel,
+    // which must not survive into the forked CLI child.
+    process.env[PM2_GRACEFUL_EXIT_CODE_ENV] = '90';
     try {
       const env = redactChildEnv(process.env) as { [k: string]: string };
       const script =
-        'if [ -z "${LARK_APP_ID+x}" ]; then echo "R=UNSET"; else echo "R=SET[$LARK_APP_ID]"; fi';
+        'if [ -z "${LARK_APP_ID+x}" ]; then echo "R=UNSET"; else echo "R=SET[$LARK_APP_ID]"; fi; ' +
+        `if [ -z "\${${PM2_GRACEFUL_EXIT_CODE_ENV}+x}" ]; then echo "S=UNSET"; else echo "S=SET[\$${PM2_GRACEFUL_EXIT_CODE_ENV}]"; fi`;
       const out: string = await new Promise((resolve) => {
         const p = pty.spawn('/bin/sh', ['-c', script], {
           name: 'xterm-256color', cols: 80, rows: 24, cwd: '/tmp', env,
@@ -85,10 +114,13 @@ describe('redactChildEnv()', () => {
         p.onExit(() => resolve(buf));
       });
       expect(out).toContain('R=UNSET');
+      expect(out).toContain('S=UNSET');
       expect(out).not.toContain('undefined');
     } finally {
       if (prev === undefined) delete process.env.LARK_APP_ID;
       else process.env.LARK_APP_ID = prev;
+      if (prevSentinel === undefined) delete process.env[PM2_GRACEFUL_EXIT_CODE_ENV];
+      else process.env[PM2_GRACEFUL_EXIT_CODE_ENV] = prevSentinel;
     }
   });
 });
@@ -184,6 +216,16 @@ describe('session CLI home scrub call sites', () => {
     expect(fn.slice(0, fn.indexOf('\n}'))).toContain('scrubClaudeSessionMarkerEnv(');
     expect(read('index-daemon.ts')).toContain('scrubClaudeSessionMarkerEnv(process.env)');
     expect(read('worker.ts')).toContain('scrubClaudeSessionMarkerEnv(process.env)');
+  });
+
+  it('worker-pool strips the PM2 sentinel when forking a worker (source pin)', () => {
+    // WORKER_REDACTED_ENV_KEYS is a private const in worker-pool.ts (worker fork
+    // boundary, not importable without side effects), so pin at the source that
+    // the sentinel is in the strip list. redactChildEnv covers the CLI child;
+    // this covers the worker process itself so it also never exits 90.
+    const src = read('core/worker-pool.ts');
+    const decl = src.slice(src.indexOf('const WORKER_REDACTED_ENV_KEYS'));
+    expect(decl.slice(0, decl.indexOf('\n'))).toContain(PM2_GRACEFUL_EXIT_CODE_ENV);
   });
 });
 

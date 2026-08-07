@@ -45,6 +45,9 @@ export async function collectAdoptCandidates(
     limit?: number,
   ) => Promise<ResumableSession[]>,
   resumeLimit: number,
+  /** Exact live-process identity asserted only by a structured cliRuntime.
+   *  Kept separate from cliPathOverride because legacy paths may be wrappers. */
+  runtimeExecutable?: string,
 ): Promise<AdoptCandidates> {
   // Only offer live panes for THIS bot's configured CLI (adopting another
   // CLI's pane would silently change the agent behind the bot).
@@ -57,12 +60,21 @@ export async function collectAdoptCandidates(
       ? [{ sessionName: target.sessionName, agentName: target.agentName }]
       : [];
   });
+  // Only a structured cliRuntime asserts exact process identity. A legacy
+  // cliPathOverride may be a wrapper/router whose child is still stock Codex;
+  // preserving the one-argument path keeps those existing bots discoverable.
+  const tmuxAndHerdr = runtimeExecutable
+    ? discoverAdoptableSessions(botCliId as any, runtimeExecutable)
+    : discoverAdoptableSessions(botCliId as any);
+  const zellij = runtimeExecutable
+    ? discoverAdoptableZellijSessions(botCliId as any, runtimeExecutable)
+    : discoverAdoptableZellijSessions(botCliId as any);
   const sessions: Array<AdoptableSession | ZellijAdoptableSession> = [
     ...excludeOwnedHerdrAdoptTargets(
-      discoverAdoptableSessions(botCliId as any),
+      tmuxAndHerdr,
       ownedHerdrTargets,
     ),
-    ...discoverAdoptableZellijSessions(botCliId as any),
+    ...zellij,
   ];
   // Resume needs the bot's own CLI binary, so only offer it when known.
   const resumable = botCliId

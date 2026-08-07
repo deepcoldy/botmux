@@ -3,8 +3,24 @@
  * The cache exists so search / page re-renders of the picker card don't
  * re-shell-out to tmux; these pin the store / TTL / clear semantics.
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
+
+const discovery = vi.hoisted(() => ({
+  tmux: vi.fn(() => []),
+  zellij: vi.fn(() => []),
+}));
+
+vi.mock('../src/core/session-discovery.js', () => ({
+  discoverAdoptableSessions: discovery.tmux,
+  excludeOwnedHerdrAdoptTargets: (sessions: unknown[]) => sessions,
+}));
+
+vi.mock('../src/core/zellij-adopt-discovery.js', () => ({
+  discoverAdoptableZellijSessions: discovery.zellij,
+}));
+
 import {
+  collectAdoptCandidates,
   cacheAdoptCandidates,
   getCachedAdoptCandidates,
   clearAdoptCandidates,
@@ -41,5 +57,39 @@ describe('adopt-picker candidates cache', () => {
 
   it('returns undefined for an unknown key (forces re-discovery)', () => {
     expect(getCachedAdoptCandidates('never-cached', 42)).toBeUndefined();
+  });
+
+  it('passes the bot effective executable to both live discovery backends', async () => {
+    discovery.tmux.mockClear();
+    discovery.zellij.mockClear();
+    const discoverResumable = vi.fn(async () => []);
+
+    await collectAdoptCandidates(
+      'codex',
+      '/opt/Vendor Codex/vendorCodex',
+      new Map(),
+      discoverResumable,
+      20,
+      '/opt/Vendor Codex/vendorCodex',
+    );
+
+    expect(discovery.tmux).toHaveBeenCalledWith('codex', '/opt/Vendor Codex/vendorCodex');
+    expect(discovery.zellij).toHaveBeenCalledWith('codex', '/opt/Vendor Codex/vendorCodex');
+    expect(discoverResumable).toHaveBeenCalledWith(
+      'codex',
+      '/opt/Vendor Codex/vendorCodex',
+      expect.any(Map),
+      20,
+    );
+  });
+
+  it('keeps the legacy one-argument live discovery calls when no runtime is configured', async () => {
+    discovery.tmux.mockClear();
+    discovery.zellij.mockClear();
+
+    await collectAdoptCandidates('codex', '/opt/wrapper-codex', new Map(), vi.fn(async () => []), 20);
+
+    expect(discovery.tmux).toHaveBeenCalledWith('codex');
+    expect(discovery.zellij).toHaveBeenCalledWith('codex');
   });
 });

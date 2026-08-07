@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import {
-  BRIDGE_NO_REPLY_SENTINEL,
+  BRIDGE_NOTHING_TO_SEND_SENTINEL,
+  BRIDGE_NO_REPLY_SENTINEL_LEGACY,
   buildBridgeSendMarkerContent,
   buildBridgeSendPreviewText,
   shouldEmitEmptyCompletedBridgeFallback,
@@ -61,9 +62,22 @@ describe('buildBridgeSendMarkerContent', () => {
 });
 
 describe('shouldSuppressBridgeEmit', () => {
-  it('non-adopt: exact no-reply sentinel suppresses without a send marker', () => {
+  it('non-adopt: exact nothing-to-send sentinel suppresses without a send marker', () => {
     expect(shouldSuppressBridgeEmit(
-      { ...turn(100), finalText: `  ${BRIDGE_NO_REPLY_SENTINEL}\n` },
+      { ...turn(100), finalText: `  ${BRIDGE_NOTHING_TO_SEND_SENTINEL}\n` },
+      undefined,
+      [],
+      false,
+    )).toBe(true);
+  });
+
+  it('non-adopt: the legacy no-reply token is still recognized as a sentinel', () => {
+    // Rollout / restore safety: sessions spawned before the rename still carry
+    // the old token in their captured system prompt. The reader stays liberal
+    // so their sentinel line does NOT leak into Lark; only the instruction
+    // surface moved to the new name.
+    expect(shouldSuppressBridgeEmit(
+      { ...turn(100), finalText: `Nothing for me to do here.\n\n${BRIDGE_NO_REPLY_SENTINEL_LEGACY}` },
       undefined,
       [],
       false,
@@ -74,7 +88,7 @@ describe('shouldSuppressBridgeEmit', () => {
     // The real-world shape: the model explains the silence, then appends the
     // token on its own trailing line. Full-string exact match let this leak.
     expect(shouldSuppressBridgeEmit(
-      { ...turn(100), finalText: `Codex acknowledged and is reviewing. Nothing for me to do — no reply needed.\n\n${BRIDGE_NO_REPLY_SENTINEL}` },
+      { ...turn(100), finalText: `Codex acknowledged and is reviewing. Nothing for me to do — no reply needed.\n\n${BRIDGE_NOTHING_TO_SEND_SENTINEL}` },
       undefined,
       [],
       false,
@@ -85,7 +99,7 @@ describe('shouldSuppressBridgeEmit', () => {
     // Last non-empty line is a full sentence (token mid-line), not a bare
     // sentinel — a normal answer that merely mentions the token.
     expect(shouldSuppressBridgeEmit(
-      { ...turn(100), finalText: `I will stay silent instead of replying. ${BRIDGE_NO_REPLY_SENTINEL}` },
+      { ...turn(100), finalText: `I will stay silent instead of replying. ${BRIDGE_NOTHING_TO_SEND_SENTINEL}` },
       undefined,
       [],
       false,
@@ -94,16 +108,16 @@ describe('shouldSuppressBridgeEmit', () => {
 
   it('non-adopt: sentinel followed by more prose still posts (not a terminator)', () => {
     expect(shouldSuppressBridgeEmit(
-      { ...turn(100), finalText: `${BRIDGE_NO_REPLY_SENTINEL}\n\nActually, here is the answer you asked for.` },
+      { ...turn(100), finalText: `${BRIDGE_NOTHING_TO_SEND_SENTINEL}\n\nActually, here is the answer you asked for.` },
       undefined,
       [],
       false,
     )).toBe(false);
   });
 
-  it('adopt mode does not interpret the no-reply sentinel', () => {
+  it('adopt mode does not interpret the nothing-to-send sentinel', () => {
     expect(shouldSuppressBridgeEmit(
-      { ...turn(100), finalText: BRIDGE_NO_REPLY_SENTINEL },
+      { ...turn(100), finalText: BRIDGE_NOTHING_TO_SEND_SENTINEL },
       undefined,
       [],
       true,
