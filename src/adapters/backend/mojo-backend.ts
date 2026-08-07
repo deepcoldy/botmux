@@ -51,7 +51,7 @@ import { locateOnPath } from '../cli/registry.js';
 import { buildWrappedLaunch } from '../../setup/cli-selection.js';
 import { logger } from '../../utils/logger.js';
 import type { SessionBackend, SpawnOpts } from './types.js';
-import { findReservedMojoCliFlags, MOJO_CONTROL_ENV_KEYS, MOJO_LIVE_PATCH_KEYS } from './mojo-types.js';
+import { findReservedMojoCliFlags, MOJO_CONTROL_ENV_KEYS } from './mojo-types.js';
 import type {
     MojoAuthStatus,
     MojoLivePatch,
@@ -151,6 +151,8 @@ export class MojoBackend implements SessionBackend {
     private launchPrefix: { bin: string; args: string[] } | null = null;
     /** Guard so the config-side wrapper resolution is attempted at most once. */
     private wrapperResolved = false;
+    /** Resolved once per session — see resolveBin. */
+    private pinnedBin: string | null = null;
     /**
      * Generic CLI args the worker composed for this session (today: CLI_EXTRA_ARGS,
      * e.g. `--timeout 77`). The mojo adapter's buildArgs() returns [], so anything
@@ -242,7 +244,32 @@ export class MojoBackend implements SessionBackend {
         if (prefix) {
             return { bin: prefix.bin, args: [...prefix.args, ...cliArgs] };
         }
-        return { bin: this.config.bin ?? 'mojo', args: cliArgs };
+        return { bin: this.resolveBin(), args: cliArgs };
+    }
+
+    /**
+     * Resolve the binary ONCE and reuse it for every turn of this session.
+     *
+     * Without pinning, a bare `mojo` was re-resolved on each turn against the
+     * then-current PATH, so anything able to influence the environment between
+     * turns could substitute the executable. The live patch no longer carries
+     * `env` at all, but pinning removes the class of problem rather than one
+     * instance of it — and it also keeps a session on one binary if PATH shifts
+     * underneath a long-running worker.
+     */
+    private resolveBin(): string {
+        if (this.pinnedBin) return this.pinnedBin;
+        const configured = this.config.bin?.trim();
+        if (configured) {
+            this.pinnedBin = configured;
+        } else {
+            // Absolute path when resolvable; the bare name is a last resort so a
+            // PATH-only install still works.
+            const located = locateOnPath('mojo');
+            this.pinnedBin = located ?? 'mojo';
+            logger.info(`[mojo] pinned binary for this session: ${this.pinnedBin}`);
+        }
+        return this.pinnedBin;
     }
 
     /** Lazily resolve (and memoize) `config.wrapperCli` when spawn() never ran. */
@@ -290,34 +317,34 @@ export class MojoBackend implements SessionBackend {
     }
 
     /**
-     * Rotate credentials / behaviour knobs on a LIVE session, without a refork.
+     * Rotate the JWT on a LIVE session, without a refork.
      *
      * Needed because the config is otherwise read once at worker init, so every
-     * subsequent per-turn CLI invocation kept using the ORIGINAL JWT — a rotated
-     * token never took effect, contradicting the documented "credentials stay
-     * live" contract (the control plane is the part that is deliberately frozen).
+     * subsequent per-turn CLI invocation kept using the ORIGINAL token — a rotated
+     * credential never took effect.
      *
-     * Only the live-updatable subset is accepted; anything else is ignored, so
-     * this can never become a back door for changing the control plane.
+     * Takes a COMPLETE snapshot rather than a sparse diff, so the two states that
+     * a sparse patch could not express both work:
+     *   - `jwt: null`      → cleared (a deleted `mojo.jwt` must not linger)
+     *   - `jwt: <original>` → rolled back (A → B → A must return to A)
+     *
+     * Only the JWT is patchable. An `env` patch would be equivalent to replacing
+     * the launcher — see MOJO_LIVE_PATCH_KEYS.
      */
     applyLivePatch(patch: MojoLivePatch): void {
-        const next: Record<string, unknown> = { ...this.config };
-        const changed: string[] = [];
-        for (const key of MOJO_LIVE_PATCH_KEYS) {
-            const incoming = (patch as Record<string, unknown>)[key];
-            if (incoming === undefined) continue;
-            const current = next[key];
-            const differs = key === 'env'
-                ? JSON.stringify(current ?? {}) !== JSON.stringify(incoming ?? {})
-                : current !== incoming;
-            if (!differs) continue;
-            next[key] = incoming;
-            changed.push(key);
-        }
-        if (changed.length === 0) return;
-        this.config = next as EffectiveMojoConfig;
-        // Names only — `jwt` and `env` values are credentials.
-        logger.info(`[mojo] applied live config patch: ${changed.join(', ')}`);
+        if (patch.jwt === undefined) return;
+        const next = patch.jwt === null ? undefined : patch.jwt;
+        if (this.config.jwt === next) return;
+        // Reassigned rather than mutated so an in-flight turn keeps the config it
+        // started with.
+        this.config = { ...this.config, jwt: next };
+        // Never log the value.
+        logger.info(`[mojo] live JWT ${next === undefined ? 'cleared' : 'rotated'}`);
+    }
+
+    /** Current live-patchable state, so the daemon can diff against reality. */
+    livePatchState(): { jwt?: string | null } {
+        return { jwt: this.config.jwt ?? null };
     }
 
     resize(_cols: number, _rows: number): void { /* no terminal to resize */ }

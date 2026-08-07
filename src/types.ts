@@ -436,6 +436,15 @@ export interface Session {
    */
   mojoQuarantinedLineage?: string;
   /**
+   * Set alongside `mojoQuarantinedLineage` and cleared once the user has been told.
+   *
+   * The parking itself is irreversible for that lineage, so a log line is not
+   * enough: without a visible notice the user silently loses their context, does
+   * not know the next message starts a new session, and never learns that a remote
+   * id needs manual cleanup.
+   */
+  mojoQuarantineNoticePending?: boolean;
+  /**
    * Session backend resolved AT SPAWN TIME (tmux/herdr/zellij/zmx/pty). Stamped on
    * fork so restore can resolve the backend authoritatively from the session
    * itself instead of re-deriving it from the live daemon default — which

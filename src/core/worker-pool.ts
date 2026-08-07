@@ -36,7 +36,6 @@ import {
   buildEffectiveMojoConfig,
   diffMojoSessionIdentity,
   MOJO_IDENTITY_KEYS,
-  mojoLivePatchDiffers,
   pickMojoLivePatch,
   pickMojoSessionIdentity,
   type MojoConfig,
@@ -1041,7 +1040,7 @@ function frozenSessionLaunchIdentity(
  * `freeze` is false on read-only paths (workerless cancel) so teardown never
  * mutates session state.
  */
-function sessionMojoConfig(
+export function sessionMojoConfig(
   ds: DaemonSession,
   botCfg: { mojo?: MojoConfig },
   opts: { freeze: boolean },
@@ -1050,41 +1049,29 @@ function sessionMojoConfig(
   const liveIdentity = pickMojoSessionIdentity(live);
 
   if (!ds.session.mojoIdentity) {
-    // Legacy row, never frozen. `undefined` means "predates this field"; an empty
-    // object means "frozen with nothing configured" and is NOT this branch — which
-    // is why the migration persists `{}` rather than skipping it.
-    const lineage = ds.session.riffParentTaskId ?? ds.session.mojoQuarantinedLineage;
-    if (lineage) {
-      // QUARANTINE, do not delete. The id is the only record of a remote session
-      // that is still running somewhere; keeping it allows manual inspection and
-      // cleanup, and lets the user be told their context was parked. Deleting it
-      // would lose that silently.
-      if (opts.freeze) {
-        if (ds.session.mojoQuarantinedLineage !== lineage
-            || ds.session.riffParentTaskId !== undefined
-            || !ds.session.mojoIdentity) {
-          ds.session.mojoQuarantinedLineage = lineage;
-          // Cleared from the ACTIVE slot so no resume path picks it up, while the
-          // value itself survives under the quarantine key.
-          ds.session.riffParentTaskId = undefined;
-          ds.session.mojoIdentity = liveIdentity;
-          sessionStore.updateSession(ds.session);
-        }
-        logger.warn(
-          `[${tag(ds)}] mojo session has a remote lineage but no frozen control plane `
-          + '(created before this field existed). Parked it as quarantined: it will not '
-          + 'be resumed or cancelled automatically, because cancelling through the '
-          + 'current configuration could reach a different tenant. The next message '
-          + 'starts a fresh session on the current control plane.',
-        );
-      }
+    // Legacy row, never frozen. Delegate to the shared helper rather than
+    // duplicating the freeze/quarantine rules — two copies of this had already
+    // started to drift. `undefined` means "predates this field"; an empty object
+    // means "frozen with nothing configured", which is why the helper persists
+    // `{}` instead of skipping it.
+    if (opts.freeze) {
+      freezeMojoIdentityForSession(ds.session, ds.larkAppId);
+    } else if (ds.session.riffParentTaskId) {
+      // Read-only path (teardown): the row still has an unverifiable lineage and
+      // we must not write, so report it without mutating.
       return { config: live, lineage: 'quarantined' };
     }
-    if (opts.freeze) {
-      ds.session.mojoIdentity = liveIdentity;
-      sessionStore.updateSession(ds.session);
-    }
-    return { config: live, lineage: 'none' };
+    // Fall through: the helper may have frozen an identity just now, so re-derive
+    // the answer from the (possibly updated) row below.
+  }
+
+  if (!ds.session.mojoIdentity) {
+    // Still unfrozen — the bot was deregistered, so there is nothing to freeze
+    // from. Behave as before: usable only if there is no lineage at risk.
+    return {
+      config: live,
+      lineage: ds.session.riffParentTaskId ? 'quarantined' : 'none',
+    };
   }
 
   const frozen = ds.session.mojoIdentity;
@@ -1105,13 +1092,18 @@ function sessionMojoConfig(
     if (value === undefined) delete merged[key];
     else merged[key] = value;
   }
-  return {
-    config: merged as MojoConfig,
-    // A previously quarantined row keeps its quarantine even once an identity has
-    // been frozen: the frozen value describes TODAY's control plane, not the one
-    // that created the parked lineage.
-    lineage: ds.session.mojoQuarantinedLineage ? 'quarantined' : 'usable',
-  };
+  // Quarantine is bound to a specific ID, not to the session.
+  //
+  // Once an identity is frozen, any lineage created AFTERWARDS was created on that
+  // known control plane and is therefore trustworthy. Treating the session as
+  // permanently quarantined meant a new session could never be cancelled after its
+  // worker died — it kept consuming cloud sandbox time and holding credentials.
+  // The parked id remains as an audit record only.
+  const active = ds.session.riffParentTaskId;
+  const lineage = active === undefined
+    ? 'none'
+    : (active === ds.session.mojoQuarantinedLineage ? 'quarantined' : 'usable');
+  return { config: merged as MojoConfig, lineage };
 }
 
 function loadKnownBotOpenIdsForApp(larkAppId: string): Set<string> {
@@ -4049,32 +4041,76 @@ export function sendWorkerInput(
       : {}),
     ...(mojoLivePatchForSession(ds) ?? {}),
   };
+  // First moment with a reply context after a restore/resume-time quarantine.
+  deliverPendingMojoQuarantineNotice(ds);
   return sendWorkerSessionInput(ds, message);
 }
 
 /**
- * Credential / behaviour patch to ride along with a turn, so a live mojo session
- * picks up a rotated JWT without a refork.
+ * Complete live-credential snapshot to ride along with a turn, so a live mojo
+ * session picks up a rotated / cleared JWT without a refork.
  *
- * Only sent when it actually differs from what the worker was given at init,
- * keeping the common path free of redundant payload. Returns undefined for
- * non-mojo sessions and when nothing changed.
+ * Sent on EVERY turn rather than only when it differs from the init snapshot. The
+ * daemon cannot know which patches a live worker has already applied, so diffing
+ * against init was wrong in both directions:
+ *   - a deleted `mojo.jwt` produced no patch, leaving the old token in place;
+ *   - `init A → patch B → config rolled back to A` compared A against A and sent
+ *     nothing, leaving the backend on B.
+ * The backend de-duplicates against its own current value, which is the only
+ * authoritative source.
  *
  * The control plane is NOT included — it stays frozen for the session's lifetime.
  */
 function mojoLivePatchForSession(ds: DaemonSession): { mojoLivePatch: MojoLivePatch } | undefined {
   const backendType = ds.initConfig?.backendType ?? ds.session.backendType;
   if (backendType !== 'mojo') return undefined;
-  let liveMojo: MojoConfig | undefined;
+  let botCfg;
   try {
-    liveMojo = getBot(ds.larkAppId).config.mojo;
+    botCfg = getBot(ds.larkAppId).config;
   } catch {
     return undefined;
   }
-  const patch = pickMojoLivePatch(liveMojo);
-  const atInit = (ds.initConfig?.backendConfig ?? {}) as MojoConfig;
-  if (!mojoLivePatchDiffers(atInit, patch)) return undefined;
-  return { mojoLivePatch: patch };
+  // Resolves jwtEnv daemon-side across the same layers buildEnv() uses, so the
+  // worker receives a value and never an env map.
+  return {
+    mojoLivePatch: pickMojoLivePatch(botCfg.mojo, {
+      genericEnv: botCfg.env ? sanitizePerBotEnv(botCfg.env) : undefined,
+    }),
+  };
+}
+
+/**
+ * Deliver the one-time notice that a mojo session's earlier remote lineage was
+ * parked, then clear the flag.
+ *
+ * Quarantining happens during restore/resume where there is no reply context, so
+ * the notice is deferred to the next turn — the first moment there is somewhere to
+ * put it. Cleared before sending so a delivery failure cannot loop.
+ */
+function deliverPendingMojoQuarantineNotice(ds: DaemonSession): void {
+  if (!ds.session.mojoQuarantineNoticePending) return;
+  const lineage = ds.session.mojoQuarantinedLineage;
+  ds.session.mojoQuarantineNoticePending = undefined;
+  sessionStore.updateSession(ds.session);
+  if (!lineage) return;
+  let botCfg;
+  try {
+    botCfg = getBot(ds.larkAppId).config;
+  } catch {
+    return;
+  }
+  const message = tr(
+    'worker.mojo_lineage_quarantined',
+    { lineage },
+    botLocale(botCfg),
+  );
+  void callbacks?.sessionReply(
+    sessionAnchorId(ds),
+    message,
+    'text',
+    ds.larkAppId,
+    ds.currentReplyTarget?.turnId,
+  ).catch(err => logger.warn(`[${tag(ds)}] failed to deliver mojo quarantine notice: ${err}`));
 }
 
 export function forkWorker(

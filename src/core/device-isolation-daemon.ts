@@ -163,7 +163,7 @@ function isPersistentBackend(value: InventoryBackend): value is LocalPersistentB
  * is deliberate: the frozen backendType alone cannot answer this, and guessing
  * `true` would be the fail-open direction.
  */
-function resolveRemoteExecutionProven(ds: DaemonSession): boolean {
+export function resolveRemoteExecutionProven(ds: DaemonSession): boolean {
   const backendType = ds.initConfig?.backendType ?? ds.session.backendType;
   if (backendType === 'riff') return true;
   if (backendType !== 'mojo') return false;
@@ -174,15 +174,26 @@ function resolveRemoteExecutionProven(ds: DaemonSession): boolean {
   //      a session frozen as local (but since switched to cloud) as safe_remote,
   //      and vice versa.
   //   3. live bot config, ONLY for a legacy row that was never frozen
+  //
+  // wrapperCli lives on the TOP-LEVEL session/init config, not inside the mojo
+  // block or the frozen identity, so it has to be folded in explicitly: a launch
+  // prefix runs before the binary and can re-enable host execution
+  // (`env AGENT_LOCAL_DAEMON=1 mojo`), which is exactly what voids the proof.
+  // Without this, a wrapped session was still classified safe_remote here even
+  // after the worker's own sandbox gate had been fixed.
+  const wrapperCli = ds.initConfig?.wrapperCli ?? ds.session.wrapperCli;
   const fromInit = ds.initConfig?.backendConfig as
     { cloud?: boolean; localDaemon?: boolean } | undefined;
-  if (fromInit) return isMojoFullyRemote(fromInit);
-  if (ds.session.mojoIdentity) return isMojoFullyRemote(ds.session.mojoIdentity);
+  if (fromInit) return isMojoFullyRemote({ ...fromInit, wrapperCli });
+  if (ds.session.mojoIdentity) {
+    return isMojoFullyRemote({ ...ds.session.mojoIdentity, wrapperCli });
+  }
   try {
     // Legacy migration branch only. Reached when the session predates
     // `mojoIdentity` AND has not been through migrateMojoSessionIdentities yet
     // (e.g. the bot was deregistered at restore time).
-    return isMojoFullyRemote(getBot(ds.larkAppId).config.mojo);
+    const botCfg = getBot(ds.larkAppId).config;
+    return isMojoFullyRemote({ ...botCfg.mojo, wrapperCli: wrapperCli ?? botCfg.wrapperCli });
   } catch {
     // Bot deregistered — no proof available, so assume local (fail closed).
     return false;

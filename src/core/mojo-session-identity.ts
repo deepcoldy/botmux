@@ -46,6 +46,11 @@ export function freezeMojoIdentityForSession(session: Session, larkAppId: string
     // handle left for manual inspection/cleanup, and the user can be told.
     session.mojoQuarantinedLineage = lineage;
     session.riffParentTaskId = undefined;
+    // Flag for a user-visible notice. This module runs during restore/resume where
+    // there is no reply context, so the actual delivery happens on the next turn
+    // (see deliverPendingMojoQuarantineNotice); a log line alone would leave the
+    // user unaware that their context was parked.
+    session.mojoQuarantineNoticePending = true;
     logger.warn(
       `[mojo] session ${session.sessionId} has a remote lineage but no frozen `
       + 'control plane; quarantined it (no automatic resume or cancel).',

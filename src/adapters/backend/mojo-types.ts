@@ -427,53 +427,92 @@ export function isMojoFullyRemote(
 }
 
 /**
- * The subset of `mojo` settings that may change on a LIVE session: credentials
- * and behaviour knobs. Explicitly NOT the control plane — that stays frozen.
+ * The ONLY setting that may change on a live session: the JWT.
  *
- * Exists because the config is otherwise read once at worker init, so a rotated
- * JWT never reached an existing session's per-turn CLI invocations, contradicting
- * the "credentials stay live" contract.
+ * Deliberately this narrow. The previous version allowed an arbitrary `env` patch,
+ * which review showed is equivalent to replacing the launcher: with no
+ * `cliPathOverride` the backend spawns the bare name `mojo`, so a live
+ * `env: { PATH: <dir with a fake mojo> }` executes a different binary on the next
+ * turn — and `NODE_OPTIONS` / `LD_PRELOAD` / `DYLD_*` are comparable. Enumerating
+ * dangerous variables cannot be made complete, so `env` is not patchable at all.
+ *
+ * Note this is not about a compromised daemon (which already has more authority
+ * than this); the problem was that a completely legitimate, validated patch could
+ * change what gets executed.
+ *
+ * Everything else in `mojo` (env / stream / systemPrompt / idleTimeoutSec) now
+ * requires a new session, matching how the control plane already behaves.
  */
-export const MOJO_LIVE_PATCH_KEYS = [
-    'jwt',
-    'jwtEnv',
-    'env',
-    'stream',
-    'systemPrompt',
-    'idleTimeoutSec',
-] as const;
-
-export type MojoLivePatch = Pick<MojoConfig, typeof MOJO_LIVE_PATCH_KEYS[number]>;
+export const MOJO_LIVE_PATCH_KEYS = ['jwt'] as const;
 
 /**
- * Extract the live-updatable subset. Absent keys are omitted so the receiver can
- * distinguish "unchanged" from "explicitly cleared".
+ * A COMPLETE snapshot of the live-updatable state, not a sparse diff.
+ *
+ * `null` is a tombstone meaning "cleared"; `undefined` means the daemon has
+ * nothing to say. The distinction matters because a sparse patch could neither
+ * clear a credential nor roll one back: with `undefined` skipped on both sides,
+ * deleting `mojo.jwt` left the backend holding the old token indefinitely.
  */
-export function pickMojoLivePatch(cfg: MojoConfig | undefined): MojoLivePatch {
-    const out: Record<string, unknown> = {};
-    if (!cfg) return out;
-    for (const key of MOJO_LIVE_PATCH_KEYS) {
-        const value = (cfg as Record<string, unknown>)[key];
-        if (value !== undefined) out[key] = value;
-    }
-    return out;
+export interface MojoLivePatch {
+    /**
+     * Resolved JWT: the literal `mojo.jwt`, or the value read from `jwtEnv` —
+     * resolved DAEMON-side so the backend never receives an env map. `null`
+     * clears it (fall back to whatever the host login provides).
+     */
+    jwt?: string | null;
 }
 
-/** True when a live patch differs from what the backend currently holds. */
-export function mojoLivePatchDiffers(current: MojoConfig, patch: MojoLivePatch): boolean {
-    for (const key of MOJO_LIVE_PATCH_KEYS) {
-        const a = (current as Record<string, unknown>)[key];
-        const b = (patch as Record<string, unknown>)[key];
-        if (key === 'env') {
-            if (JSON.stringify(a ?? {}) !== JSON.stringify(b ?? {})) return true;
-            continue;
-        }
-        if (a !== b) return true;
-    }
-    return false;
+/**
+ * Build the complete live snapshot for a session.
+ *
+ * Resolves `jwtEnv` here rather than shipping the env map, so credential rotation
+ * works without giving a patch the power to change PATH / loader variables.
+ * Always returns an explicit value (`null` when there is no credential), because
+ * an omitted field cannot express "cleared".
+ */
+export function pickMojoLivePatch(
+    cfg: MojoConfig | undefined,
+    sources: {
+        /** Per-bot `env` (top level). Lower precedence than `mojo.env`. */
+        genericEnv?: Record<string, string>;
+        /** Ambient env, lowest precedence. Defaults to the daemon's own. */
+        ambientEnv?: NodeJS.ProcessEnv;
+    } = {},
+): MojoLivePatch {
+    const literal = cfg?.jwt?.trim();
+    if (literal) return { jwt: literal };
+    // Resolve the configured key across the same layers buildEnv() would, reading
+    // only the VALUE — the map itself is never shipped, which is what stops a
+    // patch from rewriting PATH / loader variables.
+    const key = cfg?.jwtEnv?.trim() || 'X_JWT_TOKEN';
+    const fromMojoEnv = cfg?.env?.[key]?.trim();
+    if (fromMojoEnv) return { jwt: fromMojoEnv };
+    const fromGeneric = sources.genericEnv?.[key]?.trim();
+    if (fromGeneric) return { jwt: fromGeneric };
+    const fromAmbient = (sources.ambientEnv ?? process.env)[key]?.trim();
+    // Always explicit: `null` is the tombstone that lets a deleted credential
+    // actually be cleared on the backend.
+    return { jwt: fromAmbient ? fromAmbient : null };
 }
 
-/** Outcome of validating a raw `mojo` config block. */
+/**
+ * True when the snapshot differs from what the backend currently holds.
+ *
+ * Compares against the BACKEND's current value, never against the init snapshot:
+ * the daemon does not know which patches a live worker has already applied, so
+ * `init A → patch B → config rolled back to A` looked like "no change" and left
+ * the backend on B.
+ */
+export function mojoLivePatchDiffers(
+    current: { jwt?: string | null } | undefined,
+    patch: MojoLivePatch,
+): boolean {
+    const a = current?.jwt ?? null;
+    const b = patch.jwt ?? null;
+    return a !== b;
+}
+
+/** Outcome of validating a raw `mojo` config block. *//** Outcome of validating a raw `mojo` config block. */
 export type MojoConfigNormalizeResult =
     | { ok: true; value: MojoConfig }
     | { ok: false; errors: string[] };
