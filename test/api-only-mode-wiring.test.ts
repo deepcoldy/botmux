@@ -430,7 +430,12 @@ describe('API-only bot mode — no-transport fs-policy authority provenance (wor
   it('worker turns an unconfined no-transport layout into a fail-closed spawn abort', () => {
     // FsPolicyConfigError (external bots-config / workingDir-is-authority) must
     // abort the spawn with a diagnostic, never fall through to an unconfined run.
-    expect(workerSource).toContain('import { buildFsPolicy, compileToSeatbelt, migrateLegacySandboxFields, resolveRedirectedAdapterAuthPaths, FsPolicyConfigError }');
+    // Assert the meaningful imports are present (not a frozen full-literal named-import
+    // list — that list legitimately grows, e.g. resolveLarkCliLinuxStoreDir for the
+    // Linux keystore fix — so match the module + the two symbols this test relies on).
+    const fsPolicyImport = region(workerSource, "import {", "} from './adapters/cli/fs-policy.js';");
+    expect(fsPolicyImport).toContain('buildFsPolicy');
+    expect(fsPolicyImport).toContain('FsPolicyConfigError');
     const block = region(workerSource, 'const policy = (() => {', 'suppressedAuthorityPaths?.length');
     expect(block).toContain('if (err instanceof FsPolicyConfigError) {');
     expect(block).toContain('refusing to start no-transport session');
