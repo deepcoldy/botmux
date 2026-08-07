@@ -292,14 +292,37 @@ function dedupeAndSortCandidates(candidates: DiscoveredSkillCandidate[]): Discov
   return [...byPath.values()].sort((a, b) => a.path.localeCompare(b.path));
 }
 
-function walkSkillDirs(parentDir: string, dir: string, out: DiscoveredSkillCandidate[], depth: number): void {
+const INCIDENTAL_DISCOVERY_DIRS = new Set([
+  'assets',
+  'example',
+  'examples',
+  'fixtures',
+  'images',
+  'test',
+  'tests',
+]);
+
+function walkSkillDirs(
+  parentDir: string,
+  dir: string,
+  out: DiscoveredSkillCandidate[],
+  depth: number,
+  opts: { skipIncidental?: boolean } = {},
+): void {
   if (depth > 4) return;
   for (const child of listChildDirs(dir)) {
-    const name = child.split('/').pop() ?? '';
+    const name = basename(child);
     if (name === '.git' || name === 'node_modules') continue;
     const candidate = candidateFromDir(parentDir, child);
-    if (candidate) out.push(candidate);
-    walkSkillDirs(parentDir, child, out, depth + 1);
+    if (candidate) {
+      out.push(candidate);
+      // A discovered skill is a package boundary. During automatic fallback,
+      // do not mistake bundled examples or fixtures for sibling skills.
+      if (opts.skipIncidental) continue;
+    } else if (opts.skipIncidental && INCIDENTAL_DISCOVERY_DIRS.has(name.toLowerCase())) {
+      continue;
+    }
+    walkSkillDirs(parentDir, child, out, depth + 1, opts);
   }
 }
 
@@ -313,19 +336,19 @@ export function discoverLocalSkillCandidates(
   const rootCandidate = candidateFromDir(sourceDir, sourceDir);
   if (rootCandidate) {
     candidates.push(rootCandidate);
-    if (!opts.fullDepth) return { skills: dedupeAndSortCandidates(candidates) };
+    if (!opts.fullDepth && !opts.fallbackToFullDepth) {
+      return { skills: dedupeAndSortCandidates(candidates) };
+    }
   }
   // Native CLI libraries are themselves named `skills` (for example
   // ~/.claude/skills). When callers pass that library root directly, scan its
   // immediate children instead of looking for a redundant skills/skills layer.
   // Check both the requested and canonical paths so a symlink named `skills`
   // still gets the expected behavior after realpath resolution.
-  let shallowMayBeIncomplete = false;
   const scanShallowRoot = (libraryRoot: string): void => {
     for (const child of listChildDirs(libraryRoot)) {
       const candidate = candidateFromDir(sourceDir, child);
       if (candidate) candidates.push(candidate);
-      else shallowMayBeIncomplete = true;
     }
   };
   if (basename(requestedDir) === 'skills' || basename(sourceDir) === 'skills') {
@@ -334,10 +357,12 @@ export function discoverLocalSkillCandidates(
   for (const relativeRoot of ['skills', '.agents/skills', '.botmux/skills']) {
     scanShallowRoot(join(sourceDir, relativeRoot));
   }
-  const useFallback = !opts.fullDepth
-    && opts.fallbackToFullDepth
-    && (candidates.length === 0 || shallowMayBeIncomplete);
-  if (opts.fullDepth || useFallback) walkSkillDirs(sourceDir, sourceDir, candidates, 0);
+  const useFallback = !opts.fullDepth && opts.fallbackToFullDepth === true;
+  if (opts.fullDepth) {
+    walkSkillDirs(sourceDir, sourceDir, candidates, 0);
+  } else if (useFallback) {
+    walkSkillDirs(sourceDir, sourceDir, candidates, 0, { skipIncidental: true });
+  }
   return {
     skills: dedupeAndSortCandidates(candidates),
     ...(useFallback ? { deepScanned: true } : {}),
@@ -779,6 +804,7 @@ export function discoverGitSkillCandidates(opts: {
   ref?: string;
   path?: string;
   fullDepth?: boolean;
+  fallbackToFullDepth?: boolean;
 }): SkillSourceDiscovery {
   const checkout = checkoutTemporaryGitSource(opts.url, opts.ref);
   try {
@@ -793,8 +819,8 @@ export async function discoverGitSkillCandidatesAsync(opts: {
   ref?: string;
   path?: string;
   fullDepth?: boolean;
-  /** When a shallow whole-repo scan finds nothing, retry recursively against
-   *  the same checkout instead of cloning the remote a second time. */
+  /** Retry recursively against the same checkout so mixed repository layouts
+   *  produce the same candidate set during discovery and installation. */
   fallbackToFullDepth?: boolean;
 }): Promise<SkillSourceDiscovery> {
   const checkout = await checkoutTemporaryGitSourceAsync(opts.url, opts.ref);

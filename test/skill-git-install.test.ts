@@ -273,6 +273,21 @@ describe('git skill install', () => {
     expect(installed.map(skill => skill.name)).toEqual(['nested']);
   });
 
+  it('keeps sync CLI discovery aligned with fallback installation candidates', () => {
+    write(join(repo, 'plugins', 'p', 'skills', 'nested', 'SKILL.md'), '---\nname: nested\n---\n# Nested');
+    run('git', ['add', '.'], repo);
+    run('git', ['commit', '-m', 'add plugin skill'], repo);
+
+    const discovered = discoverGitSkillCandidates({
+      url: repo,
+      ref: 'HEAD',
+      fallbackToFullDepth: true,
+    });
+
+    expect(discovered.skills.map(skill => skill.name).sort()).toEqual(['deploy', 'nested']);
+    expect(discovered.deepScanned).toBe(true);
+  });
+
   it('installs the only discovered skill from a repository root', async () => {
     const [pkg] = await installGitSkillsFromSourceAsync({ url: repo, ref: 'HEAD' });
 

@@ -54,11 +54,44 @@ describe('discovery deep-scan fallback', () => {
     expect(result.deepScanned).toBe(true);
   });
 
-  it('does not deep-scan (or flag) when the shallow scan is complete', async () => {
+  it('keeps explicit shallow-only discovery shallow', () => {
     const root = makeRepo(join('skills', 'alpha'));
-    const result = await discoverDashboardSkills(parseDashboardSkillInstallRequest({ source: root }));
+    const result = discoverLocalSkillCandidates(root, { fullDepth: false });
     expect(result.skills.length).toBeGreaterThan(0);
     expect(result.deepScanned).not.toBe(true);
+  });
+
+  it('fallback ignores incidental resource and test directories', async () => {
+    const root = makeRepo(join('skills', 'alpha'));
+    mkdirSync(join(root, 'skills', 'assets'), { recursive: true });
+    writeFileSync(join(root, 'skills', 'assets', 'logo.svg'), '<svg/>');
+    addSkill(root, join('test', 'fixtures', 'demo'), 'fixture-skill');
+
+    const result = await discoverDashboardSkills(parseDashboardSkillInstallRequest({ source: root }));
+
+    expect(result.skills.map(skill => skill.name)).toEqual(['grill-me']);
+    expect(result.deepScanned).toBe(true);
+  });
+
+  it('fallback finds skills in mixed plugin and library layouts', async () => {
+    const root = makeRepo(join('skills', 'alpha'));
+    addSkill(root, join('plugins', 'p', 'skills', 'plugin-skill'), 'plugin-skill');
+    addSkill(root, join('.claude', 'skills', 'review'), 'review');
+
+    const result = await discoverDashboardSkills(parseDashboardSkillInstallRequest({ source: root }));
+
+    expect(result.skills.map(skill => skill.name).sort()).toEqual(['grill-me', 'plugin-skill', 'review']);
+    expect(result.deepScanned).toBe(true);
+  });
+
+  it('fallback preserves a root skill while discovering nested siblings', async () => {
+    const root = makeRepo('.');
+    addSkill(root, join('plugins', 'p', 'skills', 'nested'), 'nested');
+
+    const result = await discoverDashboardSkills(parseDashboardSkillInstallRequest({ source: root }));
+
+    expect(result.skills.map(skill => skill.name).sort()).toEqual(['grill-me', 'nested']);
+    expect(result.deepScanned).toBe(true);
   });
 
   it('an explicit fullDepth request skips the shallow pass entirely', async () => {
