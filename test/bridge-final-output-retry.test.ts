@@ -610,6 +610,60 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     expect(ds.session.codexAppDispatchLedger?.[0]?.dispatchId).toBe('dispatch-solo');
   });
 
+  it('R7-B2 daemon half: a two-member steered group settles through the REAL daemon handler — superseded head persisted+suppressed (not delivered), real member delivered, ledger drains', async () => {
+    // DAEMON-SIDE of the round-trip: drives the real setupWorkerHandlers ledger
+    // preview → store-write → ACK path (not a worker-side fake ACK). Member 1 is
+    // steer_superseded (must commit + NOT deliver), member 2 is the real final
+    // (must deliver). Proves the daemon accepts the superseded, advances the FIFO,
+    // and only delivers the real member — the half the worker integration test
+    // stubs with a deterministic ACK.
+    const sessionReply = vi.fn(async () => 'om_delivered');
+    initWorkerPool({
+      sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn(),
+    });
+    const ds = makeDs();
+    ds.adoptedFrom = undefined;
+    ds.session.cliId = 'codex-app';
+    ds.session.codexAppDispatchLedger = [
+      { dispatchId: 'd-grp-1', turnId: 'turn-grp-1', state: 'prepared', content: '', deliverySink: 'lark', codexAppSteerable: true, replyTarget: { mode: 'thread', rootMessageId: 'om_grp' } },
+      { dispatchId: 'd-grp-2', turnId: 'turn-grp-2', state: 'accepted', content: 'real answer', deliverySink: 'lark', codexAppSteerable: true, replyTarget: { mode: 'thread', rootMessageId: 'om_grp' } },
+    ];
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+
+    // Member 1: superseded — persisted + suppressed (no delivery), pops the head.
+    (ds.worker as any).emit('message', {
+      type: 'final_output', sessionId: ds.session.sessionId,
+      content: '', lastUuid: 'uuid-grp-1', turnId: 'turn-grp-1',
+      suppressDelivery: true, disposition: 'steer_superseded',
+      codexAppSettlement: { requestId: 'settle-grp-1', generation: 'gen-grp', seq: 1, dispatchId: 'd-grp-1' },
+    } satisfies Extract<WorkerToDaemon, { type: 'final_output' }>);
+    await vi.waitFor(() => expect((ds.worker as any).send).toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'codex_app_dispatch_persisted', requestId: 'settle-grp-1', ok: true })));
+    await vi.waitFor(() => expect(ds.session.codexAppDispatchLedger?.length).toBe(1));
+    expect(sessionReply).not.toHaveBeenCalled(); // superseded head NOT delivered
+
+    // Member 2 becomes the head; the runner submits it (accepted → prepared)
+    // before its final can settle — mirror that transition through the real handler.
+    (ds.worker as any).emit('message', {
+      type: 'codex_app_dispatch_transition',
+      sessionId: ds.session.sessionId,
+      requestId: 'prepare-grp-2',
+      operation: 'submit',
+      entries: [{ dispatchId: 'd-grp-2', turnId: 'turn-grp-2' }],
+    } satisfies Extract<WorkerToDaemon, { type: 'codex_app_dispatch_transition' }>);
+    await vi.waitFor(() => expect(ds.session.codexAppDispatchLedger?.[0]?.state).toBe('prepared'));
+
+    // Member 2: the real final — delivered, ledger fully drains.
+    (ds.worker as any).emit('message', {
+      type: 'final_output', sessionId: ds.session.sessionId,
+      content: 'real answer', lastUuid: 'uuid-grp-2', turnId: 'turn-grp-2',
+      codexAppSettlement: { requestId: 'settle-grp-2', generation: 'gen-grp', seq: 2, dispatchId: 'd-grp-2' },
+    } satisfies Extract<WorkerToDaemon, { type: 'final_output' }>);
+    await vi.advanceTimersByTimeAsync(10);
+    await vi.waitFor(() => expect(sessionReply).toHaveBeenCalledTimes(1)); // real member delivered
+    await vi.waitFor(() => expect(ds.session.codexAppDispatchLedger ?? []).toEqual([]));
+  });
+
   it('still resolves a live HTTP wait sink without posting to Lark', async () => {
     const sessionReply = vi.fn(async () => 'om_forbidden');
     const resolveWait = vi.fn();

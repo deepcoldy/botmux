@@ -116,6 +116,7 @@ import { globalConfigPath, invalidateGlobalConfigCache } from '../src/global-con
 import {
   __testOnly_activeSessions as activeSessions,
   __testOnly_handleThreadReply as handleThreadReply,
+  __testOnly_computeCodexAppSteerable as computeCodexAppSteerable,
 } from '../src/daemon.js';
 
 const APP = 'initial_turn_app';
@@ -736,5 +737,48 @@ describe('empty-started session — first real business turn must use the new-to
     expect(mocks.forkWorker.mock.calls[mocks.forkWorker.mock.calls.length - 1]?.[2])
       .toEqual({ resume: false, turnId: 'om_after_death' });
     expect(ds.session.initialUserTurnPending).toBeUndefined();
+  });
+});
+
+describe('computeCodexAppSteerable — fail-closed positive-human gate (R7-B1)', () => {
+  const humanFacts = {
+    humanSender: true,
+    adopted: false,
+    isForeignBot: false,
+    isBotSenderType: false,
+    substituteTrigger: false,
+    controlRewrite: false,
+    messageListener: false,
+    vcMeetingReceiver: false,
+    vcMeetingImTurnOrigin: false,
+  };
+
+  it('authorizes ONLY a positive human sender with no special semantics', () => {
+    expect(computeCodexAppSteerable({ ...humanFacts })).toBe(true);
+  });
+
+  it('is fail-closed: NO humanSender ⇒ serial even when every exclusion is absent (the fail-open root)', () => {
+    // The bug codex caught: excluding a list of known non-human sources is not
+    // enough — an un-enumerated non-user source (humanSender:false) must still be
+    // denied. This is the core positive-assert guarantee.
+    expect(computeCodexAppSteerable({ ...humanFacts, humanSender: false })).toBe(false);
+  });
+
+  it('each special-source fact independently forces serial', () => {
+    for (const key of [
+      'adopted', 'isForeignBot', 'isBotSenderType', 'substituteTrigger',
+      'controlRewrite', 'messageListener', 'vcMeetingReceiver', 'vcMeetingImTurnOrigin',
+    ] as const) {
+      expect(computeCodexAppSteerable({ ...humanFacts, [key]: true })).toBe(false);
+    }
+  });
+
+  it('a known peer bot (isForeignBot true / humanSender false) stays serial even if sender_type looked user-like', () => {
+    // The known-peer fallback: an anomalous sender_type from a known peer must
+    // NOT be authorized. Both the humanSender=false and isForeignBot=true facts
+    // (which the daemon derives via isKnownPeerBot) independently deny it.
+    expect(computeCodexAppSteerable({
+      ...humanFacts, humanSender: false, isForeignBot: true,
+    })).toBe(false);
   });
 });

@@ -15498,6 +15498,7 @@ export const __testOnly_resolvePinnedWorkingDir = resolvePinnedWorkingDir;
 // which unit tests calling handleCommand directly can never catch.
 export const __testOnly_handleNewTopic = (data: any, ctx: RoutingContext): Promise<void> => handleNewTopic(data, ctx);
 export const __testOnly_handleThreadReply = (data: any, ctx: RoutingContext): Promise<void> => handleThreadReply(data, ctx);
+export const __testOnly_computeCodexAppSteerable = computeCodexAppSteerable;
 
 type NewDaemonSessionClaim =
   | { accepted: true; key: string; owner: DaemonSession }
@@ -15817,6 +15818,15 @@ function releaseQueuedActivationReservation(ds: DaemonSession, acknowledgedToken
     // Runtime buffers are rolling-upgrade compatibility only. If they carry an
     // arrival-time decision, preserve it; otherwise fail closed rather than
     // sampling a later ON setting and inventing a sidecar at ACK time.
+    //
+    // R7-B1/coalesced (codex ruling): `codexAppInputAccepted` here is the
+    // clean-input FEATURE gate, NOT a steer authorization — it is deliberately
+    // never used to derive `codexAppSteerable`. Coalescing N buffered messages
+    // into one prompt / one ledger reservation / one final (turnId is the last
+    // one) has already lost each message's per-message identity, so a single
+    // steer flag could not safely express the batch. This coalesced opening
+    // successor therefore stays FORCED-SERIAL by construction: the admit below
+    // carries no `codexAppSteerable`, and nothing downstream re-derives one.
     reservation.codexAppInputAccepted = bufferedGateDecisions.length > 0
       && bufferedGateDecisions.every(Boolean);
     try {
@@ -16278,27 +16288,33 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
  * Codex App steer authorization (Blocking 1, decision A) from INBOUND SOURCE
  * FACTS only — the single source of truth shared by both admission twins
  * (handleNewTopicAdmitted + handleThreadReplyAdmitted), so a plain-human turn is
- * authorized identically whether it opens a new topic or continues one (R6-B1).
- * Explicit positive ONLY: a real human sender with NONE of adopt / foreign-bot /
- * Feishu-bot-sender / substitute-rewrite / v3-grill / message-listener / VC
- * receiver / VC origin. Never inferred from the delivery sink or a session flag;
- * every control-rewrite / non-human / dedicated-receiver turn stays forced-serial.
+ * authorized identically whether it opens a new topic or continues one (R6/R7-B1).
+ *
+ * FAIL-CLOSED by construction (R7-B1): authorization requires a POSITIVE
+ * `humanSender` (senderType === 'user' AND not a known peer bot) AND the absence
+ * of every control-rewrite / dedicated-receiver signal. Excluding a list of
+ * known non-human sources is NOT enough — an exclude-list is never complete, so
+ * any un-enumerated non-user source would fail OPEN. The positive humanSender
+ * gate makes the default deny: anything that is not provably a real human turn
+ * with no special semantics stays forced-serial.
  */
 function computeCodexAppSteerable(facts: {
+  humanSender: boolean;
   adopted: boolean;
   isForeignBot: boolean;
   isBotSenderType: boolean;
   substituteTrigger: boolean;
-  threadGrill: boolean;
+  controlRewrite: boolean;
   messageListener: boolean;
   vcMeetingReceiver: boolean;
   vcMeetingImTurnOrigin: boolean;
 }): boolean {
-  return !facts.adopted
+  return facts.humanSender
+    && !facts.adopted
     && !facts.isForeignBot
     && !facts.isBotSenderType
     && !facts.substituteTrigger
-    && !facts.threadGrill
+    && !facts.controlRewrite
     && !facts.messageListener
     && !facts.vcMeetingReceiver
     && !facts.vcMeetingImTurnOrigin;
@@ -16786,11 +16802,19 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     // fact here. buildReservedInitialInput COPIES this onto the opening payload;
     // forkReservedInitialSession never infers it.
     ...(computeCodexAppSteerable({
+      // R7-B1: positive real-human gate — senderType must be 'user' AND not a
+      // known peer bot (cross-ref fallback, matching the thread twin's foreign-bot
+      // definition; an anomalous/missing sender_type from a known peer must not
+      // be authorized). controlRewrite reflects the ACTUAL v3-grill trigger, not
+      // a hardcoded false — a rewritten /workflow prompt stays serial.
+      humanSender: parsed.senderType === 'user'
+        && !isKnownPeerBot(config.session.dataDir, larkAppId, senderOpenId),
       adopted: false,
-      isForeignBot: isBotSenderType,
+      isForeignBot: isBotSenderType
+        || isKnownPeerBot(config.session.dataDir, larkAppId, senderOpenId),
       isBotSenderType,
       substituteTrigger: !!substituteTrigger,
-      threadGrill: false,
+      controlRewrite: !!newTopicGrill,
       messageListener: !!messageListener,
       vcMeetingReceiver: false,
       vcMeetingImTurnOrigin: !!ctx.vcMeetingImTurnOrigin,
@@ -17975,11 +17999,14 @@ async function handleThreadReplyAdmitted(
   // shared by bot-added / scheduler / system bootstrap and only COPIES an
   // explicit upstream true, never defaults it.
   const codexAppSteerable = computeCodexAppSteerable({
+    // Positive real-human gate (R7-B1 fail-closed): senderType must be 'user'.
+    // isForeignBot already folds in the isKnownPeerBot cross-ref fallback.
+    humanSender: parsed.senderType === 'user',
     adopted: !!ds?.adoptedFrom,
     isForeignBot,
     isBotSenderType,
     substituteTrigger: !!substituteTrigger,
-    threadGrill: !!threadGrill,
+    controlRewrite: !!threadGrill,
     messageListener: !!ctx.messageListener,
     vcMeetingReceiver: ds?.session.vcMeetingReceiver !== undefined,
     vcMeetingImTurnOrigin: !!ctx.vcMeetingImTurnOrigin,

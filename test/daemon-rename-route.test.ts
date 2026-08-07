@@ -420,7 +420,7 @@ describe('/rename production routing — must not pre-create a session (review P
     expect(openingPayload?.codexAppSteerable).toBe(true);
   });
 
-  it('R6-B1: a Feishu bot-sender NEW TOPIC stays forced-serial (no steer authorization)', async () => {
+  it('R7-B1: a plain-human Codex App `/workflow new` (v3-grill) NEW TOPIC stays forced-serial (control-rewrite is not steerable)', async () => {
     const bot = registerBot({
       larkAppId: APP,
       larkAppSecret: 's',
@@ -430,15 +430,41 @@ describe('/rename production routing — must not pre-create a session (review P
     });
     bot.resolvedAllowedUsers = [OWNER];
 
-    // A bot sender (sender_type app) must NOT be authorized to steer.
+    // A real human sends `/workflow new …`, but the generated/rewritten control
+    // prompt must NOT be steerable (locked "v3-grill serial"). This is the
+    // fail-open codex caught: the new-topic ds hardcoded threadGrill:false.
+    await handleNewTopic(
+      makeEventData('om_grill_new', '/workflow new 修复首轮授权'),
+      makeCtx('om_grill_new', 'om_grill_new'),
+    );
+
+    expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
+    const openingPayload = mocks.forkWorker.mock.calls[0]?.[1] as any;
+    expect(openingPayload?.codexAppSteerable).toBeUndefined();
+  });
+
+  it('R6/R7-B1: a Feishu bot-sender NEW TOPIC that forks stays forced-serial (no steer authorization)', async () => {
+    const bot = registerBot({
+      larkAppId: APP,
+      larkAppSecret: 's',
+      cliId: 'codex-app',
+      allowedUsers: [OWNER],
+      defaultWorkingDir: '/tmp',
+    });
+    bot.resolvedAllowedUsers = [OWNER];
+    // Authorize the bot sender as an operator so routing reaches the fork (we are
+    // testing steer authorization, not the operate gate).
+    mocks.getBot?.();
+
+    // A bot sender (sender_type app) must NOT be authorized to steer. Force the
+    // fork to actually happen so the assertion is not vacuous (codex nit).
     const botEvent = makeEventData('om_ct_bot', 'bot-originated new topic');
     botEvent.sender = { sender_id: { open_id: OWNER }, sender_type: 'app' };
     await handleNewTopic(botEvent, makeCtx('om_ct_bot', 'om_ct_bot'));
 
-    if (mocks.forkWorker.mock.calls.length > 0) {
-      const openingPayload = mocks.forkWorker.mock.calls[0]?.[1] as any;
-      expect(openingPayload?.codexAppSteerable).toBeUndefined();
-    }
+    expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
+    const openingPayload = mocks.forkWorker.mock.calls[0]?.[1] as any;
+    expect(openingPayload?.codexAppSteerable).toBeUndefined();
   });
 
   it('uses the group name for mention-only sessions on both creation paths', async () => {
@@ -776,6 +802,39 @@ describe('/rename production routing — must not pre-create a session (review P
     });
     expect(onQueuedActivationSubmitted(ds, successorToken)).toBe(true);
     expect(ds.initialStartPending).toBe(false);
+  });
+
+  it('R7 coalesced-serial: buffered follow-ups fold into one serial turn — NO steerable even when every clean-input gate decision is true', async () => {
+    // codex ruling: coalescing N buffered opening-window messages into one prompt
+    // / one ledger reservation / one final loses per-message identity, so the
+    // batch is FORCED-SERIAL by construction. The clean-input feature gate
+    // (pendingCodexAppFollowUpGateAccepted) is NOT a steer authorization and must
+    // never derive codexAppSteerable — even when all true.
+    const anchor = 'om_coalesced_root';
+    const ds = seedThreadSession(anchor, 'coalesced serial');
+    Object.assign(ds.session, { cliId: 'codex-app', workingDir: '/tmp' });
+    ds.workingDir = '/tmp';
+    ds.worker = { killed: false, send: vi.fn() } as any;
+    ds.pendingFollowUps = ['BUFFERED_ONE', 'BUFFERED_TWO'];
+    ds.pendingFollowUpTurnIds = ['om_buf_1', 'om_buf_2'];
+    ds.pendingCodexAppFollowUps = ['BUFFERED_ONE', 'BUFFERED_TWO'];
+    ds.pendingCodexAppFollowUpContexts = ['', ''];
+    // Every buffered message was clean-input-accepted (all true) — must NOT leak
+    // into a steer authorization.
+    ds.pendingCodexAppFollowUpGateAccepted = [true, true];
+
+    expect(releaseQueuedActivationReservation(ds)).toBe(true);
+
+    // The coalesced follow-up is delivered to the worker as ONE serial message
+    // with NO steer authorization — even though every clean-input gate decision
+    // was true. (release admits then promotes+sends the coalesced tail, so assert
+    // on the actual worker IPC payload, the authoritative delivered form.)
+    const send = vi.mocked(ds.worker!.send);
+    const msg = send.mock.calls.map(c => c[0] as any).find(m => m?.type === 'message');
+    expect(msg).toBeTruthy();
+    expect(msg.content).toContain('BUFFERED_ONE');
+    expect(msg.content).toContain('BUFFERED_TWO');
+    expect(msg.codexAppSteerable).toBeUndefined();
   });
 
   it('atomically claims a fresh queued refork so a concurrent reply buffers behind its owner', async () => {

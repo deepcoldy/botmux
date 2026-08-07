@@ -867,14 +867,15 @@ describe('Codex App worker replacement durable handoff', () => {
       .toHaveLength(2);
   }, 40_000);
 
-  it('R6: full durable round-trip — ordered steered group expands to N final_output through worker persist→daemon ACK→commit, first N−1 superseded', async () => {
-    // Closes the "two halves" gap: prior superseded coverage was worker-only
-    // (fallback, no dispatchId) + daemon-only (fake IPC). This drives the REAL
-    // durable path: each member carries a codexAppDispatchId, so the worker calls
-    // waitForCodexAppDaemonPersistence and only commits after the daemon ACK. The
-    // `steer` fixture holds the turn open until the 2nd steer, so root + 2
-    // follow-ups fold into one native turn → 3 final_output, each with a
-    // codexAppSettlement, the first two disposition:'steer_superseded'.
+  it('R7-B2: worker durable superseded expansion — each member persists (codexAppSettlement), commits only after ACK, retires its liveness slot, and never wedges', async () => {
+    // WORKER-SIDE of the round-trip (the daemon-side ledger preview/store/ACK is
+    // proven separately in bridge-final-output-retry via setupWorkerHandlers).
+    // Here the ACK is a deterministic stand-in so we can assert the WORKER's real
+    // behaviour: each member carries a codexAppDispatchId → the worker calls
+    // waitForCodexAppDaemonPersistence and commits ONLY after the ACK; the group
+    // expands to N final_output (first N−1 superseded); and — critically — a 4th
+    // turn afterwards starts and finals cleanly, proving the FIFO/liveness did not
+    // wedge. The `steer` fixture holds turn 1 open until its 2nd steer.
     const root = mkdtempSync(join(tmpdir(), 'botmux-worker-codex-sup-rt-'));
     tempDirs.add(root);
     const fakeCodex = join(root, 'fake-codex');
@@ -942,7 +943,7 @@ describe('Codex App worker replacement durable handoff', () => {
       );
       // All three went through the durable settlement path (codexAppSettlement).
       expect(finals.every(f => f.codexAppSettlement !== undefined)).toBe(true);
-      expect(finals.map(f => ({
+      expect(finals.slice(0, 3).map(f => ({
         turnId: f.turnId,
         disposition: (f as any).disposition,
         suppress: (f as any).suppressDelivery === true,
@@ -955,10 +956,29 @@ describe('Codex App worker replacement durable handoff', () => {
       const turnMethods = readRequests(requestLog)
         .filter(r => r.method === 'turn/start' || r.method === 'turn/steer').map(r => r.method);
       expect(turnMethods).toEqual(['turn/start', 'turn/steer', 'turn/steer']);
-      // No wedge: the real final settled (no "rejected final" / no_pending_turn).
+      // Each member reached a completed terminal — i.e. the worker ran
+      // commitExactHead after each ACK and retired the member's liveness slot.
+      // This (3 completed terminals for the 3 durable settlements, in order) is
+      // the worker-side proof the group settled cleanly: a wrongly-committed
+      // superseded head or an uncleared awaiting-final would strand a member and
+      // this count would never reach 3.
+      await waitFor(worker, logs, () =>
+        messages.filter(m => m.type === 'turn_terminal'
+          && (m as any).status === 'completed'
+          && ['om_rt_1', 'om_rt_2', 'om_rt_3'].includes((m as any).turnId)).length >= 3, 15_000);
+      const terminals = messages.filter(
+        (m): m is Extract<WorkerToDaemon, { type: 'turn_terminal' }> =>
+          m.type === 'turn_terminal' && ['om_rt_1', 'om_rt_2', 'om_rt_3'].includes((m as any).turnId));
+      expect(terminals.map(t => ({ turnId: (t as any).turnId, status: (t as any).status }))).toEqual([
+        { turnId: 'om_rt_1', status: 'completed' },
+        { turnId: 'om_rt_2', status: 'completed' },
+        { turnId: 'om_rt_3', status: 'completed' },
+      ]);
+      // No wedge / mis-commit: no rejected final and no FIFO-empty error.
       expect(logs.join('')).not.toContain('rejected final marker');
+      expect(logs.join('')).not.toContain('no_pending_turn');
     } finally {
       await stopChild(worker);
     }
-  }, 40_000);
+  }, 45_000);
 });
