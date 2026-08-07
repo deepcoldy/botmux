@@ -768,6 +768,25 @@ describe('buildMarkdownCard', () => {
     )).toBeNull();
   });
 
+  it('strips a leading provider/ routing prefix from the model name', () => {
+    // model_hub/es1_orange_o48 → es1_orange_o48 (relay namespace hidden);
+    // underscores are markdown-escaped by the shared compact formatter.
+    expect(cardUsageRuntimeSegment(
+      { context: null, tokens: null, model: 'model_hub/es1_orange_o48' },
+      true,
+    )).toBe('**es1\\_orange\\_o48**');
+    // a value with no slash is untouched
+    expect(cardUsageRuntimeSegment(
+      { context: null, tokens: null, model: 'gpt-5.6-sol' },
+      true,
+    )).toBe('**gpt-5.6-sol**');
+    // only a clean single-token prefix + one slash is removed
+    expect(cardUsageRuntimeSegment(
+      { context: null, tokens: null, model: 'a/b/c' },
+      true,
+    )).toBe('**b/c**');
+  });
+
   it('does not create a standalone runtime line without native usage metrics', () => {
     expect(cardUsageFooterSegment(
       {

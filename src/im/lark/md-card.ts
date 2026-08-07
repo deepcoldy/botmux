@@ -323,6 +323,16 @@ function compactRuntimeLabel(value: string | undefined, maxLength: number): stri
     .replace(/ /g, '\u00a0');
 }
 
+/** Strip a leading `provider/` routing namespace from a model id so the card
+ *  shows the bare model name (e.g. `model_hub/es1_orange_o48` \u2192
+ *  `es1_orange_o48`). Only a clean single-token prefix (alphanumerics, `.`, `_`,
+ *  `-`) followed by one slash is removed, so a value with no slash
+ *  (`gpt-5.6-sol`) or arbitrary text containing a slash is returned unchanged. */
+function stripModelProviderPrefix(value: string | undefined): string | undefined {
+  if (!value) return value;
+  return value.replace(/^[A-Za-z0-9._-]+\//, '');
+}
+
 /** Format usage as one segment shared by reply-card footers and the live
  * streaming card. The caller supplies native facts; this module only formats
  * them and never infers a context window or token count. Returns null when no
@@ -401,8 +411,11 @@ export function cardUsageRuntimeSegment(
   hasMetrics: boolean,
 ): string | null {
   if (!hasMetrics) return null;
+  // Strip a leading `provider/` routing prefix (e.g. `model_hub/es1_orange_o48`
+  // \u2192 `es1_orange_o48`) so the card shows the bare model name, not the relay's
+  // internal namespace. A value with no slash (e.g. `gpt-5.6-sol`) is untouched.
   // Keep the tail compact so the continuous usage paragraph wraps predictably.
-  const model = compactRuntimeLabel(usage.model, 20);
+  const model = compactRuntimeLabel(stripModelProviderPrefix(usage.model), 20);
   if (!model) return null;
   const reasoningEffort = compactRuntimeLabel(usage.reasoningEffort, 10);
   return `**${model}**${reasoningEffort ? `\u00a0${reasoningEffort}` : ''}`;
