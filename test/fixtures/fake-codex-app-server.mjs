@@ -386,7 +386,7 @@ function handle(request) {
   if (request.method === 'thread/turns/list') {
     const data = behavior === 'history-no-match'
       ? []
-      : behavior === 'history-multi-match' && reconciledTurn
+      : (behavior === 'history-multi-match' || behavior === 'steer-group-history-multi') && reconciledTurn
         ? [reconciledTurn, { ...reconciledTurn, id: `${reconciledTurn.id}-duplicate` }]
         : reconciledTurn ? [reconciledTurn] : [];
     respond(request.id, {
@@ -485,7 +485,7 @@ function handle(request) {
       activeTurn = undefined;
       return;
     }
-    if (behavior === 'steer-group-history-match') {
+    if (behavior === 'steer-group-history-match' || behavior === 'steer-group-history-multi') {
       if (!activeTurn || request.params.expectedTurnId !== activeTurn.turnId) {
         reject(request.id, -32602, 'expectedTurnId does not match active turn');
         return;
@@ -610,11 +610,11 @@ function handle(request) {
     reject(request.id, -32000, 'model overloaded');
     return;
   }
-  if (behavior === 'steer' || behavior === 'steer-group-mismatch' || behavior === 'steer-noncanonical' || behavior === 'steer-group-history-match') {
+  if (behavior === 'steer' || behavior === 'steer-group-mismatch' || behavior === 'steer-noncanonical' || behavior === 'steer-group-history-match' || behavior === 'steer-group-history-multi') {
     const threadId = request.params.threadId;
     const turnId = `turn-fake-${turnAttempt}`;
     activeTurn = { threadId, turnId, outputSchema: request.params.outputSchema };
-    if (behavior === 'steer-group-mismatch' || behavior === 'steer-noncanonical' || behavior === 'steer-group-history-match') {
+    if (behavior === 'steer-group-mismatch' || behavior === 'steer-noncanonical' || behavior === 'steer-group-history-match' || behavior === 'steer-group-history-multi') {
       groupClientIds = [request.params.clientUserMessageId ?? null];
     }
     respond(request.id, { turn: { id: turnId } });

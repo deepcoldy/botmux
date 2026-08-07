@@ -15654,7 +15654,7 @@ function buildReservedInitialInput(
 ) {
   const selfBot = getBot(ds.larkAppId);
   const botCfg = selfBot.config;
-  return buildNewTopicCliInput(
+  const built = buildNewTopicCliInput(
     ds.pendingPrompt ?? '',
     ds.session.sessionId,
     ds.session.cliId ?? botCfg.cliId,
@@ -15678,6 +15678,10 @@ function buildReservedInitialInput(
       codexAppFollowUpContexts: ds.pendingCodexAppFollowUpContexts,
     },
   );
+  // R5-B1-1: COPY the frozen new-topic steer authorization onto the opening
+  // payload — never inferred here. Only an explicit upstream `true` carries over.
+  if (ds.pendingCodexAppSteerable === true) built.codexAppSteerable = true;
+  return built;
 }
 
 function clearInitialStartBuffers(ds: DaemonSession): void {
@@ -15689,6 +15693,7 @@ function clearInitialStartBuffers(ds: DaemonSession): void {
   ds.pendingMentions = undefined;
   ds.pendingSubstituteTrigger = undefined;
   ds.pendingSender = undefined;
+  ds.pendingCodexAppSteerable = undefined;
   ds.pendingFollowUps = undefined;
   ds.pendingFollowUpTurnIds = undefined;
   ds.pendingCodexAppFollowUps = undefined;
@@ -17912,6 +17917,27 @@ async function handleThreadReplyAdmitted(
   // opening path — would silently drop it. When a claim token IS held (a
   // concurrent first turn owns the opening) or a queued-activation ACK is
   // pending, a live worker MUST keep buffering to preserve FIFO submission order.
+  // Codex App steer authorization (Blocking 1, decision A) — computed ONCE here,
+  // BEFORE every admission/fork branch below (R5-B1-1): the earliest tail-admit
+  // (initialStartPending follower), pending-repo follower, worker-null refork,
+  // and new-topic auto-create paths all need the same frozen value, and several
+  // of them return before the later existing-owner branch. Explicit positive
+  // ONLY for a plain-human-interactive turn (real human sender; none of
+  // foreign-bot / bot-sender / substitute-rewrite / v3-grill / message-listener /
+  // VC receiver / VC origin / adopt). Never inferred from the delivery sink;
+  // ignored by acceptCodexAppDispatch for non-codex-app CLIs. A new-topic root
+  // must FREEZE this into its opening payload — forkReservedInitialSession is
+  // shared by bot-added / scheduler / system bootstrap and only COPIES an
+  // explicit upstream true, never defaults it.
+  const codexAppSteerable = !ds?.adoptedFrom
+    && !isForeignBot
+    && !isBotSenderType
+    && !substituteTrigger
+    && !threadGrill
+    && !ctx.messageListener
+    && ds?.session.vcMeetingReceiver === undefined
+    && !ctx.vcMeetingImTurnOrigin;
+
   const liveTakeoverReady = !!ds?.worker && !ds.worker.killed
     && !hasQueuedActivationAdmissionGate(ds)
     && ds.initialStartClaimToken === undefined;
@@ -17937,6 +17963,10 @@ async function handleThreadReplyAdmitted(
         codexAppApplicationContext,
         codexAppMessageContext,
       });
+      // R5-B1-1: freeze the admission-time steer authorization onto this earliest
+      // (initialStartPending follower) tail entry — the strip-proof admit rebuild
+      // then preserves it through promote/repark. Only a plain-human turn is true.
+      if (codexAppSteerable) followUp.codexAppSteerable = true;
       admitQueuedActivationTail(ds, {
         userPrompt: promptContent,
         cliInput: followUp,
@@ -18068,6 +18098,8 @@ async function handleThreadReplyAdmitted(
         ds.session.queuedPrompt ??= ds.pendingPrompt;
         ds.session.queuedCodexAppText ??= ds.pendingCodexAppText;
         ds.session.queuedCodexAppMessageContext ??= ds.pendingCodexAppMessageContext;
+        // R5-B1-1: freeze steer authorization onto the pending-repo follower tail.
+        if (codexAppSteerable) exactFollowUp.codexAppSteerable = true;
         admitQueuedActivationTail(ds, {
           userPrompt: promptContent,
           cliInput: exactFollowUp,
@@ -18257,6 +18289,11 @@ async function handleThreadReplyAdmitted(
       pendingSubstituteTrigger: substituteTrigger,
       pendingSubstituteControlCard: shouldSendSubstituteControlCard,
       pendingSender: autoCreateSender,
+      // R5-B1-1: freeze the plain-human steer authorization into the new-topic
+      // opening metadata. buildReservedInitialInput COPIES this onto the built
+      // opening payload; forkReservedInitialSession never infers it (that shared
+      // helper is also used by bot-added / scheduler / system bootstrap).
+      ...(codexAppSteerable ? { pendingCodexAppSteerable: true as const } : {}),
       ownerOpenId,
       currentTurnTitle: parsed.content.substring(0, 50),
       workingDir: pinnedWorkingDir,
@@ -18348,22 +18385,8 @@ async function handleThreadReplyAdmitted(
   messageQueue.appendMessage(anchor, parsed);
   publishSessionMessagePreviewPatch(ds);
 
-  // Codex App steer authorization (Blocking 1, decision A) — computed ONCE here,
-  // BEFORE the live-worker / worker-null branch split (R4-B1), so every opening
-  // path (live message, queued-tail admit, cold refork) COPIES the same frozen
-  // value. Explicit positive ONLY for a plain-human-interactive turn: a real
-  // human sender (not a foreign bot, not a Feishu-stamped bot sender) with NONE
-  // of substitute-rewrite / v3-grill / message-listener / VC receiver / VC
-  // origin / bridge semantics. Never inferred from the delivery sink; ignored by
-  // acceptCodexAppDispatch for non-codex-app CLIs.
-  const codexAppSteerable = !ds.adoptedFrom
-    && !isForeignBot
-    && !isBotSenderType
-    && !substituteTrigger
-    && !threadGrill
-    && !ctx.messageListener
-    && !ds.session.vcMeetingReceiver
-    && !ctx.vcMeetingImTurnOrigin;
+  // codexAppSteerable was computed ONCE above (R5-B1-1), before every admission /
+  // fork branch; reuse that frozen value for the live-worker / worker-null split.
 
   // Send message to worker via IPC
   if (ds.worker && !ds.worker.killed) {

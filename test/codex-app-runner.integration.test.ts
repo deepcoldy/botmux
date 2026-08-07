@@ -1327,11 +1327,62 @@ describe('codex-app-runner app-server protocol integration', () => {
       expect(realFinal.content).toBe('authoritative B answer');
       // The superseded first member is empty (never carries the intermediate text).
       expect(control.finals[0]).toMatchObject({ turnId: 'om_gh_root', content: '', disposition: 'steer_superseded' });
-      // Goal C survived the CAS: the runner still reports native-busy (busy:true,
-      // tracksTurn:false) AFTER the group settled — C was not cleared.
-      await waitFor(harness, () => control.states.some(
-        state => state.busy === true && state.tracksTurn === false,
-      ));
+      // Goal C survived the CAS. The post-group state must reflect C still active:
+      // wait for a native-busy state that is recorded AFTER both finals (not a
+      // stale pre-final C-started state — codex's timing correction), and require
+      // the LATEST state to be native-busy. If the CAS had wrongly cleared C, the
+      // runner would instead publish an idle (busy:false) terminal state.
+      await waitFor(harness, () => {
+        const last = control.states[control.states.length - 1];
+        return control.finals.length === 2 && last?.busy === true && last?.tracksTurn === false;
+      });
+      // And it never went idle after settling (C keeps the runner busy).
+      const lastState = control.states[control.states.length - 1];
+      expect(lastState).toMatchObject({ busy: true, tracksTurn: false });
+    } finally {
+      await stopChild(harness.child);
+      await control.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('fails closed when a grown group finds MULTIPLE full-group history matches (R4-B3 multi)', async () => {
+    // R4-B3 boundary: a grown group's non-canonical completion triggers a
+    // group-aware bounded-history reconcile. If MORE THAN ONE terminal turn
+    // contains the full ordered group, identity is ambiguous → fail closed
+    // (identity error, never expand a follower final from an ambiguous match).
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-codex-r4b3-multi-'));
+    const fakeCodex = join(dir, 'fake-codex');
+    const logPath = join(dir, 'requests.jsonl');
+    copyFileSync(FAKE_SERVER_FIXTURE, fakeCodex);
+    chmodSync(fakeCodex, 0o755);
+    const control = new ControlCollector(dir);
+    await control.listen();
+    const harness = startRunner(fakeCodex, dir, logPath, '0.144.6', 'steer-group-history-multi', control.bootstrap.path);
+
+    const send = (text: string, replyTurnId: string) => {
+      harness.child.stdin.write(`${CONTROL_PREFIX}${encodeRunnerInput(
+        `legacy:${text}`, { text, clientUserMessageId: replyTurnId }, replyTurnId, true,
+      )}\r`);
+    };
+
+    try {
+      await waitFor(harness, () => control.states.some(state => state.busy === false));
+      send('root', 'om_gm_root');
+      await waitFor(harness, () => readRequests(logPath).some(r => r.method === 'turn/start'));
+      send('follow', 'om_gm_follow');
+
+      // The fixture starts a Goal C after the non-canonical completion, so the
+      // runner stays native-busy — wait on the finals (2: superseded + the
+      // identity-error real), not on an idle boundary.
+      await waitFor(harness, () => control.finals.length === 2);
+
+      const diagnostics = control.markers.filter(m => m.kind === 'diagnostic');
+      expect(diagnostics.length).toBeGreaterThanOrEqual(1);
+      expect(diagnostics[0].payload.code).toBe('native_turn_identity_conflict');
+      const realFinal = control.finals[control.finals.length - 1];
+      expect(realFinal.content).toContain('Codex App turn failed');
+      expect(realFinal.content).not.toContain('authoritative B answer');
     } finally {
       await stopChild(harness.child);
       await control.close();

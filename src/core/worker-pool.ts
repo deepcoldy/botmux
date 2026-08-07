@@ -4270,6 +4270,10 @@ export function promoteQueuedActivationTail(
   const exactInput: CliTurnPayload = {
     content: head.cliInput.content,
     ...(codexAppInput ? { codexAppInput } : {}),
+    // R5-B1-2: preserve the frozen steer authorization onto the promoted
+    // queuedActivationInput so the ensuing fork/accept-ledger COPY (below) sees
+    // it. Only `=== true`; a missing/false tail head stays forced-serial.
+    ...(head.cliInput.codexAppSteerable === true ? { codexAppSteerable: true as const } : {}),
   };
   const vcMeetingImTurnOrigin = resolveVcMeetingImTurnOrigin(ds.session, head.turnId);
 
@@ -4397,6 +4401,10 @@ export function admitQueuedActivationTail(
     cliInput: {
       content: entry.cliInput.content,
       ...(acceptedCodexAppInput ? { codexAppInput: acceptedCodexAppInput } : {}),
+      // R5-B1-2: preserve the frozen steer authorization across the tail rebuild
+      // (only `=== true`, never truthy). Dropping it here silently un-authorized
+      // every queued/opening turn — the strip point that defeated the R4 fix.
+      ...(entry.cliInput.codexAppSteerable === true ? { codexAppSteerable: true as const } : {}),
     },
   };
   const priorTail = ds.session.queuedActivationTail;
@@ -4629,6 +4637,9 @@ export function forkWorker(
           ...(promptPayload.codexAppInput
             ? { codexAppInput: promptPayload.codexAppInput }
             : {}),
+          // R5-B1-2: preserve the frozen steer authorization on the double-fork
+          // staged tail entry (only `=== true`).
+          ...(initCodexAppSteerable ? { codexAppSteerable: true as const } : {}),
         },
         turnId,
         ...(initDispatchAttempt !== undefined
@@ -7220,26 +7231,33 @@ function setupWorkerHandlers(
             acknowledge(false, preview.error);
             break;
           }
-          // R4-B4 defense-in-depth: a `steer_superseded` settlement silently
+          // R4/R5-B4 defense-in-depth: a `steer_superseded` settlement silently
           // advances the FIFO without delivering, so it is ONLY legitimate for a
-          // genuine plain-Lark steerable head. Reject (ACK=false, no pop, no
-          // receiver completion, no mutation) BEFORE the commit block below if the
-          // settled entry is not steerable, not a Lark sink, or belongs to a VC /
-          // durable-receiver / special channel — a mixed/stale/forged runner must
-          // never use superseded to swallow an independent waiter's turn.
+          // genuine plain-Lark steerable head that STILL has a successor. Reject
+          // (ACK=false, no pop, no receiver completion, no mutation) BEFORE the
+          // commit block below if the settled entry is not steerable, not an
+          // explicit Lark sink, belongs to a VC / durable-receiver / special
+          // channel, or is the SOLE remaining head. R5: `deliverySink` must be
+          // exactly 'lark' — admission always writes both sink and steerable
+          // together, so "steerable=true + sink missing" can only be a
+          // mixed/corrupt/legacy ledger and must fail closed, not be treated as
+          // safe Lark. And a lone forged superseded (no successor) must never
+          // silently commit the only head — the real final would then find no
+          // pending turn. preview.ledger is the post-settle remainder.
           if (msg.disposition === 'steer_superseded') {
             const entry = preview.settledEntry;
             const supersededHeadOk = entry.codexAppSteerable === true
-              && (entry.deliverySink === undefined || entry.deliverySink === 'lark')
+              && entry.deliverySink === 'lark'
               && entry.vcMeetingImTurnOrigin === undefined
-              && ds.session.vcMeetingReceiver === undefined;
+              && ds.session.vcMeetingReceiver === undefined
+              && preview.ledger.length > 0;
             if (!supersededHeadOk) {
               logger.warn(
-                `[${t}] Rejected steer_superseded for non-steerable/special head `
+                `[${t}] Rejected steer_superseded for non-steerable/special/last head `
                 + `(turn ${msg.turnId.substring(0, 8)}, sink=${entry.deliverySink ?? 'legacy'}, `
-                + `steerable=${entry.codexAppSteerable === true})`,
+                + `steerable=${entry.codexAppSteerable === true}, successors=${preview.ledger.length})`,
               );
-              acknowledge(false, 'superseded_head_not_plain_lark_steerable');
+              acknowledge(false, 'superseded_head_not_plain_lark_steerable_with_successor');
               break;
             }
           }

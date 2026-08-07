@@ -351,6 +351,53 @@ describe('Codex App clean-input feature gate', () => {
     }
   });
 
+  it('R5-B1-2: preserves codexAppSteerable through the queued admit → promote copy chain (persisted tail + queuedActivationInput + accept-ledger)', () => {
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'codex-app' }));
+    // Worker-null session already behind a queued-activation gate so a new input
+    // is ADMITTED to the durable tail (not sent live). This is the exact copy
+    // chain codex flagged: admit rebuild → promote exactInput → accept-ledger.
+    const ds = makeDs({
+      worker: makeFakeWorker(),
+      initialStartPending: true,
+    } as any);
+    ds.session.queuedActivationPending = true; // gate: force admit path
+    ds.session.queuedActivationInput = { content: 'opening' };
+
+    // Admit a plain-human steerable follow-up into the tail.
+    expect(sendWorkerInput(ds, { content: 'follow', codexAppSteerable: true }, 'turn-steer-tail', {
+      codexAppSteerable: true,
+    })).toBe(true);
+    // The PERSISTED tail entry must carry the frozen flag (admit must not strip).
+    const tailEntry = ds.session.queuedActivationTail?.find(e => e.turnId === 'turn-steer-tail');
+    expect(tailEntry?.cliInput.codexAppSteerable).toBe(true);
+
+    // Now promote the tail head (simulate the opening ACK draining the gate).
+    ds.session.queuedActivationPending = false;
+    const promoted = promoteQueuedActivationTail(ds, { send: false });
+    expect(promoted).toBe(true);
+    // The promoted queuedActivationInput and the fresh accept-ledger entry must
+    // both still carry the flag (promote exactInput + acceptCodexAppDispatch COPY).
+    expect(ds.session.queuedActivationInput?.codexAppSteerable).toBe(true);
+    expect(ds.session.codexAppDispatchLedger?.some(e => e.codexAppSteerable === true)).toBe(true);
+  });
+
+  it('R5-B1-2: a missing/false steer authorization stays forced-serial through the same copy chain', () => {
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'codex-app' }));
+    const ds = makeDs({ worker: makeFakeWorker(), initialStartPending: true } as any);
+    ds.session.queuedActivationPending = true;
+    ds.session.queuedActivationInput = { content: 'opening' };
+
+    // No codexAppSteerable → forced serial; the flag must be absent everywhere.
+    expect(sendWorkerInput(ds, { content: 'follow' }, 'turn-serial-tail')).toBe(true);
+    const tailEntry = ds.session.queuedActivationTail?.find(e => e.turnId === 'turn-serial-tail');
+    expect(tailEntry?.cliInput.codexAppSteerable).toBeUndefined();
+
+    ds.session.queuedActivationPending = false;
+    expect(promoteQueuedActivationTail(ds, { send: false })).toBe(true);
+    expect(ds.session.queuedActivationInput?.codexAppSteerable).toBeUndefined();
+    expect(ds.session.codexAppDispatchLedger?.every(e => e.codexAppSteerable !== true)).toBe(true);
+  });
+
   it('resolves explicit meeting IM origin while keeping the clean cold-fork sidecar', () => {
     vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'codex-app', codexAppCleanInput: true }));
     const ds = makeDs();

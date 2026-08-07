@@ -113,4 +113,25 @@ describe('CodexAppTurnDispatchQueue', () => {
       reason: 'no_pending_turn',
     });
   });
+
+  it('R5-B4-1: restore preserves codexAppSteerable onto the prepared reservation and surfaces it on settle', () => {
+    const queue = new CodexAppTurnDispatchQueue();
+    // A replacement worker restores the daemon-frozen prepared prefix. The head
+    // was admitted from the plain-human path (steerable), a later peer was not.
+    queue.restore([
+      { dispatchId: 'd-head', turnId: 'turn-head', codexAppSteerable: true },
+      { dispatchId: 'd-next', turnId: 'turn-next' },
+    ]);
+    // settleFinal (consume:false — the worker's mode) must surface steerable +
+    // a remaining successor, so a legitimate superseded head is NOT wrongly
+    // rejected at the worker (the exact wedge B4-1 fixes: without this the
+    // restored reservation is steerable=false and superseded fails closed).
+    const head = queue.settleFinal({ turnId: 'turn-head' }, false);
+    expect(head).toMatchObject({ ok: true, turnId: 'turn-head', codexAppSteerable: true, remaining: 1 });
+    // A non-steerable restored entry stays forced-serial (flag absent).
+    queue.commitExactHead((head as any).handle);
+    const next = queue.settleFinal({ turnId: 'turn-next' }, false);
+    expect((next as any).codexAppSteerable).toBeUndefined();
+    expect((next as any).remaining).toBe(0);
+  });
 });

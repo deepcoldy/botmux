@@ -89,10 +89,11 @@ export class CodexAppTurnDispatchQueue {
     turnId: string;
     dispatchAttempt?: number;
     replyTurnId?: string;
+    codexAppSteerable?: true;
   }>): void {
     if (this.queue.length > 0) throw new Error('Codex App dispatch queue is already populated');
     for (const entry of entries) {
-      this.reserve(entry.turnId, entry.dispatchAttempt, entry.dispatchId, true, entry.replyTurnId);
+      this.reserve(entry.turnId, entry.dispatchAttempt, entry.dispatchId, true, entry.replyTurnId, entry.codexAppSteerable);
     }
   }
 

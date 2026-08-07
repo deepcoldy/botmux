@@ -13340,6 +13340,12 @@ process.on('message', async (raw: unknown) => {
               turnId: entry.turnId,
               replyTurnId: entry.replyTurnId,
               dispatchAttempt: entry.dispatchAttempt,
+              // R5-B4-1: COPY the frozen steer authorization onto the restored
+              // prepared reservation. Without it a replacement worker's exact-head
+              // reservation is steerable=false while the daemon ledger head is
+              // true, so a legitimate superseded settlement would be rejected and
+              // the crash-replay chain wedges.
+              ...(entry.codexAppSteerable ? { codexAppSteerable: true as const } : {}),
             })),
         );
       }

@@ -171,6 +171,11 @@ export interface DaemonSession {
    *  so the deferred spawn after repo-selection still injects a <sender> tag
    *  matching the original caller, not the user who clicked the card. */
   pendingSender?: import('../im/lark/identity-cache.js').ResolvedSender;
+  /** Frozen plain-human steer authorization for a NEW-TOPIC opening (R5-B1-1).
+   * Set by the auto-create admission; buildReservedInitialInput COPIES it onto
+   * the opening CliTurnPayload. Only `true`; forkReservedInitialSession (shared by
+   * bot-added / scheduler / system bootstrap) never infers it. */
+  pendingCodexAppSteerable?: true;
   pendingFollowUps?: string[];         // buffered follow-up messages (enriched) sent while waiting for repo selection
   /** Exact turn for a same-caller pendingRawInput follow-up batch. Cleared on
    *  mixed callers so the combined prompt fails closed instead of borrowing. */

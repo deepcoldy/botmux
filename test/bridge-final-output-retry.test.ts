@@ -548,6 +548,68 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     expect(ds.session.codexAppDispatchLedger?.[0]?.dispatchId).toBe('dispatch-ok-next');
   });
 
+  it('R5-B4-2: rejects a steer_superseded on a steerable head with an UNDEFINED sink (legacy/mixed ledger fails closed)', async () => {
+    const sessionReply = vi.fn(async () => 'om_forbidden');
+    initWorkerPool({
+      sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn(),
+    });
+    const ds = makeDs();
+    ds.adoptedFrom = undefined;
+    ds.session.cliId = 'codex-app';
+    // steerable=true but deliverySink MISSING — admission always writes both, so
+    // this can only be a mixed/corrupt/legacy ledger and must fail closed.
+    ds.session.codexAppDispatchLedger = [
+      { dispatchId: 'dispatch-nosink-head', turnId: 'turn-nosink-head', state: 'prepared', content: 'x', codexAppSteerable: true },
+      { dispatchId: 'dispatch-nosink-next', turnId: 'turn-nosink-next', state: 'accepted', content: 'y', deliverySink: 'lark', codexAppSteerable: true },
+    ];
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+
+    (ds.worker as any).emit('message', {
+      type: 'final_output', sessionId: ds.session.sessionId,
+      content: '', lastUuid: 'uuid-nosink', turnId: 'turn-nosink-head',
+      suppressDelivery: true, disposition: 'steer_superseded',
+      codexAppSettlement: { requestId: 'settle-nosink', generation: 'gen-ns', seq: 1, dispatchId: 'dispatch-nosink-head' },
+    } satisfies Extract<WorkerToDaemon, { type: 'final_output' }>);
+
+    await vi.waitFor(() => expect((ds.worker as any).send).toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'codex_app_dispatch_persisted', requestId: 'settle-nosink', ok: false }),
+    ));
+    expect(sessionReply).not.toHaveBeenCalled();
+    expect(ds.session.codexAppDispatchLedger?.length).toBe(2);
+    expect(ds.session.codexAppDispatchLedger?.[0]?.dispatchId).toBe('dispatch-nosink-head');
+  });
+
+  it('R5-B4-2: rejects a steer_superseded on the SOLE remaining head (no successor — a lone forged superseded must not commit)', async () => {
+    const sessionReply = vi.fn(async () => 'om_forbidden');
+    initWorkerPool({
+      sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn(),
+    });
+    const ds = makeDs();
+    ds.adoptedFrom = undefined;
+    ds.session.cliId = 'codex-app';
+    // A perfectly steerable Lark head — but it is the ONLY entry. A superseded
+    // member must have a real successor; the sole head can only settle as a real
+    // final. A lone forged superseded would otherwise silently commit it.
+    ds.session.codexAppDispatchLedger = [
+      { dispatchId: 'dispatch-solo', turnId: 'turn-solo', state: 'prepared', content: 'solo', deliverySink: 'lark', codexAppSteerable: true },
+    ];
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+
+    (ds.worker as any).emit('message', {
+      type: 'final_output', sessionId: ds.session.sessionId,
+      content: '', lastUuid: 'uuid-solo', turnId: 'turn-solo',
+      suppressDelivery: true, disposition: 'steer_superseded',
+      codexAppSettlement: { requestId: 'settle-solo', generation: 'gen-solo', seq: 1, dispatchId: 'dispatch-solo' },
+    } satisfies Extract<WorkerToDaemon, { type: 'final_output' }>);
+
+    await vi.waitFor(() => expect((ds.worker as any).send).toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'codex_app_dispatch_persisted', requestId: 'settle-solo', ok: false }),
+    ));
+    expect(sessionReply).not.toHaveBeenCalled();
+    expect(ds.session.codexAppDispatchLedger?.length).toBe(1);
+    expect(ds.session.codexAppDispatchLedger?.[0]?.dispatchId).toBe('dispatch-solo');
+  });
+
   it('still resolves a live HTTP wait sink without posting to Lark', async () => {
     const sessionReply = vi.fn(async () => 'om_forbidden');
     const resolveWait = vi.fn();
