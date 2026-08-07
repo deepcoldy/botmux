@@ -8,13 +8,16 @@
  * source's context via the CLI-native fork primitive, and leaves the source
  * completely untouched. The most load-bearing behavior these tests lock is that
  * the child inherits the source's FROZEN LAUNCH POSTURE — sandbox decision,
- * model/effort override, and bot identity (larkAppId) — because the child is a
+ * effort override, and bot identity (larkAppId) — because the child is a
  * brand-new row (not a reused ds.session like transferSession), and a missing
  * field silently re-derives to the wrong value:
  *   • missing sandbox → forkWorker's resume=true path writes sandbox=false →
  *     a fork of a sandboxed session runs UNSANDBOXED (credential-seal escape);
- *   • missing model/effort → sessionAgentConfig re-freezes from the live bot
+ *   • missing effort → sessionAgentConfig re-freezes from the live bot
  *     config, dropping per-session overrides;
+ *   • the model is deliberately NOT part of that set — it resolves from the live
+ *     bot config on every spawn; only an EXPLICIT per-trigger override travels,
+ *     and it rides on the runtime (in-memory) session, never the row;
  *   • missing larkAppId → restoreActiveSessions misattributes the fork to the
  *     first bot in the roster.
  *
@@ -239,12 +242,11 @@ describe('forkSession — frozen launch posture inheritance', () => {
     expect(child.sandbox).toBe(false);
   });
 
-  // ── P2: per-session model / reasoningEffort overrides + the agentFrozen
-  //    marker must ride along, else sessionAgentConfig re-freezes from the live
-  //    bot config and the clone silently drops the source's launch identity. ──
-  it('P2: model / reasoningEffort / cliPathOverride / wrapperCli / agentFrozen inherited', async () => {
+  // ── P2: the per-session reasoningEffort override + the agentFrozen marker
+  //    must ride along, else sessionAgentConfig re-freezes from the live bot
+  //    config and the clone silently drops the source's launch identity. ──
+  it('P2: reasoningEffort / cliPathOverride / wrapperCli / agentFrozen inherited', async () => {
     const src = makeSourceDs({
-      model: 'opus-custom',
       reasoningEffort: 'xhigh',
       cliPathOverride: '/opt/custom/claude',
       wrapperCli: 'ttadk',
@@ -255,11 +257,40 @@ describe('forkSession — frozen launch posture inheritance', () => {
     const r = await callFork(src);
     expect(r.ok).toBe(true);
     const child = vi.mocked(sessionStore.createSession).mock.results[0].value as Session;
-    expect(child.model).toBe('opus-custom');
     expect(child.reasoningEffort).toBe('xhigh');
     expect(child.cliPathOverride).toBe('/opt/custom/claude');
     expect(child.wrapperCli).toBe('ttadk');
     expect(child.agentFrozen).toBe(true);
+  });
+
+  // ── The model is NOT part of the frozen posture: it resolves from the live
+  //    bot config at every spawn (both sessions run the same bot, so the clone
+  //    matches the source automatically). Copying a stale `session.model` onto
+  //    the fresh row would resurrect the frozen-model bug on the clone. ──
+  it('does not copy a legacy frozen model onto the child row', async () => {
+    const src = makeSourceDs({ model: 'legacy-frozen-model' });
+    registry.set(sessionKey('om_source_root', 'cli_app_test'), src);
+
+    const r = await callFork(src);
+    expect(r.ok).toBe(true);
+    const child = vi.mocked(sessionStore.createSession).mock.results[0].value as Session;
+    expect(child.model).toBeUndefined();
+  });
+
+  // ── An EXPLICIT per-trigger override, however, must reach the clone: it lives
+  //    on the runtime session (in-memory, never persisted), so forkSession has
+  //    to hand it to the child ds or the fork silently drops to the bot default. ──
+  it('carries an explicit per-trigger model override onto the child runtime session', async () => {
+    const src = makeSourceDs({}, { spawnModelOverride: 'gpt-5.6-terra' });
+    registry.set(sessionKey('om_source_root', 'cli_app_test'), src);
+
+    const r = await callFork(src);
+    expect(r.ok).toBe(true);
+    const [childDs] = forkWorkerSpy.mock.calls[0] as [DaemonSession];
+    expect(childDs.spawnModelOverride).toBe('gpt-5.6-terra');
+    // …and it stays out of the persisted row.
+    const child = vi.mocked(sessionStore.createSession).mock.results[0].value as Session;
+    expect(child.model).toBeUndefined();
   });
 
   // ── The larkAppId gap codex caught: the persisted child row must carry the

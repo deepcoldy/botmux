@@ -185,8 +185,12 @@ describe('triggerSessionTurn rootMessageId target', () => {
     const activeSessions = new Map<string, DaemonSession>();
     await triggerSessionTurn(req, { larkAppId: APP, activeSessions });
     const ds = activeSessions.get(sessionKey(ROOT, APP));
+    // The model override is PER TRIGGER, so it lands on the in-memory runtime
+    // session only. Persisting it (the old behavior) made a one-shot caller
+    // choice outrank the bot's configured model on every later resume, forever.
+    expect(ds?.spawnModelOverride).toBe('gpt-5.6-terra');
+    expect(ds?.session.model).toBeUndefined();
     // xhigh preserved verbatim (no downgrade — codex 0.145 accepts it)
-    expect(ds?.session.model).toBe('gpt-5.6-terra');
     expect(ds?.session.reasoningEffort).toBe('xhigh');
   });
 
@@ -198,6 +202,7 @@ describe('triggerSessionTurn rootMessageId target', () => {
     const activeSessions = new Map<string, DaemonSession>();
     await triggerSessionTurn(req, { larkAppId: APP, activeSessions });
     const ds = activeSessions.get(sessionKey(ROOT, APP));
+    expect(ds?.spawnModelOverride).toBeUndefined();
     expect(ds?.session.model).toBeUndefined();
     expect(ds?.session.reasoningEffort).toBeUndefined();
   });
@@ -280,6 +285,7 @@ describe('triggerSessionTurn rootMessageId target', () => {
 
     expect(mockCreateSession).not.toHaveBeenCalled(); // folded in, not new
     expect(ds.session.model).toBe('frozen-model');
+    expect(ds.spawnModelOverride).toBeUndefined();   // no per-trigger override either
     expect(ds.session.reasoningEffort).toBe('low');
   });
 
