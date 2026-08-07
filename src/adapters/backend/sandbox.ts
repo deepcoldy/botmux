@@ -20,7 +20,7 @@
  */
 import { mkdirSync, existsSync, writeFileSync, chmodSync, readdirSync, readFileSync, rmSync, rmdirSync, unlinkSync, statSync, lstatSync, readlinkSync, realpathSync, openSync, fstatSync, readSync, writeSync, closeSync, constants as fsConstants } from 'node:fs';
 import { atomicWriteFileSync } from '../../utils/atomic-write.js';
-import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
+import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawn, spawnSync } from 'node:child_process';
 import { compileToBwrap, type FsPolicy } from '../cli/fs-policy.js';
@@ -72,6 +72,7 @@ export function buildCredentialOnlySandboxArgs(input: {
   hideDirectories: string[];
   hideFiles: string[];
   readonlyPaths?: string[];
+  privateReadonlyDirectories?: Array<{ parent: string; path: string }>;
   workingDir: string;
   cliBin: string;
   cliArgs: string[];
@@ -83,6 +84,15 @@ export function buildCredentialOnlySandboxArgs(input: {
     assertCredentialIsolationPath(path, 'directory')))];
   const hideFiles = [...new Set(input.hideFiles.map(path =>
     assertCredentialIsolationPath(path, 'file')))];
+  const privateReadonlyDirectories = (input.privateReadonlyDirectories ?? []).map(entry => {
+    const parent = assertCredentialIsolationPath(entry.parent, 'private parent');
+    const path = assertCredentialIsolationPath(entry.path, 'private directory');
+    const child = relative(parent, path);
+    if (!child || child.startsWith('..') || isAbsolute(child)) {
+      throw new Error(`credential isolation private directory must be below its parent: ${path}`);
+    }
+    return { parent, path };
+  });
   if (hideDirectories.length === 0 && hideFiles.length === 0) {
     throw new Error('credential isolation requires at least one authority mask');
   }
@@ -95,6 +105,12 @@ export function buildCredentialOnlySandboxArgs(input: {
     const normalized = assertCredentialIsolationPath(path, 'readonly path');
     args.push('--ro-bind', normalized, normalized);
   }
+  const privateParents = [...new Set(privateReadonlyDirectories.map(entry => entry.parent))].sort();
+  for (const parent of privateParents) args.push('--tmpfs', parent);
+  for (const path of [...new Set(privateReadonlyDirectories.map(entry => entry.path))].sort()) {
+    args.push('--ro-bind', path, path);
+  }
+  for (const parent of privateParents) args.push('--remount-ro', parent);
   for (const directory of hideDirectories.sort()) args.push('--tmpfs', directory);
   for (const file of hideFiles.sort()) args.push('--ro-bind', '/dev/null', file);
   args.push(
@@ -186,6 +202,7 @@ export function prepareCredentialOnlySandbox(input: {
   hideDirectories: string[];
   hideFiles: string[];
   readonlyPaths?: string[];
+  privateReadonlyDirectories?: Array<{ parent: string; path: string }>;
   workingDir: string;
   cliBin: string;
   cliArgs: string[];

@@ -266,10 +266,10 @@ describe('isolatedPaneReattachSafe — #714 mount contract forces cold respawn o
     expect(isolatedPaneReattachSafe(isolationPaneMarkerContent('fresh', [...full]), ['read', 'write'])).toBe(true);
   });
 
-  it('has moved the version past 8 (the #709 env-contract version)', () => {
-    // Reverting below 9 would silently warm-reattach panes that predate the
-    // migration-marker mount. ≥ 9 is required.
-    expect(ISOLATION_PANE_MARKER_VERSION).toBeGreaterThan(8);
+  it('has moved the version past 9 (credential-only capability mount contract)', () => {
+    // Reverting below 10 would silently warm-reattach credential-only panes
+    // that lack the private capability mount/env contract.
+    expect(ISOLATION_PANE_MARKER_VERSION).toBeGreaterThan(9);
   });
 });
 
@@ -293,6 +293,32 @@ describe('worker capability carve-out ordering', () => {
     expect(relayAt).toBeGreaterThan(policyAt);
     expect(relayPublishAt).toBeGreaterThan(relayAt);
     expect(source).toContain('replaceManagedOriginCapabilityFile(profilePath, buildSeatbeltProfile(');
+
+    const credentialSetupAt = source.indexOf('if (credentialOnlyBwrap) {');
+    const credentialDirectoryAt = source.indexOf(
+      'managedOriginCapabilityDirectory(\n      isolationRuntimeDataDir,\n      cfg.sessionId,',
+      credentialSetupAt,
+    );
+    const credentialPublishAt = source.indexOf(
+      'publishSandboxRelayCapability({ failClosed: true })',
+      credentialDirectoryAt,
+    );
+    const credentialBwrapAt = source.indexOf(
+      'if (!willReattachPersistent && credentialOnlyBwrap)',
+      credentialPublishAt,
+    );
+    const credentialSandboxAt = source.indexOf(
+      'prepareCredentialOnlySandbox({',
+      credentialBwrapAt,
+    );
+    expect(credentialSetupAt).toBeGreaterThan(-1);
+    expect(credentialDirectoryAt).toBeGreaterThan(credentialSetupAt);
+    expect(credentialPublishAt).toBeGreaterThan(credentialDirectoryAt);
+    expect(credentialBwrapAt).toBeGreaterThan(credentialPublishAt);
+    expect(credentialSandboxAt).toBeGreaterThan(credentialBwrapAt);
+    expect(source).toContain('privateReadonlyDirectories: [{');
+    expect(source).toContain('childEnv[MANAGED_ORIGIN_CAPABILITY_DIR_ENV]');
+    expect(source).toContain('delete childEnv[MANAGED_ORIGIN_CAPABILITY_DIR_ENV]');
   });
 
   it('denies every same-UID Gateway socket before allowing only the current session socket', () => {

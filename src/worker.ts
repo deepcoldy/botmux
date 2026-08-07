@@ -295,7 +295,9 @@ import {
 } from './services/codex-app-runner-protocol.js';
 import {
   hasMatchingManagedOriginCapability,
+  managedOriginCapabilityDirectory,
   managedOriginCapabilityPath,
+  MANAGED_ORIGIN_CAPABILITY_DIR_ENV,
   RELAY_ORIGIN_CAPABILITY_BASENAME,
   replaceManagedOriginCapabilityFile,
 } from './core/managed-origin-capability.js';
@@ -8795,6 +8797,9 @@ async function spawnCli(
   // namespaced BOTMUX_LARK_APP_ID injected below; the worker keeps its own
   // bare creds (forkWorker) for lark-upload. See utils/child-env.ts.
   const childEnv = redactChildEnv(process.env);
+  // This path is minted per credential-only bwrap generation below. Never let
+  // a worker/daemon launch environment pin an unrelated session's directory.
+  delete childEnv[MANAGED_ORIGIN_CAPABILITY_DIR_ENV];
   if (sessionMcpGatewayHost) {
     childEnv[MCP_GATEWAY_SOCKET_ENV] = sessionMcpGatewayHost.socketPath;
     childEnv[MCP_GATEWAY_REQUIRED_ENV] = '1';
@@ -9490,9 +9495,23 @@ async function spawnCli(
     spawnBin = credentialMechanismExecutable ?? '/usr/bin/sandbox-exec';
     log(`[device-credential-isolation] wrapping ${cliAdapter.id} in credential-only Seatbelt: ${spawnBin} -f ${profilePath}`);
   }
-  if (!willReattachPersistent && credentialOnlyBwrap) {
+  let credentialOnlyCapabilityDir: string | undefined;
+  if (credentialOnlyBwrap) {
     const panePolicyDir = join(isolationRuntimeDataDir, 'read-isolation');
     mkdirSync(panePolicyDir, { recursive: true });
+    credentialOnlyCapabilityDir = managedOriginCapabilityDirectory(
+      isolationRuntimeDataDir,
+      cfg.sessionId,
+    );
+    readIsolationOriginCapabilityFile = join(
+      credentialOnlyCapabilityDir,
+      RELAY_ORIGIN_CAPABILITY_BASENAME,
+    );
+    publishSandboxRelayCapability({ failClosed: true });
+    childEnv[MANAGED_ORIGIN_CAPABILITY_DIR_ENV] = realpathSync(credentialOnlyCapabilityDir);
+  }
+  if (!willReattachPersistent && credentialOnlyBwrap) {
+    const panePolicyDir = join(isolationRuntimeDataDir, 'read-isolation');
     const hideDirectories = new Set<string>();
     const hideFiles = new Set<string>();
     const processedRoots = new Set<string>();
@@ -9560,7 +9579,10 @@ async function spawnCli(
     const credentialSandbox = prepareCredentialOnlySandbox({
       hideDirectories: [...hideDirectories],
       hideFiles: [...hideFiles],
-      readonlyPaths: [realpathSync(panePolicyDir)],
+      privateReadonlyDirectories: [{
+        parent: realpathSync(panePolicyDir),
+        path: realpathSync(credentialOnlyCapabilityDir!),
+      }],
       workingDir: spawnCwd,
       cliBin: credentialCliBin,
       cliArgs: spawnArgs,
@@ -9920,6 +9942,7 @@ async function spawnCli(
       cfg.sessionId,
       sandboxRelayCapability?.token,
       sandboxRelayOutbox ?? undefined,
+      childEnv[MANAGED_ORIGIN_CAPABILITY_DIR_ENV],
     );
   const readySignalAvailable =
     readyHookAvailable && readyPortAvailable && readyCapabilityAvailable;

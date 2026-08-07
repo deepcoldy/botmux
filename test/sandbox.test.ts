@@ -11,7 +11,7 @@ import { describe, it, expect } from 'vitest';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { mkdtempSync, existsSync, writeFileSync, readFileSync, symlinkSync, realpathSync } from 'node:fs';
-import { buildRelayHostEnv, validateRelayRequest, materializeOutboxFile, prepareDirectSandbox, coreOnlyPidNamespaceDegrade, bwrapCanUnsharePid, pidNsDualProbeCanUnshare, __testOnly_resetPidNamespaceProbe } from '../src/adapters/backend/sandbox.js';
+import { buildCredentialOnlySandboxArgs, buildRelayHostEnv, validateRelayRequest, materializeOutboxFile, prepareDirectSandbox, coreOnlyPidNamespaceDegrade, bwrapCanUnsharePid, pidNsDualProbeCanUnshare, __testOnly_resetPidNamespaceProbe } from '../src/adapters/backend/sandbox.js';
 import { createCodexAppAdapter } from '../src/adapters/cli/codex-app.js';
 
 const tmp = () => mkdtempSync(join(tmpdir(), 'sbx-'));
@@ -38,6 +38,33 @@ describe('prepareDirectSandbox platform gate', () => {
       chdir: '/x', home: '/home/u', cliBin: '/usr/bin/true', cliArgs: [],
     });
     expect(r).toBeNull();
+  });
+});
+
+describe('credential-only private capability carve-out', () => {
+  it('masks sibling capability directories and re-exposes only this session directory read-only', () => {
+    const parent = '/srv/botmux/data/read-isolation';
+    const ownDirectory = `${parent}/origin-private`;
+    const args = buildCredentialOnlySandboxArgs({
+      hideDirectories: ['/srv/botmux/.device-authority'],
+      hideFiles: ['/srv/botmux/.dashboard-secret'],
+      privateReadonlyDirectories: [{ parent, path: ownDirectory }],
+      workingDir: '/srv/project',
+      cliBin: '/usr/bin/true',
+      cliArgs: [],
+    });
+
+    const parentMaskAt = args.findIndex((value, index) =>
+      value === '--tmpfs' && args[index + 1] === parent);
+    const ownBindAt = args.findIndex((value, index) =>
+      value === '--ro-bind'
+      && args[index + 1] === ownDirectory
+      && args[index + 2] === ownDirectory);
+    const parentSealAt = args.findIndex((value, index) =>
+      value === '--remount-ro' && args[index + 1] === parent);
+    expect(parentMaskAt).toBeGreaterThan(-1);
+    expect(ownBindAt).toBeGreaterThan(parentMaskAt);
+    expect(parentSealAt).toBeGreaterThan(ownBindAt);
   });
 });
 

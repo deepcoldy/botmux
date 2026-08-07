@@ -14,6 +14,7 @@
  */
 
 import {
+  MANAGED_ORIGIN_CAPABILITY_DIR_ENV,
   readManagedOriginCapability,
 } from '../../core/managed-origin-capability.js';
 import { findAncestorSessionContext } from '../../core/session-marker.js';
@@ -58,7 +59,12 @@ export function readWorkflowSessionRelayContext(options: {
   if (marker?.sessionId) return null;
   const readClaim = options.readClaim ?? readManagedOriginCapability;
   const relayDir = options.env.BOTMUX_SEND_RELAY?.trim();
-  const claim = readClaim(options.dataDir, sessionId, relayDir || undefined);
+  const claim = readClaim(
+    options.dataDir,
+    sessionId,
+    relayDir || undefined,
+    options.env[MANAGED_ORIGIN_CAPABILITY_DIR_ENV]?.trim() || undefined,
+  );
   if (!claim) return null;
   const portRaw = Number(options.env.BOTMUX_DAEMON_IPC_PORT);
   const ipcPortFallback = Number.isSafeInteger(portRaw) && portRaw > 0 ? portRaw : undefined;

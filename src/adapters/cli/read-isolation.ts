@@ -323,7 +323,10 @@ export function buildSeatbeltProfile(
 // #709 (→8) merged first; this PR (#714) rebased on top and takes 9. Numbers stay
 // strictly monotonic — a pane at any intermediate version must be rejected so it
 // cold-spawns under the current contract rather than bypassing a migration.
-export const ISOLATION_PANE_MARKER_VERSION = 9;
+//   · 9 → 10 (#779): credential-only bwrap sessions receive a private rotating
+//     origin-capability directory + env pointer. A v9 pane has neither, and a
+//     warm reattach cannot add mounts or environment to its live process.
+export const ISOLATION_PANE_MARKER_VERSION = 10;
 
 export type IsolationCapability = 'credential' | 'read' | 'write';
 
