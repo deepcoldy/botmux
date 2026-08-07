@@ -15,6 +15,10 @@ import { join } from 'node:path';
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
+// The lazily-loaded worker-pool import is expensive on first touch; under
+// full-suite load the default 30s was not enough for whichever case paid for it.
+vi.setConfig({ testTimeout: 90_000 });
+
 vi.mock('@larksuiteoapi/node-sdk', () => {
   class FakeClient {
     constructor(public opts: Record<string, unknown>) {}
@@ -51,8 +55,11 @@ async function boot(mojo?: MojoConfig) {
   store.init();
   // Leaf module on purpose: no worker/spawn graph, so this stays a cheap unit test.
   const identity = await import('../src/core/mojo-session-identity.js');
-  const pool = await import('../src/core/worker-pool.js');
-  return { registry, store, pool, identity };
+  // worker-pool is a heavy module (spawn wiring, dashboard, IM). Loaded lazily so
+  // only the few cases that need sessionMojoConfig pay for it — importing it
+  // eagerly pushed this file past the 30s timeout under full-suite load.
+  const loadPool = () => import('../src/core/worker-pool.js');
+  return { registry, store, identity, loadPool };
 }
 
 type Booted = Awaited<ReturnType<typeof boot>>;
@@ -198,7 +205,7 @@ describe('freezeMojoIdentityForSession', () => {
 
 describe('migrateMojoSessionIdentities', () => {
   it('freezes every restored mojo row in one pass', async () => {
-    const { store, pool } = await boot({ cloud: true, workspaceId: 'ws-a' });
+    const { store, loadPool } = await boot({ cloud: true, workspaceId: 'ws-a' });
     const a = seed(store);
     const b = seed(store, { riffParentTaskId: 'lineage-b' });
     const c = seed(store, { backendType: 'tmux', cliId: 'claude-code' });
@@ -209,7 +216,7 @@ describe('migrateMojoSessionIdentities', () => {
         session, larkAppId: APP_ID,
       } as never);
     }
-    pool.migrateMojoSessionIdentities(activeSessions as never);
+    (await loadPool()).migrateMojoSessionIdentities(activeSessions as never);
 
     expect(a.mojoIdentity).toEqual({ cloud: true, workspaceId: 'ws-a' });
     // The one with a lineage is quarantined, not silently adopted.
@@ -217,5 +224,79 @@ describe('migrateMojoSessionIdentities', () => {
     expect(b.riffParentTaskId).toBeUndefined();
     // Non-mojo untouched.
     expect(c.mojoIdentity).toBeUndefined();
+  });
+});
+
+describe('quarantine is bound to an ID, not to the session', () => {
+  it('marks a NEW lineage usable even though an old one is parked', async () => {
+    // Once an identity is frozen, anything created afterwards was created on that
+    // known control plane. Treating the session as permanently quarantined meant
+    // the new session could never be cancelled after its worker died — it kept
+    // consuming cloud sandbox time and holding credentials.
+    const { store, loadPool } = await boot({ cloud: true, baseUrl: 'https://tenant-b.example.com' });
+    const session = seed(store, {
+      mojoIdentity: { cloud: true, baseUrl: 'https://tenant-b.example.com' },
+      mojoQuarantinedLineage: 'old-on-unknown-tenant',
+      riffParentTaskId: 'new-on-frozen-tenant-b',
+    });
+
+    const ds = { session, larkAppId: APP_ID } as never;
+    const resolved = (await loadPool()).sessionMojoConfig(ds, { mojo: { cloud: true } }, { freeze: false });
+
+    // The decision the workerless /close path gates on.
+    expect(resolved.lineage).toBe('usable');
+  });
+
+  it('marks the parked ID itself quarantined', async () => {
+    const { store, loadPool } = await boot({ cloud: true });
+    const session = seed(store, {
+      mojoIdentity: { cloud: true },
+      mojoQuarantinedLineage: 'parked-id',
+      riffParentTaskId: 'parked-id',
+    });
+    const ds = { session, larkAppId: APP_ID } as never;
+    expect((await loadPool()).sessionMojoConfig(ds, { mojo: { cloud: true } }, { freeze: false }).lineage)
+      .toBe('quarantined');
+  });
+
+  it("reports 'none' when there is no lineage at all", async () => {
+    const { store, loadPool } = await boot({ cloud: true });
+    const session = seed(store, { mojoIdentity: { cloud: true } });
+    const ds = { session, larkAppId: APP_ID } as never;
+    expect((await loadPool()).sessionMojoConfig(ds, { mojo: { cloud: true } }, { freeze: false }).lineage)
+      .toBe('none');
+  });
+
+  it('re-freezing does not re-park an already-quarantined row', async () => {
+    const { store, identity } = await boot({ cloud: true });
+    const session = seed(store, {
+      mojoIdentity: { cloud: true },
+      mojoQuarantinedLineage: 'parked-id',
+      riffParentTaskId: 'fresh-id',
+    });
+    identity.freezeMojoIdentityForSession(session, APP_ID);
+    // Already frozen → untouched, so the fresh lineage survives.
+    expect(session.riffParentTaskId).toBe('fresh-id');
+    expect(session.mojoQuarantinedLineage).toBe('parked-id');
+  });
+
+  it('flags a user-visible notice when it parks a lineage', async () => {
+    // A log line alone left the user unaware their context was parked.
+    const { store, identity } = await boot({ cloud: true });
+    const session = seed(store, { riffParentTaskId: 'legacy-lineage' });
+    identity.freezeMojoIdentityForSession(session, APP_ID);
+
+    expect(session.mojoQuarantineNoticePending).toBe(true);
+    // Durable, so a restart cannot swallow the notice.
+    const reread = await boot();
+    const reloaded = reread.store.listSessions().find(s => s.sessionId === session.sessionId);
+    expect(reloaded!.mojoQuarantineNoticePending).toBe(true);
+  });
+
+  it('does not flag a notice when there was nothing to park', async () => {
+    const { store, identity } = await boot({ cloud: true });
+    const session = seed(store);
+    identity.freezeMojoIdentityForSession(session, APP_ID);
+    expect(session.mojoQuarantineNoticePending).toBeUndefined();
   });
 });

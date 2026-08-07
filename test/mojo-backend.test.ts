@@ -252,11 +252,11 @@ describe('MojoBackend NDJSON framing', () => {
 });
 
 describe('MojoBackend.applyLivePatch', () => {
-  /** Records X_JWT_TOKEN for EVERY invocation, so turn 2 can be compared to turn 1. */
+  /** Records X_JWT_TOKEN for EVERY invocation, so turns can be compared. */
   function jwtRecordingMojo(dumpPath: string): string {
     const p = join(binDir, 'mojo');
     writeFileSync(p, `#!/usr/bin/env bash
-echo "$X_JWT_TOKEN" >> ${dumpPath}
+echo "[$X_JWT_TOKEN]" >> ${dumpPath}
 echo '{"type":"system","subtype":"init","session_id":"sid-jwt"}'
 echo '{"type":"result","status":"ok","result":"ok","session_id":"sid-jwt","warnings":[]}'
 `);
@@ -264,42 +264,117 @@ echo '{"type":"result","status":"ok","result":"ok","session_id":"sid-jwt","warni
     return p;
   }
 
-  it('a rotated JWT reaches the NEXT turn without a refork', async () => {
-    // The bug: config was read once at worker init, so every later per-turn
-    // invocation kept using the original token — a rotated credential never took
-    // effect, contradicting the "credentials stay live" contract.
-    const dump = join(binDir, 'jwts.txt');
-    const bin = jwtRecordingMojo(dump);
-    const backend = new MojoBackend({ bin, jwt: 'original-token' }, 'session-jwt');
-
-    const turn = () => new Promise<void>((resolveTurn) => {
-      backend.onTaskDone(() => resolveTurn());
+  /** Drive N turns, applying a patch between each. */
+  async function turns(
+    backend: MojoBackend,
+    patches: Array<{ jwt?: string | null } | undefined>,
+    spawnEnv: Record<string, string> = {},
+  ): Promise<void> {
+    const one = () => new Promise<void>((done) => {
+      backend.onTaskDone(() => done());
       backend.write('hi');
     });
+    // Explicit env: this host has an ambient X_JWT_TOKEN, and buildEnv falls back
+    // to it by design ("cleared" means "use the host login"). Passing a clean env
+    // isolates what the PATCH did from what the host provides.
+    backend.spawn('', [], { env: spawnEnv } as never);
+    for (const patch of patches) {
+      if (patch) backend.applyLivePatch(patch);
+      await one();
+    }
+  }
 
-    backend.spawn('', [], {} as never);
-    await turn();
-    backend.applyLivePatch({ jwt: 'rotated-token' });
-    await turn();
+  function seen(dumpPath: string): string[] {
+    return readFileSync(dumpPath, 'utf-8').trim().split('\n');
+  }
 
-    const seen = readFileSync(dump, 'utf-8').trim().split('\n');
-    expect(seen).toEqual(['original-token', 'rotated-token']);
+  it('rotates A → B on the next turn without a refork', async () => {
+    const dump = join(binDir, 'rotate.txt');
+    const bin = jwtRecordingMojo(dump);
+    const backend = new MojoBackend({ bin, jwt: 'A' }, 's');
+    await turns(backend, [undefined, { jwt: 'B' }]);
+    expect(seen(dump)).toEqual(['[A]', '[B]']);
   }, 30_000);
 
-  it('ignores control-plane keys in a patch', () => {
-    // A patch must never become the escape hatch for the frozen control plane.
-    const backend = new MojoBackend({ cloud: true, baseUrl: 'https://tenant-a.example.com' }, 's');
-    backend.applyLivePatch({ jwt: 'x', ...{ baseUrl: 'https://tenant-b.example.com', cloud: false } } as never);
+  it('rolls back B → A (the daemon cannot diff against its init snapshot)', async () => {
+    // Comparing the live config to the INIT snapshot made this look like "no
+    // change", leaving the backend on B indefinitely.
+    const dump = join(binDir, 'rollback.txt');
+    const bin = jwtRecordingMojo(dump);
+    const backend = new MojoBackend({ bin, jwt: 'A' }, 's');
+    await turns(backend, [undefined, { jwt: 'B' }, { jwt: 'A' }]);
+    expect(seen(dump)).toEqual(['[A]', '[B]', '[A]']);
+  }, 40_000);
+
+  it('CLEARS the credential on a null tombstone', async () => {
+    // Deleting mojo.jwt used to leave the old token alive for the worker's whole
+    // lifetime, because both the picker and the applier skipped `undefined`.
+    const dump = join(binDir, 'clear.txt');
+    const bin = jwtRecordingMojo(dump);
+    const backend = new MojoBackend({ bin, jwt: 'A' }, 's');
+    await turns(backend, [undefined, { jwt: null }]);
+    expect(seen(dump)).toEqual(['[A]', '[]']);
+  }, 30_000);
+
+  it('after clearing, falls back to the host login rather than nothing', async () => {
+    // "Cleared" means "stop overriding", not "block auth" — buildEnv reads the
+    // ambient value from the env the worker supplied. Asserted explicitly so the
+    // clear case above is not misread as "auth is disabled".
+    const dump = join(binDir, 'clear-fallback.txt');
+    const bin = jwtRecordingMojo(dump);
+    const backend = new MojoBackend({ bin, jwt: 'A' }, 's');
+    await turns(backend, [undefined, { jwt: null }], { X_JWT_TOKEN: 'host-login' });
+    expect(seen(dump)).toEqual(['[A]', '[host-login]']);
+  }, 30_000);
+
+  it('ignores an undefined jwt (the daemon had nothing to say)', async () => {
+    const dump = join(binDir, 'noop.txt');
+    const bin = jwtRecordingMojo(dump);
+    const backend = new MojoBackend({ bin, jwt: 'A' }, 's');
+    await turns(backend, [undefined, {}]);
+    expect(seen(dump)).toEqual(['[A]', '[A]']);
+  }, 30_000);
+
+  it('reports its own state so the daemon can diff against reality', () => {
+    const backend = new MojoBackend({ jwt: 'A' }, 's');
+    expect(backend.livePatchState()).toEqual({ jwt: 'A' });
+    backend.applyLivePatch({ jwt: null });
+    expect(backend.livePatchState()).toEqual({ jwt: null });
+  });
+
+  it('cannot be used to change the control plane or the launcher', () => {
+    const backend = new MojoBackend(
+      { cloud: true, baseUrl: 'https://tenant-a.example.com', bin: '/frozen/mojo' },
+      's',
+    );
+    backend.applyLivePatch({
+      jwt: 'x',
+      ...{ baseUrl: 'https://tenant-b.example.com', cloud: false, bin: '/evil/mojo', env: { PATH: '/evil' } },
+    } as never);
     const cfg = (backend as unknown as { config: Record<string, unknown> }).config;
     expect(cfg.baseUrl).toBe('https://tenant-a.example.com');
     expect(cfg.cloud).toBe(true);
+    expect(cfg.bin).toBe('/frozen/mojo');
+    expect(cfg.env).toBeUndefined();
     expect(cfg.jwt).toBe('x');
   });
 
-  it('is a no-op when nothing actually changed', () => {
-    const backend = new MojoBackend({ jwt: 'same' }, 's');
-    const before = { ...(backend as unknown as { config: Record<string, unknown> }).config };
-    backend.applyLivePatch({ jwt: 'same' });
-    expect((backend as unknown as { config: Record<string, unknown> }).config).toEqual(before);
-  });
+  it('pins the binary once, so a later PATH change cannot swap it', async () => {
+    // Belt and braces: env is no longer patchable, but the binary was previously
+    // re-resolved from PATH on every turn.
+    const dump = join(binDir, 'pin.txt');
+    jwtRecordingMojo(dump);
+    const backend = new MojoBackend({}, 's');
+    const pathBefore = process.env.PATH;
+    process.env.PATH = `${binDir}:${pathBefore ?? ''}`;
+    try {
+      backend.spawn('', [], {} as never);
+      const first = (backend as unknown as { resolveBin(): string }).resolveBin();
+      // Point PATH somewhere else entirely.
+      process.env.PATH = '/nonexistent';
+      expect((backend as unknown as { resolveBin(): string }).resolveBin()).toBe(first);
+    } finally {
+      process.env.PATH = pathBefore;
+    }
+  }, 30_000);
 });

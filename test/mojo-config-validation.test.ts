@@ -321,41 +321,74 @@ describe('reserved CLI flags', () => {
 });
 
 describe('live credential patch', () => {
-  it('carries credentials and behaviour knobs, never the control plane', () => {
-    expect([...MOJO_LIVE_PATCH_KEYS]).toEqual([
-      'jwt', 'jwtEnv', 'env', 'stream', 'systemPrompt', 'idleTimeoutSec',
-    ]);
+  it('carries ONLY the jwt — never env, and never the control plane', () => {
+    // An arbitrary `env` patch is equivalent to replacing the launcher: with no
+    // cliPathOverride the backend spawns the bare name `mojo`, so a live
+    // `PATH` (or NODE_OPTIONS / LD_PRELOAD / DYLD_*) change executes a different
+    // binary on the next turn. Enumerating dangerous variables cannot be complete,
+    // so env is not patchable at all.
+    expect([...MOJO_LIVE_PATCH_KEYS]).toEqual(['jwt']);
+    expect([...MOJO_LIVE_PATCH_KEYS]).not.toContain('env');
     for (const identityKey of MOJO_IDENTITY_KEYS) {
       expect([...MOJO_LIVE_PATCH_KEYS], `${identityKey} must stay frozen`)
         .not.toContain(identityKey);
     }
   });
 
-  it('extracts only the live subset', () => {
-    expect(pickMojoLivePatch({
-      jwt: 'token', env: { A: 'b' }, cloud: true, baseUrl: 'https://x.example.com',
-    })).toEqual({ jwt: 'token', env: { A: 'b' } });
+  it('resolves a literal jwt', () => {
+    expect(pickMojoLivePatch({ jwt: 'literal-token' }, { ambientEnv: {} }))
+      .toEqual({ jwt: 'literal-token' });
   });
 
-  it('detects a rotated JWT as a real change', () => {
-    expect(mojoLivePatchDiffers({ jwt: 'old' }, { jwt: 'new' })).toBe(true);
-    expect(mojoLivePatchDiffers({ jwt: 'same' }, { jwt: 'same' })).toBe(false);
+  it('resolves jwtEnv across mojo.env → per-bot env → ambient, in that order', () => {
+    const cfg = { jwtEnv: 'MY_JWT' };
+    expect(pickMojoLivePatch({ ...cfg, env: { MY_JWT: 'from-mojo-env' } }, {
+      genericEnv: { MY_JWT: 'from-generic' },
+      ambientEnv: { MY_JWT: 'from-ambient' },
+    })).toEqual({ jwt: 'from-mojo-env' });
+
+    expect(pickMojoLivePatch(cfg, {
+      genericEnv: { MY_JWT: 'from-generic' },
+      ambientEnv: { MY_JWT: 'from-ambient' },
+    })).toEqual({ jwt: 'from-generic' });
+
+    expect(pickMojoLivePatch(cfg, { ambientEnv: { MY_JWT: 'from-ambient' } }))
+      .toEqual({ jwt: 'from-ambient' });
   });
 
-  it('compares env by value, not by reference', () => {
-    // A fresh object with identical contents must not look like a change, or every
-    // turn would carry a redundant patch.
-    expect(mojoLivePatchDiffers({ env: { A: 'b' } }, { env: { A: 'b' } })).toBe(false);
-    expect(mojoLivePatchDiffers({ env: { A: 'b' } }, { env: { A: 'c' } })).toBe(true);
-    expect(mojoLivePatchDiffers({}, { env: {} })).toBe(false);
+  it('defaults to X_JWT_TOKEN when jwtEnv is unset', () => {
+    expect(pickMojoLivePatch({}, { ambientEnv: { X_JWT_TOKEN: 'ambient' } }))
+      .toEqual({ jwt: 'ambient' });
   });
 
-  it('does not report a control-plane change as a live change', () => {
-    // Changing the endpoint must NOT be delivered to a live session — it is
-    // frozen, and a patch is not the escape hatch.
-    expect(mojoLivePatchDiffers(
-      { baseUrl: 'https://tenant-a.example.com' },
-      pickMojoLivePatch({ baseUrl: 'https://tenant-b.example.com' }),
-    )).toBe(false);
+  it('emits an explicit null tombstone when there is no credential', () => {
+    // `undefined` would be omitted from the payload and could never express
+    // "cleared", which is how a deleted mojo.jwt used to linger on the backend.
+    const patch = pickMojoLivePatch({}, { ambientEnv: {} });
+    expect(patch).toEqual({ jwt: null });
+    expect('jwt' in patch).toBe(true);
+  });
+
+  it('never ships an env map, even when mojo.env holds unrelated keys', () => {
+    const patch = pickMojoLivePatch(
+      { jwt: 't', env: { PATH: '/evil/bin', LD_PRELOAD: '/evil/x.so' } },
+      { ambientEnv: {} },
+    );
+    expect(patch).toEqual({ jwt: 't' });
+    expect(JSON.stringify(patch)).not.toContain('/evil');
+  });
+
+  it('diffs against the BACKEND state, so a rollback is detected', () => {
+    // The daemon cannot know which patches a live worker already applied, so
+    // comparing against the init snapshot missed `A → B → A`.
+    expect(mojoLivePatchDiffers({ jwt: 'B' }, { jwt: 'A' })).toBe(true);
+    expect(mojoLivePatchDiffers({ jwt: 'A' }, { jwt: 'A' })).toBe(false);
+  });
+
+  it('treats a clear as a real change', () => {
+    expect(mojoLivePatchDiffers({ jwt: 'A' }, { jwt: null })).toBe(true);
+    expect(mojoLivePatchDiffers({ jwt: null }, { jwt: null })).toBe(false);
+    expect(mojoLivePatchDiffers(undefined, { jwt: null })).toBe(false);
+    expect(mojoLivePatchDiffers(undefined, { jwt: 'A' })).toBe(true);
   });
 });
