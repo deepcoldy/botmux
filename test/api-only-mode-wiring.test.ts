@@ -184,9 +184,18 @@ describe('API-only bot mode — bot-level primitive boundary (source lock)', () 
     expect(block).toContain("assertLarkTransport(larkAppId, 'downloadMessageResource')");
   });
 
-  it('worker-pool suppresses ALL aux UI for no-transport sessions at managedAuxUiSuppressed', () => {
-    const block = region(workerPoolSource, 'const managedAuxUiSuppressed =', 'const managedFinalOutputSuppressed');
-    expect(block).toContain('larkTransportEnabled({ chatId: ds.chatId, apiOnly: getBot(ds.larkAppId).config.apiOnly })');
+  it('worker-pool suppresses ALL aux UI for no-transport sessions at auxUiSuppressedFor', () => {
+    // The check moved out of the `managedAuxUiSuppressed` closure into the shared
+    // auxUiSuppressedFor() so the mojo quarantine notice could not drift from this
+    // policy. The closure now just delegates, so lock BOTH: the delegation and the
+    // no-transport gate in its new home.
+    const closure = region(workerPoolSource, 'const managedAuxUiSuppressed =', 'const managedFinalOutputSuppressed');
+    expect(closure).toContain('auxUiSuppressedFor(ds, turnId, dispatchAttempt)');
+    const shared = region(workerPoolSource, 'export function auxUiSuppressedFor(', 'isSilentScheduledTurn');
+    expect(shared).toContain('larkTransportEnabled({');
+    expect(shared).toContain('apiOnly: getBot(ds.larkAppId).config.apiOnly,');
+    // Fail CLOSED if the bot is gone, so a deregistered bot cannot leak aux UI.
+    expect(shared).toContain('return true;');
   });
 
   it('scheduleCardPatch is a defense-in-depth no-op for no-transport sessions', () => {
