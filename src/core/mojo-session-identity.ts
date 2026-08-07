@@ -28,6 +28,21 @@ import { pickMojoSessionIdentity, type MojoConfig } from '../adapters/backend/mo
 export function freezeMojoIdentityForSession(session: Session, larkAppId: string): void {
   const backendType = session.backendType;
   if (backendType !== 'mojo') return;
+
+  // BACKFILL, before the early return below. A row quarantined by an earlier
+  // build already has an identity, so it would return here and never get the
+  // notice flag — the user would never learn their context was parked. Runs as
+  // its own step so it is independent of whether a freeze is needed.
+  if (session.mojoQuarantinedLineage
+      && session.mojoQuarantineNoticePending === undefined) {
+    session.mojoQuarantineNoticePending = true;
+    sessionStore.updateSession(session);
+    logger.info(
+      `[mojo] session ${session.sessionId} was quarantined by an earlier build; `
+      + 'queued the user-visible notice',
+    );
+  }
+
   if (session.mojoIdentity) return;
 
   let liveMojo: MojoConfig | undefined;
@@ -39,8 +54,25 @@ export function freezeMojoIdentityForSession(session: Session, larkAppId: string
     return;
   }
 
-  const lineage = session.riffParentTaskId ?? session.mojoQuarantinedLineage;
+  // Only reached for an UNFROZEN row, where any lineage is unverifiable by
+  // definition. Prefer the active slot; if a stale parked id is also present and
+  // differs, keep both rather than silently overwriting an audit record.
+  const active = session.riffParentTaskId;
+  const alreadyParked = session.mojoQuarantinedLineage;
+  const lineage = active ?? alreadyParked;
   if (lineage) {
+    if (active && alreadyParked && active !== alreadyParked) {
+      logger.warn(
+        `[mojo] session ${session.sessionId} carries two unverifiable lineages `
+        + `(active + previously parked); parking both for manual cleanup.`,
+      );
+      session.mojoQuarantinedLineage = `${alreadyParked},${active}`;
+      session.riffParentTaskId = undefined;
+      session.mojoQuarantineNoticePending = true;
+      session.mojoIdentity = pickMojoSessionIdentity(liveMojo);
+      sessionStore.updateSession(session);
+      return;
+    }
     // Unverifiable: created before the identity existed, so nothing records which
     // control plane holds it. Park it instead of deleting — the id is the only
     // handle left for manual inspection/cleanup, and the user can be told.

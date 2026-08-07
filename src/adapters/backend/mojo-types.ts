@@ -496,20 +496,42 @@ export function pickMojoLivePatch(
 }
 
 /**
- * True when the snapshot differs from what the backend currently holds.
+ * Validate a live patch arriving over IPC.
  *
- * Compares against the BACKEND's current value, never against the init snapshot:
- * the daemon does not know which patches a live worker has already applied, so
- * `init A → patch B → config rolled back to A` looked like "no change" and left
- * the backend on B.
+ * Separate from normalizeMojoConfig on purpose: that one validates the USER's
+ * config block, where `jwt` must be a non-empty string. A live patch is a
+ * different shape — `null` is a meaningful tombstone — so reusing the config
+ * validator rejected every clear request and the backend never saw it.
  */
-export function mojoLivePatchDiffers(
-    current: { jwt?: string | null } | undefined,
-    patch: MojoLivePatch,
-): boolean {
-    const a = current?.jwt ?? null;
-    const b = patch.jwt ?? null;
-    return a !== b;
+export function normalizeMojoLivePatch(
+    raw: unknown,
+): { ok: true; value: MojoLivePatch } | { ok: false; errors: string[] } {
+    if (raw === undefined || raw === null) return { ok: true, value: {} };
+    if (typeof raw !== 'object' || Array.isArray(raw)) {
+        return { ok: false, errors: ['mojo live patch must be a JSON object'] };
+    }
+    const errors: string[] = [];
+    const value: MojoLivePatch = {};
+    for (const [key, val] of Object.entries(raw as Record<string, unknown>)) {
+        if (key !== 'jwt') {
+            // Deliberately strict: an `env` patch would be equivalent to replacing
+            // the launcher (see MOJO_LIVE_PATCH_KEYS), so anything beyond `jwt` is
+            // a bug or a stale payload, not something to accept quietly.
+            errors.push(`mojo live patch does not accept "${key}"`);
+            continue;
+        }
+        if (val === undefined) continue;
+        if (val === null) {
+            value.jwt = null;
+            continue;
+        }
+        if (typeof val !== 'string' || !val.trim()) {
+            errors.push('mojo live patch jwt must be a non-empty string or null');
+            continue;
+        }
+        value.jwt = val;
+    }
+    return errors.length > 0 ? { ok: false, errors } : { ok: true, value };
 }
 
 /** Outcome of validating a raw `mojo` config block. *//** Outcome of validating a raw `mojo` config block. */

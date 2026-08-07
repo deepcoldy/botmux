@@ -236,7 +236,7 @@ import {
   isValidRiffSandboxCluster,
   type RiffBackendConfig,
 } from './adapters/backend/riff-backend.js';
-import { buildEffectiveMojoConfig, findReservedMojoCliFlags, normalizeMojoConfig, pickMojoLivePatch, type EffectiveMojoConfig, type MojoLivePatch } from './adapters/backend/mojo-types.js';
+import { buildEffectiveMojoConfig, findReservedMojoCliFlags, normalizeMojoConfig, normalizeMojoLivePatch, type EffectiveMojoConfig, type MojoLivePatch } from './adapters/backend/mojo-types.js';
 import {
   prepareDirectSandbox,
   prepareCredentialOnlySandbox,
@@ -10064,14 +10064,16 @@ function applyMojoLivePatch(patch: MojoLivePatch | undefined): void {
   // CLI, and the capability check is what actually matters.
   const current = backend as (SessionBackend & { applyLivePatch?: (p: MojoLivePatch) => void }) | null;
   if (typeof current?.applyLivePatch !== 'function') return;
-  // Reuse the full validator: it rejects unknown keys, internal launch-identity
-  // keys and wrong types, so a patch can never widen into the control plane.
-  const validated = normalizeMojoConfig(patch);
+  // Patch-specific validator. The CONFIG validator was wrong here: it requires a
+  // non-empty `jwt` string, so it rejected every `null` tombstone and the backend
+  // never received a clear request — the credential stayed live for the worker's
+  // whole lifetime. This one accepts exactly `{ jwt: string | null }`.
+  const validated = normalizeMojoLivePatch(patch);
   if (!validated.ok) {
     log(`Ignoring invalid mojo live patch: ${validated.errors.join('; ')}`);
     return;
   }
-  current.applyLivePatch(pickMojoLivePatch(validated.value));
+  current.applyLivePatch(validated.value);
 }
 
 function killCli(opts: {

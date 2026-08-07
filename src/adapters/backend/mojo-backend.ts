@@ -46,6 +46,8 @@
  * ({code, message, retryable}), not a string.
  */
 import { spawn as spawnProcess, type ChildProcessByStdio } from 'node:child_process';
+import { accessSync, constants as fsConstants } from 'node:fs';
+import { delimiter, join } from 'node:path';
 import type { Readable } from 'node:stream';
 import { locateOnPath } from '../cli/registry.js';
 import { buildWrappedLaunch } from '../../setup/cli-selection.js';
@@ -153,6 +155,18 @@ export class MojoBackend implements SessionBackend {
     private wrapperResolved = false;
     /** Resolved once per session — see resolveBin. */
     private pinnedBin: string | null = null;
+    /**
+     * Live JWT, THREE states — the distinction is why a clear used to fail:
+     *   undefined → no live snapshot received; resolve from config/env as before
+     *   string    → use exactly this
+     *   null      → explicitly cleared; do NOT fall back to any config-layer env
+     *
+     * The daemon already folds the ambient fallback into the snapshot it sends, so
+     * `null` genuinely means "no credential from any config layer". Previously a
+     * clear only set `config.jwt = undefined`, and buildEnv then re-read `jwtEnv`
+     * out of the init-time `config.env` / `injectEnv`, reviving a stale token.
+     */
+    private liveJwt: string | null | undefined = undefined;
     /**
      * Generic CLI args the worker composed for this session (today: CLI_EXTRA_ARGS,
      * e.g. `--timeout 77`). The mojo adapter's buildArgs() returns [], so anything
@@ -262,14 +276,39 @@ export class MojoBackend implements SessionBackend {
         const configured = this.config.bin?.trim();
         if (configured) {
             this.pinnedBin = configured;
-        } else {
-            // Absolute path when resolvable; the bare name is a last resort so a
-            // PATH-only install still works.
-            const located = locateOnPath('mojo');
-            this.pinnedBin = located ?? 'mojo';
-            logger.info(`[mojo] pinned binary for this session: ${this.pinnedBin}`);
+            return this.pinnedBin;
         }
+        // Resolve against the EFFECTIVE child PATH, not the daemon's own.
+        // `locateOnPath` reads this process's env, which silently ignored a
+        // per-bot `PATH` — the child would then run a different binary than the
+        // one that was pinned, changing the documented semantics of per-bot env.
+        this.pinnedBin = this.locateOnEffectivePath('mojo') ?? 'mojo';
+        logger.info(`[mojo] pinned binary for this session: ${this.pinnedBin}`);
         return this.pinnedBin;
+    }
+
+    /**
+     * Find an executable using the PATH the CHILD will actually see.
+     *
+     * Layered exactly like buildEnv (worker env → per-bot injectEnv → mojo.env),
+     * so a per-bot PATH override takes effect. Falls back to the caller's own PATH
+     * when spawn() has not run (direct/unit use).
+     */
+    private locateOnEffectivePath(cmd: string): string | null {
+        const childPath = this.config.env?.PATH
+            ?? this.spawnOpts?.injectEnv?.PATH
+            ?? this.spawnOpts?.env?.PATH;
+        if (!childPath) return locateOnPath(cmd);
+        for (const dir of childPath.split(delimiter)) {
+            if (!dir) continue;
+            const candidate = join(dir, cmd);
+            try {
+                accessSync(candidate, fsConstants.X_OK);
+                return candidate;
+            } catch { /* not here */ }
+        }
+        // Not on the child's PATH — fall back so a normal install still works.
+        return locateOnPath(cmd);
     }
 
     /** Lazily resolve (and memoize) `config.wrapperCli` when spawn() never ran. */
@@ -282,7 +321,12 @@ export class MojoBackend implements SessionBackend {
             // cliArgs is [] on purpose: the mojo adapter bakes nothing into launch
             // args, so this yields the PREFIX only, and the per-turn args are
             // appended by resolveLaunch.
-            const launch = buildWrappedLaunch(wrapperCli, [], b => locateOnPath(b) ?? b);
+            // Same effective-PATH resolution as resolveBin: a per-bot PATH must
+            // decide the wrapper binary too, or the two disagree about which
+            // install is in use.
+            const launch = buildWrappedLaunch(
+                wrapperCli, [], b => this.locateOnEffectivePath(b) ?? b,
+            );
             if (!launch.bin) return null;
             this.launchPrefix = { bin: launch.bin, args: launch.args };
             logger.info(`[mojo] launch prefix resolved from config: ${launch.bin} ${launch.args.join(' ')}`);
@@ -333,18 +377,10 @@ export class MojoBackend implements SessionBackend {
      */
     applyLivePatch(patch: MojoLivePatch): void {
         if (patch.jwt === undefined) return;
-        const next = patch.jwt === null ? undefined : patch.jwt;
-        if (this.config.jwt === next) return;
-        // Reassigned rather than mutated so an in-flight turn keeps the config it
-        // started with.
-        this.config = { ...this.config, jwt: next };
+        if (this.liveJwt === patch.jwt) return;
+        this.liveJwt = patch.jwt;
         // Never log the value.
-        logger.info(`[mojo] live JWT ${next === undefined ? 'cleared' : 'rotated'}`);
-    }
-
-    /** Current live-patchable state, so the daemon can diff against reality. */
-    livePatchState(): { jwt?: string | null } {
-        return { jwt: this.config.jwt ?? null };
+        logger.info(`[mojo] live JWT ${patch.jwt === null ? 'cleared' : 'rotated'}`);
     }
 
     resize(_cols: number, _rows: number): void { /* no terminal to resize */ }
@@ -735,8 +771,18 @@ export class MojoBackend implements SessionBackend {
         // to process.env here would let the host's token override a per-bot one
         // and silently run the bot as the wrong identity.
         const jwtKey = this.config.jwtEnv ?? 'X_JWT_TOKEN';
-        const jwt = this.config.jwt ?? env[jwtKey];
-        if (jwt) env.X_JWT_TOKEN = jwt;
+        if (this.liveJwt !== undefined) {
+            // A live snapshot is authoritative and already includes the daemon's
+            // ambient fallback. `null` therefore means "no credential anywhere", so
+            // the inherited value must be REMOVED rather than left to stand in —
+            // otherwise deleting `mojo.jwt` / `jwtEnv` revived the stale token.
+            delete env[jwtKey];
+            delete env.X_JWT_TOKEN;
+            if (this.liveJwt !== null) env.X_JWT_TOKEN = this.liveJwt;
+        } else {
+            const jwt = this.config.jwt ?? env[jwtKey];
+            if (jwt) env.X_JWT_TOKEN = jwt;
+        }
 
         // ── Control plane: config is the ONLY source ──────────────────────────
         // Drop every inherited control-plane variable BEFORE re-deriving it. The

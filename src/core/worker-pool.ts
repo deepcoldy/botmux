@@ -4042,7 +4042,7 @@ export function sendWorkerInput(
     ...(mojoLivePatchForSession(ds) ?? {}),
   };
   // First moment with a reply context after a restore/resume-time quarantine.
-  deliverPendingMojoQuarantineNotice(ds);
+  deliverPendingMojoQuarantineNotice(ds, turnId);
   return sendWorkerSessionInput(ds, message);
 }
 
@@ -4080,37 +4080,83 @@ function mojoLivePatchForSession(ds: DaemonSession): { mojoLivePatch: MojoLivePa
 }
 
 /**
+ * Is auxiliary UI an authorized output channel for this session/turn?
+ *
+ * Mirrors the first three checks of setupWorkerHandlers' `managedAuxUiSuppressed`
+ * (which is a closure and unreachable from here). Deliberately conservative: a
+ * dedicated VC receiver, a silent scheduled turn, or a session with no real Lark
+ * transport must never receive a bypass message. Those cases still get the
+ * persisted quarantine state for dashboard/audit — the notice is only about the
+ * chat channel.
+ */
+export function mojoAuxNoticeAllowed(ds: DaemonSession, turnId?: string): boolean {
+  try {
+    if (!larkTransportEnabled({
+      chatId: ds.chatId,
+      apiOnly: getBot(ds.larkAppId).config.apiOnly,
+    })) return false;
+  } catch {
+    return false;
+  }
+  if (isSilentScheduledTurn(ds, turnId)) return false;
+  if (ds.session.vcMeetingReceiver) return false;
+  return true;
+}
+
+/**
  * Deliver the one-time notice that a mojo session's earlier remote lineage was
  * parked, then clear the flag.
  *
  * Quarantining happens during restore/resume where there is no reply context, so
- * the notice is deferred to the next turn — the first moment there is somewhere to
- * put it. Cleared before sending so a delivery failure cannot loop.
+ * the notice is deferred to the first ACCEPTED turn — hot send and cold fork both
+ * call this, since a cold-resumed session goes straight to forkWorker and would
+ * otherwise never deliver it.
+ *
+ * The flag is cleared only AFTER a successful send, so a transient Lark failure
+ * retries on the next turn instead of losing the notice permanently. For a
+ * suppressed channel (VC receiver / silent turn / no transport) the flag is
+ * cleared too: the state is already persisted on the session for dashboard/audit,
+ * and holding the flag forever would retry on every future turn.
  */
-function deliverPendingMojoQuarantineNotice(ds: DaemonSession): void {
+function deliverPendingMojoQuarantineNotice(ds: DaemonSession, turnId?: string): void {
   if (!ds.session.mojoQuarantineNoticePending) return;
   const lineage = ds.session.mojoQuarantinedLineage;
-  ds.session.mojoQuarantineNoticePending = undefined;
-  sessionStore.updateSession(ds.session);
-  if (!lineage) return;
+  if (!lineage) {
+    ds.session.mojoQuarantineNoticePending = undefined;
+    sessionStore.updateSession(ds.session);
+    return;
+  }
   let botCfg;
   try {
     botCfg = getBot(ds.larkAppId).config;
   } catch {
+    return; // Bot deregistered — retry once it is back.
+  }
+  const clearFlag = (): void => {
+    ds.session.mojoQuarantineNoticePending = undefined;
+    sessionStore.updateSession(ds.session);
+  };
+  if (!mojoAuxNoticeAllowed(ds, turnId)) {
+    logger.info(
+      `[${tag(ds)}] mojo quarantine notice kept out of auxiliary Lark UI `
+      + '(VC receiver / silent turn / no transport); state remains on the session',
+    );
+    clearFlag();
     return;
   }
-  const message = tr(
-    'worker.mojo_lineage_quarantined',
-    { lineage },
-    botLocale(botCfg),
-  );
+  const message = tr('worker.mojo_lineage_quarantined', { lineage }, botLocale(botCfg));
   void callbacks?.sessionReply(
     sessionAnchorId(ds),
     message,
     'text',
     ds.larkAppId,
-    ds.currentReplyTarget?.turnId,
-  ).catch(err => logger.warn(`[${tag(ds)}] failed to deliver mojo quarantine notice: ${err}`));
+    // The turn that actually carried this delivery, not a stale reply target.
+    turnId,
+    ds.session.vcMeetingReceiver ? { sourceSessionId: ds.session.sessionId } : undefined,
+  ).then(clearFlag).catch((err) => {
+    // Flag intentionally left set: the next turn retries.
+    logger.warn(`[${tag(ds)}] failed to deliver mojo quarantine notice (will retry): ${err}`);
+  });
 }
 
 export function forkWorker(
@@ -4585,6 +4631,10 @@ export function forkWorker(
   }
   worker.send(initMsg);
   ds.initConfig = initMsg;
+  // Cold-resume path: a workerless session goes straight here without passing
+  // through sendWorkerInput, so without this the "notice on the next message"
+  // promise was never kept for exactly the sessions most likely to need it.
+  deliverPendingMojoQuarantineNotice(ds, initAttributionTurnId);
 
   // Stamp cliId on the persisted session so the dashboard can show a CLI badge
   // even after the session is closed. Do this before installing worker handlers:
