@@ -11787,6 +11787,61 @@ function sendAndFlush(msg: WorkerToDaemon): Promise<void> {
   });
 }
 
+/** Flush budget, carved out of the daemon's 2s post-suspend SIGTERM backstop
+ *  (WORKER_SIGTERM_BACKSTOP_MS in worker-pool.ts) so the destroySession +
+ *  cleanup that follow still have room inside it. Waiting unbounded would not
+ *  buy a stronger guarantee — that same SIGTERM lands at 2s either way — it
+ *  would only spend the whole budget here and get killed BEFORE the backing
+ *  tmux session and CLI are destroyed, leaving the memory this suspend exists
+ *  to reclaim. */
+const SUSPEND_OUTPUT_FLUSH_MS = 500;
+
+/** Get this turn's reply out before a suspend tears the worker down.
+ *
+ *  `final_output` is transcript-driven (bridge fs.watch + 1s poller) while the
+ *  idle `screen_update` that triggers a suspend comes from the screen analyzer
+ *  — two independent producers with no ordering guarantee. So at suspend time
+ *  the just-finished reply may still be sitting in a bridge queue, and the
+ *  handler's own teardown would destroy it twice over: stopBridgeWatcher()
+ *  calls clearPending(), and process.exit(0) drops IPC that process.send() has
+ *  only queued. That is the same "reply gets cut off" bug deferred suspend
+ *  exists to remove, re-entered from the other side — and it applies equally to
+ *  the two pre-existing idle-based suspend paths (idle-worker-sweeper and
+ *  host_overload_sweep).
+ *
+ *  Drain both bridges (same pairing as drainReliableTerminalBeforeInterrupt,
+ *  minus its reliable-terminal gate — draining here only publishes what the
+ *  next poller tick would have), then use a trailing acknowledged send as a
+ *  write barrier: process.send is FIFO, so its callback firing means the
+ *  final_output writes ahead of it already made it onto the channel.
+ *
+ *  Best-effort, not a guarantee: the wait is bounded (see
+ *  SUSPEND_OUTPUT_FLUSH_MS), so under enough IPC back-pressure the barrier can
+ *  time out with writes still queued and the exit will drop them. That is a far
+ *  smaller window than the unflushed status quo, and the bound is what keeps the
+ *  teardown below inside the daemon's kill backstop — but callers must not read
+ *  this as "the reply always survives". */
+async function flushBridgeOutputBeforeSuspend(): Promise<void> {
+  try { bridgeDrainAndMaybeEmit(); } catch (err: any) {
+    log(`Suspend bridge drain failed: ${err.message}`);
+  }
+  try { codexBridgeDrainAndMaybeEmit({ signalIdle: false }); } catch (err: any) {
+    log(`Suspend codex bridge drain failed: ${err.message}`);
+  }
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([
+      sendAndFlush({ type: 'suspend_ready', sessionId }),
+      new Promise<void>((resolve) => {
+        timeout = setTimeout(resolve, SUSPEND_OUTPUT_FLUSH_MS);
+        timeout.unref?.();
+      }),
+    ]);
+  } finally {
+    if (timeout) clearTimeout(timeout);
+  }
+}
+
 const TRANSFER_DETACH_ACK_FLUSH_MS = 250;
 
 /** Best-effort terminal ACK for transfer. Backend detach has already happened,
@@ -12919,6 +12974,10 @@ process.on('message', async (raw: unknown) => {
     case 'suspend': {
       log('Suspend requested');
       stopScreenshotLoop();
+      // Publish this turn's reply while the CLI (and its transcript) are still
+      // intact — everything below either clears the bridge queue or exits the
+      // process. See flushBridgeOutputBeforeSuspend.
+      await flushBridgeOutputBeforeSuspend();
       stopBridgeWatcher();
       // A parked crash diagnostic shell has backend===null, so the
       // destroySession/kill below is a no-op and would otherwise leak the
