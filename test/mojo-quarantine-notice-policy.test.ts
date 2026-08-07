@@ -28,12 +28,18 @@ vi.mock('../src/core/silent-schedule-turns.js', () => ({
   isSilentScheduledTurn: (_ds: unknown, turnId?: string) => turnId === 'silent-turn',
 }));
 
-import { mojoAuxNoticeAllowed } from '../src/core/worker-pool.js';
+import { auxUiSuppressedFor } from '../src/core/worker-pool.js';
 
-function ds(opts: { larkAppId?: string; chatId?: string; vcReceiver?: boolean }): never {
+function ds(opts: {
+  larkAppId?: string;
+  chatId?: string;
+  vcReceiver?: boolean;
+  suppressedTurns?: Map<string, number>;
+}): never {
   return {
     larkAppId: opts.larkAppId ?? 'app_ok',
     chatId: opts.chatId ?? 'oc_real_chat',
+    ...(opts.suppressedTurns ? { suppressedFinalOutputTurns: opts.suppressedTurns } : {}),
     session: {
       sessionId: 'sid-x',
       ...(opts.vcReceiver ? { vcMeetingReceiver: { some: 'receiver' } } : {}),
@@ -41,30 +47,51 @@ function ds(opts: { larkAppId?: string; chatId?: string; vcReceiver?: boolean })
   } as never;
 }
 
-describe('mojoAuxNoticeAllowed', () => {
+describe('auxUiSuppressedFor', () => {
   it('allows an ordinary IM session', () => {
-    expect(mojoAuxNoticeAllowed(ds({}), 'turn-1')).toBe(true);
+    expect(auxUiSuppressedFor(ds({}), 'turn-1')).toBe(false);
   });
 
   it('suppresses a dedicated VC receiver', () => {
     // Auxiliary UI is never an authorized channel there.
-    expect(mojoAuxNoticeAllowed(ds({ vcReceiver: true }), 'turn-1')).toBe(false);
+    expect(auxUiSuppressedFor(ds({ vcReceiver: true }), 'turn-1')).toBe(true);
   });
 
   it('suppresses a silent scheduled turn', () => {
-    expect(mojoAuxNoticeAllowed(ds({}), 'silent-turn')).toBe(false);
+    expect(auxUiSuppressedFor(ds({}), 'silent-turn')).toBe(true);
   });
 
   it('suppresses a no-transport (apiOnly) bot', () => {
-    expect(mojoAuxNoticeAllowed(ds({ larkAppId: 'app_api_only' }), 'turn-1')).toBe(false);
+    expect(auxUiSuppressedFor(ds({ larkAppId: 'app_api_only' }), 'turn-1')).toBe(true);
   });
 
   it('suppresses an HTTP virtual chat', () => {
-    expect(mojoAuxNoticeAllowed(ds({ chatId: 'http_async_abc' }), 'turn-1')).toBe(false);
-    expect(mojoAuxNoticeAllowed(ds({ chatId: 'http_wait_abc' }), 'turn-1')).toBe(false);
+    expect(auxUiSuppressedFor(ds({ chatId: 'http_async_abc' }), 'turn-1')).toBe(true);
+    expect(auxUiSuppressedFor(ds({ chatId: 'http_wait_abc' }), 'turn-1')).toBe(true);
   });
 
   it('fails closed when the bot is deregistered', () => {
-    expect(mojoAuxNoticeAllowed(ds({ larkAppId: 'app_missing' }), 'turn-1')).toBe(false);
+    expect(auxUiSuppressedFor(ds({ larkAppId: 'app_missing' }), 'turn-1')).toBe(true);
+  });
+
+  it('suppresses a DURABLE-suppressed replay attempt', () => {
+    // The check the previous hand-copied gate dropped: an attempt at or below the
+    // armed watermark is a replay whose output already happened. A quarantine
+    // notice posted there is a duplicate on a ledger-suppressed turn.
+    const suppressed = new Map([['turn-d', 2]]);
+    expect(auxUiSuppressedFor(ds({ suppressedTurns: suppressed }), 'turn-d', 1)).toBe(true);
+    expect(auxUiSuppressedFor(ds({ suppressedTurns: suppressed }), 'turn-d', 2)).toBe(true);
+    // A LATER attempt is past the watermark and may output.
+    expect(auxUiSuppressedFor(ds({ suppressedTurns: suppressed }), 'turn-d', 3)).toBe(false);
+    // No dispatchAttempt at all = an ordinary IM turn, not a durable replay.
+    expect(auxUiSuppressedFor(ds({ suppressedTurns: suppressed }), 'turn-d')).toBe(false);
+  });
+
+  it('is the SAME function the worker-handler gate uses', () => {
+    // Regression guard for the root cause: the notice used to hand-copy three of
+    // four checks. If someone re-introduces a private copy, this import stops
+    // being the shared policy and the durable case above silently diverges again.
+    expect(typeof auxUiSuppressedFor).toBe('function');
+    expect(auxUiSuppressedFor.length).toBeGreaterThanOrEqual(2);
   });
 });

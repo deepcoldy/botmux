@@ -13,7 +13,7 @@
  *   7. On 'restart', kills CLI and re-spawns with --resume
  */
 import { randomBytes } from 'node:crypto';
-import { mkdirSync, writeFileSync, unlinkSync, rmdirSync, existsSync, statSync, lstatSync, readdirSync, readlinkSync, readFileSync, realpathSync, copyFileSync, watch as fsWatch, createWriteStream, openSync, closeSync, fstatSync, constants as fsConstants, type FSWatcher, type WriteStream } from 'node:fs';
+import { accessSync, mkdirSync, writeFileSync, unlinkSync, rmdirSync, existsSync, statSync, lstatSync, readdirSync, readlinkSync, readFileSync, realpathSync, copyFileSync, watch as fsWatch, createWriteStream, openSync, closeSync, fstatSync, constants as fsConstants, type FSWatcher, type WriteStream } from 'node:fs';
 import { atomicWriteFileSync } from './utils/atomic-write.js';
 import { join, basename, dirname, delimiter } from 'node:path';
 import { resolveBotmuxWrapperBinDir, prependBotmuxBin } from './core/botmux-wrapper.js';
@@ -6697,6 +6697,10 @@ async function flushPending(): Promise<void> {
     while (pendingMessages.length > 0 && backend && cliAdapter) {
       const item = freshnessInputQueue.takeNormal();
       if (!item) break;
+      // Apply the credential snapshot that arrived WITH this turn, immediately
+      // before the turn is written. Doing it at IPC-receive time collapsed two
+      // queued credential turns (A/B/C ran as A/C/C).
+      applyMojoLivePatch(item.mojoLivePatch);
       const durableWrite = item.dispatchAttempt !== undefined;
       const msg = item.content;
       const logicalMsg = item.logicalContent ?? msg;
@@ -6948,6 +6952,31 @@ async function flushPending(): Promise<void> {
   }
 }
 
+/**
+ * Find an executable using the PATH the CHILD will actually see.
+ *
+ * The layered env (worker env → per-bot `env`) is authoritative: when it names a
+ * PATH, that is the ONLY place searched, because falling back to the daemon's own
+ * PATH is exactly how an ambient install shadowed a per-bot one.
+ */
+function locateOnEffectiveChildPath(
+  cmd: string,
+  childEnvForPath: Record<string, string | undefined>,
+): string | null {
+  const childPath = childEnvForPath.PATH;
+  if (!childPath) return locateOnPath(cmd);
+  for (const dir of childPath.split(delimiter)) {
+    if (!dir) continue;
+    const candidate = join(dir, cmd);
+    try {
+      accessSync(candidate, fsConstants.X_OK);
+      return candidate;
+    } catch { /* not here */ }
+  }
+  // Explicit child PATH is authoritative — do NOT fall back to the ambient one.
+  return null;
+}
+
 function sendToPty(
   content: string,
   turnId?: string,
@@ -6955,12 +6984,15 @@ function sendToPty(
     codexAppInput?: CodexAppTurnInput;
     dispatchAttempt?: number;
     vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin;
+    /** mojo credential snapshot delivered with this turn; applied at write time. */
+    mojoLivePatch?: MojoLivePatch;
   } = {},
 ): boolean {
   if (!cliAdapter) return false;
   const next: PendingCliInput = {
     content,
     turnId,
+    ...(opts.mojoLivePatch ? { mojoLivePatch: opts.mojoLivePatch } : {}),
     ...(opts.codexAppInput ? { codexAppInput: opts.codexAppInput } : {}),
     ...(opts.dispatchAttempt !== undefined ? { dispatchAttempt: opts.dispatchAttempt } : {}),
     ...(opts.vcMeetingImTurnOrigin
@@ -9264,7 +9296,11 @@ async function spawnCli(
     if (sandboxRequested) {
       log(`wrapperCli="${cfg.wrapperCli}" ignored: file sandbox enabled and takes precedence (cannot combine launch prefix with the sandbox wrapper)`);
     } else {
-      const launch = buildWrappedLaunch(cfg.wrapperCli, spawnArgs, (b) => locateOnPath(b) ?? b, {
+      // Resolve wrapper binaries against the EFFECTIVE child PATH (per-bot env
+      // layered over the worker's), not the daemon's own. `locateOnPath` reads
+      // this process's env, so an ambient install shadowed a per-bot one and the
+      // child ran a different wrapper than the operator configured.
+      const launch = buildWrappedLaunch(cfg.wrapperCli, spawnArgs, (b) => locateOnEffectiveChildPath(b, { ...childEnv, ...perBotInjectEnv }) ?? b, {
         ttadkModel: cfg.model,
       });
       if (launch.bin) {
@@ -10047,6 +10083,11 @@ async function spawnCli(
   // adapters, so isPromptReady would otherwise stay false until the ~15s
   // fallback and every first message would be needlessly delayed.
   if (isRemoteBackendType(effectiveBackendType)) {
+    // BEFORE markPromptReady, which can flush a queued turn: a replacement
+    // backend is built from the original init config, so a rotated — or cleared —
+    // credential must be re-applied first or the queued turn runs against the
+    // revived token.
+    restoreMojoLivePatchAfterRespawn();
     markPromptReady();
   }
 }
@@ -10057,13 +10098,20 @@ async function spawnCli(
  * Validated first: the daemon is trusted, but this arrives over IPC and a stale
  * or malformed payload must not reach the backend. Non-mojo backends ignore it.
  */
+/**
+ * Last VALIDATED credential snapshot applied to a backend in this worker.
+ *
+ * Survives a backend replacement (`/restart`, crash respawn, lease-fenced
+ * restart), which is the only place it matters: a replacement backend is
+ * constructed from the ORIGINAL init config, so a credential that had since been
+ * rotated — or, worse, cleared — silently reverted. A queued clear turn then ran
+ * against the revived token. Restart IPC deliberately does NOT need to carry the
+ * snapshot; the worker already knows it.
+ */
+let lastAppliedMojoLivePatch: MojoLivePatch | undefined;
+
 function applyMojoLivePatch(patch: MojoLivePatch | undefined): void {
   if (!patch || effectiveBackendType !== 'mojo') return;
-  // Duck-typed rather than `instanceof`: importing MojoBackend as a value here
-  // would pull the backend module into the worker's eager import graph for every
-  // CLI, and the capability check is what actually matters.
-  const current = backend as (SessionBackend & { applyLivePatch?: (p: MojoLivePatch) => void }) | null;
-  if (typeof current?.applyLivePatch !== 'function') return;
   // Patch-specific validator. The CONFIG validator was wrong here: it requires a
   // non-empty `jwt` string, so it rejected every `null` tombstone and the backend
   // never received a clear request — the credential stayed live for the worker's
@@ -10073,7 +10121,33 @@ function applyMojoLivePatch(patch: MojoLivePatch | undefined): void {
     log(`Ignoring invalid mojo live patch: ${validated.errors.join('; ')}`);
     return;
   }
-  current.applyLivePatch(validated.value);
+  if (validated.value.jwt !== undefined) lastAppliedMojoLivePatch = validated.value;
+  pushMojoLivePatchToBackend(validated.value);
+}
+
+/** Hand an already-validated snapshot to the live backend, if it can take one. */
+function pushMojoLivePatchToBackend(patch: MojoLivePatch): void {
+  // Duck-typed rather than `instanceof`: importing MojoBackend as a value here
+  // would pull the backend module into the worker's eager import graph for every
+  // CLI, and the capability check is what actually matters.
+  const current = backend as (SessionBackend & { applyLivePatch?: (p: MojoLivePatch) => void }) | null;
+  if (typeof current?.applyLivePatch !== 'function') return;
+  current.applyLivePatch(patch);
+}
+
+/**
+ * Re-apply the remembered snapshot onto a freshly installed backend.
+ *
+ * Must run AFTER the replacement backend is installed and BEFORE any pending turn
+ * is flushed into it, or a queued clear would execute against the reverted
+ * credential.
+ */
+function restoreMojoLivePatchAfterRespawn(): void {
+  if (effectiveBackendType !== 'mojo') return;
+  const remembered = lastAppliedMojoLivePatch;
+  if (!remembered || remembered.jwt === undefined) return;
+  pushMojoLivePatchToBackend(remembered);
+  log(`Restored live mojo JWT state after backend replacement (${remembered.jwt === null ? 'cleared' : 'rotated'})`);
 }
 
 function killCli(opts: {
@@ -11886,10 +11960,10 @@ process.on('message', async (raw: unknown) => {
     }
 
     case 'message': {
-      // Rotate mojo credentials before the turn runs. The config is otherwise
-      // read once at init, so a rotated JWT never reached an existing session's
-      // per-turn CLI invocations. Control-plane fields are not part of the patch.
-      applyMojoLivePatch(msg.mojoLivePatch);
+      // NOTE: the mojo credential snapshot is deliberately NOT applied here. It
+      // rides on the queue item and is applied when THIS turn is actually written
+      // to the backend (see flushPending) — applying at receive time made two
+      // queued credential turns collapse to the newest value for both.
       const messageAdoptMode = lastInitConfig?.adoptMode === true;
       // Adopt IPC handlers can overlap. Delay their turn baseline until the
       // submission mutex is held so a queued message cannot steal attribution
@@ -12179,6 +12253,8 @@ process.on('message', async (raw: unknown) => {
           codexAppInput,
           dispatchAttempt: msg.dispatchAttempt,
           vcMeetingImTurnOrigin: msg.vcMeetingImTurnOrigin,
+          // Applied when THIS item is written, not on receipt.
+          ...(msg.mojoLivePatch ? { mojoLivePatch: msg.mojoLivePatch } : {}),
         });
         if (inputCommitted) acknowledgeTurnInputCommitted(msg.turnId);
       }

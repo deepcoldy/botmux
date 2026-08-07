@@ -344,3 +344,36 @@ describe('quarantine notice state matrix', () => {
     expect(session.mojoQuarantineNoticePending).toBe(true);
   });
 });
+
+describe('delivered notice is not re-queued after a reload', () => {
+  it('treats false as DELIVERED, distinct from undefined', async () => {
+    // Clearing to `undefined` on success made the restore migration read it as
+    // "old build, never notified" and queue the notice again after every restart.
+    const { store, identity } = await boot({ cloud: true });
+    const delivered = seed(store, {
+      mojoIdentity: { cloud: true },
+      mojoQuarantinedLineage: 'parked',
+      mojoQuarantineNoticePending: false,
+    });
+    identity.freezeMojoIdentityForSession(delivered, APP_ID);
+    expect(delivered.mojoQuarantineNoticePending).toBe(false);
+
+    // Survives a real store reload — this is the restart path.
+    const reread = await boot();
+    const reloaded = reread.store.listSessions().find(s => s.sessionId === delivered.sessionId);
+    expect(reloaded!.mojoQuarantineNoticePending).toBe(false);
+    // And a second migration pass still does not re-queue it.
+    reread.identity.freezeMojoIdentityForSession(reloaded!, APP_ID);
+    expect(reloaded!.mojoQuarantineNoticePending).toBe(false);
+  });
+
+  it('still queues for a row that was never notified', async () => {
+    const { store, identity } = await boot({ cloud: true });
+    const never = seed(store, {
+      mojoIdentity: { cloud: true },
+      mojoQuarantinedLineage: 'parked',
+    });
+    identity.freezeMojoIdentityForSession(never, APP_ID);
+    expect(never.mojoQuarantineNoticePending).toBe(true);
+  });
+});

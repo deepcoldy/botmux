@@ -534,7 +534,7 @@ export function normalizeMojoLivePatch(
     return errors.length > 0 ? { ok: false, errors } : { ok: true, value };
 }
 
-/** Outcome of validating a raw `mojo` config block. *//** Outcome of validating a raw `mojo` config block. */
+/** Outcome of validating a raw `mojo` config block. */
 export type MojoConfigNormalizeResult =
     | { ok: true; value: MojoConfig }
     | { ok: false; errors: string[] };

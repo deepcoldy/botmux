@@ -4042,7 +4042,7 @@ export function sendWorkerInput(
     ...(mojoLivePatchForSession(ds) ?? {}),
   };
   // First moment with a reply context after a restore/resume-time quarantine.
-  deliverPendingMojoQuarantineNotice(ds, turnId);
+  deliverPendingMojoQuarantineNotice(ds, turnId, opts.dispatchAttempt);
   return sendWorkerSessionInput(ds, message);
 }
 
@@ -4089,18 +4089,43 @@ function mojoLivePatchForSession(ds: DaemonSession): { mojoLivePatch: MojoLivePa
  * persisted quarantine state for dashboard/audit — the notice is only about the
  * chat channel.
  */
-export function mojoAuxNoticeAllowed(ds: DaemonSession, turnId?: string): boolean {
+/** Sessions with a quarantine notice send in flight, so it cannot double-post. */
+const mojoQuarantineNoticeInFlight = new Set<string>();
+
+/**
+ * THE auxiliary-UI suppression policy. One definition, two call sites.
+ *
+ * Previously setupWorkerHandlers held this as a closure and the quarantine notice
+ * COPIED three of its four checks — dropping `ordinaryManagedSuppression`, so a
+ * durable-suppressed turn still posted to Lark. Copying a policy is how the two
+ * diverge; this is the shared implementation both now call.
+ *
+ * Returns true when auxiliary UI must be suppressed.
+ */
+export function auxUiSuppressedFor(
+  ds: DaemonSession,
+  turnId?: string,
+  dispatchAttempt?: number,
+): boolean {
+  // No-transport session (apiOnly bot or HTTP virtual chat): there is no real
+  // Feishu chat to render into.
   try {
     if (!larkTransportEnabled({
       chatId: ds.chatId,
       apiOnly: getBot(ds.larkAppId).config.apiOnly,
-    })) return false;
+    })) return true;
   } catch {
-    return false;
+    // Bot deregistered — fail closed.
+    return true;
   }
-  if (isSilentScheduledTurn(ds, turnId)) return false;
-  if (ds.session.vcMeetingReceiver) return false;
-  return true;
+  if (isSilentScheduledTurn(ds, turnId)) return true;
+  if (ds.session.vcMeetingReceiver) return true;
+  // Durable ledger: an attempt at or below the armed watermark is a replay whose
+  // output already happened (or was deliberately suppressed).
+  const armedThrough = turnId ? ds.suppressedFinalOutputTurns?.get(turnId) : undefined;
+  return dispatchAttempt !== undefined
+    && armedThrough !== undefined
+    && dispatchAttempt <= armedThrough;
 }
 
 /**
@@ -4118,8 +4143,15 @@ export function mojoAuxNoticeAllowed(ds: DaemonSession, turnId?: string): boolea
  * cleared too: the state is already persisted on the session for dashboard/audit,
  * and holding the flag forever would retry on every future turn.
  */
-function deliverPendingMojoQuarantineNotice(ds: DaemonSession, turnId?: string): void {
-  if (!ds.session.mojoQuarantineNoticePending) return;
+function deliverPendingMojoQuarantineNotice(
+  ds: DaemonSession,
+  turnId?: string,
+  dispatchAttempt?: number,
+): void {
+  if (ds.session.mojoQuarantineNoticePending !== true) return;
+  // In-flight guard: two turns can be accepted before the first sessionReply
+  // resolves, which would post the notice twice.
+  if (mojoQuarantineNoticeInFlight.has(ds.session.sessionId)) return;
   const lineage = ds.session.mojoQuarantinedLineage;
   if (!lineage) {
     ds.session.mojoQuarantineNoticePending = undefined;
@@ -4132,18 +4164,25 @@ function deliverPendingMojoQuarantineNotice(ds: DaemonSession, turnId?: string):
   } catch {
     return; // Bot deregistered — retry once it is back.
   }
-  const clearFlag = (): void => {
-    ds.session.mojoQuarantineNoticePending = undefined;
+  // `false` = DELIVERED, distinct from `undefined` = never queued. Clearing to
+  // undefined made the restore migration read it as "old build, never notified"
+  // and queue the notice again after every restart.
+  const markDelivered = (): void => {
+    ds.session.mojoQuarantineNoticePending = false;
     sessionStore.updateSession(ds.session);
   };
-  if (!mojoAuxNoticeAllowed(ds, turnId)) {
+  if (auxUiSuppressedFor(ds, turnId, dispatchAttempt)) {
+    // Stay PENDING: this turn simply had no authorized channel (durable replay,
+    // silent schedule, VC receiver, no transport). A later ordinary IM turn
+    // delivers it. The quarantine state itself is already persisted for
+    // dashboard/audit either way.
     logger.info(
-      `[${tag(ds)}] mojo quarantine notice kept out of auxiliary Lark UI `
-      + '(VC receiver / silent turn / no transport); state remains on the session',
+      `[${tag(ds)}] mojo quarantine notice deferred — no authorized output channel `
+      + 'for this turn; still pending',
     );
-    clearFlag();
     return;
   }
+  mojoQuarantineNoticeInFlight.add(ds.session.sessionId);
   const message = tr('worker.mojo_lineage_quarantined', { lineage }, botLocale(botCfg));
   void callbacks?.sessionReply(
     sessionAnchorId(ds),
@@ -4153,9 +4192,11 @@ function deliverPendingMojoQuarantineNotice(ds: DaemonSession, turnId?: string):
     // The turn that actually carried this delivery, not a stale reply target.
     turnId,
     ds.session.vcMeetingReceiver ? { sourceSessionId: ds.session.sessionId } : undefined,
-  ).then(clearFlag).catch((err) => {
+  ).then(markDelivered).catch((err) => {
     // Flag intentionally left set: the next turn retries.
     logger.warn(`[${tag(ds)}] failed to deliver mojo quarantine notice (will retry): ${err}`);
+  }).finally(() => {
+    mojoQuarantineNoticeInFlight.delete(ds.session.sessionId);
   });
 }
 
@@ -4634,7 +4675,7 @@ export function forkWorker(
   // Cold-resume path: a workerless session goes straight here without passing
   // through sendWorkerInput, so without this the "notice on the next message"
   // promise was never kept for exactly the sessions most likely to need it.
-  deliverPendingMojoQuarantineNotice(ds, initAttributionTurnId);
+  deliverPendingMojoQuarantineNotice(ds, initAttributionTurnId, initDispatchAttempt);
 
   // Stamp cliId on the persisted session so the dashboard can show a CLI badge
   // even after the session is closed. Do this before installing worker handlers:
@@ -4869,19 +4910,14 @@ function setupWorkerHandlers(
   };
   /** Auxiliary worker UI is never an authorized output channel for a dedicated
    * VC receiver. Dashboard/audit state is still updated before these guards. */
-  const managedAuxUiSuppressed = (turnId?: string, dispatchAttempt?: number): boolean => {
-    // No-transport session (apiOnly bot or HTTP virtual chat): there is no real
-    // Feishu chat to render a card/reaction into. Suppress ALL auxiliary UI at
-    // the single source every aux-UI handler funnels through — this is the
-    // authoritative fix, NOT a fake "success" message id from sessionReply (a
-    // synthetic id would get stored as streamCardId and later scheduleCardPatch
-    // → updateMessage would still dial Feishu). Dashboard/web-terminal state is
-    // still updated before these guards, so the terminal view is unaffected.
-    if (!larkTransportEnabled({ chatId: ds.chatId, apiOnly: getBot(ds.larkAppId).config.apiOnly })) return true;
-    if (isSilentScheduledTurn(ds, turnId)) return true;
-    if (ds.session.vcMeetingReceiver) return true;
-    return ordinaryManagedSuppression(turnId, dispatchAttempt);
-  };
+  // Delegates to the shared policy (auxUiSuppressedFor) so this and the mojo
+  // quarantine notice cannot drift apart. Suppressing here is the authoritative
+  // fix, NOT a fake "success" message id from sessionReply (a synthetic id would
+  // get stored as streamCardId and later scheduleCardPatch → updateMessage would
+  // still dial Feishu). Dashboard/web-terminal state is updated before these
+  // guards, so the terminal view is unaffected.
+  const managedAuxUiSuppressed = (turnId?: string, dispatchAttempt?: number): boolean =>
+    auxUiSuppressedFor(ds, turnId, dispatchAttempt);
   /** final_output is the sole exception: listener_thread and exact IM replies
    * may proceed into the durable action ledger; silent/stale attempts do not. */
   const managedFinalOutputSuppressed = (

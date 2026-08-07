@@ -307,8 +307,10 @@ export class MojoBackend implements SessionBackend {
                 return candidate;
             } catch { /* not here */ }
         }
-        // Not on the child's PATH — fall back so a normal install still works.
-        return locateOnPath(cmd);
+        // Explicit child PATH is authoritative: do NOT fall back to the daemon's
+        // ambient PATH. Falling back is how an ambient install shadowed a per-bot
+        // one, which defeats the point of resolving on the child PATH at all.
+        return null;
     }
 
     /** Lazily resolve (and memoize) `config.wrapperCli` when spawn() never ran. */
