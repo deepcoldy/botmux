@@ -2813,6 +2813,63 @@ export function suspendWorker(ds: DaemonSession, reason = 'suspended_idle'): boo
   return true;
 }
 
+/**
+ * Cash in a queued suspend. Called once the session leaves the producing states
+ * it was queued for; a no-op during working/analyzing — that IS why it queued.
+ *
+ * Callers MUST defer this out of the status handler's synchronous body
+ * (queueMicrotask) — suspendWorker clears `ds.worker` and `ds.lastScreenStatus`,
+ * and the rest of that handler still reads both to record the usage delta, flip
+ * the turn reaction ✋→✅, emit the state-transition hook, and render the final
+ * card. Running it inline would skip exactly the turn-completion bookkeeping
+ * this whole feature exists to protect.
+ *
+ * `ownsGeneration` is the calling handler's generation check (`ownsWorkerSession`)
+ * and is REQUIRED for correctness, not a nicety: `screenshot_uploaded` writes
+ * `lastScreenStatus` with no ownership check of its own, so a stale `idle` from a
+ * replaced worker can land on a session that has since re-forked. Without this
+ * check the microtask would then suspend the *replacement* worker — mid-reply —
+ * which is the exact truncation bug this feature removes. A stale checkpoint
+ * keeps the flag pending; only the owning generation may consume it.
+ *
+ * Deliberately the generation check ALONE, not `ownsLifecycleMutation` (which
+ * also folds in "not transferring"): a routing transfer is a temporary refusal,
+ * not a lost claim, and it is suspendWorker's own guard to make. Screen updates
+ * stop once a session sits quiet, so treating transfer as "not ours" would park
+ * the flag with no later checkpoint to revive it — hence the explicit
+ * transfer-settled retry below.
+ */
+function runPendingSuspendIfSettled(ds: DaemonSession, ownsGeneration?: () => boolean): void {
+  const reason = ds.pendingSuspendReason;
+  if (!reason) return;
+  if (ownsGeneration && !ownsGeneration()) return;
+  const st = ds.lastScreenStatus;
+  if (st !== 'idle' && st !== 'limited') return;
+  // Worker already gone (crash / suspended by another path): the goal state is
+  // reached, so drop the flag. Falling through to suspendWorker would take its
+  // no-worker branch and clear managedTurnOrigin/workerReady for a generation
+  // this queued request never owned.
+  if (!ds.worker || ds.worker.killed) {
+    ds.pendingSuspendReason = undefined;
+    return;
+  }
+  // Clear only on success. suspendWorker refuses mid-routing-transfer (and for a
+  // backend that stopped being suspendable), and that refusal is temporary —
+  // eating the flag would silently drop the request until the next `suspend all`.
+  if (suspendWorker(ds, reason)) {
+    ds.pendingSuspendReason = undefined;
+    logger.info(`[${tag(ds)}] Deferred suspend fulfilled (${reason}) after turn completed`);
+    return;
+  }
+  // Refused by an in-flight transfer: keeping the flag is not enough on its own.
+  // A settled session emits no further screen updates, so there may be no next
+  // checkpoint — re-run when the relay gate releases. Returns false when no
+  // transfer is active (a non-transfer refusal, e.g. pty), which needs no retry.
+  deferUntilSessionTransferSettled(ds, () => runPendingSuspendIfSettled(ds, ownsGeneration));
+}
+
+export const __testOnly_runPendingSuspendIfSettled = runPendingSuspendIfSettled;
+
 function armWorkerKillBackstop(w: ChildProcess, label: string, sigtermMs: number = WORKER_SIGTERM_BACKSTOP_MS): void {
   const sigterm = setTimeout(() => {
     if (w.exitCode === null && w.signalCode === null) {
@@ -7519,6 +7576,11 @@ function setupWorkerHandlers(
         updateUsageLimitState(ds, msg.usageLimit);
         ds.lastScreenContent = msg.content;
         ds.lastScreenStatus = (msg.usageLimit ?? ds.usageLimit) ? 'limited' : msg.status;
+        // A suspend that arrived mid-turn parked itself here. Defer until this
+        // screen_update has finished using process state — suspendWorker nulls
+        // `worker` + `lastScreenStatus`, which everything below still reads
+        // (usage ledger, turn reactions, transition hook, final card).
+        queueMicrotask(() => runPendingSuspendIfSettled(ds, ownsWorkerSession));
 
         // State-boundary clear: the moment we leave `working` (→ idle/limited),
         // stop the periodic usage refresh immediately — BEFORE the aux-UI /
@@ -7725,6 +7787,12 @@ function setupWorkerHandlers(
         const prevStatus = ds.lastScreenStatus;
         updateUsageLimitState(ds, msg.usageLimit);
         ds.lastScreenStatus = (msg.usageLimit ?? ds.usageLimit) ? 'limited' : msg.status;
+        // Same deferred-suspend checkpoint as the screen_update branch, and
+        // deferred for the same reason (see runPendingSuspendIfSettled). This
+        // case has NO ownership guard of its own, so passing the predicate is
+        // what stops a stale worker's late `idle` from suspending its
+        // replacement — the assignment above is already unguarded today.
+        queueMicrotask(() => runPendingSuspendIfSettled(ds, ownsWorkerSession));
         emitSessionStateTransitionHook(ds, prevStatus, ds.lastScreenStatus, {
           source: 'screenshot_uploaded',
           imageKey: msg.imageKey,

@@ -5918,10 +5918,61 @@ async function cmdSuspend(): Promise<void> {
   }
 
   const online = listOnlineDaemons();
-  let suspended = 0, skipped = 0, failed = 0;
+  let suspended = 0, deferred = 0, skipped = 0, failed = 0;
+
+  // dry-run 的预告要复刻 suspend 路由的分类，而这些判据（实时屏幕状态、是否还有
+  // 存活 worker、backend、adopt）本地 session store 全都没有。每个 daemon 只拉一次
+  // /api/sessions 拿 dashboard 行；拉不到就退回不带判据的旧预告，dry-run 不该因为
+  // 一个 daemon 抽风而失败。
+  const daemonRows = new Map<number, Map<string, any> | null>();
+  let dryRunDegraded = false;
+  const rowOf = async (sessionId: string, larkAppId?: string): Promise<any | undefined> => {
+    const daemon = findDaemon(larkAppId);
+    if (!daemon) { dryRunDegraded = true; return undefined; }
+    if (!daemonRows.has(daemon.ipcPort)) {
+      try {
+        const res = await fetchDaemonIpc(daemon.ipcPort, '/api/sessions', { method: 'GET' });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const body: any = await res.json();
+        const rows: any[] = Array.isArray(body?.sessions) ? body.sessions : [];
+        daemonRows.set(daemon.ipcPort, new Map(rows.filter(r => r?.sessionId).map(r => [r.sessionId, r])));
+      } catch { daemonRows.set(daemon.ipcPort, null); }
+    }
+    const map = daemonRows.get(daemon.ipcPort);
+    if (!map) { dryRunDegraded = true; return undefined; }
+    return map.get(sessionId);
+  };
+  // 复刻 dashboard-ipc-server 的 suspend 路由分支顺序。行拿不到时返回 undefined
+  // （预告降级为"未知"），绝不猜一个确定的结论。
+  //
+  // ⚠️ 一个分支复刻不了：路由的第一道守卫是 `isSessionTransferring` → 409，而
+  // /api/sessions 的行不暴露 transfer 状态。正在 routing transfer 中的会话会被这里
+  // 预告成 排队/挂起，实际执行拿到 `session_transferring`。transfer 是短暂窗口，
+  // 为一个 dry-run 预告给 SessionRow 加字段不成比例；如果以后行里有了该状态，
+  // 在 adopt 之前补一条分支即可。
+  const SUSPENDABLE_BACKENDS = new Set(['tmux', 'herdr', 'zellij', 'zmx']);
+  const predictSuspend = (row: any): 'defer' | 'suspend' | 'no_worker' | 'refuse' | undefined => {
+    if (!row) return undefined;
+    if (row.adopt) return 'refuse';                          // adopt_suspend_unsupported
+    if (row.status === 'dormant' || row.status === 'closed') return 'no_worker';
+    if (!SUSPENDABLE_BACKENDS.has(row.backendType)) return 'refuse';  // backend_not_suspendable
+    if (row.status === 'working' || row.status === 'analyzing') return 'defer';
+    return 'suspend';
+  };
+
   for (const s of matched) {
     const label = `${s.sessionId.substring(0, 8)}  ${s.title ?? ''}`.trimEnd();
-    if (dryRun) { console.log(`· 将挂起: ${label}`); continue; }
+    if (dryRun) {
+      const predicted = predictSuspend(await rowOf(s.sessionId, s.larkAppId));
+      switch (predicted) {
+        case 'defer': console.log(`· 将排队（正在回复，完成后自动挂起）: ${label}`); deferred++; break;
+        case 'suspend': console.log(`· 将挂起: ${label}`); break;
+        case 'no_worker': console.log(`· 将跳过（本就无存活 CLI）: ${label}`); skipped++; break;
+        case 'refuse': console.log(`· 将拒绝（adopt / 不可挂起 backend）: ${label}`); failed++; break;
+        default: console.log(`? 未知（daemon 状态读不到，无法预告）: ${label}`); break;
+      }
+      continue;
+    }
     // 旧会话缺 larkAppId 时多 daemon 下无法判定归属，跳过而不是误路由。
     if (!s.larkAppId && online.length > 1) {
       console.log(`- 跳过（缺 larkAppId，多 daemon 无法判定归属）: ${label}`);
@@ -5943,6 +5994,10 @@ async function cmdSuspend(): Promise<void> {
       const body: any = await res.json().catch(() => ({}));
       if (res.ok && body?.ok) {
         if (body.suspended) { console.log(`✓ 已挂起: ${label}`); suspended++; }
+        else if (body.reason === 'deferred') {
+          console.log(`⏳ 已排队（正在回复，完成后自动挂起）: ${label}`);
+          deferred++;
+        }
         else { console.log(`· 本就无存活 CLI（目标态已达成）: ${label}`); skipped++; }
       } else {
         console.log(`✗ 失败（${body?.error ?? `HTTP ${res.status}`}）: ${label}`);
@@ -5955,10 +6010,14 @@ async function cmdSuspend(): Promise<void> {
   }
 
   if (dryRun) {
-    console.log(`\nDRY-RUN：共 ${matched.length} 个目标，未执行。`);
+    if (dryRunDegraded) {
+      console.log('\n⚠️  部分会话的 daemon 状态读不到（daemon 不在线或 /api/sessions 失败），这些预告标为「未知」而非猜测。');
+    }
+    console.log(`DRY-RUN：共 ${matched.length} 个目标${deferred ? `（其中 ${deferred} 个正在回复，会排队）` : ''}，未执行。`);
     return;
   }
-  console.log(`\n完成：挂起 ${suspended} 个，跳过 ${skipped} 个${failed ? `，失败 ${failed} 个` : ''}。`);
+  // 排队数必须单列：不设兑现上限的安全阀是可见性——这个数持续不降就是会话卡住的信号。
+  console.log(`\n完成：挂起 ${suspended} 个，排队 ${deferred} 个，跳过 ${skipped} 个${failed ? `，失败 ${failed} 个` : ''}。`);
   console.log('下条消息会冷启动并 --resume 续上下文；读隔离 bot 冷启动时自动同步最新登录凭证。');
   if (failed > 0) process.exitCode = 1;
 }

@@ -257,6 +257,13 @@ export interface DaemonSession {
   activeReasoningEffort?: string;
   /** Runtime change arrived while a streaming-card POST was in flight. */
   pendingActiveRuntimeCardRefresh?: boolean;
+  /** Queued suspend: the request arrived while the session was producing
+   *  (working/analyzing), where killing the worker would drop that turn's reply.
+   *  Record the reason instead and cash it in once screen_update settles into
+   *  idle/limited (see worker-pool.ts runPendingSuspendIfSettled). In-memory
+   *  only: lost on daemon restart, and the next `suspend all` cycle re-queues
+   *  it — the cost is one cycle of delay, not a missed session. */
+  pendingSuspendReason?: string;
   /** Executor-observed Codex settings for this worker/rollout generation. */
   codexServiceTier?: CodexServiceTierSnapshot;
   /** Tier change arrived while a card POST was in-flight. */

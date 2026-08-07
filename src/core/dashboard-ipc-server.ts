@@ -1158,6 +1158,24 @@ ipcRoute('POST', '/api/sessions/:sessionId/suspend', async (_req, res, params) =
     // already reached, so report idempotent success without a live kill.
     return jsonRes(res, 200, { ok: true, sessionId: params.sessionId, suspended: false, reason: 'no_live_worker' });
   }
+  // Producing a reply — killing the worker now would drop this turn. Queue
+  // instead; worker-pool's runPendingSuspendIfSettled cashes it in on the
+  // idle/limited edge. Ordering matters: the idempotent no-worker branch above
+  // must win, so "worker was already gone" never reports as deferred.
+  //
+  // The suspendability check is part of the queueing condition, not a new guard
+  // ahead of it: a non-suspendable (pty) backend must keep falling through to
+  // suspendWorker's existing 409 rather than get a `deferred` that could only
+  // fail silently at fulfillment time.
+  if (
+    (ds.lastScreenStatus === 'working' || ds.lastScreenStatus === 'analyzing')
+    && isSuspendableBackendType(ds.initConfig?.backendType)
+  ) {
+    ds.pendingSuspendReason = 'manual_suspend';
+    return jsonRes(res, 200, {
+      ok: true, sessionId: params.sessionId, suspended: false, reason: 'deferred',
+    });
+  }
   if (!suspendWorker(ds, 'manual_suspend')) {
     // Live worker but a non-suspendable (pty) backend: killing it would drop the
     // in-memory conversation with no persistent pane to resume from lazily.
