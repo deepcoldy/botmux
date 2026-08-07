@@ -20,6 +20,34 @@ export const ASK_TOGGLE_ACTION = 'ask_toggle';
 
 const MAX_BUTTONS_PER_ACTION_ROW = 4;
 
+/** Card-dispatch retry policy. A transient Feishu failure (5xx / network /
+ *  timeout) must NOT collapse the ask into `invalidated` — that unblocks the
+ *  CLI hook into passthrough, Claude renders its native picker, and the answer
+ *  channel is gone even though the card may well have posted. We retry with a
+ *  stable idempotency uuid (Feishu returns the original message_id for repeats
+ *  within a 1h TTL), so a partial success (card delivered, response errored)
+ *  recovers the real messageId instead of discarding the ask. */
+const CARD_DISPATCH_MAX_ATTEMPTS = 3;
+const CARD_DISPATCH_BASE_DELAY_MS = 400;
+
+/** Extract an HTTP-ish status from an SDK/Axios error across SDK versions. */
+function errorStatus(err: unknown): number | undefined {
+  const e = err as any;
+  return e?.response?.status ?? e?.response?.statusCode ?? e?.status ?? e?.statusCode;
+}
+
+/** Retry only when a retry could plausibly help: network errors (no status),
+ *  429, and 5xx. A definitive 4xx (e.g. 400 invalid_message_id, 403) will fail
+ *  identically on retry, so surface it immediately. */
+function isTransientDispatchError(err: unknown): boolean {
+  const status = errorStatus(err);
+  if (status === undefined) return true; // network / timeout / no HTTP response
+  if (status === 429) return true;
+  return status >= 500 && status <= 599;
+}
+
+const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+
 export interface AskCardActionData {
   operator?: { open_id?: string };
   action?: {
@@ -50,10 +78,34 @@ export function createLarkAskCardDispatcher(
       // 所以这里要按前缀判断是否真的能 reply.
       const canReplyToRoot =
         typeof ask.rootMessageId === 'string' && ask.rootMessageId.startsWith('om_');
-      const messageId = canReplyToRoot
-        ? await reply(ask.larkAppId, ask.rootMessageId!, cardJson, 'interactive', true)
-        : await send(ask.larkAppId, ask.chatId, cardJson, 'interactive');
-      return { messageId };
+      // Stable idempotency token: repeated attempts for the same ask dedupe on
+      // the Feishu server (1h TTL) so a retry after a partial success returns
+      // the ORIGINAL message_id instead of posting a duplicate card.
+      const uuid = `ask-${ask.askId}`;
+      let lastErr: unknown;
+      for (let attempt = 1; attempt <= CARD_DISPATCH_MAX_ATTEMPTS; attempt++) {
+        try {
+          const messageId = canReplyToRoot
+            ? await reply(ask.larkAppId, ask.rootMessageId!, cardJson, 'interactive', true, uuid)
+            : await send(ask.larkAppId, ask.chatId, cardJson, 'interactive', uuid);
+          return { messageId };
+        } catch (err) {
+          lastErr = err;
+          // A definitive (non-transient) error will fail identically on retry —
+          // surface it now so the ask is invalidated promptly (e.g. the chat is
+          // gone). Transient errors get a bounded, backed-off retry.
+          if (!isTransientDispatchError(err) || attempt === CARD_DISPATCH_MAX_ATTEMPTS) {
+            throw err;
+          }
+          logger.warn(
+            `[ask:${ask.askId}] card dispatch attempt ${attempt}/${CARD_DISPATCH_MAX_ATTEMPTS} ` +
+            `failed (transient, retrying): ${err instanceof Error ? err.message : String(err)}`,
+          );
+          await sleep(CARD_DISPATCH_BASE_DELAY_MS * attempt);
+        }
+      }
+      // Unreachable (loop either returns or throws), but satisfies the type checker.
+      throw lastErr;
     },
     async onSettle(ask, result) {
       if (!ask.cardMessageId) return;

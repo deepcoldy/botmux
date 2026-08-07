@@ -182,6 +182,21 @@ describe('runHook', () => {
     });
   });
 
+  describe('ask timeoutMs 默认值（防止过早超时退化成原生 picker）', () => {
+    // ask 超时不是良性兜底：broker settle 成 timedOut → hook passthrough →
+    // Claude 渲染原生 picker，此后飞书回调无通道送回答案。默认值必须足够长
+    // （对齐 hook 安装侧 86400s 进程超时），避免"人回复慢→picker 卡死"。
+    it('未设 BOTMUX_ASK_TIMEOUT_MS → body.timeoutMs 默认 24h', async () => {
+      let capturedBody: Record<string, unknown> | undefined;
+      const captureStub = async (body: Record<string, unknown>) => {
+        capturedBody = body;
+        return { kind: 'answered' as const, answers: [['继续']], by: 'ou_u', comment: null, timedOut: false };
+      };
+      await runHook(claudeAskPayload, FULL_ENV, captureStub, 'claude-code');
+      expect(capturedBody?.timeoutMs).toBe(86_400_000);
+    });
+  });
+
   describe('env 缺失 + adopt 路由返回 null → passthrough', () => {
     // Codex 钉桩：祖先里有非 adopt PID、daemon 全 404（resolver 返回 null）时，
     // 必须既不调用 postAsk、stdout 又为空——确保"真·非 botmux 会话"完全不受影响。
@@ -259,7 +274,7 @@ describe('runHook', () => {
       expect(capturedBody?.timeoutMs).toBe(7_200_000);
     });
 
-    it('无效值 → 使用默认 3600000', async () => {
+    it('无效值 → 回退到默认（24h，对齐 hook 进程超时上限）', async () => {
       let capturedBody: Record<string, unknown> | undefined;
       const captureStub = async (body: Record<string, unknown>): Promise<AskResult> => {
         capturedBody = body;
@@ -267,7 +282,7 @@ describe('runHook', () => {
       };
       const env = { ...FULL_ENV, BOTMUX_ASK_TIMEOUT_MS: 'not_a_number' };
       await runHook(claudeAskPayload, env, captureStub, 'claude-code');
-      expect(capturedBody?.timeoutMs).toBe(3_600_000);
+      expect(capturedBody?.timeoutMs).toBe(86_400_000);
     });
   });
 

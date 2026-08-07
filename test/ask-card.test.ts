@@ -638,7 +638,9 @@ describe('createLarkAskCardDispatcher', () => {
     const dispatcher = createLarkAskCardDispatcher({ replyMessage: reply as any, sendMessage: send as any });
 
     await expect(dispatcher.send(makePending())).resolves.toEqual({ messageId: 'om_reply' });
-    expect(reply).toHaveBeenCalledWith('cli_ask', 'om_root', expect.any(String), 'interactive', true);
+    // A stable idempotency uuid (`ask-<askId>`) is passed so retries dedupe on
+    // the Feishu server instead of posting a duplicate card.
+    expect(reply).toHaveBeenCalledWith('cli_ask', 'om_root', expect.any(String), 'interactive', true, 'ask-ask-1');
     expect(send).not.toHaveBeenCalled();
   });
 
@@ -649,7 +651,7 @@ describe('createLarkAskCardDispatcher', () => {
     const ask = makePending({ rootMessageId: null, cardMessageId: 'om_card' });
 
     await expect(dispatcher.send(ask)).resolves.toEqual({ messageId: 'om_send' });
-    expect(send).toHaveBeenCalledWith('cli_ask', 'oc_chat', expect.any(String), 'interactive');
+    expect(send).toHaveBeenCalledWith('cli_ask', 'oc_chat', expect.any(String), 'interactive', 'ask-ask-1');
 
     await dispatcher.onSettle?.(ask, {
       kind: 'timedOut',
@@ -659,5 +661,54 @@ describe('createLarkAskCardDispatcher', () => {
       timedOut: true,
     });
     expect(update).toHaveBeenCalledWith('cli_ask', 'om_card', expect.stringContaining('超时'));
+  });
+
+  // ── Dispatch resilience: a transient Feishu failure must NOT bubble out of
+  //    send() (which would invalidate the ask → hook passthrough → stuck native
+  //    picker). It retries with the same idempotency uuid and recovers. ──────
+  it('retries a transient 500 and recovers the messageId (idempotent uuid reused)', async () => {
+    const err500 = Object.assign(new Error('Request failed with status code 500'), {
+      response: { status: 500 },
+    });
+    const reply = vi
+      .fn()
+      .mockRejectedValueOnce(err500) // partial-success shape: card may have posted, response errored
+      .mockResolvedValueOnce('om_reply');
+    const dispatcher = createLarkAskCardDispatcher({ replyMessage: reply as any });
+
+    await expect(dispatcher.send(makePending())).resolves.toEqual({ messageId: 'om_reply' });
+    expect(reply).toHaveBeenCalledTimes(2);
+    // Same idempotency uuid on both attempts → Feishu dedupes, no duplicate card.
+    expect(reply.mock.calls[0]![5]).toBe('ask-ask-1');
+    expect(reply.mock.calls[1]![5]).toBe('ask-ask-1');
+  });
+
+  it('retries a network error (no HTTP status) then succeeds', async () => {
+    const netErr = Object.assign(new Error('ECONNRESET'), { code: 'ECONNRESET' });
+    const send = vi.fn().mockRejectedValueOnce(netErr).mockResolvedValueOnce('om_send');
+    const dispatcher = createLarkAskCardDispatcher({ sendMessage: send as any });
+
+    await expect(
+      dispatcher.send(makePending({ rootMessageId: null })),
+    ).resolves.toEqual({ messageId: 'om_send' });
+    expect(send).toHaveBeenCalledTimes(2);
+  });
+
+  it('does NOT retry a definitive 4xx — throws immediately so a dead chat invalidates promptly', async () => {
+    const err400 = Object.assign(new Error('invalid message_id'), { response: { status: 400 } });
+    const reply = vi.fn().mockRejectedValue(err400);
+    const dispatcher = createLarkAskCardDispatcher({ replyMessage: reply as any });
+
+    await expect(dispatcher.send(makePending())).rejects.toBe(err400);
+    expect(reply).toHaveBeenCalledTimes(1); // no retry on a permanent error
+  });
+
+  it('gives up after the attempt cap and rethrows the last transient error', async () => {
+    const err503 = Object.assign(new Error('unavailable'), { response: { status: 503 } });
+    const reply = vi.fn().mockRejectedValue(err503);
+    const dispatcher = createLarkAskCardDispatcher({ replyMessage: reply as any });
+
+    await expect(dispatcher.send(makePending())).rejects.toBe(err503);
+    expect(reply).toHaveBeenCalledTimes(3); // CARD_DISPATCH_MAX_ATTEMPTS
   });
 });

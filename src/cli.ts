@@ -9709,8 +9709,14 @@ export async function runHook(
     routeRoot = adopt.rootMessageId;
   }
 
-  // 解析 timeoutMs：默认 1 小时，可由 BOTMUX_ASK_TIMEOUT_MS 覆盖
-  const DEFAULT_TIMEOUT_MS = 3_600_000;
+  // 解析 timeoutMs：默认 ~24h，可由 BOTMUX_ASK_TIMEOUT_MS 覆盖。
+  // 为什么这么长：ask 超时不是良性兜底——broker settle 成 `timedOut` 会让 hook
+  // 落到 passthrough，Claude 转而渲染原生 picker，而此后飞书回调已无通道把答案
+  // 送回（picker 挂死、答案不生效）。所以默认值对齐 hook 安装侧的进程超时上限
+  // （settings.json 里的 86400s），让 broker 不会 *早于* hook 进程本身超时；
+  // 既避免"人回复慢→picker 卡死"，又保留一个有限的进程级兜底（永不超时会让一次
+  // CLI turn 无限阻塞，是更糟的失败）。
+  const DEFAULT_TIMEOUT_MS = 86_400_000; // 24h — 对齐 hook 安装侧 timeout:86400s
   let timeoutMs = DEFAULT_TIMEOUT_MS;
   const timeoutEnv = env.BOTMUX_ASK_TIMEOUT_MS;
   if (timeoutEnv) {
