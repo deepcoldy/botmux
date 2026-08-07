@@ -47,6 +47,13 @@ async function waitFor(pred: () => boolean, ms: number, fail: () => string): Pro
   throw new Error(fail());
 }
 
+/** How many IPC messages of this type have arrived so far. Fences compare a
+ *  BEFORE and AFTER count, because init emits the same readiness handshake that
+ *  a respawn does — presence alone proves nothing. */
+function countMsgs(h: Harness, type: string): number {
+  return h.msgs.filter(m => m.type === type).length;
+}
+
 function lines(dump: string): string[] {
   if (!existsSync(dump)) return [];
   const raw = readFileSync(dump, 'utf-8').trim();
@@ -58,9 +65,12 @@ interface Harness {
   dump: string;
   child: ChildProcess;
   logs: string[];
-  /** WorkerToDaemon IPC messages, so a test can fence on a real readiness
-   *  signal (`restart_result`) instead of grepping stdout for a log line. */
-  msgs: Array<{ type: string; status?: string; category?: string }>;
+  /** WorkerToDaemon IPC messages, so a test can fence on the worker's own
+   *  readiness signals (`local_process_attestation` / `prompt_ready`) instead of
+   *  grepping stdout for a log line. Always COUNT these rather than testing for
+   *  presence: init emits the same handshake, so `some()` is satisfied before the
+   *  event under test has happened. */
+  msgs: Array<{ type: string }>;
 }
 
 function bootWorker(opts: { mojo?: Record<string, unknown>; appId?: string }): Harness {
@@ -197,31 +207,43 @@ describe('mojo cross-boundary contracts', () => {
       await waitFor(() => lines(h.dump).length >= 1, 25_000, () => `turn one never ran\n${h.logs.join('')}`);
       expect(lines(h.dump)[0]).toBe('[stale-A]');
 
-      // 1. Clear, and let the turn settle COMPLETELY before restarting.
+      // 1. Clear, and let the turn settle COMPLETELY before restarting — that
+      //    ordering is the whole point of this test, so waiting only for the dump
+      //    to land is not enough: the worker must also report the turn finished.
+      const readyBeforeClear = countMsgs(h, 'prompt_ready');
       h.child.send({ type: 'message', content: 'clear me', mojoLivePatch: { jwt: null } } as DaemonToWorker);
-      await waitFor(() => lines(h.dump).length >= 2, 30_000, () => `clear turn never ran\n${h.logs.join('')}`);
+      await waitFor(
+        () => lines(h.dump).length >= 2 && countMsgs(h, 'prompt_ready') > readyBeforeClear,
+        30_000,
+        () => `clear turn never settled (dump=${lines(h.dump).length}, `
+          + `prompt_ready ${readyBeforeClear} -> ${countMsgs(h, 'prompt_ready')})\n${h.logs.join('')}`,
+      );
       expect(lines(h.dump)[1]).toBe('[]');
+
       // 2. Rebuild the backend and fence on the worker's own IPC, not a stdout
       //    grep ('Spawning fresh CLI' is also logged at init, so includes() would
       //    be a vacuous precondition). A bare `restart` emits no `restart_result`
       //    (that is only sent for an attemptId-carrying restart), so the fence is
-      //    the readiness handshake a fresh backend re-emits: attestation followed
-      //    by prompt_ready. Counted, so the init handshake cannot satisfy it.
-      const readyBefore = h.msgs.filter(m => m.type === 'local_process_attestation').length;
+      //    the readiness handshake a fresh backend re-emits. BOTH signals are
+      //    counted: init emits this same pair, so `some()` on prompt_ready would
+      //    be satisfied by the init handshake and prove nothing.
+      const attBeforeRestart = countMsgs(h, 'local_process_attestation');
+      const readyBeforeRestart = countMsgs(h, 'prompt_ready');
       h.child.send({ type: 'restart' } as DaemonToWorker);
       await waitFor(
-        () => h.msgs.filter(m => m.type === 'local_process_attestation').length > readyBefore
-          && h.msgs.some(m => m.type === 'prompt_ready'),
+        () => countMsgs(h, 'local_process_attestation') > attBeforeRestart
+          && countMsgs(h, 'prompt_ready') > readyBeforeRestart,
         40_000,
-        () => `restart never re-emitted the readiness handshake: `
-          + `${JSON.stringify(h.msgs.map(m => m.type))}\n${h.logs.join('')}`,
+        () => `restart never re-emitted the readiness handshake `
+          + `(attestation ${attBeforeRestart} -> ${countMsgs(h, 'local_process_attestation')}, `
+          + `prompt_ready ${readyBeforeRestart} -> ${countMsgs(h, 'prompt_ready')})\n${h.logs.join('')}`,
       );
       // The restart's own teardown cancels via the OLD backend (already cleared),
       // so it must not be counted as progress — that is what made an earlier
       // version of this test pass vacuously.
       const afterTeardown = lines(h.dump).length;
 
-      // 4. A turn on the REPLACEMENT backend carrying no patch of its own. This
+      // 3. A turn on the REPLACEMENT backend carrying no patch of its own. This
       //    is what revives the credential without the restore, and it also gives
       //    the new backend a session id so the close below can actually cancel.
       h.child.send({ type: 'message', content: 'after respawn' } as DaemonToWorker);
@@ -232,7 +254,7 @@ describe('mojo cross-boundary contracts', () => {
       );
       const afterTurn = lines(h.dump).length;
 
-      // 5. Now the lifecycle op review asked for, on a backend that has a remote
+      // 4. Now the lifecycle op review asked for, on a backend that has a remote
       //    session to cancel.
       h.child.send({ type: 'close' } as DaemonToWorker);
       await waitFor(
