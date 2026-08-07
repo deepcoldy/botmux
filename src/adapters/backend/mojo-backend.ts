@@ -53,7 +53,7 @@ import { locateOnPath } from '../cli/registry.js';
 import { buildWrappedLaunch } from '../../setup/cli-selection.js';
 import { logger } from '../../utils/logger.js';
 import type { SessionBackend, SpawnOpts } from './types.js';
-import { findReservedMojoCliFlags, MOJO_CONTROL_ENV_KEYS } from './mojo-types.js';
+import { buildEffectiveChildEnv, findReservedMojoCliFlags, MOJO_CONTROL_ENV_KEYS } from './mojo-types.js';
 import type {
     MojoAuthStatus,
     MojoLivePatch,
@@ -759,11 +759,14 @@ export class MojoBackend implements SessionBackend {
         //   → bots.json `mojo.env`
         // Falling back to process.env keeps direct/unit use working when spawn()
         // was never called.
-        const env: NodeJS.ProcessEnv = {
-            ...(this.spawnOpts?.env ?? process.env),
-            ...(this.spawnOpts?.injectEnv ?? {}),
-            ...(this.config.env ?? {}),
-        };
+        // Shared with the launcher's wrapper resolution — see
+        // buildEffectiveChildEnv. Do NOT re-inline this layering: the two sites
+        // drifted apart once already and the launcher silently dropped mojo.env.
+        const env: NodeJS.ProcessEnv = buildEffectiveChildEnv({
+            base: this.spawnOpts?.env ?? process.env,
+            botEnv: this.spawnOpts?.injectEnv,
+            mojoEnv: this.config.env,
+        });
         // Prefer an injected JWT so the bot never depends on an interactive
         // `mojo auth login` on the host. Verified: X_JWT_TOKEN makes
         // `mojo auth status --json` report mode=jwt / source=env.

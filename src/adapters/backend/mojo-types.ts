@@ -116,6 +116,35 @@ export const MOJO_IDENTITY_KEYS = [
  * from the (frozen) config alone. `X_JWT_TOKEN` is deliberately absent: a rotated
  * credential must keep taking effect.
  */
+/**
+ * The child's effective environment, layered lowest → highest precedence:
+ *
+ *   base (worker-supplied session env / process env)
+ *   → bot `env`      (bots.json top-level, already sanitized)
+ *   → `mojo.env`     (bots.json mojo block — highest)
+ *
+ * This exists so the launcher and the backend cannot disagree. They previously
+ * layered independently and the launcher omitted `mojo.env` entirely, so a
+ * wrapper binary was resolved against a PATH the child never actually ran with:
+ * a same-named program earlier on the bot-level PATH shadowed the one the
+ * operator pinned in `mojo.env.PATH`. For a wrapper that carries auth or acts
+ * as a gateway, that means executing under the wrong identity.
+ *
+ * Callers that need control-plane hygiene must still strip
+ * MOJO_CONTROL_ENV_KEYS afterwards; this helper only fixes the layering.
+ */
+export function buildEffectiveChildEnv(layers: {
+    base?: NodeJS.ProcessEnv;
+    botEnv?: NodeJS.ProcessEnv;
+    mojoEnv?: Record<string, string> | undefined;
+}): NodeJS.ProcessEnv {
+    return {
+        ...(layers.base ?? {}),
+        ...(layers.botEnv ?? {}),
+        ...(layers.mojoEnv ?? {}),
+    };
+}
+
 export const MOJO_CONTROL_ENV_KEYS = [
     'AGENT_BASE_URL',
     'MOJO_PPE_ENV',

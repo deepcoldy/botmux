@@ -236,7 +236,7 @@ import {
   isValidRiffSandboxCluster,
   type RiffBackendConfig,
 } from './adapters/backend/riff-backend.js';
-import { buildEffectiveMojoConfig, findReservedMojoCliFlags, normalizeMojoConfig, normalizeMojoLivePatch, type EffectiveMojoConfig, type MojoLivePatch } from './adapters/backend/mojo-types.js';
+import { buildEffectiveChildEnv, buildEffectiveMojoConfig, findReservedMojoCliFlags, normalizeMojoConfig, normalizeMojoLivePatch, type EffectiveMojoConfig, type MojoLivePatch } from './adapters/backend/mojo-types.js';
 import {
   prepareDirectSandbox,
   prepareCredentialOnlySandbox,
@@ -9296,11 +9296,21 @@ async function spawnCli(
     if (sandboxRequested) {
       log(`wrapperCli="${cfg.wrapperCli}" ignored: file sandbox enabled and takes precedence (cannot combine launch prefix with the sandbox wrapper)`);
     } else {
-      // Resolve wrapper binaries against the EFFECTIVE child PATH (per-bot env
-      // layered over the worker's), not the daemon's own. `locateOnPath` reads
-      // this process's env, so an ambient install shadowed a per-bot one and the
-      // child ran a different wrapper than the operator configured.
-      const launch = buildWrappedLaunch(cfg.wrapperCli, spawnArgs, (b) => locateOnEffectiveChildPath(b, { ...childEnv, ...perBotInjectEnv }) ?? b, {
+      // Resolve wrapper binaries against the EFFECTIVE child PATH — the exact env
+      // the child will really run with — not the daemon's own. `locateOnPath`
+      // reads this process's env, so an ambient install shadowed a per-bot one.
+      // The layering MUST come from the shared buildEffectiveChildEnv: this site
+      // previously merged only childEnv + bot env and omitted the
+      // highest-precedence `mojo.env`, so a wrapper pinned via `mojo.env.PATH`
+      // lost to a same-named binary on the bot-level PATH.
+      const effectiveChildEnv = buildEffectiveChildEnv({
+        base: childEnv,
+        botEnv: perBotInjectEnv,
+        mojoEnv: effectiveBackendType === 'mojo'
+          ? (riffBackendConfig as EffectiveMojoConfig | undefined)?.env
+          : undefined,
+      });
+      const launch = buildWrappedLaunch(cfg.wrapperCli, spawnArgs, (b) => locateOnEffectiveChildPath(b, effectiveChildEnv) ?? b, {
         ttadkModel: cfg.model,
       });
       if (launch.bin) {

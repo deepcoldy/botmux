@@ -4082,8 +4082,9 @@ function mojoLivePatchForSession(ds: DaemonSession): { mojoLivePatch: MojoLivePa
 /**
  * Is auxiliary UI an authorized output channel for this session/turn?
  *
- * Mirrors the first three checks of setupWorkerHandlers' `managedAuxUiSuppressed`
- * (which is a closure and unreachable from here). Deliberately conservative: a
+ * The single source of truth for this policy: setupWorkerHandlers' own
+ * `managedAuxUiSuppressed` now delegates here instead of keeping a parallel copy
+ * that could drift. Deliberately conservative: a
  * dedicated VC receiver, a silent scheduled turn, or a session with no real Lark
  * transport must never receive a bypass message. Those cases still get the
  * persisted quarantine state for dashboard/audit — the notice is only about the
@@ -4137,11 +4138,12 @@ export function auxUiSuppressedFor(
  * call this, since a cold-resumed session goes straight to forkWorker and would
  * otherwise never deliver it.
  *
- * The flag is cleared only AFTER a successful send, so a transient Lark failure
- * retries on the next turn instead of losing the notice permanently. For a
- * suppressed channel (VC receiver / silent turn / no transport) the flag is
- * cleared too: the state is already persisted on the session for dashboard/audit,
- * and holding the flag forever would retry on every future turn.
+ * The flag is marked delivered (`false`) only AFTER a successful send, so a
+ * transient Lark failure retries on the next turn instead of losing the notice
+ * permanently. For a suppressed channel (durable replay / silent schedule / VC
+ * receiver / no transport) the flag STAYS PENDING: that turn merely had no
+ * authorized output channel, so a later ordinary IM turn delivers it. The
+ * quarantine state itself is persisted for dashboard/audit either way.
  */
 function deliverPendingMojoQuarantineNotice(
   ds: DaemonSession,
