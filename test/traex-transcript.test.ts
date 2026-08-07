@@ -124,6 +124,47 @@ describe('drainTraexRollout', () => {
     expect(readLatestTraexRuntime(path)).toEqual({ model: 'stable-model' });
   });
 
+  it('readLatestTraexRuntime resolves model and effort from independent latest records (backward scan)', () => {
+    // /model then /effort switched in separate turns — each field is
+    // latest-wins independently, so the newest of EACH must win even though
+    // they live on different lines.
+    writeFileSync(path, [
+      line({ type: 'turn_context', payload: { model: 'old-model', reasoning_effort: 'low' } }),
+      line(user('/model new')),
+      line({ type: 'turn_context', payload: { model: 'new-model' } }),
+      line(user('/effort high')),
+      line({ type: 'turn_context', payload: { reasoning_effort: 'high' } }),
+      line(taskComplete('done')),
+    ].join(''));
+
+    expect(readLatestTraexRuntime(path)).toEqual({
+      model: 'new-model',
+      reasoningEffort: 'high',
+    });
+  });
+
+  it('readLatestTraexRuntime finds the runtime when the only record is the first line (offset 0)', () => {
+    writeFileSync(path, line({ type: 'turn_context', payload: { model: 'solo-model' } }));
+    expect(readLatestTraexRuntime(path)).toEqual({ model: 'solo-model' });
+  });
+
+  it('readLatestTraexRuntime scans back across a large transcript to the newest tail record', () => {
+    const filler = Array.from({ length: 2000 }, (_, i) =>
+      line(assistantProgress(`tool commentary chunk ${i} ${'x'.repeat(200)}`)),
+    ).join('');
+    writeFileSync(path, [
+      line({ type: 'turn_context', payload: { model: 'stale', reasoning_effort: 'low' } }),
+      filler,
+      line({ type: 'turn_context', payload: { model: 'fresh-tail', reasoning_effort: 'xhigh' } }),
+      line(taskComplete('done')),
+    ].join(''));
+
+    expect(readLatestTraexRuntime(path)).toEqual({
+      model: 'fresh-tail',
+      reasoningEffort: 'xhigh',
+    });
+  });
+
   it('uses task_complete as the terminal and ignores phase-less assistant progress', () => {
     writeFileSync(path, [
       line(user('do the work')),

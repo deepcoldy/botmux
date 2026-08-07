@@ -31,7 +31,16 @@ describe('TRAE worker structured-bridge wiring', () => {
     const attachStart = workerSource.indexOf('function codexBridgeAttach');
     const attachEnd = workerSource.indexOf('function codexBridgeDetachFile', attachStart);
     const attach = workerSource.slice(attachStart, attachEnd);
+    // Baseline modes seed from a bounded backward read; fresh-empty/split-live
+    // are excluded so split-live does not re-scan the file it just drained.
     expect(attach).toContain('publishActiveRuntime(readLatestTraexRuntime(rolloutPath))');
+    expect(attach).toMatch(/mode !== 'fresh-empty'\s*&&\s*mode !== 'split-live'[\s\S]*?publishActiveRuntime\(readLatestTraexRuntime/);
+    // split-live reuses its own drain result rather than a second full scan.
+    const splitStart = attach.indexOf("mode === 'split-live' && existsSync");
+    const splitBlock = attach.slice(splitStart, splitStart + 1600);
+    expect(splitBlock).toContain('publishActiveRuntime({');
+    expect(splitBlock).toContain('model: traex.latestModel');
+    expect(splitBlock).not.toContain('readLatestTraexRuntime');
 
     const ingestStart = workerSource.indexOf('function codexBridgeIngest');
     const ingestEnd = workerSource.indexOf('function codexBridgeMarkPendingTurn', ingestStart);

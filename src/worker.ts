@@ -3812,7 +3812,6 @@ function mtrBridgeIngest(): void {
 function codexBridgeAttach(rolloutPath: string, mode: 'baseline-existing' | 'baseline-existing-skip-tail' | 'fresh-empty' | 'split-live'): void {
   codexBridgeRolloutPath = rolloutPath;
   if (structuredBridgeIsCodex()) codexServiceTierTracker.bind(rolloutPath);
-  if (structuredBridgeIsTraex()) publishActiveRuntime(readLatestTraexRuntime(rolloutPath));
   if (mode === 'fresh-empty') {
     // Brand-new session OR late-attach right after first submit. Either
     // way we want to ingest from offset 0 — pending turns marked before
@@ -3844,6 +3843,15 @@ function codexBridgeAttach(rolloutPath: string, mode: 'baseline-existing' | 'bas
         rolloutPath,
         (result as CodexDrainResult).latestThreadSettings,
       );
+    }
+    // Reuse this drain's runtime observation instead of a second full-file
+    // scan — split-live already read the whole rollout above.
+    if (structuredBridgeIsTraex()) {
+      const traex = result as TraexDrainResult;
+      publishActiveRuntime({
+        model: traex.latestModel,
+        reasoningEffort: traex.latestReasoningEffort,
+      });
     }
     log(`Codex bridge split-live: ${rolloutPath} (history=${history.length}, live=${live.length}, cutoff=${cutoff}, offset=${codexBridgeOffset})`);
     maybeEmitCodexAdoptPreamble(history);
@@ -3883,6 +3891,17 @@ function codexBridgeAttach(rolloutPath: string, mode: 'baseline-existing' | 'bas
     && mode !== 'split-live'
   ) {
     codexServiceTierTracker.observe(rolloutPath, scanCodexThreadSettings(rolloutPath));
+  }
+  // TRAE baseline modes only cursor to the tail without draining, so seed the
+  // active runtime from a bounded backward read. split-live already published
+  // from its own drain; fresh-empty has no history and picks it up on first
+  // live ingest.
+  if (
+    structuredBridgeIsTraex()
+    && mode !== 'fresh-empty'
+    && mode !== 'split-live'
+  ) {
+    publishActiveRuntime(readLatestTraexRuntime(rolloutPath));
   }
   try {
     codexBridgeWatcher = fsWatch(rolloutPath, { persistent: false }, () => {

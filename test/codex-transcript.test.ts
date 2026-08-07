@@ -532,6 +532,42 @@ describe('Codex thread settings observation', () => {
     expect(scanCodexThreadSettings(path)).toBeUndefined();
   });
 
+  it('reads the top-level reasoning_effort (follows an in-session /effort switch)', () => {
+    writeFileSync(path, ev({
+      timestamp: '2026-04-29T07:00:00.000Z',
+      type: 'event_msg',
+      payload: {
+        type: 'thread_settings_applied',
+        thread_settings: {
+          model: 'gpt-5.6-sol',
+          service_tier: 'default',
+          reasoning_effort: 'xhigh',
+        },
+      },
+    }));
+    expect(scanCodexThreadSettings(path)).toEqual({
+      model: 'gpt-5.6-sol',
+      reasoningEffort: 'xhigh',
+      serviceTier: 'default',
+    });
+  });
+
+  it('falls back to collaboration_mode.settings.reasoning_effort when no top-level effort', () => {
+    writeFileSync(path, ev({
+      timestamp: '2026-04-29T07:00:00.000Z',
+      type: 'event_msg',
+      payload: {
+        type: 'thread_settings_applied',
+        thread_settings: {
+          model: 'gpt-5.6-sol',
+          service_tier: 'default',
+          collaboration_mode: { settings: { reasoning_effort: 'high' } },
+        },
+      },
+    }));
+    expect(scanCodexThreadSettings(path)?.reasoningEffort).toBe('high');
+  });
+
   it('reports the latest settings from the newly appended byte range', () => {
     writeFileSync(path,
       ev(threadSettingsApplied('default')) + ev(userResponseItem('first')));

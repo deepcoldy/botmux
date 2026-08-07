@@ -50,7 +50,6 @@ export interface CardUsageSnapshot {
   tokens: {
     in: number;
     out: number;
-    model?: string;
   } | null;
   /** Delta for the latest user turn (small, matches the CLI TUI's per-turn
    *  ↑↓). Null for dialects without per-turn tracking. Rendered on the live

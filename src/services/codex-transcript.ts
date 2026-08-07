@@ -567,7 +567,19 @@ function codexThreadSettingsFromEvent(obj: any): CodexThreadSettings | undefined
   const serviceTier = raw?.service_tier;
   if (typeof serviceTier !== 'string' || !serviceTier) return undefined;
   const model = typeof raw?.model === 'string' && raw.model ? raw.model : undefined;
-  return { ...(model ? { model } : {}), serviceTier };
+  // Effort follows an in-session `/effort` switch. Codex records it both at the
+  // top level and under collaboration_mode.settings; take the top-level value
+  // first, matching the model precedence above.
+  const rawEffort = raw?.reasoning_effort
+    ?? raw?.collaboration_mode?.settings?.reasoning_effort;
+  const reasoningEffort = typeof rawEffort === 'string' && rawEffort.trim()
+    ? rawEffort.trim()
+    : undefined;
+  return {
+    ...(model ? { model } : {}),
+    ...(reasoningEffort ? { reasoningEffort } : {}),
+    serviceTier,
+  };
 }
 
 /**

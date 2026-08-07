@@ -34,7 +34,7 @@ import {
   type CodexDrainResult,
   codexSessionIdFromRolloutPath,
 } from './codex-transcript.js';
-import { scanJsonlFromOffset } from './jsonl-cursor.js';
+import { baselineJsonlCursor } from './jsonl-cursor.js';
 import { traeSessionsRoot } from './traex-paths.js';
 
 export { splitCodexEventsByCutoff as splitTraexEventsByCutoff };
@@ -54,6 +54,12 @@ export interface TraexRuntimeSnapshot {
 }
 
 const IS_LINUX = platform() === 'linux';
+
+/** Upper bound on how far back readLatestTraexRuntime scans for the newest
+ * model/effort. The newest turn_context sits near the tail, so this is only a
+ * pathological-file guard (cf. #740): never synchronously parse a multi-GB
+ * rollout on attach just to surface advisory runtime identity. */
+const TRAEX_RUNTIME_SCAN_MAX_BYTES = 4 * 1024 * 1024;
 
 function joinInputText(content: unknown): string {
   if (!Array.isArray(content)) return '';
@@ -193,25 +199,80 @@ export function drainTraexRollout(path: string, fromOffset: number): TraexDrainR
 
 /** Read the current TRAE runtime from complete rollout records without
  * retaining the full transcript in memory. Each field is latest-wins because
- * `/model` and `/effort` can change independently in a long-lived session. */
+ * `/model` and `/effort` can change independently in a long-lived session.
+ *
+ * Scans BACKWARD in fixed-size chunks and stops as soon as both fields are
+ * resolved — the newest `turn_context` is near the tail, so a live session
+ * touches only the last chunk. A hard byte cap bounds the pathological case
+ * where a field never appears (same guard rationale as #740's
+ * MAX_USAGE_TRANSCRIPT_BYTES): runtime identity is advisory and must never
+ * synchronously parse a multi-GB rollout on attach. A non-newline-terminated
+ * trailing partial is excluded via baselineJsonlCursor, so a crash mid-write
+ * cannot surface a half-written model — matching drainTraexRollout. */
 export function readLatestTraexRuntime(path: string): TraexRuntimeSnapshot {
   if (!path || !existsSync(path)) return {};
+  let completeEnd: number;
+  try { completeEnd = baselineJsonlCursor(path).newOffset; } catch { return {}; }
+  if (completeEnd <= 0) return {};
+
   let latestModel: string | undefined;
   let latestReasoningEffort: string | undefined;
-  scanJsonlFromOffset(path, 0, {
-    onLine: (line) => {
-      if (!line.trim()) return;
-      try {
-        const runtime = runtimeFromTraexEntry(JSON.parse(line));
-        latestModel = runtime?.model ?? latestModel;
-        latestReasoningEffort = runtime?.reasoningEffort ?? latestReasoningEffort;
-      } catch { /* skip malformed lines */ }
-    },
-  });
-  return {
+  const emit = (): TraexRuntimeSnapshot => ({
     ...(latestModel ? { model: latestModel } : {}),
     ...(latestReasoningEffort ? { reasoningEffort: latestReasoningEffort } : {}),
+  });
+  // Backward scan keeps the first (newest) value seen for each field; returns
+  // true once both are known so the scan can stop early.
+  const consider = (line: string): boolean => {
+    if (!line.trim()) return false;
+    let runtime: TraexRuntimeSnapshot | undefined;
+    try { runtime = runtimeFromTraexEntry(JSON.parse(line)); } catch { return false; }
+    if (latestModel === undefined && runtime?.model) latestModel = runtime.model;
+    if (latestReasoningEffort === undefined && runtime?.reasoningEffort) {
+      latestReasoningEffort = runtime.reasoningEffort;
+    }
+    return latestModel !== undefined && latestReasoningEffort !== undefined;
   };
+
+  const floor = Math.max(0, completeEnd - TRAEX_RUNTIME_SCAN_MAX_BYTES);
+  const chunkBytes = 64 * 1024;
+  let fd: number | undefined;
+  try {
+    fd = openSync(path, 'r');
+    let end = completeEnd;
+    let carry = Buffer.alloc(0);
+    while (end > floor) {
+      const start = Math.max(floor, end - chunkBytes);
+      const chunk = Buffer.alloc(end - start);
+      readSync(fd, chunk, 0, chunk.length, start);
+      const block = carry.length > 0 ? Buffer.concat([chunk, carry]) : chunk;
+      let lineEnd = block.length;
+      if (lineEnd > 0 && block[lineEnd - 1] === 0x0a) lineEnd--;
+      let carryEnd = lineEnd;
+      for (let i = lineEnd - 1; i >= 0; i--) {
+        if (block[i] !== 0x0a) continue;
+        const line = block.subarray(i + 1, lineEnd).toString('utf8');
+        lineEnd = i;
+        carryEnd = i;
+        if (consider(line)) return emit();
+      }
+      // Carry the partial leading fragment back to the previous chunk. The one
+      // exception is the byte-cap floor (floor > 0 && start === floor): there
+      // the leading fragment is a truncated historical partial and is dropped.
+      // At true file start (start === 0) the fragment is the complete first
+      // record and must be considered.
+      carry = start === floor && floor > 0
+        ? Buffer.alloc(0)
+        : block.subarray(0, carryEnd);
+      end = start;
+    }
+    if (carry.length > 0) consider(carry.toString('utf8'));
+  } catch {
+    return emit();
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+  }
+  return emit();
 }
 
 function normaliseInputText(text: string): string {

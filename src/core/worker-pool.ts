@@ -204,14 +204,11 @@ export function getDaemonStreamingCardUsageSnapshot(
   effectiveCliId?: CliId,
   opts?: { fresh?: boolean },
 ): CardUsageSnapshot {
-  const snapshot = getDaemonSessionUsageSnapshot(
-    ds,
-    effectiveCliId,
-    { fresh: opts?.fresh ?? false },
-  );
-  const model = ds.activeModel?.trim()
-    || snapshot.tokens?.model?.trim()
-    || ds.session.model?.trim();
+  // Runtime identity is derived from in-memory fields only, so it is available
+  // without reading the transcript. The disk read (getDaemonSessionUsageSnapshot)
+  // is deferred until we know usage will actually render — a footer/off bot must
+  // not pay a per-tick transcript parse just to throw the tokens away.
+  const runtimeModel = ds.activeModel?.trim() || ds.session.model?.trim();
   const reasoningEffort = ds.activeReasoningEffort?.trim()
     || ds.session.reasoningEffort?.trim();
   try {
@@ -219,16 +216,26 @@ export function getDaemonStreamingCardUsageSnapshot(
       return {
         context: null,
         tokens: null,
-        ...(model ? { model } : {}),
+        ...(runtimeModel ? { model: runtimeModel } : {}),
         ...(reasoningEffort ? { reasoningEffort } : {}),
       };
     }
   } catch {
     // Missing runtime config → default 'streaming' → show usage (best-effort).
   }
+  const snapshot = getDaemonSessionUsageSnapshot(
+    ds,
+    effectiveCliId,
+    { fresh: opts?.fresh ?? false },
+  );
+  // Model comes only from an explicitly-wired executor runtime (TRAE/Codex set
+  // ds.activeModel from their rollout settings) or the user-configured launch
+  // model — never snapshot.tokens.model. That field is the RAW transcript model
+  // and for relay-style CLIs is an internal routing code (e.g. `ark/relay-code`)
+  // that must not surface on a user card.
   return {
     ...snapshot,
-    ...(model ? { model } : {}),
+    ...(runtimeModel ? { model: runtimeModel } : {}),
     ...(reasoningEffort ? { reasoningEffort } : {}),
   };
 }
@@ -4839,6 +4846,13 @@ function setupWorkerHandlers(
   // Codex badge before a role switch starts a non-Codex worker.
   ds.codexServiceTier = undefined;
   ds.pendingCodexTierCardRefresh = undefined;
+  // Active runtime is likewise authority of this exact worker generation. The
+  // new worker republishes it via active_runtime after re-reading the rollout;
+  // clear it here so the window between respawn and that first observation
+  // cannot leave a stale model/effort tail on the card.
+  ds.activeModel = undefined;
+  ds.activeReasoningEffort = undefined;
+  ds.pendingActiveRuntimeCardRefresh = undefined;
   const handlerSession = ds.session;
   const handlerAnchor = sessionAnchorId(ds);
   const handlerLarkAppId = ds.larkAppId;
@@ -5536,6 +5550,14 @@ function setupWorkerHandlers(
         ds.codexServiceTier = effectiveCliId === 'codex'
           ? (msg.snapshot ?? undefined)
           : undefined;
+        // Codex has no active_runtime channel (that path is TRAE-gated), but
+        // its thread_settings_applied snapshot carries the executor-confirmed
+        // model/effort — surface them through the same in-memory fields the
+        // card reads so an in-session /model or /effort switch is reflected.
+        if (effectiveCliId === 'codex') {
+          ds.activeModel = ds.codexServiceTier?.model?.trim() || undefined;
+          ds.activeReasoningEffort = ds.codexServiceTier?.reasoningEffort?.trim() || undefined;
+        }
         scheduleCodexServiceTierPatch(ds);
         break;
       }
