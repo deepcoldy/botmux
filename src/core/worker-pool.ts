@@ -941,13 +941,26 @@ function sessionAgentConfig(
     }
     if (repaired) sessionStore.updateSession(ds.session);
   }
+  // Resolved at EVERY spawn, resume included — see resolveSessionLaunchModel.
+  const model = resolveSessionLaunchModel(ds, botCfg);
+  // Record what this session is actually launching with, so the mismatch
+  // fallback (rule 3) still has something to fall back ON after the bot switches
+  // CLI: a session pinned to the old CLI would otherwise lose its model and drop
+  // to the CLI default. Not every entry point that hot-swaps `bot.config.cliId`
+  // (`/botconfig set cli`, the config card) runs the dashboard's
+  // closeCliMismatchedSessionsForBot sweep, so such sessions do survive to refork.
+  // A per-trigger override is deliberately NOT recorded — it is one-shot by
+  // contract, and persisting it is exactly the mistake the frozen model was.
+  if (!ds.spawnModelOverride && ds.session.model !== model) {
+    ds.session.model = model;   // undefined clears a stale record
+    sessionStore.updateSession(ds.session);
+  }
   return {
     cliId: ds.session.cliId ?? botCfg.cliId,
     cliRuntime: ds.session.cliRuntime,
     cliPathOverride: ds.session.cliPathOverride,
     wrapperCli: ds.session.wrapperCli,
-    // Resolved at EVERY spawn, resume included — see resolveSessionLaunchModel.
-    model: resolveSessionLaunchModel(ds, botCfg),
+    model,
     reasoningEffort: ds.session.reasoningEffort,
   };
 }
@@ -2131,12 +2144,30 @@ function destroyLivePaneBeforeRestart(ds: DaemonSession): void {
  * ANTHROPIC_BASE_URL/TOKEN）后 /restart 并不会生效（只有 refork 路径生效）。
  * 三分态返回：对象 = 最新 env；null = 明确清空（dashboard 已删）；
  * undefined = 取不到（bot 已注销等异常），让 worker 保持快照不动（=旧行为）。
- * 只热更 env 一个字段：sandbox/backendType 是刻意 freeze-once 的设计（见
+ * 只热更 env / model 两个字段：sandbox/backendType 是刻意 freeze-once 的设计（见
  * forkWorker init 注释），cliId 换 CLI 会踩 resume transcript 对齐，均不带。
  */
 export function latestPerBotEnvForRestart(ds: DaemonSession): Record<string, string> | null | undefined {
   try {
     return getBot(ds.larkAppId).config.env ?? null;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Live-worker /restart 携带的最新模型（与 env 同一条通道、同一套三分态）。
+ *
+ * model 不进冻结集合、每次 spawn 按当前 bot 配置解析（见 resolveSessionLaunchModel），
+ * 但 `/restart`、dashboard 重启、CLI 崩溃自动重启这三条路**不 refork**：worker 收到
+ * restart 后用旧 `lastInitConfig` 原地 respawn。不捎带的话，改完模型再重启起来的还是
+ * 旧模型——正是「改配置对存量会话生效」要修的那件事。
+ * 三分态：字符串 = 用它；null = 明确不传模型（bot 未配 / 已清空）；
+ * undefined = 取不到（bot 已注销等异常），让 worker 保持快照不动（=旧行为）。
+ */
+export function latestModelForRestart(ds: DaemonSession): string | null | undefined {
+  try {
+    return resolveSessionLaunchModel(ds, getBot(ds.larkAppId).config) ?? null;
   } catch {
     return undefined;
   }
@@ -2154,7 +2185,7 @@ export function requestSessionRestart(
   return restartCoordinator.request(ds.session.sessionId, observer, attemptId => {
     if (ds.worker && !ds.worker.killed) {
       ds.workerReady = false;
-      ds.worker.send({ type: 'restart', attemptId, env: latestPerBotEnvForRestart(ds) } as DaemonToWorker);
+      ds.worker.send({ type: 'restart', attemptId, env: latestPerBotEnvForRestart(ds), model: latestModelForRestart(ds) } as DaemonToWorker);
       return;
     }
     // No live worker but the persistent pane may still be alive (e.g. after a
@@ -6146,7 +6177,7 @@ function setupWorkerHandlers(
         if (ds.worker && !ds.worker.killed) {
           logger.info(`[${t}] Auto-restarting ${sessionCliDisplayName(ds, botCfg)}...`);
           ds.workerReady = false;
-          ds.worker.send({ type: 'restart', env: latestPerBotEnvForRestart(ds) } as DaemonToWorker);
+          ds.worker.send({ type: 'restart', env: latestPerBotEnvForRestart(ds), model: latestModelForRestart(ds) } as DaemonToWorker);
         }
         break;
       }

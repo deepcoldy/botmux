@@ -12508,6 +12508,14 @@ process.on('message', async (raw: unknown) => {
       if (msg.env !== undefined && lastInitConfig) {
         lastInitConfig.env = msg.env === null ? undefined : msg.env;
       }
+      // model 热更，与 env 同一条通道、同一套三分态。model 不进冻结集合、每次
+      // spawn 按当前 bot 配置解析（见 resolveSessionLaunchModel），但 live-worker
+      // restart 不 refork，没有 init 重发这条通道——不覆盖的话，改完模型再重启
+      // 起来的还是快照里的旧模型。undefined=不携带（旧 daemon / 取不到）保持快照；
+      // null=当前不该传模型（bot 未配 / 已清空）→ 移除快照。同样放在合并守卫之前。
+      if (msg.model !== undefined && lastInitConfig) {
+        lastInitConfig.model = msg.model === null ? undefined : msg.model;
+      }
       // restart 合并：已有一轮 restart 在飞（teardown 进行中，或 tmux jitter
       // 定时器未触发）时不叠加第二轮——叠加会 clearTimeout 吃掉首轮 teardown、
       // 把重启预算无故烧到 tier-2 强制 FRESH（丢上下文），非 tmux 路径还会

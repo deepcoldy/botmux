@@ -4584,11 +4584,14 @@ async function adoptCodexNotifierEvent(
     // wrapper/model；这些配置针对普通 CLI，会错误包装 app-server runner。
     // model 由 resolveSessionLaunchModel 在每次 spawn 时解析：这里把 cliId 钉成
     // codex-app 后，若通知 Bot 自己不是 codex-app，session 与 bot 的 cliId 不匹配
-    // → 不会拿 bot 那个面向别的 CLI 的 model；清掉遗留记录值让兜底也为空。
+    // → 不会拿 bot 那个面向别的 CLI 的 model；清掉历史记录值让兜底也为空。
+    // spawnModelOverride（trigger 的一次性 model）优先级最高且无条件，必须一并清掉，
+    // 否则它会泄漏进接管后的 codex-app 启动。
     ds.session.cliId = 'codex-app';
     ds.session.cliPathOverride = botCfg.cliPathOverride;
     delete ds.session.wrapperCli;
     delete ds.session.model;
+    ds.spawnModelOverride = undefined;
     ds.session.agentFrozen = true;
     sessionStore.updateSession(ds.session);
 

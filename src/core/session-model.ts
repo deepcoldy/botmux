@@ -29,10 +29,11 @@ export type LaunchModelBotConfig = { cliId?: CliId; model?: string };
  *      switched CLI later, or a Codex App thread takeover that forces
  *      `codex-app`) must not be handed a model string meant for a different
  *      CLI.
- *   3. the session's own historical `model`, as a last resort for exactly that
- *      mismatch case: it is the value that CLI was actually launched with.
- *      Never consulted while the live config applies, which is what makes a
- *      dashboard edit effective on old sessions.
+ *   3. the model this session was last launched with (`session.model`, stamped
+ *      by sessionAgentConfig on every spawn), as a last resort for exactly that
+ *      mismatch case: it is the value that CLI actually ran with. Never
+ *      consulted while the live config applies, which is what makes a dashboard
+ *      edit effective on old sessions.
  *
  * `undefined` → botmux passes no model flag and the CLI resolves its own
  * default (for `claude --resume`, that means the model recorded in the

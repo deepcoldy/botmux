@@ -1918,9 +1918,10 @@ describe('forkWorker session agent config freeze', () => {
 
     expect(ds.session.cliId).toBe('codex');
     expect(ds.session.wrapperCli).toBe('ttadk codex');
-    // The model is resolved per spawn from the bot config — freezing it here is
-    // what used to make a dashboard model change ineffective on long sessions.
-    expect(ds.session.model).toBeUndefined();
+    // The model is resolved per spawn from the bot config; what lands on the
+    // session is only a RECORD of what it launched with (read back solely when
+    // the bot later switches CLI), never a freeze that outranks the config.
+    expect(ds.session.model).toBe('glm-5.1');
     const worker = forkMock.mock.results.at(-1)!.value;
     expect(worker.send).toHaveBeenCalledWith(expect.objectContaining({
       type: 'init',
@@ -1938,7 +1939,7 @@ describe('forkWorker session agent config freeze', () => {
 
     expect(ds.session.cliId).toBe('codex');
     expect(ds.session.wrapperCli).toBe('ttadk codex');
-    expect(ds.session.model).toBeUndefined();
+    expect(ds.session.model).toBe('glm-5.1');   // record of the launched model
     const worker = forkMock.mock.results.at(-1)!.value;
     expect(worker.send).toHaveBeenCalledWith(expect.objectContaining({
       type: 'init',
@@ -1992,8 +1993,42 @@ describe('forkWorker session agent config freeze', () => {
       model: 'glm-5.1',
       resume: true,
     }));
-    // …and the stale record is left untouched (no migration, nothing to undo).
-    expect(ds.session.model).toBe('stale-frozen-model');
+    // …and the stale record is refreshed to what it actually launched with, so
+    // the mismatch fallback stays truthful if the bot later switches CLI.
+    expect(ds.session.model).toBe('glm-5.1');
+  });
+
+  // ── The record exists so that rule 3 still has something to fall back ON for
+  //    sessions created AFTER this change: spawn once under the codex bot, then
+  //    switch the bot to another CLI (`/botconfig set cli` hot-swaps cliId
+  //    without the dashboard's mismatch sweep) — the session pinned to codex
+  //    must keep launching with the model it actually ran, not drop to the CLI
+  //    default nor inherit the new CLI's model. ──
+  it('a session whose bot later switched CLI keeps the model it recorded on its first spawn', () => {
+    const ds = makeDs();
+    forkWorker(ds, 'hello', false);            // codex bot, model glm-5.1
+    expect(ds.session.model).toBe('glm-5.1');  // recorded on the first spawn
+
+    vi.mocked(getBot).mockReturnValueOnce({
+      config: {
+        larkAppId: 'app_test',
+        larkAppSecret: 'secret',
+        cliId: 'claude-code',                  // bot moved to another CLI…
+        model: 'opus',                         // …with a model meant for it
+      },
+      resolvedAllowedUsers: [],
+      botOpenId: 'ou_bot',
+      botName: 'TestBot',
+    } as any);
+    forkWorker(ds, '', true);
+
+    const worker = forkMock.mock.results.at(-1)!.value;
+    expect(worker.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'init',
+      cliId: 'codex',
+      model: 'glm-5.1',
+      resume: true,
+    }));
   });
 
   // ── An EXPLICIT per-trigger override (trigger API options.model) still wins
@@ -2025,7 +2060,7 @@ describe('forkWorker session agent config freeze', () => {
     forkWorker(ds, '', true);
 
     expect(ds.session.wrapperCli).toBe('ttadk codex');
-    expect(ds.session.model).toBeUndefined();
+    expect(ds.session.model).toBe('glm-5.1');   // record of the launched model
     expect(ds.session.agentFrozen).toBe(true);
     const worker = forkMock.mock.results.at(-1)!.value;
     expect(worker.send).toHaveBeenCalledWith(expect.objectContaining({

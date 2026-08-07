@@ -69,7 +69,7 @@ import { readGlobalConfig } from '../global-config.js';
 import { normalizeChatReplyMode, setChatReplyMode, type ChatReplyMode } from '../services/chat-reply-mode-store.js';
 import * as chatFirstSeenStore from '../services/chat-first-seen-store.js';
 import * as scheduler from './scheduler.js';
-import { listActiveSessions, findActiveBySessionId, closeSession, getActiveSessionsRegistry, transferSession, deliverWriteLinkCardToOwners, forkWorker, suspendWorker, killWorker, latestPerBotEnvForRestart, getDaemonReplyCardUsageSnapshot, sessionSupportsWebTerminal, sendWorkerSessionInput, isSessionTransferring } from './worker-pool.js';
+import { listActiveSessions, findActiveBySessionId, closeSession, getActiveSessionsRegistry, transferSession, deliverWriteLinkCardToOwners, forkWorker, suspendWorker, killWorker, latestPerBotEnvForRestart, latestModelForRestart, getDaemonReplyCardUsageSnapshot, sessionSupportsWebTerminal, sendWorkerSessionInput, isSessionTransferring } from './worker-pool.js';
 import { listOnlineDaemons } from '../utils/daemon-discovery.js';
 import { isSessionStopped } from './session-liveness.js';
 import { isSuspendableBackendType } from './persistent-backend.js';
@@ -718,7 +718,7 @@ ipcRoute('POST', '/api/sessions/:sessionId/restart', (_req, res, params) => {
     // 捎带最新 per-bot env：dashboard 改完 env 后重启才真正生效（与 /restart 同逻辑）。
     try {
       ds.workerReady = false;
-      ds.worker.send({ type: 'restart', env: latestPerBotEnvForRestart(ds) } as DaemonToWorker);
+      ds.worker.send({ type: 'restart', env: latestPerBotEnvForRestart(ds), model: latestModelForRestart(ds) } as DaemonToWorker);
     } catch (err) {
       return jsonRes(res, 502, { ok: false, error: String(err) });
     }
@@ -1036,7 +1036,7 @@ ipcRoute('POST', '/api/sessions/:sessionId/cd', async (req, res, params) => {
     // 陈旧的 lastInitConfig.workingDir（daemon 侧 initConfig 已在上面同步）。
     try {
       ds.workerReady = false;
-      ds.worker.send({ type: 'restart', updateWorkingDir: v.resolvedPath, env: latestPerBotEnvForRestart(ds) } as DaemonToWorker);
+      ds.worker.send({ type: 'restart', updateWorkingDir: v.resolvedPath, env: latestPerBotEnvForRestart(ds), model: latestModelForRestart(ds) } as DaemonToWorker);
     } catch {
       // send() 抛异常：worker 进程实际上已经不可达（管道已断），但 above 的
       // repinSessionWorkingDir 已经把记录改成了新目录——绝不能留下「记录新、

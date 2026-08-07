@@ -389,13 +389,15 @@ export interface Session {
   /** Optional wrapper launcher frozen at creation, e.g. `ttadk codex` or `aiden x claude`. */
   wrapperCli?: string;
   /**
-   * @deprecated Historical record only — NO LONGER WRITTEN, and no longer the
-   * launch source of truth. Sessions used to freeze the bot's model here at
-   * creation, which made a long-running session ignore the model configured in
-   * the dashboard forever; the model is now resolved from the live bot config on
-   * every spawn (see resolveSessionLaunchModel). Kept because old rows carry it
-   * and it remains the only sane value for a session pinned to a CLI the bot no
-   * longer uses.
+   * The model this session was last LAUNCHED with — a record, not the launch
+   * source of truth. Sessions used to freeze the bot's model here at creation,
+   * which made a long-running session ignore the model configured in the
+   * dashboard forever; the model is now resolved from the live bot config on
+   * every spawn (see resolveSessionLaunchModel) and stamped back here.
+   *
+   * Only ever READ when the session is pinned to a CLI the bot no longer runs
+   * (rule 3), where the live model belongs to a different CLI — never while the
+   * live config applies, which is what keeps a config change effective.
    */
   model?: string;
   /** Optional codex reasoning effort frozen at creation (per-turn API override).
@@ -685,7 +687,7 @@ export type DaemonToWorker =
    *  /restart 真正生效（否则 live-worker restart 一直用 fork 时刻的旧快照）。
    *  三分态：undefined = 不携带（旧 daemon / 兜底，worker 保持快照不动）；
    *  null = 明确清空（dashboard 清除了 env，worker 移除快照）。 */
-  | { type: 'restart'; attemptId?: string; updateWorkingDir?: string; env?: Record<string, string> | null }
+  | { type: 'restart'; attemptId?: string; updateWorkingDir?: string; env?: Record<string, string> | null; model?: string | null }
   /** Lease watchdog fencing: only the exact still-running durable attempt may
    * tear down/restart the CLI. A late command after terminal/current-turn
    * advance is ignored worker-side. */
