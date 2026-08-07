@@ -4341,6 +4341,11 @@ export function promoteQueuedActivationTail(
         ? { dispatchAttempt: head.dispatchAttempt }
         : {}),
       ...(codexAppDispatchId ? { codexAppDispatchId } : {}),
+      // R6-B2: COPY the frozen steer authorization onto the live-worker IPC — the
+      // last hop. Without it a promoted N+1 reaches a live worker with the daemon
+      // ledger head steerable=true but the worker reservation false, so a
+      // legitimate superseded settlement would be wrongly rejected.
+      ...(exactInput.codexAppSteerable === true ? { codexAppSteerable: true as const } : {}),
       queuedActivationToken: token,
       ...(vcMeetingImTurnOrigin ? { vcMeetingImTurnOrigin } : {}),
     } as DaemonToWorker);
@@ -4654,6 +4659,12 @@ export function forkWorker(
     }
     const routed = sendWorkerInput(ds, promptPayload, initTurnId, {
       ...(initDispatchAttempt !== undefined ? { dispatchAttempt: initDispatchAttempt } : {}),
+      // R6-B3: sendWorkerInput reads steer authorization from OPTS (not the
+      // payload), so the direct-route double-fork (protected ownership, no
+      // activation gate — e.g. only an unsettled ledger) must pass it through
+      // opts too. The gate branch above already admits with the flag; this
+      // sibling branch would otherwise silently downgrade true → false.
+      ...(initCodexAppSteerable ? { codexAppSteerable: true as const } : {}),
     });
     logger[routed ? 'info' : 'warn'](
       `[${tag(ds)}] ${routed ? 'Routed' : 'Failed to route'} double-fork prompt through existing durable owner`,

@@ -16274,6 +16274,36 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
   );
 }
 
+/**
+ * Codex App steer authorization (Blocking 1, decision A) from INBOUND SOURCE
+ * FACTS only — the single source of truth shared by both admission twins
+ * (handleNewTopicAdmitted + handleThreadReplyAdmitted), so a plain-human turn is
+ * authorized identically whether it opens a new topic or continues one (R6-B1).
+ * Explicit positive ONLY: a real human sender with NONE of adopt / foreign-bot /
+ * Feishu-bot-sender / substitute-rewrite / v3-grill / message-listener / VC
+ * receiver / VC origin. Never inferred from the delivery sink or a session flag;
+ * every control-rewrite / non-human / dedicated-receiver turn stays forced-serial.
+ */
+function computeCodexAppSteerable(facts: {
+  adopted: boolean;
+  isForeignBot: boolean;
+  isBotSenderType: boolean;
+  substituteTrigger: boolean;
+  threadGrill: boolean;
+  messageListener: boolean;
+  vcMeetingReceiver: boolean;
+  vcMeetingImTurnOrigin: boolean;
+}): boolean {
+  return !facts.adopted
+    && !facts.isForeignBot
+    && !facts.isBotSenderType
+    && !facts.substituteTrigger
+    && !facts.threadGrill
+    && !facts.messageListener
+    && !facts.vcMeetingReceiver
+    && !facts.vcMeetingImTurnOrigin;
+}
+
 async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<void> {
   const { chatId, messageId, chatType, larkAppId, replyRootId, substituteTrigger, messageListener } = ctx;
   // scope/anchor are mutable here: `/t` / `/topic` may flip a 普通群 chat-scope
@@ -16750,6 +16780,21 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     pendingSubstituteTrigger: substituteTrigger,
     pendingSubstituteControlCard: shouldSendSubstituteControlCard,
     pendingSender: newTopicSender,
+    // R6-B1: freeze the plain-human steer authorization into the NEW-TOPIC opening
+    // metadata from inbound source facts (the same helper the follow-up twin uses).
+    // A brand-new session has no VC receiver yet; foreign-bot maps to the bot-sender
+    // fact here. buildReservedInitialInput COPIES this onto the opening payload;
+    // forkReservedInitialSession never infers it.
+    ...(computeCodexAppSteerable({
+      adopted: false,
+      isForeignBot: isBotSenderType,
+      isBotSenderType,
+      substituteTrigger: !!substituteTrigger,
+      threadGrill: false,
+      messageListener: !!messageListener,
+      vcMeetingReceiver: false,
+      vcMeetingImTurnOrigin: !!ctx.vcMeetingImTurnOrigin,
+    }) ? { pendingCodexAppSteerable: true as const } : {}),
     ownerOpenId: senderOpenId,
     currentTurnTitle: initialTurnTitle,
     workingDir: pinnedWorkingDir,
@@ -17929,14 +17974,16 @@ async function handleThreadReplyAdmitted(
   // must FREEZE this into its opening payload — forkReservedInitialSession is
   // shared by bot-added / scheduler / system bootstrap and only COPIES an
   // explicit upstream true, never defaults it.
-  const codexAppSteerable = !ds?.adoptedFrom
-    && !isForeignBot
-    && !isBotSenderType
-    && !substituteTrigger
-    && !threadGrill
-    && !ctx.messageListener
-    && ds?.session.vcMeetingReceiver === undefined
-    && !ctx.vcMeetingImTurnOrigin;
+  const codexAppSteerable = computeCodexAppSteerable({
+    adopted: !!ds?.adoptedFrom,
+    isForeignBot,
+    isBotSenderType,
+    substituteTrigger: !!substituteTrigger,
+    threadGrill: !!threadGrill,
+    messageListener: !!ctx.messageListener,
+    vcMeetingReceiver: ds?.session.vcMeetingReceiver !== undefined,
+    vcMeetingImTurnOrigin: !!ctx.vcMeetingImTurnOrigin,
+  });
 
   const liveTakeoverReady = !!ds?.worker && !ds.worker.killed
     && !hasQueuedActivationAdmissionGate(ds)
@@ -18072,6 +18119,9 @@ async function handleThreadReplyAdmitted(
         ds.pendingAttachments = attachments.length > 0 ? attachments : undefined;
         ds.pendingMentions = parsed.mentions;
         ds.pendingSender = followUpSender;
+        // R6-B1: this inbound becomes the durable opening — freeze its plain-human
+        // steer authorization so the repo-selected opening isn't forced-serial.
+        ds.pendingCodexAppSteerable = codexAppSteerable ? true : undefined;
         const existingSetup = ds.session.pendingRepoSetup;
         stagePendingRepoSetup(ds, {
           mode: existingSetup?.mode ?? 'picker',

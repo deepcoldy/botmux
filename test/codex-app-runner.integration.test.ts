@@ -1319,7 +1319,8 @@ describe('codex-app-runner app-server protocol integration', () => {
       send('follow', 'om_gh_follow');
 
       // Two finals (root superseded + follow real), settled from turn-B-full.
-      await waitFor(harness, () => control.finals.length === 2);
+      // Group-history reconcile does a bounded round-trip → allow the wider wait.
+      await waitFor(harness, () => control.finals.length === 2, 25_000);
       const realFinal = control.finals[control.finals.length - 1];
       // Authority switched to the matched history turn.
       expect(realFinal.turnId).toBe('om_gh_follow');
@@ -1374,8 +1375,10 @@ describe('codex-app-runner app-server protocol integration', () => {
 
       // The fixture starts a Goal C after the non-canonical completion, so the
       // runner stays native-busy — wait on the finals (2: superseded + the
-      // identity-error real), not on an idle boundary.
-      await waitFor(harness, () => control.finals.length === 2);
+      // identity-error real), not on an idle boundary. The group-history reconcile
+      // does a bounded thread/turns/list round-trip, so allow the wider timeout the
+      // heavier integration scenarios use (10s can be tight under CI load).
+      await waitFor(harness, () => control.finals.length === 2, 25_000);
 
       const diagnostics = control.markers.filter(m => m.kind === 'diagnostic');
       expect(diagnostics.length).toBeGreaterThanOrEqual(1);

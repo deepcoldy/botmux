@@ -866,4 +866,99 @@ describe('Codex App worker replacement durable handoff', () => {
     expect(readRequests(requestLog).filter(request => request.method === 'turn/start'))
       .toHaveLength(2);
   }, 40_000);
+
+  it('R6: full durable round-trip — ordered steered group expands to N final_output through worker persist→daemon ACK→commit, first N−1 superseded', async () => {
+    // Closes the "two halves" gap: prior superseded coverage was worker-only
+    // (fallback, no dispatchId) + daemon-only (fake IPC). This drives the REAL
+    // durable path: each member carries a codexAppDispatchId, so the worker calls
+    // waitForCodexAppDaemonPersistence and only commits after the daemon ACK. The
+    // `steer` fixture holds the turn open until the 2nd steer, so root + 2
+    // follow-ups fold into one native turn → 3 final_output, each with a
+    // codexAppSettlement, the first two disposition:'steer_superseded'.
+    const root = mkdtempSync(join(tmpdir(), 'botmux-worker-codex-sup-rt-'));
+    tempDirs.add(root);
+    const fakeCodex = join(root, 'fake-codex');
+    const requestLog = join(root, 'requests.jsonl');
+    copyFileSync(resolve('test/fixtures/fake-codex-app-server.mjs'), fakeCodex);
+    chmodSync(fakeCodex, 0o755);
+    const sessionId = `codex-sup-rt-${process.pid}-${Date.now()}`;
+    tmuxSessions.add(`bmx-${sessionId.slice(0, 8)}`);
+
+    const logs: string[] = [];
+    const messages: WorkerToDaemon[] = [];
+    let followsSent = false;
+    const worker = spawnWorker(
+      root, sessionId, fakeCodex, requestLog, 'steer', logs, messages,
+      (message, child) => {
+        // ACK every durable persistence so the worker can commit each settlement.
+        if (message.type === 'final_output' && message.codexAppSettlement && child.connected) {
+          child.send({
+            type: 'codex_app_dispatch_persisted',
+            requestId: message.codexAppSettlement.requestId,
+            ok: true,
+          } satisfies DaemonToWorker);
+        }
+        if (message.type === 'codex_app_dispatch_transition' && child.connected) {
+          child.send({
+            type: 'codex_app_dispatch_persisted',
+            requestId: message.requestId,
+            ok: true,
+          } satisfies DaemonToWorker);
+        }
+        // After the runner is ready, queue two steerable follow-ups (each durable).
+        if (message.type === 'ready' && !followsSent) {
+          followsSent = true;
+          child.send({
+            type: 'message',
+            content: '<user_message>follow one</user_message>',
+            codexAppInput: { text: 'follow one', clientUserMessageId: 'om_rt_2' },
+            turnId: 'om_rt_2',
+            codexAppDispatchId: 'dispatch-rt-2',
+            codexAppSteerable: true,
+          } as DaemonToWorker);
+          child.send({
+            type: 'message',
+            content: '<user_message>follow two</user_message>',
+            codexAppInput: { text: 'follow two', clientUserMessageId: 'om_rt_3' },
+            turnId: 'om_rt_3',
+            codexAppDispatchId: 'dispatch-rt-3',
+            codexAppSteerable: true,
+          } as DaemonToWorker);
+        }
+      },
+    );
+    worker.send(replacementInit(sessionId, fakeCodex, '<user_message>root</user_message>', {
+      env: { FAKE_CODEX_LOG: requestLog, FAKE_CODEX_BEHAVIOR: 'steer' },
+      turnId: 'om_rt_1',
+      codexAppDispatchId: 'dispatch-rt-1',
+      codexAppSteerable: true,
+      promptCodexAppInput: { text: 'root', clientUserMessageId: 'om_rt_1' },
+    }));
+
+    try {
+      await waitFor(worker, logs, () => messages.filter(m => m.type === 'final_output').length >= 3, 30_000);
+      const finals = messages.filter(
+        (m): m is Extract<WorkerToDaemon, { type: 'final_output' }> => m.type === 'final_output',
+      );
+      // All three went through the durable settlement path (codexAppSettlement).
+      expect(finals.every(f => f.codexAppSettlement !== undefined)).toBe(true);
+      expect(finals.map(f => ({
+        turnId: f.turnId,
+        disposition: (f as any).disposition,
+        suppress: (f as any).suppressDelivery === true,
+      }))).toEqual([
+        { turnId: 'om_rt_1', disposition: 'steer_superseded', suppress: true },
+        { turnId: 'om_rt_2', disposition: 'steer_superseded', suppress: true },
+        { turnId: 'om_rt_3', disposition: undefined, suppress: false },
+      ]);
+      // One turn/start + two turn/steer (ordered steer through the durable path).
+      const turnMethods = readRequests(requestLog)
+        .filter(r => r.method === 'turn/start' || r.method === 'turn/steer').map(r => r.method);
+      expect(turnMethods).toEqual(['turn/start', 'turn/steer', 'turn/steer']);
+      // No wedge: the real final settled (no "rejected final" / no_pending_turn).
+      expect(logs.join('')).not.toContain('rejected final marker');
+    } finally {
+      await stopChild(worker);
+    }
+  }, 40_000);
 });

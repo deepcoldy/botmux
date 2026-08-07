@@ -395,6 +395,52 @@ describe('/rename production routing — must not pre-create a session (review P
     expect(ds?.session.nativeSessionTitle).toBe('[BotMux·Lark] /workflow new 修复首轮授权');
   });
 
+  it('R6-B1: a plain-human Codex App NEW TOPIC freezes steer authorization onto the opening fork payload', async () => {
+    // Production wiring: the MAIN new-topic entry (handleNewTopicAdmitted), NOT
+    // the handleThreadReply safety-net. A pinned-workingDir codex-app bot forks
+    // immediately via forkReservedInitialSession → buildReservedInitialInput,
+    // which must COPY the frozen pendingCodexAppSteerable onto the opening payload.
+    const bot = registerBot({
+      larkAppId: APP,
+      larkAppSecret: 's',
+      cliId: 'codex-app',
+      allowedUsers: [OWNER],
+      defaultWorkingDir: '/tmp',
+    });
+    bot.resolvedAllowedUsers = [OWNER];
+
+    await handleNewTopic(
+      makeEventData('om_ct_new', '第一条真人交互消息'),
+      makeCtx('om_ct_new', 'om_ct_new'),
+    );
+
+    expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
+    // forkWorker's 2nd arg is the opening CliTurnPayload; it must carry the flag.
+    const openingPayload = mocks.forkWorker.mock.calls[0]?.[1] as any;
+    expect(openingPayload?.codexAppSteerable).toBe(true);
+  });
+
+  it('R6-B1: a Feishu bot-sender NEW TOPIC stays forced-serial (no steer authorization)', async () => {
+    const bot = registerBot({
+      larkAppId: APP,
+      larkAppSecret: 's',
+      cliId: 'codex-app',
+      allowedUsers: [OWNER],
+      defaultWorkingDir: '/tmp',
+    });
+    bot.resolvedAllowedUsers = [OWNER];
+
+    // A bot sender (sender_type app) must NOT be authorized to steer.
+    const botEvent = makeEventData('om_ct_bot', 'bot-originated new topic');
+    botEvent.sender = { sender_id: { open_id: OWNER }, sender_type: 'app' };
+    await handleNewTopic(botEvent, makeCtx('om_ct_bot', 'om_ct_bot'));
+
+    if (mocks.forkWorker.mock.calls.length > 0) {
+      const openingPayload = mocks.forkWorker.mock.calls[0]?.[1] as any;
+      expect(openingPayload?.codexAppSteerable).toBeUndefined();
+    }
+  });
+
   it('uses the group name for mention-only sessions on both creation paths', async () => {
     const bot = registerBot({
       larkAppId: APP,
