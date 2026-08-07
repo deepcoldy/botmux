@@ -15,10 +15,14 @@
 import { describe, it, expect } from 'vitest';
 import {
   decideHardTimeoutAction,
+  decidePostHookPromptEvidence,
   decideSettleMarkReady,
   shouldReleaseFirstPromptTimeout,
   shouldWaitForPostSessionStartPromptEvidence,
   shouldWriteNow,
+  POST_HOOK_EVIDENCE_MAX_WAIT_MS,
+  POST_HOOK_EVIDENCE_QUIET_MS,
+  POST_HOOK_EVIDENCE_RETRY_MS,
 } from '../src/utils/input-gate.js';
 
 const base = {
@@ -187,6 +191,89 @@ describe('decideSettleMarkReady', () => {
       promptReadyDetectedDuringSettle: true,
       readyPatternSeenDuringHold: true,
     })).toBe(true);
+  });
+});
+
+describe('decidePostHookPromptEvidence', () => {
+  // A prompt that was already on screen before the SessionStart boundary is
+  // legitimate evidence, but ONLY when the caller can prove it is still there.
+  const waiting = {
+    stillWaiting: true,
+    elapsedMs: 3_000,
+    quietMs: POST_HOOK_EVIDENCE_QUIET_MS,
+    screenHasReadyPattern: true,
+  };
+
+  it('accepts once the PTY is quiet and the prompt is on the current screen', () => {
+    expect(decidePostHookPromptEvidence(waiting)).toEqual({ action: 'accept' });
+  });
+
+  it('steps aside the moment real evidence wins the race', () => {
+    // markPromptReadyFromPty() clears the waiting flag. A timer that already
+    // fired must not seed evidence on top of a session that moved on.
+    expect(decidePostHookPromptEvidence({ ...waiting, stillWaiting: false }))
+      .toEqual({ action: 'stop' });
+  });
+
+  it('gives up at the max wait instead of polling forever', () => {
+    // Handing back to the existing first-prompt timeout is the safe default:
+    // the fallback must never become a second, unbounded readiness path.
+    expect(decidePostHookPromptEvidence({ ...waiting, elapsedMs: POST_HOOK_EVIDENCE_MAX_WAIT_MS }))
+      .toEqual({ action: 'stop' });
+    expect(decidePostHookPromptEvidence({ ...waiting, elapsedMs: POST_HOOK_EVIDENCE_MAX_WAIT_MS + 1 }))
+      .toEqual({ action: 'stop' });
+  });
+
+  it('waits out the remainder of the quiet window rather than accepting early', () => {
+    // THE POINT OF THE QUIET GATE: a startup selector keeps painting, so it
+    // never goes quiet. Accepting before the window closes would put the first
+    // message into a selector's look-alike prompt.
+    const decision = decidePostHookPromptEvidence({ ...waiting, quietMs: 500 });
+    expect(decision.action).toBe('retry');
+    expect(decision.retryInMs).toBe(POST_HOOK_EVIDENCE_QUIET_MS - 500 + 100);
+  });
+
+  it('boundary: exactly the quiet threshold is enough, one ms short is not', () => {
+    expect(decidePostHookPromptEvidence({ ...waiting, quietMs: POST_HOOK_EVIDENCE_QUIET_MS }).action)
+      .toBe('accept');
+    expect(decidePostHookPromptEvidence({ ...waiting, quietMs: POST_HOOK_EVIDENCE_QUIET_MS - 1 }).action)
+      .toBe('retry');
+  });
+
+  it('THE SCROLLBACK TRAP: a quiet PTY without the prompt on screen must NOT accept', () => {
+    // The first cut of this fix read recentTerminalLogTail() — the appended PTY
+    // log with ANSI stripped. A ❯ the TUI had already erased still matched
+    // there, so a quiet-but-not-ready screen would have been accepted and the
+    // first message forced into a UI that wasn't listening. The caller now
+    // passes renderer.rawSnapshot(); this case pins the decision it feeds.
+    const decision = decidePostHookPromptEvidence({ ...waiting, screenHasReadyPattern: false });
+    expect(decision).toEqual({ action: 'retry', retryInMs: POST_HOOK_EVIDENCE_RETRY_MS });
+  });
+
+  it('keeps retrying while the prompt is absent, until the window expires', () => {
+    // Absent prompt at 9s → still retry; at 10s the max-wait stop wins.
+    expect(decidePostHookPromptEvidence({ ...waiting, elapsedMs: 9_000, screenHasReadyPattern: false }).action)
+      .toBe('retry');
+    expect(decidePostHookPromptEvidence({ ...waiting, elapsedMs: 10_000, screenHasReadyPattern: false }).action)
+      .toBe('stop');
+  });
+
+  it('stop beats every other condition — an expired window never accepts', () => {
+    expect(decidePostHookPromptEvidence({
+      stillWaiting: false,
+      elapsedMs: 0,
+      quietMs: 60_000,
+      screenHasReadyPattern: true,
+    })).toEqual({ action: 'stop' });
+  });
+
+  it('honours caller-supplied thresholds', () => {
+    expect(decidePostHookPromptEvidence({
+      ...waiting, quietMs: 400, quietThresholdMs: 300,
+    }).action).toBe('accept');
+    expect(decidePostHookPromptEvidence({
+      ...waiting, elapsedMs: 4_000, maxWaitMs: 4_000,
+    }).action).toBe('stop');
   });
 });
 

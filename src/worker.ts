@@ -43,10 +43,13 @@ import { BridgeTurnQueue, makeFingerprint, normaliseForFingerprint } from './ser
 import { shouldEmitEmptyCompletedBridgeFallback, shouldSuppressBridgeEmit, type BridgeSendMarker } from './services/bridge-fallback-gate.js';
 import {
   decideHardTimeoutAction,
+  decidePostHookPromptEvidence,
   decideSettleMarkReady,
   shouldReleaseFirstPromptTimeout,
   shouldWaitForPostSessionStartPromptEvidence,
   shouldWriteNow,
+  POST_HOOK_EVIDENCE_FALLBACK_MS,
+  POST_HOOK_EVIDENCE_RETRY_MS,
 } from './utils/input-gate.js';
 import {
   decideCodexRunnerFreshness,
@@ -5685,6 +5688,62 @@ function recentTerminalLogTail(): string | undefined {
   return tailChars(plain, CRASH_LOG_TAIL_MAX);
 }
 
+/**
+ * 兜底：SessionStart 边界之后接受「屏幕上已有的」提示符。
+ * 判据本身是 decidePostHookPromptEvidence()（input-gate.ts），这里只负责取数据
+ * 和排定时器。
+ *
+ * 提示符必须从**渲染后的画面**读（renderer.rawSnapshot()），不能用
+ * recentTerminalLogTail() —— 后者是 PTY 追加日志，stripAnsi 之后擦除语义全丢，
+ * 一个早已被 TUI 抹掉的 ❯ 照样匹配得上，会把首条消息灌进还没就绪的界面。
+ * 另外只有 rawSnapshot() 才含 ❯ 行，snapshot() 会把它过滤掉。
+ */
+let postHookEvidenceFallbackTimer: ReturnType<typeof setTimeout> | null = null;
+
+function clearPostHookEvidenceFallback(): void {
+  if (postHookEvidenceFallbackTimer) {
+    clearTimeout(postHookEvidenceFallbackTimer);
+    postHookEvidenceFallbackTimer = null;
+  }
+}
+
+/** 当前渲染画面是否有提示符（renderer 尚未就绪时按「没有」处理，等下一轮）。 */
+function screenShowsReadyPattern(): boolean {
+  const pattern = cliAdapter?.readyPattern;
+  if (!pattern) return false;
+  let screen = '';
+  try { screen = renderer?.rawSnapshot() ?? ''; } catch { return false; }
+  return !!screen && pattern.test(screen);
+}
+
+function armPostHookPromptEvidenceFallback(
+  startedAt: number = Date.now(),
+  delayMs: number = POST_HOOK_EVIDENCE_FALLBACK_MS,
+): void {
+  clearPostHookEvidenceFallback();
+  postHookEvidenceFallbackTimer = setTimeout(() => {
+    postHookEvidenceFallbackTimer = null;
+    const quietMs = Date.now() - lastPtyOutputAtMs;
+    const decision = decidePostHookPromptEvidence({
+      stillWaiting: awaitingPostSessionStartPromptEvidence,
+      elapsedMs: Date.now() - startedAt,
+      quietMs,
+      screenHasReadyPattern: screenShowsReadyPattern(),
+    });
+    if (decision.action === 'stop') return;
+    if (decision.action === 'retry') {
+      armPostHookPromptEvidenceFallback(startedAt, decision.retryInMs ?? POST_HOOK_EVIDENCE_RETRY_MS);
+      return;
+    }
+    // seedReadyEvidence() 只补 readySeen，仍走完整静默判定；随后由既有的
+    // markIdle('screen') → markPromptReadyFromPty() 链路清除等待标记。
+    if (idleDetector?.seedReadyEvidence()) {
+      log(`Post-SessionStart evidence fallback: screen quiet ${quietMs}ms with readyPattern on screen; accepting existing prompt`);
+    }
+  }, delayMs);
+  postHookEvidenceFallbackTimer.unref?.();
+}
+
 function crashDiagnosticPath(): string | undefined {
   const dataDir = process.env.SESSION_DATA_DIR;
   if (!dataDir || !sessionId) return undefined;
@@ -7711,6 +7770,7 @@ function markPromptReady(): void {
       return;
     }
     awaitingPostSessionStartPromptEvidence = false;
+    clearPostHookEvidenceFallback();
     log('Fresh prompt evidence observed after SessionStart hooks');
   }
   if (isSettlingFirstFlush) {
@@ -7767,6 +7827,7 @@ function markPromptReady(): void {
   if (awaitingFirstPrompt) {
     awaitingFirstPrompt = false;
     awaitingPostSessionStartPromptEvidence = false;
+    clearPostHookEvidenceFallback();
     renderer?.markNewTurn();  // exclude history replay from streaming card
   }
   send({ type: 'prompt_ready' });
@@ -11665,6 +11726,7 @@ async function spawnCli(
   promptReadyDetectedDuringSettle = false;
   readyPatternSeenDuringHold = false;
   awaitingPostSessionStartPromptEvidence = false;
+  clearPostHookEvidenceFallback();
   // Reset quiescence baseline so the settle measures silence from THIS spawn.
   lastPtyOutputAtMs = Date.now();
   const readyHookAvailable = effectiveReadyHookInstall
@@ -12025,6 +12087,7 @@ async function spawnCli(
 
     awaitingFirstPrompt = false;
     awaitingPostSessionStartPromptEvidence = false;
+    clearPostHookEvidenceFallback();
     renderer?.markNewTurn();
     log(forced
       ? `WARN First prompt hard timeout — ${cliName()} readyPattern did not arrive; forcing queued message flush`
@@ -12102,6 +12165,7 @@ function killCli(opts: {
   promptReadyDetectedDuringSettle = false;
   readyPatternSeenDuringHold = false;
   awaitingPostSessionStartPromptEvidence = false;
+  clearPostHookEvidenceFallback();
   stopStuckDetector();
   tuiPromptBlocking = false;
   stopScreenUpdates();
@@ -14771,6 +14835,7 @@ process.on('message', async (raw: unknown) => {
         idleDetector?.resetReadyEvidence();
         lastPtyOutputAtMs = Date.now();
         log('SessionStart boundary recorded — waiting for fresh post-hook prompt evidence');
+        armPostHookPromptEvidenceFallback();
       }
       // 先记下 gate 是否已被 45s fallback 释放：ReadyGate.receive() 是一次性
       // 语义，fallback 抢先后 releaseReadyGate 会整块跳过迟到的真信号。
