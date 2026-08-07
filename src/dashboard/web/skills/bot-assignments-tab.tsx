@@ -216,7 +216,7 @@ export function BotAssignmentsTab(props: BotAssignmentsTabProps) {
                     data-palette-drag-id={pack.id}
                     onDragStart={event => startDrag(event, { type: 'pack', id: pack.id }, 'copy')}
                     onDragEnd={clearDragState}
-                    title={`${pack.name} (${pack.include.length} skills)`}
+                    title={`${pack.name} (${tr('skills.skillCount', { count: pack.include.length })})`}
                   >
                     {pack.name}
                   </span>
@@ -499,7 +499,7 @@ function BotAssignmentEditor(props: {
               <label key={pack.id} className="skills-pack-skill-item">
                 <input type="checkbox" checked={packDraft.has(pack.id)} onChange={() => togglePack(pack.id)} />
                 <span>{pack.name}</span>
-                <small>{pack.include.length} skills</small>
+                <small>{tr('skills.skillCount', { count: pack.include.length })}</small>
               </label>
             ))}
             {props.packs.length === 0 && <small className="muted">{tr('skills.packsEmpty')}</small>}

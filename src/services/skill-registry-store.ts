@@ -61,17 +61,27 @@ export interface SkillRegistryFile {
   skills: Record<string, SkillPackage>;
 }
 
+function emptySkillRegistryMap(): Record<string, SkillPackage> {
+  return Object.create(null) as Record<string, SkillPackage>;
+}
+
 export function readSkillRegistry(): SkillRegistryFile {
   const file = skillRegistryPath();
-  if (!existsSync(file)) return { schemaVersion: 1, skills: {} };
+  if (!existsSync(file)) return { schemaVersion: 1, skills: emptySkillRegistryMap() };
   try {
     const parsed = JSON.parse(readFileSync(file, 'utf-8'));
+    const skills = emptySkillRegistryMap();
+    if (parsed?.skills && typeof parsed.skills === 'object' && !Array.isArray(parsed.skills)) {
+      for (const [name, skill] of Object.entries(parsed.skills)) {
+        skills[name] = skill as SkillPackage;
+      }
+    }
     return {
       schemaVersion: 1,
-      skills: parsed?.skills && typeof parsed.skills === 'object' ? parsed.skills : {},
+      skills,
     };
   } catch {
-    return { schemaVersion: 1, skills: {} };
+    return { schemaVersion: 1, skills: emptySkillRegistryMap() };
   }
 }
 

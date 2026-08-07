@@ -4,7 +4,7 @@ type DashboardMessages = Record<string, string>;
 
 export const DASHBOARD_LOCALE_STORAGE_KEY = 'botmux.dashboard.locale';
 
-const zh: DashboardMessages = {
+const zh = {
   'app.name': 'botmux',
   'app.subtitle': '飞书 AI CLI 控制台',
   'nav.docs': '文档',
@@ -1313,6 +1313,7 @@ const zh: DashboardMessages = {
   'settings.hostOverloadAlertEnterLoadHelp': '当 15 分钟平均负载 > 逻辑核数 × 此值时判定为过载。默认 1.5。恢复线固定为内置默认（核数 × 1.0）；若你把进入线设得比它还低，恢复线会自动压到进入线的 95%，以保证「低于进入线才算恢复」不抖动。',
   'settings.hostOverloadAlertEnterMem': '内存进入阈值（%）',
   'settings.hostOverloadAlertEnterMemHelp': '当已用内存占比 ≥ 此百分比时判定为过载。默认 92。恢复线固定为内置默认（85%）；同样在你把进入线设得更低时,自动压到进入线的 95%。',
+  'settings.noVisibleOutputHint': '“无可见输出”防重发提示',
   'settings.noVisibleOutputHintHelp': '实验性，默认关闭。在 botmux 路由提示里加一段纠偏：告诉模型 botmux send 成功即已送达、本轮无可见文本地结束是正常的、看到「无可见输出请继续」是底层 CLI（Claude Code ≥2.1.212）的误判不要重发。主要用于 Claude Code 驱动非 Claude 后端模型时（易把 thinking-only nudge 误读为发送失败而重复回复）；对纯 Claude 场景无害但通常无需开启。开关翻动下一个会话即生效，无需重启。',
   'settings.sectionVcMeetingAgent': '会议监听',
   'settings.vcMeetingAgent': '允许本机使用会议监听能力',
@@ -1679,6 +1680,10 @@ const zh: DashboardMessages = {
   'skills.globalDelivery': 'Skill 注入方式',
   'skills.bots': 'Bot Skill 配置',
   'skills.botsHelp': '为每个 bot 设置优先披露的 Skill。',
+  'skills.bot': 'Bot',
+  'skills.cli': 'CLI',
+  'skills.injection': '注入方式',
+  'skills.status': '状态',
   'skills.dragHint': '从左侧拖入即可分配；把 Bot 中的芯片拖回左侧即可取消',
   'skills.dragToRemove': '拖回左侧取消此分配',
   'skills.unassignDropTitle': '拖到这里取消分配',
@@ -1743,9 +1748,11 @@ const zh: DashboardMessages = {
   'skills.packRefCount': '{count} 个 Bot',
   'skills.packRefs': '已分配 Bot',
   'skills.packMissing': '缺失 Skill',
+  'skills.packIdPlaceholder': 'my-pack-slug',
+  'skills.packTagsPlaceholder': '标签1, 标签2',
   'skills.packDeleted': '已删除“{name}”',
   'skills.packDeleteConfirmTitle': '删除专项包',
-  'skills.packDeleteConfirmBody': '专项包“{name}”仍被 Bot 引用。强制删除会从这些 Bot 的 policy 中移除对应 pack: 引用，但不会卸载成员 Skill。',
+  'skills.packDeleteConfirmBody': '专项包“{name}”仍被 Bot 引用。强制删除只会删除专项包，不会自动清理这些 Bot policy 中的 pack: 引用，也不会卸载成员 Skill；删除后这些引用将显示为缺失。',
   'skills.packDeleteAffectedBots': '受影响的 Bot',
   'skills.packDeleteForceWarning': '此操作不可撤销，受影响的 Bot 将在新会话中失去该包提供的能力。',
   'skills.installWizard': '安装向导',
@@ -2267,9 +2274,9 @@ const zh: DashboardMessages = {
   'workflow.v3.cancelAlreadyTerminal': '运行已先一步进入终态，未再提交取消。',
   'workflow.v3.cancelAuthRequired': '需要 Dashboard 写权限：请在终端运行 `botmux dashboard` 获取当前登录链接后重试。',
   'workflow.v3.cancelFailed': '取消失败：{error}',
-};
+} satisfies DashboardMessages;
 
-const en: DashboardMessages = {
+const en: Record<keyof typeof zh, string> = {
   'app.name': 'botmux',
   'app.subtitle': 'Feishu AI CLI Control',
   'nav.docs': 'Docs',
@@ -3945,6 +3952,10 @@ const en: DashboardMessages = {
   'skills.globalDelivery': 'Skill Delivery',
   'skills.bots': 'Bot Skill Settings',
   'skills.botsHelp': 'Choose priority Skills for each bot to disclose first.',
+  'skills.bot': 'Bot',
+  'skills.cli': 'CLI',
+  'skills.injection': 'Injection',
+  'skills.status': 'Status',
   'skills.dragHint': 'Drag from the left to assign; drag a Bot chip back here to unassign',
   'skills.dragToRemove': 'Drag back to the left to unassign',
   'skills.unassignDropTitle': 'Drop here to unassign',
@@ -4009,9 +4020,11 @@ const en: DashboardMessages = {
   'skills.packRefCount': '{count} Bots',
   'skills.packRefs': 'Assigned Bots',
   'skills.packMissing': 'Missing Skills',
+  'skills.packIdPlaceholder': 'my-pack-slug',
+  'skills.packTagsPlaceholder': 'tag1, tag2',
   'skills.packDeleted': 'Deleted "{name}"',
   'skills.packDeleteConfirmTitle': 'Delete Skill Pack',
-  'skills.packDeleteConfirmBody': 'Pack "{name}" is still referenced by Bots. Force-deleting removes the pack: reference from those Bots\' policies, but does not uninstall member skills.',
+  'skills.packDeleteConfirmBody': 'Pack "{name}" is still referenced by Bots. Force-deleting removes only the pack; it does not clean up pack: references in Bot policies or uninstall member skills. Those references will be shown as missing.',
   'skills.packDeleteAffectedBots': 'Affected Bots',
   'skills.packDeleteForceWarning': 'This cannot be undone. Affected Bots will lose the pack\'s skills in new sessions.',
   'skills.installWizard': 'Install Wizard',

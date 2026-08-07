@@ -162,6 +162,11 @@ import {
   SkillPackStoreError,
 } from './services/skill-pack-store.js';
 import { redactGitUrlCredentials } from './core/skills/sources.js';
+import {
+  enrichPackForDashboard,
+  enrichPacksForDashboard,
+  sanitizeSkillForDashboard,
+} from './dashboard/skill-pack-response.js';
 import { effectiveDefaultWorkingDir, getBot, loadBotConfigs, parseBotConfigsFromText, type BotConfig, type VcMeetingAgentConfig } from './bot-registry.js';
 import { addChatToFeedGroup, createFeedGroup, FEED_GROUP_SCOPES, FeedGroupApiError, listFeedGroups } from './dashboard/feed-groups.js';
 import { generateAuthUrl, handleCallbackUrl, isCallbackUrl } from './utils/user-token.js';
@@ -2531,14 +2536,6 @@ function startSkillJob(type: SkillJob['type'], run: () => Promise<SkillPackage |
   return job;
 }
 
-function sanitizeSkillForDashboard(skill: SkillPackage): SkillPackage {
-  if (skill.source.type !== 'git') return skill;
-  return {
-    ...skill,
-    source: { ...skill.source, url: redactGitUrlCredentials(skill.source.url) },
-  };
-}
-
 function dashboardSkillCliIds(): CliId[] {
   const ids = new Set<CliId>();
   // Always scan all known CLI skill dirs, not just configured bots — users may
@@ -2587,27 +2584,6 @@ function botsReferencingPack(packId: string, bots: BotConfig[]): Array<{ larkApp
     .sort((a, b) => a.botName.localeCompare(b.botName));
 }
 
-function enrichPackForDashboard(
-  pack: SkillPack,
-  registrySkills: Record<string, SkillPackage>,
-  bots: BotConfig[],
-): SkillPack & { resolvedSkills: SkillPackage[]; missingSkills: string[]; references: Array<{ larkAppId: string; botName: string }> } {
-  const resolvedSkills: SkillPackage[] = [];
-  const missingSkills: string[] = [];
-  for (const selector of pack.include) {
-    const name = selector.slice('skill:'.length);
-    const skill = registrySkills[name];
-    if (skill) resolvedSkills.push(skill);
-    else missingSkills.push(name);
-  }
-  return {
-    ...pack,
-    resolvedSkills,
-    missingSkills,
-    references: botsReferencingPack(pack.id, bots),
-  };
-}
-
 function parsePackInput(body: unknown): { id: string; name: string; description?: string; tags?: string[]; include: Array<`skill:${string}`> } {
   if (!body || typeof body !== 'object' || Array.isArray(body)) throw new SkillPackStoreError({ code: 'SKILL_PACK_INVALID', reason: 'body must be an object' });
   const b = body as Record<string, unknown>;
@@ -2654,7 +2630,11 @@ function packErrorBody(err: unknown): { ok: false; error: string; [key: string]:
     if (d.code === 'SKILL_PACK_INVALID_SELECTOR') body.selector = d.selector;
     return body;
   }
-  return { ok: false, error: 'internal_error', detail: err instanceof Error ? err.message : String(err) };
+  return {
+    ok: false,
+    error: 'internal_error',
+    detail: redactGitUrlCredentials(err instanceof Error ? err.message : String(err)),
+  };
 }
 
 function mergeSkillReferenceBot(refs: Map<string, SkillReferenceBot>, ref: SkillReferenceBot): void {
@@ -3804,7 +3784,11 @@ const server = createServer(async (req, res) => {
     if (req.method === 'GET' && url.pathname === '/api/skill-packs') {
       const registrySkills = readSkillRegistry().skills;
       const bots = loadBotConfigsSafe();
-      const packs = listSkillPacks().map((pack) => enrichPackForDashboard(pack, registrySkills, bots));
+      const packs = enrichPacksForDashboard(
+        listSkillPacks(),
+        registrySkills,
+        (packId) => botsReferencingPack(packId, bots),
+      );
       return jsonRes(res, 200, { ok: true, packs });
     }
 
@@ -3827,7 +3811,10 @@ const server = createServer(async (req, res) => {
       if (!pack) return jsonRes(res, 404, { ok: false, error: 'SKILL_PACK_NOT_FOUND' });
       const registrySkills = readSkillRegistry().skills;
       const bots = loadBotConfigsSafe();
-      return jsonRes(res, 200, { ok: true, pack: enrichPackForDashboard(pack, registrySkills, bots) });
+      return jsonRes(res, 200, {
+        ok: true,
+        pack: enrichPackForDashboard(pack, registrySkills, botsReferencingPack(pack.id, bots)),
+      });
     }
 
     if (req.method === 'PUT' && (mPack = url.pathname.match(/^\/api\/skill-packs\/([^/]+)$/))) {

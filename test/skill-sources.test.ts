@@ -12,6 +12,14 @@ describe('skill install sources', () => {
     expect(() => parseSkillInstallSource('https://user:secret@example.com/acme/skills')).toThrow(/git_url_credentials_not_allowed/);
   });
 
+  it('rejects embedded passwords in SSH and git protocol URLs while allowing SSH usernames', () => {
+    expect(() => parseSkillInstallSource('git+ssh://user:secret@example.com/acme/skills.git'))
+      .toThrow(/git_url_credentials_not_allowed/);
+    expect(() => parseSkillInstallSource('git://user:secret@example.com/acme/skills.git'))
+      .toThrow(/git_url_credentials_not_allowed/);
+    expect(parseSkillInstallSource('git+ssh://git@example.com/acme/skills.git')).toMatchObject({ kind: 'git' });
+  });
+
   it('redacts URL credentials for display and errors', () => {
     expect(redactGitUrlCredentials('https://user:secret@example.com/acme/skills.git'))
       .toBe('https://***:***@example.com/acme/skills.git');

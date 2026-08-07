@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
@@ -71,6 +71,13 @@ describe('skill pack store', () => {
     createSkillPack({ id: 'x', name: 'X', include: ['skill:a'] });
     expect(() => createSkillPack({ id: 'x', name: 'X2', include: ['skill:b'] }))
       .toThrow(SkillPackStoreError);
+  });
+
+  it('supports valid ids that collide with Object prototype properties', () => {
+    const created = createSkillPack({ id: 'constructor', name: 'Constructor', include: ['skill:a'] });
+    expect(getSkillPack('constructor')).toEqual(created);
+    deleteSkillPack('constructor');
+    expect(getSkillPack('constructor')).toBeUndefined();
   });
 
   it('rejects invalid ids', () => {
@@ -161,5 +168,34 @@ describe('skill pack store', () => {
     }));
 
     expect(Object.keys(readSkillPackRegistry().packs)).toEqual(['valid']);
+  });
+
+  it('refuses to overwrite a malformed existing registry during mutation', () => {
+    const dir = join(home, '.botmux', 'skills');
+    const file = join(dir, 'packs.json');
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(file, '{ malformed');
+
+    expect(readSkillPackRegistry()).toEqual({ schemaVersion: 1, packs: {} });
+    expect(() => createSkillPack({ id: 'new-pack', name: 'New', include: ['skill:a'] }))
+      .toThrow(/SKILL_PACK_INVALID/);
+    expect(readFileSync(file, 'utf-8')).toBe('{ malformed');
+  });
+
+  it('refuses to drop an invalid stored sibling during mutation', () => {
+    const dir = join(home, '.botmux', 'skills');
+    const file = join(dir, 'packs.json');
+    mkdirSync(dir, { recursive: true });
+    const original = JSON.stringify({
+      schemaVersion: 1,
+      packs: {
+        broken: { id: 'broken', name: 'Broken', include: [123], revision: 1 },
+      },
+    });
+    writeFileSync(file, original);
+
+    expect(() => createSkillPack({ id: 'new-pack', name: 'New', include: ['skill:a'] }))
+      .toThrow(/SKILL_PACK_INVALID/);
+    expect(readFileSync(file, 'utf-8')).toBe(original);
   });
 });
