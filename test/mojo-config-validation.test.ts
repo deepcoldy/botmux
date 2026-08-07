@@ -22,8 +22,8 @@ import {
   MOJO_CONTROL_ENV_KEYS,
   MOJO_IDENTITY_KEYS,
   MOJO_LIVE_PATCH_KEYS,
-  mojoLivePatchDiffers,
   normalizeMojoConfig,
+  normalizeMojoLivePatch,
   pickMojoLivePatch,
   pickMojoSessionIdentity,
 } from '../src/adapters/backend/mojo-types.js';
@@ -378,17 +378,56 @@ describe('live credential patch', () => {
     expect(JSON.stringify(patch)).not.toContain('/evil');
   });
 
-  it('diffs against the BACKEND state, so a rollback is detected', () => {
-    // The daemon cannot know which patches a live worker already applied, so
-    // comparing against the init snapshot missed `A → B → A`.
-    expect(mojoLivePatchDiffers({ jwt: 'B' }, { jwt: 'A' })).toBe(true);
-    expect(mojoLivePatchDiffers({ jwt: 'A' }, { jwt: 'A' })).toBe(false);
+
+});
+
+describe('normalizeMojoLivePatch', () => {
+  it('accepts a null tombstone (the config validator rejects it)', () => {
+    // This split is the whole point: the CONFIG validator requires a non-empty
+    // jwt string, so reusing it silently dropped every clear request at the IPC
+    // boundary and the credential stayed live for the worker's lifetime.
+    expect(normalizeMojoConfig({ jwt: null }).ok).toBe(false);
+    const r = normalizeMojoLivePatch({ jwt: null });
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.value).toEqual({ jwt: null });
   });
 
-  it('treats a clear as a real change', () => {
-    expect(mojoLivePatchDiffers({ jwt: 'A' }, { jwt: null })).toBe(true);
-    expect(mojoLivePatchDiffers({ jwt: null }, { jwt: null })).toBe(false);
-    expect(mojoLivePatchDiffers(undefined, { jwt: null })).toBe(false);
-    expect(mojoLivePatchDiffers(undefined, { jwt: 'A' })).toBe(true);
+  it('accepts a rotation', () => {
+    const r = normalizeMojoLivePatch({ jwt: 'new-token' });
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.value).toEqual({ jwt: 'new-token' });
+  });
+
+  it('treats an absent patch as an empty one', () => {
+    for (const raw of [undefined, null, {}]) {
+      const r = normalizeMojoLivePatch(raw);
+      expect(r.ok).toBe(true);
+      if (r.ok) expect(r.value).toEqual({});
+    }
+  });
+
+  it('rejects anything beyond jwt — a patch must not widen', () => {
+    // env in particular is equivalent to replacing the launcher.
+    for (const raw of [
+      { env: { PATH: '/evil' } },
+      { jwt: 'x', cloud: true },
+      { baseUrl: 'https://tenant-b.example.com' },
+      { bin: '/evil/mojo' },
+    ]) {
+      const r = normalizeMojoLivePatch(raw);
+      expect(r.ok, JSON.stringify(raw)).toBe(false);
+    }
+  });
+
+  it('rejects a malformed jwt', () => {
+    for (const bad of ['', '   ', 5, true, {}, []]) {
+      expect(normalizeMojoLivePatch({ jwt: bad }).ok, JSON.stringify(bad)).toBe(false);
+    }
+  });
+
+  it('rejects a non-object payload', () => {
+    for (const bad of ['x', 5, ['a']]) {
+      expect(normalizeMojoLivePatch(bad).ok, JSON.stringify(bad)).toBe(false);
+    }
   });
 });

@@ -11,6 +11,7 @@
  */
 import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
@@ -316,15 +317,27 @@ echo '{"type":"result","status":"ok","result":"ok","session_id":"sid-jwt","warni
     expect(seen(dump)).toEqual(['[A]', '[]']);
   }, 30_000);
 
-  it('after clearing, falls back to the host login rather than nothing', async () => {
-    // "Cleared" means "stop overriding", not "block auth" — buildEnv reads the
-    // ambient value from the env the worker supplied. Asserted explicitly so the
-    // clear case above is not misread as "auth is disabled".
-    const dump = join(binDir, 'clear-fallback.txt');
+  it('a cleared credential does NOT fall back to an inherited one', async () => {
+    // Semantics tightened per review: the daemon already folds the ambient
+    // fallback into the snapshot it sends, so `null` means "no credential from any
+    // layer". Previously a clear only unset config.jwt and buildEnv re-read
+    // jwtEnv from the init-time env, reviving a stale token.
+    const dump = join(binDir, 'clear-nofallback.txt');
     const bin = jwtRecordingMojo(dump);
     const backend = new MojoBackend({ bin, jwt: 'A' }, 's');
-    await turns(backend, [undefined, { jwt: null }], { X_JWT_TOKEN: 'host-login' });
-    expect(seen(dump)).toEqual(['[A]', '[host-login]']);
+    await turns(backend, [undefined, { jwt: null }], { X_JWT_TOKEN: 'inherited' });
+    expect(seen(dump)).toEqual(['[A]', '[]']);
+  }, 30_000);
+
+  it('a cleared credential also ignores a stale jwtEnv source', async () => {
+    const dump = join(binDir, 'clear-jwtenv.txt');
+    const bin = jwtRecordingMojo(dump);
+    const backend = new MojoBackend(
+      { bin, jwtEnv: 'MY_JWT', env: { MY_JWT: 'stale-A' } },
+      's',
+    );
+    await turns(backend, [undefined, { jwt: null }]);
+    expect(seen(dump)).toEqual(['[stale-A]', '[]']);
   }, 30_000);
 
   it('ignores an undefined jwt (the daemon had nothing to say)', async () => {
@@ -335,14 +348,10 @@ echo '{"type":"result","status":"ok","result":"ok","session_id":"sid-jwt","warni
     expect(seen(dump)).toEqual(['[A]', '[A]']);
   }, 30_000);
 
-  it('reports its own state so the daemon can diff against reality', () => {
-    const backend = new MojoBackend({ jwt: 'A' }, 's');
-    expect(backend.livePatchState()).toEqual({ jwt: 'A' });
-    backend.applyLivePatch({ jwt: null });
-    expect(backend.livePatchState()).toEqual({ jwt: null });
-  });
 
   it('cannot be used to change the control plane or the launcher', () => {
+    // The patch now lands in a dedicated `liveJwt` field rather than mutating
+    // config, so the frozen launch identity is structurally out of reach.
     const backend = new MojoBackend(
       { cloud: true, baseUrl: 'https://tenant-a.example.com', bin: '/frozen/mojo' },
       's',
@@ -351,13 +360,51 @@ echo '{"type":"result","status":"ok","result":"ok","session_id":"sid-jwt","warni
       jwt: 'x',
       ...{ baseUrl: 'https://tenant-b.example.com', cloud: false, bin: '/evil/mojo', env: { PATH: '/evil' } },
     } as never);
-    const cfg = (backend as unknown as { config: Record<string, unknown> }).config;
-    expect(cfg.baseUrl).toBe('https://tenant-a.example.com');
-    expect(cfg.cloud).toBe(true);
-    expect(cfg.bin).toBe('/frozen/mojo');
-    expect(cfg.env).toBeUndefined();
-    expect(cfg.jwt).toBe('x');
+    const inner = backend as unknown as {
+      config: Record<string, unknown>;
+      liveJwt: string | null | undefined;
+    };
+    expect(inner.config.baseUrl).toBe('https://tenant-a.example.com');
+    expect(inner.config.cloud).toBe(true);
+    expect(inner.config.bin).toBe('/frozen/mojo');
+    expect(inner.config.env).toBeUndefined();
+    expect(inner.liveJwt).toBe('x');
   });
+
+  it('resolves the binary on the EFFECTIVE child PATH, not the daemon ambient one', async () => {
+    // locateOnPath reads THIS process's env, so a per-bot PATH was ignored and the
+    // child ran a different install than the one that was pinned — changing the
+    // documented semantics of per-bot env.
+    const perBotDir = mkdtempSync(join(tmpdir(), 'mojo-perbot-'));
+    const perBotBin = join(perBotDir, 'mojo');
+    writeFileSync(perBotBin, '#!/usr/bin/env bash\nexit 0\n');
+    chmodSync(perBotBin, 0o755);
+    try {
+      const backend = new MojoBackend({}, 's');
+      // injectEnv is the per-bot layer the worker hands over at spawn.
+      backend.spawn('', [], { env: { PATH: '/nonexistent' }, injectEnv: { PATH: perBotDir } } as never);
+      expect((backend as unknown as { resolveBin(): string }).resolveBin()).toBe(perBotBin);
+    } finally {
+      rmSync(perBotDir, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  it('lets mojo.env PATH win over the per-bot layer, matching buildEnv', async () => {
+    const a = mkdtempSync(join(tmpdir(), 'mojo-a-'));
+    const b = mkdtempSync(join(tmpdir(), 'mojo-b-'));
+    for (const d of [a, b]) {
+      writeFileSync(join(d, 'mojo'), '#!/usr/bin/env bash\nexit 0\n');
+      chmodSync(join(d, 'mojo'), 0o755);
+    }
+    try {
+      const backend = new MojoBackend({ env: { PATH: b } }, 's');
+      backend.spawn('', [], { env: {}, injectEnv: { PATH: a } } as never);
+      expect((backend as unknown as { resolveBin(): string }).resolveBin()).toBe(join(b, 'mojo'));
+    } finally {
+      rmSync(a, { recursive: true, force: true });
+      rmSync(b, { recursive: true, force: true });
+    }
+  }, 30_000);
 
   it('pins the binary once, so a later PATH change cannot swap it', async () => {
     // Belt and braces: env is no longer patchable, but the binary was previously

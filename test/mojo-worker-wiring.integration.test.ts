@@ -592,6 +592,95 @@ describe('mojo worker wiring', () => {
     expect(invocation.argv).toContain('--idle-timeout');
   }, 40_000);
 
+  it('clears the JWT through the REAL IPC boundary (A → null)', async () => {
+    // The previous clear test called backend.applyLivePatch() directly and so
+    // bypassed the worker's validator — which rejected every `null` tombstone
+    // (`jwt must be a string`), meaning the backend never saw a clear request in
+    // production. This drives it over real IPC, two turns, one process.
+    const root = realpathSync(mkdtempSync(join(tmpdir(), 'botmux-mojo-clear-')));
+    let child: ChildProcess | undefined;
+    const logs: string[] = [];
+    const dump = join(root, 'jwts.txt');
+    try {
+      const appId = 'app_mojo_clear';
+      const botsPath = join(root, 'bots.json');
+      writeFileSync(botsPath, JSON.stringify([{
+        larkAppId: appId, larkAppSecret: 'secret',
+        cliId: 'mojo', backendType: 'mojo',
+        // A stale credential reachable via jwtEnv: clearing must not revive it.
+        mojo: { cloud: true, jwtEnv: 'MY_JWT', env: { MY_JWT: 'stale-A' } },
+      }]));
+      // Append X_JWT_TOKEN on every invocation so the two turns are comparable.
+      const bin = join(root, 'mojo');
+      writeFileSync(bin, `#!/usr/bin/env bash
+echo "[$X_JWT_TOKEN]" >> ${dump}
+echo '{"type":"system","subtype":"init","session_id":"sid-clear"}'
+echo '{"type":"result","status":"ok","result":"ok","session_id":"sid-clear","warnings":[]}'
+`);
+      chmodSync(bin, 0o755);
+
+      let ready = 0;
+      child = spawn(process.execPath, ['--import', 'tsx', resolve('src/worker.ts')], {
+        cwd: resolve('.'),
+        env: {
+          ...process.env,
+          HOME: root, SESSION_DATA_DIR: root, BOTS_CONFIG: botsPath,
+          BOTMUX_SESSION_ID: 'sid-clear',
+          LARK_APP_ID: appId, LARK_APP_SECRET: 'secret',
+          PATH: `${root}:${process.env.PATH ?? ''}`,
+          // Ambient must not stand in for a cleared credential either.
+          X_JWT_TOKEN: 'ambient-token',
+        },
+        stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+      });
+      child.stdout?.on('data', c => logs.push(c.toString()));
+      child.stderr?.on('data', c => logs.push(c.toString()));
+      child.on('message', raw => {
+        const msg = raw as WorkerToDaemon;
+        if (msg.type === 'prompt_ready') ready += 1;
+      });
+
+      child.send({
+        type: 'init',
+        sessionId: 'sid-clear', chatId: 'oc_x', rootMessageId: 'om_x',
+        workingDir: root, cliId: 'mojo', backendType: 'mojo',
+        backendConfig: { cloud: true, jwtEnv: 'MY_JWT', env: { MY_JWT: 'stale-A' } },
+        prompt: 'turn one', larkAppId: appId, larkAppSecret: 'secret',
+      } as DaemonToWorker);
+
+      await waitFor(
+        () => existsSync(dump) && readFileSync(dump, 'utf-8').trim().split('\n').length >= 1,
+        20_000,
+        () => `first turn never ran\n${logs.join('')}`,
+      );
+
+      // Second turn carrying the tombstone the daemon would send after the
+      // operator deleted the credential.
+      child.send({
+        type: 'message',
+        content: 'turn two',
+        mojoLivePatch: { jwt: null },
+      } as DaemonToWorker);
+
+      await waitFor(
+        () => readFileSync(dump, 'utf-8').trim().split('\n').length >= 2,
+        20_000,
+        () => `second turn never ran\n${logs.join('')}`,
+      );
+
+      const seen = readFileSync(dump, 'utf-8').trim().split('\n');
+      expect(seen[0]).toBe('[stale-A]');
+      // Cleared means cleared: neither the jwtEnv value nor the ambient token may
+      // stand in for it.
+      expect(seen[1]).toBe('[]');
+      expect(logs.join('')).not.toContain('Ignoring invalid mojo live patch');
+      void ready;
+    } finally {
+      if (child && child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 60_000);
+
   it('refuses to start a locally-executing mojo bot that requested sandbox', async () => {
     // cloud is NOT set here, so tools would run on this host while the user
     // believes the sandbox is active. Fail closed rather than silently skipping.

@@ -300,3 +300,47 @@ describe('quarantine is bound to an ID, not to the session', () => {
     expect(session.mojoQuarantineNoticePending).toBeUndefined();
   });
 });
+
+describe('quarantine notice state matrix', () => {
+  it('BACKFILLS the notice flag onto a row parked by an earlier build', async () => {
+    // Such a row already has an identity, so both migration entry points returned
+    // early and the user would never learn their context was parked.
+    const { store, identity } = await boot({ cloud: true });
+    const session = seed(store, {
+      mojoIdentity: { cloud: true },
+      mojoQuarantinedLineage: 'parked-by-old-build',
+      // No notice flag — this is what the previous build persisted.
+    });
+    identity.freezeMojoIdentityForSession(session, APP_ID);
+    expect(session.mojoQuarantineNoticePending).toBe(true);
+  });
+
+  it('does not re-queue a notice that was already delivered', async () => {
+    // `false` (delivered) must be distinguishable from `undefined` (never queued),
+    // or every future turn would re-notify.
+    const { store, identity } = await boot({ cloud: true });
+    const session = seed(store, {
+      mojoIdentity: { cloud: true },
+      mojoQuarantinedLineage: 'parked',
+      mojoQuarantineNoticePending: false,
+    });
+    identity.freezeMojoIdentityForSession(session, APP_ID);
+    expect(session.mojoQuarantineNoticePending).toBe(false);
+  });
+
+  it('parks BOTH ids rather than silently overwriting an audit record', async () => {
+    // Self-audit find: `active ?? parked` would overwrite an existing parked id
+    // when both are present and differ, losing the only handle to a remote
+    // session that is still running somewhere.
+    const { store, identity } = await boot({ cloud: true });
+    const session = seed(store, {
+      riffParentTaskId: 'active-unverifiable',
+      mojoQuarantinedLineage: 'previously-parked',
+    });
+    identity.freezeMojoIdentityForSession(session, APP_ID);
+    expect(session.mojoQuarantinedLineage).toContain('previously-parked');
+    expect(session.mojoQuarantinedLineage).toContain('active-unverifiable');
+    expect(session.riffParentTaskId).toBeUndefined();
+    expect(session.mojoQuarantineNoticePending).toBe(true);
+  });
+});
