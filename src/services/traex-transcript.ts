@@ -34,11 +34,24 @@ import {
   type CodexDrainResult,
   codexSessionIdFromRolloutPath,
 } from './codex-transcript.js';
+import { scanJsonlFromOffset } from './jsonl-cursor.js';
 import { traeSessionsRoot } from './traex-paths.js';
 
 export { splitCodexEventsByCutoff as splitTraexEventsByCutoff };
 export { extractLastCodexTurn as extractLastTraexTurn };
-export type { CodexBridgeEvent as TraexBridgeEvent, CodexDrainResult as TraexDrainResult };
+export type { CodexBridgeEvent as TraexBridgeEvent };
+
+export interface TraexDrainResult extends CodexDrainResult {
+  /** Latest executor-reported model observed in the drained complete records. */
+  latestModel?: string;
+  /** Latest executor-reported reasoning effort observed in complete records. */
+  latestReasoningEffort?: string;
+}
+
+export interface TraexRuntimeSnapshot {
+  model?: string;
+  reasoningEffort?: string;
+}
 
 const IS_LINUX = platform() === 'linux';
 
@@ -68,13 +81,32 @@ function abortErrorCode(reason: unknown): string {
   return `traex_turn_aborted:${normalized}`;
 }
 
+function runtimeFromTraexEntry(entry: any): TraexRuntimeSnapshot | undefined {
+  const settings = entry?.payload?.collaboration_mode?.settings;
+  const model = entry?.payload?.model ?? settings?.model;
+  const reasoningEffort = entry?.payload?.reasoning_effort
+    ?? entry?.payload?.effort
+    ?? settings?.reasoning_effort;
+  const normalizedModel = typeof model === 'string' && model.trim()
+    ? model.trim()
+    : undefined;
+  const normalizedReasoningEffort = typeof reasoningEffort === 'string' && reasoningEffort.trim()
+    ? reasoningEffort.trim()
+    : undefined;
+  if (!normalizedModel && !normalizedReasoningEffort) return undefined;
+  return {
+    ...(normalizedModel ? { model: normalizedModel } : {}),
+    ...(normalizedReasoningEffort ? { reasoningEffort: normalizedReasoningEffort } : {}),
+  };
+}
+
 /** Incrementally drain complete TRAE rollout lines.
  *
  * `task_complete` is intentionally emitted even when last_agent_message is
  * missing/empty: a silent successful turn still has to release a durable
  * delivery. A non-newline-terminated tail is never parsed, so a process crash
  * halfway through the terminal JSON object cannot manufacture completion. */
-export function drainTraexRollout(path: string, fromOffset: number): CodexDrainResult {
+export function drainTraexRollout(path: string, fromOffset: number): TraexDrainResult {
   if (!existsSync(path)) return { events: [], newOffset: 0, pendingTail: '' };
   let size: number;
   try { size = statSync(path).size; } catch { return { events: [], newOffset: fromOffset, pendingTail: '' }; }
@@ -93,6 +125,8 @@ export function drainTraexRollout(path: string, fromOffset: number): CodexDrainR
   const sourceSessionId = codexSessionIdFromRolloutPath(path);
 
   const events: CodexBridgeEvent[] = [];
+  let latestModel: string | undefined;
+  let latestReasoningEffort: string | undefined;
   let cursor = start;
   for (const line of completeText.split('\n')) {
     if (line.length === 0) {
@@ -103,6 +137,9 @@ export function drainTraexRollout(path: string, fromOffset: number): CodexDrainR
     cursor += Buffer.byteLength(line, 'utf8') + 1;
     let obj: any;
     try { obj = JSON.parse(line); } catch { continue; }
+    const runtime = runtimeFromTraexEntry(obj);
+    latestModel = runtime?.model ?? latestModel;
+    latestReasoningEffort = runtime?.reasoningEffort ?? latestReasoningEffort;
     const payload = obj?.payload;
     if (!payload || typeof payload !== 'object') continue;
     const base = {
@@ -145,7 +182,36 @@ export function drainTraexRollout(path: string, fromOffset: number): CodexDrainR
       });
     }
   }
-  return { events, newOffset, pendingTail };
+  return {
+    events,
+    newOffset,
+    pendingTail,
+    ...(latestModel ? { latestModel } : {}),
+    ...(latestReasoningEffort ? { latestReasoningEffort } : {}),
+  };
+}
+
+/** Read the current TRAE runtime from complete rollout records without
+ * retaining the full transcript in memory. Each field is latest-wins because
+ * `/model` and `/effort` can change independently in a long-lived session. */
+export function readLatestTraexRuntime(path: string): TraexRuntimeSnapshot {
+  if (!path || !existsSync(path)) return {};
+  let latestModel: string | undefined;
+  let latestReasoningEffort: string | undefined;
+  scanJsonlFromOffset(path, 0, {
+    onLine: (line) => {
+      if (!line.trim()) return;
+      try {
+        const runtime = runtimeFromTraexEntry(JSON.parse(line));
+        latestModel = runtime?.model ?? latestModel;
+        latestReasoningEffort = runtime?.reasoningEffort ?? latestReasoningEffort;
+      } catch { /* skip malformed lines */ }
+    },
+  });
+  return {
+    ...(latestModel ? { model: latestModel } : {}),
+    ...(latestReasoningEffort ? { reasoningEffort: latestReasoningEffort } : {}),
+  };
 }
 
 function normaliseInputText(text: string): string {

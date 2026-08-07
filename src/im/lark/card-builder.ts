@@ -6,7 +6,7 @@ import type { CodexAppThreadSummary } from '../../services/codex-app-threads.js'
 import type { DisplayMode, StreamStatus } from '../../types.js';
 import type { CliUsageLimitState } from '../../utils/cli-usage-limit.js';
 import { t, type Locale } from '../../i18n/index.js';
-import { cardUsageFooterSegment, type CardUsageSnapshot } from './md-card.js';
+import { cardUsageFooterSegment, cardUsageRuntimeSegment, type CardUsageSnapshot } from './md-card.js';
 import { readGlobalConfig } from '../../global-config.js';
 import type { ConfigCardData } from '../../services/bot-config-store.js';
 import { isLocalCliOpenEnabled } from '../../services/local-cli-opener.js';
@@ -225,6 +225,23 @@ function escapeMd(s: string): string {
   return s.replace(/[*_~`\[\]\\<>]/g, c => `\\${c}`);
 }
 
+/** Sanitize a user-derived string for a `plain_text` HEADER title. Unlike
+ *  {@link escapeMd} (for `lark_md` bodies), a plain_text field renders literally
+ *  — so markdown-escaping would surface visible backslashes, and a raw
+ *  `<at id=…></at>` carried over from the seeding message shows as the literal
+ *  tag text (both seen leaking in the header). Strip mention markup entirely (a
+ *  title should never carry a mention), collapse the whitespace it leaves, and
+ *  drop stray angle brackets so no tag-like text survives. No backslashes: the
+ *  field is not markdown. */
+function plainTitle(s: string): string {
+  return s
+    .replace(/<at\b[^>]*>.*?<\/at>/gis, '') // drop <at ...>…</at> mention markup
+    .replace(/<at\b[^>]*\/?>/gis, '')       // drop any unbalanced <at ...> too
+    .replace(/[<>]/g, '')                    // no stray angle brackets in plain_text
+    .replace(/\s{2,}/g, ' ')
+    .trim();
+}
+
 function sidebarUrl(url: string): string {
   const qs = new URLSearchParams({
     mode: 'sidebar-semi',
@@ -364,7 +381,7 @@ export function buildSessionCard(
   const card = {
     config: { wide_screen_mode: true },
     header: {
-      title: { tag: 'plain_text', content: `🖥️ ${cliName} · ${escapeMd(title)}` },
+      title: { tag: 'plain_text', content: `🖥️ ${cliName} · ${plainTitle(title)}` },
       template: 'blue',
     },
     elements: [
@@ -769,10 +786,22 @@ function pushStreamBody(
   // cardUsageFooterSegment; a fully-empty snapshot renders nothing.
   const usageSeg = usage ? cardUsageFooterSegment(usage, locale, 'streaming') : null;
   if (usageSeg) {
+    // Usage metrics + runtime identity render as ONE single-line text run in a
+    // single markdown element, joined by ` · ` — not a two-column split. This
+    // reads as "one row": when the content is short it's literally one line;
+    // when it's long it wraps as the CONTINUOUS FLOW of one paragraph, never as
+    // two mis-aligned columns (the column_set variants left the runtime floating
+    // on a second line / left-anchored on mobile, which the user found jarring).
+    // The trade-off the user accepted: on a long line the runtime is not pinned
+    // to the right edge — it simply follows the metrics in reading order. The
+    // runtime self-truncates (model ≤20 chars) so the tail stays compact. No
+    // runtime → the metrics render alone, unchanged.
+    const runtimeSeg = usage ? cardUsageRuntimeSegment(usage, true) : null;
+    const line = runtimeSeg ? `${usageSeg} · ${runtimeSeg}` : usageSeg;
     elements.push({
       tag: 'markdown',
       text_size: 'notation_small_v2',
-      content: `<font color='grey'>${usageSeg}</font>`,
+      content: `<font color='grey'>${line}</font>`,
     });
   }
 }
@@ -943,7 +972,7 @@ export function buildStreamingCard(
   const card = {
     config: { wide_screen_mode: true },
     header: {
-      title: { tag: 'plain_text', content: `🖥️ ${cliName}${serviceTierBadge ? ` ${serviceTierBadge}` : ''} · ${escapeMd(title)} — ${streamStatusLabel(status, usageLimit, locale)}` },
+      title: { tag: 'plain_text', content: `🖥️ ${cliName}${serviceTierBadge ? ` ${serviceTierBadge}` : ''} · ${plainTitle(title)} — ${streamStatusLabel(status, usageLimit, locale)}` },
       template: STREAM_TEMPLATE_MAP[displayStatus],
     },
     elements,
@@ -1048,7 +1077,7 @@ export function buildPrivateSnapshotCard(
   const card = {
     config: { wide_screen_mode: true },
     header: {
-      title: { tag: 'plain_text', content: `🔒 ${cliName} · ${escapeMd(title)} — ${streamStatusLabel(status, usageLimit, locale)}` },
+      title: { tag: 'plain_text', content: `🔒 ${cliName} · ${plainTitle(title)} — ${streamStatusLabel(status, usageLimit, locale)}` },
       template: STREAM_TEMPLATE_MAP[displayStatus],
     },
     elements,

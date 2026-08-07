@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { CodexBridgeQueue } from '../src/services/codex-bridge-queue.js';
 import {
   drainTraexRollout,
+  readLatestTraexRuntime,
   traexRolloutHasUserInputSince,
   traexHistoryMatchDelta,
   traexHistorySize,
@@ -83,6 +84,46 @@ afterEach(() => {
 });
 
 describe('drainTraexRollout', () => {
+  it('reports the latest complete turn_context model and reasoning effort', () => {
+    writeFileSync(path, [
+      line({
+        type: 'turn_context',
+        payload: {
+          model: 'GPT-5.5',
+          collaboration_mode: { settings: { reasoning_effort: 'high' } },
+        },
+      }),
+      line(user('switch model')),
+      line({
+        type: 'turn_context',
+        payload: {
+          model: 'GPT-5.6-Sol',
+          collaboration_mode: { settings: { reasoning_effort: 'xhigh' } },
+        },
+      }),
+      line(taskComplete('done')),
+    ].join(''));
+
+    const result = drainTraexRollout(path, 0);
+    expect(result.latestModel).toBe('GPT-5.6-Sol');
+    expect(result.latestReasoningEffort).toBe('xhigh');
+    expect(readLatestTraexRuntime(path)).toEqual({
+      model: 'GPT-5.6-Sol',
+      reasoningEffort: 'xhigh',
+    });
+  });
+
+  it('ignores a partial trailing model record until it is complete', () => {
+    writeFileSync(path, line({ type: 'turn_context', payload: { model: 'stable-model' } }));
+    appendFileSync(path, JSON.stringify({
+      type: 'turn_context',
+      payload: { model: 'partial-model' },
+    }).slice(0, -4));
+
+    expect(drainTraexRollout(path, 0).latestModel).toBe('stable-model');
+    expect(readLatestTraexRuntime(path)).toEqual({ model: 'stable-model' });
+  });
+
   it('uses task_complete as the terminal and ignores phase-less assistant progress', () => {
     writeFileSync(path, [
       line(user('do the work')),

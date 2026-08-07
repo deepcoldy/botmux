@@ -133,7 +133,7 @@ import {
 import { buildBotmuxLarkNativeSessionTitle } from './core/session-title.js';
 import { drainCodexRollout, findCodexRolloutBySessionId, findCodexRolloutByPid, findCodexRolloutSetByPid, codexHistorySidIsOwned, splitCodexEventsByCutoff, extractLastCodexTurn, codexSessionIdFromRolloutPath, scanCodexThreadSettings, type CodexBridgeEvent, type CodexDrainResult } from './services/codex-transcript.js';
 import { CodexServiceTierTracker, resolveCodexServiceTierSnapshot } from './services/codex-service-tier.js';
-import { drainTraexRollout, findTraexRolloutBySessionId, findTraexRolloutByPid, findTraexRolloutSetByPid, traexHistorySidIsOwned } from './services/traex-transcript.js';
+import { drainTraexRollout, findTraexRolloutBySessionId, findTraexRolloutByPid, findTraexRolloutSetByPid, readLatestTraexRuntime, traexHistorySidIsOwned, type TraexDrainResult, type TraexRuntimeSnapshot } from './services/traex-transcript.js';
 import { parseTraexUserInputQuestions } from './services/traex-user-input.js';
 import { cocoEventsPathForSession, drainCocoEvents, findCocoSessionByPid } from './services/coco-transcript.js';
 import { currentHermesStateOffset, drainHermesStateDb, resolveHermesStateDbPath } from './services/hermes-transcript.js';
@@ -2267,6 +2267,8 @@ let codexBridgeRolloutPath: string | undefined;
 let codexBridgeOffset = 0;
 let codexBridgePendingTail = '';
 let codexBridgeBaselineDone = false;
+let publishedActiveRuntime: TraexRuntimeSnapshot = {};
+let activeRuntimePublished = false;
 const codexBridgeQueue = new CodexBridgeQueue();
 let codexBridgeWatcher: FSWatcher | null = null;
 let codexBridgeTimer: NodeJS.Timeout | null = null;
@@ -2277,6 +2279,29 @@ const codexServiceTierTracker = new CodexServiceTierTracker(
   resolveCodexServiceTierSnapshot,
   snapshot => send({ type: 'codex_service_tier', snapshot }),
 );
+
+function publishActiveRuntime(runtime: TraexRuntimeSnapshot): void {
+  const normalized: TraexRuntimeSnapshot = {
+    ...(runtime.model?.trim() ? { model: runtime.model.trim() } : {}),
+    ...(runtime.reasoningEffort?.trim()
+      ? { reasoningEffort: runtime.reasoningEffort.trim() }
+      : {}),
+  };
+  if (
+    activeRuntimePublished
+    && normalized.model === publishedActiveRuntime.model
+    && normalized.reasoningEffort === publishedActiveRuntime.reasoningEffort
+  ) {
+    return;
+  }
+  activeRuntimePublished = true;
+  publishedActiveRuntime = normalized;
+  send({
+    type: 'active_runtime',
+    model: normalized.model ?? null,
+    reasoningEffort: normalized.reasoningEffort ?? null,
+  });
+}
 let hermesBridgeOffset = 0;
 let hermesBridgeBaselineDone = false;
 let hermesBridgeDbPath: string | undefined;
@@ -3787,6 +3812,7 @@ function mtrBridgeIngest(): void {
 function codexBridgeAttach(rolloutPath: string, mode: 'baseline-existing' | 'baseline-existing-skip-tail' | 'fresh-empty' | 'split-live'): void {
   codexBridgeRolloutPath = rolloutPath;
   if (structuredBridgeIsCodex()) codexServiceTierTracker.bind(rolloutPath);
+  if (structuredBridgeIsTraex()) publishActiveRuntime(readLatestTraexRuntime(rolloutPath));
   if (mode === 'fresh-empty') {
     // Brand-new session OR late-attach right after first submit. Either
     // way we want to ingest from offset 0 — pending turns marked before
@@ -4255,6 +4281,13 @@ function codexBridgeIngest(opts: { signalIdle?: boolean } = {}): void {
   const result = structuredBridgeIngestPath(codexBridgeRolloutPath, codexBridgeOffset);
   codexBridgeOffset = result.newOffset;
   codexBridgePendingTail = result.pendingTail;
+  if (structuredBridgeIsTraex()) {
+    const traex = result as TraexDrainResult;
+    publishActiveRuntime({
+      model: traex.latestModel ?? publishedActiveRuntime.model,
+      reasoningEffort: traex.latestReasoningEffort ?? publishedActiveRuntime.reasoningEffort,
+    });
+  }
   if (structuredBridgeIsCodex()) {
     codexServiceTierTracker.observe(
       codexBridgeRolloutPath,
@@ -4413,6 +4446,8 @@ function stopCodexBridge(): void {
     codexBridgeTimer = null;
   }
   codexServiceTierTracker.detach();
+  activeRuntimePublished = false;
+  publishedActiveRuntime = {};
   codexBridgeRolloutPath = undefined;
   codexBridgeOffset = 0;
   codexBridgePendingTail = '';
@@ -9700,6 +9735,7 @@ async function spawnCli(
         log(`TRAE sandbox: resolved real traex leaf pid ${realPid} under bwrap supervisor ${launcherPid}; rewiring ownership pid`);
         (backend as TmuxBackend | PtyBackend | ZellijBackend | ZmxBackend).cliPid = realPid;
         (backend as TmuxBackend | PtyBackend | ZellijBackend | ZmxBackend).cliCwd = cfg.workingDir;
+        codexAdoptPendingPid = realPid;
         publishLocalProcessAttestation(realPid);
       },
       schedule: (fn, ms) => { setTimeout(fn, ms); },
@@ -9731,6 +9767,7 @@ async function spawnCli(
     const wiredPid = cfg.cliId === 'traex' ? resolveTraexOwnershipPid(cliPid, outerBwrapActive) : cliPid;
     (backend as TmuxBackend | PtyBackend | ZellijBackend | ZmxBackend).cliPid = wiredPid;
     (backend as TmuxBackend | PtyBackend | ZellijBackend | ZmxBackend).cliCwd = cfg.workingDir;
+    if (cfg.cliId === 'traex') codexAdoptPendingPid = wiredPid;
     if (cfg.cliId === 'traex' && outerBwrapActive) startTraexSandboxPidResolve(cliPid);
   }
 
@@ -9763,6 +9800,7 @@ async function spawnCli(
           const wiredPid = cfg.cliId === 'traex' ? resolveTraexOwnershipPid(pid, outerBwrapActive) : pid;
           (backend as TmuxBackend | PtyBackend | ZellijBackend | ZmxBackend).cliPid = wiredPid;
           (backend as TmuxBackend | PtyBackend | ZellijBackend | ZmxBackend).cliCwd = cfg.workingDir;
+          if (cfg.cliId === 'traex') codexAdoptPendingPid = wiredPid;
           if (cfg.cliId === 'traex' && outerBwrapActive) startTraexSandboxPidResolve(pid);
         }
         // wrapperCli under a late-pid backend (zellij): `pid` here is still the

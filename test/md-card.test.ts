@@ -19,6 +19,7 @@ import {
   buildReplyCardFooter,
   brandFooterSegment,
   cardUsageFooterSegment,
+  cardUsageRuntimeSegment,
   DEFAULT_BRAND_LABEL,
   hasMarkdown,
   normalizeLocalHomeLinks,
@@ -728,6 +729,72 @@ describe('buildMarkdownCard', () => {
     expect(seg).toContain('本轮 ↑5K ↓1.2K');
     expect(seg).toContain('累计 ↑67.9K ↓123');
     expect(seg).not.toContain('上下文');
+  });
+
+  it('keeps the metric formatter runtime-free so the streaming renderer owns the tail', () => {
+    const seg = cardUsageFooterSegment(
+      {
+        context: { usedTokens: 80_700, windowTokens: 258_400, percentUsed: 31 },
+        tokens: { in: 1_400_000, out: 7_800 },
+        model: 'GPT-5.6-Sol',
+        reasoningEffort: 'xhigh',
+      },
+      'zh',
+      'streaming',
+    );
+    expect(seg).toBe('上下文 80.7K/258.4K (31%) · 累计 ↑1.4M ↓7.8K');
+    expect(seg).not.toContain('GPT-5.6-Sol');
+  });
+
+  it('cardUsageRuntimeSegment renders a compact model (bold) + effort tail', () => {
+    expect(cardUsageRuntimeSegment(
+      { context: null, tokens: null, model: 'GPT-5.6-Sol', reasoningEffort: 'xhigh' },
+      true,
+    )).toBe('**GPT-5.6-Sol** xhigh');
+    // no effort -> model only, no trailing space/placeholder
+    expect(cardUsageRuntimeSegment(
+      { context: null, tokens: null, model: 'gpt-4o' },
+      true,
+    )).toBe('**gpt-4o**');
+    // no model -> nothing
+    expect(cardUsageRuntimeSegment(
+      { context: null, tokens: null, reasoningEffort: 'xhigh' },
+      true,
+    )).toBeNull();
+    // no metric line to anchor to -> nothing (matches footer contract)
+    expect(cardUsageRuntimeSegment(
+      { context: null, tokens: null, model: 'GPT-5.6-Sol', reasoningEffort: 'xhigh' },
+      false,
+    )).toBeNull();
+  });
+
+  it('does not create a standalone runtime line without native usage metrics', () => {
+    expect(cardUsageFooterSegment(
+      {
+        context: null,
+        tokens: null,
+        model: 'GPT-5.6-Sol',
+        reasoningEffort: 'xhigh',
+      },
+      'zh',
+      'streaming',
+    )).toBeNull();
+  });
+
+  it('escapes runtime labels and truncates long model names', () => {
+    const seg = cardUsageRuntimeSegment(
+      {
+        context: { usedTokens: 1 },
+        tokens: null,
+        model: `[very-long-${'x'.repeat(60)}] <at id=ou_fake></at>`,
+        reasoningEffort: '*xhigh*',
+      },
+      true,
+    )!;
+    expect(seg).toContain('**\\[very-long-');
+    expect(seg).toContain('…** \\*xhigh\\*');
+    expect(seg).not.toContain('<at id=ou_fake>');
+    expect(seg.length).toBeLessThan(100);
   });
 
   it('omits an all-zero token line (new session / synthetic zero-usage record)', () => {

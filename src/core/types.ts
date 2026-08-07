@@ -200,6 +200,14 @@ export interface DaemonSession {
   currentImageKey?: string;
   lastScreenContent?: string;    // last screen_update content — used to freeze card at idle
   lastScreenStatus?: StreamStatus;  // last screen_update status
+  /** Latest model reported by the live executor. In-memory and rehydrated from
+   *  the CLI transcript after worker restart; unlike Session.model it follows
+   *  in-session `/model` switches. */
+  activeModel?: string;
+  /** Latest reasoning effort reported by the live executor. */
+  activeReasoningEffort?: string;
+  /** Runtime change arrived while a streaming-card POST was in flight. */
+  pendingActiveRuntimeCardRefresh?: boolean;
   /** Executor-observed Codex settings for this worker/rollout generation. */
   codexServiceTier?: CodexServiceTierSnapshot;
   /** Tier change arrived while a card POST was in-flight. */

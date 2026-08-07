@@ -471,10 +471,15 @@ describe('buildSessionCard', () => {
     expect(card.header.title.content).toContain(TITLE);
   });
 
-  it('should escape markdown special characters in title', () => {
-    const card = parse(buildSessionCard(SID, ROOT, URL, 'Fix *bold* and [link]'));
-    expect(card.header.title.content).toContain('\\*bold\\*');
-    expect(card.header.title.content).toContain('\\[link\\]');
+  it('renders a plain_text title literally (no markdown backslashes) and strips <at> tags', () => {
+    // plain_text header is not markdown: markdown specials pass through as-is,
+    // and mention markup is stripped so no raw <at id=...></at> can leak.
+    const card = parse(buildSessionCard(SID, ROOT, URL, 'Fix *bold* <at id=ou_x></at> [link]'));
+    expect(card.header.title.content).toContain('*bold*');
+    expect(card.header.title.content).toContain('[link]');
+    expect(card.header.title.content).not.toContain('\\');
+    expect(card.header.title.content).not.toContain('<at');
+    expect(card.header.title.content).not.toContain('ou_x');
   });
 
   it('should default to "Claude" display name when cliId is omitted', () => {
@@ -793,9 +798,73 @@ describe('buildStreamingCard', () => {
       expect(card.header.title.content).toContain('等待输入');
     });
 
-    it('should include escaped title in header', () => {
-      const card = parse(buildStreamingCard(SID, ROOT, URL, 'Fix *bug*', '', 'idle'));
-      expect(card.header.title.content).toContain('Fix \\*bug\\*');
+    it('renders usage + runtime as one single-line markdown run (tail-joined, no column_set)', () => {
+      const card = parse(buildStreamingCard(
+        SID, ROOT, URL, TITLE, '', 'idle', 'traex', 'hidden',
+        undefined, undefined, false, false, 'en', undefined, undefined, false,
+        {
+          context: { usedTokens: 80_700, windowTokens: 258_400, percentUsed: 31 },
+          tokens: { in: 1_400_000, out: 7_800 },
+          model: 'GPT-5.6-Sol',
+          reasoningEffort: 'xhigh',
+        },
+      ));
+      // Single markdown element: metrics · runtime, one continuous text run.
+      const line = card.elements.find(
+        (element: any) => element.tag === 'markdown' && element.content.includes('GPT-5.6-Sol'),
+      );
+      expect(line).toBeTruthy();
+      expect(line.text_size).toBe('notation_small_v2');
+      expect(line.content).toContain('Context 80.7K/258.4K (31%) · Total ↑1.4M ↓7.8K · **GPT-5.6-Sol**');
+      expect(line.content).toContain('xhigh');
+      // metrics and runtime joined by ' · ' in reading order
+      expect(line.content.indexOf('Total')).toBeLessThan(line.content.indexOf('GPT-5.6-Sol'));      // Not a two-column layout anymore.
+      expect(card.elements.some((element: any) => element.tag === 'column_set'
+        && JSON.stringify(element).includes('GPT-5.6-Sol'))).toBe(false);
+    });
+
+    it('renders metrics alone (no trailing runtime) when there is no model', () => {
+      const card = parse(buildStreamingCard(
+        SID, ROOT, URL, TITLE, '', 'idle', 'traex', 'hidden',
+        undefined, undefined, false, false, 'en', undefined, undefined, false,
+        { context: { usedTokens: 80_700, windowTokens: 258_400, percentUsed: 31 }, tokens: { in: 1_400_000, out: 7_800 } },
+      ));
+      const line = card.elements.find(
+        (element: any) => element.tag === 'markdown' && element.content.includes('Context'),
+      );
+      expect(line.content).toContain('Context 80.7K/258.4K (31%) · Total ↑1.4M ↓7.8K');
+      expect(line.content).not.toContain('·  ·');
+    });
+
+    it('keeps a plain full-width usage markdown when there is no model', () => {
+      const card = parse(buildStreamingCard(
+        SID, ROOT, URL, TITLE, '', 'idle', 'traex', 'hidden',
+        undefined, undefined, false, false, 'en', undefined, undefined, false,
+        {
+          context: { usedTokens: 80_700, windowTokens: 258_400, percentUsed: 31 },
+          tokens: { in: 1_400_000, out: 7_800 },
+        },
+      ));
+      const usage = card.elements.find(
+        (element: any) => element.tag === 'markdown' && element.content.includes('Context'),
+      );
+      expect(usage.content).toContain('Context 80.7K/258.4K (31%) · Total ↑1.4M ↓7.8K');
+      expect(usage.text_size).toBe('notation_small_v2');
+    });
+
+    it('renders a plain_text title without markdown backslashes and strips <at> mention leaks', () => {
+      // plain_text header: NOT markdown, so no backslash-escaping (that leaked as
+      // visible '\\<at' before). A title seeded from a message with an @mention
+      // must not surface the raw <at id=...></at> tag.
+      const card = parse(buildStreamingCard(
+        SID, ROOT, URL, 'Fix bug <at id=ou_abc123></at> now', '', 'idle',
+      ));
+      expect(card.header.title.content).toContain('Fix bug');
+      expect(card.header.title.content).toContain('now');
+      expect(card.header.title.content).not.toContain('<at');
+      expect(card.header.title.content).not.toContain('</at>');
+      expect(card.header.title.content).not.toContain('ou_abc123');
+      expect(card.header.title.content).not.toContain('\\');
       expect(card.header.title.content).toContain('等待输入');
     });
 

@@ -27,6 +27,19 @@ describe('TRAE worker structured-bridge wiring', () => {
     expect(body).toContain('if (structuredBridgeIsTraex()) return drainTraexRollout(path, offset);');
   });
 
+  it('publishes the latest TRAE runtime on attach and incremental ingest', () => {
+    const attachStart = workerSource.indexOf('function codexBridgeAttach');
+    const attachEnd = workerSource.indexOf('function codexBridgeDetachFile', attachStart);
+    const attach = workerSource.slice(attachStart, attachEnd);
+    expect(attach).toContain('publishActiveRuntime(readLatestTraexRuntime(rolloutPath))');
+
+    const ingestStart = workerSource.indexOf('function codexBridgeIngest');
+    const ingestEnd = workerSource.indexOf('function codexBridgeMarkPendingTurn', ingestStart);
+    const ingest = workerSource.slice(ingestStart, ingestEnd);
+    expect(ingest).toContain('publishActiveRuntime({');
+    expect(ingest).toContain('reasoningEffort: traex.latestReasoningEffort ?? publishedActiveRuntime.reasoningEffort');
+  });
+
   it('drains the retired rollout before reattaching a newly verified TRAE session', () => {
     const start = workerSource.indexOf('function codexBridgeNotifyCliSessionId');
     const end = workerSource.indexOf('function maybeFollowGrokSessionRotationViaPid', start);
@@ -88,6 +101,7 @@ describe('TRAE worker structured-bridge wiring', () => {
     // include traex alongside grok.
     const matches = workerSource.match(/claudeDataDir \|\| cfg\.cliId === 'grok' \|\| cfg\.cliId === 'traex'/g) ?? [];
     expect(matches.length).toBeGreaterThanOrEqual(2);
+    expect(workerSource.match(/codexAdoptPendingPid = wiredPid;/g)?.length).toBeGreaterThanOrEqual(2);
   });
 
   it('gates the TRAE INITIAL bridge attach on pid-fd ownership (adopt mode)', () => {

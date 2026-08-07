@@ -50,6 +50,7 @@ export interface CardUsageSnapshot {
   tokens: {
     in: number;
     out: number;
+    model?: string;
   } | null;
   /** Delta for the latest user turn (small, matches the CLI TUI's per-turn
    *  ↑↓). Null for dialects without per-turn tracking. Rendered on the live
@@ -58,6 +59,10 @@ export interface CardUsageSnapshot {
     in: number;
     out: number;
   } | null;
+  /** Latest executor-reported model. Rendered by session-status cards only. */
+  model?: string;
+  /** Latest executor-reported reasoning effort. */
+  reasoningEffort?: string;
 }
 
 export interface ReplyCardFooter {
@@ -306,6 +311,19 @@ function isNonNegativeFinite(value: unknown): value is number {
   return typeof value === 'number' && Number.isFinite(value) && value >= 0;
 }
 
+function compactRuntimeLabel(value: string | undefined, maxLength: number): string | undefined {
+  const normalized = value
+    ?.trim()
+    .replace(/[ \t]*(?:\r\n?|\n|\u2028|\u2029)+[ \t]*/g, ' ');
+  if (!normalized) return undefined;
+  const compact = normalized.length > maxLength
+    ? `${normalized.slice(0, Math.max(1, maxLength - 1))}…`
+    : normalized;
+  return compact
+    .replace(/[*_~`\[\]\\<>]/g, char => `\\${char}`)
+    .replace(/ /g, '\u00a0');
+}
+
 /** Format usage as one segment shared by reply-card footers and the live
  * streaming card. The caller supplies native facts; this module only formats
  * them and never infers a context window or token count. Returns null when no
@@ -366,7 +384,29 @@ export function cardUsageFooterSegment(
       + `↑${compactTokenCount(usage.tokens.in)} ↓${compactTokenCount(usage.tokens.out)}`,
     );
   }
+  // Runtime identity is formatted separately by cardUsageRuntimeSegment, then
+  // the streaming card appends it to this metric string with ` · ` in one
+  // continuous markdown paragraph. Keep this function metric-only so reply-card
+  // footers remain unchanged and the streaming renderer owns the tail layout.
   return parts.length > 0 ? parts.join(' · ') : null;
+}
+
+/** Streaming-card runtime tail appended after
+ * {@link cardUsageFooterSegment}'s metric text. Returns `**model** effort`
+ * (model bolded within the shared grey markdown) or null when there is no model.
+ * `effort` is dropped when absent — no placeholder. `hasMetrics` prevents a
+ * standalone runtime-only row when native usage is unavailable. The
+ * model↔effort join uses a non-breaking space so the pair never wraps apart. */
+export function cardUsageRuntimeSegment(
+  usage: CardUsageSnapshot,
+  hasMetrics: boolean,
+): string | null {
+  if (!hasMetrics) return null;
+  // Keep the tail compact so the continuous usage paragraph wraps predictably.
+  const model = compactRuntimeLabel(usage.model, 20);
+  if (!model) return null;
+  const reasoningEffort = compactRuntimeLabel(usage.reasoningEffort, 10);
+  return `**${model}**${reasoningEffort ? `\u00a0${reasoningEffort}` : ''}`;
 }
 
 /** Build the one canonical footer shared by all Bot Session reply cards.

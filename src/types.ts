@@ -833,6 +833,13 @@ export type WorkerToDaemon =
       cliProcStart?: string;
     }
   | { type: 'cli_session_id'; cliSessionId: string; turnId?: string; dispatchAttempt?: number }
+  /** Executor-observed active runtime. Unlike the frozen Session launch config,
+   * these fields follow in-session `/model` and `/effort` switches. */
+  | {
+      type: 'active_runtime';
+      model: string | null;
+      reasoningEffort: string | null;
+    }
   | { type: 'native_session_title_generated'; title: string }
   | { type: 'claude_exit'; code: number | null; signal: string | null; logTail?: string; canParkDiagnostic?: boolean; turnId?: string; dispatchAttempt?: number }
   /** Worker-side close handler has crossed the point where it will no longer
