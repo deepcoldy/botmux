@@ -9454,6 +9454,21 @@ async function spawnCli(
   // wrapperCli and every descendant it starts inherit the boundary. Full
   // Seatbelt/bwrap sessions were already wrapped above and never enter these
   // branches (gate mode `covered`), avoiding nested/double sandboxes.
+  let credentialOnlyCapabilityDir: string | undefined;
+  if (credentialOnlySeatbelt || credentialOnlyBwrap) {
+    const panePolicyDir = join(isolationRuntimeDataDir, 'read-isolation');
+    mkdirSync(panePolicyDir, { recursive: true });
+    credentialOnlyCapabilityDir = managedOriginCapabilityDirectory(
+      isolationRuntimeDataDir,
+      cfg.sessionId,
+    );
+    readIsolationOriginCapabilityFile = join(
+      credentialOnlyCapabilityDir,
+      RELAY_ORIGIN_CAPABILITY_BASENAME,
+    );
+    publishSandboxRelayCapability({ failClosed: true });
+    childEnv[MANAGED_ORIGIN_CAPABILITY_DIR_ENV] = realpathSync(credentialOnlyCapabilityDir);
+  }
   if (!willReattachPersistent && credentialOnlySeatbelt) {
     const canonical = (path: string) => {
       try { return realpathSync(path); } catch { return path; }
@@ -9467,10 +9482,10 @@ async function spawnCli(
     mkdirSync(profileDir, { recursive: true });
     const profilePath = join(profileDir, `${cfg.sessionId}.sb`);
     replaceManagedOriginCapabilityFile(profilePath, buildSeatbeltProfile(
-      rules.denyPaths.map(canonical),
+      [...rules.denyPaths.map(canonical), canonical(profileDir)],
+      [canonical(credentialOnlyCapabilityDir!)],
       [],
-      [],
-      [],
+      [canonical(profileDir)],
       rules.denyRegexes,
       undefined,
       {
@@ -9494,21 +9509,6 @@ async function spawnCli(
     // well-known system location used by full Seatbelt wrapping above.
     spawnBin = credentialMechanismExecutable ?? '/usr/bin/sandbox-exec';
     log(`[device-credential-isolation] wrapping ${cliAdapter.id} in credential-only Seatbelt: ${spawnBin} -f ${profilePath}`);
-  }
-  let credentialOnlyCapabilityDir: string | undefined;
-  if (credentialOnlyBwrap) {
-    const panePolicyDir = join(isolationRuntimeDataDir, 'read-isolation');
-    mkdirSync(panePolicyDir, { recursive: true });
-    credentialOnlyCapabilityDir = managedOriginCapabilityDirectory(
-      isolationRuntimeDataDir,
-      cfg.sessionId,
-    );
-    readIsolationOriginCapabilityFile = join(
-      credentialOnlyCapabilityDir,
-      RELAY_ORIGIN_CAPABILITY_BASENAME,
-    );
-    publishSandboxRelayCapability({ failClosed: true });
-    childEnv[MANAGED_ORIGIN_CAPABILITY_DIR_ENV] = realpathSync(credentialOnlyCapabilityDir);
   }
   if (!willReattachPersistent && credentialOnlyBwrap) {
     const panePolicyDir = join(isolationRuntimeDataDir, 'read-isolation');

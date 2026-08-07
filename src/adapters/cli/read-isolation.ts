@@ -326,7 +326,10 @@ export function buildSeatbeltProfile(
 //   · 9 → 10 (#779): credential-only bwrap sessions receive a private rotating
 //     origin-capability directory + env pointer. A v9 pane has neither, and a
 //     warm reattach cannot add mounts or environment to its live process.
-export const ISOLATION_PANE_MARKER_VERSION = 10;
+//   · 10 → 11 (#779): apply the same private capability contract to macOS
+//     credential-only Seatbelt sessions. A v10 Seatbelt pane lacks the env and
+//     carve-out, which likewise cannot be added by warm reattach.
+export const ISOLATION_PANE_MARKER_VERSION = 11;
 
 export type IsolationCapability = 'credential' | 'read' | 'write';
 

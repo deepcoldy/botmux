@@ -7,6 +7,7 @@ import {
   deviceCredentialIsolationMarkerPath,
   isCredentialIsolationReservedBasename,
   buildCredentialIsolationRules,
+  buildSeatbeltProfile,
   isolatedPaneReattachSafe,
   isolationPaneMarkerContent,
   ISOLATION_PANE_MARKER_VERSION,
@@ -253,7 +254,7 @@ describe('isolatedPaneReattachSafe — start-time contract bump forces cold resp
  * Ordering note: #709 took 8 (env contract); #714 takes 9. Both prior versions
  * must be rejected. If the merge order flips, rebase so this stays monotonic.
  */
-describe('isolatedPaneReattachSafe — #714 mount contract forces cold respawn of pre-9 panes', () => {
+describe('isolatedPaneReattachSafe — spawn contract changes force cold respawn', () => {
   const full = ['credential', 'read', 'write'] as const;
   for (const v of [7, 8]) {
     it(`rejects a v${v} pane even with full capabilities (its bwrap lacks the marker mount)`, () => {
@@ -266,10 +267,10 @@ describe('isolatedPaneReattachSafe — #714 mount contract forces cold respawn o
     expect(isolatedPaneReattachSafe(isolationPaneMarkerContent('fresh', [...full]), ['read', 'write'])).toBe(true);
   });
 
-  it('has moved the version past 9 (credential-only capability mount contract)', () => {
-    // Reverting below 10 would silently warm-reattach credential-only panes
-    // that lack the private capability mount/env contract.
-    expect(ISOLATION_PANE_MARKER_VERSION).toBeGreaterThan(9);
+  it('has moved the version past 10 (credential-only capability contract on both OSes)', () => {
+    // Reverting below 11 would silently warm-reattach Seatbelt panes that lack
+    // the private capability file/env contract.
+    expect(ISOLATION_PANE_MARKER_VERSION).toBeGreaterThan(10);
   });
 });
 
@@ -294,7 +295,9 @@ describe('worker capability carve-out ordering', () => {
     expect(relayPublishAt).toBeGreaterThan(relayAt);
     expect(source).toContain('replaceManagedOriginCapabilityFile(profilePath, buildSeatbeltProfile(');
 
-    const credentialSetupAt = source.indexOf('if (credentialOnlyBwrap) {');
+    const credentialSetupAt = source.indexOf(
+      'if (credentialOnlySeatbelt || credentialOnlyBwrap) {',
+    );
     const credentialDirectoryAt = source.indexOf(
       'managedOriginCapabilityDirectory(\n      isolationRuntimeDataDir,\n      cfg.sessionId,',
       credentialSetupAt,
@@ -319,6 +322,40 @@ describe('worker capability carve-out ordering', () => {
     expect(source).toContain('privateReadonlyDirectories: [{');
     expect(source).toContain('childEnv[MANAGED_ORIGIN_CAPABILITY_DIR_ENV]');
     expect(source).toContain('delete childEnv[MANAGED_ORIGIN_CAPABILITY_DIR_ENV]');
+
+    const seatbeltAt = source.indexOf(
+      'if (!willReattachPersistent && credentialOnlySeatbelt)',
+    );
+    const seatbeltProfileAt = source.indexOf('buildSeatbeltProfile(', seatbeltAt);
+    const seatbeltEndAt = source.indexOf('seatbeltProfilePath = profilePath;', seatbeltProfileAt);
+    const seatbeltProfileRegion = source.slice(seatbeltProfileAt, seatbeltEndAt);
+    expect(seatbeltAt).toBeGreaterThan(credentialPublishAt);
+    expect(seatbeltProfileRegion).toContain('canonical(profileDir)');
+    expect(seatbeltProfileRegion).toContain('canonical(credentialOnlyCapabilityDir!)');
+  });
+
+  it('orders the credential-only Seatbelt parent deny before the own-session carve-out', () => {
+    const parent = '/Users/u/.botmux/data/read-isolation';
+    const own = `${parent}/origin-own`;
+    const profile = buildSeatbeltProfile(
+      [parent],
+      [own],
+      [],
+      [parent],
+      [],
+      undefined,
+      { denyWritePaths: [parent] },
+    );
+    const parentDeny = profile.indexOf(`(deny file-read* (subpath "${parent}"))`);
+    const parentTraverse = profile.indexOf(
+      `(allow file-read-metadata (literal "${parent}"))`,
+    );
+    const ownAllow = profile.indexOf(`(allow file-read* (subpath "${own}"))`);
+    const writeDeny = profile.indexOf(`(deny file-write* (subpath "${parent}"))`);
+    expect(parentDeny).toBeGreaterThan(-1);
+    expect(parentTraverse).toBeGreaterThan(parentDeny);
+    expect(ownAllow).toBeGreaterThan(parentTraverse);
+    expect(writeDeny).toBeGreaterThan(ownAllow);
   });
 
   it('denies every same-UID Gateway socket before allowing only the current session socket', () => {
