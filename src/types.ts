@@ -115,6 +115,50 @@ export type ScreenStatus = 'working' | 'idle' | 'analyzing' | 'limited' | 'stall
 /** Status shown on a streaming card — adds the pre-spawn 'starting' phase. */
 export type StreamStatus = ScreenStatus | 'starting';
 
+/** One human/bot who took part in a turn's window — the union of every folded
+ *  message's sender and @-mentions (type-ahead follow-ups included), excluding
+ *  the answering bot itself. Drives `botmux send --mention-back`'s ambiguity
+ *  gate: 2+ distinct counterparts → block --mention-back and list these as
+ *  explicit --mention candidates. A participant WITHOUT `openId` (an app_id /
+ *  user_id / union_id-form @ that could not be reduced to a receiver-scoped
+ *  open_id) still counts toward the distinct-counterpart tally, but marks the
+ *  window incomplete (no id to hand back as a --mention candidate).
+ *  `isBot` labels each candidate: true = bot, false = human, undefined = unknown
+ *  (NOT provably a human — e.g. a third-party bot not in the peer cross-ref). */
+export interface TurnParticipant {
+  /** Receiver-scoped open_id when available; absent for app_id-form mentions. */
+  openId?: string;
+  name?: string;
+  isBot?: boolean;
+}
+
+/** Reply context bound to one exact inbound turn. `rootMessageId` is absent
+ * for thread-scope and rootless chat turns, which still need an immutable
+ * sender for `--mention-back`. `senderOpenId` is per-turn sender attribution
+ * (written in any scope); `participants` is the turn-window counterpart set
+ * (sender + mentions across folded/type-ahead messages) for the --mention-back
+ * ambiguity gate; `rootMessageId`/`quoteOnly`/`substitute` are chat-scope-only
+ * routing metadata. */
+export interface ReplyTargetEntry {
+  rootMessageId?: string;
+  updatedAt: string;
+  quoteOnly?: boolean;
+  substitute?: boolean;
+  senderOpenId?: string;
+  /** Turn-window counterparts (sender + @-mentions, self bot excluded, deduped
+   *  by open_id) accumulated across every message folded into this turn,
+   *  type-ahead follow-ups included. `botmux send` reads it to decide whether
+   *  --mention-back is unambiguous (≤1 counterpart → allow) or must be replaced
+   *  by an explicit --mention (≥2 → block + offer these as candidates). */
+  participants?: TurnParticipant[];
+  /** True when this turn's counterpart set may be UNDER-counted — an @ arrived
+   *  in a non-open_id form (app_id / user_id / union_id) that we could not
+   *  reduce to a usable open_id, or a window-relevant sibling record was pruned.
+   *  `botmux send` treats an incomplete window as ambiguous → forces an explicit
+   *  --mention decision rather than risk auto-@-ing the wrong single counterpart. */
+  participantsIncomplete?: boolean;
+}
+
 export interface Session {
   sessionId: string;
   /** Build fingerprint of the last fresh owned Codex App runner that became ready. */
@@ -317,12 +361,21 @@ export interface Session {
    * Per-turn reply targets keyed by turnId (the inbound message_id that opened
    * the turn). currentReplyTarget above only remembers the LATEST turn — when
    * turns queue up (e.g. two substitute triggers, or a trigger while the CLI is
-   * busy) the earlier turn's send would see a mismatched turnId and degrade to
-   * a top-level plain send. `botmux send` and the daemon resolve the executing
-   * turn against this map first. Bounded (oldest pruned); evicted turns fall
-   * back to the single-slot behavior.
+   * busy) the earlier turn must retain both its routing anchor and sender.
+   * `botmux send` and the daemon resolve the executing turn against this map
+   * first. Bounded (oldest pruned); an evicted turn may use legacy fields only
+   * when their turnId still exactly matches, otherwise it fails closed.
    */
-  replyTargets?: Record<string, { rootMessageId: string; updatedAt: string; quoteOnly?: boolean; substitute?: boolean }>;
+  replyTargets?: Record<string, ReplyTargetEntry>;
+  /**
+   * High-water mark: the latest `updatedAt` of any `replyTargets` entry ever
+   * pruned by the bounded-map eviction. `botmux send`'s --mention-back
+   * ambiguity gate treats a turn window as incomplete (→ force an explicit
+   * --mention) when this watermark reaches into the turn's window, since a
+   * pruned sibling could have carried an unseen counterpart. Lets a busy
+   * message flood stay bounded without silently under-counting participants.
+   */
+  replyTargetsPrunedThrough?: string;
   /**
    * Durable receiver acknowledgement keyed by the exact inbound Lark
    * message_id. A receipt is written only after the worker has committed that
@@ -354,7 +407,8 @@ export interface Session {
    * deliverFinalOutput / botmux send 成功路径清理对应 entry。
    */
   docCommentTargets?: Record<string, { fileToken: string; fileType: string; commentId: string; replyToName?: string; replyToOpenId?: string; turnId: string; replyId?: string; reactionId?: string }>;
-  /** open_id of the quote-target message's sender — used by --mention-back. */
+  /** Latest quote-target sender. Kept for UI/legacy compatibility; turn-bound
+   * `replyTargets[turnId].senderOpenId` is authoritative for --mention-back. */
   quoteTargetSenderOpenId?: string;
   /** Whether the quote-target sender is a bot (vs a human) — drives the
    *  @ hard-gate's context-aware error text. */
@@ -509,6 +563,7 @@ export interface LarkMention {
   openId?: string;    // open_id of the mentioned user/bot
   userId?: string;    // user_id of the mentioned user, when Lark includes it
   unionId?: string;   // stable user id across bot app namespaces when present
+  appId?: string;      // app_id of a mentioned BOT (app_id-form @; open_id absent)
   idType?: string;     // e.g. "open_id" or "app_id" from Lark event payloads
 }
 

@@ -29,13 +29,13 @@ import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { createInterface } from 'node:readline';
 import { createRequire } from 'node:module';
-import { randomBytes } from 'node:crypto';
+import { randomBytes, randomUUID } from 'node:crypto';
 import { validateWorkingDir } from './core/working-dir.js';
 import { resolveSessionContext } from './core/session-marker.js';
 import { resolveBotmuxDataDir } from './core/data-dir.js';
 import { dashboardSecretPath } from './core/dashboard-secret.js';
 import { acceptedDispatchBotAppIds, activeConversationBotOpenIds, appendDispatchReportProtocol, appendLegacyDispatchReportProtocol, parseDispatchBotSpec, buildDispatchMessages, buildRepoPrimeText, buildReportContent, eligibleAutoMentionAliases, findDispatchRegistryEntry, foldableChatSessionAppIds, offTopicSubBotTopic, resolveReportPlacement, resolveReportRecipient, resolveReportTarget, resolveSendTarget, threadRootForReachability } from './core/dispatch.js';
-import { pickTurnReplyTarget } from './core/reply-target.js';
+import { pickTurnReplyTarget, collectTurnWindowParticipants } from './core/reply-target.js';
 import { recordDispatchRegistryEntry } from './core/dispatch-registry.js';
 import { enableAutostart, disableAutostart, autostartStatus, refreshAutostart } from './autostart.js';
 import { tmuxEnv } from './setup/ensure-tmux.js';
@@ -88,6 +88,13 @@ import { expandHomePath, invalidWorkingDirs } from './utils/working-dir.js';
 import { firstPositional } from './cli/arg-utils.js';
 import { isColdResumeDormant, isRealManagedSession, sessionListDisposition } from './cli/session-list-liveness.js';
 import {
+  computeSessionPickerLayout,
+  type SessionPickerColumnKey,
+  type SessionPickerLayout,
+} from './cli/session-picker-layout.js';
+import { computeSessionPickerScrollWindow } from './cli/session-picker-viewport.js';
+import { terminalCellWidth } from './cli/terminal-width.js';
+import {
   attachFrozenManagedZmxSession,
   freezeManagedZmxAttachTarget,
 } from './cli/zmx-managed-attach.js';
@@ -115,6 +122,7 @@ import {
   readWorkflowSessionRelayContext,
 } from './workflows/v3/session-relay-client.js';
 import { fetchDaemonIpc, loadDaemonIpcSecret } from './core/daemon-ipc-auth.js';
+import { isRetryableAskHttpStatus } from './core/ask-types.js';
 import { readManagedOriginCapability } from './core/managed-origin-capability.js';
 import { rejectLikelyWindowsStdinMojibake, decodeStdinBytes } from './cli/stdin-encoding.js';
 import {
@@ -3192,7 +3200,8 @@ interface SessionData {
   /** Chat-scope quote chain — see Session.quoteTargetId in types.ts. */
   quoteTargetId?: string;
   currentReplyTarget?: { rootMessageId: string; turnId: string; updatedAt: string; quoteOnly?: boolean; substitute?: boolean };
-  replyTargets?: Record<string, { rootMessageId: string; updatedAt: string; quoteOnly?: boolean; substitute?: boolean }>;
+  /** Per-turn reply targets（见 Session.replyTargets in types.ts）——排队/并发轮次各自的回复锚点。 */
+  replyTargets?: Record<string, { rootMessageId?: string; updatedAt: string; quoteOnly?: boolean; substitute?: boolean; senderOpenId?: string }>;
   codexAppDispatchLedger?: CodexAppDispatchLedgerEntry[];
   codexAppGenerationCommits?: unknown;
   queued?: boolean;
@@ -3664,31 +3673,39 @@ function formatDuration(ms: number): string {
   return `${days}d${hours % 24}h`;
 }
 
-/** Get display width of a string, accounting for CJK double-width characters. */
+/**
+ * Get display width of a string in terminal cells.
+ *
+ * Delegates to a cross-terminal conservative width table (see terminal-width.ts):
+ * for any real terminal the width returned is >= what it paints, so the picker's
+ * `layoutWidth <= termWidth` genuinely implies rows never wrap. The previous
+ * inline table only covered CJK/Hangul and under-counted emoji (🤖/🫠 as 1),
+ * letting emoji session titles overflow a row, wrap onto a second physical line,
+ * and push the pinned title off the alt-screen.
+ *
+ * NOTE: cursor-moving control chars (Tab/ESC/C0/C1) are NOT sized here — width
+ * can't express a tab stop. Run text through `sanitizeCellText` first.
+ */
 function displayWidth(str: string): number {
-  let width = 0;
-  for (const ch of str) {
-    const code = ch.codePointAt(0)!;
-    // CJK Unified Ideographs, CJK Compatibility, Fullwidth forms, Hangul, Kana, etc.
-    if (
-      (code >= 0x1100 && code <= 0x115f) ||   // Hangul Jamo
-      (code >= 0x2e80 && code <= 0x303e) ||   // CJK Radicals, Kangxi, CJK Symbols
-      (code >= 0x3040 && code <= 0x33bf) ||   // Hiragana, Katakana, Bopomofo, CJK Compat
-      (code >= 0x3400 && code <= 0x4dbf) ||   // CJK Unified Ext A
-      (code >= 0x4e00 && code <= 0xa4cf) ||   // CJK Unified, Yi
-      (code >= 0xac00 && code <= 0xd7af) ||   // Hangul Syllables
-      (code >= 0xf900 && code <= 0xfaff) ||   // CJK Compat Ideographs
-      (code >= 0xfe30 && code <= 0xfe6f) ||   // CJK Compat Forms
-      (code >= 0xff01 && code <= 0xff60) ||   // Fullwidth Forms
-      (code >= 0xffe0 && code <= 0xffe6) ||   // Fullwidth Signs
-      (code >= 0x20000 && code <= 0x2fa1f)    // CJK Unified Ext B-F, Compat Supplement
-    ) {
-      width += 2;
-    } else {
-      width += 1;
-    }
-  }
-  return width;
+  return terminalCellWidth(str);
+}
+
+/**
+ * Strip everything that would move the cursor or otherwise desync column math
+ * from dynamic text (session titles, working dirs, flash messages) before it is
+ * measured or printed. A raw Tab jumps to the next tab stop and a raw ESC starts
+ * a control sequence — both make a "one physical line" cell silently span more
+ * columns (or lines) than displayWidth accounts for, wrapping the row and
+ * pushing the pinned title off screen. Collapse them all to a single space:
+ *   - C0 controls incl. Tab/CR/LF (U+0000–U+001F) and DEL (U+007F);
+ *   - C1 controls (U+0080–U+009F);
+ *   - stray ESC (U+001B) is covered by the C0 range.
+ * (ANSI colour sequences the picker itself emits are added AFTER sanitizing, so
+ * they are never fed through here.)
+ */
+function sanitizeCellText(str: string): string {
+  // eslint-disable-next-line no-control-regex
+  return str.replace(/[\x00-\x1F\x7F-\x9F]+/g, " ");
 }
 
 /** Truncate string to fit within maxWidth display columns, append '…' if truncated. */
@@ -4114,28 +4131,7 @@ function interactiveSessionPicker(active: SessionData[], probeSnapshot: BackingP
     botLabels.set(b.larkAppId, `bot${i + 1} (${b.cliId ?? 'claude-code'})`);
   }
 
-  // Responsive column widths based on terminal width
-  const termWidth = process.stdout.columns || 100;
-  const PREFIX = 4;    // "  ❯ " or "    "
-  const SEP_W = 3;     // " │ "
-  const fixedCols = { id: 10, pid: 8, uptime: 7, status: 7, target: 26 };
-  const botW = multiBot ? 18 : 0;
-  const numSeps = (multiBot ? 8 : 7) - 1;  // separators between columns
-  const fixedTotal = PREFIX + fixedCols.id + botW + fixedCols.pid + fixedCols.uptime + fixedCols.status + fixedCols.target + numSeps * SEP_W;
-  const flexTotal = Math.max(20, termWidth - fixedTotal);
-  const titleW = Math.floor(flexTotal * 0.4);
-  const dirW = flexTotal - titleW;
-
-  const cols = {
-    id: fixedCols.id,
-    ...(multiBot ? { bot: botW } : {}),
-    title: titleW,
-    dir: dirW,
-    pid: fixedCols.pid,
-    uptime: fixedCols.uptime,
-    status: fixedCols.status,
-    target: fixedCols.target,
-  };
+  let layout: SessionPickerLayout = computeSessionPickerLayout(process.stdout.columns || 100, multiBot);
 
   // Build row data — use shortened paths for TUI
   function buildRows(): Array<{
@@ -4155,26 +4151,31 @@ function interactiveSessionPicker(active: SessionData[], probeSnapshot: BackingP
         ? { probe: 'missing' as const, label: adoptTargetLabel(s) }
         : sessionBackingInfo(s, probeSnapshot);
       const targetLabel = backing.label;
-      // Build row text with shortened dir
-      const id = padEndDisplay(s.sessionId.substring(0, 8), cols.id);
-      const parts = [id];
-      if (multiBot) {
-        const label = s.larkAppId ? (botLabels.get(s.larkAppId) ?? s.larkAppId.substring(0, 16)) : '-';
-        parts.push(padEndDisplay(truncate(label, cols.bot!), cols.bot!));
-      }
-      const title = padEndDisplay(truncate((s.title || '(untitled)').replace(/[\r\n]+/g, ' '), cols.title), cols.title);
-      const dir = padEndDisplay(truncate(shortenPath(s.workingDir || '-'), cols.dir), cols.dir);
       const displayPid = sessionDisplayPid(s);
-      const pid = displayPid ? String(displayPid).padEnd(cols.pid) : '-'.padEnd(cols.pid);
-      const uptime = formatDuration(Date.now() - new Date(s.createdAt).getTime()).padEnd(cols.uptime);
       const alive = isSessionAliveForList(s);
-      const status = padEndDisplay(sessionStatusLabel(s), cols.status);
-      const target = padEndDisplay(truncate(targetLabel, cols.target), cols.target);
-      parts.push(title, dir, pid, uptime, status, target);
+      const botLabel = s.larkAppId ? (botLabels.get(s.larkAppId) ?? s.larkAppId.substring(0, 16)) : '-';
+      const cells: Record<SessionPickerColumnKey, string> = {
+        id: s.sessionId.substring(0, 8),
+        bot: botLabel,
+        title: s.title || '(untitled)',
+        dir: shortenPath(s.workingDir || '-'),
+        pid: displayPid ? String(displayPid) : '-',
+        uptime: formatDuration(Date.now() - new Date(s.createdAt).getTime()),
+        status: sessionStatusLabel(s),
+        target: targetLabel,
+      };
+      const text = layout.columns
+        .map(column => {
+          // Sanitize every cell (not just title): a Tab/ESC/control char in any
+          // dynamic field would move the cursor and desync the one-line-per-row math.
+          const value = sanitizeCellText(cells[column.key]);
+          return padEndDisplay(truncate(value, column.width), column.width);
+        })
+        .join(' │ ');
 
       return {
         session: s,
-        text: parts.join(' │ '),
+        text,
         alive,
         backendTarget: 'target' in backing ? backing.target : undefined,
         backingProbe: backing.probe,
@@ -4193,76 +4194,176 @@ function interactiveSessionPicker(active: SessionData[], probeSnapshot: BackingP
 
   // Build header (same column layout as rows, no extra prefix in join)
   function buildHeader(): string {
-    const hParts = ['id'.padEnd(cols.id)];
-    if (multiBot) hParts.push('bot'.padEnd(cols.bot!));
-    hParts.push(
-      'title'.padEnd(cols.title),
-      'working dir'.padEnd(cols.dir),
-      'pid'.padEnd(cols.pid),
-      'uptime'.padEnd(cols.uptime),
-      'status'.padEnd(cols.status),
-      'target'.padEnd(cols.target),
-    );
-    return hParts.join(' │ ');
+    const labels: Record<SessionPickerColumnKey, string> = {
+      id: 'id',
+      bot: 'bot',
+      title: 'title',
+      dir: 'working dir',
+      pid: 'pid',
+      uptime: 'uptime',
+      status: 'status',
+      target: 'target',
+    };
+    return layout.columns
+      .map(column => padEndDisplay(truncate(labels[column.key], column.width), column.width))
+      .join(' │ ');
   }
 
-  const header = buildHeader();
-  const separator = '─'.repeat(displayWidth(header));
+  let header = buildHeader();
+  let separator = '─'.repeat(displayWidth(header));
 
   let cursor = 0;
+  let scrollTop = 0;              // index of the first visible row (vertical scroll)
   let confirmDelete = false;  // true when waiting for y/n confirmation
-  let flashMsg = '';
+  // Transient status line. Stored as {style, text} where text is UNSTYLED and may
+  // contain untrusted session metadata — it is sanitized + SGR-wrapped only at
+  // render time, so a control char in `text` can never reach the terminal raw.
+  type FooterStyle = 'error' | 'success' | 'warn' | 'dim';
+  let flash: { style: FooterStyle; text: string } | null = null;
+
+  // Fixed chrome around the scrolling row window: title(2) + header block(3) +
+  // bottom separator(1) + target hint(2) + flash/confirm(2) + hints(2) + a
+  // one-line safety margin so the final newline never scrolls the pinned title
+  // off the alt-screen. Everything else is the row viewport.
+  const CHROME_ROWS = 13;
+  let sepWidth = displayWidth(separator);
+
+  function rebuildLayout(): void {
+    layout = computeSessionPickerLayout(process.stdout.columns || 100, multiBot);
+    rows = buildRows();
+    header = buildHeader();
+    separator = '─'.repeat(displayWidth(header));
+    sepWidth = displayWidth(separator);
+  }
+  // Overlay a "N 更多" marker onto a separator line without changing its display
+  // width, so the up/down hidden-row counters cost no extra vertical lines.
+  const sepWithMarker = (marker: string): string => {
+    const label = ` ${marker} `;
+    const lw = displayWidth(label);
+    if (lw + 4 > sepWidth) return separator;
+    return `──${label}${'─'.repeat(sepWidth - 2 - lw)}`;
+  };
+
+  const fitLine = (text: string, width: number): string => {
+    if (width <= 0) return '';
+    const singleLine = sanitizeCellText(text);
+    return displayWidth(singleLine) <= width ? singleLine : truncate(singleLine, width);
+  };
+  // The ONLY place footer SGR colour is applied. `text` is treated as untrusted:
+  // it is sanitized (control chars stripped) and width-fitted first, then wrapped
+  // in a fixed whitelist SGR from `style`. No caller-supplied escape can survive,
+  // and there is no fast path that returns a raw/mixed string — closing the two
+  // bypasses where a session's target label / flash message could inject e.g.
+  // `\x1b[2J` (clear screen) into the footer and scroll the pinned title away.
+  const SGR: Record<FooterStyle, string> = {
+    error: '\x1b[31m',
+    success: '\x1b[32m',
+    warn: '\x1b[33m',
+    dim: '\x1b[2m',
+  };
+  const styledFooter = (style: FooterStyle, text: string, width: number): string =>
+    `${SGR[style]}${fitLine(text, width)}\x1b[0m`;
+  const blankRowPrefix = (): string => ' '.repeat(layout.prefixWidth);
+  const rowPrefix = (selected: boolean): string => {
+    if (!selected) return blankRowPrefix();
+    const pointer = '\x1b[36m❯\x1b[0m';
+    if (layout.prefixWidth >= 4) return `  ${pointer} `;
+    if (layout.prefixWidth === 3) return ` ${pointer} `;
+    if (layout.prefixWidth === 2) return `${pointer} `;
+    return layout.prefixWidth === 1 ? pointer : '';
+  };
+  const footerPrefixWidth = (): number => Math.min(2, layout.termWidth);
+  const footerContentWidth = (): number => Math.max(0, layout.termWidth - footerPrefixWidth());
+  const footerPrefix = (): string => ' '.repeat(footerPrefixWidth());
 
   function render(): void {
     process.stdout.write('\x1b[H\x1b[J');
 
-    process.stdout.write(`\x1b[1m botmux sessions\x1b[0m  \x1b[2m(${rows.length})\x1b[0m\n\n`);
-
-    // Header + separator — use same 4-char prefix as rows
-    process.stdout.write(`    ${separator}\n`);
-    process.stdout.write(`    \x1b[2m${header}\x1b[0m\n`);
-    process.stdout.write(`    ${separator}\n`);
+    const posLabel = rows.length > 0 ? `${cursor + 1}/${rows.length}` : '0';
+    const titleText = ` botmux sessions  (${posLabel})`;
+    if (displayWidth(titleText) <= layout.termWidth) {
+      process.stdout.write(`\x1b[1m botmux sessions\x1b[0m  \x1b[2m(${posLabel})\x1b[0m\n\n`);
+    } else {
+      process.stdout.write(`\x1b[1m${fitLine(titleText, layout.termWidth)}\x1b[0m\n\n`);
+    }
 
     if (rows.length === 0) {
-      process.stdout.write(`\n    \x1b[2m没有活跃会话\x1b[0m\n`);
-      process.stdout.write(`    ${separator}\n`);
-      process.stdout.write(`\n  \x1b[2mq 退出\x1b[0m\n`);
+      process.stdout.write(`${blankRowPrefix()}${separator}\n`);
+      process.stdout.write(`${blankRowPrefix()}\x1b[2m${header}\x1b[0m\n`);
+      process.stdout.write(`${blankRowPrefix()}${separator}\n`);
+      process.stdout.write(`\n${blankRowPrefix()}\x1b[2m${fitLine('没有活跃会话', Math.max(0, layout.termWidth - layout.prefixWidth))}\x1b[0m\n`);
+      process.stdout.write(`${blankRowPrefix()}${separator}\n`);
+      process.stdout.write(`\n${footerPrefix()}\x1b[2m${fitLine('q 退出', footerContentWidth())}\x1b[0m\n`);
       return;
     }
 
-    for (let i = 0; i < rows.length; i++) {
+    // Vertical viewport: render only the window of rows that fits the terminal
+    // height, scrolling to keep the cursor visible. Without this a long session
+    // list overflows the alt-screen and pushes the title/header/top rows off it.
+    const win = computeSessionPickerScrollWindow({
+      cursor,
+      scrollTop,
+      rowCount: rows.length,
+      termRows: process.stdout.rows || 24,
+      chromeRows: CHROME_ROWS,
+    });
+    scrollTop = win.scrollTop;
+    const { viewEnd, hiddenAbove, hiddenBelow } = win;
+
+    // Header + separator — use the same responsive prefix as rows.
+    process.stdout.write(`${blankRowPrefix()}${separator}\n`);
+    process.stdout.write(`${blankRowPrefix()}\x1b[2m${header}\x1b[0m\n`);
+    process.stdout.write(hiddenAbove > 0
+      ? `${blankRowPrefix()}\x1b[36m${sepWithMarker(`↑ ${hiddenAbove} 更多`)}\x1b[0m\n`
+      : `${blankRowPrefix()}${separator}\n`);
+
+    for (let i = scrollTop; i < viewEnd; i++) {
       const r = rows[i];
-      const pointer = i === cursor ? '\x1b[36m❯\x1b[0m' : ' ';
       if (i === cursor) {
-        process.stdout.write(`  ${pointer} \x1b[7m${r.text}\x1b[0m\n`);
+        process.stdout.write(`${rowPrefix(true)}\x1b[7m${r.text}\x1b[0m\n`);
       } else {
-        process.stdout.write(`  ${pointer} ${r.text}\n`);
+        process.stdout.write(`${rowPrefix(false)}${r.text}\n`);
       }
     }
 
-    process.stdout.write(`    ${separator}\n`);
+    process.stdout.write(hiddenBelow > 0
+      ? `${blankRowPrefix()}\x1b[36m${sepWithMarker(`↓ ${hiddenBelow} 更多`)}\x1b[0m\n`
+      : `${blankRowPrefix()}${separator}\n`);
 
-    // Footer info
+    // Footer info. Every dynamic field (targetLabel, backend session name) is
+    // untrusted session metadata, so it only ever reaches the terminal via
+    // styledFooter (sanitize → fit → whitelist SGR). The adopt hint's fixed
+    // suffix is trusted static text, appended after the fitted label.
     const selected = rows[cursor];
-    const targetHint = selected.isAdopt
-      ? `\x1b[33m${selected.targetLabel}\x1b[0m  \x1b[2mEnter 已禁用；请直接使用原 tmux/zellij/herdr 客户端。\x1b[0m`
-      : selected.canAttach
-        ? `\x1b[32m${selected.attachBackend}: ${selected.backendTarget?.sessionName}\x1b[0m`
-        : `\x1b[2m${selected.targetLabel}（不可连接）\x1b[0m`;
-    process.stdout.write(`\n  ${targetHint}\n`);
+    const width = footerContentWidth();
+    let footerLine: string;
+    if (selected.isAdopt) {
+      const suffix = '  Enter 已禁用；请直接使用原 tmux/zellij/herdr 客户端。';
+      const labelWidth = Math.max(0, width - displayWidth(suffix));
+      footerLine = `${styledFooter('warn', selected.targetLabel, labelWidth)}\x1b[2m${fitLine(suffix, width)}\x1b[0m`;
+    } else if (selected.canAttach) {
+      footerLine = styledFooter('success', `${selected.attachBackend}: ${selected.backendTarget?.sessionName}`, width);
+    } else {
+      footerLine = styledFooter('dim', `${selected.targetLabel}（不可连接）`, width);
+    }
+    process.stdout.write(`\n${footerPrefix()}${footerLine}\n`);
 
     // Flash message or confirmation prompt
     if (confirmDelete) {
       const s = selected.session;
-      process.stdout.write(`\n  \x1b[33m确认删除 ${s.sessionId.substring(0, 8)} "${truncate(s.title || '', 20)}"? (y/n)\x1b[0m\n`);
-    } else if (flashMsg) {
-      process.stdout.write(`\n  ${flashMsg}\n`);
+      const confirmation = `确认删除 ${s.sessionId.substring(0, 8)} "${truncate(s.title || '', 20)}"? (y/n)`;
+      process.stdout.write(`\n${footerPrefix()}${styledFooter('warn', confirmation, width)}\n`);
+    } else if (flash) {
+      process.stdout.write(`\n${footerPrefix()}${styledFooter(flash.style, flash.text, width)}\n`);
     } else {
       process.stdout.write('\n');
     }
 
     // Keybinding hints
-    process.stdout.write(`\n  \x1b[2m↑/↓ 选择  ⏎ ${selected?.canAttach ? '连接' : '不可连接'}  d 删除  q 退出\x1b[0m\n`);
+    const fullHints = `↑/↓ 选择  ⏎ ${selected?.canAttach ? '连接' : '不可连接'}  d 删除  q 退出`;
+    const compactHints = '↑/↓ 选择  ⏎  d  q';
+    const hints = displayWidth(fullHints) <= width ? fullHints : compactHints;
+    process.stdout.write(`\n${footerPrefix()}${styledFooter('dim', hints, width)}\n`);
   }
 
   return new Promise<void>((resolve) => {
@@ -4275,7 +4376,16 @@ function interactiveSessionPicker(active: SessionData[], probeSnapshot: BackingP
 
     render();
 
+    // Rebuild both axes on resize: rows/header must use the current columns or
+    // stale wide lines wrap and invalidate the vertical one-row-per-session math.
+    const onResize = (): void => {
+      rebuildLayout();
+      render();
+    };
+    process.stdout.on('resize', onResize);
+
     function cleanup(): void {
+      process.stdout.off('resize', onResize);
       process.stdin.setRawMode(false);
       process.stdin.pause();
       process.stdout.write('\x1b[?25h');   // show cursor
@@ -4293,7 +4403,7 @@ function interactiveSessionPicker(active: SessionData[], probeSnapshot: BackingP
       // fallback rereads the exact row and clears the latest ledger/commits.
       const result = await abandonSessionAuthoritatively(s);
       if (!result.ok) {
-        flashMsg = `\x1b[31m删除失败 ${s.sessionId.substring(0, 8)}${result.error ? `：${result.error}` : ''}；会话保持活跃，可重试\x1b[0m`;
+        flash = { style: 'error', text: `✗ 删除失败: ${result.error}` };
         return;
       }
       // A live daemon owns process/pane teardown and has re-resolved the latest
@@ -4306,9 +4416,12 @@ function interactiveSessionPicker(active: SessionData[], probeSnapshot: BackingP
       rows.splice(idx, 1);
 
       if (cursor >= rows.length) cursor = Math.max(0, rows.length - 1);
-      flashMsg = result.mode === 'daemon'
-        ? `\x1b[32m✓ 已删除 ${s.sessionId.substring(0, 8)}\x1b[0m`
-        : `\x1b[33m✓ 已离线删除 ${s.sessionId.substring(0, 8)}\x1b[0m`;
+      // master's flash-object footer; the daemon/offline discriminant on
+      // abandonSessionAuthoritatively is `mode` (see its return type ~3573),
+      // NOT master's `via` — that belongs to a different helper.
+      flash = result.mode === 'daemon'
+        ? { style: 'success', text: `✓ 已删除 ${s.sessionId.substring(0, 8)}` }
+        : { style: 'warn', text: `✓ 已离线删除 ${s.sessionId.substring(0, 8)}` };
     }
 
     process.stdin.on('data', async (key: string) => {
@@ -4321,13 +4434,13 @@ function interactiveSessionPicker(active: SessionData[], probeSnapshot: BackingP
           try { await deleteSession(cursor); }
           finally { deleteInFlight = false; }
         } else {
-          flashMsg = '\x1b[2m取消删除\x1b[0m';
+          flash = { style: 'dim', text: '取消删除' };
         }
         render();
         return;
       }
 
-      flashMsg = '';
+      flash = null;
 
       // Ctrl-C or q or Esc
       if (key === '\x03' || key === 'q' || key === '\x1b') {
@@ -4367,19 +4480,19 @@ function interactiveSessionPicker(active: SessionData[], probeSnapshot: BackingP
       if (key === '\r' || key === '\n') {
         const selected = rows[cursor];
         if (selected.isAdopt) {
-          flashMsg = `\x1b[33m这是 adopt 会话；botmux 不 attach 用户 pane。目标: ${selected.targetLabel}\x1b[0m`;
+          flash = { style: 'warn', text: `这是 adopt 会话；botmux 不 attach 用户 pane。目标: ${selected.targetLabel}` };
           render();
           return;
         }
         if (!selected.canAttach) {
-          flashMsg = '\x1b[33m该会话没有可连接的持久后端\x1b[0m';
+          flash = { style: 'warn', text: '该会话没有可连接的持久后端' };
           render();
           return;
         }
         if (selected.attachBackend === 'zmx') {
           const target = selected.backendTarget;
           if (!target || target.backendType !== 'zmx') {
-            flashMsg = '\x1b[31mZMX attach target is missing or inconsistent\x1b[0m';
+            flash = { style: 'error', text: 'ZMX attach target is missing or inconsistent' };
             render();
             return;
           }
@@ -4391,7 +4504,7 @@ function interactiveSessionPicker(active: SessionData[], probeSnapshot: BackingP
             selected.session.sessionId,
           );
           if (!frozen.ok) {
-            flashMsg = `\x1b[31m${frozen.message}\x1b[0m`;
+            flash = { style: 'error', text: frozen.message };
             render();
             return;
           }
@@ -4405,7 +4518,7 @@ function interactiveSessionPicker(active: SessionData[], probeSnapshot: BackingP
         } else {
           const target = selected.backendTarget;
           if (!target || target.backendType !== 'tmux') {
-            flashMsg = '\x1b[31mtmux attach target is missing or inconsistent\x1b[0m';
+            flash = { style: 'error', text: 'tmux attach target is missing or inconsistent' };
             render();
             return;
           }
@@ -6695,7 +6808,8 @@ import { getSessionUsageSnapshot } from './core/cost-calculator.js';
 import {
   resolveQuoteTarget,
   validateMentionDecision,
-  shouldBlockMentionBackByParticipants,
+  mentionBackAmbiguity,
+  mentionBackAmbiguityError,
   parseAttentionFlag,
   attentionUsageError,
   managedVcQuoteError,
@@ -7850,6 +7964,7 @@ async function cmdSend(rest: string[]): Promise<void> {
   }
   const replyTargetSenderOpenId = explicitVcMeetingImOrigin?.replyTargetSenderOpenId
     ?? frozenTurnDispatch?.replyTargetSenderOpenId
+    ?? turnReplyTarget?.senderOpenId
     ?? s.quoteTargetSenderOpenId;
 
   // @ hard-gate (config.send.requireMentionDecision, default on): force the
@@ -7865,12 +7980,8 @@ async function cmdSend(rest: string[]): Promise<void> {
   });
   if (!mentionGate.ok) { console.error(mentionGate.error); process.exit(2); }
 
-  // Register bots so the Lark client works. MUST run before the participant
-  // gate below: that gate calls getGroupStats → getBotClient, which throws
-  // "Bot not registered" in this standalone `botmux send` process (a fresh
-  // process with an empty registry) — getGroupStats would then soft-fail to
-  // {999,999} and wrongly block --mention-back even in a true 1v1. registerBot
-  // is idempotent, so the downstream send path reuses these same clients.
+  // Register bots so the downstream Lark client works. registerBot is
+  // idempotent, so all send paths reuse these same clients.
   // envPinnedRiffBot is re-registered LAST so a remote env credential is never
   // clobbered by a stale bots.json entry for the same app.
   const { registerBot, loadBotConfigs, findOncallChatForAnyBot, getBot } = await import('./bot-registry.js');
@@ -7878,30 +7989,20 @@ async function cmdSend(rest: string[]): Promise<void> {
   try { for (const cfg of loadBotConfigs()) registerBot(cfg); } catch { /* */ }
   if (envPinnedRiffBot) { try { registerBot(envPinnedRiffBot); } catch { /* */ } }
 
-  // Participant gate for --mention-back: in a true 1v1 the triggerer is the
-  // only counterpart so auto-@-ing them back is unambiguous, but once a third
-  // party joins (humans + bots > 2) "who triggered this turn" is no longer
-  // reliably "who should be addressed". Force an explicit --mention there.
-  // Symmetric with the inbound un-@ gate (event-dispatcher getGroupStats).
-  // Only fetch when mention-back is actually requested AND the chat isn't a p2p
-  // DM (inherently 1v1) — keeps the common send path free of an API round-trip.
-  if (mentionBack && s.chatType !== 'p2p' && s.larkAppId && s.chatId && !sendTopLevel) {
-    try {
-      const { getGroupStats } = await import('./im/lark/event-dispatcher.js');
-      const { userCount, botCount } = await getGroupStats(s.larkAppId, s.chatId);
-      if (shouldBlockMentionBackByParticipants({ chatType: s.chatType, userCount, botCount })) {
-        console.error(
-          `--mention-back 在多人会话（当前 ${userCount} 人 + ${botCount} bot）里不可用：`
-          + '"回复触发这轮的人/bot" 在多方场景可能 @ 错对象。请改用 --mention <ou:Name> 显式点名，'
-          + '或 --no-mention 不 @。',
-        );
-        process.exit(2);
-      }
-    } catch (err: any) {
-      // getGroupStats already soft-fails to {999,999} (→ block) internally, so
-      // reaching here means the dynamic import itself failed. Fail-closed to a
-      // clear error rather than silently letting a possibly-wrong @ through.
-      console.error(`无法确认会话人数以校验 --mention-back：${err?.message ?? err}。请改用 --mention <ou:Name> 或 --no-mention。`);
+  // Ambiguity gate for --mention-back. --mention-back means "@ back the one
+  // counterpart who triggered this turn"; that is only unambiguous when this
+  // turn's window had a single counterpart. Once 2+ distinct people/bots took
+  // part (a human + a peer bot, two humans, the triggerer plus someone they
+  // @-ed, a type-ahead follow-up from a third party, …), block --mention-back
+  // and hand the model the exact candidates so it can --mention <open_id> the
+  // right one instead of guessing (or mis-@-ing the lone human). Reads the
+  // persisted per-turn participant window — no group-stats round-trip. Explicit
+  // VC turns carry their own single-target origin, so they skip this gate.
+  if (mentionBack && !explicitVcMeetingImOrigin && !sendTopLevel) {
+    const window = collectTurnWindowParticipants(s, currentTurnId);
+    const ambiguity = mentionBackAmbiguity({ chatType: s.chatType, participants: window.participants, incomplete: window.incomplete });
+    if (ambiguity.ambiguous) {
+      console.error(mentionBackAmbiguityError(ambiguity.candidates, ambiguity.incomplete));
       process.exit(2);
     }
   }
@@ -8384,7 +8485,7 @@ async function cmdSend(rest: string[]): Promise<void> {
       ? { sendTo: undefined as string | undefined, cc: [] as string[] }
       : buildFooterAddressing(frozenFooterAddressingSource, {
           isOncall: !!oncallEntry,
-          isSubstitute: turnReplyTarget?.turnId === currentTurnId && turnReplyTarget?.substitute === true,
+          isSubstitute: isChatScope && turnReplyTarget?.turnId === currentTurnId && turnReplyTarget?.substitute === true,
           hasExplicitBotMention: explicitKnownBotMention,
           knownBotOpenIds,
         });
@@ -9742,20 +9843,24 @@ botmux create-group — 用一组机器人新建飞书群
 
 /**
  * postAsk: 找到 daemon → POST /api/asks → 返回 AskResult。
- * 连接失败 / HTTP 错误时抛出带 exitCode 属性的 Error：
- *   - exitCode=3：daemon 不可达或 HTTP 错误
+ * 连接失败 / HTTP 错误时抛出带 `exitCode` + `retryable` 属性的 Error：
+ *   - exitCode=3：daemon 不可达或 HTTP 错误（保持向后兼容）
+ *   - retryable=true：仅当 daemon 不可达 / 网络失败 / 明确的 transient HTTP
+ *     (502/503/504，含 daemon 启动尚未就绪) 时。这些正是"daemon 重启中"的信号,
+ *     runHook 会重连重试。确定性 4xx（bad body / capability 拒绝 / unsupported)
+ *     与非 JSON 是 retryable=false —— 重试 24h 也不会变,应立即 passthrough。
  */
 async function postAsk(body: Record<string, unknown>): Promise<import('./core/ask-types.js').AskResult> {
   type AskResult = import('./core/ask-types.js').AskResult;
+  type AskError = Error & { exitCode: number; retryable: boolean };
+  const mkErr = (message: string, retryable: boolean): AskError =>
+    Object.assign(new Error(message), { exitCode: 3, retryable });
 
   const larkAppId = body.larkAppId as string;
   const daemon = findDaemon(larkAppId);
   if (!daemon) {
-    const err = new Error(
-      `botmux ask: 找不到 daemon (larkAppId=${larkAppId})。daemon 已停？exit 3.`,
-    ) as Error & { exitCode: number };
-    err.exitCode = 3;
-    throw err;
+    // No daemon record → it's (re)starting or momentarily gone → retryable.
+    throw mkErr(`botmux ask: 找不到 daemon (larkAppId=${larkAppId})。daemon 已停？exit 3.`, true);
   }
 
   let res: Response;
@@ -9787,28 +9892,27 @@ async function postAsk(body: Record<string, unknown>): Promise<import('./core/as
       ? await fetchDaemonIpc(daemon.ipcPort, '/api/asks', init, hostSecret)
       : await fetch(`http://127.0.0.1:${daemon.ipcPort}/api/asks`, init);
   } catch (fetchErr) {
+    // Socket refused / reset / timeout → daemon is down or restarting → retryable.
     const msg = fetchErr instanceof Error ? fetchErr.message : String(fetchErr);
-    const err = new Error(
-      `botmux ask: 无法连接 daemon (port=${daemon.ipcPort}): ${msg}`,
-    ) as Error & { exitCode: number };
-    err.exitCode = 3;
-    throw err;
+    throw mkErr(`botmux ask: 无法连接 daemon (port=${daemon.ipcPort}): ${msg}`, true);
   }
 
   if (!res.ok) {
     let errBody = '';
     try { errBody = (await res.text()).slice(0, 200); } catch { /* */ }
-    const err = new Error(`botmux ask: daemon HTTP ${res.status}: ${errBody}`) as Error & { exitCode: number };
-    err.exitCode = 3;
-    throw err;
+    // Only transient server states are retryable. A deterministic 4xx (bad
+    // body, capability denied, unsupported chat) will fail identically forever;
+    // 502/503/504 mean the daemon is up but not ready (startup window) → retry.
+    // Shared pure classifier (unit-tested directly — codex P1-3 seam).
+    const retryable = isRetryableAskHttpStatus(res.status);
+    throw mkErr(`botmux ask: daemon HTTP ${res.status}: ${errBody}`, retryable);
   }
 
   try {
     return (await res.json()) as AskResult;
   } catch (jsonErr) {
-    const err = new Error(`botmux ask: daemon 返回非 JSON: ${jsonErr}`) as Error & { exitCode: number };
-    err.exitCode = 3;
-    throw err;
+    // A malformed body is not something a retry fixes.
+    throw mkErr(`botmux ask: daemon 返回非 JSON: ${jsonErr}`, false);
   }
 }
 
@@ -9896,6 +10000,10 @@ async function cmdAsk(sub: string, rest: string[]): Promise<void> {
     options,
     prompt,
     timeoutMs,
+    // Explicit `botmux ask buttons` has no reconnecting claimant (the CLI exits
+    // on daemon restart), so mark it non-hook: the broker won't persist/handoff
+    // it and can never confuse it with a hook ask's card (codex P1-4/P1-3).
+    originKind: 'explicit',
     ...(liveAskOrigin?.turnId ? { originTurnId: liveAskOrigin.turnId } : {}),
     ...(liveAskOrigin?.dispatchAttempt !== undefined
       ? { originDispatchAttempt: liveAskOrigin.dispatchAttempt }
@@ -10036,8 +10144,14 @@ export async function runHook(
     routeRoot = adopt.rootMessageId;
   }
 
-  // 解析 timeoutMs：默认 1 小时，可由 BOTMUX_ASK_TIMEOUT_MS 覆盖
-  const DEFAULT_TIMEOUT_MS = 3_600_000;
+  // 解析 timeoutMs：默认 ~24h，可由 BOTMUX_ASK_TIMEOUT_MS 覆盖。
+  // 为什么这么长：ask 超时不是良性兜底——broker settle 成 `timedOut` 会让 hook
+  // 落到 passthrough，Claude 转而渲染原生 picker，而此后飞书回调已无通道把答案
+  // 送回（picker 挂死、答案不生效）。所以默认值对齐 hook 安装侧的进程超时上限
+  // （settings.json 里的 86400s），让 broker 不会 *早于* hook 进程本身超时；
+  // 既避免"人回复慢→picker 卡死"，又保留一个有限的进程级兜底（永不超时会让一次
+  // CLI turn 无限阻塞，是更糟的失败）。
+  const DEFAULT_TIMEOUT_MS = 86_400_000; // 24h — 对齐 hook 安装侧 timeout:86400s
   let timeoutMs = DEFAULT_TIMEOUT_MS;
   const timeoutEnv = env.BOTMUX_ASK_TIMEOUT_MS;
   if (timeoutEnv) {
@@ -10047,6 +10161,12 @@ export async function runHook(
     }
   }
 
+  // Per-invocation identity: generated ONCE here (outside the retry loop) and
+  // reused across every reconnect POST, so a re-POST after a daemon restart
+  // re-attaches to the same restored ask instead of posting a duplicate card.
+  // originKind='hook' namespaces it away from an explicit `botmux ask buttons`.
+  const requestId = randomUUID();
+
   const body: Record<string, unknown> = {
     sessionId: routeSessionId,
     chatId: routeChatId,
@@ -10054,14 +10174,46 @@ export async function runHook(
     rootMessageId: routeRoot,
     questions: parsed.questions,
     timeoutMs,
+    requestId,
+    originKind: 'hook',
   };
 
-  let result: import('./core/ask-types.js').AskResult;
-  try {
-    result = await postAskFn(body);
-  } catch {
-    // 任何失败（daemon 不可达、HTTP 错误等）→ passthrough 放行
-    return { stdout: adapter.passthrough(payload) };
+  // Post the ask, RETRYING across a daemon restart. The daemon holds pending
+  // asks in memory only, so a restart between "card posted" and "user clicked"
+  // drops the ask; historically postAskFn then threw (daemon unreachable) and
+  // we fell straight to passthrough → the CLI rendered its native picker with no
+  // way to receive the answer. Instead: while the daemon is unreachable (and
+  // only then — an answered/timedOut/invalidated result returns normally), keep
+  // reconnecting until the ask's own deadline. The daemon restores the pending
+  // ask from disk on boot and re-attaches this reconnecting request to it by a
+  // stable key, so the SAME card resolves through the normal hook directive.
+  // Blocking here keeps Claude spinning; the native picker never renders.
+  const deadline = Date.now() + timeoutMs;
+  let result: import('./core/ask-types.js').AskResult | undefined;
+  let attempt = 0;
+  while (true) {
+    try {
+      result = await postAskFn(body);
+      break;
+    } catch (err) {
+      // Retry ONLY genuinely transient failures (daemon unreachable / network /
+      // 502-503-504 startup-not-ready — see postAsk's `retryable`). That is the
+      // restart-in-progress case. A deterministic error (4xx bad body /
+      // capability / unsupported, non-JSON) has retryable=false → passthrough
+      // immediately rather than spin for 24h. A non-coded throw is also treated
+      // as non-retryable.
+      const retryable = (err as { retryable?: boolean } | undefined)?.retryable === true;
+      if (!retryable || Date.now() >= deadline) {
+        return { stdout: adapter.passthrough(payload) };
+      }
+      attempt++;
+      // Backoff: quick first reconnects (daemon usually returns in a few
+      // seconds), capped at 5s. Never sleep past the deadline.
+      const backoff = Math.min(5_000, 500 * attempt);
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) return { stdout: adapter.passthrough(payload) };
+      await new Promise((r) => setTimeout(r, Math.min(backoff, remaining)));
+    }
   }
 
   if (result.kind === 'answered') {

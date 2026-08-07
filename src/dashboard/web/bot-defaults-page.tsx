@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+import { createPortal } from 'react-dom';
 import { openBotOnboarding } from './bot-onboarding.js';
 import {
   agentSelectionKey,
@@ -1221,7 +1222,17 @@ function FeishuLoginModal(props: { onClose(): void; onSuccess(): void }) {
     };
   }, [begin, stopTimer]);
 
-  return (
+  if (typeof document === 'undefined') return null;
+
+  // Portal 到 body:此弹层内联渲染在头像组件(位于 .page 页面容器)的 DOM 里。
+  // 祖先 .page 有 `animation: dashboard-page-enter … both`,其关键帧动画 transform
+  // (translateY→none);fill-mode:both 下动画结束后持续「填充」,浏览器把 .page 的
+  // computed transform 算成 identity matrix(而非关键字 none)——「非 none 的 transform」
+  // 会为后代 position:fixed 建立包含块,于是弹层不再相对视口、被约束进 .page 的几何
+  // 范围,顶到视口下方,用户得滚动才看得到二维码(与主题无关,light/dark 均复现;
+  // 注意不是 .app-shell 的 overflow:hidden——overflow 不建立 fixed 包含块)。挂到
+  // body 顶层后逃出任何祖先包含块,与 auth-expired-overlay 一致,稳定居中。
+  return createPortal(
     <div
       className="feishu-login-overlay"
       onClick={event => {
@@ -1239,7 +1250,8 @@ function FeishuLoginModal(props: { onClose(): void; onSuccess(): void }) {
           <button type="button" className="primary" data-retry hidden={!retry} onClick={() => void begin()}>{tr('feishuLogin.retry')}</button>
         </div>
       </div>
-    </div>
+    </div>,
+    document.body,
   );
 }
 

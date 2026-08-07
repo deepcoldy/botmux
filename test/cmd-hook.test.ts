@@ -52,10 +52,11 @@ function makeAnsweredStub(answers: string[][]): () => Promise<AskResult> {
   });
 }
 
-// 构造一个抛出错误的 postAskFn stub
-function makeThrowingStub(msg = 'daemon unreachable'): () => Promise<AskResult> {
+// 构造一个抛出错误的 postAskFn stub。exitCode=3（daemon 不可达）会被 runHook
+// 重试；传别的（或不传）用于测"非可重试错误立即 passthrough"。
+function makeThrowingStub(msg = 'boom', exitCode?: number): () => Promise<AskResult> {
   return async () => {
-    throw Object.assign(new Error(msg), { exitCode: 3 });
+    throw Object.assign(new Error(msg), exitCode !== undefined ? { exitCode } : {});
   };
 }
 
@@ -91,8 +92,8 @@ describe('runHook', () => {
   });
 
   describe('(b) postAskFn 抛错 → 输出 passthrough，不抛出', () => {
-    it('任何 postAsk 错误均优雅放行', async () => {
-      const stub = makeThrowingStub('daemon unreachable');
+    it('非可重试错误（无 exitCode 3）立即优雅放行', async () => {
+      const stub = makeThrowingStub('boom');
       // 不应抛出
       let result: Awaited<ReturnType<typeof runHook>>;
       expect(async () => {
@@ -104,6 +105,42 @@ describe('runHook', () => {
       // 回归（Codex P1.1）：放行 = 空 stdout，绝不输出 directive。直接断言空串，
       // 不与实现的 passthrough() 比较，避免实现回退时测试跟着移动。
       expect(result.stdout).toBe('');
+    });
+
+    it('daemon 不可达（retryable）先重试，超过 ask 截止仍失败才 passthrough', async () => {
+      // retryable=true = daemon restart-in-progress → runHook 重试而非立即放行,
+      // 避免"卡还在但 hook 退出→原生 picker 卡死"。这里用极短 timeout 让重试
+      // 循环很快撞上截止、回落 passthrough,断言:①最终仍优雅放行 ②确实重试了多次。
+      let calls = 0;
+      const stub = async () => { calls++; throw Object.assign(new Error('daemon unreachable'), { exitCode: 3, retryable: true }); };
+      const env = { ...FULL_ENV, BOTMUX_ASK_TIMEOUT_MS: '1200' }; // 1.2s window
+      const result = await runHook(claudeAskPayload, env, stub, 'claude-code');
+      expect(result.stdout).toBe('');       // 截止后 passthrough
+      expect(calls).toBeGreaterThan(1);     // 至少重试过一次（非立即放行）
+    });
+
+    it('确定性错误（retryable=false，如 4xx / 非 JSON）立即 passthrough,不重试', async () => {
+      // 关键回归（codex P1-3）：postAsk 对确定性 4xx / 非 JSON 给 retryable=false,
+      // runHook 必须立即放行,而不是每 5s 重试到 24h。
+      let calls = 0;
+      const stub = async () => { calls++; throw Object.assign(new Error('HTTP 400 bad body'), { exitCode: 3, retryable: false }); };
+      const result = await runHook(claudeAskPayload, FULL_ENV, stub, 'claude-code');
+      expect(result.stdout).toBe('');
+      expect(calls).toBe(1);                 // 只调一次,不重试
+    });
+
+    it('daemon 恢复后重试拿到 answered → 走正常 directive（不 passthrough）', async () => {
+      // 模拟：前两次 retryable（restart 中），第三次 daemon 回来返 answered。
+      let calls = 0;
+      const stub = async (): Promise<AskResult> => {
+        calls++;
+        if (calls < 3) throw Object.assign(new Error('daemon unreachable'), { exitCode: 3, retryable: true });
+        return { kind: 'answered', answers: [['继续']], by: 'ou_u', comment: null, timedOut: false };
+      };
+      const result = await runHook(claudeAskPayload, FULL_ENV, stub, 'claude-code');
+      expect(calls).toBe(3);
+      expect(result.stdout).toBeTruthy();
+      expect(JSON.stringify(JSON.parse(result.stdout))).toContain('继续');
     });
   });
 
@@ -259,7 +296,7 @@ describe('runHook', () => {
       expect(capturedBody?.timeoutMs).toBe(7_200_000);
     });
 
-    it('无效值 → 使用默认 3600000', async () => {
+    it('无效值 → 回退到默认（24h，对齐 hook 进程超时上限）', async () => {
       let capturedBody: Record<string, unknown> | undefined;
       const captureStub = async (body: Record<string, unknown>): Promise<AskResult> => {
         capturedBody = body;
@@ -267,7 +304,17 @@ describe('runHook', () => {
       };
       const env = { ...FULL_ENV, BOTMUX_ASK_TIMEOUT_MS: 'not_a_number' };
       await runHook(claudeAskPayload, env, captureStub, 'claude-code');
-      expect(capturedBody?.timeoutMs).toBe(3_600_000);
+      expect(capturedBody?.timeoutMs).toBe(86_400_000);
+    });
+
+    it('未设 BOTMUX_ASK_TIMEOUT_MS → body.timeoutMs 默认 24h', async () => {
+      let capturedBody: Record<string, unknown> | undefined;
+      const captureStub = async (body: Record<string, unknown>): Promise<AskResult> => {
+        capturedBody = body;
+        return { kind: 'answered', answers: [['继续']], by: 'ou_u', comment: null, timedOut: false };
+      };
+      await runHook(claudeAskPayload, FULL_ENV, captureStub, 'claude-code');
+      expect(capturedBody?.timeoutMs).toBe(86_400_000);
     });
   });
 

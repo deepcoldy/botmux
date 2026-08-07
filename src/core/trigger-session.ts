@@ -349,8 +349,12 @@ async function triggerSessionTurnAdmitted(
     if (!suppressLoudFinal) return;
     armTriggerFinalSuppression(target, triggerId);
     // The synthetic turn id must not cost this turn its chat-scope fold-back
-    // anchor — see inheritTriggerReplyAnchor.
+    // anchor — see inheritTriggerReplyAnchor. Persist immediately: the synthetic
+    // anchor AND the prune watermark it may raise must be on disk for the
+    // independent `botmux send` process (which reads the session file) to resolve
+    // routing and the --mention-back ambiguity window correctly.
     inheritTriggerReplyAnchor(target, triggerId);
+    sessionStore.updateSession(target.session);
   };
   const disarmLoudFinalSuppression = (target: DaemonSession): void => {
     if (suppressLoudFinal) disarmTriggerFinalSuppression(target, triggerId);

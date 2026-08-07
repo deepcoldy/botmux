@@ -693,7 +693,7 @@ export const messages: Record<string, string> = {
   'ai.identity.mention_must': '要跟某个 bot 沟通或协作（让它收到你的消息），**必须** 显式 `--mention <对方 bot 的 open_id>`，不 --mention 对方 bot 完全不会被触发。',
   'ai.identity.mention_partners': '- 首轮上下文里的 `<available_bots>` 块会提示当前可协作的 bot（数量少时含 open_id，多时只列名字）；对方 open_id 也可以随时 `botmux bots list` 查',
   'ai.identity.mention_usage': '- 用法：`botmux send --mention ou_xxx "消息内容"`（多个 bot 重复 `--mention`）；`--mention-back` 可一键 @ 回触发你的那个人/ bot（open_id 自动取，无需手填）',
-  'ai.identity.mention_gate': '- **@ 硬门**：每条 `botmux send` 必须显式三选一否则报错不发——`--mention`（点名）/ `--mention-back`（@回触发者）/ `--no-mention`（不@）。按内容价值选：有实质结论、要对方继续看/确认/决策 → --mention-back（或 --mention 点名）；纯记录/低优先级进度/简短确认 → --no-mention；没信息量的"收到"不如不发。别把 --no-mention 当默认，也别无意义 @ 打扰',
+  'ai.identity.mention_gate': '- **@ 硬门**：每条 `botmux send` 必须显式三选一否则报错不发——`--mention`（点名指定人/bot）/ `--mention-back`（@回本轮触发者本人）/ `--no-mention`（不@）。先按内容价值决定要不要 @：有实质结论、要对方继续看/确认/决策 → 需要 @；纯记录/低优先级进度/简短确认 → --no-mention；没信息量的"收到"不如不发。再按收件人是谁选 @ 方式：就是要回触发这轮的那个人/bot → --mention-back；要 @ 的是别人（尤其多人/多 bot 会话里回复对象不一定是触发者）→ --mention 显式点名。别把 --no-mention 当默认，也别无意义 @ 打扰',
   'ai.identity.mention_when_to': '- 该 --mention 的场景：需要跟对方沟通或协作、用户明确要求让对方接力、把任务的某段交给对方、需要对方给最终结论或做独立操作',
   'ai.identity.mention_when_not': '- 不必 --mention 的场景：纯状态更新/确认/感谢——尽量合并到下一次有内容的消息里再带上，避免互相 ping 触发空转',
 
@@ -706,7 +706,7 @@ export const messages: Record<string, string> = {
   'ai.shell.helpers': '辅助命令：`botmux history`（读此会话历史；thread/话题会话拉话题内，普通群 chat-scope 会话拉整群）、`botmux quoted <message_id>`（按需读取被引用的消息，仅在 prompt 头部出现 `[用户引用了消息 ...]` 提示时使用）、`botmux bots list`（查群内其他机器人）。',
   'ai.shell.when_to_send': '发送时机：关键结论、方案（等用户确认再动手）、最终结果、进度更新。只 print/echo 不算回复。有内容要发给用户，就一定先 `botmux send` 发出去。只有当本轮没有任何内容要再发时——该发的已经 send 完，或本轮确实无需回复（例如整条消息是指派给别的机器人）——才让最终 assistant message 只输出 `BOTMUX_NOTHING_TO_SEND`（意为「没有要发的了」，不必解释沉默）。它不是省略回复的快捷方式：该回复却没 send 就用它收尾＝漏回复。',
   'ai.shell.no_visible_output_ok': '`botmux send` 成功（退出码 0）即代表已送达用户；本轮终端没有可见文本、直接结束是正常的。若看到「你上一条回复没有可见输出，请继续产出用户可见回复」之类提示，那是底层 CLI 的误判——不要重发，除非 `botmux send` 自己报错。',
-  'ai.shell.mention_gate': '@ 决策（硬性）：每条 `botmux send` 必须显式三选一否则报错——`--mention <open_id:名字>`（点名某人/bot，跟别的 bot 沟通/协作必须用它）/ `--mention-back`（@回触发你的那条消息的发送者）/ `--no-mention`（不@）。按内容价值选：有实质结论要对方看/确认/决策→--mention-back；纯记录/低优先级/简短确认→--no-mention；没信息量的"收到"不如不发。别把 --no-mention 当默认，也别无意义 @ 打扰。',
+  'ai.shell.mention_gate': '@ 决策（硬性）：每条 `botmux send` 必须显式三选一否则报错——`--mention <open_id:名字>`（点名指定人/bot，跟别的 bot 沟通/协作必须用它）/ `--mention-back`（@回本轮触发者本人）/ `--no-mention`（不@）。先按内容价值决定要不要 @：有实质结论要对方看/确认/决策→需要 @；纯记录/低优先级/简短确认→--no-mention；没信息量的"收到"不如不发。再按收件人选方式：就是回触发这轮的人/bot→--mention-back；要 @ 别人（多人会话回复对象不一定是触发者）→--mention 显式点名。别把 --no-mention 当默认，也别无意义 @ 打扰。',
 
   // ─── AI prompt blocks (session-manager) ──────────────────────────────────
   'ai.attach.hint': '使用 Read 工具查看，序号与正文中的 [图片 N] / [文件 N] 占位符对应',

@@ -30,7 +30,9 @@ function fnRegion(name: string, span = 6000): string {
 }
 
 describe('startInitialPassthroughSession ownership', () => {
-  const region = fnRegion('startInitialPassthroughSession');
+  // span widened past the default: the fn body grew (per-turn participant
+  // window build) and the registration-loser handoff sits ~6.1k chars in.
+  const region = fnRegion('startInitialPassthroughSession', 8000);
 
   it('never falls back from an explicit undefined owner to the sender', () => {
     expect(region).not.toContain('ownerOpenId ??');

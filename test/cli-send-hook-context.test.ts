@@ -55,10 +55,11 @@ describe('cmdSend hook context wiring', () => {
     expect(cliSource).toMatch(/replyMessage\(\s*appId,\s*sendTarget\.rootMessageId,\s*content,\s*msgType,\s*sendTarget\.mode === 'thread',\s*uuid,\s*hookContext,/);
   });
 
-  it('resolves mention-back from the explicit VC turn instead of the latest queued sender', () => {
+  it('resolves mention-back from the exact turn instead of the latest queued sender', () => {
     expect(cliSource).toContain(
       'const replyTargetSenderOpenId = explicitVcMeetingImOrigin?.replyTargetSenderOpenId',
     );
+    expect(cliSource).toContain('?? turnReplyTarget?.senderOpenId');
     expect(cliSource).toContain('hasQuoteTargetSender: !!replyTargetSenderOpenId');
     expect(cliSource).toMatch(/mentions\.push\(\{ open_id: replyTargetSenderOpenId, name: '' \}\)/);
   });
@@ -251,6 +252,19 @@ describe('cmdSend hook context wiring', () => {
     expect(docSend).toContain('Daemon settlement owns exact target retirement.');
     expect(docSend).not.toContain('saveSession(');
     expect(docSend).not.toMatch(/delete\s+exactDocSession\.docCommentTargets/);
+  });
+
+  it('gates --mention-back by turn-window participant ambiguity (no group-stats round-trip)', () => {
+    // 2+ distinct counterparts OR an incomplete window → block --mention-back and
+    // hand the model explicit --mention candidates. Reads the persisted
+    // participant window; no getGroupStats fetch. Explicit VC turns skip it.
+    expect(cliSource).toContain('collectTurnWindowParticipants(s, currentTurnId)');
+    expect(cliSource).toContain('mentionBackAmbiguity({ chatType: s.chatType, participants: window.participants, incomplete: window.incomplete })');
+    expect(cliSource).toMatch(/if \(mentionBack && !explicitVcMeetingImOrigin && !sendTopLevel\)/);
+    expect(cliSource).toContain('console.error(mentionBackAmbiguityError(ambiguity.candidates, ambiguity.incomplete))');
+    // The old asymmetric/group-stats gate is fully gone.
+    expect(cliSource).not.toContain('shouldBlockMentionBackByParticipants');
+    expect(cliSource).not.toMatch(/mentionBack[\s\S]{0,300}getGroupStats/);
   });
 
   it('freezes VC listener replay content and indexes only the successful primary output', () => {

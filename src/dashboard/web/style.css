@@ -10601,6 +10601,7 @@ button.contrast:hover { background: var(--danger-soft); border-color: var(--dang
   align-items: center;
   justify-content: center;
   padding: 20px;
+  overflow: auto;
   background: var(--modal-backdrop);
   backdrop-filter: blur(3px);
 }
@@ -10608,6 +10609,11 @@ button.contrast:hover { background: var(--danger-soft); border-color: var(--dang
   position: relative;
   display: grid;
   gap: 12px;
+  /* margin:auto 让 modal 在极矮视口高于视口时,靠 overlay 的 overflow:auto 也能
+     完整滚到顶部。纯 flex 居中(align-items:center)下,超高子元素会上下等量溢出,
+     顶部溢出无法滚回(flexbox 通用行为),标题/关闭按钮够不着;auto margin 在负
+     可用空间下归 0、子元素落到滚动起点,正常视口仍由 auto margin 居中。 */
+  margin: auto;
   width: min(360px, 92vw);
   padding: 18px;
   border-radius: var(--radius-lg);

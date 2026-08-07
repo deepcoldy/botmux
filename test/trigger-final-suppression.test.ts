@@ -91,6 +91,25 @@ describe('inheritTriggerReplyAnchor (P2: synthetic turn keeps the fold-back anch
     expect(resolveSessionReplyTarget(ds, 'trg_x')).toEqual({ mode: 'quote', rootMessageId: 'om_q' });
   });
 
+  it('routes eviction through the shared prune helper → raises the participant watermark', () => {
+    // The second replyTargets writer must update replyTargetsPrunedThrough on
+    // eviction, or a synthetic trigger folding in could silently prune a
+    // participant-bearing sibling without the --mention-back gate noticing.
+    const base = { rootMessageId: 'om_shared', turnId: 'om_h', updatedAt: '2026-01-01T00:00:00.000Z' } as any;
+    const replyTargets: Record<string, any> = {};
+    for (let i = 0; i < 40; i++) {
+      replyTargets[`t${i}`] = { rootMessageId: 'om_shared', updatedAt: new Date(Date.parse('2026-01-01T00:00:00.000Z') + i * 1000).toISOString() };
+    }
+    const ds = {
+      scope: 'chat', chatId: 'oc_chat', currentReplyTarget: base,
+      session: { rootMessageId: 'oc_chat', currentReplyTarget: base, replyTargets },
+    } as unknown as DaemonSession;
+    inheritTriggerReplyAnchor(ds, 'trg_new', new Date(Date.parse('2026-01-01T00:00:00.000Z') + 100_000).toISOString());
+    expect(Object.keys(ds.session.replyTargets!).length).toBe(32);
+    // Something got evicted → watermark is now set (not undefined).
+    expect(ds.session.replyTargetsPrunedThrough).toBeTruthy();
+  });
+
   it('no-op for a flat chat session with no fold-back anchor (behavior unchanged)', () => {
     const ds = { scope: 'chat', chatId: 'oc_chat', session: {} } as unknown as DaemonSession;
     inheritTriggerReplyAnchor(ds, 'trg_x', 'now');
