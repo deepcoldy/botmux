@@ -106,11 +106,11 @@ export function previewOverlayReducer(state: PreviewOverlayState, action: Previe
 // 'unknown' 兜底：没有 cliId 的会话在 filtered() 里按 'unknown' 归类。
 export const CLI_FILTER_OPTIONS = [...CLI_OPTIONS.map(o => o.id), 'unknown'];
 
-export type BoardColumnId = 'needs-you' | 'starting' | 'working' | 'idle';
+// 状态列收敛：「启动中」并入「进行中」（starting 归到 working 列），不再单列。
+export type BoardColumnId = 'needs-you' | 'working' | 'idle';
 
 export const BOARD_COLUMNS: Array<{ id: BoardColumnId; labelKey: string; hintKey: string }> = [
   { id: 'needs-you', labelKey: 'sessions.board.needsYou', hintKey: 'sessions.board.needsYouHint' },
-  { id: 'starting', labelKey: 'sessions.board.starting', hintKey: 'sessions.board.startingHint' },
   { id: 'working', labelKey: 'sessions.board.working', hintKey: 'sessions.board.workingHint' },
   { id: 'idle', labelKey: 'sessions.board.idle', hintKey: 'sessions.board.idleHint' },
 ];
@@ -411,9 +411,10 @@ export function historySenderKey(message: any): string {
 
 export function deriveSessionBoardColumn(s: any): BoardColumnId | null {
   if (s.status === 'closed') return null;
+  // needs-you 保留 master 新增的 stalled 触发；starting 并入「进行中」(P1 命名收敛)。
   if (s.pendingRepo || s.tuiPromptActive || s.agentAttention || s.status === 'limited' || s.status === 'stalled') return 'needs-you';
-  if (s.status === 'starting') return 'starting';
-  if (s.status === 'working' || s.status === 'analyzing' || s.status === 'active') return 'working';
+  // 「启动中」并入「进行中」：starting / working / analyzing / active 同列。
+  if (s.status === 'starting' || s.status === 'working' || s.status === 'analyzing' || s.status === 'active') return 'working';
   if (s.status === 'dormant') return 'idle';
   return 'idle';
 }

@@ -116,18 +116,26 @@ describe('sessions unknown chat preference', () => {
 });
 
 describe('sessions board column order', () => {
-  it('accepts any permutation of the four column ids', () => {
+  it('accepts any permutation of the three column ids', () => {
     expect(normalizeBoardOrder([...DEFAULT_BOARD_ORDER])).toEqual([...DEFAULT_BOARD_ORDER]);
-    expect(normalizeBoardOrder(['working', 'idle', 'needs-you', 'starting']))
-      .toEqual(['working', 'idle', 'needs-you', 'starting']);
+    expect(normalizeBoardOrder(['working', 'idle', 'needs-you']))
+      .toEqual(['working', 'idle', 'needs-you']);
+  });
+
+  it('migrates a legacy four-column order by dropping the merged "starting" column', () => {
+    // 旧版本存过 needs-you/starting/working/idle 四列；starting 已并入 working。
+    expect(normalizeBoardOrder(['needs-you', 'starting', 'working', 'idle']))
+      .toEqual(['needs-you', 'working', 'idle']);
+    expect(normalizeBoardOrder(['working', 'starting', 'idle', 'needs-you']))
+      .toEqual(['working', 'idle', 'needs-you']);
   });
 
   it('rejects missing, extra, duplicated, or unknown columns', () => {
-    expect(normalizeBoardOrder(['needs-you', 'starting', 'working'])).toBeNull();
+    expect(normalizeBoardOrder(['needs-you', 'working'])).toBeNull();
     expect(normalizeBoardOrder([...DEFAULT_BOARD_ORDER, 'closed'])).toBeNull();
-    expect(normalizeBoardOrder(['needs-you', 'needs-you', 'working', 'idle'])).toBeNull();
-    expect(normalizeBoardOrder(['a', 'b', 'c', 'd'])).toBeNull();
-    expect(normalizeBoardOrder('needs-you,starting,working,idle')).toBeNull();
+    expect(normalizeBoardOrder(['needs-you', 'needs-you', 'working'])).toBeNull();
+    expect(normalizeBoardOrder(['a', 'b', 'c'])).toBeNull();
+    expect(normalizeBoardOrder('needs-you,working,idle')).toBeNull();
     expect(normalizeBoardOrder(null)).toBeNull();
   });
 

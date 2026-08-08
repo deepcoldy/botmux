@@ -73,15 +73,19 @@ export function readStoredSessionsShowUnknownChats(storage: Storage | undefined)
 
 // ── 看板列顺序（用户可拖拽/按钮自定义，从左到右）─────────────────────────────
 export const SESSIONS_BOARD_ORDER_STORAGE_KEY = 'botmux.dashboard.sessions.boardOrder';
-export const DEFAULT_BOARD_ORDER = ['needs-you', 'starting', 'working', 'idle'] as const;
+export const DEFAULT_BOARD_ORDER = ['needs-you', 'working', 'idle'] as const;
 
-/** 必须是默认四列的一个排列（防旧版本残留/手改 localStorage 的脏值）。 */
+/** 必须是默认三列的一个排列（防旧版本残留/手改 localStorage 的脏值）。
+ *  旧版本存过含 'starting' 的四列排列：先剔除 'starting'（已并入 'working'）再校验，
+ *  避免老用户的自定义列顺序被整体丢弃回默认。 */
 export function normalizeBoardOrder(value: unknown): string[] | null {
-  if (!Array.isArray(value) || value.length !== DEFAULT_BOARD_ORDER.length) return null;
-  const seen = new Set(value);
-  if (seen.size !== value.length) return null;
+  if (!Array.isArray(value)) return null;
+  const migrated = value.filter(id => id !== 'starting');
+  if (migrated.length !== DEFAULT_BOARD_ORDER.length) return null;
+  const seen = new Set(migrated);
+  if (seen.size !== migrated.length) return null;
   for (const id of DEFAULT_BOARD_ORDER) if (!seen.has(id)) return null;
-  return value.slice();
+  return migrated.slice();
 }
 
 export function readStoredBoardOrder(storage: Storage | undefined): string[] {

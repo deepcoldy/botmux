@@ -693,3 +693,27 @@ describe('dashboard sessions kanban react view', () => {
     expect(html).toContain('data-action="write-link"');
   });
 });
+
+describe('deriveSessionBoardColumn', () => {
+  it('drops closed sessions off the board', () => {
+    expect(deriveSessionBoardColumn({ status: 'closed' })).toBeNull();
+  });
+
+  it('routes needs-you signals ahead of runtime state', () => {
+    expect(deriveSessionBoardColumn({ status: 'working', pendingRepo: true })).toBe('needs-you');
+    expect(deriveSessionBoardColumn({ status: 'idle', tuiPromptActive: true })).toBe('needs-you');
+    expect(deriveSessionBoardColumn({ status: 'idle', agentAttention: { kind: 'x', reason: 'y', at: 1 } })).toBe('needs-you');
+    expect(deriveSessionBoardColumn({ status: 'limited' })).toBe('needs-you');
+  });
+
+  it('folds "starting" into the "working" (进行中) column', () => {
+    for (const status of ['starting', 'working', 'analyzing', 'active']) {
+      expect(deriveSessionBoardColumn({ status })).toBe('working');
+    }
+  });
+
+  it('treats idle and dormant as idle', () => {
+    expect(deriveSessionBoardColumn({ status: 'idle' })).toBe('idle');
+    expect(deriveSessionBoardColumn({ status: 'dormant' })).toBe('idle');
+  });
+});
