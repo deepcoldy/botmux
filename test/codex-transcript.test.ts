@@ -409,8 +409,10 @@ describe('drainCodexRollout', () => {
   it('redacts quoted-JSON credential values while keeping non-secret fields', () => {
     // Provider errors are commonly JSON payloads whose message text embeds a
     // credential in quoted-JSON form: `"api_key":"..."`. The key name carries
-    // its own closing quote, so a `key[:=]` matcher without an optional quote
-    // around the key would miss it and leak the secret.
+    // its own closing quote, so a bare `key[:=]` matcher misses it. The redact
+    // rule pairs the key/value quotes with backrefs and spans `\"` escapes, so
+    // the WHOLE value is removed — including values that contain an escaped
+    // quote — while quoted keys with bare-word values are left untouched.
     writeFileSync(path, ev({
       timestamp: '2026-08-08T02:50:18.520Z',
       type: 'event_msg',
@@ -430,6 +432,89 @@ describe('drainCodexRollout', () => {
     expect(failed.terminalErrorSummary).toContain('[REDACTED]');
     // Non-secret text (the useful reason) survives — no over-redaction.
     expect(failed.terminalErrorSummary).toContain('gpt-5');
+  });
+
+  it('redacts the whole value when a quoted-JSON secret contains an escaped quote', () => {
+    // A value like `"abc\"TAIL"` must be redacted in full. A value matcher that
+    // stopped at the first inner quote would leave the `TAIL` tail exposed.
+    writeFileSync(path, ev({
+      timestamp: '2026-08-08T02:50:18.520Z',
+      type: 'event_msg',
+      payload: {
+        type: 'task_complete',
+        turn_id: 'escaped-quote',
+        error: { message: `gateway rejected: ${JSON.stringify({ password: 'abc"TAIL_SECRET_123' })}` },
+      },
+    }));
+    const failed = drainCodexRollout(path, 0).events[0];
+    expect(failed.terminalErrorSummary).toBeDefined();
+    expect(failed.terminalErrorSummary).not.toContain('TAIL_SECRET_123');
+    expect(failed.terminalErrorSummary).toContain('[REDACTED]');
+    expect(failed.terminalErrorSummary).toContain('gateway rejected');
+  });
+
+  it('does not swallow the word after a quoted key that has a bare-word value', () => {
+    // Regression guard: `"token": a lexical unit` is NOT `key=value` — the
+    // redaction must not treat `a` as the value and delete the trailing words.
+    writeFileSync(path, ev({
+      timestamp: '2026-08-08T02:50:18.520Z',
+      type: 'event_msg',
+      payload: {
+        type: 'task_complete',
+        turn_id: 'quoted-key-bare-value',
+        error: { message: 'provider said {"token": a lexical unit failed here}' },
+      },
+    }));
+    const failed = drainCodexRollout(path, 0).events[0];
+    expect(failed.terminalErrorSummary).toBeDefined();
+    // The lexical units are ordinary prose, not a credential — keep them.
+    expect(failed.terminalErrorSummary).toContain('a lexical unit failed here');
+  });
+
+  it('fails closed (no summary) when message wrapping exceeds the unwrap depth', () => {
+    // codexFailureLeaf peels at most 6 levels. A provider that wraps
+    // `message: JSON.stringify(...)` more deeply leaves `message` as a still
+    // -nested JSON literal whose escaped quotes defeat redaction. Rather than
+    // leak the embedded secret verbatim, surface no summary.
+    let inner: string = JSON.stringify({ api_key: 'DEEP_SECRET_VALUE' });
+    for (let i = 0; i < 9; i++) inner = JSON.stringify({ message: inner });
+    writeFileSync(path, ev({
+      timestamp: '2026-08-08T02:50:18.520Z',
+      type: 'event_msg',
+      payload: {
+        type: 'task_complete',
+        turn_id: 'deep-wrap',
+        error: JSON.parse(inner),
+      },
+    }));
+    const failed = drainCodexRollout(path, 0).events[0];
+    expect(failed.terminalStatus).toBe('failed');
+    // The secret never reaches the user-facing summary.
+    expect(failed.terminalErrorSummary ?? '').not.toContain('DEEP_SECRET_VALUE');
+    expect(failed.terminalErrorSummary).toBeUndefined();
+  });
+
+  it('bounds redaction work on adversarial long input (no super-linear blowup)', () => {
+    // A JWT-shaped `-`-rich run makes the credential regexes backtrack
+    // super-linearly. The pre-scan cap must keep a large blob fast. Guard with
+    // wall-clock: unbounded, ~32k chars took seconds; bounded it is a few ms.
+    const evil = `${'a-'.repeat(16_000)}aaaaaaaaaaaa.bbbbbbbbbbbb.short`;
+    writeFileSync(path, ev({
+      timestamp: '2026-08-08T02:50:18.520Z',
+      type: 'event_msg',
+      payload: {
+        type: 'task_complete',
+        turn_id: 'redos-guard',
+        error: { message: evil },
+      },
+    }));
+    const t0 = Date.now();
+    const failed = drainCodexRollout(path, 0).events[0];
+    const elapsedMs = Date.now() - t0;
+    expect(failed.terminalStatus).toBe('failed');
+    expect((failed.terminalErrorSummary ?? '').length).toBeLessThanOrEqual(320);
+    // Generous ceiling: bounded is single-digit ms; unbounded blew past 500ms.
+    expect(elapsedMs).toBeLessThan(200);
   });
 
   it('classifies structured 429 failures for the dedicated limited state', () => {

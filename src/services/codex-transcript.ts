@@ -230,6 +230,10 @@ export const CODEX_CONNECTION_ERROR_CODE = 'codex_connection_failed';
 export const CODEX_TASK_FAILED_ERROR_CODE = 'codex_task_failed';
 
 const CODEX_FAILURE_SUMMARY_MAX_CHARS = 320;
+/** Pre-scan bound applied BEFORE the redaction regexes run. Well above the
+ *  displayed max so it never truncates a shown reason, but small enough to keep
+ *  the (super-linear-on-adversarial-input) patterns cheap. */
+const CODEX_FAILURE_SUMMARY_PRESCAN_MAX_CHARS = 2_000;
 
 function parseEmbeddedJson(value: unknown): unknown {
   if (typeof value !== 'string') return undefined;
@@ -283,6 +287,30 @@ function safeFailureSummary(error: unknown): string | undefined {
   if (message) summary = summary ? `${summary}: ${message}` : message;
   if (!summary) return undefined;
 
+  // Fail closed on unpeeled deep nesting. codexFailureLeaf bounds unwrapping to
+  // 6 levels; a provider that wraps `message: JSON.stringify(...)` more deeply
+  // leaves `message` as a still-nested JSON literal. Its escaped quotes (`\"`)
+  // defeat the quote-paired redaction below and would leak the embedded secret
+  // verbatim. When the reason we are about to show is itself a bare JSON
+  // object/array literal, treat it as unsafe and surface no summary — the raw
+  // error still lives in the rollout / web terminal / daemon logs.
+  const messageTrimmed = message.trim();
+  if (messageTrimmed.length >= 2
+    && (messageTrimmed.startsWith('{') || messageTrimmed.startsWith('['))) {
+    return undefined;
+  }
+
+  // Bound the input before running the redaction regexes. Only the first
+  // CODEX_FAILURE_SUMMARY_MAX_CHARS survive to the user anyway, so trimming a
+  // long tail loses no displayed content — but it caps the worst-case work of
+  // the patterns below. The JWT-shaped pattern in particular backtracks
+  // super-linearly on long `-`-rich runs (its char class includes `-` and `\b`
+  // restarts after each one); an unbounded provider blob could otherwise spend
+  // hundreds of ms in a single replace. Cutting to a few KB keeps that flat.
+  if (summary.length > CODEX_FAILURE_SUMMARY_PRESCAN_MAX_CHARS) {
+    summary = summary.slice(0, CODEX_FAILURE_SUMMARY_PRESCAN_MAX_CHARS);
+  }
+
   // Provider errors are untrusted. Keep the useful reason while removing
   // common credentials, signed URLs, mention/HTML syntax and control chars.
   summary = summary
@@ -290,7 +318,17 @@ function safeFailureSummary(error: unknown): string | undefined {
     .replace(/\bBearer\s+[A-Za-z0-9._~+\/-]+=*/gi, 'Bearer [REDACTED]')
     .replace(/\b(?:sk|rk|pk)-[A-Za-z0-9_-]{12,}\b/g, '[REDACTED]')
     .replace(/\b([A-Za-z0-9_-]{12,}\.[A-Za-z0-9_-]{12,}\.[A-Za-z0-9_-]{12,})\b/g, '[REDACTED]')
-    .replace(/(["']?(?:api[_-]?key|access[_-]?token|token|auth(?:orization)?|secret|password|signature|credential|cookie)["']?\s*[:=]\s*)(?:"[^"]*"|'[^']*'|[^\s,;}]+)/gi, '$1[REDACTED]')
+    // Quoted-JSON credential: `"api_key":"..."`. Key quote and value quote are
+    // each matched by a backref (\2 / \3) so single/double quotes both work,
+    // and the value pattern spans backslash escapes (`\"` / `\'`) so it covers
+    // the WHOLE string rather than stopping at the first inner quote. BOTH key
+    // and value must be quoted here — a quoted key with a bare-word value does
+    // NOT match, so no trailing word is swallowed.
+    .replace(/((["'])(?:api[_-]?key|access[_-]?token|token|auth(?:orization)?|secret|password|signature|credential|cookie)\2\s*:\s*)(["'])(?:\\.|(?!\3).)*\3/gi, '$1[REDACTED]')
+    // Bare `key = value` (value may be a quoted string or a bare word). Kept
+    // as the original narrow form: the key here is unquoted, so this never
+    // fires on the quoted-JSON shape handled above.
+    .replace(/((?:api[_-]?key|access[_-]?token|token|auth(?:orization)?|secret|password|signature|credential|cookie)\s*[:=]\s*)(?:"[^"]*"|'[^']*'|[^\s,;}]+)/gi, '$1[REDACTED]')
     .replace(/[\u0000-\u001f\u007f]+/g, ' ')
     .replace(/\s+/g, ' ')
     .trim()
