@@ -17923,7 +17923,7 @@ form.dashboard-toolbar > input[type="text"]:focus {
 
 .connector-topic-message-options {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 8px;
 }
 
@@ -17963,6 +17963,13 @@ form.dashboard-toolbar > input[type="text"]:focus {
   font-weight: 600;
 }
 .connector-topic-message-input > small span { color: var(--faint); font-variant-numeric: tabular-nums; }
+.connector-topic-message-extractors {
+  min-height: 148px;
+  resize: vertical;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  line-height: 1.5;
+}
 
 .connector-topic-message-preview {
   margin: 0;
