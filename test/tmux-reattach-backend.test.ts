@@ -319,6 +319,16 @@ describe('selectSessionBackend', () => {
     expect((selected.backend as any).opts).toEqual({ ownsSession: true, isReattach: false });
   });
 
+  it('marks an existing zellij session as reattach without making it pipe mode', () => {
+    vi.mocked(ZellijBackend.hasSession).mockReturnValue(true);
+
+    const selected = selectSessionBackend({ sessionId: '9cfa0024-197d-4781-845b-c541dceb8980', backendType: 'zellij' });
+
+    expect(selected.isZellijMode).toBe(true);
+    expect(selected.isPipeMode).toBe(false);
+    expect((selected.backend as any).opts).toEqual({ ownsSession: true, isReattach: true });
+  });
+
   it('uses zmx tail signals, history snapshots, and send as a managed pipe backend', () => {
     vi.mocked(ZmxBackend.hasSession).mockReturnValue(true);
 

@@ -412,7 +412,7 @@ describe('buildFollowUpContent', () => {
     // every follow-up reminder intentionally tiny. By default (experimental
     // anti-resend toggle OFF) it is exactly #554's nothing-to-send sentinel
     // baseline — no anti-resend clause appended.
-    expect(content).toContain('<botmux_reminder>有内容要发给用户就必须先 botmux send；只有本轮没有任何要发的了（已 send 完，或确实无需回复）才让 final 只输出 BOTMUX_NOTHING_TO_SEND，它不是省略回复的快捷方式</botmux_reminder>');
+    expect(content).toContain('<botmux_reminder>有内容给用户必须先 botmux send;仅当本轮确实无需回复（消息不是发给你的 / 指派给别的机器人）才让 final 只输出 BOTMUX_NOTHING_TO_SEND 这一个词</botmux_reminder>');
     expect(content).not.toContain('别因「无输出」提示重发');
     expect(content).not.toContain('JSON.stringify');
     expect(content).not.toContain('botmux skill show botmux-send');
@@ -439,7 +439,7 @@ describe('buildFollowUpContent', () => {
     // exactly #554's nothing-to-send sentinel baseline — same as codex/traex.
     const content = buildFollowUpContent('hello', SESSION_ID, { cliId: 'hermes' });
 
-    expect(content).toContain('<botmux_reminder>有内容要发给用户就必须先 botmux send；只有本轮没有任何要发的了（已 send 完，或确实无需回复）才让 final 只输出 BOTMUX_NOTHING_TO_SEND，它不是省略回复的快捷方式</botmux_reminder>');
+    expect(content).toContain('<botmux_reminder>有内容给用户必须先 botmux send;仅当本轮确实无需回复（消息不是发给你的 / 指派给别的机器人）才让 final 只输出 BOTMUX_NOTHING_TO_SEND 这一个词</botmux_reminder>');
     expect(content).not.toContain('普通文字回复不要调用 `botmux send`');
     expect(content).not.toContain('直接把给用户看的答案写在 final');
   });

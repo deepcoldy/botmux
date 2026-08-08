@@ -2287,6 +2287,7 @@ button.primary {
 .status-analyzing { background: var(--warning-soft); color: var(--warning); }
 .status-starting { background: var(--success-soft); color: var(--success); }
 .status-limited { background: var(--danger-soft); color: var(--danger); }
+.status-stalled { background: var(--danger-soft); color: var(--danger); }
 
 /* ── Sessions board — "control-room signal wall" ─────────────────────────────
    Each column is a signal channel: a LED dot + uppercase channel label in the
@@ -4361,6 +4362,18 @@ td code,
 
 #g-drawer.groups-create-modal .g-profile-menu .sect-sort-pop button {
   justify-content: flex-start;
+}
+
+#g-drawer.groups-create-modal .g-feed-group-new {
+  display: grid;
+  gap: 6px;
+  margin-top: 10px;
+}
+
+#g-drawer.groups-create-modal .g-feed-group-new > span {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
 }
 
 #g-drawer.groups-create-modal .g-create-status:empty {
@@ -9201,6 +9214,7 @@ button.contrast:hover { background: var(--danger-soft); border-color: var(--dang
   color: var(--warning);
 }
 .status-limited { background: var(--danger-soft); color: var(--danger); }
+.status-stalled { background: var(--danger-soft); color: var(--danger); }
 
 /* ── 玻璃面板（dark 下生效；light 保持实底）─────────────────────────────── */
 :root[data-theme="dark"] .panel,
@@ -23206,6 +23220,20 @@ dialog select[multiple]:hover:not(:disabled) {
 }
 .bot-defaults-page .toggle-row .switch {
   margin-top: 0;
+  transition: background 140ms ease, transform 100ms ease;
+}
+.bot-defaults-page .toggle-row:active:not(:has(input:disabled)) .switch {
+  transform: scale(0.96);
+}
+.bot-defaults-page .toggle-row input:focus-visible + .switch {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
+}
+.bot-defaults-page .toggle-row:has(input:disabled) {
+  cursor: not-allowed;
+}
+.bot-defaults-page .toggle-row input:disabled ~ .toggle-tx {
+  color: var(--faint);
 }
 
 .bot-defaults-page .bd-tile :where(input[type="text"], input[type="number"], textarea) {
@@ -23286,6 +23314,117 @@ dialog select[multiple]:hover:not(:disabled) {
   min-width: 0;
   height: 100%;
   margin: 0;
+}
+
+.bot-defaults-page .bd-grant-defaults {
+  margin-top: 16px;
+}
+
+.bot-defaults-page .bd-grant-defaults > .actions {
+  justify-content: flex-end;
+}
+
+.bot-defaults-page .bd-field-error {
+  display: block;
+  margin-top: 6px;
+  color: var(--danger);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.bot-defaults-page .bd-grant-defaults input[aria-invalid="true"] {
+  border-color: var(--danger);
+}
+
+.bot-defaults-page .bd-card-settings {
+  display: grid;
+  gap: 16px;
+  margin-top: 12px;
+}
+
+.bot-defaults-page .bd-card-setting-group {
+  min-width: 0;
+}
+
+.bot-defaults-page .bd-card-setting-group + .bd-card-setting-group {
+  padding-top: 16px;
+  border-top: 1px solid color-mix(in srgb, var(--border-soft) 82%, transparent);
+}
+
+.bot-defaults-page .bd-card-setting-heading {
+  margin: 0 0 8px;
+  color: var(--fg);
+  font-size: 12px;
+  font-weight: 700;
+  line-height: 1.35;
+}
+
+.bot-defaults-page .bd-card-setting-copy {
+  margin: -2px 0 8px;
+  color: var(--muted);
+  font-size: 11.5px;
+  line-height: 1.5;
+}
+
+.bot-defaults-page .bd-card-settings .toggle-row {
+  min-width: 0;
+  margin: 0;
+}
+
+.bot-defaults-page .bd-card-settings .toggle-tx small {
+  display: block;
+  overflow: visible;
+  margin-top: 3px;
+  color: var(--muted);
+  font-size: 11.5px;
+  line-height: 1.45;
+  -webkit-box-orient: initial;
+  -webkit-line-clamp: unset;
+}
+
+.bot-defaults-page .bd-card-primary-toggle {
+  padding: 4px 0;
+}
+
+.bot-defaults-page .bd-card-dependent {
+  display: grid;
+  gap: 7px;
+  margin: 8px 0 0 48px;
+  padding: 10px 12px;
+  border-left: 2px solid color-mix(in srgb, var(--accent) 58%, var(--border-soft));
+  border-radius: 0 var(--radius-md) var(--radius-md) 0;
+  background: color-mix(in srgb, var(--accent) 5%, transparent);
+}
+
+.bot-defaults-page .bd-card-dependent[hidden] {
+  display: none;
+}
+
+.bot-defaults-page .bd-card-dependent .toggle-row {
+  padding: 0;
+}
+
+.bot-defaults-page .bd-card-mode-note {
+  margin: 0 0 0 48px;
+  color: var(--muted);
+  font-size: 11.5px;
+  line-height: 1.5;
+}
+
+.bot-defaults-page .bd-card-setting-group > .bd-row {
+  margin-top: 0;
+}
+
+.bot-defaults-page .bd-card-control-list {
+  display: grid;
+  gap: 10px;
+  margin-top: 10px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .bot-defaults-page .toggle-row .switch {
+    transition: none;
+  }
 }
 
 .bot-defaults-page .bd-substitute-target-list {
@@ -23388,6 +23527,10 @@ dialog select[multiple]:hover:not(:disabled) {
 @media (max-width: 720px) {
   .bot-defaults-page .bd-toggle-grid {
     grid-template-columns: 1fr;
+  }
+
+  .bot-defaults-page .bd-card-dependent {
+    margin-left: 0;
   }
 
   .bot-defaults-page .bd-runtime-fields {
@@ -25825,4 +25968,59 @@ button.ui-refresh-button.is-loading .ui-action-icon {
 .schedule-delete-button {
   color: var(--danger, #e5484d) !important;
   border-color: color-mix(in srgb, var(--danger, #e5484d) 48%, var(--border-soft)) !important;
+}
+.feed-group-auth-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 10000;
+  display: grid;
+  place-items: center;
+  padding: 20px;
+  background: rgb(15 23 42 / 62%);
+}
+
+.feed-group-auth-card {
+  width: min(520px, 100%);
+  padding: 24px;
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  background: var(--panel, #fff);
+  color: #111827;
+  box-shadow: 0 24px 70px rgb(0 0 0 / 28%);
+}
+
+.feed-group-auth-card h3 { margin-top: 0; }
+.feed-group-auth-card p,
+.feed-group-auth-card label,
+.feed-group-auth-card label span { color: #111827; }
+.feed-group-auth-card label { display: grid; gap: 8px; margin-top: 18px; }
+.feed-group-auth-card input { width: 100%; box-sizing: border-box; color: #111827; background: #fff; }
+.feed-group-auth-card input::placeholder { color: #4b5563; opacity: 1; }
+.feed-group-auth-card .actions { margin-top: 20px; justify-content: flex-end; }
+.feed-group-auth-open {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 42px;
+  margin-top: 4px;
+  padding: 0 20px;
+  border: 1px solid #2563eb;
+  border-radius: 8px;
+  color: #fff;
+  background: #2563eb;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.feed-group-auth-open:hover { background: #1d4ed8; }
+
+.cs-advanced-fields .cs-feed-group {
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
+.cs-advanced-fields .cs-feed-group > legend {
+  padding: 0;
 }

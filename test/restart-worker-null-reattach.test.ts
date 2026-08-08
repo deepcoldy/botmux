@@ -254,7 +254,11 @@ describe('P2 worker onTaskDone generation fence', () => {
       ['onTaskDone', taskDone],
       ['onExit', onExit],
     ] as const) {
-      expect(region.slice(start, start + 700), name)
+      // 900-char window (matches the sibling onTaskDone test above): the merged
+      // onTaskDone body keeps BOTH the fatalWorkerErrorPending guard and the
+      // 8-line generation-fence rationale comment, so the fence sits ~684 chars
+      // in — just past the old 700 window.
+      expect(region.slice(start, start + 900), name)
         .toContain('backend !== observedBackend');
     }
   });

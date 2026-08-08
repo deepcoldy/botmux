@@ -125,6 +125,7 @@ export const SESSION_STATUS_OPTIONS = [
   'idle',
   'dormant',
   'analyzing',
+  'stalled',
   'active',
   'limited',
   'closed',
@@ -410,7 +411,7 @@ export function historySenderKey(message: any): string {
 
 export function deriveSessionBoardColumn(s: any): BoardColumnId | null {
   if (s.status === 'closed') return null;
-  if (s.pendingRepo || s.tuiPromptActive || s.agentAttention || s.status === 'limited') return 'needs-you';
+  if (s.pendingRepo || s.tuiPromptActive || s.agentAttention || s.status === 'limited' || s.status === 'stalled') return 'needs-you';
   if (s.status === 'starting') return 'starting';
   if (s.status === 'working' || s.status === 'analyzing' || s.status === 'active') return 'working';
   if (s.status === 'dormant') return 'idle';
@@ -432,7 +433,7 @@ export function restartConfirmMessage(s: any): string {
 }
 
 export function canRestartSession(s: any): boolean {
-  return s.status !== 'closed' && !s.adopt && !s.pendingRepo;
+  return s.status !== 'closed' && !s.adopt && !s.pendingRepo && s.cliId !== 'riff';
 }
 
 export interface PickerBot { larkAppId: string; botName: string; }

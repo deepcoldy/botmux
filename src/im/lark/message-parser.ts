@@ -1205,8 +1205,9 @@ const BOTMUX_INTERNAL_CARD_ACTIONS: ReadonlySet<string> = new Set([
   'repo_manual_submit', 'repo_worktree_submit', 'skip_repo',
   'worktree_toggle_mode',
   // config / grant / relay cards
-  'config_toggle', 'config_set', 'config_quota', 'config_text_open',
-  'config_text_save', 'grant_chat', 'grant_global', 'grant_deny',
+  'config_toggle', 'config_set', 'config_quota', 'config_quota_open',
+  'config_quota_save', 'config_text_open', 'config_text_save',
+  'grant_chat', 'grant_global', 'grant_deny',
   'relay_search', 'relay_page', 'relay_select', 'relay_confirm',
   // host-overload alert + codex notifier cards
   'overload_noop', 'overload_clean_stopped', 'overload_suspend_idle',

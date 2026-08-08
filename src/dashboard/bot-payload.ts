@@ -2,6 +2,7 @@ import { defaultSummaryRangePrefs, summaryRangeFromLegacyContentTriggers } from 
 import { selectionKeyForBot } from '../setup/cli-selection.js';
 import { normalizeUsageDisplay } from '../bot-registry.js';
 import type { CliRuntimeConfig } from '../adapters/cli/runtime.js';
+import { GRANT_DURATION_OPTIONS } from '../services/grant-policy.js';
 
 export interface DashboardBotDescriptor {
   larkAppId: string;
@@ -113,6 +114,10 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     substituteMode: j?.substituteMode && typeof j.substituteMode === 'object' ? j.substituteMode : null,
     restrictGrantCommands: j?.restrictGrantCommands === true,
     autoGrantRequestCards: j?.autoGrantRequestCards !== false,
+    grantDefaultDurationMs: typeof j?.grantDefaultDurationMs === 'number'
+      && GRANT_DURATION_OPTIONS.includes(j.grantDefaultDurationMs as (typeof GRANT_DURATION_OPTIONS)[number])
+      ? j.grantDefaultDurationMs
+      : null,
     messageQuotaDefaultLimit: typeof j?.messageQuotaDefaultLimit === 'number' ? j.messageQuotaDefaultLimit : null,
     p2pMode: j?.p2pMode === 'thread' ? 'thread' : 'chat',
     skillInjection: (j?.skillInjection === 'global' || j?.skillInjection === 'prompt' || j?.skillInjection === 'off') ? j.skillInjection : null,

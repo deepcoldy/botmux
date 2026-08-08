@@ -8,7 +8,7 @@
  * OAuth login via /login command writes to botmux's own token file.
  * Auto-refreshes expired access_token using refresh_token.
  */
-import { readFileSync, mkdirSync, existsSync } from 'node:fs';
+import { readFileSync, mkdirSync, existsSync, unlinkSync, readdirSync } from 'node:fs';
 import { atomicWriteFileSync } from './atomic-write.js';
 import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
@@ -19,6 +19,7 @@ import { type Brand, larkHosts } from '../im/lark/lark-hosts.js';
 // ─── Token paths ──────────────────────────────────────────────────────────────
 
 const TOKEN_DIR = join(homedir(), '.botmux', 'data');
+const PENDING_DIR = join(TOKEN_DIR, 'oauth-pending');
 /** 旧版单文件（升级前都是单 feishu bot）。仅作向后兼容读取，不再写入。 */
 const LEGACY_TOKEN_PATH = join(TOKEN_DIR, 'user-token.json');
 const BUFFER_MS = 60_000; // 60s safety margin before expiry
@@ -72,6 +73,48 @@ interface PendingLogin {
 }
 
 const pendingLogins = new Map<string, PendingLogin>(); // keyed by state
+
+function pendingPath(state: string): string | null {
+  return /^[a-f0-9]{64}$/.test(state) ? join(PENDING_DIR, `${state}.json`) : null;
+}
+
+/** Persist pending OAuth state so Dashboard and daemon processes can finish
+ * each other's authorization flow. Files contain app credentials and are
+ * therefore always mode 0600 and removed immediately after consumption. */
+function savePendingLogin(pending: PendingLogin): void {
+  const path = pendingPath(pending.state);
+  if (!path) return;
+  mkdirSync(PENDING_DIR, { recursive: true, mode: 0o700 });
+  atomicWriteFileSync(path, JSON.stringify(pending), { mode: 0o600 });
+}
+
+function loadPendingLogin(state: string): PendingLogin | null {
+  const path = pendingPath(state);
+  if (!path) return null;
+  try {
+    const pending = JSON.parse(readFileSync(path, 'utf8')) as PendingLogin;
+    if (pending.state !== state || Date.now() - pending.createdAt > 5 * 60_000) return null;
+    return pending;
+  } catch {
+    return null;
+  }
+}
+
+function removePendingLogin(state: string): void {
+  const path = pendingPath(state);
+  if (!path) return;
+  try { unlinkSync(path); } catch { /* already absent */ }
+}
+
+function cleanupPendingLogins(): void {
+  try {
+    for (const name of readdirSync(PENDING_DIR)) {
+      const state = name.endsWith('.json') ? name.slice(0, -5) : '';
+      const pending = loadPendingLogin(state);
+      if (!pending) removePendingLogin(state);
+    }
+  } catch { /* directory absent */ }
+}
 
 // ─── Token I/O ────────────────────────────────────────────────────────────────
 
@@ -252,11 +295,13 @@ export function generateAuthUrl(appId: string, appSecret: string, brand: Brand =
     brand,
     createdAt: Date.now(),
   });
+  savePendingLogin(pendingLogins.get(state)!);
 
   // Clean up stale pending logins
   for (const [s, p] of pendingLogins) {
     if (Date.now() - p.createdAt > 5 * 60_000) pendingLogins.delete(s);
   }
+  cleanupPendingLogins();
 
   return { authUrl, state };
 }
@@ -274,12 +319,13 @@ export async function handleCallbackUrl(url: string): Promise<string | null> {
   const code = decodeURIComponent(match[1]);
   const state = decodeURIComponent(stateMatch[1]);
 
-  const pending = pendingLogins.get(state);
+  const pending = pendingLogins.get(state) ?? loadPendingLogin(state);
   if (!pending) {
     return '❌ 授权失败：state 不匹配或已过期，请重新执行 /login';
   }
 
   pendingLogins.delete(state);
+  removePendingLogin(state);
 
   // Exchange code for token
   try {
