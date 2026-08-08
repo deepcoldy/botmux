@@ -76,6 +76,7 @@ import {
 import { ReadyGate, shouldArmReadyGate } from './utils/ready-gate.js';
 import { shouldRunStartupCommandsOnSpawn, shouldDeferInitialPromptForStartup } from './core/startup-commands.js';
 import { sanitizePerBotEnv } from './core/per-bot-env.js';
+import { resolveBotmuxConfigDir } from './core/config-dir.js';
 import {
   evaluateVcMeetingManagedSend,
 } from './services/vc-meeting-send-policy.js';
@@ -8817,6 +8818,13 @@ async function spawnCli(
   if (cfg.chatType) childEnv.BOTMUX_CHAT_TYPE = cfg.chatType;
   else delete childEnv.BOTMUX_CHAT_TYPE;
   childEnv.BOTMUX_LARK_APP_ID = cfg.larkAppId;
+  // Pin the config root so the child's `botmux send` reads the SAME registry
+  // this daemon loaded. Required when the daemon runs under a non-default HOME
+  // (`HOME=~/alt botmux start`): the child inherits BOTMUX_* but not HOME, so it
+  // would otherwise resolve the default ~/.botmux and fail "Bot not registered".
+  // Always set (not just in the divergent case) so the child never re-derives a
+  // root from its own HOME — one source of truth, same as SESSION_DATA_DIR.
+  childEnv.BOTMUX_CONFIG_DIR = resolveBotmuxConfigDir(process.env);
   // Explicit, HOST-DECIDED read-isolation marker. The CLI needs to tell
   // "bots.json is denied because I'm sandboxed (expected)" from "bots.json is
   // unreadable (real fault)" — see underReadIsolation() in read-isolation.ts.
