@@ -2579,7 +2579,7 @@ button.primary {
   animation: board-led-pulse 1.6s ease-in-out infinite;
 }
 
-.session-board-starting {
+.session-board-todo {
   --col-signal: var(--warning);
 }
 
@@ -10096,7 +10096,7 @@ button.contrast:hover { background: var(--danger-soft); border-color: var(--dang
 .session-board-count { border-radius: var(--radius-full); font-family: inherit; }
 .session-board-needs-you { --col-signal: var(--warning); }
 .session-board-needs-you { background: color-mix(in srgb, var(--warning) 4%, var(--surface)); }
-.session-board-starting { --col-signal: var(--info); }
+.session-board-todo { --col-signal: var(--info); }
 .session-board-working { --col-signal: var(--accent); }
 .session-board-idle { --col-signal: var(--success); }
 :root[data-theme="dark"] .session-board-needs-you {

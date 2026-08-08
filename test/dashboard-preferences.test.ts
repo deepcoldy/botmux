@@ -116,26 +116,33 @@ describe('sessions unknown chat preference', () => {
 });
 
 describe('sessions board column order', () => {
-  it('accepts any permutation of the three column ids', () => {
+  it('accepts any permutation of the four column ids', () => {
     expect(normalizeBoardOrder([...DEFAULT_BOARD_ORDER])).toEqual([...DEFAULT_BOARD_ORDER]);
-    expect(normalizeBoardOrder(['working', 'idle', 'needs-you']))
-      .toEqual(['working', 'idle', 'needs-you']);
+    expect(normalizeBoardOrder(['working', 'todo', 'idle', 'needs-you']))
+      .toEqual(['working', 'todo', 'idle', 'needs-you']);
   });
 
-  it('migrates a legacy four-column order by dropping the merged "starting" column', () => {
-    // 旧版本存过 needs-you/starting/working/idle 四列；starting 已并入 working。
+  it('migrates a legacy order: drops merged "starting", appends the new "todo" column', () => {
+    // 旧版本存过 needs-you/starting/working/idle 四列；starting 已并入 working，
+    // 新列 todo 补到末尾 → 得到当前四列（needs-you/working/idle/todo）。
     expect(normalizeBoardOrder(['needs-you', 'starting', 'working', 'idle']))
-      .toEqual(['needs-you', 'working', 'idle']);
-    expect(normalizeBoardOrder(['working', 'starting', 'idle', 'needs-you']))
-      .toEqual(['working', 'idle', 'needs-you']);
+      .toEqual(['needs-you', 'working', 'idle', 'todo']);
+    // 旧的三列存值（没 starting 也没 todo）同样补齐 todo。
+    expect(normalizeBoardOrder(['working', 'idle', 'needs-you']))
+      .toEqual(['working', 'idle', 'needs-you', 'todo']);
   });
 
-  it('rejects missing, extra, duplicated, or unknown columns', () => {
-    expect(normalizeBoardOrder(['needs-you', 'working'])).toBeNull();
+  it('fills a partial order up to the full four columns', () => {
+    // 缺列不再判死：迁移会把缺失的默认列补到末尾（兼容旧的少列存值）。
+    expect(normalizeBoardOrder(['needs-you', 'working']))
+      .toEqual(['needs-you', 'working', 'todo', 'idle']);
+  });
+
+  it('rejects extra, duplicated, or unknown columns', () => {
     expect(normalizeBoardOrder([...DEFAULT_BOARD_ORDER, 'closed'])).toBeNull();
-    expect(normalizeBoardOrder(['needs-you', 'needs-you', 'working'])).toBeNull();
-    expect(normalizeBoardOrder(['a', 'b', 'c'])).toBeNull();
-    expect(normalizeBoardOrder('needs-you,working,idle')).toBeNull();
+    expect(normalizeBoardOrder(['needs-you', 'needs-you', 'working', 'idle'])).toBeNull();
+    expect(normalizeBoardOrder(['a', 'b', 'c', 'd'])).toBeNull();
+    expect(normalizeBoardOrder('needs-you,working,todo,idle')).toBeNull();
     expect(normalizeBoardOrder(null)).toBeNull();
   });
 

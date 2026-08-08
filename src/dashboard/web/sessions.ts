@@ -106,12 +106,14 @@ export function previewOverlayReducer(state: PreviewOverlayState, action: Previe
 // 'unknown' 兜底：没有 cliId 的会话在 filtered() 里按 'unknown' 归类。
 export const CLI_FILTER_OPTIONS = [...CLI_OPTIONS.map(o => o.id), 'unknown'];
 
-// 状态列收敛：「启动中」并入「进行中」（starting 归到 working 列），不再单列。
-export type BoardColumnId = 'needs-you' | 'working' | 'idle';
+// 状态列收敛：「启动中」并入「进行中」（starting 归到 working 列）；「待办」重定义为
+// 任务态（有未完成 TODO），不再拿 idle 冒充——idle 且无未完成 todo 才是真「空闲」。
+export type BoardColumnId = 'needs-you' | 'working' | 'todo' | 'idle';
 
 export const BOARD_COLUMNS: Array<{ id: BoardColumnId; labelKey: string; hintKey: string }> = [
   { id: 'needs-you', labelKey: 'sessions.board.needsYou', hintKey: 'sessions.board.needsYouHint' },
   { id: 'working', labelKey: 'sessions.board.working', hintKey: 'sessions.board.workingHint' },
+  { id: 'todo', labelKey: 'sessions.board.todo', hintKey: 'sessions.board.todoHint' },
   { id: 'idle', labelKey: 'sessions.board.idle', hintKey: 'sessions.board.idleHint' },
 ];
 
@@ -415,8 +417,16 @@ export function deriveSessionBoardColumn(s: any): BoardColumnId | null {
   if (s.pendingRepo || s.tuiPromptActive || s.agentAttention || s.status === 'limited' || s.status === 'stalled') return 'needs-you';
   // 「启动中」并入「进行中」：starting / working / analyzing / active 同列。
   if (s.status === 'starting' || s.status === 'working' || s.status === 'analyzing' || s.status === 'active') return 'working';
-  if (s.status === 'dormant') return 'idle';
+  // 任务态优先于「空闲」：机器停了但还有未完成 TODO → 待办（真），正是要抓的
+  // 「活没干完」。读不到 todo（其它 CLI / 无 transcript）时退回空闲，不硬判。
+  if (hasOpenTodos(s)) return 'todo';
   return 'idle';
+}
+
+/** 会话是否有未完成 TODO（任务态）。openTodos 缺失 = 未知/不支持 → 视为无。 */
+export function hasOpenTodos(s: any): boolean {
+  const t = s?.openTodos;
+  return !!t && typeof t.remaining === 'number' && t.remaining > 0;
 }
 
 export function restartConfirmMessage(s: any): string {
