@@ -35,7 +35,6 @@ import {
   findAncestorSessionContext as findLiveAncestorSessionContext,
   resolveSessionContext,
 } from './core/session-marker.js';
-import { readSupervisorProcessStartIdentity } from './core/process-start-identity.js';
 import { resolveBotmuxDataDir } from './core/data-dir.js';
 import { dashboardSecretPath } from './core/dashboard-secret.js';
 import { acceptedDispatchBotAppIds, activeConversationBotOpenIds, appendDispatchReportProtocol, appendLegacyDispatchReportProtocol, parseDispatchBotSpec, buildDispatchMessages, buildRepoPrimeText, buildReportContent, eligibleAutoMentionAliases, findDispatchRegistryEntry, foldableChatSessionAppIds, offTopicSubBotTopic, resolveReportPlacement, resolveReportRecipient, resolveReportTarget, resolveSendTarget, threadRootForReachability } from './core/dispatch.js';
