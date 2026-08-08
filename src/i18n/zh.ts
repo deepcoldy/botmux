@@ -65,6 +65,11 @@ export const messages: Record<string, string> = {
   // ─── Repo select card ────────────────────────────────────────────────────
   'card.repo.title': '📁 项目仓库管理',
   'card.repo.placeholder_switch': '选择仓库并切换',
+  'card.repo.search_placeholder': '搜索项目名、分支或路径',
+  'card.repo.search_button': '搜索',
+  'card.repo.search_no_match': '未找到匹配“{query}”的项目，请换个关键词。',
+  'card.repo.search_empty': '当前没有可搜索的项目。',
+  'card.repo.search_result': '已显示 {count} 个匹配项目。',
   'card.repo.manual_placeholder': '输入任意工作目录，如 /path/to/project 或 ~/projects/foo',
   'card.repo.manual_empty': '请输入工作目录路径',
   'card.repo.worktree_empty': '请至少选择一个仓库',
@@ -72,12 +77,14 @@ export const messages: Record<string, string> = {
   'card.repo.worktree_child_conflict': '多个仓库会映射到相同 worktree 子目录：{names}。请先调整项目名或改用单项目创建。',
   'card.repo.current_active': '当前工作目录：',
   'card.repo.current_marker': ' ← 当前',
+  'card.repo.list_limited': '项目较多，下拉仅显示部分结果（切换 {shown}/{total}，新建 worktree {worktreeShown}/{worktreeTotal}）。可用上方搜索查找未显示的项目，也可手动输入路径或使用 `/repo` 命令。',
   'card.repo.note': '也可以回复 `/repo <编号>` 切换（如 `/repo 1`），或直接 `/repo <路径|项目名>`（如 `/repo botmux`、`/repo ~/projects/foo`）跳过本卡片；`/repo wt <编号|项目名> [分支名]` 基于远端默认分支新建 worktree 打开',
   'card.repo.placeholder_worktree': '🌿 选仓库新建 worktree 打开',
   'card.repo.placeholder_worktree_multi': '🌿 选择一个或多个仓库新建 worktree',
   'card.repo.worktree_now_multi': '多仓库选择器已开启（本 bot 后续会话默认）',
   'card.repo.toast_worktree_mode_switched': '已切到多仓库选择器，本 bot 后续会话默认生效（可再点切回）。',
   'card.repo.toast_worktree_mode_switched_back': '已切回单仓库选择器，本 bot 后续会话默认生效（可再点切到多仓库）。',
+  'card.repo.refresh_failed': '选择卡刷新失败，请回复 `/repo <项目名|路径>` 选择，或直接回复 `/repo` 继续。',
   'card.repo.worktree_rolled_back': '{repo} 创建 worktree 失败：{error}。已回滚本批次此前创建的 {count} 个 worktree。',
   'card.repo.toast_worktree_creating': '正在创建 worktree，完成后会在话题里通知…',
 
@@ -893,6 +900,8 @@ export const messages: Record<string, string> = {
   'daemon.fast_unsupported_backend': '⚠️ 这个会话的后端下 /fast 切不了 Codex 档位（RPC 输入模式 / Riff 的对话不走终端，按键到不了执行端）。卡片徽标仍会如实反映 Codex 实际运行的档位。',
   'daemon.enriched_mentions_label': '消息中的 @mention：',
   'daemon.choose_repo_first': '请先在上方卡片中选择仓库，您的消息已暂存，选择后会自动发送。',
+  'daemon.repo_scan_in_progress': '正在扫描仓库，您的消息已暂存。扫描完成后会自动显示选择卡或直接开始，无需再次 @。',
+  'daemon.repo_card_unavailable': '仓库选择卡当前不可用，您的消息仍已暂存。请回复 `/repo <项目名|路径>` 选择仓库，或直接回复 `/repo` 使用当前工作目录继续。',
   'daemon.worktree_building_wait': '正在创建 worktree（含 git fetch，可能需要几秒），您的消息已暂存，创建完成后会自动一并发送。',
 
   // ─── /dashboard command group (PR3 C1) ─────────────────────────────────

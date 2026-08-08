@@ -393,6 +393,17 @@ function deferRepoCardWithdraw(larkAppId: string | undefined, messageId: string 
   });
 }
 
+function isCurrentRepoCardReplacement(
+  ds: DaemonSession,
+  activeSessions: Map<string, DaemonSession>,
+  rootId: string,
+  cardMessageId: string | undefined,
+): boolean {
+  const botScoped = activeSessions.get(sessionKey(rootId, ds.larkAppId));
+  const legacy = activeSessions.get(rootId);
+  return (botScoped === ds || legacy === ds) && isActiveRepoCard(ds, cardMessageId);
+}
+
 /**
  * Commit a resolved working directory onto a repo-select session: pin it, then
  * either fork the pending CLI (first selection) or close + recreate the session
@@ -426,6 +437,9 @@ export async function commitRepoSelection(
     confirmReplyText?: string;
     pinWorkingDir?: boolean;
     riffRepoDirs?: string[];
+    /** Preserve route-specific acknowledgement work immediately before the
+     * pending input snapshot + fork. No pending input snapshot precedes it. */
+    beforePendingFork?: () => Promise<void>;
   },
 ): Promise<void> {
   const { ds, rootId, cardMessageId, larkAppId, operatorOpenId, activeSessions, sessionReply } = ctx;
@@ -478,6 +492,15 @@ export async function commitRepoSelection(
           !ds.pendingRepo || (ds.worker && !ds.worker.killed)) {
         logger.warn(`[${tag(ds)}] Session changed while preparing the pending-CLI prompt (${commitGenSessionId} → ${ds.session.sessionId}, active=${sessionStillActive()}, pending=${!!ds.pendingRepo}, worker=${!!ds.worker}) — aborting this fork`);
         return;
+      }
+
+      if (opts?.beforePendingFork) {
+        await opts.beforePendingFork();
+        if (!sessionStillActive() || ds.session.sessionId !== commitGenSessionId ||
+            !ds.pendingRepo || (ds.worker && !ds.worker.killed)) {
+          logger.warn(`[${tag(ds)}] Session changed during pending-CLI acknowledgement — aborting this fork`);
+          return;
+        }
       }
 
       const pendingPrompt = ds.pendingPrompt ?? '';
@@ -588,8 +611,10 @@ export async function commitRepoSelection(
       // release (and so a sessionReply throw that jumps to finally still leaves
       // the card locally invalid).
       const cardToWithdraw = cardMessageId ?? ds.repoCardMessageId;
+      const scanCardToWithdraw = ds.repoScanCardMessageId;
       markRepoCardConsumed(ds, cardToWithdraw);
       ds.repoCardMessageId = undefined;
+      ds.repoScanCardMessageId = undefined;
 
       // Hold the claim through confirmation. Card withdrawal is deferred until
       // after the callback can ACK; stale clicks are blocked by the local
@@ -607,6 +632,7 @@ export async function commitRepoSelection(
         logger.warn(`[${tag(ds)}] Confirm reply after pending repo commit failed: ${e instanceof Error ? e.message : e}`);
       }
       deferRepoCardWithdraw(larkAppId, cardToWithdraw);
+      deferRepoCardWithdraw(larkAppId, scanCardToWithdraw);
     } finally {
       ds.pendingRepoCommitInFlight = false;
     }
@@ -1703,7 +1729,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     );
   }
 
-  const isSensitive = value?.action && ['restart', 'close', 'resume', 'skip_repo', 'repo_manual_submit', 'repo_worktree_submit', 'worktree_toggle_mode', 'retry_last_task', 'get_write_link', 'open_local_terminal', 'open_local_cli', 'toggle_stream', 'toggle_display', 'export_text', 'term_action', 'refresh_screenshot', 'takeover', 'disconnect', 'tui_keys', 'tui_text_input', 'wf_approve', 'wf_reject', 'wf_cancel'].includes(value.action);
+  const isSensitive = value?.action && ['restart', 'close', 'resume', 'skip_repo', 'repo_search_submit', 'repo_manual_submit', 'repo_worktree_submit', 'worktree_toggle_mode', 'retry_last_task', 'get_write_link', 'open_local_terminal', 'open_local_cli', 'toggle_stream', 'toggle_display', 'export_text', 'term_action', 'refresh_screenshot', 'takeover', 'disconnect', 'tui_keys', 'tui_text_input', 'wf_approve', 'wf_reject', 'wf_cancel'].includes(value.action);
   if (isSensitive) {
     const rootId = value?.root_id;
     // activeSessions is keyed by sessionKey(anchor, larkAppId) — `${anchor}::${larkAppId}`
@@ -1724,13 +1750,14 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       : undefined;
     const effectiveAppId = larkAppId ?? ds?.larkAppId ?? closedForCtx?.larkAppId;
     const chatId = ds?.chatId ?? closedForCtx?.chatId;
-    // pendingRepo 阶段，会话发起人（含 chat-granted 用户）可以 skip_repo / 手动填目录
-    // 起会话——与 repo 下拉选择同款例外，否则被授权人连自己的首次会话都启动不了。
+    // pendingRepo 阶段，会话发起人（含 chat-granted 用户）可以搜索，并通过
+    // skip_repo / 手动填目录起会话——与 repo 下拉选择同款例外，否则被授权人
+    // 连自己的首次会话都启动不了。
     // 注意：worktree_toggle_mode 故意不在此列——它持久写 bot 级 worktreeMultiPicker
     // （影响该 bot 所有后续会话），属管理动作，必须走 canOperate，不能让 talk-only/
     // chat-granted 用户借「开自己的 pending 卡」绕过去改 bot 配置。
     const pendingRepoOwnerException =
-      (value.action === 'skip_repo' || value.action === 'repo_manual_submit' || value.action === 'repo_worktree_submit') && !!ds?.pendingRepo &&
+      (value.action === 'skip_repo' || value.action === 'repo_search_submit' || value.action === 'repo_manual_submit' || value.action === 'repo_worktree_submit') && !!ds?.pendingRepo &&
       !!operatorOpenId && operatorOpenId === ds.session.ownerOpenId;
     if (effectiveAppId) {
       if (!pendingRepoOwnerException && !canOperate(effectiveAppId, chatId, operatorOpenId)) {
@@ -2984,27 +3011,92 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       );
     }
 
+    if (actionType === 'repo_search_submit' && ds) {
+      const locDs = localeForBot(ds.larkAppId);
+      const oldCardMessageId = cardMessageId ?? ds.repoCardMessageId;
+      if (!isActiveRepoCard(ds, oldCardMessageId)) {
+        return { toast: { type: 'info', content: t('cmd.repo.card_already_consumed', undefined, locDs) } };
+      }
+      const query = String(action?.form_value?.repo_search_query ?? '').trim();
+      const normalizedQuery = query.toLowerCase();
+      const projects = lastRepoScan.get(ds.chatId) ?? [];
+      const displayIndexByPath = new Map(projects.map((project, index) => [project.path, index + 1]));
+      const matches = normalizedQuery
+        ? projects.filter(project => [project.name, project.branch, project.path]
+          .some(field => field.toLowerCase().includes(normalizedQuery)))
+        : projects;
+      if (matches.length === 0) {
+        const key = query ? 'card.repo.search_no_match' : 'card.repo.search_empty';
+        return { toast: { type: 'error', content: t(key, { query }, locDs) } };
+      }
+
+      const newCard = buildRepoSelectCard(
+        matches,
+        getSessionWorkingDir(ds),
+        rootId,
+        locDs,
+        getBot(ds.larkAppId).config.worktreeMultiPicker === true,
+        displayIndexByPath,
+      );
+      try {
+        const newCardMessageId = await sessionReply(rootId, newCard, 'interactive');
+        if (!isCurrentRepoCardReplacement(ds, activeSessions, rootId, oldCardMessageId)) {
+          deferRepoCardWithdraw(ds.larkAppId, newCardMessageId);
+          return { toast: { type: 'info', content: t('cmd.repo.card_already_consumed', undefined, locDs) } };
+        }
+        ds.repoCardMessageId = newCardMessageId;
+        deferRepoCardWithdraw(ds.larkAppId, oldCardMessageId);
+      } catch (err) {
+        logger.warn(`[${tag(ds)}] Repo picker search replacement failed: ${err instanceof Error ? err.message : err}`);
+        return { toast: { type: 'error', content: t('card.repo.refresh_failed', undefined, locDs) } };
+      }
+      return { toast: { type: 'info', content: t('card.repo.search_result', { count: matches.length }, locDs) } };
+    }
+
     if (actionType === 'worktree_toggle_mode' && ds) {
       // Flip the persisted per-bot worktree picker mode (single ⇄ multi), then
       // re-send a fresh repo card in the new mode — a form can't ride an
-      // in-place patch, so the old card is withdrawn and a new one posted.
+      // in-place patch, so a new card is posted and the old one then withdrawn.
       const locDs = localeForBot(ds.larkAppId);
       // Same active-card gate as skip/manual/worktree: a stale card must not
       // flip bot config or replace the live repo card after claim/restart.
-      if (cardMessageId && !isActiveRepoCard(ds, cardMessageId)) {
+      const oldCardMessageId = cardMessageId ?? ds.repoCardMessageId;
+      if (!isActiveRepoCard(ds, oldCardMessageId)) {
         return { toast: { type: 'info', content: t('cmd.repo.card_already_consumed', undefined, locDs) } };
       }
       const spec = findConfigField('worktreeMultiPicker');
       if (!spec) return;
       const next = getBot(ds.larkAppId).config.worktreeMultiPicker !== true;
-      const r = await applyConfigField(ds.larkAppId, spec, next);
-      if (!r.ok) return { toast: { type: 'error', content: t('cmd.config.write_failed', { reason: r.reason }, locDs) } };
       const projects = lastRepoScan.get(ds.chatId) ?? [];
-      // await so a rejected delete is caught here (not an unhandled rejection);
-      // a missing/already-gone card is fine — we post the fresh one regardless.
-      if (ds.repoCardMessageId && ds.larkAppId) { try { await deleteMessage(ds.larkAppId, ds.repoCardMessageId); } catch { /* card already gone */ } }
       const newCard = buildRepoSelectCard(projects, getSessionWorkingDir(ds), rootId, locDs, next);
-      ds.repoCardMessageId = await sessionReply(rootId, newCard, 'interactive');
+      let newCardMessageId: string;
+      try {
+        newCardMessageId = await sessionReply(rootId, newCard, 'interactive');
+      } catch (err) {
+        logger.warn(`[${tag(ds)}] Repo picker mode replacement card failed: ${err instanceof Error ? err.message : err}`);
+        return { toast: { type: 'error', content: t('card.repo.refresh_failed', undefined, locDs) } };
+      }
+      if (!isCurrentRepoCardReplacement(ds, activeSessions, rootId, oldCardMessageId)) {
+        deferRepoCardWithdraw(ds.larkAppId, newCardMessageId);
+        return { toast: { type: 'info', content: t('cmd.repo.card_already_consumed', undefined, locDs) } };
+      }
+      let r: Awaited<ReturnType<typeof applyConfigField>>;
+      try {
+        r = await applyConfigField(ds.larkAppId, spec, next);
+      } catch (err) {
+        deferRepoCardWithdraw(ds.larkAppId, newCardMessageId);
+        return { toast: { type: 'error', content: t('cmd.config.write_failed', { reason: err instanceof Error ? err.message : String(err) }, locDs) } };
+      }
+      if (!r.ok) {
+        deferRepoCardWithdraw(ds.larkAppId, newCardMessageId);
+        return { toast: { type: 'error', content: t('cmd.config.write_failed', { reason: r.reason }, locDs) } };
+      }
+      if (!isCurrentRepoCardReplacement(ds, activeSessions, rootId, oldCardMessageId)) {
+        deferRepoCardWithdraw(ds.larkAppId, newCardMessageId);
+        return { toast: { type: 'info', content: t('cmd.repo.card_already_consumed', undefined, locDs) } };
+      }
+      ds.repoCardMessageId = newCardMessageId;
+      deferRepoCardWithdraw(ds.larkAppId, oldCardMessageId);
       return { toast: { type: 'info', content: t(next ? 'card.repo.toast_worktree_mode_switched' : 'card.repo.toast_worktree_mode_switched_back', undefined, locDs) } };
     }
 

@@ -10,6 +10,7 @@ import { cardUsageFooterSegment, type CardUsageSnapshot } from './md-card.js';
 import { readGlobalConfig } from '../../global-config.js';
 import type { ConfigCardData } from '../../services/bot-config-store.js';
 import { isLocalCliOpenEnabled } from '../../services/local-cli-opener.js';
+import { stampBotmuxCallbackMarkers } from './callback-button-marker.js';
 import {
   clampGrantQuotaForCard,
   DEFAULT_GRANT_DURATION_MS,
@@ -1060,6 +1061,32 @@ export function buildPrivateSnapshotCard(
  * Build a Feishu interactive card with a dropdown selector for projects.
  * Returns a JSON string suitable for msg_type: 'interactive'.
  */
+// Live traffic shows the gateway dropping interactive request-data near 16 KiB.
+// Budget the actual SDK `data` JSON (including callback markers, the stable
+// delivery UUID, and content's second JSON escaping), with room left for
+// transport framing and headers.
+const REPO_SELECT_REQUEST_DATA_MAX_BYTES = 12_000;
+const REPO_SELECT_CARD_MAX_OPTIONS = 40;
+const REPO_SELECT_BUDGET_RECEIVE_ID = `oc_${'x'.repeat(61)}`;
+const REPO_SELECT_BUDGET_UUID = 'x'.repeat(50);
+
+function repoSelectRequestDataBytes(cardJson: string): number {
+  const stamped = stampBotmuxCallbackMarkers(cardJson);
+  const replyBytes = Buffer.byteLength(JSON.stringify({
+    msg_type: 'interactive',
+    content: stamped,
+    reply_in_thread: true,
+    uuid: REPO_SELECT_BUDGET_UUID,
+  }), 'utf-8');
+  const createBytes = Buffer.byteLength(JSON.stringify({
+    receive_id: REPO_SELECT_BUDGET_RECEIVE_ID,
+    msg_type: 'interactive',
+    content: stamped,
+    uuid: REPO_SELECT_BUDGET_UUID,
+  }), 'utf-8');
+  return Math.max(replyBytes, createBytes);
+}
+
 /** The worktree multi-select form element (multi_select + branch input + submit),
  *  inlined into the repo card when the bot is in multi-repo-picker mode. */
 function worktreeMultiForm(worktreeOptions: Array<{ text: { tag: 'plain_text'; content: string }; value: string }>, rootMessageId?: string, locale?: Locale): any {
@@ -1108,16 +1135,35 @@ function worktreeMultiForm(worktreeOptions: Array<{ text: { tag: 'plain_text'; c
   };
 }
 
+/** Lightweight placeholder shown while the first repository scan runs. */
+export function buildRepoScanProgressCard(locale?: Locale): string {
+  return JSON.stringify({
+    config: { wide_screen_mode: true, update_multi: true },
+    header: {
+      template: 'blue',
+      title: { tag: 'plain_text', content: t('card.repo.title', undefined, locale) },
+    },
+    elements: [{
+      tag: 'div',
+      text: { tag: 'lark_md', content: t('daemon.repo_scan_in_progress', undefined, locale) },
+    }],
+  });
+}
+
 /** Repo selection card. `multiPicker` (persisted per-bot via worktreeMultiPicker)
  *  flips the worktree control between an instant single-select dropdown (false)
  *  and the inline multi-select form (true). */
-export function buildRepoSelectCard(projects: ProjectInfo[], currentPath?: string, rootMessageId?: string, locale?: Locale, multiPicker?: boolean): string {
+export function buildRepoSelectCard(projects: ProjectInfo[], currentPath?: string, rootMessageId?: string, locale?: Locale, multiPicker?: boolean, displayIndexByPath?: ReadonlyMap<string, number>): string {
   const currentMarker = t('card.repo.current_marker', undefined, locale);
-  const options = projects.map((p, i) => {
+  const currentPathText = {
+    tag: 'lark_md',
+    content: `${t('card.repo.current_active', undefined, locale)}**${escapeMd(currentPath ?? 'N/A')}**`,
+  };
+  const options = projects.slice(0, REPO_SELECT_CARD_MAX_OPTIONS).map((p, i) => {
     const currentTag = p.path === currentPath ? currentMarker : '';
     const typeTag = p.type === 'worktree' ? ' [worktree]' : '';
     return {
-      text: { tag: 'plain_text' as const, content: `${i + 1}. ${p.name} (${p.branch})${typeTag}${currentTag}` },
+      text: { tag: 'plain_text' as const, content: `${displayIndexByPath?.get(p.path) ?? i + 1}. ${p.name} (${p.branch})${typeTag}${currentTag}` },
       value: p.path,
     };
   });
@@ -1127,13 +1173,20 @@ export function buildRepoSelectCard(projects: ProjectInfo[], currentPath?: strin
   // worktrees of the same repo would just duplicate the list.
   const worktreeOptions = projects
     .filter(p => p.type === 'repo')
+    .slice(0, REPO_SELECT_CARD_MAX_OPTIONS)
     .map(p => ({
       text: { tag: 'plain_text' as const, content: `${p.name} (${p.branch})` },
       value: p.path,
     }));
+  const totalWorktreeOptions = projects.filter(p => p.type === 'repo').length;
+
+  const note = {
+    tag: 'note',
+    elements: [{ tag: 'lark_md', content: '' }],
+  };
 
   const card = {
-    config: { wide_screen_mode: true },
+    config: { wide_screen_mode: true, update_multi: true },
     header: {
       template: 'blue',
       title: { tag: 'plain_text', content: t('card.repo.title', undefined, locale) },
@@ -1159,10 +1212,7 @@ export function buildRepoSelectCard(projects: ProjectInfo[], currentPath?: strin
             elements: [
               {
                 tag: 'div',
-                text: {
-                  tag: 'lark_md',
-                  content: `${t('card.repo.current_active', undefined, locale)}**${escapeMd(currentPath ?? 'N/A')}**`,
-                },
+                text: currentPathText,
               },
             ],
           },
@@ -1183,6 +1233,36 @@ export function buildRepoSelectCard(projects: ProjectInfo[], currentPath?: strin
       },
       {
         tag: 'hr',
+      },
+      {
+        tag: 'form',
+        name: 'repo_search_form',
+        elements: [{
+          tag: 'column_set',
+          flex_mode: 'none',
+          horizontal_spacing: 'default',
+          columns: [
+            {
+              tag: 'column', width: 'weighted', weight: 1, vertical_align: 'center',
+              elements: [{
+                tag: 'input',
+                name: 'repo_search_query',
+                placeholder: { tag: 'plain_text', content: t('card.repo.search_placeholder', undefined, locale) },
+              }],
+            },
+            {
+              tag: 'column', width: 'auto', vertical_align: 'center',
+              elements: [{
+                tag: 'button',
+                name: 'repo_search_submit',
+                text: { tag: 'plain_text', content: t('card.repo.search_button', undefined, locale) },
+                type: 'default',
+                action_type: 'form_submit',
+                value: { action: 'repo_search_submit', root_id: rootMessageId ?? '' },
+              }],
+            },
+          ],
+        }],
       },
       {
         tag: 'action',
@@ -1306,19 +1386,49 @@ export function buildRepoSelectCard(projects: ProjectInfo[], currentPath?: strin
           },
         ],
       },
-      {
-        tag: 'note',
-        elements: [
-          {
-            tag: 'lark_md',
-            content: t('card.repo.note', undefined, locale),
-          },
-        ],
-      },
+      note,
     ],
   };
 
-  return JSON.stringify(card);
+  const serialize = (): string => {
+    const limited = options.length < projects.length || worktreeOptions.length < totalWorktreeOptions;
+    const limitNote = limited
+      ? `${t('card.repo.list_limited', {
+        shown: options.length,
+        total: projects.length,
+        worktreeShown: worktreeOptions.length,
+        worktreeTotal: totalWorktreeOptions,
+      }, locale)}\n`
+      : '';
+    note.elements[0].content = `${limitNote}${t('card.repo.note', undefined, locale)}`;
+    return JSON.stringify(card);
+  };
+
+  let json = serialize();
+  while (repoSelectRequestDataBytes(json) > REPO_SELECT_REQUEST_DATA_MAX_BYTES
+    && (options.length > 0 || worktreeOptions.length > 0)) {
+    // Remove the larger trailing option first. Both dropdowns remain useful for
+    // ordinary scans, while unusually long values converge on the manual path.
+    const switchBytes = options.length > 0
+      ? Buffer.byteLength(JSON.stringify(options[options.length - 1]), 'utf-8')
+      : -1;
+    const worktreeBytes = worktreeOptions.length > 0
+      ? Buffer.byteLength(JSON.stringify(worktreeOptions[worktreeOptions.length - 1]), 'utf-8')
+      : -1;
+    if (worktreeBytes >= switchBytes) worktreeOptions.pop();
+    else options.pop();
+    json = serialize();
+  }
+
+  // Project paths are filesystem-bounded in practice. If an unusually escaped
+  // current path alone still exhausts the wire budget, collapse only its display;
+  // action values and the manual/search recovery controls remain intact.
+  if (repoSelectRequestDataBytes(json) > REPO_SELECT_REQUEST_DATA_MAX_BYTES) {
+    currentPathText.content = `${t('card.repo.current_active', undefined, locale)}**…**`;
+    json = serialize();
+  }
+
+  return json;
 }
 
 // ─── 群内授权卡片 ─────────────────────────────────────────────────────────────

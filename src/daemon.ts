@@ -109,7 +109,8 @@ import type { CliId } from './adapters/cli/types.js';
 import { runtimeInstallationKey } from './adapters/cli/runtime.js';
 import * as scheduler from './core/scheduler.js';
 import { scanProjects, scanMultipleProjects } from './services/project-scanner.js';
-import { buildQuotaExhaustedCard, buildRepoSelectCard, buildStreamingCard, getCliDisplayName } from './im/lark/card-builder.js';
+import { scanMultipleProjectsAsync } from './services/project-scanner-async.js';
+import { buildQuotaExhaustedCard, buildRepoScanProgressCard, buildRepoSelectCard, buildStreamingCard, getCliDisplayName } from './im/lark/card-builder.js';
 import { codexServiceTierBadge } from './services/codex-service-tier.js';
 import { sessionConfiguredRuntimeDisplayName } from './core/cli-runtime-display.js';
 import { isLocalCliOpenReady } from './services/local-cli-opener.js';
@@ -214,7 +215,7 @@ import {
   type PersistentBackendType,
 } from './core/persistent-backend.js';
 import type { PersistentBackendTarget } from './adapters/backend/types.js';
-import { handleCardAction, runAutoWorktreeCommit } from './im/lark/card-handler.js';
+import { commitRepoSelection, handleCardAction, runAutoWorktreeCommit } from './im/lark/card-handler.js';
 import { setIssueActivate } from './im/lark/issue-command-deps.js';
 import { startIssueOutboxPump } from './services/issue-outbox-pump.js';
 import type { CardActionData, CardHandlerDeps } from './im/lark/card-handler.js';
@@ -4475,9 +4476,12 @@ function notifierAdoptWouldDropInput(ds: DaemonSession): boolean {
  * their input was cancelled on both the success and failure card.
  */
 function clearPendingRepoStateForNotifierAdopt(ds: DaemonSession): void {
+  const scanCardToWithdraw = ds.repoScanCardMessageId;
   ds.pendingRepo = false;
+  ds.repoScanInFlight = false;
   ds.pendingRepoCommitInFlight = false;
   ds.worktreeCreating = false;
+  ds.repoScanCardMessageId = undefined;
   ds.repoCardMessageId = undefined;
   ds.pendingPrompt = undefined;
   ds.pendingTurnId = undefined;
@@ -4497,6 +4501,11 @@ function clearPendingRepoStateForNotifierAdopt(ds: DaemonSession): void {
   ds.pendingChatContext = undefined;
   ds.pendingCodexAppFollowUps = undefined;
   ds.pendingCodexAppFollowUpContexts = undefined;
+  if (scanCardToWithdraw) {
+    void deleteMessage(ds.larkAppId, scanCardToWithdraw).catch(err => {
+      logger.debug(`[${tag(ds)}] Repo scan card withdraw after notifier adopt failed: ${err}`);
+    });
+  }
 }
 
 async function adoptCodexNotifierEvent(
@@ -15538,6 +15547,169 @@ function deliverPassthroughToExistingSession(
 export const __testOnly_deliverPassthroughToExistingSession =
   deliverPassthroughToExistingSession;
 
+const RETRYABLE_REPO_CARD_TRANSPORT_CODES = new Set([
+  'EPIPE',
+  'ECONNRESET',
+  'ECONNABORTED',
+  'ETIMEDOUT',
+]);
+const REPO_CARD_TRANSPORT_RETRY_DELAY_MS = 100;
+
+function isRetryableRepoCardTransportError(err: unknown): boolean {
+  const code = typeof (err as any)?.code === 'string' ? (err as any).code : '';
+  if (RETRYABLE_REPO_CARD_TRANSPORT_CODES.has(code)) return true;
+  const message = err instanceof Error ? err.message : String(err);
+  return /socket hang up|\b(?:EPIPE|ECONNRESET|ECONNABORTED|ETIMEDOUT)\b/i.test(message);
+}
+
+/** Deliver the first-spawn repo picker. When a shared scan-progress card already
+ * exists, PATCH that same message in place; otherwise POST a new picker with a
+ * stable provider UUID. Retry one transient transport failure after allowing the
+ * SDK's stale keep-alive socket to drain. If both attempts fail, keep the pending
+ * input buffered and send the deterministic `/repo` text recovery instead. */
+async function postPendingRepoSelectCard(
+  ds: DaemonSession,
+  anchor: string,
+  projects: import('./services/project-scanner.js').ProjectInfo[],
+  existingMessageId?: string,
+): Promise<string | undefined> {
+  const deliveryUuid = `repo-picker:${ds.session.sessionId}`;
+  const clearProvisionalRepoCard = (): void => {
+    if (existingMessageId && ds.repoCardMessageId === existingMessageId) {
+      ds.repoCardMessageId = undefined;
+    }
+  };
+  const pendingCommitOwnsExistingCard = (): boolean => existingMessageId !== undefined
+    && ds.pendingRepoCommitInFlight === true
+    && ds.repoCardMessageId === existingMessageId;
+  try {
+    const cardJson = buildRepoSelectCard(
+      projects,
+      getSessionWorkingDir(ds),
+      anchor,
+      localeForBot(ds.larkAppId),
+      getBot(ds.larkAppId).config.worktreeMultiPicker,
+    );
+    const deliver = async (): Promise<string> => {
+      if (existingMessageId) {
+        // Feishu can render the patched picker before the PATCH response reaches
+        // us. Authorize that same message before awaiting so an immediate click
+        // is not rejected as stale; every failure path below rolls it back only
+        // if no newer route/card has replaced it.
+        ds.repoCardMessageId = existingMessageId;
+        await updateMessage(ds.larkAppId, existingMessageId, cardJson);
+        return existingMessageId;
+      }
+      return sessionReply(anchor, cardJson, 'interactive', ds.larkAppId, undefined, { uuid: deliveryUuid });
+    };
+    try {
+      return await deliver();
+    } catch (err) {
+      if (!isRetryableRepoCardTransportError(err)) throw err;
+      logger.warn(`[${tag(ds)}] Repo selection card transport failed; retrying ${existingMessageId ? 'same-message PATCH' : 'with stable UUID'}: ${err instanceof Error ? err.message : err}`);
+      // The failed socket is removed from the shared Agent on a later event-loop
+      // turn. An immediate retry can pick it again and fail within the same 2ms.
+      await new Promise<void>(resolve => setTimeout(resolve, REPO_CARD_TRANSPORT_RETRY_DELAY_MS));
+      if (pendingCommitOwnsExistingCard()) {
+        logger.info(`[${tag(ds)}] Repo selection card retry skipped because a pending commit took over`);
+        return existingMessageId;
+      }
+      if (!ds.pendingRepo || !ownsCurrentRoute(ds, ds.larkAppId)
+          || (existingMessageId !== undefined && (
+            ds.repoScanCardMessageId !== existingMessageId
+            || ds.repoCardMessageId !== existingMessageId
+          ))) {
+        clearProvisionalRepoCard();
+        logger.info(`[${tag(ds)}] Repo selection card retry skipped because the pending route changed during backoff`);
+        return undefined;
+      }
+      return await deliver();
+    }
+  } catch (err) {
+    logger.warn(`[${tag(ds)}] Repo selection card delivery failed: ${err instanceof Error ? err.message : err}`);
+    if (pendingCommitOwnsExistingCard()) {
+      logger.info(`[${tag(ds)}] Repo selection text fallback skipped because a pending commit took over`);
+      return existingMessageId;
+    }
+    const newerRepoCardTookOver = existingMessageId !== undefined
+      && ds.repoCardMessageId !== undefined
+      && ds.repoCardMessageId !== existingMessageId;
+    clearProvisionalRepoCard();
+    if (newerRepoCardTookOver) {
+      logger.info(`[${tag(ds)}] Repo selection text fallback skipped because a newer picker took over`);
+      return undefined;
+    }
+    if (!ds.pendingRepo || ds.pendingRepoCommitInFlight ||
+        (ds.worker && !ds.worker.killed) || !ownsCurrentRoute(ds, ds.larkAppId)) {
+      logger.info(`[${tag(ds)}] Repo selection text fallback skipped because the pending route changed`);
+      return undefined;
+    }
+    try {
+      await sessionReply(
+        anchor,
+        tr('daemon.repo_card_unavailable', undefined, localeForBot(ds.larkAppId)),
+        'text',
+        ds.larkAppId,
+      );
+    } catch (fallbackErr) {
+      logger.warn(`[${tag(ds)}] Repo selection text fallback failed: ${fallbackErr instanceof Error ? fallbackErr.message : fallbackErr}`);
+    }
+    return undefined;
+  }
+}
+
+function pendingRepoScanStillOwnsRoute(
+  ds: DaemonSession,
+  anchor: string,
+  sessionId: string,
+  scanCardMessageId: string | undefined,
+): boolean {
+  return activeSessions.get(sessionKey(anchor, ds.larkAppId)) === ds
+    && ds.session.sessionId === sessionId
+    && ds.session.status === 'active'
+    && ds.pendingRepo === true
+    && ds.repoScanInFlight === true
+    && ds.repoScanCardMessageId === scanCardMessageId
+    && !ds.pendingRepoCommitInFlight
+    && !(ds.worker && !ds.worker.killed);
+}
+
+function deleteRepoScanProgressMessage(ds: DaemonSession, messageId: string): void {
+  void (async () => {
+    try {
+      if (await deleteMessage(ds.larkAppId, messageId)) return;
+      await new Promise<void>(resolve => setTimeout(resolve, REPO_CARD_TRANSPORT_RETRY_DELAY_MS));
+      if (await deleteMessage(ds.larkAppId, messageId)) return;
+      logger.warn(`[${tag(ds)}] Repo scan progress card withdrawal failed twice`);
+    } catch (err) {
+      logger.warn(`[${tag(ds)}] Repo scan progress card withdrawal failed: ${err instanceof Error ? err.message : err}`);
+    }
+  })();
+}
+
+function withdrawRepoScanProgressCard(ds: DaemonSession, messageId: string | undefined): void {
+  if (!messageId || ds.repoScanCardMessageId !== messageId) return;
+  ds.repoScanCardMessageId = undefined;
+  deleteRepoScanProgressMessage(ds, messageId);
+}
+
+async function postPendingRepoScanProgressCard(
+  ds: DaemonSession,
+  anchor: string,
+  scanSessionId: string,
+): Promise<string> {
+  const cardJson = buildRepoScanProgressCard(localeForBot(ds.larkAppId));
+  const deliveryUuid = `repo-scan:${scanSessionId}`;
+  try {
+    return await sessionReply(anchor, cardJson, 'interactive', ds.larkAppId, undefined, { uuid: deliveryUuid });
+  } catch (err) {
+    if (!isRetryableRepoCardTransportError(err)) throw err;
+    logger.warn(`[${tag(ds)}] Repo scan progress card transport failed; retrying with stable UUID: ${err instanceof Error ? err.message : err}`);
+    await new Promise<void>(resolve => setTimeout(resolve, REPO_CARD_TRANSPORT_RETRY_DELAY_MS));
+    return sessionReply(anchor, cardJson, 'interactive', ds.larkAppId, undefined, { uuid: deliveryUuid });
+  }
+}
+
 async function startInitialPassthroughSession(args: {
   larkAppId: string;
   chatId: string;
@@ -15705,8 +15877,7 @@ async function startInitialPassthroughSession(args: {
   const projects = scanDirs.length > 0 ? scanMultipleProjects(scanDirs, 3, repoPickerScanOptions()) : [];
   if (projects.length > 0) {
     lastRepoScan.set(chatId, projects);
-    const cardJson = buildRepoSelectCard(projects, getSessionWorkingDir(ds), anchor, localeForBot(larkAppId), getBot(larkAppId).config.worktreeMultiPicker);
-    ds.repoCardMessageId = await sessionReply(anchor, cardJson, 'interactive', larkAppId);
+    ds.repoCardMessageId = await postPendingRepoSelectCard(ds, anchor, projects);
     announcePendingRepoSession(ds);
     logger.info(`[${tag(ds)}] Waiting for repo selection before initial raw passthrough (${projects.length} projects)`);
     return;
@@ -16309,29 +16480,186 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
   // Show repo selection card
   if (await replyInvalidWorkingDirs(anchor, larkAppId, ds)) return;
   const scanDirs = getProjectScanDirs(ds).filter(d => existsSync(d));
-  let projects: import('./services/project-scanner.js').ProjectInfo[] = [];
   if (scanDirs.length > 0) {
-    projects = scanMultipleProjects(scanDirs, 3, repoPickerScanOptions());
-  }
-  if (projects.length > 0) {
-    lastRepoScan.set(chatId, projects);
-    const currentCwd = getSessionWorkingDir(ds);
-    const cardJson = buildRepoSelectCard(projects, currentCwd, anchor, localeForBot(larkAppId), getBot(larkAppId).config.worktreeMultiPicker);
-    ds.repoCardMessageId = await sessionReply(anchor, cardJson, 'interactive', larkAppId);
+    const scanSessionId = ds.session.sessionId;
+    let repoScanCardMessageId: string | undefined;
+    ds.repoScanInFlight = true;
     announcePendingRepoSession(ds);
-    logger.info(`[${tag(ds)}] Waiting for repo selection (${projects.length} projects)`);
-  } else {
-    // No projects found — skip repo selection, spawn directly
-    ds.pendingRepo = false;
-    const selfBot = getBot(larkAppId);
-    ensureSessionWhiteboard(ds);
-    const prompt = buildNewTopicCliInput(promptContent, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, chatId), undefined, { name: selfBot.botName, openId: selfBot.botOpenId }, localeForBot(larkAppId), newTopicSender, { larkAppId, chatId, whiteboardId: ds.session.whiteboardId, substituteTrigger, codexAppText: codexAppVisibleText, codexAppApplicationContext, codexAppMessageContext });
-    await noteTurnReceived(ds, messageId, content, newTopicSender, messageId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
-    rememberLastCliInput(ds, promptContent, prompt);
-    forkWorker(ds, prompt, { turnId: messageId });
-    ds.pendingTurnId = undefined;
-    logger.info(`Session ${session.sessionId} ready (no projects to select), total active: ${getActiveCount()}`);
+    try {
+      repoScanCardMessageId = (await postPendingRepoScanProgressCard(ds, anchor, scanSessionId)) || undefined;
+      if (!pendingRepoScanStillOwnsRoute(ds, anchor, scanSessionId, undefined)) {
+        ds.repoScanInFlight = false;
+        if (repoScanCardMessageId) deleteRepoScanProgressMessage(ds, repoScanCardMessageId);
+        logger.info(`[${tag(ds)}] Withdrawing late repo scan progress card because the pending route changed during delivery`);
+        return;
+      }
+      ds.repoScanCardMessageId = repoScanCardMessageId;
+    } catch (err) {
+      logger.warn(`[${tag(ds)}] Repo scan progress card failed: ${err instanceof Error ? err.message : err}`);
+      if (pendingRepoScanStillOwnsRoute(ds, anchor, scanSessionId, undefined)) {
+        try {
+          await sessionReply(
+            anchor,
+            tr('daemon.repo_scan_in_progress', undefined, localeForBot(larkAppId)),
+            'text',
+            larkAppId,
+          );
+        } catch (fallbackErr) {
+          logger.warn(`[${tag(ds)}] Repo scan progress text fallback failed: ${fallbackErr instanceof Error ? fallbackErr.message : fallbackErr}`);
+        }
+      }
+    }
+    if (!pendingRepoScanStillOwnsRoute(ds, anchor, scanSessionId, repoScanCardMessageId)) {
+      ds.repoScanInFlight = false;
+      withdrawRepoScanProgressCard(ds, repoScanCardMessageId);
+      logger.info(`[${tag(ds)}] Repo scan skipped because the pending route changed before launch`);
+      return;
+    }
+
+    // The pending session and visible progress reply are now stable. Detach the
+    // expensive scan so the per-anchor serializer can release immediately;
+    // follow-ups and `/repo`/`/close` may then consume the same pending buffer.
+    void (async () => {
+      try {
+        let projects: import('./services/project-scanner.js').ProjectInfo[];
+        try {
+          projects = await scanMultipleProjectsAsync(scanDirs, 3, repoPickerScanOptions());
+        } catch (err) {
+          logger.warn(`[${tag(ds)}] Isolated repo scan failed: ${err instanceof Error ? err.message : err}`);
+          if (pendingRepoScanStillOwnsRoute(ds, anchor, scanSessionId, repoScanCardMessageId)) {
+            withdrawRepoScanProgressCard(ds, repoScanCardMessageId);
+            try {
+              await sessionReply(
+                anchor,
+                tr('daemon.repo_card_unavailable', undefined, localeForBot(larkAppId)),
+                'text',
+                larkAppId,
+              );
+            } catch (fallbackErr) {
+              logger.warn(`[${tag(ds)}] Repo scan recovery reply failed: ${fallbackErr instanceof Error ? fallbackErr.message : fallbackErr}`);
+            }
+          }
+          return;
+        }
+        if (!pendingRepoScanStillOwnsRoute(ds, anchor, scanSessionId, repoScanCardMessageId)) {
+          withdrawRepoScanProgressCard(ds, repoScanCardMessageId);
+          logger.info(`[${tag(ds)}] Discarding late repo scan result because the pending route changed`);
+          return;
+        }
+
+        if (projects.length > 0) {
+          lastRepoScan.set(chatId, projects);
+          const repoCardMessageId = await postPendingRepoSelectCard(ds, anchor, projects, repoScanCardMessageId);
+          const pendingRouteStillOwned = pendingRepoScanStillOwnsRoute(
+            ds,
+            anchor,
+            scanSessionId,
+            repoScanCardMessageId,
+          );
+          const pickerHandoffStillOwned = repoScanCardMessageId === undefined
+            || ds.repoCardMessageId === repoScanCardMessageId
+            || (repoCardMessageId === undefined && ds.repoCardMessageId === undefined);
+          if (!pendingRouteStillOwned || !pickerHandoffStillOwned) {
+            const pendingCommitTookOver = repoScanCardMessageId !== undefined
+              && repoCardMessageId === repoScanCardMessageId
+              && ds.pendingRepoCommitInFlight === true
+              && ds.repoCardMessageId === repoScanCardMessageId;
+            if (pendingCommitTookOver) {
+              ds.repoScanCardMessageId = undefined;
+              logger.info(`[${tag(ds)}] Repo picker handoff completed under the pending commit`);
+              return;
+            }
+            const newerPendingPickerTookOver = pendingRouteStillOwned
+              && ds.repoCardMessageId !== undefined
+              && ds.repoCardMessageId !== repoScanCardMessageId;
+            if (repoCardMessageId && repoCardMessageId !== repoScanCardMessageId) {
+              void deleteMessage(larkAppId, repoCardMessageId);
+            }
+            withdrawRepoScanProgressCard(ds, repoScanCardMessageId);
+            if (repoScanCardMessageId && ds.repoCardMessageId === repoScanCardMessageId) {
+              ds.repoCardMessageId = undefined;
+            }
+            if (!newerPendingPickerTookOver && lastRepoScan.get(chatId) === projects) {
+              lastRepoScan.delete(chatId);
+            }
+            logger.info(`[${tag(ds)}] Withdrawing late repo card because the pending route or picker changed during delivery`);
+            return;
+          }
+          ds.repoCardMessageId = repoCardMessageId;
+          if (repoCardMessageId && repoCardMessageId === repoScanCardMessageId) {
+            // The shared progress message is now the active picker. Transfer its
+            // authorization role without withdrawing the message users can see.
+            ds.repoScanCardMessageId = undefined;
+          } else {
+            withdrawRepoScanProgressCard(ds, repoScanCardMessageId);
+          }
+          logger.info(`[${tag(ds)}] Waiting for repo selection (${projects.length} projects)`);
+          return;
+        }
+
+        // A successful empty scan retains the old direct-start behavior. Reuse
+        // the pending commit transaction so messages buffered while the child
+        // was scanning are folded into the first turn instead of being dropped.
+        await commitRepoSelection(
+          {
+            ds,
+            rootId: anchor,
+            larkAppId,
+            operatorOpenId: senderOpenId,
+            activeSessions,
+            sessionReply: (rid, replyContent, msgType, turnId) =>
+              sessionReply(rid, replyContent, msgType, larkAppId, turnId),
+          },
+          getSessionWorkingDir(ds),
+          getSessionWorkingDir(ds),
+          {
+            suppressConfirmReply: true,
+            pinWorkingDir: false,
+            beforePendingFork: () => noteTurnReceived(
+              ds,
+              messageId,
+              content,
+              newTopicSender,
+              messageId,
+              substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined,
+            ),
+          },
+        );
+        if (ds.worker && !ds.worker.killed) {
+          logger.info(`Session ${session.sessionId} ready (no projects to select), total active: ${getActiveCount()}`);
+        }
+      } catch (err) {
+        logger.warn(`[${tag(ds)}] Detached repo scan completion failed: ${err instanceof Error ? err.message : err}`);
+        if (pendingRepoScanStillOwnsRoute(ds, anchor, scanSessionId, repoScanCardMessageId)) {
+          withdrawRepoScanProgressCard(ds, repoScanCardMessageId);
+          try {
+            await sessionReply(
+              anchor,
+              tr('daemon.repo_card_unavailable', undefined, localeForBot(larkAppId)),
+              'text',
+              larkAppId,
+            );
+          } catch (fallbackErr) {
+            logger.warn(`[${tag(ds)}] Repo scan completion recovery reply failed: ${fallbackErr instanceof Error ? fallbackErr.message : fallbackErr}`);
+          }
+        }
+      } finally {
+        ds.repoScanInFlight = false;
+      }
+    })();
+    return;
   }
+
+  // No scan roots found — preserve the original immediate-start path.
+  ds.pendingRepo = false;
+  const selfBot = getBot(larkAppId);
+  ensureSessionWhiteboard(ds);
+  const prompt = buildNewTopicCliInput(promptContent, session.sessionId, botCfg.cliId, botCfg.cliPathOverride, attachments, parsed.mentions, await getAvailableBots(larkAppId, chatId), undefined, { name: selfBot.botName, openId: selfBot.botOpenId }, localeForBot(larkAppId), newTopicSender, { larkAppId, chatId, whiteboardId: ds.session.whiteboardId, substituteTrigger, codexAppText: codexAppVisibleText, codexAppApplicationContext, codexAppMessageContext });
+  await noteTurnReceived(ds, messageId, content, newTopicSender, messageId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
+  rememberLastCliInput(ds, promptContent, prompt);
+  forkWorker(ds, prompt, { turnId: messageId });
+  ds.pendingTurnId = undefined;
+  logger.info(`Session ${session.sessionId} ready (no projects to select), total active: ${getActiveCount()}`);
 }
 
 // 主动开工 — 场景①: in-flight lock so two near-simultaneous `bot.added` events
@@ -16765,14 +17093,13 @@ async function handleBotAdded(
     const projects = scanDirs.length > 0 ? scanMultipleProjects(scanDirs, 3, repoPickerScanOptions()) : [];
     if (projects.length > 0) {
       lastRepoScan.set(chatId, projects);
-      const cardJson = buildRepoSelectCard(projects, getSessionWorkingDir(ds), anchor, localeForBot(larkAppId), getBot(larkAppId).config.worktreeMultiPicker);
       // The repo card itself belongs under the shared join seed. Arm the target
       // immediately before its single network await; pendingRepo already makes
       // this a stable buffered state for normal inbound/scheduler paths.
       armSharedReplyTarget();
-      const repoCardMessageId = await sessionReply(anchor, cardJson, 'interactive', larkAppId);
+      const repoCardMessageId = await postPendingRepoSelectCard(ds, anchor, projects);
       if (joinBootstrapWasTakenOver()) {
-        void deleteMessage(larkAppId, repoCardMessageId);
+        if (repoCardMessageId) void deleteMessage(larkAppId, repoCardMessageId);
         // If another entry actually started this same ds, its output still owns
         // the shared seed we just armed. Preserve that root; closed/replaced
         // candidates may withdraw it.
@@ -17468,12 +17795,19 @@ async function handleThreadReply(
         codexAppApplicationContext,
       );
     }
+    // The progress card already says that messages are queued. Keep buffering
+    // silently instead of posting the same scan notice for every follow-up.
+    if (ds.repoScanInFlight && ds.repoScanCardMessageId) return;
     // Auto-worktree pending (worktreeCreating) has no repo card to point at — the
     // message IS buffered (folded on commit), so just say "hold on, building worktree"
     // instead of the misleading "pick a repo from the card above".
     const pendingReplyKey = (ds.worktreeCreating || ds.pendingRepoCommitInFlight)
       ? 'daemon.worktree_building_wait'
-      : 'daemon.choose_repo_first';
+      : ds.repoScanInFlight
+        ? 'daemon.repo_scan_in_progress'
+        : ds.repoCardMessageId
+          ? 'daemon.choose_repo_first'
+          : 'daemon.repo_card_unavailable';
     await sessionReply(anchor, tr(pendingReplyKey, undefined, localeForBot(larkAppId)), 'text', larkAppId);
     return;
   }
@@ -17663,9 +17997,7 @@ async function handleThreadReply(
     }
     if (projects.length > 0) {
       lastRepoScan.set(autoCreateChatId, projects);
-      const currentCwd = getSessionWorkingDir(newDs);
-      const cardJson = buildRepoSelectCard(projects, currentCwd, anchor, localeForBot(larkAppId), getBot(larkAppId).config.worktreeMultiPicker);
-      newDs.repoCardMessageId = await sessionReply(anchor, cardJson, 'interactive', larkAppId);
+      newDs.repoCardMessageId = await postPendingRepoSelectCard(newDs, anchor, projects);
       announcePendingRepoSession(newDs);
       logger.info(`[${tag(newDs)}] Waiting for repo selection (${projects.length} projects)`);
     } else {

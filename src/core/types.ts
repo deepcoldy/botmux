@@ -89,10 +89,14 @@ export interface DaemonSession {
    *  都会重报，daemon 重启后自愈。仅有写权限的 dashboard 视图经 spawn-command 接口取。 */
   spawnCommand?: string;
   pendingRepo?: boolean;         // waiting for repo selection before spawning CLI
+  /** The initial repo list is being prepared outside the daemon process. */
+  repoScanInFlight?: boolean;
   /** One in-memory owner is preparing the pending repo's first worker. Kept
    *  separate from worktreeCreating because plain select, skip, and /repo can
    *  also await prompt context before the fork. */
   pendingRepoCommitInFlight?: boolean;
+  /** Inert progress card shown while the initial repository scan is running. */
+  repoScanCardMessageId?: string;
   repoCardMessageId?: string;    // message_id of the repo selection card — for withdrawal
   /**
    * Repo-select card message ids already consumed by a successful pending→worker
