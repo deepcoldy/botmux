@@ -90,6 +90,7 @@ export type BotDefaultsRow = {
   substituteMode?: BotSubstituteMode | null;
   docSubscribeDefaultMode?: string;
   maxLiveWorkers?: number | null;
+  maxSessionRssMiB?: number | null;
   logicalSessionCount?: number;
   residentSessionCount?: number;
   dormantSessionCount?: number;

@@ -464,6 +464,24 @@ describe('bot-config store', () => {
     expect(registry.getBot('app_default').config.maxLiveWorkers).toBeUndefined();
   });
 
+  it('number field (maxSessionRssMiB) round-trips and clears on null', async () => {
+    const { registry, store } = await loaded();
+    const spec = store.findConfigField('maxSessionRssMiB')!;
+    expect(spec.kind).toBe('number');
+    expect(spec.effect).toBe('immediate');
+
+    const r1 = await store.applyConfigField('app_default', spec, 4096);
+    expect(r1.ok).toBe(true);
+    if (r1.ok) { expect(r1.oldText).toBe('∅'); expect(r1.newText).toBe('4096'); }
+    expect(readConfig().maxSessionRssMiB).toBe(4096);
+    expect(registry.getBot('app_default').config.maxSessionRssMiB).toBe(4096);
+
+    const r2 = await store.applyConfigField('app_default', spec, null);
+    expect(r2.ok).toBe(true);
+    expect(readConfig().maxSessionRssMiB).toBeUndefined();
+    expect(registry.getBot('app_default').config.maxSessionRssMiB).toBeUndefined();
+  });
+
   it('coerceConfigValue(number) accepts positive integers and rejects junk/≤0/fractions', async () => {
     const { store } = await loaded();
     const spec = store.findConfigField('maxLiveWorkers')!;

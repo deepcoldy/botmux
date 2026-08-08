@@ -178,6 +178,22 @@ describe('parseBotConfigsFromText — brand', () => {
     }
   });
 
+  it('keeps a positive-integer maxSessionRssMiB guard threshold', () => {
+    const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([
+      { larkAppId: 'a', larkAppSecret: 's', maxSessionRssMiB: 4096 },
+    ]));
+    expect(cfg.maxSessionRssMiB).toBe(4096);
+  });
+
+  it('drops invalid maxSessionRssMiB values to undefined', () => {
+    for (const bad of [0, -2, 1.5, '4096', null] as const) {
+      const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([
+        { larkAppId: 'a', larkAppSecret: 's', maxSessionRssMiB: bad },
+      ]));
+      expect(cfg.maxSessionRssMiB).toBeUndefined();
+    }
+  });
+
   it('keeps a trimmed displayName and drops blank/non-string values', () => {
     const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([
       { larkAppId: 'a', larkAppSecret: 's', displayName: '  小助手  ' },
