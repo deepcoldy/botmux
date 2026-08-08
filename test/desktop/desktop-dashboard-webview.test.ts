@@ -400,13 +400,60 @@ describe('desktop dashboard embed', () => {
     expect(styleSource).toContain('.runtime-action[hidden]');
     expect(styleSource).toContain('.runtime-action svg');
     expect(styleSource).toContain('.runtime-action-takeover');
-    expect(styleSource).toContain('grid-column: 1 / -1');
+    // Visible actions flex to fill the row because state-irrelevant buttons hide.
+    expect(styleSource).toContain('flex-wrap: wrap');
+    expect(styleSource).toContain('flex: 1 1 100%');
     expect(html).toContain('footer-meta-row');
     expect(html).toContain('开机启动 App');
-    expect(styleSource).toContain('grid-template-columns: repeat(3, minmax(0, 1fr))');
     expect(styleSource).toContain('grid-template-columns: minmax(0, 1fr)');
-    expect(styleSource).toContain('text-align: left');
+    // The bottom version line centers under evenly spaced footer rows.
+    expect(styleSource).toContain('justify-content: space-between');
+    expect(styleSource).toContain('text-align: center');
     expect(styleSource).toContain('-webkit-line-clamp: 2');
+  });
+
+  it('shows only state-relevant runtime actions', () => {
+    const rendererSource = readFileSync(
+      fileURLToPath(new URL('../../src/desktop/renderer/app.ts', import.meta.url)),
+      'utf-8',
+    );
+
+    // Running-like states offer stop/restart; everything else offers start only.
+    const controlsFunction = /function paintControls[\s\S]*?function paintBridgeUnavailable/.exec(rendererSource)?.[0] ?? '';
+    expect(controlsFunction).toContain("status === 'running' || status === 'starting' || status === 'degraded'");
+    expect(controlsFunction).toContain('startBtn.hidden = runningLike');
+    expect(controlsFunction).toContain('stopBtn.hidden = !runningLike');
+    expect(controlsFunction).toContain('restartBtn.hidden = !runningLike');
+  });
+
+  it('renders launch-at-login as a switch with distinct on/off copy', () => {
+    const html = readFileSync(
+      fileURLToPath(new URL('../../src/desktop/renderer/index.html', import.meta.url)),
+      'utf-8',
+    );
+    const rendererSource = readFileSync(
+      fileURLToPath(new URL('../../src/desktop/renderer/app.ts', import.meta.url)),
+      'utf-8',
+    );
+    const styleSource = readFileSync(
+      fileURLToPath(new URL('../../src/desktop/renderer/style.css', import.meta.url)),
+      'utf-8',
+    );
+
+    // The hidden checkbox keeps label/a11y semantics; the sliding switch next
+    // to it is the visible control, and enabled state changes label copy/color.
+    expect(html).toMatch(/<input id="login-toggle" type="checkbox" role="switch"/);
+    expect(html).toContain('class="login-switch"');
+    expect(html).toContain('id="login-label"');
+    // The switch shares the status row: status reads left, switch right-aligns.
+    expect(html).toMatch(/<div class="runtime-line">[\s\S]*id="login-row"[\s\S]*?<\/div>\n\s*<div class="runtime-actions/);
+    expect(styleSource).toContain('grid-template-columns: 10px minmax(0, 1fr) auto');
+    expect(styleSource).toContain('.login-row input:checked ~ .login-switch');
+    expect(styleSource).toContain('.login-row input:focus-visible ~ .login-switch');
+    expect(styleSource).toContain('.login-row[data-enabled="true"] .login-label');
+    expect(rendererSource).toContain('function paintLoginState');
+    expect(rendererSource).toContain("'login.launchAtLoginOn'");
+    expect(rendererSource).toContain("'login.launchAtLoginOn': 'Launches at login'");
   });
 
   it('syncs desktop locale into the embedded dashboard', () => {
