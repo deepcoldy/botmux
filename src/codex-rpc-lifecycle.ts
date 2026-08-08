@@ -60,18 +60,34 @@ export function rpcTranscriptIngestBlockedByAwaitingActivation(
  *  returned by the latest begin() may publish process-global engine state. */
 export class RpcEngagementFence {
   private epoch = 0;
+  private deadEpoch: number | undefined;
 
   begin(): number {
     this.epoch += 1;
+    this.deadEpoch = undefined;
     return this.epoch;
   }
 
   invalidate(): void {
     this.epoch += 1;
+    this.deadEpoch = undefined;
   }
 
   isCurrent(lease: number): boolean {
     return lease === this.epoch;
+  }
+
+  /** Record an app-server death only for the engagement that owns it. A late
+   *  callback from an older engine must not poison a replacement generation. */
+  markDead(lease: number): void {
+    if (this.isCurrent(lease)) this.deadEpoch = lease;
+  }
+
+  /** Publication requires both generation ownership and a live app-server.
+   *  `onDead` can run after the last awaited RPC response but before the worker
+   *  stores the engine globally, so generation freshness alone is insufficient. */
+  isLive(lease: number): boolean {
+    return this.isCurrent(lease) && this.deadEpoch !== lease;
   }
 }
 

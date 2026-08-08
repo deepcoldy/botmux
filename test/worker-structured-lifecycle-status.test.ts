@@ -420,6 +420,30 @@ describe('worker structured-turn status wiring', () => {
     expect(stop).toContain('codexBridgeQueue.dropPendingTurn(turn.turnId, turn.dispatchAttempt, true)');
   });
 
+  it('never publishes a dead pre-publication RPC engine or pastes an already-dispatched fresh turn', () => {
+    const engage = functionSlice('engageCodexRpc', 'armRpcStartupDialogDismiss');
+    const onDead = engage.indexOf('rpcEngagementFence.markDead(engagementLease)');
+    const publish = engage.indexOf('codexRpcEngine = engine;');
+    expect(onDead).toBeGreaterThanOrEqual(0);
+    expect(onDead).toBeLessThan(publish);
+    expect(engage).toContain('if (!rpcEngagementFence.isLive(engagementLease))');
+
+    const send = engage.indexOf('await engine.sendFirstTurn(');
+    const ownership = engage.indexOf("freshDeliveryOwned = first.outcome !== 'not-sent';", send);
+    const postSendFence = engage.indexOf('assertRpcEngagementCurrent();', ownership);
+    expect(ownership).toBeGreaterThan(send);
+    expect(postSendFence).toBeGreaterThan(ownership);
+    expect(postSendFence).toBeLessThan(publish);
+
+    const abort = engage.indexOf(
+      'if (err instanceof CodexRpcEngineDiedDuringEngagementError && freshDeliveryOwned)',
+    );
+    const pasteFallback = engage.indexOf('falling back to paste mode', abort);
+    expect(abort).toBeGreaterThan(publish);
+    expect(engage.slice(abort, pasteFallback)).toContain('throw err;');
+    expect(engage.slice(abort, pasteFallback)).not.toContain("return 'not-engaged'");
+  });
+
   it('does not synthesize prompt-ready after a conclusively failed unstarted submit', () => {
     const cleanup = functionSlice('dropFailedBridgeMark', 'scheduleSubmitFailureNotify');
     expect(cleanup).toContain('codexBridgeQueue.dropPendingTurn(bridgeTurnId, dispatchAttempt)');

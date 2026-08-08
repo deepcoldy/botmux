@@ -1055,9 +1055,13 @@ async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): P
   const engagementLease = rpcEngagementFence.begin();
   let engine: CodexRpcEngine | undefined;
   let enginePidMarker: string | null = null;
+  let freshDeliveryOwned = false;
   const assertRpcEngagementCurrent = (): void => {
     if (!rpcEngagementFence.isCurrent(engagementLease)) {
       throw new CliSpawnSupersededError();
+    }
+    if (!rpcEngagementFence.isLive(engagementLease)) {
+      throw new CodexRpcEngineDiedDuringEngagementError();
     }
   };
   try {
@@ -1110,6 +1114,12 @@ async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): P
         });
       },
       onDead: () => {
+        // Death can race after the final awaited response but before the engine
+        // is published below. Record it against this exact engagement even when
+        // codexRpcEngine is still undefined; otherwise the continuation can
+        // publish a permanently dead/deadNotified engine whose later failures
+        // can no longer trigger onDead recovery.
+        rpcEngagementFence.markDead(engagementLease);
         if (codexRpcEngine === engine) {
           log('Codex RPC app-server died; replacing the tmux session and re-engaging the thread');
           // failAll() rejects the active sendTurn promise immediately after this
@@ -1154,6 +1164,7 @@ async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): P
       // 'ambiguous' (dispatched, unconfirmed → engaged but NEVER resend).
       const first = await engine.sendFirstTurn(cfg.prompt, firstIdentity,
         (tid) => codexRolloutProbe(cfg.cliId, tid, cfg.prompt, 12_000));
+      freshDeliveryOwned = first.outcome !== 'not-sent';
       // restart/close may have settled this exact attempt as ambiguous while the
       // rollout probe was pending. Fence before ANY durable/bridge/global engine
       // mutation; a superseded delivery is never pasted or re-queued.
@@ -1276,6 +1287,17 @@ async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): P
         ? err
         : new CliSpawnSupersededError();
     }
+    if (err instanceof CodexRpcEngineDiedDuringEngagementError && freshDeliveryOwned) {
+      // The first frame may already have executed. Never turn this into
+      // `not-engaged`, because the init path would paste the same prompt into a
+      // native viewer and duplicate side effects. Tear down exact local state
+      // and fail the worker generation so durable recovery owns the next step.
+      log('Codex RPC app-server died after the fresh delivery boundary; aborting init without paste fallback');
+      clearRpcEnginePidMarker();
+      try { engine?.stop(); } catch { /* best effort */ }
+      stopCodexRpcEngine();
+      throw err;
+    }
     log(`Codex RPC input failed to start (${err?.message ?? err}); falling back to paste mode`);
     clearRpcEnginePidMarker();
     try { engine?.stop(); } catch { /* best effort */ }   // P1-3a: stop the LOCAL ref (codexRpcEngine may be unassigned)
@@ -1341,6 +1363,13 @@ class CliSpawnSupersededError extends Error {
   constructor() {
     super('CLI spawn was superseded by a newer lifecycle operation');
     this.name = 'CliSpawnSupersededError';
+  }
+}
+
+class CodexRpcEngineDiedDuringEngagementError extends Error {
+  constructor() {
+    super('Codex RPC app-server died before engagement publication');
+    this.name = 'CodexRpcEngineDiedDuringEngagementError';
   }
 }
 let cliPidMarker: string | null = null;  // path to .botmux-cli-pids/<pid>

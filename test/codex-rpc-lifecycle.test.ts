@@ -102,6 +102,22 @@ describe('RpcEngagementFence', () => {
     expect(published).toBe(false);
     expect(requeued).toBe(false);
   });
+
+  it('rejects publication when the owned app-server dies after its last await', () => {
+    const fence = new RpcEngagementFence();
+    const lease = fence.begin();
+
+    expect(fence.isLive(lease)).toBe(true);
+    fence.markDead(lease);
+    expect(fence.isCurrent(lease)).toBe(true);
+    expect(fence.isLive(lease)).toBe(false);
+
+    // A delayed death callback from the retired engine must not poison the
+    // replacement engagement.
+    const replacementLease = fence.begin();
+    fence.markDead(lease);
+    expect(fence.isLive(replacementLease)).toBe(true);
+  });
 });
 
 describe('codexRpcEligible — every fail-closed gate degrades to paste', () => {
