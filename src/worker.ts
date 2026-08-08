@@ -5943,8 +5943,14 @@ function finalizeRpcTurnTerminal(
     codexBridgeQueue.dropPendingTurn(identity.turnId, identity.dispatchAttempt, true);
   }
 
+  // RPC `aborted` means the turn had already started executing before it was
+  // interrupted, so its side effects may have already run. Map it to
+  // `ambiguous` (fail-closed, no auto-retry) to match the transcript path
+  // (codex-transcript.ts turn_aborted -> ambiguous). Only a genuine app-server
+  // `failed` is retryable. Otherwise durable delivery would auto-redispatch and
+  // re-run already-executed side effects — exactly what this PR guards against.
   const status = terminal.status === 'completed' ? 'completed'
-    : terminal.status === 'failed' || terminal.status === 'aborted' ? 'failed'
+    : terminal.status === 'failed' ? 'failed'
       : 'ambiguous';
   const errorCode = terminal.errorCode
     ?? (terminal.status === 'engine-dead' ? 'rpc_engine_dead'

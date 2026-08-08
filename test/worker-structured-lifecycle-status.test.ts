@@ -395,7 +395,11 @@ describe('worker structured-turn status wiring', () => {
     const finalize = functionSlice('finalizeRpcTurnTerminal', 'hydrateCompletedRpcTurn');
     expect(finalize).toContain('settlingRpcTerminalOwners.get(ownerKey)');
     expect(finalize).toContain('codexBridgeQueue.dropPendingTurn(identity.turnId, identity.dispatchAttempt, true)');
-    expect(finalize).toContain("terminal.status === 'failed' || terminal.status === 'aborted'");
+    // RPC `aborted` must NOT be lumped with `failed`: aborted turns may have
+    // already executed side effects, so they map to `ambiguous` (no auto-retry),
+    // matching the transcript path. Only a genuine `failed` stays retryable.
+    expect(finalize).toContain("terminal.status === 'failed' ? 'failed'");
+    expect(finalize).not.toContain("terminal.status === 'failed' || terminal.status === 'aborted'");
     expect(finalize).toContain("terminal.status === 'engine-dead'");
     expect(finalize).toContain("terminal.status === 'stopped'");
 
