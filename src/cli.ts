@@ -4927,6 +4927,7 @@ async function postSessionCliIpc(
       resolveDataDir(),
       sessionId,
       process.env.BOTMUX_SEND_RELAY,
+      process.env.BOTMUX_ORIGIN_CHANNEL_ID,
     );
     if (claim) {
       requestBody.originCapability = claim.capability;
