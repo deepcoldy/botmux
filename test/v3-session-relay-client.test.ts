@@ -4,7 +4,9 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 
 import {
+  managedOriginCapabilityDirectory,
   managedOriginCapabilityPath,
+  MANAGED_ORIGIN_CAPABILITY_DIR_ENV,
   RELAY_ORIGIN_CAPABILITY_BASENAME,
 } from '../src/core/managed-origin-capability.js';
 import { WorkflowDaemonMutationTransportError } from '../src/workflows/v3/daemon-ipc-client.js';
@@ -107,6 +109,33 @@ describe('readWorkflowSessionRelayContext', () => {
       capability: CAPABILITY,
       turnId: 'turn-7',
       dispatchAttempt: 2,
+    });
+  });
+
+  it('detects a credential-only session via its private capability directory', () => {
+    const privateDir = managedOriginCapabilityDirectory(dataDir, 'sess-1');
+    mkdirSync(privateDir, { recursive: true });
+    writeFileSync(
+      join(privateDir, RELAY_ORIGIN_CAPABILITY_BASENAME),
+      JSON.stringify({
+        sessionId: 'sess-1',
+        capability: CAPABILITY,
+        turnId: 'turn-private',
+      }),
+    );
+    const context = readWorkflowSessionRelayContext({
+      env: {
+        BOTMUX_SESSION_ID: 'sess-1',
+        [MANAGED_ORIGIN_CAPABILITY_DIR_ENV]: privateDir,
+        BOTMUX_DAEMON_IPC_PORT: '4310',
+      },
+      dataDir,
+    });
+    expect(context).toMatchObject({
+      sessionId: 'sess-1',
+      capability: CAPABILITY,
+      turnId: 'turn-private',
+      ipcPortFallback: 4310,
     });
   });
 

@@ -5,6 +5,7 @@ import {
 import { dirname, join } from 'node:path';
 
 export const RELAY_ORIGIN_CAPABILITY_BASENAME = '.botmux-origin-capability.json';
+export const MANAGED_ORIGIN_CAPABILITY_DIR_ENV = 'BOTMUX_ORIGIN_CAPABILITY_DIR';
 
 export interface ManagedOriginCapabilityClaim {
   sessionId: string;
@@ -23,6 +24,17 @@ export interface ManagedOriginCapabilityClaim {
 export function managedOriginCapabilityPath(dataDir: string, sessionId: string): string {
   const digest = createHash('sha256').update(sessionId).digest('hex');
   return join(dataDir, 'read-isolation', `origin-${digest}.json`);
+}
+
+/**
+ * Host directory bound read-only into a credential-only bwrap session. The
+ * enclosing read-isolation directory is masked first, so sibling sessions'
+ * capabilities remain invisible; binding a directory (rather than one file)
+ * also lets atomic rename-based rotations become visible to the child.
+ */
+export function managedOriginCapabilityDirectory(dataDir: string, sessionId: string): string {
+  const digest = createHash('sha256').update(sessionId).digest('hex');
+  return join(dataDir, 'read-isolation', `origin-${digest}`);
 }
 
 /**
@@ -60,12 +72,15 @@ export function readManagedOriginCapability(
   dataDir: string,
   sessionId: string | undefined,
   relayDir?: string,
+  privateDir: string | undefined = process.env[MANAGED_ORIGIN_CAPABILITY_DIR_ENV],
 ): ManagedOriginCapabilityClaim | null {
   if (!sessionId) return null;
   const relay = !!relayDir;
   const path = relay
     ? join(relayDir!, RELAY_ORIGIN_CAPABILITY_BASENAME)
-    : managedOriginCapabilityPath(dataDir, sessionId);
+    : privateDir
+      ? join(privateDir, RELAY_ORIGIN_CAPABILITY_BASENAME)
+      : managedOriginCapabilityPath(dataDir, sessionId);
   try {
     const parsed = JSON.parse(readFileSync(path, 'utf8')) as {
       sessionId?: unknown;
@@ -113,8 +128,9 @@ export function hasMatchingManagedOriginCapability(
   sessionId: string | undefined,
   expectedCapability: string | undefined,
   relayDir?: string,
+  privateDir?: string,
 ): boolean {
   if (!expectedCapability) return false;
-  return readManagedOriginCapability(dataDir, sessionId, relayDir)?.capability
+  return readManagedOriginCapability(dataDir, sessionId, relayDir, privateDir)?.capability
     === expectedCapability;
 }

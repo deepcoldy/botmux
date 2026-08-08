@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import {
   hasMatchingManagedOriginCapability,
+  managedOriginCapabilityDirectory,
   managedOriginCapabilityPath,
   readManagedOriginCapability,
   RELAY_ORIGIN_CAPABILITY_BASENAME,
@@ -91,6 +92,27 @@ describe('managed origin capability transport', () => {
     });
     writeFileSync(relayPath, JSON.stringify({ token: 'not-a-capability' }));
     expect(readManagedOriginCapability(dir, 'session-a', relay)).toBeNull();
+  });
+
+  it('reads a rotating claim from a credential-only private directory', () => {
+    const dir = makeDir();
+    const sessionId = 'session-private';
+    const privateDir = managedOriginCapabilityDirectory(dir, sessionId);
+    const capabilityPath = join(privateDir, RELAY_ORIGIN_CAPABILITY_BASENAME);
+    replaceManagedOriginCapabilityFile(capabilityPath, JSON.stringify({
+      sessionId,
+      capability: 'fa'.repeat(32),
+      turnId: 'turn-private',
+      dispatchAttempt: 3,
+    }));
+
+    expect(readManagedOriginCapability(dir, sessionId, undefined, privateDir)).toEqual({
+      sessionId,
+      capability: 'fa'.repeat(32),
+      turnId: 'turn-private',
+      dispatchAttempt: 3,
+    });
+    expect(readManagedOriginCapability(dir, 'session-other', undefined, privateDir)).toBeNull();
   });
 
   it('ready preflight rejects stale, malformed, and non-file relay capabilities', () => {

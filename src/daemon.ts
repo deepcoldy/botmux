@@ -152,11 +152,17 @@ import {
   waitForSessionReadyAck,
 } from './core/session-ready-handshake.js';
 import { loadOrCreateDashboardSecret } from './dashboard/auth.js';
-import { daemonIpcAuthHeaders, loadDaemonIpcSecret } from './core/daemon-ipc-auth.js';
+import { daemonIpcAuthHeaders, fetchDaemonIpc, loadDaemonIpcSecret } from './core/daemon-ipc-auth.js';
 import {
   authorizeSessionScopedIpc,
   bindSessionScopedIpcIdentity,
 } from './core/daemon-ipc-session-auth.js';
+import {
+  authorizeReportSessionRelayRequest,
+  buildOrchestratorReportTrigger,
+  REPORT_SESSION_RELAY_MAX_BYTES,
+  REPORT_SESSION_RELAY_ROUTE,
+} from './core/report-session-relay.js';
 import { saveFrozenCards, deleteFrozenCards } from './services/frozen-card-store.js';
 import { DAEMON_COMMANDS, SESSIONLESS_DAEMON_COMMANDS, EXISTING_SESSION_ONLY_DAEMON_COMMANDS, resolvePassthroughCommands, resolveAdapterDefaultPassthroughCommands, handleCommand, handleCardCommand, handleTermLinkCommand, parseSlashCommandInvocation, parseForceTopicInvocation } from './core/command-handler.js';
 import { docWatchCommandNeedsSession } from './core/doc-watch-command.js';
@@ -5029,6 +5035,88 @@ workflowDaemonMutationRoute('grant', async (reply, params, body, identity) => {
   // granted / already-granted → make sure the run is moving.
   v3GateRunner.driveDetached(runId);
   return reply(202, { ok: true, runId, ...outcome });
+});
+
+// ─── report session relay：隔离 CLI 的 dispatch 完成回注 ──────────────────
+//
+// Linux credential-only bwrap / macOS read isolation 都
+// 不允许 CLI 读取 `.dashboard-secret`。这里验证 source session 当前轮换的
+// capability，并把 dispatch root 与 daemon 自己的 live session 绑定；目标
+// app/session 只从宿主 dispatch registry 派生，再由本 daemon 用 HMAC 转发。
+ipcRoute('POST', REPORT_SESSION_RELAY_ROUTE, async (req, res) => {
+  let raw: unknown;
+  try {
+    raw = await readJsonBody<unknown>(req, REPORT_SESSION_RELAY_MAX_BYTES);
+  } catch (error) {
+    if (error instanceof JsonBodyTooLargeError) {
+      return jsonRes(res, 413, { ok: false, error: 'body_too_large' });
+    }
+    return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+  }
+  const claimedSessionId = raw && typeof raw === 'object' && !Array.isArray(raw)
+    ? (raw as Record<string, unknown>).sessionId
+    : undefined;
+  const ds = typeof claimedSessionId === 'string'
+    ? findActiveBySessionId(claimedSessionId)
+    : undefined;
+  let registry: Record<string, unknown> = {};
+  try {
+    const parsed = JSON.parse(readFileSync(
+      join(config.session.dataDir, 'orchestrate-dispatch.json'),
+      'utf8',
+    ));
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      registry = parsed as Record<string, unknown>;
+    }
+  } catch { /* missing/malformed registry fails closed below */ }
+
+  const decision = authorizeReportSessionRelayRequest({
+    raw,
+    trustedHost: isTrustedHostIpcRequest(req),
+    session: ds
+      ? {
+          sessionId: ds.session.sessionId,
+          larkAppId: ds.larkAppId,
+          receiver: !!ds.session.vcMeetingReceiver,
+          scope: ds.scope ?? ds.session.scope,
+          rootMessageId: ds.session.rootMessageId,
+          ...(ds.managedTurnOrigin ? { liveOrigin: ds.managedTurnOrigin } : {}),
+          ...(ds.session.quoteTargetId ? { quoteTargetId: ds.session.quoteTargetId } : {}),
+          ...((ds.currentReplyTarget ?? ds.session.currentReplyTarget)
+            ? { currentReplyTarget: ds.currentReplyTarget ?? ds.session.currentReplyTarget }
+            : {}),
+        }
+      : undefined,
+    selfLarkAppId: selfDaemonLarkAppId,
+    registry,
+  });
+  if (!decision.ok) {
+    return jsonRes(res, decision.status, { ok: false, error: decision.error });
+  }
+
+  const targetDaemon = findOnlineDaemon(decision.target.larkAppId);
+  if (!targetDaemon) {
+    return jsonRes(res, 503, { ok: false, error: 'orchestrator_daemon_offline' });
+  }
+  const trigger = buildOrchestratorReportTrigger(decision, {
+    requestId: `report:${decision.source.sessionId}:${Date.now()}`,
+    receivedAt: new Date().toISOString(),
+  });
+  try {
+    const response = await fetchDaemonIpc(targetDaemon.ipcPort, '/api/trigger', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(trigger),
+    });
+    const responseBody: unknown = await response.json().catch(() => ({}));
+    return jsonRes(res, response.status, responseBody);
+  } catch (error) {
+    return jsonRes(res, 502, {
+      ok: false,
+      error: 'orchestrator_daemon_unreachable',
+      detail: error instanceof Error ? error.message : String(error),
+    });
+  }
 });
 
 // ─── v3 session relay：sandbox / read-isolation 会话的 workflow 变更通道 ─────
