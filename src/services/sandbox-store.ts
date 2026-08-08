@@ -37,10 +37,14 @@ export function getBotReadIsolation(larkAppId: string): boolean {
   try { return getBot(larkAppId).config.readIsolation === true; } catch { return false; }
 }
 
-/** Restore only the daemon's live spawn view before an async persistence
- * rollback. This closes the otherwise observable window where a cold refork
- * could consume a transient read-isolation value while bots.json is being
- * rolled back after a Codex App ownership conflict. */
+/** Publish only the daemon's live spawn view (in-memory `botCfg.readIsolation`)
+ * without touching bots.json. Split out from {@link persistBotReadIsolation} so
+ * a future fence-then-publish caller can order the durable write and the
+ * worker-admission view independently — e.g. to close the window where a cold
+ * refork consumes a transient value while bots.json is rolled back after a
+ * Codex App ownership conflict. No caller stages the two halves yet;
+ * {@link updateBotReadIsolation} composes them in the usual persist→publish
+ * order, so today this only ever runs after a successful persist. */
 export function setBotReadIsolationRuntime(larkAppId: string, enabled: boolean): void {
   try {
     const cfg = getBot(larkAppId).config;
@@ -49,9 +53,12 @@ export function setBotReadIsolationRuntime(larkAppId: string, enabled: boolean):
   } catch { /* the preceding successful update already proves this in production */ }
 }
 
-/** Persist the desired flag without exposing it to worker admission yet.
- * Dashboard cold-restart mutations use this staged form so the daemon can
- * atomically fence all old generations before publishing the new spawn view. */
+/** Persist the desired flag to bots.json without publishing it to the live
+ * worker-admission view yet (see {@link setBotReadIsolationRuntime} for that
+ * half). Split from {@link updateBotReadIsolation} so a future caller can fence
+ * old generations between the durable write and the spawn-view publish; no
+ * caller stages the two halves today, so this runs as the first step of the
+ * composed {@link updateBotReadIsolation}. */
 export async function persistBotReadIsolation(
   larkAppId: string,
   enabled: boolean,
