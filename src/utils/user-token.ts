@@ -245,8 +245,6 @@ const DEFAULT_PORT = 9768;
 const DEFAULT_SCOPES = [
   'im:message:readonly',
   'im:resource',
-  'im:feed_group_v1:read',
-  'im:feed_group_v1:write',
   'offline_access',
 ].join(' ');
 

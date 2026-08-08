@@ -5222,18 +5222,18 @@ const server = createServer(async (req, res) => {
         const newFeedGroupName = typeof parsed.newFeedGroupName === 'string' ? parsed.newFeedGroupName.trim() : '';
         const feedGroupAppId = typeof parsed.feedGroupAppId === 'string' ? parsed.feedGroupAppId.trim() : '';
         if (upstream.ok && upstreamJson.ok && typeof upstreamJson.chatId === 'string' && (existingFeedGroupId || newFeedGroupName)) {
-          const feedBot = loadBotConfigs().find(bot => bot.larkAppId === feedGroupAppId && !bot.apiOnly);
-          if (!feedBot) {
-            upstreamJson.feedGroupError = '读取标签所用的机器人当前不可用。群聊已创建，但未加入标签。';
-          } else {
-            try {
+          try {
+            const feedBot = loadBotConfigs().find(bot => bot.larkAppId === feedGroupAppId && !bot.apiOnly);
+            if (!feedBot) {
+              upstreamJson.feedGroupError = '读取标签所用的机器人当前不可用。群聊已创建，但未加入标签。';
+            } else {
               const targetId = existingFeedGroupId || await createFeedGroup(feedBot, newFeedGroupName);
               await addChatToFeedGroup(feedBot, targetId, upstreamJson.chatId);
               upstreamJson.feedGroupId = targetId;
               upstreamJson.feedGroupName = newFeedGroupName || undefined;
-            } catch (error) {
-              upstreamJson.feedGroupError = error instanceof Error ? error.message : String(error);
             }
+          } catch (error) {
+            upstreamJson.feedGroupError = error instanceof Error ? error.message : String(error);
           }
         }
       }
@@ -5334,16 +5334,16 @@ const server = createServer(async (req, res) => {
       let feedGroupError = '';
       if (existingFeedGroupId || newFeedGroupName) {
         const feedGroupAppId = typeof parsed.feedGroupAppId === 'string' ? parsed.feedGroupAppId.trim() : '';
-        const feedBot = loadBotConfigs().find(bot => bot.larkAppId === feedGroupAppId && !bot.apiOnly);
-        if (!feedBot) {
-          feedGroupError = '读取标签所用的机器人当前不可用。';
-        } else {
-          try {
+        try {
+          const feedBot = loadBotConfigs().find(bot => bot.larkAppId === feedGroupAppId && !bot.apiOnly);
+          if (!feedBot) {
+            feedGroupError = '读取标签所用的机器人当前不可用。';
+          } else {
             feedGroupId = existingFeedGroupId || await createFeedGroup(feedBot, newFeedGroupName);
             await addChatToFeedGroup(feedBot, feedGroupId, chatId);
-          } catch (error) {
-            feedGroupError = error instanceof Error ? error.message : String(error);
           }
+        } catch (error) {
+          feedGroupError = error instanceof Error ? error.message : String(error);
         }
       }
 
