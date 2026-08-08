@@ -55,6 +55,7 @@ import { createMtrAdapter } from '../src/adapters/cli/mtr.js';
 import { createHermesAdapter } from '../src/adapters/cli/hermes.js';
 import { createMiraAdapter } from '../src/adapters/cli/mira.js';
 import { createPiAdapter } from '../src/adapters/cli/pi.js';
+import { createKimiAdapter } from '../src/adapters/cli/kimi.js';
 import { createGrokAdapter } from '../src/adapters/cli/grok.js';
 import { createKiroCliAdapter } from '../src/adapters/cli/kiro-cli.js';
 import type { CliAdapter, PtyHandle } from '../src/adapters/cli/types.js';
@@ -171,6 +172,7 @@ const PLAIN_ADAPTERS: AdapterEntry[] = [
 ];
 
 const OPENCODE_ADAPTER: AdapterEntry = ['opencode', createOpenCodeAdapter('/bin/opencode')];
+const KIMI_ADAPTER: AdapterEntry = ['kimi', createKimiAdapter('/bin/kimi')];
 
 /** Node runner adapters use a one-line base64 control protocol so multiline
  *  content cannot be split by terminal Enter semantics. */
@@ -195,10 +197,11 @@ const PASTE_BUFFER_ADAPTERS: AdapterEntry[] = [
 ];
 
 /** Adapters that wrap content in bracketed-paste markers (\x1b[200~ ... \x1b[201~)
- *  in non-tmux mode — claude-code and coco. */
+ *  in non-tmux mode. */
 const BRACKETED_PASTE_FALLBACK_ADAPTERS: AdapterEntry[] = [
   ...HUMAN_TYPING_ADAPTERS,
   ...PASTE_BUFFER_ADAPTERS,
+  KIMI_ADAPTER,
 ];
 
 const ALL_ADAPTERS: AdapterEntry[] = [
@@ -206,6 +209,7 @@ const ALL_ADAPTERS: AdapterEntry[] = [
   ...PASTE_BUFFER_ADAPTERS,
   ...PLAIN_ADAPTERS,
   OPENCODE_ADAPTER,
+  KIMI_ADAPTER,
   ...APP_RUNNER_ADAPTERS,
 ];
 
@@ -234,6 +238,15 @@ describe('writeInput: single-line, tmux mode', () => {
     expect(pty.pasteText).toHaveBeenCalledWith('hello world');
     expect(pty.sendSpecialKeys).toHaveBeenCalledWith('Enter');
     expect(pty.sendText).not.toHaveBeenCalled();
+  });
+
+  it('kimi: sends one explicit bracketed paste + Enter', async () => {
+    const [, adapter] = KIMI_ADAPTER;
+    const pty = makeTmuxPty();
+    await adapter.writeInput(pty, 'hello world');
+    expect(pty.sendText).toHaveBeenCalledWith('\x1b[200~hello world\x1b[201~');
+    expect(pty.sendSpecialKeys).toHaveBeenCalledWith('Enter');
+    expect(pty.pasteText).not.toHaveBeenCalled();
   });
 
   it.each(APP_RUNNER_ADAPTERS)('%s: sends a base64 runner control line + Enter', async (_name, adapter) => {
@@ -520,6 +533,15 @@ describe('writeInput: multiline, tmux mode', () => {
     expect(pty.sendText).not.toHaveBeenCalled();
     expect(pty.sendSpecialKeys).toHaveBeenCalledWith('Enter');
   });
+
+  it('kimi: preserves multiline content inside one explicit bracketed paste', async () => {
+    const [, adapter] = KIMI_ADAPTER;
+    const pty = makeTmuxPty();
+    await adapter.writeInput(pty, MULTILINE);
+    expect(pty.sendText).toHaveBeenCalledWith(`\x1b[200~${MULTILINE}\x1b[201~`);
+    expect(pty.sendSpecialKeys).toHaveBeenCalledWith('Enter');
+    expect(pty.pasteText).not.toHaveBeenCalled();
+  });
 });
 
 describe('writeInput: multiline, non-tmux mode', () => {
@@ -571,6 +593,16 @@ describe('writeInput: multiline preserves unicode and session IDs', () => {
     await adapter.writeInput(pty, followUp);
 
     expect(pty.pasteText).toHaveBeenCalledWith(followUp);
+    expect(pty.sendSpecialKeys).toHaveBeenLastCalledWith('Enter');
+  });
+
+  it('kimi: unicode content round-trips inside bracketed-paste markers', async () => {
+    const [, adapter] = KIMI_ADAPTER;
+    const pty = makeTmuxPty();
+    const followUp = '帮我看看\n\nSession ID: dece91fd-abc';
+    await adapter.writeInput(pty, followUp);
+
+    expect(pty.sendText).toHaveBeenCalledWith(`\x1b[200~${followUp}\x1b[201~`);
     expect(pty.sendSpecialKeys).toHaveBeenLastCalledWith('Enter');
   });
 });
@@ -647,6 +679,34 @@ describe('writeInput: edge cases', () => {
     const pty = makeTmuxPty();
     await adapter.writeInput(pty, '');
     expect(pty.sendSpecialKeys).toHaveBeenCalledWith('Enter');
+  });
+
+  it('kimi: reports a failed submission when Enter is rejected', async () => {
+    const adapter = createKimiAdapter('/bin/kimi');
+    const pty = {
+      write: vi.fn(),
+      sendText: vi.fn(),
+      sendSpecialKeys: vi.fn(() => false),
+    } satisfies PtyHandle;
+
+    const result = await adapter.writeInput(pty, MULTILINE);
+
+    expect(pty.sendText).toHaveBeenCalledWith(`\x1b[200~${MULTILINE}\x1b[201~`);
+    expect(result).toEqual({ submitted: false });
+  });
+
+  it('kimi: reports a failed submission when the text transport throws', async () => {
+    const adapter = createKimiAdapter('/bin/kimi');
+    const pty = {
+      write: vi.fn(),
+      sendText: vi.fn(() => { throw new Error('pane disappeared'); }),
+      sendSpecialKeys: vi.fn(),
+    } satisfies PtyHandle;
+
+    const result = await adapter.writeInput(pty, MULTILINE);
+
+    expect(pty.sendSpecialKeys).not.toHaveBeenCalled();
+    expect(result).toEqual({ submitted: false });
   });
 
   it('claude-code: image path in multiline still types via sendText', async () => {
