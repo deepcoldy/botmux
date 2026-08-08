@@ -1,5 +1,6 @@
 import * as sessionStore from '../services/session-store.js';
 import * as asyncTriggerStore from '../services/async-trigger-store.js';
+import * as idempotencyStore from '../services/idempotency-store.js';
 import * as groupsStore from '../services/groups-store.js';
 import * as oncallStore from '../services/oncall-store.js';
 import { randomUUID } from 'node:crypto';
@@ -10,14 +11,29 @@ import { localeForBot, t } from '../i18n/index.js';
 import { validateWorkingDir } from './working-dir.js';
 import { buildFollowUpCliInput, buildNewTopicCliInput, ensureSessionWhiteboard, getAvailableBots, rememberLastCliInput } from './session-manager.js';
 import { markSessionActivity } from './session-activity.js';
-import { closeSession, forkWorker, getCurrentCliVersion, sendWorkerInput, setActiveSessionIfActive } from './worker-pool.js';
+import {
+  closeSession,
+  forkWorker,
+  getCurrentCliVersion,
+  getDaemonBootId,
+  hasQueuedActivationAdmissionGate,
+  sendWorkerInput,
+  setActiveSessionIfActive,
+  withActiveSessionKeyLock,
+} from './worker-pool.js';
 import { armTriggerFinalSuppression, disarmTriggerFinalSuppression, inheritTriggerReplyAnchor } from './trigger-final-suppression.js';
 import { botAutoWorktreeEnabled } from '../services/default-worktree.js';
+import { currentDeviceIsolationFreezeLease } from './device-isolation-activation.js';
 import * as messageQueue from '../services/message-queue.js';
 import type { DaemonSession } from './types.js';
-import { sessionKey, larkTransportEnabled, isHttpVirtualSession } from './types.js';
+import { activeSessionKey, sessionKey, larkTransportEnabled, isHttpVirtualSession } from './types.js';
 import type { TriggerRequest, TriggerResponse } from '../services/trigger-types.js';
+import { computeInputHash } from '../utils/canonical-input-hash.js';
+import { logger } from '../utils/logger.js';
 import type { CliTurnPayload } from '../types.js';
+import { withBotTurnAdmission } from './bot-turn-mutation-gate.js';
+import { stagePendingRepoSetup } from './pending-repo-journal.js';
+import { hasProtectedSessionMutationOwnership } from './session-mutation-guard.js';
 
 export interface TriggerSessionDeps {
   larkAppId: string;
@@ -112,11 +128,20 @@ export function buildExternalEventDataContext(req: TriggerRequest, triggerId: st
   // 其他 connector 保持原有 pretty-print 行为不变。
   const compact = req.source.type === 'vc_meeting';
   const { rawText, ...envelopeRest } = req.envelope;
+  // idempotencyKey is transport metadata (dispatch lease lookup), deliberately
+  // NOT part of the business payload — the requestHash excludes it. It must be
+  // stripped from the RENDERED options too, or the raw pre-trim key leaks into
+  // the model prompt: `'k'` vs `' k '` trim to the same lease + identical
+  // hash-options yet would render different prompt JSON, so the second retry
+  // reuses silently while `prompt differs` — the exact seam codex #776 round-6
+  // finding #4 flagged. Stripping it keeps renderer and hash on the SAME
+  // normalized execution payload, so trim-equivalent keys are a legitimate reuse.
+  const { idempotencyKey: _omitRenderedKey, ...optionsForRender } = (req.options ?? {}) as Record<string, unknown>;
   const body = {
     triggerId,
     source: req.source,
     envelope: compact ? envelopeRest : req.envelope,
-    options: req.options ?? {},
+    options: optionsForRender,
   };
   const lines: string[] = [];
   lines.push(
@@ -165,6 +190,351 @@ function activeBySessionId(activeSessions: Map<string, DaemonSession>, sessionId
   return undefined;
 }
 
+type IdempotencyHitDecision =
+  | { kind: 'reuse'; chatId: string; message: string }
+  | { kind: 'terminal'; chatId: string; message: string }
+  | { kind: 'takeover' };
+
+/** Decide what a same-payload idempotency-key HIT means (at-most-once). The
+ *  TERMINAL outcome is owned by async-trigger-store (completed / failed), not by
+ *  the lease — so a durable failed (dispatch_unknown) or completed is checked
+ *  FIRST and wins over any lease state. The lease only distinguishes "in flight
+ *  / reserved by me" (reuse) from "older-boot reserved" (takeover). Exported for tests. */
+export function resolveIdempotencyHit(
+  hit: idempotencyStore.IdempotencyRecord,
+  ownerBootId: string,
+  activeSessions: Map<string, DaemonSession>,
+): IdempotencyHitDecision {
+  const live = activeBySessionId(activeSessions, hit.sessionId);
+  // "In flight" for reuse decisions means a genuinely EXECUTING worker, not mere
+  // registry presence. A worker that died with no final_output sets ds.worker=null
+  // but leaves the DaemonSession in activeSessions (worker-pool.ts exit handler),
+  // so `!!live` alone would wrongly report reuse/queued forever (codex #776
+  // round-6 finding #1). Require a non-killed worker. (The worker-exit handler
+  // also writes a durable dispatch_unknown that makes the owned-failed branch
+  // below fire first; this guard closes the race window before that write and any
+  // path where the stamp was absent.)
+  const liveWorker = !!live?.worker && !live.worker.killed;
+  // Owner-scoped session read: getOwnedSession returns a row ONLY from this
+  // process's own bot store, never another bot's sessions-*.json (getSession's
+  // cross-file fallback could surface a foreign session and leak its chatId —
+  // codex #776 round-4 finding #3).
+  const chatId = live?.chatId ?? sessionStore.getOwnedSession(hit.sessionId)?.chatId ?? '';
+  // Terminal async evidence is only trustworthy when it was written by the SAME
+  // owner as the lease. A cross-bot write to the same sessionId/triggerId (codex
+  // deterministically reproduced B's completed suppressing A's dispatch) is
+  // IGNORED — we fall through to this owner's lease state rather than adopt a
+  // foreign terminal. The idempotency async record is always owner-stamped
+  // (beginAsyncTrigger → recordPending with ds.larkAppId; reconcile's
+  // recordFailedStrict requires an owner), so requiring a match never rejects a
+  // legitimate own record, and an unstamped legacy record is correctly not
+  // trusted (a new idempotency turn has no unstamped evidence of its own).
+  const asyncRec = asyncTriggerStore.lookup(hit.sessionId, hit.triggerId);
+  let ownedOutcome: 'pending' | 'completed' | 'failed' | undefined;
+  if (asyncRec) {
+    if (asyncRec.ownerLarkAppId === hit.ownerLarkAppId) {
+      ownedOutcome = asyncRec.result.status;
+    } else {
+      logger.warn(`[idempotency] ignoring foreign async evidence for ${hit.sessionId}/${hit.triggerId}: record owner=${asyncRec.ownerLarkAppId ?? '(unstamped)'} != lease owner=${hit.ownerLarkAppId}`);
+    }
+  }
+  // Durable terminal evidence wins over lease state (completed > failed).
+  if (ownedOutcome === 'completed') {
+    return { kind: 'reuse', chatId, message: 'idempotency key already completed; reuse the session (poll trigger-result)' };
+  }
+  if (ownedOutcome === 'failed') {
+    return { kind: 'terminal', chatId, message: 'previous dispatch outcome is unknown (ambiguous crash); not re-run (at-most-once)' };
+  }
+  if (hit.state === 'attempting') {
+    // Ground truth for "genuinely in flight" is a LIVE WORKER, not registry
+    // presence or ownerBootId. A dispatched turn holds a non-killed worker from
+    // fork (synchronous, no await between register and fork) until the worker
+    // exits. A worker that died with no final_output leaves ds in the map with
+    // worker=null — an ORPHAN, not in flight. The worker-exit handler writes a
+    // durable dispatch_unknown (caught by the owned-failed branch above); this
+    // liveWorker guard closes the race window before that write and any path
+    // where no stamp existed. Not-live attempting → terminal (at-most-once:
+    // never re-dispatch); reconcile / worker-exit make it durable (codex #776
+    // round-6 finding #1: registry presence ≠ execution liveness).
+    if (liveWorker) {
+      return { kind: 'reuse', chatId, message: 'idempotency key in flight; reuse the session (poll trigger-result)' };
+    }
+    return { kind: 'terminal', chatId, message: 'previous dispatch was interrupted with unknown outcome; not re-run (at-most-once)' };
+  }
+  // reserved
+  if (hit.ownerBootId === ownerBootId) {
+    // Same-boot reserved: mid-dispatch in THIS process (between claim and the
+    // attempting barrier) only while a live worker is executing it. A not-live
+    // same-boot reserved lease is an abandoned pre-dispatch orphan (barrier-fail
+    // release hit EIO and couldn't prove removal) — fail-closed to terminal so a
+    // retry never reuses the closed session forever (codex #776 round-6 finding
+    // #1). The still-reserved lease is swept by the next boot's reconcile.
+    if (liveWorker) {
+      return { kind: 'reuse', chatId, message: 'idempotency key reserved and being dispatched; reuse the session' };
+    }
+    return { kind: 'terminal', chatId, message: 'previous reservation was abandoned pre-dispatch with unknown outcome; not re-run (at-most-once)' };
+  }
+  return { kind: 'takeover' };
+}
+
+/**
+ * Boot reconcile for idempotency leases (at-most-once convergence). MUST run
+ * after the session store + worker pool are initialized but BEFORE the IPC
+ * server binds, and is scoped to a SINGLE owning bot (`ownerLarkAppId`) — the
+ * dataDir is shared across bots, so a bot must never touch another's leases.
+ * For each of THIS owner's leases left by a PREVIOUS boot:
+ *   - completed (async store proves it) → keep; a retry polls the completed result.
+ *   - attempting (commit-unknown, previous boot gone) → write a durable
+ *     `dispatch_unknown` FAILED into async-trigger-store (authoritative terminal,
+ *     so trigger-result converges to `failed` regardless of session close), then
+ *     best-effort close the orphan. NEVER re-dispatched.
+ *   - reserved (provably pre-dispatch) → CAS-remove the lease + best-effort close
+ *     the never-dispatched session, so a same-key retry starts fresh.
+ * Returns the set of sessionIds terminalized/closed here so the caller can
+ * quarantine them from re-attach in restoreActiveSessions.
+ */
+export async function reconcileIdempotencyLeasesOnBoot(
+  ownerLarkAppId: string,
+  currentBootId: string,
+  getSession: (id: string) => { chatId?: string } | undefined = sessionStore.getOwnedSession,
+): Promise<Set<string>> {
+  const now = Date.now();
+  const quarantined = new Set<string>();
+  // Fail-closed: any lease we cannot PROVE converged (terminal not durable, or a
+  // corrupt/unreadable lease we can't reason about) makes the whole reconcile
+  // throw — the daemon must then abort this bot's startup rather than bind and
+  // let a poller hang `running` or an orphan re-attach. We finish the sweep to
+  // converge everything we can, but remember the first hard failure and rethrow.
+  let hardFailure: Error | undefined;
+  // Owner-PARTITIONED enumeration: read only THIS bot's subdir. A foreign bot's
+  // corrupt lease lives under a different owner subdir and is never opened here,
+  // so it can't abort this owner's startup (finding #4). A corrupt lease under
+  // OUR OWN owner still throws (unprovable → fail-closed).
+  const leases = idempotencyStore.listAllForOwner(ownerLarkAppId, { throwOnCorrupt: true });
+  // Terminalize an attempting/commit-unknown lease authoritatively into the
+  // async store. THROWS only on a GENUINE I/O failure (caught below →
+  // fail-closed). A destination async slot owned by ANOTHER bot is NOT an I/O
+  // failure and must NOT abort this bot's startup: it's a globally-unique
+  // sessionId colliding with a foreign record (adversarial/corrupt — can't happen
+  // benignly). We must not clobber their evidence, and we don't need to: the
+  // retry path is already at-most-once via resolveIdempotencyHit (not-live
+  // attempting → terminal) and the poll path drops foreign persisted results
+  // (decideAsyncOwnership positive-proof gate). Aborting startup there would be
+  // the same cross-bot DoS shape as finding #4. So skip the durable write for a
+  // foreign slot; the caller still quarantines + closes OUR orphan session.
+  const terminalizeAttempting = (rec: idempotencyStore.IdempotencyRecord): void => {
+    const dest = asyncTriggerStore.lookup(rec.sessionId, rec.triggerId);
+    if (dest?.ownerLarkAppId && dest.ownerLarkAppId !== ownerLarkAppId) {
+      logger.warn(`[idempotency] reconcile NOT terminalizing ${rec.sessionId}/${rec.triggerId}: async slot owned by ${dest.ownerLarkAppId} (foreign) — at-most-once held via lease + poll owner-gate, not aborting startup`);
+      return;
+    }
+    asyncTriggerStore.recordFailedStrict(rec.sessionId, rec.triggerId, now, ownerLarkAppId, 'dispatch_unknown');
+  };
+  for (const { file, record } of leases) {
+    // Defensive re-check (listAllForOwner already filtered) + skip current boot's
+    // own in-flight leases.
+    if (record.ownerLarkAppId !== ownerLarkAppId) continue;
+    if (record.ownerBootId === currentBootId) continue;
+    try {
+      // Trust async terminal evidence ONLY when it was written by THIS owner. A
+      // foreign completed/failed on the same sessionId/triggerId must NOT let us
+      // declare this owner's lease converged (codex #776 round-4 finding #3):
+      // ignore it and fall through to lease-state handling.
+      const asyncRec = asyncTriggerStore.lookup(record.sessionId, record.triggerId);
+      const outcome = (asyncRec && asyncRec.ownerLarkAppId === ownerLarkAppId) ? asyncRec.result.status : undefined;
+      if (asyncRec && asyncRec.ownerLarkAppId !== ownerLarkAppId) {
+        logger.warn(`[idempotency] reconcile ignoring foreign async evidence for ${record.sessionId}/${record.triggerId}: record owner=${asyncRec.ownerLarkAppId ?? '(unstamped)'} != ${ownerLarkAppId}`);
+      }
+      if (outcome === 'completed') continue; // converged good; retry reuses + polls
+      if (outcome === 'failed') {
+        // Already durable-failed, but a PREVIOUS boot may have crashed after
+        // writing failed and before closing → always re-quarantine and re-attempt
+        // close, so restore never re-attaches a session the caller already saw failed.
+        quarantined.add(record.sessionId);
+        if (getSession(record.sessionId)) await closeSession(record.sessionId);
+        continue;
+      }
+      if (record.state === 'attempting') {
+        // Write the authoritative terminal FIRST (throws on I/O failure), THEN
+        // quarantine + close. Quarantine happens regardless of close success.
+        terminalizeAttempting(record);
+        quarantined.add(record.sessionId);
+        if (getSession(record.sessionId)) await closeSession(record.sessionId);
+        continue;
+      }
+      // reserved: provably never dispatched → CAS-remove by path (only if the
+      // on-disk record is still this exact reserved snapshot). A discriminated
+      // result (not a swallowed boolean) so we react to a lease that CHANGED
+      // under us instead of declaring the sweep converged (findings #2/#3):
+      //  - removed / absent → converged; quarantine + close the empty session.
+      //  - changed + sameIdentity + now `attempting` → MY exact lease advanced
+      //    (a crossed commit-unknown barrier by a concurrent flow of the same
+      //    identity): terminalize by the CURRENT record's own session/trigger and
+      //    quarantine/close THAT session (cur.sessionId) — never the stale
+      //    snapshot's — else a session already declared `failed` could be
+      //    re-attached (finding #2). The stale snapshot has the same sessionId
+      //    here (identity matched), so one convergence covers it.
+      //  - changed + DIFFERENT identity → a takeover/re-claim replaced the slot
+      //    with a NEW session/trigger/boot UNDER THE SAME KEY FILE. `leases` is a
+      //    one-time snapshot from reconcile start, so this winner is NOT in it and
+      //    will NEVER be re-scanned "on its own file" (same key = same hashed
+      //    file). We must classify the winner by its CURRENT record ON THE SPOT
+      //    (codex #776 round-7 finding #2), AND independently converge OUR
+      //    never-dispatched stale-snapshot orphan (record.sessionId):
+      //      · winner is current boot → genuinely in flight, leave it.
+      //      · winner is old-boot attempting → durable failed + quarantine/close
+      //        the winner's session (its commit-unknown fence has no owner alive).
+      //      · winner is old-boot reserved → fenced compareAndRemove against the
+      //        CURRENT snapshot + quarantine/close the winner (provably
+      //        pre-dispatch). A live worker on it means it's genuinely running →
+      //        cannot prove convergence → fail-closed.
+      //      · anything else unprovable → fail-closed (throw).
+      //    (corrupt / EIO inside the CAS THROWS — caught below → fail-closed.)
+      const rm = idempotencyStore.compareAndRemoveByPath(file, record);
+      if (rm.kind === 'changed') {
+        const cur = rm.current;
+        if (rm.sameIdentity) {
+          // Same immutable identity, only state/revision advanced. current-boot
+          // re-claim → genuinely in flight, leave it. Otherwise a previous-boot
+          // crossed fence → terminalize + quarantine/close by the CURRENT record.
+          if (cur.ownerBootId === currentBootId) continue;
+          if (cur.state === 'attempting') {
+            terminalizeAttempting(cur);
+            quarantined.add(cur.sessionId);
+            if (getSession(cur.sessionId)) await closeSession(cur.sessionId);
+            continue;
+          }
+          throw new Error(`reserved lease advanced to an unexpected state under reconcile CAS (rev ${cur.revision} state ${cur.state} boot ${cur.ownerBootId}); cannot prove convergence`);
+        }
+        // DIFFERENT identity winner replaced the slot. First converge OUR
+        // never-dispatched stale-snapshot orphan (it never dispatched, so no
+        // durable failed is owed — just quarantine + close so restore can't revive
+        // an empty session).
+        logger.warn(`[idempotency] reconcile: reserved snapshot for ${record.sessionId} was replaced by a different winner (session=${cur.sessionId} boot=${cur.ownerBootId} state=${cur.state}); converging our orphan + classifying the winner on the spot`);
+        quarantined.add(record.sessionId);
+        if (getSession(record.sessionId)) await closeSession(record.sessionId);
+        // Then classify the WINNER on the spot — it will never be re-scanned.
+        if (cur.ownerBootId === currentBootId) continue; // in flight this boot → leave it
+        const liveWinner = !!getSession(cur.sessionId); // session row present → may be restored/live
+        if (cur.state === 'attempting') {
+          // Old-boot crossed fence with no live owner → durable failed + quarantine.
+          terminalizeAttempting(cur);
+          quarantined.add(cur.sessionId);
+          if (getSession(cur.sessionId)) await closeSession(cur.sessionId);
+          continue;
+        }
+        // Old-boot reserved winner: provably pre-dispatch → fenced remove against
+        // the winner's CURRENT snapshot, quarantine + close. If a live worker is
+        // genuinely running it we cannot prove convergence → fail-closed.
+        if (liveWinner) {
+          throw new Error(`different-identity winner ${cur.sessionId} (rev ${cur.revision} state ${cur.state} boot ${cur.ownerBootId}) has a live session under reconcile; cannot prove convergence`);
+        }
+        const winnerRm = idempotencyStore.compareAndRemoveByPath(file, cur);
+        if (winnerRm.kind === 'changed') {
+          throw new Error(`different-identity winner ${cur.sessionId} changed again under reconcile CAS (rev ${winnerRm.current.revision} state ${winnerRm.current.state}); cannot prove convergence`);
+        }
+        quarantined.add(cur.sessionId);
+        if (getSession(cur.sessionId)) await closeSession(cur.sessionId);
+        continue;
+      }
+      quarantined.add(record.sessionId);
+      if (getSession(record.sessionId)) await closeSession(record.sessionId);
+    } catch (err) {
+      // This lease could not be converged (strict-failed write threw, CAS-remove
+      // threw on EIO/corruption, changed-under-us, or close threw). Do NOT
+      // skip-and-continue as "handled": record it and keep the session
+      // quarantined so restore can't revive it, then fail the whole reconcile
+      // after the sweep.
+      quarantined.add(record.sessionId);
+      const e = err as Error;
+      logger.error(`[idempotency] reconcile could not converge lease for ${record.sessionId}: ${e.message}`);
+      if (!hardFailure) hardFailure = e;
+    }
+  }
+  if (hardFailure) {
+    throw new Error(`idempotency boot reconcile failed to converge at least one lease: ${hardFailure.message}`);
+  }
+  return quarantined;
+}
+
+/**
+ * Converge an INCOMPLETE idempotent async turn when its worker exits (codex #776
+ * round-6 finding #1). A worker that dies with no final_output sets ds.worker=null
+ * but leaves the session in activeSessions and its async record `pending`, so
+ * trigger-result would poll `running` and a same-key retry would `reuse` the dead
+ * session — both forever, until the next daemon boot reconcile. Registry presence
+ * is NOT execution liveness.
+ *
+ * We write the authoritative durable `dispatch_unknown` failed (the same terminal
+ * the boot reconcile writes), which trigger-result reads BEFORE its running
+ * branch and resolveIdempotencyHit reads as `terminal` — converging both without
+ * a re-dispatch. Best-effort + fail-safe: only fires for the EXACT generation
+ * that was stamped (a later generation that already completed/moved on is
+ * ignored), and only when no completed evidence exists (completed always wins in
+ * recordFailedStrict anyway). Idempotent: the stamp is cleared after.
+ *
+ * Called from the daemon's onWorkerExit/onCliExit callbacks. Returns a status so
+ * the caller can react to a convergence WRITE FAILURE (EIO/ENOSPC): merely
+ * logging + keeping the stamp is NOT enough, because the same Node worker
+ * auto-restarts to a healthy idle CLI and per-item noReplay stops the keyed input
+ * from re-running — so async-store stays `pending`, the session stays `open`, and
+ * ds.worker becomes live again → trigger-result polls `running` forever and a
+ * same-key retry reuses via liveWorker, with no automatic next-boot reconcile
+ * trigger (codex #776 round-8 finding #2). On `write_failed` the caller MUST take
+ * this session to an observable fail-closed terminal (close it → trigger-result's
+ * closed-branch resolves `failed`), not wait for an unknown future restart.
+ *   - 'converged'    → durable dispatch_unknown written (or owner-matched completed seen); stamp cleared.
+ *   - 'noop'         → nothing to converge (no stamp, wrong generation).
+ *   - 'write_failed' → the strict durable write threw; stamp kept; caller must fail-closed the session.
+ */
+export type IdempotentExitConvergence = 'converged' | 'noop' | 'write_failed';
+export function convergeIdempotentAsyncTurnOnWorkerExit(
+  ds: DaemonSession,
+  exitingWorkerGeneration: number,
+): IdempotentExitConvergence {
+  const turn = ds.idempotentAsyncTurn;
+  if (!turn) return 'noop';
+  // Only converge the generation this turn was dispatched on. A later worker
+  // generation (post-completion re-fork, takeover) exiting must not retro-fail a
+  // turn that already produced output on an earlier generation.
+  if (turn.workerGeneration !== exitingWorkerGeneration) return 'noop';
+  // Already completed by THIS owner (final_output cleared the stamp, or a durable
+  // owner-matched completed exists)? Then clear the stamp and skip the write.
+  // CRITICAL: only OUR OWN completed counts. async-trigger-store is keyed by
+  // sessionId, so a foreign/unstamped completed on the same sessionId/triggerId
+  // must NOT clear our only exit-convergence stamp (codex #776 round-7 finding
+  // #3): if it did, onCliExit (Node worker still live) would leave no stamp, then
+  // resolveIdempotencyHit ignores the foreign outcome yet reuses the attempting
+  // lease via liveWorker, and the later onWorkerExit — now stampless — can never
+  // converge it → permanent running. Owner positive-proof, mirroring the
+  // resolveIdempotencyHit / reconcile evidence gates.
+  const existing = asyncTriggerStore.lookup(ds.session.sessionId, turn.triggerId);
+  const ownedCompleted = existing?.result.status === 'completed'
+    && existing.ownerLarkAppId === turn.ownerLarkAppId;
+  if (ownedCompleted) { ds.idempotentAsyncTurn = undefined; return 'converged'; }
+  try {
+    // recordFailedStrict is itself owner-proofed (throws on owner mismatch) and
+    // completed-wins, so a foreign-occupied slot throws here → caught below →
+    // stamp intact, caller fail-closes. Never clobbers another bot's evidence.
+    asyncTriggerStore.recordFailedStrict(ds.session.sessionId, turn.triggerId, Date.now(), turn.ownerLarkAppId, 'dispatch_unknown');
+    logger.warn(`[idempotency] worker exit converged incomplete idempotent async turn ${ds.session.sessionId}/${turn.triggerId} (gen ${exitingWorkerGeneration}) → durable dispatch_unknown`);
+    // The turn is now durably terminal; clear the stamp so a subsequent exit of a
+    // replacement generation is a no-op.
+    ds.idempotentAsyncTurn = undefined;
+    return 'converged';
+  } catch (err) {
+    // Durable write failed (EIO/ENOSPC, or a foreign-occupied slot). Keep the
+    // stamp and report write_failed so the caller takes this session to an
+    // observable fail-closed terminal (close it). We must NOT merely wait for a
+    // next-boot reconcile: the same Node worker auto-restarts to a healthy idle
+    // CLI, per-item noReplay stops the keyed input from re-running, and the live
+    // ds would otherwise strand the poller on `running` forever (codex #776
+    // round-8 finding #2).
+    logger.error(`[idempotency] worker-exit convergence write failed for ${ds.session.sessionId}/${turn.triggerId}; caller must fail-close: ${(err as Error).message}`);
+    return 'write_failed';
+  }
+}
+
 function waitForSessionFinalOutput(
   ds: DaemonSession,
   triggerId: string,
@@ -190,7 +560,18 @@ function waitForSessionFinalOutput(
         resolve({ ok: false, triggerId, errorCode: 'trigger_failed', error: err.message });
       },
     });
-    dispatchTurn();
+    try {
+      dispatchTurn();
+    } catch (err) {
+      clearTimeout(timer);
+      ds.pendingWaitPromises?.delete(triggerId);
+      resolve({
+        ok: false,
+        triggerId,
+        errorCode: 'trigger_failed',
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
   });
 }
 
@@ -273,7 +654,7 @@ function buildExistingSessionContent(
   });
 }
 
-export async function triggerSessionTurn(
+async function triggerSessionTurnAdmitted(
   req: TriggerRequest,
   deps: TriggerSessionDeps,
   internal?: TriggerSessionInternalOptions,
@@ -388,6 +769,97 @@ export async function triggerSessionTurn(
   const codexAppMessageContext = buildExternalEventDataContext(req, triggerId);
   const promptPreview = prompt.length > 4000 ? prompt.slice(0, 4000) + '\n...[truncated]' : prompt;
 
+  // ── Idempotency (fresh async virtual only — validator guarantees the shape) ──
+  // A caller-supplied options.idempotencyKey makes a retried /api/trigger (e.g.
+  // after a lost HTTP response) resolve to the SAME turn instead of dispatching
+  // twice. This is an at-most-once dispatch LEASE (see idempotency-store), not a
+  // "session exists → reuse" map: a turn that crashed before/mid dispatch must
+  // resolve to a terminal state, never silently re-run or hang `running`.
+  const idempotencyKey = req.options?.idempotencyKey?.trim();
+  // requestHash binds the key to its full business payload — a same-key retry
+  // with a DIFFERENT payload is a caller bug (409), not a silent join. It must
+  // cover everything that renders into the prompt / drives execution:
+  // instruction, envelope, source, presentation, and the WHOLE options object
+  // EXCEPT the idempotencyKey itself (that's the lookup key, not payload). Hashing
+  // only a hand-picked subset (model/effort/suppress) silently reused a turn when
+  // e.g. options.status firing→resolved changed the prompt but not the hash
+  // (codex #776 round-4). No daemon-generated ids (session/chat/triggerId) are in
+  // these inputs, so the hash is stable across retries.
+  const { idempotencyKey: _omitKey, ...optionsForHash } = (req.options ?? {}) as Record<string, unknown>;
+  const requestHash = idempotencyKey
+    ? computeInputHash({
+        instruction: req.instruction ?? null,
+        envelope: req.envelope,
+        source: req.source,
+        presentation: req.presentation ?? null,
+        options: optionsForHash,
+      })
+    : '';
+  const ownerBootId = getDaemonBootId();
+  // Records this call may take over (older-boot reserved) — resolved during
+  // lookup, consumed at claim time so we don't re-read.
+  let idempotencyTakeover: idempotencyStore.IdempotencyRecord | undefined;
+  if (idempotencyKey && !dryRun) {
+    // A device-isolation freeze (device-credential enrollment) makes forkWorker
+    // DEFER the spawn and return early WITHOUT forking — so if we crossed the
+    // reserved→attempting barrier and armed beginAsyncTrigger, we would return
+    // `queued` while ds.worker stays null; a same-key retry would see a not-live
+    // attempting lease and resolve `failed`, then the deferred callback would
+    // actually fork and run the turn AFTER the caller saw failed (codex #776
+    // round-8 finding #1). Refuse the keyed dispatch up-front (before any lease
+    // claim / session / async pending), so nothing is dispatched and the caller
+    // can retry cleanly once the freeze releases. Retryable, not terminal.
+    if (currentDeviceIsolationFreezeLease()) {
+      return {
+        ok: false,
+        errorCode: 'trigger_failed',
+        error: 'device credential activation in progress; retry the idempotent trigger shortly',
+        idempotencyKey,
+      };
+    }
+    let hit: idempotencyStore.IdempotencyRecord | undefined;
+    try {
+      hit = idempotencyStore.lookup(larkAppId, idempotencyKey);
+    } catch (err) {
+      // Corrupt/unreadable existing lease — fail-closed (never fall through to a
+      // fresh dispatch that could double-run).
+      return { ok: false, errorCode: 'trigger_failed', error: `idempotency lease unreadable: ${(err as Error).message}` };
+    }
+    if (hit) {
+      if (hit.requestHash !== requestHash) {
+        return {
+          ok: false,
+          errorCode: 'idempotency_conflict',
+          error: 'idempotencyKey already used with a different request payload',
+          idempotencyKey,
+        };
+      }
+      const decision = resolveIdempotencyHit(hit, ownerBootId, deps.activeSessions);
+      if (decision.kind === 'reuse') {
+        return {
+          ...buildAsyncQueuedResponse(hit.triggerId, hit.sessionId, decision.chatId, decision.message),
+          idempotencyKey,
+          idempotent: true,
+        };
+      }
+      if (decision.kind === 'terminal') {
+        return {
+          ok: false,
+          state: 'failed',
+          triggerId: hit.triggerId,
+          errorCode: 'no_output',
+          error: decision.message,
+          target: { kind: 'turn', sessionId: hit.sessionId, chatId: decision.chatId },
+          idempotencyKey,
+          idempotent: true,
+        };
+      }
+      // decision.kind === 'takeover' — an older-boot pre-dispatch reserved lease.
+      // Fall through to create a fresh session + RE-CLAIM via takeover below.
+      idempotencyTakeover = hit;
+    }
+  }
+
   const rootMessageId = typeof req.target.rootMessageId === 'string' ? req.target.rootMessageId.trim() : '';
   let ds = req.target.sessionId ? activeBySessionId(deps.activeSessions, req.target.sessionId) : undefined;
   if (req.target.sessionId && !ds) {
@@ -444,97 +916,159 @@ export async function triggerSessionTurn(
     };
   }
 
-  if (ds?.worker && !ds.worker.killed) {
-    const content = buildExistingSessionContent(
-      ds, prompt, larkAppId, chatId, codexAppText, codexAppApplicationContext, codexAppMessageContext,
-    );
-    markSessionActivity(ds);
-    rememberInput(ds, prompt, content);
-
-    if (req.options?.waitForFinalOutput) {
-      return waitForSessionFinalOutput(
-        ds,
+  const deliverToExisting = async (target: DaemonSession): Promise<TriggerResponse> => {
+    // Ownership guard (PR #597): the target must still be the live, registered
+    // occupant before we dispatch. Validate by object identity at its canonical
+    // key AND — because a session can legitimately be reached via a non-canonical
+    // routing key (e.g. an external trigger addressed a chat-scope session by a
+    // fold-back rootMessageId anchor) — accept it if it is still registered
+    // anywhere in the map. This keeps the guard against eviction/replacement
+    // while not rejecting a validly-found session whose canonical key differs
+    // from the lookup key.
+    const targetKey = activeSessionKey(target);
+    const stillRegistered = deps.activeSessions.get(targetKey) === target
+      || [...deps.activeSessions.values()].includes(target);
+    if (!stillRegistered || target.session.status !== 'active') {
+      return {
+        ok: false,
         triggerId,
-        req.options?.timeoutMs ?? 120_000,
-        (text) => ({
-          ok: true,
-          triggerId,
-          action: 'completed',
-          target: { kind: 'turn', sessionId: ds!.session.sessionId, chatId },
-          output: { content: text },
-          message: 'delivered to existing session and completed',
-        }),
-        () => {
-          const dispatchAttempt = prepareStableDispatch(ds!, false);
-          armFinalOutputSuppression(ds!, dispatchAttempt);
-          sendWorkerInput(ds!, content, triggerId, {
-            ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
-          });
-        },
-      );
+        errorCode: 'session_not_found',
+        error: `active session ownership changed before dispatch: ${target.session.sessionId}`,
+      };
     }
+    const workerIsLive = !!target.worker && !target.worker.killed;
+    if (!workerIsLive && (target.pendingRepo || target.initialStartPending
+      || target.worktreeCreating || target.session.queued
+      || hasProtectedSessionMutationOwnership(target))) {
+      const state = target.pendingRepo
+        ? 'pending_repo'
+        : target.initialStartPending
+          ? 'initial_start_pending'
+          : target.worktreeCreating
+            ? 'worktree_creating'
+            : target.session.queued
+              ? 'queued_backlog'
+              : 'durable_owner';
+      return {
+        ok: false,
+        triggerId,
+        errorCode: 'trigger_failed',
+        error: `target session ${target.session.sessionId} is not runnable (${state}); preserving its opening prompt`,
+      };
+    }
+    const content = buildExistingSessionContent(
+      target, prompt, larkAppId, chatId, codexAppText, codexAppApplicationContext, codexAppMessageContext,
+    );
+    const queuedBehindActivation = workerIsLive
+      && hasQueuedActivationAdmissionGate(target);
+    const recordAcceptedInput = (): void => {
+      markSessionActivity(target);
+      rememberInput(target, prompt, content);
+    };
 
-    if (req.options?.asyncReturnSessionId) {
-      beginAsyncTrigger(ds, triggerId);
-      const dispatchAttempt = prepareStableDispatch(ds, false);
-      armFinalOutputSuppression(ds, dispatchAttempt);
-      sendWorkerInput(ds, content, triggerId, {
+    if (workerIsLive) {
+      if (req.options?.waitForFinalOutput) {
+        return waitForSessionFinalOutput(
+          target,
+          triggerId,
+          req.options?.timeoutMs ?? 120_000,
+          (text) => ({
+            ok: true,
+            triggerId,
+            action: 'completed',
+            target: { kind: 'turn', sessionId: target.session.sessionId, chatId },
+            output: { content: text },
+            message: 'delivered to existing session and completed',
+          }),
+          () => {
+            const dispatchAttempt = prepareStableDispatch(target, false);
+            armFinalOutputSuppression(target, dispatchAttempt);
+            const accepted = sendWorkerInput(target, content, triggerId, {
+              ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
+            });
+            if (!accepted) throw new Error('worker refused trigger input before acceptance');
+            recordAcceptedInput();
+          },
+        );
+      }
+
+      if (req.options?.asyncReturnSessionId) {
+        beginAsyncTrigger(target, triggerId);
+        const dispatchAttempt = prepareStableDispatch(target, false);
+        armFinalOutputSuppression(target, dispatchAttempt);
+        const accepted = sendWorkerInput(target, content, triggerId, {
+          ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
+        });
+        if (!accepted) {
+          target.asyncTriggerResults?.delete(triggerId);
+          if (target.latestAsyncTriggerId === triggerId) target.latestAsyncTriggerId = undefined;
+          return {
+            ok: false,
+            triggerId,
+            errorCode: 'trigger_failed',
+            error: 'worker refused async trigger input before acceptance',
+          };
+        }
+        recordAcceptedInput();
+        return buildAsyncQueuedResponse(
+          triggerId,
+          target.session.sessionId,
+          chatId,
+          'delivered to existing session; poll by sessionId or triggerId for final output',
+        );
+      }
+
+      const dispatchAttempt = prepareStableDispatch(target, false);
+      armFinalOutputSuppression(target, dispatchAttempt);
+      armLoudFinalSuppression(target);
+      const accepted = sendWorkerInput(target, content, stableTurnId ? triggerId : loudTurnId, {
         ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
       });
-      return buildAsyncQueuedResponse(
+      if (!accepted) {
+        disarmLoudFinalSuppression(target);
+        return {
+          ok: false,
+          triggerId,
+          errorCode: 'trigger_failed',
+          error: 'worker refused trigger input before acceptance',
+        };
+      }
+      recordAcceptedInput();
+      return {
+        ok: true,
         triggerId,
-        ds.session.sessionId,
-        chatId,
-        'delivered to existing session; poll by sessionId or triggerId for final output',
-      );
+        action: queuedBehindActivation ? 'queued' : 'delivered',
+        target: { kind: 'turn', sessionId: target.session.sessionId, chatId },
+        message: queuedBehindActivation
+          ? 'durably queued behind the existing activation'
+          : 'delivered to existing session',
+      };
     }
 
-    const dispatchAttempt = prepareStableDispatch(ds, false);
-    armFinalOutputSuppression(ds, dispatchAttempt);
-    armLoudFinalSuppression(ds);
-    if (!sendWorkerInput(ds, content, stableTurnId ? triggerId : loudTurnId, {
-      ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
-    })) {
-      disarmLoudFinalSuppression(ds);
-    }
-    return {
-      ok: true,
-      triggerId,
-      action: 'delivered',
-      target: { kind: 'turn', sessionId: ds.session.sessionId, chatId },
-      message: 'delivered to existing session',
-    };
-  }
+    recordAcceptedInput();
 
-  // An explicit session target stays bound to that session even while its
-  // worker is dormant. The old rootMessageId-only condition accidentally fell
-  // through to createSession for chat-scope sessions, which is unsafe for a
-  // durable meeting receiver whose projection pins one receiverSessionId.
-  if (ds) {
-    const content = buildExistingSessionContent(
-      ds, prompt, larkAppId, chatId, codexAppText, codexAppApplicationContext, codexAppMessageContext,
-    );
-    markSessionActivity(ds);
-    rememberInput(ds, prompt, content);
-
+    // An explicit session target stays bound to that session even while its
+    // worker is dormant. The old rootMessageId-only condition accidentally
+    // fell through to createSession for chat-scope sessions, which is unsafe
+    // for a durable meeting receiver whose projection pins one receiver id.
     if (req.options?.waitForFinalOutput) {
       return waitForSessionFinalOutput(
-        ds,
+        target,
         triggerId,
         req.options?.timeoutMs ?? 120_000,
         (text) => ({
           ok: true,
           triggerId,
           action: 'completed',
-          target: { kind: 'turn', sessionId: ds!.session.sessionId, chatId },
+          target: { kind: 'turn', sessionId: target.session.sessionId, chatId },
           output: { content: text },
           message: 'delivered to existing session and completed',
         }),
         () => {
-          const dispatchAttempt = prepareStableDispatch(ds!, true);
-          armFinalOutputSuppression(ds!, dispatchAttempt);
-          forkWorker(ds!, content, {
-            resume: ds!.hasHistory,
+          const dispatchAttempt = prepareStableDispatch(target, true);
+          armFinalOutputSuppression(target, dispatchAttempt);
+          forkWorker(target, content, {
+            resume: target.hasHistory,
             turnId: triggerId,
             ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
           });
@@ -543,27 +1077,27 @@ export async function triggerSessionTurn(
     }
 
     if (req.options?.asyncReturnSessionId) {
-      beginAsyncTrigger(ds, triggerId);
-      const dispatchAttempt = prepareStableDispatch(ds, true);
-      armFinalOutputSuppression(ds, dispatchAttempt);
-      forkWorker(ds, content, {
-        resume: ds.hasHistory,
+      beginAsyncTrigger(target, triggerId);
+      const dispatchAttempt = prepareStableDispatch(target, true);
+      armFinalOutputSuppression(target, dispatchAttempt);
+      forkWorker(target, content, {
+        resume: target.hasHistory,
         turnId: triggerId,
         ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
       });
       return buildAsyncQueuedResponse(
         triggerId,
-        ds.session.sessionId,
+        target.session.sessionId,
         chatId,
         'delivered to existing session; poll by sessionId or triggerId for final output',
       );
     }
 
-    const dispatchAttempt = prepareStableDispatch(ds, true);
-    armFinalOutputSuppression(ds, dispatchAttempt);
-    armLoudFinalSuppression(ds);
-    forkWorker(ds, content, {
-      resume: ds.hasHistory,
+    const dispatchAttempt = prepareStableDispatch(target, true);
+    armFinalOutputSuppression(target, dispatchAttempt);
+    armLoudFinalSuppression(target);
+    forkWorker(target, content, {
+      resume: target.hasHistory,
       turnId: triggerId,
       ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
     });
@@ -571,10 +1105,12 @@ export async function triggerSessionTurn(
       ok: true,
       triggerId,
       action: 'queued',
-      target: { kind: 'turn', sessionId: ds.session.sessionId, chatId },
+      target: { kind: 'turn', sessionId: target.session.sessionId, chatId },
       message: 'queued existing session turn',
     };
-  }
+  };
+
+  if (ds) return deliverToExisting(ds);
 
   const wd = resolveWorkingDir(larkAppId, chatId);
   if (!wd.ok) {
@@ -595,49 +1131,6 @@ export async function triggerSessionTurn(
     scope = 'thread';
   }
 
-  const session = sessionStore.createSession(chatId, anchor, triggerTitle(req), 'group');
-  const now = Date.now();
-  session.larkAppId = larkAppId;
-  session.scope = scope;
-  if (shouldOpenOwnTopic && topicMessage === null) session.externalTriggerTopicless = true;
-  session.lastMessageAt = new Date(now).toISOString();
-  session.workingDir = wd.workingDir;
-  session.cliId = bot.config.cliId;
-  // Per-turn model / reasoning-effort override — scoped to codex-family bots
-  // (the documented B-mode target) and to a freshly-created trigger session.
-  // Gating on cliId keeps the contract honest and bounded: it never silently
-  // changes the model of a Claude/Gemini/CoCo bot, and a fold-in to an existing
-  // worker never reaches here. reasoningEffort is codex-only regardless (other
-  // adapters ignore it); model is gated here so it can't leak to non-codex CLIs.
-  const isCodexFamily = bot.config.cliId === 'codex' || bot.config.cliId === 'codex-app';
-  if (isCodexFamily) {
-    if (typeof req.options?.model === 'string' && req.options.model.trim()) {
-      session.model = req.options.model.trim();
-    }
-    if (req.options?.reasoningEffort) {
-      session.reasoningEffort = req.options.reasoningEffort;
-    }
-  }
-  sessionStore.updateSession(session);
-
-  messageQueue.ensureQueue(anchor);
-
-  const newDs: DaemonSession = {
-    session,
-    worker: null,
-    workerPort: null,
-    workerToken: null,
-    larkAppId,
-    chatId,
-    chatType: 'group',
-    scope,
-    spawnedAt: Date.parse(session.createdAt) || now,
-    cliVersion: getCurrentCliVersion(),
-    lastMessageAt: now,
-    hasHistory: false,
-    workingDir: wd.workingDir,
-  };
-
   // 仅默认目录 + auto-worktree：chat 驱动的 webhook 开新会话且落在本 bot 自己的默认目录时，走
   // pendingRepo 挂起 + 异步提交（登记挂起→关键路径外建 worktree→commitRepoSelection 提交+fork），
   // detach 后立即返回 queued。规则：**仅普通 webhook 适用**——HTTP 应答模式（waitForFinalOutput /
@@ -650,14 +1143,96 @@ export async function triggerSessionTurn(
     && !stableTurnId
     && wd.fromBotDefault
     && botAutoWorktreeEnabled(larkAppId);
-  if (useAutoWt) {
-    // Register BEFORE the detached commit so its guard + the router's pendingRepo
-    // buffering both see the session. pendingRepo=true → no force-fork in the window.
-    newDs.pendingRepo = true;      // router buffers concurrent events; commit clears it
-    newDs.pendingPrompt = prompt;  // folded into the first turn by commitRepoSelection
+
+  // New trigger sessions participate in the same first-owner lock as resume,
+  // dashboard creation, and scheduled creation.  The earlier routing lookup
+  // necessarily precedes chat-membership/mode awaits, so it is only a hint;
+  // the owner must be re-read at the commit point.  Publish a reservation
+  // before any post-registration await so resume can never pass its final
+  // check and then have this trigger overwrite it.
+  const key = sessionKey(anchor, larkAppId);
+  const claim = await withActiveSessionKeyLock(deps.activeSessions, key, () => {
+    const current = deps.activeSessions.get(key);
+    if (current) return { kind: 'existing' as const, ds: current };
+
+    const session = sessionStore.createSession(chatId, anchor, triggerTitle(req), 'group');
+    const now = Date.now();
+    session.larkAppId = larkAppId;
+    session.scope = scope;
+    if (shouldOpenOwnTopic && topicMessage === null) session.externalTriggerTopicless = true;
+    session.lastMessageAt = new Date(now).toISOString();
+    session.workingDir = wd.workingDir;
+    session.cliId = bot.config.cliId;
+    // Per-turn model / reasoning-effort override — scoped to codex-family bots
+    // (the documented B-mode target) and to a freshly-created trigger session.
+    // Gating on cliId keeps the contract honest and bounded: it never silently
+    // changes the model of a Claude/Gemini/CoCo bot, and a fold-in to an existing
+    // worker never reaches here. reasoningEffort is codex-only regardless (other
+    // adapters ignore it); model is gated here so it can't leak to non-codex CLIs.
+    const isCodexFamily = bot.config.cliId === 'codex' || bot.config.cliId === 'codex-app';
+    if (isCodexFamily) {
+      if (typeof req.options?.model === 'string' && req.options.model.trim()) {
+        session.model = req.options.model.trim();
+      }
+      if (req.options?.reasoningEffort) {
+        session.reasoningEffort = req.options.reasoningEffort;
+      }
+    }
+    sessionStore.updateSession(session);
+    messageQueue.ensureQueue(anchor);
+
+    const newDs: DaemonSession = {
+      session,
+      worker: null,
+      workerPort: null,
+      workerToken: null,
+      larkAppId,
+      chatId,
+      chatType: 'group',
+      scope,
+      spawnedAt: Date.parse(session.createdAt) || now,
+      cliVersion: getCurrentCliVersion(),
+      lastMessageAt: now,
+      hasHistory: false,
+      workingDir: wd.workingDir,
+    };
+    // Retain the complete opening input until a worker or repo workflow has
+    // synchronously accepted it. This is both the route reservation and the
+    // retry payload if a write-ahead hook/fork throws before acceptance.
+    newDs.pendingPrompt = prompt;
     newDs.pendingCodexAppText = codexAppText;
     newDs.pendingCodexAppApplicationContext = codexAppApplicationContext || undefined;
     newDs.pendingCodexAppMessageContext = codexAppMessageContext;
+    if (useAutoWt) {
+      newDs.pendingRepo = true;
+      try {
+        stagePendingRepoSetup(newDs, {
+          mode: 'auto_worktree',
+          baseDir: wd.workingDir,
+          turnId: triggerId,
+        });
+      } catch (err) {
+        // The route was never published, but createSession already persisted
+        // an active row. Close only this unaccepted row so a staging fault
+        // cannot reappear as an unregistered owner after restart.
+        try { sessionStore.closeSession(session.sessionId); }
+        catch { /* keep the original admission error */ }
+        throw err;
+      }
+    } else {
+      newDs.initialStartPending = true;
+    }
+    deps.activeSessions.set(key, newDs);
+    return { kind: 'created' as const, ds: newDs };
+  });
+
+  if (claim.kind === 'existing') return deliverToExisting(claim.ds);
+  const newDs = claim.ds;
+  const session = newDs.session;
+
+  if (useAutoWt) {
+    // The key-lock claim registered pendingRepo before this dynamic import;
+    // repo commit and inbound routing therefore see the same reservation.
     // Stamp the trigger turn id so commitRepoSelection's deferred fork carries it
     // and the armed final_output suppression can match this turn.
     // Known, intentional degradation: if a HUMAN message folds into this pending
@@ -672,16 +1247,6 @@ export async function triggerSessionTurn(
     // not a hard guarantee — consistent with the 256/TTL best-effort bound.
     if (loudTurnId) newDs.pendingTurnId = loudTurnId;
     armLoudFinalSuppression(newDs);
-    if (!setActiveSessionIfActive(deps.activeSessions, sessionKey(anchor, larkAppId), newDs)) {
-      disarmLoudFinalSuppression(newDs);
-      await closeSession(session.sessionId);
-      return {
-        ok: false,
-        triggerId,
-        errorCode: 'trigger_failed',
-        error: 'session route is reserved by an active persisted session',
-      };
-    }
     const { runAutoWorktreeCommit } = await import('../im/lark/card-handler.js');
     void runAutoWorktreeCommit({
       ds: newDs, anchor, larkAppId, baseDir: wd.workingDir, title: triggerTitle(req),
@@ -704,9 +1269,22 @@ export async function triggerSessionTurn(
   // /is_in_chat) for no-transport sessions: an apiOnly bot or an HTTP virtual
   // chat has no real Lark chat to enumerate, and probing a synthetic id only
   // adds a failing network round-trip + latency. No peer bots → empty roster.
-  const availableBots = larkTransportEnabled({ chatId, apiOnly: bot.config.apiOnly })
-    ? await getAvailableBots(larkAppId, chatId)
-    : [];
+  let availableBots: Awaited<ReturnType<typeof getAvailableBots>>;
+  try {
+    availableBots = larkTransportEnabled({ chatId, apiOnly: bot.config.apiOnly })
+      ? await getAvailableBots(larkAppId, chatId)
+      : [];
+  } catch (err) {
+    // Prompt construction failed before any worker existed. Retire only the
+    // still-owned reservation so a retry is not blocked by a ghost active row.
+    await withActiveSessionKeyLock(deps.activeSessions, key, () => {
+      if (deps.activeSessions.get(key) === newDs && newDs.initialStartPending) {
+        deps.activeSessions.delete(key);
+        sessionStore.closeSession(session.sessionId);
+      }
+    });
+    throw err;
+  }
   const promptInput = buildNewTopicCliInput(
     prompt,
     session.sessionId,
@@ -728,19 +1306,92 @@ export async function triggerSessionTurn(
       codexAppMessageContext,
     },
   );
-  // Register right before the fork branches (no await between here and forkWorker)
-  // so a concurrent inbound message can't observe this session worker-less and
-  // race a duplicate re-fork — the set-and-fork atomicity the original path had.
-  if (!setActiveSessionIfActive(deps.activeSessions, sessionKey(anchor, larkAppId), newDs)) {
-    await closeSession(session.sessionId);
+  // No await from the ownership check through forkWorker. The reservation and
+  // opening buffers are released only after synchronous pre-accept succeeds.
+  if (deps.activeSessions.get(key) !== newDs
+    || newDs.session.status !== 'active'
+    || !newDs.initialStartPending) {
+    if (newDs.session.status !== 'closed') sessionStore.closeSession(session.sessionId);
     return {
       ok: false,
       triggerId,
       errorCode: 'trigger_failed',
-      error: 'session was closed while the trigger was being prepared',
+      error: 'new trigger session lost its first-owner reservation before startup',
     };
   }
   rememberInput(newDs, prompt, promptInput);
+
+  const releaseInitialReservation = (): void => {
+    newDs.initialStartPending = false;
+    newDs.pendingPrompt = undefined;
+    newDs.pendingCodexAppText = undefined;
+    newDs.pendingCodexAppApplicationContext = undefined;
+    newDs.pendingCodexAppMessageContext = undefined;
+  };
+
+  // Idempotency claim (fresh async virtual only — validator guarantees this is
+  // the asyncReturnSessionId branch). Bind key → this session as a `reserved`
+  // lease BEFORE any dispatch. Two outcomes to guard:
+  //  - a concurrent same-key trigger already won → abandon our session (never
+  //    dispatched), reuse the winner (exactly-once dispatch);
+  //  - an older-boot pre-dispatch `reserved` lease → take it over for this fresh run.
+  // Any store I/O error THROWS → we roll back the session and 5xx BEFORE dispatch
+  // (fail-closed: never fall through to a fork that could double-run).
+  let idempotencyLease: idempotencyStore.IdempotencyRecord | undefined;
+  if (idempotencyKey) {
+    // Handle a claim/takeover that resolved to an EXISTING winner (we lost the
+    // race, or the older-boot lease was advanced/seized by someone else): tear
+    // down our just-created session and resolve from the winner's terminal
+    // evidence (via resolveIdempotencyHit → async-store), never dispatching.
+    const reuseExistingWinner = async (winner: idempotencyStore.IdempotencyRecord): Promise<TriggerResponse> => {
+      await closeSession(session.sessionId);
+      const decision = resolveIdempotencyHit(winner, ownerBootId, deps.activeSessions);
+      const winnerChatId = (decision.kind !== 'takeover' && decision.chatId) ? decision.chatId : chatId;
+      if (decision.kind === 'terminal') {
+        return {
+          ok: false, state: 'failed', triggerId: winner.triggerId,
+          errorCode: 'no_output', error: decision.message,
+          target: { kind: 'turn', sessionId: winner.sessionId, chatId: winnerChatId },
+          idempotencyKey, idempotent: true,
+        };
+      }
+      return {
+        ...buildAsyncQueuedResponse(winner.triggerId, winner.sessionId, winnerChatId,
+          'idempotency key already claimed; reusing the winning session (no new dispatch)'),
+        idempotencyKey, idempotent: true,
+      };
+    };
+    try {
+      const res = idempotencyTakeover
+        ? idempotencyStore.takeover({
+            ownerLarkAppId: larkAppId, key: idempotencyKey, expect: idempotencyTakeover,
+            sessionId: session.sessionId, triggerId, requestHash, ownerBootId, now: Date.now(),
+          })
+        : idempotencyStore.claim({
+            ownerLarkAppId: larkAppId, sessionId: session.sessionId, triggerId,
+            requestHash, ownerBootId, key: idempotencyKey, now: Date.now(),
+          });
+      if (res.kind === 'existing') return await reuseExistingWinner(res.record);
+      idempotencyLease = res.record;
+    } catch (err) {
+      if (err instanceof idempotencyStore.IdempotencyConflictError) {
+        await closeSession(session.sessionId);
+        return { ok: false, errorCode: 'idempotency_conflict', error: 'idempotencyKey already used with a different request payload', idempotencyKey };
+      }
+      await closeSession(session.sessionId);
+      return { ok: false, errorCode: 'trigger_failed', error: `idempotency claim failed: ${(err as Error).message}` };
+    }
+  }
+
+  // CAS the lease reserved→attempting immediately before dispatch (commit-unknown
+  // barrier). Throws → caller rolls back (releases the reserved lease).
+  const markAttemptingBeforeDispatch = (): void => {
+    if (idempotencyKey && idempotencyLease) {
+      idempotencyLease = idempotencyStore.transition(larkAppId, idempotencyKey, idempotencyLease, {
+        state: 'attempting', now: Date.now(),
+      });
+    }
+  };
 
   if (req.options?.waitForFinalOutput) {
     return waitForSessionFinalOutput(
@@ -761,23 +1412,163 @@ export async function triggerSessionTurn(
         forkWorker(newDs, promptInput, dispatchAttempt === undefined
           ? triggerId
           : { turnId: triggerId, dispatchAttempt });
+        releaseInitialReservation();
       },
     );
   }
 
   if (req.options?.asyncReturnSessionId) {
-    beginAsyncTrigger(newDs, triggerId);
-    const dispatchAttempt = prepareStableDispatch(newDs, true);
-    armFinalOutputSuppression(newDs, dispatchAttempt);
-    forkWorker(newDs, promptInput, dispatchAttempt === undefined
-      ? triggerId
-      : { turnId: triggerId, dispatchAttempt });
-    return buildAsyncQueuedResponse(
-      triggerId,
-      session.sessionId,
-      chatId,
-      'queued new session turn; poll by sessionId or triggerId for final output',
-    );
+    // Commit-unknown barrier: CAS the lease reserved→attempting durably BEFORE
+    // beginAsyncTrigger / forkWorker touch the worker.
+    // BEFORE the barrier (still `reserved`, provably no dispatch): a failure here
+    // must truly CONVERGE the lease so a same-key retry does the right thing —
+    // never leaving a current-boot lease bound to the session we're about to
+    // close (resolveIdempotencyHit would otherwise reuse it and hang the poller).
+    // No fork has happened yet, so at-most-once is trivially safe on this path;
+    // the only goal is convergence (finding #1: the old catch swallowed both the
+    // `changed` result AND an EIO throw as "best-effort success").
+    try {
+      markAttemptingBeforeDispatch();
+    } catch (err) {
+      // Did we durably terminalize a CROSSED fence here? If so we can return an
+      // observable terminal `failed` (the caller polls it) rather than a bare
+      // 5xx — codex #776 finding #1: "若已 attempting 则 durable terminalize …
+      // 真正收敛 … 而不是 close 后返回普通 5xx".
+      let terminalizedCrossedFence = false;
+      if (idempotencyKey && idempotencyLease) {
+        try {
+          // idempotencyLease is still the pre-transition `reserved` snapshot
+          // (markAttemptingBeforeDispatch only reassigns it on success).
+          const rm = idempotencyStore.compareAndRemove(larkAppId, idempotencyKey, idempotencyLease);
+          if (rm.kind === 'changed' && rm.sameIdentity && rm.current.state === 'attempting') {
+            // MY exact lease (same immutable identity) advanced to attempting: the
+            // rename landed but a post-rename fsync threw → the disk is now a
+            // CROSSED commit-unknown fence I own. Never delete it — durably
+            // terminalize MY session/trigger so a retry resolves `failed`
+            // (at-most-once), not reuse-forever.
+            asyncTriggerStore.recordFailedStrict(session.sessionId, triggerId, Date.now(), larkAppId, 'dispatch_unknown');
+            terminalizedCrossedFence = true;
+          } else if (rm.kind === 'changed') {
+            // Changed but NOT my identity advanced-to-attempting: either a
+            // DIFFERENT winner replaced the slot (takeover/re-claim), or my lease
+            // moved to an unexpected state. Do NOT fabricate a local terminal on a
+            // session that isn't the current winner (finding #3) — that would fail
+            // MY loser session while the real winner keeps running. Leave the
+            // winner to its own lifecycle; only close my never-dispatched local
+            // session below and return an honest 5xx (a retry resolves via the
+            // winner's own evidence).
+            logger.warn(`[idempotency] barrier-fail release saw the lease change (sameIdentity=${rm.sameIdentity} current rev ${rm.current.revision} state ${rm.current.state} session ${rm.current.sessionId}); not faking a local terminal, leaving the winner`);
+          }
+          // removed / absent → cleanly released; a same-key retry starts fresh.
+        } catch (e) {
+          // Either compareAndRemove THREW (corrupt re-read / EIO unlink) or the
+          // crossed-fence recordFailedStrict THREW (double fault): the store state
+          // is unprovable / not durably terminal. Leave the lease for next-boot
+          // reconcile; the same-boot-needs-live guard in resolveIdempotencyHit
+          // stops a reuse-forever before then (finding #1: unprovable ≠ silent
+          // success). Fall through to the honest 5xx.
+          logger.error(`[idempotency] barrier-fail release could not converge the lease (${(e as Error).message}); left for reconcile`);
+        }
+      }
+      await closeSession(session.sessionId);
+      if (terminalizedCrossedFence) {
+        // Observable terminal: the caller can poll this sessionId and get `failed`.
+        return {
+          ok: false, state: 'failed', triggerId,
+          errorCode: 'no_output',
+          error: `idempotency attempt-barrier crossed then failed; outcome unknown (at-most-once, not re-run): ${(err as Error).message}`,
+          target: { kind: 'turn', sessionId: session.sessionId, chatId },
+          idempotencyKey, idempotent: false,
+        };
+      }
+      return {
+        ok: false, errorCode: 'trigger_failed',
+        error: `idempotency attempt-barrier failed: ${(err as Error).message}`,
+        ...(idempotencyKey ? { idempotencyKey } : {}),
+      };
+    }
+    // AFTER the barrier (now `attempting`, commit-unknown): any synchronous throw
+    // from beginAsyncTrigger/prepare/forkWorker must NOT leave the caller polling
+    // `running` forever. Write the authoritative durable failed (dispatch_unknown)
+    // and close — at-most-once, never re-dispatched (finding #5b).
+    try {
+      beginAsyncTrigger(newDs, triggerId);
+      // Stamp the idempotent-async-turn descriptor so a worker that dies with no
+      // final_output converges to a durable `dispatch_unknown` instead of polling
+      // `running` forever (codex #776 round-6 finding #1). Only for keyed turns:
+      // a non-idempotent async turn has no lease to transition and its
+      // worker-crash semantics are unchanged. The generation is the one this fork
+      // runs on (fork increments from the current max), so the exit handler can
+      // ignore a later generation that already moved on.
+      if (idempotencyKey && idempotencyLease) {
+        const dispatchedGeneration = Math.max(
+          newDs.workerGeneration ?? 0,
+          newDs.session.workerGeneration ?? 0,
+        ) + 1;
+        newDs.idempotentAsyncTurn = {
+          ownerLarkAppId: larkAppId,
+          key: idempotencyKey,
+          triggerId,
+          workerGeneration: dispatchedGeneration,
+        };
+      }
+      const dispatchAttempt = prepareStableDispatch(newDs, true);
+      armFinalOutputSuppression(newDs, dispatchAttempt);
+      // Keyed idempotent async turns are at-most-once: once the daemon
+      // terminalizes them on CLI/worker exit, the worker must NEVER replay the
+      // input onto an auto-restarted CLI (codex #776 round-7 finding #1). Pass the
+      // object form so `atMostOnce` rides the init message even when there's no
+      // dispatchAttempt (keyed turns have none).
+      const atMostOnce = !!(idempotencyKey && idempotencyLease);
+      const forkArg = (dispatchAttempt === undefined && !atMostOnce)
+        ? triggerId
+        : { turnId: triggerId, ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}), ...(atMostOnce ? { atMostOnce: true } : {}) };
+      forkWorker(newDs, promptInput, forkArg);
+      releaseInitialReservation();
+    } catch (err) {
+      // The ONLY thing that lets us honestly report a terminal `failed` is a
+      // DURABLE failed record (that is what trigger-result reads). If the strict
+      // write itself fails (disk full/EIO), we must NOT claim `state:failed` —
+      // the caller could never observe it and would see `running` forever. In
+      // that double-failure case return a 5xx so the caller treats it as an
+      // unknown hard error (and the next boot's reconcile will converge the
+      // still-`attempting` lease). Only on a successful durable write do we
+      // return the terminal failed. (finding: double storage failure must be a
+      // fail-closed 5xx, not a phantom `failed`.)
+      let terminalDurable = false;
+      if (idempotencyKey) {
+        try {
+          asyncTriggerStore.recordFailedStrict(session.sessionId, triggerId, Date.now(), larkAppId, 'dispatch_unknown');
+          terminalDurable = true;
+        } catch (e) {
+          logger.error(`[idempotency] dispatch threw AND recordFailedStrict failed — lease stays attempting for next-boot reconcile: ${(e as Error).message}`);
+        }
+      }
+      try { await closeSession(session.sessionId); } catch { /* best-effort; terminal already durable if terminalDurable */ }
+      if (idempotencyKey && !terminalDurable) {
+        return {
+          ok: false, errorCode: 'trigger_failed',
+          error: `dispatch failed and terminal outcome could not be persisted: ${(err as Error).message}`,
+          target: { kind: 'turn', sessionId: session.sessionId, chatId },
+          idempotencyKey,
+        };
+      }
+      return {
+        ok: false, state: 'failed', triggerId,
+        errorCode: 'no_output', error: `dispatch failed with unknown outcome: ${(err as Error).message}`,
+        target: { kind: 'turn', sessionId: session.sessionId, chatId },
+        ...(idempotencyKey ? { idempotencyKey, idempotent: false } : {}),
+      };
+    }
+    return {
+      ...buildAsyncQueuedResponse(
+        triggerId,
+        session.sessionId,
+        chatId,
+        'queued new session turn; poll by sessionId or triggerId for final output',
+      ),
+      ...(idempotencyKey ? { idempotencyKey, idempotent: false } : {}),
+    };
   }
 
   if (stableTurnId) {
@@ -786,12 +1577,17 @@ export async function triggerSessionTurn(
     forkWorker(newDs, promptInput, dispatchAttempt === undefined
       ? triggerId
       : { turnId: triggerId, dispatchAttempt });
+    releaseInitialReservation();
   }
   else if (loudTurnId) {
     armLoudFinalSuppression(newDs);
     forkWorker(newDs, promptInput, loudTurnId);
+    releaseInitialReservation();
   }
-  else forkWorker(newDs, promptInput);
+  else {
+    forkWorker(newDs, promptInput);
+    releaseInitialReservation();
+  }
 
   return {
     ok: true,
@@ -800,4 +1596,15 @@ export async function triggerSessionTurn(
     target: { kind: 'turn', sessionId: session.sessionId, chatId },
     message: 'queued new session turn',
   };
+}
+
+export async function triggerSessionTurn(
+  req: TriggerRequest,
+  deps: TriggerSessionDeps,
+  internal?: TriggerSessionInternalOptions,
+): Promise<TriggerResponse> {
+  return withBotTurnAdmission(
+    deps.larkAppId,
+    () => triggerSessionTurnAdmitted(req, deps, internal),
+  );
 }

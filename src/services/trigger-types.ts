@@ -43,6 +43,12 @@ export interface TriggerRequest {
   options?: {
     dryRun?: boolean;
     dedupKey?: string;
+    /** Caller-provided idempotency key (scoped per bot). A retried /api/trigger
+     *  with the same key returns the SAME session + triggerId instead of
+     *  creating a new one and re-dispatching — so a lost HTTP response can't make
+     *  the turn run twice. Distinct from `dedupKey` (webhook-lifecycle alert
+     *  grouping). Non-empty, ≤200 chars. */
+    idempotencyKey?: string;
     status?: 'firing' | 'resolved' | string;
     waitForFinalOutput?: boolean;
     asyncReturnSessionId?: boolean;
@@ -68,6 +74,7 @@ export type TriggerErrorCode =
   | 'bot_not_in_chat'
   | 'daemon_offline'
   | 'dry_run'
+  | 'idempotency_conflict'
   | 'invalid_signature'
   | 'chat_not_allowed'
   | 'legacy_workflow_retired'
@@ -131,6 +138,12 @@ export interface TriggerResponse {
     sessionId?: string;
     completedAt?: string;
   };
+  /** Echo of the caller's `options.idempotencyKey`, when one was supplied. */
+  idempotencyKey?: string;
+  /** True when this response reused an EXISTING session for the idempotency key
+   *  (no new session created, no re-dispatch) instead of creating a fresh one.
+   *  Absent/false on the first (creating) call and on non-idempotent triggers. */
+  idempotent?: boolean;
   /** Read-only web-terminal URL for the live session's CLI pane, present only
    *  while a worker web server is up (typically `state:'running'` and at
    *  `'completed'` before the session closes). Lets an async caller (e.g. riff's
@@ -161,6 +174,17 @@ export function validateTriggerRequest(raw: unknown): { ok: true; request: Trigg
     return { ok: false, status: 400, body: { ok: false, errorCode: 'target_required', error: 'target.kind must be turn or workflow' } };
   }
   const options = isRecord(raw.options) ? raw.options : {};
+  // Strict boolean typing for the mode/gate flags. The validator derives these
+  // with `=== true` but triggerSessionTurn consumes some with truthiness; a
+  // non-boolean (e.g. "false" / 1) would pass a scope gate here yet take a
+  // different runtime branch — which, for an idempotency turn, could skip the
+  // reserved→attempting barrier and break at-most-once. Reject non-booleans so
+  // the two layers can never diverge (codex #776 round-4).
+  for (const flag of ['waitForFinalOutput', 'asyncReturnSessionId', 'dryRun'] as const) {
+    if (options[flag] !== undefined && typeof options[flag] !== 'boolean') {
+      return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: `options.${flag} must be a boolean` } };
+    }
+  }
   const waitForFinalOutput = options.waitForFinalOutput === true;
   const asyncReturnSessionId = options.asyncReturnSessionId === true;
   const hasChatId = typeof target.chatId === 'string' && target.chatId.trim().length > 0;
@@ -212,6 +236,36 @@ export function validateTriggerRequest(raw: unknown): { ok: true; request: Trigg
   }
   if (options.reasoningEffort !== undefined && !['low', 'medium', 'high', 'xhigh'].includes(options.reasoningEffort as string)) {
     return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: 'options.reasoningEffort must be one of low|medium|high|xhigh' } };
+  }
+  if (options.idempotencyKey !== undefined) {
+    if (typeof options.idempotencyKey !== 'string' || options.idempotencyKey.trim().length === 0 || options.idempotencyKey.length > 200) {
+      return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: 'options.idempotencyKey must be a non-empty string (<=200 chars)' } };
+    }
+    // Scope lock (fresh async virtual only): the dispatch lease is implemented
+    // solely on the fresh-session async-return seam, so the public contract must
+    // not advertise it anywhere else — an existing-session / wait / plain / dryRun
+    // retry would silently bypass the lease and double-run. Require the exact
+    // intersection: turn + asyncReturnSessionId, no wait/dryRun, and NO target
+    // that could resolve to an existing/real session (sessionId/rootMessageId/
+    // chatId — including a caller-forged http_async_*). Widen only via a new PR
+    // that extends the lease to those seams.
+    if (
+      target.kind !== 'turn'
+      || !asyncReturnSessionId
+      || waitForFinalOutput
+      || options.dryRun === true
+      || hasSessionId
+      || hasRootMessageId
+      || hasChatId
+    ) {
+      return {
+        ok: false, status: 400,
+        body: {
+          ok: false, errorCode: 'bad_request',
+          error: 'options.idempotencyKey is only supported for a fresh async virtual trigger (target.kind=turn, options.asyncReturnSessionId=true, no waitForFinalOutput/dryRun, and no target.sessionId/rootMessageId/chatId)',
+        },
+      };
+    }
   }
   return { ok: true, request: raw as unknown as TriggerRequest };
 }

@@ -37,6 +37,43 @@ export function getBotReadIsolation(larkAppId: string): boolean {
   try { return getBot(larkAppId).config.readIsolation === true; } catch { return false; }
 }
 
+/** Publish only the daemon's live spawn view (in-memory `botCfg.readIsolation`)
+ * without touching bots.json. Split out from {@link persistBotReadIsolation} so
+ * a future fence-then-publish caller can order the durable write and the
+ * worker-admission view independently — e.g. to close the window where a cold
+ * refork consumes a transient value while bots.json is rolled back after a
+ * Codex App ownership conflict. No caller stages the two halves yet;
+ * {@link updateBotReadIsolation} composes them in the usual persist→publish
+ * order, so today this only ever runs after a successful persist. */
+export function setBotReadIsolationRuntime(larkAppId: string, enabled: boolean): void {
+  try {
+    const cfg = getBot(larkAppId).config;
+    if (enabled) cfg.readIsolation = true;
+    else delete cfg.readIsolation;
+  } catch { /* the preceding successful update already proves this in production */ }
+}
+
+/** Persist the desired flag to bots.json without publishing it to the live
+ * worker-admission view yet (see {@link setBotReadIsolationRuntime} for that
+ * half). Split from {@link updateBotReadIsolation} so a future caller can fence
+ * old generations between the durable write and the spawn-view publish; no
+ * caller stages the two halves today, so this runs as the first step of the
+ * composed {@link updateBotReadIsolation}. */
+export async function persistBotReadIsolation(
+  larkAppId: string,
+  enabled: boolean,
+): Promise<{ ok: true; readIsolation: boolean } | { ok: false; reason: string }> {
+  try { getBot(larkAppId); } catch { return { ok: false, reason: 'bot_not_registered' }; }
+
+  const r = await rmwBotEntry<boolean>(larkAppId, (entry) => {
+    if (enabled) entry.readIsolation = true;
+    else delete entry.readIsolation;
+    return { write: true, result: enabled };
+  });
+  if (!r.ok) return { ok: false, reason: r.reason };
+  return { ok: true, readIsolation: enabled };
+}
+
 /** Per-bot read-isolation toggle (macOS Seatbelt read-deny). Same persistence
  *  contract as {@link updateBotSandbox}: atomic bots.json write + in-memory sync,
  *  so the next session spawn reads `botCfg.readIsolation` without a daemon restart. */
@@ -44,17 +81,9 @@ export async function updateBotReadIsolation(
   larkAppId: string,
   enabled: boolean,
 ): Promise<{ ok: true; readIsolation: boolean } | { ok: false; reason: string }> {
-  let bot;
-  try { bot = getBot(larkAppId); } catch { return { ok: false, reason: 'bot_not_registered' }; }
-
-  const r = await rmwBotEntry<boolean>(larkAppId, (entry) => {
-    if (enabled) entry.readIsolation = true;
-    else delete entry.readIsolation;  // omit key when off → preserves "absent = off"
-    return { write: true, result: enabled };
-  });
+  const r = await persistBotReadIsolation(larkAppId, enabled);
   if (!r.ok) return { ok: false, reason: r.reason };
-
-  bot.config.readIsolation = enabled;
+  setBotReadIsolationRuntime(larkAppId, enabled);
   logger.info(`[read-isolation:${larkAppId}] readIsolation → ${enabled}`);
   return { ok: true, readIsolation: enabled };
 }

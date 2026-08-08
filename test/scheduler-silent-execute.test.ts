@@ -91,7 +91,23 @@ vi.mock('../src/core/worker-pool.js', () => ({
   }),
   setActiveSessionSafe: vi.fn(async (map: Map<string, any>, k: string, ds: any) => { map.set(k, ds); }),
   getActiveSessionsRegistry: vi.fn(() => null),
-  isRelayableRealSession: vi.fn(() => false),
+  withActiveSessionKeyLock: vi.fn(async (
+    _map: Map<string, any>,
+    _key: string,
+    action: () => any,
+  ) => action()),
+  isRelayableRealSession: vi.fn((ds: DaemonSession) =>
+    (!!ds.worker && !ds.worker.killed) || !!ds.session.cliId || !!ds.session.lastCliInput),
+  isDisposableCommandScratch: vi.fn((ds: DaemonSession) =>
+    !ds.worker
+    && !ds.pendingRepo
+    && ds.pendingPrompt === undefined
+    && ds.pendingRawInput === undefined
+    && !ds.adoptedFrom
+    && !ds.session.adoptedFrom
+    && !ds.session.queued
+    && !ds.session.cliId
+    && !ds.session.lastCliInput),
   closeSession: vi.fn(),
   suspendWorker: vi.fn(),
 }));

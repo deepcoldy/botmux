@@ -20,25 +20,34 @@ describe('daemon per-turn reply sender + participant wiring', () => {
     expect(daemonSource).toContain('buildTurnParticipants(larkAppId, senderOpenId, senderIsBotTriState(parsed.senderType, isForeignBotSender), parsed.mentions, newTopicSender?.name, newTopicPostAt)');
     expect(daemonSource).toMatch(/participants: newTopicWindow\.participants, participantsIncomplete: newTopicWindow\.incomplete/);
     // existing-session: prepared (race-loser) handoff uses the COMPLETE pre-extracted
-    // set; otherwise extract from this message.
-    expect(daemonSource).toContain('const existingPostAt = prepared?.postParticipantMentions ?? collectPostAtMentions(data?.message);');
+    // set; otherwise extract from this message AND the forward-seed message (a
+    // CAS loser routes back through handleThreadReplyAdmitted without re-passing
+    // prepared.postParticipantMentions, so the seed's post @s must be recovered
+    // from ctx.forwardSeedData here — see the double-race guard test below).
+    expect(daemonSource).toContain('const existingPostAt = prepared?.postParticipantMentions ?? collectPostAtMentions(data?.message, ctx.forwardSeedData?.message);');
     expect(daemonSource).toContain('buildTurnParticipants(larkAppId, callerOpenId, senderIsBotTriState(parsed.senderType, isForeignBot), parsed.mentions, undefined, existingPostAt)');
     expect(daemonSource).toMatch(/participants: existingWindow\.participants, participantsIncomplete: existingWindow\.incomplete/);
-    // auto-create: same prepared-vs-fresh post-@ resolution
-    expect(daemonSource).toContain('const autoCreatePostAt = prepared?.postParticipantMentions ?? collectPostAtMentions(data?.message);');
+    // auto-create: same prepared-vs-fresh post-@ resolution (also folds forward seed)
+    expect(daemonSource).toContain('const autoCreatePostAt = prepared?.postParticipantMentions ?? collectPostAtMentions(data?.message, ctx.forwardSeedData?.message);');
     expect(daemonSource).toContain('buildTurnParticipants(larkAppId, senderOId, senderIsBotTriState(parsed.senderType, isForeignBot), parsed.mentions, autoCreateSender?.name, autoCreatePostAt)');
     expect(daemonSource).toMatch(/participants: autoCreateWindow\.participants, participantsIncomplete: autoCreateWindow\.incomplete/);
   });
 
-  it('BOTH registration-race loser handoffs carry the pre-extracted seed+follow-up post @s', () => {
-    // Two CAS-loser handoffs (new-topic loser → handleThreadReply, and the
-    // auto-create loser inside it) must EACH forward the complete pre-extracted
-    // set, or a double-race drops the seed's post inline @s.
+  it('BOTH registration-race loser handoffs preserve the pre-extracted seed+follow-up post @s', () => {
+    // Two CAS-loser handoffs (new-topic loser and the auto-create loser) must EACH
+    // preserve the complete seed's post inline @s, or a double-race drops them.
+    // #597 merge: the losers route back through the canonical owner via
+    // handleThreadReplyAdmitted(data, ctx) rather than passing an explicit
+    // `postParticipantMentions`. That handler recomputes the window from
+    // `prepared?.postParticipantMentions ?? collectPostAtMentions(data, forwardSeed)`,
+    // so it MUST read ctx.forwardSeedData?.message too — otherwise the seed's post
+    // @s vanish on the loser path (the exact double-race #750 guarded). Assert the
+    // recompute in both admitted branches carries the forward seed.
     expect(daemonSource).toMatch(/postParticipantMentions\?: LarkMention\[\];/);   // on the prepared type
-    expect(daemonSource).toContain('postParticipantMentions: newTopicPostAt,');    // new-topic loser handoff
-    expect(daemonSource).toContain('postParticipantMentions: autoCreatePostAt,');  // auto-create loser handoff
-    // Exactly the two loser handoffs pass it (not accidentally dropped from one).
-    expect(daemonSource.match(/postParticipantMentions: (?:newTopicPostAt|autoCreatePostAt),/g)).toHaveLength(2);
+    // Both admitted recompute points fold the forward-seed message into the post @s.
+    expect(
+      daemonSource.match(/collectPostAtMentions\(data\?\.message, ctx\.forwardSeedData\?\.message\)/g),
+    ).toHaveLength(3); // new-topic primary + existing-thread loser + auto-create loser
   });
 
   it('buildTurnParticipants concats pre-extracted post @s (extractPostAtParticipants) into the window', () => {

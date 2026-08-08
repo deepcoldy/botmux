@@ -19,7 +19,7 @@ describe('dashboard bot payload helpers', () => {
       'botToBotSameDir', 'brandLabel', 'canTalkDaemonCommands', 'cliRuntime', 'codexAppCleanInput',
       'customPassthroughCommands', 'defaultOncall', 'defaultWorkingDir',
       'defaultWorkingDirAutoWorktree', 'disableStreamingCard', 'docSubscribeDefaultMode',
-      'env', 'launchShell', 'maxLiveWorkers', 'messageQuotaDefaultLimit', 'model',
+      'env', 'grantDefaultDurationMs', 'launchShell', 'maxLiveWorkers', 'messageQuotaDefaultLimit', 'model',
       'overloadAlert', 'p2pMode', 'privateCard', 'regularGroupMentionMode',
       'regularGroupReplyMode', 'restrictGrantCommands', 'riff', 'sandbox', 'sandboxPaths',
       'silentTurnReactions', 'skillInjection', 'startupCommands', 'substituteMode',
@@ -255,6 +255,17 @@ describe('dashboard bot payload helpers', () => {
     });
     expect(botDefaultsPayload(daemon, { autoGrantRequestCards: false })).toMatchObject({
       autoGrantRequestCards: false,
+    });
+  });
+
+  it('projects only supported default grant durations', () => {
+    const daemon = { larkAppId: 'app_a', botName: 'BotA', cliId: 'codex' };
+    expect(botDefaultsPayload(daemon, {})).toMatchObject({ grantDefaultDurationMs: null });
+    expect(botDefaultsPayload(daemon, { grantDefaultDurationMs: 8 * 60 * 60 * 1000 })).toMatchObject({
+      grantDefaultDurationMs: 8 * 60 * 60 * 1000,
+    });
+    expect(botDefaultsPayload(daemon, { grantDefaultDurationMs: 2 * 60 * 60 * 1000 })).toMatchObject({
+      grantDefaultDurationMs: null,
     });
   });
 

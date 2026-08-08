@@ -13,13 +13,15 @@ describe('daemon stopped-worker substitute refork wiring', () => {
     expect(forkStart).toBeGreaterThan(start);
     expect(end).toBeGreaterThan(start);
     const reforkBlock = source.slice(start, end);
-    expect(reforkBlock).toMatch(/\n\s+substituteTrigger,\n/);
+    expect(reforkBlock).toContain(
+      'substituteTrigger: queuedHasDurableTail ? undefined : substituteTrigger',
+    );
     expect(reforkBlock).toContain('substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined');
     expect(reforkBlock).toContain('applyQueuedCodexAppLegacyFallback(builtReforkInput');
     expect(reforkBlock).toContain('Legacy queued dashboard task has no clean-input text');
     expect(reforkBlock).toContain('wrappedInput !== builtReforkInput && dsBotCfgForFork.codexAppCleanInput === true');
     expect(reforkBlock.indexOf('applyQueuedCodexAppLegacyFallback(builtReforkInput'))
-      .toBeLessThan(reforkBlock.indexOf('rememberLastCliInput(ds, promptContent, wrappedInput)'));
+      .toBeLessThan(reforkBlock.indexOf('rememberLastCliInput(ds, queuedHasDurableTail'));
   });
 
   it('clears stale multi-Riff repo state when doc-watch replaces a stopped session cwd', () => {

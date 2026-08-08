@@ -84,6 +84,12 @@ export const BOTMUX_REQUIRED_SCOPES: RequiredScope[] = [
   // 自检 DM 打扰；只有当同时缺别的 critical 项时才顺带在提示里列出。开了功能却缺它 →
   // bot 开的新话题收不到事件、自动开工静默不触发（预期降级，非崩溃）。
   { name: 'im:message.group_msg.include_bot:read', desc: '接收群聊中所有用户和其他机器人发送的消息（「其他机器人开的新话题也自动开工」需要）', critical: false },
+  // Dashboard 建群/创建会话的原生飞书标签功能。标签 API 只接受用户身份，
+  // 这里检测的是应用是否已经声明对应 user scope；真正使用时仍需用户做一次 OAuth。
+  // 标 non-critical：不用标签的部署不应因它阻塞 daemon 启动；有缓存的开放平台
+  // Web session 时，event-dispatcher 会在启动阶段静默补权限并发布新版本。
+  { name: 'im:feed_group_v1:read', desc: '读取飞书会话标签（Dashboard 建群分类）', critical: false },
+  { name: 'im:feed_group_v1:write', desc: '创建飞书会话标签并将新群加入标签', critical: false },
   { name: 'application:application:self_manage', desc: '应用自查 (免审批)', critical: false },
 ];
 

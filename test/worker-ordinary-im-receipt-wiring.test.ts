@@ -43,17 +43,18 @@ describe('ordinary IM worker receipt wiring', () => {
     const backendQueue = sendToPty.indexOf('if (cliRestartInProgress || !backend)');
     const adapterReject = sendToPty.indexOf('if (!cliAdapter) return false;');
     const init = caseRegion('init', 'message');
+    const initialPromptQueue = init.indexOf('pendingMessages.unshift(...recoveredAcceptedInputs, {');
     const flushStart = workerSource.indexOf('async function flushPending()');
     const flushEnd = workerSource.indexOf('\nfunction sendToPty(', flushStart);
     const flush = workerSource.slice(flushStart, flushEnd);
 
     expect(backendQueue).toBeGreaterThanOrEqual(0);
     expect(adapterReject).toBeGreaterThan(backendQueue);
-    expect(init).toContain('pendingMessages.unshift({');
+    expect(initialPromptQueue).toBeGreaterThanOrEqual(0);
     expect(flush).toContain('if (initialInputOwnershipPending) return;');
     expect(init.indexOf('initialInputOwnershipPending = !!msg.prompt;'))
       .toBeLessThan(init.indexOf('await startWebServer('));
     expect(init.indexOf('initialInputOwnershipPending = false;'))
-      .toBeGreaterThan(init.indexOf('pendingMessages.unshift({'));
+      .toBeGreaterThan(initialPromptQueue);
   });
 });

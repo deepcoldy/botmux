@@ -68,6 +68,7 @@ vi.mock('../src/adapters/backend/zmx-backend.js', () => ({
 
 vi.mock('../src/bot-registry.js', () => ({
   getBot: getBotMock,
+  getBotBrand: vi.fn(() => 'feishu'),
   getAllBots: vi.fn(() => []),
   resolveBrandLabel: vi.fn(() => undefined),
 }));
@@ -84,6 +85,7 @@ vi.mock('../src/im/lark/client.js', () => ({
 vi.mock('../src/services/frozen-card-store.js', () => ({
   loadFrozenCards: vi.fn(() => new Map()),
   saveFrozenCards: vi.fn(),
+  deleteFrozenCards: vi.fn(),
 }));
 
 vi.mock('../src/utils/logger.js', () => ({
@@ -533,6 +535,7 @@ describe('killWorker — with a live worker (unchanged path)', () => {
     expect(d.worker).toBeNull();
     expect(d.managedTurnOrigin).toBeUndefined();
   });
+
 });
 
 describe('teardownAuthoritativePersistentBackingBeforeClose', () => {

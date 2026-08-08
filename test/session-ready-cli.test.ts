@@ -65,6 +65,7 @@ describe('botmux session-ready — isolated CLI fallback', () => {
     writeFileSync(
       join(relayDir, RELAY_ORIGIN_CAPABILITY_BASENAME),
       JSON.stringify({ token: capability }),
+      { mode: 0o600 },
     );
 
     let receivedBody = '';

@@ -16,6 +16,7 @@ describe('bot defaults focused layout', () => {
     expect(page).toContain('<SessionModeSection');
     expect(page).toContain('<SandboxSection');
     expect(page).toContain('<CardBehaviorSection');
+    expect(page).toContain('<section className="bd-tile bd-tile-wide"><CardBehaviorSection');
     expect(page).toContain('<RuntimeEnvironmentSection');
   });
 
@@ -81,5 +82,21 @@ describe('bot defaults focused layout', () => {
     for (const key of ['tabCommon', 'tabSessions', 'tabSecurity', 'tabCards', 'tabAdvanced']) {
       expect(i18n.match(new RegExp(`'botDefaults\\.${key}'`, 'g'))).toHaveLength(2);
     }
+  });
+
+  it('adds duration without replacing the familiar full-width quota editor', () => {
+    expect(page).toContain('dataInput="grantDefaultDurationMs"');
+    expect(page).toContain('data-input="quotaLimit"');
+    expect(page).toContain('data-action="save-grant-defaults"');
+    expect(page).toContain('className="bd-row bd-grant-duration"');
+    expect(page).toContain('className="bd-row bd-quota"');
+    expect(page).not.toContain('data-action="toggle-grant-quota-oncall"');
+    expect(page).not.toContain('data-action="reset-grant-defaults"');
+    expect(i18n).toContain("'botDefaults.quotaPlaceholder': '留空＝授权卡每人 3 条'");
+    expect(i18n).toContain("'botDefaults.grantDefaultsCurrentBuiltIn': '当前：{duration} · 授权卡每人 {count} 条；Oncall 不限'");
+    expect(i18n).not.toContain('产品默认 3 条');
+    expect(i18n).not.toContain('product default of 3');
+    expect(css).not.toContain('.bot-defaults-page .bd-grant-default-grid');
+    expect(css).toMatch(/\.bot-defaults-page \.bd-grant-defaults > \.actions\s*\{[\s\S]*?justify-content:\s*flex-end;/);
   });
 });

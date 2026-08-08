@@ -100,4 +100,20 @@ describe('CodexServiceTierTracker', () => {
       null,
     ]);
   });
+
+  it('re-publishes when only reasoningEffort changes (in-session /effort switch)', () => {
+    const updates: Array<CodexServiceTierSnapshot | null> = [];
+    const tracker = new CodexServiceTierTracker(resolve, update => updates.push(update));
+
+    tracker.bind('/rollout.jsonl');
+    tracker.observe('/rollout.jsonl', { model: 'gpt-5.6-sol', serviceTier: 'default', reasoningEffort: 'high' });
+    // Same model + tier, different effort → must NOT dedupe away.
+    tracker.observe('/rollout.jsonl', { model: 'gpt-5.6-sol', serviceTier: 'default', reasoningEffort: 'xhigh' });
+
+    expect(updates).toEqual([
+      null,
+      { model: 'gpt-5.6-sol', serviceTier: 'default', reasoningEffort: 'high', nonDefault: false },
+      { model: 'gpt-5.6-sol', serviceTier: 'default', reasoningEffort: 'xhigh', nonDefault: false },
+    ]);
+  });
 });

@@ -25,13 +25,16 @@ import { existsSync, mkdirSync, copyFileSync, readFileSync, writeFileSync, renam
 import { underReadIsolation, sendCredFilePath } from './adapters/cli/read-isolation.js';
 import { atomicWriteFileSync } from './utils/atomic-write.js';
 import { join, dirname, basename, resolve } from 'node:path';
-import { homedir } from 'node:os';
+import { homedir, userInfo } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { createInterface } from 'node:readline';
 import { createRequire } from 'node:module';
 import { randomBytes, randomUUID } from 'node:crypto';
 import { validateWorkingDir } from './core/working-dir.js';
-import { resolveSessionContext } from './core/session-marker.js';
+import {
+  findAncestorSessionContext as findLiveAncestorSessionContext,
+  resolveSessionContext,
+} from './core/session-marker.js';
 import { resolveBotmuxDataDir } from './core/data-dir.js';
 import { dashboardSecretPath } from './core/dashboard-secret.js';
 import { acceptedDispatchBotAppIds, activeConversationBotOpenIds, appendDispatchReportProtocol, appendLegacyDispatchReportProtocol, parseDispatchBotSpec, buildDispatchMessages, buildRepoPrimeText, buildReportContent, eligibleAutoMentionAliases, findDispatchRegistryEntry, foldableChatSessionAppIds, offTopicSubBotTopic, resolveReportPlacement, resolveReportRecipient, resolveReportTarget, resolveSendTarget, threadRootForReachability } from './core/dispatch.js';
@@ -77,8 +80,14 @@ import {
 import { interactiveSelect, pickChoice, pickCliSelection } from './setup/interactive-select.js';
 import { buildPreset, serializePreset, presetFilename } from './setup/agent-preset.js';
 import type { CliId } from './adapters/cli/types.js';
+import type { CodexAppDispatchLedgerEntry } from './types.js';
+import {
+  validateCodexAppManagedSendOrigin,
+} from './utils/codex-app-dispatch-ledger.js';
+import { hasProtectedSessionMutationOwnership } from './core/session-mutation-guard.js';
 import type { BackendType, PersistentBackendTarget, SessionProbe } from './adapters/backend/types.js';
 import { logger } from './utils/logger.js';
+import { withFileLock, withFileLockSync } from './utils/file-lock.js';
 import { scrubClaudeSessionMarkerEnv, scrubSessionCliHomeEnv } from './utils/child-env.js';
 import { scheduleTimeZone } from './utils/timezone.js';
 import { expandHomePath, invalidWorkingDirs } from './utils/working-dir.js';
@@ -103,7 +112,6 @@ import { buildPm2SpawnCommand } from './cli/pm2-command.js';
 import { pm2ManagedExitConfig } from './pm2-graceful-exit.js';
 import { callDashboard, type DashboardEndpoint, type DashboardResult } from './cli/dashboard-endpoint.js';
 import { globalInstallUpdateLockTargetIn, installLatestBotmuxSync } from './core/maintenance.js';
-import { withFileLockSync } from './utils/file-lock.js';
 import {
   formatGlobalInstallCommand,
   resolveGlobalInstallPlan,
@@ -121,7 +129,19 @@ import {
 } from './workflows/v3/session-relay-client.js';
 import { fetchDaemonIpc, loadDaemonIpcSecret } from './core/daemon-ipc-auth.js';
 import { isRetryableAskHttpStatus } from './core/ask-types.js';
-import { readManagedOriginCapability } from './core/managed-origin-capability.js';
+import {
+  hasManagedOriginIsolationMarker,
+  managedOriginDataRootProbeAccess,
+  managedOriginIsolationSentinelAccess,
+  managedOriginLegacyIsolationProbeAccess,
+  readManagedOriginRootLocator,
+  readManagedOriginCapability,
+} from './core/managed-origin-capability.js';
+import {
+  attestManagedOrigin,
+  type ManagedOriginAttestation,
+  type ManagedOriginAttestationContext,
+} from './core/managed-origin-attestation.js';
 import { rejectLikelyWindowsStdinMojibake, decodeStdinBytes } from './cli/stdin-encoding.js';
 import {
   formatBotInfoEntriesForCli,
@@ -3244,6 +3264,12 @@ interface SessionData {
   currentReplyTarget?: { rootMessageId: string; turnId: string; updatedAt: string; quoteOnly?: boolean; substitute?: boolean };
   /** Per-turn reply targets（见 Session.replyTargets in types.ts）——排队/并发轮次各自的回复锚点。 */
   replyTargets?: Record<string, { rootMessageId?: string; updatedAt: string; quoteOnly?: boolean; substitute?: boolean; senderOpenId?: string }>;
+  codexAppDispatchLedger?: CodexAppDispatchLedgerEntry[];
+  codexAppGenerationCommits?: unknown;
+  queued?: boolean;
+  queuedActivationPending?: boolean;
+  queuedActivationTail?: import('./types.js').QueuedActivationTailEntry[];
+  pendingRepoSetup?: import('./types.js').PendingRepoSetup;
   /** Current persisted worker lifetime and its exact input-queue receipts. */
   workerGeneration?: number;
   dispatchInputReceipts?: Record<string, {
@@ -3330,42 +3356,19 @@ function loadSessions(): Map<string, SessionData> {
     if (process.env.BOTMUX_LARK_APP_ID) loadPerBot(process.env.BOTMUX_LARK_APP_ID);
   }
 
-  // Migrate: remove sessions from legacy file if they have larkAppId (belong in per-bot files)
-  let legacyDirty = false;
-  for (const [k, v] of Object.entries(legacyData)) {
-    const s = v as SessionData;
-    if (s.larkAppId) {
-      delete legacyData[k];
-      legacyDirty = true;
-      // Ensure the session exists in its per-bot file
-      const perBotFp = join(dataDir, `sessions-${s.larkAppId}.json`);
-      let perBotData: Record<string, SessionData> = {};
-      if (existsSync(perBotFp)) {
-        try { perBotData = JSON.parse(readFileSync(perBotFp, 'utf-8')); } catch { /* */ }
-      }
-      // Only write if per-bot file doesn't already have this session
-      if (!perBotData[k]) {
-        perBotData[k] = s;
-        const tmpFp = perBotFp + '.tmp';
-        writeFileSync(tmpFp, JSON.stringify(perBotData, null, 2), 'utf-8');
-        renameSync(tmpFp, perBotFp);
-      }
-    }
-  }
-  if (legacyDirty) {
-    const tmpFp = legacyFp + '.tmp';
-    writeFileSync(tmpFp, JSON.stringify(legacyData, null, 2), 'utf-8');
-    renameSync(tmpFp, legacyFp);
-  }
+  // Deliberately read-only. Older CLIs opportunistically migrated legacy rows
+  // here, which made even `botmux list` a whole-file writer capable of racing a
+  // daemon ledger save. Durable migration belongs to daemon startup under the
+  // session-store lock; this generic discovery path only composes snapshots.
 
   return sessions;
 }
 
-/** Save a single session back to its appropriate file based on larkAppId. */
 function loadSessionFresh(session: SessionData): SessionData | undefined {
   return loadSessions().get(session.sessionId);
 }
 
+/** Save a single session back to its appropriate file based on larkAppId. */
 function saveSession(session: SessionData): void {
   const dataDir = resolveDataDir();
   const fileName = session.larkAppId ? `sessions-${session.larkAppId}.json` : 'sessions.json';
@@ -3411,6 +3414,289 @@ function saveSession(session: SessionData): void {
   }
 }
 
+/** Offline-only narrow session mutation. Callers must prefer the owning daemon
+ * while it is available; rereading the exact row here prevents stale CLI
+ * snapshots from copying FIFO fields during offline maintenance. */
+function mutateSessionOffline(
+  session: SessionData,
+  mutate: (current: SessionData) => boolean,
+): SessionData | undefined {
+  const dataDir = resolveDataDir();
+  const fileName = session.larkAppId ? `sessions-${session.larkAppId}.json` : 'sessions.json';
+  const fp = join(dataDir, fileName);
+  return withFileLockSync(fp, () => {
+    // The owning daemon uses the same session-file lock for every save. Check
+    // absence while holding it so two CLIs cannot race each other and an
+    // already-published daemon cannot be bypassed by the offline fallback.
+    if (session.larkAppId) {
+      try { if (findDaemon(session.larkAppId)) return undefined; } catch { /* offline */ }
+    }
+    let data: Record<string, SessionData> = {};
+    if (existsSync(fp)) {
+      try { data = JSON.parse(readFileSync(fp, 'utf-8')); } catch { /* start fresh */ }
+    }
+    const current = data[session.sessionId];
+    if (!current || !mutate(current)) return current;
+    data[session.sessionId] = current;
+
+    // Clean up entries where file key doesn't match the entry's sessionId
+    // (data corruption), and strip removed placeholder-card fields.
+    for (const [key, val] of Object.entries(data)) {
+      if (val && typeof val === 'object' && 'sessionId' in val && (val as SessionData).sessionId !== key) {
+        delete data[key];
+        continue;
+      }
+      if (val && typeof val === 'object') stripLegacyPendingCardFields(val as unknown as Record<string, unknown>);
+    }
+
+    // Recheck immediately before publication. A daemon that appears during
+    // the read/decision phase becomes authoritative; leave the file untouched.
+    if (session.larkAppId) {
+      try { if (findDaemon(session.larkAppId)) return undefined; } catch { /* offline */ }
+    }
+    const tmpFp = `${fp}.${process.pid}.${randomBytes(4).toString('hex')}.tmp`;
+    writeFileSync(tmpFp, JSON.stringify(data, null, 2), 'utf-8');
+    renameSync(tmpFp, fp);
+    return current;
+  });
+}
+
+type OfflineAbandonResult =
+  | { ok: true; current: SessionData; cleanedBacking?: string }
+  | { ok: false; error: string };
+
+/** Offline explicit abandon stops the exact Botmux-owned worker, then closes
+ * the newest durable row under the shared session-file lock. Provider-specific
+ * backing cleanup remains owned by the dedicated backend lifecycle changes. */
+async function abandonSessionOffline(session: SessionData): Promise<OfflineAbandonResult> {
+  let current = mutateSessionOffline(session, () => false);
+  if (!current) return { ok: false, error: 'owning_daemon_became_available' };
+
+  const originalPid = adoptedCliPid(current);
+  const ownedWorkerPid = current.pid && current.pid !== originalPid ? current.pid : undefined;
+  if (ownedWorkerPid) {
+    // Narrow the unavoidable descriptor race: do not signal a worker after an
+    // owning daemon has become visible. The locked write below repeats this.
+    if (current.larkAppId) {
+      try {
+        if (findDaemon(current.larkAppId)) {
+          return { ok: false, error: 'owning_daemon_became_available' };
+        }
+      } catch { /* still offline */ }
+    }
+    if (isProcessAlive(ownedWorkerPid)) {
+      const signalled = killProcess(ownedWorkerPid);
+      if ((!signalled && isProcessAlive(ownedWorkerPid))
+        || !(await waitForProcessExit(ownedWorkerPid))) {
+        return { ok: false, error: `worker_pid_kill_failed:${ownedWorkerPid}` };
+      }
+    }
+
+    // Persist worker-less state without touching FIFO authority. If a new
+    // daemon/generation changed the row while SIGTERM settled, fail closed.
+    let workerCleared = false;
+    const afterStop = mutateSessionOffline(current, latest => {
+      if (latest.pid !== ownedWorkerPid
+        || isAdoptedSession(latest) !== isAdoptedSession(current!)) return false;
+      delete latest.pid;
+      workerCleared = true;
+      return true;
+    });
+    if (!afterStop || !workerCleared) {
+      return { ok: false, error: 'session_changed_while_stopping_worker' };
+    }
+    current = afterStop;
+  } else {
+    // Even without a Botmux worker pid, re-read after the first authority check
+    // so the cleanup inputs are the newest locked backend/task lineage.
+    const refreshed = mutateSessionOffline(current, () => false);
+    if (!refreshed) return { ok: false, error: 'owning_daemon_became_available' };
+    current = refreshed;
+  }
+
+  // Provider-specific backing teardown (no daemon to run killWorker()). Adopted
+  // panes belong to the user and are never touched. This runs BEFORE the durable
+  // close so a ZMX ownership-tag mismatch fails closed: refusing to hide the sole
+  // control row while its CLI is still alive under a different owner.
+  let cleanedBacking: string | undefined;
+  if (!isAdoptedSession(current)) {
+    if (isSuspendableBackendType(current.backendType)) {
+      const target = resolvePersistentBackendTarget(
+        current.backendType,
+        current.sessionId,
+        current.persistentBackendTarget,
+      );
+      try {
+        killPersistentBackendTarget(target, current.sessionId);
+        cleanedBacking = `${target.backendType}:${target.sessionName}`;
+      } catch (err) {
+        // ZMX destruction is identity-verified against the complete botmux
+        // session UUID and waits for confirmed disappearance. Swallowing an
+        // inconclusive/mismatched kill would hide the sole control row while
+        // its CLI remains alive. Older mux backends keep their historical
+        // best-effort offline-close compatibility.
+        if (target.backendType === 'zmx') {
+          return {
+            ok: false,
+            error: `ZMX 离线删除未完成：${err instanceof Error ? err.message : String(err)}`,
+          };
+        }
+      }
+    } else {
+      // Legacy rows without backendType were historically tmux-backed.
+      const tmuxName = `bmx-${current.sessionId.substring(0, 8)}`;
+      try {
+        execSync(`tmux kill-session -t '${tmuxName}' 2>/dev/null`, {
+          stdio: 'ignore',
+          env: tmuxEnv(),
+        });
+      } catch { /* no tmux session */ }
+    }
+  }
+
+  let applied = false;
+  const published = mutateSessionOffline(current, latest => {
+    if (isAdoptedSession(latest) !== isAdoptedSession(current)) return false;
+    if (latest.status === 'closed') {
+      applied = true;
+      return false;
+    }
+    latest.status = 'closed';
+    latest.closedAt = new Date().toISOString();
+    delete latest.codexAppDispatchLedger;
+    delete latest.codexAppGenerationCommits;
+    delete latest.queuedActivationPending;
+    delete latest.queuedActivationTail;
+    delete latest.pendingRepoSetup;
+    applied = true;
+    return true;
+  });
+  if (!published || !applied) {
+    return { ok: false, error: 'session_changed_during_offline_cleanup' };
+  }
+
+  return { ok: true, current: published, ...(cleanedBacking ? { cleanedBacking } : {}) };
+}
+
+function pruneSessionOfflineIfLedgerEmpty(session: SessionData): boolean {
+  let pruned = false;
+  mutateSessionOffline(session, current => {
+    if (hasProtectedSessionMutationOwnership(current)) return false;
+    current.status = 'closed';
+    current.closedAt = new Date().toISOString();
+    delete current.codexAppDispatchLedger;
+    delete current.codexAppGenerationCommits;
+    pruned = true;
+    return true;
+  });
+  return pruned;
+}
+
+function patchSessionWhiteboardOffline(session: SessionData, whiteboardId: string): boolean {
+  return !!mutateSessionOffline(session, current => {
+    current.whiteboardId = whiteboardId;
+    return true;
+  });
+}
+
+async function postOwningDaemonSessionMutation(
+  session: SessionData,
+  suffix: 'close' | 'prune' | 'whiteboard',
+  body?: Record<string, unknown>,
+): Promise<'applied' | 'refused' | 'unavailable'> {
+  if (!session.larkAppId) return 'unavailable';
+  let daemon: ReturnType<typeof findDaemon>;
+  try { daemon = findDaemon(session.larkAppId); } catch { return 'unavailable'; }
+  if (!daemon) return 'unavailable';
+  let secret: string;
+  try { secret = loadDaemonIpcSecret(); } catch { return 'unavailable'; }
+  const res = await fetchDaemonIpc(
+    daemon.ipcPort,
+    `/api/sessions/${encodeURIComponent(session.sessionId)}/${suffix}`,
+    {
+      method: 'POST',
+      ...(body
+        ? {
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify(body),
+          }
+        : {}),
+    },
+    secret,
+  );
+  if (suffix === 'prune' && res.status === 409) return 'refused';
+  if (!res.ok) {
+    throw new Error(`owning daemon ${suffix} mutation failed: HTTP ${res.status}`);
+  }
+  return 'applied';
+}
+
+type AuthoritativeAbandonResult =
+  | { ok: true; mode: 'daemon' }
+  | { ok: true; mode: 'offline'; current: SessionData; cleanedBacking?: string }
+  | { ok: false; error?: string };
+
+async function abandonSessionAuthoritatively(
+  session: SessionData,
+  online: DaemonDescriptorLite[] = listOnlineDaemons(),
+): Promise<AuthoritativeAbandonResult> {
+  // Legacy larkAppId-less rows live in sessions.json; a per-bot daemon writes
+  // only its own sessions-<appId>.json and silently no-ops on close, so keep
+  // them on the offline path (which persists to the legacy file correctly).
+  if (session.larkAppId) {
+    const daemon = online.find(d => d.larkAppId === session.larkAppId);
+    const isCurrentSession = process.env.BOTMUX_SESSION_ID === session.sessionId;
+    const injectedPort = isCurrentSession
+      ? resolveDaemonIpcPort(undefined, process.env.BOTMUX_DAEMON_IPC_PORT)
+      : undefined;
+    const ipcPort = daemon?.ipcPort ?? injectedPort;
+    if (ipcPort) {
+      try {
+        // Explicit abandon boundary: route through the owning daemon so the
+        // ledger FIFO is cleared atomically with close. postSessionCliIpc carries
+        // the trusted-host HMAC (non-isolated) OR this session's rotating origin
+        // capability (sandboxed/read-isolated) so a sandboxed `delete <other-id>`
+        // stays fail-closed at the daemon's sessionCliIpcAuth check.
+        const res = await postSessionCliIpc(ipcPort, session.sessionId, 'close', {});
+        const body = await res.json().catch(() => ({} as Record<string, unknown>));
+        if (res.ok && (body as { ok?: unknown }).ok) return { ok: true, mode: 'daemon' };
+        // Surface the daemon's own rejection reason (e.g. origin_unproven) and
+        // never fall back to a partial local kill: a fresh descriptor means the
+        // daemon may still hold authoritative in-memory state.
+        return { ok: false, error: (body as { error?: string }).error ?? `HTTP ${res.status}` };
+      } catch (err) {
+        return { ok: false, error: `连接 daemon 失败: ${err instanceof Error ? err.message : String(err)}` };
+      }
+    }
+  }
+  const offline = await abandonSessionOffline(session);
+  return offline.ok
+    ? {
+        ok: true,
+        mode: 'offline',
+        current: offline.current,
+        ...(offline.cleanedBacking ? { cleanedBacking: offline.cleanedBacking } : {}),
+      }
+    : { ok: false, error: offline.error };
+}
+
+async function pruneSessionAuthoritatively(session: SessionData): Promise<boolean> {
+  const result = await postOwningDaemonSessionMutation(session, 'prune');
+  if (result === 'applied') return true;
+  if (result === 'refused') return false;
+  return pruneSessionOfflineIfLedgerEmpty(session);
+}
+
+async function patchSessionWhiteboardAuthoritatively(
+  session: SessionData,
+  whiteboardId: string,
+): Promise<boolean> {
+  const result = await postOwningDaemonSessionMutation(session, 'whiteboard', { whiteboardId });
+  if (result === 'applied') return true;
+  if (result === 'refused') return false;
+  return patchSessionWhiteboardOffline(session, whiteboardId);
+}
+
 function isProcessAlive(pid: number): boolean {
   try {
     process.kill(pid, 0);
@@ -3427,6 +3713,15 @@ function killProcess(pid: number): boolean {
   } catch {
     return false;
   }
+}
+
+async function waitForProcessExit(pid: number, timeoutMs = 2_000): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (!isProcessAlive(pid)) return true;
+    await new Promise(resolve => setTimeout(resolve, 50));
+  }
+  return !isProcessAlive(pid);
 }
 
 function formatDuration(ms: number): string {
@@ -4164,11 +4459,18 @@ function interactiveSessionPicker(active: SessionData[], probeSnapshot: BackingP
     async function deleteSession(idx: number): Promise<void> {
       const r = rows[idx];
       const s = r.session;
-      const result = await closeSessionForDelete(s);
+
+      // Explicit delete is the abandon boundary. Prefer the owning daemon so
+      // its current in-memory FIFO is cleared atomically with close; offline
+      // fallback rereads the exact row and clears the latest ledger/commits.
+      const result = await abandonSessionAuthoritatively(s);
       if (!result.ok) {
         flash = { style: 'error', text: `✗ 删除失败: ${result.error}` };
         return;
       }
+      // A live daemon owns process/pane teardown and has re-resolved the latest
+      // generation. Only the locked offline path may clean up resources, using
+      // the freshly-read row rather than this TUI's stale snapshot.
 
       // Remove from active list and TUI rows
       const activeIdx = active.indexOf(s);
@@ -4176,7 +4478,10 @@ function interactiveSessionPicker(active: SessionData[], probeSnapshot: BackingP
       rows.splice(idx, 1);
 
       if (cursor >= rows.length) cursor = Math.max(0, rows.length - 1);
-      flash = result.via === 'daemon'
+      // master's flash-object footer; the daemon/offline discriminant on
+      // abandonSessionAuthoritatively is `mode` (see its return type ~3573),
+      // NOT master's `via` — that belongs to a different helper.
+      flash = result.mode === 'daemon'
         ? { style: 'success', text: `✓ 已删除 ${s.sessionId.substring(0, 8)}` }
         : { style: 'warn', text: `✓ 已离线删除 ${s.sessionId.substring(0, 8)}` };
     }
@@ -4366,16 +4671,16 @@ async function cmdList(): Promise<void> {
   const closeNow = async (arr: SessionData[], kind: 'scratch' | 'real'): Promise<number> => {
     let closed = 0;
     for (const s of arr) {
-      const result = await closeSessionForDelete(s);
-      if (result.ok) {
+      if (await pruneSessionAuthoritatively(s)) {
         closed++;
       } else {
-        // Keep it visible: mutating only the store while a possible owner
-        // daemon still has the row in memory lets the next message resurrect
-        // exactly the session auto-prune claimed to close.
+        // The owning daemon observed a newly unsettled FIFO after this CLI's
+        // liveness snapshot, or still has the row in memory. Keep it visible
+        // instead of abandoning it: mutating only the store here would let the
+        // next message resurrect exactly the session auto-prune claimed to close.
         live.push(s);
         console.warn(
-          `⚠️ 未自动清理 ${kind === 'scratch' ? '占位' : '会话'} ${s.sessionId.substring(0, 8)}：${result.error}`,
+          `⚠️ 未自动清理 ${kind === 'scratch' ? '占位' : '会话'} ${s.sessionId.substring(0, 8)}：owner 仍持有该会话或存在未结算派发`,
         );
       }
     }
@@ -4384,9 +4689,9 @@ async function cmdList(): Promise<void> {
   // Scratches: close silently — they were placeholders, not dead sessions.
   await closeNow(prunedScratch, 'scratch');
   if (pruned.length > 0) {
-    const closed = await closeNow(pruned, 'real');
-    if (closed > 0) {
-      console.log(`已自动清理 ${closed} 个不可恢复的会话（进程已退出或无可恢复后端）`);
+    const prunedCount = await closeNow(pruned, 'real');
+    if (prunedCount > 0) {
+      console.log(`已自动清理 ${prunedCount} 个不可恢复的会话（进程已退出或无可恢复后端）`);
     }
   }
 
@@ -4474,20 +4779,25 @@ async function cmdDelete(): Promise<void> {
     toDelete.sort((a, b) => Number(a.sessionId === currentSessionId) - Number(b.sessionId === currentSessionId));
   }
 
-  const online = listOnlineDaemons();
   let closed = 0;
   let offline = 0;
   let failed = 0;
   for (const s of toDelete) {
-    const result = await closeSessionForDelete(s, online);
+    // Explicit abandon boundary: route through the owning daemon so the ledger
+    // FIFO is cleared atomically with close; offline fallback rereads the row
+    // and clears the latest ledger/commits.
+    const result = await abandonSessionAuthoritatively(s);
     if (!result.ok) {
-      console.error(`✗ ${s.sessionId.substring(0, 8)} ${s.title}: ${result.error}`);
+      console.error(`✗ ${s.sessionId.substring(0, 8)} ${s.title}${result.error ? `: ${result.error}` : ''}`);
       failed++;
       continue;
     }
     closed++;
-    if (result.via === 'offline') offline++;
-    console.log(`✓ ${s.sessionId.substring(0, 8)} ${s.title}${result.via === 'offline' ? '（daemon 离线，本地收口）' : ''}`);
+    if (result.mode === 'offline') {
+      offline++;
+      if (result.cleanedBacking) console.log(`  killed ${result.cleanedBacking}`);
+    }
+    console.log(`✓ ${s.sessionId.substring(0, 8)} ${s.title}${result.mode === 'offline' ? '（daemon 离线，本地收口）' : ''}`);
   }
   console.log(`\n已关闭 ${closed} 个会话${offline ? `（${offline} 个离线收口）` : ''}${failed ? `，${failed} 个失败` : ''}`);
   if (failed > 0) process.exitCode = 1;
@@ -4617,6 +4927,7 @@ async function postSessionCliIpc(
       resolveDataDir(),
       sessionId,
       process.env.BOTMUX_SEND_RELAY,
+      process.env.BOTMUX_ORIGIN_CHANNEL_ID,
     );
     if (claim) {
       requestBody.originCapability = claim.capability;
@@ -5852,7 +6163,10 @@ Context flags: --session-id, --lark-app-id, --chat-id, --working-dir/--repo`);
     let meta = ctx.session?.whiteboardId ? getWhiteboard(ctx.session.whiteboardId) : undefined;
     if (!meta && argFlag(rest, '--create')) {
       meta = ensureDefaultWhiteboard({ larkAppId: ctx.larkAppId, chatId: ctx.chatId, workingDir: ctx.workingDir, sessionId: ctx.sessionId });
-      if (ctx.session) { ctx.session.whiteboardId = meta.id; saveSession(ctx.session); }
+      if (ctx.session) {
+        await patchSessionWhiteboardAuthoritatively(ctx.session, meta.id);
+        ctx.session.whiteboardId = meta.id;
+      }
     }
     if (!meta) {
       console.log(JSON.stringify({ enabled: true, current: null, hint: 'Run `botmux whiteboard current --create` to ensure the default board.' }, null, 2));
@@ -5866,7 +6180,10 @@ Context flags: --session-id, --lark-app-id, --chat-id, --working-dir/--repo`);
     requireWhiteboardEnabled();
     const ctx = currentWhiteboardContext(rest);
     const meta = createWhiteboard({ id: argValue(rest, '--id'), title: argValue(rest, '--title'), larkAppId: ctx.larkAppId, chatId: ctx.chatId, workingDir: ctx.workingDir, sessionId: ctx.sessionId });
-    if (ctx.session && !ctx.session.whiteboardId) { ctx.session.whiteboardId = meta.id; saveSession(ctx.session); }
+    if (ctx.session && !ctx.session.whiteboardId) {
+      await patchSessionWhiteboardAuthoritatively(ctx.session, meta.id);
+      ctx.session.whiteboardId = meta.id;
+    }
     console.log(JSON.stringify({ board: meta, path: whiteboardPath(meta.id) }, null, 2));
     return;
   }
@@ -5887,7 +6204,10 @@ Context flags: --session-id, --lark-app-id, --chat-id, --working-dir/--repo`);
   if (!id && whiteboardEnabled() && action === 'update') {
     const meta = ensureDefaultWhiteboard({ larkAppId: ctx.larkAppId, chatId: ctx.chatId, workingDir: ctx.workingDir, sessionId: ctx.sessionId });
     id = meta.id;
-    if (ctx.session) { ctx.session.whiteboardId = id; saveSession(ctx.session); }
+    if (ctx.session) {
+      await patchSessionWhiteboardAuthoritatively(ctx.session, id);
+      ctx.session.whiteboardId = id;
+    }
   }
   if (!id) { console.error('No whiteboard id. Pass --id or run `botmux whiteboard current --create`.'); process.exit(1); }
 
@@ -6613,6 +6933,7 @@ async function relaySend(
     resolveDataDir(),
     sid,
     relayDir,
+    process.env.BOTMUX_ORIGIN_CHANNEL_ID,
   )?.capability;
   // Structured request: the daemon-side watcher rebuilds the argv from these
   // validated fields (it NEVER executes raw argv — see buildRelayHostArgs).
@@ -6995,14 +7316,100 @@ async function cmdSend(rest: string[]): Promise<void> {
   // central session-capability gate — same hard door every Feishu-touching CLI
   // command consults.
   assertTurnTransportOrExit('send');
-  // Managed output attribution must come from the live process-tree marker,
-  // whose turn/attempt is refreshed by the worker. BOTMUX_TURN_ID is a
-  // spawn-time fallback and can be stale in a detached child after a later
-  // delivery starts, so it is never authority for receiver policy.
-  const liveMarkerCtx = resolveSessionContext(
-    resolveDataDir(),
-    process.env.BOTMUX_SESSION_ID,
-  );
+  // Resolve isolation marker-first. A visible host marker always wins over a
+  // leftover capability. Linux bwrap keeps its host-execution outbox; macOS
+  // read isolation instead challenges the owning daemon and trusts only the
+  // matching host-written read-only proof sidecar. The capability file itself
+  // may survive worker SIGKILL and is never direct-send authority.
+  let sendDataDir = resolveDataDir();
+  let liveMarkerCtx = findLiveAncestorSessionContext(sendDataDir);
+  const relayDir = process.env.BOTMUX_SEND_RELAY;
+  const sessionIdArg = argValue(rest, '--session-id');
+  const inheritedSessionId = process.env.BOTMUX_SESSION_ID?.trim();
+  const inheritedOriginChannelId = process.env.BOTMUX_ORIGIN_CHANNEL_ID?.trim();
+  const isolationSessionCandidates = [...new Set([
+    inheritedSessionId,
+    ancestorCtx?.sessionId,
+    sessionIdArg,
+  ].filter((value): value is string => !!value))];
+  const isolationMarkerPresent = isolationSessionCandidates
+    .some(sessionId => !!inheritedOriginChannelId
+      && hasManagedOriginIsolationMarker(
+        sendDataDir,
+        sessionId,
+        inheritedOriginChannelId,
+      ));
+  let osUserHomeDir: string;
+  try { osUserHomeDir = userInfo().homedir; }
+  catch {
+    console.error('botmux send refused: OS account home unavailable for isolation classification');
+    process.exit(2);
+  }
+  if (!osUserHomeDir) {
+    console.error('botmux send refused: OS account home unavailable for isolation classification');
+    process.exit(2);
+  }
+  const kernelReadIsolationDetected = managedOriginLegacyIsolationProbeAccess(osUserHomeDir)
+    === 'sandbox_denied'
+    || managedOriginIsolationSentinelAccess(osUserHomeDir) === 'sandbox_denied';
+  const isolatedSendRequired = !relayDir
+    && (kernelReadIsolationDetected
+      || process.env.BOTMUX_READ_ISOLATED === '1'
+      || (!liveMarkerCtx?.sessionId && isolationMarkerPresent));
+  let isolatedBoundSessionId: string | undefined;
+  if (isolatedSendRequired) {
+    if (!inheritedOriginChannelId || !/^[a-f0-9]{64}$/.test(inheritedOriginChannelId)) {
+      console.error('botmux send refused: read-isolated pane authority channel is missing or invalid');
+      process.exit(2);
+    }
+    const locators = isolationSessionCandidates.flatMap(sessionId => {
+      const locator = readManagedOriginRootLocator(osUserHomeDir, sessionId);
+      return locator ? [locator] : [];
+    });
+    if (locators.length !== 1) {
+      console.error('botmux send refused: read-isolated owning data-root locator is missing or ambiguous');
+      process.exit(2);
+    }
+    const locator = locators[0]!;
+    if ((sessionIdArg && sessionIdArg !== locator.sessionId)
+      || (inheritedSessionId && inheritedSessionId !== locator.sessionId)) {
+      console.error('botmux send refused: read-isolated session does not match the owning data-root locator');
+      process.exit(2);
+    }
+    isolatedBoundSessionId = locator.sessionId;
+    sendDataDir = locator.dataDir;
+    // A locator is data, not authority. Require the kernel to deny the probe
+    // under the locator-selected *actual* Botmux root. Legacy Seatbelt profiles
+    // already denied this dashboard-secret basename class at their real root;
+    // a child-forged fake root remains readable and is therefore rejected.
+    if (managedOriginDataRootProbeAccess(sendDataDir, locator.sessionId)
+      !== 'sandbox_denied') {
+      console.error('botmux send refused: locator-selected data root is not protected by the active sandbox');
+      process.exit(2);
+    }
+    // All later session/credential/marker reads in this short-lived command
+    // must use the host-bound root, never the child's mutable inherited value.
+    process.env.SESSION_DATA_DIR = sendDataDir;
+    liveMarkerCtx = findLiveAncestorSessionContext(sendDataDir);
+  }
+  const isolatedCapabilityCtx = !isolatedSendRequired && liveMarkerCtx?.sessionId
+    ? null
+    : readWorkflowSessionRelayContext({
+        env: process.env,
+        dataDir: sendDataDir,
+        // Keep one marker snapshot for the whole decision. In particular, do
+        // not let resolveSessionContext's protected-capability fallback get
+        // mislabeled as a live process marker.
+        findMarker: () => isolatedSendRequired ? null : liveMarkerCtx,
+      });
+  if (isolatedSendRequired
+    && (isolatedCapabilityCtx?.sessionId !== isolatedBoundSessionId
+      || isolatedCapabilityCtx?.originChannelId !== inheritedOriginChannelId)) {
+    console.error('botmux send refused: read-isolated capability is not bound to this session');
+    process.exit(2);
+  }
+  let isolatedAttestationContext: ManagedOriginAttestationContext | undefined;
+  let isolatedManagedOriginCtx: ManagedOriginAttestation | undefined;
   const trustedHostRelay = process.env.BOTMUX_HOST_RELAY_AUTHORIZED === '1';
   const trustedRelayAttemptRaw = Number(process.env.BOTMUX_DISPATCH_ATTEMPT);
   const trustedRelayCandidate = trustedHostRelay && process.env.BOTMUX_SESSION_ID
@@ -7014,14 +7421,53 @@ async function cmdSend(rest: string[]): Promise<void> {
           : undefined,
       }
     : undefined;
-  const sessionIdArg = argValue(rest, '--session-id');
   // Inside bwrap the PID namespace makes host marker traversal impossible.
   // The relay watcher therefore binds a short-lived host-issued capability to
   // the worker's live turn and performs the authoritative policy check.
-  const relayDir = process.env.BOTMUX_SEND_RELAY;
-  if (relayDir) {
+  if (relayDir && isolatedCapabilityCtx) {
     await relaySend(rest, relayDir);
     return;
+  }
+  if (relayDir && !liveMarkerCtx?.sessionId) {
+    // The child may delete or replace its writable outbox capability, while
+    // the immutable default snapshot remains visible. That snapshot is only a
+    // routing hint and can survive worker death; never fall through to direct
+    // Lark send when the live relay token is absent.
+    console.error('botmux send refused: managed host relay capability is stale or missing');
+    process.exit(2);
+  }
+  if (!relayDir && isolatedSendRequired && !isolatedCapabilityCtx) {
+    // Isolation classification must not depend on successfully parsing the
+    // rotating token. A missing/corrupt/revoked capability is an authorization
+    // failure, never permission to downgrade into the ordinary direct path.
+    console.error('botmux send refused: read-isolated managed origin capability is stale, corrupt, or missing');
+    process.exit(2);
+  }
+  if (!relayDir && isolatedCapabilityCtx) {
+    isolatedAttestationContext = {
+      sessionId: isolatedCapabilityCtx.sessionId,
+      channelId: isolatedCapabilityCtx.originChannelId!,
+      capability: isolatedCapabilityCtx.capability,
+      dataDir: sendDataDir,
+      ...(isolatedCapabilityCtx.larkAppId
+        ? { larkAppId: isolatedCapabilityCtx.larkAppId }
+        : {}),
+      ...(isolatedCapabilityCtx.ipcPortFallback !== undefined
+        ? { ipcPortFallback: isolatedCapabilityCtx.ipcPortFallback }
+        : {}),
+    };
+    try {
+      isolatedManagedOriginCtx = await attestManagedOrigin({
+        context: isolatedAttestationContext,
+        resolveIpcPort: (larkAppId) => {
+          try { return larkAppId ? findDaemon(larkAppId)?.ipcPort : undefined; }
+          catch { return undefined; }
+        },
+      });
+    } catch (err) {
+      console.error(`botmux send refused: ${err instanceof Error ? err.message : String(err)}`);
+      process.exit(2);
+    }
   }
   // Silent is an execution policy, not a prompt suggestion. During a durable
   // meeting turn, refuse botmux-mediated sends before either the direct-Lark or
@@ -7041,10 +7487,45 @@ async function cmdSend(rest: string[]): Promise<void> {
   )
     ? trustedRelayCandidate
     : undefined;
+  // Keep origin authority independent from the requested destination.  In
+  // particular, `--session-id <other>` may select where an ordinary Lark turn
+  // is sent, but it must never replace the session whose durable delivery sink
+  // governs this process.  Session identity may fall back to the inherited env
+  // for detached commands; the turn tuple may not. `ancestorCtx` deliberately
+  // adds spawn-time BOTMUX_TURN_ID/ATTEMPT compatibility fallbacks, which can be
+  // stale after a later turn, so only a parent-bound host relay or a fresh
+  // marker/protected-capability tuple can authorize a durable dispatch.
   const originSessionId = trustedRelayCtx?.sessionId
-    || liveMarkerCtx?.sessionId
-    || ancestorCtx?.sessionId
-    || sessionIdArg;
+    ?? liveMarkerCtx?.sessionId
+    ?? isolatedManagedOriginCtx?.sessionId
+    ?? ancestorCtx?.sessionId
+    ?? process.env.BOTMUX_SESSION_ID;
+  const authoritativeOriginTurnCtx = trustedRelayCtx
+    ? (trustedRelayCtx.turnId ? trustedRelayCtx : undefined)
+    : (liveMarkerCtx?.turnId
+        ? liveMarkerCtx
+        : isolatedManagedOriginCtx?.turnId
+          ? isolatedManagedOriginCtx
+          : undefined);
+  const originTurnId = authoritativeOriginTurnCtx?.turnId;
+  const originDispatchAttempt = authoritativeOriginTurnCtx?.dispatchAttempt;
+  const originSession = originSessionId
+    ? sessionsForOrigin.get(originSessionId)
+    : undefined;
+  const hostRelayRequiresCodexAppLedger = !!trustedRelayCtx
+    && process.env.BOTMUX_HOST_RELAY_REQUIRES_CODEX_APP_LEDGER === '1';
+  // The live worker authorizes a Codex App relay only while an exact durable
+  // dispatch remains unsettled. Recheck that prerequisite before any other
+  // managed-output policy or provider setup: terminal settlement can win the
+  // race between watcher authorization and this host child loading the store,
+  // and must never downgrade the send into an ordinary Lark message.
+  if ((hostRelayRequiresCodexAppLedger || isolatedManagedOriginCtx?.requiresCodexAppLedger)
+    && (originSession?.codexAppDispatchLedger?.length ?? 0) === 0) {
+    console.error(
+      `botmux send refused: authorized Codex App origin ${originSessionId}/${originTurnId} is no longer unsettled`,
+    );
+    process.exit(2);
+  }
   let explicitVcMeetingImOrigin: ReturnType<typeof resolveVcMeetingImTurnOrigin>;
   let vcMeetingListenerOutputOwner: { listenerAppId: string; meetingId: string } | undefined;
   let vcMeetingManagedSendOrigin: VcMeetingManagedSendOrigin | undefined;
@@ -7054,14 +7535,12 @@ async function cmdSend(rest: string[]): Promise<void> {
     dispatchAttempt: number;
   } | undefined;
   if (originSessionId) {
-    const originSession = sessionsForOrigin.get(originSessionId);
-    const originTurnId = trustedRelayCtx?.turnId ?? liveMarkerCtx?.turnId;
     const imOrigin = resolveVcMeetingImTurnOrigin(originSession, originTurnId);
     const managedOrigin: VcMeetingManagedSendOrigin = {
       receiverSessionId: originSessionId,
       receiverSession: !!originSession?.vcMeetingReceiver,
       turnId: originTurnId,
-      dispatchAttempt: trustedRelayCtx?.dispatchAttempt ?? liveMarkerCtx?.dispatchAttempt,
+      dispatchAttempt: originDispatchAttempt,
       currentImTurnOrigin: imOrigin,
     };
     const decision = evaluateVcMeetingManagedSend(resolveDataDir(), managedOrigin);
@@ -7083,7 +7562,7 @@ async function cmdSend(rest: string[]): Promise<void> {
       }
     }
     if (decision.kind === 'listener_thread'
-      && (trustedRelayCtx?.dispatchAttempt ?? liveMarkerCtx?.dispatchAttempt) === undefined) {
+      && originDispatchAttempt === undefined) {
       explicitVcMeetingImOrigin = imOrigin;
     }
   }
@@ -7245,7 +7724,7 @@ async function cmdSend(rest: string[]): Promise<void> {
   }
 
   const sessions = loadSessions();
-  const currentTurnId = ancestorCtx?.turnId ?? process.env.BOTMUX_TURN_ID;
+  const currentTurnId = originTurnId;
   let s = sessions.get(sid);
 
   // Riff (remote backend) sandbox: no local daemon/sessions.json/bots.json.
@@ -7281,9 +7760,166 @@ async function cmdSend(rest: string[]): Promise<void> {
   let deferredMaterializedByThisCommand = false;
   let deferredTopicRootMessageIdForOutput: string | undefined;
 
-  // 本轮的回复锚点：优先按 turnId 精确取 per-turn 落点（排队/并发轮次不再被
-  // 后到轮次覆盖 currentReplyTarget 而塌成群顶层 plain），无记录再退回单槽。
+  // Prefer the exact per-turn reply anchor; the latest single slot is only a
+  // compatibility fallback for sessions persisted before replyTargets.
   const turnReplyTarget = pickTurnReplyTarget(s, currentTurnId);
+
+  const exactOriginDispatch = (() => {
+    const unsettledOriginDispatches = originSession?.codexAppDispatchLedger ?? [];
+    // The live worker authorized this host re-exec against an exact unsettled
+    // Codex App entry. If terminal settlement/revocation won the race before
+    // this child reloaded the store, never degrade into an ordinary Lark send
+    // against mutable session state.
+    if (unsettledOriginDispatches.length === 0) {
+      return undefined;
+    }
+    // A detached/backgrounded command can still inherit the correct session id
+    // but only a spawn-time (and now stale) turn env.  If this session has any
+    // unsettled durable output, absence of a fresh marker/capability tuple must
+    // fail closed rather than silently falling through to ordinary Lark IM.
+    if (!originTurnId) {
+      console.error(
+        `botmux send refused: origin session ${originSessionId} has unsettled durable output but no fresh authoritative dispatch identity`,
+      );
+      process.exit(2);
+    }
+    const turnMatches = unsettledOriginDispatches
+      .filter(entry => entry.turnId === originTurnId);
+    const exactMatches = originDispatchAttempt === undefined
+      ? turnMatches
+      : turnMatches.filter(entry => entry.dispatchAttempt === originDispatchAttempt);
+    // Once a durable turn exists, a supplied attempt must match it exactly.
+    // Falling back to another attempt would let a stale/replayed process select
+    // the wrong sink.  With no attempt, multiple entries are equally unsafe.
+    if (exactMatches.length !== 1) {
+      const detail = originDispatchAttempt === undefined
+        ? `${turnMatches.length} ledger entries share the turn id`
+        : `${exactMatches.length} ledger entries match attempt ${originDispatchAttempt}`;
+      console.error(
+        `botmux send refused: origin dispatch ${originSessionId}/${originTurnId} is ambiguous (${detail})`,
+      );
+      process.exit(2);
+    }
+    return exactMatches[0];
+  })();
+
+  // Frozen reply routing applies only when the selected destination is the
+  // trusted origin session.  A cross-session publish must not accidentally
+  // reuse a coincidentally-equal turn id from the destination ledger.
+  const frozenTurnDispatch = originSessionId === sid
+    ? exactOriginDispatch
+    : undefined;
+  const frozenTurnReplyTarget = frozenTurnDispatch?.replyTarget;
+  if (exactOriginDispatch?.deliverySink === 'http_wait'
+    || exactOriginDispatch?.deliverySink === 'http_async'
+    || exactOriginDispatch?.deliverySink === 'suppressed') {
+    console.error(
+      `botmux send refused: origin turn ${originTurnId} is bound to the `
+      + `${exactOriginDispatch.deliverySink} host sink`,
+    );
+    process.exit(2);
+  }
+
+  // A proof is a point-in-time liveness check, not a five-second send lease.
+  // Re-challenge immediately before observable provider effects so lengthy
+  // local parsing/card preparation cannot carry an old capability across a
+  // worker restart, turn rotation, or Codex ledger settlement.
+  const revalidateIsolatedOriginBeforeEffect = async (): Promise<ManagedOriginAttestation | undefined> => {
+    if (!isolatedAttestationContext || !isolatedManagedOriginCtx) return undefined;
+    const fresh = await attestManagedOrigin({
+      context: isolatedAttestationContext,
+      resolveIpcPort: (larkAppId) => {
+        try { return larkAppId ? findDaemon(larkAppId)?.ipcPort : undefined; }
+        catch { return undefined; }
+      },
+    });
+    if (fresh.sessionId !== isolatedManagedOriginCtx.sessionId
+      || fresh.turnId !== isolatedManagedOriginCtx.turnId
+      || fresh.dispatchAttempt !== isolatedManagedOriginCtx.dispatchAttempt
+      || fresh.requiresCodexAppLedger !== isolatedManagedOriginCtx.requiresCodexAppLedger) {
+      throw new Error('managed origin changed before provider effect');
+    }
+    const currentOriginSession = loadSessions().get(fresh.sessionId);
+    const ledgerDecision = validateCodexAppManagedSendOrigin(
+      currentOriginSession?.codexAppDispatchLedger,
+      fresh,
+      fresh.requiresCodexAppLedger,
+    );
+    if (!ledgerDecision.ok
+      || ledgerDecision.requiresLedger !== fresh.requiresCodexAppLedger) {
+      throw new Error(
+        `managed origin ledger changed before provider effect${ledgerDecision.ok ? '' : `: ${ledgerDecision.error}`}`,
+      );
+    }
+    return fresh;
+  };
+  const fenceIsolatedOriginBeforeEffect = async (): Promise<void> => {
+    await revalidateIsolatedOriginBeforeEffect();
+  };
+  const isolatedHookOrigin = isolatedAttestationContext?.ipcPortFallback
+    && isolatedManagedOriginCtx
+    ? {
+        ipcPort: isolatedAttestationContext.ipcPortFallback,
+        sessionId: isolatedManagedOriginCtx.sessionId,
+        capability: isolatedAttestationContext.capability,
+        turnId: isolatedManagedOriginCtx.turnId,
+        ...(isolatedManagedOriginCtx.dispatchAttempt !== undefined
+          ? { dispatchAttempt: isolatedManagedOriginCtx.dispatchAttempt }
+          : {}),
+      }
+    : undefined;
+  // Outbound hooks are a distinct post-provider effect. Preserve normal hook
+  // behavior, but bind it to a fresh challenge of this command's original
+  // protected claim. The Lark client treats fence failure as hook-only loss so
+  // an already-delivered primary is never reported failed and duplicated.
+  const outboundMessageOptions = (suppressHook = false) =>
+    suppressHook
+      ? { suppressHook: true as const }
+      : isolatedAttestationContext
+        ? isolatedHookOrigin
+          ? {
+              beforeHook: fenceIsolatedOriginBeforeEffect,
+              hookOrigin: isolatedHookOrigin,
+            }
+          : { suppressHook: true as const }
+        : undefined;
+
+  // A document-comment turn has exactly one supported observable effect: a
+  // plain text reply to its frozen origin target.  Validate the complete shape
+  // before reading stdin/content/card files and before any TTS, upload, or Lark
+  // provider call.  In particular, an explicit destination session is not an
+  // escape hatch from the origin sink.
+  const docTarget = originTurnId
+    ? originSession?.docCommentTargets?.[originTurnId]
+    : undefined;
+  // Codex App turns are governed exclusively by their exact dispatch ledger:
+  // a settled/missing ledger entry must never fall back to mutable session
+  // state. Other CLI adapters predate that ledger, so their frozen per-turn
+  // docCommentTargets entry remains the authoritative origin sink.
+  const isOriginDocCommentTurn = exactOriginDispatch?.deliverySink === 'doc_comment'
+    || (!exactOriginDispatch && originSession?.cliId !== 'codex-app' && !!docTarget);
+  if (isOriginDocCommentTurn) {
+    if (!docTarget || !originSession?.larkAppId) {
+      console.error('botmux send refused: this turn is bound to a document comment, but its exact origin target is no longer available');
+      process.exit(2);
+    }
+    if (sid !== originSessionId
+      || sendTopLevel
+      || !!overrideChatId
+      || !!sendInto
+      || asVoice
+      || images.length > 0
+      || files.length > 0
+      || videoAttachments.length > 0
+      || videoCovers.length > 0
+      || customCardRequested
+      || attention.requested
+      || explicitQuote !== undefined
+      || noQuote) {
+      console.error('botmux send refused: a document-comment turn supports only its exact plain-text comment reply');
+      process.exit(2);
+    }
+  }
 
   // Read content from: --content-file > positional arg > stdin
   let content = '';
@@ -7386,8 +8022,12 @@ async function cmdSend(rest: string[]): Promise<void> {
     const targetChatId = overrideChatId ?? s.chatId;
     let dir: string | undefined;
     try {
-      const out = await synthesizeVoiceOpus(appId, content);
+      await revalidateIsolatedOriginBeforeEffect();
+      const out = await synthesizeVoiceOpus(appId, content, {
+        beforeProviderEffect: fenceIsolatedOriginBeforeEffect,
+      });
       dir = out.dir;
+      await revalidateIsolatedOriginBeforeEffect();
       const fileKey = await uploadFile(appId, out.path, { duration: out.durationMs });
       const sentAtMs = Date.now();
       const proposedOutput = {
@@ -7411,9 +8051,7 @@ async function cmdSend(rest: string[]): Promise<void> {
         messageId = prepared.messageId;
       } else {
         revalidateVcMeetingManagedSend();
-        const managedProviderOptions = prepared
-          ? { suppressHook: true }
-          : undefined;
+        const managedProviderOptions = outboundMessageOptions(!!prepared);
         const deferred = !sendInto && (!overrideChatId || overrideChatId === s.chatId)
           ? await dispatchDeferredTopicSend({
               dataDir: resolveDataDir(),
@@ -7424,9 +8062,18 @@ async function cmdSend(rest: string[]): Promise<void> {
               content: canonicalOutput.content,
               msgType: canonicalOutput.msgType,
               uuid: prepared?.providerKey,
-              sendRoot: (body, type, uuid) => sendMessage(appId, targetChatId, body, type, uuid, undefined, managedProviderOptions),
-              sendTitleSeed: (title, uuid) => sendMessage(appId, targetChatId, title, 'text', uuid),
-              replyRoot: (root, body, type, uuid) => replyMessage(appId, root, body, type, true, uuid, undefined, managedProviderOptions),
+              sendRoot: async (body, type, uuid) => {
+                await revalidateIsolatedOriginBeforeEffect();
+                return sendMessage(appId, targetChatId, body, type, uuid, undefined, managedProviderOptions);
+              },
+              sendTitleSeed: async (title, uuid) => {
+                await revalidateIsolatedOriginBeforeEffect();
+                return sendMessage(appId, targetChatId, title, 'text', uuid);
+              },
+              replyRoot: async (root, body, type, uuid) => {
+                await revalidateIsolatedOriginBeforeEffect();
+                return replyMessage(appId, root, body, type, true, uuid, undefined, managedProviderOptions);
+              },
             })
           : { handled: false };
         if (deferred.handled && deferred.messageId) {
@@ -7434,17 +8081,20 @@ async function cmdSend(rest: string[]): Promise<void> {
           deferredTopicRootMessageIdForOutput = deferred.rootMessageId;
           messageId = deferred.messageId;
         } else {
-          const canonicalTarget = resolveSendTarget({
-            into: sendInto,
-            topLevel: sendTopLevel,
-            chatScope: s.scope === 'chat',
-            chatId: canonicalOutput.targetChatId,
-            rootMessageId: s.rootMessageId,
-            replyTargetRootId: turnReplyTarget?.rootMessageId,
-            replyTargetTurnId: turnReplyTarget?.turnId,
-            replyTargetQuoteOnly: turnReplyTarget?.quoteOnly,
-            currentTurnId,
-          });
+          const canonicalTarget = !sendInto && !sendTopLevel && !overrideChatId && frozenTurnReplyTarget
+            ? frozenTurnReplyTarget
+            : resolveSendTarget({
+                into: sendInto,
+                topLevel: sendTopLevel,
+                chatScope: s.scope === 'chat',
+                chatId: canonicalOutput.targetChatId,
+                rootMessageId: s.rootMessageId,
+                replyTargetRootId: turnReplyTarget?.rootMessageId,
+                replyTargetTurnId: turnReplyTarget?.turnId,
+                replyTargetQuoteOnly: turnReplyTarget?.quoteOnly,
+                currentTurnId,
+              });
+          await revalidateIsolatedOriginBeforeEffect();
           messageId = canonicalTarget.mode === 'plain'
             ? await sendMessage(
                 appId,
@@ -7506,28 +8156,22 @@ async function cmdSend(rest: string[]): Promise<void> {
   }
 
   // ── 文档评论入口分流（/watch-comment / /subscribe-lark-doc）─────────────────
-  // 本轮若由飞书文档评论触发（daemon 已把落点写进 session.docCommentTargets[turnId]），
-  // 把用户可见回复发表为飞书文档评论，而非发回飞书会话。绕过 @ 硬门（评论不 @ 飞书
-  // 用户）。显式改路由（--top-level / --chat-id / --into）时不分流，让模型仍能主动
-  // 用 BOTMUX_TURN_ID 从 per-turn map 取本轮落点；非文档轮的 turnId 不会命中 map，
-  // 天然不会误投。per-turn map 设计：并发评论之间互不覆盖，不会串线。
-  const docTarget = currentTurnId ? s.docCommentTargets?.[currentTurnId] : undefined;
-  if (docTarget && !sendTopLevel && !overrideChatId && !sendInto) {
-    if (customCardRequested) {
-      console.error('botmux send: 文档评论回复不支持 --card-file/--card-json；请改用普通文本，或显式 --top-level/--chat-id 发到飞书群');
-      process.exit(2);
-    }
+  // The authority and payload-shape checks ran before content/provider work.
+  // Use only the trusted origin session here; `--session-id` is a destination
+  // selector for ordinary Lark turns and cannot retarget a document turn.
+  if (isOriginDocCommentTurn) {
+    const exactDocTarget = docTarget!;
+    const exactDocSession = originSession!;
     const { registerBot, loadBotConfigs } = await import('./bot-registry.js');
     try { for (const cfg of loadBotConfigs()) registerBot(cfg); } catch { /* */ }
   if (envPinnedRiffBot) { try { registerBot(envPinnedRiffBot); } catch { /* */ } }
     const { replyToDocComment, chunkCommentText, removeCommentReaction } = await import('./im/lark/doc-comment.js');
-    const appId = s.larkAppId!;
-    const loc = localeForBot(appId);
+    const appId = exactDocSession.larkAppId!;
     try {
       // @ 落点：--mention-back → 回 @ 原评论人；--mention <open_id[:name]> → @ 指定人；
       // 否则（--no-mention / 无）不 @。文档评论里靠 person 元素渲染 @，仅首块加。
       let docMentionOpenId: string | undefined;
-      if (mentionBack) docMentionOpenId = docTarget.replyToOpenId;
+      if (mentionBack) docMentionOpenId = exactDocTarget.replyToOpenId;
       else if (mentionArgs.length > 0) {
         const first = mentionArgs[0];
         const idx = first.indexOf(':');
@@ -7536,13 +8180,21 @@ async function cmdSend(rest: string[]): Promise<void> {
       // 嵌套回复到用户那条评论 thread（已挂其下，无需 ↪ 前缀）。
       const chunks = chunkCommentText(content);
       for (let i = 0; i < chunks.length; i++) {
-        await replyToDocComment(appId, { fileToken: docTarget.fileToken, fileType: docTarget.fileType }, docTarget.commentId, chunks[i], i === 0 ? docMentionOpenId : undefined);
+        await replyToDocComment(
+          appId,
+          { fileToken: exactDocTarget.fileToken, fileType: exactDocTarget.fileType },
+          exactDocTarget.commentId,
+          chunks[i],
+          i === 0 ? docMentionOpenId : undefined,
+          { beforeProviderEffect: fenceIsolatedOriginBeforeEffect },
+        );
       }
       // 清理 "Typing" reaction（bot 已回复完毕）。
-      if (docTarget.reactionId && docTarget.replyId) {
+      if (exactDocTarget.reactionId && exactDocTarget.replyId) {
         await removeCommentReaction(appId,
-          { fileToken: docTarget.fileToken, fileType: docTarget.fileType },
-          docTarget.commentId, docTarget.replyId, docTarget.reactionId);
+          { fileToken: exactDocTarget.fileToken, fileType: exactDocTarget.fileType },
+          exactDocTarget.commentId, exactDocTarget.replyId, exactDocTarget.reactionId,
+          { beforeProviderEffect: fenceIsolatedOriginBeforeEffect });
       }
       // 写 bridge send marker → 抑制 worker 的 final_output 兜底（否则会再补一条评论）。
       try {
@@ -7550,20 +8202,18 @@ async function cmdSend(rest: string[]): Promise<void> {
         if (!existsSync(markerDir)) mkdirSync(markerDir, { recursive: true });
         const marker: Record<string, unknown> = {
           sentAtMs: Date.now(),
-          messageId: `doc:${docTarget.commentId}`,
+          messageId: `doc:${exactDocTarget.commentId}`,
           contentLength: content.length,
         };
         const previewText = buildBridgeSendPreviewText(content);
         if (previewText) marker.previewText = previewText;
-        appendFileSync(join(markerDir, `${sid}.jsonl`), JSON.stringify(marker) + '\n');
+        appendFileSync(join(markerDir, `${originSessionId}.jsonl`), JSON.stringify(marker) + '\n');
       } catch { /* best-effort：漏记只多一条兜底 */ }
-      // 清理已消费的 per-turn 落点，避免 session 文件无限堆积。
-      if (s.docCommentTargets && currentTurnId && s.docCommentTargets[currentTurnId]) {
-        delete s.docCommentTargets[currentTurnId];
-        try { saveSession(s); } catch { /* best-effort */ }
-      }
-      console.error(`✓ 已回复文档评论 ${docTarget.commentId.slice(0, 12)}（${chunks.length} 条）`);
-      console.log(JSON.stringify({ success: true, commentId: docTarget.commentId, sessionId: sid, kind: 'doc-comment', chunks: chunks.length }));
+      // Do not write this startup snapshot back after the async provider calls:
+      // the daemon may have advanced the dispatch ledger or accepted another
+      // turn in the meantime.  Daemon settlement owns exact target retirement.
+      console.error(`✓ 已回复文档评论 ${exactDocTarget.commentId.slice(0, 12)}（${chunks.length} 条）`);
+      console.log(JSON.stringify({ success: true, commentId: exactDocTarget.commentId, sessionId: originSessionId, kind: 'doc-comment', chunks: chunks.length }));
     } catch (e: any) {
       console.error(`文档评论发送失败：${e?.message ?? e}`);
       process.exit(1);
@@ -7585,7 +8235,16 @@ async function cmdSend(rest: string[]): Promise<void> {
     }
   }
   const replyTargetSenderOpenId = explicitVcMeetingImOrigin?.replyTargetSenderOpenId
-    ?? turnReplyTarget?.senderOpenId;
+    ?? frozenTurnDispatch?.replyTargetSenderOpenId
+    ?? turnReplyTarget?.senderOpenId
+    // #750 exact-turn contract: the global latest-slot quote sender may ONLY be
+    // borrowed as a legacy fallback when there is NO currentTurnId (true
+    // legacy/no-turn send). With a turnId, an exact-turn map miss/eviction must
+    // resolve to NO sender — never the global slot, which may have advanced to a
+    // DIFFERENT turn B and would mis-@ B as A's --mention-back (the cross-turn
+    // bug #750 fixed). pickTurnReplyTarget already enforces
+    // quoteTargetId===currentTurnId for its own hit.
+    ?? (currentTurnId ? undefined : s.quoteTargetSenderOpenId);
 
   // @ hard-gate (config.send.requireMentionDecision, default on): force the
   // model to make an explicit @ decision before sending. --top-level publish
@@ -7654,7 +8313,12 @@ async function cmdSend(rest: string[]): Promise<void> {
   // Compute the actual outbound anchor before the advisory guard. A chat-scope
   // sender can still reply into a per-turn topic, so sender scope alone does
   // not describe which peer sessions are reachable.
-  const sendTarget = resolveSendTarget({ into: sendInto, topLevel: sendTopLevel, chatScope: isChatScope, chatId: targetChatId, rootMessageId: s.rootMessageId, replyTargetRootId: turnReplyTarget?.rootMessageId, replyTargetTurnId: turnReplyTarget?.turnId, replyTargetQuoteOnly: turnReplyTarget?.quoteOnly, currentTurnId });
+  // #597: a frozen per-turn reply target (from a Codex App dispatch) overrides
+  // the nominal resolveSendTarget in chat scope so a steered/dispatched turn
+  // replies to its own origin, not the session's latest human quote target.
+  const sendTarget = !sendInto && !sendTopLevel && !overrideChatId && frozenTurnReplyTarget
+    ? frozenTurnReplyTarget
+    : resolveSendTarget({ into: sendInto, topLevel: sendTopLevel, chatScope: isChatScope, chatId: targetChatId, rootMessageId: s.rootMessageId, replyTargetRootId: turnReplyTarget?.rootMessageId, replyTargetTurnId: turnReplyTarget?.turnId, replyTargetQuoteOnly: turnReplyTarget?.quoteOnly, currentTurnId });
   const dataDir = resolveDataDir();
   const deferredBinding = !sendInto && (!overrideChatId || overrideChatId === s.chatId)
     ? readDeferredTopicBinding(dataDir, s.sessionId)
@@ -7776,7 +8440,9 @@ async function cmdSend(rest: string[]): Promise<void> {
   // Ordinary delivery uses the nominal target. Deferred delivery gets first
   // refusal below; the advisory mirrors its existing binding in
   // `reachabilityTarget` above so both paths agree about the effective root.
-  const dispatch = async (
+  // (sendTarget itself is defined once above, carrying #597's frozen per-turn
+  // reply-target override.)
+  const dispatchAfterOriginGate = async (
     content: string,
     msgType: string,
     uuid?: string,
@@ -7795,29 +8461,38 @@ async function cmdSend(rest: string[]): Promise<void> {
         content,
         msgType,
         uuid,
-        sendRoot: (body, type, rootUuid) => sendMessage(
-          appId,
-          targetChatId,
-          body,
-          type,
-          rootUuid,
-          hookContext,
-          suppressHook ? { suppressHook: true } : undefined,
-        ),
+        sendRoot: async (body, type, rootUuid) => {
+          await revalidateIsolatedOriginBeforeEffect();
+          return sendMessage(
+            appId,
+            targetChatId,
+            body,
+            type,
+            rootUuid,
+            hookContext,
+            outboundMessageOptions(!!suppressHook),
+          );
+        },
         // The optional title is the root seed and the actual alert follows as
         // its first reply. Do not emit a user outbound hook for presentation-
         // only seed text; the alert itself still goes through the hook path.
-        sendTitleSeed: (title, rootUuid) => sendMessage(appId, targetChatId, title, 'text', rootUuid),
-        replyRoot: (root, body, type, replyUuid) => replyMessage(
-          appId,
-          root,
-          body,
-          type,
-          true,
-          replyUuid,
-          hookContext,
-          suppressHook ? { suppressHook: true } : undefined,
-        ),
+        sendTitleSeed: async (title, rootUuid) => {
+          await revalidateIsolatedOriginBeforeEffect();
+          return sendMessage(appId, targetChatId, title, 'text', rootUuid);
+        },
+        replyRoot: async (root, body, type, replyUuid) => {
+          await revalidateIsolatedOriginBeforeEffect();
+          return replyMessage(
+            appId,
+            root,
+            body,
+            type,
+            true,
+            replyUuid,
+            hookContext,
+            outboundMessageOptions(!!suppressHook),
+          );
+        },
       });
       if (deferred.handled && deferred.messageId) {
         deferredMaterializedByThisCommand ||= deferred.materializedNow === true;
@@ -7825,17 +8500,18 @@ async function cmdSend(rest: string[]): Promise<void> {
         return deferred.messageId;
       }
     }
+    await revalidateIsolatedOriginBeforeEffect();
     return sendTarget.mode === 'plain'
-      ? sendMessage(
+      ? await sendMessage(
           appId,
           sendTarget.chatId,
           content,
           msgType,
           uuid,
           hookContext,
-          suppressHook ? { suppressHook: true } : undefined,
+          outboundMessageOptions(!!suppressHook),
         )
-      : replyMessage(
+      : await replyMessage(
           appId,
           sendTarget.rootMessageId,
           content,
@@ -7843,8 +8519,17 @@ async function cmdSend(rest: string[]): Promise<void> {
           sendTarget.mode === 'thread',
           uuid,
           hookContext,
-          suppressHook ? { suppressHook: true } : undefined,
+          outboundMessageOptions(!!suppressHook),
         );
+  };
+  const dispatch = async (
+    content: string,
+    msgType: string,
+    uuid?: string,
+    suppressHook?: boolean,
+  ): Promise<string> => {
+    await revalidateIsolatedOriginBeforeEffect();
+    return dispatchAfterOriginGate(content, msgType, uuid, suppressHook);
   };
   const recordBridgeSendMarker = (sentAtMs: number, messageId: string, sentContent: string): void => {
     try {
@@ -7869,11 +8554,17 @@ async function cmdSend(rest: string[]): Promise<void> {
     // belong to another queued IM turn and is not part of the delivery action.
     sessionQuoteTargetId: vcMeetingDeliveryReplyOrigin
       ? undefined
-      : explicitVcMeetingImOrigin?.larkMessageId ?? s.quoteTargetId,
+      : explicitVcMeetingImOrigin?.larkMessageId
+        ?? frozenTurnDispatch?.quoteTargetId
+        ?? s.quoteTargetId,
   });
   let primaryQuotedId: string | null = null;
   let vcMeetingListenerReplyReplay = false;
-  const dispatchPrimary = async (content: string, msgType: string): Promise<string> => {
+  const dispatchPrimary = async (
+    content: string,
+    msgType: string,
+    originAlreadyRevalidated = false,
+  ): Promise<string> => {
     // `dispatchPrimaryMessage` may call replyMessage directly for a quote, so
     // fence immediately before preparing/performing that primary effect too.
     revalidateVcMeetingManagedSend();
@@ -7922,11 +8613,17 @@ async function cmdSend(rest: string[]): Promise<void> {
         ...(prepared ? { suppressHook: true } : {}),
         hookContext,
         MessageWithdrawnError,
+        ...(isolatedHookOrigin
+          ? {
+              beforeHook: fenceIsolatedOriginBeforeEffect,
+              hookOrigin: isolatedHookOrigin,
+            }
+          : {}),
         // Explicit VC IM --into is rejected above, so an unquoted first send
         // retains the normal chat-scope dispatch semantics. On a mismatch the
         // frozen canonical target remains authoritative.
         dispatch: prepared?.outputMismatch
-          ? (body, type, uuid, suppressHook) => {
+          ? async (body, type, uuid, suppressHook) => {
               revalidateVcMeetingManagedSend();
               return sendMessage(
                 appId,
@@ -7935,11 +8632,17 @@ async function cmdSend(rest: string[]): Promise<void> {
                 type,
                 uuid,
                 hookContext,
-                suppressHook ? { suppressHook: true } : undefined,
+                outboundMessageOptions(!!suppressHook),
               );
             }
-          : dispatch,
-        beforeQuoteFallback: revalidateVcMeetingManagedSend,
+          : dispatchAfterOriginGate,
+        beforeEffect: originAlreadyRevalidated
+          ? undefined
+          : fenceIsolatedOriginBeforeEffect,
+        beforeQuoteFallback: async () => {
+          revalidateVcMeetingManagedSend();
+          await revalidateIsolatedOriginBeforeEffect();
+        },
         onQuoteWithdrawn: (id) => {
           console.error(`引用目标 ${id} 已撤回，改为普通发送`);
         },
@@ -7986,8 +8689,10 @@ async function cmdSend(rest: string[]): Promise<void> {
     // managed side-effect gate above.
     const imageKeys: string[] = [];
     if (images.length > 0) {
-      const results = await Promise.all(images.map(p => uploadImage(appId, p)));
-      imageKeys.push(...results);
+      for (const imagePath of images) {
+        await revalidateIsolatedOriginBeforeEffect();
+        imageKeys.push(await uploadImage(appId, imagePath));
+      }
     }
 
     // Auto-detect @BotName in text and inject as mentions, using the sender
@@ -8083,11 +8788,18 @@ async function cmdSend(rest: string[]): Promise<void> {
     // --no-mention 显式不 @ 任何人 → 连 footer 的"发送给/cc"寻址 <at> 也清空，
     // 否则 footer 仍会 @ 人，与 --no-mention 语义和"未@任何人"输出自相矛盾
     // （Codex review P2）。--top-level 同样无特定收件人。
+    const frozenFooterAddressingSource = explicitVcMeetingImOrigin?.replyTargetSenderOpenId
+      ? { ...s, lastCallerOpenId: explicitVcMeetingImOrigin.replyTargetSenderOpenId }
+      : frozenTurnDispatch?.replyTargetSenderOpenId
+        ? {
+            ...s,
+            lastCallerOpenId: frozenTurnDispatch.replyTargetSenderOpenId,
+            lastCallerIsBot: frozenTurnDispatch.replyTargetSenderIsBot,
+          }
+        : s;
     const footerAddressing = (sendTopLevel || noMention)
       ? { sendTo: undefined as string | undefined, cc: [] as string[] }
-      : buildFooterAddressing(explicitVcMeetingImOrigin?.replyTargetSenderOpenId
-        ? { ...s, lastCallerOpenId: explicitVcMeetingImOrigin.replyTargetSenderOpenId }
-        : s, {
+      : buildFooterAddressing(frozenFooterAddressingSource, {
           isOncall: !!oncallEntry,
           isSubstitute: isChatScope && turnReplyTarget?.turnId === currentTurnId && turnReplyTarget?.substitute === true,
           hasExplicitBotMention: explicitKnownBotMention,
@@ -8146,8 +8858,9 @@ async function cmdSend(rest: string[]): Promise<void> {
         {
           uploadFile,
           uploadImage,
-          dispatch,
-          primaryDispatch: dispatchPrimary,
+          dispatch: dispatchAfterOriginGate,
+          primaryDispatch: (body, type) => dispatchPrimary(body, type, true),
+          beforeEffect: fenceIsolatedOriginBeforeEffect,
           ...(vcMeetingManagedSendOrigin ? { maxMessages: 1 } : {}),
         },
         appId,
@@ -8288,10 +9001,10 @@ async function cmdSend(rest: string[]): Promise<void> {
     // surface as command failure.
     if (!pureVideoSend && !vcMeetingListenerReplyReplay) {
       ({ failed: failedAttachments } = await sendFileAttachments(
-        { uploadFile, dispatch }, appId, files,
+        { uploadFile, dispatch: dispatchAfterOriginGate, beforeEffect: fenceIsolatedOriginBeforeEffect }, appId, files,
       ));
       const videoResult = await sendVideoAttachments(
-        { uploadFile, uploadImage, dispatch }, appId, videoAttachments,
+        { uploadFile, uploadImage, dispatch: dispatchAfterOriginGate, beforeEffect: fenceIsolatedOriginBeforeEffect }, appId, videoAttachments,
       );
       failedVideoAttachments = videoResult.failed;
     }
@@ -8312,6 +9025,14 @@ async function cmdSend(rest: string[]): Promise<void> {
       ? `@${mentions.map(m => m.name || m.open_id).join(',')}`
       : '未@任何人';
     console.error(`✓ 已发送 ${messageId} ｜ ${primaryQuotedId ? `引用 ${primaryQuotedId}` : '未引用'} ｜ ${atSummary}`);
+    // Sentinel guidance is surfaced HERE — in the send-success output the model
+    // reads back — rather than only in the injected system prompt. A model only
+    // learns about BOTMUX_NOTHING_TO_SEND after it has actually sent, so it
+    // cannot use the sentinel to end a turn where it did work but forgot to send
+    // (the ghosting shape). The injected prompt keeps a one-line sentinel note
+    // only for the genuine never-send silence case (message addressed to another
+    // bot). See services/bridge-fallback-gate.ts for the matching strip-and-forward gate.
+    console.error(t('ai.send.after_success_hint', undefined, localeForBot(appId)));
 
     // --attention: message is already delivered above; now flip the dashboard
     // needs-you state via the daemon (botmux send is direct-to-Lark, so the
@@ -8322,13 +9043,29 @@ async function cmdSend(rest: string[]): Promise<void> {
     let attentionError: string | undefined;
     if (attention.requested) {
       try {
-        const daemon = findDaemon(appId);
-        if (!daemon) throw new Error(`找不到 daemon (larkAppId=${appId})`);
-        const originCapability = readManagedOriginCapability(
-          resolveDataDir(),
-          sid,
-          process.env.BOTMUX_SEND_RELAY,
-        )?.capability;
+        // Raising attention is a second externally visible effect after the
+        // awaited Lark send.  Bind it to a fresh proof of the same original
+        // turn instead of re-reading a stable path that may now belong to a
+        // successor worker generation.
+        const freshIsolatedOrigin = await revalidateIsolatedOriginBeforeEffect();
+        const attentionOrigin = freshIsolatedOrigin ?? liveMarkerCtx;
+        const daemon = freshIsolatedOrigin ? undefined : findDaemon(appId);
+        const attentionPort = freshIsolatedOrigin
+          ? isolatedAttestationContext?.ipcPortFallback
+          : daemon?.ipcPort;
+        if (!attentionPort) {
+          throw new Error(freshIsolatedOrigin
+            ? '受保护的 managed-origin claim 未提供 owning daemon 端口'
+            : `找不到 daemon (larkAppId=${appId})`);
+        }
+        const originCapability = freshIsolatedOrigin
+          ? isolatedAttestationContext?.capability
+          : readManagedOriginCapability(
+              resolveDataDir(),
+              sid,
+              process.env.BOTMUX_SEND_RELAY,
+              process.env.BOTMUX_ORIGIN_CHANNEL_ID,
+            )?.capability;
         const request = {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
@@ -8339,15 +9076,15 @@ async function cmdSend(rest: string[]): Promise<void> {
             kind: attention.kind,
             reason: text.trim(),
             originCapability,
-            originTurnId: liveMarkerCtx?.turnId,
-            originDispatchAttempt: liveMarkerCtx?.dispatchAttempt,
+            originTurnId: attentionOrigin?.turnId,
+            originDispatchAttempt: attentionOrigin?.dispatchAttempt,
           }),
         } satisfies RequestInit;
         let secret: string | undefined;
         try { secret = loadDaemonIpcSecret(); } catch { /* Seatbelt/read-isolated CLI */ }
         const res = secret
-          ? await fetchDaemonIpc(daemon.ipcPort, '/api/attention', request, secret)
-          : await fetch(`http://127.0.0.1:${daemon.ipcPort}/api/attention`, request);
+          ? await fetchDaemonIpc(attentionPort, '/api/attention', request, secret)
+          : await fetch(`http://127.0.0.1:${attentionPort}/api/attention`, request);
         if (!res.ok) throw new Error(`daemon HTTP ${res.status}`);
         attentionRaised = true;
         console.error(`🙋 已举手：本会话已进 dashboard「需要你」列（用户回复后自动撤下）`);
@@ -9478,6 +10215,7 @@ async function postAsk(body: Record<string, unknown>): Promise<import('./core/as
         resolveDataDir(),
         sessionId,
         process.env.BOTMUX_SEND_RELAY,
+        process.env.BOTMUX_ORIGIN_CHANNEL_ID,
       );
       if (claim) requestBody.originCapability = claim.capability;
     }
@@ -9595,6 +10333,7 @@ async function cmdAsk(sub: string, rest: string[]): Promise<void> {
     resolveDataDir(),
     askSessionId,
     askRelayDir,
+    process.env.BOTMUX_ORIGIN_CHANNEL_ID,
   )?.capability;
   const body = {
     sessionId: askSessionId,
@@ -9916,6 +10655,7 @@ async function cmdSessionReady(): Promise<void> {
         resolveDataDir(),
         sessionId,
         relayDir,
+        process.env.BOTMUX_ORIGIN_CHANNEL_ID,
       )?.capability;
       const liveOrigin = resolveSessionContext(resolveDataDir(), sessionId);
       const envAttempt = Number(process.env.BOTMUX_DISPATCH_ATTEMPT);
