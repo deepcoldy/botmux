@@ -118,7 +118,7 @@ describe('worker native session rename queue', () => {
     expect(region).toContain('if (sessionRenameInFlight()) return');
     expect(region).toContain('if (commandLineWritesPending > 0) return');
     expect(region).toContain('const rawInputReady = isPromptReady');
-    expect(region).toContain('await sendRawCommandLineSerially(renameBackend, buildRename(title))');
+    expect(region).toContain('await sendRawCommandLineWithRecoveryFence(renameBackend, buildRename(title))');
     expect(region).toContain("sessionRenamePhase = 'reserved'");
     expect(region).toContain("sessionRenamePhase = 'writing'");
     expect(region).toContain("sessionRenamePhase = 'sent'");
@@ -127,7 +127,7 @@ describe('worker native session rename queue', () => {
     expect(renameIdx).toBeGreaterThanOrEqual(0);
     expect(renameIdx).toBeLessThan(promptLoopIdx);
     expect(region.indexOf("sessionRenamePhase = 'writing'"))
-      .toBeLessThan(region.indexOf('await sendRawCommandLineSerially(renameBackend'));
+      .toBeLessThan(region.indexOf('await sendRawCommandLineWithRecoveryFence(renameBackend'));
     expect(region.indexOf('await sendRawCommandLineSerially(renameBackend'))
       .toBeLessThan(region.indexOf("sessionRenamePhase = 'sent'"));
   });

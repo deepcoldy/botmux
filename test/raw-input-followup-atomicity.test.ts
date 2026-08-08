@@ -96,7 +96,7 @@ describe('worker adopt/native-rename coordination', () => {
     expect(flushRegion).toContain("sessionRenamePhase = 'reserved'");
     const beginIdx = flushRegion.indexOf('beginCliWriteCycle();', flushRegion.indexOf('const writeRename'));
     const writingIdx = flushRegion.indexOf("sessionRenamePhase = 'writing'", beginIdx);
-    const commandIdx = flushRegion.indexOf('await sendRawCommandLineSerially(renameBackend', writingIdx);
+    const commandIdx = flushRegion.indexOf('await sendRawCommandLineWithRecoveryFence(renameBackend', writingIdx);
     const sentIdx = flushRegion.indexOf("sessionRenamePhase = 'sent'", commandIdx);
     expect(beginIdx).toBeGreaterThanOrEqual(0);
     expect(writingIdx).toBeGreaterThan(beginIdx);
@@ -398,13 +398,15 @@ describe('post-settle restart fence', () => {
   // async 化扩出的第二个窗口。三处 source-level 顺序断言钉死修复。
 
   it('flushPending re-checks cliRestartInProgress AFTER the awaited detector, BEFORE any write', () => {
-    const flush = caseRegion(workerSrc, 'async function flushPending()', 24000);
+    // RPC lifecycle/replay wiring expands the front half of flushPending; keep
+    // the slice large enough to include both structured adapter write paths.
+    const flush = caseRegion(workerSrc, 'async function flushPending()', 35000);
     const detector = flush.indexOf('if (await detectBareShellLaunch())');
     const fence = flush.indexOf('if (cliRestartInProgress) return;', detector);
     const startup = flush.indexOf('await runStartupCommands()', detector);
     const rawShift = flush.indexOf('freshnessInputQueue.takeRaw()', detector);
-    const writeStructuredInput = flush.indexOf('targetAdapter.writeStructuredInput!(', detector);
-    const writeInput = flush.indexOf('targetAdapter.writeInput(', detector);
+    const writeStructuredInput = flush.indexOf('writeAdapter.writeStructuredInput!(', detector);
+    const writeInput = flush.indexOf('writeAdapter.writeInput(', detector);
     expect(detector).toBeGreaterThanOrEqual(0);
     expect(fence).toBeGreaterThan(detector);
     // Fence must precede every downstream write/shift the settle await exposed.
