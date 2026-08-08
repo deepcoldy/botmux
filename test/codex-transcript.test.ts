@@ -406,6 +406,32 @@ describe('drainCodexRollout', () => {
     expect(failed.terminalErrorSummary!.length).toBeLessThanOrEqual(320);
   });
 
+  it('redacts quoted-JSON credential values while keeping non-secret fields', () => {
+    // Provider errors are commonly JSON payloads whose message text embeds a
+    // credential in quoted-JSON form: `"api_key":"..."`. The key name carries
+    // its own closing quote, so a `key[:=]` matcher without an optional quote
+    // around the key would miss it and leak the secret.
+    writeFileSync(path, ev({
+      timestamp: '2026-08-08T02:50:18.520Z',
+      type: 'event_msg',
+      payload: {
+        type: 'task_complete',
+        turn_id: 'json-secret',
+        error: {
+          message: 'gateway rejected request for model gpt-5: {"api_key":"AbCdEf123456xyz","password":"hunter2secret"}',
+        },
+      },
+    }));
+    const failed = drainCodexRollout(path, 0).events[0];
+    expect(failed.terminalErrorSummary).toBeDefined();
+    // Secrets in quoted-JSON form are redacted.
+    expect(failed.terminalErrorSummary).not.toContain('AbCdEf123456xyz');
+    expect(failed.terminalErrorSummary).not.toContain('hunter2secret');
+    expect(failed.terminalErrorSummary).toContain('[REDACTED]');
+    // Non-secret text (the useful reason) survives — no over-redaction.
+    expect(failed.terminalErrorSummary).toContain('gpt-5');
+  });
+
   it('classifies structured 429 failures for the dedicated limited state', () => {
     writeFileSync(path, ev({
       timestamp: '2026-08-08T02:50:18.520Z',
