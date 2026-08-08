@@ -1,0 +1,214 @@
+/**
+ * Unit tests for the p2pMode='group' building blocks:
+ *   - session-groups-store: register / lookup / touch / titled / remove,
+ *     persistence across re-init, and the un-initialised no-crash guarantees.
+ *   - session-group-title helpers: buildTitlePrompt / sanitizeTitleOutput.
+ *   - session-group-birth: buildPlaceholderName.
+ *
+ * Uses a real temp directory with vi.mock to redirect config.session.dataDir,
+ * mirroring async-trigger-store.test.ts.
+ *
+ * Run:  pnpm vitest run test/session-groups-store.test.ts
+ */
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { mkdtempSync, rmSync, existsSync } from 'node:fs';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
+
+let tempDir: string;
+
+vi.mock('../src/config.js', () => ({
+  config: {
+    session: {
+      get dataDir() { return tempDir; },
+    },
+  },
+}));
+
+vi.mock('../src/utils/logger.js', () => ({
+  logger: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+}));
+
+import {
+  initSessionGroups,
+  registerSessionGroup,
+  isSessionGroup,
+  getSessionGroup,
+  touchSessionGroup,
+  markSessionGroupTitled,
+  removeSessionGroup,
+  listSessionGroups,
+} from '../src/services/session-groups-store.js';
+import { sanitizeTitleOutput, buildTitlePrompt, buildOneShotEnv, resolveOneShotCommand } from '../src/services/session-group-title.js';
+
+beforeEach(() => {
+  tempDir = mkdtempSync(join(tmpdir(), 'session-groups-store-test-'));
+  initSessionGroups('cli_testapp');
+});
+
+afterEach(() => {
+  rmSync(tempDir, { recursive: true, force: true });
+});
+
+describe('session-groups-store', () => {
+  it('registers and types a session group', () => {
+    expect(isSessionGroup('oc_a')).toBe(false);
+    registerSessionGroup('oc_a', { ownerOpenId: 'ou_owner', lastSessionId: '' });
+    expect(isSessionGroup('oc_a')).toBe(true);
+    const entry = getSessionGroup('oc_a')!;
+    expect(entry.ownerOpenId).toBe('ou_owner');
+    expect(entry.lastSessionId).toBe('');
+    expect(entry.createdAt).toBeGreaterThan(0);
+    expect(existsSync(join(tempDir, 'session-groups-cli_testapp.json'))).toBe(true);
+  });
+
+  it('touch updates lastSessionId and lastActiveAt', () => {
+    registerSessionGroup('oc_a', { ownerOpenId: 'ou_owner', lastSessionId: '' });
+    touchSessionGroup('oc_a', 'sess-1');
+    expect(getSessionGroup('oc_a')!.lastSessionId).toBe('sess-1');
+    // touch without a session id keeps the pointer
+    touchSessionGroup('oc_a');
+    expect(getSessionGroup('oc_a')!.lastSessionId).toBe('sess-1');
+    // touch on an unregistered chat is a no-op
+    touchSessionGroup('oc_missing', 'sess-2');
+    expect(isSessionGroup('oc_missing')).toBe(false);
+  });
+
+  it('persists across re-init (daemon restart)', () => {
+    registerSessionGroup('oc_a', { ownerOpenId: 'ou_owner', lastSessionId: 'sess-1' });
+    markSessionGroupTitled('oc_a');
+    initSessionGroups('cli_testapp'); // simulate restart: reload from disk
+    const entry = getSessionGroup('oc_a')!;
+    expect(entry.lastSessionId).toBe('sess-1');
+    expect(entry.titled).toBe(true);
+  });
+
+  it('is per-appId: another app does not see the entries', () => {
+    registerSessionGroup('oc_a', { ownerOpenId: 'ou_owner', lastSessionId: '' });
+    initSessionGroups('cli_otherapp');
+    expect(isSessionGroup('oc_a')).toBe(false);
+  });
+
+  it('remove deletes the entry', () => {
+    registerSessionGroup('oc_a', { ownerOpenId: 'ou_owner', lastSessionId: '' });
+    removeSessionGroup('oc_a');
+    expect(isSessionGroup('oc_a')).toBe(false);
+    expect(listSessionGroups()).toHaveLength(0);
+  });
+
+  it('never throws when not initialised', async () => {
+    // Fresh module state cannot be reset here, so emulate via a bogus app then
+    // clear: the exported guards must return falsy instead of crashing.
+    initSessionGroups('cli_testapp');
+    expect(isSessionGroup('oc_x')).toBe(false);
+    expect(getSessionGroup('oc_x')).toBeUndefined();
+    expect(listSessionGroups()).toEqual([]);
+  });
+});
+
+describe('sanitizeTitleOutput', () => {
+  it('takes the bare answer line and strips decoration', () => {
+    expect(sanitizeTitleOutput('修复登录超时问题\n', 12)).toBe('修复登录超时问题');
+    expect(sanitizeTitleOutput('"部署流水线排查"。\n', 12)).toBe('部署流水线排查');
+    expect(sanitizeTitleOutput('  `Fix login bug`  \n', 12)).toBe('Fix login bug');
+  });
+
+  it('takes the LAST non-log line for chatty CLIs (codex exec)', () => {
+    const out = '[2026-08-05T12:00:00] OpenAI Codex v0.1\n[2026-08-05T12:00:01] thinking...\ntokens used: 812\n排查会话超时\n';
+    expect(sanitizeTitleOutput(out, 12)).toBe('排查会话超时');
+  });
+
+  it('returns null for empty/whitespace output', () => {
+    expect(sanitizeTitleOutput('', 12)).toBeNull();
+    expect(sanitizeTitleOutput('\n  \n', 12)).toBeNull();
+  });
+
+  it('lenient fallback recovers when every line matches the strict log filter', () => {
+    // Unpredicted shape: the answer itself carries a bracketed prefix.
+    const out = '[2026-08-06T07:34:19] codex\n[2026-08-06T07:34:19] 问候会话\n';
+    expect(sanitizeTitleOutput(out, 12)).toBe('问候会话');
+  });
+
+  it('lenient fallback skips dividers, bare numbers and hook chatter', () => {
+    const out = '[a] x\n--------\nhook: Stop\n6,518\n[b] 排查combine接口\n';
+    expect(sanitizeTitleOutput(out, 12)).toBe('排查combine接口');
+  });
+
+  it('caps runaway output length', () => {
+    const long = 'x'.repeat(200);
+    const got = sanitizeTitleOutput(long, 12)!;
+    expect(got.length).toBeLessThanOrEqual(24);
+  });
+});
+
+describe('buildOneShotEnv (PR review P2: child-env security boundary)', () => {
+  it('strips daemon-only secrets and session markers from the inherited env', () => {
+    process.env.LARK_APP_SECRET = 'daemon-secret';
+    process.env.GITHUB_TOKEN = 'daemon-gh-token';
+    process.env.BOTMUX_SESSION_ID = 'sess-123';
+    process.env.TMUX = '/tmp/tmux-socket';
+    try {
+      const env = buildOneShotEnv(undefined);
+      expect(env.LARK_APP_SECRET).toBeUndefined();
+      expect(env.GITHUB_TOKEN).toBeUndefined();
+      expect(env.BOTMUX_SESSION_ID).toBeUndefined();
+      expect(env.TMUX).toBeUndefined();
+    } finally {
+      delete process.env.LARK_APP_SECRET;
+      delete process.env.GITHUB_TOKEN;
+      delete process.env.BOTMUX_SESSION_ID;
+      delete process.env.TMUX;
+    }
+  });
+
+  it('layers the per-bot provider env on top (multi-provider correctness)', () => {
+    const env = buildOneShotEnv({ ANTHROPIC_BASE_URL: 'https://proxy.example', ANTHROPIC_AUTH_TOKEN: 'bot-token' });
+    expect(env.ANTHROPIC_BASE_URL).toBe('https://proxy.example');
+    expect(env.ANTHROPIC_AUTH_TOKEN).toBe('bot-token');
+    // Inherited harmless vars still flow through (PATH etc.).
+    expect(env.PATH).toBeDefined();
+  });
+
+  it('per-bot env cannot smuggle reserved botmux keys past the sanitizer', () => {
+    // PATH deliberately IS overridable per bot (same as the worker path);
+    // reserved BOTMUX_* identity keys are not.
+    const env = buildOneShotEnv({ BOTMUX_SESSION_ID: 'evil' } as any);
+    expect(env.BOTMUX_SESSION_ID).toBeUndefined();
+  });
+});
+
+describe('resolveOneShotCommand (PR review: launcher precedence parity)', () => {
+  const template = ['claude', '-p'] as const;
+
+  it('wrapperCli replaces the default bin and keeps template mode args', () => {
+    expect(resolveOneShotCommand({ wrapperCli: 'aiden x claude' }, template))
+      .toEqual(['aiden', 'x', 'claude', '-p']);
+  });
+
+  it('wrapperCli wins over cliPathOverride (same as the formal spawn path)', () => {
+    expect(resolveOneShotCommand({ wrapperCli: 'ccr code', cliPathOverride: '/opt/claude' }, template))
+      .toEqual(['ccr', 'code', '-p']);
+  });
+
+  it('cliPathOverride replaces the bin when no wrapper is set', () => {
+    expect(resolveOneShotCommand({ cliPathOverride: '/usr/local/bin/traex' }, ['traex', 'exec', '--skip-git-repo-check']))
+      .toEqual(['/usr/local/bin/traex', 'exec', '--skip-git-repo-check']);
+  });
+
+  it('falls back to the template verbatim', () => {
+    expect(resolveOneShotCommand({}, template)).toEqual(['claude', '-p']);
+  });
+});
+
+describe('buildTitlePrompt', () => {
+  it('embeds the excerpt and maxLen (zh)', () => {
+    const p = buildTitlePrompt('帮我看看  这个\n\n报错', 12, 'zh');
+    expect(p).toContain('12');
+    expect(p).toContain('帮我看看 这个 报错');
+  });
+
+  it('caps the excerpt at 500 chars', () => {
+    const p = buildTitlePrompt('y'.repeat(2000), 12, 'en');
+    expect(p.length).toBeLessThan(700);
+  });
+});

@@ -2858,7 +2858,7 @@ function SessionModeSection(props: {
   putCardPref(patch: CardPrefPatch): Promise<JsonResponse>;
 }) {
   const tr = useT();
-  const [p2p, setP2p] = useState(props.bot.p2pMode === 'thread' ? 'thread' : 'chat');
+  const [p2p, setP2p] = useState(normalizeP2pMode(props.bot.p2pMode));
   const [regular, setRegular] = useState(regularGroupMode(props.bot));
   const [mention, setMention] = useState(mentionMode(props.bot));
   const [docMode, setDocMode] = useState(props.bot.docSubscribeDefaultMode === 'all' ? 'all' : 'mention-only');
@@ -2869,7 +2869,7 @@ function SessionModeSection(props: {
   const [docStatus, setDocStatus] = useState<StatusMessage>(null);
 
   useEffect(() => {
-    setP2p(props.bot.p2pMode === 'thread' ? 'thread' : 'chat');
+    setP2p(normalizeP2pMode(props.bot.p2pMode));
     setRegular(regularGroupMode(props.bot));
     setMention(mentionMode(props.bot));
     setDocMode(props.bot.docSubscribeDefaultMode === 'all' ? 'all' : 'mention-only');
@@ -2881,14 +2881,14 @@ function SessionModeSection(props: {
   ]);
 
   async function saveP2p(next: string): Promise<void> {
-    const mode = next === 'chat' ? 'chat' : 'thread';
+    const mode = normalizeP2pMode(next);
     setP2p(mode);
     setBusy('p2p');
     setP2pStatus(null);
     try {
       const res = await sendJson('PUT', `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/p2p-mode`, { p2pMode: mode });
       if (res.ok && res.body.ok) {
-        props.patchBot(props.bot.larkAppId, { p2pMode: res.body.p2pMode === 'thread' ? 'thread' : 'chat' });
+        props.patchBot(props.bot.larkAppId, { p2pMode: normalizeP2pMode(res.body.p2pMode) });
         setP2pStatus({ text: `✓ ${tr('botDefaults.cardPrefSaved')}`, ok: true });
       } else {
         setP2pStatus({ text: `✗ ${responseErrorText(res)}` });
@@ -2913,9 +2913,10 @@ function SessionModeSection(props: {
     }
   }
 
-  const p2pOptions: DropdownFieldOption<'thread' | 'chat'>[] = [
+  const p2pOptions: DropdownFieldOption<'thread' | 'chat' | 'group'>[] = [
     { value: 'thread', label: tr('botDefaults.p2pThread') },
     { value: 'chat', label: tr('botDefaults.p2pChat') },
+    { value: 'group', label: tr('botDefaults.p2pGroup') },
   ];
   const regularOptions: DropdownFieldOption<string>[] = [
     { value: 'chat', label: tr('botDefaults.regularGroupModeChat') },
@@ -2951,6 +2952,7 @@ function SessionModeSection(props: {
         </div>
         <div className="actions"><StatusSpan status={p2pStatus} attr={{ 'data-p2p-status': '' }} /></div>
       </div>
+      {p2p === 'group' && <SessionGroupTagRow bot={props.bot} />}
       <div className="bd-row">
         <div className="bd-field">
           <FieldTitle help={tr('botDefaults.regularGroupModeHelp')}>{tr('botDefaults.regularGroupMode')}</FieldTitle>
@@ -3433,6 +3435,125 @@ function SubstituteModeSection(props: { bot: BotDefaultsRow; patchBot: PatchBot 
         <StatusSpan status={status} attr={{ 'data-substitute-status': '' }} />
       </div>
     </section>
+  );
+}
+
+function normalizeP2pMode(value: unknown): 'thread' | 'chat' | 'group' {
+  return value === 'thread' ? 'thread' : value === 'group' ? 'group' : 'chat';
+}
+
+/** 会话群标签行（p2pMode=group 时显示）：tag mode 选择器 + 按模式分支的
+ *  授权 UI（PR review：授权行必须与实际 tagMode 一致）。
+ *  - chat-tag（默认）：应用租户身份打企业群标签，无需用户授权 → 不显示授权按钮
+ *  - feed-group：个人侧边栏分组，需一次 OAuth → 显示状态徽标 + 一键授权
+ *  - off：不打标签
+ *  一键授权 → 新标签页打开飞书授权 → 回跳 dashboard /oauth/callback 自动完成
+ *  → 本行轮询到 authorized 后徽标变绿。 */
+function SessionGroupTagRow(props: { bot: BotDefaultsRow }) {
+  const tr = useT();
+  const [status, setStatus] = useState<{ authorized: boolean; tagMode: string } | null>(null);
+  const [authBusy, setAuthBusy] = useState(false);
+  const [modeBusy, setModeBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  const fetchStatus = async (): Promise<boolean> => {
+    try {
+      const res = await sendJson('GET', `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/session-group-tag-status`);
+      if (res.ok && res.body.ok) {
+        setStatus({ authorized: !!res.body.authorized, tagMode: String(res.body.tagMode ?? 'chat-tag') });
+        return !!res.body.authorized;
+      }
+    } catch { /* transient */ }
+    return false;
+  };
+
+  useEffect(() => { void fetchStatus(); }, [props.bot.larkAppId]);
+
+  async function saveMode(next: string): Promise<void> {
+    setModeBusy(true);
+    setErr(null);
+    try {
+      const res = await sendJson('PUT', `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/session-group-tag-config`, { mode: next });
+      if (res.ok && res.body.ok) {
+        setStatus(s => ({ authorized: s?.authorized ?? false, tagMode: String(res.body.tagMode) }));
+      } else {
+        setErr(responseErrorText(res));
+      }
+    } catch (e: any) {
+      setErr(caughtErrorText(e));
+    } finally {
+      setModeBusy(false);
+    }
+  }
+
+  async function startAuth(): Promise<void> {
+    setAuthBusy(true);
+    setErr(null);
+    try {
+      const res = await sendJson('POST', `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/session-group-tag-auth`, {});
+      if (!res.ok || !res.body.ok || !res.body.authUrl) {
+        setErr(responseErrorText(res));
+        return;
+      }
+      window.open(res.body.authUrl, '_blank', 'noopener');
+      // 轮询授权结果：3s × 60 次（授权链接 5 分钟有效期同量级）。
+      for (let i = 0; i < 60; i++) {
+        await new Promise(r => setTimeout(r, 3000));
+        if (await fetchStatus()) return;
+      }
+      setErr(tr('botDefaults.sgTagAuthTimeout'));
+    } catch (e: any) {
+      setErr(caughtErrorText(e));
+    } finally {
+      setAuthBusy(false);
+    }
+  }
+
+  const tagMode = status?.tagMode ?? 'chat-tag';
+  const authorized = status?.authorized === true;
+  const modeOptions: DropdownFieldOption<string>[] = [
+    { value: 'chat-tag', label: tr('botDefaults.sgTagModeChatTag') },
+    { value: 'feed-group', label: tr('botDefaults.sgTagModeFeedGroup') },
+    { value: 'off', label: tr('botDefaults.sgTagModeOff') },
+  ];
+  return (
+    <div className="bd-row" data-session-group-tag-row>
+      <div className="bd-field">
+        <FieldTitle help={tr('botDefaults.sgTagHelp')}>{tr('botDefaults.sgTag')}</FieldTitle>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+          <DropdownField
+            dataInput="sessionGroupTagMode"
+            ariaLabel={tr('botDefaults.sgTag')}
+            value={tagMode}
+            disabled={modeBusy || !status}
+            options={modeOptions}
+            onChange={next => void saveMode(next)}
+          />
+          {tagMode === 'chat-tag' && (
+            <span data-sg-tag-state="tenant">{tr('botDefaults.sgTagChatTagNote')}</span>
+          )}
+          {tagMode === 'feed-group' && (
+            <>
+              <span data-sg-tag-state={authorized ? 'authorized' : 'unauthorized'}>
+                {authorized ? `🟢 ${tr('botDefaults.sgTagAuthorized')}` : `⚪ ${tr('botDefaults.sgTagUnauthorized')}`}
+              </span>
+              {!authorized && (
+                <button
+                  type="button"
+                  className="primary"
+                  data-action="session-group-tag-auth"
+                  disabled={authBusy}
+                  onClick={() => void startAuth()}
+                >
+                  {authBusy ? tr('botDefaults.sgTagAuthWaiting') : tr('botDefaults.sgTagAuthStart')}
+                </button>
+              )}
+            </>
+          )}
+          {err && <span className="status-error">✗ {err}</span>}
+        </div>
+      </div>
+    </div>
   );
 }
 

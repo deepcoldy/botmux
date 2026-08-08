@@ -184,6 +184,7 @@ import {
   rememberLastCliInput,
   ensureTerminalWorkerPort,
   ensureSessionWhiteboard,
+  resumeSession,
 } from './core/session-manager.js';
 import { triggerSessionTurn } from './core/trigger-session.js';
 import { claimInitialUserTurn, isInitialUserTurnPending, releaseInitialUserTurn } from './core/initial-user-turn.js';
@@ -399,6 +400,9 @@ import {
 } from './vc-agent/realtime/index.js';
 import { createGroupWithBots } from './services/group-creator.js';
 import { addBotToChat, isInChat } from './services/groups-store.js';
+import { initSessionGroups, isSessionGroup, getSessionGroup, touchSessionGroup } from './services/session-groups-store.js';
+import { maybeBirthSessionGroup } from './core/session-group-birth.js';
+import { scheduleSessionGroupTitle } from './services/session-group-title.js';
 import { setChatReplyMode } from './services/chat-reply-mode-store.js';
 import {
   hasVcMeetingEndedTombstone,
@@ -15741,10 +15745,57 @@ function mergeVcMeetingApplicationContext(
 
 async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
   const { chatId, messageId, chatType, larkAppId, replyRootId, substituteTrigger, messageListener } = ctx;
+  // Session-group birth re-homes the turn into the new group: replies/quotes
+  // anchor on the in-group intro message, while `messageId` (the ORIGINAL
+  // inbound message) keeps serving resource downloads / merge-forward
+  // expansion / dedup — their keys belong to the source message.
+  const replyAnchorId = ctx.replyAnchorMessageId ?? messageId;
   // scope/anchor are mutable here: `/t` / `/topic` may flip a 普通群 chat-scope
   // routing into thread-scope so the bot's first reply seeds a Lark thread.
   let scope = ctx.scope;
   let anchor = ctx.anchor;
+
+  // ─── p2pMode='group'：会话群出生 ────────────────────────────────────────
+  // group 模式下，顶层 DM 消息在任何会话机制启动前先改道：建一个专属会话群
+  //（bot 保留群主），把本轮 context 重写到新群（chat-scope）后递归。返回 null
+  // 表示跳过/失败（斜杠命令、建群失败已私聊提示），落回旧的 DM 话题行为。
+  // sessionGroupBirth 防递归；scope/anchor 形状约束保证只有全新顶层种子会出生
+  //（回复旧 DM 话题的消息仍归原会话）。thread_id 检查兜住「话题内发送 + 同时
+  // 发送到会话」的消息形态：它的事件 root_id 为空（顶层形态）但携带 thread_id
+  // ——语境属于既有话题，绝不能当全新会话去建群；放行后按旧 thread 行为在
+  // 原 DM 落话题（用户实测反馈的误建群场景）。
+  if (
+    chatType === 'p2p'
+    && getBot(larkAppId).config.p2pMode === 'group'
+    && !ctx.sessionGroupBirth
+    && !substituteTrigger
+    && scope === 'thread'
+    && anchor === messageId
+    && !data?.message?.thread_id
+  ) {
+    const reborn = await maybeBirthSessionGroup(data, ctx);
+    if (reborn) return handleNewTopic(data, reborn);
+  }
+
+  // ─── 会话群同群续聊 ─────────────────────────────────────────────────────
+  // 会话群里的新消息发现登记的会话已关闭时，自动 resume 原会话（与话题内续聊
+  // 同款体验），而不是新开 CLI。恢复失败则照常走全新会话。
+  if (chatType === 'group' && scope === 'chat' && !ctx.sessionGroupBirth) {
+    const sgEntry = getSessionGroup(chatId);
+    if (sgEntry?.lastSessionId) {
+      const prevSession = sessionStore.getSession(sgEntry.lastSessionId);
+      if (prevSession?.status === 'closed') {
+        const resumed = await resumeSession(sgEntry.lastSessionId, activeSessions);
+        if (resumed.ok) {
+          touchSessionGroup(chatId);
+          logger.info(`[session-group] resumed session=${sgEntry.lastSessionId.substring(0, 8)} in chat=${chatId.substring(0, 12)}`);
+          return handleThreadReply(data, ctx);
+        }
+        logger.warn(`[session-group] resume failed (${resumed.error}) chat=${chatId.substring(0, 12)}; spawning fresh session`);
+      }
+    }
+  }
+
   const numberer = createImgNumberer();
   let forwardSeedContent = '';
   let forwardSeedResources: MessageResource[] = [];
@@ -16169,9 +16220,16 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
   // disconnect click silently no-ops.
   // For chat-scope, rootMessageId stores the seed message_id (audit only);
   // routing keys off chatId via sessionAnchorId(), so any value works.
-  const rootIdForStore = scope === 'thread' ? anchor : messageId;
+  // Session-group births store the in-group intro (reply anchor) here so the
+  // audit trail points at a message that actually lives in the session's chat.
+  const rootIdForStore = scope === 'thread' ? anchor : replyAnchorId;
   const initialTurnTitle = (messageListener?.replyCardTitle ?? (ctx.forwardSeedData ? followupContent : content)).substring(0, 50);
   const session = sessionStore.createSession(chatId, rootIdForStore, initialTurnTitle, chatType);
+  // Session-group registry: point the group at its (new) resident session so
+  // same-group resume and the async AI title can find it.
+  if (chatType === 'group' && isSessionGroup(chatId)) {
+    touchSessionGroup(chatId, session.sessionId);
+  }
   const now = Date.now();
   setDirectChatDisplayNameFromSender(session, chatType, newTopicSender);
   const groupChatName = await groupChatNamePromise;
@@ -16188,7 +16246,11 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
   // `botmux send` can --mention-back / 引用 the triggering message (chat scope).
   // Without this the first reply hits hasQuoteTargetSender=false (exit 2) and
   // chat-scope首条不引用. Use the event's sender open_id (correct app scope).
-  session.quoteTargetId = parsed.messageId;
+  // Keyed off the REPLY anchor (== messageId except for session-group births,
+  // where it is the in-group intro message so quotes stay in the group instead
+  // of leaking to the source DM — while messageId itself keeps serving
+  // resource/merge-forward lookups against the original inbound message).
+  session.quoteTargetId = replyAnchorId;
   session.quoteTargetSenderOpenId = senderOpenId;
   session.quoteTargetSenderIsBot = isForeignBotSender || parsed.senderType === 'app' || parsed.senderType === 'bot';
   session.lastMessageAt = new Date(now).toISOString();
@@ -16884,6 +16946,16 @@ async function handleThreadReply(
   }
 
   if (!prepared) learnFromMentions(larkAppId, parsed.mentions);
+
+  // 会话群自愈命名：出生时 AI 命名失败（CLI 抖动/超时/当时无模板）的群会停在
+  // 截断占位名——任意后续文本消息触发一次补跑（title 服务内 in-flight 去重 +
+  // titled 标记幂等），把偶发失败自动治愈，而不是永远留疤。
+  if (ctxChatType === 'group' && isSessionGroup(ctxChatId)) {
+    const sgEntry = getSessionGroup(ctxChatId);
+    if (sgEntry && !sgEntry.titled && parsed.content.trim() && !parsed.content.trim().startsWith('/')) {
+      scheduleSessionGroupTitle({ larkAppId, chatId: ctxChatId, userText: parsed.content });
+    }
+  }
 
   // Foreign bot @mention prefix: when sender is another botmux bot，把内容包成
   // [来自 X 的 @mention]\n<原文> 喂给 worker，让 CLI 知道这是另一个 bot 发的——
@@ -18700,6 +18772,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   catch (err) { logger.warn(`[hook] startup ensureCliEnv failed for ${cfg.cliId}: ${err instanceof Error ? err.message : String(err)}`); }
   sessionStore.init(cfg.larkAppId);
   chatFirstSeenStore.init(cfg.larkAppId);
+  initSessionGroups(cfg.larkAppId);
   const ambiguousOnBoot = reconcileVcMeetingDeliveriesOnBoot(
     config.session.dataDir,
     { receiverBootId: getDaemonBootId(), agentAppId: cfg.larkAppId },

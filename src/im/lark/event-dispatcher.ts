@@ -1745,6 +1745,16 @@ export interface RoutingContext {
   messageListener?: MessageListenerMatch;
   /** Earlier topic seed coalesced into this root-linked clarification. */
   forwardSeedData?: any;
+  /** Set by the session-group birth flow (p2pMode='group') after it has
+   *  re-homed this turn from a DM into a freshly-created session group —
+   *  prevents the birth logic from re-triggering on the rewritten context. */
+  sessionGroupBirth?: boolean;
+  /** Session-group birth only: the in-group intro message id used as the
+   *  turn's REPLY anchor (quote target / session rootMessageId), so the first
+   *  turn's outputs land in the group. `messageId` stays the ORIGINAL inbound
+   *  DM message id — resource downloads and merge-forward expansion must keep
+   *  using it (the resource keys belong to the source message, PR review P1). */
+  replyAnchorMessageId?: string;
   larkAppId: string;
 }
 
@@ -2288,16 +2298,21 @@ async function decideRoutingWithSource(
   // 下面的 real-thread（root_id+thread_id）分支判断 —— 否则用户在 DM 里"回复某条
   // 消息"形成的 thread 形态消息会被提前分流到 thread-scope，破坏"连续单聊会话"
   // 语义（典型触发：thread→chat 模式切换后回复旧 thread，或 Lark 给 DM 回复塞了
-  // thread_id）。p2pMode 默认 'chat'；只有显式 'thread' 才回到每条 DM 独立话题的
-  // 旧行为。群聊不受影响。
-  if (chatType === 'p2p' && getBot(larkAppId)?.config?.p2pMode !== 'thread') {
-    return { scope: 'chat', anchor: chatId, source: 'p2p' };
+  // thread_id）。p2pMode 默认 'chat'；显式 'thread' 回到每条 DM 独立话题的旧行为；
+  // 显式 'group'（会话群模式）与 thread 同形路由——每条顶层 DM 都是新锚点，随后由
+  // handleNewTopic 的会话群出生流程把会话改道进新建的专属群。群聊不受影响。
+  {
+    const p2pModeForRouting = getBot(larkAppId)?.config?.p2pMode;
+    if (chatType === 'p2p' && p2pModeForRouting !== 'thread' && p2pModeForRouting !== 'group') {
+      return { scope: 'chat', anchor: chatId, source: 'p2p' };
+    }
   }
 
   if (rootId && threadId) return { scope: 'thread', anchor: rootId, source: 'real-thread' };
 
-  // 私聊 thread 模式（显式 opt-out）：每条 top-level DM 都视为新话题 — 跟话题群
-  // 同款，匹配 Lark DM 的话题化行为，把 1:1 对话按消息拆成独立 CLI 进程。
+  // 私聊 thread / group 模式（显式 opt-out）：每条 top-level DM 都视为新话题 — 跟
+  // 话题群同款，匹配 Lark DM 的话题化行为，把 1:1 对话按消息拆成独立 CLI 进程
+  // （group 模式的改道发生在 handleNewTopic，路由形状与 thread 一致）。
   if (chatType === 'p2p') {
     return { scope: 'thread', anchor: messageId, source: 'p2p' };
   }

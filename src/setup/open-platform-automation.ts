@@ -13,6 +13,7 @@ import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import qrcode from 'qrcode-terminal';
 import { VC_MEETING_BOT_EVENTS } from './verify-permissions.js';
+import { readGlobalConfig } from '../global-config.js';
 
 /**
  * All non-VC events (application identity) that the botmux dispatcher consumes.
@@ -400,10 +401,12 @@ export function buildScopeUpdatePayload(appId: string, mapped: Pick<MappedScopeI
   };
 }
 
-export function buildSafeSettingPayload(appId: string) {
+export function buildSafeSettingPayload(appId: string, extraRedirectUrls: string[] = []) {
   return {
     clientId: appId,
-    redirectURL: [BOTMUX_REDIRECT_URL],
+    // 默认本机回贴地址 + 可选的 dashboard 自动回调地址（global-config
+    // oauthRedirectBase 场景）。去重保持幂等。
+    redirectURL: [...new Set([BOTMUX_REDIRECT_URL, ...extraRedirectUrls])],
   };
 }
 
@@ -892,7 +895,14 @@ export async function automateOpenPlatformSetup(
   }
 
   try {
-    await postJson(`/developers/v1/safe_setting/update/${options.appId}`, buildSafeSettingPayload(options.appId));
+    // 自动回调场景：global-config oauthRedirectBase 指向本机 dashboard 时，把
+    // `<base>/oauth/callback` 一并写入 redirect 白名单，authorize 才允许回跳。
+    let extraRedirects: string[] = [];
+    try {
+      const base = readGlobalConfig().oauthRedirectBase?.trim().replace(/\/+$/, '');
+      if (base && /^https?:\/\//.test(base)) extraRedirects = [`${base}/oauth/callback`];
+    } catch { /* config unavailable → default only */ }
+    await postJson(`/developers/v1/safe_setting/update/${options.appId}`, buildSafeSettingPayload(options.appId, extraRedirects));
     const contactRange = await postJson(`/developers/v1/contact_range/${options.appId}`, {});
     // 镜像应用原有 contact range 作为版本可见范围——绝不注入「当前 Web session
     // 操作者」:automateOpenPlatformSetup 也被 VC listener 保存 / 权限自愈 / 选择
