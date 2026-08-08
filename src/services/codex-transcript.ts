@@ -213,11 +213,118 @@ export interface CodexBridgeEvent {
    *  default. */
   terminalStatus?: 'completed' | 'failed' | 'ambiguous';
   terminalErrorCode?: string;
+  /** Safe, bounded user-facing detail extracted from a structured failure.
+   *  Raw provider payloads stay in the rollout/Web terminal. */
+  terminalErrorSummary?: string;
   sourceSessionId?: string;
   /** Keep the pending turn's original markTimeMs instead of moving it to the
    *  transcript user timestamp. Used by bridges whose committed user
    *  timestamp can lag behind in-turn delivery markers. */
   preserveMarkTimeMs?: boolean;
+}
+
+export const CODEX_RATE_LIMIT_ERROR_CODE = 'codex_rate_limited';
+export const CODEX_AUTH_ERROR_CODE = 'codex_auth_failed';
+export const CODEX_INVALID_REQUEST_ERROR_CODE = 'codex_invalid_request';
+export const CODEX_CONNECTION_ERROR_CODE = 'codex_connection_failed';
+export const CODEX_TASK_FAILED_ERROR_CODE = 'codex_task_failed';
+
+const CODEX_FAILURE_SUMMARY_MAX_CHARS = 320;
+
+function parseEmbeddedJson(value: unknown): unknown {
+  if (typeof value !== 'string') return undefined;
+  const trimmed = value.trim();
+  if (trimmed.length < 2 || trimmed.length > 20_000) return undefined;
+  if (!trimmed.startsWith('{') && !trimmed.startsWith('[')) return undefined;
+  try { return JSON.parse(trimmed); } catch { return undefined; }
+}
+
+/** Peel provider wrappers such as `{ message: "{\"error\":{...}}" }`. */
+function codexFailureLeaf(error: unknown): unknown {
+  let current = error;
+  for (let depth = 0; depth < 6; depth++) {
+    const parsed = parseEmbeddedJson(current);
+    if (parsed !== undefined) {
+      current = parsed;
+      continue;
+    }
+    if (!current || typeof current !== 'object') break;
+    const value = current as Record<string, unknown>;
+    if (value.error !== undefined) {
+      current = value.error;
+      continue;
+    }
+    const parsedMessage = parseEmbeddedJson(value.message);
+    if (parsedMessage !== undefined) {
+      current = parsedMessage;
+      continue;
+    }
+    break;
+  }
+  return current;
+}
+
+function safeFailureSummary(error: unknown): string | undefined {
+  const leaf = codexFailureLeaf(error);
+  let message = '';
+  let code = '';
+  let type = '';
+  if (typeof leaf === 'string') {
+    message = leaf;
+  } else if (leaf && typeof leaf === 'object') {
+    const value = leaf as Record<string, unknown>;
+    message = typeof value.message === 'string' ? value.message : '';
+    code = typeof value.code === 'string' || typeof value.code === 'number'
+      ? String(value.code)
+      : '';
+    type = typeof value.type === 'string' ? value.type : '';
+  }
+  let summary = [code, type].filter(Boolean).join(' ');
+  if (message) summary = summary ? `${summary}: ${message}` : message;
+  if (!summary) return undefined;
+
+  // Provider errors are untrusted. Keep the useful reason while removing
+  // common credentials, signed URLs, mention/HTML syntax and control chars.
+  summary = summary
+    .replace(/https?:\/\/[^\s"'<>]+/gi, '[URL]')
+    .replace(/\bBearer\s+[A-Za-z0-9._~+\/-]+=*/gi, 'Bearer [REDACTED]')
+    .replace(/\b(?:sk|rk|pk)-[A-Za-z0-9_-]{12,}\b/g, '[REDACTED]')
+    .replace(/\b([A-Za-z0-9_-]{12,}\.[A-Za-z0-9_-]{12,}\.[A-Za-z0-9_-]{12,})\b/g, '[REDACTED]')
+    .replace(/((?:api[_-]?key|access[_-]?token|token|auth(?:orization)?|secret|password|signature|credential|cookie)\s*[:=]\s*)(?:"[^"]*"|'[^']*'|[^\s,;}]+)/gi, '$1[REDACTED]')
+    .replace(/[\u0000-\u001f\u007f]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .replace(/</g, '‹')
+    .replace(/>/g, '›')
+    .replace(/`/g, "'")
+    .replace(/@/g, '＠');
+  if (!summary) return undefined;
+  return summary.length > CODEX_FAILURE_SUMMARY_MAX_CHARS
+    ? `${summary.slice(0, CODEX_FAILURE_SUMMARY_MAX_CHARS - 1)}…`
+    : summary;
+}
+
+function codexTaskFailureCode(error: unknown): string {
+  let serialized = '';
+  try { serialized = JSON.stringify(error); } catch { serialized = String(error ?? ''); }
+  const normalized = serialized.toLowerCase();
+  if (/\b429\b|too many requests|rate[_ -]?limit/.test(normalized)) return CODEX_RATE_LIMIT_ERROR_CODE;
+  if (/\b401\b|\b403\b|unauthorized|forbidden|authentication|invalid[_ -]?(?:api[_ -]?)?key/.test(normalized)) {
+    return CODEX_AUTH_ERROR_CODE;
+  }
+  if (/invalid_request|invalid request|validation|empty_string|\b400\b|\b-4003\b/.test(normalized)) {
+    return CODEX_INVALID_REQUEST_ERROR_CODE;
+  }
+  if (/econn|connection|network|socket|timed?\s*out|timeout|dns|enotfound/.test(normalized)) {
+    return CODEX_CONNECTION_ERROR_CODE;
+  }
+  return CODEX_TASK_FAILED_ERROR_CODE;
+}
+
+export function isCodexRateLimitEvent(event: CodexBridgeEvent): boolean {
+  return event.kind === 'assistant_final'
+    && event.terminalStatus === 'failed'
+    && event.terminalErrorCode === CODEX_RATE_LIMIT_ERROR_CODE;
 }
 
 /** Extract the last completed user/assistant turn from a Codex / CoCo bridge
@@ -529,11 +636,17 @@ export function drainCodexRollout(path: string, fromOffset: number): CodexDrainR
       && p.type === 'task_complete'
       && typeof p.turn_id === 'string'
       && p.turn_id.length > 0) {
+      const failed = p.error !== null && p.error !== undefined;
       events.push({
         uuid: `${path}:${lineStart}`,
         timestampMs,
         kind: 'assistant_final',
         text: typeof p.last_agent_message === 'string' ? p.last_agent_message : '',
+        ...(failed ? {
+          terminalStatus: 'failed' as const,
+          terminalErrorCode: codexTaskFailureCode(p.error),
+          terminalErrorSummary: safeFailureSummary(p.error),
+        } : {}),
       });
       continue;
     }

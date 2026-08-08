@@ -39,7 +39,8 @@ import { readProcessStartIdentity } from './core/session-marker.js';
 import { roleLibraryRoot, roleLibrarySubtree } from './core/role-library.js';
 import { drainTranscript, joinAssistantText, trailingAssistantText, findJsonlContainingFingerprint, findJsonlsContainingExactContent, findLatestJsonl, extractLastAssistantTurn, stringifyUserContent, extractTurnStartText, splitTranscriptEventsByCutoff, isTranscriptRateLimitEvent, apiErrorMessageText, type TranscriptEvent } from './services/claude-transcript.js';
 import { BridgeTurnQueue, makeFingerprint, normaliseForFingerprint } from './services/bridge-turn-queue.js';
-import { shouldEmitEmptyCompletedBridgeFallback, shouldSuppressBridgeEmit, type BridgeSendMarker } from './services/bridge-fallback-gate.js';
+import { shouldEmitEmptyCompletedBridgeFallback, shouldEmitFailedBridgeFallback, shouldSuppressBridgeEmit, type BridgeSendMarker } from './services/bridge-fallback-gate.js';
+import { buildSubmitMessagePreview } from './services/submit-notification.js';
 import {
   decideHardTimeoutAction,
   decideSettleMarkReady,
@@ -131,7 +132,7 @@ import {
   setCodexAppThreadName,
 } from './services/codex-app-threads.js';
 import { buildBotmuxLarkNativeSessionTitle } from './core/session-title.js';
-import { drainCodexRollout, findCodexRolloutBySessionId, findCodexRolloutByPid, findCodexRolloutSetByPid, codexHistorySidIsOwned, splitCodexEventsByCutoff, extractLastCodexTurn, codexSessionIdFromRolloutPath, scanCodexThreadSettings, type CodexBridgeEvent, type CodexDrainResult } from './services/codex-transcript.js';
+import { CODEX_AUTH_ERROR_CODE, CODEX_CONNECTION_ERROR_CODE, CODEX_INVALID_REQUEST_ERROR_CODE, CODEX_RATE_LIMIT_ERROR_CODE, drainCodexRollout, findCodexRolloutBySessionId, findCodexRolloutByPid, findCodexRolloutSetByPid, codexHistorySidIsOwned, splitCodexEventsByCutoff, extractLastCodexTurn, codexSessionIdFromRolloutPath, isCodexRateLimitEvent, scanCodexThreadSettings, type CodexBridgeEvent, type CodexDrainResult } from './services/codex-transcript.js';
 import { CodexServiceTierTracker, resolveCodexServiceTierSnapshot } from './services/codex-service-tier.js';
 import { drainTraexRollout, findTraexRolloutBySessionId, findTraexRolloutByPid, findTraexRolloutSetByPid, traexHistorySidIsOwned } from './services/traex-transcript.js';
 import { parseTraexUserInputQuestions } from './services/traex-user-input.js';
@@ -2237,10 +2238,9 @@ const bridgeSecondaryPaths = new Map<string, number>(); // path → offset
 let bridgeOffset = 0;
 let bridgePendingTail = '';
 const bridgeQueue = new BridgeTurnQueue();
-/** uuids of Claude transcript rate-limit records we've already turned into a
- *  `limited` emit. drainTranscript re-reads from offset 0 on truncation /
- *  rotation and emitReadyTurns re-drains from 0, so the same rate_limit record
- *  can resurface; keying on the record's stable uuid makes the emit idempotent. */
+/** uuids of structured transcript rate-limit records already turned into a
+ *  `limited` emit. Readers may re-read from offset 0 after rotation, so the
+ *  stable record uuid keeps the notification idempotent. */
 const emittedRateLimitUuids = new Set<string>();
 let bridgeWatcher: FSWatcher | null = null;
 let bridgeFallbackTimer: NodeJS.Timeout | null = null;
@@ -2350,6 +2350,19 @@ function formatHeadlessLocalTurnContent(assistantText: string): string | null {
 
 function emptyCompletedBridgeFallbackContent(): string {
   return t('worker.empty_final_completed', { cliName: cliName() });
+}
+
+function failedBridgeFallbackContent(errorCode?: string, summary?: string, partialText?: string): string {
+  const reason = summary || t('worker.failed_reason_unavailable');
+  const key = errorCode === CODEX_INVALID_REQUEST_ERROR_CODE
+    ? 'worker.empty_final_failed_invalid_request'
+    : errorCode === CODEX_AUTH_ERROR_CODE
+      ? 'worker.empty_final_failed_auth'
+      : errorCode === CODEX_CONNECTION_ERROR_CODE
+        ? 'worker.empty_final_failed_connection'
+        : 'worker.empty_final_failed';
+  const failure = t(key, { cliName: cliName(), reason });
+  return partialText?.trim() ? `${partialText.trim()}\n\n${failure}` : failure;
 }
 
 // ─── Bridge fallback marker (non-adopt) ────────────────────────────────────
@@ -4260,6 +4273,7 @@ function codexBridgeIngest(opts: { signalIdle?: boolean } = {}): void {
       codexBridgeRolloutPath,
       (result as CodexDrainResult).latestThreadSettings,
     );
+    maybeEmitCodexStructuredRateLimit(result.events);
   }
   if (result.events.length > 0) lastStructuredBridgeActivityAtMs = Date.now();
   codexBridgeQueue.ingest(result.events);
@@ -4271,6 +4285,26 @@ function codexBridgeIngest(opts: { signalIdle?: boolean } = {}): void {
   // converge. Idempotent — IdleDetector.fireIdle no-ops while already idle.
   if (opts.signalIdle !== false && result.events.some(e => e.kind === 'assistant_final')) {
     idleDetector?.fireIdle();
+  }
+}
+
+/** 将 Codex 的结构化 429 终态同步为既有的限流状态。 */
+function maybeEmitCodexStructuredRateLimit(events: readonly CodexBridgeEvent[]): void {
+  for (const ev of events) {
+    if (!isCodexRateLimitEvent(ev) || emittedRateLimitUuids.has(ev.uuid)) continue;
+    emittedRateLimitUuids.add(ev.uuid);
+    const usageLimit = structuredRateLimitState(ev.terminalErrorSummary ?? '429 Too Many Requests');
+    usageLimitTracker.noteStructuredLimit();
+    send({
+      type: 'screen_update',
+      content: currentUsageLimitSnapshot(),
+      status: 'limited',
+      usageLimit,
+      turnId: currentBotmuxTurnId,
+      dispatchAttempt: currentBotmuxDispatchAttempt,
+    });
+    log(`Structured rate-limit detected in Codex transcript (uuid=${ev.uuid.substring(0, 8)}, retryLabel=${usageLimit.retryLabel}) → emitted limited state.`);
+    return;
   }
 }
 
@@ -4351,11 +4385,14 @@ function emitReadyCodexTurns(): void {
       finalText: turn.finalText,
       terminalStatus: turn.terminalStatus,
     };
-    const content = turn.finalText && turn.finalText.trim()
-      ? turn.finalText
-      : shouldEmitEmptyCompletedBridgeFallback(gateInput, nextBoundaryMs, markers, adoptMode)
-        ? emptyCompletedBridgeFallbackContent()
-        : '';
+    const content = turn.terminalErrorCode !== CODEX_RATE_LIMIT_ERROR_CODE
+      && shouldEmitFailedBridgeFallback(gateInput, nextBoundaryMs, markers, adoptMode)
+      ? failedBridgeFallbackContent(turn.terminalErrorCode, turn.terminalErrorSummary, turn.finalText)
+      : turn.finalText && turn.finalText.trim()
+        ? turn.finalText
+        : shouldEmitEmptyCompletedBridgeFallback(gateInput, nextBoundaryMs, markers, adoptMode)
+          ? emptyCompletedBridgeFallbackContent()
+          : '';
     if (!content) continue;
     if (shouldSuppressBridgeEmit(gateInput, nextBoundaryMs, markers, adoptMode)) {
       log(`Codex bridge fallback suppressed for turn ${turn.turnId.substring(0, 8)} (gate)`);
@@ -6511,7 +6548,7 @@ function scheduleSubmitFailureNotify(
   turnIdentity?: Pick<PendingCliInput, 'turnId' | 'dispatchAttempt'>,
   durableTerminalStatus: 'failed' | 'ambiguous' = 'failed',
 ): void {
-  const preview = msg.length > 60 ? msg.slice(0, 60) + '…' : msg;
+  const preview = buildSubmitMessagePreview(msg);
   const emitDurableTerminal = (errorCode: string): void => {
     if (turnIdentity?.turnId && turnIdentity.dispatchAttempt !== undefined) {
       emitTurnTerminal(

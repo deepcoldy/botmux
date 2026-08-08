@@ -832,6 +832,11 @@ export const messages: Record<string, string> = {
   'worker.raw_input_failed_recovery': '⚠️ Slash 命令未能确认送达 {cliName}，同一条消息中紧随其后的正文没有继续提交。\n原因：{reason}',
   'worker.raw_input_failed_command_only_recovery': '⚠️ Slash 命令未能确认送达 {cliName}。\n原因：{reason}',
   'worker.empty_final_completed': '⚠️ {cliName} 已报告本轮处理完成，但 botmux 没有从终端记录里捕获到最终文本，也没有追踪到本轮的回复。若你已经通过改道发送（--top-level / --into / --override-chat）回复过，可忽略本提示；否则请打开 Web 终端查看最后输出，或直接重发消息让会话继续。',
+  'worker.failed_reason_unavailable': '未提供可安全展示的错误摘要',
+  'worker.empty_final_failed': '⚠️ {cliName} 本轮执行失败：{reason}\n完整错误已保留在 Web 终端和 daemon 日志中；排除问题后请重发消息。',
+  'worker.empty_final_failed_invalid_request': '⚠️ {cliName} 请求被拒绝：{reason}\n请检查 CLI、模型网关和工具 schema 配置，修复后重发消息。',
+  'worker.empty_final_failed_auth': '⚠️ {cliName} 认证失败：{reason}\n请检查 CLI 登录状态和模型服务凭证，修复后重发消息。',
+  'worker.empty_final_failed_connection': '⚠️ {cliName} 连接模型服务失败：{reason}\n请检查网络与模型服务状态，恢复后重发消息。',
 
   // ─── CLI setup wizard / pm2 lifecycle (no per-bot context) ───────────────
   'setup.lark_create_app': '请先在飞书开放平台创建应用: https://open.feishu.cn/app',
@@ -1214,8 +1219,8 @@ export const messages: Record<string, string> = {
   // Worker-side submit / notify messages
   'worker.codex_composer_conflict': '已 adopt 的 Codex 终端输入框里已有未提交的本地草稿。botmux 保留了草稿，没有把这条飞书消息拼到后面。请先提交或清空本地草稿，再重发飞书消息。',
   'worker.submit_impossible': '⚠️ 刚才那条消息没有安全写入 {cliName}。\n原因：{reason}\n请处理上述原因并确认终端状态后再试。\n开头：{preview}',
-  'worker.submit_unconfirmed': '⚠️ 刚才那条消息发给 {cliName} 后没能确认提交（重试 Enter 后等了 {secs}s 仍未在{transcriptLabel}里看到新记录）。可能卡在输入框里——请去 Web 终端看一下，手动按 Enter 或重发。\n开头：{preview}',
-  'worker.submit_unconfirmed_zmx': '⚠️ 刚才那条消息没能确认写入 {cliName}（等待 {secs}s 后仍无提交证据）。不要直接重发；请在本机运行 botmux list 进入该 ZMX 会话检查输入框。\n开头：{preview}',
+  'worker.submit_unconfirmed': '⚠️ 消息提交状态未确认\n阶段：输入提交\n错误码：submit_unconfirmed\nBotMux 已写入消息并重试 Enter，但 {secs} 秒内未在{transcriptLabel}发现 {cliName} 的新会话记录。尚无请求到达模型的证据，因此当前没有模型侧错误可透传。\n请打开 Web 终端检查输入框；确认消息未执行后再重发。\n原消息：{preview}',
+  'worker.submit_unconfirmed_zmx': '⚠️ 消息提交状态未确认\n阶段：输入提交\n错误码：submit_unconfirmed\nBotMux 等待了 {secs} 秒，仍未发现 {cliName} 的提交证据。尚无请求到达模型的证据，因此当前没有模型侧错误可透传。\n不要直接重发；请在本机运行 botmux list，进入该 ZMX 会话检查输入框。\n原消息：{preview}',
   'worker.zmx_recovery_pending': 'ZMX 控制面暂时无法确认会话身份，自动清理没有执行。不要直接重发；请在本机运行 botmux list 进入会话，检查并按 Ctrl+C 清空输入框，然后用 /restart 重启会话后再试。',
   'worker.zmx_recovery_unconfirmed': 'ZMX 自动清理 Ctrl+C 的结果无法确认；为避免重复、拼接或截断输入，本会话已停止自动写入。不要直接重发；请在本机运行 botmux list 进入会话检查并手动清空输入框，然后用 /restart 重启会话后再试。',
   'worker.interrupt_unconfirmed': '⚠️ 中断键 {key} 连续两次未送达 {cliName}，CLI 可能仍在运行；卡片不会把这次操作标成已停止。{recovery}',
