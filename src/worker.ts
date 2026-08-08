@@ -5693,6 +5693,12 @@ function recentTerminalLogTail(): string | undefined {
  * 判据本身是 decidePostHookPromptEvidence()（input-gate.ts），这里只负责取数据
  * 和排定时器。
  *
+ * 挡住启动选择器假提示符的**不是**静默窗口 —— 选择器停在那儿等按键时屏幕是静
+ * 的（这正是它当初骗过 readyPattern 的原因）。真正的保障是 arm 的时机：只在
+ * 收到 SessionStart ready 信号之后才 arm，而该 hook 在选择器还没过去时不会
+ * 触发。窗口之外本兜底根本不运行。adopt / reattach 同理拿不到信号，不会 arm，
+ * 与 shouldArmReadyGate() 的 !adoptMode && !willReattachPersistent 天然一致。
+ *
  * 提示符必须从**渲染后的画面**读（renderer.rawSnapshot()），不能用
  * recentTerminalLogTail() —— 后者是 PTY 追加日志，stripAnsi 之后擦除语义全丢，
  * 一个早已被 TUI 抹掉的 ❯ 照样匹配得上，会把首条消息灌进还没就绪的界面。

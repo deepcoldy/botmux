@@ -20,6 +20,7 @@ import {
   shouldReleaseFirstPromptTimeout,
   shouldWaitForPostSessionStartPromptEvidence,
   shouldWriteNow,
+  POST_HOOK_EVIDENCE_FALLBACK_MS,
   POST_HOOK_EVIDENCE_MAX_WAIT_MS,
   POST_HOOK_EVIDENCE_QUIET_MS,
   POST_HOOK_EVIDENCE_RETRY_MS,
@@ -225,12 +226,28 @@ describe('decidePostHookPromptEvidence', () => {
   });
 
   it('waits out the remainder of the quiet window rather than accepting early', () => {
-    // THE POINT OF THE QUIET GATE: a startup selector keeps painting, so it
-    // never goes quiet. Accepting before the window closes would put the first
-    // message into a selector's look-alike prompt.
+    // The quiet window proves the CLI stopped emitting, not that a selector is
+    // gone — a selector waiting for a keypress is perfectly quiet. What keeps
+    // the selector out is the arming point (only after the SessionStart signal,
+    // which does not fire while the selector is up); this gate is about not
+    // trusting a screen that is still being painted.
     const decision = decidePostHookPromptEvidence({ ...waiting, quietMs: 500 });
     expect(decision.action).toBe('retry');
     expect(decision.retryInMs).toBe(POST_HOOK_EVIDENCE_QUIET_MS - 500 + 100);
+  });
+
+  it('first poll is not scheduled before the quiet window can possibly close', () => {
+    // The boundary resets the quiescence baseline, so quietMs cannot exceed the
+    // time since arming. Polling before the quiet threshold can only ever
+    // return retry — and polling later than it adds dead time to every new
+    // session. Keep the two aligned.
+    expect(POST_HOOK_EVIDENCE_FALLBACK_MS).toBe(POST_HOOK_EVIDENCE_QUIET_MS);
+    // At exactly the first poll, a session quiet since the boundary accepts.
+    expect(decidePostHookPromptEvidence({
+      ...waiting,
+      elapsedMs: POST_HOOK_EVIDENCE_FALLBACK_MS,
+      quietMs: POST_HOOK_EVIDENCE_FALLBACK_MS,
+    }).action).toBe('accept');
   });
 
   it('boundary: exactly the quiet threshold is enough, one ms short is not', () => {

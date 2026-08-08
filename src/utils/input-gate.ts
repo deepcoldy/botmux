@@ -61,8 +61,15 @@ export function shouldWaitForPostSessionStartPromptEvidence(state: {
     && !state.alreadyWaiting;
 }
 
-/** How long after the SessionStart boundary the fallback starts polling. */
-export const POST_HOOK_EVIDENCE_FALLBACK_MS = 3_000;
+/**
+ * How long after the SessionStart boundary the fallback starts polling.
+ *
+ * The boundary also resets the quiescence baseline (`lastPtyOutputAtMs`), so the
+ * quiet window can never be satisfied before `POST_HOOK_EVIDENCE_QUIET_MS` has
+ * passed — polling earlier than that only burns a wakeup. Polling LATER just
+ * adds dead time to every new session, so this tracks the quiet threshold.
+ */
+export const POST_HOOK_EVIDENCE_FALLBACK_MS = 2_000;
 /** PTY must be silent at least this long before the screen is trusted. */
 export const POST_HOOK_EVIDENCE_QUIET_MS = 2_000;
 /** Past this the fallback gives up and hands back to the first-prompt timeout. */
@@ -82,9 +89,14 @@ export const POST_HOOK_EVIDENCE_RETRY_MS = 500;
  * timeout before its first message is forced in.
  *
  * So the wait window gets a second, independent criterion: the screen has been
- * quiet long enough AND the prompt is visible on the CURRENT screen. Together
- * these still exclude a startup selector's look-alike prompt (a selector screen
- * does not go quiet), without depending on a redraw that may never happen.
+ * quiet long enough AND the prompt is visible on the CURRENT screen — no longer
+ * depending on a redraw that may never happen.
+ *
+ * What keeps a startup selector's look-alike ❯ out is NOT the quiet window — a
+ * selector sitting there waiting for a keypress is perfectly quiet. It is the
+ * arming point: the caller only arms this fallback once the SessionStart ready
+ * signal has arrived, and that hook does not fire while the selector is still
+ * up. Outside that window the fallback never runs at all.
  *
  * The caller must read the prompt from the rendered viewport
  * (`renderer.rawSnapshot()`), NOT from the appended PTY log: after ANSI erase

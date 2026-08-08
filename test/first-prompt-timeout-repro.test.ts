@@ -217,11 +217,20 @@ describe('First prompt timeout: worker 侧兜底接线', () => {
     expect(screenProbe).toContain('catch { return false; }');
   });
 
-  it('兜底只在 SessionStart 边界 arm', () => {
+  it('兜底只在 SessionStart 边界 arm —— 这是挡住启动选择器的唯一保障', () => {
+    // 选择器停在那儿等按键时屏幕是【静的】（这正是它当初骗过 readyPattern 的
+    // 原因），所以静默窗口挡不住它。真正挡住它的是 arm 时机：SessionStart hook
+    // 在选择器还没过去时不触发，兜底也就不会上场。这条断言一旦松掉（比如为了
+    // 修 re-attach 把 arm 提前到收信号之前），选择器就重新暴露在射程内。
     const armCallIdx = source.indexOf('armPostHookPromptEvidenceFallback();');
     const boundaryIdx = source.indexOf('SessionStart boundary recorded');
     expect(armCallIdx).toBeGreaterThan(boundaryIdx);
     expect(armCallIdx - boundaryIdx).toBeLessThan(200);   // 紧挨着边界日志
+
+    // 且这段必须落在 session_ready 消息分支内 —— 收到 ready 信号才 arm。
+    const caseIdx = source.lastIndexOf("case 'session_ready':", armCallIdx);
+    expect(caseIdx).toBeGreaterThan(-1);
+    expect(armCallIdx - caseIdx).toBeLessThan(1_500);
   });
 
   it('每个清除等待标记的位置都必须同时清定时器', () => {
