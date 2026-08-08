@@ -407,6 +407,7 @@ import {
   markVcTranscriptItemsFlushed,
 } from './vc-agent/meeting-state.js';
 import {
+  ensureLarkCliBotProfile,
   fetchMeetingEventsAsBot,
   joinMeetingAsBot,
   sendMeetingTextMessageAsBot,
@@ -1626,6 +1627,8 @@ type VcMeetingDaemonSession = {
    * replayed exactly. */
   consumerRestoreCatchUpRequired?: boolean;
   consumerRecoveryGapNotified?: boolean;
+  /** De-dupes the owner DM sent when a meeting invite fails to join. */
+  inviteFailureNotified?: boolean;
   consumerRecoveryGap?: VcMeetingDeliveryGap;
   consumerTranscriptRevisions: Record<string, number>;
   consumerLastInjectedAtMs?: number;
@@ -1859,6 +1862,18 @@ const VC_MEETING_ACTIVATION_CONTEXT_FIELD = 'vc_meeting_activation_context';
 const VC_MEETING_ACTIVATION_CONTEXT_MAX_CHARS = 2_000;
 const vcMeetingEndedTombstones = new BoundedMap<string, number>(2_000);
 const vcMeetingPendingInvites = new BoundedMap<string, VcMeetingPendingInvite>(2_000);
+/**
+ * De-dupes the owner DM for an eager-join failure that happens BEFORE a session
+ * exists (invite carries only a meeting_no, no meeting.id — so there is no
+ * session to hang `inviteFailureNotified` on). Keyed by `${larkAppId}:${no}`;
+ * bounded and best-effort. Cleared once the meeting is successfully joined so a
+ * later genuine failure can still notify. */
+const vcMeetingEagerJoinFailureNotified = new BoundedMap<string, number>(2_000);
+const VC_MEETING_EAGER_JOIN_FAILURE_TTL_MS = 30 * 60 * 1000;
+
+function vcMeetingEagerJoinFailureKey(larkAppId: string, meetingNo: string): string {
+  return `${larkAppId}:${meetingNo}`;
+}
 
 function vcMeetingSessionKey(larkAppId: string, meetingId: string): string {
   return `${larkAppId}:${meetingId}`;
@@ -2074,6 +2089,94 @@ function vcMeetingConfiguredBotConfigs(): BotConfig[] {
 
 function vcMeetingConfiguredBotConfig(larkAppId: string): BotConfig | undefined {
   return vcMeetingConfiguredBotConfigs().find(cfg => cfg.larkAppId === larkAppId);
+}
+
+export type VcMeetingJoinProfileResult =
+  | { ok: true; profile: string; created: boolean }
+  | { ok: false; reason: 'no_profile' | 'missing_secret' | 'add_failed'; profile?: string; error: string };
+
+/**
+ * Ensure the lark-cli bot profile used for `--as bot` meeting join actually
+ * exists, provisioning it from the bot's stored appSecret when absent.
+ *
+ * Historically `larkCliProfile` defaulted to the bot's own appId (see the
+ * dashboard managed-listener bootstrap) but nothing ever registered that
+ * profile with lark-cli, so the first real invite failed with "profile not
+ * found" and the bot was stuck ringing. This closes the gap in the trusted
+ * daemon process (the secret only reaches lark-cli's encrypted store, never a
+ * worker/sandbox and never argv). Idempotent: a present profile is a no-op.
+ */
+function ensureVcMeetingJoinProfile(
+  larkAppId: string,
+  cfg: VcMeetingAgentConfig,
+): VcMeetingJoinProfileResult {
+  const profile = cfg.larkCliProfile?.trim();
+  if (!profile) {
+    return { ok: false, reason: 'no_profile', error: '缺少 vcMeetingAgent.larkCliProfile' };
+  }
+  const botCfg = vcMeetingLocalBotConfig(larkAppId) ?? vcMeetingConfiguredBotConfig(larkAppId);
+  const result = ensureLarkCliBotProfile({
+    profileName: profile,
+    appId: larkAppId,
+    appSecret: botCfg?.larkAppSecret ?? '',
+    ...(botCfg?.brand ? { brand: botCfg.brand } : {}),
+  });
+  if (result.ok) {
+    if (result.created) {
+      logger.info(`[vc-agent] auto-provisioned lark-cli profile ${profile} for ${larkAppId} before join`);
+    }
+    return { ok: true, profile, created: result.created };
+  }
+  return { ok: false, reason: result.reason, profile, error: result.error };
+}
+
+/** Actionable, operator-facing text for a failed join-profile provision. */
+function vcMeetingJoinProfileErrorText(
+  larkAppId: string,
+  result: Extract<VcMeetingJoinProfileResult, { ok: false }>,
+): string {
+  switch (result.reason) {
+    case 'no_profile':
+      return '缺少 vcMeetingAgent.larkCliProfile，拒绝使用 lark-cli 默认 profile 入会';
+    case 'missing_secret':
+      return `无法为 ${larkAppId} 自动创建 lark-cli profile「${result.profile}」：配置里没有该 bot 的 appSecret（apiOnly bot 无法入会）`;
+    case 'add_failed':
+      return `自动创建 lark-cli profile「${result.profile}」失败：${result.error}`;
+  }
+}
+
+/**
+ * DM the meeting-agent owner when an invite fails, so a broken join no longer
+ * shows up only as a silently-ringing bot + one log line. Best-effort and
+ * de-duped per session so retries don't spam. `errorText` is already the
+ * actionable operator-facing message from startVcMeetingMonitoring.
+ */
+function notifyVcMeetingInviteFailure(
+  larkAppId: string,
+  cfg: VcMeetingAgentConfig,
+  session: VcMeetingDaemonSession | undefined,
+  meeting: VcMeetingPushContext['meeting'],
+  errorText: string,
+): void {
+  if (session) {
+    if (session.inviteFailureNotified) return;
+    session.inviteFailureNotified = true;
+  }
+  const target = vcMeetingTargetOpenId(larkAppId, cfg);
+  if (!target) return;
+  const title = vcMeetingTitle(meeting);
+  void sendUserMessage(
+    larkAppId,
+    target,
+    `⚠️ 机器人未能加入会议「${title}」。\n\n原因：${errorText}\n\n`
+    + '请到 dashboard 检查该会议 bot 的 lark-cli profile / appSecret / VC 权限后重新邀请。',
+    'text',
+  ).catch((err) => {
+    logger.warn(
+      `[vc-agent] invite failure notice failed meeting=${meeting.id || '?'}: `
+      + `${err instanceof Error ? err.message : String(err)}`,
+    );
+  });
 }
 
 function vcMeetingConsumerBotOnline(larkAppId: string): boolean {
@@ -2301,6 +2404,12 @@ async function ensureVcMeetingReceiverSession(
       `receiver agent ${selfAppId} has no managed side-effect isolation: ${isolation.decision.error}`,
     );
   }
+  // Plan B: the receiver runs sandboxed only when the bot actually opted in and
+  // the boundary is deliverable. An unsandboxed opt-out (isolated:false) must
+  // spawn WITHOUT the sandbox — hardcoding sandbox=true here would confine a bot
+  // whose environment/working dir was never set up for bwrap, and the CLI would
+  // fail to spawn or be unable to work (the "joined but never replies" bug).
+  const receiverSandboxed = isolation.decision.isolated;
   const rawWorkingDir = findOncallChat(selfAppId, chatId)?.workingDir
     ?? effectiveDefaultWorkingDir(bot.config)
     ?? bot.config.workingDir
@@ -2328,11 +2437,12 @@ async function ensureVcMeetingReceiverSession(
   session.cliId = bot.config.cliId;
   // Freeze the security-critical launch decision at receiver creation.  A
   // later live Bot-config edit must neither weaken this session nor make an
-  // old unisolated receiver appear eligible retroactively.
-  session.sandbox = true;
-  session.sandboxHidePaths = bot.config.sandboxHidePaths ?? [];
-  session.sandboxReadonlyPaths = bot.config.sandboxReadonlyPaths ?? [];
-  session.sandboxNetwork = bot.config.sandboxNetwork !== false;
+  // old unisolated receiver appear eligible retroactively. Under plan B the
+  // frozen value follows the bot's opt-in, not a hardcoded true.
+  session.sandbox = receiverSandboxed;
+  session.sandboxHidePaths = receiverSandboxed ? (bot.config.sandboxHidePaths ?? []) : [];
+  session.sandboxReadonlyPaths = receiverSandboxed ? (bot.config.sandboxReadonlyPaths ?? []) : [];
+  session.sandboxNetwork = receiverSandboxed ? (bot.config.sandboxNetwork !== false) : true;
   session.backendType = isolation.backendType;
   sessionStore.updateSession(session);
 
@@ -13535,13 +13645,14 @@ async function startVcMeetingMonitoring(input: {
       }
 
       if (input.forceJoin || !session.joined || session.listenerPresenceStale) {
-        if (!input.cfg.larkCliProfile) {
-          throw new Error('缺少 vcMeetingAgent.larkCliProfile，拒绝使用 lark-cli 默认 profile 入会');
+        const provisioned = ensureVcMeetingJoinProfile(input.larkAppId, input.cfg);
+        if (!provisioned.ok) {
+          throw new Error(vcMeetingJoinProfileErrorText(input.larkAppId, provisioned));
         }
         if (!meeting.meetingNo) {
           throw new Error('会议事件没有 meeting_no，无法执行 BotJoinMeeting');
         }
-        const joined = joinMeetingAsBot({ meetingNumber: meeting.meetingNo, profile: input.cfg.larkCliProfile });
+        const joined = joinMeetingAsBot({ meetingNumber: meeting.meetingNo, profile: provisioned.profile });
         if (joined.meetingId && joined.meetingId !== meeting.id) {
           if (input.forceJoin || session.listenerPresenceStale) {
             throw new Error(
@@ -15048,14 +15159,40 @@ async function handleVcMeetingPush(ctx: VcMeetingPushContext): Promise<void> {
   if (ctx.kind === 'meeting_invited') {
     let meeting = ctx.meeting;
     let joinedByInvite = false;
-    if (!meeting.id && meeting.meetingNo && cfg.larkCliProfile) {
+    // Eager join: an invite that carries only a meeting_no (no meeting.id) must
+    // be joined here to learn the id. A failure in THIS block used to only WARN
+    // and then fall through to the silent "no meeting id yet" return below — so
+    // the original "profile not found → bot rings forever" bug produced no user
+    // signal at all (there is no session yet for the manual-invite DM path). We
+    // now DM the owner here too, deduped per meeting_no so redelivered invites
+    // don't spam.
+    if (!meeting.id && meeting.meetingNo) {
+      const eagerNo = meeting.meetingNo;
+      const notifyEagerFailure = (errorText: string): void => {
+        const dmKey = vcMeetingEagerJoinFailureKey(ctx.larkAppId, eagerNo);
+        const last = vcMeetingEagerJoinFailureNotified.get(dmKey);
+        const now = Date.now();
+        if (last !== undefined && now - last <= VC_MEETING_EAGER_JOIN_FAILURE_TTL_MS) return;
+        vcMeetingEagerJoinFailureNotified.set(dmKey, now);
+        // session is undefined here → notify skips per-session dedup and sends.
+        notifyVcMeetingInviteFailure(ctx.larkAppId, cfg, undefined, meeting, errorText);
+      };
       try {
-        const joined = joinMeetingAsBot({ meetingNumber: meeting.meetingNo, profile: cfg.larkCliProfile });
+        // A missing larkCliProfile previously skipped this whole block (the old
+        // `&& cfg.larkCliProfile` guard) and died silently; surface it instead.
+        const provisioned = ensureVcMeetingJoinProfile(ctx.larkAppId, cfg);
+        if (!provisioned.ok) throw new Error(vcMeetingJoinProfileErrorText(ctx.larkAppId, provisioned));
+        const joined = joinMeetingAsBot({ meetingNumber: eagerNo, profile: provisioned.profile });
         meeting = { ...meeting, id: joined.meetingId };
         joinedByInvite = true;
-        logger.info(`[vc-agent] manual invite joined before session create meeting=${meeting.id} meetingNo=${meeting.meetingNo} profile=${cfg.larkCliProfile}`);
+        // Success → clear any prior failure tombstone so a later real failure
+        // (e.g. rotated secret on a subsequent meeting) can notify again.
+        vcMeetingEagerJoinFailureNotified.delete(vcMeetingEagerJoinFailureKey(ctx.larkAppId, eagerNo));
+        logger.info(`[vc-agent] manual invite joined before session create meeting=${meeting.id} meetingNo=${eagerNo} profile=${provisioned.profile}`);
       } catch (err) {
-        logger.warn(`[vc-agent] manual invite join failed meetingNo=${meeting.meetingNo}: ${err instanceof Error ? err.message : String(err)}`);
+        const message = err instanceof Error ? err.message : String(err);
+        logger.warn(`[vc-agent] manual invite join failed meetingNo=${eagerNo}: ${message}`);
+        notifyEagerFailure(message);
       }
     }
     if (!meeting.id) {
@@ -15079,6 +15216,7 @@ async function handleVcMeetingPush(ctx: VcMeetingPushContext): Promise<void> {
     });
     if (!result.ok) {
       logger.warn(`[vc-agent] manual invite start failed meeting=${meeting.id}: ${result.error}`);
+      notifyVcMeetingInviteFailure(ctx.larkAppId, cfg, session, meeting, result.error);
     } else {
       deleteVcMeetingPendingInvite(key);
       if (result.key !== key) deleteVcMeetingPendingInvite(result.key);
@@ -15422,6 +15560,7 @@ export const __vcMeetingAgentTest = {
     vcMeetingConsumerCloseTimingOverrideForTest = undefined;
     vcMeetingEndedTombstones.clear();
     for (const key of [...vcMeetingPendingInvites.keys()]) deleteVcMeetingPendingInvite(key);
+    vcMeetingEagerJoinFailureNotified.clear();
   },
 };
 

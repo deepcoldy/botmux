@@ -787,7 +787,7 @@ function vcMeetingConsumerProfilesApiDeps(): VcMeetingConsumerProfilesApiDeps {
         return false;
       }
     },
-    managedSideEffectIsolation: bot => evaluateVcMeetingConsumerIsolation({
+    managedSideEffectEligible: bot => evaluateVcMeetingConsumerIsolation({
       sandbox: bot.sandbox,
       platform: process.platform,
       backendType: resolvePairedSpawnBackendType(
@@ -797,6 +797,19 @@ function vcMeetingConsumerProfilesApiDeps(): VcMeetingConsumerProfilesApiDeps {
         config.daemon.backendType,
       ),
     }).ok,
+    sandboxIsolated: bot => {
+      const decision = evaluateVcMeetingConsumerIsolation({
+        sandbox: bot.sandbox,
+        platform: process.platform,
+        backendType: resolvePairedSpawnBackendType(
+          bot.cliId ?? config.daemon.cliId,
+          undefined,
+          bot.backendType,
+          config.daemon.backendType,
+        ),
+      });
+      return decision.ok && decision.isolated;
+    },
     reloadDaemons: reloadVcMeetingBotConfigOnDaemons,
   };
 }
