@@ -238,30 +238,37 @@ const CODEX_FAILURE_SUMMARY_PRESCAN_MAX_CHARS = 2_000;
 /** Credential key names redacted from user-facing failure summaries. */
 const CODEX_SECRET_KEY_ALTERNATION =
   'api[_-]?key|access[_-]?token|token|auth(?:orization)?|secret|password|signature|credential|cookie';
-/** Quoted-JSON credential with a double-quoted value: `"api_key":"..."`. The
- *  value uses mutually-exclusive branches — `\\.` consumes an escaped pair,
- *  `[^\\"]` consumes any other non-quote — so a missing close quote can NOT
- *  trigger exponential backtracking (the branches never overlap). */
+// Escape-safe quoted-value bodies. The two branches are mutually exclusive —
+// `\\.` consumes an escaped pair, `[^\\<q>]` consumes any other non-quote char —
+// so they never overlap and a missing close quote can NOT trigger exponential
+// backtracking. Spanning `\\.` also means an embedded `\"` (or `\'`) does not
+// prematurely end the value, so the WHOLE secret is covered, not just its head.
+const CODEX_DQ_VALUE_BODY = '"(?:\\\\.|[^\\\\"])*"';
+const CODEX_SQ_VALUE_BODY = "'(?:\\\\.|[^\\\\'])*'";
+/** Quoted-JSON credential, double-quoted value: `"api_key":"..."`. */
 const CODEX_QUOTED_SECRET_DQ = new RegExp(
-  `(("(?:${CODEX_SECRET_KEY_ALTERNATION})")\\s*:\\s*)"(?:\\\\.|[^\\\\"])*"`, 'gi');
+  `(("(?:${CODEX_SECRET_KEY_ALTERNATION})")\\s*:\\s*)${CODEX_DQ_VALUE_BODY}`, 'gi');
 /** Same, single-quoted value: `'secret':'...'`. */
 const CODEX_QUOTED_SECRET_SQ = new RegExp(
-  `(('(?:${CODEX_SECRET_KEY_ALTERNATION})')\\s*:\\s*)'(?:\\\\.|[^\\\\'])*'`, 'gi');
-/** Bare `key = value` (value quoted or a bare word). `\b` keeps `notpassword=`
- *  from matching `password`. */
+  `(('(?:${CODEX_SECRET_KEY_ALTERNATION})')\\s*:\\s*)${CODEX_SQ_VALUE_BODY}`, 'gi');
+/** Bare `key = value` — value is a quoted string (escape-safe, same as above so
+ *  an embedded `\"` does not leak the tail) or a bare word. `\b` keeps
+ *  `notpassword=` from matching `password`. */
 const CODEX_BARE_SECRET = new RegExp(
-  `(\\b(?:${CODEX_SECRET_KEY_ALTERNATION})\\s*[:=]\\s*)(?:"[^"]*"|'[^']*'|[^\\s,;}]+)`, 'gi');
-/** An UNCLOSED quoted/bare credential value running to end-of-input — created
- *  when a real secret is cut mid-value by the pre-scan bound (or arrives
- *  truncated). Its prefix would otherwise slip past the closed-value redactors
- *  into the shown summary, so we fail closed instead. Same exclusive-branch
- *  value shape, so these probes are themselves backtracking-safe. */
+  `(\\b(?:${CODEX_SECRET_KEY_ALTERNATION})\\s*[:=]\\s*)(?:${CODEX_DQ_VALUE_BODY}|${CODEX_SQ_VALUE_BODY}|[^\\s,;}]+)`, 'gi');
+/** An UNCLOSED quoted credential value running to end-of-input — created when a
+ *  real secret is cut mid-value by the pre-scan bound (or arrives truncated).
+ *  Its prefix would otherwise slip past the closed-value redactors into the
+ *  shown summary, so we fail closed instead. The trailing `\\?` absorbs a lone
+ *  dangling backslash left when the pre-scan cut lands mid-escape — without it
+ *  the exclusive value body rejects that final char and the whole probe misses,
+ *  re-opening the leak. Same exclusive branches, so the probes stay linear. */
 const CODEX_UNCLOSED_SECRET_DQ = new RegExp(
-  `"(?:${CODEX_SECRET_KEY_ALTERNATION})"\\s*:\\s*"(?:\\\\.|[^\\\\"])*$`, 'i');
+  `"(?:${CODEX_SECRET_KEY_ALTERNATION})"\\s*:\\s*"(?:\\\\.|[^\\\\"])*\\\\?$`, 'i');
 const CODEX_UNCLOSED_SECRET_SQ = new RegExp(
-  `'(?:${CODEX_SECRET_KEY_ALTERNATION})'\\s*:\\s*'(?:\\\\.|[^\\\\'])*$`, 'i');
+  `'(?:${CODEX_SECRET_KEY_ALTERNATION})'\\s*:\\s*'(?:\\\\.|[^\\\\'])*\\\\?$`, 'i');
 const CODEX_UNCLOSED_SECRET_BARE = new RegExp(
-  `\\b(?:${CODEX_SECRET_KEY_ALTERNATION})\\s*[:=]\\s*(?:"[^"]*|'[^']*)$`, 'i');
+  `\\b(?:${CODEX_SECRET_KEY_ALTERNATION})\\s*[:=]\\s*(?:"(?:\\\\.|[^\\\\"])*|'(?:\\\\.|[^\\\\'])*)\\\\?$`, 'i');
 
 function parseEmbeddedJson(value: unknown): unknown {
   if (typeof value !== 'string') return undefined;

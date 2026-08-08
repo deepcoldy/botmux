@@ -573,6 +573,37 @@ describe('drainCodexRollout', () => {
     expect(failed2.terminalErrorSummary).toContain('[REDACTED]');
   });
 
+  it('fails closed when the pre-scan cut lands on a lone dangling backslash', () => {
+    // If the 2000-char pre-scan slices mid-escape, the value tail ends in a
+    // single `\`. The unclosed-value probe must still fire (its trailing `\\?`
+    // absorbs that lone backslash) or the secret prefix leaks into the summary.
+    const prefix = 'x'.repeat(300) + '{"password":"';
+    const message = prefix + 'S'.repeat(2000 - prefix.length - 1) + '\\REST_OF_SECRET"}';
+    writeFileSync(path, ev({
+      timestamp: '2026-08-08T02:50:18.520Z',
+      type: 'event_msg',
+      payload: { type: 'task_complete', turn_id: 'odd-backslash-cut', error: { message } },
+    }));
+    const failed = drainCodexRollout(path, 0).events[0];
+    expect(failed.terminalErrorSummary ?? '').not.toContain('SSSSS');
+    expect(failed.terminalErrorSummary).toBeUndefined();
+  });
+
+  it('redacts a bare-key quoted value containing an escaped quote', () => {
+    // `password:"abc\"TAIL"` (bare key, double-quoted value with an inner
+    // escaped quote). The bare rule's quoted-value branch must be escape-safe
+    // like the JSON-key rule, or it stops at the `\"` and leaks the tail.
+    writeFileSync(path, ev({
+      timestamp: '2026-08-08T02:50:18.520Z',
+      type: 'event_msg',
+      payload: { type: 'task_complete', turn_id: 'bare-escaped-quote', error: { message: 'provider {password:"abc\\"TAIL_SECRET_123"} rejected' } },
+    }));
+    const failed = drainCodexRollout(path, 0).events[0];
+    expect(failed.terminalErrorSummary).toBeDefined();
+    expect(failed.terminalErrorSummary).not.toContain('TAIL_SECRET_123');
+    expect(failed.terminalErrorSummary).toContain('[REDACTED]');
+  });
+
   it('classifies structured 429 failures for the dedicated limited state', () => {
     writeFileSync(path, ev({
       timestamp: '2026-08-08T02:50:18.520Z',
