@@ -151,7 +151,22 @@ import {
   removeInstalledSkills,
   updateInstalledSkillAsync,
 } from './services/skill-registry-store.js';
+import { readSkillPackRegistry } from './services/skill-pack-store.js';
+import {
+  cloneSkillPack,
+  createSkillPack,
+  deleteSkillPack,
+  getSkillPack,
+  listSkillPacks,
+  updateSkillPack,
+  SkillPackStoreError,
+} from './services/skill-pack-store.js';
 import { redactGitUrlCredentials } from './core/skills/sources.js';
+import {
+  enrichPackForDashboard,
+  enrichPacksForDashboard,
+  sanitizeSkillForDashboard,
+} from './dashboard/skill-pack-response.js';
 import { effectiveDefaultWorkingDir, getBot, loadBotConfigs, parseBotConfigsFromText, type BotConfig, type VcMeetingAgentConfig } from './bot-registry.js';
 import { findEntryIndex, readRawConfig, requireConfigPath, writeRawConfigAtomic } from './services/config-store.js';
 import {
@@ -165,9 +180,9 @@ import {
   runCodexSideConversationMonitor,
   runCodexNotifierWorkerSupervisor,
 } from './features/codex-notifier/index.js';
-import type { BotSkillPolicy, SkillPackage } from './core/skills/types.js';
+import type { BotSkillPolicy, SkillPack, SkillPackage, SkillSelector } from './core/skills/types.js';
 import { discoverNativeCliSkillGroups } from './core/skills/discovery.js';
-import { analyzeSkillReferences, type SkillReferenceBot, type SkillReferenceSummary } from './core/skills/references.js';
+import { analyzeSkillReferences, packsContainingSkill, type SkillReferenceBot, type SkillReferenceSummary } from './core/skills/references.js';
 import { discoverDashboardSkills, installDashboardSkill, parseDashboardSkillInstallRequest, parseInstallLocalLinksSources, MAX_LOCAL_LINK_SOURCES } from './dashboard/skill-install-request.js';
 import { botDefaultsPayload, botSummaryPayload, brandMapByAppId } from './dashboard/bot-payload.js';
 import {
@@ -2504,16 +2519,12 @@ function startSkillJob(type: SkillJob['type'], run: () => Promise<SkillPackage |
   return job;
 }
 
-function sanitizeSkillForDashboard(skill: SkillPackage): SkillPackage {
-  if (skill.source.type !== 'git') return skill;
-  return {
-    ...skill,
-    source: { ...skill.source, url: redactGitUrlCredentials(skill.source.url) },
-  };
-}
-
 function dashboardSkillCliIds(): CliId[] {
   const ids = new Set<CliId>();
+  // Always scan all known CLI skill dirs, not just configured bots — users may
+  // want to discover codex/trae/... skills even before creating a bot for them.
+  const allCliIds: CliId[] = ['claude-code', 'seed', 'relay', 'aiden', 'coco', 'codex', 'codex-app', 'cursor', 'gemini', 'genius', 'opencode', 'antigravity', 'mtr', 'hermes', 'mira', 'mir', 'traex', 'pi', 'copilot', 'oh-my-pi', 'kimi', 'grok', 'kiro-cli', 'riff'];
+  for (const cliId of allCliIds) ids.add(cliId);
   try {
     for (const cliId of configuredCliIds().values()) ids.add(cliId as CliId);
   } catch {
@@ -2542,6 +2553,73 @@ function dashboardSkillsPayload(): Record<string, unknown> {
   };
 }
 
+// --- Skill pack dashboard helpers ------------------------------------------
+
+function loadBotConfigsSafe(): BotConfig[] {
+  try { return loadBotConfigs(); } catch { return []; }
+}
+
+function botsReferencingPack(packId: string, bots: BotConfig[]): Array<{ larkAppId: string; botName: string }> {
+  const selector = `pack:${packId}`;
+  return bots
+    .filter((bot) => Array.isArray(bot.skills?.include) && bot.skills!.include!.includes(selector as SkillSelector))
+    .map((bot) => ({ larkAppId: bot.larkAppId, botName: bot.name ?? bot.larkAppId }))
+    .sort((a, b) => a.botName.localeCompare(b.botName));
+}
+
+function parsePackInput(body: unknown): { id: string; name: string; description?: string; tags?: string[]; include: Array<`skill:${string}`> } {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) throw new SkillPackStoreError({ code: 'SKILL_PACK_INVALID', reason: 'body must be an object' });
+  const b = body as Record<string, unknown>;
+  return {
+    id: typeof b.id === 'string' ? b.id : '',
+    name: typeof b.name === 'string' ? b.name : '',
+    description: typeof b.description === 'string' ? b.description : undefined,
+    tags: Array.isArray(b.tags) ? b.tags as string[] : undefined,
+    include: Array.isArray(b.include) ? b.include as Array<`skill:${string}`> : [],
+  };
+}
+
+function parsePackUpdate(body: unknown): { name?: string; description?: string | null; tags?: string[] | null; include?: Array<`skill:${string}`>; expectedRevision?: number } {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) throw new SkillPackStoreError({ code: 'SKILL_PACK_INVALID', reason: 'body must be an object' });
+  const b = body as Record<string, unknown>;
+  return {
+    name: typeof b.name === 'string' ? b.name : undefined,
+    description: b.description === null ? null : typeof b.description === 'string' ? b.description : undefined,
+    tags: b.tags === null ? null : Array.isArray(b.tags) ? b.tags as string[] : undefined,
+    include: Array.isArray(b.include) ? b.include as Array<`skill:${string}`> : undefined,
+    expectedRevision: typeof b.expectedRevision === 'number' ? b.expectedRevision : undefined,
+  };
+}
+
+function packErrorStatus(err: unknown): number {
+  if (err instanceof SkillPackStoreError) {
+    switch (err.detail.code) {
+      case 'SKILL_PACK_NOT_FOUND': return 404;
+      case 'SKILL_PACK_ID_CONFLICT': return 409;
+      case 'SKILL_PACK_REVISION_CONFLICT': return 409;
+      case 'SKILL_PACK_IN_USE': return 409;
+      default: return 400;
+    }
+  }
+  return 400;
+}
+
+function packErrorBody(err: unknown): { ok: false; error: string; [key: string]: unknown } {
+  if (err instanceof SkillPackStoreError) {
+    const d = err.detail;
+    const body: { ok: false; error: string; [key: string]: unknown } = { ok: false, error: d.code };
+    if (d.code === 'SKILL_PACK_REVISION_CONFLICT') body.current = d.current;
+    if (d.code === 'SKILL_PACK_INVALID') body.reason = d.reason;
+    if (d.code === 'SKILL_PACK_INVALID_SELECTOR') body.selector = d.selector;
+    return body;
+  }
+  return {
+    ok: false,
+    error: 'internal_error',
+    detail: redactGitUrlCredentials(err instanceof Error ? err.message : String(err)),
+  };
+}
+
 function mergeSkillReferenceBot(refs: Map<string, SkillReferenceBot>, ref: SkillReferenceBot): void {
   const current = refs.get(ref.larkAppId);
   if (!current) {
@@ -2554,11 +2632,17 @@ function mergeSkillReferenceBot(refs: Map<string, SkillReferenceBot>, ref: Skill
 async function dashboardSkillReferencesMany(skillNames: readonly string[]): Promise<Map<string, SkillReferenceSummary>> {
   const uniqueNames = [...new Set(skillNames)];
   const refsBySkill = new Map(uniqueNames.map(name => [name, new Map<string, SkillReferenceBot>()]));
+  let packs: Record<string, SkillPack> | undefined;
+  try {
+    packs = readSkillPackRegistry().packs;
+  } catch {
+    // packs.json may be absent; fall back to direct-only analysis.
+  }
   try {
     const configuredBots = loadBotConfigs();
     for (const name of uniqueNames) {
       const refs = refsBySkill.get(name)!;
-      for (const ref of analyzeSkillReferences(name, { bots: configuredBots }).bots) mergeSkillReferenceBot(refs, ref);
+      for (const ref of analyzeSkillReferences(name, { bots: configuredBots, packs }).bots) mergeSkillReferenceBot(refs, ref);
     }
   } catch {
     // Fall back to online daemon data below when the dashboard process cannot
@@ -2581,15 +2665,16 @@ async function dashboardSkillReferencesMany(skillNames: readonly string[]): Prom
   const availableOnlineConfigs = onlineConfigs.filter(config => config !== null);
   for (const name of uniqueNames) {
     const refs = refsBySkill.get(name)!;
-    for (const ref of analyzeSkillReferences(name, { bots: availableOnlineConfigs }).bots) mergeSkillReferenceBot(refs, ref);
+    for (const ref of analyzeSkillReferences(name, { bots: availableOnlineConfigs, packs }).bots) mergeSkillReferenceBot(refs, ref);
   }
   return new Map([...refsBySkill].map(([name, refs]) => [name, {
     bots: [...refs.values()].sort((a, b) => a.botName.localeCompare(b.botName)),
+    packs: packsContainingSkill(name, packs),
   }]));
 }
 
 async function dashboardSkillReferences(skillName: string): Promise<SkillReferenceSummary> {
-  return (await dashboardSkillReferencesMany([skillName])).get(skillName) ?? { bots: [] };
+  return (await dashboardSkillReferencesMany([skillName])).get(skillName) ?? { bots: [], packs: [] };
 }
 
 /** Extract the sessionId from a terminal path `/s/<sessionId>[/...]`. Returns
@@ -3458,10 +3543,14 @@ const server = createServer(async (req, res) => {
       if (missing.length > 0) return jsonRes(res, 400, { ok: false, error: 'skill_not_installed', missing });
 
       const referencesBySkill = await dashboardSkillReferencesMany(names);
-      const references = names.map(name => ({ name, refs: referencesBySkill.get(name) ?? { bots: [] } }));
+      const references = names.map(name => ({ name, refs: referencesBySkill.get(name) ?? { bots: [], packs: [] } }));
       const affectedSkills = references
-        .filter(item => item.refs.bots.length > 0)
-        .map(item => ({ name: item.name, affectedBots: item.refs.bots }));
+        .filter(item => item.refs.bots.length > 0 || item.refs.packs.length > 0)
+        .map(item => ({
+          name: item.name,
+          affectedBots: item.refs.bots,
+          affectedPacks: item.refs.packs,
+        }));
       if (body.force !== true && affectedSkills.length > 0) {
         return jsonRes(res, 409, {
           ok: false,
@@ -3585,11 +3674,12 @@ const server = createServer(async (req, res) => {
       const force = url.searchParams.get('force') === '1';
       if (!readSkillRegistry().skills[name]) return jsonRes(res, 400, { ok: false, error: 'skill_not_installed' });
       const refs = await dashboardSkillReferences(name);
-      if (!force && refs.bots.length > 0) {
+      if (!force && (refs.bots.length > 0 || refs.packs.length > 0)) {
         return jsonRes(res, 409, {
           ok: false,
           error: 'skill_in_use',
           affectedBots: refs.bots,
+          affectedPacks: refs.packs,
         });
       }
       const r = removeInstalledSkill(name);
@@ -3597,8 +3687,91 @@ const server = createServer(async (req, res) => {
       return jsonRes(res, 200, {
         ok: true,
         affectedBots: refs.bots,
+        affectedPacks: refs.packs,
         ...dashboardSkillsPayload(),
       });
+    }
+
+    // --- Skill pack CRUD ---------------------------------------------------
+
+    if (req.method === 'GET' && url.pathname === '/api/skill-packs') {
+      const registrySkills = readSkillRegistry().skills;
+      const bots = loadBotConfigsSafe();
+      const packs = enrichPacksForDashboard(
+        listSkillPacks(),
+        registrySkills,
+        (packId) => botsReferencingPack(packId, bots),
+      );
+      return jsonRes(res, 200, { ok: true, packs });
+    }
+
+    if (req.method === 'POST' && url.pathname === '/api/skill-packs') {
+      let body: unknown;
+      try { body = await readJsonBody(req); } catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+      try {
+        const input = parsePackInput(body);
+        const pack = createSkillPack(input);
+        return jsonRes(res, 201, { ok: true, pack });
+      } catch (err) {
+        return jsonRes(res, packErrorStatus(err), packErrorBody(err));
+      }
+    }
+
+    let mPack: RegExpMatchArray | null;
+    if (req.method === 'GET' && (mPack = url.pathname.match(/^\/api\/skill-packs\/([^/]+)$/))) {
+      const id = decodeURIComponent(mPack[1]);
+      const pack = getSkillPack(id);
+      if (!pack) return jsonRes(res, 404, { ok: false, error: 'SKILL_PACK_NOT_FOUND' });
+      const registrySkills = readSkillRegistry().skills;
+      const bots = loadBotConfigsSafe();
+      return jsonRes(res, 200, {
+        ok: true,
+        pack: enrichPackForDashboard(pack, registrySkills, botsReferencingPack(pack.id, bots)),
+      });
+    }
+
+    if (req.method === 'PUT' && (mPack = url.pathname.match(/^\/api\/skill-packs\/([^/]+)$/))) {
+      const id = decodeURIComponent(mPack[1]);
+      let body: unknown;
+      try { body = await readJsonBody(req); } catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+      try {
+        const input = parsePackUpdate(body);
+        const pack = updateSkillPack(id, input);
+        return jsonRes(res, 200, { ok: true, pack });
+      } catch (err) {
+        return jsonRes(res, packErrorStatus(err), packErrorBody(err));
+      }
+    }
+
+    if (req.method === 'DELETE' && (mPack = url.pathname.match(/^\/api\/skill-packs\/([^/]+)$/))) {
+      const id = decodeURIComponent(mPack[1]);
+      const force = url.searchParams.get('force') === '1';
+      const pack = getSkillPack(id);
+      if (!pack) return jsonRes(res, 404, { ok: false, error: 'SKILL_PACK_NOT_FOUND' });
+      const refs = botsReferencingPack(id, loadBotConfigsSafe());
+      if (!force && refs.length > 0) {
+        return jsonRes(res, 409, { ok: false, error: 'SKILL_PACK_IN_USE', references: refs });
+      }
+      try {
+        deleteSkillPack(id);
+        return jsonRes(res, 200, { ok: true, references: refs });
+      } catch (err) {
+        return jsonRes(res, packErrorStatus(err), packErrorBody(err));
+      }
+    }
+
+    if (req.method === 'POST' && (mPack = url.pathname.match(/^\/api\/skill-packs\/([^/]+)\/clone$/))) {
+      const id = decodeURIComponent(mPack[1]);
+      let body: unknown;
+      try { body = await readJsonBody(req); } catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+      const newId = typeof (body as any)?.id === 'string' ? (body as any).id.trim() : '';
+      if (!newId) return jsonRes(res, 400, { ok: false, error: 'id_required' });
+      try {
+        const pack = cloneSkillPack(id, newId);
+        return jsonRes(res, 201, { ok: true, pack });
+      } catch (err) {
+        return jsonRes(res, packErrorStatus(err), packErrorBody(err));
+      }
     }
 
     if (req.method === 'GET' && url.pathname === '/api/whiteboards') {

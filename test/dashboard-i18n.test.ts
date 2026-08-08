@@ -1,8 +1,35 @@
+import { readdirSync, readFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 
 import { createDashboardTranslator } from '../src/dashboard/web/i18n.js';
 
 describe('dashboard i18n helpers', () => {
+  it('defines every literal tr() key used by the Dashboard UI', () => {
+    const root = fileURLToPath(new URL('../src/dashboard/web/', import.meta.url));
+    const keys = new Set<string>();
+    const visit = (dir: string): void => {
+      for (const entry of readdirSync(dir, { withFileTypes: true })) {
+        const path = join(dir, entry.name);
+        if (entry.isDirectory()) {
+          visit(path);
+        } else if (/\.[cm]?[jt]sx?$/.test(entry.name)) {
+          const source = readFileSync(path, 'utf8');
+          for (const match of source.matchAll(/\btr\(\s*['"]([^'"]+)['"]/g)) keys.add(match[1]);
+        }
+      }
+    };
+    visit(root);
+
+    const zh = createDashboardTranslator('zh');
+    const en = createDashboardTranslator('en');
+    for (const key of [...keys].sort()) {
+      expect(zh(key), `missing zh translation: ${key}`).not.toBe(key);
+      expect(en(key), `missing en translation: ${key}`).not.toBe(key);
+    }
+  });
+
   it('renders English v3 workflow labels with interpolation', () => {
     const t = createDashboardTranslator('en');
     expect(t('nav.workflows')).toBe('Workflows');

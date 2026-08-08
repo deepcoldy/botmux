@@ -9,6 +9,10 @@ export function skillRegistryPath(): string {
   return join(botmuxSkillsHome(), 'registry.json');
 }
 
+export function skillPackRegistryPath(): string {
+  return join(botmuxSkillsHome(), 'packs.json');
+}
+
 export function skillStoreDir(): string {
   return join(botmuxSkillsHome(), 'store');
 }
