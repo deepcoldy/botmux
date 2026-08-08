@@ -517,6 +517,62 @@ describe('drainCodexRollout', () => {
     expect(elapsedMs).toBeLessThan(200);
   });
 
+  it('does not backtrack on an unclosed quoted value full of backslashes', () => {
+    // The quoted-value redactor must use mutually-exclusive branches so a
+    // missing close quote after a run of backslashes cannot blow up. Under the
+    // old `(?:\\.|(?!close).)*` shape this took hundreds of ms at ~56 chars.
+    const evil = `gateway {"password":"${'\\'.repeat(4_000)}X`;
+    const t0 = Date.now();
+    writeFileSync(path, ev({
+      timestamp: '2026-08-08T02:50:18.520Z',
+      type: 'event_msg',
+      payload: { type: 'task_complete', turn_id: 'backslash-redos', error: { message: evil } },
+    }));
+    const failed = drainCodexRollout(path, 0).events[0];
+    const elapsedMs = Date.now() - t0;
+    expect(failed.terminalStatus).toBe('failed');
+    expect(elapsedMs).toBeLessThan(200);
+  });
+
+  it('fails closed when the pre-scan cut leaves a credential value unclosed', () => {
+    // A real secret sitting past the pre-scan bound gets sliced mid-value,
+    // leaving `password":"SSS…` with no closing quote. The closed-value
+    // redactor would miss it and leak the prefix into the shown summary, so an
+    // unclosed credential value must fail closed instead.
+    const message = 'x'.repeat(300) + `{"password":"${'S'.repeat(1800)}"}`;
+    writeFileSync(path, ev({
+      timestamp: '2026-08-08T02:50:18.520Z',
+      type: 'event_msg',
+      payload: { type: 'task_complete', turn_id: 'prescan-cut', error: { message } },
+    }));
+    const failed = drainCodexRollout(path, 0).events[0];
+    expect(failed.terminalStatus).toBe('failed');
+    expect(failed.terminalErrorSummary ?? '').not.toContain('SSSSS');
+    expect(failed.terminalErrorSummary).toBeUndefined();
+  });
+
+  it('keeps a word-boundary so lookalike keys like notpassword are not redacted', () => {
+    // `notpassword=VALUE` is not a `password` credential — the bare-key rule
+    // must anchor on a word boundary and leave the value intact.
+    writeFileSync(path, ev({
+      timestamp: '2026-08-08T02:50:18.520Z',
+      type: 'event_msg',
+      payload: { type: 'task_complete', turn_id: 'word-boundary', error: { message: 'config notpassword=VISIBLE_WORD applied' } },
+    }));
+    const failed = drainCodexRollout(path, 0).events[0];
+    expect(failed.terminalErrorSummary).toBeDefined();
+    expect(failed.terminalErrorSummary).toContain('VISIBLE_WORD');
+    // A real bare `password=` in the same string is still redacted.
+    writeFileSync(path, ev({
+      timestamp: '2026-08-08T02:50:18.520Z',
+      type: 'event_msg',
+      payload: { type: 'task_complete', turn_id: 'word-boundary-2', error: { message: 'auth password=REAL_SECRET_VAL denied' } },
+    }));
+    const failed2 = drainCodexRollout(path, 0).events[0];
+    expect(failed2.terminalErrorSummary).not.toContain('REAL_SECRET_VAL');
+    expect(failed2.terminalErrorSummary).toContain('[REDACTED]');
+  });
+
   it('classifies structured 429 failures for the dedicated limited state', () => {
     writeFileSync(path, ev({
       timestamp: '2026-08-08T02:50:18.520Z',

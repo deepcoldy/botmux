@@ -235,6 +235,34 @@ const CODEX_FAILURE_SUMMARY_MAX_CHARS = 320;
  *  the (super-linear-on-adversarial-input) patterns cheap. */
 const CODEX_FAILURE_SUMMARY_PRESCAN_MAX_CHARS = 2_000;
 
+/** Credential key names redacted from user-facing failure summaries. */
+const CODEX_SECRET_KEY_ALTERNATION =
+  'api[_-]?key|access[_-]?token|token|auth(?:orization)?|secret|password|signature|credential|cookie';
+/** Quoted-JSON credential with a double-quoted value: `"api_key":"..."`. The
+ *  value uses mutually-exclusive branches — `\\.` consumes an escaped pair,
+ *  `[^\\"]` consumes any other non-quote — so a missing close quote can NOT
+ *  trigger exponential backtracking (the branches never overlap). */
+const CODEX_QUOTED_SECRET_DQ = new RegExp(
+  `(("(?:${CODEX_SECRET_KEY_ALTERNATION})")\\s*:\\s*)"(?:\\\\.|[^\\\\"])*"`, 'gi');
+/** Same, single-quoted value: `'secret':'...'`. */
+const CODEX_QUOTED_SECRET_SQ = new RegExp(
+  `(('(?:${CODEX_SECRET_KEY_ALTERNATION})')\\s*:\\s*)'(?:\\\\.|[^\\\\'])*'`, 'gi');
+/** Bare `key = value` (value quoted or a bare word). `\b` keeps `notpassword=`
+ *  from matching `password`. */
+const CODEX_BARE_SECRET = new RegExp(
+  `(\\b(?:${CODEX_SECRET_KEY_ALTERNATION})\\s*[:=]\\s*)(?:"[^"]*"|'[^']*'|[^\\s,;}]+)`, 'gi');
+/** An UNCLOSED quoted/bare credential value running to end-of-input — created
+ *  when a real secret is cut mid-value by the pre-scan bound (or arrives
+ *  truncated). Its prefix would otherwise slip past the closed-value redactors
+ *  into the shown summary, so we fail closed instead. Same exclusive-branch
+ *  value shape, so these probes are themselves backtracking-safe. */
+const CODEX_UNCLOSED_SECRET_DQ = new RegExp(
+  `"(?:${CODEX_SECRET_KEY_ALTERNATION})"\\s*:\\s*"(?:\\\\.|[^\\\\"])*$`, 'i');
+const CODEX_UNCLOSED_SECRET_SQ = new RegExp(
+  `'(?:${CODEX_SECRET_KEY_ALTERNATION})'\\s*:\\s*'(?:\\\\.|[^\\\\'])*$`, 'i');
+const CODEX_UNCLOSED_SECRET_BARE = new RegExp(
+  `\\b(?:${CODEX_SECRET_KEY_ALTERNATION})\\s*[:=]\\s*(?:"[^"]*|'[^']*)$`, 'i');
+
 function parseEmbeddedJson(value: unknown): unknown {
   if (typeof value !== 'string') return undefined;
   const trimmed = value.trim();
@@ -306,9 +334,21 @@ function safeFailureSummary(error: unknown): string | undefined {
   // the patterns below. The JWT-shaped pattern in particular backtracks
   // super-linearly on long `-`-rich runs (its char class includes `-` and `\b`
   // restarts after each one); an unbounded provider blob could otherwise spend
-  // hundreds of ms in a single replace. Cutting to a few KB keeps that flat.
+  // seconds in a single replace. Cutting to a few KB keeps that flat.
   if (summary.length > CODEX_FAILURE_SUMMARY_PRESCAN_MAX_CHARS) {
     summary = summary.slice(0, CODEX_FAILURE_SUMMARY_PRESCAN_MAX_CHARS);
+  }
+
+  // Fail closed on an UNCLOSED quoted/bare credential value. The pre-scan cut
+  // above can slice a long real secret mid-value, leaving `password":"SEKR…`
+  // with no closing quote — which the closed-value redactors below would NOT
+  // match, leaking the prefix into the shown summary. Run this AFTER the cut so
+  // it sees the same string the redactors will. (A genuinely truncated provider
+  // error hits the same guard, which is the safe outcome.)
+  if (CODEX_UNCLOSED_SECRET_DQ.test(summary)
+    || CODEX_UNCLOSED_SECRET_SQ.test(summary)
+    || CODEX_UNCLOSED_SECRET_BARE.test(summary)) {
+    return undefined;
   }
 
   // Provider errors are untrusted. Keep the useful reason while removing
@@ -318,17 +358,15 @@ function safeFailureSummary(error: unknown): string | undefined {
     .replace(/\bBearer\s+[A-Za-z0-9._~+\/-]+=*/gi, 'Bearer [REDACTED]')
     .replace(/\b(?:sk|rk|pk)-[A-Za-z0-9_-]{12,}\b/g, '[REDACTED]')
     .replace(/\b([A-Za-z0-9_-]{12,}\.[A-Za-z0-9_-]{12,}\.[A-Za-z0-9_-]{12,})\b/g, '[REDACTED]')
-    // Quoted-JSON credential: `"api_key":"..."`. Key quote and value quote are
-    // each matched by a backref (\2 / \3) so single/double quotes both work,
-    // and the value pattern spans backslash escapes (`\"` / `\'`) so it covers
-    // the WHOLE string rather than stopping at the first inner quote. BOTH key
-    // and value must be quoted here — a quoted key with a bare-word value does
-    // NOT match, so no trailing word is swallowed.
-    .replace(/((["'])(?:api[_-]?key|access[_-]?token|token|auth(?:orization)?|secret|password|signature|credential|cookie)\2\s*:\s*)(["'])(?:\\.|(?!\3).)*\3/gi, '$1[REDACTED]')
-    // Bare `key = value` (value may be a quoted string or a bare word). Kept
-    // as the original narrow form: the key here is unquoted, so this never
-    // fires on the quoted-JSON shape handled above.
-    .replace(/((?:api[_-]?key|access[_-]?token|token|auth(?:orization)?|secret|password|signature|credential|cookie)\s*[:=]\s*)(?:"[^"]*"|'[^']*'|[^\s,;}]+)/gi, '$1[REDACTED]')
+    // Quoted-JSON credential (`"api_key":"..."` / `'secret':'...'`). Both key
+    // and value are quoted here — a quoted key with a bare-word value does NOT
+    // match, so no trailing word is swallowed — and the value branches are
+    // mutually exclusive so a pathological value cannot backtrack. See the
+    // CODEX_QUOTED_SECRET_* definitions.
+    .replace(CODEX_QUOTED_SECRET_DQ, '$1[REDACTED]')
+    .replace(CODEX_QUOTED_SECRET_SQ, '$1[REDACTED]')
+    // Bare `key = value`.
+    .replace(CODEX_BARE_SECRET, '$1[REDACTED]')
     .replace(/[\u0000-\u001f\u007f]+/g, ' ')
     .replace(/\s+/g, ' ')
     .trim()
