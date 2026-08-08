@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, writeFileSync, appendFileSync, rmSync, statSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { drainCodexRollout, codexSessionIdFromRolloutPath, findCodexRolloutBySessionId, findCodexSessionIdByBotmuxSessionId, codexHistorySidIsOwned, splitCodexEventsByCutoff, extractLastCodexTurn, scanCodexThreadSettings, type CodexBridgeEvent } from '../src/services/codex-transcript.js';
+import { CODEX_AUTH_ERROR_CODE, CODEX_INVALID_REQUEST_ERROR_CODE, CODEX_RATE_LIMIT_ERROR_CODE, drainCodexRollout, codexSessionIdFromRolloutPath, findCodexRolloutBySessionId, findCodexSessionIdByBotmuxSessionId, codexHistorySidIsOwned, isCodexRateLimitEvent, splitCodexEventsByCutoff, extractLastCodexTurn, scanCodexThreadSettings, type CodexBridgeEvent } from '../src/services/codex-transcript.js';
 
 let dir: string;
 let path: string;
@@ -349,6 +349,76 @@ describe('drainCodexRollout', () => {
     expect(r.events).toHaveLength(2);
     expect(r.events[1].kind).toBe('assistant_final');
     expect(r.events[1].text).toBe('');
+  });
+
+  it('maps the real nested -4003 task_complete error to a safe failed terminal', () => {
+    const nested = JSON.stringify({
+      error: {
+        message: "code: empty_string; message: Invalid 'input[0].tools[0].description': empty string. Expected a string with minimum length 1, but got an empty string instead.",
+        type: 'invalid_request_error',
+        param: 'input[0].tools[0].description',
+        code: '-4003',
+      },
+    });
+    writeFileSync(path,
+      ev(userResponseItem('inspect incident')) +
+      ev({
+        timestamp: '2026-08-08T02:50:18.520Z',
+        type: 'event_msg',
+        payload: {
+          type: 'task_complete',
+          turn_id: '019fdf47-40cf-7a60-9a78-718346e4ce80',
+          last_agent_message: null,
+          error: { message: nested, codex_error_info: 'other' },
+        },
+      }));
+    const failed = drainCodexRollout(path, 0).events[1];
+    expect(failed).toMatchObject({
+      kind: 'assistant_final',
+      text: '',
+      terminalStatus: 'failed',
+      terminalErrorCode: CODEX_INVALID_REQUEST_ERROR_CODE,
+    });
+    expect(failed.terminalErrorSummary).toContain('-4003 invalid_request_error');
+    expect(failed.terminalErrorSummary).toContain('input[0].tools[0].description');
+  });
+
+  it('redacts credentials and active syntax from bounded auth summaries', () => {
+    writeFileSync(path, ev({
+      timestamp: '2026-08-08T02:50:18.520Z',
+      type: 'event_msg',
+      payload: {
+        type: 'task_complete',
+        turn_id: 'auth-failure',
+        error: {
+          message: `401 Unauthorized authorization=Bearer abcdefghijklmnopqrstuvwxyz token=super-secret-value https://example.test/cb?signature=leak <at user_id="ou_secret"> @all ${'x'.repeat(500)}`,
+        },
+      },
+    }));
+    const failed = drainCodexRollout(path, 0).events[0];
+    expect(failed.terminalErrorCode).toBe(CODEX_AUTH_ERROR_CODE);
+    expect(failed.terminalErrorSummary).toContain('[REDACTED]');
+    expect(failed.terminalErrorSummary).toContain('[URL]');
+    expect(failed.terminalErrorSummary).not.toContain('abcdefghijkl');
+    expect(failed.terminalErrorSummary).not.toContain('super-secret-value');
+    expect(failed.terminalErrorSummary).not.toContain('<at');
+    expect(failed.terminalErrorSummary).not.toContain('@all');
+    expect(failed.terminalErrorSummary!.length).toBeLessThanOrEqual(320);
+  });
+
+  it('classifies structured 429 failures for the dedicated limited state', () => {
+    writeFileSync(path, ev({
+      timestamp: '2026-08-08T02:50:18.520Z',
+      type: 'event_msg',
+      payload: {
+        type: 'task_complete',
+        turn_id: 'limited',
+        error: { message: '429 Too Many Requests' },
+      },
+    }));
+    const failed = drainCodexRollout(path, 0).events[0];
+    expect(failed.terminalErrorCode).toBe(CODEX_RATE_LIMIT_ERROR_CODE);
+    expect(isCodexRateLimitEvent(failed)).toBe(true);
   });
 
   // task_complete without a turn_id is a malformed/partial record — ignored

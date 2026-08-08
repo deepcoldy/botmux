@@ -64,6 +64,7 @@ describe('CodexBridgeQueue', () => {
         ...asstEv(''),
         terminalStatus: 'failed',
         terminalErrorCode: 'grok_turn_error',
+        terminalErrorSummary: 'safe summary',
       },
     ]);
     expect(q.drainEmittable()).toEqual([
@@ -73,6 +74,7 @@ describe('CodexBridgeQueue', () => {
         finalText: '',
         terminalStatus: 'failed',
         terminalErrorCode: 'grok_turn_error',
+        terminalErrorSummary: 'safe summary',
       }),
     ]);
   });
