@@ -8,7 +8,10 @@
  *   botmux setup list|add|configure|edit|remove — scripted (non-TUI) bot management, see `botmux setup help`
  *   botmux start          — start daemon and auto plugin services
  *   botmux stop [--with-plugin] — stop daemon (optionally stop auto plugin services)
- *   botmux restart [--include-pm2] [--with-plugin] — restart daemon, then ensure auto plugin services
+ *   botmux restart [--include-pm2] [--with-plugin] — restart daemon, then ensure auto plugin services;
+ *     --include-pm2 is a zero-live-God admission fence, not authority to signal an existing PM2 God
+ *   botmux restart --bootstrap-shutdown-protocol --yes — operator-approved one-time retirement
+ *     of a pre-protocol fleet after independently confirming all Session/Riff work is idle
  *   botmux logs [--lines] — view daemon logs
  *   botmux status         — show daemon status
  *   botmux upgrade|update — upgrade to latest version
@@ -104,12 +107,51 @@ import {
   attachFrozenManagedZmxSession,
   freezeManagedZmxAttachTarget,
 } from './cli/zmx-managed-attach.js';
+import { readSupervisorProcessStartIdentity } from './core/process-start-identity.js';
+import {
+  FLEET_DAEMON_EXIT_WAIT_MS,
+  FLEET_SUCCESSOR_SETTLE_MS,
+  PM2_DAEMON_KILL_TIMEOUT_MS,
+  PM2_DAEMON_RESTART_DELAY_MS,
+} from './core/shutdown-budgets.js';
+import {
+  isFleetEntryProvenFreeOfAutorestartTimer,
+  signalAndAwaitFleet,
+  type FleetProcessEntry,
+} from './cli/fleet-shutdown.js';
+import {
+  startExactPm2ProcessIds,
+  type Pm2ExactStartClient,
+} from './cli/pm2-exact-start.js';
 import { dispatchPrimaryMessage, findStdinAliasAttachment, normalizeInteractiveCardInput, sendFileAttachments, sendVideoAttachments, shouldSendAsPureVideo, validateVideoAttachments } from './cli/send-dispatch.js';
 import { dispatchDeferredTopicSend, reusableDeferredTopicRoot, type DeferredScheduleRunData } from './cli/deferred-topic-send.js';
 import { readDeferredTopicBinding } from './core/deferred-topic-binding.js';
 import { resolveDaemonEnv } from './cli/daemon-lifecycle-env.js';
 import { buildPm2SpawnCommand } from './cli/pm2-command.js';
 import { pm2ManagedExitConfig } from './pm2-graceful-exit.js';
+import {
+  parseCanonicalPm2Id,
+  parsePm2JlistOutput,
+  parsePm2JlistOutputStrict,
+  parsePm2Integer,
+} from './cli/pm2-jlist.js';
+import { assertLinuxPm2GodExecutableUsable } from './cli/pm2-preflight.js';
+import { assertNoUnregisteredLiveDaemonDescriptorsIn } from './cli/pm2-descriptor-guard.js';
+import { assertPm2DaemonShutdownCapabilitiesIn } from './cli/pm2-shutdown-capability.js';
+import { assertIncludePm2RestartAdmission } from './cli/pm2-god-admission.js';
+import {
+  requestAttestedDaemonShutdown,
+  requestAttestedDaemonShutdownBatch,
+} from './cli/supervisor-shutdown-client.js';
+import {
+  assertDaemonPm2GracefulExitPolicy,
+  assertConfiguredPm2FleetReady,
+  assertExactAttestedDaemonSet,
+  classifyStartBotFleetAdmission,
+  normalizeRawPm2StopExitCodes,
+  reconcileLatePm2StartPublication,
+  runBoundedPm2StartTransaction,
+} from './cli/pm2-start-transaction.js';
 import { callDashboard, type DashboardEndpoint, type DashboardResult } from './cli/dashboard-endpoint.js';
 import { globalInstallUpdateLockTargetIn, installLatestBotmuxSync } from './core/maintenance.js';
 import {
@@ -172,7 +214,15 @@ import {
   buildBridgeSendMarkerContent,
   buildBridgeSendPreviewText,
 } from './services/bridge-fallback-gate.js';
-import { bindRestartLeaseTo, writeManualIntentIfAbsentTo } from './services/restart-intent-store.js';
+import {
+  bindRestartLeaseTo,
+  commitRestartIntentAttemptTo,
+  consumeRestartIntentTo,
+  removeRestartIntentAttemptTo,
+  type RestartIntent,
+  writeManualIntentIfAbsentTo,
+  writeRestartAttemptIntentTo,
+} from './services/restart-intent-store.js';
 import { repairMissingChatScope, stripLegacyPendingCardFields } from './services/session-store.js';
 import {
   evaluateVcMeetingManagedSend,
@@ -199,8 +249,6 @@ import {
   inspectBotmuxPm2Apps,
   isExactPm2BotActivationReceipt,
   managedActivationPm2Disposition,
-  parsePm2JlistOutputStrict as parsePm2JlistOutput,
-  stopExactPm2Process,
   type BotmuxPm2Inspection,
 } from './core/bot-live-control.js';
 import {
@@ -247,6 +295,18 @@ const PM2_NAME = 'botmux';
  * when those external pm2 installations get moved or removed.
  */
 const PM2_HOME = join(CONFIG_DIR, 'pm2');
+const PM2_FLEET_MUTATION_LOCK_TARGET = join(CONFIG_DIR, 'pm2-fleet-mutation');
+const PM2_START_COMMAND_TIMEOUT_MS = 30_000;
+const PM2_START_VERIFY_MIN_TIMEOUT_MS = 60_000;
+const PM2_START_VERIFY_PER_PROCESS_MS = 2_000;
+const PM2_START_LATE_PUBLICATION_SETTLE_MS = 10_000;
+
+function pm2StartVerifyTimeoutMs(processCount: number): number {
+  return Math.max(
+    PM2_START_VERIFY_MIN_TIMEOUT_MS,
+    Math.max(1, Math.floor(processCount)) * PM2_START_VERIFY_PER_PROCESS_MS,
+  );
+}
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -298,54 +358,85 @@ function pm2Env(home: string = PM2_HOME): NodeJS.ProcessEnv {
 }
 
 function listPm2GodDaemonPids(home: string = PM2_HOME): number[] {
-  if (process.platform !== 'linux') return [];
   const marker = `God Daemon (${home})`;
   const pids: number[] = [];
-  try {
-    for (const ent of readdirSync('/proc')) {
+  if (process.platform === 'linux') {
+    let entries: string[];
+    try { entries = readdirSync('/proc'); }
+    catch (err) {
+      throw new Error(`cannot inspect /proc for duplicate PM2 Gods: ${err instanceof Error ? err.message : err}`);
+    }
+    for (const ent of entries) {
       if (!/^\d+$/.test(ent)) continue;
       const pid = parseInt(ent, 10);
       if (!pid) continue;
       try {
         const cmd = readFileSync(`/proc/${pid}/cmdline`, 'utf-8').replace(/\u0000/g, ' ').trim();
         if (cmd.includes('PM2 v') && cmd.includes(marker)) pids.push(pid);
-      } catch { /* ignore unreadable proc entries */ }
+      } catch { /* another user's or already-exited process */ }
     }
-  } catch { /* ignore proc scan failure */ }
+    return pids.sort((a, b) => a - b);
+  }
+  if (process.platform === 'win32') {
+    const windowsScan = spawnSync('powershell.exe', [
+      '-NoProfile',
+      '-NonInteractive',
+      '-Command',
+      "$needle = \"God Daemon ($env:BOTMUX_PM2_SCAN_HOME)\"; "
+      + "Get-CimInstance Win32_Process | Where-Object { "
+      + "$_.CommandLine -and $_.CommandLine.Contains('PM2 v') "
+      + "-and $_.CommandLine.Contains($needle) } | ForEach-Object { $_.ProcessId }",
+    ], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+      timeout: 4_000,
+      env: { ...process.env, BOTMUX_PM2_SCAN_HOME: home },
+    });
+    if (windowsScan.status !== 0 || windowsScan.error) {
+      throw new Error(
+        `cannot inspect Windows process table for duplicate PM2 Gods: `
+        + `${windowsScan.error?.message ?? String(windowsScan.stderr || `status ${windowsScan.status}`).trim()}`,
+      );
+    }
+    for (const line of String(windowsScan.stdout).split(/\r?\n/)) {
+      const pid = parsePm2Integer(line.trim(), { nonNegative: true });
+      if (pid && pid > 1) pids.push(pid);
+    }
+    return [...new Set(pids)].sort((a, b) => a - b);
+  }
+  const ps = spawnSync('ps', ['-axo', 'pid=,command='], {
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'pipe'],
+    timeout: 2_000,
+  });
+  if (ps.status !== 0 || ps.error) {
+    throw new Error(
+      `cannot inspect process table for duplicate PM2 Gods: `
+      + `${ps.error?.message ?? String(ps.stderr || `status ${ps.status}`).trim()}`,
+    );
+  }
+  for (const line of String(ps.stdout).split(/\r?\n/)) {
+    if (!line.includes('PM2 v') || !line.includes(marker)) continue;
+    const match = line.match(/^\s*(\d+)\s+/);
+    if (match) pids.push(Number(match[1]));
+  }
   return pids.sort((a, b) => a - b);
 }
 
-function killDuplicatePm2GodDaemons(home: string = PM2_HOME): boolean {
+function listSingletonPm2GodDaemonPidsForMutation(home: string = PM2_HOME): number[] {
   const pids = listPm2GodDaemonPids(home);
-  if (pids.length <= 1) return false;
+  if (pids.length <= 1) return pids;
+  // Never signal a duplicate God automatically. Its SIGTERM handler may
+  // serially stop/force-kill managed children, including a Riff generation
+  // whose lineage is not yet durable in the surviving God's registry.
+  throw new Error(
+    `refusing PM2 mutation: multiple PM2 God daemons share ${home} `
+    + `(pids: ${pids.join(', ')}); no process was signalled`,
+  );
+}
 
-  const pidFile = join(home, 'pm2.pid');
-  let keepPid = 0;
-  if (existsSync(pidFile)) {
-    try {
-      const parsed = parseInt(readFileSync(pidFile, 'utf-8').trim(), 10);
-      if (pids.includes(parsed)) keepPid = parsed;
-    } catch { /* ignore malformed pid file */ }
-  }
-  if (!keepPid) keepPid = pids[pids.length - 1];
-
-  const dupes = pids.filter(pid => pid !== keepPid);
-  if (dupes.length === 0) return false;
-
-  for (const pid of dupes) {
-    try { process.kill(pid, 'SIGTERM'); } catch { /* ignore */ }
-    try {
-      process.kill(pid, 0);
-      process.kill(pid, 'SIGKILL');
-    } catch { /* ignore */ }
-  }
-
-  try {
-    atomicWriteFileSync(pidFile, `${keepPid}\n`);
-  } catch { /* ignore */ }
-
-  console.warn(`⚠️  检测到同一 PM2_HOME (${home}) 下存在多个 PM2 God Daemon，已清理重复实例；保留 pid ${keepPid}，移除: ${dupes.join(', ')}`);
-  return true;
+function assertNoDuplicatePm2GodDaemons(home: string = PM2_HOME): void {
+  listSingletonPm2GodDaemonPidsForMutation(home);
 }
 
 function runPm2(args: string[], inherit = true, home: string = PM2_HOME, timeoutMs?: number): void {
@@ -391,6 +482,70 @@ function pm2Capture(args: string[], home: string = PM2_HOME, timeoutMs = 10_000)
     throw new Error(`pm2 ${args.join(' ')} failed: ${detail}`);
   }
   return typeof r.stdout === 'string' ? r.stdout : '';
+}
+
+async function cmdInternalPm2StartExact(args: string[]): Promise<void> {
+  const processIds = args.map(value => Number(value));
+  try {
+    const claimedParent = parsePm2Integer(process.env.BOTMUX_PM2_FLEET_LOCK_OWNER_PID, {
+      nonNegative: true,
+    });
+    if (claimedParent !== process.ppid) {
+      throw new Error('internal exact PM2 start requires its live parent fleet-lock owner');
+    }
+    const lockPayload = readFileSync(`${PM2_FLEET_MUTATION_LOCK_TARGET}.lock`, 'utf8').trim();
+    let lockPid: number | undefined;
+    try {
+      const parsed = JSON.parse(lockPayload) as unknown;
+      lockPid = parsed && typeof parsed === 'object'
+        ? parsePm2Integer((parsed as Record<string, unknown>).pid, { nonNegative: true })
+        : undefined;
+    } catch {
+      lockPid = parsePm2Integer(lockPayload, { nonNegative: true });
+    }
+    if (lockPid !== process.ppid) {
+      throw new Error('internal exact PM2 start could not verify the parent fleet lock');
+    }
+    const pm2 = require('pm2') as { Client: Pm2ExactStartClient };
+    await startExactPm2ProcessIds(processIds, pm2.Client);
+  } catch (err) {
+    console.error(err instanceof Error ? err.message : String(err));
+    process.exitCode = 1;
+  }
+}
+
+function runExactPm2Starts(
+  entries: FleetProcessEntry[],
+  home: string,
+  timeoutMs: number,
+): void {
+  const processIds = entries.map(entry => entry.pmId);
+  if (processIds.some(id => !Number.isInteger(id) || (id as number) < 0)) {
+    throw new Error('conditional PM2 compensation requires an exact pm_id for every entry');
+  }
+  const boundedTimeoutMs = Math.floor(timeoutMs);
+  if (boundedTimeoutMs <= 0) {
+    throw new Error('fleet deadline exhausted before conditional PM2 compensation');
+  }
+  const result = spawnSync(
+    process.execPath,
+    [__filename, '__pm2-start-exact', ...processIds.map(String)],
+    {
+      stdio: 'pipe',
+      env: {
+        ...pm2Env(home),
+        BOTMUX_PM2_FLEET_LOCK_OWNER_PID: String(process.pid),
+      },
+      timeout: boundedTimeoutMs,
+      encoding: 'utf8',
+    },
+  );
+  if (result.status !== 0) {
+    const detail = result.error?.message
+      ?? result.stderr?.trim()
+      ?? `status ${result.status}`;
+    throw new Error(`conditional PM2 compensation failed: ${detail}`);
+  }
 }
 
 function loadBotsJson(): any[] {
@@ -568,9 +723,11 @@ function pm2SafeInterpreter(): string {
   return exec;
 }
 
-function ecosystemConfig(activationAppId?: string): string {
+function ecosystemConfig(
+  bots: any[] = loadBotsJson(),
+  activationAppId?: string,
+): string {
   const daemonScript = join(PKG_ROOT, 'dist', 'index-daemon.js');
-  const bots = loadBotsJson();
   ensureUniqueBotProcessNames(bots);
   const daemonEnv = resolveDaemonEnv(
     process.env,
@@ -590,20 +747,16 @@ function ecosystemConfig(activationAppId?: string): string {
     cwd: CONFIG_DIR,
     autorestart: true,
     max_restarts: 10,
-    restart_delay: 3000,
-    // A graceful PM2-managed shutdown exits with a dedicated sentinel code.
-    // Tell pm2 that only this code is intentional so it does NOT autorestart the daemon
-    // while `botmux restart` is tearing the fleet down — otherwise pm2 revives
-    // each daemon (after restart_delay) the instant our parallel SIGTERM drains
-    // it, and re-deleting those revivals one-by-one re-serializes the teardown
-    // (~13s of churn for 31 bots). Do not use 0 here: PM2 normalizes a signal
-    // exit's null code to 0, which would suppress autorestart after SIGKILL.
+    restart_delay: PM2_DAEMON_RESTART_DELAY_MS,
+    // PM2 maps signal-only death to exit_code=0 before applying
+    // stop_exit_codes. Zero cannot be a graceful sentinel: SIGKILL/OOM during
+    // a prepared Riff drain would otherwise suppress autorestart and look safe
+    // to delete. Only shutdown()'s fully committed success exits the reserved
+    // non-zero code. All signal deaths and ordinary failures still restart.
     stop_exit_codes: managedExit.stopExitCodes,
-    // pm2's default kill_timeout (1.6s) is SHORTER than the daemon's own
-    // SHUTDOWN_GRACE_MS (3s), so any daemon pm2 has to signal directly gets
-    // SIGKILL'd mid-drain → orphaned (ppid=1) workers. Give pm2 headroom past
-    // the daemon's graceful-drain budget so it never force-kills mid-shutdown.
-    kill_timeout: 3500,
+    // Keep the supervisor outside every bounded Riff prepare/commit/refusal
+    // handshake so PM2 cannot SIGKILL a correct daemon mid-ACK.
+    kill_timeout: PM2_DAEMON_KILL_TIMEOUT_MS,
     log_date_format: 'YYYY-MM-DD HH:mm:ss',
     merge_logs: true,
     node_args: [
@@ -684,9 +837,9 @@ function ecosystemConfig(activationAppId?: string): string {
     cwd: PKG_ROOT,
     autorestart: true,
     max_restarts: 10,
-    restart_delay: 3000,
-    // Same rationale as the bot daemons: don't let pm2 revive on graceful exit
-    // during a fleet teardown, and don't SIGKILL mid-shutdown. (See baseApp.)
+    restart_delay: PM2_DAEMON_RESTART_DELAY_MS,
+    // Dashboard receives the same managed sentinel env and exits through
+    // gracefulProcessExitCode(), so its stop policy must match the daemon's.
     stop_exit_codes: managedExit.stopExitCodes,
     kill_timeout: 3500,
     error_file: join(LOG_DIR, 'dashboard-error.log'),
@@ -1732,7 +1885,7 @@ async function cmdSetupScripted(argv: string[]): Promise<void> {
       );
       return;
     }
-    const live = ensureBotDaemonStarted(bot.larkAppId, { quiet: cmd.json });
+    const live = await ensureBotDaemonStarted(bot.larkAppId, { quiet: cmd.json });
     const next = live.ok ? 'live' : (live.reason === 'fleet_down' ? 'botmux start' : 'botmux restart');
     if (cmd.json) {
       console.log(JSON.stringify({
@@ -2005,7 +2158,7 @@ async function cmdSetupScripted(argv: string[]): Promise<void> {
       return;
     }
     // daemon 在跑就直接把新 bot 那一个进程拉起来，免整组 botmux restart。
-    const live = ensureBotDaemonStarted(bot.larkAppId, { quiet: cmd.json });
+    const live = await ensureBotDaemonStarted(bot.larkAppId, { quiet: cmd.json });
     const next = live.ok ? 'live' : (live.reason === 'fleet_down' ? 'botmux start' : 'botmux restart');
     if (cmd.json) {
       console.log(JSON.stringify({
@@ -2347,7 +2500,7 @@ async function cmdSetup(): Promise<void> {
     console.log(`\n✅ 已添加机器人 ${newBot.larkAppId}，共 ${bots.length + 1} 个`);
     console.log(`   配置文件: ${BOTS_JSON_FILE}`);
     await finishOpenPlatformSetup(newBot.larkAppId, botBrand(newBot), { reuseOnly: hasSetupWebSession(newBot) });
-    printAddBotLiveHint(newBot.larkAppId);
+    await printAddBotLiveHint(newBot.larkAppId);
     return;
     }
 
@@ -2404,7 +2557,7 @@ async function cmdSetup(): Promise<void> {
     console.log(`   配置文件: ${BOTS_JSON_FILE}`);
     console.log(`   旧配置已备份: ${ENV_FILE}.bak`);
     await finishOpenPlatformSetup(newBot.larkAppId, botBrand(newBot), { reuseOnly: hasSetupWebSession(newBot) });
-    printAddBotLiveHint(newBot.larkAppId);
+    await printAddBotLiveHint(newBot.larkAppId);
 
   } else {
     // --- Fresh install ---
@@ -2423,38 +2576,19 @@ async function cmdSetup(): Promise<void> {
  * the daemon, but the error gets buried in pm2 logs and the user sees
  * silence.
  *
- * Detects two cases and either auto-heals or aborts with a clear message:
- *   1. pm2 god daemon's running binary is deleted → auto `pm2 kill`
+ * Detects two cases and aborts with a clear message:
+ *   1. pm2 god daemon's running binary is deleted → fail closed; an automatic
+ *      kill could bypass a managed daemon's Riff shutdown protocol
  *   2. This package is installed under an nvm Node version that no longer
  *      exists on disk → abort with reinstall instructions
  */
-function preflightNodeSanity(): void {
-  // Case 1: pm2 god is alive but its Node binary has been deleted.
-  const pm2PidFile = join(PM2_HOME, 'pm2.pid');
-  if (existsSync(pm2PidFile)) {
-    let pm2Pid = 0;
-    try { pm2Pid = parseInt(readFileSync(pm2PidFile, 'utf-8').trim(), 10); } catch { /* ignore */ }
-    if (pm2Pid) {
-      let pm2Alive = false;
-      try { process.kill(pm2Pid, 0); pm2Alive = true; } catch { /* not alive */ }
-      if (pm2Alive && process.platform === 'linux') {
-        // On Linux, /proc/<pid>/exe is a symlink to the running executable.
-        // readlink includes a " (deleted)" suffix when the on-disk file is gone.
-        try {
-          const exe = readlinkSync(`/proc/${pm2Pid}/exe`);
-          const cleanPath = exe.replace(/ \(deleted\)$/, '');
-          const exeDeleted = exe.endsWith(' (deleted)') || !existsSync(cleanPath);
-          if (exeDeleted) {
-            console.warn(`⚠️  pm2 god daemon (pid ${pm2Pid}) 使用的 Node 二进制已失效: ${cleanPath}`);
-            console.warn(`   自动杀掉 pm2 god 以便用当前 Node 重启...`);
-            try {
-              runPm2(['kill'], false, PM2_HOME, 10_000);
-            } catch {
-              try { process.kill(pm2Pid, 'SIGKILL'); } catch { /* ignore */ }
-            }
-          }
-        } catch { /* /proc not readable, skip */ }
-      }
+function preflightNodeSanity(home: string = PM2_HOME): void {
+  // `pm2.pid` is only a cache. Inspect every God actually enumerated for this
+  // PM2_HOME and refuse rather than guessing which generation is authoritative.
+  const actualGodPids = listPm2GodDaemonPids(home);
+  if (process.platform === 'linux') {
+    for (const pm2Pid of actualGodPids) {
+      assertLinuxPm2GodExecutableUsable(pm2Pid);
     }
   }
 
@@ -2485,8 +2619,6 @@ async function cmdStart(): Promise<void> {
     process.exit(1);
   }
   ensureConfigDir();
-  killDuplicatePm2GodDaemons();
-  preflightNodeSanity();
   await ensureSystemDependencies();
 
   // 启动前快速校验每个 bot 的凭证. Codex review 边界 #5: 凭证无效是
@@ -2522,9 +2654,70 @@ async function cmdStart(): Promise<void> {
     }
   }
 
-  cleanupLegacyPm2();
-  const cfg = ecosystemConfig();
-  runPm2(['start', cfg]);
+  await withFileLock(PM2_FLEET_MUTATION_LOCK_TARGET, async () => {
+    await withFileLock(BOTS_JSON_FILE, async () => {
+      const lockedBots = loadBotsJson();
+      if (JSON.stringify(lockedBots) !== JSON.stringify(botsForCheck)) {
+        throw new Error('[start] bots.json changed during credential preflight; retry with the new configuration');
+      }
+      assertNoDuplicatePm2GodDaemons();
+      preflightNodeSanity();
+      cleanupLegacyPm2();
+      const currentProjection = readVerifiedBotmuxPm2Projection('start');
+      assertNoUnregisteredLiveDaemonDescriptors('start', currentProjection);
+      assertCanonicalUniquePm2Rows('start', currentProjection);
+      const configuredNames = configuredCoreProcessNames(lockedBots);
+      const verifyTimeoutMs = pm2StartVerifyTimeoutMs(configuredNames.length);
+      const cfg = ecosystemConfig(lockedBots);
+      const liveEntries = currentProjection.filter(isLivePm2Entry);
+      if (liveEntries.length > 0) {
+        try {
+          readAndAssertConfiguredFleetOnline(
+            'start-idempotent-ready',
+            configuredNames,
+            PM2_HOME,
+            verifyTimeoutMs,
+          );
+          return;
+        } catch (error) {
+          throw new Error(
+            `[start] refusing PM2 start while a partial/live core fleet exists `
+            + `(${liveEntries.map(entry => `${entry.name}:${entry.pid}`).join(', ')}): `
+            + `${error instanceof Error ? error.message : String(error)}; `
+            + 'use start-bot only for an exact one-missing-bot fleet, or restart',
+          );
+        }
+      }
+      const unprovenDormant = currentProjection.filter(
+        entry => !isFleetEntryProvenFreeOfAutorestartTimer(entry),
+      );
+      if (unprovenDormant.length > 0) {
+        throw new Error(
+          `[start] refusing PM2 start: dormant row(s) may still have a restart timer `
+          + `(${unprovenDormant.map(entry => `${entry.name}:${entry.status ?? 'unknown'}`).join(', ')})`,
+        );
+      }
+      runBoundedPm2StartTransaction(
+        'start',
+        PM2_START_COMMAND_TIMEOUT_MS,
+        verifyTimeoutMs,
+        {
+          start: timeoutMs => {
+            assertBotsConfigSnapshotUnchanged('start', lockedBots);
+            assertNoDuplicatePm2GodDaemons();
+            preflightNodeSanity();
+            runPm2(['start', cfg], true, PM2_HOME, timeoutMs);
+          },
+          verifyFresh: timeoutMs => readAndAssertConfiguredFleetOnline(
+            'start-after-launch', configuredNames, PM2_HOME, timeoutMs,
+          ),
+          rollback: () => rollbackPm2StartAttempt(
+            'start', currentProjection, configuredNames,
+          ),
+        },
+      );
+    }, { maxWaitMs: 5_000 });
+  }, { maxWaitMs: 5_000 });
   await reconcilePluginServicesForCli(undefined, { autoOnly: true });
   const bots = loadBotsJson();
   const count = bots.length || 1;
@@ -2570,81 +2763,670 @@ function isBotmuxCoreProcessName(name: string): boolean {
   return name === PM2_NAME || (name.startsWith(`${PM2_NAME}-`) && !name.startsWith(`${PM2_NAME}-plugin-`));
 }
 
-function deleteAllBotmuxProcesses(home: string = PM2_HOME): void {
-  let entries: Array<{ name: string; pid: number; online: boolean }>;
-  try {
-    const apps = parsePm2JlistOutput(pm2Capture(['jlist'], home));
-    entries = (Array.isArray(apps) ? apps : [])
-      .filter(a => a && isBotmuxCoreProcessName(String(a.name)))
-      .map(a => ({ name: String(a.name), pid: Number(a.pid) || 0, online: a?.pm2_env?.status === 'online' }));
-  } catch (e) {
-    console.error(`[restart] pm2 jlist failed (pm2 not running or no apps?): ${e instanceof Error ? e.message : e}`);
-    return;
-  }
-  if (entries.length === 0) return;
-  const names = entries.map(e => e.name);
+function isBotmuxDaemonProcessName(name: string): boolean {
+  return isBotmuxCoreProcessName(name) && name !== 'botmux-dashboard';
+}
 
-  // Parallel graceful shutdown. pm2's own delete stops apps one-at-a-time
-  // (async eachLimit, concurrency 1) and each botmux daemon's drain eats pm2's
-  // full kill_timeout (~1.6s) → ~N×1.6s serial (~38s for 31 bots). Instead we
-  // SIGTERM every online daemon AT ONCE so their graceful drains overlap (the
-  // daemon's SIGTERM handler detaches workers within SHUTDOWN_GRACE_MS), wait
-  // once for them all to exit, then let pm2 delete reap the now-dead entries
-  // instantly. Orphan-safe: each daemon runs its FULL graceful drain and we wait
-  // for real exit before pm2 touches it — avoiding the mid-drain SIGKILL the old
-  // path forced (pm2 kill_timeout 1.6s < daemon SHUTDOWN_GRACE_MS 3s).
-  const pids = entries.filter(e => e.online && e.pid > 0).map(e => e.pid);
-  for (const pid of pids) {
-    try { process.kill(pid, 'SIGTERM'); } catch { /* already gone */ }
-  }
-  // Poll until every signalled daemon has exited (bounded). SHUTDOWN_GRACE_MS is
-  // 3s; give headroom. Exits early the moment the last one dies.
-  const deadline = Date.now() + 5_000;
-  let alive = pids.slice();
-  while (alive.length > 0 && Date.now() < deadline) {
-    sleepSyncMs(50);
-    alive = alive.filter(pid => { try { process.kill(pid, 0); return true; } catch { return false; } });
-  }
+type BotmuxPm2ProcessEntry = FleetProcessEntry;
 
-  // Reap pm2 entries. Processes are already dead → each delete is instant, and
-  // ONE batched `pm2 delete name1 name2 …` collapses N pm2 CLI cold-boots
-  // (~315ms each) into one. A revived (autorestart, gated by restart_delay)
-  // instance is still removed by name.
-  const batchTimeout = Math.max(15_000, names.length * 2_500);
+function toBotmuxPm2ProcessEntry(app: any): BotmuxPm2ProcessEntry {
+  const rawStopExitCodes = app?.pm2_env?.stop_exit_codes;
+  const pmId = parseCanonicalPm2Id(app);
+  const exitCode = parsePm2Integer(app?.pm2_env?.exit_code);
+  return {
+    name: String(app.name),
+    ...(pmId !== undefined ? { pmId } : {}),
+    pid: Number(app.pid) || 0,
+    online: app?.pm2_env?.status === 'online',
+    status: String(app?.pm2_env?.status ?? 'unknown'),
+    autorestart: app?.pm2_env?.autorestart,
+    stopExitCodes: normalizeRawPm2StopExitCodes(rawStopExitCodes),
+    ...(exitCode !== undefined ? { exitCode } : {}),
+  };
+}
+
+function readVerifiedBotmuxPm2Projection(
+  operation: string,
+  home: string = PM2_HOME,
+  timeoutMs = 10_000,
+): BotmuxPm2ProcessEntry[] {
   try {
-    runPm2(['delete', ...names], false, home, batchTimeout);
-    return;
-  } catch (e) {
-    // pm2's batched delete (async eachLimit) aborts on the first failed name,
-    // so a mid-batch failure can leave stragglers. Fall back to the resilient
-    // per-name loop that try/catches each name independently.
-    console.error(`[restart] batched pm2 delete failed, falling back to per-name: ${e instanceof Error ? e.message : e}`);
-  }
-  for (const name of names) {
-    try {
-      runPm2(['delete', name], false, home, 10_000);
-    } catch (e) {
-      // Don't swallow silently — a failed delete here used to leave the
-      // restart half-done with no trace. Surface it (the auto-restart
-      // driver captures stderr to ~/.botmux/logs/maintenance-restart.log).
-      console.error(`[restart] pm2 delete ${name} failed: ${e instanceof Error ? e.message : e}`);
-    }
+    return parsePm2JlistOutputStrict(pm2Capture(['jlist'], home, timeoutMs))
+      .filter(app => app && isBotmuxCoreProcessName(String(app.name)))
+      .map(toBotmuxPm2ProcessEntry);
+  } catch (err) {
+    throw new Error(
+      `[${operation}] pm2 jlist failed; refusing an unverified PM2 mutation: `
+      + `${err instanceof Error ? err.message : String(err)}`,
+    );
   }
 }
 
-function killPm2GodDaemon(home: string = PM2_HOME): void {
+function assertNoUnregisteredLiveDaemonDescriptors(
+  operation: string,
+  projections: BotmuxPm2ProcessEntry[],
+): void {
+  assertNoUnregisteredLiveDaemonDescriptorsIn(
+    operation,
+    projections,
+    join(resolveDataDir(), 'dashboard-daemons'),
+  );
+}
+
+function duplicatePm2CoreNames(entries: BotmuxPm2ProcessEntry[]): string[] {
+  return [...new Set(entries.map(entry => entry.name))]
+    .filter(name => entries.filter(entry => entry.name === name).length > 1);
+}
+
+function isLivePm2Entry(entry: BotmuxPm2ProcessEntry): boolean {
+  if (!Number.isInteger(entry.pid) || entry.pid <= 1) return false;
+  try { process.kill(entry.pid, 0); return true; } catch { return false; }
+}
+
+function configuredCoreProcessNames(
+  bots: any[] = loadBotsJson(),
+  activationAppId?: string,
+): string[] {
+  const names: string[] = [];
+  bots.forEach((bot, index) => {
+    const appId = typeof bot?.larkAppId === 'string' ? bot.larkAppId : '';
+    const starting = bot?.activationStarting;
+    const committed = bot?.activationCommitted;
+    const deactivating = bot?.activationDeactivating;
+    const conflicting = starting !== undefined && committed !== undefined;
+    const marker = starting ?? committed;
+    const validMarker = (
+      marker
+      && typeof marker === 'object'
+      && !Array.isArray(marker)
+      && marker.appId === appId
+      && typeof marker.jobId === 'string'
+      && marker.jobId
+    );
+    if (
+      bot?.activationPending === true
+      || deactivating !== undefined
+      || conflicting
+      || (
+        (starting !== undefined || committed !== undefined)
+        && (!validMarker || activationAppId !== appId)
+      )
+    ) return;
+    names.push(botProcessName(bot, index, PM2_NAME));
+  });
+  names.push('botmux-dashboard');
+  return names;
+}
+
+function assertBotsConfigSnapshotUnchanged(operation: string, snapshot: any[]): void {
+  if (JSON.stringify(loadBotsJson()) === JSON.stringify(snapshot)) return;
+  throw new Error(`[${operation}] bots.json generation changed before PM2 start; no launch attempted`);
+}
+
+function readAndAssertConfiguredFleetOnline(
+  operation: string,
+  configuredNames: string[],
+  home: string = PM2_HOME,
+  timeoutMs: number = PM2_START_VERIFY_MIN_TIMEOUT_MS,
+): BotmuxPm2ProcessEntry[] {
+  const deadline = Date.now() + Math.max(1, Math.floor(timeoutMs));
+  let lastError: unknown;
+  while (Date.now() < deadline) {
+    try {
+      const remainingMs = Math.max(1, deadline - Date.now());
+      const projection = readVerifiedBotmuxPm2Projection(operation, home, remainingMs);
+      assertNoUnregisteredLiveDaemonDescriptors(operation, projection);
+      assertConfiguredPm2FleetReady(
+        operation,
+        projection,
+        configuredNames,
+        pid => { try { process.kill(pid, 0); return true; } catch { return false; } },
+        readyEntries => {
+          const daemonEntries = readyEntries.filter(entry => isBotmuxDaemonProcessName(entry.name));
+          assertDaemonPm2GracefulExitPolicy(
+            `${operation}-handler-ready-pm2-policy`,
+            daemonEntries,
+          );
+          const attested = assertPm2DaemonShutdownCapabilitiesIn(
+            `${operation}-handler-ready`,
+            daemonEntries.map(entry => ({ name: entry.name, pid: entry.pid })),
+            join(resolveDataDir(), 'dashboard-daemons'),
+          );
+          assertExactAttestedDaemonSet(
+            `${operation}-handler-ready`,
+            daemonEntries,
+            attested.map(entry => entry.pid),
+            pid => { try { process.kill(pid, 0); return true; } catch { return false; } },
+          );
+          for (const target of attested) {
+            if (readSupervisorProcessStartIdentity(target.pid) !== target.processStartIdentity) {
+              throw new Error(
+                `[${operation}-handler-ready] daemon generation changed after capability scan: `
+                + `${target.name}/${target.pid}`,
+              );
+            }
+          }
+          if (readyEntries
+            .filter(entry => !isBotmuxDaemonProcessName(entry.name))
+            .some(entry => !isLivePm2Entry(entry))) {
+            throw new Error(`[${operation}] dashboard exited during handler-ready verification`);
+          }
+        },
+      );
+      return projection;
+    } catch (error) {
+      lastError = error;
+      const remainingMs = deadline - Date.now();
+      if (remainingMs <= 0) break;
+      sleepSyncMs(Math.min(100, remainingMs));
+    }
+  }
+  throw new Error(
+    `[${operation}] configured fleet never reached PM2-online plus handler-ready capability `
+    + `within ${timeoutMs}ms: ${lastError instanceof Error ? lastError.message : String(lastError)}`,
+  );
+}
+
+function assertCanonicalUniquePm2Rows(
+  operation: string,
+  entries: BotmuxPm2ProcessEntry[],
+): void {
+  const duplicateNames = duplicatePm2CoreNames(entries);
+  const missingIds = entries.filter(entry =>
+    !Number.isSafeInteger(entry.pmId) || (entry.pmId as number) < 0);
+  const duplicateIds = [...new Set(entries
+    .map(entry => entry.pmId)
+    .filter((id): id is number => Number.isSafeInteger(id)))]
+    .filter(id => entries.filter(entry => entry.pmId === id).length > 1);
+  const duplicateLivePids = [...new Set(entries
+    .map(entry => entry.pid)
+    .filter(pid => Number.isSafeInteger(pid) && pid > 1))]
+    .filter(pid => entries.filter(entry => entry.pid === pid).length > 1);
+  if (duplicateNames.length === 0
+      && missingIds.length === 0
+      && duplicateIds.length === 0
+      && duplicateLivePids.length === 0) return;
+  throw new Error(
+    `[${operation}] refusing PM2 mutation: canonical registry identity is ambiguous`
+    + (duplicateNames.length > 0 ? ` (duplicate names: ${duplicateNames.join(', ')})` : '')
+    + (duplicateIds.length > 0 ? ` (duplicate pm_id: ${duplicateIds.join(', ')})` : '')
+    + (duplicateLivePids.length > 0
+      ? ` (duplicate positive pid: ${duplicateLivePids.join(', ')})`
+      : '')
+    + (missingIds.length > 0
+      ? ` (missing pm_id: ${missingIds.map(entry => entry.name).join(', ')})`
+      : ''),
+  );
+}
+
+function exactQuiescentRowsForMutation(
+  operation: string,
+  originals: BotmuxPm2ProcessEntry[],
+  fresh: BotmuxPm2ProcessEntry[],
+): BotmuxPm2ProcessEntry[] {
+  const exact: BotmuxPm2ProcessEntry[] = [];
+  for (const original of originals) {
+    const rows = fresh.filter(entry => entry.name === original.name);
+    if (rows.length === 0) continue;
+    if (rows.length !== 1 || rows[0]!.pmId !== original.pmId) {
+      throw new Error(
+        `[${operation}] refusing PM2 mutation: registry row ${original.name} was recreated or duplicated`,
+      );
+    }
+    if (isLivePm2Entry(rows[0]!)) {
+      throw new Error(
+        `[${operation}] refusing PM2 mutation: live generation appeared for `
+        + `${original.name}:${rows[0]!.pid}`,
+      );
+    }
+    if (!isFleetEntryProvenFreeOfAutorestartTimer(rows[0]!)) {
+      throw new Error(
+        `[${operation}] refusing PM2 mutation: ${original.name} may still publish a successor`,
+      );
+    }
+    exact.push(rows[0]!);
+  }
+  return exact;
+}
+
+function revalidateExactQuiescentRowBeforeMutation(
+  operation: string,
+  original: BotmuxPm2ProcessEntry,
+  allOriginals: BotmuxPm2ProcessEntry[],
+  home: string = PM2_HOME,
+  additionalDescriptorAuthority: BotmuxPm2ProcessEntry[] = [],
+): BotmuxPm2ProcessEntry | undefined {
+  assertNoDuplicatePm2GodDaemons(home);
+  const fresh = readVerifiedBotmuxPm2Projection(operation, home);
+  assertNoUnregisteredLiveDaemonDescriptors(
+    operation,
+    [...fresh, ...additionalDescriptorAuthority],
+  );
+  assertCanonicalUniquePm2Rows(operation, fresh);
+  return exactQuiescentRowsForMutation(operation, allOriginals, fresh)
+    .find(entry => entry.name === original.name);
+}
+
+function signalAndAwaitBotmuxProcesses(
+  entries: BotmuxPm2ProcessEntry[],
+  operation: 'restart' | 'stop',
+  home: string = PM2_HOME,
+  additionalDescriptorAuthority: BotmuxPm2ProcessEntry[] = [],
+): void {
+  assertCanonicalUniquePm2Rows(operation, entries);
+  const processNameByPid = new Map<number, string>();
+  const processEntryByPid = new Map<number, BotmuxPm2ProcessEntry>();
+  const processStartByPid = new Map<number, string>();
+  const rememberProcessIdentity = (
+    identityOperation: string,
+    entry: BotmuxPm2ProcessEntry,
+  ): void => {
+    if (entry.pid <= 1) return;
+    const identity = readSupervisorProcessStartIdentity(entry.pid);
+    if (!identity) {
+      if (!isLivePm2Entry(entry)) return;
+      throw new Error(
+        `[${identityOperation}] cannot bind ${entry.name}/${entry.pid} to a process-start identity`,
+      );
+    }
+    processNameByPid.set(entry.pid, entry.name);
+    processEntryByPid.set(entry.pid, entry);
+    processStartByPid.set(entry.pid, identity);
+  };
+  for (const entry of entries) rememberProcessIdentity(`${operation}-initial-identity`, entry);
+
+  const assertShutdownCapability = (
+    capabilityOperation: string,
+    targets: BotmuxPm2ProcessEntry[],
+  ) => {
+    const daemonTargets = targets.filter(entry => isBotmuxDaemonProcessName(entry.name));
+    assertDaemonPm2GracefulExitPolicy(capabilityOperation, daemonTargets);
+    return assertPm2DaemonShutdownCapabilitiesIn(
+      capabilityOperation,
+      daemonTargets.map(entry => ({ name: entry.name, pid: entry.pid })),
+      join(resolveDataDir(), 'dashboard-daemons'),
+    );
+  };
+  assertShutdownCapability(
+    `${operation}-shutdown-capability-preflight`,
+    entries.filter(entry => entry.online && entry.pid > 1),
+  );
+
+  const list = (timeoutMs: number): BotmuxPm2ProcessEntry[] => {
+    const projection = parsePm2JlistOutputStrict(pm2Capture(
+      ['jlist'],
+      home,
+      Math.min(10_000, Math.max(1, Math.floor(timeoutMs))),
+    ))
+      .filter(app => app && isBotmuxCoreProcessName(String(app.name)))
+      .map(toBotmuxPm2ProcessEntry);
+    assertNoUnregisteredLiveDaemonDescriptors(
+      `${operation}-successor-projection`,
+      [...projection, ...additionalDescriptorAuthority],
+    );
+    assertCanonicalUniquePm2Rows(`${operation}-successor-projection`, projection);
+    for (const entry of projection) {
+      rememberProcessIdentity(`${operation}-successor-identity`, entry);
+    }
+    return projection;
+  };
+
+  const shutdownRequestFailures: string[] = [];
+  const recordShutdownFailure = (name: string, pid: number, error: unknown): void => {
+    shutdownRequestFailures.push(
+      `${name}/${pid}: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  };
+  const signalDashboardResidual = (name: string, pid: number): void => {
+    const expectedStart = processStartByPid.get(pid);
+    const currentStart = readSupervisorProcessStartIdentity(pid);
+    if (!currentStart) return;
+    if (!expectedStart || currentStart !== expectedStart) {
+      recordShutdownFailure(name, pid, 'dashboard process generation changed');
+      return;
+    }
+    try { process.kill(pid, 'SIGTERM'); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException)?.code !== 'ESRCH') {
+        recordShutdownFailure(name, pid, error);
+      }
+    }
+  };
+
   try {
-    runPm2(['kill'], true, home, 15_000);
-    return;
-  } catch {
-    // Fall back to direct pid cleanup below.
+    signalAndAwaitFleet(entries, operation, FLEET_DAEMON_EXIT_WAIT_MS, {
+      signal: pid => {
+        const name = processNameByPid.get(pid);
+        if (!name) {
+          throw new Error(`[${operation}] refusing signal for unmapped PM2 daemon pid ${pid}`);
+        }
+        if (isBotmuxDaemonProcessName(name)) {
+          try {
+            const successor = processEntryByPid.get(pid);
+            if (!successor) {
+              recordShutdownFailure(name, pid, 'successor PM2 policy projection is missing');
+              return;
+            }
+            const authorized = assertShutdownCapability(
+              `${operation}-successor-immediately-before-request`,
+              [successor],
+            );
+            const target = authorized.find(entry => entry.pid === pid);
+            if (!target) {
+              recordShutdownFailure(name, pid, 'daemon exited before exact IPC attestation');
+              return;
+            }
+            requestAttestedDaemonShutdown(target, loadDaemonIpcSecret());
+          } catch (error) {
+            recordShutdownFailure(name, pid, error);
+          }
+          return;
+        }
+        signalDashboardResidual(name, pid);
+      },
+      signalInitial: targets => {
+        let authorized;
+        try {
+          authorized = assertShutdownCapability(
+            `${operation}-initial-immediately-before-batch-request`,
+            targets as BotmuxPm2ProcessEntry[],
+          );
+        } catch (error) {
+          for (const target of targets.filter(entry => isBotmuxDaemonProcessName(entry.name))) {
+            recordShutdownFailure(target.name, target.pid, error);
+          }
+          return;
+        }
+        const expectedDaemonTargets = targets
+          .filter(entry => isBotmuxDaemonProcessName(entry.name));
+        const authorizedPids = new Set(authorized.map(entry => entry.pid));
+        for (const target of expectedDaemonTargets) {
+          if (!authorizedPids.has(target.pid)) {
+            recordShutdownFailure(
+              target.name,
+              target.pid,
+              'daemon exited before initial exact IPC attestation',
+            );
+          }
+        }
+        let attempts;
+        try {
+          attempts = requestAttestedDaemonShutdownBatch(authorized, loadDaemonIpcSecret());
+        } catch (error) {
+          attempts = authorized.map(target => ({ target, ok: false, error: String(error) }));
+        }
+        for (const attempt of attempts) {
+          if (!attempt.ok) {
+            recordShutdownFailure(
+              attempt.target.name,
+              attempt.target.pid,
+              attempt.error ?? 'supervisor shutdown request refused',
+            );
+          }
+        }
+        for (const target of targets.filter(entry => !isBotmuxDaemonProcessName(entry.name))) {
+          signalDashboardResidual(target.name, target.pid);
+        }
+      },
+      assertSignalAuthorityComplete: () => {
+        if (shutdownRequestFailures.length > 0) {
+          throw new Error(shutdownRequestFailures.join('; '));
+        }
+      },
+      isAlive: pid => { try { process.kill(pid, 0); return true; } catch { return false; } },
+      now: () => Date.now(),
+      sleep: sleepSyncMs,
+      startOffline: (offlineEntries, timeoutMs) => {
+        runExactPm2Starts(offlineEntries, home, Math.min(10_000, timeoutMs));
+      },
+      list,
+      successorSettleMs: FLEET_SUCCESSOR_SETTLE_MS,
+    });
+  } catch (error) {
+    if (shutdownRequestFailures.length === 0) throw error;
+    throw new Error(
+      `${error instanceof Error ? error.message : String(error)}; `
+      + `shutdown request refusal(s): ${shutdownRequestFailures.join('; ')}`,
+    );
+  }
+}
+
+function rollbackPm2StartAttempt(
+  operation: string,
+  before: BotmuxPm2ProcessEntry[],
+  candidateNames: string[],
+  home: string = PM2_HOME,
+): void {
+  const candidateSet = new Set(candidateNames);
+  reconcileLatePm2StartPublication(
+    operation,
+    PM2_START_LATE_PUBLICATION_SETTLE_MS,
+    FLEET_DAEMON_EXIT_WAIT_MS + PM2_START_LATE_PUBLICATION_SETTLE_MS,
+    {
+      now: () => Date.now(),
+      sleep: sleepSyncMs,
+      reconcileOnce: () => {
+        assertNoDuplicatePm2GodDaemons(home);
+        const fresh = readVerifiedBotmuxPm2Projection(`${operation}-rollback-read`, home);
+        assertNoUnregisteredLiveDaemonDescriptors(`${operation}-rollback-read`, fresh);
+        assertCanonicalUniquePm2Rows(`${operation}-rollback-read`, fresh);
+        const attemptedRows = fresh.filter(entry => candidateSet.has(entry.name));
+
+        for (const row of attemptedRows) {
+          const priorRows = before.filter(entry => entry.name === row.name);
+          if (priorRows.length > 1
+              || (priorRows.length === 1 && priorRows[0]!.pmId !== row.pmId)
+              || (priorRows.length === 1 && isLivePm2Entry(priorRows[0]!))) {
+            throw new Error(
+              `[${operation}] cannot prove ownership of partial-launch row ${row.name}/${row.pmId}`,
+            );
+          }
+        }
+
+        const rowsNeedingCompensation = attemptedRows.filter(row => {
+          const prior = before.find(entry => entry.name === row.name);
+          if (!prior) return true;
+          return isLivePm2Entry(row) || !isFleetEntryProvenFreeOfAutorestartTimer(row);
+        });
+        if (rowsNeedingCompensation.length > 0) {
+          const shutdownRows = rowsNeedingCompensation.map(entry => {
+            if (isLivePm2Entry(entry)) return { ...entry, online: true };
+            if (isFleetEntryProvenFreeOfAutorestartTimer(entry)) return entry;
+            return { ...entry, online: false, status: 'stopped', autorestart: false };
+          });
+          signalAndAwaitBotmuxProcesses(shutdownRows, 'stop', home);
+          for (const original of rowsNeedingCompensation) {
+            const exact = revalidateExactQuiescentRowBeforeMutation(
+              `${operation}-rollback-before-mutation`,
+              original,
+              rowsNeedingCompensation,
+              home,
+            );
+            if (!exact) continue;
+            const existedBefore = before.some(entry =>
+              entry.name === original.name && entry.pmId === original.pmId);
+            runPm2(
+              [existedBefore ? 'stop' : 'delete', String(exact.pmId)],
+              false,
+              home,
+              10_000,
+            );
+          }
+          return false;
+        }
+
+        const restored = candidateNames.every(name => {
+          const prior = before.find(entry => entry.name === name);
+          const rows = attemptedRows.filter(entry => entry.name === name);
+          if (!prior) return rows.length === 0;
+          return rows.length === 1
+            && rows[0]!.pmId === prior.pmId
+            && !isLivePm2Entry(rows[0]!)
+            && isFleetEntryProvenFreeOfAutorestartTimer(rows[0]!);
+        });
+        if (!restored) {
+          throw new Error(`[${operation}] rollback could not prove the pre-start registry shape`);
+        }
+        return true;
+      },
+    },
+  );
+}
+
+function deleteAllBotmuxProcesses(
+  home: string = PM2_HOME,
+  additionalDescriptorAuthority: BotmuxPm2ProcessEntry[] = [],
+): void {
+  assertNoDuplicatePm2GodDaemons(home);
+  let entries: BotmuxPm2ProcessEntry[];
+  try {
+    entries = parsePm2JlistOutputStrict(pm2Capture(['jlist'], home))
+      .filter(a => a && isBotmuxCoreProcessName(String(a.name)))
+      .map(toBotmuxPm2ProcessEntry);
+  } catch (e) {
+    throw new Error(
+      `[restart] pm2 jlist failed; refusing to start a second fleet without a safe shutdown view: `
+      + `${e instanceof Error ? e.message : e}`,
+    );
+  }
+  assertNoUnregisteredLiveDaemonDescriptors(
+    'restart',
+    [...entries, ...additionalDescriptorAuthority],
+  );
+  assertCanonicalUniquePm2Rows('restart', entries);
+  if (entries.length === 0) return;
+  const names = entries.map(e => e.name);
+
+  signalAndAwaitBotmuxProcesses(entries, 'restart', home, additionalDescriptorAuthority);
+
+  const deleteErrors: string[] = [];
+  for (const entry of entries) {
+    try {
+      const exact = revalidateExactQuiescentRowBeforeMutation(
+        'restart-before-delete',
+        entry,
+        entries,
+        home,
+        additionalDescriptorAuthority,
+      );
+      if (!exact) continue;
+      runPm2(['delete', String(exact.pmId)], false, home, 10_000);
+    } catch (e) {
+      const message = e instanceof Error ? e.message : String(e);
+      deleteErrors.push(`${entry.name}: ${message}`);
+      console.error(`[restart] pm2 delete ${entry.name}/${entry.pmId} failed: ${message}`);
+    }
   }
 
-  for (const pid of listPm2GodDaemonPids(home)) {
-    try { process.kill(pid, 'SIGTERM'); } catch { /* already gone */ }
+  let remaining: string[];
+  try {
+    const targetNames = new Set(names);
+    const freshProjection = parsePm2JlistOutputStrict(pm2Capture(['jlist'], home))
+      .filter(app => app && isBotmuxCoreProcessName(String(app.name)))
+      .map(toBotmuxPm2ProcessEntry);
+    assertNoUnregisteredLiveDaemonDescriptors(
+      'restart-after-delete',
+      [...freshProjection, ...additionalDescriptorAuthority],
+    );
+    exactQuiescentRowsForMutation('restart-after-delete', entries, freshProjection);
+    remaining = freshProjection
+      .filter(entry => targetNames.has(entry.name))
+      .map(entry => entry.name);
+  } catch (err) {
+    throw new Error(
+      `[restart] PM2 delete verification failed; refusing to report a clean fleet: `
+      + `${err instanceof Error ? err.message : String(err)}`,
+    );
   }
-  for (const pid of listPm2GodDaemonPids(home)) {
-    try { process.kill(pid, 0); process.kill(pid, 'SIGKILL'); } catch { /* already gone */ }
+  if (remaining.length > 0) {
+    throw new Error(
+      `[restart] PM2 delete left registry entries: ${[...new Set(remaining)].join(', ')}`
+      + (deleteErrors.length > 0 ? ` (${deleteErrors.join('; ')})` : ''),
+    );
+  }
+}
+
+/**
+ * Explicit first-upgrade escape hatch for a live fleet that predates the
+ * authenticated shutdown protocol. This intentionally bypasses descriptor
+ * capability attestation, but only behind a named flag plus --yes. Every PM2
+ * delete is still bound to the exact name + pm_id + PID + process birth read
+ * before the first mutation and revalidated immediately before that mutation.
+ */
+function bootstrapDeleteAllBotmuxProcesses(
+  operation: 'stop' | 'restart',
+  home: string = PM2_HOME,
+): void {
+  assertNoDuplicatePm2GodDaemons(home);
+  const readProjection = (phase: string): BotmuxPm2ProcessEntry[] => {
+    const apps = parsePm2JlistOutputStrict(pm2Capture(['jlist'], home));
+    const projection = (Array.isArray(apps) ? apps : [])
+      .filter(app => app && isBotmuxCoreProcessName(String(app.name)))
+      .map(toBotmuxPm2ProcessEntry);
+    assertCanonicalUniquePm2Rows(`${operation}-bootstrap-${phase}`, projection);
+    return projection;
+  };
+
+  const entries = readProjection('initial');
+  const identities = new Map<number, string>();
+  for (const entry of entries) {
+    if (!Number.isInteger(entry.pmId)) {
+      throw new Error(
+        `[${operation}] bootstrap refused: ${entry.name} has no canonical PM2 id`,
+      );
+    }
+    if (entry.pid > 1 && isLivePm2Entry(entry)) {
+      const identity = readSupervisorProcessStartIdentity(entry.pid);
+      if (!identity) {
+        throw new Error(
+          `[${operation}] bootstrap refused: cannot bind ${entry.name}/${entry.pid} to a process birth`,
+        );
+      }
+      identities.set(entry.pmId!, identity);
+    }
+  }
+
+  for (const original of entries) {
+    const fresh = readProjection(`before-delete-${original.pmId}`);
+    const exact = fresh.filter(entry => entry.pmId === original.pmId);
+    if (exact.length !== 1 || exact[0]!.name !== original.name) {
+      throw new Error(
+        `[${operation}] bootstrap refused: PM2 row ${original.name}/${original.pmId} changed before delete`,
+      );
+    }
+    const current = exact[0]!;
+    const expectedBirth = identities.get(original.pmId!);
+    if (expectedBirth) {
+      const currentBirth = current.pid > 1
+        ? readSupervisorProcessStartIdentity(current.pid)
+        : undefined;
+      if (current.pid !== original.pid
+          || !isLivePm2Entry(current)
+          || currentBirth !== expectedBirth) {
+        throw new Error(
+          `[${operation}] bootstrap refused: process generation changed for `
+          + `${original.name}/${original.pmId}`,
+        );
+      }
+    } else if (isLivePm2Entry(current)) {
+      throw new Error(
+        `[${operation}] bootstrap refused: dormant PM2 row ${original.name}/${original.pmId} became live`,
+      );
+    }
+    runPm2(
+      ['delete', String(current.pmId)],
+      false,
+      home,
+      FLEET_DAEMON_EXIT_WAIT_MS,
+    );
+  }
+
+  const remaining = readProjection('after-delete');
+  if (remaining.length > 0) {
+    throw new Error(
+      `[${operation}] bootstrap retirement incomplete: `
+      + remaining.map(entry => `${entry.name}/${entry.pmId}`).join(', '),
+    );
   }
 }
 
@@ -2655,40 +3437,116 @@ function killPm2GodDaemon(home: string = PM2_HOME): void {
  * truth. Only touches processes named `botmux` or `botmux-*` — the user's
  * unrelated pm2 apps are left untouched. No-op on fresh installs.
  */
-function cleanupLegacyPm2(): boolean {
+function cleanupLegacyPm2(
+  bootstrapOperation?: 'stop' | 'restart',
+): boolean {
   const legacyHome = join(homedir(), '.pm2');
   if (legacyHome === PM2_HOME) return false;
-  const legacyPidFile = join(legacyHome, 'pm2.pid');
-  if (!existsSync(legacyPidFile)) return false;
-
-  let legacyPid = 0;
-  try { legacyPid = parseInt(readFileSync(legacyPidFile, 'utf-8').trim(), 10); } catch { return false; }
-  if (!legacyPid) return false;
-  // If the legacy daemon isn't alive anymore there's nothing to clean.
-  try { process.kill(legacyPid, 0); } catch { return false; }
-
-  deleteAllBotmuxProcesses(legacyHome);
+  const legacyGodPids = listPm2GodDaemonPids(legacyHome);
+  if (legacyGodPids.length === 0) return false;
+  assertNoDuplicatePm2GodDaemons(legacyHome);
+  preflightNodeSanity(legacyHome);
+  assertNoDuplicatePm2GodDaemons(legacyHome);
+  if (bootstrapOperation) bootstrapDeleteAllBotmuxProcesses(bootstrapOperation, legacyHome);
+  else {
+    const currentProjection = readVerifiedBotmuxPm2Projection('legacy-cleanup-authority');
+    deleteAllBotmuxProcesses(legacyHome, currentProjection);
+  }
   return true;
 }
 
 async function cmdStop(): Promise<void> {
   const includePluginServices = process.argv.includes('--with-plugin');
-  killDuplicatePm2GodDaemons();
-  cleanupLegacyPm2();
-  let stopped = false;
-  try {
-    const output = pm2Capture(['jlist']);
-    const apps = parsePm2JlistOutput(output);
-    for (const app of apps) {
-      if (isBotmuxCoreProcessName(String(app.name))) {
-        try { runPm2(['stop', app.name]); stopped = true; } catch { /* */ }
+  const bootstrapShutdownProtocol = process.argv.includes('--bootstrap-shutdown-protocol');
+  const bootstrapConfirmed = process.argv.includes('--yes');
+  if (bootstrapShutdownProtocol && !bootstrapConfirmed) {
+    throw new Error(
+      '[stop] --bootstrap-shutdown-protocol requires --yes after confirming every Session/Riff workload is idle',
+    );
+  }
+  ensureConfigDir();
+  await withFileLock(PM2_FLEET_MUTATION_LOCK_TARGET, async () => {
+    assertNoDuplicatePm2GodDaemons();
+    cleanupLegacyPm2(bootstrapShutdownProtocol ? 'stop' : undefined);
+    if (bootstrapShutdownProtocol) {
+      bootstrapDeleteAllBotmuxProcesses('stop');
+      cleanupStaleDaemonDescriptors();
+      if (includePluginServices) {
+        await stopPluginServicesForCli(undefined, { autoOnly: true });
+      }
+      console.log('daemon 已通过一次性 shutdown-protocol bootstrap 安全边界停止。');
+      return;
+    }
+    let entries: BotmuxPm2ProcessEntry[];
+    try {
+      entries = parsePm2JlistOutputStrict(pm2Capture(['jlist']))
+        .filter(app => app && isBotmuxCoreProcessName(String(app.name)))
+        .map(toBotmuxPm2ProcessEntry);
+    } catch (err) {
+      throw new Error(
+        `[stop] pm2 jlist failed; refusing an unverified stop: `
+        + `${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+    assertNoUnregisteredLiveDaemonDescriptors('stop', entries);
+    assertCanonicalUniquePm2Rows('stop', entries);
+    if (entries.length === 0) {
+      cleanupStaleDaemonDescriptors();
+      if (includePluginServices) {
+        await stopPluginServicesForCli(undefined, { autoOnly: true });
+      }
+      console.log('daemon 未在运行。');
+      return;
+    }
+    signalAndAwaitBotmuxProcesses(entries, 'stop');
+    const beforeStop = readVerifiedBotmuxPm2Projection('stop-before-registry-mutation');
+    assertNoUnregisteredLiveDaemonDescriptors('stop-before-registry-mutation', beforeStop);
+    exactQuiescentRowsForMutation('stop-before-registry-mutation', entries, beforeStop);
+
+    const stopErrors: string[] = [];
+    for (const entry of entries) {
+      try {
+        const exact = revalidateExactQuiescentRowBeforeMutation(
+          'stop-immediately-before-registry-mutation',
+          entry,
+          entries,
+        );
+        if (!exact) continue;
+        runPm2(['stop', String(exact.pmId)], false, PM2_HOME, 10_000);
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        stopErrors.push(`${entry.name}: ${message}`);
+        console.error(`[stop] pm2 stop ${entry.name} failed: ${message}`);
       }
     }
-  } catch { /* */ }
-  // Wipe abandoned dashboard-daemon descriptors left behind by stopped daemons.
-  cleanupStaleDaemonDescriptors();
-  if (includePluginServices) await stopPluginServicesForCli(undefined, { autoOnly: true });
-  if (!stopped) console.log('daemon 未在运行。');
+    let nonStoppedResidual: string[];
+    try {
+      const targetNames = new Set(entries.map(entry => entry.name));
+      const freshProjection = parsePm2JlistOutputStrict(pm2Capture(['jlist']))
+        .filter(app => app && isBotmuxCoreProcessName(String(app.name)))
+        .map(toBotmuxPm2ProcessEntry);
+      assertNoUnregisteredLiveDaemonDescriptors('stop-after-registry-mutation', freshProjection);
+      exactQuiescentRowsForMutation('stop-after-registry-mutation', entries, freshProjection);
+      nonStoppedResidual = freshProjection
+        .filter(entry => targetNames.has(entry.name) && entry.status !== 'stopped')
+        .map(entry => `${entry.name}:${entry.status ?? 'unknown'}`);
+    } catch (err) {
+      throw new Error(
+        `[stop] PM2 stop verification failed: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+    if (stopErrors.length > 0 || nonStoppedResidual.length > 0) {
+      throw new Error(
+        `[stop] PM2 registry mutation incomplete`
+        + (nonStoppedResidual.length > 0
+          ? ` (not stopped: ${[...new Set(nonStoppedResidual)].join(', ')})`
+          : '')
+        + (stopErrors.length > 0 ? ` (errors: ${stopErrors.join('; ')})` : ''),
+      );
+    }
+    cleanupStaleDaemonDescriptors();
+    if (includePluginServices) await stopPluginServicesForCli(undefined, { autoOnly: true });
+  }, { maxWaitMs: 5_000 });
 }
 
 async function cmdRestart(): Promise<void> {
@@ -2710,39 +3568,112 @@ async function cmdRestart(): Promise<void> {
     process.exit(1);
   }
   ensureConfigDir();
-  const includePm2 = process.argv.includes('--include-pm2');
-  const includePluginServices = process.argv.includes('--with-plugin');
-  // Drop a restart-intent breadcrumb so the fresh daemon knows this was an
-  // intentional restart and DMs the owner a summary. `IfAbsent` preserves a
-  // richer breadcrumb (update / auto-restart) already written by the
-  // maintenance timer that spawned this very `botmux restart`. A pm2
-  // crash-autorestart bypasses this path → no breadcrumb → silent.
-  try {
-    const now = Date.now();
-    writeManualIntentIfAbsentTo(resolveDataDir(), now, new Date(now).toISOString());
-  } catch { /* breadcrumb is best-effort */ }
-  killDuplicatePm2GodDaemons();
-  preflightNodeSanity();
-  await ensureSystemDependencies();
-  const cfg = ecosystemConfig();
-  cleanupLegacyPm2();
-  // Delete all botmux processes (handles both old single-process and new multi-process)
-  deleteAllBotmuxProcesses();
-  if (includePluginServices) await stopPluginServicesForCli(undefined, { autoOnly: true });
-  if (includePm2) {
-    killPm2GodDaemon();
-  }
-  // Wipe abandoned dashboard-daemon descriptors left behind by killed daemons.
-  cleanupStaleDaemonDescriptors();
-  runPm2(['start', cfg]);
-  // Default restart preserves running plugin services, then ensures every auto
-  // service is online. --with-plugin changes only the pre-restart side above:
-  // it explicitly stops auto services first, so this ensure becomes a restart.
-  await reconcilePluginServicesForCli(undefined, { autoOnly: true });
-  if (refreshAutostart({ pkgRoot: PKG_ROOT, configDir: CONFIG_DIR, logDir: LOG_DIR })) {
-    console.log(`autostart unit 已同步到当前 Node/cli.js 路径`);
-  }
-  await printDashboardHintWithRetry();
+  await withFileLock(PM2_FLEET_MUTATION_LOCK_TARGET, async () => {
+    const includePm2 = process.argv.includes('--include-pm2');
+    const includePluginServices = process.argv.includes('--with-plugin');
+    const bootstrapShutdownProtocol = process.argv.includes('--bootstrap-shutdown-protocol');
+    const bootstrapConfirmed = process.argv.includes('--yes');
+    if (bootstrapShutdownProtocol && !bootstrapConfirmed) {
+      throw new Error(
+        '[restart] --bootstrap-shutdown-protocol requires --yes after confirming every Session/Riff workload is idle',
+      );
+    }
+    if (bootstrapShutdownProtocol && includePm2) {
+      throw new Error('[restart] --bootstrap-shutdown-protocol cannot be combined with --include-pm2');
+    }
+    if (includePm2) {
+      assertIncludePm2RestartAdmission(listPm2GodDaemonPids());
+    }
+
+    const restartIntentDir = resolveDataDir();
+    let stagedRestartIntent: RestartIntent | null = null;
+    try {
+      stagedRestartIntent = consumeRestartIntentTo(restartIntentDir, Date.now());
+    } catch { /* intent reporting is best-effort */ }
+
+    assertNoDuplicatePm2GodDaemons();
+    preflightNodeSanity();
+    await ensureSystemDependencies();
+    cleanupLegacyPm2(bootstrapShutdownProtocol ? 'restart' : undefined);
+    if (bootstrapShutdownProtocol) bootstrapDeleteAllBotmuxProcesses('restart');
+    else deleteAllBotmuxProcesses();
+    if (includePluginServices) await stopPluginServicesForCli(undefined, { autoOnly: true });
+    cleanupStaleDaemonDescriptors();
+
+    const retiredProjection = readVerifiedBotmuxPm2Projection('restart-start');
+    assertNoUnregisteredLiveDaemonDescriptors('restart-start', retiredProjection);
+    if (retiredProjection.length > 0) {
+      throw new Error(
+        `[restart-start] new PM2 core row(s) appeared after verified retirement: `
+        + retiredProjection.map(entry => `${entry.name}:${entry.pid}`).join(', '),
+      );
+    }
+
+    await withFileLock(BOTS_JSON_FILE, async () => {
+      const restartBots = loadBotsJson();
+      const cfg = ecosystemConfig(restartBots);
+      const restartAttemptId = randomBytes(16).toString('hex');
+      let restartIntentPrepared = false;
+      try {
+        const now = Date.now();
+        writeRestartAttemptIntentTo(
+          restartIntentDir,
+          stagedRestartIntent ?? { kind: 'manual', at: new Date(now).toISOString() },
+          now,
+          restartAttemptId,
+        );
+        restartIntentPrepared = true;
+      } catch { /* breadcrumb is best-effort */ }
+
+      try {
+        const configuredNames = configuredCoreProcessNames(restartBots);
+        const verifyTimeoutMs = pm2StartVerifyTimeoutMs(configuredNames.length);
+        runBoundedPm2StartTransaction(
+          'restart-start',
+          PM2_START_COMMAND_TIMEOUT_MS,
+          verifyTimeoutMs,
+          {
+            start: timeoutMs => {
+              assertBotsConfigSnapshotUnchanged('restart-start', restartBots);
+              assertNoDuplicatePm2GodDaemons();
+              preflightNodeSanity();
+              runPm2(['start', cfg], true, PM2_HOME, timeoutMs);
+            },
+            verifyFresh: timeoutMs => readAndAssertConfiguredFleetOnline(
+              'restart-after-launch', configuredNames, PM2_HOME, timeoutMs,
+            ),
+            rollback: () => rollbackPm2StartAttempt(
+              'restart-start', retiredProjection, configuredNames,
+            ),
+          },
+        );
+      } catch (err) {
+        try {
+          removeRestartIntentAttemptTo(restartIntentDir, restartAttemptId);
+        } catch { /* best-effort */ }
+        throw err;
+      }
+
+      if (restartIntentPrepared) {
+        let committed = false;
+        try {
+          committed = commitRestartIntentAttemptTo(restartIntentDir, restartAttemptId);
+        } catch { /* best-effort after verified healthy fleet */ }
+        if (!committed) {
+          try {
+            removeRestartIntentAttemptTo(restartIntentDir, restartAttemptId);
+          } catch { /* best-effort */ }
+          console.warn('⚠️  daemon 已完整启动，但重启摘要凭据未能提交；本次不会发送重启摘要。');
+        }
+      }
+    }, { maxWaitMs: 5_000 });
+
+    await reconcilePluginServicesForCli(undefined, { autoOnly: true });
+    if (refreshAutostart({ pkgRoot: PKG_ROOT, configDir: CONFIG_DIR, logDir: LOG_DIR })) {
+      console.log(`autostart unit 已同步到当前 Node/cli.js 路径`);
+    }
+    await printDashboardHintWithRetry();
+  }, { maxWaitMs: 5_000 });
 }
 
 /** Observe botmux PM2 rows. Unknown state is never represented as absence. */
@@ -2758,34 +3689,78 @@ export type StopBotLiveResult =
   | { ok: true; state: 'stopped' | 'already-stopped'; processName: string }
   | { ok: false; reason: 'not_found' | 'pm2_error'; message: string };
 
-function ensureBotDaemonStopped(appId: string, opts: { quiet?: boolean } = {}): StopBotLiveResult {
-  const bots = loadBotsJson();
-  const index = bots.findIndex(b => b?.larkAppId === appId);
-  if (index < 0) {
-    return { ok: false, reason: 'not_found', message: `appId ${appId} 不在 bots.json 中` };
+function retireExactBotmuxProcess(
+  operation: string,
+  target: BotmuxPm2ProcessEntry,
+  fullProjection: BotmuxPm2ProcessEntry[],
+): void {
+  const peers = fullProjection.filter(entry => entry.name !== target.name);
+  signalAndAwaitBotmuxProcesses([target], 'stop', PM2_HOME, peers);
+  const exact = revalidateExactQuiescentRowBeforeMutation(
+    `${operation}-before-delete`,
+    target,
+    [target],
+    PM2_HOME,
+    peers,
+  );
+  if (exact) {
+    runPm2(['delete', String(exact.pmId)], false, PM2_HOME, 10_000);
   }
-  const processName = botProcessName(bots[index], index, PM2_NAME);
-  const running = listBotmuxPm2Apps();
-  if (!running.ok) {
-    return { ok: false, reason: 'pm2_error', message: running.message };
+  const fresh = readVerifiedBotmuxPm2Projection(`${operation}-after-delete`);
+  assertNoUnregisteredLiveDaemonDescriptors(`${operation}-after-delete`, fresh);
+  if (fresh.some(entry => entry.name === target.name)) {
+    throw new Error(`[${operation}] PM2 row ${target.name} is still present after exact delete`);
   }
-  const named = running.apps.filter(app => app.name === processName);
-  if (named.length > 0 && !named.some(app => isExactPm2BotActivationReceipt(app, processName, index, appId))) {
+}
+
+async function ensureBotDaemonStopped(
+  appId: string,
+  _opts: { quiet?: boolean } = {},
+): Promise<StopBotLiveResult> {
+  ensureConfigDir();
+  try {
+    return await withFileLock(PM2_FLEET_MUTATION_LOCK_TARGET, async () => (
+      withFileLock(BOTS_JSON_FILE, async () => {
+        assertNoDuplicatePm2GodDaemons();
+        preflightNodeSanity();
+        cleanupLegacyPm2();
+        const bots = loadBotsJson();
+        const index = bots.findIndex(b => b?.larkAppId === appId);
+        if (index < 0) {
+          return { ok: false, reason: 'not_found', message: `appId ${appId} 不在 bots.json 中` };
+        }
+        const processName = botProcessName(bots[index], index, PM2_NAME);
+        const inspection = listBotmuxPm2Apps();
+        if (!inspection.ok) {
+          return { ok: false, reason: 'pm2_error', message: inspection.message };
+        }
+        const named = inspection.apps.filter(app => app.name === processName);
+        if (named.length > 0 && !named.every(app =>
+          isExactPm2BotActivationReceipt(app, processName, index, appId))) {
+          return {
+            ok: false,
+            reason: 'pm2_error',
+            message: `pm2 process ${processName} does not match bots.json slot ${index} / ${appId}`,
+          };
+        }
+        const projection = readVerifiedBotmuxPm2Projection('stop-bot');
+        assertNoUnregisteredLiveDaemonDescriptors('stop-bot', projection);
+        assertCanonicalUniquePm2Rows('stop-bot', projection);
+        const target = projection.find(entry => entry.name === processName);
+        if (!target) {
+          return { ok: true, state: 'already-stopped', processName };
+        }
+        retireExactBotmuxProcess('stop-bot', target, projection);
+        return { ok: true, state: 'stopped', processName };
+      }, { maxWaitMs: 5_000 })
+    ), { maxWaitMs: 5_000 });
+  } catch (err) {
     return {
       ok: false,
       reason: 'pm2_error',
-      message: `pm2 process ${processName} does not match bots.json slot ${index} / ${appId}`,
+      message: err instanceof Error ? err.message : String(err),
     };
   }
-  return stopExactPm2Process(
-    processName,
-    listBotmuxPm2Apps,
-    exactName => {
-      // Delete only this exact PM2 entry. The later start-bot command recreates
-      // it from the current ecosystem config after activation is acknowledged.
-      runPm2(['delete', exactName], !opts.quiet);
-    },
-  );
 }
 
 /**
@@ -2807,115 +3782,184 @@ function ensureBotDaemonStopped(appId: string, opts: { quiet?: boolean } = {}): 
  * NOT start a lone bot; that case belongs to `botmux start`, which brings up the
  * entire ecosystem (all bots + dashboard).
  */
-function ensureBotDaemonStarted(appId: string, opts: { quiet?: boolean } = {}): StartBotLiveResult {
-  const bots = loadBotsJson();
-  const index = bots.findIndex(b => b?.larkAppId === appId);
-  if (index < 0) {
-    return { ok: false, reason: 'not_found', message: `appId ${appId} 不在 bots.json 中` };
-  }
-  const bot = bots[index];
-  if (bot?.activationPending === true) {
-    return { ok: false, reason: 'not_ready', message: `appId ${appId} is still activation pending` };
-  }
-  const activationStarting = bot?.activationStarting;
-  const activationCommitted = bot?.activationCommitted;
-  const activationDeactivating = bot?.activationDeactivating;
-  if (activationDeactivating !== undefined) {
-    return { ok: false, reason: 'not_ready', message: `appId ${appId} is still deactivating` };
-  }
-  if (activationStarting !== undefined && activationCommitted !== undefined) {
-    return { ok: false, reason: 'not_ready', message: `appId ${appId} has conflicting activation markers` };
-  }
-  const activationMarker = activationStarting ?? activationCommitted;
-  const activationJobId = (
-    activationMarker
-    && typeof activationMarker === 'object'
-    && !Array.isArray(activationMarker)
-    && activationMarker.appId === appId
-    && typeof activationMarker.jobId === 'string'
-    && activationMarker.jobId
-  )
-    ? activationMarker.jobId
-    : undefined;
-  if (activationMarker !== undefined && !activationJobId) {
-    return { ok: false, reason: 'not_ready', message: `appId ${appId} has an invalid activation marker` };
-  }
-  const processName = botProcessName(bot, index, PM2_NAME);
-
-  const running = listBotmuxPm2Apps();
-  if (!running.ok) {
-    return { ok: false, reason: 'pm2_error', message: running.message };
-  }
-  if (running.apps.length === 0) {
-    return { ok: false, reason: 'fleet_down', message: 'daemon 未在运行，请先 botmux start' };
-  }
-  const named = running.apps.filter(app => app.name === processName);
-  if (!activationJobId && named.some(app => (
-    isExactPm2BotActivationReceipt(app, processName, index, appId) && app.online
-  ))) {
-    return { ok: true, state: 'already-online', processName };
-  }
-  if (activationJobId && named.length > 0) {
-    const disposition = managedActivationPm2Disposition(
-      named,
-      processName,
-      index,
-      appId,
-      activationJobId,
-    );
-    if (disposition === 'acknowledged') {
-      return { ok: true, state: 'already-online', processName };
-    }
-    if (disposition === 'identity_mismatch') {
-      return {
-        ok: false,
-        reason: 'pm2_error',
-        message: `pm2 process ${processName} does not match bots.json slot ${index} / ${appId}`,
-      };
-    }
-  } else if (named.length > 0) {
-    return {
-      ok: false,
-      reason: 'pm2_error',
-      message: `pm2 process ${processName} does not match bots.json slot ${index} / ${appId}`,
-    };
-  }
-  if (activationJobId && named.length > 0) {
-    // A same App/index process without this durable receipt can be an old
-    // daemon already consuming Feishu traffic. Delete it and prove absence
-    // before the gated activation daemon is allowed to become the PM2 ACK.
-    const stopped = stopExactPm2Process(
-      processName,
-      listBotmuxPm2Apps,
-      exactName => runPm2(['delete', exactName], !opts.quiet),
-    );
-    if (!stopped.ok) {
-      return { ok: false, reason: 'pm2_error', message: stopped.message };
-    }
-  }
-
-  const cfg = ecosystemConfig(appId);
+async function ensureBotDaemonStarted(
+  appId: string,
+  opts: { quiet?: boolean } = {},
+): Promise<StartBotLiveResult> {
+  ensureConfigDir();
   try {
-    // `--only <name>` filters the ecosystem to just this app, so pm2 starts only
-    // the new bot's daemon and never restarts the already-online ones.
-    runPm2(['start', cfg, '--only', processName], !opts.quiet);
-  } catch (e) {
-    return { ok: false, reason: 'pm2_error', message: e instanceof Error ? e.message : String(e) };
-  }
-  const acknowledged = listBotmuxPm2Apps();
-  if (!acknowledged.ok) {
-    return { ok: false, reason: 'pm2_error', message: acknowledged.message };
-  }
-  if (!acknowledged.apps.some(app => (
-    isExactPm2BotActivationReceipt(app, processName, index, appId, activationJobId) && app.online
-  ))) {
+    return await withFileLock(PM2_FLEET_MUTATION_LOCK_TARGET, async () => (
+      withFileLock(BOTS_JSON_FILE, async () => {
+        assertNoDuplicatePm2GodDaemons();
+        preflightNodeSanity();
+        cleanupLegacyPm2();
+        const bots = loadBotsJson();
+        const index = bots.findIndex(b => b?.larkAppId === appId);
+        if (index < 0) {
+          return { ok: false, reason: 'not_found', message: `appId ${appId} 不在 bots.json 中` };
+        }
+        const bot = bots[index];
+        if (bot?.activationPending === true) {
+          return { ok: false, reason: 'not_ready', message: `appId ${appId} is still activation pending` };
+        }
+        const activationStarting = bot?.activationStarting;
+        const activationCommitted = bot?.activationCommitted;
+        const activationDeactivating = bot?.activationDeactivating;
+        if (activationDeactivating !== undefined) {
+          return { ok: false, reason: 'not_ready', message: `appId ${appId} is still deactivating` };
+        }
+        if (activationStarting !== undefined && activationCommitted !== undefined) {
+          return { ok: false, reason: 'not_ready', message: `appId ${appId} has conflicting activation markers` };
+        }
+        const activationMarker = activationStarting ?? activationCommitted;
+        const activationJobId = (
+          activationMarker
+          && typeof activationMarker === 'object'
+          && !Array.isArray(activationMarker)
+          && activationMarker.appId === appId
+          && typeof activationMarker.jobId === 'string'
+          && activationMarker.jobId
+        )
+          ? String(activationMarker.jobId)
+          : undefined;
+        if (activationMarker !== undefined && !activationJobId) {
+          return { ok: false, reason: 'not_ready', message: `appId ${appId} has an invalid activation marker` };
+        }
+
+        const processName = botProcessName(bot, index, PM2_NAME);
+        const configuredNames = configuredCoreProcessNames(
+          bots,
+          activationJobId ? appId : undefined,
+        );
+        const verifyTimeoutMs = pm2StartVerifyTimeoutMs(configuredNames.length);
+        const inspection = listBotmuxPm2Apps();
+        if (!inspection.ok) {
+          return { ok: false, reason: 'pm2_error', message: inspection.message };
+        }
+        let projection = readVerifiedBotmuxPm2Projection('start-bot');
+        assertNoUnregisteredLiveDaemonDescriptors('start-bot', projection);
+        assertCanonicalUniquePm2Rows('start-bot', projection);
+
+        const namedInspection = inspection.apps.filter(app => app.name === processName);
+        if (activationJobId && namedInspection.length > 0) {
+          const disposition = managedActivationPm2Disposition(
+            namedInspection,
+            processName,
+            index,
+            appId,
+            activationJobId,
+          );
+          if (disposition === 'identity_mismatch') {
+            return {
+              ok: false,
+              reason: 'pm2_error',
+              message: `pm2 process ${processName} does not match bots.json slot ${index} / ${appId}`,
+            };
+          }
+          if (disposition === 'acknowledged') {
+            readAndAssertConfiguredFleetOnline(
+              'start-bot-already-online-ready',
+              configuredNames,
+              PM2_HOME,
+              verifyTimeoutMs,
+            );
+            return { ok: true, state: 'already-online', processName };
+          }
+          const target = projection.find(entry => entry.name === processName);
+          if (!target) {
+            throw new Error(`[start-bot] PM2 identity view disagrees about ${processName}`);
+          }
+          retireExactBotmuxProcess('start-bot-replace', target, projection);
+          projection = readVerifiedBotmuxPm2Projection('start-bot-after-replace');
+        } else if (namedInspection.length > 0) {
+          if (!namedInspection.every(app =>
+            isExactPm2BotActivationReceipt(app, processName, index, appId))) {
+            return {
+              ok: false,
+              reason: 'pm2_error',
+              message: `pm2 process ${processName} does not match bots.json slot ${index} / ${appId}`,
+            };
+          }
+        }
+
+        const admission = classifyStartBotFleetAdmission(
+          'start-bot',
+          projection,
+          configuredNames,
+          processName,
+          pid => { try { process.kill(pid, 0); return true; } catch { return false; } },
+        );
+        if (admission.state === 'already-online') {
+          readAndAssertConfiguredFleetOnline(
+            'start-bot-already-online-ready',
+            configuredNames,
+            PM2_HOME,
+            verifyTimeoutMs,
+          );
+          return { ok: true, state: 'already-online', processName };
+        }
+        if (admission.state === 'fleet-down') {
+          return { ok: false, reason: 'fleet_down', message: 'daemon 未在运行，请先 botmux start' };
+        }
+
+        const beforeStart = projection;
+        const cfg = ecosystemConfig(bots, activationJobId ? appId : undefined);
+        runBoundedPm2StartTransaction(
+          'start-bot',
+          PM2_START_COMMAND_TIMEOUT_MS,
+          verifyTimeoutMs,
+          {
+            start: timeoutMs => {
+              assertBotsConfigSnapshotUnchanged('start-bot', bots);
+              assertNoDuplicatePm2GodDaemons();
+              preflightNodeSanity();
+              runPm2(
+                ['start', cfg, '--only', processName],
+                !opts.quiet,
+                PM2_HOME,
+                timeoutMs,
+              );
+            },
+            verifyFresh: timeoutMs => {
+              const fresh = readAndAssertConfiguredFleetOnline(
+                'start-bot-after-launch',
+                configuredNames,
+                PM2_HOME,
+                timeoutMs,
+              );
+              const acknowledged = listBotmuxPm2Apps();
+              if (!acknowledged.ok || !acknowledged.apps.some(app => (
+                isExactPm2BotActivationReceipt(
+                  app,
+                  processName,
+                  index,
+                  appId,
+                  activationJobId,
+                ) && app.online
+              ))) {
+                throw new Error(
+                  `pm2 start did not acknowledge ${processName} at bots.json slot ${index} / ${appId}`,
+                );
+              }
+              return fresh;
+            },
+            rollback: () => rollbackPm2StartAttempt(
+              'start-bot',
+              beforeStart,
+              [processName],
+            ),
+          },
+        );
+        return { ok: true, state: 'started', processName };
+      }, { maxWaitMs: 5_000 })
+    ), { maxWaitMs: 5_000 });
+  } catch (err) {
     return {
       ok: false,
       reason: 'pm2_error',
-      message: `pm2 start did not acknowledge ${processName} at bots.json slot ${index} / ${appId}`,
+      message: err instanceof Error ? err.message : String(err),
     };
   }
-  return { ok: true, state: 'started', processName };
 }
 
 /**
@@ -2934,7 +3978,7 @@ async function cmdStartBot(argv: string[]): Promise<void> {
     process.exit(1);
   }
   ensureConfigDir();
-  const r = ensureBotDaemonStarted(appId, { quiet: wantsJson });
+  const r = await ensureBotDaemonStarted(appId, { quiet: wantsJson });
   if (wantsJson) {
     console.log(JSON.stringify(r, null, 2));
     if (!r.ok) process.exitCode = 1;
@@ -2964,7 +4008,7 @@ async function cmdStopBot(argv: string[]): Promise<void> {
     process.exit(1);
   }
   ensureConfigDir();
-  const r = ensureBotDaemonStopped(appId, { quiet: wantsJson });
+  const r = await ensureBotDaemonStopped(appId, { quiet: wantsJson });
   if (wantsJson) {
     console.log(JSON.stringify(r, null, 2));
     if (!r.ok) process.exitCode = 1;
@@ -2983,8 +4027,8 @@ async function cmdStopBot(argv: string[]): Promise<void> {
 /** Print the post-add "next step" line for interactive setup: auto-start the new
  *  bot's own daemon when the fleet is up (no fleet-wide restart), else fall back
  *  to the botmux start / restart hint. */
-function printAddBotLiveHint(appId: string): void {
-  const live = ensureBotDaemonStarted(appId);
+async function printAddBotLiveHint(appId: string): Promise<void> {
+  const live = await ensureBotDaemonStarted(appId);
   if (live.ok) {
     console.log(`✅ 已自动上线（${live.processName}），无需重启其它机器人。\n`);
   } else if (live.reason === 'fleet_down') {
@@ -3061,7 +4105,6 @@ function warnIfLegacyBotmuxAlive(): void {
 }
 
 function cmdLogs(): void {
-  killDuplicatePm2GodDaemons();
   warnIfLegacyBotmuxAlive();
   const lines = process.argv.includes('--lines')
     ? process.argv[process.argv.indexOf('--lines') + 1] || '50'
@@ -3103,7 +4146,6 @@ function cmdLogs(): void {
 }
 
 function cmdStatus(): void {
-  killDuplicatePm2GodDaemons();
   warnIfLegacyBotmuxAlive();
   runPm2(['status']);
 }
@@ -5766,7 +6808,10 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
               默认使用 botmux 内置 Feishu Web QR 登录尝试自动导入权限/redirect/发布版本；可加 --no-open-platform-auto 跳过
   start       启动 daemon，并启动 mode=auto 的插件 service
   stop        停止 daemon（默认不停止插件 service；--with-plugin 显式停止 mode=auto 的插件 service）
-  restart     重启 daemon（默认不停止插件 service，core 启动后确保 mode=auto 正在运行；--with-plugin 显式先停再启动 auto service；--include-pm2 同时重启 PM2 God）
+  restart     重启 daemon（默认不停止插件 service，core 启动后确保 mode=auto 正在运行；--with-plugin 显式先停再启动 auto service）
+              --include-pm2 仅允许“入场时没有 live PM2 God”的干净启动；若已有 live God，整条命令会在 fleet/breadcrumb 零改动处拒绝，且不会信号或重启现存 God
+              首次升级若旧 daemon 缺少 shutdown protocol：先独立确认所有 Session/Riff 工作均 idle，再一次性运行
+              botmux restart --bootstrap-shutdown-protocol --yes；普通 stop/restart 仍保持 fail-closed
   logs        查看 daemon 日志（--lines N, --bot <0-based-index|pm2-name|appId>）
   status      查看 daemon 状态
   upgrade     升级到最新版本（别名：update）
@@ -11821,6 +12866,9 @@ if (LARK_FACING_COMMANDS.has(command) && managedOriginHasNoTransport()) {
 }
 
 switch (command) {
+  case '__pm2-start-exact':
+    await cmdInternalPm2StartExact(process.argv.slice(3));
+    break;
   case '--version':
   case '-v':      console.log(getVersion()); break;
   case 'capabilities': {

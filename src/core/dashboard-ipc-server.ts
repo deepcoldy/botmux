@@ -135,6 +135,11 @@ import {
 import { listChatMemberDisplays } from '../services/groups-store.js';
 
 const MESSAGE_LISTENER_PREVIEW_WINDOW_MS = 24 * 60 * 60 * 1000;
+import {
+  SUPERVISOR_SHUTDOWN_ROUTE,
+  isExactSupervisorShutdownRequest,
+  type SupervisorShutdownIdentity,
+} from './supervisor-shutdown-ipc.js';
 
 let exactChatGrantHandler: typeof applyExactChatGrantRequest = applyExactChatGrantRequest;
 /** Test seam: replace the exact-grant service without touching live Feishu/config state. */
@@ -160,6 +165,16 @@ export type BotAvatarOutcome =
 let botAvatarChanger: ((image: Buffer) => Promise<BotAvatarOutcome>) | null = null;
 export function setBotAvatarChanger(fn: ((image: Buffer) => Promise<BotAvatarOutcome>) | null): void {
   botAvatarChanger = fn;
+}
+
+type SupervisorShutdownRegistration = SupervisorShutdownIdentity & {
+  shutdown: () => Promise<void>;
+};
+let supervisorShutdownRegistration: SupervisorShutdownRegistration | null = null;
+export function setSupervisorShutdownHandler(
+  registration: SupervisorShutdownRegistration | null,
+): void {
+  supervisorShutdownRegistration = registration;
 }
 import {
   composeRowFromActive,
@@ -280,6 +295,39 @@ function rejectProtectedSessionMutation(
   });
   return true;
 }
+
+ipcRoute('POST', SUPERVISOR_SHUTDOWN_ROUTE, async (req, res) => {
+  // The production server-wide HMAC gate records trusted requests here. Keep
+  // an explicit route-local check: shutdown is never a bare loopback API.
+  if (!isTrustedHostIpcRequest(req)) {
+    return jsonRes(res, 403, { ok: false, error: 'supervisor_shutdown_unauthorized' });
+  }
+  const registration = supervisorShutdownRegistration;
+  if (!registration) {
+    return jsonRes(res, 503, { ok: false, error: 'supervisor_shutdown_not_ready' });
+  }
+  let body: unknown;
+  try { body = await readJsonBody(req); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'invalid_json' }); }
+  if (!isExactSupervisorShutdownRequest(registration, body)) {
+    return jsonRes(res, 409, { ok: false, error: 'supervisor_shutdown_generation_mismatch' });
+  }
+  // ACK means this exact in-memory generation accepted the request; the CLI
+  // still proves OS/PM2 quiescence. Start after flushing the ACK so a long Riff
+  // drain cannot turn a valid request into an ambiguous transport timeout.
+  jsonRes(res, 202, {
+    ok: true,
+    accepted: true,
+    larkAppId: registration.larkAppId,
+    bootInstanceId: registration.bootInstanceId,
+    processStartIdentity: registration.processStartIdentity,
+  });
+  setImmediate(() => {
+    void registration.shutdown().catch(error => {
+      logger.error(`supervisor shutdown failed: ${error instanceof Error ? error.message : String(error)}`);
+    });
+  });
+});
 export class JsonBodyTooLargeError extends Error {
   constructor(readonly maxBytes: number) {
     super(`JSON request body exceeds ${maxBytes} bytes`);

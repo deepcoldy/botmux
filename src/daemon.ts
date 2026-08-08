@@ -43,6 +43,11 @@ import {
   stopCliRuntimeUpdateMonitor,
 } from './core/cli-runtime-update.js';
 import { sendRestartReportIfPending } from './core/restart-report.js';
+import {
+  SUPERVISOR_SHUTDOWN_PROTOCOL,
+  type SupervisorShutdownProtocol,
+} from './core/supervisor-shutdown-protocol.js';
+import { readSupervisorProcessStartIdentity } from './core/process-start-identity.js';
 import { statSync } from 'node:fs';
 import { addReaction, deleteMessage, getChatContext, getChatMode, getChatNameAndMode, getMessageChatId, listChatMemberOpenIds, MessageWithdrawnError, replyMessage, resolveAllowedUsersWithMap, sendMessage, sendUserMessage, updateMessage, type EntryResolveStatus } from './im/lark/client.js';
 import { resolveGroupJoinPrompt, waitForAllowedUserInChat } from './core/auto-start.js';
@@ -165,7 +170,7 @@ import {
   isSessionTransferring,
   type WorkerSessionReplyOptions,
 } from './core/worker-pool.js';
-import { AbortDeadlineError, hasExactSafeJsonKeys, ipcRoute, isTrustedHostIpcRequest, JsonBodyTooLargeError, jsonRes, readJsonBody, runWithAbortDeadline, setBotName, setLarkAppId, startIpcServer, setBotRenamer, setBotAvatarChanger, armCoreOnlyReadinessGate, setCoreOnlyReady } from './core/dashboard-ipc-server.js';
+import { AbortDeadlineError, hasExactSafeJsonKeys, ipcRoute, isTrustedHostIpcRequest, JsonBodyTooLargeError, jsonRes, readJsonBody, runWithAbortDeadline, setBotName, setLarkAppId, startIpcServer, setBotRenamer, setBotAvatarChanger, armCoreOnlyReadinessGate, setCoreOnlyReady, setSupervisorShutdownHandler } from './core/dashboard-ipc-server.js';
 import { setDeviceIsolationDaemonIdentity } from './core/device-isolation-daemon.js';
 import {
   cancelSessionReadyAck,
@@ -3502,11 +3507,16 @@ interface DaemonDescriptor {
   botIndex: number;
   ipcPort: number;
   pid: number;
+  /** Kernel/OS process-birth identity; prevents fresh stale PID reuse. */
+  processStartIdentity: string;
   startedAt: number;
   /** Public, random audience that changes on every daemon process start. */
   bootInstanceId: string;
   /** Full-envelope Workflow mutation protocol supported by this process. */
   workflowIpcProtocol: 'v1';
+  /** Exact supervisor protocol this in-memory daemon will execute on signal.
+   * Absent until the SIGTERM/SIGINT handlers and all captured state are ready. */
+  supervisorShutdownProtocol?: SupervisorShutdownProtocol;
   lastHeartbeat: number;
   /**
    * Resolved open_ids from this bot's allowedUsers config (post-email
@@ -20078,6 +20088,10 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // agent-facing, live-origin-gated endpoints. Internal control endpoints use
   // a separate daemon-to-daemon credential and never trust this port marker.
   process.env.BOTMUX_DAEMON_IPC_PORT = String(ipcPort);
+  const daemonProcessStartIdentity = readSupervisorProcessStartIdentity(process.pid);
+  if (!daemonProcessStartIdentity) {
+    throw new Error('cannot bind daemon descriptor to a process-start identity');
+  }
   const desc: DaemonDescriptor = {
     larkAppId: cfg.larkAppId,
     botName: cfg.displayName ?? cfg.larkAppId,
@@ -20085,6 +20099,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     botIndex: idx,
     ipcPort,
     pid: process.pid,
+    processStartIdentity: daemonProcessStartIdentity,
     startedAt: Date.now(),
     bootInstanceId: generateWorkflowDaemonBootInstanceId(),
     workflowIpcProtocol: 'v1',
@@ -21042,7 +21057,8 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // Ordinary workers then receive SIGTERM / close IPC and the daemon waits up
   // to DAEMON_WORKER_EXIT_GRACE_MS for them to exit
   // before sending SIGKILL to stragglers. Without the wait, daemon
-  // `process.exit(0)` races worker signal delivery — and any worker whose
+  // the final managed sentinel exit races worker signal delivery —
+  // and any worker whose
   // main thread is in a sync code path (e.g. the bridge fingerprint scan
   // bug fixed in v2.9.2) loses the signal and survives as a ppid=1 orphan
   // forever (we'd accumulated 841 such orphans across daemon restarts,
@@ -21301,10 +21317,27 @@ export async function startDaemon(botIndex?: number): Promise<void> {
 
   process.on('SIGTERM', () => { shutdown().catch(err => { logger.error(`shutdown failed: ${err?.message ?? err}`); process.exit(1); }); });
   process.on('SIGINT', () => { shutdown().catch(err => { logger.error(`shutdown failed: ${err?.message ?? err}`); process.exit(1); }); });
+  // Capability publication is the final startup commit for supervisor-driven
+  // shutdown. The early descriptor intentionally lacks it: a new CLI that
+  // observes this daemon before both handlers/state closures exist must refuse
+  // to signal. Atomic rewrite makes the capability visible only afterward.
+  if (readSupervisorProcessStartIdentity(process.pid) !== desc.processStartIdentity) {
+    throw new Error('daemon process-start identity changed before shutdown capability commit');
+  }
+  setSupervisorShutdownHandler({
+    larkAppId: cfg.larkAppId,
+    bootInstanceId: desc.bootInstanceId,
+    processStartIdentity: desc.processStartIdentity,
+    shutdown,
+  });
+  desc.supervisorShutdownProtocol = SUPERVISOR_SHUTDOWN_PROTOCOL;
+  desc.lastHeartbeat = Date.now();
+  writeDaemonDescriptor(desc);
   // Best-effort cleanup on plain `exit` (e.g. uncaught fatal). No worker
   // shutdown here since the process is already on its way out — just remove
   // the descriptor so the dashboard doesn't see a phantom daemon.
   process.on('exit', () => {
+    setSupervisorShutdownHandler(null);
     clearInterval(descriptorHeartbeat);
     clearInterval(idleWorkerSweepTimer);
     clearInterval(docCommentPollTimer);
