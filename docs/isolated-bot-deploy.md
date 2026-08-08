@@ -35,6 +35,8 @@ claude /login                         # 写 keychain / ~/.claude/.credentials.js
 pnpm switch:here && botmux restart
 ```
 
+> **要在隔离会话里用 `lark-cli`，还得先做「按 bot 拆 lark-cli 配置」** —— 见 [lark-cli 按 bot 隔离配置](./lark-cli-per-bot.md)。隔离整目录 deny 了 `~/.lark-cli` 与 `~/.lark-cli-bots`，只给本 bot 的 `~/.lark-cli-bots/<自己>` 开 carve-out；没配过的机器上，隔离会话里的 lark-cli 会以 `not configured` / `operation not permitted` 失败。
+
 > 源码部署时 `package.json` 的 `version` 是 `0.0.0`，正常——版本号只有 CI 打 tag 发版时才写入，不影响功能。
 >
 > ⚠️ **同一个飞书 app 不能被两台机器的 daemon 同时监听**——两个 daemon 会争抢同一批飞书事件。新机器要么用**另一批飞书 app**，要么是**迁移**（起新的、停旧的）。
@@ -121,6 +123,7 @@ botmux suspend --isolated       # 挂起所有隔离 bot 的活跃会话(--dry-r
 | `botmux send` 报 "Bot not registered" | 确认 `~/.botmux/bin` 在 PATH 最前（用本 build 的 send-cred reader）；确认 BOT_HOME 里有 `send-cred.json` |
 | bot 卡 `401 / run /login` | 凭证过期 → `botmux suspend --isolated`，下条消息冷启动自动同步最新凭证 |
 | 隔离 bot 读不到自己该读的项目文件 | 确认它在 BOT_HOME 外；`readDenyExtraPaths` 没误伤 |
+| `lark-cli` 报 `not configured` / `config_file: operation not permitted` | 没做「按 bot 拆 lark-cli 配置」→ lark-cli 落回被 deny 的 `~/.lark-cli`。见 [lark-cli 按 bot 隔离配置](./lark-cli-per-bot.md)。**给 node / codex 开完全磁盘访问权限对此无效**——TCC 与 Seatbelt 是两套独立的强制访问控制 |
 
 ## 回滚
 
