@@ -30,7 +30,7 @@ import { updateMessage, deleteMessage, sendEphemeralCard, sendUserMessage, addRe
 import { buildStreamingCard, buildPrivateSnapshotCard, buildSessionCard, buildTuiPromptCard, buildTuiPromptResolvedCard, buildTuiPromptFailedCard, buildRelayedFrozenCard, getCliDisplayName } from '../im/lark/card-builder.js';
 import { codexServiceTierBadge } from '../services/codex-service-tier.js';
 import { loadFrozenCards, saveFrozenCards } from '../services/frozen-card-store.js';
-import { hashUrlForLog, cancelRiffTaskById } from '../adapters/backend/riff-backend.js';
+import { hashUrlForLog } from '../adapters/backend/riff-backend.js';
 import { logger } from '../utils/logger.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import {
@@ -64,7 +64,7 @@ import {
   isStrongManagedHerdrAgentName,
   managedHerdrAgentName,
 } from '../adapters/backend/session-backend-selector.js';
-import { isSuspendableBackendType, getSessionPersistentBackendType, persistentBackendTargetForSession, persistentSessionName, killPersistentBackendTarget, killPersistentSession, managedTargetsForCliChange, probePersistentBackendTarget, resolvePairedSpawnBackendType, resolvePersistentBackendTarget } from './persistent-backend.js';
+import { isRiffBackendSession, isSuspendableBackendType, getSessionPersistentBackendType, persistentBackendTargetForSession, persistentSessionName, killPersistentBackendTarget, killPersistentSession, managedTargetsForCliChange, probePersistentBackendTarget, resolvePairedSpawnBackendType, resolvePersistentBackendTarget } from './persistent-backend.js';
 import { withBotTurnMutation } from './bot-turn-mutation-gate.js';
 import { getBot, getAllBots, loadBotConfigs, resolveBrandLabel, getLoadedConfigPath, resolveUsageDisplay } from '../bot-registry.js';
 import { RestartCoordinator, type RestartObserver } from './restart-coordinator.js';
@@ -211,14 +211,40 @@ export function getDaemonStreamingCardUsageSnapshot(
   effectiveCliId?: CliId,
   opts?: { fresh?: boolean },
 ): CardUsageSnapshot {
+  // Runtime identity is derived from in-memory fields only, so it is available
+  // without reading the transcript. The disk read (getDaemonSessionUsageSnapshot)
+  // is deferred until we know usage will actually render — a footer/off bot must
+  // not pay a per-tick transcript parse just to throw the tokens away.
+  const runtimeModel = ds.activeModel?.trim() || ds.session.model?.trim();
+  const reasoningEffort = ds.activeReasoningEffort?.trim()
+    || ds.session.reasoningEffort?.trim();
   try {
     if (resolveUsageDisplay(ds.larkAppId) !== 'streaming') {
-      return { context: null, tokens: null };
+      return {
+        context: null,
+        tokens: null,
+        ...(runtimeModel ? { model: runtimeModel } : {}),
+        ...(reasoningEffort ? { reasoningEffort } : {}),
+      };
     }
   } catch {
     // Missing runtime config → default 'streaming' → show usage (best-effort).
   }
-  return getDaemonSessionUsageSnapshot(ds, effectiveCliId, { fresh: opts?.fresh ?? false });
+  const snapshot = getDaemonSessionUsageSnapshot(
+    ds,
+    effectiveCliId,
+    { fresh: opts?.fresh ?? false },
+  );
+  // Model comes only from an explicitly-wired executor runtime (TRAE/Codex set
+  // ds.activeModel from their rollout settings) or the user-configured launch
+  // model — never snapshot.tokens.model. That field is the RAW transcript model
+  // and for relay-style CLIs is an internal routing code (e.g. `ark/relay-code`)
+  // that must not surface on a user card.
+  return {
+    ...snapshot,
+    ...(runtimeModel ? { model: runtimeModel } : {}),
+    ...(reasoningEffort ? { reasoningEffort } : {}),
+  };
 }
 
 import { normalizeBrand } from '../im/lark/lark-hosts.js';
@@ -262,6 +288,7 @@ import {
   storedSessionAnchorId,
   isDocNativeSession,
   larkTransportEnabled,
+  riffRetirementAdmissionPhase,
   type DaemonSession,
 } from './types.js';
 import { hasProtectedSessionMutationOwnership } from './session-mutation-guard.js';
@@ -302,6 +329,12 @@ import {
 import { acknowledgeSessionReady } from './session-ready-handshake.js';
 import { recordDispatchInputCommit } from './dispatch.js';
 import { sendWorkerIpc } from './worker-ipc.js';
+import { cleanupExplicitSessionBacking } from './explicit-session-backing-cleanup.js';
+import { RIFF_ADMISSION_RESTORE_TIMEOUT_MS } from './shutdown-budgets.js';
+import {
+  managedOriginCapabilityPath,
+  replaceManagedOriginCapabilityFile,
+} from './managed-origin-capability.js';
 
 type WindowsForkOptions = ForkOptions & { windowsHide?: boolean };
 
@@ -491,6 +524,18 @@ function requireCallbacks(): WorkerPoolCallbacks {
 // linear-scan by sessionId.
 let activeSessionsRegistry: Map<string, DaemonSession> | undefined;
 
+type RiffWorkerCloseResult = {
+  ok: boolean;
+  taskId?: string;
+  error?: string;
+};
+
+const pendingRiffWorkerCloses = new Map<string, {
+  sessionId: string;
+  worker: ChildProcess;
+  resolve: (result: RiffWorkerCloseResult) => void;
+}>();
+
 export function setActiveSessionsRegistry(m: Map<string, DaemonSession>): void {
   activeSessionsRegistry = m;
 }
@@ -675,6 +720,59 @@ function flushPendingLocalCliOpenReadinessPatch(ds: DaemonSession): void {
   if (!ds.pendingLocalCliButtonRefresh) return;
   ds.pendingLocalCliButtonRefresh = undefined;
   scheduleLocalCliOpenReadinessPatch(ds);
+}
+
+/** PATCH the live card when the executor reports a different active runtime.
+ * Runtime identity stays attached to the streaming usage line. */
+function scheduleActiveRuntimePatch(ds: DaemonSession): void {
+  if (ds.session.vcMeetingReceiver || streamingCardDisabled(ds) || ds.suppressRecoveryCard) {
+    ds.pendingActiveRuntimeCardRefresh = undefined;
+    return;
+  }
+  if (ds.streamCardNonce && ds.parkedStreamCardNonce === ds.streamCardNonce) {
+    ds.pendingActiveRuntimeCardRefresh = undefined;
+    return;
+  }
+  if (ds.streamCardId === CARD_POSTING_SENTINEL) {
+    ds.pendingActiveRuntimeCardRefresh = true;
+    return;
+  }
+  if (!ds.streamCardId || !workerHasInitialized(ds)) {
+    ds.pendingActiveRuntimeCardRefresh = undefined;
+    return;
+  }
+  ds.pendingActiveRuntimeCardRefresh = undefined;
+  const botCfg = getBot(ds.larkAppId).config;
+  const effectiveCliId = sessionCliId(ds, botCfg);
+  const status = ds.usageLimit ? 'limited' : (ds.lastScreenStatus ?? 'starting');
+  const cardJson = buildStreamingCard(
+    ds.session.sessionId,
+    sessionAnchorId(ds),
+    readableTerminalUrlFor(ds),
+    ds.currentTurnTitle || ds.session.title || sessionCliDisplayName(ds, botCfg),
+    ds.lastScreenContent ?? '',
+    status,
+    effectiveCliId,
+    ds.displayMode ?? 'hidden',
+    ds.streamCardNonce,
+    ds.currentImageKey,
+    !!ds.adoptedFrom,
+    false,
+    localeForBot(ds.larkAppId),
+    status === 'limited' ? ds.usageLimit : undefined,
+    writableTerminalLinkFor(ds),
+    isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
+    getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId),
+    sessionRuntimeDisplayName(ds, botCfg),
+    codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
+  );
+  scheduleCardPatch(ds, cardJson);
+}
+
+function flushPendingActiveRuntimePatch(ds: DaemonSession): void {
+  if (!ds.pendingActiveRuntimeCardRefresh) return;
+  ds.pendingActiveRuntimeCardRefresh = undefined;
+  scheduleActiveRuntimePatch(ds);
 }
 
 /** PATCH a live card when rollout settings change, even if the PTY is static. */
@@ -1321,6 +1419,7 @@ export async function postFreshStreamingCard(
     recallFrozenCards(ds);
     flushPendingLocalCliOpenReadinessPatch(ds);
     flushPendingRiffUrlPatch(ds);
+    flushPendingActiveRuntimePatch(ds);
     flushPendingCodexServiceTierPatch(ds);
     // Manual /card during a working turn lands a live card whose subsequent
     // screen_updates are working→working (no status edge) — arm the periodic
@@ -1334,6 +1433,7 @@ export async function postFreshStreamingCard(
     ds.streamCardPending = prevPending;
     flushPendingLocalCliOpenReadinessPatch(ds);
     flushPendingRiffUrlPatch(ds);
+    flushPendingActiveRuntimePatch(ds);
     flushPendingCodexServiceTierPatch(ds);
     // Rolled back to the prior card identity — re-sync so a restored still-live
     // working card keeps (or resumes) its refresh rather than losing the timer.
@@ -1939,7 +2039,23 @@ export function ensureClaudeFolderTrust(workingDir: string, stateJsonPath: strin
 
 // ─── Kill worker ────────────────────────────────────────────────────────────
 
-export function killWorker(ds: DaemonSession): void {
+export function killWorker(
+  ds: DaemonSession,
+  opts: { riffCloseCommitRequestId?: string } = {},
+): void {
+  const closeFrozenType = ds.initConfig?.backendType ?? ds.session.backendType;
+  if (ds.worker && !ds.worker.killed
+      && closeFrozenType === 'riff'
+      && !opts.riffCloseCommitRequestId) {
+    // A generic synchronous retirement cannot safely detach Riff. An accepted
+    // create/follow-up may still be waiting for the task id that becomes the
+    // only durable lineage anchor.
+    logger.error(
+      `[${tag(ds)}] Refused unprepared live Riff worker retirement; `
+      + 'preserving worker and remote-task lineage',
+    );
+    return;
+  }
   restartCoordinator.cancelSession(ds.session.sessionId);
   clearUsageLimitState(ds);
   ds.workerReady = false;
@@ -1963,11 +2079,26 @@ export function killWorker(ds: DaemonSession): void {
     // session would leave an orphaned CLI running in tmux that still replies.
     // Destroy the backing session directly here so /close always terminates it.
     destroyOrphanedBackingSession(ds);
+    if (opts.riffCloseCommitRequestId
+        && ds.riffCloseState?.requestId === opts.riffCloseCommitRequestId) {
+      ds.riffCloseState = undefined;
+    }
     return;
   }
   try {
-    ds.worker.send({ type: 'close' } as DaemonToWorker);
+    if (opts.riffCloseCommitRequestId) {
+      ds.worker.send({
+        type: 'close_commit',
+        requestId: opts.riffCloseCommitRequestId,
+      } as DaemonToWorker);
+    } else {
+      ds.worker.send({ type: 'close' } as DaemonToWorker);
+    }
   } catch { /* IPC already closed */ }
+  if (opts.riffCloseCommitRequestId
+      && ds.riffCloseState?.requestId === opts.riffCloseCommitRequestId) {
+    ds.riffCloseState = undefined;
+  }
   const w = ds.worker;
   trackLifecycleRetirement(ds, w);
   armCloseFence(ds, w);
@@ -1975,7 +2106,6 @@ export function killWorker(ds: DaemonSession): void {
   // 外层 race 8s）。默认 2s SIGTERM backstop 会在取消发出前掐死进程，已关闭话题
   // 的远端任务照跑——冻结为 riff 的会话放宽到 24s（层级：destroy 20s < worker 22s
   // < SIGTERM 24s < SIGKILL 29s；正常路径 worker 自行 exit，不会等满）。
-  const closeFrozenType = ds.initConfig?.backendType ?? ds.session.backendType;
   armWorkerKillBackstop(w, tag(ds), closeFrozenType === 'riff' ? 24_000 : WORKER_SIGTERM_BACKSTOP_MS);
   ds.worker = null;
   ds.workerPort = null;
@@ -2269,22 +2399,17 @@ export function __testOnly_resetRestartCoordinator(): void {
 function destroyOrphanedBackingSession(ds: DaemonSession): void {
   if (ds.initConfig?.adoptMode || ds.adoptedFrom) return;
   reclaimParkedCrashDiagnostic(ds);
-  // riff：worker 已死时 /close 仍要取消持久化血缘指向的远端任务——否则已关闭
-  // 话题的远端 agent 继续拿着注入凭证发消息。fire-and-forget（内部有界+重试）。
+  // Riff cancellation is asynchronous and cannot be made safe from this
+  // synchronous best-effort helper. The authoritative closeSession path awaits
+  // cancellation before publishing the closed row and retains lineage on
+  // failure.
   const frozenType = ds.initConfig?.backendType ?? ds.session.backendType;
   if (frozenType === 'riff') {
-    const taskId = ds.session.riffParentTaskId;
-    if (taskId) {
-      try {
-        const riffCfg = getBot(ds.larkAppId).config.riff;
-        if (riffCfg?.baseUrl) {
-          void cancelRiffTaskById(riffCfg, taskId).then((ok) => {
-            if (ok) logger.info(`[${tag(ds)}] killWorker: orphan riff task ${taskId} cancelled`);
-          });
-        }
-      } catch { /* bot deregistered — nothing to cancel with */ }
-      ds.session.riffParentTaskId = undefined;
-      sessionStore.updateSession(ds.session);
+    if (ds.session.riffParentTaskId) {
+      logger.warn(
+        `[${tag(ds)}] worker-less Riff teardown requires awaited explicit close; `
+        + `retaining task ${ds.session.riffParentTaskId} for retry`,
+      );
     }
     return;
   }
@@ -2296,6 +2421,305 @@ function destroyOrphanedBackingSession(ds: DaemonSession): void {
   } catch (err) {
     logger.warn(`[${tag(ds)}] killWorker: failed to destroy orphaned ${backendType} backing session: ${err}`);
   }
+}
+
+type RiffClosePreparation =
+  | { ok: true; taskId?: string }
+  | {
+      ok: false;
+      error:
+        | 'riff_cancel_failed'
+        | 'riff_config_missing'
+        | 'riff_task_changed'
+        | 'riff_worker_close_failed'
+        | 'riff_row_inconsistent'
+        | 'riff_durable_close_failed'
+        | 'riff_close_reconciliation_required'
+        | 'riff_shutdown_fence_in_progress';
+      retryable: true;
+      taskId?: string;
+    };
+
+async function abortLiveRiffWorkerClose(
+  ds: DaemonSession,
+  requestId: string,
+  opts: { allowAbsentAfterProvenRestore?: boolean } = {},
+): Promise<boolean> {
+  if (ds.riffCloseState?.requestId !== requestId) return false;
+  const worker = ds.worker;
+  if (!worker || worker.killed) {
+    if (opts.allowAbsentAfterProvenRestore) {
+      ds.riffCloseState = undefined;
+      return true;
+    }
+    ds.riffCloseState = { ...ds.riffCloseState, phase: 'uncertain' };
+    return false;
+  }
+
+  const restored = await new Promise<{ ok: boolean; error?: string }>(resolve => {
+    let settled = false;
+    const finish = (result: { ok: boolean; error?: string }): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      worker.removeListener?.('message', onMessage);
+      worker.removeListener?.('exit', onExit);
+      resolve(result);
+    };
+    const onMessage = (raw: unknown): void => {
+      const msg = raw as WorkerToDaemon;
+      if (msg?.type !== 'close_abort_result' || msg.requestId !== requestId) return;
+      if (ds.worker !== worker) {
+        finish({ ok: false, error: 'stale_worker_generation' });
+        return;
+      }
+      finish({ ok: msg.ok, ...(msg.error ? { error: msg.error } : {}) });
+    };
+    const onExit = (): void => finish({
+      ok: false,
+      error: 'worker_exited_before_close_abort_result',
+    });
+    const timer = setTimeout(
+      () => finish({ ok: false, error: 'close_abort_result_timeout' }),
+      RIFF_ADMISSION_RESTORE_TIMEOUT_MS,
+    );
+    timer.unref?.();
+    worker.on?.('message', onMessage);
+    worker.once?.('exit', onExit);
+    try {
+      worker.send({ type: 'close_abort', requestId } as DaemonToWorker);
+    } catch (err) {
+      finish({ ok: false, error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  if (restored.ok && ds.riffCloseState?.requestId === requestId) {
+    ds.riffCloseState = undefined;
+    return true;
+  }
+  if (opts.allowAbsentAfterProvenRestore
+      && ds.riffCloseState?.requestId === requestId) {
+    ds.riffCloseState = undefined;
+    return true;
+  }
+  if (ds.riffCloseState?.requestId === requestId) {
+    ds.riffCloseState = { ...ds.riffCloseState, phase: 'uncertain' };
+  }
+  logger.warn(
+    `[${tag(ds)}] Riff close abort was not acknowledged (${restored.error ?? 'unknown'}); `
+    + 'retaining admission fence pending explicit lineage reconciliation',
+  );
+  return false;
+}
+
+async function prepareLiveRiffWorkerClose(ds: DaemonSession): Promise<RiffClosePreparation> {
+  const worker = ds.worker;
+  if (!worker || worker.killed) {
+    return { ok: false, error: 'riff_worker_close_failed', retryable: true };
+  }
+  if (ds.riffCloseState || ds.riffShutdownState) {
+    return {
+      ok: false,
+      error: 'riff_worker_close_failed',
+      retryable: true,
+      ...((ds.riffCloseState?.taskId ?? ds.riffShutdownState?.taskId)
+        ? { taskId: (ds.riffCloseState?.taskId ?? ds.riffShutdownState?.taskId)! }
+        : {}),
+    };
+  }
+  const requestId = randomUUID();
+  ds.riffCloseState = {
+    phase: 'preparing',
+    requestId,
+    ...(ds.session.riffParentTaskId ? { taskId: ds.session.riffParentTaskId } : {}),
+  };
+  let matchedCloseResult = false;
+  const result = await new Promise<RiffWorkerCloseResult>((resolve) => {
+    let settled = false;
+    const finish = (value: RiffWorkerCloseResult): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      worker.removeListener?.('exit', onExit);
+      pendingRiffWorkerCloses.delete(requestId);
+      resolve(value);
+    };
+    const onExit = (): void => finish({
+      ok: false,
+      error: 'worker_exited_before_close_result',
+    });
+    const timer = setTimeout(
+      () => finish({ ok: false, error: 'worker_close_result_timeout' }),
+      23_000,
+    );
+    timer.unref?.();
+    worker.once?.('exit', onExit);
+    pendingRiffWorkerCloses.set(requestId, {
+      sessionId: ds.session.sessionId,
+      worker,
+      resolve: value => {
+        matchedCloseResult = true;
+        finish(value);
+      },
+    });
+    try {
+      worker.send({ type: 'close', requestId } as DaemonToWorker);
+    } catch (err) {
+      finish({ ok: false, error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  const taskId = result.taskId ?? ds.session.riffParentTaskId;
+  if (result.taskId) {
+    ds.session.riffParentTaskId = result.taskId;
+    try {
+      sessionStore.updateSession(ds.session);
+    } catch (err) {
+      await abortLiveRiffWorkerClose(ds, requestId);
+      logger.error(
+        `[${tag(ds)}] Riff close lineage persistence failed; close aborted: `
+        + `${err instanceof Error ? err.message : String(err)}`,
+      );
+      return {
+        ok: false,
+        error: 'riff_durable_close_failed',
+        retryable: true,
+        taskId: result.taskId,
+      };
+    }
+  }
+
+  if (!result.ok) {
+    await abortLiveRiffWorkerClose(ds, requestId, {
+      allowAbsentAfterProvenRestore: matchedCloseResult,
+    });
+    logger.warn(
+      `[${tag(ds)}] Riff worker close prepare failed: ${result.error ?? 'unknown'}; `
+      + `session remains active${taskId ? ` (task ${taskId})` : ''}`,
+    );
+    return {
+      ok: false,
+      error: 'riff_worker_close_failed',
+      retryable: true,
+      ...(taskId ? { taskId } : {}),
+    };
+  }
+
+  ds.riffCloseState = {
+    phase: 'prepared',
+    requestId,
+    ...(taskId ? { taskId } : {}),
+  };
+  logger.info(`[${tag(ds)}] Riff worker close prepared and remote task cancellation confirmed`);
+  return { ok: true, ...(taskId ? { taskId } : {}) };
+}
+
+/** Await remote cancellation for any Riff owner before its durable row is
+ * closed. Live workers use prepare/commit; worker-less rows cancel their exact
+ * persisted task through current authoritative bot config. */
+async function prepareRiffExplicitClose(
+  ds: DaemonSession | undefined,
+  stored: Session | undefined,
+): Promise<RiffClosePreparation> {
+  const session = ds?.session ?? stored;
+  if (!session) return { ok: true };
+  const backendType = ds?.initConfig?.backendType ?? session.backendType;
+  const taskId = session.riffParentTaskId;
+  if (ds?.riffShutdownState) {
+    const fencedTaskId = Object.prototype.hasOwnProperty.call(ds.riffShutdownState, 'taskId')
+      ? ds.riffShutdownState.taskId
+      : taskId;
+    return {
+      ok: false,
+      error: 'riff_shutdown_fence_in_progress',
+      retryable: true,
+      ...(typeof fencedTaskId === 'string' && fencedTaskId ? { taskId: fencedTaskId } : {}),
+    };
+  }
+  if (ds?.riffCloseState) {
+    return {
+      ok: false,
+      error: 'riff_close_reconciliation_required',
+      retryable: true,
+      ...(ds.riffCloseState.taskId ? { taskId: ds.riffCloseState.taskId } : {}),
+    };
+  }
+  if (backendType !== 'riff') return { ok: true };
+  if (ds?.initConfig?.adoptMode || ds?.adoptedFrom || session.adoptedFrom) return { ok: true };
+
+  if (ds?.worker && !ds.worker.killed) {
+    if (!stored || stored.status !== 'active') {
+      return {
+        ok: false,
+        error: 'riff_row_inconsistent',
+        retryable: true,
+        ...(taskId ? { taskId } : {}),
+      };
+    }
+    return prepareLiveRiffWorkerClose(ds);
+  }
+
+  const durableBefore = sessionStore.getSession(session.sessionId);
+  if (ds && durableBefore
+      && ds.session.riffParentTaskId !== durableBefore.riffParentTaskId) {
+    const authoritativeTaskId = durableBefore.riffParentTaskId ?? ds.session.riffParentTaskId;
+    logger.warn(
+      `[${tag(ds)}] explicit close refused before cancellation: runtime/durable Riff lineage differs `
+      + `(${ds.session.riffParentTaskId ?? 'none'}/${durableBefore.riffParentTaskId ?? 'none'})`,
+    );
+    return {
+      ok: false,
+      error: 'riff_task_changed',
+      retryable: true,
+      ...(authoritativeTaskId ? { taskId: authoritativeTaskId } : {}),
+    };
+  }
+  if (!taskId) return { ok: true };
+
+  let riffConfig;
+  const larkAppId = ds?.larkAppId ?? session.larkAppId;
+  try { if (larkAppId) riffConfig = getBot(larkAppId).config.riff; } catch { /* bot removed */ }
+  const cleanup = await cleanupExplicitSessionBacking({
+    sessionId: session.sessionId,
+    backendType,
+    riffParentTaskId: taskId,
+    riffConfig,
+  });
+  const closeLabel = ds ? tag(ds) : session.sessionId.slice(0, 8);
+  if (!cleanup.ok) {
+    logger.warn(
+      `[${closeLabel}] explicit close refused: ${cleanup.kind}; `
+      + `Riff task ${taskId} remains active and retryable`,
+    );
+    return {
+      ok: false,
+      error: cleanup.kind === 'riff_config_missing' ? 'riff_config_missing' : 'riff_cancel_failed',
+      retryable: true,
+      taskId,
+    };
+  }
+  if (cleanup.kind !== 'cancelled_riff') return { ok: true };
+
+  const latest = sessionStore.getSession(session.sessionId);
+  const latestTaskId = latest?.riffParentTaskId;
+  const runtimeTaskId = ds?.session.riffParentTaskId;
+  if (!latest || latest.status !== 'active' || latestTaskId !== cleanup.taskId
+      || (ds && runtimeTaskId !== cleanup.taskId)) {
+    logger.warn(
+      `[${closeLabel}] explicit close cancelled stale Riff task ${cleanup.taskId}, `
+      + `but runtime/durable lineage or status changed to `
+      + `${runtimeTaskId ?? 'none'}/${latestTaskId ?? 'none'}/${latest?.status ?? 'missing'}; retry required`,
+    );
+    return {
+      ok: false,
+      error: 'riff_task_changed',
+      retryable: true,
+      taskId: latestTaskId ?? runtimeTaskId ?? cleanup.taskId,
+    };
+  }
+
+  logger.info(`[${closeLabel}] Riff task ${cleanup.taskId} cancellation prepared for explicit close`);
+  return { ok: true, taskId: cleanup.taskId };
 }
 
 /**
@@ -2623,9 +3047,16 @@ export function teardownAuthoritativePersistentBackingBeforeClose(
  * Calling this on an unknown sessionId, an already-closed session, or a session
  * whose worker died asynchronously must still resolve with `{ ok: true }`.
  */
+export type CloseSessionResult =
+  | { ok: true; alreadyClosed: boolean; known: boolean }
+  | ({
+      ok: false;
+      alreadyClosed: false;
+    } & Exclude<RiffClosePreparation, { ok: true }>);
+
 export async function closeSession(
   sessionId: string,
-): Promise<{ ok: true; alreadyClosed: boolean; known: boolean }> {
+): Promise<CloseSessionResult> {
   const ds = findActiveBySessionId(sessionId);
   const stored = sessionStore.getOwnedSession(sessionId);
   // Prove fail-closed ZMX teardown before any registry/store mutation. Repo
@@ -2634,10 +3065,11 @@ export async function closeSession(
   if (teardownTarget) {
     teardownAuthoritativePersistentBackingBeforeCloseImpl(teardownTarget, true);
   }
+  const isOwnedRiffClose = !ds?.initConfig?.adoptMode
+    && !ds?.adoptedFrom
+    && !stored?.adoptedFrom
+    && (ds?.initConfig?.backendType ?? ds?.session.backendType ?? stored?.backendType) === 'riff';
   let killedLive = false;
-  // 会话关闭即可回收其崩溃重启计数；否则每个曾崩溃过的 session 会在 daemon
-  // 生命周期内永久占位（restartCounts 此前无任何 delete）。
-  restartCounts.delete(sessionId);
   const hadLiveWorker = !!ds?.worker && !ds.worker.killed;
   const closeWorkerGeneration = ds ? closeFenceGeneration(ds) : undefined;
   // Snapshot ownership + transition state before mutating the live object:
@@ -2646,6 +3078,29 @@ export async function closeSession(
   const wasOpen = !!stored && stored.status !== 'closed';
   const storedHadDocCommentTargets = Object.keys(stored?.docCommentTargets ?? {}).length > 0;
   const docReactionTargets = collectDocCommentReactionTargets(ds, stored);
+
+  if (ds) {
+    // Usage ledger: flush the final delta before the worker goes away (a
+    // crash/limited turn may never have reached an idle edge).
+    recordUsageForDaemonSession(ds);
+  }
+
+  // Riff owns a remote credential-bearing process. Prove cancellation before
+  // mutating routing, transient capabilities, or the durable row. Non-Riff
+  // closes retain master's synchronous state-transition path.
+  const prepared: RiffClosePreparation = isOwnedRiffClose
+    ? await prepareRiffExplicitClose(ds, stored)
+    : { ok: true };
+  if (!prepared.ok) {
+    return { ...prepared, alreadyClosed: false };
+  }
+  const preparedRiffRequestId = ds?.riffCloseState?.phase === 'prepared'
+    ? ds.riffCloseState.requestId
+    : undefined;
+
+  // 会话关闭即可回收其崩溃重启计数；否则每个曾崩溃过的 session 会在 daemon
+  // 生命周期内永久占位（restartCounts 此前无任何 delete）。
+  restartCounts.delete(sessionId);
   // Per-turn comment routes are transient capabilities. Clear them from both
   // live and owner-scoped persisted objects inside the synchronous close
   // critical section, before any best-effort Lark cleanup can yield.
@@ -2655,30 +3110,33 @@ export async function closeSession(
   if (stored && !wasOpen && storedHadDocCommentTargets) {
     sessionStore.updateSession(stored);
   }
-  if (ds) {
-    // Usage ledger: flush the final delta before the worker goes away (a
-    // crash/limited turn may never have reached an idle edge).
-    recordUsageForDaemonSession(ds);
-    killWorker(ds);
-    const activeKey = activeSessionKey(ds);
-    if (activeSessionsRegistry?.get(activeKey) === ds) {
-      activeSessionsRegistry.delete(activeKey);
-    }
-    // Mark the captured object too. Async message/card paths may already hold a
-    // reference to `ds`; deleting only the registry entry would not stop one of
-    // those continuations from re-forking the closed session after its await.
-    ds.session.status = 'closed';
-    ds.session.closedAt ??= new Date().toISOString();
-    killedLive = true;
-  }
 
   // Mutations are bot-owner scoped. getSession() has a read-only cross-file
   // fallback for agent CLI discovery, so it must not authorize close.
   if (wasOpen) {
-    if (!ds && stored) destroyUnregisteredPersistentBacking(stored);
-    sessionStore.closeSession(sessionId, {
-      cleanupBridgeMarkers: !hadLiveWorker,
-    });
+    if (!ds && stored && !isOwnedRiffClose) destroyUnregisteredPersistentBacking(stored);
+    try {
+      sessionStore.closeSession(sessionId, {
+        cleanupBridgeMarkers: !hadLiveWorker,
+        ...(isOwnedRiffClose ? { clearRiffParentTaskId: true } : {}),
+      });
+    } catch (err) {
+      if (!isOwnedRiffClose) throw err;
+      if (ds && preparedRiffRequestId) {
+        await abortLiveRiffWorkerClose(ds, preparedRiffRequestId);
+      }
+      logger.error(
+        `[${sessionId.slice(0, 8)}] Durable session close failed after Riff prepare; `
+        + `worker admission restored: ${err instanceof Error ? err.message : String(err)}`,
+      );
+      return {
+        ok: false,
+        alreadyClosed: false,
+        error: 'riff_durable_close_failed',
+        retryable: true,
+        ...(prepared.taskId ? { taskId: prepared.taskId } : {}),
+      };
+    }
     const after = sessionStore.getOwnedSession(sessionId);
     if (ds) {
       ds.session.status = 'closed';
@@ -2687,6 +3145,22 @@ export async function closeSession(
   }
 
   if (ds) {
+    killWorker(ds, {
+      ...(preparedRiffRequestId ? { riffCloseCommitRequestId: preparedRiffRequestId } : {}),
+    });
+    // A transferred/restored exact object may remain under more than one alias.
+    // Remove only identity matches, never a same-key successor.
+    if (activeSessionsRegistry) {
+      for (const [registeredKey, candidate] of activeSessionsRegistry) {
+        if (candidate === ds) activeSessionsRegistry.delete(registeredKey);
+      }
+    }
+    // Mark the captured object too. Async message/card paths may already hold a
+    // reference to `ds`; deleting only the registry entry would not stop one of
+    // those continuations from re-forking the closed session after its await.
+    ds.session.status = 'closed';
+    ds.session.closedAt ??= new Date().toISOString();
+    killedLive = true;
     if (!ds.exitEventEmitted) {
       ds.exitEventEmitted = true;
       dashboardEventBus.publish({
@@ -4825,6 +5299,25 @@ export function sendWorkerInput(
     codexAppSteerable?: true;
   } = {},
 ): boolean {
+  const riffRetirementPhase = riffRetirementAdmissionPhase(ds);
+  if (riffRetirementPhase) {
+    logger.warn(
+      `[${tag(ds)}] Rejected turn ${turnId ?? '?'} while Riff retirement fence is ${riffRetirementPhase}`,
+    );
+    void callbacks?.sessionReply(
+      sessionAnchorId(ds),
+      tr('worker.riff_close_in_progress', undefined, localeForBot(ds.larkAppId)),
+      'text',
+      ds.larkAppId,
+      turnId,
+    ).catch(err => {
+      logger.warn(
+        `[${tag(ds)}] Failed to notify rejected Riff close-race turn: `
+        + `${err instanceof Error ? err.message : String(err)}`,
+      );
+    });
+    return false;
+  }
   const transferGate = transferInputGates.get(ds);
   if ((!ds.worker || ds.worker.killed) && !transferGate) return false;
   const normalized = typeof payload === 'string' ? { content: payload } : payload;
@@ -5189,6 +5682,12 @@ export type ForkResumeOrTurnId = boolean | string | {
   /** Correlates a worker restart across the detach/refork boundary so late
    * lifecycle events from the retired worker are not misattributed. */
   restartAttemptId?: string;
+  /** At-most-once turn (idempotency lease): the worker must NEVER replay this
+   *  input after a CLI exit — not via inflight carry-over, not from the still-
+   *  queued pendingMessages. Once the daemon terminalizes the turn, re-executing
+   *  it on an auto-restarted CLI would violate at-most-once (codex #776 round-7
+   *  finding #1). */
+  atMostOnce?: boolean;
 };
 
 /** Central quarantine decision for one fork boundary — the SINGLE authority that
@@ -5352,6 +5851,7 @@ export function forkWorker(
   let initDispatchAttempt: number | undefined;
   let restartAttemptId: string | undefined;
   let initCodexAppInputGateFrozen = promptInput === ds.session.queuedActivationInput;
+  let initAtMostOnce: boolean | undefined;
   if (typeof resumeOrTurnId === 'string') {
     initTurnId = resumeOrTurnId;
   } else if (typeof resumeOrTurnId === 'object' && resumeOrTurnId !== null) {
@@ -5360,6 +5860,7 @@ export function forkWorker(
     initDispatchAttempt = resumeOrTurnId.dispatchAttempt;
     restartAttemptId = resumeOrTurnId.restartAttemptId;
     initCodexAppInputGateFrozen ||= resumeOrTurnId.codexAppInputGateFrozen === true;
+    initAtMostOnce = resumeOrTurnId.atMostOnce;
   } else {
     resume = resumeOrTurnId;
   }
@@ -5796,11 +6297,19 @@ export function forkWorker(
       } else {
         reparkQueuedActivationFollowUpTail(ds, 'worker error during activation follow-up handoff');
       }
-      ds.worker = null;
-      ds.workerPort = null;
-      ds.workerToken = null;
-      ds.workerViewToken = null;
-      ds.managedTurnOrigin = undefined;
+      const retainExactRetirementGeneration = ds.riffShutdownState !== undefined
+        || ds.riffCloseState !== undefined;
+      if (!retainExactRetirementGeneration) {
+        ds.worker = null;
+        ds.workerPort = null;
+        ds.workerToken = null;
+        ds.workerViewToken = null;
+        ds.managedTurnOrigin = undefined;
+        ds.riffCloseState = undefined;
+      }
+      // The retirement coordinator owns a prepared generation. Keep the exact
+      // ChildProcess pointer until exit so it can decide whether abort/commit
+      // was durably verified.
       try { worker.kill(); } catch { /* best-effort failed-child fence */ }
     }
     if (startupState.failureNotified) return;
@@ -5964,6 +6473,9 @@ export function forkWorker(
     ...((ds.session.codexAppGenerationCommits?.length ?? 0) > 0
       ? { codexAppGenerationCommits: ds.session.codexAppGenerationCommits }
       : {}),
+    // At-most-once (idempotency lease): ride the flag on the init message so the
+    // worker tags the keyed init prompt no-replay (codex #776 round-7 #1).
+    ...(initAtMostOnce ? { atMostOnce: true } : {}),
     vcMeetingImTurnOrigin: initVcMeetingImTurnOrigin,
     pluginBindings: botCfg.plugins,
     skillPolicy: botCfg.skills,
@@ -6218,6 +6730,13 @@ function setupWorkerHandlers(
   // Codex badge before a role switch starts a non-Codex worker.
   ds.codexServiceTier = undefined;
   ds.pendingCodexTierCardRefresh = undefined;
+  // Active runtime is likewise authority of this exact worker generation. The
+  // new worker republishes it via active_runtime after re-reading the rollout;
+  // clear it here so the window between respawn and that first observation
+  // cannot leave a stale model/effort tail on the card.
+  ds.activeModel = undefined;
+  ds.activeReasoningEffort = undefined;
+  ds.pendingActiveRuntimeCardRefresh = undefined;
   const handlerSession = ds.session;
   const handlerAnchor = sessionAnchorId(ds);
   const handlerLarkAppId = ds.larkAppId;
@@ -6754,6 +7273,7 @@ function setupWorkerHandlers(
           recallFrozenCards(ds);
           flushPendingLocalCliOpenReadinessPatch(ds);
           flushPendingRiffUrlPatch(ds);
+          flushPendingActiveRuntimePatch(ds);
           flushPendingCodexServiceTierPatch(ds);
           // Fresh ready POST: if this turn is already `working` (e.g. relay
           // resume where the CLI kept running), arm here — same authorized arm
@@ -6943,6 +7463,29 @@ function setupWorkerHandlers(
         break;
       }
 
+      case 'active_runtime': {
+        if (
+          ds.worker !== worker
+          || ds.workerGeneration !== workerGeneration
+          || ds.session.workerGeneration !== workerGeneration
+        ) {
+          logger.warn(`[${t}] Ignored active_runtime from stale worker generation`);
+          break;
+        }
+        const model = msg.model?.trim() || undefined;
+        const reasoningEffort = msg.reasoningEffort?.trim() || undefined;
+        if (
+          ds.activeModel === model
+          && ds.activeReasoningEffort === reasoningEffort
+        ) {
+          break;
+        }
+        ds.activeModel = model;
+        ds.activeReasoningEffort = reasoningEffort;
+        scheduleActiveRuntimePatch(ds);
+        break;
+      }
+
       case 'codex_service_tier': {
         if (
           ds.worker !== worker
@@ -6955,6 +7498,13 @@ function setupWorkerHandlers(
         ds.codexServiceTier = effectiveCliId === 'codex'
           ? (msg.snapshot ?? undefined)
           : undefined;
+        // Model/effort now flow through the active_runtime channel (Codex
+        // publishes them from every turn_context, same as TRAE), so this
+        // handler is scoped to the ⚡ service-tier badge only and must NOT
+        // also write activeModel/activeReasoningEffort — doing so would race
+        // the active_runtime writer and, since thread_settings_applied is not
+        // emitted in many sessions, could clobber the good value with a stale
+        // one.
         scheduleCodexServiceTierPatch(ds);
         break;
       }
@@ -7107,6 +7657,7 @@ function setupWorkerHandlers(
               recallFrozenCards(ds);
               flushPendingLocalCliOpenReadinessPatch(ds);
               flushPendingRiffUrlPatch(ds);
+              flushPendingActiveRuntimePatch(ds);
               flushPendingCodexServiceTierPatch(ds);
               // New-turn POST is the FIRST working screen_update of the turn —
               // the else (same-turn PATCH) branch never runs for it, so arm the
@@ -7123,6 +7674,7 @@ function setupWorkerHandlers(
               logger.debug(`[${t}] Failed to create streaming card: ${err}`);
               ds.streamCardId = undefined;
               clearPendingLocalCliOpenReadinessPatch(ds);
+              ds.pendingActiveRuntimeCardRefresh = undefined;
               ds.pendingCodexTierCardRefresh = undefined;
               persistStreamCardState(ds);
             });
@@ -7599,6 +8151,32 @@ function setupWorkerHandlers(
           break;
         }
 
+        // Riff is a remote lineage-owning backend, not a local CLI process.
+        // The worker intentionally refuses restart because tearing it down can
+        // destroy or orphan the remote sandbox. Stop before crash-loop
+        // accounting and tell the user how to recover, rather than logging an
+        // "auto-restart" whose IPC is guaranteed to be a no-op.
+        if (isRiffBackendSession(ds)) {
+          const retirementPhase = riffRetirementAdmissionPhase(ds);
+          logger.warn(
+            `[${t}] Riff backend exited; automatic restart is unsupported`
+            + (retirementPhase ? ` (${retirementPhase})` : ''),
+          );
+          // Explicit /close and daemon shutdown already own the user-visible
+          // lifecycle. Only an unexpected backend exit needs recovery guidance.
+          if (!retirementPhase && !suppressExitUi) {
+            try {
+              await scopedReply(tr('cmd.restart.riff_unsupported', undefined, loc), 'text', undefined);
+            } catch (replyErr) {
+              if (replyErr instanceof MessageWithdrawnError) {
+                logger.warn(`[${t}] Root message withdrawn, closing stale session`);
+                cb.closeSession(ds);
+              }
+            }
+          }
+          break;
+        }
+
         // Rate-limit auto-restart to prevent crash loops
         const key = ds.session.sessionId;
         const rc = restartCounts.get(key) ?? { count: 0, lastAt: 0 };
@@ -7721,8 +8299,16 @@ function setupWorkerHandlers(
         if (msg.taskId === null) {
           // follow-up 血缘断裂：清掉持久化锚点，否则 daemon 重启会复活已判坏的 parent。
           if (ds.session.riffParentTaskId) {
+            const priorTaskId = ds.session.riffParentTaskId;
             ds.session.riffParentTaskId = undefined;
-            sessionStore.updateSession(ds.session);
+            try {
+              sessionStore.updateSession(ds.session);
+            } catch (err) {
+              ds.session.riffParentTaskId = priorTaskId;
+              logger.error(
+                `[${t}] Failed to clear Riff lineage: ${err instanceof Error ? err.message : String(err)}`,
+              );
+            }
           }
           break;
         }
@@ -7732,7 +8318,34 @@ function setupWorkerHandlers(
         // next message continues the riff conversation in the warm sandbox
         // instead of cold-booting a context-less fresh task (4-5 min).
         ds.session.riffParentTaskId = msg.taskId;
-        sessionStore.updateSession(ds.session);
+        try {
+          sessionStore.updateSession(ds.session);
+        } catch (err) {
+          // Retain the newest runtime lineage. A close_result or later task-id
+          // event retries persistence; reverting here would make a follow-up
+          // target the stale parent while the worker owns the new child.
+          logger.error(
+            `[${t}] Failed to persist Riff lineage ${msg.taskId}: ${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+        break;
+      }
+
+      case 'close_result': {
+        const pending = pendingRiffWorkerCloses.get(msg.requestId);
+        if (!pending
+          || pending.worker !== worker
+          || pending.sessionId !== ds.session.sessionId
+          || ds.worker !== worker) {
+          logger.warn(`[${t}] Ignored stale/unmatched Riff close result ${msg.requestId}`);
+          break;
+        }
+        pendingRiffWorkerCloses.delete(msg.requestId);
+        pending.resolve({
+          ok: msg.ok,
+          ...(msg.taskId ? { taskId: msg.taskId } : {}),
+          ...(msg.error ? { error: msg.error } : {}),
+        });
         break;
       }
 
@@ -7916,8 +8529,47 @@ function setupWorkerHandlers(
           logger.warn(`[${t}] Dropped managed_turn_origin with mismatched sessionId`);
           break;
         }
+        // macOS uses one stable per-session pathname visible inside Seatbelt.
+        // Only the daemon handler for the CURRENT ChildProcess generation may
+        // replace it. Stale workers can still emit IPC, but the identity guard
+        // above drops them before filesystem mutation, so they cannot overwrite
+        // a successor capability (or unlink it during teardown).
+        if (process.platform === 'darwin' && msg.originChannelId) {
+          if (!/^[a-f0-9]{64}$/.test(msg.originChannelId)) {
+            ds.managedTurnOrigin = undefined;
+            logger.error(`[${t}] Refused managed origin publication with an invalid pane channel`);
+            break;
+          }
+          try {
+            const ipcPort = Number(process.env.BOTMUX_DAEMON_IPC_PORT);
+            replaceManagedOriginCapabilityFile(
+              managedOriginCapabilityPath(
+                config.session.dataDir,
+                msg.sessionId,
+                msg.originChannelId,
+              ),
+              JSON.stringify({
+                sessionId: msg.sessionId,
+                channelId: msg.originChannelId,
+                capability: msg.capability,
+                ...(Number.isSafeInteger(ipcPort) && ipcPort > 0 && ipcPort <= 65_535
+                  ? { ipcPort }
+                  : {}),
+                ...(msg.turnId ? { turnId: msg.turnId } : {}),
+                ...(msg.dispatchAttempt !== undefined
+                  ? { dispatchAttempt: msg.dispatchAttempt }
+                  : {}),
+              }),
+            );
+          } catch (err) {
+            ds.managedTurnOrigin = undefined;
+            logger.error(`[${t}] Failed to publish daemon-owned managed origin capability: ${err instanceof Error ? err.message : String(err)}`);
+            break;
+          }
+        }
         ds.managedTurnOrigin = {
           capability: msg.capability,
+          ...(msg.originChannelId ? { originChannelId: msg.originChannelId } : {}),
           ...(msg.turnId ? { turnId: msg.turnId } : {}),
           ...(msg.dispatchAttempt !== undefined
             ? { dispatchAttempt: msg.dispatchAttempt }
@@ -7941,6 +8593,12 @@ function setupWorkerHandlers(
           && ds.managedTurnOrigin?.capability
           && ds.managedTurnOrigin.capability !== msg.capability) {
           logger.warn(`[${t}] Ignored stale managed turn origin revoke after capability rotation`);
+          break;
+        }
+        if (msg.originChannelId
+          && ds.managedTurnOrigin?.originChannelId
+          && ds.managedTurnOrigin.originChannelId !== msg.originChannelId) {
+          logger.warn(`[${t}] Ignored managed_turn_origin_revoked for a different pane channel`);
           break;
         }
         if (!msg.capability && ds.managedTurnOrigin
@@ -8335,7 +8993,14 @@ function setupWorkerHandlers(
       // Dead worker generation — stop the periodic usage refresh immediately
       // instead of waiting a tick for it to self-clear on !workerHasInitialized.
       clearUsageRefreshTimer(ds);
+      ds.workerToken = null;
+      ds.workerViewToken = null;
       ds.managedTurnOrigin = undefined;
+      if (ds.riffCloseState) {
+        ds.riffCloseState = { ...ds.riffCloseState, phase: 'uncertain' };
+      }
+      // Do not clear riffShutdownState here. Only the shutdown coordinator can
+      // release a generation after lineage persistence or admission restore.
       // This worker generation is gone. Invalidate any stuck-warning card it
       // posted so a late click cannot inject keys into a replacement worker.
       invalidateStuckWarning(ds, 'worker_exit');
@@ -8526,6 +9191,10 @@ function deliverFinalOutput(
     // (with content + usage) after a daemon restart drops the in-memory Map.
     // Stamp the owning bot for cross-bot isolation.
     asyncTriggerStore.recordCompleted(ds.session.sessionId, msg.turnId, msg.content, completedAt, ds.larkAppId, msg.usage);
+    // This idempotent async turn produced its terminal output — clear the
+    // worker-exit convergence stamp so a later graceful exit of this generation
+    // is not retro-failed (codex #776 round-6 finding #1).
+    if (ds.idempotentAsyncTurn?.triggerId === msg.turnId) ds.idempotentAsyncTurn = undefined;
     ds.lastBridgeEmittedUuid = finalOutputDedupeKey(ds, msg);
     logger.info(`[${t}] Captured final_output for Async HTTP request (turn ${msg.turnId.substring(0, 8)})`);
     onComplete?.(true);

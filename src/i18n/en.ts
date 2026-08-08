@@ -296,6 +296,9 @@ export const messages: Record<string, string> = {
   'cmd.restart.failed': '❌ Failed to restart {cliName}.',
   'cmd.restart.timed_out': '⌛ {cliName} restart timed out before becoming ready.',
   'cmd.restart.terminated': '{cliName} has been terminated; it will auto-resume on your next message.',
+  'cmd.restart.riff_unsupported': '⚠️ Riff sessions cannot be restarted. Use /close to close the current remote session, then send a new message to create one.',
+  'cmd.cd.riff_unsupported': '⚠️ Riff sessions cannot switch working directory or role in place. Use /close to close the current remote session, then create one from the new directory.',
+  'cmd.takeover.riff_unsupported': '⚠️ Riff sessions cannot adopt or import another session in place. Use /close to safely close the current remote session, then create or import a session.',
   'cmd.cd.usage': 'Usage: /cd <path>\nExample: /cd ~/projects/my-app',
   'cmd.cd.switched': 'Working directory switched to {path}. It will resume there on your next message.',
   'cmd.cd.created_switched': '📁 Directory did not exist — created it and switched to {path}. It will resume there on your next message.',
@@ -684,7 +687,7 @@ export const messages: Record<string, string> = {
   'ai.routing.must_use_botmux': 'To make the user see something, you MUST send it via the `botmux send` command. Terminal output does NOT reach the chat.',
   'ai.routing.no_visible_output_ok': 'IMPORTANT: a successful `botmux send` (exit code 0 / returns `{"success":true,...}`) means the message was DELIVERED to the user. So ending a turn with NO visible terminal text is entirely normal and expected here — not a failure. If you later see a note like "your previous response had no visible output, please continue", that is a false alarm from the underlying CLI: do NOT resend. Only retry when `botmux send` itself failed (non-zero exit or printed a send error).',
   'ai.routing.usage_heading': 'How to use it:',
-  'ai.routing.usage_send_when': '- Use `botmux send` for: key conclusions, plans (wait for user approval before acting), final results, progress updates. If you have anything for the user, you MUST `botmux send` it first. Only when there is nothing left to send this turn — everything meant for the user is already sent, or the turn genuinely needs no reply (e.g. the whole message was addressed to another bot) — make the final assistant message exactly `BOTMUX_NOTHING_TO_SEND` (meaning "nothing left to send"; no need to explain the silence). It is NOT a shortcut for skipping a reply: ending with it when you owed a reply you never sent means the user got ghosted.',
+  'ai.routing.usage_send_when': '- Use `botmux send` for: key conclusions, plans (wait for user approval before acting), final results, progress updates. If you have anything for the user, you MUST `botmux send` it first, or the user sees nothing; only when the turn genuinely needs no reply (the message was not for you / was addressed to another bot) make the final assistant message just the single word `BOTMUX_NOTHING_TO_SEND`.',
   'ai.routing.usage_send_text': '- Plain text is fine: `botmux send "your message"`. Formatting is auto-handled.',
   'ai.routing.usage_heredoc': '- Multi-line body text MUST use a quoted heredoc / stdin (or a UTF-8 `--content-file`). Never write `botmux send "line1\\nline2"` or pass `JSON.stringify` / JSON-escaped text as a positional argument; shell / botmux do not turn literal `\\n` back into newlines.',
   'ai.routing.heredoc_example': "  Correct multi-line example:\n```bash\nbotmux send <<'EOF'\nline 1\nline 2\nEOF\n```",
@@ -693,6 +696,7 @@ export const messages: Record<string, string> = {
   'ai.routing.usage_videos': '- Attach video previews: `botmux send --videos /path/to/replay.mp4 --video-covers /path/to/cover.png --no-mention "preview"`',
   'ai.routing.usage_history': '- Need prior context? Use `botmux history` to read this session\'s history.',
   'ai.routing.usage_bots_list': '- List collaborator bots in the group: `botmux bots list`',
+  'ai.send.after_success_hint': 'If you still have anything for the user this turn, keep using `botmux send`; if not, make the final reply just the single word BOTMUX_NOTHING_TO_SEND (write nothing else).',
 
   // ─── AI identity (multi-bot routing rules) ───────────────────────────────
   'ai.identity.unknown': '(unknown)',
@@ -715,7 +719,7 @@ export const messages: Record<string, string> = {
   'ai.shell.multiline_heredoc': 'Multi-line body text MUST use a quoted heredoc / stdin (or a UTF-8 `--content-file`). Never write `botmux send "line1\\nline2"` or pass `JSON.stringify` / JSON-escaped text as a positional argument; shell / botmux do not turn literal `\\n` back into newlines.',
   'ai.shell.heredoc_example': "Correct multi-line example:\n```bash\nbotmux send <<'EOF'\nline 1\nline 2\nEOF\n```",
   'ai.shell.helpers': 'Helpers: `botmux history` (read this session\'s history — thread/topic sessions are topic-scoped; regular-group chat-scope sessions are group-wide), `botmux quoted <message_id>` (fetch a quoted message — only use it when the prompt header shows `[user quoted message ...]`), `botmux bots list` (list other bots in the group).',
-  'ai.shell.when_to_send': 'When to send: key conclusions, plans (wait for user approval before acting), final results, progress updates. A bare `print`/`echo` does NOT count as a reply. If you have anything for the user, you MUST `botmux send` it first. Only when there is nothing left to send this turn — everything meant for the user is already sent, or the turn genuinely needs no reply (e.g. the whole message was addressed to another bot) — make the final assistant message exactly `BOTMUX_NOTHING_TO_SEND` (meaning "nothing left to send"; no need to explain the silence). It is NOT a shortcut for skipping a reply: ending with it when you owed a reply you never sent means the user got ghosted.',
+  'ai.shell.when_to_send': 'When to send: key conclusions, plans (wait for user approval before acting), final results, progress updates. A bare `print`/`echo` does NOT count as a reply. If you have anything for the user, you MUST `botmux send` it first, or the user sees nothing; only when the turn genuinely needs no reply (the message was not for you / was addressed to another bot) make the final assistant message just the single word `BOTMUX_NOTHING_TO_SEND`.',
   'ai.shell.no_visible_output_ok': 'A successful `botmux send` (exit code 0) means it reached the user; ending a turn with no visible terminal text is normal. If you see a note like "your previous response had no visible output, please continue and produce a user-visible response", that is a false alarm from the underlying CLI — do NOT resend unless `botmux send` itself errored.',
   'ai.shell.mention_gate': '@ decision (mandatory): every `botmux send` MUST explicitly pick one or it errors — `--mention <open_id:name>` (name a specific person/bot; REQUIRED to communicate or collaborate with another bot) / `--mention-back` (@ the triggerer of THIS turn) / `--no-mention` (none). First decide WHETHER to @ by VALUE: substantive conclusion the other party should read/confirm/decide → @ someone; pure record / low-priority / short ack → --no-mention; a contentless "got it" is better not sent. Then pick HOW by recipient: it is the person/bot that triggered this turn → --mention-back; it is someone else (in a multi-person chat the right recipient is often not the triggerer) → --mention to name them. Do not default to --no-mention, and do not @ people for nothing.',
 
@@ -725,8 +729,8 @@ export const messages: Record<string, string> = {
   'ai.available_bots.hint': 'To communicate or collaborate with a bot listed here you MUST --mention its open_id (botmux send --mention ou_xxx ...). Without --mention the other bot receives nothing.',
   'ai.available_bots.hint_collapsed': 'To communicate or collaborate with another bot, first run `botmux bots list` to get its open_id, then --mention it. Without --mention the other bot receives nothing.',
   'ai.available_bots.collapsed_line': 'There are {count} collaborator bots in this chat: {names}.',
-  'ai.followup.reminder': 'If you have anything for the user, you MUST `botmux send` it first; only when there is nothing left to send this turn (already sent, or genuinely no reply needed) make the final exactly BOTMUX_NOTHING_TO_SEND — it is not a shortcut for skipping a reply.',
-  'ai.followup.reminder_no_resend': 'If you have anything for the user, you MUST `botmux send` it first; only when there is nothing left to send this turn (already sent, or genuinely no reply needed) make the final exactly BOTMUX_NOTHING_TO_SEND — it is not a shortcut for skipping a reply. A successful send is already delivered; ending a turn with no visible text is normal, so do not resend on a "no visible output" nudge.',
+  'ai.followup.reminder': 'If you have anything for the user, you MUST `botmux send` it first; only when the turn genuinely needs no reply (message was not for you / addressed to another bot) make the final just the single word BOTMUX_NOTHING_TO_SEND.',
+  'ai.followup.reminder_no_resend': 'If you have anything for the user, you MUST `botmux send` it first; only when the turn genuinely needs no reply (message was not for you / addressed to another bot) make the final just the single word BOTMUX_NOTHING_TO_SEND. A successful send is already delivered; ending a turn with no visible text is normal, so do not resend on a "no visible output" nudge.',
   'ai.cursor.sender_note': 'The sender tag is metadata identifying the current speaker — never copy its open_id or name (e.g. ou_xxx:Alice) into your botmux send body or opening line; to @ the triggerer use botmux send --mention-back.',
   'ai.bridge.attachments_label': '[Attachments]',
   'ai.bridge.mentions_label': '[@Mentions]',
@@ -834,6 +838,7 @@ export const messages: Record<string, string> = {
 
   // ─── Worker → daemon notices ─────────────────────────────────────────────
   'worker.adopted_session_exited': '⏏ Adopted CLI session has exited.',
+  'worker.riff_close_in_progress': '⏳ The remote Riff session is closing. Wait for the close result before sending another message.',
   'worker.crash_loop_stopped': '⚠️ {cliName} crashed {count} times in 1 minute. Auto-restart disabled. Send a message to retry.',
   'worker.crash_diagnostic_terminal': 'The web terminal, where available, preserves the last startup output. Fix the issue, then send a new message to retry.',
   'worker.crash_recent_output': 'Recent terminal output:',

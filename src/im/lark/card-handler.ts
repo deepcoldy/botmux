@@ -98,7 +98,7 @@ import { buildTerminalUrl } from '../../core/terminal-url.js';
 import type { ProjectInfo } from '../../services/project-scanner.js';
 import { createRepoWorktree, removeRepoWorktree, dirSuffixForBranch, pushWorktreeBranch } from '../../services/git-worktree.js';
 import { withCodexAppContext } from '../../utils/codex-app-context.js';
-import { resolvePairedSpawnBackendType } from '../../core/persistent-backend.js';
+import { isRiffBackendSession, resolvePairedSpawnBackendType } from '../../core/persistent-backend.js';
 import { sessionConfiguredRuntimeDisplayName } from '../../core/cli-runtime-display.js';
 import { worktreeSlugFromContextAI } from '../../services/worktree-slug-ai.js';
 import { t, localeForBot, isLocale, type Locale } from '../../i18n/index.js';
@@ -447,6 +447,17 @@ export async function commitRepoSelection(
       `[${tag(ds)}] Ignoring stale repo-card callback ${cardMessageId} `
       + `(current=${ds.repoCardMessageId ?? 'none'})`,
     );
+    return false;
+  }
+
+  // A live Riff generation cannot use the generic close-and-refork branch.
+  // Riff teardown is a remote prepare/commit protocol; a failed cancellation
+  // followed by forkWorker would reach the double-fork kill and orphan the
+  // still-live remote task.  Require an explicit /close before any card,
+  // worktree, or manual-directory selection can replace this generation.
+  if (!ds.pendingRepo && isRiffBackendSession(ds)) {
+    await sessionReply(rootId, t('cmd.cd.riff_unsupported', undefined, locTarget));
+    logger.warn(`[${tag(ds)}] Repo switch refused: Riff session requires explicit close before replacement`);
     return false;
   }
 
@@ -2229,6 +2240,21 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         await sessionReply(rootId, t('card.action.adopt_no_restart', undefined, locDs));
         return;
       }
+      // New Riff cards omit this button, but old/stale cards remain clickable.
+      // Surface the same explicit close-and-recreate guidance as /restart
+      // instead of forwarding an IPC the Riff worker must silently refuse.
+      if (isRiffBackendSession(ds)) {
+        logger.warn(`[${tag(ds)}] Rejected restart on Riff backend session`);
+        const unsupported = t('cmd.restart.riff_unsupported', undefined, locDs);
+        await deliverEphemeralOrReply(
+          ds,
+          operatorOpenId,
+          unsupported,
+          'text',
+          () => sessionReply(rootId, unsupported),
+        );
+        return;
+      }
       // Codex App: an accepted-but-unsettled dispatch still owns the turn route.
       // requestSessionRestart does not itself gate on dispatch ownership, so
       // reject here before the restart coordinator tears the worker down.
@@ -3358,6 +3384,15 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
   if (!allowRepo) {
     logger.info(`Repo card action blocked for ${operatorOpenId} (pending=${targetDs.pendingRepo})`);
     return { toast: { type: 'error', content: t('card.grant.toast_no_repo_perm', undefined, localeForBot(targetDs.larkAppId)) } };
+  }
+
+  // Reject a live Riff repo/worktree replacement before slug generation or
+  // any local/remote Git side effect. First-spawn pendingRepo selections stay
+  // recoverable when a synchronous fork failure has already stamped Riff.
+  if (!targetDs.pendingRepo && isRiffBackendSession(targetDs)) {
+    await sessionReply(rootId, t('cmd.cd.riff_unsupported', undefined, localeForBot(targetDs.larkAppId)));
+    logger.warn(`[${tag(targetDs)}] Repo switch refused before Git work: Riff session requires explicit close before replacement`);
+    return;
   }
 
   // Resolve the project name from cached scan

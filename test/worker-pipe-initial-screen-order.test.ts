@@ -35,13 +35,15 @@ describe('worker pipe initial screen ordering', () => {
 
     const closeCase = source.slice(
       source.indexOf("case 'close':"),
-      source.indexOf("case 'suspend':", source.indexOf("case 'close':")),
+      source.indexOf("case 'detach_for_transfer':", source.indexOf("case 'close':")),
     );
-    const setCloseIdx = closeCase.indexOf('closeRequested = true;');
-    const ackIdx = closeCase.indexOf("send({ type: 'session_close_ready', sessionId });");
-    const stopBridgeIdx = closeCase.indexOf('stopBridgeWatcher();');
-    const teardownIdx = closeCase.indexOf('backend?.destroySession?.();');
-    const clearIdx = closeCase.indexOf('clearSendMarkers();');
+    const localCloseIdx = closeCase.indexOf('// Local close:');
+    const setCloseIdx = closeCase.lastIndexOf('closeRequested = true;', localCloseIdx);
+    const ackIdx = closeCase.lastIndexOf("send({ type: 'session_close_ready', sessionId });", localCloseIdx);
+    const stopBridgeIdx = closeCase.lastIndexOf('stopBridgeWatcher();', localCloseIdx);
+    const teardownIdx = closeCase.indexOf('backend?.destroySession?.();', localCloseIdx);
+    const clearIdx = closeCase.indexOf('clearSendMarkers();', localCloseIdx);
+    expect(localCloseIdx).toBeGreaterThan(-1);
     expect(setCloseIdx).toBeGreaterThan(-1);
     expect(ackIdx).toBeGreaterThan(setCloseIdx);
     expect(stopBridgeIdx).toBeGreaterThan(ackIdx);

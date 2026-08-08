@@ -497,7 +497,7 @@ describe('core-only entrypoint hardening (codex 4 P1s — source lock)', () => {
     // after restore, ready line last.
     const armAt = daemonSource.indexOf('armCoreOnlyReadinessGate()');
     const bindAt = daemonSource.indexOf('const ipcHandle = await startIpcServer(');
-    const restoreAt = daemonSource.indexOf('await restoreActiveSessions(activeSessions)');
+    const restoreAt = daemonSource.indexOf('await restoreActiveSessions(activeSessions');
     const readyAt = daemonSource.indexOf('setCoreOnlyReady()');
     const readyLineAt = daemonSource.indexOf('[core-only] listening on 127.0.0.1:');
     expect(armAt).toBeGreaterThan(0);

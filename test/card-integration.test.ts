@@ -522,6 +522,31 @@ describe('Card integration: full event flow', () => {
       expect(deps.sessionReply).not.toHaveBeenCalled();
     });
 
+    it('restart from a stale Riff card should explain close-and-recreate without IPC', async () => {
+      const clientMod = await import('../src/im/lark/client.js');
+      const workerSend = vi.fn();
+      const ds = makeDaemonSession({
+        worker: { killed: false, send: workerSend } as any,
+      });
+      ds.session.cliId = 'riff';
+      ds.session.backendType = 'riff';
+      const sessions = new Map<string, DaemonSession>();
+      sessions.set(sessionKey(ROOT_ID, APP_ID), ds);
+      const deps = makeDeps(sessions);
+
+      await handleCardAction(makeRestartEvent(ROOT_ID), deps, APP_ID);
+
+      expect(workerSend).not.toHaveBeenCalled();
+      expect(forkWorker).not.toHaveBeenCalled();
+      expect(vi.mocked(clientMod.sendEphemeralCard)).toHaveBeenCalledWith(
+        APP_ID,
+        ds.chatId,
+        'ou_user',
+        expect.stringMatching(/Riff.*不支持重启.*\/close/),
+      );
+      expect(deps.sessionReply).not.toHaveBeenCalled();
+    });
+
     it('restart without worker should re-fork', async () => {
       const ds = makeDaemonSession({ worker: null });
       const sessions = new Map<string, DaemonSession>();

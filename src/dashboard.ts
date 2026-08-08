@@ -153,6 +153,8 @@ import {
 } from './services/skill-registry-store.js';
 import { redactGitUrlCredentials } from './core/skills/sources.js';
 import { effectiveDefaultWorkingDir, getBot, loadBotConfigs, parseBotConfigsFromText, type BotConfig, type VcMeetingAgentConfig } from './bot-registry.js';
+import { addChatToFeedGroup, createFeedGroup, FEED_GROUP_SCOPES, FeedGroupApiError, listFeedGroups } from './dashboard/feed-groups.js';
+import { generateAuthUrl, handleCallbackUrl, isCallbackUrl } from './utils/user-token.js';
 import { findEntryIndex, readRawConfig, requireConfigPath, writeRawConfigAtomic } from './services/config-store.js';
 import {
   emitCodexNotifierOutboxItem,
@@ -205,7 +207,7 @@ import { maybeInstallTraexPluginOnSettingsChange, TRAEX_RECOMMENDED_SOURCE, TRAE
 import { deriveCreateGroupName, selectCreateSessionTargets } from './core/session-create.js';
 import { parseDashboardImageUploads } from './core/dashboard-images.js';
 import { checkLarkCliVersion, MIN_LARK_CLI_VERSION_FOR_VC_BOT } from './vc-agent/polling-source.js';
-import { larkHosts } from './im/lark/lark-hosts.js';
+import { larkHosts, normalizeBrand } from './im/lark/lark-hosts.js';
 import { buildResourceMonitorDaemonSeeds, createResourceMonitorService, handleResourceMonitorApi, toResourceMonitorSessionSeed } from './dashboard/resource-monitor-service.js';
 import { readPluginRegistry } from './services/plugin-registry-store.js';
 import { pluginRuntimeDir, resolvePluginPath } from './core/plugins/paths.js';
@@ -5066,6 +5068,63 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    // Native Feishu/Lark conversation labels (feed groups). These APIs are
+    // user-token-only, so the frontend pins subsequent create/assign calls to
+    // the same app whose OAuth token produced this list.
+    if (req.method === 'GET' && url.pathname === '/api/feed-groups/auth-url') {
+      const appId = url.searchParams.get('larkAppId') ?? '';
+      let bot: BotConfig | undefined;
+      try { bot = loadBotConfigs().find(item => !item.apiOnly && (!appId || item.larkAppId === appId)); }
+      catch { /* handled below */ }
+      if (!bot) return jsonRes(res, 404, { ok: false, error: 'bot_not_found' });
+      const { authUrl } = generateAuthUrl(bot.larkAppId, bot.larkAppSecret, normalizeBrand(bot.brand), [...FEED_GROUP_SCOPES]);
+      return jsonRes(res, 200, { ok: true, larkAppId: bot.larkAppId, authUrl });
+    }
+
+    if (req.method === 'POST' && url.pathname === '/api/feed-groups/oauth-callback') {
+      let body: { callbackUrl?: unknown };
+      try { body = await readJsonBody(req) as { callbackUrl?: unknown }; }
+      catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+      const callbackUrl = typeof body.callbackUrl === 'string' ? body.callbackUrl.trim() : '';
+      if (!isCallbackUrl(callbackUrl)) {
+        return jsonRes(res, 400, { ok: false, error: 'invalid_callback_url', message: '请粘贴完整的 127.0.0.1 OAuth 回调 URL。' });
+      }
+      const message = await handleCallbackUrl(callbackUrl);
+      const ok = typeof message === 'string' && message.startsWith('✅');
+      return jsonRes(res, ok ? 200 : 400, { ok, error: ok ? undefined : 'oauth_exchange_failed', message });
+    }
+
+    if (req.method === 'GET' && url.pathname === '/api/feed-groups') {
+      const requestedAppId = url.searchParams.get('larkAppId') ?? '';
+      let bots: BotConfig[];
+      try { bots = loadBotConfigs().filter(bot => !bot.apiOnly); }
+      catch { return jsonRes(res, 500, { ok: false, error: 'bot_config_unavailable' }); }
+      const ordered = requestedAppId
+        ? [...bots.filter(bot => bot.larkAppId === requestedAppId), ...bots.filter(bot => bot.larkAppId !== requestedAppId)]
+        : bots;
+      let loginRequired = false;
+      for (const bot of ordered) {
+        try {
+          const groups = await listFeedGroups(bot);
+          return jsonRes(res, 200, { ok: true, larkAppId: bot.larkAppId, groups });
+        } catch (error) {
+          if (error instanceof FeedGroupApiError && error.code === 'user_login_required') {
+            loginRequired = true;
+            continue;
+          }
+          if (requestedAppId && bot.larkAppId === requestedAppId) {
+            const e = error as FeedGroupApiError;
+            return jsonRes(res, e.status ?? 502, { ok: false, error: e.code ?? 'feed_group_list_failed', message: e.message });
+          }
+        }
+      }
+      return jsonRes(res, loginRequired ? 401 : 503, {
+        ok: false,
+        error: loginRequired ? 'user_login_required' : 'feed_group_api_unavailable',
+        message: loginRequired ? '尚未获得飞书标签权限，请点击「立即授权」按钮进行授权。' : '没有可用于读取标签的飞书机器人。',
+      });
+    }
+
     // Create a new chat — pick a creator from the user-selected larkAppIds
     // (Feishu makes the calling bot the implicit first member, so picking
     // anything else would silently add an unwanted bot). Auto-invite the
@@ -5073,7 +5132,7 @@ const server = createServer(async (req, res) => {
     // are app-scoped, so creator daemon and operator open_id come from the
     // SAME bot by construction. See dashboard/operator-selector.ts.
     if (req.method === 'POST' && url.pathname === '/api/groups/create') {
-      let parsed: { name?: unknown; larkAppIds?: unknown; userOpenIds?: unknown; ownerUnionIds?: unknown; bindWorkingDir?: unknown; roleProfileId?: unknown };
+      let parsed: { name?: unknown; larkAppIds?: unknown; userOpenIds?: unknown; ownerUnionIds?: unknown; bindWorkingDir?: unknown; roleProfileId?: unknown; feedGroupId?: unknown; newFeedGroupName?: unknown; feedGroupAppId?: unknown };
       try {
         const chunks: Buffer[] = [];
         for await (const c of req) chunks.push(c as Buffer);
@@ -5159,6 +5218,24 @@ const server = createServer(async (req, res) => {
         } else {
           upstreamJson.autoInvitedOpenId = autoInvited;
         }
+        const existingFeedGroupId = typeof parsed.feedGroupId === 'string' ? parsed.feedGroupId.trim() : '';
+        const newFeedGroupName = typeof parsed.newFeedGroupName === 'string' ? parsed.newFeedGroupName.trim() : '';
+        const feedGroupAppId = typeof parsed.feedGroupAppId === 'string' ? parsed.feedGroupAppId.trim() : '';
+        if (upstream.ok && upstreamJson.ok && typeof upstreamJson.chatId === 'string' && (existingFeedGroupId || newFeedGroupName)) {
+          try {
+            const feedBot = loadBotConfigs().find(bot => bot.larkAppId === feedGroupAppId && !bot.apiOnly);
+            if (!feedBot) {
+              upstreamJson.feedGroupError = '读取标签所用的机器人当前不可用。群聊已创建，但未加入标签。';
+            } else {
+              const targetId = existingFeedGroupId || await createFeedGroup(feedBot, newFeedGroupName);
+              await addChatToFeedGroup(feedBot, targetId, upstreamJson.chatId);
+              upstreamJson.feedGroupId = targetId;
+              upstreamJson.feedGroupName = newFeedGroupName || undefined;
+            }
+          } catch (error) {
+            upstreamJson.feedGroupError = error instanceof Error ? error.message : String(error);
+          }
+        }
       }
       if (upstream.ok && upstreamJson?.ok) groupsMatrixSnapshot.invalidate();
       res.writeHead(upstream.status, { 'content-type': 'application/json' });
@@ -5173,6 +5250,7 @@ const server = createServer(async (req, res) => {
       let parsed: {
         content?: unknown; larkAppIds?: unknown; mode?: unknown; column?: unknown;
         leadLarkAppId?: unknown; name?: unknown; bindWorkingDir?: unknown; images?: unknown;
+        feedGroupId?: unknown; newFeedGroupName?: unknown; feedGroupAppId?: unknown;
       };
       try {
         const chunks: Buffer[] = [];
@@ -5250,12 +5328,30 @@ const server = createServer(async (req, res) => {
       }
       const chatId: string = groupResp.chatId;
       const invalidBotIds: string[] = Array.isArray(groupResp.invalidBotIds) ? groupResp.invalidBotIds : [];
+      const existingFeedGroupId = typeof parsed.feedGroupId === 'string' ? parsed.feedGroupId.trim() : '';
+      const newFeedGroupName = typeof parsed.newFeedGroupName === 'string' ? parsed.newFeedGroupName.trim() : '';
+      let feedGroupId = '';
+      let feedGroupError = '';
+      if (existingFeedGroupId || newFeedGroupName) {
+        const feedGroupAppId = typeof parsed.feedGroupAppId === 'string' ? parsed.feedGroupAppId.trim() : '';
+        try {
+          const feedBot = loadBotConfigs().find(bot => bot.larkAppId === feedGroupAppId && !bot.apiOnly);
+          if (!feedBot) {
+            feedGroupError = '读取标签所用的机器人当前不可用。';
+          } else {
+            feedGroupId = existingFeedGroupId || await createFeedGroup(feedBot, newFeedGroupName);
+            await addChatToFeedGroup(feedBot, feedGroupId, chatId);
+          }
+        } catch (error) {
+          feedGroupError = error instanceof Error ? error.message : String(error);
+        }
+      }
 
       // spawn 目标：lead 模式只有 lead；一起开工是所有成功入群的选中 bot。
       const joinedIds = selectedIds.filter(id => !invalidBotIds.includes(id) && !!registry.getByAppId(id));
       const targets = selectCreateSessionTargets(mode, joinedIds, creatorLarkAppId);
       if (targets.length === 0) {
-        return jsonRes(res, 200, { ok: true, chatId, shareLink: groupResp.shareLink, spawned: [], failed: [], warning: 'no_spawn_target' });
+        return jsonRes(res, 200, { ok: true, chatId, shareLink: groupResp.shareLink, spawned: [], failed: [], warning: 'no_spawn_target', feedGroupId, feedGroupError });
       }
 
       const bots = liveBots();
@@ -5286,7 +5382,7 @@ const server = createServer(async (req, res) => {
       }));
 
       return jsonRes(res, 200, {
-        ok: true, chatId, shareLink: groupResp.shareLink, mode, column, spawned, failed,
+        ok: true, chatId, shareLink: groupResp.shareLink, mode, column, spawned, failed, feedGroupId, feedGroupError,
       });
     }
 
@@ -5341,6 +5437,41 @@ const server = createServer(async (req, res) => {
     logger.error('[dashboard] handler error', err);
     if (!res.headersSent) jsonRes(res, 500, { error: String(err) });
   }
+});
+
+// OAuth loopback callback for browsers running on the same machine as BotMux.
+// Remote-browser deployments cannot reach this loopback listener; their
+// Dashboard keeps the manual callback-URL paste flow as a fallback.
+const oauthCallbackServer = createServer(async (req, res) => {
+  const url = new URL(req.url ?? '/', 'http://127.0.0.1:9768');
+  if (req.method !== 'GET' || url.pathname !== '/callback') {
+    res.writeHead(404, { 'content-type': 'text/plain; charset=utf-8' });
+    return res.end('Not found');
+  }
+  let ok = false;
+  try {
+    const message = await handleCallbackUrl(url.toString());
+    ok = typeof message === 'string' && message.startsWith('✅');
+  } catch (error) {
+    logger.warn(`[dashboard] OAuth loopback callback failed: ${(error as Error).message}`);
+  }
+  res.writeHead(ok ? 200 : 400, {
+    'content-type': 'text/html; charset=utf-8',
+    'cache-control': 'no-store',
+  });
+  return res.end(`<!doctype html><meta charset="utf-8"><title>${ok ? '授权成功' : '授权失败'}</title><style>body{font-family:system-ui,sans-serif;max-width:560px;margin:80px auto;padding:24px;color:#111827}h1{font-size:28px}</style><h1>${ok ? '授权成功' : '授权失败'}</h1><p>${ok ? 'BotMux 已完成授权。你可以关闭此页面并返回 Dashboard。' : '授权链接无效或已过期。请返回 Dashboard 后重新发起授权。'}</p>`);
+});
+
+oauthCallbackServer.on('error', error => {
+  const code = (error as NodeJS.ErrnoException).code;
+  if (code === 'EADDRINUSE') {
+    logger.warn('[dashboard] OAuth loopback port 127.0.0.1:9768 is already in use; remote/manual callback fallback remains available');
+  } else {
+    logger.warn(`[dashboard] OAuth loopback server error: ${(error as Error).message}`);
+  }
+});
+oauthCallbackServer.listen(9768, '127.0.0.1', () => {
+  logger.info('[dashboard] OAuth loopback callback listening on 127.0.0.1:9768');
 });
 
 // Web terminal WebSocket reverse-proxy: bridge `/s/*` upgrade requests through to
@@ -5654,6 +5785,7 @@ function shutdown(): void {
   resourceMonitor.stop();
   platformTunnel?.stop();
   debugTerminalManager.shutdown();
+  if (oauthCallbackServer.listening) oauthCallbackServer.close();
   server.close(() => process.exit(gracefulProcessExitCode()));
   // Hard-exit fallback after 5s
   setTimeout(() => process.exit(gracefulProcessExitCode()), 5_000).unref();

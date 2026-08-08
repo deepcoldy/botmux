@@ -372,6 +372,44 @@ describe('closeSession()', () => {
     expect(reloaded!.closedAt).toBeDefined();
   });
 
+  it('clears Riff lineage atomically with the durable closed row', () => {
+    const session = createSession('chat1', 'root1', 'Close Riff');
+    session.backendType = 'riff';
+    session.riffParentTaskId = 'riff-task-prepared';
+    updateSession(session);
+
+    closeSession(session.sessionId, { clearRiffParentTaskId: true });
+    init();
+
+    expect(getSession(session.sessionId)).toMatchObject({ status: 'closed' });
+    expect(getSession(session.sessionId)?.riffParentTaskId).toBeUndefined();
+  });
+
+  it('restores Riff close state in memory when the atomic save fails', () => {
+    const session = createSession('chat1', 'root1', 'Close Riff Save Failure');
+    session.backendType = 'riff';
+    session.riffParentTaskId = 'riff-task-retry';
+    updateSession(session);
+    fsControl.failSessionWrite = true;
+
+    expect(() => closeSession(
+      session.sessionId,
+      { clearRiffParentTaskId: true },
+    )).toThrow(/simulated session repair write failure/);
+    expect(getSession(session.sessionId)).toMatchObject({
+      status: 'active',
+      riffParentTaskId: 'riff-task-retry',
+    });
+    expect(mockDeleteFrozenCards).not.toHaveBeenCalled();
+
+    fsControl.failSessionWrite = false;
+    init();
+    expect(getSession(session.sessionId)).toMatchObject({
+      status: 'active',
+      riffParentTaskId: 'riff-task-retry',
+    });
+  });
+
   it('should call deleteFrozenCards with the sessionId', () => {
     const session = createSession('chat1', 'root1', 'Frozen');
     closeSession(session.sessionId);

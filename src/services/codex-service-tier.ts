@@ -3,6 +3,8 @@ import type { CliId } from '../adapters/cli/types.js';
 /** Executor-confirmed settings copied from Codex's rollout. */
 export interface CodexThreadSettings {
   model?: string;
+  /** Executor-confirmed reasoning effort; follows in-session `/effort`. */
+  reasoningEffort?: string;
   serviceTier: string;
 }
 
@@ -47,6 +49,7 @@ function snapshotsEqual(
   right: CodexServiceTierSnapshot,
 ): boolean {
   return left?.model === right.model
+    && left?.reasoningEffort === right.reasoningEffort
     && left?.serviceTier === right.serviceTier
     && left?.nonDefault === right.nonDefault;
 }

@@ -539,6 +539,7 @@ describe('dashboard sessions filters', () => {
     expect(canRestartSession({ status: 'closed', adopt: false })).toBe(false);
     expect(canRestartSession({ status: 'idle', adopt: true })).toBe(false);
     expect(canRestartSession({ status: 'starting', pendingRepo: true })).toBe(false);
+    expect(canRestartSession({ status: 'idle', adopt: false, cliId: 'riff' })).toBe(false);
   });
 
   it('formats session location labels for group chats and direct chats', () => {

@@ -53,6 +53,7 @@ vi.mock('../src/config.js', () => ({
 }));
 
 const updateSessionMock = vi.fn();
+const sessionReplyMock = vi.fn(async () => 'om_reply');
 vi.mock('../src/services/session-store.js', () => ({
   registerSessionBridgeSendMarkerCleanupFence: vi.fn(),
   cleanupSessionBridgeSendMarkers: vi.fn(),
@@ -167,11 +168,51 @@ describe("crash-loop diagnostic terminal (daemon 'claude_exit' handler)", () => 
     vi.clearAllMocks();
     restartCounts.clear();
     initWorkerPool({
-      sessionReply: vi.fn(async () => 'om_reply'),
+      sessionReply: sessionReplyMock,
       getSessionWorkingDir: () => '/tmp',
       getActiveCount: () => 1,
       closeSession: vi.fn(),
     } as any);
+  });
+
+  it('does not auto-restart a crashed Riff worker and tells the user how to recover', async () => {
+    const worker = makeFakeWorker();
+    const ds = makeDs('sid-riff-no-restart', worker);
+    ds.session.cliId = 'riff';
+    ds.session.backendType = 'riff';
+    __testOnly_setupWorkerHandlers(ds, worker);
+
+    await crashTimes(worker, 1);
+
+    expect(worker.send).not.toHaveBeenCalledWith({ type: 'restart' });
+    expect(restartCounts.has('sid-riff-no-restart')).toBe(false);
+    expect(sessionReplyMock).toHaveBeenCalledWith(
+      'om_root',
+      expect.stringMatching(/Riff.*不支持重启.*\/close/),
+      'text',
+      'app_test',
+      undefined,
+      undefined,
+    );
+  });
+
+  it('does not duplicate recovery guidance while an explicit Riff close owns the exit', async () => {
+    const worker = makeFakeWorker();
+    const ds = makeDs('sid-riff-closing', worker);
+    ds.session.cliId = 'riff';
+    ds.session.backendType = 'riff';
+    ds.riffCloseState = {
+      phase: 'preparing',
+      requestId: 'close-riff',
+      taskId: 'task-riff',
+    };
+    __testOnly_setupWorkerHandlers(ds, worker);
+
+    await crashTimes(worker, 1);
+
+    expect(worker.send).not.toHaveBeenCalledWith({ type: 'restart' });
+    expect(restartCounts.has('sid-riff-closing')).toBe(false);
+    expect(sessionReplyMock).not.toHaveBeenCalled();
   });
 
   it('after >3 tmux crashes: keeps the worker + marks lazy cold-resume (survives restart)', async () => {

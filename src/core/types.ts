@@ -249,6 +249,14 @@ export interface DaemonSession {
   currentImageKey?: string;
   lastScreenContent?: string;    // last screen_update content — used to freeze card at idle
   lastScreenStatus?: StreamStatus;  // last screen_update status
+  /** Latest model reported by the live executor. In-memory and rehydrated from
+   *  the CLI transcript after worker restart; unlike Session.model it follows
+   *  in-session `/model` switches. */
+  activeModel?: string;
+  /** Latest reasoning effort reported by the live executor. */
+  activeReasoningEffort?: string;
+  /** Runtime change arrived while a streaming-card POST was in flight. */
+  pendingActiveRuntimeCardRefresh?: boolean;
   /** Executor-observed Codex settings for this worker/rollout generation. */
   codexServiceTier?: CodexServiceTierSnapshot;
   /** Tier change arrived while a card POST was in-flight. */
@@ -261,6 +269,19 @@ export interface DaemonSession {
    *  "Web终端" button opens the riff sandbox. In-memory only — re-sent by the
    *  worker on each task. */
   riffAccessUrl?: string;
+  /** Explicit-close transaction: while present, no new Riff input may be
+   * admitted until cancellation commits or admission restoration is ACKed. */
+  riffCloseState?: {
+    phase: 'preparing' | 'prepared' | 'uncertain';
+    requestId: string;
+    taskId?: string;
+  };
+  /** Graceful-shutdown transaction for the exact Riff worker generation. */
+  riffShutdownState?: {
+    phase: 'preparing' | 'prepared';
+    requestId: string;
+    taskId?: string | null;
+  };
   usageLimit?: CliUsageLimitState;
   usageLimitRetryTimer?: NodeJS.Timeout;
   /** Interval that re-PATCHes the live streaming card with fresh Context/Token
@@ -297,6 +318,23 @@ export interface DaemonSession {
     usage?: { inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheCreateTokens: number };
   }>;
   latestAsyncTriggerId?: string;
+  /** Set on a fresh async virtual turn dispatched under an at-most-once
+   *  idempotency lease (options.idempotencyKey). Lets the worker-exit handler
+   *  converge an INCOMPLETE idempotent async turn to a durable
+   *  `dispatch_unknown` terminal: a worker that dies with no final_output leaves
+   *  ds.worker=null but keeps the session in activeSessions + the async record
+   *  `pending`, which would otherwise poll `running` forever and let a same-key
+   *  retry reuse the dead session until the next daemon reconcile (codex #776
+   *  round-6 finding #1). Cleared once the turn completes (final_output). */
+  idempotentAsyncTurn?: {
+    ownerLarkAppId: string;
+    key: string;
+    triggerId: string;
+    /** The worker generation this turn was dispatched on. The exit handler only
+     *  converges when the DYING generation is this one (a later generation that
+     *  completed and moved on must not be retro-failed). */
+    workerGeneration: number;
+  };
   /** Stable turn ids whose automatic transcript fallback is capture/discard.
    *  turn_terminal clears the entry; bounded in trigger-session for crash
    *  paths that never produce a terminal. */
@@ -305,6 +343,8 @@ export interface DaemonSession {
    * (ask/relay) that cannot trust a long-lived CLI's spawn-time env. */
   managedTurnOrigin?: {
     capability: string;
+    /** Unguessable Seatbelt pane/profile authority channel. */
+    originChannelId?: string;
     turnId?: string;
     dispatchAttempt?: number;
   };
@@ -397,6 +437,14 @@ export interface DaemonSession {
     paneCols?: number;        // pane width at adopt time
     paneRows?: number;        // pane height at adopt time
   };
+}
+
+/** A non-null value means this Riff generation is deliberately rejecting new
+ * input until a close/shutdown commit or an ACKed admission restore. */
+export function riffRetirementAdmissionPhase(ds: DaemonSession): string | null {
+  if (ds.riffShutdownState) return `shutdown-${ds.riffShutdownState.phase}`;
+  if (ds.riffCloseState) return `close-${ds.riffCloseState.phase}`;
+  return null;
 }
 
 /** Composite key for activeSessions — allows multiple bots to have independent

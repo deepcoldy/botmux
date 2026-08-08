@@ -433,7 +433,7 @@ export function restartConfirmMessage(s: any): string {
 }
 
 export function canRestartSession(s: any): boolean {
-  return s.status !== 'closed' && !s.adopt && !s.pendingRepo;
+  return s.status !== 'closed' && !s.adopt && !s.pendingRepo && s.cliId !== 'riff';
 }
 
 export interface PickerBot { larkAppId: string; botName: string; }

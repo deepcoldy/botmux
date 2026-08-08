@@ -51,6 +51,7 @@ import { execSync } from 'node:child_process';
 import { platform } from 'node:os';
 import { join } from 'node:path';
 import { codexHistoryPath, codexSessionsRoot } from './codex-paths.js';
+import { baselineJsonlCursor } from './jsonl-cursor.js';
 import type { CodexThreadSettings } from './codex-service-tier.js';
 
 const IS_LINUX = platform() === 'linux';
@@ -286,6 +287,45 @@ export interface CodexDrainResult {
   pendingTail: string;
   /** Latest complete settings record in this byte range, if any. */
   latestThreadSettings?: CodexThreadSettings;
+  /** Newest executor model observed in this byte range (from `turn_context`),
+   *  latest-wins. Undefined when no `turn_context` appeared in the range. */
+  latestModel?: string;
+  /** Newest executor reasoning effort observed in this byte range (from
+   *  `turn_context`), latest-wins. Undefined when none appeared. */
+  latestReasoningEffort?: string;
+}
+
+/** Bounded backward-scan cap for the one-shot runtime bootstrap — runtime
+ *  identity is advisory and must never synchronously parse a multi-GB rollout
+ *  on attach (same guard rationale as usage-side MAX_USAGE_TRANSCRIPT_BYTES).
+ *  Mirrors traex-transcript's TRAEX_RUNTIME_SCAN_MAX_BYTES. */
+const CODEX_RUNTIME_SCAN_MAX_BYTES = 4 * 1024 * 1024;
+
+/** Executor-confirmed model / reasoning-effort as recorded in a Codex
+ *  `turn_context` event. Codex writes this on every turn (top-level `model`
+ *  and `effort`, with a `collaboration_mode.settings` mirror), so it — not the
+ *  optional `thread_settings_applied` record — is the reliable in-session
+ *  model/effort source. Mirrors traex-transcript's runtimeFromTraexEntry. */
+function runtimeFromCodexEntry(obj: any): { model?: string; reasoningEffort?: string } | undefined {
+  if (obj?.type !== 'turn_context') return undefined;
+  const payload = obj.payload;
+  if (!payload || typeof payload !== 'object') return undefined;
+  const settings = payload.collaboration_mode?.settings;
+  const model = payload.model ?? settings?.model;
+  const reasoningEffort = payload.reasoning_effort
+    ?? payload.effort
+    ?? settings?.reasoning_effort;
+  const normalizedModel = typeof model === 'string' && model.trim()
+    ? model.trim()
+    : undefined;
+  const normalizedReasoningEffort = typeof reasoningEffort === 'string' && reasoningEffort.trim()
+    ? reasoningEffort.trim()
+    : undefined;
+  if (!normalizedModel && !normalizedReasoningEffort) return undefined;
+  return {
+    ...(normalizedModel ? { model: normalizedModel } : {}),
+    ...(normalizedReasoningEffort ? { reasoningEffort: normalizedReasoningEffort } : {}),
+  };
 }
 
 /** Locate the rollout file for a given Codex sessionId. Codex names files
@@ -489,6 +529,8 @@ export function drainCodexRollout(path: string, fromOffset: number): CodexDrainR
 
   const events: CodexBridgeEvent[] = [];
   let latestThreadSettings: CodexThreadSettings | undefined;
+  let latestModel: string | undefined;
+  let latestReasoningEffort: string | undefined;
   // Track byte offset within the file as we walk lines so synthetic uuids
   // are stable across re-drains.
   let cursor = start;
@@ -505,6 +547,15 @@ export function drainCodexRollout(path: string, fromOffset: number): CodexDrainR
     const settings = codexThreadSettingsFromEvent(obj);
     if (settings) {
       latestThreadSettings = settings;
+      continue;
+    }
+    // turn_context carries the executor model/effort on every turn (latest-wins,
+    // since /model and /effort change independently). Published via the same
+    // active_runtime channel TRAE uses.
+    const runtime = runtimeFromCodexEntry(obj);
+    if (runtime) {
+      if (runtime.model) latestModel = runtime.model;
+      if (runtime.reasoningEffort) latestReasoningEffort = runtime.reasoningEffort;
       continue;
     }
     const p = obj?.payload;
@@ -564,7 +615,7 @@ export function drainCodexRollout(path: string, fromOffset: number): CodexDrainR
     // reasoning, function_call*, and every assistant `response_item` message
     // (mid-turn OR final) — the turn boundary comes only from task_complete.
   }
-  return { events, newOffset, pendingTail, latestThreadSettings };
+  return { events, newOffset, pendingTail, latestThreadSettings, latestModel, latestReasoningEffort };
 }
 
 function codexThreadSettingsFromEvent(obj: any): CodexThreadSettings | undefined {
@@ -573,7 +624,19 @@ function codexThreadSettingsFromEvent(obj: any): CodexThreadSettings | undefined
   const serviceTier = raw?.service_tier;
   if (typeof serviceTier !== 'string' || !serviceTier) return undefined;
   const model = typeof raw?.model === 'string' && raw.model ? raw.model : undefined;
-  return { ...(model ? { model } : {}), serviceTier };
+  // Effort follows an in-session `/effort` switch. Codex records it both at the
+  // top level and under collaboration_mode.settings; take the top-level value
+  // first, matching the model precedence above.
+  const rawEffort = raw?.reasoning_effort
+    ?? raw?.collaboration_mode?.settings?.reasoning_effort;
+  const reasoningEffort = typeof rawEffort === 'string' && rawEffort.trim()
+    ? rawEffort.trim()
+    : undefined;
+  return {
+    ...(model ? { model } : {}),
+    ...(reasoningEffort ? { reasoningEffort } : {}),
+    serviceTier,
+  };
 }
 
 /**
@@ -628,4 +691,73 @@ export function scanCodexThreadSettings(
     if (fd !== undefined) closeSync(fd);
   }
   return undefined;
+}
+
+/** One-shot bootstrap of the current Codex runtime (model / reasoning effort)
+ *  from `turn_context` records, for attach/restore paths that cursor straight
+ *  to the tail without draining history. Scans BACKWARD in fixed-size chunks
+ *  and stops once both fields resolve — the newest `turn_context` sits near the
+ *  tail. A hard byte cap bounds the pathological missing-field case. A
+ *  non-newline-terminated trailing partial is excluded via baselineJsonlCursor
+ *  so a crash mid-write cannot surface a half-written record. Mirrors
+ *  traex-transcript's readLatestTraexRuntime. */
+export function readLatestCodexRuntime(
+  path: string,
+): { model?: string; reasoningEffort?: string } {
+  if (!path || !existsSync(path)) return {};
+  let completeEnd: number;
+  try { completeEnd = baselineJsonlCursor(path).newOffset; } catch { return {}; }
+  if (completeEnd <= 0) return {};
+
+  let latestModel: string | undefined;
+  let latestReasoningEffort: string | undefined;
+  const emit = (): { model?: string; reasoningEffort?: string } => ({
+    ...(latestModel ? { model: latestModel } : {}),
+    ...(latestReasoningEffort ? { reasoningEffort: latestReasoningEffort } : {}),
+  });
+  const consider = (line: string): boolean => {
+    if (!line.trim()) return false;
+    let runtime: { model?: string; reasoningEffort?: string } | undefined;
+    try { runtime = runtimeFromCodexEntry(JSON.parse(line)); } catch { return false; }
+    if (latestModel === undefined && runtime?.model) latestModel = runtime.model;
+    if (latestReasoningEffort === undefined && runtime?.reasoningEffort) {
+      latestReasoningEffort = runtime.reasoningEffort;
+    }
+    return latestModel !== undefined && latestReasoningEffort !== undefined;
+  };
+
+  const floor = Math.max(0, completeEnd - CODEX_RUNTIME_SCAN_MAX_BYTES);
+  const chunkBytes = 64 * 1024;
+  let fd: number | undefined;
+  try {
+    fd = openSync(path, 'r');
+    let end = completeEnd;
+    let carry = Buffer.alloc(0);
+    while (end > floor) {
+      const start = Math.max(floor, end - chunkBytes);
+      const chunk = Buffer.alloc(end - start);
+      readSync(fd, chunk, 0, chunk.length, start);
+      const block = carry.length > 0 ? Buffer.concat([chunk, carry]) : chunk;
+      let lineEnd = block.length;
+      if (lineEnd > 0 && block[lineEnd - 1] === 0x0a) lineEnd--;
+      let carryEnd = lineEnd;
+      for (let i = lineEnd - 1; i >= 0; i--) {
+        if (block[i] !== 0x0a) continue;
+        const line = block.subarray(i + 1, lineEnd).toString('utf8');
+        lineEnd = i;
+        carryEnd = i;
+        if (consider(line)) return emit();
+      }
+      carry = start === floor && floor > 0
+        ? Buffer.alloc(0)
+        : block.subarray(0, carryEnd);
+      end = start;
+    }
+    if (carry.length > 0) consider(carry.toString('utf8'));
+  } catch {
+    return emit();
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+  }
+  return emit();
 }

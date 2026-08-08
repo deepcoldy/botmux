@@ -14,7 +14,7 @@ import * as scheduler from './scheduler.js';
 import { scanProjects, scanMultipleProjects, describeProjectDir } from '../services/project-scanner.js';
 import { createRepoWorktree, pushWorktreeBranch } from '../services/git-worktree.js';
 import { worktreeSlugFromContextAI } from '../services/worktree-slug-ai.js';
-import { resolvePairedSpawnBackendType } from './persistent-backend.js';
+import { isRiffBackendSession, resolvePairedSpawnBackendType } from './persistent-backend.js';
 import { buildRepoSelectCard, buildAdoptSelectCard, buildCodexAppThreadSelectCard, buildSlashListCard, getCliDisplayName, buildConfigCard, buildForkPanelCard, buildAdoptBlockedCard } from '../im/lark/card-builder.js';
 import { handleDashboardCommand } from './dashboard-command/index.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
@@ -1405,6 +1405,11 @@ export async function handleCommand(
             await sessionReply(rootId, t('card.action.adopt_no_restart', undefined, loc));
             break;
           }
+          if (isRiffBackendSession(ds)) {
+            logger.info(`[${logTag}] Rejected /restart for Riff backend session`);
+            await sessionReply(rootId, t('cmd.restart.riff_unsupported', undefined, loc));
+            break;
+          }
           // Codex App: an accepted-but-unsettled dispatch still owns the turn
           // route. requestSessionRestart does not itself gate on dispatch
           // ownership, so reject here before the coordinator tears the worker
@@ -1446,6 +1451,14 @@ export async function handleCommand(
         }
         if (isSessionTransferring(ds)) {
           await sessionReply(rootId, t('cmd.session.transfer_in_progress', undefined, loc));
+          break;
+        }
+        // A live Riff worker owns a remote task rooted in its original cwd.
+        // killWorker/restart deliberately refuse to replace that generation,
+        // so persisting a new cwd here would report success while the remote
+        // task keeps running in the old directory.
+        if (isRiffBackendSession(ds)) {
+          await sessionReply(rootId, t('cmd.cd.riff_unsupported', undefined, loc));
           break;
         }
         // Cheap preflight avoids creating a requested directory when the
@@ -1535,6 +1548,15 @@ export async function handleCommand(
         break;
       }
       case '/repo': {
+        // A live Riff generation must finish the explicit /close protocol before
+        // its anchor can be reused.  The generic repo-switch path closes and
+        // immediately reforks; if remote cancellation fails, that would fall
+        // through to the double-fork kill and orphan the remote task.
+        if (ds && !ds.pendingRepo && isRiffBackendSession(ds)) {
+          await sessionReply(rootId, t('cmd.cd.riff_unsupported', undefined, loc));
+          logger.warn(`[${logTag}] Repo switch refused: Riff session requires explicit close before replacement`);
+          break;
+        }
         const repoArg = message.content.replace(/^\/repo\s*/, '').trim();
         if (ds && !ds.pendingRepo
           && hasProtectedSessionMutationOwnership(ds)) {
@@ -4012,6 +4034,24 @@ async function blockTakeoverWhilePendingRepo(
   return true;
 }
 
+/**
+ * A live Riff worker cannot be replaced through the generic adopt/import
+ * refork path: that path sends a request-less close and then kills the local
+ * worker, while Riff requires its remote task to finish the explicit
+ * prepare/commit close protocol first. Refuse before target validation or any
+ * persisted ownership mutation so the original lineage stays recoverable.
+ */
+async function blockRiffTakeover(
+  ds: DaemonSession,
+  sessionReply: (rid: string, content: string, msgType?: string) => Promise<string>,
+): Promise<boolean> {
+  if (!isRiffBackendSession(ds)) return false;
+  const loc = localeForBot(ds.larkAppId);
+  await sessionReply(sessionAnchorId(ds), t('cmd.takeover.riff_unsupported', undefined, loc));
+  logger.warn(`[${tag(ds)}] Takeover refused: Riff session requires explicit close before replacement`);
+  return true;
+}
+
 export async function startCodexAppThreadSession(
   thread: CodexAppThreadSummary,
   ds: DaemonSession,
@@ -4027,6 +4067,7 @@ export async function startCodexAppThreadSession(
     return;
   }
 
+  if (await blockRiffTakeover(ds, sessionReply)) return;
   if (await blockTakeoverWhilePendingRepo(ds, sessionReply)) return;
 
   const targetSessionId = ds.session.sessionId;
@@ -4081,6 +4122,8 @@ export async function startAdoptSession(
     await sessionReply(sessionAnchorId(ds), t('cmd.session.transfer_in_progress', undefined, loc));
     return;
   }
+
+  if (await blockRiffTakeover(ds, sessionReply)) return;
 
   const zellij = isZellijTarget(target);
   if (!zellij && target.source === 'herdr' && target.herdrSessionName && target.herdrAgentName) {
@@ -4243,6 +4286,7 @@ export async function startResumeImportSession(
     return;
   }
 
+  if (await blockRiffTakeover(ds, sessionReply)) return;
   if (await blockTakeoverWhilePendingRepo(ds, sessionReply)) return;
 
   const targetSessionId = ds.session.sessionId;

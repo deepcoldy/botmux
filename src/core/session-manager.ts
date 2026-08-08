@@ -1543,7 +1543,10 @@ export async function staggeredRecoveryFork(
   }
 }
 
-export async function restoreActiveSessions(activeSessions: Map<string, DaemonSession>): Promise<void> {
+export async function restoreActiveSessions(
+  activeSessions: Map<string, DaemonSession>,
+  quarantinedSessionIds: ReadonlySet<string> = new Set(),
+): Promise<void> {
   const sessions = sessionStore.listSessions();
   const restorePriority = (session: Session): number => {
     if (session.adoptedFrom || session.cliId || session.lastCliInput || session.backendType) return 2;
@@ -1556,6 +1559,13 @@ export async function restoreActiveSessions(activeSessions: Map<string, DaemonSe
   // every startup candidate regardless of this disk ordering.
   const active = sessions
     .filter(s => s.status === 'active')
+    // Idempotency quarantine (at-most-once): a session the boot reconcile just
+    // terminalized as `dispatch_unknown` (or dropped as a pre-dispatch reserved
+    // orphan) must NOT be re-attached — the poller now sees it `failed`, so
+    // reviving its old pane would diverge state from execution. The reconcile
+    // best-effort closed it; this is the belt-and-suspenders exclusion in case
+    // that close failed.
+    .filter(s => !quarantinedSessionIds.has(s.sessionId))
     .sort((a, b) => restorePriority(b) - restorePriority(a));
 
   // Sweep dead CLI-pid markers regardless of whether we have sessions to restore:

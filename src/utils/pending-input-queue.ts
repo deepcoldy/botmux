@@ -16,6 +16,14 @@ export interface PendingCliInput {
   queuedActivationToken?: string;
   vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin;
   codexAppInput?: CodexAppTurnInput;
+  /** Per-item at-most-once marker: an input carrying this must NEVER be replayed
+   *  onto an auto-restarted CLI — excluded from both the pendingMessages drain and
+   *  the InflightInputTracker carry-over (codex #776 round-7 finding #1). Set on
+   *  the KEYED idempotency-lease init prompt (from init.atMostOnce); scoped
+   *  per-item so a later PLAIN follow-up turn folded into the same http_async_
+   *  session is NOT dropped (codex #776 round-8). The worker's CLI-exit carry
+   *  predicate and pending-drop both honor it. */
+  noReplay?: boolean;
 }
 
 /**

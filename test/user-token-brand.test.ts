@@ -27,4 +27,21 @@ describe('generateAuthUrl — brand-aware authorize host', () => {
     expect(authUrl).toContain('accounts.feishu.cn');
     expect(authUrl).not.toContain('larksuite.com');
   });
+
+  it('keeps feed-group scopes out of the generic login URL', () => {
+    const { authUrl } = generateAuthUrl('cli_app', 'secret', 'lark');
+    const scopes = new URL(authUrl).searchParams.get('scope')?.split(' ') ?? [];
+    expect(scopes).not.toContain('im:feed_group_v1:read');
+    expect(scopes).not.toContain('im:feed_group_v1:write');
+  });
+
+  it('includes feed-group scopes when the caller explicitly requests them', () => {
+    const { authUrl } = generateAuthUrl('cli_app', 'secret', 'feishu', [
+      'im:feed_group_v1:read',
+      'im:feed_group_v1:write',
+    ]);
+    const scopes = new URL(authUrl).searchParams.get('scope')?.split(' ') ?? [];
+    expect(scopes).toContain('im:feed_group_v1:read');
+    expect(scopes).toContain('im:feed_group_v1:write');
+  });
 });
