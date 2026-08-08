@@ -979,6 +979,11 @@ export type WorkerToDaemon =
   /** Worker-side close handler has crossed the point where it will no longer
    * read bridge send markers or emit transcript fallback for this session. */
   | { type: 'session_close_ready'; sessionId: string }
+  /** Write barrier, not a command: the worker's last act before a suspend exit,
+   *  sent with an acknowledged process.send so the FIFO channel is known to have
+   *  carried this turn's final_output out first. The daemon has already decided
+   *  to suspend and needs nothing from it beyond the flush. */
+  | { type: 'suspend_ready'; sessionId: string }
   | { type: 'prompt_ready' }
   | { type: 'runner_build_ready'; runnerBuildId: string }
   | {
