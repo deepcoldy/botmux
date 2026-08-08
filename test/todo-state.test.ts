@@ -86,6 +86,70 @@ describe('parseOpenTodos (last-write-wins)', () => {
   });
 });
 
+// ── Claude Code 内建 Task* 工具（本 botmux 环境）的增量重放 ────────────────────
+// TaskCreate 无 taskId（分配的号在紧邻 tool_result 文本里），TaskUpdate 按 id 改状态。
+const taskCreate = (useId: string, subject: string) => ({
+  type: 'assistant',
+  message: { role: 'assistant', content: [{ type: 'tool_use', id: useId, name: 'TaskCreate', input: { subject, description: 'x', activeForm: 'doing' } }] },
+});
+const createResult = (useId: string, taskNo: number) => ({
+  type: 'user',
+  message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: useId, content: `Task #${taskNo} created successfully: whatever` }] },
+});
+const taskUpdate = (taskId: string, status: string) => ({
+  type: 'assistant',
+  message: { role: 'assistant', content: [{ type: 'tool_use', id: `u-${taskId}-${status}`, name: 'TaskUpdate', input: { taskId, status } }] },
+});
+
+describe('parseOpenTodos (Claude Task* incremental replay)', () => {
+  it('replays TaskCreate/TaskUpdate into the current task state', () => {
+    const entries = [
+      taskCreate('c1', 'A'), createResult('c1', 1),
+      taskCreate('c2', 'B'), createResult('c2', 2),
+      taskCreate('c3', 'C'), createResult('c3', 3),
+      taskUpdate('1', 'completed'),
+      taskUpdate('2', 'in_progress'),
+      // 3 仍是创建时的默认 pending
+    ];
+    expect(parseOpenTodos(entries, 'claude'))
+      .toEqual({ total: 3, done: 1, remaining: 2, hasInProgress: true });
+  });
+
+  it('honors the last status per task and drops deleted tasks', () => {
+    const entries = [
+      taskCreate('c1', 'A'), createResult('c1', 1),
+      taskCreate('c2', 'B'), createResult('c2', 2),
+      taskUpdate('1', 'in_progress'),
+      taskUpdate('1', 'completed'), // 后写覆盖
+      taskUpdate('2', 'deleted'),   // 移出清单
+    ];
+    expect(parseOpenTodos(entries, 'claude'))
+      .toEqual({ total: 1, done: 1, remaining: 0, hasInProgress: false });
+  });
+
+  it('keeps a task in the list on a metadata-only update (no status field)', () => {
+    const entries = [
+      taskCreate('c1', 'A'), createResult('c1', 1),
+      { type: 'assistant', message: { content: [{ type: 'tool_use', id: 'u1', name: 'TaskUpdate', input: { taskId: '1', subject: 'renamed' } }] } },
+    ];
+    expect(parseOpenTodos(entries, 'claude'))
+      .toEqual({ total: 1, done: 0, remaining: 1, hasInProgress: false });
+  });
+
+  it('TodoWrite snapshot wins over Task* replay when both are present', () => {
+    const entries = [
+      taskCreate('c1', 'A'), createResult('c1', 1),
+      claudeTodo(['completed', 'completed']),
+    ];
+    expect(parseOpenTodos(entries, 'claude'))
+      .toEqual({ total: 2, done: 2, remaining: 0, hasInProgress: false });
+  });
+
+  it('returns null when no Task* and no TodoWrite events exist', () => {
+    expect(parseOpenTodos([{ type: 'user', message: { content: 'hi' } }], 'claude')).toBeNull();
+  });
+});
+
 describe('readSessionOpenTodos (unsupported CLIs)', () => {
   it('returns null for CLIs without a todo dialect, without touching disk', () => {
     expect(readSessionOpenTodos({ cliId: 'gemini', sessionId: 's1', cwd: '/tmp' })).toBeNull();

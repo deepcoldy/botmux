@@ -89,14 +89,94 @@ function parseArgs(raw: unknown): Record<string, unknown> | null {
   }
 }
 
-/** 从整份 transcript（已按行解析的记录数组）取「最后一次 todo 快照」= 当前任务态。 */
+/** 从整份 transcript（已按行解析的记录数组）取当前任务态。
+ *  - codex：update_plan 是整表快照，取最后一次即可。
+ *  - claude：两种方言二选一——
+ *      · 开源版 Claude Code 用 TodoWrite（整表快照，取最后一次）；
+ *      · 本 botmux 环境用 Task* 工具（TaskCreate/TaskUpdate 增量），需按记录重放
+ *        累积成末态。TodoWrite 优先（真快照）；没有 TodoWrite 时回退到 Task* 重放。 */
 export function parseOpenTodos(entries: any[], kind: 'claude' | 'codex'): OpenTodos | null {
   let latest: OpenTodos | null = null;
   for (const entry of entries) {
     const snap = todoSnapshotFromEntry(entry, kind);
     if (snap) latest = snap; // 后写覆盖：整表快照语义，只保留最后一次
   }
-  return latest;
+  if (latest) return latest;
+  // 无 TodoWrite/update_plan 快照时，claude 侧尝试 Task* 增量重放。
+  if (kind === 'claude') return replayClaudeTaskState(entries);
+  return null;
+}
+
+// ── Claude Code 内建 Task* 工具（本 botmux 环境）的增量重放 ────────────────────
+// 与开源版 TodoWrite（整表快照）不同，本环境的任务清单是增量事件：
+//   · TaskCreate：input={subject,description,activeForm}，无 taskId——分配的 id 在
+//     紧邻的 tool_result 文本里「Task #N created successfully: ...」。新任务初始
+//     状态 pending。
+//   · TaskUpdate：input={taskId, status?, ...}，status ∈ pending/in_progress/
+//     completed/deleted。deleted 从清单移除（工具语义：永久删除）。
+// 按 tool_use.id 关联 TaskCreate 与其结果，重放出 Map<taskId,status> 末态，再折叠
+// 成 OpenTodos。整个清单没有任何任务时返回 null（= 未用过任务清单，别当已交付）。
+function replayClaudeTaskState(entries: any[]): OpenTodos | null {
+  const status = new Map<string, TodoStatus>();
+  // TaskCreate 的 tool_use.id → 该次创建（等它的 tool_result 回填分配的 taskId）。
+  const pendingCreate = new Map<string, true>();
+  let sawAnyTask = false;
+
+  for (const entry of entries) {
+    const content = entry?.message?.content;
+    if (!Array.isArray(content)) continue;
+    for (const block of content) {
+      if (block?.type === 'tool_use') {
+        const name = typeof block.name === 'string' ? block.name.trim().toLowerCase() : '';
+        if (name === 'taskcreate') {
+          if (typeof block.id === 'string') pendingCreate.set(block.id, true);
+          sawAnyTask = true;
+        } else if (name === 'taskupdate') {
+          const id = taskIdString(block?.input?.taskId);
+          const st = block?.input?.status;
+          if (id) {
+            sawAnyTask = true;
+            if (st === 'deleted') status.delete(id);
+            else {
+              const norm = normalizeTodoStatus(st);
+              // status 缺省的 TaskUpdate（只改 subject/owner 等）不动状态，但要确保
+              // 该任务已在册（默认 pending），否则纯元数据更新会丢任务。
+              if (!status.has(id)) status.set(id, 'pending');
+              if (norm) status.set(id, norm);
+            }
+          }
+        }
+      } else if (block?.type === 'tool_result') {
+        const forId = typeof block.tool_use_id === 'string' ? block.tool_use_id : '';
+        if (forId && pendingCreate.has(forId)) {
+          pendingCreate.delete(forId);
+          const assigned = extractCreatedTaskId(block.content);
+          if (assigned && !status.has(assigned)) status.set(assigned, 'pending');
+        }
+      }
+    }
+  }
+
+  if (!sawAnyTask || status.size === 0) return null;
+  return summarize([...status.values()]);
+}
+
+function taskIdString(v: unknown): string | null {
+  if (typeof v === 'string' && v.trim()) return v.trim();
+  if (typeof v === 'number' && Number.isFinite(v)) return String(v);
+  return null;
+}
+
+/** 从 TaskCreate 的 tool_result 文本里抓分配的任务号：「Task #N created successfully」。
+ *  content 可能是纯字符串，或 [{type:'text',text}] 数组。 */
+function extractCreatedTaskId(content: unknown): string | null {
+  let text = '';
+  if (typeof content === 'string') text = content;
+  else if (Array.isArray(content)) {
+    text = content.map((b: any) => (typeof b?.text === 'string' ? b.text : '')).join('\n');
+  }
+  const m = text.match(/Task #(\d+) created/i);
+  return m ? m[1] : null;
 }
 
 // ── 带 mtime 失效的缓存读取（对齐 cost-calculator 的 usageFileCache 思路）──────
