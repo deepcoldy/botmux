@@ -222,7 +222,33 @@ function StatusBadge(props: { status: unknown }): React.JSX.Element {
  *  单看运行态徽标解释不了列归属。openTodos 缺失或已全部完成时不渲染。 */
 function TodoBadge(props: { row: any }): React.JSX.Element | null {
   const todos = props.row?.openTodos;
+  // 两种打开态：hover=悬浮预览（移开即关）；pinned=点击固定（不自动消失，可选中复制）。
   const [pos, setPos] = useState<{ x: number; y: number } | null>(null);
+  const [pinned, setPinned] = useState(false);
+  const [copied, setCopied] = useState(false);
+  const anchorRef = useRef<HTMLSpanElement | null>(null);
+  const popRef = useRef<HTMLDivElement | null>(null);
+
+  // 固定态下：点浮层与徽标之外关闭；Esc 关闭。
+  useEffect(() => {
+    if (!pinned) return;
+    const onDown = (e: globalThis.MouseEvent) => {
+      const tgt = e.target as Node;
+      if (popRef.current?.contains(tgt) || anchorRef.current?.contains(tgt)) return;
+      setPinned(false);
+      setPos(null);
+    };
+    const onKey = (e: globalThis.KeyboardEvent) => {
+      if (e.key === 'Escape') { setPinned(false); setPos(null); }
+    };
+    document.addEventListener('mousedown', onDown, true);
+    document.addEventListener('keydown', onKey, true);
+    return () => {
+      document.removeEventListener('mousedown', onDown, true);
+      document.removeEventListener('keydown', onKey, true);
+    };
+  }, [pinned]);
+
   if (!todos || typeof todos.remaining !== 'number' || todos.remaining <= 0) return null;
   const total = Number(todos.total ?? 0);
   const done = Number(todos.done ?? 0);
@@ -230,27 +256,79 @@ function TodoBadge(props: { row: any }): React.JSX.Element | null {
   const title = t('sessions.board.todoBadgeTitle', { remaining: todos.remaining, total, done });
   const items: Array<{ status: string; text: string }> = Array.isArray(todos.items) ? todos.items : [];
   const glyph = (s: string) => (s === 'completed' ? '✓' : s === 'in_progress' ? '▶' : '○');
-  // 卡片/列都是 overflow:hidden，纯 CSS 绝对定位浮层会被裁。改用 fixed + 悬浮时按
+  // 卡片/列都是 overflow:hidden，纯 CSS 绝对定位浮层会被裁。改用 fixed + 打开时按
   // 徽标位置定位，再 portal 到 body 逃出裁剪。
-  const open = (el: HTMLElement) => {
+  const locate = (el: HTMLElement) => {
     const r = el.getBoundingClientRect();
     setPos({ x: r.left, y: r.bottom + 6 });
   };
+  // 复制用纯文本清单：每行「[状态] 文字」，含顶部摘要，方便贴到别处。
+  const plainText = (): string => {
+    const mark = (s: string) => (s === 'completed' ? '[x]' : s === 'in_progress' ? '[>]' : '[ ]');
+    const lines = items.map((it, i) => `${mark(it.status)} ${it.text || `#${i + 1}`}`);
+    return `${title}\n${lines.join('\n')}`;
+  };
+  const doCopy = async () => {
+    const text = plainText();
+    try {
+      if (navigator.clipboard?.writeText) await navigator.clipboard.writeText(text);
+      else {
+        const ta = document.createElement('textarea');
+        ta.value = text;
+        ta.style.position = 'fixed';
+        ta.style.opacity = '0';
+        document.body.appendChild(ta);
+        ta.select();
+        document.execCommand('copy');
+        document.body.removeChild(ta);
+      }
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 1500);
+    } catch {
+      // 复制失败静默：用户仍可手动选中浮层文字。
+    }
+  };
+  const showPop = pinned || pos;
   return (
     <span
-      className={`session-todo-badge${todos.hasInProgress ? ' active' : ''}`}
+      ref={anchorRef}
+      className={`session-todo-badge${todos.hasInProgress ? ' active' : ''}${pinned ? ' pinned' : ''}`}
       tabIndex={0}
-      onMouseEnter={e => open(e.currentTarget)}
-      onFocus={e => open(e.currentTarget)}
-      onMouseLeave={() => setPos(null)}
-      onBlur={() => setPos(null)}
+      onMouseEnter={e => { if (!pinned) locate(e.currentTarget); }}
+      onFocus={e => { if (!pinned) locate(e.currentTarget); }}
+      onMouseLeave={() => { if (!pinned) setPos(null); }}
+      onBlur={() => { if (!pinned) setPos(null); }}
+      onClick={e => {
+        e.stopPropagation();
+        if (pinned) { setPinned(false); setPos(null); }
+        else { locate(e.currentTarget); setPinned(true); }
+      }}
     >
       {todos.hasInProgress ? <span className="session-todo-dot" aria-hidden="true" /> : null}
       {label}
-      {pos && items.length
+      {showPop && items.length
         ? createPortal(
-            <div className="session-todo-pop" role="tooltip" style={{ left: `${pos.x}px`, top: `${pos.y}px` }}>
-              <div className="session-todo-pop-head">{title}</div>
+            <div
+              ref={popRef}
+              className={`session-todo-pop${pinned ? ' pinned' : ''}`}
+              role={pinned ? 'dialog' : 'tooltip'}
+              style={{ left: `${pos?.x ?? 0}px`, top: `${pos?.y ?? 0}px` }}
+              onMouseDown={e => e.stopPropagation()}
+            >
+              <div className="session-todo-pop-head">
+                <span className="session-todo-pop-title">{title}</span>
+                {pinned ? (
+                  <button
+                    type="button"
+                    className="session-todo-pop-copy"
+                    onClick={e => { e.stopPropagation(); void doCopy(); }}
+                  >
+                    {copied ? t('sessions.board.todoCopied') : t('sessions.board.todoCopy')}
+                  </button>
+                ) : (
+                  <span className="session-todo-pop-hint">{t('sessions.board.todoClickHint')}</span>
+                )}
+              </div>
               <div className="session-todo-pop-list">
                 {items.map((it, i) => (
                   <div key={i} className={`session-todo-pop-item st-${cssToken(it.status)}`}>

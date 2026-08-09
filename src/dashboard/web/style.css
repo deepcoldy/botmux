@@ -2941,6 +2941,13 @@ button.primary {
   cursor: help;
 }
 
+.session-todo-badge.pinned {
+  color: var(--warning, #b26b00);
+  background: color-mix(in srgb, var(--warning, #f5a623) 22%, transparent);
+  border-color: color-mix(in srgb, var(--warning, #f5a623) 55%, transparent);
+  cursor: pointer;
+}
+
 .session-todo-dot {
   width: 6px;
   height: 6px;
@@ -2955,7 +2962,8 @@ button.primary {
 }
 
 /* 悬浮浮层：列出每条 TODO 的状态字形 + 文字。portal 到 body、fixed 定位（卡片/列
-   都是 overflow:hidden，绝对定位会被裁）。JS 控制挂载，位置由行内 left/top 给。 */
+   都是 overflow:hidden，绝对定位会被裁）。JS 控制挂载，位置由行内 left/top 给。
+   两态：hover 悬浮预览（移开即关）；pinned 点击固定（不自动消失，文字可选中复制）。 */
 .session-todo-pop {
   position: fixed;
   z-index: 2000;
@@ -2975,6 +2983,13 @@ button.primary {
   letter-spacing: 0;
   white-space: normal;
   animation: todo-pop-in 0.12s ease;
+  user-select: none;
+}
+
+/* 固定态：文字可选中复制，边框更实以区分「已锁定」。 */
+.session-todo-pop.pinned {
+  user-select: text;
+  border-color: color-mix(in srgb, var(--warning, #f5a623) 45%, var(--border, rgba(255, 255, 255, 0.12)));
 }
 
 @keyframes todo-pop-in {
@@ -2983,11 +2998,46 @@ button.primary {
 }
 
 .session-todo-pop-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
   font-size: 11px;
   font-weight: 700;
   color: var(--muted, #9aa3b2);
   padding-bottom: 4px;
   border-bottom: 1px solid var(--border, rgba(255, 255, 255, 0.1));
+}
+
+.session-todo-pop-title {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.session-todo-pop-hint {
+  flex: none;
+  font-weight: 500;
+  font-size: 10px;
+  opacity: 0.7;
+}
+
+.session-todo-pop-copy {
+  flex: none;
+  cursor: pointer;
+  font-family: var(--sans, inherit);
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--warning, #f5a623);
+  background: color-mix(in srgb, var(--warning, #f5a623) 14%, transparent);
+  border: 1px solid color-mix(in srgb, var(--warning, #f5a623) 40%, transparent);
+  border-radius: var(--radius-sm, 5px);
+  padding: 2px 8px;
+  line-height: 1.4;
+  transition: background 0.1s ease;
+}
+
+.session-todo-pop-copy:hover {
+  background: color-mix(in srgb, var(--warning, #f5a623) 24%, transparent);
 }
 
 .session-todo-pop-list {
