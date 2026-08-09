@@ -2937,6 +2937,8 @@ button.primary {
   color: var(--warning, #b26b00);
   background: color-mix(in srgb, var(--warning, #f5a623) 12%, transparent);
   border: 1px solid color-mix(in srgb, var(--warning, #f5a623) 34%, transparent);
+  position: relative;
+  cursor: help;
 }
 
 .session-todo-dot {
@@ -2951,6 +2953,74 @@ button.primary {
   0%, 100% { opacity: 1; }
   50% { opacity: 0.3; }
 }
+
+/* 悬浮浮层：列出每条 TODO 的状态字形 + 文字。portal 到 body、fixed 定位（卡片/列
+   都是 overflow:hidden，绝对定位会被裁）。JS 控制挂载，位置由行内 left/top 给。 */
+.session-todo-pop {
+  position: fixed;
+  z-index: 2000;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 220px;
+  max-width: 360px;
+  padding: 10px 12px;
+  border-radius: var(--radius-md, 8px);
+  background: var(--surface-raised, #1b1f2a);
+  border: 1px solid var(--border, rgba(255, 255, 255, 0.12));
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.35);
+  color: var(--text, #e6e8ee);
+  font-family: var(--sans, inherit);
+  font-weight: 400;
+  letter-spacing: 0;
+  white-space: normal;
+  animation: todo-pop-in 0.12s ease;
+}
+
+@keyframes todo-pop-in {
+  from { opacity: 0; transform: translateY(-4px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+.session-todo-pop-head {
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--muted, #9aa3b2);
+  padding-bottom: 4px;
+  border-bottom: 1px solid var(--border, rgba(255, 255, 255, 0.1));
+}
+
+.session-todo-pop-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-height: 320px;
+  overflow-y: auto;
+}
+
+.session-todo-pop-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.session-todo-pop-glyph {
+  flex: none;
+  width: 14px;
+  text-align: center;
+  font-family: var(--mono);
+  font-weight: 700;
+}
+
+.session-todo-pop-item.st-completed { color: var(--muted, #9aa3b2); }
+.session-todo-pop-item.st-completed .session-todo-pop-text { text-decoration: line-through; }
+.session-todo-pop-item.st-completed .session-todo-pop-glyph { color: var(--success, #35c46a); }
+.session-todo-pop-item.st-in-progress { color: var(--text, #e6e8ee); font-weight: 600; }
+.session-todo-pop-item.st-in-progress .session-todo-pop-glyph { color: var(--warning, #f5a623); }
+.session-todo-pop-item.st-pending { color: var(--text-secondary, #c3c9d4); }
+.session-todo-pop-item.st-pending .session-todo-pop-glyph { color: var(--muted, #9aa3b2); }
 
 .session-signal {
   display: inline-flex;

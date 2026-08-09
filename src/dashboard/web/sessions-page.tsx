@@ -222,18 +222,47 @@ function StatusBadge(props: { status: unknown }): React.JSX.Element {
  *  单看运行态徽标解释不了列归属。openTodos 缺失或已全部完成时不渲染。 */
 function TodoBadge(props: { row: any }): React.JSX.Element | null {
   const todos = props.row?.openTodos;
+  const [pos, setPos] = useState<{ x: number; y: number } | null>(null);
   if (!todos || typeof todos.remaining !== 'number' || todos.remaining <= 0) return null;
   const total = Number(todos.total ?? 0);
   const done = Number(todos.done ?? 0);
   const label = t('sessions.board.todoBadge', { done, total });
   const title = t('sessions.board.todoBadgeTitle', { remaining: todos.remaining, total, done });
+  const items: Array<{ status: string; text: string }> = Array.isArray(todos.items) ? todos.items : [];
+  const glyph = (s: string) => (s === 'completed' ? '✓' : s === 'in_progress' ? '▶' : '○');
+  // 卡片/列都是 overflow:hidden，纯 CSS 绝对定位浮层会被裁。改用 fixed + 悬浮时按
+  // 徽标位置定位，再 portal 到 body 逃出裁剪。
+  const open = (el: HTMLElement) => {
+    const r = el.getBoundingClientRect();
+    setPos({ x: r.left, y: r.bottom + 6 });
+  };
   return (
     <span
       className={`session-todo-badge${todos.hasInProgress ? ' active' : ''}`}
-      title={title}
+      tabIndex={0}
+      onMouseEnter={e => open(e.currentTarget)}
+      onFocus={e => open(e.currentTarget)}
+      onMouseLeave={() => setPos(null)}
+      onBlur={() => setPos(null)}
     >
       {todos.hasInProgress ? <span className="session-todo-dot" aria-hidden="true" /> : null}
       {label}
+      {pos && items.length
+        ? createPortal(
+            <div className="session-todo-pop" role="tooltip" style={{ left: `${pos.x}px`, top: `${pos.y}px` }}>
+              <div className="session-todo-pop-head">{title}</div>
+              <div className="session-todo-pop-list">
+                {items.map((it, i) => (
+                  <div key={i} className={`session-todo-pop-item st-${cssToken(it.status)}`}>
+                    <span className="session-todo-pop-glyph" aria-hidden="true">{glyph(it.status)}</span>
+                    <span className="session-todo-pop-text">{it.text || `#${i + 1}`}</span>
+                  </div>
+                ))}
+              </div>
+            </div>,
+            document.body,
+          )
+        : null}
     </span>
   );
 }

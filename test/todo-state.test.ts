@@ -32,7 +32,17 @@ const codexPlan = (statuses: string[], asString = false) => {
 describe('todoSnapshotFromEntry (Claude)', () => {
   it('summarizes a TodoWrite snapshot', () => {
     expect(todoSnapshotFromEntry(claudeTodo(['completed', 'in_progress', 'pending']), 'claude'))
-      .toEqual({ total: 3, done: 1, remaining: 2, hasInProgress: true });
+      .toMatchObject({ total: 3, done: 1, remaining: 2, hasInProgress: true });
+  });
+
+  it('carries per-item text and status in order (TodoWrite content)', () => {
+    // 悬浮浮层要的具体清单：每条 {status,text}，text 取 TodoWrite 的 content。
+    expect(todoSnapshotFromEntry(claudeTodo(['completed', 'in_progress', 'pending']), 'claude')?.items)
+      .toEqual([
+        { status: 'completed', text: 'step 0' },
+        { status: 'in_progress', text: 'step 1' },
+        { status: 'pending', text: 'step 2' },
+      ]);
   });
 
   it('ignores non-TodoWrite tool_use and non-assistant entries', () => {
@@ -46,19 +56,27 @@ describe('todoSnapshotFromEntry (Claude)', () => {
     expect(todoSnapshotFromEntry(claudeTodo([]), 'claude')).toBeNull();
     // mixed valid + junk keeps only valid ones
     expect(todoSnapshotFromEntry(claudeTodo(['completed', 'nope']), 'claude'))
-      .toEqual({ total: 1, done: 1, remaining: 0, hasInProgress: false });
+      .toMatchObject({ total: 1, done: 1, remaining: 0, hasInProgress: false });
   });
 });
 
 describe('todoSnapshotFromEntry (Codex)', () => {
   it('summarizes an update_plan snapshot (object args)', () => {
     expect(todoSnapshotFromEntry(codexPlan(['completed', 'completed', 'pending']), 'codex'))
-      .toEqual({ total: 3, done: 2, remaining: 1, hasInProgress: false });
+      .toMatchObject({ total: 3, done: 2, remaining: 1, hasInProgress: false });
   });
 
   it('parses update_plan arguments delivered as a JSON string', () => {
     expect(todoSnapshotFromEntry(codexPlan(['in_progress', 'pending'], true), 'codex'))
-      .toEqual({ total: 2, done: 0, remaining: 2, hasInProgress: true });
+      .toMatchObject({ total: 2, done: 0, remaining: 2, hasInProgress: true });
+  });
+
+  it('carries per-item text from the plan step', () => {
+    expect(todoSnapshotFromEntry(codexPlan(['completed', 'pending']), 'codex')?.items)
+      .toEqual([
+        { status: 'completed', text: 'step 0' },
+        { status: 'pending', text: 'step 1' },
+      ]);
   });
 
   it('ignores other function calls and malformed args', () => {
@@ -77,7 +95,7 @@ describe('parseOpenTodos (last-write-wins)', () => {
       claudeTodo(['completed', 'completed', 'completed']),
     ];
     expect(parseOpenTodos(entries, 'claude'))
-      .toEqual({ total: 3, done: 3, remaining: 0, hasInProgress: false });
+      .toMatchObject({ total: 3, done: 3, remaining: 0, hasInProgress: false });
   });
 
   it('returns null when the transcript has no todo snapshot at all', () => {
@@ -112,7 +130,23 @@ describe('parseOpenTodos (Claude Task* incremental replay)', () => {
       // 3 仍是创建时的默认 pending
     ];
     expect(parseOpenTodos(entries, 'claude'))
-      .toEqual({ total: 3, done: 1, remaining: 2, hasInProgress: true });
+      .toMatchObject({ total: 3, done: 1, remaining: 2, hasInProgress: true });
+  });
+
+  it('carries each task subject as item text, in creation order', () => {
+    const entries = [
+      taskCreate('c1', 'A'), createResult('c1', 1),
+      taskCreate('c2', 'B'), createResult('c2', 2),
+      taskCreate('c3', 'C'), createResult('c3', 3),
+      taskUpdate('1', 'completed'),
+      taskUpdate('2', 'in_progress'),
+    ];
+    expect(parseOpenTodos(entries, 'claude')?.items)
+      .toEqual([
+        { status: 'completed', text: 'A' },
+        { status: 'in_progress', text: 'B' },
+        { status: 'pending', text: 'C' },
+      ]);
   });
 
   it('honors the last status per task and drops deleted tasks', () => {
@@ -124,7 +158,7 @@ describe('parseOpenTodos (Claude Task* incremental replay)', () => {
       taskUpdate('2', 'deleted'),   // 移出清单
     ];
     expect(parseOpenTodos(entries, 'claude'))
-      .toEqual({ total: 1, done: 1, remaining: 0, hasInProgress: false });
+      .toMatchObject({ total: 1, done: 1, remaining: 0, hasInProgress: false });
   });
 
   it('keeps a task in the list on a metadata-only update (no status field)', () => {
@@ -133,7 +167,7 @@ describe('parseOpenTodos (Claude Task* incremental replay)', () => {
       { type: 'assistant', message: { content: [{ type: 'tool_use', id: 'u1', name: 'TaskUpdate', input: { taskId: '1', subject: 'renamed' } }] } },
     ];
     expect(parseOpenTodos(entries, 'claude'))
-      .toEqual({ total: 1, done: 0, remaining: 1, hasInProgress: false });
+      .toMatchObject({ total: 1, done: 0, remaining: 1, hasInProgress: false });
   });
 
   it('TodoWrite snapshot wins over Task* replay when both are present', () => {
@@ -142,7 +176,7 @@ describe('parseOpenTodos (Claude Task* incremental replay)', () => {
       claudeTodo(['completed', 'completed']),
     ];
     expect(parseOpenTodos(entries, 'claude'))
-      .toEqual({ total: 2, done: 2, remaining: 0, hasInProgress: false });
+      .toMatchObject({ total: 2, done: 2, remaining: 0, hasInProgress: false });
   });
 
   it('returns null when no Task* and no TodoWrite events exist', () => {
@@ -163,7 +197,7 @@ describe('readSessionOpenTodos (unsupported CLIs)', () => {
 describe('todo dialect mapping (traex ≡ codex)', () => {
   it('parses a traex-format update_plan snapshot via the codex dialect', () => {
     expect(todoSnapshotFromEntry(codexPlan(['completed', 'in_progress']), 'codex'))
-      .toEqual({ total: 2, done: 1, remaining: 1, hasInProgress: true });
+      .toMatchObject({ total: 2, done: 1, remaining: 1, hasInProgress: true });
   });
 });
 

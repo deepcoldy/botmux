@@ -15,6 +15,13 @@ import type { CliId } from '../adapters/cli/types.js';
 
 export type TodoStatus = 'pending' | 'in_progress' | 'completed';
 
+/** 单条 TODO：状态 + 文字。文字来源随方言不同：Claude TodoWrite 的 content、
+ *  Task* 的 subject、Codex update_plan 的 step。供 UI 悬浮展示具体清单。 */
+export interface TodoItem {
+  status: TodoStatus;
+  text: string;
+}
+
 export interface OpenTodos {
   /** 待办总数（当前快照里的全部条目）。 */
   total: number;
@@ -24,24 +31,36 @@ export interface OpenTodos {
   remaining: number;
   /** 是否有一项正在进行（in_progress）—— 供 UI 高亮「正在做这一步」。 */
   hasInProgress: boolean;
+  /** 每条 TODO 的状态与文字（按原始顺序），供 UI 悬浮展开清单。 */
+  items: TodoItem[];
 }
 
 function normalizeTodoStatus(value: unknown): TodoStatus | null {
   return value === 'pending' || value === 'in_progress' || value === 'completed' ? value : null;
 }
 
-/** 把一组 {status} 折叠成完成度。空数组返回 null（= 没有有效待办快照，别当成
- *  「0 项已交付」，那会让刚清空 todo 的会话和从没建 todo 的会话表现一致）。 */
-function summarize(statuses: Array<TodoStatus | null>): OpenTodos | null {
-  const valid = statuses.filter((s): s is TodoStatus => s !== null);
+/** 清洗单条文字：转字符串、trim、限长（防超长步骤撑爆浮层）。 */
+function cleanTodoText(v: unknown): string {
+  const s = typeof v === 'string' ? v : v == null ? '' : String(v);
+  const t = s.replace(/\s+/g, ' ').trim();
+  return t.length > 120 ? `${t.slice(0, 119)}…` : t;
+}
+
+/** 把一组 {status,text} 折叠成完成度 + 清单。无任何有效状态返回 null（= 没有有效
+ *  待办快照，别当成「0 项已交付」，那会让刚清空 todo 的会话和从没建 todo 的会话表现
+ *  一致）。 */
+function summarize(entries: Array<{ status: TodoStatus | null; text?: unknown }>): OpenTodos | null {
+  const valid = entries.filter((e): e is { status: TodoStatus; text?: unknown } => e.status !== null);
   if (valid.length === 0) return null;
   let done = 0;
   let hasInProgress = false;
-  for (const s of valid) {
-    if (s === 'completed') done++;
-    else if (s === 'in_progress') hasInProgress = true;
+  const items: TodoItem[] = [];
+  for (const e of valid) {
+    if (e.status === 'completed') done++;
+    else if (e.status === 'in_progress') hasInProgress = true;
+    items.push({ status: e.status, text: cleanTodoText(e.text) });
   }
-  return { total: valid.length, done, remaining: valid.length - done, hasInProgress };
+  return { total: valid.length, done, remaining: valid.length - done, hasInProgress, items };
 }
 
 /** 从单条已解析的 transcript 记录里取 todo 快照；不是 todo 记录返回 null。
@@ -62,7 +81,7 @@ export function todoSnapshotFromEntry(entry: any, kind: 'claude' | 'codex'): Ope
       const todos = block?.input?.todos;
       if (!Array.isArray(todos)) continue;
       // 同一条消息里若出现多次（罕见），后者覆盖前者。
-      latest = summarize(todos.map((t: any) => normalizeTodoStatus(t?.status))) ?? latest;
+      latest = summarize(todos.map((t: any) => ({ status: normalizeTodoStatus(t?.status), text: t?.content ?? t?.activeForm }))) ?? latest;
     }
     return latest;
   }
@@ -75,7 +94,7 @@ export function todoSnapshotFromEntry(entry: any, kind: 'claude' | 'codex'): Ope
   const args = parseArgs(payload.arguments ?? payload.input);
   const plan = args?.plan;
   if (!Array.isArray(plan)) return null;
-  return summarize(plan.map((p: any) => normalizeTodoStatus(p?.status)));
+  return summarize(plan.map((p: any) => ({ status: normalizeTodoStatus(p?.status), text: p?.step })));
 }
 
 function parseArgs(raw: unknown): Record<string, unknown> | null {
@@ -117,9 +136,10 @@ export function parseOpenTodos(entries: any[], kind: 'claude' | 'codex'): OpenTo
 // 按 tool_use.id 关联 TaskCreate 与其结果，重放出 Map<taskId,status> 末态，再折叠
 // 成 OpenTodos。整个清单没有任何任务时返回 null（= 未用过任务清单，别当已交付）。
 function replayClaudeTaskState(entries: any[]): OpenTodos | null {
-  const status = new Map<string, TodoStatus>();
-  // TaskCreate 的 tool_use.id → 该次创建（等它的 tool_result 回填分配的 taskId）。
-  const pendingCreate = new Map<string, true>();
+  // id → {status,text}，Map 按插入顺序（= 任务创建顺序）保序，供 UI 顺序展示。
+  const tasks = new Map<string, { status: TodoStatus; text: string }>();
+  // TaskCreate 的 tool_use.id → 该次创建的 subject（等 tool_result 回填分配的 taskId）。
+  const pendingCreate = new Map<string, string>();
   let sawAnyTask = false;
 
   for (const entry of entries) {
@@ -129,36 +149,41 @@ function replayClaudeTaskState(entries: any[]): OpenTodos | null {
       if (block?.type === 'tool_use') {
         const name = typeof block.name === 'string' ? block.name.trim().toLowerCase() : '';
         if (name === 'taskcreate') {
-          if (typeof block.id === 'string') pendingCreate.set(block.id, true);
+          if (typeof block.id === 'string') {
+            const subject = block?.input?.subject ?? block?.input?.activeForm ?? '';
+            pendingCreate.set(block.id, typeof subject === 'string' ? subject : String(subject ?? ''));
+          }
           sawAnyTask = true;
         } else if (name === 'taskupdate') {
           const id = taskIdString(block?.input?.taskId);
           const st = block?.input?.status;
           if (id) {
             sawAnyTask = true;
-            if (st === 'deleted') status.delete(id);
+            if (st === 'deleted') tasks.delete(id);
             else {
               const norm = normalizeTodoStatus(st);
               // status 缺省的 TaskUpdate（只改 subject/owner 等）不动状态，但要确保
               // 该任务已在册（默认 pending），否则纯元数据更新会丢任务。
-              if (!status.has(id)) status.set(id, 'pending');
-              if (norm) status.set(id, norm);
+              const cur = tasks.get(id) ?? { status: 'pending' as TodoStatus, text: '' };
+              const newSubject = typeof block?.input?.subject === 'string' ? block.input.subject : cur.text;
+              tasks.set(id, { status: norm ?? cur.status, text: newSubject });
             }
           }
         }
       } else if (block?.type === 'tool_result') {
         const forId = typeof block.tool_use_id === 'string' ? block.tool_use_id : '';
         if (forId && pendingCreate.has(forId)) {
+          const subject = pendingCreate.get(forId) ?? '';
           pendingCreate.delete(forId);
           const assigned = extractCreatedTaskId(block.content);
-          if (assigned && !status.has(assigned)) status.set(assigned, 'pending');
+          if (assigned && !tasks.has(assigned)) tasks.set(assigned, { status: 'pending', text: subject });
         }
       }
     }
   }
 
-  if (!sawAnyTask || status.size === 0) return null;
-  return summarize([...status.values()]);
+  if (!sawAnyTask || tasks.size === 0) return null;
+  return summarize([...tasks.values()]);
 }
 
 function taskIdString(v: unknown): string | null {
