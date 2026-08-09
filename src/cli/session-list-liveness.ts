@@ -3,6 +3,7 @@ export interface SessionListMarkers {
   cliId?: unknown;
   lastCliInput?: unknown;
   adoptedFrom?: unknown;
+  codexAppDispatchLedger?: readonly unknown[];
 }
 
 export type SessionListDisposition = 'keep' | 'prune_scratch';
@@ -44,6 +45,11 @@ export function sessionListDisposition(
 ): SessionListDisposition {
   if (runtime.hasPid || runtime.hasBackingSession) return 'keep';
   if (session.suspendedColdResume === true) return 'keep';
+  // PR #597: a Codex App session with an in-flight dispatch ledger is kept even
+  // before it qualifies as a "real managed" session below — the accepted→
+  // prepared→settled FIFO is the authoritative in-flight-turn signal and must
+  // beat the generic prune so a mid-dispatch owner is never abandoned.
+  if ((session.codexAppDispatchLedger?.length ?? 0) > 0) return 'keep';
   // A real managed session with neither a live pid nor a surviving backing pane
   // is dormant, not a zombie: keep it for lazy cold-resume instead of pruning.
   // This is the host-reboot fix — `restoreActiveSessions` keeps these rows, and

@@ -116,6 +116,7 @@ import { globalConfigPath, invalidateGlobalConfigCache } from '../src/global-con
 import {
   __testOnly_activeSessions as activeSessions,
   __testOnly_handleThreadReply as handleThreadReply,
+  __testOnly_computeCodexAppSteerable as computeCodexAppSteerable,
 } from '../src/daemon.js';
 
 const APP = 'initial_turn_app';
@@ -375,6 +376,53 @@ describe('empty-started session — first real business turn must use the new-to
       .toContain('om_codex_quote_target');
     expect(payload.codexAppInput?.additionalContext?.botmux_sender?.value)
       .toContain('ou_owner');
+  });
+
+  it('live worker: a plain human Codex App turn is admitted as steerable (R4-B1 production wiring, not hand-injected)', async () => {
+    const anchor = 'om_steer_live_root';
+    registerBot({
+      larkAppId: APP,
+      larkAppSecret: 's',
+      cliId: 'codex-app',
+      allowedUsers: [OWNER],
+      oncallChats: [{ chatId: CHAT, workingDir: '/tmp' }],
+    }).resolvedAllowedUsers = [OWNER];
+    seedEmptyStarted(anchor, { cliId: 'codex-app' });
+
+    await handleThreadReply(
+      makeEventData('om_steer_live_msg', '第一条真实交互消息', anchor),
+      makeCtx(anchor, 'om_steer_live_msg'),
+    );
+
+    // The daemon computes codexAppSteerable and passes it as sendWorkerInput's
+    // 4th arg (opts) — this is the production path the worker init COPY depends
+    // on. The test does NOT hand-inject the flag anywhere.
+    const opts = mocks.sendWorkerInput.mock.calls[0]?.[3];
+    expect(opts?.codexAppSteerable).toBe(true);
+  });
+
+  it('worker-null refork: a plain human Codex App opening carries the frozen steerable flag on the fork payload (R4-B1)', async () => {
+    const anchor = 'om_steer_cold_root';
+    registerBot({
+      larkAppId: APP,
+      larkAppSecret: 's',
+      cliId: 'codex-app',
+      allowedUsers: [OWNER],
+      oncallChats: [{ chatId: CHAT, workingDir: '/tmp' }],
+    }).resolvedAllowedUsers = [OWNER];
+    seedEmptyStarted(anchor, { live: false, hasHistory: true, cliId: 'codex-app' });
+
+    await handleThreadReply(
+      makeEventData('om_steer_cold_msg', '冷启后的第一条真实交互消息', anchor),
+      makeCtx(anchor, 'om_steer_cold_msg'),
+    );
+
+    // The worker-null re-fork opening must carry the frozen steer authorization
+    // on the CliTurnPayload handed to forkWorker (the gap codex flagged: the
+    // production init path never set it, only the hand-injected test did).
+    expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
+    const openingPayload = mocks.forkWorker.mock.calls[0]?.[1] as any;
+    expect(openingPayload?.codexAppSteerable).toBe(true);
   });
 
   // ─── worker-null / refork ───────────────────────────────────────────────────
@@ -689,5 +737,48 @@ describe('empty-started session — first real business turn must use the new-to
     expect(mocks.forkWorker.mock.calls[mocks.forkWorker.mock.calls.length - 1]?.[2])
       .toEqual({ resume: false, turnId: 'om_after_death' });
     expect(ds.session.initialUserTurnPending).toBeUndefined();
+  });
+});
+
+describe('computeCodexAppSteerable — fail-closed positive-human gate (R7-B1)', () => {
+  const humanFacts = {
+    humanSender: true,
+    adopted: false,
+    isForeignBot: false,
+    isBotSenderType: false,
+    substituteTrigger: false,
+    controlRewrite: false,
+    messageListener: false,
+    vcMeetingReceiver: false,
+    vcMeetingImTurnOrigin: false,
+  };
+
+  it('authorizes ONLY a positive human sender with no special semantics', () => {
+    expect(computeCodexAppSteerable({ ...humanFacts })).toBe(true);
+  });
+
+  it('is fail-closed: NO humanSender ⇒ serial even when every exclusion is absent (the fail-open root)', () => {
+    // The bug codex caught: excluding a list of known non-human sources is not
+    // enough — an un-enumerated non-user source (humanSender:false) must still be
+    // denied. This is the core positive-assert guarantee.
+    expect(computeCodexAppSteerable({ ...humanFacts, humanSender: false })).toBe(false);
+  });
+
+  it('each special-source fact independently forces serial', () => {
+    for (const key of [
+      'adopted', 'isForeignBot', 'isBotSenderType', 'substituteTrigger',
+      'controlRewrite', 'messageListener', 'vcMeetingReceiver', 'vcMeetingImTurnOrigin',
+    ] as const) {
+      expect(computeCodexAppSteerable({ ...humanFacts, [key]: true })).toBe(false);
+    }
+  });
+
+  it('a known peer bot (isForeignBot true / humanSender false) stays serial even if sender_type looked user-like', () => {
+    // The known-peer fallback: an anomalous sender_type from a known peer must
+    // NOT be authorized. Both the humanSender=false and isForeignBot=true facts
+    // (which the daemon derives via isKnownPeerBot) independently deny it.
+    expect(computeCodexAppSteerable({
+      ...humanFacts, humanSender: false, isForeignBot: true,
+    })).toBe(false);
   });
 });

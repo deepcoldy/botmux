@@ -802,9 +802,13 @@ export function updateTask(
   if (!task) return { ok: false, error: 'not_found' };
 
   const patch: Record<string, unknown> = {};
+  const eventPatch: Record<string, unknown> = {};
   if (updates.name !== undefined) patch.name = updates.name;
   if (updates.prompt !== undefined) patch.prompt = updates.prompt;
-  if (updates.silent !== undefined) patch.silent = updates.silent === true ? true : undefined;
+  if (updates.silent !== undefined) {
+    patch.silent = updates.silent === true ? true : undefined;
+    eventPatch.silent = updates.silent === true;
+  }
 
   const legacyPosition = updates.deliver === 'new-topic'
     ? 'new-topic'
@@ -844,7 +848,7 @@ export function updateTask(
   scheduleStore.updateTask(id, patch);
   dashboardEventBus.publish({
     type: 'schedule.updated',
-    body: { id, patch },
+    body: { id, patch: { ...patch, ...eventPatch } },
   });
   return { ok: true };
 }

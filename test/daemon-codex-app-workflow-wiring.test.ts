@@ -26,7 +26,15 @@ describe('daemon Codex App workflow prompt lanes', () => {
     expect(block).toContain("const codexAppMessageContext = topicThreadContext + codexAppQuoteContext + (workflowGrillPrompt ?? '');");
     expect(block).toContain('const promptContent = topicThreadContext + codexAppQuoteContext + codexAppApplicationContext + content;');
     expect(block).toContain('pendingCodexAppText: codexAppVisibleText');
-    expect(block.match(/codexAppText: codexAppVisibleText/g)).toHaveLength(2);
+    expect(source).toContain('codexAppText: ds.pendingCodexAppText');
+    // Pinned (oncall/inherited/default-dir) new topics still fork immediately via
+    // forkReservedInitialSession. The no-project fork now happens off the critical
+    // path: repo scanning is async, so an empty scan folds into commitRepoSelection
+    // inside the detached scan-completion handler rather than a second inline
+    // forkReservedInitialSession call.
+    expect(block.match(/forkReservedInitialSession\(ds, availableBots\)/g)).toHaveLength(1);
+    expect(block).toContain('await commitRepoSelection(');
+    expect(block).toContain('scanMultipleProjectsAsync(scanDirs');
   });
 
   it('retains VC lifecycle context in rewritten legacy prompts without demoting it to untrusted', () => {
@@ -47,5 +55,14 @@ describe('daemon Codex App workflow prompt lanes', () => {
     expect(block).toContain(
       'const codexAppApplicationContext = initialCodexAppApplicationContext;',
     );
+  });
+
+  it('does not buffer ordinary turns solely because repo commit UI cleanup is still in flight', () => {
+    const block = region(
+      'async function handleThreadReply',
+      'async function autoCreateDocSession',
+    );
+    expect(block).toContain('if (ds?.pendingRepo || initialStartPending) {');
+    expect(block).not.toContain('if (ds?.pendingRepo || ds?.pendingRepoCommitInFlight || initialStartPending)');
   });
 });

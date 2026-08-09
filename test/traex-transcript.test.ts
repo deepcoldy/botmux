@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { CodexBridgeQueue } from '../src/services/codex-bridge-queue.js';
 import {
   drainTraexRollout,
+  readLatestTraexRuntime,
   traexRolloutHasUserInputSince,
   traexHistoryMatchDelta,
   traexHistorySize,
@@ -83,6 +84,87 @@ afterEach(() => {
 });
 
 describe('drainTraexRollout', () => {
+  it('reports the latest complete turn_context model and reasoning effort', () => {
+    writeFileSync(path, [
+      line({
+        type: 'turn_context',
+        payload: {
+          model: 'GPT-5.5',
+          collaboration_mode: { settings: { reasoning_effort: 'high' } },
+        },
+      }),
+      line(user('switch model')),
+      line({
+        type: 'turn_context',
+        payload: {
+          model: 'GPT-5.6-Sol',
+          collaboration_mode: { settings: { reasoning_effort: 'xhigh' } },
+        },
+      }),
+      line(taskComplete('done')),
+    ].join(''));
+
+    const result = drainTraexRollout(path, 0);
+    expect(result.latestModel).toBe('GPT-5.6-Sol');
+    expect(result.latestReasoningEffort).toBe('xhigh');
+    expect(readLatestTraexRuntime(path)).toEqual({
+      model: 'GPT-5.6-Sol',
+      reasoningEffort: 'xhigh',
+    });
+  });
+
+  it('ignores a partial trailing model record until it is complete', () => {
+    writeFileSync(path, line({ type: 'turn_context', payload: { model: 'stable-model' } }));
+    appendFileSync(path, JSON.stringify({
+      type: 'turn_context',
+      payload: { model: 'partial-model' },
+    }).slice(0, -4));
+
+    expect(drainTraexRollout(path, 0).latestModel).toBe('stable-model');
+    expect(readLatestTraexRuntime(path)).toEqual({ model: 'stable-model' });
+  });
+
+  it('readLatestTraexRuntime resolves model and effort from independent latest records (backward scan)', () => {
+    // /model then /effort switched in separate turns — each field is
+    // latest-wins independently, so the newest of EACH must win even though
+    // they live on different lines.
+    writeFileSync(path, [
+      line({ type: 'turn_context', payload: { model: 'old-model', reasoning_effort: 'low' } }),
+      line(user('/model new')),
+      line({ type: 'turn_context', payload: { model: 'new-model' } }),
+      line(user('/effort high')),
+      line({ type: 'turn_context', payload: { reasoning_effort: 'high' } }),
+      line(taskComplete('done')),
+    ].join(''));
+
+    expect(readLatestTraexRuntime(path)).toEqual({
+      model: 'new-model',
+      reasoningEffort: 'high',
+    });
+  });
+
+  it('readLatestTraexRuntime finds the runtime when the only record is the first line (offset 0)', () => {
+    writeFileSync(path, line({ type: 'turn_context', payload: { model: 'solo-model' } }));
+    expect(readLatestTraexRuntime(path)).toEqual({ model: 'solo-model' });
+  });
+
+  it('readLatestTraexRuntime scans back across a large transcript to the newest tail record', () => {
+    const filler = Array.from({ length: 2000 }, (_, i) =>
+      line(assistantProgress(`tool commentary chunk ${i} ${'x'.repeat(200)}`)),
+    ).join('');
+    writeFileSync(path, [
+      line({ type: 'turn_context', payload: { model: 'stale', reasoning_effort: 'low' } }),
+      filler,
+      line({ type: 'turn_context', payload: { model: 'fresh-tail', reasoning_effort: 'xhigh' } }),
+      line(taskComplete('done')),
+    ].join(''));
+
+    expect(readLatestTraexRuntime(path)).toEqual({
+      model: 'fresh-tail',
+      reasoningEffort: 'xhigh',
+    });
+  });
+
   it('uses task_complete as the terminal and ignores phase-less assistant progress', () => {
     writeFileSync(path, [
       line(user('do the work')),

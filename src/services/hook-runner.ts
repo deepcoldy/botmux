@@ -45,6 +45,21 @@ export type HookPayload = Record<string, unknown> & {
   sender_open_id?: string;
 };
 
+/** Frozen authority for a read-isolated post-provider hook. Every value comes
+ * from the original protected claim/attestation; forwarding must not rediscover
+ * a daemon or reread a rotating capability after the fence. */
+export interface ManagedHookOrigin {
+  ipcPort: number;
+  sessionId: string;
+  capability: string;
+  turnId: string;
+  dispatchAttempt?: number;
+}
+
+export interface EmitHookEventOptions {
+  managedOrigin?: ManagedHookOrigin;
+}
+
 export type ParsedHookCommand = {
   file: string;
   args: string[];
@@ -361,7 +376,11 @@ async function runHookCommand(
   });
 }
 
-export function emitHookEvent(event: HookEvent, body: Record<string, unknown> = {}): void {
+export function emitHookEvent(
+  event: HookEvent,
+  body: Record<string, unknown> = {},
+  options: EmitHookEventOptions = {},
+): void {
   try {
     const payload: HookPayload = {
       ...body,
@@ -378,8 +397,14 @@ export function emitHookEvent(event: HookEvent, body: Record<string, unknown> = 
     // session-scoped env scrubbed (index-daemon.ts) and its /api/hooks/emit
     // handler calls emitHookEventLocal, so the gate can't self-forward even
     // if leaked env survives somewhere.
-    if (process.env.BOTMUX_SESSION_ID && process.env.BOTMUX_LARK_APP_ID) {
-      void forwardEmitToDaemon(event, payload, process.env.BOTMUX_LARK_APP_ID);
+    if (options.managedOrigin
+      || (process.env.BOTMUX_SESSION_ID && process.env.BOTMUX_LARK_APP_ID)) {
+      void forwardEmitToDaemon(
+        event,
+        payload,
+        process.env.BOTMUX_LARK_APP_ID ?? '',
+        options.managedOrigin,
+      );
       return;
     }
 
@@ -442,10 +467,16 @@ const HOOK_FORWARD_FETCH_TIMEOUT_MS = 2_000;
  * process-group cleanup work. Best-effort — daemon unreachable / 4xx / 5xx
  * just log and drop, hooks are best-effort by contract.
  */
-async function forwardEmitToDaemon(event: HookEvent, payload: HookPayload, larkAppId: string): Promise<void> {
+export async function forwardEmitToDaemon(
+  event: HookEvent,
+  payload: HookPayload,
+  larkAppId: string,
+  managedOrigin?: ManagedHookOrigin,
+): Promise<void> {
   try {
-    const daemon = findOnlineDaemon(larkAppId);
-    if (!daemon) {
+    const daemon = managedOrigin ? undefined : findOnlineDaemon(larkAppId);
+    const ipcPort = managedOrigin?.ipcPort ?? daemon?.ipcPort;
+    if (!ipcPort) {
       logger.debug(`[hooks] CLI forward: no daemon for ${larkAppId}, dropping ${event}`);
       return;
     }
@@ -453,13 +484,16 @@ async function forwardEmitToDaemon(event: HookEvent, payload: HookPayload, larkA
     const timer = setTimeout(() => ctrl.abort(), HOOK_FORWARD_FETCH_TIMEOUT_MS);
     timer.unref();
     try {
-      const sessionId = process.env.BOTMUX_SESSION_ID;
-      const origin = resolveSessionContext(config.session.dataDir, sessionId);
-      const originCapability = readManagedOriginCapability(
-        config.session.dataDir,
-        sessionId,
-        process.env.BOTMUX_SEND_RELAY,
-      )?.capability;
+      const sessionId = managedOrigin?.sessionId ?? process.env.BOTMUX_SESSION_ID;
+      const origin = managedOrigin
+        ? undefined
+        : resolveSessionContext(config.session.dataDir, sessionId);
+      const originCapability = managedOrigin?.capability ?? readManagedOriginCapability(
+          config.session.dataDir,
+          sessionId,
+          process.env.BOTMUX_SEND_RELAY,
+          process.env.BOTMUX_ORIGIN_CHANNEL_ID,
+        )?.capability;
       const envAttempt = Number(process.env.BOTMUX_DISPATCH_ATTEMPT);
       const request = {
         method: 'POST',
@@ -469,8 +503,8 @@ async function forwardEmitToDaemon(event: HookEvent, payload: HookPayload, larkA
           payload,
           sessionId,
           originCapability,
-          originTurnId: origin?.turnId ?? process.env.BOTMUX_TURN_ID,
-          originDispatchAttempt: origin?.dispatchAttempt
+          originTurnId: managedOrigin?.turnId ?? origin?.turnId ?? process.env.BOTMUX_TURN_ID,
+          originDispatchAttempt: managedOrigin?.dispatchAttempt ?? origin?.dispatchAttempt
             ?? (Number.isSafeInteger(envAttempt) && envAttempt > 0 ? envAttempt : undefined),
         }),
         signal: ctrl.signal,
@@ -478,8 +512,8 @@ async function forwardEmitToDaemon(event: HookEvent, payload: HookPayload, larkA
       let secret: string | undefined;
       try { secret = loadDaemonIpcSecret(); } catch { /* Seatbelt/read-isolated CLI */ }
       const res = secret
-        ? await fetchDaemonIpc(daemon.ipcPort, '/api/hooks/emit', request, secret)
-        : await fetch(`http://127.0.0.1:${daemon.ipcPort}/api/hooks/emit`, request);
+        ? await fetchDaemonIpc(ipcPort, '/api/hooks/emit', request, secret)
+        : await fetch(`http://127.0.0.1:${ipcPort}/api/hooks/emit`, request);
       if (!res.ok) {
         logger.warn(`[hooks] CLI forward ${event} → daemon: HTTP ${res.status}`);
       }

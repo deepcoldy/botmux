@@ -284,7 +284,7 @@ describe('daemon close barrier used by botmux delete', () => {
         cliVersion: 'test',
         lastMessageAt: Date.now(),
         hasHistory: true,
-        initConfig: { backendType: 'riff' },
+        initConfig: { backendType: 'pty' },
       } as any;
 
       workerPool.killWorker(ds);
@@ -366,7 +366,7 @@ describe('daemon close barrier used by botmux delete', () => {
         lastMessageAt: Date.now(),
         hasHistory: true,
         workerGeneration: 1,
-        initConfig: { backendType: 'riff' },
+        initConfig: { backendType: 'pty' },
       } as any;
 
       workerPool.killWorker(ds);
@@ -375,7 +375,7 @@ describe('daemon close barrier used by botmux delete', () => {
       expect(existsSync(oldMarkerPath)).toBe(true);
 
       // Repo/card switch reuses the same DaemonSession object for a new
-      // Session + worker generation while the old riff close fence is still
+      // Session + worker generation while the old worker close fence is still
       // unresolved. The new close must NOT reuse the old fence: it needs a
       // fence registered under newSession.sessionId, otherwise default
       // sessionStore.closeSession() would unlink the new marker immediately.

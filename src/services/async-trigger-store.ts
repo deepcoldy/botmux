@@ -25,12 +25,20 @@ import { readFileSync, writeFileSync, mkdirSync, existsSync, renameSync, unlinkS
 import { join } from 'node:path';
 import { config } from '../config.js';
 import { logger } from '../utils/logger.js';
+import { withFileLockSync } from '../utils/file-lock.js';
+import { atomicWriteFileSync } from '../utils/atomic-write.js';
 
 export interface PersistedAsyncTriggerResult {
-  status: 'pending' | 'completed';
+  status: 'pending' | 'completed' | 'failed';
   createdAt: number;
   completedAt?: number;
   content?: string;
+  /** Set only when status==='failed'. `dispatch_unknown` is the at-most-once
+   *  ambiguous-crash outcome written by the idempotency reconcile/barrier: a
+   *  turn whose dispatch may or may not have executed and must NOT be re-run. */
+  failedAt?: number;
+  errorCode?: 'no_output';
+  reason?: 'dispatch_unknown';
   /** Per-turn token usage captured at completion (codex-app). Optional — omitted
    *  when the turn produced no coherent usage. */
   usage?: {
@@ -77,6 +85,26 @@ function load(sessionId: string): AsyncTriggerFile {
   }
 }
 
+/** STRICT loader for the authoritative failed-evidence RMW: ONLY a genuinely
+ *  absent file (ENOENT) is treated as empty. A present-but-unreadable file
+ *  (EIO/EACCES), corrupt JSON, or invalid shape THROWS — the soft `load()` would
+ *  fold these into `{results:{}}`, and recordFailedStrict would then durably
+ *  OVERWRITE a file that might hold a `completed` proof or another owner's data
+ *  (finding: strict write over a soft read defeats completed-wins/owner-proof). */
+function loadStrict(sessionId: string): AsyncTriggerFile {
+  const fp = getFilePath(sessionId);
+  try { readFileSync(fp, 'utf-8'); }
+  catch (err: any) {
+    if (err?.code === 'ENOENT') return { results: {} };
+    throw err; // EIO/EACCES/… — do NOT treat as empty
+  }
+  const data = JSON.parse(readFileSync(fp, 'utf-8')) as AsyncTriggerFile; // corrupt → throw
+  if (!data || typeof data !== 'object' || typeof data.results !== 'object') {
+    throw new Error(`corrupt async-trigger file (invalid shape): ${fp}`);
+  }
+  return { ownerLarkAppId: data.ownerLarkAppId, latestTriggerId: data.latestTriggerId, results: data.results ?? {} };
+}
+
 function save(sessionId: string, file: AsyncTriggerFile): void {
   ensureDir();
   const fp = getFilePath(sessionId);
@@ -87,6 +115,17 @@ function save(sessionId: string, file: AsyncTriggerFile): void {
   } catch (err) {
     logger.debug(`Failed to persist async trigger results for ${sessionId}: ${err}`);
   }
+}
+
+/** Crash-durable, THROWING save for authoritative failed evidence. Unlike
+ *  `save` (best-effort), a write failure here propagates so the caller can treat
+ *  a lost dispatch_unknown record as a hard error. */
+function saveStrict(sessionId: string, file: AsyncTriggerFile): void {
+  ensureDir();
+  atomicWriteFileSync(getFilePath(sessionId), JSON.stringify(file, null, 2), {
+    durable: true,
+    followTargetSymlink: false,
+  });
 }
 
 /** Record a freshly-armed async trigger as pending. Best-effort; a failed write
@@ -113,18 +152,71 @@ export function recordCompleted(
   ownerLarkAppId: string,
   usage?: PersistedAsyncTriggerResult['usage'],
 ): void {
-  const file = load(sessionId);
-  if (ownerLarkAppId) file.ownerLarkAppId = ownerLarkAppId;
-  const prev = file.results[triggerId];
-  file.results[triggerId] = {
-    status: 'completed',
-    createdAt: prev?.createdAt ?? completedAt,
-    completedAt,
-    content,
-    ...(usage ? { usage } : {}),
-  };
-  if (!file.latestTriggerId) file.latestTriggerId = triggerId;
-  save(sessionId, file);
+  // Serialize with recordFailedStrict on the same per-session lock so a
+  // completed proof and a dispatch_unknown failure can't interleave-clobber.
+  // Completed is the STRONGER evidence: it always wins (a late completed
+  // overwrites a previously-written dispatch_unknown — the turn did finish).
+  ensureDir();
+  withFileLockSync(getFilePath(sessionId), () => {
+    const file = load(sessionId);
+    if (ownerLarkAppId) file.ownerLarkAppId = ownerLarkAppId;
+    const prev = file.results[triggerId];
+    file.results[triggerId] = {
+      status: 'completed',
+      createdAt: prev?.createdAt ?? completedAt,
+      completedAt,
+      content,
+      ...(usage ? { usage } : {}),
+    };
+    if (!file.latestTriggerId) file.latestTriggerId = triggerId;
+    save(sessionId, file);
+  });
+}
+
+/**
+ * Record a durable `failed` async outcome (STRICT). This is the authoritative
+ * terminal state the idempotency reconcile/barrier writes for a
+ * `dispatch_unknown` turn — an at-most-once ambiguous crash that must NOT be
+ * re-run. Unlike recordPending/recordCompleted's best-effort save, this:
+ *   - takes the per-session cross-process lock (serialized with recordCompleted),
+ *   - writes crash-durable (fsync temp + rename), and
+ *   - THROWS on any I/O error (the caller must treat a failed persist as a hard
+ *     failure — the whole point is that this evidence is authoritative).
+ *
+ * Completed-wins invariant: if a `completed` result is ALREADY on disk for this
+ * triggerId, this is a no-op (the turn finished; the stronger proof stands). We
+ * deliberately do NOT make `failed` irreversible — a completed arriving later
+ * still wins via recordCompleted (same lock).
+ */
+export function recordFailedStrict(
+  sessionId: string,
+  triggerId: string,
+  failedAt: number,
+  ownerLarkAppId: string,
+  reason: 'dispatch_unknown' = 'dispatch_unknown',
+): void {
+  if (!ownerLarkAppId) throw new Error('recordFailedStrict requires ownerLarkAppId');
+  ensureDir();
+  withFileLockSync(getFilePath(sessionId), () => {
+    const file = loadStrict(sessionId); // ONLY ENOENT is empty; corrupt/EIO throws
+    // Owner proof: never overwrite another bot's file (a hash/path mixup or a
+    // cross-bot mistake must fail-closed, not clobber their evidence).
+    if (file.ownerLarkAppId && file.ownerLarkAppId !== ownerLarkAppId) {
+      throw new Error(`recordFailedStrict owner mismatch: file owned by ${file.ownerLarkAppId}, caller ${ownerLarkAppId}`);
+    }
+    const prev = file.results[triggerId];
+    if (prev?.status === 'completed') return; // completed is stronger — keep it
+    file.ownerLarkAppId = ownerLarkAppId;
+    file.results[triggerId] = {
+      status: 'failed',
+      createdAt: prev?.createdAt ?? failedAt,
+      failedAt,
+      errorCode: 'no_output',
+      reason,
+    };
+    if (!file.latestTriggerId) file.latestTriggerId = triggerId;
+    saveStrict(sessionId, file); // durable + throws
+  });
 }
 
 /** Look up a persisted result. With no triggerId, resolves the latest recorded

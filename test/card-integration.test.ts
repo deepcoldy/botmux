@@ -180,7 +180,7 @@ import {
   forkWorker,
   requestSessionRestart,
 } from '../src/core/worker-pool.js';
-import { sessionKey } from '../src/core/types.js';
+import { activeSessionKey, sessionKey } from '../src/core/types.js';
 import type { DaemonSession } from '../src/core/types.js';
 import { buildStreamingCard } from '../src/im/lark/card-builder.js';
 import * as sessionStore from '../src/services/session-store.js';
@@ -522,6 +522,31 @@ describe('Card integration: full event flow', () => {
       expect(deps.sessionReply).not.toHaveBeenCalled();
     });
 
+    it('restart from a stale Riff card should explain close-and-recreate without IPC', async () => {
+      const clientMod = await import('../src/im/lark/client.js');
+      const workerSend = vi.fn();
+      const ds = makeDaemonSession({
+        worker: { killed: false, send: workerSend } as any,
+      });
+      ds.session.cliId = 'riff';
+      ds.session.backendType = 'riff';
+      const sessions = new Map<string, DaemonSession>();
+      sessions.set(sessionKey(ROOT_ID, APP_ID), ds);
+      const deps = makeDeps(sessions);
+
+      await handleCardAction(makeRestartEvent(ROOT_ID), deps, APP_ID);
+
+      expect(workerSend).not.toHaveBeenCalled();
+      expect(forkWorker).not.toHaveBeenCalled();
+      expect(vi.mocked(clientMod.sendEphemeralCard)).toHaveBeenCalledWith(
+        APP_ID,
+        ds.chatId,
+        'ou_user',
+        expect.stringMatching(/Riff.*不支持重启.*\/close/),
+      );
+      expect(deps.sessionReply).not.toHaveBeenCalled();
+    });
+
     it('restart without worker should re-fork', async () => {
       const ds = makeDaemonSession({ worker: null });
       const sessions = new Map<string, DaemonSession>();
@@ -533,15 +558,15 @@ describe('Card integration: full event flow', () => {
       expect(requestSessionRestart).toHaveBeenCalledWith(ds, expect.objectContaining({ source: 'card' }));
     });
 
-    it('close should kill worker and remove session', async () => {
+    it('close should remove session and deliver the closed card', async () => {
       const clientMod = await import('../src/im/lark/client.js');
       const ds = makeDaemonSession();
       const sessions = new Map<string, DaemonSession>();
-      const sKey = sessionKey(ROOT_ID, APP_ID);
+      const sKey = activeSessionKey(ds);
       sessions.set(sKey, ds);
       const deps = makeDeps(sessions);
 
-      await handleCardAction(makeCloseEvent(ROOT_ID), deps, APP_ID);
+      await handleCardAction(makeCloseEvent(ROOT_ID, 'ou_user', undefined, ds.session.sessionId), deps, APP_ID);
 
       expect(sessionStore.closeSession).toHaveBeenCalledWith(
         ds.session.sessionId,
@@ -604,11 +629,15 @@ describe('Card integration: full event flow', () => {
       try {
         const ds = makeDaemonSession();
         const sessions = new Map<string, DaemonSession>();
-        const sKey = sessionKey(ROOT_ID, APP_ID);
+        const sKey = activeSessionKey(ds);
         sessions.set(sKey, ds);
         const deps = makeDeps(sessions);
 
-        await handleCardAction(makeCloseEvent(ROOT_ID, 'ou_owner'), deps, APP_ID);
+        await handleCardAction(
+          makeCloseEvent(ROOT_ID, 'ou_owner', undefined, ds.session.sessionId),
+          deps,
+          APP_ID,
+        );
 
         expect(sessionStore.closeSession).toHaveBeenCalledWith(
           ds.session.sessionId,
@@ -649,11 +678,15 @@ describe('Card integration: full event flow', () => {
       try {
         const ds = makeDaemonSession();
         const sessions = new Map<string, DaemonSession>();
-        const sKey = sessionKey(ROOT_ID, APP_ID);
+        const sKey = activeSessionKey(ds);
         sessions.set(sKey, ds);
         const deps = makeDeps(sessions);
 
-        await handleCardAction(makeCloseEvent(ROOT_ID, 'ou_owner', 'private'), deps, APP_ID);
+        await handleCardAction(
+          makeCloseEvent(ROOT_ID, 'ou_owner', 'private', ds.session.sessionId),
+          deps,
+          APP_ID,
+        );
 
         expect(sessionStore.closeSession).toHaveBeenCalledWith(
           ds.session.sessionId,
@@ -886,7 +919,7 @@ describe('Card integration: full event flow', () => {
       const clientMod = await import('../src/im/lark/client.js');
       const ds = makeDaemonSession({ scope: 'thread' });
       const sessions = new Map<string, DaemonSession>();
-      const sKey = sessionKey(ROOT_ID, APP_ID);
+      const sKey = activeSessionKey(ds);
       sessions.set(sKey, ds);
       const deps = makeDeps(sessions);
 
@@ -1294,6 +1327,7 @@ describe('Card integration: full event flow', () => {
       // sessionReply was used to surface the rejection message.
       expect(deps.sessionReply).toHaveBeenCalled();
     });
+
   });
 
   describe('Scenario 8: usage-limit retry action', () => {

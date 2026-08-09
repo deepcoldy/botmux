@@ -2,10 +2,10 @@ import { readFileSync, writeFileSync, createWriteStream, mkdirSync, existsSync }
 import { dirname, extname, basename, join } from 'node:path';
 import { pipeline } from 'node:stream/promises';
 import { Client } from '@larksuiteoapi/node-sdk';
-import { getBotClient, getAllBots, getBot, formatLarkError, LarkTransportDisabledError } from '../../bot-registry.js';
+import { getBotClient, getBotUploadClient, getAllBots, getBot, formatLarkError, LarkTransportDisabledError } from '../../bot-registry.js';
 import { loadBotConfigs } from '../../bot-registry.js';
 import { config } from '../../config.js';
-import { emitHookEvent } from '../../services/hook-runner.js';
+import { emitHookEvent, type ManagedHookOrigin } from '../../services/hook-runner.js';
 import { logger } from '../../utils/logger.js';
 import { BoundedMap } from '../../utils/bounded-map.js';
 import { resolveUserToken } from '../../utils/user-token.js';
@@ -219,6 +219,31 @@ export interface OutboundMessageOptions {
    * Lark deduplicates the message, but the local outbound hook is a separate
    * side effect and must not be fired twice. */
   suppressHook?: boolean;
+  /** Fence the distinct post-provider hook effect. A failure drops only the
+   * hook because the Lark message has already been accepted and must not be
+   * reported as failed (which would invite a duplicate retry). */
+  beforeHook?: () => void | Promise<void>;
+  /** Frozen protected origin used by read-isolated hook forwarding. */
+  hookOrigin?: ManagedHookOrigin;
+}
+
+async function emitOutboundHookIfAllowed(
+  options: OutboundMessageOptions | undefined,
+  event: 'outbound.send' | 'outbound.reply',
+  payload: Record<string, unknown>,
+): Promise<void> {
+  if (options?.suppressHook) return;
+  try {
+    await options?.beforeHook?.();
+  } catch (err) {
+    logger.warn(`Dropped ${event} hook after authority changed: ${err instanceof Error ? err.message : String(err)}`);
+    return;
+  }
+  if (options?.hookOrigin) {
+    emitHookEvent(event, payload, { managedOrigin: options.hookOrigin });
+  } else {
+    emitHookEvent(event, payload);
+  }
 }
 
 export async function sendMessage(
@@ -262,8 +287,7 @@ export async function sendMessage(
   const messageId = res.data?.message_id;
   if (!messageId) throw new Error('No message_id in response');
   logger.info(`Sent message ${messageId} to chat ${chatId}`);
-  if (!options?.suppressHook) {
-    emitHookEvent('outbound.send', {
+  await emitOutboundHookIfAllowed(options, 'outbound.send', {
       ...hookContext,
       larkAppId,
       chatId,
@@ -272,7 +296,6 @@ export async function sendMessage(
       uuid,
       content,
     });
-  }
   return messageId;
 }
 
@@ -325,8 +348,7 @@ export async function replyMessage(
   const replyId = res.data?.message_id;
   if (!replyId) throw new Error('No message_id in reply response');
   logger.info(`Replied ${replyId} to message ${messageId} [msgType=${msgType}, replyInThread=${replyInThread}]`);
-  if (!options?.suppressHook) {
-    emitHookEvent('outbound.reply', {
+  await emitOutboundHookIfAllowed(options, 'outbound.reply', {
       ...hookContext,
       larkAppId,
       messageId,
@@ -336,7 +358,6 @@ export async function replyMessage(
       uuid,
       content,
     });
-  }
   return replyId;
 }
 
@@ -1001,6 +1022,37 @@ export async function getMessageChatId(
   }
 }
 
+/** Resolve the `omt_...` topic id for an `om_...` topic-root message. Topic
+ *  routing itself keeps using the root message id; this helper is only for
+ *  client AppLinks. */
+export async function getMessageThreadId(
+  larkAppId: string,
+  messageId: string,
+  options?: LarkRequestOptions,
+): Promise<string | null> {
+  try {
+    const detail = await getMessageDetail(larkAppId, messageId, {
+      userCardContent: false,
+      ...options,
+    });
+    const candidates = [
+      detail?.items?.[0]?.thread_id,
+      detail?.thread_id,
+      detail?.message?.thread_id,
+    ];
+    for (const value of candidates) {
+      if (typeof value === 'string' && value.trim()) return value.trim();
+    }
+    return null;
+  } catch (err) {
+    if (options?.signal?.aborted) {
+      throw options.signal.reason instanceof Error ? options.signal.reason : err;
+    }
+    logger.debug(`[message] failed to resolve thread_id for ${messageId.substring(0, 12)}: ${err instanceof Error ? err.message : err}`);
+    return null;
+  }
+}
+
 export async function downloadMessageResource(larkAppId: string, messageId: string, fileKey: string, type: 'image' | 'file', savePath: string): Promise<void> {
   // apiOnly hard-gate BEFORE the app→user token fallback. Without this, the
   // App Token attempt (getBotClient) throws LarkTransportDisabledError, gets
@@ -1100,7 +1152,7 @@ const EXT_TO_FILE_TYPE: Record<string, string> = {
 
 export async function uploadImage(larkAppId: string, imagePath: string): Promise<string> {
   assertLarkTransport(larkAppId, 'uploadImage');
-  const c = getBotClient(larkAppId);
+  const c = getBotUploadClient(larkAppId);
   const buf = readFileSync(imagePath);
   // SDK returns { image_key } directly (not wrapped in { code, data })
   const res = await c.im.v1.image.create({
@@ -1114,7 +1166,7 @@ export async function uploadImage(larkAppId: string, imagePath: string): Promise
 
 export async function uploadFile(larkAppId: string, filePath: string, opts?: { duration?: number }): Promise<string> {
   assertLarkTransport(larkAppId, 'uploadFile');
-  const c = getBotClient(larkAppId);
+  const c = getBotUploadClient(larkAppId);
   const buf = readFileSync(filePath);
   const ext = extname(filePath).toLowerCase();
   const fileType = EXT_TO_FILE_TYPE[ext] ?? 'stream';

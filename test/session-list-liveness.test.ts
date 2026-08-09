@@ -24,6 +24,13 @@ describe('botmux list session liveness', () => {
     )).toBe('keep');
   });
 
+  it('never auto-prunes an unsettled Codex App owner with no process markers', () => {
+    expect(sessionListDisposition(
+      { codexAppDispatchLedger: [{ state: 'prepared' }] },
+      { hasPid: false, hasBackingSession: false },
+    )).toBe('keep');
+  });
+
   it('still prunes a never-started scratch row (no real-CLI markers, no pid/backing) silently', () => {
     expect(sessionListDisposition({}, { hasPid: false, hasBackingSession: false })).toBe('prune_scratch');
   });

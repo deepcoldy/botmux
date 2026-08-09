@@ -213,6 +213,16 @@ describe('first-mention async repo scan routing', () => {
     mocks.updateMessage.mockResolvedValue(undefined);
     mocks.scanDeferreds.length = 0;
     activeSessions.clear();
+    // Mirror the real worker-pool.closeSession contract: it removes the closed
+    // session from the active registry. Upstream's /close now relies on this
+    // (it no longer deletes from activeSessions in command-handler itself).
+    mocks.closeSession.mockReset();
+    mocks.closeSession.mockImplementation(async (sessionId: string) => {
+      for (const [key, candidate] of activeSessions) {
+        if (candidate.session.sessionId === sessionId) activeSessions.delete(key);
+      }
+      return { ok: true, alreadyClosed: false, known: true };
+    });
     __resetAnchorQueues();
     __testOnly_resetBotRegistry();
     const bot = registerBot({
