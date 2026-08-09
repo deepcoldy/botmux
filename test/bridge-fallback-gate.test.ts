@@ -7,6 +7,7 @@ import {
   bridgePostText,
   isBridgeNothingToSendFinal,
   shouldEmitEmptyCompletedBridgeFallback,
+  shouldEmitFailedBridgeFallback,
   shouldSuppressBridgeEmit,
   stripTrailingBridgeSentinelLine,
   type BridgeSendMarker,
@@ -462,5 +463,52 @@ describe('shouldEmitEmptyCompletedBridgeFallback', () => {
       [],
       false,
     )).toBe(false);
+  });
+});
+
+describe('shouldEmitFailedBridgeFallback', () => {
+  it('emits for an empty failed turn with no explicit reply', () => {
+    expect(shouldEmitFailedBridgeFallback(
+      { ...turn(100), finalText: '', terminalStatus: 'failed' },
+      undefined,
+      [],
+      false,
+    )).toBe(true);
+  });
+
+  it('does not duplicate a send or affect completed, local, and adopt turns', () => {
+    expect(shouldEmitFailedBridgeFallback(
+      { ...turn(100), finalText: '', terminalStatus: 'failed' },
+      200,
+      [markerForContent(150, 'already reported')],
+      false,
+    )).toBe(false);
+    expect(shouldEmitFailedBridgeFallback(
+      { ...turn(100), finalText: '', terminalStatus: 'completed' },
+      undefined,
+      [],
+      false,
+    )).toBe(false);
+    expect(shouldEmitFailedBridgeFallback(
+      { ...turn(100, true), finalText: '', terminalStatus: 'failed' },
+      undefined,
+      [],
+      false,
+    )).toBe(false);
+    expect(shouldEmitFailedBridgeFallback(
+      { ...turn(100), finalText: '', terminalStatus: 'failed' },
+      undefined,
+      [],
+      true,
+    )).toBe(false);
+  });
+
+  it('keeps the failure visible when the provider also returned partial text', () => {
+    expect(shouldEmitFailedBridgeFallback(
+      { ...turn(100), finalText: 'partial answer', terminalStatus: 'failed' },
+      undefined,
+      [],
+      false,
+    )).toBe(true);
   });
 });

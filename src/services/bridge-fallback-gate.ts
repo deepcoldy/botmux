@@ -316,3 +316,16 @@ export function shouldEmitEmptyCompletedBridgeFallback(
   if ((turn.finalText ?? '').trim().length > 0) return false;
   return !shouldSuppressBridgeEmit(turn, nextBoundaryMs, markers, adoptMode);
 }
+
+/** 结构化失败回合补发可见错误；部分回答不能替代失败原因。 */
+export function shouldEmitFailedBridgeFallback(
+  turn: BridgeGateInput,
+  nextBoundaryMs: number | undefined,
+  markers: readonly BridgeSendMarker[],
+  adoptMode: boolean,
+): boolean {
+  if (adoptMode) return false;
+  if (turn.isLocal) return false;
+  if (turn.terminalStatus !== 'failed') return false;
+  return !shouldSuppressBridgeEmit(turn, nextBoundaryMs, markers, adoptMode);
+}

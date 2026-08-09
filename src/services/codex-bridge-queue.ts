@@ -86,6 +86,7 @@ export interface CodexPendingTurn {
    *  assistant-final => completed behaviour. */
   terminalStatus?: 'completed' | 'failed' | 'ambiguous';
   terminalErrorCode?: string;
+  terminalErrorSummary?: string;
   /** Set when this turn was synthesised from a user_message that didn't
    *  match any pending Lark fingerprint. Adopt-only. The worker emit path
    *  formats these with both userText and finalText under a "终端本地对话"
@@ -522,6 +523,7 @@ export class CodexBridgeQueue {
         this.collecting.finalText = ev.text;
         this.collecting.terminalStatus = ev.terminalStatus;
         this.collecting.terminalErrorCode = ev.terminalErrorCode;
+        this.collecting.terminalErrorSummary = ev.terminalErrorSummary;
         this.lastClosedAssistantFinalTimeMs = ev.timestampMs;
         this.collecting = null;
         // CoCo-style type-ahead writes the next user event only after this

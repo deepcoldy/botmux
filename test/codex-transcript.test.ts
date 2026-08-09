@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, writeFileSync, appendFileSync, rmSync, statSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { drainCodexRollout, codexSessionIdFromRolloutPath, findCodexRolloutBySessionId, findCodexSessionIdByBotmuxSessionId, codexHistorySidIsOwned, splitCodexEventsByCutoff, extractLastCodexTurn, scanCodexThreadSettings, readLatestCodexRuntime, type CodexBridgeEvent } from '../src/services/codex-transcript.js';
+import { CODEX_AUTH_ERROR_CODE, CODEX_INVALID_REQUEST_ERROR_CODE, CODEX_RATE_LIMIT_ERROR_CODE, drainCodexRollout, codexSessionIdFromRolloutPath, findCodexRolloutBySessionId, findCodexSessionIdByBotmuxSessionId, codexHistorySidIsOwned, isCodexRateLimitEvent, splitCodexEventsByCutoff, extractLastCodexTurn, scanCodexThreadSettings, readLatestCodexRuntime, type CodexBridgeEvent } from '../src/services/codex-transcript.js';
 
 let dir: string;
 let path: string;
@@ -349,6 +349,274 @@ describe('drainCodexRollout', () => {
     expect(r.events).toHaveLength(2);
     expect(r.events[1].kind).toBe('assistant_final');
     expect(r.events[1].text).toBe('');
+  });
+
+  it('maps the real nested -4003 task_complete error to a safe failed terminal', () => {
+    const nested = JSON.stringify({
+      error: {
+        message: "code: empty_string; message: Invalid 'input[0].tools[0].description': empty string. Expected a string with minimum length 1, but got an empty string instead.",
+        type: 'invalid_request_error',
+        param: 'input[0].tools[0].description',
+        code: '-4003',
+      },
+    });
+    writeFileSync(path,
+      ev(userResponseItem('inspect incident')) +
+      ev({
+        timestamp: '2026-08-08T02:50:18.520Z',
+        type: 'event_msg',
+        payload: {
+          type: 'task_complete',
+          turn_id: '019fdf47-40cf-7a60-9a78-718346e4ce80',
+          last_agent_message: null,
+          error: { message: nested, codex_error_info: 'other' },
+        },
+      }));
+    const failed = drainCodexRollout(path, 0).events[1];
+    expect(failed).toMatchObject({
+      kind: 'assistant_final',
+      text: '',
+      terminalStatus: 'failed',
+      terminalErrorCode: CODEX_INVALID_REQUEST_ERROR_CODE,
+    });
+    expect(failed.terminalErrorSummary).toContain('-4003 invalid_request_error');
+    expect(failed.terminalErrorSummary).toContain('input[0].tools[0].description');
+  });
+
+  it('redacts credentials and active syntax from bounded auth summaries', () => {
+    writeFileSync(path, ev({
+      timestamp: '2026-08-08T02:50:18.520Z',
+      type: 'event_msg',
+      payload: {
+        type: 'task_complete',
+        turn_id: 'auth-failure',
+        error: {
+          message: `401 Unauthorized authorization=Bearer abcdefghijklmnopqrstuvwxyz token=super-secret-value https://example.test/cb?signature=leak <at user_id="ou_secret"> @all ${'x'.repeat(500)}`,
+        },
+      },
+    }));
+    const failed = drainCodexRollout(path, 0).events[0];
+    expect(failed.terminalErrorCode).toBe(CODEX_AUTH_ERROR_CODE);
+    expect(failed.terminalErrorSummary).toContain('[REDACTED]');
+    expect(failed.terminalErrorSummary).toContain('[URL]');
+    expect(failed.terminalErrorSummary).not.toContain('abcdefghijkl');
+    expect(failed.terminalErrorSummary).not.toContain('super-secret-value');
+    expect(failed.terminalErrorSummary).not.toContain('<at');
+    expect(failed.terminalErrorSummary).not.toContain('@all');
+    expect(failed.terminalErrorSummary!.length).toBeLessThanOrEqual(320);
+  });
+
+  it('redacts quoted-JSON credential values while keeping non-secret fields', () => {
+    // Provider errors are commonly JSON payloads whose message text embeds a
+    // credential in quoted-JSON form: `"api_key":"..."`. The key name carries
+    // its own closing quote, so a bare `key[:=]` matcher misses it. The redact
+    // rule pairs the key/value quotes with backrefs and spans `\"` escapes, so
+    // the WHOLE value is removed — including values that contain an escaped
+    // quote — while quoted keys with bare-word values are left untouched.
+    writeFileSync(path, ev({
+      timestamp: '2026-08-08T02:50:18.520Z',
+      type: 'event_msg',
+      payload: {
+        type: 'task_complete',
+        turn_id: 'json-secret',
+        error: {
+          message: 'gateway rejected request for model gpt-5: {"api_key":"AbCdEf123456xyz","password":"hunter2secret"}',
+        },
+      },
+    }));
+    const failed = drainCodexRollout(path, 0).events[0];
+    expect(failed.terminalErrorSummary).toBeDefined();
+    // Secrets in quoted-JSON form are redacted.
+    expect(failed.terminalErrorSummary).not.toContain('AbCdEf123456xyz');
+    expect(failed.terminalErrorSummary).not.toContain('hunter2secret');
+    expect(failed.terminalErrorSummary).toContain('[REDACTED]');
+    // Non-secret text (the useful reason) survives — no over-redaction.
+    expect(failed.terminalErrorSummary).toContain('gpt-5');
+  });
+
+  it('redacts the whole value when a quoted-JSON secret contains an escaped quote', () => {
+    // A value like `"abc\"TAIL"` must be redacted in full. A value matcher that
+    // stopped at the first inner quote would leave the `TAIL` tail exposed.
+    writeFileSync(path, ev({
+      timestamp: '2026-08-08T02:50:18.520Z',
+      type: 'event_msg',
+      payload: {
+        type: 'task_complete',
+        turn_id: 'escaped-quote',
+        error: { message: `gateway rejected: ${JSON.stringify({ password: 'abc"TAIL_SECRET_123' })}` },
+      },
+    }));
+    const failed = drainCodexRollout(path, 0).events[0];
+    expect(failed.terminalErrorSummary).toBeDefined();
+    expect(failed.terminalErrorSummary).not.toContain('TAIL_SECRET_123');
+    expect(failed.terminalErrorSummary).toContain('[REDACTED]');
+    expect(failed.terminalErrorSummary).toContain('gateway rejected');
+  });
+
+  it('does not swallow the word after a quoted key that has a bare-word value', () => {
+    // Regression guard: `"token": a lexical unit` is NOT `key=value` — the
+    // redaction must not treat `a` as the value and delete the trailing words.
+    writeFileSync(path, ev({
+      timestamp: '2026-08-08T02:50:18.520Z',
+      type: 'event_msg',
+      payload: {
+        type: 'task_complete',
+        turn_id: 'quoted-key-bare-value',
+        error: { message: 'provider said {"token": a lexical unit failed here}' },
+      },
+    }));
+    const failed = drainCodexRollout(path, 0).events[0];
+    expect(failed.terminalErrorSummary).toBeDefined();
+    // The lexical units are ordinary prose, not a credential — keep them.
+    expect(failed.terminalErrorSummary).toContain('a lexical unit failed here');
+  });
+
+  it('fails closed (no summary) when message wrapping exceeds the unwrap depth', () => {
+    // codexFailureLeaf peels at most 6 levels. A provider that wraps
+    // `message: JSON.stringify(...)` more deeply leaves `message` as a still
+    // -nested JSON literal whose escaped quotes defeat redaction. Rather than
+    // leak the embedded secret verbatim, surface no summary.
+    let inner: string = JSON.stringify({ api_key: 'DEEP_SECRET_VALUE' });
+    for (let i = 0; i < 9; i++) inner = JSON.stringify({ message: inner });
+    writeFileSync(path, ev({
+      timestamp: '2026-08-08T02:50:18.520Z',
+      type: 'event_msg',
+      payload: {
+        type: 'task_complete',
+        turn_id: 'deep-wrap',
+        error: JSON.parse(inner),
+      },
+    }));
+    const failed = drainCodexRollout(path, 0).events[0];
+    expect(failed.terminalStatus).toBe('failed');
+    // The secret never reaches the user-facing summary.
+    expect(failed.terminalErrorSummary ?? '').not.toContain('DEEP_SECRET_VALUE');
+    expect(failed.terminalErrorSummary).toBeUndefined();
+  });
+
+  it('bounds redaction work on adversarial long input (no super-linear blowup)', () => {
+    // A JWT-shaped `-`-rich run makes the credential regexes backtrack
+    // super-linearly. The pre-scan cap must keep a large blob fast. Guard with
+    // wall-clock: unbounded, ~32k chars took seconds; bounded it is a few ms.
+    const evil = `${'a-'.repeat(16_000)}aaaaaaaaaaaa.bbbbbbbbbbbb.short`;
+    writeFileSync(path, ev({
+      timestamp: '2026-08-08T02:50:18.520Z',
+      type: 'event_msg',
+      payload: {
+        type: 'task_complete',
+        turn_id: 'redos-guard',
+        error: { message: evil },
+      },
+    }));
+    const t0 = Date.now();
+    const failed = drainCodexRollout(path, 0).events[0];
+    const elapsedMs = Date.now() - t0;
+    expect(failed.terminalStatus).toBe('failed');
+    expect((failed.terminalErrorSummary ?? '').length).toBeLessThanOrEqual(320);
+    // Generous ceiling: bounded is single-digit ms; unbounded blew past 500ms.
+    expect(elapsedMs).toBeLessThan(200);
+  });
+
+  it('does not backtrack on an unclosed quoted value full of backslashes', () => {
+    // The quoted-value redactor must use mutually-exclusive branches so a
+    // missing close quote after a run of backslashes cannot blow up. Under the
+    // old `(?:\\.|(?!close).)*` shape this took hundreds of ms at ~56 chars.
+    const evil = `gateway {"password":"${'\\'.repeat(4_000)}X`;
+    const t0 = Date.now();
+    writeFileSync(path, ev({
+      timestamp: '2026-08-08T02:50:18.520Z',
+      type: 'event_msg',
+      payload: { type: 'task_complete', turn_id: 'backslash-redos', error: { message: evil } },
+    }));
+    const failed = drainCodexRollout(path, 0).events[0];
+    const elapsedMs = Date.now() - t0;
+    expect(failed.terminalStatus).toBe('failed');
+    expect(elapsedMs).toBeLessThan(200);
+  });
+
+  it('fails closed when the pre-scan cut leaves a credential value unclosed', () => {
+    // A real secret sitting past the pre-scan bound gets sliced mid-value,
+    // leaving `password":"SSS…` with no closing quote. The closed-value
+    // redactor would miss it and leak the prefix into the shown summary, so an
+    // unclosed credential value must fail closed instead.
+    const message = 'x'.repeat(300) + `{"password":"${'S'.repeat(1800)}"}`;
+    writeFileSync(path, ev({
+      timestamp: '2026-08-08T02:50:18.520Z',
+      type: 'event_msg',
+      payload: { type: 'task_complete', turn_id: 'prescan-cut', error: { message } },
+    }));
+    const failed = drainCodexRollout(path, 0).events[0];
+    expect(failed.terminalStatus).toBe('failed');
+    expect(failed.terminalErrorSummary ?? '').not.toContain('SSSSS');
+    expect(failed.terminalErrorSummary).toBeUndefined();
+  });
+
+  it('keeps a word-boundary so lookalike keys like notpassword are not redacted', () => {
+    // `notpassword=VALUE` is not a `password` credential — the bare-key rule
+    // must anchor on a word boundary and leave the value intact.
+    writeFileSync(path, ev({
+      timestamp: '2026-08-08T02:50:18.520Z',
+      type: 'event_msg',
+      payload: { type: 'task_complete', turn_id: 'word-boundary', error: { message: 'config notpassword=VISIBLE_WORD applied' } },
+    }));
+    const failed = drainCodexRollout(path, 0).events[0];
+    expect(failed.terminalErrorSummary).toBeDefined();
+    expect(failed.terminalErrorSummary).toContain('VISIBLE_WORD');
+    // A real bare `password=` in the same string is still redacted.
+    writeFileSync(path, ev({
+      timestamp: '2026-08-08T02:50:18.520Z',
+      type: 'event_msg',
+      payload: { type: 'task_complete', turn_id: 'word-boundary-2', error: { message: 'auth password=REAL_SECRET_VAL denied' } },
+    }));
+    const failed2 = drainCodexRollout(path, 0).events[0];
+    expect(failed2.terminalErrorSummary).not.toContain('REAL_SECRET_VAL');
+    expect(failed2.terminalErrorSummary).toContain('[REDACTED]');
+  });
+
+  it('fails closed when the pre-scan cut lands on a lone dangling backslash', () => {
+    // If the 2000-char pre-scan slices mid-escape, the value tail ends in a
+    // single `\`. The unclosed-value probe must still fire (its trailing `\\?`
+    // absorbs that lone backslash) or the secret prefix leaks into the summary.
+    const prefix = 'x'.repeat(300) + '{"password":"';
+    const message = prefix + 'S'.repeat(2000 - prefix.length - 1) + '\\REST_OF_SECRET"}';
+    writeFileSync(path, ev({
+      timestamp: '2026-08-08T02:50:18.520Z',
+      type: 'event_msg',
+      payload: { type: 'task_complete', turn_id: 'odd-backslash-cut', error: { message } },
+    }));
+    const failed = drainCodexRollout(path, 0).events[0];
+    expect(failed.terminalErrorSummary ?? '').not.toContain('SSSSS');
+    expect(failed.terminalErrorSummary).toBeUndefined();
+  });
+
+  it('redacts a bare-key quoted value containing an escaped quote', () => {
+    // `password:"abc\"TAIL"` (bare key, double-quoted value with an inner
+    // escaped quote). The bare rule's quoted-value branch must be escape-safe
+    // like the JSON-key rule, or it stops at the `\"` and leaks the tail.
+    writeFileSync(path, ev({
+      timestamp: '2026-08-08T02:50:18.520Z',
+      type: 'event_msg',
+      payload: { type: 'task_complete', turn_id: 'bare-escaped-quote', error: { message: 'provider {password:"abc\\"TAIL_SECRET_123"} rejected' } },
+    }));
+    const failed = drainCodexRollout(path, 0).events[0];
+    expect(failed.terminalErrorSummary).toBeDefined();
+    expect(failed.terminalErrorSummary).not.toContain('TAIL_SECRET_123');
+    expect(failed.terminalErrorSummary).toContain('[REDACTED]');
+  });
+
+  it('classifies structured 429 failures for the dedicated limited state', () => {
+    writeFileSync(path, ev({
+      timestamp: '2026-08-08T02:50:18.520Z',
+      type: 'event_msg',
+      payload: {
+        type: 'task_complete',
+        turn_id: 'limited',
+        error: { message: '429 Too Many Requests' },
+      },
+    }));
+    const failed = drainCodexRollout(path, 0).events[0];
+    expect(failed.terminalErrorCode).toBe(CODEX_RATE_LIMIT_ERROR_CODE);
+    expect(isCodexRateLimitEvent(failed)).toBe(true);
   });
 
   // task_complete without a turn_id is a malformed/partial record — ignored
