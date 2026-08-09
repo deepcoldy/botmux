@@ -45,6 +45,7 @@ import {
   decideHardTimeoutAction,
   decidePostHookPromptEvidence,
   decideSettleMarkReady,
+  shouldArmPostHookPromptEvidenceFallback,
   shouldReleaseFirstPromptTimeout,
   shouldWaitForPostSessionStartPromptEvidence,
   shouldWriteNow,
@@ -14834,6 +14835,16 @@ process.on('message', async (raw: unknown) => {
         isPromptReady,
         alreadyWaiting: awaitingPostSessionStartPromptEvidence,
       });
+      // 「接受屏幕已有提示符」兜底只对全新会话（source=startup）arm：新建会话在
+      // hook 跑完前就画好提示符、之后不再重绘，fence 必须靠兜底才解。resume/clear/
+      // compact 会在边界后自行重绘一个新 ❯（transcript 重放/重印），fence 靠真证据
+      // ~2s 自解；给它们 arm 反而会让回放中残留的历史 ❯ 满足静默门控、提前接受边界
+      // 前的旧提示符，破坏 resume 本就依赖的 fresh-evidence fence。未识别的 source
+      // 按非 startup 处理（fail-safe 不 arm，退回既有 15s 首提示符超时，无新回归）。
+      const armPostHookFallback = shouldArmPostHookPromptEvidenceFallback({
+        waitingForPostHookPrompt: waitForPostHookPrompt,
+        source: msg.source,
+      });
       if (waitForPostHookPrompt) {
         awaitingPostSessionStartPromptEvidence = true;
         promptReadyDetectedDuringSettle = false;
@@ -14841,7 +14852,7 @@ process.on('message', async (raw: unknown) => {
         idleDetector?.resetReadyEvidence();
         lastPtyOutputAtMs = Date.now();
         log('SessionStart boundary recorded — waiting for fresh post-hook prompt evidence');
-        armPostHookPromptEvidenceFallback();
+        if (armPostHookFallback) armPostHookPromptEvidenceFallback();
       }
       // 先记下 gate 是否已被 45s fallback 释放：ReadyGate.receive() 是一次性
       // 语义，fallback 抢先后 releaseReadyGate 会整块跳过迟到的真信号。

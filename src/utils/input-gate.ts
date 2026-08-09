@@ -62,6 +62,33 @@ export function shouldWaitForPostSessionStartPromptEvidence(state: {
 }
 
 /**
+ * Whether the "accept a prompt that is ALREADY on screen" fallback
+ * (decidePostHookPromptEvidence) may be armed for THIS SessionStart signal.
+ *
+ * The fallback exists only for `source=startup`: a brand-new session paints its
+ * prompt before the hooks finish and never redraws, so the fresh-evidence fence
+ * would otherwise wait out the full first-prompt timeout. Every OTHER source
+ * (resume/clear/compact) replays or reprints its transcript AFTER the boundary,
+ * so a genuinely fresh ❯ redraw arrives on its own in ~2s — the fence resolves
+ * without help. Arming the fallback there would instead let a >2s pause over a
+ * REPLAYED historical ❯ (still on the viewport during replay) satisfy the quiet
+ * gate and accept a pre-boundary prompt, defeating the very fence resume relies
+ * on. So the fallback is startup-only; the fence itself stays for all sources.
+ *
+ * Fail-safe: an unknown/absent source is NOT startup, so it does not arm — the
+ * signal simply falls back to the existing first-prompt timeout (status quo),
+ * never a new premature-delivery path.
+ */
+export function shouldArmPostHookPromptEvidenceFallback(state: {
+  /** shouldWaitForPostSessionStartPromptEvidence already said we're fencing. */
+  waitingForPostHookPrompt: boolean;
+  /** The SessionStart hook payload's `source` field (Claude: startup/resume/…). */
+  source: string | undefined;
+}): boolean {
+  return state.waitingForPostHookPrompt && state.source === 'startup';
+}
+
+/**
  * How long after the SessionStart boundary the fallback starts polling.
  *
  * The boundary also resets the quiescence baseline (`lastPtyOutputAtMs`), so the

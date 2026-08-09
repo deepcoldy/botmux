@@ -230,7 +230,28 @@ describe('First prompt timeout: worker 侧兜底接线', () => {
     // 且这段必须落在 session_ready 消息分支内 —— 收到 ready 信号才 arm。
     const caseIdx = source.lastIndexOf("case 'session_ready':", armCallIdx);
     expect(caseIdx).toBeGreaterThan(-1);
-    expect(armCallIdx - caseIdx).toBeLessThan(1_500);
+    expect(armCallIdx - caseIdx).toBeLessThan(2_000);
+  });
+
+  it('兜底只对 source=startup arm —— resume/clear/compact 不进兜底射程', () => {
+    // 兜底是为「新建会话画完提示符后不再重绘」而生。resume/clear/compact 会在
+    // 边界后自行重绘一个新 ❯，fence 靠真证据自解；给它们 arm 反而会让回放中
+    // 残留的历史 ❯ 满足静默门控、提前接受边界前的旧提示符，破坏 fresh-evidence
+    // fence。所以 arm 调用必须被 startup gate 守着，而不是裸调用。
+    const armLineStart = source.lastIndexOf('\n', source.indexOf('armPostHookPromptEvidenceFallback();'));
+    const armLine = source.slice(armLineStart, source.indexOf('armPostHookPromptEvidenceFallback();') + 'armPostHookPromptEvidenceFallback();'.length);
+    // arm 必须由 startup 判据守卫，不能裸调用（否则 resume 也会 arm）。
+    expect(armLine).toContain('if (armPostHookFallback)');
+
+    // 判据本身走 input-gate 的纯函数，并且喂进去的是 SessionStart 的 msg.source。
+    const caseStart = source.indexOf("case 'session_ready':");
+    const caseBody = source.slice(caseStart, source.indexOf('armPostHookPromptEvidenceFallback();', caseStart));
+    expect(caseBody).toContain('shouldArmPostHookPromptEvidenceFallback({');
+    expect(caseBody).toContain('source: msg.source,');
+
+    // fence 本身（awaitingPostSessionStartPromptEvidence = true）必须对所有 source
+    // 都设 —— resume 依赖它等真证据；只有 arm 才收窄到 startup。
+    expect(caseBody).toContain('awaitingPostSessionStartPromptEvidence = true;');
   });
 
   it('每个清除等待标记的位置都必须同时清定时器', () => {

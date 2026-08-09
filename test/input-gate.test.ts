@@ -17,6 +17,7 @@ import {
   decideHardTimeoutAction,
   decidePostHookPromptEvidence,
   decideSettleMarkReady,
+  shouldArmPostHookPromptEvidenceFallback,
   shouldReleaseFirstPromptTimeout,
   shouldWaitForPostSessionStartPromptEvidence,
   shouldWriteNow,
@@ -192,6 +193,62 @@ describe('decideSettleMarkReady', () => {
       promptReadyDetectedDuringSettle: true,
       readyPatternSeenDuringHold: true,
     })).toBe(true);
+  });
+});
+
+describe('shouldArmPostHookPromptEvidenceFallback', () => {
+  // The fresh-evidence FENCE is set for every source (resume relies on it). This
+  // predicate only decides whether the "accept a prompt already on screen"
+  // FALLBACK is armed on top of it — and that must be startup-only, because only
+  // a brand-new session paints its prompt before hooks finish and never redraws.
+  it('arms for a fresh startup session that is fencing', () => {
+    expect(shouldArmPostHookPromptEvidenceFallback({
+      waitingForPostHookPrompt: true,
+      source: 'startup',
+    })).toBe(true);
+  });
+
+  it('does NOT arm for resume — its transcript replay redraws a fresh prompt on its own', () => {
+    // THE BLOCKING CASE: arming resume let a >2s pause over a REPLAYED historical
+    // ❯ satisfy the quiet gate and accept a pre-boundary prompt, defeating the
+    // fence resume depends on. Resume must keep the fence but never the fallback.
+    expect(shouldArmPostHookPromptEvidenceFallback({
+      waitingForPostHookPrompt: true,
+      source: 'resume',
+    })).toBe(false);
+  });
+
+  it('does NOT arm for clear / compact — both reprint after the boundary', () => {
+    expect(shouldArmPostHookPromptEvidenceFallback({
+      waitingForPostHookPrompt: true,
+      source: 'clear',
+    })).toBe(false);
+    expect(shouldArmPostHookPromptEvidenceFallback({
+      waitingForPostHookPrompt: true,
+      source: 'compact',
+    })).toBe(false);
+  });
+
+  it('fail-safe: an unknown or absent source is not startup, so it never arms', () => {
+    // A future/unrecognised source falls back to the existing first-prompt
+    // timeout (status quo) rather than a new premature-delivery path.
+    expect(shouldArmPostHookPromptEvidenceFallback({
+      waitingForPostHookPrompt: true,
+      source: 'future-mode',
+    })).toBe(false);
+    expect(shouldArmPostHookPromptEvidenceFallback({
+      waitingForPostHookPrompt: true,
+      source: undefined,
+    })).toBe(false);
+  });
+
+  it('never arms when we are not even fencing, regardless of source', () => {
+    // If shouldWaitForPostSessionStartPromptEvidence said no (e.g. already ready,
+    // non-Claude, or a mid-session clear/compact), the fallback has nothing to do.
+    expect(shouldArmPostHookPromptEvidenceFallback({
+      waitingForPostHookPrompt: false,
+      source: 'startup',
+    })).toBe(false);
   });
 });
 
