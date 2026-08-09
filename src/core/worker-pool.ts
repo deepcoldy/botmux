@@ -2736,6 +2736,30 @@ function reclaimParkedCrashDiagnostic(ds: DaemonSession): void {
   try { unlinkSync(join(config.session.dataDir, 'crash-diagnostics', `${ds.session.sessionId}.ansi`)); } catch { /* absent — benign */ }
 }
 
+/**
+ * Consume a queued suspend claim once its goal state is reached.
+ *
+ * A claim only ever means "suspend the generation that is producing right now".
+ * It is therefore consumed the moment that generation stops running, by ANY
+ * route — the deferred checkpoint itself, a `/cd` or read-isolation switch that
+ * suspended first, or an outright crash. Leaving it set is not a harmless
+ * no-op: `runPendingSuspendIfSettled` fires on the NEXT generation's first
+ * screen checkpoint, and its `ownsGeneration` predicate passes there (that
+ * worker legitimately owns the session), so the replacement gets suspended for
+ * a request that was never about it.
+ *
+ * The old code did have a "worker already gone → drop the flag" branch, but it
+ * lived inside the checkpoint — which by definition stops running once the
+ * session goes quiet. The clear needs to hang off the lifecycle events instead.
+ */
+function clearPendingSuspendClaim(ds: DaemonSession, why: string): void {
+  if (ds.pendingSuspendReason === undefined && ds.pendingSuspendGeneration === undefined) return;
+  const reason = ds.pendingSuspendReason;
+  ds.pendingSuspendReason = undefined;
+  ds.pendingSuspendGeneration = undefined;
+  logger.debug(`[${tag(ds)}] Cleared queued suspend claim (${reason ?? 'none'}): ${why}`);
+}
+
 export function suspendWorker(ds: DaemonSession, reason = 'suspended_idle'): boolean {
   if (hasProtectedSessionMutationOwnership(ds)) {
     logger.warn(`[${tag(ds)}] Refused worker suspend (${reason}) while Codex App dispatch ownership is non-empty`);
@@ -2809,6 +2833,10 @@ export function suspendWorker(ds: DaemonSession, reason = 'suspended_idle'): boo
       },
     });
   }
+  // Goal state reached. Whoever queued a suspend for this generation got what
+  // they asked for — including the paths that never touch the deferred
+  // checkpoint (`/cd`, read-isolation switch, sweepIdleWorkers).
+  clearPendingSuspendClaim(ds, `suspended (${reason})`);
   logger.info(`[${tag(ds)}] Worker + CLI suspended (${reason}); session stays active, cold-resumes from transcript on next message`);
   return true;
 }
@@ -2843,6 +2871,19 @@ function runPendingSuspendIfSettled(ds: DaemonSession, ownsGeneration?: () => bo
   const reason = ds.pendingSuspendReason;
   if (!reason) return;
   if (ownsGeneration && !ownsGeneration()) return;
+  // A claim belongs to the generation that was producing when it was queued.
+  // Reaching a LATER generation means its own fulfilment checkpoint never ran
+  // (crash, or another path suspended first) — consume it rather than suspend a
+  // worker the request never asked about. clearPendingSuspendClaim covers the
+  // normal exits; this is the backstop for a claim that slipped past them.
+  if (
+    ds.pendingSuspendGeneration !== undefined
+    && ds.workerGeneration !== undefined
+    && ds.pendingSuspendGeneration !== ds.workerGeneration
+  ) {
+    clearPendingSuspendClaim(ds, 'generation changed');
+    return;
+  }
   const st = ds.lastScreenStatus;
   if (st !== 'idle' && st !== 'limited') return;
   // Worker already gone (crash / suspended by another path): the goal state is
@@ -2850,14 +2891,16 @@ function runPendingSuspendIfSettled(ds: DaemonSession, ownsGeneration?: () => bo
   // no-worker branch and clear managedTurnOrigin/workerReady for a generation
   // this queued request never owned.
   if (!ds.worker || ds.worker.killed) {
-    ds.pendingSuspendReason = undefined;
+    clearPendingSuspendClaim(ds, 'worker already gone');
     return;
   }
   // Clear only on success. suspendWorker refuses mid-routing-transfer (and for a
   // backend that stopped being suspendable), and that refusal is temporary —
   // eating the flag would silently drop the request until the next `suspend all`.
   if (suspendWorker(ds, reason)) {
-    ds.pendingSuspendReason = undefined;
+    // suspendWorker already consumed the claim (goal state reached); logging
+    // here keeps the "fulfilled by the deferred path" signal distinguishable
+    // from a suspend that came from anywhere else.
     logger.info(`[${tag(ds)}] Deferred suspend fulfilled (${reason}) after turn completed`);
     return;
   }
@@ -9058,6 +9101,11 @@ function setupWorkerHandlers(
       ds.worker = null;
       ds.workerReady = false;
       ds.workerPort = null;
+      // A queued suspend for THIS generation is now moot — the worker it was
+      // about is gone. Leaving it set would suspend the replacement on its
+      // first idle (the deferred checkpoint's own "worker gone" branch cannot
+      // help: it only runs on a screen update that will never arrive).
+      clearPendingSuspendClaim(ds, 'worker exited');
       // Dead worker generation — stop the periodic usage refresh immediately
       // instead of waiting a tick for it to self-clear on !workerHasInitialized.
       clearUsageRefreshTimer(ds);

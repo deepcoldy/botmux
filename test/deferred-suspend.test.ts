@@ -25,7 +25,10 @@ vi.mock('../src/utils/logger.js', () => ({
   },
 }));
 
-import { __testOnly_runPendingSuspendIfSettled as runPendingSuspendIfSettled } from '../src/core/worker-pool.js';
+import {
+  __testOnly_runPendingSuspendIfSettled as runPendingSuspendIfSettled,
+  suspendWorker,
+} from '../src/core/worker-pool.js';
 import { logger } from '../src/utils/logger.js';
 
 function fakeWorker() {
@@ -185,5 +188,78 @@ describe('runPendingSuspendIfSettled', () => {
     // 兑现函数必须在它之前 return，不产生这些副作用。
     expect(ds.workerReady).toBeUndefined();
     if (worker) expect((worker as any).send).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * claim 的生命周期必须止于它自己那一代 worker。
+ *
+ * 原实现只在兑现函数内部清标志，而兑现函数只被 screen_update /
+ * screenshot_uploaded 两个 checkpoint 调用 —— 会话一旦安静下来就再没有
+ * checkpoint。于是「排队之后 worker 崩了，或被 /cd、读隔离切换先挂起」这类路径
+ * 会把标志留到下一代，下一代第一次 idle 时被平白挂一次；而 ownsGeneration 谓词
+ * 挡不住，因为那时传进来的正是新 worker 自己的闭包。
+ */
+describe('queued suspend claim lifecycle', () => {
+  function claimedSession(status = 'idle') {
+    const worker = fakeWorker();
+    const ds: any = {
+      session: { sessionId: 'sid-claim', status: 'active' },
+      initConfig: { backendType: 'tmux' },
+      worker,
+      workerGeneration: 7,
+      lastScreenStatus: status,
+      exitEventEmitted: false,
+      pendingSuspendReason: 'manual_suspend',
+      pendingSuspendGeneration: 7,
+    };
+    return { ds, worker };
+  }
+
+  // /cd、读隔离切换、idle sweeper 都是直接调 suspendWorker，从不路过兑现函数。
+  // 目标态（这一代被挂起）已经达成，claim 必须就地消费掉。
+  it('is consumed by ANY successful suspend, not just the deferred checkpoint', () => {
+    const { ds, worker } = claimedSession('working');   // 注意：还在产出也不影响
+
+    expect(suspendWorker(ds, 'role_switch')).toBe(true);
+
+    expect(worker.send).toHaveBeenCalledWith({ type: 'suspend' });
+    expect(ds.pendingSuspendReason).toBeUndefined();
+    expect(ds.pendingSuspendGeneration).toBeUndefined();
+  });
+
+  // 拒绝是暂时的，claim 不能被吃掉（与既有 pty 用例同一条不变式，这里补上
+  // generation 字段一并保留的断言）。
+  it('survives a refused suspend together with its generation', () => {
+    const { ds } = claimedSession();
+    ds.initConfig = { backendType: 'pty' };
+
+    expect(suspendWorker(ds, 'manual_suspend')).toBe(false);
+
+    expect(ds.pendingSuspendReason).toBe('manual_suspend');
+    expect(ds.pendingSuspendGeneration).toBe(7);
+  });
+
+  // 兜底：claim 万一漏过了上面的消费点，到了下一代也绝不能挂新 worker。
+  it('never suspends a LATER generation — it consumes the stale claim instead', () => {
+    const { ds, worker } = claimedSession();
+    ds.workerGeneration = 8;              // 已经 refork 过，claim 属于第 7 代
+
+    runPendingSuspendIfSettled(ds);
+
+    expect(worker.send).not.toHaveBeenCalled();   // 新 worker 毫发无伤
+    expect(ds.worker).toBe(worker);
+    expect(ds.pendingSuspendReason).toBeUndefined();
+    expect(ds.pendingSuspendGeneration).toBeUndefined();
+  });
+
+  // 同一代则照常兑现 —— 上面那条门控不能把正常路径也一并挡掉。
+  it('still fulfills when the claim belongs to the CURRENT generation', () => {
+    const { ds, worker } = claimedSession();
+
+    runPendingSuspendIfSettled(ds);
+
+    expect(worker.send).toHaveBeenCalledWith({ type: 'suspend' });
+    expect(ds.pendingSuspendReason).toBeUndefined();
   });
 });

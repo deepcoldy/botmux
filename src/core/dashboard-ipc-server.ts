@@ -1172,6 +1172,9 @@ ipcRoute('POST', '/api/sessions/:sessionId/suspend', async (_req, res, params) =
     && isSuspendableBackendType(ds.initConfig?.backendType)
   ) {
     ds.pendingSuspendReason = 'manual_suspend';
+    // Bind the claim to the generation that is producing right now: it must not
+    // outlive that worker (see clearPendingSuspendClaim).
+    ds.pendingSuspendGeneration = ds.workerGeneration;
     return jsonRes(res, 200, {
       ok: true, sessionId: params.sessionId, suspended: false, reason: 'deferred',
     });
