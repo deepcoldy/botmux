@@ -130,7 +130,7 @@ describe('dispatch completion switch wiring', () => {
     );
     expect(completion).toContain('botmux report --dispatch-root om_seed_exact');
     expect(completion).toContain('botmux send --no-mention');
-    expect(completion).toContain('除上述 botmux report 回注外');
+    expect(completion).toContain('除上述 botmux report 回报外');
     expect(completion).toContain('不要 @ 主 bot，不要新开话题');
   });
 

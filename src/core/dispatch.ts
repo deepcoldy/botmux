@@ -69,7 +69,7 @@ export function appendDispatchReportProtocol(brief: string, dispatchRootId: stri
 export function appendDispatchCompletionProtocol(brief: string): string {
   return brief.trimEnd()
     + '\n\n— 原话题留档 —\n'
-    + '除上述 botmux report 回注外，完成后还需在收到任务的原话题运行 '
+    + '除上述 botmux report 回报外，完成后还需在收到任务的原话题运行 '
     + '`botmux send --no-mention "子项目完成 + 产出位置/摘要"` '
     + '额外留一份人可见的最终交付；不要 @ 主 bot，不要新开话题。';
 }
