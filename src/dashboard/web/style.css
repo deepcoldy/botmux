@@ -2977,7 +2977,7 @@ button.primary {
   background: var(--surface-raised, #1b1f2a);
   border: 1px solid var(--border, rgba(255, 255, 255, 0.12));
   box-shadow: 0 8px 28px rgba(0, 0, 0, 0.35);
-  color: var(--text, #e6e8ee);
+  color: var(--fg, #18202a);
   font-family: var(--sans, inherit);
   font-weight: 400;
   letter-spacing: 0;
@@ -3064,13 +3064,16 @@ button.primary {
   font-weight: 700;
 }
 
-.session-todo-pop-item.st-completed { color: var(--muted, #9aa3b2); }
+/* 完成项最浅（灰+删除线），未完成项更深、进行中最深加粗——让「还没做的」在视觉上更突出。
+   注意用 --fg / --faint（本主题真实存在的 token）；早前误用未定义的 --text/--text-secondary，
+   会回退到近白色 #e6e8ee，在浅色模式下几乎看不清。 */
+.session-todo-pop-item.st-completed { color: var(--faint, #7b8798); }
 .session-todo-pop-item.st-completed .session-todo-pop-text { text-decoration: line-through; }
-.session-todo-pop-item.st-completed .session-todo-pop-glyph { color: var(--success, #35c46a); }
-.session-todo-pop-item.st-in-progress { color: var(--text, #e6e8ee); font-weight: 600; }
-.session-todo-pop-item.st-in-progress .session-todo-pop-glyph { color: var(--warning, #f5a623); }
-.session-todo-pop-item.st-pending { color: var(--text-secondary, #c3c9d4); }
-.session-todo-pop-item.st-pending .session-todo-pop-glyph { color: var(--muted, #9aa3b2); }
+.session-todo-pop-item.st-completed .session-todo-pop-glyph { color: var(--success, #15803d); }
+.session-todo-pop-item.st-in-progress { color: var(--fg, #18202a); font-weight: 700; }
+.session-todo-pop-item.st-in-progress .session-todo-pop-glyph { color: var(--warning, #b7791f); }
+.session-todo-pop-item.st-pending { color: var(--fg, #18202a); }
+.session-todo-pop-item.st-pending .session-todo-pop-glyph { color: var(--muted, #627084); }
 
 .session-signal {
   display: inline-flex;
