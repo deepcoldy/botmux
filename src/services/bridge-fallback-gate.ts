@@ -143,6 +143,41 @@ export function stripTrailingBridgeSentinelLine(finalText: string): string {
   return lines.slice(0, end + 1).join('\n');
 }
 
+/**
+ * Detect a Claude Code serialized-tool-call that leaked into an assistant TEXT
+ * block instead of being parsed as a real `tool_use` block.
+ *
+ * Why this exists: in long sessions the model sometimes emits what should be a
+ * structured tool call as plain prose (a malformed `<invoke name="…">…` span,
+ * often prefixed by a stray token like `count`). Claude Code cannot re-derive
+ * intent from a text block, so the turn closes with `stop_reason:end_turn` and
+ * NO `tool_use` block — the transcript fallback then treats the leaked XML as a
+ * normal final answer and forwards it to Lark. This predicate lets the fallback
+ * path recognise that shape and refuse to post it verbatim.
+ *
+ * Conservative by construction — it must NOT fire on a human legitimately
+ * pasting/discussing this XML, or on code/log prose. It requires the full
+ * high-confidence Anthropic tool-call signature: an opening `<invoke name="…">`
+ * tag PAIRED with either a `<parameter name="…">` child or a matching
+ * `</invoke>` close. A lone `<invoke>` mention, an `invoke(` function call in
+ * code, or the words in prose do not match.
+ *
+ * Scope: callers apply this ONLY on the transcript-drain fallback, never to an
+ * explicit `botmux send` body — a user who deliberately sends this XML via
+ * `botmux send` is choosing to, and is not rewritten.
+ */
+const LEAKED_TOOL_CALL_PATTERNS: readonly RegExp[] = [
+  // <invoke name="Bash"> … <parameter name="command"> (opening tag + a parameter child)
+  /<invoke\s+name\s*=\s*"[^"]+"\s*>[\s\S]*?<parameter\s+name\s*=\s*"[^"]+"\s*>/,
+  // <invoke name="Bash"> … </invoke> (opening tag + its matching close)
+  /<invoke\s+name\s*=\s*"[^"]+"\s*>[\s\S]*?<\/invoke>/,
+];
+
+export function looksLikeLeakedToolCall(text: string | undefined): boolean {
+  if (!text) return false;
+  return LEAKED_TOOL_CALL_PATTERNS.some(re => re.test(text));
+}
+
 /** The text a transcript-drain emit path should actually post for `finalText`.
  *
  *  NON-ADOPT: strip a trailing sentinel line so the literal token never reaches

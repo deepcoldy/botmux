@@ -6,6 +6,7 @@ import {
   buildBridgeSendPreviewText,
   bridgePostText,
   isBridgeNothingToSendFinal,
+  looksLikeLeakedToolCall,
   shouldEmitEmptyCompletedBridgeFallback,
   shouldEmitFailedBridgeFallback,
   shouldSuppressBridgeEmit,
@@ -510,5 +511,61 @@ describe('shouldEmitFailedBridgeFallback', () => {
       [],
       false,
     )).toBe(true);
+  });
+});
+
+describe('looksLikeLeakedToolCall', () => {
+  it('fires on the real leak shape: <invoke name> + <parameter name>', () => {
+    // The exact shape observed in production transcripts (stray "count" prefix,
+    // opening invoke tag, a parameter child, unbalanced/truncated tail).
+    const leaked = [
+      'count',
+      '<invoke name="Bash">',
+      '<parameter name="command">echo hi</parameter>',
+      '</invoke>',
+    ].join('\n');
+    expect(looksLikeLeakedToolCall(leaked)).toBe(true);
+  });
+
+  it('fires on invoke prose narration followed by the tool-call block', () => {
+    const leaked = '补上 build symlink 再回归。\n\ncount\n<invoke name="Bash">\n<parameter name="command">ls -la</parameter>\n</invoke>';
+    expect(looksLikeLeakedToolCall(leaked)).toBe(true);
+  });
+
+  it('fires on an opening invoke tag paired only with its closing tag', () => {
+    expect(looksLikeLeakedToolCall('<invoke name="TaskUpdate"></invoke>')).toBe(true);
+  });
+
+  it('fires even when the parameter body is truncated (no closing tags)', () => {
+    // Production leaks are often cut off mid-stream; the opening invoke tag plus
+    // a parameter child is already high-confidence.
+    const leaked = '<invoke name="Bash">\n<parameter name="command">botmux send --mention ou_x <<\'EOF\'\nhello';
+    expect(looksLikeLeakedToolCall(leaked)).toBe(true);
+  });
+
+  // --- must NOT fire (false-positive guards) ---
+
+  it('does not fire on empty / undefined input', () => {
+    expect(looksLikeLeakedToolCall(undefined)).toBe(false);
+    expect(looksLikeLeakedToolCall('')).toBe(false);
+  });
+
+  it('does not fire on ordinary prose that merely mentions "invoke"', () => {
+    expect(looksLikeLeakedToolCall('You can invoke the Bash tool to run commands.')).toBe(false);
+    expect(looksLikeLeakedToolCall('The <invoke> element is part of the tool protocol.')).toBe(false);
+  });
+
+  it('does not fire on a lone <invoke> tag with no name and no pairing', () => {
+    expect(looksLikeLeakedToolCall('<invoke>')).toBe(false);
+    expect(looksLikeLeakedToolCall('an <invoke name="Bash"> tag on its own')).toBe(false);
+  });
+
+  it('does not fire on code discussing invoke() calls', () => {
+    const code = '```ts\nclient.invoke({ name: "Bash", input: { command: "ls" } });\n```';
+    expect(looksLikeLeakedToolCall(code)).toBe(false);
+  });
+
+  it('does not fire on a user pasting a <parameter> tag without an invoke', () => {
+    expect(looksLikeLeakedToolCall('why does <parameter name="command"> show up in my logs?')).toBe(false);
   });
 });

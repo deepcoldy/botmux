@@ -852,6 +852,7 @@ export const messages: Record<string, string> = {
   'worker.raw_input_failed_recovery': '⚠️ Slash 命令未能确认送达 {cliName}，同一条消息中紧随其后的正文没有继续提交。\n原因：{reason}',
   'worker.raw_input_failed_command_only_recovery': '⚠️ Slash 命令未能确认送达 {cliName}。\n原因：{reason}',
   'worker.empty_final_completed': '⚠️ {cliName} 已报告本轮处理完成，但 botmux 没有从终端记录里捕获到最终文本，也没有追踪到本轮的回复。若你已经通过改道发送（--top-level / --into / --override-chat）回复过，可忽略本提示；否则请打开 Web 终端查看最后输出，或直接重发消息让会话继续。',
+  'worker.leaked_tool_call': '⚠️ {cliName} 本轮生成了畸形的工具调用（工具调用结构被当成普通文本，未被解析执行），因此本轮任务并未真正执行。botmux 已拦截该内容，未原样转发。建议重发本条消息重试；若持续出现，请新开会话以避免受污染的上下文继续复发。',
   'worker.failed_reason_unavailable': '未提供可安全展示的错误摘要',
   'worker.empty_final_failed': '⚠️ {cliName} 本轮执行失败：{reason}\n完整错误已保留在 Web 终端和 daemon 日志中；排除问题后请重发消息。',
   'worker.empty_final_failed_invalid_request': '⚠️ {cliName} 请求被拒绝：{reason}\n请检查 CLI、模型网关和工具 schema 配置，修复后重发消息。',

@@ -43,7 +43,7 @@ import { readProcessStartIdentity } from './core/session-marker.js';
 import { roleLibraryRoot, roleLibrarySubtree } from './core/role-library.js';
 import { drainTranscript, joinAssistantText, trailingAssistantText, findJsonlContainingFingerprint, findJsonlsContainingExactContent, findLatestJsonl, extractLastAssistantTurn, stringifyUserContent, extractTurnStartText, splitTranscriptEventsByCutoff, isTranscriptRateLimitEvent, apiErrorMessageText, type TranscriptEvent } from './services/claude-transcript.js';
 import { BridgeTurnQueue, makeFingerprint, normaliseForFingerprint } from './services/bridge-turn-queue.js';
-import { bridgePostText, shouldEmitEmptyCompletedBridgeFallback, shouldEmitFailedBridgeFallback, shouldSuppressBridgeEmit, stripTrailingBridgeSentinelLine, type BridgeSendMarker } from './services/bridge-fallback-gate.js';
+import { bridgePostText, looksLikeLeakedToolCall, shouldEmitEmptyCompletedBridgeFallback, shouldEmitFailedBridgeFallback, shouldSuppressBridgeEmit, stripTrailingBridgeSentinelLine, type BridgeSendMarker } from './services/bridge-fallback-gate.js';
 import { buildSubmitMessagePreview } from './services/submit-notification.js';
 import {
   decideHardTimeoutAction,
@@ -4587,6 +4587,28 @@ function emitReadyTurns(opts: { explicitTerminalOnly?: boolean } = {}): void {
     // the sentinel, so stripping here would break that contract.
     const postText = bridgePostText(assistantText, adoptMode);
     if (!adoptMode && postText.trim().length === 0) continue;
+
+    // P0 leak guard (non-adopt only): the model sometimes writes what should be
+    // a structured tool call into a plain TEXT block (a malformed `<invoke …>`
+    // span). The turn then closes with no tool_use block, so this fallback would
+    // otherwise forward the serialized tool call to Lark as if it were the
+    // answer. Detect that shape and post a clear diagnostic instead of the raw
+    // XML, so the user knows the turn did NOT run rather than mistaking leaked
+    // markup for a completed reply. Explicit `botmux send` bodies never reach
+    // here, so a user deliberately sending this XML is not affected. Adopt mode
+    // is left verbatim (botmux-unaware CLI; transcript drain is its only
+    // channel and it may legitimately surface such content).
+    if (!adoptMode && looksLikeLeakedToolCall(postText)) {
+      log(`Bridge fallback intercepted leaked tool-call for turn ${turn.turnId.substring(0, 8)} (malformed <invoke> in text block, not forwarded)`);
+      send({
+        type: 'final_output',
+        content: t('worker.leaked_tool_call', { cliName: cliName() }),
+        lastUuid,
+        turnId: turn.turnId,
+        ...(turn.dispatchAttempt !== undefined ? { dispatchAttempt: turn.dispatchAttempt } : {}),
+      });
+      continue;
+    }
 
     if (turn.isLocal) {
       if (turn.userUuid) {
