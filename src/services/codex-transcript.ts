@@ -225,11 +225,6 @@ export interface CodexBridgeEvent {
   preserveMarkTimeMs?: boolean;
 }
 
-/** Terminal lifecycle edges understood by the shared structured bridge. */
-export function isStructuredTerminalEvent(event: Pick<CodexBridgeEvent, 'kind'>): boolean {
-  return event.kind === 'assistant_final' || event.kind === 'turn_aborted';
-}
-
 export const CODEX_RATE_LIMIT_ERROR_CODE = 'codex_rate_limited';
 export const CODEX_AUTH_ERROR_CODE = 'codex_auth_failed';
 export const CODEX_INVALID_REQUEST_ERROR_CODE = 'codex_invalid_request';

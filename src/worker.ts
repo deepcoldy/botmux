@@ -6981,7 +6981,12 @@ async function writeAdoptMessage(
     try {
       const transaction = await runAmbiguousSubmissionTransaction(
         submissionBackend,
-        () => cliAdapter!.writeInput(adoptBackend as unknown as PtyHandle, content),
+        // adapterInputHandle wraps a ZmxBackend in strictInputHandle, which turns
+        // a `sendText/sendSpecialKeys === false` (ZMX write refusal) into a throw
+        // so the transaction can cancel/poison the WAL. Passing the bare backend
+        // would let a refused write look like success and clear the journal —
+        // silent input loss (the exact failure the transaction guards against).
+        () => cliAdapter!.writeInput(adapterInputHandle(submissionBackend), content),
         settleVerifiableSubmissionForJournal,
         prepareAdoptWrite,
       );
@@ -7051,14 +7056,18 @@ async function writeAdoptMessage(
       const transaction = await runAmbiguousSubmissionTransaction(
         submissionBackend,
         async () => {
-          (adoptBackend as any).sendText(content);
+          // Use adapterInputHandle so a ZMX write refusal (sendText/sendSpecialKeys
+          // returning false) throws instead of silently succeeding — the raw path
+          // needs the same strict-handle guard as the structured writeInput path.
+          const input = adapterInputHandle(submissionBackend);
+          input.sendText!(content);
           // Beat between text and Enter so Ink-based TUIs register pasted text
           // before submit. The serial queue holds across this await.
           await new Promise(r => setTimeout(r, 200));
           if (!adoptWriteFenceIsCurrent(executionFence)) {
             throw new Error('backend changed before adopt raw Enter');
           }
-          (adoptBackend as any).sendSpecialKeys('Enter');
+          input.sendSpecialKeys!('Enter');
         },
         undefined,
         prepareAdoptWrite,

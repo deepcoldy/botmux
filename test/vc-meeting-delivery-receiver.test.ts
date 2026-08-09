@@ -632,14 +632,14 @@ describe('vc meeting delivery receiver', () => {
     })).toMatchObject({ receiverCommittedThrough: 2 });
   });
 
-  // Regression guard for the RPC-abort mapping fix (PR #601 double-review
-  // blocking): an RPC turn interrupted after it started executing is finalized
-  // as `ambiguous` (not `failed`). The receiver must turn that into a parked
-  // `ambiguous` receipt — NOT the `failed_retryable` receipt a worker `failed`
-  // terminal produces. `failed_retryable` is what the reconciler auto-retries
-  // (re-running already-executed side effects); `ambiguous` parks and is never
-  // auto-retried. This test pins both sides of that contrast so the two
-  // statuses can never be collapsed again.
+  // Regression guard for the RPC-abort mapping: an RPC turn interrupted after
+  // it started executing is finalized as `ambiguous` (not `failed`). The
+  // receiver must turn that into a parked `ambiguous` receipt — NOT the
+  // `failed_retryable` receipt a worker `failed` terminal produces.
+  // `failed_retryable` is what the reconciler auto-retries (re-running
+  // already-executed side effects); `ambiguous` parks and is never auto-retried.
+  // This test pins both sides of that contrast so the two statuses can never be
+  // collapsed again.
   it('maps an RPC-aborted (ambiguous) terminal to a parked receipt, unlike a retryable failed terminal', async () => {
     const abortedHarness = receiverHarness(dir, { workerGeneration: 7 });
     await registerActiveMember(abortedHarness);
