@@ -84,7 +84,6 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
           deny: Array.isArray(j.sandboxPaths.deny) ? j.sandboxPaths.deny.filter((x: unknown) => typeof x === 'string') : [],
         }
       : null,
-    readIsolation: j?.readIsolation === true,
     readIsolationSupported: j?.readIsolationSupported === true,
     backendType: typeof j?.backendType === 'string' ? j.backendType : null,
     usageDisplay: normalizeUsageDisplay(j ?? {}),
