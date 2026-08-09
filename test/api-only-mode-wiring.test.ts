@@ -194,8 +194,16 @@ describe('API-only bot mode — bot-level primitive boundary (source lock)', () 
     const shared = region(workerPoolSource, 'export function auxUiSuppressedFor(', 'isSilentScheduledTurn');
     expect(shared).toContain('larkTransportEnabled({');
     expect(shared).toContain('apiOnly: getBot(ds.larkAppId).config.apiOnly,');
-    // Fail CLOSED if the bot is gone, so a deregistered bot cannot leak aux UI.
-    expect(shared).toContain('return true;');
+    // Fail CLOSED if the bot is gone. The region above spans BOTH `return true;`
+    // statements (the no-transport path, already locked by the two assertions
+    // above, and the catch), so asserting on that text here guarded nothing:
+    // flipping the catch to `return false` — the exact regression the comment
+    // warns about — left all 43 cases green. Narrowed to the catch block itself.
+    // The real guard is behavioural and lives in
+    // test/mojo-quarantine-notice-policy.test.ts ('fails closed when the bot is
+    // deregistered'), which DOES fail on that flip.
+    const catchBlock = region(workerPoolSource, '    // Bot deregistered — fail closed.', '  if (isSilentScheduledTurn');
+    expect(catchBlock).toContain('return true;');
   });
 
   it('scheduleCardPatch is a defense-in-depth no-op for no-transport sessions', () => {

@@ -226,6 +226,33 @@ describe('control-plane env keys are not a back door', () => {
     }
   });
 
+  it('rejects session-identity keys the top-level env already blocks', () => {
+    // mojo.env is the HIGHEST-precedence layer in buildEffectiveChildEnv, but it
+    // only screened MOJO_CONTROL_ENV_KEYS — so keys that botmux blocks on the
+    // top-level `env` (via sanitizePerBotEnv / isReservedPerBotEnvKey) sailed
+    // through here and then won the merge. Review demonstrated
+    // BOTMUX_SESSION_ID being overwritten to 'hijacked' in the real child env.
+    for (const key of [
+      'BOTMUX_SESSION_ID',   // session routing
+      'SESSION_DATA_DIR',    // CLI data root
+      'LARK_APP_SECRET',     // bot credential
+      'CLAUDE_CONFIG_DIR',   // CLI data root / identity marker
+      'IS_SANDBOX',
+    ]) {
+      const r = normalizeMojoConfig({ env: { [key]: 'hijacked' } });
+      expect(r.ok, `${key} must be rejected in mojo.env`).toBe(false);
+      if (!r.ok) expect(r.errors.join()).toContain(key);
+    }
+  });
+
+  it('rejects a key that is not a valid env var name', () => {
+    // The top-level entry point validates the NAME too; mojo.env did not, so a
+    // key like `PATH=/evil` or an empty string reached the child env as-is.
+    for (const key of ['', 'not a var', 'PATH=/evil', '1LEADING_DIGIT']) {
+      expect(normalizeMojoConfig({ env: { [key]: 'x' } }).ok, `${JSON.stringify(key)} must be rejected`).toBe(false);
+    }
+  });
+
   it('still accepts an unrelated env var, and a live JWT', () => {
     expect(normalizeMojoConfig({ env: { MY_TOKEN: 'x' } }).ok).toBe(true);
     expect(normalizeMojoConfig({ env: { X_JWT_TOKEN: 'rotated' } }).ok).toBe(true);

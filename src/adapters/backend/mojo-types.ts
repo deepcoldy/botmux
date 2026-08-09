@@ -627,11 +627,32 @@ function httpUrl(v: unknown): string | undefined {
         : 'must be an http(s) URL';
 }
 
+/**
+ * Same reserved-key rule the top-level `env` uses. Imported rather than
+ * duplicated: per-bot-env.ts is itself a dependency-free leaf, so this keeps
+ * mojo-types cheap for the many tests that pull it in.
+ */
+import { isReservedPerBotEnvKey } from '../../core/per-bot-env.js';
+
+/** Same rule the top-level `env` uses — see per-bot-env.ts. */
+const ENV_KEY_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
 function stringMap(v: unknown): string | undefined {
     if (!v || typeof v !== 'object' || Array.isArray(v)) return 'must be a JSON object';
     const control = new Set<string>(MOJO_CONTROL_ENV_KEYS);
     for (const [k, val] of Object.entries(v as Record<string, unknown>)) {
         if (typeof val !== 'string') return `value for "${k}" must be a string`;
+        if (!ENV_KEY_RE.test(k)) return `"${k}" is not a valid environment variable name`;
+        // `mojo.env` is the HIGHEST-precedence layer of the child env, so it must
+        // honour the SAME reserved list as the top-level `env`. Otherwise the block
+        // botmux already enforces there (session routing, CLI data roots, bot
+        // credentials) is bypassed just by moving the key in here — and it then
+        // WINS the merge. Delegated to isReservedPerBotEnvKey rather than
+        // re-listed, because a second copy of that set would drift.
+        if (isReservedPerBotEnvKey(k)) {
+            return `must not set ${k} — botmux owns this variable (session identity, `
+                + 'CLI data root, or bot credential); per-bot `env` rejects it too';
+        }
         // Reject rather than silently strip: buildEnv() removes these anyway, and
         // an operator who sets AGENT_BASE_URL here would otherwise believe their
         // endpoint took effect while the session kept its frozen one.

@@ -134,6 +134,10 @@ export class MojoBackend implements SessionBackend {
      *  so the trailing whole-segment `text` event isn't printed twice. */
     private streamedThisTurn = false;
     private readonly cliTimeoutMs = 60_000;
+    /** How long /close waits for an in-flight turn to publish its session id
+     *  before tearing down. Must stay well under the worker's close/restart
+     *  race so teardown never becomes the thing that times out. */
+    private readonly destroySettleMs = 8_000;
     /**
      * Captured from spawn(). The worker owns the authoritative cwd + env (the
      * BOTMUX_* session context, per-bot `env`, credential paths, proxies) and
@@ -195,12 +199,30 @@ export class MojoBackend implements SessionBackend {
         // over the authoritative cwd/env, so keep them for buildEnv()/runTurn().
         this.spawnOpts = opts;
 
-        // A launch prefix only ever reaches us from wrapperCli: the mojo adapter's
-        // resolvedBin is '' and its buildArgs() returns [], and the sandbox
-        // wrappers (which also rewrite spawnBin) are unreachable for this backend
-        // — a fully-remote mojo session never requests the local sandbox, and a
-        // locally-executing one that does is refused before spawn (see
-        // backendSandboxCompatibilityError).
+        // FAIL CLOSED on a launch prefix we did not ask for.
+        //
+        // This used to assume a non-empty `bin` could only be wrapperCli, on the
+        // grounds that the FILE sandbox is refused for this backend before spawn
+        // (backendSandboxCompatibilityError). That misses a second, INDEPENDENT
+        // wrapping path: mandatory device-credential isolation, which
+        // read-isolation.ts documents as "independent of the optional bot sandbox
+        // toggle" and which rewrites spawnBin whenever the host is enrolled and the
+        // session is not provably remote — e.g. a mojo bot with no `cloud` set.
+        //
+        // In that state the old code dropped the wrapper AND passed its argv to
+        // mojo as extraCliArgs, so a boundary the platform mandates vanished while
+        // the session looked healthy. Refusing is the only safe answer here: this
+        // backend cannot tell which confinement it was handed, and guessing is
+        // what caused the silent downgrade.
+        if (bin && !this.config.wrapperCli) {
+            throw new Error(
+                `[mojo] refusing to launch session ${this.sessionId}: unexpected launch wrapper `
+                + `"${bin}" was supplied but no wrapperCli is configured. The mojo backend `
+                + 'invokes the CLI per turn and cannot carry an unknown confinement wrapper; '
+                + 'run this bot fully remote (cloud on, localDaemon off) so the credential '
+                + 'boundary is satisfied remotely, or configure wrapperCli explicitly.',
+            );
+        }
         // Generic extra args come from the config: the worker deliberately keeps
         // them out of both the spawn args and the wrapper prefix so they can be
         // appended AFTER our own flags on every turn (last-value-wins). Fall back
@@ -427,10 +449,33 @@ export class MojoBackend implements SessionBackend {
         this.exitCb?.(0, null);
     }
 
+    /** Test-only view of the adopted lineage, so a teardown test can assert it is
+     *  still unset inside the pre-init window it is exercising. */
+    get cliSessionIdForTest(): string | undefined {
+        return this.cliSessionId ?? undefined;
+    }
+
     /** /close teardown — cancel the server-side session so it stops consuming
      *  cloud sandbox time after the IM session is gone. */
     async destroySession(): Promise<void> {
+        // Gate FIRST so no new turn is accepted, then let the in-flight one settle
+        // before tearing anything down. Killing the child here (as this used to)
+        // destroyed the only source of the lineage: cliSessionId is adopted from
+        // the first `system/init` line, so a /close inside the "turn dispatched,
+        // init not yet arrived" window found it null, skipped the cancel, and never
+        // fired taskIdCb — leaving the daemon's orphan fallback without an id too.
+        // The remote session then leaked, still holding the injected credential.
+        //
+        // Bounded, and only worth waiting for while a turn is actually in flight.
+        // Budget sits under the worker's own close/restart race (see
+        // RiffBackend.destroySession for the layered deadlines).
         this.closing = true;
+        if (this.child && !this.cliSessionId) {
+            await Promise.race([
+                this.writeChain.catch(() => undefined),
+                new Promise<void>(r => setTimeout(r, this.destroySettleMs).unref?.()),
+            ]);
+        }
         this.child?.kill('SIGTERM');
         this.child = null;
         if (this.cliSessionId) {

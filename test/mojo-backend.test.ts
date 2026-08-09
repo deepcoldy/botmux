@@ -11,7 +11,6 @@
  */
 import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
@@ -60,6 +59,71 @@ function runTurn(
 
 beforeAll(() => { binDir = mkdtempSync(join(tmpdir(), 'mojo-fake-')); });
 afterAll(() => { rmSync(binDir, { recursive: true, force: true }); });
+
+describe('MojoBackend spawn contract', () => {
+  it('refuses an unexpected launch wrapper instead of silently dropping it', () => {
+    // spawn() assumed any non-empty bin could only be wrapperCli, because the
+    // FILE sandbox is refused for this backend before spawn. But MANDATORY
+    // device-credential isolation is a second, independent wrapping path
+    // (read-isolation.ts: "independent of the optional bot sandbox toggle"), and
+    // it rewrites spawnBin whenever the host is enrolled and the session is not
+    // provably remote — e.g. a mojo bot with no `cloud` set. With wrapperCli
+    // unset, the old code dropped that wrapper AND fed its argv to mojo as
+    // extraCliArgs: the credential boundary silently disappeared.
+    const backend = new MojoBackend({ bin: '/usr/bin/mojo' }, 'sid-wrap');
+    expect(() => backend.spawn('/usr/bin/bwrap', ['--dev-bind', '/', '/', '/usr/bin/mojo'], {} as never))
+      .toThrow(/unexpected launch wrapper/i);
+  });
+
+  it('still accepts a wrapper that came from wrapperCli', () => {
+    const backend = new MojoBackend(
+      { bin: '/usr/bin/mojo', wrapperCli: 'mywrap mojo' },
+      'sid-wrap-ok',
+    );
+    expect(() => backend.spawn('/usr/bin/mywrap', [], {} as never)).not.toThrow();
+  });
+
+  it('still treats bare args as extra CLI args when no wrapper binary is given', () => {
+    // Back-compat path for a caller that has not been updated: args without a
+    // bin are generic CLI_EXTRA_ARGS, not a wrapper.
+    const backend = new MojoBackend({ bin: '/usr/bin/mojo' }, 'sid-extra');
+    expect(() => backend.spawn('', ['--verbose'], {} as never)).not.toThrow();
+  });
+});
+
+describe('MojoBackend teardown', () => {
+  it('cancels the remote session even when /close lands before the init event', async () => {
+    // Race: destroySession() read cliSessionId immediately, but that id only
+    // exists after the first `system/init` line is parsed. A /close inside the
+    // "turn dispatched, init not yet arrived" window therefore skipped the cancel
+    // AND never fired taskIdCb, so the daemon's orphan fallback had no id either —
+    // the remote session leaked, still holding the injected X_JWT_TOKEN and
+    // burning cloud sandbox time.
+    const argvLog = join(binDir, 'argv.log');
+    const bin = fakeMojo(`echo "$@" >> ${argvLog}
+if [ "$1" = "session" ]; then echo '{"status":"ok"}'; exit 0; fi
+# A turn: the init line is deliberately LATE, so /close lands before it.
+sleep 0.6
+echo '{"type":"system","subtype":"init","session_id":"sid-late"}'
+echo '{"type":"result","status":"ok","result":"ok","session_id":"sid-late","warnings":[]}'`);
+
+    const backend = new MojoBackend({ bin }, 'session-under-test');
+    const taskIds: Array<string | null> = [];
+    backend.onTaskId((id) => { taskIds.push(id); });
+    backend.spawn('', [], {} as never);
+    backend.write('a turn that is still in flight');
+
+    // Close INSIDE the window: the turn is dispatched, init has not arrived.
+    await new Promise<void>(r => setTimeout(r, 100));
+    expect(backend.cliSessionIdForTest).toBeUndefined();
+    await backend.destroySession();
+
+    const argv = readFileSync(argvLog, 'utf-8');
+    expect(argv, `argv was:\n${argv}`).toContain('session cancel sid-late');
+    // The lineage must also reach the daemon, so its orphan fallback can retry.
+    expect(taskIds).toContain('sid-late');
+  });
+});
 
 describe('MojoBackend stream handling', () => {
   it('adopts the session id from the first init event and streams deltas once', async () => {

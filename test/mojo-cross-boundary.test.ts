@@ -70,7 +70,7 @@ interface Harness {
    *  grepping stdout for a log line. Always COUNT these rather than testing for
    *  presence: init emits the same handshake, so `some()` is satisfied before the
    *  event under test has happened. */
-  msgs: Array<{ type: string }>;
+  msgs: Array<{ type: string; message?: string }>;
 }
 
 function bootWorker(opts: { mojo?: Record<string, unknown>; appId?: string }): Harness {
@@ -96,10 +96,10 @@ function bootWorker(opts: { mojo?: Record<string, unknown>; appId?: string }): H
     },
     stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
   });
-  const msgs: Array<{ type: string; status?: string; category?: string }> = [];
+  const msgs: Array<{ type: string; message?: string }> = [];
   child.stdout?.on('data', c => logs.push(c.toString()));
   child.stderr?.on('data', c => logs.push(c.toString()));
-  child.on('message', (m) => msgs.push(m as { type: string }));
+  child.on('message', (m) => msgs.push(m as { type: string; message?: string }));
   return { root, dump, child, logs, msgs };
 }
 
@@ -265,6 +265,39 @@ describe('mojo cross-boundary contracts', () => {
 
       // Index-free: every credential use from the clear onwards must be empty.
       expect(lines(h.dump).slice(1)).not.toContain('[stale-A]');
+    } finally { teardown(h); }
+  });
+
+  it('3b. mojo.env cannot hijack a botmux-owned session variable', async () => {
+    // mojo.env is the highest-precedence env layer, so a reserved key accepted by
+    // the validator would WIN over the worker's own BOTMUX_SESSION_ID. Review
+    // demonstrated it being overwritten to 'hijacked'. The worker rejects an
+    // invalid mojo config outright, so the end-to-end contract is that this
+    // session never launches at all.
+    const h = bootWorker({});
+    try {
+      h.child.send({
+        type: 'init',
+        sessionId: 'sid-xb', chatId: 'oc_x', rootMessageId: 'om_x',
+        workingDir: h.root, cliId: 'mojo', backendType: 'mojo',
+        backendConfig: { cloud: true, env: { BOTMUX_SESSION_ID: 'hijacked' } },
+        prompt: 'should never run', larkAppId: 'app_xb', larkAppSecret: 'secret',
+      } as DaemonToWorker);
+
+      // The refusal travels as a fatal `error` IPC message (spawnCli throws ->
+      // sendFatalWorkerErrorAndExit), not on stdout — an earlier draft grepped the
+      // logs and timed out at 25s without ever observing the real signal.
+      await waitFor(
+        () => h.msgs.some(m => m.type === 'error' && (m.message ?? '').includes('BOTMUX_SESSION_ID')),
+        25_000,
+        () => `worker never rejected the reserved key: `
+          + `${JSON.stringify(h.msgs.map(m => [m.type, m.message]))}\n${h.logs.join('')}`,
+      );
+      const err = h.msgs.find(m => m.type === 'error')?.message ?? '';
+      expect(err).toContain('mojo config is invalid');
+      expect(err).toContain('botmux owns this variable');
+      // Rejected BEFORE any turn ran: the fake mojo records one line per launch.
+      expect(lines(h.dump)).toEqual([]);
     } finally { teardown(h); }
   });
 

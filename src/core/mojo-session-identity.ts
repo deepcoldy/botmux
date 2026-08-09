@@ -25,9 +25,39 @@ import { pickMojoSessionIdentity, type MojoConfig } from '../adapters/backend/mo
  *
  * Idempotent: a row that already carries an identity is left untouched.
  */
+/**
+ * Is this row a mojo session?
+ *
+ * Must NOT read `session.backendType` alone. forkWorker builds initMsg — and
+ * therefore calls the freeze — BEFORE it stamps `backendType`/`cliId` onto the
+ * row (worker-pool: sessionMojoConfig at initMsg construction vs. the stamp
+ * after `worker.send`), and createSession() never writes those fields. So on the
+ * one path EVERY new mojo session takes, both are still `undefined` and a
+ * `!== 'mojo'` guard early-returns: the freeze silently no-ops, leaving the
+ * "control plane edited after creation" window wide open and causing the next
+ * restart to quarantine a lineage whose control plane was fully known.
+ *
+ * Precedence:
+ *   - a STAMPED backendType is authoritative (a riff row stays untouched even if
+ *     the bot has since been switched to mojo);
+ *   - otherwise fall back to the live bot config, which is what decides the
+ *     session's backend in the first place.
+ */
+function isMojoSessionRow(session: Session, larkAppId: string): boolean {
+  if (session.backendType) return session.backendType === 'mojo';
+  if (session.cliId === 'mojo') return true;
+  try {
+    const cfg = getBot(larkAppId).config;
+    return cfg.backendType === 'mojo' || cfg.cliId === 'mojo';
+  } catch {
+    // Bot deregistered — cannot classify, so do nothing rather than freeze a row
+    // that may not be mojo at all.
+    return false;
+  }
+}
+
 export function freezeMojoIdentityForSession(session: Session, larkAppId: string): void {
-  const backendType = session.backendType;
-  if (backendType !== 'mojo') return;
+  if (!isMojoSessionRow(session, larkAppId)) return;
 
   // BACKFILL, before the early return below. A row quarantined by an earlier
   // build already has an identity, so it would return here and never get the

@@ -77,6 +77,22 @@ function seed(store: Booted['store'], patch: Partial<Session> = {}): Session {
   return created;
 }
 
+/**
+ * A session row EXACTLY as createSession() produces it — no backendType, because
+ * services/session-store.ts:createSession does not write that field and
+ * forkWorker only stamps it AFTER worker.send(initMsg).
+ *
+ * seed() above is deliberately NOT reused here: it hard-writes
+ * `backendType: 'mojo'`, i.e. the state a session only reaches after its first
+ * fork, which silently skipped the one path every new mojo session takes.
+ */
+function seedAsCreated(store: Booted['store'], patch: Partial<Session> = {}): Session {
+  const created = store.createSession('oc_freeze', 'om_freeze', 'freeze test');
+  Object.assign(created, { larkAppId: APP_ID, cliId: 'mojo', ...patch });
+  store.updateSession(created);
+  return created;
+}
+
 /** Raw on-disk contents, for asserting what actually reached the file. */
 function rawStoreFiles(): string {
   return readdirSync(dir)
@@ -97,6 +113,76 @@ afterEach(() => {
 });
 
 describe('freezeMojoIdentityForSession', () => {
+  it('freezes a session that has NOT been stamped with backendType yet', async () => {
+    // THE path every new mojo session takes, and the one this whole mechanism
+    // existed to cover — previously untested, so the guard's early return made
+    // the freeze a silent no-op for every first fork:
+    //   createSession()                 -> no backendType field at all
+    //   forkWorker: sessionMojoConfig({freeze:true})  <- runs HERE
+    //   worker.send(initMsg)
+    //   ds.session.backendType = ...    <- stamped only AFTER the send
+    // Consequences: the "control plane edited after creation" window stays wide
+    // open (resume/cancel can hit another tenant), and the next daemon restart
+    // sees an unfrozen row with a lineage and quarantines a session whose control
+    // plane was fully known — dropping context and leaking a remote session that
+    // is never cancelled.
+    const { store, identity } = await boot({
+      cloud: true, baseUrl: 'https://tenant-a.example.com', workspaceId: 'ws-a',
+    });
+    const session = seedAsCreated(store);
+    expect(session.backendType).toBeUndefined();
+    expect(session.mojoIdentity).toBeUndefined();
+
+    identity.freezeMojoIdentityForSession(session, APP_ID);
+
+    expect(session.mojoIdentity).toEqual({
+      cloud: true, baseUrl: 'https://tenant-a.example.com', workspaceId: 'ws-a',
+    });
+    expect(rawStoreFiles()).toContain('tenant-a.example.com');
+  });
+
+  it('does not quarantine its own lineage after a restart', async () => {
+    // The second consequence, over the REAL two-phase timeline. An earlier draft
+    // of this test asserted on a row that was both unstamped and already carried
+    // a lineage — a state that never coexists in production — so it failed for
+    // the wrong reason. The actual sequence is:
+    //   1. first fork: freeze runs while backendType is still undefined
+    //   2. forkWorker then stamps backendType = 'mojo'
+    //   3. first turn completes, riffParentTaskId is persisted
+    //   4. daemon restarts, restore freezes again
+    // With the guard reading only backendType, step 1 no-ops, so step 4 finds an
+    // unfrozen row WITH a lineage and parks a session whose control plane was
+    // fully known — dropping context and leaking a remote session nothing will
+    // ever cancel.
+    const { store, identity } = await boot({ cloud: true, workspaceId: 'ws-a' });
+
+    // 1. first fork
+    const session = seedAsCreated(store);
+    identity.freezeMojoIdentityForSession(session, APP_ID);
+    // 2. + 3. forkWorker stamps the backend, then the turn persists its lineage.
+    session.backendType = 'mojo';
+    session.riffParentTaskId = 'remote-sess-1';
+    store.updateSession(session);
+
+    // 4. restart
+    identity.freezeMojoIdentityForSession(session, APP_ID);
+
+    expect(session.mojoQuarantinedLineage).toBeUndefined();
+    expect(session.riffParentTaskId).toBe('remote-sess-1');
+    expect(session.mojoIdentity).toEqual({ cloud: true, workspaceId: 'ws-a' });
+  });
+
+  it('still ignores a session belonging to another backend', async () => {
+    // The guard must keep doing its real job: only mojo rows get an identity.
+    // Without a positive signal a riff session would now be frozen too.
+    const { store, identity } = await boot({ cloud: true, workspaceId: 'ws-a' });
+    const session = seedAsCreated(store, { cliId: 'riff', backendType: 'riff' });
+
+    identity.freezeMojoIdentityForSession(session, APP_ID);
+
+    expect(session.mojoIdentity).toBeUndefined();
+  });
+
   it('freezes the live control plane onto a fresh session', async () => {
     const { store, identity } = await boot({
       cloud: true, baseUrl: 'https://tenant-a.example.com', workspaceId: 'ws-a',
