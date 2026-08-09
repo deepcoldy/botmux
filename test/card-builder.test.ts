@@ -1901,3 +1901,33 @@ describe('buildPrivateSnapshotCard', () => {
     expect(JSON.stringify(note)).toContain('🔒');
   });
 });
+
+describe('remote backends get no PTY quick-action keys', () => {
+  /** The 11 quick-action buttons only make sense with a local terminal. */
+  const KEY_LABELS = ['Esc', '^C', 'Tab', '␣ Space', '↵ Enter', '←', '↑', '↓', '→'];
+
+  function keysIn(cliId: 'claude-code' | 'riff' | 'mojo'): string[] {
+    const card = buildStreamingCard(
+      'sid-1', 'om-1', '', 'title', 'screen', 'idle' as never,
+      cliId as never,
+      'screenshot' as never,
+    );
+    return KEY_LABELS.filter(l => card.includes(`"content":"${l}"`));
+  }
+
+  it('renders them for a local CLI', () => {
+    // Guards the negative assertions below: if the buttons stopped being rendered
+    // at all, those would pass for the wrong reason.
+    expect(keysIn('claude-code')).toEqual(KEY_LABELS);
+  });
+
+  for (const cliId of ['riff', 'mojo'] as const) {
+    it(`hides them for ${cliId}`, () => {
+      // A remote backend has no terminal to drive, so these clicks are silently
+      // inert. The gate was hardcoded to `cliId !== 'riff'`, so adding mojo left
+      // it rendering all 11 buttons; it now consults the REMOTE_CLI_IDS leaf, so
+      // the next remote CLI cannot regress this the same way.
+      expect(keysIn(cliId)).toEqual([]);
+    });
+  }
+});

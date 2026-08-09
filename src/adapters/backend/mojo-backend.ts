@@ -97,8 +97,6 @@ const RESUME_DEAD_RE =
     /会话.*(不存在|已过期|已结束|无效|未找到)|session.*(not\s*found|expired|invalid|does not exist)|not_found|invalid_session/i;
 const BUSY_RETRY_DELAYS_MS: readonly number[] = [1_000, 2_000, 4_000, 8_000];
 
-/** Cap on remembered settled-turn session ids (see settleTurn). */
-const SEEN_RESULTS_MAX = 64;
 
 /**
  * stdio is always `['ignore','pipe','pipe']` here (stdin MUST be closed — see
@@ -126,8 +124,6 @@ export class MojoBackend implements SessionBackend {
     /** True once the current turn has emitted its `result` event, so a late
      *  process exit cannot fire a second turn boundary. */
     private turnSettled = true;
-    /** Bounded set of session ids whose boundary already fired. */
-    private readonly seenResults = new Set<string>();
     /** Buffer for partial NDJSON lines across stdout chunks. */
     private stdoutTail = '';
     /** Set when --include-partial deltas have already rendered this turn's text,
@@ -722,7 +718,7 @@ export class MojoBackend implements SessionBackend {
             for (const w of warnings) this.emitLine(`⚠️ ${String(w)}`, 'warn');
         }
         if (ev.error && !askSkipped) this.emitLine(`❌ ${this.fmtErr(ev.error)}`, 'err');
-        this.settleTurn(ev.session_id);
+        this.settleTurn();
     }
 
     /**
@@ -736,13 +732,16 @@ export class MojoBackend implements SessionBackend {
      * still RUNNING (rejected — see SESSION_BUSY_RE) and attributing the reply
      * to the wrong turn/card. See the `isRemoteBackendType` gate in worker.ts.
      */
-    private settleTurn(resultSessionId?: string): void {
+    private settleTurn(): void {
+        // `turnSettled` alone provides the once-per-turn guarantee. A
+        // `seenResults` Set used to be maintained alongside it and described as
+        // "session ids whose boundary already fired", but nothing ever queried it
+        // — it was only added to and, past a cap, cleared wholesale. Dead state
+        // reading as if it enforced cross-turn dedup, so it is gone rather than
+        // left to mislead. If per-session result dedup is ever actually needed,
+        // it has to be a real lookup here.
         if (this.turnSettled) return;
         this.turnSettled = true;
-        if (resultSessionId) {
-            this.seenResults.add(resultSessionId);
-            if (this.seenResults.size > SEEN_RESULTS_MAX) this.seenResults.clear();
-        }
         this.taskDoneCb?.();
     }
 

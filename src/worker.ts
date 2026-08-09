@@ -1737,6 +1737,11 @@ async function deliverRawInput(msg: Extract<DaemonToWorker, { type: 'raw_input' 
       targetBackend,
       msg.content,
       () => {
+        // A passthrough (/compact, /model, ...) lands as a REAL mojo turn, so the
+        // credential snapshot has to be applied here — at the write moment, which
+        // is the same point flushPending applies it for a queued message. Without
+        // this, a cleared or rotated JWT did not take effect on these turns.
+        applyMojoLivePatch(msg.mojoLivePatch);
         renderer?.markNewTurn();
         usageLimitTracker.beginTurn(currentUsageLimitSnapshot());
         if (tmuxScrolledHalfPages > 0) exitTmuxScrollMode();

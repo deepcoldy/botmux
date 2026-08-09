@@ -4061,7 +4061,7 @@ export function sendWorkerInput(
  *
  * The control plane is NOT included — it stays frozen for the session's lifetime.
  */
-function mojoLivePatchForSession(ds: DaemonSession): { mojoLivePatch: MojoLivePatch } | undefined {
+export function mojoLivePatchForSession(ds: DaemonSession): { mojoLivePatch: MojoLivePatch } | undefined {
   const backendType = ds.initConfig?.backendType ?? ds.session.backendType;
   if (backendType !== 'mojo') return undefined;
   let botCfg;
@@ -5396,6 +5396,10 @@ function setupWorkerHandlers(
           sendWorkerSessionInput(ds, {
             type: 'raw_input',
             content: rawInput,
+            // Passthrough commands (/compact, /model, ...) become REAL mojo turns,
+            // so they must carry the same credential snapshot a normal message
+            // does — otherwise a cleared or rotated JWT simply did not apply here.
+            ...(mojoLivePatchForSession(ds) ?? {}),
             ...(rawTurnId ? { turnId: rawTurnId } : {}),
             followUpContent: followUp?.cliInput,
             ...(followUp?.turnId ? { followUpTurnId: followUp.turnId } : {}),

@@ -12,6 +12,7 @@
  * import cycle with each other.
  */
 import { getBot } from '../bot-registry.js';
+import { isRemoteBackendId } from './remote-cli-ids.js';
 import { TmuxBackend } from '../adapters/backend/tmux-backend.js';
 import { HerdrBackend } from '../adapters/backend/herdr-backend.js';
 import { ZellijBackend } from '../adapters/backend/zellij-backend.js';
@@ -98,18 +99,16 @@ export function resolveSpawnBackendType(
  * hardcoded `=== 'riff'` chain in every helper below) is exactly what made this
  * generalization necessary.
  */
-const REMOTE_CLI_IDS: ReadonlySet<string> = new Set(['riff', 'mojo']);
+// The set itself now lives in the dependency-free core/remote-cli-ids leaf so
+// light consumers (e.g. the Lark card builder) can share it without pulling in
+// every PTY backend class through this module.
 
 /** True for a backend that runs the agent off-box (no local PTY to own). */
 export function isRemoteBackendType(type: BackendType): boolean {
-  return REMOTE_CLI_IDS.has(type);
+  return isRemoteBackendId(type);
 }
 
-/** True for a CLI whose backend is remote. By construction the cliId and its
- *  backendType share a name, so callers pairing the two can reuse the id. */
-export function isRemoteCliId(cliId: string | undefined): boolean {
-  return cliId !== undefined && REMOTE_CLI_IDS.has(cliId);
-}
+export { isRemoteCliId } from './remote-cli-ids.js';
 
 /**
  * Enforce the `cliId === <remote> ⇔ backendType === <remote>` pairing invariant
@@ -131,7 +130,7 @@ export function reconcileRiffBackendType(
   defaultType: BackendType,
 ): BackendType {
   // A remote CLI dictates its own backend (same name by construction).
-  if (REMOTE_CLI_IDS.has(cliId)) return cliId as BackendType;
+  if (isRemoteBackendId(cliId)) return cliId as BackendType;
   // defaultType 本身被误配成远端后端时兜底到确定可用的本地后端（pty 无外部依赖）。
   if (isRemoteBackendType(resolved)) {
     return !isRemoteBackendType(defaultType) ? defaultType : 'pty';

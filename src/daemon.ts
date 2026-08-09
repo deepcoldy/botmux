@@ -144,6 +144,7 @@ import {
   isSessionTransferring,
   type WorkerSessionReplyOptions,
   migrateMojoSessionIdentities,
+  mojoLivePatchForSession,
 } from './core/worker-pool.js';
 import { AbortDeadlineError, hasExactSafeJsonKeys, ipcRoute, isTrustedHostIpcRequest, JsonBodyTooLargeError, jsonRes, readJsonBody, runWithAbortDeadline, setBotName, setLarkAppId, startIpcServer, setBotRenamer, setBotAvatarChanger, armCoreOnlyReadinessGate, setCoreOnlyReady } from './core/dashboard-ipc-server.js';
 import { setDeviceIsolationDaemonIdentity } from './core/device-isolation-daemon.js';
@@ -15431,6 +15432,9 @@ function deliverPassthroughToExistingSession(
     sendWorkerSessionInput(ds, {
       type: 'raw_input',
       content: commandContent,
+      // Same reason as the worker-pool raw_input send: a passthrough is a real
+      // mojo turn, so it needs the live credential snapshot too.
+      ...(mojoLivePatchForSession(ds) ?? {}),
       turnId: turn.messageId,
     });
     markSessionActivity(ds);

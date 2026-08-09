@@ -252,9 +252,16 @@ describe('worker sendRawCommandLine helper', () => {
 });
 
 describe('daemon prompt_ready dispatch', () => {
-  const region = caseRegion(poolSrc, "case 'prompt_ready':", 2000);
+  // Anchored on the raw_input send itself, NOT a fixed character window from
+  // `case 'prompt_ready':`. The old 2000-char span silently stopped covering the
+  // assertion below as soon as comments were added above it, so this failed
+  // without the wiring having changed at all.
+  const sendIdx = poolSrc.indexOf("case 'prompt_ready':");
+  const rawIdx = poolSrc.indexOf("type: 'raw_input',", sendIdx);
+  const region = poolSrc.slice(sendIdx, poolSrc.indexOf('});', rawIdx));
 
   it('bundles the follow-up onto the raw_input IPC instead of a second message IPC', () => {
+    expect(rawIdx, 'raw_input send not found after prompt_ready').toBeGreaterThan(sendIdx);
     expect(region).toContain('followUpContent: followUp?.cliInput');
     // A separate `message` IPC here would reopen the race — must not exist.
     expect(region).not.toContain("type: 'message'");

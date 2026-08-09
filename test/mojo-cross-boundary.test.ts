@@ -268,6 +268,39 @@ describe('mojo cross-boundary contracts', () => {
     } finally { teardown(h); }
   });
 
+  it('2c. a passthrough turn honours a cleared credential', async () => {
+    // /compact, /model and friends arrive as `raw_input`, not `message`. That IPC
+    // carried no credential snapshot and the worker applied none, yet for mojo it
+    // becomes a REAL turn (MojoBackend has no sendText, so it falls through to
+    // be.write()). A cleared or rotated JWT therefore did not apply to any of
+    // these turns — the stale token was used again.
+    const h = bootWorker({ mojo: { jwtEnv: 'MY_JWT', env: { MY_JWT: 'stale-A' } } });
+    try {
+      h.child.send({
+        type: 'init',
+        sessionId: 'sid-xb', chatId: 'oc_x', rootMessageId: 'om_x',
+        workingDir: h.root, cliId: 'mojo', backendType: 'mojo',
+        backendConfig: { cloud: true, jwtEnv: 'MY_JWT', env: { MY_JWT: 'stale-A' } },
+        prompt: 'turn one', larkAppId: 'app_xb', larkAppSecret: 'secret',
+      } as DaemonToWorker);
+      await waitFor(() => lines(h.dump).length >= 1, 25_000, () => `turn one never ran\n${h.logs.join('')}`);
+      expect(lines(h.dump)[0]).toBe('[stale-A]');
+
+      // The rotation must arrive ON THE PASSTHROUGH ITSELF. Asserting it after a
+      // preceding `message` that already carried the same snapshot proves nothing:
+      // the backend state is identical either way, and an earlier draft of this
+      // test passed with the worker-side apply removed.
+      h.child.send({ type: 'raw_input', content: '/compact', mojoLivePatch: { jwt: 'rotated-B' } } as DaemonToWorker);
+      await waitFor(() => lines(h.dump).length >= 2, 30_000, () => `passthrough never ran\n${h.logs.join('')}`);
+      expect(lines(h.dump)[1]).toBe('[rotated-B]');
+
+      // And a clear delivered the same way must stick.
+      h.child.send({ type: 'raw_input', content: '/model', mojoLivePatch: { jwt: null } } as DaemonToWorker);
+      await waitFor(() => lines(h.dump).length >= 3, 30_000, () => `second passthrough never ran\n${h.logs.join('')}`);
+      expect(lines(h.dump)[2]).toBe('[]');
+    } finally { teardown(h); }
+  });
+
   it('3b. mojo.env cannot hijack a botmux-owned session variable', async () => {
     // mojo.env is the highest-precedence env layer, so a reserved key accepted by
     // the validator would WIN over the worker's own BOTMUX_SESSION_ID. Review

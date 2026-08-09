@@ -1,3 +1,4 @@
+import { isRemoteCliId } from '../../core/remote-cli-ids.js';
 import type { ProjectInfo } from '../../services/project-scanner.js';
 import type { CliId, ResumableSession } from '../../adapters/cli/types.js';
 import { adoptTargetKey, adoptTargetLabel, type AdoptableSession } from '../../core/session-discovery.js';
@@ -848,9 +849,12 @@ export function buildStreamingCard(
 
   // ── Quick-action keys (only when the screenshot is visible — in text mode
   //    there's no visible cursor/input, so these keys would fire blindly) ──
-  // riff：远端任务后端没有可驱动的终端，PTY 快捷键只会变成内容为控制字符的
-  // follow-up 任务（worker 侧也有同款拒绝守卫），整排隐藏。
-  if (displayMode === 'screenshot' && cliId !== 'riff') {
+  // 远端任务后端（riff / mojo）没有可驱动的终端，PTY 快捷键只会变成内容为控制
+  // 字符的 follow-up 任务（worker 侧也有同款拒绝守卫），整排隐藏。
+  // 用 isRemoteCliId 而非硬编码单个 id：这一处原本只排除了 riff，于是新增 mojo
+  // 后卡片照旧渲染 11 个按钮、点击全部静默无效；改走 REMOTE_CLI_IDS 单一事实源，
+  // 以后再加远端 CLI 不会重复漏改。
+  if (displayMode === 'screenshot' && !isRemoteCliId(cliId)) {
     const mkKey = (label: string, key: string) => ({
       tag: 'button',
       text: { tag: 'plain_text', content: label },
