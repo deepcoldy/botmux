@@ -26024,3 +26024,91 @@ button.ui-refresh-button.is-loading .ui-action-icon {
 .cs-advanced-fields .cs-feed-group > legend {
   padding: 0;
 }
+
+.feed-group-picker {
+  position: relative;
+  width: 100%;
+}
+
+.feed-group-picker > summary {
+  box-sizing: border-box;
+  display: flex;
+  align-items: center;
+  min-height: var(--button-height);
+  padding: 0 42px 0 var(--button-padding-x);
+  border: 1px solid color-mix(in srgb, var(--accent) 38%, var(--border-soft));
+  border-radius: var(--radius-full);
+  background: var(--surface);
+  color: var(--fg);
+  cursor: pointer;
+  list-style: none;
+  border-color: color-mix(in srgb, var(--accent) 38%, var(--border-soft));
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 10%, transparent);
+}
+
+.feed-group-picker > summary::-webkit-details-marker { display: none; }
+
+.feed-group-picker > summary::after {
+  content: "";
+  position: absolute;
+  right: 18px;
+  width: 8px;
+  height: 8px;
+  border-style: solid;
+  border-width: 0 2px 2px 0;
+  border-color: var(--accent-strong);
+  transform: translateY(-2px) rotate(45deg);
+}
+
+.feed-group-picker[open] > summary::after { transform: translateY(2px) rotate(225deg); }
+.feed-group-picker.is-disabled > summary { cursor: not-allowed; opacity: .58; }
+
+.feed-group-picker-pop {
+  position: absolute;
+  z-index: 120;
+  left: 0;
+  right: 0;
+  top: calc(100% + 6px);
+  display: grid;
+  padding: 8px;
+  border: 1px solid var(--border-soft);
+  border-radius: 14px;
+  background: var(--surface-elevated, var(--surface));
+  box-shadow: 0 16px 40px rgb(0 0 0 / 28%);
+}
+
+.feed-group-picker-new {
+  display: grid;
+  gap: 6px;
+  padding: 4px 4px 10px;
+  border-bottom: 1px solid var(--border-soft);
+}
+
+.feed-group-picker-new > span { color: var(--muted); font-size: 12px; font-weight: 700; }
+.feed-group-picker-new > input {
+  box-sizing: border-box;
+  width: 100%;
+  min-height: 38px;
+  padding: 0 12px;
+  border: 1px solid var(--border-soft);
+  border-radius: 9px;
+  background: var(--surface);
+  color: var(--fg);
+}
+
+.feed-group-picker-pop > button {
+  min-height: 38px;
+  padding: 0 12px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--fg);
+  text-align: left;
+  cursor: pointer;
+}
+
+.feed-group-picker-pop > button:hover,
+.feed-group-picker-pop > button[aria-current="true"] {
+  background: var(--accent-soft);
+  color: var(--accent-strong);
+}
