@@ -10,11 +10,34 @@ interface ScanRequest {
   options: ProjectScanOptions;
 }
 
+// A scan child that loads and then wedges on a synchronous fs call (hung NFS
+// mount, pathological directory tree — exactly the slow-scan case this async
+// subsystem exists to isolate) never emits message/error/close, so runScan's
+// Promise would otherwise never settle. Because scans are globally serialized
+// (scanQueue), one wedged child would permanently block every later session's
+// repo scan. Bound each scan so a wedge is killed and surfaced as a normal
+// failure (progress card withdrawn + `/repo` text recovery) and the queue drains.
+const DEFAULT_SCAN_TIMEOUT_MS = 60_000;
+// After SIGTERM, give the child a brief grace period to unwind before SIGKILL —
+// a child truly wedged in a blocking syscall may ignore SIGTERM.
+const SCAN_KILL_GRACE_MS = 2_000;
+
+function scanTimeoutMs(): number {
+  const raw = Number(process.env.BOTMUX_REPO_SCAN_TIMEOUT_MS);
+  return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_SCAN_TIMEOUT_MS;
+}
+
 type ScanResponse =
   | { ok: true; projects: ProjectInfo[] }
   | { ok: false; error: string };
 
 function childEntryPoint(): { path: string; execArgv: string[] } {
+  // Test/override seam: point the scanner at an alternate child entry (e.g. a
+  // deliberately-hanging script) to exercise the timeout path without waiting on
+  // a real wedge. Not used in production.
+  const override = process.env.BOTMUX_REPO_SCANNER_CHILD;
+  if (override && existsSync(override)) return { path: override, execArgv: [] };
+
   const compiledPath = fileURLToPath(new URL('./project-scanner-child.js', import.meta.url));
   if (existsSync(compiledPath)) return { path: compiledPath, execArgv: [] };
 
@@ -34,6 +57,25 @@ function runScan(request: ScanRequest): Promise<ProjectInfo[]> {
     let response: ScanResponse | undefined;
     let failure: Error | undefined;
 
+    // Bound the child: on timeout SIGTERM it, escalate to SIGKILL if it ignores
+    // that, and record a timeout failure so the 'close' handler rejects. Killing
+    // guarantees a 'close' event, which is what settles this Promise and lets the
+    // serialized scanQueue drain past a wedged child.
+    let killTimer: ReturnType<typeof setTimeout> | undefined;
+    const timeoutTimer = setTimeout(() => {
+      failure ??= new Error(`Project scanner child timed out after ${scanTimeoutMs()}ms`);
+      child.kill('SIGTERM');
+      killTimer = setTimeout(() => {
+        try { child.kill('SIGKILL'); } catch { /* already gone */ }
+      }, SCAN_KILL_GRACE_MS);
+      killTimer.unref?.();
+    }, scanTimeoutMs());
+    timeoutTimer.unref?.();
+    const clearTimers = (): void => {
+      clearTimeout(timeoutTimer);
+      if (killTimer) clearTimeout(killTimer);
+    };
+
     child.once('message', (message) => {
       response = message as ScanResponse;
     });
@@ -41,6 +83,7 @@ function runScan(request: ScanRequest): Promise<ProjectInfo[]> {
       failure ??= error;
     });
     child.once('close', (code, signal) => {
+      clearTimers();
       if (failure) {
         reject(failure);
       } else if (!response) {

@@ -70,4 +70,28 @@ describe('scanMultipleProjectsAsync', () => {
     expect(timerRan).toBe(true);
     expect(actual).toEqual(expected);
   });
+
+  it('times out a wedged scan child and lets the serial queue drain past it', async () => {
+    // A child that loads then wedges on a blocking call never emits
+    // message/error/close, so without a timeout the scan Promise — and the
+    // global serial scanQueue behind it — would hang forever. Point the scanner
+    // at a deliberately-hanging child with a tiny timeout and assert it rejects,
+    // then that a subsequent scan still succeeds (queue not poisoned).
+    const hangChild = join(tempRoot, 'hang-child.mjs');
+    // Stays alive with an unresolved timer and never replies on IPC.
+    writeFileSync(hangChild, 'setInterval(() => {}, 1 << 30);\n');
+    process.env.BOTMUX_REPO_SCANNER_CHILD = hangChild;
+    process.env.BOTMUX_REPO_SCAN_TIMEOUT_MS = '300';
+    try {
+      await expect(scanMultipleProjectsAsync([tempRoot])).rejects.toThrow(/timed out/i);
+    } finally {
+      delete process.env.BOTMUX_REPO_SCANNER_CHILD;
+      delete process.env.BOTMUX_REPO_SCAN_TIMEOUT_MS;
+    }
+
+    // The queue must have drained: a normal scan after the wedge still works.
+    const expected = scanMultipleProjects([tempRoot]);
+    const actual = await scanMultipleProjectsAsync([tempRoot]);
+    expect(actual).toEqual(expected);
+  });
 });
