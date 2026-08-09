@@ -11,6 +11,7 @@ export function FeedGroupPicker(props: {
   onChange(selectedId: string, newName: string): void;
 }): React.JSX.Element {
   const detailsRef = useRef<HTMLDetailsElement | null>(null);
+  const summaryRef = useRef<HTMLElement | null>(null);
   const selectedName = props.groups.find(group => group.groupId === props.selectedId)?.name;
   const label = props.newName.trim()
     ? `新建标签：${props.newName.trim()}`
@@ -34,11 +35,23 @@ export function FeedGroupPicker(props: {
     };
   }, []);
 
+  useEffect(() => {
+    if (props.disabled && detailsRef.current?.open) detailsRef.current.open = false;
+  }, [props.disabled]);
+
+  const choose = (selectedId: string, newName: string) => {
+    props.onChange(selectedId, newName);
+    detailsRef.current?.removeAttribute('open');
+    queueMicrotask(() => summaryRef.current?.focus());
+  };
+
   return (
     <details ref={detailsRef} className={`feed-group-picker${props.disabled ? ' is-disabled' : ''}`}>
       <summary
-        aria-label="飞书标签"
+        ref={summaryRef}
+        aria-label={`飞书标签，当前：${label}`}
         aria-disabled={props.disabled || undefined}
+        tabIndex={props.disabled ? -1 : undefined}
         onClick={event => { if (props.disabled) event.preventDefault(); }}
       >
         <span>{label}</span>
@@ -60,7 +73,7 @@ export function FeedGroupPicker(props: {
         <button
           type="button"
           aria-current={!props.selectedId && !props.newName.trim() ? 'true' : undefined}
-          onClick={() => { props.onChange('', ''); detailsRef.current?.removeAttribute('open'); }}
+          onClick={() => choose('', '')}
         >
           不选择标签
         </button>
@@ -69,7 +82,7 @@ export function FeedGroupPicker(props: {
             key={group.groupId}
             type="button"
             aria-current={props.selectedId === group.groupId && !props.newName.trim() ? 'true' : undefined}
-            onClick={() => { props.onChange(group.groupId, ''); detailsRef.current?.removeAttribute('open'); }}
+            onClick={() => choose(group.groupId, '')}
           >
             {group.name}
           </button>
