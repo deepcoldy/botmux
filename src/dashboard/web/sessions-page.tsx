@@ -217,6 +217,27 @@ function StatusBadge(props: { status: unknown }): React.JSX.Element {
   return <span className={`status status-${cssToken(raw)}`}>{sessionStatusText(raw)}</span>;
 }
 
+/** 任务态徽标：机器可能空闲，但 transcript 里还有未完成的 TODO。挂在卡片上让人
+ *  一眼看出「为什么这张卡在待办列」——运行态（空闲）与任务态（未完成 TODO）正交，
+ *  单看运行态徽标解释不了列归属。openTodos 缺失或已全部完成时不渲染。 */
+function TodoBadge(props: { row: any }): React.JSX.Element | null {
+  const todos = props.row?.openTodos;
+  if (!todos || typeof todos.remaining !== 'number' || todos.remaining <= 0) return null;
+  const total = Number(todos.total ?? 0);
+  const done = Number(todos.done ?? 0);
+  const label = t('sessions.board.todoBadge', { done, total });
+  const title = t('sessions.board.todoBadgeTitle', { remaining: todos.remaining, total, done });
+  return (
+    <span
+      className={`session-todo-badge${todos.hasInProgress ? ' active' : ''}`}
+      title={title}
+    >
+      {todos.hasInProgress ? <span className="session-todo-dot" aria-hidden="true" /> : null}
+      {label}
+    </span>
+  );
+}
+
 function LockChip(props: { row: any }): React.JSX.Element | null {
   if (!props.row.locked) return null;
   return <span className="session-lock-badge" title={t('sessions.locked')}>{t('sessions.locked')}</span>;
@@ -915,7 +936,7 @@ function SessionsTable(props: {
       case 'cliId':
         return <td data-label={labels.cliId}><span className={`badge cli-${cssToken(row.cliId)}`} title={row.runtimeId && row.runtimeId !== row.cliId ? `${row.cliId} / ${row.runtimeId}` : undefined}>{sessionCliDisplayName(row)}</span></td>;
       case 'status':
-        return <td data-label={labels.status}><StatusBadge status={row.status} /><LockChip row={row} /></td>;
+        return <td data-label={labels.status}><StatusBadge status={row.status} /><TodoBadge row={row} /><LockChip row={row} /></td>;
       case 'chat':
         return <td className="session-location-cell" data-label={labels.chat} title={sessionLocationTitle(row)}>{sessionLocationText(row)}</td>;
       case 'tokenIn':
@@ -1261,6 +1282,7 @@ function BoardCard(props: {
         </div>
         <span className="session-card-status-group">
           <StatusBadge status={row.status} />
+          <TodoBadge row={row} />
           <LockChip row={row} />
         </span>
       </div>
@@ -1878,6 +1900,7 @@ function Drawer(props: {
             </div>
             <span className="drawer-status-line">
               <StatusBadge status={row.status} />
+              <TodoBadge row={row} />
               <LockChip row={row} />
             </span>
             <p><code>{row.sessionId}</code> <CopyButton value={row.sessionId} /></p>

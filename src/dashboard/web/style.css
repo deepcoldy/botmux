@@ -2920,6 +2920,38 @@ button.primary {
   margin-left: 0;
 }
 
+/* 任务态徽标：告诉人「这张卡为什么在待办列」——机器空闲但还有未完成 TODO。
+   琥珀色区别于运行态 status（灰/蓝/绿），hasInProgress 时加脉冲圆点。 */
+.session-todo-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 2px 8px;
+  border-radius: var(--radius-full);
+  font-family: var(--mono);
+  font-weight: 700;
+  font-size: 11px;
+  line-height: 1.3;
+  letter-spacing: 0.02em;
+  white-space: nowrap;
+  color: var(--warning, #b26b00);
+  background: color-mix(in srgb, var(--warning, #f5a623) 12%, transparent);
+  border: 1px solid color-mix(in srgb, var(--warning, #f5a623) 34%, transparent);
+}
+
+.session-todo-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--warning, #f5a623);
+  animation: todo-pulse 1.6s ease-in-out infinite;
+}
+
+@keyframes todo-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.3; }
+}
+
 .session-signal {
   display: inline-flex;
   align-items: center;
