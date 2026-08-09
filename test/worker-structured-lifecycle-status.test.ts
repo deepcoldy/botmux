@@ -56,8 +56,11 @@ describe('worker structured-turn status wiring', () => {
     expect(flush).toContain('codexBridgeQueue.finishSubmitVerification(bridgeTurnId, undefined, item.dispatchAttempt)');
 
     const adopt = functionSlice('writeAdoptMessage', 'isWorkflowWorker');
+    // beginCliWriteCycle re-arms readiness inside prepareAdoptWrite, which the
+    // submission transaction runs as its beforeWrite hook — textually before the
+    // wrapped writeInput. The write stays the literal cliAdapter.writeInput call.
     const adoptCycle = adopt.indexOf('beginCliWriteCycle()');
-    const adoptWrite = adopt.indexOf('await cliAdapter.writeInput(adoptBackend as unknown as PtyHandle, content)');
+    const adoptWrite = adopt.indexOf('cliAdapter!.writeInput(adoptBackend as unknown as PtyHandle, content)');
     expect(adoptCycle).toBeGreaterThanOrEqual(0);
     expect(adoptWrite).toBeGreaterThan(adoptCycle);
     expect(adopt).toContain('result?.submitted === true && adoptStructuredBridgeTurnId');
@@ -73,8 +76,10 @@ describe('worker structured-turn status wiring', () => {
     expect(itemWrite).toBeGreaterThan(perItemCycle);
 
     const adopt = functionSlice('writeAdoptMessage', 'isWorkflowWorker');
-    const adoptWrite = adopt.indexOf('await cliAdapter.writeInput(adoptBackend as unknown as PtyHandle, content)');
+    const adoptWrite = adopt.indexOf('cliAdapter!.writeInput(adoptBackend as unknown as PtyHandle, content)');
     expect(adoptWrite).toBeGreaterThanOrEqual(0);
+    // Re-arm (setPromptReady(false)/idleDetector.reset via beginCliWriteCycle)
+    // happens in prepareAdoptWrite BEFORE the write, never after it.
     expect(adopt.slice(adoptWrite)).not.toContain('isPromptReady = false;');
     expect(adopt.slice(adoptWrite)).not.toContain('idleDetector?.reset();');
   });

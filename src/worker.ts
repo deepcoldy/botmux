@@ -6861,22 +6861,35 @@ async function writeAdoptMessage(
   publishSandboxRelayCapability();
   let adoptStructuredBridgeTurnId: string | undefined;
 
-  // Capture transcript baseline before writing so subsequent assistant events
-  // are attributed to this Lark turn, not prior local pane activity.
-  if (bridgeJsonlPath) {
-    try { bridgeIngest(); } catch { /* best effort */ }
-    bridgeMarkPendingTurn(content, turnId, dispatchAttempt);
-  } else if (codexBridgeFallbackActive()) {
-    if (codexBridgeIsCursor()) {
-      // Cursor may append the current line before IPC handling; mark first so
-      // the pre-existing line can fingerprint-match instead of becoming seen.
-      adoptStructuredBridgeTurnId = codexBridgeMarkPendingTurn(content, turnId, dispatchAttempt);
-      try { codexBridgeIngest(); } catch { /* best effort */ }
-    } else {
-      try { codexBridgeIngest(); } catch { /* best effort */ }
-      adoptStructuredBridgeTurnId = codexBridgeMarkPendingTurn(content, turnId, dispatchAttempt);
+  // Capture the transcript baseline immediately before the literal write, inside
+  // the submission transaction (as its beforeWrite hook), so a ZMX composer-
+  // recovery hold that refuses the write never leaves a bare, unwritten bridge
+  // mark. prepareAdoptWrite is idempotent and also re-arms readiness before the
+  // adapter can yield (an assistant_final may arrive while writeInput polls
+  // history), so the re-arm stays BEFORE the write, never after.
+  let adoptWritePrepared = false;
+  const prepareAdoptWrite = (): void => {
+    if (adoptWritePrepared) return;
+    adoptWritePrepared = true;
+    beginCliWriteCycle();
+    if (bridgeJsonlPath) {
+      try { bridgeIngest(); } catch { /* best effort */ }
+      bridgeMarkPendingTurn(content, turnId, dispatchAttempt);
+    } else if (codexBridgeFallbackActive()) {
+      if (codexBridgeIsCursor()) {
+        // Cursor may append the current line before IPC handling; mark first so
+        // the pre-existing line can fingerprint-match instead of becoming seen.
+        adoptStructuredBridgeTurnId = codexBridgeMarkPendingTurn(content, turnId, dispatchAttempt);
+        try { codexBridgeIngest(); } catch { /* best effort */ }
+      } else {
+        try { codexBridgeIngest(); } catch { /* best effort */ }
+        adoptStructuredBridgeTurnId = codexBridgeMarkPendingTurn(content, turnId, dispatchAttempt);
+      }
+      if (adoptStructuredBridgeTurnId) {
+        codexBridgeQueue.beginSubmitVerification(adoptStructuredBridgeTurnId, undefined, dispatchAttempt);
+      }
     }
-  }
+  };
 
   const settleStaleAfterWrite = (errorCode: string): AdoptWriteResult => {
     if (adoptStructuredBridgeTurnId) {
@@ -6899,15 +6912,44 @@ async function writeAdoptMessage(
     return 'stale-after-write';
   };
 
-  // Re-arm before the adapter can yield. An assistant_final may arrive while
-  // writeInput is still polling history.
-  beginCliWriteCycle();
+  // Adopt mode write:
+  //   - Structured-bridge adopt-input CLIs (codex/traex/pi/grok/mtr) route
+  //     through cliAdapter.writeInput. The composer-conflict guard refuses input
+  //     when the adopted pane already holds an unsubmitted human draft, and the
+  //     shared submission transaction gives ZMX its capture→write→confirm/cancel
+  //     journal (a transparent pass-through on every non-ZMX backend).
+  //   - raw sendText+Enter runs inside the same transaction for identical
+  //     commit-journal atomicity.
   if (isStructuredBridgeAdoptInputCli(lastInitConfig?.cliId) && cliAdapter) {
+    const submissionBackend = adoptBackend;
+    let recoveryFailureReason: string | undefined;
+    // Refuse adopt input while the local composer still holds an unsubmitted
+    // human draft, BEFORE any bridge attribution or terminal write — otherwise
+    // the Lark message would be appended onto the human's half-typed line.
+    const composerConflict = codexAdoptComposerConflict(submissionBackend);
+    if (composerConflict) {
+      log('Refused Codex adopt input because the local composer contains an unsubmitted draft');
+      scheduleSubmitFailureNotify(
+        content,
+        undefined,
+        'submit history',
+        undefined,
+        composerConflict,
+        turnSeq,
+        { turnId, dispatchAttempt },
+        'failed',
+      );
+      return 'completed';
+    }
     try {
-      if (adoptStructuredBridgeTurnId) {
-        codexBridgeQueue.beginSubmitVerification(adoptStructuredBridgeTurnId, undefined, dispatchAttempt);
-      }
-      const result = await cliAdapter.writeInput(adoptBackend as unknown as PtyHandle, content);
+      const transaction = await runAmbiguousSubmissionTransaction(
+        submissionBackend,
+        () => cliAdapter!.writeInput(adoptBackend as unknown as PtyHandle, content),
+        settleVerifiableSubmissionForJournal,
+        prepareAdoptWrite,
+      );
+      const result = transaction.result;
+      recoveryFailureReason = transaction.recoveryFailureReason;
       if (!adoptWriteFenceIsCurrent(executionFence)) {
         return settleStaleAfterWrite('adopt_generation_changed');
       }
@@ -6921,20 +6963,30 @@ async function writeAdoptMessage(
         codexBridgeQueue.finishSubmitVerification(adoptStructuredBridgeTurnId, undefined, dispatchAttempt);
       }
       redriveRejectedStructuredReady();
-      if (result && result.submitted === false) {
-        scheduleSubmitFailureNotify(
-          content,
-          result.recheck,
-          'submit history',
-          adoptStructuredBridgeTurnId,
-          result.failureReason,
-          turnSeq,
-          { turnId, dispatchAttempt },
-          'failed',
-          true,
-        );
+      if (result?.submitted === false || recoveryFailureReason) {
+        if (recoveryFailureReason) {
+          notifyAmbiguousSubmissionRecovery(recoveryFailureReason, { turnId, dispatchAttempt });
+        } else {
+          scheduleSubmitFailureNotify(
+            content,
+            result?.recheck,
+            'submit history',
+            adoptStructuredBridgeTurnId,
+            result?.failureReason,
+            turnSeq,
+            { turnId, dispatchAttempt },
+            'failed',
+            true,
+          );
+        }
       }
     } catch (err: any) {
+      recoveryFailureReason = err instanceof SubmissionWriteError
+        ? err.recoveryFailureReason
+        : recoveryFailureReason;
+      const blockedBeforeWrite = err instanceof SubmissionWriteError
+        && !!err.recoveryFailureReason
+        && !err.submissionStarted;
       log(`Adopt writeInput error (${lastInitConfig?.cliId}): ${err.message}`);
       if (!adoptWriteFenceIsCurrent(executionFence)) {
         return settleStaleAfterWrite('adopt_generation_changed');
@@ -6943,21 +6995,66 @@ async function writeAdoptMessage(
         codexBridgeQueue.finishSubmitVerification(adoptStructuredBridgeTurnId, undefined, dispatchAttempt);
       }
       dropFailedBridgeMark(adoptStructuredBridgeTurnId, dispatchAttempt);
-      if (turnId && dispatchAttempt !== undefined) {
+      if (turnId && dispatchAttempt !== undefined && blockedBeforeWrite) {
+        // The ZMX recovery hold refused the write, so the input definitely did
+        // NOT execute — a genuine retryable failure, not an ambiguous one.
+        emitTurnTerminal(turnId, 'failed', 'zmx_recovery_blocked_before_write', dispatchAttempt);
+      } else if (turnId && dispatchAttempt !== undefined && !recoveryFailureReason) {
         emitTurnTerminal(turnId, 'ambiguous', 'adopt_write_input_threw', dispatchAttempt);
+      }
+      if (recoveryFailureReason) {
+        notifyAmbiguousSubmissionRecovery(recoveryFailureReason, { turnId, dispatchAttempt });
       }
       redriveRejectedStructuredReady();
     }
   } else if ('sendText' in adoptBackend && 'sendSpecialKeys' in adoptBackend) {
-    (adoptBackend as any).sendText(content);
-    // Beat between text and Enter so Ink-based TUIs register pasted text before
-    // submit. The serial queue holds across this await.
-    await new Promise(r => setTimeout(r, 200));
-    if (!adoptWriteFenceIsCurrent(executionFence)) {
-      return settleStaleAfterWrite('adopt_generation_changed_before_enter');
+    const submissionBackend = adoptBackend;
+    let recoveryFailureReason: string | undefined;
+    try {
+      const transaction = await runAmbiguousSubmissionTransaction(
+        submissionBackend,
+        async () => {
+          (adoptBackend as any).sendText(content);
+          // Beat between text and Enter so Ink-based TUIs register pasted text
+          // before submit. The serial queue holds across this await.
+          await new Promise(r => setTimeout(r, 200));
+          if (!adoptWriteFenceIsCurrent(executionFence)) {
+            throw new Error('backend changed before adopt raw Enter');
+          }
+          (adoptBackend as any).sendSpecialKeys('Enter');
+        },
+        undefined,
+        prepareAdoptWrite,
+      );
+      recoveryFailureReason = transaction.recoveryFailureReason;
+      if (!adoptWriteFenceIsCurrent(executionFence)) {
+        return settleStaleAfterWrite('adopt_generation_changed_before_enter');
+      }
+      if (recoveryFailureReason) {
+        throw new SubmissionWriteError(
+          `backend could not commit the adopt submission journal; ${recoveryFailureReason}`,
+          recoveryFailureReason,
+        );
+      }
+    } catch (err: any) {
+      recoveryFailureReason = err instanceof SubmissionWriteError
+        ? err.recoveryFailureReason
+        : recoveryFailureReason;
+      const blockedBeforeWrite = err instanceof SubmissionWriteError
+        && !!err.recoveryFailureReason
+        && !err.submissionStarted;
+      log(`Adopt raw input error (${lastInitConfig?.cliId}): ${err.message}`);
+      if (turnId && dispatchAttempt !== undefined && blockedBeforeWrite) {
+        emitTurnTerminal(turnId, 'failed', 'zmx_recovery_blocked_before_write', dispatchAttempt);
+      } else if (turnId && dispatchAttempt !== undefined && !recoveryFailureReason) {
+        emitTurnTerminal(turnId, 'ambiguous', 'write_input_threw', dispatchAttempt);
+      }
+      if (recoveryFailureReason) {
+        notifyAmbiguousSubmissionRecovery(recoveryFailureReason, { turnId, dispatchAttempt });
+      }
     }
-    (adoptBackend as any).sendSpecialKeys('Enter');
   } else {
+    prepareAdoptWrite();
     adoptBackend.write(content + '\r');
   }
   return 'completed';

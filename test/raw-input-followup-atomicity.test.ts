@@ -115,7 +115,14 @@ describe('worker adopt/native-rename coordination', () => {
   });
 
   it('fences process-lifetime adopt tasks before transcript mark or replacement-backend write', () => {
-    const writeRegion = caseRegion(workerSrc, 'async function writeAdoptMessage', 6200);
+    // Bound the region to the writeAdoptMessage function body (up to the next
+    // function) rather than a fixed char span, so restoring the composer guard +
+    // submission transaction (which lengthen the body) can't push the later
+    // staleness returns out of a hardcoded window.
+    const writeRegion = workerSrc.slice(
+      workerSrc.indexOf('async function writeAdoptMessage'),
+      workerSrc.indexOf('async function runAdoptMessageForCapturedGeneration'),
+    );
     const runnerRegion = caseRegion(workerSrc, 'async function runAdoptMessageForCapturedGeneration', 1800);
     const fenceIdx = writeRegion.indexOf('if (!executionFence || !adoptWriteFenceIsCurrent(executionFence))');
     const rendererIdx = writeRegion.indexOf('renderer?.markNewTurn()');

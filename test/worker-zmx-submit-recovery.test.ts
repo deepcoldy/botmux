@@ -50,7 +50,7 @@ describe('worker ZMX logical submission recovery', () => {
       'async function flushPending(): Promise<void>',
       'function sendToPty(',
     );
-    const adopt = region('// Adopt mode write:', "case 'raw_input':");
+    const adopt = region('async function writeAdoptMessage', 'async function runAdoptMessageForCapturedGeneration');
 
     expect(flush).toContain('runAmbiguousSubmissionTransaction(');
     expect(flush).toContain('settleVerifiableSubmissionForJournal');
