@@ -86,3 +86,83 @@ describe('/botconfig usageDisplay enum', () => {
     expect(registry.getBot('app_config').config.usageDisplay).toBeUndefined();
   });
 });
+
+describe('/botconfig legacy quota', () => {
+  it('keeps the read-only legacy option without rewriting it', async () => {
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    config[0].messageQuota = { defaultLimit: 5000 };
+    writeFileSync(configPath, JSON.stringify(config, null, 2));
+    const { registry, handler } = await fresh();
+
+    const result = await handler.handleCardAction({
+      operator: { open_id: 'ou_owner' },
+      action: {
+        value: { action: 'config_quota', loc: 'en' },
+        option: 'legacy',
+      },
+    }, deps, 'app_config');
+
+    expect(result?.toast).toMatchObject({
+      type: 'info',
+      content: 'Current legacy quota kept unchanged',
+    });
+    expect(JSON.parse(readFileSync(configPath, 'utf8'))[0].messageQuota.defaultLimit).toBe(5000);
+    expect(registry.getBot('app_config').config.messageQuota?.defaultLimit).toBe(5000);
+  });
+});
+
+describe('/botconfig free-input quota', () => {
+  it.each([1, 12, 1000])('persists the arbitrary value %i', async quota => {
+    const { registry, handler } = await fresh();
+    const result = await handler.handleCardAction({
+      operator: { open_id: 'ou_owner' },
+      action: {
+        value: { action: 'config_quota_save', loc: 'en' },
+        form_value: { messageQuota: String(quota) },
+      },
+    }, deps, 'app_config');
+
+    expect(result?.toast).toMatchObject({
+      type: 'success',
+      content: `Message quota set: grant cards and Oncall use ${quota} messages per person`,
+    });
+    expect(JSON.parse(readFileSync(configPath, 'utf8'))[0].messageQuota.defaultLimit).toBe(quota);
+    expect(registry.getBot('app_config').config.messageQuota?.defaultLimit).toBe(quota);
+  });
+
+  it.each(['0', '1001', '1.5', 'abc'])('rejects the invalid value %s without changing config', async raw => {
+    const { registry, handler } = await fresh();
+    const result = await handler.handleCardAction({
+      operator: { open_id: 'ou_owner' },
+      action: {
+        value: { action: 'config_quota_save', loc: 'en' },
+        form_value: { messageQuota: raw },
+      },
+    }, deps, 'app_config');
+
+    expect(result?.toast?.type).toBe('error');
+    expect(JSON.parse(readFileSync(configPath, 'utf8'))[0].messageQuota).toBeUndefined();
+    expect(registry.getBot('app_config').config.messageQuota).toBeUndefined();
+  });
+
+  it('restores the built-in defaults when the input is blank', async () => {
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    config[0].messageQuota = { defaultLimit: 12 };
+    writeFileSync(configPath, JSON.stringify(config, null, 2));
+    const { registry, handler } = await fresh();
+    const result = await handler.handleCardAction({
+      operator: { open_id: 'ou_owner' },
+      action: {
+        value: { action: 'config_quota_save', loc: 'en' },
+        form_value: { messageQuota: '  ' },
+      },
+    }, deps, 'app_config');
+
+    expect(result?.toast).toMatchObject({
+      type: 'success',
+      content: 'Default restored: grant cards use 3 messages per person and Oncall is unlimited',
+    });
+    expect(JSON.parse(readFileSync(configPath, 'utf8'))[0].messageQuota).toBeUndefined();
+    expect(registry.getBot('app_config').config.messageQuota).toBeUndefined();
+  });
+});

@@ -21,6 +21,8 @@ import {
   buildAdoptBlockedCard,
   buildPrivateSnapshotCard,
   buildConfigCard,
+  buildConfigQuotaCard,
+  buildForkPanelCard,
   buildTuiPromptFailedCard,
   buildSlashListCard,
   getCliDisplayName,
@@ -365,8 +367,7 @@ describe('buildSlashListCard', () => {
 });
 
 describe('buildConfigCard', () => {
-  it('renders card-behaviour toggles', () => {
-    const card = parse(buildConfigCard({
+  const configData = (quota: number | null) => ({
       larkAppId: 'app_cfg',
       botName: 'Config Bot',
       cliId: 'codex',
@@ -381,7 +382,7 @@ describe('buildConfigCard', () => {
       customPassthroughCommands: null,
       startupCommands: null,
       teamRole: null,
-      quota: null,
+      quota,
       admins: 1,
       booleans: [
         { key: 'disableStreamingCard', on: false },
@@ -393,7 +394,10 @@ describe('buildConfigCard', () => {
         { key: 'disableCliBypass', on: false },
         { key: 'restrictGrantCommands', on: false },
       ],
-    }, 'en'));
+    });
+
+  it('renders card-behaviour toggles', () => {
+    const card = parse(buildConfigCard(configData(null), 'en'));
 
     const toggle = allActions(card).find((a: any) => a.value?.field === 'silentTurnReactions');
     expect(toggle).toBeTruthy();
@@ -408,6 +412,99 @@ describe('buildConfigCard', () => {
       (a: any) => a.value?.field === 'usageDisplay' || a.value?.field === 'showUsageInCardFooter',
     );
     expect(usageToggle).toBeFalsy();
+  });
+
+  it('describes the built-in grant-card and Oncall quota defaults', () => {
+    const card = parse(buildConfigCard(configData(null), 'en'));
+    const quotaEdit = allActions(card).find((a: any) => a.value?.action === 'config_quota_open');
+    const text = card.elements
+      .filter((element: any) => element.tag === 'div')
+      .map((element: any) => element.text?.content ?? '')
+      .join('\n');
+
+    expect(quotaEdit.text.content).toBe('Set message quota');
+    expect(text).toContain('Default: grant card 3 / Oncall unlimited');
+    expect(allActions(card).some((a: any) => a.value?.action === 'config_quota')).toBe(false);
+  });
+
+  it.each([3, 12, 1000])('shows the arbitrary current quota %i without a fixed-options select', current => {
+    const card = parse(buildConfigCard(configData(current), 'en'));
+    const text = card.elements
+      .filter((element: any) => element.tag === 'div')
+      .map((element: any) => element.text?.content ?? '')
+      .join('\n');
+
+    expect(text).toContain(`grant cards and Oncall use ${current} messages per person`);
+    expect(allActions(card).some((a: any) => a.value?.action === 'config_quota')).toBe(false);
+  });
+
+  it('explains a legacy quota above the supported range without placing it in a select', () => {
+    const card = parse(buildConfigCard(configData(5000), 'en'));
+    const text = card.elements
+      .filter((element: any) => element.tag === 'div')
+      .map((element: any) => element.text?.content ?? '')
+      .join('\n');
+
+    expect(text).toContain('new grant cards use at most 1000, while Oncall still uses 5000');
+    expect(allActions(card).some((a: any) => a.value?.action === 'config_quota')).toBe(false);
+  });
+
+  it('renders a free-input quota card for the 1–1000 range', () => {
+    const card = parse(buildConfigQuotaCard(configData(12), 'en'));
+    const form = card.elements.find((element: any) => element.tag === 'form');
+    const input = form.elements.find((element: any) => element.tag === 'input');
+    const save = form.elements.find((element: any) => element.value?.action === 'config_quota_save');
+
+    expect(input).toMatchObject({ name: 'messageQuota', default_value: '12' });
+    expect(input.placeholder.content).toContain('1–1000');
+    expect(save.action_type).toBe('form_submit');
+  });
+
+  it('leaves the legacy quota input blank while retaining the compatibility explanation', () => {
+    const card = parse(buildConfigQuotaCard(configData(5000), 'en'));
+    const form = card.elements.find((element: any) => element.tag === 'form');
+    const input = form.elements.find((element: any) => element.tag === 'input');
+    const text = card.elements
+      .filter((element: any) => element.tag === 'div')
+      .map((element: any) => element.text?.content ?? '')
+      .join('\n');
+
+    expect(input.default_value).toBe('');
+    expect(text).toContain('new grant cards use at most 1000, while Oncall still uses 5000');
+  });
+});
+
+describe('buildForkPanelCard', () => {
+  it('renders an actionable row for each child and normalizes multiline tasks', () => {
+    const card = parse(buildForkPanelCard([
+      { instruction: 'investigate\ncleanup', status: 'active', link: 'https://example.test/thread/1' },
+      { instruction: 'ship fix', status: 'closed', link: 'https://example.test/thread/2' },
+    ], 'en'));
+    const table = card.body.elements.find((element: any) => element.tag === 'table');
+
+    expect(table.rows).toEqual([
+      {
+        instruction: 'investigate cleanup',
+        status: '🟢 running',
+        link: '[open](https://example.test/thread/1)',
+      },
+      {
+        instruction: 'ship fix',
+        status: '⚪ closed',
+        link: '[open](https://example.test/thread/2)',
+      },
+    ]);
+  });
+
+  it('renders an explicit empty state for /forklist', () => {
+    const card = parse(buildForkPanelCard([], 'en'));
+
+    expect(card.body.elements).toEqual([
+      {
+        tag: 'markdown',
+        content: 'This session has no forked tasks yet. Use `/fork <task>` to create one.',
+      },
+    ]);
   });
 });
 
@@ -436,10 +533,15 @@ describe('buildSessionCard', () => {
     expect(card.header.title.content).toContain(TITLE);
   });
 
-  it('should escape markdown special characters in title', () => {
-    const card = parse(buildSessionCard(SID, ROOT, URL, 'Fix *bold* and [link]'));
-    expect(card.header.title.content).toContain('\\*bold\\*');
-    expect(card.header.title.content).toContain('\\[link\\]');
+  it('renders a plain_text title literally (no markdown backslashes) and strips <at> tags', () => {
+    // plain_text header is not markdown: markdown specials pass through as-is,
+    // and mention markup is stripped so no raw <at id=...></at> can leak.
+    const card = parse(buildSessionCard(SID, ROOT, URL, 'Fix *bold* <at id=ou_x></at> [link]'));
+    expect(card.header.title.content).toContain('*bold*');
+    expect(card.header.title.content).toContain('[link]');
+    expect(card.header.title.content).not.toContain('\\');
+    expect(card.header.title.content).not.toContain('<at');
+    expect(card.header.title.content).not.toContain('ou_x');
   });
 
   it('should default to "Claude" display name when cliId is omitted', () => {
@@ -631,6 +733,14 @@ describe('buildSessionCard', () => {
       expect(restartBtn.value.session_id).toBe(SID);
     });
 
+    it('should omit restart for Riff management cards', () => {
+      const card = parse(buildSessionCard(SID, ROOT, URL, TITLE, 'riff', true));
+      const actions = findActions(card);
+
+      expect(actions.find((a: any) => a.value?.action === 'restart')).toBeUndefined();
+      expect(actions.map((a: any) => a.value?.action ?? 'url')).toEqual(['url', 'close']);
+    });
+
     it('should NOT include "get write link" button', () => {
       const card = parse(buildSessionCard(SID, ROOT, URL, TITLE, undefined, true));
       const actions = findActions(card);
@@ -752,15 +862,92 @@ describe('buildStreamingCard', () => {
       expect(card.header.title.content).toContain('工作中');
     });
 
+    it('shows a red, neutral no-progress label for stalled turns', () => {
+      const zh = parse(buildStreamingCard(SID, ROOT, URL, TITLE, '', 'stalled'));
+      expect(zh.header.template).toBe('red');
+      expect(zh.header.title.content).toContain('长时间无进展');
+
+      const en = parse(buildStreamingCard(
+        SID, ROOT, URL, TITLE, '', 'stalled', undefined, 'hidden',
+        undefined, undefined, false, false, 'en',
+      ));
+      expect(en.header.template).toBe('red');
+      expect(en.header.title.content).toContain('No recent progress');
+    });
+
     it('should show green template and "等待输入" for idle status', () => {
       const card = parse(buildStreamingCard(SID, ROOT, URL, TITLE, '', 'idle'));
       expect(card.header.template).toBe('green');
       expect(card.header.title.content).toContain('等待输入');
     });
 
-    it('should include escaped title in header', () => {
-      const card = parse(buildStreamingCard(SID, ROOT, URL, 'Fix *bug*', '', 'idle'));
-      expect(card.header.title.content).toContain('Fix \\*bug\\*');
+    it('renders usage + runtime as one single-line markdown run (tail-joined, no column_set)', () => {
+      const card = parse(buildStreamingCard(
+        SID, ROOT, URL, TITLE, '', 'idle', 'traex', 'hidden',
+        undefined, undefined, false, false, 'en', undefined, undefined, false,
+        {
+          context: { usedTokens: 80_700, windowTokens: 258_400, percentUsed: 31 },
+          tokens: { in: 1_400_000, out: 7_800 },
+          model: 'GPT-5.6-Sol',
+          reasoningEffort: 'xhigh',
+        },
+      ));
+      // Single markdown element: metrics · runtime, one continuous text run.
+      const line = card.elements.find(
+        (element: any) => element.tag === 'markdown' && element.content.includes('GPT-5.6-Sol'),
+      );
+      expect(line).toBeTruthy();
+      expect(line.text_size).toBe('notation_small_v2');
+      expect(line.content).toContain('Context 80.7K/258.4K (31%) · Total ↑1.4M ↓7.8K · **GPT-5.6-Sol**');
+      expect(line.content).toContain('xhigh');
+      // metrics and runtime joined by ' · ' in reading order
+      expect(line.content.indexOf('Total')).toBeLessThan(line.content.indexOf('GPT-5.6-Sol'));      // Not a two-column layout anymore.
+      expect(card.elements.some((element: any) => element.tag === 'column_set'
+        && JSON.stringify(element).includes('GPT-5.6-Sol'))).toBe(false);
+    });
+
+    it('renders metrics alone (no trailing runtime) when there is no model', () => {
+      const card = parse(buildStreamingCard(
+        SID, ROOT, URL, TITLE, '', 'idle', 'traex', 'hidden',
+        undefined, undefined, false, false, 'en', undefined, undefined, false,
+        { context: { usedTokens: 80_700, windowTokens: 258_400, percentUsed: 31 }, tokens: { in: 1_400_000, out: 7_800 } },
+      ));
+      const line = card.elements.find(
+        (element: any) => element.tag === 'markdown' && element.content.includes('Context'),
+      );
+      expect(line.content).toContain('Context 80.7K/258.4K (31%) · Total ↑1.4M ↓7.8K');
+      expect(line.content).not.toContain('·  ·');
+    });
+
+    it('keeps a plain full-width usage markdown when there is no model', () => {
+      const card = parse(buildStreamingCard(
+        SID, ROOT, URL, TITLE, '', 'idle', 'traex', 'hidden',
+        undefined, undefined, false, false, 'en', undefined, undefined, false,
+        {
+          context: { usedTokens: 80_700, windowTokens: 258_400, percentUsed: 31 },
+          tokens: { in: 1_400_000, out: 7_800 },
+        },
+      ));
+      const usage = card.elements.find(
+        (element: any) => element.tag === 'markdown' && element.content.includes('Context'),
+      );
+      expect(usage.content).toContain('Context 80.7K/258.4K (31%) · Total ↑1.4M ↓7.8K');
+      expect(usage.text_size).toBe('notation_small_v2');
+    });
+
+    it('renders a plain_text title without markdown backslashes and strips <at> mention leaks', () => {
+      // plain_text header: NOT markdown, so no backslash-escaping (that leaked as
+      // visible '\\<at' before). A title seeded from a message with an @mention
+      // must not surface the raw <at id=...></at> tag.
+      const card = parse(buildStreamingCard(
+        SID, ROOT, URL, 'Fix bug <at id=ou_abc123></at> now', '', 'idle',
+      ));
+      expect(card.header.title.content).toContain('Fix bug');
+      expect(card.header.title.content).toContain('now');
+      expect(card.header.title.content).not.toContain('<at');
+      expect(card.header.title.content).not.toContain('</at>');
+      expect(card.header.title.content).not.toContain('ou_abc123');
+      expect(card.header.title.content).not.toContain('\\');
       expect(card.header.title.content).toContain('等待输入');
     });
 

@@ -33,7 +33,14 @@ export function mergeMessageMentions(
         ? `user:${mention.userId}`
         : mention.unionId
           ? `union:${mention.unionId}`
-          : `key:${mention.key}:${mention.name}`;
+          : mention.appId
+            // An app_id-form @ (bot mention, no open/user/union id) MUST key on
+            // its app_id — never on key+name. key is re-numbered per message
+            // (@_user_1…) and same-named bots collide, silently folding two
+            // distinct bots into one (fail-open: the second bot vanishes from
+            // the turn's participant window).
+            ? `app:${mention.appId}`
+            : `key:${mention.key}:${mention.name}`;
     const existingIndex = indexes.get(identity);
     if (existingIndex === undefined) {
       indexes.set(identity, merged.length);
@@ -45,6 +52,7 @@ export function mergeMessageMentions(
         openId: merged[existingIndex].openId ?? mention.openId,
         userId: merged[existingIndex].userId ?? mention.userId,
         unionId: merged[existingIndex].unionId ?? mention.unionId,
+        appId: merged[existingIndex].appId ?? mention.appId,
         idType: merged[existingIndex].idType ?? mention.idType,
       };
     }

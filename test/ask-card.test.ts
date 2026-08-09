@@ -632,24 +632,25 @@ describe('handleAskCardAction: ask_submit 路径', () => {
 });
 
 describe('createLarkAskCardDispatcher', () => {
-  it('replies into the root thread when rootMessageId exists', async () => {
+  it('replies into the root thread when rootMessageId exists (forwards dispatchUuid)', async () => {
     const reply = vi.fn(async () => 'om_reply');
     const send = vi.fn(async () => 'om_send');
     const dispatcher = createLarkAskCardDispatcher({ replyMessage: reply as any, sendMessage: send as any });
 
-    await expect(dispatcher.send(makePending())).resolves.toEqual({ messageId: 'om_reply' });
-    expect(reply).toHaveBeenCalledWith('cli_ask', 'om_root', expect.any(String), 'interactive', true);
+    await expect(dispatcher.send(makePending({ dispatchUuid: 'req-uuid-1' }))).resolves.toEqual({ messageId: 'om_reply' });
+    // The stable dispatchUuid is forwarded as the Feishu message uuid (idempotent re-send).
+    expect(reply).toHaveBeenCalledWith('cli_ask', 'om_root', expect.any(String), 'interactive', true, 'req-uuid-1');
     expect(send).not.toHaveBeenCalled();
   });
 
-  it('sends to chat when rootMessageId is absent and patches on settle', async () => {
+  it('sends to chat when rootMessageId is absent and patches on settle (forwards dispatchUuid)', async () => {
     const update = vi.fn(async () => undefined);
     const send = vi.fn(async () => 'om_send');
     const dispatcher = createLarkAskCardDispatcher({ sendMessage: send as any, updateMessage: update as any });
-    const ask = makePending({ rootMessageId: null, cardMessageId: 'om_card' });
+    const ask = makePending({ rootMessageId: null, cardMessageId: 'om_card', dispatchUuid: 'req-uuid-2' });
 
     await expect(dispatcher.send(ask)).resolves.toEqual({ messageId: 'om_send' });
-    expect(send).toHaveBeenCalledWith('cli_ask', 'oc_chat', expect.any(String), 'interactive');
+    expect(send).toHaveBeenCalledWith('cli_ask', 'oc_chat', expect.any(String), 'interactive', 'req-uuid-2');
 
     await dispatcher.onSettle?.(ask, {
       kind: 'timedOut',

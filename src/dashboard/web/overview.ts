@@ -18,6 +18,9 @@ export async function loadGroupsSnapshot(): Promise<void> {
 export type BotCard = {
   botName: string;
   larkAppId?: string;
+  /** 租户品牌，决定飞书后台深链的 host（feishu.cn vs larksuite.com）。
+   *  缺省（旧 payload / 未注册）→ larkConsoleUrl 内 normalizeBrand 兜底 feishu。 */
+  brand?: string;
   botAvatarUrl?: string;
   cliId: string;
   online: boolean;
@@ -53,6 +56,7 @@ export function buildBotCards(sessions: any[]): BotCard[] {
     if (b.botName) card.botName = b.botName;
     if (b.botAvatarUrl) card.botAvatarUrl = b.botAvatarUrl;
     if (b.cliId) card.cliId = b.cliId;
+    if (b.brand) card.brand = b.brand;
   }
   // 两遍：先 active 建卡，再让 closed 会话只补充已有卡（不为其单独出卡）
   const ordered = [...sessions].sort((a, b) => Number(a.status === 'closed') - Number(b.status === 'closed'));

@@ -386,10 +386,11 @@ describe('attention signals', () => {
     expect(start).toBeGreaterThanOrEqual(0);
     const end = src.indexOf('async function autoCreateDocSession(', start);
     expect(end).toBeGreaterThan(start);
-    // Bound the source-order assertion by the next top-level handler instead
+    // Bound the source-order assertion by the next top-level sibling instead
     // of a character count. Legitimate additions to handleThreadReply (for
-    // example CAS handoff paths) must not make this regression test silently
-    // inspect only the first part of the function.
+    // example master's CAS handoff paths or PR #597's admission and recovery
+    // guards) must not make this regression test silently inspect only the
+    // first part of the function.
     const region = src.slice(start, end);
     const clearIdx = region.indexOf('clearAgentAttentionForHumanInbound();');
     expect(clearIdx).toBeGreaterThanOrEqual(0);

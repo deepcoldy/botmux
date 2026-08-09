@@ -1,4 +1,5 @@
 import { extname } from 'node:path';
+import type { ManagedHookOrigin } from '../services/hook-runner.js';
 
 export type SendMessageFn = (
   larkAppId: string,
@@ -7,7 +8,7 @@ export type SendMessageFn = (
   msgType?: string,
   uuid?: string,
   hookContext?: Record<string, unknown>,
-  options?: { suppressHook?: boolean },
+  options?: { suppressHook?: boolean; beforeHook?: () => void | Promise<void>; hookOrigin?: ManagedHookOrigin },
 ) => Promise<string>;
 
 export type ReplyMessageFn = (
@@ -18,7 +19,7 @@ export type ReplyMessageFn = (
   replyInThread?: boolean,
   uuid?: string,
   hookContext?: Record<string, unknown>,
-  options?: { suppressHook?: boolean },
+  options?: { suppressHook?: boolean; beforeHook?: () => void | Promise<void>; hookOrigin?: ManagedHookOrigin },
 ) => Promise<string>;
 
 export type DispatchPrimaryDeps = {
@@ -48,6 +49,7 @@ export function findStdinAliasAttachment(paths: readonly string[]): string | nul
 export type SendFileAttachmentsDeps = {
   uploadFile: (appId: string, path: string) => Promise<string>;
   dispatch: (content: string, msgType: string) => Promise<string>;
+  beforeEffect?: () => void | Promise<void>;
 };
 
 export type SendFileAttachmentsResult = {
@@ -72,7 +74,9 @@ export async function sendFileAttachments(
   const failed: { path: string; error: string }[] = [];
   for (const fp of files) {
     try {
+      await deps.beforeEffect?.();
       const fileKey = await deps.uploadFile(appId, fp);
+      await deps.beforeEffect?.();
       sent.push(await deps.dispatch(JSON.stringify({ file_key: fileKey }), 'file'));
     } catch (err: any) {
       failed.push({ path: fp, error: err?.message ?? String(err) });
@@ -324,6 +328,7 @@ export type SendVideoAttachmentsDeps = {
    * replies set this to one because only the primary media message has a durable
    * action/provider identity; later bare media sends would duplicate on replay. */
   maxMessages?: number;
+  beforeEffect?: () => void | Promise<void>;
 };
 
 export type SendVideoAttachmentsResult = {
@@ -349,7 +354,9 @@ export async function sendVideoAttachments(
   let primaryUsed = false;
   for (const video of videos) {
     try {
+      await deps.beforeEffect?.();
       const fileKey = await deps.uploadFile(appId, video.videoPath);
+      await deps.beforeEffect?.();
       const imageKey = await deps.uploadImage(appId, video.coverPath);
       const content = JSON.stringify({
         file_key: fileKey,
@@ -357,6 +364,7 @@ export async function sendVideoAttachments(
         duration: video.durationMs,
       });
       const send = (!primaryUsed && deps.primaryDispatch) ? deps.primaryDispatch : deps.dispatch;
+      await deps.beforeEffect?.();
       const messageId = await send(content, 'media');
       primaryUsed = true;
       sent.push(messageId);
@@ -384,9 +392,14 @@ export type DispatchPrimaryOptions = {
   dispatch: (content: string, msgType: string, uuid?: string, suppressHook?: boolean) => Promise<string>;
   /** Provider UUID reconciliation must not repeat the local outbound hook. */
   suppressHook?: boolean;
+  /** Revalidate immediately before the distinct post-provider hook effect. */
+  beforeHook?: () => void | Promise<void>;
+  hookOrigin?: ManagedHookOrigin;
   /** Revalidate any side-effect authority after an awaited quote failure and
    * immediately before the fallback creates a top-level message. */
   beforeQuoteFallback?: () => void | Promise<void>;
+  /** Revalidate managed authority immediately before each provider call. */
+  beforeEffect?: () => void | Promise<void>;
   onQuoteWithdrawn?: (messageId: string) => void;
 };
 
@@ -400,6 +413,7 @@ export async function dispatchPrimaryMessage(
   opts: DispatchPrimaryOptions,
 ): Promise<DispatchPrimaryResult> {
   if (!opts.quoteTargetId) {
+    await opts.beforeEffect?.();
     return {
       messageId: await (opts.suppressHook
         ? opts.dispatch(opts.content, opts.msgType, opts.uuid, true)
@@ -409,6 +423,7 @@ export async function dispatchPrimaryMessage(
   }
 
   try {
+    await opts.beforeEffect?.();
     const args = [
       opts.appId,
       opts.quoteTargetId,
@@ -418,13 +433,26 @@ export async function dispatchPrimaryMessage(
       opts.uuid,
       opts.hookContext,
     ] as const;
-    const messageId = opts.suppressHook
-      ? await deps.replyMessage(...args, { suppressHook: true })
+    const hookOptions = opts.suppressHook
+      ? { suppressHook: true as const }
+      : opts.beforeHook
+        ? {
+            beforeHook: opts.beforeHook,
+            ...(opts.hookOrigin ? { hookOrigin: opts.hookOrigin } : {}),
+          }
+        : undefined;
+    const messageId = hookOptions
+      ? await deps.replyMessage(...args, hookOptions)
       : await deps.replyMessage(...args);
     return { messageId, primaryQuotedId: opts.quoteTargetId };
   } catch (err: any) {
     if (err instanceof opts.MessageWithdrawnError) {
-      await opts.beforeQuoteFallback?.();
+      // A quote failure is an awaited provider boundary.  Revalidate once
+      // immediately before the fallback effect: callers may provide a
+      // fallback-specific composite fence (for example VC + managed-origin),
+      // otherwise reuse the ordinary per-effect fence.
+      if (opts.beforeQuoteFallback) await opts.beforeQuoteFallback();
+      else await opts.beforeEffect?.();
       opts.onQuoteWithdrawn?.(opts.quoteTargetId);
       return {
         messageId: await (opts.suppressHook
@@ -437,14 +465,27 @@ export async function dispatchPrimaryMessage(
               opts.hookContext,
               { suppressHook: true },
             )
-          : deps.sendMessage(
-              opts.appId,
-              opts.targetChatId,
-              opts.content,
-              opts.msgType,
-              opts.uuid,
-              opts.hookContext,
-            )),
+          : opts.beforeHook
+            ? deps.sendMessage(
+                opts.appId,
+                opts.targetChatId,
+                opts.content,
+                opts.msgType,
+                opts.uuid,
+                opts.hookContext,
+                {
+                  beforeHook: opts.beforeHook,
+                  ...(opts.hookOrigin ? { hookOrigin: opts.hookOrigin } : {}),
+                },
+              )
+            : deps.sendMessage(
+                opts.appId,
+                opts.targetChatId,
+                opts.content,
+                opts.msgType,
+                opts.uuid,
+                opts.hookContext,
+              )),
         primaryQuotedId: null,
       };
     }

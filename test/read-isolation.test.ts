@@ -7,15 +7,24 @@ import {
   deviceCredentialIsolationMarkerPath,
   isCredentialIsolationReservedBasename,
   buildCredentialIsolationRules,
+  isolatedPaneOriginChannel,
   isolatedPaneReattachSafe,
   isolationPaneMarkerContent,
   ISOLATION_PANE_MARKER_VERSION,
+  isolationPanePolicyDigest,
   botHomePath,
   buildCliExecutableReadCarveOuts,
   sendCredFilePath,
   assertSafeAppId,
   normalizeIsolationPath,
 } from '../src/adapters/cli/read-isolation.js';
+
+const G1 = '11'.repeat(32);
+const POLICY1 = isolationPanePolicyDigest({
+  readIsolation: true,
+  writeSandbox: false,
+  readDenyExtraPaths: ['/private/a'],
+});
 
 describe('normalizeIsolationPath (path hardening)', () => {
   it('drops relative / traversal paths instead of silently keeping them', () => {
@@ -199,6 +208,108 @@ describe('isolatedPaneReattachSafe', () => {
     expect(isolatedPaneReattachSafe('')).toBe(false);
     expect(isolatedPaneReattachSafe('   ')).toBe(false);
   });
+
+  it('binds Darwin warm reattach to the pane channel and exact read/write policy', () => {
+    const marker = isolationPaneMarkerContent(
+      'boot-new',
+      ['credential', 'read'],
+      {
+        originChannelId: G1,
+        readIsolation: true,
+        writeSandbox: false,
+        policyDigest: POLICY1,
+      },
+    );
+    expect(isolatedPaneOriginChannel(marker)).toBe(G1);
+    expect(isolatedPaneReattachSafe(marker, {
+      requiredCapabilities: ['credential', 'read'],
+      readIsolation: true, writeSandbox: false, requireOriginChannel: true,
+      policyDigest: POLICY1,
+    })).toBe(true);
+    expect(isolatedPaneReattachSafe(marker, {
+      requiredCapabilities: ['credential', 'read'],
+      readIsolation: false, writeSandbox: false, requireOriginChannel: true,
+      policyDigest: POLICY1,
+    })).toBe(false);
+    const broadTmpDigest = isolationPanePolicyDigest({
+      readIsolation: true,
+      writeSandbox: true,
+      writeAllowExtraPaths: ['/custom/broad-tmp'],
+    });
+    const narrowTmpDigest = isolationPanePolicyDigest({
+      readIsolation: true,
+      writeSandbox: true,
+      writeAllowExtraPaths: ['/private/var/folders/narrow'],
+    });
+    const broadTmpMarker = isolationPaneMarkerContent('boot-old', ['credential', 'read', 'write'], {
+      originChannelId: G1,
+      readIsolation: true,
+      writeSandbox: true,
+      policyDigest: broadTmpDigest,
+    });
+    expect(isolatedPaneReattachSafe(broadTmpMarker, {
+      requiredCapabilities: ['credential', 'read', 'write'],
+      readIsolation: true,
+      writeSandbox: true,
+      requireOriginChannel: true,
+      policyDigest: narrowTmpDigest,
+    })).toBe(false);
+    expect(isolatedPaneReattachSafe(marker, {
+      requiredCapabilities: ['credential', 'read', 'write'],
+      readIsolation: true, writeSandbox: true, requireOriginChannel: true,
+      policyDigest: POLICY1,
+    })).toBe(false);
+    expect(isolatedPaneReattachSafe(marker, {
+      requiredCapabilities: ['credential', 'read'],
+      readIsolation: true,
+      writeSandbox: false,
+      requireOriginChannel: true,
+      policyDigest: isolationPanePolicyDigest({
+        readIsolation: true,
+        writeSandbox: false,
+        readDenyExtraPaths: ['/private/b'],
+      }),
+    })).toBe(false);
+    expect(isolatedPaneReattachSafe(JSON.stringify({
+      version: 4,
+      bootId: 'legacy-v4',
+      readIsolation: true,
+      writeSandbox: false,
+      originChannelId: G1,
+    }), {
+      requiredCapabilities: ['credential', 'read'],
+      readIsolation: true,
+      writeSandbox: false,
+      requireOriginChannel: true,
+      policyDigest: POLICY1,
+    })).toBe(false);
+    expect(isolatedPaneReattachSafe(isolationPaneMarkerContent(
+      'linux-v7', ['credential', 'read'],
+    ), {
+      requiredCapabilities: ['credential', 'read'],
+      requireOriginChannel: false,
+    })).toBe(true);
+    expect(isolatedPaneReattachSafe(isolationPaneMarkerContent(
+      'credential-only-v7', ['credential'],
+    ), {
+      requiredCapabilities: ['credential'],
+      exactCapabilities: true,
+      requireOriginChannel: false,
+    })).toBe(true);
+    expect(isolatedPaneReattachSafe(isolationPaneMarkerContent(
+      'old-broader-policy-v7', ['credential', 'read', 'write'],
+    ), {
+      requiredCapabilities: ['credential'],
+      exactCapabilities: true,
+      requireOriginChannel: false,
+    })).toBe(false);
+    expect(isolatedPaneReattachSafe(isolationPaneMarkerContent(
+      'linux-v7', ['credential', 'read'],
+    ), {
+      requiredCapabilities: ['credential', 'read'],
+      requireOriginChannel: true,
+    })).toBe(false);
+  });
 });
 
 // ─── cold-start migration: START-TIME env contract (bots.json EPERM fix) ──────
@@ -341,7 +452,8 @@ describe('worker capability carve-out ordering', () => {
     expect(credentialWrapperAt).toBeLessThan(spawnAt);
     expect(source).toContain('if (!willReattachPersistent && credentialOnlyBwrap)');
     expect(source).toContain('isCredentialIsolationReservedBasename(name)');
-    expect(source).toContain('isolatedPaneReattachSafe(marker, appliedIsolationCapabilities)');
+    expect(source).toContain('requiredCapabilities: appliedIsolationCapabilities');
+    expect(source).toContain('exactCapabilities: true');
   });
 });
 
@@ -349,9 +461,15 @@ describe('CLI protected capability wiring', () => {
   const cliSource = readFileSync(new URL('../src/cli.ts', import.meta.url), 'utf8');
   const vcSource = readFileSync(new URL('../src/cli/vc-agent.ts', import.meta.url), 'utf8');
 
-  it('passes the session id when resolving protected turn snapshots', () => {
+  it('requires host-file attestation when the fixed sentinel is kernel-denied', () => {
     expect(cliSource).toContain(
-      'const liveMarkerCtx = resolveSessionContext(\n    resolveDataDir(),\n    process.env.BOTMUX_SESSION_ID,',
+      'let liveMarkerCtx = findLiveAncestorSessionContext(sendDataDir);',
+    );
+    expect(cliSource).toContain(
+      'managedOriginIsolationSentinelAccess(osUserHomeDir)',
+    );
+    expect(cliSource).toContain(
+      'if (!relayDir && isolatedSendRequired && !isolatedCapabilityCtx)',
     );
     expect(cliSource).toContain(
       'const liveOrigin = resolveSessionContext(resolveDataDir(), sessionId);',

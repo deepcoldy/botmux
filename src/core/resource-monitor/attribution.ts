@@ -91,6 +91,22 @@ function collectSubtree(rootPid: number | undefined, children: Map<number, numbe
   return out;
 }
 
+/**
+ * Do a sampled process and a marker agree on the same process birth?
+ *
+ * Linux compares /proc start ticks, where the two producers are byte-identical.
+ * macOS compares ps(1) `lstart` strings, and the two producers format the
+ * day-of-month differently: `ps -p <pid>` keeps ps's space padding (`Aug  5`) while
+ * the sampler's bulk table is whitespace-split (`Aug 5`). Normalizing here rather
+ * than in readProcessStartIdentity() keeps the stamps already written into live
+ * marker files valid across an upgrade — the marker path must stay byte-exact.
+ */
+function sameProcessBirth(sampled: number | string | undefined, markerProcStart: string): boolean {
+  if (sampled === undefined) return false;
+  const collapse = (value: string): string => value.trim().replace(/\s+/g, ' ');
+  return collapse(String(sampled)) === collapse(markerProcStart);
+}
+
 function addPidTree(
   target: Set<number>,
   rootPid: number | undefined,
@@ -146,7 +162,7 @@ export function attributeResources(input: AttributionInput): AttributionResult {
   const markerPidsBySession = new Map<string, number[]>();
   for (const [pid, marker] of input.cliMarkers) {
     const proc = byPid.get(pid);
-    if (marker.procStart && (!proc || proc.startTicks === undefined || String(proc.startTicks) !== marker.procStart)) {
+    if (marker.procStart && (!proc || !sameProcessBirth(proc.startTicks, marker.procStart))) {
       continue;
     }
     const arr = markerPidsBySession.get(marker.sessionId) ?? [];

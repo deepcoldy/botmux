@@ -8,6 +8,7 @@ import {
   botAvatarHtml,
   botDisplayName,
   chatDisplayTitle,
+  larkConsoleUrl,
   loadNameMaps,
   relTime,
   stripMentionPrefix,
@@ -114,6 +115,7 @@ function alignPanelToSidebarBottom(panel: HTMLElement | null, propertyName: stri
 
 function MateCard({ card }: { card: BotCard }) {
   const tr = useT();
+  const consoleUrl = larkConsoleUrl(card.larkAppId, card.brand);
   const offline = !card.online && card.active.length === 0;
   const needsYou = card.attention.length > 0;
   const busy = card.busy.length > 0;
@@ -140,6 +142,20 @@ function MateCard({ card }: { card: BotCard }) {
 
   return (
     <article className={`mate${needsYou ? ' mate-attn' : ''}${offline ? ' mate-off' : ''}`}>
+      {consoleUrl ? (
+        <a
+          className="mate-console"
+          href={consoleUrl}
+          target="_blank"
+          rel="noopener noreferrer"
+          data-tip={tr('overview.botConsole')}
+          aria-label={tr('overview.botConsole')}
+        >
+          <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+            <path d="M7 17 17 7M9 7h8v8" />
+          </svg>
+        </a>
+      ) : null}
       <div className="mate-top">
         <Html html={botAvatarHtml({ name: card.botName, larkAppId: card.larkAppId, avatarUrl: card.botAvatarUrl, dot: dotClass })} />
         <div className="mate-id">

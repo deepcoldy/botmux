@@ -8,7 +8,10 @@
  *   botmux setup list|add|configure|edit|remove — scripted (non-TUI) bot management, see `botmux setup help`
  *   botmux start          — start daemon and auto plugin services
  *   botmux stop [--with-plugin] — stop daemon (optionally stop auto plugin services)
- *   botmux restart [--include-pm2] [--with-plugin] — restart daemon, then ensure auto plugin services
+ *   botmux restart [--include-pm2] [--with-plugin] — restart daemon, then ensure auto plugin services;
+ *     --include-pm2 is a zero-live-God admission fence, not authority to signal an existing PM2 God
+ *   botmux restart --bootstrap-shutdown-protocol --yes — operator-approved one-time retirement
+ *     of a pre-protocol fleet after independently confirming all Session/Riff work is idle
  *   botmux logs [--lines] — view daemon logs
  *   botmux status         — show daemon status
  *   botmux upgrade|update — upgrade to latest version
@@ -21,21 +24,24 @@
  *   botmux whiteboard status|enable|disable|current|list|read|update|write — local project whiteboard
  */
 import { execSync, execFileSync, spawnSync, spawn } from 'node:child_process';
-import { existsSync, mkdirSync, copyFileSync, readFileSync, writeFileSync, renameSync, readdirSync, readlinkSync, appendFileSync, statSync, unlinkSync, rmSync, realpathSync } from 'node:fs';
+import { existsSync, mkdirSync, copyFileSync, readFileSync, writeFileSync, renameSync, readdirSync, readlinkSync, symlinkSync, appendFileSync, statSync, unlinkSync, rmSync, realpathSync } from 'node:fs';
 import { underReadIsolation, sendCredFilePath } from './adapters/cli/read-isolation.js';
 import { atomicWriteFileSync } from './utils/atomic-write.js';
 import { join, dirname, basename, resolve } from 'node:path';
-import { homedir } from 'node:os';
+import { homedir, userInfo } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { createInterface } from 'node:readline';
 import { createRequire } from 'node:module';
-import { randomBytes } from 'node:crypto';
+import { randomBytes, randomUUID } from 'node:crypto';
 import { validateWorkingDir } from './core/working-dir.js';
-import { resolveSessionContext } from './core/session-marker.js';
+import {
+  findAncestorSessionContext as findLiveAncestorSessionContext,
+  resolveSessionContext,
+} from './core/session-marker.js';
 import { resolveBotmuxDataDir } from './core/data-dir.js';
 import { dashboardSecretPath } from './core/dashboard-secret.js';
-import { acceptedDispatchBotAppIds, activeConversationBotOpenIds, buildDispatchCompletionBrief, parseDispatchBotSpec, buildDispatchMessages, buildRepoPrimeText, buildReportContent, eligibleAutoMentionAliases, findDispatchRegistryEntry, foldableChatSessionAppIds, offTopicSubBotTopic, resolveReportTarget, resolveSendTarget, threadRootForReachability } from './core/dispatch.js';
-import { pickTurnReplyTarget } from './core/reply-target.js';
+import { acceptedDispatchBotAppIds, activeConversationBotOpenIds, buildDispatchCompletionBrief, parseDispatchBotSpec, buildDispatchMessages, buildRepoPrimeText, buildReportContent, eligibleAutoMentionAliases, findDispatchRegistryEntry, foldableChatSessionAppIds, offTopicSubBotTopic, resolveReportPlacement, resolveReportRecipient, resolveReportTarget, resolveSendTarget, threadRootForReachability } from './core/dispatch.js';
+import { pickTurnReplyTarget, collectTurnWindowParticipants } from './core/reply-target.js';
 import { recordDispatchRegistryEntry } from './core/dispatch-registry.js';
 import { enableAutostart, disableAutostart, autostartStatus, refreshAutostart } from './autostart.js';
 import { tmuxEnv } from './setup/ensure-tmux.js';
@@ -77,25 +83,82 @@ import {
 import { interactiveSelect, pickChoice, pickCliSelection } from './setup/interactive-select.js';
 import { buildPreset, serializePreset, presetFilename } from './setup/agent-preset.js';
 import type { CliId } from './adapters/cli/types.js';
+import type { CodexAppDispatchLedgerEntry } from './types.js';
+import {
+  validateCodexAppManagedSendOrigin,
+} from './utils/codex-app-dispatch-ledger.js';
+import { hasProtectedSessionMutationOwnership } from './core/session-mutation-guard.js';
 import type { BackendType, PersistentBackendTarget, SessionProbe } from './adapters/backend/types.js';
 import { logger } from './utils/logger.js';
+import { withFileLock, withFileLockSync } from './utils/file-lock.js';
 import { scrubClaudeSessionMarkerEnv, scrubSessionCliHomeEnv } from './utils/child-env.js';
 import { scheduleTimeZone } from './utils/timezone.js';
 import { expandHomePath, invalidWorkingDirs } from './utils/working-dir.js';
 import { firstPositional } from './cli/arg-utils.js';
 import { isColdResumeDormant, isRealManagedSession, sessionListDisposition } from './cli/session-list-liveness.js';
 import {
+  computeSessionPickerLayout,
+  type SessionPickerColumnKey,
+  type SessionPickerLayout,
+} from './cli/session-picker-layout.js';
+import { computeSessionPickerScrollWindow } from './cli/session-picker-viewport.js';
+import { terminalCellWidth } from './cli/terminal-width.js';
+import {
   attachFrozenManagedZmxSession,
   freezeManagedZmxAttachTarget,
 } from './cli/zmx-managed-attach.js';
+import { readSupervisorProcessStartIdentity } from './core/process-start-identity.js';
+import {
+  FLEET_DAEMON_EXIT_WAIT_MS,
+  FLEET_SUCCESSOR_SETTLE_MS,
+  PM2_DAEMON_KILL_TIMEOUT_MS,
+  PM2_DAEMON_RESTART_DELAY_MS,
+} from './core/shutdown-budgets.js';
+import {
+  isFleetEntryProvenFreeOfAutorestartTimer,
+  signalAndAwaitFleet,
+  type FleetProcessEntry,
+} from './cli/fleet-shutdown.js';
+import {
+  startExactPm2ProcessIds,
+  type Pm2ExactStartClient,
+} from './cli/pm2-exact-start.js';
 import { dispatchPrimaryMessage, findStdinAliasAttachment, normalizeInteractiveCardInput, sendFileAttachments, sendVideoAttachments, shouldSendAsPureVideo, validateVideoAttachments } from './cli/send-dispatch.js';
 import { dispatchDeferredTopicSend, reusableDeferredTopicRoot, type DeferredScheduleRunData } from './cli/deferred-topic-send.js';
 import { readDeferredTopicBinding } from './core/deferred-topic-binding.js';
 import { resolveDaemonEnv } from './cli/daemon-lifecycle-env.js';
 import { buildPm2SpawnCommand } from './cli/pm2-command.js';
+import { pm2ManagedExitConfig } from './pm2-graceful-exit.js';
+import {
+  parseCanonicalPm2Id,
+  parsePm2JlistOutput,
+  parsePm2JlistOutputStrict,
+  parsePm2Integer,
+} from './cli/pm2-jlist.js';
+import { assertLinuxPm2GodExecutableUsable } from './cli/pm2-preflight.js';
+import { assertNoUnregisteredLiveDaemonDescriptorsIn } from './cli/pm2-descriptor-guard.js';
+import { assertPm2DaemonShutdownCapabilitiesIn } from './cli/pm2-shutdown-capability.js';
+import { assertIncludePm2RestartAdmission } from './cli/pm2-god-admission.js';
+import {
+  requestAttestedDaemonShutdown,
+  requestAttestedDaemonShutdownBatch,
+} from './cli/supervisor-shutdown-client.js';
+import {
+  assertDaemonPm2GracefulExitPolicy,
+  assertConfiguredPm2FleetReady,
+  assertExactAttestedDaemonSet,
+  classifyStartBotFleetAdmission,
+  normalizeRawPm2StopExitCodes,
+  reconcileLatePm2StartPublication,
+  runBoundedPm2StartTransaction,
+} from './cli/pm2-start-transaction.js';
 import { callDashboard, type DashboardEndpoint, type DashboardResult } from './cli/dashboard-endpoint.js';
+import {
+  DASHBOARD_COMMAND_USAGE,
+  executeDashboardCommand,
+  formatDashboardFallbackFailure,
+} from './cli/dashboard-command.js';
 import { globalInstallUpdateLockTargetIn, installLatestBotmuxSync } from './core/maintenance.js';
-import { withFileLockSync } from './utils/file-lock.js';
 import {
   formatGlobalInstallCommand,
   resolveGlobalInstallPlan,
@@ -112,7 +175,20 @@ import {
   readWorkflowSessionRelayContext,
 } from './workflows/v3/session-relay-client.js';
 import { fetchDaemonIpc, loadDaemonIpcSecret } from './core/daemon-ipc-auth.js';
-import { readManagedOriginCapability } from './core/managed-origin-capability.js';
+import { isRetryableAskHttpStatus } from './core/ask-types.js';
+import {
+  hasManagedOriginIsolationMarker,
+  managedOriginDataRootProbeAccess,
+  managedOriginIsolationSentinelAccess,
+  managedOriginLegacyIsolationProbeAccess,
+  readManagedOriginRootLocator,
+  readManagedOriginCapability,
+} from './core/managed-origin-capability.js';
+import {
+  attestManagedOrigin,
+  type ManagedOriginAttestation,
+  type ManagedOriginAttestationContext,
+} from './core/managed-origin-attestation.js';
 import { rejectLikelyWindowsStdinMojibake, decodeStdinBytes } from './cli/stdin-encoding.js';
 import {
   formatBotInfoEntriesForCli,
@@ -143,7 +219,15 @@ import {
   buildBridgeSendMarkerContent,
   buildBridgeSendPreviewText,
 } from './services/bridge-fallback-gate.js';
-import { bindRestartLeaseTo, writeManualIntentIfAbsentTo } from './services/restart-intent-store.js';
+import {
+  bindRestartLeaseTo,
+  commitRestartIntentAttemptTo,
+  consumeRestartIntentTo,
+  removeRestartIntentAttemptTo,
+  type RestartIntent,
+  writeManualIntentIfAbsentTo,
+  writeRestartAttemptIntentTo,
+} from './services/restart-intent-store.js';
 import { repairMissingChatScope, stripLegacyPendingCardFields } from './services/session-store.js';
 import {
   evaluateVcMeetingManagedSend,
@@ -170,8 +254,6 @@ import {
   inspectBotmuxPm2Apps,
   isExactPm2BotActivationReceipt,
   managedActivationPm2Disposition,
-  parsePm2JlistOutputStrict as parsePm2JlistOutput,
-  stopExactPm2Process,
   type BotmuxPm2Inspection,
 } from './core/bot-live-control.js';
 import {
@@ -218,6 +300,18 @@ const PM2_NAME = 'botmux';
  * when those external pm2 installations get moved or removed.
  */
 const PM2_HOME = join(CONFIG_DIR, 'pm2');
+const PM2_FLEET_MUTATION_LOCK_TARGET = join(CONFIG_DIR, 'pm2-fleet-mutation');
+const PM2_START_COMMAND_TIMEOUT_MS = 30_000;
+const PM2_START_VERIFY_MIN_TIMEOUT_MS = 60_000;
+const PM2_START_VERIFY_PER_PROCESS_MS = 2_000;
+const PM2_START_LATE_PUBLICATION_SETTLE_MS = 10_000;
+
+function pm2StartVerifyTimeoutMs(processCount: number): number {
+  return Math.max(
+    PM2_START_VERIFY_MIN_TIMEOUT_MS,
+    Math.max(1, Math.floor(processCount)) * PM2_START_VERIFY_PER_PROCESS_MS,
+  );
+}
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -269,54 +363,85 @@ function pm2Env(home: string = PM2_HOME): NodeJS.ProcessEnv {
 }
 
 function listPm2GodDaemonPids(home: string = PM2_HOME): number[] {
-  if (process.platform !== 'linux') return [];
   const marker = `God Daemon (${home})`;
   const pids: number[] = [];
-  try {
-    for (const ent of readdirSync('/proc')) {
+  if (process.platform === 'linux') {
+    let entries: string[];
+    try { entries = readdirSync('/proc'); }
+    catch (err) {
+      throw new Error(`cannot inspect /proc for duplicate PM2 Gods: ${err instanceof Error ? err.message : err}`);
+    }
+    for (const ent of entries) {
       if (!/^\d+$/.test(ent)) continue;
       const pid = parseInt(ent, 10);
       if (!pid) continue;
       try {
         const cmd = readFileSync(`/proc/${pid}/cmdline`, 'utf-8').replace(/\u0000/g, ' ').trim();
         if (cmd.includes('PM2 v') && cmd.includes(marker)) pids.push(pid);
-      } catch { /* ignore unreadable proc entries */ }
+      } catch { /* another user's or already-exited process */ }
     }
-  } catch { /* ignore proc scan failure */ }
+    return pids.sort((a, b) => a - b);
+  }
+  if (process.platform === 'win32') {
+    const windowsScan = spawnSync('powershell.exe', [
+      '-NoProfile',
+      '-NonInteractive',
+      '-Command',
+      "$needle = \"God Daemon ($env:BOTMUX_PM2_SCAN_HOME)\"; "
+      + "Get-CimInstance Win32_Process | Where-Object { "
+      + "$_.CommandLine -and $_.CommandLine.Contains('PM2 v') "
+      + "-and $_.CommandLine.Contains($needle) } | ForEach-Object { $_.ProcessId }",
+    ], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+      timeout: 4_000,
+      env: { ...process.env, BOTMUX_PM2_SCAN_HOME: home },
+    });
+    if (windowsScan.status !== 0 || windowsScan.error) {
+      throw new Error(
+        `cannot inspect Windows process table for duplicate PM2 Gods: `
+        + `${windowsScan.error?.message ?? String(windowsScan.stderr || `status ${windowsScan.status}`).trim()}`,
+      );
+    }
+    for (const line of String(windowsScan.stdout).split(/\r?\n/)) {
+      const pid = parsePm2Integer(line.trim(), { nonNegative: true });
+      if (pid && pid > 1) pids.push(pid);
+    }
+    return [...new Set(pids)].sort((a, b) => a - b);
+  }
+  const ps = spawnSync('ps', ['-axo', 'pid=,command='], {
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'pipe'],
+    timeout: 2_000,
+  });
+  if (ps.status !== 0 || ps.error) {
+    throw new Error(
+      `cannot inspect process table for duplicate PM2 Gods: `
+      + `${ps.error?.message ?? String(ps.stderr || `status ${ps.status}`).trim()}`,
+    );
+  }
+  for (const line of String(ps.stdout).split(/\r?\n/)) {
+    if (!line.includes('PM2 v') || !line.includes(marker)) continue;
+    const match = line.match(/^\s*(\d+)\s+/);
+    if (match) pids.push(Number(match[1]));
+  }
   return pids.sort((a, b) => a - b);
 }
 
-function killDuplicatePm2GodDaemons(home: string = PM2_HOME): boolean {
+function listSingletonPm2GodDaemonPidsForMutation(home: string = PM2_HOME): number[] {
   const pids = listPm2GodDaemonPids(home);
-  if (pids.length <= 1) return false;
+  if (pids.length <= 1) return pids;
+  // Never signal a duplicate God automatically. Its SIGTERM handler may
+  // serially stop/force-kill managed children, including a Riff generation
+  // whose lineage is not yet durable in the surviving God's registry.
+  throw new Error(
+    `refusing PM2 mutation: multiple PM2 God daemons share ${home} `
+    + `(pids: ${pids.join(', ')}); no process was signalled`,
+  );
+}
 
-  const pidFile = join(home, 'pm2.pid');
-  let keepPid = 0;
-  if (existsSync(pidFile)) {
-    try {
-      const parsed = parseInt(readFileSync(pidFile, 'utf-8').trim(), 10);
-      if (pids.includes(parsed)) keepPid = parsed;
-    } catch { /* ignore malformed pid file */ }
-  }
-  if (!keepPid) keepPid = pids[pids.length - 1];
-
-  const dupes = pids.filter(pid => pid !== keepPid);
-  if (dupes.length === 0) return false;
-
-  for (const pid of dupes) {
-    try { process.kill(pid, 'SIGTERM'); } catch { /* ignore */ }
-    try {
-      process.kill(pid, 0);
-      process.kill(pid, 'SIGKILL');
-    } catch { /* ignore */ }
-  }
-
-  try {
-    atomicWriteFileSync(pidFile, `${keepPid}\n`);
-  } catch { /* ignore */ }
-
-  console.warn(`⚠️  检测到同一 PM2_HOME (${home}) 下存在多个 PM2 God Daemon，已清理重复实例；保留 pid ${keepPid}，移除: ${dupes.join(', ')}`);
-  return true;
+function assertNoDuplicatePm2GodDaemons(home: string = PM2_HOME): void {
+  listSingletonPm2GodDaemonPidsForMutation(home);
 }
 
 function runPm2(args: string[], inherit = true, home: string = PM2_HOME, timeoutMs?: number): void {
@@ -362,6 +487,70 @@ function pm2Capture(args: string[], home: string = PM2_HOME, timeoutMs = 10_000)
     throw new Error(`pm2 ${args.join(' ')} failed: ${detail}`);
   }
   return typeof r.stdout === 'string' ? r.stdout : '';
+}
+
+async function cmdInternalPm2StartExact(args: string[]): Promise<void> {
+  const processIds = args.map(value => Number(value));
+  try {
+    const claimedParent = parsePm2Integer(process.env.BOTMUX_PM2_FLEET_LOCK_OWNER_PID, {
+      nonNegative: true,
+    });
+    if (claimedParent !== process.ppid) {
+      throw new Error('internal exact PM2 start requires its live parent fleet-lock owner');
+    }
+    const lockPayload = readFileSync(`${PM2_FLEET_MUTATION_LOCK_TARGET}.lock`, 'utf8').trim();
+    let lockPid: number | undefined;
+    try {
+      const parsed = JSON.parse(lockPayload) as unknown;
+      lockPid = parsed && typeof parsed === 'object'
+        ? parsePm2Integer((parsed as Record<string, unknown>).pid, { nonNegative: true })
+        : undefined;
+    } catch {
+      lockPid = parsePm2Integer(lockPayload, { nonNegative: true });
+    }
+    if (lockPid !== process.ppid) {
+      throw new Error('internal exact PM2 start could not verify the parent fleet lock');
+    }
+    const pm2 = require('pm2') as { Client: Pm2ExactStartClient };
+    await startExactPm2ProcessIds(processIds, pm2.Client);
+  } catch (err) {
+    console.error(err instanceof Error ? err.message : String(err));
+    process.exitCode = 1;
+  }
+}
+
+function runExactPm2Starts(
+  entries: FleetProcessEntry[],
+  home: string,
+  timeoutMs: number,
+): void {
+  const processIds = entries.map(entry => entry.pmId);
+  if (processIds.some(id => !Number.isInteger(id) || (id as number) < 0)) {
+    throw new Error('conditional PM2 compensation requires an exact pm_id for every entry');
+  }
+  const boundedTimeoutMs = Math.floor(timeoutMs);
+  if (boundedTimeoutMs <= 0) {
+    throw new Error('fleet deadline exhausted before conditional PM2 compensation');
+  }
+  const result = spawnSync(
+    process.execPath,
+    [__filename, '__pm2-start-exact', ...processIds.map(String)],
+    {
+      stdio: 'pipe',
+      env: {
+        ...pm2Env(home),
+        BOTMUX_PM2_FLEET_LOCK_OWNER_PID: String(process.pid),
+      },
+      timeout: boundedTimeoutMs,
+      encoding: 'utf8',
+    },
+  );
+  if (result.status !== 0) {
+    const detail = result.error?.message
+      ?? result.stderr?.trim()
+      ?? `status ${result.status}`;
+    throw new Error(`conditional PM2 compensation failed: ${detail}`);
+  }
 }
 
 function loadBotsJson(): any[] {
@@ -498,38 +687,81 @@ async function cmdServe(args: string[]): Promise<void> {
   });
 }
 
-function ecosystemConfig(activationAppId?: string): string {
+/**
+ * pm2-safe interpreter path.
+ *
+ * pm2 (>=6, lib/Common.js) treats ANY interpreter path containing the
+ * substring `node@` as an nvm version handle and tries to `nvm install` it —
+ * so a Homebrew keg-only Node (e.g.
+ * `/home/linuxbrew/.linuxbrew/Cellar/node@22/22.23.1/bin/node`) is misread as
+ * version `22/22.23.1/bin/node`, and every `botmux start/restart` dies with
+ * `Version '22/22.23.1/bin/node' not found`.
+ *
+ * We can't just point at a different existing binary: the keg-only formula's
+ * only paths (Cellar/, opt/, and — when it's not the default — bin/) all
+ * contain `node@`. So when process.execPath carries `node@`, we materialize a
+ * stable `@`-free symlink under ~/.botmux and hand pm2 THAT. The symlink still
+ * resolves to the exact Node that launched this CLI (same version → native
+ * modules like node-pty keep working), but its path no longer trips pm2's
+ * nvm heuristic. Non-Homebrew installs keep using process.execPath verbatim.
+ */
+function pm2SafeInterpreter(): string {
+  const exec = process.execPath;
+  if (!exec.includes('node@')) return exec;
+  const link = join(CONFIG_DIR, 'node-interpreter');
+  try {
+    mkdirSync(CONFIG_DIR, { recursive: true });
+    // Refresh the link if missing or pointing at a stale Node (e.g. after a
+    // Homebrew upgrade bumped the patch version under the same install).
+    let current: string | undefined;
+    try { current = readlinkSync(link); } catch { /* not a symlink / absent */ }
+    if (current !== exec) {
+      try { unlinkSync(link); } catch { /* absent */ }
+      symlinkSync(exec, link);
+    }
+    // Sanity: the link must still resolve to a real node. If anything is off,
+    // fall back to the raw path rather than handing pm2 a dangling symlink.
+    if (realpathSync(link) && !link.includes('node@')) return link;
+  } catch {
+    /* fall through to raw execPath */
+  }
+  return exec;
+}
+
+function ecosystemConfig(
+  bots: any[] = loadBotsJson(),
+  activationAppId?: string,
+): string {
   const daemonScript = join(PKG_ROOT, 'dist', 'index-daemon.js');
-  const bots = loadBotsJson();
   ensureUniqueBotProcessNames(bots);
   const daemonEnv = resolveDaemonEnv(
     process.env,
     existsSync(ENV_FILE) ? readFileSync(ENV_FILE, 'utf-8') : undefined,
   );
+  const managedExit = pm2ManagedExitConfig();
+
+  // Node binary every managed process is pinned to (see pm2SafeInterpreter).
+  const interpreter = pm2SafeInterpreter();
 
   const baseApp = {
     script: daemonScript,
     // Pin every managed core process to the Node that invoked this CLI. This
     // keeps GUI/launchd starts independent from PATH and lets Desktop replace
     // an external fleet without also killing unrelated plugin services.
-    interpreter: process.execPath,
+    interpreter,
     cwd: CONFIG_DIR,
     autorestart: true,
     max_restarts: 10,
-    restart_delay: 3000,
-    // A graceful daemon shutdown exits 0 (SIGTERM/SIGINT → drain → process.exit(0)).
-    // Tell pm2 that exit 0 is intentional so it does NOT autorestart the daemon
-    // while `botmux restart` is tearing the fleet down — otherwise pm2 revives
-    // each daemon (after restart_delay) the instant our parallel SIGTERM drains
-    // it, and re-deleting those revivals one-by-one re-serializes the teardown
-    // (~13s of churn for 31 bots). Crashes (non-zero exit / killed by signal)
-    // are NOT in this list, so genuine crash-autorestart is preserved.
-    stop_exit_codes: [0],
-    // pm2's default kill_timeout (1.6s) is SHORTER than the daemon's own
-    // SHUTDOWN_GRACE_MS (3s), so any daemon pm2 has to signal directly gets
-    // SIGKILL'd mid-drain → orphaned (ppid=1) workers. Give pm2 headroom past
-    // the daemon's graceful-drain budget so it never force-kills mid-shutdown.
-    kill_timeout: 3500,
+    restart_delay: PM2_DAEMON_RESTART_DELAY_MS,
+    // PM2 maps signal-only death to exit_code=0 before applying
+    // stop_exit_codes. Zero cannot be a graceful sentinel: SIGKILL/OOM during
+    // a prepared Riff drain would otherwise suppress autorestart and look safe
+    // to delete. Only shutdown()'s fully committed success exits the reserved
+    // non-zero code. All signal deaths and ordinary failures still restart.
+    stop_exit_codes: managedExit.stopExitCodes,
+    // Keep the supervisor outside every bounded Riff prepare/commit/refusal
+    // handshake so PM2 cannot SIGKILL a correct daemon mid-ACK.
+    kill_timeout: PM2_DAEMON_KILL_TIMEOUT_MS,
     log_date_format: 'YYYY-MM-DD HH:mm:ss',
     merge_logs: true,
     node_args: [
@@ -585,6 +817,7 @@ function ecosystemConfig(activationAppId?: string): string {
       out_file: join(LOG_DIR, `daemon-${i}-out.log`),
       env: {
         ...daemonEnv,
+        ...managedExit.env,
         SESSION_DATA_DIR: DATA_DIR,
         BOTMUX_BOT_INDEX: String(i),
         BOTMUX_LARK_APP_ID: appId,
@@ -605,20 +838,21 @@ function ecosystemConfig(activationAppId?: string): string {
   apps.push({
     name: 'botmux-dashboard',
     script: join(PKG_ROOT, 'dist', 'dashboard.js'),
-    interpreter: process.execPath,
+    interpreter,
     cwd: PKG_ROOT,
     autorestart: true,
     max_restarts: 10,
-    restart_delay: 3000,
-    // Same rationale as the bot daemons: don't let pm2 revive on graceful exit-0
-    // during a fleet teardown, and don't SIGKILL mid-shutdown. (See baseApp.)
-    stop_exit_codes: [0],
+    restart_delay: PM2_DAEMON_RESTART_DELAY_MS,
+    // Dashboard receives the same managed sentinel env and exits through
+    // gracefulProcessExitCode(), so its stop policy must match the daemon's.
+    stop_exit_codes: managedExit.stopExitCodes,
     kill_timeout: 3500,
     error_file: join(LOG_DIR, 'dashboard-error.log'),
     out_file: join(LOG_DIR, 'dashboard-out.log'),
     merge_logs: true,
     env: {
       ...daemonEnv,
+      ...managedExit.env,
       // MUST match the bot daemons' SESSION_DATA_DIR: the dashboard shares
       // pairings/federations/memberships with them via {dataDir}/*.json. Without
       // it the dashboard falls back to an install-relative ../data and reads a
@@ -1656,7 +1890,7 @@ async function cmdSetupScripted(argv: string[]): Promise<void> {
       );
       return;
     }
-    const live = ensureBotDaemonStarted(bot.larkAppId, { quiet: cmd.json });
+    const live = await ensureBotDaemonStarted(bot.larkAppId, { quiet: cmd.json });
     const next = live.ok ? 'live' : (live.reason === 'fleet_down' ? 'botmux start' : 'botmux restart');
     if (cmd.json) {
       console.log(JSON.stringify({
@@ -1929,7 +2163,7 @@ async function cmdSetupScripted(argv: string[]): Promise<void> {
       return;
     }
     // daemon 在跑就直接把新 bot 那一个进程拉起来，免整组 botmux restart。
-    const live = ensureBotDaemonStarted(bot.larkAppId, { quiet: cmd.json });
+    const live = await ensureBotDaemonStarted(bot.larkAppId, { quiet: cmd.json });
     const next = live.ok ? 'live' : (live.reason === 'fleet_down' ? 'botmux start' : 'botmux restart');
     if (cmd.json) {
       console.log(JSON.stringify({
@@ -2271,7 +2505,7 @@ async function cmdSetup(): Promise<void> {
     console.log(`\n✅ 已添加机器人 ${newBot.larkAppId}，共 ${bots.length + 1} 个`);
     console.log(`   配置文件: ${BOTS_JSON_FILE}`);
     await finishOpenPlatformSetup(newBot.larkAppId, botBrand(newBot), { reuseOnly: hasSetupWebSession(newBot) });
-    printAddBotLiveHint(newBot.larkAppId);
+    await printAddBotLiveHint(newBot.larkAppId);
     return;
     }
 
@@ -2328,7 +2562,7 @@ async function cmdSetup(): Promise<void> {
     console.log(`   配置文件: ${BOTS_JSON_FILE}`);
     console.log(`   旧配置已备份: ${ENV_FILE}.bak`);
     await finishOpenPlatformSetup(newBot.larkAppId, botBrand(newBot), { reuseOnly: hasSetupWebSession(newBot) });
-    printAddBotLiveHint(newBot.larkAppId);
+    await printAddBotLiveHint(newBot.larkAppId);
 
   } else {
     // --- Fresh install ---
@@ -2347,38 +2581,19 @@ async function cmdSetup(): Promise<void> {
  * the daemon, but the error gets buried in pm2 logs and the user sees
  * silence.
  *
- * Detects two cases and either auto-heals or aborts with a clear message:
- *   1. pm2 god daemon's running binary is deleted → auto `pm2 kill`
+ * Detects two cases and aborts with a clear message:
+ *   1. pm2 god daemon's running binary is deleted → fail closed; an automatic
+ *      kill could bypass a managed daemon's Riff shutdown protocol
  *   2. This package is installed under an nvm Node version that no longer
  *      exists on disk → abort with reinstall instructions
  */
-function preflightNodeSanity(): void {
-  // Case 1: pm2 god is alive but its Node binary has been deleted.
-  const pm2PidFile = join(PM2_HOME, 'pm2.pid');
-  if (existsSync(pm2PidFile)) {
-    let pm2Pid = 0;
-    try { pm2Pid = parseInt(readFileSync(pm2PidFile, 'utf-8').trim(), 10); } catch { /* ignore */ }
-    if (pm2Pid) {
-      let pm2Alive = false;
-      try { process.kill(pm2Pid, 0); pm2Alive = true; } catch { /* not alive */ }
-      if (pm2Alive && process.platform === 'linux') {
-        // On Linux, /proc/<pid>/exe is a symlink to the running executable.
-        // readlink includes a " (deleted)" suffix when the on-disk file is gone.
-        try {
-          const exe = readlinkSync(`/proc/${pm2Pid}/exe`);
-          const cleanPath = exe.replace(/ \(deleted\)$/, '');
-          const exeDeleted = exe.endsWith(' (deleted)') || !existsSync(cleanPath);
-          if (exeDeleted) {
-            console.warn(`⚠️  pm2 god daemon (pid ${pm2Pid}) 使用的 Node 二进制已失效: ${cleanPath}`);
-            console.warn(`   自动杀掉 pm2 god 以便用当前 Node 重启...`);
-            try {
-              runPm2(['kill'], false, PM2_HOME, 10_000);
-            } catch {
-              try { process.kill(pm2Pid, 'SIGKILL'); } catch { /* ignore */ }
-            }
-          }
-        } catch { /* /proc not readable, skip */ }
-      }
+function preflightNodeSanity(home: string = PM2_HOME): void {
+  // `pm2.pid` is only a cache. Inspect every God actually enumerated for this
+  // PM2_HOME and refuse rather than guessing which generation is authoritative.
+  const actualGodPids = listPm2GodDaemonPids(home);
+  if (process.platform === 'linux') {
+    for (const pm2Pid of actualGodPids) {
+      assertLinuxPm2GodExecutableUsable(pm2Pid);
     }
   }
 
@@ -2409,8 +2624,6 @@ async function cmdStart(): Promise<void> {
     process.exit(1);
   }
   ensureConfigDir();
-  killDuplicatePm2GodDaemons();
-  preflightNodeSanity();
   await ensureSystemDependencies();
 
   // 启动前快速校验每个 bot 的凭证. Codex review 边界 #5: 凭证无效是
@@ -2446,9 +2659,70 @@ async function cmdStart(): Promise<void> {
     }
   }
 
-  cleanupLegacyPm2();
-  const cfg = ecosystemConfig();
-  runPm2(['start', cfg]);
+  await withFileLock(PM2_FLEET_MUTATION_LOCK_TARGET, async () => {
+    await withFileLock(BOTS_JSON_FILE, async () => {
+      const lockedBots = loadBotsJson();
+      if (JSON.stringify(lockedBots) !== JSON.stringify(botsForCheck)) {
+        throw new Error('[start] bots.json changed during credential preflight; retry with the new configuration');
+      }
+      assertNoDuplicatePm2GodDaemons();
+      preflightNodeSanity();
+      cleanupLegacyPm2();
+      const currentProjection = readVerifiedBotmuxPm2Projection('start');
+      assertNoUnregisteredLiveDaemonDescriptors('start', currentProjection);
+      assertCanonicalUniquePm2Rows('start', currentProjection);
+      const configuredNames = configuredCoreProcessNames(lockedBots);
+      const verifyTimeoutMs = pm2StartVerifyTimeoutMs(configuredNames.length);
+      const cfg = ecosystemConfig(lockedBots);
+      const liveEntries = currentProjection.filter(isLivePm2Entry);
+      if (liveEntries.length > 0) {
+        try {
+          readAndAssertConfiguredFleetOnline(
+            'start-idempotent-ready',
+            configuredNames,
+            PM2_HOME,
+            verifyTimeoutMs,
+          );
+          return;
+        } catch (error) {
+          throw new Error(
+            `[start] refusing PM2 start while a partial/live core fleet exists `
+            + `(${liveEntries.map(entry => `${entry.name}:${entry.pid}`).join(', ')}): `
+            + `${error instanceof Error ? error.message : String(error)}; `
+            + 'use start-bot only for an exact one-missing-bot fleet, or restart',
+          );
+        }
+      }
+      const unprovenDormant = currentProjection.filter(
+        entry => !isFleetEntryProvenFreeOfAutorestartTimer(entry),
+      );
+      if (unprovenDormant.length > 0) {
+        throw new Error(
+          `[start] refusing PM2 start: dormant row(s) may still have a restart timer `
+          + `(${unprovenDormant.map(entry => `${entry.name}:${entry.status ?? 'unknown'}`).join(', ')})`,
+        );
+      }
+      runBoundedPm2StartTransaction(
+        'start',
+        PM2_START_COMMAND_TIMEOUT_MS,
+        verifyTimeoutMs,
+        {
+          start: timeoutMs => {
+            assertBotsConfigSnapshotUnchanged('start', lockedBots);
+            assertNoDuplicatePm2GodDaemons();
+            preflightNodeSanity();
+            runPm2(['start', cfg], true, PM2_HOME, timeoutMs);
+          },
+          verifyFresh: timeoutMs => readAndAssertConfiguredFleetOnline(
+            'start-after-launch', configuredNames, PM2_HOME, timeoutMs,
+          ),
+          rollback: () => rollbackPm2StartAttempt(
+            'start', currentProjection, configuredNames,
+          ),
+        },
+      );
+    }, { maxWaitMs: 5_000 });
+  }, { maxWaitMs: 5_000 });
   await reconcilePluginServicesForCli(undefined, { autoOnly: true });
   const bots = loadBotsJson();
   const count = bots.length || 1;
@@ -2494,81 +2768,670 @@ function isBotmuxCoreProcessName(name: string): boolean {
   return name === PM2_NAME || (name.startsWith(`${PM2_NAME}-`) && !name.startsWith(`${PM2_NAME}-plugin-`));
 }
 
-function deleteAllBotmuxProcesses(home: string = PM2_HOME): void {
-  let entries: Array<{ name: string; pid: number; online: boolean }>;
-  try {
-    const apps = parsePm2JlistOutput(pm2Capture(['jlist'], home));
-    entries = (Array.isArray(apps) ? apps : [])
-      .filter(a => a && isBotmuxCoreProcessName(String(a.name)))
-      .map(a => ({ name: String(a.name), pid: Number(a.pid) || 0, online: a?.pm2_env?.status === 'online' }));
-  } catch (e) {
-    console.error(`[restart] pm2 jlist failed (pm2 not running or no apps?): ${e instanceof Error ? e.message : e}`);
-    return;
-  }
-  if (entries.length === 0) return;
-  const names = entries.map(e => e.name);
+function isBotmuxDaemonProcessName(name: string): boolean {
+  return isBotmuxCoreProcessName(name) && name !== 'botmux-dashboard';
+}
 
-  // Parallel graceful shutdown. pm2's own delete stops apps one-at-a-time
-  // (async eachLimit, concurrency 1) and each botmux daemon's drain eats pm2's
-  // full kill_timeout (~1.6s) → ~N×1.6s serial (~38s for 31 bots). Instead we
-  // SIGTERM every online daemon AT ONCE so their graceful drains overlap (the
-  // daemon's SIGTERM handler detaches workers within SHUTDOWN_GRACE_MS), wait
-  // once for them all to exit, then let pm2 delete reap the now-dead entries
-  // instantly. Orphan-safe: each daemon runs its FULL graceful drain and we wait
-  // for real exit before pm2 touches it — avoiding the mid-drain SIGKILL the old
-  // path forced (pm2 kill_timeout 1.6s < daemon SHUTDOWN_GRACE_MS 3s).
-  const pids = entries.filter(e => e.online && e.pid > 0).map(e => e.pid);
-  for (const pid of pids) {
-    try { process.kill(pid, 'SIGTERM'); } catch { /* already gone */ }
-  }
-  // Poll until every signalled daemon has exited (bounded). SHUTDOWN_GRACE_MS is
-  // 3s; give headroom. Exits early the moment the last one dies.
-  const deadline = Date.now() + 5_000;
-  let alive = pids.slice();
-  while (alive.length > 0 && Date.now() < deadline) {
-    sleepSyncMs(50);
-    alive = alive.filter(pid => { try { process.kill(pid, 0); return true; } catch { return false; } });
-  }
+type BotmuxPm2ProcessEntry = FleetProcessEntry;
 
-  // Reap pm2 entries. Processes are already dead → each delete is instant, and
-  // ONE batched `pm2 delete name1 name2 …` collapses N pm2 CLI cold-boots
-  // (~315ms each) into one. A revived (autorestart, gated by restart_delay)
-  // instance is still removed by name.
-  const batchTimeout = Math.max(15_000, names.length * 2_500);
+function toBotmuxPm2ProcessEntry(app: any): BotmuxPm2ProcessEntry {
+  const rawStopExitCodes = app?.pm2_env?.stop_exit_codes;
+  const pmId = parseCanonicalPm2Id(app);
+  const exitCode = parsePm2Integer(app?.pm2_env?.exit_code);
+  return {
+    name: String(app.name),
+    ...(pmId !== undefined ? { pmId } : {}),
+    pid: Number(app.pid) || 0,
+    online: app?.pm2_env?.status === 'online',
+    status: String(app?.pm2_env?.status ?? 'unknown'),
+    autorestart: app?.pm2_env?.autorestart,
+    stopExitCodes: normalizeRawPm2StopExitCodes(rawStopExitCodes),
+    ...(exitCode !== undefined ? { exitCode } : {}),
+  };
+}
+
+function readVerifiedBotmuxPm2Projection(
+  operation: string,
+  home: string = PM2_HOME,
+  timeoutMs = 10_000,
+): BotmuxPm2ProcessEntry[] {
   try {
-    runPm2(['delete', ...names], false, home, batchTimeout);
-    return;
-  } catch (e) {
-    // pm2's batched delete (async eachLimit) aborts on the first failed name,
-    // so a mid-batch failure can leave stragglers. Fall back to the resilient
-    // per-name loop that try/catches each name independently.
-    console.error(`[restart] batched pm2 delete failed, falling back to per-name: ${e instanceof Error ? e.message : e}`);
-  }
-  for (const name of names) {
-    try {
-      runPm2(['delete', name], false, home, 10_000);
-    } catch (e) {
-      // Don't swallow silently — a failed delete here used to leave the
-      // restart half-done with no trace. Surface it (the auto-restart
-      // driver captures stderr to ~/.botmux/logs/maintenance-restart.log).
-      console.error(`[restart] pm2 delete ${name} failed: ${e instanceof Error ? e.message : e}`);
-    }
+    return parsePm2JlistOutputStrict(pm2Capture(['jlist'], home, timeoutMs))
+      .filter(app => app && isBotmuxCoreProcessName(String(app.name)))
+      .map(toBotmuxPm2ProcessEntry);
+  } catch (err) {
+    throw new Error(
+      `[${operation}] pm2 jlist failed; refusing an unverified PM2 mutation: `
+      + `${err instanceof Error ? err.message : String(err)}`,
+    );
   }
 }
 
-function killPm2GodDaemon(home: string = PM2_HOME): void {
+function assertNoUnregisteredLiveDaemonDescriptors(
+  operation: string,
+  projections: BotmuxPm2ProcessEntry[],
+): void {
+  assertNoUnregisteredLiveDaemonDescriptorsIn(
+    operation,
+    projections,
+    join(resolveDataDir(), 'dashboard-daemons'),
+  );
+}
+
+function duplicatePm2CoreNames(entries: BotmuxPm2ProcessEntry[]): string[] {
+  return [...new Set(entries.map(entry => entry.name))]
+    .filter(name => entries.filter(entry => entry.name === name).length > 1);
+}
+
+function isLivePm2Entry(entry: BotmuxPm2ProcessEntry): boolean {
+  if (!Number.isInteger(entry.pid) || entry.pid <= 1) return false;
+  try { process.kill(entry.pid, 0); return true; } catch { return false; }
+}
+
+function configuredCoreProcessNames(
+  bots: any[] = loadBotsJson(),
+  activationAppId?: string,
+): string[] {
+  const names: string[] = [];
+  bots.forEach((bot, index) => {
+    const appId = typeof bot?.larkAppId === 'string' ? bot.larkAppId : '';
+    const starting = bot?.activationStarting;
+    const committed = bot?.activationCommitted;
+    const deactivating = bot?.activationDeactivating;
+    const conflicting = starting !== undefined && committed !== undefined;
+    const marker = starting ?? committed;
+    const validMarker = (
+      marker
+      && typeof marker === 'object'
+      && !Array.isArray(marker)
+      && marker.appId === appId
+      && typeof marker.jobId === 'string'
+      && marker.jobId
+    );
+    if (
+      bot?.activationPending === true
+      || deactivating !== undefined
+      || conflicting
+      || (
+        (starting !== undefined || committed !== undefined)
+        && (!validMarker || activationAppId !== appId)
+      )
+    ) return;
+    names.push(botProcessName(bot, index, PM2_NAME));
+  });
+  names.push('botmux-dashboard');
+  return names;
+}
+
+function assertBotsConfigSnapshotUnchanged(operation: string, snapshot: any[]): void {
+  if (JSON.stringify(loadBotsJson()) === JSON.stringify(snapshot)) return;
+  throw new Error(`[${operation}] bots.json generation changed before PM2 start; no launch attempted`);
+}
+
+function readAndAssertConfiguredFleetOnline(
+  operation: string,
+  configuredNames: string[],
+  home: string = PM2_HOME,
+  timeoutMs: number = PM2_START_VERIFY_MIN_TIMEOUT_MS,
+): BotmuxPm2ProcessEntry[] {
+  const deadline = Date.now() + Math.max(1, Math.floor(timeoutMs));
+  let lastError: unknown;
+  while (Date.now() < deadline) {
+    try {
+      const remainingMs = Math.max(1, deadline - Date.now());
+      const projection = readVerifiedBotmuxPm2Projection(operation, home, remainingMs);
+      assertNoUnregisteredLiveDaemonDescriptors(operation, projection);
+      assertConfiguredPm2FleetReady(
+        operation,
+        projection,
+        configuredNames,
+        pid => { try { process.kill(pid, 0); return true; } catch { return false; } },
+        readyEntries => {
+          const daemonEntries = readyEntries.filter(entry => isBotmuxDaemonProcessName(entry.name));
+          assertDaemonPm2GracefulExitPolicy(
+            `${operation}-handler-ready-pm2-policy`,
+            daemonEntries,
+          );
+          const attested = assertPm2DaemonShutdownCapabilitiesIn(
+            `${operation}-handler-ready`,
+            daemonEntries.map(entry => ({ name: entry.name, pid: entry.pid })),
+            join(resolveDataDir(), 'dashboard-daemons'),
+          );
+          assertExactAttestedDaemonSet(
+            `${operation}-handler-ready`,
+            daemonEntries,
+            attested.map(entry => entry.pid),
+            pid => { try { process.kill(pid, 0); return true; } catch { return false; } },
+          );
+          for (const target of attested) {
+            if (readSupervisorProcessStartIdentity(target.pid) !== target.processStartIdentity) {
+              throw new Error(
+                `[${operation}-handler-ready] daemon generation changed after capability scan: `
+                + `${target.name}/${target.pid}`,
+              );
+            }
+          }
+          if (readyEntries
+            .filter(entry => !isBotmuxDaemonProcessName(entry.name))
+            .some(entry => !isLivePm2Entry(entry))) {
+            throw new Error(`[${operation}] dashboard exited during handler-ready verification`);
+          }
+        },
+      );
+      return projection;
+    } catch (error) {
+      lastError = error;
+      const remainingMs = deadline - Date.now();
+      if (remainingMs <= 0) break;
+      sleepSyncMs(Math.min(100, remainingMs));
+    }
+  }
+  throw new Error(
+    `[${operation}] configured fleet never reached PM2-online plus handler-ready capability `
+    + `within ${timeoutMs}ms: ${lastError instanceof Error ? lastError.message : String(lastError)}`,
+  );
+}
+
+function assertCanonicalUniquePm2Rows(
+  operation: string,
+  entries: BotmuxPm2ProcessEntry[],
+): void {
+  const duplicateNames = duplicatePm2CoreNames(entries);
+  const missingIds = entries.filter(entry =>
+    !Number.isSafeInteger(entry.pmId) || (entry.pmId as number) < 0);
+  const duplicateIds = [...new Set(entries
+    .map(entry => entry.pmId)
+    .filter((id): id is number => Number.isSafeInteger(id)))]
+    .filter(id => entries.filter(entry => entry.pmId === id).length > 1);
+  const duplicateLivePids = [...new Set(entries
+    .map(entry => entry.pid)
+    .filter(pid => Number.isSafeInteger(pid) && pid > 1))]
+    .filter(pid => entries.filter(entry => entry.pid === pid).length > 1);
+  if (duplicateNames.length === 0
+      && missingIds.length === 0
+      && duplicateIds.length === 0
+      && duplicateLivePids.length === 0) return;
+  throw new Error(
+    `[${operation}] refusing PM2 mutation: canonical registry identity is ambiguous`
+    + (duplicateNames.length > 0 ? ` (duplicate names: ${duplicateNames.join(', ')})` : '')
+    + (duplicateIds.length > 0 ? ` (duplicate pm_id: ${duplicateIds.join(', ')})` : '')
+    + (duplicateLivePids.length > 0
+      ? ` (duplicate positive pid: ${duplicateLivePids.join(', ')})`
+      : '')
+    + (missingIds.length > 0
+      ? ` (missing pm_id: ${missingIds.map(entry => entry.name).join(', ')})`
+      : ''),
+  );
+}
+
+function exactQuiescentRowsForMutation(
+  operation: string,
+  originals: BotmuxPm2ProcessEntry[],
+  fresh: BotmuxPm2ProcessEntry[],
+): BotmuxPm2ProcessEntry[] {
+  const exact: BotmuxPm2ProcessEntry[] = [];
+  for (const original of originals) {
+    const rows = fresh.filter(entry => entry.name === original.name);
+    if (rows.length === 0) continue;
+    if (rows.length !== 1 || rows[0]!.pmId !== original.pmId) {
+      throw new Error(
+        `[${operation}] refusing PM2 mutation: registry row ${original.name} was recreated or duplicated`,
+      );
+    }
+    if (isLivePm2Entry(rows[0]!)) {
+      throw new Error(
+        `[${operation}] refusing PM2 mutation: live generation appeared for `
+        + `${original.name}:${rows[0]!.pid}`,
+      );
+    }
+    if (!isFleetEntryProvenFreeOfAutorestartTimer(rows[0]!)) {
+      throw new Error(
+        `[${operation}] refusing PM2 mutation: ${original.name} may still publish a successor`,
+      );
+    }
+    exact.push(rows[0]!);
+  }
+  return exact;
+}
+
+function revalidateExactQuiescentRowBeforeMutation(
+  operation: string,
+  original: BotmuxPm2ProcessEntry,
+  allOriginals: BotmuxPm2ProcessEntry[],
+  home: string = PM2_HOME,
+  additionalDescriptorAuthority: BotmuxPm2ProcessEntry[] = [],
+): BotmuxPm2ProcessEntry | undefined {
+  assertNoDuplicatePm2GodDaemons(home);
+  const fresh = readVerifiedBotmuxPm2Projection(operation, home);
+  assertNoUnregisteredLiveDaemonDescriptors(
+    operation,
+    [...fresh, ...additionalDescriptorAuthority],
+  );
+  assertCanonicalUniquePm2Rows(operation, fresh);
+  return exactQuiescentRowsForMutation(operation, allOriginals, fresh)
+    .find(entry => entry.name === original.name);
+}
+
+function signalAndAwaitBotmuxProcesses(
+  entries: BotmuxPm2ProcessEntry[],
+  operation: 'restart' | 'stop',
+  home: string = PM2_HOME,
+  additionalDescriptorAuthority: BotmuxPm2ProcessEntry[] = [],
+): void {
+  assertCanonicalUniquePm2Rows(operation, entries);
+  const processNameByPid = new Map<number, string>();
+  const processEntryByPid = new Map<number, BotmuxPm2ProcessEntry>();
+  const processStartByPid = new Map<number, string>();
+  const rememberProcessIdentity = (
+    identityOperation: string,
+    entry: BotmuxPm2ProcessEntry,
+  ): void => {
+    if (entry.pid <= 1) return;
+    const identity = readSupervisorProcessStartIdentity(entry.pid);
+    if (!identity) {
+      if (!isLivePm2Entry(entry)) return;
+      throw new Error(
+        `[${identityOperation}] cannot bind ${entry.name}/${entry.pid} to a process-start identity`,
+      );
+    }
+    processNameByPid.set(entry.pid, entry.name);
+    processEntryByPid.set(entry.pid, entry);
+    processStartByPid.set(entry.pid, identity);
+  };
+  for (const entry of entries) rememberProcessIdentity(`${operation}-initial-identity`, entry);
+
+  const assertShutdownCapability = (
+    capabilityOperation: string,
+    targets: BotmuxPm2ProcessEntry[],
+  ) => {
+    const daemonTargets = targets.filter(entry => isBotmuxDaemonProcessName(entry.name));
+    assertDaemonPm2GracefulExitPolicy(capabilityOperation, daemonTargets);
+    return assertPm2DaemonShutdownCapabilitiesIn(
+      capabilityOperation,
+      daemonTargets.map(entry => ({ name: entry.name, pid: entry.pid })),
+      join(resolveDataDir(), 'dashboard-daemons'),
+    );
+  };
+  assertShutdownCapability(
+    `${operation}-shutdown-capability-preflight`,
+    entries.filter(entry => entry.online && entry.pid > 1),
+  );
+
+  const list = (timeoutMs: number): BotmuxPm2ProcessEntry[] => {
+    const projection = parsePm2JlistOutputStrict(pm2Capture(
+      ['jlist'],
+      home,
+      Math.min(10_000, Math.max(1, Math.floor(timeoutMs))),
+    ))
+      .filter(app => app && isBotmuxCoreProcessName(String(app.name)))
+      .map(toBotmuxPm2ProcessEntry);
+    assertNoUnregisteredLiveDaemonDescriptors(
+      `${operation}-successor-projection`,
+      [...projection, ...additionalDescriptorAuthority],
+    );
+    assertCanonicalUniquePm2Rows(`${operation}-successor-projection`, projection);
+    for (const entry of projection) {
+      rememberProcessIdentity(`${operation}-successor-identity`, entry);
+    }
+    return projection;
+  };
+
+  const shutdownRequestFailures: string[] = [];
+  const recordShutdownFailure = (name: string, pid: number, error: unknown): void => {
+    shutdownRequestFailures.push(
+      `${name}/${pid}: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  };
+  const signalDashboardResidual = (name: string, pid: number): void => {
+    const expectedStart = processStartByPid.get(pid);
+    const currentStart = readSupervisorProcessStartIdentity(pid);
+    if (!currentStart) return;
+    if (!expectedStart || currentStart !== expectedStart) {
+      recordShutdownFailure(name, pid, 'dashboard process generation changed');
+      return;
+    }
+    try { process.kill(pid, 'SIGTERM'); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException)?.code !== 'ESRCH') {
+        recordShutdownFailure(name, pid, error);
+      }
+    }
+  };
+
   try {
-    runPm2(['kill'], true, home, 15_000);
-    return;
-  } catch {
-    // Fall back to direct pid cleanup below.
+    signalAndAwaitFleet(entries, operation, FLEET_DAEMON_EXIT_WAIT_MS, {
+      signal: pid => {
+        const name = processNameByPid.get(pid);
+        if (!name) {
+          throw new Error(`[${operation}] refusing signal for unmapped PM2 daemon pid ${pid}`);
+        }
+        if (isBotmuxDaemonProcessName(name)) {
+          try {
+            const successor = processEntryByPid.get(pid);
+            if (!successor) {
+              recordShutdownFailure(name, pid, 'successor PM2 policy projection is missing');
+              return;
+            }
+            const authorized = assertShutdownCapability(
+              `${operation}-successor-immediately-before-request`,
+              [successor],
+            );
+            const target = authorized.find(entry => entry.pid === pid);
+            if (!target) {
+              recordShutdownFailure(name, pid, 'daemon exited before exact IPC attestation');
+              return;
+            }
+            requestAttestedDaemonShutdown(target, loadDaemonIpcSecret());
+          } catch (error) {
+            recordShutdownFailure(name, pid, error);
+          }
+          return;
+        }
+        signalDashboardResidual(name, pid);
+      },
+      signalInitial: targets => {
+        let authorized;
+        try {
+          authorized = assertShutdownCapability(
+            `${operation}-initial-immediately-before-batch-request`,
+            targets as BotmuxPm2ProcessEntry[],
+          );
+        } catch (error) {
+          for (const target of targets.filter(entry => isBotmuxDaemonProcessName(entry.name))) {
+            recordShutdownFailure(target.name, target.pid, error);
+          }
+          return;
+        }
+        const expectedDaemonTargets = targets
+          .filter(entry => isBotmuxDaemonProcessName(entry.name));
+        const authorizedPids = new Set(authorized.map(entry => entry.pid));
+        for (const target of expectedDaemonTargets) {
+          if (!authorizedPids.has(target.pid)) {
+            recordShutdownFailure(
+              target.name,
+              target.pid,
+              'daemon exited before initial exact IPC attestation',
+            );
+          }
+        }
+        let attempts;
+        try {
+          attempts = requestAttestedDaemonShutdownBatch(authorized, loadDaemonIpcSecret());
+        } catch (error) {
+          attempts = authorized.map(target => ({ target, ok: false, error: String(error) }));
+        }
+        for (const attempt of attempts) {
+          if (!attempt.ok) {
+            recordShutdownFailure(
+              attempt.target.name,
+              attempt.target.pid,
+              attempt.error ?? 'supervisor shutdown request refused',
+            );
+          }
+        }
+        for (const target of targets.filter(entry => !isBotmuxDaemonProcessName(entry.name))) {
+          signalDashboardResidual(target.name, target.pid);
+        }
+      },
+      assertSignalAuthorityComplete: () => {
+        if (shutdownRequestFailures.length > 0) {
+          throw new Error(shutdownRequestFailures.join('; '));
+        }
+      },
+      isAlive: pid => { try { process.kill(pid, 0); return true; } catch { return false; } },
+      now: () => Date.now(),
+      sleep: sleepSyncMs,
+      startOffline: (offlineEntries, timeoutMs) => {
+        runExactPm2Starts(offlineEntries, home, Math.min(10_000, timeoutMs));
+      },
+      list,
+      successorSettleMs: FLEET_SUCCESSOR_SETTLE_MS,
+    });
+  } catch (error) {
+    if (shutdownRequestFailures.length === 0) throw error;
+    throw new Error(
+      `${error instanceof Error ? error.message : String(error)}; `
+      + `shutdown request refusal(s): ${shutdownRequestFailures.join('; ')}`,
+    );
+  }
+}
+
+function rollbackPm2StartAttempt(
+  operation: string,
+  before: BotmuxPm2ProcessEntry[],
+  candidateNames: string[],
+  home: string = PM2_HOME,
+): void {
+  const candidateSet = new Set(candidateNames);
+  reconcileLatePm2StartPublication(
+    operation,
+    PM2_START_LATE_PUBLICATION_SETTLE_MS,
+    FLEET_DAEMON_EXIT_WAIT_MS + PM2_START_LATE_PUBLICATION_SETTLE_MS,
+    {
+      now: () => Date.now(),
+      sleep: sleepSyncMs,
+      reconcileOnce: () => {
+        assertNoDuplicatePm2GodDaemons(home);
+        const fresh = readVerifiedBotmuxPm2Projection(`${operation}-rollback-read`, home);
+        assertNoUnregisteredLiveDaemonDescriptors(`${operation}-rollback-read`, fresh);
+        assertCanonicalUniquePm2Rows(`${operation}-rollback-read`, fresh);
+        const attemptedRows = fresh.filter(entry => candidateSet.has(entry.name));
+
+        for (const row of attemptedRows) {
+          const priorRows = before.filter(entry => entry.name === row.name);
+          if (priorRows.length > 1
+              || (priorRows.length === 1 && priorRows[0]!.pmId !== row.pmId)
+              || (priorRows.length === 1 && isLivePm2Entry(priorRows[0]!))) {
+            throw new Error(
+              `[${operation}] cannot prove ownership of partial-launch row ${row.name}/${row.pmId}`,
+            );
+          }
+        }
+
+        const rowsNeedingCompensation = attemptedRows.filter(row => {
+          const prior = before.find(entry => entry.name === row.name);
+          if (!prior) return true;
+          return isLivePm2Entry(row) || !isFleetEntryProvenFreeOfAutorestartTimer(row);
+        });
+        if (rowsNeedingCompensation.length > 0) {
+          const shutdownRows = rowsNeedingCompensation.map(entry => {
+            if (isLivePm2Entry(entry)) return { ...entry, online: true };
+            if (isFleetEntryProvenFreeOfAutorestartTimer(entry)) return entry;
+            return { ...entry, online: false, status: 'stopped', autorestart: false };
+          });
+          signalAndAwaitBotmuxProcesses(shutdownRows, 'stop', home);
+          for (const original of rowsNeedingCompensation) {
+            const exact = revalidateExactQuiescentRowBeforeMutation(
+              `${operation}-rollback-before-mutation`,
+              original,
+              rowsNeedingCompensation,
+              home,
+            );
+            if (!exact) continue;
+            const existedBefore = before.some(entry =>
+              entry.name === original.name && entry.pmId === original.pmId);
+            runPm2(
+              [existedBefore ? 'stop' : 'delete', String(exact.pmId)],
+              false,
+              home,
+              10_000,
+            );
+          }
+          return false;
+        }
+
+        const restored = candidateNames.every(name => {
+          const prior = before.find(entry => entry.name === name);
+          const rows = attemptedRows.filter(entry => entry.name === name);
+          if (!prior) return rows.length === 0;
+          return rows.length === 1
+            && rows[0]!.pmId === prior.pmId
+            && !isLivePm2Entry(rows[0]!)
+            && isFleetEntryProvenFreeOfAutorestartTimer(rows[0]!);
+        });
+        if (!restored) {
+          throw new Error(`[${operation}] rollback could not prove the pre-start registry shape`);
+        }
+        return true;
+      },
+    },
+  );
+}
+
+function deleteAllBotmuxProcesses(
+  home: string = PM2_HOME,
+  additionalDescriptorAuthority: BotmuxPm2ProcessEntry[] = [],
+): void {
+  assertNoDuplicatePm2GodDaemons(home);
+  let entries: BotmuxPm2ProcessEntry[];
+  try {
+    entries = parsePm2JlistOutputStrict(pm2Capture(['jlist'], home))
+      .filter(a => a && isBotmuxCoreProcessName(String(a.name)))
+      .map(toBotmuxPm2ProcessEntry);
+  } catch (e) {
+    throw new Error(
+      `[restart] pm2 jlist failed; refusing to start a second fleet without a safe shutdown view: `
+      + `${e instanceof Error ? e.message : e}`,
+    );
+  }
+  assertNoUnregisteredLiveDaemonDescriptors(
+    'restart',
+    [...entries, ...additionalDescriptorAuthority],
+  );
+  assertCanonicalUniquePm2Rows('restart', entries);
+  if (entries.length === 0) return;
+  const names = entries.map(e => e.name);
+
+  signalAndAwaitBotmuxProcesses(entries, 'restart', home, additionalDescriptorAuthority);
+
+  const deleteErrors: string[] = [];
+  for (const entry of entries) {
+    try {
+      const exact = revalidateExactQuiescentRowBeforeMutation(
+        'restart-before-delete',
+        entry,
+        entries,
+        home,
+        additionalDescriptorAuthority,
+      );
+      if (!exact) continue;
+      runPm2(['delete', String(exact.pmId)], false, home, 10_000);
+    } catch (e) {
+      const message = e instanceof Error ? e.message : String(e);
+      deleteErrors.push(`${entry.name}: ${message}`);
+      console.error(`[restart] pm2 delete ${entry.name}/${entry.pmId} failed: ${message}`);
+    }
   }
 
-  for (const pid of listPm2GodDaemonPids(home)) {
-    try { process.kill(pid, 'SIGTERM'); } catch { /* already gone */ }
+  let remaining: string[];
+  try {
+    const targetNames = new Set(names);
+    const freshProjection = parsePm2JlistOutputStrict(pm2Capture(['jlist'], home))
+      .filter(app => app && isBotmuxCoreProcessName(String(app.name)))
+      .map(toBotmuxPm2ProcessEntry);
+    assertNoUnregisteredLiveDaemonDescriptors(
+      'restart-after-delete',
+      [...freshProjection, ...additionalDescriptorAuthority],
+    );
+    exactQuiescentRowsForMutation('restart-after-delete', entries, freshProjection);
+    remaining = freshProjection
+      .filter(entry => targetNames.has(entry.name))
+      .map(entry => entry.name);
+  } catch (err) {
+    throw new Error(
+      `[restart] PM2 delete verification failed; refusing to report a clean fleet: `
+      + `${err instanceof Error ? err.message : String(err)}`,
+    );
   }
-  for (const pid of listPm2GodDaemonPids(home)) {
-    try { process.kill(pid, 0); process.kill(pid, 'SIGKILL'); } catch { /* already gone */ }
+  if (remaining.length > 0) {
+    throw new Error(
+      `[restart] PM2 delete left registry entries: ${[...new Set(remaining)].join(', ')}`
+      + (deleteErrors.length > 0 ? ` (${deleteErrors.join('; ')})` : ''),
+    );
+  }
+}
+
+/**
+ * Explicit first-upgrade escape hatch for a live fleet that predates the
+ * authenticated shutdown protocol. This intentionally bypasses descriptor
+ * capability attestation, but only behind a named flag plus --yes. Every PM2
+ * delete is still bound to the exact name + pm_id + PID + process birth read
+ * before the first mutation and revalidated immediately before that mutation.
+ */
+function bootstrapDeleteAllBotmuxProcesses(
+  operation: 'stop' | 'restart',
+  home: string = PM2_HOME,
+): void {
+  assertNoDuplicatePm2GodDaemons(home);
+  const readProjection = (phase: string): BotmuxPm2ProcessEntry[] => {
+    const apps = parsePm2JlistOutputStrict(pm2Capture(['jlist'], home));
+    const projection = (Array.isArray(apps) ? apps : [])
+      .filter(app => app && isBotmuxCoreProcessName(String(app.name)))
+      .map(toBotmuxPm2ProcessEntry);
+    assertCanonicalUniquePm2Rows(`${operation}-bootstrap-${phase}`, projection);
+    return projection;
+  };
+
+  const entries = readProjection('initial');
+  const identities = new Map<number, string>();
+  for (const entry of entries) {
+    if (!Number.isInteger(entry.pmId)) {
+      throw new Error(
+        `[${operation}] bootstrap refused: ${entry.name} has no canonical PM2 id`,
+      );
+    }
+    if (entry.pid > 1 && isLivePm2Entry(entry)) {
+      const identity = readSupervisorProcessStartIdentity(entry.pid);
+      if (!identity) {
+        throw new Error(
+          `[${operation}] bootstrap refused: cannot bind ${entry.name}/${entry.pid} to a process birth`,
+        );
+      }
+      identities.set(entry.pmId!, identity);
+    }
+  }
+
+  for (const original of entries) {
+    const fresh = readProjection(`before-delete-${original.pmId}`);
+    const exact = fresh.filter(entry => entry.pmId === original.pmId);
+    if (exact.length !== 1 || exact[0]!.name !== original.name) {
+      throw new Error(
+        `[${operation}] bootstrap refused: PM2 row ${original.name}/${original.pmId} changed before delete`,
+      );
+    }
+    const current = exact[0]!;
+    const expectedBirth = identities.get(original.pmId!);
+    if (expectedBirth) {
+      const currentBirth = current.pid > 1
+        ? readSupervisorProcessStartIdentity(current.pid)
+        : undefined;
+      if (current.pid !== original.pid
+          || !isLivePm2Entry(current)
+          || currentBirth !== expectedBirth) {
+        throw new Error(
+          `[${operation}] bootstrap refused: process generation changed for `
+          + `${original.name}/${original.pmId}`,
+        );
+      }
+    } else if (isLivePm2Entry(current)) {
+      throw new Error(
+        `[${operation}] bootstrap refused: dormant PM2 row ${original.name}/${original.pmId} became live`,
+      );
+    }
+    runPm2(
+      ['delete', String(current.pmId)],
+      false,
+      home,
+      FLEET_DAEMON_EXIT_WAIT_MS,
+    );
+  }
+
+  const remaining = readProjection('after-delete');
+  if (remaining.length > 0) {
+    throw new Error(
+      `[${operation}] bootstrap retirement incomplete: `
+      + remaining.map(entry => `${entry.name}/${entry.pmId}`).join(', '),
+    );
   }
 }
 
@@ -2579,40 +3442,116 @@ function killPm2GodDaemon(home: string = PM2_HOME): void {
  * truth. Only touches processes named `botmux` or `botmux-*` — the user's
  * unrelated pm2 apps are left untouched. No-op on fresh installs.
  */
-function cleanupLegacyPm2(): boolean {
+function cleanupLegacyPm2(
+  bootstrapOperation?: 'stop' | 'restart',
+): boolean {
   const legacyHome = join(homedir(), '.pm2');
   if (legacyHome === PM2_HOME) return false;
-  const legacyPidFile = join(legacyHome, 'pm2.pid');
-  if (!existsSync(legacyPidFile)) return false;
-
-  let legacyPid = 0;
-  try { legacyPid = parseInt(readFileSync(legacyPidFile, 'utf-8').trim(), 10); } catch { return false; }
-  if (!legacyPid) return false;
-  // If the legacy daemon isn't alive anymore there's nothing to clean.
-  try { process.kill(legacyPid, 0); } catch { return false; }
-
-  deleteAllBotmuxProcesses(legacyHome);
+  const legacyGodPids = listPm2GodDaemonPids(legacyHome);
+  if (legacyGodPids.length === 0) return false;
+  assertNoDuplicatePm2GodDaemons(legacyHome);
+  preflightNodeSanity(legacyHome);
+  assertNoDuplicatePm2GodDaemons(legacyHome);
+  if (bootstrapOperation) bootstrapDeleteAllBotmuxProcesses(bootstrapOperation, legacyHome);
+  else {
+    const currentProjection = readVerifiedBotmuxPm2Projection('legacy-cleanup-authority');
+    deleteAllBotmuxProcesses(legacyHome, currentProjection);
+  }
   return true;
 }
 
 async function cmdStop(): Promise<void> {
   const includePluginServices = process.argv.includes('--with-plugin');
-  killDuplicatePm2GodDaemons();
-  cleanupLegacyPm2();
-  let stopped = false;
-  try {
-    const output = pm2Capture(['jlist']);
-    const apps = parsePm2JlistOutput(output);
-    for (const app of apps) {
-      if (isBotmuxCoreProcessName(String(app.name))) {
-        try { runPm2(['stop', app.name]); stopped = true; } catch { /* */ }
+  const bootstrapShutdownProtocol = process.argv.includes('--bootstrap-shutdown-protocol');
+  const bootstrapConfirmed = process.argv.includes('--yes');
+  if (bootstrapShutdownProtocol && !bootstrapConfirmed) {
+    throw new Error(
+      '[stop] --bootstrap-shutdown-protocol requires --yes after confirming every Session/Riff workload is idle',
+    );
+  }
+  ensureConfigDir();
+  await withFileLock(PM2_FLEET_MUTATION_LOCK_TARGET, async () => {
+    assertNoDuplicatePm2GodDaemons();
+    cleanupLegacyPm2(bootstrapShutdownProtocol ? 'stop' : undefined);
+    if (bootstrapShutdownProtocol) {
+      bootstrapDeleteAllBotmuxProcesses('stop');
+      cleanupStaleDaemonDescriptors();
+      if (includePluginServices) {
+        await stopPluginServicesForCli(undefined, { autoOnly: true });
+      }
+      console.log('daemon 已通过一次性 shutdown-protocol bootstrap 安全边界停止。');
+      return;
+    }
+    let entries: BotmuxPm2ProcessEntry[];
+    try {
+      entries = parsePm2JlistOutputStrict(pm2Capture(['jlist']))
+        .filter(app => app && isBotmuxCoreProcessName(String(app.name)))
+        .map(toBotmuxPm2ProcessEntry);
+    } catch (err) {
+      throw new Error(
+        `[stop] pm2 jlist failed; refusing an unverified stop: `
+        + `${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+    assertNoUnregisteredLiveDaemonDescriptors('stop', entries);
+    assertCanonicalUniquePm2Rows('stop', entries);
+    if (entries.length === 0) {
+      cleanupStaleDaemonDescriptors();
+      if (includePluginServices) {
+        await stopPluginServicesForCli(undefined, { autoOnly: true });
+      }
+      console.log('daemon 未在运行。');
+      return;
+    }
+    signalAndAwaitBotmuxProcesses(entries, 'stop');
+    const beforeStop = readVerifiedBotmuxPm2Projection('stop-before-registry-mutation');
+    assertNoUnregisteredLiveDaemonDescriptors('stop-before-registry-mutation', beforeStop);
+    exactQuiescentRowsForMutation('stop-before-registry-mutation', entries, beforeStop);
+
+    const stopErrors: string[] = [];
+    for (const entry of entries) {
+      try {
+        const exact = revalidateExactQuiescentRowBeforeMutation(
+          'stop-immediately-before-registry-mutation',
+          entry,
+          entries,
+        );
+        if (!exact) continue;
+        runPm2(['stop', String(exact.pmId)], false, PM2_HOME, 10_000);
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        stopErrors.push(`${entry.name}: ${message}`);
+        console.error(`[stop] pm2 stop ${entry.name} failed: ${message}`);
       }
     }
-  } catch { /* */ }
-  // Wipe abandoned dashboard-daemon descriptors left behind by stopped daemons.
-  cleanupStaleDaemonDescriptors();
-  if (includePluginServices) await stopPluginServicesForCli(undefined, { autoOnly: true });
-  if (!stopped) console.log('daemon 未在运行。');
+    let nonStoppedResidual: string[];
+    try {
+      const targetNames = new Set(entries.map(entry => entry.name));
+      const freshProjection = parsePm2JlistOutputStrict(pm2Capture(['jlist']))
+        .filter(app => app && isBotmuxCoreProcessName(String(app.name)))
+        .map(toBotmuxPm2ProcessEntry);
+      assertNoUnregisteredLiveDaemonDescriptors('stop-after-registry-mutation', freshProjection);
+      exactQuiescentRowsForMutation('stop-after-registry-mutation', entries, freshProjection);
+      nonStoppedResidual = freshProjection
+        .filter(entry => targetNames.has(entry.name) && entry.status !== 'stopped')
+        .map(entry => `${entry.name}:${entry.status ?? 'unknown'}`);
+    } catch (err) {
+      throw new Error(
+        `[stop] PM2 stop verification failed: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+    if (stopErrors.length > 0 || nonStoppedResidual.length > 0) {
+      throw new Error(
+        `[stop] PM2 registry mutation incomplete`
+        + (nonStoppedResidual.length > 0
+          ? ` (not stopped: ${[...new Set(nonStoppedResidual)].join(', ')})`
+          : '')
+        + (stopErrors.length > 0 ? ` (errors: ${stopErrors.join('; ')})` : ''),
+      );
+    }
+    cleanupStaleDaemonDescriptors();
+    if (includePluginServices) await stopPluginServicesForCli(undefined, { autoOnly: true });
+  }, { maxWaitMs: 5_000 });
 }
 
 async function cmdRestart(): Promise<void> {
@@ -2634,39 +3573,112 @@ async function cmdRestart(): Promise<void> {
     process.exit(1);
   }
   ensureConfigDir();
-  const includePm2 = process.argv.includes('--include-pm2');
-  const includePluginServices = process.argv.includes('--with-plugin');
-  // Drop a restart-intent breadcrumb so the fresh daemon knows this was an
-  // intentional restart and DMs the owner a summary. `IfAbsent` preserves a
-  // richer breadcrumb (update / auto-restart) already written by the
-  // maintenance timer that spawned this very `botmux restart`. A pm2
-  // crash-autorestart bypasses this path → no breadcrumb → silent.
-  try {
-    const now = Date.now();
-    writeManualIntentIfAbsentTo(resolveDataDir(), now, new Date(now).toISOString());
-  } catch { /* breadcrumb is best-effort */ }
-  killDuplicatePm2GodDaemons();
-  preflightNodeSanity();
-  await ensureSystemDependencies();
-  const cfg = ecosystemConfig();
-  cleanupLegacyPm2();
-  // Delete all botmux processes (handles both old single-process and new multi-process)
-  deleteAllBotmuxProcesses();
-  if (includePluginServices) await stopPluginServicesForCli(undefined, { autoOnly: true });
-  if (includePm2) {
-    killPm2GodDaemon();
-  }
-  // Wipe abandoned dashboard-daemon descriptors left behind by killed daemons.
-  cleanupStaleDaemonDescriptors();
-  runPm2(['start', cfg]);
-  // Default restart preserves running plugin services, then ensures every auto
-  // service is online. --with-plugin changes only the pre-restart side above:
-  // it explicitly stops auto services first, so this ensure becomes a restart.
-  await reconcilePluginServicesForCli(undefined, { autoOnly: true });
-  if (refreshAutostart({ pkgRoot: PKG_ROOT, configDir: CONFIG_DIR, logDir: LOG_DIR })) {
-    console.log(`autostart unit 已同步到当前 Node/cli.js 路径`);
-  }
-  await printDashboardHintWithRetry();
+  await withFileLock(PM2_FLEET_MUTATION_LOCK_TARGET, async () => {
+    const includePm2 = process.argv.includes('--include-pm2');
+    const includePluginServices = process.argv.includes('--with-plugin');
+    const bootstrapShutdownProtocol = process.argv.includes('--bootstrap-shutdown-protocol');
+    const bootstrapConfirmed = process.argv.includes('--yes');
+    if (bootstrapShutdownProtocol && !bootstrapConfirmed) {
+      throw new Error(
+        '[restart] --bootstrap-shutdown-protocol requires --yes after confirming every Session/Riff workload is idle',
+      );
+    }
+    if (bootstrapShutdownProtocol && includePm2) {
+      throw new Error('[restart] --bootstrap-shutdown-protocol cannot be combined with --include-pm2');
+    }
+    if (includePm2) {
+      assertIncludePm2RestartAdmission(listPm2GodDaemonPids());
+    }
+
+    const restartIntentDir = resolveDataDir();
+    let stagedRestartIntent: RestartIntent | null = null;
+    try {
+      stagedRestartIntent = consumeRestartIntentTo(restartIntentDir, Date.now());
+    } catch { /* intent reporting is best-effort */ }
+
+    assertNoDuplicatePm2GodDaemons();
+    preflightNodeSanity();
+    await ensureSystemDependencies();
+    cleanupLegacyPm2(bootstrapShutdownProtocol ? 'restart' : undefined);
+    if (bootstrapShutdownProtocol) bootstrapDeleteAllBotmuxProcesses('restart');
+    else deleteAllBotmuxProcesses();
+    if (includePluginServices) await stopPluginServicesForCli(undefined, { autoOnly: true });
+    cleanupStaleDaemonDescriptors();
+
+    const retiredProjection = readVerifiedBotmuxPm2Projection('restart-start');
+    assertNoUnregisteredLiveDaemonDescriptors('restart-start', retiredProjection);
+    if (retiredProjection.length > 0) {
+      throw new Error(
+        `[restart-start] new PM2 core row(s) appeared after verified retirement: `
+        + retiredProjection.map(entry => `${entry.name}:${entry.pid}`).join(', '),
+      );
+    }
+
+    await withFileLock(BOTS_JSON_FILE, async () => {
+      const restartBots = loadBotsJson();
+      const cfg = ecosystemConfig(restartBots);
+      const restartAttemptId = randomBytes(16).toString('hex');
+      let restartIntentPrepared = false;
+      try {
+        const now = Date.now();
+        writeRestartAttemptIntentTo(
+          restartIntentDir,
+          stagedRestartIntent ?? { kind: 'manual', at: new Date(now).toISOString() },
+          now,
+          restartAttemptId,
+        );
+        restartIntentPrepared = true;
+      } catch { /* breadcrumb is best-effort */ }
+
+      try {
+        const configuredNames = configuredCoreProcessNames(restartBots);
+        const verifyTimeoutMs = pm2StartVerifyTimeoutMs(configuredNames.length);
+        runBoundedPm2StartTransaction(
+          'restart-start',
+          PM2_START_COMMAND_TIMEOUT_MS,
+          verifyTimeoutMs,
+          {
+            start: timeoutMs => {
+              assertBotsConfigSnapshotUnchanged('restart-start', restartBots);
+              assertNoDuplicatePm2GodDaemons();
+              preflightNodeSanity();
+              runPm2(['start', cfg], true, PM2_HOME, timeoutMs);
+            },
+            verifyFresh: timeoutMs => readAndAssertConfiguredFleetOnline(
+              'restart-after-launch', configuredNames, PM2_HOME, timeoutMs,
+            ),
+            rollback: () => rollbackPm2StartAttempt(
+              'restart-start', retiredProjection, configuredNames,
+            ),
+          },
+        );
+      } catch (err) {
+        try {
+          removeRestartIntentAttemptTo(restartIntentDir, restartAttemptId);
+        } catch { /* best-effort */ }
+        throw err;
+      }
+
+      if (restartIntentPrepared) {
+        let committed = false;
+        try {
+          committed = commitRestartIntentAttemptTo(restartIntentDir, restartAttemptId);
+        } catch { /* best-effort after verified healthy fleet */ }
+        if (!committed) {
+          try {
+            removeRestartIntentAttemptTo(restartIntentDir, restartAttemptId);
+          } catch { /* best-effort */ }
+          console.warn('⚠️  daemon 已完整启动，但重启摘要凭据未能提交；本次不会发送重启摘要。');
+        }
+      }
+    }, { maxWaitMs: 5_000 });
+
+    await reconcilePluginServicesForCli(undefined, { autoOnly: true });
+    if (refreshAutostart({ pkgRoot: PKG_ROOT, configDir: CONFIG_DIR, logDir: LOG_DIR })) {
+      console.log(`autostart unit 已同步到当前 Node/cli.js 路径`);
+    }
+    await printDashboardHintWithRetry();
+  }, { maxWaitMs: 5_000 });
 }
 
 /** Observe botmux PM2 rows. Unknown state is never represented as absence. */
@@ -2682,34 +3694,78 @@ export type StopBotLiveResult =
   | { ok: true; state: 'stopped' | 'already-stopped'; processName: string }
   | { ok: false; reason: 'not_found' | 'pm2_error'; message: string };
 
-function ensureBotDaemonStopped(appId: string, opts: { quiet?: boolean } = {}): StopBotLiveResult {
-  const bots = loadBotsJson();
-  const index = bots.findIndex(b => b?.larkAppId === appId);
-  if (index < 0) {
-    return { ok: false, reason: 'not_found', message: `appId ${appId} 不在 bots.json 中` };
+function retireExactBotmuxProcess(
+  operation: string,
+  target: BotmuxPm2ProcessEntry,
+  fullProjection: BotmuxPm2ProcessEntry[],
+): void {
+  const peers = fullProjection.filter(entry => entry.name !== target.name);
+  signalAndAwaitBotmuxProcesses([target], 'stop', PM2_HOME, peers);
+  const exact = revalidateExactQuiescentRowBeforeMutation(
+    `${operation}-before-delete`,
+    target,
+    [target],
+    PM2_HOME,
+    peers,
+  );
+  if (exact) {
+    runPm2(['delete', String(exact.pmId)], false, PM2_HOME, 10_000);
   }
-  const processName = botProcessName(bots[index], index, PM2_NAME);
-  const running = listBotmuxPm2Apps();
-  if (!running.ok) {
-    return { ok: false, reason: 'pm2_error', message: running.message };
+  const fresh = readVerifiedBotmuxPm2Projection(`${operation}-after-delete`);
+  assertNoUnregisteredLiveDaemonDescriptors(`${operation}-after-delete`, fresh);
+  if (fresh.some(entry => entry.name === target.name)) {
+    throw new Error(`[${operation}] PM2 row ${target.name} is still present after exact delete`);
   }
-  const named = running.apps.filter(app => app.name === processName);
-  if (named.length > 0 && !named.some(app => isExactPm2BotActivationReceipt(app, processName, index, appId))) {
+}
+
+async function ensureBotDaemonStopped(
+  appId: string,
+  _opts: { quiet?: boolean } = {},
+): Promise<StopBotLiveResult> {
+  ensureConfigDir();
+  try {
+    return await withFileLock(PM2_FLEET_MUTATION_LOCK_TARGET, async () => (
+      withFileLock(BOTS_JSON_FILE, async () => {
+        assertNoDuplicatePm2GodDaemons();
+        preflightNodeSanity();
+        cleanupLegacyPm2();
+        const bots = loadBotsJson();
+        const index = bots.findIndex(b => b?.larkAppId === appId);
+        if (index < 0) {
+          return { ok: false, reason: 'not_found', message: `appId ${appId} 不在 bots.json 中` };
+        }
+        const processName = botProcessName(bots[index], index, PM2_NAME);
+        const inspection = listBotmuxPm2Apps();
+        if (!inspection.ok) {
+          return { ok: false, reason: 'pm2_error', message: inspection.message };
+        }
+        const named = inspection.apps.filter(app => app.name === processName);
+        if (named.length > 0 && !named.every(app =>
+          isExactPm2BotActivationReceipt(app, processName, index, appId))) {
+          return {
+            ok: false,
+            reason: 'pm2_error',
+            message: `pm2 process ${processName} does not match bots.json slot ${index} / ${appId}`,
+          };
+        }
+        const projection = readVerifiedBotmuxPm2Projection('stop-bot');
+        assertNoUnregisteredLiveDaemonDescriptors('stop-bot', projection);
+        assertCanonicalUniquePm2Rows('stop-bot', projection);
+        const target = projection.find(entry => entry.name === processName);
+        if (!target) {
+          return { ok: true, state: 'already-stopped', processName };
+        }
+        retireExactBotmuxProcess('stop-bot', target, projection);
+        return { ok: true, state: 'stopped', processName };
+      }, { maxWaitMs: 5_000 })
+    ), { maxWaitMs: 5_000 });
+  } catch (err) {
     return {
       ok: false,
       reason: 'pm2_error',
-      message: `pm2 process ${processName} does not match bots.json slot ${index} / ${appId}`,
+      message: err instanceof Error ? err.message : String(err),
     };
   }
-  return stopExactPm2Process(
-    processName,
-    listBotmuxPm2Apps,
-    exactName => {
-      // Delete only this exact PM2 entry. The later start-bot command recreates
-      // it from the current ecosystem config after activation is acknowledged.
-      runPm2(['delete', exactName], !opts.quiet);
-    },
-  );
 }
 
 /**
@@ -2731,115 +3787,184 @@ function ensureBotDaemonStopped(appId: string, opts: { quiet?: boolean } = {}): 
  * NOT start a lone bot; that case belongs to `botmux start`, which brings up the
  * entire ecosystem (all bots + dashboard).
  */
-function ensureBotDaemonStarted(appId: string, opts: { quiet?: boolean } = {}): StartBotLiveResult {
-  const bots = loadBotsJson();
-  const index = bots.findIndex(b => b?.larkAppId === appId);
-  if (index < 0) {
-    return { ok: false, reason: 'not_found', message: `appId ${appId} 不在 bots.json 中` };
-  }
-  const bot = bots[index];
-  if (bot?.activationPending === true) {
-    return { ok: false, reason: 'not_ready', message: `appId ${appId} is still activation pending` };
-  }
-  const activationStarting = bot?.activationStarting;
-  const activationCommitted = bot?.activationCommitted;
-  const activationDeactivating = bot?.activationDeactivating;
-  if (activationDeactivating !== undefined) {
-    return { ok: false, reason: 'not_ready', message: `appId ${appId} is still deactivating` };
-  }
-  if (activationStarting !== undefined && activationCommitted !== undefined) {
-    return { ok: false, reason: 'not_ready', message: `appId ${appId} has conflicting activation markers` };
-  }
-  const activationMarker = activationStarting ?? activationCommitted;
-  const activationJobId = (
-    activationMarker
-    && typeof activationMarker === 'object'
-    && !Array.isArray(activationMarker)
-    && activationMarker.appId === appId
-    && typeof activationMarker.jobId === 'string'
-    && activationMarker.jobId
-  )
-    ? activationMarker.jobId
-    : undefined;
-  if (activationMarker !== undefined && !activationJobId) {
-    return { ok: false, reason: 'not_ready', message: `appId ${appId} has an invalid activation marker` };
-  }
-  const processName = botProcessName(bot, index, PM2_NAME);
-
-  const running = listBotmuxPm2Apps();
-  if (!running.ok) {
-    return { ok: false, reason: 'pm2_error', message: running.message };
-  }
-  if (running.apps.length === 0) {
-    return { ok: false, reason: 'fleet_down', message: 'daemon 未在运行，请先 botmux start' };
-  }
-  const named = running.apps.filter(app => app.name === processName);
-  if (!activationJobId && named.some(app => (
-    isExactPm2BotActivationReceipt(app, processName, index, appId) && app.online
-  ))) {
-    return { ok: true, state: 'already-online', processName };
-  }
-  if (activationJobId && named.length > 0) {
-    const disposition = managedActivationPm2Disposition(
-      named,
-      processName,
-      index,
-      appId,
-      activationJobId,
-    );
-    if (disposition === 'acknowledged') {
-      return { ok: true, state: 'already-online', processName };
-    }
-    if (disposition === 'identity_mismatch') {
-      return {
-        ok: false,
-        reason: 'pm2_error',
-        message: `pm2 process ${processName} does not match bots.json slot ${index} / ${appId}`,
-      };
-    }
-  } else if (named.length > 0) {
-    return {
-      ok: false,
-      reason: 'pm2_error',
-      message: `pm2 process ${processName} does not match bots.json slot ${index} / ${appId}`,
-    };
-  }
-  if (activationJobId && named.length > 0) {
-    // A same App/index process without this durable receipt can be an old
-    // daemon already consuming Feishu traffic. Delete it and prove absence
-    // before the gated activation daemon is allowed to become the PM2 ACK.
-    const stopped = stopExactPm2Process(
-      processName,
-      listBotmuxPm2Apps,
-      exactName => runPm2(['delete', exactName], !opts.quiet),
-    );
-    if (!stopped.ok) {
-      return { ok: false, reason: 'pm2_error', message: stopped.message };
-    }
-  }
-
-  const cfg = ecosystemConfig(appId);
+async function ensureBotDaemonStarted(
+  appId: string,
+  opts: { quiet?: boolean } = {},
+): Promise<StartBotLiveResult> {
+  ensureConfigDir();
   try {
-    // `--only <name>` filters the ecosystem to just this app, so pm2 starts only
-    // the new bot's daemon and never restarts the already-online ones.
-    runPm2(['start', cfg, '--only', processName], !opts.quiet);
-  } catch (e) {
-    return { ok: false, reason: 'pm2_error', message: e instanceof Error ? e.message : String(e) };
-  }
-  const acknowledged = listBotmuxPm2Apps();
-  if (!acknowledged.ok) {
-    return { ok: false, reason: 'pm2_error', message: acknowledged.message };
-  }
-  if (!acknowledged.apps.some(app => (
-    isExactPm2BotActivationReceipt(app, processName, index, appId, activationJobId) && app.online
-  ))) {
+    return await withFileLock(PM2_FLEET_MUTATION_LOCK_TARGET, async () => (
+      withFileLock(BOTS_JSON_FILE, async () => {
+        assertNoDuplicatePm2GodDaemons();
+        preflightNodeSanity();
+        cleanupLegacyPm2();
+        const bots = loadBotsJson();
+        const index = bots.findIndex(b => b?.larkAppId === appId);
+        if (index < 0) {
+          return { ok: false, reason: 'not_found', message: `appId ${appId} 不在 bots.json 中` };
+        }
+        const bot = bots[index];
+        if (bot?.activationPending === true) {
+          return { ok: false, reason: 'not_ready', message: `appId ${appId} is still activation pending` };
+        }
+        const activationStarting = bot?.activationStarting;
+        const activationCommitted = bot?.activationCommitted;
+        const activationDeactivating = bot?.activationDeactivating;
+        if (activationDeactivating !== undefined) {
+          return { ok: false, reason: 'not_ready', message: `appId ${appId} is still deactivating` };
+        }
+        if (activationStarting !== undefined && activationCommitted !== undefined) {
+          return { ok: false, reason: 'not_ready', message: `appId ${appId} has conflicting activation markers` };
+        }
+        const activationMarker = activationStarting ?? activationCommitted;
+        const activationJobId = (
+          activationMarker
+          && typeof activationMarker === 'object'
+          && !Array.isArray(activationMarker)
+          && activationMarker.appId === appId
+          && typeof activationMarker.jobId === 'string'
+          && activationMarker.jobId
+        )
+          ? String(activationMarker.jobId)
+          : undefined;
+        if (activationMarker !== undefined && !activationJobId) {
+          return { ok: false, reason: 'not_ready', message: `appId ${appId} has an invalid activation marker` };
+        }
+
+        const processName = botProcessName(bot, index, PM2_NAME);
+        const configuredNames = configuredCoreProcessNames(
+          bots,
+          activationJobId ? appId : undefined,
+        );
+        const verifyTimeoutMs = pm2StartVerifyTimeoutMs(configuredNames.length);
+        const inspection = listBotmuxPm2Apps();
+        if (!inspection.ok) {
+          return { ok: false, reason: 'pm2_error', message: inspection.message };
+        }
+        let projection = readVerifiedBotmuxPm2Projection('start-bot');
+        assertNoUnregisteredLiveDaemonDescriptors('start-bot', projection);
+        assertCanonicalUniquePm2Rows('start-bot', projection);
+
+        const namedInspection = inspection.apps.filter(app => app.name === processName);
+        if (activationJobId && namedInspection.length > 0) {
+          const disposition = managedActivationPm2Disposition(
+            namedInspection,
+            processName,
+            index,
+            appId,
+            activationJobId,
+          );
+          if (disposition === 'identity_mismatch') {
+            return {
+              ok: false,
+              reason: 'pm2_error',
+              message: `pm2 process ${processName} does not match bots.json slot ${index} / ${appId}`,
+            };
+          }
+          if (disposition === 'acknowledged') {
+            readAndAssertConfiguredFleetOnline(
+              'start-bot-already-online-ready',
+              configuredNames,
+              PM2_HOME,
+              verifyTimeoutMs,
+            );
+            return { ok: true, state: 'already-online', processName };
+          }
+          const target = projection.find(entry => entry.name === processName);
+          if (!target) {
+            throw new Error(`[start-bot] PM2 identity view disagrees about ${processName}`);
+          }
+          retireExactBotmuxProcess('start-bot-replace', target, projection);
+          projection = readVerifiedBotmuxPm2Projection('start-bot-after-replace');
+        } else if (namedInspection.length > 0) {
+          if (!namedInspection.every(app =>
+            isExactPm2BotActivationReceipt(app, processName, index, appId))) {
+            return {
+              ok: false,
+              reason: 'pm2_error',
+              message: `pm2 process ${processName} does not match bots.json slot ${index} / ${appId}`,
+            };
+          }
+        }
+
+        const admission = classifyStartBotFleetAdmission(
+          'start-bot',
+          projection,
+          configuredNames,
+          processName,
+          pid => { try { process.kill(pid, 0); return true; } catch { return false; } },
+        );
+        if (admission.state === 'already-online') {
+          readAndAssertConfiguredFleetOnline(
+            'start-bot-already-online-ready',
+            configuredNames,
+            PM2_HOME,
+            verifyTimeoutMs,
+          );
+          return { ok: true, state: 'already-online', processName };
+        }
+        if (admission.state === 'fleet-down') {
+          return { ok: false, reason: 'fleet_down', message: 'daemon 未在运行，请先 botmux start' };
+        }
+
+        const beforeStart = projection;
+        const cfg = ecosystemConfig(bots, activationJobId ? appId : undefined);
+        runBoundedPm2StartTransaction(
+          'start-bot',
+          PM2_START_COMMAND_TIMEOUT_MS,
+          verifyTimeoutMs,
+          {
+            start: timeoutMs => {
+              assertBotsConfigSnapshotUnchanged('start-bot', bots);
+              assertNoDuplicatePm2GodDaemons();
+              preflightNodeSanity();
+              runPm2(
+                ['start', cfg, '--only', processName],
+                !opts.quiet,
+                PM2_HOME,
+                timeoutMs,
+              );
+            },
+            verifyFresh: timeoutMs => {
+              const fresh = readAndAssertConfiguredFleetOnline(
+                'start-bot-after-launch',
+                configuredNames,
+                PM2_HOME,
+                timeoutMs,
+              );
+              const acknowledged = listBotmuxPm2Apps();
+              if (!acknowledged.ok || !acknowledged.apps.some(app => (
+                isExactPm2BotActivationReceipt(
+                  app,
+                  processName,
+                  index,
+                  appId,
+                  activationJobId,
+                ) && app.online
+              ))) {
+                throw new Error(
+                  `pm2 start did not acknowledge ${processName} at bots.json slot ${index} / ${appId}`,
+                );
+              }
+              return fresh;
+            },
+            rollback: () => rollbackPm2StartAttempt(
+              'start-bot',
+              beforeStart,
+              [processName],
+            ),
+          },
+        );
+        return { ok: true, state: 'started', processName };
+      }, { maxWaitMs: 5_000 })
+    ), { maxWaitMs: 5_000 });
+  } catch (err) {
     return {
       ok: false,
       reason: 'pm2_error',
-      message: `pm2 start did not acknowledge ${processName} at bots.json slot ${index} / ${appId}`,
+      message: err instanceof Error ? err.message : String(err),
     };
   }
-  return { ok: true, state: 'started', processName };
 }
 
 /**
@@ -2858,7 +3983,7 @@ async function cmdStartBot(argv: string[]): Promise<void> {
     process.exit(1);
   }
   ensureConfigDir();
-  const r = ensureBotDaemonStarted(appId, { quiet: wantsJson });
+  const r = await ensureBotDaemonStarted(appId, { quiet: wantsJson });
   if (wantsJson) {
     console.log(JSON.stringify(r, null, 2));
     if (!r.ok) process.exitCode = 1;
@@ -2888,7 +4013,7 @@ async function cmdStopBot(argv: string[]): Promise<void> {
     process.exit(1);
   }
   ensureConfigDir();
-  const r = ensureBotDaemonStopped(appId, { quiet: wantsJson });
+  const r = await ensureBotDaemonStopped(appId, { quiet: wantsJson });
   if (wantsJson) {
     console.log(JSON.stringify(r, null, 2));
     if (!r.ok) process.exitCode = 1;
@@ -2907,8 +4032,8 @@ async function cmdStopBot(argv: string[]): Promise<void> {
 /** Print the post-add "next step" line for interactive setup: auto-start the new
  *  bot's own daemon when the fleet is up (no fleet-wide restart), else fall back
  *  to the botmux start / restart hint. */
-function printAddBotLiveHint(appId: string): void {
-  const live = ensureBotDaemonStarted(appId);
+async function printAddBotLiveHint(appId: string): Promise<void> {
+  const live = await ensureBotDaemonStarted(appId);
   if (live.ok) {
     console.log(`✅ 已自动上线（${live.processName}），无需重启其它机器人。\n`);
   } else if (live.reason === 'fleet_down') {
@@ -2985,7 +4110,6 @@ function warnIfLegacyBotmuxAlive(): void {
 }
 
 function cmdLogs(): void {
-  killDuplicatePm2GodDaemons();
   warnIfLegacyBotmuxAlive();
   const lines = process.argv.includes('--lines')
     ? process.argv[process.argv.indexOf('--lines') + 1] || '50'
@@ -3027,7 +4151,6 @@ function cmdLogs(): void {
 }
 
 function cmdStatus(): void {
-  killDuplicatePm2GodDaemons();
   warnIfLegacyBotmuxAlive();
   runPm2(['status']);
 }
@@ -3091,7 +4214,7 @@ async function printDashboardHintWithRetry(): Promise<void> {
   }
   // Soft fallback
   if (last?.reason === 'no-active-token') {
-    console.log('   面板: 运行 `botmux dashboard` 获取链接');
+    console.log('   面板: 运行 `botmux dashboard` 创建登录链接');
   } else if (last?.reason === 'no-secret') {
     console.log('   面板: dashboard 凭证未就绪，启动后可用 `botmux dashboard` 获取链接');
   } else if (last?.reason === 'wrong-service') {
@@ -3101,13 +4224,23 @@ async function printDashboardHintWithRetry(): Promise<void> {
   }
 }
 
-/**
- * Print a fresh dashboard URL by HMAC-authing to the dashboard process's
- * loopback rotation endpoint. Each call invalidates the previously-issued
- * token, so sharing a URL is the same as sharing a one-shot session.
- */
-async function cmdDashboard(): Promise<void> {
-  const r = await callDashboardEndpoint('/__cli/rotate');
+/** Get or create the current dashboard URL, or explicitly rotate it. Bare
+ * `dashboard` is the non-rotating get-or-create form; help and invalid
+ * subcommands never call either credential endpoint. */
+async function cmdDashboard(args: string[]): Promise<void> {
+  const execution = await executeDashboardCommand(args, callDashboardEndpoint);
+  if (execution.kind === 'help') {
+    console.log(DASHBOARD_COMMAND_USAGE);
+    return;
+  }
+  if (execution.kind === 'invalid') {
+    console.error(`未知 dashboard 子命令: ${execution.argument}`);
+    console.error(DASHBOARD_COMMAND_USAGE);
+    process.exitCode = 2;
+    return;
+  }
+
+  const { action, result: r } = execution;
   if (r.ok) {
     // 首行保持纯 URL（脚本/复制取第一行即可）；走中心化平台时再补一行本地直连兜底。
     console.log(r.url);
@@ -3134,8 +4267,7 @@ async function cmdDashboard(): Promise<void> {
     );
     if (r.detail) console.error(`  详情: ${r.detail}`);
   } else {
-    // `no-active-token` can't occur on rotate (it always mints); fall through.
-    console.error('Rotation failed:', r.detail ?? r.reason);
+    console.error(formatDashboardFallbackFailure(action, r));
   }
   process.exit(1);
 }
@@ -3187,7 +4319,13 @@ interface SessionData {
   quoteTargetId?: string;
   currentReplyTarget?: { rootMessageId: string; turnId: string; updatedAt: string; quoteOnly?: boolean; substitute?: boolean };
   /** Per-turn reply targets（见 Session.replyTargets in types.ts）——排队/并发轮次各自的回复锚点。 */
-  replyTargets?: Record<string, { rootMessageId: string; updatedAt: string; quoteOnly?: boolean; substitute?: boolean }>;
+  replyTargets?: Record<string, { rootMessageId?: string; updatedAt: string; quoteOnly?: boolean; substitute?: boolean; senderOpenId?: string }>;
+  codexAppDispatchLedger?: CodexAppDispatchLedgerEntry[];
+  codexAppGenerationCommits?: unknown;
+  queued?: boolean;
+  queuedActivationPending?: boolean;
+  queuedActivationTail?: import('./types.js').QueuedActivationTailEntry[];
+  pendingRepoSetup?: import('./types.js').PendingRepoSetup;
   /** Current persisted worker lifetime and its exact input-queue receipts. */
   workerGeneration?: number;
   dispatchInputReceipts?: Record<string, {
@@ -3274,42 +4412,19 @@ function loadSessions(): Map<string, SessionData> {
     if (process.env.BOTMUX_LARK_APP_ID) loadPerBot(process.env.BOTMUX_LARK_APP_ID);
   }
 
-  // Migrate: remove sessions from legacy file if they have larkAppId (belong in per-bot files)
-  let legacyDirty = false;
-  for (const [k, v] of Object.entries(legacyData)) {
-    const s = v as SessionData;
-    if (s.larkAppId) {
-      delete legacyData[k];
-      legacyDirty = true;
-      // Ensure the session exists in its per-bot file
-      const perBotFp = join(dataDir, `sessions-${s.larkAppId}.json`);
-      let perBotData: Record<string, SessionData> = {};
-      if (existsSync(perBotFp)) {
-        try { perBotData = JSON.parse(readFileSync(perBotFp, 'utf-8')); } catch { /* */ }
-      }
-      // Only write if per-bot file doesn't already have this session
-      if (!perBotData[k]) {
-        perBotData[k] = s;
-        const tmpFp = perBotFp + '.tmp';
-        writeFileSync(tmpFp, JSON.stringify(perBotData, null, 2), 'utf-8');
-        renameSync(tmpFp, perBotFp);
-      }
-    }
-  }
-  if (legacyDirty) {
-    const tmpFp = legacyFp + '.tmp';
-    writeFileSync(tmpFp, JSON.stringify(legacyData, null, 2), 'utf-8');
-    renameSync(tmpFp, legacyFp);
-  }
+  // Deliberately read-only. Older CLIs opportunistically migrated legacy rows
+  // here, which made even `botmux list` a whole-file writer capable of racing a
+  // daemon ledger save. Durable migration belongs to daemon startup under the
+  // session-store lock; this generic discovery path only composes snapshots.
 
   return sessions;
 }
 
-/** Save a single session back to its appropriate file based on larkAppId. */
 function loadSessionFresh(session: SessionData): SessionData | undefined {
   return loadSessions().get(session.sessionId);
 }
 
+/** Save a single session back to its appropriate file based on larkAppId. */
 function saveSession(session: SessionData): void {
   const dataDir = resolveDataDir();
   const fileName = session.larkAppId ? `sessions-${session.larkAppId}.json` : 'sessions.json';
@@ -3355,6 +4470,289 @@ function saveSession(session: SessionData): void {
   }
 }
 
+/** Offline-only narrow session mutation. Callers must prefer the owning daemon
+ * while it is available; rereading the exact row here prevents stale CLI
+ * snapshots from copying FIFO fields during offline maintenance. */
+function mutateSessionOffline(
+  session: SessionData,
+  mutate: (current: SessionData) => boolean,
+): SessionData | undefined {
+  const dataDir = resolveDataDir();
+  const fileName = session.larkAppId ? `sessions-${session.larkAppId}.json` : 'sessions.json';
+  const fp = join(dataDir, fileName);
+  return withFileLockSync(fp, () => {
+    // The owning daemon uses the same session-file lock for every save. Check
+    // absence while holding it so two CLIs cannot race each other and an
+    // already-published daemon cannot be bypassed by the offline fallback.
+    if (session.larkAppId) {
+      try { if (findDaemon(session.larkAppId)) return undefined; } catch { /* offline */ }
+    }
+    let data: Record<string, SessionData> = {};
+    if (existsSync(fp)) {
+      try { data = JSON.parse(readFileSync(fp, 'utf-8')); } catch { /* start fresh */ }
+    }
+    const current = data[session.sessionId];
+    if (!current || !mutate(current)) return current;
+    data[session.sessionId] = current;
+
+    // Clean up entries where file key doesn't match the entry's sessionId
+    // (data corruption), and strip removed placeholder-card fields.
+    for (const [key, val] of Object.entries(data)) {
+      if (val && typeof val === 'object' && 'sessionId' in val && (val as SessionData).sessionId !== key) {
+        delete data[key];
+        continue;
+      }
+      if (val && typeof val === 'object') stripLegacyPendingCardFields(val as unknown as Record<string, unknown>);
+    }
+
+    // Recheck immediately before publication. A daemon that appears during
+    // the read/decision phase becomes authoritative; leave the file untouched.
+    if (session.larkAppId) {
+      try { if (findDaemon(session.larkAppId)) return undefined; } catch { /* offline */ }
+    }
+    const tmpFp = `${fp}.${process.pid}.${randomBytes(4).toString('hex')}.tmp`;
+    writeFileSync(tmpFp, JSON.stringify(data, null, 2), 'utf-8');
+    renameSync(tmpFp, fp);
+    return current;
+  });
+}
+
+type OfflineAbandonResult =
+  | { ok: true; current: SessionData; cleanedBacking?: string }
+  | { ok: false; error: string };
+
+/** Offline explicit abandon stops the exact Botmux-owned worker, then closes
+ * the newest durable row under the shared session-file lock. Provider-specific
+ * backing cleanup remains owned by the dedicated backend lifecycle changes. */
+async function abandonSessionOffline(session: SessionData): Promise<OfflineAbandonResult> {
+  let current = mutateSessionOffline(session, () => false);
+  if (!current) return { ok: false, error: 'owning_daemon_became_available' };
+
+  const originalPid = adoptedCliPid(current);
+  const ownedWorkerPid = current.pid && current.pid !== originalPid ? current.pid : undefined;
+  if (ownedWorkerPid) {
+    // Narrow the unavoidable descriptor race: do not signal a worker after an
+    // owning daemon has become visible. The locked write below repeats this.
+    if (current.larkAppId) {
+      try {
+        if (findDaemon(current.larkAppId)) {
+          return { ok: false, error: 'owning_daemon_became_available' };
+        }
+      } catch { /* still offline */ }
+    }
+    if (isProcessAlive(ownedWorkerPid)) {
+      const signalled = killProcess(ownedWorkerPid);
+      if ((!signalled && isProcessAlive(ownedWorkerPid))
+        || !(await waitForProcessExit(ownedWorkerPid))) {
+        return { ok: false, error: `worker_pid_kill_failed:${ownedWorkerPid}` };
+      }
+    }
+
+    // Persist worker-less state without touching FIFO authority. If a new
+    // daemon/generation changed the row while SIGTERM settled, fail closed.
+    let workerCleared = false;
+    const afterStop = mutateSessionOffline(current, latest => {
+      if (latest.pid !== ownedWorkerPid
+        || isAdoptedSession(latest) !== isAdoptedSession(current!)) return false;
+      delete latest.pid;
+      workerCleared = true;
+      return true;
+    });
+    if (!afterStop || !workerCleared) {
+      return { ok: false, error: 'session_changed_while_stopping_worker' };
+    }
+    current = afterStop;
+  } else {
+    // Even without a Botmux worker pid, re-read after the first authority check
+    // so the cleanup inputs are the newest locked backend/task lineage.
+    const refreshed = mutateSessionOffline(current, () => false);
+    if (!refreshed) return { ok: false, error: 'owning_daemon_became_available' };
+    current = refreshed;
+  }
+
+  // Provider-specific backing teardown (no daemon to run killWorker()). Adopted
+  // panes belong to the user and are never touched. This runs BEFORE the durable
+  // close so a ZMX ownership-tag mismatch fails closed: refusing to hide the sole
+  // control row while its CLI is still alive under a different owner.
+  let cleanedBacking: string | undefined;
+  if (!isAdoptedSession(current)) {
+    if (isSuspendableBackendType(current.backendType)) {
+      const target = resolvePersistentBackendTarget(
+        current.backendType,
+        current.sessionId,
+        current.persistentBackendTarget,
+      );
+      try {
+        killPersistentBackendTarget(target, current.sessionId);
+        cleanedBacking = `${target.backendType}:${target.sessionName}`;
+      } catch (err) {
+        // ZMX destruction is identity-verified against the complete botmux
+        // session UUID and waits for confirmed disappearance. Swallowing an
+        // inconclusive/mismatched kill would hide the sole control row while
+        // its CLI remains alive. Older mux backends keep their historical
+        // best-effort offline-close compatibility.
+        if (target.backendType === 'zmx') {
+          return {
+            ok: false,
+            error: `ZMX 离线删除未完成：${err instanceof Error ? err.message : String(err)}`,
+          };
+        }
+      }
+    } else {
+      // Legacy rows without backendType were historically tmux-backed.
+      const tmuxName = `bmx-${current.sessionId.substring(0, 8)}`;
+      try {
+        execSync(`tmux kill-session -t '${tmuxName}' 2>/dev/null`, {
+          stdio: 'ignore',
+          env: tmuxEnv(),
+        });
+      } catch { /* no tmux session */ }
+    }
+  }
+
+  let applied = false;
+  const published = mutateSessionOffline(current, latest => {
+    if (isAdoptedSession(latest) !== isAdoptedSession(current)) return false;
+    if (latest.status === 'closed') {
+      applied = true;
+      return false;
+    }
+    latest.status = 'closed';
+    latest.closedAt = new Date().toISOString();
+    delete latest.codexAppDispatchLedger;
+    delete latest.codexAppGenerationCommits;
+    delete latest.queuedActivationPending;
+    delete latest.queuedActivationTail;
+    delete latest.pendingRepoSetup;
+    applied = true;
+    return true;
+  });
+  if (!published || !applied) {
+    return { ok: false, error: 'session_changed_during_offline_cleanup' };
+  }
+
+  return { ok: true, current: published, ...(cleanedBacking ? { cleanedBacking } : {}) };
+}
+
+function pruneSessionOfflineIfLedgerEmpty(session: SessionData): boolean {
+  let pruned = false;
+  mutateSessionOffline(session, current => {
+    if (hasProtectedSessionMutationOwnership(current)) return false;
+    current.status = 'closed';
+    current.closedAt = new Date().toISOString();
+    delete current.codexAppDispatchLedger;
+    delete current.codexAppGenerationCommits;
+    pruned = true;
+    return true;
+  });
+  return pruned;
+}
+
+function patchSessionWhiteboardOffline(session: SessionData, whiteboardId: string): boolean {
+  return !!mutateSessionOffline(session, current => {
+    current.whiteboardId = whiteboardId;
+    return true;
+  });
+}
+
+async function postOwningDaemonSessionMutation(
+  session: SessionData,
+  suffix: 'close' | 'prune' | 'whiteboard',
+  body?: Record<string, unknown>,
+): Promise<'applied' | 'refused' | 'unavailable'> {
+  if (!session.larkAppId) return 'unavailable';
+  let daemon: ReturnType<typeof findDaemon>;
+  try { daemon = findDaemon(session.larkAppId); } catch { return 'unavailable'; }
+  if (!daemon) return 'unavailable';
+  let secret: string;
+  try { secret = loadDaemonIpcSecret(); } catch { return 'unavailable'; }
+  const res = await fetchDaemonIpc(
+    daemon.ipcPort,
+    `/api/sessions/${encodeURIComponent(session.sessionId)}/${suffix}`,
+    {
+      method: 'POST',
+      ...(body
+        ? {
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify(body),
+          }
+        : {}),
+    },
+    secret,
+  );
+  if (suffix === 'prune' && res.status === 409) return 'refused';
+  if (!res.ok) {
+    throw new Error(`owning daemon ${suffix} mutation failed: HTTP ${res.status}`);
+  }
+  return 'applied';
+}
+
+type AuthoritativeAbandonResult =
+  | { ok: true; mode: 'daemon' }
+  | { ok: true; mode: 'offline'; current: SessionData; cleanedBacking?: string }
+  | { ok: false; error?: string };
+
+async function abandonSessionAuthoritatively(
+  session: SessionData,
+  online: DaemonDescriptorLite[] = listOnlineDaemons(),
+): Promise<AuthoritativeAbandonResult> {
+  // Legacy larkAppId-less rows live in sessions.json; a per-bot daemon writes
+  // only its own sessions-<appId>.json and silently no-ops on close, so keep
+  // them on the offline path (which persists to the legacy file correctly).
+  if (session.larkAppId) {
+    const daemon = online.find(d => d.larkAppId === session.larkAppId);
+    const isCurrentSession = process.env.BOTMUX_SESSION_ID === session.sessionId;
+    const injectedPort = isCurrentSession
+      ? resolveDaemonIpcPort(undefined, process.env.BOTMUX_DAEMON_IPC_PORT)
+      : undefined;
+    const ipcPort = daemon?.ipcPort ?? injectedPort;
+    if (ipcPort) {
+      try {
+        // Explicit abandon boundary: route through the owning daemon so the
+        // ledger FIFO is cleared atomically with close. postSessionCliIpc carries
+        // the trusted-host HMAC (non-isolated) OR this session's rotating origin
+        // capability (sandboxed/read-isolated) so a sandboxed `delete <other-id>`
+        // stays fail-closed at the daemon's sessionCliIpcAuth check.
+        const res = await postSessionCliIpc(ipcPort, session.sessionId, 'close', {});
+        const body = await res.json().catch(() => ({} as Record<string, unknown>));
+        if (res.ok && (body as { ok?: unknown }).ok) return { ok: true, mode: 'daemon' };
+        // Surface the daemon's own rejection reason (e.g. origin_unproven) and
+        // never fall back to a partial local kill: a fresh descriptor means the
+        // daemon may still hold authoritative in-memory state.
+        return { ok: false, error: (body as { error?: string }).error ?? `HTTP ${res.status}` };
+      } catch (err) {
+        return { ok: false, error: `连接 daemon 失败: ${err instanceof Error ? err.message : String(err)}` };
+      }
+    }
+  }
+  const offline = await abandonSessionOffline(session);
+  return offline.ok
+    ? {
+        ok: true,
+        mode: 'offline',
+        current: offline.current,
+        ...(offline.cleanedBacking ? { cleanedBacking: offline.cleanedBacking } : {}),
+      }
+    : { ok: false, error: offline.error };
+}
+
+async function pruneSessionAuthoritatively(session: SessionData): Promise<boolean> {
+  const result = await postOwningDaemonSessionMutation(session, 'prune');
+  if (result === 'applied') return true;
+  if (result === 'refused') return false;
+  return pruneSessionOfflineIfLedgerEmpty(session);
+}
+
+async function patchSessionWhiteboardAuthoritatively(
+  session: SessionData,
+  whiteboardId: string,
+): Promise<boolean> {
+  const result = await postOwningDaemonSessionMutation(session, 'whiteboard', { whiteboardId });
+  if (result === 'applied') return true;
+  if (result === 'refused') return false;
+  return patchSessionWhiteboardOffline(session, whiteboardId);
+}
+
 function isProcessAlive(pid: number): boolean {
   try {
     process.kill(pid, 0);
@@ -3373,6 +4771,15 @@ function killProcess(pid: number): boolean {
   }
 }
 
+async function waitForProcessExit(pid: number, timeoutMs = 2_000): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (!isProcessAlive(pid)) return true;
+    await new Promise(resolve => setTimeout(resolve, 50));
+  }
+  return !isProcessAlive(pid);
+}
+
 function formatDuration(ms: number): string {
   const seconds = Math.floor(ms / 1000);
   if (seconds < 60) return `${seconds}s`;
@@ -3384,31 +4791,39 @@ function formatDuration(ms: number): string {
   return `${days}d${hours % 24}h`;
 }
 
-/** Get display width of a string, accounting for CJK double-width characters. */
+/**
+ * Get display width of a string in terminal cells.
+ *
+ * Delegates to a cross-terminal conservative width table (see terminal-width.ts):
+ * for any real terminal the width returned is >= what it paints, so the picker's
+ * `layoutWidth <= termWidth` genuinely implies rows never wrap. The previous
+ * inline table only covered CJK/Hangul and under-counted emoji (🤖/🫠 as 1),
+ * letting emoji session titles overflow a row, wrap onto a second physical line,
+ * and push the pinned title off the alt-screen.
+ *
+ * NOTE: cursor-moving control chars (Tab/ESC/C0/C1) are NOT sized here — width
+ * can't express a tab stop. Run text through `sanitizeCellText` first.
+ */
 function displayWidth(str: string): number {
-  let width = 0;
-  for (const ch of str) {
-    const code = ch.codePointAt(0)!;
-    // CJK Unified Ideographs, CJK Compatibility, Fullwidth forms, Hangul, Kana, etc.
-    if (
-      (code >= 0x1100 && code <= 0x115f) ||   // Hangul Jamo
-      (code >= 0x2e80 && code <= 0x303e) ||   // CJK Radicals, Kangxi, CJK Symbols
-      (code >= 0x3040 && code <= 0x33bf) ||   // Hiragana, Katakana, Bopomofo, CJK Compat
-      (code >= 0x3400 && code <= 0x4dbf) ||   // CJK Unified Ext A
-      (code >= 0x4e00 && code <= 0xa4cf) ||   // CJK Unified, Yi
-      (code >= 0xac00 && code <= 0xd7af) ||   // Hangul Syllables
-      (code >= 0xf900 && code <= 0xfaff) ||   // CJK Compat Ideographs
-      (code >= 0xfe30 && code <= 0xfe6f) ||   // CJK Compat Forms
-      (code >= 0xff01 && code <= 0xff60) ||   // Fullwidth Forms
-      (code >= 0xffe0 && code <= 0xffe6) ||   // Fullwidth Signs
-      (code >= 0x20000 && code <= 0x2fa1f)    // CJK Unified Ext B-F, Compat Supplement
-    ) {
-      width += 2;
-    } else {
-      width += 1;
-    }
-  }
-  return width;
+  return terminalCellWidth(str);
+}
+
+/**
+ * Strip everything that would move the cursor or otherwise desync column math
+ * from dynamic text (session titles, working dirs, flash messages) before it is
+ * measured or printed. A raw Tab jumps to the next tab stop and a raw ESC starts
+ * a control sequence — both make a "one physical line" cell silently span more
+ * columns (or lines) than displayWidth accounts for, wrapping the row and
+ * pushing the pinned title off screen. Collapse them all to a single space:
+ *   - C0 controls incl. Tab/CR/LF (U+0000–U+001F) and DEL (U+007F);
+ *   - C1 controls (U+0080–U+009F);
+ *   - stray ESC (U+001B) is covered by the C0 range.
+ * (ANSI colour sequences the picker itself emits are added AFTER sanitizing, so
+ * they are never fed through here.)
+ */
+function sanitizeCellText(str: string): string {
+  // eslint-disable-next-line no-control-regex
+  return str.replace(/[\x00-\x1F\x7F-\x9F]+/g, " ");
 }
 
 /** Truncate string to fit within maxWidth display columns, append '…' if truncated. */
@@ -3766,16 +5181,34 @@ function sessionBackingInfo(s: SessionData, snapshot?: BackingProbeSnapshot): {
   if (s.backendType === 'pty') {
     return { backendType: 'pty', probe: 'missing', label: 'pty' };
   }
-  // Legacy rows predate backend stamping. Only tmux was externally attachable.
-  const target = sessionPersistentTarget(s)!;
-  const probe = backingProbe(snapshot, target);
-  return {
-    backendType: 'tmux',
-    target,
-    probe,
-    label: probe === 'exists' ? `tmux: ${target.sessionName}` : '-',
-    attachBackend: 'tmux',
-  };
+  if (s.backendType === 'riff') {
+    // Riff runs the CLI on a remote sandbox, not a local multiplexer pane: there
+    // is nothing to probe, attach to, or name as a PersistentBackendTarget
+    // (sessionPersistentTarget returns undefined for it, by design). Surface a
+    // stable label and report the nonexistent local backing as missing — exactly
+    // like pty — so it never slips into the legacy tmux branch and dereferences an
+    // undefined target.
+    return { backendType: 'riff', probe: 'missing', label: 'riff' };
+  }
+  if (s.backendType === undefined) {
+    // Legacy rows predate backend stamping. Only tmux was externally attachable,
+    // so its deterministic target remains the compatibility path.
+    const target = sessionPersistentTarget(s)!;
+    const probe = backingProbe(snapshot, target);
+    return {
+      backendType: 'tmux',
+      target,
+      probe,
+      label: probe === 'exists' ? `tmux: ${target.sessionName}` : '-',
+      attachBackend: 'tmux',
+    };
+  }
+  // Exhaustiveness guard: every BackendType must be classified above. A future
+  // non-suspendable backend added to BackendType will fail to compile here rather
+  // than silently inheriting the legacy tmux target (the Riff crash's root cause).
+  const _exhaustive: never = s.backendType;
+  void _exhaustive;
+  return { probe: 'missing', label: '-' };
 }
 
 function sessionTargetLabel(s: SessionData, snapshot?: BackingProbeSnapshot): string {
@@ -3816,28 +5249,7 @@ function interactiveSessionPicker(active: SessionData[], probeSnapshot: BackingP
     botLabels.set(b.larkAppId, `bot${i + 1} (${b.cliId ?? 'claude-code'})`);
   }
 
-  // Responsive column widths based on terminal width
-  const termWidth = process.stdout.columns || 100;
-  const PREFIX = 4;    // "  ❯ " or "    "
-  const SEP_W = 3;     // " │ "
-  const fixedCols = { id: 10, pid: 8, uptime: 7, status: 7, target: 26 };
-  const botW = multiBot ? 18 : 0;
-  const numSeps = (multiBot ? 8 : 7) - 1;  // separators between columns
-  const fixedTotal = PREFIX + fixedCols.id + botW + fixedCols.pid + fixedCols.uptime + fixedCols.status + fixedCols.target + numSeps * SEP_W;
-  const flexTotal = Math.max(20, termWidth - fixedTotal);
-  const titleW = Math.floor(flexTotal * 0.4);
-  const dirW = flexTotal - titleW;
-
-  const cols = {
-    id: fixedCols.id,
-    ...(multiBot ? { bot: botW } : {}),
-    title: titleW,
-    dir: dirW,
-    pid: fixedCols.pid,
-    uptime: fixedCols.uptime,
-    status: fixedCols.status,
-    target: fixedCols.target,
-  };
+  let layout: SessionPickerLayout = computeSessionPickerLayout(process.stdout.columns || 100, multiBot);
 
   // Build row data — use shortened paths for TUI
   function buildRows(): Array<{
@@ -3857,26 +5269,31 @@ function interactiveSessionPicker(active: SessionData[], probeSnapshot: BackingP
         ? { probe: 'missing' as const, label: adoptTargetLabel(s) }
         : sessionBackingInfo(s, probeSnapshot);
       const targetLabel = backing.label;
-      // Build row text with shortened dir
-      const id = padEndDisplay(s.sessionId.substring(0, 8), cols.id);
-      const parts = [id];
-      if (multiBot) {
-        const label = s.larkAppId ? (botLabels.get(s.larkAppId) ?? s.larkAppId.substring(0, 16)) : '-';
-        parts.push(padEndDisplay(truncate(label, cols.bot!), cols.bot!));
-      }
-      const title = padEndDisplay(truncate((s.title || '(untitled)').replace(/[\r\n]+/g, ' '), cols.title), cols.title);
-      const dir = padEndDisplay(truncate(shortenPath(s.workingDir || '-'), cols.dir), cols.dir);
       const displayPid = sessionDisplayPid(s);
-      const pid = displayPid ? String(displayPid).padEnd(cols.pid) : '-'.padEnd(cols.pid);
-      const uptime = formatDuration(Date.now() - new Date(s.createdAt).getTime()).padEnd(cols.uptime);
       const alive = isSessionAliveForList(s);
-      const status = padEndDisplay(sessionStatusLabel(s), cols.status);
-      const target = padEndDisplay(truncate(targetLabel, cols.target), cols.target);
-      parts.push(title, dir, pid, uptime, status, target);
+      const botLabel = s.larkAppId ? (botLabels.get(s.larkAppId) ?? s.larkAppId.substring(0, 16)) : '-';
+      const cells: Record<SessionPickerColumnKey, string> = {
+        id: s.sessionId.substring(0, 8),
+        bot: botLabel,
+        title: s.title || '(untitled)',
+        dir: shortenPath(s.workingDir || '-'),
+        pid: displayPid ? String(displayPid) : '-',
+        uptime: formatDuration(Date.now() - new Date(s.createdAt).getTime()),
+        status: sessionStatusLabel(s),
+        target: targetLabel,
+      };
+      const text = layout.columns
+        .map(column => {
+          // Sanitize every cell (not just title): a Tab/ESC/control char in any
+          // dynamic field would move the cursor and desync the one-line-per-row math.
+          const value = sanitizeCellText(cells[column.key]);
+          return padEndDisplay(truncate(value, column.width), column.width);
+        })
+        .join(' │ ');
 
       return {
         session: s,
-        text: parts.join(' │ '),
+        text,
         alive,
         backendTarget: 'target' in backing ? backing.target : undefined,
         backingProbe: backing.probe,
@@ -3895,76 +5312,176 @@ function interactiveSessionPicker(active: SessionData[], probeSnapshot: BackingP
 
   // Build header (same column layout as rows, no extra prefix in join)
   function buildHeader(): string {
-    const hParts = ['id'.padEnd(cols.id)];
-    if (multiBot) hParts.push('bot'.padEnd(cols.bot!));
-    hParts.push(
-      'title'.padEnd(cols.title),
-      'working dir'.padEnd(cols.dir),
-      'pid'.padEnd(cols.pid),
-      'uptime'.padEnd(cols.uptime),
-      'status'.padEnd(cols.status),
-      'target'.padEnd(cols.target),
-    );
-    return hParts.join(' │ ');
+    const labels: Record<SessionPickerColumnKey, string> = {
+      id: 'id',
+      bot: 'bot',
+      title: 'title',
+      dir: 'working dir',
+      pid: 'pid',
+      uptime: 'uptime',
+      status: 'status',
+      target: 'target',
+    };
+    return layout.columns
+      .map(column => padEndDisplay(truncate(labels[column.key], column.width), column.width))
+      .join(' │ ');
   }
 
-  const header = buildHeader();
-  const separator = '─'.repeat(displayWidth(header));
+  let header = buildHeader();
+  let separator = '─'.repeat(displayWidth(header));
 
   let cursor = 0;
+  let scrollTop = 0;              // index of the first visible row (vertical scroll)
   let confirmDelete = false;  // true when waiting for y/n confirmation
-  let flashMsg = '';
+  // Transient status line. Stored as {style, text} where text is UNSTYLED and may
+  // contain untrusted session metadata — it is sanitized + SGR-wrapped only at
+  // render time, so a control char in `text` can never reach the terminal raw.
+  type FooterStyle = 'error' | 'success' | 'warn' | 'dim';
+  let flash: { style: FooterStyle; text: string } | null = null;
+
+  // Fixed chrome around the scrolling row window: title(2) + header block(3) +
+  // bottom separator(1) + target hint(2) + flash/confirm(2) + hints(2) + a
+  // one-line safety margin so the final newline never scrolls the pinned title
+  // off the alt-screen. Everything else is the row viewport.
+  const CHROME_ROWS = 13;
+  let sepWidth = displayWidth(separator);
+
+  function rebuildLayout(): void {
+    layout = computeSessionPickerLayout(process.stdout.columns || 100, multiBot);
+    rows = buildRows();
+    header = buildHeader();
+    separator = '─'.repeat(displayWidth(header));
+    sepWidth = displayWidth(separator);
+  }
+  // Overlay a "N 更多" marker onto a separator line without changing its display
+  // width, so the up/down hidden-row counters cost no extra vertical lines.
+  const sepWithMarker = (marker: string): string => {
+    const label = ` ${marker} `;
+    const lw = displayWidth(label);
+    if (lw + 4 > sepWidth) return separator;
+    return `──${label}${'─'.repeat(sepWidth - 2 - lw)}`;
+  };
+
+  const fitLine = (text: string, width: number): string => {
+    if (width <= 0) return '';
+    const singleLine = sanitizeCellText(text);
+    return displayWidth(singleLine) <= width ? singleLine : truncate(singleLine, width);
+  };
+  // The ONLY place footer SGR colour is applied. `text` is treated as untrusted:
+  // it is sanitized (control chars stripped) and width-fitted first, then wrapped
+  // in a fixed whitelist SGR from `style`. No caller-supplied escape can survive,
+  // and there is no fast path that returns a raw/mixed string — closing the two
+  // bypasses where a session's target label / flash message could inject e.g.
+  // `\x1b[2J` (clear screen) into the footer and scroll the pinned title away.
+  const SGR: Record<FooterStyle, string> = {
+    error: '\x1b[31m',
+    success: '\x1b[32m',
+    warn: '\x1b[33m',
+    dim: '\x1b[2m',
+  };
+  const styledFooter = (style: FooterStyle, text: string, width: number): string =>
+    `${SGR[style]}${fitLine(text, width)}\x1b[0m`;
+  const blankRowPrefix = (): string => ' '.repeat(layout.prefixWidth);
+  const rowPrefix = (selected: boolean): string => {
+    if (!selected) return blankRowPrefix();
+    const pointer = '\x1b[36m❯\x1b[0m';
+    if (layout.prefixWidth >= 4) return `  ${pointer} `;
+    if (layout.prefixWidth === 3) return ` ${pointer} `;
+    if (layout.prefixWidth === 2) return `${pointer} `;
+    return layout.prefixWidth === 1 ? pointer : '';
+  };
+  const footerPrefixWidth = (): number => Math.min(2, layout.termWidth);
+  const footerContentWidth = (): number => Math.max(0, layout.termWidth - footerPrefixWidth());
+  const footerPrefix = (): string => ' '.repeat(footerPrefixWidth());
 
   function render(): void {
     process.stdout.write('\x1b[H\x1b[J');
 
-    process.stdout.write(`\x1b[1m botmux sessions\x1b[0m  \x1b[2m(${rows.length})\x1b[0m\n\n`);
-
-    // Header + separator — use same 4-char prefix as rows
-    process.stdout.write(`    ${separator}\n`);
-    process.stdout.write(`    \x1b[2m${header}\x1b[0m\n`);
-    process.stdout.write(`    ${separator}\n`);
+    const posLabel = rows.length > 0 ? `${cursor + 1}/${rows.length}` : '0';
+    const titleText = ` botmux sessions  (${posLabel})`;
+    if (displayWidth(titleText) <= layout.termWidth) {
+      process.stdout.write(`\x1b[1m botmux sessions\x1b[0m  \x1b[2m(${posLabel})\x1b[0m\n\n`);
+    } else {
+      process.stdout.write(`\x1b[1m${fitLine(titleText, layout.termWidth)}\x1b[0m\n\n`);
+    }
 
     if (rows.length === 0) {
-      process.stdout.write(`\n    \x1b[2m没有活跃会话\x1b[0m\n`);
-      process.stdout.write(`    ${separator}\n`);
-      process.stdout.write(`\n  \x1b[2mq 退出\x1b[0m\n`);
+      process.stdout.write(`${blankRowPrefix()}${separator}\n`);
+      process.stdout.write(`${blankRowPrefix()}\x1b[2m${header}\x1b[0m\n`);
+      process.stdout.write(`${blankRowPrefix()}${separator}\n`);
+      process.stdout.write(`\n${blankRowPrefix()}\x1b[2m${fitLine('没有活跃会话', Math.max(0, layout.termWidth - layout.prefixWidth))}\x1b[0m\n`);
+      process.stdout.write(`${blankRowPrefix()}${separator}\n`);
+      process.stdout.write(`\n${footerPrefix()}\x1b[2m${fitLine('q 退出', footerContentWidth())}\x1b[0m\n`);
       return;
     }
 
-    for (let i = 0; i < rows.length; i++) {
+    // Vertical viewport: render only the window of rows that fits the terminal
+    // height, scrolling to keep the cursor visible. Without this a long session
+    // list overflows the alt-screen and pushes the title/header/top rows off it.
+    const win = computeSessionPickerScrollWindow({
+      cursor,
+      scrollTop,
+      rowCount: rows.length,
+      termRows: process.stdout.rows || 24,
+      chromeRows: CHROME_ROWS,
+    });
+    scrollTop = win.scrollTop;
+    const { viewEnd, hiddenAbove, hiddenBelow } = win;
+
+    // Header + separator — use the same responsive prefix as rows.
+    process.stdout.write(`${blankRowPrefix()}${separator}\n`);
+    process.stdout.write(`${blankRowPrefix()}\x1b[2m${header}\x1b[0m\n`);
+    process.stdout.write(hiddenAbove > 0
+      ? `${blankRowPrefix()}\x1b[36m${sepWithMarker(`↑ ${hiddenAbove} 更多`)}\x1b[0m\n`
+      : `${blankRowPrefix()}${separator}\n`);
+
+    for (let i = scrollTop; i < viewEnd; i++) {
       const r = rows[i];
-      const pointer = i === cursor ? '\x1b[36m❯\x1b[0m' : ' ';
       if (i === cursor) {
-        process.stdout.write(`  ${pointer} \x1b[7m${r.text}\x1b[0m\n`);
+        process.stdout.write(`${rowPrefix(true)}\x1b[7m${r.text}\x1b[0m\n`);
       } else {
-        process.stdout.write(`  ${pointer} ${r.text}\n`);
+        process.stdout.write(`${rowPrefix(false)}${r.text}\n`);
       }
     }
 
-    process.stdout.write(`    ${separator}\n`);
+    process.stdout.write(hiddenBelow > 0
+      ? `${blankRowPrefix()}\x1b[36m${sepWithMarker(`↓ ${hiddenBelow} 更多`)}\x1b[0m\n`
+      : `${blankRowPrefix()}${separator}\n`);
 
-    // Footer info
+    // Footer info. Every dynamic field (targetLabel, backend session name) is
+    // untrusted session metadata, so it only ever reaches the terminal via
+    // styledFooter (sanitize → fit → whitelist SGR). The adopt hint's fixed
+    // suffix is trusted static text, appended after the fitted label.
     const selected = rows[cursor];
-    const targetHint = selected.isAdopt
-      ? `\x1b[33m${selected.targetLabel}\x1b[0m  \x1b[2mEnter 已禁用；请直接使用原 tmux/zellij/herdr 客户端。\x1b[0m`
-      : selected.canAttach
-        ? `\x1b[32m${selected.attachBackend}: ${selected.backendTarget?.sessionName}\x1b[0m`
-        : `\x1b[2m${selected.targetLabel}（不可连接）\x1b[0m`;
-    process.stdout.write(`\n  ${targetHint}\n`);
+    const width = footerContentWidth();
+    let footerLine: string;
+    if (selected.isAdopt) {
+      const suffix = '  Enter 已禁用；请直接使用原 tmux/zellij/herdr 客户端。';
+      const labelWidth = Math.max(0, width - displayWidth(suffix));
+      footerLine = `${styledFooter('warn', selected.targetLabel, labelWidth)}\x1b[2m${fitLine(suffix, width)}\x1b[0m`;
+    } else if (selected.canAttach) {
+      footerLine = styledFooter('success', `${selected.attachBackend}: ${selected.backendTarget?.sessionName}`, width);
+    } else {
+      footerLine = styledFooter('dim', `${selected.targetLabel}（不可连接）`, width);
+    }
+    process.stdout.write(`\n${footerPrefix()}${footerLine}\n`);
 
     // Flash message or confirmation prompt
     if (confirmDelete) {
       const s = selected.session;
-      process.stdout.write(`\n  \x1b[33m确认删除 ${s.sessionId.substring(0, 8)} "${truncate(s.title || '', 20)}"? (y/n)\x1b[0m\n`);
-    } else if (flashMsg) {
-      process.stdout.write(`\n  ${flashMsg}\n`);
+      const confirmation = `确认删除 ${s.sessionId.substring(0, 8)} "${truncate(s.title || '', 20)}"? (y/n)`;
+      process.stdout.write(`\n${footerPrefix()}${styledFooter('warn', confirmation, width)}\n`);
+    } else if (flash) {
+      process.stdout.write(`\n${footerPrefix()}${styledFooter(flash.style, flash.text, width)}\n`);
     } else {
       process.stdout.write('\n');
     }
 
     // Keybinding hints
-    process.stdout.write(`\n  \x1b[2m↑/↓ 选择  ⏎ ${selected?.canAttach ? '连接' : '不可连接'}  d 删除  q 退出\x1b[0m\n`);
+    const fullHints = `↑/↓ 选择  ⏎ ${selected?.canAttach ? '连接' : '不可连接'}  d 删除  q 退出`;
+    const compactHints = '↑/↓ 选择  ⏎  d  q';
+    const hints = displayWidth(fullHints) <= width ? fullHints : compactHints;
+    process.stdout.write(`\n${footerPrefix()}${styledFooter('dim', hints, width)}\n`);
   }
 
   return new Promise<void>((resolve) => {
@@ -3977,7 +5494,16 @@ function interactiveSessionPicker(active: SessionData[], probeSnapshot: BackingP
 
     render();
 
+    // Rebuild both axes on resize: rows/header must use the current columns or
+    // stale wide lines wrap and invalidate the vertical one-row-per-session math.
+    const onResize = (): void => {
+      rebuildLayout();
+      render();
+    };
+    process.stdout.on('resize', onResize);
+
     function cleanup(): void {
+      process.stdout.off('resize', onResize);
       process.stdin.setRawMode(false);
       process.stdin.pause();
       process.stdout.write('\x1b[?25h');   // show cursor
@@ -3989,11 +5515,18 @@ function interactiveSessionPicker(active: SessionData[], probeSnapshot: BackingP
     async function deleteSession(idx: number): Promise<void> {
       const r = rows[idx];
       const s = r.session;
-      const result = await closeSessionForDelete(s);
+
+      // Explicit delete is the abandon boundary. Prefer the owning daemon so
+      // its current in-memory FIFO is cleared atomically with close; offline
+      // fallback rereads the exact row and clears the latest ledger/commits.
+      const result = await abandonSessionAuthoritatively(s);
       if (!result.ok) {
-        flashMsg = `\x1b[31m✗ 删除失败: ${result.error}\x1b[0m`;
+        flash = { style: 'error', text: `✗ 删除失败: ${result.error}` };
         return;
       }
+      // A live daemon owns process/pane teardown and has re-resolved the latest
+      // generation. Only the locked offline path may clean up resources, using
+      // the freshly-read row rather than this TUI's stale snapshot.
 
       // Remove from active list and TUI rows
       const activeIdx = active.indexOf(s);
@@ -4001,9 +5534,12 @@ function interactiveSessionPicker(active: SessionData[], probeSnapshot: BackingP
       rows.splice(idx, 1);
 
       if (cursor >= rows.length) cursor = Math.max(0, rows.length - 1);
-      flashMsg = result.via === 'daemon'
-        ? `\x1b[32m✓ 已删除 ${s.sessionId.substring(0, 8)}\x1b[0m`
-        : `\x1b[33m✓ 已离线删除 ${s.sessionId.substring(0, 8)}\x1b[0m`;
+      // master's flash-object footer; the daemon/offline discriminant on
+      // abandonSessionAuthoritatively is `mode` (see its return type ~3573),
+      // NOT master's `via` — that belongs to a different helper.
+      flash = result.mode === 'daemon'
+        ? { style: 'success', text: `✓ 已删除 ${s.sessionId.substring(0, 8)}` }
+        : { style: 'warn', text: `✓ 已离线删除 ${s.sessionId.substring(0, 8)}` };
     }
 
     process.stdin.on('data', async (key: string) => {
@@ -4016,13 +5552,13 @@ function interactiveSessionPicker(active: SessionData[], probeSnapshot: BackingP
           try { await deleteSession(cursor); }
           finally { deleteInFlight = false; }
         } else {
-          flashMsg = '\x1b[2m取消删除\x1b[0m';
+          flash = { style: 'dim', text: '取消删除' };
         }
         render();
         return;
       }
 
-      flashMsg = '';
+      flash = null;
 
       // Ctrl-C or q or Esc
       if (key === '\x03' || key === 'q' || key === '\x1b') {
@@ -4062,19 +5598,19 @@ function interactiveSessionPicker(active: SessionData[], probeSnapshot: BackingP
       if (key === '\r' || key === '\n') {
         const selected = rows[cursor];
         if (selected.isAdopt) {
-          flashMsg = `\x1b[33m这是 adopt 会话；botmux 不 attach 用户 pane。目标: ${selected.targetLabel}\x1b[0m`;
+          flash = { style: 'warn', text: `这是 adopt 会话；botmux 不 attach 用户 pane。目标: ${selected.targetLabel}` };
           render();
           return;
         }
         if (!selected.canAttach) {
-          flashMsg = '\x1b[33m该会话没有可连接的持久后端\x1b[0m';
+          flash = { style: 'warn', text: '该会话没有可连接的持久后端' };
           render();
           return;
         }
         if (selected.attachBackend === 'zmx') {
           const target = selected.backendTarget;
           if (!target || target.backendType !== 'zmx') {
-            flashMsg = '\x1b[31mZMX attach target is missing or inconsistent\x1b[0m';
+            flash = { style: 'error', text: 'ZMX attach target is missing or inconsistent' };
             render();
             return;
           }
@@ -4086,7 +5622,7 @@ function interactiveSessionPicker(active: SessionData[], probeSnapshot: BackingP
             selected.session.sessionId,
           );
           if (!frozen.ok) {
-            flashMsg = `\x1b[31m${frozen.message}\x1b[0m`;
+            flash = { style: 'error', text: frozen.message };
             render();
             return;
           }
@@ -4100,7 +5636,7 @@ function interactiveSessionPicker(active: SessionData[], probeSnapshot: BackingP
         } else {
           const target = selected.backendTarget;
           if (!target || target.backendType !== 'tmux') {
-            flashMsg = '\x1b[31mtmux attach target is missing or inconsistent\x1b[0m';
+            flash = { style: 'error', text: 'tmux attach target is missing or inconsistent' };
             render();
             return;
           }
@@ -4191,16 +5727,16 @@ async function cmdList(): Promise<void> {
   const closeNow = async (arr: SessionData[], kind: 'scratch' | 'real'): Promise<number> => {
     let closed = 0;
     for (const s of arr) {
-      const result = await closeSessionForDelete(s);
-      if (result.ok) {
+      if (await pruneSessionAuthoritatively(s)) {
         closed++;
       } else {
-        // Keep it visible: mutating only the store while a possible owner
-        // daemon still has the row in memory lets the next message resurrect
-        // exactly the session auto-prune claimed to close.
+        // The owning daemon observed a newly unsettled FIFO after this CLI's
+        // liveness snapshot, or still has the row in memory. Keep it visible
+        // instead of abandoning it: mutating only the store here would let the
+        // next message resurrect exactly the session auto-prune claimed to close.
         live.push(s);
         console.warn(
-          `⚠️ 未自动清理 ${kind === 'scratch' ? '占位' : '会话'} ${s.sessionId.substring(0, 8)}：${result.error}`,
+          `⚠️ 未自动清理 ${kind === 'scratch' ? '占位' : '会话'} ${s.sessionId.substring(0, 8)}：owner 仍持有该会话或存在未结算派发`,
         );
       }
     }
@@ -4209,9 +5745,9 @@ async function cmdList(): Promise<void> {
   // Scratches: close silently — they were placeholders, not dead sessions.
   await closeNow(prunedScratch, 'scratch');
   if (pruned.length > 0) {
-    const closed = await closeNow(pruned, 'real');
-    if (closed > 0) {
-      console.log(`已自动清理 ${closed} 个不可恢复的会话（进程已退出或无可恢复后端）`);
+    const prunedCount = await closeNow(pruned, 'real');
+    if (prunedCount > 0) {
+      console.log(`已自动清理 ${prunedCount} 个不可恢复的会话（进程已退出或无可恢复后端）`);
     }
   }
 
@@ -4299,20 +5835,25 @@ async function cmdDelete(): Promise<void> {
     toDelete.sort((a, b) => Number(a.sessionId === currentSessionId) - Number(b.sessionId === currentSessionId));
   }
 
-  const online = listOnlineDaemons();
   let closed = 0;
   let offline = 0;
   let failed = 0;
   for (const s of toDelete) {
-    const result = await closeSessionForDelete(s, online);
+    // Explicit abandon boundary: route through the owning daemon so the ledger
+    // FIFO is cleared atomically with close; offline fallback rereads the row
+    // and clears the latest ledger/commits.
+    const result = await abandonSessionAuthoritatively(s);
     if (!result.ok) {
-      console.error(`✗ ${s.sessionId.substring(0, 8)} ${s.title}: ${result.error}`);
+      console.error(`✗ ${s.sessionId.substring(0, 8)} ${s.title}${result.error ? `: ${result.error}` : ''}`);
       failed++;
       continue;
     }
     closed++;
-    if (result.via === 'offline') offline++;
-    console.log(`✓ ${s.sessionId.substring(0, 8)} ${s.title}${result.via === 'offline' ? '（daemon 离线，本地收口）' : ''}`);
+    if (result.mode === 'offline') {
+      offline++;
+      if (result.cleanedBacking) console.log(`  killed ${result.cleanedBacking}`);
+    }
+    console.log(`✓ ${s.sessionId.substring(0, 8)} ${s.title}${result.mode === 'offline' ? '（daemon 离线，本地收口）' : ''}`);
   }
   console.log(`\n已关闭 ${closed} 个会话${offline ? `（${offline} 个离线收口）` : ''}${failed ? `，${failed} 个失败` : ''}`);
   if (failed > 0) process.exitCode = 1;
@@ -4442,6 +5983,7 @@ async function postSessionCliIpc(
       resolveDataDir(),
       sessionId,
       process.env.BOTMUX_SEND_RELAY,
+      process.env.BOTMUX_ORIGIN_CHANNEL_ID,
     );
     if (claim) {
       requestBody.originCapability = claim.capability;
@@ -5280,11 +6822,17 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
               默认使用 botmux 内置 Feishu Web QR 登录尝试自动导入权限/redirect/发布版本；可加 --no-open-platform-auto 跳过
   start       启动 daemon，并启动 mode=auto 的插件 service
   stop        停止 daemon（默认不停止插件 service；--with-plugin 显式停止 mode=auto 的插件 service）
-  restart     重启 daemon（默认不停止插件 service，core 启动后确保 mode=auto 正在运行；--with-plugin 显式先停再启动 auto service；--include-pm2 同时重启 PM2 God）
+  restart     重启 daemon（默认不停止插件 service，core 启动后确保 mode=auto 正在运行；--with-plugin 显式先停再启动 auto service）
+              --include-pm2 仅允许“入场时没有 live PM2 God”的干净启动；若已有 live God，整条命令会在 fleet/breadcrumb 零改动处拒绝，且不会信号或重启现存 God
+              首次升级若旧 daemon 缺少 shutdown protocol：先独立确认所有 Session/Riff 工作均 idle，再一次性运行
+              botmux restart --bootstrap-shutdown-protocol --yes；普通 stop/restart 仍保持 fail-closed
   logs        查看 daemon 日志（--lines N, --bot <0-based-index|pm2-name|appId>）
   status      查看 daemon 状态
   upgrade     升级到最新版本（别名：update）
-  dashboard   打印新的 Web Dashboard 一次性登录 URL（旧 token 同时失效）
+  dashboard current
+              获取当前 Web Dashboard 登录 URL（裸 \`dashboard\` 同义；没有则创建）
+  dashboard rotate
+              显式轮换 token，并打印新的登录 URL
   device enroll|status|logout
               在宿主终端注册、查看或清除 desktop device 凭证（AI CLI 会话内拒绝）
   list        列出活跃会话（交互式选择并连接 tmux）
@@ -5407,7 +6955,7 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
                                        v2 历史 run 私有静态归档；retire 在维护窗双验后原子迁入 quarantine
   （完整参数见 \`botmux workflow help\` / \`botmux template help\`）
   dispatch --bot <name> [...]          多话题编排：开子话题并把 bot 派进去（详见 \`botmux dispatch --help\`）
-  report [...]                         v3/编排场景向上汇报进度或结果（详见 \`botmux report --help\`）
+  report [...]                         交接 Review / 进展 / 结果并继承会话位置（详见 \`botmux report --help\`）
 
 新建飞书群:
   create-group --bot <name> [--bot ...] [--name "群名"]
@@ -5677,7 +7225,10 @@ Context flags: --session-id, --lark-app-id, --chat-id, --working-dir/--repo`);
     let meta = ctx.session?.whiteboardId ? getWhiteboard(ctx.session.whiteboardId) : undefined;
     if (!meta && argFlag(rest, '--create')) {
       meta = ensureDefaultWhiteboard({ larkAppId: ctx.larkAppId, chatId: ctx.chatId, workingDir: ctx.workingDir, sessionId: ctx.sessionId });
-      if (ctx.session) { ctx.session.whiteboardId = meta.id; saveSession(ctx.session); }
+      if (ctx.session) {
+        await patchSessionWhiteboardAuthoritatively(ctx.session, meta.id);
+        ctx.session.whiteboardId = meta.id;
+      }
     }
     if (!meta) {
       console.log(JSON.stringify({ enabled: true, current: null, hint: 'Run `botmux whiteboard current --create` to ensure the default board.' }, null, 2));
@@ -5691,7 +7242,10 @@ Context flags: --session-id, --lark-app-id, --chat-id, --working-dir/--repo`);
     requireWhiteboardEnabled();
     const ctx = currentWhiteboardContext(rest);
     const meta = createWhiteboard({ id: argValue(rest, '--id'), title: argValue(rest, '--title'), larkAppId: ctx.larkAppId, chatId: ctx.chatId, workingDir: ctx.workingDir, sessionId: ctx.sessionId });
-    if (ctx.session && !ctx.session.whiteboardId) { ctx.session.whiteboardId = meta.id; saveSession(ctx.session); }
+    if (ctx.session && !ctx.session.whiteboardId) {
+      await patchSessionWhiteboardAuthoritatively(ctx.session, meta.id);
+      ctx.session.whiteboardId = meta.id;
+    }
     console.log(JSON.stringify({ board: meta, path: whiteboardPath(meta.id) }, null, 2));
     return;
   }
@@ -5712,7 +7266,10 @@ Context flags: --session-id, --lark-app-id, --chat-id, --working-dir/--repo`);
   if (!id && whiteboardEnabled() && action === 'update') {
     const meta = ensureDefaultWhiteboard({ larkAppId: ctx.larkAppId, chatId: ctx.chatId, workingDir: ctx.workingDir, sessionId: ctx.sessionId });
     id = meta.id;
-    if (ctx.session) { ctx.session.whiteboardId = id; saveSession(ctx.session); }
+    if (ctx.session) {
+      await patchSessionWhiteboardAuthoritatively(ctx.session, id);
+      ctx.session.whiteboardId = id;
+    }
   }
   if (!id) { console.error('No whiteboard id. Pass --id or run `botmux whiteboard current --create`.'); process.exit(1); }
 
@@ -6376,7 +7933,8 @@ import { getSessionUsageSnapshot } from './core/cost-calculator.js';
 import {
   resolveQuoteTarget,
   validateMentionDecision,
-  shouldBlockMentionBackByParticipants,
+  mentionBackAmbiguity,
+  mentionBackAmbiguityError,
   parseAttentionFlag,
   attentionUsageError,
   managedVcQuoteError,
@@ -6437,6 +7995,7 @@ async function relaySend(
     resolveDataDir(),
     sid,
     relayDir,
+    process.env.BOTMUX_ORIGIN_CHANNEL_ID,
   )?.capability;
   // Structured request: the daemon-side watcher rebuilds the argv from these
   // validated fields (it NEVER executes raw argv — see buildRelayHostArgs).
@@ -6819,14 +8378,100 @@ async function cmdSend(rest: string[]): Promise<void> {
   // central session-capability gate — same hard door every Feishu-touching CLI
   // command consults.
   assertTurnTransportOrExit('send');
-  // Managed output attribution must come from the live process-tree marker,
-  // whose turn/attempt is refreshed by the worker. BOTMUX_TURN_ID is a
-  // spawn-time fallback and can be stale in a detached child after a later
-  // delivery starts, so it is never authority for receiver policy.
-  const liveMarkerCtx = resolveSessionContext(
-    resolveDataDir(),
-    process.env.BOTMUX_SESSION_ID,
-  );
+  // Resolve isolation marker-first. A visible host marker always wins over a
+  // leftover capability. Linux bwrap keeps its host-execution outbox; macOS
+  // read isolation instead challenges the owning daemon and trusts only the
+  // matching host-written read-only proof sidecar. The capability file itself
+  // may survive worker SIGKILL and is never direct-send authority.
+  let sendDataDir = resolveDataDir();
+  let liveMarkerCtx = findLiveAncestorSessionContext(sendDataDir);
+  const relayDir = process.env.BOTMUX_SEND_RELAY;
+  const sessionIdArg = argValue(rest, '--session-id');
+  const inheritedSessionId = process.env.BOTMUX_SESSION_ID?.trim();
+  const inheritedOriginChannelId = process.env.BOTMUX_ORIGIN_CHANNEL_ID?.trim();
+  const isolationSessionCandidates = [...new Set([
+    inheritedSessionId,
+    ancestorCtx?.sessionId,
+    sessionIdArg,
+  ].filter((value): value is string => !!value))];
+  const isolationMarkerPresent = isolationSessionCandidates
+    .some(sessionId => !!inheritedOriginChannelId
+      && hasManagedOriginIsolationMarker(
+        sendDataDir,
+        sessionId,
+        inheritedOriginChannelId,
+      ));
+  let osUserHomeDir: string;
+  try { osUserHomeDir = userInfo().homedir; }
+  catch {
+    console.error('botmux send refused: OS account home unavailable for isolation classification');
+    process.exit(2);
+  }
+  if (!osUserHomeDir) {
+    console.error('botmux send refused: OS account home unavailable for isolation classification');
+    process.exit(2);
+  }
+  const kernelReadIsolationDetected = managedOriginLegacyIsolationProbeAccess(osUserHomeDir)
+    === 'sandbox_denied'
+    || managedOriginIsolationSentinelAccess(osUserHomeDir) === 'sandbox_denied';
+  const isolatedSendRequired = !relayDir
+    && (kernelReadIsolationDetected
+      || process.env.BOTMUX_READ_ISOLATED === '1'
+      || (!liveMarkerCtx?.sessionId && isolationMarkerPresent));
+  let isolatedBoundSessionId: string | undefined;
+  if (isolatedSendRequired) {
+    if (!inheritedOriginChannelId || !/^[a-f0-9]{64}$/.test(inheritedOriginChannelId)) {
+      console.error('botmux send refused: read-isolated pane authority channel is missing or invalid');
+      process.exit(2);
+    }
+    const locators = isolationSessionCandidates.flatMap(sessionId => {
+      const locator = readManagedOriginRootLocator(osUserHomeDir, sessionId);
+      return locator ? [locator] : [];
+    });
+    if (locators.length !== 1) {
+      console.error('botmux send refused: read-isolated owning data-root locator is missing or ambiguous');
+      process.exit(2);
+    }
+    const locator = locators[0]!;
+    if ((sessionIdArg && sessionIdArg !== locator.sessionId)
+      || (inheritedSessionId && inheritedSessionId !== locator.sessionId)) {
+      console.error('botmux send refused: read-isolated session does not match the owning data-root locator');
+      process.exit(2);
+    }
+    isolatedBoundSessionId = locator.sessionId;
+    sendDataDir = locator.dataDir;
+    // A locator is data, not authority. Require the kernel to deny the probe
+    // under the locator-selected *actual* Botmux root. Legacy Seatbelt profiles
+    // already denied this dashboard-secret basename class at their real root;
+    // a child-forged fake root remains readable and is therefore rejected.
+    if (managedOriginDataRootProbeAccess(sendDataDir, locator.sessionId)
+      !== 'sandbox_denied') {
+      console.error('botmux send refused: locator-selected data root is not protected by the active sandbox');
+      process.exit(2);
+    }
+    // All later session/credential/marker reads in this short-lived command
+    // must use the host-bound root, never the child's mutable inherited value.
+    process.env.SESSION_DATA_DIR = sendDataDir;
+    liveMarkerCtx = findLiveAncestorSessionContext(sendDataDir);
+  }
+  const isolatedCapabilityCtx = !isolatedSendRequired && liveMarkerCtx?.sessionId
+    ? null
+    : readWorkflowSessionRelayContext({
+        env: process.env,
+        dataDir: sendDataDir,
+        // Keep one marker snapshot for the whole decision. In particular, do
+        // not let resolveSessionContext's protected-capability fallback get
+        // mislabeled as a live process marker.
+        findMarker: () => isolatedSendRequired ? null : liveMarkerCtx,
+      });
+  if (isolatedSendRequired
+    && (isolatedCapabilityCtx?.sessionId !== isolatedBoundSessionId
+      || isolatedCapabilityCtx?.originChannelId !== inheritedOriginChannelId)) {
+    console.error('botmux send refused: read-isolated capability is not bound to this session');
+    process.exit(2);
+  }
+  let isolatedAttestationContext: ManagedOriginAttestationContext | undefined;
+  let isolatedManagedOriginCtx: ManagedOriginAttestation | undefined;
   const trustedHostRelay = process.env.BOTMUX_HOST_RELAY_AUTHORIZED === '1';
   const trustedRelayAttemptRaw = Number(process.env.BOTMUX_DISPATCH_ATTEMPT);
   const trustedRelayCandidate = trustedHostRelay && process.env.BOTMUX_SESSION_ID
@@ -6838,14 +8483,53 @@ async function cmdSend(rest: string[]): Promise<void> {
           : undefined,
       }
     : undefined;
-  const sessionIdArg = argValue(rest, '--session-id');
   // Inside bwrap the PID namespace makes host marker traversal impossible.
   // The relay watcher therefore binds a short-lived host-issued capability to
   // the worker's live turn and performs the authoritative policy check.
-  const relayDir = process.env.BOTMUX_SEND_RELAY;
-  if (relayDir) {
+  if (relayDir && isolatedCapabilityCtx) {
     await relaySend(rest, relayDir);
     return;
+  }
+  if (relayDir && !liveMarkerCtx?.sessionId) {
+    // The child may delete or replace its writable outbox capability, while
+    // the immutable default snapshot remains visible. That snapshot is only a
+    // routing hint and can survive worker death; never fall through to direct
+    // Lark send when the live relay token is absent.
+    console.error('botmux send refused: managed host relay capability is stale or missing');
+    process.exit(2);
+  }
+  if (!relayDir && isolatedSendRequired && !isolatedCapabilityCtx) {
+    // Isolation classification must not depend on successfully parsing the
+    // rotating token. A missing/corrupt/revoked capability is an authorization
+    // failure, never permission to downgrade into the ordinary direct path.
+    console.error('botmux send refused: read-isolated managed origin capability is stale, corrupt, or missing');
+    process.exit(2);
+  }
+  if (!relayDir && isolatedCapabilityCtx) {
+    isolatedAttestationContext = {
+      sessionId: isolatedCapabilityCtx.sessionId,
+      channelId: isolatedCapabilityCtx.originChannelId!,
+      capability: isolatedCapabilityCtx.capability,
+      dataDir: sendDataDir,
+      ...(isolatedCapabilityCtx.larkAppId
+        ? { larkAppId: isolatedCapabilityCtx.larkAppId }
+        : {}),
+      ...(isolatedCapabilityCtx.ipcPortFallback !== undefined
+        ? { ipcPortFallback: isolatedCapabilityCtx.ipcPortFallback }
+        : {}),
+    };
+    try {
+      isolatedManagedOriginCtx = await attestManagedOrigin({
+        context: isolatedAttestationContext,
+        resolveIpcPort: (larkAppId) => {
+          try { return larkAppId ? findDaemon(larkAppId)?.ipcPort : undefined; }
+          catch { return undefined; }
+        },
+      });
+    } catch (err) {
+      console.error(`botmux send refused: ${err instanceof Error ? err.message : String(err)}`);
+      process.exit(2);
+    }
   }
   // Silent is an execution policy, not a prompt suggestion. During a durable
   // meeting turn, refuse botmux-mediated sends before either the direct-Lark or
@@ -6865,10 +8549,45 @@ async function cmdSend(rest: string[]): Promise<void> {
   )
     ? trustedRelayCandidate
     : undefined;
+  // Keep origin authority independent from the requested destination.  In
+  // particular, `--session-id <other>` may select where an ordinary Lark turn
+  // is sent, but it must never replace the session whose durable delivery sink
+  // governs this process.  Session identity may fall back to the inherited env
+  // for detached commands; the turn tuple may not. `ancestorCtx` deliberately
+  // adds spawn-time BOTMUX_TURN_ID/ATTEMPT compatibility fallbacks, which can be
+  // stale after a later turn, so only a parent-bound host relay or a fresh
+  // marker/protected-capability tuple can authorize a durable dispatch.
   const originSessionId = trustedRelayCtx?.sessionId
-    || liveMarkerCtx?.sessionId
-    || ancestorCtx?.sessionId
-    || sessionIdArg;
+    ?? liveMarkerCtx?.sessionId
+    ?? isolatedManagedOriginCtx?.sessionId
+    ?? ancestorCtx?.sessionId
+    ?? process.env.BOTMUX_SESSION_ID;
+  const authoritativeOriginTurnCtx = trustedRelayCtx
+    ? (trustedRelayCtx.turnId ? trustedRelayCtx : undefined)
+    : (liveMarkerCtx?.turnId
+        ? liveMarkerCtx
+        : isolatedManagedOriginCtx?.turnId
+          ? isolatedManagedOriginCtx
+          : undefined);
+  const originTurnId = authoritativeOriginTurnCtx?.turnId;
+  const originDispatchAttempt = authoritativeOriginTurnCtx?.dispatchAttempt;
+  const originSession = originSessionId
+    ? sessionsForOrigin.get(originSessionId)
+    : undefined;
+  const hostRelayRequiresCodexAppLedger = !!trustedRelayCtx
+    && process.env.BOTMUX_HOST_RELAY_REQUIRES_CODEX_APP_LEDGER === '1';
+  // The live worker authorizes a Codex App relay only while an exact durable
+  // dispatch remains unsettled. Recheck that prerequisite before any other
+  // managed-output policy or provider setup: terminal settlement can win the
+  // race between watcher authorization and this host child loading the store,
+  // and must never downgrade the send into an ordinary Lark message.
+  if ((hostRelayRequiresCodexAppLedger || isolatedManagedOriginCtx?.requiresCodexAppLedger)
+    && (originSession?.codexAppDispatchLedger?.length ?? 0) === 0) {
+    console.error(
+      `botmux send refused: authorized Codex App origin ${originSessionId}/${originTurnId} is no longer unsettled`,
+    );
+    process.exit(2);
+  }
   let explicitVcMeetingImOrigin: ReturnType<typeof resolveVcMeetingImTurnOrigin>;
   let vcMeetingListenerOutputOwner: { listenerAppId: string; meetingId: string } | undefined;
   let vcMeetingManagedSendOrigin: VcMeetingManagedSendOrigin | undefined;
@@ -6878,14 +8597,12 @@ async function cmdSend(rest: string[]): Promise<void> {
     dispatchAttempt: number;
   } | undefined;
   if (originSessionId) {
-    const originSession = sessionsForOrigin.get(originSessionId);
-    const originTurnId = trustedRelayCtx?.turnId ?? liveMarkerCtx?.turnId;
     const imOrigin = resolveVcMeetingImTurnOrigin(originSession, originTurnId);
     const managedOrigin: VcMeetingManagedSendOrigin = {
       receiverSessionId: originSessionId,
       receiverSession: !!originSession?.vcMeetingReceiver,
       turnId: originTurnId,
-      dispatchAttempt: trustedRelayCtx?.dispatchAttempt ?? liveMarkerCtx?.dispatchAttempt,
+      dispatchAttempt: originDispatchAttempt,
       currentImTurnOrigin: imOrigin,
     };
     const decision = evaluateVcMeetingManagedSend(resolveDataDir(), managedOrigin);
@@ -6907,7 +8624,7 @@ async function cmdSend(rest: string[]): Promise<void> {
       }
     }
     if (decision.kind === 'listener_thread'
-      && (trustedRelayCtx?.dispatchAttempt ?? liveMarkerCtx?.dispatchAttempt) === undefined) {
+      && originDispatchAttempt === undefined) {
       explicitVcMeetingImOrigin = imOrigin;
     }
   }
@@ -7069,7 +8786,7 @@ async function cmdSend(rest: string[]): Promise<void> {
   }
 
   const sessions = loadSessions();
-  const currentTurnId = ancestorCtx?.turnId ?? process.env.BOTMUX_TURN_ID;
+  const currentTurnId = originTurnId;
   let s = sessions.get(sid);
 
   // Riff (remote backend) sandbox: no local daemon/sessions.json/bots.json.
@@ -7105,9 +8822,166 @@ async function cmdSend(rest: string[]): Promise<void> {
   let deferredMaterializedByThisCommand = false;
   let deferredTopicRootMessageIdForOutput: string | undefined;
 
-  // 本轮的回复锚点：优先按 turnId 精确取 per-turn 落点（排队/并发轮次不再被
-  // 后到轮次覆盖 currentReplyTarget 而塌成群顶层 plain），无记录再退回单槽。
+  // Prefer the exact per-turn reply anchor; the latest single slot is only a
+  // compatibility fallback for sessions persisted before replyTargets.
   const turnReplyTarget = pickTurnReplyTarget(s, currentTurnId);
+
+  const exactOriginDispatch = (() => {
+    const unsettledOriginDispatches = originSession?.codexAppDispatchLedger ?? [];
+    // The live worker authorized this host re-exec against an exact unsettled
+    // Codex App entry. If terminal settlement/revocation won the race before
+    // this child reloaded the store, never degrade into an ordinary Lark send
+    // against mutable session state.
+    if (unsettledOriginDispatches.length === 0) {
+      return undefined;
+    }
+    // A detached/backgrounded command can still inherit the correct session id
+    // but only a spawn-time (and now stale) turn env.  If this session has any
+    // unsettled durable output, absence of a fresh marker/capability tuple must
+    // fail closed rather than silently falling through to ordinary Lark IM.
+    if (!originTurnId) {
+      console.error(
+        `botmux send refused: origin session ${originSessionId} has unsettled durable output but no fresh authoritative dispatch identity`,
+      );
+      process.exit(2);
+    }
+    const turnMatches = unsettledOriginDispatches
+      .filter(entry => entry.turnId === originTurnId);
+    const exactMatches = originDispatchAttempt === undefined
+      ? turnMatches
+      : turnMatches.filter(entry => entry.dispatchAttempt === originDispatchAttempt);
+    // Once a durable turn exists, a supplied attempt must match it exactly.
+    // Falling back to another attempt would let a stale/replayed process select
+    // the wrong sink.  With no attempt, multiple entries are equally unsafe.
+    if (exactMatches.length !== 1) {
+      const detail = originDispatchAttempt === undefined
+        ? `${turnMatches.length} ledger entries share the turn id`
+        : `${exactMatches.length} ledger entries match attempt ${originDispatchAttempt}`;
+      console.error(
+        `botmux send refused: origin dispatch ${originSessionId}/${originTurnId} is ambiguous (${detail})`,
+      );
+      process.exit(2);
+    }
+    return exactMatches[0];
+  })();
+
+  // Frozen reply routing applies only when the selected destination is the
+  // trusted origin session.  A cross-session publish must not accidentally
+  // reuse a coincidentally-equal turn id from the destination ledger.
+  const frozenTurnDispatch = originSessionId === sid
+    ? exactOriginDispatch
+    : undefined;
+  const frozenTurnReplyTarget = frozenTurnDispatch?.replyTarget;
+  if (exactOriginDispatch?.deliverySink === 'http_wait'
+    || exactOriginDispatch?.deliverySink === 'http_async'
+    || exactOriginDispatch?.deliverySink === 'suppressed') {
+    console.error(
+      `botmux send refused: origin turn ${originTurnId} is bound to the `
+      + `${exactOriginDispatch.deliverySink} host sink`,
+    );
+    process.exit(2);
+  }
+
+  // A proof is a point-in-time liveness check, not a five-second send lease.
+  // Re-challenge immediately before observable provider effects so lengthy
+  // local parsing/card preparation cannot carry an old capability across a
+  // worker restart, turn rotation, or Codex ledger settlement.
+  const revalidateIsolatedOriginBeforeEffect = async (): Promise<ManagedOriginAttestation | undefined> => {
+    if (!isolatedAttestationContext || !isolatedManagedOriginCtx) return undefined;
+    const fresh = await attestManagedOrigin({
+      context: isolatedAttestationContext,
+      resolveIpcPort: (larkAppId) => {
+        try { return larkAppId ? findDaemon(larkAppId)?.ipcPort : undefined; }
+        catch { return undefined; }
+      },
+    });
+    if (fresh.sessionId !== isolatedManagedOriginCtx.sessionId
+      || fresh.turnId !== isolatedManagedOriginCtx.turnId
+      || fresh.dispatchAttempt !== isolatedManagedOriginCtx.dispatchAttempt
+      || fresh.requiresCodexAppLedger !== isolatedManagedOriginCtx.requiresCodexAppLedger) {
+      throw new Error('managed origin changed before provider effect');
+    }
+    const currentOriginSession = loadSessions().get(fresh.sessionId);
+    const ledgerDecision = validateCodexAppManagedSendOrigin(
+      currentOriginSession?.codexAppDispatchLedger,
+      fresh,
+      fresh.requiresCodexAppLedger,
+    );
+    if (!ledgerDecision.ok
+      || ledgerDecision.requiresLedger !== fresh.requiresCodexAppLedger) {
+      throw new Error(
+        `managed origin ledger changed before provider effect${ledgerDecision.ok ? '' : `: ${ledgerDecision.error}`}`,
+      );
+    }
+    return fresh;
+  };
+  const fenceIsolatedOriginBeforeEffect = async (): Promise<void> => {
+    await revalidateIsolatedOriginBeforeEffect();
+  };
+  const isolatedHookOrigin = isolatedAttestationContext?.ipcPortFallback
+    && isolatedManagedOriginCtx
+    ? {
+        ipcPort: isolatedAttestationContext.ipcPortFallback,
+        sessionId: isolatedManagedOriginCtx.sessionId,
+        capability: isolatedAttestationContext.capability,
+        turnId: isolatedManagedOriginCtx.turnId,
+        ...(isolatedManagedOriginCtx.dispatchAttempt !== undefined
+          ? { dispatchAttempt: isolatedManagedOriginCtx.dispatchAttempt }
+          : {}),
+      }
+    : undefined;
+  // Outbound hooks are a distinct post-provider effect. Preserve normal hook
+  // behavior, but bind it to a fresh challenge of this command's original
+  // protected claim. The Lark client treats fence failure as hook-only loss so
+  // an already-delivered primary is never reported failed and duplicated.
+  const outboundMessageOptions = (suppressHook = false) =>
+    suppressHook
+      ? { suppressHook: true as const }
+      : isolatedAttestationContext
+        ? isolatedHookOrigin
+          ? {
+              beforeHook: fenceIsolatedOriginBeforeEffect,
+              hookOrigin: isolatedHookOrigin,
+            }
+          : { suppressHook: true as const }
+        : undefined;
+
+  // A document-comment turn has exactly one supported observable effect: a
+  // plain text reply to its frozen origin target.  Validate the complete shape
+  // before reading stdin/content/card files and before any TTS, upload, or Lark
+  // provider call.  In particular, an explicit destination session is not an
+  // escape hatch from the origin sink.
+  const docTarget = originTurnId
+    ? originSession?.docCommentTargets?.[originTurnId]
+    : undefined;
+  // Codex App turns are governed exclusively by their exact dispatch ledger:
+  // a settled/missing ledger entry must never fall back to mutable session
+  // state. Other CLI adapters predate that ledger, so their frozen per-turn
+  // docCommentTargets entry remains the authoritative origin sink.
+  const isOriginDocCommentTurn = exactOriginDispatch?.deliverySink === 'doc_comment'
+    || (!exactOriginDispatch && originSession?.cliId !== 'codex-app' && !!docTarget);
+  if (isOriginDocCommentTurn) {
+    if (!docTarget || !originSession?.larkAppId) {
+      console.error('botmux send refused: this turn is bound to a document comment, but its exact origin target is no longer available');
+      process.exit(2);
+    }
+    if (sid !== originSessionId
+      || sendTopLevel
+      || !!overrideChatId
+      || !!sendInto
+      || asVoice
+      || images.length > 0
+      || files.length > 0
+      || videoAttachments.length > 0
+      || videoCovers.length > 0
+      || customCardRequested
+      || attention.requested
+      || explicitQuote !== undefined
+      || noQuote) {
+      console.error('botmux send refused: a document-comment turn supports only its exact plain-text comment reply');
+      process.exit(2);
+    }
+  }
 
   // Read content from: --content-file > positional arg > stdin
   let content = '';
@@ -7210,8 +9084,12 @@ async function cmdSend(rest: string[]): Promise<void> {
     const targetChatId = overrideChatId ?? s.chatId;
     let dir: string | undefined;
     try {
-      const out = await synthesizeVoiceOpus(appId, content);
+      await revalidateIsolatedOriginBeforeEffect();
+      const out = await synthesizeVoiceOpus(appId, content, {
+        beforeProviderEffect: fenceIsolatedOriginBeforeEffect,
+      });
       dir = out.dir;
+      await revalidateIsolatedOriginBeforeEffect();
       const fileKey = await uploadFile(appId, out.path, { duration: out.durationMs });
       const sentAtMs = Date.now();
       const proposedOutput = {
@@ -7235,9 +9113,7 @@ async function cmdSend(rest: string[]): Promise<void> {
         messageId = prepared.messageId;
       } else {
         revalidateVcMeetingManagedSend();
-        const managedProviderOptions = prepared
-          ? { suppressHook: true }
-          : undefined;
+        const managedProviderOptions = outboundMessageOptions(!!prepared);
         const deferred = !sendInto && (!overrideChatId || overrideChatId === s.chatId)
           ? await dispatchDeferredTopicSend({
               dataDir: resolveDataDir(),
@@ -7248,9 +9124,18 @@ async function cmdSend(rest: string[]): Promise<void> {
               content: canonicalOutput.content,
               msgType: canonicalOutput.msgType,
               uuid: prepared?.providerKey,
-              sendRoot: (body, type, uuid) => sendMessage(appId, targetChatId, body, type, uuid, undefined, managedProviderOptions),
-              sendTitleSeed: (title, uuid) => sendMessage(appId, targetChatId, title, 'text', uuid),
-              replyRoot: (root, body, type, uuid) => replyMessage(appId, root, body, type, true, uuid, undefined, managedProviderOptions),
+              sendRoot: async (body, type, uuid) => {
+                await revalidateIsolatedOriginBeforeEffect();
+                return sendMessage(appId, targetChatId, body, type, uuid, undefined, managedProviderOptions);
+              },
+              sendTitleSeed: async (title, uuid) => {
+                await revalidateIsolatedOriginBeforeEffect();
+                return sendMessage(appId, targetChatId, title, 'text', uuid);
+              },
+              replyRoot: async (root, body, type, uuid) => {
+                await revalidateIsolatedOriginBeforeEffect();
+                return replyMessage(appId, root, body, type, true, uuid, undefined, managedProviderOptions);
+              },
             })
           : { handled: false };
         if (deferred.handled && deferred.messageId) {
@@ -7258,17 +9143,20 @@ async function cmdSend(rest: string[]): Promise<void> {
           deferredTopicRootMessageIdForOutput = deferred.rootMessageId;
           messageId = deferred.messageId;
         } else {
-          const canonicalTarget = resolveSendTarget({
-            into: sendInto,
-            topLevel: sendTopLevel,
-            chatScope: s.scope === 'chat',
-            chatId: canonicalOutput.targetChatId,
-            rootMessageId: s.rootMessageId,
-            replyTargetRootId: turnReplyTarget?.rootMessageId,
-            replyTargetTurnId: turnReplyTarget?.turnId,
-            replyTargetQuoteOnly: turnReplyTarget?.quoteOnly,
-            currentTurnId,
-          });
+          const canonicalTarget = !sendInto && !sendTopLevel && !overrideChatId && frozenTurnReplyTarget
+            ? frozenTurnReplyTarget
+            : resolveSendTarget({
+                into: sendInto,
+                topLevel: sendTopLevel,
+                chatScope: s.scope === 'chat',
+                chatId: canonicalOutput.targetChatId,
+                rootMessageId: s.rootMessageId,
+                replyTargetRootId: turnReplyTarget?.rootMessageId,
+                replyTargetTurnId: turnReplyTarget?.turnId,
+                replyTargetQuoteOnly: turnReplyTarget?.quoteOnly,
+                currentTurnId,
+              });
+          await revalidateIsolatedOriginBeforeEffect();
           messageId = canonicalTarget.mode === 'plain'
             ? await sendMessage(
                 appId,
@@ -7330,28 +9218,22 @@ async function cmdSend(rest: string[]): Promise<void> {
   }
 
   // ── 文档评论入口分流（/watch-comment / /subscribe-lark-doc）─────────────────
-  // 本轮若由飞书文档评论触发（daemon 已把落点写进 session.docCommentTargets[turnId]），
-  // 把用户可见回复发表为飞书文档评论，而非发回飞书会话。绕过 @ 硬门（评论不 @ 飞书
-  // 用户）。显式改路由（--top-level / --chat-id / --into）时不分流，让模型仍能主动
-  // 用 BOTMUX_TURN_ID 从 per-turn map 取本轮落点；非文档轮的 turnId 不会命中 map，
-  // 天然不会误投。per-turn map 设计：并发评论之间互不覆盖，不会串线。
-  const docTarget = currentTurnId ? s.docCommentTargets?.[currentTurnId] : undefined;
-  if (docTarget && !sendTopLevel && !overrideChatId && !sendInto) {
-    if (customCardRequested) {
-      console.error('botmux send: 文档评论回复不支持 --card-file/--card-json；请改用普通文本，或显式 --top-level/--chat-id 发到飞书群');
-      process.exit(2);
-    }
+  // The authority and payload-shape checks ran before content/provider work.
+  // Use only the trusted origin session here; `--session-id` is a destination
+  // selector for ordinary Lark turns and cannot retarget a document turn.
+  if (isOriginDocCommentTurn) {
+    const exactDocTarget = docTarget!;
+    const exactDocSession = originSession!;
     const { registerBot, loadBotConfigs } = await import('./bot-registry.js');
     try { for (const cfg of loadBotConfigs()) registerBot(cfg); } catch { /* */ }
   if (envPinnedRiffBot) { try { registerBot(envPinnedRiffBot); } catch { /* */ } }
     const { replyToDocComment, chunkCommentText, removeCommentReaction } = await import('./im/lark/doc-comment.js');
-    const appId = s.larkAppId!;
-    const loc = localeForBot(appId);
+    const appId = exactDocSession.larkAppId!;
     try {
       // @ 落点：--mention-back → 回 @ 原评论人；--mention <open_id[:name]> → @ 指定人；
       // 否则（--no-mention / 无）不 @。文档评论里靠 person 元素渲染 @，仅首块加。
       let docMentionOpenId: string | undefined;
-      if (mentionBack) docMentionOpenId = docTarget.replyToOpenId;
+      if (mentionBack) docMentionOpenId = exactDocTarget.replyToOpenId;
       else if (mentionArgs.length > 0) {
         const first = mentionArgs[0];
         const idx = first.indexOf(':');
@@ -7360,13 +9242,21 @@ async function cmdSend(rest: string[]): Promise<void> {
       // 嵌套回复到用户那条评论 thread（已挂其下，无需 ↪ 前缀）。
       const chunks = chunkCommentText(content);
       for (let i = 0; i < chunks.length; i++) {
-        await replyToDocComment(appId, { fileToken: docTarget.fileToken, fileType: docTarget.fileType }, docTarget.commentId, chunks[i], i === 0 ? docMentionOpenId : undefined);
+        await replyToDocComment(
+          appId,
+          { fileToken: exactDocTarget.fileToken, fileType: exactDocTarget.fileType },
+          exactDocTarget.commentId,
+          chunks[i],
+          i === 0 ? docMentionOpenId : undefined,
+          { beforeProviderEffect: fenceIsolatedOriginBeforeEffect },
+        );
       }
       // 清理 "Typing" reaction（bot 已回复完毕）。
-      if (docTarget.reactionId && docTarget.replyId) {
+      if (exactDocTarget.reactionId && exactDocTarget.replyId) {
         await removeCommentReaction(appId,
-          { fileToken: docTarget.fileToken, fileType: docTarget.fileType },
-          docTarget.commentId, docTarget.replyId, docTarget.reactionId);
+          { fileToken: exactDocTarget.fileToken, fileType: exactDocTarget.fileType },
+          exactDocTarget.commentId, exactDocTarget.replyId, exactDocTarget.reactionId,
+          { beforeProviderEffect: fenceIsolatedOriginBeforeEffect });
       }
       // 写 bridge send marker → 抑制 worker 的 final_output 兜底（否则会再补一条评论）。
       try {
@@ -7374,20 +9264,18 @@ async function cmdSend(rest: string[]): Promise<void> {
         if (!existsSync(markerDir)) mkdirSync(markerDir, { recursive: true });
         const marker: Record<string, unknown> = {
           sentAtMs: Date.now(),
-          messageId: `doc:${docTarget.commentId}`,
+          messageId: `doc:${exactDocTarget.commentId}`,
           contentLength: content.length,
         };
         const previewText = buildBridgeSendPreviewText(content);
         if (previewText) marker.previewText = previewText;
-        appendFileSync(join(markerDir, `${sid}.jsonl`), JSON.stringify(marker) + '\n');
+        appendFileSync(join(markerDir, `${originSessionId}.jsonl`), JSON.stringify(marker) + '\n');
       } catch { /* best-effort：漏记只多一条兜底 */ }
-      // 清理已消费的 per-turn 落点，避免 session 文件无限堆积。
-      if (s.docCommentTargets && currentTurnId && s.docCommentTargets[currentTurnId]) {
-        delete s.docCommentTargets[currentTurnId];
-        try { saveSession(s); } catch { /* best-effort */ }
-      }
-      console.error(`✓ 已回复文档评论 ${docTarget.commentId.slice(0, 12)}（${chunks.length} 条）`);
-      console.log(JSON.stringify({ success: true, commentId: docTarget.commentId, sessionId: sid, kind: 'doc-comment', chunks: chunks.length }));
+      // Do not write this startup snapshot back after the async provider calls:
+      // the daemon may have advanced the dispatch ledger or accepted another
+      // turn in the meantime.  Daemon settlement owns exact target retirement.
+      console.error(`✓ 已回复文档评论 ${exactDocTarget.commentId.slice(0, 12)}（${chunks.length} 条）`);
+      console.log(JSON.stringify({ success: true, commentId: exactDocTarget.commentId, sessionId: originSessionId, kind: 'doc-comment', chunks: chunks.length }));
     } catch (e: any) {
       console.error(`文档评论发送失败：${e?.message ?? e}`);
       process.exit(1);
@@ -7409,7 +9297,16 @@ async function cmdSend(rest: string[]): Promise<void> {
     }
   }
   const replyTargetSenderOpenId = explicitVcMeetingImOrigin?.replyTargetSenderOpenId
-    ?? s.quoteTargetSenderOpenId;
+    ?? frozenTurnDispatch?.replyTargetSenderOpenId
+    ?? turnReplyTarget?.senderOpenId
+    // #750 exact-turn contract: the global latest-slot quote sender may ONLY be
+    // borrowed as a legacy fallback when there is NO currentTurnId (true
+    // legacy/no-turn send). With a turnId, an exact-turn map miss/eviction must
+    // resolve to NO sender — never the global slot, which may have advanced to a
+    // DIFFERENT turn B and would mis-@ B as A's --mention-back (the cross-turn
+    // bug #750 fixed). pickTurnReplyTarget already enforces
+    // quoteTargetId===currentTurnId for its own hit.
+    ?? (currentTurnId ? undefined : s.quoteTargetSenderOpenId);
 
   // @ hard-gate (config.send.requireMentionDecision, default on): force the
   // model to make an explicit @ decision before sending. --top-level publish
@@ -7424,12 +9321,8 @@ async function cmdSend(rest: string[]): Promise<void> {
   });
   if (!mentionGate.ok) { console.error(mentionGate.error); process.exit(2); }
 
-  // Register bots so the Lark client works. MUST run before the participant
-  // gate below: that gate calls getGroupStats → getBotClient, which throws
-  // "Bot not registered" in this standalone `botmux send` process (a fresh
-  // process with an empty registry) — getGroupStats would then soft-fail to
-  // {999,999} and wrongly block --mention-back even in a true 1v1. registerBot
-  // is idempotent, so the downstream send path reuses these same clients.
+  // Register bots so the downstream Lark client works. registerBot is
+  // idempotent, so all send paths reuse these same clients.
   // envPinnedRiffBot is re-registered LAST so a remote env credential is never
   // clobbered by a stale bots.json entry for the same app.
   const { registerBot, loadBotConfigs, findOncallChatForAnyBot, getBot } = await import('./bot-registry.js');
@@ -7437,30 +9330,20 @@ async function cmdSend(rest: string[]): Promise<void> {
   try { for (const cfg of loadBotConfigs()) registerBot(cfg); } catch { /* */ }
   if (envPinnedRiffBot) { try { registerBot(envPinnedRiffBot); } catch { /* */ } }
 
-  // Participant gate for --mention-back: in a true 1v1 the triggerer is the
-  // only counterpart so auto-@-ing them back is unambiguous, but once a third
-  // party joins (humans + bots > 2) "who triggered this turn" is no longer
-  // reliably "who should be addressed". Force an explicit --mention there.
-  // Symmetric with the inbound un-@ gate (event-dispatcher getGroupStats).
-  // Only fetch when mention-back is actually requested AND the chat isn't a p2p
-  // DM (inherently 1v1) — keeps the common send path free of an API round-trip.
-  if (mentionBack && s.chatType !== 'p2p' && s.larkAppId && s.chatId && !sendTopLevel) {
-    try {
-      const { getGroupStats } = await import('./im/lark/event-dispatcher.js');
-      const { userCount, botCount } = await getGroupStats(s.larkAppId, s.chatId);
-      if (shouldBlockMentionBackByParticipants({ chatType: s.chatType, userCount, botCount })) {
-        console.error(
-          `--mention-back 在多人会话（当前 ${userCount} 人 + ${botCount} bot）里不可用：`
-          + '"回复触发这轮的人/bot" 在多方场景可能 @ 错对象。请改用 --mention <ou:Name> 显式点名，'
-          + '或 --no-mention 不 @。',
-        );
-        process.exit(2);
-      }
-    } catch (err: any) {
-      // getGroupStats already soft-fails to {999,999} (→ block) internally, so
-      // reaching here means the dynamic import itself failed. Fail-closed to a
-      // clear error rather than silently letting a possibly-wrong @ through.
-      console.error(`无法确认会话人数以校验 --mention-back：${err?.message ?? err}。请改用 --mention <ou:Name> 或 --no-mention。`);
+  // Ambiguity gate for --mention-back. --mention-back means "@ back the one
+  // counterpart who triggered this turn"; that is only unambiguous when this
+  // turn's window had a single counterpart. Once 2+ distinct people/bots took
+  // part (a human + a peer bot, two humans, the triggerer plus someone they
+  // @-ed, a type-ahead follow-up from a third party, …), block --mention-back
+  // and hand the model the exact candidates so it can --mention <open_id> the
+  // right one instead of guessing (or mis-@-ing the lone human). Reads the
+  // persisted per-turn participant window — no group-stats round-trip. Explicit
+  // VC turns carry their own single-target origin, so they skip this gate.
+  if (mentionBack && !explicitVcMeetingImOrigin && !sendTopLevel) {
+    const window = collectTurnWindowParticipants(s, currentTurnId);
+    const ambiguity = mentionBackAmbiguity({ chatType: s.chatType, participants: window.participants, incomplete: window.incomplete });
+    if (ambiguity.ambiguous) {
+      console.error(mentionBackAmbiguityError(ambiguity.candidates, ambiguity.incomplete));
       process.exit(2);
     }
   }
@@ -7492,7 +9375,12 @@ async function cmdSend(rest: string[]): Promise<void> {
   // Compute the actual outbound anchor before the advisory guard. A chat-scope
   // sender can still reply into a per-turn topic, so sender scope alone does
   // not describe which peer sessions are reachable.
-  const sendTarget = resolveSendTarget({ into: sendInto, topLevel: sendTopLevel, chatScope: isChatScope, chatId: targetChatId, rootMessageId: s.rootMessageId, replyTargetRootId: turnReplyTarget?.rootMessageId, replyTargetTurnId: turnReplyTarget?.turnId, replyTargetQuoteOnly: turnReplyTarget?.quoteOnly, currentTurnId });
+  // #597: a frozen per-turn reply target (from a Codex App dispatch) overrides
+  // the nominal resolveSendTarget in chat scope so a steered/dispatched turn
+  // replies to its own origin, not the session's latest human quote target.
+  const sendTarget = !sendInto && !sendTopLevel && !overrideChatId && frozenTurnReplyTarget
+    ? frozenTurnReplyTarget
+    : resolveSendTarget({ into: sendInto, topLevel: sendTopLevel, chatScope: isChatScope, chatId: targetChatId, rootMessageId: s.rootMessageId, replyTargetRootId: turnReplyTarget?.rootMessageId, replyTargetTurnId: turnReplyTarget?.turnId, replyTargetQuoteOnly: turnReplyTarget?.quoteOnly, currentTurnId });
   const dataDir = resolveDataDir();
   const deferredBinding = !sendInto && (!overrideChatId || overrideChatId === s.chatId)
     ? readDeferredTopicBinding(dataDir, s.sessionId)
@@ -7614,7 +9502,9 @@ async function cmdSend(rest: string[]): Promise<void> {
   // Ordinary delivery uses the nominal target. Deferred delivery gets first
   // refusal below; the advisory mirrors its existing binding in
   // `reachabilityTarget` above so both paths agree about the effective root.
-  const dispatch = async (
+  // (sendTarget itself is defined once above, carrying #597's frozen per-turn
+  // reply-target override.)
+  const dispatchAfterOriginGate = async (
     content: string,
     msgType: string,
     uuid?: string,
@@ -7633,29 +9523,38 @@ async function cmdSend(rest: string[]): Promise<void> {
         content,
         msgType,
         uuid,
-        sendRoot: (body, type, rootUuid) => sendMessage(
-          appId,
-          targetChatId,
-          body,
-          type,
-          rootUuid,
-          hookContext,
-          suppressHook ? { suppressHook: true } : undefined,
-        ),
+        sendRoot: async (body, type, rootUuid) => {
+          await revalidateIsolatedOriginBeforeEffect();
+          return sendMessage(
+            appId,
+            targetChatId,
+            body,
+            type,
+            rootUuid,
+            hookContext,
+            outboundMessageOptions(!!suppressHook),
+          );
+        },
         // The optional title is the root seed and the actual alert follows as
         // its first reply. Do not emit a user outbound hook for presentation-
         // only seed text; the alert itself still goes through the hook path.
-        sendTitleSeed: (title, rootUuid) => sendMessage(appId, targetChatId, title, 'text', rootUuid),
-        replyRoot: (root, body, type, replyUuid) => replyMessage(
-          appId,
-          root,
-          body,
-          type,
-          true,
-          replyUuid,
-          hookContext,
-          suppressHook ? { suppressHook: true } : undefined,
-        ),
+        sendTitleSeed: async (title, rootUuid) => {
+          await revalidateIsolatedOriginBeforeEffect();
+          return sendMessage(appId, targetChatId, title, 'text', rootUuid);
+        },
+        replyRoot: async (root, body, type, replyUuid) => {
+          await revalidateIsolatedOriginBeforeEffect();
+          return replyMessage(
+            appId,
+            root,
+            body,
+            type,
+            true,
+            replyUuid,
+            hookContext,
+            outboundMessageOptions(!!suppressHook),
+          );
+        },
       });
       if (deferred.handled && deferred.messageId) {
         deferredMaterializedByThisCommand ||= deferred.materializedNow === true;
@@ -7663,17 +9562,18 @@ async function cmdSend(rest: string[]): Promise<void> {
         return deferred.messageId;
       }
     }
+    await revalidateIsolatedOriginBeforeEffect();
     return sendTarget.mode === 'plain'
-      ? sendMessage(
+      ? await sendMessage(
           appId,
           sendTarget.chatId,
           content,
           msgType,
           uuid,
           hookContext,
-          suppressHook ? { suppressHook: true } : undefined,
+          outboundMessageOptions(!!suppressHook),
         )
-      : replyMessage(
+      : await replyMessage(
           appId,
           sendTarget.rootMessageId,
           content,
@@ -7681,8 +9581,17 @@ async function cmdSend(rest: string[]): Promise<void> {
           sendTarget.mode === 'thread',
           uuid,
           hookContext,
-          suppressHook ? { suppressHook: true } : undefined,
+          outboundMessageOptions(!!suppressHook),
         );
+  };
+  const dispatch = async (
+    content: string,
+    msgType: string,
+    uuid?: string,
+    suppressHook?: boolean,
+  ): Promise<string> => {
+    await revalidateIsolatedOriginBeforeEffect();
+    return dispatchAfterOriginGate(content, msgType, uuid, suppressHook);
   };
   const recordBridgeSendMarker = (sentAtMs: number, messageId: string, sentContent: string): void => {
     try {
@@ -7707,11 +9616,17 @@ async function cmdSend(rest: string[]): Promise<void> {
     // belong to another queued IM turn and is not part of the delivery action.
     sessionQuoteTargetId: vcMeetingDeliveryReplyOrigin
       ? undefined
-      : explicitVcMeetingImOrigin?.larkMessageId ?? s.quoteTargetId,
+      : explicitVcMeetingImOrigin?.larkMessageId
+        ?? frozenTurnDispatch?.quoteTargetId
+        ?? s.quoteTargetId,
   });
   let primaryQuotedId: string | null = null;
   let vcMeetingListenerReplyReplay = false;
-  const dispatchPrimary = async (content: string, msgType: string): Promise<string> => {
+  const dispatchPrimary = async (
+    content: string,
+    msgType: string,
+    originAlreadyRevalidated = false,
+  ): Promise<string> => {
     // `dispatchPrimaryMessage` may call replyMessage directly for a quote, so
     // fence immediately before preparing/performing that primary effect too.
     revalidateVcMeetingManagedSend();
@@ -7760,11 +9675,17 @@ async function cmdSend(rest: string[]): Promise<void> {
         ...(prepared ? { suppressHook: true } : {}),
         hookContext,
         MessageWithdrawnError,
+        ...(isolatedHookOrigin
+          ? {
+              beforeHook: fenceIsolatedOriginBeforeEffect,
+              hookOrigin: isolatedHookOrigin,
+            }
+          : {}),
         // Explicit VC IM --into is rejected above, so an unquoted first send
         // retains the normal chat-scope dispatch semantics. On a mismatch the
         // frozen canonical target remains authoritative.
         dispatch: prepared?.outputMismatch
-          ? (body, type, uuid, suppressHook) => {
+          ? async (body, type, uuid, suppressHook) => {
               revalidateVcMeetingManagedSend();
               return sendMessage(
                 appId,
@@ -7773,11 +9694,17 @@ async function cmdSend(rest: string[]): Promise<void> {
                 type,
                 uuid,
                 hookContext,
-                suppressHook ? { suppressHook: true } : undefined,
+                outboundMessageOptions(!!suppressHook),
               );
             }
-          : dispatch,
-        beforeQuoteFallback: revalidateVcMeetingManagedSend,
+          : dispatchAfterOriginGate,
+        beforeEffect: originAlreadyRevalidated
+          ? undefined
+          : fenceIsolatedOriginBeforeEffect,
+        beforeQuoteFallback: async () => {
+          revalidateVcMeetingManagedSend();
+          await revalidateIsolatedOriginBeforeEffect();
+        },
         onQuoteWithdrawn: (id) => {
           console.error(`引用目标 ${id} 已撤回，改为普通发送`);
         },
@@ -7824,8 +9751,10 @@ async function cmdSend(rest: string[]): Promise<void> {
     // managed side-effect gate above.
     const imageKeys: string[] = [];
     if (images.length > 0) {
-      const results = await Promise.all(images.map(p => uploadImage(appId, p)));
-      imageKeys.push(...results);
+      for (const imagePath of images) {
+        await revalidateIsolatedOriginBeforeEffect();
+        imageKeys.push(await uploadImage(appId, imagePath));
+      }
     }
 
     // Auto-detect @BotName in text and inject as mentions, using the sender
@@ -7921,13 +9850,20 @@ async function cmdSend(rest: string[]): Promise<void> {
     // --no-mention 显式不 @ 任何人 → 连 footer 的"发送给/cc"寻址 <at> 也清空，
     // 否则 footer 仍会 @ 人，与 --no-mention 语义和"未@任何人"输出自相矛盾
     // （Codex review P2）。--top-level 同样无特定收件人。
+    const frozenFooterAddressingSource = explicitVcMeetingImOrigin?.replyTargetSenderOpenId
+      ? { ...s, lastCallerOpenId: explicitVcMeetingImOrigin.replyTargetSenderOpenId }
+      : frozenTurnDispatch?.replyTargetSenderOpenId
+        ? {
+            ...s,
+            lastCallerOpenId: frozenTurnDispatch.replyTargetSenderOpenId,
+            lastCallerIsBot: frozenTurnDispatch.replyTargetSenderIsBot,
+          }
+        : s;
     const footerAddressing = (sendTopLevel || noMention)
       ? { sendTo: undefined as string | undefined, cc: [] as string[] }
-      : buildFooterAddressing(explicitVcMeetingImOrigin?.replyTargetSenderOpenId
-        ? { ...s, lastCallerOpenId: explicitVcMeetingImOrigin.replyTargetSenderOpenId }
-        : s, {
+      : buildFooterAddressing(frozenFooterAddressingSource, {
           isOncall: !!oncallEntry,
-          isSubstitute: turnReplyTarget?.turnId === currentTurnId && turnReplyTarget?.substitute === true,
+          isSubstitute: isChatScope && turnReplyTarget?.turnId === currentTurnId && turnReplyTarget?.substitute === true,
           hasExplicitBotMention: explicitKnownBotMention,
           knownBotOpenIds,
         });
@@ -7984,8 +9920,9 @@ async function cmdSend(rest: string[]): Promise<void> {
         {
           uploadFile,
           uploadImage,
-          dispatch,
-          primaryDispatch: dispatchPrimary,
+          dispatch: dispatchAfterOriginGate,
+          primaryDispatch: (body, type) => dispatchPrimary(body, type, true),
+          beforeEffect: fenceIsolatedOriginBeforeEffect,
           ...(vcMeetingManagedSendOrigin ? { maxMessages: 1 } : {}),
         },
         appId,
@@ -8126,10 +10063,10 @@ async function cmdSend(rest: string[]): Promise<void> {
     // surface as command failure.
     if (!pureVideoSend && !vcMeetingListenerReplyReplay) {
       ({ failed: failedAttachments } = await sendFileAttachments(
-        { uploadFile, dispatch }, appId, files,
+        { uploadFile, dispatch: dispatchAfterOriginGate, beforeEffect: fenceIsolatedOriginBeforeEffect }, appId, files,
       ));
       const videoResult = await sendVideoAttachments(
-        { uploadFile, uploadImage, dispatch }, appId, videoAttachments,
+        { uploadFile, uploadImage, dispatch: dispatchAfterOriginGate, beforeEffect: fenceIsolatedOriginBeforeEffect }, appId, videoAttachments,
       );
       failedVideoAttachments = videoResult.failed;
     }
@@ -8150,6 +10087,14 @@ async function cmdSend(rest: string[]): Promise<void> {
       ? `@${mentions.map(m => m.name || m.open_id).join(',')}`
       : '未@任何人';
     console.error(`✓ 已发送 ${messageId} ｜ ${primaryQuotedId ? `引用 ${primaryQuotedId}` : '未引用'} ｜ ${atSummary}`);
+    // Sentinel guidance is surfaced HERE — in the send-success output the model
+    // reads back — rather than only in the injected system prompt. A model only
+    // learns about BOTMUX_NOTHING_TO_SEND after it has actually sent, so it
+    // cannot use the sentinel to end a turn where it did work but forgot to send
+    // (the ghosting shape). The injected prompt keeps a one-line sentinel note
+    // only for the genuine never-send silence case (message addressed to another
+    // bot). See services/bridge-fallback-gate.ts for the matching strip-and-forward gate.
+    console.error(t('ai.send.after_success_hint', undefined, localeForBot(appId)));
 
     // --attention: message is already delivered above; now flip the dashboard
     // needs-you state via the daemon (botmux send is direct-to-Lark, so the
@@ -8160,13 +10105,29 @@ async function cmdSend(rest: string[]): Promise<void> {
     let attentionError: string | undefined;
     if (attention.requested) {
       try {
-        const daemon = findDaemon(appId);
-        if (!daemon) throw new Error(`找不到 daemon (larkAppId=${appId})`);
-        const originCapability = readManagedOriginCapability(
-          resolveDataDir(),
-          sid,
-          process.env.BOTMUX_SEND_RELAY,
-        )?.capability;
+        // Raising attention is a second externally visible effect after the
+        // awaited Lark send.  Bind it to a fresh proof of the same original
+        // turn instead of re-reading a stable path that may now belong to a
+        // successor worker generation.
+        const freshIsolatedOrigin = await revalidateIsolatedOriginBeforeEffect();
+        const attentionOrigin = freshIsolatedOrigin ?? liveMarkerCtx;
+        const daemon = freshIsolatedOrigin ? undefined : findDaemon(appId);
+        const attentionPort = freshIsolatedOrigin
+          ? isolatedAttestationContext?.ipcPortFallback
+          : daemon?.ipcPort;
+        if (!attentionPort) {
+          throw new Error(freshIsolatedOrigin
+            ? '受保护的 managed-origin claim 未提供 owning daemon 端口'
+            : `找不到 daemon (larkAppId=${appId})`);
+        }
+        const originCapability = freshIsolatedOrigin
+          ? isolatedAttestationContext?.capability
+          : readManagedOriginCapability(
+              resolveDataDir(),
+              sid,
+              process.env.BOTMUX_SEND_RELAY,
+              process.env.BOTMUX_ORIGIN_CHANNEL_ID,
+            )?.capability;
         const request = {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
@@ -8177,15 +10138,15 @@ async function cmdSend(rest: string[]): Promise<void> {
             kind: attention.kind,
             reason: text.trim(),
             originCapability,
-            originTurnId: liveMarkerCtx?.turnId,
-            originDispatchAttempt: liveMarkerCtx?.dispatchAttempt,
+            originTurnId: attentionOrigin?.turnId,
+            originDispatchAttempt: attentionOrigin?.dispatchAttempt,
           }),
         } satisfies RequestInit;
         let secret: string | undefined;
         try { secret = loadDaemonIpcSecret(); } catch { /* Seatbelt/read-isolated CLI */ }
         const res = secret
-          ? await fetchDaemonIpc(daemon.ipcPort, '/api/attention', request, secret)
-          : await fetch(`http://127.0.0.1:${daemon.ipcPort}/api/attention`, request);
+          ? await fetchDaemonIpc(attentionPort, '/api/attention', request, secret)
+          : await fetch(`http://127.0.0.1:${attentionPort}/api/attention`, request);
         if (!res.ok) throw new Error(`daemon HTTP ${res.status}`);
         attentionRaised = true;
         console.error(`🙋 已举手：本会话已进 dashboard「需要你」列（用户回复后自动撤下）`);
@@ -8528,40 +10489,69 @@ async function cmdDispatch(rest: string[]): Promise<void> {
 }
 
 /**
- * `botmux report` — delivery / progress report.
+ * `botmux report` — delivery / progress report, then hand Review/progress/results
+ * back to the stable recipient.
  *
  * Two paths:
  * 1) Platform Issue 领取群：session 有活跃 issue binding → enqueue+write `in_review`
  *    (待验收). This is what kickoff means by 「完成后执行 botmux report」.
- * 2) 多话题协作：dispatched sub-bot reports back to the orchestrator session.
- *    The sub-bot lives in its own sub-topic where the orchestrator has no session;
- *    @-ing the orchestrator there would spawn a fresh context-less one. Instead this
- *    routes INTO the orchestrator's thread (orchestrate-dispatch.json) and @-s it there.
+ * 2) 交接回报：recipient and placement are separate decisions. Registry-backed
+ *    multi-topic dispatches keep their exact orchestrator-session route. Ordinary
+ *    development handoffs inherit the executing turn's visible position with the
+ *    same turn-id gate as `botmux send`, so a later turn cannot reuse a stale
+ *    topic anchor.
  */
 async function cmdReport(rest: string[]): Promise<void> {
   if (rest.includes('--help') || rest.includes('-h')) {
-    console.log(`botmux report — 交付回报（issue 待验收 / 多话题协作回主编排）
+    console.log(`botmux report — 交付回报（issue 待验收 / 交接 Review·进展·结果并保持自然会话位置）
 
 用法:
-  botmux report "子项目X 完成，产出在 …"
-  botmux report --dispatch-root <om_seed> "子项目X 完成，产出在 …"
   botmux report --content-file <path>
+  botmux report --into <om_root> --content-file <path>
+  botmux report --top-level "子项目X 完成，产出在 …"
+  botmux report --dispatch-root <om_seed> "子项目X 完成，产出在 …"
+  botmux report "子项目X 完成，产出在 …" --legacy-dispatch
 
 说明:
   1) 平台 Issue 领取群：本会话绑定了平台 issue 时，把 issue 推到「待验收」(in_review)。
      kickoff 里「完成后执行 botmux report」指的就是这条路径。
-  2) 多话题协作：被 botmux dispatch 派活的子话题里，把回报发回主编排会话并 @ 主 bot
-     （不要在子话题里 @ 主 bot——会另起无上下文会话）。
+  2) 交接 / 协作回报：接收者与消息落点独立解析——接收者仍是原 Reviewer / orchestrator；
+     消息默认依次采用显式 --into / --top-level、dispatch 注册表、legacy dispatch 兼容回退、
+     当前轮次位置，最后才回退到会话默认位置。
+     当前轮次在群顶层就留在群顶层，在话题里就留在原话题；过期轮次的话题目标会被忽略。
+     dispatch 注册表命中时仍回到原主编排会话，并唤醒其已有上下文。
+     legacy / 跨机器 dispatch 没有本机注册表时仍回退群顶层，避免在子话题唤醒无上下文会话。
+
+  代码 Review 交接建议明确写出：首次 Review / 复审、MR、本轮改动、验证、风险，
+  以及希望 Reviewer 采取的动作。
 
 选项:
   --content-file <path>  从文件读取回报内容
+  --into <root_id>       显式发进指定话题（覆盖默认落点）
+  --top-level            显式发到当前群顶层（覆盖默认落点）
   --dispatch-root <id>   dispatch 注入的精确 seed；优先且不命中时 fail closed
+  --legacy-dispatch      legacy / 跨机器 dispatch 自动注入的兼容标记
   --session-id <id>      指定来源会话（默认自动推断）`);
     return;
   }
 
   process.env.SESSION_DATA_DIR ??= resolveDataDir();
   const sessionIdArg = argValue(rest, '--session-id');
+  if (flagPresentButValueMissing(rest, '--into')) {
+    console.error('--into 需要一个 om_ 话题根消息 id。');
+    process.exit(1);
+  }
+  const explicitInto = argValue(rest, '--into')?.trim();
+  if (explicitInto && !/^om_[A-Za-z0-9_-]{1,128}$/.test(explicitInto)) {
+    console.error('--into 必须是有效的 om_ 话题根消息 id。');
+    process.exit(1);
+  }
+  const explicitTopLevel = rest.includes('--top-level');
+  const legacyDispatch = rest.includes('--legacy-dispatch');
+  if (explicitInto && explicitTopLevel) {
+    console.error('--into 与 --top-level 不能同时使用。');
+    process.exit(1);
+  }
   if (flagPresentButValueMissing(rest, '--dispatch-root')) {
     console.error('--dispatch-root 需要一个 om_ 消息 id。');
     process.exit(1);
@@ -8578,7 +10568,7 @@ async function cmdReport(rest: string[]): Promise<void> {
     if (!existsSync(contentFile)) { console.error(`文件不存在: ${contentFile}`); process.exit(1); }
     content = readFileSync(contentFile, 'utf-8');
   } else {
-    const pos = positionals(rest);
+    const pos = positionals(rest, ['--top-level', '--legacy-dispatch']);
     content = pos.length ? pos.join(' ') : await readStdin();
   }
   if (!contentFile) rejectLikelyWindowsStdinMojibake(content);
@@ -8587,11 +10577,21 @@ async function cmdReport(rest: string[]): Promise<void> {
     process.exit(1);
   }
 
-  const sid = sessionIdArg ?? findAncestorSessionId();
+  // The process-tree marker carries the executing turn. Do not revive the
+  // spawn-time BOTMUX_TURN_ID here: it is stale in a long-lived or detached
+  // CLI and could make an old topic target look current.
+  const reportContext = resolveSessionContext(
+    resolveDataDir(),
+    process.env.BOTMUX_SESSION_ID,
+  );
+  const sid = sessionIdArg ?? reportContext?.sessionId;
   if (!sid) {
-    console.error('无法推断 session-id。请在 issue 领取群 / 被 dispatch 派活的会话里运行，或传 --session-id <id>。');
+    console.error('无法推断 session-id。请在当前 Botmux 会话（issue 领取群 / 被 dispatch 派活的会话）里运行，或传 --session-id <id>。');
     process.exit(1);
   }
+  const currentTurnId = reportContext?.sessionId === sid
+    ? reportContext.turnId
+    : undefined;
   const sessions = loadSessions();
   const s = sessions.get(sid);
   if (!s) { console.error(`未找到 session ${sid}`); process.exit(1); }
@@ -8682,34 +10682,60 @@ async function cmdReport(rest: string[]): Promise<void> {
     }
   }
 
-  // Resolve where the report goes + who to @. Same-machine: the dispatch registry
-  // (keyed by this sub-bot's thread root) carries the orchestrator's exact coords.
-  // CROSS-MACHINE: the orchestrator is on another machine, so its registry isn't
-  // on THIS one — resolveReportTarget falls back to this sub-bot's own session
-  // (report top-level into its chat, @ the dispatcher via creatorOpenId). See
-  // resolveReportTarget / Session.creatorOpenId.
+  // Recipient and visible placement are independent. creatorOpenId remains the
+  // stable Reviewer/orchestrator identity; current-turn routing controls where
+  // an ordinary report appears.
+  const reportRecipient = resolveReportRecipient({
+    creatorOpenId: s.creatorOpenId,
+    ownerOpenId: s.ownerOpenId,
+    quoteTargetSenderOpenId: s.quoteTargetSenderOpenId,
+  });
+  const turnReplyTarget = pickTurnReplyTarget(s, currentTurnId);
+  const validatedTurnReplyTarget = currentTurnId
+    && turnReplyTarget?.turnId === currentTurnId
+    ? turnReplyTarget
+    : undefined;
+
+  // Same-machine dispatches retain their exact orchestrator registry route.
+  // A chat-scope target may participate only when it belongs to this executing
+  // turn; historical aliases have no turn id and are intentionally ignored.
   const regPath = join(resolveDataDir(), 'orchestrate-dispatch.json');
   let reg: Record<string, any> = {};
   try { if (existsSync(regPath)) reg = JSON.parse(readFileSync(regPath, 'utf-8')); } catch { /* */ }
   const registryMatch = findDispatchRegistryEntry({
     registry: reg,
     dispatchRootId: explicitDispatchRoot,
+    sessionScope: s.scope ?? 'thread',
     rootMessageId: s.rootMessageId,
-    currentReplyTargetRootId: s.currentReplyTarget?.rootMessageId,
-    replyThreadAliases: s.replyThreadAliases,
+    currentReplyTargetRootId: validatedTurnReplyTarget?.rootMessageId,
+    currentReplyTargetTurnId: validatedTurnReplyTarget?.turnId,
+    currentTurnId,
   });
   if (explicitDispatchRoot && registryMatch?.key !== explicitDispatchRoot) {
     console.error(`精确 dispatch root ${explicitDispatchRoot} 在本机注册表中不存在；为避免串到其他 PM 会话，本次回报已停止。`);
     process.exit(1);
   }
   const entry = registryMatch?.entry as any;
+  const dispatchCoords = resolveReportTarget({
+    registryEntry: entry,
+    sessionChatId: s.chatId,
+  });
+  const registryTarget = registryMatch
+    ? dispatchCoords.orchScope !== 'chat' && dispatchCoords.orchRoot
+      ? { mode: 'thread' as const, rootMessageId: dispatchCoords.orchRoot }
+      : dispatchCoords.orchChatId
+        ? { mode: 'plain' as const, chatId: dispatchCoords.orchChatId }
+        : undefined
+    : undefined;
+  const hasExplicitPlacement = !!explicitInto || explicitTopLevel;
 
   // Same-host dispatches carry the exact source session. Inject the report into
   // that live PM context through its own daemon instead of trying to make the
   // resident app post into the PM's source chat (which may be a P2P the
   // resident app cannot access). The report body remains untrusted envelope
-  // data; only the fixed consolidation instruction is trusted.
-  if (entry?.orchAppId && entry?.orchSessionId) {
+  // data; only the fixed consolidation instruction is trusted. An explicit
+  // visible placement overrides this registry delivery by design.
+  if (!hasExplicitPlacement && entry?.orchAppId && entry?.orchSessionId) {
     const daemon = findDaemon(entry.orchAppId);
     if (!daemon) {
       console.error('主编排 Bot daemon 不在线；回报未发送，可稍后重试同一 botmux report。');
@@ -8760,24 +10786,42 @@ async function cmdReport(rest: string[]): Promise<void> {
       delivery: 'orchestrator-session',
       reportedTo: entry.orchSessionId,
       viaRegistry: true,
+      recipient: {
+        kind: 'orchestrator-session',
+        botAppId: entry.orchAppId,
+        sessionId: entry.orchSessionId,
+        ...(reportRecipient ? { openId: reportRecipient } : {}),
+      },
+      placementSource: 'dispatch-registry',
+      messageTarget: {
+        mode: 'orchestrator-session',
+        sessionId: entry.orchSessionId,
+        botAppId: entry.orchAppId,
+      },
       triggerId: triggerBody.triggerId,
     }));
     return;
   }
 
-  const tgt = resolveReportTarget({
-    registryEntry: entry,
-    sessionChatId: s.chatId,
-    creatorOpenId: s.creatorOpenId,
-    ownerOpenId: s.ownerOpenId,
-    quoteTargetSenderOpenId: s.quoteTargetSenderOpenId,
-  });
-  if (!tgt.orchOpenId || !tgt.orchChatId) {
+  if (!reportRecipient) {
     console.error(
-      '找不到主编排坐标：本会话没记录派活者（creatorOpenId/ownerOpenId 都空）或缺 chatId——大概不是被 botmux dispatch 派活的会话。\n' +
-      '若确需回报，请改用 `botmux send` 或显式 @ 对应的人/ bot。');
+      '找不到 Review / 回报接收者：本会话没有 creatorOpenId、ownerOpenId 或可用的历史发送者。\n' +
+      '若确需交接，请改用 `botmux send --mention <open_id:名字>` 明确指定接收者。');
     process.exit(1);
   }
+  const placement = resolveReportPlacement({
+    into: explicitInto,
+    topLevel: explicitTopLevel,
+    registryTarget,
+    legacyDispatch,
+    chatScope: (s.scope ?? 'thread') === 'chat',
+    chatId: s.chatId,
+    rootMessageId: s.rootMessageId,
+    replyTargetRootId: validatedTurnReplyTarget?.rootMessageId,
+    replyTargetTurnId: validatedTurnReplyTarget?.turnId,
+    replyTargetQuoteOnly: validatedTurnReplyTarget?.quoteOnly,
+    currentTurnId,
+  });
 
   const { registerBot, loadBotConfigs } = await import('./bot-registry.js');
   try { for (const cfg of loadBotConfigs()) registerBot(cfg); } catch { /* */ }
@@ -8785,25 +10829,36 @@ async function cmdReport(rest: string[]): Promise<void> {
   const { sendMessage, replyMessage } = await import('./im/lark/client.js');
   const appId = s.larkAppId!;
 
-  const paras = buildReportContent({ orchOpenId: tgt.orchOpenId, content });
+  const paras = buildReportContent({ orchOpenId: reportRecipient, content });
   const postJson = JSON.stringify({ zh_cn: { title: '', content: paras } });
 
   try {
     let msgId: string;
-    if (tgt.orchScope === 'chat' || !tgt.orchRoot) {
-      // Orchestrator at chat scope, or cross-machine fallback → post top-level
-      // into the chat (the sub-topic's chat = the orchestrator's chat).
-      msgId = await sendMessage(appId, tgt.orchChatId, postJson, 'post');
+    if (placement.target.mode === 'plain') {
+      msgId = await sendMessage(appId, placement.target.chatId, postJson, 'post');
     } else {
-      // Same-machine thread-scope orchestrator → reply into its thread so its
-      // existing context-rich session (anchored on orchRoot) receives the report.
-      msgId = await replyMessage(appId, tgt.orchRoot, postJson, 'post', true);
+      msgId = await replyMessage(
+        appId,
+        placement.target.rootMessageId,
+        postJson,
+        'post',
+        placement.target.mode === 'thread',
+      );
     }
+    const messageTarget = placement.target.mode === 'plain'
+      ? { mode: 'top-level', chatId: placement.target.chatId }
+      : { mode: placement.target.mode, rootMessageId: placement.target.rootMessageId };
     console.log(JSON.stringify({
       success: true,
-      reportedTo: tgt.orchRoot || tgt.orchChatId,
-      orchestrator: tgt.orchOpenId,
+      delivery: 'lark-message',
+      reportedTo: placement.target.mode === 'plain'
+        ? placement.target.chatId
+        : placement.target.rootMessageId,
+      orchestrator: reportRecipient,
+      recipient: { kind: 'mention', openId: reportRecipient },
       viaRegistry: !!registryMatch,
+      placementSource: placement.source,
+      messageTarget,
       messageId: msgId,
     }));
   } catch (err: any) {
@@ -9193,20 +11248,24 @@ botmux create-group — 用一组机器人新建飞书群
 
 /**
  * postAsk: 找到 daemon → POST /api/asks → 返回 AskResult。
- * 连接失败 / HTTP 错误时抛出带 exitCode 属性的 Error：
- *   - exitCode=3：daemon 不可达或 HTTP 错误
+ * 连接失败 / HTTP 错误时抛出带 `exitCode` + `retryable` 属性的 Error：
+ *   - exitCode=3：daemon 不可达或 HTTP 错误（保持向后兼容）
+ *   - retryable=true：仅当 daemon 不可达 / 网络失败 / 明确的 transient HTTP
+ *     (502/503/504，含 daemon 启动尚未就绪) 时。这些正是"daemon 重启中"的信号,
+ *     runHook 会重连重试。确定性 4xx（bad body / capability 拒绝 / unsupported)
+ *     与非 JSON 是 retryable=false —— 重试 24h 也不会变,应立即 passthrough。
  */
 async function postAsk(body: Record<string, unknown>): Promise<import('./core/ask-types.js').AskResult> {
   type AskResult = import('./core/ask-types.js').AskResult;
+  type AskError = Error & { exitCode: number; retryable: boolean };
+  const mkErr = (message: string, retryable: boolean): AskError =>
+    Object.assign(new Error(message), { exitCode: 3, retryable });
 
   const larkAppId = body.larkAppId as string;
   const daemon = findDaemon(larkAppId);
   if (!daemon) {
-    const err = new Error(
-      `botmux ask: 找不到 daemon (larkAppId=${larkAppId})。daemon 已停？exit 3.`,
-    ) as Error & { exitCode: number };
-    err.exitCode = 3;
-    throw err;
+    // No daemon record → it's (re)starting or momentarily gone → retryable.
+    throw mkErr(`botmux ask: 找不到 daemon (larkAppId=${larkAppId})。daemon 已停？exit 3.`, true);
   }
 
   let res: Response;
@@ -9220,6 +11279,7 @@ async function postAsk(body: Record<string, unknown>): Promise<import('./core/as
         resolveDataDir(),
         sessionId,
         process.env.BOTMUX_SEND_RELAY,
+        process.env.BOTMUX_ORIGIN_CHANNEL_ID,
       );
       if (claim) requestBody.originCapability = claim.capability;
     }
@@ -9238,28 +11298,27 @@ async function postAsk(body: Record<string, unknown>): Promise<import('./core/as
       ? await fetchDaemonIpc(daemon.ipcPort, '/api/asks', init, hostSecret)
       : await fetch(`http://127.0.0.1:${daemon.ipcPort}/api/asks`, init);
   } catch (fetchErr) {
+    // Socket refused / reset / timeout → daemon is down or restarting → retryable.
     const msg = fetchErr instanceof Error ? fetchErr.message : String(fetchErr);
-    const err = new Error(
-      `botmux ask: 无法连接 daemon (port=${daemon.ipcPort}): ${msg}`,
-    ) as Error & { exitCode: number };
-    err.exitCode = 3;
-    throw err;
+    throw mkErr(`botmux ask: 无法连接 daemon (port=${daemon.ipcPort}): ${msg}`, true);
   }
 
   if (!res.ok) {
     let errBody = '';
     try { errBody = (await res.text()).slice(0, 200); } catch { /* */ }
-    const err = new Error(`botmux ask: daemon HTTP ${res.status}: ${errBody}`) as Error & { exitCode: number };
-    err.exitCode = 3;
-    throw err;
+    // Only transient server states are retryable. A deterministic 4xx (bad
+    // body, capability denied, unsupported chat) will fail identically forever;
+    // 502/503/504 mean the daemon is up but not ready (startup window) → retry.
+    // Shared pure classifier (unit-tested directly — codex P1-3 seam).
+    const retryable = isRetryableAskHttpStatus(res.status);
+    throw mkErr(`botmux ask: daemon HTTP ${res.status}: ${errBody}`, retryable);
   }
 
   try {
     return (await res.json()) as AskResult;
   } catch (jsonErr) {
-    const err = new Error(`botmux ask: daemon 返回非 JSON: ${jsonErr}`) as Error & { exitCode: number };
-    err.exitCode = 3;
-    throw err;
+    // A malformed body is not something a retry fixes.
+    throw mkErr(`botmux ask: daemon 返回非 JSON: ${jsonErr}`, false);
   }
 }
 
@@ -9338,6 +11397,7 @@ async function cmdAsk(sub: string, rest: string[]): Promise<void> {
     resolveDataDir(),
     askSessionId,
     askRelayDir,
+    process.env.BOTMUX_ORIGIN_CHANNEL_ID,
   )?.capability;
   const body = {
     sessionId: askSessionId,
@@ -9347,6 +11407,10 @@ async function cmdAsk(sub: string, rest: string[]): Promise<void> {
     options,
     prompt,
     timeoutMs,
+    // Explicit `botmux ask buttons` has no reconnecting claimant (the CLI exits
+    // on daemon restart), so mark it non-hook: the broker won't persist/handoff
+    // it and can never confuse it with a hook ask's card (codex P1-4/P1-3).
+    originKind: 'explicit',
     ...(liveAskOrigin?.turnId ? { originTurnId: liveAskOrigin.turnId } : {}),
     ...(liveAskOrigin?.dispatchAttempt !== undefined
       ? { originDispatchAttempt: liveAskOrigin.dispatchAttempt }
@@ -9487,8 +11551,14 @@ export async function runHook(
     routeRoot = adopt.rootMessageId;
   }
 
-  // 解析 timeoutMs：默认 1 小时，可由 BOTMUX_ASK_TIMEOUT_MS 覆盖
-  const DEFAULT_TIMEOUT_MS = 3_600_000;
+  // 解析 timeoutMs：默认 ~24h，可由 BOTMUX_ASK_TIMEOUT_MS 覆盖。
+  // 为什么这么长：ask 超时不是良性兜底——broker settle 成 `timedOut` 会让 hook
+  // 落到 passthrough，Claude 转而渲染原生 picker，而此后飞书回调已无通道把答案
+  // 送回（picker 挂死、答案不生效）。所以默认值对齐 hook 安装侧的进程超时上限
+  // （settings.json 里的 86400s），让 broker 不会 *早于* hook 进程本身超时；
+  // 既避免"人回复慢→picker 卡死"，又保留一个有限的进程级兜底（永不超时会让一次
+  // CLI turn 无限阻塞，是更糟的失败）。
+  const DEFAULT_TIMEOUT_MS = 86_400_000; // 24h — 对齐 hook 安装侧 timeout:86400s
   let timeoutMs = DEFAULT_TIMEOUT_MS;
   const timeoutEnv = env.BOTMUX_ASK_TIMEOUT_MS;
   if (timeoutEnv) {
@@ -9498,6 +11568,12 @@ export async function runHook(
     }
   }
 
+  // Per-invocation identity: generated ONCE here (outside the retry loop) and
+  // reused across every reconnect POST, so a re-POST after a daemon restart
+  // re-attaches to the same restored ask instead of posting a duplicate card.
+  // originKind='hook' namespaces it away from an explicit `botmux ask buttons`.
+  const requestId = randomUUID();
+
   const body: Record<string, unknown> = {
     sessionId: routeSessionId,
     chatId: routeChatId,
@@ -9505,14 +11581,46 @@ export async function runHook(
     rootMessageId: routeRoot,
     questions: parsed.questions,
     timeoutMs,
+    requestId,
+    originKind: 'hook',
   };
 
-  let result: import('./core/ask-types.js').AskResult;
-  try {
-    result = await postAskFn(body);
-  } catch {
-    // 任何失败（daemon 不可达、HTTP 错误等）→ passthrough 放行
-    return { stdout: adapter.passthrough(payload) };
+  // Post the ask, RETRYING across a daemon restart. The daemon holds pending
+  // asks in memory only, so a restart between "card posted" and "user clicked"
+  // drops the ask; historically postAskFn then threw (daemon unreachable) and
+  // we fell straight to passthrough → the CLI rendered its native picker with no
+  // way to receive the answer. Instead: while the daemon is unreachable (and
+  // only then — an answered/timedOut/invalidated result returns normally), keep
+  // reconnecting until the ask's own deadline. The daemon restores the pending
+  // ask from disk on boot and re-attaches this reconnecting request to it by a
+  // stable key, so the SAME card resolves through the normal hook directive.
+  // Blocking here keeps Claude spinning; the native picker never renders.
+  const deadline = Date.now() + timeoutMs;
+  let result: import('./core/ask-types.js').AskResult | undefined;
+  let attempt = 0;
+  while (true) {
+    try {
+      result = await postAskFn(body);
+      break;
+    } catch (err) {
+      // Retry ONLY genuinely transient failures (daemon unreachable / network /
+      // 502-503-504 startup-not-ready — see postAsk's `retryable`). That is the
+      // restart-in-progress case. A deterministic error (4xx bad body /
+      // capability / unsupported, non-JSON) has retryable=false → passthrough
+      // immediately rather than spin for 24h. A non-coded throw is also treated
+      // as non-retryable.
+      const retryable = (err as { retryable?: boolean } | undefined)?.retryable === true;
+      if (!retryable || Date.now() >= deadline) {
+        return { stdout: adapter.passthrough(payload) };
+      }
+      attempt++;
+      // Backoff: quick first reconnects (daemon usually returns in a few
+      // seconds), capped at 5s. Never sleep past the deadline.
+      const backoff = Math.min(5_000, 500 * attempt);
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) return { stdout: adapter.passthrough(payload) };
+      await new Promise((r) => setTimeout(r, Math.min(backoff, remaining)));
+    }
   }
 
   if (result.kind === 'answered') {
@@ -9611,6 +11719,7 @@ async function cmdSessionReady(): Promise<void> {
         resolveDataDir(),
         sessionId,
         relayDir,
+        process.env.BOTMUX_ORIGIN_CHANNEL_ID,
       )?.capability;
       const liveOrigin = resolveSessionContext(resolveDataDir(), sessionId);
       const envAttempt = Number(process.env.BOTMUX_DISPATCH_ATTEMPT);
@@ -10776,6 +12885,9 @@ if (LARK_FACING_COMMANDS.has(command) && managedOriginHasNoTransport()) {
 }
 
 switch (command) {
+  case '__pm2-start-exact':
+    await cmdInternalPm2StartExact(process.argv.slice(3));
+    break;
   case '--version':
   case '-v':      console.log(getVersion()); break;
   case 'capabilities': {
@@ -10807,7 +12919,7 @@ switch (command) {
   case 'status':  cmdStatus(); break;
   case 'upgrade':
   case 'update':  cmdUpgrade(); break;
-  case 'dashboard': await cmdDashboard(); break;
+  case 'dashboard': await cmdDashboard(process.argv.slice(3)); break;
   case 'bind': {
     // `botmux bind <code>` — 把本机绑定到中心化平台
     const { cmdBind } = await import('./platform/bind.js');

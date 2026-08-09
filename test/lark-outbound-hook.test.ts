@@ -65,4 +65,40 @@ describe('Lark outbound hook provider replay suppression', () => {
     expect(mocks.reply).toHaveBeenCalledOnce();
     expect(mocks.emitHookEvent).not.toHaveBeenCalled();
   });
+
+  it('fences the post-provider hook and forwards its frozen managed origin', async () => {
+    const beforeHook = vi.fn(async () => {});
+    const hookOrigin = {
+      ipcPort: 4310,
+      sessionId: 'sid',
+      capability: 'ab'.repeat(32),
+      turnId: 'turn-1',
+      dispatchAttempt: 2,
+    };
+    await sendMessage(
+      'app', 'oc_chat', 'answer', 'text', undefined, { sessionId: 'sid' },
+      { beforeHook, hookOrigin },
+    );
+
+    expect(beforeHook).toHaveBeenCalledOnce();
+    expect(mocks.create.mock.invocationCallOrder[0])
+      .toBeLessThan(beforeHook.mock.invocationCallOrder[0]!);
+    expect(beforeHook.mock.invocationCallOrder[0])
+      .toBeLessThan(mocks.emitHookEvent.mock.invocationCallOrder[0]!);
+    expect(mocks.emitHookEvent).toHaveBeenCalledWith(
+      'outbound.send',
+      expect.objectContaining({ messageId: 'om_send', content: 'answer' }),
+      { managedOrigin: hookOrigin },
+    );
+  });
+
+  it('drops only the hook when authority is revoked after provider acceptance', async () => {
+    const beforeHook = vi.fn(async () => { throw new Error('origin rotated'); });
+    await expect(sendMessage(
+      'app', 'oc_chat', 'answer', 'text', undefined, { sessionId: 'sid' },
+      { beforeHook },
+    )).resolves.toBe('om_send');
+    expect(beforeHook).toHaveBeenCalledOnce();
+    expect(mocks.emitHookEvent).not.toHaveBeenCalled();
+  });
 });

@@ -7,7 +7,7 @@
  * Run:  pnpm vitest run test/message-parser.test.ts
  */
 import { describe, it, expect } from 'vitest';
-import { parseApiMessage, extractResources, parseEventMessage, stripLeadingMentions, createImgNumberer, cardContentHasUpgradeFallback, isPureCardUpgradeFallback, mergeCardText, wrapResolvedCardText, mentionOpenId, messageMentionsBot, CARD_EMBEDDED_PLACEHOLDER } from '../src/im/lark/message-parser.js';
+import { parseApiMessage, extractResources, parseEventMessage, stripLeadingMentions, createImgNumberer, cardContentHasUpgradeFallback, isPureCardUpgradeFallback, mergeCardText, wrapResolvedCardText, mentionOpenId, messageMentionsBot, extractPostAtParticipants, CARD_EMBEDDED_PLACEHOLDER } from '../src/im/lark/message-parser.js';
 import { buildMarkdownCard, buildReplyCardFooter } from '../src/im/lark/md-card.js';
 import { stampBotmuxCallbackMarkers, hasBotmuxCallbackMarker, BOTMUX_CALLBACK_MARKER_KEY } from '../src/im/lark/callback-button-marker.js';
 
@@ -1711,5 +1711,34 @@ describe('messageMentionsBot', () => {
 
   it('matches an app_id mention even when botOpenId is not yet resolved', () => {
     expect(messageMentionsBot({ mentions: [{ app_id: BOT_APP }] }, BOT_APP, undefined)).toBe(true);
+  });
+});
+
+describe('extractPostAtParticipants (post inline @ → routing-only participants)', () => {
+  const post = (nodes: any[]) => ({ content: JSON.stringify({ zh_cn: { title: '', content: [nodes] } }) });
+
+  it('classifies ou_ → openId, cli_ → appId, carries user_name', () => {
+    const out = extractPostAtParticipants(post([
+      { tag: 'text', text: 'hi ' },
+      { tag: 'at', user_id: 'ou_human', user_name: '张三' },
+      { tag: 'at', user_id: 'cli_bot', user_name: 'OtherBot' },
+    ]));
+    expect(out).toEqual([
+      { key: '@_post_at_1', name: '张三', openId: 'ou_human', idType: 'open_id' },
+      { key: '@_post_at_2', name: 'OtherBot', appId: 'cli_bot', idType: 'app_id' },
+    ]);
+  });
+
+  it('an `all` inline at is surfaced WITHOUT an executable id (→ core marks incomplete)', () => {
+    const out = extractPostAtParticipants(post([{ tag: 'at', user_id: 'all', user_name: '所有人' }]));
+    expect(out).toHaveLength(1);
+    expect(out[0].openId).toBeUndefined();
+    expect(out[0].appId).toBeUndefined();
+  });
+
+  it('non-post shapes / parse errors → empty', () => {
+    expect(extractPostAtParticipants({ content: '{"text":"plain"}' })).toEqual([]);
+    expect(extractPostAtParticipants({ content: 'not json' })).toEqual([]);
+    expect(extractPostAtParticipants(undefined)).toEqual([]);
   });
 });

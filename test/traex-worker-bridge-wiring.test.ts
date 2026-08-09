@@ -27,6 +27,35 @@ describe('TRAE worker structured-bridge wiring', () => {
     expect(body).toContain('if (structuredBridgeIsTraex()) return drainTraexRollout(path, offset);');
   });
 
+  it('publishes the latest TRAE runtime on attach and incremental ingest', () => {
+    const attachStart = workerSource.indexOf('function codexBridgeAttach');
+    const attachEnd = workerSource.indexOf('function codexBridgeDetachFile', attachStart);
+    const attach = workerSource.slice(attachStart, attachEnd);
+    // Baseline modes seed from a bounded backward read; fresh-empty/split-live
+    // are excluded so split-live does not re-scan the file it just drained.
+    expect(attach).toContain('publishActiveRuntime(readLatestTraexRuntime(rolloutPath))');
+    expect(attach).toMatch(/mode !== 'fresh-empty'\s*&&\s*mode !== 'split-live'[\s\S]*?publishActiveRuntime\(readLatestTraexRuntime/);
+    // split-live reuses its own drain result rather than a second full scan.
+    // Bound the block to the actual `split-live` success branch (up to the
+    // `else if (mode === 'split-live')` degraded branch) instead of a fixed
+    // char window, so unrelated code inserted ahead of the TRAE publish (e.g.
+    // the sibling Codex runtime block) can't push the assertion out of range.
+    const splitStart = attach.indexOf("mode === 'split-live' && existsSync");
+    const splitEnd = attach.indexOf("} else if (mode === 'split-live')", splitStart);
+    expect(splitStart).toBeGreaterThanOrEqual(0);
+    expect(splitEnd).toBeGreaterThan(splitStart);
+    const splitBlock = attach.slice(splitStart, splitEnd);
+    expect(splitBlock).toContain('publishActiveRuntime({');
+    expect(splitBlock).toContain('model: traex.latestModel');
+    expect(splitBlock).not.toContain('readLatestTraexRuntime');
+
+    const ingestStart = workerSource.indexOf('function codexBridgeIngest');
+    const ingestEnd = workerSource.indexOf('function codexBridgeMarkPendingTurn', ingestStart);
+    const ingest = workerSource.slice(ingestStart, ingestEnd);
+    expect(ingest).toContain('publishActiveRuntime({');
+    expect(ingest).toContain('reasoningEffort: traex.latestReasoningEffort ?? publishedActiveRuntime.reasoningEffort');
+  });
+
   it('drains the retired rollout before reattaching a newly verified TRAE session', () => {
     const start = workerSource.indexOf('function codexBridgeNotifyCliSessionId');
     const end = workerSource.indexOf('function maybeFollowGrokSessionRotationViaPid', start);
@@ -88,6 +117,7 @@ describe('TRAE worker structured-bridge wiring', () => {
     // include traex alongside grok.
     const matches = workerSource.match(/claudeDataDir \|\| cfg\.cliId === 'grok' \|\| cfg\.cliId === 'traex'/g) ?? [];
     expect(matches.length).toBeGreaterThanOrEqual(2);
+    expect(workerSource.match(/codexAdoptPendingPid = wiredPid;/g)?.length).toBeGreaterThanOrEqual(2);
   });
 
   it('gates the TRAE INITIAL bridge attach on pid-fd ownership (adopt mode)', () => {

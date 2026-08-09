@@ -84,6 +84,19 @@ export const REDACTED_CHILD_ENV_KEYS = [
   // the source. Non-tmux CLIs are unaffected (they don't read TMUX).
   'TMUX',
   'TMUX_PANE',
+  // PM2 graceful-exit sentinel (BOTMUX_PM2_GRACEFUL_EXIT_CODE, defined as
+  // PM2_GRACEFUL_EXIT_CODE_ENV in pm2-graceful-exit.ts). pm2 bakes it into the
+  // daemon/dashboard env so ONLY those two managed cores exit with the sentinel
+  // code (90) on graceful stop instead of 0 — otherwise a signal-killed daemon's
+  // null→0 code would match stop_exit_codes and suppress crash-autorestart. But
+  // it must never reach a session's CLI child: a foreground `botmux serve
+  // --api-only` / `daemon` / `dashboard` launched from inside a bot session would
+  // inherit the marker and, per gracefulProcessExitCode(), exit 90 on a clean
+  // Ctrl+C — a supervisor/launcher then misreads that non-zero code as a crash.
+  // Only daemon.ts + dashboard.ts read this key, so stripping it at the child
+  // boundary is safe. Kept as a string literal (like the keys above) with a
+  // drift-guard test pinning it to PM2_GRACEFUL_EXIT_CODE_ENV.
+  'BOTMUX_PM2_GRACEFUL_EXIT_CODE',
 ] as const;
 
 /**
@@ -195,10 +208,19 @@ export const BOTMUX_INJECTED_ENV_KEYS = [
   // session-scoped, capability-gated routes (v3 workflow relay, vc-agent).
   // A port marker, not a credential — every route authenticates independently.
   'BOTMUX_DAEMON_IPC_PORT',
+  // Fail-closed classification hint for macOS read isolation. This is never
+  // authority; cmdSend also checks the host-owned marker + live challenge.
+  'BOTMUX_READ_ISOLATED',
+  // Unguessable pane/profile authority channel. It selects an exact read carve
+  // but is not sufficient without the daemon-rotated capability inside it.
+  'BOTMUX_ORIGIN_CHANNEL_ID',
   // Keep `botmux bots list` and ready-gated CLIs aligned with daemon config.
   'BOTMUX_LARK_LIST_BOTS_API_ENABLED',
   'BOTMUX_LARK_LIST_BOTS_API_TIMEOUT_MS',
   'BOTMUX_READY_COMMAND',
+  // Path to a one-shot 0600 Codex App control bootstrap. Only the path reaches
+  // the pane; the runner consumes+unlinks the file before app-server starts.
+  'BOTMUX_CODEX_APP_CONTROL_BOOTSTRAP',
   // Hermes profile roots must match the worker-side transcript reader.
   'HERMES_HOME',
   'HERMES_BOTMUX_SOURCE_HOME',
