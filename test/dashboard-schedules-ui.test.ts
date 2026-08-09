@@ -49,6 +49,13 @@ describe('dashboard schedules React page helpers', () => {
     expect(page).not.toContain('setDeliver(');
   });
 
+  it('shows the target chat in both the schedule row and edit dialog', () => {
+    const page = readFileSync(new URL('../src/dashboard/web/schedules-page.tsx', import.meta.url), 'utf8');
+    expect(page).toContain("import { chatDisplayTitle, loadNameMaps } from './ui.js';");
+    expect(page).toContain("{s.chatId ? <span title={String(s.chatId)}>{tr('schedules.form.chat')}: {chatTitle ?? s.chatId}</span> : null}");
+    expect(page).toContain("<code title={chatId}>{chatDisplayTitle(editing) ?? chatId}</code>");
+  });
+
   it('offers three execution positions and allows lazy silent fresh topics', () => {
     const page = readFileSync(new URL('../src/dashboard/web/schedules-page.tsx', import.meta.url), 'utf8');
     expect(page).toContain('onChange={e => setSilent(e.target.checked)}');
