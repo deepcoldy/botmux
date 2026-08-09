@@ -15,9 +15,15 @@ interface ScanRequest {
 // subsystem exists to isolate) never emits message/error/close, so runScan's
 // Promise would otherwise never settle. Because scans are globally serialized
 // (scanQueue), one wedged child would permanently block every later session's
-// repo scan. Bound each scan so a wedge is killed and surfaced as a normal
-// failure (progress card withdrawn + `/repo` text recovery) and the queue drains.
-const DEFAULT_SCAN_TIMEOUT_MS = 60_000;
+// repo scan. Bound each scan so a wedge is surfaced as a normal failure
+// (progress card withdrawn + `/repo` text recovery) and the queue drains.
+//
+// The default must sit ABOVE the real-world upper bound: the reference
+// deployment scans 134 repos in ~76s, so a 60s budget would guillotine the
+// core case before it finishes and leave it permanently on the text fallback.
+// 180s gives that ~2.4x headroom; BOTMUX_REPO_SCAN_TIMEOUT_MS can tighten it for
+// diagnosis or loosen it for pathologically large trees.
+const DEFAULT_SCAN_TIMEOUT_MS = 180_000;
 // After SIGTERM, give the child a brief grace period to unwind before SIGKILL —
 // a child truly wedged in a blocking syscall may ignore SIGTERM.
 const SCAN_KILL_GRACE_MS = 2_000;
@@ -57,55 +63,78 @@ function runScan(request: ScanRequest): Promise<ProjectInfo[]> {
     let response: ScanResponse | undefined;
     let failure: Error | undefined;
 
-    // Bound the child: on timeout SIGTERM it, escalate to SIGKILL if it ignores
-    // that, and record a timeout failure so the 'close' handler rejects. Killing
-    // guarantees a 'close' event, which is what settles this Promise and lets the
-    // serialized scanQueue drain past a wedged child.
+    // The parent OWNS settlement — it must never depend on the child's 'close'
+    // event to unblock the serialized queue. Under uninterruptible I/O (hung NFS)
+    // even SIGKILL can stay pending indefinitely, so 'close' may never arrive.
+    // settle() therefore resolves/rejects exactly once and detaches every child
+    // listener so a later (or never) 'close' cannot double-settle or leak.
+    let settled = false;
     let killTimer: ReturnType<typeof setTimeout> | undefined;
-    const timeoutTimer = setTimeout(() => {
+    let timeoutTimer: ReturnType<typeof setTimeout> | undefined;
+    const settle = (): void => {
+      if (settled) return;
+      settled = true;
+      if (timeoutTimer) clearTimeout(timeoutTimer);
+      if (killTimer) clearTimeout(killTimer);
+      child.removeAllListeners('message');
+      child.removeAllListeners('error');
+      child.removeAllListeners('close');
+      if (failure) {
+        reject(failure);
+      } else if (!response) {
+        reject(new Error('Project scanner child produced no response'));
+      } else if (!response.ok) {
+        reject(new Error(response.error));
+      } else {
+        resolve(response.projects);
+      }
+    };
+
+    // Bound the child: on timeout record a failure, SIGTERM it, then settle the
+    // Promise immediately after the SIGKILL escalation is queued — WITHOUT
+    // waiting for 'close'. The best-effort SIGKILL still fires to reap the
+    // process, but the serialized queue drains regardless of whether the wedged
+    // child ever actually dies.
+    timeoutTimer = setTimeout(() => {
       failure ??= new Error(`Project scanner child timed out after ${scanTimeoutMs()}ms`);
-      child.kill('SIGTERM');
+      try { child.kill('SIGTERM'); } catch { /* already gone */ }
       killTimer = setTimeout(() => {
         try { child.kill('SIGKILL'); } catch { /* already gone */ }
       }, SCAN_KILL_GRACE_MS);
       killTimer.unref?.();
+      settle();
     }, scanTimeoutMs());
     timeoutTimer.unref?.();
-    const clearTimers = (): void => {
-      clearTimeout(timeoutTimer);
-      if (killTimer) clearTimeout(killTimer);
-    };
 
     child.once('message', (message) => {
       response = message as ScanResponse;
+      settle();
     });
     child.once('error', (error) => {
       failure ??= error;
+      settle();
     });
     child.once('close', (code, signal) => {
-      clearTimers();
-      if (failure) {
-        reject(failure);
-      } else if (!response) {
-        reject(new Error(`Project scanner child exited without a response (code=${code}, signal=${signal ?? 'none'})`));
-      } else if (!response.ok) {
-        reject(new Error(response.error));
-      } else if (code !== 0) {
-        reject(new Error(`Project scanner child exited with code ${code}`));
-      } else {
-        resolve(response.projects);
+      if (!failure && !response) {
+        failure = new Error(`Project scanner child exited without a response (code=${code}, signal=${signal ?? 'none'})`);
+      } else if (response?.ok && code !== 0 && code !== null) {
+        failure ??= new Error(`Project scanner child exited with code ${code}`);
+        response = undefined;
       }
+      settle();
     });
 
     try {
       child.send(request, (error) => {
         if (!error) return;
         failure ??= error;
-        child.kill();
+        try { child.kill(); } catch { /* already gone */ }
+        settle();
       });
     } catch (error) {
       failure ??= error instanceof Error ? error : new Error(String(error));
-      child.kill();
+      try { child.kill(); } catch { /* already gone */ }
+      settle();
     }
   });
 }

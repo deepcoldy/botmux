@@ -94,4 +94,33 @@ describe('scanMultipleProjectsAsync', () => {
     const actual = await scanMultipleProjectsAsync([tempRoot]);
     expect(actual).toEqual(expected);
   });
+
+  it('settles on timeout even when the killed child never emits close', async () => {
+    // Regression for the "watchdog depends on close" trap: under uninterruptible
+    // I/O a killed child's 'close' can be delayed indefinitely, so settlement
+    // must NOT wait for it. This child traps SIGTERM (ignores it) and keeps a
+    // live timer, so 'close' will not arrive within the grace window. The scan
+    // must still reject promptly (parent-owned settle), and the queue must drain.
+    const stubbornChild = join(tempRoot, 'stubborn-child.mjs');
+    writeFileSync(
+      stubbornChild,
+      "process.on('SIGTERM', () => {});\nsetInterval(() => {}, 1 << 30);\n",
+    );
+    process.env.BOTMUX_REPO_SCANNER_CHILD = stubbornChild;
+    process.env.BOTMUX_REPO_SCAN_TIMEOUT_MS = '300';
+    try {
+      const started = Date.now();
+      await expect(scanMultipleProjectsAsync([tempRoot])).rejects.toThrow(/timed out/i);
+      // Must settle at ~timeout, well before the SIGKILL grace makes 'close'
+      // eventually fire — proving settlement is parent-owned, not close-driven.
+      expect(Date.now() - started).toBeLessThan(1_500);
+    } finally {
+      delete process.env.BOTMUX_REPO_SCANNER_CHILD;
+      delete process.env.BOTMUX_REPO_SCAN_TIMEOUT_MS;
+    }
+
+    const expected = scanMultipleProjects([tempRoot]);
+    const actual = await scanMultipleProjectsAsync([tempRoot]);
+    expect(actual).toEqual(expected);
+  });
 });

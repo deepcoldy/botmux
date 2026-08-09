@@ -11,7 +11,8 @@ import { readGlobalConfig, repoPickerScanOptions } from '../global-config.js';
 import * as sessionStore from '../services/session-store.js';
 import * as scheduleStore from '../services/schedule-store.js';
 import * as scheduler from './scheduler.js';
-import { scanProjects, scanMultipleProjects, describeProjectDir } from '../services/project-scanner.js';
+import { scanProjects, describeProjectDir } from '../services/project-scanner.js';
+import { scanMultipleProjectsAsync } from '../services/project-scanner-async.js';
 import { createRepoWorktree, pushWorktreeBranch } from '../services/git-worktree.js';
 import { worktreeSlugFromContextAI } from '../services/worktree-slug-ai.js';
 import { isRiffBackendSession, resolvePairedSpawnBackendType } from './persistent-backend.js';
@@ -222,10 +223,10 @@ export { validateWorkingDir };
  *      level).
  * Returns null when nothing resolves to an existing directory.
  */
-export function resolveRepoSelection(
+export async function resolveRepoSelection(
   repoArg: string,
   scanDirs: string[],
-): { path: string; displayName: string } | null {
+): Promise<{ path: string; displayName: string } | null> {
   const isExplicitPath =
     repoArg.startsWith('/') ||
     repoArg.startsWith('~') ||
@@ -260,8 +261,13 @@ export function resolveRepoSelection(
   // them. Bare names alone may refer to a repo nested below a scan root.
   if (isExplicitPath) return null;
 
+  // The bare-name basename search recurses through every scan root. Run it in
+  // the isolated, watchdog-bounded child scanner instead of a synchronous
+  // traversal on the daemon event loop — otherwise `/repo <name>` (which the
+  // scan-failure recovery text itself suggests) would reintroduce the exact
+  // whole-daemon hang this async subsystem exists to eliminate.
   const existingScanDirs = scanDirs.filter((d) => existsSync(d));
-  const projects = existingScanDirs.length > 0 ? scanMultipleProjects(existingScanDirs) : [];
+  const projects = existingScanDirs.length > 0 ? await scanMultipleProjectsAsync(existingScanDirs) : [];
   const byName = projects.find((p) => p.name === repoArg);
   if (byName) return { path: byName.path, displayName: `${byName.name} (${byName.branch})` };
 
@@ -1897,7 +1903,7 @@ export async function handleCommand(
             }
             repoPath = cached[repoIndex - 1]!.path;
           } else {
-            const resolved = resolveRepoSelection(targetArg!, getProjectScanDirs(ds));
+            const resolved = await resolveRepoSelection(targetArg!, getProjectScanDirs(ds));
             if (!resolved) {
               await sessionReply(rootId, t('cmd.repo.path_not_found', { arg: targetArg! }, loc));
               break;
@@ -2013,7 +2019,7 @@ export async function handleCommand(
         // Non-numeric arg → a path (relative/absolute) or first-level project
         // name under workingDir; resolve it directly and skip the card.
         if (repoArg && ds) {
-          const resolved = resolveRepoSelection(repoArg, getProjectScanDirs(ds));
+          const resolved = await resolveRepoSelection(repoArg, getProjectScanDirs(ds));
           if (!resolved) {
             await sessionReply(rootId, t('cmd.repo.path_not_found', { arg: repoArg }, loc));
             break;
@@ -2060,7 +2066,10 @@ export async function handleCommand(
           await sessionReply(rootId, t('cmd.repo.scan_dir_not_exist', { dirs: scanDirs.join(', ') }, loc));
           break;
         }
-        const projects = scanMultipleProjects(validDirs, 3, repoPickerScanOptions());
+        // Bare `/repo` rebuilds the picker over every scan root. Use the
+        // isolated, watchdog-bounded child scanner so this (the recovery text's
+        // "safe" fallback) can't wedge the daemon event loop on a slow/hung mount.
+        const projects = await scanMultipleProjectsAsync(validDirs, 3, repoPickerScanOptions());
         if (projects.length === 0) {
           await sessionReply(rootId, t('cmd.repo.no_git_repos', { dirs: validDirs.join(', ') }, loc));
           break;

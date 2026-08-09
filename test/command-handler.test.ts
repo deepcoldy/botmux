@@ -173,10 +173,23 @@ vi.mock('../src/core/scheduler.js', () => ({
   extractScheduleModifiers: vi.fn((prompt: string) => ({ deliver: 'origin' as const, silent: false, prompt })),
 }));
 
+const scanMocks = vi.hoisted(() => ({
+  scanMultipleProjects: vi.fn(() => [] as unknown[]),
+}));
+
 vi.mock('../src/services/project-scanner.js', () => ({
   scanProjects: vi.fn(() => []),
-  scanMultipleProjects: vi.fn(() => []),
+  scanMultipleProjects: scanMocks.scanMultipleProjects,
   describeProjectDir: vi.fn(() => null),
+}));
+
+// The `/repo` picker and bare-name resolution now scan through the isolated
+// async child scanner (so a slow/hung mount can't wedge the daemon). Route the
+// async mock's results through the same sync mock the tests configure, so the
+// existing `scanMultipleProjects` expectations keep describing scan behavior.
+vi.mock('../src/services/project-scanner-async.js', () => ({
+  scanMultipleProjectsAsync: vi.fn(async (...args: unknown[]) =>
+    scanMocks.scanMultipleProjects(...(args as []))),
 }));
 
 vi.mock('../src/services/git-worktree.js', () => ({
