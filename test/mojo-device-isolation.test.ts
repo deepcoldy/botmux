@@ -81,9 +81,18 @@ describe('resolveRemoteExecutionProven', () => {
     liveBotConfig = { env: { LD_PRELOAD: '/tmp/x.so' } };
     expect(resolveRemoteExecutionProven(ds({ mojoIdentity: { cloud: true } }))).toBe(false);
 
-    // The credential variable alone stays provable.
-    liveBotConfig = { mojo: { jwtEnv: 'MY_JWT', env: { MY_JWT: 'tok' } } };
+    // The CANONICAL credential variable alone stays provable.
+    liveBotConfig = { mojo: { env: { X_JWT_TOKEN: 'tok' } } };
     expect(resolveRemoteExecutionProven(ds({ mojoIdentity: { cloud: true } }))).toBe(true);
+
+    // But a config-named credential key does NOT buy an exemption here either.
+    // This is the alias bypass at the device-isolation layer: if `jwtEnv` widened
+    // the allowlist, `jwtEnv: 'PATH'` would be classified safe_remote and activate
+    // device credentials around a local child running an operator-chosen binary.
+    liveBotConfig = { mojo: { jwtEnv: 'MY_JWT', env: { MY_JWT: 'tok' } } };
+    expect(resolveRemoteExecutionProven(ds({ mojoIdentity: { cloud: true } }))).toBe(false);
+    liveBotConfig = { mojo: { jwtEnv: 'PATH', env: { PATH: '/tmp/fake-mojo' } } };
+    expect(resolveRemoteExecutionProven(ds({ mojoIdentity: { cloud: true } }))).toBe(false);
   });
 
   it('a frozen session whose bot is gone fails closed', () => {

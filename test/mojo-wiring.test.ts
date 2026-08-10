@@ -20,6 +20,11 @@ vi.mock('../src/utils/logger.js', () => ({
 import { createMojoAdapter } from '../src/adapters/cli/mojo.js';
 import { createCliAdapterSync, rawCliExecutable } from '../src/adapters/cli/registry.js';
 import { isMojoFullyRemote, localSandboxApplies } from '../src/adapters/backend/sandbox.js';
+import {
+  buildEffectiveMojoConfig,
+  mojoUnprovableEnvKeys,
+  pickMojoLivePatch,
+} from '../src/adapters/backend/mojo-types.js';
 import { backendSandboxCompatibilityError } from '../src/adapters/backend/session-backend-selector.js';
 import { buildReproduceCommand } from '../src/adapters/backend/reproduce-command.js';
 import {
@@ -126,13 +131,75 @@ describe('mojo backend bypasses local-only machinery', () => {
     // set that can redirect execution cannot be enumerated.
     expect(isMojoFullyRemote({ cloud: true, env: { SOMETHING_NEW: 'x' } })).toBe(false);
 
-    // The credential variable is the one safe case — it cannot change what runs.
+    // The canonical credential variable is the one safe case — it cannot change
+    // what runs, and it is the ONLY name the CLI ever reads the token from.
     expect(isMojoFullyRemote({ cloud: true, env: { X_JWT_TOKEN: 'tok' } })).toBe(true);
-    expect(isMojoFullyRemote({ cloud: true, jwtEnv: 'MY_JWT', env: { MY_JWT: 'tok' } })).toBe(true);
-    // ...and only under the name this bot actually reads it from.
-    expect(isMojoFullyRemote({ cloud: true, jwtEnv: 'MY_JWT', env: { X_JWT_TOKEN: 'tok' } })).toBe(false);
+    // ...and it stays exempt even when jwtEnv points somewhere else, because the
+    // exemption is about the name's harmlessness, not about this bot's lookup.
+    expect(isMojoFullyRemote({ cloud: true, jwtEnv: 'MY_JWT', env: { X_JWT_TOKEN: 'tok' } })).toBe(true);
     // An empty env block must not itself be disqualifying.
     expect(isMojoFullyRemote({ cloud: true, env: {} })).toBe(true);
+  });
+
+  it('jwtEnv cannot widen the proof allowlist (alias bypass)', () => {
+    // Review finding: the exemption used to be `jwtEnv || 'X_JWT_TOKEN'`, i.e.
+    // operator-EXTENSIBLE. Naming jwtEnv after a variable that redirects execution
+    // laundered it through the allowlist: normalizeMojoConfig accepts it (PATH is
+    // not a reserved key), unprovable keys came back empty, isMojoFullyRemote said
+    // true — so the local sandbox was skipped and device isolation said safe_remote
+    // — while resolveBin() picked the binary off that very PATH.
+    for (const key of ['PATH', 'NODE_OPTIONS', 'LD_PRELOAD', 'DYLD_INSERT_LIBRARIES']) {
+      expect(
+        mojoUnprovableEnvKeys({ jwtEnv: key, env: { [key]: 'payload' } }),
+        `${key} must stay unprovable even when jwtEnv names it`,
+      ).toEqual([key]);
+      expect(
+        isMojoFullyRemote({ cloud: true, jwtEnv: key, env: { [key]: 'payload' } }),
+        `jwtEnv: ${key} must not prove remote execution`,
+      ).toBe(false);
+      // The sandbox gate is the consequence that actually matters.
+      expect(
+        localSandboxApplies('mojo', { cloud: true, jwtEnv: key, env: { [key]: 'payload' } }),
+        `jwtEnv: ${key} must not skip the local sandbox`,
+      ).toBe(true);
+    }
+    // A custom credential name gets no exemption either — the proof cannot tell it
+    // apart from the redirecting ones above. Configs that relied on this must move
+    // the value to `mojo.jwt` or the daemon's own env (neither is a proof input).
+    expect(mojoUnprovableEnvKeys({ jwtEnv: 'MY_JWT', env: { MY_JWT: 'tok' } })).toEqual(['MY_JWT']);
+    expect(isMojoFullyRemote({ cloud: true, jwtEnv: 'MY_JWT', env: { MY_JWT: 'tok' } })).toBe(false);
+  });
+
+  it('a custom jwtEnv kept in the daemon env stays provable and still resolves', () => {
+    // The migration path offered by the error message has to actually work. The
+    // proof input is assembled from bots.json only (per-bot `env` + `mojo.env`) —
+    // process.env is NOT part of it — so a credential that lives in the daemon's
+    // own environment costs nothing in provability.
+    const effective = buildEffectiveMojoConfig({ cloud: true, jwtEnv: 'MY_JWT' }, {});
+    expect(effective.env).toBeUndefined();
+    expect(isMojoFullyRemote(effective)).toBe(true);
+
+    // ...and the value is still reachable, without the map ever being shipped.
+    expect(pickMojoLivePatch({ jwtEnv: 'MY_JWT' }, { ambientEnv: { MY_JWT: 'tok' } }))
+      .toEqual({ jwt: 'tok' });
+    // The other offered migration: a literal, which never touches env at all.
+    expect(isMojoFullyRemote(buildEffectiveMojoConfig({ cloud: true, jwt: 'tok' }, {})))
+      .toBe(true);
+  });
+
+  it('the proof exemption is the canonical name the child actually reads', () => {
+    // buildEnv() hands the resolved token to the CLI as X_JWT_TOKEN no matter what
+    // jwtEnv says, which is what makes exempting exactly that name (and nothing
+    // else) sound. If these two ever drift, the bypass comes back silently.
+    const backendSrc = readFileSync(resolve('src/adapters/backend/mojo-backend.ts'), 'utf8');
+    expect(backendSrc).not.toMatch(/env\.X_JWT_TOKEN\s*=/);
+    expect(backendSrc).toContain('env[MOJO_CANONICAL_JWT_ENV_KEY] =');
+
+    const typesSrc = readFileSync(resolve('src/adapters/backend/mojo-types.ts'), 'utf8');
+    const fn = typesSrc.slice(typesSrc.indexOf('export function mojoUnprovableEnvKeys'));
+    const body = fn.slice(0, fn.indexOf('\n}'));
+    // The whole defect was reading jwtEnv here. Nothing may reintroduce it.
+    expect(body).not.toMatch(/cfg\??\.\s*jwtEnv/);
   });
 
   it('the proof plumbing does not silently drop env on the way in', () => {
@@ -186,6 +253,25 @@ describe('mojo backend bypasses local-only machinery', () => {
     expect(reason).toContain('PATH');
     // Not the generic cloud advice, which would be actively misleading here.
     expect(reason).not.toContain('set mojo.cloud=true');
+  });
+
+  it('gives a credential key its own migration advice, not "this redirects execution"', () => {
+    // A custom jwtEnv key now shows up in the unprovable list. The generic wording
+    // ("these can change which binary is executed") reads as a false accusation
+    // against a JWT variable, so this case gets its own actionable message.
+    const reason = backendSandboxCompatibilityError({
+      backendType: 'mojo',
+      fileSandboxRequested: true,
+      effectiveReadIsolationRequested: false,
+      mojoConfig: { cloud: true, jwtEnv: 'MY_JWT', env: { MY_JWT: 'tok' } },
+    });
+    expect(reason).toBeDefined();
+    expect(reason).toContain('MY_JWT');
+    // Both offered migrations must be named, or the operator is stuck.
+    expect(reason).toContain('mojo.jwt');
+    expect(reason).toMatch(/daemon's own environment/);
+    // Key names only — this string reaches logs and chat.
+    expect(reason).not.toContain('tok');
   });
 
   it('refuses to launch a locally-executing mojo bot that requested sandbox', () => {

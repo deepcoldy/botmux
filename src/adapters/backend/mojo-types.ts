@@ -151,6 +151,16 @@ export const MOJO_CONTROL_ENV_KEYS = [
     'AGENT_LOCAL_DAEMON',
 ] as const;
 
+/**
+ * The one env var name the mojo CLI actually reads its credential from.
+ *
+ * `jwtEnv` only tells the DAEMON where to look up the value; buildEnv() always
+ * hands the resolved token to the child as this name. That asymmetry is why the
+ * remote-execution proof exempts this fixed name and never `jwtEnv` — see
+ * mojoUnprovableEnvKeys.
+ */
+export const MOJO_CANONICAL_JWT_ENV_KEY = 'X_JWT_TOKEN';
+
 /** The frozen control-plane identity, persisted on the session. */
 export type MojoSessionIdentity = Pick<MojoConfig, typeof MOJO_IDENTITY_KEYS[number]>;
 
@@ -449,6 +459,9 @@ export function findReservedMojoCliFlags(args: readonly string[]): string[] {
  * see mojoUnprovableEnvKeys.
  */
 export function mojoUnprovableEnvKeys(
+    // `jwtEnv` is accepted (callers spread a whole config in) but deliberately
+    // IGNORED — see the exemption note below. Keep it in the signature so those
+    // spreads keep type-checking; do NOT read it.
     cfg?: { jwtEnv?: string; env?: Record<string, string> },
 ): string[] {
     const keys = Object.keys(cfg?.env ?? {});
@@ -458,10 +471,20 @@ export function mojoUnprovableEnvKeys(
     // enumerated completely — the same reason `env` is not live-patchable, see
     // MOJO_LIVE_PATCH_KEYS below. So anything NOT known-harmless voids the proof.
     //
-    // The credential variable is the one safe case: mojo reads it as a token, it
-    // cannot change which binary runs or how it is loaded.
-    const credential = cfg?.jwtEnv?.trim() || 'X_JWT_TOKEN';
-    return keys.filter(k => k !== credential).sort();
+    // The exemption is the FIXED canonical name and nothing else. It must never be
+    // derived from `jwtEnv`, because that made the allowlist operator-extensible:
+    // `jwtEnv: 'PATH'` + `env: { PATH: <dir with a fake mojo> }` passed validation
+    // (PATH is not a reserved key) and then reported ZERO unprovable keys, so
+    // isMojoFullyRemote() returned true — the local sandbox was skipped and device
+    // isolation classified the session safe_remote, while resolveBin() picked the
+    // binary off that very PATH. Same trick with NODE_OPTIONS / LD_PRELOAD / DYLD_*.
+    //
+    // Ignoring `jwtEnv` here is not a compatibility break in the child: buildEnv()
+    // resolves whatever `jwtEnv` names and hands the VALUE to the CLI as
+    // X_JWT_TOKEN regardless (see MojoBackend.buildEnv). `jwtEnv` is a "where to
+    // read it from" pointer, never a name the child reads — so it has no business
+    // widening a proof about which binary executes.
+    return keys.filter(k => k !== MOJO_CANONICAL_JWT_ENV_KEY).sort();
 }
 
 export function isMojoFullyRemote(
@@ -549,7 +572,7 @@ export function pickMojoLivePatch(
     // Resolve the configured key across the same layers buildEnv() would, reading
     // only the VALUE — the map itself is never shipped, which is what stops a
     // patch from rewriting PATH / loader variables.
-    const key = cfg?.jwtEnv?.trim() || 'X_JWT_TOKEN';
+    const key = cfg?.jwtEnv?.trim() || MOJO_CANONICAL_JWT_ENV_KEY;
     const fromMojoEnv = cfg?.env?.[key]?.trim();
     if (fromMojoEnv) return { jwt: fromMojoEnv };
     const fromGeneric = sources.genericEnv?.[key]?.trim();

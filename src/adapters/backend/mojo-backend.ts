@@ -53,7 +53,12 @@ import { locateOnPath } from '../cli/registry.js';
 import { buildWrappedLaunch } from '../../setup/cli-selection.js';
 import { logger } from '../../utils/logger.js';
 import type { SessionBackend, SpawnOpts } from './types.js';
-import { buildEffectiveChildEnv, findReservedMojoCliFlags, MOJO_CONTROL_ENV_KEYS } from './mojo-types.js';
+import {
+    buildEffectiveChildEnv,
+    findReservedMojoCliFlags,
+    MOJO_CANONICAL_JWT_ENV_KEY,
+    MOJO_CONTROL_ENV_KEYS,
+} from './mojo-types.js';
 import type {
     MojoAuthStatus,
     MojoLivePatch,
@@ -819,18 +824,23 @@ export class MojoBackend implements SessionBackend {
         // ambient X_JWT_TOKEN is the lowest layer of that merge, so reaching back
         // to process.env here would let the host's token override a per-bot one
         // and silently run the bot as the wrong identity.
-        const jwtKey = this.config.jwtEnv ?? 'X_JWT_TOKEN';
+        // `jwtEnv` decides only WHERE the value is read from; the child is always
+        // handed it under the canonical name below. The remote-execution proof
+        // relies on exactly this (mojoUnprovableEnvKeys exempts the canonical name
+        // and never `jwtEnv`), so both sites share one constant rather than two
+        // literals that could drift apart and silently re-open the bypass.
+        const jwtKey = this.config.jwtEnv ?? MOJO_CANONICAL_JWT_ENV_KEY;
         if (this.liveJwt !== undefined) {
             // A live snapshot is authoritative and already includes the daemon's
             // ambient fallback. `null` therefore means "no credential anywhere", so
             // the inherited value must be REMOVED rather than left to stand in —
             // otherwise deleting `mojo.jwt` / `jwtEnv` revived the stale token.
             delete env[jwtKey];
-            delete env.X_JWT_TOKEN;
-            if (this.liveJwt !== null) env.X_JWT_TOKEN = this.liveJwt;
+            delete env[MOJO_CANONICAL_JWT_ENV_KEY];
+            if (this.liveJwt !== null) env[MOJO_CANONICAL_JWT_ENV_KEY] = this.liveJwt;
         } else {
             const jwt = this.config.jwt ?? env[jwtKey];
-            if (jwt) env.X_JWT_TOKEN = jwt;
+            if (jwt) env[MOJO_CANONICAL_JWT_ENV_KEY] = jwt;
         }
 
         // ── Control plane: config is the ONLY source ──────────────────────────
