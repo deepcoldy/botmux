@@ -12,7 +12,6 @@ import { validateWorkingDir } from './working-dir.js';
 import { buildFollowUpCliInput, buildNewTopicCliInput, ensureSessionWhiteboard, getAvailableBots, rememberLastCliInput } from './session-manager.js';
 import { markSessionActivity } from './session-activity.js';
 import {
-  closeSession,
   closeSessionForBackgroundCleanup,
   forkWorker,
   getCurrentCliVersion,

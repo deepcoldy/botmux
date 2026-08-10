@@ -430,4 +430,3 @@ describe('closeSessionForBackgroundCleanup', () => {
     expect(errored).toContain('unit cleanup');
   });
 });
-

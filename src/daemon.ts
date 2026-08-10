@@ -2815,6 +2815,16 @@ function scheduleDeferredScheduleSettlement(
         );
         return;
       }
+      if (result.action === 'close_refused') {
+        // Must NOT print "Auto-closed": the row is still active and its remote
+        // session may still be running. Two contradictory log lines about the same
+        // session is exactly how a false success hides.
+        logger.error(
+          `[scheduler] Deferred run close REFUSED (${result.error ?? 'unknown'}); session stays `
+          + `ACTIVE session=${sessionId.slice(0, 8)} turn=${context.turnId.slice(0, 12)} source=${context.source}`,
+        );
+        return;
+      }
       if (result.action === 'closed') {
         logger.info(
           `[scheduler] Auto-closed silent deferred run with no botmux send `
