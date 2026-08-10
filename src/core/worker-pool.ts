@@ -2615,9 +2615,9 @@ function resolveMojoCancelLaunch(
   try {
     botCfg = getBot(ds.larkAppId).config;
   } catch {
-    // Bot deregistered — nothing to cancel WITH. The lineage stays on the row for
-    // manual cleanup; blocking the close forever would be worse, since re-adding
-    // the bot is the only thing that could ever make this succeed.
+    // Bot deregistered — nothing to cancel WITH. The caller decides what that
+    // means; the explicit-close path treats it as a RETRYABLE refusal, because
+    // re-registering the bot restores exactly the config this needs.
     logger.warn(
       `[${tag(ds)}] ${label}: cannot cancel mojo session ${remoteId} — bot `
       + `${ds.larkAppId} is deregistered. Lineage retained for manual cleanup.`,
@@ -2734,7 +2734,14 @@ function destroyOrphanedBackingSession(
 }
 
 type RiffClosePreparation =
-  | { ok: true; taskId?: string; residual?: CloseResidual }
+  | {
+      ok: true;
+      taskId?: string;
+      residual?: CloseResidual;
+      /** Move this still-uncancellable lineage into the PARKED slot as part of the
+       *  durable close, so the residual decision survives and replays. */
+      parkMojoLineage?: string;
+    }
   | {
       ok: false;
       error:
@@ -3057,10 +3064,10 @@ async function prepareRiffExplicitClose(
  * cancel on its own side (and waits out the pre-init window, which the daemon
  * cannot observe).
  *
- * Not handled: a session with an open durable row but no entry in the active
- * registry. Every helper the cancel needs (frozen identity, launch identity) is
- * keyed on DaemonSession, and that case has no cancel path today either — it is
- * called out rather than silently widened here.
+ * An open durable row with no entry in the active registry cannot be cancelled
+ * from here at all (every helper the cancel needs is keyed on DaemonSession), so
+ * it is refused as retryable rather than published as closed — restoring the owner
+ * makes the retry work.
  */
 async function prepareMojoExplicitClose(
   ds: DaemonSession | undefined,
@@ -3069,8 +3076,20 @@ async function prepareMojoExplicitClose(
   const session = ds?.session ?? stored;
   if (!session) return { ok: true };
   if (ds?.initConfig?.adoptMode || ds?.adoptedFrom || session.adoptedFrom) return { ok: true };
+  // A row whose lineage was PARKED (restore-time quarantine moves the id here and
+  // clears the active slot) still has a remote session running. It is reported as
+  // a residual on every close of this row, including replays of an already-closed
+  // one — which is what makes the outcome idempotent instead of degrading to a
+  // failure once the owner is gone.
+  const parked = mojoCloseResidualForRow(session);
   const remoteId = session.riffParentTaskId;
-  if (!remoteId) return { ok: true };
+  // Nothing ACTIVE to cancel: either a clean row, or a parked-only one.
+  if (!remoteId) return parked ? { ok: true, residual: parked } : { ok: true };
+  // Already closed: this is a replay, so there is nothing left to cancel. Report
+  // the same residual rather than failing on the missing owner below.
+  if (stored && stored.status === 'closed') {
+    return parked ? { ok: true, residual: parked } : { ok: true };
+  }
   if (!ds) {
     // An open durable row carrying a lineage, with no owner in the active
     // registry. Everything the cancel needs (frozen identity, launch identity)
@@ -3098,9 +3117,14 @@ async function prepareMojoExplicitClose(
     // ever make an unverifiable control plane verifiable. Refusing forever would
     // strand the row, so the close proceeds — but as an EXPLICIT residual, never
     // as an ordinary success, and the lineage stays on the row for manual cleanup.
+    //
+    // The id is PARKED as part of the durable close (see parkMojoLineage), which is
+    // what makes the decision replayable: a second close reads it back out of the
+    // parked slot instead of tripping over an active lineage with no owner.
     return {
       ok: true,
-      residual: { reason: 'mojo_lineage_quarantined', taskId: remoteId },
+      residual: parked ?? { reason: 'mojo_lineage_quarantined', taskId: remoteId },
+      parkMojoLineage: remoteId,
     };
   }
 
@@ -3124,7 +3148,27 @@ async function prepareMojoExplicitClose(
   // repeat-cancel is suppressed with an explicit flag rather than by mutating
   // shared state early.
   logger.info(`[${tag(ds)}] mojo session ${remoteId} cancelled for explicit close`);
-  return { ok: true, taskId: remoteId };
+  // Cancelling the ACTIVE lineage says nothing about a previously parked one: a row
+  // can carry both (restore parked the old id, the session then created a new one).
+  // Reporting a plain success here would hide the parked remote session entirely.
+  return { ok: true, taskId: remoteId, ...(parked ? { residual: parked } : {}) };
+}
+
+/**
+ * The residual a row carries because a lineage was PARKED as unverifiable.
+ *
+ * Read from the parked slot, never from the active one: restore-time quarantine
+ * moves the id into `mojoQuarantinedLineage` and clears `riffParentTaskId`, so a
+ * check against the active slot misses the production shape completely — the row
+ * would close as an ordinary success while its remote session kept running.
+ *
+ * May hold more than one id (comma-joined) when two unverifiable lineages were
+ * parked together; it is passed through verbatim so manual cleanup sees both.
+ */
+export function mojoCloseResidualForRow(session: Session | undefined): CloseResidual | undefined {
+  const parked = session?.mojoQuarantinedLineage;
+  if (!parked) return undefined;
+  return { reason: 'mojo_lineage_quarantined', taskId: parked };
 }
 
 /**
@@ -3537,6 +3581,12 @@ export async function closeSession(
   // Only when the cancel actually happened: a quarantined / bot-gone mojo session
   // keeps its lineage on the row for manual cleanup.
   const clearMojoLineage = isOwnedMojoClose && !!prepared.taskId;
+  // Residual survives beyond this call: prefer what the prepare decided, and fall
+  // back to whatever the ROW already carries so an already-closed replay reports
+  // the same thing instead of a bare success.
+  const closeResidual = isOwnedMojoClose
+    ? (prepared.residual ?? mojoCloseResidualForRow(stored ?? ds?.session))
+    : undefined;
   const preparedRiffRequestId = ds?.riffCloseState?.phase === 'prepared'
     ? ds.riffCloseState.requestId
     : undefined;
@@ -3559,9 +3609,24 @@ export async function closeSession(
   if (wasOpen) {
     if (!ds && stored && !isOwnedRiffClose) destroyUnregisteredPersistentBacking(stored);
     try {
+      // Park the uncancellable lineage in the SAME durable write that closes the
+      // row, so the residual decision is persisted rather than recomputed from an
+      // active slot that this close is about to clear.
+      if (prepared.parkMojoLineage) {
+        const target = ds?.session ?? stored;
+        if (target) {
+          const already = target.mojoQuarantinedLineage;
+          target.mojoQuarantinedLineage = already && already !== prepared.parkMojoLineage
+            ? `${already},${prepared.parkMojoLineage}`
+            : prepared.parkMojoLineage;
+          target.mojoQuarantineNoticePending = true;
+        }
+      }
       sessionStore.closeSession(sessionId, {
         cleanupBridgeMarkers: !hadLiveWorker,
-        ...(isOwnedRiffClose || clearMojoLineage ? { clearRiffParentTaskId: true } : {}),
+        ...(isOwnedRiffClose || clearMojoLineage || prepared.parkMojoLineage
+          ? { clearRiffParentTaskId: true }
+          : {}),
       });
     } catch (err) {
       if (!isOwnedRiffClose) throw err;
@@ -3699,11 +3764,11 @@ export async function closeSession(
   // The local row IS closed, but a remote session was deliberately left running
   // (its control plane could not be verified, so cancelling it might have hit
   // another tenant). Callers must render this differently from an ordinary close.
-  if (prepared.residual) {
+  if (closeResidual) {
     return {
       ok: true,
       outcome: 'closed_with_residual',
-      residual: prepared.residual,
+      residual: closeResidual,
       alreadyClosed,
       known,
     };

@@ -310,7 +310,7 @@ vi.mock('../src/core/worker-pool.js', () => ({
   // /relay --create empty-leader path closes the scratch via this; default
   // resolves as idempotent close so unrelated tests don't need to think
   // about it.
-  closeSession: vi.fn(async () => ({ ok: true, alreadyClosed: false })),
+  closeSession: vi.fn(async () => ({ ok: true, outcome: 'closed', alreadyClosed: false })),
   withActiveSessionKeyLock: vi.fn(async (_map: Map<string, any>, _key: string, action: () => any) => action()),
   // `isRelayableRealSession(ds)` — true when ds.worker is set OR persisted
   // CLI markers exist (session.cliId / session.lastCliInput). The default
@@ -1216,7 +1216,7 @@ describe('handleCommand', () => {
           if (candidate.session.sessionId === sessionId) lastMadeActiveSessions.delete(k);
         }
       }
-      return { ok: true, alreadyClosed: false, known: true };
+      return { ok: true, outcome: 'closed', alreadyClosed: false, known: true };
     });
     vi.mocked(teardownAuthoritativePersistentBackingBeforeClose).mockImplementation(() => undefined);
     vi.mocked(getBot).mockImplementation(defaultGetBot as any);
@@ -1782,6 +1782,29 @@ describe('handleCommand', () => {
       const reply = vi.mocked(deps.sessionReply).mock.calls[0]?.[1] as string;
       expect(reply).toContain('会话关闭失败');
       expect(reply).toContain('mojo_cancel_failed');
+    });
+
+    it('reports a residual instead of a plain closed card', async () => {
+      // The row DID close, so this is not a failure — but a remote session was
+      // deliberately left running, and the ordinary closed card would say
+      // everything is gone.
+      const ds = makeDaemonSession();
+      const deps = makeDeps(ds);
+      vi.mocked(closeSession).mockResolvedValueOnce({
+        ok: true,
+        outcome: 'closed_with_residual',
+        residual: { reason: 'mojo_lineage_quarantined', taskId: 'mojo-parked-9' },
+        alreadyClosed: false,
+        known: true,
+      } as never);
+
+      await handleCommand('/close', ROOT_ID, makeLarkMessage('/close'), deps, LARK_APP_ID);
+
+      // No ordinary "closed" card.
+      expect(deliverEphemeralOrReply).not.toHaveBeenCalled();
+      const reply = vi.mocked(deps.sessionReply).mock.calls[0]?.[1] as string;
+      expect(reply).toContain('mojo-parked-9');
+      expect(reply).toContain('未被取消');
     });
 
     it('does not delete a replacement session that wins the anchor while close awaits cleanup', async () => {

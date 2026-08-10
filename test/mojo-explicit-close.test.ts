@@ -79,13 +79,18 @@ function createFixture(options: {
   liveWorker?: boolean;
   /** Omit the frozen identity so the lineage reads as quarantined. */
   legacyUnfrozen?: boolean;
+  /** Restore-time quarantine PARKS the id here and clears the active slot. */
+  parkedLineage?: string;
+  /** Drop the active lineage, as restore-time quarantine does. */
+  noActiveLineage?: boolean;
 } = {}) {
   sessionStore.init('app');
   const session = sessionStore.createSession('oc_mojo', 'om_mojo', 'mojo close', 'group');
   session.larkAppId = 'app';
   session.scope = 'chat';
   session.backendType = 'mojo';
-  session.riffParentTaskId = 'mojo-sid-123';
+  session.riffParentTaskId = options.noActiveLineage ? undefined : 'mojo-sid-123';
+  if (options.parkedLineage) session.mojoQuarantinedLineage = options.parkedLineage;
   if (!options.legacyUnfrozen) {
     // A frozen identity is what makes the lineage cancellable (trustworthy control
     // plane); without it the teardown path must refuse to cancel.
@@ -232,7 +237,10 @@ describe('mojo explicit close', () => {
     expect(cancelMojoMock).not.toHaveBeenCalled();
     const after = sessionStore.getSession(fixture.session.sessionId);
     expect(after).toMatchObject({ status: 'closed' });
-    expect(after?.riffParentTaskId).toBe('mojo-sid-123');
+    // The id is PARKED (not left in the active slot) by the same durable write that
+    // closed the row — that is what makes the residual replayable.
+    expect(after?.mojoQuarantinedLineage).toBe('mojo-sid-123');
+    expect(after?.riffParentTaskId).toBeUndefined();
   });
 
   it('refuses (retryably) when the bot is deregistered', async () => {
@@ -281,5 +289,56 @@ describe('mojo explicit close', () => {
     expect((await closeSession(fixture.session.sessionId)).ok).toBe(true);
     expect(cancelMojoMock).not.toHaveBeenCalled();
     expect(fixture.worker.send).toHaveBeenCalledWith(expect.objectContaining({ type: 'close' }));
+  });
+
+  it('reports a PARKED lineage as residual even with no active lineage', async () => {
+    // The production shape: restore-time quarantine moves the id into
+    // mojoQuarantinedLineage and CLEARS riffParentTaskId. Reading only the active
+    // slot made this row close as an ordinary success while its remote session
+    // kept running.
+    const fixture = createFixture({ parkedLineage: 'mojo-parked-9', noActiveLineage: true });
+
+    expect(await closeSession(fixture.session.sessionId)).toEqual({
+      ok: true,
+      outcome: 'closed_with_residual',
+      residual: { reason: 'mojo_lineage_quarantined', taskId: 'mojo-parked-9' },
+      alreadyClosed: false,
+      known: true,
+    });
+    // Nothing active to cancel, so no cancel is attempted.
+    expect(cancelMojoMock).not.toHaveBeenCalled();
+  });
+
+  it('cancels the active lineage but still reports the parked one', async () => {
+    // A row can carry both: restore parked the old id, the session then made a new
+    // one. Cancelling the new one says nothing about the old.
+    const fixture = createFixture({ parkedLineage: 'mojo-parked-9' });
+
+    expect(await closeSession(fixture.session.sessionId)).toEqual({
+      ok: true,
+      outcome: 'closed_with_residual',
+      residual: { reason: 'mojo_lineage_quarantined', taskId: 'mojo-parked-9' },
+      alreadyClosed: false,
+      known: true,
+    });
+    expect(cancelMojoMock).toHaveBeenCalledWith(expect.anything(), 'mojo-sid-123');
+  });
+
+  it('replays the same residual on a second close instead of failing', async () => {
+    // The residual decision is persisted (the id is parked as part of the durable
+    // close), so a repeat close is an idempotent success — not a retryable failure
+    // about a missing owner.
+    const fixture = createFixture({ legacyUnfrozen: true });
+    const first = await closeSession(fixture.session.sessionId);
+    expect(first).toMatchObject({ ok: true, outcome: 'closed_with_residual' });
+
+    const second = await closeSession(fixture.session.sessionId);
+    expect(second).toEqual({
+      ok: true,
+      outcome: 'closed_with_residual',
+      residual: { reason: 'mojo_lineage_quarantined', taskId: 'mojo-sid-123' },
+      alreadyClosed: true,
+      known: true,
+    });
   });
 });

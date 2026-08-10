@@ -76,7 +76,7 @@ import { readGlobalConfig } from '../global-config.js';
 import { normalizeChatReplyMode, setChatReplyMode, type ChatReplyMode } from '../services/chat-reply-mode-store.js';
 import * as chatFirstSeenStore from '../services/chat-first-seen-store.js';
 import * as scheduler from './scheduler.js';
-import { listActiveSessions, findActiveBySessionId, closeSession, getActiveSessionsRegistry, transferSession, deliverWriteLinkCardToOwners, forkWorker, suspendWorker, killWorker, latestPerBotEnvForRestart, getDaemonReplyCardUsageSnapshot, sessionSupportsWebTerminal, sendWorkerSessionInput, isSessionTransferring } from './worker-pool.js';
+import { listActiveSessions, findActiveBySessionId, closeSession, getActiveSessionsRegistry, transferSession, deliverWriteLinkCardToOwners, forkWorker, suspendWorker, killWorker, latestPerBotEnvForRestart, getDaemonReplyCardUsageSnapshot, sessionSupportsWebTerminal, sendWorkerSessionInput, isSessionTransferring, mojoCloseResidualForRow } from './worker-pool.js';
 import { listOnlineDaemons } from '../utils/daemon-discovery.js';
 import { isSessionStopped } from './session-liveness.js';
 import { isRemoteBackendType, isRemoteCliId, isSuspendableBackendType } from './persistent-backend.js';
@@ -1028,7 +1028,14 @@ ipcRoute('POST', '/api/sessions/:sessionId/close', async (req, res, params) => {
     // never clear a stale pre-drain snapshot while a turn is still preparing.
     const current = findSessionRecord(params.sessionId);
     if (current && current.status === 'closed') {
-      return jsonRes(res, 200, { ok: true, alreadyClosed: true });
+      // A closed row can still carry an UNCANCELLED remote session (a quarantined
+      // lineage is parked, not cancelled). Short-circuiting to a bare success here
+      // meant a retry — or any client that lost the first response — could never
+      // learn about it, so replay the same outcome the close itself would report.
+      const residual = mojoCloseResidualForRow(current);
+      return jsonRes(res, 200, residual
+        ? { ok: true, outcome: 'closed_with_residual', residual, alreadyClosed: true }
+        : { ok: true, outcome: 'closed', alreadyClosed: true });
     }
     const r = await closeSession(params.sessionId);
     jsonRes(res, r.ok ? 200 : 502, r);

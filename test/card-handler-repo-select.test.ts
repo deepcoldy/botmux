@@ -96,7 +96,7 @@ vi.mock('../src/core/worker-pool.js', () => {
   resolvePrivateCardAudience: vi.fn(() => []),
   deliverWriteLinkCard: vi.fn(),
   deliverEphemeralOrReply: vi.fn(),
-  closeSession: vi.fn(async () => ({ ok: true, alreadyClosed: false })),
+  closeSession: vi.fn(async () => ({ ok: true, outcome: 'closed', alreadyClosed: false })),
   withActiveSessionKeyLock,
   CARD_POSTING_SENTINEL: '__posting__',
   };
@@ -1084,7 +1084,7 @@ describe('repo select card — plain switch', () => {
     await Promise.resolve();
     expect(contenderEntered).toBe(false);
 
-    close.resolve({ ok: true, alreadyClosed: false });
+    close.resolve({ ok: true, outcome: 'closed', alreadyClosed: false });
     await switching;
     const ownerAfterSwitch = await contender;
     expect(contenderEntered).toBe(true);
