@@ -466,10 +466,21 @@ export async function closeSessionsForAgentSwitch(
     if (ds.larkAppId !== larkAppId) continue;
     if (ds.session.queued) continue;
     if (ds.adoptedFrom || ds.session.adoptedFrom || ds.session.title?.startsWith('Adopt:')) continue;
-    // Same preflight the sweep uses, and it must stay BEFORE any close.
-    if (hasProtectedSessionMutationOwnership(ds)) continue;
     // Compared against the PROPOSED config, not the live one.
     if (!sessionMismatchesTargetCli(ds, target)) continue;
+    // A protected owner is NOT an exemption like adopt/queued: it is a session
+    // that would keep running the old agent and cannot be closed right now, so it
+    // BLOCKS the switch. The route has its own preflight, but this helper is
+    // exported and must not hand back ok:true with such a row still live.
+    if (hasProtectedSessionMutationOwnership(ds)) {
+      out.failed++;
+      out.ok = false;
+      logger.error(
+        `[${ds.session.sessionId.substring(0, 8)}] agent switch: mismatched session has protected `
+        + 'mutation ownership and cannot be closed; the switch will NOT be committed',
+      );
+      continue;
+    }
     if (isSessionTransferring(ds)) {
       // A relay in flight cannot be closed here, and committing would strand it on
       // the old agent — treat it as a blocking failure rather than deferring.

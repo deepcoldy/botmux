@@ -83,6 +83,17 @@ import { isRemoteBackendType, isRemoteCliId, isSuspendableBackendType } from './
 import { getChatMode, replyMessage, sendMessage, resolveUnionIdFromOpenId, listThreadMessages, listChatMessages, listChatMessagesUntil, listChatBotMembers, getUserProfile, getUserProfileStrict, resolveAllowedUsersWithMap, type ChatBotMember } from '../im/lark/client.js';
 import { parseApiMessage, cardContentHasUpgradeFallback, resolveMergedCardContent, messageMentionsBot } from '../im/lark/message-parser.js';
 import { resumeSession, spawnDashboardSession, activateQueuedSession, closeCliMismatchedSessionsForBot, closeSessionsForAgentSwitch } from './session-manager.js';
+
+/**
+ * Indirection so a test can inject a failing close WITHOUT mocking the whole
+ * session-manager module (this route's suite runs against the real one).
+ *
+ * The transaction's correctness is "config is not written when a close fails",
+ * and that can only be proven by driving the real route with a failing close.
+ */
+export const agentSwitchCloseHook = {
+  run: closeSessionsForAgentSwitch as typeof closeSessionsForAgentSwitch,
+};
 import { parseSpawnRequest } from './session-create.js';
 import { cleanupMaterializedDashboardImages, materializeDashboardImages } from './dashboard-images.js';
 import { getCliDisplayName } from '../im/lark/card-builder.js';
@@ -3933,7 +3944,7 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
       cliPathOverride: nextRuntime?.executable ?? nextLegacyPath,
       wrapperCli: selected.wrapperCli,
     };
-    const closedMismatchedSessions = await closeSessionsForAgentSwitch(larkAppId, switchTarget);
+    const closedMismatchedSessions = await agentSwitchCloseHook.run(larkAppId, switchTarget);
     if (!closedMismatchedSessions.ok) {
       // Rows that DID close stay closed (a cancelled remote session cannot be
       // brought back); the ones that refused are still active on the old agent,
@@ -3945,6 +3956,10 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
         closedMismatchedSessions: closedMismatchedSessions.closed,
         closedMismatchedResidual: closedMismatchedSessions.residual,
         closedMismatchedFailed: closedMismatchedSessions.failed,
+        // Same field/shape as the 200 branch. A partial failure is exactly when a
+        // residual id matters most: those rows DID close, so this is the only
+        // place their surviving remote id is ever reported.
+        closedMismatchedResidualTaskIds: closedMismatchedSessions.residualTaskIds,
       });
     }
 

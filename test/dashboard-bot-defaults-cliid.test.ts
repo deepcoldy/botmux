@@ -271,6 +271,53 @@ describe('Codex-compatible runtime editor', () => {
     expect(className).not.toContain('hint-ok');
   });
 
+  it('shows the residual task ids on success, not just a count', async () => {
+    // A count is not actionable; the id is the only handle for manual cleanup.
+    const { text } = await saveAgentWithSweep({
+      closedMismatchedSessions: 2,
+      closedMismatchedResidual: 1,
+      closedMismatchedFailed: 0,
+      closedMismatchedResidualTaskIds: ['mojo-parked-9'],
+    });
+
+    expect(text).toContain('mojo-parked-9');
+  });
+
+  it('reports an aborted switch with its residual ids, and does not patch the bot', async () => {
+    const previousFetch = globalThis.fetch;
+    (globalThis as any).fetch = vi.fn(async () => ({
+      ok: false,
+      status: 409,
+      json: async () => ({
+        ok: false,
+        error: 'agent_switch_close_failed',
+        closedMismatchedSessions: 1,
+        closedMismatchedResidual: 1,
+        closedMismatchedFailed: 1,
+        closedMismatchedResidualTaskIds: ['mojo-parked-9'],
+      }),
+    } as any));
+    try {
+      const patchBot = vi.fn();
+      const { root } = renderAgent({ cliId: 'codex' }, patchBot);
+      await act(async () => {
+        root.findByProps({ 'data-action': 'save-agent' }).props.onClick();
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+
+      const text = root.findByProps({ 'data-agent-status': '' }).children.join('');
+      // Not a bare error code: says the switch did NOT happen, plus the counts…
+      expect(text).toContain('Agent 未切换');
+      // …and the surviving remote id.
+      expect(text).toContain('mojo-parked-9');
+      // The config was not committed, so the local bot row must not be patched.
+      expect(patchBot).not.toHaveBeenCalled();
+    } finally {
+      (globalThis as any).fetch = previousFetch;
+    }
+  });
+
   it('keeps the green tick when the sweep was completely clean', async () => {
     const { text, className } = await saveAgentWithSweep({
       closedMismatchedSessions: 2,

@@ -5,7 +5,9 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync 
 import { request as httpRequest } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { ipcRoute, startIpcServer, setLarkAppId, setIpcAuthSecret, setBotRenamer, setBotAvatarChanger, setExactChatGrantHandler, armCoreOnlyReadinessGate, setCoreOnlyReady, __testOnly_resetCoreOnlyReadiness, type IpcServerHandle } from '../src/core/dashboard-ipc-server.js';
+import { ipcRoute, startIpcServer, setLarkAppId, setIpcAuthSecret, setBotRenamer, setBotAvatarChanger, setExactChatGrantHandler, armCoreOnlyReadinessGate, setCoreOnlyReady, __testOnly_resetCoreOnlyReadiness, type IpcServerHandle,
+  agentSwitchCloseHook,
+} from '../src/core/dashboard-ipc-server.js';
 import { cliAuthBind, signCliAuth } from '../src/dashboard/auth.js';
 import { dashboardEventBus } from '../src/core/dashboard-events.js';
 import * as groupsStore from '../src/services/groups-store.js';
@@ -2818,6 +2820,67 @@ describe('PUT /api/bot-agent', () => {
         model: 'kimi-k2.5',
       });
     } finally {
+      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = prevBotsConfig;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('does NOT write bots.json or live config when a mismatched close fails', async () => {
+    // The transaction's whole claim: config commit happens only after every
+    // old-agent session is proven closed. Injected through a narrow seam because
+    // this suite runs against the real session-manager.
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-agent-abort-'));
+    const configPath = join(dir, 'bots.json');
+    const appId = 'test-agent-abort';
+    const prevBotsConfig = process.env.BOTS_CONFIG;
+    const originalHook = agentSwitchCloseHook.run;
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      writeFileSync(configPath, JSON.stringify([{
+        larkAppId: appId,
+        larkAppSecret: 'secret',
+        cliId: 'traex',
+        model: 'old-model',
+      }], null, 2));
+      loadBotConfigs().forEach((c: any) => registerBot(c));
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      // One row closed with a surviving remote, one row refused → abort.
+      agentSwitchCloseHook.run = async () => ({
+        ok: false,
+        closed: 1,
+        residual: 1,
+        failed: 1,
+        residualTaskIds: ['mojo-parked-9'],
+      });
+
+      const res = await fetch(`http://127.0.0.1:${handle.port}/api/bot-agent`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ cliId: 'codex', model: 'kimi-k2.5' }),
+      });
+
+      expect(res.status).toBe(409);
+      expect(await res.json()).toMatchObject({
+        ok: false,
+        error: 'agent_switch_close_failed',
+        closedMismatchedSessions: 1,
+        closedMismatchedFailed: 1,
+        // The surviving id must reach the client on THIS branch too — those rows
+        // did close, so this is the only report of their remote sessions.
+        closedMismatchedResidualTaskIds: ['mojo-parked-9'],
+      });
+      // Disk untouched.
+      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0]).toMatchObject({
+        cliId: 'traex',
+        model: 'old-model',
+      });
+      // In-memory config untouched.
+      expect(getBot(appId).config.cliId).toBe('traex');
+      expect(getBot(appId).config.model).toBe('old-model');
+    } finally {
+      agentSwitchCloseHook.run = originalHook;
       if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
       else process.env.BOTS_CONFIG = prevBotsConfig;
       rmSync(dir, { recursive: true, force: true });

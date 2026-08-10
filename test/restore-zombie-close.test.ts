@@ -1293,7 +1293,7 @@ describe('closeCliMismatchedSessionsForBot — runtime CLI hot-switch sweep', ()
       expect(closeSession).not.toHaveBeenCalled();
     });
 
-    it('never closes a protected / adopt / queued session', async () => {
+    it('skips adopt / queued sessions as legitimate exemptions', async () => {
       const adopted = makeActivePersistentSession('om_sw_adopt');
       adopted.adoptedFrom = 'tmux';
       sessionStore.updateSession(adopted);
@@ -1306,6 +1306,57 @@ describe('closeCliMismatchedSessionsForBot — runtime CLI hot-switch sweep', ()
       await expect(closeSessionsForAgentSwitch('app_test', target))
         .resolves.toMatchObject({ ok: true, closed: 0, failed: 0 });
       expect(closeSession).not.toHaveBeenCalled();
+    });
+
+    it('BLOCKS the switch on a protected mismatched owner (not a silent skip)', async () => {
+      // Protected is NOT an exemption like adopt/queued: this row would keep
+      // running the old agent and cannot be closed now, so committing the switch
+      // would recreate the config/execution mismatch. The route has its own
+      // preflight; this helper is exported and must fail closed on its own.
+      const protectedRow = makeActivePersistentSession('om_sw_protected');
+      // A pending activation head is one of the protected-ownership reasons.
+      protectedRow.queuedActivationPending = true;
+      sessionStore.updateSession(protectedRow);
+      registerDs(protectedRow);
+
+      await expect(closeSessionsForAgentSwitch('app_test', target))
+        .resolves.toMatchObject({ ok: false, closed: 0, failed: 1 });
+      expect(closeSession).not.toHaveBeenCalled();
+      expect(sessionStore.getSession(protectedRow.sessionId)!.status).toBe('active');
+    });
+
+    it('keeps the residual id when another row in the same batch FAILS', async () => {
+      // Mixed batch: A closes with a surviving remote, B refuses. The switch is
+      // blocked (B), but A's remote id is still the only cleanup handle and must
+      // survive into the caller's response.
+      const withResidual = makeActivePersistentSession('om_sw_mixed_residual');
+      sessionStore.updateSession(withResidual);
+      registerDs(withResidual);
+      const refuses = makeActivePersistentSession('om_sw_mixed_failed');
+      sessionStore.updateSession(refuses);
+      registerDs(refuses);
+      vi.mocked(closeSession)
+        .mockResolvedValueOnce({
+          ok: true,
+          outcome: 'closed_with_residual',
+          residual: { reason: 'mojo_lineage_quarantined', taskId: 'mojo-parked-9' },
+          alreadyClosed: false,
+          known: true,
+        } as never)
+        .mockResolvedValueOnce({
+          ok: false,
+          alreadyClosed: false,
+          error: 'mojo_cancel_failed',
+          retryable: true,
+        } as never);
+
+      await expect(closeSessionsForAgentSwitch('app_test', target)).resolves.toMatchObject({
+        ok: false,
+        closed: 1,
+        residual: 1,
+        failed: 1,
+        residualTaskIds: ['mojo-parked-9'],
+      });
     });
   });
 });

@@ -287,6 +287,16 @@ export function BdTabGrid(props: { children: ReactNode; className?: string }) {
   );
 }
 
+/** Render residual remote ids, validating the JSON shape (never blank-swallow). */
+function residualIdText(
+  raw: unknown,
+  tr: (key: string, params?: Record<string, string | number>) => string,
+): string {
+  if (!Array.isArray(raw) || raw.length === 0) return '';
+  const ids = raw.map(id => (typeof id === 'string' && id.trim() ? id : 'unknown'));
+  return tr('botDefaults.agentResidualIds', { ids: ids.join(', ') });
+}
+
 function statusClass(status: StatusMessage, extra = ''): string {
   const suffix = status ? ` ${status.ok ? 'hint-ok' : 'hint-warn-inline'}` : '';
   return `oncall-status${extra ? ` ${extra}` : ''}${suffix}`;
@@ -1419,6 +1429,10 @@ export function BotAgentSection(props: {
           residualCount > 0 ? tr('botDefaults.agentClosedResidual', { count: residualCount }) : '',
           // Not closed at all — the rows are still active.
           failedCount > 0 ? tr('botDefaults.agentCloseFailed', { count: failedCount }) : '',
+          // The ids are the ONLY handle for manual cleanup; a count alone is not
+          // actionable. Malformed/blank entries render as `unknown` rather than
+          // silently disappearing.
+          residualIdText(res.body.closedMismatchedResidualTaskIds, tr),
         ].filter(Boolean);
         const closedText = notes.join(' · ');
         const hadProblem = residualCount > 0 || failedCount > 0;
@@ -1457,10 +1471,22 @@ export function BotAgentSection(props: {
           }
         }
       } else {
-        const detail = typeof res.body?.message === 'string' && res.body.message
-          ? res.body.message
-          : responseErrorText(res);
-        const text = `✗ ${detail}`;
+        // The switch transaction refused: say what actually happened rather than
+        // surfacing a bare error code — the config is unchanged, some rows closed,
+        // and some remote sessions may need manual cleanup.
+        const aborted = res.body?.error === 'agent_switch_close_failed';
+        const detail = aborted
+          ? [
+            tr('botDefaults.agentSwitchAborted', {
+              closed: Number(res.body.closedMismatchedSessions ?? 0),
+              failed: Number(res.body.closedMismatchedFailed ?? 0),
+            }),
+            residualIdText(res.body.closedMismatchedResidualTaskIds, tr),
+          ].filter(Boolean).join(' · ')
+          : typeof res.body?.message === 'string' && res.body.message
+            ? res.body.message
+            : responseErrorText(res);
+        const text = aborted ? detail : `✗ ${detail}`;
         setAgentStatus({ text });
         if (cliKey === 'codex' && runtimeDraft.mode === 'custom') setRuntimeStatus({ text });
       }
