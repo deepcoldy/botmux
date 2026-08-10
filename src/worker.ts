@@ -43,7 +43,7 @@ import { readProcessStartIdentity } from './core/session-marker.js';
 import { roleLibraryRoot, roleLibrarySubtree } from './core/role-library.js';
 import { drainTranscript, joinAssistantText, trailingAssistantText, findJsonlContainingFingerprint, findJsonlsContainingExactContent, findLatestJsonl, extractLastAssistantTurn, stringifyUserContent, extractTurnStartText, splitTranscriptEventsByCutoff, isTranscriptRateLimitEvent, apiErrorMessageText, type TranscriptEvent } from './services/claude-transcript.js';
 import { BridgeTurnQueue, makeFingerprint, normaliseForFingerprint } from './services/bridge-turn-queue.js';
-import { bridgePostText, shouldEmitEmptyCompletedBridgeFallback, shouldEmitFailedBridgeFallback, shouldSuppressBridgeEmit, stripTrailingBridgeSentinelLine, type BridgeSendMarker } from './services/bridge-fallback-gate.js';
+import { bridgePostText, isBridgeNothingToSendFinal, shouldEmitEmptyCompletedBridgeFallback, shouldEmitFailedBridgeFallback, shouldSuppressBridgeEmit, stripTrailingBridgeSentinelLine, type BridgeSendMarker } from './services/bridge-fallback-gate.js';
 import { buildSubmitMessagePreview } from './services/submit-notification.js';
 import {
   decideHardTimeoutAction,
@@ -294,7 +294,7 @@ import {
 import { parseWorkerRequestUrl } from './utils/worker-http.js';
 import { detectCliUsageLimit, usageLimitStateKey, structuredRateLimitState, isStructuredRateLimitAuthoritative, type CliUsageLimitState } from './utils/cli-usage-limit.js';
 import { uploadImageBuffer } from './utils/lark-upload.js';
-import { redactChildEnv, scrubClaudeSessionMarkerEnv, scrubSessionCliHomeEnv } from './utils/child-env.js';
+import { applySessionOwnerEnv, redactChildEnv, scrubClaudeSessionMarkerEnv, scrubSessionCliHomeEnv } from './utils/child-env.js';
 import {
   decideSubmitConfirmationAction,
   settleDeferredSubmitConfirmation,
@@ -1112,8 +1112,6 @@ async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): P
     engineEnv.BOTMUX_LARK_APP_ID = cfg.larkAppId;
     engineEnv.BOTMUX_ROOT_MESSAGE_ID = cfg.rootMessageId;
     engineEnv.BOTMUX_SESSION_SCOPE = cfg.rootMessageId?.startsWith('om_') ? 'thread' : 'chat';
-    if (cfg.ownerOpenId) engineEnv.BOTMUX_OWNER_OPEN_ID = cfg.ownerOpenId;
-    else delete engineEnv.BOTMUX_OWNER_OPEN_ID;
     // The app-server owns model execution in RPC mode. Its MCP gateway child
     // must inherit the trusted host socket just like a native CLI process does.
     if (sessionMcpGatewayHost) {
@@ -1128,6 +1126,9 @@ async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): P
     // injects into the TUI — else a 3rd-party-provider bot's app-server silently
     // falls back to the default provider. Re-sanitized (crossed IPC).
     Object.assign(engineEnv, sanitizePerBotEnv(cfg.env));
+    // Session identity is host-owned. Pin it after the config-controlled merge,
+    // matching every other backend and preventing stale owner resurrection.
+    applySessionOwnerEnv(engineEnv, cfg.ownerOpenId);
     engine = new CodexRpcEngine({
       cliBin, cwd: cfg.workingDir, env: engineEnv, sessionId: cfg.sessionId,
       model: cfg.model, reasoningEffort: cfg.reasoningEffort, log: (m: string) => log(m),
@@ -5055,6 +5056,10 @@ function emitReadyTurns(opts: { explicitTerminalOnly?: boolean } = {}): void {
   const remainingPending = bridgeQueue.peek();
   const nextPendingMarkTimeMs = remainingPending.length > 0 ? remainingPending[0].markTimeMs : undefined;
   const cache = new Map<string, ReturnType<typeof drainTranscript>>();
+  // Turns suppressed as GENUINE SILENCE — see emitReadyCodexTurns for the full
+  // rationale. Tracked by object identity across this function's two loops so
+  // the terminal can carry positive silence evidence for a durable/async caller.
+  const nothingToSendTurns = new Set<(typeof ready)[number]>();
   for (let i = 0; i < ready.length; i++) {
     const turn = ready[i];
     const nextBoundaryMs = (i + 1 < ready.length ? ready[i + 1].markTimeMs : nextPendingMarkTimeMs);
@@ -5087,6 +5092,11 @@ function emitReadyTurns(opts: { explicitTerminalOnly?: boolean } = {}): void {
     if (shouldSuppressBridgeEmit(gateInput, nextBoundaryMs, markers, adoptMode)) {
       const reason = turn.isLocal ? 'local-typed' : 'model called botmux send within window';
       log(`Bridge fallback suppressed for turn ${turn.turnId.substring(0, 8)} (${reason})`);
+      // Positive silence evidence for the terminal — only a bare nothing-to-send
+      // sentinel (no prose, no send), never "already sent" / local-typed.
+      if (!adoptMode && isBridgeNothingToSendFinal(assistantText)) {
+        nothingToSendTurns.add(turn);
+      }
       notifyExplicitReplyObserved(
         turn.turnId,
         explicitReplyMarkerForTurnWindow(gateInput, nextBoundaryMs, markers, adoptMode),
@@ -5157,7 +5167,7 @@ function emitReadyTurns(opts: { explicitTerminalOnly?: boolean } = {}): void {
   // after the model used `botmux send`. Completion is not optional. Emit it
   // only after all corresponding final_output IPC messages have been queued so
   // the daemon observes a stable per-turn ordering.
-  for (const turn of ready) emitTurnTerminal(turn.turnId, 'completed', undefined, turn.dispatchAttempt);
+  for (const turn of ready) emitTurnTerminal(turn.turnId, 'completed', undefined, turn.dispatchAttempt, nothingToSendTurns.has(turn) ? 'nothing_to_send' : undefined);
 }
 
 /** Drain `path` from `fromOffset` and feed the events to the bridge queue
@@ -6449,6 +6459,14 @@ function drainReliableTerminalBeforeInterrupt(): void {
 function emitReadyCodexTurns(): void {
   const ready = codexBridgeQueue.drainEmittable();
   if (ready.length === 0) return;
+  // Turns suppressed as GENUINE SILENCE (model terminated with a bare
+  // nothing-to-send sentinel, no `botmux send`). Tracked by object identity —
+  // both the emit loop and the terminal loop below iterate this same `ready`
+  // array — so the terminal for such a turn can carry positive silence evidence
+  // (outputDisposition: 'nothing_to_send'). A durable/async caller uses ONLY
+  // that flag to settle completed-with-empty; a bare `completed` terminal (e.g.
+  // the RPC-hydration timeout path) must never be read as silence.
+  const nothingToSendTurns = new Set<(typeof ready)[number]>();
   const adoptMode = lastInitConfig?.adoptMode === true;
   // Adopt mode: model is the user's external Codex, no botmux send to
   // gate against — every assistant turn (Lark-driven OR locally typed)
@@ -6487,6 +6505,16 @@ function emitReadyCodexTurns(): void {
     if (!content) continue;
     if (shouldSuppressBridgeEmit(gateInput, nextBoundaryMs, markers, adoptMode)) {
       log(`Codex bridge fallback suppressed for turn ${turn.turnId.substring(0, 8)} (gate)`);
+      // Distinguish DELIBERATE SILENCE (bare nothing-to-send sentinel, no prose,
+      // no send) from other suppression reasons (already `botmux send`-ed this
+      // turn, local-typed). Only the former is positive evidence that the model
+      // chose to produce no output — the terminal below carries it so a durable/
+      // async caller can settle completed-with-empty. "Already sent" is NOT
+      // silence: its content went out via final_output/botmux send and the async
+      // result is captured there, so it must not be stamped.
+      if (!adoptMode && isBridgeNothingToSendFinal(turn.finalText)) {
+        nothingToSendTurns.add(turn);
+      }
       notifyExplicitReplyObserved(
         turn.turnId,
         explicitReplyMarkerForTurnWindow(gateInput, nextBoundaryMs, markers, adoptMode),
@@ -6542,6 +6570,7 @@ function emitReadyCodexTurns(): void {
       turn.terminalStatus ?? 'completed',
       turn.terminalErrorCode,
       turn.dispatchAttempt,
+      nothingToSendTurns.has(turn) ? 'nothing_to_send' : undefined,
     );
   }
 }
@@ -8470,7 +8499,15 @@ async function handleTrustedCodexAppMarker(
     }
     if (deliverableContent && startedAtMs !== undefined) {
       const suppressMarkers = readSendMarkers();
-      const gateInput = { markTimeMs: startedAtMs, isLocal: false, finalText: deliverableContent };
+      // Pass the RAW finalContent (not the pre-stripped deliverableContent) as
+      // finalText: shouldSuppressBridgeEmit needs to SEE the trailing sentinel to
+      // apply the "already sent this turn + sentinel terminator → suppress
+      // narration" branch. It strips internally for the length comparison, so a
+      // prose+sentinel final is still length-matched on the stripped prose. If we
+      // handed it the already-stripped text, the trailing-sentinel signal would
+      // be invisible and a longer-than-send narration would leak (same class as
+      // the transcript-path bug this fixes).
+      const gateInput = { markTimeMs: startedAtMs, isLocal: false, finalText: finalContent };
       suppressDelivery = suppressDelivery || shouldSuppressBridgeEmit(
         gateInput,
         completedAtMs + 5_001,
@@ -11494,8 +11531,6 @@ async function spawnCli(
         sessionEnv.BOTMUX_DEFERRED_SCHEDULE_TOPIC_TITLE = cfg.deferredScheduleRun.topicTitle;
       }
     }
-    // Turn sender so `--mention-back` can resolve an @ target in the sandbox.
-    if (cfg.ownerOpenId) sessionEnv.BOTMUX_OWNER_OPEN_ID = cfg.ownerOpenId;
     // Lark credentials so `botmux send` works inside the riff sandbox without a
     // local daemon or bots.json. The sandbox has no session data / bot config,
     // so cmdSend falls back to these env vars to call the Lark API directly.
@@ -11523,6 +11558,13 @@ async function spawnCli(
       mergedEnv.BOTMUX_API_ONLY = '1';
       mergedEnv.BOTMUX_CHAT_ID = cfg.chatId; // host-owned; never from config
     }
+    // Session identity is host-owned. Re-freeze it AFTER per-bot/riff config
+    // merge so a stale or user-supplied backend env cannot impersonate another
+    // owner (or resurrect an owner on an ownerless session).
+    applySessionOwnerEnv(mergedEnv, cfg.ownerOpenId);
+    // `riffCfg` is `cfg.backendConfig` already narrowed once at the top of this
+    // riff-only branch — same object, so master's owner re-freeze above is
+    // unaffected; keeping the typed alias avoids re-widening to the shared union.
     riffBackendConfig = Object.assign({}, riffCfg, { env: mergedEnv, resumeParentTaskId: cfg.riffParentTaskId });
     // 复用本地仓库+分支：多仓只认会话上的显式 stamp（仓库选择卡多选流按用户
     // 顺序写入 cfg.riffRepoDirs，首仓=primary）；否则仅对 workingDir 本身做单仓
@@ -12463,6 +12505,7 @@ async function spawnCli(
   if (cfg.apiOnly) childEnv.BOTMUX_API_ONLY = '1';
   else delete childEnv.BOTMUX_API_ONLY;
   childEnv.BOTMUX_ROOT_MESSAGE_ID = cfg.rootMessageId;
+  applySessionOwnerEnv(childEnv, cfg.ownerOpenId);
   // This bot's resolved brandLabel template, injected so a SANDBOXED `botmux
   // send` renders the role-name footer without reading bots.json (deny-by-
   // default → EPERM → role footer would silently fall back to the default
@@ -13774,8 +13817,19 @@ async function spawnCli(
           log('Screen settle barrier degraded after bounded retries; finalizing from the last successful snapshot');
         }
       }
-      if (evidenceSource === 'screen' && idleBackend
-        && deferPromptReadyWhileBusy(`${cliName()} screen-idle`, idleBackend)) return;
+      // Pi's transcript final (assistant_final) is persisted asynchronously
+      // from the TUI clearing its `Working...` busy marker — either order
+      // occurs. An external idle landing while the authoritative viewport
+      // still shows busy must defer exactly like a screen idle, or the card
+      // flips to 等待输入 mid-turn. Scoped to Pi: Grok/Codex own their idle
+      // via reliableTurnTerminal / lifecycle blocking, and their busy markers
+      // legitimately lag behind the transcript final. deferPromptReadyWhileBusy
+      // itself fail-opens on non-authoritative screens (ZMX), so a stale
+      // `Working...` in ZMX history can never block a structured terminal.
+      const busyGuardedIdle = evidenceSource === 'screen'
+        || (evidenceSource === 'external' && structuredBridgeIsPi());
+      if (busyGuardedIdle && idleBackend
+        && deferPromptReadyWhileBusy(`${cliName()} ${evidenceSource}-idle`, idleBackend)) return;
       drainBridgesThenMarkReady(evidenceSource);
     });
   }
@@ -15621,6 +15675,7 @@ function emitTurnTerminal(
   status: TurnTerminalStatus,
   errorCode?: string,
   dispatchAttempt?: number,
+  outputDisposition?: 'nothing_to_send',
 ): void {
   if (!sessionId || !turnId) return;
   if (!emittedTurnTerminals.claim(sessionId, turnId, dispatchAttempt)) return;
@@ -15640,6 +15695,7 @@ function emitTurnTerminal(
     status,
     ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
     ...(errorCode ? { errorCode } : {}),
+    ...(outputDisposition ? { outputDisposition } : {}),
   });
   if (terminalReleasesDurableTurn(
     { turnId: currentBotmuxTurnId, dispatchAttempt: currentBotmuxDispatchAttempt },
@@ -15859,7 +15915,7 @@ process.on('message', async (raw: unknown) => {
       sessionId = msg.sessionId;
       refreshTerminalViewToken();
       refreshTerminalWriteToken();
-      if (msg.ownerOpenId) process.env.__OWNER_OPEN_ID = msg.ownerOpenId;
+      applySessionOwnerEnv(process.env, msg.ownerOpenId);
       // Pin this worker's i18n locale early so every t() call below resolves
       // against the bot's chosen language without each callsite needing to
       // re-thread it.

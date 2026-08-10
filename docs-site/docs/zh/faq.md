@@ -71,7 +71,13 @@ botmux 权限分两层（详见 [权限怎么分](#权限怎么分谁能操作)�
 
 ## 多个机器人怎么互相协作？
 
-先用 `botmux bots list` 或消息里的 `<available_bots>` 找到目标 bot 的 `openId`，再用 `botmux send --mention <对方 openId>` 显式触发对方。不 `--mention` 对方 bot 不会被触发。`/introduce` 现在只是旧版 / 外部 bot 兜底：目标缺失或 `mentionable=false` 时再手动登记一次。
+**默认就支持，不用任何额外设置**——把要协作的机器人拉进同一个群就行。
+
+- **群里只有你和一个 bot**：直接说话即可，自动响应、无需 @。
+- **多个 bot / 多个人的群**：发消息时 @ 你想交给的那个 bot。
+- 需要 bot 之间接力（如一个写、一个 review）时，由 bot 用 @ 互相触发，你只管把活交给第一个。
+
+详见 [多机器人协作](/multi-bot)。
 
 ## daemon 重启会丢上下文吗？
 

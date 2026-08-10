@@ -8912,6 +8912,44 @@ function setupWorkerHandlers(
           // never let a projection/store failure crash the worker IPC loop.
           logger.error(`[${t}] Failed to persist turn_terminal for ${msg.turnId.substring(0, 8)}: ${err.message}`);
         }
+        // Async-HTTP settle-on-terminal (core-only completion bug #70): a turn
+        // the worker's bridge gate suppressed as GENUINE SILENCE (the model
+        // terminated with a bare nothing-to-send sentinel, no `botmux send`)
+        // emits turn_terminal but NO final_output, so the async-trigger result
+        // would stay `pending` and the poller would hang `running` until timeout.
+        // Settle it here with EMPTY content — nothing-to-send is a legitimate
+        // completed-with-empty-output for an HTTP task.
+        //
+        // POSITIVE EVIDENCE ONLY: we settle solely on the worker's explicit
+        // `outputDisposition === 'nothing_to_send'` flag, never on a bare
+        // `completed`. A bare completed terminal is NOT proof of silence — the
+        // RPC-hydration timeout path (worker.ts hydrateCompletedRpcTurn) emits
+        // `completed` with no final_output after fs-lag while the real answer is
+        // still materializing; settling that empty would mask a lost reply.
+        // Guarded further so it never double-settles a final_output-completed
+        // turn (pending-only), never touches a managed VC-meeting receiver, and
+        // only affects this bot's own pending async result. Feishu turns have no
+        // asyncTriggerResults entry, so their silent-turn behavior is unchanged.
+        if (msg.status === 'completed'
+          && msg.outputDisposition === 'nothing_to_send'
+          && !ds.session.vcMeetingReceiver) {
+          const pendingAsync = ds.asyncTriggerResults?.get(msg.turnId);
+          if (pendingAsync && pendingAsync.status === 'pending') {
+            const completedAt = Date.now();
+            pendingAsync.status = 'completed';
+            pendingAsync.content = '';
+            pendingAsync.completedAt = completedAt;
+            try {
+              asyncTriggerStore.recordCompleted(ds.session.sessionId, msg.turnId, '', completedAt, ds.larkAppId);
+            } catch (err: any) {
+              logger.error(`[${t}] Failed to persist async terminal-settle for ${msg.turnId.substring(0, 8)}: ${err.message}`);
+            }
+            // Cleared like the final_output path so worker-exit convergence does
+            // not retro-fail this now-completed turn.
+            if (ds.idempotentAsyncTurn?.triggerId === msg.turnId) ds.idempotentAsyncTurn = undefined;
+            logger.info(`[${t}] Settled async HTTP turn ${msg.turnId.substring(0, 8)} completed (empty output; nothing-to-send)`);
+          }
+        }
         if (msg.turnId.startsWith('mlrp_turn_') && msg.status !== 'completed') {
           markMessageListenerRunPreviewFailed(msg.turnId, {
             sessionId: msg.sessionId,

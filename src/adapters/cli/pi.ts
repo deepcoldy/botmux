@@ -66,10 +66,11 @@ export function createPiAdapter(pathOverride?: string): CliAdapter {
     authPaths: ['~/.pi/agent/auth.json'],
     resolvedBin: bin,
 
-    buildArgs({ sessionId, initialPrompt }) {
+    buildArgs({ sessionId, initialPrompt, model }) {
       const args = [
         '--session-id', sessionId,
       ];
+      if (model?.trim()) args.push('--model', model.trim());
       // Pi's interactive mode processes positional initial messages after TUI
       // startup, avoiding stdin races while keeping the native TUI visible.
       if (initialPrompt) args.push(initialPrompt);

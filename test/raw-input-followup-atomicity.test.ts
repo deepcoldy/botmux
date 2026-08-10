@@ -490,7 +490,7 @@ describe('late bare-shell launch recovery', () => {
   });
 
   it('generation-fences PTY data before it can feed the active idle detector', () => {
-    const wiring = caseRegion(workerSrc, 'const observedBackend = backend;', 2300);
+    const wiring = caseRegion(workerSrc, 'const observedBackend = backend;', 3400);
     const onData = wiring.indexOf('observedBackend.onData((data) =>');
     const fence = wiring.indexOf('if (backend !== observedBackend) return;', onData);
     const feed = wiring.indexOf('onPtyData(data)', fence);

@@ -80,6 +80,11 @@ import {
   SETUP_CLI_USAGE,
   type SetupCommand,
 } from './setup/setup-args.js';
+import {
+  detectUnusableOwnerEntries,
+  normalizeManagedOwnerEntries,
+  resolveScannerAllowedUser,
+} from './setup/owner-identity.js';
 import { interactiveSelect, pickChoice, pickCliSelection } from './setup/interactive-select.js';
 import { buildPreset, serializePreset, presetFilename } from './setup/agent-preset.js';
 import type { CliId } from './adapters/cli/types.js';
@@ -204,7 +209,7 @@ import {
   type BotMentionEntry,
 } from './utils/bot-routing.js';
 import { isLocale, localeForBot, setDefaultLocale, SUPPORTED_LOCALES, t, type Locale } from './i18n/index.js';
-import { type Brand, chatAppLink, larkHosts, normalizeBrand, sdkDomain } from './im/lark/lark-hosts.js';
+import { type Brand, chatAppLink, larkHosts, normalizeBrand } from './im/lark/lark-hosts.js';
 import { mergeDashboardConfig, mergeGlobalConfig, readGlobalConfig, setGlobalLocale, globalConfigPath } from './global-config.js';
 import {
   createWhiteboard,
@@ -1344,32 +1349,6 @@ async function obtainCredentials(rl: ReturnType<typeof createInterface>): Promis
 }
 
 /**
- * 用新应用自身凭证验证扫码链路拿到的 open_id。
- * 能解析 union_id 时写 on_；没有 union_id 但 open_id 对当前 app 有效时写 ou_。
- * 查询失败或用户不在当前 app 视角时返回 undefined，调用方不得 fallback 写入该 ou_。
- */
-async function resolveScannerAllowedUser(
-  appId: string,
-  appSecret: string,
-  openId: string,
-  brand: Brand = 'feishu',
-): Promise<string | undefined> {
-  try {
-    const { Client } = await import('@larksuiteoapi/node-sdk');
-    // brand → 域名。Lark 扫码人 ou_→on_ 必须打 larksuite.com，否则失败丢掉 cross-app 稳定性。
-    const client = new Client({ appId, appSecret, domain: sdkDomain(brand) });
-    const res = await (client as any).contact.v3.user.get({
-      path: { user_id: openId },
-      params: { user_id_type: 'open_id' },
-    });
-    if (res.code === 0 && res.data?.user) {
-      return res.data.user.union_id ?? openId;
-    }
-  } catch { /* do not trust scanner open_id when verification fails */ }
-  return undefined;
-}
-
-/**
  * 手动建 bot 时（没有扫码人 open_id）必须指定至少一个 owner.
  * 循环追问直到给出合法条目（邮箱、union_id on_xxx 或 open_id ou_xxx），拒绝裸邮箱前缀与空输入.
  * setup 不允许没有 owner —— 没 owner 的配置一旦叠加 allowedChatGroups 即成权限黑洞.
@@ -1791,6 +1770,15 @@ function failSetupScripted(json: boolean, message: string, details: Record<strin
   process.exitCode = 1;
 }
 
+function setupAddContinuationCommand(
+  appId: string,
+  brand: Brand,
+  ownerPlaceholder = '<OWNER_EMAIL>',
+): string {
+  return `botmux setup add --app-id ${appId} --app-secret <APP_SECRET> ` +
+    `--allowed-users ${ownerPlaceholder}${brand === 'lark' ? ' --brand lark' : ''} --open-platform-auto`;
+}
+
 /** 某个（可能带 ~ 前缀的）路径若不存在/不是目录，返回展开后的绝对路径；合法返回 null。 */
 function missingDirResolved(raw: string): string | null {
   const resolved = resolve(expandHomePath(raw));
@@ -1917,12 +1905,49 @@ async function cmdSetupScripted(argv: string[]): Promise<void> {
     let migratedEnv = false;
     let createdAppId: string | undefined;
     let createdAppName: string | undefined;
+    const requestedBrand = normalizeBrand(cmd.flags.brand);
     if (!existsSync(BOTS_JSON_FILE) && existsSync(ENV_FILE)) {
       const legacy = parseDotEnvToBotConfig();
       if (legacy.larkAppId && legacy.larkAppSecret) {
         existing = [legacy];
         migratedEnv = true;
       }
+    }
+
+    // A managed Agent sees the daemon-frozen session owner as
+    // BOTMUX_OWNER_OPEN_ID in the source bot's app scope; it is not the
+    // current-turn sender. Copying that ou_ into a newly created/different app
+    // locks the owner out. Convert only that exact injected identity to on_
+    // through the source app before any real app is created.
+    try {
+      cmd.flags.allowedUsers = await normalizeManagedOwnerEntries(
+        cmd.flags.allowedUsers,
+        {
+          sourceAppId: process.env.BOTMUX_LARK_APP_ID,
+          sourceOwnerOpenId: process.env.BOTMUX_OWNER_OPEN_ID ?? process.env.__OWNER_OPEN_ID,
+          creatingApp: cmd.createApp,
+          targetAppId: cmd.createApp ? undefined : cmd.flags.appId?.trim(),
+        },
+        async (sourceAppId, sourceOwnerOpenId) => {
+          const sourceBot = existing.find(bot => bot?.larkAppId === sourceAppId);
+          if (!sourceBot?.larkAppSecret) return undefined;
+          // A deliberate account/platform switch may create under another
+          // developer tenant, where the source app's union_id is not stable.
+          // Require an explicit target-account identity before creating.
+          if (cmd.switchAccount || cmd.compatibilityMode || botBrand(sourceBot) !== requestedBrand) {
+            return undefined;
+          }
+          return resolveScannerAllowedUser(
+            sourceAppId,
+            sourceBot.larkAppSecret,
+            sourceOwnerOpenId,
+            botBrand(sourceBot),
+          );
+        },
+      );
+    } catch (err) {
+      failSetupScripted(cmd.json, `${err instanceof Error ? err.message : String(err)} 未创建应用、未写入配置。`);
+      return;
     }
 
     // --create-app 会产生真实开放平台应用；先用占位凭证完成纯本地字段、owner、
@@ -1958,7 +1983,6 @@ async function cmdSetupScripted(argv: string[]): Promise<void> {
       }
 
       const appName = resolveSetupAppName(cmd.flags.appName, existing.length);
-      const requestedBrand = normalizeBrand(cmd.flags.brand);
       let credentials:
         | { ok: true; appId: string; appSecret: string; brand: Brand }
         | { ok: false; message: string; appId?: string };
@@ -2034,7 +2058,7 @@ async function cmdSetupScripted(argv: string[]): Promise<void> {
 
       if (!credentials.ok) {
         const continueCommand = credentials.appId
-          ? `botmux setup add --app-id ${credentials.appId} --app-secret <APP_SECRET> --allowed-users <OWNER_EMAIL> --open-platform-auto`
+          ? setupAddContinuationCommand(credentials.appId, requestedBrand)
           : undefined;
         failSetupScripted(cmd.json,
           `${credentials.message}${credentials.appId ? `；已创建 AppID ${credentials.appId}，请从开放平台读取 App Secret 后运行 ${continueCommand} 继续，未重复创建。` : ''}`,
@@ -2087,7 +2111,7 @@ async function cmdSetupScripted(argv: string[]): Promise<void> {
     const v = await validateCredentials(bot.larkAppId, bot.larkAppSecret, botBrand(bot));
     if (!v.ok) {
       const continueCommand = createdAppId
-        ? `botmux setup add --app-id ${createdAppId} --app-secret <APP_SECRET> --allowed-users <OWNER_EMAIL> --open-platform-auto`
+        ? setupAddContinuationCommand(createdAppId, botBrand(bot))
         : undefined;
       failSetupScripted(
         cmd.json,
@@ -2097,11 +2121,43 @@ async function cmdSetupScripted(argv: string[]): Promise<void> {
       return;
     }
 
+    // Scripted add historically accepted any syntactically valid ou_ and wrote
+    // it verbatim. A source bot's open_id is syntactically valid but belongs to
+    // the wrong app, so canTalk/canOperate can never match it in the new bot.
+    // Match Dashboard onboarding: reject only identities the target app can
+    // definitively prove unusable; transient/scope failures remain inconclusive.
+    const unusableOwners = await detectUnusableOwnerEntries(
+      bot.larkAppId,
+      bot.larkAppSecret,
+      botBrand(bot),
+      bot.allowedUsers ?? [],
+    );
+    if (unusableOwners.length > 0) {
+      const continueCommand = createdAppId
+        ? setupAddContinuationCommand(createdAppId, botBrand(bot), '<OWNER_EMAIL_OR_UNION_ID>')
+        : undefined;
+      failSetupScripted(
+        cmd.json,
+        `--allowed-users 包含当前应用无法使用的 owner: ${unusableOwners.join(', ')}。` +
+          `open_id 仅对签发它的 Bot 有效，请改用完整邮箱、手机号或 on_ union_id。` +
+          (continueCommand ? ` 应用已创建但未写入配置；请运行 ${continueCommand} 继续。` : ' 未写入配置。'),
+        createdAppId
+          ? {
+              partial: true,
+              appId: createdAppId,
+              ...(createdAppName ? { appName: createdAppName } : {}),
+              continueCommand,
+            }
+          : {},
+      );
+      return;
+    }
+
     try {
       writeBotsJsonAtomic([...existing, bot]);
     } catch (err) {
       const continueCommand = createdAppId
-        ? `botmux setup add --app-id ${createdAppId} --app-secret <APP_SECRET> --allowed-users <OWNER_EMAIL> --open-platform-auto`
+        ? setupAddContinuationCommand(createdAppId, botBrand(bot))
         : undefined;
       failSetupScripted(
         cmd.json,

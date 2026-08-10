@@ -481,6 +481,36 @@ describe('worker structured-turn status wiring', () => {
     expect(tickPrune).toBeGreaterThan(finallyBlock);
   });
 
+  it('routes Pi external idle through the busy-viewport guard; ZMX stays fail-open', () => {
+    const callback = source.slice(
+      source.indexOf('idleDetector.onIdle(async (evidenceSource)'),
+      source.indexOf('drainBridgesThenMarkReady(evidenceSource);'),
+    );
+    // Pi's assistant_final is persisted asynchronously from the TUI clearing
+    // Working... — an external idle landing while the authoritative viewport
+    // still shows busy must defer exactly like a screen idle.
+    expect(callback).toContain("evidenceSource === 'screen'");
+    expect(callback).toContain("evidenceSource === 'external' && structuredBridgeIsPi()");
+    expect(callback).toContain('deferPromptReadyWhileBusy(`${cliName()} ${evidenceSource}-idle`, idleBackend)');
+
+    // The guard fail-opens on non-authoritative screens (ZMX) BEFORE testing
+    // the busy pattern, so a stale Working... in ZMX history can never block
+    // a structured terminal; on a busy authoritative viewport it re-arms the
+    // detector and reuses the busy-pattern probe until the marker clears.
+    const defer = functionSlice('deferPromptReadyWhileBusy', 'probeBusyPatternIdle');
+    const authoritativeGate = defer.indexOf('!backendScreenEvidenceIsAuthoritativeForMutation()');
+    const busyTest = defer.indexOf('cliAdapter.busyPattern.test(');
+    expect(authoritativeGate).toBeGreaterThanOrEqual(0);
+    expect(busyTest).toBeGreaterThan(authoritativeGate);
+    expect(defer.indexOf('idleDetector?.reset()')).toBeGreaterThan(busyTest);
+    expect(defer.indexOf('scheduleBusyPatternIdleProbe(source)')).toBeGreaterThan(busyTest);
+
+    // The re-armed probe itself refuses to arm on non-authoritative backends,
+    // so a deferred ZMX turn can never be pinned by the probe loop.
+    const probe = functionSlice('scheduleBusyPatternIdleProbe', 'spawnCli');
+    expect(probe).toContain('if (!backendScreenEvidenceIsAuthoritativeForMutation()) return;');
+  });
+
   it('carries the structured mark through adopt submit confirmation and exception cleanup', () => {
     const adopt = functionSlice('writeAdoptMessage', 'isWorkflowWorker');
     const handler = source.slice(source.indexOf("case 'message':"), source.indexOf("case 'raw_input':"));

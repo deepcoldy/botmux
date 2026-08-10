@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
 import {
+  applySessionOwnerEnv,
   BOTMUX_INJECTED_ENV_KEYS,
   CLAUDE_SESSION_MARKER_ENV_KEYS,
   redactChildEnv,
@@ -10,6 +11,27 @@ import {
   SESSION_CLI_HOME_ENV_KEYS,
 } from '../src/utils/child-env.js';
 import { PM2_GRACEFUL_EXIT_CODE_ENV } from '../src/pm2-graceful-exit.js';
+
+describe('applySessionOwnerEnv()', () => {
+  it('injects both the public contract and legacy owner names', () => {
+    const env: NodeJS.ProcessEnv = {};
+    applySessionOwnerEnv(env, 'ou_owner');
+    expect(env).toMatchObject({
+      BOTMUX_OWNER_OPEN_ID: 'ou_owner',
+      __OWNER_OPEN_ID: 'ou_owner',
+    });
+  });
+
+  it('removes inherited owner names when the session has no owner', () => {
+    const env: NodeJS.ProcessEnv = {
+      BOTMUX_OWNER_OPEN_ID: 'ou_stale',
+      __OWNER_OPEN_ID: 'ou_stale',
+    };
+    applySessionOwnerEnv(env, undefined);
+    expect(env).not.toHaveProperty('BOTMUX_OWNER_OPEN_ID');
+    expect(env).not.toHaveProperty('__OWNER_OPEN_ID');
+  });
+});
 
 describe('redactChildEnv()', () => {
   it('truly removes leaked keys — absent, not present-with-"undefined"', () => {
@@ -216,6 +238,14 @@ describe('session CLI home scrub call sites', () => {
     expect(fn.slice(0, fn.indexOf('\n}'))).toContain('scrubClaudeSessionMarkerEnv(');
     expect(read('index-daemon.ts')).toContain('scrubClaudeSessionMarkerEnv(process.env)');
     expect(read('worker.ts')).toContain('scrubClaudeSessionMarkerEnv(process.env)');
+  });
+
+  it('injects the canonical session owner at every worker execution boundary', () => {
+    const worker = read('worker.ts');
+    expect(worker).toContain('applySessionOwnerEnv(process.env, msg.ownerOpenId)');
+    expect(worker).toContain('applySessionOwnerEnv(childEnv, cfg.ownerOpenId)');
+    expect(worker).toContain('applySessionOwnerEnv(engineEnv, cfg.ownerOpenId)');
+    expect(worker).toContain('applySessionOwnerEnv(mergedEnv, cfg.ownerOpenId)');
   });
 
   it('worker-pool strips the PM2 sentinel when forking a worker (source pin)', () => {
