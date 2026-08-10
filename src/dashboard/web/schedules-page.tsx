@@ -106,7 +106,14 @@ function ScheduleRowCard(props: {
         </div>
         <div className="schedule-chip-strip">
           <span>{kind}</span>
-          {s.chatId ? <span title={String(s.chatId)}>{tr('schedules.form.chat')}: {chatTitle ?? s.chatId}</span> : null}
+          {s.chatId ? (
+            <span
+              className="schedule-chat-chip"
+              title={chatTitle ? `${chatTitle} · ${String(s.chatId)}` : String(s.chatId)}
+            >
+              {tr('schedules.form.chat')}: {chatTitle ?? s.chatId}
+            </span>
+          ) : null}
           <span>{tr('schedules.delivery')}: {placementLabel(s, tr)}</span>
           {s.silent ? <span>🔇 {tr('schedules.silent')}</span> : null}
           <span>{tr('schedules.next')}: {fmtScheduleDate(s.nextRunAt, scheduleTimeZone)}</span>

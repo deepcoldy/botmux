@@ -13640,6 +13640,16 @@ tbody tr[data-chat]:hover {
   white-space: nowrap;
 }
 
+.schedule-chip-strip span.schedule-chat-chip {
+  display: inline-block;
+  max-width: min(320px, 100%);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  line-height: 22px;
+  text-align: left;
+}
+
 .schedule-chip-strip span.schedule-error-chip {
   border-color: color-mix(in srgb, var(--danger) 35%, var(--border-soft));
   background: color-mix(in srgb, var(--danger) 10%, var(--surface));
