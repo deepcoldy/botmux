@@ -1,143 +1,170 @@
 /**
- * Repo-level guard for close consumers.
+ * Repo-level guard for close consumers — CALL-SITE level, via the TypeScript AST.
  *
- * Every review round of this work found another consumer quietly flattening
- * `closed_with_residual` (or a refused close) into an ordinary success. Patching
- * them one per round never converged, because nothing failed when a NEW consumer
- * appeared — the type cannot help across a JSON seam, and a caller that reads only
- * `.ok` compiles fine.
+ * Every review round of this work found another consumer flattening a residual (or
+ * a refused close) into an ordinary success. Patching them one per round never
+ * converged because nothing FAILED when a new one appeared: the discriminant does
+ * not survive a JSON seam, and a caller reading only `.ok` compiles fine.
  *
- * So the invariant is enforced here instead: every place that closes a session, or
- * reads a close response, must be classified. An unclassified one fails this test
- * with instructions, which is the only mechanism that makes the next consumer
- * visible at the time it is written.
+ * A FILE-level version was tried first and was not good enough — it was broken in
+ * two minimal mutations. Most new consumers get added to an already-listed file
+ * (daemon.ts, a handler), which a file inventory can never catch, and
+ * `import { closeSession as close }` defeats name matching outright. Scanning raw
+ * text also counts a `closeSession()` written inside a comment.
  *
- * Deliberately NOT line-number based, and deliberately no TODO allowlist: known
- * debt is either fixed or classified honestly with the risk stated.
+ * So this resolves real CallExpressions against the imported binding — alias,
+ * namespace and destructured dynamic import included — and keys each site by
+ * `file::enclosing function::sink`, never by line number. A new call anywhere,
+ * under any alias, fails until it is classified.
  *
  * Run:  pnpm vitest run test/close-consumer-matrix.test.ts
  */
 import { readFileSync, readdirSync, statSync } from 'node:fs';
 import { join, relative, resolve } from 'node:path';
+import ts from 'typescript';
 import { describe, expect, it } from 'vitest';
 
 const SRC = resolve('src');
 
 type Category =
-  /** Renders the outcome to a human: MUST surface failure and residual. */
+  /** Renders the outcome to a human: MUST surface refusal AND residual. */
   | 'user_surface'
-  /** No user surface: MUST at least log a failure/residual (observability). */
+  /** No user surface: MUST log them (prefer closeSessionForBackgroundCleanup). */
   | 'background'
-  /** Owns/serves the close contract itself rather than consuming it. */
+  /** Defines/serves the close contract rather than consuming it. */
   | 'infrastructure'
-  /** Cannot produce a residual; must say why, and be provable. */
+  /** Provably cannot produce a residual — `why` must state how it is proven. */
   | 'impossible_by_invariant';
 
-interface ConsumerRule {
-  category: Category;
-  why: string;
-  /** Background callers must go through closeSessionForBackgroundCleanup. */
-  forbidBareClose?: boolean;
-  /** JSON-seam consumers must decode via the shared parser, never ad hoc. */
-  requireSharedParser?: boolean;
-}
+/** Exported names that close a session. */
+const SINKS = new Set([
+  'closeSession',
+  'closeSessionForBackgroundCleanup',
+  'closeSessionsForAgentSwitch',
+  'closeCliMismatchedSessionsForBot',
+]);
+/** Only these modules' `closeSession` is the lifecycle one (not the store's). */
+const SINK_MODULE_RE = /worker-pool\.js$|session-manager\.js$/;
 
-/**
- * The matrix. Adding a close consumer without adding a line here fails the test.
- */
-const CONSUMERS: Record<string, ConsumerRule> = {
-  'core/worker-pool.ts': {
-    category: 'infrastructure',
-    why: 'Defines closeSession(), the residual model and the background wrapper.',
-  },
-  'services/session-store.ts': {
-    category: 'infrastructure',
-    why: 'Durable close transaction (status + parked lineage) — not a consumer.',
-  },
-  'core/close-residual.ts': {
-    category: 'infrastructure',
-    why: 'The shared JSON parser every seam decodes with.',
-  },
-  'core/command-handler.ts': {
+interface CallSite { key: string; sink: string }
+
+/** The matrix, keyed per CALL SITE. */
+const CONSUMERS: Record<string, { category: Category; why: string }> = {
+  // NOTE: worker-pool's own internal closeSession() call (inside the background
+  // wrapper) is not listed — it is a same-module reference, not an imported
+  // binding, so the detector does not see it. That is the definition site, not a
+  // consumer.
+  // ── user surfaces: must render refusal AND residual ──────────────────────
+  'core/command-handler.ts::handleCommand::closeSession': {
     category: 'user_surface',
-    why: '/close and text /repo: report refusal and residual, refuse repo switch.',
+    why: '/close: close_refused message and closed_with_residual warning, never the '
+      + 'ordinary closed card.',
   },
-  'im/lark/card-handler.ts': {
+  'core/command-handler.ts::commitRepoSelection::closeSession': {
     category: 'user_surface',
-    why: 'Close button and card repo switch: warning toast / abort with the id.',
+    why: 'Text /repo: a refusal or residual aborts the switch and names the id.',
   },
-  'im/lark/sessions-card.ts': {
+  'im/lark/card-handler.ts::handleCardAction::closeSession': {
     category: 'user_surface',
-    why: 'Sessions board card: residual banner on the closed detail card.',
-    requireSharedParser: true,
+    why: 'Close button: warning toast on refusal/residual, no closed card.',
   },
-  'dashboard/web/sessions-page.tsx': {
+  'im/lark/card-handler.ts::commitRepoSelection::closeSession': {
     category: 'user_surface',
-    why: 'Web single + bulk close: residual alert, counted apart from failures.',
-    requireSharedParser: true,
+    why: 'Card repo switch: aborts rather than spawning over an uncancelled remote.',
   },
-  'dashboard/web/groups-page.tsx': {
+  'core/dashboard-ipc-server.ts::<module>::closeSession': {
     category: 'user_surface',
-    why: 'Group leave/disband cascade: residual count + ids in the summary.',
+    why: 'Close route: serialises the whole result; the closed-row fast path '
+      + 'replays the residual.',
   },
-  'dashboard/web/bot-defaults-page.tsx': {
-    category: 'user_surface',
-    why: 'Agent switch: residual/failed counts, ids, and no green tick.',
-  },
-  'dashboard/groups-action-helpers.ts': {
-    category: 'user_surface',
-    why: 'Builds the group cascade result the groups page renders.',
-  },
-  'dashboard.ts': {
-    category: 'user_surface',
-    why: 'Proxies idle-cleanup and group-cascade closes; forwards residual.',
-    requireSharedParser: true,
-  },
-  'core/dashboard-ipc-server.ts': {
-    category: 'user_surface',
-    why: 'Close route + agent-switch transaction; replays residual on closed rows.',
-  },
-  'core/session-manager.ts': {
+  // NOTE: the agent-switch call goes through agentSwitchCloseHook.run (a test
+  // seam), so it is a property call on a local object rather than a resolvable
+  // import. Covered instead by the route tests that assert the config is not
+  // committed on refusal.
+
+  // ── background: no UI, so refusal/residual must be logged ────────────────
+  'core/session-manager.ts::closeActiveSessionIfCliMismatch::closeSession': {
     category: 'background',
-    why: 'CLI-mismatch sweep and agent-switch transaction: counted + logged.',
+    why: 'Returns close_failed / closed_with_residual to the sweep; a refusal is '
+      + 'never reported as closed.',
   },
-  'core/trigger-session.ts': {
+  'core/session-manager.ts::closeSessionsForAgentSwitch::closeSession': {
     category: 'background',
-    why: 'Boot reconcile / lease cleanup: no user surface, so it must log.',
-    forbidBareClose: true,
+    why: 'Agent-switch transaction: collects refusal + residual, blocks the commit.',
   },
-  'core/deferred-schedule-settlement.ts': {
+  'core/session-manager.ts::restoreActiveSessions::closeSession': {
     category: 'background',
-    why: 'Returns close_refused instead of modelling a refusal as closed.',
+    why: 'Restore CLI-mismatch close: a refusal quarantines the row instead of '
+      + 'leaving it active-but-unregistered.',
   },
-  'cli.ts': {
-    category: 'user_surface',
-    why: '`botmux delete` + interactive picker: per-row warning and a separate '
-      + 'residual count in the summary.',
-    requireSharedParser: true,
+  'core/session-manager.ts::resumeSession::closeSession': {
+    category: 'impossible_by_invariant',
+    why: 'Closes only a worker:null daemon-command scratch placeholder occupying '
+      + 'the anchor (isRelayableRealSession is excluded), which has no CLI session '
+      + 'and therefore no remote lineage to leave behind.',
   },
-  'dashboard/session-cleanup.ts': {
-    category: 'infrastructure',
-    why: 'Idle-cleanup result shape; carries `residual` apart from `closed`.',
+  'core/session-manager.ts::spawnDashboardSession::closeSession': {
+    category: 'impossible_by_invariant',
+    why: 'Same scratch-placeholder eviction as resumeSession: no remote lineage.',
   },
-  'daemon.ts': {
+  'core/session-manager.ts::executeScheduledTask::closeSession': {
     category: 'background',
-    why: 'Scheduler settlement + sweeps; injects the background wrapper.',
+    why: 'Scheduled-run teardown; a refusal leaves the row active and is logged by '
+      + 'closeSession itself. No user surface at schedule time.',
+  },
+  'core/session-manager.ts::suspendActiveSessionsForBot::closeSession': {
+    category: 'background',
+    why: 'Bot-wide suspend sweep; a refusal keeps the row active and logged.',
+  },
+  'core/trigger-session.ts::reconcileIdempotencyLeasesOnBoot::closeSessionForBackgroundCleanup': {
+    category: 'background',
+    why: 'Boot reconcile: wrapper logs refusal and residual with the remote id.',
+  },
+  'core/trigger-session.ts::reuseExistingWinner::closeSessionForBackgroundCleanup': {
+    category: 'background',
+    why: 'Loser cleanup on an idempotency race; wrapper logs both.',
+  },
+  'core/trigger-session.ts::triggerSessionTurnAdmitted::closeSessionForBackgroundCleanup': {
+    category: 'background',
+    why: 'Admission failure cleanup; wrapper logs both.',
+  },
+  'daemon.ts::closeSession::closeSessionForBackgroundCleanup': {
+    category: 'background',
+    why: 'Deferred-schedule settlement injection; settlement returns close_refused '
+      + 'rather than closed.',
+  },
+  'daemon.ts::closeSession::closeSession': {
+    category: 'background',
+    why: 'Withdraw auto-close: inspects ok and outcome — a refusal returns false '
+      + 'and logs, and a residual warns with the remote id.',
+  },
+  'daemon.ts::failCloseIdempotentTurnIfConvergenceWriteFailed::closeSession': {
+    category: 'background',
+    why: 'Idempotency fail-close: only claims "fail-closed" when ok is true; a '
+      + 'refusal logs that the row stays active.',
+  },
+  'daemon.ts::adoptCodexNotifierEvent::closeSession': {
+    category: 'background',
+    why: 'Adopt-notifier teardown; a refusal keeps the row active and logged.',
+  },
+  'daemon.ts::handleBotAdded::closeSession': {
+    category: 'background',
+    why: 'Bot re-registration cleanup; a refusal keeps the row active and logged.',
+  },
+  'daemon.ts::rollbackRegisteredJoinSession::closeSession': {
+    category: 'background',
+    why: 'Rolls back a just-registered join session; a refusal keeps it active '
+      + 'rather than reporting a rollback that did not happen.',
+  },
+  'daemon.ts::onCodexAppLedgerDrained::closeCliMismatchedSessionsForBot': {
+    category: 'background',
+    why: 'Deferred CLI-mismatch resweep; the sweep counts residual and failed.',
+  },
+  'daemon.ts::retireVcMeetingCodexAppDispatchAfterBackingMissing::closeCliMismatchedSessionsForBot': {
+    category: 'background',
+    why: 'VC retire path resweep; the sweep counts residual and failed.',
   },
 };
-
-/** Actual call syntax, so a doc comment or a '/close' command string is not a hit. */
-const CALL_RE =
-  /(closeSession|closeWorkerPoolSession|closeSessionForBackgroundCleanup|closeSessionsForAgentSwitch|closeSessionsMatching)\s*\(/;
-/** A JSON seam: something POSTing to the close route and reading its body. */
-const SEAM_RE = /\}\/close`|\/close`, \{|sessions\/[^`'"]*\/close/;
-/**
- * Consuming the RESULT counts too. A file that never calls close but renders (or
- * forwards) its outcome is exactly the kind of consumer that kept getting missed —
- * the group cascade summary and the agent-switch page both got here that way.
- */
-const RESULT_RE =
-  /parseCloseResidual|describeCloseResidual|closed_with_residual|close_refused|closedMismatchedResidual|CloseResidual/;
 
 function walk(dir: string): string[] {
   const out: string[] = [];
@@ -150,76 +177,175 @@ function walk(dir: string): string[] {
   return out;
 }
 
-function consumerFiles(): { key: string; source: string; isSeam: boolean }[] {
-  return walk(SRC).flatMap(file => {
-    const source = readFileSync(file, 'utf8');
-    const isCall = CALL_RE.test(source);
-    const isSeam = SEAM_RE.test(source);
-    const isResult = RESULT_RE.test(source);
-    if (!isCall && !isSeam && !isResult) return [];
-    return [{ key: relative(SRC, file).split('\\').join('/'), source, isSeam }];
+/** Local identifiers bound to a sink, plus namespace aliases of the sink modules. */
+export function closeSinkBindings(sf: ts.SourceFile): {
+  locals: Map<string, string>;
+  namespaces: Set<string>;
+} {
+  const locals = new Map<string, string>();
+  const namespaces = new Set<string>();
+  const visit = (node: ts.Node): void => {
+    if (ts.isImportDeclaration(node) && ts.isStringLiteral(node.moduleSpecifier)
+      && SINK_MODULE_RE.test(node.moduleSpecifier.text)) {
+      const clause = node.importClause;
+      if (clause?.namedBindings && ts.isNamedImports(clause.namedBindings)) {
+        for (const el of clause.namedBindings.elements) {
+          // `closeSession as closeWorkerPoolSession` → key on the LOCAL name.
+          const exported = (el.propertyName ?? el.name).text;
+          if (SINKS.has(exported)) locals.set(el.name.text, exported);
+        }
+      }
+      if (clause?.namedBindings && ts.isNamespaceImport(clause.namedBindings)) {
+        namespaces.add(clause.namedBindings.name.text);
+      }
+    }
+    // `const { closeSession } = await import('./worker-pool.js')`
+    if (ts.isVariableDeclaration(node) && node.initializer
+      && ts.isObjectBindingPattern(node.name)
+      // Non-anchored: the text here is `await import('./worker-pool.js')`.
+      && /worker-pool\.js|session-manager\.js/.test(node.initializer.getText(sf))) {
+      for (const el of node.name.elements) {
+        const exported = (el.propertyName ?? el.name).getText(sf);
+        if (SINKS.has(exported) && ts.isIdentifier(el.name)) locals.set(el.name.text, exported);
+      }
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(sf);
+  return { locals, namespaces };
+}
+
+/** Nearest named function/method/arrow-in-const — a stable, non-line-based key. */
+function enclosingName(node: ts.Node): string {
+  let cur: ts.Node | undefined = node.parent;
+  while (cur) {
+    if (ts.isFunctionDeclaration(cur) && cur.name) return cur.name.text;
+    if (ts.isMethodDeclaration(cur) && ts.isIdentifier(cur.name)) return cur.name.text;
+    // Only when the variable/property IS the function — otherwise
+    // `const closeResult = await closeSession(...)` would name the site after its
+    // result variable instead of the function that owns it.
+    if ((ts.isVariableDeclaration(cur) || ts.isPropertyAssignment(cur))
+      && ts.isIdentifier(cur.name) && cur.initializer
+      && (ts.isArrowFunction(cur.initializer) || ts.isFunctionExpression(cur.initializer))) {
+      return cur.name.text;
+    }
+    cur = cur.parent;
+  }
+  return '<module>';
+}
+
+/** Every resolved close call site in a source file. */
+export function closeCallSitesIn(sf: ts.SourceFile, rel: string): CallSite[] {
+  const { locals, namespaces } = closeSinkBindings(sf);
+  if (locals.size === 0 && namespaces.size === 0) return [];
+  const found: CallSite[] = [];
+  const visit = (node: ts.Node): void => {
+    if (ts.isCallExpression(node)) {
+      let sink: string | undefined;
+      if (ts.isIdentifier(node.expression)) {
+        sink = locals.get(node.expression.text);
+      } else if (ts.isPropertyAccessExpression(node.expression)
+        && ts.isIdentifier(node.expression.expression)
+        && namespaces.has(node.expression.expression.text)
+        && SINKS.has(node.expression.name.text)) {
+        sink = node.expression.name.text;
+      }
+      if (sink) found.push({ key: `${rel}::${enclosingName(node)}::${sink}`, sink });
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(sf);
+  return found;
+}
+
+function allCallSites(): CallSite[] {
+  return walk(SRC).flatMap((file) => {
+    const sf = ts.createSourceFile(
+      file, readFileSync(file, 'utf8'), ts.ScriptTarget.Latest, true,
+    );
+    return closeCallSitesIn(sf, relative(SRC, file).split('\\').join('/'));
   });
 }
 
-describe('close consumer matrix', () => {
-  it('every close consumer is classified', () => {
-    const unclassified = consumerFiles()
-      .map(f => f.key)
-      .filter(key => !(key in CONSUMERS));
+function probe(code: string): ts.SourceFile {
+  return ts.createSourceFile('probe.ts', code, ts.ScriptTarget.Latest, true);
+}
+
+describe('close consumer matrix (call-site)', () => {
+  it('every close call site is classified', () => {
+    const unclassified = [...new Set(
+      allCallSites().map(c => c.key).filter(key => !(key in CONSUMERS)),
+    )].sort();
 
     expect(
       unclassified,
-      'New close consumer(s) found. Add each to CONSUMERS in this file with a '
-      + 'category:\n'
-      + '  user_surface  — must render a refusal AND a residual (taskId), never a plain success\n'
-      + '  background    — no UI, so it must at least log them (closeSessionForBackgroundCleanup)\n'
+      'Unclassified close call site(s). Add each key to CONSUMERS with a category:\n'
+      + '  user_surface  — must render a refusal AND a residual (taskId)\n'
+      + '  background    — no UI, so it must LOG both (prefer closeSessionForBackgroundCleanup)\n'
       + '  infrastructure — defines/serves the contract\n'
-      + '  impossible_by_invariant — prove it cannot produce a residual\n'
-      + `Unclassified: ${unclassified.join(', ')}`,
+      + '  impossible_by_invariant — `why` must state how that is proven\n\n'
+      + `${unclassified.join('\n')}`,
     ).toEqual([]);
   });
 
-  it('the matrix has no stale entries', () => {
-    const present = new Set(consumerFiles().map(f => f.key));
+  it('has no stale entries', () => {
+    const present = new Set(allCallSites().map(c => c.key));
     const stale = Object.keys(CONSUMERS).filter(key => !present.has(key));
-    expect(stale, `Entries no longer reference a close consumer: ${stale.join(', ')}`)
-      .toEqual([]);
+    expect(stale, `No longer a call site: ${stale.join(', ')}`).toEqual([]);
   });
 
-  it('background consumers do not call closeSession() bare', () => {
-    // Bare closeSession() on a path with no user surface discards the only signal
-    // that a remote session survived.
-    const offenders = consumerFiles()
-      .filter(f => CONSUMERS[f.key]?.forbidBareClose)
-      .filter(f => /(?<![\w.])closeSession\s*\(/.test(f.source))
-      .map(f => f.key);
-    expect(
-      offenders,
-      `Must use closeSessionForBackgroundCleanup(): ${offenders.join(', ')}`,
-    ).toEqual([]);
+  // ── detector self-tests: without these the guard can be decorative ────────
+
+  it('resolves an ALIASED import (defeated the file-level guard)', () => {
+    const { locals } = closeSinkBindings(probe(
+      "import { closeSession as bye } from './worker-pool.js';\n"
+      + 'export async function p(id: string) { await bye(id); }\n',
+    ));
+    expect(locals.get('bye')).toBe('closeSession');
   });
 
-  it('JSON-seam consumers decode with the shared parser', () => {
-    const offenders = consumerFiles()
-      .filter(f => CONSUMERS[f.key]?.requireSharedParser)
-      .filter(f => !f.source.includes('close-residual.js'))
-      .map(f => f.key);
-    expect(
-      offenders,
-      'Must import parseCloseResidual from core/close-residual.js rather than '
-      + `reading outcome/residual ad hoc: ${offenders.join(', ')}`,
-    ).toEqual([]);
+  it('resolves a NAMESPACE import call', () => {
+    const sites = closeCallSitesIn(probe(
+      "import * as wp from './worker-pool.js';\n"
+      + 'export async function p(id: string) { await wp.closeSession(id); }\n',
+    ), 'probe.ts');
+    expect(sites.map(s => s.key)).toEqual(['probe.ts::p::closeSession']);
   });
 
-  it('the scheduler injects the BACKGROUND wrapper, not a bare close', () => {
-    // Binding-level check: settleDeferredScheduleRun already refuses to report a
-    // refusal as closed, but swapping this injection back would silently drop the
-    // residual log.
-    const daemon = readFileSync(join(SRC, 'daemon.ts'), 'utf8');
-    const injection = daemon.slice(
-      daemon.indexOf('settleDeferredScheduleRun('),
-      daemon.indexOf('settleDeferredScheduleRun(') + 600,
-    );
-    expect(injection).toContain('closeSessionForBackgroundCleanup');
+  it('resolves a destructured DYNAMIC import', () => {
+    const { locals } = closeSinkBindings(probe(
+      "export async function p(id: string) {\n"
+      + "  const { closeSession } = await import('./worker-pool.js');\n"
+      + '  await closeSession(id);\n}\n',
+    ));
+    expect(locals.get('closeSession')).toBe('closeSession');
+  });
+
+  it('does NOT count a call written in a comment or a string', () => {
+    const sites = closeCallSitesIn(probe(
+      "import { closeSession } from './worker-pool.js';\n"
+      + '// closeSession(id) in a comment\n'
+      + 'export const s = "closeSession(id)";\n',
+    ), 'probe.ts');
+    expect(sites).toEqual([]);
+  });
+
+  it('catches a NEW call added to an already-classified file', () => {
+    // The mutation a file inventory cannot see: same file, extra call site in a
+    // different function.
+    const sites = closeCallSitesIn(probe(
+      "import { closeSession } from './worker-pool.js';\n"
+      + 'export async function known(id: string) { await closeSession(id); }\n'
+      + 'export async function sneaky(id: string) { await closeSession(id); }\n',
+    ), 'daemon.ts');
+    expect(sites.map(s => s.key)).toContain('daemon.ts::sneaky::closeSession');
+  });
+
+  it('ignores the session-store close, which is a different sink', () => {
+    const sites = closeCallSitesIn(probe(
+      "import * as sessionStore from './session-store.js';\n"
+      + 'export function p(id: string) { sessionStore.closeSession(id); }\n',
+    ), 'probe.ts');
+    expect(sites).toEqual([]);
   });
 });
