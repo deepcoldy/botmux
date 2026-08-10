@@ -1536,7 +1536,7 @@ export function BotAgentSection(props: {
           : typeof res.body?.message === 'string' && res.body.message
             ? res.body.message
             : responseErrorText(res);
-        const text = aborted ? detail : `✗ ${detail}`;
+        const text = `✗ ${detail}`;
         setAgentStatus({ text });
         if (cliKey === 'codex' && runtimeDraft.mode === 'custom') setRuntimeStatus({ text });
       }
@@ -1588,7 +1588,10 @@ export function BotAgentSection(props: {
         || res.body?.error === 'agent_switch_commit_failed';
       const note = aborted
         ? [
-          tr('botDefaults.agentSwitchAborted', { closed: summary.closed, failed: summary.failed }),
+          // Riff-specific wording: by this point the /riff write already
+          // succeeded, so "config unchanged" would be false here — only the
+          // Agent selection failed to switch.
+          tr('botDefaults.riffAgentSwitchAborted', { closed: summary.closed, failed: summary.failed }),
           residualIdText(summary, tr),
         ].filter(Boolean).join(' · ')
         : responseErrorText(res);

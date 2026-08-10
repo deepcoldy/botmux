@@ -766,8 +766,13 @@ describe('riff save consumes the agent-switch close summary', () => {
     await act(async () => { await root.findByProps({ 'data-action': 'save-riff' }).props.onClick(); });
 
     const text = root.findByProps({ 'data-riff-status': '' }).children.join('');
-    expect(text).toContain('Agent 未切换');
+    // Riff-specific truth: the /riff write already succeeded, so it must NOT claim
+    // the config is unchanged — only the Agent selection failed to switch.
+    expect(text).toContain('Riff 配置已保存');
+    expect(text).toContain('Agent 选择未切换');
     expect(text).toContain('mojo-parked-9');
+    // Exactly one status icon (the key used to carry its own ✗ as well).
+    expect(text.match(/✗/g)?.length ?? 0).toBe(1);
     // The /riff write succeeded, but cliId must NOT be flipped to riff.
     expect(patchBot.mock.calls.some(c => (c[1] as any)?.cliId === 'riff')).toBe(false);
   });

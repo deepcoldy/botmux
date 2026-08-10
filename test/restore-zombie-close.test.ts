@@ -1325,6 +1325,45 @@ describe('closeCliMismatchedSessionsForBot — runtime CLI hot-switch sweep', ()
       expect(sessionStore.getSession(protectedRow.sessionId)!.status).toBe('active');
     });
 
+    it('also closes a mismatched row that is active on disk but NOT in the registry', async () => {
+      // The registry is not the only authority. A row can be active on disk yet
+      // unregistered (restore quarantine, an incomplete registration). Scanning
+      // only the registry let the config commit through while that row stayed
+      // frozen on the old agent — the very mismatch this transaction prevents.
+      const durableOnly = makeActivePersistentSession('om_sw_durable_only');
+      sessionStore.updateSession(durableOnly);
+      // Deliberately NOT registerDs(...): it exists only in the store.
+
+      await expect(closeSessionsForAgentSwitch('app_test', target))
+        .resolves.toMatchObject({ ok: true, closed: 1 });
+      expect(closeSession).toHaveBeenCalledWith(durableOnly.sessionId);
+    });
+
+    it('blocks the switch when an unregistered durable row cannot be closed', async () => {
+      const durableOnly = makeActivePersistentSession('om_sw_durable_refused');
+      sessionStore.updateSession(durableOnly);
+      vi.mocked(closeSession).mockResolvedValueOnce({
+        ok: false,
+        alreadyClosed: false,
+        error: 'mojo_close_identity_missing',
+        retryable: true,
+        taskId: 'mojo-sid-123',
+      } as never);
+
+      await expect(closeSessionsForAgentSwitch('app_test', target))
+        .resolves.toMatchObject({ ok: false, failed: 1 });
+    });
+
+    it('does not close the same session twice when it is in both authorities', async () => {
+      const both = makeActivePersistentSession('om_sw_both');
+      sessionStore.updateSession(both);
+      registerDs(both);
+
+      await expect(closeSessionsForAgentSwitch('app_test', target))
+        .resolves.toMatchObject({ ok: true, closed: 1 });
+      expect(closeSession).toHaveBeenCalledTimes(1);
+    });
+
     it('keeps the residual id when another row in the same batch FAILS', async () => {
       // Mixed batch: A closes with a surviving remote, B refuses. The switch is
       // blocked (B), but A's remote id is still the only cleanup handle and must

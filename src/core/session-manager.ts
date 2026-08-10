@@ -260,6 +260,21 @@ export function sessionMismatchesTargetCli(
   ds: DaemonSession,
   target: CliMismatchTargetConfig,
 ): { sessionCli: string; botCli: string } | null {
+  return sessionRowMismatchesTargetCli(ds.session, target);
+}
+
+/**
+ * Same comparison against a DURABLE row.
+ *
+ * The agent switch must also consider rows that are active on disk but absent
+ * from the runtime registry — every field this compares lives on Session, so
+ * there is no need to fabricate a DaemonSession to reach them.
+ */
+export function sessionRowMismatchesTargetCli(
+  row: Session,
+  target: CliMismatchTargetConfig,
+): { sessionCli: string; botCli: string } | null {
+  const ds = { session: row } as DaemonSession;
   const sessionCliId = ds.session.cliId;
   if (!sessionCliId) return null;
   const botCfg = target;
@@ -461,9 +476,34 @@ export async function closeSessionsForAgentSwitch(
 }> {
   const registry = getActiveSessionsRegistry();
   const out = { ok: true, closed: 0, residual: 0, failed: 0, residualTaskIds: [] as string[] };
-  if (!registry) return out;
-  for (const ds of [...registry.values()]) {
+  const seen = new Set<string>();
+
+  const recordClose = (
+    sessionId: string,
+    result: Awaited<ReturnType<typeof closeSession>>,
+  ): void => {
+    if (!result.ok) {
+      out.failed++;
+      out.ok = false;
+      logger.error(
+        `[${sessionId.substring(0, 8)}] agent switch: close REFUSED (${result.error}); `
+        + 'the switch will NOT be committed',
+      );
+      return;
+    }
+    out.closed++;
+    if (result.outcome === 'closed_with_residual') {
+      out.residual++;
+      out.residualTaskIds.push(result.residual.taskId);
+    }
+  };
+
+  for (const ds of [...(registry?.values() ?? [])]) {
     if (ds.larkAppId !== larkAppId) continue;
+    // The registry entry is the authoritative view of this session, whatever the
+    // outcome below (skipped, blocked, closed). Claim it here so the durable scan
+    // cannot evaluate — or double-count — the same row again.
+    seen.add(ds.session.sessionId);
     if (ds.session.queued) continue;
     if (ds.adoptedFrom || ds.session.adoptedFrom || ds.session.title?.startsWith('Adopt:')) continue;
     // Compared against the PROPOSED config, not the live one.
@@ -491,21 +531,7 @@ export async function closeSessionsForAgentSwitch(
     try {
       // The close uses the session's own FROZEN identity, so it does not depend on
       // the config we are about to (not) write.
-      const result = await closeSession(ds.session.sessionId);
-      if (!result.ok) {
-        out.failed++;
-        out.ok = false;
-        logger.error(
-          `[${ds.session.sessionId.substring(0, 8)}] agent switch: close REFUSED (${result.error}); `
-          + 'the switch will NOT be committed',
-        );
-        continue;
-      }
-      out.closed++;
-      if (result.outcome === 'closed_with_residual') {
-        out.residual++;
-        out.residualTaskIds.push(result.residual.taskId);
-      }
+      recordClose(ds.session.sessionId, await closeSession(ds.session.sessionId));
     } catch (err) {
       // Collected, not thrown: every remaining row must still be evaluated, or an
       // early exit leaves unchecked sessions behind a refused switch.
@@ -514,6 +540,56 @@ export async function closeSessionsForAgentSwitch(
       logger.error(
         `[${ds.session.sessionId.substring(0, 8)}] agent switch: close threw; the switch will NOT `
         + `be committed: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+
+  // The registry is NOT the only authority: a row can be active on disk yet
+  // absent from it (restore quarantine, a crashed/incomplete registration).
+  // Scanning only the registry let the config commit through while such a row
+  // stayed frozen on the old agent — the original mismatch, one layer down. The
+  // route already reads this same list for its protected preflight.
+  let storedRows: Session[] = [];
+  try {
+    storedRows = sessionStore.listSessions().filter(row =>
+      row.status === 'active'
+      && (row.larkAppId === larkAppId || !row.larkAppId)
+      && !seen.has(row.sessionId),
+    );
+  } catch (err) {
+    // Cannot prove the durable side is clean → do not commit.
+    out.failed++;
+    out.ok = false;
+    logger.error(
+      `agent switch: could not read the session store to check durable rows; the switch `
+      + `will NOT be committed: ${err instanceof Error ? err.message : String(err)}`,
+    );
+    return out;
+  }
+  for (const row of storedRows) {
+    if (row.queued) continue;
+    if (row.adoptedFrom || row.title?.startsWith('Adopt:')) continue;
+    if (!sessionRowMismatchesTargetCli(row, target)) continue;
+    if (hasProtectedSessionMutationOwnership(row)) {
+      out.failed++;
+      out.ok = false;
+      logger.error(
+        `[${row.sessionId.substring(0, 8)}] agent switch: durable mismatched row has protected `
+        + 'mutation ownership; the switch will NOT be committed',
+      );
+      continue;
+    }
+    try {
+      // closeSession supports the stored-only shape. When cancelling genuinely
+      // needs a runtime owner it returns mojo_close_identity_missing, which
+      // blocks the commit rather than publishing a false success.
+      recordClose(row.sessionId, await closeSession(row.sessionId));
+    } catch (err) {
+      out.failed++;
+      out.ok = false;
+      logger.error(
+        `[${row.sessionId.substring(0, 8)}] agent switch: durable-row close threw; the switch `
+        + `will NOT be committed: ${err instanceof Error ? err.message : String(err)}`,
       );
     }
   }

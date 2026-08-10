@@ -3945,22 +3945,24 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
       wrapperCli: selected.wrapperCli,
     };
     const closedMismatchedSessions = await agentSwitchCloseHook.run(larkAppId, switchTarget);
+    // ONE shape for every post-close exit. These closes are irreversible, so each
+    // exit after them is the only report of a surviving remote session; three
+    // hand-written copies would drift.
+    const closeSummaryPayload = (error: string, reason?: string) => ({
+      ok: false as const,
+      error,
+      ...(reason ? { reason } : {}),
+      closedMismatchedSessions: closedMismatchedSessions.closed,
+      closedMismatchedResidual: closedMismatchedSessions.residual,
+      closedMismatchedFailed: closedMismatchedSessions.failed,
+      closedMismatchedResidualTaskIds: closedMismatchedSessions.residualTaskIds,
+    });
     if (!closedMismatchedSessions.ok) {
       // Rows that DID close stay closed (a cancelled remote session cannot be
       // brought back); the ones that refused are still active on the old agent,
       // which is still the configured agent. Consistent, and retryable by saving
       // again.
-      return jsonRes(res, 409, {
-        ok: false,
-        error: 'agent_switch_close_failed',
-        closedMismatchedSessions: closedMismatchedSessions.closed,
-        closedMismatchedResidual: closedMismatchedSessions.residual,
-        closedMismatchedFailed: closedMismatchedSessions.failed,
-        // Same field/shape as the 200 branch. A partial failure is exactly when a
-        // residual id matters most: those rows DID close, so this is the only
-        // place their surviving remote id is ever reported.
-        closedMismatchedResidualTaskIds: closedMismatchedSessions.residualTaskIds,
-      });
+      return jsonRes(res, 409, closeSummaryPayload('agent_switch_close_failed'));
     }
 
     let r: Awaited<ReturnType<typeof rmwBotEntry>>;
@@ -4003,29 +4005,16 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
     } catch (err) {
       // A read/rename/atomic-write throw would otherwise escape this handler with
       // no body at all, losing the same summary the !ok branch preserves.
-      return jsonRes(res, 500, {
-        ok: false,
-        error: 'agent_switch_commit_failed',
-        reason: err instanceof Error ? err.message : String(err),
-        closedMismatchedSessions: closedMismatchedSessions.closed,
-        closedMismatchedResidual: closedMismatchedSessions.residual,
-        closedMismatchedFailed: closedMismatchedSessions.failed,
-        closedMismatchedResidualTaskIds: closedMismatchedSessions.residualTaskIds,
-      });
+      return jsonRes(res, 500, closeSummaryPayload(
+        'agent_switch_commit_failed',
+        err instanceof Error ? err.message : String(err),
+      ));
     }
     if (!r.ok) {
       // Third post-close exit. The closes above are IRREVERSIBLE, so this must
       // carry the same summary as the 409 branch — otherwise a commit failure
       // silently destroys the only handle for a surviving remote session.
-      return jsonRes(res, 400, {
-        ok: false,
-        error: 'agent_switch_commit_failed',
-        reason: r.reason,
-        closedMismatchedSessions: closedMismatchedSessions.closed,
-        closedMismatchedResidual: closedMismatchedSessions.residual,
-        closedMismatchedFailed: closedMismatchedSessions.failed,
-        closedMismatchedResidualTaskIds: closedMismatchedSessions.residualTaskIds,
-      });
+      return jsonRes(res, 400, closeSummaryPayload('agent_switch_commit_failed', r.reason));
     }
 
     const bot = getBot(larkAppId);

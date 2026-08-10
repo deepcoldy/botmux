@@ -2887,6 +2887,62 @@ describe('PUT /api/bot-agent', () => {
     }
   });
 
+  it('reports the closed sessions when the commit RETURNS not-ok (entry missing)', async () => {
+    // The !ok return branch, distinct from the throw path below: a live bot exists
+    // but the latest bots.json no longer contains its entry.
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-agent-commitnotok-'));
+    const configPath = join(dir, 'bots.json');
+    const appId = 'test-agent-commitnotok';
+    const prevBotsConfig = process.env.BOTS_CONFIG;
+    const originalHook = agentSwitchCloseHook.run;
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      writeFileSync(configPath, JSON.stringify([{
+        larkAppId: appId,
+        larkAppSecret: 'secret',
+        cliId: 'traex',
+        model: 'old-model',
+      }], null, 2));
+      loadBotConfigs().forEach((c: any) => registerBot(c));
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      agentSwitchCloseHook.run = async () => ({
+        ok: true,
+        closed: 2,
+        residual: 1,
+        failed: 0,
+        residualTaskIds: ['mojo-parked-9'],
+      });
+      // Valid JSON, but the target entry is gone → rmwBotEntry returns !ok.
+      writeFileSync(configPath, JSON.stringify([{
+        larkAppId: 'some-other-bot',
+        larkAppSecret: 'secret',
+        cliId: 'traex',
+      }], null, 2));
+
+      const res = await fetch(`http://127.0.0.1:${handle.port}/api/bot-agent`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ cliId: 'codex', model: 'kimi-k2.5' }),
+      });
+
+      expect(res.ok).toBe(false);
+      expect(await res.json()).toMatchObject({
+        ok: false,
+        error: 'agent_switch_commit_failed',
+        closedMismatchedSessions: 2,
+        closedMismatchedResidual: 1,
+        closedMismatchedResidualTaskIds: ['mojo-parked-9'],
+      });
+      expect(getBot(appId).config.cliId).toBe('traex');
+    } finally {
+      agentSwitchCloseHook.run = originalHook;
+      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = prevBotsConfig;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('still reports the closed sessions when the config commit itself fails', async () => {
     // Third post-close exit. The closes already ran and are irreversible, so this
     // response is the only place a surviving remote id is ever reported.
