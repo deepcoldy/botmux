@@ -152,6 +152,7 @@ describe('Riff explicit close', () => {
 
     expect(await closeSession(fixture.session.sessionId)).toEqual({
       ok: true,
+      outcome: 'closed',
       alreadyClosed: false,
       known: true,
     });
@@ -187,6 +188,7 @@ describe('Riff explicit close', () => {
 
     expect(await closeSession(fixture.session.sessionId)).toEqual({
       ok: true,
+      outcome: 'closed',
       alreadyClosed: false,
       known: true,
     });

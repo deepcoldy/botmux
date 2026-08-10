@@ -2734,7 +2734,7 @@ function destroyOrphanedBackingSession(
 }
 
 type RiffClosePreparation =
-  | { ok: true; taskId?: string }
+  | { ok: true; taskId?: string; residual?: CloseResidual }
   | {
       ok: false;
       error:
@@ -2749,7 +2749,11 @@ type RiffClosePreparation =
         // mojo reuses this preparation contract: same problem (a remote,
         // credential-bearing session that must be proven gone before the row is
         // published as closed), same retryable-failure shape.
-        | 'mojo_cancel_failed';
+        | 'mojo_cancel_failed'
+        /** Bot deregistered — retryable once it is registered again. */
+        | 'mojo_config_missing'
+        /** Durable lineage with no active owner to cancel through. */
+        | 'mojo_close_identity_missing';
       retryable: true;
       taskId?: string;
     };
@@ -3063,20 +3067,41 @@ async function prepareMojoExplicitClose(
   stored: Session | undefined,
 ): Promise<RiffClosePreparation> {
   const session = ds?.session ?? stored;
-  if (!session || !ds) return { ok: true };
-  if (ds.initConfig?.adoptMode || ds.adoptedFrom || session.adoptedFrom) return { ok: true };
-  // A live worker cancels remote-side itself on the `close` IPC.
-  if (ds.worker && !ds.worker.killed) return { ok: true };
+  if (!session) return { ok: true };
+  if (ds?.initConfig?.adoptMode || ds?.adoptedFrom || session.adoptedFrom) return { ok: true };
   const remoteId = session.riffParentTaskId;
   if (!remoteId) return { ok: true };
+  if (!ds) {
+    // An open durable row carrying a lineage, with no owner in the active
+    // registry. Everything the cancel needs (frozen identity, launch identity)
+    // hangs off DaemonSession, so this cannot be cancelled from here — and
+    // silently publishing it as closed would be the same lie as before, just
+    // through a different door. Fail closed; a restore/adopt puts the owner back
+    // and makes the retry work.
+    logger.warn(
+      `[${session.sessionId.slice(0, 8)}] explicit close refused: mojo lineage ${remoteId} `
+      + 'has no active owner to cancel through; row stays open',
+    );
+    return { ok: false, error: 'mojo_close_identity_missing', retryable: true, taskId: remoteId };
+  }
+  // A live worker cancels remote-side itself on the `close` IPC.
+  if (ds.worker && !ds.worker.killed) return { ok: true };
 
   const resolved = resolveMojoCancelLaunch(ds, remoteId, 'explicit close');
   if (!resolved.ok) {
-    // Quarantined or bot-gone: cancelling is either unsafe or impossible, and no
-    // retry could ever change that. Proceed with the close and KEEP the lineage on
-    // the row so the remote session can still be cleaned up by hand — both cases
-    // already logged why.
-    return { ok: true };
+    if (resolved.reason === 'bot_gone') {
+      // NOT permanent: re-registering the bot restores the config this needs, so
+      // this is retryable and must not close the row behind the operator's back.
+      return { ok: false, error: 'mojo_config_missing', retryable: true, taskId: remoteId };
+    }
+    // Quarantined: cancelling could reach a different tenant, and no retry can
+    // ever make an unverifiable control plane verifiable. Refusing forever would
+    // strand the row, so the close proceeds — but as an EXPLICIT residual, never
+    // as an ordinary success, and the lineage stays on the row for manual cleanup.
+    return {
+      ok: true,
+      residual: { reason: 'mojo_lineage_quarantined', taskId: remoteId },
+    };
   }
 
   const outcome = await cancelMojoSessionById(resolved.launchCfg, remoteId);
@@ -3427,8 +3452,36 @@ export function teardownAuthoritativePersistentBackingBeforeClose(
  * Calling this on an unknown sessionId, an already-closed session, or a session
  * whose worker died asynchronously must still resolve with `{ ok: true }`.
  */
+/**
+ * Why a close left a remote session behind even though the local row closed.
+ *
+ * Only ONE cause qualifies: a quarantined lineage, where nothing records which
+ * control plane holds the remote session, so cancelling could reach a different
+ * tenant. Refusing forever would strand the row (no retry can ever make an
+ * unverifiable control plane verifiable), so the row closes — but the caller must
+ * SAY so rather than showing the ordinary "closed" confirmation.
+ */
+export interface CloseResidual {
+  reason: 'mojo_lineage_quarantined';
+  taskId: string;
+}
+
+/**
+ * `outcome` is a REQUIRED discriminant on success, not an optional warning field.
+ *
+ * An optional flag on an otherwise ordinary success is exactly what every call
+ * site forgets to read; making it mandatory means a new entry point cannot render
+ * "closed" without first deciding what to do about a residual remote session.
+ */
 export type CloseSessionResult =
-  | { ok: true; alreadyClosed: boolean; known: boolean }
+  | { ok: true; outcome: 'closed'; alreadyClosed: boolean; known: boolean }
+  | {
+      ok: true;
+      outcome: 'closed_with_residual';
+      residual: CloseResidual;
+      alreadyClosed: boolean;
+      known: boolean;
+    }
   | ({
       ok: false;
       alreadyClosed: false;
@@ -3643,7 +3696,19 @@ export async function closeSession(
 
   // alreadyClosed = nothing happened on either path.
   const alreadyClosed = !killedLive && !wasOpen;
-  return { ok: true, alreadyClosed, known };
+  // The local row IS closed, but a remote session was deliberately left running
+  // (its control plane could not be verified, so cancelling it might have hit
+  // another tenant). Callers must render this differently from an ordinary close.
+  if (prepared.residual) {
+    return {
+      ok: true,
+      outcome: 'closed_with_residual',
+      residual: prepared.residual,
+      alreadyClosed,
+      known,
+    };
+  }
+  return { ok: true, outcome: 'closed', alreadyClosed, known };
 }
 
 /**

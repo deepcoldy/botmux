@@ -1322,6 +1322,17 @@ export async function handleCommand(
             if (!closeResult.ok) {
               return { status: 'close_refused' as const, result: closeResult };
             }
+            if (closeResult.outcome === 'closed_with_residual') {
+              // Local row IS closed, so this is not a failure — but a remote
+              // session was deliberately left running, and the ordinary "closed"
+              // card would imply everything is gone.
+              return {
+                status: 'closed_with_residual' as const,
+                current,
+                card,
+                residual: closeResult.residual,
+              };
+            }
             return { status: 'closed' as const, current, card };
           });
           if (!closed) {
@@ -1333,6 +1344,20 @@ export async function handleCommand(
             await sessionReply(
               rootId,
               `⚠️ 会话关闭失败，已保留 active 记录以便重试：${closed.err instanceof Error ? closed.err.message : String(closed.err)}`,
+            );
+            break;
+          }
+          if (closed.status === 'closed_with_residual') {
+            logger.warn(
+              `[${logTag}] session closed locally but remote lineage ${closed.residual.taskId} `
+              + `was NOT cancelled (${closed.residual.reason}); manual cleanup required`,
+            );
+            await sessionReply(
+              rootId,
+              '✅ 会话已在本地关闭。\n'
+              + `⚠️ 但远端会话 \`${closed.residual.taskId}\` **未被取消** —— 它的控制面无法验证`
+              + '（quarantined），盲目取消可能打到别的租户，因此保留下来。**需要人工清理**，'
+              + '否则它会继续占用云端沙箱并持有已注入的凭据。',
             );
             break;
           }
@@ -1818,6 +1843,16 @@ export async function handleCommand(
                 if (!closeResult.ok) {
                   return { ok: false as const, error: 'close_refused' as const };
                 }
+                if (closeResult.outcome === 'closed_with_residual') {
+                  // The user asked to switch directory, not to consent to leaving a
+                  // remote session running. Stop here and tell them, rather than
+                  // quietly spawning a replacement on top of the residual.
+                  return {
+                    ok: false as const,
+                    error: 'close_residual' as const,
+                    residual: closeResult.residual,
+                  };
+                }
                 // The key lock excludes every sanctioned creator. A direct
                 // lifecycle callback may still have published unexpectedly;
                 // fail closed instead of overwriting that first owner.
@@ -1863,6 +1898,14 @@ export async function handleCommand(
                 await sessionReply(
                   rootId,
                   '当前 Codex App 仍有未结算消息，暂不能切换仓库；请等待本轮完成或关闭会话。',
+                );
+              } else if (switched.error === 'close_residual') {
+                logger.warn(`[${logTag}] Repo switch stopped: old session closed with an uncancelled remote lineage`);
+                await sessionReply(
+                  rootId,
+                  '⚠️ 原会话已在本地关闭，但它的远端会话未能取消（控制面无法验证），'
+                  + `需要人工清理：\`${switched.residual.taskId}\`。\n`
+                  + '**未创建新会话** —— 请先处理遗留的远端会话，再重新切换仓库。',
                 );
               } else if (switched.error === 'close_refused') {
                 // Silence here would be the worst outcome: the old session is

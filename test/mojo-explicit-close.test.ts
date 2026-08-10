@@ -156,6 +156,7 @@ describe('mojo explicit close', () => {
 
     expect(await closeSession(fixture.session.sessionId)).toEqual({
       ok: true,
+      outcome: 'closed',
       alreadyClosed: false,
       known: true,
     });
@@ -198,6 +199,7 @@ describe('mojo explicit close', () => {
     cancelMojoMock.mockResolvedValue({ kind: 'cancelled' });
     expect(await closeSession(fixture.session.sessionId)).toEqual({
       ok: true,
+      outcome: 'closed',
       alreadyClosed: false,
       known: true,
     });
@@ -213,14 +215,17 @@ describe('mojo explicit close', () => {
     expect(cancelMojoMock).toHaveBeenCalledTimes(1);
   });
 
-  it('never cancels a quarantined lineage, but still closes', async () => {
+  it('never cancels a quarantined lineage: closes, but as an explicit residual', async () => {
     // Nothing records which control plane holds an unfrozen lineage, so cancelling
     // could reach a different tenant. Close proceeds and the id is KEPT on the row
-    // for manual cleanup — a retry could never make this safe.
+    // for manual cleanup — a retry could never make this safe. But it must NOT look
+    // like an ordinary close, or the user is told a running remote session is gone.
     const fixture = createFixture({ legacyUnfrozen: true });
 
     expect(await closeSession(fixture.session.sessionId)).toEqual({
       ok: true,
+      outcome: 'closed_with_residual',
+      residual: { reason: 'mojo_lineage_quarantined', taskId: 'mojo-sid-123' },
       alreadyClosed: false,
       known: true,
     });
@@ -230,16 +235,41 @@ describe('mojo explicit close', () => {
     expect(after?.riffParentTaskId).toBe('mojo-sid-123');
   });
 
-  it('closes (keeping the lineage) when the bot is deregistered', async () => {
-    // Cancelling is impossible and no retry could change that, so blocking the
-    // close forever would strand the row instead of just the remote session.
+  it('refuses (retryably) when the bot is deregistered', async () => {
+    // Re-registering the bot restores the config this needs, so this IS retryable —
+    // closing the row now would publish "gone" for a session still running.
     getBotMock.mockImplementation(() => { throw new Error('bot gone'); });
     const fixture = createFixture();
 
-    expect((await closeSession(fixture.session.sessionId)).ok).toBe(true);
+    expect(await closeSession(fixture.session.sessionId)).toEqual({
+      ok: false,
+      alreadyClosed: false,
+      error: 'mojo_config_missing',
+      retryable: true,
+      taskId: 'mojo-sid-123',
+    });
     expect(cancelMojoMock).not.toHaveBeenCalled();
-    expect(sessionStore.getSession(fixture.session.sessionId)?.riffParentTaskId)
-      .toBe('mojo-sid-123');
+    const after = sessionStore.getSession(fixture.session.sessionId);
+    expect(after?.status).not.toBe('closed');
+    expect(after?.riffParentTaskId).toBe('mojo-sid-123');
+  });
+
+  it('refuses a durable lineage that has no active owner to cancel through', async () => {
+    // Open row + lineage, but nothing in the registry: the frozen identity the
+    // cancel needs hangs off DaemonSession. Publishing closed here would be the
+    // same lie through a different door.
+    const fixture = createFixture();
+    setActiveSessionsRegistry(new Map());
+
+    expect(await closeSession(fixture.session.sessionId)).toEqual({
+      ok: false,
+      alreadyClosed: false,
+      error: 'mojo_close_identity_missing',
+      retryable: true,
+      taskId: 'mojo-sid-123',
+    });
+    expect(cancelMojoMock).not.toHaveBeenCalled();
+    expect(sessionStore.getSession(fixture.session.sessionId)?.status).not.toBe('closed');
   });
 
   it('leaves cancellation to the worker when one is live', async () => {

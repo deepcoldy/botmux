@@ -722,6 +722,16 @@ export async function commitRepoSelection(
         if (!closeResult.ok) {
           return { ok: false as const, error: 'close_refused' as const };
         }
+        if (closeResult.outcome === 'closed_with_residual') {
+          // Same rule as the text /repo path: picking a directory is not consent
+          // to leave a remote session running, so stop instead of spawning a
+          // replacement on top of it.
+          return {
+            ok: false as const,
+            error: 'close_residual' as const,
+            residual: closeResult.residual,
+          };
+        }
         if (activeSessions.get(key) === current) activeSessions.delete(key);
         if (activeSessions.has(key)) {
           return { ok: false as const, error: 'session_replaced' as const };
@@ -771,6 +781,13 @@ export async function commitRepoSelection(
         await sessionReply(
           rootId,
           '当前 Codex App 仍有未结算消息，暂不能切换仓库；请等待本轮完成或关闭会话。',
+        );
+      } else if (switched.error === 'close_residual') {
+        await sessionReply(
+          rootId,
+          '⚠️ 原会话已在本地关闭，但它的远端会话未能取消（控制面无法验证），'
+          + `需要人工清理：\`${switched.residual.taskId}\`。\n`
+          + '**未创建新会话** —— 请先处理遗留的远端会话，再重新切换仓库。',
         );
       } else if (switched.error === 'close_refused') {
         // Without this the user taps the card and gets nothing back, while the old
@@ -2342,6 +2359,15 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           );
           return { status: 'close_refused' as const, result: closeResult };
         }
+        if (closeResult.outcome === 'closed_with_residual') {
+          return {
+            status: 'closed_with_residual' as const,
+            current,
+            botCfg,
+            card,
+            residual: closeResult.residual,
+          };
+        }
         return { status: 'closed' as const, current, botCfg, card };
       });
       if (!closed) {
@@ -2352,6 +2378,16 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           toast: {
             type: 'warning',
             content: `会话关闭失败：${closed.err instanceof Error ? closed.err.message : String(closed.err)}`,
+          },
+        };
+      }
+      if (closed.status === 'closed_with_residual') {
+        // Closed locally, but a remote session was deliberately left running.
+        return {
+          toast: {
+            type: 'warning',
+            content: `会话已在本地关闭，但远端会话 ${closed.residual.taskId} 未被取消`
+              + '（控制面无法验证），需要人工清理。',
           },
         };
       }
