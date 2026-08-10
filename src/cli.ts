@@ -10339,7 +10339,7 @@ async function cmdDispatch(rest: string[]): Promise<void> {
     console.error(`加载 bot 配置失败: ${err?.message ?? err}`);
     process.exit(1);
   }
-  const { resolveCurrentChatBotOpenIdsByLarkAppIds, sendMessage, replyMessage } = await import('./im/lark/client.js');
+  const { resolveCurrentChatBotOpenIdsByLarkAppIds, replyMessage } = await import('./im/lark/client.js');
   const appId = s.larkAppId!;
 
   const parsedBotApps: Array<{ appId: string; role?: string }> = [];
@@ -10445,19 +10445,15 @@ async function cmdDispatch(rest: string[]): Promise<void> {
     }
 
     // New-thread mode.
-    // 1. Seed (thread root) — top-level header; gives the thread something to hang off.
-    const seedId = await sendMessage(appId, targetChatId, built.seedText, 'text');
-
-    // Register through the owning daemon before sending the task. The daemon
-    // proves this exact seed was sent by this bot, derives the orchestrator
-    // identity from the authenticated live session, and persists an HMAC-bound
-    // report target. The CLI never authors trusted registry coordinates.
+    // Ask the owning daemon to create the seed and persist the HMAC-bound
+    // report target as one trusted host-side action. The CLI never supplies a
+    // pre-existing registry key that another co-tenant session could claim.
     const registration = await postCurrentSessionDaemonRoute({
       path: DISPATCH_REPORT_REGISTER_ROUTE,
       sessionId: sid,
       larkAppId: s.larkAppId,
       body: {
-        dispatchRoot: seedId,
+        seedText: built.seedText,
         targetChatId,
         targetAppIds: parsedBotApps.map(item => item.appId),
         title: title.trim(),
@@ -10469,6 +10465,10 @@ async function cmdDispatch(rest: string[]): Promise<void> {
       throw new Error(
         `dispatch report binding registration failed: ${registrationBody?.error ?? `HTTP ${registration.status}`}`,
       );
+    }
+    const seedId = registrationBody?.dispatchRoot;
+    if (typeof seedId !== 'string' || !seedId) {
+      throw new Error('dispatch report binding registration did not return a seed id');
     }
 
     // 2. Optional repo prime — a plain TEXT message "@bot /repo <path>" (like a

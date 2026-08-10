@@ -124,32 +124,3 @@ export function resolveVerifiedDispatchReportTarget(input: {
     ? { ok: true, binding }
     : { ok: false, error: 'dispatch_binding_unproven' };
 }
-
-/** Prove a registry key is an actual seed sent by the registering daemon's bot. */
-export function dispatchSeedOwnedBy(input: {
-  message: unknown;
-  dispatchRoot: string;
-  targetChatId: string;
-  larkAppId: string;
-  botOpenId?: string;
-}): boolean {
-  if (!input.message || typeof input.message !== 'object' || Array.isArray(input.message)) {
-    return false;
-  }
-  const message = input.message as Record<string, any>;
-  const sender = message.sender && typeof message.sender === 'object'
-    ? message.sender as Record<string, unknown>
-    : {};
-  const senderType = sender.sender_type ?? message.sender_type;
-  const senderId = sender.open_bot_id ?? sender.id ?? sender.open_id ?? sender.app_id;
-  const senderIdType = sender.open_bot_id
-    ? 'open_id'
-    : sender.id_type ?? sender.sender_id_type;
-  const senderMatches = (senderIdType === 'app_id' && senderId === input.larkAppId)
-    || senderId === input.larkAppId
-    || (!!input.botOpenId && senderId === input.botOpenId);
-  return message.message_id === input.dispatchRoot
-    && message.chat_id === input.targetChatId
-    && (senderType === 'app' || senderType === 'bot')
-    && senderMatches;
-}

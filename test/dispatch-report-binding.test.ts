@@ -2,7 +2,6 @@ import { describe, expect, it } from 'vitest';
 
 import {
   createDispatchReportBinding,
-  dispatchSeedOwnedBy,
   resolveVerifiedDispatchReportTarget,
 } from '../src/core/dispatch-report-binding.js';
 
@@ -60,31 +59,4 @@ describe('dispatch report binding', () => {
     })).toEqual({ ok: false, error: 'dispatch_binding_unproven' });
   });
 
-  it('accepts only a seed sent by the registering bot into the exact chat', () => {
-    const owned = {
-      message_id: 'om_seed',
-      chat_id: 'oc_target',
-      sender: { id: 'cli_orchestrator', id_type: 'app_id', sender_type: 'app' },
-    };
-    const input = {
-      message: owned,
-      dispatchRoot: 'om_seed',
-      targetChatId: 'oc_target',
-      larkAppId: 'cli_orchestrator',
-      botOpenId: 'ou_orchestrator',
-    };
-    expect(dispatchSeedOwnedBy(input)).toBe(true);
-    expect(dispatchSeedOwnedBy({
-      ...input,
-      message: { ...owned, chat_id: 'oc_victim' },
-    })).toBe(false);
-    expect(dispatchSeedOwnedBy({
-      ...input,
-      message: { ...owned, sender: { id: 'cli_victim', id_type: 'app_id', sender_type: 'app' } },
-    })).toBe(false);
-    expect(dispatchSeedOwnedBy({
-      ...input,
-      message: { ...owned, sender: { id: 'cli_orchestrator', id_type: 'app_id', sender_type: 'user' } },
-    })).toBe(false);
-  });
 });

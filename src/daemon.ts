@@ -49,7 +49,7 @@ import {
 } from './core/supervisor-shutdown-protocol.js';
 import { readSupervisorProcessStartIdentity } from './core/process-start-identity.js';
 import { statSync } from 'node:fs';
-import { addReaction, deleteMessage, getChatContext, getChatMode, getChatNameAndMode, getMessageChatId, getMessageDetail, listChatMemberOpenIds, MessageWithdrawnError, replyMessage, resolveAllowedUsersWithMap, sendMessage, sendUserMessage, updateMessage, type EntryResolveStatus } from './im/lark/client.js';
+import { addReaction, deleteMessage, getChatContext, getChatMode, getChatNameAndMode, getMessageChatId, listChatMemberOpenIds, MessageWithdrawnError, replyMessage, resolveAllowedUsersWithMap, sendMessage, sendUserMessage, updateMessage, type EntryResolveStatus } from './im/lark/client.js';
 import { resolveGroupJoinPrompt, waitForAllowedUserInChat } from './core/auto-start.js';
 import {
   loadBotConfigAtIndex,
@@ -57,7 +57,6 @@ import {
   isManagedActivationStartingAtIndex,
   registerBot,
   getBot,
-  getBotOpenId,
   getAllBots,
   getOwnerOpenId,
   findOncallChat,
@@ -191,7 +190,6 @@ import {
 } from './core/report-session-relay.js';
 import {
   createDispatchReportBinding,
-  dispatchSeedOwnedBy,
   dispatchReportBindingSecretPath,
   DISPATCH_REPORT_REGISTER_MAX_BYTES,
   DISPATCH_REPORT_REGISTER_ROUTE,
@@ -5310,12 +5308,12 @@ ipcRoute('POST', DISPATCH_REPORT_REGISTER_ROUTE, async (req, res) => {
     ? raw as Record<string, unknown>
     : undefined;
   const sessionId = typeof body?.sessionId === 'string' ? body.sessionId.trim() : '';
-  const dispatchRoot = typeof body?.dispatchRoot === 'string' ? body.dispatchRoot.trim() : '';
+  const seedText = typeof body?.seedText === 'string' ? body.seedText.trim() : '';
   const targetChatId = typeof body?.targetChatId === 'string' ? body.targetChatId.trim() : '';
   const title = typeof body?.title === 'string' ? body.title.trim().slice(0, 200) : '';
   if (!sessionId) return jsonRes(res, 400, { ok: false, error: 'missing_session_id' });
-  if (!/^om_[A-Za-z0-9_-]{1,128}$/.test(dispatchRoot)) {
-    return jsonRes(res, 400, { ok: false, error: 'bad_dispatch_root' });
+  if (!seedText) {
+    return jsonRes(res, 400, { ok: false, error: 'missing_seed_text' });
   }
   if (!/^oc_[A-Za-z0-9_-]{1,128}$/.test(targetChatId)) {
     return jsonRes(res, 400, { ok: false, error: 'bad_target_chat_id' });
@@ -5341,38 +5339,15 @@ ipcRoute('POST', DISPATCH_REPORT_REGISTER_ROUTE, async (req, res) => {
     return jsonRes(res, 403, { ok: false, error: 'session_identity_incomplete' });
   }
 
-  // The daemon, not the CLI, proves that this exact registry key is a seed
-  // message sent by the current orchestrator bot into the claimed chat. A
-  // capability-owning session therefore cannot register a victim bot's root.
-  let seed: any;
-  let seedLookupError: unknown;
-  for (let attempt = 0; attempt < 3 && !seed; attempt += 1) {
-    try {
-      seed = (await getMessageDetail(ds.larkAppId, dispatchRoot, {
-        userCardContent: false,
-      }))?.items?.[0];
-      seedLookupError = undefined;
-    } catch (error) {
-      seedLookupError = error;
-    }
-    if (!seed && attempt < 2) await delay(100 * (attempt + 1));
-  }
-  if (!seed && seedLookupError) {
+  let dispatchRoot: string;
+  try {
+    dispatchRoot = await sendMessage(ds.larkAppId, targetChatId, seedText, 'text');
+  } catch (error) {
     return jsonRes(res, 502, {
       ok: false,
-      error: 'dispatch_seed_unverifiable',
-      detail: seedLookupError instanceof Error ? seedLookupError.message : String(seedLookupError),
+      error: 'dispatch_seed_send_failed',
+      detail: error instanceof Error ? error.message : String(error),
     });
-  }
-  const expectedBotOpenId = getBotOpenId(ds.larkAppId);
-  if (!dispatchSeedOwnedBy({
-    message: seed,
-    dispatchRoot,
-    targetChatId,
-    larkAppId: ds.larkAppId,
-    botOpenId: expectedBotOpenId,
-  })) {
-    return jsonRes(res, 403, { ok: false, error: 'dispatch_seed_not_owned' });
   }
 
   const bindingSecret = loadOrCreateDashboardSecret(
