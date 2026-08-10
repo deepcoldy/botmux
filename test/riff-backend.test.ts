@@ -447,12 +447,12 @@ describe('RiffBackend', () => {
       expect(out).not.toContain('item.completed');
     });
 
-    it('renders a completed command as [命令] <cmd> (exit 0) in green', () => {
+    it('renders a completed command as [命令] <cmd> (exit 0) in green (no output case)', () => {
       const be = makeBackend({ injectStatusLines: false });
       const lines: string[] = [];
       be.onData(d => lines.push(d));
       (be as any).currentTaskId = 'task-1';
-      // riff's real command projection: {command,status,exitCode,summary} + NO text.
+      // A command with no captured output: riff omits `text`, so header only.
       (be as any).handleSseEvent(
         logEvt({ group: 'stdout', text: '{}', display: { kind: 'command', title: '命令执行', command: 'ls -la', status: 'completed', exitCode: 0, summary: '命令执行完成' } }),
         'task-1',
@@ -462,6 +462,36 @@ describe('RiffBackend', () => {
       expect(out).toContain('\x1b[32m'); // green for exit 0
       // MUST NOT print `summary` ('命令执行完成') as a fake output line.
       expect(out).not.toContain('命令执行完成');
+    });
+
+    it('renders captured command output (riff folds stdout into display.text) below the header', () => {
+      const be = makeBackend({ injectStatusLines: false });
+      const lines: string[] = [];
+      be.onData(d => lines.push(d));
+      (be as any).currentTaskId = 'task-1';
+      // riff's collapseCommandOutputIntoPrimary puts the real stdout in `text`.
+      (be as any).handleSseEvent(
+        logEvt({ group: 'stdout', text: '{}', display: { kind: 'command', title: '命令执行', command: 'echo hello', status: 'completed', exitCode: 0, summary: '命令执行完成', text: 'hello' } }),
+        'task-1',
+      );
+      const out = lines.join('');
+      expect(out).toContain('[命令执行] echo hello (exit 0)');
+      expect(out).toContain('hello'); // the real output IS rendered
+      expect(out).not.toContain('命令执行完成'); // summary still never rendered
+    });
+
+    it('renders multi-line command output verbatim with CRLF normalization', () => {
+      const be = makeBackend({ injectStatusLines: false });
+      const lines: string[] = [];
+      be.onData(d => lines.push(d));
+      (be as any).currentTaskId = 'task-1';
+      (be as any).handleSseEvent(
+        logEvt({ group: 'stdout', text: '{}', display: { kind: 'command', title: '命令', command: 'ls', status: 'completed', exitCode: 0, text: 'file1\nfile2' } }),
+        'task-1',
+      );
+      const out = lines.join('');
+      expect(out).toContain('file1\r\nfile2');
+      expect(out).not.toMatch(/[^\r]\n/); // no bare LF (would stair-step)
     });
 
     it('renders a failed command in red with its exit code', () => {

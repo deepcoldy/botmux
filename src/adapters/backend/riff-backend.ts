@@ -897,10 +897,11 @@ export class RiffBackend implements SessionBackend {
       stderr: '',
     };
     const label = display.title || LABEL[kind] || kind;
-    // NOTE: for a codex `command` projection riff sets {command,status,exitCode,
-    // summary:'命令执行完成'} and NO `text` — the real captured stdout rides a
-    // SEPARATE stdout event on the verbatim `text`/passthrough path, not here. So
-    // the command branch renders ONLY its header (never `summary` as fake output).
+    // For a codex `command` projection riff sets {command,status,exitCode,
+    // summary:'命令执行完成'} PLUS `text` = the captured command output (stdout/
+    // stderr, already truncated to 32KB by riff's collapseCommandOutputIntoPrimary).
+    // `summary` is a status blurb we never render; `text` is the real output we DO
+    // render beneath the header. For non-command kinds `text` is the content itself.
     const body = (display.text ?? '').trimEnd();
 
     if (kind === 'command') {
@@ -912,6 +913,10 @@ export class RiffBackend implements SessionBackend {
       // neutral (info) for a still-running command (no exit code yet).
       const style = failed ? 'err' : completed ? 'ok' : 'info';
       this.emitTimelineRow(`[${label}] ${cmd}${exit}`, style);
+      // Render the captured command output (riff folds it into `text`) beneath the
+      // header, verbatim/uncolored. `summary` ('命令执行完成') is NOT this — it never
+      // reaches `body` (we read `text` only), so no fake output line.
+      if (body) this.emitTimelineRow(body, 'plain');
       return;
     }
     switch (kind) {
