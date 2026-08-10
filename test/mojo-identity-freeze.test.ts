@@ -287,6 +287,100 @@ describe('freezeMojoIdentityForSession', () => {
     identity.freezeMojoIdentityForSession(session, 'app_does_not_exist');
     expect(session.mojoIdentity).toBeUndefined();
   });
+
+  it('freezes a cliId-stamped row even after the bot was switched away', async () => {
+    // Found by reverting change points one at a time: deleting the cliId branch
+    // left every test green, because the bot-config fallback covered the same case
+    // whenever the bot was still mojo. It is NOT redundant though — a session keeps
+    // running the CLI frozen onto it (agentFrozen), so once the bot is switched to
+    // riff the fallback would answer "not mojo" and this row would never be frozen,
+    // reopening the P0 for exactly the sessions still talking to mojo.
+    const { registry, store, identity } = await boot({ cloud: true, workspaceId: 'ws-a' });
+    registry.registerBot({
+      larkAppId: 'app_switched', larkAppSecret: 'secret',
+      cliId: 'riff', backendType: 'riff',
+    } as never);
+    // cliId stamped (sessionAgentConfig runs before the freeze), backendType not yet.
+    const session = seedAsCreated(store, { cliId: 'mojo', larkAppId: 'app_switched' });
+    expect(session.backendType).toBeUndefined();
+
+    identity.freezeMojoIdentityForSession(session, 'app_switched');
+
+    // Frozen from the live mojo block of the bot it is actually pointed at; the
+    // point is that it was CLASSIFIED as mojo at all.
+    expect(session.mojoIdentity).toBeDefined();
+  });
+
+  // ── The live-bot-config fallback ────────────────────────────────────────────
+  // Neither backendType NOR cliId stamped. Reachable because cliId is stamped by
+  // sessionAgentConfig() DURING forkWorker: a row whose first fork never got that
+  // far (daemon killed, or an early throw between createSession and the stamp) is
+  // persisted with both fields empty, and the next restore has only the live bot
+  // config left to classify it by. Guarding this matters — misclassifying such a
+  // row is precisely the P0: it later acquires a lineage and gets quarantined
+  // instead of frozen.
+  //
+  // Note on the earlier reasoning: I claimed cliId was also written only after
+  // worker.send(). That was wrong — sessionAgentConfig (worker-pool:4396, stamping
+  // at :876) runs BEFORE the freeze at :4613, and only backendType (:4698) comes
+  // after. Review caught it. The fallback is still correct and still needed for
+  // the crash window above, but it is NOT the branch the normal path takes.
+  it('classifies by live bot config when neither backendType nor cliId is stamped', async () => {
+    const { store, identity } = await boot({ cloud: true, workspaceId: 'ws-a' });
+    const session = seedAsCreated(store, { cliId: undefined });
+    expect(session.backendType).toBeUndefined();
+    expect(session.cliId).toBeUndefined();
+
+    identity.freezeMojoIdentityForSession(session, APP_ID);
+
+    expect(session.mojoIdentity).toEqual({ cloud: true, workspaceId: 'ws-a' });
+  });
+
+  it('does not classify an unstamped row when the bot is a non-mojo one', async () => {
+    // The fallback must not freeze rows that merely happen to be unstamped.
+    const { registry, store, identity } = await boot({ cloud: true });
+    registry.registerBot({
+      larkAppId: 'app_riff', larkAppSecret: 'secret',
+      cliId: 'riff', backendType: 'riff',
+    } as never);
+    const session = seedAsCreated(store, { cliId: undefined, larkAppId: 'app_riff' });
+
+    identity.freezeMojoIdentityForSession(session, 'app_riff');
+
+    expect(session.mojoIdentity).toBeUndefined();
+  });
+
+  it('does not queue a quarantine notice for an unclassifiable row', async () => {
+    // This is what distinguishes the catch branch. Returning `true` there (i.e.
+    // "assume mojo") would fall through to the notice BACKFILL step and mark a row
+    // we cannot even classify — the bot is gone, so it may not be mojo at all.
+    // Asserting only on mojoIdentity cannot see this: the freeze body's own getBot
+    // also throws, so the identity stays unset either way, which is why this branch
+    // was zero-guard until now.
+    const { store, identity } = await boot({ cloud: true });
+    const session = seedAsCreated(store, {
+      cliId: undefined,
+      mojoQuarantinedLineage: 'parked-earlier',
+    });
+
+    identity.freezeMojoIdentityForSession(session, 'app_does_not_exist');
+
+    // Untouched, so a later re-registration can classify it and then notify.
+    expect(session.mojoQuarantineNoticePending).toBeUndefined();
+  });
+
+  it('fails safe on an unstamped row whose bot is deregistered', async () => {
+    // No config to classify from AND nothing stamped: must neither freeze nor
+    // park the lineage, so a later re-registration can still do it properly.
+    const { store, identity } = await boot({ cloud: true });
+    const session = seedAsCreated(store, { cliId: undefined, riffParentTaskId: 'lineage-x' });
+
+    identity.freezeMojoIdentityForSession(session, 'app_does_not_exist');
+
+    expect(session.mojoIdentity).toBeUndefined();
+    expect(session.mojoQuarantinedLineage).toBeUndefined();
+    expect(session.riffParentTaskId).toBe('lineage-x');
+  });
 });
 
 describe('migrateMojoSessionIdentities', () => {

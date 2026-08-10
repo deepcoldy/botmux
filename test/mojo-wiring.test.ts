@@ -8,6 +8,9 @@
  *
  * Run:  pnpm vitest run test/mojo-wiring.test.ts
  */
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
+
 import { describe, expect, it, vi } from 'vitest';
 
 vi.mock('../src/utils/logger.js', () => ({
@@ -167,4 +170,49 @@ describe('mojo requires a local binary (unlike riff/mira)', () => {
   it('honours an explicit path override', () => {
     expect(rawCliExecutable('mojo', '/opt/custom/mojo')).toBe('/opt/custom/mojo');
   });
+});
+
+describe('every raw_input send carries the mojo credential snapshot', () => {
+  // Per-CHANGE-POINT guard, not per-defect. The original fix had two daemon-side
+  // send points plus the worker-side apply, but only the worker side was pinned:
+  // commenting out BOTH sends left 378 tests green, so the real production bug
+  // ("the raw_input the daemon sends has no credential snapshot") could be
+  // reintroduced for free.
+  //
+  // Exhaustive by construction: it scans for every `type: 'raw_input'` literal in
+  // src/, so a NEW send point added later without the snapshot fails here too
+  // rather than silently reopening the hole.
+  const SRC_FILES = ['src/core/worker-pool.ts', 'src/daemon.ts'];
+
+  function rawInputSends(): Array<{ file: string; line: number; body: string }> {
+    const out: Array<{ file: string; line: number; body: string }> = [];
+    for (const file of SRC_FILES) {
+      const src = readFileSync(resolve(file), 'utf8');
+      let from = 0;
+      for (;;) {
+        const idx = src.indexOf("type: 'raw_input',", from);
+        if (idx < 0) break;
+        from = idx + 1;
+        // The object literal this send is building, up to its closing `});`.
+        const end = src.indexOf('});', idx);
+        out.push({
+          file,
+          line: src.slice(0, idx).split('\n').length,
+          body: src.slice(idx, end < 0 ? idx + 600 : end),
+        });
+      }
+    }
+    return out;
+  }
+
+  it('finds the send points at all (guards the assertion below)', () => {
+    // Without this, renaming the IPC would make the loop vacuous and pass.
+    expect(rawInputSends().length).toBeGreaterThanOrEqual(2);
+  });
+
+  for (const send of rawInputSends()) {
+    it(`${send.file}:${send.line} attaches mojoLivePatchForSession`, () => {
+      expect(send.body).toContain('mojoLivePatchForSession(ds)');
+    });
+  }
 });

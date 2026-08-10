@@ -27,19 +27,42 @@ import type { DaemonToWorker } from '../src/types.js';
 
 vi.setConfig({ testTimeout: 90_000 });
 
-/** A fake mojo that appends the JWT it saw, one line per invocation. */
+/**
+ * A fake mojo that records, one line per invocation, the two things a hijack
+ * would show up in: the JWT it ran with, and the session id botmux injected.
+ *
+ * BOTMUX_SESSION_ID is recorded because the reserved-key test asserts the actual
+ * CONSEQUENCE (mojo.env is the highest-precedence layer, so an accepted reserved
+ * key wins the merge and rewrites session routing). Recording only the JWT made
+ * that test a restatement of the validator unit test.
+ */
 function writeJwtRecorder(root: string, dump: string): void {
   const bin = join(root, 'mojo');
   writeFileSync(bin, `#!/usr/bin/env bash
-echo "[$X_JWT_TOKEN]" >> ${dump}
+echo "[$X_JWT_TOKEN] sid=$BOTMUX_SESSION_ID" >> ${dump}
 echo '{"type":"system","subtype":"init","session_id":"sid-x"}'
 echo '{"type":"result","status":"ok","result":"ok","session_id":"sid-x","warnings":[]}'
 `);
   chmodSync(bin, 0o755);
 }
 
+/**
+ * Every per-step budget below is multiplied by this.
+ *
+ * These steps spawn REAL worker processes, so under a full-suite run (5 workers
+ * competing for CPU) a step that takes ~1s in isolation can take many times
+ * that. The file-level testTimeout was already raised to 90s for exactly this
+ * reason, but the individual waitFor budgets were not — which is what made these
+ * tests intermittently red under load (~2/8 full runs) while passing standalone.
+ * Scaled rather than hardcoded larger so a genuine hang still fails reasonably
+ * fast when the file is run on its own.
+ */
+const LOAD_FACTOR = process.env.BOTMUX_TEST_LOAD_FACTOR
+  ? Number(process.env.BOTMUX_TEST_LOAD_FACTOR)
+  : 4;
+
 async function waitFor(pred: () => boolean, ms: number, fail: () => string): Promise<void> {
-  const deadline = Date.now() + ms;
+  const deadline = Date.now() + ms * LOAD_FACTOR;
   while (Date.now() < deadline) {
     if (pred()) return;
     await new Promise<void>(r => setTimeout(r, 100));
@@ -54,10 +77,21 @@ function countMsgs(h: Harness, type: string): number {
   return h.msgs.filter(m => m.type === type).length;
 }
 
-function lines(dump: string): string[] {
+/** Raw recorder lines, e.g. `[tok] sid=abc`. */
+function rawLines(dump: string): string[] {
   if (!existsSync(dump)) return [];
   const raw = readFileSync(dump, 'utf-8').trim();
   return raw ? raw.split('\n') : [];
+}
+
+/** Just the credential each invocation ran with, e.g. `[tok]`. */
+function lines(dump: string): string[] {
+  return rawLines(dump).map(l => l.replace(/ sid=.*$/, ''));
+}
+
+/** Just the injected session id each invocation ran with. */
+function sessionIds(dump: string): string[] {
+  return rawLines(dump).map(l => l.replace(/^.* sid=/, ''));
 }
 
 interface Harness {
@@ -303,10 +337,14 @@ describe('mojo cross-boundary contracts', () => {
 
   it('3b. mojo.env cannot hijack a botmux-owned session variable', async () => {
     // mojo.env is the highest-precedence env layer, so a reserved key accepted by
-    // the validator would WIN over the worker's own BOTMUX_SESSION_ID. Review
-    // demonstrated it being overwritten to 'hijacked'. The worker rejects an
-    // invalid mojo config outright, so the end-to-end contract is that this
-    // session never launches at all.
+    // the validator WINS over the worker's own BOTMUX_SESSION_ID — review
+    // demonstrated it being rewritten to 'hijacked'. The end-to-end contract is
+    // that this session never launches at all.
+    //
+    // The fence deliberately waits for EITHER outcome (a refusal, or a turn that
+    // actually ran). An earlier version waited only for the refusal, so with the
+    // fix reverted it died on a 25s poll timeout and the assertion below — the one
+    // that actually names the hijack — never executed at all.
     const h = bootWorker({});
     try {
       h.child.send({
@@ -317,20 +355,43 @@ describe('mojo cross-boundary contracts', () => {
         prompt: 'should never run', larkAppId: 'app_xb', larkAppSecret: 'secret',
       } as DaemonToWorker);
 
-      // The refusal travels as a fatal `error` IPC message (spawnCli throws ->
-      // sendFatalWorkerErrorAndExit), not on stdout — an earlier draft grepped the
-      // logs and timed out at 25s without ever observing the real signal.
       await waitFor(
-        () => h.msgs.some(m => m.type === 'error' && (m.message ?? '').includes('BOTMUX_SESSION_ID')),
-        25_000,
-        () => `worker never rejected the reserved key: `
-          + `${JSON.stringify(h.msgs.map(m => [m.type, m.message]))}\n${h.logs.join('')}`,
+        () => rawLines(h.dump).length > 0 || h.msgs.some(m => m.type === 'error'),
+        20_000,
+        () => `worker neither refused nor launched: `
+          + `${JSON.stringify(h.msgs.map(m => m.type))}\n${h.logs.join('')}`,
       );
+
+      // THE consequence assertion: no invocation may ever have run under the
+      // injected session id.
+      expect(sessionIds(h.dump), `recorder saw: ${rawLines(h.dump).join(' | ')}`)
+        .not.toContain('hijacked');
+      // Refused before any turn ran at all (the recorder writes one line per launch).
+      expect(rawLines(h.dump)).toEqual([]);
+      // And refused for the right reason, naming the key.
       const err = h.msgs.find(m => m.type === 'error')?.message ?? '';
       expect(err).toContain('mojo config is invalid');
+      expect(err).toContain('BOTMUX_SESSION_ID');
       expect(err).toContain('botmux owns this variable');
-      // Rejected BEFORE any turn ran: the fake mojo records one line per launch.
-      expect(lines(h.dump)).toEqual([]);
+    } finally { teardown(h); }
+  });
+
+  it('3c. an ALLOWED mojo.env var still cannot reach session routing', async () => {
+    // Positive sentinel for the test above: proves the recorder really observes
+    // BOTMUX_SESSION_ID, so `not.toContain('hijacked')` cannot pass merely because
+    // the variable is never recorded. Uses a key the validator permits, so the
+    // session actually launches.
+    const h = bootWorker({ mojo: { env: { MY_TOKEN: 'fine' } } });
+    try {
+      h.child.send({
+        type: 'init',
+        sessionId: 'sid-xb', chatId: 'oc_x', rootMessageId: 'om_x',
+        workingDir: h.root, cliId: 'mojo', backendType: 'mojo',
+        backendConfig: { cloud: true, env: { MY_TOKEN: 'fine' } },
+        prompt: 'a real turn', larkAppId: 'app_xb', larkAppSecret: 'secret',
+      } as DaemonToWorker);
+      await waitFor(() => rawLines(h.dump).length >= 1, 20_000, () => `turn never ran\n${h.logs.join('')}`);
+      expect(sessionIds(h.dump)[0]).toBe('sid-xb');
     } finally { teardown(h); }
   });
 
