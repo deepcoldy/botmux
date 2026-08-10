@@ -8,7 +8,9 @@ import {
   REDACTED_CHILD_ENV_KEYS,
   scrubClaudeSessionMarkerEnv,
   scrubSessionCliHomeEnv,
+  scrubWorkflowWorkerEnv,
   SESSION_CLI_HOME_ENV_KEYS,
+  WORKFLOW_WORKER_ENV_KEYS,
 } from '../src/utils/child-env.js';
 import { PM2_GRACEFUL_EXIT_CODE_ENV } from '../src/pm2-graceful-exit.js';
 
@@ -206,6 +208,25 @@ describe('scrubClaudeSessionMarkerEnv()', () => {
   });
 });
 
+describe('scrubWorkflowWorkerEnv()', () => {
+  it('removes the complete workflow and goal identity in place', () => {
+    const env: NodeJS.ProcessEnv = {
+      ...Object.fromEntries(WORKFLOW_WORKER_ENV_KEYS.map((key) => [key, 'leaked'])),
+      BOTMUX_WORKFLOW_RUNS_DIR: '/shared/workflow-runs',
+      KEEP: 'v',
+    };
+
+    scrubWorkflowWorkerEnv(env);
+
+    for (const key of WORKFLOW_WORKER_ENV_KEYS) {
+      expect(key in env, key).toBe(false);
+    }
+    // Global workflow storage configuration is not a node-worker identity.
+    expect(env.BOTMUX_WORKFLOW_RUNS_DIR).toBe('/shared/workflow-runs');
+    expect(env.KEEP).toBe('v');
+  });
+});
+
 describe('session CLI home scrub call sites', () => {
   // The scrub only works if every process boundary actually invokes it. These
   // source-level pins keep a refactor from silently dropping a boundary:
@@ -246,6 +267,14 @@ describe('session CLI home scrub call sites', () => {
     expect(worker).toContain('applySessionOwnerEnv(childEnv, cfg.ownerOpenId)');
     expect(worker).toContain('applySessionOwnerEnv(engineEnv, cfg.ownerOpenId)');
     expect(worker).toContain('applySessionOwnerEnv(mergedEnv, cfg.ownerOpenId)');
+  });
+
+  it('pm2 and daemon boot scrub workflow-worker identity without scrubbing real worker boot', () => {
+    const cli = read('cli.ts');
+    const fn = cli.slice(cli.indexOf('function pm2Env('));
+    expect(fn.slice(0, fn.indexOf('\n}'))).toContain('scrubWorkflowWorkerEnv(');
+    expect(read('index-daemon.ts')).toContain('scrubWorkflowWorkerEnv(process.env)');
+    expect(read('worker.ts')).not.toContain('scrubWorkflowWorkerEnv(process.env)');
   });
 
   it('worker-pool strips the PM2 sentinel when forking a worker (source pin)', () => {

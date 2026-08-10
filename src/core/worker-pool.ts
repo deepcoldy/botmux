@@ -69,6 +69,7 @@ import { withBotTurnMutation } from './bot-turn-mutation-gate.js';
 import { getBot, getAllBots, loadBotConfigs, resolveBrandLabel, getLoadedConfigPath, resolveUsageDisplay } from '../bot-registry.js';
 import { RestartCoordinator, type RestartObserver } from './restart-coordinator.js';
 import { runtimeBuildIdentity } from '../utils/runtime-build-id.js';
+import { scrubWorkflowWorkerEnv } from '../utils/child-env.js';
 
 /** A random id minted once per daemon process (this lifetime). Stamped onto
  *  isolated persistent panes so a suspend→resume reattach (same id) is
@@ -394,6 +395,10 @@ const WORKER_REDACTED_ENV_KEYS = ['GITHUB_TOKEN', 'GH_TOKEN', 'BOTMUX_PM2_GRACEF
 function workerForkEnv(base: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...base };
   for (const key of WORKER_REDACTED_ENV_KEYS) delete env[key];
+  // Defense in depth for a daemon started from a contaminated PM2 snapshot.
+  // Genuine workflow workers bypass this pool and receive their markers from
+  // workflows/v3/ephemeral-pool.ts.
+  scrubWorkflowWorkerEnv(env);
   return env;
 }
 
