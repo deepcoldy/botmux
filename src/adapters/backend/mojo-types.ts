@@ -161,6 +161,35 @@ export const MOJO_CONTROL_ENV_KEYS = [
  */
 export const MOJO_CANONICAL_JWT_ENV_KEY = 'X_JWT_TOKEN';
 
+/**
+ * The outcome of trying to cancel a mojo session's remote lineage.
+ *
+ * Deliberately NOT a boolean. The old `Promise<boolean>` collapsed two states the
+ * caller must tell apart — "the remote session is provably gone" and "we do not
+ * know" — into one `false`. Its own doc comment claimed a completed session "is
+ * not an error worth surfacing" while the code returned `false` for it, so a close
+ * that awaits proof would refuse forever on a session that had simply finished.
+ *
+ * `already_terminal` therefore requires EVIDENCE from a verified mojo error
+ * code/state, never a text guess: a loose regex over CLI stderr is how a
+ * "finished" and a "cancel is broken" become indistinguishable again, and this
+ * repo already carries that debt once (RESUME_DEAD_RE). Until the real codes are
+ * calibrated against @byted/mojo, the classifier returns `failed` for everything
+ * it cannot prove, which fails CLOSED (row stays open, retryable).
+ */
+export type MojoCancelOutcome =
+    /** The cancel call succeeded. The remote session is gone. */
+    | { kind: 'cancelled' }
+    /** Proven already finished — carries the verified signal that proved it. */
+    | { kind: 'already_terminal'; evidence: string }
+    /** Unknown or failed. `retryable: false` only for causes a retry cannot fix. */
+    | { kind: 'failed'; code?: string; message: string; retryable: boolean };
+
+/** True only when the remote session is provably gone (cancelled or finished). */
+export function isMojoRemoteGone(outcome: MojoCancelOutcome): boolean {
+    return outcome.kind === 'cancelled' || outcome.kind === 'already_terminal';
+}
+
 /** The frozen control-plane identity, persisted on the session. */
 export type MojoSessionIdentity = Pick<MojoConfig, typeof MOJO_IDENTITY_KEYS[number]>;
 

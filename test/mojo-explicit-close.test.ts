@@ -20,7 +20,7 @@ import { activeSessionKey, type DaemonSession } from '../src/core/types.js';
 
 const { getBotMock, cancelMojoMock } = vi.hoisted(() => ({
   getBotMock: vi.fn(),
-  cancelMojoMock: vi.fn(async () => true),
+  cancelMojoMock: vi.fn(async () => ({ kind: 'cancelled' as const })),
 }));
 
 vi.mock('../src/bot-registry.js', () => ({
@@ -133,7 +133,7 @@ beforeEach(() => {
     resolvedAllowedUsers: [],
     config: { mojo: { cloud: true } },
   });
-  cancelMojoMock.mockResolvedValue(true);
+  cancelMojoMock.mockResolvedValue({ kind: 'cancelled' });
   initWorkerPool({
     sessionReply: vi.fn(async () => 'om_reply'),
     getSessionWorkingDir: () => '/repo',
@@ -169,7 +169,7 @@ describe('mojo explicit close', () => {
   it('does NOT report success when the cancel fails; row and lineage survive', async () => {
     // The whole point: the operator must not be told the session is gone while the
     // remote one keeps running with the injected credential.
-    cancelMojoMock.mockResolvedValue(false);
+    cancelMojoMock.mockResolvedValue({ kind: 'failed', message: 'HTTP 500', retryable: true });
     const fixture = createFixture();
 
     expect(await closeSession(fixture.session.sessionId)).toEqual({
@@ -190,12 +190,12 @@ describe('mojo explicit close', () => {
   it('a retry after a failed cancel actually reaches the cancel again', async () => {
     // The regression this suite exists for: the old path closed the row on the
     // first attempt, so nothing could ever retry the cancel.
-    cancelMojoMock.mockResolvedValue(false);
+    cancelMojoMock.mockResolvedValue({ kind: 'failed', message: 'HTTP 500', retryable: true });
     const fixture = createFixture();
     expect((await closeSession(fixture.session.sessionId)).ok).toBe(false);
     expect(cancelMojoMock).toHaveBeenCalledTimes(1);
 
-    cancelMojoMock.mockResolvedValue(true);
+    cancelMojoMock.mockResolvedValue({ kind: 'cancelled' });
     expect(await closeSession(fixture.session.sessionId)).toEqual({
       ok: true,
       alreadyClosed: false,

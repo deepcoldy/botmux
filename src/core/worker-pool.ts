@@ -37,6 +37,7 @@ import {
   diffMojoSessionIdentity,
   MOJO_IDENTITY_KEYS,
   pickMojoLivePatch,
+  isMojoRemoteGone,
   pickMojoSessionIdentity,
   type EffectiveMojoConfig,
   type MojoConfig,
@@ -2705,8 +2706,10 @@ function destroyOrphanedBackingSession(
     // Clear the lineage ONLY once the remote session is really gone. This used to
     // clear unconditionally right after firing, so a failed cancel erased the only
     // id — the exact leak master's riff change above calls out.
-    void cancelMojoSessionById(resolved.launchCfg, remoteId).then((ok) => {
-      if (!ok) {
+    void cancelMojoSessionById(resolved.launchCfg, remoteId).then((outcome) => {
+      // Structured outcome, not a boolean — `if (!outcome)` would be always-false
+      // and silently treat every failure as a success (an object is truthy).
+      if (!isMojoRemoteGone(outcome)) {
         logger.warn(
           `[${tag(ds)}] killWorker: orphan mojo session ${remoteId} NOT cancelled; `
           + 'retaining the lineage — note nothing retries this automatically, so an '
@@ -3076,11 +3079,15 @@ async function prepareMojoExplicitClose(
     return { ok: true };
   }
 
-  const cancelled = await cancelMojoSessionById(resolved.launchCfg, remoteId);
-  if (!cancelled) {
+  const outcome = await cancelMojoSessionById(resolved.launchCfg, remoteId);
+  // Structured, NOT a boolean: `if (!outcome)` on an object is always false and
+  // would turn every failure into a silent success. `already_terminal` counts as
+  // gone, but only when the classifier could PROVE it (see MojoCancelOutcome).
+  if (!isMojoRemoteGone(outcome)) {
     logger.warn(
       `[${tag(ds)}] explicit close refused: mojo session ${remoteId} could not be `
-      + 'cancelled; the row stays open and the lineage is retained so the close is retryable',
+      + 'cancelled; the row stays open and the lineage is retained so the close is retryable'
+      + (outcome.kind === 'failed' ? ` (${outcome.message})` : ''),
     );
     return { ok: false, error: 'mojo_cancel_failed', retryable: true, taskId: remoteId };
   }

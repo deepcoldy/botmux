@@ -21,6 +21,7 @@ vi.mock('../src/utils/logger.js', () => ({
 }));
 
 import { cancelMojoSessionById } from '../src/adapters/backend/mojo-backend.js';
+import { isMojoRemoteGone } from '../src/adapters/backend/mojo-types.js';
 import { buildEffectiveMojoConfig } from '../src/adapters/backend/mojo-types.js';
 
 let root: string;
@@ -153,9 +154,9 @@ describe('workerless orphan cancel', () => {
         workingDir: root,
         env: { X_JWT_TOKEN: 'per-bot-jwt', PER_BOT_TOKEN: 'per-bot-value' },
       });
-      const ok = await cancelMojoSessionById(cfg, 'sid-orphan-1');
+      const outcome = await cancelMojoSessionById(cfg, 'sid-orphan-1');
 
-      expect(ok).toBe(true);
+      expect(outcome).toEqual({ kind: 'cancelled' });
       expect(existsSync(dump)).toBe(true);
       const d = readDump(dump);
       // The pinned binary ran — not a bare `mojo` off PATH.
@@ -187,8 +188,8 @@ describe('workerless orphan cancel', () => {
       // The daemon has no worker to resolve the prefix, so the backend resolves it
       // from the config itself — otherwise a wrapper-dependent setup (a gateway
       // injecting auth, say) would be unreachable exactly at teardown.
-      const ok = await cancelMojoSessionById(cfg, 'sid-orphan-2');
-      expect(ok).toBe(true);
+      const outcome = await cancelMojoSessionById(cfg, 'sid-orphan-2');
+      expect(outcome).toEqual({ kind: 'cancelled' });
       const d = readDump(dump);
       expect(d.argv).toEqual(['session', 'cancel', 'sid-orphan-2']);
       expect(d.env.WRAPPER_MARK).toBe('wrapped');
@@ -218,8 +219,8 @@ describe('workerless orphan cancel', () => {
       );
       expect(cfg.wrapperCli).toBeUndefined();
 
-      const ok = await cancelMojoSessionById(cfg, 'sid-orphan-4');
-      expect(ok).toBe(true);
+      const outcome = await cancelMojoSessionById(cfg, 'sid-orphan-4');
+      expect(outcome).toEqual({ kind: 'cancelled' });
       expect(readDump(dump).env.WRAPPER_MARK).toBeUndefined();
     } finally {
       process.env.PATH = pathBefore;
@@ -228,11 +229,15 @@ describe('workerless orphan cancel', () => {
   }, 30_000);
 
   it('reports failure (and does not throw) when the binary is missing', async () => {
-    const ok = await cancelMojoSessionById(
+    const outcome = await cancelMojoSessionById(
       { bin: join(root, 'definitely-not-here') },
       'sid-orphan-3',
     );
-    // Best-effort by design: a dead session must not crash daemon teardown.
-    expect(ok).toBe(false);
+    // Must not throw (daemon teardown runs this), and must NOT be reported as
+    // gone: an unreachable binary proves nothing about the remote session, so it
+    // has to fail closed and stay retryable.
+    expect(outcome.kind).toBe('failed');
+    expect(isMojoRemoteGone(outcome)).toBe(false);
+    if (outcome.kind === 'failed') expect(outcome.retryable).toBe(true);
   }, 30_000);
 });

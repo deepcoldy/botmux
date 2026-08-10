@@ -52,11 +52,12 @@ import type { Readable } from 'node:stream';
 import { locateOnPath } from '../cli/registry.js';
 import { buildWrappedLaunch } from '../../setup/cli-selection.js';
 import { logger } from '../../utils/logger.js';
-import type { SessionBackend, SpawnOpts } from './types.js';
+import type { SessionBackend, SessionDestroyResult, SpawnOpts } from './types.js';
 import {
     buildEffectiveChildEnv,
     findReservedMojoCliFlags,
     mojoRemoteProofFailureReason,
+    isMojoRemoteGone,
     MOJO_CANONICAL_JWT_ENV_KEY,
     MOJO_CONTROL_ENV_KEYS,
 } from './mojo-types.js';
@@ -66,6 +67,7 @@ import type {
     EffectiveMojoConfig,
     MojoCliEnvelope,
     MojoError,
+    MojoCancelOutcome,
     MojoLineStyle,
     MojoStreamEvent,
 } from './mojo-types.js';
@@ -468,7 +470,7 @@ export class MojoBackend implements SessionBackend {
 
     /** /close teardown — cancel the server-side session so it stops consuming
      *  cloud sandbox time after the IM session is gone. */
-    async destroySession(): Promise<void> {
+    async destroySession(): Promise<SessionDestroyResult> {
         // Gate FIRST so no new turn is accepted, then let the in-flight one settle
         // before tearing anything down. Killing the child here (as this used to)
         // destroyed the only source of the lineage: cliSessionId is adopted from
@@ -490,15 +492,48 @@ export class MojoBackend implements SessionBackend {
         this.child?.kill('SIGTERM');
         this.child = null;
         if (this.cliSessionId) {
+            let outcome: MojoCancelOutcome;
             try {
                 await this.runCliJson(['session', 'cancel', this.cliSessionId]);
+                outcome = { kind: 'cancelled' };
                 logger.info(`[mojo] cancelled session ${this.cliSessionId}`);
             } catch (err: unknown) {
-                // Best-effort: a completed session cannot be cancelled and that is fine.
+                outcome = classifyMojoCancelFailure(err);
                 logger.warn(`[mojo] session cancel failed: ${String(err)}`);
+            }
+            if (!isMojoRemoteGone(outcome)) {
+                // Report it instead of swallowing it. This used to return void on
+                // every path, so the worker ACKed a "successful" close and the
+                // daemon published a closed row while the remote session kept
+                // running and holding the injected credential.
+                //
+                // `killed` deliberately stays false: the session was NOT torn down,
+                // and abortDestroySession() must be able to restore admission.
+                this.closing = false;
+                return {
+                    ok: false,
+                    taskId: this.cliSessionId,
+                    error: outcome.kind === 'failed' ? outcome.message : 'cancel not proven',
+                };
             }
         }
         this.killed = true;
+        return { ok: true, ...(this.cliSessionId ? { taskId: this.cliSessionId } : {}) };
+    }
+
+    /**
+     * Roll back a FAILED prepare (restore write admission).
+     *
+     * Only valid when the cancel did not succeed. A proven cancel is irreversible:
+     * the remote session is gone, so restoring admission would produce a session
+     * that looks active but can never continue.
+     */
+    abortDestroySession(): void {
+        if (this.killed) {
+            logger.warn('[mojo] abortDestroySession ignored: session was already torn down');
+            return;
+        }
+        this.closing = false;
     }
 
     // ── One turn ─────────────────────────────────────────────────────────────
@@ -967,6 +1002,23 @@ export class MojoBackend implements SessionBackend {
 }
 
 /**
+ * Classify a failed `session cancel` into the outcome model.
+ *
+ * Currently ALWAYS `failed`. Distinguishing "the session had already finished"
+ * from "cancellation is broken" requires the real @byted/mojo error codes/states,
+ * which are not calibrated yet — and guessing from stderr text is precisely the
+ * mistake that made the old boolean ambiguous. Failing closed here means a close
+ * refuses rather than silently claiming a still-running session is gone.
+ *
+ * When the codes ARE calibrated (needs intranet CLI + a real JWT), this is the one
+ * place that changes: return `already_terminal` with the matched code as evidence.
+ */
+function classifyMojoCancelFailure(err: unknown): MojoCancelOutcome {
+    const message = err instanceof Error ? err.message : String(err);
+    return { kind: 'failed', message, retryable: true };
+}
+
+/**
  * Cancel a mojo session by id WITHOUT a live backend instance.
  *
  * The daemon needs this on the workerless `/close` path: the worker is already
@@ -974,13 +1026,13 @@ export class MojoBackend implements SessionBackend {
  * session must stop consuming cloud sandbox time (and stop an agent that may
  * still hold injected credentials). Mirrors `cancelRiffTaskById`.
  *
- * Best-effort with one retry; a session that already completed cannot be
- * cancelled and that is not an error worth surfacing.
+ * One retry, then a STRUCTURED outcome — see MojoCancelOutcome for why this is no
+ * longer a boolean.
  */
 export async function cancelMojoSessionById(
     config: EffectiveMojoConfig,
     sessionId: string,
-): Promise<boolean> {
+): Promise<MojoCancelOutcome> {
     // Reuse the instance's CLI plumbing (env layering, JSON envelope parsing,
     // timeout) rather than duplicating spawn logic here. The sentinel session id
     // is only used for logging.
@@ -990,16 +1042,17 @@ export async function cancelMojoSessionById(
     };
     try {
         await attempt();
-        return true;
+        return { kind: 'cancelled' };
     } catch {
         try {
             await attempt();
-            return true;
+            return { kind: 'cancelled' };
         } catch (err: unknown) {
+            const outcome = classifyMojoCancelFailure(err);
             logger.warn(
                 `[mojo] orphan session cancel failed (session ${sessionId} may keep running remotely): ${String(err)}`,
             );
-            return false;
+            return outcome;
         }
     }
 }
