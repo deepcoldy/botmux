@@ -213,6 +213,11 @@ export interface DaemonSession {
   streamCardId?: string;         // message_id of the streaming card in group (PATCHed with live output)
   streamCardNonce?: string;       // unique nonce for the current streaming card — embedded in button values to distinguish old vs current card
   streamCardPending?: boolean;    // true when a new turn started, next screen_update creates a new card
+  /** Monotonic in-memory generation for accepted user turns. Card POST
+   * completions use it to avoid clearing a newer turn's pending state. */
+  streamCardTurnGeneration?: number;
+  /** Exact newest turn awaiting its own streaming card. In-memory only. */
+  streamCardPendingTurnId?: string;
   pendingLocalCliButtonRefresh?: boolean; // true when cli_session_id arrived while the streaming card POST was in flight
   pendingRiffUrlCardRefresh?: boolean; // true when riff_access_url arrived while the streaming card POST was in flight
   /** Set on sessions restored after a daemon restart: suppresses the automatic

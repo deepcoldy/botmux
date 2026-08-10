@@ -113,6 +113,7 @@ import {
   recallFrozenCards,
   parkStreamCard,
   postFreshStreamingCard,
+  postTurnStartingCard,
   restoreUsageLimitRuntimeState,
   scheduleCardPatch,
   usageRefreshShouldRun,
@@ -443,6 +444,83 @@ describe('receiver streaming card boundary', () => {
     await expect(postFreshStreamingCard(ds, sessionReply)).resolves.toBe(false);
     expect(sessionReply).not.toHaveBeenCalled();
     expect(buildStreamingCard).not.toHaveBeenCalled();
+  });
+});
+
+describe('postTurnStartingCard', () => {
+  it('posts a new-turn card immediately without waiting for screen_update', async () => {
+    const ds = makeDs();
+    ds.workerReady = true;
+    ds.streamCardId = 'om_previous';
+    ds.streamCardNonce = 'nonce_previous';
+    ds.streamCardPending = true;
+    ds.streamCardTurnGeneration = 1;
+    ds.streamCardPendingTurnId = 'om_turn_1';
+    ds.currentTurnTitle = 'first turn';
+    const sessionReply = vi.fn(async () => 'om_turn_card_1');
+
+    await expect(postTurnStartingCard(ds, sessionReply, 'om_turn_1')).resolves.toBe(true);
+
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+    expect(sessionReply.mock.calls[0][4]).toBe('om_turn_1');
+    expect(ds.streamCardId).toBe('om_turn_card_1');
+    expect(ds.streamCardPending).toBe(false);
+    expect(ds.streamCardPendingTurnId).toBeUndefined();
+  });
+
+  it('posts the newest queued turn after an older card POST finishes', async () => {
+    let resolveFirst!: (messageId: string) => void;
+    const sessionReply = vi.fn()
+      .mockImplementationOnce(() => new Promise<string>(resolve => { resolveFirst = resolve; }))
+      .mockResolvedValueOnce('om_turn_card_2');
+    const ds = makeDs();
+    ds.workerReady = true;
+    ds.streamCardId = 'om_previous';
+    ds.streamCardNonce = 'nonce_previous';
+    ds.streamCardPending = true;
+    ds.streamCardTurnGeneration = 1;
+    ds.streamCardPendingTurnId = 'om_turn_1';
+    ds.currentTurnTitle = 'first turn';
+
+    const firstPost = postTurnStartingCard(ds, sessionReply, 'om_turn_1');
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+
+    ds.streamCardTurnGeneration = 2;
+    ds.streamCardPendingTurnId = 'om_turn_2';
+    ds.currentTurnTitle = 'second turn';
+    await expect(postTurnStartingCard(ds, sessionReply, 'om_turn_2')).resolves.toBe(false);
+
+    resolveFirst('om_turn_card_1');
+    await firstPost;
+    await flush();
+    await flush();
+
+    expect(sessionReply).toHaveBeenCalledTimes(2);
+    expect(sessionReply.mock.calls[1][4]).toBe('om_turn_2');
+    expect(ds.streamCardId).toBe('om_turn_card_2');
+    expect(ds.streamCardPending).toBe(false);
+    expect(ds.streamCardPendingTurnId).toBeUndefined();
+    expect(deleteMessageMock).toHaveBeenCalledWith(APP_ID, 'om_turn_card_1');
+  });
+
+  it('restores the previous live card when the starting-card POST fails', async () => {
+    const ds = makeDs();
+    ds.workerReady = true;
+    ds.streamCardId = 'om_previous';
+    ds.streamCardNonce = 'nonce_previous';
+    ds.streamCardPending = true;
+    ds.streamCardTurnGeneration = 1;
+    ds.streamCardPendingTurnId = 'om_turn_1';
+    ds.currentTurnTitle = 'first turn';
+    const sessionReply = vi.fn(async () => { throw new Error('network unavailable'); });
+
+    await expect(postTurnStartingCard(ds, sessionReply, 'om_turn_1')).resolves.toBe(false);
+
+    expect(ds.streamCardId).toBe('om_previous');
+    expect(ds.streamCardNonce).toBe('nonce_previous');
+    expect(ds.streamCardPending).toBe(true);
+    expect(ds.streamCardPendingTurnId).toBe('om_turn_1');
+    expect(deleteMessageMock).not.toHaveBeenCalled();
   });
 });
 
