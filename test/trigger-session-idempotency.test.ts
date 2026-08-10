@@ -77,6 +77,7 @@ beforeEach(() => {
   process.env.SESSION_DATA_DIR = tempDir;
   sessionRows.clear();
   mockCloseSession.mockClear();
+  mockBackgroundClose.mockClear();
 });
 afterEach(() => {
   vi.restoreAllMocks(); // guarantee any listAllForOwner/etc spy is undone even if an assertion threw
