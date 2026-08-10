@@ -135,7 +135,8 @@ vi.mock('../src/services/project-scanner.js', async () => {
   return { ...actual, scanMultipleProjects: mocks.scanMultipleProjects };
 });
 
-vi.mock('../src/services/project-scanner-async.js', () => ({
+vi.mock('../src/services/project-scanner-async.js', async (importOriginal) => ({
+  ...(await importOriginal<Record<string, unknown>>()),
   scanMultipleProjectsAsync: (...args: any[]) => mocks.scanMultipleProjectsAsync(...args),
 }));
 

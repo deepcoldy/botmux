@@ -137,6 +137,32 @@ describe('resolveRepoSelection', () => {
     }
   });
 
+  it('runs the direct-candidate stat + git describe off the daemon loop too (fully child-isolated)', async () => {
+    // The direct-candidate fast-path also does synchronous fs/git — statSync +
+    // describeProjectDir (which shells out to `git describe --tags`, a 2-6s
+    // hotspot on huge-tag repos). On a hung mount even a single statSync locks
+    // the event loop before any watchdog child starts. Assert NONE of the
+    // synchronous scanner / describe runs in the parent for a direct hit; the
+    // resolver delegates the whole resolution to the isolated child.
+    const repo = join(scanDir, 'payments');
+    mkdirSync(repo);
+    gitInit(repo, 'main');
+    const syncScan = vi.spyOn(projectScanner, 'scanMultipleProjects');
+    const syncDescribe = vi.spyOn(projectScanner, 'describeProjectDir');
+
+    try {
+      const r = await resolveRepoSelection('payments', [scanDir]);
+      expect(r).not.toBeNull();
+      expect(realpathSync(r!.path)).toBe(repo);
+      expect(r!.displayName).toBe('payments (main)');
+      expect(syncScan).not.toHaveBeenCalled();
+      expect(syncDescribe).not.toHaveBeenCalled();
+    } finally {
+      syncScan.mockRestore();
+      syncDescribe.mockRestore();
+    }
+  });
+
   it('falls back to a plain (non-git) directory with a basename label', async () => {
     const plain = join(scanDir, 'plaindir');
     mkdirSync(plain);

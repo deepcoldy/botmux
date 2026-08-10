@@ -5,10 +5,19 @@ import { fileURLToPath } from 'node:url';
 import type { ProjectInfo, ProjectScanOptions } from './project-scanner.js';
 
 interface ScanRequest {
+  kind?: 'scan';
   baseDirs: string[];
   maxDepth: number;
   options: ProjectScanOptions;
 }
+
+interface ResolveRequest {
+  kind: 'resolve';
+  repoArg: string;
+  scanDirs: string[];
+}
+
+type ChildRequest = ScanRequest | ResolveRequest;
 
 // A scan child that loads and then wedges on a synchronous fs call (hung NFS
 // mount, pathological directory tree — exactly the slow-scan case this async
@@ -37,6 +46,12 @@ type ScanResponse =
   | { ok: true; projects: ProjectInfo[] }
   | { ok: false; error: string };
 
+type ResolveResponse =
+  | { ok: true; resolved: { path: string; displayName: string } | null }
+  | { ok: false; error: string };
+
+type ChildResponse = ScanResponse | ResolveResponse;
+
 function childEntryPoint(): { path: string; execArgv: string[] } {
   // Test/override seam: point the scanner at an alternate child entry (e.g. a
   // deliberately-hanging script) to exercise the timeout path without waiting on
@@ -53,14 +68,14 @@ function childEntryPoint(): { path: string; execArgv: string[] } {
   };
 }
 
-function runScan(request: ScanRequest): Promise<ProjectInfo[]> {
-  return new Promise((resolve, reject) => {
+function runChild(request: ChildRequest): Promise<ChildResponse> {
+  return new Promise((resolvePromise, reject) => {
     const entryPoint = childEntryPoint();
     const child = fork(entryPoint.path, [], {
       execArgv: entryPoint.execArgv,
       stdio: ['ignore', 'ignore', 'ignore', 'ipc'],
     });
-    let response: ScanResponse | undefined;
+    let response: ChildResponse | undefined;
     let failure: Error | undefined;
 
     // The parent OWNS settlement — it must never depend on the child's 'close'
@@ -90,7 +105,7 @@ function runScan(request: ScanRequest): Promise<ProjectInfo[]> {
       } else if (!response.ok) {
         reject(new Error(response.error));
       } else {
-        resolve(response.projects);
+        resolvePromise(response);
       }
     };
 
@@ -114,7 +129,7 @@ function runScan(request: ScanRequest): Promise<ProjectInfo[]> {
     // already gone, so the pending reap timer — if any — is unnecessary. Clear it
     // only on the child's own 'close', never as part of settle().
     child.once('message', (message) => {
-      response = message as ScanResponse;
+      response = message as ChildResponse;
       settle();
     });
     child.once('error', (error) => {
@@ -147,19 +162,48 @@ function runScan(request: ScanRequest): Promise<ProjectInfo[]> {
   });
 }
 
+// Every child scan/resolve is globally serialized: the fork + IPC + recursive
+// git work is heavy, and serializing bounds concurrent load. A wedged child no
+// longer poisons the queue because runChild is parent-settled (see above).
 let scanQueue: Promise<void> = Promise.resolve();
 
-export function scanMultipleProjectsAsync(
+function enqueueChild(request: ChildRequest): Promise<ChildResponse> {
+  const result = scanQueue.then(() => runChild(request));
+  scanQueue = result.then(() => undefined, () => undefined);
+  return result;
+}
+
+export async function scanMultipleProjectsAsync(
   baseDirs: string[],
   maxDepth: number = 3,
   options: ProjectScanOptions = {},
 ): Promise<ProjectInfo[]> {
   const request: ScanRequest = {
+    kind: 'scan',
     baseDirs: [...baseDirs],
     maxDepth,
     options: { ...options },
   };
-  const result = scanQueue.then(() => runScan(request));
-  scanQueue = result.then(() => undefined, () => undefined);
-  return result;
+  const response = await enqueueChild(request);
+  return 'projects' in response ? response.projects : [];
+}
+
+/**
+ * Resolve `/repo <name|path>` entirely inside the isolated child: the candidate
+ * `statSync`, the `git describe`/ref lookups behind describeProjectDir, AND the
+ * recursive basename scan all run off the daemon event loop. This closes the
+ * gap where the direct-candidate fast-path still touched (possibly hung) fs/git
+ * synchronously on the main loop.
+ */
+export async function resolveRepoSelectionAsync(
+  repoArg: string,
+  scanDirs: string[],
+): Promise<{ path: string; displayName: string } | null> {
+  const request: ResolveRequest = {
+    kind: 'resolve',
+    repoArg,
+    scanDirs: [...scanDirs],
+  };
+  const response = await enqueueChild(request);
+  return 'resolved' in response ? response.resolved : null;
 }

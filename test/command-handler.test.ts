@@ -175,22 +175,59 @@ vi.mock('../src/core/scheduler.js', () => ({
 
 const scanMocks = vi.hoisted(() => ({
   scanMultipleProjects: vi.fn(() => [] as unknown[]),
+  describeProjectDir: vi.fn((_dir: string) => null as { name: string; branch: string } | null),
 }));
 
 vi.mock('../src/services/project-scanner.js', () => ({
   scanProjects: vi.fn(() => []),
   scanMultipleProjects: scanMocks.scanMultipleProjects,
-  describeProjectDir: vi.fn(() => null),
+  describeProjectDir: scanMocks.describeProjectDir,
 }));
 
 // The `/repo` picker and bare-name resolution now scan through the isolated
 // async child scanner (so a slow/hung mount can't wedge the daemon). Route the
-// async mock's results through the same sync mock the tests configure, so the
-// existing `scanMultipleProjects` expectations keep describing scan behavior.
-vi.mock('../src/services/project-scanner-async.js', () => ({
-  scanMultipleProjectsAsync: vi.fn(async (...args: unknown[]) =>
-    scanMocks.scanMultipleProjects(...(args as []))),
-}));
+// async mock's results through the same sync mocks the tests configure, so the
+// existing scanMultipleProjects/describeProjectDir expectations keep describing
+// behavior. resolveRepoSelectionAsync mirrors the child's resolution algorithm
+// against those mocks (real fs primitives are mocked at node:fs).
+vi.mock('../src/services/project-scanner-async.js', async (importOriginal) => {
+  const nodePath = await import('node:path');
+  const nodeFs = await import('node:fs');
+  const workingDir = await import('../src/core/working-dir.js');
+  return {
+    ...(await importOriginal<Record<string, unknown>>()),
+    scanMultipleProjectsAsync: vi.fn(async (...args: unknown[]) =>
+      scanMocks.scanMultipleProjects(...(args as []))),
+    resolveRepoSelectionAsync: vi.fn(async (repoArg: string, scanDirs: string[]) => {
+      const isExplicitPath = repoArg.startsWith('/') || repoArg.startsWith('~')
+        || repoArg.startsWith('.') || repoArg.includes('/');
+      const candidates: string[] = [];
+      if (repoArg.startsWith('/') || repoArg.startsWith('~')) {
+        candidates.push(nodePath.resolve(workingDir.expandHome(repoArg)));
+      } else {
+        for (const d of scanDirs) candidates.push(nodePath.resolve(d, repoArg));
+        candidates.push(nodePath.resolve(workingDir.expandHome(repoArg)));
+      }
+      for (const cand of candidates) {
+        try {
+          if (!nodeFs.statSync(cand).isDirectory()) continue;
+        } catch {
+          continue;
+        }
+        const desc = scanMocks.describeProjectDir(cand);
+        return desc
+          ? { path: cand, displayName: `${desc.name} (${desc.branch})` }
+          : { path: cand, displayName: nodePath.basename(cand) };
+      }
+      if (isExplicitPath) return null;
+      const projects = scanDirs.length > 0
+        ? (scanMocks.scanMultipleProjects(scanDirs) as Array<{ name: string; branch: string; path: string }>)
+        : [];
+      const byName = projects.find((p) => p.name === repoArg);
+      return byName ? { path: byName.path, displayName: `${byName.name} (${byName.branch})` } : null;
+    }),
+  };
+});
 
 vi.mock('../src/services/git-worktree.js', () => ({
   createRepoWorktree: vi.fn(),

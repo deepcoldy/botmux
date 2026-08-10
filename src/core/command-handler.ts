@@ -12,7 +12,7 @@ import * as sessionStore from '../services/session-store.js';
 import * as scheduleStore from '../services/schedule-store.js';
 import * as scheduler from './scheduler.js';
 import { scanProjects, describeProjectDir } from '../services/project-scanner.js';
-import { scanMultipleProjectsAsync } from '../services/project-scanner-async.js';
+import { scanMultipleProjectsAsync, resolveRepoSelectionAsync } from '../services/project-scanner-async.js';
 import { createRepoWorktree, pushWorktreeBranch } from '../services/git-worktree.js';
 import { worktreeSlugFromContextAI } from '../services/worktree-slug-ai.js';
 import { isRiffBackendSession, resolvePairedSpawnBackendType } from './persistent-backend.js';
@@ -227,51 +227,13 @@ export async function resolveRepoSelection(
   repoArg: string,
   scanDirs: string[],
 ): Promise<{ path: string; displayName: string } | null> {
-  const isExplicitPath =
-    repoArg.startsWith('/') ||
-    repoArg.startsWith('~') ||
-    repoArg.startsWith('.') ||
-    repoArg.includes('/');
-
-  const candidates: string[] = [];
-  if (repoArg.startsWith('/') || repoArg.startsWith('~')) {
-    candidates.push(resolve(expandHome(repoArg)));
-  } else {
-    for (const d of scanDirs) candidates.push(resolve(d, repoArg));
-    candidates.push(resolve(expandHome(repoArg))); // daemon-cwd fallback (matches /cd)
-  }
-
-  // Direct candidates must win before any recursive scan. Besides avoiding
-  // unnecessary traversal (especially a legacy HOME fallback), describing just
-  // the selected directory preserves the same "name (branch)" label for repos.
-  for (const cand of candidates) {
-    try {
-      if (!statSync(cand).isDirectory()) continue;
-    } catch {
-      continue; // missing / not a dir — try next candidate
-    }
-    const desc = describeProjectDir(cand);
-    return desc
-      ? { path: cand, displayName: `${desc.name} (${desc.branch})` }
-      : { path: cand, displayName: basename(cand) };
-  }
-
-  // Explicit and relative paths have no basename-search semantics: when their
-  // concrete candidates do not exist, a recursive project scan cannot resolve
-  // them. Bare names alone may refer to a repo nested below a scan root.
-  if (isExplicitPath) return null;
-
-  // The bare-name basename search recurses through every scan root. Run it in
-  // the isolated, watchdog-bounded child scanner instead of a synchronous
-  // traversal on the daemon event loop — otherwise `/repo <name>` (which the
-  // scan-failure recovery text itself suggests) would reintroduce the exact
-  // whole-daemon hang this async subsystem exists to eliminate.
-  const existingScanDirs = scanDirs.filter((d) => existsSync(d));
-  const projects = existingScanDirs.length > 0 ? await scanMultipleProjectsAsync(existingScanDirs) : [];
-  const byName = projects.find((p) => p.name === repoArg);
-  if (byName) return { path: byName.path, displayName: `${byName.name} (${byName.branch})` };
-
-  return null;
+  // The whole resolution — candidate statSync, the git describe/ref lookups
+  // behind describeProjectDir, AND the recursive basename scan — runs in the
+  // isolated, watchdog-bounded child scanner. None of it touches the daemon
+  // event loop, so a hung mount / slow-git repo (the exact hazard this PR
+  // targets) cannot wedge the daemon here, no matter which candidate path or
+  // fallback the resolution takes.
+  return resolveRepoSelectionAsync(repoArg, scanDirs);
 }
 
 /**
