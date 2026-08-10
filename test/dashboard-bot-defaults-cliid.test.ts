@@ -208,9 +208,7 @@ describe('Codex-compatible runtime editor', () => {
     }
   });
 
-  it('warns (and drops the green tick) when the sweep left residual/failed sessions', async () => {
-    // "closed N" alone reported rows that are still active, and remote sessions
-    // that are still running, as fully torn down.
+  async function saveAgentWithSweep(body: Record<string, unknown>) {
     const previousFetch = globalThis.fetch;
     (globalThis as any).fetch = vi.fn(async () => ({
       ok: true,
@@ -223,12 +221,9 @@ describe('Codex-compatible runtime editor', () => {
         wrapperCli: null,
         model: '',
         selectionKey: 'codex',
-        closedMismatchedSessions: 3,
-        closedMismatchedResidual: 2,
-        closedMismatchedFailed: 1,
+        ...body,
       }),
     } as any));
-
     try {
       const { root } = renderAgent({ cliId: 'codex' });
       await act(async () => {
@@ -236,16 +231,55 @@ describe('Codex-compatible runtime editor', () => {
         await Promise.resolve();
         await Promise.resolve();
       });
-
       const status = root.findByProps({ 'data-agent-status': '' });
-      const text = status.children.join('');
-      // Both problems surfaced, and no green success marker.
-      expect(text).toContain('⚠️');
-      expect(text).not.toContain('✓');
-      expect(status.props.status?.ok).not.toBe(true);
+      return { text: status.children.join(''), className: String(status.props.className ?? '') };
     } finally {
       (globalThis as any).fetch = previousFetch;
     }
+  }
+
+  it('warns about RESIDUAL sessions on their own (remote not cancelled)', async () => {
+    // Proven separately from `failed`: a combined payload would stay green if
+    // only one of the two branches existed.
+    const { text, className } = await saveAgentWithSweep({
+      closedMismatchedSessions: 3,
+      closedMismatchedResidual: 2,
+      closedMismatchedFailed: 0,
+    });
+
+    expect(text).toContain('2');
+    // Localised residual copy, not the failure copy.
+    expect(text).toContain('远端会话未取消');
+    expect(text).not.toContain('关闭失败');
+    expect(text).not.toContain('✓');
+    expect(className).toContain('hint-warn-inline');
+    expect(className).not.toContain('hint-ok');
+  });
+
+  it('warns about FAILED closes on their own (rows still active)', async () => {
+    const { text, className } = await saveAgentWithSweep({
+      closedMismatchedSessions: 1,
+      closedMismatchedResidual: 0,
+      closedMismatchedFailed: 4,
+    });
+
+    expect(text).toContain('4');
+    expect(text).toContain('关闭失败');
+    expect(text).not.toContain('远端会话未取消');
+    expect(text).not.toContain('✓');
+    expect(className).toContain('hint-warn-inline');
+    expect(className).not.toContain('hint-ok');
+  });
+
+  it('keeps the green tick when the sweep was completely clean', async () => {
+    const { text, className } = await saveAgentWithSweep({
+      closedMismatchedSessions: 2,
+      closedMismatchedResidual: 0,
+      closedMismatchedFailed: 0,
+    });
+
+    expect(text).toContain('✓');
+    expect(className).toContain('hint-ok');
   });
 
   it('explicitly clears a legacy path and reports sessions closed by the runtime switch', async () => {
