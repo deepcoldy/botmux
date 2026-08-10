@@ -759,14 +759,30 @@ function herdrPaneCliProcess(
     // reporting a live Pi pane as exited.
     const argv0 = typeof proc?.argv0 === 'string' ? proc.argv0 : undefined;
     const effectiveArgv = argv.length > 0 ? argv : argv0 ? [argv0] : [];
-    const cliId = cliIdFromCommArgv(
+    const pid = Number(proc?.pid);
+    const pidMatches = Number.isInteger(pid) && pid > 0 && (!expectedPid || pid === expectedPid);
+    let cliId = cliIdFromCommArgv(
       typeof proc?.name === 'string' ? proc.name : undefined,
       effectiveArgv,
       filterCliId,
       filterExecutable,
     );
-    const pid = Number(proc?.pid);
-    if (cliId && Number.isInteger(pid) && pid > 0 && (!expectedPid || pid === expectedPid)) {
+    // Herdr's `name` is the basename of the RESOLVED executable, so a CLI shipped
+    // as a version-named binary behind a stable symlink reports the version, not
+    // the CLI name — Claude Code 2.x installs `~/.local/bin/claude` as a symlink
+    // to `~/.local/share/claude/versions/2.1.224`, and herdr reports
+    // `name:"2.1.224"` for it. No CLI_COMM_MAP entry matches that, and the argv
+    // fallback only fires for COMM_ARGV_LAUNCHERS (node/python/…), so the
+    // `argv:["claude"]` sitting right beside it is never consulted. Discovery
+    // still lists the pane (agent-list reports `agent:"claude"`) while adopt
+    // revalidation resolves nothing → the pane is wrongly reported as exited.
+    // Our own readComm goes through /proc/<pid>/comm (Linux) or `ps -o comm=`
+    // (macOS), both of which keep the symlink name, so retry with it.
+    if (!cliId && pidMatches) {
+      const comm = readComm(pid);
+      if (comm) cliId = cliIdFromCommArgv(comm, effectiveArgv, filterCliId, filterExecutable);
+    }
+    if (cliId && pidMatches) {
       return { pid, cliId, cwd: typeof proc?.cwd === 'string' ? proc.cwd : undefined };
     }
   }

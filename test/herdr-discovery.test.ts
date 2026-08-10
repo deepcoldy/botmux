@@ -100,6 +100,56 @@ describe('validateHerdrAdoptTarget', () => {
     expect(validateHerdrAdoptTarget('sess', 'pane-1', 3333, 'claude-code')).toBe('missing');
   });
 
+  it('falls back to the pane process comm when herdr reports a version-named binary', () => {
+    // Claude Code 2.x installs `~/.local/bin/claude` as a symlink to
+    // `~/.local/share/claude/versions/<version>`, and herdr's `name` is the
+    // basename of the RESOLVED executable — so it reports `2.1.224`, which no
+    // CLI_COMM_MAP entry matches. The argv fallback in cliIdFromCommArgv only
+    // fires for COMM_ARGV_LAUNCHERS (node/python/…), so `argv:["claude"]` is
+    // never consulted either. agent-list discovery still lists the pane, so
+    // without the comm fallback revalidation wrongly reports "exited".
+    mockExecFileSync
+      .mockReturnValueOnce(
+        JSON.stringify({ result: { agents: [{ pane_id: 'pane-1', agent: '/usr/bin/claude' }] } }) as any,
+      )
+      .mockReturnValueOnce(JSON.stringify({
+        result: {
+          process_info: {
+            foreground_processes: [{ pid: 4242, name: '2.1.224', argv: ['claude'] }],
+          },
+        },
+      }) as any);
+    // readComm on Linux reads /proc/<pid>/comm, which keeps the symlink name.
+    mockReadFileSync.mockImplementation(((path: unknown) => {
+      if (String(path) === '/proc/4242/comm') return 'claude\n';
+      throw new Error('ENOENT');
+    }) as any);
+
+    expect(validateHerdrAdoptTarget('sess', 'pane-1', 4242, 'claude-code')).toBe('alive');
+  });
+
+  it('keeps the cliId filter honoured on the comm fallback path', () => {
+    // The fallback must not become a hole in the filter: a codex pane stays
+    // unadoptable for a claude-code bot even when herdr's name is unrecognisable.
+    mockExecFileSync
+      .mockReturnValueOnce(
+        JSON.stringify({ result: { agents: [{ pane_id: 'pane-1', agent: '/usr/bin/codex' }] } }) as any,
+      )
+      .mockReturnValueOnce(JSON.stringify({
+        result: {
+          process_info: {
+            foreground_processes: [{ pid: 4242, name: '0.9.1', argv: ['codex'] }],
+          },
+        },
+      }) as any);
+    mockReadFileSync.mockImplementation(((path: unknown) => {
+      if (String(path) === '/proc/4242/comm') return 'codex\n';
+      throw new Error('ENOENT');
+    }) as any);
+
+    expect(validateHerdrAdoptTarget('sess', 'pane-1', 4242, 'claude-code')).toBe('missing');
+  });
+
   it('returns "missing" when herdr returns ok but pane is not in list', () => {
     mockExecFileSync
       .mockReturnValueOnce(JSON.stringify({ result: { agents: [{ pane_id: 'pane-other' }] } }) as any)
