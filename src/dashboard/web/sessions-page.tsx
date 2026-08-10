@@ -66,6 +66,7 @@ import {
   repoBasename,
   restartConfirmMessage,
   sessionLocationText,
+  preferChatFilterLabel,
   sessionLocationTitle,
   sessionExchangePreview,
   sessionRuntimeCounts,
@@ -2472,8 +2473,7 @@ function SessionsPage(): React.JSX.Element {
       if (!chatId) continue;
       if (!filters.showUnknownChats && isUnknownChatSession(row)) continue;
       const label = sessionLocationText(row);
-      const existing = options.get(chatId);
-      if (!existing || label < existing) options.set(chatId, label);
+      options.set(chatId, preferChatFilterLabel(options.get(chatId), label, chatId));
     }
     return [...options.entries()]
       .sort((a, b) => a[1].localeCompare(b[1]))

@@ -9,6 +9,8 @@ import {
   CLI_FILTER_OPTIONS,
   groupSessionsByTopic,
   isUnknownChatSession,
+  preferChatFilterLabel,
+  chatFilterLabelIsUnresolved,
   restartConfirmMessage,
   historySenderKey,
   sessionLocationText,
@@ -549,6 +551,31 @@ describe('dashboard sessions filters', () => {
     expect(isUnknownChatSession(row, () => 'SellerIM Agent 集中营')).toBe(false);
     expect(isUnknownChatSession(namedDirect)).toBe(false);
     expect(isUnknownChatSession({}, () => null)).toBe(false);
+  });
+
+  it('detects chat-filter labels that still fall back to the raw chatId', () => {
+    expect(chatFilterLabelIsUnresolved('单聊 · oc_dm - Nil-RD', 'oc_dm')).toBe(true);
+    expect(chatFilterLabelIsUnresolved('单聊 · 韩毅 - Nil-RD', 'oc_dm')).toBe(false);
+    expect(chatFilterLabelIsUnresolved('群聊 · oc_group', 'oc_group')).toBe(true);
+    expect(chatFilterLabelIsUnresolved('anything', '')).toBe(false);
+  });
+
+  it('prefers a resolved chat-filter label over a raw-id one during dedup', () => {
+    // Same p2p chatId: one row resolved the human name, another (a scheduled
+    // task with no user sender) fell back to the raw id. The resolved name must
+    // win regardless of arrival order, even though ASCII `oc_…` sorts before CJK.
+    const resolved = '单聊 · 韩毅 - 韩毅';
+    const rawId = '单聊 · oc_cfa427 - 韩毅';
+    expect(preferChatFilterLabel(undefined, rawId, 'oc_cfa427')).toBe(rawId);
+    expect(preferChatFilterLabel(rawId, resolved, 'oc_cfa427')).toBe(resolved);
+    expect(preferChatFilterLabel(resolved, rawId, 'oc_cfa427')).toBe(resolved);
+  });
+
+  it('falls back to a deterministic lexicographic pick when both labels are equally resolved', () => {
+    expect(preferChatFilterLabel('群聊 · B', '群聊 · A', 'oc_x')).toBe('群聊 · A');
+    expect(preferChatFilterLabel('群聊 · A', '群聊 · B', 'oc_x')).toBe('群聊 · A');
+    // Both unresolved (raw id) → still deterministic, no crash.
+    expect(preferChatFilterLabel('群聊 · oc_x', '群聊 · oc_x', 'oc_x')).toBe('群聊 · oc_x');
   });
 
   it('groups consecutive app/bot history records by sender identity', () => {

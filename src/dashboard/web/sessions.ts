@@ -199,6 +199,32 @@ export function isUnknownChatSession(
   return !!chatId && !resolveTitle(s);
 }
 
+/** True when a chat-filter label still falls back to the raw `chatId` (no
+ * human-readable name resolved). Used to demote unresolved labels during
+ * option dedup so a named session always wins over an id-only one. */
+export function chatFilterLabelIsUnresolved(label: string, chatId: string): boolean {
+  const id = String(chatId ?? '').trim();
+  return !!id && String(label ?? '').includes(id);
+}
+
+/** Pick the better of two chat-filter labels for the same `chatId`. A label
+ * that resolved to a real name beats one that still shows the raw id; when both
+ * are equally (un)resolved, fall back to a deterministic lexicographic pick so
+ * option ordering stays stable across renders.
+ *
+ * Fixes the dedup bug where `label < existing` alone let a raw-id label
+ * (ASCII `oc_…`, which sorts before CJK names) mask an already-resolved name
+ * such as `单聊 · 韩毅 - Nil-RD`. */
+export function preferChatFilterLabel(existing: string | undefined, candidate: string, chatId: string): string {
+  if (existing === undefined) return candidate;
+  const existingUnresolved = chatFilterLabelIsUnresolved(existing, chatId);
+  const candidateUnresolved = chatFilterLabelIsUnresolved(candidate, chatId);
+  if (existingUnresolved !== candidateUnresolved) {
+    return existingUnresolved ? candidate : existing;
+  }
+  return candidate < existing ? candidate : existing;
+}
+
 export function sessionLocationTitle(s: any): string {
   const label = sessionLocationText(s);
   const chatId = String(s?.chatId ?? '').trim();
