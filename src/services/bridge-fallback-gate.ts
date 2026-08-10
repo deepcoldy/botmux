@@ -159,27 +159,51 @@ export function stripTrailingBridgeSentinelLine(finalText: string): string {
  * normal final answer and forwards it to Lark. This predicate lets the fallback
  * path recognise that shape and refuse to post it verbatim.
  *
- * Conservative by construction — it must NOT fire on a human legitimately
- * pasting/discussing this XML, or on code/log prose. It requires the full
- * high-confidence Anthropic tool-call signature: an opening `<invoke name="…">`
- * tag PAIRED with either a `<parameter name="…">` child or a matching
- * `</invoke>` close. A lone `<invoke>` mention, an `invoke(` function call in
- * code, or the words in prose do not match.
+ * Conservative by construction — tuned to minimise false positives on the
+ * LOW-confidence shapes: a lone `<invoke>` mention, an `invoke(` function call
+ * in code, the words in prose, or a stray `<parameter>` all stay clear. It
+ * requires the full high-confidence Anthropic tool-call signature: an opening
+ * `<invoke name="…">` tag PAIRED with either a `<parameter name="…">` child or
+ * a matching `</invoke>` close. It CANNOT, however, distinguish a genuine leak
+ * from a *complete, well-formed* block a human legitimately pastes or discusses
+ * (see NOTE ON CONFIDENCE) — that same-shape case is an accepted limitation, not
+ * something the predicate can rule out by text alone.
  *
  * Scope: callers apply this ONLY on the transcript-drain fallback, never to an
  * explicit `botmux send` body — a user who deliberately sends this XML via
  * `botmux send` is choosing to, and is not rewritten.
+ *
+ * NOTE ON CONFIDENCE: a *complete, well-formed* `<invoke name="…">…</invoke>`
+ * block that a human legitimately pastes or discusses (in code, a log, a bug
+ * report) also matches — it is indistinguishable from a leak by text shape
+ * alone. That over-match is an accepted trade-off of a text-only heuristic;
+ * confining the call site to the transcript-drain fallback (never an explicit
+ * send) is what keeps it safe in practice.
+ *
+ * IMPLEMENTATION: a two-phase O(n) scan, NOT a single regex with a lazy `.*?`
+ * bridge between the opener and the terminator. A pattern like
+ * `/<invoke name="…">[\s\S]*?<\/invoke>/` backtracks catastrophically (O(n²))
+ * on pathological input — many `<invoke name="x">` openers that never close
+ * force the lazy span to re-scan to end-of-text from each failed opener. Here
+ * we instead (1) find the FIRST opener with a single linear `exec`, then
+ * (2) look only in the suffix after it for a `<parameter name="…">` child or a
+ * `</invoke>` close. Hit ⟺ the earliest opener is followed (anywhere later) by
+ * a terminator — equivalent to the paired-signature intent, but linear.
  */
-const LEAKED_TOOL_CALL_PATTERNS: readonly RegExp[] = [
-  // <invoke name="Bash"> … <parameter name="command"> (opening tag + a parameter child)
-  /<invoke\s+name\s*=\s*"[^"]+"\s*>[\s\S]*?<parameter\s+name\s*=\s*"[^"]+"\s*>/,
-  // <invoke name="Bash"> … </invoke> (opening tag + its matching close)
-  /<invoke\s+name\s*=\s*"[^"]+"\s*>[\s\S]*?<\/invoke>/,
-];
+const LEAKED_INVOKE_OPENER = /<invoke\s+name\s*=\s*"[^"]+"\s*>/;
+const LEAKED_PARAMETER_CHILD = /<parameter\s+name\s*=\s*"[^"]+"\s*>/;
+const LEAKED_INVOKE_CLOSE = '</invoke>';
 
 export function looksLikeLeakedToolCall(text: string | undefined): boolean {
   if (!text) return false;
-  return LEAKED_TOOL_CALL_PATTERNS.some(re => re.test(text));
+  // Phase 1: locate the first high-confidence opening tag (linear scan).
+  const opener = LEAKED_INVOKE_OPENER.exec(text);
+  if (!opener) return false;
+  // Phase 2: a terminator anywhere AFTER that opener confirms the leak shape.
+  // Both lookups start past the opener's end, so no lazy backtracking occurs.
+  const suffix = text.slice(opener.index + opener[0].length);
+  if (suffix.includes(LEAKED_INVOKE_CLOSE)) return true;
+  return LEAKED_PARAMETER_CHILD.test(suffix);
 }
 
 /** The text a transcript-drain emit path should actually post for `finalText`.

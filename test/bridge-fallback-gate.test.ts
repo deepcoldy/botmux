@@ -608,4 +608,34 @@ describe('looksLikeLeakedToolCall', () => {
   it('does not fire on a user pasting a <parameter> tag without an invoke', () => {
     expect(looksLikeLeakedToolCall('why does <parameter name="command"> show up in my logs?')).toBe(false);
   });
+
+  it('does not fire when a <parameter>/<\/invoke> terminator precedes the only opener', () => {
+    // A terminator that appears BEFORE the first opener is not part of a pair —
+    // the two-phase scan only accepts a terminator in the opener's suffix.
+    expect(looksLikeLeakedToolCall('<parameter name="x"> then later <invoke name="a">')).toBe(false);
+    expect(looksLikeLeakedToolCall('a stray </invoke> then <invoke name="a"> with no closer')).toBe(false);
+  });
+
+  it('fires when a later opener closes even if the first opener does not', () => {
+    // Multi-opener: the earliest opener is followed (further along) by a
+    // terminator belonging to a later opener — still the leak shape.
+    expect(looksLikeLeakedToolCall('<invoke name="a"> no close here <invoke name="b"></invoke>')).toBe(true);
+  });
+
+  it('does not fire on multiple openers that never terminate', () => {
+    expect(looksLikeLeakedToolCall('<invoke name="a"> gap <invoke name="b"> gap <invoke name="c"> end')).toBe(false);
+  });
+
+  it('stays linear-time on pathological unterminated openers (no ReDoS)', () => {
+    // Regression for the O(n²) lazy-backtrack hazard: many `<invoke name="x">`
+    // openers with NO terminator forced the old lazy-bridge regex to re-scan to
+    // end-of-text from each opener. The two-phase scan is O(n) — this returns
+    // effectively instantly; the old form took seconds at this size.
+    const pathological = '<invoke name="x">'.repeat(50_000) + 'NOCLOSER';
+    const start = Date.now();
+    const hit = looksLikeLeakedToolCall(pathological);
+    const elapsedMs = Date.now() - start;
+    expect(hit).toBe(false);
+    expect(elapsedMs).toBeLessThan(200);
+  });
 });
