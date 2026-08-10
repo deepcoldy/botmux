@@ -52,6 +52,7 @@ import {
   roleKey,
   ROLE_WARN_BYTES,
   saveInjectMode,
+  saveDispatchCompletionEnabled,
   saveMessageListener,
   saveProfileEntry,
   saveRole,
@@ -139,7 +140,12 @@ function cloneListener(listener: MessageListenerData | null | undefined): Messag
 }
 
 function listenerHasConfig(listener: MessageListenerData | null): boolean {
-  return listener?.enabled === true && listener.prompt.trim().length > 0;
+  // A persisted listener is worth loading into the editor whenever it carries a
+  // prompt — INCLUDING a disabled draft (enabled:false + non-empty prompt). The
+  // backend persists such drafts (see messageListenerConfigFromUpdate); gating
+  // on enabled here would reset the editor to blank on reload and make the saved
+  // draft look lost. Runtime matching still requires enabled===true elsewhere.
+  return !!listener && listener.prompt.trim().length > 0;
 }
 
 function groupHasAnyRoleOrListener(group: GroupInfo): boolean {
@@ -234,11 +240,14 @@ function RolesPage(props: { tab: RolesTab }) {
   const [selectedRole, setSelectedRole] = useState<RoleData | null>(null);
   const [editingContent, setEditingContent] = useState('');
   const [editingInjectMode, setEditingInjectMode] = useState<RoleInjectMode>('every');
+  const [editingDispatchCompletionEnabled, setEditingDispatchCompletionEnabled] = useState(false);
   const [roleSaving, setRoleSaving] = useState(false);
   const [roleDeleting, setRoleDeleting] = useState(false);
   const [injectSaving, setInjectSaving] = useState(false);
+  const [dispatchCompletionSaving, setDispatchCompletionSaving] = useState(false);
   const [roleFlash, setRoleFlash] = useState<FlashState>(null);
   const [injectFlash, setInjectFlash] = useState<FlashState>(null);
+  const [dispatchCompletionFlash, setDispatchCompletionFlash] = useState<FlashState>(null);
   const [groupEditorSection, setGroupEditorSection] = useState<GroupEditorSection>('role');
   const [selectedListener, setSelectedListener] = useState<MessageListenerData | null>(null);
   const [editingListener, setEditingListener] = useState<MessageListenerData>(() => cloneListener(DEFAULT_LISTENER));
@@ -426,6 +435,7 @@ function RolesPage(props: { tab: RolesTab }) {
     setSelectedBotId(botId);
     setRoleFlash(null);
     setInjectFlash(null);
+    setDispatchCompletionFlash(null);
     setListenerFlash(null);
     applyLoadedListener(null);
     const role = await loadRole(botId, groupId);
@@ -433,6 +443,7 @@ function RolesPage(props: { tab: RolesTab }) {
     setSelectedRole(role);
     setEditingContent(role.content ?? '');
     setEditingInjectMode(role.injectMode === 'once' ? 'once' : 'every');
+    setEditingDispatchCompletionEnabled(role.dispatchCompletionEnabled === true);
     await loadListenerForSelection(botId, groupId, serial);
   }
 
@@ -447,6 +458,7 @@ function RolesPage(props: { tab: RolesTab }) {
       setSelectedRole(role);
       setEditingContent(role.content ?? '');
       setEditingInjectMode(role.injectMode === 'once' ? 'once' : 'every');
+      setEditingDispatchCompletionEnabled(role.dispatchCompletionEnabled === true);
       await loadListenerForSelection(selectedBotId, selectedGroupId, serial);
     }
   }
@@ -455,12 +467,24 @@ function RolesPage(props: { tab: RolesTab }) {
     if (!selectedGroupId || !selectedBotId) return;
     setRoleSaving(true);
     try {
-      const ok = await saveRole(selectedBotId, selectedGroupId, editingContent, editingInjectMode);
+      const ok = await saveRole(
+        selectedBotId,
+        selectedGroupId,
+        editingContent,
+        editingInjectMode,
+        editingDispatchCompletionEnabled,
+      );
       if (!alive.current) return;
       if (ok) {
         const snapshot = await refreshGroups();
         if (!alive.current) return;
-        setSelectedRole(prev => prev ? { ...prev, content: editingContent, hasRole: true, injectMode: editingInjectMode } : prev);
+        setSelectedRole(prev => prev ? {
+          ...prev,
+          content: editingContent,
+          hasRole: true,
+          injectMode: editingInjectMode,
+          dispatchCompletionEnabled: editingDispatchCompletionEnabled,
+        } : prev);
         void refreshRoleContext(snapshot.groups, profiles);
         flash(setRoleFlash, tr('roles.saved'));
       } else {
@@ -486,6 +510,7 @@ function RolesPage(props: { tab: RolesTab }) {
         setSelectedRole(null);
         setEditingContent('');
         setEditingInjectMode('every');
+        setEditingDispatchCompletionEnabled(false);
         void refreshRoleContext(snapshot.groups, profiles);
       }
     } finally {
@@ -505,6 +530,21 @@ function RolesPage(props: { tab: RolesTab }) {
       flash(setInjectFlash, ok ? tr('roles.saved') : tr('roles.saveFailed'), !ok);
     } finally {
       if (alive.current) setInjectSaving(false);
+    }
+  }
+
+  async function handleDispatchCompletionEnabledChange(enabled: boolean): Promise<void> {
+    if (!selectedGroupId || !selectedBotId) return;
+    const prev = editingDispatchCompletionEnabled;
+    setEditingDispatchCompletionEnabled(enabled);
+    setDispatchCompletionSaving(true);
+    try {
+      const ok = await saveDispatchCompletionEnabled(selectedBotId, selectedGroupId, enabled);
+      if (!alive.current) return;
+      if (!ok) setEditingDispatchCompletionEnabled(prev);
+      flash(setDispatchCompletionFlash, ok ? tr('roles.saved') : tr('roles.saveFailed'), !ok);
+    } finally {
+      if (alive.current) setDispatchCompletionSaving(false);
     }
   }
 
@@ -740,18 +780,28 @@ function RolesPage(props: { tab: RolesTab }) {
 
   async function handleSaveListener(): Promise<void> {
     if (!selectedGroupId || !selectedBotId) return;
-    if (!editingListener.enabled) {
+    // Disabled + blank prompt = clear the listener entirely (mirrors the backend
+    // messageListenerConfigFromUpdate: nothing worth persisting → delete). A
+    // disabled draft WITH a prompt falls through and is saved as-is (enabled:false),
+    // so turning the toggle off then Save no longer discards the typed content.
+    if (!editingListener.enabled && !editingListener.prompt.trim()) {
       await handleDeleteListener(false);
       return;
     }
-    if (!editingListener.prompt.trim()) {
-      flash(setListenerFlash, tr('roles.listenerPromptRequired'), true);
-      return;
-    }
-    if (editingListener.senderPolicy?.mode !== 'all_except_excluded'
-      && (editingListener.senderPolicy?.includeSenderOpenIds?.length ?? 0) === 0) {
-      flash(setListenerFlash, tr('roles.listenerSenderRequired'), true);
-      return;
+    // Prompt + sender requirements only gate an ENABLED listener (it will match
+    // live messages). A disabled draft never matches at runtime, so an
+    // incomplete sender policy is fine to persist and re-editing later can
+    // complete it before enabling.
+    if (editingListener.enabled) {
+      if (!editingListener.prompt.trim()) {
+        flash(setListenerFlash, tr('roles.listenerPromptRequired'), true);
+        return;
+      }
+      if (editingListener.senderPolicy?.mode !== 'all_except_excluded'
+        && (editingListener.senderPolicy?.includeSenderOpenIds?.length ?? 0) === 0) {
+        flash(setListenerFlash, tr('roles.listenerSenderRequired'), true);
+        return;
+      }
     }
     setListenerSaving(true);
     try {
@@ -1012,7 +1062,7 @@ function RolesPage(props: { tab: RolesTab }) {
                         type="button"
                         id="roles-listener-delete"
                         className="danger"
-                        style={{ display: selectedListener?.enabled ? '' : 'none' }}
+                        style={{ display: selectedListener ? '' : 'none' }}
                         disabled={listenerDeleting}
                         onClick={() => void handleDeleteListener()}
                       >
@@ -1068,6 +1118,22 @@ function RolesPage(props: { tab: RolesTab }) {
                     />
                     <span className="roles-editor-inject-hint">{tr('roles.injectModeHint')}</span>
                     <Flash flash={injectFlash} />
+                  </div>
+                  <div className="roles-editor-inject">
+                    <span className="roles-field-label">{tr('roles.dispatchCompletionLabel')}</span>
+                    <label className="filter-toggle roles-listener-enabled">
+                      <input
+                        id="roles-editor-dispatch-completion-enabled"
+                        type="checkbox"
+                        checked={editingDispatchCompletionEnabled}
+                        disabled={dispatchCompletionSaving}
+                        onChange={event => void handleDispatchCompletionEnabledChange(event.currentTarget.checked)}
+                      />
+                      <span className="filter-toggle-switch" aria-hidden="true"></span>
+                      <span className="filter-toggle-label">{tr('roles.dispatchCompletionEnabled')}</span>
+                    </label>
+                    <span className="roles-editor-inject-hint">{tr('roles.dispatchCompletionHint')}</span>
+                    <Flash flash={dispatchCompletionFlash} />
                   </div>
                   <textarea
                     id="roles-editor-textarea"

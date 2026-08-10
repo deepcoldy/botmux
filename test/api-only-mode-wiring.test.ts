@@ -52,7 +52,10 @@ describe('API-only bot mode — boot-time Feishu decoupling (source lock)', () =
     // botHandlers.set stays unconditional (replay paths may read it); only the
     // WSClient start is gated.
     expect(block).toContain('if (!cfg.apiOnly) {');
-    expect(block).toContain('startLarkEventDispatcher(cfg.larkAppId, cfg.larkAppSecret, botEventHandlers');
+    // The dispatcher start is deferred into a startEventDispatchers thunk (args
+    // split across lines after the PR #597 merge); assert the gated call, not a
+    // single-line arg signature.
+    expect(block).toContain('startEventDispatchers.push(() => startLarkEventDispatcher(');
     expect(block.indexOf('if (!cfg.apiOnly) {'))
       .toBeLessThan(block.indexOf('startLarkEventDispatcher('));
   });
@@ -511,7 +514,7 @@ describe('core-only entrypoint hardening (codex 4 P1s — source lock)', () => {
     // after restore, ready line last.
     const armAt = daemonSource.indexOf('armCoreOnlyReadinessGate()');
     const bindAt = daemonSource.indexOf('const ipcHandle = await startIpcServer(');
-    const restoreAt = daemonSource.indexOf('await restoreActiveSessions(activeSessions)');
+    const restoreAt = daemonSource.indexOf('await restoreActiveSessions(activeSessions');
     const readyAt = daemonSource.indexOf('setCoreOnlyReady()');
     const readyLineAt = daemonSource.indexOf('[core-only] listening on 127.0.0.1:');
     expect(armAt).toBeGreaterThan(0);

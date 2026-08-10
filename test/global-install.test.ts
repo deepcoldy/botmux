@@ -1,3 +1,6 @@
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync } from 'node:fs';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
 import { describe, expect, it } from 'vitest';
 import {
   detectGlobalInstallManager,
@@ -52,6 +55,46 @@ describe('resolveGlobalInstallPlan', () => {
     const plan = resolveGlobalInstallPlan(root, 'linux');
     expect(plan.manager).toBe('pnpm');
     expect(plan.activePackageRoot).toBe(root);
+  });
+
+  it('recognises the pnpm 11 isolated global runtime layout', () => {
+    const root = '/home/bot/.local/share/pnpm/global/v11/2bd754-19fd4ccaab4-b6f57fa0272de3b8/node_modules/botmux';
+    const plan = resolveGlobalInstallPlan(root, 'linux');
+    expect(plan).toMatchObject({
+      manager: 'pnpm',
+      command: 'pnpm',
+      args: ['add', '-g', '--global-dir', '/home/bot/.local/share/pnpm/global', 'botmux@latest'],
+      activePackageRoot: root,
+    });
+    expect(detectGlobalInstallManager(root, 'linux')).toBe('pnpm');
+  });
+
+  it('uses the stable pnpm 11 symlink for post-update operations', () => {
+    const tempRoot = mkdtempSync(join(tmpdir(), 'botmux-pnpm11-'));
+    try {
+      const globalDir = join(tempRoot, 'pnpm', 'global');
+      const layoutDir = join(globalDir, 'v11');
+      const runtimeDir = join(layoutDir, 'runtime-dir');
+      const stableDir = join(layoutDir, 'a'.repeat(64));
+      const packageRoot = join(runtimeDir, 'node_modules', 'botmux');
+      mkdirSync(packageRoot, { recursive: true });
+      symlinkSync('runtime-dir', stableDir, 'dir');
+
+      const plan = resolveGlobalInstallPlan(packageRoot, 'linux');
+
+      expect(plan.activePackageRoot).toBe(join(stableDir, 'node_modules', 'botmux'));
+    } finally {
+      rmSync(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('preserves the Windows pnpm 11 global-dir path', () => {
+    const root = String.raw`D:\pnpm\global\v11\2bd754-19fd4ccaab4-b6f57fa0272de3b8\node_modules\botmux`;
+    const plan = resolveGlobalInstallPlan(root, 'win32');
+    expect(plan.manager).toBe('pnpm');
+    expect(plan.args).toEqual([
+      'add', '-g', '--global-dir', 'D:/pnpm/global', 'botmux@latest',
+    ]);
   });
 
   it('handles a Windows pnpm virtual-store path', () => {

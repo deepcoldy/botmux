@@ -100,7 +100,7 @@ describe('usage-refresh timer wiring (source lock)', () => {
   });
 
   it('killWorker and dead-generation worker exit clear the timer', () => {
-    const kill = functionBody(src, 'export function killWorker(ds: DaemonSession): void {');
+    const kill = functionBody(src, 'export function killWorker(');
     expect(kill).toContain('clearUsageRefreshTimer(ds)');
     // The `ds.worker === worker` exit branch (dead generation) also clears.
     const exitIdx = src.indexOf("worker.on('exit'");

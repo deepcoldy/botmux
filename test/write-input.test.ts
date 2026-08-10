@@ -19,9 +19,11 @@
  *   message in the input box. Submit is verified via CoCo's platform-specific
  *   history.jsonl.
  * - CoCo (raw PTY): same explicit \x1b[200~...\x1b[201~ wrap as claude-code.
- * - Other adapters (Aiden/Codex/Gemini/OpenCode): use plain sendText + Enter
+ * - Other adapters (Aiden/Codex/Gemini): use plain sendText + Enter
  *   in tmux, or write(content) + \r in raw mode. The whole content (including
  *   newlines) is sent in one sendText call — those CLIs tolerate raw LF.
+ * - OpenCode: short single-line prompts use sendText + Enter; multiline or
+ *   large prompts use pasteText + Enter so OpenTUI receives bracketed paste.
  *
  * Run:  pnpm vitest run test/write-input.test.ts
  */
@@ -157,17 +159,18 @@ function makeRawPty(opts?: { confirmCodexSubmit?: boolean; codexSessionId?: stri
 type AdapterEntry = [string, CliAdapter];
 
 /** Adapters that use plain sendText+Enter (tmux) / write+CR (raw) — Aiden,
- *  Gemini, Genius, OpenCode, MTR, Hermes. (Codex moved to PASTE_BUFFER_ADAPTERS; its
+ *  Gemini, Genius, MTR, Hermes. (Codex moved to PASTE_BUFFER_ADAPTERS; its
  *  TUI treats every literal \n as Enter, so a multi-line burst fragmented into
  *  per-line submits / "Queued follow-up inputs" — bracketed paste fixes it.) */
 const PLAIN_ADAPTERS: AdapterEntry[] = [
   ['aiden', createAidenAdapter('/bin/aiden')],
   ['gemini', createGeminiAdapter('/bin/gemini')],
   ['genius', createGeniusAdapter('/bin/genius')],
-  ['opencode', createOpenCodeAdapter('/bin/opencode')],
   ['mtr', createMtrAdapter('/bin/mtr')],
   ['hermes', createHermesAdapter('/bin/hermes')],
 ];
+
+const OPENCODE_ADAPTER: AdapterEntry = ['opencode', createOpenCodeAdapter('/bin/opencode')];
 
 /** Node runner adapters use a one-line base64 control protocol so multiline
  *  content cannot be split by terminal Enter semantics. */
@@ -202,6 +205,7 @@ const ALL_ADAPTERS: AdapterEntry[] = [
   ...HUMAN_TYPING_ADAPTERS,
   ...PASTE_BUFFER_ADAPTERS,
   ...PLAIN_ADAPTERS,
+  OPENCODE_ADAPTER,
   ...APP_RUNNER_ADAPTERS,
 ];
 
@@ -216,12 +220,21 @@ function decodeRunnerLine(line: string, prefix: string): any {
 // =========================================================================
 
 describe('writeInput: single-line, tmux mode', () => {
-  it.each([...HUMAN_TYPING_ADAPTERS, ...PLAIN_ADAPTERS])('%s: sendText + Enter, no pasteText', async (_name, adapter) => {
+  it.each([...HUMAN_TYPING_ADAPTERS, ...PLAIN_ADAPTERS, OPENCODE_ADAPTER])('%s: sendText + Enter, no pasteText', async (_name, adapter) => {
     const pty = makeTmuxPty();
     await adapter.writeInput(pty, 'hello world');
     expect(pty.sendText).toHaveBeenCalledWith('hello world');
     expect(pty.sendSpecialKeys).toHaveBeenCalledWith('Enter');
     expect(pty.pasteText).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['hermes', createHermesAdapter('/bin/hermes')],
+    ['pi', createPiAdapter('/bin/pi')],
+    ['mtr', createMtrAdapter('/bin/mtr')],
+  ] satisfies AdapterEntry[])('%s: returns undefined without authoritative submit evidence', async (_name, adapter) => {
+    const result = await adapter.writeInput(makeTmuxPty(), 'silent submit path');
+    expect(result).toBeUndefined();
   });
 
   it.each(PASTE_BUFFER_ADAPTERS)('%s: pasteText + delayed Enter, no sendText', async (_name, adapter) => {
@@ -243,7 +256,7 @@ describe('writeInput: single-line, tmux mode', () => {
 });
 
 describe('writeInput: single-line, non-tmux mode', () => {
-  it.each(PLAIN_ADAPTERS)('%s: write(content) + CR', async (_name, adapter) => {
+  it.each([...PLAIN_ADAPTERS, OPENCODE_ADAPTER])('%s: write(content) + CR', async (_name, adapter) => {
     const pty = makeRawPty();
     await adapter.writeInput(pty, 'hello world');
     const allWritten = pty.write.mock.calls.map(c => c[0]).join('');
@@ -273,9 +286,11 @@ describe('writeInput: single-line, non-tmux mode', () => {
 // 2. Multiline content
 //    - Claude Code / CoCo / Codex: bracketed paste (pasteText) with the whole
 //      string — the embedded \n stay content, only the trailing Enter submits.
-//    - PLAIN adapters (Aiden/Gemini/OpenCode/MTR/Hermes): sendText with the
+//    - PLAIN adapters (Aiden/Gemini/MTR/Hermes): sendText with the
 //      whole string (including \n) — those CLIs treat literal LF as a newline,
 //      not a submit, so only the trailing Enter submits.
+//    - OpenCode: pasteText for multiline/large prompts so its TUI receives
+//      bracketed paste rather than slow literal key replay.
 // =========================================================================
 
 const MULTILINE = 'first line\n\nSession ID: abc-123';
@@ -285,6 +300,44 @@ describe('writeInput: multiline, tmux mode', () => {
     const pty = makeTmuxPty();
     await adapter.writeInput(pty, MULTILINE);
     expect(pty.sendText).toHaveBeenCalledWith(MULTILINE);
+    expect(pty.sendSpecialKeys).toHaveBeenCalledWith('Enter');
+    expect(pty.pasteText).not.toHaveBeenCalled();
+  });
+
+  it('opencode: short single-line input uses sendText + Enter', async () => {
+    const [, adapter] = OPENCODE_ADAPTER;
+    const pty = makeTmuxPty();
+    await adapter.writeInput(pty, 'hello world');
+    expect(pty.sendText).toHaveBeenCalledWith('hello world');
+    expect(pty.sendSpecialKeys).toHaveBeenCalledWith('Enter');
+    expect(pty.pasteText).not.toHaveBeenCalled();
+  });
+
+  it('opencode: long single-line input uses pasteText + Enter', async () => {
+    const [, adapter] = OPENCODE_ADAPTER;
+    const input = 'x'.repeat(151);
+    const pty = makeTmuxPty();
+    await adapter.writeInput(pty, input);
+    expect(pty.pasteText).toHaveBeenCalledWith(input);
+    expect(pty.sendSpecialKeys).toHaveBeenCalledWith('Enter');
+    expect(pty.sendText).not.toHaveBeenCalled();
+  });
+
+  it('opencode: multiline input uses pasteText + Enter', async () => {
+    const [, adapter] = OPENCODE_ADAPTER;
+    const pty = makeTmuxPty();
+    await adapter.writeInput(pty, MULTILINE);
+    expect(pty.pasteText).toHaveBeenCalledWith(MULTILINE);
+    expect(pty.sendSpecialKeys).toHaveBeenCalledWith('Enter');
+    expect(pty.sendText).not.toHaveBeenCalled();
+  });
+
+  it('opencode: slash commands keep sendText even when long or multiline', async () => {
+    const [, adapter] = OPENCODE_ADAPTER;
+    const input = `/help\n${'x'.repeat(151)}`;
+    const pty = makeTmuxPty();
+    await adapter.writeInput(pty, input);
+    expect(pty.sendText).toHaveBeenCalledWith(input);
     expect(pty.sendSpecialKeys).toHaveBeenCalledWith('Enter');
     expect(pty.pasteText).not.toHaveBeenCalled();
   });
@@ -1218,7 +1271,7 @@ describe('codex writeInput submission confirmation', () => {
     const adapter = createCodexAdapter('/bin/codex');
     const result = await adapter.writeInput(pty, MULTILINE);
 
-    expect(result).toBeUndefined();
+    expect(result).toEqual({ submitted: true });
     expect(pty.pasteText).toHaveBeenCalledWith(MULTILINE);
     expect(pty.sendText).not.toHaveBeenCalled();
     expect(pty.sendSpecialKeys).toHaveBeenCalledTimes(1);
@@ -1312,6 +1365,24 @@ describe('codex writeInput submission confirmation', () => {
     expect(pty.sendText).not.toHaveBeenCalled();
     expect(pty.sendSpecialKeys).toHaveBeenCalledTimes(4);
   });
+
+  it('does not crash and reports failure when history.jsonl is absent', async () => {
+    // Codex has no fresh-install short-wait branch like CoCo. When
+    // history.jsonl does not exist at submit time, currentFileSize returns 0
+    // and waitForHistoryAppend polls until the budget expires, then retries
+    // Enter and finally surfaces { submitted: false, recheck } — it must NOT
+    // throw or silently return undefined (which would let a missing submit
+    // look like a confirmed one).
+    const { rmSync } = await import('node:fs');
+    try { rmSync(codexHistoryPath()); } catch { /* may not exist */ }
+    const pty = makeTmuxPty({ confirmCodexSubmit: false });
+    const adapter = createCodexAdapter('/bin/codex');
+    const result = await adapter.writeInput(pty, MULTILINE);
+
+    expect(result).toMatchObject({ submitted: false });
+    expect(typeof (result as any)?.recheck).toBe('function');
+    expect((result as any).recheck()).toBe(false);
+  });
 });
 
 describe('coco writeInput submission confirmation', () => {
@@ -1345,8 +1416,9 @@ describe('coco writeInput submission confirmation', () => {
     const pty = makeCocoPasteTmuxPty();
     const result = await adapter.writeInput(pty, MULTILINE);
 
-    // Successful submit returns undefined (no warning needed)
-    expect(result).toBeUndefined();
+    // Verified history append is authoritative for the worker's bounded
+    // structured-turn start lease.
+    expect(result).toEqual({ submitted: true });
     // tmux paste-buffer path: single pasteText with the whole content, then
     // exactly one Enter (no retries — the mock confirmed via history.jsonl).
     expect(pty.pasteText).toHaveBeenCalledWith(MULTILINE);
@@ -1408,8 +1480,8 @@ describe('coco writeInput submission confirmation', () => {
     const result = await adapter.writeInput(pty, angled);
 
     // Success path: JSON-decode + startsWith finds the Go-escaped content,
-    // so writeInput returns undefined (no warning queued).
-    expect(result).toBeUndefined();
+    // so writeInput returns an authoritative submit confirmation.
+    expect(result).toEqual({ submitted: true });
   });
 
   it('skips verification on fresh install with no history.jsonl yet', async () => {
@@ -1423,6 +1495,49 @@ describe('coco writeInput submission confirmation', () => {
     const pty = makeCocoPasteTmuxPty({ confirmCocoSubmit: false });
     const result = await adapter.writeInput(pty, 'hello');
     expect(result).toBeUndefined();
+  });
+
+  it('fresh install: returns { submitted: true } when history.jsonl appears with our marker during the short wait', async () => {
+    // Fresh-install branch 1: history.jsonl is absent at submit time, but CoCo
+    // creates it and appends our marker within the 1.2s short-wait window.
+    // Adapter must return authoritative { submitted: true }, not undefined.
+    const { rmSync } = await import('node:fs');
+    try { rmSync(COCO_HISTORY_PATH); } catch { /* may not exist */ }
+    const adapter = createCocoAdapter('/bin/coco');
+    // The mock confirms on the first Enter by writing a coco-shaped history
+    // line — but the file does not exist yet when baseByte is sampled, so we
+    // exercise the fresh-install short-wait path rather than the normal loop.
+    const pty = makeCocoPasteTmuxPty({ confirmCocoSubmit: true });
+    const result = await adapter.writeInput(pty, MULTILINE);
+    expect(result).toEqual({ submitted: true });
+  });
+
+  it('fresh install: falls through to retry loop when history.jsonl appears without our marker', async () => {
+    // Fresh-install branch 3: history.jsonl is absent at submit time, appears
+    // during the short wait, but does NOT contain our marker (e.g. another
+    // session's line landed first). Adapter must NOT silently return undefined;
+    // it must fall through to the normal retry/failure loop and surface
+    // { submitted: false, recheck } so the worker can warn rather than mask a
+    // real submit failure on a new install.
+    const { rmSync } = await import('node:fs');
+    try { rmSync(COCO_HISTORY_PATH); } catch { /* may not exist */ }
+    const adapter = createCocoAdapter('/bin/coco');
+    let submittedOnce = false;
+    const pty: PtyHandle = {
+      write: vi.fn(),
+      sendText: vi.fn(),
+      sendSpecialKeys: vi.fn((key: string) => {
+        if (key !== 'Enter') return;
+        if (submittedOnce) return;
+        submittedOnce = true;
+        // File appears, but with an unrelated line — our marker is absent.
+        appendCocoHistory('some other session\'s submit, not ours');
+      }),
+      pasteText: vi.fn(),
+    };
+    const result = await adapter.writeInput(pty, MULTILINE);
+    expect(result).toMatchObject({ submitted: false });
+    expect(typeof (result as any)?.recheck).toBe('function');
   });
 
   it('confirms submit when baseByte lands mid-line (non-atomic history append)', async () => {
@@ -1460,8 +1575,8 @@ describe('coco writeInput submission confirmation', () => {
     const adapter = createCocoAdapter('/bin/coco');
     const result = await adapter.writeInput(pty, prompt);
 
-    // Confirmed → no warning, and no spurious retry Enters.
-    expect(result).toBeUndefined();
+    // Confirmed → authoritative success, no warning or spurious retry Enters.
+    expect(result).toEqual({ submitted: true });
     const enterCalls = (pty.sendSpecialKeys as any).mock.calls.filter((c: string[]) => c[0] === 'Enter').length;
     expect(enterCalls).toBe(1);
   });

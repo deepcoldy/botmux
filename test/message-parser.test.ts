@@ -7,7 +7,7 @@
  * Run:  pnpm vitest run test/message-parser.test.ts
  */
 import { describe, it, expect } from 'vitest';
-import { parseApiMessage, extractResources, parseEventMessage, stripLeadingMentions, createImgNumberer, cardContentHasUpgradeFallback, isPureCardUpgradeFallback, mergeCardText, wrapResolvedCardText, mentionOpenId, messageMentionsBot, CARD_EMBEDDED_PLACEHOLDER } from '../src/im/lark/message-parser.js';
+import { parseApiMessage, extractResources, parseEventMessage, stripLeadingMentions, createImgNumberer, cardContentHasUpgradeFallback, isPureCardUpgradeFallback, mergeCardText, wrapResolvedCardText, mentionOpenId, messageMentionsBot, extractPostAtParticipants, CARD_EMBEDDED_PLACEHOLDER } from '../src/im/lark/message-parser.js';
 import { buildMarkdownCard, buildReplyCardFooter } from '../src/im/lark/md-card.js';
 import { stampBotmuxCallbackMarkers, hasBotmuxCallbackMarker, BOTMUX_CALLBACK_MARKER_KEY } from '../src/im/lark/callback-button-marker.js';
 
@@ -618,6 +618,37 @@ describe('Interactive card parsing: botmux footer is stripped from prompt', () =
     expect(result.content).toContain('稍后对比');
   });
 
+  it('drops the live split-font signed footer appended after a command', () => {
+    const card = {
+      elements: [[
+        { tag: 'text', text: '/repo /data00/home/chenjihong.daryl/botmux/.worktree/peer-bot-repo-permission\n' },
+        { tag: 'a', text: 'botmux', href: 'https://github.com/deepcoldy/botmux' },
+        { tag: 'text', text: "<font color='grey'> </font>" },
+        { tag: 'a', text: '·', href: 'https://github.com/deepcoldy/bot%6Dux#reply-card-footer-v1' },
+        { tag: 'text', text: "<font color='grey'> 发送给：</font>" },
+        { tag: 'at', user_name: 'jihong traex' },
+      ]],
+    };
+    const result = parseApiMessage(makeMsg('interactive', card));
+    expect(result.content).toBe('/repo /data00/home/chenjihong.daryl/botmux/.worktree/peer-bot-repo-permission');
+  });
+
+  it('keeps ordinary links that mention botmux and the marker URL without footer structure', () => {
+    const card = {
+      elements: [[
+        { tag: 'text', text: '正文提到 ' },
+        { tag: 'a', text: 'botmux', href: 'https://github.com/deepcoldy/botmux' },
+        { tag: 'text', text: ' 以及 ' },
+        { tag: 'a', text: 'footer spec', href: 'https://github.com/deepcoldy/bot%6Dux#reply-card-footer-v1' },
+        { tag: 'text', text: '，但这不是签名页脚。' },
+      ]],
+    };
+    const result = parseApiMessage(makeMsg('interactive', card));
+    expect(result.content).toContain('botmux(https://github.com/deepcoldy/botmux)');
+    expect(result.content).toContain('footer spec(https://github.com/deepcoldy/bot%6Dux#reply-card-footer-v1)');
+    expect(result.content).toContain('不是签名页脚');
+  });
+
   it('keeps a usage-shaped final line when it belongs to the same body paragraph', () => {
     const card = {
       elements: [[
@@ -695,6 +726,70 @@ describe('Interactive card parsing: botmux footer is stripped from prompt', () =
 // ─── Structural footer strip (brand-agnostic, for per-bot custom brands) ──
 
 describe('Interactive card parsing: footer stripped structurally (custom brand)', () => {
+  it('drops a schema 2.0 footer element without text_size when it carries the exact split-font marker', () => {
+    const card = {
+      schema: '2.0',
+      body: { elements: [
+        { tag: 'markdown', content: '/repo /data00/home/chenjihong.daryl/botmux/.worktree/peer-bot-repo-permission' },
+        { tag: 'hr' },
+        {
+          element_id: 'botmux_reply_footer',
+          tag: 'markdown',
+          content: '[botmux](https://github.com/deepcoldy/botmux)'
+            + "<font color='grey'> </font>"
+            + '[·](https://github.com/deepcoldy/bot%6Dux#reply-card-footer-v1)'
+            + "<font color='grey'> 发送给：</font><at id=ou_owner></at>",
+        },
+      ] },
+    };
+
+    const result = parseApiMessage(makeMsg('interactive', card));
+    expect(result.content).toBe('/repo /data00/home/chenjihong.daryl/botmux/.worktree/peer-bot-repo-permission');
+  });
+
+  it.each([
+    {
+      name: 'wrong marker text',
+      footer: {
+        element_id: 'botmux_reply_footer',
+        tag: 'markdown',
+        content: '[footer spec](https://github.com/deepcoldy/bot%6Dux#reply-card-footer-v1)',
+      },
+      expected: 'footer spec',
+    },
+    {
+      name: 'wrong marker URL',
+      footer: {
+        element_id: 'botmux_reply_footer',
+        tag: 'markdown',
+        content: '[·](https://github.com/deepcoldy/bot%6Dux#reply-card-footer-v1-guide)',
+      },
+      expected: 'reply-card-footer-v1-guide',
+    },
+    {
+      name: 'unexpected text_size',
+      footer: {
+        element_id: 'botmux_reply_footer',
+        tag: 'markdown',
+        text_size: 'normal_v2',
+        content: '[·](https://github.com/deepcoldy/bot%6Dux#reply-card-footer-v1)',
+      },
+      expected: 'reply-card-footer-v1',
+    },
+  ])('keeps a schema 2.0 element-id collision with $name', ({ footer, expected }) => {
+    const card = {
+      schema: '2.0',
+      body: { elements: [
+        { tag: 'markdown', content: '正文内容' },
+        footer,
+      ] },
+    };
+
+    const result = parseApiMessage(makeMsg('interactive', card));
+    expect(result.content).toContain('正文内容');
+    expect(result.content).toContain(expected);
+  });
+
   it('drops a footer carrying the complete Botmux structural signature', () => {
     const footer = buildReplyCardFooter({
       brand: 'Acme',
@@ -1616,5 +1711,34 @@ describe('messageMentionsBot', () => {
 
   it('matches an app_id mention even when botOpenId is not yet resolved', () => {
     expect(messageMentionsBot({ mentions: [{ app_id: BOT_APP }] }, BOT_APP, undefined)).toBe(true);
+  });
+});
+
+describe('extractPostAtParticipants (post inline @ → routing-only participants)', () => {
+  const post = (nodes: any[]) => ({ content: JSON.stringify({ zh_cn: { title: '', content: [nodes] } }) });
+
+  it('classifies ou_ → openId, cli_ → appId, carries user_name', () => {
+    const out = extractPostAtParticipants(post([
+      { tag: 'text', text: 'hi ' },
+      { tag: 'at', user_id: 'ou_human', user_name: '张三' },
+      { tag: 'at', user_id: 'cli_bot', user_name: 'OtherBot' },
+    ]));
+    expect(out).toEqual([
+      { key: '@_post_at_1', name: '张三', openId: 'ou_human', idType: 'open_id' },
+      { key: '@_post_at_2', name: 'OtherBot', appId: 'cli_bot', idType: 'app_id' },
+    ]);
+  });
+
+  it('an `all` inline at is surfaced WITHOUT an executable id (→ core marks incomplete)', () => {
+    const out = extractPostAtParticipants(post([{ tag: 'at', user_id: 'all', user_name: '所有人' }]));
+    expect(out).toHaveLength(1);
+    expect(out[0].openId).toBeUndefined();
+    expect(out[0].appId).toBeUndefined();
+  });
+
+  it('non-post shapes / parse errors → empty', () => {
+    expect(extractPostAtParticipants({ content: '{"text":"plain"}' })).toEqual([]);
+    expect(extractPostAtParticipants({ content: 'not json' })).toEqual([]);
+    expect(extractPostAtParticipants(undefined)).toEqual([]);
   });
 });

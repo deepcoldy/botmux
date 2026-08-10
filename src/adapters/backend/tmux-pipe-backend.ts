@@ -248,9 +248,9 @@ export class TmuxPipeBackend implements SessionBackend {
     }
   }
 
-  write(data: string): void {
+  write(data: string): boolean {
     // No PTY to write to — interpret as a literal send-keys.
-    this.sendText(data);
+    return this.sendText(data);
   }
 
   sendText(text: string): boolean {
@@ -684,6 +684,30 @@ export class TmuxPipeBackend implements SessionBackend {
   captureViewport(): string {
     // No `-S`/`-E` flags = tmux default = current viewport only.
     return this.captureWithBounds('');
+  }
+
+  captureInputState(): {
+    viewport: string;
+    cursor: { x: number; y: number };
+  } | null {
+    if (this.exited) return null;
+    const cursor = this.getCursorPosition();
+    if (!cursor) return null;
+    try {
+      const viewport = execFileSync(
+        'tmux', ['capture-pane', '-p', '-t', this.paneTarget],
+        {
+          encoding: 'utf-8',
+          stdio: ['ignore', 'pipe', 'ignore'],
+          timeout: 2000,
+          maxBuffer: 16 * 1024 * 1024,
+          env: tmuxEnv(),
+        },
+      );
+      return { viewport, cursor };
+    } catch {
+      return null;
+    }
   }
 
   private captureWithBounds(bounds: string, opts?: { restoreCursor?: boolean }): string {

@@ -17,14 +17,40 @@ vi.mock('node:os', async (importOriginal) => ({
 // Mock fs so we never touch real disk
 vi.mock('node:fs', async (importOriginal) => {
   const original = await importOriginal<typeof import('node:fs')>();
+  const readFileSyncMock = vi.fn(() => '');
+  const fdContent = new Map<number, string>();
+  let nextFd = 10_000;
+  const statsForContent = (content: string) => ({
+    dev: 1,
+    ino: 1,
+    size: Buffer.byteLength(content, 'utf8'),
+    mtimeMs: 1,
+    ctimeMs: 1,
+    isFile: () => true,
+  });
   return {
     ...original,
+    closeSync: vi.fn((fd: number) => { fdContent.delete(fd); }),
     existsSync: vi.fn(() => false),
+    fstatSync: vi.fn((fd: number) => statsForContent(fdContent.get(fd) ?? '')),
     lstatSync: vi.fn(() => ({
       isFile: () => true,
       mtimeMs: 0,
     })),
-    readFileSync: vi.fn(() => ''),
+    openSync: vi.fn((path: string) => {
+      const fd = nextFd++;
+      fdContent.set(fd, String(readFileSyncMock(path, 'utf-8') ?? ''));
+      return fd;
+    }),
+    readFileSync: readFileSyncMock,
+    readSync: vi.fn((fd: number, buffer: Buffer, offset: number, length: number, position: number | null) => {
+      const content = Buffer.from(fdContent.get(fd) ?? '', 'utf8');
+      const start = Math.max(0, position ?? 0);
+      const slice = content.subarray(start, start + length);
+      slice.copy(buffer, offset);
+      return slice.length;
+    }),
+    statSync: vi.fn((path: string) => statsForContent(String(readFileSyncMock(path, 'utf-8') ?? ''))),
   };
 });
 

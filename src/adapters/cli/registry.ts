@@ -28,6 +28,7 @@ import { createKimiAdapter } from './kimi.js';
 import { createGrokAdapter } from './grok.js';
 import { createKiroCliAdapter } from './kiro-cli.js';
 import { createRiffAdapter } from './riff.js';
+import { createReasonixAdapter } from './reasonix.js';
 import { createMojoAdapter } from './mojo.js';
 
 /**
@@ -67,6 +68,7 @@ const RAW_CLI_EXECUTABLES: Readonly<Record<CliId, string | undefined>> = {
   'kiro-cli': 'kiro-cli',
   // API-backed; no local executable is required.
   riff: undefined,
+  reasonix: 'reasonix',
   // The worker never spawns this (MojoBackend shells out per turn), but the
   // binary DOES have to exist locally — unlike riff/mira, which are pure HTTP.
   // Declaring it lets `botmux setup` fail fast on a missing install instead of
@@ -165,7 +167,7 @@ export async function createCliAdapter(id: CliId, pathOverride?: string): Promis
   return adapter;
 }
 
-export { createClaudeCodeAdapter, createSeedAdapter, createRelayAdapter, createAidenAdapter, createCocoAdapter, createCodexAdapter, createCodexAppAdapter, createCursorAdapter, createGeminiAdapter, createGeniusAdapter, createOpenCodeAdapter, createAntigravityAdapter, createMtrAdapter, createHermesAdapter, createMiraAdapter, createMirAdapter, createTraexAdapter, createPiAdapter, createCopilotAdapter, createOhMyPiAdapter, createKimiAdapter, createGrokAdapter, createKiroCliAdapter, createRiffAdapter, createMojoAdapter };
+export { createClaudeCodeAdapter, createSeedAdapter, createRelayAdapter, createAidenAdapter, createCocoAdapter, createCodexAdapter, createCodexAppAdapter, createCursorAdapter, createGeminiAdapter, createGeniusAdapter, createOpenCodeAdapter, createAntigravityAdapter, createMtrAdapter, createHermesAdapter, createMiraAdapter, createMirAdapter, createTraexAdapter, createPiAdapter, createCopilotAdapter, createOhMyPiAdapter, createKimiAdapter, createGrokAdapter, createKiroCliAdapter, createRiffAdapter, createReasonixAdapter, createMojoAdapter };
 
 /** Synchronous version for use in worker process. */
 export function createCliAdapterSync(id: CliId, pathOverride?: string): CliAdapter {
@@ -194,6 +196,7 @@ export function createCliAdapterSync(id: CliId, pathOverride?: string): CliAdapt
     case 'grok': return createGrokAdapter(pathOverride);
     case 'kiro-cli': return createKiroCliAdapter(pathOverride);
     case 'riff': return createRiffAdapter(pathOverride);
+    case 'reasonix': return createReasonixAdapter(pathOverride);
     case 'mojo': return createMojoAdapter(pathOverride);
     default: throw new Error(`Unknown CLI adapter: ${id}`);
   }

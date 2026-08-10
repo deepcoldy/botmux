@@ -1,6 +1,8 @@
 import type { ChildProcess } from 'node:child_process';
 import type {
   CodexAppTurnInput,
+  CliTurnPayload,
+  ChatContext,
   Session,
   DaemonToWorker,
   LarkAttachment,
@@ -92,6 +94,32 @@ export interface DaemonSession {
    *  separate from worktreeCreating because plain select, skip, and /repo can
    *  also await prompt context before the fork. */
   pendingRepoCommitInFlight?: boolean;
+  /** A fresh live-route owner has been published but its opening input has not
+   * reached the first fork yet. Same-anchor turns must buffer into the opening
+   * input instead of reforking worker:null and overtaking it. In-memory only. */
+  initialStartPending?: boolean;
+  /** Restore quarantine: a durable activation-tail promotion failed transiently
+   * during restoreActiveSessions, so the row was registered with its tail
+   * un-promoted. The next fork boundary (toReattach blank fork / daemon inbound
+   * refork) must retry the promotion BEFORE forking and skip a blank fork if it
+   * still fails — never leave a live worker beside an unpromoted tail. Cleared
+   * once promotion succeeds. In-memory only. */
+  quarantinedActivationTailPromotion?: boolean;
+  /** Generation token for the handler that atomically reserved a worker:null
+   * refork. Later same-anchor handlers may prepare concurrently, but only this
+   * owner may cross the fork boundary; followers buffer behind its gate. */
+  initialStartClaimToken?: string;
+  /** Number of activation-tail arrivals that reserved FIFO order before an
+   * asynchronous prompt/sender build and have not yet durably admitted or
+   * failed. An opening ACK must not clear the route while this is non-zero. */
+  queuedActivationTailAdmissionsOutstanding?: number;
+  /** An opening ACK (or ordinary cold-start handoff) observed while an
+   * asynchronous tail admission was outstanding. The final settler replays
+   * this release so a late durable successor cannot be stranded. */
+  queuedActivationTailReleasePending?: { acknowledgedToken?: string };
+  /** Retry timer for an ordinary cold-start handoff whose durable promotion
+   * failed after all asynchronous admissions had settled. */
+  queuedActivationTailReleaseRetryTimer?: ReturnType<typeof setTimeout>;
   repoCardMessageId?: string;    // message_id of the repo selection card — for withdrawal
   /**
    * Repo-select card message ids already consumed by a successful pending→worker
@@ -116,6 +144,8 @@ export interface DaemonSession {
    * user message while the first turn waits for repo selection/worktree setup. */
   pendingCodexAppApplicationContext?: string;
   pendingCodexAppMessageContext?: string;
+  /** 入群自动开工首轮使用的群元数据；repo 选择或 auto-worktree 延迟启动时保留。 */
+  pendingChatContext?: ChatContext;
   /** One-shot CLI slash command to send literally after the worker reports
    *  prompt_ready. Used when a new topic starts with an adapter-default
    *  passthrough command such as `/goal`: the CLI must see raw `/...`, not a
@@ -149,12 +179,34 @@ export interface DaemonSession {
    *  so the deferred spawn after repo-selection still injects a <sender> tag
    *  matching the original caller, not the user who clicked the card. */
   pendingSender?: import('../im/lark/identity-cache.js').ResolvedSender;
+  /** Frozen plain-human steer authorization for a NEW-TOPIC opening (R5-B1-1).
+   * Set by the auto-create admission; buildReservedInitialInput COPIES it onto
+   * the opening CliTurnPayload. Only `true`; forkReservedInitialSession (shared by
+   * bot-added / scheduler / system bootstrap) never infers it. */
+  pendingCodexAppSteerable?: true;
   pendingFollowUps?: string[];         // buffered follow-up messages (enriched) sent while waiting for repo selection
   /** Exact turn for a same-caller pendingRawInput follow-up batch. Cleared on
    *  mixed callers so the combined prompt fails closed instead of borrowing. */
   pendingFollowUpTurnId?: string;
+  pendingFollowUpTurnIds?: string[];   // matching inbound ids; last id attributes a folded buffered batch
   pendingCodexAppFollowUps?: string[]; // matching raw user texts for clean Codex App materialization
   pendingCodexAppFollowUpContexts?: string[]; // matching metadata-only context; never duplicates the raw follow-up text
+  /** Arrival-time clean-input decisions matching pendingCodexAppFollowUps.
+   * Used only when a literal raw cold start must fold followers onto the same
+   * text→Enter IPC boundary. */
+  pendingCodexAppFollowUpGateAccepted?: boolean[];
+  /** Exact turns that arrived while a previously attempted queued activation
+   * was re-parked. They remain separate FIFO items behind the retained opening
+   * payload and advance only after worker acceptance. In-memory only. */
+  pendingQueuedActivationFollowUps?: Array<{
+    userPrompt: string;
+    cliInput: CliTurnPayload;
+    turnId: string;
+    dispatchAttempt?: number;
+    /** Legacy volatile entries already crossed the clean-input gate when they
+     * were staged. Migration must preserve that exact sidecar decision. */
+    codexAppInputGateFrozen?: true;
+  }>;
   ownerOpenId?: string;          // topic creator's open_id — receives write-enabled terminal link via DM
   streamCardId?: string;         // message_id of the streaming card in group (PATCHed with live output)
   streamCardNonce?: string;       // unique nonce for the current streaming card — embedded in button values to distinguish old vs current card
@@ -197,6 +249,14 @@ export interface DaemonSession {
   currentImageKey?: string;
   lastScreenContent?: string;    // last screen_update content — used to freeze card at idle
   lastScreenStatus?: StreamStatus;  // last screen_update status
+  /** Latest model reported by the live executor. In-memory and rehydrated from
+   *  the CLI transcript after worker restart; unlike Session.model it follows
+   *  in-session `/model` switches. */
+  activeModel?: string;
+  /** Latest reasoning effort reported by the live executor. */
+  activeReasoningEffort?: string;
+  /** Runtime change arrived while a streaming-card POST was in flight. */
+  pendingActiveRuntimeCardRefresh?: boolean;
   /** Executor-observed Codex settings for this worker/rollout generation. */
   codexServiceTier?: CodexServiceTierSnapshot;
   /** Tier change arrived while a card POST was in-flight. */
@@ -209,6 +269,19 @@ export interface DaemonSession {
    *  "Web终端" button opens the riff sandbox. In-memory only — re-sent by the
    *  worker on each task. */
   riffAccessUrl?: string;
+  /** Explicit-close transaction: while present, no new Riff input may be
+   * admitted until cancellation commits or admission restoration is ACKed. */
+  riffCloseState?: {
+    phase: 'preparing' | 'prepared' | 'uncertain';
+    requestId: string;
+    taskId?: string;
+  };
+  /** Graceful-shutdown transaction for the exact Riff worker generation. */
+  riffShutdownState?: {
+    phase: 'preparing' | 'prepared';
+    requestId: string;
+    taskId?: string | null;
+  };
   usageLimit?: CliUsageLimitState;
   usageLimitRetryTimer?: NodeJS.Timeout;
   /** Interval that re-PATCHes the live streaming card with fresh Context/Token
@@ -245,6 +318,23 @@ export interface DaemonSession {
     usage?: { inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheCreateTokens: number };
   }>;
   latestAsyncTriggerId?: string;
+  /** Set on a fresh async virtual turn dispatched under an at-most-once
+   *  idempotency lease (options.idempotencyKey). Lets the worker-exit handler
+   *  converge an INCOMPLETE idempotent async turn to a durable
+   *  `dispatch_unknown` terminal: a worker that dies with no final_output leaves
+   *  ds.worker=null but keeps the session in activeSessions + the async record
+   *  `pending`, which would otherwise poll `running` forever and let a same-key
+   *  retry reuse the dead session until the next daemon reconcile (codex #776
+   *  round-6 finding #1). Cleared once the turn completes (final_output). */
+  idempotentAsyncTurn?: {
+    ownerLarkAppId: string;
+    key: string;
+    triggerId: string;
+    /** The worker generation this turn was dispatched on. The exit handler only
+     *  converges when the DYING generation is this one (a later generation that
+     *  completed and moved on must not be retro-failed). */
+    workerGeneration: number;
+  };
   /** Stable turn ids whose automatic transcript fallback is capture/discard.
    *  turn_terminal clears the entry; bounded in trigger-session for crash
    *  paths that never produce a terminal. */
@@ -253,6 +343,8 @@ export interface DaemonSession {
    * (ask/relay) that cannot trust a long-lived CLI's spawn-time env. */
   managedTurnOrigin?: {
     capability: string;
+    /** Unguessable Seatbelt pane/profile authority channel. */
+    originChannelId?: string;
     turnId?: string;
     dispatchAttempt?: number;
   };
@@ -345,6 +437,14 @@ export interface DaemonSession {
     paneCols?: number;        // pane width at adopt time
     paneRows?: number;        // pane height at adopt time
   };
+}
+
+/** A non-null value means this Riff generation is deliberately rejecting new
+ * input until a close/shutdown commit or an ACKed admission restore. */
+export function riffRetirementAdmissionPhase(ds: DaemonSession): string | null {
+  if (ds.riffShutdownState) return `shutdown-${ds.riffShutdownState.phase}`;
+  if (ds.riffCloseState) return `close-${ds.riffCloseState.phase}`;
+  return null;
 }
 
 /** Composite key for activeSessions — allows multiple bots to have independent

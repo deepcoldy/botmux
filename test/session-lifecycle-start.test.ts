@@ -136,10 +136,19 @@ vi.mock('@larksuiteoapi/node-sdk', () => ({
 }));
 
 import { __testOnly_resetSessionLifecycleHooks } from '../src/services/session-lifecycle-hooks.js';
-import { forkAdoptWorker, forkWorker, initWorkerPool, sendWorkerInput } from '../src/core/worker-pool.js';
+import {
+  __testOnly_resetOrdinaryImDeliveries,
+  forkAdoptWorker,
+  forkWorker,
+  initWorkerPool,
+  promoteQueuedActivationTail,
+  sendWorkerInput,
+} from '../src/core/worker-pool.js';
 import type { DaemonSession } from '../src/core/types.js';
 import * as sessionStore from '../src/services/session-store.js';
 import { getBot } from '../src/bot-registry.js';
+import { dashboardEventBus } from '../src/core/dashboard-events.js';
+import { retireCodexAppDispatchAfterBackingMissing } from '../src/utils/codex-app-dispatch-ledger.js';
 import { mkdtempSync, rmSync, symlinkSync } from 'node:fs';
 import { tmpdir, homedir } from 'node:os';
 import { join } from 'node:path';
@@ -202,7 +211,10 @@ function defaultBot(overrides: Record<string, unknown> = {}) {
 }
 
 beforeEach(() => {
+  vi.useRealTimers();
   vi.clearAllMocks();
+  vi.mocked(sessionStore.updateSession).mockImplementation(() => undefined);
+  __testOnly_resetOrdinaryImDeliveries();
   vi.mocked(getBot).mockImplementation(() => defaultBot());
   __testOnly_resetSessionLifecycleHooks();
   forkMock.mockImplementation(() => makeFakeWorker());
@@ -211,6 +223,225 @@ beforeEach(() => {
     getSessionWorkingDir: () => '/repo',
     getActiveCount: () => 1,
     closeSession: vi.fn(),
+  });
+});
+
+describe('ordinary IM worker receipt acknowledgement', () => {
+  it('clears the watchdog when the exact live worker generation receives the turn', async () => {
+    vi.useFakeTimers();
+    const sessionReply = vi.fn(async () => 'om_reply');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const ds = makeDs();
+    forkWorker(ds, 'hello', false);
+    const worker = forkMock.mock.results.at(-1)!.value;
+
+    expect(sendWorkerInput(ds, 'business turn', 'om_business')).toBe(true);
+    worker.emit('message', { type: 'turn_input_received', turnId: 'om_business' });
+    await vi.advanceTimersByTimeAsync(5_000);
+
+    const businessSends = vi.mocked(worker.send).mock.calls
+      .map(call => call[0])
+      .filter(message => message?.type === 'message' && message?.turnId === 'om_business');
+    expect(businessSends).toHaveLength(1);
+    expect(sessionReply).not.toHaveBeenCalled();
+  });
+
+  it('retries the exact turn once and reports a visible failure when no receipt ACK arrives', async () => {
+    vi.useFakeTimers();
+    const sessionReply = vi.fn(async () => 'om_failure');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const ds = makeDs();
+    forkWorker(ds, 'hello', false);
+    const worker = forkMock.mock.results.at(-1)!.value;
+
+    expect(sendWorkerInput(ds, 'business turn', 'om_business')).toBe(true);
+    await vi.advanceTimersByTimeAsync(2_000);
+    let businessSends = vi.mocked(worker.send).mock.calls
+      .map(call => call[0])
+      .filter(message => message?.type === 'message' && message?.turnId === 'om_business');
+    expect(businessSends).toHaveLength(2);
+
+    await vi.advanceTimersByTimeAsync(2_000);
+    await Promise.resolve();
+    expect(sessionReply).toHaveBeenCalledWith(
+      'om_root',
+      expect.stringContaining('Worker 未能接收'),
+      'text',
+      'app_test',
+      'om_business',
+    );
+    businessSends = vi.mocked(worker.send).mock.calls
+      .map(call => call[0])
+      .filter(message => message?.type === 'message' && message?.turnId === 'om_business');
+    expect(businessSends).toHaveLength(2);
+  });
+
+  it('retries immediately when the parent IPC callback rejects the enqueue', async () => {
+    vi.useFakeTimers();
+    const sessionReply = vi.fn(async () => 'om_failure');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const ds = makeDs();
+    forkWorker(ds, 'hello', false);
+    const worker = forkMock.mock.results.at(-1)!.value;
+    vi.mocked(worker.send).mockImplementation((message: any, callback?: (err?: Error | null) => void) => {
+      if (message?.type === 'message') callback?.(new Error('channel closed'));
+    });
+
+    expect(sendWorkerInput(ds, 'business turn', 'om_business')).toBe(true);
+    await vi.runAllTicks();
+
+    const businessSends = vi.mocked(worker.send).mock.calls
+      .map(call => call[0])
+      .filter(message => message?.type === 'message' && message?.turnId === 'om_business');
+    expect(businessSends).toHaveLength(2);
+    expect(sessionReply).toHaveBeenCalledWith(
+      'om_root',
+      expect.stringContaining('Worker 未能接收'),
+      'text',
+      'app_test',
+      'om_business',
+    );
+  });
+
+  it('retries a turn that the worker received but could not enqueue', async () => {
+    vi.useFakeTimers();
+    const sessionReply = vi.fn(async () => 'om_failure');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const ds = makeDs();
+    forkWorker(ds, 'hello', false);
+    const worker = forkMock.mock.results.at(-1)!.value;
+
+    expect(sendWorkerInput(ds, 'business turn', 'om_business')).toBe(true);
+    worker.emit('message', { type: 'turn_input_received', turnId: 'om_business' });
+    worker.emit('message', {
+      type: 'turn_input_rejected',
+      turnId: 'om_business',
+      reason: 'cli_input_unavailable',
+    });
+    let businessSends = vi.mocked(worker.send).mock.calls
+      .map(call => call[0])
+      .filter(message => message?.type === 'message' && message?.turnId === 'om_business');
+    expect(businessSends).toHaveLength(2);
+
+    worker.emit('message', { type: 'turn_input_received', turnId: 'om_business' });
+    worker.emit('message', {
+      type: 'turn_input_rejected',
+      turnId: 'om_business',
+      reason: 'cli_input_unavailable',
+    });
+    await Promise.resolve();
+
+    expect(sessionReply).toHaveBeenCalledWith(
+      'om_root',
+      expect.stringContaining('Worker 未能接收'),
+      'text',
+      'app_test',
+      'om_business',
+    );
+    businessSends = vi.mocked(worker.send).mock.calls
+      .map(call => call[0])
+      .filter(message => message?.type === 'message' && message?.turnId === 'om_business');
+    expect(businessSends).toHaveLength(2);
+  });
+
+  it('ignores a stale worker ACK and fails the original generation visibly', async () => {
+    vi.useFakeTimers();
+    const sessionReply = vi.fn(async () => 'om_failure');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const ds = makeDs();
+    forkWorker(ds, 'first', false);
+    const firstWorker = forkMock.mock.results.at(-1)!.value;
+    expect(sendWorkerInput(ds, 'business turn', 'om_business')).toBe(true);
+
+    forkWorker(ds, 'replacement', { resume: true });
+    firstWorker.emit('message', { type: 'turn_input_received', turnId: 'om_business' });
+    await vi.advanceTimersByTimeAsync(2_000);
+    await Promise.resolve();
+
+    expect(sessionReply).toHaveBeenCalledWith(
+      'om_root',
+      expect.stringContaining('Worker 未能接收'),
+      'text',
+      'app_test',
+      'om_business',
+    );
+  });
+
+  it('tracks a cold-start init turn and retries when the worker never receives it', async () => {
+    vi.useFakeTimers();
+    const sessionReply = vi.fn(async () => 'om_failure');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const ds = makeDs();
+
+    forkWorker(ds, 'cold start', 'om_kickoff');
+    const worker = forkMock.mock.results.at(-1)!.value;
+    await vi.advanceTimersByTimeAsync(4_000);
+    await Promise.resolve();
+
+    const initSends = vi.mocked(worker.send).mock.calls
+      .map(call => call[0])
+      .filter(message => message?.type === 'init' && message?.turnId === 'om_kickoff');
+    expect(initSends).toHaveLength(2);
+    expect(sessionReply).toHaveBeenCalledWith(
+      'om_root',
+      expect.stringContaining('Worker 未能接收'),
+      'text',
+      'app_test',
+      'om_kickoff',
+    );
+  });
+
+  it('does not mistake slow startup for delivery failure after init is received', async () => {
+    vi.useFakeTimers();
+    const sessionReply = vi.fn(async () => 'om_failure');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const ds = makeDs();
+
+    forkWorker(ds, 'cold start', 'om_kickoff');
+    const worker = forkMock.mock.results.at(-1)!.value;
+    worker.emit('message', { type: 'turn_input_received', turnId: 'om_kickoff' });
+    await vi.advanceTimersByTimeAsync(10_000);
+
+    const initSends = vi.mocked(worker.send).mock.calls
+      .map(call => call[0])
+      .filter(message => message?.type === 'init' && message?.turnId === 'om_kickoff');
+    expect(initSends).toHaveLength(1);
+    expect(sessionReply).not.toHaveBeenCalled();
   });
 });
 
@@ -417,13 +648,103 @@ describe('Codex App clean-input feature gate', () => {
     ds.session.vcMeetingImTurnOrigins = { om_vc_im: origin };
 
     expect(sendWorkerInput(ds, payload, 'om_vc_im')).toBe(true);
-    expect(worker.send).toHaveBeenCalledWith({
+    expect(worker.send).toHaveBeenCalledWith(expect.objectContaining({
       type: 'message',
       content: payload.content,
       codexAppInput: { text: 'clean', clientUserMessageId: 'om_vc_im' },
       turnId: 'om_vc_im',
+      codexAppDispatchId: expect.any(String),
       vcMeetingImTurnOrigin: origin,
-    });
+    }));
+  });
+
+  it('freezes non-Lark delivery sinks into every accepted Codex App entry', () => {
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'codex-app' }));
+    const cases = [
+      {
+        sink: 'doc_comment',
+        prepare: (ds: any, turnId: string) => {
+          ds.session.docCommentTargets = {
+            [turnId]: { fileToken: 'doc', fileType: 'docx', commentId: 'comment', turnId },
+          };
+        },
+      },
+      {
+        sink: 'http_wait',
+        prepare: (ds: any, turnId: string) => {
+          ds.pendingWaitPromises = new Map([[turnId, { resolve: vi.fn() }]]);
+        },
+      },
+      {
+        sink: 'http_async',
+        prepare: (ds: any, turnId: string) => {
+          ds.asyncTriggerResults = new Map([[turnId, { status: 'pending', createdAt: Date.now() }]]);
+        },
+      },
+      {
+        sink: 'suppressed',
+        prepare: (ds: any, turnId: string) => {
+          ds.suppressedFinalOutputTurns = new Map([[turnId, 1]]);
+        },
+      },
+    ] as const;
+
+    for (const [index, fixture] of cases.entries()) {
+      const turnId = `turn-sink-${index}`;
+      const ds = makeDs({ worker: makeFakeWorker() });
+      fixture.prepare(ds, turnId);
+      expect(sendWorkerInput(ds, `payload-${index}`, turnId, {
+        ...(fixture.sink === 'suppressed' ? { dispatchAttempt: 1 } : {}),
+      })).toBe(true);
+      expect(ds.session.codexAppDispatchLedger?.[0]?.deliverySink).toBe(fixture.sink);
+    }
+  });
+
+  it('R5-B1-2: preserves codexAppSteerable through the queued admit → promote copy chain (persisted tail + queuedActivationInput + accept-ledger)', () => {
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'codex-app' }));
+    // Worker-null session already behind a queued-activation gate so a new input
+    // is ADMITTED to the durable tail (not sent live). This is the exact copy
+    // chain codex flagged: admit rebuild → promote exactInput → accept-ledger.
+    const ds = makeDs({
+      worker: makeFakeWorker(),
+      initialStartPending: true,
+    } as any);
+    ds.session.queuedActivationPending = true; // gate: force admit path
+    ds.session.queuedActivationInput = { content: 'opening' };
+
+    // Admit a plain-human steerable follow-up into the tail.
+    expect(sendWorkerInput(ds, { content: 'follow', codexAppSteerable: true }, 'turn-steer-tail', {
+      codexAppSteerable: true,
+    })).toBe(true);
+    // The PERSISTED tail entry must carry the frozen flag (admit must not strip).
+    const tailEntry = ds.session.queuedActivationTail?.find(e => e.turnId === 'turn-steer-tail');
+    expect(tailEntry?.cliInput.codexAppSteerable).toBe(true);
+
+    // Now promote the tail head (simulate the opening ACK draining the gate).
+    ds.session.queuedActivationPending = false;
+    const promoted = promoteQueuedActivationTail(ds, { send: false });
+    expect(promoted).toBe(true);
+    // The promoted queuedActivationInput and the fresh accept-ledger entry must
+    // both still carry the flag (promote exactInput + acceptCodexAppDispatch COPY).
+    expect(ds.session.queuedActivationInput?.codexAppSteerable).toBe(true);
+    expect(ds.session.codexAppDispatchLedger?.some(e => e.codexAppSteerable === true)).toBe(true);
+  });
+
+  it('R5-B1-2: a missing/false steer authorization stays forced-serial through the same copy chain', () => {
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'codex-app' }));
+    const ds = makeDs({ worker: makeFakeWorker(), initialStartPending: true } as any);
+    ds.session.queuedActivationPending = true;
+    ds.session.queuedActivationInput = { content: 'opening' };
+
+    // No codexAppSteerable → forced serial; the flag must be absent everywhere.
+    expect(sendWorkerInput(ds, { content: 'follow' }, 'turn-serial-tail')).toBe(true);
+    const tailEntry = ds.session.queuedActivationTail?.find(e => e.turnId === 'turn-serial-tail');
+    expect(tailEntry?.cliInput.codexAppSteerable).toBeUndefined();
+
+    ds.session.queuedActivationPending = false;
+    expect(promoteQueuedActivationTail(ds, { send: false })).toBe(true);
+    expect(ds.session.queuedActivationInput?.codexAppSteerable).toBeUndefined();
+    expect(ds.session.codexAppDispatchLedger?.every(e => e.codexAppSteerable !== true)).toBe(true);
   });
 
   it('resolves explicit meeting IM origin while keeping the clean cold-fork sidecar', () => {
@@ -479,7 +800,7 @@ describe('Codex App clean-input feature gate', () => {
     expect(ds.managedTurnOrigin).toBeUndefined();
   });
 
-  it('does not lend a previous human turn to a non-empty system prompt', () => {
+  it('mints a durable identity without borrowing previous-turn routing for a no-id fork', () => {
     vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'codex-app', codexAppCleanInput: true }));
     const ds = makeDs({
       currentReplyTarget: {
@@ -502,11 +823,930 @@ describe('Codex App clean-input feature gate', () => {
     const init = vi.mocked(worker.send).mock.calls[0][0];
     expect(init).toEqual(expect.objectContaining({
       prompt: payload.content,
-      promptCodexAppInput: { text: 'clean' },
+      promptCodexAppInput: {
+        text: 'clean',
+        clientUserMessageId: expect.stringMatching(/^codex-app-dispatch-/),
+      },
+      turnId: expect.stringMatching(/^codex-app-dispatch-/),
+      codexAppDispatchId: expect.any(String),
     }));
-    expect(init.turnId).toBeUndefined();
+    expect(init.promptCodexAppInput.clientUserMessageId).toBe(init.turnId);
+    expect(init.replyTurnId).toBeUndefined();
     expect(init.vcMeetingImTurnOrigin).toBeUndefined();
   });
+
+  it('mints distinct persisted identities for consecutive live no-id inputs without losing reply routing', () => {
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'codex-app', codexAppCleanInput: true }));
+    const worker = makeFakeWorker();
+    const ds = makeDs({
+      worker,
+      currentReplyTarget: {
+        rootMessageId: 'om_root',
+        turnId: 'om_route',
+        updatedAt: new Date().toISOString(),
+      },
+    });
+
+    expect(sendWorkerInput(ds, { content: 'scheduler one', codexAppInput: { text: 'one' } })).toBe(true);
+    expect(sendWorkerInput(ds, { content: 'scheduler two', codexAppInput: { text: 'two' } })).toBe(true);
+
+    const messages = vi.mocked(worker.send).mock.calls.map(call => call[0]);
+    expect(messages).toHaveLength(2);
+    expect(messages[0]).toEqual(expect.objectContaining({
+      turnId: expect.stringMatching(/^codex-app-dispatch-/),
+      replyTurnId: 'om_route',
+      codexAppDispatchId: expect.any(String),
+    }));
+    expect(messages[1]).toEqual(expect.objectContaining({
+      turnId: expect.stringMatching(/^codex-app-dispatch-/),
+      replyTurnId: 'om_route',
+      codexAppDispatchId: expect.any(String),
+    }));
+    expect(messages[1].turnId).not.toBe(messages[0].turnId);
+    expect(ds.session.codexAppDispatchLedger).toHaveLength(2);
+    expect(ds.session.codexAppDispatchLedger?.map(entry => entry.replyTurnId)).toEqual([
+      'om_route',
+      'om_route',
+    ]);
+  });
+
+  it('copies the inbound turn registry into the durable ledger after mutable reply state advances', () => {
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'codex-app' }));
+    const worker = makeFakeWorker();
+    const ds = makeDs({
+      worker,
+      scope: 'chat',
+      currentReplyTarget: {
+        rootMessageId: 'om_topic_b', turnId: 'turn-b', updatedAt: new Date().toISOString(),
+      },
+    });
+    ds.session.scope = 'chat';
+    ds.session.cliId = 'codex-app';
+    ds.session.currentReplyTarget = ds.currentReplyTarget;
+    ds.session.turnReplyContexts = {
+      'turn-a': {
+        target: { mode: 'thread', rootMessageId: 'om_topic_a' },
+        quoteTargetId: 'turn-a',
+        replyTargetSenderOpenId: 'ou_a',
+      },
+      'turn-b': { target: { mode: 'thread', rootMessageId: 'om_topic_b' } },
+    };
+
+    expect(sendWorkerInput(ds, 'late A input', 'turn-a')).toBe(true);
+    expect(ds.session.codexAppDispatchLedger?.[0]?.replyTarget)
+      .toEqual({ mode: 'thread', rootMessageId: 'om_topic_a' });
+    expect(ds.session.codexAppDispatchLedger?.[0]).toMatchObject({
+      quoteTargetId: 'turn-a', replyTargetSenderOpenId: 'ou_a',
+    });
+  });
+
+  it('rejects an empty double-fork before mutating or killing a ledger-owned live worker', () => {
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'codex-app' }));
+    const worker = makeFakeWorker();
+    const ds = makeDs({ worker });
+    ds.session.cliId = 'codex-app';
+    ds.session.queued = true;
+    ds.session.codexAppDispatchLedger = [
+      { dispatchId: 'old', turnId: 'turn-old', state: 'prepared', content: 'old' },
+    ];
+
+    forkWorker(ds, '', true);
+
+    expect(forkMock).not.toHaveBeenCalled();
+    expect(worker.send).not.toHaveBeenCalled();
+    expect(worker.kill).not.toHaveBeenCalled();
+    expect(ds.worker).toBe(worker);
+    expect(ds.session.queued).toBe(true);
+    expect(sessionStore.updateSession).not.toHaveBeenCalled();
+  });
+
+  it('routes a non-empty double-fork into the existing durable FIFO without replacing its worker', () => {
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'codex-app', codexAppCleanInput: true }));
+    const worker = makeFakeWorker();
+    const ds = makeDs({ worker });
+    ds.session.cliId = 'codex-app';
+    ds.session.codexAppDispatchLedger = [
+      { dispatchId: 'old', turnId: 'turn-old', state: 'prepared', content: 'old' },
+    ];
+
+    forkWorker(ds, { content: 'next', codexAppInput: { text: 'next clean' } }, {
+      resume: true,
+      turnId: 'turn-next',
+      dispatchAttempt: 2,
+    });
+
+    expect(forkMock).not.toHaveBeenCalled();
+    expect(worker.kill).not.toHaveBeenCalled();
+    expect(worker.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'message',
+      content: 'next',
+      turnId: 'turn-next',
+      dispatchAttempt: 2,
+      codexAppDispatchId: expect.any(String),
+    }));
+    expect(ds.session.codexAppDispatchLedger?.map(entry => entry.turnId))
+      .toEqual(['turn-old', 'turn-next']);
+  });
+
+  it('stages a non-Codex double-fork behind a tokened activation without live IPC', () => {
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'claude-code' }));
+    const worker = makeFakeWorker();
+    const ds = makeDs({ worker, initialStartPending: true });
+    Object.assign(ds.session, {
+      cliId: 'claude-code',
+      queuedActivationPending: true,
+      queuedActivationToken: 'opening-token',
+      queuedActivationInput: { content: 'OPENING_N' },
+      queuedActivationTurnId: 'turn-opening',
+    });
+
+    forkWorker(ds, { content: 'FOLLOWER_N1' }, {
+      resume: true,
+      turnId: 'turn-follower',
+      dispatchAttempt: 3,
+    });
+
+    expect(forkMock).not.toHaveBeenCalled();
+    expect(worker.send).not.toHaveBeenCalled();
+    expect(worker.kill).not.toHaveBeenCalled();
+    expect(ds.session.queuedActivationTail).toEqual([
+      expect.objectContaining({
+        order: 1,
+        turnId: 'turn-follower',
+        dispatchAttempt: 3,
+        userPrompt: 'FOLLOWER_N1',
+        cliInput: { content: 'FOLLOWER_N1' },
+      }),
+    ]);
+    expect(sessionStore.updateSession).toHaveBeenCalledWith(ds.session);
+  });
+
+  it('rejects a gated non-Codex double-fork when exact-tail persistence fails', () => {
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'claude-code' }));
+    const worker = makeFakeWorker();
+    const ds = makeDs({ worker, initialStartPending: true });
+    Object.assign(ds.session, {
+      cliId: 'claude-code',
+      queuedActivationPending: true,
+      queuedActivationToken: 'opening-token',
+      queuedActivationInput: { content: 'OPENING_N' },
+      queuedActivationTurnId: 'turn-opening',
+    });
+    vi.mocked(sessionStore.updateSession).mockImplementationOnce(() => {
+      throw new Error('tail store unavailable');
+    });
+
+    expect(() => forkWorker(ds, 'FOLLOWER_MUST_NOT_SEND', { turnId: 'turn-follower' }))
+      .toThrow('tail store unavailable');
+
+    expect(forkMock).not.toHaveBeenCalled();
+    expect(worker.send).not.toHaveBeenCalled();
+    expect(worker.kill).not.toHaveBeenCalled();
+    expect(ds.session.queuedActivationTail).toBeUndefined();
+    expect(ds.session.queuedActivationPending).toBe(true);
+  });
+
+  it('rolls back an exact tail promotion when its single durable write fails', () => {
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'claude-code' }));
+    const ds = makeDs({ hasHistory: true, initialStartPending: true });
+    ds.session.cliId = 'claude-code';
+    ds.session.queuedActivationTail = [{
+      id: 'tail-promote-1',
+      order: 1,
+      userPrompt: 'PROMOTE_ME',
+      cliInput: { content: 'PROMOTE_ME' },
+      turnId: 'turn-promote',
+      dispatchAttempt: 4,
+    }];
+    ds.session.queuedActivationTailNextOrder = 1;
+    vi.mocked(sessionStore.updateSession).mockImplementationOnce(() => {
+      throw new Error('promotion store unavailable');
+    });
+
+    expect(promoteQueuedActivationTail(ds, { send: false })).toBe(false);
+
+    expect(ds.session.queuedActivationPending).toBeUndefined();
+    expect(ds.session.queuedActivationToken).toBeUndefined();
+    expect(ds.session.queuedActivationInput).toBeUndefined();
+    expect(ds.session.queuedActivationTail).toEqual([expect.objectContaining({
+      id: 'tail-promote-1',
+      turnId: 'turn-promote',
+      dispatchAttempt: 4,
+      cliInput: { content: 'PROMOTE_ME' },
+    })]);
+    expect(ds.pendingPrompt).toBeUndefined();
+  });
+
+  // ── Central quarantine guard (resolveQuarantinedForkPlan inside forkWorker) ──
+  // These drive the REAL forkWorker + REAL promoteQueuedActivationTail (only the
+  // child fork + session store are faked), so they cover the actual wiring codex
+  // asked for: restore-time quarantine → next real fork boundary. A helper-only
+  // unit test could not catch the P2-A/P2-B defects (wrong fork target / missed
+  // entry point) because those live in how forkWorker applies the plan.
+  describe('quarantined tail-only owner recovery at the fork boundary', () => {
+    function quarantinedDs(cliId: 'codex-app' | 'claude-code'): DaemonSession {
+      const ds = makeDs({
+        hasHistory: true,
+        initialStartPending: true,
+        quarantinedActivationTailPromotion: true,
+      });
+      ds.session.cliId = cliId;
+      // The old head that failed to promote at restore, still parked in the tail.
+      ds.session.queuedActivationTail = [{
+        id: 'tail-head',
+        order: 1,
+        userPrompt: 'OLD_HEAD',
+        cliInput: { content: 'OLD_HEAD' },
+        turnId: 'turn-old-head',
+        dispatchAttempt: 7,
+      }];
+      ds.session.queuedActivationTailNextOrder = 1;
+      return ds;
+    }
+
+    it('REFUSES a non-empty fork while quarantined (returns false, no fork, no promotion, no overtaking)', () => {
+      vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'codex-app' }));
+      const ds = quarantinedDs('codex-app');
+
+      const forked = forkWorker(ds, 'BRAND_NEW_TURN', { turnId: 'turn-new' });
+
+      expect(forked).toBe(false);
+      // No worker started — the caller must treat the session as still worker-less.
+      expect(forkMock).not.toHaveBeenCalled();
+      // Promotion NOT attempted (a non-empty prompt could overtake the old head;
+      // the guard bails before touching promotion).
+      expect(ds.session.queuedActivationPending).toBeUndefined();
+      // Still quarantined; the old head is untouched at the front of the tail.
+      expect(ds.quarantinedActivationTailPromotion).toBe(true);
+      expect(ds.session.queuedActivationTail?.[0]?.turnId).toBe('turn-old-head');
+    });
+
+    it('retry FAILS → refuses the blank fork, keeps worker:null + gate + quarantine (never a live worker beside an unpromoted tail)', () => {
+      vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'codex-app' }));
+      const ds = quarantinedDs('codex-app');
+      // Promotion's single durable write still fails transiently.
+      vi.mocked(sessionStore.updateSession).mockImplementationOnce(() => {
+        throw new Error('promotion store still unavailable');
+      });
+
+      const forked = forkWorker(ds, '', true);
+
+      expect(forked).toBe(false);
+      expect(forkMock).not.toHaveBeenCalled();
+      // Gate stays held and the session stays quarantined for a later boundary.
+      expect(ds.initialStartPending).toBe(true);
+      expect(ds.quarantinedActivationTailPromotion).toBe(true);
+      // Old head not promoted, still parked exactly.
+      expect(ds.session.queuedActivationPending).toBeUndefined();
+      expect(ds.session.queuedActivationTail?.[0]?.turnId).toBe('turn-old-head');
+    });
+
+    it('retry SUCCEEDS (Codex App) → clears quarantine, forks a recovery worker for the PROMOTED OLD HEAD via the ledger', () => {
+      vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'codex-app' }));
+      const ds = quarantinedDs('codex-app');
+
+      const forked = forkWorker(ds, '', true);
+
+      expect(forked).toBe(true);
+      // Promotion moved the old head into the tokened activation.
+      expect(ds.session.queuedActivationPending).toBe(true);
+      expect(ds.session.queuedActivationInput?.content).toBe('OLD_HEAD');
+      expect(ds.session.queuedActivationTurnId).toBe('turn-old-head');
+      // Quarantine cleared; a real worker was forked to recover it.
+      expect(ds.quarantinedActivationTailPromotion).toBeUndefined();
+      expect(forkMock).toHaveBeenCalledTimes(1);
+      // Codex App recovers through its dispatch ledger, NOT the init prompt arg:
+      // the promoted old head travels as the tokened queuedActivationInput (+ the
+      // recovered ledger entry), so the worker is spawned with an EMPTY init
+      // prompt — never a synthetic opening turn. (The head content is asserted via
+      // queuedActivationInput above.)
+      const worker = forkMock.mock.results.at(-1)!.value;
+      const init = vi.mocked(worker.send).mock.calls[0][0];
+      expect(init.type).toBe('init');
+      expect(init.prompt).toBe('');
+      expect(init.queuedActivationToken).toBeTruthy();
+    });
+
+    it('retry SUCCEEDS (non-Codex) → forks the exact queuedActivationInput as the recovery prompt (not an opening builder envelope)', () => {
+      vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'claude-code' }));
+      const ds = quarantinedDs('claude-code');
+
+      const forked = forkWorker(ds, '', true);
+
+      expect(forked).toBe(true);
+      expect(ds.session.queuedActivationPending).toBe(true);
+      expect(ds.session.queuedActivationInput?.content).toBe('OLD_HEAD');
+      expect(ds.quarantinedActivationTailPromotion).toBeUndefined();
+      expect(forkMock).toHaveBeenCalledTimes(1);
+      // Non-Codex resubmits the exact recovered input as the worker prompt — a
+      // plain 'OLD_HEAD', with no new-topic routing/<user_message> envelope wrapped
+      // around it (which forkReservedInitialSession would have produced).
+      const worker = forkMock.mock.results.at(-1)!.value;
+      const init = vi.mocked(worker.send).mock.calls[0][0];
+      expect(init.type).toBe('init');
+      expect(init.prompt).toBe('OLD_HEAD');
+      expect(init.prompt).not.toContain('<user_message>');
+    });
+
+    it('is a pure pass-through for a NON-quarantined session (no promotion side effects)', () => {
+      vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'codex-app' }));
+      const ds = quarantinedDs('codex-app');
+      ds.quarantinedActivationTailPromotion = undefined; // not quarantined
+
+      const forked = forkWorker(ds, '', true);
+
+      expect(forked).toBe(true);
+      // The old head is left exactly where it was — the guard did not promote it.
+      expect(ds.session.queuedActivationPending).toBeUndefined();
+      expect(ds.session.queuedActivationTail?.[0]?.turnId).toBe('turn-old-head');
+    });
+  });
+
+  it('promotes the admitted clean sidecar exactly even after the live config gate flips off', () => {
+    let cleanInputEnabled = true;
+    vi.mocked(getBot).mockImplementation(() => defaultBot({
+      cliId: 'codex-app',
+      codexAppCleanInput: cleanInputEnabled,
+    }));
+    const worker = makeFakeWorker();
+    const ds = makeDs({ worker, initialStartPending: true, hasHistory: true });
+    Object.assign(ds.session, {
+      cliId: 'codex-app',
+      queuedActivationPending: true,
+      queuedActivationToken: 'opening-token',
+      queuedActivationInput: { content: 'OPENING_N' },
+      queuedActivationTurnId: 'turn-opening',
+    });
+    const admittedSidecar = {
+      text: 'FOLLOWER_CLEAN_N1',
+      additionalContext: {
+        hidden: { kind: 'application' as const, value: '<hidden>exact</hidden>' },
+      },
+    };
+
+    expect(sendWorkerInput(ds, {
+      content: '<user_message>FOLLOWER_LEGACY_N1</user_message>',
+      codexAppInput: admittedSidecar,
+    }, 'turn-follower', { dispatchAttempt: 5 })).toBe(true);
+    expect(worker.send).not.toHaveBeenCalled();
+    expect(ds.session.queuedActivationTail?.[0]?.cliInput.codexAppInput).toEqual({
+      ...admittedSidecar,
+      clientUserMessageId: 'turn-follower',
+    });
+
+    // Model the opening ACK, then flip the immediate setting before N+1 is
+    // promoted. The persisted entry—not current config—is authoritative.
+    Object.assign(ds.session, {
+      queuedActivationPending: undefined,
+      queuedActivationToken: undefined,
+      queuedActivationInput: undefined,
+      queuedActivationTurnId: undefined,
+      queuedActivationDispatchAttempt: undefined,
+      queuedActivationResume: undefined,
+    });
+    cleanInputEnabled = false;
+
+    expect(promoteQueuedActivationTail(ds)).toBe(true);
+
+    const exactSidecar = {
+      ...admittedSidecar,
+      clientUserMessageId: 'turn-follower',
+    };
+    expect(ds.session.queuedActivationInput?.codexAppInput).toEqual(exactSidecar);
+    expect(ds.session.codexAppDispatchLedger?.at(-1)?.codexAppInput).toEqual(exactSidecar);
+    expect(worker.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'message',
+      turnId: 'turn-follower',
+      dispatchAttempt: 5,
+      codexAppInput: exactSidecar,
+      queuedActivationToken: expect.any(String),
+    }));
+  });
+
+  it('retries the exact pre-init activation sidecar after the live gate flips off', () => {
+    let cleanInputEnabled = true;
+    vi.mocked(getBot).mockImplementation(() => defaultBot({
+      cliId: 'codex-app',
+      codexAppCleanInput: cleanInputEnabled,
+    }));
+    const ds = makeDs();
+    Object.assign(ds.session, {
+      cliId: 'codex-app',
+      queued: true,
+      queuedPrompt: '<user_message>OPENING_LEGACY</user_message>',
+      queuedCodexAppText: 'OPENING_CLEAN',
+    });
+    const exactSidecar = {
+      text: 'OPENING_CLEAN',
+      additionalContext: {
+        hidden: { kind: 'application' as const, value: '<hidden>retry-exact</hidden>' },
+      },
+      clientUserMessageId: 'turn-exact-retry',
+    };
+    const failingWorker = makeFakeWorker();
+    failingWorker.send = vi.fn(() => {
+      throw new Error('init IPC rejected before acceptance');
+    });
+    forkMock.mockReturnValueOnce(failingWorker);
+
+    expect(() => forkWorker(ds, {
+      content: '<user_message>OPENING_LEGACY</user_message>',
+      codexAppInput: {
+        text: exactSidecar.text,
+        additionalContext: exactSidecar.additionalContext,
+      },
+    }, { turnId: 'turn-exact-retry', dispatchAttempt: 7 }))
+      .toThrow('init IPC rejected before acceptance');
+
+    expect(ds.session.queued).toBe(true);
+    expect(ds.session.queuedActivationInput?.codexAppInput).toEqual(exactSidecar);
+    expect(ds.session.codexAppDispatchLedger).toEqual([]);
+
+    cleanInputEnabled = false;
+    const retained = ds.session.queuedActivationInput!;
+    forkWorker(ds, retained, {
+      turnId: ds.session.queuedActivationTurnId,
+      dispatchAttempt: ds.session.queuedActivationDispatchAttempt,
+    });
+
+    const retryWorker = forkMock.mock.results.at(-1)!.value;
+    const retryInit = vi.mocked(retryWorker.send).mock.calls[0]![0];
+    expect(retryInit.promptCodexAppInput).toEqual(exactSidecar);
+    expect(ds.session.queuedActivationInput?.codexAppInput).toEqual(exactSidecar);
+    expect(ds.session.codexAppDispatchLedger?.at(-1)?.codexAppInput).toEqual(exactSidecar);
+  });
+
+  it('rolls back only the new double-fork acceptance when existing-worker IPC fails', () => {
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'codex-app' }));
+    const worker = makeFakeWorker();
+    worker.send = vi.fn(() => { throw new Error('ipc failed'); });
+    const ds = makeDs({ worker });
+    ds.session.cliId = 'codex-app';
+    const oldEntry = { dispatchId: 'old', turnId: 'turn-old', state: 'accepted' as const, content: 'old' };
+    ds.session.codexAppDispatchLedger = [oldEntry];
+
+    forkWorker(ds, 'next', { turnId: 'turn-next' });
+
+    expect(forkMock).not.toHaveBeenCalled();
+    expect(worker.kill).not.toHaveBeenCalled();
+    expect(ds.worker).toBe(worker);
+    expect(ds.session.codexAppDispatchLedger).toEqual([oldEntry]);
+  });
+
+  it('persists queued dequeue and Codex App acceptance until the exact submission ACK', async () => {
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'codex-app' }));
+    const oldEntry = {
+      dispatchId: 'dispatch-existing',
+      turnId: 'turn-existing',
+      state: 'accepted' as const,
+      content: 'existing FIFO item',
+    };
+    const ds = makeDs();
+    Object.assign(ds.session, {
+      cliId: 'codex-app',
+      queued: true,
+      queuedPrompt: 'queued opening',
+      queuedCodexAppText: 'queued clean input',
+      queuedCodexAppMessageContext: 'queued context',
+      codexAppDispatchLedger: [oldEntry],
+    });
+    const persisted: Array<DaemonSession['session']> = [];
+    vi.mocked(sessionStore.updateSession).mockImplementation(session => {
+      persisted.push(structuredClone(session));
+    });
+
+    forkWorker(ds, 'queued opening', { turnId: 'turn-queued' });
+
+    const firstDequeued = persisted.find(snapshot => snapshot.queued === false);
+    expect(firstDequeued).toMatchObject({
+      queued: false,
+      queuedActivationPending: true,
+      queuedActivationToken: expect.any(String),
+      queuedActivationInput: { content: 'queued opening' },
+      queuedActivationTurnId: 'turn-queued',
+      queuedPrompt: 'queued opening',
+      queuedCodexAppText: 'queued clean input',
+      queuedCodexAppMessageContext: 'queued context',
+      codexAppDispatchLedger: [
+        oldEntry,
+        expect.objectContaining({
+          turnId: 'turn-queued',
+          state: 'accepted',
+          queuedActivationToken: expect.any(String),
+        }),
+      ],
+    });
+    expect(persisted).not.toContainEqual(expect.objectContaining({
+      queued: false,
+      codexAppDispatchLedger: [oldEntry],
+    }));
+    expect(ds.session).toMatchObject({
+      queued: false,
+      queuedActivationPending: true,
+      queuedActivationToken: expect.any(String),
+      queuedActivationInput: { content: 'queued opening' },
+      queuedPrompt: 'queued opening',
+      codexAppDispatchLedger: [
+        oldEntry,
+        expect.objectContaining({ turnId: 'turn-queued', state: 'accepted' }),
+      ],
+    });
+    const worker = forkMock.mock.results.at(-1)!.value;
+    const init = vi.mocked(worker.send).mock.calls[0]![0];
+    expect(init.queuedActivationToken).toBe(ds.session.queuedActivationToken);
+    worker.emit('message', {
+      type: 'queued_activation_submitted',
+      sessionId: ds.session.sessionId,
+      activationToken: init.queuedActivationToken,
+    });
+    await vi.waitFor(() => expect(ds.session.queuedActivationPending).toBeUndefined());
+    expect(ds.session.queuedActivationPending).toBeUndefined();
+    expect(ds.session.queuedPrompt).toBeUndefined();
+    expect(ds.session.queuedActivationInput).toBeUndefined();
+  });
+
+  it('recovers a post-init crash journal through the accepted Codex FIFO until its ACK', async () => {
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'codex-app' }));
+    const accepted = {
+      dispatchId: 'dispatch-accepted-before-crash',
+      turnId: 'turn-queued',
+      state: 'accepted' as const,
+      content: 'queued opening',
+    };
+    const ds = makeDs();
+    Object.assign(ds.session, {
+      cliId: 'codex-app',
+      queued: false,
+      queuedActivationPending: true,
+      queuedPrompt: 'queued opening',
+      queuedCodexAppText: 'queued clean input',
+      queuedCodexAppMessageContext: 'queued context',
+      codexAppDispatchLedger: [accepted],
+    });
+    const persisted: Array<DaemonSession['session']> = [];
+    vi.mocked(sessionStore.updateSession).mockImplementation(session => {
+      persisted.push(structuredClone(session));
+    });
+
+    forkWorker(ds, '', true);
+
+    const worker = forkMock.mock.results.at(-1)!.value;
+    const init = vi.mocked(worker.send).mock.calls[0][0];
+    expect(init).toMatchObject({
+      prompt: '',
+      resume: true,
+      queuedActivationToken: expect.any(String),
+      codexAppRecoveredDispatches: [expect.objectContaining({
+        ...accepted,
+        queuedActivationToken: expect.any(String),
+      })],
+    });
+    expect(init).not.toHaveProperty('codexAppDispatchId');
+    expect(ds.session.codexAppDispatchLedger).toEqual([accepted]);
+    expect(ds.session.queued).toBe(false);
+    expect(ds.session.queuedActivationPending).toBe(true);
+    expect(ds.session.queuedPrompt).toBe('queued opening');
+    worker.emit('message', {
+      type: 'queued_activation_submitted',
+      sessionId: ds.session.sessionId,
+      activationToken: init.queuedActivationToken,
+    });
+    await vi.waitFor(() => expect(ds.session.queuedActivationPending).toBeUndefined());
+    expect(ds.session.queuedActivationPending).toBeUndefined();
+    expect(ds.session.queuedPrompt).toBeUndefined();
+    expect(persisted).toContainEqual(expect.objectContaining({
+      queued: false,
+      queuedActivationPending: undefined,
+      queuedPrompt: undefined,
+      codexAppDispatchLedger: [accepted],
+    }));
+  });
+
+  it('durably restores a queued payload and preserves the prior FIFO when child fork throws', () => {
+    vi.mocked(getBot).mockImplementation(() => defaultBot({
+      cliId: 'codex-app',
+      codexAppCleanInput: true,
+    }));
+    const oldEntry = {
+      dispatchId: 'dispatch-existing',
+      turnId: 'turn-existing',
+      state: 'accepted' as const,
+      content: 'existing FIFO item',
+    };
+    const ds = makeDs();
+    Object.assign(ds.session, {
+      cliId: 'codex-app',
+      queued: true,
+      queuedPrompt: '<queued>wrapped opening</queued>',
+      queuedCodexAppText: 'clean opening',
+      queuedCodexAppMessageContext: '<context>queued</context>',
+      codexAppDispatchLedger: [oldEntry],
+    });
+    const persisted: Array<DaemonSession['session']> = [];
+    vi.mocked(sessionStore.updateSession).mockImplementation(session => {
+      persisted.push(structuredClone(session));
+    });
+    forkMock.mockImplementationOnce(() => { throw new Error('synchronous fork failed'); });
+
+    expect(() => forkWorker(ds, {
+      content: '<queued>wrapped opening</queued>',
+      codexAppInput: { text: 'clean opening' },
+    }, { turnId: 'turn-queued' })).toThrow('synchronous fork failed');
+
+    expect(ds.worker).toBeNull();
+    expect(ds.session).toMatchObject({
+      queued: true,
+      queuedPrompt: '<queued>wrapped opening</queued>',
+      queuedCodexAppText: 'clean opening',
+      queuedCodexAppMessageContext: '<context>queued</context>',
+    });
+    expect(ds.session.codexAppDispatchLedger).toEqual([oldEntry]);
+    expect(persisted.at(-1)).toMatchObject({
+      queued: true,
+      queuedPrompt: '<queued>wrapped opening</queued>',
+      queuedCodexAppText: 'clean opening',
+      queuedCodexAppMessageContext: '<context>queued</context>',
+      codexAppDispatchLedger: [oldEntry],
+    });
+  });
+
+  it('fences the child and atomically restores queued/FIFO state when init IPC throws', () => {
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'codex-app' }));
+    const oldEntry = {
+      dispatchId: 'dispatch-existing',
+      turnId: 'turn-existing',
+      state: 'prepared' as const,
+      content: 'existing FIFO item',
+    };
+    const ds = makeDs();
+    Object.assign(ds.session, {
+      cliId: 'codex-app',
+      queued: true,
+      queuedPrompt: 'queued opening',
+      queuedCodexAppText: 'queued clean input',
+      queuedCodexAppMessageContext: 'queued context',
+      codexAppDispatchLedger: [oldEntry],
+    });
+    const persisted: Array<DaemonSession['session']> = [];
+    vi.mocked(sessionStore.updateSession).mockImplementation(session => {
+      persisted.push(structuredClone(session));
+    });
+    const worker = makeFakeWorker();
+    worker.send = vi.fn(() => { throw new Error('synchronous init IPC failed'); });
+    forkMock.mockReturnValueOnce(worker);
+
+    expect(() => forkWorker(ds, 'queued opening', { turnId: 'turn-queued' }))
+      .toThrow('synchronous init IPC failed');
+
+    expect(worker.kill).toHaveBeenCalledOnce();
+    expect(ds.worker).toBeNull();
+    expect(ds.session).toMatchObject({
+      queued: true,
+      queuedPrompt: 'queued opening',
+      queuedCodexAppText: 'queued clean input',
+      queuedCodexAppMessageContext: 'queued context',
+    });
+    expect(ds.session.codexAppDispatchLedger).toEqual([oldEntry]);
+    expect(persisted.at(-1)).toMatchObject({
+      queued: true,
+      queuedPrompt: 'queued opening',
+      codexAppDispatchLedger: [oldEntry],
+    });
+  });
+
+  it('retains the exact Codex activation journal after init IPC until submission is proved', async () => {
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'codex-app' }));
+    const ds = makeDs();
+    Object.assign(ds.session, {
+      cliId: 'codex-app',
+      queued: true,
+      queuedPrompt: 'queued opening',
+      queuedCodexAppText: 'queued clean input',
+      codexAppDispatchLedger: [],
+    });
+
+    forkWorker(ds, 'queued opening', { turnId: 'turn-queued' });
+    const worker = forkMock.mock.results.at(-1)!.value;
+    worker.emit('error', new Error('async spawn error after send returned'));
+    await Promise.resolve();
+
+    expect(ds.session.queued).toBe(false);
+    expect(ds.session.queuedActivationPending).toBe(true);
+    expect(ds.session.queuedActivationToken).toEqual(expect.any(String));
+    expect(ds.session.queuedActivationInput).toEqual({ content: 'queued opening' });
+    expect(ds.session.queuedPrompt).toBe('queued opening');
+    expect(ds.session.codexAppDispatchLedger).toEqual([
+      expect.objectContaining({ turnId: 'turn-queued', state: 'accepted' }),
+    ]);
+    expect(ds.worker).toBeNull();
+    expect(ds.initialStartPending).toBe(false);
+    expect(worker.kill).toHaveBeenCalledOnce();
+  });
+
+  it.each(['error', 'exit'] as const)(
+    'retains the exact non-Codex activation journal when its worker emits %s before ACK',
+    async event => {
+      const ds = makeDs();
+      Object.assign(ds.session, {
+        cliId: 'codex',
+        queued: true,
+        queuedPrompt: 'BACKLOG_AND_TRIGGER_REPLY',
+      });
+
+      forkWorker(ds, { content: 'BACKLOG_AND_TRIGGER_REPLY' }, {
+        turnId: 'turn-trigger-reply',
+        dispatchAttempt: 3,
+      });
+      const worker = forkMock.mock.results.at(-1)!.value;
+      if (event === 'error') worker.emit('error', new Error('pre-ACK worker error'));
+      else worker.emit('exit', 1, null);
+      await Promise.resolve();
+
+      expect(ds.worker).toBeNull();
+      expect(ds.initialStartPending).toBe(false);
+      expect(ds.session).toMatchObject({
+        queued: false,
+        queuedPrompt: 'BACKLOG_AND_TRIGGER_REPLY',
+        queuedActivationPending: true,
+        queuedActivationToken: expect.any(String),
+        queuedActivationInput: { content: 'BACKLOG_AND_TRIGGER_REPLY' },
+        queuedActivationTurnId: 'turn-trigger-reply',
+        queuedActivationDispatchAttempt: 3,
+        queuedActivationResume: false,
+      });
+      expect(vi.mocked(sessionStore.updateSession).mock.calls.map(call => call[0]))
+        .toContainEqual(expect.objectContaining({
+          queued: false,
+          queuedActivationPending: true,
+          queuedActivationInput: { content: 'BACKLOG_AND_TRIGGER_REPLY' },
+        }));
+    },
+  );
+
+  it('keeps the worker authoritative and restores its journal when ACK persistence fails', async () => {
+    vi.useFakeTimers({ now: 0 });
+    try {
+      const ds = makeDs();
+      Object.assign(ds.session, {
+        queued: true,
+        queuedPrompt: 'queued opening',
+      });
+      forkWorker(ds, 'queued opening', { turnId: 'turn-queued' });
+      const worker = forkMock.mock.results.at(-1)!.value;
+      const init = vi.mocked(worker.send).mock.calls[0]![0];
+      vi.mocked(sessionStore.updateSession).mockImplementationOnce(() => {
+        throw new Error('ACK journal write failed');
+      });
+
+      worker.emit('message', {
+        type: 'queued_activation_submitted',
+        sessionId: ds.session.sessionId,
+        activationToken: init.queuedActivationToken,
+      });
+      await Promise.resolve();
+
+      expect(ds.worker).toBe(worker);
+      expect(worker.kill).not.toHaveBeenCalled();
+      expect(ds.hasHistory).toBe(false);
+      expect(ds.initialStartPending).toBe(true);
+      expect(ds.session).toMatchObject({
+        queued: false,
+        queuedActivationPending: true,
+        queuedActivationToken: init.queuedActivationToken,
+        queuedActivationInput: { content: 'queued opening' },
+        queuedPrompt: 'queued opening',
+      });
+
+      await vi.advanceTimersByTimeAsync(100);
+      expect(ds.hasHistory).toBe(true);
+      expect(ds.initialStartPending).toBe(false);
+      expect(ds.session.queuedActivationPending).toBeUndefined();
+      expect(ds.session.queuedActivationToken).toBeUndefined();
+      expect(ds.session.queuedActivationInput).toBeUndefined();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('never reports retryable activation failure after init IPC accepted the worker', () => {
+    const enforceLiveSessionCap = vi.fn(() => {
+      throw new Error('post-send cap projection failed');
+    });
+    initWorkerPool({
+      sessionReply: vi.fn(async () => 'om_reply'),
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+      enforceLiveSessionCap,
+    });
+    vi.mocked(sessionStore.updateSessionPid).mockImplementationOnce(() => {
+      throw new Error('post-send pid persistence failed');
+    });
+    vi.mocked(dashboardEventBus.publish).mockImplementationOnce(() => {
+      throw new Error('post-send dashboard projection failed');
+    });
+    const ds = makeDs();
+    Object.assign(ds.session, {
+      queued: true,
+      queuedPrompt: 'queued opening',
+    });
+
+    expect(() => forkWorker(ds, 'queued opening', { turnId: 'turn-queued' }))
+      .not.toThrow();
+    expect(ds.worker).toBe(forkMock.mock.results.at(-1)!.value);
+    expect(ds.session).toMatchObject({
+      queued: false,
+      queuedActivationPending: true,
+      queuedActivationInput: { content: 'queued opening' },
+    });
+    expect(enforceLiveSessionCap).toHaveBeenCalledOnce();
+  });
+
+  it('retries only an unaccepted ACK follow-up with exponential backoff capped at five seconds', async () => {
+    vi.useFakeTimers({ now: 0 });
+    try {
+      const callTimes: number[] = [];
+      const release = vi.fn((session: DaemonSession) => {
+        callTimes.push(Date.now());
+        if (callTimes.length < 9) return false;
+        session.initialStartPending = false;
+        return true;
+      });
+      initWorkerPool({
+        sessionReply: vi.fn(async () => 'om_reply'),
+        getSessionWorkingDir: () => '/repo',
+        getActiveCount: () => 1,
+        closeSession: vi.fn(),
+        onQueuedActivationSubmitted: release,
+      });
+      const ds = makeDs();
+      Object.assign(ds.session, {
+        queued: true,
+        queuedPrompt: 'queued opening',
+      });
+
+      forkWorker(ds, 'queued opening', { turnId: 'turn-queued' });
+      const worker = forkMock.mock.results.at(-1)!.value;
+      const init = vi.mocked(worker.send).mock.calls[0]![0];
+      worker.emit('message', {
+        type: 'queued_activation_submitted',
+        sessionId: ds.session.sessionId,
+        activationToken: init.queuedActivationToken,
+      });
+      await vi.advanceTimersByTimeAsync(0);
+      for (let i = 0; i < 8; i++) await vi.runOnlyPendingTimersAsync();
+
+      expect(release).toHaveBeenCalledTimes(9);
+      expect(callTimes.slice(1).map((time, i) => time - callTimes[i]!))
+        .toEqual([100, 200, 400, 800, 1_600, 3_200, 5_000, 5_000]);
+      expect(ds.initialStartPending).toBe(false);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it.each(['accepted', 'prepared'] as const)(
+    'does not restore crashed %s N beside hub replay N+1 after exact backing-missing retirement',
+    state => {
+      vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'codex-app' }));
+      const ds = makeDs();
+      ds.session.cliId = 'codex-app';
+      ds.session.codexAppDispatchLedger = [{
+        dispatchId: 'old-dispatch', turnId: 'delivery', dispatchAttempt: 1,
+        state, content: 'old N',
+      }];
+      const retired = retireCodexAppDispatchAfterBackingMissing(
+        ds.session.codexAppDispatchLedger,
+        'delivery',
+        1,
+      );
+      expect(retired.ok).toBe(true);
+      if (!retired.ok) return;
+      ds.session.codexAppDispatchLedger = retired.ledger;
+      sessionStore.updateSession(ds.session);
+
+      forkWorker(ds, 'hub replay N+1', {
+        resume: true,
+        turnId: 'delivery',
+        dispatchAttempt: 2,
+      });
+
+      const worker = forkMock.mock.results.at(-1)!.value;
+      const init = vi.mocked(worker.send).mock.calls[0][0];
+      expect(init.codexAppRecoveredDispatches).toBeUndefined();
+      expect(init).toEqual(expect.objectContaining({
+        turnId: 'delivery',
+        dispatchAttempt: 2,
+        codexAppDispatchId: expect.not.stringMatching(/^old-dispatch$/),
+      }));
+      expect(ds.session.codexAppDispatchLedger).toEqual([
+        expect.objectContaining({
+          turnId: 'delivery', dispatchAttempt: 2, state: 'accepted',
+        }),
+      ]);
+    },
+  );
 
   it('starts an old queued activation without a sidecar and a modern one with exactly one', () => {
     vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'codex-app', codexAppCleanInput: true }));
@@ -541,18 +1781,20 @@ describe('Codex App clean-input feature gate', () => {
     ds.session.agentFrozen = true;
 
     expect(sendWorkerInput(ds, payload, 'om_1')).toBe(true);
-    expect(worker.send).toHaveBeenLastCalledWith({
+    expect(worker.send).toHaveBeenLastCalledWith(expect.objectContaining({
       type: 'message',
       content: payload.content,
       codexAppInput: { text: 'clean', clientUserMessageId: 'om_1' },
       turnId: 'om_1',
-    });
+      codexAppDispatchId: expect.any(String),
+    }));
 
     bot.config.codexAppCleanInput = undefined;
     expect(sendWorkerInput(ds, payload, 'om_2')).toBe(true);
-    expect(worker.send).toHaveBeenLastCalledWith({
+    expect(worker.send).toHaveBeenLastCalledWith(expect.objectContaining({
       type: 'message', content: payload.content, turnId: 'om_2',
-    });
+      codexAppDispatchId: expect.any(String),
+    }));
   });
 
   it('never applies the sidecar to a frozen non-Codex-App session', () => {
@@ -1430,12 +2672,13 @@ describe('worker startup failure delivery', () => {
       content: '<user_message>legacy follow-up</user_message>',
       codexAppInput: { text: 'clean follow-up' },
     }, 'turn-live-clean')).toBe(true);
-    expect(worker.send).toHaveBeenLastCalledWith({
+    expect(worker.send).toHaveBeenLastCalledWith(expect.objectContaining({
       type: 'message',
       content: '<user_message>legacy follow-up</user_message>',
       codexAppInput: { text: 'clean follow-up', clientUserMessageId: 'turn-live-clean' },
       turnId: 'turn-live-clean',
-    });
+      codexAppDispatchId: expect.any(String),
+    }));
 
     worker.emit('message', { type: 'error', message: 'CLI relaunch dependency disappeared', turnId: 'turn-live-clean' });
     await Promise.resolve();

@@ -107,6 +107,44 @@ export function makeFingerprint(message: string, len = 30): string | undefined {
   return collapsed.substring(0, len);
 }
 
+/** Minimum tail length (normalised chars) required for a truncation-proof
+ *  match. A non-trivial length floor so a very short surviving tail can't
+ *  coincide with an unrelated short local prompt. This is a length gate, NOT a
+ *  uniqueness/entropy claim — the actual proof is the SUFFIX anchor below. */
+const TRUNCATION_MATCH_MIN_CHARS = 16;
+
+/** Capability-agnostic proof that a recorded transcript user line is THIS
+ *  turn's user event even though its head-substring fingerprint didn't match.
+ *
+ *  claude-code TRUNCATES the leading envelope lines (`<user_message>` +
+ *  `<botmux_task …>`) when persisting the user turn, so the head fingerprint is
+ *  gone — but the surviving text is exactly the TAIL of what we sent, i.e. a
+ *  contiguous SUFFIX of the mark's full normalised content. We anchor the proof
+ *  to that observed invariant with `endsWith`, NOT a loose `includes`: an
+ *  interior substring (a command like `run pnpm test --project unit`, or the
+ *  bare closing tags `</botmux_task> </user_message>`) that happens to appear
+ *  in the middle of the task body is NOT a suffix, so a Web Terminal operator
+ *  typing such a phrase can't spoof this and steal the pending durable mark
+ *  (the interior-substring false-match codex demonstrated on PR #724). Length
+ *  (16) is a floor, not the proof — the suffix anchor is. Proof is by CONTENT
+ *  shape, not session type (apiOnly/adopt), so it holds regardless of whether
+ *  the session can mint a Web Terminal write token.
+ *
+ *  `recordedNorm` and `markContentNorm` are both already normaliseForFingerprint'd.
+ *  Guards: require a real mark content, a recorded tail of at least
+ *  TRUNCATION_MATCH_MIN_CHARS, and a strict suffix match.
+ *
+ *  NOTE: if a future claude-code build stops truncating at the head (recorded
+ *  line no longer a suffix of what we sent), this correctly returns false and
+ *  the turn falls back to local-synth — never a wrong-mark bind. Re-proving a
+ *  non-suffix truncation would need a truncation-surviving turn nonce/closing
+ *  marker, not a relaxed substring test. */
+export function isTruncatedMatch(recordedNorm: string, markContentNorm?: string): boolean {
+  if (!markContentNorm || markContentNorm.length === 0) return false;
+  if (recordedNorm.length < TRUNCATION_MATCH_MIN_CHARS) return false;
+  return markContentNorm.endsWith(recordedNorm);
+}
+
 export class BridgeTurnQueue {
   private seen = new Set<string>();
   private queue: BridgePendingTurn[] = [];
@@ -343,8 +381,26 @@ export class BridgeTurnQueue {
           next.markTimeMs = eventTimeMs;
           this.collecting = next;
           consumedNext = true;
+        } else if (isTruncatedMatch(userText, next.contentNormalized)) {
+          // TRUNCATION-PROOF bind (capability-agnostic — see isTruncatedMatch).
+          // The head-substring fingerprint didn't match because claude-code
+          // TRUNCATES the leading envelope lines (`<user_message>` +
+          // `<botmux_task …>`) when persisting the user turn. But the recorded
+          // line is PROVABLY this turn's user event: its normalised text is a
+          // non-trivial contiguous substring of the FULL marked content
+          // (`contentNormalized`), i.e. exactly the surviving tail of what we
+          // sent. This does NOT guess from session type (apiOnly/adopt) —
+          // unrelated local terminal input like `pwd` is not a substring of the
+          // marked API/Lark prompt, so it can never steal the durable mark
+          // (the write-terminal race codex flagged on PR #724).
+          next.started = true;
+          if (!next.sourceJsonlPath) next.sourceJsonlPath = sourceJsonlPath;
+          next.markTimeMs = eventTimeMs;
+          this.collecting = next;
+          consumedNext = true;
         }
-        // Mismatch falls through to local-turn synthesis below.
+        // Otherwise (no fingerprint match, not a provable truncation) falls
+        // through to local-turn synthesis below (adopt) or is skipped (managed).
       } else {
         // Legacy mark() with no fingerprint — start on the next turn-start.
         next.started = true;
@@ -355,10 +411,16 @@ export class BridgeTurnQueue {
       }
     }
     if (!consumedNext) {
-      // Local-terminal input (or a queued_command whose prompt didn't
-      // match any pending Lark fingerprint). Synthesise a started turn
-      // ahead of any unstarted Lark turn so chronological order matches
-      // transcript order at emit time.
+      // The user event neither fingerprint-matched nor proved a truncation of a
+      // pending durable mark. Treat it as local-terminal input: synthesise a
+      // started local turn ahead of any unstarted turn so chronological order
+      // matches transcript order at emit time. This is SAFE regardless of
+      // session type — it never steals a pending durable mark (the mark stays
+      // unstarted, to be bound by its real user line). Restoring the original
+      // pre-PR behavior here (no session-type gate) is what keeps codex's
+      // requirement: a genuine local turn on a normal managed writable terminal
+      // still emits and is not silently dropped. The mark-stealing bug lived in
+      // the fingerprint-MISMATCH bind above, now gated on the truncation proof.
       const localTurn: BridgePendingTurn = {
         turnId: `local-${uuid}`,
         started: true,

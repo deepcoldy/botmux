@@ -44,6 +44,22 @@ function findCardCallbackValue(card: any, action: string): any {
   return visit(card);
 }
 
+function findCardNode(card: any, predicate: (node: any) => boolean): any {
+  if (predicate(card)) return card;
+  if (Array.isArray(card)) {
+    for (const child of card) {
+      const found = findCardNode(child, predicate);
+      if (found) return found;
+    }
+  } else if (card && typeof card === 'object') {
+    for (const child of Object.values(card)) {
+      const found = findCardNode(child, predicate);
+      if (found) return found;
+    }
+  }
+  return undefined;
+}
+
 describe('parseGrantTarget', () => {
   it('extracts first non-bot human mention', () => {
     const msg = { mentions: [
@@ -224,6 +240,23 @@ describe('tryHandleGrantCommand (@bot /grant @user)', () => {
     expect(msgType).toBe('interactive');
     expect(content).toContain('grant_chat');           // card carries grant actions
     const grantChat = findCardCallbackValue(JSON.parse(content), 'grant_chat');
+    expect(pending.checkNonce('b1', 'oc_1', 'ou_z', grantChat.nonce)).toBe(true);
+    expect(pending.getPendingGrantLimits('b1', 'oc_1', 'ou_z')?.durationMs).toBe(60 * 60 * 1000);
+  });
+
+  it('uses the configured finite duration for both the /grant card and pending limits', async () => {
+    getBot('b1').config.grantDefaultDurationMs = 8 * 60 * 60 * 1000;
+
+    await tryHandleGrantCommand('b1', grantMessage(), 'ou_owner');
+
+    const [, , content] = replyMock.mock.calls.at(-1)!;
+    const card = JSON.parse(content);
+    const grantChat = findCardCallbackValue(card, 'grant_chat');
+    const durationSelect = findCardNode(card, node => node?.tag === 'select_static' && node?.name === 'grant_duration');
+    expect(durationSelect.initial_option).toBe(String(8 * 60 * 60 * 1000));
+    expect(pending.getPendingGrantLimits('b1', 'oc_1', 'ou_z')).toMatchObject({
+      durationMs: 8 * 60 * 60 * 1000,
+    });
     expect(pending.checkNonce('b1', 'oc_1', 'ou_z', grantChat.nonce)).toBe(true);
   });
 

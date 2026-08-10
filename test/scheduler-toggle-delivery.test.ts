@@ -119,3 +119,18 @@ describe('scheduler.toggleDelivery', () => {
     expect(publish).not.toHaveBeenCalled();
   });
 });
+
+describe('scheduler.updateTask', () => {
+  it('publishes silent:false when disabling silent so dashboard caches clear stale true', async () => {
+    const { updateTask } = await import('../src/core/scheduler.js');
+    const id = seed('origin', { silent: true });
+
+    expect(updateTask(id, { silent: false })).toEqual({ ok: true });
+
+    expect(store.get(id)!.silent).toBeUndefined();
+    expect(publish).toHaveBeenCalledWith({
+      type: 'schedule.updated',
+      body: { id, patch: { silent: false } },
+    });
+  });
+});

@@ -62,6 +62,7 @@ import {
   getOwnedSession,
   listSessions,
   closeSession,
+  reactivateClosedSession,
   updateSession,
   updateSessionPid,
   findActiveSessionsByRoot,
@@ -371,6 +372,44 @@ describe('closeSession()', () => {
     expect(reloaded!.closedAt).toBeDefined();
   });
 
+  it('clears Riff lineage atomically with the durable closed row', () => {
+    const session = createSession('chat1', 'root1', 'Close Riff');
+    session.backendType = 'riff';
+    session.riffParentTaskId = 'riff-task-prepared';
+    updateSession(session);
+
+    closeSession(session.sessionId, { clearRiffParentTaskId: true });
+    init();
+
+    expect(getSession(session.sessionId)).toMatchObject({ status: 'closed' });
+    expect(getSession(session.sessionId)?.riffParentTaskId).toBeUndefined();
+  });
+
+  it('restores Riff close state in memory when the atomic save fails', () => {
+    const session = createSession('chat1', 'root1', 'Close Riff Save Failure');
+    session.backendType = 'riff';
+    session.riffParentTaskId = 'riff-task-retry';
+    updateSession(session);
+    fsControl.failSessionWrite = true;
+
+    expect(() => closeSession(
+      session.sessionId,
+      { clearRiffParentTaskId: true },
+    )).toThrow(/simulated session repair write failure/);
+    expect(getSession(session.sessionId)).toMatchObject({
+      status: 'active',
+      riffParentTaskId: 'riff-task-retry',
+    });
+    expect(mockDeleteFrozenCards).not.toHaveBeenCalled();
+
+    fsControl.failSessionWrite = false;
+    init();
+    expect(getSession(session.sessionId)).toMatchObject({
+      status: 'active',
+      riffParentTaskId: 'riff-task-retry',
+    });
+  });
+
   it('should call deleteFrozenCards with the sessionId', () => {
     const session = createSession('chat1', 'root1', 'Frozen');
     closeSession(session.sessionId);
@@ -395,6 +434,39 @@ describe('closeSession()', () => {
     // closedAt gets updated on second close
     expect(secondClosedAt).toBeDefined();
     expect(getSession(session.sessionId)!.status).toBe('closed');
+  });
+});
+
+describe('reactivateClosedSession()', () => {
+  it('sanitizes queued/setup state left on a legacy closed row', () => {
+    const session = createSession('chat1', 'root1', 'Legacy Closed Queue');
+    closeSession(session.sessionId);
+    const legacy = getSession(session.sessionId)!;
+    legacy.queued = true;
+    legacy.queuedPrompt = 'legacy backlog';
+    legacy.pendingRepoSetup = { mode: 'picker', prompt: 'legacy picker' };
+    legacy.queuedActivationPending = true;
+    legacy.queuedActivationToken = 'legacy-token';
+    legacy.queuedActivationInput = { content: 'legacy head' };
+    legacy.queuedActivationTail = [{
+      id: 'legacy-tail', order: 1, userPrompt: 'tail', cliInput: { content: 'legacy tail' }, turnId: 'tail-turn',
+    }];
+    legacy.queuedActivationTailNextOrder = 2;
+    updateSession(legacy);
+
+    const result = reactivateClosedSession(session.sessionId);
+    expect(result.ok).toBe(true);
+    init();
+
+    const reloaded = getSession(session.sessionId)!;
+    expect(reloaded.status).toBe('active');
+    expect(reloaded.closedAt).toBeUndefined();
+    expect(reloaded.queued).toBeUndefined();
+    expect(reloaded.pendingRepoSetup).toBeUndefined();
+    expect(reloaded.queuedActivationPending).toBeUndefined();
+    expect(reloaded.queuedActivationToken).toBeUndefined();
+    expect(reloaded.queuedActivationInput).toBeUndefined();
+    expect(reloaded.queuedActivationTail).toBeUndefined();
   });
 });
 

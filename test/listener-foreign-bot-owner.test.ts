@@ -21,7 +21,7 @@ import { describe, expect, it } from 'vitest';
 
 const src = readFileSync(new URL('../src/daemon.ts', import.meta.url), 'utf-8');
 
-function fnRegion(name: string, span = 24000): string {
+function fnRegion(name: string, span = 50000): string {
   const start = src.indexOf(`async function ${name}(`);
   expect(start, `${name} not found in daemon.ts`).toBeGreaterThanOrEqual(0);
   return src.slice(start, start + span);

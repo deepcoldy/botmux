@@ -1,5 +1,6 @@
 import { readdirSync, readFileSync } from 'node:fs';
 import { platform } from 'node:os';
+import { sampleDarwin } from './darwin.js';
 import type { ProcfsSample, ProcessResourceSample } from './types.js';
 
 const PAGE_SIZE_BYTES = 4096;
@@ -76,6 +77,10 @@ export function parseProcessStat(raw: string): { pid: number; ppid: number; cpuT
 }
 
 export function sampleProcfs(nowMs = Date.now()): ProcfsSample {
+  // macOS has no /proc; darwin.ts rebuilds the same shape from ps/vm_stat/sysctl/top
+  // and returns null when those tools are unavailable (e.g. denied by a sandbox
+  // profile), which degrades to the same "unsupported" snapshot as any other platform.
+  if (platform() === 'darwin') return sampleDarwin(nowMs) ?? unsupportedSample(nowMs);
   if (platform() !== 'linux') return unsupportedSample(nowMs);
 
   let procEntries: string[];

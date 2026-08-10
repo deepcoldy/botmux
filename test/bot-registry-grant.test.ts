@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { parseBotConfigsFromText, getOwnerOpenId, registerBot } from '../src/bot-registry.js';
+import { GRANT_DURATION_OPTIONS } from '../src/services/grant-policy.js';
 
 describe('bot-registry grant additions', () => {
   it('parseBotConfigsFromText preserves & filters chatReplyModes (four-state incl. chat-topic)', () => {
@@ -107,6 +108,25 @@ describe('bot-registry grant additions', () => {
       expect(c[0].messageQuota).toBeUndefined();
     }
     expect(parseBotConfigsFromText(JSON.stringify([{ larkAppId: 'mq2', larkAppSecret: 's' }]))[0].messageQuota).toBeUndefined();
+  });
+
+  it('parses grantDefaultDurationMs only from the finite card options', () => {
+    for (const durationMs of GRANT_DURATION_OPTIONS) {
+      const config = parseBotConfigsFromText(JSON.stringify([{
+        larkAppId: `gd${durationMs}`,
+        larkAppSecret: 's',
+        grantDefaultDurationMs: durationMs,
+      }]))[0];
+      expect(config.grantDefaultDurationMs).toBe(durationMs);
+    }
+    for (const bad of [undefined, null, '3600000', 0, -1, 2.5, 2 * 60 * 60 * 1000]) {
+      const config = parseBotConfigsFromText(JSON.stringify([{
+        larkAppId: 'gd_bad',
+        larkAppSecret: 's',
+        grantDefaultDurationMs: bad,
+      }]))[0];
+      expect(config.grantDefaultDurationMs).toBeUndefined();
+    }
   });
 
   it('parses & sanitizes quotaState (scope-aware keys + positive int limit, used>=0)', () => {

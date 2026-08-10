@@ -1,4 +1,5 @@
 import type { DaemonSession } from './types.js';
+import { pruneReplyTargets } from './reply-target.js';
 
 // Turn-exact suppression of the daemon-rendered final_output for loud external
 // triggers whose owner opted into "no trailing final notice" (connector
@@ -11,10 +12,10 @@ import type { DaemonSession } from './types.js';
 const SUPPRESS_TTL_MS = 24 * 60 * 60 * 1000;
 const MAX_SUPPRESSED_TURNS_PER_SESSION = 256;
 
-/** Bound on the per-turn reply-target map, mirroring reply-target.ts's own
- *  REPLY_TARGETS_MAX so an inherited trigger anchor can never grow the map
- *  past what the normal IM path allows. */
-const REPLY_TARGETS_MAX = 32;
+/** Bound on the per-turn reply-target map — reuses reply-target.ts's shared
+ *  pruneReplyTargets so eviction updates the SAME prune watermark the
+ *  --mention-back ambiguity gate reads (a synthetic trigger folding in must not
+ *  silently prune a participant-bearing sibling without raising the watermark). */
 
 /**
  * Give a synthetic trigger turn the session's CURRENT fold-back anchor.
@@ -50,13 +51,7 @@ export function inheritTriggerReplyAnchor(
     ...(anchor.quoteOnly ? { quoteOnly: true } : {}),
     ...(anchor.substitute ? { substitute: true } : {}),
   };
-  const keys = Object.keys(targets);
-  if (keys.length > REPLY_TARGETS_MAX) {
-    keys
-      .sort((a, b) => (targets[a].updatedAt < targets[b].updatedAt ? -1 : 1))
-      .slice(0, keys.length - REPLY_TARGETS_MAX)
-      .forEach(k => { delete targets[k]; });
-  }
+  ds.session.replyTargetsPrunedThrough = pruneReplyTargets(targets, ds.session.replyTargetsPrunedThrough);
   ds.session.replyTargets = targets;
 }
 

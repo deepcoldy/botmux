@@ -18,66 +18,26 @@ import type { CliId } from '../../adapters/cli/types.js';
 import type { V3GoalNode } from './dag.js';
 import type { RunChatBinding } from './grill-state.js';
 import type { V3ArmedAttemptWorkerFence } from './worker-fence.js';
+import type { AttemptLease } from './runtime-host-contract.js';
+import type { ManifestFileKind } from './artifact-contract.js';
 
 // ─── Manifest (node product declaration) ───────────────────────────────────
 
-/** Enumerated, NOT free-string (design Q8 / §7).  Unknown → validator rejects
- *  (or the producer downgrades to `binary`). */
-export type ManifestFileKind =
-  | 'markdown'
-  | 'json'
-  | 'text'
-  | 'code'
-  | 'log'
-  | 'binary'
-  | 'directory';
-
-export const MANIFEST_FILE_KINDS: readonly ManifestFileKind[] = [
-  'markdown', 'json', 'text', 'code', 'log', 'binary', 'directory',
-];
-
-/** Soft limits the manifest validator enforces (codex point 2). */
-export const MANIFEST_SUMMARY_MAX_BYTES = 4 * 1024;
-export const MANIFEST_PREVIEW_MAX_BYTES = 4 * 1024;
-
-export interface ManifestFile {
-  name: string;
-  /** Relative to the node's `outputDir` — absolute paths are REJECTED by the
-   *  validator (which canonicalizes `outputDir/path` and asserts it stays
-   *  inside outputDir).  Downstream `inputs.json` carries the resolved
-   *  absolute path; the manifest author may only write relative. */
-  path: string;
-  kind: ManifestFileKind;
-  bytes: number;
-  /** sha256 of the file; the empty string is the agreed sentinel for
-   *  `kind: 'directory'`. */
-  sha256: string;
-  mime: string;
-  /** Optional human-readable excerpt; validator truncates to
-   *  MANIFEST_PREVIEW_MAX_BYTES. */
-  preview?: string;
-}
-
-export type ManifestStatus = 'ok' | 'fail';
-
-export const MANIFEST_STATUSES: readonly ManifestStatus[] = ['ok', 'fail'];
-
-/**
- * Written by a goal-mode worker at `BOTMUX_GOAL_MANIFEST_PATH` before exit.
- * Invariants (enforced by the validator on codex's side):
- *   - `status:'ok'`  → `files.length >= 1`, `error` absent
- *   - `status:'fail'` → `error` required, `files` may be empty
- */
-export interface Manifest {
-  schemaVersion: 1;
-  status: ManifestStatus;
-  /** Truncated to MANIFEST_SUMMARY_MAX_BYTES. */
-  summary: string;
-  error?: { code: string; message: string; retryable?: boolean };
-  files: ManifestFile[];
-}
-
-export const MANIFEST_SCHEMA_VERSION = 1 as const;
+export {
+  MANIFEST_FILE_KINDS,
+  MANIFEST_PREVIEW_MAX_BYTES,
+  MANIFEST_SCHEMA_VERSION,
+  MANIFEST_STATUSES,
+  MANIFEST_SUMMARY_MAX_BYTES,
+} from './artifact-contract.js';
+export type {
+  Manifest,
+  ManifestFile,
+  ManifestFileKind,
+  ManifestStatus,
+  ManifestValidationResult,
+  ValidateManifest,
+} from './artifact-contract.js';
 
 // ─── Downstream inputs (runtime writes, goal-mode reads) ────────────────────
 
@@ -152,35 +112,7 @@ export const GOAL_ASK_FILE = 'ask.json';
  *  human's {@link GoalAnswer} to; the retry's GoalInputs points at this path. */
 export const GOAL_ANSWER_FILE = 'answer.json';
 
-export type GoalAsk =
-  | {
-    /** The single question to put to the human. */
-    question: string;
-    /** 2–6 concrete options the human picks from; each becomes a card button. */
-    options: string[];
-    freeText?: false;
-  }
-  | {
-    /** The single question to put to the human. */
-    question: string;
-    /** Ask the human to provide free-form text instead of picking an option. */
-    freeText: true;
-    options?: never;
-  };
-
-export type GoalAnswer =
-  | {
-    /** The option the human selected (one of {@link GoalAsk.options}). */
-    selected: string;
-    /** open_id of the human who answered. */
-    by: string;
-  }
-  | {
-    /** Free-form text the human provided. */
-    text: string;
-    /** open_id of the human who answered. */
-    by: string;
-  };
+export type { GoalAnswer, GoalAsk } from './event-contract.js';
 
 // ─── Supported CLIs ─────────────────────────────────────────────────────────
 
@@ -254,6 +186,9 @@ export interface RunNodeRequest {
   runId: string;
   /** Stable id e.g. `research/attempts/001`, used for sessionId / log naming. */
   attemptId: string;
+  /** Host-neutral scheduler ownership. New runtime calls always provide this;
+   * optional during the compatibility window for older RunNode adapters. */
+  attemptLease?: AttemptLease;
   node: V3GoalNode;
   /** Frozen at run start; do NOT re-resolve the bot here. */
   botSnapshot: BotSnapshot;
@@ -309,33 +244,6 @@ export interface RunNodeResult {
  * manifest — the runtime validates it.
  */
 export type RunNode = (req: RunNodeRequest) => Promise<RunNodeResult>;
-
-// ─── Manifest validation (codex implements, runtime calls) ──────────────────
-
-export interface ManifestValidationResult {
-  ok: boolean;
-  /** Present when `ok` — the parsed, normalized manifest. */
-  manifest?: Manifest;
-  /** Present when `!ok` — the full problem list (mirror dag.ts's style). */
-  problems?: string[];
-}
-
-/**
- * The runtime's view of manifest validation: read + validate the manifest at
- * `manifestPath` against `outputDir`, returning a result object (never throws,
- * so the dispatch loop stays branch-clean).
- *
- * codex's `manifest.ts` exposes the validation in a throw-based async form
- * (`readAndValidateManifest(path, outputDir): Promise<Manifest>`); the daemon /
- * CLI wiring adapts it to this shape at the injection boundary
- * (try → `{ok:true, manifest}` / catch `ManifestValidationError` →
- * `{ok:false, problems}`).  Async because the underlying impl reads the file
- * and hashes its contents.
- */
-export type ValidateManifest = (
-  manifestPath: string,
-  outputDir: string,
-) => Promise<ManifestValidationResult>;
 
 // ─── Spec (grill 产物 → architect 输入) ──────────────────────────────────────
 

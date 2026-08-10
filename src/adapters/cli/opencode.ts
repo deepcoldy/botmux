@@ -20,6 +20,7 @@ import { delay } from '../../utils/timing.js';
  */
 
 const OPENCODE_SESSION_ID_RE = /^ses_[0-9A-Za-z]+$/;
+const OPENCODE_PASTE_THRESHOLD = 150;
 
 function isOpenCodeSessionId(value: string | undefined): value is string {
   return typeof value === 'string' && OPENCODE_SESSION_ID_RE.test(value);
@@ -253,7 +254,11 @@ export function createOpenCodeAdapter(pathOverride?: string): CliAdapter {
 
       try {
         if (pty.sendText && pty.sendSpecialKeys) {
-          pty.sendText(content);
+          if (!isSlashCommand && pty.pasteText && (content.length > OPENCODE_PASTE_THRESHOLD || content.includes('\n'))) {
+            pty.pasteText(content);
+          } else {
+            pty.sendText(content);
+          }
           await delay(200);
           pty.sendSpecialKeys('Enter');
         } else {

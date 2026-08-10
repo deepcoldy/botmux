@@ -20,6 +20,9 @@
   },
   "scripts": {
     "build": "pnpm audit:domains && node scripts/clean-dist.mjs && tsc && node scripts/generate-runtime-build-id.mjs && cp src/setup/lark-scopes.json dist/setup/ && pnpm dashboard:bundle && chmod +x dist/cli.js && node scripts/audit-dist.mjs",
+    "workflow-core:build": "node scripts/build-workflow-core-package.mjs",
+    "workflow-core:test": "pnpm workflow-core:build && node scripts/test-workflow-core-package.mjs",
+    "workflow-core:pack": "pnpm workflow-core:build && node scripts/pack-workflow-core-package.mjs",
     "audit:domains": "node scripts/audit-public-domains.mjs",
     "dashboard:bundle": "node scripts/build-dashboard.mjs",
     "dashboard:watch": "node scripts/build-dashboard.mjs --watch",

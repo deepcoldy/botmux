@@ -34,13 +34,32 @@ import {
   type CodexDrainResult,
   codexSessionIdFromRolloutPath,
 } from './codex-transcript.js';
+import { baselineJsonlCursor } from './jsonl-cursor.js';
 import { traeSessionsRoot } from './traex-paths.js';
 
 export { splitCodexEventsByCutoff as splitTraexEventsByCutoff };
 export { extractLastCodexTurn as extractLastTraexTurn };
-export type { CodexBridgeEvent as TraexBridgeEvent, CodexDrainResult as TraexDrainResult };
+export type { CodexBridgeEvent as TraexBridgeEvent };
+
+export interface TraexDrainResult extends CodexDrainResult {
+  /** Latest executor-reported model observed in the drained complete records. */
+  latestModel?: string;
+  /** Latest executor-reported reasoning effort observed in complete records. */
+  latestReasoningEffort?: string;
+}
+
+export interface TraexRuntimeSnapshot {
+  model?: string;
+  reasoningEffort?: string;
+}
 
 const IS_LINUX = platform() === 'linux';
+
+/** Upper bound on how far back readLatestTraexRuntime scans for the newest
+ * model/effort. The newest turn_context sits near the tail, so this is only a
+ * pathological-file guard (cf. #740): never synchronously parse a multi-GB
+ * rollout on attach just to surface advisory runtime identity. */
+const TRAEX_RUNTIME_SCAN_MAX_BYTES = 4 * 1024 * 1024;
 
 function joinInputText(content: unknown): string {
   if (!Array.isArray(content)) return '';
@@ -68,13 +87,32 @@ function abortErrorCode(reason: unknown): string {
   return `traex_turn_aborted:${normalized}`;
 }
 
+function runtimeFromTraexEntry(entry: any): TraexRuntimeSnapshot | undefined {
+  const settings = entry?.payload?.collaboration_mode?.settings;
+  const model = entry?.payload?.model ?? settings?.model;
+  const reasoningEffort = entry?.payload?.reasoning_effort
+    ?? entry?.payload?.effort
+    ?? settings?.reasoning_effort;
+  const normalizedModel = typeof model === 'string' && model.trim()
+    ? model.trim()
+    : undefined;
+  const normalizedReasoningEffort = typeof reasoningEffort === 'string' && reasoningEffort.trim()
+    ? reasoningEffort.trim()
+    : undefined;
+  if (!normalizedModel && !normalizedReasoningEffort) return undefined;
+  return {
+    ...(normalizedModel ? { model: normalizedModel } : {}),
+    ...(normalizedReasoningEffort ? { reasoningEffort: normalizedReasoningEffort } : {}),
+  };
+}
+
 /** Incrementally drain complete TRAE rollout lines.
  *
  * `task_complete` is intentionally emitted even when last_agent_message is
  * missing/empty: a silent successful turn still has to release a durable
  * delivery. A non-newline-terminated tail is never parsed, so a process crash
  * halfway through the terminal JSON object cannot manufacture completion. */
-export function drainTraexRollout(path: string, fromOffset: number): CodexDrainResult {
+export function drainTraexRollout(path: string, fromOffset: number): TraexDrainResult {
   if (!existsSync(path)) return { events: [], newOffset: 0, pendingTail: '' };
   let size: number;
   try { size = statSync(path).size; } catch { return { events: [], newOffset: fromOffset, pendingTail: '' }; }
@@ -93,6 +131,8 @@ export function drainTraexRollout(path: string, fromOffset: number): CodexDrainR
   const sourceSessionId = codexSessionIdFromRolloutPath(path);
 
   const events: CodexBridgeEvent[] = [];
+  let latestModel: string | undefined;
+  let latestReasoningEffort: string | undefined;
   let cursor = start;
   for (const line of completeText.split('\n')) {
     if (line.length === 0) {
@@ -103,6 +143,9 @@ export function drainTraexRollout(path: string, fromOffset: number): CodexDrainR
     cursor += Buffer.byteLength(line, 'utf8') + 1;
     let obj: any;
     try { obj = JSON.parse(line); } catch { continue; }
+    const runtime = runtimeFromTraexEntry(obj);
+    latestModel = runtime?.model ?? latestModel;
+    latestReasoningEffort = runtime?.reasoningEffort ?? latestReasoningEffort;
     const payload = obj?.payload;
     if (!payload || typeof payload !== 'object') continue;
     const base = {
@@ -145,7 +188,91 @@ export function drainTraexRollout(path: string, fromOffset: number): CodexDrainR
       });
     }
   }
-  return { events, newOffset, pendingTail };
+  return {
+    events,
+    newOffset,
+    pendingTail,
+    ...(latestModel ? { latestModel } : {}),
+    ...(latestReasoningEffort ? { latestReasoningEffort } : {}),
+  };
+}
+
+/** Read the current TRAE runtime from complete rollout records without
+ * retaining the full transcript in memory. Each field is latest-wins because
+ * `/model` and `/effort` can change independently in a long-lived session.
+ *
+ * Scans BACKWARD in fixed-size chunks and stops as soon as both fields are
+ * resolved — the newest `turn_context` is near the tail, so a live session
+ * touches only the last chunk. A hard byte cap bounds the pathological case
+ * where a field never appears (same guard rationale as #740's
+ * MAX_USAGE_TRANSCRIPT_BYTES): runtime identity is advisory and must never
+ * synchronously parse a multi-GB rollout on attach. A non-newline-terminated
+ * trailing partial is excluded via baselineJsonlCursor, so a crash mid-write
+ * cannot surface a half-written model — matching drainTraexRollout. */
+export function readLatestTraexRuntime(path: string): TraexRuntimeSnapshot {
+  if (!path || !existsSync(path)) return {};
+  let completeEnd: number;
+  try { completeEnd = baselineJsonlCursor(path).newOffset; } catch { return {}; }
+  if (completeEnd <= 0) return {};
+
+  let latestModel: string | undefined;
+  let latestReasoningEffort: string | undefined;
+  const emit = (): TraexRuntimeSnapshot => ({
+    ...(latestModel ? { model: latestModel } : {}),
+    ...(latestReasoningEffort ? { reasoningEffort: latestReasoningEffort } : {}),
+  });
+  // Backward scan keeps the first (newest) value seen for each field; returns
+  // true once both are known so the scan can stop early.
+  const consider = (line: string): boolean => {
+    if (!line.trim()) return false;
+    let runtime: TraexRuntimeSnapshot | undefined;
+    try { runtime = runtimeFromTraexEntry(JSON.parse(line)); } catch { return false; }
+    if (latestModel === undefined && runtime?.model) latestModel = runtime.model;
+    if (latestReasoningEffort === undefined && runtime?.reasoningEffort) {
+      latestReasoningEffort = runtime.reasoningEffort;
+    }
+    return latestModel !== undefined && latestReasoningEffort !== undefined;
+  };
+
+  const floor = Math.max(0, completeEnd - TRAEX_RUNTIME_SCAN_MAX_BYTES);
+  const chunkBytes = 64 * 1024;
+  let fd: number | undefined;
+  try {
+    fd = openSync(path, 'r');
+    let end = completeEnd;
+    let carry = Buffer.alloc(0);
+    while (end > floor) {
+      const start = Math.max(floor, end - chunkBytes);
+      const chunk = Buffer.alloc(end - start);
+      readSync(fd, chunk, 0, chunk.length, start);
+      const block = carry.length > 0 ? Buffer.concat([chunk, carry]) : chunk;
+      let lineEnd = block.length;
+      if (lineEnd > 0 && block[lineEnd - 1] === 0x0a) lineEnd--;
+      let carryEnd = lineEnd;
+      for (let i = lineEnd - 1; i >= 0; i--) {
+        if (block[i] !== 0x0a) continue;
+        const line = block.subarray(i + 1, lineEnd).toString('utf8');
+        lineEnd = i;
+        carryEnd = i;
+        if (consider(line)) return emit();
+      }
+      // Carry the partial leading fragment back to the previous chunk. The one
+      // exception is the byte-cap floor (floor > 0 && start === floor): there
+      // the leading fragment is a truncated historical partial and is dropped.
+      // At true file start (start === 0) the fragment is the complete first
+      // record and must be considered.
+      carry = start === floor && floor > 0
+        ? Buffer.alloc(0)
+        : block.subarray(0, carryEnd);
+      end = start;
+    }
+    if (carry.length > 0) consider(carry.toString('utf8'));
+  } catch {
+    return emit();
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+  }
+  return emit();
 }
 
 function normaliseInputText(text: string): string {
@@ -165,6 +292,81 @@ export function traexRolloutHasUserInputSince(
   );
 }
 
+// -- history.jsonl submit-confirmation (submit-time truth) ------------------
+//
+// TRAE writes ~/.trae/cli/history.jsonl at SUBMIT time — one JSON line
+// {session_id, ts, text} per successful user submit, byte-identical to Codex's
+// format. This is the correct submit-confirmation source: a type-ahead message
+// parked while a turn runs is logged here immediately, whereas the per-session
+// rollout only records it when the running turn dequeues it (which can exceed
+// the worker's confirmation deadline → false "submission couldn't be confirmed"
+// warning). Because history.jsonl is a single global file shared by every TRAE
+// pane under one TRAE_HOME, a same-text line may be written by a concurrent
+// sibling pane; callers pass an `acceptSid` ownership filter to skip a foreign
+// pane's line. Mirrors the codex.ts writeInput verification path exactly.
+
+export interface TraexHistoryMatch {
+  found: boolean;
+  cliSessionId?: string;
+}
+
+/** Optional ownership filter for a shared-history match: accept a same-text
+ *  line only when its session id is one the owning pid actually holds open.
+ *  Re-evaluated on every call so a lazily-opened owned rollout fd that appears
+ *  AFTER its history line can still be accepted on a later poll. */
+export type TraexHistorySidFilter = (cliSessionId: string | undefined) => boolean;
+
+function readTraexHistorySid(parsed: unknown): string | undefined {
+  return parsed && typeof parsed === 'object' && typeof (parsed as any).session_id === 'string'
+    ? (parsed as any).session_id
+    : undefined;
+}
+
+/** Scan the byte delta appended to history.jsonl since `fromByte` for a line
+ *  whose decoded `text` exactly matches `expectedText` (newline-normalised).
+ *  Never parses a non-newline-terminated tail, so a half-written line can't
+ *  manufacture a false match — a later poll sees the completed entry. */
+export function traexHistoryMatchDelta(
+  path: string,
+  fromByte: number,
+  expectedText: string,
+  acceptSid?: TraexHistorySidFilter,
+): TraexHistoryMatch {
+  if (!existsSync(path)) return { found: false };
+  let size: number;
+  try { size = statSync(path).size; } catch { return { found: false }; }
+  if (size <= fromByte) return { found: false };
+  const len = size - fromByte;
+  const buf = Buffer.alloc(len);
+  const fd = openSync(path, 'r');
+  try { readSync(fd, buf, 0, len, fromByte); } finally { closeSync(fd); }
+  const delta = buf.toString('utf8');
+  // Drop a trailing partial line (no newline yet) — it may still be mid-write.
+  const lines = delta.endsWith('\n') ? delta.split('\n') : delta.split('\n').slice(0, -1);
+  const expected = normaliseInputText(expectedText);
+  for (const line of lines) {
+    if (line.length === 0) continue;
+    let parsed: any;
+    try { parsed = JSON.parse(line); } catch { continue; }
+    if (typeof parsed?.text !== 'string') continue;
+    if (normaliseInputText(parsed.text) !== expected) continue;
+    const cliSessionId = readTraexHistorySid(parsed);
+    // Skip a same-text line owned by a DIFFERENT pane (shared-TRAE_HOME
+    // collision). Keep scanning — the owned line may be later in this delta
+    // or arrive on a later poll.
+    if (acceptSid && !acceptSid(cliSessionId)) continue;
+    return { found: true, cliSessionId };
+  }
+  return { found: false };
+}
+
+/** Current byte size of history.jsonl (0 when absent), captured before a paste
+ *  so the confirmation scan only considers lines this submit appends. */
+export function traexHistorySize(path: string): number {
+  if (!path || !existsSync(path)) return 0;
+  try { return statSync(path).size; } catch { return 0; }
+}
+
 function matchTraexRolloutPath(target: string): { path: string; cliSessionId: string } | undefined {
   if (!target.endsWith('.jsonl')) return undefined;
   // Accept both the default layout (~/.trae/cli/sessions/...) and any
@@ -180,42 +382,82 @@ function matchTraexRolloutPath(target: string): { path: string; cliSessionId: st
   return { path: target, cliSessionId: sid };
 }
 
+/** Enumerate the file paths a pid holds open (Linux /proc, else lsof). Shared
+ *  by findTraexRolloutByPid (single) and findTraexRolloutSetByPid (ownership
+ *  set) so both derive from one source. Returns undefined when enumeration is
+ *  unavailable — callers treat that as "cannot prove ownership". */
+function traexProcessOpenTargets(pid: number): string[] | undefined {
+  if (!Number.isInteger(pid) || pid <= 0) return undefined;
+  if (IS_LINUX) {
+    const fdDir = `/proc/${pid}/fd`;
+    if (!existsSync(fdDir)) return undefined;
+    let entries: string[];
+    try { entries = readdirSync(fdDir); } catch { return undefined; }
+    const targets: string[] = [];
+    for (const fd of entries) {
+      try { targets.push(readlinkSync(join(fdDir, fd))); } catch { continue; }
+    }
+    return targets;
+  }
+  let out: string;
+  try {
+    out = execSync(`lsof -p ${pid} -Fn`, { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] });
+  } catch {
+    return undefined;
+  }
+  const targets: string[] = [];
+  for (const line of out.split('\n')) {
+    if (line.startsWith('n/')) targets.push(line.slice(1));
+  }
+  return targets;
+}
+
 /** Find the rollout file an externally-running TRAE process has open.
  *  Same /proc/<pid>/fd strategy as findCodexRolloutByPid, but with a
  *  TRAE-specific path matcher so we never bind to a sibling Codex pane. */
 export function findTraexRolloutByPid(pid: number): { path: string; cliSessionId: string } | undefined {
-  if (!Number.isInteger(pid) || pid <= 0) return undefined;
-  if (IS_LINUX) {
-    const fdDir = `/proc/${pid}/fd`;
-    if (existsSync(fdDir)) {
-      let entries: string[];
-      try { entries = readdirSync(fdDir); } catch { return undefined; }
-      for (const fd of entries) {
-        let target: string;
-        try { target = readlinkSync(join(fdDir, fd)); } catch { continue; }
-        const hit = matchTraexRolloutPath(target);
-        if (hit) return hit;
-      }
-      return undefined;
-    }
-  }
-  let out: string;
-  try {
-    out = execSync(`lsof -p ${pid} -Fn`, {
-      encoding: 'utf-8',
-      stdio: ['pipe', 'pipe', 'pipe'],
-    });
-  } catch {
-    return undefined;
-  }
-  for (const line of out.split('\n')) {
-    if (!line.startsWith('n/')) continue;
-    const target = line.slice(1);
+  const targets = traexProcessOpenTargets(pid);
+  if (!targets) return undefined;
+  for (const target of targets) {
     const hit = matchTraexRolloutPath(target);
     if (hit) return hit;
   }
   return undefined;
 }
+
+/** Lowercased set of TRAE session ids whose rollout the pid holds open. The
+ *  ownership gate for a shared-history.jsonl submit match: only a sid this pid
+ *  actually owns is safe to accept, so a concurrent sibling pane's identical
+ *  text can't hand back a foreign session id. Empty Set = pid holds no TRAE
+ *  rollout; undefined = fd enumeration unavailable (callers must treat undefined
+ *  as "cannot prove ownership" — fail closed, do not bind). Mirrors
+ *  findCodexRolloutSetByPid. */
+export function findTraexRolloutSetByPid(pid: number): Set<string> | undefined {
+  const targets = traexProcessOpenTargets(pid);
+  if (!targets) return undefined;
+  const set = new Set<string>();
+  for (const target of targets) {
+    const hit = matchTraexRolloutPath(target);
+    if (hit) set.add(hit.cliSessionId.toLowerCase());
+  }
+  return set;
+}
+
+/** Pure ownership decision: is `cliSessionId` one of the rollouts the observed
+ *  pid holds open? `ownedRollouts` is the lowercased sid set from
+ *  findTraexRolloutSetByPid (undefined when fd enumeration was unavailable).
+ *  FAIL CLOSED — a missing set or a non-member id returns false so the caller
+ *  never binds the bridge (or persists a resume id) it can't prove the pid owns.
+ *  Extracted so the exact predicate the worker's persist/attach gates use is
+ *  unit-testable without a live pid. Mirrors codexHistorySidIsOwned. */
+export function traexHistorySidIsOwned(
+  cliSessionId: string,
+  ownedRollouts: Set<string> | undefined,
+): boolean {
+  if (!ownedRollouts) return false;
+  return ownedRollouts.has(cliSessionId.toLowerCase());
+}
+
 
 /** Locate the rollout file for a given TRAE session UUID. Filename shape is
  *  identical to Codex: `rollout-<ts>-<sid>.jsonl`, so a suffix match over the

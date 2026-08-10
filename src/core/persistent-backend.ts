@@ -154,6 +154,14 @@ export function resolvePairedSpawnBackendType(
   );
 }
 
+/** Whether the live/persisted session is frozen onto the remote Riff backend.
+ *  Restart guards must use the session stamp rather than the bot's mutable
+ *  current config: changing a bot later must not make an existing Riff
+ *  generation look locally restartable. */
+export function isRiffBackendSession(ds: DaemonSession): boolean {
+  return (ds.initConfig?.backendType ?? ds.session.backendType) === 'riff';
+}
+
 /**
  * How a session's worker is torn down at daemon shutdown, branched on the
  * session's FROZEN backend (via getSessionPersistentBackendType), NOT live config:
@@ -163,11 +171,17 @@ export function resolvePairedSpawnBackendType(
  * Freezing here stops a live backendType edit from changing how a running session
  * tears down — e.g. detach-preserving a "herdr" session whose real pane is tmux.
  */
-export function shutdownBackendDisposition(ds: DaemonSession): 'detach' | 'close' {
-  // 远端后端（riff / mojo）：远端会话独立于本地进程存活。daemon shutdown 走
-  // 'close' 会经 worker 的 destroySession() 取消远端会话——重启不该杀它（血缘已
-  // 持久化，重启后 follow-up 续上，agent 的 botmux send 照常送达）。
-  // detach = 仅 SIGTERM worker。
+export function shutdownBackendDisposition(ds: DaemonSession): 'riff-drain-detach' | 'detach' | 'close' {
+  // Riff 不能落进普通 detach 的直接 SIGTERM：create/follow-up 最长 10s 才返回
+  // task id，而 worker SIGTERM 会立即 exit，丢掉唯一血缘。独立 disposition 迫使
+  // daemon 先走 drain → durable ACK → commit 协议；类型检查防止未来回归。
+  if (isRiffBackendSession(ds)) return 'riff-drain-detach';
+  // mojo 走普通 detach，不复用上面的 drain：那条协议是 riff 专属的
+  // （prepareRiffFleetForShutdown 打的是 riff HTTP + fence/ACK）。mojo 也不需要
+  // 它——血缘来自流式输出的第一条 `system/init` 事件，taskIdCb 当场就发，不像
+  // riff 要等一次最长 10s 的 HTTP 往返，所以 SIGTERM 不会丢血缘。
+  // 与 riff 相同的是：远端会话独立于本地进程存活，daemon 重启不该取消它
+  // （'close' 会经 worker 的 destroySession() 取消远端会话）。
   const frozen = ds.initConfig?.backendType ?? ds.session.backendType;
   if (frozen && isRemoteBackendType(frozen)) return 'detach';
   return getSessionPersistentBackendType(ds) ? 'detach' : 'close';

@@ -18,17 +18,44 @@ export class IdleDetector {
   private quiescenceTimer: ReturnType<typeof setTimeout> | null = null;
   private isIdle = false;
   private idleCallback: ((source: IdleEvidenceSource) => void) | null = null;
+  private busyCallback: (() => void) | null = null;
   private completionPattern: RegExp | undefined;
+  private idleToBusyPattern: RegExp | undefined;
+  private busyTransitionArmed = false;
   private readyPattern: RegExp | undefined;
   private readySeen = false;
 
   constructor(cli: CliAdapter) {
     this.completionPattern = cli.completionPattern;
+    this.idleToBusyPattern = cli.idleToBusyPattern;
     this.readyPattern = cli.readyPattern;
   }
 
   onIdle(cb: (source: IdleEvidenceSource) => void): void {
     this.idleCallback = cb;
+  }
+
+  onBusy(cb: () => void): void {
+    this.busyCallback = cb;
+  }
+
+  /**
+   * Seed readyPattern evidence for a prompt that IS on screen but was rendered
+   * before resetReadyEvidence() cleared the flag. A new session (SessionStart
+   * source=startup) never redraws after that boundary, so Strategy 2's
+   * `!readySeen` early return would suppress quiescence detection forever.
+   *
+   * The caller must first confirm the PTY is quiet AND the current rendered
+   * screen matches readyPattern. This only restores readySeen — a full
+   * quiescence check (spinner guard included) still runs on top of it, so no
+   * existing check is bypassed.
+   */
+  seedReadyEvidence(): boolean {
+    if (this.isIdle || this.readySeen) return false;
+    this.readySeen = true;
+    this.clearTimer();
+    this.quiescenceCheck();
+    return true;
   }
 
   feed(data: string): void {
@@ -45,6 +72,22 @@ export class IdleDetector {
 
     const stripped = this.stripAnsi(data);
     this.outputTail = (this.outputTail + stripped).slice(-500);
+
+    // Only an explicitly opted-in CLI marker may turn a previously reported
+    // idle cycle back into busy. Plain PTY activity — and legacy busyPattern
+    // matches — can be a transcript redraw, so they are insufficient evidence.
+    // Keep the edge armed across chunks, then emit at most once per cycle.
+    if (
+      this.busyTransitionArmed
+      && this.idleToBusyPattern
+      && (
+        this.idleToBusyPattern.test(stripped)
+        || this.idleToBusyPattern.test(this.outputTail)
+      )
+    ) {
+      this.busyTransitionArmed = false;
+      this.busyCallback?.();
+    }
 
     // Track when the CLI's input prompt appears.
     // Check the current chunk too — a single chunk can contain the prompt
@@ -86,6 +129,7 @@ export class IdleDetector {
 
   reset(): void {
     this.isIdle = false;
+    this.busyTransitionArmed = false;
     this.outputTail = '';
     this.readySeen = false;
     this.lastSpinnerAt = Date.now();
@@ -100,6 +144,7 @@ export class IdleDetector {
    */
   resetReadyEvidence(): void {
     this.isIdle = false;
+    this.busyTransitionArmed = false;
     this.outputTail = '';
     this.readySeen = false;
     this.lastSpinnerAt = 0;
@@ -119,6 +164,8 @@ export class IdleDetector {
   dispose(): void {
     this.clearTimer();
     this.idleCallback = null;
+    this.busyCallback = null;
+    this.busyTransitionArmed = false;
   }
 
   private quiescenceCheck(): void {
@@ -137,6 +184,9 @@ export class IdleDetector {
 
   private markIdle(source: IdleEvidenceSource): void {
     this.isIdle = true;
+    // Arm before the callback: markPromptReady may synchronously flush queued
+    // botmux input and call reset(), which must win and disarm this edge.
+    this.busyTransitionArmed = true;
     this.outputTail = '';
     this.clearTimer();
     this.idleCallback?.(source);

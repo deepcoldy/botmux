@@ -157,7 +157,11 @@ export interface ProcessResourceSample {
   ppid: number;
   rssBytes: number;
   cpuTicks: number;
-  startTicks?: number;
+  // Process-birth identity, compared as a string against a marker's `procStart` to
+  // reject stale markers after PID reuse. Linux supplies /proc start ticks (number),
+  // macOS supplies ps(1)'s `lstart` timestamp (string) — the same two forms
+  // readProcessStartIdentity() produces, so the values line up per platform.
+  startTicks?: number | string;
   cmd?: string;
 }
 

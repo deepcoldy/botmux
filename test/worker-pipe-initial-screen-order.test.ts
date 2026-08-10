@@ -35,13 +35,15 @@ describe('worker pipe initial screen ordering', () => {
 
     const closeCase = source.slice(
       source.indexOf("case 'close':"),
-      source.indexOf("case 'suspend':", source.indexOf("case 'close':")),
+      source.indexOf("case 'detach_for_transfer':", source.indexOf("case 'close':")),
     );
-    const setCloseIdx = closeCase.indexOf('closeRequested = true;');
-    const ackIdx = closeCase.indexOf("send({ type: 'session_close_ready', sessionId });");
-    const stopBridgeIdx = closeCase.indexOf('stopBridgeWatcher();');
-    const teardownIdx = closeCase.indexOf('backend?.destroySession?.();');
-    const clearIdx = closeCase.indexOf('clearSendMarkers();');
+    const localCloseIdx = closeCase.indexOf('// Local close:');
+    const setCloseIdx = closeCase.lastIndexOf('closeRequested = true;', localCloseIdx);
+    const ackIdx = closeCase.lastIndexOf("send({ type: 'session_close_ready', sessionId });", localCloseIdx);
+    const stopBridgeIdx = closeCase.lastIndexOf('stopBridgeWatcher();', localCloseIdx);
+    const teardownIdx = closeCase.indexOf('backend?.destroySession?.();', localCloseIdx);
+    const clearIdx = closeCase.indexOf('clearSendMarkers();', localCloseIdx);
+    expect(localCloseIdx).toBeGreaterThan(-1);
     expect(setCloseIdx).toBeGreaterThan(-1);
     expect(ackIdx).toBeGreaterThan(setCloseIdx);
     expect(stopBridgeIdx).toBeGreaterThan(ackIdx);
@@ -61,6 +63,21 @@ describe('worker pipe initial screen ordering', () => {
     expect(captureIdx).toBeGreaterThan(idleIdx);
   });
 
+  it('starts Codex App warm liveness only after old-key challenge proof, not from a backend flag', () => {
+    const source = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
+    const activationIdx = source.indexOf('function activateCodexAppControlConnection(');
+    const proofKindIdx = source.indexOf("const proofKind = identity.generation === codexAppFreshCandidateGeneration", activationIdx);
+    const beginIdx = source.indexOf('codexAppTurnLiveness.beginReattachObservation();', proofKindIdx);
+    const pipeGateIdx = source.indexOf('if (isPipeMode && backend && isPersistentBackendReattach)');
+    const seedIdx = source.indexOf('seedBackendScreen(`${effectiveBackendType} reattach`, backend);', pipeGateIdx);
+
+    expect(activationIdx).toBeGreaterThan(-1);
+    expect(proofKindIdx).toBeGreaterThan(activationIdx);
+    expect(beginIdx).toBeGreaterThan(proofKindIdx);
+    expect(seedIdx).toBeGreaterThan(pipeGateIdx);
+    expect(source).not.toContain('shouldBeginCodexAppReattachObservation({');
+  });
+
   it('cold-start argv prompts seed working for card-off; Grok holds busy, quiescence seeds idle', () => {
     // Grok: argv + SessionStart → hold working until assistant_final.
     // Pi/Gemini: argv but first ready IS turn end → seed working then idle.
@@ -75,8 +92,8 @@ describe('worker pipe initial screen ordering', () => {
     // Synthetic working must not be rewritten by classifyScreenUsageLimit
     // (rate-limit banner would otherwise collapse seed to limited→limited).
     expect(source).toContain('opts?.force');
-    // Short-turn fix: flushPending publishes working immediately on submit.
-    expect(source).toContain("// Immediate working for card-off reaction settle");
+    // Every submitted item starts a fresh runtime write cycle immediately.
+    expect(source).toContain('beginCliWriteCycle()');
   });
 
   it('runs a busy-pattern idle probe after each submitted input — except reliableTurnTerminal CLIs', () => {
@@ -89,7 +106,7 @@ describe('worker pipe initial screen ordering', () => {
     const flushStart = source.indexOf('async function flushPending(): Promise<void>');
     const flushEnd = source.indexOf('function sendToPty(', flushStart);
     const flush = source.slice(flushStart, flushEnd);
-    const writeIdx = flush.indexOf('() => targetAdapter.writeInput(');
+    const writeIdx = flush.indexOf('() => writeAdapter.writeInput(');
     const gateIdx = flush.indexOf('if (cliAdapter.reliableTurnTerminal !== true) {', writeIdx);
     const probeIdx = flush.indexOf('scheduleBusyPatternIdleProbe(`${cliName()} post-submit`);', writeIdx);
     const helperIdx = source.indexOf('function scheduleBusyPatternIdleProbe(source: string): void');
@@ -307,6 +324,255 @@ describe('worker pipe initial screen ordering', () => {
     expect(markReadyIdx).toBeGreaterThan(flushIdx);
   });
 
+  it('rejects Codex App prompts before proof and while the explicit queue is active', () => {
+    const source = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
+    const markStart = source.indexOf('function markPromptReady');
+    const markEnd = source.indexOf('function persistCliSessionId', markStart);
+    const mark = source.slice(markStart, markEnd);
+
+    const livenessGuardIdx = mark.indexOf(
+      "if (lastInitConfig?.cliId === 'codex-app' && !codexAppTurnLiveness.notePrompt())",
+    );
+    const proofGuardIdx = mark.indexOf(
+      "if (lastInitConfig?.cliId === 'codex-app' && !codexAppControlProven)",
+    );
+    const signedIdleGuardIdx = mark.indexOf(
+      "if (lastInitConfig?.cliId === 'codex-app' && !codexAppReadyAuthority.canPublishPromptReady())",
+    );
+    const readySetIdx = mark.indexOf('isPromptReady = true;');
+    const promptReadySendIdx = mark.indexOf("send({ type: 'prompt_ready' });");
+    // The master merge replaced the inline `usageLimitTracker.classify(content,
+    // 'idle')` screen_update with the publishScreenStatus('idle') projection
+    // (classify runs inside it). It still fires AFTER prompt_ready.
+    const idleUpdateIdx = mark.indexOf("publishScreenStatus('idle')");
+
+    expect(proofGuardIdx).toBeGreaterThan(-1);
+    expect(proofGuardIdx).toBeLessThan(livenessGuardIdx);
+    expect(livenessGuardIdx).toBeGreaterThan(-1);
+    expect(signedIdleGuardIdx).toBeGreaterThan(livenessGuardIdx);
+    // The explicit runner queue wins before any immediate daemon/card status
+    // projection; returning from the guard therefore suppresses both paths.
+    // The shared projector composes the structured lifecycle gate with signed
+    // Codex App liveness instead of hard-coding an idle card update here.
+    expect(livenessGuardIdx).toBeLessThan(readySetIdx);
+    expect(signedIdleGuardIdx).toBeLessThan(readySetIdx);
+    expect(readySetIdx).toBeLessThan(promptReadySendIdx);
+    expect(promptReadySendIdx).toBeLessThan(idleUpdateIdx);
+  });
+
+  it('lets explicit Codex App activity override a stale idle screen heuristic', () => {
+    const source = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
+    const helperStart = source.indexOf('function codexAppLivenessStatus');
+    const helperEnd = source.indexOf('// Per-turn usage-limit state machine', helperStart);
+    const helper = source.slice(helperStart, helperEnd);
+    const activityStart = source.indexOf("if (kind === 'activity' && lastInitConfig?.cliId === 'codex-app')");
+    const activityEnd = source.indexOf("if (kind === 'final'", activityStart);
+    const activity = source.slice(activityStart, activityEnd);
+
+    expect(helper).toContain("liveness.active && base === 'idle' ? 'working' : base");
+    expect(activity).toContain('applyTrustedCodexAppActivityMarker(');
+    expect(activity).toContain('if (!activity.accepted)');
+    expect(activity).toContain('isPromptReady = false;');
+  });
+
+  it('re-drives a deferred Codex App prompt after a queued submit cancellation', () => {
+    const source = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
+    const flushStart = source.indexOf('async function flushPending');
+    const flushEnd = source.indexOf('function sendToPty', flushStart);
+    const flush = source.slice(flushStart, flushEnd);
+
+    expect(flush.match(/codexAppPromptReplay\.cancelSubmission\(\s*codexAppTurnLiveness,\s*codexAppReadyAuthority,\s*codexAppLivenessHandle,?\s*\)/g)).toHaveLength(2);
+    expect(flush).toContain('codexAppPromptReplay.consumeAfterFlush(codexAppTurnLiveness)');
+    expect(flush.lastIndexOf('markPromptReady();')).toBeGreaterThan(flush.lastIndexOf('isFlushing = false;'));
+  });
+
+  it('persists a late-created public candidate before spawn and never trusts Codex App OSC', () => {
+    const source = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
+    const prepareIdx = source.indexOf('await prepareCodexAppControlGeneration(cfg, willReattachPersistent, !!persistentSessionName);');
+    const candidateIdx = source.indexOf('prepareFreshCodexAppControlBootstrap(cfg, !!persistentSessionName);');
+    const injectIdx = source.indexOf('childEnv[CODEX_APP_CONTROL_BOOTSTRAP_ENV] = codexAppControlBootstrapPathForSpawn;');
+    const spawnIdx = source.indexOf('backend.spawn(spawnBin, spawnArgs');
+    const finalizeIdx = source.indexOf('finalizeCodexAppControlGeneration(', spawnIdx);
+    // The master merge refactored the post-spawn PTY listener into the
+    // setupBackendHandlers `observedBackend.onData((data) => …)` form (with the
+    // backend!==observedBackend generation fence); the bare `backend.onData(
+    // onPtyData)` now only appears in the earlier adopt early-return paths.
+    const onDataIdx = source.indexOf('observedBackend.onData((data)', spawnIdx);
+    const finalizeStart = source.indexOf('function finalizeCodexAppControlGeneration(');
+    const finalizeEnd = source.indexOf('function rejectCodexAppControlMarker', finalizeStart);
+    const finalize = source.slice(finalizeStart, finalizeEnd);
+
+    expect(prepareIdx).toBeGreaterThan(-1);
+    expect(candidateIdx).toBeGreaterThan(prepareIdx);
+    expect(injectIdx).toBeGreaterThan(candidateIdx);
+    expect(spawnIdx).toBeGreaterThan(injectIdx);
+    expect(finalizeIdx).toBeGreaterThan(spawnIdx);
+    expect(onDataIdx).toBeGreaterThan(finalizeIdx);
+    expect(finalize).toContain("codexAppControlProven && codexAppControlStateValue?.status === 'active'");
+    expect(source).toContain("const APP_RUNNER_OSC_CLI_IDS = new Set(['mira', 'mir']);");
+    expect(source).not.toContain('CODEX_APP_CONTROL_NONCE_ENV');
+    expect(source).not.toContain('codexAppControlNonceForSpawn');
+  });
+
+  it('awaits bind and locator publication before every backend spawn path', () => {
+    const source = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
+    const spawnStart = source.indexOf('async function spawnCli(');
+    const prepareIdx = source.indexOf('await prepareCodexAppControlGeneration(', spawnStart);
+    const pluginPrepareIdx = source.indexOf('await prepareCliPluginGenerationAndGateway(cfg, cliAdapter)', prepareIdx);
+    const backendSpawnIdx = source.indexOf('backend.spawn(spawnBin, spawnArgs', prepareIdx);
+
+    expect(spawnStart).toBeGreaterThan(-1);
+    expect(prepareIdx).toBeGreaterThan(spawnStart);
+    expect(backendSpawnIdx).toBeGreaterThan(prepareIdx);
+    expect(source.match(/await spawnCli\(/g)).toHaveLength(3);
+    expect(source.slice(spawnStart, prepareIdx)).toContain('const spawnGeneration = ++cliSpawnGeneration;');
+    expect(source.slice(prepareIdx, backendSpawnIdx))
+      .toContain('if (spawnGeneration !== cliSpawnGeneration) throw new CliSpawnSupersededError();');
+    expect(source.slice(pluginPrepareIdx, backendSpawnIdx)
+      .match(/if \(spawnGeneration !== cliSpawnGeneration\) throw new CliSpawnSupersededError\(\);/g))
+      .toHaveLength(2);
+    // killCli bumps the spawn generation as its first mutation so an in-flight
+    // async spawn is invalidated before any other teardown runs. The master merge
+    // expanded the signature (added `preserveSandbox?`) and prefixed a rationale
+    // comment, so assert the two invariants instead of an exact concatenation:
+    // the (multi-line) signature exists, and cliSpawnGeneration++ is the first
+    // statement inside the body.
+    const killCliIdx = source.indexOf('function killCli(opts: {');
+    expect(killCliIdx).toBeGreaterThan(-1);
+    const killCliBody = source.slice(source.indexOf('} = {}): void {', killCliIdx));
+    expect(killCliBody.slice(0, 300)).toContain('cliSpawnGeneration++;');
+    // Two additional checks normalize nested spawn failures before the three
+    // restart/init/message handlers consume them.
+    expect(source.match(/err instanceof CliSpawnSupersededError/g)).toHaveLength(5);
+    const restartHandler = source.slice(
+      source.indexOf('async function restartCliProcess('),
+      source.indexOf('// ─── HTTP + WebSocket Server'),
+    );
+    const initHandler = source.slice(
+      source.indexOf("case 'init':"),
+      source.indexOf("case 'codex_app_dispatch_persisted':"),
+    );
+    const messageHandler = source.slice(
+      source.indexOf("case 'message':"),
+      source.indexOf("case 'raw_input':"),
+    );
+    for (const handler of [restartHandler, initHandler, messageHandler]) {
+      expect(handler).toContain('if (err instanceof CliSpawnSupersededError) return;');
+    }
+  });
+
+  it('uses hardened locators, random endpoints, and process-lifetime publisher leases', () => {
+    const source = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
+    const prepareStart = source.indexOf('async function prepareCodexAppControlGeneration(');
+    const prepareEnd = source.indexOf('/** Late-create the only secret-bearing file', prepareStart);
+    const prepare = source.slice(prepareStart, prepareEnd);
+    const bootstrapStart = prepareEnd;
+    const bootstrapEnd = source.indexOf('function finalizeCodexAppControlGeneration(', bootstrapStart);
+    const bootstrap = source.slice(bootstrapStart, bootstrapEnd);
+    const acceptStart = source.indexOf('function acceptCodexAppControlSocket(');
+    const acceptEnd = source.indexOf('function removeStaleCodexAppSocket', acceptStart);
+    const accept = source.slice(acceptStart, acceptEnd);
+    const stopStart = source.indexOf('function stopCodexAppControlChannel(');
+    const stopEnd = source.indexOf('function failCodexAppControlGeneration', stopStart);
+    const stop = source.slice(stopStart, stopEnd);
+
+    expect(prepare).toContain("process.platform === 'win32' ? codexAppWindowsControlRoot()");
+    const leaseIdx = prepare.indexOf('await ensureCodexAppWindowsOwnerLease(cfg.sessionId)');
+    const locatorIdx = prepare.indexOf('codexAppControlLocatorPath(controlRoot, cfg.sessionId)');
+    expect(leaseIdx).toBeGreaterThan(-1);
+    expect(locatorIdx).toBeGreaterThan(leaseIdx);
+    expect(prepare).toContain('else await ensureCodexAppPosixOwnerLease(controlRoot, cfg.sessionId);');
+    expect(prepare).toContain('codexAppControlLocatorPath(controlRoot, cfg.sessionId)');
+    expect(prepare).toContain('const started = await startCodexAppControlEndpoint(cfg, channelId);');
+    expect(source).toContain('await bindThenPublishCodexAppControlLocator({');
+    expect(source).toContain('generateCodexAppWindowsPipeEndpoint()');
+    expect(source).toContain('generateCodexAppPosixSocketEndpoint(codexAppControlSocketDirectory)');
+    expect(bootstrap).toContain("{ kind: 'locator', locatorPath: codexAppControlLocatorPathValue }");
+    expect(accept).toContain("rotateCodexAppControlEndpoint('active socket closed')");
+    expect(accept).toContain('if (wasActive');
+    expect(stop).toContain("if (socketPath && process.platform !== 'win32')");
+    expect(stop).not.toContain('unlinkSync(codexAppControlLocatorPathValue)');
+    expect(prepare).toContain('Deleting first would');
+    const killStart = source.indexOf('function killCli(');
+    const killEnd = source.indexOf('function cleanup()', killStart);
+    const cleanupStart = source.indexOf('function cleanup()');
+    const cleanupEnd = source.indexOf("process.on('SIGTERM'", cleanupStart);
+    expect(source.slice(killStart, killEnd)).not.toContain('releaseCodexAppPosixOwnerLease()');
+    expect(source.slice(cleanupStart, cleanupEnd)).toContain('releaseCodexAppPosixOwnerLease();');
+  });
+
+  it('prevents retired async endpoints from publishing or failing a newer channel', () => {
+    const source = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
+    const start = source.slice(
+      source.indexOf('async function startCodexAppControlEndpoint('),
+      source.indexOf('function installCodexAppControlEndpoint('),
+    );
+    const rotateStart = source.indexOf('function rotateCodexAppControlEndpoint(');
+    const rotate = source.slice(
+      rotateStart,
+      source.indexOf('async function prepareCodexAppControlGeneration(', rotateStart),
+    );
+
+    expect(start.indexOf('channelId !== codexAppControlChannelId')).toBeLessThan(
+      start.indexOf('writeCodexAppControlLocator(locatorPath, locator);'),
+    );
+    expect(start).toContain('if (codexAppControlServer === server)');
+    expect(rotate).toContain('if (shouldFailCodexAppControlChannel({');
+    expect(rotate).toContain('if (codexAppControlRotation === rotation) codexAppControlRotation = undefined;');
+  });
+
+  it('keeps an unproved endpoint bound until the shared 90-second fail-close deadline', () => {
+    const source = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
+    const acceptStart = source.indexOf('function acceptCodexAppControlSocket(');
+    const acceptEnd = source.indexOf('function removeStaleCodexAppSocket', acceptStart);
+    const accept = source.slice(acceptStart, acceptEnd);
+    const finalizeStart = source.indexOf('function finalizeCodexAppControlGeneration(');
+    const finalizeEnd = source.indexOf('function rejectCodexAppControlMarker', finalizeStart);
+    const finalize = source.slice(finalizeStart, finalizeEnd);
+
+    expect(accept).toContain('Rotate only after the authenticated runner closes.');
+    expect(accept).toContain('if (wasActive');
+    expect(accept).toContain('codexAppProofDeadline.arm(() => {');
+    expect(accept).toContain('did not re-authenticate within');
+    expect(accept).not.toContain('pre-auth socket closed');
+    expect(finalize).toContain('codexAppProofDeadline.arm(() => {');
+  });
+
+  it('shares the 90-second first-prompt cap with bootstrap cleanup and runner proof', () => {
+    const source = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
+    const bootstrapStart = source.indexOf('function prepareFreshCodexAppControlBootstrap(');
+    const bootstrapEnd = source.indexOf('function finalizeCodexAppControlGeneration(', bootstrapStart);
+    const bootstrap = source.slice(bootstrapStart, bootstrapEnd);
+    const proofStart = bootstrapEnd;
+    const proofEnd = source.indexOf('function rejectCodexAppControlMarker', proofStart);
+    const proof = source.slice(proofStart, proofEnd);
+
+    expect(source).toContain('const FIRST_PROMPT_HARD_TIMEOUT_MS = CODEX_APP_CONTROL_STARTUP_TIMEOUT_MS;');
+    expect(bootstrap).toContain('armCodexAppControlStartupTimeout(cleanupCodexAppControlBootstrap)');
+    expect(proof).toContain('codexAppProofDeadline.arm(() => {');
+    expect(bootstrap).not.toContain('30_000');
+    expect(proof).not.toContain('30_000');
+  });
+
+  it('kills legacy/no-public-key reattach and fail-closes candidate setup before PTY listeners attach', () => {
+    const source = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
+    const preflightIdx = source.indexOf('shouldColdStartCodexAppReattach({');
+    const preflightKillIdx = source.indexOf('killPersistentSession(', preflightIdx);
+    const prepareIdx = source.indexOf('prepareCodexAppControlGeneration(', preflightIdx);
+    const finalizeIdx = source.indexOf('finalizeCodexAppControlGeneration(', prepareIdx);
+    const failureKillIdx = source.indexOf('killPersistentSession(', finalizeIdx);
+    // Post-merge the PTY listener is the setupBackendHandlers
+    // `observedBackend.onData((data) => …)` form (was `backend.onData(onPtyData)`).
+    const onDataIdx = source.indexOf('observedBackend.onData((data)', finalizeIdx);
+
+    expect(preflightIdx).toBeGreaterThan(-1);
+    expect(preflightKillIdx).toBeGreaterThan(preflightIdx);
+    expect(preflightKillIdx).toBeLessThan(prepareIdx);
+    expect(finalizeIdx).toBeGreaterThan(prepareIdx);
+    expect(failureKillIdx).toBeGreaterThan(finalizeIdx);
+    expect(failureKillIdx).toBeLessThan(onDataIdx);
+  });
+
   it('keys overlapping authoritative screen settles by the idle-edge revision', () => {
     const source = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
     const settleStart = source.indexOf('function settleBackendScreenBeforeIdle');
@@ -367,6 +633,31 @@ describe('worker pipe initial screen ordering', () => {
     expect(helper).toContain('const tailLineCount = Math.max(12, Math.ceil(lines.length / 3));');
     expect(probe).toContain('cliAdapter.busyPattern.test(busyProbeRegion(content))');
     expect(probe).not.toContain('cliAdapter.busyPattern.test(content)');
+  });
+
+  it('restores working from an explicit post-idle busy edge in spawn and adopt modes', () => {
+    const source = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
+    const helperStart = source.indexOf('function wireIdleDetectorBusyTransition(');
+    const helperEnd = source.indexOf('function setupAdoptIdleDetection', helperStart);
+    const helper = source.slice(helperStart, helperEnd);
+
+    expect(helperStart).toBeGreaterThan(-1);
+    expect(helper).toContain('detector.onBusy(() => {');
+    expect(helper).toContain('if (!isPromptReady) return;');
+    expect(helper).toContain('isPromptReady = false;');
+    expect(helper).toContain("publishScreenStatus('working', { force: true });");
+    expect(helper).not.toContain('idleDetector?.reset()');
+    expect(helper).not.toContain('detector.reset()');
+
+    const adoptStart = source.indexOf('function setupAdoptIdleDetection');
+    const adoptEnd = source.indexOf('function seedBackendScreen', adoptStart);
+    const adopt = source.slice(adoptStart, adoptEnd);
+    expect(adopt).toContain('wireIdleDetectorBusyTransition(idleDetector, `${label} adopt mode`);');
+
+    const spawnStart = source.indexOf('// Set up idle detection.');
+    const spawnEnd = source.indexOf('observedBackend.onData((data) =>', spawnStart);
+    const spawn = source.slice(spawnStart, spawnEnd);
+    expect(spawn).toContain('wireIdleDetectorBusyTransition(idleDetector, `${cliName()} PTY`);');
   });
 
   it('settles an authoritative screen before a busy-pattern probe marks the prompt ready', () => {
@@ -473,6 +764,14 @@ describe('worker pipe initial screen ordering', () => {
     expect(herdrBlock).toContain('herdrBe.cliPid = cfg.adoptCliPid');
     expect(herdrBlock).toContain('cfg.adoptCwd ?? cfg.workingDir');
     expect(herdrBlock).toContain('herdrBe.cliCwd');
+  });
+
+  it('wires reasonix cliPid/cliCwd in both immediate and late pid paths', () => {
+    const source = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
+    // reasonix joins the inline pid/cwd-wiring condition alongside grok/traex at
+    // BOTH sites (synchronous tmux/pty resolve + async zellij late-pid fallback).
+    const matches = source.match(/cfg\.cliId === 'grok' \|\| cfg\.cliId === 'traex' \|\| cfg\.cliId === 'reasonix'/g) ?? [];
+    expect(matches.length).toBeGreaterThanOrEqual(2);
   });
 
   it('wires Herdr adopt snapshots before seeding the initial screen', () => {

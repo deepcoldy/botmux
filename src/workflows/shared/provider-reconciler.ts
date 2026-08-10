@@ -7,19 +7,13 @@
  * the caller owns durable state transitions and retry policy.
  */
 
-export type ReadOnlyLookupResult =
-  | { found: true; externalRefs: Record<string, unknown>; evidence?: Record<string, unknown> }
-  | { found: false; evidence?: Record<string, unknown> };
+import type { ProviderReconciler } from '../v3/runtime-host-contract.js';
 
-export type IdempotentSubmitResult =
-  | { ok: true; externalRefs: Record<string, unknown>; evidence?: Record<string, unknown> }
-  | {
-      ok: false;
-      errorCode: string;
-      errorClass: 'retryable' | 'fatal' | 'userFault' | 'manual';
-      errorMessage: string;
-      evidence?: Record<string, unknown>;
-    };
+export type {
+  IdempotentSubmitResult,
+  ProviderReconciler,
+  ReadOnlyLookupResult,
+} from '../v3/runtime-host-contract.js';
 
 /**
  * Provider dedupe windows shared by v3 host execution and frozen v2 replay.
@@ -29,15 +23,3 @@ export const PROVIDER_TTL_MS = {
   'feishu-im': 60 * 60 * 1000,
   'botmux-schedule': Number.MAX_SAFE_INTEGER,
 } as const;
-
-export interface ProviderReconciler {
-  readonly provider: string;
-  /** Whether provider reconciliation requires the exact frozen input bytes. */
-  readonly requiresEffectInput?: boolean;
-  /** Pure provider lookup keyed by the durable idempotency key. */
-  readOnlyLookup?(idempotencyKey: string, input: unknown): Promise<ReadOnlyLookupResult>;
-  /** Idempotent re-submit using the original key and verified frozen input. */
-  idempotentSubmit?(idempotencyKey: string, input: unknown): Promise<IdempotentSubmitResult>;
-  /** Must match the executor's canonicalInput implementation exactly. */
-  canonicalInput?(input: unknown): unknown;
-}

@@ -2,7 +2,8 @@ import { describe, it, expect, vi } from 'vitest';
 import {
   resolveQuoteTarget,
   validateMentionDecision,
-  shouldBlockMentionBackByParticipants,
+  mentionBackAmbiguity,
+  mentionBackAmbiguityError,
   parseAttentionFlag,
   attentionUsageError,
   managedVcQuoteError,
@@ -249,35 +250,75 @@ describe('validateMentionDecision', () => {
   });
 });
 
-describe('shouldBlockMentionBackByParticipants', () => {
-  it('p2p DM never blocks (inherently 1v1), regardless of reported counts', () => {
-    // p2p short-circuits before any count check — caller skips the API fetch.
-    expect(shouldBlockMentionBackByParticipants({ chatType: 'p2p', userCount: 999, botCount: 999 })).toBe(false);
+describe('mentionBackAmbiguity (turn-window participants + completeness)', () => {
+  it('zero or one counterpart in a COMPLETE window → unambiguous, allow --mention-back', () => {
+    expect(mentionBackAmbiguity({ chatType: 'group', participants: [], incomplete: false })).toEqual({ ambiguous: false, candidates: [], incomplete: false });
+    expect(mentionBackAmbiguity({ chatType: 'group', participants: [{ openId: 'ou_a' }], incomplete: false })).toEqual({ ambiguous: false, candidates: [], incomplete: false });
   });
 
-  it('allows 1 human + 1 bot (true 1v1 group, sum = 2)', () => {
-    expect(shouldBlockMentionBackByParticipants({ chatType: 'group', userCount: 1, botCount: 1 })).toBe(false);
+  it('a bot-only 1v1 complete window stays unambiguous (bot→bot handoff @-back is exact)', () => {
+    // The reported footgun path: 1 human + N idle bots, a bot triggers — the
+    // turn window has just that one bot, so --mention-back is allowed and @s it.
+    expect(mentionBackAmbiguity({ chatType: 'group', participants: [{ openId: 'ou_bot_a', isBot: true }], incomplete: false }).ambiguous).toBe(false);
   });
 
-  it('allows a lone human with no bot yet (sum = 1)', () => {
-    expect(shouldBlockMentionBackByParticipants({ chatType: 'group', userCount: 1, botCount: 0 })).toBe(false);
+  it('2+ distinct counterparts → ambiguous, list them as --mention candidates', () => {
+    const r = mentionBackAmbiguity({
+      chatType: 'group',
+      participants: [{ openId: 'ou_human', name: '张三' }, { openId: 'ou_bot', name: 'Codex', isBot: true }],
+      incomplete: false,
+    });
+    expect(r.ambiguous).toBe(true);
+    expect(r.candidates.map(c => c.openId)).toEqual(['ou_human', 'ou_bot']);
   });
 
-  it('blocks 2 humans + 1 bot (sum = 3 > 2)', () => {
-    expect(shouldBlockMentionBackByParticipants({ chatType: 'group', userCount: 2, botCount: 1 })).toBe(true);
+  it('INCOMPLETE window is ambiguous even with ≤1 known candidate (hidden counterpart may exist)', () => {
+    // e.g. "human sender + @OtherBot(app_id-form)": only the human resolves to an
+    // open_id, but the unresolved bot mention set incomplete → must not auto-@.
+    const r = mentionBackAmbiguity({ chatType: 'group', participants: [{ openId: 'ou_human', name: '张三' }], incomplete: true });
+    expect(r.ambiguous).toBe(true);
+    expect(r.incomplete).toBe(true);
+    expect(r.candidates.map(c => c.openId)).toEqual(['ou_human']); // the one we CAN list
   });
 
-  it('blocks 1 human + 2 bots (multi-bot needs explicit @, sum = 3)', () => {
-    expect(shouldBlockMentionBackByParticipants({ chatType: 'group', userCount: 1, botCount: 2 })).toBe(true);
+  it('INCOMPLETE window with zero known candidates is still ambiguous (old session, no participants)', () => {
+    expect(mentionBackAmbiguity({ chatType: 'group', participants: [], incomplete: true }).ambiguous).toBe(true);
   });
 
-  it('getGroupStats soft-failure fallback {999,999} fails closed to blocked', () => {
-    expect(shouldBlockMentionBackByParticipants({ chatType: 'group', userCount: 999, botCount: 999 })).toBe(true);
+  it('p2p DM is never ambiguous regardless of participants/incomplete', () => {
+    expect(mentionBackAmbiguity({ chatType: 'p2p', participants: [{ openId: 'ou_a' }, { openId: 'ou_b' }], incomplete: true }))
+      .toEqual({ ambiguous: false, candidates: [], incomplete: false });
   });
 
-  it('undefined chatType (unknown) still counts participants — sum > 2 blocks', () => {
-    expect(shouldBlockMentionBackByParticipants({ userCount: 3, botCount: 0 })).toBe(true);
-    expect(shouldBlockMentionBackByParticipants({ userCount: 1, botCount: 1 })).toBe(false);
+  it('ignores participant entries without an open_id when counting', () => {
+    expect(mentionBackAmbiguity({ chatType: 'group', participants: [{ openId: 'ou_a' }, { openId: '' }], incomplete: false }).ambiguous).toBe(false);
+  });
+});
+
+describe('mentionBackAmbiguityError', () => {
+  it('lists each candidate open_id with three-state label (bot/人/未知) and name', () => {
+    const msg = mentionBackAmbiguityError([
+      { openId: 'ou_human', name: '张三', isBot: false },
+      { openId: 'ou_bot', name: 'Codex', isBot: true },
+      { openId: 'ou_unknown', name: '?' }, // isBot undefined → 未知
+    ]);
+    expect(msg).toContain('--mention <open_id>');
+    expect(msg).toContain('ou_human（人 张三）');
+    expect(msg).toContain('ou_bot（bot Codex）');
+    expect(msg).toContain('ou_unknown（未知 ?）');
+    expect(msg).toContain('--no-mention');
+  });
+
+  it('incomplete window: still lists the known sender + says there may be unresolved participants', () => {
+    const msg = mentionBackAmbiguityError([{ openId: 'ou_human', name: '张三', isBot: false }], true);
+    expect(msg).toContain('ou_human（人 张三）'); // known candidate still offered
+    expect(msg).toContain('无法确定唯一'); // incomplete phrasing
+  });
+
+  it('incomplete window with no listable candidate still guides to explicit --mention/--no-mention', () => {
+    const msg = mentionBackAmbiguityError([], true);
+    expect(msg).toContain('--mention <open_id>');
+    expect(msg).toContain('--no-mention');
   });
 });
 

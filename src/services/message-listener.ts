@@ -123,6 +123,30 @@ export function extractListenerMessageText(message: any): string {
   return '';
 }
 
+/**
+ * Refresh a card match's observed text/title from the (now-resolved) message.
+ *
+ * The listener match is computed during filtering, off the SIMPLIFIED card the
+ * WS/history API first delivers — that view drops button jump URLs and lazy
+ * sub-card bodies. The live delivery path (daemon handleNewTopic) later runs
+ * resolveNonsupportMessage(data), merging the card's two representations
+ * (server-rendered + structured body.elements, incl. button open_url) into
+ * `message.content` — the same depth the direct-@bot path uses. Re-extracting
+ * here lets the model receive the button links, not the lossy match-time
+ * snapshot. Only interactive cards can differ (plain text/post already carried
+ * full content at match time). Fail-safe: a resolver miss (cross-tenant, REST
+ * unavailable) leaves `message.content` as the simplified view and yields the
+ * SAME text as match time, so guarding on a non-empty result never blanks a
+ * match — it only ever upgrades. Mutates `match` in place.
+ */
+export function refreshListenerCardTextFromResolved(match: MessageListenerMatch, message: any): void {
+  if (match.msgType !== 'interactive') return;
+  const text = extractListenerMessageText(message);
+  if (text.trim()) match.messageText = text;
+  const title = extractListenerMessageTitle(message);
+  if (title?.trim()) match.messageTitle = title;
+}
+
 function contains(list: readonly string[] | undefined, value: string | undefined): boolean {
   return !!value && !!list && list.includes(value);
 }

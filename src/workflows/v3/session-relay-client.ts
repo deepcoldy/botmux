@@ -24,6 +24,7 @@ import { V3_SESSION_RUN_MUTATION_ROUTE_PREFIX } from './session-relay.js';
 export interface WorkflowSessionRelayContext {
   sessionId: string;
   capability: string;
+  originChannelId?: string;
   turnId?: string;
   dispatchAttempt?: number;
   /** Routing hints only — never identity. */
@@ -58,14 +59,25 @@ export function readWorkflowSessionRelayContext(options: {
   if (marker?.sessionId) return null;
   const readClaim = options.readClaim ?? readManagedOriginCapability;
   const relayDir = options.env.BOTMUX_SEND_RELAY?.trim();
-  const claim = readClaim(options.dataDir, sessionId, relayDir || undefined);
+  const originChannelId = options.env.BOTMUX_ORIGIN_CHANNEL_ID?.trim();
+  const claim = readClaim(
+    options.dataDir,
+    sessionId,
+    relayDir || undefined,
+    originChannelId || undefined,
+  );
   if (!claim) return null;
   const portRaw = Number(options.env.BOTMUX_DAEMON_IPC_PORT);
-  const ipcPortFallback = Number.isSafeInteger(portRaw) && portRaw > 0 ? portRaw : undefined;
+  // Persistent panes can retain a spawn-time daemon port across daemon
+  // restarts. Prefer the current worker-published port from the rotating,
+  // protected claim; the inherited env remains a compatibility fallback.
+  const ipcPortFallback = claim.ipcPort
+    ?? (Number.isSafeInteger(portRaw) && portRaw > 0 ? portRaw : undefined);
   const larkAppId = options.env.BOTMUX_LARK_APP_ID?.trim();
   return {
     sessionId,
     capability: claim.capability,
+    ...(claim.channelId ? { originChannelId: claim.channelId } : {}),
     ...(claim.turnId ? { turnId: claim.turnId } : {}),
     ...(claim.dispatchAttempt !== undefined ? { dispatchAttempt: claim.dispatchAttempt } : {}),
     ...(larkAppId ? { larkAppId } : {}),
@@ -88,7 +100,7 @@ export async function postWorkflowSessionRunMutation(input: {
   fetchImpl?: typeof fetch;
 }): Promise<WorkflowDaemonMutationResponse> {
   const discovered = input.resolveIpcPort?.(input.context.larkAppId);
-  const ipcPort = discovered ?? input.context.ipcPortFallback;
+  const ipcPort = input.context.ipcPortFallback ?? discovered;
   if (!ipcPort) {
     throw new WorkflowDaemonMutationTransportError(
       '找不到目标 daemon 端口（daemon 发现目录不可见且缺少 BOTMUX_DAEMON_IPC_PORT）；请确认 daemon 在线',
@@ -99,6 +111,9 @@ export async function postWorkflowSessionRunMutation(input: {
     ...(input.body ?? {}),
     sessionId: input.context.sessionId,
     originCapability: input.context.capability,
+    ...(input.context.originChannelId
+      ? { originChannelId: input.context.originChannelId }
+      : {}),
     ...(input.context.turnId ? { originTurnId: input.context.turnId } : {}),
     ...(input.context.dispatchAttempt !== undefined
       ? { originDispatchAttempt: input.context.dispatchAttempt }

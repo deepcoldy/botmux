@@ -107,6 +107,37 @@ export function getMessageListenerConfig(larkAppId: string, chatId: string): Mes
   }
 }
 
+/**
+ * Build the persisted config for a listener update, or `null` when the update
+ * carries nothing worth keeping (→ delete the entry).
+ *
+ * A DISABLED listener with a non-empty prompt is a valid *draft*: it is
+ * persisted with `enabled:false` so the operator can turn it on later without
+ * retyping. Previously any disabled update was collapsed to `null` (deleted
+ * outright), so a draft saved while the toggle was off vanished on the next
+ * reload — the exact bug this fixes. Only a disabled update with a BLANK prompt
+ * is a true clear (this is also what the DELETE route sends: `{enabled:false,
+ * prompt:''}`). Enabled updates always carry a prompt
+ * (validateMessageListenerUpdate guarantees it), so they always build a config.
+ *
+ * Runtime is unaffected by a persisted draft: findMessageListenerForChat and
+ * enabledMessageListenerChatIds both require `enabled===true`, so an off draft
+ * never matches messages — it only survives for the dashboard editor.
+ */
+export function messageListenerConfigFromUpdate(patch: MessageListenerUpdate): MessageListenerConfig | null {
+  if (!patch.prompt.trim()) return null;
+  return {
+    enabled: patch.enabled,
+    ...(patch.name ? { name: patch.name } : {}),
+    ...(patch.replyCardTitle ? { replyCardTitle: patch.replyCardTitle } : {}),
+    ...(patch.workingDir ? { workingDir: patch.workingDir } : {}),
+    prompt: patch.prompt,
+    ...(patch.senderPolicy && Object.keys(patch.senderPolicy).length > 0 ? { senderPolicy: patch.senderPolicy } : {}),
+    ...(patch.messagePolicy ? { messagePolicy: { ...patch.messagePolicy, scope: 'top_level' } } : { messagePolicy: { scope: 'top_level' } }),
+    replyPolicy: { mode: 'thread', sessionMode: 'per_message' },
+  };
+}
+
 export async function updateMessageListenerConfig(
   larkAppId: string,
   chatId: string,
@@ -115,19 +146,13 @@ export async function updateMessageListenerConfig(
   let bot;
   try { bot = getBot(larkAppId); } catch { return { ok: false, reason: 'bot_not_registered' }; }
 
-  const normalized: MessageListenerConfig | null = patch.enabled ? {
-    enabled: true,
-    ...(patch.name ? { name: patch.name } : {}),
-    ...(patch.replyCardTitle ? { replyCardTitle: patch.replyCardTitle } : {}),
-    ...(patch.workingDir ? { workingDir: patch.workingDir } : {}),
-    prompt: patch.prompt,
-    ...(patch.senderPolicy && Object.keys(patch.senderPolicy).length > 0 ? { senderPolicy: patch.senderPolicy } : {}),
-    ...(patch.messagePolicy ? { messagePolicy: { ...patch.messagePolicy, scope: 'top_level' } } : { messagePolicy: { scope: 'top_level' } }),
-    replyPolicy: { mode: 'thread', sessionMode: 'per_message' },
-  } : null;
-
   const validation = validateMessageListenerUpdate(patch);
   if (!validation.ok) return { ok: false, reason: validation.reason };
+
+  // A disabled update with a non-empty prompt persists as an off DRAFT (kept for
+  // the editor, never matched at runtime); only a blank-prompt disabled update
+  // clears the entry. See messageListenerConfigFromUpdate.
+  const normalized = messageListenerConfigFromUpdate(patch);
 
   const result = await rmwBotEntry<MessageListenerConfig | null>(larkAppId, (entry) => {
     if (!normalized) {

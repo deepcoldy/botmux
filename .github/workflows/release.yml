@@ -150,6 +150,9 @@ jobs:
       - name: Sync version from git tag to package.json
         run: npm version "${GITHUB_REF_NAME#v}" --no-git-tag-version --allow-same-version
 
+      - name: Sync workflow core version from git tag
+        run: npm version "${GITHUB_REF_NAME#v}" --no-git-tag-version --allow-same-version --prefix packages/workflow-core
+
       - name: Resolve npm dist-tag + prerelease flag
         id: dist_tag
         run: |
@@ -234,8 +237,15 @@ jobs:
 
       - run: pnpm build
 
-      - name: Publish to npm
-        run: npm publish --tag "${{ steps.dist_tag.outputs.tag }}"
+      - run: pnpm workflow-core:test
+
+      - name: Publish workflow core to npm
+        run: node scripts/publish-npm-if-missing.mjs ./packages/workflow-core "${{ steps.dist_tag.outputs.tag }}"
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_ACCESS_TOKEN }}
+
+      - name: Publish botmux to npm
+        run: node scripts/publish-npm-if-missing.mjs . "${{ steps.dist_tag.outputs.tag }}"
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_ACCESS_TOKEN }}
 

@@ -20,6 +20,14 @@ export const GRANT_DURATION_OPTIONS = [
   7 * 24 * 60 * 60 * 1000,
 ] as const;
 
+export type GrantDurationMs = (typeof GRANT_DURATION_OPTIONS)[number];
+
+/** Dashboard/config 只允许卡片本身支持的四个有限时长。 */
+export function isGrantDurationOption(raw: unknown): raw is GrantDurationMs {
+  return typeof raw === 'number'
+    && GRANT_DURATION_OPTIONS.includes(raw as GrantDurationMs);
+}
+
 export function normalizeGrantDurationOption(raw: unknown): number | undefined | null {
   if (raw === 'permanent') return undefined;
   if (typeof raw !== 'string' || !/^\d+$/.test(raw)) return null;
