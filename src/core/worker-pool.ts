@@ -3513,9 +3513,15 @@ export interface CloseResidual {
 /**
  * `outcome` is a REQUIRED discriminant on success, not an optional warning field.
  *
- * An optional flag on an otherwise ordinary success is exactly what every call
- * site forgets to read; making it mandatory means a new entry point cannot render
- * "closed" without first deciding what to do about a residual remote session.
+ * An optional flag on an otherwise ordinary success is exactly what every call site
+ * forgets to read, so making it mandatory does help — but ONLY across a typed call.
+ * It is not a completeness guarantee: a consumer that reads just `.ok` compiles
+ * fine, and every JSON boundary (the dashboard IPC route, the CLI's daemon POST,
+ * the sessions card) erases the type entirely. Reviewing this change found exactly
+ * such consumers silently flattening a residual into a plain success.
+ *
+ * So the invariant is held by the consumer TESTS, not by this type. Any new close
+ * consumer needs one.
  */
 export type CloseSessionResult =
   | { ok: true; outcome: 'closed'; alreadyClosed: boolean; known: boolean }

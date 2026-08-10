@@ -4743,8 +4743,18 @@ async function postOwningDaemonSessionMutation(
   return 'applied';
 }
 
+/**
+ * A remote session the daemon closed LOCALLY but could not cancel.
+ *
+ * Carried all the way to the CLI/TUI: collapsing it into a plain success is the
+ * same lie the daemon-side result matrix exists to prevent, just one process
+ * boundary further out. JSON is `any` at this seam, so nothing but an explicit
+ * read keeps it — the discriminant cannot help here.
+ */
+type AbandonResidual = { reason?: string; taskId?: string };
+
 type AuthoritativeAbandonResult =
-  | { ok: true; mode: 'daemon' }
+  | { ok: true; mode: 'daemon'; residual?: AbandonResidual }
   | { ok: true; mode: 'offline'; current: SessionData; cleanedBacking?: string }
   | { ok: false; error?: string };
 
@@ -4771,7 +4781,15 @@ async function abandonSessionAuthoritatively(
         // stays fail-closed at the daemon's sessionCliIpcAuth check.
         const res = await postSessionCliIpc(ipcPort, session.sessionId, 'close', {});
         const body = await res.json().catch(() => ({} as Record<string, unknown>));
-        if (res.ok && (body as { ok?: unknown }).ok) return { ok: true, mode: 'daemon' };
+        if (res.ok && (body as { ok?: unknown }).ok) {
+          // Preserve an uncancelled remote session. An older daemon sends no
+          // `outcome` at all, which is treated as an ordinary close.
+          const outcome = (body as { outcome?: unknown }).outcome;
+          const residual = (body as { residual?: AbandonResidual }).residual;
+          return outcome === 'closed_with_residual' && residual
+            ? { ok: true, mode: 'daemon', residual }
+            : { ok: true, mode: 'daemon' };
+        }
         // Surface the daemon's own rejection reason (e.g. origin_unproven) and
         // never fall back to a partial local kill: a fresh descriptor means the
         // daemon may still hold authoritative in-memory state.
@@ -5051,55 +5069,6 @@ function closeSessionOffline(s: SessionData): SessionDeleteCloseResult {
   s.closedAt = new Date().toISOString();
   saveSession(s);
   return { ok: true, via: 'offline' };
-}
-
-/** Close through the owning daemon whenever it is online. The IPC request is
- *  deliberately sent BEFORE any local kill: deleting the current bmx-* tmux
- *  first would terminate this very CLI before it can evict daemon memory.
- *
- *  Trusted host callers use the dashboard HMAC. A sandboxed/read-isolated CLI
- *  can only authorize the exact current session with its rotating per-turn
- *  capability, so `delete <other-id>` remains fail-closed. */
-async function closeSessionForDelete(
-  s: SessionData,
-  online = listOnlineDaemons(),
-): Promise<SessionDeleteCloseResult> {
-  // Legacy sessions without larkAppId live in sessions.json. A per-bot daemon
-  // writes only its own sessions-<appId>.json and silently no-ops on close
-  // (sessionStore.closeSession only touches the current file), so routing a
-  // legacy session to it yields "200 OK" with no actual state change. This must
-  // hold on BOTH ways a daemon port is discovered — the descriptor lookup AND
-  // the injected-port current-session fallback below — so gate the whole daemon
-  // path on larkAppId with one authoritative guard. A live daemon-spawned
-  // session always carries larkAppId, so this never diverts the legitimate
-  // sandboxed current-session close (which reaches its daemon via the injected
-  // port); it only keeps larkAppId-less legacy records on the offline fallback,
-  // whose saveSession() persists to the legacy file correctly.
-  if (!s.larkAppId) {
-    return closeSessionOffline(s);
-  }
-
-  const daemon = online.find(d => d.larkAppId === s.larkAppId);
-  const isCurrentSession = process.env.BOTMUX_SESSION_ID === s.sessionId;
-  const injectedPort = isCurrentSession
-    ? resolveDaemonIpcPort(undefined, process.env.BOTMUX_DAEMON_IPC_PORT)
-    : undefined;
-  const ipcPort = daemon?.ipcPort ?? injectedPort;
-
-  if (ipcPort) {
-    try {
-      const res = await postSessionCliIpc(ipcPort, s.sessionId, 'close', {});
-      const body: any = await res.json().catch(() => ({}));
-      if (res.ok && body?.ok) return { ok: true, via: 'daemon' };
-      return { ok: false, error: body?.error ?? `HTTP ${res.status}` };
-    } catch (err: any) {
-      // A fresh daemon descriptor means there may still be authoritative
-      // in-memory state. Never fall back to a partial local kill in this case.
-      return { ok: false, error: `连接 daemon 失败: ${err?.message ?? err}` };
-    }
-  }
-
-  return closeSessionOffline(s);
 }
 
 function adoptTargetLabel(s: SessionData): string {
@@ -5599,7 +5568,16 @@ function interactiveSessionPicker(active: SessionData[], probeSnapshot: BackingP
       // abandonSessionAuthoritatively is `mode` (see its return type ~3573),
       // NOT master's `via` — that belongs to a different helper.
       flash = result.mode === 'daemon'
-        ? { style: 'success', text: `✓ 已删除 ${s.sessionId.substring(0, 8)}` }
+        ? (result.residual
+          // Local row closed, remote session still running: never the green
+          // "deleted" text, or the operator walks away from a live agent that
+          // still holds the injected credential.
+          ? {
+            style: 'warn',
+            text: `⚠ 本地已删除 ${s.sessionId.substring(0, 8)}，但远端会话未取消`
+              + `${result.residual.taskId ? `（${result.residual.taskId}）` : ''}，需人工清理`,
+          }
+          : { style: 'success', text: `✓ 已删除 ${s.sessionId.substring(0, 8)}` })
         : { style: 'warn', text: `✓ 已离线删除 ${s.sessionId.substring(0, 8)}` };
     }
 
@@ -5899,6 +5877,7 @@ async function cmdDelete(): Promise<void> {
   let closed = 0;
   let offline = 0;
   let failed = 0;
+  let residual = 0;
   for (const s of toDelete) {
     // Explicit abandon boundary: route through the owning daemon so the ledger
     // FIFO is cleared atomically with close; offline fallback rereads the row
@@ -5914,9 +5893,19 @@ async function cmdDelete(): Promise<void> {
       offline++;
       if (result.cleanedBacking) console.log(`  killed ${result.cleanedBacking}`);
     }
+    if (result.mode === 'daemon' && result.residual) {
+      // Local row closed, remote session NOT cancelled. Reported per session AND
+      // counted in the summary, so a bulk delete cannot bury it.
+      residual++;
+      console.warn(
+        `⚠ ${s.sessionId.substring(0, 8)} ${s.title}：本地已关闭，但远端会话未取消`
+        + `${result.residual.taskId ? `（${result.residual.taskId}）` : ''}，需人工清理`,
+      );
+      continue;
+    }
     console.log(`✓ ${s.sessionId.substring(0, 8)} ${s.title}${result.mode === 'offline' ? '（daemon 离线，本地收口）' : ''}`);
   }
-  console.log(`\n已关闭 ${closed} 个会话${offline ? `（${offline} 个离线收口）` : ''}${failed ? `，${failed} 个失败` : ''}`);
+  console.log(`\n已关闭 ${closed} 个会话${offline ? `（${offline} 个离线收口）` : ''}${failed ? `，${failed} 个失败` : ''}${residual ? `，${residual} 个远端未取消需人工清理` : ''}`);
   if (failed > 0) process.exitCode = 1;
 }
 
