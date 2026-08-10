@@ -5919,8 +5919,14 @@ function startPlatformTunnelIfBound(): void {
     const binding = readPlatformBinding();
     if (!binding) return;
     const existingToken = currentDashboardToken();
-    loadOrCreatePersistedToken(TOKEN_PATH);
+    // An already-materialized dashboard token is sufficient to start the
+    // tunnel. Avoid re-validating its path via secureHostFilePath(): on Linux
+    // the request-time read is descriptor-pinned, while deployments whose HOME
+    // is a root-owned symlink (common on managed dev hosts) can make the
+    // path-returning helper fail even though the 0600 file is safely readable.
+    // Only the first token creation needs the path+lock helper.
     if (!existingToken) {
+      loadOrCreatePersistedToken(TOKEN_PATH);
       logger.info('[platform-tunnel] 已初始化 dashboard token');
     }
     const version = readBotmuxVersion();

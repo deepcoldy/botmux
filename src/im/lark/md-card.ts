@@ -30,6 +30,8 @@ import {
   REPLY_CARD_FOOTER_ELEMENT_ID,
   REPLY_CARD_FOOTER_MARKER,
 } from './reply-card-footer-signature.js';
+import { buildSkillFeedbackElement } from './skill-feedback-card.js';
+import type { SkillFeedbackLevel } from '../../services/skill-feedback-store.js';
 
 export { REPLY_CARD_FOOTER_MARKER } from './reply-card-footer-signature.js';
 
@@ -959,6 +961,34 @@ export function buildMarkdownCard(
   });
 }
 
+/** Build the canonical final-answer card. Feedback defaults to L1 only when
+ * the caller omits a level; callers with an answer-goal classification should
+ * always pass L0/L1/L2 explicitly. Streaming/progress/session cards must keep
+ * using their existing builders and never call this helper. */
+export function buildCanonicalFinalReplyCard(opts: {
+  markdown: string;
+  feedback?: { level?: SkillFeedbackLevel };
+  recipientOpenId?: string;
+  brand?: string;
+  locale?: Locale;
+  workingDir?: string;
+  localHomeLinkMode?: LocalHomeLinkMode;
+  usage?: CardUsageSnapshot;
+}): string {
+  const elements = opts.markdown
+    ? buildCardBodyElements(opts.markdown, opts.workingDir, opts.localHomeLinkMode ?? 'filesystem')
+    : [];
+  if (opts.feedback) elements.push(buildSkillFeedbackElement(opts.feedback.level));
+  const footer = buildReplyCardFooter({
+    brand: opts.brand,
+    recipientOpenIds: opts.recipientOpenId ? [opts.recipientOpenId] : [],
+    usage: opts.usage,
+    locale: opts.locale,
+  });
+  if (footer) elements.push({ tag: 'hr' }, footer.element);
+  return JSON.stringify({ schema: '2.0', config: { update_multi: true }, body: { direction: 'vertical', elements } });
+}
+
 /** Prefix every line with `> ` so Feishu's markdown widget renders it as a
  *  blockquote even when the body contains blank lines. Empty lines become a
  *  bare `>` to keep the quote block contiguous. */
@@ -994,6 +1024,7 @@ export function buildContextualReplyCard(opts: {
   workingDir?: string;
   localHomeLinkMode?: LocalHomeLinkMode;
   usage?: CardUsageSnapshot;
+  feedback?: { level?: SkillFeedbackLevel };
 }): string {
   const {
     title,
@@ -1033,6 +1064,8 @@ export function buildContextualReplyCard(opts: {
     ? buildCardBodyElements(assistantText, workingDir, localHomeLinkMode)
     : [{ tag: 'markdown', content: `*${t('common.empty_paren', undefined, locale)}*` }];
   for (const el of bodyElements) elements.push(el);
+
+  if (opts.feedback) elements.push(buildSkillFeedbackElement(opts.feedback.level));
 
   const footer = buildReplyCardFooter({
     brand,

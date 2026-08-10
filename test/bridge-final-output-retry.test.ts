@@ -295,6 +295,39 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     expect(ds.lastBridgeEmittedUuid).toBe(SCOPED_DEDUPE_KEY);
   });
 
+  it('records a feedback Delivery only after the canonical final_output send returns its platform message id', async () => {
+    const sessionReply = vi.fn(async () => 'om_feedback_answer');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const ds = makeDs();
+    const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+    const { getSkillFeedbackStore } = await import('../src/services/skill-feedback-store.js');
+
+    __testOnly_deliverFinalOutput(ds, finalOutputMsg(), 'tag', 0);
+    const feedbackStore = await getSkillFeedbackStore('/tmp/test-sessions');
+    expect(feedbackStore.findDeliveryByPlatformMessage('lark', ds.larkAppId, 'om_feedback_answer')).toBeUndefined();
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect(feedbackStore.findDeliveryByPlatformMessage('lark', ds.larkAppId, 'om_feedback_answer')).toMatchObject({
+      platformMessageId: 'om_feedback_answer',
+      level: 'L1',
+    });
+  });
+
+  it('keeps feedback controls on ordinary local-turn output', async () => {
+    const sessionReply = vi.fn(async () => 'om_local_feedback');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    const ds = makeDs();
+    const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+    __testOnly_deliverFinalOutput(ds, { ...finalOutputMsg(), kind: 'local-turn', userText: 'question' }, 'tag', 0);
+    await vi.advanceTimersByTimeAsync(10);
+    expect(String(sessionReply.mock.calls[0][1])).toContain('botmux_skill_feedback');
+  });
+
   it('routes synthetic Codex App identities through their frozen reply turn and uses dispatch-stable Lark UUIDs', async () => {
     const sessionReply = vi.fn(async () => 'om_reply');
     initWorkerPool({
@@ -1447,7 +1480,6 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     __testOnly_deliverFinalOutput(ds, { ...msg, lastUuid: 'bridge-replay' }, 'tag', 0);
     await vi.advanceTimersByTimeAsync(10);
     expect(sessionReply).toHaveBeenCalledTimes(1);
-
     __testOnly_deliverFinalOutput(ds, {
       ...msg,
       content: 'changed fallback answer',
@@ -1555,6 +1587,7 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     expect(sessionReply).toHaveBeenCalledTimes(1);
     expect(sessionReply.mock.calls[0][1]).toContain('final answer');
     expect(sessionReply.mock.calls[0][1]).not.toContain('decision');
+    expect(sessionReply.mock.calls[0][1]).not.toContain('botmux_skill_feedback');
     expect(sessionReply.mock.calls[0][5]).toMatchObject({
       uuid: expect.stringMatching(/^vcp_[0-9a-f]+$/),
       sourceSessionId: ds.session.sessionId,
@@ -1565,6 +1598,10 @@ describe('Bridge final_output delivery (P2 retry)', () => {
       meetingId: 'meeting-1',
       targetChatId: ds.chatId,
     })).toEqual(['om_meeting_fallback']);
+    const { getSkillFeedbackStore } = await import('../src/services/skill-feedback-store.js');
+    expect((await getSkillFeedbackStore('/tmp/test-sessions')).findDeliveryByPlatformMessage(
+      'lark', ds.larkAppId, 'om_meeting_fallback',
+    )).toBeUndefined();
   });
 
   it('treats a valid skip decision as a successful no-message outcome', async () => {

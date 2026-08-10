@@ -502,4 +502,15 @@ describe('cmdSend hook context wiring', () => {
     expect(cmdSend).toContain('const managedProviderOptions = outboundMessageOptions(!!prepared);');
     expect(cmdSend).toContain('...(vcMeetingManagedSendOrigin ? { maxMessages: 1 } : {})');
   });
+
+  it('keeps feedback indexing best-effort after the primary send', () => {
+    const cmdSendStart = cliSource.indexOf('async function cmdSend(');
+    const cmdDispatchStart = cliSource.indexOf('async function cmdDispatch(', cmdSendStart);
+    const cmdSend = cliSource.slice(cmdSendStart, cmdDispatchStart);
+    const primarySend = cmdSend.indexOf('messageId = await dispatchPrimary');
+    const feedbackIndex = cmdSend.indexOf('feedback indexing failed after delivery');
+    expect(primarySend).toBeGreaterThanOrEqual(0);
+    expect(feedbackIndex).toBeGreaterThan(primarySend);
+    expect(cmdSend.slice(cmdSend.lastIndexOf('try {', feedbackIndex), feedbackIndex)).toContain('getSkillFeedbackStore');
+  });
 });

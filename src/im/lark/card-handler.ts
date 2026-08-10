@@ -1196,6 +1196,15 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     return handleAskCardAction(data);
   }
 
+  if (value?.action === 'skill_feedback_submit' && larkAppId) {
+    const { handleSkillFeedbackCardAction } = await import('./skill-feedback-card.js');
+    const { getSkillFeedbackStore } = await import('../../services/skill-feedback-store.js');
+    const { config } = await import('../../config.js');
+    return handleSkillFeedbackCardAction(data, larkAppId, {
+      store: await getSkillFeedbackStore(config.session.dataDir),
+    });
+  }
+
   if (
     (value?.action === 'codex_notifier_continue' || value?.action === 'codex_notifier_open_app')
     && larkAppId

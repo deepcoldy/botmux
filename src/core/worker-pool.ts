@@ -47,6 +47,7 @@ import { claudeJsonlPathForSession } from '../adapters/cli/claude-code.js';
 import { findUniqueClaudeSessionByCwd } from './session-discovery.js';
 import {
   buildMarkdownCard,
+  buildCanonicalFinalReplyCard,
   buildContextualReplyCard,
   type CardUsageSnapshot,
   type LocalHomeLinkMode,
@@ -9523,6 +9524,41 @@ async function finishTurnReactions(ds: DaemonSession): Promise<void> {
  *  same provider key; the daemon owns bounded transient retries. After 3 attempts we log
  *  and give up — the user's answer is lost; better than leaking memory
  *  via an unbounded retry loop. */
+async function persistFinalOutputFeedback(
+  ds: DaemonSession,
+  turnId: string,
+  content: string,
+  effectiveCliId: string,
+  messageId: string,
+  logTag: string,
+): Promise<void> {
+  try {
+    const { getSkillFeedbackStore } = await import('../services/skill-feedback-store.js');
+    const feedbackStore = await getSkillFeedbackStore(config.session.dataDir);
+    const context = {
+      runtime: effectiveCliId,
+      agent: effectiveCliId,
+      platform: 'lark',
+      session: ds.session.sessionId,
+      turn: turnId,
+    };
+    const interactionId = `lark:${ds.larkAppId}:${ds.session.sessionId}:${turnId}`;
+    const response = feedbackStore.createResponse({ interactionId, content, context });
+    feedbackStore.createDelivery({
+      responseId: response.responseId,
+      platform: 'lark',
+      platformAppId: ds.larkAppId,
+      platformMessageId: messageId,
+      level: 'L1',
+      context,
+    });
+  } catch (error) {
+    logger.warn(
+      `[${logTag}] Failed to persist final-output feedback delivery: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+}
+
 function deliverFinalOutput(
   ds: DaemonSession,
   msg: Extract<WorkerToDaemon, { type: 'final_output' }>,
@@ -9764,6 +9800,7 @@ function deliverFinalOutput(
         : imOrigin?.replyTargetSenderOpenId
           ?? daemonCardFooterRecipientOpenId(ds, effectiveCliId);
       const localHomeLinkMode = daemonCardLocalHomeLinkMode(ds);
+      const feedback = managedReceiver ? undefined : { level: 'L1' as const };
       cardUsage ??= getDaemonReplyCardUsageSnapshot(ds, effectiveCliId);
       const cardJson = msg.kind === 'local-turn' || msg.kind === 'local-turn-headless'
         ? buildContextualReplyCard({
@@ -9779,16 +9816,18 @@ function deliverFinalOutput(
             workingDir: ds.workingDir,
             localHomeLinkMode,
             usage: cardUsage,
+            ...(feedback ? { feedback } : {}),
           })
-        : buildMarkdownCard(
-            safeAssistantText,
+        : buildCanonicalFinalReplyCard({
+            markdown: safeAssistantText,
+            ...(feedback ? { feedback } : {}),
             recipientOpenId,
-            renderBrandTemplate(resolveBrandLabel(ds.larkAppId), ds.workingDir),
-            localeForBot(ds.larkAppId),
-            ds.workingDir,
+            brand: renderBrandTemplate(resolveBrandLabel(ds.larkAppId), ds.workingDir),
+            locale: localeForBot(ds.larkAppId),
+            workingDir: ds.workingDir,
             localHomeLinkMode,
-            cardUsage,
-          );
+            usage: cardUsage,
+          });
 
       const proposedOutput = {
         targetChatId: ds.chatId,
@@ -9877,6 +9916,9 @@ function deliverFinalOutput(
       };
       if (preparedListenerReply?.kind === 'succeeded' && preparedListenerReply.messageId) {
         recordPrimaryOutput(preparedListenerReply.messageId);
+        if (feedback) {
+          await persistFinalOutputFeedback(ds, msg.turnId, safeAssistantText, effectiveCliId, preparedListenerReply.messageId, t);
+        }
         ds.lastBridgeEmittedUuid = finalOutputDedupeKey(ds, msg);
         logger.info(
           `[${t}] VC listener fallback replayed existing provider result `
@@ -9932,6 +9974,9 @@ function deliverFinalOutput(
       }
       ds.lastBridgeEmittedUuid = finalOutputDedupeKey(ds, msg);
       logger.info(`[${t}] Bridge final_output forwarded (turn ${msg.turnId.substring(0, 8)}, ${msg.content.length} chars, kind=${msg.kind ?? 'bridge'}, attempt ${attempt + 1})`);
+      if (feedback && messageId) {
+        await persistFinalOutputFeedback(ds, msg.turnId, safeAssistantText, effectiveCliId, messageId, t);
+      }
       onComplete?.(true);
     } catch (err: any) {
       if (!isStillOwned()) { onComplete?.(false); return; }

@@ -186,6 +186,20 @@ describe('validateRelayRequest', () => {
     expect(r.value.flags).toEqual(['--mention-back', '--mention', 'ou:X', '--voice']);
   });
 
+  it('allows only validated feedback levels through the sandbox relay', () => {
+    expect(validateRelayRequest({
+      contentFile: 'c.content',
+      flags: ['--feedback-level', 'L2', '--no-mention'],
+    })).toMatchObject({
+      ok: true,
+      value: { flags: ['--feedback-level', 'L2', '--no-mention'] },
+    });
+    expect(validateRelayRequest({
+      contentFile: 'c.content',
+      flags: ['--feedback-level', 'L9'],
+    })).toMatchObject({ ok: false, error: 'flag --feedback-level must be L0, L1, or L2' });
+  });
+
   it('accepts a custom card file as a plain outbox basename', () => {
     const r = validateRelayRequest({
       contentFile: 'c.content',
