@@ -316,12 +316,16 @@ interface RiffLogDisplay {
 // through, this recognizes it so we suppress rather than render a wall of JSON.
 // Deliberately narrow: only a single-line JSON object whose `type` is a known
 // no-content lifecycle marker — never plain shell output.
+// Kept in sync with riff's CODEX_NOISE_EVENT_TYPES (agentExecuteLogParser.ts) — the
+// authoritative classifier. Mirror it exactly so our fallback matches riff's filter.
 const CODEX_NOISE_TYPES = new Set([
   'thread.started',
   'turn.started',
   'item.started',
   'item.updated',
   'turn.completed',
+  'response.completed',
+  'response.done',
 ]);
 function isBareCodexNoiseLine(text: string): boolean {
   const trimmed = text.trim();
@@ -821,13 +825,14 @@ export class RiffBackend implements SessionBackend {
    * lines stair-step to the right, which is the main reason the raw log view
    * was hard to read. Always emit `\r\n` and reset ANSI styling per line.
    */
-  private emitLine(text: string, style: 'info' | 'warn' | 'ok' | 'err' | 'title' | 'plain' = 'info'): void {
+  private emitLine(text: string, style: 'info' | 'warn' | 'ok' | 'err' | 'title' | 'dim' | 'plain' = 'info'): void {
     const codes: Record<string, string> = {
       info: '\x1b[36m',   // cyan — routine status
       warn: '\x1b[33m',   // yellow — degraded/attention
       ok: '\x1b[32m',     // green — completion
       err: '\x1b[31m',    // red — failure
       title: '\x1b[1m',   // bold — section separators
+      dim: '\x1b[2m',     // faint — low-signal (reasoning / usage)
       plain: '',
     };
     const open = codes[style] ?? '';
@@ -845,66 +850,98 @@ export class RiffBackend implements SessionBackend {
   }
 
   /**
+   * Emit ONE timeline row for a route-B display projection. Unlike {@link emitLine}
+   * (which brackets every call with a leading + trailing CRLF → blank lines between
+   * consecutive rows, and leaves internal `\n` un-normalized → xterm stair-stepping),
+   * this normalizes ALL internal newlines to CRLF and appends exactly ONE trailing
+   * CRLF, with NO leading CRLF. Consecutive rows therefore sit on adjacent lines and
+   * multi-line bodies render flush-left.
+   */
+  private emitTimelineRow(text: string, style: 'info' | 'warn' | 'ok' | 'err' | 'title' | 'dim' | 'plain' = 'info'): void {
+    const codes: Record<string, string> = {
+      info: '\x1b[36m', warn: '\x1b[33m', ok: '\x1b[32m',
+      err: '\x1b[31m', title: '\x1b[1m', dim: '\x1b[2m', plain: '',
+    };
+    const open = codes[style] ?? '';
+    const close = open ? '\x1b[0m' : '';
+    // Color the whole (possibly multi-line) row, then normalize every newline —
+    // including the internal ones — to CRLF, and terminate with exactly one CRLF.
+    const body = `${open}${text}${close}`.replace(/\r?\n/g, '\r\n');
+    const line = `${body}\r\n`;
+    this.outputBuffer += line;
+    this.dataCb?.(line);
+  }
+
+  /**
    * Render a riff route-B `display` projection (a codex app-server event distilled
    * to {kind,title,text,command,exitCode,status}) as one human-readable timeline
    * row: `[思路] …` / `[命令] <cmd> (exit N)` / `[回答] …`. The Chinese label comes
    * from riff's already-localized `title` when present (i18n follows riff); we only
    * fall back to a kind→label table when it is absent. Colour follows the kind
-   * (command exit!=0 / error → red, completion → green, reasoning/usage dimmed).
+   * (failed command / error → red, completed command → green, reasoning/usage dim).
    */
   private emitDisplay(display: RiffLogDisplay): void {
     const kind = display.kind;
-    // Kind → default label + emitLine style. `title` (localized by riff) wins over
-    // the label when present.
+    // Kind → default label. `title` (localized by riff) wins when present.
     const LABEL: Record<string, string> = {
       message: '回答',
       reasoning: '思路',
       command: '命令',
       tool: '工具',
-      error: '错误',
       system: '系统',
       usage: '用量',
+      error: '错误',
+      stage: '阶段',
+      trace: '追踪',
       stdout: '',
       stderr: '',
     };
     const label = display.title || LABEL[kind] || kind;
-    const body = (display.text ?? display.summary ?? '').trimEnd();
+    // NOTE: for a codex `command` projection riff sets {command,status,exitCode,
+    // summary:'命令执行完成'} and NO `text` — the real captured stdout rides a
+    // SEPARATE stdout event on the verbatim `text`/passthrough path, not here. So
+    // the command branch renders ONLY its header (never `summary` as fake output).
+    const body = (display.text ?? '').trimEnd();
 
     if (kind === 'command') {
-      const cmd = display.command || body || '已执行命令';
+      const cmd = display.command || '已执行命令';
+      const completed = display.status === 'completed' || display.exitCode === 0;
       const failed = display.status === 'failed' || (display.exitCode != null && display.exitCode !== 0);
       const exit = display.exitCode != null ? ` (exit ${display.exitCode})` : '';
-      this.emitLine(`[${label}] ${cmd}${exit}`, failed ? 'err' : 'ok');
-      // Surface any captured command output beneath the header, verbatim.
-      if (body && body !== cmd) this.emitText(`${body}\n`);
+      // Green ONLY for a confirmed-completed/exit-0 command; red for failure;
+      // neutral (info) for a still-running command (no exit code yet).
+      const style = failed ? 'err' : completed ? 'ok' : 'info';
+      this.emitTimelineRow(`[${label}] ${cmd}${exit}`, style);
       return;
     }
     switch (kind) {
       case 'reasoning':
       case 'usage':
-        // Low-signal in a live terminal — keep but dim (plain, no color).
-        this.emitLine(`[${label}] ${body}`, 'plain');
+        this.emitTimelineRow(`[${label}] ${body}`, 'dim');
         return;
       case 'error':
-        this.emitLine(`[${label}] ${body}`, 'err');
+        this.emitTimelineRow(`[${label}] ${body}`, 'err');
         return;
       case 'stderr':
-        this.emitLine(body, 'warn');
+        this.emitTimelineRow(body, 'warn');
         return;
       case 'stdout':
-        // Plain shell output projected as-is.
-        if (body) this.emitText(`${body}\n`);
+        // Plain shell output projected as-is (no label prefix).
+        if (body) this.emitTimelineRow(body, 'plain');
         return;
       case 'message':
-        this.emitLine(`[${label}] ${body}`, 'title');
+        this.emitTimelineRow(`[${label}] ${body}`, 'title');
         return;
       case 'tool':
       case 'system':
+      case 'stage':
+      case 'trace':
       default:
-        this.emitLine(`[${label}] ${body}`, 'info');
+        this.emitTimelineRow(`[${label}] ${body}`, 'info');
         return;
     }
   }
+
 
   private extractAttachments(content: string): { text: string; attachments: RiffAttachment[] } {
     const attachments: RiffAttachment[] = [];

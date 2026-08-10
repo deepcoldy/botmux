@@ -447,18 +447,92 @@ describe('RiffBackend', () => {
       expect(out).not.toContain('item.completed');
     });
 
-    it('renders a command display with exit code + failure color', () => {
+    it('renders a completed command as [命令] <cmd> (exit 0) in green', () => {
+      const be = makeBackend({ injectStatusLines: false });
+      const lines: string[] = [];
+      be.onData(d => lines.push(d));
+      (be as any).currentTaskId = 'task-1';
+      // riff's real command projection: {command,status,exitCode,summary} + NO text.
+      (be as any).handleSseEvent(
+        logEvt({ group: 'stdout', text: '{}', display: { kind: 'command', title: '命令执行', command: 'ls -la', status: 'completed', exitCode: 0, summary: '命令执行完成' } }),
+        'task-1',
+      );
+      const out = lines.join('');
+      expect(out).toContain('[命令执行] ls -la (exit 0)');
+      expect(out).toContain('\x1b[32m'); // green for exit 0
+      // MUST NOT print `summary` ('命令执行完成') as a fake output line.
+      expect(out).not.toContain('命令执行完成');
+    });
+
+    it('renders a failed command in red with its exit code', () => {
       const be = makeBackend({ injectStatusLines: false });
       const lines: string[] = [];
       be.onData(d => lines.push(d));
       (be as any).currentTaskId = 'task-1';
       (be as any).handleSseEvent(
-        logEvt({ group: 'stdout', text: '{}', display: { kind: 'command', title: '命令', command: 'ls -la', status: 'failed', exitCode: 2 } }),
+        logEvt({ group: 'stdout', text: '{}', display: { kind: 'command', title: '命令', command: 'false', status: 'failed', exitCode: 2, summary: '命令执行失败' } }),
         'task-1',
       );
       const out = lines.join('');
-      expect(out).toContain('[命令] ls -la (exit 2)');
-      expect(out).toContain('\x1b[31m'); // red for the failed command
+      expect(out).toContain('[命令] false (exit 2)');
+      expect(out).toContain('\x1b[31m'); // red
+      expect(out).not.toContain('命令执行失败'); // summary not printed as output
+    });
+
+    it('does NOT color a still-running command green (no exit code yet)', () => {
+      const be = makeBackend({ injectStatusLines: false });
+      const lines: string[] = [];
+      be.onData(d => lines.push(d));
+      (be as any).currentTaskId = 'task-1';
+      (be as any).handleSseEvent(
+        logEvt({ group: 'stdout', text: '{}', display: { kind: 'command', title: '命令', command: 'sleep 5', status: 'running' } }),
+        'task-1',
+      );
+      const out = lines.join('');
+      expect(out).toContain('[命令] sleep 5');
+      expect(out).not.toContain('(exit'); // no exit code segment while running
+      expect(out).not.toContain('\x1b[32m'); // NOT green while running
+    });
+
+    it('dims reasoning/usage rows (actual ANSI dim, not a no-op)', () => {
+      const be = makeBackend({ injectStatusLines: false });
+      const lines: string[] = [];
+      be.onData(d => lines.push(d));
+      (be as any).currentTaskId = 'task-1';
+      (be as any).handleSseEvent(
+        logEvt({ group: 'stdout', text: '{}', display: { kind: 'reasoning', title: '思路', text: 'thinking...' } }),
+        'task-1',
+      );
+      const out = lines.join('');
+      expect(out).toContain('[思路] thinking...');
+      expect(out).toContain('\x1b[2m'); // faint
+    });
+
+    it('does not double-space consecutive display rows', () => {
+      const be = makeBackend({ injectStatusLines: false });
+      const lines: string[] = [];
+      be.onData(d => lines.push(d));
+      (be as any).currentTaskId = 'task-1';
+      (be as any).handleSseEvent(logEvt({ group: 'stdout', text: '{}', display: { kind: 'message', title: '回答', text: 'A' } }), 'task-1');
+      (be as any).handleSseEvent(logEvt({ group: 'stdout', text: '{}', display: { kind: 'message', title: '回答', text: 'B' } }), 'task-1');
+      const out = lines.join('');
+      // No blank line between the two rows: no CRLFCRLF anywhere in the stream.
+      expect(out).not.toContain('\r\n\r\n');
+    });
+
+    it('normalizes internal newlines in a multi-line display body (no stair-step)', () => {
+      const be = makeBackend({ injectStatusLines: false });
+      const lines: string[] = [];
+      be.onData(d => lines.push(d));
+      (be as any).currentTaskId = 'task-1';
+      (be as any).handleSseEvent(
+        logEvt({ group: 'stdout', text: '{}', display: { kind: 'tool', title: '工具调用', text: 'line1\nline2' } }),
+        'task-1',
+      );
+      const out = lines.join('');
+      // Every newline in the emitted row is a CRLF — no bare \n left to stair-step.
+      expect(out).not.toMatch(/[^\r]\n/);
+      expect(out).toContain('line1\r\nline2');
     });
 
     it('falls back to raw line (with separator) when display is absent (#805)', () => {
@@ -478,6 +552,16 @@ describe('RiffBackend', () => {
       // No display + a bare lifecycle event = riff would normally have downgraded
       // it to channel:'raw'; if it slips through, we must not re-wall.
       (be as any).handleSseEvent(logEvt({ group: 'stdout', text: '{"type":"thread.started","thread_id":"t1"}' }), 'task-1');
+      expect(lines.join('')).toBe('');
+    });
+
+    it('suppresses response.completed / response.done noise (kept in sync with riff)', () => {
+      const be = makeBackend({ injectStatusLines: false });
+      const lines: string[] = [];
+      be.onData(d => lines.push(d));
+      (be as any).currentTaskId = 'task-1';
+      (be as any).handleSseEvent(logEvt({ group: 'stdout', text: '{"type":"response.completed"}' }), 'task-1');
+      (be as any).handleSseEvent(logEvt({ group: 'stdout', text: '{"type":"response.done"}' }), 'task-1');
       expect(lines.join('')).toBe('');
     });
 
