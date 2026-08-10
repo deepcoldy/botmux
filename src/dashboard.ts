@@ -15,8 +15,8 @@ import { gracefulProcessExitCode } from './pm2-graceful-exit.js';
 import { config, isWildcardBindHost } from './config.js';
 import { listenWithProbe } from './utils/listen-with-probe.js';
 import {
-  generateToken, parseCookie, buildSetCookie, verifyHmac, cliAuthBind, decideDashboardAuth,
-  loadPersistedToken, loadOrCreatePersistedToken, persistToken,
+  parseCookie, buildSetCookie, verifyHmac, cliAuthBind, decideDashboardAuth,
+  loadPersistedToken, loadOrCreatePersistedToken, rotatePersistedToken,
   loadDashboardSecret, loadOrCreateDashboardSecret,
 } from './dashboard/auth.js';
 import { DaemonRegistry, botsRosterSignature } from './dashboard/registry.js';
@@ -219,6 +219,11 @@ import { assertPluginBindingTransition, describePluginDependencyError } from './
 import { inspectGatewayEntry } from './core/plugins/mcp/gateway-installer.js';
 import type { InstalledPluginRecord, PluginDashboardEntry } from './core/plugins/types.js';
 import { fetchDaemonIpc } from './core/daemon-ipc-auth.js';
+import {
+  buildDashboardSummary,
+  parseDashboardSummaryRows,
+} from './dashboard/dashboard-summary.js';
+import { createDashboardSummaryEndpoint } from './dashboard/dashboard-summary-endpoint.js';
 
 const SECRET_PATH = dashboardSecretPath();
 const TOKEN_PATH = join(homedir(), '.botmux', '.dashboard-token');
@@ -229,7 +234,8 @@ const BOTS_JSON_PATH = join(homedir(), '.botmux', 'bots.json');
 const REGISTRY_DIR = join(resolveBotmuxDataDir(), 'dashboard-daemons');
 // The dashboard probes upward if its configured port is busy (e.g. a second
 // botmux instance on this host). The actually-bound port is persisted here so
-// the `botmux dashboard` CLI can reach /__cli/rotate without guessing.
+// the `botmux dashboard` CLI can reach /__cli/current, /__cli/ensure, and
+// /__cli/rotate without guessing.
 const PORT_PATH = join(homedir(), '.botmux', '.dashboard-port');
 
 function loadOrCreateSecret(): string {
@@ -253,16 +259,21 @@ function loadOrCreateSecret(): string {
   }
 }
 
-// The active dashboard token is persisted to disk so a previously-issued
-// dashboard URL survives `botmux restart`. A platform-bound dashboard creates
-// the first token on startup; only `botmux dashboard` (the /__cli/rotate
-// endpoint) replaces it and thereby invalidates the old link.
-// The start/restart hint reads it via the non-rotating /__cli/current endpoint
-// so it can show the live link without invalidating it.
-let activeToken: string | null = loadPersistedToken(TOKEN_PATH);
+// The persisted file is the active-token authority. Reading it at each use
+// keeps multiple dashboard processes coherent: first creation converges under
+// a file lock, and an explicit rotation is observed by every process without a
+// restart. `/__cli/current` remains a strictly read-only probe.
+function currentDashboardToken(): string | null {
+  try {
+    return loadPersistedToken(TOKEN_PATH);
+  } catch (error) {
+    logger.warn(`[dashboard] Failed to read token from ${TOKEN_PATH}: ${(error as Error).message}`);
+    return null;
+  }
+}
 
 // The port we actually bound (may differ from config.dashboard.port after an
-// EADDRINUSE probe). Used for the rotation-URL and persisted for the CLI.
+// EADDRINUSE probe). Used for token-bearing URLs and persisted for the CLI.
 let boundDashboardPort = config.dashboard.port;
 
 const SECRET = loadOrCreateSecret();
@@ -341,7 +352,7 @@ aggregator.on(sessionPresentation.onEvent);
 // 调试终端（owner-only 裸 bash）。默认工作目录取当前所有 session 的工作目录去重，
 // 让 owner 从熟悉的目录起终端复现问题；都没有时模块内退回 homedir。
 const debugTerminalManager = createDebugTerminalManager({
-  getActiveToken: () => activeToken,
+  getActiveToken: currentDashboardToken,
   defaultWorkingDirs: () => {
     const dirs = new Set<string>();
     for (const s of aggregator.getSessions()) {
@@ -1243,9 +1254,9 @@ const groupsActionDeps: GroupsActionDeps = {
 // ─── PR2 C8: Route B internal API (`/__daemon/*`) ───────────────────────────
 // HMAC + loopback + ts ±60s + nonce TTL, signed-request envelope = full
 // (ts, nonce, method, pathWithQuery, sha256(body)). Reuses `.dashboard-secret`
-// for the HMAC key — the same secret `/__cli/rotate` already uses — but the
-// signing material is wider so a `/__cli/rotate` signature cannot be replayed
-// here and vice versa (different protocols, same secret, no cross-replay).
+// for the HMAC key — the same secret the `/__cli/*` protocol uses — but the
+// signing material is wider so a CLI signature cannot be replayed here and
+// vice versa (different protocols, same secret, no cross-replay).
 //
 // SECRET fail-closed: `loadOrCreateSecret()` returns a 32-byte base64url
 // string and never empty; we still guard below at server-startup time.
@@ -1936,7 +1947,11 @@ async function handlePluginManagementApi(
 
 // ─── HTTP routing ────────────────────────────────────────────────────────────
 
-function authedToken(req: IncomingMessage, url: URL): string | undefined {
+function authedToken(
+  req: IncomingMessage,
+  url: URL,
+  activeToken: string | null,
+): string | undefined {
   const q = url.searchParams.get('t');
   if (q && q === activeToken) return q;
   return parseCookie(req.headers.cookie);
@@ -2603,6 +2618,55 @@ function parseTerminalSessionId(pathname: string): string | undefined {
   return seg || undefined;
 }
 
+/**
+ * Read every currently-online daemon directly for the public dashboard
+ * summary. The regular aggregator intentionally retains offline
+ * rows for operator history, so using it here would make an offline bot's old
+ * sessions or schedules look live. A failed or malformed daemon snapshot
+ * rejects the whole projection instead of silently turning missing data into
+ * zeroes.
+ */
+async function liveDashboardSummary(): Promise<ReturnType<typeof buildDashboardSummary>> {
+  const daemons = registry.list();
+  const configuredBots = loadBotConfigs();
+  const snapshots = await Promise.all(daemons.map(async daemon => {
+    const [sessionsResponse, schedulesResponse] = await Promise.all([
+      fetchDaemonIpc(daemon.ipcPort, '/api/sessions', {
+        signal: AbortSignal.timeout(2_000),
+      }),
+      fetchDaemonIpc(daemon.ipcPort, '/api/schedules', {
+        signal: AbortSignal.timeout(2_000),
+      }),
+    ]);
+    if (!sessionsResponse.ok || !schedulesResponse.ok) {
+      throw new Error('daemon_snapshot_http_error');
+    }
+    const [sessionsBody, schedulesBody] = await Promise.all([
+      sessionsResponse.json() as Promise<{ sessions?: unknown }>,
+      schedulesResponse.json() as Promise<{ schedules?: unknown }>,
+    ]);
+    return parseDashboardSummaryRows({
+      sessions: sessionsBody.sessions,
+      schedules: schedulesBody.schedules,
+    });
+  }));
+
+  return buildDashboardSummary({
+    generatedAt: new Date(),
+    configuredBotAppIds: configuredBots.map(bot => bot.larkAppId),
+    onlineBotAppIds: daemons.map(daemon => daemon.larkAppId),
+    sessions: snapshots.flatMap(snapshot => snapshot.sessions),
+    schedules: snapshots.flatMap(snapshot => snapshot.schedules),
+  });
+}
+
+const dashboardSummaryEndpoint = createDashboardSummaryEndpoint({
+  load: liveDashboardSummary,
+  onError: error => {
+    logger.warn(`[dashboard-summary] live snapshot unavailable: ${error instanceof Error ? error.message : String(error)}`);
+  },
+});
+
 const server = createServer(async (req, res) => {
   try {
     const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
@@ -2624,7 +2688,8 @@ const server = createServer(async (req, res) => {
     // outside the browser auth gate so packaged desktop apps can decide whether
     // this runtime speaks their dashboard protocol before loading the SPA.
     if (req.method === 'GET' && url.pathname === '/__desktop/compat') {
-      const presentedToken = authedToken(req, url);
+      const activeToken = currentDashboardToken();
+      const presentedToken = authedToken(req, url, activeToken);
       const boundMachineId = activeToken && presentedToken === activeToken
         ? readPlatformBinding()?.machineId
         : null;
@@ -2698,29 +2763,48 @@ const server = createServer(async (req, res) => {
       return;
     }
 
-    // CLI rotate (HMAC + loopback only) — for `botmux dashboard`. Mints a fresh
-    // token, invalidating any previously-issued link.
+    // CLI rotate (HMAC + loopback only) — for `botmux dashboard rotate`.
+    // Publish the new token only after a durable write succeeds.
     if (req.method === 'POST' && url.pathname === '/__cli/rotate') {
       const gate = verifyCliRequest(req, url.pathname);
       if (!gate.ok) return jsonRes(res, gate.status, gate.body);
-      activeToken = generateToken();
       try {
-        persistToken(TOKEN_PATH, activeToken);
+        const token = rotatePersistedToken(TOKEN_PATH);
+        return jsonRes(res, 200, dashboardUrlsFor(token));
       } catch (e) {
         logger.warn(`[dashboard] Failed to persist token to ${TOKEN_PATH}: ${(e as Error).message}`);
+        return jsonRes(res, 500, { error: 'token_persist_failed' });
       }
-      return jsonRes(res, 200, dashboardUrlsFor(activeToken));
     }
 
-    // CLI read current URL (HMAC + loopback only) — for the start/restart hint.
-    // Unlike /__cli/rotate this does NOT mint a token, so an already-issued
-    // dashboard link survives restart untouched. 404 → no token has ever been
-    // minted (caller falls back to suggesting `botmux dashboard`).
+    // CLI get-or-create URL (HMAC + loopback only). Existing links survive
+    // untouched; the first caller atomically creates and persists a token.
+    if (req.method === 'POST' && url.pathname === '/__cli/ensure') {
+      const gate = verifyCliRequest(req, url.pathname);
+      if (!gate.ok) return jsonRes(res, gate.status, gate.body);
+      try {
+        const token = loadOrCreatePersistedToken(TOKEN_PATH);
+        return jsonRes(res, 200, dashboardUrlsFor(token));
+      } catch (e) {
+        logger.warn(`[dashboard] Failed to ensure token at ${TOKEN_PATH}: ${(e as Error).message}`);
+        return jsonRes(res, 500, { error: 'token_persist_failed' });
+      }
+    }
+
+    // CLI read current URL (HMAC + loopback only) — for start/restart hints and
+    // safe port discovery. This never mints a token.
     if (req.method === 'POST' && url.pathname === '/__cli/current') {
       const gate = verifyCliRequest(req, url.pathname);
       if (!gate.ok) return jsonRes(res, gate.status, gate.body);
-      if (!activeToken) return jsonRes(res, 404, { error: 'no_active_token' });
-      return jsonRes(res, 200, dashboardUrlsFor(activeToken));
+      let token: string | null;
+      try {
+        token = loadPersistedToken(TOKEN_PATH);
+      } catch (e) {
+        logger.warn(`[dashboard] Failed to read token from ${TOKEN_PATH}: ${(e as Error).message}`);
+        return jsonRes(res, 500, { error: 'token_unavailable' });
+      }
+      if (!token) return jsonRes(res, 404, { error: 'no_active_token' });
+      return jsonRes(res, 200, dashboardUrlsFor(token));
     }
 
     // CLI 通知绑定变化（HMAC + loopback）——`botmux bind` 写完绑定后捅一下，立即重连平台，
@@ -2743,7 +2827,8 @@ const server = createServer(async (req, res) => {
       return jsonRes(res, 200, { ok: true });
     }
 
-    const presentedToken = authedToken(req, url);
+    const activeToken = currentDashboardToken();
+    const presentedToken = authedToken(req, url, activeToken);
     const globalDashboardConfig = readGlobalConfig().dashboard;
     const decision = decideDashboardAuth({
       method: req.method ?? 'GET',
@@ -2882,6 +2967,12 @@ const server = createServer(async (req, res) => {
     }
 
     // ─── Public API (cookie/token already validated above) ──────────────────
+
+    if (req.method === 'GET' && url.pathname === '/api/dashboard/v1/summary') {
+      const result = await dashboardSummaryEndpoint.get({ authenticated: authed });
+      for (const [name, value] of Object.entries(result.headers)) res.setHeader(name, value);
+      return jsonRes(res, result.status, result.body);
+    }
 
     if (await handleResourceMonitorApi(req, res, url, resourceMonitor)) {
       return;
@@ -5646,15 +5737,16 @@ function startPlatformTunnelIfBound(): void {
   try {
     const binding = readPlatformBinding();
     if (!binding) return;
-    if (!activeToken) {
-      activeToken = loadOrCreatePersistedToken(TOKEN_PATH);
+    const existingToken = currentDashboardToken();
+    loadOrCreatePersistedToken(TOKEN_PATH);
+    if (!existingToken) {
       logger.info('[platform-tunnel] 已初始化 dashboard token');
     }
     const version = readBotmuxVersion();
     platformTunnel = startPlatformTunnelClient({
       binding,
       getDashboardPort: () => boundDashboardPort,
-      getDashboardToken: () => activeToken,
+      getDashboardToken: currentDashboardToken,
       getVersion: () => version,
       getBots: () => readPlatformBotsInfo(),
       getTeamSyncRev: () => getPlatformTeamSyncRev(config.session.dataDir),

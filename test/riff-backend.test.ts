@@ -380,6 +380,47 @@ describe('RiffBackend', () => {
     });
   });
 
+  describe('stdout log line separation (finding: app_server char-wall)', () => {
+    // riff ships each stdout log line BARE (no trailing newline). The relay must
+    // re-add a separator per log event, else consecutive events concatenate into
+    // one unreadable "wall" — the exact symptom seen with codex_app_server, whose
+    // stdout logs are one JSON.stringify(event) per line (thread.started, etc).
+    it('separates consecutive stdout log events instead of concatenating them', () => {
+      const be = makeBackend({ injectStatusLines: false });
+      const lines: string[] = [];
+      be.onData(d => lines.push(d));
+      (be as any).currentTaskId = 'task-1';
+      (be as any).handleSseEvent('event:log\ndata:{"group":"stdout","text":"{\\"type\\":\\"thread.started\\"}"}', 'task-1');
+      (be as any).handleSseEvent('event:log\ndata:{"group":"stdout","text":"{\\"type\\":\\"turn.started\\"}"}', 'task-1');
+      const out = lines.join('');
+      // The two events must not butt together (…}{… would be the wall).
+      expect(out).not.toContain('}{');
+      // Each event renders on its own line (emitText normalizes \n → \r\n).
+      expect(out).toContain('{"type":"thread.started"}\r\n');
+      expect(out).toContain('{"type":"turn.started"}\r\n');
+    });
+
+    it('does not double-space a stdout log (bare line + exactly one separator)', () => {
+      const be = makeBackend({ injectStatusLines: false });
+      const lines: string[] = [];
+      be.onData(d => lines.push(d));
+      (be as any).currentTaskId = 'task-1';
+      (be as any).handleSseEvent('event:log\ndata:{"group":"stdout","text":"hello"}', 'task-1');
+      expect(lines.join('')).toBe('hello\r\n');
+    });
+
+    it('leaves the output/chunk path raw (chunks may be partial lines)', () => {
+      const be = makeBackend({ injectStatusLines: false });
+      const lines: string[] = [];
+      be.onData(d => lines.push(d));
+      (be as any).currentTaskId = 'task-1';
+      (be as any).handleSseEvent('event:output\ndata:{"chunk":"par"}', 'task-1');
+      (be as any).handleSseEvent('event:output\ndata:{"chunk":"tial"}', 'task-1');
+      // No synthetic newline injected between chunks — they join seamlessly.
+      expect(lines.join('')).toBe('partial');
+    });
+  });
+
   describe('task isolation (finding F)', () => {
     it('stale stream events are inert once a newer task is current', () => {
       const be = makeBackend({ injectStatusLines: false });

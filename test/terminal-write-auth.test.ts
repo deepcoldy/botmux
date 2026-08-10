@@ -184,6 +184,22 @@ describe('resolveTerminalWriteForRequest', () => {
       .toEqual({ hasWrite: false, platformReadonly: false });
   });
 
+  it('fails closed when the live dashboard token cannot be read during rotation', () => {
+    const unreadable = () => { throw new Error('token changed during read'); };
+    expect(() => resolveTerminalWriteForRequest(
+      { 'x-botmux-role': 'owner', ...cookie(TOK) },
+      false,
+      bound,
+      unreadable,
+    )).not.toThrow();
+    expect(resolveTerminalWriteForRequest(
+      { 'x-botmux-role': 'owner', ...cookie(TOK) },
+      false,
+      bound,
+      unreadable,
+    )).toEqual({ hasWrite: false, platformReadonly: false });
+  });
+
   it('ignores the role when unbound even with a matching cookie', () => {
     expect(resolveTerminalWriteForRequest({ 'x-botmux-role': 'owner', ...cookie(TOK) }, false, unbound, token))
       .toEqual({ hasWrite: false, platformReadonly: false });
@@ -246,6 +262,16 @@ describe('resolveTerminalAccessForRequest', () => {
   it('lets an authenticated local dashboard cookie view without platform binding', () => {
     expect(resolveTerminalAccessForRequest(cookie(TOK), false, false, unbound, token))
       .toEqual({ hasRead: true, hasWrite: false, platformReadonly: false });
+  });
+
+  it('denies the request instead of throwing when token rotation races the read', () => {
+    const unreadable = () => { throw new Error('token changed during read'); };
+    expect(() => resolveTerminalAccessForRequest(
+      cookie(TOK), false, false, unbound, unreadable,
+    )).not.toThrow();
+    expect(resolveTerminalAccessForRequest(
+      cookie(TOK), false, false, unbound, unreadable,
+    )).toEqual({ hasRead: false, hasWrite: false, platformReadonly: false });
   });
 
   it('keeps authenticated platform guest read-only and owner writable', () => {

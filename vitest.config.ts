@@ -33,6 +33,8 @@ export default defineConfig({
           // e2e dir out explicitly so a stray *.test.ts there can't sneak in.
           exclude: ['test/e2e-browser/**', '**/*.e2e.ts', 'node_modules/**'],
           testTimeout: 30_000,
+          globalSetup: ['./test/unit-global-setup.ts'],
+          setupFiles: ['./test/unit-setup.ts'],
         },
       },
       {

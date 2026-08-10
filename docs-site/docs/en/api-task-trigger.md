@@ -23,13 +23,13 @@ Both modes open a "virtual session" (when no `chatId` is given) that **never ent
 
 ## 2. Authentication
 
-Calls go through the dashboard (default `http://<daemon-host>:7891`). Auth currently uses a short-lived dashboard token:
+Calls go through the dashboard (default `http://<daemon-host>:7891`). Auth currently uses the rotating dashboard token:
 
 - **Programmatic calls MUST send the token as a Cookie header**: `Cookie: botmux_dashboard_token=<TOKEN>`
 - ⚠️ Do NOT use `?t=<TOKEN>` query: that's for browser login; a `POST` carrying it returns a **302 redirect** (set-cookie) and the call fails.
-- Getting a token: run `botmux dashboard` to print the login URL — the part after `?t=` is the token. Each run rotates it (the old token is invalidated).
+- Getting a token: run `botmux dashboard` to get the current login URL — the part after `?t=` is the token. The command creates the first token when absent; use `botmux dashboard rotate` only when you intend to invalidate an existing token.
 
-> The token is short-lived. Long-lived API-key auth (e.g. `X-Botmux-Api-Key`) is planned; this doc will be updated when it lands.
+> The token persists until explicit rotation. Dedicated API-key auth (e.g. `X-Botmux-Api-Key`) is planned; this doc will be updated when it lands.
 
 ---
 

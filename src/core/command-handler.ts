@@ -247,8 +247,9 @@ export async function resolveRepoSelection(
  *   must NOT match, otherwise we'd false-trigger on common /-prefixed words.
  * - tolerates leading whitespace (mention-stripping can leave a space).
  * - prompt is whatever follows the prefix (verbatim, including newlines).
- * - `/t` alone (no args) is allowed → empty prompt; the user can fill it in
- *   while the repo selection card is still pending.
+ * - `/t` alone (no args) is allowed → empty prompt; the daemon treats it as
+ *   topic setup, choosing either a repository picker or a visible thread that
+ *   waits for the first real task according to the bot's cwd configuration.
  *
  * Returns null for anything else, so callers can fall through to the regular
  * `parseSlashCommandInvocation` / message-handling path.

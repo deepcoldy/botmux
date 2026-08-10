@@ -89,6 +89,11 @@
             <div id="runtime-status" class="runtime-status" data-i18n="runtime.checking">正在检查运行时</div>
             <div id="runtime-meta" class="runtime-meta" data-i18n="runtime.waitingBridge">等待桌面桥接</div>
           </div>
+          <label id="login-row" class="login-row">
+            <input id="login-toggle" type="checkbox" role="switch" disabled />
+            <span class="login-switch" aria-hidden="true"></span>
+            <span id="login-label" class="login-label">开机启动 App</span>
+          </label>
         </div>
         <div class="runtime-actions runtime-control-group" aria-label="CLI actions">
           <button id="start-btn" class="runtime-action runtime-action-primary" type="button" disabled>
@@ -110,10 +115,6 @@
         </div>
 
         <div class="footer-meta-row">
-          <label class="login-row">
-            <input id="login-toggle" type="checkbox" disabled />
-            <span data-i18n="login.launchAtLogin">开机启动 App</span>
-          </label>
           <div id="version-line" class="version-line" data-i18n="version.unavailable">版本信息不可用</div>
         </div>
       </div>

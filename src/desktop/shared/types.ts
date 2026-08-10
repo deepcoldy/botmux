@@ -63,7 +63,7 @@ export interface LogTail {
 }
 
 export type DashboardLocateResult =
-  | { ok: true; url: string; source: 'current' | 'rotated' }
+  | { ok: true; url: string; source: 'current' | 'ensured' }
   | {
     ok: false;
     reason: 'not_running' | 'no_secret' | 'wrong_service' | 'unreachable' | 'incompatible' | 'unknown';

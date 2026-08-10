@@ -27,6 +27,7 @@ import {
 import { mountReactPage, type PageDisposer } from './react-mount.js';
 import { useStoreSelector, useT } from './react-hooks.js';
 import { copyText } from './clipboard.js';
+import { FeedGroupPicker } from './feed-group-picker.js';
 import {
   KANBAN_TEAM_STORAGE_KEY,
   normalizeHiddenTableColumns,
@@ -2464,23 +2465,14 @@ function CreateSessionDialog(props: {
             </label>
             <fieldset className="cs-feed-group">
               <legend>飞书标签（可选）</legend>
-              <select
-                value={feedGroupId}
+              <FeedGroupPicker
+                groups={feedGroups}
+                selectedId={feedGroupId}
+                newName={newFeedGroupName}
                 disabled={feedGroupLoading || !!feedGroupError}
-                onChange={event => { setFeedGroupId(event.currentTarget.value); if (event.currentTarget.value) setNewFeedGroupName(''); }}
-              >
-                <option value="">点击选择已有标签（可选）</option>
-                {feedGroups.map(group => <option key={group.groupId} value={group.groupId}>{group.name}</option>)}
-              </select>
-              <input
-                type="text"
-                value={newFeedGroupName}
-                maxLength={60}
-                placeholder="或输入新标签名称"
-                disabled={!!feedGroupId || feedGroupLoading || !!feedGroupError}
-                onChange={event => setNewFeedGroupName(event.currentTarget.value.trimStart())}
+                onChange={(selectedId, newName) => { setFeedGroupId(selectedId); setNewFeedGroupName(newName); }}
               />
-              <small>点击下拉框可选择已有标签，将新建群聊归入该标签；也可以输入名称创建新标签。</small>
+              <small>展开后可在第一行输入新标签名称，或选择下方已有标签。</small>
               {feedGroupLoading ? <small>正在读取飞书标签…</small> : null}
               {feedGroupError ? (
                 <div className="cs-warn">

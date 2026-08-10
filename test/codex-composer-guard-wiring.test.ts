@@ -10,13 +10,16 @@ describe('Codex adopt composer collision guard wiring', () => {
     const worker = readFileSync(join(repoRoot, 'src/worker.ts'), 'utf8');
     const adoptBranch = worker.indexOf('const composerConflict = codexAdoptComposerConflict(submissionBackend);');
     const bridgePreparation = worker.indexOf('prepareAdoptWrite,', adoptBranch);
-    const adapterWrite = worker.indexOf('submissionAdapter.writeInput(', adoptBranch);
+    const adapterWrite = worker.indexOf('cliAdapter!.writeInput(', adoptBranch);
 
     expect(adoptBranch).toBeGreaterThan(0);
     expect(bridgePreparation).toBeGreaterThan(adoptBranch);
     expect(adapterWrite).toBeGreaterThan(adoptBranch);
     expect(worker.slice(adoptBranch, bridgePreparation)).toContain('scheduleSubmitFailureNotify(');
-    expect(worker.slice(adoptBranch, bridgePreparation)).toContain('return;');
+    // The guard returns early — before any bridge attribution or terminal write.
+    // writeAdoptMessage is a value-returning helper, so the early return is
+    // `return 'completed';` (the old inline switch branch used a bare `return;`).
+    expect(worker.slice(adoptBranch, bridgePreparation)).toContain("return 'completed';");
   });
 
   it('gets a plain viewport and real cursor from the adopted tmux pane', () => {

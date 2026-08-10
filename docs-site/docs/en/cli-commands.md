@@ -15,7 +15,7 @@ Manage the daemon and sessions from the terminal.
 | `botmux delete <id>` (aliases `del`/`rm`) | Close the specified session, with ID prefix matching |
 | `botmux delete all` | Close all active sessions |
 | `botmux delete stopped` | Clean up zombie sessions whose processes have exited |
-| `botmux dashboard` | Print a Web Dashboard URL once (refreshes the token each time) |
+| `botmux dashboard [current\|rotate]` | Get the current Dashboard login URL, creating the first token if absent; `rotate` explicitly replaces an existing token |
 
 When the daemon is online, `botmux delete` first asks the owning daemon to run
 the same lifecycle teardown as `/close`: evict the in-memory active session,

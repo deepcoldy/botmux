@@ -42,6 +42,7 @@ const mocks = vi.hoisted(() => {
     dataDir,
     replyMessage: vi.fn(async () => 'om_reply'),
     sendMessage: vi.fn(async () => 'om_top'),
+    addReaction: vi.fn(async () => 'reaction_received'),
     getChatMode: vi.fn(async () => 'group' as 'group' | 'topic' | 'p2p'),
     getChatNameAndMode: vi.fn(async () => ({ name: null, mode: 'group' as const })),
     resolveSender: vi.fn(async (_appId: string, openId: string | undefined, senderType: string | undefined) => (
@@ -100,6 +101,7 @@ vi.mock('../src/im/lark/client.js', async () => {
     ...actual,
     replyMessage: mocks.replyMessage,
     sendMessage: mocks.sendMessage,
+    addReaction: mocks.addReaction,
     getChatMode: mocks.getChatMode,
     getChatNameAndMode: mocks.getChatNameAndMode,
   };
@@ -594,6 +596,366 @@ describe('/rename production routing — must not pre-create a session (review P
 
     expect(mocks.createSession).toHaveBeenCalledTimes(1);
     expect(activeSessions.has(sessionKey('om_new_2', APP))).toBe(true);
+  });
+
+  it('pinned cwd + bare `/t` seeds the thread without creating an empty Session', async () => {
+    const bot = registerBot({
+      larkAppId: APP,
+      larkAppSecret: 's',
+      cliId: 'codex',
+      allowedUsers: [OWNER],
+      defaultWorkingDir: '/tmp',
+      disableStreamingCard: true,
+    });
+    bot.resolvedAllowedUsers = [OWNER];
+
+    await handleNewTopic(
+      makeEventData('om_bare_force_topic', '/t'),
+      makeCtx('om_bare_force_topic', 'om_bare_force_topic'),
+    );
+
+    expect(mocks.replyMessage.mock.calls[0]?.slice(0, 5)).toEqual([
+      APP,
+      'om_bare_force_topic',
+      '💬 新话题已创建。请在话题内发送任务，也可以先用 /repo 选择项目。',
+      'text',
+      true,
+    ]);
+    expect(mocks.createSession).not.toHaveBeenCalled();
+    expect(mocks.forkWorker).not.toHaveBeenCalled();
+    expect(mocks.addReaction).not.toHaveBeenCalled();
+    expect(activeSessions.size).toBe(0);
+  });
+
+  it('thread-root parent_id remains bare `/t` routing metadata, not a quoted task', async () => {
+    const bot = registerBot({
+      larkAppId: APP,
+      larkAppSecret: 's',
+      cliId: 'codex',
+      allowedUsers: [OWNER],
+      defaultWorkingDir: '/tmp',
+      disableStreamingCard: true,
+    });
+    bot.resolvedAllowedUsers = [OWNER];
+    const rootId = 'om_force_topic_parent_root';
+    const data = makeEventData('om_force_topic_parent_child', '/t', rootId);
+    data.message.parent_id = rootId;
+
+    await handleNewTopic(data, makeCtx(rootId, 'om_force_topic_parent_child'));
+
+    expect(mocks.replyMessage.mock.calls[0]?.[2]).toContain('新话题已创建');
+    expect(mocks.createSession).not.toHaveBeenCalled();
+    expect(mocks.forkWorker).not.toHaveBeenCalled();
+    expect(mocks.addReaction).not.toHaveBeenCalled();
+  });
+
+  it('card-off quoted `/t` seeds the thread before starting the quoted task', async () => {
+    const bot = registerBot({
+      larkAppId: APP,
+      larkAppSecret: 's',
+      cliId: 'codex',
+      allowedUsers: [OWNER],
+      defaultWorkingDir: '/tmp',
+      disableStreamingCard: true,
+    });
+    bot.resolvedAllowedUsers = [OWNER];
+    const messageId = 'om_force_topic_quoted_task';
+    const data = makeEventData(messageId, '/t');
+    data.message.parent_id = 'om_distinct_quoted_message';
+
+    await handleNewTopic(data, makeCtx(messageId, messageId));
+
+    expect(mocks.replyMessage.mock.calls[0]?.slice(0, 5)).toEqual([
+      APP,
+      messageId,
+      '↪️ 已转入新话题，正在处理…',
+      'text',
+      true,
+    ]);
+    expect(mocks.replyMessage.mock.invocationCallOrder[0]).toBeLessThan(
+      mocks.forkWorker.mock.invocationCallOrder[0]!,
+    );
+    expect(JSON.stringify(mocks.forkWorker.mock.calls[0]?.[1])).toContain('om_distinct_quoted_message');
+    expect(mocks.createSession).toHaveBeenCalledTimes(1);
+    expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
+  });
+
+  it('`/t <content>` preserves a paired forward seed in the first worker input', async () => {
+    const bot = registerBot({
+      larkAppId: APP,
+      larkAppSecret: 's',
+      cliId: 'codex',
+      allowedUsers: [OWNER],
+      defaultWorkingDir: '/tmp',
+      disableStreamingCard: true,
+    });
+    bot.resolvedAllowedUsers = [OWNER];
+    const messageId = 'om_force_topic_forward_followup';
+
+    await handleNewTopic(
+      makeEventData(messageId, '/t 处理这份背景'),
+      {
+        ...makeCtx(messageId, messageId),
+        forwardSeedData: makeEventData('om_force_topic_forward_seed', '转发的原始背景'),
+      },
+    );
+
+    const openingInput = JSON.stringify(mocks.forkWorker.mock.calls[0]?.[1]);
+    expect(openingInput).toContain('转发的原始背景');
+    expect(openingInput).toContain('处理这份背景');
+    expect(mocks.replyMessage.mock.calls[0]?.[2]).toBe('↪️ 已转入新话题，正在处理…');
+    expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
+  });
+
+  it('no pinned cwd + bare `/t` keeps the repo picker setup flow', async () => {
+    const bot = registerBot({
+      larkAppId: APP,
+      larkAppSecret: 's',
+      cliId: 'codex',
+      allowedUsers: [OWNER],
+      workingDirs: ['/tmp'],
+      disableStreamingCard: true,
+    });
+    bot.resolvedAllowedUsers = [OWNER];
+    mocks.scanMultipleProjects.mockReturnValue([{
+      name: 'botmux',
+      path: '/tmp',
+      type: 'repo',
+      branch: 'master',
+    }]);
+
+    await handleNewTopic(
+      makeEventData('om_bare_force_topic_picker', '/t'),
+      makeCtx('om_bare_force_topic_picker', 'om_bare_force_topic_picker'),
+    );
+
+    const ds = activeSessions.get(sessionKey('om_bare_force_topic_picker', APP));
+    expect(ds?.pendingRepo).toBe(true);
+    expect(mocks.createSession).toHaveBeenCalledTimes(1);
+    expect(mocks.forkWorker).not.toHaveBeenCalled();
+    expect(mocks.replyMessage).toHaveBeenCalledTimes(1);
+    expect(mocks.addReaction).not.toHaveBeenCalled();
+    expect(mocks.replyMessage.mock.calls[0]?.slice(0, 5)).toEqual([
+      APP,
+      'om_bare_force_topic_picker',
+      expect.any(String),
+      'interactive',
+      true,
+    ]);
+    const picker = JSON.parse(String(mocks.replyMessage.mock.calls[0]?.[2]));
+    expect(JSON.stringify(picker)).toContain('"key":"repo_switch"');
+    expect(JSON.stringify(picker)).toContain('"root_id":"om_bare_force_topic_picker"');
+    expect(JSON.stringify(picker)).toContain('"value":"/tmp"');
+  });
+
+  it('no pinned cwd + no projects + bare `/t` waits without creating an empty Session', async () => {
+    const bot = registerBot({
+      larkAppId: APP,
+      larkAppSecret: 's',
+      cliId: 'codex',
+      allowedUsers: [OWNER],
+      workingDirs: ['/tmp'],
+      disableStreamingCard: true,
+    });
+    bot.resolvedAllowedUsers = [OWNER];
+    mocks.scanMultipleProjects.mockReturnValue([]);
+
+    await handleNewTopic(
+      makeEventData('om_bare_force_topic_no_projects', '/t'),
+      makeCtx('om_bare_force_topic_no_projects', 'om_bare_force_topic_no_projects'),
+    );
+
+    expect(mocks.replyMessage.mock.calls[0]?.slice(0, 5)).toEqual([
+      APP,
+      'om_bare_force_topic_no_projects',
+      '💬 新话题已创建。请在话题内发送任务，也可以先用 /repo 选择项目。',
+      'text',
+      true,
+    ]);
+    expect(mocks.createSession).not.toHaveBeenCalled();
+    expect(mocks.forkWorker).not.toHaveBeenCalled();
+    expect(mocks.addReaction).not.toHaveBeenCalled();
+    expect(activeSessions.size).toBe(0);
+  });
+
+  it('bare `/t` reports invalid scan directories before claiming topic setup', async () => {
+    const missing = '/tmp/botmux-force-topic-directory-does-not-exist';
+    const bot = registerBot({
+      larkAppId: APP,
+      larkAppSecret: 's',
+      cliId: 'codex',
+      allowedUsers: [OWNER],
+      workingDirs: [missing],
+      disableStreamingCard: true,
+    });
+    bot.resolvedAllowedUsers = [OWNER];
+
+    await handleNewTopic(
+      makeEventData('om_bare_force_topic_invalid_dir', '/t'),
+      makeCtx('om_bare_force_topic_invalid_dir', 'om_bare_force_topic_invalid_dir'),
+    );
+
+    expect(repliedText()).toContain('配置的工作目录不存在');
+    expect(repliedText()).toContain(missing);
+    expect(mocks.createSession).not.toHaveBeenCalled();
+    expect(mocks.forkWorker).not.toHaveBeenCalled();
+  });
+
+  it('pinned cwd + bare `/t` followed by `/repo` starts the first Session without a close card', async () => {
+    const bot = registerBot({
+      larkAppId: APP,
+      larkAppSecret: 's',
+      cliId: 'codex',
+      allowedUsers: [OWNER],
+      defaultWorkingDir: '/tmp',
+      disableStreamingCard: true,
+    });
+    bot.resolvedAllowedUsers = [OWNER];
+    const rootId = 'om_bare_force_topic_then_repo';
+
+    await handleNewTopic(makeEventData(rootId, '/t'), makeCtx(rootId, rootId));
+    // The dispatcher rechecks ownership at execution time. Because bare `/t`
+    // deliberately kept no active owner, this human thread reply takes the
+    // fresh-topic handler even though Lark supplies a root_id/thread_id.
+    await handleNewTopic(
+      makeEventData('om_first_repo_in_force_topic', '/repo /tmp', rootId),
+      makeCtx(rootId, 'om_first_repo_in_force_topic'),
+    );
+
+    expect(mocks.createSession).toHaveBeenCalledTimes(1);
+    expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
+    expect(mocks.closeSession).not.toHaveBeenCalled();
+    expect(repliedText()).not.toContain('会话已关闭');
+    expect(activeSessions.get(sessionKey(rootId, APP))?.workingDir).toBe('/tmp');
+  });
+
+  it('`/t /repo <path>` selects the first Session repository in one message', async () => {
+    const bot = registerBot({
+      larkAppId: APP,
+      larkAppSecret: 's',
+      cliId: 'codex',
+      allowedUsers: [OWNER],
+      defaultWorkingDir: '/tmp',
+      disableStreamingCard: true,
+    });
+    bot.resolvedAllowedUsers = [OWNER];
+    const rootId = 'om_force_topic_repo_composed';
+
+    await handleNewTopic(
+      makeEventData(rootId, '/t /repo /tmp'),
+      makeCtx(rootId, rootId),
+    );
+
+    expect(mocks.createSession).toHaveBeenCalledTimes(1);
+    expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
+    expect(mocks.closeSession).not.toHaveBeenCalled();
+    expect(repliedText()).not.toContain('会话已关闭');
+    expect(activeSessions.get(sessionKey(rootId, APP))?.workingDir).toBe('/tmp');
+  });
+
+  it('card-off pinned cwd + `/t /goal ...` seeds the thread before the initial raw fork', async () => {
+    const bot = registerBot({
+      larkAppId: APP,
+      larkAppSecret: 's',
+      cliId: 'codex',
+      allowedUsers: [OWNER],
+      defaultWorkingDir: '/tmp',
+      disableStreamingCard: true,
+    });
+    bot.resolvedAllowedUsers = [OWNER];
+    const rootId = 'om_force_topic_goal_pinned';
+    const rawOpening = '/goal 检查实现';
+
+    await handleNewTopic(
+      makeEventData(rootId, `/t ${rawOpening}`),
+      makeCtx(rootId, rootId),
+    );
+
+    expect(mocks.replyMessage.mock.calls[0]?.slice(0, 5)).toEqual([
+      APP,
+      rootId,
+      '↪️ 已转入新话题，正在处理…',
+      'text',
+      true,
+    ]);
+    expect(mocks.replyMessage.mock.invocationCallOrder[0]).toBeLessThan(
+      mocks.forkWorker.mock.invocationCallOrder[0]!,
+    );
+    expect(mocks.forkWorker.mock.calls[0]?.[0]?.pendingRawInput).toBe(rawOpening);
+    expect(mocks.forkWorker.mock.calls[0]?.[1]).toBe('');
+    expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
+  });
+
+  it('card-off no-project fallback + `/t /goal ...` seeds the thread before the initial raw fork', async () => {
+    const bot = registerBot({
+      larkAppId: APP,
+      larkAppSecret: 's',
+      cliId: 'codex',
+      allowedUsers: [OWNER],
+      workingDirs: ['/tmp'],
+      disableStreamingCard: true,
+    });
+    bot.resolvedAllowedUsers = [OWNER];
+    mocks.scanMultipleProjects.mockReturnValue([]);
+    const rootId = 'om_force_topic_goal_no_projects';
+    const rawOpening = '/goal 检查实现';
+
+    await handleNewTopic(
+      makeEventData(rootId, `/t ${rawOpening}`),
+      makeCtx(rootId, rootId),
+    );
+
+    expect(mocks.scanMultipleProjects).toHaveBeenCalled();
+    expect(mocks.replyMessage.mock.calls[0]?.slice(0, 5)).toEqual([
+      APP,
+      rootId,
+      '↪️ 已转入新话题，正在处理…',
+      'text',
+      true,
+    ]);
+    expect(mocks.replyMessage.mock.invocationCallOrder[0]).toBeLessThan(
+      mocks.forkWorker.mock.invocationCallOrder[0]!,
+    );
+    expect(mocks.forkWorker.mock.calls[0]?.[0]?.pendingRawInput).toBe(rawOpening);
+    expect(mocks.forkWorker.mock.calls[0]?.[1]).toBe('');
+    expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
+  });
+
+  it('card-off pinned cwd + `/t <content>` immediately seeds the thread and starts work', async () => {
+    const bot = registerBot({
+      larkAppId: APP,
+      larkAppSecret: 's',
+      cliId: 'codex',
+      allowedUsers: [OWNER],
+      defaultWorkingDir: '/tmp',
+      disableStreamingCard: true,
+    });
+    bot.resolvedAllowedUsers = [OWNER];
+
+    await handleNewTopic(
+      makeEventData('om_force_topic_with_content', '/t 检查实现'),
+      makeCtx('om_force_topic_with_content', 'om_force_topic_with_content'),
+    );
+
+    expect(mocks.replyMessage.mock.calls[0]?.slice(0, 5)).toEqual([
+      APP,
+      'om_force_topic_with_content',
+      '↪️ 已转入新话题，正在处理…',
+      'text',
+      true,
+    ]);
+    expect(mocks.createSession).toHaveBeenCalledTimes(1);
+    expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
+    expect(mocks.replyMessage.mock.invocationCallOrder[0]).toBeLessThan(
+      mocks.forkWorker.mock.invocationCallOrder[0]!,
+    );
+    expect(JSON.stringify(mocks.forkWorker.mock.calls[0]?.[1])).toContain('检查实现');
+    expect(mocks.sendMessage).not.toHaveBeenCalled();
+    expect(mocks.addReaction).toHaveBeenCalledWith(
+      APP,
+      'om_force_topic_with_content',
+      expect.any(String),
+    );
   });
 
   it('routes a colliding daemon command to the canonical pending owner and closes only the loser', async () => {

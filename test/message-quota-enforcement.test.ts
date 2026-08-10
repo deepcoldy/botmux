@@ -108,6 +108,21 @@ describe('message quota enforcement', () => {
     expect(mocks.consumeQuota).not.toHaveBeenCalled();
   });
 
+  it('checks talk permission but does not charge a setup-only message', async () => {
+    await expect(enforceMessageQuotaForCliInput(
+      'quota_app', 'oc_1', 'ou_chat', 'om_setup', 'om_anchor',
+      undefined, undefined, 'group', false, { skipCharge: true },
+    )).resolves.toBe(true);
+    expect(mocks.beginCharge).not.toHaveBeenCalled();
+    expect(mocks.consumeQuota).not.toHaveBeenCalled();
+
+    await expect(enforceMessageQuotaForCliInput(
+      'quota_app', 'oc_1', 'ou_stranger', 'om_setup_denied', 'om_anchor',
+      undefined, undefined, 'group', false, { skipCharge: true },
+    )).resolves.toBe(false);
+    expect(mocks.beginCharge).not.toHaveBeenCalled();
+  });
+
   it('bot 发送方走 evaluateBotTalk：团队拉群里没带 union_id 也不被这道复查丢掉', async () => {
     // 端到端断点（#332 同款的最后一截）：dispatcher 外层用 evaluateBotTalk 放行了
     // 「团队拉群 + sender 没带 union_id」的 bot，这里若仍用 evaluateTalk 就会静默丢弃

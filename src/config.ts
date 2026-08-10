@@ -233,7 +233,7 @@ export const config = {
      *  schedules, SSE — are reachable WITHOUT a token, so a stale dashboard
      *  link degrades to read-only browsing instead of a dead "link expired"
      *  wall. Write actions (POST/PATCH/DELETE) and the raw PTY log always
-     *  require the rotated token. Opt out with
+     *  require the current token. Opt out with
      *  BOTMUX_DASHBOARD_PUBLIC_READONLY=false.
      *
      *  NOTE: this env value is only the DEFAULT. Once the toggle is changed on

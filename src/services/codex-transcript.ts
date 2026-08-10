@@ -203,8 +203,9 @@ export interface CodexBridgeEvent {
   timestampMs: number;
   /** Discriminator for the queue layer:
    *   - 'user' starts a pending Lark turn (fingerprint-matched)
-   *   - 'assistant_final' closes the currently-collecting turn */
-  kind: 'user' | 'assistant_final';
+   *   - 'assistant_final' closes the currently-collecting turn with output
+   *   - 'turn_aborted' closes it without producing fallback output */
+  kind: 'user' | 'assistant_final' | 'turn_aborted';
   /** Concatenated text from the message's content blocks (input_text for
    *  user, output_text for assistant). */
   text: string;
@@ -422,7 +423,7 @@ export function isCodexRateLimitEvent(event: CodexBridgeEvent): boolean {
  *  undefined when either side is missing — typically a fresh session whose
  *  user typed something but the model hasn't replied yet. */
 export function extractLastCodexTurn(
-  events: readonly { kind: 'user' | 'assistant_final'; text: string }[],
+  events: readonly { kind: 'user' | 'assistant_final' | 'turn_aborted'; text: string }[],
 ): { userText: string; assistantText: string } | undefined {
   let assistantIdx = -1;
   for (let i = events.length - 1; i >= 0; i--) {
