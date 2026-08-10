@@ -80,6 +80,7 @@ vi.mock('../src/core/worker-pool.js', () => ({
   getCurrentCliVersion: vi.fn(() => 'test'),
   setActiveSessionIfActive: (map: Map<string, any>, key: string, ds: any) => { map.set(key, ds); return true; },
   closeSession: (...a: any[]) => mockCloseSession(...a),
+  closeSessionForBackgroundCleanup: (...a: any[]) => mockCloseSession(a[0]),
   getDaemonBootId: () => 'boot-CURRENT',
   // master refactor: trigger-session now takes the active-session key lock and
   // checks the queued-activation admission gate. The lock just runs the action;

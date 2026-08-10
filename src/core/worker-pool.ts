@@ -3537,6 +3537,40 @@ export type CloseSessionResult =
       alreadyClosed: false;
     } & Exclude<RiffClosePreparation, { ok: true }>);
 
+/**
+ * Close from a BACKGROUND path — one with no user surface to report to
+ * (trigger-session cleanup, deferred-schedule settlement, sweeps).
+ *
+ * These callers cannot show a card or a toast, so the only honest thing they can
+ * do with a residual or a refusal is make it OBSERVABLE: an uncancelled remote
+ * session is still burning cloud time and holding an injected credential, and
+ * silently discarding the result is how that became invisible everywhere else.
+ *
+ * Returns the untouched result so a caller that DOES care can still branch.
+ */
+export async function closeSessionForBackgroundCleanup(
+  sessionId: string,
+  context: string,
+): Promise<CloseSessionResult> {
+  const result = await closeSession(sessionId);
+  const tagId = sessionId.slice(0, 8);
+  if (!result.ok) {
+    logger.error(
+      `[${tagId}] ${context}: close REFUSED (${result.error}); the row stays active `
+      + 'and its remote session may still be running',
+    );
+    return result;
+  }
+  if (result.outcome === 'closed_with_residual') {
+    logger.warn(
+      `[${tagId}] ${context}: closed locally, but remote session `
+      + `${result.residual.taskId} was NOT cancelled (${result.residual.reason}); `
+      + 'manual cleanup required',
+    );
+  }
+  return result;
+}
+
 export async function closeSession(
   sessionId: string,
 ): Promise<CloseSessionResult> {

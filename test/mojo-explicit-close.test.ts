@@ -67,6 +67,7 @@ import { config } from '../src/config.js';
 import {
   __testOnly_setupWorkerHandlers,
   closeSession,
+  closeSessionForBackgroundCleanup,
   initWorkerPool,
   setActiveSessionsRegistry,
 } from '../src/core/worker-pool.js';
@@ -394,3 +395,39 @@ describe('mojo explicit close', () => {
     });
   });
 });
+
+describe('closeSessionForBackgroundCleanup', () => {
+  it('logs the surviving remote id when a background close leaves a residual', async () => {
+    // These callers have no card/toast to render to, so the log line is the only
+    // thing standing between "remote still running" and total invisibility.
+    const fixture = createFixture({ legacyUnfrozen: true });
+    const { logger } = await import('../src/utils/logger.js');
+
+    const result = await closeSessionForBackgroundCleanup(
+      fixture.session.sessionId,
+      'unit cleanup',
+    );
+
+    expect(result).toMatchObject({ ok: true, outcome: 'closed_with_residual' });
+    const warned = vi.mocked(logger.warn).mock.calls.map(c => String(c[0])).join('\n');
+    expect(warned).toContain('mojo-sid-123');
+    expect(warned).toContain('unit cleanup');
+  });
+
+  it('logs an error when a background close is refused', async () => {
+    cancelMojoMock.mockResolvedValue({ kind: 'failed', message: 'HTTP 500', retryable: true });
+    const fixture = createFixture();
+    const { logger } = await import('../src/utils/logger.js');
+
+    const result = await closeSessionForBackgroundCleanup(
+      fixture.session.sessionId,
+      'unit cleanup',
+    );
+
+    expect(result.ok).toBe(false);
+    const errored = vi.mocked(logger.error).mock.calls.map(c => String(c[0])).join('\n');
+    expect(errored).toContain('close REFUSED');
+    expect(errored).toContain('unit cleanup');
+  });
+});
+

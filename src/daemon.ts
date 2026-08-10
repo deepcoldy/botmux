@@ -155,6 +155,7 @@ import {
   CARD_POSTING_SENTINEL,
   parkStreamCard,
   closeSession as closeSessionHelper,
+  closeSessionForBackgroundCleanup,
   setActiveSessionIfActive,
   rollbackRejectedSessionAndGetWinner,
   ensureCliEnv,
@@ -2801,7 +2802,12 @@ function scheduleDeferredScheduleSettlement(
     deferredScheduleSettleTimers.delete(sessionId);
     void settleDeferredScheduleRun(ds, context, {
       reconcile: reconcileDeferredTopicBinding,
-      closeSession: closeSessionHelper,
+      // Background path: no user surface, so a residual/refusal must at least be
+      // logged with its remote id instead of being discarded.
+      closeSession: (id: string) => closeSessionForBackgroundCleanup(
+        id,
+        'deferred-schedule settlement',
+      ),
     }).then((result) => {
       if (result.action === 'materialized') {
         logger.info(

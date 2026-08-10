@@ -33,6 +33,7 @@ vi.mock('../src/utils/logger.js', () => ({
 const mockCloseSession = vi.fn(async () => ({ ok: true, outcome: 'closed', alreadyClosed: false, known: true }));
 vi.mock('../src/core/worker-pool.js', () => ({
   closeSession: (...a: any[]) => mockCloseSession(...a),
+  closeSessionForBackgroundCleanup: (...a: any[]) => mockCloseSession(a[0]),
   forkWorker: vi.fn(),
   getCurrentCliVersion: vi.fn(() => 'test'),
   sendWorkerInput: vi.fn(() => true),
