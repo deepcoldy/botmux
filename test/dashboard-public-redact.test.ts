@@ -239,6 +239,29 @@ describe('session presentation redaction', () => {
     expect(updateBody.patch.riffAccessUrl).toBe('https://def456.sandbox.example/term');
   });
 
+  it('strips openTodos (task-state plaintext from transcripts) from anonymous REST rows and SSE bodies', () => {
+    // openTodos.items[].text is CLI transcript plaintext — equivalent to preview
+    // content. Anonymous read-only visitors must not receive it (they get no TODO
+    // badge); the field is entirely blacklisted, both in the full REST projection
+    // and in incremental SSE patches (where worker-pool publishes openTodos on
+    // every runtime status edge).
+    const todoSession = {
+      sessionId: 's-todo',
+      status: 'idle',
+      openTodos: { total: 3, done: 1, remaining: 2, hasInProgress: true, items: [{ status: 'in_progress', text: 'secret task text' }] },
+    };
+    const rest = redactSessionsForPublic([todoSession]) as any[];
+    expect(rest[0]).toEqual({ sessionId: 's-todo', status: 'idle' });
+    expect(todoSession.openTodos.remaining).toBe(2);
+
+    const spawned = redactSessionEventForPublic('session.spawned', { session: todoSession }) as any;
+    expect(spawned.session).not.toHaveProperty('openTodos');
+
+    const updateBody = { sessionId: 's-todo', patch: { status: 'working', openTodos: { total: 1, done: 0, remaining: 1, hasInProgress: false, items: [{ status: 'pending', text: 'x' }] } } };
+    const updated = redactSessionEventForPublic('session.update', updateBody) as any;
+    expect(updated.patch).toEqual({ status: 'working' });
+  });
+
   it('fails closed for future preview-prefixed fields on anonymous REST and SSE surfaces', () => {
     const future = {
       sessionId: 's-future',

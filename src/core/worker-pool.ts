@@ -7550,6 +7550,9 @@ function setupWorkerHandlers(
                 previewUserAt: dashboardRow.previewUserAt,
                 previewBotAt: dashboardRow.previewBotAt,
                 previewBotState: dashboardRow.previewBotState,
+                // 任务态随运行态边沿一起推：working→idle 时 todo 往往刚变化，
+                // 不带上会让看板「待办」列停在旧值。?? null 让清空也能同步（patch 合并）。
+                openTodos: dashboardRow.openTodos ?? null,
               },
             },
           });

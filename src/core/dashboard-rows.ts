@@ -94,7 +94,7 @@ export interface SessionRow extends SessionMessagePreview {
    *  与运行态正交——「运行态=空闲 + 有未完成 todo」正是要抓的「机器停了活没干完」。
    *  仅 Claude / Codex 家族能提取；其它 CLI、无 transcript、从未建 todo 时为 undefined
    *  （= 未知/不支持，前端不据此判「已交付」）。 */
-  openTodos?: { total: number; done: number; remaining: number; hasInProgress: boolean };
+  openTodos?: { total: number; done: number; remaining: number; hasInProgress: boolean; items: Array<{ status: string; text: string }> };
   /** Native Agent CLI token usage for this session. Null means unavailable. */
   tokenUsage?: SessionTokenUsage | null;
   /** Worker process PID, active rows only. Used by dashboard resource attribution. */
@@ -156,6 +156,7 @@ function sessionOpenTodos(s: Session, workingDir?: string): SessionRow['openTodo
     sessionId: s.sessionId,
     cliSessionId: s.cliSessionId,
     cwd: workingDir ?? s.workingDir,
+    larkAppId: s.larkAppId,
   }) ?? undefined;
 }
 

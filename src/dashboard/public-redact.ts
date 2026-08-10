@@ -77,6 +77,9 @@ const PRIVATE_SESSION_FIELDS = new Set([
   'previewUserAt',
   'previewBotAt',
   'previewBotState',
+  // openTodos.items[].text 是从 CLI transcript 读出的任务明文，等同 preview 内容，
+  // 匿名看板不得透传。整字段进黑名单（列归属靠运行态即可，匿名侧不显示 TODO 徽标）。
+  'openTodos',
 ]);
 
 function omitPrivateSessionFields(record: Record<string, unknown>): Record<string, unknown> {

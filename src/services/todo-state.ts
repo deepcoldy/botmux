@@ -243,6 +243,7 @@ export function readSessionOpenTodos(q: {
   sessionId: string;
   cliSessionId?: string;
   cwd?: string;
+  larkAppId?: string;
 }): OpenTodos | null {
   const kind = todoKindForCli(q.cliId);
   if (!kind) return null;
@@ -252,6 +253,7 @@ export function readSessionOpenTodos(q: {
     sessionId: q.sessionId,
     cliSessionId: q.cliSessionId,
     cwd: q.cwd,
+    larkAppId: q.larkAppId,
   });
   // resolver 的 kind 与我们的 todo dialect 需一致。traex rollout 与 codex 逐字节同构
   // （response_item + function_call），按 codex 方言解析。
