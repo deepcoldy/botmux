@@ -212,7 +212,7 @@ export interface DaemonSession {
   ownerOpenId?: string;          // receives owner-only links and controls write-enabled access
   streamCardId?: string;         // message_id of the streaming card in group (PATCHed with live output)
   streamCardNonce?: string;       // unique nonce for the current streaming card — embedded in button values to distinguish old vs current card
-  streamCardPending?: boolean;    // true when a new turn started, next screen_update creates a new card
+  streamCardPending?: boolean;    // true while the newest turn still needs its own streaming card
   /** Monotonic in-memory generation for accepted user turns. Card POST
    * completions use it to avoid clearing a newer turn's pending state. */
   streamCardTurnGeneration?: number;

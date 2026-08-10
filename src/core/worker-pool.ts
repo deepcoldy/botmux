@@ -1374,6 +1374,10 @@ export async function postTurnStartingCard(
   if (!larkTransportEnabled({ chatId: ds.chatId, apiOnly: getBot(ds.larkAppId).config.apiOnly })) return false;
 
   const generation = ds.streamCardTurnGeneration ?? 0;
+  const sessionAtPost = ds.session;
+  const larkAppIdAtPost = ds.larkAppId;
+  const anchorAtPost = sessionAnchorId(ds);
+  const registryKeyAtPost = sessionKey(anchorAtPost, larkAppIdAtPost);
   const botCfg = getBot(ds.larkAppId).config;
   const effectiveCliId = sessionCliId(ds, botCfg);
   const previousCardId = ds.streamCardId;
@@ -1408,10 +1412,24 @@ export async function postTurnStartingCard(
 
   ds.streamCardNonce = nonce;
   ds.streamCardId = CARD_POSTING_SENTINEL;
+  const stillOwnsPost = (): boolean =>
+    ds.session === sessionAtPost
+    && ds.session.status === 'active'
+    && ds.larkAppId === larkAppIdAtPost
+    && sessionAnchorId(ds) === anchorAtPost
+    && !isSessionTransferring(ds)
+    && ds.streamCardId === CARD_POSTING_SENTINEL
+    && ds.streamCardNonce === nonce
+    && (!activeSessionsRegistry || activeSessionsRegistry.get(registryKeyAtPost) === ds);
   try {
     const messageId = await sessionReply(
-      sessionAnchorId(ds), cardJson, 'interactive', ds.larkAppId, turnId,
+      anchorAtPost, cardJson, 'interactive', larkAppIdAtPost, turnId,
     );
+    if (!stillOwnsPost()) {
+      void deleteMessage(larkAppIdAtPost, messageId).catch(() => { /* best-effort stale-card cleanup */ });
+      logger.info(`[${tag(ds)}] Discarded stale starting card for turn ${turnId.substring(0, 12)}`);
+      return false;
+    }
     ds.streamCardId = messageId;
     ds.parkedStreamCardNonce = undefined;
     const superseded = (ds.streamCardTurnGeneration ?? 0) !== generation;
@@ -1432,6 +1450,10 @@ export async function postTurnStartingCard(
     }
     return true;
   } catch (err) {
+    if (!stillOwnsPost()) {
+      logger.info(`[${tag(ds)}] Ignored stale starting-card failure for turn ${turnId.substring(0, 12)}`);
+      return false;
+    }
     ds.streamCardId = previousCardId;
     ds.streamCardNonce = previousNonce;
     persistStreamCardState(ds);
