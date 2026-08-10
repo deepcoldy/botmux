@@ -1,12 +1,22 @@
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { setTimeout as delay } from 'node:timers/promises';
 
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 import { scanMultipleProjectsAsync } from '../src/services/project-scanner-async.js';
 import { scanMultipleProjects } from '../src/services/project-scanner.js';
+
+function isProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0); // signal 0: probe existence without killing
+    return true;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === 'EPERM'; // exists but not ours
+  }
+}
 
 let tempRoot: string;
 
@@ -95,28 +105,52 @@ describe('scanMultipleProjectsAsync', () => {
     expect(actual).toEqual(expected);
   });
 
-  it('settles on timeout even when the killed child never emits close', async () => {
-    // Regression for the "watchdog depends on close" trap: under uninterruptible
-    // I/O a killed child's 'close' can be delayed indefinitely, so settlement
-    // must NOT wait for it. This child traps SIGTERM (ignores it) and keeps a
-    // live timer, so 'close' will not arrive within the grace window. The scan
-    // must still reject promptly (parent-owned settle), and the queue must drain.
+  it('settles on timeout even when the killed child never emits close, and still reaps it via SIGKILL', async () => {
+    // Two coupled regressions:
+    //  (a) "watchdog depends on close": under uninterruptible I/O a killed
+    //      child's 'close' can be delayed indefinitely, so settlement must not
+    //      wait for it — the scan must reject promptly (parent-owned settle).
+    //  (b) "settle cancels its own SIGKILL": a child that ignores SIGTERM (the
+    //      wedge case) must still be reaped by the escalated SIGKILL. settle()
+    //      must NOT clear the reap timer, or the process leaks forever.
+    // This child traps SIGTERM (ignores it), writes its PID, and keeps a live
+    // timer so 'close' won't arrive within the grace window.
+    const pidFile = join(tempRoot, 'stubborn-child.pid');
     const stubbornChild = join(tempRoot, 'stubborn-child.mjs');
     writeFileSync(
       stubbornChild,
-      "process.on('SIGTERM', () => {});\nsetInterval(() => {}, 1 << 30);\n",
+      "import { writeFileSync } from 'node:fs';\n"
+      + `writeFileSync(${JSON.stringify(pidFile)}, String(process.pid));\n`
+      + "process.on('SIGTERM', () => {});\n"
+      + 'setInterval(() => {}, 1 << 30);\n',
     );
     process.env.BOTMUX_REPO_SCANNER_CHILD = stubbornChild;
     process.env.BOTMUX_REPO_SCAN_TIMEOUT_MS = '300';
+    let childPid: number | undefined;
     try {
       const started = Date.now();
       await expect(scanMultipleProjectsAsync([tempRoot])).rejects.toThrow(/timed out/i);
-      // Must settle at ~timeout, well before the SIGKILL grace makes 'close'
-      // eventually fire — proving settlement is parent-owned, not close-driven.
+      // (a) Must settle at ~timeout, well before the SIGKILL grace elapses —
+      // proving settlement is parent-owned, not close-driven.
       expect(Date.now() - started).toBeLessThan(1_500);
+
+      // (b) After SIGTERM (ignored) + the 2s grace + SIGKILL, the child must be
+      // dead. Poll past the grace window and assert the recorded PID is gone.
+      expect(existsSync(pidFile)).toBe(true);
+      childPid = Number(readFileSync(pidFile, 'utf8').trim());
+      expect(Number.isInteger(childPid) && childPid > 0).toBe(true);
+      let alive = true;
+      for (let i = 0; i < 40 && alive; i++) {
+        await delay(100);
+        alive = isProcessAlive(childPid);
+      }
+      expect(alive).toBe(false); // SIGKILL reaped it — no orphan leak
     } finally {
       delete process.env.BOTMUX_REPO_SCANNER_CHILD;
       delete process.env.BOTMUX_REPO_SCAN_TIMEOUT_MS;
+      if (childPid && isProcessAlive(childPid)) {
+        try { process.kill(childPid, 'SIGKILL'); } catch { /* already gone */ }
+      }
     }
 
     const expected = scanMultipleProjects([tempRoot]);

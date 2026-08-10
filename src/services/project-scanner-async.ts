@@ -75,7 +75,11 @@ function runScan(request: ScanRequest): Promise<ProjectInfo[]> {
       if (settled) return;
       settled = true;
       if (timeoutTimer) clearTimeout(timeoutTimer);
-      if (killTimer) clearTimeout(killTimer);
+      // Deliberately do NOT clear killTimer here: settlement only unblocks the
+      // queue, it must never cancel the pending SIGKILL escalation. A child that
+      // ignores SIGTERM (exactly the wedge case) would otherwise leak forever —
+      // SIGTERM does nothing and the SIGKILL we just scheduled would be cancelled
+      // by our own cleanup. The reap timer runs to completion and clears itself.
       child.removeAllListeners('message');
       child.removeAllListeners('error');
       child.removeAllListeners('close');
@@ -90,11 +94,11 @@ function runScan(request: ScanRequest): Promise<ProjectInfo[]> {
       }
     };
 
-    // Bound the child: on timeout record a failure, SIGTERM it, then settle the
-    // Promise immediately after the SIGKILL escalation is queued — WITHOUT
-    // waiting for 'close'. The best-effort SIGKILL still fires to reap the
-    // process, but the serialized queue drains regardless of whether the wedged
-    // child ever actually dies.
+    // Bound the child: on timeout record a failure, SIGTERM it, schedule a
+    // SIGKILL escalation, then settle the Promise immediately — WITHOUT waiting
+    // for 'close'. The serialized queue drains right away; the SIGKILL still
+    // fires after the grace period to reap a child that ignores SIGTERM, so no
+    // wedged process is left behind.
     timeoutTimer = setTimeout(() => {
       failure ??= new Error(`Project scanner child timed out after ${scanTimeoutMs()}ms`);
       try { child.kill('SIGTERM'); } catch { /* already gone */ }
@@ -106,6 +110,9 @@ function runScan(request: ScanRequest): Promise<ProjectInfo[]> {
     }, scanTimeoutMs());
     timeoutTimer.unref?.();
 
+    // A clean exit (message/error/close before timeout) means the child is
+    // already gone, so the pending reap timer — if any — is unnecessary. Clear it
+    // only on the child's own 'close', never as part of settle().
     child.once('message', (message) => {
       response = message as ScanResponse;
       settle();
@@ -115,6 +122,7 @@ function runScan(request: ScanRequest): Promise<ProjectInfo[]> {
       settle();
     });
     child.once('close', (code, signal) => {
+      if (killTimer) clearTimeout(killTimer);
       if (!failure && !response) {
         failure = new Error(`Project scanner child exited without a response (code=${code}, signal=${signal ?? 'none'})`);
       } else if (response?.ok && code !== 0 && code !== null) {
