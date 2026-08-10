@@ -274,12 +274,11 @@ export function sessionRowMismatchesTargetCli(
   row: Session,
   target: CliMismatchTargetConfig,
 ): { sessionCli: string; botCli: string } | null {
-  const ds = { session: row } as DaemonSession;
-  const sessionCliId = ds.session.cliId;
+  const sessionCliId = row.cliId;
   if (!sessionCliId) return null;
   const botCfg = target;
   if (!botCfg.cliId) return null;
-  const sessionWrapper = ds.session.wrapperCli?.trim() || undefined;
+  const sessionWrapper = row.wrapperCli?.trim() || undefined;
   const botWrapper = botCfg.wrapperCli?.trim() || undefined;
   const describe = (
     cliId: CliId,
@@ -292,7 +291,7 @@ export function sessionRowMismatchesTargetCli(
   };
   if (sessionCliId !== botCfg.cliId) {
     return {
-      sessionCli: describe(sessionCliId, ds.session.cliRuntime, ds.session.cliPathOverride, sessionWrapper),
+      sessionCli: describe(sessionCliId, row.cliRuntime, row.cliPathOverride, sessionWrapper),
       botCli: describe(botCfg.cliId, botCfg.cliRuntime, botCfg.cliPathOverride, botWrapper),
     };
   }
@@ -300,11 +299,11 @@ export function sessionRowMismatchesTargetCli(
   // 启动选择（selectionKeyForBot 以 cliId+wrapperCli 为键），wrapper 间切换同样不能
   // 复活旧会话。仅 agentFrozen 的会话有可靠的 wrapper 快照——legacy 未冻结会话下次
   // fork 会从 live bot 配置回填 wrapper，天然不会在这条轴上失配。
-  if (ds.session.agentFrozen && !sameRuntimeIdentity(
+  if (row.agentFrozen && !sameRuntimeIdentity(
     {
       cliId: sessionCliId,
-      cliRuntime: ds.session.cliRuntime,
-      cliPathOverride: ds.session.cliPathOverride,
+      cliRuntime: row.cliRuntime,
+      cliPathOverride: row.cliPathOverride,
       wrapperCli: sessionWrapper,
     },
     {
@@ -315,7 +314,7 @@ export function sessionRowMismatchesTargetCli(
     },
   )) {
     return {
-      sessionCli: describe(sessionCliId, ds.session.cliRuntime, ds.session.cliPathOverride, sessionWrapper),
+      sessionCli: describe(sessionCliId, row.cliRuntime, row.cliPathOverride, sessionWrapper),
       botCli: describe(botCfg.cliId, botCfg.cliRuntime, botCfg.cliPathOverride, botWrapper),
     };
   }
@@ -557,7 +556,12 @@ export async function closeSessionsForAgentSwitch(
       && !seen.has(row.sessionId),
     );
   } catch (err) {
-    // Cannot prove the durable side is clean → do not commit.
+    // Narrow on purpose: this only catches an error that listSessions() actually
+    // THROWS. It is NOT full fail-closed on store health — session-store's load()
+    // catches a read/parse failure itself, logs it and yields an empty Map, so a
+    // corrupt or unreadable file reaches us as "no durable rows" and this branch
+    // never runs. Closing that hole needs a health-aware store API; until then the
+    // durable pass is best-effort against an unreadable store.
     out.failed++;
     out.ok = false;
     logger.error(

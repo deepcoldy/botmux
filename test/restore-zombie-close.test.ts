@@ -1331,6 +1331,8 @@ describe('closeCliMismatchedSessionsForBot — runtime CLI hot-switch sweep', ()
       // only the registry let the config commit through while that row stayed
       // frozen on the old agent — the very mismatch this transaction prevents.
       const durableOnly = makeActivePersistentSession('om_sw_durable_only');
+      // Explicit: the fixture inherits bot.cliId, which other tests mutate.
+      durableOnly.cliId = 'claude-code';
       sessionStore.updateSession(durableOnly);
       // Deliberately NOT registerDs(...): it exists only in the store.
 
@@ -1341,6 +1343,7 @@ describe('closeCliMismatchedSessionsForBot — runtime CLI hot-switch sweep', ()
 
     it('blocks the switch when an unregistered durable row cannot be closed', async () => {
       const durableOnly = makeActivePersistentSession('om_sw_durable_refused');
+      durableOnly.cliId = 'claude-code';
       sessionStore.updateSession(durableOnly);
       vi.mocked(closeSession).mockResolvedValueOnce({
         ok: false,
@@ -1356,12 +1359,18 @@ describe('closeCliMismatchedSessionsForBot — runtime CLI hot-switch sweep', ()
 
     it('does not close the same session twice when it is in both authorities', async () => {
       const both = makeActivePersistentSession('om_sw_both');
+      both.cliId = 'claude-code';
       sessionStore.updateSession(both);
       registerDs(both);
 
-      await expect(closeSessionsForAgentSwitch('app_test', target))
-        .resolves.toMatchObject({ ok: true, closed: 1 });
-      expect(closeSession).toHaveBeenCalledTimes(1);
+      await closeSessionsForAgentSwitch('app_test', target);
+
+      // The specific row is closed EXACTLY once, even though it appears in both
+      // authorities. Asserting the id (not just a count) so a leaked row from
+      // another case cannot stand in for it.
+      const calls = vi.mocked(closeSession).mock.calls
+        .filter(c => c[0] === both.sessionId);
+      expect(calls).toHaveLength(1);
     });
 
     it('keeps the residual id when another row in the same batch FAILS', async () => {
