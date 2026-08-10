@@ -260,7 +260,9 @@ vi.mock('../src/core/session-activity.js', () => ({
   markSessionActivity: vi.fn(),
 }));
 
-import { restoreActiveSessions, closeCliMismatchedSessionsForBot, resumeSession } from '../src/core/session-manager.js';
+import { restoreActiveSessions, closeCliMismatchedSessionsForBot, resumeSession,
+  closeSessionsForAgentSwitch,
+} from '../src/core/session-manager.js';
 import { TmuxBackend } from '../src/adapters/backend/tmux-backend.js';
 import { HerdrBackend } from '../src/adapters/backend/herdr-backend.js';
 import { ZmxBackend } from '../src/adapters/backend/zmx-backend.js';
@@ -1206,5 +1208,104 @@ describe('closeCliMismatchedSessionsForBot — runtime CLI hot-switch sweep', ()
     wp.registry = null;
     expect(await closeCliMismatchedSessionsForBot('app_test'))
       .toMatchObject({ closed: 0 });
+  });
+
+  describe('closeSessionsForAgentSwitch — close BEFORE the config commit', () => {
+    const target = { cliId: 'codex' as const };
+
+    it('reports ok when every mismatched session closes cleanly', async () => {
+      const s1 = makeActivePersistentSession('om_sw_clean');
+      sessionStore.updateSession(s1);
+      registerDs(s1);
+
+      await expect(closeSessionsForAgentSwitch('app_test', target))
+        .resolves.toMatchObject({ ok: true, closed: 1, failed: 0, residual: 0 });
+      expect(closeSession).toHaveBeenCalledWith(s1.sessionId);
+    });
+
+    it('BLOCKS the switch when a close is refused', async () => {
+      // The whole point of the reorder: the caller must not commit, so the bot keeps
+      // running the same agent this still-active row is frozen on.
+      const s1 = makeActivePersistentSession('om_sw_refused');
+      sessionStore.updateSession(s1);
+      registerDs(s1);
+      vi.mocked(closeSession).mockResolvedValueOnce({
+        ok: false,
+        alreadyClosed: false,
+        error: 'mojo_cancel_failed',
+        retryable: true,
+        taskId: 'mojo-sid-123',
+      } as never);
+
+      await expect(closeSessionsForAgentSwitch('app_test', target))
+        .resolves.toMatchObject({ ok: false, closed: 0, failed: 1 });
+      expect(sessionStore.getSession(s1.sessionId)!.status).toBe('active');
+    });
+
+    it('BLOCKS the switch when a close throws, and still evaluates later rows', async () => {
+      const boom = makeActivePersistentSession('om_sw_throw');
+      sessionStore.updateSession(boom);
+      registerDs(boom);
+      const later = makeActivePersistentSession('om_sw_after_throw');
+      sessionStore.updateSession(later);
+      registerDs(later);
+      vi.mocked(closeSession).mockRejectedValueOnce(new Error('probe unavailable'));
+
+      const result = await closeSessionsForAgentSwitch('app_test', target);
+
+      expect(result.ok).toBe(false);
+      expect(result.failed).toBe(1);
+      // No early exit: the second row was still processed.
+      expect(result.closed).toBe(1);
+      expect(closeSession).toHaveBeenCalledWith(later.sessionId);
+    });
+
+    it('allows the commit for a residual close, but reports the surviving id', async () => {
+      // The local row IS closed, so nothing can route to it; only the remote session
+      // survives, and that is reported rather than blocking the switch.
+      const s1 = makeActivePersistentSession('om_sw_residual');
+      sessionStore.updateSession(s1);
+      registerDs(s1);
+      vi.mocked(closeSession).mockResolvedValueOnce({
+        ok: true,
+        outcome: 'closed_with_residual',
+        residual: { reason: 'mojo_lineage_quarantined', taskId: 'mojo-parked-9' },
+        alreadyClosed: false,
+        known: true,
+      } as never);
+
+      await expect(closeSessionsForAgentSwitch('app_test', target)).resolves.toMatchObject({
+        ok: true,
+        closed: 1,
+        residual: 1,
+        residualTaskIds: ['mojo-parked-9'],
+      });
+    });
+
+    it('closes nothing when the target identity is unchanged (e.g. model-only edit)', async () => {
+      const s1 = makeActivePersistentSession('om_sw_model_only');
+      sessionStore.updateSession(s1);
+      registerDs(s1);
+
+      // Same cliId the session is frozen on → not a mismatch.
+      await expect(closeSessionsForAgentSwitch('app_test', { cliId: s1.cliId as never }))
+        .resolves.toMatchObject({ ok: true, closed: 0, failed: 0 });
+      expect(closeSession).not.toHaveBeenCalled();
+    });
+
+    it('never closes a protected / adopt / queued session', async () => {
+      const adopted = makeActivePersistentSession('om_sw_adopt');
+      adopted.adoptedFrom = 'tmux';
+      sessionStore.updateSession(adopted);
+      registerDs(adopted);
+      const queued = makeActivePersistentSession('om_sw_queued');
+      queued.queued = true;
+      sessionStore.updateSession(queued);
+      registerDs(queued);
+
+      await expect(closeSessionsForAgentSwitch('app_test', target))
+        .resolves.toMatchObject({ ok: true, closed: 0, failed: 0 });
+      expect(closeSession).not.toHaveBeenCalled();
+    });
   });
 });

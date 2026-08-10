@@ -82,7 +82,7 @@ import { isSessionStopped } from './session-liveness.js';
 import { isRemoteBackendType, isRemoteCliId, isSuspendableBackendType } from './persistent-backend.js';
 import { getChatMode, replyMessage, sendMessage, resolveUnionIdFromOpenId, listThreadMessages, listChatMessages, listChatMessagesUntil, listChatBotMembers, getUserProfile, getUserProfileStrict, resolveAllowedUsersWithMap, type ChatBotMember } from '../im/lark/client.js';
 import { parseApiMessage, cardContentHasUpgradeFallback, resolveMergedCardContent, messageMentionsBot } from '../im/lark/message-parser.js';
-import { resumeSession, spawnDashboardSession, activateQueuedSession, closeCliMismatchedSessionsForBot } from './session-manager.js';
+import { resumeSession, spawnDashboardSession, activateQueuedSession, closeCliMismatchedSessionsForBot, closeSessionsForAgentSwitch } from './session-manager.js';
 import { parseSpawnRequest } from './session-create.js';
 import { cleanupMaterializedDashboardImages, materializeDashboardImages } from './dashboard-images.js';
 import { getCliDisplayName } from '../im/lark/card-builder.js';
@@ -3918,6 +3918,36 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
     // read-isolation toggle validates at enable time; changing the agent afterwards
     // is the other way a bot could end up configured-but-unenforceable.)
     let readIsolationCleared = false;
+    // ── close BEFORE commit ────────────────────────────────────────────────
+    // Every session frozen on the OLD agent is closed first, compared against the
+    // PROPOSED config. If any close fails we do not write bots.json and do not
+    // touch the in-memory config, so the bot keeps running the old agent — the
+    // same one those still-active rows are frozen on. Committing first was what
+    // allowed "config says new agent, next message resurrects the old one".
+    //
+    // We are inside withBotTurnMutation, so no new turn can be admitted for this
+    // bot between the closes and the commit.
+    const switchTarget = {
+      cliId: selected.cliId,
+      cliRuntime: nextRuntime,
+      cliPathOverride: nextRuntime?.executable ?? nextLegacyPath,
+      wrapperCli: selected.wrapperCli,
+    };
+    const closedMismatchedSessions = await closeSessionsForAgentSwitch(larkAppId, switchTarget);
+    if (!closedMismatchedSessions.ok) {
+      // Rows that DID close stay closed (a cancelled remote session cannot be
+      // brought back); the ones that refused are still active on the old agent,
+      // which is still the configured agent. Consistent, and retryable by saving
+      // again.
+      return jsonRes(res, 409, {
+        ok: false,
+        error: 'agent_switch_close_failed',
+        closedMismatchedSessions: closedMismatchedSessions.closed,
+        closedMismatchedResidual: closedMismatchedSessions.residual,
+        closedMismatchedFailed: closedMismatchedSessions.failed,
+      });
+    }
+
     const r = await rmwBotEntry(larkAppId, (entry) => {
     entry.cliId = selected.cliId;
     if (selected.wrapperCli) entry.wrapperCli = selected.wrapperCli;
@@ -3969,10 +3999,6 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
       bot.config.backendType = undefined;
     }
 
-    // 热切后立刻清掉本 bot 名下失配的存量会话——否则它们冻结的旧 CLI 会被下一条
-    // 消息 lazy resume 复活，要等下次 daemon 重启才被 restore 守卫清理。
-    const closedMismatchedSessions = await closeCliMismatchedSessionsForBot(larkAppId);
-
     const selectionKey = selectionKeyForBot(selected.cliId, selected.wrapperCli);
     jsonRes(res, 200, {
       ok: true,
@@ -3988,6 +4014,7 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
       closedMismatchedSessions: closedMismatchedSessions.closed,
       closedMismatchedResidual: closedMismatchedSessions.residual,
       closedMismatchedFailed: closedMismatchedSessions.failed,
+      closedMismatchedResidualTaskIds: closedMismatchedSessions.residualTaskIds,
       // Report the (possibly auto-cleared) read-isolation state + whether the new
       // agent can still enforce it, so the dashboard updates its toggle immediately
       // instead of showing a stale enabled/supported state until a full refetch.

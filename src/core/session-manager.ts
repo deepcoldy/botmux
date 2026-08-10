@@ -239,11 +239,30 @@ function sameUsageLimit(a: DaemonSession['usageLimit'], b: DaemonSession['usageL
   return usageLimitStateKey(a) === usageLimitStateKey(b) && a.retryReady === b.retryReady;
 }
 
-function sessionBotCliMismatch(ds: DaemonSession): { sessionCli: string; botCli: string } | null {
+/** The launch identity a session is compared against. */
+export interface CliMismatchTargetConfig {
+  cliId?: CliId;
+  cliRuntime?: CliRuntimeConfig;
+  cliPathOverride?: string;
+  wrapperCli?: string;
+}
+
+/**
+ * Compare a session's FROZEN launch identity against a target config.
+ *
+ * `target` is explicit so the agent-switch transaction can ask "which sessions
+ * WOULD mismatch if I committed this config" BEFORE writing it. Deriving the
+ * answer from live bot config forces a commit-then-reconcile order, which is
+ * exactly the ordering that let a failed close leave the config switched while
+ * old-agent sessions stayed routable.
+ */
+export function sessionMismatchesTargetCli(
+  ds: DaemonSession,
+  target: CliMismatchTargetConfig,
+): { sessionCli: string; botCli: string } | null {
   const sessionCliId = ds.session.cliId;
   if (!sessionCliId) return null;
-  let botCfg: { cliId?: CliId; cliRuntime?: CliRuntimeConfig; cliPathOverride?: string; wrapperCli?: string };
-  try { botCfg = getBot(ds.larkAppId).config; } catch { return null; }
+  const botCfg = target;
   if (!botCfg.cliId) return null;
   const sessionWrapper = ds.session.wrapperCli?.trim() || undefined;
   const botWrapper = botCfg.wrapperCli?.trim() || undefined;
@@ -286,6 +305,13 @@ function sessionBotCliMismatch(ds: DaemonSession): { sessionCli: string; botCli:
     };
   }
   return null;
+}
+
+/** Live-config comparison — the restore / reattach / sweep paths. */
+function sessionBotCliMismatch(ds: DaemonSession): { sessionCli: string; botCli: string } | null {
+  let botCfg: CliMismatchTargetConfig;
+  try { botCfg = getBot(ds.larkAppId).config; } catch { return null; }
+  return sessionMismatchesTargetCli(ds, botCfg);
 }
 
 type CliMismatchCloseResult =
@@ -409,6 +435,80 @@ async function closeActiveSessionIfCliMismatch(ds: DaemonSession): Promise<CliMi
  * 豁免口径与 restoreActiveSessions 一致：queued（待办池）会话从没起过 CLI；
  * adopt 会话接管的是用户自己的外部 CLI，其 cliId 与 bot 配置不同是合法状态。
  */
+/**
+ * Close every live session that would run the OLD agent under `target`, and say
+ * whether the switch may be committed.
+ *
+ * Ordering is the whole point: this runs BEFORE bots.json / the in-memory config
+ * change, inside the caller's `withBotTurnMutation` lock. If any close fails, the
+ * caller must not commit — leaving the config on the OLD agent, which is the same
+ * agent those still-active sessions are frozen on. That is consistent (a routed
+ * message runs the agent the config names) instead of the previous state, where a
+ * committed switch coexisted with rows that resurrect the old CLI.
+ *
+ * A `closed_with_residual` does NOT block the commit: the local row IS closed, so
+ * nothing can route to it. Its surviving remote id is reported for manual cleanup.
+ */
+export async function closeSessionsForAgentSwitch(
+  larkAppId: string,
+  target: CliMismatchTargetConfig,
+): Promise<{
+  ok: boolean;
+  closed: number;
+  residual: number;
+  failed: number;
+  residualTaskIds: string[];
+}> {
+  const registry = getActiveSessionsRegistry();
+  const out = { ok: true, closed: 0, residual: 0, failed: 0, residualTaskIds: [] as string[] };
+  if (!registry) return out;
+  for (const ds of [...registry.values()]) {
+    if (ds.larkAppId !== larkAppId) continue;
+    if (ds.session.queued) continue;
+    if (ds.adoptedFrom || ds.session.adoptedFrom || ds.session.title?.startsWith('Adopt:')) continue;
+    // Same preflight the sweep uses, and it must stay BEFORE any close.
+    if (hasProtectedSessionMutationOwnership(ds)) continue;
+    // Compared against the PROPOSED config, not the live one.
+    if (!sessionMismatchesTargetCli(ds, target)) continue;
+    if (isSessionTransferring(ds)) {
+      // A relay in flight cannot be closed here, and committing would strand it on
+      // the old agent — treat it as a blocking failure rather than deferring.
+      out.failed++;
+      out.ok = false;
+      continue;
+    }
+    try {
+      // The close uses the session's own FROZEN identity, so it does not depend on
+      // the config we are about to (not) write.
+      const result = await closeSession(ds.session.sessionId);
+      if (!result.ok) {
+        out.failed++;
+        out.ok = false;
+        logger.error(
+          `[${ds.session.sessionId.substring(0, 8)}] agent switch: close REFUSED (${result.error}); `
+          + 'the switch will NOT be committed',
+        );
+        continue;
+      }
+      out.closed++;
+      if (result.outcome === 'closed_with_residual') {
+        out.residual++;
+        out.residualTaskIds.push(result.residual.taskId);
+      }
+    } catch (err) {
+      // Collected, not thrown: every remaining row must still be evaluated, or an
+      // early exit leaves unchecked sessions behind a refused switch.
+      out.failed++;
+      out.ok = false;
+      logger.error(
+        `[${ds.session.sessionId.substring(0, 8)}] agent switch: close threw; the switch will NOT `
+        + `be committed: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+  return out;
+}
+
 export async function closeCliMismatchedSessionsForBot(
   larkAppId: string,
 ): Promise<{ closed: number; residual: number; failed: number }> {
