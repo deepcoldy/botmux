@@ -282,6 +282,23 @@ describe('mojo worker wiring', () => {
     expect(invocation.env.X_JWT_TOKEN).toBe('ambient-jwt');
   }, 40_000);
 
+  it('resolves a custom jwtEnv from the DAEMON env on the first turn', async () => {
+    // The migration offered when a custom `jwtEnv` is refused from bots.json is
+    // "move it to the daemon's own environment". That has to work on the FIRST turn,
+    // and only a real worker run proves it: `init` carries the first prompt but no
+    // mojoLivePatch, so the live-patch path cannot cover for it — the value has to
+    // survive redactChildEnv() into the worker env and be picked up by buildEnv().
+    // A unit test on pickMojoLivePatch() would miss a change to the redaction list.
+    const { invocation } = await runWorker({
+      workerEnv: { MY_JWT: 'ambient-token' },
+      botEntry: { mojo: { cloud: true, jwtEnv: 'MY_JWT' } },
+      init: { backendConfig: { cloud: true, jwtEnv: 'MY_JWT' } },
+    });
+    // Delivered under the CANONICAL name whatever jwtEnv is called — the asymmetry
+    // the remote-execution proof depends on.
+    expect(invocation.env.X_JWT_TOKEN).toBe('ambient-token');
+  }, 40_000);
+
   it('lets an explicit mojo.jwt win over both', async () => {
     const { invocation } = await runWorker({
       workerEnv: { X_JWT_TOKEN: 'ambient-jwt' },

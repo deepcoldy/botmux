@@ -6,7 +6,7 @@ import { HerdrBackend } from './herdr-backend.js';
 import { PtyBackend } from './pty-backend.js';
 import { MojoBackend } from './mojo-backend.js';
 import { isMojoFullyRemote } from './sandbox.js';
-import { mojoUnprovableEnvKeys, MOJO_CANONICAL_JWT_ENV_KEY } from './mojo-types.js';
+import { mojoRemoteProofFailureReason } from './mojo-types.js';
 import type { EffectiveMojoConfig } from './mojo-types.js';
 import { RiffBackend, type RiffBackendConfig } from './riff-backend.js';
 import { TmuxBackend } from './tmux-backend.js';
@@ -228,40 +228,13 @@ export function backendSandboxCompatibilityError(opts: {
     // impossible — fail CLOSED with an actionable message rather than running
     // unisolated while the user believes they are sandboxed.
     if (isMojoFullyRemote(opts.mojoConfig)) return undefined;
-    // Name the launcher env explicitly: "set cloud=true" is useless advice when
-    // cloud IS already true and the real blocker is an env var that can redirect
-    // which binary runs.
-    const unprovableEnv = mojoUnprovableEnvKeys(opts.mojoConfig);
-    if (unprovableEnv.length > 0) {
-      // Key NAMES only, never values: this string reaches logs and chat, and one
-      // of these keys is by definition the operator's credential variable.
-      const listed = unprovableEnv.join(', ');
-      // A custom `jwtEnv` key is NOT dangerous in itself, so the generic "these can
-      // change which binary runs" wording reads as a bug report against a JWT name.
-      // Name the real reason (the proof exempts only the canonical key) and give the
-      // two migrations that keep the session provably remote.
-      const credentialKey = opts.mojoConfig?.jwtEnv?.trim();
-      if (credentialKey
-        && credentialKey !== MOJO_CANONICAL_JWT_ENV_KEY
-        && unprovableEnv.includes(credentialKey)) {
-        return `backend "mojo" cannot prove it runs nothing locally: ${listed} `
-          + `(set in the bot's \`env\` / \`mojo.env\`). The proof exempts only `
-          + `\`${MOJO_CANONICAL_JWT_ENV_KEY}\`, because a config-supplied name cannot be `
-          + 'told apart from one that redirects execution (PATH / LD_PRELOAD / '
-          + `NODE_OPTIONS / DYLD_*). Since \`${credentialKey}\` holds this bot's `
-          + 'credential, either set `mojo.jwt` instead, or move that variable to the '
-          + "daemon's own environment — both keep the credential working without "
-          + 'putting it in the config env map. Otherwise disable sandbox for this bot';
-      }
-      return 'backend "mojo" cannot prove it runs nothing locally while these env '
-        + `variables are set: ${listed} — they can change which `
-        + 'binary is executed (PATH) or inject into it (LD_PRELOAD / NODE_OPTIONS / '
-        + 'DYLD_*), so the local sandbox must stay engaged. Remove them from the '
-        + "bot's `env` / `mojo.env`, or disable sandbox for this bot";
-    }
-    return 'backend "mojo" only bypasses the local sandbox when it runs fully '
-      + 'remotely; set mojo.cloud=true (and leave mojo.localDaemon off) to keep '
-      + 'execution off this host, or disable sandbox for this bot';
+    // Explanation comes from the shared helper, NOT from a copy local to this gate:
+    // the mandatory device-isolation path refuses the same sessions and used to
+    // give different (and, for an env blocker, unusable) advice. See
+    // mojoRemoteProofFailureReason.
+    return 'backend "mojo" cannot prove it runs nothing locally, so the local '
+      + `sandbox must stay engaged: ${mojoRemoteProofFailureReason(opts.mojoConfig)} `
+      + 'Otherwise disable sandbox for this bot';
   }
   return `backend "${opts.backendType}" does not support file/read isolation; `
     + 'use tmux/pty or disable sandbox for this bot';

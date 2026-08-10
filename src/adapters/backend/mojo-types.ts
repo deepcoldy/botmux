@@ -514,6 +514,80 @@ export function isMojoFullyRemote(
     return true;
 }
 
+/** The proof inputs, shared by isMojoFullyRemote and its explanation helper. */
+export type MojoRemoteProofInput = {
+    cloud?: boolean;
+    localDaemon?: boolean;
+    wrapperCli?: string;
+    jwtEnv?: string;
+    env?: Record<string, string>;
+};
+
+/**
+ * WHY this config cannot prove it runs nothing locally — one actionable
+ * explanation, or `undefined` when the proof holds.
+ *
+ * Shared deliberately. There are two independent places that refuse a
+ * not-provably-remote mojo session — the OPTIONAL sandbox gate
+ * (backendSandboxCompatibilityError) and the MANDATORY device-credential
+ * isolation path (which rewrites spawnBin, so MojoBackend.spawn refuses the
+ * wrapper it never asked for) — and they used to explain it differently. The
+ * device path told operators to "run fully remote (cloud on, localDaemon off)"
+ * even when cloud was already on and the real blocker was an env key, which is
+ * advice that cannot be acted on. Both now read from this one function.
+ *
+ * Returns key NAMES only, never values: these strings reach logs and chat, and
+ * one of the keys is by definition the operator's credential variable.
+ *
+ * Ordering mirrors isMojoFullyRemote so the two can never disagree about whether
+ * there is a problem — only about how much detail to print.
+ */
+export function mojoRemoteProofFailureReason(cfg?: MojoRemoteProofInput): string | undefined {
+    if (cfg?.cloud !== true) {
+        return 'mojo.cloud is not enabled, so tools run on this host — '
+            + 'set mojo.cloud=true (and leave mojo.localDaemon off).';
+    }
+    if (cfg.localDaemon === true) {
+        return 'mojo.localDaemon is on, which deliberately runs tools on this host — '
+            + 'turn it off to keep execution remote.';
+    }
+    const wrapper = cfg.wrapperCli?.trim();
+    if (wrapper) {
+        return 'a launch prefix (wrapperCli) runs before the binary and can rewrite the '
+            + 'environment the decision depends on, so it voids the proof.';
+    }
+    const unprovable = mojoUnprovableEnvKeys(cfg);
+    if (unprovable.length === 0) return undefined;
+
+    const listed = unprovable.join(', ');
+    const dangerous = 'they can change which binary is executed (PATH) or inject into it '
+        + '(LD_PRELOAD / NODE_OPTIONS / DYLD_*)';
+    // A custom `jwtEnv` key is not dangerous in itself, so the generic wording reads
+    // as a false accusation against a JWT variable. Explain the real rule and give
+    // the two migrations that keep the credential working AND the session provable.
+    const credentialKey = cfg.jwtEnv?.trim();
+    const hitsCredential = !!credentialKey
+        && credentialKey !== MOJO_CANONICAL_JWT_ENV_KEY
+        && unprovable.includes(credentialKey);
+    if (!hitsCredential) {
+        return `the bot's \`env\` / \`mojo.env\` sets ${listed} — ${dangerous}.`;
+    }
+    const rest = unprovable.filter(k => k !== credentialKey);
+    const credentialAdvice =
+        `\`${credentialKey}\` holds this bot's credential, but the proof exempts only `
+        + `\`${MOJO_CANONICAL_JWT_ENV_KEY}\` — a config-supplied name cannot be told apart `
+        + 'from one that redirects execution. Set `mojo.jwt` instead, or move that '
+        + "variable to the daemon's own environment (neither is a proof input).";
+    if (rest.length === 0) {
+        return `the bot's \`env\` / \`mojo.env\` sets ${listed}. ${credentialAdvice}`;
+    }
+    // Mixed case: migrating the credential alone would NOT make this provable, and a
+    // message that implies otherwise sends the operator round the loop a second time.
+    return `the bot's \`env\` / \`mojo.env\` sets ${listed}. ${credentialAdvice} `
+        + `Migrating the credential is not sufficient on its own: ${rest.join(', ')} `
+        + `must be removed as well — ${dangerous}.`;
+}
+
 /**
  * The ONLY setting that may change on a live session: the JWT.
  *

@@ -56,6 +56,7 @@ import type { SessionBackend, SpawnOpts } from './types.js';
 import {
     buildEffectiveChildEnv,
     findReservedMojoCliFlags,
+    mojoRemoteProofFailureReason,
     MOJO_CANONICAL_JWT_ENV_KEY,
     MOJO_CONTROL_ENV_KEYS,
 } from './mojo-types.js';
@@ -216,12 +217,21 @@ export class MojoBackend implements SessionBackend {
         // backend cannot tell which confinement it was handed, and guessing is
         // what caused the silent downgrade.
         if (bin && !this.config.wrapperCli) {
+            // Say WHY this session is not provably remote, from the shared helper.
+            // The old text always advised "run fully remote (cloud on, localDaemon
+            // off)" — useless for the common case where cloud is already on and the
+            // blocker is an env key, which is exactly the state that sends a session
+            // down this path in the first place.
+            const proofGap = mojoRemoteProofFailureReason(this.config);
             throw new Error(
                 `[mojo] refusing to launch session ${this.sessionId}: unexpected launch wrapper `
                 + `"${bin}" was supplied but no wrapperCli is configured. The mojo backend `
-                + 'invokes the CLI per turn and cannot carry an unknown confinement wrapper; '
-                + 'run this bot fully remote (cloud on, localDaemon off) so the credential '
-                + 'boundary is satisfied remotely, or configure wrapperCli explicitly.',
+                + 'invokes the CLI per turn and cannot carry an unknown confinement wrapper. '
+                + (proofGap
+                    ? `This session is not provably remote, which is what engaged the wrapper: ${proofGap} `
+                    + 'Resolve that so the credential boundary is satisfied remotely, or '
+                    + 'configure wrapperCli explicitly.'
+                    : 'Configure wrapperCli explicitly if this bot needs a launch prefix.'),
             );
         }
         // Generic extra args come from the config: the worker deliberately keeps

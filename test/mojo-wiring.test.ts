@@ -22,9 +22,11 @@ import { createCliAdapterSync, rawCliExecutable } from '../src/adapters/cli/regi
 import { isMojoFullyRemote, localSandboxApplies } from '../src/adapters/backend/sandbox.js';
 import {
   buildEffectiveMojoConfig,
+  mojoRemoteProofFailureReason,
   mojoUnprovableEnvKeys,
   pickMojoLivePatch,
 } from '../src/adapters/backend/mojo-types.js';
+import { MojoBackend } from '../src/adapters/backend/mojo-backend.js';
 import { backendSandboxCompatibilityError } from '../src/adapters/backend/session-backend-selector.js';
 import { buildReproduceCommand } from '../src/adapters/backend/reproduce-command.js';
 import {
@@ -253,6 +255,63 @@ describe('mojo backend bypasses local-only machinery', () => {
     expect(reason).toContain('PATH');
     // Not the generic cloud advice, which would be actively misleading here.
     expect(reason).not.toContain('set mojo.cloud=true');
+  });
+
+  it('the failure reason agrees with the proof, and never leaks a value', () => {
+    // The gate and the device-isolation refusal both branch on isMojoFullyRemote but
+    // PRINT this helper, so a disagreement would produce "refused" with no reason or
+    // "reason" with no refusal.
+    const cases: Parameters<typeof mojoRemoteProofFailureReason>[0][] = [
+      undefined, {}, { cloud: true }, { cloud: false }, { cloud: true, localDaemon: true },
+      { cloud: true, wrapperCli: 'env X=1 mojo' },
+      { cloud: true, env: { PATH: '/tmp/evil' } },
+      { cloud: true, jwtEnv: 'MY_JWT', env: { MY_JWT: 'sup3rsecret' } },
+      { cloud: true, env: { X_JWT_TOKEN: 'sup3rsecret' } },
+    ];
+    for (const cfg of cases) {
+      const reason = mojoRemoteProofFailureReason(cfg);
+      expect(reason === undefined, JSON.stringify(cfg)).toBe(isMojoFullyRemote(cfg));
+      // Key names are fine; the credential VALUE must never reach a log or a card.
+      if (reason) expect(reason).not.toContain('sup3rsecret');
+    }
+  });
+
+  it('does not let a credential migration look sufficient when other keys remain', () => {
+    // Mixed case: fixing only the JWT still leaves the session unprovable, so a
+    // message that stops at the credential sends the operator round the loop twice.
+    const reason = mojoRemoteProofFailureReason({
+      cloud: true, jwtEnv: 'MY_JWT', env: { MY_JWT: 'tok', LD_PRELOAD: '/tmp/x.so' },
+    });
+    expect(reason).toContain('MY_JWT');
+    expect(reason).toContain('LD_PRELOAD');
+    expect(reason).toMatch(/not sufficient on its own/);
+  });
+
+  it('the mandatory device-isolation refusal explains the real blocker', () => {
+    // This path is reached with sandbox NOT requested: device isolation rewrites
+    // spawnBin, and MojoBackend refuses the wrapper it never asked for. It used to
+    // advise "run fully remote (cloud on, localDaemon off)" — advice that cannot be
+    // acted on, because cloud is already on and the blocker is an env key.
+    const backend = new MojoBackend(
+      { cloud: true, jwtEnv: 'MY_JWT', env: { MY_JWT: 'tok' } } as never,
+      'sid-device-iso',
+    );
+    let message = '';
+    try {
+      backend.spawn('/usr/bin/bwrap', ['--dev-bind', '/', '/'], {} as never);
+    } catch (err) {
+      message = err instanceof Error ? err.message : String(err);
+    }
+    expect(message).toContain('unexpected launch wrapper');
+    expect(message).toContain('MY_JWT');
+    expect(message).toContain('mojo.jwt');
+    // The advice that used to be printed here is already satisfied, so it must not
+    // be what the operator is told to do.
+    expect(message).not.toMatch(/run this bot fully remote \(cloud on/);
+    // This path is NOT about the optional sandbox toggle — offering to disable it
+    // would be wrong advice for a MANDATORY boundary.
+    expect(message).not.toContain('disable sandbox');
+    expect(message).not.toContain('tok');
   });
 
   it('gives a credential key its own migration advice, not "this redirects execution"', () => {
