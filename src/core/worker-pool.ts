@@ -1368,6 +1368,7 @@ export async function postTurnStartingCard(
   turnId: string,
 ): Promise<boolean> {
   if (!ds.streamCardPending || ds.streamCardPendingTurnId !== turnId) return false;
+  if (riffRetirementAdmissionPhase(ds)) return false;
   if (ds.streamCardId === CARD_POSTING_SENTINEL) return false;
   if (ds.session.vcMeetingReceiver || streamingCardDisabled(ds, turnId)) return false;
   if (!workerHasInitialized(ds)) return false;
@@ -1412,7 +1413,7 @@ export async function postTurnStartingCard(
 
   ds.streamCardNonce = nonce;
   ds.streamCardId = CARD_POSTING_SENTINEL;
-  const stillOwnsPost = (): boolean =>
+  const ownsPostIdentity = (): boolean =>
     ds.session === sessionAtPost
     && ds.session.status === 'active'
     && ds.larkAppId === larkAppIdAtPost
@@ -1421,12 +1422,22 @@ export async function postTurnStartingCard(
     && ds.streamCardId === CARD_POSTING_SENTINEL
     && ds.streamCardNonce === nonce
     && (!activeSessionsRegistry || activeSessionsRegistry.get(registryKeyAtPost) === ds);
+  const stillOwnsPost = (): boolean =>
+    ownsPostIdentity() && riffRetirementAdmissionPhase(ds) === null;
+  const restorePrePostIdentityForRetirement = (): boolean => {
+    if (riffRetirementAdmissionPhase(ds) === null || !ownsPostIdentity()) return false;
+    ds.streamCardId = previousCardId;
+    ds.streamCardNonce = previousNonce;
+    persistStreamCardState(ds);
+    return true;
+  };
   try {
     const messageId = await sessionReply(
       anchorAtPost, cardJson, 'interactive', larkAppIdAtPost, turnId,
     );
     if (!stillOwnsPost()) {
       void deleteMessage(larkAppIdAtPost, messageId).catch(() => { /* best-effort stale-card cleanup */ });
+      restorePrePostIdentityForRetirement();
       logger.info(`[${tag(ds)}] Discarded stale starting card for turn ${turnId.substring(0, 12)}`);
       return false;
     }
@@ -1451,6 +1462,7 @@ export async function postTurnStartingCard(
     return true;
   } catch (err) {
     if (!stillOwnsPost()) {
+      restorePrePostIdentityForRetirement();
       logger.info(`[${tag(ds)}] Ignored stale starting-card failure for turn ${turnId.substring(0, 12)}`);
       return false;
     }
