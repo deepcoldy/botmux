@@ -14,7 +14,7 @@ import * as scheduler from './scheduler.js';
 import { scanProjects, scanMultipleProjects, describeProjectDir } from '../services/project-scanner.js';
 import { createRepoWorktree, pushWorktreeBranch } from '../services/git-worktree.js';
 import { worktreeSlugFromContextAI } from '../services/worktree-slug-ai.js';
-import { resolvePairedSpawnBackendType } from './persistent-backend.js';
+import { isRiffBackendSession, resolvePairedSpawnBackendType } from './persistent-backend.js';
 import { buildRepoSelectCard, buildAdoptSelectCard, buildCodexAppThreadSelectCard, buildSlashListCard, getCliDisplayName, buildConfigCard, buildForkPanelCard, buildAdoptBlockedCard } from '../im/lark/card-builder.js';
 import { handleDashboardCommand } from './dashboard-command/index.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
@@ -25,7 +25,7 @@ import { chatAppLink, threadAppLink, normalizeBrand } from '../im/lark/lark-host
 import { claimPairing } from '../services/pairing-store.js';
 import { logger } from '../utils/logger.js';
 import { scheduleTimeZone } from '../utils/timezone.js';
-import { closeSession, killWorker, teardownAuthoritativePersistentBackingBeforeClose, suspendWorker, forkWorker, forkAdoptWorker, adoptSandboxBlocked, getCurrentCliVersion, postFreshStreamingCard, postPrivateSnapshotCard, resolvePrivateCardAudience, deliverEphemeralOrReply, deliverWritableTerminalCardTo, requestSessionRestart, isSessionTransferring } from './worker-pool.js';
+import { killWorker, teardownAuthoritativePersistentBackingBeforeClose, suspendWorker, forkWorker, forkAdoptWorker, adoptSandboxBlocked, getCurrentCliVersion, postFreshStreamingCard, postPrivateSnapshotCard, resolvePrivateCardAudience, deliverEphemeralOrReply, deliverWritableTerminalCardTo, closeSession as closeWorkerPoolSession, withActiveSessionKeyLock, requestSessionRestart, isSessionTransferring } from './worker-pool.js';
 import {
   expandHome,
   getSessionWorkingDir,
@@ -68,7 +68,7 @@ import {
 import { resolveCliId, findInvalidAllowedUserEntries } from '../setup/bot-config-editor.js';
 import { buildClosedSessionCard } from './closed-session-card.js';
 import { ttadkConfigModelChoices } from '../setup/cli-selection.js';
-import { publishAttentionPatch, publishClosedSessionPatch, announcePendingRepoSession } from './session-activity.js';
+import { publishAttentionPatch, announcePendingRepoSession } from './session-activity.js';
 import { setCardMode } from '../services/card-mode-store.js';
 import { canOperate } from '../im/lark/event-dispatcher.js';
 import { buildSafeInsightReport } from '../services/insight/report.js';
@@ -86,15 +86,17 @@ import {
   readRoleProfileEntry,
   writeRoleProfileEntry,
 } from '../services/role-profile-store.js';
-import type { LarkMessage, DaemonToWorker } from '../types.js';
+import type { LarkMessage, DaemonToWorker, CodexAppTurnInput } from '../types.js';
 import type { ResolvedSender } from '../im/lark/identity-cache.js';
-import { sessionKey, sessionAnchorId, markRepoCardConsumed, claimCurrentRepoCard } from './types.js';
+import { activeSessionKey, sessionKey, sessionAnchorId, markRepoCardConsumed, claimCurrentRepoCard } from './types.js';
 import type { DaemonSession } from './types.js';
 import { t, localeForBot, type Locale } from '../i18n/index.js';
 import { runSkillsImCommand } from './skills/im-command.js';
 import { fetchDaemonIpc } from './daemon-ipc-auth.js';
 import { updateSessionTitle } from './session-title.js';
 import { requestAgentSessionRename } from './session-rename.js';
+import { hasProtectedSessionMutationOwnership } from './session-mutation-guard.js';
+import { withBotTurnMutation } from './bot-turn-mutation-gate.js';
 import {
   configuredRuntimeDisplayName,
   sessionConfiguredRuntimeDisplayName,
@@ -277,8 +279,9 @@ export function resolveRepoSelection(
  *   must NOT match, otherwise we'd false-trigger on common /-prefixed words.
  * - tolerates leading whitespace (mention-stripping can leave a space).
  * - prompt is whatever follows the prefix (verbatim, including newlines).
- * - `/t` alone (no args) is allowed → empty prompt; the user can fill it in
- *   while the repo selection card is still pending.
+ * - `/t` alone (no args) is allowed → empty prompt; the daemon treats it as
+ *   topic setup, choosing either a repository picker or a visible thread that
+ *   waits for the first real task according to the bot's cwd configuration.
  *
  * Returns null for anything else, so callers can fall through to the regular
  * `parseSlashCommandInvocation` / message-handling path.
@@ -1288,30 +1291,51 @@ export async function handleCommand(
     switch (cmd) {
       case '/close': {
         if (ds) {
-          // Capture the closed-session card BEFORE killWorker/closeSession —
-          // it reads the live session's identity off `ds`.
-          const card = buildClosedSessionCard(ds, loc);
-          const activeKey = sessionKey(rootId, larkAppId!);
-          try {
-            await closeSession(ds.session.sessionId);
-          } catch (err) {
-            logger.error(`[${logTag}] Refused /close because backing teardown was not verified: ${err}`);
+          const targetSessionId = ds.session.sessionId;
+          const closed = await withBotTurnMutation(ds.larkAppId, async () => {
+            // Re-resolve the exact session after all peer admissions drain. A
+            // relay may have moved it to another key while this command was
+            // admitted; closeSession removes its current identity, never the
+            // stale root key from this message.
+            const current = [...activeSessions.values()].find(
+              candidate => candidate.session.sessionId === targetSessionId,
+            );
+            if (!current) return undefined;
+            // Capture the closed-session card BEFORE closeWorkerPoolSession —
+            // it reads the live session's identity off `current`.
+            const card = buildClosedSessionCard(current, localeForBot(current.larkAppId));
+            try {
+              // closeWorkerPoolSession proves fail-closed backing teardown
+              // before mutating any registry/store state, throwing when it
+              // cannot verify it. Surface that so the active record is kept
+              // for retry instead of being silently dropped.
+              await closeWorkerPoolSession(targetSessionId);
+            } catch (err) {
+              return { status: 'teardown_failed' as const, err };
+            }
+            return { status: 'closed' as const, current, card };
+          });
+          if (!closed) {
+            await sessionReply(rootId, t('cmd.no_active_session', undefined, loc));
+            break;
+          }
+          if (closed.status === 'teardown_failed') {
+            logger.error(`[${logTag}] Refused /close because backing teardown was not verified: ${closed.err}`);
             await sessionReply(
               rootId,
-              `⚠️ 会话关闭失败，已保留 active 记录以便重试：${err instanceof Error ? err.message : String(err)}`,
+              `⚠️ 会话关闭失败，已保留 active 记录以便重试：${closed.err instanceof Error ? closed.err.message : String(closed.err)}`,
             );
             break;
           }
-          if (activeSessions.get(activeKey) === ds) activeSessions.delete(activeKey);
           // 「会话已关闭」卡片优先「仅自己可见」：普通群里走 ephemeral 只发给执行
           // /close 的本人；话题群不支持 ephemeral(18053) 时回退为正常的群内可见回复
           // ——与流式卡片上「关闭会话」按钮的送达方式保持一致。
           await deliverEphemeralOrReply(
-            ds,
+            closed.current,
             message.senderId,
-            card,
+            closed.card,
             'interactive',
-            () => sessionReply(rootId, card, 'interactive'),
+            () => sessionReply(rootId, closed.card, 'interactive'),
           );
           logger.info(`[${logTag}] Session closed by /close command`);
         } else {
@@ -1359,13 +1383,18 @@ export async function handleCommand(
           break;
         }
         const closedSessionId = ds.session.sessionId;
-        killWorker(ds);
-        sessionStore.closeSession(closedSessionId);
-        publishClosedSessionPatch(
-          closedSessionId,
-          ds.session.closedAt ? Date.parse(ds.session.closedAt) : undefined,
-        );
-        activeSessions.delete(sessionKey(rootId, larkAppId!));
+        const detached = await withBotTurnMutation(ds.larkAppId, async () => {
+          const current = [...activeSessions.values()].find(
+            candidate => candidate.session.sessionId === closedSessionId,
+          );
+          if (!current || !current.adoptedFrom) return false;
+          await closeWorkerPoolSession(closedSessionId);
+          return true;
+        });
+        if (!detached) {
+          await sessionReply(rootId, t('cmd.no_active_session', undefined, loc));
+          break;
+        }
         await sessionReply(rootId, t('cmd.detach.success', undefined, loc));
         logger.info(`[${logTag}] Detached (adopt) by ${cmd} command`);
         break;
@@ -1375,6 +1404,22 @@ export async function handleCommand(
         if (ds) {
           if (ds.adoptedFrom) {
             await sessionReply(rootId, t('card.action.adopt_no_restart', undefined, loc));
+            break;
+          }
+          if (isRiffBackendSession(ds)) {
+            logger.info(`[${logTag}] Rejected /restart for Riff backend session`);
+            await sessionReply(rootId, t('cmd.restart.riff_unsupported', undefined, loc));
+            break;
+          }
+          // Codex App: an accepted-but-unsettled dispatch still owns the turn
+          // route. requestSessionRestart does not itself gate on dispatch
+          // ownership, so reject here before the coordinator tears the worker
+          // down (mirrors the card-handler restart path).
+          if (hasProtectedSessionMutationOwnership(ds)) {
+            await sessionReply(
+              rootId,
+              '当前 Codex App 仍有未结算消息，暂不能重启；请等待本轮完成或关闭会话。',
+            );
             break;
           }
           if (isSessionTransferring(ds)) {
@@ -1409,21 +1454,61 @@ export async function handleCommand(
           await sessionReply(rootId, t('cmd.session.transfer_in_progress', undefined, loc));
           break;
         }
+        // A live Riff worker owns a remote task rooted in its original cwd.
+        // killWorker/restart deliberately refuse to replace that generation,
+        // so persisting a new cwd here would report success while the remote
+        // task keeps running in the old directory.
+        if (isRiffBackendSession(ds)) {
+          await sessionReply(rootId, t('cmd.cd.riff_unsupported', undefined, loc));
+          break;
+        }
+        // Cheap preflight avoids creating a requested directory when the
+        // current FIFO already makes the switch impossible.  The mutation
+        // below repeats this check after draining peer admissions.
+        if (hasProtectedSessionMutationOwnership(ds)) {
+          await sessionReply(
+            rootId,
+            '当前 Codex App 仍有未结算消息，暂不能切换工作目录；请等待本轮完成或关闭会话。',
+          );
+          break;
+        }
         const validation = validateWorkingDir(targetPath, loc, { autoCreate: true });
         if (!validation.ok) {
           await sessionReply(rootId, validation.error);
           break;
         }
         const resolvedPath = validation.resolvedPath;
-        // Persistent backends can cold-resume without treating a cwd switch as
-        // a real session close. This also preserves a sandbox upper long enough
-        // for the next worker to relocate Claude's cwd-scoped transcript.
-        // Adopted sessions are observers of a user-owned CLI and keep the old
-        // detach/kill behavior; PTY falls back to killWorker, while its normal
-        // on-disk transcript remains available for the resume-sync preflight.
-        const suspended = !ds.adoptedFrom && suspendWorker(ds, 'working_dir_changed');
-        if (!suspended) killWorker(ds);
-        repinSessionWorkingDir(ds, resolvedPath);
+        const targetSessionId = ds.session.sessionId;
+        const switched = await withBotTurnMutation(ds.larkAppId, async () => {
+          const current = [...activeSessions.values()].find(
+            candidate => candidate.session.sessionId === targetSessionId
+              && candidate.session.status === 'active',
+          );
+          if (!current) return 'gone' as const;
+          if (hasProtectedSessionMutationOwnership(current)) {
+            return 'pending' as const;
+          }
+          const suspended = !current.adoptedFrom
+            && suspendWorker(current, 'working_dir_changed');
+          if (!suspended) killWorker(current);
+          repinSessionWorkingDir(current, resolvedPath);
+          // cwd 变了，riff 多仓 stamp（选择卡多选时写入）随之失效——保留会让下次
+          // refork 仍按旧仓库组合推导、无视新目录。
+          current.session.riffRepoDirs = undefined;
+          sessionStore.updateSession(current.session);
+          return 'switched' as const;
+        });
+        if (switched === 'pending') {
+          await sessionReply(
+            rootId,
+            '当前 Codex App 仍有未结算消息，暂不能切换工作目录；请等待本轮完成或关闭会话。',
+          );
+          break;
+        }
+        if (switched === 'gone') {
+          await sessionReply(rootId, t('cmd.no_active_session', undefined, loc));
+          break;
+        }
         if (validation.created) {
           await sessionReply(rootId, t('cmd.cd.created_switched', { path: resolvedPath }, loc));
         } else {
@@ -1464,156 +1549,173 @@ export async function handleCommand(
         break;
       }
       case '/repo': {
+        // A live Riff generation must finish the explicit /close protocol before
+        // its anchor can be reused.  The generic repo-switch path closes and
+        // immediately reforks; if remote cancellation fails, that would fall
+        // through to the double-fork kill and orphan the remote task.
+        if (ds && !ds.pendingRepo && isRiffBackendSession(ds)) {
+          await sessionReply(rootId, t('cmd.cd.riff_unsupported', undefined, loc));
+          logger.warn(`[${logTag}] Repo switch refused: Riff session requires explicit close before replacement`);
+          break;
+        }
         const repoArg = message.content.replace(/^\/repo\s*/, '').trim();
+        if (ds && !ds.pendingRepo
+          && hasProtectedSessionMutationOwnership(ds)) {
+          await sessionReply(
+            rootId,
+            '当前 Codex App 仍有未结算消息，暂不能切换仓库；请等待本轮完成或关闭会话。',
+          );
+          break;
+        }
 
         // First-spawn fork: consume the buffered prompt/attachments and start the
         // CLI in whatever workingDir is currently set on the session. Shared by
         // `commitRepoSelection` (a repo was named) and the bare-`/repo` launch
         // (use the default workingDir) — both only run while `pendingRepo`.
-        const forkPendingCli = async (replyText: string, claimAlready = false): Promise<boolean> => {
-          if (!claimAlready) {
-            if (ds!.pendingRepoCommitInFlight) {
-              await sessionReply(rootId, t('cmd.repo.worktree_in_progress', undefined, loc));
-              return false;
+        const forkPendingCli = async (
+          replyText: string,
+          selection?: { path: string; riffRepoDirs?: string[] },
+        ) => {
+          const targetSessionId = ds!.session.sessionId;
+          const started = await withBotTurnMutation(ds!.larkAppId, async () => {
+            const current = [...activeSessions.values()].find(
+              candidate => candidate.session.sessionId === targetSessionId
+                && candidate.session.status === 'active',
+            );
+            if (!current || current !== ds || !current.pendingRepo) return false;
+            if (selection) {
+              current.workingDir = selection.path;
+              current.session.workingDir = selection.path;
+              current.session.riffRepoDirs = selection.riffRepoDirs;
+              sessionStore.updateSession(current.session);
             }
-            ds!.pendingRepoCommitInFlight = true;
-          }
-          const selfBot = getBot(ds!.larkAppId);
-          const botCfg = selfBot.config;
-          const commitGenSessionId = ds!.session.sessionId;
-          let committed = false;
-          try {
-            // Keep pendingRepo=true while prompt context is awaited. Incoming
-            // messages stay in the same buffer and card selections see the
-            // shared in-flight claim instead of treating this as a repo switch.
-            const initiallyBuffered =
-              (ds!.pendingPrompt?.trim().length ?? 0) > 0 ||
-              (ds!.pendingAttachments?.length ?? 0) > 0 ||
-              (ds!.pendingFollowUps?.length ?? 0) > 0 ||
-              ds!.pendingChatContext !== undefined;
-            const availableBots = initiallyBuffered
-              ? await getAvailableBots(ds!.larkAppId, ds!.chatId)
-              : [];
-            const stillActive = activeSessions.get(sessionKey(rootId, larkAppId!)) === ds;
-            if (!stillActive || ds!.session.sessionId !== commitGenSessionId ||
-                !ds!.pendingRepo || (ds!.worker && !ds!.worker.killed)) {
-              logger.warn(`[${logTag}] Session changed while preparing the pending CLI (${commitGenSessionId} → ${ds!.session.sessionId}, active=${stillActive}, pending=${!!ds!.pendingRepo}, worker=${!!ds!.worker})`);
-              return false;
+            const selfBot = getBot(current.larkAppId);
+            const botCfg = selfBot.config;
+            const pendingPrompt = current.pendingPrompt ?? '';
+            const pendingRawInput = current.pendingRawInput;
+            const hasBufferedInput = pendingPrompt.trim().length > 0
+              || current.pendingCodexAppText !== undefined
+              || (current.pendingAttachments?.length ?? 0) > 0
+              || (current.pendingFollowUps?.length ?? 0) > 0
+              || current.pendingChatContext !== undefined;
+            let wrappedInput: { content: string; codexAppInput?: CodexAppTurnInput } | undefined;
+            if (hasBufferedInput) {
+              const { buildNewTopicCliInput: buildInput, ensureSessionWhiteboard, getAvailableBots } = await import('./session-manager.js');
+              ensureSessionWhiteboard(current);
+              const availableBots = await getAvailableBots(current.larkAppId, current.chatId);
+              // Detached lifecycle work can still close/replace while the
+              // roster lookup awaits.  Never fork the captured generation.
+              if (current.session.status !== 'active'
+                || [...activeSessions.values()].find(candidate => candidate.session.sessionId === targetSessionId) !== current
+                || !current.pendingRepo) return false;
+              wrappedInput = buildInput(
+                pendingPrompt,
+                current.session.sessionId,
+                current.session.cliId ?? botCfg.cliId,
+                current.session.cliPathOverride ?? botCfg.cliPathOverride,
+                current.pendingAttachments,
+                current.pendingMentions,
+                availableBots,
+                current.pendingFollowUps,
+                { name: selfBot.botName, openId: selfBot.botOpenId },
+                loc,
+                current.pendingSender,
+                {
+                  larkAppId,
+                  chatId: current.chatId,
+                  whiteboardId: current.session.whiteboardId,
+                  substituteTrigger: current.pendingSubstituteTrigger,
+                  codexAppText: current.pendingCodexAppText,
+                  codexAppApplicationContext: current.pendingCodexAppApplicationContext,
+                  codexAppMessageContext: current.pendingCodexAppMessageContext,
+                  codexAppFollowUps: current.pendingCodexAppFollowUps,
+                  codexAppFollowUpContexts: current.pendingCodexAppFollowUpContexts,
+                  chatContext: current.pendingChatContext,
+                },
+              );
             }
-
-            const pendingPrompt = ds!.pendingPrompt ?? '';
-            const pendingRawInput = ds!.pendingRawInput;
-            const hasBufferedInput =
-              pendingPrompt.trim().length > 0 ||
-              (ds!.pendingAttachments?.length ?? 0) > 0 ||
-              (ds!.pendingFollowUps?.length ?? 0) > 0 ||
-              ds!.pendingChatContext !== undefined;
-            // Nothing to submit at all (bare `/repo`: the message IS the command).
-            // The CLI boots idle, so the user's NEXT real message is its first
-            // turn and must carry the full new-topic opening — see
-            // markInitialUserTurnPending below.
-            const emptyStart = !pendingRawInput && !hasBufferedInput;
-            if (hasBufferedInput) ensureSessionWhiteboard(ds!);
-            const wrappedInput = hasBufferedInput
-              ? buildNewTopicCliInput(
-                  pendingPrompt,
-                  ds!.session.sessionId,
-                  ds!.session.cliId ?? botCfg.cliId,
-                  ds!.session.cliPathOverride ?? botCfg.cliPathOverride,
-                  ds!.pendingAttachments,
-                  ds!.pendingMentions,
-                  availableBots,
-                  ds!.pendingFollowUps,
-                  { name: selfBot.botName, openId: selfBot.botOpenId },
-                  loc,
-                  ds!.pendingSender,
-                  {
-                    larkAppId,
-                    chatId: ds!.chatId,
-                    whiteboardId: ds!.session.whiteboardId,
-                    substituteTrigger: ds!.pendingSubstituteTrigger,
-                    codexAppText: ds!.pendingCodexAppText,
-                    codexAppApplicationContext: ds!.pendingCodexAppApplicationContext,
-                    codexAppMessageContext: ds!.pendingCodexAppMessageContext,
-                    codexAppFollowUps: ds!.pendingCodexAppFollowUps,
-                    codexAppFollowUpContexts: ds!.pendingCodexAppFollowUpContexts,
-                    chatContext: ds!.pendingChatContext,
-                  },
-                )
-              : { content: '' };
-            const pendingTurnId = ds!.pendingTurnId;
-            const previousPendingFollowUpInput = ds!.pendingFollowUpInput;
-            if (pendingRawInput && hasBufferedInput) {
-              ds!.pendingFollowUpInput = {
-                userPrompt: ds!.pendingCodexAppText !== undefined || ds!.pendingCodexAppFollowUps
-                  ? [ds!.pendingCodexAppText ?? '', ...(ds!.pendingCodexAppFollowUps ?? [])].filter(Boolean).join('\n\n')
-                  : pendingPrompt || ds!.pendingFollowUps?.join('\n\n') || '',
+            if (pendingRawInput && hasBufferedInput && wrappedInput) {
+              current.pendingFollowUpInput = {
+                userPrompt: current.pendingCodexAppText !== undefined || current.pendingCodexAppFollowUps
+                  ? [current.pendingCodexAppText ?? '', ...(current.pendingCodexAppFollowUps ?? [])].filter(Boolean).join('\n\n')
+                  : pendingPrompt || current.pendingFollowUps?.join('\n\n') || '',
                 cliInput: wrappedInput.content,
-                ...(ds!.pendingFollowUpTurnId ? { turnId: ds!.pendingFollowUpTurnId } : {}),
-                ...((ds!.session.cliId ?? botCfg.cliId) === 'codex-app' && botCfg.codexAppCleanInput === true && wrappedInput.codexAppInput
+                ...((current.pendingFollowUpTurnIds?.at(-1) ?? current.pendingFollowUpTurnId)
+                  ? { turnId: current.pendingFollowUpTurnIds?.at(-1) ?? current.pendingFollowUpTurnId }
+                  : {}),
+                ...((current.session.cliId ?? botCfg.cliId) === 'codex-app' && botCfg.codexAppCleanInput === true && wrappedInput.codexAppInput
                   ? { codexAppInput: wrappedInput.codexAppInput }
                   : {}),
                 codexAppInputGateFrozen: true,
               };
             }
+            if (pendingRawInput) rememberLastCliInput(current, pendingRawInput, pendingRawInput);
+            else if (hasBufferedInput && wrappedInput) rememberLastCliInput(current, pendingPrompt, wrappedInput);
 
-            ds!.pendingRepo = false;
-            publishAttentionPatch(ds!);
-            try {
-              if (pendingRawInput) forkWorker(ds!, '', false);
-              else if (pendingTurnId && hasBufferedInput) forkWorker(ds!, wrappedInput, { turnId: pendingTurnId });
-              else if (hasBufferedInput) forkWorker(ds!, wrappedInput);
-              else forkWorker(ds!, '', false);
-            } catch (e) {
-              ds!.pendingRepo = true;
-              ds!.pendingFollowUpInput = previousPendingFollowUpInput;
-              publishAttentionPatch(ds!);
-              throw e;
-            }
-            if (pendingRawInput || hasBufferedInput) {
-              rememberLastCliInput(ds!, pendingRawInput ?? pendingPrompt, pendingRawInput ?? wrappedInput);
-            }
-            // Durable, one-shot: the CLI is up but has never received a real user
-            // turn, so the next business message must be built as a NEW TOPIC
-            // (routing + built-in skill discovery + identity), not a follow-up.
-            // Set after the fork so a throwing fork leaves the session untouched.
-            if (emptyStart) markInitialUserTurnPending(ds!);
-            ds!.pendingPrompt = undefined;
-            ds!.pendingCodexAppText = undefined;
-            ds!.pendingCodexAppApplicationContext = undefined;
-            ds!.pendingCodexAppMessageContext = undefined;
-            ds!.pendingChatContext = undefined;
-            ds!.pendingAttachments = undefined;
-            ds!.pendingMentions = undefined;
-            ds!.pendingSubstituteTrigger = undefined;
-            ds!.pendingSender = undefined;
-            ds!.pendingFollowUps = undefined;
-            ds!.pendingCodexAppFollowUps = undefined;
-            ds!.pendingCodexAppFollowUpContexts = undefined;
-            ds!.pendingFollowUpTurnId = undefined;
-            ds!.pendingTurnId = undefined;
-            committed = true;
-
-            // Local one-shot consume BEFORE network awaits. Feishu withdraw is
-            // best-effort; stale card clicks must be rejected via this mark even
-            // if sessionReply throws or deleteMessage lags/fails.
-            const cardToWithdraw = ds!.repoCardMessageId;
-            markRepoCardConsumed(ds!, cardToWithdraw);
-            ds!.repoCardMessageId = undefined;
-
-            // Hold the claim through confirmation + best-effort card withdraw.
+            // forkWorker performs the synchronous pre-accept/write-ahead work.
+            // Keep the opening reservation and every buffered field intact if
+            // that step throws, so a failed launch cannot silently consume the
+            // first user turn or expose this worker:null owner as scratch.
+            const pendingTurnId = current.pendingTurnId
+              ?? current.session.pendingRepoSetup?.turnId;
+            // Nothing to submit at all (bare `/repo`: the message IS the
+            // command). The CLI boots idle, so the user's NEXT real message is
+            // its first turn and must carry the full new-topic opening — see
+            // markInitialUserTurnPending below.
+            const emptyStart = !pendingRawInput && !hasBufferedInput;
+            forkWorker(
+              current,
+              pendingRawInput ? '' : (wrappedInput ?? ''),
+              !pendingRawInput && pendingTurnId ? { turnId: pendingTurnId } : false,
+            );
+            current.pendingRepo = false;
+            current.pendingRepoCommitInFlight = true;
+            // Queued activation ownership lasts through adapter submission.
+            // These source buffers were folded into opening N; clear them but
+            // keep the gate so later inbounds enter the exact post-ACK FIFO.
+            current.initialStartPending = current.session.queuedActivationPending === true;
+            // Durable, one-shot: an empty-started CLI has never received a real
+            // user turn, so the next business message must be built as a NEW
+            // TOPIC (routing + built-in skill discovery + identity), not a
+            // follow-up. Set after the fork so a throwing fork leaves it clean.
+            if (emptyStart) markInitialUserTurnPending(current);
+            publishAttentionPatch(current);
+            current.pendingPrompt = undefined;
+            current.pendingCodexAppText = undefined;
+            current.pendingCodexAppApplicationContext = undefined;
+            current.pendingCodexAppMessageContext = undefined;
+            current.pendingChatContext = undefined;
+            current.pendingAttachments = undefined;
+            current.pendingMentions = undefined;
+            current.pendingSubstituteTrigger = undefined;
+            current.pendingSender = undefined;
+            current.pendingFollowUps = undefined;
+            current.pendingFollowUpTurnId = undefined;
+            current.pendingFollowUpTurnIds = undefined;
+            current.pendingCodexAppFollowUps = undefined;
+            current.pendingCodexAppFollowUpContexts = undefined;
+            current.pendingCodexAppFollowUpGateAccepted = undefined;
+            current.pendingTurnId = undefined;
+            const cardToWithdraw = current.repoCardMessageId;
+            markRepoCardConsumed(current, cardToWithdraw);
+            current.repoCardMessageId = undefined;
+            return { current, cardToWithdraw };
+          });
+          if (!started) return false;
+          try {
             try {
               await sessionReply(rootId, replyText);
             } catch (e) {
               logger.warn(`[${logTag}] Confirm reply after pending repo commit failed: ${e instanceof Error ? e.message : e}`);
             }
-            if (cardToWithdraw) {
-              try { await deleteMessage(ds!.larkAppId, cardToWithdraw); } catch { /* best-effort */ }
+            if (started.cardToWithdraw) {
+              try { await deleteMessage(started.current.larkAppId, started.cardToWithdraw); }
+              catch { /* best-effort */ }
             }
           } finally {
-            ds!.pendingRepoCommitInFlight = false;
+            started.current.pendingRepoCommitInFlight = false;
           }
-          return committed;
+          return true;
         };
 
         // Shared commit path for an already-resolved repo: update the session's
@@ -1622,26 +1724,13 @@ export async function handleCommand(
         // numeric `/repo <N>` form and the `/repo <path|name>` form.
         const commitRepoSelection = async (selectedPath: string, displayName: string, how: string): Promise<boolean> => {
           if (ds!.pendingRepo) {
-            if (ds!.pendingRepoCommitInFlight) {
-              await sessionReply(rootId, t('cmd.repo.worktree_in_progress', undefined, loc));
-              return false;
-            }
-            ds!.pendingRepoCommitInFlight = true;
-            try {
-              // Claim before changing cwd so a card selection cannot overwrite
-              // this choice while the pending prompt is prepared.
-              ds!.workingDir = selectedPath;
-              ds!.session.workingDir = selectedPath;
-              ds!.session.riffRepoDirs = undefined;
-              sessionStore.updateSession(ds!.session);
-              // forkPendingCli owns claim release + confirm reply + card withdraw.
-              if (!await forkPendingCli(t('cmd.repo.selected_in_pending', { name: displayName }, loc), true)) {
-                return false;
-              }
-            } catch (e) {
-              ds!.pendingRepoCommitInFlight = false;
-              throw e;
-            }
+            // First spawn: the cwd pin and fork are one exclusive commit. Two
+            // simultaneous selections cannot make A reply while forking B's cwd.
+            const started = await forkPendingCli(
+              t('cmd.repo.selected_in_pending', { name: displayName }, loc),
+              { path: selectedPath, riffRepoDirs: undefined },
+            );
+            if (!started) return false;
           } else {
             // Safety net: a mid-session `/repo` switch closes the running
             // session and spawns a fresh one on the SAME anchor. Without a
@@ -1674,67 +1763,100 @@ export async function handleCommand(
             // card), so `claude --resume` later would reopen the old context in
             // the new repo's cwd. The new repo is pinned onto the fresh session
             // below instead.
-            const claimedCard = claimCurrentRepoCard(ds!, undefined);
-            const oldSession = ds!.session;
-            const oldSessionId = oldSession.sessionId;
-            const closedCard = buildClosedSessionCard(ds!, loc);
-            killWorker(ds!);
-            sessionStore.closeSession(ds!.session.sessionId);
-            publishClosedSessionPatch(
-              ds!.session.sessionId,
-              ds!.session.closedAt ? Date.parse(ds!.session.closedAt) : undefined,
-            );
-            await deliverEphemeralOrReply(
-              ds!,
-              message.senderId,
-              closedCard,
-              'interactive',
-              () => sessionReply(rootId, closedCard, 'interactive'),
-            );
+            const targetSessionId = ds!.session.sessionId;
+            const switched = await withBotTurnMutation(ds!.larkAppId, async () => {
+              const candidate = [...activeSessions.values()].find(
+                candidate => candidate.session.sessionId === targetSessionId,
+              );
+              if (!candidate || candidate !== ds || candidate.session.status !== 'active') {
+                return { ok: false as const, error: 'session_replaced' as const };
+              }
+              const key = activeSessionKey(candidate);
+              return withActiveSessionKeyLock(activeSessions, key, async () => {
+                // Resume/scheduler/dashboard creators use this same key lock
+                // without joining the bot admission gate. Re-resolve after the
+                // lock wait, then keep it across close -> replacement publish.
+                const current = [...activeSessions.values()].find(
+                  owner => owner.session.sessionId === targetSessionId,
+                );
+                if (!current || current !== candidate
+                  || activeSessions.get(key) !== current
+                  || current.session.status !== 'active') {
+                  return { ok: false as const, error: 'session_replaced' as const };
+                }
+                if (hasProtectedSessionMutationOwnership(current)) {
+                  return { ok: false as const, error: 'dispatch_pending' as const };
+                }
+                const closedCard = buildClosedSessionCard(current, loc);
+                const oldSession = current.session;
+                await closeWorkerPoolSession(targetSessionId);
+                // The key lock excludes every sanctioned creator. A direct
+                // lifecycle callback may still have published unexpectedly;
+                // fail closed instead of overwriting that first owner.
+                if (activeSessions.get(key) === current) activeSessions.delete(key);
+                if (activeSessions.has(key)) {
+                  return { ok: false as const, error: 'session_replaced' as const };
+                }
+                const cardToWithdraw = current.repoCardMessageId;
+                markRepoCardConsumed(current, cardToWithdraw);
+                current.repoCardMessageId = undefined;
 
-            const stillOwnsGeneration = activeSessions.get(sessionKey(rootId, larkAppId!)) === ds
-              && ds!.session === oldSession;
-            if (!stillOwnsGeneration) {
-              logger.warn(`[${logTag}] Repo switch cancelled after closing ${oldSessionId.substring(0, 8)}; routing generation changed during card delivery`);
+                const session = sessionStore.createSession(
+                  current.chatId,
+                  current.scope === 'chat' ? oldSession.rootMessageId : rootId,
+                  displayName,
+                  current.chatType,
+                  current.scope,
+                );
+                current.session = session;
+                current.lastUserPrompt = undefined;
+                current.lastCliInput = undefined;
+                current.workingDir = selectedPath;
+                session.workingDir = selectedPath;
+                session.larkAppId = current.larkAppId;
+                session.chatDisplayName = oldSession.chatDisplayName;
+                session.ownerOpenId = oldSession.ownerOpenId;
+                session.creatorOpenId = oldSession.creatorOpenId;
+                session.lastCallerOpenId = oldSession.lastCallerOpenId;
+                sessionStore.updateSession(session);
+                current.hasHistory = false;
+                activeSessions.set(key, current);
+                forkWorker(current, '', false);
+                // Brand-new CLI in a brand-new session record: it has never
+                // seen the botmux opening context either, so the next real
+                // business message is its new-topic first turn (same invariant
+                // as the pending path).
+                markInitialUserTurnPending(current);
+                return { ok: true as const, current, closedCard, cardToWithdraw };
+              });
+            });
+            if (!switched.ok) {
+              if (switched.error === 'dispatch_pending') {
+                await sessionReply(
+                  rootId,
+                  '当前 Codex App 仍有未结算消息，暂不能切换仓库；请等待本轮完成或关闭会话。',
+                );
+              } else {
+                logger.warn(`[${logTag}] Repo switch aborted because the session was replaced`);
+              }
               return false;
             }
-            // `rootId` is the routing anchor. For chat-scope sessions it is the
-            // `oc_...` chat id, not the traceable `om_...` message root stored on
-            // Session. Preserve the old identity and explicitly persist scope so
-            // repo switches cannot turn a chat session into a legacy scope-less
-            // record that the CLI later mistakes for a thread.
-            const session = sessionStore.createSession(
-              ds!.chatId,
-              ds!.scope === 'chat' ? oldSession.rootMessageId : rootId,
-              displayName,
-              ds!.chatType,
-              ds!.scope,
+            await deliverEphemeralOrReply(
+              switched.current,
+              message.senderId,
+              switched.closedCard,
+              'interactive',
+              () => sessionReply(rootId, switched.closedCard, 'interactive'),
             );
-            ds!.session = session;
-            ds!.lastUserPrompt = undefined;
-            ds!.lastCliInput = undefined;
-            ds!.workingDir = selectedPath;
-            ds!.session.workingDir = selectedPath;
-            ds!.session.larkAppId = ds!.larkAppId;
-            ds!.session.chatDisplayName = oldSession.chatDisplayName;
-            ds!.session.ownerOpenId = oldSession.ownerOpenId;
-            ds!.session.creatorOpenId = oldSession.creatorOpenId;
-            ds!.session.lastCallerOpenId = oldSession.lastCallerOpenId;
-            sessionStore.updateSession(ds!.session);
-            ds!.hasHistory = false;
-            forkWorker(ds!, '', false);
-            // Brand-new CLI in a brand-new session record: it has never seen the
-            // botmux opening context either, so the next real business message
-            // is its new-topic first turn (same invariant as the pending path).
-            markInitialUserTurnPending(ds!);
-            try {
-              await sessionReply(rootId, t('cmd.repo.switched_to', { name: displayName }, loc));
-            } catch (e) {
-              logger.warn(`[${logTag}] Confirm reply after mid-session repo switch failed: ${e instanceof Error ? e.message : e}`);
+            await sessionReply(rootId, t('cmd.repo.switched_to', { name: displayName }, loc));
+            if (switched.cardToWithdraw) {
+              try { await deleteMessage(switched.current.larkAppId, switched.cardToWithdraw); }
+              catch { /* best-effort */ }
             }
-            if (claimedCard) {
-              try { await deleteMessage(ds!.larkAppId, claimedCard); } catch { /* best-effort */ }
-            }
+          }
+          if (ds!.repoCardMessageId) {
+            deleteMessage(ds!.larkAppId, ds!.repoCardMessageId);
+            ds!.repoCardMessageId = undefined;
           }
           logger.info(`[${logTag}] Repo selected via ${how}: ${selectedPath}`);
           return true;
@@ -3913,6 +4035,24 @@ async function blockTakeoverWhilePendingRepo(
   return true;
 }
 
+/**
+ * A live Riff worker cannot be replaced through the generic adopt/import
+ * refork path: that path sends a request-less close and then kills the local
+ * worker, while Riff requires its remote task to finish the explicit
+ * prepare/commit close protocol first. Refuse before target validation or any
+ * persisted ownership mutation so the original lineage stays recoverable.
+ */
+async function blockRiffTakeover(
+  ds: DaemonSession,
+  sessionReply: (rid: string, content: string, msgType?: string) => Promise<string>,
+): Promise<boolean> {
+  if (!isRiffBackendSession(ds)) return false;
+  const loc = localeForBot(ds.larkAppId);
+  await sessionReply(sessionAnchorId(ds), t('cmd.takeover.riff_unsupported', undefined, loc));
+  logger.warn(`[${tag(ds)}] Takeover refused: Riff session requires explicit close before replacement`);
+  return true;
+}
+
 export async function startCodexAppThreadSession(
   thread: CodexAppThreadSummary,
   ds: DaemonSession,
@@ -3928,24 +4068,46 @@ export async function startCodexAppThreadSession(
     return;
   }
 
+  if (await blockRiffTakeover(ds, sessionReply)) return;
   if (await blockTakeoverWhilePendingRepo(ds, sessionReply)) return;
 
-  ds.adoptedFrom = undefined;
-  ds.workingDir = thread.cwd;
-  ds.hasHistory = true;
-  ds.currentTurnTitle = undefined;
-  ds.lastScreenContent = undefined;
-  ds.lastScreenStatus = undefined;
-
-  ds.session.workingDir = thread.cwd;
-  ds.session.title = `Codex App: ${title}`;
-  ds.session.cliId = 'codex-app';
-  ds.session.cliSessionId = thread.threadId;
-  ds.session.adoptedFrom = undefined;
-  sessionStore.updateSession(ds.session);
-
-  forkWorker(ds, '', true);
-  await sessionReply(sessionAnchorId(ds), t('cmd.codex_app_adopt.success', { title }, loc));
+  const targetSessionId = ds.session.sessionId;
+  const switched = await withBotTurnMutation(ds.larkAppId, async () => {
+    const current = [...deps.activeSessions.values()].find(
+      candidate => candidate.session.sessionId === targetSessionId
+        && candidate.session.status === 'active',
+    );
+    if (!current || current !== ds) return { status: 'gone' as const };
+    if (hasProtectedSessionMutationOwnership(current)) {
+      return { status: 'pending' as const, anchor: sessionAnchorId(current) };
+    }
+    current.adoptedFrom = undefined;
+    current.workingDir = thread.cwd;
+    current.hasHistory = true;
+    current.currentTurnTitle = undefined;
+    current.lastScreenContent = undefined;
+    current.lastScreenStatus = undefined;
+    current.session.workingDir = thread.cwd;
+    current.session.title = `Codex App: ${title}`;
+    current.session.cliId = 'codex-app';
+    current.session.cliSessionId = thread.threadId;
+    current.session.adoptedFrom = undefined;
+    sessionStore.updateSession(current.session);
+    forkWorker(current, '', true);
+    return { status: 'switched' as const, anchor: sessionAnchorId(current) };
+  });
+  if (switched.status === 'gone') {
+    await sessionReply(sessionAnchorId(ds), t('cmd.no_active_session', undefined, loc));
+    return;
+  }
+  if (switched.status === 'pending') {
+    await sessionReply(
+      switched.anchor,
+      '当前 Codex App 仍有未结算消息，不能切换原生 thread；请等待本轮完成或先关闭会话。',
+    );
+    return;
+  }
+  await sessionReply(switched.anchor, t('cmd.codex_app_adopt.success', { title }, loc));
 }
 
 export async function startAdoptSession(
@@ -3961,6 +4123,8 @@ export async function startAdoptSession(
     await sessionReply(sessionAnchorId(ds), t('cmd.session.transfer_in_progress', undefined, loc));
     return;
   }
+
+  if (await blockRiffTakeover(ds, sessionReply)) return;
 
   const zellij = isZellijTarget(target);
   if (!zellij && target.source === 'herdr' && target.herdrSessionName && target.herdrAgentName) {
@@ -4014,31 +4178,52 @@ export async function startAdoptSession(
 
   const project = target.cwd.split('/').pop() || target.cwd;
   const pane = zellij ? `${target.zellijSession}/${target.zellijPaneId}` : adoptTargetLabel(target);
-
-  ds.workingDir = target.cwd;
-  ds.session.workingDir = target.cwd;
-  ds.session.title = `Adopt: ${project}`;
-  ds.adoptedFrom = {
-    source: zellij ? 'zellij' : target.source,
-    tmuxTarget: zellij ? undefined : target.tmuxTarget,
-    zellijSession: zellij ? target.zellijSession : undefined,
-    zellijPaneId: zellij ? target.zellijPaneId : undefined,
-    herdrSessionName: zellij ? undefined : target.herdrSessionName,
-    herdrTarget: zellij ? undefined : target.herdrTarget,
-    herdrPaneId: zellij ? undefined : target.herdrPaneId,
-    herdrAgentName: zellij ? undefined : target.herdrAgentName,
-    herdrTerminalId: zellij ? undefined : target.herdrTerminalId,
-    originalCliPid: target.cliPid,
-    sessionId: target.sessionId,
-    cliId: target.cliId,
-    cwd: target.cwd,
-    paneCols: target.paneCols,
-    paneRows: target.paneRows,
-  };
-  ds.session.adoptedFrom = { ...ds.adoptedFrom };
-  sessionStore.updateSession(ds.session);
-
-  forkAdoptWorker(ds);
+  const targetSessionId = ds.session.sessionId;
+  const adopted = await withBotTurnMutation(ds.larkAppId, async () => {
+    const current = [...deps.activeSessions.values()].find(
+      candidate => candidate.session.sessionId === targetSessionId
+        && candidate.session.status === 'active',
+    );
+    if (!current || current !== ds) return { status: 'gone' as const };
+    if (hasProtectedSessionMutationOwnership(current)) {
+      return { status: 'pending' as const, anchor: sessionAnchorId(current) };
+    }
+    current.workingDir = target.cwd;
+    current.session.workingDir = target.cwd;
+    current.session.title = `Adopt: ${project}`;
+    current.adoptedFrom = {
+      source: zellij ? 'zellij' : target.source,
+      tmuxTarget: zellij ? undefined : target.tmuxTarget,
+      zellijSession: zellij ? target.zellijSession : undefined,
+      zellijPaneId: zellij ? target.zellijPaneId : undefined,
+      herdrSessionName: zellij ? undefined : target.herdrSessionName,
+      herdrTarget: zellij ? undefined : target.herdrTarget,
+      herdrPaneId: zellij ? undefined : target.herdrPaneId,
+      herdrAgentName: zellij ? undefined : target.herdrAgentName,
+      herdrTerminalId: zellij ? undefined : target.herdrTerminalId,
+      originalCliPid: target.cliPid,
+      sessionId: target.sessionId,
+      cliId: target.cliId,
+      cwd: target.cwd,
+      paneCols: target.paneCols,
+      paneRows: target.paneRows,
+    };
+    current.session.adoptedFrom = { ...current.adoptedFrom };
+    sessionStore.updateSession(current.session);
+    forkAdoptWorker(current);
+    return { status: 'adopted' as const, anchor: sessionAnchorId(current) };
+  });
+  if (adopted.status === 'gone') {
+    await sessionReply(sessionAnchorId(ds), t('cmd.no_active_session', undefined, loc));
+    return;
+  }
+  if (adopted.status === 'pending') {
+    await sessionReply(
+      adopted.anchor,
+      '当前 Codex App 仍有未结算消息，不能切换到外部会话；请等待本轮完成或先关闭会话。',
+    );
+    return;
+  }
 
   const cliName = sessionCliDisplayName(ds);
   await sessionReply(sessionAnchorId(ds), t('cmd.adopt.success', { cliName, project, pane }, loc));
@@ -4102,19 +4287,41 @@ export async function startResumeImportSession(
     return;
   }
 
+  if (await blockRiffTakeover(ds, sessionReply)) return;
   if (await blockTakeoverWhilePendingRepo(ds, sessionReply)) return;
 
-  ds.workingDir = target.cwd;
-  ds.session.workingDir = target.cwd;
-  ds.session.cliSessionId = target.cliSessionId;
-  ds.session.title = target.title || `Import: ${project}`;
-  // Resume sandbox decision is left to forkWorker (resume=true → not sandboxed,
-  // matching restore semantics). Mark history so the session is treated as a
-  // resume, not a fresh spawn.
-  ds.hasHistory = true;
-  sessionStore.updateSession(ds.session);
-
-  forkWorker(ds, '', true);
+  const targetSessionId = ds.session.sessionId;
+  const resumed = await withBotTurnMutation(ds.larkAppId, async () => {
+    const current = [...deps.activeSessions.values()].find(
+      candidate => candidate.session.sessionId === targetSessionId
+        && candidate.session.status === 'active',
+    );
+    if (!current || current !== ds) return { status: 'gone' as const };
+    if (hasProtectedSessionMutationOwnership(current)) {
+      return { status: 'pending' as const, anchor: sessionAnchorId(current) };
+    }
+    current.workingDir = target.cwd;
+    current.session.workingDir = target.cwd;
+    current.session.cliSessionId = target.cliSessionId;
+    current.session.title = target.title || `Import: ${project}`;
+    // Resume sandbox decision is left to forkWorker (resume=true → not
+    // sandboxed, matching restore semantics). Mark history so this is a resume.
+    current.hasHistory = true;
+    sessionStore.updateSession(current.session);
+    forkWorker(current, '', true);
+    return { status: 'resumed' as const, anchor: sessionAnchorId(current) };
+  });
+  if (resumed.status === 'gone') {
+    await sessionReply(sessionAnchorId(ds), t('cmd.no_active_session', undefined, loc));
+    return;
+  }
+  if (resumed.status === 'pending') {
+    await sessionReply(
+      resumed.anchor,
+      '当前 Codex App 仍有未结算消息，不能导入外部会话；请等待本轮完成或先关闭会话。',
+    );
+    return;
+  }
 
   const cliName = sessionCliDisplayName(ds);
   await sessionReply(sessionAnchorId(ds), t('cmd.adopt.resume_success', { cliName, project, title: target.title || target.cliSessionId.slice(0, 8) }, loc));

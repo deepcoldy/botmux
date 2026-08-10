@@ -68,6 +68,7 @@ interface CreatedConnector {
   isToken: boolean;
   isDynamic: boolean;
   exampleChat: string;
+  rotated?: boolean;
 }
 
 type ConnectorsTab = 'webhooks' | 'logs';
@@ -530,7 +531,38 @@ function ConnectorsPage(props: { tab: ConnectorsTab }) {
       if ((r.status === 201 || r.status === 200) && r.body?.ok) {
         if (editingConnector) {
           const editedId = editingConnector.id;
-          setConnectors(current => replaceConnectorById(current, r.body.connector as Connector));
+          const updated = r.body.connector as Connector;
+          setConnectors(current => replaceConnectorById(current, updated));
+          // A changed secret/token is shown only once. `body.secret` holds the
+          // value the user typed this edit; `r.body.secret` is present when the
+          // server auto-generated one. Either way, surface it in the same
+          // one-time panel new connectors use — otherwise the new token is lost
+          // and a token-mode connector can never be triggered again.
+          const rotatedSecret = r.body.secret ?? body.secret;
+          if (rotatedSecret) {
+            const editUrl = r.body.webhookUrl || webhookUrl(updated.id);
+            const editIsToken = (updated.verify?.type ?? 'token') === 'token';
+            const editIsDynamic = updated.target.mode === 'dynamic';
+            const editExampleChat = editIsDynamic
+              ? (updated.target.allowChats?.[0] || '<chatId>')
+              : '';
+            setCreateMsg(null);
+            setCreated({
+              name,
+              mode: updated.target.mode,
+              chatId: updated.target.chatId,
+              url: editUrl,
+              secret: rotatedSecret,
+              isToken: editIsToken,
+              isDynamic: editIsDynamic,
+              exampleChat: editExampleChat,
+              rotated: true,
+            });
+            // Keep editingConnector set so the modal header still reads "edit";
+            // closeCreateModal clears it when the user dismisses the panel.
+            await load();
+            return;
+          }
           setEditMsg({ id: editedId, text: tr('connectors.updated') });
           setCreateOpen(false);
           setEditingConnector(null);
@@ -921,15 +953,22 @@ function ConnectorsPage(props: { tab: ConnectorsTab }) {
           )}
               </div>
               <footer className="connector-modal-actions">
-                <button type="button" disabled={creating} onClick={closeCreateModal}>
-                  {tr('connectors.cancel')}
-                </button>
                 {created ? (
+                  // The one-time credential panel commits server-side before it
+                  // shows. A "cancel" here would not roll anything back — it would
+                  // only dismiss the shown-once token and lose it. Offer just
+                  // "close" so the credential can't be discarded by a misleading
+                  // button. This footer is shared by create + edit success paths.
                   <button type="button" className="primary" onClick={closeCreateModal}>{tr('connectors.close')}</button>
                 ) : (
-                  <button id="cn-create" type="button" className="primary" disabled={creating} onClick={() => void submitConnector()}>
-                    {tr(editingConnector ? 'connectors.btnSave' : 'connectors.btnCreate')}
-                  </button>
+                  <>
+                    <button type="button" disabled={creating} onClick={closeCreateModal}>
+                      {tr('connectors.cancel')}
+                    </button>
+                    <button id="cn-create" type="button" className="primary" disabled={creating} onClick={() => void submitConnector()}>
+                      {tr(editingConnector ? 'connectors.btnSave' : 'connectors.btnCreate')}
+                    </button>
+                  </>
                 )}
               </footer>
             </article>
@@ -973,7 +1012,7 @@ function CreatedPanel(props: { created: CreatedConnector; groupName(chatId: stri
     <div className="connector-created-wrap">
       <div className="card connector-created-card">
         <p className="connector-created-title ok">
-          {tr('connectors.createdPrefix', { name: c.name })}
+          {tr(c.rotated ? 'connectors.rotatedPrefix' : 'connectors.createdPrefix', { name: c.name })}
           {c.mode === 'fixed' && c.chatId ? (
             <span className="muted"> · {tr('connectors.createdDest', { name: props.groupName(c.chatId) })}</span>
           ) : null}

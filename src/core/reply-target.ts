@@ -1,5 +1,5 @@
 import type { DaemonSession } from './types.js';
-import type { LarkMention, ReplyTargetEntry, Session, TurnParticipant } from '../types.js';
+import type { FrozenSessionReplyContext, LarkMention, ReplyTargetEntry, Session, TurnParticipant } from '../types.js';
 
 /** Merge participants by open_id, keeping the richest label (a later entry can
  *  fill a missing name / promote isBot). Order-stable on first appearance so a
@@ -234,7 +234,37 @@ export function beginReplyTargetTurn(
   nowIso = new Date().toISOString(),
   opts?: { quoteOnly?: boolean; substitute?: boolean; senderOpenId?: string; participants?: TurnParticipant[]; participantsIncomplete?: boolean },
 ): void {
-  // Routing and sender are one atomic per-turn record. Thread-scope and
+  // #597: the frozen per-turn dispatch context — the authoritative reply target
+  // for THIS turn's Codex App dispatch (steer/queued/opening). Independent of the
+  // mention-back participant record below; both are written per turn.
+  const exactTarget: SessionReplyTarget = ds.scope === 'chat'
+    ? replyRootId
+      ? opts?.quoteOnly
+        ? { mode: 'quote', rootMessageId: replyRootId }
+        : { mode: 'thread', rootMessageId: replyRootId }
+      : { mode: 'plain', chatId: ds.chatId }
+    : { mode: 'thread', rootMessageId: ds.session.rootMessageId };
+  const exactContexts = { ...(ds.session.turnReplyContexts ?? {}) };
+  // Re-insertion keeps the newest turn at the end for deterministic bounding.
+  delete exactContexts[turnId];
+  exactContexts[turnId] = {
+    target: exactTarget,
+    ...(ds.session.quoteTargetId ? { quoteTargetId: ds.session.quoteTargetId } : {}),
+    ...(ds.session.quoteTargetSenderOpenId
+      ? { replyTargetSenderOpenId: ds.session.quoteTargetSenderOpenId }
+      : {}),
+    ...(ds.session.quoteTargetSenderIsBot !== undefined
+      ? { replyTargetSenderIsBot: ds.session.quoteTargetSenderIsBot }
+      : {}),
+  };
+  const overflow = Object.keys(exactContexts).length - 256;
+  if (overflow > 0) {
+    for (const staleTurnId of Object.keys(exactContexts).slice(0, overflow)) {
+      delete exactContexts[staleTurnId];
+    }
+  }
+  ds.session.turnReplyContexts = exactContexts;
+  // #750: routing and sender are one atomic per-turn record. Thread-scope and
   // rootless chat turns may have no rootMessageId, but still require their
   // exact sender for --mention-back. Sender attribution (senderOpenId) and the
   // turn-window participant set are written in ANY scope — bot→bot handoff
@@ -275,6 +305,16 @@ export function beginReplyTargetTurn(
   }
   ds.currentReplyTarget = undefined;
   ds.session.currentReplyTarget = undefined;
+}
+
+/** Resolve a turn's immutable inbound destination, falling back only for
+ * legacy/non-Lark turns that predate the bounded registry. */
+export function frozenReplyContextForTurn(
+  ds: Pick<DaemonSession, 'scope' | 'chatId' | 'session' | 'currentReplyTarget'>,
+  turnId?: string,
+): FrozenSessionReplyContext {
+  const frozen = turnId ? ds.session.turnReplyContexts?.[turnId] : undefined;
+  return frozen ?? { target: resolveSessionReplyTarget(ds, turnId) };
 }
 
 /** Window within which sibling turn records are treated as the SAME turn for

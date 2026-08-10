@@ -8,18 +8,34 @@ import {
   REPORT_SESSION_RELAY_ROUTE,
   type ReportSessionRelaySessionView,
 } from '../src/core/report-session-relay.js';
+import { createDispatchReportBinding } from '../src/core/dispatch-report-binding.js';
 
 const CAPABILITY = 'c'.repeat(64);
+const BINDING_SECRET = 'binding-secret';
 const REGISTRY = {
   om_dispatch: {
     orchAppId: 'cli_orchestrator',
     orchSessionId: 'session-orchestrator',
     title: '指标页修复',
+    reportBinding: createDispatchReportBinding(BINDING_SECRET, {
+      dispatchRoot: 'om_dispatch',
+      targetLarkAppId: 'cli_orchestrator',
+      targetSessionId: 'session-orchestrator',
+      sourceName: '指标页修复',
+      issuedAt: '2026-08-07T07:00:00.000Z',
+    }),
   },
   om_other: {
     orchAppId: 'cli_other',
     orchSessionId: 'session-other',
     title: '其他任务',
+    reportBinding: createDispatchReportBinding(BINDING_SECRET, {
+      dispatchRoot: 'om_other',
+      targetLarkAppId: 'cli_other',
+      targetSessionId: 'session-other',
+      sourceName: '其他任务',
+      issuedAt: '2026-08-07T07:00:00.000Z',
+    }),
   },
 };
 
@@ -52,6 +68,7 @@ function authorize(
     session: session(),
     selfLarkAppId: 'cli_source',
     registry: REGISTRY,
+    bindingSecret: BINDING_SECRET,
     ...overrides,
   });
 }
@@ -78,9 +95,12 @@ describe('report session relay authorization', () => {
         originCapability: 'd'.repeat(64),
       },
     })).toEqual({ ok: false, status: 403, error: 'origin_unproven' });
+  });
+
+  it('keeps a live thread capability valid after type-ahead advances quoteTargetId', () => {
     expect(authorize({
       session: session({ quoteTargetId: 'turn-next' }),
-    })).toEqual({ ok: false, status: 403, error: 'turn_provenance_stale' });
+    }).ok).toBe(true);
   });
 
   it('rejects a dispatch root that is not bound to the authenticated session', () => {
@@ -92,18 +112,53 @@ describe('report session relay authorization', () => {
     })).toEqual({ ok: false, status: 403, error: 'dispatch_route_mismatch' });
   });
 
-  it('requires a chat-scope dispatch root to belong to the same live turn', () => {
+  it('uses the exact per-turn chat reply target and ignores the overwritten single slot', () => {
     const currentReplyTarget = { rootMessageId: 'om_dispatch', turnId: 'turn-current' };
     expect(authorize({
-      session: session({ scope: 'chat', rootMessageId: 'oc_group', currentReplyTarget }),
+      session: session({
+        scope: 'chat',
+        rootMessageId: 'oc_group',
+        currentReplyTarget: { rootMessageId: 'om_other', turnId: 'turn-next' },
+        replyTargets: { 'turn-current': currentReplyTarget },
+      }),
     }).ok).toBe(true);
     expect(authorize({
       session: session({
         scope: 'chat',
         rootMessageId: 'oc_group',
-        currentReplyTarget: { ...currentReplyTarget, turnId: 'turn-next' },
+        currentReplyTarget: { rootMessageId: 'om_other', turnId: 'turn-next' },
+        replyTargets: {},
       }),
     })).toEqual({ ok: false, status: 403, error: 'turn_provenance_stale' });
+  });
+
+  it('ignores confused-deputy registry coordinates and rejects a forged binding', () => {
+    const poisoned = {
+      om_dispatch: {
+        ...REGISTRY.om_dispatch,
+        orchAppId: 'cli_victim',
+        orchSessionId: 'session-victim',
+      },
+    };
+    expect(authorize({ registry: poisoned })).toMatchObject({
+      ok: true,
+      target: { larkAppId: 'cli_orchestrator', sessionId: 'session-orchestrator' },
+    });
+    expect(authorize({
+      registry: {
+        om_dispatch: {
+          ...poisoned.om_dispatch,
+          reportBinding: {
+            ...REGISTRY.om_dispatch.reportBinding,
+            payload: {
+              ...REGISTRY.om_dispatch.reportBinding.payload,
+              targetLarkAppId: 'cli_victim',
+              targetSessionId: 'session-victim',
+            },
+          },
+        },
+      },
+    })).toEqual({ ok: false, status: 403, error: 'dispatch_binding_unproven' });
   });
 
   it('ignores caller-supplied source and target identities', () => {
@@ -175,8 +230,12 @@ describe('report session relay wiring', () => {
     expect(ipcSource).toContain("pathname === REPORT_SESSION_RELAY_ROUTE");
   });
 
+  it('admits the daemon-owned dispatch registration route through the same narrow gate', () => {
+    expect(ipcSource).toContain("pathname === DISPATCH_REPORT_REGISTER_ROUTE");
+  });
+
   it('falls back to the source daemon relay when the host secret is masked', () => {
-    expect(cliSource).toContain("fetch(`http://127.0.0.1:${sourceDaemonPort}${REPORT_SESSION_RELAY_ROUTE}`");
+    expect(cliSource).toContain("fetch(`http://127.0.0.1:${port}${input.path}`");
     expect(cliSource).toContain('originCapability: originClaim?.capability');
   });
 

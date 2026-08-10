@@ -11,8 +11,10 @@ import {
   isStructuredBridgeAdoptCli,
   isStructuredBridgeAdoptIdleCli,
   isStructuredBridgeAdoptInputCli,
+  isStructuredBridgeLifecycleBlockingCli,
   STRUCTURED_BRIDGE_ALWAYS_CLI_IDS,
   STRUCTURED_BRIDGE_ADOPT_CLI_IDS,
+  STRUCTURED_BRIDGE_LIFECYCLE_BLOCKING_CLI_IDS,
 } from '../src/services/structured-bridge-clis.js';
 import { resolveFileBridgePath } from '../src/services/file-bridge-path.js';
 
@@ -45,8 +47,16 @@ describe('structured-bridge-clis', () => {
     expect(isStructuredBridgeAdoptIdleCli('coco')).toBe(true);
     expect(isStructuredBridgeAdoptIdleCli('cursor')).toBe(false);
     expect(isStructuredBridgeAdoptInputCli('mtr')).toBe(true);
-    expect(isStructuredBridgeAdoptInputCli('coco')).toBe(false);
+    expect(isStructuredBridgeAdoptInputCli('coco')).toBe(true);
     expect(isStructuredBridgeAdoptCli('cursor')).toBe(true);
+  });
+
+  it('enables the strong status gate only for Codex with a complete terminal contract', () => {
+    expect(STRUCTURED_BRIDGE_LIFECYCLE_BLOCKING_CLI_IDS).toEqual(['codex']);
+    expect(isStructuredBridgeLifecycleBlockingCli('codex')).toBe(true);
+    for (const id of ['traex', 'coco', 'hermes', 'mtr', 'pi', 'grok', 'cursor']) {
+      expect(isStructuredBridgeLifecycleBlockingCli(id)).toBe(false);
+    }
   });
 });
 

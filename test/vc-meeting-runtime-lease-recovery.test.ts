@@ -86,6 +86,7 @@ function harness(input: {
   probe?: (backend: 'tmux' | 'herdr' | 'zellij' | 'zmx', sessionName: string) => 'exists' | 'missing' | 'unknown';
   missingPersistentScope?: FakeSession['testPersistentScope'];
   backendAvailable?: (backend: 'tmux' | 'herdr' | 'zellij' | 'zmx') => boolean;
+  retireDispatch?: (sessionId: string, turnId: string, dispatchAttempt: number) => boolean;
 } = {}) {
   const sessions = new Map((input.sessions ?? []).map(ds => [ds.session.sessionId, ds]));
   const sent: Array<{ sessionId: string; turnId: string; dispatchAttempt: number }> = [];
@@ -95,6 +96,7 @@ function harness(input: {
   const probes: string[] = [];
   const warnings: string[] = [];
   const errors: string[] = [];
+  const retired: Array<{ sessionId: string; turnId: string; dispatchAttempt: number }> = [];
   const recovery = createRecovery({
     findSession: (sessionId: string) => sessions.get(sessionId),
     sendExpiry: (ds: FakeSession, message: { turnId: string; dispatchAttempt: number }) => {
@@ -119,10 +121,14 @@ function harness(input: {
       probes.push(`${backend}:${sessionName}`);
       return input.probe?.(backend, sessionName) ?? 'missing';
     },
+    retireDispatch: (sessionId: string, turnId: string, dispatchAttempt: number) => {
+      retired.push({ sessionId, turnId, dispatchAttempt });
+      return input.retireDispatch?.(sessionId, turnId, dispatchAttempt) ?? true;
+    },
     warn: (message: string) => warnings.push(message),
     error: (message: string) => errors.push(message),
   } as any);
-  return { recovery, sessions, sent, killed, backingKills, backingKillCalls, probes, warnings, errors };
+  return { recovery, sessions, sent, killed, backingKills, backingKillCalls, probes, retired, warnings, errors };
 }
 
 describe('VC meeting runtime lease recovery', () => {
@@ -198,6 +204,26 @@ describe('VC meeting runtime lease recovery', () => {
     expect(h.killed).toEqual(['session_a']);
     expect(h.backingKills).toEqual(['tmux:bmx-session_']);
     expect(h.probes).toEqual(['tmux:bmx-session_']);
+    expect(h.retired).toEqual([{
+      sessionId: 'session_a', turnId: 'delivery_a', dispatchAttempt: 1,
+    }]);
+    expect(h.recovery.snapshot()).toEqual([]);
+  });
+
+  it('keeps a workerless receiver fenced when exact ledger retirement cannot persist', async () => {
+    let retirementWorks = false;
+    const h = harness({
+      sessions: [fakeSession({ worker: false, persistentScope: 'tmux' })],
+      retireDispatch: () => retirementWorks,
+    });
+    h.recovery.arm(ref(), 'agent_test');
+
+    expect(h.recovery.snapshot()).toMatchObject([{ phase: 'blocked', timerArmed: true }]);
+    expect(h.errors.some(message => message.includes('dispatch retirement failed'))).toBe(true);
+
+    retirementWorks = true;
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(h.retired).toHaveLength(2);
     expect(h.recovery.snapshot()).toEqual([]);
   });
 

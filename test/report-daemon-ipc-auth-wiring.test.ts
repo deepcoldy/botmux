@@ -13,15 +13,20 @@ function reportCommandSource(): string {
 }
 
 describe('botmux report daemon IPC auth wiring', () => {
-  it('uses the authenticated daemon client when the host secret is available', () => {
+  it('routes through the authenticated source daemon when the host secret is available', () => {
     const source = reportCommandSource();
 
-    expect(source).toContain(
-      "response = await fetchDaemonIpc(targetDaemon.ipcPort, '/api/trigger', {",
-    );
-    expect(source).toContain('}, hostSecret);');
+    expect(source).toContain('response = await postCurrentSessionDaemonRoute({');
+    expect(source).toContain('path: REPORT_SESSION_RELAY_ROUTE');
     expect(source).not.toContain(
       'response = await fetch(`http://127.0.0.1:${targetDaemon.ipcPort}/api/trigger`',
     );
+  });
+
+  it('does not require the isolated CLI to read the dispatch registry', () => {
+    const source = reportCommandSource();
+
+    expect(source).not.toContain("orchestrate-dispatch.json");
+    expect(source).not.toContain('findDispatchRegistryEntry({');
   });
 });

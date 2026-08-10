@@ -30,6 +30,7 @@ vi.mock('../src/utils/logger.js', () => ({
 import {
   recordPending,
   recordCompleted,
+  recordFailedStrict,
   lookup,
   deleteResults,
 } from '../src/services/async-trigger-store.js';
@@ -178,5 +179,48 @@ describe('robustness', () => {
     const sid = 'om_root::cli_app';
     recordCompleted(sid, 'trg_x', 'ok', 9, 'cli_test');
     expect(lookup(sid)?.result.content).toBe('ok');
+  });
+});
+
+describe('recordFailedStrict (authoritative dispatch_unknown terminal)', () => {
+  it('writes a durable failed(dispatch_unknown) that lookup surfaces', () => {
+    recordFailedStrict('sessF', 'trg_f', 7000, 'cli_test', 'dispatch_unknown');
+    const r = lookup('sessF', 'trg_f')?.result;
+    expect(r?.status).toBe('failed');
+    expect(r?.errorCode).toBe('no_output');
+    expect(r?.reason).toBe('dispatch_unknown');
+  });
+
+  it('COMPLETED WINS: does not overwrite an existing completed result', () => {
+    recordCompleted('sessC', 'trg_c', 'the answer', 5000, 'cli_test');
+    recordFailedStrict('sessC', 'trg_c', 6000, 'cli_test'); // must be a no-op
+    expect(lookup('sessC', 'trg_c')?.result.status).toBe('completed');
+    expect(lookup('sessC', 'trg_c')?.result.content).toBe('the answer');
+  });
+
+  it('LATE COMPLETED WINS: a completed arriving after failed overwrites it', () => {
+    recordFailedStrict('sessL', 'trg_l', 6000, 'cli_test');
+    expect(lookup('sessL', 'trg_l')?.result.status).toBe('failed');
+    recordCompleted('sessL', 'trg_l', 'done late', 7000, 'cli_test');
+    expect(lookup('sessL', 'trg_l')?.result.status).toBe('completed');
+  });
+
+  it('STRICT READ: throws on a corrupt existing file (never overwrites it as empty)', () => {
+    mkdirSync(join(tempDir, 'async-triggers'), { recursive: true });
+    writeFileSync(join(tempDir, 'async-triggers', 'sessCorrupt.json'), '{ not json', 'utf-8');
+    expect(() => recordFailedStrict('sessCorrupt', 'trg_x', 8000, 'cli_test')).toThrow();
+    // The corrupt file is left intact for a human — not silently replaced.
+    expect(existsSync(join(tempDir, 'async-triggers', 'sessCorrupt.json'))).toBe(true);
+  });
+
+  it('OWNER PROOF: refuses to overwrite a file owned by a different bot', () => {
+    recordCompleted('sessO', 'trg_o', 'x', 5000, 'cli_ownerA');
+    expect(() => recordFailedStrict('sessO', 'trg_o', 6000, 'cli_ownerB')).toThrow(/owner mismatch/);
+    // ownerA's data intact.
+    expect(lookup('sessO', 'trg_o')?.result.status).toBe('completed');
+  });
+
+  it('requires ownerLarkAppId', () => {
+    expect(() => recordFailedStrict('sessN', 'trg_n', 1, '')).toThrow(/ownerLarkAppId/);
   });
 });

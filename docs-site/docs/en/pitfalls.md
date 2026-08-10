@@ -47,7 +47,7 @@
 
 ## Dashboard / Security
 
-- **Don't post a token-bearing dashboard URL into a group** (it's equivalent to publicly exposing a temporary access credential). For security-sensitive scenarios, bind the host to the local machine: `BOTMUX_DASHBOARD_HOST=127.0.0.1`. The token is single-use; each run of `botmux dashboard` regenerates it and the old link becomes invalid immediately.
+- **Don't post a token-bearing dashboard URL into a group** (it's equivalent to publicly exposing a temporary access credential). For security-sensitive scenarios, bind the host to the local machine: `BOTMUX_DASHBOARD_HOST=127.0.0.1`. The token rotates rather than being consumed: the same URL remains reusable until rotation; only `botmux dashboard rotate` generates a new token and immediately invalidates the old link. The bare command and `botmux dashboard current` do not rotate it.
 - **Dashboard won't open**: First run `curl http://<host>:<port>/__health`; a `{"ok":true}` response means the service is healthy. The problem is usually a browser proxy / wrong host (a Mac's intranet IP can change) / opening a link with an old token.
 
 ## General troubleshooting approach

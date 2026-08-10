@@ -231,10 +231,41 @@ export function resolveRole(larkAppId: string, chatId: string): { content: strin
 
 export type RoleInjectMode = 'every' | 'once';
 
+interface RoleMeta {
+  inject?: 'once';
+  dispatchCompletionEnabled?: true;
+}
+
 /** Absolute path to the per-chat role metadata sidecar. */
 function roleMetaFilePath(larkAppId: string, chatId: string): string {
   assertRoleChatId(chatId);
   return join(config.session.dataDir, 'roles', larkAppId, `${chatId}.meta.json`);
+}
+
+function readRoleMeta(larkAppId: string, chatId: string): RoleMeta {
+  try {
+    const fp = roleMetaFilePath(larkAppId, chatId);
+    if (!existsSync(fp)) return {};
+    const meta: unknown = JSON.parse(readFileSync(fp, 'utf-8'));
+    if (meta === null || typeof meta !== 'object' || Array.isArray(meta)) return {};
+    const raw = meta as Record<string, unknown>;
+    return {
+      ...(raw.inject === 'once' ? { inject: 'once' as const } : {}),
+      ...(raw.dispatchCompletionEnabled === true ? { dispatchCompletionEnabled: true as const } : {}),
+    };
+  } catch {
+    return {};
+  }
+}
+
+function writeRoleMeta(larkAppId: string, chatId: string, meta: RoleMeta): void {
+  const fp = roleMetaFilePath(larkAppId, chatId);
+  if (Object.keys(meta).length === 0) {
+    try { unlinkSync(fp); } catch { /* already absent */ }
+    return;
+  }
+  mkdirSync(dirname(fp), { recursive: true });
+  atomicWriteFileSync(fp, JSON.stringify(meta));
 }
 
 /** Absolute path to the bot-level default role metadata sidecar (sits next to
@@ -282,14 +313,8 @@ export function writeTeamRoleInjectMode(larkAppId: string, mode: RoleInjectMode)
  */
 export function readRoleInjectMode(larkAppId: string, chatId: string): RoleInjectMode {
   if (!larkAppId || !chatId || !isValidRoleChatId(chatId)) return 'every';
-  try {
-    const fp = roleMetaFilePath(larkAppId, chatId);
-    if (!existsSync(fp)) return readTeamRoleInjectMode(larkAppId);
-    const meta = JSON.parse(readFileSync(fp, 'utf-8')) as { inject?: unknown };
-    return meta?.inject === 'once' ? 'once' : 'every';
-  } catch {
-    return readTeamRoleInjectMode(larkAppId);
-  }
+  const meta = readRoleMeta(larkAppId, chatId);
+  return meta.inject === 'once' ? 'once' : readTeamRoleInjectMode(larkAppId);
 }
 
 /**
@@ -297,18 +322,33 @@ export function readRoleInjectMode(larkAppId: string, chatId: string): RoleInjec
  * on-disk state stays clean; 'once' writes it.
  */
 export function writeRoleInjectMode(larkAppId: string, chatId: string, mode: RoleInjectMode): void {
-  const fp = roleMetaFilePath(larkAppId, chatId);
-  if (mode === 'once') {
-    mkdirSync(dirname(fp), { recursive: true });
-    atomicWriteFileSync(fp, JSON.stringify({ inject: 'once' }));
-  } else {
-    try { unlinkSync(fp); } catch { /* already absent */ }
-  }
+  const meta = readRoleMeta(larkAppId, chatId);
+  if (mode === 'once') meta.inject = 'once';
+  else delete meta.inject;
+  writeRoleMeta(larkAppId, chatId, meta);
   logger.info(`[role] inject mode chat=${chatId} app=${larkAppId} => ${mode}`);
 }
 
-/** Remove the injection-mode sidecar (used when a chat role is deleted). */
-export function deleteRoleInjectMode(larkAppId: string, chatId: string): void {
+/** Whether dispatch completion additionally leaves a same-topic send copy after report. */
+export function readRoleDispatchCompletionEnabled(larkAppId: string, chatId: string): boolean {
+  if (!larkAppId || !chatId || !isValidRoleChatId(chatId)) return false;
+  return readRoleMeta(larkAppId, chatId).dispatchCompletionEnabled === true;
+}
+
+export function writeRoleDispatchCompletionEnabled(
+  larkAppId: string,
+  chatId: string,
+  enabled: boolean,
+): void {
+  const meta = readRoleMeta(larkAppId, chatId);
+  if (enabled) meta.dispatchCompletionEnabled = true;
+  else delete meta.dispatchCompletionEnabled;
+  writeRoleMeta(larkAppId, chatId, meta);
+  logger.info(`[role] dispatch completion chat=${chatId} app=${larkAppId} => ${enabled}`);
+}
+
+/** Remove all per-chat role metadata when the chat role is deleted. */
+export function deleteRoleMeta(larkAppId: string, chatId: string): void {
   if (!isValidRoleChatId(chatId)) return;
   try { unlinkSync(roleMetaFilePath(larkAppId, chatId)); } catch { /* already absent */ }
 }

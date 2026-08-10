@@ -20,6 +20,7 @@
  * plaintext). See the design doc for the two-layer rationale.
  */
 
+import { createHash } from 'node:crypto';
 import {
   DEVICE_AUTHORITY_DIRECTORY,
   DEVICE_CREDENTIAL_FILE,
@@ -320,16 +321,13 @@ export function buildSeatbeltProfile(
 //     (sandboxReadonlyPaths) so goal-mode stops wedging on the TRAE first-run
 //     migration prompt. That is a new spawn-time mount; a pane predating it warm-
 //     reattaches with the old mount set and still wedges, so it must cold-spawn.
+//   · 9 → 10: credential-only Seatbelt/bwrap panes receive a private rotating
+//     managed-origin channel for capability-gated daemon IPC. A warm pane with
+//     the v9 marker lacks both the env and the private read carve-out.
 // #709 (→8) merged first; this PR (#714) rebased on top and takes 9. Numbers stay
 // strictly monotonic — a pane at any intermediate version must be rejected so it
 // cold-spawns under the current contract rather than bypassing a migration.
-//   · 9 → 10 (#779): credential-only bwrap sessions receive a private rotating
-//     origin-capability directory + env pointer. A v9 pane has neither, and a
-//     warm reattach cannot add mounts or environment to its live process.
-//   · 10 → 11 (#779): apply the same private capability contract to macOS
-//     credential-only Seatbelt sessions. A v10 Seatbelt pane lacks the env and
-//     carve-out, which likewise cannot be added by warm reattach.
-export const ISOLATION_PANE_MARKER_VERSION = 11;
+export const ISOLATION_PANE_MARKER_VERSION = 10;
 
 export type IsolationCapability = 'credential' | 'read' | 'write';
 
@@ -346,15 +344,97 @@ function normalizeIsolationCapabilities(
   return ALL_ISOLATION_CAPABILITIES.filter(capability => requested.has(capability));
 }
 
+export interface IsolationPanePolicyInput {
+  readIsolation: boolean;
+  writeSandbox: boolean;
+  readDenyExtraPaths?: readonly string[];
+  writeAllowExtraPaths?: readonly string[];
+  readOnlyExtraPaths?: readonly string[];
+  readWriteExtraPaths?: readonly string[];
+  workingDir?: string;
+  homeDir?: string;
+  osUserHomeDir?: string;
+  botmuxHome?: string;
+  sessionDataDir?: string;
+  currentAppId?: string;
+  cliId?: string;
+  resolvedBin?: string;
+}
+
+/** Deterministic fingerprint of effective Darwin Seatbelt inputs that can
+ * change between worker forks while the pane survives. Arrays are normalized
+ * as sets because rule order does not change their final deny semantics. */
+export function isolationPanePolicyDigest(input: IsolationPanePolicyInput): string {
+  const normalizedExtra = (input.readDenyExtraPaths ?? [])
+    .map(normalizeIsolationPath)
+    .filter((value): value is string => !!value)
+    .sort();
+  const normalizedWriteExtra = (input.writeAllowExtraPaths ?? [])
+    .map(normalizeIsolationPath)
+    .filter((value): value is string => !!value)
+    .sort();
+  const normalizedReadOnlyExtra = (input.readOnlyExtraPaths ?? [])
+    .map(normalizeIsolationPath)
+    .filter((value): value is string => !!value)
+    .sort();
+  const normalizedReadWriteExtra = (input.readWriteExtraPaths ?? [])
+    .map(normalizeIsolationPath)
+    .filter((value): value is string => !!value)
+    .sort();
+  return createHash('sha256').update(JSON.stringify({
+    domain: 'botmux.darwin-seatbelt-policy.v7',
+    readIsolation: input.readIsolation,
+    writeSandbox: input.writeSandbox,
+    readDenyExtraPaths: normalizedExtra,
+    writeAllowExtraPaths: normalizedWriteExtra,
+    readOnlyExtraPaths: normalizedReadOnlyExtra,
+    readWriteExtraPaths: normalizedReadWriteExtra,
+    workingDir: input.workingDir ?? '',
+    homeDir: input.homeDir ?? '',
+    osUserHomeDir: input.osUserHomeDir ?? '',
+    botmuxHome: input.botmuxHome ?? '',
+    sessionDataDir: input.sessionDataDir ?? '',
+    currentAppId: input.currentAppId ?? '',
+    cliId: input.cliId ?? '',
+    resolvedBin: input.resolvedBin ?? '',
+  })).digest('hex');
+}
+
 export function isolationPaneMarkerContent(
   bootId: string,
   capabilities: readonly IsolationCapability[],
+  policy?: {
+    originChannelId: string;
+    readIsolation: boolean;
+    writeSandbox: boolean;
+    policyDigest: string;
+  },
 ): string {
+  if (policy
+    && (!/^[a-f0-9]{64}$/.test(policy.originChannelId)
+      || !/^[a-f0-9]{64}$/.test(policy.policyDigest))) {
+    throw new Error('invalid isolation marker policy');
+  }
   return JSON.stringify({
     version: ISOLATION_PANE_MARKER_VERSION,
     bootId,
     capabilities: normalizeIsolationCapabilities(capabilities),
+    ...(policy ?? {}),
   });
+}
+
+export function isolatedPaneOriginChannel(
+  markerContent: string | null | undefined,
+): string | undefined {
+  try {
+    const parsed = JSON.parse(markerContent ?? '') as { originChannelId?: unknown };
+    return typeof parsed.originChannelId === 'string'
+      && /^[a-f0-9]{64}$/.test(parsed.originChannelId)
+      ? parsed.originChannelId
+      : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 /**
@@ -372,25 +452,61 @@ export function isolationPaneMarkerContent(
  */
 export function isolatedPaneReattachSafe(
   markerContent: string | null | undefined,
-  requiredCapabilities: readonly IsolationCapability[] = [],
+  expected: readonly IsolationCapability[] | {
+    requiredCapabilities: readonly IsolationCapability[];
+    exactCapabilities?: boolean;
+    readIsolation?: boolean;
+    writeSandbox?: boolean;
+    requireOriginChannel?: boolean;
+    policyDigest?: string;
+  } = [],
 ): boolean {
   try {
     const parsed = JSON.parse(markerContent ?? '') as {
       version?: unknown;
       bootId?: unknown;
       capabilities?: unknown;
+      readIsolation?: unknown;
+      writeSandbox?: unknown;
+      originChannelId?: unknown;
+      policyDigest?: unknown;
     };
-    if (!Array.isArray(parsed.capabilities)
+    if (parsed.version !== ISOLATION_PANE_MARKER_VERSION
+      || typeof parsed.bootId !== 'string'
+      || parsed.bootId.trim().length === 0
+      || !Array.isArray(parsed.capabilities)
       || parsed.capabilities.some(capability =>
         typeof capability !== 'string'
         || !ALL_ISOLATION_CAPABILITIES.includes(capability as IsolationCapability))) {
       return false;
     }
+    const expectedPolicy = Array.isArray(expected)
+      ? undefined
+      : expected as {
+          requiredCapabilities: readonly IsolationCapability[];
+          exactCapabilities?: boolean;
+          readIsolation?: boolean;
+          writeSandbox?: boolean;
+          requireOriginChannel?: boolean;
+          policyDigest?: string;
+        };
+    const requiredCapabilities: readonly IsolationCapability[] = expectedPolicy
+      ? expectedPolicy.requiredCapabilities
+      : expected as readonly IsolationCapability[];
     const actual = new Set(parsed.capabilities as IsolationCapability[]);
-    return parsed.version === ISOLATION_PANE_MARKER_VERSION
-      && typeof parsed.bootId === 'string'
-      && parsed.bootId.trim().length > 0
-      && requiredCapabilities.every(capability => actual.has(capability));
+    if (!requiredCapabilities.every(capability => actual.has(capability))) return false;
+    if (expectedPolicy?.exactCapabilities
+      && actual.size !== new Set(requiredCapabilities).size) return false;
+    if (!expectedPolicy) return true;
+    if (expectedPolicy.readIsolation !== undefined
+      && parsed.readIsolation !== expectedPolicy.readIsolation) return false;
+    if (expectedPolicy.writeSandbox !== undefined
+      && parsed.writeSandbox !== expectedPolicy.writeSandbox) return false;
+    if (expectedPolicy.policyDigest !== undefined
+      && parsed.policyDigest !== expectedPolicy.policyDigest) return false;
+    return !expectedPolicy.requireOriginChannel
+      || (typeof parsed.originChannelId === 'string'
+        && /^[a-f0-9]{64}$/.test(parsed.originChannelId));
   } catch {
     return false;
   }

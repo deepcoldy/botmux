@@ -23,13 +23,13 @@ Both modes open a "virtual session" (when no `chatId` is given) that **never ent
 
 ## 2. Authentication
 
-Calls go through the dashboard (default `http://<daemon-host>:7891`). Auth currently uses a short-lived dashboard token:
+Calls go through the dashboard (default `http://<daemon-host>:7891`). Auth currently uses the rotating dashboard token:
 
 - **Programmatic calls MUST send the token as a Cookie header**: `Cookie: botmux_dashboard_token=<TOKEN>`
 - ⚠️ Do NOT use `?t=<TOKEN>` query: that's for browser login; a `POST` carrying it returns a **302 redirect** (set-cookie) and the call fails.
-- Getting a token: run `botmux dashboard` to print the login URL — the part after `?t=` is the token. Each run rotates it (the old token is invalidated).
+- Getting a token: run `botmux dashboard` to get the current login URL — the part after `?t=` is the token. The command creates the first token when absent; use `botmux dashboard rotate` only when you intend to invalidate an existing token.
 
-> The token is short-lived. Long-lived API-key auth (e.g. `X-Botmux-Api-Key`) is planned; this doc will be updated when it lands.
+> The token persists until explicit rotation. Dedicated API-key auth (e.g. `X-Botmux-Api-Key`) is planned; this doc will be updated when it lands.
 
 ---
 
@@ -118,6 +118,34 @@ Response (HTTP 200, returns immediately — **keep `target.sessionId` as the cor
   "message": "queued new session turn; poll by sessionId or triggerId for final output"
 }
 ```
+
+### Idempotency key (`options.idempotencyKey`) — prevent a retry from running twice
+
+**Problem**: if the HTTP response to an async trigger is lost in transit (the daemon already created the session and the task is running), your retry builds a **brand-new session** and runs the same task a **second time** (duplicate external side effects: two messages sent, a migration run twice…). Your own dedup can't stop this — the first session is genuinely already executing.
+
+**Fix**: pass a stable key in `options.idempotencyKey` that you **persist before issuing the trigger**. On a same-key retry the daemon returns the **same session/triggerId — no new session, no re-dispatch**:
+
+```bash
+curl -X POST "http://<host>:7891/api/trigger" -H 'content-type: application/json' \
+  -H "Cookie: botmux_dashboard_token=$TOKEN" \
+  -d '{
+    "source":{"type":"webhook"},
+    "target":{"kind":"turn","botId":"cli_xxx"},
+    "instruction":"...",
+    "envelope":{"format":"json","sourceName":"demo","trusted":false},
+    "options":{"asyncReturnSessionId":true, "idempotencyKey":"my-task-42"}
+  }'
+```
+
+A hit carries `idempotent:true` (reused, no new dispatch); the first create carries `idempotent:false`. Poll `trigger-result` with the (reused or new) `sessionId` as usual — **no extra lookup endpoint needed**.
+
+**Scope (important)**: `idempotencyKey` is supported only for a **fresh async virtual** trigger — `target.kind:'turn'` + `options.asyncReturnSessionId:true`, with **no** `target.sessionId` / `rootMessageId` / `chatId`, and no `waitForFinalOutput` / `dryRun`. Any other combination carrying a key returns **400** (the lease is implemented only on this seam, so the contract does not advertise it elsewhere).
+
+**Same key, different payload → 409 `idempotency_conflict`**: the key is bound to its business payload (`instruction` / `envelope` / execution-affecting `options`); reusing a key with a changed payload is a caller bug and the daemon returns 409 rather than silently joining the old task. Retry with the **same key AND the same payload**.
+
+**Crash semantics (at-most-once)**: before dispatching, the daemon durably marks the key's lease `attempting` (a commit-unknown barrier). If the daemon crashes between "dispatch started" and "completion proven", it will **not** blindly re-dispatch on restart (`forkWorker` returning is not proof the model didn't start). The key converges to a terminal state and `trigger-result` reports `failed` (errorCode `no_output`, meaning "previous dispatch outcome unknown; not re-run under at-most-once"). Treat it as **Failed** in your recovery (better a visible failure you retry as a new task than a double run).
+
+**Retention**: the key→session mapping is append-only (same policy as async results), so a late retry after completion still reuses the same session instead of rebuilding it.
 
 ---
 
@@ -307,4 +335,4 @@ Robustness notes (all from the tested contract):
 | `/api/sessions/:id` | GET | session metadata (status/title/etc.) |
 | `/api/sessions/:id/close` | POST | cancel/close a session |
 
-Key `errorCode`s: `target_required`, `bad_request` (incl. `trusted` check, `timeoutMs` out of range), `bot_not_found`, `bot_not_in_chat`, `wait_timeout`, `no_output`, `session_not_found`.
+Key `errorCode`s: `target_required`, `bad_request` (incl. `trusted` check, `timeoutMs` out of range, `idempotencyKey` out of scope), `idempotency_conflict` (same key, different payload), `bot_not_found`, `bot_not_in_chat`, `wait_timeout`, `no_output`, `session_not_found`.

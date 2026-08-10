@@ -51,6 +51,7 @@ describe('buildBotmuxEnvAssignments()', () => {
       IS_SANDBOX: '1',
       BOTMUX_LARK_APP_ID: 'cli_namespaced',
       BOTMUX_TURN_ID: 'om_turn',
+      BOTMUX_ORIGIN_CHANNEL_ID: 'ab'.repeat(32),
       // None of the rest should appear — those come from rcfile.
       PATH: '/usr/bin',
       HOME: '/home/u',
@@ -64,6 +65,7 @@ describe('buildBotmuxEnvAssignments()', () => {
       'IS_SANDBOX=1',
       'BOTMUX_LARK_APP_ID=cli_namespaced',
       'BOTMUX_TURN_ID=om_turn',
+      `BOTMUX_ORIGIN_CHANNEL_ID=${'ab'.repeat(32)}`,
     ]);
     expect(out.some(s => s.startsWith('LARK_APP_ID='))).toBe(false);
     expect(out.some(s => s.startsWith('LARK_APP_SECRET='))).toBe(false);
@@ -143,14 +145,17 @@ describe('buildBotmuxEnvAssignments()', () => {
     expect(out).not.toContain('PATH=/usr/bin');
   });
 
-  it('forwards the worker-owned MCP relay capability into the CLI pane', () => {
+  it('forwards only a Codex App bootstrap path and strips the retired shared-secret env', () => {
+    const retiredSharedSecret = 'A'.repeat(43);
+    const bootstrapPath = '/private/bot-home/control.bootstrap';
     const out = buildBotmuxEnvAssignments({
       BOTMUX: '1',
-      BOTMUX_MCP_GATEWAY_SOCKET: '/tmp/botmux-mcp/session/gateway.sock',
-      BOTMUX_MCP_GATEWAY_REQUIRED: '1',
+      BOTMUX_CODEX_APP_CONTROL_NONCE: retiredSharedSecret,
+      BOTMUX_CODEX_APP_CONTROL_BOOTSTRAP: bootstrapPath,
     });
-    expect(out).toContain('BOTMUX_MCP_GATEWAY_SOCKET=/tmp/botmux-mcp/session/gateway.sock');
-    expect(out).toContain('BOTMUX_MCP_GATEWAY_REQUIRED=1');
+    expect(out).toContain(`BOTMUX_CODEX_APP_CONTROL_BOOTSTRAP=${bootstrapPath}`);
+    expect(out.join(' ')).not.toContain(retiredSharedSecret);
+    expect(out.some(value => value.startsWith('BOTMUX_CODEX_APP_CONTROL_NONCE='))).toBe(false);
   });
 
   it('forwards Hermes profile paths so the pane and transcript reader use the same state DB', () => {

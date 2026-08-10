@@ -41,30 +41,39 @@ describe('prepareDirectSandbox platform gate', () => {
   });
 });
 
-describe('credential-only private capability carve-out', () => {
-  it('masks sibling capability directories and re-exposes only this session directory read-only', () => {
+describe('credential-only managed-origin carve-out', () => {
+  it('hides the shared parent before exposing only the owning rotating directory', () => {
     const parent = '/srv/botmux/data/read-isolation';
-    const ownDirectory = `${parent}/origin-private`;
+    const own = `${parent}/origin-${'a'.repeat(64)}`;
     const args = buildCredentialOnlySandboxArgs({
-      hideDirectories: ['/srv/botmux/.device-authority'],
+      hideDirectories: ['/srv/botmux/device-authority'],
       hideFiles: ['/srv/botmux/.dashboard-secret'],
-      privateReadonlyDirectories: [{ parent, path: ownDirectory }],
-      workingDir: '/srv/project',
+      privateReadonlyDirectories: [{ parent, directory: own }],
+      workingDir: '/workspace',
       cliBin: '/usr/bin/true',
       cliArgs: [],
     });
+    const hideParentAt = args.findIndex((value, index) => value === '--tmpfs'
+      && args[index + 1] === parent);
+    const exposeOwnAt = args.findIndex((value, index) => value === '--ro-bind'
+      && args[index + 1] === own && args[index + 2] === own);
+    expect(hideParentAt).toBeGreaterThan(-1);
+    expect(exposeOwnAt).toBe(hideParentAt + 2);
+    expect(args).not.toContain(`${parent}/origin-${'b'.repeat(64)}`);
+  });
 
-    const parentMaskAt = args.findIndex((value, index) =>
-      value === '--tmpfs' && args[index + 1] === parent);
-    const ownBindAt = args.findIndex((value, index) =>
-      value === '--ro-bind'
-      && args[index + 1] === ownDirectory
-      && args[index + 2] === ownDirectory);
-    const parentSealAt = args.findIndex((value, index) =>
-      value === '--remount-ro' && args[index + 1] === parent);
-    expect(parentMaskAt).toBeGreaterThan(-1);
-    expect(ownBindAt).toBeGreaterThan(parentMaskAt);
-    expect(parentSealAt).toBeGreaterThan(ownBindAt);
+  it('rejects a private directory outside the hidden parent', () => {
+    expect(() => buildCredentialOnlySandboxArgs({
+      hideDirectories: ['/srv/botmux/device-authority'],
+      hideFiles: [],
+      privateReadonlyDirectories: [{
+        parent: '/srv/botmux/data/read-isolation',
+        directory: '/srv/other/origin',
+      }],
+      workingDir: '/workspace',
+      cliBin: '/usr/bin/true',
+      cliArgs: [],
+    })).toThrow(/must be below/);
   });
 });
 

@@ -188,6 +188,13 @@ describe('buildFooterAddressing', () => {
     )).toEqual({ sendTo: 'ou_owner', cc: [] });
   });
 
+  it('honors a frozen bot-sender bit even before cross-ref learns that bot id', () => {
+    expect(buildFooterAddressing(
+      { ownerOpenId: 'ou_owner', lastCallerOpenId: 'ou_new_bot', lastCallerIsBot: true },
+      { isOncall: true, knownBotOpenIds },
+    )).toEqual({ sendTo: 'ou_owner', cc: [] });
+  });
+
   it('drops addressing when the resolved recipient would be a bot', () => {
     expect(buildFooterAddressing(
       { ownerOpenId: 'ou_codex_bot', lastCallerOpenId: 'ou_claude_bot' },

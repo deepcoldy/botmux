@@ -20,7 +20,7 @@
  */
 import { mkdirSync, existsSync, writeFileSync, chmodSync, readdirSync, readFileSync, rmSync, rmdirSync, unlinkSync, statSync, lstatSync, readlinkSync, realpathSync, openSync, fstatSync, readSync, writeSync, closeSync, constants as fsConstants } from 'node:fs';
 import { atomicWriteFileSync } from '../../utils/atomic-write.js';
-import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
+import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawn, spawnSync } from 'node:child_process';
 import { compileToBwrap, type FsPolicy } from '../cli/fs-policy.js';
@@ -72,7 +72,7 @@ export function buildCredentialOnlySandboxArgs(input: {
   hideDirectories: string[];
   hideFiles: string[];
   readonlyPaths?: string[];
-  privateReadonlyDirectories?: Array<{ parent: string; path: string }>;
+  privateReadonlyDirectories?: Array<{ parent: string; directory: string }>;
   workingDir: string;
   cliBin: string;
   cliArgs: string[];
@@ -84,15 +84,6 @@ export function buildCredentialOnlySandboxArgs(input: {
     assertCredentialIsolationPath(path, 'directory')))];
   const hideFiles = [...new Set(input.hideFiles.map(path =>
     assertCredentialIsolationPath(path, 'file')))];
-  const privateReadonlyDirectories = (input.privateReadonlyDirectories ?? []).map(entry => {
-    const parent = assertCredentialIsolationPath(entry.parent, 'private parent');
-    const path = assertCredentialIsolationPath(entry.path, 'private directory');
-    const child = relative(parent, path);
-    if (!child || child.startsWith('..') || isAbsolute(child)) {
-      throw new Error(`credential isolation private directory must be below its parent: ${path}`);
-    }
-    return { parent, path };
-  });
   if (hideDirectories.length === 0 && hideFiles.length === 0) {
     throw new Error('credential isolation requires at least one authority mask');
   }
@@ -101,16 +92,24 @@ export function buildCredentialOnlySandboxArgs(input: {
     '--bind', '/', '/',
     '--proc', '/proc',
   ];
+  for (const entry of input.privateReadonlyDirectories ?? []) {
+    const parent = assertCredentialIsolationPath(entry.parent, 'private readonly parent');
+    const directory = assertCredentialIsolationPath(
+      entry.directory,
+      'private readonly directory',
+    );
+    if (!directory.startsWith(`${parent}/`)) {
+      throw new Error(`private readonly directory must be below its parent: ${directory}`);
+    }
+    // Hide every sibling channel first, then expose only the owning directory.
+    // A directory bind (rather than a file bind) observes the worker's atomic
+    // rename-based capability rotations without pinning the old inode.
+    args.push('--tmpfs', parent, '--ro-bind', directory, directory);
+  }
   for (const path of [...new Set(input.readonlyPaths ?? [])].sort()) {
     const normalized = assertCredentialIsolationPath(path, 'readonly path');
     args.push('--ro-bind', normalized, normalized);
   }
-  const privateParents = [...new Set(privateReadonlyDirectories.map(entry => entry.parent))].sort();
-  for (const parent of privateParents) args.push('--tmpfs', parent);
-  for (const path of [...new Set(privateReadonlyDirectories.map(entry => entry.path))].sort()) {
-    args.push('--ro-bind', path, path);
-  }
-  for (const parent of privateParents) args.push('--remount-ro', parent);
   for (const directory of hideDirectories.sort()) args.push('--tmpfs', directory);
   for (const file of hideFiles.sort()) args.push('--ro-bind', '/dev/null', file);
   args.push(
@@ -202,7 +201,7 @@ export function prepareCredentialOnlySandbox(input: {
   hideDirectories: string[];
   hideFiles: string[];
   readonlyPaths?: string[];
-  privateReadonlyDirectories?: Array<{ parent: string; path: string }>;
+  privateReadonlyDirectories?: Array<{ parent: string; directory: string }>;
   workingDir: string;
   cliBin: string;
   cliArgs: string[];
@@ -1017,6 +1016,7 @@ export function buildRelayHostEnv(
   const env: NodeJS.ProcessEnv = { ...baseEnv };
   delete env.BOTMUX_SEND_RELAY;
   delete env.BOTMUX_CARD_PREPARED_CONTENT_FILE;
+  delete env.BOTMUX_HOST_RELAY_REQUIRES_CODEX_APP_LEDGER;
   if (preparedContentFile) {
     env.BOTMUX_CARD_LOCAL_LINK_MODE = 'disabled';
     env.BOTMUX_CARD_PREPARED_CONTENT_FILE = preparedContentFile;
@@ -1038,7 +1038,19 @@ export function startOutboxWatcher(
      *  absent the relay still runs, but carries NO durable origin — a missing
      *  hook must never let the sandbox promote its own origin fields. */
     authorize?: (claim: { capability?: string }) =>
-      | { ok: true; origin: { turnId?: string; dispatchAttempt?: number } }
+      | {
+          ok: true;
+          origin: {
+            turnId?: string;
+            dispatchAttempt?: number;
+            /** The worker matched an unsettled Codex App ledger entry. The
+             * host child must still find that exact entry before any provider
+             * side effect; terminal settlement/revocation between authorize
+             * and re-exec therefore fails closed instead of degrading to an
+             * ordinary mutable-session send. */
+            requiresCodexAppLedger?: boolean;
+          };
+        }
       | { ok: false; error: string };
     cliPath?: string;
   } = {},
@@ -1161,6 +1173,11 @@ export function startOutboxWatcher(
       if (trustedOrigin?.turnId !== undefined) requestEnv.BOTMUX_TURN_ID = trustedOrigin.turnId;
       if (trustedOrigin?.dispatchAttempt !== undefined) {
         requestEnv.BOTMUX_DISPATCH_ATTEMPT = String(trustedOrigin.dispatchAttempt);
+      }
+      if (trustedOrigin?.requiresCodexAppLedger) {
+        requestEnv.BOTMUX_HOST_RELAY_REQUIRES_CODEX_APP_LEDGER = '1';
+      } else {
+        delete requestEnv.BOTMUX_HOST_RELAY_REQUIRES_CODEX_APP_LEDGER;
       }
       const child = spawn(process.execPath, [cli, 'send', ...hostArgs], { env: requestEnv });
       let out = '', err = '';

@@ -134,6 +134,18 @@ export function readDashboardCookie(cookieHeader: string | string[] | undefined)
   return null;
 }
 
+/** Credential rotation atomically replaces the token file, so a strict
+ * inode-stability read may transiently throw while the rename wins. Auth must
+ * fail closed for that request rather than letting storage errors escape into
+ * the worker HTTP/WebSocket server. */
+function readLiveDashboardToken(getDashboardToken: () => string | null): string | null {
+  try {
+    return getDashboardToken();
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Resolve terminal write for one request: extract the `X-Botmux-Role` header
  * (a duplicated/array header is treated as absent), verify the request came
@@ -141,10 +153,10 @@ export function readDashboardCookie(cookieHeader: string | string[] | undefined)
  * active token), and gate the role's trust on the machine's platform binding.
  *
  * Both `isPlatformBound` and `getDashboardToken` are thunks evaluated on EVERY
- * call — never snapshotted. `botmux bind`/unbind and `botmux dashboard` (token
- * rotation) rewrite state that the dashboard hot-reloads WITHOUT restarting live
- * workers; a cached value would go stale — keep trusting a request after an
- * unbind / token rotation, or deny legitimate platform writes after a bind.
+ * call — never snapshotted. `botmux bind`/unbind and `botmux dashboard rotate`
+ * rewrite state that the dashboard hot-reloads WITHOUT restarting live workers;
+ * a cached value would go stale — keep trusting a request after an unbind / token
+ * rotation, or deny legitimate platform writes after a bind.
  */
 export function resolveTerminalWriteForRequest(
   headers: Record<string, string | string[] | undefined>,
@@ -155,7 +167,7 @@ export function resolveTerminalWriteForRequest(
   const rawRole = headers['x-botmux-role'];
   const role = typeof rawRole === 'string' ? rawRole : undefined;
   const cookieToken = readDashboardCookie(headers['cookie']);
-  const activeToken = getDashboardToken();
+  const activeToken = readLiveDashboardToken(getDashboardToken);
   const platformProxied = !!activeToken && safeTerminalTokenEqual(cookieToken, activeToken);
   return resolveTerminalWrite({ role, tokenMatches, platformBound: isPlatformBound(), platformProxied });
 }
@@ -175,7 +187,7 @@ export function resolveTerminalAccessForRequest(
   const rawRole = headers['x-botmux-role'];
   const role = typeof rawRole === 'string' ? rawRole : undefined;
   const cookieToken = readDashboardCookie(headers['cookie']);
-  const activeToken = getDashboardToken();
+  const activeToken = readLiveDashboardToken(getDashboardToken);
   const platformProxied = !!activeToken && safeTerminalTokenEqual(cookieToken, activeToken);
   return resolveTerminalAccess({
     role,

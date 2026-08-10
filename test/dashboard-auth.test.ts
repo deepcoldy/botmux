@@ -3,13 +3,13 @@ import { createHmac } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
 import {
-  mkdirSync, mkdtempSync, rmSync, writeFileSync, existsSync, statSync,
+  mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync, existsSync, statSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   verifyHmac, generateToken, parseCookie, decideDashboardAuth,
-  loadPersistedToken, loadOrCreatePersistedToken, persistToken,
+  loadPersistedToken, loadOrCreatePersistedToken, persistToken, rotatePersistedToken,
   loadDashboardSecret, loadOrCreateDashboardSecret,
 } from '../src/dashboard/auth.js';
 
@@ -64,7 +64,7 @@ describe('generateToken', () => {
   });
 });
 
-describe('token persistence (survives restart, rotates only on `botmux dashboard`)', () => {
+describe('token persistence (survives restart, rotates only on `botmux dashboard rotate`)', () => {
   let dir: string;
   let tokenPath: string;
 
@@ -97,6 +97,54 @@ describe('token persistence (survives restart, rotates only on `botmux dashboard
     expect(loadPersistedToken(tokenPath)).toBe('existing-token');
   });
 
+  it('concurrent processes creating the first token all return the persisted winner', async () => {
+    const goPath = join(dir, 'go');
+    const authModuleUrl = new URL('../src/dashboard/auth.ts', import.meta.url).href;
+    const childSource = `
+      import { existsSync, writeFileSync } from 'node:fs';
+      const [tokenPath, readyPath, goPath] = process.argv.slice(1);
+      const { loadOrCreatePersistedToken } = await import(${JSON.stringify(authModuleUrl)});
+      writeFileSync(readyPath, 'ready');
+      while (!existsSync(goPath)) await new Promise(resolve => setTimeout(resolve, 5));
+      process.stdout.write(loadOrCreatePersistedToken(tokenPath));
+    `;
+    const children = Array.from({ length: 12 }, (_, index) => {
+      const readyPath = join(dir, `token-ready-${index}`);
+      const child = spawn(process.execPath, [
+        '--import', 'tsx', '--input-type=module', '-e', childSource,
+        tokenPath, readyPath, goPath,
+      ], { stdio: ['ignore', 'pipe', 'pipe'] });
+      let stdout = '';
+      let stderr = '';
+      child.stdout.on('data', chunk => { stdout += String(chunk); });
+      child.stderr.on('data', chunk => { stderr += String(chunk); });
+      return { child, readyPath, stdout: () => stdout, stderr: () => stderr };
+    });
+
+    try {
+      const deadline = Date.now() + 10_000;
+      while (!children.every(entry => existsSync(entry.readyPath))) {
+        if (Date.now() >= deadline) throw new Error('token children did not reach barrier');
+        await new Promise(resolve => setTimeout(resolve, 10));
+      }
+      writeFileSync(goPath, 'go');
+      const exits = await Promise.all(children.map(async entry => {
+        const [code, signal] = await once(entry.child, 'close');
+        return { code, signal, stdout: entry.stdout(), stderr: entry.stderr() };
+      }));
+      for (const result of exits) {
+        expect(result, result.stderr).toMatchObject({ code: 0, signal: null });
+      }
+      const tokens = exits.map(result => result.stdout);
+      expect(new Set(tokens).size).toBe(1);
+      expect(tokens[0]).toBe(loadPersistedToken(tokenPath));
+    } finally {
+      for (const { child } of children) {
+        if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+      }
+    }
+  }, 20_000);
+
   it('persisted token survives a simulated restart (same file, new process)', () => {
     const tok = generateToken();
     persistToken(tokenPath, tok);
@@ -104,11 +152,10 @@ describe('token persistence (survives restart, rotates only on `botmux dashboard
     expect(loadPersistedToken(tokenPath)).toBe(tok);
   });
 
-  it('re-running `botmux dashboard` overwrites the old token (old link invalidated)', () => {
+  it('running `botmux dashboard rotate` overwrites the old token (old link invalidated)', () => {
     const first = generateToken();
     persistToken(tokenPath, first);
-    const second = generateToken();
-    persistToken(tokenPath, second);
+    const second = rotatePersistedToken(tokenPath);
     expect(second).not.toBe(first);
     expect(loadPersistedToken(tokenPath)).toBe(second);
   });
@@ -118,22 +165,32 @@ describe('token persistence (survives restart, rotates only on `botmux dashboard
     expect(statSync(tokenPath).mode & 0o777).toBe(0o600);
   });
 
+  it('refuses rotation through a token leaf symlink without modifying its target', () => {
+    if (process.platform === 'win32') return;
+    mkdirSync(join(dir, 'nested'));
+    const victim = join(dir, 'victim');
+    writeFileSync(victim, 'keep-me', { mode: 0o600 });
+    symlinkSync(victim, tokenPath);
+
+    expect(() => rotatePersistedToken(tokenPath)).toThrow();
+    expect(readFileSync(victim, 'utf8')).toBe('keep-me');
+  });
+
   it('loadPersistedToken trims surrounding whitespace/newlines', () => {
     const p = join(dir, 'spaced-token');
-    writeFileSync(p, '  tok-with-space\n');
+    writeFileSync(p, '  tok-with-space\n', { mode: 0o600 });
     expect(loadPersistedToken(p)).toBe('tok-with-space');
   });
 
   it('loadPersistedToken returns null for an empty file', () => {
     const p = join(dir, 'empty-token');
-    writeFileSync(p, '   \n');
+    writeFileSync(p, '   \n', { mode: 0o600 });
     expect(loadPersistedToken(p)).toBeNull();
     expect(existsSync(p)).toBe(true);
   });
 
-  it('loadPersistedToken returns null when path is a directory (unreadable)', () => {
-    // dir itself exists but is not a file — read throws, helper swallows.
-    expect(loadPersistedToken(dir)).toBeNull();
+  it('loadPersistedToken fails closed when the credential path is not a regular file', () => {
+    expect(() => loadPersistedToken(dir)).toThrow();
   });
 });
 
@@ -531,7 +588,7 @@ describe('decideDashboardAuth — ?t=<token> cookie set redirect', () => {
     expect(d.kind).toBe('allow');
   });
 
-  it('empty active token never authenticates (server not yet rotated)', () => {
+  it('empty active token never authenticates (server has not created one yet)', () => {
     const d = decideDashboardAuth({
       method: 'POST',
       pathname: '/api/workflows/run-1/cancel',
@@ -586,6 +643,14 @@ describe('decideDashboardAuth — publicReadOnly mode', () => {
     expect(d.kind).toBe('deny401');
   });
 
+  it('publicReadOnly off → tokenless dashboard summary stays private', () => {
+    const d = decideDashboardAuth({
+      method: 'GET', pathname: '/api/dashboard/v1/summary', hasTokenParam: false,
+      presentedToken: undefined, activeToken: TOK, publicReadOnly: false,
+    });
+    expect(d.kind).toBe('deny401');
+  });
+
   it('stale token GET behaves like tokenless read-only (no 401 wall)', () => {
     const d = decideDashboardAuth({
       method: 'GET', pathname: '/api/schedules', hasTokenParam: false,
@@ -626,7 +691,7 @@ describe('decideDashboardAuth — publicReadOnly mode', () => {
   });
 
   it('allow-listed watch-work reads are public in publicReadOnly', () => {
-    for (const pathname of ['/api/sessions', '/api/schedules', '/api/settings', '/api/groups', '/events']) {
+    for (const pathname of ['/api/dashboard/v1/summary', '/api/sessions', '/api/schedules', '/api/settings', '/api/groups', '/events']) {
       const d = decideDashboardAuth({
         method: 'GET', pathname, hasTokenParam: false,
         presentedToken: undefined, activeToken: TOK, publicReadOnly: true,

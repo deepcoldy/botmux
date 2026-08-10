@@ -50,7 +50,7 @@ describe('worker ZMX logical submission recovery', () => {
       'async function flushPending(): Promise<void>',
       'function sendToPty(',
     );
-    const adopt = region('// Adopt mode write:', "case 'raw_input':");
+    const adopt = region('async function writeAdoptMessage', 'async function runAdoptMessageForCapturedGeneration');
 
     expect(flush).toContain('runAmbiguousSubmissionTransaction(');
     expect(flush).toContain('settleVerifiableSubmissionForJournal');
@@ -78,6 +78,17 @@ describe('worker ZMX logical submission recovery', () => {
     expect(adopt).toContain("'zmx_recovery_blocked_before_write'");
     expect(adopt).toContain("'failed'");
     expect(adopt).not.toContain('captureAmbiguousSubmissionFence(');
+    // Both adopt write paths must go through adapterInputHandle so a ZMX write
+    // refusal (sendText/sendSpecialKeys === false) becomes a throw the
+    // transaction can cancel/poison — not a silent success that clears the WAL.
+    // Structured path feeds it to writeInput; raw path calls sendText!/
+    // sendSpecialKeys! on it. A bare backend here would re-open silent loss.
+    expect(adopt).toContain('cliAdapter!.writeInput(adapterInputHandle(submissionBackend), content)');
+    expect(adopt).toContain('const input = adapterInputHandle(submissionBackend)');
+    expect(adopt).toContain('input.sendText!(content)');
+    expect(adopt).toContain("input.sendSpecialKeys!('Enter')");
+    expect(adopt).not.toContain('(adoptBackend as any).sendText');
+    expect(adopt).not.toContain('(adoptBackend as any).sendSpecialKeys');
   });
 
   it('holds definitely-unwritten normal input until restart and fences any blocked durable expiry', () => {

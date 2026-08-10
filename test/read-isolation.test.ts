@@ -7,16 +7,24 @@ import {
   deviceCredentialIsolationMarkerPath,
   isCredentialIsolationReservedBasename,
   buildCredentialIsolationRules,
-  buildSeatbeltProfile,
+  isolatedPaneOriginChannel,
   isolatedPaneReattachSafe,
   isolationPaneMarkerContent,
   ISOLATION_PANE_MARKER_VERSION,
+  isolationPanePolicyDigest,
   botHomePath,
   buildCliExecutableReadCarveOuts,
   sendCredFilePath,
   assertSafeAppId,
   normalizeIsolationPath,
 } from '../src/adapters/cli/read-isolation.js';
+
+const G1 = '11'.repeat(32);
+const POLICY1 = isolationPanePolicyDigest({
+  readIsolation: true,
+  writeSandbox: false,
+  readDenyExtraPaths: ['/private/a'],
+});
 
 describe('normalizeIsolationPath (path hardening)', () => {
   it('drops relative / traversal paths instead of silently keeping them', () => {
@@ -200,6 +208,108 @@ describe('isolatedPaneReattachSafe', () => {
     expect(isolatedPaneReattachSafe('')).toBe(false);
     expect(isolatedPaneReattachSafe('   ')).toBe(false);
   });
+
+  it('binds Darwin warm reattach to the pane channel and exact read/write policy', () => {
+    const marker = isolationPaneMarkerContent(
+      'boot-new',
+      ['credential', 'read'],
+      {
+        originChannelId: G1,
+        readIsolation: true,
+        writeSandbox: false,
+        policyDigest: POLICY1,
+      },
+    );
+    expect(isolatedPaneOriginChannel(marker)).toBe(G1);
+    expect(isolatedPaneReattachSafe(marker, {
+      requiredCapabilities: ['credential', 'read'],
+      readIsolation: true, writeSandbox: false, requireOriginChannel: true,
+      policyDigest: POLICY1,
+    })).toBe(true);
+    expect(isolatedPaneReattachSafe(marker, {
+      requiredCapabilities: ['credential', 'read'],
+      readIsolation: false, writeSandbox: false, requireOriginChannel: true,
+      policyDigest: POLICY1,
+    })).toBe(false);
+    const broadTmpDigest = isolationPanePolicyDigest({
+      readIsolation: true,
+      writeSandbox: true,
+      writeAllowExtraPaths: ['/custom/broad-tmp'],
+    });
+    const narrowTmpDigest = isolationPanePolicyDigest({
+      readIsolation: true,
+      writeSandbox: true,
+      writeAllowExtraPaths: ['/private/var/folders/narrow'],
+    });
+    const broadTmpMarker = isolationPaneMarkerContent('boot-old', ['credential', 'read', 'write'], {
+      originChannelId: G1,
+      readIsolation: true,
+      writeSandbox: true,
+      policyDigest: broadTmpDigest,
+    });
+    expect(isolatedPaneReattachSafe(broadTmpMarker, {
+      requiredCapabilities: ['credential', 'read', 'write'],
+      readIsolation: true,
+      writeSandbox: true,
+      requireOriginChannel: true,
+      policyDigest: narrowTmpDigest,
+    })).toBe(false);
+    expect(isolatedPaneReattachSafe(marker, {
+      requiredCapabilities: ['credential', 'read', 'write'],
+      readIsolation: true, writeSandbox: true, requireOriginChannel: true,
+      policyDigest: POLICY1,
+    })).toBe(false);
+    expect(isolatedPaneReattachSafe(marker, {
+      requiredCapabilities: ['credential', 'read'],
+      readIsolation: true,
+      writeSandbox: false,
+      requireOriginChannel: true,
+      policyDigest: isolationPanePolicyDigest({
+        readIsolation: true,
+        writeSandbox: false,
+        readDenyExtraPaths: ['/private/b'],
+      }),
+    })).toBe(false);
+    expect(isolatedPaneReattachSafe(JSON.stringify({
+      version: 4,
+      bootId: 'legacy-v4',
+      readIsolation: true,
+      writeSandbox: false,
+      originChannelId: G1,
+    }), {
+      requiredCapabilities: ['credential', 'read'],
+      readIsolation: true,
+      writeSandbox: false,
+      requireOriginChannel: true,
+      policyDigest: POLICY1,
+    })).toBe(false);
+    expect(isolatedPaneReattachSafe(isolationPaneMarkerContent(
+      'linux-v7', ['credential', 'read'],
+    ), {
+      requiredCapabilities: ['credential', 'read'],
+      requireOriginChannel: false,
+    })).toBe(true);
+    expect(isolatedPaneReattachSafe(isolationPaneMarkerContent(
+      'credential-only-v7', ['credential'],
+    ), {
+      requiredCapabilities: ['credential'],
+      exactCapabilities: true,
+      requireOriginChannel: false,
+    })).toBe(true);
+    expect(isolatedPaneReattachSafe(isolationPaneMarkerContent(
+      'old-broader-policy-v7', ['credential', 'read', 'write'],
+    ), {
+      requiredCapabilities: ['credential'],
+      exactCapabilities: true,
+      requireOriginChannel: false,
+    })).toBe(false);
+    expect(isolatedPaneReattachSafe(isolationPaneMarkerContent(
+      'linux-v7', ['credential', 'read'],
+    ), {
+      requiredCapabilities: ['credential', 'read'],
+      requireOriginChannel: true,
+    })).toBe(false);
+  });
 });
 
 // ─── cold-start migration: START-TIME env contract (bots.json EPERM fix) ──────
@@ -254,7 +364,7 @@ describe('isolatedPaneReattachSafe — start-time contract bump forces cold resp
  * Ordering note: #709 took 8 (env contract); #714 takes 9. Both prior versions
  * must be rejected. If the merge order flips, rebase so this stays monotonic.
  */
-describe('isolatedPaneReattachSafe — spawn contract changes force cold respawn', () => {
+describe('isolatedPaneReattachSafe — #714 mount contract forces cold respawn of pre-9 panes', () => {
   const full = ['credential', 'read', 'write'] as const;
   for (const v of [7, 8]) {
     it(`rejects a v${v} pane even with full capabilities (its bwrap lacks the marker mount)`, () => {
@@ -267,10 +377,10 @@ describe('isolatedPaneReattachSafe — spawn contract changes force cold respawn
     expect(isolatedPaneReattachSafe(isolationPaneMarkerContent('fresh', [...full]), ['read', 'write'])).toBe(true);
   });
 
-  it('has moved the version past 10 (credential-only capability contract on both OSes)', () => {
-    // Reverting below 11 would silently warm-reattach Seatbelt panes that lack
-    // the private capability file/env contract.
-    expect(ISOLATION_PANE_MARKER_VERSION).toBeGreaterThan(10);
+  it('has moved the version past 8 (the #709 env-contract version)', () => {
+    // Reverting below 9 would silently warm-reattach panes that predate the
+    // migration-marker mount. ≥ 9 is required.
+    expect(ISOLATION_PANE_MARKER_VERSION).toBeGreaterThan(8);
   });
 });
 
@@ -287,75 +397,28 @@ describe('worker capability carve-out ordering', () => {
     expect(macPathAt).toBeGreaterThanOrEqual(0);
     expect(macPublishAt).toBeGreaterThan(macPathAt);
     expect(policyAt).toBeGreaterThan(macPublishAt);
-    expect(source).toContain('mandatoryReadOnlyPaths.push(readIsolationOriginCapabilityFile)');
+    expect(source).toContain('mandatoryReadOnlyPaths.push(managedOriginCapabilityDirectory(');
+
+    const credentialPathAt = source.indexOf(
+      'if (readIsolationOriginChannelId && !sandboxRequested)',
+    );
+    const credentialPublishAt = source.indexOf(
+      'publishSandboxRelayCapability({ failClosed: true })',
+      credentialPathAt,
+    );
+    const credentialWrapperAt = source.indexOf(
+      'if (!willReattachPersistent && credentialOnlyBwrap)',
+      credentialPublishAt,
+    );
+    expect(credentialPathAt).toBeGreaterThanOrEqual(0);
+    expect(credentialPublishAt).toBeGreaterThan(credentialPathAt);
+    expect(credentialWrapperAt).toBeGreaterThan(credentialPublishAt);
 
     const relayAt = source.indexOf('sandboxRelayOutbox = sbx.outbox');
     const relayPublishAt = source.indexOf('publishSandboxRelayCapability();', relayAt);
     expect(relayAt).toBeGreaterThan(policyAt);
     expect(relayPublishAt).toBeGreaterThan(relayAt);
     expect(source).toContain('replaceManagedOriginCapabilityFile(profilePath, buildSeatbeltProfile(');
-
-    const credentialSetupAt = source.indexOf(
-      'if (credentialOnlySeatbelt || credentialOnlyBwrap) {',
-    );
-    const credentialDirectoryAt = source.indexOf(
-      'managedOriginCapabilityDirectory(\n      isolationRuntimeDataDir,\n      cfg.sessionId,',
-      credentialSetupAt,
-    );
-    const credentialPublishAt = source.indexOf(
-      'publishSandboxRelayCapability({ failClosed: true })',
-      credentialDirectoryAt,
-    );
-    const credentialBwrapAt = source.indexOf(
-      'if (!willReattachPersistent && credentialOnlyBwrap)',
-      credentialPublishAt,
-    );
-    const credentialSandboxAt = source.indexOf(
-      'prepareCredentialOnlySandbox({',
-      credentialBwrapAt,
-    );
-    expect(credentialSetupAt).toBeGreaterThan(-1);
-    expect(credentialDirectoryAt).toBeGreaterThan(credentialSetupAt);
-    expect(credentialPublishAt).toBeGreaterThan(credentialDirectoryAt);
-    expect(credentialBwrapAt).toBeGreaterThan(credentialPublishAt);
-    expect(credentialSandboxAt).toBeGreaterThan(credentialBwrapAt);
-    expect(source).toContain('privateReadonlyDirectories: [{');
-    expect(source).toContain('childEnv[MANAGED_ORIGIN_CAPABILITY_DIR_ENV]');
-    expect(source).toContain('delete childEnv[MANAGED_ORIGIN_CAPABILITY_DIR_ENV]');
-
-    const seatbeltAt = source.indexOf(
-      'if (!willReattachPersistent && credentialOnlySeatbelt)',
-    );
-    const seatbeltProfileAt = source.indexOf('buildSeatbeltProfile(', seatbeltAt);
-    const seatbeltEndAt = source.indexOf('seatbeltProfilePath = profilePath;', seatbeltProfileAt);
-    const seatbeltProfileRegion = source.slice(seatbeltProfileAt, seatbeltEndAt);
-    expect(seatbeltAt).toBeGreaterThan(credentialPublishAt);
-    expect(seatbeltProfileRegion).toContain('canonical(profileDir)');
-    expect(seatbeltProfileRegion).toContain('canonical(credentialOnlyCapabilityDir!)');
-  });
-
-  it('orders the credential-only Seatbelt parent deny before the own-session carve-out', () => {
-    const parent = '/Users/u/.botmux/data/read-isolation';
-    const own = `${parent}/origin-own`;
-    const profile = buildSeatbeltProfile(
-      [parent],
-      [own],
-      [],
-      [parent],
-      [],
-      undefined,
-      { denyWritePaths: [parent] },
-    );
-    const parentDeny = profile.indexOf(`(deny file-read* (subpath "${parent}"))`);
-    const parentTraverse = profile.indexOf(
-      `(allow file-read-metadata (literal "${parent}"))`,
-    );
-    const ownAllow = profile.indexOf(`(allow file-read* (subpath "${own}"))`);
-    const writeDeny = profile.indexOf(`(deny file-write* (subpath "${parent}"))`);
-    expect(parentDeny).toBeGreaterThan(-1);
-    expect(parentTraverse).toBeGreaterThan(parentDeny);
-    expect(ownAllow).toBeGreaterThan(parentTraverse);
-    expect(writeDeny).toBeGreaterThan(ownAllow);
   });
 
   it('denies every same-UID Gateway socket before allowing only the current session socket', () => {
@@ -404,7 +467,8 @@ describe('worker capability carve-out ordering', () => {
     expect(credentialWrapperAt).toBeLessThan(spawnAt);
     expect(source).toContain('if (!willReattachPersistent && credentialOnlyBwrap)');
     expect(source).toContain('isCredentialIsolationReservedBasename(name)');
-    expect(source).toContain('isolatedPaneReattachSafe(marker, appliedIsolationCapabilities)');
+    expect(source).toContain('requiredCapabilities: appliedIsolationCapabilities');
+    expect(source).toContain('exactCapabilities: true');
   });
 });
 
@@ -412,9 +476,15 @@ describe('CLI protected capability wiring', () => {
   const cliSource = readFileSync(new URL('../src/cli.ts', import.meta.url), 'utf8');
   const vcSource = readFileSync(new URL('../src/cli/vc-agent.ts', import.meta.url), 'utf8');
 
-  it('passes the session id when resolving protected turn snapshots', () => {
+  it('requires host-file attestation when the fixed sentinel is kernel-denied', () => {
     expect(cliSource).toContain(
-      'const liveMarkerCtx = resolveSessionContext(\n    resolveDataDir(),\n    process.env.BOTMUX_SESSION_ID,',
+      'let liveMarkerCtx = findLiveAncestorSessionContext(sendDataDir);',
+    );
+    expect(cliSource).toContain(
+      'managedOriginIsolationSentinelAccess(osUserHomeDir)',
+    );
+    expect(cliSource).toContain(
+      'if (!relayDir && isolatedSendRequired && !isolatedCapabilityCtx)',
     );
     expect(cliSource).toContain(
       'const liveOrigin = resolveSessionContext(resolveDataDir(), sessionId);',

@@ -47,7 +47,7 @@
 
 ## Dashboard / 安全
 
-- **别把带 token 的 dashboard URL 发到群里**（等于公开临时访问凭证）。安全敏感场景把 host 绑本机：`BOTMUX_DASHBOARD_HOST=127.0.0.1`。token 一次性，每跑一次 `botmux dashboard` 重新生成、旧链接立即失效。
+- **别把带 token 的 dashboard URL 发到群里**（等于公开临时访问凭证）。安全敏感场景把 host 绑本机：`BOTMUX_DASHBOARD_HOST=127.0.0.1`。token 是轮换式而非单次消费：轮换前同一 URL 可重复使用；只有 `botmux dashboard rotate` 会生成新 token、让旧链接立即失效，裸命令和 `botmux dashboard current` 都不会轮换。
 - **dashboard 打不开**：先 `curl http://<host>:<port>/__health`，返回 `{"ok":true}` 说明服务正常；问题多在浏览器代理 / host 不对（mac 连内网 IP 会变）/ 打开了旧 token 链接。
 
 ## 排查通用手法

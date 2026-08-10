@@ -15,7 +15,7 @@
 | `botmux delete <id>` (别名 `del`/`rm`) | 关闭指定会话，支持 ID 前缀匹配 |
 | `botmux delete all` | 关闭所有活跃会话 |
 | `botmux delete stopped` | 清理进程已退出的僵尸会话 |
-| `botmux dashboard` | 输出一次 Web Dashboard URL（每次刷 token） |
+| `botmux dashboard [current\|rotate]` | 获取当前 Dashboard 登录 URL，尚无 token 时创建第一个；`rotate` 才显式替换已有 token |
 
 daemon 在线时，`botmux delete` 会先请求会话所属 daemon 执行与 `/close`
 一致的生命周期收口：移除内存中的活跃会话、持久化关闭状态，并回收
