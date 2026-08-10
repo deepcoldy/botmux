@@ -291,6 +291,8 @@ function sessionBotCliMismatch(ds: DaemonSession): { sessionCli: string; botCli:
 type CliMismatchCloseResult =
   | 'not_mismatched'
   | 'closed'
+  /** Closed, but its remote session survived and needs manual cleanup. */
+  | 'closed_with_residual'
   | 'teardown_failed'
   | 'transfer_deferred';
 
@@ -370,7 +372,17 @@ async function closeActiveSessionIfCliMismatch(ds: DaemonSession): Promise<CliMi
   } else {
     logger.warn(`[${tag}] CLI mismatch (session=${mismatch.sessionCli}, bot=${mismatch.botCli}), closing active session`);
   }
-  await closeSession(ds.session.sessionId);
+  const result = await closeSession(ds.session.sessionId);
+  if (result.ok && result.outcome === 'closed_with_residual') {
+    // A hot CLI/backend switch can hit an old mojo row carrying a parked lineage.
+    // This path has no interactive surface, so the warning has to be loud in the
+    // log AND counted separately for whatever is showing the sweep total.
+    logger.warn(
+      `[${tag}] CLI mismatch close left an UNCANCELLED remote session `
+      + `(${result.residual.taskId}); manual cleanup required`,
+    );
+    return 'closed_with_residual';
+  }
   return 'closed';
 }
 
@@ -384,10 +396,13 @@ async function closeActiveSessionIfCliMismatch(ds: DaemonSession): Promise<CliMi
  * 豁免口径与 restoreActiveSessions 一致：queued（待办池）会话从没起过 CLI；
  * adopt 会话接管的是用户自己的外部 CLI，其 cliId 与 bot 配置不同是合法状态。
  */
-export async function closeCliMismatchedSessionsForBot(larkAppId: string): Promise<number> {
+export async function closeCliMismatchedSessionsForBot(
+  larkAppId: string,
+): Promise<{ closed: number; residual: number }> {
   const registry = getActiveSessionsRegistry();
-  if (!registry) return 0;
+  if (!registry) return { closed: 0, residual: 0 };
   let closed = 0;
+  let residual = 0;
   // 先快照再遍历：closeSession 会在迭代途中从 registry 删项。
   for (const ds of [...registry.values()]) {
     if (ds.larkAppId !== larkAppId) continue;
@@ -404,6 +419,7 @@ export async function closeCliMismatchedSessionsForBot(larkAppId: string): Promi
     try {
       const result = await closeActiveSessionIfCliMismatch(ds);
       if (result === 'closed') closed++;
+      else if (result === 'closed_with_residual') { closed++; residual++; }
       else if (result === 'transfer_deferred') armCliMismatchResweep(ds);
     } catch (err) {
       logger.error(
@@ -412,7 +428,7 @@ export async function closeCliMismatchedSessionsForBot(larkAppId: string): Promi
       );
     }
   }
-  return closed;
+  return { closed, residual };
 }
 
 /**

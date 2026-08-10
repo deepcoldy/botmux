@@ -80,6 +80,7 @@ import {
   type DashboardUrls,
 } from './core/dashboard-url.js';
 import { resolveBotmuxDataDir } from './core/data-dir.js';
+import { parseCloseResidual, type ParsedCloseResidual } from './core/close-residual.js';
 import { dashboardSecretPath } from './core/dashboard-secret.js';
 import { getGitRepoInfo } from './core/session-row-enrichment.js';
 import { deleteWhiteboard, listWhiteboards, readWhiteboard, whiteboardEnabled } from './services/whiteboard-store.js';
@@ -2388,7 +2389,7 @@ async function buildGroupsMatrix(): Promise<GroupsMatrix> {
  */
 async function closeSessionsMatching(
   pred: (s: any) => boolean,
-): Promise<{ sessionId: string; ok: boolean; error?: string }[]> {
+): Promise<{ sessionId: string; ok: boolean; error?: string; residual?: ParsedCloseResidual }[]> {
   const matching = aggregator.getSessions().filter(s => s.status !== 'closed' && pred(s));
   return Promise.all(matching.map(async s => {
     try {
@@ -2400,9 +2401,11 @@ async function closeSessionsMatching(
       const text = await upstream.text();
       let body: any = null;
       try { body = JSON.parse(text); } catch { /* tolerate */ }
+      const residual = body?.ok ? parseCloseResidual(body) : undefined;
       return {
         sessionId: s.sessionId as string,
         ok: !!body?.ok,
+        ...(residual ? { residual } : {}),
         error: body?.ok ? undefined : (body?.error ?? `http_${upstream.status}`),
       };
     } catch (e: any) {
@@ -3158,9 +3161,14 @@ const server = createServer(async (req, res) => {
           // else (incl. an unparseable/missing body) as a failure rather than a
           // silent success.
           const ok = upstream.ok && parsed?.ok === true;
+          // A residual is NOT a failure (the row closed) but must not be counted
+          // as a clean close either: an idle/workerless mojo row can carry a
+          // parked lineage, so this path really does produce them.
+          const residual = ok ? parseCloseResidual(parsed) : undefined;
           return {
             sessionId: s.sessionId,
             ok,
+            ...(residual ? { residual } : {}),
             error: ok ? undefined : (parsed?.error ?? `http_${upstream.status}`),
           };
         } catch (e: any) {

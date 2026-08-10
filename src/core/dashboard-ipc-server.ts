@@ -3982,7 +3982,11 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
       wrapperCli: selected.wrapperCli ?? null,
       model: model || null,
       selectionKey,
-      closedMismatchedSessions,
+      // Number kept for compatibility with an older dashboard bundle; the residual
+      // count rides alongside so a hot CLI switch cannot silently strand remote
+      // sessions behind a plain "closed N".
+      closedMismatchedSessions: closedMismatchedSessions.closed,
+      closedMismatchedResidual: closedMismatchedSessions.residual,
       // Report the (possibly auto-cleared) read-isolation state + whether the new
       // agent can still enforce it, so the dashboard updates its toggle immediately
       // instead of showing a stale enabled/supported state until a full refetch.

@@ -34,6 +34,7 @@ import { createInterface } from 'node:readline';
 import { createRequire } from 'node:module';
 import { randomBytes, randomUUID } from 'node:crypto';
 import { validateWorkingDir } from './core/working-dir.js';
+import { describeCloseResidual, parseCloseResidual, type ParsedCloseResidual } from './core/close-residual.js';
 import {
   findAncestorSessionContext as findLiveAncestorSessionContext,
   resolveSessionContext,
@@ -4751,10 +4752,8 @@ async function postOwningDaemonSessionMutation(
  * boundary further out. JSON is `any` at this seam, so nothing but an explicit
  * read keeps it — the discriminant cannot help here.
  */
-type AbandonResidual = { reason?: string; taskId?: string };
-
 type AuthoritativeAbandonResult =
-  | { ok: true; mode: 'daemon'; residual?: AbandonResidual }
+  | { ok: true; mode: 'daemon'; residual?: ParsedCloseResidual }
   | { ok: true; mode: 'offline'; current: SessionData; cleanedBacking?: string }
   | { ok: false; error?: string };
 
@@ -4782,11 +4781,11 @@ async function abandonSessionAuthoritatively(
         const res = await postSessionCliIpc(ipcPort, session.sessionId, 'close', {});
         const body = await res.json().catch(() => ({} as Record<string, unknown>));
         if (res.ok && (body as { ok?: unknown }).ok) {
-          // Preserve an uncancelled remote session. An older daemon sends no
-          // `outcome` at all, which is treated as an ordinary close.
-          const outcome = (body as { outcome?: unknown }).outcome;
-          const residual = (body as { residual?: AbandonResidual }).residual;
-          return outcome === 'closed_with_residual' && residual
+          // Shared parser: a body that DECLARES a residual must warn even when the
+          // `residual` object is missing/malformed, or a bad payload silently
+          // becomes an ordinary success again.
+          const residual = parseCloseResidual(body);
+          return residual
             ? { ok: true, mode: 'daemon', residual }
             : { ok: true, mode: 'daemon' };
         }
@@ -5575,7 +5574,7 @@ function interactiveSessionPicker(active: SessionData[], probeSnapshot: BackingP
           ? {
             style: 'warn',
             text: `⚠ 本地已删除 ${s.sessionId.substring(0, 8)}，但远端会话未取消`
-              + `${result.residual.taskId ? `（${result.residual.taskId}）` : ''}，需人工清理`,
+              + `（${describeCloseResidual(result.residual)}），需人工清理`,
           }
           : { style: 'success', text: `✓ 已删除 ${s.sessionId.substring(0, 8)}` })
         : { style: 'warn', text: `✓ 已离线删除 ${s.sessionId.substring(0, 8)}` };
@@ -5899,7 +5898,7 @@ async function cmdDelete(): Promise<void> {
       residual++;
       console.warn(
         `⚠ ${s.sessionId.substring(0, 8)} ${s.title}：本地已关闭，但远端会话未取消`
-        + `${result.residual.taskId ? `（${result.residual.taskId}）` : ''}，需人工清理`,
+        + `（${describeCloseResidual(result.residual)}），需人工清理`,
       );
       continue;
     }

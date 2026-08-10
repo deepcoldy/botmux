@@ -1405,8 +1405,16 @@ export function BotAgentSection(props: {
         const closedCount = Number.isInteger(res.body.closedMismatchedSessions) && res.body.closedMismatchedSessions > 0
           ? res.body.closedMismatchedSessions as number
           : 0;
+        const residualCount = Number.isInteger(res.body.closedMismatchedResidual)
+          ? res.body.closedMismatchedResidual as number
+          : 0;
         const closedText = closedCount > 0
           ? tr('botDefaults.agentClosedCount', { count: closedCount })
+            // Some of those closes left a remote session running; saying only
+            // "closed N" would report them as fully torn down.
+            + (residualCount > 0
+              ? `（⚠️ ${residualCount} 个远端会话未取消，需人工清理）`
+              : '')
           : '';
         setAgentStatus(res.body.availabilityWarning
           ? { text: `⚠️ ${res.body.availabilityWarning}${closedText ? ` · ${closedText}` : ''}` }

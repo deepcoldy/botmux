@@ -969,6 +969,7 @@ export const messages: Record<string, string> = {
   'card.dashboard.sessions.confirm.close.title': 'Close this session?',
   'card.dashboard.sessions.confirm.close.text': 'Once closed the session cannot continue and any in-flight progress may be lost. Session: {title}',
   'card.dashboard.sessions.close_failed': '⚠️ Close failed: {reason}',
+  'card.dashboard.sessions.close_residual': '⚠️ **Closed locally, but the remote session was NOT cancelled**: `{taskId}` — manual cleanup required.',
   'card.dashboard.sessions.session_not_found': '⚠️ Session not found or already cleaned up.',
   'card.dashboard.sessions.close.disabled.alreadyClosed': 'Session already closed',
   'card.dashboard.sessions.close.disabled.starting': 'Session is starting; close disabled',

@@ -1,3 +1,4 @@
+import { describeCloseResidual } from '../../core/close-residual.js';
 import {
   memo,
   useCallback,
@@ -1081,9 +1082,14 @@ function ManageDialog(props: {
         const closed = (x.closedSessions ?? []) as any[];
         const failed = closed.filter(c => !c.ok).length;
         const ok = closed.length - failed;
+        // Closed locally but the remote session survived: not a failure, but it
+        // must not disappear into the plain "closed N" tally.
+        const residuals = closed.filter(c => c.ok && c.residual)
+          .map(c => describeCloseResidual(c.residual));
         const note = closed.length === 0
           ? ''
-          : failed === 0 ? `（关闭 ${ok} 个会话）` : `（关闭 ${ok} 个，${failed} 个失败）`;
+          : `（关闭 ${ok} 个会话${failed ? `，${failed} 个失败` : ''}`
+            + `${residuals.length ? `，${residuals.length} 个远端未取消需人工清理：${residuals.join(', ')}` : ''}）`;
         return `${x.larkAppId}: OK${note}`;
       }).join('\n');
       alert(lines || `Unexpected: ${JSON.stringify(respBody)}`);
@@ -1114,9 +1120,12 @@ function ManageDialog(props: {
           const closed = (respBody.closedSessions ?? []) as any[];
           const failed = closed.filter(c => !c.ok).length;
           const ok = closed.length - failed;
+          const residuals = closed.filter(c => c.ok && c.residual)
+            .map(c => describeCloseResidual(c.residual));
           const closedNote = closed.length === 0
             ? ''
-            : failed === 0 ? `\n关闭了 ${ok} 个会话。` : `\n关闭了 ${ok} 个会话，${failed} 个会话关闭失败。`;
+            : `\n关闭了 ${ok} 个会话${failed ? `，${failed} 个会话关闭失败` : ''}`
+              + `${residuals.length ? `\n⚠️ ${residuals.length} 个远端会话未取消，需人工清理：${residuals.join(', ')}` : ''}。`;
           alert(`已解散（由 ${member.botName ?? member.larkAppId} 执行）${closedNote}`);
           await props.onReloadGroups({ force: true });
           props.onClose();

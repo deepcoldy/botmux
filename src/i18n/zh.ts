@@ -970,6 +970,7 @@ export const messages: Record<string, string> = {
   'card.dashboard.sessions.confirm.close.title': '确认关闭会话？',
   'card.dashboard.sessions.confirm.close.text': '关闭后会话将无法继续，已有进度可能丢失。会话：{title}',
   'card.dashboard.sessions.close_failed': '⚠️ 关闭失败：{reason}',
+  'card.dashboard.sessions.close_residual': '⚠️ **本地已关闭，但远端会话未取消**：`{taskId}`，需人工清理。',
   'card.dashboard.sessions.session_not_found': '⚠️ 会话不存在或已被清理。',
   'card.dashboard.sessions.close.disabled.alreadyClosed': '会话已关闭',
   'card.dashboard.sessions.close.disabled.starting': '会话启动中，暂不可关闭',

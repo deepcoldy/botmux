@@ -898,7 +898,7 @@ describe('closeCliMismatchedSessionsForBot — runtime CLI hot-switch sweep', ()
 
     const closed = await closeCliMismatchedSessionsForBot('app_test');
 
-    expect(closed).toBe(1);
+    expect(closed).toMatchObject({ closed: 1 });
     expect(closeSession).toHaveBeenCalledWith(stale.sessionId);
     expect(sessionStore.getSession(stale.sessionId)!.status).toBe('closed');
     expect(wp.registry!.get(sessionKey('om_rt_stale', 'app_test'))).toBeUndefined();
@@ -913,8 +913,30 @@ describe('closeCliMismatchedSessionsForBot — runtime CLI hot-switch sweep', ()
     sessionStore.updateSession(s);
     registerDs(s);
 
-    expect(await closeCliMismatchedSessionsForBot('app_test')).toBe(1);
+    expect(await closeCliMismatchedSessionsForBot('app_test'))
+      .toMatchObject({ closed: 1 });
     expect(sessionStore.getSession(s.sessionId)!.status).toBe('closed');
+  });
+
+  it('counts a close that left an uncancelled remote session', async () => {
+    // A hot CLI/backend switch can hit an old mojo row carrying a parked lineage.
+    // This sweep has no interactive surface, so the count is the only way the
+    // dashboard can avoid reporting those as fully torn down.
+    const s = makeActivePersistentSession('om_rt_residual');
+    s.wrapperCli = 'aiden x claude';
+    s.agentFrozen = true;
+    sessionStore.updateSession(s);
+    registerDs(s);
+    vi.mocked(closeSession).mockResolvedValueOnce({
+      ok: true,
+      outcome: 'closed_with_residual',
+      residual: { reason: 'mojo_lineage_quarantined', taskId: 'mojo-parked-9' },
+      alreadyClosed: false,
+      known: true,
+    } as never);
+
+    expect(await closeCliMismatchedSessionsForBot('app_test'))
+      .toMatchObject({ closed: 1, residual: 1 });
   });
 
   it('closes runtime identity mismatches and describes both distributions in the warning', async () => {
@@ -939,7 +961,8 @@ describe('closeCliMismatchedSessionsForBot — runtime CLI hot-switch sweep', ()
     sessionStore.updateSession(s);
     registerDs(s);
 
-    expect(await closeCliMismatchedSessionsForBot('app_test')).toBe(1);
+    expect(await closeCliMismatchedSessionsForBot('app_test'))
+      .toMatchObject({ closed: 1 });
     expect(sessionStore.getSession(s.sessionId)!.status).toBe('closed');
     const warnings = vi.mocked(logger.warn).mock.calls.flat().join('\n');
     expect(warnings).toContain('session=Frozen Codex');
@@ -961,7 +984,8 @@ describe('closeCliMismatchedSessionsForBot — runtime CLI hot-switch sweep', ()
     sessionStore.updateSession(s);
     registerDs(s);
 
-    expect(await closeCliMismatchedSessionsForBot('app_test')).toBe(1);
+    expect(await closeCliMismatchedSessionsForBot('app_test'))
+      .toMatchObject({ closed: 1 });
     expect(closeSession).toHaveBeenCalledWith(s.sessionId);
     expect(sessionStore.getSession(s.sessionId)!.status).toBe('closed');
   });
@@ -976,7 +1000,8 @@ describe('closeCliMismatchedSessionsForBot — runtime CLI hot-switch sweep', ()
     sessionStore.updateSession(s);
     registerDs(s);
 
-    expect(await closeCliMismatchedSessionsForBot('app_test')).toBe(1);
+    expect(await closeCliMismatchedSessionsForBot('app_test'))
+      .toMatchObject({ closed: 1 });
     expect(closeSession).toHaveBeenCalledWith(s.sessionId);
     expect(sessionStore.getSession(s.sessionId)!.status).toBe('closed');
   });
@@ -994,7 +1019,8 @@ describe('closeCliMismatchedSessionsForBot — runtime CLI hot-switch sweep', ()
     sessionStore.updateSession(s);
     registerDs(s);
 
-    expect(await closeCliMismatchedSessionsForBot('app_test')).toBe(0);
+    expect(await closeCliMismatchedSessionsForBot('app_test'))
+      .toMatchObject({ closed: 0 });
     expect(closeSession).not.toHaveBeenCalledWith(s.sessionId);
     expect(sessionStore.getSession(s.sessionId)!.status).toBe('active');
   });
@@ -1006,7 +1032,8 @@ describe('closeCliMismatchedSessionsForBot — runtime CLI hot-switch sweep', ()
     const ds = registerDs(s);
     transferState.active.add(ds);
 
-    expect(await closeCliMismatchedSessionsForBot('app_test')).toBe(0);
+    expect(await closeCliMismatchedSessionsForBot('app_test'))
+      .toMatchObject({ closed: 0 });
     expect(closeSession).not.toHaveBeenCalledWith(s.sessionId);
     expect(sessionStore.getSession(s.sessionId)!.status).toBe('active');
 
@@ -1041,7 +1068,8 @@ describe('closeCliMismatchedSessionsForBot — runtime CLI hot-switch sweep', ()
     sessionStore.updateSession(otherBot);
     registerDs(otherBot, 'app_other');
 
-    expect(await closeCliMismatchedSessionsForBot('app_test')).toBe(0);
+    expect(await closeCliMismatchedSessionsForBot('app_test'))
+      .toMatchObject({ closed: 0 });
     expect(closeSession).not.toHaveBeenCalled();
     for (const s of [queued, adopt, otherBot]) {
       expect(sessionStore.getSession(s.sessionId)!.status).toBe('active');
@@ -1059,7 +1087,8 @@ describe('closeCliMismatchedSessionsForBot — runtime CLI hot-switch sweep', ()
     (ds as any).worker = { killed: false };
     vi.mocked(TmuxBackend.killSession).mockClear();
 
-    expect(await closeCliMismatchedSessionsForBot('app_test')).toBe(1);
+    expect(await closeCliMismatchedSessionsForBot('app_test'))
+      .toMatchObject({ closed: 1 });
     expect(closeSession).toHaveBeenCalledWith(s.sessionId);
     expect(TmuxBackend.killSession).not.toHaveBeenCalled();
   });
@@ -1077,7 +1106,8 @@ describe('closeCliMismatchedSessionsForBot — runtime CLI hot-switch sweep', ()
       .mockImplementationOnce(() => { throw new Error('ownership probe unavailable'); })
       .mockImplementationOnce(() => undefined);
 
-    await expect(closeCliMismatchedSessionsForBot('app_test')).resolves.toBe(1);
+    await expect(closeCliMismatchedSessionsForBot('app_test'))
+      .resolves.toMatchObject({ closed: 1 });
 
     expect(sessionStore.getSession(blocked.sessionId)?.status).toBe('active');
     expect(wp.registry!.get(sessionKey('om_rt_zmx_blocked', 'app_test'))?.session.sessionId).toBe(blocked.sessionId);
@@ -1089,6 +1119,7 @@ describe('closeCliMismatchedSessionsForBot — runtime CLI hot-switch sweep', ()
 
   it('returns 0 when the registry is not initialized', async () => {
     wp.registry = null;
-    expect(await closeCliMismatchedSessionsForBot('app_test')).toBe(0);
+    expect(await closeCliMismatchedSessionsForBot('app_test'))
+      .toMatchObject({ closed: 0 });
   });
 });

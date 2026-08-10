@@ -25,6 +25,7 @@ import type { DaemonClient } from '../../dashboard/daemon-internal-client.js';
 import type { SessionRow } from '../../core/dashboard-rows.js';
 import { config } from '../../config.js';
 import { formatUrlHost } from '../../core/dashboard-url.js';
+import { describeCloseResidual, parseCloseResidual } from '../../core/close-residual.js';
 import { type Locale, t } from '../../i18n/index.js';
 
 import { terminalMultiUrl } from './card-builder.js';
@@ -828,9 +829,7 @@ export async function handleSessionsCardAction(
     // that as `outcome: 'closed_with_residual'`; rendering the ordinary closed card
     // would tell the operator everything is gone. This seam is JSON, so only an
     // explicit read preserves it.
-    const residual = body.outcome === 'closed_with_residual'
-      ? (body.residual as { reason?: string; taskId?: string } | undefined)
-      : undefined;
+    const residual = parseCloseResidual(body);
     const detail = composeDetail(synth, now());
     const cardJson = buildSessionsDetailCard(detail, {
       invokerOpenId: operatorOpenId,
@@ -852,8 +851,12 @@ export async function handleSessionsCardAction(
         : undefined;
       elements?.unshift({
         tag: 'markdown',
-        content: `⚠️ **本地已关闭，但远端会话未取消**${residual.taskId ? `：\`${residual.taskId}\`` : ''}`
-          + '，需人工清理。',
+        // locale-aware: an English bot must not receive a Chinese warning.
+        content: t(
+          'card.dashboard.sessions.close_residual',
+          { taskId: describeCloseResidual(residual) },
+          locale,
+        ),
       });
     }
     return { card: { type: 'raw', data: card } };
