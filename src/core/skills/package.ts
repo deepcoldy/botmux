@@ -1,5 +1,5 @@
-import { existsSync, readFileSync, realpathSync } from 'node:fs';
-import { basename, join } from 'node:path';
+import { existsSync, readFileSync, realpathSync, statSync } from 'node:fs';
+import { basename, isAbsolute, join, relative, sep } from 'node:path';
 import { readSkillFrontmatter } from './frontmatter.js';
 import type { SkillPackage, SkillSource } from './types.js';
 
@@ -21,7 +21,13 @@ export function loadSkillPackage(
   const valid = validateSkillPackageDir(dir);
   if (!valid.ok) throw new Error(valid.reason);
   const rootDir = realpathSync(dir);
-  const text = readFileSync(join(rootDir, 'SKILL.md'), 'utf-8');
+  const entrypoint = realpathSync(join(rootDir, 'SKILL.md'));
+  const entrypointRelative = relative(rootDir, entrypoint);
+  if (entrypointRelative === '..' || entrypointRelative.startsWith(`..${sep}`) || isAbsolute(entrypointRelative)) {
+    throw new Error('skill_entrypoint_outside_root');
+  }
+  if (!statSync(entrypoint).isFile()) throw new Error('skill_entrypoint_not_file');
+  const text = readFileSync(entrypoint, 'utf-8');
   const fm = readSkillFrontmatter(text);
   const name = fm.name?.trim() || basename(rootDir);
   if (!isValidSkillName(name)) throw new Error(`invalid_skill_name:${name}`);

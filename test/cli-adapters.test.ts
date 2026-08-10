@@ -829,6 +829,18 @@ describe('pi buildArgs', () => {
     expect(adapter.maxInitialPromptArgBytes).toBeUndefined();
     expect(adapter.altScreen).toBe(true);
   });
+
+  it('pins the configured model instead of inheriting Pi defaults', () => {
+    const args = adapter.buildArgs({
+      sessionId: 'sess-pi',
+      resume: false,
+      model: 'custom/long-context-model',
+    });
+    expect(args).toEqual([
+      '--session-id', 'sess-pi',
+      '--model', 'custom/long-context-model',
+    ]);
+  });
 });
 
 describe('oh-my-pi buildArgs', () => {

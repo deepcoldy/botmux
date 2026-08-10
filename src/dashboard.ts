@@ -15,8 +15,8 @@ import { gracefulProcessExitCode } from './pm2-graceful-exit.js';
 import { config, isWildcardBindHost } from './config.js';
 import { listenWithProbe } from './utils/listen-with-probe.js';
 import {
-  generateToken, parseCookie, buildSetCookie, verifyHmac, cliAuthBind, decideDashboardAuth,
-  loadPersistedToken, loadOrCreatePersistedToken, persistToken,
+  parseCookie, buildSetCookie, verifyHmac, cliAuthBind, decideDashboardAuth,
+  loadPersistedToken, loadOrCreatePersistedToken, rotatePersistedToken,
   loadDashboardSecret, loadOrCreateDashboardSecret,
 } from './dashboard/auth.js';
 import { DaemonRegistry, botsRosterSignature } from './dashboard/registry.js';
@@ -151,7 +151,22 @@ import {
   removeInstalledSkills,
   updateInstalledSkillAsync,
 } from './services/skill-registry-store.js';
+import { readSkillPackRegistry } from './services/skill-pack-store.js';
+import {
+  cloneSkillPack,
+  createSkillPack,
+  deleteSkillPack,
+  getSkillPack,
+  listSkillPacks,
+  updateSkillPack,
+  SkillPackStoreError,
+} from './services/skill-pack-store.js';
 import { redactGitUrlCredentials } from './core/skills/sources.js';
+import {
+  enrichPackForDashboard,
+  enrichPacksForDashboard,
+  sanitizeSkillForDashboard,
+} from './dashboard/skill-pack-response.js';
 import { effectiveDefaultWorkingDir, getBot, loadBotConfigs, parseBotConfigsFromText, type BotConfig, type VcMeetingAgentConfig } from './bot-registry.js';
 import { addChatToFeedGroup, createFeedGroup, FEED_GROUP_SCOPES, FeedGroupApiError, listFeedGroups } from './dashboard/feed-groups.js';
 import { generateAuthUrl, handleCallbackUrl, isCallbackUrl } from './utils/user-token.js';
@@ -167,9 +182,9 @@ import {
   runCodexSideConversationMonitor,
   runCodexNotifierWorkerSupervisor,
 } from './features/codex-notifier/index.js';
-import type { BotSkillPolicy, SkillPackage } from './core/skills/types.js';
+import type { BotSkillPolicy, SkillPack, SkillPackage, SkillSelector } from './core/skills/types.js';
 import { discoverNativeCliSkillGroups } from './core/skills/discovery.js';
-import { analyzeSkillReferences, type SkillReferenceBot, type SkillReferenceSummary } from './core/skills/references.js';
+import { analyzeSkillReferences, packsContainingSkill, type SkillReferenceBot, type SkillReferenceSummary } from './core/skills/references.js';
 import { discoverDashboardSkills, installDashboardSkill, parseDashboardSkillInstallRequest, parseInstallLocalLinksSources, MAX_LOCAL_LINK_SOURCES } from './dashboard/skill-install-request.js';
 import { botDefaultsPayload, botSummaryPayload, brandMapByAppId } from './dashboard/bot-payload.js';
 import {
@@ -219,6 +234,19 @@ import { assertPluginBindingTransition, describePluginDependencyError } from './
 import { inspectGatewayEntry } from './core/plugins/mcp/gateway-installer.js';
 import type { InstalledPluginRecord, PluginDashboardEntry } from './core/plugins/types.js';
 import { fetchDaemonIpc } from './core/daemon-ipc-auth.js';
+import {
+  buildDashboardSummary,
+  parseDashboardSummaryRows,
+} from './dashboard/dashboard-summary.js';
+import { createDashboardSummaryEndpoint } from './dashboard/dashboard-summary-endpoint.js';
+import { scrubWorkflowWorkerEnv } from './utils/child-env.js';
+
+// The dashboard is an independent long-lived PM2 app and can be resurrected
+// from a stale dump.pm2 without passing through cli.ts pm2Env(). Its start/stop
+// and detached-restart children inherit process.env, so a leaked workflow
+// marker would make those CLI commands fail at the workflow safety gate before
+// they can reach their own cleanup boundary.
+scrubWorkflowWorkerEnv(process.env);
 
 const SECRET_PATH = dashboardSecretPath();
 const TOKEN_PATH = join(homedir(), '.botmux', '.dashboard-token');
@@ -229,7 +257,8 @@ const BOTS_JSON_PATH = join(homedir(), '.botmux', 'bots.json');
 const REGISTRY_DIR = join(resolveBotmuxDataDir(), 'dashboard-daemons');
 // The dashboard probes upward if its configured port is busy (e.g. a second
 // botmux instance on this host). The actually-bound port is persisted here so
-// the `botmux dashboard` CLI can reach /__cli/rotate without guessing.
+// the `botmux dashboard` CLI can reach /__cli/current, /__cli/ensure, and
+// /__cli/rotate without guessing.
 const PORT_PATH = join(homedir(), '.botmux', '.dashboard-port');
 
 function loadOrCreateSecret(): string {
@@ -253,16 +282,21 @@ function loadOrCreateSecret(): string {
   }
 }
 
-// The active dashboard token is persisted to disk so a previously-issued
-// dashboard URL survives `botmux restart`. A platform-bound dashboard creates
-// the first token on startup; only `botmux dashboard` (the /__cli/rotate
-// endpoint) replaces it and thereby invalidates the old link.
-// The start/restart hint reads it via the non-rotating /__cli/current endpoint
-// so it can show the live link without invalidating it.
-let activeToken: string | null = loadPersistedToken(TOKEN_PATH);
+// The persisted file is the active-token authority. Reading it at each use
+// keeps multiple dashboard processes coherent: first creation converges under
+// a file lock, and an explicit rotation is observed by every process without a
+// restart. `/__cli/current` remains a strictly read-only probe.
+function currentDashboardToken(): string | null {
+  try {
+    return loadPersistedToken(TOKEN_PATH);
+  } catch (error) {
+    logger.warn(`[dashboard] Failed to read token from ${TOKEN_PATH}: ${(error as Error).message}`);
+    return null;
+  }
+}
 
 // The port we actually bound (may differ from config.dashboard.port after an
-// EADDRINUSE probe). Used for the rotation-URL and persisted for the CLI.
+// EADDRINUSE probe). Used for token-bearing URLs and persisted for the CLI.
 let boundDashboardPort = config.dashboard.port;
 
 const SECRET = loadOrCreateSecret();
@@ -341,7 +375,7 @@ aggregator.on(sessionPresentation.onEvent);
 // 调试终端（owner-only 裸 bash）。默认工作目录取当前所有 session 的工作目录去重，
 // 让 owner 从熟悉的目录起终端复现问题；都没有时模块内退回 homedir。
 const debugTerminalManager = createDebugTerminalManager({
-  getActiveToken: () => activeToken,
+  getActiveToken: currentDashboardToken,
   defaultWorkingDirs: () => {
     const dirs = new Set<string>();
     for (const s of aggregator.getSessions()) {
@@ -1243,9 +1277,9 @@ const groupsActionDeps: GroupsActionDeps = {
 // ─── PR2 C8: Route B internal API (`/__daemon/*`) ───────────────────────────
 // HMAC + loopback + ts ±60s + nonce TTL, signed-request envelope = full
 // (ts, nonce, method, pathWithQuery, sha256(body)). Reuses `.dashboard-secret`
-// for the HMAC key — the same secret `/__cli/rotate` already uses — but the
-// signing material is wider so a `/__cli/rotate` signature cannot be replayed
-// here and vice versa (different protocols, same secret, no cross-replay).
+// for the HMAC key — the same secret the `/__cli/*` protocol uses — but the
+// signing material is wider so a CLI signature cannot be replayed here and
+// vice versa (different protocols, same secret, no cross-replay).
 //
 // SECRET fail-closed: `loadOrCreateSecret()` returns a 32-byte base64url
 // string and never empty; we still guard below at server-startup time.
@@ -1936,7 +1970,11 @@ async function handlePluginManagementApi(
 
 // ─── HTTP routing ────────────────────────────────────────────────────────────
 
-function authedToken(req: IncomingMessage, url: URL): string | undefined {
+function authedToken(
+  req: IncomingMessage,
+  url: URL,
+  activeToken: string | null,
+): string | undefined {
   const q = url.searchParams.get('t');
   if (q && q === activeToken) return q;
   return parseCookie(req.headers.cookie);
@@ -2506,16 +2544,12 @@ function startSkillJob(type: SkillJob['type'], run: () => Promise<SkillPackage |
   return job;
 }
 
-function sanitizeSkillForDashboard(skill: SkillPackage): SkillPackage {
-  if (skill.source.type !== 'git') return skill;
-  return {
-    ...skill,
-    source: { ...skill.source, url: redactGitUrlCredentials(skill.source.url) },
-  };
-}
-
 function dashboardSkillCliIds(): CliId[] {
   const ids = new Set<CliId>();
+  // Always scan all known CLI skill dirs, not just configured bots — users may
+  // want to discover codex/trae/... skills even before creating a bot for them.
+  const allCliIds: CliId[] = ['claude-code', 'seed', 'relay', 'aiden', 'coco', 'codex', 'codex-app', 'cursor', 'gemini', 'genius', 'opencode', 'antigravity', 'mtr', 'hermes', 'mira', 'mir', 'traex', 'pi', 'copilot', 'oh-my-pi', 'kimi', 'grok', 'kiro-cli', 'riff'];
+  for (const cliId of allCliIds) ids.add(cliId);
   try {
     for (const cliId of configuredCliIds().values()) ids.add(cliId as CliId);
   } catch {
@@ -2544,6 +2578,73 @@ function dashboardSkillsPayload(): Record<string, unknown> {
   };
 }
 
+// --- Skill pack dashboard helpers ------------------------------------------
+
+function loadBotConfigsSafe(): BotConfig[] {
+  try { return loadBotConfigs(); } catch { return []; }
+}
+
+function botsReferencingPack(packId: string, bots: BotConfig[]): Array<{ larkAppId: string; botName: string }> {
+  const selector = `pack:${packId}`;
+  return bots
+    .filter((bot) => Array.isArray(bot.skills?.include) && bot.skills!.include!.includes(selector as SkillSelector))
+    .map((bot) => ({ larkAppId: bot.larkAppId, botName: bot.name ?? bot.larkAppId }))
+    .sort((a, b) => a.botName.localeCompare(b.botName));
+}
+
+function parsePackInput(body: unknown): { id: string; name: string; description?: string; tags?: string[]; include: Array<`skill:${string}`> } {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) throw new SkillPackStoreError({ code: 'SKILL_PACK_INVALID', reason: 'body must be an object' });
+  const b = body as Record<string, unknown>;
+  return {
+    id: typeof b.id === 'string' ? b.id : '',
+    name: typeof b.name === 'string' ? b.name : '',
+    description: typeof b.description === 'string' ? b.description : undefined,
+    tags: Array.isArray(b.tags) ? b.tags as string[] : undefined,
+    include: Array.isArray(b.include) ? b.include as Array<`skill:${string}`> : [],
+  };
+}
+
+function parsePackUpdate(body: unknown): { name?: string; description?: string | null; tags?: string[] | null; include?: Array<`skill:${string}`>; expectedRevision?: number } {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) throw new SkillPackStoreError({ code: 'SKILL_PACK_INVALID', reason: 'body must be an object' });
+  const b = body as Record<string, unknown>;
+  return {
+    name: typeof b.name === 'string' ? b.name : undefined,
+    description: b.description === null ? null : typeof b.description === 'string' ? b.description : undefined,
+    tags: b.tags === null ? null : Array.isArray(b.tags) ? b.tags as string[] : undefined,
+    include: Array.isArray(b.include) ? b.include as Array<`skill:${string}`> : undefined,
+    expectedRevision: typeof b.expectedRevision === 'number' ? b.expectedRevision : undefined,
+  };
+}
+
+function packErrorStatus(err: unknown): number {
+  if (err instanceof SkillPackStoreError) {
+    switch (err.detail.code) {
+      case 'SKILL_PACK_NOT_FOUND': return 404;
+      case 'SKILL_PACK_ID_CONFLICT': return 409;
+      case 'SKILL_PACK_REVISION_CONFLICT': return 409;
+      case 'SKILL_PACK_IN_USE': return 409;
+      default: return 400;
+    }
+  }
+  return 400;
+}
+
+function packErrorBody(err: unknown): { ok: false; error: string; [key: string]: unknown } {
+  if (err instanceof SkillPackStoreError) {
+    const d = err.detail;
+    const body: { ok: false; error: string; [key: string]: unknown } = { ok: false, error: d.code };
+    if (d.code === 'SKILL_PACK_REVISION_CONFLICT') body.current = d.current;
+    if (d.code === 'SKILL_PACK_INVALID') body.reason = d.reason;
+    if (d.code === 'SKILL_PACK_INVALID_SELECTOR') body.selector = d.selector;
+    return body;
+  }
+  return {
+    ok: false,
+    error: 'internal_error',
+    detail: redactGitUrlCredentials(err instanceof Error ? err.message : String(err)),
+  };
+}
+
 function mergeSkillReferenceBot(refs: Map<string, SkillReferenceBot>, ref: SkillReferenceBot): void {
   const current = refs.get(ref.larkAppId);
   if (!current) {
@@ -2556,11 +2657,17 @@ function mergeSkillReferenceBot(refs: Map<string, SkillReferenceBot>, ref: Skill
 async function dashboardSkillReferencesMany(skillNames: readonly string[]): Promise<Map<string, SkillReferenceSummary>> {
   const uniqueNames = [...new Set(skillNames)];
   const refsBySkill = new Map(uniqueNames.map(name => [name, new Map<string, SkillReferenceBot>()]));
+  let packs: Record<string, SkillPack> | undefined;
+  try {
+    packs = readSkillPackRegistry().packs;
+  } catch {
+    // packs.json may be absent; fall back to direct-only analysis.
+  }
   try {
     const configuredBots = loadBotConfigs();
     for (const name of uniqueNames) {
       const refs = refsBySkill.get(name)!;
-      for (const ref of analyzeSkillReferences(name, { bots: configuredBots }).bots) mergeSkillReferenceBot(refs, ref);
+      for (const ref of analyzeSkillReferences(name, { bots: configuredBots, packs }).bots) mergeSkillReferenceBot(refs, ref);
     }
   } catch {
     // Fall back to online daemon data below when the dashboard process cannot
@@ -2583,15 +2690,16 @@ async function dashboardSkillReferencesMany(skillNames: readonly string[]): Prom
   const availableOnlineConfigs = onlineConfigs.filter(config => config !== null);
   for (const name of uniqueNames) {
     const refs = refsBySkill.get(name)!;
-    for (const ref of analyzeSkillReferences(name, { bots: availableOnlineConfigs }).bots) mergeSkillReferenceBot(refs, ref);
+    for (const ref of analyzeSkillReferences(name, { bots: availableOnlineConfigs, packs }).bots) mergeSkillReferenceBot(refs, ref);
   }
   return new Map([...refsBySkill].map(([name, refs]) => [name, {
     bots: [...refs.values()].sort((a, b) => a.botName.localeCompare(b.botName)),
+    packs: packsContainingSkill(name, packs),
   }]));
 }
 
 async function dashboardSkillReferences(skillName: string): Promise<SkillReferenceSummary> {
-  return (await dashboardSkillReferencesMany([skillName])).get(skillName) ?? { bots: [] };
+  return (await dashboardSkillReferencesMany([skillName])).get(skillName) ?? { bots: [], packs: [] };
 }
 
 /** Extract the sessionId from a terminal path `/s/<sessionId>[/...]`. Returns
@@ -2602,6 +2710,55 @@ function parseTerminalSessionId(pathname: string): string | undefined {
   const seg = pathname.slice(3).split('/')[0];
   return seg || undefined;
 }
+
+/**
+ * Read every currently-online daemon directly for the public dashboard
+ * summary. The regular aggregator intentionally retains offline
+ * rows for operator history, so using it here would make an offline bot's old
+ * sessions or schedules look live. A failed or malformed daemon snapshot
+ * rejects the whole projection instead of silently turning missing data into
+ * zeroes.
+ */
+async function liveDashboardSummary(): Promise<ReturnType<typeof buildDashboardSummary>> {
+  const daemons = registry.list();
+  const configuredBots = loadBotConfigs();
+  const snapshots = await Promise.all(daemons.map(async daemon => {
+    const [sessionsResponse, schedulesResponse] = await Promise.all([
+      fetchDaemonIpc(daemon.ipcPort, '/api/sessions', {
+        signal: AbortSignal.timeout(2_000),
+      }),
+      fetchDaemonIpc(daemon.ipcPort, '/api/schedules', {
+        signal: AbortSignal.timeout(2_000),
+      }),
+    ]);
+    if (!sessionsResponse.ok || !schedulesResponse.ok) {
+      throw new Error('daemon_snapshot_http_error');
+    }
+    const [sessionsBody, schedulesBody] = await Promise.all([
+      sessionsResponse.json() as Promise<{ sessions?: unknown }>,
+      schedulesResponse.json() as Promise<{ schedules?: unknown }>,
+    ]);
+    return parseDashboardSummaryRows({
+      sessions: sessionsBody.sessions,
+      schedules: schedulesBody.schedules,
+    });
+  }));
+
+  return buildDashboardSummary({
+    generatedAt: new Date(),
+    configuredBotAppIds: configuredBots.map(bot => bot.larkAppId),
+    onlineBotAppIds: daemons.map(daemon => daemon.larkAppId),
+    sessions: snapshots.flatMap(snapshot => snapshot.sessions),
+    schedules: snapshots.flatMap(snapshot => snapshot.schedules),
+  });
+}
+
+const dashboardSummaryEndpoint = createDashboardSummaryEndpoint({
+  load: liveDashboardSummary,
+  onError: error => {
+    logger.warn(`[dashboard-summary] live snapshot unavailable: ${error instanceof Error ? error.message : String(error)}`);
+  },
+});
 
 const server = createServer(async (req, res) => {
   try {
@@ -2624,7 +2781,8 @@ const server = createServer(async (req, res) => {
     // outside the browser auth gate so packaged desktop apps can decide whether
     // this runtime speaks their dashboard protocol before loading the SPA.
     if (req.method === 'GET' && url.pathname === '/__desktop/compat') {
-      const presentedToken = authedToken(req, url);
+      const activeToken = currentDashboardToken();
+      const presentedToken = authedToken(req, url, activeToken);
       const boundMachineId = activeToken && presentedToken === activeToken
         ? readPlatformBinding()?.machineId
         : null;
@@ -2698,29 +2856,48 @@ const server = createServer(async (req, res) => {
       return;
     }
 
-    // CLI rotate (HMAC + loopback only) — for `botmux dashboard`. Mints a fresh
-    // token, invalidating any previously-issued link.
+    // CLI rotate (HMAC + loopback only) — for `botmux dashboard rotate`.
+    // Publish the new token only after a durable write succeeds.
     if (req.method === 'POST' && url.pathname === '/__cli/rotate') {
       const gate = verifyCliRequest(req, url.pathname);
       if (!gate.ok) return jsonRes(res, gate.status, gate.body);
-      activeToken = generateToken();
       try {
-        persistToken(TOKEN_PATH, activeToken);
+        const token = rotatePersistedToken(TOKEN_PATH);
+        return jsonRes(res, 200, dashboardUrlsFor(token));
       } catch (e) {
         logger.warn(`[dashboard] Failed to persist token to ${TOKEN_PATH}: ${(e as Error).message}`);
+        return jsonRes(res, 500, { error: 'token_persist_failed' });
       }
-      return jsonRes(res, 200, dashboardUrlsFor(activeToken));
     }
 
-    // CLI read current URL (HMAC + loopback only) — for the start/restart hint.
-    // Unlike /__cli/rotate this does NOT mint a token, so an already-issued
-    // dashboard link survives restart untouched. 404 → no token has ever been
-    // minted (caller falls back to suggesting `botmux dashboard`).
+    // CLI get-or-create URL (HMAC + loopback only). Existing links survive
+    // untouched; the first caller atomically creates and persists a token.
+    if (req.method === 'POST' && url.pathname === '/__cli/ensure') {
+      const gate = verifyCliRequest(req, url.pathname);
+      if (!gate.ok) return jsonRes(res, gate.status, gate.body);
+      try {
+        const token = loadOrCreatePersistedToken(TOKEN_PATH);
+        return jsonRes(res, 200, dashboardUrlsFor(token));
+      } catch (e) {
+        logger.warn(`[dashboard] Failed to ensure token at ${TOKEN_PATH}: ${(e as Error).message}`);
+        return jsonRes(res, 500, { error: 'token_persist_failed' });
+      }
+    }
+
+    // CLI read current URL (HMAC + loopback only) — for start/restart hints and
+    // safe port discovery. This never mints a token.
     if (req.method === 'POST' && url.pathname === '/__cli/current') {
       const gate = verifyCliRequest(req, url.pathname);
       if (!gate.ok) return jsonRes(res, gate.status, gate.body);
-      if (!activeToken) return jsonRes(res, 404, { error: 'no_active_token' });
-      return jsonRes(res, 200, dashboardUrlsFor(activeToken));
+      let token: string | null;
+      try {
+        token = loadPersistedToken(TOKEN_PATH);
+      } catch (e) {
+        logger.warn(`[dashboard] Failed to read token from ${TOKEN_PATH}: ${(e as Error).message}`);
+        return jsonRes(res, 500, { error: 'token_unavailable' });
+      }
+      if (!token) return jsonRes(res, 404, { error: 'no_active_token' });
+      return jsonRes(res, 200, dashboardUrlsFor(token));
     }
 
     // CLI 通知绑定变化（HMAC + loopback）——`botmux bind` 写完绑定后捅一下，立即重连平台，
@@ -2743,7 +2920,8 @@ const server = createServer(async (req, res) => {
       return jsonRes(res, 200, { ok: true });
     }
 
-    const presentedToken = authedToken(req, url);
+    const activeToken = currentDashboardToken();
+    const presentedToken = authedToken(req, url, activeToken);
     const globalDashboardConfig = readGlobalConfig().dashboard;
     const decision = decideDashboardAuth({
       method: req.method ?? 'GET',
@@ -2882,6 +3060,12 @@ const server = createServer(async (req, res) => {
     }
 
     // ─── Public API (cookie/token already validated above) ──────────────────
+
+    if (req.method === 'GET' && url.pathname === '/api/dashboard/v1/summary') {
+      const result = await dashboardSummaryEndpoint.get({ authenticated: authed });
+      for (const [name, value] of Object.entries(result.headers)) res.setHeader(name, value);
+      return jsonRes(res, result.status, result.body);
+    }
 
     if (await handleResourceMonitorApi(req, res, url, resourceMonitor)) {
       return;
@@ -3460,10 +3644,14 @@ const server = createServer(async (req, res) => {
       if (missing.length > 0) return jsonRes(res, 400, { ok: false, error: 'skill_not_installed', missing });
 
       const referencesBySkill = await dashboardSkillReferencesMany(names);
-      const references = names.map(name => ({ name, refs: referencesBySkill.get(name) ?? { bots: [] } }));
+      const references = names.map(name => ({ name, refs: referencesBySkill.get(name) ?? { bots: [], packs: [] } }));
       const affectedSkills = references
-        .filter(item => item.refs.bots.length > 0)
-        .map(item => ({ name: item.name, affectedBots: item.refs.bots }));
+        .filter(item => item.refs.bots.length > 0 || item.refs.packs.length > 0)
+        .map(item => ({
+          name: item.name,
+          affectedBots: item.refs.bots,
+          affectedPacks: item.refs.packs,
+        }));
       if (body.force !== true && affectedSkills.length > 0) {
         return jsonRes(res, 409, {
           ok: false,
@@ -3587,11 +3775,12 @@ const server = createServer(async (req, res) => {
       const force = url.searchParams.get('force') === '1';
       if (!readSkillRegistry().skills[name]) return jsonRes(res, 400, { ok: false, error: 'skill_not_installed' });
       const refs = await dashboardSkillReferences(name);
-      if (!force && refs.bots.length > 0) {
+      if (!force && (refs.bots.length > 0 || refs.packs.length > 0)) {
         return jsonRes(res, 409, {
           ok: false,
           error: 'skill_in_use',
           affectedBots: refs.bots,
+          affectedPacks: refs.packs,
         });
       }
       const r = removeInstalledSkill(name);
@@ -3599,8 +3788,91 @@ const server = createServer(async (req, res) => {
       return jsonRes(res, 200, {
         ok: true,
         affectedBots: refs.bots,
+        affectedPacks: refs.packs,
         ...dashboardSkillsPayload(),
       });
+    }
+
+    // --- Skill pack CRUD ---------------------------------------------------
+
+    if (req.method === 'GET' && url.pathname === '/api/skill-packs') {
+      const registrySkills = readSkillRegistry().skills;
+      const bots = loadBotConfigsSafe();
+      const packs = enrichPacksForDashboard(
+        listSkillPacks(),
+        registrySkills,
+        (packId) => botsReferencingPack(packId, bots),
+      );
+      return jsonRes(res, 200, { ok: true, packs });
+    }
+
+    if (req.method === 'POST' && url.pathname === '/api/skill-packs') {
+      let body: unknown;
+      try { body = await readJsonBody(req); } catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+      try {
+        const input = parsePackInput(body);
+        const pack = createSkillPack(input);
+        return jsonRes(res, 201, { ok: true, pack });
+      } catch (err) {
+        return jsonRes(res, packErrorStatus(err), packErrorBody(err));
+      }
+    }
+
+    let mPack: RegExpMatchArray | null;
+    if (req.method === 'GET' && (mPack = url.pathname.match(/^\/api\/skill-packs\/([^/]+)$/))) {
+      const id = decodeURIComponent(mPack[1]);
+      const pack = getSkillPack(id);
+      if (!pack) return jsonRes(res, 404, { ok: false, error: 'SKILL_PACK_NOT_FOUND' });
+      const registrySkills = readSkillRegistry().skills;
+      const bots = loadBotConfigsSafe();
+      return jsonRes(res, 200, {
+        ok: true,
+        pack: enrichPackForDashboard(pack, registrySkills, botsReferencingPack(pack.id, bots)),
+      });
+    }
+
+    if (req.method === 'PUT' && (mPack = url.pathname.match(/^\/api\/skill-packs\/([^/]+)$/))) {
+      const id = decodeURIComponent(mPack[1]);
+      let body: unknown;
+      try { body = await readJsonBody(req); } catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+      try {
+        const input = parsePackUpdate(body);
+        const pack = updateSkillPack(id, input);
+        return jsonRes(res, 200, { ok: true, pack });
+      } catch (err) {
+        return jsonRes(res, packErrorStatus(err), packErrorBody(err));
+      }
+    }
+
+    if (req.method === 'DELETE' && (mPack = url.pathname.match(/^\/api\/skill-packs\/([^/]+)$/))) {
+      const id = decodeURIComponent(mPack[1]);
+      const force = url.searchParams.get('force') === '1';
+      const pack = getSkillPack(id);
+      if (!pack) return jsonRes(res, 404, { ok: false, error: 'SKILL_PACK_NOT_FOUND' });
+      const refs = botsReferencingPack(id, loadBotConfigsSafe());
+      if (!force && refs.length > 0) {
+        return jsonRes(res, 409, { ok: false, error: 'SKILL_PACK_IN_USE', references: refs });
+      }
+      try {
+        deleteSkillPack(id);
+        return jsonRes(res, 200, { ok: true, references: refs });
+      } catch (err) {
+        return jsonRes(res, packErrorStatus(err), packErrorBody(err));
+      }
+    }
+
+    if (req.method === 'POST' && (mPack = url.pathname.match(/^\/api\/skill-packs\/([^/]+)\/clone$/))) {
+      const id = decodeURIComponent(mPack[1]);
+      let body: unknown;
+      try { body = await readJsonBody(req); } catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+      const newId = typeof (body as any)?.id === 'string' ? (body as any).id.trim() : '';
+      if (!newId) return jsonRes(res, 400, { ok: false, error: 'id_required' });
+      try {
+        const pack = cloneSkillPack(id, newId);
+        return jsonRes(res, 201, { ok: true, pack });
+      } catch (err) {
+        return jsonRes(res, packErrorStatus(err), packErrorBody(err));
+      }
     }
 
     if (req.method === 'GET' && url.pathname === '/api/whiteboards') {
@@ -5646,15 +5918,16 @@ function startPlatformTunnelIfBound(): void {
   try {
     const binding = readPlatformBinding();
     if (!binding) return;
-    if (!activeToken) {
-      activeToken = loadOrCreatePersistedToken(TOKEN_PATH);
+    const existingToken = currentDashboardToken();
+    loadOrCreatePersistedToken(TOKEN_PATH);
+    if (!existingToken) {
       logger.info('[platform-tunnel] 已初始化 dashboard token');
     }
     const version = readBotmuxVersion();
     platformTunnel = startPlatformTunnelClient({
       binding,
       getDashboardPort: () => boundDashboardPort,
-      getDashboardToken: () => activeToken,
+      getDashboardToken: currentDashboardToken,
       getVersion: () => version,
       getBots: () => readPlatformBotsInfo(),
       getTeamSyncRev: () => getPlatformTeamSyncRev(config.session.dataDir),

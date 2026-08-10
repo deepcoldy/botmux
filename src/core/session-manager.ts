@@ -493,25 +493,26 @@ export function getProjectScanDir(ds?: DaemonSession): string {
  * recurses downward from it. See getProjectScanDir for why we no longer climb
  * to the parent directory.
  */
-export function getProjectScanDirs(ds?: DaemonSession): string[] {
-  if (ds?.larkAppId) {
-    const bot = getBot(ds.larkAppId);
-    const dirs = new Set<string>();
-    const configuredMultiDirs = parseWorkingDirList(bot.config.workingDirs);
-    const configuredLegacyDirs = parseWorkingDirList(bot.config.workingDir);
-    const workingDirs = configuredMultiDirs.length > 0
-      ? configuredMultiDirs
-      : configuredLegacyDirs.length > 0
-        ? configuredLegacyDirs
-        : [effectiveDefaultWorkingDir(bot.config) ?? '~'];
-    for (const wd of workingDirs) {
-      dirs.add(expandHome(wd));
-    }
-    if (ds.workingDir) {
-      dirs.add(expandHome(ds.workingDir));
-    }
-    return [...dirs];
+export function getProjectScanDirsForBot(larkAppId: string, workingDir?: string): string[] {
+  const bot = getBot(larkAppId);
+  const dirs = new Set<string>();
+  const configuredMultiDirs = parseWorkingDirList(bot.config.workingDirs);
+  const configuredLegacyDirs = parseWorkingDirList(bot.config.workingDir);
+  const workingDirs = configuredMultiDirs.length > 0
+    ? configuredMultiDirs
+    : configuredLegacyDirs.length > 0
+      ? configuredLegacyDirs
+      : [effectiveDefaultWorkingDir(bot.config) ?? '~'];
+  for (const wd of workingDirs) {
+    dirs.add(expandHome(wd));
   }
+  if (workingDir) dirs.add(expandHome(workingDir));
+  return [...dirs];
+}
+
+/** Session-shaped compatibility wrapper for callers that already own a DS. */
+export function getProjectScanDirs(ds?: DaemonSession): string[] {
+  if (ds?.larkAppId) return getProjectScanDirsForBot(ds.larkAppId, ds.workingDir);
   // Fallback to global config
   const dirs = new Set<string>();
   const configuredMultiDirs = parseWorkingDirList(config.daemon.workingDirs);

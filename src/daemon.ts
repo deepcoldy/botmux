@@ -43,6 +43,11 @@ import {
   stopCliRuntimeUpdateMonitor,
 } from './core/cli-runtime-update.js';
 import { sendRestartReportIfPending } from './core/restart-report.js';
+import {
+  SUPERVISOR_SHUTDOWN_PROTOCOL,
+  type SupervisorShutdownProtocol,
+} from './core/supervisor-shutdown-protocol.js';
+import { readSupervisorProcessStartIdentity } from './core/process-start-identity.js';
 import { statSync } from 'node:fs';
 import { addReaction, deleteMessage, getChatContext, getChatMode, getChatNameAndMode, getMessageChatId, listChatMemberOpenIds, MessageWithdrawnError, replyMessage, resolveAllowedUsersWithMap, sendMessage, sendUserMessage, updateMessage, type EntryResolveStatus } from './im/lark/client.js';
 import { resolveGroupJoinPrompt, waitForAllowedUserInChat } from './core/auto-start.js';
@@ -165,13 +170,13 @@ import {
   isSessionTransferring,
   type WorkerSessionReplyOptions,
 } from './core/worker-pool.js';
-import { AbortDeadlineError, hasExactSafeJsonKeys, ipcRoute, isTrustedHostIpcRequest, JsonBodyTooLargeError, jsonRes, readJsonBody, runWithAbortDeadline, setBotName, setLarkAppId, startIpcServer, setBotRenamer, setBotAvatarChanger, armCoreOnlyReadinessGate, setCoreOnlyReady } from './core/dashboard-ipc-server.js';
+import { AbortDeadlineError, hasExactSafeJsonKeys, ipcRoute, isTrustedHostIpcRequest, JsonBodyTooLargeError, jsonRes, readJsonBody, runWithAbortDeadline, setBotName, setLarkAppId, startIpcServer, setBotRenamer, setBotAvatarChanger, armCoreOnlyReadinessGate, setCoreOnlyReady, setSupervisorShutdownHandler } from './core/dashboard-ipc-server.js';
 import { setDeviceIsolationDaemonIdentity } from './core/device-isolation-daemon.js';
 import {
   cancelSessionReadyAck,
   waitForSessionReadyAck,
 } from './core/session-ready-handshake.js';
-import { loadOrCreateDashboardSecret } from './dashboard/auth.js';
+import { loadOrCreateDashboardSecret, loadPersistedToken } from './dashboard/auth.js';
 import { daemonIpcAuthHeaders, loadDaemonIpcSecret } from './core/daemon-ipc-auth.js';
 import {
   authorizeSessionScopedIpc,
@@ -190,6 +195,7 @@ import {
   getSessionWorkingDir,
   getProjectScanDir,
   getProjectScanDirs,
+  getProjectScanDirsForBot,
   expandHome,
   downloadResources,
   formatAttachmentsHint,
@@ -3256,6 +3262,29 @@ async function sessionReply(
 export const __testOnly_sessionReply = sessionReply;
 export const __testOnly_activeSessions = activeSessions;
 
+async function maybeSeedCardlessForceTopicTurn(args: {
+  ds: DaemonSession;
+  enabled: boolean;
+  anchor: string;
+  messageId: string;
+}): Promise<void> {
+  const { ds, enabled, anchor, messageId } = args;
+  if (!enabled || !streamingCardDisabledFor(ds, messageId)) return;
+  try {
+    await sessionReply(
+      anchor,
+      tr('daemon.force_topic_started', undefined, localeForBot(ds.larkAppId)),
+      'text',
+      ds.larkAppId,
+    );
+  } catch (err) {
+    // Thread materialization is a UX acknowledgement, not permission to drop
+    // an accepted task. Keep starting the worker if this lightweight reply
+    // fails; the final answer can still seed the thread.
+    logger.warn(`[/t] Failed to seed card-off topic reply: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
 async function revokeQuotaGrant(
   larkAppId: string,
   chatId: string,
@@ -3301,7 +3330,7 @@ export async function enforceMessageQuotaForCliInput(
   memberUnionId?: string,
   chatType?: 'group' | 'p2p',
   botSender?: boolean,
-  opts?: { listenerAuthorized?: boolean },
+  opts?: { listenerAuthorized?: boolean; skipCharge?: boolean },
 ): Promise<boolean> {
   if (opts?.listenerAuthorized) return true;
   // senderUnionId（bot-locked）让 evaluateTalk 认出跨部署团队 peer bot（teamBot 腿）；
@@ -3321,6 +3350,9 @@ export async function enforceMessageQuotaForCliInput(
     logger.debug(`[quota:${larkAppId}] dropping message ${messageId.substring(0, 12)} from non-allowed sender ${senderOpenId?.substring(0, 12) ?? '?'}`);
     return false;
   }
+  // Control/setup messages still need the authorization decision above, but
+  // they never reach a CLI and therefore must not spend or dedupe a quota unit.
+  if (opts?.skipCharge) return true;
   if (!ev.quotaKey) return true;
   if (!senderOpenId) return false;
   // 去重三态：'done' = 同条已成功扣费 → 放行（不重复扣）；'pending' = 同条扣费 in-flight 未定论
@@ -3502,11 +3534,16 @@ interface DaemonDescriptor {
   botIndex: number;
   ipcPort: number;
   pid: number;
+  /** Kernel/OS process-birth identity; prevents fresh stale PID reuse. */
+  processStartIdentity: string;
   startedAt: number;
   /** Public, random audience that changes on every daemon process start. */
   bootInstanceId: string;
   /** Full-envelope Workflow mutation protocol supported by this process. */
   workflowIpcProtocol: 'v1';
+  /** Exact supervisor protocol this in-memory daemon will execute on signal.
+   * Absent until the SIGTERM/SIGINT handlers and all captured state are ready. */
+  supervisorShutdownProtocol?: SupervisorShutdownProtocol;
   lastHeartbeat: number;
   /**
    * Resolved open_ids from this bot's allowedUsers config (post-email
@@ -16276,10 +16313,15 @@ async function startInitialPassthroughSession(args: {
    *  这样飞书 sender_type 缺失/变值但已识别 peer 时冷启动 passthrough 也归属为 bot，
    *  不扩大 quota 的信任边界。 */
   senderIsBot?: boolean;
+  /** This raw cold start came from `/t ...`; seed a visible thread only on the
+   *  direct-fork branches that otherwise produce no immediate reply. */
+  cardlessForceTopicSeed: boolean;
 }): Promise<void> {
   const {
     larkAppId, chatId, chatType, scope, anchor, messageId, replyRootId,
-    parsed, cmd, commandContent, senderOpenId, substitute, senderUnionId, memberUnionId, ownerOpenId, ownerUnionId, creatorOpenId, botSender, senderIsBot,
+    parsed, cmd, commandContent, senderOpenId, substitute, senderUnionId,
+    memberUnionId, ownerOpenId, ownerUnionId, creatorOpenId, botSender,
+    senderIsBot, cardlessForceTopicSeed,
     routeToCanonicalOwner,
   } = args;
   if (!await enforceMessageQuotaForCliInput(larkAppId, chatId, senderOpenId, messageId, anchor, senderUnionId, memberUnionId, chatType, botSender)) {
@@ -16386,6 +16428,12 @@ async function startInitialPassthroughSession(args: {
 
   if (pinnedWorkingDir) {
     if (await replyInvalidWorkingDirs(anchor, larkAppId, ds)) return;
+    await maybeSeedCardlessForceTopicTurn({
+      ds,
+      enabled: cardlessForceTopicSeed,
+      anchor,
+      messageId,
+    });
     const availableBots = await getAvailableBots(larkAppId, chatId);
     forkReservedInitialRawSession(ds, availableBots);
     const reason = oncallEntry
@@ -16412,6 +16460,12 @@ async function startInitialPassthroughSession(args: {
   }
 
   ds.pendingRepo = false;
+  await maybeSeedCardlessForceTopicTurn({
+    ds,
+    enabled: cardlessForceTopicSeed,
+    anchor,
+    messageId,
+  });
   const availableBots = await getAvailableBots(larkAppId, chatId);
   forkReservedInitialRawSession(ds, availableBots);
   logger.info(`[${tag(ds)}] No projects to select, queued initial raw passthrough ${commandContent.substring(0, 40)}`);
@@ -16537,8 +16591,8 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
   // thread-scope anchored at the user's message_id so sessionReply() uses
   // reply_in_thread=true and seeds a fresh Lark thread. In 话题群 / p2p
   // (already thread-scope) it's just a prefix strip — no routing change.
-  // Empty prompt is allowed: the user can fill it in while the repo card is
-  // pending (pendingFollowUps in handleThreadReply picks up subsequent text).
+  // Empty prompt is allowed: later setup chooses either a repo picker or a
+  // visible thread that waits for the first real task, without an empty worker.
   const senderOpenId: string | undefined = data.sender?.sender_id?.open_id;
   const forceTopic = parseForceTopicInvocation(cmdContent);
   if (forceTopic) {
@@ -16555,7 +16609,9 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
       scope = 'thread';
       anchor = messageId;
     }
-    content = forceTopic.prompt;
+    // Keep any paired forward seed as task context; `/t` only strips its own
+    // routing prefix from the follow-up text.
+    content = composeForwardFollowupContent(forwardSeedContent, forceTopic.prompt);
     parsed.content = forceTopic.prompt;
     cmdContent = forceTopic.prompt;
     logger.info(`[/t] Force-topic invocation: prompt="${forceTopic.prompt.substring(0, 60)}" (scope=${scope}, anchor=${anchor.substring(0, 12)})`);
@@ -16717,6 +16773,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
           // bots included), matching the twin new-topic spawn path so冷启动
           // passthrough 也能让 bot→bot 的 --mention-back 直通不对称门禁。
           senderIsBot: isForeignBotSender,
+          cardlessForceTopicSeed: forceTopic !== null,
           // New-topic senders are humans here (mirrors the normal new-topic
           // spawn path, which assigns ownership unconditionally too).
           ownerOpenId: senderOpenId,
@@ -16835,8 +16892,19 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     }
   }
 
+  // A setup-only `/t` must still pass the same talk-permission recheck as any
+  // CLI input, but it creates no AI turn and therefore must not consume a
+  // message-quota unit. `buildQuoteHint` distinguishes a real user quote from
+  // parent_id values that merely point at the current thread root.
+  const isBareForceTopic = forceTopic?.prompt === ''
+    && content === ''
+    && resources.length === 0
+    && buildQuoteHint(parsed, scope, anchor, localeForBot(larkAppId)) === ''
+    && !ctx.forwardSeedData
+    && !messageListener;
   if (!await enforceMessageQuotaForCliInput(larkAppId, chatId, senderOpenId, messageId, anchor, teamTrustUnionId, senderUnionId, chatType, isBotSenderType, {
     listenerAuthorized: !!messageListener,
+    skipCharge: isBareForceTopic,
   })) {
     return;
   }
@@ -16903,6 +16971,53 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     larkAppId,
     listenerWorkingDir: messageListener?.workingDir,
   });
+  // A text-only bare `/t` is topic setup, not an empty CLI turn. Preserve the
+  // repo-picker path when no cwd is pinned; a pinned cwd needs no setup owner,
+  // so one visible reply can materialize the Lark thread and the first real
+  // task (or `/repo`) will create its Session. Attachments, quotes, forwarded
+  // context, and listener prompts remain real inputs and must not be dropped.
+  let prefetchedRepoProjects: import('./services/project-scanner.js').ProjectInfo[] | undefined;
+  if (isBareForceTopic) {
+    const setupDirs = pinnedWorkingDir
+      ? [pinnedWorkingDir]
+      : getProjectScanDirsForBot(larkAppId);
+    const invalidDirs = invalidWorkingDirs({ workingDirs: setupDirs });
+    if (invalidDirs.length > 0) {
+      await sessionReply(
+        anchor,
+        tr('cmd.repo.working_dir_not_exist', {
+          dirs: invalidDirs.map(d => `\`${d}\``).join(', '),
+        }, localeForBot(larkAppId)),
+        'text',
+        larkAppId,
+      );
+      logger.warn(`[/t] configured workingDir missing: ${invalidDirs.join(', ')}`);
+      return;
+    }
+    if (pinnedWorkingDir) {
+      await sessionReply(
+        anchor,
+        tr('daemon.force_topic_ready', undefined, localeForBot(larkAppId)),
+        'text',
+        larkAppId,
+      );
+      return;
+    }
+    const scanDirs = setupDirs.filter(d => existsSync(d));
+    prefetchedRepoProjects = scanDirs.length > 0
+      ? scanMultipleProjects(scanDirs, 3, repoPickerScanOptions())
+      : [];
+    if (prefetchedRepoProjects.length === 0) {
+      await sessionReply(
+        anchor,
+        tr('daemon.force_topic_ready', undefined, localeForBot(larkAppId)),
+        'text',
+        larkAppId,
+      );
+      return;
+    }
+  }
+
   // Auto-worktree: register PENDING (router buffers concurrent msgs, no force-fork)
   // and build the worktree off the critical path (willAutoWorktree / runAutoWorktreeCommit).
   const autoWt = willAutoWorktree(larkAppId, pinnedWorkingDir, pinnedFromBotDefault);
@@ -17070,6 +17185,12 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
   if (pinnedWorkingDir) {
     if (await replyInvalidWorkingDirs(anchor, larkAppId, ds)) return;
     ensureSessionWhiteboard(ds);
+    await maybeSeedCardlessForceTopicTurn({
+      ds,
+      enabled: !!forceTopic && !isBareForceTopic,
+      anchor,
+      messageId,
+    });
     const availableBots = await getAvailableBots(larkAppId, chatId);
     await noteTurnReceived(ds, messageId, content, newTopicSender, messageId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
     forkReservedInitialSession(ds, availableBots);
@@ -17084,10 +17205,12 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
 
   // Show repo selection card
   if (await replyInvalidWorkingDirs(anchor, larkAppId, ds)) return;
-  const scanDirs = getProjectScanDirs(ds).filter(d => existsSync(d));
-  let projects: import('./services/project-scanner.js').ProjectInfo[] = [];
-  if (scanDirs.length > 0) {
-    projects = scanMultipleProjects(scanDirs, 3, repoPickerScanOptions());
+  let projects = prefetchedRepoProjects ?? [];
+  if (!prefetchedRepoProjects) {
+    const scanDirs = getProjectScanDirs(ds).filter(d => existsSync(d));
+    if (scanDirs.length > 0) {
+      projects = scanMultipleProjects(scanDirs, 3, repoPickerScanOptions());
+    }
   }
   if (projects.length > 0) {
     ds.initialStartPending = false; // pendingRepo/card now owns buffering
@@ -17102,6 +17225,12 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     // No projects found — skip repo selection, spawn directly
     ds.pendingRepo = false;
     ensureSessionWhiteboard(ds);
+    await maybeSeedCardlessForceTopicTurn({
+      ds,
+      enabled: !!forceTopic && !isBareForceTopic,
+      anchor,
+      messageId,
+    });
     const availableBots = await getAvailableBots(larkAppId, chatId);
     await noteTurnReceived(ds, messageId, content, newTopicSender, messageId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
     forkReservedInitialSession(ds, availableBots);
@@ -17921,6 +18050,7 @@ async function handleThreadReplyAdmitted(
           // treat as bot for --mention-back (never mis-attribute a peer bot as
           // human when飞书 sender_type 缺失/变值但已识别 peer).
           senderIsBot: isBotSenderType || isForeignBot,
+          cardlessForceTopicSeed: false,
           // Bot-started cold starts get no human owner (mirrors the auto-create
           // path) — see the ownership note on startInitialPassthroughSession.
           ownerOpenId: isForeignBot ? undefined : threadSenderOpenId,
@@ -19789,9 +19919,8 @@ function dashboardUrlForReport(): { url?: string; localUrl?: string } {
   try {
     const dir = join(homedir(), '.botmux');
     const portFile = join(dir, '.dashboard-port');
-    const tokenFile = join(dir, '.dashboard-token');
     const port = existsSync(portFile) ? readFileSync(portFile, 'utf8').trim() : String(config.dashboard.port);
-    const tok = existsSync(tokenFile) ? readFileSync(tokenFile, 'utf8').trim() : '';
+    const tok = loadPersistedToken(join(dir, '.dashboard-token')) ?? '';
     // buildDashboardUrls swaps in the central-platform machine subdomain when
     // 远程访问 is on and this host is bound, so the restart-report DM links to the
     // platform dashboard instead of an unreachable local host:port. In that case
@@ -20078,6 +20207,10 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // agent-facing, live-origin-gated endpoints. Internal control endpoints use
   // a separate daemon-to-daemon credential and never trust this port marker.
   process.env.BOTMUX_DAEMON_IPC_PORT = String(ipcPort);
+  const daemonProcessStartIdentity = readSupervisorProcessStartIdentity(process.pid);
+  if (!daemonProcessStartIdentity) {
+    throw new Error('cannot bind daemon descriptor to a process-start identity');
+  }
   const desc: DaemonDescriptor = {
     larkAppId: cfg.larkAppId,
     botName: cfg.displayName ?? cfg.larkAppId,
@@ -20085,6 +20218,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     botIndex: idx,
     ipcPort,
     pid: process.pid,
+    processStartIdentity: daemonProcessStartIdentity,
     startedAt: Date.now(),
     bootInstanceId: generateWorkflowDaemonBootInstanceId(),
     workflowIpcProtocol: 'v1',
@@ -21042,7 +21176,8 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // Ordinary workers then receive SIGTERM / close IPC and the daemon waits up
   // to DAEMON_WORKER_EXIT_GRACE_MS for them to exit
   // before sending SIGKILL to stragglers. Without the wait, daemon
-  // `process.exit(0)` races worker signal delivery — and any worker whose
+  // the final managed sentinel exit races worker signal delivery —
+  // and any worker whose
   // main thread is in a sync code path (e.g. the bridge fingerprint scan
   // bug fixed in v2.9.2) loses the signal and survives as a ppid=1 orphan
   // forever (we'd accumulated 841 such orphans across daemon restarts,
@@ -21301,10 +21436,27 @@ export async function startDaemon(botIndex?: number): Promise<void> {
 
   process.on('SIGTERM', () => { shutdown().catch(err => { logger.error(`shutdown failed: ${err?.message ?? err}`); process.exit(1); }); });
   process.on('SIGINT', () => { shutdown().catch(err => { logger.error(`shutdown failed: ${err?.message ?? err}`); process.exit(1); }); });
+  // Capability publication is the final startup commit for supervisor-driven
+  // shutdown. The early descriptor intentionally lacks it: a new CLI that
+  // observes this daemon before both handlers/state closures exist must refuse
+  // to signal. Atomic rewrite makes the capability visible only afterward.
+  if (readSupervisorProcessStartIdentity(process.pid) !== desc.processStartIdentity) {
+    throw new Error('daemon process-start identity changed before shutdown capability commit');
+  }
+  setSupervisorShutdownHandler({
+    larkAppId: cfg.larkAppId,
+    bootInstanceId: desc.bootInstanceId,
+    processStartIdentity: desc.processStartIdentity,
+    shutdown,
+  });
+  desc.supervisorShutdownProtocol = SUPERVISOR_SHUTDOWN_PROTOCOL;
+  desc.lastHeartbeat = Date.now();
+  writeDaemonDescriptor(desc);
   // Best-effort cleanup on plain `exit` (e.g. uncaught fatal). No worker
   // shutdown here since the process is already on its way out — just remove
   // the descriptor so the dashboard doesn't see a phantom daemon.
   process.on('exit', () => {
+    setSupervisorShutdownHandler(null);
     clearInterval(descriptorHeartbeat);
     clearInterval(idleWorkerSweepTimer);
     clearInterval(docCommentPollTimer);

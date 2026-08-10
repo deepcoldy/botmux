@@ -9,6 +9,7 @@ import {
   OverviewListMain,
   OverviewListTail,
 } from './dashboard-components.js';
+import { chatDisplayTitle, loadNameMaps } from './ui.js';
 
 type ScheduleRow = Record<string, any> & { id: string };
 type ScheduleAction = 'run' | 'pause' | 'resume';
@@ -84,6 +85,7 @@ function ScheduleRowCard(props: {
   onDelete(schedule: ScheduleRow): void;
 }) {
   const { schedule: s, scheduleTimeZone, tr } = props;
+  const chatTitle = chatDisplayTitle(s);
   const kind = String(s.parsed?.kind ?? 'unknown');
   const toggleOp: ScheduleAction = s.enabled ? 'pause' : 'resume';
   const toggleKey = `${s.id}:${toggleOp}`;
@@ -104,6 +106,14 @@ function ScheduleRowCard(props: {
         </div>
         <div className="schedule-chip-strip">
           <span>{kind}</span>
+          {s.chatId ? (
+            <span
+              className="schedule-chat-chip"
+              title={chatTitle ? `${chatTitle} · ${String(s.chatId)}` : String(s.chatId)}
+            >
+              {tr('schedules.form.chat')}: {chatTitle ?? s.chatId}
+            </span>
+          ) : null}
           <span>{tr('schedules.delivery')}: {placementLabel(s, tr)}</span>
           {s.silent ? <span>🔇 {tr('schedules.silent')}</span> : null}
           <span>{tr('schedules.next')}: {fmtScheduleDate(s.nextRunAt, scheduleTimeZone)}</span>
@@ -171,6 +181,7 @@ function SchedulesPage() {
   const [editing, setEditing] = useState<ScheduleRow | null>(null);
   const [formError, setFormError] = useState<string | null>(null);
   const [bots, setBots] = useState<Array<{ larkAppId: string; botName?: string }>>([]);
+  const [, setNameMapsVersion] = useState(0);
 
   useEffect(() => {
     fetch('/api/bots')
@@ -179,6 +190,10 @@ function SchedulesPage() {
         if (Array.isArray(b?.bots)) setBots(b.bots);
       })
       .catch(() => undefined);
+  }, []);
+
+  useEffect(() => {
+    void loadNameMaps().then(() => setNameMapsVersion(version => version + 1));
   }, []);
 
   const rows = useMemo(
@@ -583,9 +598,14 @@ function ScheduleFormModal(props: {
             />
             <small className="schedule-form-help">{tr('schedules.form.promptHelp')}</small>
           </label>
-          {!editing ? (
-            <label className="schedule-form-field">
-              <span className="schedule-form-label">{tr('schedules.form.chat')}</span>
+        {editing ? (
+          <div className="schedule-form-field">
+            <span className="schedule-form-label">{tr('schedules.form.chat')}</span>
+            <code title={chatId}>{chatDisplayTitle(editing) ?? chatId}</code>
+          </div>
+        ) : (
+          <label className="schedule-form-field">
+            <span className="schedule-form-label">{tr('schedules.form.chat')}</span>
               <input
                 type="text"
                 value={chatId}
@@ -594,7 +614,7 @@ function ScheduleFormModal(props: {
                 required
               />
             </label>
-          ) : null}
+          )}
           {localDelivery ? (
             <div className="schedule-form-field">
               <span className="schedule-form-label">{tr('schedules.form.deliver')}</span>

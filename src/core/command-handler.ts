@@ -279,8 +279,9 @@ export function resolveRepoSelection(
  *   must NOT match, otherwise we'd false-trigger on common /-prefixed words.
  * - tolerates leading whitespace (mention-stripping can leave a space).
  * - prompt is whatever follows the prefix (verbatim, including newlines).
- * - `/t` alone (no args) is allowed → empty prompt; the user can fill it in
- *   while the repo selection card is still pending.
+ * - `/t` alone (no args) is allowed → empty prompt; the daemon treats it as
+ *   topic setup, choosing either a repository picker or a visible thread that
+ *   waits for the first real task according to the bot's cwd configuration.
  *
  * Returns null for anything else, so callers can fall through to the regular
  * `parseSlashCommandInvocation` / message-handling path.
@@ -2049,10 +2050,24 @@ export async function handleCommand(
           await sessionReply(rootId, t('cmd.repo.scan_dir_not_exist', { dirs: scanDirs.join(', ') }, loc));
           break;
         }
-        const projects = scanMultipleProjects(validDirs, 3, repoPickerScanOptions());
+        let scanBudgetHit = false;
+        const projects = scanMultipleProjects(validDirs, 3, {
+          ...repoPickerScanOptions(),
+          onBudgetExceeded: () => { scanBudgetHit = true; },
+        });
         if (projects.length === 0) {
-          await sessionReply(rootId, t('cmd.repo.no_git_repos', { dirs: validDirs.join(', ') }, loc));
+          // Distinguish "genuinely no repos here" from "we bailed at the scan
+          // budget before we could find them" — the latter is actionable
+          // (narrow the root / give an explicit path) and must not read as an
+          // empty projects dir.
+          const key = scanBudgetHit ? 'cmd.repo.scan_budget_no_repos' : 'cmd.repo.no_git_repos';
+          await sessionReply(rootId, t(key, { dirs: validDirs.join(', ') }, loc));
           break;
+        }
+        if (scanBudgetHit) {
+          // We have a partial list; show it but warn it may be incomplete so a
+          // missing target repo doesn't look like it simply isn't there.
+          await sessionReply(rootId, t('cmd.repo.scan_budget_partial', undefined, loc));
         }
         if (ds) lastRepoScan.set(ds.chatId, projects);
         const currentCwd = getSessionWorkingDir(ds);

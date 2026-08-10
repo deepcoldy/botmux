@@ -23,13 +23,13 @@
 
 ## 2. 鉴权
 
-调用走 dashboard（默认 `http://<daemon-host>:7891`）。当前用 dashboard 短期 token 鉴权：
+调用走 dashboard（默认 `http://<daemon-host>:7891`）。当前用 dashboard 轮换式 token 鉴权：
 
 - **程序化调用必须把 token 放在 Cookie 头**：`Cookie: botmux_dashboard_token=<TOKEN>`
 - ⚠️ 不要用 `?t=<TOKEN>` query：那是给浏览器登录用的，`POST` 带它会返回 **302 重定向**（set-cookie），程序化调用会失败。
-- token 获取：运行 `botmux dashboard` 打印登录 URL，其中 `?t=` 后面那段就是 token。每次运行会 rotate（旧 token 失效）。
+- token 获取：运行 `botmux dashboard` 获取当前登录 URL，其中 `?t=` 后面那段就是 token。尚无 token 时命令会创建第一个；仅在确实要让已有 token 失效时才运行 `botmux dashboard rotate`。
 
-> token 是短期凭证。长期稳定的 API Key 认证（如 `X-Botmux-Api-Key`）在规划中，届时本文更新。
+> token 会一直保留到显式轮换。独立 API Key 认证（如 `X-Botmux-Api-Key`）在规划中，届时本文更新。
 
 ---
 

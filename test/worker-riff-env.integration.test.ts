@@ -133,10 +133,18 @@ describe('Riff worker session environment', () => {
         workingDir: root,
         cliId: 'riff',
         backendType: 'riff',
-        backendConfig: { baseUrl: `http://127.0.0.1:${port}`, injectStatusLines: false },
+        backendConfig: {
+          baseUrl: `http://127.0.0.1:${port}`,
+          injectStatusLines: false,
+          env: {
+            BOTMUX_OWNER_OPEN_ID: 'ou_stale_config_owner',
+            __OWNER_OPEN_ID: 'ou_stale_config_owner',
+          },
+        },
         prompt: 'verify remote session environment',
         larkAppId: appId,
         larkAppSecret: 'secret',
+        ownerOpenId: 'ou_authenticated_owner',
       };
       child.send(init);
 
@@ -147,6 +155,8 @@ describe('Riff worker session environment', () => {
         }),
       ]);
       expect(request.config?.env?.BOTMUX_USAGE_DISPLAY).toBe('footer');
+      expect(request.config?.env?.BOTMUX_OWNER_OPEN_ID).toBe('ou_authenticated_owner');
+      expect(request.config?.env?.__OWNER_OPEN_ID).toBe('ou_authenticated_owner');
     } finally {
       if (child && child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
       for (const socket of sockets) socket.destroy();

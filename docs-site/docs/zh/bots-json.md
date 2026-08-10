@@ -141,7 +141,7 @@
 
 | 字段 | 说明 |
 |------|------|
-| `allowedUsers` | 操作权名单（**完整邮箱**或 `ou_xxx`）。配了 `allowedChatGroups` 时至少要有一个作为 owner |
+| `allowedUsers` | 操作权名单。推荐使用**完整邮箱**、手机号或 `on_xxx`；`ou_xxx` 只能用于签发它的同一应用，禁止跨 Bot 复制。配了 `allowedChatGroups` 时至少要有一个作为 owner |
 | `allowedChatGroups` | 可对话群（`oc_xxx`）。群内任何成员可对话（仅 `canTalk`），敏感操作仍由 `allowedUsers` 控制 |
 | `p2pOpen` | `true` 时允许飞书应用可用范围内的任何用户私聊该 bot（仅 `canTalk`）；群聊不受影响，敏感操作仍只认 `allowedUsers`。建议始终同时配置至少一个 `allowedUsers` owner |
 | `oncallChats` | oncall 绑定，`[{ "chatId": "oc_xxx", "workingDir": "~/projects/foo" }]`。见 [oncall](/oncall) |
@@ -183,6 +183,44 @@
 | `autoStartOnGroupJoin` | `true` 时，被拉入含至少一名 `allowedUsers` 的新群即自动开工（不必 @）。需在飞书后台为该应用订阅 `im.chat.member.bot.added_v1` 事件 |
 | `autoStartOnGroupJoinPrompt` | 配合上面：自动开工的首轮 prompt；留空 / 空白则空消息开场，让 bot 自己读群上下文。`autoStartOnGroupJoin` 关闭时无意义 |
 | `autoStartOnNewTopic` | `true` 时，话题群里每个新话题的首条消息无需 @ 也自动开工（普通群无效）。默认被动（仅 @ 触发） |
+
+## 群消息监听
+
+让 Bot **主动盯住某个群**：命中条件的群消息无需 @ 就自动拉起一个会话去处理。典型用途是**报警运维**——监控/告警系统本来就有自己的飞书机器人在往群里发告警，把这个 Bot 拉进那个群、开启监听，每条告警自动开工排查，不必额外配 [Webhook 接入点](/webhook)。
+
+推荐在 **Dashboard「角色 → 消息监听」** 里按群配置（可**预览**最近 24h 命中的消息、**试运行**验证效果）；也可直接写 `bots.json` 的 `messageListeners`（键为 `chat_id`，值为下表配置）：
+
+| 字段 | 说明 |
+|------|------|
+| `enabled` | 是否启用该群的监听。启用时 `prompt` 必填，否则整条配置被忽略 |
+| `prompt` | 监听提示词：告诉 Bot 哪些消息要处理、怎么回复。命中消息会在其**下方新建话题**回复 |
+| `name` | 监听名称（可选），如「告警监听」，用于 Dashboard 展示 |
+| `replyCardTitle` | 回复卡片标题（可选），留空用默认 |
+| `workingDir` | 该监听拉起会话的工作目录（可选），留空用 Bot 默认工作目录 |
+| `senderPolicy.mode` | `all_except_excluded`（黑名单，默认）：处理所有匹配发送者类型、仅排除指定项；`include_only`（白名单）：只处理 `includeSenderOpenIds` 里的发送者 |
+| `senderPolicy.includeSenderTypes` | 监听的发送者类型：`["user"]` / `["bot"]` / 两者。**监听第三方告警机器人必须含 `"bot"`** |
+| `senderPolicy.includeSenderOpenIds` / `excludeSenderOpenIds` | 按 `open_id` 精确白名单 / 黑名单 |
+| `senderPolicy.excludeSelf` | 默认 `true`，始终排除当前 Bot 自己发的消息（防自触发） |
+| `messagePolicy.includeMsgTypes` | 监听的消息类型，默认文本 + 富文本（`post`） |
+
+```json
+{
+  "messageListeners": {
+    "oc_xxxxxxxxxxxxxxxx": {
+      "enabled": true,
+      "name": "告警监听",
+      "prompt": "群里每条告警都是线上事件。定位受影响服务、给出初步排查方向；确认是误报就说明理由。",
+      "senderPolicy": { "mode": "all_except_excluded", "includeSenderTypes": ["bot"] }
+    }
+  }
+}
+```
+
+约定与边界（V1）:
+
+- **只处理群聊顶层消息**：已有话题里的普通回复不处理；显式 @ 本 Bot 的消息仍走普通 @ 路由（不重复触发）。
+- **每条命中消息各拉起一个会话**，回复到该消息下方的新话题。
+- **触达方式**：实时事件路径覆盖飞书推送到的消息；**其他机器人发的、以及未 @ 的消息，靠约 30s 一次的历史轮询补齐**（即最长约 30s 延迟）。所以监听第三方告警机器人时用黑名单模式（`all_except_excluded` + 含 `"bot"`）最稳——白名单按 `open_id` 匹配，而历史接口里第三方机器人按 `app_id` 上报、可能解析不出 `open_id` 从而命中不到。
 
 ## 总结命令
 

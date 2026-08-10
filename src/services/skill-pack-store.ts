@@ -1,0 +1,292 @@
+import { existsSync, mkdirSync, readFileSync } from 'node:fs';
+import { dirname } from 'node:path';
+import { atomicWriteFileSync } from '../utils/atomic-write.js';
+import { withFileLockSync } from '../utils/file-lock.js';
+import { skillPackRegistryPath } from '../core/skills/registry-paths.js';
+import type { SkillPack, SkillPackRegistryFile } from '../core/skills/types.js';
+
+const MAX_NAME_LENGTH = 80;
+const MAX_DESCRIPTION_LENGTH = 500;
+const MAX_TAGS = 20;
+const MAX_TAG_LENGTH = 40;
+const MAX_INCLUDE = 100;
+const LOCK_WAIT_MS = 30_000;
+
+export interface SkillPackInput {
+  id: string;
+  name: string;
+  description?: string;
+  tags?: string[];
+  include: Array<`skill:${string}`>;
+}
+
+export interface SkillPackUpdateInput {
+  name?: string;
+  description?: string | null;
+  tags?: string[] | null;
+  include?: Array<`skill:${string}`>;
+  /** Expected current revision; if it does not match, the update is rejected
+   *  with `SKILL_PACK_REVISION_CONFLICT` so two dashboard tabs cannot silently
+   *  overwrite each other. */
+  expectedRevision?: number;
+}
+
+export type SkillPackStoreErrorDetail =
+  | { code: 'SKILL_PACK_NOT_FOUND'; id: string }
+  | { code: 'SKILL_PACK_ID_CONFLICT'; id: string }
+  | { code: 'SKILL_PACK_INVALID_SELECTOR'; selector: string }
+  | { code: 'SKILL_PACK_INVALID'; reason: string }
+  | { code: 'SKILL_PACK_REVISION_CONFLICT'; id: string; current: number }
+  | { code: 'SKILL_PACK_IN_USE'; id: string };
+
+export class SkillPackStoreError extends Error {
+  constructor(public readonly detail: SkillPackStoreErrorDetail) {
+    super(detail.code);
+    this.name = 'SkillPackStoreError';
+  }
+}
+
+function emptyRegistry(): SkillPackRegistryFile {
+  return { schemaVersion: 1, packs: {} };
+}
+
+function normalizeStoredTimestamp(value: unknown): string {
+  if (typeof value !== 'string' || !value.trim() || Number.isNaN(Date.parse(value))) {
+    throw new SkillPackStoreError({ code: 'SKILL_PACK_INVALID', reason: 'timestamps must be date strings' });
+  }
+  return value;
+}
+
+function normalizeStoredPack(key: string, raw: unknown): SkillPack | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const value = raw as Record<string, unknown>;
+  try {
+    const id = validateId(value.id);
+    if (id !== key || validateId(key) !== key) return undefined;
+    const revision = value.revision;
+    if (!Number.isSafeInteger(revision) || (revision as number) < 1) {
+      throw new SkillPackStoreError({ code: 'SKILL_PACK_INVALID', reason: 'revision must be a positive integer' });
+    }
+    return {
+      id,
+      name: validateName(value.name),
+      description: validateDescription(value.description),
+      tags: normalizeTags(value.tags),
+      include: normalizeInclude(value.include),
+      revision: revision as number,
+      createdAt: normalizeStoredTimestamp(value.createdAt),
+      updatedAt: normalizeStoredTimestamp(value.updatedAt),
+    };
+  } catch {
+    return undefined;
+  }
+}
+
+export function readSkillPackRegistry(): SkillPackRegistryFile {
+  return readSkillPackRegistryInternal(false);
+}
+
+/** Read-time callers stay tolerant so a damaged optional registry cannot take
+ * down session startup. Mutations must fail closed, however: treating an
+ * existing malformed file as empty and then writing it back would erase every
+ * recoverable pack on the next create/update/delete. */
+function readSkillPackRegistryInternal(strict: boolean): SkillPackRegistryFile {
+  const file = skillPackRegistryPath();
+  if (!existsSync(file)) return emptyRegistry();
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(readFileSync(file, 'utf-8')) as unknown;
+  } catch {
+    // Malformed JSON or an unreadable file must not take down the whole skill
+    // pipeline; bots keep working and invalid packs resolve to nothing.
+    if (strict) {
+      throw new SkillPackStoreError({ code: 'SKILL_PACK_INVALID', reason: 'existing packs registry is unreadable or malformed' });
+    }
+    return emptyRegistry();
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    if (strict) throw new SkillPackStoreError({ code: 'SKILL_PACK_INVALID', reason: 'existing packs registry must be an object' });
+    return emptyRegistry();
+  }
+  const registry = parsed as Record<string, unknown>;
+  if (registry.schemaVersion !== 1 || !registry.packs || typeof registry.packs !== 'object' || Array.isArray(registry.packs)) {
+    if (strict) throw new SkillPackStoreError({ code: 'SKILL_PACK_INVALID', reason: 'existing packs registry schema is invalid' });
+    return emptyRegistry();
+  }
+  const packs: Record<string, SkillPack> = {};
+  for (const [key, raw] of Object.entries(registry.packs as Record<string, unknown>)) {
+    const pack = normalizeStoredPack(key, raw);
+    if (!pack) {
+      if (strict) throw new SkillPackStoreError({ code: 'SKILL_PACK_INVALID', reason: `stored pack "${key}" is invalid` });
+      continue;
+    }
+    packs[key] = pack;
+  }
+  return { schemaVersion: 1, packs };
+}
+
+function writeSkillPackRegistry(registry: SkillPackRegistryFile): void {
+  mkdirSync(dirname(skillPackRegistryPath()), { recursive: true });
+  atomicWriteFileSync(skillPackRegistryPath(), JSON.stringify(registry, null, 2) + '\n', { mode: 0o600 });
+}
+
+function withSkillPackMutation<T>(mutate: (registry: SkillPackRegistryFile) => T): T {
+  const file = skillPackRegistryPath();
+  mkdirSync(dirname(file), { recursive: true });
+  return withFileLockSync(file, () => {
+    const registry = readSkillPackRegistryInternal(true);
+    const result = mutate(registry);
+    writeSkillPackRegistry(registry);
+    return result;
+  }, { maxWaitMs: LOCK_WAIT_MS });
+}
+
+function isSkillSelector(value: unknown): value is `skill:${string}` {
+  return typeof value === 'string' && /^skill:.+$/.test(value);
+}
+
+function normalizeInclude(raw: unknown): Array<`skill:${string}`> {
+  if (!Array.isArray(raw)) throw new SkillPackStoreError({ code: 'SKILL_PACK_INVALID', reason: 'include must be an array' });
+  const seen = new Set<string>();
+  const out: Array<`skill:${string}`> = [];
+  for (const item of raw) {
+    if (!isSkillSelector(item)) {
+      throw new SkillPackStoreError({ code: 'SKILL_PACK_INVALID_SELECTOR', selector: String(item) });
+    }
+    if (seen.has(item)) continue;
+    seen.add(item);
+    out.push(item);
+  }
+  if (out.length === 0) throw new SkillPackStoreError({ code: 'SKILL_PACK_INVALID', reason: 'include must contain at least one skill' });
+  if (out.length > MAX_INCLUDE) throw new SkillPackStoreError({ code: 'SKILL_PACK_INVALID', reason: `include exceeds ${MAX_INCLUDE} skills` });
+  return out;
+}
+
+function normalizeTags(raw: unknown): string[] | undefined {
+  if (raw === undefined || raw === null) return undefined;
+  if (!Array.isArray(raw)) throw new SkillPackStoreError({ code: 'SKILL_PACK_INVALID', reason: 'tags must be an array' });
+  const out: string[] = [];
+  for (const tag of raw) {
+    if (typeof tag !== 'string') throw new SkillPackStoreError({ code: 'SKILL_PACK_INVALID', reason: 'tags must be strings' });
+    const trimmed = tag.trim();
+    if (!trimmed) continue;
+    if (trimmed.length > MAX_TAG_LENGTH) throw new SkillPackStoreError({ code: 'SKILL_PACK_INVALID', reason: `tag exceeds ${MAX_TAG_LENGTH} chars` });
+    if (!out.includes(trimmed)) out.push(trimmed);
+  }
+  if (out.length > MAX_TAGS) throw new SkillPackStoreError({ code: 'SKILL_PACK_INVALID', reason: `tags exceed ${MAX_TAGS}` });
+  return out.length > 0 ? out : undefined;
+}
+
+function validateId(id: unknown): string {
+  if (typeof id !== 'string' || !/^[a-z0-9][a-z0-9-]*$/.test(id)) {
+    throw new SkillPackStoreError({ code: 'SKILL_PACK_INVALID', reason: 'id must be a lowercase slug (a-z, 0-9, -)' });
+  }
+  return id;
+}
+
+function validateName(name: unknown): string {
+  if (typeof name !== 'string' || !name.trim()) {
+    throw new SkillPackStoreError({ code: 'SKILL_PACK_INVALID', reason: 'name is required' });
+  }
+  const trimmed = name.trim();
+  if (trimmed.length > MAX_NAME_LENGTH) {
+    throw new SkillPackStoreError({ code: 'SKILL_PACK_INVALID', reason: `name exceeds ${MAX_NAME_LENGTH} chars` });
+  }
+  return trimmed;
+}
+
+function validateDescription(description: unknown): string | undefined {
+  if (description === undefined || description === null) return undefined;
+  if (typeof description !== 'string') {
+    throw new SkillPackStoreError({ code: 'SKILL_PACK_INVALID', reason: 'description must be a string' });
+  }
+  const trimmed = description.trim();
+  if (!trimmed) return undefined;
+  if (trimmed.length > MAX_DESCRIPTION_LENGTH) {
+    throw new SkillPackStoreError({ code: 'SKILL_PACK_INVALID', reason: `description exceeds ${MAX_DESCRIPTION_LENGTH} chars` });
+  }
+  return trimmed;
+}
+
+export function listSkillPacks(): SkillPack[] {
+  return Object.values(readSkillPackRegistry().packs).sort((a, b) => a.name.localeCompare(b.name));
+}
+
+export function getSkillPack(id: string): SkillPack | undefined {
+  const packs = readSkillPackRegistry().packs;
+  return Object.hasOwn(packs, id) ? packs[id] : undefined;
+}
+
+export function createSkillPack(input: SkillPackInput): SkillPack {
+  const id = validateId(input.id);
+  return withSkillPackMutation((registry) => {
+    if (Object.hasOwn(registry.packs, id)) {
+      throw new SkillPackStoreError({ code: 'SKILL_PACK_ID_CONFLICT', id });
+    }
+    const now = new Date().toISOString();
+    const pack: SkillPack = {
+      id,
+      name: validateName(input.name),
+      description: validateDescription(input.description),
+      tags: normalizeTags(input.tags),
+      include: normalizeInclude(input.include),
+      revision: 1,
+      createdAt: now,
+      updatedAt: now,
+    };
+    registry.packs[id] = pack;
+    return pack;
+  });
+}
+
+export function updateSkillPack(id: string, input: SkillPackUpdateInput): SkillPack {
+  return withSkillPackMutation((registry) => {
+    if (!Object.hasOwn(registry.packs, id)) throw new SkillPackStoreError({ code: 'SKILL_PACK_NOT_FOUND', id });
+    const existing = registry.packs[id];
+    if (input.expectedRevision !== undefined && input.expectedRevision !== existing.revision) {
+      throw new SkillPackStoreError({ code: 'SKILL_PACK_REVISION_CONFLICT', id, current: existing.revision });
+    }
+    const updated: SkillPack = {
+      ...existing,
+      name: input.name !== undefined ? validateName(input.name) : existing.name,
+      description: input.description !== undefined ? validateDescription(input.description) : existing.description,
+      tags: input.tags !== undefined ? normalizeTags(input.tags) : existing.tags,
+      include: input.include !== undefined ? normalizeInclude(input.include) : existing.include,
+      revision: existing.revision + 1,
+      updatedAt: new Date().toISOString(),
+    };
+    registry.packs[id] = updated;
+    return updated;
+  });
+}
+
+export function deleteSkillPack(id: string): void {
+  withSkillPackMutation((registry) => {
+    if (!Object.hasOwn(registry.packs, id)) throw new SkillPackStoreError({ code: 'SKILL_PACK_NOT_FOUND', id });
+    delete registry.packs[id];
+  });
+}
+
+export function cloneSkillPack(id: string, newId: string): SkillPack {
+  const targetId = validateId(newId);
+  return withSkillPackMutation((registry) => {
+    if (!Object.hasOwn(registry.packs, id)) throw new SkillPackStoreError({ code: 'SKILL_PACK_NOT_FOUND', id });
+    const source = registry.packs[id];
+    if (Object.hasOwn(registry.packs, targetId)) {
+      throw new SkillPackStoreError({ code: 'SKILL_PACK_ID_CONFLICT', id: targetId });
+    }
+    const now = new Date().toISOString();
+    const clone: SkillPack = {
+      id: targetId,
+      name: validateName(`${source.name} (copy)`),
+      description: source.description,
+      tags: source.tags ? [...source.tags] : undefined,
+      include: [...source.include],
+      revision: 1,
+      createdAt: now,
+      updatedAt: now,
+    };
+    registry.packs[targetId] = clone;
+    return clone;
+  });
+}

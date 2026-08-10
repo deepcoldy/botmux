@@ -13,6 +13,7 @@ import { mountReactPage, type PageDisposer } from './react-mount.js';
 import { useT } from './react-hooks.js';
 import { botOrbStyle, chatAvatarUrlFor } from './ui.js';
 import { copyText } from './clipboard.js';
+import { FeedGroupPicker } from './feed-group-picker.js';
 import {
   CreateActionButton,
   DropdownMenu,
@@ -539,30 +540,14 @@ function CreateDialog(props: {
           <fieldset className="g-modal-field g-feed-group-field">
             <legend>飞书标签（可选）</legend>
             <input type="hidden" name="feedGroupId" value={feedGroupId} />
-            <DropdownMenu
-              className="g-profile-menu"
-              ariaLabel="飞书标签"
-              label={feedGroupId ? (feedGroups.find(group => group.groupId === feedGroupId)?.name ?? feedGroupId) : '点击选择已有标签（可选）'}
-              value={feedGroupId}
-              options={[
-                { value: '', label: '暂不使用标签' },
-                ...feedGroups.map(group => ({ value: group.groupId, label: group.name })),
-              ]}
-              onChange={value => { setFeedGroupId(value); if (value) setNewFeedGroupName(''); }}
+            <FeedGroupPicker
+              groups={feedGroups}
+              selectedId={feedGroupId}
+              newName={newFeedGroupName}
+              disabled={feedGroupsLoading || !!feedGroupsError}
+              onChange={(selectedId, newName) => { setFeedGroupId(selectedId); setNewFeedGroupName(newName); }}
             />
-            <div className="g-feed-group-new">
-              <span>或新建标签</span>
-              <input
-                type="text"
-                name="newFeedGroupName"
-                value={newFeedGroupName}
-                maxLength={60}
-                placeholder="输入新标签名称"
-                disabled={!!feedGroupId || feedGroupsLoading || !!feedGroupsError}
-                onChange={event => setNewFeedGroupName(event.currentTarget.value.trimStart())}
-              />
-            </div>
-            <small>点击上方下拉框可选择已有标签；不选择则不使用标签。</small>
+            <small>展开后可在第一行输入新标签名称，或选择下方已有标签。</small>
             {feedGroupsLoading ? <small>正在读取飞书标签…</small> : null}
             {feedGroupsError ? (
               <div className="hint-warn-inline">

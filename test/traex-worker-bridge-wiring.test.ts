@@ -14,7 +14,7 @@ describe('TRAE worker structured-bridge wiring', () => {
     expect(envSetup).toContain('engineEnv.BOTMUX_LARK_APP_ID = cfg.larkAppId;');
     expect(envSetup).toContain('engineEnv.BOTMUX_ROOT_MESSAGE_ID = cfg.rootMessageId;');
     expect(envSetup).toContain("engineEnv.BOTMUX_SESSION_SCOPE = cfg.rootMessageId?.startsWith('om_') ? 'thread' : 'chat';");
-    expect(envSetup).toContain('engineEnv.BOTMUX_OWNER_OPEN_ID = cfg.ownerOpenId;');
+    expect(envSetup).toContain('applySessionOwnerEnv(engineEnv, cfg.ownerOpenId);');
     expect(envSetup).not.toContain('BOTMUX_LARK_APP_SECRET');
   });
 
@@ -36,8 +36,15 @@ describe('TRAE worker structured-bridge wiring', () => {
     expect(attach).toContain('publishActiveRuntime(readLatestTraexRuntime(rolloutPath))');
     expect(attach).toMatch(/mode !== 'fresh-empty'\s*&&\s*mode !== 'split-live'[\s\S]*?publishActiveRuntime\(readLatestTraexRuntime/);
     // split-live reuses its own drain result rather than a second full scan.
+    // Bound the block to the actual `split-live` success branch (up to the
+    // `else if (mode === 'split-live')` degraded branch) instead of a fixed
+    // char window, so unrelated code inserted ahead of the TRAE publish (e.g.
+    // the sibling Codex runtime block) can't push the assertion out of range.
     const splitStart = attach.indexOf("mode === 'split-live' && existsSync");
-    const splitBlock = attach.slice(splitStart, splitStart + 2200);
+    const splitEnd = attach.indexOf("} else if (mode === 'split-live')", splitStart);
+    expect(splitStart).toBeGreaterThanOrEqual(0);
+    expect(splitEnd).toBeGreaterThan(splitStart);
+    const splitBlock = attach.slice(splitStart, splitEnd);
     expect(splitBlock).toContain('publishActiveRuntime({');
     expect(splitBlock).toContain('model: traex.latestModel');
     expect(splitBlock).not.toContain('readLatestTraexRuntime');

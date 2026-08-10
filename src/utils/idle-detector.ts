@@ -39,6 +39,25 @@ export class IdleDetector {
     this.busyCallback = cb;
   }
 
+  /**
+   * Seed readyPattern evidence for a prompt that IS on screen but was rendered
+   * before resetReadyEvidence() cleared the flag. A new session (SessionStart
+   * source=startup) never redraws after that boundary, so Strategy 2's
+   * `!readySeen` early return would suppress quiescence detection forever.
+   *
+   * The caller must first confirm the PTY is quiet AND the current rendered
+   * screen matches readyPattern. This only restores readySeen — a full
+   * quiescence check (spinner guard included) still runs on top of it, so no
+   * existing check is bypassed.
+   */
+  seedReadyEvidence(): boolean {
+    if (this.isIdle || this.readySeen) return false;
+    this.readySeen = true;
+    this.clearTimer();
+    this.quiescenceCheck();
+    return true;
+  }
+
   feed(data: string): void {
     // A botmux-owned submit calls reset() before writing input, but adopted
     // panes can also receive local terminal input while we are already idle.

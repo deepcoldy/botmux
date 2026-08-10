@@ -657,6 +657,32 @@ describe('drainCodexRollout', () => {
     expect(r.events[0].text).toBe('actual prompt');
   });
 
+  it('extracts turn_aborted as a no-output terminal edge', () => {
+    writeFileSync(path,
+      ev(userResponseItem('interrupt me')) +
+      ev({
+        timestamp: '2026-04-29T07:00:02.000Z',
+        type: 'event_msg',
+        payload: { type: 'turn_aborted', turn_id: 't1', reason: 'interrupted' },
+      }));
+    const r = drainCodexRollout(path, 0);
+    expect(r.events.map(event => ({ kind: event.kind, text: event.text, status: event.terminalStatus }))).toEqual([
+      { kind: 'user', text: 'interrupt me', status: undefined },
+      { kind: 'assistant_final', text: '', status: 'ambiguous' },
+    ]);
+  });
+
+  it('keeps an empty final_answer as a normal completed terminal edge', () => {
+    writeFileSync(path,
+      ev(userResponseItem('finish without visible text')) +
+      ev(assistantFinalResponseItem('')));
+    const r = drainCodexRollout(path, 0);
+    expect(r.events.map(event => ({ kind: event.kind, text: event.text }))).toEqual([
+      { kind: 'user', text: 'finish without visible text' },
+      { kind: 'assistant_final', text: '' },
+    ]);
+  });
+
   it('skips messages with no input_text/output_text content', () => {
     writeFileSync(path,
       ev({

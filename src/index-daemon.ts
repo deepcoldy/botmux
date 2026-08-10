@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { existsSync } from 'node:fs';
 import { installStdioEpipeGuard } from './utils/stdio-epipe-guard.js';
-import { scrubClaudeSessionMarkerEnv, scrubSessionCliHomeEnv } from './utils/child-env.js';
+import { scrubClaudeSessionMarkerEnv, scrubSessionCliHomeEnv, scrubWorkflowWorkerEnv } from './utils/child-env.js';
 
 // Under pm2 the daemon's stdout/stderr are pipes to the God daemon. A broken
 // pipe (log streaming detaches, God daemon restart) would otherwise emit an
@@ -41,6 +41,11 @@ scrubSessionCliHomeEnv(process.env);
 // as a nested child session (transcript saving OFF → --resume continuity
 // silently lost). See CLAUDE_SESSION_MARKER_ENV_KEYS.
 scrubClaudeSessionMarkerEnv(process.env);
+// A stale PM2 dump can bypass cli.ts pm2Env(). Daemons are workflow hosts,
+// never workflow workers; remove node-scoped identity before importing daemon
+// code or forking ordinary chat workers. The ephemeral pool re-adds the exact
+// markers only to genuine workflow workers.
+scrubWorkflowWorkerEnv(process.env);
 
 async function main() {
   // Resolve global UI locale from ~/.botmux/config.json BEFORE loading

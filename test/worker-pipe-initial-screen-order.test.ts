@@ -92,8 +92,8 @@ describe('worker pipe initial screen ordering', () => {
     // Synthetic working must not be rewritten by classifyScreenUsageLimit
     // (rate-limit banner would otherwise collapse seed to limited→limited).
     expect(source).toContain('opts?.force');
-    // Short-turn fix: flushPending publishes working immediately on submit.
-    expect(source).toContain("// Immediate working for card-off reaction settle");
+    // Every submitted item starts a fresh runtime write cycle immediately.
+    expect(source).toContain('beginCliWriteCycle()');
   });
 
   it('runs a busy-pattern idle probe after each submitted input — except reliableTurnTerminal CLIs', () => {
@@ -106,7 +106,7 @@ describe('worker pipe initial screen ordering', () => {
     const flushStart = source.indexOf('async function flushPending(): Promise<void>');
     const flushEnd = source.indexOf('function sendToPty(', flushStart);
     const flush = source.slice(flushStart, flushEnd);
-    const writeIdx = flush.indexOf('() => targetAdapter.writeInput(');
+    const writeIdx = flush.indexOf('() => writeAdapter.writeInput(');
     const gateIdx = flush.indexOf('if (cliAdapter.reliableTurnTerminal !== true) {', writeIdx);
     const probeIdx = flush.indexOf('scheduleBusyPatternIdleProbe(`${cliName()} post-submit`);', writeIdx);
     const helperIdx = source.indexOf('function scheduleBusyPatternIdleProbe(source: string): void');
@@ -186,7 +186,10 @@ describe('worker pipe initial screen ordering', () => {
     const idleStart = source.search(/idleDetector\.onIdle\(async \(/);
     const idleEnd = source.indexOf('observedBackend.onData((data) =>', idleStart);
     const idle = source.slice(idleStart, idleEnd);
-    const deferIdx = idle.indexOf("deferPromptReadyWhileBusy(`${cliName()} screen-idle`, idleBackend)");
+    // The defer label is templated by evidence source (`screen-idle` /
+    // `external-idle`) since Pi's transcript final is guarded by the same
+    // helper; pin the call itself and its ordering before the ready drain.
+    const deferIdx = idle.indexOf("deferPromptReadyWhileBusy(`${cliName()} ${evidenceSource}-idle`, idleBackend)");
     const drainIdx = idle.indexOf('drainBridgesThenMarkReady(evidenceSource);');
     const adoptStart = source.indexOf('function setupAdoptIdleDetection');
     const adoptEnd = source.indexOf('function seedBackendScreen', adoptStart);
@@ -350,8 +353,10 @@ describe('worker pipe initial screen ordering', () => {
     expect(proofGuardIdx).toBeLessThan(livenessGuardIdx);
     expect(livenessGuardIdx).toBeGreaterThan(-1);
     expect(signedIdleGuardIdx).toBeGreaterThan(livenessGuardIdx);
-    // The explicit runner queue wins before any immediate daemon/card idle
+    // The explicit runner queue wins before any immediate daemon/card status
     // projection; returning from the guard therefore suppresses both paths.
+    // The shared projector composes the structured lifecycle gate with signed
+    // Codex App liveness instead of hard-coding an idle card update here.
     expect(livenessGuardIdx).toBeLessThan(readySetIdx);
     expect(signedIdleGuardIdx).toBeLessThan(readySetIdx);
     expect(readySetIdx).toBeLessThan(promptReadySendIdx);
@@ -439,7 +444,24 @@ describe('worker pipe initial screen ordering', () => {
     expect(killCliIdx).toBeGreaterThan(-1);
     const killCliBody = source.slice(source.indexOf('} = {}): void {', killCliIdx));
     expect(killCliBody.slice(0, 300)).toContain('cliSpawnGeneration++;');
-    expect(source.match(/err instanceof CliSpawnSupersededError/g)).toHaveLength(3);
+    // Two additional checks normalize nested spawn failures before the three
+    // restart/init/message handlers consume them.
+    expect(source.match(/err instanceof CliSpawnSupersededError/g)).toHaveLength(5);
+    const restartHandler = source.slice(
+      source.indexOf('async function restartCliProcess('),
+      source.indexOf('// ─── HTTP + WebSocket Server'),
+    );
+    const initHandler = source.slice(
+      source.indexOf("case 'init':"),
+      source.indexOf("case 'codex_app_dispatch_persisted':"),
+    );
+    const messageHandler = source.slice(
+      source.indexOf("case 'message':"),
+      source.indexOf("case 'raw_input':"),
+    );
+    for (const handler of [restartHandler, initHandler, messageHandler]) {
+      expect(handler).toContain('if (err instanceof CliSpawnSupersededError) return;');
+    }
   });
 
   it('uses hardened locators, random endpoints, and process-lifetime publisher leases', () => {

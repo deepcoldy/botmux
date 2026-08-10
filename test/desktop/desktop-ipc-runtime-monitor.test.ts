@@ -238,7 +238,7 @@ describe('desktop dashboard locate IPC', () => {
     await expect(handlers.get('desktop:get-dashboard-url')?.({} as any)).resolves.toBe('http://10.92.89.226:7891/?t=local-token');
   });
 
-  it('rotates a dashboard URL only when no active dashboard token exists', async () => {
+  it('creates a dashboard URL only when no active dashboard token exists', async () => {
     const { registerDesktopIpc } = await import('../../src/desktop/main/ipc.js');
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
       ok: true,
@@ -271,7 +271,7 @@ describe('desktop dashboard locate IPC', () => {
     await expect(handlers.get('desktop:locate-dashboard')?.({} as any)).resolves.toEqual({
       ok: true,
       url: 'http://127.0.0.1:7891/?t=x',
-      source: 'rotated',
+      source: 'ensured',
     });
     expect(runtime.dashboard).toHaveBeenCalledTimes(1);
   });

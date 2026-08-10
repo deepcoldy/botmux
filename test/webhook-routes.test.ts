@@ -4,7 +4,13 @@ import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { connectorTriggerPresentation, verifyWebhookSignature, verifyWebhookToken } from '../src/dashboard/webhook-routes.js';
+import {
+  connectorTriggerPresentation,
+  resolveConnectorMentionIdentities,
+  resolveConnectorTriggerPresentation,
+  verifyWebhookSignature,
+  verifyWebhookToken,
+} from '../src/dashboard/webhook-routes.js';
 import type { ConnectorDefinition } from '../src/services/connector-store.js';
 
 let server: Server | null = null;
@@ -15,6 +21,7 @@ let prevDataDir: string | undefined;
 async function startWebhookServer(opts: {
   createLifecycleGroup?: any;
   proxyToDaemon?: any;
+  resolveMentionIdentities?: any;
 } = {}): Promise<void> {
   vi.resetModules();
   const { handleWebhookRoute } = await import('../src/dashboard/webhook-routes.js');
@@ -27,6 +34,7 @@ async function startWebhookServer(opts: {
     if (await handleWebhookRoute(req, res, url, {
       proxyToDaemon,
       createLifecycleGroup: opts.createLifecycleGroup,
+      resolveMentionIdentities: opts.resolveMentionIdentities,
     })) return;
     res.writeHead(404, { 'content-type': 'application/json' });
     res.end(JSON.stringify({ error: 'not_found' }));
@@ -184,6 +192,28 @@ afterEach(async () => {
 });
 
 describe('webhook route verification helpers', () => {
+  it('strictly verifies direct open_ids with the target bot before mentioning them', async () => {
+    const resolveRaw = vi.fn(async (_botId: string, identities: string[]) => ({
+      map: new Map(identities.map(identity => [identity, 'ou_resolved_email'])),
+    }));
+    const getProfile = vi.fn(async (_botId: string, openId: string) => (
+      openId === 'ou_same_app' ? { status: 'ok' as const, profile: { name: 'Same app' } } : { status: 'cross_app' as const }
+    ));
+
+    const result = await resolveConnectorMentionIdentities(
+      'app1',
+      ['ou_same_app', 'ou_foreign', 'owner@corp.com'],
+      { resolveRaw, getProfile },
+    );
+
+    expect(result).toEqual(new Map([
+      ['owner@corp.com', 'ou_resolved_email'],
+      ['ou_same_app', 'ou_same_app'],
+    ]));
+    expect(resolveRaw).toHaveBeenCalledWith('app1', ['owner@corp.com']);
+    expect(getProfile).toHaveBeenCalledTimes(2);
+  });
+
   it('verifies HMAC over timestamp dot raw-body', () => {
     const ts = '1770000000';
     const raw = Buffer.from('{"ok":true}');
@@ -214,6 +244,43 @@ describe('webhook route verification helpers', () => {
       ...connector,
       topicMessage: { mode: 'none' },
     })).toEqual({ topicMessage: null });
+  });
+
+  it('keeps trusted mentions and role labels intact when a payload title exceeds the topic limit', async () => {
+    const connector = {
+      name: 'Meego development',
+      target: { botId: 'app1' },
+      promptEnvelope: { sourceName: 'Meego' },
+      topicMessage: {
+        mode: 'template',
+        text: 'Meego启动开发：{{title}} {{mention owner}}负责人 {{mention trigger}}触发人',
+        extractors: {
+          title: { path: '$.issue.title', kind: 'text' },
+          owner: { path: '$.owner', kind: 'mention', identityPath: '$.email', namePath: '$.name' },
+          trigger: { path: '$.trigger', kind: 'mention', identityPath: '$.email', namePath: '$.name' },
+        },
+      },
+    } as ConnectorDefinition;
+
+    const presentation = await resolveConnectorTriggerPresentation(
+      connector,
+      {
+        issue: { title: '需求'.repeat(180) },
+        owner: { name: 'Owner', email: 'owner@corp.com' },
+        trigger: { name: 'Trigger', email: 'trigger@corp.com' },
+      },
+      async () => new Map([
+        ['owner@corp.com', 'ou_owner'],
+        ['trigger@corp.com', 'ou_trigger'],
+      ]),
+    );
+
+    const message = presentation?.topicMessage ?? '';
+    expect(Array.from(message).length).toBeLessThanOrEqual(200);
+    expect(message).toContain('<at user_id="ou_owner">Owner</at>负责人');
+    expect(message).toContain('<at user_id="ou_trigger">Trigger</at>触发人');
+    expect((message.match(/<at /g) ?? [])).toHaveLength(2);
+    expect((message.match(/<\/at>/g) ?? [])).toHaveLength(2);
   });
 });
 
@@ -307,6 +374,53 @@ describe('webhook token mode', () => {
 
     expect(res.status).toBe(200);
     expect(captured[0].presentation).toEqual({ topicMessage: 'Alert from simple' });
+    expect(captured[0].envelope.payload.presentation.topicMessage).toBe('untrusted override');
+  });
+
+  it('renders a connector-owned trusted template with safe payload fields and resolved mentions', async () => {
+    const captured: any[] = [];
+    const proxyToDaemon = vi.fn(async (_appId: string, _path: string, init: RequestInit) => {
+      captured.push(JSON.parse(String(init.body)));
+      return { status: 200, text: async () => JSON.stringify({ ok: true, action: 'delivered' }) };
+    }) as any;
+    const resolveMentionIdentities = vi.fn(async (_botId: string, identities: string[]) => new Map([
+      ['owner@corp.com', 'ou_owner'],
+      ['trigger@corp.com', 'ou_trigger'],
+    ].filter(([identity]) => identities.includes(identity))));
+    await startWebhookServer({ proxyToDaemon, resolveMentionIdentities });
+    const connector = await seedTokenConnector();
+    const { upsertConnector } = await import('../src/services/connector-store.js');
+    upsertConnector({
+      ...connector,
+      topicMessage: {
+        mode: 'template',
+        text: 'Meego启动开发：{{title}} {{mention owners}}负责人 {{mention trigger}}触发人',
+        extractors: {
+          title: { path: '$.issue.title', kind: 'text' },
+          owners: { path: '$.meego.owners', kind: 'mention', identityPath: '$.email', namePath: '$.name' },
+          trigger: { path: '$.meego.trigger', kind: 'mention', identityPath: '$.email', namePath: '$.name' },
+        },
+      },
+    });
+
+    const res = await fetch(`${baseUrl}/webhook/conn_token/tok_plain_value`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        issue: { title: 'Batch <at user_id="ou_evil">伪造</at>' },
+        meego: {
+          owners: [{ name: 'Owner </at>', email: 'owner@corp.com' }],
+          trigger: { name: 'Trigger', email: 'trigger@corp.com' },
+        },
+        presentation: { topicMessage: 'untrusted override' },
+      }),
+    });
+
+    expect(res.status).toBe(200);
+    expect(resolveMentionIdentities).toHaveBeenCalledWith('app1', ['owner@corp.com', 'trigger@corp.com']);
+    expect(captured[0].presentation).toEqual({
+      topicMessage: 'Meego启动开发：Batch ＜at user_id="ou_evil"＞伪造＜/at＞ <at user_id="ou_owner">Owner ＜/at＞</at>负责人 <at user_id="ou_trigger">Trigger</at>触发人',
+    });
     expect(captured[0].envelope.payload.presentation.topicMessage).toBe('untrusted override');
   });
 

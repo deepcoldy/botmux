@@ -24,10 +24,9 @@ describe('worker app-runner control-channel wiring', () => {
     const flushEnd = workerSource.indexOf('function sendToPty', flushStart);
     const flush = workerSource.slice(flushStart, flushEnd);
     const reserveIdx = flush.indexOf('codexAppTurnDispatchQueue.reserve(');
-    // The master merge wraps the structured write in runAmbiguousSubmissionTransaction,
-    // so the call is now a `() => targetAdapter.writeStructuredInput!(...)` thunk
-    // (was `await cliAdapter.writeStructuredInput(...)` pre-merge).
-    const writeIdx = flush.indexOf('() => targetAdapter.writeStructuredInput!(');
+    // The master recovery wrapper keeps the structured write in a thunk; the
+    // captured adapter prevents an async continuation from crossing generation.
+    const writeIdx = flush.indexOf('() => writeAdapter.writeStructuredInput!(');
     expect(reserveIdx).toBeGreaterThan(-1);
     expect(writeIdx).toBeGreaterThan(reserveIdx);
     expect(flush).toContain("result.submissionDisposition === 'untouched'");
@@ -73,12 +72,12 @@ describe('worker app-runner control-channel wiring', () => {
     const engageEnd = workerSource.indexOf('/** RPC panes have NO terminal input path', engageStart);
     const engage = workerSource.slice(engageStart, engageEnd);
     const firstTurn = engage.indexOf('await engine.sendFirstTurn(');
-    const accepted = engage.indexOf("if (first === 'accepted' && cfg.queuedActivationToken)", firstTurn);
+    const accepted = engage.indexOf("if (first.outcome === 'accepted' && cfg.queuedActivationToken)", firstTurn);
     const ack = engage.indexOf("type: 'queued_activation_submitted'", accepted);
     expect(firstTurn).toBeGreaterThan(-1);
     expect(accepted).toBeGreaterThan(firstTurn);
     expect(ack).toBeGreaterThan(accepted);
-    expect(engage.slice(firstTurn, accepted)).toContain("if (first === 'not-sent')");
+    expect(engage.slice(firstTurn, accepted)).toContain("if (first.outcome === 'not-sent')");
   });
 
   it('restores the durable FIFO but never treats warm signed idle as proof that prepared input was unwritten', () => {
@@ -352,5 +351,28 @@ describe('worker app-runner control-channel wiring', () => {
     expect(suppressedFinalIdx).toBeGreaterThan(notifyIdx);
     // Both the signed final and the bridge-fallback paths notify — never just one.
     expect((workerSource.match(/notifyExplicitReplyObserved\(/g) ?? []).length).toBeGreaterThanOrEqual(2);
+  });
+
+  it('passes RAW finalContent (not the pre-stripped deliverable) to the suppress gate', () => {
+    // Regression guard for the narration-leak fix (#804): shouldSuppressBridgeEmit
+    // gained a branch "trailing sentinel + a send marker in-window → suppress" so
+    // that a model which already `botmux send`-ed and then wrote longer narration
+    // ending in the sentinel does NOT get that narration re-posted. That branch
+    // can only fire if the gate SEES the trailing sentinel — so the codex-app
+    // call site must hand it the RAW finalContent, not deliverableContent (which
+    // has already had the sentinel stripped). The actual send still uses
+    // deliverableContent; the gate strips internally for its length comparison.
+    const markerStart = workerSource.indexOf('async function handleTrustedCodexAppMarker(');
+    const markerEnd = workerSource.indexOf('function handleAppRunnerOscMarker(', markerStart);
+    const marker = workerSource.slice(markerStart, markerEnd);
+    // The deliverable is derived by stripping; the gate input must be the raw text.
+    expect(marker).toContain('const deliverableContent = stripTrailingBridgeSentinelLine(finalContent);');
+    const gateInputIdx = marker.indexOf('finalText: finalContent };');
+    expect(gateInputIdx).toBeGreaterThan(-1);
+    // Guard against reintroducing the bug: the gateInput must NOT be built from
+    // the already-stripped deliverableContent.
+    expect(marker).not.toContain('finalText: deliverableContent');
+    // The send payload still posts the stripped deliverable, not the raw final.
+    expect(marker).toContain('content: (suppressDelivery || isSuperseded) ? \'\' : deliverableContent,');
   });
 });

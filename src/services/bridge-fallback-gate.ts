@@ -10,17 +10,21 @@
  * Rules:
  *   - Non-adopt + sentinel terminator: the model ended its final with a
  *     standalone `BOTMUX_NOTHING_TO_SEND` (or the legacy `BOTMUX_NO_REPLY`)
- *     line. Two sub-cases, split by what remains after the sentinel line is
- *     stripped (stripTrailingBridgeSentinelLine):
- *       · NOTHING remains → genuine silence (#554): the model was triggered but
- *         deliberately produced no answer (ambient group chatter, or a message
- *         addressed to another bot). Suppress the whole turn. isBridgeNothingToSendFinal.
- *       · PROSE remains → the model DID produce an answer and merely appended
- *         the sentinel. This is the "did work, forgot to `botmux send`, ended
- *         with the sentinel" ghosting shape. Do NOT drop it: callers strip the
- *         sentinel line and forward the prose through the normal send-marker
- *         gate (so a turn that already sent is still suppressed, but an un-sent
- *         answer is delivered instead of lost).
+ *     line. Sub-cases:
+ *       · NOTHING remains after stripping the sentinel → genuine silence (#554):
+ *         the model was triggered but deliberately produced no answer (ambient
+ *         group chatter, or a message addressed to another bot). Suppress the
+ *         whole turn. isBridgeNothingToSendFinal.
+ *       · PROSE remains AND the model ALREADY sent ≥1 message in-window → the
+ *         trailing prose is narration / thinking the model kept out of chat and
+ *         then ended with the sentinel. SUPPRESS (do not re-post it as a new
+ *         answer — the length heuristic would otherwise mistake longer narration
+ *         for a substantive final). This is the "already sent, then narrated,
+ *         ended with sentinel" leak the send-marker branch guards.
+ *       · PROSE remains AND the model sent NOTHING in-window → the prose is a
+ *         real answer produced but never sent (ghosting). Do NOT drop it: callers
+ *         strip the sentinel line and forward the prose (empty marker set → not
+ *         suppressed).
  *     A token that only appears inline (mid-sentence, or with prose after it) is
  *     a normal answer and is left untouched.
  *   - Adopt mode never suppresses: in /adopt the model in the adopted
@@ -300,6 +304,25 @@ export function shouldSuppressBridgeEmit(
   const lower = turn.markTimeMs;
   const upper = nextBoundaryMs ?? Number.POSITIVE_INFINITY;
   const markersInWindow = markers.filter(m => m.sentAtMs >= lower && m.sentAtMs < upper);
+  // A trailing sentinel line is the model's explicit "I have nothing more to
+  // send" signal. Split the two prose+sentinel cases by whether the model
+  // ALREADY sent this turn:
+  //   · sent ≥1 in-window + trailing sentinel → the trailing prose is narration
+  //     / thinking the model deliberately kept out of chat (it explicitly ended
+  //     with the sentinel after sending). SUPPRESS — do NOT let the length
+  //     heuristic below mistake longer narration for a new substantive answer
+  //     and re-post it. This is the "already sent, then narrated, ended with
+  //     sentinel" leak.
+  //   · zero sends in-window + trailing sentinel → the prose is a real answer
+  //     the model produced but never sent (ghosting). Fall through: the
+  //     stripped prose is forwarded by the length check below (markers empty →
+  //     markerSetCoversFinal=false → not suppressed → caller posts it).
+  // A final WITHOUT a trailing sentinel keeps the pure length-based behavior.
+  if (turn.finalText !== undefined
+      && hasTrailingBridgeSentinelLine(turn.finalText)
+      && markersInWindow.length > 0) {
+    return true;
+  }
   // Compare the SENTINEL-STRIPPED final against send markers: a prose+sentinel
   // final is delivered as the stripped prose (callers strip before send), so the
   // length used for the material-longer check must match what actually posts —

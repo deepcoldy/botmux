@@ -1263,9 +1263,18 @@ export class RiffBackend implements SessionBackend {
           const kind = data['kind'] as string | undefined;
           const group = (data['group'] as string | undefined)
             ?? (data['payload'] as Record<string, unknown> | undefined)?.['group'] as string | undefined;
-          // stdout logs are the real output stream — emit as data regardless of logLevel
+          // stdout logs are the real output stream — emit as data regardless of logLevel.
+          // riff stores each stdout log line BARE (no trailing newline): the runner's
+          // logger persists `message` verbatim (Logger.createRootLog) and the SSE `log`
+          // event carries it as `text` unchanged (taskLog.ts runnerLog*→text: log.message).
+          // For codex_app_server that message is one `JSON.stringify(event)` per line. Since
+          // emitText only NORMALIZES existing newlines and never adds a separator, emitting
+          // the bare text would butt consecutive events together into one unreadable wall.
+          // Re-add the per-line separator here (safe & non-duplicating precisely because the
+          // stored line has no trailing newline). NOTE: the `output`/chunk path stays raw —
+          // those chunks may be partial lines, so they must NOT get a synthetic newline.
           if (group === 'stdout' && text) {
-            this.emitText(text);
+            this.emitText(`${text}\n`);
           } else if (this.config.logLevel === 'verbose' && text) {
             this.emitLine(`[riff:${kind ?? 'log'}] ${text}`);
           }

@@ -109,15 +109,75 @@ function normalizeTopicMessage(
 ): { ok: true; value: NonNullable<ConnectorDefinition['topicMessage']> } | { ok: false; error: string } {
   const raw = record(value ?? prior);
   const mode = typeof raw.mode === 'string' ? raw.mode : prior?.mode ?? 'default';
-  if (!['default', 'custom', 'none'].includes(mode)) {
+  if (!['default', 'custom', 'template', 'none'].includes(mode)) {
     return { ok: false, error: 'bad_topic_message_mode' };
   }
-  if (mode !== 'custom') return { ok: true, value: { mode } as NonNullable<ConnectorDefinition['topicMessage']> };
+  if (mode !== 'custom' && mode !== 'template') {
+    return { ok: true, value: { mode } as NonNullable<ConnectorDefinition['topicMessage']> };
+  }
 
   const text = typeof raw.text === 'string' ? raw.text.trim() : prior?.text?.trim() ?? '';
-  if (!text) return { ok: false, error: 'topic_message_required' };
-  if (Array.from(text).length > 200) return { ok: false, error: 'topic_message_too_long' };
-  return { ok: true, value: { mode: 'custom', text } };
+  if (!text) return { ok: false, error: mode === 'template' ? 'topic_message_template_required' : 'topic_message_required' };
+  if (Array.from(text).length > 200) {
+    return { ok: false, error: mode === 'template' ? 'topic_message_template_too_long' : 'topic_message_too_long' };
+  }
+  if (mode === 'custom') return { ok: true, value: { mode: 'custom', text } };
+
+  const extractorsInput = raw.extractors ?? (prior?.mode === 'template' ? prior.extractors : undefined) ?? {};
+  if (!extractorsInput || typeof extractorsInput !== 'object' || Array.isArray(extractorsInput)) {
+    return { ok: false, error: 'topic_message_template_extractors_invalid' };
+  }
+  const extractorEntries = Object.entries(extractorsInput as Record<string, unknown>);
+  if (extractorEntries.length > 20) return { ok: false, error: 'topic_message_template_extractors_too_many' };
+
+  const extractors: NonNullable<ConnectorDefinition['topicMessage']>['extractors'] = {};
+  const aliasPattern = /^[A-Za-z][A-Za-z0-9_.-]{0,63}$/;
+  const pathPattern = /^(?:\$\.)?[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*$/;
+  const unsafePathSegments = new Set(['__proto__', 'prototype', 'constructor']);
+  const validPath = (path: string): boolean => {
+    if (!pathPattern.test(path)) return false;
+    const normalized = path.startsWith('$.') ? path.slice(2) : path;
+    return normalized.split('.').every(segment => !unsafePathSegments.has(segment));
+  };
+
+  for (const [alias, value] of extractorEntries) {
+    if (!aliasPattern.test(alias) || !value || typeof value !== 'object' || Array.isArray(value)) {
+      return { ok: false, error: 'topic_message_template_extractor_invalid' };
+    }
+    const extractor = value as Record<string, unknown>;
+    const path = typeof extractor.path === 'string' ? extractor.path.trim() : '';
+    const kind = extractor.kind;
+    const identityPath = typeof extractor.identityPath === 'string' ? extractor.identityPath.trim() : undefined;
+    const namePath = typeof extractor.namePath === 'string' ? extractor.namePath.trim() : undefined;
+    if (!validPath(path) || (kind !== 'text' && kind !== 'mention')) {
+      return { ok: false, error: 'topic_message_template_extractor_invalid' };
+    }
+    if (kind === 'text' && (identityPath || namePath)) {
+      return { ok: false, error: 'topic_message_template_extractor_invalid' };
+    }
+    if ((identityPath && !validPath(identityPath)) || (namePath && !validPath(namePath))) {
+      return { ok: false, error: 'topic_message_template_extractor_invalid' };
+    }
+    extractors[alias] = {
+      path,
+      kind,
+      ...(identityPath ? { identityPath } : {}),
+      ...(namePath ? { namePath } : {}),
+    };
+  }
+
+  const tokenPattern = /{{\s*(?:(mention)\s+)?([A-Za-z][A-Za-z0-9_.-]{0,63})\s*}}/g;
+  const stripped = text.replace(tokenPattern, (_token, mention: string | undefined, alias: string) => {
+    if (alias === 'source') return mention ? '{{invalid}}' : '';
+    const extractor = extractors[alias];
+    if (!extractor) return '{{missing}}';
+    if ((mention ? 'mention' : 'text') !== extractor.kind) return '{{mismatch}}';
+    return '';
+  });
+  if (stripped.includes('{{') || stripped.includes('}}')) {
+    return { ok: false, error: 'topic_message_template_token_invalid' };
+  }
+  return { ok: true, value: { mode: 'template', text, extractors } };
 }
 
 function sameStringSet(left: string[] | undefined, right: string[] | undefined): boolean {

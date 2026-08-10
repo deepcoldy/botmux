@@ -69,6 +69,7 @@ import { withBotTurnMutation } from './bot-turn-mutation-gate.js';
 import { getBot, getAllBots, loadBotConfigs, resolveBrandLabel, getLoadedConfigPath, resolveUsageDisplay } from '../bot-registry.js';
 import { RestartCoordinator, type RestartObserver } from './restart-coordinator.js';
 import { runtimeBuildIdentity } from '../utils/runtime-build-id.js';
+import { scrubWorkflowWorkerEnv } from '../utils/child-env.js';
 
 /** A random id minted once per daemon process (this lifetime). Stamped onto
  *  isolated persistent panes so a suspend→resume reattach (same id) is
@@ -394,6 +395,10 @@ const WORKER_REDACTED_ENV_KEYS = ['GITHUB_TOKEN', 'GH_TOKEN', 'BOTMUX_PM2_GRACEF
 function workerForkEnv(base: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...base };
   for (const key of WORKER_REDACTED_ENV_KEYS) delete env[key];
+  // Defense in depth for a daemon started from a contaminated PM2 snapshot.
+  // Genuine workflow workers bypass this pool and receive their markers from
+  // workflows/v3/ephemeral-pool.ts.
+  scrubWorkflowWorkerEnv(env);
   return env;
 }
 
@@ -8477,6 +8482,44 @@ function setupWorkerHandlers(
           // The durable receipt remains non-terminal and can be reconciled;
           // never let a projection/store failure crash the worker IPC loop.
           logger.error(`[${t}] Failed to persist turn_terminal for ${msg.turnId.substring(0, 8)}: ${err.message}`);
+        }
+        // Async-HTTP settle-on-terminal (core-only completion bug #70): a turn
+        // the worker's bridge gate suppressed as GENUINE SILENCE (the model
+        // terminated with a bare nothing-to-send sentinel, no `botmux send`)
+        // emits turn_terminal but NO final_output, so the async-trigger result
+        // would stay `pending` and the poller would hang `running` until timeout.
+        // Settle it here with EMPTY content — nothing-to-send is a legitimate
+        // completed-with-empty-output for an HTTP task.
+        //
+        // POSITIVE EVIDENCE ONLY: we settle solely on the worker's explicit
+        // `outputDisposition === 'nothing_to_send'` flag, never on a bare
+        // `completed`. A bare completed terminal is NOT proof of silence — the
+        // RPC-hydration timeout path (worker.ts hydrateCompletedRpcTurn) emits
+        // `completed` with no final_output after fs-lag while the real answer is
+        // still materializing; settling that empty would mask a lost reply.
+        // Guarded further so it never double-settles a final_output-completed
+        // turn (pending-only), never touches a managed VC-meeting receiver, and
+        // only affects this bot's own pending async result. Feishu turns have no
+        // asyncTriggerResults entry, so their silent-turn behavior is unchanged.
+        if (msg.status === 'completed'
+          && msg.outputDisposition === 'nothing_to_send'
+          && !ds.session.vcMeetingReceiver) {
+          const pendingAsync = ds.asyncTriggerResults?.get(msg.turnId);
+          if (pendingAsync && pendingAsync.status === 'pending') {
+            const completedAt = Date.now();
+            pendingAsync.status = 'completed';
+            pendingAsync.content = '';
+            pendingAsync.completedAt = completedAt;
+            try {
+              asyncTriggerStore.recordCompleted(ds.session.sessionId, msg.turnId, '', completedAt, ds.larkAppId);
+            } catch (err: any) {
+              logger.error(`[${t}] Failed to persist async terminal-settle for ${msg.turnId.substring(0, 8)}: ${err.message}`);
+            }
+            // Cleared like the final_output path so worker-exit convergence does
+            // not retro-fail this now-completed turn.
+            if (ds.idempotentAsyncTurn?.triggerId === msg.turnId) ds.idempotentAsyncTurn = undefined;
+            logger.info(`[${t}] Settled async HTTP turn ${msg.turnId.substring(0, 8)} completed (empty output; nothing-to-send)`);
+          }
         }
         if (msg.turnId.startsWith('mlrp_turn_') && msg.status !== 'completed') {
           markMessageListenerRunPreviewFailed(msg.turnId, {
