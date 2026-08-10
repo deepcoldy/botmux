@@ -1,13 +1,14 @@
-import { appendFileSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
-import { homedir, tmpdir } from 'node:os';
+import { appendFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
 import {
   parseOpenTodos,
   todoSnapshotFromEntry,
   readSessionOpenTodos,
   __resetTodoStateCacheForTest,
 } from '../src/services/todo-state.js';
+import { __resetTranscriptResolverCacheForTest } from '../src/services/transcript-resolver.js';
 
 // ── Claude TodoWrite tool_use blocks ──────────────────────────────────────────
 const claudeTodo = (statuses: string[]) => ({
@@ -201,120 +202,105 @@ describe('todo dialect mapping (traex ≡ codex)', () => {
   });
 });
 
-describe('readSessionOpenTodos (Claude transcript on disk, mtime cache)', () => {
-  let dir: string;
-  afterEach(() => { __resetTodoStateCacheForTest(); if (dir) rmSync(dir, { recursive: true, force: true }); });
+// ── 落盘 transcript：增量续读 / fail-closed / 文件替换 / fresh 贯穿 ───────────────
+// 二轮审核阻塞②③ + ① fresh。全部走 codex 方言，原因有二：
+//   1) fresh 只在「resolver 带 30s miss 负缓存」的路径上有意义。claude-code 分支每次
+//      调用都现算（newerFile 直读盘），fresh 是 no-op——用它测 fresh 是假绿（删掉生产
+//      代码里的 fresh 透传，claude 用例照样过）。codex 分支走
+//      cachedTranscriptPathLookup(...,{retryMiss:q.fresh})，才真正锁住护栏。
+//   2) codex home 由 CODEX_HOME 环境变量定向，fixture 全写进临时目录，绝不污染开发者
+//      真实 ~/.codex 或 ~/.claude（上一版把 fixture 写进真实 ~/.claude/projects 且没删
+//      projectKey 目录——已修正为环境定向 + 整体清理，杜绝 PR #792 同类的数据目录污染）。
+// 增量游标 / fail-closed / 文件替换的机制与方言无关；Claude 的 Task* 增量重放由上面的
+// 纯 parseOpenTodos 单测覆盖，这里不再落盘重复。
+describe('readSessionOpenTodos (落盘 codex rollout：增量续读 / fail-closed / 文件替换 / fresh)', () => {
+  let codexHome: string;
+  let prevCodexHome: string | undefined;
+  let sidCounter = 0;
 
-  // Claude transcript path = <cwd project key>/<sessionId>.jsonl under ~/.claude.
-  // The cold-start case (no transcript yet) must resolve to null, not throw.
-  it('returns null when no transcript exists for the session', () => {
-    dir = mkdtempSync(join(tmpdir(), 'todo-state-'));
-    expect(readSessionOpenTodos({ cliId: 'claude-code', sessionId: `nope-${Date.now()}`, cwd: dir })).toBeNull();
+  beforeAll(() => {
+    prevCodexHome = process.env.CODEX_HOME;
+    codexHome = mkdtempSync(join(tmpdir(), 'todo-codexhome-'));
+    process.env.CODEX_HOME = codexHome;
   });
-});
-
-// ── 增量游标读 / fail-closed / 文件替换（二轮审核阻塞②③ + ① fresh 贯穿）──────────
-// readSessionOpenTodos 走真实落盘 transcript：写在 resolver 计算出的
-// ~/.claude/projects/<项目key>/<sessionId>.jsonl。cwd 用 mkdtemp 保证 projectKey
-// 唯一（realpath→非字母数字转 '-'），sessionId 带随机后缀，afterEach 清理该文件。
-describe('readSessionOpenTodos (增量续读 / fail-closed / 文件替换)', () => {
-  let cwdDir: string;
-  let transcriptPath: string;
-
-  // resolver: projectKey = realpathSync(cwd) 里非 [A-Za-z0-9-] → '-'。
-  function transcriptPathFor(cwd: string, sessionId: string): string {
-    const projectKey = realpathSync(cwd).replace(/[^A-Za-z0-9-]/g, '-');
-    const projectDir = join(homedir(), '.claude', 'projects', projectKey);
-    mkdirSync(projectDir, { recursive: true });
-    return join(projectDir, `${sessionId}.jsonl`);
-  }
-  const line = (entry: unknown) => `${JSON.stringify(entry)}\n`;
-
+  afterAll(() => {
+    if (prevCodexHome === undefined) delete process.env.CODEX_HOME;
+    else process.env.CODEX_HOME = prevCodexHome;
+    if (codexHome) rmSync(codexHome, { recursive: true, force: true });
+  });
   afterEach(() => {
     __resetTodoStateCacheForTest();
-    if (transcriptPath) rmSync(transcriptPath, { force: true });
-    if (cwdDir) rmSync(cwdDir, { recursive: true, force: true });
-    transcriptPath = '';
-    cwdDir = '';
+    __resetTranscriptResolverCacheForTest();
   });
 
-  function setup(): { sessionId: string; cwd: string } {
-    cwdDir = mkdtempSync(join(tmpdir(), 'todo-cwd-'));
-    const sessionId = `sess-${process.pid}-${Math.floor(performance.now() * 1000)}`;
-    transcriptPath = transcriptPathFor(cwdDir, sessionId);
-    return { sessionId, cwd: cwdDir };
+  const line = (entry: unknown) => `${JSON.stringify(entry)}\n`;
+
+  // codex rollout 路径：<CODEX_HOME>/sessions/<Y>/<M>/<D>/rollout-<ts>-<sid>.jsonl。
+  // 每个用例用唯一 sid，避免 resolver 正向缓存（路径命中永久 TTL）跨用例串味。
+  function newSession(): { sessionId: string; cliSessionId: string; rolloutPath: string } {
+    const cliSessionId = `sid-${process.pid}-${sidCounter++}`;
+    const dir = join(codexHome, 'sessions', '2026', '08', '10');
+    mkdirSync(dir, { recursive: true });
+    const rolloutPath = join(dir, `rollout-2026-08-10T00-00-00-${cliSessionId}.jsonl`);
+    return { sessionId: `bmx-${cliSessionId}`, cliSessionId, rolloutPath };
   }
+  const read = (s: { sessionId: string; cliSessionId: string }, fresh?: boolean) =>
+    readSessionOpenTodos({ cliId: 'codex', sessionId: s.sessionId, cliSessionId: s.cliSessionId, fresh });
 
-  it('增量续读：追加新 TodoWrite 快照后反映最新状态（不重折旧行）', () => {
-    const { sessionId, cwd } = setup();
-    writeFileSync(transcriptPath, line(claudeTodo(['pending', 'pending', 'pending'])));
-    expect(readSessionOpenTodos({ cliId: 'claude-code', sessionId, cwd }))
-      .toMatchObject({ total: 3, done: 0, remaining: 3, hasInProgress: false });
-
-    // 追加一条更新过的快照——增量路径应只 fold 新行、给出最新末态。
-    appendFileSync(transcriptPath, line(claudeTodo(['completed', 'completed', 'in_progress'])));
-    expect(readSessionOpenTodos({ cliId: 'claude-code', sessionId, cwd }))
-      .toMatchObject({ total: 3, done: 2, remaining: 1, hasInProgress: true });
+  it('无 rollout 落盘时解析为 null，不抛异常', () => {
+    const s = newSession();
+    expect(read(s)).toBeNull();
   });
 
-  it('增量续读：Task* 增量事件跨多次读盘持续累积', () => {
-    const { sessionId, cwd } = setup();
-    writeFileSync(transcriptPath, line(taskCreate('c1', 'A')) + line(createResult('c1', 1)));
-    expect(readSessionOpenTodos({ cliId: 'claude-code', sessionId, cwd }))
-      .toMatchObject({ total: 1, done: 0, remaining: 1, hasInProgress: false });
+  it('增量续读：追加新 update_plan 快照后反映最新状态（只 fold 新行）', () => {
+    const s = newSession();
+    writeFileSync(s.rolloutPath, line(codexPlan(['pending', 'pending', 'pending'])));
+    expect(read(s)).toMatchObject({ total: 3, done: 0, remaining: 3, hasInProgress: false });
 
-    // 追加第二个任务 + 把第一个标完成——沿用折叠状态，末态应为 2 项 1 完成。
-    appendFileSync(transcriptPath, line(taskCreate('c2', 'B')) + line(createResult('c2', 2)) + line(taskUpdate('1', 'completed')));
-    expect(readSessionOpenTodos({ cliId: 'claude-code', sessionId, cwd }))
-      .toMatchObject({ total: 2, done: 1, remaining: 1, hasInProgress: false });
+    // 追加更新过的快照——增量路径只 fold 新行、给出最新末态（last-write-wins）。
+    appendFileSync(s.rolloutPath, line(codexPlan(['completed', 'completed', 'in_progress'])));
+    expect(read(s)).toMatchObject({ total: 3, done: 2, remaining: 1, hasInProgress: true });
   });
 
   it('size 未变则直接返缓存（无新行，稳定同值）', () => {
-    const { sessionId, cwd } = setup();
-    writeFileSync(transcriptPath, line(claudeTodo(['completed', 'pending'])));
-    const first = readSessionOpenTodos({ cliId: 'claude-code', sessionId, cwd });
-    const second = readSessionOpenTodos({ cliId: 'claude-code', sessionId, cwd });
+    const s = newSession();
+    writeFileSync(s.rolloutPath, line(codexPlan(['completed', 'pending'])));
+    const first = read(s);
+    const second = read(s);
     expect(second).toEqual(first);
     expect(second).toMatchObject({ total: 2, done: 1, remaining: 1 });
   });
 
   it('文件被整体替换（内容变短，size<offset）→ 冷读重解析，不返旧值', () => {
-    const { sessionId, cwd } = setup();
-    writeFileSync(transcriptPath, line(claudeTodo(['completed', 'completed', 'completed'])));
-    expect(readSessionOpenTodos({ cliId: 'claude-code', sessionId, cwd }))
-      .toMatchObject({ total: 3, done: 3, remaining: 0 });
+    const s = newSession();
+    writeFileSync(s.rolloutPath, line(codexPlan(['completed', 'completed', 'completed'])));
+    expect(read(s)).toMatchObject({ total: 3, done: 3, remaining: 0 });
 
-    // 用更短的新内容整体覆盖（size 变小 < 上次 offset）——必须冷读出新的单项状态。
-    writeFileSync(transcriptPath, line(claudeTodo(['pending'])));
-    expect(readSessionOpenTodos({ cliId: 'claude-code', sessionId, cwd }))
-      .toMatchObject({ total: 1, done: 0, remaining: 1, hasInProgress: false });
+    // 更短的新内容整体覆盖（size 变小 < 上次 offset）——必须冷读出新的单项状态。
+    writeFileSync(s.rolloutPath, line(codexPlan(['pending'])));
+    expect(read(s)).toMatchObject({ total: 1, done: 0, remaining: 1, hasInProgress: false });
   });
 
-  it('冷读遇 >32MiB transcript → fail-closed 返 null，绝不返旧 cache', () => {
-    const { sessionId, cwd } = setup();
-    // 先建一个正常的小文件并读出有效值，占住 cache。
-    writeFileSync(transcriptPath, line(claudeTodo(['completed', 'pending'])));
-    expect(readSessionOpenTodos({ cliId: 'claude-code', sessionId, cwd }))
-      .toMatchObject({ total: 2, done: 1 });
+  it('>32MiB transcript → fail-closed 返 null，绝不返旧 cache（含增量路径）', () => {
+    const s = newSession();
+    // 先建正常小文件并读出有效值，占住 cache（offset 前沿）。
+    writeFileSync(s.rolloutPath, line(codexPlan(['completed', 'pending'])));
+    expect(read(s)).toMatchObject({ total: 2, done: 1 });
 
-    // 整体替换成一个 >32MiB 的新文件（size<offset 触发冷读路径，超阈值 fail-closed）。
-    const bigLine = line(claudeTodo(['pending']));
-    const header = Buffer.from(bigLine);
-    const filler = Buffer.alloc(33 * 1024 * 1024, 0x20); // 33MiB 空格，非法 JSON 也无所谓——超阈直接拒
-    writeFileSync(transcriptPath, Buffer.concat([header, filler]));
-    expect(readSessionOpenTodos({ cliId: 'claude-code', sessionId, cwd })).toBeNull();
+    // 同 inode 原地追加撑到 >32MiB：既走「size≥offset 的增量分支」，护栏又必须拦下。
+    // 这正是上一版漏掉的路径（旧护栏只挡冷读）——现在选路前一刀切，返 null。
+    appendFileSync(s.rolloutPath, Buffer.alloc(33 * 1024 * 1024, 0x20));
+    expect(read(s)).toBeNull();
   });
 
-  it('fresh 贯穿：resolver miss 负缓存后，fresh=true 能在同一读里拿到刚落盘的 transcript', () => {
-    // 先用非 fresh 读一次不存在的 transcript（种下 resolver 的 30s miss 负缓存），
-    // 再落盘并以 fresh=true 读——fresh 绕过负缓存立即命中，而非等 30s。
-    cwdDir = mkdtempSync(join(tmpdir(), 'todo-cwd-'));
-    const sessionId = `sess-fresh-${process.pid}-${Math.floor(performance.now() * 1000)}`;
-    expect(readSessionOpenTodos({ cliId: 'claude-code', sessionId, cwd: cwdDir })).toBeNull();
-
-    transcriptPath = transcriptPathFor(cwdDir, sessionId);
-    writeFileSync(transcriptPath, line(claudeTodo(['completed', 'in_progress'])));
-    expect(readSessionOpenTodos({ cliId: 'claude-code', sessionId, cwd: cwdDir, fresh: true }))
+  it('fresh 贯穿：resolver miss 负缓存后，fresh=true 当场解析成功（non-fresh=null）', () => {
+    // codex 分支带 30s miss 负缓存。先非 fresh 读一次（rollout 尚未落盘）种下负缓存，
+    // 再落盘：不带 fresh 仍吃负缓存返 null；带 fresh 绕过负缓存当场解析成功。
+    const s = newSession();
+    expect(read(s)).toBeNull();               // 种下 miss 负缓存
+    writeFileSync(s.rolloutPath, line(codexPlan(['completed', 'in_progress'])));
+    expect(read(s)).toBeNull();               // 非 fresh：仍吃 30s 负缓存
+    expect(read(s, true))                      // fresh：绕过负缓存，当场命中
       .toMatchObject({ total: 2, done: 1, remaining: 1, hasInProgress: true });
   });
 });
