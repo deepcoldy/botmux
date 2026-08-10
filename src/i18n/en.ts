@@ -320,6 +320,8 @@ export const messages: Record<string, string> = {
   'cmd.repo.scan_dir_not_exist': 'Scan dirs do not exist: {dirs}\nCheck that workingDir in bots.json points to a valid directory.',
   'cmd.repo.working_dir_not_exist': '❌ Configured working directory does not exist or is not a directory: {dirs}\nCheck workingDir / workingDirs in ~/.botmux/bots.json, or run `botmux setup` and choose an existing directory.',
   'cmd.repo.no_git_repos': 'No git repositories found under {dirs}.',
+  'cmd.repo.scan_budget_no_repos': '⚠️ Scanning {dirs} hit too many directories (or was too slow) and stopped at the budget before finding any git repo.\nThis usually means the scan root is too large (e.g. pointed at your home dir `~`). Use `/repo <path-to-repo>` to open one directly, or narrow workingDir / workingDirs in ~/.botmux/bots.json.\nNote: if a directory hangs at the OS level (not just "too many dirs"), this guard cannot interrupt it — narrowing the root is still required.',
+  'cmd.repo.scan_budget_partial': '⚠️ Too many directories (or too slow); the scan stopped at the budget, so the list below may be incomplete.\nIf your repo is missing, use `/repo <path-to-repo>`, or narrow workingDir / workingDirs in ~/.botmux/bots.json.',
   'cmd.repo.worktree_usage': 'Usage: `/repo wt <N|name|path> [new-branch]` — create a worktree off the repo\'s remote default branch and open it; without a branch, Botmux auto-names it from the topic title / first prompt when possible.',
   'cmd.repo.worktree_creating': '🌿 Creating a worktree for `{repo}` (includes a git fetch, may take a few seconds)…',
   'card.repo.riff_worktree_push_failed': '⚠️ Failed to push branch `{branch}` to origin: {error}\nThe riff sandbox will use the default branch (push manually and retry).',

@@ -321,6 +321,8 @@ export const messages: Record<string, string> = {
   'cmd.repo.scan_dir_not_exist': '扫描目录不存在：{dirs}\n请检查 bots.json 中的 workingDir 是否指向有效目录。',
   'cmd.repo.working_dir_not_exist': '❌ 配置的工作目录不存在或不是目录：{dirs}\n请检查 ~/.botmux/bots.json 中的 workingDir / workingDirs，或重新运行 `botmux setup` 修改为已存在的目录。',
   'cmd.repo.no_git_repos': '在 {dirs} 下未找到 git 仓库。',
+  'cmd.repo.scan_budget_no_repos': '⚠️ 扫描 {dirs} 时目录过多或读取过慢，已在到达上限后中止，未发现 git 仓库。\n这通常是根目录设得太大（例如指向了 home 目录 `~`）。请用 `/repo <具体仓库路径>` 直接指定，或收窄 `~/.botmux/bots.json` 里的 workingDir / workingDirs。\n注意：若某个目录在系统层面读取卡死（非目录过多），本护栏无法中断它，仍需收窄根目录。',
+  'cmd.repo.scan_budget_partial': '⚠️ 目录过多或读取过慢，扫描在到达上限后中止，下方仓库列表可能不完整。\n如未看到目标仓库，请用 `/repo <具体仓库路径>` 指定，或收窄 `~/.botmux/bots.json` 里的 workingDir / workingDirs。',
   'cmd.repo.worktree_usage': '用法：`/repo wt <编号|项目名|路径> [新分支名]` — 基于该仓库的远端默认分支新建 worktree 并打开；未指定分支时会优先根据话题标题/首条需求自动命名。',
   'cmd.repo.worktree_creating': '🌿 正在为 `{repo}` 创建 worktree（含 git fetch，可能需要几秒）…',
   'card.repo.riff_worktree_push_failed': '⚠️ 分支 `{branch}` 推送远端失败：{error}\nRiff 沙箱将使用默认分支（可手动 push 后重试）',

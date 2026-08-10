@@ -2623,8 +2623,69 @@ describe('handleCommand', () => {
       expect(scanMultipleProjects).toHaveBeenCalledWith(
         ['/home/testuser'],
         3,
-        { includeWorktrees: false },
+        expect.objectContaining({
+          includeWorktrees: false,
+          onBudgetExceeded: expect.any(Function),
+        }),
       );
+    });
+
+    // ── Scan-budget prompts (behavioural, not just wiring) ──────────────────
+    // These fire the onBudgetExceeded callback the handler passes in and assert
+    // the USER-VISIBLE consequence. A mutation that keeps the callback wired but
+    // empties its body (`() => {}`) leaves scanBudgetHit false, so both prompts
+    // vanish — and both of these tests must go red. (The `expect.any(Function)`
+    // wiring check above cannot catch that; this is the rev1 false-green lesson.)
+    it('budget hit with zero repos → warns to narrow the root and sends NO card', async () => {
+      vi.mocked(existsSync).mockReturnValue(true);
+      // scan bailed at the budget before finding anything: empty list + callback.
+      vi.mocked(scanMultipleProjects).mockImplementation(((_dirs: any, _depth: any, options: any) => {
+        options?.onBudgetExceeded?.({ reason: 'dirs', dirsVisited: 4000, baseDir: '/home/testuser' });
+        return [];
+      }) as any);
+
+      const ds = makeDaemonSession({ worker: null });
+      const deps = makeDeps(ds);
+
+      await handleCommand('/repo', ROOT_ID, makeLarkMessage('/repo'), deps, LARK_APP_ID);
+
+      // t() returns the resolved zh string here, so assert on stable fragments
+      // that are UNIQUE to each i18n key (avoids brittle full-text matching).
+      // scan_budget_no_repos: "…已在到达上限后中止，未发现 git 仓库。"
+      // no_git_repos:         "在 {dirs} 下未找到 git 仓库。"
+      const replies = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls.map(c => c[1] as string);
+      // Must warn with the budget-specific message (mentions 中止 / 收窄根目录)…
+      expect(replies.some(c => typeof c === 'string' && c.includes('到达上限后中止') && c.includes('未发现 git 仓库'))).toBe(true);
+      // …and must NOT have fallen through to the plain "未找到 git 仓库" empty message.
+      expect(replies.some(c => typeof c === 'string' && c.includes('下未找到 git 仓库'))).toBe(false);
+      // …nor sent an interactive repo-selection card (there are no repos to pick).
+      const sentCard = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls
+        .some(c => c[2] === 'interactive');
+      expect(sentCard).toBe(false);
+    });
+
+    it('budget hit with a partial list → sends the "incomplete" notice BEFORE the card', async () => {
+      vi.mocked(existsSync).mockReturnValue(true);
+      // scan found one repo but tripped the budget: partial list + callback.
+      vi.mocked(scanMultipleProjects).mockImplementation(((_dirs: any, _depth: any, options: any) => {
+        options?.onBudgetExceeded?.({ reason: 'time', dirsVisited: 12, baseDir: '/home/testuser' });
+        return [{ name: 'proj', path: '/home/testuser/proj', branch: 'main' }];
+      }) as any);
+
+      const ds = makeDaemonSession({ worker: null });
+      const deps = makeDeps(ds);
+
+      await handleCommand('/repo', ROOT_ID, makeLarkMessage('/repo'), deps, LARK_APP_ID);
+
+      const calls = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls;
+      // scan_budget_partial is the only message containing "列表可能不完整".
+      const partialIdx = calls.findIndex(c => typeof c[1] === 'string' && (c[1] as string).includes('列表可能不完整'));
+      const cardIdx = calls.findIndex(c => c[2] === 'interactive');
+      // Both must happen…
+      expect(partialIdx).toBeGreaterThanOrEqual(0);
+      expect(cardIdx).toBeGreaterThanOrEqual(0);
+      // …and the "may be incomplete" notice must precede the card.
+      expect(partialIdx).toBeLessThan(cardIdx);
     });
 
     it('should resolve a first-level project name and switch repo (mid-session)', async () => {
