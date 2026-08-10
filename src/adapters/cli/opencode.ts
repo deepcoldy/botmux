@@ -22,7 +22,8 @@ import { delay } from '../../utils/timing.js';
 const OPENCODE_SESSION_ID_RE = /^ses_[0-9A-Za-z]+$/;
 const OPENCODE_PASTE_THRESHOLD = 150;
 
-function isOpenCodeSessionId(value: string | undefined): value is string {
+/** 判断是否 OpenCode 原生会话 id（`ses_…`）。opencode2 复用同一套 id 规则。 */
+export function isOpenCodeSessionId(value: string | undefined): value is string {
   return typeof value === 'string' && OPENCODE_SESSION_ID_RE.test(value);
 }
 
@@ -71,8 +72,8 @@ function loadSqlite(): typeof sqliteModule {
 
 /** 只读打开 opencode.db 执行一次查询。DB 是 WAL 模式且被活跃 OpenCode 进程持有，
  *  read-only 连接可并发读；任何失败（模块缺失/文件不存在/短暂锁忙）都回落 null，
- *  上层按"无法验证"降级，不影响输入投递本身。 */
-function withDb<T>(fn: (db: DatabaseSyncLike) => T): T | null {
+ *  上层按"无法验证"降级，不影响输入投递本身。opencode2 与 opencode 共用该库。 */
+export function withDb<T>(fn: (db: DatabaseSyncLike) => T): T | null {
   const mod = loadSqlite();
   if (!mod) return null;
   const dbPath = opencodeDbPath();
@@ -90,7 +91,7 @@ function withDb<T>(fn: (db: DatabaseSyncLike) => T): T | null {
 
 /** 提交验证基线：part 表当前最大 time_created（epoch ms，与 worker 同机同钟）。
  *  之后只认 >= 基线的新行，避免历史消息误配。 */
-function snapPartBaseline(): number | null {
+export function snapPartBaseline(): number | null {
   return withDb((db) => {
     const row = db.prepare('SELECT COALESCE(MAX(time_created), 0) AS ts FROM part').get() as { ts: number } | undefined;
     return row?.ts ?? 0;
@@ -120,10 +121,56 @@ function detectNewSubmit(baseline: number, expectedText: string): { found: boole
   }) ?? { found: false };
 }
 
+/** 提交验证轮询（writeInput 共用实现，opencode2 复用）：基线已由调用方采样，
+ *  之后只认 > 基线的新 user part；命中则带回 cliSessionId。斜杠命令基线为 null
+ *  （不产生 user message 行），直接视为已提交。 */
+export async function detectOpenCodeSubmit(
+  pty: PtyHandle,
+  baseline: number | null,
+  content: string,
+  delayFn: (ms: number) => Promise<void> = delay,
+): Promise<{ submitted: boolean; cliSessionId?: string; recheck?: () => { submitted: boolean; cliSessionId?: string } | false }> {
+  const trySendEnter = (): boolean => {
+    try {
+      if (pty.sendSpecialKeys) pty.sendSpecialKeys('Enter');
+      else pty.write('\r');
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  if (baseline === null) return { submitted: true };
+
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const match = detectNewSubmit(baseline, content);
+    if (match.found) {
+      return match.cliSessionId
+        ? { submitted: true, cliSessionId: match.cliSessionId }
+        : { submitted: true };
+    }
+    await delayFn(800);
+    if (!trySendEnter()) return { submitted: false };
+  }
+  const finalMatch = detectNewSubmit(baseline, content);
+  if (finalMatch.found) {
+    return finalMatch.cliSessionId
+      ? { submitted: true, cliSessionId: finalMatch.cliSessionId }
+      : { submitted: true };
+  }
+  const recheck = () => {
+    const late = detectNewSubmit(baseline, content);
+    return late.found
+      ? { submitted: true, cliSessionId: late.cliSessionId }
+      : false;
+  };
+  return { submitted: false, recheck };
+}
+
 /** 兜底反查：botmux 每条 prompt 都带 `<session_id>xxx</session_id>` 块，按该文本在
  *  user part 里找最近命中的 OpenCode 会话。用于 cliSessionId 尚未持久化时的 resume
  *  （典型：首条消息经 --prompt 注入、没走 writeInput 就被 suspend/重启）。 */
-function latestOpenCodeSessionForBotmuxSession(botmuxSessionId: string): string | undefined {
+export function latestOpenCodeSessionForBotmuxSession(botmuxSessionId: string): string | undefined {
   return withDb((db) => {
     const row = db.prepare(
       'SELECT p.session_id AS sid ' +
@@ -137,11 +184,35 @@ function latestOpenCodeSessionForBotmuxSession(botmuxSessionId: string): string 
   }) ?? undefined;
 }
 
-function sessionRowExists(cliSessionId: string): boolean | null {
+export function sessionRowExists(cliSessionId: string): boolean | null {
   return withDb((db) => {
     const row = db.prepare('SELECT 1 AS ok FROM session WHERE id = ? LIMIT 1').get(cliSessionId) as { ok?: number } | undefined;
     return !!row?.ok;
   });
+}
+
+/** Import path（/adopt 第二过滤器）共用实现：从全局 session 表列出可续接的顶层会话
+ *  （parent_id 非空的是子代理会话，跳过）。opencode2 与 opencode 共用同一库。 */
+export function listOpenCodeResumableSessions(opts: { limit: number; exclude?: ReadonlySet<string> }): ResumableSession[] {
+  const { limit, exclude } = opts;
+  const rows = withDb((db) => db.prepare(
+    'SELECT id, directory, title, time_updated AS timeUpdated FROM session ' +
+    'WHERE parent_id IS NULL AND time_archived IS NULL ' +
+    'ORDER BY time_updated DESC LIMIT ?',
+  ).all(limit + (exclude?.size ?? 0)) as { id: string; directory: string; title?: string; timeUpdated: number }[]) ?? [];
+  const out: ResumableSession[] = [];
+  for (const r of rows) {
+    if (out.length >= limit) break;
+    if (exclude?.has(r.id)) continue;
+    if (!r.directory || !existsSync(r.directory)) continue;
+    out.push({
+      cliSessionId: r.id,
+      cwd: r.directory,
+      title: (r.title ?? '').trim() || r.id,
+      lastActivityAt: r.timeUpdated,
+    });
+  }
+  return out;
 }
 
 // -------------------------------------------------------------------------
@@ -215,25 +286,8 @@ export function createOpenCodeAdapter(pathOverride?: string): CliAdapter {
 
     /** Import path（/adopt 第二过滤器）：从全局 session 表列出可续接的顶层会话
      *  （parent_id 非空的是子代理会话，跳过）。title 是 OpenCode 自动生成的摘要。 */
-    listResumableSessions({ limit, exclude }) {
-      const rows = withDb((db) => db.prepare(
-        'SELECT id, directory, title, time_updated AS timeUpdated FROM session ' +
-        'WHERE parent_id IS NULL AND time_archived IS NULL ' +
-        'ORDER BY time_updated DESC LIMIT ?',
-      ).all(limit + (exclude?.size ?? 0)) as { id: string; directory: string; title?: string; timeUpdated: number }[]) ?? [];
-      const out: ResumableSession[] = [];
-      for (const r of rows) {
-        if (out.length >= limit) break;
-        if (exclude?.has(r.id)) continue;
-        if (!r.directory || !existsSync(r.directory)) continue;
-        out.push({
-          cliSessionId: r.id,
-          cwd: r.directory,
-          title: (r.title ?? '').trim() || r.id,
-          lastActivityAt: r.timeUpdated,
-        });
-      }
-      return Promise.resolve(out);
+    listResumableSessions(opts) {
+      return Promise.resolve(listOpenCodeResumableSessions(opts));
     },
 
     async writeInput(pty: PtyHandle, content: string) {
@@ -241,16 +295,6 @@ export function createOpenCodeAdapter(pathOverride?: string): CliAdapter {
       // 不产生 user message 行，跳过验证（重试 Enter 还可能误触面板项）。
       const isSlashCommand = content.startsWith('/');
       const baseline = isSlashCommand ? null : snapPartBaseline();
-
-      const trySendEnter = (): boolean => {
-        try {
-          if (pty.sendSpecialKeys) pty.sendSpecialKeys('Enter');
-          else pty.write('\r');
-          return true;
-        } catch {
-          return false;
-        }
-      };
 
       try {
         if (pty.sendText && pty.sendSpecialKeys) {
@@ -274,29 +318,13 @@ export function createOpenCodeAdapter(pathOverride?: string): CliAdapter {
       // DB 缺失（首次运行 / sandbox 未授权该 DB 路径）→ 维持旧行为：盲发、假定成功。
       if (baseline === null) return undefined;
 
-      for (let attempt = 0; attempt < 3; attempt++) {
-        const match = detectNewSubmit(baseline, content);
-        if (match.found) {
-          return match.cliSessionId
-            ? { submitted: true, cliSessionId: match.cliSessionId }
-            : { submitted: true };
-        }
-        await delay(800);
-        if (!trySendEnter()) return { submitted: false };
-      }
-      const finalMatch = detectNewSubmit(baseline, content);
-      if (finalMatch.found) {
-        return finalMatch.cliSessionId
-          ? { submitted: true, cliSessionId: finalMatch.cliSessionId }
+      const result = await detectOpenCodeSubmit(pty, baseline, content, delay);
+      if (result.submitted) {
+        return result.cliSessionId
+          ? { submitted: true, cliSessionId: result.cliSessionId }
           : { submitted: true };
       }
-      const recheck = () => {
-        const late = detectNewSubmit(baseline, content);
-        return late.found
-          ? { submitted: true, cliSessionId: late.cliSessionId }
-          : false;
-      };
-      return { submitted: false, recheck };
+      return { submitted: false, recheck: result.recheck };
     },
 
     completionPattern: undefined,   // quiescence only — no explicit completion marker

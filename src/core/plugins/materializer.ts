@@ -12,6 +12,7 @@ export const CLI_CAPABILITY_MATRIX: Record<string, { skills: CliCapabilityState;
   codex: { skills: 'supported', mcpGateway: 'supported' },
   'claude-code': { skills: 'supported', mcpGateway: 'supported' },
   opencode: { skills: 'supported', mcpGateway: 'adapter-required' },
+  opencode2: { skills: 'supported', mcpGateway: 'adapter-required' },
 };
 
 export function readMaterializedPlugin(pluginId: string): PluginMaterializedFile | undefined {

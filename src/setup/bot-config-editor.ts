@@ -33,6 +33,7 @@ export const CLI_ID_CHOICES: Record<string, CliId> = {
   '23': 'kiro-cli',
   '24': 'riff',
   '25': 'reasonix',
+  '26': 'opencode2',
 };
 
 const VALID_CLI_IDS: ReadonlySet<string> = new Set(Object.values(CLI_ID_CHOICES));
@@ -51,6 +52,7 @@ const CLI_DISPLAY_LABELS: Record<CliId, string> = {
   'gemini': 'Gemini',
   'genius': 'Genius',
   'opencode': 'OpenCode',
+  'opencode2': 'OpenCode 2',
   'antigravity': 'Antigravity',
   'mtr': 'MTR',
   'hermes': 'Hermes',

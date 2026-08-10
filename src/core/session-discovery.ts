@@ -64,6 +64,7 @@ const CLI_COMM_MAP: Record<string, CliId> = {
   traex: 'traex',
   gemini: 'gemini',
   opencode: 'opencode',
+  opencode2: 'opencode2',
   mtr: 'mtr',
   hermes: 'hermes',
   pi: 'pi',

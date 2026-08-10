@@ -17,6 +17,7 @@ botmux 通过适配器桥接不同 CLI / Agent，`bots.json` 里用 `cliId` 选�
 | `gemini` | Gemini | 本地进程 | ✅ |
 | `cursor` | Cursor（cursor-agent） | 本地进程 | ✅ |
 | `opencode` | OpenCode | 本地进程 | ✅ |
+| `opencode2` | OpenCode 2（beta，`opencode2`） | 本地进程 | |
 | `antigravity` | Antigravity（agy） | 本地进程 | |
 | `copilot` | GitHub Copilot | 本地进程 | ✅ |
 | `grok` | Grok（grok-cli） | 本地进程 | ✅ |

@@ -347,6 +347,61 @@ describe('installHook — opencode-plugin', () => {
   });
 });
 
+// ─── opencode2-plugin 格式（OpenCode 2.0 新插件 API）─────────────────────────
+
+describe('installHook — opencode2-plugin', () => {
+  let tmpDir: string;
+  let configPath: string;
+  const hookCommand = '/usr/bin/node /path/to/cli.js hook opencode2';
+
+  beforeEach(() => {
+    tmpDir = makeTmpDir();
+    configPath = join(tmpDir, '.config', 'opencode', 'plugins', 'botmux-ask.js');
+  });
+
+  it('V2 插件：default export { id, setup }，事件走 ctx.event.subscribe() 异步迭代流', () => {
+    installHook('opencode2', { configPath, format: 'opencode2-plugin' }, hookCommand);
+    const content = readFileSync(configPath, 'utf-8');
+
+    // V2 插件契约：default export 必须是对象（V1 的函数导出会被 V2 loader 拒绝）
+    expect(content).toContain('export default {');
+    expect(content).toContain('id: "botmux.ask"');
+    expect(content).toContain('setup: async (ctx) =>');
+    expect(content).not.toContain('export const BotmuxAsk = async');
+    // 事件流 API（回调式 subscribe 会被静默忽略）
+    expect(content).toContain('ctx.event.subscribe()');
+    expect(content).toContain('for await (const ev of iterator)');
+    expect(content).toContain('question.asked');
+    // 异步 spawn（绝不能用 spawnSync 同步阻塞服务端）
+    expect(content).toContain('spawn(');
+    expect(content).not.toContain('spawnSync(');
+    // session-scoped 新 reply 端点（V1 的 /question/{id}/reply 在 V2 是 404）
+    expect(content).toContain('/api/session/');
+    expect(content).toContain('/question/');
+    expect(content).toContain('/reply');
+    expect(content).not.toContain('/question/" + id + "/reply');
+    // 注册文件发现 + Basic auth + 多 worktree 路由头
+    expect(content).toContain('service.json');
+    expect(content).toContain('x-opencode-directory');
+    expect(content).toContain('"opencode:"');
+    // args 以 JSON 数组嵌入，包含 hook 子命令与 cliId
+    expect(content).toContain('"hook"');
+    expect(content).toContain('"opencode2"');
+    expect(content).toContain('cli.js');
+    expect(content).not.toContain('.split(');
+  });
+
+  it('幂等——二次调用后文件内容与第一次完全相同', () => {
+    installHook('opencode2', { configPath, format: 'opencode2-plugin' }, hookCommand);
+    const afterFirst = readFileSync(configPath, 'utf-8');
+
+    installHook('opencode2', { configPath, format: 'opencode2-plugin' }, hookCommand);
+    const afterSecond = readFileSync(configPath, 'utf-8');
+
+    expect(afterSecond).toBe(afterFirst);
+  });
+});
+
 // ─── TRAE legacy hook cleanup ────────────────────────────────────────────────
 
 describe('cleanupTraexAskHooks', () => {
