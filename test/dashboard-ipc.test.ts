@@ -2887,6 +2887,61 @@ describe('PUT /api/bot-agent', () => {
     }
   });
 
+  it('still reports the closed sessions when the config commit itself fails', async () => {
+    // Third post-close exit. The closes already ran and are irreversible, so this
+    // response is the only place a surviving remote id is ever reported.
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-agent-commitfail-'));
+    const configPath = join(dir, 'bots.json');
+    const appId = 'test-agent-commitfail';
+    const prevBotsConfig = process.env.BOTS_CONFIG;
+    const originalHook = agentSwitchCloseHook.run;
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      writeFileSync(configPath, JSON.stringify([{
+        larkAppId: appId,
+        larkAppSecret: 'secret',
+        cliId: 'traex',
+        model: 'old-model',
+      }], null, 2));
+      loadBotConfigs().forEach((c: any) => registerBot(c));
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      agentSwitchCloseHook.run = async () => ({
+        ok: true,
+        closed: 2,
+        residual: 1,
+        failed: 0,
+        residualTaskIds: ['mojo-parked-9'],
+      });
+      // Make the durable write fail AFTER the closes have run.
+      rmSync(configPath);
+      mkdtempSync(join(dir, 'blocker-'));
+      writeFileSync(configPath, 'not json at all');
+
+      const res = await fetch(`http://127.0.0.1:${handle.port}/api/bot-agent`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ cliId: 'codex', model: 'kimi-k2.5' }),
+      });
+
+      expect(res.ok).toBe(false);
+      const body = await res.json();
+      expect(body).toMatchObject({
+        ok: false,
+        error: 'agent_switch_commit_failed',
+        closedMismatchedSessions: 2,
+        closedMismatchedResidualTaskIds: ['mojo-parked-9'],
+      });
+      // In-memory config unchanged: the switch did not take effect.
+      expect(getBot(appId).config.cliId).toBe('traex');
+    } finally {
+      agentSwitchCloseHook.run = originalHook;
+      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = prevBotsConfig;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('rejects an unsettled Codex App session before config/readIsolation mutation or close', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'botmux-agent-pending-ipc-'));
     const dataDir = join(dir, 'data');

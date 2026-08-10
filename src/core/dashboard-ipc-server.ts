@@ -3963,7 +3963,9 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
       });
     }
 
-    const r = await rmwBotEntry(larkAppId, (entry) => {
+    let r: Awaited<ReturnType<typeof rmwBotEntry>>;
+    try {
+      r = await rmwBotEntry(larkAppId, (entry) => {
     entry.cliId = selected.cliId;
     if (selected.wrapperCli) entry.wrapperCli = selected.wrapperCli;
     else delete entry.wrapperCli;
@@ -3997,8 +3999,34 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
       delete entry.backendType;
     }
     return { write: true, result: null };
-    });
-    if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
+      });
+    } catch (err) {
+      // A read/rename/atomic-write throw would otherwise escape this handler with
+      // no body at all, losing the same summary the !ok branch preserves.
+      return jsonRes(res, 500, {
+        ok: false,
+        error: 'agent_switch_commit_failed',
+        reason: err instanceof Error ? err.message : String(err),
+        closedMismatchedSessions: closedMismatchedSessions.closed,
+        closedMismatchedResidual: closedMismatchedSessions.residual,
+        closedMismatchedFailed: closedMismatchedSessions.failed,
+        closedMismatchedResidualTaskIds: closedMismatchedSessions.residualTaskIds,
+      });
+    }
+    if (!r.ok) {
+      // Third post-close exit. The closes above are IRREVERSIBLE, so this must
+      // carry the same summary as the 409 branch — otherwise a commit failure
+      // silently destroys the only handle for a surviving remote session.
+      return jsonRes(res, 400, {
+        ok: false,
+        error: 'agent_switch_commit_failed',
+        reason: r.reason,
+        closedMismatchedSessions: closedMismatchedSessions.closed,
+        closedMismatchedResidual: closedMismatchedSessions.residual,
+        closedMismatchedFailed: closedMismatchedSessions.failed,
+        closedMismatchedResidualTaskIds: closedMismatchedSessions.residualTaskIds,
+      });
+    }
 
     const bot = getBot(larkAppId);
     bot.config.cliId = selected.cliId;

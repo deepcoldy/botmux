@@ -318,6 +318,68 @@ describe('Codex-compatible runtime editor', () => {
     }
   });
 
+  it('shows unknown (and stays warn) when a residual count arrives with no ids', async () => {
+    // Malformed payload must fail CLOSED: the count alone is evidence a remote
+    // session survived, so it cannot render as a silent success.
+    const { text, className } = await saveAgentWithSweep({
+      closedMismatchedSessions: 1,
+      closedMismatchedResidual: 1,
+      closedMismatchedResidualTaskIds: [],
+    });
+
+    expect(text).toContain('unknown');
+    expect(text).not.toContain('✓');
+    expect(className).toContain('hint-warn-inline');
+  });
+
+  it('drops the green tick when ids arrive with no residual count', async () => {
+    // The mirror case: ids are evidence too. This used to print "manual cleanup
+    // required" AND the green tick at the same time.
+    const { text, className } = await saveAgentWithSweep({
+      closedMismatchedSessions: 1,
+      closedMismatchedResidualTaskIds: ['mojo-parked-9'],
+    });
+
+    expect(text).toContain('mojo-parked-9');
+    expect(text).not.toContain('✓');
+    expect(className).not.toContain('hint-ok');
+  });
+
+  it('reports a commit failure that happened AFTER sessions were closed', async () => {
+    // Third post-close exit: the closes are irreversible, so this response is the
+    // only report of the surviving remote sessions.
+    const previousFetch = globalThis.fetch;
+    (globalThis as any).fetch = vi.fn(async () => ({
+      ok: false,
+      status: 400,
+      json: async () => ({
+        ok: false,
+        error: 'agent_switch_commit_failed',
+        reason: 'ENOSPC',
+        closedMismatchedSessions: 2,
+        closedMismatchedResidual: 1,
+        closedMismatchedFailed: 0,
+        closedMismatchedResidualTaskIds: ['mojo-parked-9'],
+      }),
+    } as any));
+    try {
+      const patchBot = vi.fn();
+      const { root } = renderAgent({ cliId: 'codex' }, patchBot);
+      await act(async () => {
+        root.findByProps({ 'data-action': 'save-agent' }).props.onClick();
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+
+      const text = root.findByProps({ 'data-agent-status': '' }).children.join('');
+      expect(text).toContain('Agent 未切换');
+      expect(text).toContain('mojo-parked-9');
+      expect(patchBot).not.toHaveBeenCalled();
+    } finally {
+      (globalThis as any).fetch = previousFetch;
+    }
+  });
+
   it('keeps the green tick when the sweep was completely clean', async () => {
     const { text, className } = await saveAgentWithSweep({
       closedMismatchedSessions: 2,
@@ -644,6 +706,70 @@ describe('riff CLI switch persistence (PR #467 P1)', () => {
     expect(puts.map(r => r.url.split('/').pop())).toEqual(['riff', 'agent']);
     expect(puts[1]!.body).toEqual({ cliId: 'riff', model: '' });
     expect(JSON.parse(puts[0]!.body.riff)).toMatchObject({ sandboxCluster: 'cn', reasoningEffort: 'xhigh' });
+  });
+});
+
+describe('riff save consumes the agent-switch close summary', () => {
+  function renderRiff(agentBody: any, agentStatus = 200) {
+    const patchBot = vi.fn();
+    (globalThis as any).fetch = async (url: string) => (String(url).endsWith('/agent')
+      ? { ok: agentStatus === 200, status: agentStatus, json: async () => agentBody } as any
+      : { ok: true, status: 200, json: async () => ({ ok: true, riff: JSON.stringify({ baseUrl: 'https://riff.example' }) }) } as any);
+    let renderer!: TestRenderer.ReactTestRenderer;
+    act(() => {
+      renderer = TestRenderer.create(React.createElement(BotAgentSection, {
+        bot: { larkAppId: 'cli_riff_sum', cliId: 'codex', model: '' },
+        sessionFallback: 'codex',
+        cliState: {
+          options: [{ id: 'codex', label: 'Codex' }, { id: 'riff', label: 'Riff' }],
+          ttadkModelDefault: 'glm-5.1',
+          ttadkModelSuggestions: [],
+        },
+        patchBot,
+      }));
+    });
+    act(() => { renderer.root.findByProps({ dataInput: 'agentCliId' }).props.onChange('riff'); });
+    return { root: renderer.root, patchBot };
+  }
+
+  it('200 + residual: shows the id in the RIFF status and is not green', async () => {
+    // setAgentStatus is rendered in the !isRiff branch, so a residual reported
+    // there while Riff is selected is invisible. It has to land on this section.
+    const { root } = renderRiff({
+      ok: true,
+      cliId: 'riff',
+      wrapperCli: null,
+      model: '',
+      selectionKey: 'riff',
+      closedMismatchedSessions: 1,
+      closedMismatchedResidual: 1,
+      closedMismatchedResidualTaskIds: ['mojo-parked-9'],
+    });
+
+    await act(async () => { await root.findByProps({ 'data-action': 'save-riff' }).props.onClick(); });
+
+    const status = root.findByProps({ 'data-riff-status': '' });
+    expect(status.children.join('')).toContain('mojo-parked-9');
+    expect(status.children.join('')).not.toContain('✓');
+  });
+
+  it('409 aborted switch: shows Agent-not-switched + id, and does not patch cliId', async () => {
+    const { root, patchBot } = renderRiff({
+      ok: false,
+      error: 'agent_switch_close_failed',
+      closedMismatchedSessions: 1,
+      closedMismatchedResidual: 1,
+      closedMismatchedFailed: 1,
+      closedMismatchedResidualTaskIds: ['mojo-parked-9'],
+    }, 409);
+
+    await act(async () => { await root.findByProps({ 'data-action': 'save-riff' }).props.onClick(); });
+
+    const text = root.findByProps({ 'data-riff-status': '' }).children.join('');
+    expect(text).toContain('Agent 未切换');
+    expect(text).toContain('mojo-parked-9');
+    // The /riff write succeeded, but cliId must NOT be flipped to riff.
+    expect(patchBot.mock.calls.some(c => (c[1] as any)?.cliId === 'riff')).toBe(false);
   });
 });
 

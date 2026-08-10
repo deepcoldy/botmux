@@ -287,14 +287,62 @@ export function BdTabGrid(props: { children: ReactNode; className?: string }) {
   );
 }
 
-/** Render residual remote ids, validating the JSON shape (never blank-swallow). */
+/**
+ * Normalise an agent-switch close summary out of an (untrusted) JSON body.
+ *
+ * count and ids are read TOGETHER on purpose. Either one alone is evidence that a
+ * remote session survived, and trusting only one is how a malformed payload
+ * fails open:
+ *  - count>0 with missing/empty ids used to print no id at all;
+ *  - ids present with count 0/absent used to print "manual cleanup required" and
+ *    still show the green tick.
+ * So: any evidence at all ⇒ residual, and a declared residual with no usable id
+ * renders as `unknown` rather than vanishing.
+ */
+/** What a Riff-side agent persist reports back to its own visible status. */
+interface CliPersistOutcome {
+  ok: boolean;
+  /** True when a remote session survived (or the switch aborted). */
+  hadProblem: boolean;
+  note: string;
+}
+
+function parseAgentSwitchSummary(body: unknown): {
+  closed: number;
+  failed: number;
+  residual: number;
+  residualIds: string[];
+  hasResidual: boolean;
+} {
+  const record = (body && typeof body === 'object' ? body : {}) as Record<string, unknown>;
+  const num = (v: unknown): number =>
+    typeof v === 'number' && Number.isInteger(v) && v > 0 ? v : 0;
+  const closed = num(record.closedMismatchedSessions);
+  const failed = num(record.closedMismatchedFailed);
+  const residualCount = num(record.closedMismatchedResidual);
+  const rawIds = record.closedMismatchedResidualTaskIds;
+  const ids = Array.isArray(rawIds)
+    ? rawIds.map(id => (typeof id === 'string' && id.trim() ? id : 'unknown'))
+    : [];
+  const hasResidual = residualCount > 0 || ids.length > 0;
+  // A declared residual with no usable id must still be visible.
+  const residualIds = hasResidual && ids.length === 0 ? ['unknown'] : ids;
+  return {
+    closed,
+    failed,
+    residual: Math.max(residualCount, residualIds.length),
+    residualIds,
+    hasResidual,
+  };
+}
+
+/** Render residual remote ids; empty only when there is genuinely no residual. */
 function residualIdText(
-  raw: unknown,
+  summary: { residualIds: string[] },
   tr: (key: string, params?: Record<string, string | number>) => string,
 ): string {
-  if (!Array.isArray(raw) || raw.length === 0) return '';
-  const ids = raw.map(id => (typeof id === 'string' && id.trim() ? id : 'unknown'));
-  return tr('botDefaults.agentResidualIds', { ids: ids.join(', ') });
+  if (summary.residualIds.length === 0) return '';
+  return tr('botDefaults.agentResidualIds', { ids: summary.residualIds.join(', ') });
 }
 
 function statusClass(status: StatusMessage, extra = ''): string {
@@ -1412,15 +1460,10 @@ export function BotAgentSection(props: {
       };
       const res = await sendJson('PUT', `/api/bots/${encodeURIComponent(bot.larkAppId)}/agent`, body);
       if (res.ok && res.body.ok) {
-        const closedCount = Number.isInteger(res.body.closedMismatchedSessions) && res.body.closedMismatchedSessions > 0
-          ? res.body.closedMismatchedSessions as number
-          : 0;
-        const residualCount = Number.isInteger(res.body.closedMismatchedResidual)
-          ? res.body.closedMismatchedResidual as number
-          : 0;
-        const failedCount = Number.isInteger(res.body.closedMismatchedFailed)
-          ? res.body.closedMismatchedFailed as number
-          : 0;
+        const summary = parseAgentSwitchSummary(res.body);
+        const closedCount = summary.closed;
+        const residualCount = summary.residual;
+        const failedCount = summary.failed;
         // Localised, not hardcoded: this component is already tr()-driven, so a
         // raw Chinese string would reach an English dashboard.
         const notes = [
@@ -1432,10 +1475,12 @@ export function BotAgentSection(props: {
           // The ids are the ONLY handle for manual cleanup; a count alone is not
           // actionable. Malformed/blank entries render as `unknown` rather than
           // silently disappearing.
-          residualIdText(res.body.closedMismatchedResidualTaskIds, tr),
+          residualIdText(summary, tr),
         ].filter(Boolean);
         const closedText = notes.join(' · ');
-        const hadProblem = residualCount > 0 || failedCount > 0;
+        // `hasResidual` (count OR ids), not the count alone — a payload carrying
+        // only ids must still lose the green tick.
+        const hadProblem = summary.hasResidual || failedCount > 0;
         setAgentStatus(res.body.availabilityWarning
           ? { text: `⚠️ ${res.body.availabilityWarning}${closedText ? ` · ${closedText}` : ''}` }
           : hadProblem
@@ -1474,14 +1519,19 @@ export function BotAgentSection(props: {
         // The switch transaction refused: say what actually happened rather than
         // surfacing a bare error code — the config is unchanged, some rows closed,
         // and some remote sessions may need manual cleanup.
-        const aborted = res.body?.error === 'agent_switch_close_failed';
+        // Both post-close exits: the switch aborted because a close failed, OR the
+        // closes ran and the config commit failed. Either way some rows are closed
+        // and their remote ids are only reported here.
+        const aborted = res.body?.error === 'agent_switch_close_failed'
+          || res.body?.error === 'agent_switch_commit_failed';
+        const abortSummary = parseAgentSwitchSummary(res.body);
         const detail = aborted
           ? [
             tr('botDefaults.agentSwitchAborted', {
-              closed: Number(res.body.closedMismatchedSessions ?? 0),
-              failed: Number(res.body.closedMismatchedFailed ?? 0),
+              closed: abortSummary.closed,
+              failed: abortSummary.failed,
             }),
-            residualIdText(res.body.closedMismatchedResidualTaskIds, tr),
+            residualIdText(abortSummary, tr),
           ].filter(Boolean).join(' · ')
           : typeof res.body?.message === 'string' && res.body.message
             ? res.body.message
@@ -1506,10 +1556,18 @@ export function BotAgentSection(props: {
    * reach PUT /agent — the bot would stay on its old CLI and backendType
    * would never auto-flip to riff. Returns false when persisting failed.
    */
-  async function persistRiffCliSelection(): Promise<boolean> {
-    if (bot.cliId === 'riff') return true; // already persisted
+  /**
+   * Riff's save reuses PUT /agent, so it inherits the SAME close transaction —
+   * including a residual (rows closed, remote still running) and an aborted
+   * switch. It must return that to the caller instead of a bare boolean:
+   * `setAgentStatus` is rendered in the `!isRiff` branch, so anything written
+   * there while Riff is selected is invisible.
+   */
+  async function persistRiffCliSelection(): Promise<CliPersistOutcome> {
+    if (bot.cliId === 'riff') return { ok: true, hadProblem: false, note: '' };
     try {
       const res = await sendJson('PUT', `/api/bots/${encodeURIComponent(bot.larkAppId)}/agent`, { cliId: 'riff', model: '' });
+      const summary = parseAgentSwitchSummary(res.body);
       if (res.ok && res.body.ok) {
         patchBot(bot.larkAppId, {
           cliId: res.body.cliId,
@@ -1518,13 +1576,25 @@ export function BotAgentSection(props: {
           model: res.body.model ?? '',
           agentSelectionKey: res.body.selectionKey ?? 'riff',
         });
-        return true;
+        const note = [
+          summary.residual > 0 ? tr('botDefaults.agentClosedResidual', { count: summary.residual }) : '',
+          residualIdText(summary, tr),
+        ].filter(Boolean).join(' · ');
+        return { ok: true, hadProblem: summary.hasResidual, note };
       }
-      setAgentStatus({ text: `✗ ${responseErrorText(res)}` });
-      return false;
+      // Aborted switch (close refused, or commit failed after closes ran): the
+      // config did NOT change and some remote sessions may need manual cleanup.
+      const aborted = res.body?.error === 'agent_switch_close_failed'
+        || res.body?.error === 'agent_switch_commit_failed';
+      const note = aborted
+        ? [
+          tr('botDefaults.agentSwitchAborted', { closed: summary.closed, failed: summary.failed }),
+          residualIdText(summary, tr),
+        ].filter(Boolean).join(' · ')
+        : responseErrorText(res);
+      return { ok: false, hadProblem: true, note };
     } catch (e: any) {
-      setAgentStatus({ text: `✗ ${caughtErrorText(e)}` });
-      return false;
+      return { ok: false, hadProblem: true, note: caughtErrorText(e) };
     }
   }
 
@@ -3841,7 +3911,7 @@ const RIFF_REASONING_EFFORT_OPTIONS = ['', 'low', 'medium', 'high', 'xhigh'];
 /** riff task-execute 的 sandboxCluster；缺省行为与服务端一致，回落 BOE。 */
 const RIFF_SANDBOX_CLUSTER_OPTIONS = ['boe', 'cn'] as const;
 
-function RiffSection(props: { bot: BotDefaultsRow; patchBot: PatchBot; persistCliSelection?: () => Promise<boolean> }) {
+function RiffSection(props: { bot: BotDefaultsRow; patchBot: PatchBot; persistCliSelection?: () => Promise<CliPersistOutcome> }) {
   const tr = useT();
   const riff = props.bot.riff && typeof props.bot.riff === 'object' ? props.bot.riff : {};
   const [baseUrl, setBaseUrl] = useState(typeof riff.baseUrl === 'string' ? riff.baseUrl : '');
@@ -3891,8 +3961,16 @@ function RiffSection(props: { bot: BotDefaultsRow; patchBot: PatchBot; persistCl
       if (res.ok && res.body.ok) {
         const next = typeof res.body.riff === 'string' && res.body.riff ? JSON.parse(res.body.riff) : null;
         props.patchBot(props.bot.larkAppId, { riff: next });
-        if (props.persistCliSelection && !(await props.persistCliSelection())) {
-          setStatus({ text: `✗ ${tr('botDefaults.riffCliPersistFailed')}` });
+        const persisted = await props.persistCliSelection?.();
+        if (persisted && !persisted.ok) {
+          // Show the transaction's own detail (Agent NOT switched + surviving
+          // remote ids) in THIS section's visible status, not the generic text.
+          setStatus({ text: `✗ ${persisted.note || tr('botDefaults.riffCliPersistFailed')}` });
+          return;
+        }
+        if (persisted?.hadProblem) {
+          // Saved, but a remote session survived — never the green tick.
+          setStatus({ text: `⚠️ ${persisted.note}` });
           return;
         }
         setStatus({ text: `✓ ${tr('botDefaults.cardPrefSaved')}`, ok: true });
