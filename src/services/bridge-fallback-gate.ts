@@ -8,14 +8,21 @@
  * disk and threads them through here.
  *
  * Rules:
- *   - Non-adopt + no-reply sentinel terminator: suppress the whole turn.
- *     Botmux-aware models use this explicit protocol when a turn genuinely
- *     needs no chat response. The signal is the LAST non-empty line of the
- *     final being exactly `BOTMUX_NO_REPLY` — models almost always explain
- *     the silence first and then append the token on its own line, so a
- *     full-string exact match leaked the literal token into Lark. A token
- *     that only appears inline (mid-sentence, or with prose after it) is
- *     still a normal answer and is NOT guessed away. See isBridgeNoReplyFinal.
+ *   - Non-adopt + sentinel terminator: the model ended its final with a
+ *     standalone `BOTMUX_NOTHING_TO_SEND` (or the legacy `BOTMUX_NO_REPLY`)
+ *     line. Two sub-cases, split by what remains after the sentinel line is
+ *     stripped (stripTrailingBridgeSentinelLine):
+ *       · NOTHING remains → genuine silence (#554): the model was triggered but
+ *         deliberately produced no answer (ambient group chatter, or a message
+ *         addressed to another bot). Suppress the whole turn. isBridgeNothingToSendFinal.
+ *       · PROSE remains → the model DID produce an answer and merely appended
+ *         the sentinel. This is the "did work, forgot to `botmux send`, ended
+ *         with the sentinel" ghosting shape. Do NOT drop it: callers strip the
+ *         sentinel line and forward the prose through the normal send-marker
+ *         gate (so a turn that already sent is still suppressed, but an un-sent
+ *         answer is delivered instead of lost).
+ *     A token that only appears inline (mid-sentence, or with prose after it) is
+ *     a normal answer and is left untouched.
  *   - Adopt mode never suppresses: in /adopt the model in the adopted
  *     session is unaware of botmux, so transcript drain is the ONLY
  *     channel from model to Lark. There's no `botmux send` to compete
@@ -43,31 +50,117 @@ import { normaliseForFingerprint } from './bridge-turn-queue.js';
 const MATERIAL_FINAL_LENGTH_RATIO = 2;
 const MATERIAL_FINAL_MIN_EXTRA_CHARS = 120;
 
-export const BRIDGE_NO_REPLY_SENTINEL = 'BOTMUX_NO_REPLY';
+export const BRIDGE_NOTHING_TO_SEND_SENTINEL = 'BOTMUX_NOTHING_TO_SEND';
+/** Superseded token name. Instructions no longer teach it, but the matcher
+ *  below still accepts it: during a rollout (and after a restart that restores
+ *  sessions spawned before the rename) in-flight turns still carry the old
+ *  token in their captured system prompt, and dropping recognition would leak
+ *  that literal sentinel line into Lark. The reader stays liberal; only the
+ *  instruction surface moved to the new name. */
+export const BRIDGE_NO_REPLY_SENTINEL_LEGACY = 'BOTMUX_NO_REPLY';
 
-export function isBridgeNoReplyFinal(finalText: string | undefined): boolean {
+const BRIDGE_SENTINEL_TOKENS: readonly string[] = [
+  BRIDGE_NOTHING_TO_SEND_SENTINEL,
+  BRIDGE_NO_REPLY_SENTINEL_LEGACY,
+];
+
+export function isBridgeNothingToSendFinal(finalText: string | undefined): boolean {
   if (finalText === undefined) return false;
-  // Suppress the whole turn when the model's final ENDS WITH a standalone
-  // no-reply sentinel line. We look at the LAST non-empty line only:
-  //   - pure `BOTMUX_NO_REPLY`                       → suppress
-  //   - `<prose>\n\nBOTMUX_NO_REPLY`                 → suppress the whole turn
-  //   - a final whose last non-empty line is prose   → NOT a no-reply signal
-  //     (the token inline in a sentence, or followed by more prose, still posts)
-  // Full-string exact match was too brittle: botmux-aware models almost always
-  // explain the silence first ("...no reply needed.") and then append the token
-  // on its own line, which exact match let leak the literal token into Lark.
-  // Trade-off (accepted): a genuine answer that happens to end with a bare
-  // sentinel line is dropped WHOLE — the product wants a fully silent no-reply
-  // turn over the safer strip-and-forward. The last-non-empty-line rule (not a
-  // substring / endsWith test) keeps that risk to finals the model deliberately
-  // terminated with the sentinel.
+  // "Genuine silence" signal: the final, after stripping a trailing sentinel
+  // line, has NOTHING left. This is the #554 case the sentinel exists for — the
+  // model was triggered (e.g. ambient group chatter, or a message addressed to
+  // another bot) and deliberately produced no answer, terminating with only the
+  // sentinel. Suppress the whole turn so no noise reaches Lark.
+  //
+  // NOTE (behavior change vs the old drop-whole-turn rule): a final that is
+  // PROSE followed by a trailing sentinel line is NO LONGER treated as silence.
+  // Earlier the whole turn was dropped, which ghosted users who did real work,
+  // forgot to `botmux send`, and ended with the sentinel. Now the prose is the
+  // real answer: stripTrailingBridgeSentinelLine removes the sentinel line and
+  // callers forward the remainder through the normal send-marker gate (so a turn
+  // that already `botmux send`-ed is still suppressed, but an un-sent answer is
+  // delivered instead of lost). Only a final that is EMPTY once the sentinel is
+  // stripped counts as silence here.
+  return stripTrailingBridgeSentinelLine(finalText).trim().length === 0
+    && hasTrailingBridgeSentinelLine(finalText);
+}
+
+/** True when the LAST non-empty line of `finalText` is exactly a sentinel token
+ *  (current or legacy). Used to tell "model deliberately terminated with the
+ *  sentinel" apart from a normal answer that merely mentions the token inline
+ *  or has prose after it. */
+function hasTrailingBridgeSentinelLine(finalText: string): boolean {
   const lines = finalText.split('\n');
   for (let i = lines.length - 1; i >= 0; i--) {
     const line = lines[i].trim();
     if (line.length === 0) continue;
-    return line === BRIDGE_NO_REPLY_SENTINEL;
+    return BRIDGE_SENTINEL_TOKENS.includes(line);
   }
   return false;
+}
+
+/** Remove the trailing RUN of standalone sentinel lines (current or legacy
+ *  token, mixable) plus interleaved blank lines from `finalText`, returning the
+ *  text that should actually reach Lark.
+ *
+ *  Stripping the whole trailing run — not just one line — is required to keep the
+ *  "literal token never reaches Lark" guarantee: a model can emit the sentinel
+ *  more than once (`prose\nTOKEN\nTOKEN`, or a bare `TOKEN\nTOKEN`). A one-line
+ *  strip would leave a surviving token to leak, and a bare multi-token final
+ *  would be misjudged as "not silence" and post a literal token — a regression
+ *  vs the old whole-turn suppression. We peel blank + sentinel lines off the end
+ *  until the last remaining line is real prose (or nothing is left).
+ *
+ *    - `BOTMUX_NOTHING_TO_SEND`                 → "" (silence)
+ *    - `TOKEN\nTOKEN` / `TOKEN\n\nTOKEN`        → "" (silence — all tokens peeled)
+ *    - `<prose>\n\nBOTMUX_NOTHING_TO_SEND`      → `<prose>` (the real answer)
+ *    - `<prose>\nTOKEN\nTOKEN`                  → `<prose>` (both tokens peeled)
+ *    - `<prose ending mid-sentence …TOKEN>`     → unchanged (token inline)
+ *    - `TOKEN\n\n<more prose>`                  → unchanged (token not trailing)
+ *  When the last non-empty line is NOT a sentinel, the input is returned as-is;
+ *  leading content is untouched. Mixed current/legacy tokens in the run all peel. */
+export function stripTrailingBridgeSentinelLine(finalText: string): string {
+  const lines = finalText.split('\n');
+  // Walk back from the end, skipping blank lines and standalone sentinel lines.
+  // Stop at the first line that is real prose (or run off the top).
+  let end = lines.length - 1;
+  let strippedASentinel = false;
+  while (end >= 0) {
+    const trimmed = lines[end].trim();
+    if (trimmed.length === 0) { end--; continue; }          // blank — peel
+    if (BRIDGE_SENTINEL_TOKENS.includes(trimmed)) {          // standalone token — peel
+      strippedASentinel = true;
+      end--;
+      continue;
+    }
+    break;                                                   // real prose — stop
+  }
+  // If the tail had no standalone sentinel at all, return verbatim (don't trim
+  // trailing blanks of an ordinary answer — matches prior behavior).
+  if (!strippedASentinel) return finalText;
+  // Drop any blank lines now orphaned before the first surviving prose line.
+  while (end >= 0 && lines[end].trim().length === 0) end--;
+  return lines.slice(0, end + 1).join('\n');
+}
+
+/** The text a transcript-drain emit path should actually post for `finalText`.
+ *
+ *  NON-ADOPT: strip a trailing sentinel line so the literal token never reaches
+ *  Lark (prose+sentinel = the "did work, forgot to send" shape → post the prose).
+ *
+ *  ADOPT: return the text VERBATIM. The adopted CLI is botmux-unaware, transcript
+ *  drain is its only channel to Lark, and it may legitimately output the literal
+ *  sentinel string as content. shouldSuppressBridgeEmit(adoptMode) already
+ *  refuses to interpret the sentinel; stripping here would break that contract
+ *  (a real answer ending in the token would be truncated, and a verbatim token
+ *  reply would be dropped by the caller's empty-guard). Callers must gate their
+ *  own "skip if empty after post" check on !adoptMode to match.
+ *
+ *  Shared by emitReadyTurns and emitReadyCodexTurns so the per-mode rule lives in
+ *  one place and is unit-tested directly. codex-app does not use adopt and drives
+ *  its own strip on the deliverable content path. */
+export function bridgePostText(finalText: string, adoptMode: boolean): string {
+  return adoptMode ? finalText : stripTrailingBridgeSentinelLine(finalText);
 }
 
 export interface BridgeSendMarker {
@@ -166,13 +259,21 @@ export function shouldSuppressBridgeEmit(
   adoptMode: boolean,
 ): boolean {
   if (adoptMode) return false;
-  if (isBridgeNoReplyFinal(turn.finalText)) return true;
+  if (isBridgeNothingToSendFinal(turn.finalText)) return true;
   if (turn.isLocal) return true;
   if (turn.markTimeMs === undefined) return false;
   const lower = turn.markTimeMs;
   const upper = nextBoundaryMs ?? Number.POSITIVE_INFINITY;
   const markersInWindow = markers.filter(m => m.sentAtMs >= lower && m.sentAtMs < upper);
-  return markerSetCoversFinal(markersInWindow, turn.finalText);
+  // Compare the SENTINEL-STRIPPED final against send markers: a prose+sentinel
+  // final is delivered as the stripped prose (callers strip before send), so the
+  // length used for the material-longer check must match what actually posts —
+  // otherwise the trailing sentinel line inflates the final past a same-content
+  // `botmux send` and defeats dedup.
+  const gatedFinal = turn.finalText === undefined
+    ? undefined
+    : stripTrailingBridgeSentinelLine(turn.finalText);
+  return markerSetCoversFinal(markersInWindow, gatedFinal);
 }
 
 /** Some structured CLIs can report a durable completed turn while their
@@ -213,5 +314,18 @@ export function shouldEmitEmptyCompletedBridgeFallback(
   if (turn.isLocal) return false;
   if (turn.terminalStatus !== undefined && turn.terminalStatus !== 'completed') return false;
   if ((turn.finalText ?? '').trim().length > 0) return false;
+  return !shouldSuppressBridgeEmit(turn, nextBoundaryMs, markers, adoptMode);
+}
+
+/** 结构化失败回合补发可见错误；部分回答不能替代失败原因。 */
+export function shouldEmitFailedBridgeFallback(
+  turn: BridgeGateInput,
+  nextBoundaryMs: number | undefined,
+  markers: readonly BridgeSendMarker[],
+  adoptMode: boolean,
+): boolean {
+  if (adoptMode) return false;
+  if (turn.isLocal) return false;
+  if (turn.terminalStatus !== 'failed') return false;
   return !shouldSuppressBridgeEmit(turn, nextBoundaryMs, markers, adoptMode);
 }

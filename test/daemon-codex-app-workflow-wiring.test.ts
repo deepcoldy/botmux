@@ -26,7 +26,8 @@ describe('daemon Codex App workflow prompt lanes', () => {
     expect(block).toContain("const codexAppMessageContext = topicThreadContext + codexAppQuoteContext + (workflowGrillPrompt ?? '');");
     expect(block).toContain('const promptContent = topicThreadContext + codexAppQuoteContext + codexAppApplicationContext + content;');
     expect(block).toContain('pendingCodexAppText: codexAppVisibleText');
-    expect(block.match(/codexAppText: codexAppVisibleText/g)).toHaveLength(2);
+    expect(source).toContain('codexAppText: ds.pendingCodexAppText');
+    expect(block.match(/forkReservedInitialSession\(ds, availableBots\)/g)).toHaveLength(2);
   });
 
   it('retains VC lifecycle context in rewritten legacy prompts without demoting it to untrusted', () => {
@@ -47,5 +48,14 @@ describe('daemon Codex App workflow prompt lanes', () => {
     expect(block).toContain(
       'const codexAppApplicationContext = initialCodexAppApplicationContext;',
     );
+  });
+
+  it('does not buffer ordinary turns solely because repo commit UI cleanup is still in flight', () => {
+    const block = region(
+      'async function handleThreadReply',
+      'async function autoCreateDocSession',
+    );
+    expect(block).toContain('if (ds?.pendingRepo || initialStartPending) {');
+    expect(block).not.toContain('if (ds?.pendingRepo || ds?.pendingRepoCommitInFlight || initialStartPending)');
   });
 });

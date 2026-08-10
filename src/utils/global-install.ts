@@ -7,6 +7,7 @@
  * supported; known Yarn layouts are identified for diagnostics but rejected
  * until their global-dir/bin-dir semantics are handled explicitly.
  */
+import { readdirSync, realpathSync } from 'node:fs';
 import { posix, win32 } from 'node:path';
 import { botmuxInstallRoot } from './install-info.js';
 
@@ -39,6 +40,42 @@ function normalized(path: string): string {
   return path.replace(/\\/g, '/').replace(/\/+$/, '');
 }
 
+/**
+ * pnpm 11 installs a global project in a versioned directory and points a
+ * stable content-addressed symlink at that directory:
+ *
+ *   <global-dir>/v11/<runtime-dir>/node_modules/botmux
+ *   <global-dir>/v11/<stable-hash> -> <runtime-dir>
+ *
+ * Keep using the stable symlink for the post-update version check/restart. If
+ * the install was copied, the symlink was removed, or the filesystem is not
+ * readable, falling back to the running package root still preserves the
+ * correct package-manager command and keeps this path detector conservative.
+ */
+function pnpmV11StablePackageRoot(
+  packageRoot: string,
+  globalDir: string,
+  layout: string,
+  pathImpl: typeof posix,
+): string {
+  const layoutRoot = pathImpl.join(globalDir, layout);
+  try {
+    const runtimeRoot = realpathSync(packageRoot);
+    for (const entry of readdirSync(layoutRoot, { withFileTypes: true })) {
+      if (!entry.isSymbolicLink()) continue;
+      const candidate = pathImpl.join(layoutRoot, entry.name, 'node_modules', 'botmux');
+      try {
+        if (realpathSync(candidate) === runtimeRoot) return candidate;
+      } catch {
+        // Ignore stale content-addressed links and keep looking.
+      }
+    }
+  } catch {
+    // The path classifier must still work for diagnostics and dry-run callers.
+  }
+  return packageRoot;
+}
+
 /** Pure, path-only ownership classification used by both updates and diagnostics. */
 export function detectGlobalInstallManager(
   packageRoot: string,
@@ -64,7 +101,8 @@ export function detectGlobalInstallManager(
   // A preserved pnpm symlink is normally only seen with --preserve-symlinks;
   // recognise the standard global-dir shape while keeping arbitrary POSIX
   // node_modules layouts unsupported.
-  if (/\/pnpm\/global\/[^/]+\/node_modules\/botmux$/.test(root)) return 'pnpm';
+  if (/\/pnpm\/global\/[^/]+\/node_modules\/botmux$/.test(root)
+    || /\/pnpm\/global\/v\d+\/[^/]+\/node_modules\/botmux$/.test(root)) return 'pnpm';
 
   // npm on Windows uses <prefix>/node_modules/botmux (without POSIX's lib/).
   return platform === 'win32' ? 'npm' : 'unknown';
@@ -96,18 +134,28 @@ export function resolveGlobalInstallPlan(
     const root = normalized(packageRoot);
     const marker = '/.pnpm/';
     const markerIndex = root.toLowerCase().indexOf(marker);
-    const globalInstallDir = markerIndex >= 0
-      ? root.slice(0, markerIndex)
+    const pnpmV11Match = root.match(/^(.*\/pnpm\/global)\/(v\d+)\/[^/]+\/node_modules\/botmux$/i);
+    // Use the capture from the normalized path. Besides avoiding a fragile
+    // separator search, this preserves Windows drive letters while converting
+    // backslashes to the separator expected by pnpm's command arguments.
+    const globalDir = pnpmV11Match?.[1];
+    const globalInstallDir = pnpmV11Match
+      ? path.join(globalDir!, pnpmV11Match[2])
+      : markerIndex >= 0
+        ? root.slice(0, markerIndex)
       : path.dirname(path.dirname(packageRoot));
-    // pnpm appends its global layout version (currently "5") to --global-dir.
-    // The runtime package lives under <global-dir>/<layout>/node_modules, so
-    // pass the parent while keeping the versioned directory as the stable root.
-    const globalDir = path.dirname(globalInstallDir);
+    // pnpm appends its global layout version (currently "5", or "v11") to
+    // --global-dir. The pnpm 11 runtime adds another temporary directory below
+    // the layout version, so pass the parent of that layout to pnpm.
+    const resolvedGlobalDir = globalDir ?? path.dirname(globalInstallDir);
+    const activePackageRoot = pnpmV11Match
+      ? pnpmV11StablePackageRoot(packageRoot, resolvedGlobalDir, pnpmV11Match[2], path)
+      : path.join(globalInstallDir, 'node_modules', 'botmux');
     return {
       manager,
       command: 'pnpm',
-      args: ['add', '-g', '--global-dir', globalDir, spec],
-      activePackageRoot: path.join(globalInstallDir, 'node_modules', 'botmux'),
+      args: ['add', '-g', '--global-dir', resolvedGlobalDir, spec],
+      activePackageRoot,
     };
   }
 

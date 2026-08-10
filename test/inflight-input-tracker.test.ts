@@ -86,6 +86,24 @@ describe('InflightInputTracker', () => {
     expect(t.takeCarryOver()).toEqual([{ content: 'ordinary IM', turnId: 'im-1' }]);
   });
 
+  it('at-most-once (noReplay) input is NEVER carried over, but a plain sibling IS — per-item, not per-session', () => {
+    // codex #776 round-7 #1 + round-8: a keyed idempotency turn (dispatchAttempt
+    // undefined, so it would otherwise look like ordinary carry-over) is marked
+    // noReplay. The daemon terminalizes it to dispatch_unknown on CLI exit, so
+    // replaying it onto the auto-restarted CLI would run a turn the caller already
+    // saw failed. Round-8: the exclusion MUST be per-item — a plain (no-key)
+    // follow-up turn folded into the same http_async_ session via target.sessionId
+    // must SURVIVE the same CLI exit, not be dropped by a whole-session flag.
+    const t = new InflightInputTracker();
+    t.onWrite({ content: 'plain follow-up (same session, no key)', turnId: 'im-1' });
+    t.onWrite({ content: 'keyed async turn', turnId: 'trg_k', noReplay: true });
+
+    // Worker's real predicate: dispatchAttempt===undefined && !noReplay.
+    expect(t.onCliExit(item => item.dispatchAttempt === undefined && !item.noReplay)).toBe(1);
+    // The keyed at-most-once turn is dropped; the plain sibling is preserved for replay.
+    expect(t.takeCarryOver()).toEqual([{ content: 'plain follow-up (same session, no key)', turnId: 'im-1' }]);
+  });
+
   it('preserves a clean explicit-IM envelope but leaves a clean durable replay to the receiver', () => {
     const t = new InflightInputTracker();
     const codexAppInput = { text: 'clean' };

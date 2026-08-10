@@ -2,17 +2,40 @@ import { defaultSummaryRangePrefs, summaryRangeFromLegacyContentTriggers } from 
 import { selectionKeyForBot } from '../setup/cli-selection.js';
 import { normalizeUsageDisplay } from '../bot-registry.js';
 import type { CliRuntimeConfig } from '../adapters/cli/runtime.js';
+import { GRANT_DURATION_OPTIONS } from '../services/grant-policy.js';
 
 export interface DashboardBotDescriptor {
   larkAppId: string;
   botName?: string | null;
   botAvatarUrl?: string;
   cliId?: string;
+  /** 租户品牌（bots.json 的 BotConfig.brand）。决定飞书后台深链 host。
+   *  缺省 → 前端 normalizeBrand 兜底 feishu，向后兼容旧 payload。 */
+  brand?: string;
   cliRuntime?: CliRuntimeConfig;
   /** Legacy executable override. Private Bot Defaults payload only. */
   cliPathOverride?: string;
   wrapperCli?: string;
   model?: string;
+}
+
+/**
+ * per-bot brand（feishu / lark）按 larkAppId 的映射,供 dashboard 前端派生飞书
+ * 后台深链 host。brand 只在 bots.json 里(DaemonRegistry 的心跳态不带它),而
+ * 配置加载在 BOTS_CONFIG 缺失 / bots.json 尚未创建 / 临时不可读时会抛——这里
+ * 用 try/catch 兜底返回空 Map（与 dashboard 的 configuredCliIds /
+ * configuredBotAgentFields 同款失败语义）,保证冷缓存 /api/groups 与 /api/bots
+ * 仍能基于 DaemonRegistry 走降级 roster（前端拿不到 brand → normalizeBrand
+ * 兜底 feishu),不因缺配置而 500。`load` 注入配置源便于单测。
+ */
+export function brandMapByAppId(
+  load: () => ReadonlyArray<{ larkAppId: string; brand?: string }>,
+): Map<string, string | undefined> {
+  try {
+    return new Map(load().map(b => [b.larkAppId, b.brand]));
+  } catch {
+    return new Map();
+  }
 }
 
 export function botSummaryPayload(bot: DashboardBotDescriptor) {
@@ -21,6 +44,7 @@ export function botSummaryPayload(bot: DashboardBotDescriptor) {
     botName: bot.botName,
     ...(bot.botAvatarUrl ? { botAvatarUrl: bot.botAvatarUrl } : {}),
     ...(bot.cliId ? { cliId: bot.cliId } : {}),
+    ...(bot.brand ? { brand: bot.brand } : {}),
   };
 }
 
@@ -29,6 +53,7 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     larkAppId: bot.larkAppId,
     botName: bot.botName,
     ...(bot.cliId ? { cliId: bot.cliId } : {}),
+    ...(bot.brand ? { brand: bot.brand } : {}),
     ...(bot.cliRuntime ? { cliRuntime: bot.cliRuntime } : {}),
     ...(bot.cliPathOverride ? { cliPathOverride: bot.cliPathOverride } : {}),
     ...(bot.wrapperCli ? { wrapperCli: bot.wrapperCli } : {}),
@@ -89,6 +114,10 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     substituteMode: j?.substituteMode && typeof j.substituteMode === 'object' ? j.substituteMode : null,
     restrictGrantCommands: j?.restrictGrantCommands === true,
     autoGrantRequestCards: j?.autoGrantRequestCards !== false,
+    grantDefaultDurationMs: typeof j?.grantDefaultDurationMs === 'number'
+      && GRANT_DURATION_OPTIONS.includes(j.grantDefaultDurationMs as (typeof GRANT_DURATION_OPTIONS)[number])
+      ? j.grantDefaultDurationMs
+      : null,
     messageQuotaDefaultLimit: typeof j?.messageQuotaDefaultLimit === 'number' ? j.messageQuotaDefaultLimit : null,
     p2pMode: j?.p2pMode === 'thread' ? 'thread' : j?.p2pMode === 'group' ? 'group' : 'chat',
     skillInjection: (j?.skillInjection === 'global' || j?.skillInjection === 'prompt' || j?.skillInjection === 'off') ? j.skillInjection : null,

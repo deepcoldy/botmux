@@ -1559,8 +1559,8 @@ describe('systemHints', () => {
     expect(hints.some(h => h.includes('botmux send'))).toBe(true);
   });
 
-  it('traex systemHints declare the exact no-reply protocol', () => {
-    expect(createTraexAdapter('/bin/traex').systemHints.join('\n')).toContain('BOTMUX_NO_REPLY');
+  it('traex systemHints declare the exact nothing-to-send protocol', () => {
+    expect(createTraexAdapter('/bin/traex').systemHints.join('\n')).toContain('BOTMUX_NOTHING_TO_SEND');
   });
 });
 

@@ -144,7 +144,7 @@ async function locateDashboard(runtime: RuntimeService): Promise<DashboardLocate
   const result = await runtime.dashboard();
   const url = result.code === 0 ? selectDesktopDashboardUrl(result.stdout) : '';
   if (url) {
-    return validateLocatedDashboard(url, 'rotated');
+    return validateLocatedDashboard(url, 'ensured');
   }
 
   const message = result.stderr.trim() || result.stdout.trim() || `Dashboard lookup failed with exit code ${result.code}`;

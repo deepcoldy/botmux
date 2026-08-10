@@ -145,7 +145,54 @@ export function mentionAppId(m: any): string | undefined {
 }
 
 /**
- * Whether a message explicitly @mentions the given bot. SHARED single source of
+ * Extract @-mentions carried by a post (rich-text) message's inline `at` nodes,
+ * as routing-only `LarkMention`s for the --mention-back participant window.
+ *
+ * WHY separate from parseEventMessage().mentions: a post's `message.mentions[]`
+ * is frequently empty — the real @s live as inline `{ tag: 'at', user_id,
+ * user_name }` nodes in the content (the realtime @-gate isBotMentioned already
+ * scans these). Folding them into the general `parsed.mentions` would ripple
+ * into prompt rendering / stripLeadingMentions / mention hints, so this stays a
+ * dedicated lane consumed ONLY by buildTurnParticipants.
+ *
+ * A post `at`'s `user_id` is an `ou_` open_id (in-group) or a `cli_` app_id
+ * (out-of-group bot). We classify into openId vs appId; `all` and any other
+ * shape are surfaced WITHOUT an executable id so the participant core marks the
+ * window incomplete rather than inventing a candidate. Deliberately NO position
+ * filtering (unlike mention-targets' command parsing) — every counterpart in the
+ * turn counts, including a leading @ of the answering bot (excluded later by
+ * self open_id/app_id). Returns [] on non-post shapes / parse errors.
+ */
+export function extractPostAtParticipants(message: { content?: string } | null | undefined): LarkMention[] {
+  const out: LarkMention[] = [];
+  let content: any;
+  try { content = JSON.parse(message?.content ?? '{}'); } catch { return out; }
+  const inner = content?.zh_cn ?? content?.en_us ?? content;
+  if (!Array.isArray(inner?.content)) return out;
+  let seq = 0;
+  for (const para of inner.content) {
+    if (!Array.isArray(para)) continue;
+    for (const node of para) {
+      if (node?.tag === 'at') {
+        const uid: string | undefined = typeof node.user_id === 'string' ? node.user_id : undefined;
+        const name: string | undefined = typeof node.user_name === 'string' ? node.user_name : undefined;
+        const isOpenId = !!uid && uid.startsWith('ou_');
+        const isAppId = !!uid && uid.startsWith('cli_');
+        out.push({
+          key: `@_post_at_${seq}`,
+          name: name ?? uid ?? '',
+          ...(isOpenId ? { openId: uid } : {}),
+          ...(isAppId ? { appId: uid } : {}),
+          idType: isAppId ? 'app_id' : 'open_id',
+        });
+      }
+      seq++;
+    }
+  }
+  return out;
+}
+
+/**
  * truth for the @-gate across every consumer (realtime routing's isBotMentioned,
  * the 30s poll backfill, and the dashboard preview/run-preview collector) so the
  * "explicit @ hands off to normal routing, not the listener" rule can never
@@ -474,6 +521,7 @@ export function parseEventMessage(
           openId: mentionOpenId(m),
           userId: mentionIdentity(m).userId,
           unionId: mentionUnionId(m),
+          appId: mentionIdentity(m).appId,
           idType: m.id_type,
         }))
       : undefined;
@@ -1157,8 +1205,9 @@ const BOTMUX_INTERNAL_CARD_ACTIONS: ReadonlySet<string> = new Set([
   'repo_manual_submit', 'repo_worktree_submit', 'skip_repo',
   'worktree_toggle_mode',
   // config / grant / relay cards
-  'config_toggle', 'config_set', 'config_quota', 'config_text_open',
-  'config_text_save', 'grant_chat', 'grant_global', 'grant_deny',
+  'config_toggle', 'config_set', 'config_quota', 'config_quota_open',
+  'config_quota_save', 'config_text_open', 'config_text_save',
+  'grant_chat', 'grant_global', 'grant_deny',
   'relay_search', 'relay_page', 'relay_select', 'relay_confirm',
   // host-overload alert + codex notifier cards
   'overload_noop', 'overload_clean_stopped', 'overload_suspend_idle',

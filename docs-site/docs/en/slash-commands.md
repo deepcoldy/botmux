@@ -13,7 +13,9 @@ Just send these commands directly in a topic, and the daemon intercepts and hand
 | `/status` | View session info (uptime, terminal address, etc.) |
 | `/restart` | Restart the CLI process (preserving the session context) |
 | `/close` | Close the session and send a recoverable card (including the CLI's own resume command) |
-| `/fork --create <group name>` | Clone the current session into a freshly-created group (the source session keeps running untouched); the clone carries full context (Claude family / Codex terminal only) |
+| `/fork <task>` | Fork the current session with full context into a new sub-topic of the same topic group; the source session keeps running untouched (Claude family / Codex terminal only) |
+| `/forklist` | Re-post the current session's forked-task panel with live/closed status and links to the child topics |
+| `/fork --create <group name>` | Clone the current session into a freshly-created group instead of a sub-topic |
 | `/rename <title>` | Rename this Botmux session and sync the running Codex/Claude native session name |
 | `/card` | Manually summon the current session's streaming card (can summon and restore live refresh even when streaming is off; in private-card mode, sends a static snapshot visible only to authorized users instead) |
 | `/term` | Get the operable (write-enabled) terminal link for this session, delivered privately to the owner (visible-to-you in-chat, falling back to DM in topic/p2p — never exposed in the group) |
@@ -21,11 +23,18 @@ Just send these commands directly in a topic, and the daemon intercepts and hand
 | `/insight` | owner-only: instantly posts a "session insight summary" card for the current session (aggregate metrics + rule suggestions; action-span detail / per-turn reconciliation / conversation replay live on the Dashboard "Insights" page) |
 | `/vc prepare <meeting link or number>` | Use the current regular group as a meeting-prep chat and reuse the same Agent session during the meeting |
 | `@bot /summary` | Read the current topic (or the configured regular-group history range) and generate a summary (default: latest 50 messages / 24 hours). If the bot has `summaryMemory` enabled, the summary is appended to the configured memory file (`summaryMemoryPath`, defaults to `summary.md`), and text following `/summary` acts as a hard "summarize only from this message" boundary; when memory is off, trailing text is only a focus hint for this summary |
-| `/t <prompt>` `/topic <prompt>` | Force a new topic inside a regular group |
+| `/t [<text>]` `/topic [<text>]` | Force a new topic inside a regular group; text becomes the first task (starting after repository selection when needed), while the bare command opens topic setup |
 | `/issue` | Open the Issue Board card and claim a botmux platform task in place: pick a repo and botmux creates a group, adds you, binds the platform task and starts the agent. Requires this machine to be bound to the platform, and the invoker to be in the bot's `allowedUsers`; only the invoker can operate the card |
 | `/issue status` | Run inside the task group to see which platform task it is bound to and where things stand: platform status / claimant / local binding / whether any status write-back is still stuck in the outbox. Read-only, also limited to the bot's `allowedUsers` |
 | `/issue done` | Run inside the task group to **accept the work** and move the task to its terminal state on the platform. An agent can only deliver up to "in review"; marking it done is a human decision. Once done, the platform clears the claim and the task can no longer be released. Also limited to the bot's `allowedUsers` |
 | `/issue release` | Run inside the group created when the task was claimed: hands the task back to the platform's todo pool so someone else can take it. The group and session are **not** disbanded — the conversation is kept. Also limited to the bot's `allowedUsers` |
+
+See [Session & Topic Model](/en/session-model) for the repository-picker and pinned-directory branches of bare `/t`. You can also make `/repo` the new topic's first command:
+
+- `/t /repo <path|project name>`
+- `/t /repo wt <path|project name> [branch]`
+
+These forms create the topic and select a repository or create a worktree directly, without starting an empty session and switching it afterward. Send the task as the next message in the topic.
 
 ## 💬 Reply Mode (`/reply-mode`)
 

@@ -28,6 +28,7 @@ import {
   type WorkerSessionInfo,
 } from './contract.js';
 import { workflowSandboxInitFields } from '../shared/sandbox-policy.js';
+import { stripPm2GracefulExitMarker } from '../../pm2-graceful-exit.js';
 import {
   armV3AttemptWorkerFence,
   bindV3AttemptWorkerFence,
@@ -140,7 +141,12 @@ async function runNodeImpl(
       workerPath: deps.workerPath,
       cwd,
       env: {
-        ...process.env,
+        // v3 ephemeral workers fork straight from the daemon here (not via
+        // workerForkEnv), so strip the PM2 graceful-exit sentinel to keep the
+        // "only daemon/dashboard carry the marker" invariant — harmless today
+        // (the worker doesn't read the graceful helper and its CLI children go
+        // through redactChildEnv), but this keeps the boundary honest.
+        ...stripPm2GracefulExitMarker(process.env),
         ...req.env,
         [GOAL_ENV.V3_MARKER]: '1',
         BOTMUX_WORKFLOW: '1',

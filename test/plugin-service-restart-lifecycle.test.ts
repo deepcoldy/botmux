@@ -16,14 +16,17 @@ describe('plugin service restart lifecycle', () => {
   it('preserves auto services by default and always ensures them after core starts', () => {
     const source = restartFunctionSource();
     const stop = 'if (includePluginServices) await stopPluginServicesForCli(undefined, { autoOnly: true });';
-    const coreStart = "runPm2(['start', cfg]);";
+    const transaction = 'runBoundedPm2StartTransaction(';
+    const coreStart = "runPm2(['start', cfg], true, PM2_HOME, timeoutMs);";
     const ensure = 'await reconcilePluginServicesForCli(undefined, { autoOnly: true });';
 
     expect(source).toContain(stop);
+    expect(source).toContain(transaction);
     expect(source).toContain(coreStart);
     expect(source).toContain(ensure);
     expect(source).not.toContain(`if (includePluginServices) ${ensure}`);
     expect(source.indexOf(stop)).toBeLessThan(source.indexOf(coreStart));
+    expect(source.indexOf(transaction)).toBeLessThan(source.indexOf(coreStart));
     expect(source.indexOf(coreStart)).toBeLessThan(source.indexOf(ensure));
   });
 

@@ -10,13 +10,31 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 // Mock @larksuiteoapi/node-sdk — we don't want real Lark connections.
 // The Client constructor just stores whatever it receives.
 vi.mock('@larksuiteoapi/node-sdk', () => {
+  // Mirror the real SDK's separable http instance so the upload-client path is
+  // exercised (create() → own instance + copyable interceptor registry).
+  const makeInstance = (): any => ({
+    defaults: { timeout: 0 },
+    create: (cfg: { timeout?: number }) => {
+      const inst = makeInstance();
+      if (cfg?.timeout !== undefined) inst.defaults.timeout = cfg.timeout;
+      return inst;
+    },
+    interceptors: {
+      request: { handlers: [], use(this: any, f: any, r: any) { this.handlers.push({ fulfilled: f, rejected: r }); } },
+      response: { handlers: [], use(this: any, f: any, r: any) { this.handlers.push({ fulfilled: f, rejected: r }); } },
+    },
+  });
+  const sharedDefault = makeInstance();
   class FakeClient {
     opts: Record<string, unknown>;
+    httpInstance: any;
     constructor(opts: Record<string, unknown>) {
       this.opts = opts;
+      // Real Client: `params.httpInstance || defaultHttpInstance`.
+      this.httpInstance = (opts?.httpInstance as any) ?? sharedDefault;
     }
   }
-  return { Client: FakeClient };
+  return { Client: FakeClient, defaultHttpInstance: sharedDefault };
 });
 
 // Mock node:fs so loadBotConfigs doesn't touch real disk.
@@ -70,6 +88,25 @@ describe('registerBot', () => {
     const client = state.client as unknown as { opts: Record<string, unknown> };
     expect(client.opts.appId).toBe('app_test_001');
     expect(client.opts.appSecret).toBe('secret_001');
+  });
+
+  it('bounds the SDK HTTP transport timeout when the client exposes axios defaults', () => {
+    const client = { httpInstance: { defaults: { timeout: 0 } } };
+    mod.configureLarkClientHttpTimeout(client);
+    expect(client.httpInstance.defaults.timeout).toBe(mod.LARK_REQUEST_TIMEOUT_MS);
+  });
+
+  it('gives media uploads a dedicated http instance with the looser upload timeout', () => {
+    const state = mod.registerBot(makeCfg());
+    const interactive = state.client as unknown as { httpInstance?: { defaults?: { timeout?: number } } };
+    const upload = state.uploadClient as unknown as { httpInstance?: { defaults?: { timeout?: number } } };
+    // Interactive client keeps the tight bound; upload client is separate + looser.
+    expect(interactive.httpInstance?.defaults?.timeout).toBe(mod.LARK_REQUEST_TIMEOUT_MS);
+    expect(upload.httpInstance?.defaults?.timeout).toBe(mod.LARK_UPLOAD_TIMEOUT_MS);
+    expect(state.uploadClient).not.toBe(state.client);
+    expect(mod.getBotUploadClient('app_test_001')).toBe(state.uploadClient);
+    // The shared SDK default must NOT be mutated to the upload bound.
+    expect(mod.LARK_UPLOAD_TIMEOUT_MS).toBeGreaterThan(mod.LARK_REQUEST_TIMEOUT_MS);
   });
 
   it('does NOT construct a Lark Client for an apiOnly bot (empty secret would throw in the real SDK)', () => {

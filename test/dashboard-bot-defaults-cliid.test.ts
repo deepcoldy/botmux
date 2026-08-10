@@ -669,3 +669,136 @@ describe('reply-card usage display mode', () => {
       .toContain('write_failed');
   });
 });
+
+describe('card behavior defaults', () => {
+  it('defaults to automatic cards while keeping explicit card-off controls usable', () => {
+    let existing!: TestRenderer.ReactTestRenderer;
+    let cardOff!: TestRenderer.ReactTestRenderer;
+    const putCardPref = vi.fn(async () => ({ ok: true, status: 200, body: { ok: true } }));
+
+    act(() => {
+      existing = TestRenderer.create(React.createElement(CardBehaviorSection, {
+        bot: { larkAppId: 'cli_existing' },
+        putCardPref,
+      }));
+      cardOff = TestRenderer.create(React.createElement(CardBehaviorSection, {
+        bot: { larkAppId: 'cli_new', disableStreamingCard: true },
+        putCardPref,
+      }));
+    });
+
+    expect(existing.root.findByProps({ 'data-action': 'toggle-disable-streaming' }).props.checked).toBe(true);
+    expect(existing.root.findByProps({ 'data-card-off-options': true }).props.hidden).toBe(true);
+    expect(cardOff.root.findByProps({ 'data-action': 'toggle-disable-streaming' }).props.checked).toBe(false);
+    expect(cardOff.root.findByProps({ 'data-card-off-options': true }).props.hidden).toBe(false);
+    expect(cardOff.root.findByProps({ 'data-action': 'toggle-silent-reactions' }).props.checked).toBe(true);
+    expect(cardOff.root.findByProps({ 'data-action': 'toggle-silent-reactions' }).props.disabled).toBe(false);
+    expect(cardOff.root.findByProps({ 'data-action': 'toggle-writable-link' }).props.disabled).toBe(false);
+    expect(cardOff.root.findByProps({ 'data-card-pref-status': '' }).props).toMatchObject({
+      role: 'status',
+      'aria-live': 'polite',
+    });
+  });
+
+  it('enabling automatic cards persists disableStreamingCard=false', async () => {
+    const putCardPref = vi.fn(async (patch: Record<string, boolean>) => ({
+      ok: true,
+      status: 200,
+      body: { ok: true, ...patch },
+    }));
+    let renderer!: TestRenderer.ReactTestRenderer;
+    act(() => {
+      renderer = TestRenderer.create(React.createElement(CardBehaviorSection, {
+        bot: { larkAppId: 'cli_new', disableStreamingCard: true },
+        putCardPref,
+      }));
+    });
+
+    const toggle = renderer.root.findByProps({ 'data-action': 'toggle-disable-streaming' });
+    await act(async () => {
+      toggle.props.onChange({ currentTarget: { checked: true } });
+      await Promise.resolve();
+    });
+
+    expect(putCardPref).toHaveBeenCalledWith({ disableStreamingCard: false });
+    expect(renderer.root.findByProps({ 'data-action': 'toggle-disable-streaming' }).props.checked).toBe(true);
+  });
+
+  it('maps the no-card processing-status switch to the inverse storage field', async () => {
+    const putCardPref = vi.fn(async (patch: Record<string, boolean>) => ({
+      ok: true,
+      status: 200,
+      body: { ok: true, ...patch },
+    }));
+    let renderer!: TestRenderer.ReactTestRenderer;
+    act(() => {
+      renderer = TestRenderer.create(React.createElement(CardBehaviorSection, {
+        bot: { larkAppId: 'cli_no_card', disableStreamingCard: true },
+        putCardPref,
+      }));
+    });
+
+    const toggle = renderer.root.findByProps({ 'data-action': 'toggle-silent-reactions' });
+    expect(toggle.props.checked).toBe(true);
+    await act(async () => {
+      toggle.props.onChange({ currentTarget: { checked: false } });
+      await Promise.resolve();
+    });
+
+    expect(putCardPref).toHaveBeenCalledWith({ silentTurnReactions: true });
+    expect(renderer.root.findByProps({ 'data-action': 'toggle-silent-reactions' }).props.checked).toBe(false);
+  });
+
+  it('rolls every card toggle back when persistence fails', async () => {
+    const putCardPref = vi.fn(async () => ({
+      ok: false,
+      status: 500,
+      body: { error: 'write_failed' },
+    }));
+    let renderer!: TestRenderer.ReactTestRenderer;
+    act(() => {
+      renderer = TestRenderer.create(React.createElement(CardBehaviorSection, {
+        bot: { larkAppId: 'cli_card_fail', disableStreamingCard: true },
+        putCardPref,
+      }));
+    });
+
+    for (const action of ['toggle-disable-streaming', 'toggle-silent-reactions', 'toggle-writable-link', 'toggle-private-card']) {
+      const before = renderer.root.findByProps({ 'data-action': action }).props.checked;
+      await act(async () => {
+        renderer.root.findByProps({ 'data-action': action }).props.onChange({ currentTarget: { checked: !before } });
+        await Promise.resolve();
+      });
+      expect(renderer.root.findByProps({ 'data-action': action }).props.checked).toBe(before);
+    }
+    expect(renderer.root.findByProps({ 'data-card-pref-status': '' }).children.join('')).toContain('write_failed');
+  });
+
+  it('uses a single-flight save so another card setting cannot race it', async () => {
+    let finish!: (value: { ok: true; status: 200; body: { ok: true } }) => void;
+    const pending = new Promise<{ ok: true; status: 200; body: { ok: true } }>(resolve => { finish = resolve; });
+    const putCardPref = vi.fn(() => pending);
+    let renderer!: TestRenderer.ReactTestRenderer;
+    act(() => {
+      renderer = TestRenderer.create(React.createElement(CardBehaviorSection, {
+        bot: { larkAppId: 'cli_card_busy', disableStreamingCard: true, usageSupported: true },
+        putCardPref,
+      }));
+    });
+
+    act(() => {
+      renderer.root.findByProps({ 'data-action': 'toggle-disable-streaming' }).props.onChange({ currentTarget: { checked: true } });
+    });
+
+    for (const action of ['toggle-disable-streaming', 'toggle-silent-reactions', 'toggle-writable-link', 'toggle-private-card']) {
+      expect(renderer.root.findByProps({ 'data-action': action }).props.disabled).toBe(true);
+    }
+    expect(renderer.root.findByProps({ id: 'bd-menu-usageDisplay' }).props.disabled).toBe(true);
+
+    await act(async () => {
+      finish({ ok: true, status: 200, body: { ok: true } });
+      await pending;
+    });
+    expect(renderer.root.findByProps({ 'data-action': 'toggle-private-card' }).props.disabled).toBe(false);
+  });
+});

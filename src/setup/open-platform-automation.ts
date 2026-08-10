@@ -14,6 +14,11 @@ import { fileURLToPath } from 'node:url';
 import qrcode from 'qrcode-terminal';
 import { VC_MEETING_BOT_EVENTS } from './verify-permissions.js';
 import { readGlobalConfig } from '../global-config.js';
+import {
+  parseOnlineVisibility,
+  VisibilityParseError,
+  type VisibilitySuggest,
+} from './open-platform-visibility.js';
 
 /**
  * All non-VC events (application identity) that the botmux dispatcher consumes.
@@ -154,6 +159,7 @@ export type OpenPlatformAutomationResult =
         | 'scope_mapping_failed'
         | 'event_verification_failed'
         | 'version_verification_failed'
+        | 'visibility_unreadable'
         | 'network'
         | 'api_error';
       message: string;
@@ -513,6 +519,14 @@ function extractEventIdsFromDetails(value: unknown): string[] {
  * 那会让版本进入人工审核、发布后应用停在「未上架/未启用」(tenantAppStatus=0),
  * 事件配置进了草稿也无法在企业内生效。visibleSuggest.members 必须含创建者,
  * 否则同样不会自动上架启用。
+ *
+ * ⚠️ **visibleSuggest 是全量覆写语义**：这里给什么,新版本的可见范围就是什么,
+ * 没给的集合会被清空而不是保持原样。因此**只有全新应用的首次发布**能用这个
+ * 默认的空 departments/groups + isAll:0 —— 对已有应用发版,调用方必须先用
+ * {@link parseOnlineVisibility} 读回线上可见范围并整块覆盖 visibleSuggest /
+ * blackVisibleSuggest（见 automateOpenPlatformSetup 与 open-platform-rename）。
+ * 曾经漏掉这一步,导致每次权限自愈自动发版都把「全员可见 / 部门 / 用户组」
+ * 静默清空。
  */
 export function buildAppVersionCreatePayload(appVersion: string, visibleMemberIds: string[] = []) {
   return {
@@ -903,16 +917,42 @@ export async function automateOpenPlatformSetup(
       if (base && /^https?:\/\//.test(base)) extraRedirects = [`${base}/oauth/callback`];
     } catch { /* config unavailable → default only */ }
     await postJson(`/developers/v1/safe_setting/update/${options.appId}`, buildSafeSettingPayload(options.appId, extraRedirects));
-    const contactRange = await postJson(`/developers/v1/contact_range/${options.appId}`, {});
-    // 镜像应用原有 contact range 作为版本可见范围——绝不注入「当前 Web session
-    // 操作者」:automateOpenPlatformSetup 也被 VC listener 保存 / 权限自愈 / 选择
-    // 已有应用等路径调用,那里操作者不一定是创建者/现有可见成员,注入会悄悄扩大
-    // 已有 bot 的可见范围。新建应用的「上架启用」由 createOpenPlatformAppWithClient
+    // 原样镜像**线上版本**的可见范围（白/黑名单都带）——绝不注入「当前 Web
+    // session 操作者」:automateOpenPlatformSetup 也被 VC listener 保存 / 权限自愈 /
+    // 选择已有应用等路径调用,那里操作者不一定是创建者/现有可见成员,注入会悄悄
+    // 扩大已有 bot 的可见范围。新建应用的「上架启用」由 createOpenPlatformAppWithClient
     // 的首次发布(含创建者可见)完成,与本处无关。
-    const visibleMemberIds = extractContactRangeMemberIds(contactRange);
+    //
+    // ⚠️ 数据来源必须是 visible/online（应用可见范围），不是 contact_range
+    // （通讯录权限范围，是另一个概念）。历史上这里读的是 contact_range 且只取
+    // members、把 departments/groups/isAll 写死空值,于是每次自动发版都把「全员
+    // 可见 / 按部门授权 / 按用户组授权」静默清成「仅少数个人可见」——权限自愈
+    // 一重启就发版,受影响的人第二天集体访问不了应用。
+    //
+    // 解析失败 fail closed：此时还没建版,可见范围零改动,调用方降级为给管理员
+    // 发 DM 手动处理,绝不发布一个可能把人关在门外的版本。
+    let visibility: { visibleSuggest: VisibilitySuggest; blackVisibleSuggest: VisibilitySuggest };
+    try {
+      visibility = parseOnlineVisibility(await postJson(`/developers/v1/visible/online/${options.appId}`, {}));
+    } catch (err: any) {
+      if (!(err instanceof VisibilityParseError)) throw err;
+      return {
+        ok: false,
+        reason: 'visibility_unreadable',
+        message: `无法可靠读取应用现有可见范围（${err.message}），已中止发版以免重置可见范围；请到开放平台手动发布新版本`,
+        sessionFile,
+        subscribedEventCount,
+        eventWarning,
+        missingVcEvents,
+        eventModeReady,
+      };
+    }
     const versionList = await postJson(`/developers/v1/app_version/list/${options.appId}`, {});
     const appVersion = nextAppVersion(versionList);
-    const created = await postJson(`/developers/v1/app_version/create/${options.appId}`, buildAppVersionCreatePayload(appVersion, visibleMemberIds));
+    const versionPayload = buildAppVersionCreatePayload(appVersion) as unknown as Record<string, unknown>;
+    versionPayload.visibleSuggest = visibility.visibleSuggest;
+    versionPayload.blackVisibleSuggest = visibility.blackVisibleSuggest;
+    const created = await postJson(`/developers/v1/app_version/create/${options.appId}`, versionPayload);
     const versionId = extractVersionId(created);
     if (options.requireVerifiedEvents && !versionId) {
       return {
@@ -1758,15 +1798,6 @@ export function nextAppVersion(payload: unknown): string {
     return a;
   });
   return [max[0], max[1], max[2] + 1].join('.');
-}
-
-function extractContactRangeMemberIds(payload: unknown): string[] {
-  const data = asRecord(asRecord(payload).data);
-  const detail = asRecord(data.contactRangeDetail);
-  const members = Array.isArray(detail.members) ? detail.members : [];
-  return uniqueStrings(members
-    .map(item => pickString(asRecord(item), ['id']))
-    .filter((id): id is string => Boolean(id)));
 }
 
 /** 从 app_version/create 响应提取 versionId（多种响应形态兼容）。 */

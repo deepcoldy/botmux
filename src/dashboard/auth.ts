@@ -4,6 +4,12 @@ import {
 } from 'node:fs';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { dirname } from 'node:path';
+import {
+  readSecureHostFileSync,
+  secureHostFilePath,
+  writeSecureHostFileSync,
+} from '../platform/secure-host-file.js';
+import { withFileLockSync } from '../utils/file-lock.js';
 
 const NONCE_TTL_MS = 60_000;
 const TS_WINDOW_S = 30;
@@ -18,11 +24,13 @@ export interface HmacAttempt { ts: string; nonce: string; sig: string; }
  * single set of `X-Botmux-Cli-*` headers signed only over `ts:nonce` is valid
  * for ANY `/__cli/*` route on ANY dashboard — which lets a malicious local
  * server, handed a discovery probe, forward the headers to the real dashboard
- * (e.g. a `/__cli/current` probe relayed to `/__cli/rotate` to mint a token).
+ * (e.g. a `/__cli/current` probe relayed to `/__cli/ensure` or `/__cli/rotate`
+ * to mint a token).
  * Binding `method + path + bound-port` makes the credential single-purpose:
  *  - the verifier uses the port IT actually bound (not the attacker-controlled
  *    Host header), so a forward from port X to the dashboard on port Y mismatches;
- *  - a `/__cli/current` capture can't be replayed to `/__cli/rotate` (path differs).
+ *  - a `/__cli/current` capture can't be replayed to either token-writing route
+ *    (path differs).
  */
 export function cliAuthBind(method: string, path: string, port: number | string): string {
   return `${String(method).toUpperCase()} ${path} ${port}`;
@@ -150,35 +158,47 @@ export function loadOrCreateDashboardSecret(secretPath: string): string {
 
 /**
  * Load the persisted active dashboard token from `tokenPath`, or `null` when
- * the file is absent / empty / unreadable.
+ * the file is genuinely absent or empty. Unsafe credential-file shapes fail
+ * closed instead of being treated as a missing token.
  *
  * Persisting the active token lets a previously-issued dashboard URL survive a
- * `botmux restart`: on startup the dashboard hydrates `activeToken` from this
- * file instead of starting blank.  Only `botmux dashboard` rotates the token
- * (via `persistToken` with a fresh value), which is what invalidates the old
- * link.
+ * `botmux restart` and keeps multiple dashboard processes on one authority.
+ * Only `botmux dashboard rotate` replaces the file, which invalidates the old
+ * link for every process on its next request.
  */
 export function loadPersistedToken(tokenPath: string): string | null {
-  try {
-    if (existsSync(tokenPath)) return readFileSync(tokenPath, 'utf8').trim() || null;
-  } catch { /* unreadable token file → behave as if none persisted */ }
-  return null;
+  return readSecureHostFileSync(tokenPath, 256)?.trim() || null;
 }
 
-/** Persist the active dashboard token to `tokenPath` with 0600 perms. */
+/** Durably persist the active dashboard token without following a leaf symlink. */
 export function persistToken(tokenPath: string, token: string): void {
-  mkdirSync(dirname(tokenPath), { recursive: true });
-  atomicWriteFileSync(tokenPath, token, { mode: 0o600 });
-  chmodSync(tokenPath, 0o600);
+  writeSecureHostFileSync(tokenPath, token);
 }
 
-/** Load the active token, creating and persisting the first one when absent. */
+/**
+ * Load the active token, creating and persisting the first one when absent.
+ * The file lock makes get-or-create linearizable across dashboard processes:
+ * every concurrent caller returns the same durable token.
+ */
 export function loadOrCreatePersistedToken(tokenPath: string): string {
-  const existing = loadPersistedToken(tokenPath);
-  if (existing) return existing;
-  const token = generateToken();
-  persistToken(tokenPath, token);
-  return token;
+  const securePath = secureHostFilePath(tokenPath);
+  return withFileLockSync(securePath, () => {
+    const existing = loadPersistedToken(securePath);
+    if (existing) return existing;
+    const token = generateToken();
+    persistToken(securePath, token);
+    return token;
+  });
+}
+
+/** Generate and durably replace the token while serialized with first creation. */
+export function rotatePersistedToken(tokenPath: string): string {
+  const securePath = secureHostFilePath(tokenPath);
+  return withFileLockSync(securePath, () => {
+    const token = generateToken();
+    persistToken(securePath, token);
+    return token;
+  });
 }
 
 /** Extract `botmux_dashboard_token` value from a Cookie header. */
@@ -215,8 +235,10 @@ export function buildSetCookie(token: string): string {
  *   - `GET /api/workflows/*`                   — zero-I/O legacy retirement
  *                                                tombstone (HTTP 410).
  *
- * Anything else (sessions, schedules, dashboard rotate, etc.) requires the active session token, matching the
- * "get_write_link" pattern that the chat web terminal already uses.
+ * Outside those always-public surfaces, the explicit `publicReadOnly`
+ * allow-list controls tokenless observation. Mutations and private reads still
+ * require the active session token, matching the chat web terminal's
+ * capability boundary.
  */
 export type AuthDecision =
   | { kind: 'allow' }
@@ -233,8 +255,9 @@ export type AuthDecision =
  *  workflow tombstone are handled separately in decideDashboardAuth. Full v3
  *  workflow projections stay private because goals, node ids, and run ids can
  *  contain project or personal information.
- *  口径：公开 = 会话板 / 排程(脱敏) / 设置(只读) / 群名册 / 事件流。 */
+ *  口径：公开 = 运行摘要 / 会话板 / 排程(脱敏) / 设置(只读) / 群名册 / 事件流。 */
 const PUBLIC_READ_PATHS: ReadonlySet<string> = new Set([
+  '/api/dashboard/v1/summary', // strongly-redacted dashboard aggregate
   '/api/sessions',    // session board
   '/api/schedules',   // schedules page — task prompt redacted for anon upstream
   '/api/settings',    // read-only settings — only public flags + authed:false

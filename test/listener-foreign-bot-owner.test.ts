@@ -21,9 +21,7 @@ import { describe, expect, it } from 'vitest';
 
 const src = readFileSync(new URL('../src/daemon.ts', import.meta.url), 'utf-8');
 
-// span covers the whole function body; widened for the session-group birth /
-// same-group-resume preamble added at the top of handleNewTopic.
-function fnRegion(name: string, span = 30000): string {
+function fnRegion(name: string, span = 50000): string {
   const start = src.indexOf(`async function ${name}(`);
   expect(start, `${name} not found in daemon.ts`).toBeGreaterThanOrEqual(0);
   return src.slice(start, start + span);

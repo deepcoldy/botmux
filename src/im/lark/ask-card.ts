@@ -4,6 +4,7 @@ import type {
   AskResult,
   PendingAsk,
 } from '../../core/ask-types.js';
+import { AskDispatchError } from '../../core/ask-types.js';
 import { getAskSnapshot, submitAsk, toggleAsk, tryResolveAsk } from '../../core/ask-broker.js';
 import { logger } from '../../utils/logger.js';
 import { t, localeForBot, type Locale } from '../../i18n/index.js';
@@ -50,10 +51,22 @@ export function createLarkAskCardDispatcher(
       // 所以这里要按前缀判断是否真的能 reply.
       const canReplyToRoot =
         typeof ask.rootMessageId === 'string' && ask.rootMessageId.startsWith('om_');
-      const messageId = canReplyToRoot
-        ? await reply(ask.larkAppId, ask.rootMessageId!, cardJson, 'interactive', true)
-        : await send(ask.larkAppId, ask.chatId, cardJson, 'interactive');
-      return { messageId };
+      // Pass the ask's stable dispatchUuid as the Feishu message uuid so a
+      // re-send after a daemon restart (restart-resume) dedupes server-side and
+      // returns the ORIGINAL message_id instead of posting a second card.
+      const uuid = ask.dispatchUuid;
+      try {
+        const messageId = canReplyToRoot
+          ? await reply(ask.larkAppId, ask.rootMessageId!, cardJson, 'interactive', true, uuid)
+          : await send(ask.larkAppId, ask.chatId, cardJson, 'interactive', uuid);
+        return { messageId };
+      } catch (err) {
+        // Re-throw as a typed AskDispatchError so the broker's bounded retry can
+        // decide transient-vs-deterministic without importing HTTP types
+        // (codex P1-3). The same uuid is reused on retry → server-side dedupe.
+        const { retryable, detail } = classifyAskDispatchError(err);
+        throw new AskDispatchError(detail, retryable);
+      }
     },
     async onSettle(ask, result) {
       if (!ask.cardMessageId) return;
@@ -68,6 +81,95 @@ export function createLarkAskCardDispatcher(
       }
     },
   };
+}
+
+/**
+ * Feishu business error codes that mean "the request is transient — retry
+ * later", per the official IM v1 send/reply error table + frequency-control
+ * guide (codex P1-3). These must be retryable EVEN when the HTTP status is a
+ * 4xx (some legacy freq-control surfaces as HTTP 400) or a 2xx-body business
+ * error — otherwise a same-uuid partial-success convergence (the second request
+ * arriving while the first is still "being sent") is wrongly given up on.
+ *
+ *   230049  the message is being sent — official "please retry"
+ *   230020  message API per-chat rate limit
+ *   99991400 generic OpenAPI frequency control (modern = HTTP 429, legacy = 400)
+ *
+ * NOT included: 11232 / 11233 are the old V4 message API; the current im.v1
+ * create/reply path never returns them, so mixing them in would only widen the
+ * whitelist without cause.
+ *
+ * Rate-limit codes (99991400 / HTTP 429) ideally honour `x-ogw-ratelimit-reset`
+ * as the retry delay — the broker's short fixed backoff can't outlast a long
+ * official reset window. Plumbing that through AskDispatchError.retryAfterMs is
+ * a follow-up (see PR notes); 230049/230020 converge within the short backoff.
+ */
+const TRANSIENT_LARK_CODES = new Set([230049, 230020, 99991400]);
+
+/** Extract a Lark business code from either error shape:
+ *  - axios path A: `response.data.code` / top-level `code` (number)
+ *  - 2xx-body path B: a plain Error whose message ends in `(code: NNN)` (the
+ *    `res.code !== 0` throws in client.ts embed the code only in the string). */
+function extractLarkCode(e: {
+  response?: { data?: { code?: number } }; code?: number; message?: string;
+} | null | undefined, rawMessage: string): number | undefined {
+  const structured = e?.response?.data?.code ?? e?.code;
+  if (typeof structured === 'number') return structured;
+  const m = /\(code:\s*(\d+)\)/.exec(rawMessage);
+  return m ? Number(m[1]) : undefined;
+}
+
+/**
+ * Classify a Feishu card-send failure into "worth retrying" vs "give up now"
+ * (codex P1-3). PURE + exported so the retry decision is unit-tested directly
+ * (executable decision seam) rather than asserted against source text.
+ *
+ * Retryable (transient — a re-send with the same uuid may succeed / dedupe):
+ *   - a well-known transient Lark business code (TRANSIENT_LARK_CODES), checked
+ *     FIRST so it wins even on an HTTP 400 or a 2xx-body business error
+ *   - no HTTP response at all (network reset, DNS, timeout)
+ *   - HTTP 429 (rate limited) or any 5xx (server-side)
+ * Not retryable (deterministic — re-sending repeats the same failure):
+ *   - HTTP 4xx other than 429 (bad request, permission, not found)
+ *   - message withdrawn (target gone)
+ *   - anything we can't positively classify → fail closed (retry is unsafe when
+ *     we can't prove idempotency).
+ *
+ * Extraction mirrors bot-registry.formatLarkError: status at `response.status`
+ * or `.status`; Feishu code at `response.data.code` / `.code` / message tail.
+ */
+export function classifyAskDispatchError(err: unknown): { retryable: boolean; detail: string } {
+  const e = err as {
+    isAxiosError?: boolean; name?: string; message?: string;
+    response?: { status?: number; data?: { code?: number; msg?: string } };
+    status?: number; code?: number; config?: unknown;
+  } | null | undefined;
+
+  const detail =
+    (e && (e.response?.data?.msg || e.message)) ||
+    (typeof err === 'string' ? err : 'unknown dispatch error');
+
+  // A whitelisted transient business code is retryable regardless of HTTP
+  // status / error shape (codex P1-3) — check it before the status branches.
+  const larkCode = extractLarkCode(e, typeof detail === 'string' ? detail : '');
+  if (larkCode !== undefined && TRANSIENT_LARK_CODES.has(larkCode)) {
+    return { retryable: true, detail: `lark code ${larkCode} (transient): ${detail}` };
+  }
+
+  const looksAxios =
+    !!e && (e.isAxiosError === true || e.name === 'AxiosError' || (!!e.config && (!!e.response || e.status != null)));
+
+  if (looksAxios) {
+    const status = e!.response?.status ?? e!.status;
+    if (status === undefined) return { retryable: true, detail: `no-response: ${detail}` }; // network/transport
+    if (status === 429 || (status >= 500 && status <= 599)) return { retryable: true, detail: `http ${status}: ${detail}` };
+    return { retryable: false, detail: `http ${status}: ${detail}` }; // deterministic 4xx
+  }
+
+  // Non-axios (plain Error / string) without a transient code. MessageWithdrawn
+  // and other `res.code !== 0` 2xx-body throws land here — HTTP already
+  // succeeded, so a re-send repeats the same deterministic outcome. Fail closed.
+  return { retryable: false, detail: `non-transport: ${detail}` };
 }
 
 export function isAskCardAction(action?: string): boolean {

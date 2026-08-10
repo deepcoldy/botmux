@@ -16,6 +16,13 @@ export interface AskApiBody {
   questions: AskQuestion[];
   /** Already in milliseconds. CLI side converts from `--timeout` seconds. */
   timeoutMs: number;
+  /** Per-invocation identity (hook generates once, reuses across reconnect
+   *  retries) so a re-POST after a daemon restart re-attaches to the same ask.
+   *  Optional — legacy callers omit it and the broker synthesizes one. */
+  requestId?: string;
+  /** Caller kind ('hook' | 'explicit' | …) namespacing the identity so an
+   *  explicit `botmux ask` can't re-claim a hook ask's card. Optional. */
+  originKind?: string;
 }
 
 export type AskApiBodyError =
@@ -33,7 +40,9 @@ export type AskApiBodyError =
   | 'duplicate_option_key'
   | 'bad_questions'
   | 'bad_question_shape'
-  | 'bad_multiSelect';
+  | 'bad_multiSelect'
+  | 'bad_requestId'
+  | 'bad_originKind';
 
 /** 校验单个 option 对象，返回解析后的 AskOption 或错误码。 */
 function parseOption(o: unknown): AskOption | AskApiBodyError {
@@ -91,6 +100,22 @@ export function parseAskBody(raw: unknown): AskApiBody | { error: AskApiBodyErro
   ) {
     return { error: 'bad_timeoutMs' };
   }
+  // Optional invocation identity. When present, must be a sane short string
+  // (used verbatim as a persistence filename segment after sanitization).
+  let requestId: string | undefined;
+  if (r.requestId !== undefined) {
+    if (typeof r.requestId !== 'string' || !r.requestId.trim() || r.requestId.length > 128) {
+      return { error: 'bad_requestId' };
+    }
+    requestId = r.requestId;
+  }
+  let originKind: string | undefined;
+  if (r.originKind !== undefined) {
+    if (typeof r.originKind !== 'string' || !r.originKind.trim() || r.originKind.length > 32) {
+      return { error: 'bad_originKind' };
+    }
+    originKind = r.originKind;
+  }
 
   let questions: AskQuestion[];
 
@@ -128,5 +153,7 @@ export function parseAskBody(raw: unknown): AskApiBody | { error: AskApiBodyErro
     rootMessageId: r.rootMessageId as string | null,
     questions,
     timeoutMs: r.timeoutMs,
+    ...(requestId !== undefined ? { requestId } : {}),
+    ...(originKind !== undefined ? { originKind } : {}),
   };
 }

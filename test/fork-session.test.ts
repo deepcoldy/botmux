@@ -148,11 +148,16 @@ describe('isForkCapableSession', () => {
     } as any);
   });
 
-  it('accepts claude-code / seed / relay / aiden / codex (terminal)', () => {
-    for (const cliId of ['claude-code', 'seed', 'relay', 'aiden', 'codex'] as const) {
+  it('accepts claude-code / seed / relay / codex (terminal)', () => {
+    for (const cliId of ['claude-code', 'seed', 'relay', 'codex'] as const) {
       const ds = makeSourceDs({ cliId });
       expect(isForkCapableSession(ds)).toBe(true);
     }
+  });
+
+  it('refuses aiden because its adapter has no native fork contract', () => {
+    const ds = makeSourceDs({ cliId: 'aiden' });
+    expect(isForkCapableSession(ds)).toBe(false);
   });
 
   it('refuses codex-app (app-server live session, no local rollout)', () => {
@@ -242,10 +247,17 @@ describe('forkSession — frozen launch posture inheritance', () => {
   // ── P2: per-session model / reasoningEffort overrides + the agentFrozen
   //    marker must ride along, else sessionAgentConfig re-freezes from the live
   //    bot config and the clone silently drops the source's launch identity. ──
-  it('P2: model / reasoningEffort / cliPathOverride / wrapperCli / agentFrozen inherited', async () => {
+  it('P2: model / reasoningEffort / cliRuntime / cliPathOverride / wrapperCli / agentFrozen inherited', async () => {
     const src = makeSourceDs({
       model: 'opus-custom',
       reasoningEffort: 'xhigh',
+      cliRuntime: {
+        id: 'custom-claude',
+        displayName: 'Custom Claude',
+        executable: '/opt/custom/claude',
+        source: 'configured',
+        update: { provider: 'self' },
+      },
       cliPathOverride: '/opt/custom/claude',
       wrapperCli: 'ttadk',
       agentFrozen: true,
@@ -257,6 +269,8 @@ describe('forkSession — frozen launch posture inheritance', () => {
     const child = vi.mocked(sessionStore.createSession).mock.results[0].value as Session;
     expect(child.model).toBe('opus-custom');
     expect(child.reasoningEffort).toBe('xhigh');
+    expect(child.cliRuntime).toEqual(src.session.cliRuntime);
+    expect(child.cliRuntime).not.toBe(src.session.cliRuntime);
     expect(child.cliPathOverride).toBe('/opt/custom/claude');
     expect(child.wrapperCli).toBe('ttadk');
     expect(child.agentFrozen).toBe(true);
@@ -286,6 +300,58 @@ describe('forkSession — frozen launch posture inheritance', () => {
     expect(child.pendingForkSession).toBe(true);
     // Child's cliSessionId points at the SOURCE's CLI id for the first fork spawn.
     expect(child.cliSessionId).toBe('cli-native-src-abc');
+  });
+
+  it('seeds a topic fork with its task metadata, effective cwd, and first turn', async () => {
+    const src = makeSourceDs(
+      { workingDir: '/persisted/project' },
+      { workingDir: '/effective/project' },
+    );
+    registry.set(sessionKey('om_source_root', 'cli_app_test'), src);
+    const buildInitialPrompt = vi.fn((childSessionId: string) => ({
+      content: `wrapped task for ${childSessionId}`,
+    }));
+
+    const result = await forkSession(
+      src.session.sessionId,
+      'oc_child',
+      'om_child_root',
+      'group',
+      'thread',
+      {
+        forkWorkerImpl: forkWorkerSpy as any,
+        childTitle: '🔱 investigate cleanup',
+        forkTaskText: 'investigate cleanup',
+        larkThreadId: 'omt_child',
+        buildInitialPrompt,
+        turnId: 'om_fork_command',
+        senderOpenId: 'ou_trigger',
+        senderIsBot: false,
+      },
+    );
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error(result.error);
+    const childSessionId = result.childSessionId;
+    const child = vi.mocked(sessionStore.createSession).mock.results[0].value as Session;
+    expect(child).toMatchObject({
+      title: '🔱 investigate cleanup',
+      forkTaskText: 'investigate cleanup',
+      larkThreadId: 'omt_child',
+      workingDir: '/effective/project',
+      lastUserPrompt: 'investigate cleanup',
+      lastCliInput: `wrapped task for ${childSessionId}`,
+      lastCallerOpenId: 'ou_trigger',
+      quoteTargetId: 'om_fork_command',
+      quoteTargetSenderOpenId: 'ou_trigger',
+      quoteTargetSenderIsBot: false,
+    });
+    expect(buildInitialPrompt).toHaveBeenCalledWith(childSessionId);
+    expect(forkWorkerSpy).toHaveBeenCalledWith(
+      expect.objectContaining({ workingDir: '/effective/project' }),
+      { content: `wrapped task for ${childSessionId}` },
+      { resume: true, turnId: 'om_fork_command' },
+    );
   });
 
   it('cold-spawns the child worker with resume=true and never touches the source', async () => {

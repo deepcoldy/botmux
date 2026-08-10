@@ -30,7 +30,9 @@ function fnRegion(name: string, span = 6000): string {
 }
 
 describe('startInitialPassthroughSession ownership', () => {
-  const region = fnRegion('startInitialPassthroughSession');
+  // span widened past the default: the fn body grew (per-turn participant
+  // window build) and the registration-loser handoff sits ~6.1k chars in.
+  const region = fnRegion('startInitialPassthroughSession', 8000);
 
   it('never falls back from an explicit undefined owner to the sender', () => {
     expect(region).not.toContain('ownerOpenId ??');
@@ -52,11 +54,17 @@ describe('startInitialPassthroughSession ownership', () => {
     expect(region).toContain('session.creatorOpenId = creatorOpenId;');
   });
 
-  it('hands a registration loser to the post-rollback winner with live passthrough semantics', () => {
-    expect(region).toContain('rollbackRejectedSessionAndGetWinner(activeSessions, creationKey, ds)');
-    expect(region).toContain('deliverPassthroughToExistingSession(winner, cmd, commandContent, anchor, larkAppId, {');
-    expect(region).toContain("senderIsBot: parsed.senderType === 'app' || parsed.senderType === 'bot'");
-    expect(region).toContain('substitute,');
+  it('hands a registration loser to the current canonical owner via the ownership claim', () => {
+    // PR #597's ownership backbone: startInitialPassthroughSession claims the
+    // routing key through claimNewDaemonSession (compare-and-set). On loss to an
+    // existing owner it routes the inbound to that canonical owner instead of
+    // silently dropping it — the same intent master expressed via
+    // rollbackRejectedSessionAndGetWinner, now expressed through the claim +
+    // routeToCanonicalOwner callback.
+    expect(region).toContain('claimNewDaemonSession(activeSessions, ds)');
+    expect(region).toContain("registration.reason === 'existing_owner'");
+    expect(region).toContain('activeSessions.get(registration.key) === registration.owner');
+    expect(region).toContain('await routeToCanonicalOwner();');
   });
 });
 
@@ -81,13 +89,15 @@ describe('startInitialPassthroughSession call sites', () => {
 });
 
 describe('registration loser command handoff', () => {
-  it('routes new-topic and thread daemon commands through the current winner', () => {
-    expect(src).toContain(
-      'rollbackRejectedSessionAndGetWinner(activeSessions, commandKey, commandDs)',
-    );
-    expect(src).toContain(
-      'rollbackRejectedSessionAndGetWinner(activeSessions, commandKey, threadCommandDs)',
-    );
+  it('routes new-topic and thread daemon commands through the ownership claim', () => {
+    // Both the new-topic and thread daemon-command paths claim the routing key
+    // through claimNewDaemonSession(activeSessions, cmdDs). On loss to an
+    // existing owner they still deliver the command (handleCommand) so the
+    // inbound reaches the canonical session — PR #597's ownership backbone
+    // replacing master's rollbackRejectedSessionAndGetWinner here.
+    const claimCalls = src.split('claimNewDaemonSession(activeSessions, cmdDs)').length - 1;
+    expect(claimCalls).toBeGreaterThanOrEqual(2);
+    expect(src).toContain("if (registration.reason !== 'existing_owner') return;");
     expect(src).toContain(
       'await handleCommand(cmd, anchor, { ...parsed, content: commandContent }, commandDeps, larkAppId)',
     );

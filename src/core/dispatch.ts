@@ -14,8 +14,9 @@
  * (cli.ts) performs the actual sendMessage + replyMessage.
  */
 
-import type { SessionReplyTarget } from './reply-target.js';
-export { resolveSendTarget } from './reply-target.js';
+import { resolveSendTarget, type SessionReplyTarget } from './reply-target.js';
+
+export { resolveSendTarget };
 
 export interface DispatchBot {
   /** open_id as seen by the orchestrator's app (from <available_bots>). */
@@ -40,24 +41,21 @@ export interface DispatchMessages {
 
 const DISPATCH_ROOT_ID_RE = /^om_[A-Za-z0-9_-]{1,128}$/;
 
-/** Compatibility protocol for legacy/cross-machine `--bot` dispatches. */
+/**
+ * Compatibility protocol for legacy/cross-machine `--bot` dispatches.
+ *
+ * Keep the marker after the positional report text. Older receivers do not know
+ * this boolean flag, but their generic positional parser safely ignores an
+ * unknown trailing flag instead of consuming the report text as its value.
+ */
 export function appendLegacyDispatchReportProtocol(brief: string): string {
   return brief.trimEnd()
     + '\n\n— 完成回报 —\n'
-    + '干完后在本话题运行 `botmux report "子项目完成 + 产出位置/摘要"` '
+    + '干完后在本话题运行 `botmux report "子项目完成 + 产出位置/摘要" --legacy-dispatch` '
     + '把结果回报给主编排会话；不要在本话题 @ 主bot（那会另起一个没有上下文的新会话）。';
 }
 
-/**
- * Freeze the report destination into the exact dispatched turn.
- *
- * A regular-group resident can reuse one chat-scoped CLI session for several
- * dispatch topics. Session-level `currentReplyTarget` is therefore mutable and
- * cannot identify an older in-flight turn once a newer assignment arrives. The
- * kickoff itself is immutable, so embed the seed in the command the resident is
- * instructed to run; `botmux report` can then select the matching registry row
- * without guessing from the session's latest alias.
- */
+/** Bind a stable local dispatch to its exact report destination. */
 export function appendDispatchReportProtocol(brief: string, dispatchRootId: string): string {
   const root = dispatchRootId.trim();
   if (!DISPATCH_ROOT_ID_RE.test(root)) throw new Error('dispatch report protocol requires a valid om_ root id');
@@ -65,6 +63,29 @@ export function appendDispatchReportProtocol(brief: string, dispatchRootId: stri
     + '\n\n— 完成回报 —\n'
     + `干完后在本话题运行 \`botmux report --dispatch-root ${root} "子项目完成 + 产出位置/摘要"\` `
     + '把结果回报给原始主编排会话；不要在本话题 @ 主bot（那会另起一个没有上下文的新会话）。';
+}
+
+/** Additionally ask the assignee to leave a human-visible copy in the task topic. */
+export function appendDispatchCompletionProtocol(brief: string): string {
+  return brief.trimEnd()
+    + '\n\n— 原话题留档 —\n'
+    + '除上述 botmux report 回报外，完成后还需在收到任务的原话题运行 '
+    + '`botmux send --no-mention "子项目完成 + 产出位置/摘要"` '
+    + '额外留一份人可见的最终交付；不要 @ 主 bot，不要新开话题。';
+}
+
+export function buildDispatchCompletionBrief(input: {
+  brief: string;
+  dispatchRootId: string;
+  exactReportRootEnabled: boolean;
+  sameTopicSendEnabled: boolean;
+}): string {
+  const withReport = input.exactReportRootEnabled
+    ? appendDispatchReportProtocol(input.brief, input.dispatchRootId)
+    : appendLegacyDispatchReportProtocol(input.brief);
+  return input.sameTopicSendEnabled
+    ? appendDispatchCompletionProtocol(withReport)
+    : withReport;
 }
 
 /**
@@ -344,22 +365,25 @@ export function activeConversationBotOpenIds(input: {
   return openIds;
 }
 
+/** Resolve the stable Review/orchestrator addressee independently of placement. */
+export function resolveReportRecipient(input: {
+  creatorOpenId?: string;
+  ownerOpenId?: string;
+  quoteTargetSenderOpenId?: string;
+}): string | undefined {
+  return [
+    input.creatorOpenId,
+    input.ownerOpenId,
+    input.quoteTargetSenderOpenId,
+  ].find(value => !!value?.trim())?.trim();
+}
+
 /**
- * Resolve where a `botmux report` should go + who to @, so report-back works
- * even when the orchestrator is on a DIFFERENT machine.
+ * Compatibility view of registry coordinates plus recipient.
  *
- * Same-machine: the dispatch registry (orchestrate-dispatch.json) is local, so
- * `registryEntry` carries the orchestrator's exact coords (incl. orchRoot for a
- * thread-scope orchestrator). Cross-machine: the foreign sub-bot's daemon never
- * wrote that registry, so `registryEntry` is undefined — but everything needed
- * for the common case is on the sub-bot's OWN session: the report goes top-level
- * into the chat the sub-topic lives in (= the orchestrator's chat) and @-s the
- * orchestrator (creatorOpenId, captured from the dispatch @). So we fall back to
- * `{ orchChatId: sessionChatId, orchScope: 'chat', orchRoot: '' }`.
- *
- * orchOpenId prefers `creatorOpenId` (stable, set on every session-creation path
- * incl. foreign-bot auto-create), then `ownerOpenId`, then the drifting
- * `quoteTargetSenderOpenId` as a last resort.
+ * `cmdReport` no longer treats these coordinates as the ordinary no-registry
+ * placement. It uses them only to preserve a matching dispatch route; otherwise
+ * {@link resolveReportPlacement} inherits the executing conversation turn.
  */
 export function resolveReportTarget(input: {
   registryEntry?: { orchChatId?: string; orchScope?: string; orchRoot?: string };
@@ -373,7 +397,75 @@ export function resolveReportTarget(input: {
     orchChatId: e?.orchChatId ?? input.sessionChatId,
     orchScope: e?.orchScope ?? 'chat',
     orchRoot: e?.orchRoot ?? '',
-    orchOpenId: input.creatorOpenId ?? input.ownerOpenId ?? input.quoteTargetSenderOpenId,
+    orchOpenId: resolveReportRecipient(input),
+  };
+}
+
+export type ReportPlacementSource =
+  | 'explicit-into'
+  | 'explicit-top-level'
+  | 'dispatch-registry'
+  | 'legacy-dispatch-fallback'
+  | 'current-turn'
+  | 'session-default';
+
+/**
+ * Resolve only the visible placement of a `botmux report`.
+ *
+ * The report recipient is intentionally resolved separately by
+ * {@link resolveReportRecipient}: choosing where the message is shown must never
+ * change who is @-mentioned. Explicit placement wins, a dispatch registry keeps
+ * its existing orchestrator-return semantics, and an explicitly marked legacy
+ * cross-machine dispatch without a local registry keeps the old top-level
+ * compatibility fallback. Ordinary reports reuse the same turn-bound placement
+ * rules as `botmux send`.
+ */
+export function resolveReportPlacement(input: {
+  into?: string;
+  topLevel?: boolean;
+  registryTarget?: SessionReplyTarget;
+  legacyDispatch?: boolean;
+  chatScope: boolean;
+  chatId: string;
+  rootMessageId: string;
+  replyTargetRootId?: string;
+  replyTargetTurnId?: string;
+  replyTargetQuoteOnly?: boolean;
+  currentTurnId?: string;
+}): { target: SessionReplyTarget; source: ReportPlacementSource } {
+  if (input.into) {
+    return {
+      target: { mode: 'thread', rootMessageId: input.into },
+      source: 'explicit-into',
+    };
+  }
+  if (input.topLevel) {
+    return {
+      target: { mode: 'plain', chatId: input.chatId },
+      source: 'explicit-top-level',
+    };
+  }
+  if (input.registryTarget) {
+    return { target: input.registryTarget, source: 'dispatch-registry' };
+  }
+  if (input.legacyDispatch) {
+    return {
+      target: { mode: 'plain', chatId: input.chatId },
+      source: 'legacy-dispatch-fallback',
+    };
+  }
+  return {
+    target: resolveSendTarget({
+      topLevel: false,
+      chatScope: input.chatScope,
+      chatId: input.chatId,
+      rootMessageId: input.rootMessageId,
+      replyTargetRootId: input.replyTargetRootId,
+      replyTargetTurnId: input.replyTargetTurnId,
+      replyTargetQuoteOnly: input.replyTargetQuoteOnly,
+      currentTurnId: input.currentTurnId,
+    }),
+    source: input.currentTurnId ? 'current-turn' : 'session-default',
   };
 }
 
@@ -391,16 +483,19 @@ export interface DispatchRegistryEntry {
  * regular-group chat-scope session folded from a dispatch topic.
  *
  * Folded sessions are keyed by chatId, while the registry is keyed by the seed
- * message id. The seed is retained in currentReplyTarget/replyThreadAliases, so
- * report-back must consult those aliases instead of silently falling back to a
- * context-less top-level message.
+ * message id. Their currentReplyTarget is usable only when it belongs to the
+ * CLI's executing turn. Historical replyThreadAliases deliberately do not
+ * participate: they have no turn id and could route a later ordinary report
+ * back into a stale dispatch.
  */
 export function findDispatchRegistryEntry(input: {
   registry: Record<string, DispatchRegistryEntry>;
   dispatchRootId?: string;
+  sessionScope?: 'thread' | 'chat';
   rootMessageId?: string;
   currentReplyTargetRootId?: string;
-  replyThreadAliases?: Record<string, { createdAt: string; lastUsedAt: string }>;
+  currentReplyTargetTurnId?: string;
+  currentTurnId?: string;
 }): { key: string; entry: DispatchRegistryEntry } | undefined {
   if (input.dispatchRootId) {
     const entry = input.registry[input.dispatchRootId];
@@ -410,11 +505,14 @@ export function findDispatchRegistryEntry(input: {
   const add = (value: string | undefined) => {
     if (value && !ordered.includes(value)) ordered.push(value);
   };
-  add(input.currentReplyTargetRootId);
-  add(input.rootMessageId);
-  const aliases = Object.entries(input.replyThreadAliases ?? {})
-    .sort((a, b) => String(b[1]?.lastUsedAt ?? '').localeCompare(String(a[1]?.lastUsedAt ?? '')));
-  for (const [rootId] of aliases) add(rootId);
+  if (
+    input.currentTurnId
+    && input.currentReplyTargetTurnId === input.currentTurnId
+  ) {
+    add(input.currentReplyTargetRootId);
+  }
+  // Chat-scope rootMessageId is traceability metadata, not a routing anchor.
+  if (input.sessionScope !== 'chat') add(input.rootMessageId);
   for (const key of ordered) {
     const entry = input.registry[key];
     if (entry) return { key, entry };
