@@ -1992,8 +1992,17 @@ export async function restoreActiveSessions(
     try {
       const mismatchClose = await closeActiveSessionIfCliMismatch(ds);
       if (mismatchClose !== 'not_mismatched') {
+        // Both failure kinds must quarantine, and neither can rely on the catch
+        // below: a REFUSED close (remote cancellation unproven) is a returned
+        // {ok:false}, not an exception. Without this the row stays active on disk
+        // while never being registered — the exact "active on disk, invisible at
+        // runtime" owner quarantineUnregisteredRestoreSession exists to prevent,
+        // after which a later inbound on the same anchor mints a second session
+        // while the old remote one is still running.
         if (mismatchClose === 'teardown_failed') {
           quarantineUnregisteredRestoreSession(session, 'cli_mismatch_teardown_unverified');
+        } else if (mismatchClose === 'close_failed') {
+          quarantineUnregisteredRestoreSession(session, 'cli_mismatch_close_failed');
         }
         continue;
       }

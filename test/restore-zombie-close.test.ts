@@ -596,6 +596,43 @@ describe('restoreActiveSessions — persistent-backend zombie-close decision', (
     expect(forkWorker).not.toHaveBeenCalled();
   });
 
+  it('quarantines a restore whose CLI-mismatch close was REFUSED (not thrown)', async () => {
+    // A refused close is a returned {ok:false}, so it never reaches the catch that
+    // quarantines a thrown one. Without an explicit branch the row stays active on
+    // disk yet is never registered — an owner that IM /close cannot reach, while a
+    // later inbound on the same anchor mints a second session and the old remote
+    // one keeps running.
+    probe.result = 'missing';
+    const blocked = makeActivePersistentSession('om_close_refused');
+    blocked.wrapperCli = 'aiden x claude';
+    blocked.agentFrozen = true;
+    sessionStore.updateSession(blocked);
+    const survivor = makeActivePersistentSession('om_restore_after_refusal', 'tmux');
+    sessionStore.updateSession(survivor);
+    vi.mocked(closeSession).mockResolvedValueOnce({
+      ok: false,
+      alreadyClosed: false,
+      error: 'mojo_cancel_failed',
+      retryable: true,
+      taskId: 'mojo-sid-123',
+    } as never);
+    const map = new Map<string, DaemonSession>();
+    wp.registry = map;
+
+    await expect(restoreActiveSessions(map)).resolves.toBeUndefined();
+
+    expect(closeSession).toHaveBeenCalledWith(blocked.sessionId);
+    // Row kept active AND quarantined, so it is visible as a problem rather than
+    // silently invisible.
+    expect(sessionStore.getSession(blocked.sessionId)?.status).toBe('active');
+    expect(sessionStore.getSession(blocked.sessionId)?.restoreQuarantinedAt)
+      .toEqual(expect.any(String));
+    expect(map.get(sessionKey('om_close_refused', 'app_test'))).toBeUndefined();
+    // Unrelated rows still restore.
+    expect(map.get(sessionKey('om_restore_after_refusal', 'app_test'))?.session.sessionId)
+      .toBe(survivor.sessionId);
+  });
+
   it('frozen wrapper matching the bot wrapper → NOT a mismatch, session kept', async () => {
     probe.result = 'missing';
     bot.wrapperCli = 'aiden x claude';
@@ -962,6 +999,29 @@ describe('closeCliMismatchedSessionsForBot — runtime CLI hot-switch sweep', ()
     expect(sessionStore.getSession(s.sessionId)!.status).toBe('active');
     expect(wp.registry?.size ?? 0).toBeGreaterThan(0);
     void ds;
+  });
+
+  it('counts a THROWN close as failed and keeps sweeping later rows', async () => {
+    // The catch used to swallow the error without counting it, so a sweep that
+    // threw on every row still reported a clean "closed 0, failed 0".
+    const boom = makeActivePersistentSession('om_rt_throw');
+    boom.wrapperCli = 'aiden x claude';
+    boom.agentFrozen = true;
+    sessionStore.updateSession(boom);
+    registerDs(boom);
+    const later = makeActivePersistentSession('om_rt_after_throw');
+    later.wrapperCli = 'aiden x claude';
+    later.agentFrozen = true;
+    sessionStore.updateSession(later);
+    registerDs(later);
+    vi.mocked(closeSession).mockRejectedValueOnce(new Error('ownership probe unavailable'));
+
+    const result = await closeCliMismatchedSessionsForBot('app_test');
+
+    expect(result.failed).toBe(1);
+    // The sweep continued: the second row was still closed.
+    expect(result.closed).toBe(1);
+    expect(closeSession).toHaveBeenCalledWith(later.sessionId);
   });
 
   it('closes runtime identity mismatches and describes both distributions in the warning', async () => {

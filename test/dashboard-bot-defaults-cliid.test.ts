@@ -208,6 +208,46 @@ describe('Codex-compatible runtime editor', () => {
     }
   });
 
+  it('warns (and drops the green tick) when the sweep left residual/failed sessions', async () => {
+    // "closed N" alone reported rows that are still active, and remote sessions
+    // that are still running, as fully torn down.
+    const previousFetch = globalThis.fetch;
+    (globalThis as any).fetch = vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        ok: true,
+        cliId: 'codex',
+        cliRuntime: null,
+        cliPathOverride: null,
+        wrapperCli: null,
+        model: '',
+        selectionKey: 'codex',
+        closedMismatchedSessions: 3,
+        closedMismatchedResidual: 2,
+        closedMismatchedFailed: 1,
+      }),
+    } as any));
+
+    try {
+      const { root } = renderAgent({ cliId: 'codex' });
+      await act(async () => {
+        root.findByProps({ 'data-action': 'save-agent' }).props.onClick();
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+
+      const status = root.findByProps({ 'data-agent-status': '' });
+      const text = status.children.join('');
+      // Both problems surfaced, and no green success marker.
+      expect(text).toContain('⚠️');
+      expect(text).not.toContain('✓');
+      expect(status.props.status?.ok).not.toBe(true);
+    } finally {
+      (globalThis as any).fetch = previousFetch;
+    }
+  });
+
   it('explicitly clears a legacy path and reports sessions closed by the runtime switch', async () => {
     const previousFetch = globalThis.fetch;
     const requests: any[] = [];
