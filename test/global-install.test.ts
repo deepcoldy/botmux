@@ -88,6 +88,37 @@ describe('resolveGlobalInstallPlan', () => {
     }
   });
 
+  it('recognises the pnpm 11 store realpath behind a global symlink', () => {
+    const root = '/home/bot/.local/share/pnpm/store/v11/links/@/botmux/3.11.0/hash/node_modules/botmux';
+    const plan = resolveGlobalInstallPlan(root, 'linux');
+    expect(plan).toMatchObject({
+      manager: 'pnpm',
+      command: 'pnpm',
+      args: ['add', '-g', '--global-dir', '/home/bot/.local/share/pnpm/global', 'botmux@latest'],
+    });
+    expect(detectGlobalInstallManager(root, 'linux')).toBe('pnpm');
+  });
+
+  it('uses the stable pnpm 11 global symlink for a store realpath', () => {
+    const tempRoot = mkdtempSync(join(tmpdir(), 'botmux-pnpm11-store-'));
+    try {
+      const pnpmHome = join(tempRoot, 'pnpm');
+      const storeRoot = join(pnpmHome, 'store', 'v11', 'links', '@', 'botmux', '3.11.0', 'hash');
+      const packageRoot = join(storeRoot, 'node_modules', 'botmux');
+      const globalRoot = join(pnpmHome, 'global', 'v11');
+      const stableDir = join(globalRoot, 'stable-hash');
+      mkdirSync(packageRoot, { recursive: true });
+      mkdirSync(globalRoot, { recursive: true });
+      symlinkSync(storeRoot, stableDir, 'dir');
+
+      const plan = resolveGlobalInstallPlan(packageRoot, 'linux');
+
+      expect(plan.activePackageRoot).toBe(join(stableDir, 'node_modules', 'botmux'));
+    } finally {
+      rmSync(tempRoot, { recursive: true, force: true });
+    }
+  });
+
   it('preserves the Windows pnpm 11 global-dir path', () => {
     const root = String.raw`D:\pnpm\global\v11\2bd754-19fd4ccaab4-b6f57fa0272de3b8\node_modules\botmux`;
     const plan = resolveGlobalInstallPlan(root, 'win32');
