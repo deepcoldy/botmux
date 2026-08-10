@@ -150,13 +150,14 @@ function sessionTokenUsage(s: Session, workingDir?: string): SessionTokenUsage |
   });
 }
 
-function sessionOpenTodos(s: Session, workingDir?: string): SessionRow['openTodos'] {
+function sessionOpenTodos(s: Session, workingDir?: string, fresh?: boolean): SessionRow['openTodos'] {
   return readSessionOpenTodos({
     cliId: s.cliId ?? 'unknown',
     sessionId: s.sessionId,
     cliSessionId: s.cliSessionId,
     cwd: workingDir ?? s.workingDir,
     larkAppId: s.larkAppId,
+    fresh,
   }) ?? undefined;
 }
 
@@ -195,7 +196,7 @@ function sessionRuntimeFields(s: Session): Pick<SessionRow, 'runtimeId' | 'runti
   return {};
 }
 
-export function composeRowFromActive(ds: DaemonSession): SessionRow {
+export function composeRowFromActive(ds: DaemonSession, opts?: { fresh?: boolean }): SessionRow {
   return {
     sessionId: ds.session.sessionId,
     larkAppId: ds.larkAppId,
@@ -247,7 +248,7 @@ export function composeRowFromActive(ds: DaemonSession): SessionRow {
       ? { kind: ds.agentAttention.kind, reason: ds.agentAttention.reason, at: ds.agentAttention.at }
       : undefined,
     tokenUsage: sessionTokenUsage(ds.session, ds.workingDir),
-    openTodos: sessionOpenTodos(ds.session, ds.workingDir),
+    openTodos: sessionOpenTodos(ds.session, ds.workingDir, opts?.fresh),
     ...(ds.worker?.pid !== undefined ? { workerPid: ds.worker.pid } : {}),
     ...(ds.adoptedFrom?.originalCliPid !== undefined ? { adoptCliPid: ds.adoptedFrom.originalCliPid } : {}),
     ...buildSessionMessagePreview(ds.session),

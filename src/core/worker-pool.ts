@@ -7534,7 +7534,10 @@ function setupWorkerHandlers(
         // upstream debouncer — by the time we get here, status flips are
         // already coarse-grained.
         if (prevStatus !== ds.lastScreenStatus) {
-          const dashboardRow = composeRowFromActive(ds);
+          // fresh:true —— 这是「状态边沿触发的 refresh 读」，transcript 此刻刚追加完
+          // 本轮输出。绕过 resolver 对懒创建 rollout 的 30s miss 负缓存，否则首轮
+          // (spawn 时 rollout 还没落盘)徽标要等 30s 后某次边沿才出现。
+          const dashboardRow = composeRowFromActive(ds, { fresh: true });
           dashboardEventBus.publish({
             type: 'session.update',
             body: {

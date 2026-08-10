@@ -1,5 +1,5 @@
-import { mkdtempSync, rmSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { appendFileSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
@@ -210,5 +210,111 @@ describe('readSessionOpenTodos (Claude transcript on disk, mtime cache)', () => 
   it('returns null when no transcript exists for the session', () => {
     dir = mkdtempSync(join(tmpdir(), 'todo-state-'));
     expect(readSessionOpenTodos({ cliId: 'claude-code', sessionId: `nope-${Date.now()}`, cwd: dir })).toBeNull();
+  });
+});
+
+// ── 增量游标读 / fail-closed / 文件替换（二轮审核阻塞②③ + ① fresh 贯穿）──────────
+// readSessionOpenTodos 走真实落盘 transcript：写在 resolver 计算出的
+// ~/.claude/projects/<项目key>/<sessionId>.jsonl。cwd 用 mkdtemp 保证 projectKey
+// 唯一（realpath→非字母数字转 '-'），sessionId 带随机后缀，afterEach 清理该文件。
+describe('readSessionOpenTodos (增量续读 / fail-closed / 文件替换)', () => {
+  let cwdDir: string;
+  let transcriptPath: string;
+
+  // resolver: projectKey = realpathSync(cwd) 里非 [A-Za-z0-9-] → '-'。
+  function transcriptPathFor(cwd: string, sessionId: string): string {
+    const projectKey = realpathSync(cwd).replace(/[^A-Za-z0-9-]/g, '-');
+    const projectDir = join(homedir(), '.claude', 'projects', projectKey);
+    mkdirSync(projectDir, { recursive: true });
+    return join(projectDir, `${sessionId}.jsonl`);
+  }
+  const line = (entry: unknown) => `${JSON.stringify(entry)}\n`;
+
+  afterEach(() => {
+    __resetTodoStateCacheForTest();
+    if (transcriptPath) rmSync(transcriptPath, { force: true });
+    if (cwdDir) rmSync(cwdDir, { recursive: true, force: true });
+    transcriptPath = '';
+    cwdDir = '';
+  });
+
+  function setup(): { sessionId: string; cwd: string } {
+    cwdDir = mkdtempSync(join(tmpdir(), 'todo-cwd-'));
+    const sessionId = `sess-${process.pid}-${Math.floor(performance.now() * 1000)}`;
+    transcriptPath = transcriptPathFor(cwdDir, sessionId);
+    return { sessionId, cwd: cwdDir };
+  }
+
+  it('增量续读：追加新 TodoWrite 快照后反映最新状态（不重折旧行）', () => {
+    const { sessionId, cwd } = setup();
+    writeFileSync(transcriptPath, line(claudeTodo(['pending', 'pending', 'pending'])));
+    expect(readSessionOpenTodos({ cliId: 'claude-code', sessionId, cwd }))
+      .toMatchObject({ total: 3, done: 0, remaining: 3, hasInProgress: false });
+
+    // 追加一条更新过的快照——增量路径应只 fold 新行、给出最新末态。
+    appendFileSync(transcriptPath, line(claudeTodo(['completed', 'completed', 'in_progress'])));
+    expect(readSessionOpenTodos({ cliId: 'claude-code', sessionId, cwd }))
+      .toMatchObject({ total: 3, done: 2, remaining: 1, hasInProgress: true });
+  });
+
+  it('增量续读：Task* 增量事件跨多次读盘持续累积', () => {
+    const { sessionId, cwd } = setup();
+    writeFileSync(transcriptPath, line(taskCreate('c1', 'A')) + line(createResult('c1', 1)));
+    expect(readSessionOpenTodos({ cliId: 'claude-code', sessionId, cwd }))
+      .toMatchObject({ total: 1, done: 0, remaining: 1, hasInProgress: false });
+
+    // 追加第二个任务 + 把第一个标完成——沿用折叠状态，末态应为 2 项 1 完成。
+    appendFileSync(transcriptPath, line(taskCreate('c2', 'B')) + line(createResult('c2', 2)) + line(taskUpdate('1', 'completed')));
+    expect(readSessionOpenTodos({ cliId: 'claude-code', sessionId, cwd }))
+      .toMatchObject({ total: 2, done: 1, remaining: 1, hasInProgress: false });
+  });
+
+  it('size 未变则直接返缓存（无新行，稳定同值）', () => {
+    const { sessionId, cwd } = setup();
+    writeFileSync(transcriptPath, line(claudeTodo(['completed', 'pending'])));
+    const first = readSessionOpenTodos({ cliId: 'claude-code', sessionId, cwd });
+    const second = readSessionOpenTodos({ cliId: 'claude-code', sessionId, cwd });
+    expect(second).toEqual(first);
+    expect(second).toMatchObject({ total: 2, done: 1, remaining: 1 });
+  });
+
+  it('文件被整体替换（内容变短，size<offset）→ 冷读重解析，不返旧值', () => {
+    const { sessionId, cwd } = setup();
+    writeFileSync(transcriptPath, line(claudeTodo(['completed', 'completed', 'completed'])));
+    expect(readSessionOpenTodos({ cliId: 'claude-code', sessionId, cwd }))
+      .toMatchObject({ total: 3, done: 3, remaining: 0 });
+
+    // 用更短的新内容整体覆盖（size 变小 < 上次 offset）——必须冷读出新的单项状态。
+    writeFileSync(transcriptPath, line(claudeTodo(['pending'])));
+    expect(readSessionOpenTodos({ cliId: 'claude-code', sessionId, cwd }))
+      .toMatchObject({ total: 1, done: 0, remaining: 1, hasInProgress: false });
+  });
+
+  it('冷读遇 >32MiB transcript → fail-closed 返 null，绝不返旧 cache', () => {
+    const { sessionId, cwd } = setup();
+    // 先建一个正常的小文件并读出有效值，占住 cache。
+    writeFileSync(transcriptPath, line(claudeTodo(['completed', 'pending'])));
+    expect(readSessionOpenTodos({ cliId: 'claude-code', sessionId, cwd }))
+      .toMatchObject({ total: 2, done: 1 });
+
+    // 整体替换成一个 >32MiB 的新文件（size<offset 触发冷读路径，超阈值 fail-closed）。
+    const bigLine = line(claudeTodo(['pending']));
+    const header = Buffer.from(bigLine);
+    const filler = Buffer.alloc(33 * 1024 * 1024, 0x20); // 33MiB 空格，非法 JSON 也无所谓——超阈直接拒
+    writeFileSync(transcriptPath, Buffer.concat([header, filler]));
+    expect(readSessionOpenTodos({ cliId: 'claude-code', sessionId, cwd })).toBeNull();
+  });
+
+  it('fresh 贯穿：resolver miss 负缓存后，fresh=true 能在同一读里拿到刚落盘的 transcript', () => {
+    // 先用非 fresh 读一次不存在的 transcript（种下 resolver 的 30s miss 负缓存），
+    // 再落盘并以 fresh=true 读——fresh 绕过负缓存立即命中，而非等 30s。
+    cwdDir = mkdtempSync(join(tmpdir(), 'todo-cwd-'));
+    const sessionId = `sess-fresh-${process.pid}-${Math.floor(performance.now() * 1000)}`;
+    expect(readSessionOpenTodos({ cliId: 'claude-code', sessionId, cwd: cwdDir })).toBeNull();
+
+    transcriptPath = transcriptPathFor(cwdDir, sessionId);
+    writeFileSync(transcriptPath, line(claudeTodo(['completed', 'in_progress'])));
+    expect(readSessionOpenTodos({ cliId: 'claude-code', sessionId, cwd: cwdDir, fresh: true }))
+      .toMatchObject({ total: 2, done: 1, remaining: 1, hasInProgress: true });
   });
 });

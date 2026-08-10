@@ -883,7 +883,7 @@ export { composeRowFromActive, composeRowFromClosed, composeRowFromPersistedActi
 export function setBotName(name: string): void { setRowsBotName(name); }
 
 function composeDashboardSessionRows(): SessionRow[] {
-  const active = listActiveSessions().map(composeRowFromActive);
+  const active = listActiveSessions().map((ds) => composeRowFromActive(ds));
   const activeIds = new Set(active.map(row => row.sessionId));
   const persisted = sessionStore.listSessions();
   const unregisteredActive = persisted

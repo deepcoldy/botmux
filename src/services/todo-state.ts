@@ -9,7 +9,8 @@
 //
 // 读不到（其它 CLI、无 transcript、从未写过 todo）返回 null —— 由调用方标「未知/不
 // 支持」，绝不硬猜完成度。纯解析函数 parseOpenTodos 无 fs 依赖，便于单测。
-import { existsSync, readFileSync, statSync } from 'node:fs';
+import { statSync, type Stats } from 'node:fs';
+import { scanJsonlFromOffset } from './jsonl-cursor.js';
 import { resolveSessionTranscriptPath } from './transcript-resolver.js';
 import type { CliId } from '../adapters/cli/types.js';
 
@@ -108,6 +109,49 @@ function parseArgs(raw: unknown): Record<string, unknown> | null {
   }
 }
 
+/** 增量折叠状态：把「整份 transcript → 当前任务态」拆成「逐行 fold + 末态 finalize」，
+ *  这样全量解析(parseOpenTodos)与增量游标读(readSessionOpenTodos)共用同一套语义，
+ *  且可跨多次读盘只 fold 新追加的行。
+ *  - codex：latestSnapshot 存最后一次 update_plan 快照（last-write-wins）。
+ *  - claude：latestSnapshot 存最后一次 TodoWrite 快照；同时 claudeTasks 增量重放
+ *    Task* 事件。finalize 时 TodoWrite 优先，缺失才回退 Task* 重放。 */
+interface ClaudeTaskState {
+  /** taskId → {status,text}，Map 保序（= 创建顺序），供 UI 顺序展示。 */
+  tasks: Map<string, { status: TodoStatus; text: string }>;
+  /** TaskCreate 的 tool_use.id → subject，等 tool_result 回填分配的 taskId。 */
+  pendingCreate: Map<string, string>;
+  sawAnyTask: boolean;
+}
+export interface TodoFoldState {
+  kind: 'claude' | 'codex';
+  latestSnapshot: OpenTodos | null;
+  claudeTasks?: ClaudeTaskState;
+}
+
+export function newTodoFoldState(kind: 'claude' | 'codex'): TodoFoldState {
+  return {
+    kind,
+    latestSnapshot: null,
+    claudeTasks: kind === 'claude'
+      ? { tasks: new Map(), pendingCreate: new Map(), sawAnyTask: false }
+      : undefined,
+  };
+}
+
+/** 把单条已解析记录折叠进状态（就地修改）。 */
+export function foldTodoEntry(state: TodoFoldState, entry: any): void {
+  const snap = todoSnapshotFromEntry(entry, state.kind);
+  if (snap) state.latestSnapshot = snap; // 后写覆盖：整表快照语义
+  if (state.kind === 'claude' && state.claudeTasks) foldClaudeTaskEntry(state.claudeTasks, entry);
+}
+
+/** 折叠出末态：TodoWrite/update_plan 快照优先，claude 缺失时回退 Task* 重放。 */
+export function finalizeTodoFold(state: TodoFoldState): OpenTodos | null {
+  if (state.latestSnapshot) return state.latestSnapshot;
+  if (state.kind === 'claude' && state.claudeTasks) return finalizeClaudeTaskState(state.claudeTasks);
+  return null;
+}
+
 /** 从整份 transcript（已按行解析的记录数组）取当前任务态。
  *  - codex：update_plan 是整表快照，取最后一次即可。
  *  - claude：两种方言二选一——
@@ -115,15 +159,9 @@ function parseArgs(raw: unknown): Record<string, unknown> | null {
  *      · 本 botmux 环境用 Task* 工具（TaskCreate/TaskUpdate 增量），需按记录重放
  *        累积成末态。TodoWrite 优先（真快照）；没有 TodoWrite 时回退到 Task* 重放。 */
 export function parseOpenTodos(entries: any[], kind: 'claude' | 'codex'): OpenTodos | null {
-  let latest: OpenTodos | null = null;
-  for (const entry of entries) {
-    const snap = todoSnapshotFromEntry(entry, kind);
-    if (snap) latest = snap; // 后写覆盖：整表快照语义，只保留最后一次
-  }
-  if (latest) return latest;
-  // 无 TodoWrite/update_plan 快照时，claude 侧尝试 Task* 增量重放。
-  if (kind === 'claude') return replayClaudeTaskState(entries);
-  return null;
+  const state = newTodoFoldState(kind);
+  for (const entry of entries) foldTodoEntry(state, entry);
+  return finalizeTodoFold(state);
 }
 
 // ── Claude Code 内建 Task* 工具（本 botmux 环境）的增量重放 ────────────────────
@@ -135,55 +173,51 @@ export function parseOpenTodos(entries: any[], kind: 'claude' | 'codex'): OpenTo
 //     completed/deleted。deleted 从清单移除（工具语义：永久删除）。
 // 按 tool_use.id 关联 TaskCreate 与其结果，重放出 Map<taskId,status> 末态，再折叠
 // 成 OpenTodos。整个清单没有任何任务时返回 null（= 未用过任务清单，别当已交付）。
-function replayClaudeTaskState(entries: any[]): OpenTodos | null {
-  // id → {status,text}，Map 按插入顺序（= 任务创建顺序）保序，供 UI 顺序展示。
-  const tasks = new Map<string, { status: TodoStatus; text: string }>();
-  // TaskCreate 的 tool_use.id → 该次创建的 subject（等 tool_result 回填分配的 taskId）。
-  const pendingCreate = new Map<string, string>();
-  let sawAnyTask = false;
-
-  for (const entry of entries) {
-    const content = entry?.message?.content;
-    if (!Array.isArray(content)) continue;
-    for (const block of content) {
-      if (block?.type === 'tool_use') {
-        const name = typeof block.name === 'string' ? block.name.trim().toLowerCase() : '';
-        if (name === 'taskcreate') {
-          if (typeof block.id === 'string') {
-            const subject = block?.input?.subject ?? block?.input?.activeForm ?? '';
-            pendingCreate.set(block.id, typeof subject === 'string' ? subject : String(subject ?? ''));
-          }
-          sawAnyTask = true;
-        } else if (name === 'taskupdate') {
-          const id = taskIdString(block?.input?.taskId);
-          const st = block?.input?.status;
-          if (id) {
-            sawAnyTask = true;
-            if (st === 'deleted') tasks.delete(id);
-            else {
-              const norm = normalizeTodoStatus(st);
-              // status 缺省的 TaskUpdate（只改 subject/owner 等）不动状态，但要确保
-              // 该任务已在册（默认 pending），否则纯元数据更新会丢任务。
-              const cur = tasks.get(id) ?? { status: 'pending' as TodoStatus, text: '' };
-              const newSubject = typeof block?.input?.subject === 'string' ? block.input.subject : cur.text;
-              tasks.set(id, { status: norm ?? cur.status, text: newSubject });
-            }
+// 拆成 foldClaudeTaskEntry（逐行）+ finalizeClaudeTaskState（末态），供增量游标读跨
+// 多次读盘持续累积同一份 tasks/pendingCreate。
+function foldClaudeTaskEntry(ts: ClaudeTaskState, entry: any): void {
+  const content = entry?.message?.content;
+  if (!Array.isArray(content)) return;
+  for (const block of content) {
+    if (block?.type === 'tool_use') {
+      const name = typeof block.name === 'string' ? block.name.trim().toLowerCase() : '';
+      if (name === 'taskcreate') {
+        if (typeof block.id === 'string') {
+          const subject = block?.input?.subject ?? block?.input?.activeForm ?? '';
+          ts.pendingCreate.set(block.id, typeof subject === 'string' ? subject : String(subject ?? ''));
+        }
+        ts.sawAnyTask = true;
+      } else if (name === 'taskupdate') {
+        const id = taskIdString(block?.input?.taskId);
+        const st = block?.input?.status;
+        if (id) {
+          ts.sawAnyTask = true;
+          if (st === 'deleted') ts.tasks.delete(id);
+          else {
+            const norm = normalizeTodoStatus(st);
+            // status 缺省的 TaskUpdate（只改 subject/owner 等）不动状态，但要确保
+            // 该任务已在册（默认 pending），否则纯元数据更新会丢任务。
+            const cur = ts.tasks.get(id) ?? { status: 'pending' as TodoStatus, text: '' };
+            const newSubject = typeof block?.input?.subject === 'string' ? block.input.subject : cur.text;
+            ts.tasks.set(id, { status: norm ?? cur.status, text: newSubject });
           }
         }
-      } else if (block?.type === 'tool_result') {
-        const forId = typeof block.tool_use_id === 'string' ? block.tool_use_id : '';
-        if (forId && pendingCreate.has(forId)) {
-          const subject = pendingCreate.get(forId) ?? '';
-          pendingCreate.delete(forId);
-          const assigned = extractCreatedTaskId(block.content);
-          if (assigned && !tasks.has(assigned)) tasks.set(assigned, { status: 'pending', text: subject });
-        }
+      }
+    } else if (block?.type === 'tool_result') {
+      const forId = typeof block.tool_use_id === 'string' ? block.tool_use_id : '';
+      if (forId && ts.pendingCreate.has(forId)) {
+        const subject = ts.pendingCreate.get(forId) ?? '';
+        ts.pendingCreate.delete(forId);
+        const assigned = extractCreatedTaskId(block.content);
+        if (assigned && !ts.tasks.has(assigned)) ts.tasks.set(assigned, { status: 'pending', text: subject });
       }
     }
   }
+}
 
-  if (!sawAnyTask || tasks.size === 0) return null;
-  return summarize([...tasks.values()]);
+function finalizeClaudeTaskState(ts: ClaudeTaskState): OpenTodos | null {
+  if (!ts.sawAnyTask || ts.tasks.size === 0) return null;
+  return summarize([...ts.tasks.values()]);
 }
 
 function taskIdString(v: unknown): string | null {
@@ -204,15 +238,27 @@ function extractCreatedTaskId(content: unknown): string | null {
   return m ? m[1] : null;
 }
 
-// ── 带 mtime 失效的缓存读取（对齐 cost-calculator 的 usageFileCache 思路）──────
-// dashboard 每次 /api/sessions 会对每个会话调一次；用 mtime+size 命中缓存，避免
-// 每请求重读整份 transcript。超大文件跳过（与 insight jsonl 的 32MB 上限一致）。
+// ── 增量游标读取（对齐 cost-calculator 的 fd+offset 增量扫描思路）──────────────
+// dashboard 每次 /api/sessions、以及每个 working→idle 状态边沿都会对会话调一次。
+// 关键：触发读盘的那个状态边沿，恰是 transcript 刚追加完本轮输出（含 todo 快照）
+// 的时刻——size 变了，任何「(mtime,size) 不变才命中」的缓存在此刻必 miss。若那时
+// 走全量 readFileSync+JSON.parse，31MiB 文件实测 ~330ms 全程阻塞 daemon 主线程。
+// 故改为「记住上次读到的字节前沿 offset + 折叠状态，只 fold 新追加的行」：
+//   · 文件按 (dev,ino) 认身份，size 未变→直接返缓存；size 增长（append-only）→
+//     从 offset 增量扫到末尾，fold 进沿用的 TodoFoldState（快照 last-write-wins、
+//     Task* 增量重放都天然支持继续累积）；
+//   · ino 变/被截断/首次→冷读全量；冷读遇 >32MiB 直接 fail-closed 返 null，
+//     绝不返旧 cache 冒充当前（否则越界前的旧 pending 会被永久当成当前状态）。
 const MAX_TODO_TRANSCRIPT_BYTES = 32 * 1024 * 1024;
 const TODO_CACHE_MAX_ENTRIES = 512;
 
 interface TodoCacheEntry {
-  mtimeMs: number;
-  size: number;
+  dev: number;
+  ino: number;
+  /** 已折叠到的字节前沿（最后一条完整行之后）。下次从此处增量续读。 */
+  offset: number;
+  /** 沿用的折叠状态，跨多次读盘持续累积（只 fold 增量行，绝不重折旧行）。 */
+  fold: TodoFoldState;
   todos: OpenTodos | null;
 }
 const todoFileCache = new Map<string, TodoCacheEntry>();
@@ -236,14 +282,18 @@ function todoKindForCli(cliId: CliId | 'unknown' | undefined): 'claude' | 'codex
   }
 }
 
-/** 读某会话当前 openTodos。定位 transcript → mtime 缓存 → 解析最后一次 todo 快照。
- *  任何一步失败（不支持的 CLI、无 transcript、超大、解析失败）都返回 null。 */
+/** 读某会话当前 openTodos。定位 transcript → 增量游标读 → 折叠出最后一次 todo 快照。
+ *  任何一步失败（不支持的 CLI、无 transcript、冷读越界、解析失败）都返回 null。
+ *  fresh=true 绕过 resolver 对「尚未落盘的懒创建 transcript」的 30s miss 负缓存——
+ *  spawn 时 rollout 常还没落盘，首个状态边沿读若不置 fresh 会在 30s 内持续吃 miss，
+ *  徽标要等 30s 后某次边沿才出现（镜像 cost-calculator 的 fresh 语义）。 */
 export function readSessionOpenTodos(q: {
   cliId: CliId | 'unknown' | undefined;
   sessionId: string;
   cliSessionId?: string;
   cwd?: string;
   larkAppId?: string;
+  fresh?: boolean;
 }): OpenTodos | null {
   const kind = todoKindForCli(q.cliId);
   if (!kind) return null;
@@ -254,6 +304,7 @@ export function readSessionOpenTodos(q: {
     cliSessionId: q.cliSessionId,
     cwd: q.cwd,
     larkAppId: q.larkAppId,
+    fresh: q.fresh,
   });
   // resolver 的 kind 与我们的 todo dialect 需一致。traex rollout 与 codex 逐字节同构
   // （response_item + function_call），按 codex 方言解析。
@@ -265,50 +316,86 @@ export function readSessionOpenTodos(q: {
   if (resolvedKind !== kind) return null;
 
   const path = resolved.path;
-  let st: ReturnType<typeof statSync> | null = null;
+  let st: Stats | null = null;
   try {
     st = statSync(path);
   } catch {
     st = null;
   }
-  if (!st) {
+  if (!st || !st.isFile()) {
     todoFileCache.delete(path);
-    return existsSync(path) ? parseFile(path, kind) : null;
+    return null;
   }
 
   const cached = todoFileCache.get(path);
-  if (cached && cached.mtimeMs === st.mtimeMs && cached.size === st.size) {
-    return cached.todos;
-  }
+  const sameFile = !!cached && cached.dev === st.dev && cached.ino === st.ino;
+
+  // >32MiB 一律 fail-closed 返 null，绝不返旧 cache——增量路径也一样。冷读越界会全量
+  // 阻塞主线程；增量路径遇「同 inode 被整体覆盖成超大文件」若按 append 续读，既读错
+  // 前缀又可能扫超大 delta。故在选路前先按总大小一刀切，语义一致、最省心。
   if (st.size > MAX_TODO_TRANSCRIPT_BYTES) {
-    return cached?.todos ?? null;
+    todoFileCache.delete(path);
+    return null;
   }
 
-  const todos = parseFile(path, kind);
+  // append-only 增量续读：size 未变→无新行，直接返缓存；size 增长→只扫 [offset,size)。
+  if (sameFile && st.size >= cached!.offset) {
+    if (st.size === cached!.offset) return cached!.todos;
+    return readIncremental(path, st, cached!);
+  }
+
+  // 冷读（首次 / 文件被替换或截断）。
+  return readCold(path, st, kind);
+}
+
+/** 从 offset 增量扫到末尾，把新完整行 fold 进沿用的折叠状态。读失败则丢缓存回退冷读。 */
+function readIncremental(path: string, st: Stats, cached: TodoCacheEntry): OpenTodos | null {
+  let scanError = false;
+  const cursor = scanJsonlFromOffset(path, cached.offset, {
+    endOffset: st.size,
+    onLine: (line) => foldJsonLine(cached.fold, line),
+    onError: () => { scanError = true; },
+  });
+  if (!cursor || scanError) {
+    todoFileCache.delete(path);
+    return readCold(path, st, cached.fold.kind);
+  }
+  cached.dev = st.dev;
+  cached.ino = st.ino;
+  cached.offset = cursor.newOffset;
+  cached.todos = finalizeTodoFold(cached.fold);
+  return cached.todos;
+}
+
+/** 冷读：从头折叠整份文件，建立新的缓存条目（含折叠状态 + 字节前沿）。 */
+function readCold(path: string, st: Stats, kind: 'claude' | 'codex'): OpenTodos | null {
+  const fold = newTodoFoldState(kind);
+  let scanError = false;
+  const cursor = scanJsonlFromOffset(path, 0, {
+    endOffset: st.size,
+    onLine: (line) => foldJsonLine(fold, line),
+    onError: () => { scanError = true; },
+  });
+  if (!cursor || scanError) {
+    todoFileCache.delete(path);
+    return null;
+  }
+  const todos = finalizeTodoFold(fold);
   if (todoFileCache.size >= TODO_CACHE_MAX_ENTRIES && !todoFileCache.has(path)) {
     const oldest = todoFileCache.keys().next().value;
     if (oldest !== undefined) todoFileCache.delete(oldest);
   }
-  todoFileCache.set(path, { mtimeMs: st.mtimeMs, size: st.size, todos });
+  todoFileCache.set(path, { dev: st.dev, ino: st.ino, offset: cursor.newOffset, fold, todos });
   return todos;
 }
 
-function parseFile(path: string, kind: 'claude' | 'codex'): OpenTodos | null {
-  let raw: string;
+/** 解析并折叠单行 JSONL；半写/损坏行跳过（任务态是 advisory）。 */
+function foldJsonLine(fold: TodoFoldState, line: string): void {
+  if (!line.trim()) return;
   try {
-    raw = readFileSync(path, 'utf-8');
+    const parsed = JSON.parse(line);
+    if (parsed && typeof parsed === 'object') foldTodoEntry(fold, parsed);
   } catch {
-    return null;
+    // 跳过半写/损坏行。
   }
-  const entries: any[] = [];
-  for (const line of raw.split('\n')) {
-    if (!line.trim()) continue;
-    try {
-      const parsed = JSON.parse(line);
-      if (parsed && typeof parsed === 'object') entries.push(parsed);
-    } catch {
-      // 跳过半写/损坏行；任务态是 advisory。
-    }
-  }
-  return parseOpenTodos(entries, kind);
 }
