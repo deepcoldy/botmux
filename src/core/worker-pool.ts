@@ -38,6 +38,7 @@ import {
   MOJO_IDENTITY_KEYS,
   pickMojoLivePatch,
   pickMojoSessionIdentity,
+  type EffectiveMojoConfig,
   type MojoConfig,
   type MojoLivePatch,
 } from '../adapters/backend/mojo-types.js';
@@ -2588,6 +2589,76 @@ export function __testOnly_resetRestartCoordinator(): void {
  * false worker-side too), so killing it would violate the bridge invariant of
  * leaving the user's own CLI untouched.
  */
+/**
+ * Build the launch config for cancelling a mojo session's remote lineage, or say
+ * why it must not be attempted.
+ *
+ * Shared by the best-effort killWorker teardown and the awaited explicit-close
+ * path so the two cannot cancel through DIFFERENT configs — the launch identity
+ * and control plane decide which tenant the cancel reaches, so a second copy of
+ * these rules drifting would silently cancel against the wrong endpoint.
+ */
+function resolveMojoCancelLaunch(
+  ds: DaemonSession,
+  remoteId: string,
+  label: string,
+): { ok: true; launchCfg: EffectiveMojoConfig } | { ok: false; reason: 'quarantined' | 'bot_gone' } {
+  let botCfg;
+  try {
+    botCfg = getBot(ds.larkAppId).config;
+  } catch {
+    // Bot deregistered — nothing to cancel WITH. The lineage stays on the row for
+    // manual cleanup; blocking the close forever would be worse, since re-adding
+    // the bot is the only thing that could ever make this succeed.
+    logger.warn(
+      `[${tag(ds)}] ${label}: cannot cancel mojo session ${remoteId} — bot `
+      + `${ds.larkAppId} is deregistered. Lineage retained for manual cleanup.`,
+    );
+    return { ok: false, reason: 'bot_gone' };
+  }
+  // mojo needs no baseUrl gate — the CLI resolves its own endpoint, and an absent
+  // `mojo` config block is a valid setup.
+  //
+  // Build the SAME effective config the worker would (shared helper): a bare
+  // `botCfg.mojo` carries neither the pinned binary (cliPathOverride) nor the
+  // per-bot env holding the JWT, so a bot that ran fine on a custom path/identity
+  // would fail to cancel here — the remote session then keeps burning cloud
+  // sandbox time while still holding injected credentials.
+  //
+  // The launch IDENTITY (binary + wrapper) must come from the values FROZEN on the
+  // session, not from live bot config: the remote session was created through
+  // those, so cancelling through a wrapper the bot gained afterwards can reach the
+  // wrong gateway/tenant. Session cwd is not persisted for a dead worker, so that
+  // one falls back to the bot's configured working dir.
+  const frozenLaunch = frozenSessionLaunchIdentity(ds, botCfg);
+  // freeze:false — teardown must not mutate session state. Cancel has to reach the
+  // endpoint/tenant that CREATED the remote session, so the frozen control plane
+  // matters here as much as the frozen binary.
+  const frozenMojo = sessionMojoConfig(ds, botCfg, { freeze: false });
+  // A quarantined lineage must NOT be cancelled: nothing records which control
+  // plane holds it, so cancelling through the current config could reach a
+  // different tenant. Callers capture `remoteId` BEFORE this call, so clearing the
+  // field would not have stopped it — the explicit state is what makes the refusal
+  // reliable.
+  if (frozenMojo.lineage === 'quarantined') {
+    logger.warn(
+      `[${tag(ds)}] ${label}: NOT cancelling mojo session ${remoteId} — `
+      + 'its control plane is unverifiable (quarantined). It is preserved on the '
+      + 'session for manual cleanup.',
+    );
+    return { ok: false, reason: 'quarantined' };
+  }
+  return {
+    ok: true,
+    launchCfg: buildEffectiveMojoConfig(frozenMojo.config, {
+      cliPathOverride: frozenLaunch.cliPathOverride,
+      workingDir: ds.session.workingDir ?? botCfg.defaultWorkingDir ?? botCfg.workingDir,
+      env: botCfg.env ? sanitizePerBotEnv(botCfg.env) : undefined,
+      wrapperCli: frozenLaunch.wrapperCli,
+    }),
+  };
+}
+
 function destroyOrphanedBackingSession(ds: DaemonSession): void {
   if (ds.initConfig?.adoptMode || ds.adoptedFrom) return;
   reclaimParkedCrashDiagnostic(ds);
@@ -2608,69 +2679,30 @@ function destroyOrphanedBackingSession(ds: DaemonSession): void {
   if (frozenType === 'mojo') {
     // Remote backends persist their lineage in the same field riff uses.
     const remoteId = ds.session.riffParentTaskId;
-    if (remoteId) {
-      try {
-        const botCfg = getBot(ds.larkAppId).config;
-        {
-          // mojo needs no baseUrl gate — the CLI resolves its own endpoint, and
-          // an absent `mojo` config block is a valid setup.
-          //
-          // Build the SAME effective config the worker would (shared helper): a
-          // bare `botCfg.mojo` carries neither the pinned binary
-          // (cliPathOverride) nor the per-bot env holding the JWT, so a bot that
-          // ran fine on a custom path/identity would fail to cancel here — the
-          // remote session then keeps burning cloud sandbox time while still
-          // holding injected credentials.
-          //
-          // The launch IDENTITY (binary + wrapper) must come from the values
-          // FROZEN on the session, not from live bot config: the remote session
-          // was created through those, so cancelling through a wrapper the bot
-          // gained afterwards can reach the wrong gateway/tenant. Session cwd is
-          // not persisted for a dead worker, so that one falls back to the bot's
-          // configured working dir.
-          const frozenLaunch = frozenSessionLaunchIdentity(ds, botCfg);
-          // freeze:false — teardown must not mutate session state. Cancel has to
-          // reach the endpoint/tenant that CREATED the remote session, so the
-          // frozen control plane matters here as much as the frozen binary.
-          const frozenMojo = sessionMojoConfig(ds, botCfg, { freeze: false });
-          // A quarantined lineage must NOT be cancelled: nothing records which
-          // control plane holds it, so cancelling through the current config could
-          // reach a different tenant. Note the caller captured `remoteId` BEFORE
-          // this call, so clearing the field would not have stopped it — the
-          // explicit state is what makes the refusal reliable.
-          if (frozenMojo.lineage === 'quarantined') {
-            logger.warn(
-              `[${tag(ds)}] killWorker: NOT cancelling mojo session ${remoteId} — `
-              + 'its control plane is unverifiable (quarantined). It is preserved on the '
-              + 'session for manual cleanup.',
-            );
-            return;
-          }
-          const launchCfg = buildEffectiveMojoConfig(frozenMojo.config, {
-            cliPathOverride: frozenLaunch.cliPathOverride,
-            workingDir: ds.session.workingDir ?? botCfg.defaultWorkingDir ?? botCfg.workingDir,
-            env: botCfg.env ? sanitizePerBotEnv(botCfg.env) : undefined,
-            wrapperCli: frozenLaunch.wrapperCli,
-          });
-          // Clear the lineage ONLY once the remote session is really gone.
-          // This used to clear unconditionally right after firing, so a failed
-          // cancel erased the only id — the exact leak master's riff change
-          // above calls out (async cancel is unsafe from a sync helper).
-          void cancelMojoSessionById(launchCfg, remoteId).then((ok) => {
-            if (!ok) {
-              logger.warn(
-                `[${tag(ds)}] killWorker: orphan mojo session ${remoteId} NOT cancelled; `
-                + 'retaining the lineage so a later explicit close can retry',
-              );
-              return;
-            }
-            logger.info(`[${tag(ds)}] killWorker: orphan mojo session ${remoteId} cancelled`);
-            ds.session.riffParentTaskId = undefined;
-            sessionStore.updateSession(ds.session);
-          });
-        }
-      } catch { /* bot deregistered — nothing to cancel with */ }
-    }
+    if (!remoteId) return;
+    const resolved = resolveMojoCancelLaunch(ds, remoteId, 'killWorker');
+    if (!resolved.ok) return;
+    // Best-effort ONLY. The authoritative /close path (prepareMojoExplicitClose)
+    // awaits the same cancellation before publishing the closed row; this branch
+    // exists for the killWorker callers that are not an explicit close (crash
+    // retirement, transfer teardown), where there is no result to report to.
+    //
+    // Clear the lineage ONLY once the remote session is really gone. This used to
+    // clear unconditionally right after firing, so a failed cancel erased the only
+    // id — the exact leak master's riff change above calls out.
+    void cancelMojoSessionById(resolved.launchCfg, remoteId).then((ok) => {
+      if (!ok) {
+        logger.warn(
+          `[${tag(ds)}] killWorker: orphan mojo session ${remoteId} NOT cancelled; `
+          + 'retaining the lineage — note nothing retries this automatically, so an '
+          + 'explicit /close (which DOES await the cancel) or manual cleanup is required',
+        );
+        return;
+      }
+      logger.info(`[${tag(ds)}] killWorker: orphan mojo session ${remoteId} cancelled`);
+      ds.session.riffParentTaskId = undefined;
+      sessionStore.updateSession(ds.session);
+    });
     return;
   }
   const backendType = getSessionPersistentBackendType(ds);
@@ -2695,7 +2727,11 @@ type RiffClosePreparation =
         | 'riff_row_inconsistent'
         | 'riff_durable_close_failed'
         | 'riff_close_reconciliation_required'
-        | 'riff_shutdown_fence_in_progress';
+        | 'riff_shutdown_fence_in_progress'
+        // mojo reuses this preparation contract: same problem (a remote,
+        // credential-bearing session that must be proven gone before the row is
+        // published as closed), same retryable-failure shape.
+        | 'mojo_cancel_failed';
       retryable: true;
       taskId?: string;
     };
@@ -2980,6 +3016,66 @@ async function prepareRiffExplicitClose(
 
   logger.info(`[${closeLabel}] Riff task ${cleanup.taskId} cancellation prepared for explicit close`);
   return { ok: true, taskId: cleanup.taskId };
+}
+
+/**
+ * Prove a workerless mojo session's remote lineage is cancelled BEFORE its row is
+ * published as closed — the mojo half of what prepareRiffExplicitClose does.
+ *
+ * Without this, `/close` on a workerless mojo session marked the row closed and
+ * returned success while the cancel was still in flight, so a failed cancel left
+ * the operator believing the session was gone while the remote one kept running
+ * and holding the injected credential. The retained lineage was not a recovery
+ * path either: cancelMojoSessionById has exactly one call site (the best-effort
+ * killWorker teardown), which a second `/close` can no longer reach because the
+ * first close removed the session from the active registry.
+ *
+ * Only the WORKERLESS case is handled here. With a live worker the `close` IPC
+ * makes the worker run MojoBackend.destroySession(), which already awaits the
+ * cancel on its own side (and waits out the pre-init window, which the daemon
+ * cannot observe).
+ *
+ * Not handled: a session with an open durable row but no entry in the active
+ * registry. Every helper the cancel needs (frozen identity, launch identity) is
+ * keyed on DaemonSession, and that case has no cancel path today either — it is
+ * called out rather than silently widened here.
+ */
+async function prepareMojoExplicitClose(
+  ds: DaemonSession | undefined,
+  stored: Session | undefined,
+): Promise<RiffClosePreparation> {
+  const session = ds?.session ?? stored;
+  if (!session || !ds) return { ok: true };
+  if (ds.initConfig?.adoptMode || ds.adoptedFrom || session.adoptedFrom) return { ok: true };
+  // A live worker cancels remote-side itself on the `close` IPC.
+  if (ds.worker && !ds.worker.killed) return { ok: true };
+  const remoteId = session.riffParentTaskId;
+  if (!remoteId) return { ok: true };
+
+  const resolved = resolveMojoCancelLaunch(ds, remoteId, 'explicit close');
+  if (!resolved.ok) {
+    // Quarantined or bot-gone: cancelling is either unsafe or impossible, and no
+    // retry could ever change that. Proceed with the close and KEEP the lineage on
+    // the row so the remote session can still be cleaned up by hand — both cases
+    // already logged why.
+    return { ok: true };
+  }
+
+  const cancelled = await cancelMojoSessionById(resolved.launchCfg, remoteId);
+  if (!cancelled) {
+    logger.warn(
+      `[${tag(ds)}] explicit close refused: mojo session ${remoteId} could not be `
+      + 'cancelled; the row stays open and the lineage is retained so the close is retryable',
+    );
+    return { ok: false, error: 'mojo_cancel_failed', retryable: true, taskId: remoteId };
+  }
+  // Drop the runtime lineage now that the remote session is really gone. This also
+  // makes the best-effort killWorker teardown a no-op later in this same close, so
+  // the cancel cannot be fired twice; the durable row is cleared in the same
+  // transaction as the status change (clearRiffParentTaskId).
+  ds.session.riffParentTaskId = undefined;
+  logger.info(`[${tag(ds)}] mojo session ${remoteId} cancelled for explicit close`);
+  return { ok: true, taskId: remoteId };
 }
 
 /**
@@ -3325,10 +3421,13 @@ export async function closeSession(
   if (teardownTarget) {
     teardownAuthoritativePersistentBackingBeforeCloseImpl(teardownTarget, true);
   }
-  const isOwnedRiffClose = !ds?.initConfig?.adoptMode
+  const closeFrozenBackendType = ds?.initConfig?.backendType
+    ?? ds?.session.backendType ?? stored?.backendType;
+  const isOwnedClose = !ds?.initConfig?.adoptMode
     && !ds?.adoptedFrom
-    && !stored?.adoptedFrom
-    && (ds?.initConfig?.backendType ?? ds?.session.backendType ?? stored?.backendType) === 'riff';
+    && !stored?.adoptedFrom;
+  const isOwnedRiffClose = isOwnedClose && closeFrozenBackendType === 'riff';
+  const isOwnedMojoClose = isOwnedClose && closeFrozenBackendType === 'mojo';
   let killedLive = false;
   const hadLiveWorker = !!ds?.worker && !ds.worker.killed;
   const closeWorkerGeneration = ds ? closeFenceGeneration(ds) : undefined;
@@ -3345,15 +3444,22 @@ export async function closeSession(
     recordUsageForDaemonSession(ds);
   }
 
-  // Riff owns a remote credential-bearing process. Prove cancellation before
-  // mutating routing, transient capabilities, or the durable row. Non-Riff
-  // closes retain master's synchronous state-transition path.
+  // Riff and mojo both own a remote, credential-bearing session. Prove
+  // cancellation before mutating routing, transient capabilities, or the durable
+  // row — publishing "closed" while the cancel is still in flight is how a failed
+  // cancel became a silent leak. Other backends retain master's synchronous
+  // state-transition path.
   const prepared: RiffClosePreparation = isOwnedRiffClose
     ? await prepareRiffExplicitClose(ds, stored)
-    : { ok: true };
+    : isOwnedMojoClose
+      ? await prepareMojoExplicitClose(ds, stored)
+      : { ok: true };
   if (!prepared.ok) {
     return { ...prepared, alreadyClosed: false };
   }
+  // Only when the cancel actually happened: a quarantined / bot-gone mojo session
+  // keeps its lineage on the row for manual cleanup.
+  const clearMojoLineage = isOwnedMojoClose && !!prepared.taskId;
   const preparedRiffRequestId = ds?.riffCloseState?.phase === 'prepared'
     ? ds.riffCloseState.requestId
     : undefined;
@@ -3378,7 +3484,7 @@ export async function closeSession(
     try {
       sessionStore.closeSession(sessionId, {
         cleanupBridgeMarkers: !hadLiveWorker,
-        ...(isOwnedRiffClose ? { clearRiffParentTaskId: true } : {}),
+        ...(isOwnedRiffClose || clearMojoLineage ? { clearRiffParentTaskId: true } : {}),
       });
     } catch (err) {
       if (!isOwnedRiffClose) throw err;
