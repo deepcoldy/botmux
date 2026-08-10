@@ -1408,17 +1408,27 @@ export function BotAgentSection(props: {
         const residualCount = Number.isInteger(res.body.closedMismatchedResidual)
           ? res.body.closedMismatchedResidual as number
           : 0;
-        const closedText = closedCount > 0
-          ? tr('botDefaults.agentClosedCount', { count: closedCount })
-            // Some of those closes left a remote session running; saying only
-            // "closed N" would report them as fully torn down.
-            + (residualCount > 0
-              ? `（⚠️ ${residualCount} 个远端会话未取消，需人工清理）`
-              : '')
-          : '';
+        const failedCount = Number.isInteger(res.body.closedMismatchedFailed)
+          ? res.body.closedMismatchedFailed as number
+          : 0;
+        // Localised, not hardcoded: this component is already tr()-driven, so a
+        // raw Chinese string would reach an English dashboard.
+        const notes = [
+          closedCount > 0 ? tr('botDefaults.agentClosedCount', { count: closedCount }) : '',
+          // Closed, but their remote sessions are still running.
+          residualCount > 0 ? tr('botDefaults.agentClosedResidual', { count: residualCount }) : '',
+          // Not closed at all — the rows are still active.
+          failedCount > 0 ? tr('botDefaults.agentCloseFailed', { count: failedCount }) : '',
+        ].filter(Boolean);
+        const closedText = notes.join(' · ');
+        const hadProblem = residualCount > 0 || failedCount > 0;
         setAgentStatus(res.body.availabilityWarning
           ? { text: `⚠️ ${res.body.availabilityWarning}${closedText ? ` · ${closedText}` : ''}` }
-          : { text: `✓ ${closedText || tr('botDefaults.agentSaved')}`, ok: true });
+          : hadProblem
+            // Never the green tick when a session is still active or a remote
+            // session survived: that is what made this invisible.
+            ? { text: `⚠️ ${closedText}` }
+            : { text: `✓ ${closedText || tr('botDefaults.agentSaved')}`, ok: true });
         patchBot(bot.larkAppId, {
           cliId: res.body.cliId,
           cliRuntime: res.body.cliRuntime === undefined

@@ -293,6 +293,8 @@ type CliMismatchCloseResult =
   | 'closed'
   /** Closed, but its remote session survived and needs manual cleanup. */
   | 'closed_with_residual'
+  /** closeSession REFUSED (e.g. remote cancellation unproven). Row stays active. */
+  | 'close_failed'
   | 'teardown_failed'
   | 'transfer_deferred';
 
@@ -373,7 +375,18 @@ async function closeActiveSessionIfCliMismatch(ds: DaemonSession): Promise<CliMi
     logger.warn(`[${tag}] CLI mismatch (session=${mismatch.sessionCli}, bot=${mismatch.botCli}), closing active session`);
   }
   const result = await closeSession(ds.session.sessionId);
-  if (result.ok && result.outcome === 'closed_with_residual') {
+  if (!result.ok) {
+    // closeSession models a refused close as a RETURNED {ok:false}, not a throw.
+    // Falling through to 'closed' here counted a still-active row (whose remote
+    // session may still be running) as torn down, and the caller then reported a
+    // green "closed N". The row and its registry owner are deliberately left
+    // intact by closeSession, so the sweep just reports the failure.
+    logger.error(
+      `[${tag}] CLI mismatch close REFUSED (${result.error}); row stays active`,
+    );
+    return 'close_failed';
+  }
+  if (result.outcome === 'closed_with_residual') {
     // A hot CLI/backend switch can hit an old mojo row carrying a parked lineage.
     // This path has no interactive surface, so the warning has to be loud in the
     // log AND counted separately for whatever is showing the sweep total.
@@ -398,11 +411,12 @@ async function closeActiveSessionIfCliMismatch(ds: DaemonSession): Promise<CliMi
  */
 export async function closeCliMismatchedSessionsForBot(
   larkAppId: string,
-): Promise<{ closed: number; residual: number }> {
+): Promise<{ closed: number; residual: number; failed: number }> {
   const registry = getActiveSessionsRegistry();
-  if (!registry) return { closed: 0, residual: 0 };
+  if (!registry) return { closed: 0, residual: 0, failed: 0 };
   let closed = 0;
   let residual = 0;
+  let failed = 0;
   // 先快照再遍历：closeSession 会在迭代途中从 registry 删项。
   for (const ds of [...registry.values()]) {
     if (ds.larkAppId !== larkAppId) continue;
@@ -420,15 +434,19 @@ export async function closeCliMismatchedSessionsForBot(
       const result = await closeActiveSessionIfCliMismatch(ds);
       if (result === 'closed') closed++;
       else if (result === 'closed_with_residual') { closed++; residual++; }
+      else if (result === 'close_failed' || result === 'teardown_failed') failed++;
       else if (result === 'transfer_deferred') armCliMismatchResweep(ds);
     } catch (err) {
+      // A thrown close is a failure too — count it, or the caller reports a clean
+      // sweep while this row is still active.
+      failed++;
       logger.error(
         `[${ds.session.sessionId.substring(0, 8)}] CLI mismatch close failed; continuing sweep: `
         + `${err instanceof Error ? err.message : String(err)}`,
       );
     }
   }
-  return { closed, residual };
+  return { closed, residual, failed };
 }
 
 /**

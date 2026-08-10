@@ -3987,6 +3987,7 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
       // sessions behind a plain "closed N".
       closedMismatchedSessions: closedMismatchedSessions.closed,
       closedMismatchedResidual: closedMismatchedSessions.residual,
+      closedMismatchedFailed: closedMismatchedSessions.failed,
       // Report the (possibly auto-cleared) read-isolation state + whether the new
       // agent can still enforce it, so the dashboard updates its toggle immediately
       // instead of showing a stale enabled/supported state until a full refetch.

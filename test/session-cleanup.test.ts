@@ -152,7 +152,10 @@ describe('dashboard idle session cleanup selection', () => {
     // An idle/workerless mojo row can carry a parked lineage, so this path really
     // does produce residuals. Folding them into `closed` reports "closed N,
     // failed 0" while remote sessions keep running with their credential.
-    const rows = [row('a', NOW - 30 * hour), row('b', NOW - 40 * hour)];
+    const rows = [
+      row('a', { lastMessageAt: NOW - 30 * hour }),
+      row('b', { lastMessageAt: NOW - 40 * hour }),
+    ];
     const result = cleanupIdleSessions(rows, 24, async candidate => (
       candidate.sessionId === 'a'
         ? { sessionId: 'a', ok: true }

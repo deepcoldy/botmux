@@ -939,6 +939,31 @@ describe('closeCliMismatchedSessionsForBot — runtime CLI hot-switch sweep', ()
       .toMatchObject({ closed: 1, residual: 1 });
   });
 
+  it('does NOT count a refused close as closed, and keeps the row + owner', async () => {
+    // closeSession models a refused close as a RETURNED {ok:false}, not a throw.
+    // Counting it as `closed` reported a green "closed N" for a row that is still
+    // active — and whose remote session may still be running.
+    const s = makeActivePersistentSession('om_rt_refused');
+    s.wrapperCli = 'aiden x claude';
+    s.agentFrozen = true;
+    sessionStore.updateSession(s);
+    const ds = registerDs(s);
+    vi.mocked(closeSession).mockResolvedValueOnce({
+      ok: false,
+      alreadyClosed: false,
+      error: 'mojo_cancel_failed',
+      retryable: true,
+      taskId: 'mojo-sid-123',
+    } as never);
+
+    expect(await closeCliMismatchedSessionsForBot('app_test'))
+      .toMatchObject({ closed: 0, residual: 0, failed: 1 });
+    // The row stays active and keeps its owner so the close can be retried.
+    expect(sessionStore.getSession(s.sessionId)!.status).toBe('active');
+    expect(wp.registry?.size ?? 0).toBeGreaterThan(0);
+    void ds;
+  });
+
   it('closes runtime identity mismatches and describes both distributions in the warning', async () => {
     bot.cliId = 'codex';
     bot.cliRuntime = {
