@@ -9,6 +9,7 @@ import {
 } from '../src/core/dashboard-ipc-server.js';
 import { daemonIpcAuthHeaders } from '../src/core/daemon-ipc-auth.js';
 import * as workerPool from '../src/core/worker-pool.js';
+import * as sessionStore from '../src/services/session-store.js';
 
 const CAP = 'c0ffee12'.repeat(8);
 const HOST_SECRET = 'test-ipc-close-host-secret';
@@ -98,7 +99,7 @@ describe('POST /api/sessions/:sessionId/close', () => {
   it('does not reveal whether an unproven target session exists', async () => {
     vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue(undefined);
     const closeSpy = vi.spyOn(workerPool, 'closeSession')
-      .mockResolvedValue({ ok: true, alreadyClosed: true });
+      .mockResolvedValue({ ok: true, outcome: 'closed', alreadyClosed: true });
 
     const res = await postClose('missing', { authRequired: true });
 
@@ -110,7 +111,7 @@ describe('POST /api/sessions/:sessionId/close', () => {
   it('keeps trusted-host close idempotent for an already missing session', async () => {
     vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue(undefined);
     const closeSpy = vi.spyOn(workerPool, 'closeSession')
-      .mockResolvedValue({ ok: true, alreadyClosed: true });
+      .mockResolvedValue({ ok: true, outcome: 'closed', alreadyClosed: true });
 
     const res = await postClose('missing', {
       auth: 'signed',
@@ -118,8 +119,40 @@ describe('POST /api/sessions/:sessionId/close', () => {
     });
 
     expect(res.status).toBe(200);
-    expect(await res.json()).toEqual({ ok: true, alreadyClosed: true });
+    expect(await res.json()).toEqual({ ok: true, outcome: 'closed', alreadyClosed: true });
     expect(closeSpy).toHaveBeenCalledWith('missing');
+  });
+
+  it('replays the residual for an already-closed row instead of a bare success', async () => {
+    // The closed-row fast path short-circuits before closeSession(). A closed row
+    // can still carry an UNCANCELLED remote session (a quarantined lineage is
+    // parked, not cancelled), so a client that lost the first response — or simply
+    // retries — must still learn about it.
+    vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue(undefined);
+    // A CLOSED durable row still carrying a parked (uncancelled) lineage.
+    vi.spyOn(sessionStore, 'getSession').mockReturnValue({
+      sessionId: 's-closed-residual',
+      status: 'closed',
+      backendType: 'mojo',
+      larkAppId: 'app-residual',
+      mojoQuarantinedLineage: 'mojo-parked-9',
+    } as never);
+    const closeSpy = vi.spyOn(workerPool, 'closeSession');
+
+    const res = await postClose('s-closed-residual', {
+      auth: 'signed',
+      authRequired: true,
+    });
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({
+      ok: true,
+      outcome: 'closed_with_residual',
+      residual: { reason: 'mojo_lineage_quarantined', taskId: 'mojo-parked-9' },
+      alreadyClosed: true,
+    });
+    // Fast path: the authoritative close is not re-run for an already-closed row.
+    expect(closeSpy).not.toHaveBeenCalled();
   });
 
   it('denies receiver-session self-close through the ordinary capability aperture', async () => {

@@ -410,6 +410,72 @@ describe('closeSession()', () => {
     });
   });
 
+  it('parks an uncancellable mojo lineage in the same transaction as the close', () => {
+    const session = createSession('chat1', 'root1', 'Close Mojo Park');
+    session.backendType = 'mojo';
+    session.riffParentTaskId = 'mojo-sid-1';
+    updateSession(session);
+
+    closeSession(session.sessionId, {
+      parkMojoLineage: 'mojo-sid-1',
+      clearRiffParentTaskId: true,
+    });
+
+    expect(getSession(session.sessionId)).toMatchObject({
+      status: 'closed',
+      mojoQuarantinedLineage: 'mojo-sid-1',
+      mojoQuarantineNoticePending: true,
+    });
+    // The active slot is cleared in the same write; the parked slot is the handle.
+    expect(getSession(session.sessionId)?.riffParentTaskId).toBeUndefined();
+  });
+
+  it('keeps BOTH ids when a different lineage was already parked', () => {
+    // Each id is the only handle left for manual cleanup of its own remote
+    // session, so the second must not overwrite the first.
+    const session = createSession('chat1', 'root1', 'Close Mojo Park Merge');
+    session.backendType = 'mojo';
+    session.mojoQuarantinedLineage = 'mojo-old';
+    session.riffParentTaskId = 'mojo-new';
+    updateSession(session);
+
+    closeSession(session.sessionId, {
+      parkMojoLineage: 'mojo-new',
+      clearRiffParentTaskId: true,
+    });
+
+    expect(getSession(session.sessionId)?.mojoQuarantinedLineage).toBe('mojo-old,mojo-new');
+  });
+
+  it('restores the mojo park fields when the atomic save fails', () => {
+    // The rollback is the whole point of doing the park inside this transaction:
+    // a FAILED close must not leave the row parked, or the next turn treats a
+    // still-live remote session as quarantined and silently starts a new one.
+    const session = createSession('chat1', 'root1', 'Close Mojo Save Failure');
+    session.backendType = 'mojo';
+    session.riffParentTaskId = 'mojo-sid-retry';
+    updateSession(session);
+    fsControl.failSessionWrite = true;
+
+    expect(() => closeSession(
+      session.sessionId,
+      { parkMojoLineage: 'mojo-sid-retry', clearRiffParentTaskId: true },
+    )).toThrow(/simulated session repair write failure/);
+
+    const inMemory = getSession(session.sessionId);
+    expect(inMemory).toMatchObject({ status: 'active', riffParentTaskId: 'mojo-sid-retry' });
+    expect(inMemory?.mojoQuarantinedLineage).toBeUndefined();
+    expect(inMemory?.mojoQuarantineNoticePending).toBeUndefined();
+
+    // ...and the same must be true of what is actually on disk.
+    fsControl.failSessionWrite = false;
+    init();
+    const reloaded = getSession(session.sessionId);
+    expect(reloaded).toMatchObject({ status: 'active', riffParentTaskId: 'mojo-sid-retry' });
+    expect(reloaded?.mojoQuarantinedLineage).toBeUndefined();
+    expect(reloaded?.mojoQuarantineNoticePending).toBeUndefined();
+  });
+
   it('should call deleteFrozenCards with the sessionId', () => {
     const session = createSession('chat1', 'root1', 'Frozen');
     closeSession(session.sessionId);
