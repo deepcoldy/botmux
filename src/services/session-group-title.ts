@@ -16,7 +16,7 @@ import { tmpdir } from 'node:os';
 import { getBot } from '../bot-registry.js';
 import { redactChildEnv } from '../utils/child-env.js';
 import { sanitizePerBotEnv } from '../core/per-bot-env.js';
-import { updateChatName } from './groups-store.js';
+import { renameChat } from './groups-store.js';
 import { getSessionGroup, markSessionGroupTitled, touchSessionGroup } from './session-groups-store.js';
 import * as sessionStore from './session-store.js';
 import { updateSessionTitle } from '../core/session-title.js';
@@ -204,9 +204,11 @@ export function scheduleSessionGroupTitle(opts: {
       }
       const prefix = sg.namePrefix ?? '';
       const finalName = `${prefix}${title}`;
-      const r = await updateChatName(larkAppId, chatId, finalName);
+      // Reuse the shared renameChat wrapper (membership precheck + error
+      // classification) instead of a bespoke chat.update call.
+      const r = await renameChat(larkAppId, chatId, finalName);
       if (!r.ok) {
-        logger.warn(`[session-group] rename chat=${chatId.substring(0, 12)} failed: ${r.error}`);
+        logger.warn(`[session-group] rename chat=${chatId.substring(0, 12)} failed: ${r.error}${r.detail ? ` (${r.detail})` : ''}`);
         return;
       }
       markSessionGroupTitled(chatId);

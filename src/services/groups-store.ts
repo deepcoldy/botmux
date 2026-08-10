@@ -267,33 +267,6 @@ export async function deleteChat(
 }
 
 /**
- * Rename a chat. Used by the session-group flow (p2pMode='group') to apply
- * the async AI-generated title onto the group's placeholder name — the bot
- * keeps ownership of session groups precisely so this call stays permitted.
- *
- * Calls /open-apis/im/v1/chats/:chat_id with `name` in the body.
- */
-export async function updateChatName(
-  larkAppId: string,
-  chatId: string,
-  name: string,
-): Promise<{ ok: true } | { ok: false; error: string }> {
-  const client = getBotClient(larkAppId);
-  try {
-    const res: any = await (client as any).im.v1.chat.update({
-      path: { chat_id: chatId },
-      data: { name },
-    });
-    if (res.code !== 0 && res.code !== undefined) {
-      return { ok: false, error: `${res.msg ?? 'unknown'} (code: ${res.code})` };
-    }
-    return { ok: true };
-  } catch (e: any) {
-    return { ok: false, error: e?.message ?? String(e) };
-  }
-}
-
-/**
  * Fetch the current owner of a chat (open_id by default, optionally union_id).
  * Used by group-creator to
  * verify the post-transfer state when transferChatOwner returns an error —
