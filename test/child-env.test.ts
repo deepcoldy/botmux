@@ -13,6 +13,7 @@ import {
   WORKFLOW_WORKER_ENV_KEYS,
 } from '../src/utils/child-env.js';
 import { PM2_GRACEFUL_EXIT_CODE_ENV } from '../src/pm2-graceful-exit.js';
+import { GOAL_ENV } from '../src/workflows/v3/contract.js';
 
 describe('applySessionOwnerEnv()', () => {
   it('injects both the public contract and legacy owner names', () => {
@@ -225,6 +226,12 @@ describe('scrubWorkflowWorkerEnv()', () => {
     expect(env.BOTMUX_WORKFLOW_RUNS_DIR).toBe('/shared/workflow-runs');
     expect(env.KEEP).toBe('v');
   });
+
+  it('covers the canonical goal contract without drifting', () => {
+    for (const key of Object.values(GOAL_ENV)) {
+      expect(WORKFLOW_WORKER_ENV_KEYS).toContain(key);
+    }
+  });
 });
 
 describe('session CLI home scrub call sites', () => {
@@ -269,11 +276,16 @@ describe('session CLI home scrub call sites', () => {
     expect(worker).toContain('applySessionOwnerEnv(mergedEnv, cfg.ownerOpenId)');
   });
 
-  it('pm2 and daemon boot scrub workflow-worker identity without scrubbing real worker boot', () => {
+  it('pm2, daemon, and dashboard boot scrub workflow identity without scrubbing real worker boot', () => {
     const cli = read('cli.ts');
     const fn = cli.slice(cli.indexOf('function pm2Env('));
     expect(fn.slice(0, fn.indexOf('\n}'))).toContain('scrubWorkflowWorkerEnv(');
     expect(read('index-daemon.ts')).toContain('scrubWorkflowWorkerEnv(process.env)');
+    const dashboard = read('dashboard.ts');
+    const scrubAt = dashboard.indexOf('scrubWorkflowWorkerEnv(process.env)');
+    expect(scrubAt).toBeGreaterThan(-1);
+    expect(scrubAt).toBeLessThan(dashboard.indexOf('function spawnStartBotLive('));
+    expect(scrubAt).toBeLessThan(dashboard.indexOf('function spawnStopBotLive('));
     expect(read('worker.ts')).not.toContain('scrubWorkflowWorkerEnv(process.env)');
   });
 
