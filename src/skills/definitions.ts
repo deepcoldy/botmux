@@ -1052,6 +1052,12 @@ botmux ask buttons --options "yes=继续,no=停止" "继续吗？"
 
 兼容 alias：\`botmux ask --options "yes,no" "继续吗？"\` 可以用，但文档和新脚本优先写 \`botmux ask buttons\`，给未来 \`ask text\` / \`ask confirm\` 留空间。
 
+多选加 \`--multi\`，stdout 返回逗号分隔的 key；需要完整结构时加 \`--json\` 读取 \`answers[0]\`：
+
+\`\`\`bash
+choices=$(botmux ask buttons --multi --options "lint=Lint,test=测试,build=构建" "要执行哪些检查？")
+\`\`\`
+
 ## JSON 输出
 
 \`\`\`bash
@@ -1062,12 +1068,13 @@ stdout 为一行 JSON。注意：\`--json\` 覆盖所有结果类型；超时 / 
 同时保留非 0 exit code。脚本判断超时必须看 exit code 或 \`timedOut\` 字段。
 
 \`\`\`json
-{"selected":"yes","by":"ou_xxx","timedOut":false,"comment":null}
+{"selected":"yes","answers":[["yes"]],"by":"ou_xxx","timedOut":false,"comment":null}
 \`\`\`
 
 ## 退出码和 stdout 契约
 
 - 成功：stdout 一行 \`<selected_key>\`，exit 0
+- \`--multi\` 成功：stdout 一行逗号分隔的 \`<selected_key>\`，exit 0
 - \`--json\`：stdout 一行 JSON（包括超时 / 失效），exit code 仍按结果返回
 - 超时：默认模式 stdout 为空，exit 124；\`--json\` 时 \`{"selected":null,"timedOut":true,...}\`
 - 缺少 botmux 环境变量 / 参数错误：stdout 为空，exit 2
@@ -1079,7 +1086,7 @@ stdout 为一行 JSON。注意：\`--json\` 覆盖所有结果类型；超时 / 
 
 - \`--options\` 必填，至少 2 项，逗号分隔
 - 推荐 \`key=label\`，key 用稳定英文短词，label 给用户看
-- 不支持 comment / multi-select / free-form text（v0.1.7 范围外）
+- \`--multi\` 开启多选；\`--json\` 的 \`answers[0]\` 保留完整 key 数组
 - 默认超时 300 秒，可用 \`--timeout <seconds>\` 调整
 `;
 

@@ -22,11 +22,14 @@ afterEach(() => {
   }
 });
 
-function runAsk(dataDir: string): Promise<{ status: number | null; stdout: string; stderr: string }> {
+function runAsk(
+  dataDir: string,
+  args = ['ask', 'buttons', '--options', 'yes,no', '请作答'],
+): Promise<{ status: number | null; stdout: string; stderr: string }> {
   return new Promise((resolve, reject) => {
     const child = spawn(
       process.execPath,
-      ['--import', 'tsx', CLI_PATH, 'ask', 'buttons', '--options', 'yes,no', '请作答'],
+      ['--import', 'tsx', CLI_PATH, ...args],
       {
         env: {
           ...process.env,
@@ -52,6 +55,55 @@ function runAsk(dataDir: string): Promise<{ status: number | null; stdout: strin
 }
 
 describe('botmux ask — CLI boundary', () => {
+  it('--multi 发送多选问题并输出逗号分隔的 keys', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-ask-cli-'));
+    tempDirs.push(dataDir);
+    let requestBody: Record<string, unknown> | undefined;
+
+    const server = createServer(async (req, res) => {
+      let body = '';
+      for await (const chunk of req) body += chunk;
+      requestBody = JSON.parse(body) as Record<string, unknown>;
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({
+        kind: 'answered',
+        answers: [['a', 'c']],
+        by: 'ou_test',
+        comment: null,
+        timedOut: false,
+      }));
+    });
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+
+    try {
+      const port = (server.address() as AddressInfo).port;
+      const registryDir = join(dataDir, 'dashboard-daemons');
+      mkdirSync(registryDir, { recursive: true });
+      writeFileSync(
+        join(registryDir, 'cli_test.json'),
+        JSON.stringify({ larkAppId: 'cli_test', ipcPort: port, lastHeartbeat: Date.now() }),
+      );
+
+      const result = await runAsk(dataDir, [
+        'ask', 'buttons', '--multi', '--options', 'a=A,b=B,c=C', '请选择',
+      ]);
+      expect(result).toMatchObject({ status: 0, stdout: 'a,c\n', stderr: '' });
+      expect(requestBody?.questions).toEqual([{
+        prompt: '请选择',
+        multiSelect: true,
+        options: [
+          { key: 'a', label: 'A' },
+          { key: 'b', label: 'B' },
+          { key: 'c', label: 'C' },
+        ],
+      }]);
+    } finally {
+      await new Promise<void>((resolve, reject) => {
+        server.close((err) => err ? reject(err) : resolve());
+      });
+    }
+  });
+
   it('文字作答保持空 stdout / exit 0，并在 stderr 指明用 --json 读取 comment', async () => {
     const dataDir = mkdtempSync(join(tmpdir(), 'botmux-ask-cli-'));
     tempDirs.push(dataDir);
