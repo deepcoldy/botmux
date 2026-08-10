@@ -1331,7 +1331,9 @@ describe('closeCliMismatchedSessionsForBot — runtime CLI hot-switch sweep', ()
       // only the registry let the config commit through while that row stayed
       // frozen on the old agent — the very mismatch this transaction prevents.
       const durableOnly = makeActivePersistentSession('om_sw_durable_only');
-      // Explicit: the fixture inherits bot.cliId, which other tests mutate.
+      // Pin the old-agent premise in the test itself rather than relying on the
+      // shared fixture default (beforeEach does reset bot.cliId; this is about not
+      // depending on that, so a later setup change cannot quietly un-mismatch it).
       durableOnly.cliId = 'claude-code';
       sessionStore.updateSession(durableOnly);
       // Deliberately NOT registerDs(...): it exists only in the store.
