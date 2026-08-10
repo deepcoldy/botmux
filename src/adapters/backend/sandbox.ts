@@ -367,7 +367,16 @@ export function coreOnlyPidNamespaceDegrade(): boolean {
  */
 export function localSandboxApplies(
   backendType: string,
-  remoteExecution?: { cloud?: boolean; localDaemon?: boolean; wrapperCli?: string },
+  // `jwtEnv` / `env` are part of the proof: the launcher env decides which binary
+  // the next turn actually executes (see mojoUnprovableEnvKeys). A narrower type
+  // here silently DROPPED a caller's env and re-opened the bypass.
+  remoteExecution?: {
+    cloud?: boolean;
+    localDaemon?: boolean;
+    wrapperCli?: string;
+    jwtEnv?: string;
+    env?: Record<string, string>;
+  },
 ): boolean {
   if (backendType === 'riff') return false;
   if (backendType === 'mojo') {

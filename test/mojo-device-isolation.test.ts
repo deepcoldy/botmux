@@ -8,13 +8,21 @@
  *
  * Run:  pnpm vitest run test/mojo-device-isolation.test.ts
  */
-import { describe, expect, it, vi } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('../src/utils/logger.js', () => ({
   logger: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() },
 }));
+// Controllable: the classifier now also reads the LIVE launcher env for a frozen
+// session (env is deliberately not frozen, since the JWT must stay rotatable), so a
+// permanently-throwing getBot would make every frozen case fail closed and hide
+// what these tests are actually about.
+let liveBotConfig: Record<string, unknown> | undefined = {};
 vi.mock('../src/bot-registry.js', () => ({
-  getBot: () => { throw new Error('bot deregistered'); },
+  getBot: () => {
+    if (!liveBotConfig) throw new Error('bot deregistered');
+    return { config: liveBotConfig };
+  },
 }));
 
 import { resolveRemoteExecutionProven } from '../src/core/device-isolation-daemon.js';
@@ -45,6 +53,8 @@ function ds(opts: {
   } as never;
 }
 
+beforeEach(() => { liveBotConfig = {}; });
+
 describe('resolveRemoteExecutionProven', () => {
   it('riff is always remote', () => {
     expect(resolveRemoteExecutionProven(ds({ backendType: 'riff' }))).toBe(true);
@@ -57,6 +67,29 @@ describe('resolveRemoteExecutionProven', () => {
   it('a cloud mojo session with no wrapper is remote', () => {
     expect(resolveRemoteExecutionProven(ds({ backendConfig: { cloud: true } }))).toBe(true);
     expect(resolveRemoteExecutionProven(ds({ mojoIdentity: { cloud: true } }))).toBe(true);
+  });
+
+  it('a frozen cloud session is NOT remote once the LIVE launcher env can redirect it', () => {
+    // The cold-refork attack, at the layer review said mislabels it `safe_remote`:
+    // `env` is not part of the frozen identity, so it is re-merged from live bot
+    // config on refork. A redirected PATH must void the proof here too, or device
+    // credentials get activated around a local child running unknown code.
+    liveBotConfig = { mojo: { env: { PATH: '/tmp/fake-mojo' } } };
+    expect(resolveRemoteExecutionProven(ds({ mojoIdentity: { cloud: true } }))).toBe(false);
+
+    // Same through the TOP-LEVEL per-bot env, which lands in the same child env.
+    liveBotConfig = { env: { LD_PRELOAD: '/tmp/x.so' } };
+    expect(resolveRemoteExecutionProven(ds({ mojoIdentity: { cloud: true } }))).toBe(false);
+
+    // The credential variable alone stays provable.
+    liveBotConfig = { mojo: { jwtEnv: 'MY_JWT', env: { MY_JWT: 'tok' } } };
+    expect(resolveRemoteExecutionProven(ds({ mojoIdentity: { cloud: true } }))).toBe(true);
+  });
+
+  it('a frozen session whose bot is gone fails closed', () => {
+    // No way to read the launcher env, so nothing can be proven.
+    liveBotConfig = undefined;
+    expect(resolveRemoteExecutionProven(ds({ mojoIdentity: { cloud: true } }))).toBe(false);
   });
 
   it('a WRAPPED cloud session is NOT remote — from initConfig', () => {

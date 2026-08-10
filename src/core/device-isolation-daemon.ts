@@ -181,12 +181,31 @@ export function resolveRemoteExecutionProven(ds: DaemonSession): boolean {
   // (`env AGENT_LOCAL_DAEMON=1 mojo`), which is exactly what voids the proof.
   // Without this, a wrapped session was still classified safe_remote here even
   // after the worker's own sandbox gate had been fixed.
+  //
+  // The launcher ENV has to be folded in for the same reason, and it cannot come
+  // from the frozen identity: env is deliberately live (a rotated JWT must apply
+  // without a refork), so MOJO_IDENTITY_KEYS excludes it. Reading it live is not a
+  // weakness here — it is precisely the live value that decides what the next turn
+  // executes, and that is what the proof has to cover.
   const wrapperCli = ds.initConfig?.wrapperCli ?? ds.session.wrapperCli;
   const fromInit = ds.initConfig?.backendConfig as
-    { cloud?: boolean; localDaemon?: boolean } | undefined;
+    { cloud?: boolean; localDaemon?: boolean; jwtEnv?: string; env?: Record<string, string> }
+    | undefined;
   if (fromInit) return isMojoFullyRemote({ ...fromInit, wrapperCli });
   if (ds.session.mojoIdentity) {
-    return isMojoFullyRemote({ ...ds.session.mojoIdentity, wrapperCli });
+    // initConfig is absent (worker-less / not yet forked), so the launcher env can
+    // only come from live bot config. A missing bot means no proof at all.
+    let liveLauncher: { jwtEnv?: string; env?: Record<string, string> } = {};
+    try {
+      const cfg = getBot(ds.larkAppId).config;
+      liveLauncher = {
+        jwtEnv: cfg.mojo?.jwtEnv,
+        env: { ...(cfg.env ?? {}), ...(cfg.mojo?.env ?? {}) },
+      };
+    } catch {
+      return false;
+    }
+    return isMojoFullyRemote({ ...ds.session.mojoIdentity, ...liveLauncher, wrapperCli });
   }
   try {
     // Legacy migration branch only. Reached when the session predates

@@ -445,13 +445,49 @@ export function findReservedMojoCliFlags(args: readonly string[]): string[] {
  * that sets the variable internally.
  *
  * So a wrapper makes the session unprovable, and the local sandbox stays engaged.
+ * The launcher's ENV is treated exactly the same way, and for the same reason —
+ * see mojoUnprovableEnvKeys.
  */
+export function mojoUnprovableEnvKeys(
+    cfg?: { jwtEnv?: string; env?: Record<string, string> },
+): string[] {
+    const keys = Object.keys(cfg?.env ?? {});
+    if (keys.length === 0) return [];
+    // ALLOWLIST, deliberately: the set of variables that can redirect execution
+    // (PATH, NODE_OPTIONS, LD_PRELOAD, LD_LIBRARY_PATH, DYLD_*, …) cannot be
+    // enumerated completely — the same reason `env` is not live-patchable, see
+    // MOJO_LIVE_PATCH_KEYS below. So anything NOT known-harmless voids the proof.
+    //
+    // The credential variable is the one safe case: mojo reads it as a token, it
+    // cannot change which binary runs or how it is loaded.
+    const credential = cfg?.jwtEnv?.trim() || 'X_JWT_TOKEN';
+    return keys.filter(k => k !== credential).sort();
+}
+
 export function isMojoFullyRemote(
-    cfg?: { cloud?: boolean; localDaemon?: boolean; wrapperCli?: string },
+    cfg?: {
+        cloud?: boolean;
+        localDaemon?: boolean;
+        wrapperCli?: string;
+        jwtEnv?: string;
+        env?: Record<string, string>;
+    },
 ): boolean {
     if (cfg?.cloud !== true) return false;
     if (cfg.localDaemon === true) return false;
     if (cfg.wrapperCli?.trim()) return false;
+    // The launcher ENV is part of the proof, not just the wrapper. resolveBin()
+    // picks the binary off the effective child PATH, so `env: { PATH: <dir with a
+    // fake mojo> }` runs different code while cloud/localDaemon/wrapperCli all
+    // still look clean — and loader hooks (LD_PRELOAD / NODE_OPTIONS / DYLD_*) do
+    // the same to the real binary.
+    //
+    // This is not hypothetical drift: `env` is NOT part of the frozen identity, so
+    // sessionMojoConfig() re-merges it from LIVE bot config on every cold refork.
+    // A session created as cloud-only could therefore be switched to a local fake
+    // after a daemon restart while this function kept returning true — bypassing
+    // the local sandbox AND getting classified safe_remote by device isolation.
+    if (mojoUnprovableEnvKeys(cfg).length > 0) return false;
     return true;
 }
 

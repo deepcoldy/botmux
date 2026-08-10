@@ -1290,6 +1290,17 @@ ipcRoute('POST', '/api/sessions/:sessionId/slash', async (req, res, params) => {
   if (ds.adoptedFrom || ds.initConfig?.adoptMode) {
     return jsonRes(res, 409, { ok: false, error: 'adopt_inject_unsupported' });
   }
+  // Remote backends (riff / mojo) have no TUI to inject a slash line into. For mojo
+  // the injection does not no-op either: MojoBackend.write() starts a REAL remote
+  // turn, and this IPC carries no credential snapshot (unlike message / raw_input),
+  // so an allowlisted slash sent after a JWT rotation or clear would run the turn
+  // on the worker's stale token. Refused rather than wired up: this is a TUI-only
+  // channel, and the same reasoning already hides the PTY quick-action keys for
+  // these backends.
+  const injectFrozenType = ds.initConfig?.backendType ?? ds.session.backendType;
+  if (injectFrozenType && isRemoteBackendType(injectFrozenType)) {
+    return jsonRes(res, 409, { ok: false, error: 'remote_backend_inject_unsupported' });
+  }
   if ((!ds.worker || ds.worker.killed) && !isSessionTransferring(ds)) {
     return jsonRes(res, 409, { ok: false, error: 'no_live_worker' });
   }

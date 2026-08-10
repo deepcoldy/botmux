@@ -6,6 +6,7 @@ import { HerdrBackend } from './herdr-backend.js';
 import { PtyBackend } from './pty-backend.js';
 import { MojoBackend } from './mojo-backend.js';
 import { isMojoFullyRemote } from './sandbox.js';
+import { mojoUnprovableEnvKeys } from './mojo-types.js';
 import type { EffectiveMojoConfig } from './mojo-types.js';
 import { RiffBackend, type RiffBackendConfig } from './riff-backend.js';
 import { TmuxBackend } from './tmux-backend.js';
@@ -195,8 +196,18 @@ export function backendSandboxCompatibilityError(opts: {
    * isolation. The worker passes false because its unified sandbox request
    * already folds in the legacy readIsolation flag on every host. */
   effectiveReadIsolationRequested: boolean;
-  /** mojo only: proof-of-remote inputs (cloud / localDaemon). */
-  mojoConfig?: { cloud?: boolean; localDaemon?: boolean };
+  /**
+   * mojo only: proof-of-remote inputs. `env` / `jwtEnv` are part of the proof, not
+   * decoration — the launcher env decides which binary actually runs (see
+   * mojoUnprovableEnvKeys), so leaving them out let a redirected launcher pass.
+   */
+  mojoConfig?: {
+    cloud?: boolean;
+    localDaemon?: boolean;
+    wrapperCli?: string;
+    jwtEnv?: string;
+    env?: Record<string, string>;
+  };
 }): string | undefined {
   const isolationRequested =
     opts.fileSandboxRequested || opts.effectiveReadIsolationRequested;
@@ -217,6 +228,17 @@ export function backendSandboxCompatibilityError(opts: {
     // impossible — fail CLOSED with an actionable message rather than running
     // unisolated while the user believes they are sandboxed.
     if (isMojoFullyRemote(opts.mojoConfig)) return undefined;
+    // Name the launcher env explicitly: "set cloud=true" is useless advice when
+    // cloud IS already true and the real blocker is an env var that can redirect
+    // which binary runs.
+    const unprovableEnv = mojoUnprovableEnvKeys(opts.mojoConfig);
+    if (unprovableEnv.length > 0) {
+      return 'backend "mojo" cannot prove it runs nothing locally while these env '
+        + `variables are set: ${unprovableEnv.join(', ')} — they can change which `
+        + 'binary is executed (PATH) or inject into it (LD_PRELOAD / NODE_OPTIONS / '
+        + 'DYLD_*), so the local sandbox must stay engaged. Remove them from the '
+        + "bot's `env` / `mojo.env`, or disable sandbox for this bot";
+    }
     return 'backend "mojo" only bypasses the local sandbox when it runs fully '
       + 'remotely; set mojo.cloud=true (and leave mojo.localDaemon off) to keep '
       + 'execution off this host, or disable sandbox for this bot';
