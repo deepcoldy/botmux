@@ -713,7 +713,15 @@ export async function commitRepoSelection(
         // frozen-card file; it is re-keyed under the replacement session below.
         parkStreamCard(current);
         const oldSession = current.session;
-        await closeWorkerPoolSession(targetSessionId);
+        const closeResult = await closeWorkerPoolSession(targetSessionId);
+        // A refused close (remote cancellation unproven) leaves the row ACTIVE on
+        // purpose. Deleting the owner anyway would strand an active row with no
+        // owner — a ghost — while the remote session keeps running and holding the
+        // injected credential. Abort the switch instead. (Same guard as the text
+        // /repo path in command-handler.)
+        if (!closeResult.ok) {
+          return { ok: false as const, error: 'close_refused' as const };
+        }
         if (activeSessions.get(key) === current) activeSessions.delete(key);
         if (activeSessions.has(key)) {
           return { ok: false as const, error: 'session_replaced' as const };
@@ -763,6 +771,13 @@ export async function commitRepoSelection(
         await sessionReply(
           rootId,
           '当前 Codex App 仍有未结算消息，暂不能切换仓库；请等待本轮完成或关闭会话。',
+        );
+      } else if (switched.error === 'close_refused') {
+        // Without this the user taps the card and gets nothing back, while the old
+        // session is still active and its remote session still running.
+        await sessionReply(
+          rootId,
+          '⚠️ 无法切换仓库：原会话的远端会话未能确认取消，已保留原会话以便重试。请稍后重试。',
         );
       }
       return false;
@@ -2311,11 +2326,21 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         // Build the closed card BEFORE closeWorkerPoolSession — it reads the
         // live session's identity off `current`.
         const card = buildClosedSessionCard(current, localeForBot(current.larkAppId));
+        let closeResult;
         try {
-          await closeWorkerPoolSession(targetSessionId);
+          closeResult = await closeWorkerPoolSession(targetSessionId);
         } catch (err) {
           logger.error(`[${tag(current)}] Refused close because backing teardown was not verified: ${err}`);
           return { status: 'teardown_failed' as const, err };
+        }
+        // Returned (not thrown) refusal: the remote session could not be proven
+        // cancelled, so the row stays active. Sending the closed card here would
+        // tell the user it is gone while it keeps running.
+        if (!closeResult.ok) {
+          logger.error(
+            `[${tag(current)}] Refused close: remote cancellation not proven (${closeResult.error})`,
+          );
+          return { status: 'close_refused' as const, result: closeResult };
         }
         return { status: 'closed' as const, current, botCfg, card };
       });
@@ -2327,6 +2352,15 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           toast: {
             type: 'warning',
             content: `会话关闭失败：${closed.err instanceof Error ? closed.err.message : String(closed.err)}`,
+          },
+        };
+      }
+      if (closed.status === 'close_refused') {
+        return {
+          toast: {
+            type: 'warning',
+            content: `会话关闭失败：远端会话未能确认取消（${closed.result.error}），`
+              + '已保留会话以便重试。远端可能仍在运行，请稍后重试。',
           },
         };
       }

@@ -2229,7 +2229,12 @@ export function ensureClaudeFolderTrust(workingDir: string, stateJsonPath: strin
 
 export function killWorker(
   ds: DaemonSession,
-  opts: { riffCloseCommitRequestId?: string } = {},
+  opts: {
+    riffCloseCommitRequestId?: string;
+    /** Set by the authoritative mojo close once its cancel is PROVEN, so the
+     *  best-effort orphan teardown below does not cancel the same session again. */
+    mojoCancelAlreadyProven?: boolean;
+  } = {},
 ): void {
   const closeFrozenType = ds.initConfig?.backendType ?? ds.session.backendType;
   if (ds.worker && !ds.worker.killed
@@ -2266,7 +2271,9 @@ export function killWorker(
     // lazy-restore keep the CLI alive for later resume), so /close on such a
     // session would leave an orphaned CLI running in tmux that still replies.
     // Destroy the backing session directly here so /close always terminates it.
-    destroyOrphanedBackingSession(ds);
+    destroyOrphanedBackingSession(ds, {
+      ...(opts.mojoCancelAlreadyProven ? { skipRemoteCancel: true } : {}),
+    });
     if (opts.riffCloseCommitRequestId
         && ds.riffCloseState?.requestId === opts.riffCloseCommitRequestId) {
       ds.riffCloseState = undefined;
@@ -2659,7 +2666,15 @@ function resolveMojoCancelLaunch(
   };
 }
 
-function destroyOrphanedBackingSession(ds: DaemonSession): void {
+function destroyOrphanedBackingSession(
+  ds: DaemonSession,
+  opts: {
+    /** The authoritative close already PROVED the remote cancel; firing the
+     *  best-effort one again would cancel a second time (and, for an already-gone
+     *  session, report a spurious failure). */
+    skipRemoteCancel?: boolean;
+  } = {},
+): void {
   if (ds.initConfig?.adoptMode || ds.adoptedFrom) return;
   reclaimParkedCrashDiagnostic(ds);
   // Riff cancellation is asynchronous and cannot be made safe from this
@@ -2679,7 +2694,7 @@ function destroyOrphanedBackingSession(ds: DaemonSession): void {
   if (frozenType === 'mojo') {
     // Remote backends persist their lineage in the same field riff uses.
     const remoteId = ds.session.riffParentTaskId;
-    if (!remoteId) return;
+    if (!remoteId || opts.skipRemoteCancel) return;
     const resolved = resolveMojoCancelLaunch(ds, remoteId, 'killWorker');
     if (!resolved.ok) return;
     // Best-effort ONLY. The authoritative /close path (prepareMojoExplicitClose)
@@ -3069,11 +3084,13 @@ async function prepareMojoExplicitClose(
     );
     return { ok: false, error: 'mojo_cancel_failed', retryable: true, taskId: remoteId };
   }
-  // Drop the runtime lineage now that the remote session is really gone. This also
-  // makes the best-effort killWorker teardown a no-op later in this same close, so
-  // the cancel cannot be fired twice; the durable row is cleared in the same
-  // transaction as the status change (clearRiffParentTaskId).
-  ds.session.riffParentTaskId = undefined;
+  // Deliberately does NOT clear the runtime lineage here. sessionStore commonly
+  // holds the very same Session object, so an early clear is visible to the durable
+  // save — and if that save then fails, the rollback has already lost the id it
+  // would restore while the on-disk row may still carry it. The lineage is cleared
+  // atomically with the status change instead (clearRiffParentTaskId), and the
+  // repeat-cancel is suppressed with an explicit flag rather than by mutating
+  // shared state early.
   logger.info(`[${tag(ds)}] mojo session ${remoteId} cancelled for explicit close`);
   return { ok: true, taskId: remoteId };
 }
@@ -3513,6 +3530,9 @@ export async function closeSession(
   if (ds) {
     killWorker(ds, {
       ...(preparedRiffRequestId ? { riffCloseCommitRequestId: preparedRiffRequestId } : {}),
+      // The prepare above already proved this cancel; the durable row cleared the
+      // lineage in the same transaction. Suppress the best-effort repeat.
+      ...(clearMojoLineage ? { mojoCancelAlreadyProven: true } : {}),
     });
     // A transferred/restored exact object may remain under more than one alias.
     // Remove only identity matches, never a same-key successor.
