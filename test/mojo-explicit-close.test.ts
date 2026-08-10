@@ -341,4 +341,56 @@ describe('mojo explicit close', () => {
       known: true,
     });
   });
+
+  it('leaves ZERO mojo-field pollution when the durable close fails', async () => {
+    // The park must not survive a failed save. If it did, the next turn would read
+    // a still-live remote session as quarantined and start a new one — silently
+    // breaking the "close failed, retry unchanged" guarantee.
+    const fixture = createFixture({ legacyUnfrozen: true });
+    const realClose = sessionStore.closeSession;
+    const spy = vi.spyOn(sessionStore, 'closeSession').mockImplementation(() => {
+      throw new Error('disk full');
+    });
+
+    await expect(closeSession(fixture.session.sessionId)).rejects.toThrow('disk full');
+    spy.mockRestore();
+    void realClose;
+
+    const after = sessionStore.getSession(fixture.session.sessionId);
+    expect(after?.status).not.toBe('closed');
+    expect(after?.mojoQuarantinedLineage).toBeUndefined();
+    expect(after?.mojoQuarantineNoticePending).toBeUndefined();
+    // The lineage the retry needs is still exactly where it was.
+    expect(after?.riffParentTaskId).toBe('mojo-sid-123');
+  });
+
+  it('persists the park even when the runtime object is NOT the store row', async () => {
+    // worker-pool used to write the park onto ds.session. When that is a different
+    // object from the authoritative row (restore/transfer paths), the id never
+    // reached disk: first close reported a residual, the second degraded to a plain
+    // success, and the only cleanup handle was gone.
+    const fixture = createFixture({ legacyUnfrozen: true });
+    // Detach the runtime object from the store row, keeping the same field values.
+    (fixture.ds as unknown as { session: unknown }).session = {
+      ...fixture.session,
+    };
+
+    const first = await closeSession(fixture.session.sessionId);
+    expect(first).toMatchObject({
+      ok: true,
+      outcome: 'closed_with_residual',
+      residual: { reason: 'mojo_lineage_quarantined', taskId: 'mojo-sid-123' },
+    });
+    // Durable row carries the park, not just the in-memory copy.
+    const onDisk = sessionStore.getSession(fixture.session.sessionId);
+    expect(onDisk?.mojoQuarantinedLineage).toBe('mojo-sid-123');
+
+    const second = await closeSession(fixture.session.sessionId);
+    expect(second).toMatchObject({
+      ok: true,
+      outcome: 'closed_with_residual',
+      residual: { reason: 'mojo_lineage_quarantined', taskId: 'mojo-sid-123' },
+      alreadyClosed: true,
+    });
+  });
 });

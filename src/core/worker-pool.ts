@@ -3581,12 +3581,9 @@ export async function closeSession(
   // Only when the cancel actually happened: a quarantined / bot-gone mojo session
   // keeps its lineage on the row for manual cleanup.
   const clearMojoLineage = isOwnedMojoClose && !!prepared.taskId;
-  // Residual survives beyond this call: prefer what the prepare decided, and fall
-  // back to whatever the ROW already carries so an already-closed replay reports
-  // the same thing instead of a bare success.
-  const closeResidual = isOwnedMojoClose
-    ? (prepared.residual ?? mojoCloseResidualForRow(stored ?? ds?.session))
-    : undefined;
+  // NOTE: the residual is derived from the COMMITTED row at the end of this
+  // function, not captured here — the store merges parked ids, so a value computed
+  // before the transaction can disagree with what was actually persisted.
   const preparedRiffRequestId = ds?.riffCloseState?.phase === 'prepared'
     ? ds.riffCloseState.requestId
     : undefined;
@@ -3609,21 +3606,14 @@ export async function closeSession(
   if (wasOpen) {
     if (!ds && stored && !isOwnedRiffClose) destroyUnregisteredPersistentBacking(stored);
     try {
-      // Park the uncancellable lineage in the SAME durable write that closes the
-      // row, so the residual decision is persisted rather than recomputed from an
-      // active slot that this close is about to clear.
-      if (prepared.parkMojoLineage) {
-        const target = ds?.session ?? stored;
-        if (target) {
-          const already = target.mojoQuarantinedLineage;
-          target.mojoQuarantinedLineage = already && already !== prepared.parkMojoLineage
-            ? `${already},${prepared.parkMojoLineage}`
-            : prepared.parkMojoLineage;
-          target.mojoQuarantineNoticePending = true;
-        }
-      }
+      // Parking is handed to the store as part of ITS transaction rather than
+      // pre-written here: the runtime object is not always the authoritative row,
+      // and a pre-write survives a failed save (the store's rollback cannot restore
+      // a field it never set). Same mistake as the early lineage clear fixed
+      // earlier — one layer up.
       sessionStore.closeSession(sessionId, {
         cleanupBridgeMarkers: !hadLiveWorker,
+        ...(prepared.parkMojoLineage ? { parkMojoLineage: prepared.parkMojoLineage } : {}),
         ...(isOwnedRiffClose || clearMojoLineage || prepared.parkMojoLineage
           ? { clearRiffParentTaskId: true }
           : {}),
@@ -3649,6 +3639,14 @@ export async function closeSession(
     if (ds) {
       ds.session.status = 'closed';
       ds.session.closedAt = after?.closedAt ?? ds.session.closedAt;
+      // Sync the parking back from the store's committed row. Only reached after a
+      // SUCCESSFUL save, and skipped when the two are the same object anyway, so
+      // the runtime view cannot end up carrying a park the disk does not have.
+      if (prepared.parkMojoLineage && after && after !== ds.session) {
+        ds.session.mojoQuarantinedLineage = after.mojoQuarantinedLineage;
+        ds.session.mojoQuarantineNoticePending = after.mojoQuarantineNoticePending;
+        ds.session.riffParentTaskId = after.riffParentTaskId;
+      }
     }
   }
 
@@ -3764,6 +3762,13 @@ export async function closeSession(
   // The local row IS closed, but a remote session was deliberately left running
   // (its control plane could not be verified, so cancelling it might have hit
   // another tenant). Callers must render this differently from an ordinary close.
+  // Read the residual back off the authoritative row so it always matches disk
+  // (including the merge when a second id was parked). `prepared.residual` is only
+  // a fallback for the paths that never reached the store.
+  const closeResidual = isOwnedMojoClose
+    ? (mojoCloseResidualForRow(sessionStore.getOwnedSession(sessionId) ?? stored ?? ds?.session)
+      ?? prepared.residual)
+    : undefined;
   if (closeResidual) {
     return {
       ok: true,

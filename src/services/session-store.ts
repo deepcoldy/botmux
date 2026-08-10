@@ -534,7 +534,20 @@ export function cleanupSessionBridgeSendMarkers(sessionId: string): void {
 
 export function closeSession(
   sessionId: string,
-  opts: { cleanupBridgeMarkers?: boolean; clearRiffParentTaskId?: boolean } = {},
+  opts: {
+    cleanupBridgeMarkers?: boolean;
+    clearRiffParentTaskId?: boolean;
+    /**
+     * Park an uncancellable mojo lineage as PART of this transaction.
+     *
+     * The caller must not pre-write this onto its own Session object: the runtime
+     * object is not always the authoritative row (and when it is, a failed save
+     * would leave a parked id the rollback below does not know about). Merging it
+     * here — against the store's own row, snapshotted and rolled back with
+     * everything else — is what makes "closed + parked" actually atomic.
+     */
+    parkMojoLineage?: string;
+  } = {},
 ): void {
   load();
   const session = sessions.get(sessionId);
@@ -544,10 +557,21 @@ export function closeSession(
     const priorRiffParentTaskId = session.riffParentTaskId;
     const priorDashboardAttachments = session.dashboardAttachments;
     const priorQueuedAttachments = session.queuedAttachments;
+    const priorQuarantinedLineage = session.mojoQuarantinedLineage;
+    const priorQuarantineNoticePending = session.mojoQuarantineNoticePending;
     session.status = 'closed';
     session.closedAt = new Date().toISOString();
     session.dashboardAttachments = undefined;
     session.queuedAttachments = undefined;
+    if (opts.parkMojoLineage) {
+      // Keep both ids when a different one was already parked: each is the only
+      // handle left for manual cleanup of its remote session.
+      const already = session.mojoQuarantinedLineage;
+      session.mojoQuarantinedLineage = already && already !== opts.parkMojoLineage
+        ? `${already},${opts.parkMojoLineage}`
+        : opts.parkMojoLineage;
+      session.mojoQuarantineNoticePending = true;
+    }
     // Riff cancellation has already completed before this durable transition.
     // Clear its retry handle in the same atomic save as status='closed'.
     if (opts.clearRiffParentTaskId) session.riffParentTaskId = undefined;
@@ -559,6 +583,11 @@ export function closeSession(
       session.riffParentTaskId = priorRiffParentTaskId;
       session.dashboardAttachments = priorDashboardAttachments;
       session.queuedAttachments = priorQueuedAttachments;
+      // Without these two the row keeps a parked lineage after a FAILED close, so
+      // the next turn treats a still-live remote session as quarantined and starts
+      // a new one — i.e. the "close failed, retry unchanged" guarantee is broken.
+      session.mojoQuarantinedLineage = priorQuarantinedLineage;
+      session.mojoQuarantineNoticePending = priorQuarantineNoticePending;
       throw err;
     }
     if (session.larkAppId && priorDashboardAttachments?.length) {
