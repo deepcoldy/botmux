@@ -63,12 +63,12 @@ describe('POST /api/sessions/:sessionId/close', () => {
       larkAppId: 'app-1',
     } as any);
     const closeSpy = vi.spyOn(workerPool, 'closeSession')
-      .mockResolvedValue({ ok: true, alreadyClosed: false });
+      .mockResolvedValue({ ok: true, outcome: 'closed', alreadyClosed: false });
 
     const res = await postClose('s-close', { authRequired: true });
 
     expect(res.status).toBe(200);
-    expect(await res.json()).toEqual({ ok: true, alreadyClosed: false });
+    expect(await res.json()).toEqual({ ok: true, outcome: 'closed', alreadyClosed: false });
     expect(closeSpy).toHaveBeenCalledWith('s-close');
   });
 
@@ -79,7 +79,7 @@ describe('POST /api/sessions/:sessionId/close', () => {
       larkAppId: 'app-1',
     } as any);
     const closeSpy = vi.spyOn(workerPool, 'closeSession')
-      .mockResolvedValue({ ok: true, alreadyClosed: false });
+      .mockResolvedValue({ ok: true, outcome: 'closed', alreadyClosed: false });
 
     const missing = await postClose('s-close-denied', {
       auth: 'none',
@@ -162,7 +162,7 @@ describe('POST /api/sessions/:sessionId/close', () => {
       larkAppId: 'app-1',
     } as any);
     const closeSpy = vi.spyOn(workerPool, 'closeSession')
-      .mockResolvedValue({ ok: true, alreadyClosed: false });
+      .mockResolvedValue({ ok: true, outcome: 'closed', alreadyClosed: false });
 
     const res = await postClose('s-receiver', { authRequired: true });
 

@@ -30,7 +30,7 @@ vi.mock('../src/utils/logger.js', () => ({
 
 // closeSession is the only worker-pool symbol the reconcile path calls; stub the
 // rest that trigger-session imports at load. getDaemonBootId returns a fixed id.
-const mockCloseSession = vi.fn(async () => ({ ok: true, alreadyClosed: false, known: true }));
+const mockCloseSession = vi.fn(async () => ({ ok: true, outcome: 'closed', alreadyClosed: false, known: true }));
 vi.mock('../src/core/worker-pool.js', () => ({
   closeSession: (...a: any[]) => mockCloseSession(...a),
   forkWorker: vi.fn(),

@@ -116,7 +116,7 @@ vi.mock('../src/core/worker-pool.js', async (importOriginal) => {
       if (stored && stored.status !== 'closed') {
         store.closeSession(sessionId, { cleanupBridgeMarkers: !hadLiveWorker });
       }
-      return { ok: true, alreadyClosed: false, known: !!stored };
+      return { ok: true, outcome: 'closed', alreadyClosed: false, known: !!stored };
     }),
   };
 });

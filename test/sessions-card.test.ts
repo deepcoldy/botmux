@@ -1154,7 +1154,7 @@ describe('handleSessionsCardAction', () => {
           return { status: 200, body: { sessions }, raw: '' };
         }
         if (req.method === 'POST' && req.path.startsWith('/__daemon/sessions/')) {
-          return closePostResp ?? { status: 200, body: { ok: true, alreadyClosed: false }, raw: '' };
+          return closePostResp ?? { status: 200, body: { ok: true, outcome: 'closed', alreadyClosed: false }, raw: '' };
         }
         throw new Error('unexpected: ' + JSON.stringify(req));
       });

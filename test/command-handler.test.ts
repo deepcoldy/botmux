@@ -1825,7 +1825,7 @@ describe('handleCommand', () => {
         title: 'replacement',
       };
       deps.activeSessions.set(sessionKey(ROOT_ID, LARK_APP_ID), replacement);
-      releaseClose({ ok: true, alreadyClosed: false, known: true });
+      releaseClose({ ok: true, outcome: 'closed', alreadyClosed: false, known: true });
       await closing;
 
       expect(deps.activeSessions.get(sessionKey(ROOT_ID, LARK_APP_ID))).toBe(replacement);
@@ -2455,6 +2455,32 @@ describe('handleCommand', () => {
       expect(ds.workingDir).toBe('/remote/riff');
       expect(ds.session.riffParentTaskId).toBe('task-live');
       expect(vi.mocked(deps.sessionReply).mock.calls.map(c => c[1]).join()).toContain('/close');
+    });
+
+    it('does not create a replacement session when the old close left a residual', async () => {
+      // Choosing a directory is not consent to leave a remote session running. The
+      // old row DID close, so this is not a failure — but the switch must stop and
+      // say so rather than spawning a replacement over an uncancelled remote.
+      const ds = makeDaemonSession({ pendingRepo: false, worker: null });
+      const deps = makeDeps(ds);
+      deps.lastRepoScan.set(CHAT_ID, [
+        { name: 'project-b', path: '/home/testuser/project-b', branch: 'dev' },
+      ]);
+      vi.mocked(closeWorkerPoolSession).mockResolvedValueOnce({
+        ok: true,
+        outcome: 'closed_with_residual',
+        residual: { reason: 'mojo_lineage_quarantined', taskId: 'mojo-parked-9' },
+        alreadyClosed: false,
+        known: true,
+      } as never);
+
+      await handleCommand('/repo', ROOT_ID, makeLarkMessage('/repo 1'), deps, LARK_APP_ID);
+
+      expect(sessionStore.createSession).not.toHaveBeenCalled();
+      expect(forkWorker).not.toHaveBeenCalled();
+      const said = vi.mocked(deps.sessionReply).mock.calls.map(c => c[1]).join();
+      expect(said).toContain('mojo-parked-9');
+      expect(said).toContain('未创建新会话');
     });
 
     it('shared fold-back: every command reply carries the triggering messageId as turnId', async () => {

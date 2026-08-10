@@ -73,7 +73,7 @@ vi.mock('../src/im/lark/card-handler.js', () => ({ runAutoWorktreeCommit: vi.fn(
 // worker-pool: forkWorker is the dispatch side effect we make throw on demand.
 let forkShouldThrow = false;
 const mockForkWorker = vi.fn(() => { if (forkShouldThrow) throw new Error('injected fork failure'); });
-const mockCloseSession = vi.fn(async () => ({ ok: true, alreadyClosed: false, known: true }));
+const mockCloseSession = vi.fn(async () => ({ ok: true, outcome: 'closed', alreadyClosed: false, known: true }));
 vi.mock('../src/core/worker-pool.js', () => ({
   forkWorker: (...a: any[]) => mockForkWorker(...a),
   sendWorkerInput: vi.fn(() => true),

@@ -169,7 +169,7 @@ vi.mock('../src/core/worker-pool.js', () => ({
     const store = await import('../src/services/session-store.js');
     const s = store.getSession(sid);
     if (s && s.status !== 'closed') store.closeSession(sid);
-    return { ok: true, alreadyClosed: false };
+    return { ok: true, outcome: 'closed', alreadyClosed: false };
   }),
 }));
 
