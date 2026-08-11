@@ -553,18 +553,13 @@ function askBotmux(payload) {
 }
 
 // 服务注册文件发现：托管后台服务（serve --service）把 { url, password } 写进
-// $XDG_STATE_HOME/opencode/service.json（默认 ~/.local/state/opencode/service.json）。
-// 插件运行在服务进程内，同一宿主直接读文件即可；读不到（--standalone 私有服务/
-// 首次启动）→ null → 放行给原生 picker。
+// $XDG_STATE_HOME/opencode/service.json（默认 ~/.local/state/opencode/service.json）
+// —— 只认这一个位置，无其它 fallback。插件运行在服务进程内，同一宿主直接读文件
+// 即可；读不到（--standalone 私有服务/首次启动）→ null → 放行给原生 picker。
 function readRegistration() {
   const state = process.env.XDG_STATE_HOME || join(homedir(), ".local", "state");
   try {
     const raw = readFileSync(join(state, "opencode", "service.json"), "utf8");
-    const j = JSON.parse(raw);
-    if (typeof j.url === "string" && j.url) return j;
-  } catch {}
-  try {
-    const raw = readFileSync(join(state, "service.json"), "utf8");
     const j = JSON.parse(raw);
     if (typeof j.url === "string" && j.url) return j;
   } catch {}
@@ -586,7 +581,9 @@ async function postReply(directory, sessionID, requestID, answers) {
   dbg("POST_REPLY id=" + requestID + " url=" + url);
   try {
     const r = await fetch(url, { method: "POST", headers, body: JSON.stringify({ answers }) });
-    dbg("REPLY_DONE id=" + requestID + " status=" + r.status);
+    let txt = ""; try { txt = await r.text(); } catch {}
+    dbg("REPLY_DONE id=" + requestID + " status=" + r.status + " body=" + txt.slice(0, 150));
+    if (!r.ok) dbg("REPLY_NON_OK id=" + requestID + " status=" + r.status + " body=" + txt.slice(0, 150));
   } catch (e) { dbg("REPLY_ERR id=" + requestID + " err=" + String(e)); }
 }
 

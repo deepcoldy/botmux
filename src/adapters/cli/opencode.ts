@@ -123,7 +123,9 @@ function detectNewSubmit(
 ): { found: boolean; cliSessionId?: string } {
   const q = kind === 'v2'
     ? "SELECT session_id AS sid, json_extract(data, '$.text') AS text " +
-      "FROM session_message WHERE type = 'user' AND time_created > ? " +
+      "FROM session_message WHERE type = 'user' " +
+      "  AND json_extract(data, '$.text') IS NOT NULL " +
+      '  AND time_created > ? ' +
       'ORDER BY time_created DESC LIMIT 20'
     : "SELECT p.session_id AS sid, json_extract(p.data, '$.text') AS text " +
       'FROM part p JOIN message m ON m.id = p.message_id ' +

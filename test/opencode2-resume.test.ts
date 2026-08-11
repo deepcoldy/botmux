@@ -267,6 +267,25 @@ describe('opencode2 writeInput DB verification', () => {
     expect((result as any).recheck).toBeTypeOf('function');
   }, 15_000);
 
+  it('still matches when >20 non-text user rows land after the baseline (LIMIT window not consumed by them)', async () => {
+    const db = openDb();
+    seedSession(db, { id: 'ses_target' });
+    const content = `non-text flood then text`;
+    for (let i = 0; i < 25; i++) {
+      const mid = `msg_noise_${i}`;
+      db.prepare('INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data) VALUES (?,?,?,?,?,?,?)')
+        .run(mid, 'ses_target', 'user', 1000 + i, Date.now() - 1000 + i, Date.now() - 1000 + i, JSON.stringify({ time: { created: Date.now() - 1000 + i }, files: [{ path: `/tmp/f${i}` }] }));
+    }
+    const pty = stubPty(() => {
+      if (pty.enters === 1) seedUserPart(db, 'ses_target', content, Date.now());
+    });
+
+    const adapter = createOpenCode2Adapter();
+    const result = await adapter.writeInput(pty, content);
+    db.close();
+    expect(result).toMatchObject({ submitted: true, cliSessionId: 'ses_target' });
+  }, 15_000);
+
   it('skips verification for slash commands (TUI command palette, no user row)', async () => {
     openDb().close();
     const events: string[] = [];
