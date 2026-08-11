@@ -149,6 +149,32 @@ curl -X POST "http://<host>:7891/api/trigger" -H 'content-type: application/json
 
 ---
 
+### 续会话轮幂等键（`options.turnIdempotencyKey`）—— 给追问轮同样的保证
+
+上面的 `idempotencyKey` 只覆盖 **fresh 新会话**。当你往**已存在的会话追加一轮追问**（带 `target.sessionId`）时，改用 `options.turnIdempotencyKey`——追加轮的 HTTP 回包一旦丢失，你无法判断 daemon 是否已受理该轮，重试就可能**重复注入两次**。
+
+传一个**在发起前就持久化**的稳定键。同键重试到同一会话时，daemon 解析到**同一轮（同 `triggerId`）、不二次注入**：
+
+```bash
+curl -X POST "http://<host>:7891/api/trigger" -H 'content-type: application/json' \
+  -H "Cookie: botmux_dashboard_token=$TOKEN" \
+  -d '{
+    "source":{"type":"webhook"},
+    "target":{"kind":"turn","botId":"cli_xxx","sessionId":"<已存在会话>"},
+    "instruction":"...",
+    "envelope":{"format":"json","sourceName":"demo","trusted":false},
+    "options":{"asyncReturnSessionId":true, "turnIdempotencyKey":"my-followup-7"}
+  }'
+```
+
+命中带 `idempotent:true`；照常用 `sessionId`/`triggerId` 轮询 `trigger-result`。
+
+**适用范围**：`turnIdempotencyKey` 仅支持**已存在会话上的续会话异步轮**——`target.kind:'turn'` + 带 `target.sessionId` + `options.asyncReturnSessionId:true`，不带 `waitForFinalOutput` / `dryRun`。它与 `idempotencyKey` **互斥**（同时传返回 **400**），且两者位于**互不碰撞的独立键空间**——即便 `turnIdempotencyKey` 和 `idempotencyKey` 取相同字符串也绝不会共用同一 lease。
+
+**同键异 payload → 409 `idempotency_conflict`**；**崩溃语义（at-most-once）**与**保留**策略与上面的 `idempotencyKey` 完全一致（派发结果未知的追问轮收敛为 `failed` / `no_output`，绝不盲目重跑）。另有一个瞬时情况：若目标会话仍在完成其**开场激活**，该追问轮会被**可重试地**拒绝（errorCode `trigger_failed`，提示含 “session activation in progress”）——稍后重试即可。
+
+---
+
 ## 4. 轮询结果（四态契约）
 
 异步模式下，用 `sessionId` 轮询：

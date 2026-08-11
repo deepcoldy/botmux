@@ -86,6 +86,7 @@ import { remoteWorkerShutdownInputBlocker } from './core/remote-worker-shutdown-
 import { ReadyGate, shouldArmReadyGate } from './utils/ready-gate.js';
 import { shouldRunStartupCommandsOnSpawn, shouldDeferInitialPromptForStartup } from './core/startup-commands.js';
 import { sanitizePerBotEnv } from './core/per-bot-env.js';
+import { resolveChildBotsConfig } from './core/config-dir.js';
 import {
   evaluateVcMeetingManagedSend,
 } from './services/vc-meeting-send-policy.js';
@@ -5959,9 +5960,9 @@ function maybeFollowTraexSessionRotationViaPid(): void {
     ?? backend.getChildPid?.()
     ?? codexAdoptPendingPid;
   if (!pid) return;
-  const observed = findTraexRolloutByPid(pid);
-  if (!observed) return;
   const currentSid = codexSessionIdFromRolloutPath(codexBridgeRolloutPath);
+  const observed = findTraexRolloutByPid(pid, currentSid);
+  if (!observed) return;
   if (currentSid?.toLowerCase() === observed.cliSessionId.toLowerCase()) return;
   persistCliSessionId(observed.cliSessionId);
   codexBridgeNotifyCliSessionId(observed.cliSessionId);
@@ -10650,6 +10651,12 @@ function sendToPty(
     vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin;
     /** mojo credential snapshot delivered with this turn; applied at write time. */
     mojoLivePatch?: MojoLivePatch;
+    /** At-most-once (idempotency lease): tag this keyed input so a CLI exit never
+     *  replays it onto the auto-restarted CLI — excluded from BOTH the inflight
+     *  carry-over and the still-queued pendingMessages drain. Mirrors the init
+     *  path's `atMostOnce → noReplay` for a keyed follow-up delivered to a LIVE
+     *  worker via `type: 'message'` (codex #776 round-8; turn-level PR #71). */
+    atMostOnce?: true;
   } = {},
 ): boolean {
   const next: PendingCliInput = {
@@ -10662,6 +10669,7 @@ function sendToPty(
     ...(opts.mojoLivePatch ? { mojoLivePatch: opts.mojoLivePatch } : {}),
     ...(opts.codexAppInput ? { codexAppInput: opts.codexAppInput } : {}),
     ...(opts.dispatchAttempt !== undefined ? { dispatchAttempt: opts.dispatchAttempt } : {}),
+    ...(opts.atMostOnce ? { noReplay: true } : {}),
     ...(opts.vcMeetingImTurnOrigin
       ? { vcMeetingImTurnOrigin: opts.vcMeetingImTurnOrigin }
       : {}),
@@ -12482,6 +12490,37 @@ async function spawnCli(
   if (cfg.chatType) childEnv.BOTMUX_CHAT_TYPE = cfg.chatType;
   else delete childEnv.BOTMUX_CHAT_TYPE;
   childEnv.BOTMUX_LARK_APP_ID = cfg.larkAppId;
+  // Pin the EXACT bots.json this daemon loaded so the child's `botmux send`
+  // reads the SAME registry. Required when the daemon runs under a non-default
+  // HOME (`HOME=~/alt botmux start`): the child inherits BOTMUX_* but not HOME,
+  // so it would otherwise resolve the default ~/.botmux and fail "Bot not
+  // registered".
+  //
+  // Why BOTS_CONFIG (a FILE) and not a config-DIR hint: BOTS_CONFIG is the TOP
+  // of the registry precedence chain and may name an arbitrary filename, so a
+  // dir-shaped hint would (a) guess `bots.json` wrongly for a custom filename
+  // and (b) rank BELOW an ambient stale BOTS_CONFIG in a shared tmux server's
+  // global env — which would silently hand the child a foreign registry.
+  // cfg.loadedBotsConfigPath is the daemon-frozen getLoadedConfigPath(), already
+  // the host-owned authority the sandbox fs-policy denies on.
+  //
+  // The decision turns on PROVENANCE, never on whether the file exists right now.
+  // A real 'loaded' authority is pinned UNCONDITIONALLY, even if it has since
+  // vanished: the child then fails loudly in the loader ("BOTS_CONFIG file not
+  // found") instead of silently falling back to `<its own HOME>/.botmux/bots.json`,
+  // which under a multi-fleet non-default HOME is a DIFFERENT registry (another
+  // fleet's secret + routing under the same appId). A 'synthetic' core-only
+  // placeholder was never parsed, so there is no authority to propagate and the
+  // key is DELETED — an inherited stale value must not survive either, because
+  // BOTS_CONFIG tops the precedence chain.
+  {
+    const pinned = resolveChildBotsConfig(
+      cfg.loadedBotsConfigPath,
+      cfg.loadedBotsConfigProvenance,
+    );
+    if (pinned) childEnv.BOTS_CONFIG = pinned;
+    else delete childEnv.BOTS_CONFIG;
+  }
   // Explicit, HOST-DECIDED read-isolation marker. The CLI needs to tell
   // "bots.json is denied because I'm sandboxed (expected)" from "bots.json is
   // unreadable (real fault)" — see underReadIsolation() in read-isolation.ts.
@@ -16331,6 +16370,7 @@ process.on('message', async (raw: unknown) => {
           dispatchAttempt: msg.dispatchAttempt,
           codexAppDispatchId: msg.codexAppDispatchId,
           ...(msg.codexAppSteerable ? { codexAppSteerable: true } : {}),
+          ...(msg.atMostOnce ? { atMostOnce: true } : {}),
           queuedActivationToken: msg.queuedActivationToken,
           replyTurnId: msg.replyTurnId,
           vcMeetingImTurnOrigin: msg.vcMeetingImTurnOrigin,

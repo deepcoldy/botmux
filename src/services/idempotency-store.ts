@@ -38,6 +38,17 @@ import { atomicWriteFileSync } from '../utils/atomic-write.js';
 
 export type IdempotencyState = 'reserved' | 'attempting';
 
+/** Which dispatch seam a lease governs. `fresh` = a fresh async-virtual session
+ *  (one lease → one throwaway session, #776). `turn` = a follow-up turn on an
+ *  EXISTING, potentially long-lived SHARED session (#71). The kind is an
+ *  UNFORGEABLE domain separator baked into the on-disk key derivation, NOT a
+ *  user-supplied string: a caller cannot craft a `fresh` key that collides with
+ *  a `turn` lease (or vice-versa) because the kind participates in the file hash.
+ *  Reconcile also reads it to avoid fresh-only teardown (closeSession) on a turn
+ *  lease whose session is shared and must survive. Absent on disk = legacy
+ *  pre-#71 record → treated as `fresh` (the only kind that existed then). */
+export type IdempotencyKind = 'fresh' | 'turn';
+
 export interface IdempotencyRecord {
   ownerLarkAppId: string;
   sessionId: string;
@@ -48,6 +59,9 @@ export interface IdempotencyRecord {
   state: IdempotencyState;
   createdAt: number;
   updatedAt: number;
+  /** Dispatch seam this lease governs (see IdempotencyKind). Omitted on legacy
+   *  pre-#71 records → read as 'fresh'. */
+  kind?: IdempotencyKind;
 }
 
 export type ClaimResult =
@@ -76,10 +90,22 @@ function ownerDir(ownerLarkAppId: string): string {
   return join(baseDir(), ownerHash);
 }
 
-/** Filename = <ownerDir>/sha256(owner \0 key).json. The NUL-separated key digest
- *  keeps the same collision-free filename; the owner subdir gives partitioning. */
-function fileFor(ownerLarkAppId: string, key: string): string {
-  const digest = createHash('sha256').update(ownerLarkAppId).update('\0').update(key).digest('hex');
+/** Filename = <ownerDir>/sha256(owner \0 [kind \0] key).json. The kind participates
+ *  in the digest as an UNFORGEABLE domain separator: a `fresh` key and a `turn`
+ *  key with the same string land on DIFFERENT files, so a caller cannot forge a
+ *  fresh `idempotencyKey` that collides with a `turn:` lease (codex #818 P1). The
+ *  NUL separators keep the digest collision-free.
+ *
+ *  BACKWARD COMPAT: `fresh` reproduces the EXACT pre-#71 digest `sha256(owner \0
+ *  key)` (no kind segment at all), so leases written by older builds keep their
+ *  path across upgrade. Only the new `turn` kind inserts a `kind \0` segment. A
+ *  user-supplied fresh key can't reach the turn keyspace because it never gets
+ *  the `turn\0` prefix injected here — the kind is a trusted call-site argument,
+ *  not derived from the key string. */
+function fileFor(ownerLarkAppId: string, key: string, kind: IdempotencyKind = 'fresh'): string {
+  const h = createHash('sha256').update(ownerLarkAppId).update('\0');
+  if (kind !== 'fresh') h.update(kind).update('\0');
+  const digest = h.update(key).digest('hex');
   return join(ownerDir(ownerLarkAppId), `${digest}.json`);
 }
 
@@ -137,8 +163,8 @@ function sameIdentity(a: IdempotencyRecord, b: {
 /** Non-locking read for the pre-check in trigger-session (a fast reject before
  *  creating a session). Owner mismatch → undefined. Corrupt → THROWS. The
  *  authoritative decision is always re-taken under the lock in claim/takeover. */
-export function lookup(ownerLarkAppId: string, key: string): IdempotencyRecord | undefined {
-  const rec = readRecord(fileFor(ownerLarkAppId, key));
+export function lookup(ownerLarkAppId: string, key: string, kind: IdempotencyKind = 'fresh'): IdempotencyRecord | undefined {
+  const rec = readRecord(fileFor(ownerLarkAppId, key, kind));
   if (!rec) return undefined;
   if (rec.ownerLarkAppId !== ownerLarkAppId) return undefined;
   return rec;
@@ -151,9 +177,10 @@ export function lookup(ownerLarkAppId: string, key: string): IdempotencyRecord |
  */
 export function claim(input: {
   ownerLarkAppId: string; sessionId: string; triggerId: string;
-  requestHash: string; ownerBootId: string; key: string; now: number;
+  requestHash: string; ownerBootId: string; key: string; now: number; kind?: IdempotencyKind;
 }): ClaimResult {
-  const fp = fileFor(input.ownerLarkAppId, input.key);
+  const kind: IdempotencyKind = input.kind ?? 'fresh';
+  const fp = fileFor(input.ownerLarkAppId, input.key, kind);
   return withKeyLock(fp, () => {
     const existing = readRecord(fp);
     if (existing) {
@@ -165,6 +192,7 @@ export function claim(input: {
       ownerLarkAppId: input.ownerLarkAppId, sessionId: input.sessionId, triggerId: input.triggerId,
       requestHash: input.requestHash, ownerBootId: input.ownerBootId,
       revision: 1, state: 'reserved', createdAt: input.now, updatedAt: input.now,
+      ...(kind !== 'fresh' ? { kind } : {}),
     };
     writeRecord(fp, rec);
     return { kind: 'won', record: rec };
@@ -186,9 +214,10 @@ export function claim(input: {
  */
 export function takeover(input: {
   ownerLarkAppId: string; key: string; expect: IdempotencyRecord;
-  sessionId: string; triggerId: string; requestHash: string; ownerBootId: string; now: number;
+  sessionId: string; triggerId: string; requestHash: string; ownerBootId: string; now: number; kind?: IdempotencyKind;
 }): ClaimResult {
-  const fp = fileFor(input.ownerLarkAppId, input.key);
+  const kind: IdempotencyKind = input.kind ?? 'fresh';
+  const fp = fileFor(input.ownerLarkAppId, input.key, kind);
   return withKeyLock(fp, () => {
     const current = readRecord(fp);
     if (!current) {
@@ -196,6 +225,7 @@ export function takeover(input: {
         ownerLarkAppId: input.ownerLarkAppId, sessionId: input.sessionId, triggerId: input.triggerId,
         requestHash: input.requestHash, ownerBootId: input.ownerBootId,
         revision: 1, state: 'reserved', createdAt: input.now, updatedAt: input.now,
+        ...(kind !== 'fresh' ? { kind } : {}),
       };
       writeRecord(fp, rec);
       return { kind: 'won', record: rec };
@@ -218,6 +248,7 @@ export function takeover(input: {
       ownerLarkAppId: input.ownerLarkAppId, sessionId: input.sessionId, triggerId: input.triggerId,
       requestHash: input.requestHash, ownerBootId: input.ownerBootId,
       revision: current.revision + 1, state: 'reserved', createdAt: current.createdAt, updatedAt: input.now,
+      ...(kind !== 'fresh' ? { kind } : {}),
     };
     writeRecord(fp, rec);
     return { kind: 'won', record: rec };
@@ -228,9 +259,9 @@ export function takeover(input: {
  *  before writing (rejects a stale/foreign writer). Returns the written record. */
 export function transition(
   ownerLarkAppId: string, key: string, from: IdempotencyRecord,
-  patch: { state: IdempotencyState; now: number },
+  patch: { state: IdempotencyState; now: number }, kind: IdempotencyKind = 'fresh',
 ): IdempotencyRecord {
-  const fp = fileFor(ownerLarkAppId, key);
+  const fp = fileFor(ownerLarkAppId, key, kind);
   return withKeyLock(fp, () => {
     const current = readRecord(fp);
     if (!current) throw new Error('idempotency transition: record vanished');
@@ -261,8 +292,8 @@ function strictUnlink(fp: string): void {
  *  delete) instead of swallowing both (finding #1). A lock-internal re-read
  *  corruption or an ambiguous unlink error (EIO/EROFS/…) THROWS — the caller
  *  must be able to trust that `removed` means the lease is truly released. */
-export function compareAndRemove(ownerLarkAppId: string, key: string, expect: IdempotencyRecord): RemoveByPathResult {
-  return compareAndRemoveByPath(fileFor(ownerLarkAppId, key), expect);
+export function compareAndRemove(ownerLarkAppId: string, key: string, expect: IdempotencyRecord, kind: IdempotencyKind = 'fresh'): RemoveByPathResult {
+  return compareAndRemoveByPath(fileFor(ownerLarkAppId, key, kind), expect);
 }
 
 /** Enumerate the leases owned by a SINGLE bot (boot reconcile is owner-scoped).

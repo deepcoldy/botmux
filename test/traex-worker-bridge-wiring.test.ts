@@ -174,7 +174,7 @@ describe('TRAE worker structured-bridge wiring', () => {
     const end = workerSource.indexOf('\n}\n', start);
     const follower = workerSource.slice(start, end);
 
-    expect(follower).toContain('findTraexRolloutByPid(pid)');
+    expect(follower).toContain('findTraexRolloutByPid(pid, currentSid)');
     expect(follower).toContain('persistCliSessionId(observed.cliSessionId);');
     expect(follower).toContain('codexBridgeNotifyCliSessionId(observed.cliSessionId);');
   });

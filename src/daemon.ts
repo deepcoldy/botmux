@@ -168,6 +168,7 @@ import {
   withActiveSessionKeyLock,
   getDaemonBootId,
   getDaemonStreamingCardUsageSnapshot,
+  postTurnStartingCard,
   isSessionTransferring,
   type WorkerSessionReplyOptions,
   migrateMojoSessionIdentities,
@@ -4232,7 +4233,7 @@ function getActiveCount(): number {
  * this, passthrough commands silently PATCH the previous card and the user
  * sees no visible response.
  */
-function beginNewTurn(ds: DaemonSession, title: string): void {
+function beginNewTurn(ds: DaemonSession, title: string, turnId: string): void {
   // docCommentTargets 改为 per-turn map（按 turnId 索引），不再需要每轮清空：
   // 非文档轮的 BOTMUX_TURN_ID 不会命中 map，天然不会误投；旧 entry 由
   // deliverFinalOutput / botmux send 成功路径清理。
@@ -4283,9 +4284,12 @@ function beginNewTurn(ds: DaemonSession, title: string): void {
   }
   ds.usageLimit = undefined;
   ds.streamCardPending = true;
+  ds.streamCardPendingTurnId = turnId;
+  ds.streamCardTurnGeneration = (ds.streamCardTurnGeneration ?? 0) + 1;
   ds.currentTurnTitle = title.substring(0, 50);
   ds.currentImageKey = undefined;
   persistStreamCardState(ds);
+  void postTurnStartingCard(ds, sessionReply, turnId);
 }
 
 /**
@@ -4325,7 +4329,7 @@ async function prewarmDocCommentSession(ds: DaemonSession, sub: DocSubscription)
     );
   }
 
-  beginNewTurn(ds, title);
+  beginNewTurn(ds, title, turnId);
   ds.lastMessageAt = Date.now();
   ds.session.lastMessageAt = new Date(ds.lastMessageAt).toISOString();
   if (sub.workingDir && (!ds.worker || ds.worker.killed)) {
@@ -16285,7 +16289,7 @@ function deliverPassthroughToExistingSession(
     // clearing the marker would lose the opening for the next real turn.
     // `/model` on an empty-started session therefore stays literal and the
     // FOLLOWING business message still opens as a new topic.
-    beginNewTurn(ds, commandContent);
+    beginNewTurn(ds, commandContent, turn.messageId);
     sendWorkerSessionInput(ds, {
       type: 'raw_input',
       content: commandContent,
@@ -18982,7 +18986,7 @@ async function handleThreadReplyAdmitted(
           codexAppApplicationContext,
           codexAppMessageContext,
         });
-    beginNewTurn(ds, parsed.content);
+    beginNewTurn(ds, parsed.content, parsed.messageId);
     await noteTurnReceived(ds, parsed.messageId, parsed.content, turnSender, parsed.messageId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
     // Codex App steer authorization was computed ONCE before the branch split
     // above (R4-B1); reuse the same frozen value here for the live-worker path.
@@ -19031,6 +19035,8 @@ async function handleThreadReplyAdmitted(
     // new Worker card until the next screenshot upload, which makes a fresh
     // @mention appear to resurrect the wrong CLI UI.
     ds.streamCardPending = true;
+    ds.streamCardPendingTurnId = parsed.messageId;
+    ds.streamCardTurnGeneration = (ds.streamCardTurnGeneration ?? 0) + 1;
     ds.currentImageKey = undefined;
     persistStreamCardState(ds);
     // Wrap the user message in the same `<user_message>` / `<session_id>` /
@@ -19617,7 +19623,7 @@ async function handleDocCommentAdmitted(ctx: DocCommentContext): Promise<boolean
           sender,
           mode: 'live',
         });
-        beginNewTurn(ds, text);
+        beginNewTurn(ds, text, turnId);
         (ds.session.docCommentTargets ??= {})[turnId] = docTarget; // per-turn map，不覆盖其他并发轮
         // rememberLastCliInput persists both the exact comment target and the
         // structured sidecar before any worker-visible delivery can occur.
@@ -19643,6 +19649,8 @@ async function handleDocCommentAdmitted(ctx: DocCommentContext): Promise<boolean
       ds.streamCardId = undefined;
       ds.streamCardNonce = undefined;
       ds.streamCardPending = true;
+      ds.streamCardPendingTurnId = turnId;
+      ds.streamCardTurnGeneration = (ds.streamCardTurnGeneration ?? 0) + 1;
       ds.currentImageKey = undefined;
       persistStreamCardState(ds);
       // Skip whiteboard ensure for adopted (bridge) sessions on re-fork — mirrors

@@ -2579,7 +2579,7 @@ button.primary {
   animation: board-led-pulse 1.6s ease-in-out infinite;
 }
 
-.session-board-starting {
+.session-board-todo {
   --col-signal: var(--warning);
 }
 
@@ -2919,6 +2919,163 @@ button.primary {
 .drawer-status-line .session-lock-badge {
   margin-left: 0;
 }
+
+/* 任务态徽标：告诉人「这张卡为什么在待办列」——机器空闲但还有未完成 TODO。
+   琥珀色区别于运行态 status（灰/蓝/绿），hasInProgress 时加脉冲圆点。 */
+/* 待办徽标：柔和描边 + 透明底（信息态，不喧宾夺主）。色调用偏红的橙红，
+   比原来的黄橙更有"该处理"的提示感，又不像红色报错。 */
+.session-todo-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 2px 8px;
+  border-radius: var(--radius-full);
+  font-family: var(--mono);
+  font-weight: 700;
+  font-size: 11px;
+  line-height: 1.3;
+  letter-spacing: 0.02em;
+  white-space: nowrap;
+  color: #c2410c;
+  background: color-mix(in srgb, #ea580c 12%, transparent);
+  border: 1px solid color-mix(in srgb, #ea580c 36%, transparent);
+  position: relative;
+  cursor: help;
+}
+
+.session-todo-badge.pinned {
+  color: #c2410c;
+  background: color-mix(in srgb, #ea580c 22%, transparent);
+  border-color: color-mix(in srgb, #ea580c 55%, transparent);
+  cursor: pointer;
+}
+
+.session-todo-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #ea580c;
+  animation: todo-pulse 1.6s ease-in-out infinite;
+}
+
+@keyframes todo-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.3; }
+}
+
+/* 悬浮浮层：列出每条 TODO 的状态字形 + 文字。portal 到 body、fixed 定位（卡片/列
+   都是 overflow:hidden，绝对定位会被裁）。JS 控制挂载，位置由行内 left/top 给。
+   两态：hover 悬浮预览（移开即关）；pinned 点击固定（不自动消失，文字可选中复制）。 */
+.session-todo-pop {
+  position: fixed;
+  z-index: 2000;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 220px;
+  max-width: 360px;
+  padding: 10px 12px;
+  border-radius: var(--radius-md, 8px);
+  background: var(--surface-raised, #1b1f2a);
+  border: 1px solid var(--border, rgba(255, 255, 255, 0.12));
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.35);
+  color: var(--fg, #18202a);
+  font-family: var(--sans, inherit);
+  font-weight: 400;
+  letter-spacing: 0;
+  white-space: normal;
+  animation: todo-pop-in 0.12s ease;
+  user-select: none;
+}
+
+/* 固定态：文字可选中复制，边框更实以区分「已锁定」。 */
+.session-todo-pop.pinned {
+  user-select: text;
+  border-color: color-mix(in srgb, var(--warning, #f5a623) 45%, var(--border, rgba(255, 255, 255, 0.12)));
+}
+
+@keyframes todo-pop-in {
+  from { opacity: 0; transform: translateY(-4px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+.session-todo-pop-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--muted, #9aa3b2);
+  padding-bottom: 4px;
+  border-bottom: 1px solid var(--border, rgba(255, 255, 255, 0.1));
+}
+
+.session-todo-pop-title {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.session-todo-pop-hint {
+  flex: none;
+  font-weight: 500;
+  font-size: 10px;
+  opacity: 0.7;
+}
+
+.session-todo-pop-copy {
+  flex: none;
+  cursor: pointer;
+  font-family: var(--sans, inherit);
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--warning, #f5a623);
+  background: color-mix(in srgb, var(--warning, #f5a623) 14%, transparent);
+  border: 1px solid color-mix(in srgb, var(--warning, #f5a623) 40%, transparent);
+  border-radius: var(--radius-sm, 5px);
+  padding: 2px 8px;
+  line-height: 1.4;
+  transition: background 0.1s ease;
+}
+
+.session-todo-pop-copy:hover {
+  background: color-mix(in srgb, var(--warning, #f5a623) 24%, transparent);
+}
+
+.session-todo-pop-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-height: 320px;
+  overflow-y: auto;
+}
+
+.session-todo-pop-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.session-todo-pop-glyph {
+  flex: none;
+  width: 14px;
+  text-align: center;
+  font-family: var(--mono);
+  font-weight: 700;
+}
+
+/* 完成项最浅（灰+删除线），未完成项更深、进行中最深加粗——让「还没做的」在视觉上更突出。
+   注意用 --fg / --faint（本主题真实存在的 token）；早前误用未定义的 --text/--text-secondary，
+   会回退到近白色 #e6e8ee，在浅色模式下几乎看不清。 */
+.session-todo-pop-item.st-completed { color: var(--faint, #7b8798); }
+.session-todo-pop-item.st-completed .session-todo-pop-text { text-decoration: line-through; }
+.session-todo-pop-item.st-completed .session-todo-pop-glyph { color: var(--success, #15803d); }
+.session-todo-pop-item.st-in-progress { color: var(--fg, #18202a); font-weight: 700; }
+.session-todo-pop-item.st-in-progress .session-todo-pop-glyph { color: var(--warning, #b7791f); }
+.session-todo-pop-item.st-pending { color: var(--fg, #18202a); }
+.session-todo-pop-item.st-pending .session-todo-pop-glyph { color: var(--muted, #627084); }
 
 .session-signal {
   display: inline-flex;
@@ -10096,7 +10253,7 @@ button.contrast:hover { background: var(--danger-soft); border-color: var(--dang
 .session-board-count { border-radius: var(--radius-full); font-family: inherit; }
 .session-board-needs-you { --col-signal: var(--warning); }
 .session-board-needs-you { background: color-mix(in srgb, var(--warning) 4%, var(--surface)); }
-.session-board-starting { --col-signal: var(--info); }
+.session-board-todo { --col-signal: var(--info); }
 .session-board-working { --col-signal: var(--accent); }
 .session-board-idle { --col-signal: var(--success); }
 :root[data-theme="dark"] .session-board-needs-you {
@@ -24362,12 +24519,64 @@ dialog.onboarding-dialog .onboarding-technical > code {
   display: grid;
   gap: var(--cs-inner-gap);
 }
-.create-session-modal .cs-bot-list {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: var(--cs-inner-gap);
+
+/* Shared searchable bot multi-select (create-session + new-group + add-bots).
+   The list has a fixed max-height and scrolls internally so a long roster never
+   grows the surrounding dialog past the viewport — the dialog action buttons
+   stay reachable regardless of how many bots exist. */
+.bot-multi-select {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
 }
+.bot-multi-select-search {
+  width: 100%;
+  box-sizing: border-box;
+}
+.bot-multi-select-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-height: 240px;
+  overflow-y: auto;
+  padding: 2px;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-sm, 8px);
+}
+.bot-multi-select-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  border-radius: var(--radius-sm, 8px);
+  cursor: pointer;
+}
+.bot-multi-select-row:hover {
+  background: var(--surface-hover, rgba(127, 127, 127, 0.12));
+}
+.bot-multi-select-main {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  min-width: 0;
+}
+.bot-multi-select-main strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.bot-multi-select-main small {
+  color: var(--text-muted, #888);
+  flex: 0 0 auto;
+}
+.bot-multi-select-empty {
+  color: var(--text-muted, #888);
+  margin: 4px 0;
+}
+.bot-multi-select-count {
+  color: var(--text-muted, #888);
+}
+
 .create-session-modal .cs-mode,
 .create-session-modal .cs-column {
   display: flex;
@@ -24379,7 +24588,6 @@ dialog.onboarding-dialog .onboarding-technical > code {
 .create-session-modal .cs-column legend {
   flex: 0 0 100%;
 }
-.create-session-modal .cs-bot,
 .create-session-modal .cs-mode label,
 .create-session-modal .cs-column label {
   position: relative;
@@ -24403,7 +24611,7 @@ dialog.onboarding-dialog .onboarding-technical > code {
     background-color 150ms ease,
     color 150ms ease;
 }
-.create-session-modal :where(.cs-bot, .cs-mode label, .cs-column label)::before {
+.create-session-modal :where(.cs-mode label, .cs-column label)::before {
   content: "";
   width: 8px;
   height: 8px;
@@ -24412,37 +24620,30 @@ dialog.onboarding-dialog .onboarding-technical > code {
   background: var(--border-soft);
   box-shadow: inset 0 0 0 1px var(--border);
 }
-.create-session-modal .cs-bot {
-  width: auto;
-  min-width: 120px;
-  max-width: min(220px, 100%);
-  margin: 0;
-}
-.create-session-modal :where(.cs-bot, .cs-mode label, .cs-column label) span {
+.create-session-modal :where(.cs-mode label, .cs-column label) span {
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
 }
-.create-session-modal .cs-bot:hover,
 .create-session-modal .cs-mode label:hover,
 .create-session-modal .cs-column label:hover {
   border-color: color-mix(in srgb, var(--accent) 42%, var(--border-soft));
   background: color-mix(in srgb, var(--accent) 6%, var(--surface));
 }
-.create-session-modal :where(.cs-bot, .cs-mode label, .cs-column label):has(input:checked) {
+.create-session-modal :where(.cs-mode label, .cs-column label):has(input:checked) {
   border-color: color-mix(in srgb, var(--accent) 52%, var(--border-soft));
   background: color-mix(in srgb, var(--accent) 9%, var(--surface));
   color: var(--accent-strong);
 }
-.create-session-modal :where(.cs-bot, .cs-mode label, .cs-column label):has(input:checked)::before {
+.create-session-modal :where(.cs-mode label, .cs-column label):has(input:checked)::before {
   background: var(--accent);
   box-shadow: 0 0 0 3px var(--accent-soft);
 }
-.create-session-modal :where(.cs-bot, .cs-mode label, .cs-column label):has(input:focus-visible) {
+.create-session-modal :where(.cs-mode label, .cs-column label):has(input:focus-visible) {
   outline: 2px solid var(--accent);
   outline-offset: 2px;
 }
-.create-session-modal :where(.cs-bot, .cs-mode label, .cs-column label) input {
+.create-session-modal :where(.cs-mode label, .cs-column label) input {
   position: absolute;
   width: 1px;
   height: 1px;
@@ -24610,43 +24811,7 @@ dialog.create-session-modal .cs-advanced input.cs-pill-input[type="text"]:focus 
   background: color-mix(in srgb, var(--accent) 8%, transparent);
   color: var(--accent-strong);
 }
-.create-session-modal .cs-empty {
-  margin: 0;
-  padding: var(--cs-gap);
-  border: 1px solid var(--border-soft);
-  border-radius: var(--radius-lg);
-  background: var(--surface);
-  color: var(--muted);
-}
 .create-session-modal .cs-warn { color: var(--warning); }
-dialog.create-session-modal input.cs-bot-search[type="search"] {
-  box-sizing: border-box;
-  display: block;
-  width: 100%;
-  height: var(--button-height) !important;
-  min-height: var(--button-height) !important;
-  max-height: var(--button-height) !important;
-  padding: 0 var(--button-padding-x) !important;
-  border: 1px solid var(--border-soft) !important;
-  /* Mirrors .cs-pill-input: the legacy global input reset uses high-specificity chained :not() selectors. */
-  border-radius: var(--radius-full) !important;
-  background: var(--surface) !important;
-  background-clip: padding-box;
-  color: var(--fg);
-  font: inherit;
-  font-size: 13px;
-  line-height: normal;
-  outline: none;
-  appearance: none;
-  -webkit-appearance: none;
-}
-dialog.create-session-modal input.cs-bot-search[type="search"]:hover {
-  border-color: color-mix(in srgb, var(--accent) 42%, var(--border-soft)) !important;
-}
-dialog.create-session-modal input.cs-bot-search[type="search"]:focus {
-  border-color: var(--accent) !important;
-  box-shadow: 0 0 0 3px var(--accent-soft);
-}
 .create-session-modal .cs-keep-open {
   display: inline-flex;
   align-items: center;

@@ -57,6 +57,10 @@ vi.mock('../src/bot-registry.js', () => ({
   })),
   getAllBots: vi.fn(() => []),
   getLoadedConfigPath: vi.fn(() => '/home/u/.botmux/bots.json'),
+  // Provenance travels with the path (see core/config-dir.ts): 'loaded' = the
+  // daemon really parsed that file, which is what forkWorker freezes into the
+  // worker init message alongside loadedBotsConfigPath.
+  getLoadedConfigProvenance: vi.fn(() => 'loaded' as const),
   loadBotConfigs: vi.fn(() => [{
     larkAppId: 'app_test',
     larkAppSecret: 'secret',
@@ -1914,6 +1918,25 @@ describe('session.start lifecycle integration', () => {
     vi.unstubAllEnvs();
   });
 
+  it('removes leaked workflow identity from the daemon→worker fork env', () => {
+    vi.stubEnv('BOTMUX_WORKFLOW', '1');
+    vi.stubEnv('BOTMUX_WORKFLOW_RUN_ID', 'run-leaked');
+    vi.stubEnv('BOTMUX_WORKFLOW_NODE_ID', 'node-leaked');
+    vi.stubEnv('BOTMUX_V3_GOAL', '1');
+    vi.stubEnv('BOTMUX_GOAL_ATTEMPT_DIR', '/tmp/leaked-attempt');
+
+    forkWorker(makeDs(), 'hello', false);
+
+    const forkOpts = forkMock.mock.calls.at(-1)?.[2] as { env?: Record<string, string | undefined> } | undefined;
+    expect(forkOpts?.env?.BOTMUX_WORKFLOW).toBeUndefined();
+    expect(forkOpts?.env?.BOTMUX_WORKFLOW_RUN_ID).toBeUndefined();
+    expect(forkOpts?.env?.BOTMUX_WORKFLOW_NODE_ID).toBeUndefined();
+    expect(forkOpts?.env?.BOTMUX_V3_GOAL).toBeUndefined();
+    expect(forkOpts?.env?.BOTMUX_GOAL_ATTEMPT_DIR).toBeUndefined();
+
+    vi.unstubAllEnvs();
+  });
+
   it('re-checks the resident-session cap after spawn and again on an idle edge', async () => {
     const enforceLiveSessionCap = vi.fn();
     initWorkerPool({
@@ -2093,6 +2116,31 @@ describe('session.start lifecycle integration', () => {
     const forkOpts = forkMock.mock.calls.at(-1)?.[2] as { env?: Record<string, string | undefined> } | undefined;
     expect(forkOpts?.env?.GITHUB_TOKEN).toBeUndefined();
     expect(forkOpts?.env?.GH_TOKEN).toBeUndefined();
+
+    vi.unstubAllEnvs();
+  });
+
+  it('removes leaked workflow identity from the daemon→adopt-worker fork env', () => {
+    vi.stubEnv('BOTMUX_WORKFLOW', '1');
+    vi.stubEnv('BOTMUX_WORKFLOW_PTY_LOG_PATH', '/tmp/leaked-pty.log');
+    vi.stubEnv('BOTMUX_V3_GOAL', '1');
+    vi.stubEnv('BOTMUX_GOAL_MANIFEST_PATH', '/tmp/leaked-manifest.json');
+
+    forkAdoptWorker(makeDs({
+      adoptedFrom: {
+        tmuxTarget: 'bmx-deadbeef:0.0',
+        originalCliPid: 23456,
+        sessionId: 'codex-session',
+        cliId: 'codex',
+        cwd: '/repo',
+      },
+    }));
+
+    const forkOpts = forkMock.mock.calls.at(-1)?.[2] as { env?: Record<string, string | undefined> } | undefined;
+    expect(forkOpts?.env?.BOTMUX_WORKFLOW).toBeUndefined();
+    expect(forkOpts?.env?.BOTMUX_WORKFLOW_PTY_LOG_PATH).toBeUndefined();
+    expect(forkOpts?.env?.BOTMUX_V3_GOAL).toBeUndefined();
+    expect(forkOpts?.env?.BOTMUX_GOAL_MANIFEST_PATH).toBeUndefined();
 
     vi.unstubAllEnvs();
   });

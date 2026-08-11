@@ -16,6 +16,7 @@ import {
 } from '../src/core/maintenance.js';
 import type { MaintenanceConfig } from '../src/global-config.js';
 import type { RestartIntent } from '../src/services/restart-intent-store.js';
+import { WORKFLOW_WORKER_ENV_KEYS } from '../src/utils/child-env.js';
 
 // 2026-06-07T04:00:00Z === 2026-06-07 12:00 local (Asia/Shanghai)
 const NOON = Date.parse('2026-06-07T04:00:00.000Z');
@@ -205,11 +206,13 @@ describe('detachedRestartEnv', () => {
       // else a detached restart keeps the stale proxy base instead of reloading
       // it from ~/.botmux/.env.
       BOTMUX_PUBLIC_URL: 'http://stale.proxy.example.com',
+      ...Object.fromEntries(WORKFLOW_WORKER_ENV_KEYS.map((key) => [key, 'leaked'])),
       PATH: '/usr/bin',
     };
 
     expect(detachedRestartEnv(inherited)).toEqual({ PATH: '/usr/bin' });
     expect(inherited.WEB_EXTERNAL_HOST).toBe('10.255.64.131');
+    expect(inherited.BOTMUX_WORKFLOW).toBe('leaked');
   });
 });
 

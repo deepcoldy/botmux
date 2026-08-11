@@ -97,7 +97,7 @@ import { hasProtectedSessionMutationOwnership } from './core/session-mutation-gu
 import type { BackendType, PersistentBackendTarget, SessionProbe } from './adapters/backend/types.js';
 import { logger } from './utils/logger.js';
 import { withFileLock, withFileLockSync } from './utils/file-lock.js';
-import { scrubClaudeSessionMarkerEnv, scrubSessionCliHomeEnv } from './utils/child-env.js';
+import { scrubClaudeSessionMarkerEnv, scrubSessionCliHomeEnv, scrubWorkflowWorkerEnv } from './utils/child-env.js';
 import { scheduleTimeZone } from './utils/timezone.js';
 import { expandHomePath, invalidWorkingDirs } from './utils/working-dir.js';
 import { firstPositional } from './cli/arg-utils.js';
@@ -365,6 +365,10 @@ function pm2Env(home: string = PM2_HOME): NodeJS.ProcessEnv {
   // they eventually flip transcript saving off fleet-wide once the tmux server
   // respawns from a poisoned daemon (see CLAUDE_SESSION_MARKER_ENV_KEYS).
   scrubClaudeSessionMarkerEnv(env);
+  // Workflow/goal markers identify one short-lived node worker. Persisting
+  // them in PM2 would make every daemon — and then every ordinary chat worker
+  // it forks — run in workflow mode after a restart initiated from that node.
+  scrubWorkflowWorkerEnv(env);
   return env;
 }
 

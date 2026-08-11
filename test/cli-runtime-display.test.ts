@@ -66,4 +66,15 @@ describe('CLI runtime display identity', () => {
     expect(body).toContain('sessionConfiguredRuntimeDisplayName(ds.session, dsBotCfg.cliRuntime)');
     expect(body).toMatch(/getDaemonStreamingCardUsageSnapshot[\s\S]*runtimeDisplayName,/);
   });
+
+  it('starts the current turn card at message acceptance instead of waiting for terminal redraw', () => {
+    const source = readFileSync(new URL('../src/daemon.ts', import.meta.url), 'utf8');
+    const begin = source.indexOf('function beginNewTurn(');
+    const end = source.indexOf('\nfunction ', begin + 1);
+    const body = source.slice(begin, end);
+
+    expect(body).toContain('postTurnStartingCard(ds, sessionReply, turnId)');
+    expect(body).toContain('ds.streamCardPendingTurnId = turnId');
+    expect(body).toContain('ds.streamCardTurnGeneration = (ds.streamCardTurnGeneration ?? 0) + 1');
+  });
 });

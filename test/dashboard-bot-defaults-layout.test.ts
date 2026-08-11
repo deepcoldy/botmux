@@ -78,6 +78,26 @@ describe('bot defaults focused layout', () => {
     expect(runtimeEnv).toContain('<LaunchShellSection');
   });
 
+  it('hides the backend picker for EVERY remote CLI, not just riff', () => {
+    // reconcileRiffBackendType rewrites backendType to the CLI's own name for
+    // any isRemoteBackendId(cliId), so offering pty/tmux to a remote bot renders
+    // a choice the spawn layer silently overwrites. Gate on the shared set so a
+    // third remote CLI cannot reintroduce the phantom control.
+    expect(page).toContain("import { isRemoteCliId } from '../../core/remote-cli-ids.js';");
+    expect(page).toMatch(/\{!isRemoteCliId\(bot\.cliId\) \? \(\s*<section className="bd-tile"><BackendTypeSection/);
+    // No open-coded riff-only gate may guard the backend picker again.
+    expect(page).not.toMatch(/bot\.cliId !== 'riff' \? \(\s*<section className="bd-tile"><BackendTypeSection/);
+  });
+
+  it('keeps the file sandbox visible for mojo while hiding it for riff', () => {
+    // Not symmetric with the backend picker on purpose: riff executes only in a
+    // remote sandbox, but a mojo turn can spawn LOCALLY (cloud optional), so its
+    // file-sandbox settings still bite. Treating "remote" as "no local exec"
+    // here would silently drop isolation.
+    expect(page).toMatch(/bot\.cliId !== 'riff' \? \(\s*<section className="bd-tile"><SandboxSection/);
+    expect(page).not.toMatch(/isRemoteCliId\(bot\.cliId\)[^\n]*<SandboxSection/);
+  });
+
   it('ships localized labels for every task category', () => {
     for (const key of ['tabCommon', 'tabSessions', 'tabSecurity', 'tabCards', 'tabAdvanced']) {
       expect(i18n.match(new RegExp(`'botDefaults\\.${key}'`, 'g'))).toHaveLength(2);

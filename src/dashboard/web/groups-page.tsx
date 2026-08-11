@@ -15,6 +15,7 @@ import { useT } from './react-hooks.js';
 import { botOrbStyle, chatAvatarUrlFor } from './ui.js';
 import { copyText } from './clipboard.js';
 import { FeedGroupPicker } from './feed-group-picker.js';
+import { BotMultiSelect } from './bot-multi-select.js';
 import {
   CreateActionButton,
   DropdownMenu,
@@ -126,19 +127,25 @@ function DialogError(props: DialogErrorState) {
   );
 }
 
-function BotCheckboxes(props: { bots: GroupBot[]; excludeIds?: Set<string> }) {
+function BotCheckboxes(props: {
+  bots: GroupBot[];
+  excludeIds?: Set<string>;
+  tr: Translator;
+  selected: Set<string>;
+  onToggle(larkAppId: string, checked: boolean): void;
+}) {
+  const options = availableBotsForPicker(props.bots, props.excludeIds);
+  const tr = props.tr;
   return (
-    <>
-      {availableBotsForPicker(props.bots, props.excludeIds).map(bot => (
-        <label className="checkbox-row" key={bot.larkAppId}>
-          <input type="checkbox" name="bot" value={bot.larkAppId} />
-          <span className="checkbox-row-main">
-            <strong>{bot.botName ?? bot.larkAppId}</strong>
-            <small>({bot.larkAppId})</small>
-          </span>
-        </label>
-      ))}
-    </>
+    <BotMultiSelect
+      bots={options}
+      selected={props.selected}
+      onToggle={props.onToggle}
+      searchPlaceholder={tr('botPicker.searchPlaceholder')}
+      noMatchLabel={tr('botPicker.noMatch')}
+      emptyLabel={tr('botPicker.empty')}
+      selectedCountLabel={n => tr('botPicker.selectedCount', { n: String(n) })}
+    />
   );
 }
 
@@ -306,6 +313,7 @@ function CreateDialog(props: {
   const [error, setError] = useState<DialogErrorState | null>(null);
   const [success, setSuccess] = useState<any | null>(null);
   const [copied, setCopied] = useState(false);
+  const [selectedBots, setSelectedBots] = useState<Set<string>>(new Set());
   const [roleProfileId, setRoleProfileId] = useState('');
   const [feedGroups, setFeedGroups] = useState<FeedGroupOption[]>([]);
   const [feedGroupAppId, setFeedGroupAppId] = useState('');
@@ -394,7 +402,7 @@ function CreateDialog(props: {
     const name = String(fd.get('name') ?? '').trim();
     const bindWorkingDir = String(fd.get('bindWorkingDir') ?? '').trim();
     const roleProfileId = String(fd.get('roleProfileId') ?? '').trim();
-    const ids = fd.getAll('bot') as string[];
+    const ids = [...selectedBots];
     if (ids.length === 0) {
       setError({ title: '请选择 bot', reason: '至少选择一个 bot 后再创建群聊。' });
       return;
@@ -508,7 +516,16 @@ function CreateDialog(props: {
         <fieldset className="g-modal-field g-create-bots">
           <legend>{tr('groups.botPicker')}</legend>
           <div className="g-bot-picker">
-            <BotCheckboxes bots={props.bots} />
+            <BotCheckboxes
+              bots={props.bots}
+              tr={tr}
+              selected={selectedBots}
+              onToggle={(id, checked) => setSelectedBots(prev => {
+                const next = new Set(prev);
+                if (checked) next.add(id); else next.delete(id);
+                return next;
+              })}
+            />
           </div>
         </fieldset>
 
@@ -629,7 +646,7 @@ function CreateInviteNote(props: { resp: any }) {
   );
 }
 
-function AddBotsDialog(props: {
+export function AddBotsDialog(props: {
   chat: GroupChat;
   bots: GroupBot[];
   tr: Translator;
@@ -640,6 +657,7 @@ function AddBotsDialog(props: {
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<DialogErrorState | null>(null);
   const [summary, setSummary] = useState<{ result: AddBotsSummary; refreshError?: unknown } | null>(null);
+  const [selectedBots, setSelectedBots] = useState<Set<string>>(new Set());
   const inChatSet = useMemo(
     () => new Set((chat.memberBots ?? []).filter(member => member.inChat).map(member => member.larkAppId)),
     [chat],
@@ -647,8 +665,7 @@ function AddBotsDialog(props: {
 
   async function submit(ev: FormEvent<HTMLFormElement>): Promise<void> {
     ev.preventDefault();
-    const fd = new FormData(ev.currentTarget);
-    const ids = fd.getAll('bot') as string[];
+    const ids = [...selectedBots];
     if (ids.length === 0) {
       setError({ title: '请选择 bot', reason: '至少选择一个 bot 后再添加。' });
       setSummary(null);
@@ -693,7 +710,17 @@ function AddBotsDialog(props: {
       <header><h3>{tr('groups.addBots')} · {chat.name ?? chat.chatId}</h3></header>
       <p>{tr('groups.createHelp')}</p>
       <form id="g-addform" onSubmit={ev => void submit(ev)}>
-        <BotCheckboxes bots={props.bots} excludeIds={inChatSet} />
+        <BotCheckboxes
+          bots={props.bots}
+          excludeIds={inChatSet}
+          tr={tr}
+          selected={selectedBots}
+          onToggle={(id, checked) => setSelectedBots(prev => {
+            const next = new Set(prev);
+            if (checked) next.add(id); else next.delete(id);
+            return next;
+          })}
+        />
         <div data-add-status aria-live="polite">
           {error ? <DialogError {...error} /> : null}
           {summary ? (

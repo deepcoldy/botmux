@@ -292,6 +292,52 @@ interface RiffAttachment {
   type: 'image' | 'file';
 }
 
+/**
+ * riff route-B `display` projection carried on stdout `log` SSE events
+ * (feat/riff-agent-log-display, TaskLogDisplay = DerivedExecuteLogEvent minus
+ * commandId/payload). A per-line, stateless distillation of a codex app-server
+ * event; `kind` drives our timeline prefix + colour, `title` is riff-localized.
+ */
+interface RiffLogDisplay {
+  kind: string;
+  actor?: string;
+  title?: string;
+  text?: string;
+  summary?: string;
+  command?: string;
+  status?: 'running' | 'completed' | 'failed';
+  stream?: 'stdout' | 'stderr';
+  exitCode?: number;
+}
+
+// Defensive backstop only: riff already downgrades codex lifecycle "noise" lines
+// (thread.started / item.started / usage-only turns) to channel:'raw' so a default
+// subscription never receives them. If an un-projected bare codex event still slips
+// through, this recognizes it so we suppress rather than render a wall of JSON.
+// Deliberately narrow: only a single-line JSON object whose `type` is a known
+// no-content lifecycle marker — never plain shell output.
+// Kept in sync with riff's CODEX_NOISE_EVENT_TYPES (agentExecuteLogParser.ts) — the
+// authoritative classifier. Mirror it exactly so our fallback matches riff's filter.
+const CODEX_NOISE_TYPES = new Set([
+  'thread.started',
+  'turn.started',
+  'item.started',
+  'item.updated',
+  'turn.completed',
+  'response.completed',
+  'response.done',
+]);
+function isBareCodexNoiseLine(text: string): boolean {
+  const trimmed = text.trim();
+  if (!trimmed.startsWith('{') || !trimmed.endsWith('}')) return false;
+  try {
+    const parsed = JSON.parse(trimmed) as { type?: unknown };
+    return typeof parsed.type === 'string' && CODEX_NOISE_TYPES.has(parsed.type);
+  } catch {
+    return false;
+  }
+}
+
 interface RiffTaskResponse {
   success: boolean;
   data: {
@@ -779,13 +825,14 @@ export class RiffBackend implements SessionBackend {
    * lines stair-step to the right, which is the main reason the raw log view
    * was hard to read. Always emit `\r\n` and reset ANSI styling per line.
    */
-  private emitLine(text: string, style: 'info' | 'warn' | 'ok' | 'err' | 'title' | 'plain' = 'info'): void {
+  private emitLine(text: string, style: 'info' | 'warn' | 'ok' | 'err' | 'title' | 'dim' | 'plain' = 'info'): void {
     const codes: Record<string, string> = {
       info: '\x1b[36m',   // cyan — routine status
       warn: '\x1b[33m',   // yellow — degraded/attention
       ok: '\x1b[32m',     // green — completion
       err: '\x1b[31m',    // red — failure
       title: '\x1b[1m',   // bold — section separators
+      dim: '\x1b[2m',     // faint — low-signal (reasoning / usage)
       plain: '',
     };
     const open = codes[style] ?? '';
@@ -801,6 +848,105 @@ export class RiffBackend implements SessionBackend {
     this.outputBuffer += normalized;
     this.dataCb?.(normalized);
   }
+
+  /**
+   * Emit ONE timeline row for a route-B display projection. Unlike {@link emitLine}
+   * (which brackets every call with a leading + trailing CRLF → blank lines between
+   * consecutive rows, and leaves internal `\n` un-normalized → xterm stair-stepping),
+   * this normalizes ALL internal newlines to CRLF and appends exactly ONE trailing
+   * CRLF, with NO leading CRLF. Consecutive rows therefore sit on adjacent lines and
+   * multi-line bodies render flush-left.
+   */
+  private emitTimelineRow(text: string, style: 'info' | 'warn' | 'ok' | 'err' | 'title' | 'dim' | 'plain' = 'info'): void {
+    const codes: Record<string, string> = {
+      info: '\x1b[36m', warn: '\x1b[33m', ok: '\x1b[32m',
+      err: '\x1b[31m', title: '\x1b[1m', dim: '\x1b[2m', plain: '',
+    };
+    const open = codes[style] ?? '';
+    const close = open ? '\x1b[0m' : '';
+    // Color the whole (possibly multi-line) row, then normalize every newline —
+    // including the internal ones — to CRLF, and terminate with exactly one CRLF.
+    const body = `${open}${text}${close}`.replace(/\r?\n/g, '\r\n');
+    const line = `${body}\r\n`;
+    this.outputBuffer += line;
+    this.dataCb?.(line);
+  }
+
+  /**
+   * Render a riff route-B `display` projection (a codex app-server event distilled
+   * to {kind,title,text,command,exitCode,status}) as one human-readable timeline
+   * row: `[思路] …` / `[命令] <cmd> (exit N)` / `[回答] …`. The Chinese label comes
+   * from riff's already-localized `title` when present (i18n follows riff); we only
+   * fall back to a kind→label table when it is absent. Colour follows the kind
+   * (failed command / error → red, completed command → green, reasoning/usage dim).
+   */
+  private emitDisplay(display: RiffLogDisplay): void {
+    const kind = display.kind;
+    // Kind → default label. `title` (localized by riff) wins when present.
+    const LABEL: Record<string, string> = {
+      message: '回答',
+      reasoning: '思路',
+      command: '命令',
+      tool: '工具',
+      system: '系统',
+      usage: '用量',
+      error: '错误',
+      stage: '阶段',
+      trace: '追踪',
+      stdout: '',
+      stderr: '',
+    };
+    const label = display.title || LABEL[kind] || kind;
+    // For a codex `command` projection riff sets {command,status,exitCode,
+    // summary:'命令执行完成'} PLUS `text` = the captured command output (stdout/
+    // stderr, already truncated to 32KB by riff's collapseCommandOutputIntoPrimary).
+    // `summary` is a status blurb we never render; `text` is the real output we DO
+    // render beneath the header. For non-command kinds `text` is the content itself.
+    const body = (display.text ?? '').trimEnd();
+
+    if (kind === 'command') {
+      const cmd = display.command || '已执行命令';
+      const completed = display.status === 'completed' || display.exitCode === 0;
+      const failed = display.status === 'failed' || (display.exitCode != null && display.exitCode !== 0);
+      const exit = display.exitCode != null ? ` (exit ${display.exitCode})` : '';
+      // Green ONLY for a confirmed-completed/exit-0 command; red for failure;
+      // neutral (info) for a still-running command (no exit code yet).
+      const style = failed ? 'err' : completed ? 'ok' : 'info';
+      this.emitTimelineRow(`[${label}] ${cmd}${exit}`, style);
+      // Render the captured command output (riff folds it into `text`) beneath the
+      // header, verbatim/uncolored. `summary` ('命令执行完成') is NOT this — it never
+      // reaches `body` (we read `text` only), so no fake output line.
+      if (body) this.emitTimelineRow(body, 'plain');
+      return;
+    }
+    switch (kind) {
+      case 'reasoning':
+      case 'usage':
+        this.emitTimelineRow(`[${label}] ${body}`, 'dim');
+        return;
+      case 'error':
+        this.emitTimelineRow(`[${label}] ${body}`, 'err');
+        return;
+      case 'stderr':
+        this.emitTimelineRow(body, 'warn');
+        return;
+      case 'stdout':
+        // Plain shell output projected as-is (no label prefix).
+        if (body) this.emitTimelineRow(body, 'plain');
+        return;
+      case 'message':
+        this.emitTimelineRow(`[${label}] ${body}`, 'title');
+        return;
+      case 'tool':
+      case 'system':
+      case 'stage':
+      case 'trace':
+      default:
+        this.emitTimelineRow(`[${label}] ${body}`, 'info');
+        return;
+    }
+  }
+
 
   private extractAttachments(content: string): { text: string; attachments: RiffAttachment[] } {
     const attachments: RiffAttachment[] = [];
@@ -1263,6 +1409,15 @@ export class RiffBackend implements SessionBackend {
           const kind = data['kind'] as string | undefined;
           const group = (data['group'] as string | undefined)
             ?? (data['payload'] as Record<string, unknown> | undefined)?.['group'] as string | undefined;
+          // riff's route-B projection (feat/riff-agent-log-display): stdout log
+          // events may carry a `display: TaskLogDisplay` — a per-line, human-readable
+          // projection of a codex app-server event (回答 / 思路 / 命令 … ). When present,
+          // render the timeline row from it instead of the raw JSON line.
+          const display = data['display'] as RiffLogDisplay | undefined;
+          if (group === 'stdout' && display && typeof display.kind === 'string') {
+            this.emitDisplay(display);
+            break;
+          }
           // stdout logs are the real output stream — emit as data regardless of logLevel.
           // riff stores each stdout log line BARE (no trailing newline): the runner's
           // logger persists `message` verbatim (Logger.createRootLog) and the SSE `log`
@@ -1274,6 +1429,13 @@ export class RiffBackend implements SessionBackend {
           // stored line has no trailing newline). NOTE: the `output`/chunk path stays raw —
           // those chunks may be partial lines, so they must NOT get a synthetic newline.
           if (group === 'stdout' && text) {
+            // Defensive backstop: riff downgrades codex lifecycle "noise" lines
+            // (thread.started / item.started / usage-only turns) to channel:'raw',
+            // so a default subscription never receives them. But if an un-projected
+            // bare codex event ever slips through, suppress it rather than re-wall.
+            if (isBareCodexNoiseLine(text)) {
+              break;
+            }
             this.emitText(`${text}\n`);
           } else if (this.config.logLevel === 'verbose' && text) {
             this.emitLine(`[riff:${kind ?? 'log'}] ${text}`);

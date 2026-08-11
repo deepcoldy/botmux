@@ -116,6 +116,10 @@ vi.mock('../src/bot-registry.js', () => ({
     return Object.keys(out).length ? out : undefined;
   }),
   getLoadedConfigPath: vi.fn(() => process.env.BOTS_CONFIG),
+  // Provenance of the above (see core/config-dir.ts). A path resolved from
+  // BOTS_CONFIG was really parsed, so it is 'loaded'; undefined when there is
+  // no path at all.
+  getLoadedConfigProvenance: vi.fn(() => (process.env.BOTS_CONFIG ? 'loaded' : undefined)),
   // Production runs ONE daemon per bot, so getAllBots() sees only this process's
   // own bot. Default to the Claude process; the split-brain test overrides this
   // to prove the /group election does NOT depend on getAllBots().

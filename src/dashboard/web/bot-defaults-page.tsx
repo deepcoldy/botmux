@@ -21,6 +21,7 @@ import {
   type CliOptionsState,
   type SubstituteTargetResolution,
 } from './bot-defaults.js';
+import { isRemoteCliId } from '../../core/remote-cli-ids.js';
 import { mountReactPage, type PageDisposer } from './react-mount.js';
 import { useT } from './react-hooks.js';
 import { store } from './store.js';
@@ -899,9 +900,11 @@ function BotDefaultsCard(props: {
           hidden={props.activeTab !== 'advanced'}
         >
           <BdTabGrid>
-            {/* riff：backendType 与 CLI 选择 1:1 绑定（spawn 层强制配对），
-                手动切 pty/tmux 只会制造坏组合，隐藏该区块。 */}
-            {bot.cliId !== 'riff' ? (
+            {/* 远端 CLI（riff/mojo）：backendType 与 CLI 选择 1:1 绑定 ——
+                reconcileRiffBackendType 在 spawn 层按 isRemoteBackendId(cliId)
+                无条件改写为同名后端，所以这里手动切 pty/tmux 只是一个会被
+                静默覆盖的假选择。隐藏该区块。 */}
+            {!isRemoteCliId(bot.cliId) ? (
               <section className="bd-tile"><BackendTypeSection bot={bot} patchBot={patchBot} /></section>
             ) : null}
             {/* Codex App 历史显示只对 codex-app agent 有意义（其它 CLI 无此渲染通道），

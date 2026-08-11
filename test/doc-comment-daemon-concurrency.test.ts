@@ -409,7 +409,7 @@ describe('document-comment routing integration', () => {
     expect(region).toMatch(/const generation = captureRoutingGeneration\(ds\);[\s\S]*await resolveSender[\s\S]*ensureCurrentRoutingGeneration\(generation, 'prewarm:sender'\)/);
     const guard = region.indexOf("ensureCurrentRoutingGeneration(generation, 'prewarm:sender')");
     expect(guard).toBeGreaterThanOrEqual(0);
-    expect(region.indexOf('beginNewTurn(ds, title)')).toBeGreaterThan(guard);
+    expect(region.indexOf('beginNewTurn(ds, title, turnId)')).toBeGreaterThan(guard);
     expect(region.indexOf('sendWorkerInput(ds, cliInput', guard)).toBeGreaterThan(guard);
     expect(region.indexOf('forkWorker(ds, wrappedInput', guard)).toBeGreaterThan(guard);
   });

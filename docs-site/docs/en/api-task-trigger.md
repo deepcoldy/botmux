@@ -149,6 +149,32 @@ A hit carries `idempotent:true` (reused, no new dispatch); the first create carr
 
 ---
 
+### Turn idempotency key (`options.turnIdempotencyKey`) — same guarantee for a follow-up turn
+
+`idempotencyKey` above only covers a **fresh** session. When you append a **follow-up turn to an existing session** (`target.sessionId` set), use `options.turnIdempotencyKey` instead — a lost HTTP response on the append otherwise can't tell you whether the daemon already accepted that turn, so a retry risks injecting it **twice**.
+
+Pass a stable key you **persist before issuing the follow-up**. On a same-key retry to the same session, the daemon resolves to the **same turn (same `triggerId`) — no second injection**:
+
+```bash
+curl -X POST "http://<host>:7891/api/trigger" -H 'content-type: application/json' \
+  -H "Cookie: botmux_dashboard_token=$TOKEN" \
+  -d '{
+    "source":{"type":"webhook"},
+    "target":{"kind":"turn","botId":"cli_xxx","sessionId":"<existing session>"},
+    "instruction":"...",
+    "envelope":{"format":"json","sourceName":"demo","trusted":false},
+    "options":{"asyncReturnSessionId":true, "turnIdempotencyKey":"my-followup-7"}
+  }'
+```
+
+A hit carries `idempotent:true`; poll `trigger-result` by `sessionId`/`triggerId` as usual.
+
+**Scope**: `turnIdempotencyKey` is supported only for a **follow-up async turn on an existing session** — `target.kind:'turn'` + `target.sessionId` set + `options.asyncReturnSessionId:true`, no `waitForFinalOutput` / `dryRun`. It is **mutually exclusive** with `idempotencyKey` (a request carrying both returns **400**), and the two live in separate, non-collidable key spaces — a `turnIdempotencyKey` and an `idempotencyKey` with the same string never share a lease.
+
+**Same key, different payload → 409 `idempotency_conflict`**; **crash semantics (at-most-once)** and **retention** are identical to `idempotencyKey` above (a follow-up whose dispatch outcome is unknown converges to `failed` / `no_output` and is never blindly re-run). One extra transient case: if the target session is still finishing its **opening activation**, the follow-up is refused **retryably** (errorCode `trigger_failed`, message mentions "session activation in progress") — retry shortly.
+
+---
+
 ## 4. Polling for the result (four-state contract)
 
 In async mode, poll by `sessionId`:

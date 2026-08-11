@@ -240,6 +240,14 @@ import {
   parseDashboardSummaryRows,
 } from './dashboard/dashboard-summary.js';
 import { createDashboardSummaryEndpoint } from './dashboard/dashboard-summary-endpoint.js';
+import { scrubWorkflowWorkerEnv } from './utils/child-env.js';
+
+// The dashboard is an independent long-lived PM2 app and can be resurrected
+// from a stale dump.pm2 without passing through cli.ts pm2Env(). Its start/stop
+// and detached-restart children inherit process.env, so a leaked workflow
+// marker would make those CLI commands fail at the workflow safety gate before
+// they can reach their own cleanup boundary.
+scrubWorkflowWorkerEnv(process.env);
 
 const SECRET_PATH = dashboardSecretPath();
 const TOKEN_PATH = join(homedir(), '.botmux', '.dashboard-token');

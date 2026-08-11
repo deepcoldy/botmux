@@ -85,12 +85,53 @@ function load(sessionId: string): AsyncTriggerFile {
   }
 }
 
+/** True for a real plain object (rejects arrays and null — both pass a bare
+ *  `typeof x === 'object'`). Used by the strict loader/lookup so a JSON file that
+ *  is syntactically valid but structurally wrong (`results: []`, a non-object
+ *  result) is treated as CORRUPT and throws, rather than silently read as
+ *  "no such trigger" and driving a fail-open action (codex #818 strict-shape). */
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/** Runtime shape guard for one persisted result. The strict lookup must not read
+ *  a `null` / malformed / invalid-status entry as a usable terminal — nor fold it
+ *  into "absent". Present-but-malformed → THROWS (fail-closed).
+ *
+ *  Validates the STATUS-CONDITIONAL fields too (codex #818 strict-schema): a
+ *  `failed` result the store writes ALWAYS carries `reason:'dispatch_unknown'` +
+ *  `errorCode:'no_output'` (recordFailedStrict is the sole writer and hard-codes
+ *  both). A `failed` hit with a missing/other `reason` is therefore CORRUPT — and
+ *  must throw here rather than pass `status`/`createdAt` only, because a
+ *  downstream reader that gates on `reason==='dispatch_unknown'` (the recovery
+ *  fence) would otherwise silently treat it as "not the terminal I care about"
+ *  and fail-OPEN (replay the turn) instead of fail-closed. `completed` timestamp
+ *  fields are likewise type-checked when present. */
+function isValidPersistedResult(value: unknown): value is PersistedAsyncTriggerResult {
+  if (!isPlainObject(value)) return false;
+  const status = value.status;
+  if (status !== 'pending' && status !== 'completed' && status !== 'failed') return false;
+  if (typeof value.createdAt !== 'number') return false;
+  if (status === 'failed') {
+    // The only shape recordFailedStrict ever persists. Anything else is corrupt.
+    if (value.reason !== 'dispatch_unknown') return false;
+    if (value.errorCode !== 'no_output') return false;
+    if (typeof value.failedAt !== 'number') return false;
+  }
+  if (status === 'completed' && typeof value.completedAt !== 'number') return false;
+  return true;
+}
+
 /** STRICT loader for the authoritative failed-evidence RMW: ONLY a genuinely
  *  absent file (ENOENT) is treated as empty. A present-but-unreadable file
  *  (EIO/EACCES), corrupt JSON, or invalid shape THROWS — the soft `load()` would
  *  fold these into `{results:{}}`, and recordFailedStrict would then durably
  *  OVERWRITE a file that might hold a `completed` proof or another owner's data
- *  (finding: strict write over a soft read defeats completed-wins/owner-proof). */
+ *  (finding: strict write over a soft read defeats completed-wins/owner-proof).
+ *  Shape check is strict about PLAIN objects: `results: []` (an array — also
+ *  `typeof === 'object'`) or a non-string owner/latest is corrupt, not empty
+ *  (codex #818 strict-shape: an array `results` slipped through the bare
+ *  `typeof` gate and was misread as "no trigger"). */
 function loadStrict(sessionId: string): AsyncTriggerFile {
   const fp = getFilePath(sessionId);
   try { readFileSync(fp, 'utf-8'); }
@@ -99,8 +140,14 @@ function loadStrict(sessionId: string): AsyncTriggerFile {
     throw err; // EIO/EACCES/… — do NOT treat as empty
   }
   const data = JSON.parse(readFileSync(fp, 'utf-8')) as AsyncTriggerFile; // corrupt → throw
-  if (!data || typeof data !== 'object' || typeof data.results !== 'object') {
+  if (!isPlainObject(data) || !isPlainObject(data.results)) {
     throw new Error(`corrupt async-trigger file (invalid shape): ${fp}`);
+  }
+  if (data.ownerLarkAppId !== undefined && typeof data.ownerLarkAppId !== 'string') {
+    throw new Error(`corrupt async-trigger file (invalid ownerLarkAppId): ${fp}`);
+  }
+  if (data.latestTriggerId !== undefined && typeof data.latestTriggerId !== 'string') {
+    throw new Error(`corrupt async-trigger file (invalid latestTriggerId): ${fp}`);
   }
   return { ownerLarkAppId: data.ownerLarkAppId, latestTriggerId: data.latestTriggerId, results: data.results ?? {} };
 }
@@ -184,20 +231,26 @@ export function recordCompleted(
  *     failure — the whole point is that this evidence is authoritative).
  *
  * Completed-wins invariant: if a `completed` result is ALREADY on disk for this
- * triggerId, this is a no-op (the turn finished; the stronger proof stands). We
- * deliberately do NOT make `failed` irreversible — a completed arriving later
- * still wins via recordCompleted (same lock).
+ * triggerId, this is a no-op and returns `already_completed` (the turn finished;
+ * the stronger proof stands). We deliberately do NOT make `failed` irreversible —
+ * a completed arriving later still wins via recordCompleted (same lock).
+ *
+ * Returns a discriminated in-lock outcome so a caller that races a late completion
+ * reacts to what ACTUALLY happened under the lock (no TOCTOU): `already_completed`
+ * = a completed was on disk, nothing written, the caller must resolve completed;
+ * `written_failed` = the durable failed was written (codex #818 P1-8 race).
  */
+export type RecordFailedStrictOutcome = 'written_failed' | 'already_completed';
 export function recordFailedStrict(
   sessionId: string,
   triggerId: string,
   failedAt: number,
   ownerLarkAppId: string,
   reason: 'dispatch_unknown' = 'dispatch_unknown',
-): void {
+): RecordFailedStrictOutcome {
   if (!ownerLarkAppId) throw new Error('recordFailedStrict requires ownerLarkAppId');
   ensureDir();
-  withFileLockSync(getFilePath(sessionId), () => {
+  return withFileLockSync(getFilePath(sessionId), () => {
     const file = loadStrict(sessionId); // ONLY ENOENT is empty; corrupt/EIO throws
     // Owner proof: never overwrite another bot's file (a hash/path mixup or a
     // cross-bot mistake must fail-closed, not clobber their evidence).
@@ -205,7 +258,7 @@ export function recordFailedStrict(
       throw new Error(`recordFailedStrict owner mismatch: file owned by ${file.ownerLarkAppId}, caller ${ownerLarkAppId}`);
     }
     const prev = file.results[triggerId];
-    if (prev?.status === 'completed') return; // completed is stronger — keep it
+    if (prev?.status === 'completed') return 'already_completed'; // completed is stronger — keep it
     file.ownerLarkAppId = ownerLarkAppId;
     file.results[triggerId] = {
       status: 'failed',
@@ -216,6 +269,7 @@ export function recordFailedStrict(
     };
     if (!file.latestTriggerId) file.latestTriggerId = triggerId;
     saveStrict(sessionId, file); // durable + throws
+    return 'written_failed';
   });
 }
 
@@ -233,6 +287,33 @@ export function lookup(sessionId: string, triggerId?: string): {
   if (!resolved) return undefined;
   const result = file.results[resolved];
   if (!result) return undefined;
+  return { triggerId: resolved, result, ownerLarkAppId: file.ownerLarkAppId };
+}
+
+/** STRICT variant of `lookup`: ONLY a genuinely absent file (ENOENT) or an
+ *  absent trigger id yields `undefined`. A present-but-unreadable file
+ *  (EIO/EACCES), corrupt JSON, or invalid shape THROWS. Use this wherever a
+ *  soft "no record" would be misread as "no terminal outcome" and drive a
+ *  fail-OPEN action — e.g. the codex-app recovery fence, which must NOT replay a
+ *  keyed turn just because its durable `failed(dispatch_unknown)` proof happens
+ *  to be transiently unreadable (the soft `load()` folds that into `{}` and the
+ *  accepted ledger entry would re-enter the recovery snapshot). Fail-closed:
+ *  the caller aborts the fork and retries at the next seam. */
+export function lookupStrict(sessionId: string, triggerId?: string): {
+  triggerId: string;
+  result: PersistedAsyncTriggerResult;
+  ownerLarkAppId?: string;
+} | undefined {
+  const file = loadStrict(sessionId); // ENOENT → empty; present-but-unreadable/corrupt/bad-shape → throws
+  const resolved = triggerId || file.latestTriggerId;
+  if (!resolved) return undefined;
+  const result = file.results[resolved];
+  if (result === undefined) return undefined; // plain-object file with no such trigger → genuine absent
+  // Present BUT malformed (null / non-object / invalid status) is NOT "absent":
+  // reading it as "no terminal" would fail-open and replay. Fail-closed → throw.
+  if (!isValidPersistedResult(result)) {
+    throw new Error(`corrupt async-trigger result (invalid shape) for ${sessionId}/${resolved}`);
+  }
   return { triggerId: resolved, result, ownerLarkAppId: file.ownerLarkAppId };
 }
 

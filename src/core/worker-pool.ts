@@ -81,9 +81,10 @@ import {
 import { isRemoteBackendType, isRiffBackendSession, isSuspendableBackendType, getSessionPersistentBackendType, persistentBackendTargetForSession, persistentSessionName, killPersistentBackendTarget, killPersistentSession, managedTargetsForCliChange, probePersistentBackendTarget, resolvePairedSpawnBackendType, resolvePersistentBackendTarget } from './persistent-backend.js';
 import { withBotTurnMutation } from './bot-turn-mutation-gate.js';
 import { freezeMojoIdentityForSession } from './mojo-session-identity.js';
-import { getBot, getAllBots, loadBotConfigs, resolveBrandLabel, getLoadedConfigPath, resolveUsageDisplay } from '../bot-registry.js';
+import { getBot, getAllBots, loadBotConfigs, resolveBrandLabel, getLoadedConfigPath, getLoadedConfigProvenance, resolveUsageDisplay } from '../bot-registry.js';
 import { RestartCoordinator, type RestartObserver } from './restart-coordinator.js';
 import { runtimeBuildIdentity } from '../utils/runtime-build-id.js';
+import { scrubWorkflowWorkerEnv } from '../utils/child-env.js';
 
 /** A random id minted once per daemon process (this lifetime). Stamped onto
  *  isolated persistent panes so a suspend→resume reattach (same id) is
@@ -409,6 +410,10 @@ const WORKER_REDACTED_ENV_KEYS = ['GITHUB_TOKEN', 'GH_TOKEN', 'BOTMUX_PM2_GRACEF
 function workerForkEnv(base: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...base };
   for (const key of WORKER_REDACTED_ENV_KEYS) delete env[key];
+  // Defense in depth for a daemon started from a contaminated PM2 snapshot.
+  // Genuine workflow workers bypass this pool and receive their markers from
+  // workflows/v3/ephemeral-pool.ts.
+  scrubWorkflowWorkerEnv(env);
   return env;
 }
 
@@ -1535,6 +1540,131 @@ export function recallFrozenCards(ds: DaemonSession): void {
     deleteMessage(ds.larkAppId, messageId).catch(() => { /* best-effort */ });
   }
   logger.info(`[${tag(ds)}] Recalled ${targets.length} previous streaming card(s)`);
+}
+
+/**
+ * Post the current turn's starting card as soon as the daemon accepts the
+ * inbound message. Terminal redraw is deliberately not part of this trigger:
+ * some CLIs consume a turn without emitting another screen_update, which used
+ * to leave streamCardPending stuck and suppress cards for every later turn.
+ *
+ * Only one POST may be in flight per session. If another turn arrives during
+ * the request, the generation check preserves that newer pending state and
+ * immediately follows with its card after the first POST settles.
+ */
+export async function postTurnStartingCard(
+  ds: DaemonSession,
+  sessionReply: (rootId: string, content: string, msgType?: string, larkAppId?: string, turnId?: string) => Promise<string>,
+  turnId: string,
+): Promise<boolean> {
+  if (!ds.streamCardPending || ds.streamCardPendingTurnId !== turnId) return false;
+  if (remoteRetirementAdmissionPhase(ds)) return false;
+  if (ds.streamCardId === CARD_POSTING_SENTINEL) return false;
+  if (ds.session.vcMeetingReceiver || streamingCardDisabled(ds, turnId)) return false;
+  if (!workerHasInitialized(ds)) return false;
+  if (!larkTransportEnabled({ chatId: ds.chatId, apiOnly: getBot(ds.larkAppId).config.apiOnly })) return false;
+
+  const generation = ds.streamCardTurnGeneration ?? 0;
+  const sessionAtPost = ds.session;
+  const larkAppIdAtPost = ds.larkAppId;
+  const anchorAtPost = sessionAnchorId(ds);
+  const registryKeyAtPost = sessionKey(anchorAtPost, larkAppIdAtPost);
+  const botCfg = getBot(ds.larkAppId).config;
+  const effectiveCliId = sessionCliId(ds, botCfg);
+  const previousCardId = ds.streamCardId;
+  const previousNonce = ds.streamCardNonce;
+  // A newer turn may have arrived while the previous turn's POST was still in
+  // flight, so beginNewTurn could not park that sentinel. Park the now-live
+  // predecessor here before replacing its identity.
+  parkStreamCard(ds);
+  const nonce = randomBytes(4).toString('hex');
+  const status = ds.usageLimit ? 'limited' : 'starting';
+  const cardJson = buildStreamingCard(
+    ds.session.sessionId,
+    sessionAnchorId(ds),
+    readableTerminalUrlFor(ds),
+    ds.currentTurnTitle || ds.session.title || sessionCliDisplayName(ds, botCfg),
+    '',
+    status,
+    effectiveCliId,
+    ds.displayMode ?? 'hidden',
+    nonce,
+    undefined,
+    !!ds.adoptedFrom,
+    false,
+    localeForBot(ds.larkAppId),
+    ds.usageLimit,
+    writableTerminalLinkFor(ds),
+    isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
+    getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId),
+    sessionRuntimeDisplayName(ds, botCfg),
+    codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
+  );
+
+  ds.streamCardNonce = nonce;
+  ds.streamCardId = CARD_POSTING_SENTINEL;
+  const ownsPostIdentity = (): boolean =>
+    ds.session === sessionAtPost
+    && ds.session.status === 'active'
+    && ds.larkAppId === larkAppIdAtPost
+    && sessionAnchorId(ds) === anchorAtPost
+    && !isSessionTransferring(ds)
+    && ds.streamCardId === CARD_POSTING_SENTINEL
+    && ds.streamCardNonce === nonce
+    && (!activeSessionsRegistry || activeSessionsRegistry.get(registryKeyAtPost) === ds);
+  const stillOwnsPost = (): boolean =>
+    ownsPostIdentity() && remoteRetirementAdmissionPhase(ds) === null;
+  const restorePrePostIdentityForRetirement = (): boolean => {
+    if (remoteRetirementAdmissionPhase(ds) === null || !ownsPostIdentity()) return false;
+    ds.streamCardId = previousCardId;
+    ds.streamCardNonce = previousNonce;
+    persistStreamCardState(ds);
+    return true;
+  };
+  try {
+    const messageId = await sessionReply(
+      anchorAtPost, cardJson, 'interactive', larkAppIdAtPost, turnId,
+    );
+    if (!stillOwnsPost()) {
+      void deleteMessage(larkAppIdAtPost, messageId).catch(() => { /* best-effort stale-card cleanup */ });
+      restorePrePostIdentityForRetirement();
+      logger.info(`[${tag(ds)}] Discarded stale starting card for turn ${turnId.substring(0, 12)}`);
+      return false;
+    }
+    ds.streamCardId = messageId;
+    ds.parkedStreamCardNonce = undefined;
+    const superseded = (ds.streamCardTurnGeneration ?? 0) !== generation;
+    if (!superseded) {
+      ds.streamCardPending = false;
+      ds.streamCardPendingTurnId = undefined;
+    }
+    persistStreamCardState(ds);
+    recallFrozenCards(ds);
+    flushPendingLocalCliOpenReadinessPatch(ds);
+    flushPendingRiffUrlPatch(ds);
+    flushPendingActiveRuntimePatch(ds);
+    flushPendingCodexServiceTierPatch(ds);
+    syncUsageRefreshTimer(ds);
+    logger.info(`[${tag(ds)}] Posted starting card for turn ${turnId.substring(0, 12)}`);
+    if (superseded && ds.streamCardPendingTurnId) {
+      void postTurnStartingCard(ds, sessionReply, ds.streamCardPendingTurnId);
+    }
+    return true;
+  } catch (err) {
+    if (!stillOwnsPost()) {
+      restorePrePostIdentityForRetirement();
+      logger.info(`[${tag(ds)}] Ignored stale starting-card failure for turn ${turnId.substring(0, 12)}`);
+      return false;
+    }
+    ds.streamCardId = previousCardId;
+    ds.streamCardNonce = previousNonce;
+    persistStreamCardState(ds);
+    logger.warn(`[${tag(ds)}] Failed to post starting card for turn ${turnId.substring(0, 12)}: ${err}`);
+    if ((ds.streamCardTurnGeneration ?? 0) !== generation && ds.streamCardPendingTurnId) {
+      void postTurnStartingCard(ds, sessionReply, ds.streamCardPendingTurnId);
+    }
+    return false;
+  }
 }
 
 /**
@@ -6098,6 +6228,144 @@ function rollbackAcceptedCodexAppDispatch(
   }
 }
 
+/**
+ * Recovery-seam at-most-once fence for a keyed follow-up turn (turnIdempotencyKey,
+ * PR #818). The turn-level idempotency lease terminalizes an interrupted keyed
+ * turn to a durable `failed(dispatch_unknown)` (worker-exit convergence / boot
+ * reconcile / same-key retry) and — unlike a fresh async-virtual session — LEAVES
+ * the shared session open and un-quarantined (P1-3). So a later refork of that
+ * session must NOT resurrect the interrupted turn: `noReplay` only lives on the
+ * transient input queues (pendingMessages / inflight), NOT on the durable Codex
+ * App dispatch ledger. Without this fence, the recovery path
+ * (codexAppRecoveredDispatches → worker init → recoveredAcceptedInputs, keyed on
+ * `state==='accepted'` alone) would re-issue `turn/start` for a turn the caller
+ * was already told is `failed` at-most-once — the ledger is the third replay
+ * channel the lease's noReplay does not reach (codex #818 recovery-seam finding).
+ *
+ * Fence: for each `accepted` (NEVER `prepared`) ledger entry whose OWNER-MATCHED
+ * async terminal is already `failed(dispatch_unknown)`, durably retire the entry
+ * via cancelCodexAppDispatch. The retirement is TRANSACTIONAL: if any candidate
+ * cannot be exact-cancelled (a prepared successor pins the FIFO, or the entry
+ * vanished), the whole batch is rolled back in-memory and the fence THROWS before
+ * any persist — never a partial retire, never a fork past a still-live
+ * terminalized `accepted`. Idempotent and re-run at EVERY recovery seam, so it
+ * also covers the window where the durable failed was written but a crash hit
+ * before the exit-time retirement (the durable async truth is authoritative,
+ * re-checked here). A `prepared` entry is never cancelled without proof — the
+ * runner may have crossed the write boundary; the fence only ever targets
+ * `accepted`, and a prepared frame blocking an accepted retirement aborts the
+ * fork (above). Owner-scoped: only THIS bot's failed evidence counts, so a
+ * foreign/unstamped async record never retires our accepted entry.
+ *
+ * FAIL-CLOSED (codex #818 recovery-seam round-2). At-most-once forbids replaying
+ * a turn the caller was already told is `failed`, so an ambiguous fence THROWS
+ * rather than proceeding to fork:
+ *   1. Read side uses `asyncTriggerStore.lookupStrict` — a present-but-unreadable
+ *      / corrupt terminal file must NOT fold into "no record" (soft `lookup`),
+ *      which would let the accepted entry re-enter the recovery snapshot and
+ *      replay. ENOENT / absent trigger is a genuine "no terminal" and is fine.
+ *   2. Retire persist failure (updateSession EIO): the in-memory ledger is rolled
+ *      back to `priorLedger` and the error is RETHROWN, aborting this fork before
+ *      the recovery snapshot is taken. `staggeredRecoveryFork` (the boot eager
+ *      re-attach caller) already try/catches each fork, isolates the row, and
+ *      retains it for a later retry — so the durable ledger + async truth stay
+ *      intact and the next seam re-attempts the retirement. Degrading to "replay
+ *      once" (the pre-fix behavior) would itself be the P1 we are closing.
+ * @throws when the authoritative async truth is unreadable, or the retirement
+ *  cannot be durably persisted — the caller (forkWorker) must abort this fork.
+ */
+function retireTerminalizedCodexAppLedgerEntriesForRecovery(ds: DaemonSession): void {
+  const ledger = ds.session.codexAppDispatchLedger;
+  if (!ledger || ledger.length === 0) return;
+  const ownerLarkAppId = ds.larkAppId;
+  const toRetire = ledger.filter(entry =>
+    entry.state === 'accepted'
+    && (() => {
+      // STRICT read: a present-but-unreadable / corrupt terminal file THROWS
+      // (fail-closed) instead of folding into "no record" and replaying. ONLY
+      // our own durable dispatch_unknown failed counts (async-trigger-store is
+      // keyed by sessionId, so a foreign/unstamped terminal on the same
+      // sessionId/triggerId must not retire our accepted entry — mirrors the
+      // owner-positive-proof gate used everywhere else in the idempotency path).
+      const rec = asyncTriggerStore.lookupStrict(ds.session.sessionId, entry.turnId);
+      return !!rec
+        && rec.ownerLarkAppId === ownerLarkAppId
+        && rec.result.status === 'failed'
+        && rec.result.reason === 'dispatch_unknown';
+    })());
+  if (toRetire.length === 0) return;
+  // TRANSACTIONAL retirement (codex #818 exact-retirement fail-open). All work is
+  // done against an in-memory working copy; nothing is persisted until EVERY
+  // owner-matched terminal candidate has been exact-cancelled. If ANY candidate
+  // cannot be cancelled — `prepared_successor_exists` (a later prepared frame
+  // pins the FIFO) or `dispatch_not_found` (the ledger changed under us) — we
+  // restore the in-memory ledger to `priorLedger` and THROW *before* any persist,
+  // aborting this fork fail-closed. A `continue`-and-fork would leave that
+  // terminalized `accepted` entry to be replayed as `recoveredAcceptedInputs`
+  // (the generation fence only constrains `prepared`, never re-adds noReplay to a
+  // surviving `accepted`), and a partial persist could retire some while forking
+  // the rest. All-or-nothing + fail-closed is the only safe shape.
+  const priorLedger = ds.session.codexAppDispatchLedger;
+  let workingLedger = [...(ds.session.codexAppDispatchLedger ?? [])];
+  const retiredTurnIds: string[] = [];
+  for (const entry of toRetire) {
+    const cancelled = cancelCodexAppDispatch(workingLedger, {
+      dispatchId: entry.dispatchId,
+      turnId: entry.turnId,
+      ...(entry.dispatchAttempt !== undefined ? { dispatchAttempt: entry.dispatchAttempt } : {}),
+    });
+    if (!cancelled.ok) {
+      // Cannot exact-cancel a terminalized accepted entry (prepared successor /
+      // vanished). Abort the whole retirement + fork fail-closed; a later seam
+      // re-attempts once the blocking prepared frame settles or the ledger
+      // stabilizes. NEVER fall through to fork with a live terminalized accepted.
+      ds.session.codexAppDispatchLedger = priorLedger;
+      throw new Error(
+        `recovery fence could not exact-retire terminalized Codex App dispatch `
+        + `turn=${entry.turnId} (${cancelled.error}); aborting fork (fail-closed)`,
+      );
+    }
+    workingLedger = cancelled.ledger;
+    retiredTurnIds.push(entry.turnId);
+  }
+  // Every candidate retired on the working copy — commit ONCE.
+  ds.session.codexAppDispatchLedger = workingLedger;
+  try {
+    sessionStore.updateSession(ds.session);
+    for (const turnId of retiredTurnIds) {
+      logger.warn(
+        `[${ds.session.sessionId.slice(0, 8)}] Recovery fence retired at-most-once terminalized `
+        + `Codex App dispatch turn=${turnId.slice(0, 12)} (durable failed:dispatch_unknown; not replayed)`,
+      );
+    }
+    if (!hasUnsettledCodexAppDispatch(ds.session.codexAppDispatchLedger)) {
+      void Promise.resolve(callbacks?.onCodexAppLedgerDrained?.(ds)).catch(err => {
+        logger.error(
+          `[${ds.session.sessionId.slice(0, 8)}] post-recovery-fence ledger-drain cleanup failed: `
+          + `${err instanceof Error ? err.message : String(err)}`,
+        );
+      });
+    }
+  } catch (err) {
+    // Persist failed (EIO/ENOSPC). Roll back the in-memory ledger so the durable
+    // async truth + the on-disk ledger stay consistent, then RETHROW to ABORT
+    // this fork BEFORE the recovery snapshot is taken (fail-closed). Degrading to
+    // "let the accepted entry replay once" is exactly the at-most-once violation
+    // this fence exists to close, so we must NOT proceed to fork. The boot eager
+    // re-attach caller (staggeredRecoveryFork) try/catches each fork, isolates
+    // this row, and retains it for a later retry — so the next seam re-attempts
+    // the retirement against the intact durable state.
+    ds.session.codexAppDispatchLedger = priorLedger;
+    logger.error(
+      `[${ds.session.sessionId.slice(0, 8)}] Recovery fence could not persist retired ledger; `
+      + `aborting fork (fail-closed), will retry next seam: ${err instanceof Error ? err.message : String(err)}`,
+    );
+    throw err instanceof Error
+      ? err
+      : new Error(`recovery-fence ledger retirement persist failed: ${String(err)}`);
+  }
+}
+
 type QueuedWorkerForkSnapshot = {
   queued: true;
   queuedPrompt: Session['queuedPrompt'];
@@ -6318,6 +6586,11 @@ export function sendWorkerInput(
      * Persisted on the accepted ledger entry and forwarded to the worker so the
      * serial runner may steer this turn into an active one. */
     codexAppSteerable?: true;
+    /** At-most-once (idempotency lease): forward to the worker so a keyed
+     * follow-up delivered to a LIVE worker is tagged noReplay and never replays
+     * onto an auto-restarted CLI after a crash+terminalize (turn-level PR #71).
+     * The dormant-fork path rides `atMostOnce` on the fork init instead. */
+    atMostOnce?: true;
   } = {},
 ): boolean {
   const remoteRetirementPhase = remoteRetirementAdmissionPhase(ds);
@@ -6449,6 +6722,7 @@ export function sendWorkerInput(
     ...(opts.dispatchAttempt !== undefined ? { dispatchAttempt: opts.dispatchAttempt } : {}),
     ...(codexAppDispatchId ? { codexAppDispatchId } : {}),
     ...(opts.codexAppSteerable ? { codexAppSteerable: true } : {}),
+    ...(opts.atMostOnce ? { atMostOnce: true } : {}),
     ...(vcMeetingImTurnOrigin
       ? { vcMeetingImTurnOrigin }
       : {}),
@@ -6998,6 +7272,9 @@ export function forkWorker(
       const gatedDispatchAttempt = typeof resumeOrTurnId === 'object' && resumeOrTurnId !== null
         ? resumeOrTurnId.dispatchAttempt
         : undefined;
+      const gatedAtMostOnce = typeof resumeOrTurnId === 'object' && resumeOrTurnId !== null
+        ? resumeOrTurnId.atMostOnce
+        : undefined;
       sendWorkerInput(ds, promptInput, gatedTurnId, {
         ...(gatedDispatchAttempt !== undefined
           ? { dispatchAttempt: gatedDispatchAttempt }
@@ -7007,6 +7284,12 @@ export function forkWorker(
         // rerouted through the transfer gate must carry the flag here too, or it
         // silently downgrades true → false like the direct-route branch did.
         ...(gatedPrompt.codexAppSteerable === true ? { codexAppSteerable: true as const } : {}),
+        // At-most-once (codex #818 P1-5): a keyed follow-up fork rerouted through
+        // the transfer gate to sendWorkerInput must preserve atMostOnce, else the
+        // replacement CLI's input is replayable and a crash after the daemon
+        // terminalized the turn re-runs it. forkWorker's own init path sets this
+        // from resumeOrTurnId.atMostOnce; the reroute must forward it identically.
+        ...(gatedAtMostOnce ? { atMostOnce: true as const } : {}),
       });
     } else {
       transferGate.needsWorker = true;
@@ -7405,6 +7688,28 @@ export function forkWorker(
   // Snapshot the prior durable FIFO before accepting this fork's new prompt.
   // A pure reattach receives the full snapshot; a refork carrying N+1 restores
   // old N first and reserves N+1 through the normal worker write path.
+  // FIRST fence out any keyed turn already terminalized to a durable
+  // failed(dispatch_unknown): the turn-level idempotency lease (PR #818) leaves
+  // the shared session open, so without this the recovery path would replay an
+  // at-most-once turn the caller was already told failed (the ledger is the third
+  // replay channel `noReplay` does not reach). Idempotent + re-checked here.
+  //
+  // FAIL-CLOSED via THROW (codex #818 recovery-seam round-3): if the fence cannot
+  // PROVE it is safe to build the recovery snapshot — unreadable/corrupt
+  // authoritative async terminal, a terminalized accepted entry that cannot be
+  // exact-cancelled, or a retirement persist failure — it THROWS. We deliberately
+  // do NOT catch-and-`return false` here: `forkWorker`'s bool return is widely
+  // IGNORED by callers (the keyed `/api/trigger` dormant path forks and then
+  // unconditionally returns `queued`, so a swallowed false would strand the turn
+  // `running`), and a `return false` would also bypass the outer
+  // `rollbackWorkerForkPreInit` that restores the queued-activation journal
+  // mutated above. Letting it throw routes through forkWorker's existing outer
+  // catch (pre-init rollback + rethrow) and then the keyed trigger's post-barrier
+  // convergence, which durably terminalizes the turn to `failed` (observable,
+  // at-most-once) — the correct contract for every fork-failure path.
+  if (agentCfg.cliId === 'codex-app') {
+    retireTerminalizedCodexAppLedgerEntriesForRecovery(ds);
+  }
   const codexAppRecoveredDispatches = agentCfg.cliId === 'codex-app'
     ? (ds.session.codexAppDispatchLedger ?? []).map(entry => ({ ...entry }))
     : [];
@@ -7681,6 +7986,12 @@ export function forkWorker(
     // rather than silently masking an arbitrary parent dir (codex P1). Omitted
     // from forkAdoptWorker below — its observe branch returns before fs-policy.
     loadedBotsConfigPath: getLoadedConfigPath(),
+    // PROVENANCE of that path: 'loaded' = the daemon actually parsed this exact
+    // file (a real registry authority, safe to pin onto CLI children);
+    // 'synthetic' = core-only placeholder that was never parsed. The worker must
+    // not guess this from the filesystem — existence and provenance are
+    // independent facts (see core/config-dir.ts BotsConfigProvenance).
+    loadedBotsConfigProvenance: getLoadedConfigProvenance(),
     brand: normalizeBrand(botCfg.brand),
     botName: bot.botName,
     botOpenId: bot.botOpenId,
@@ -8440,6 +8751,7 @@ function setupWorkerHandlers(
         // in-flight. In that case CARD_POSTING_SENTINEL is already set — don't
         // POST a second card; the in-flight POST becomes this turn's card.
         if (ds.streamCardId === CARD_POSTING_SENTINEL) break;
+        const postingGeneration = ds.streamCardTurnGeneration ?? 0;
         ds.streamCardId = CARD_POSTING_SENTINEL;
         try {
           ds.streamCardNonce = randomBytes(4).toString('hex');
@@ -8487,7 +8799,11 @@ function setupWorkerHandlers(
           // this "starting" card is orphaned (never entered frozenCards, so
           // recallFrozenCards can't withdraw it). Mirrors the screen_update POST
           // branch which clears the flag after posting.
-          ds.streamCardPending = false;
+          const superseded = (ds.streamCardTurnGeneration ?? 0) !== postingGeneration;
+          if (!superseded) {
+            ds.streamCardPending = false;
+            ds.streamCardPendingTurnId = undefined;
+          }
           ds.parkedStreamCardNonce = undefined;
           persistStreamCardState(ds);
           // Re-sync worker's display mode (it starts fresh in 'hidden')
@@ -8504,6 +8820,9 @@ function setupWorkerHandlers(
           // resume where the CLI kept running), arm here — same authorized arm
           // point as the reuse branch, now that streamCardId is the real id.
           syncUsageRefreshTimer(ds);
+          if (superseded && ds.streamCardPendingTurnId) {
+            void postTurnStartingCard(ds, cb.sessionReply, ds.streamCardPendingTurnId);
+          }
         } catch (err) {
           if (!ownsLifecycleMutation()) break;
           if (err instanceof MessageWithdrawnError) {
@@ -8763,7 +9082,10 @@ function setupWorkerHandlers(
         // upstream debouncer — by the time we get here, status flips are
         // already coarse-grained.
         if (prevStatus !== ds.lastScreenStatus) {
-          const dashboardRow = composeRowFromActive(ds);
+          // fresh:true —— 这是「状态边沿触发的 refresh 读」，transcript 此刻刚追加完
+          // 本轮输出。绕过 resolver 对懒创建 rollout 的 30s miss 负缓存，否则首轮
+          // (spawn 时 rollout 还没落盘)徽标要等 30s 后某次边沿才出现。
+          const dashboardRow = composeRowFromActive(ds, { fresh: true });
           dashboardEventBus.publish({
             type: 'session.update',
             body: {
@@ -8779,6 +9101,9 @@ function setupWorkerHandlers(
                 previewUserAt: dashboardRow.previewUserAt,
                 previewBotAt: dashboardRow.previewBotAt,
                 previewBotState: dashboardRow.previewBotState,
+                // 任务态随运行态边沿一起推：working→idle 时 todo 往往刚变化，
+                // 不带上会让看板「待办」列停在旧值。?? null 让清空也能同步（patch 合并）。
+                openTodos: dashboardRow.openTodos ?? null,
               },
             },
           });
@@ -8841,6 +9166,7 @@ function setupWorkerHandlers(
           // New turn — create a fresh card, old card freezes at its last state.
           // Generate new nonce so old card buttons are distinguishable.
           const isNewTurn = !!ds.streamCardPending;
+          const postingGeneration = ds.streamCardTurnGeneration ?? 0;
           ds.streamCardNonce = randomBytes(4).toString('hex');
           // New turn → image_key from previous turn no longer valid
           if (isNewTurn) ds.currentImageKey = undefined;
@@ -8876,6 +9202,8 @@ function setupWorkerHandlers(
                 return;
               }
               ds.streamCardId = msgId;
+              const superseded = (ds.streamCardTurnGeneration ?? 0) !== postingGeneration;
+              if (!superseded) ds.streamCardPendingTurnId = undefined;
               ds.parkedStreamCardNonce = undefined;
               persistStreamCardState(ds);
               // New card live — recall any cards parked by previous turns
@@ -8893,6 +9221,9 @@ function setupWorkerHandlers(
               // periodic usage refresh here (once the real card id exists, not
               // the POSTING sentinel). syncUsageRefreshTimer re-checks state.
               syncUsageRefreshTimer(ds);
+              if (superseded && ds.streamCardPendingTurnId) {
+                void postTurnStartingCard(ds, cb.sessionReply, ds.streamCardPendingTurnId);
+              }
             })
             .catch(async err => {
               if (!ownsLifecycleMutation()) return;
@@ -8906,6 +9237,9 @@ function setupWorkerHandlers(
               ds.pendingActiveRuntimeCardRefresh = undefined;
               ds.pendingCodexTierCardRefresh = undefined;
               persistStreamCardState(ds);
+              if ((ds.streamCardTurnGeneration ?? 0) !== postingGeneration && ds.streamCardPendingTurnId) {
+                void postTurnStartingCard(ds, cb.sessionReply, ds.streamCardPendingTurnId);
+              }
             });
         } else {
           // Same turn — PATCH only on status change. Image PATCHes go through
@@ -9740,8 +10074,9 @@ function setupWorkerHandlers(
               logger.error(`[${t}] Failed to persist async terminal-settle for ${msg.turnId.substring(0, 8)}: ${err.message}`);
             }
             // Cleared like the final_output path so worker-exit convergence does
-            // not retro-fail this now-completed turn.
-            if (ds.idempotentAsyncTurn?.triggerId === msg.turnId) ds.idempotentAsyncTurn = undefined;
+            // not retro-fail this now-completed turn. Per-triggerId delete so a
+            // concurrent sibling keyed turn's convergence entry is untouched.
+            ds.idempotentAsyncTurns?.delete(msg.turnId);
             logger.info(`[${t}] Settled async HTTP turn ${msg.turnId.substring(0, 8)} completed (empty output; nothing-to-send)`);
           }
         }
@@ -10458,10 +10793,12 @@ function deliverFinalOutput(
     // (with content + usage) after a daemon restart drops the in-memory Map.
     // Stamp the owning bot for cross-bot isolation.
     asyncTriggerStore.recordCompleted(ds.session.sessionId, msg.turnId, msg.content, completedAt, ds.larkAppId, msg.usage);
-    // This idempotent async turn produced its terminal output — clear the
-    // worker-exit convergence stamp so a later graceful exit of this generation
-    // is not retro-failed (codex #776 round-6 finding #1).
-    if (ds.idempotentAsyncTurn?.triggerId === msg.turnId) ds.idempotentAsyncTurn = undefined;
+    // This idempotent async turn produced its terminal output — drop its
+    // worker-exit convergence entry so a later graceful exit of this generation
+    // is not retro-failed (codex #776 round-6 finding #1). Per-triggerId delete so
+    // a concurrent sibling keyed turn on the same shared session is untouched
+    // (codex #818 P1-1).
+    ds.idempotentAsyncTurns?.delete(msg.turnId);
     ds.lastBridgeEmittedUuid = finalOutputDedupeKey(ds, msg);
     logger.info(`[${t}] Captured final_output for Async HTTP request (turn ${msg.turnId.substring(0, 8)})`);
     onComplete?.(true);
@@ -10870,6 +11207,7 @@ export const __testOnly_setupWorkerHandlers = setupWorkerHandlers;
 export const __testOnly_reserveWorkerGeneration = reserveWorkerGeneration;
 export const __testOnly_finishTurnReactions = finishTurnReactions;
 export const __testOnly_finalOutputDedupeKey = finalOutputDedupeKey;
+export const __testOnly_retireTerminalizedCodexAppLedgerEntriesForRecovery = retireTerminalizedCodexAppLedgerEntriesForRecovery;
 
 // ─── Fork adopt worker ──────────────────────────────────────────────────────
 

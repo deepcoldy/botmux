@@ -4,6 +4,11 @@ import type { CliAdapter, PtyHandle } from './types.js';
 
 import { delay } from '../../utils/timing.js';
 
+const BRACKETED_PASTE_START = '\x1b[200~';
+const BRACKETED_PASTE_END = '\x1b[201~';
+const KIMI_FIRST_WRITE_SETTLE_MS = 250;
+const kimiFirstWriteSeen = new WeakSet<PtyHandle>();
+
 export function createKimiAdapter(pathOverride?: string): CliAdapter {
   const rawBin = pathOverride ?? 'kimi';
   let cachedBin: string | undefined;
@@ -31,14 +36,23 @@ export function createKimiAdapter(pathOverride?: string): CliAdapter {
     },
 
     async writeInput(pty: PtyHandle, content: string) {
-      if (pty.sendText && pty.sendSpecialKeys) {
-        pty.sendText(content);
-        await delay(200);
-        pty.sendSpecialKeys('Enter');
-      } else {
-        pty.write(content);
-        await delay(1000);
-        pty.write('\r');
+      try {
+        if (!kimiFirstWriteSeen.has(pty)) {
+          kimiFirstWriteSeen.add(pty);
+          await delay(KIMI_FIRST_WRITE_SETTLE_MS);
+        }
+        if (pty.pasteText && pty.sendSpecialKeys) {
+          pty.pasteText(content);
+          await delay(200);
+          pty.sendSpecialKeys('Enter');
+        } else {
+          const pasted = `${BRACKETED_PASTE_START}${content}${BRACKETED_PASTE_END}`;
+          pty.write(pasted);
+          await delay(1000);
+          pty.write('\r');
+        }
+      } catch {
+        return;
       }
     },
 

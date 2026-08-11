@@ -281,16 +281,16 @@ describe('triggerSessionTurn — idempotency dispatch (real stores)', () => {
     const sid = first.target!.sessionId!;
     // Locate the dispatched DaemonSession + its stamped generation.
     const ds = [...shared.values()].find((d: any) => d.session.sessionId === sid) as any;
-    expect(ds?.idempotentAsyncTurn?.triggerId).toBe(first.triggerId);
-    const gen = ds.idempotentAsyncTurn.workerGeneration;
+    expect(ds?.idempotentAsyncTurns?.get(first.triggerId!)).toBeDefined();
+    const gen = ds.idempotentAsyncTurns.get(first.triggerId!).workerGeneration;
     // Simulate the real worker-exit handler: worker=null (dead), then converge.
     ds.worker = null;
     convergeIdempotentAsyncTurnOnWorkerExit(ds, gen);
     // Durable authoritative terminal is written…
     expect(asyncTriggerStore.lookup(sid, first.triggerId!)?.result.status).toBe('failed');
     expect(asyncTriggerStore.lookup(sid, first.triggerId!)?.result.reason).toBe('dispatch_unknown');
-    // …the stamp is cleared (idempotent: a later gen exit is a no-op)…
-    expect(ds.idempotentAsyncTurn).toBeUndefined();
+    // …the entry is dropped (idempotent: a later gen exit is a no-op)…
+    expect(ds.idempotentAsyncTurns?.get(first.triggerId!)).toBeUndefined();
     // …and a same-key retry resolves TERMINAL without a second fork.
     const retry = await triggerSessionTurn(freshAsyncReq('k-wx'), { larkAppId: APP, activeSessions: shared });
     expect(retry.state).toBe('failed');
@@ -303,11 +303,11 @@ describe('triggerSessionTurn — idempotency dispatch (real stores)', () => {
     const first = await triggerSessionTurn(freshAsyncReq('k-wxgen'), { larkAppId: APP, activeSessions: shared });
     const sid = first.target!.sessionId!;
     const ds = [...shared.values()].find((d: any) => d.session.sessionId === sid) as any;
-    const gen = ds.idempotentAsyncTurn.workerGeneration;
+    const gen = ds.idempotentAsyncTurns.get(first.triggerId!).workerGeneration;
     // A DIFFERENT (older) generation exits → must NOT converge this turn.
     convergeIdempotentAsyncTurnOnWorkerExit(ds, gen - 1);
     expect(asyncTriggerStore.lookup(sid, first.triggerId!)?.result.status).toBe('pending'); // untouched
-    expect(ds.idempotentAsyncTurn).toBeDefined(); // stamp intact
+    expect(ds.idempotentAsyncTurns?.get(first.triggerId!)).toBeDefined(); // entry intact
   });
 
   it('FINDING #3: a FOREIGN completed on the same sessionId does NOT clear the exit-convergence stamp', async () => {
@@ -324,7 +324,7 @@ describe('triggerSessionTurn — idempotency dispatch (real stores)', () => {
     const first = await triggerSessionTurn(freshAsyncReq('k-fc3'), { larkAppId: APP, activeSessions: shared });
     const sid = first.target!.sessionId!;
     const ds = [...shared.values()].find((d: any) => d.session.sessionId === sid) as any;
-    const gen = ds.idempotentAsyncTurn.workerGeneration;
+    const gen = ds.idempotentAsyncTurns.get(first.triggerId!).workerGeneration;
     // Foreign bot writes a completed on OUR sessionId/triggerId (adversarial /
     // sessionId collision). ownerLarkAppId != our APP.
     asyncTriggerStore.recordCompleted(sid, first.triggerId!, 'B answer', 100, 'cli_OTHER_BOT');
@@ -333,11 +333,11 @@ describe('triggerSessionTurn — idempotency dispatch (real stores)', () => {
     // The foreign completed did NOT count as our completion: convergence attempted
     // our durable failed. recordFailedStrict is completed-wins + owner-proofed, so
     // the on-disk foreign completed stays (owner mismatch → our write threw inside,
-    // stamp intact for reconcile). The KEY invariant: the stamp was NOT silently
+    // entry intact for reconcile). The KEY invariant: the entry was NOT silently
     // cleared by the foreign completed.
     const rec = asyncTriggerStore.lookup(sid, first.triggerId!);
     expect(rec?.ownerLarkAppId).toBe('cli_OTHER_BOT'); // foreign evidence untouched (owner-proof)
-    expect(ds.idempotentAsyncTurn).toBeDefined();       // stamp NOT cleared by foreign completed
+    expect(ds.idempotentAsyncTurns?.get(first.triggerId!)).toBeDefined();  // entry NOT cleared by foreign completed
   });
 
   it('FINDING #1: keyed at-most-once turn forks with atMostOnce so the worker never replays it after CLI exit', async () => {
@@ -409,15 +409,15 @@ describe('triggerSessionTurn — idempotency dispatch (real stores)', () => {
     const first = await triggerSessionTurn(freshAsyncReq('k-wf'), { larkAppId: APP, activeSessions: shared });
     const sid = first.target!.sessionId!;
     const ds = [...shared.values()].find((d: any) => d.session.sessionId === sid) as any;
-    const gen = ds.idempotentAsyncTurn.workerGeneration;
+    const gen = ds.idempotentAsyncTurns.get(first.triggerId!).workerGeneration;
     // Inject an EIO/ENOSPC-class failure on the durable dispatch_unknown write.
     const wSpy = vi.spyOn(asyncTriggerStore, 'recordFailedStrict').mockImplementationOnce(() => { throw new Error('injected ENOSPC on durable write'); });
     ds.worker = null;
     const outcome = convergeIdempotentAsyncTurnOnWorkerExit(ds, gen);
     wSpy.mockRestore();
     expect(outcome).toBe('write_failed');
-    // Stamp is KEPT (not cleared) so a later retry / reconcile can still converge.
-    expect(ds.idempotentAsyncTurn).toBeDefined();
+    // Entry is KEPT (not dropped) so a later retry / reconcile can still converge.
+    expect(ds.idempotentAsyncTurns?.get(first.triggerId!)).toBeDefined();
     // The durable failed was NOT written (write threw) — async record stays pending;
     // the daemon wrapper (failCloseIdempotentTurnIfConvergenceWriteFailed) is what
     // closes the session on this write_failed signal (asserted via source-lock).

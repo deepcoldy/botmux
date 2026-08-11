@@ -894,7 +894,7 @@ export { composeRowFromActive, composeRowFromClosed, composeRowFromPersistedActi
 export function setBotName(name: string): void { setRowsBotName(name); }
 
 function composeDashboardSessionRows(): SessionRow[] {
-  const active = listActiveSessions().map(composeRowFromActive);
+  const active = listActiveSessions().map((ds) => composeRowFromActive(ds));
   const activeIds = new Set(active.map(row => row.sessionId));
   const persisted = sessionStore.listSessions();
   const unregisteredActive = persisted
@@ -1572,6 +1572,53 @@ function buildAsyncTriggerLookupResponse(sessionId: string, triggerId?: string):
 
   const memTriggerId = triggerId || ds?.latestAsyncTriggerId;
   const memResult = ds && memTriggerId ? ds.asyncTriggerResults?.get(memTriggerId) : undefined;
+
+  // Best-effort poll-side convergence for the double-fault turn (codex #818 P1-8):
+  // the CONTRACT is that a double-fault returns 5xx and the caller retries with the
+  // same key (that retry path is the authoritative recovery). This block is only a
+  // bonus for a client that happens to poll first — if this turn is flagged
+  // postBarrierFault (post-barrier throw AND the durable terminalize then threw),
+  // nothing dispatched and no durable result exists, yet a live shared worker keeps
+  // `liveActive` true so resolveAsyncTriggerState would otherwise report `running`.
+  // Re-attempt the strict terminalize opportunistically; a persistent EIO simply
+  // falls through to `running` and is converged by a same-key retry or boot reconcile.
+  if (ds && memTriggerId) {
+    const faultEntry = ds.idempotentAsyncTurns?.get(memTriggerId);
+    if (faultEntry?.postBarrierFault) {
+      // COMPLETED-WINS (codex #818 P1-8 race): the AUTHORITATIVE decision is
+      // recordFailedStrict's IN-LOCK outcome (no TOCTOU). A pre-read fast-path
+      // avoids the write when already visibly completed; else the in-lock return
+      // (`already_completed` vs `written_failed`) decides. Never terminalize over a
+      // completion that landed after the pre-read.
+      const durable = asyncTriggerStore.lookup(sessionId, memTriggerId);
+      const ownedCompleted = durable?.result.status === 'completed'
+        && durable.ownerLarkAppId === faultEntry.ownerLarkAppId;
+      if (ownedCompleted) {
+        ds.idempotentAsyncTurns?.delete(memTriggerId);
+        // fall through to normal resolution → reports completed.
+      } else {
+        try {
+          const outcome = asyncTriggerStore.recordFailedStrict(sessionId, memTriggerId, Date.now(), faultEntry.ownerLarkAppId, 'dispatch_unknown');
+          ds.idempotentAsyncTurns?.delete(memTriggerId);
+          if (outcome === 'written_failed') {
+            ds.asyncTriggerResults?.delete(memTriggerId);
+            return {
+              ok: true, state: 'failed', triggerId: memTriggerId,
+              target: { kind: 'turn', sessionId, chatId: ds.chatId ?? stored?.chatId },
+              errorCode: 'no_output',
+              error: 'previous dispatch was interrupted with unknown outcome; not re-run (at-most-once)',
+              message: 'async trigger terminated without output',
+            };
+          }
+          // outcome === 'already_completed': a completion was seen under the lock —
+          // fall through to normal resolution (which reports the completed result).
+        } catch {
+          // Genuine I/O failure — leave the flag for the next poll / retry / boot
+          // reconcile; fall through to `running` rather than a phantom terminal.
+        }
+      }
+    }
+  }
 
   const resolved = resolveAsyncTriggerState({
     sessionId,

@@ -212,7 +212,12 @@ export interface DaemonSession {
   ownerOpenId?: string;          // receives owner-only links and controls write-enabled access
   streamCardId?: string;         // message_id of the streaming card in group (PATCHed with live output)
   streamCardNonce?: string;       // unique nonce for the current streaming card — embedded in button values to distinguish old vs current card
-  streamCardPending?: boolean;    // true when a new turn started, next screen_update creates a new card
+  streamCardPending?: boolean;    // true while the newest turn still needs its own streaming card
+  /** Monotonic in-memory generation for accepted user turns. Card POST
+   * completions use it to avoid clearing a newer turn's pending state. */
+  streamCardTurnGeneration?: number;
+  /** Exact newest turn awaiting its own streaming card. In-memory only. */
+  streamCardPendingTurnId?: string;
   pendingLocalCliButtonRefresh?: boolean; // true when cli_session_id arrived while the streaming card POST was in flight
   pendingRiffUrlCardRefresh?: boolean; // true when riff_access_url arrived while the streaming card POST was in flight
   /** Set on sessions restored after a daemon restart: suppresses the automatic
@@ -327,16 +332,33 @@ export interface DaemonSession {
    *  ds.worker=null but keeps the session in activeSessions + the async record
    *  `pending`, which would otherwise poll `running` forever and let a same-key
    *  retry reuse the dead session until the next daemon reconcile (codex #776
-   *  round-6 finding #1). Cleared once the turn completes (final_output). */
-  idempotentAsyncTurn?: {
+   *  round-6 finding #1). Keyed by triggerId so MULTIPLE concurrent keyed turns
+   *  on ONE shared session each get their own convergence stamp — a single slot
+   *  let a later turn's stamp clobber an earlier turn's, stranding the earlier
+   *  turn `pending` forever on worker exit (codex #818 P1-1). Each entry is
+   *  removed once its OWN turn completes (final_output / nothing-to-send) or is
+   *  converged on worker exit; a fresh-session turn is just the 1-entry case. */
+  idempotentAsyncTurns?: Map<string, {
     ownerLarkAppId: string;
     key: string;
-    triggerId: string;
+    /** Store domain of the lease key (fresh async-virtual vs follow-up turn) so
+     *  convergence looks the lease up under the correct unforgeable namespace. */
+    kind: 'fresh' | 'turn';
     /** The worker generation this turn was dispatched on. The exit handler only
      *  converges when the DYING generation is this one (a later generation that
      *  completed and moved on must not be retro-failed). */
     workerGeneration: number;
-  };
+    /** Set when a post-barrier fault occurred (a throw between the
+     *  reserved→attempting barrier and a proven dispatch) AND the durable
+     *  terminalize write itself then failed — so the lease is `attempting`, no
+     *  durable async result exists, and NOTHING actually dispatched. For a LIVE
+     *  shared-session turn the worker never exits, so worker-exit convergence
+     *  never fires; the ONLY recovery is a same-key retry (or poll) re-attempting
+     *  the strict terminalize. Marks this entry as "terminal write owed" so the
+     *  retry pre-check reruns recordFailedStrict instead of `reuse`-ing forever
+     *  (codex #818 P1-8). Absent = a normally-dispatched turn (converge on exit). */
+    postBarrierFault?: true;
+  }>;
   /** Stable turn ids whose automatic transcript fallback is capture/discard.
    *  turn_terminal clears the entry; bounded in trigger-session for crash
    *  paths that never produce a terminal. */

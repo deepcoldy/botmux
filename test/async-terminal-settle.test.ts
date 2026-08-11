@@ -155,7 +155,7 @@ describe('async-HTTP settle-on-terminal (daemon turn_terminal handler)', () => {
   it('settles a pending async result to completed+empty on a nothing_to_send terminal', async () => {
     const ds = makeDs();
     ds.asyncTriggerResults = new Map([['turn-silent', { status: 'pending' } as any]]);
-    ds.idempotentAsyncTurn = { triggerId: 'turn-silent' } as any;
+    ds.idempotentAsyncTurns = new Map([['turn-silent', { ownerLarkAppId: 'app_test', key: 'k', kind: 'turn', workerGeneration: 1 } as any]]);
     __testOnly_setupWorkerHandlers(ds, ds.worker as any);
 
     (ds.worker as any).emit('message', terminalMsg('turn-silent', { outputDisposition: 'nothing_to_send' }));
@@ -169,14 +169,14 @@ describe('async-HTTP settle-on-terminal (daemon turn_terminal handler)', () => {
     expect(recordCompletedMock).toHaveBeenCalledWith(
       'sid-async-settle', 'turn-silent', '', expect.any(Number), 'app_test',
     );
-    // Worker-exit convergence stamp cleared so a later graceful exit can't retro-fail it.
-    expect(ds.idempotentAsyncTurn).toBeUndefined();
+    // Worker-exit convergence entry dropped (by triggerId) so a later graceful exit can't retro-fail it.
+    expect(ds.idempotentAsyncTurns!.get('turn-silent')).toBeUndefined();
   });
 
   it('does NOT settle on a bare completed terminal (no disposition) — the RPC-hydration-timeout case', async () => {
     const ds = makeDs();
     ds.asyncTriggerResults = new Map([['turn-bare', { status: 'pending' } as any]]);
-    ds.idempotentAsyncTurn = { triggerId: 'turn-bare' } as any;
+    ds.idempotentAsyncTurns = new Map([['turn-bare', { ownerLarkAppId: 'app_test', key: 'k', kind: 'turn', workerGeneration: 1 } as any]]);
     __testOnly_setupWorkerHandlers(ds, ds.worker as any);
 
     // Bare completed: no outputDisposition. A real answer may still be materializing.
@@ -187,7 +187,7 @@ describe('async-HTTP settle-on-terminal (daemon turn_terminal handler)', () => {
     const r = ds.asyncTriggerResults!.get('turn-bare')!;
     expect(r.status).toBe('pending');          // untouched — must not fabricate empty output
     expect(recordCompletedMock).not.toHaveBeenCalled();
-    expect(ds.idempotentAsyncTurn).toEqual({ triggerId: 'turn-bare' });
+    expect(ds.idempotentAsyncTurns!.get('turn-bare')).toBeDefined(); // convergence entry intact
   });
 
   it('does NOT settle on a failed terminal even if flagged (guard is status===completed)', async () => {
