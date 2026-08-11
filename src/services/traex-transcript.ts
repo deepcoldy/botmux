@@ -477,9 +477,7 @@ function selectableTraexRollouts(refs: TraexRolloutRef[]): TraexRolloutRef[] {
   if (userRefs.length > 0) return userRefs;
   const legacyRefs = refs.filter(ref => ref.kind === 'legacy');
   if (legacyRefs.length > 0) return legacyRefs;
-  if (refs.some(ref => ref.kind === 'internal' || ref.kind === 'pending')) return [];
-  const emptyRefs = refs.filter(ref => ref.kind === 'empty');
-  return emptyRefs.length === 1 ? emptyRefs : [];
+  return [];
 }
 
 function selectTraexRollout(

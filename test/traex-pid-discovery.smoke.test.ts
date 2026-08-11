@@ -16,6 +16,8 @@ const AMBIGUOUS_B_SID = '019fea00-0000-7000-8000-000000000003';
 const LEGACY_SID = '019fea00-0000-7000-8000-000000000004';
 const LEGACY_SECOND_SID = '019fea00-0000-7000-8000-000000000005';
 const PARTIAL_SID = '019fea00-0000-7000-8000-000000000006';
+const EMPTY_SID = '019fea00-0000-7000-8000-000000000007';
+const EMPTY_THEN_USER_SID = '019fea00-0000-7000-8000-000000000008';
 
 let dir: string;
 const children: ChildProcessWithoutNullStreams[] = [];
@@ -29,6 +31,9 @@ let mainPartialChild: ChildProcessWithoutNullStreams;
 let guardianPartialChild: ChildProcessWithoutNullStreams;
 let partialChild: ChildProcessWithoutNullStreams;
 let legacyGuardianChild: ChildProcessWithoutNullStreams;
+let emptyChild: ChildProcessWithoutNullStreams;
+let emptyThenUserChild: ChildProcessWithoutNullStreams;
+let emptyThenUserPath: string;
 
 function rolloutPath(sid: string, label: string): string {
   const sessions = join(dir, 'custom-trae-home', 'cli', 'sessions', '2026', '08', '10');
@@ -119,12 +124,16 @@ beforeAll(async () => {
   const legacy = rolloutPath(LEGACY_SID, 'legacy');
   const legacySecond = rolloutPath(LEGACY_SECOND_SID, 'legacy-second');
   const partial = rolloutPath(PARTIAL_SID, 'partial');
+  const empty = rolloutPath(EMPTY_SID, 'empty');
+  emptyThenUserPath = rolloutPath(EMPTY_THEN_USER_SID, 'empty-then-user');
   writeFileSync(legacy, `${JSON.stringify({ type: 'turn_context', payload: { model: 'legacy' } })}\n`);
   writeFileSync(
     legacySecond,
     `${JSON.stringify({ type: 'turn_context', payload: { model: 'legacy-second' } })}\n`,
   );
   writeFileSync(partial, '{"type":"session_meta","payload":{"thread_source":"subagent"');
+  writeFileSync(empty, '');
+  writeFileSync(emptyThenUserPath, '');
 
   mainGuardianChild = await spawnHolder([guardian, main]);
   mainNewChild = await spawnHolder([main, guardian, newMain]);
@@ -136,6 +145,8 @@ beforeAll(async () => {
   guardianPartialChild = await spawnHolder([partial, guardian]);
   partialChild = await spawnHolder([partial]);
   legacyGuardianChild = await spawnHolder([legacy, guardian]);
+  emptyChild = await spawnHolder([empty]);
+  emptyThenUserChild = await spawnHolder([emptyThenUserPath]);
 });
 
 afterAll(() => {
@@ -192,6 +203,30 @@ describe('findTraexRolloutByPid', () => {
   it('keeps a complete legacy rollout selectable when guardian is also open', () => {
     expect(findTraexRolloutByPid(legacyGuardianChild.pid!)?.cliSessionId).toBe(LEGACY_SID);
   });
+
+  it('fails closed while the only rollout is empty and has no session_meta evidence', () => {
+    expect(findTraexRolloutByPid(emptyChild.pid!)).toBeUndefined();
+  });
+
+  it('selects an initially empty rollout after a later probe sees complete user session_meta', () => {
+    expect(findTraexRolloutByPid(emptyThenUserChild.pid!)).toBeUndefined();
+
+    writeFileSync(emptyThenUserPath, `${JSON.stringify({
+      timestamp: '2026-08-10T06:00:00.000Z',
+      type: 'session_meta',
+      payload: {
+        id: EMPTY_THEN_USER_SID,
+        timestamp: '2026-08-10T06:00:00.000Z',
+        cwd: '/workspace',
+        source: 'cli',
+        thread_source: 'user',
+      },
+    })}\n`);
+
+    expect(findTraexRolloutByPid(emptyThenUserChild.pid!)?.cliSessionId).toBe(
+      EMPTY_THEN_USER_SID,
+    );
+  });
 });
 
 describe('findTraexRolloutSetByPid', () => {
@@ -205,5 +240,9 @@ describe('findTraexRolloutSetByPid', () => {
     expect(findTraexRolloutSetByPid(mainPartialChild.pid!)).toEqual(
       new Set([MAIN_SID.toLowerCase()]),
     );
+  });
+
+  it('does not treat an empty rollout as owned before session_meta is complete', () => {
+    expect(findTraexRolloutSetByPid(emptyChild.pid!)).toEqual(new Set());
   });
 });
