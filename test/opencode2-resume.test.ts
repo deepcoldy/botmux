@@ -1,13 +1,14 @@
 /**
  * OpenCode 2.0（opencode2）resume 单测：用假 opencode.db（XDG_DATA_HOME 指向
- * 临时目录）驱动适配器的 SQLite 路径 —— buildArgs 的 --session/--prompt 解析与
- * 文本反查兜底、checkResumeTargetExists 预检、listResumableSessions、writeInput
- * 的 DB 提交验证 + cliSessionId 捕获。
+ * 临时目录）驱动适配器的 SQLite 路径 —— buildArgs 的 --session 解析与文本反查
+ * 兜底、checkResumeTargetExists 预检、listResumableSessions、writeInput 的 DB
+ * 提交验证 + cliSessionId 捕获。
  *
- * 与 opencode 的差异点断言：
+ * opencode2（next-17135 起）的存储层是 V2 表（session_v2/session_message），
+ * 所以 seed 按 V2 结构建表。与 opencode 的差异点断言：
  *   - buildArgs **不注入 --model**（V2 TUI 顶层不接受该标志，传了会打帮助退出）；
- *   - resume 时 initialPrompt 仍走 --prompt（V2 在 -s resume 下也应用并自动提交，
- *     不再像 V1 那样静默忽略 → 不设 initialPromptArgsIgnoredOnResume）；
+ *   - buildArgs **不注入 --prompt**（next-17135 实测只填 composer 不自动提交）→
+ *     首条消息走输入队列（passesInitialPromptViaArgs = false），fresh/resume 一致；
  *   - buildResumeCommand 用 `opencode2 -s`；
  *   - 沙盒声明：authPaths 整数据根 + plugins 目录只读暴露。
  *
@@ -32,27 +33,40 @@ function openDb(): DatabaseSync {
   const dbPath = opencodeDbPath();
   mkdirSync(join(dbPath, '..'), { recursive: true });
   const db = new DatabaseSync(dbPath);
+  // opencode2（next-17135 起）的存储层是 V2 表（session_v2/session_message），
+  // V1 的 session/message/part 已冻结 —— 单测必须按 V2 结构 seed。
   db.exec(`
-    CREATE TABLE IF NOT EXISTS session (
+    CREATE TABLE IF NOT EXISTS session_v2 (
       id TEXT PRIMARY KEY,
+      project_id TEXT NOT NULL DEFAULT 'global',
+      workspace_id TEXT,
       parent_id TEXT,
+      slug TEXT,
       directory TEXT NOT NULL,
-      title TEXT NOT NULL DEFAULT '',
+      path TEXT,
+      title TEXT,
+      version TEXT NOT NULL DEFAULT '0.0.0-test',
+      cost REAL DEFAULT 0,
+      tokens_input INTEGER DEFAULT 0,
+      tokens_output INTEGER DEFAULT 0,
+      tokens_reasoning INTEGER DEFAULT 0,
+      tokens_cache_read INTEGER DEFAULT 0,
+      tokens_cache_write INTEGER DEFAULT 0,
+      agent TEXT,
+      model TEXT,
       time_created INTEGER NOT NULL,
       time_updated INTEGER NOT NULL,
-      time_archived INTEGER
+      time_compacting INTEGER,
+      time_archived INTEGER,
+      time_suspended INTEGER
     );
-    CREATE TABLE IF NOT EXISTS message (
+    CREATE TABLE IF NOT EXISTS session_message (
       id TEXT PRIMARY KEY,
       session_id TEXT NOT NULL,
+      type TEXT NOT NULL,
+      seq INTEGER NOT NULL,
       time_created INTEGER NOT NULL,
-      data TEXT NOT NULL
-    );
-    CREATE TABLE IF NOT EXISTS part (
-      id TEXT PRIMARY KEY,
-      message_id TEXT NOT NULL,
-      session_id TEXT NOT NULL,
-      time_created INTEGER NOT NULL,
+      time_updated INTEGER NOT NULL,
       data TEXT NOT NULL
     );
   `);
@@ -65,16 +79,14 @@ function seedSession(db: DatabaseSync, opts: {
   id: string; directory?: string; title?: string; parentId?: string | null;
   timeUpdated?: number; timeArchived?: number | null;
 }): void {
-  db.prepare('INSERT INTO session (id, parent_id, directory, title, time_created, time_updated, time_archived) VALUES (?,?,?,?,?,?,?)')
-    .run(opts.id, opts.parentId ?? null, opts.directory ?? tmpRoot, opts.title ?? 'seeded', opts.timeUpdated ?? 1000, opts.timeUpdated ?? 1000, opts.timeArchived ?? null);
+  db.prepare('INSERT INTO session_v2 (id, project_id, parent_id, slug, directory, title, version, time_created, time_updated, time_archived) VALUES (?,?,?,?,?,?,?,?,?,?)')
+    .run(opts.id, 'global', opts.parentId ?? null, 't', opts.directory ?? tmpRoot, opts.title ?? 'seeded', '0.0.0-test', opts.timeUpdated ?? 1000, opts.timeUpdated ?? 1000, opts.timeArchived ?? null);
 }
 
 function seedUserPart(db: DatabaseSync, sessionId: string, text: string, timeCreated: number): void {
   const mid = `msg_${++idSeq}`;
-  db.prepare('INSERT INTO message (id, session_id, time_created, data) VALUES (?,?,?,?)')
-    .run(mid, sessionId, timeCreated, JSON.stringify({ role: 'user' }));
-  db.prepare('INSERT INTO part (id, message_id, session_id, time_created, data) VALUES (?,?,?,?,?)')
-    .run(`prt_${++idSeq}`, mid, sessionId, timeCreated, JSON.stringify({ type: 'text', text }));
+  db.prepare('INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data) VALUES (?,?,?,?,?,?,?)')
+    .run(mid, sessionId, 'user', idSeq, timeCreated, timeCreated, JSON.stringify({ time: { created: timeCreated }, text, files: [], agents: [] }));
 }
 
 beforeEach(() => {
@@ -124,7 +136,7 @@ describe('opencode2 buildArgs resume', () => {
     expect(args).toEqual([]);
   });
 
-  it('keeps --prompt on resume (V2 applies + auto-submits it with -s, unlike V1)', () => {
+  it('does not inject --prompt (next-17135 only fills the composer, never submits)', () => {
     const db = openDb();
     seedSession(db, { id: 'ses_x' });
     db.close();
@@ -136,9 +148,9 @@ describe('opencode2 buildArgs resume', () => {
       resumeSessionId: 'ses_x',
       initialPrompt: 'first lark message',
     });
-    // -s 在前、--prompt 在后；无 initialPromptArgsIgnoredOnResume
-    expect(args).toEqual(['--session', 'ses_x', '--prompt', 'first lark message']);
-    expect(adapter.initialPromptArgsIgnoredOnResume).toBeUndefined();
+    // 首条消息改走输入队列（paste+Enter，DB 验证），不依赖 args 自动提交
+    expect(args).toEqual(['--session', 'ses_x']);
+    expect(adapter.passesInitialPromptViaArgs).toBe(false);
   });
 });
 

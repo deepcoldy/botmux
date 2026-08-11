@@ -18,16 +18,19 @@ import { delay } from '../../utils/timing.js';
  * OpenCode 2.0（opencode2）适配器。OpenCode 2 是 1.x 的下一个主版本（beta，随
  * `@opencode-ai/cli@next` 发布，二进制名 `opencode2`），与 V1 可并行安装。
  *
- * 与 V1 的关键差异（均在 next-17082 实测 / 源码确认）：
- *   - **会话存储完全共享**：opencode2 仍写同一个全局 `~/.local/share/opencode/opencode.db`
- *     （session/message/part 表结构与 V1 一致），所以 resume 探测、submit 验证、
- *     cliSessionId 捕获、/adopt 导入全部复用 V1 的 SQLite 实现。
+ * 与 V1 的关键差异（均在 next-17135 实测 / 源码确认）：
+ *   - **会话存储是 V2 新表结构**：opencode2 写同一个全局
+ *     `~/.local/share/opencode/opencode.db`，但会话/消息落在 `session_v2` /
+ *     `session_message` 表（V1 的 session/message/part 表已冻结）。resume 探测、
+ *     submit 验证、cliSessionId 捕获、/adopt 导入复用 opencode.ts 导出的 SQLite
+ *     实现时统一走 v2 表空间。
  *   - **TUI 顶层命令没有 `--model` 标志**（只有 `run` 子命令有）。传了会被当作
  *     unknown flag 直接打印帮助退出 —— 模型只能通过 opencode 配置/UI 设置，
  *     因此 buildArgs 不注入 model，modelChoices 也留空（setup 跳过模型询问）。
- *   - **`--prompt` 在 `-s` resume 下也生效**：V2 TUI 会在会话就绪后把 prompt 填进
- *     composer 并自动 submit（V1 会静默忽略）。所以不设
- *     `initialPromptArgsIgnoredOnResume`，resume 触发的首条消息仍走 args 注入。
+ *   - **`--prompt` 不自动提交**：next-17135 实测把 prompt 填进 composer 后不会
+ *     submit（next-17082 上 -s resume 的自动提交行为已回归）。因此首条消息不走
+ *     args 注入，改走输入队列 paste+Enter（worker 在 ready 后投递，经 DB 验证），
+ *     fresh 与 resume 路径一致 —— 不设 passesInitialPromptViaArgs。
  *   - **插件 API 是全新 V2 契约**（default export `{ id, setup }`，事件走
  *     `ctx.event.subscribe()` 异步迭代流），V1 插件格式不兼容。ask-hook 插件由
  *     hook-installer 的 'opencode2-plugin' 格式写入 `~/.config/opencode/plugins/`
@@ -54,51 +57,50 @@ export function createOpenCode2Adapter(pathOverride?: string): CliAdapter {
     sandboxReadonlyPaths: () => ['~/.config/opencode/plugins'],
     get resolvedBin(): string { return (cachedBin ??= resolveCommand(rawBin)); },
 
-    buildArgs({ sessionId, resume, resumeSessionId, initialPrompt }) {
+    buildArgs({ sessionId, resume, resumeSessionId }) {
       const args: string[] = [];
       // 注意：没有 --model —— V2 TUI 顶层不接受该标志（传了直接打帮助退出）。
       const openCodeSessionId = resume
-        ? (isOpenCodeSessionId(resumeSessionId) ? resumeSessionId : latestOpenCodeSessionForBotmuxSession(sessionId))
+        ? (isOpenCodeSessionId(resumeSessionId) ? resumeSessionId : latestOpenCodeSessionForBotmuxSession(sessionId, 'v2'))
         : undefined;
       if (openCodeSessionId) {
         args.push('--session', openCodeSessionId);
       }
-      // V2 TUI 对 `-s` resume 与全新会话一样应用 --prompt（composer 填充后自动提交），
-      // 所以 resume 分支的 initialPrompt 也会被 worker 正常传入 args。
-      if (initialPrompt) {
-        args.push('--prompt', initialPrompt);
-      }
+      // 不注入 --prompt：next-17135 实测 --prompt 只填 composer 不自动提交（不建
+      // 会话不写消息）。首条消息由 worker 走输入队列经 writeInput paste+Enter
+      // 投递（passesInitialPromptViaArgs 不置位），fresh 与 resume 路径一致。
       return args;
     },
 
-    passesInitialPromptViaArgs: true,
+    // 首条消息走输入队列（ready 后 flush + DB 验证），不依赖 CLI 的 args 自动提交。
+    passesInitialPromptViaArgs: false,
 
     buildResumeCommand({ sessionId, cliSessionId }) {
-      const sid = isOpenCodeSessionId(cliSessionId) ? cliSessionId : latestOpenCodeSessionForBotmuxSession(sessionId);
+      const sid = isOpenCodeSessionId(cliSessionId) ? cliSessionId : latestOpenCodeSessionForBotmuxSession(sessionId, 'v2');
       if (!sid) return null;
       return `opencode2 -s ${sid}`;
     },
 
-    /** Resume 目标预检：与 opencode 同库同逻辑。id 不在 session 表 → false
+    /** Resume 目标预检：id 不在 session_v2 表 → false
      *  （worker 落回全新会话并提示），避免 `Session not found` exit 1 被放大成
      *  daemon 自动重启 crash-loop。DB 读不了 → undefined，交给 worker 二级护栏。 */
     checkResumeTargetExists({ sessionId, cliSessionId }) {
-      const sid = isOpenCodeSessionId(cliSessionId) ? cliSessionId : latestOpenCodeSessionForBotmuxSession(sessionId);
+      const sid = isOpenCodeSessionId(cliSessionId) ? cliSessionId : latestOpenCodeSessionForBotmuxSession(sessionId, 'v2');
       if (!sid) {
         return withDb(() => true) === null ? undefined : false;
       }
-      const exists = sessionRowExists(sid);
+      const exists = sessionRowExists(sid, 'v2');
       return exists === null ? undefined : exists;
     },
 
-    /** Import path（/adopt 第二过滤器）：复用 opencode 的全局 session 表查询。 */
+    /** Import path（/adopt 第二过滤器）：复用 opencode 的全局会话查询（V2 表空间）。 */
     listResumableSessions(opts: { limit: number; exclude?: ReadonlySet<string> }): Promise<ResumableSession[]> {
-      return Promise.resolve(listOpenCodeResumableSessions(opts));
+      return Promise.resolve(listOpenCodeResumableSessions(opts, 'v2'));
     },
 
     async writeInput(pty: PtyHandle, content: string) {
       const isSlashCommand = content.startsWith('/');
-      const baseline = isSlashCommand ? null : snapPartBaseline();
+      const baseline = isSlashCommand ? null : snapPartBaseline('v2');
 
       try {
         if (pty.sendText && pty.sendSpecialKeys) {
@@ -120,7 +122,7 @@ export function createOpenCode2Adapter(pathOverride?: string): CliAdapter {
 
       if (baseline === null) return undefined;
 
-      const result = await detectOpenCodeSubmit(pty, baseline, content, delay);
+      const result = await detectOpenCodeSubmit(pty, baseline, content, delay, 'v2');
       if (result.submitted) {
         return result.cliSessionId
           ? { submitted: true, cliSessionId: result.cliSessionId }
