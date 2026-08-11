@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { describe, expect, it } from 'vitest';
@@ -90,31 +90,40 @@ describe('resolveGlobalInstallPlan', () => {
 
   it('recognises the pnpm 11 store realpath behind a global symlink', () => {
     const root = '/home/bot/.local/share/pnpm/store/v11/links/@/botmux/3.11.0/hash/node_modules/botmux';
-    const plan = resolveGlobalInstallPlan(root, 'linux');
-    expect(plan).toMatchObject({
-      manager: 'pnpm',
-      command: 'pnpm',
-      args: ['add', '-g', '--global-dir', '/home/bot/.local/share/pnpm/global', 'botmux@latest'],
-    });
     expect(detectGlobalInstallManager(root, 'linux')).toBe('pnpm');
   });
 
-  it('uses the stable pnpm 11 global symlink for a store realpath', () => {
-    const tempRoot = mkdtempSync(join(tmpdir(), 'botmux-pnpm11-store-'));
+  it('uses pnpm root -g for a custom global-dir and fails closed without its stable link', () => {
+    const tempRoot = mkdtempSync(join(tmpdir(), 'botmux-pnpm11-custom-global-'));
+    const previousPath = process.env.PATH;
     try {
       const pnpmHome = join(tempRoot, 'pnpm');
       const storeRoot = join(pnpmHome, 'store', 'v11', 'links', '@', 'botmux', '3.11.0', 'hash');
       const packageRoot = join(storeRoot, 'node_modules', 'botmux');
-      const globalRoot = join(pnpmHome, 'global', 'v11');
-      const stableDir = join(globalRoot, 'stable-hash');
+      const customGlobal = join(tempRoot, 'custom-global');
+      const globalRoot = join(customGlobal, 'v11');
+      const fakePnpm = join(tempRoot, 'bin', 'pnpm');
       mkdirSync(packageRoot, { recursive: true });
-      mkdirSync(globalRoot, { recursive: true });
-      symlinkSync(storeRoot, stableDir, 'dir');
+      mkdirSync(join(tempRoot, 'bin'), { recursive: true });
+      writeFileSync(fakePnpm, `#!/bin/sh\nprintf '%s\\n' '[{"path":"${globalRoot}"}]'\n`);
+      chmodSync(fakePnpm, 0o755);
+      process.env.PATH = `${join(tempRoot, 'bin')}:${previousPath ?? ''}`;
+
+      expect(tryResolveGlobalInstallPlan(packageRoot, 'linux')).toBeNull();
+
+      const runtimeRoot = join(globalRoot, 'runtime');
+      const stableDir = join(globalRoot, 'stable-hash');
+      mkdirSync(join(runtimeRoot, 'node_modules'), { recursive: true });
+      symlinkSync(packageRoot, join(runtimeRoot, 'node_modules', 'botmux'), 'dir');
+      symlinkSync(runtimeRoot, stableDir, 'dir');
 
       const plan = resolveGlobalInstallPlan(packageRoot, 'linux');
-
+      expect(plan.args).toEqual([
+        'add', '-g', '--global-dir', customGlobal, 'botmux@latest',
+      ]);
       expect(plan.activePackageRoot).toBe(join(stableDir, 'node_modules', 'botmux'));
     } finally {
+      process.env.PATH = previousPath;
       rmSync(tempRoot, { recursive: true, force: true });
     }
   });

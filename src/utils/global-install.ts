@@ -7,7 +7,9 @@
  * supported; known Yarn layouts are identified for diagnostics but rejected
  * until their global-dir/bin-dir semantics are handled explicitly.
  */
+import { spawnSync } from 'node:child_process';
 import { readdirSync, realpathSync } from 'node:fs';
+import { homedir } from 'node:os';
 import { posix, win32 } from 'node:path';
 import { botmuxInstallRoot } from './install-info.js';
 
@@ -45,6 +47,31 @@ function pnpmV11StoreMatch(root: string): RegExpMatchArray | null {
   return root.match(
     /^(.*\/pnpm)\/store\/(v\d+)\/links\/@\/botmux\/[^/]+\/[^/]+\/node_modules\/botmux$/i,
   );
+}
+
+function pnpmGlobalDir(
+  pathImpl: typeof posix,
+  layout: string,
+  platform: NodeJS.Platform = process.platform,
+): string | undefined {
+  const command = platform === 'win32' ? 'pnpm.cmd' : 'pnpm';
+  const result = spawnSync(command, ['list', '-g', '--depth', '0', '--json'], {
+    cwd: homedir(),
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'ignore'],
+  });
+  if (result.status !== 0 || typeof result.stdout !== 'string') return undefined;
+  let globalRoot: string | undefined;
+  try {
+    const listing = JSON.parse(result.stdout);
+    globalRoot = Array.isArray(listing) && typeof listing[0]?.path === 'string'
+      ? normalized(listing[0].path)
+      : undefined;
+  } catch {
+    return undefined;
+  }
+  if (!globalRoot) return undefined;
+  return globalRoot.endsWith(`/${layout}`) ? pathImpl.dirname(globalRoot) : undefined;
 }
 
 /**
@@ -148,7 +175,10 @@ export function resolveGlobalInstallPlan(
     // separator search, this preserves Windows drive letters while converting
     // backslashes to the separator expected by pnpm's command arguments.
     const globalDir = pnpmV11Match?.[1]
-      ?? (pnpmV11Store ? path.join(pnpmV11Store[1], 'global') : undefined);
+      ?? (pnpmV11Store ? pnpmGlobalDir(path, pnpmV11Store[2], platform) : undefined);
+    if (pnpmV11Store && !globalDir) {
+      throw new UnsupportedGlobalInstallError('pnpm', packageRoot);
+    }
     const globalInstallDir = pnpmV11Match
       ? path.join(globalDir!, pnpmV11Match[2])
       : pnpmV11Store
@@ -165,6 +195,9 @@ export function resolveGlobalInstallPlan(
       : pnpmV11Store
         ? pnpmV11StablePackageRoot(packageRoot, resolvedGlobalDir, pnpmV11Store[2], path)
       : path.join(globalInstallDir, 'node_modules', 'botmux');
+    if (pnpmV11Store && activePackageRoot === packageRoot) {
+      throw new UnsupportedGlobalInstallError('pnpm', packageRoot);
+    }
     return {
       manager,
       command: 'pnpm',
