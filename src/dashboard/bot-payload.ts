@@ -111,6 +111,7 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
       : 'always',
     docSubscribeDefaultMode: j?.docSubscribeDefaultMode === 'all' ? 'all' : 'mention-only',
     substituteMode: j?.substituteMode && typeof j.substituteMode === 'object' ? j.substituteMode : null,
+    feedback: j?.feedback && typeof j.feedback === 'object' ? j.feedback : null,
     restrictGrantCommands: j?.restrictGrantCommands === true,
     autoGrantRequestCards: j?.autoGrantRequestCards !== false,
     grantDefaultDurationMs: typeof j?.grantDefaultDurationMs === 'number'

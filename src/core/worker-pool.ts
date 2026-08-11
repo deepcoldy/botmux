@@ -71,6 +71,7 @@ import { getBot, getAllBots, loadBotConfigs, resolveBrandLabel, getLoadedConfigP
 import { RestartCoordinator, type RestartObserver } from './restart-coordinator.js';
 import { runtimeBuildIdentity } from '../utils/runtime-build-id.js';
 import { scrubWorkflowWorkerEnv } from '../utils/child-env.js';
+import { resolveFeedbackPolicyForDelivery, resolveFeedbackTeamId } from '../services/feedback-policy-resolver.js';
 
 /** A random id minted once per daemon process (this lifetime). Stamped onto
  *  isolated persistent panes so a suspend→resume reattach (same id) is
@@ -6246,7 +6247,7 @@ export function forkWorker(
   let spawnedWorker: ChildProcess | undefined;
   let worker!: ChildProcess;
   let startupState!: WorkerStartupState;
-  let initMsg!: DaemonToWorker;
+  let initMsg!: Extract<DaemonToWorker, { type: 'init' }>;
   let agentCfg!: ReturnType<typeof sessionAgentConfig>;
   const t = tag(ds);
   ds.localProcessAttestation = undefined;
@@ -6668,6 +6669,8 @@ export function forkWorker(
 
   // Send init config — use per-bot settings
   const runtimeIdentity = runtimeBuildIdentity();
+  const feedbackPolicy = resolveFeedbackPolicyForDelivery({ dataDir: config.session.dataDir, larkAppId: ds.larkAppId, chatId: ds.chatId, bot: botCfg });
+  ds.feedbackPolicy = feedbackPolicy;
   initMsg = {
     type: 'init',
     sessionId: ds.session.sessionId,
@@ -6754,6 +6757,7 @@ export function forkWorker(
     // Feishu (uploader/cred-write are also skipped downstream on the same test).
     larkAppSecret: larkTransportEnabled({ chatId: ds.chatId, apiOnly: botCfg.apiOnly }) ? botCfg.larkAppSecret : '',
     apiOnly: botCfg.apiOnly,
+    feedback: feedbackPolicy,
     // Freeze the ACTUAL loaded bots-config path (getLoadedConfigPath) so a
     // no-transport worker's fs-policy denies it from a HOST-owned fact, not a
     // guess off BOTS_CONFIG env (which the agent could see/forge). When it lives
@@ -9526,31 +9530,43 @@ async function finishTurnReactions(ds: DaemonSession): Promise<void> {
  *  via an unbounded retry loop. */
 async function persistFinalOutputFeedback(
   ds: DaemonSession,
-  turnId: string,
+  msg: Extract<WorkerToDaemon, { type: 'final_output' }>,
   content: string,
   effectiveCliId: string,
   messageId: string,
+  policy: import('../services/feedback-policy.js').FeedbackPolicy,
+  baseCard: Record<string, unknown>,
+  requesterSubjectId: string | undefined,
+  webhookDestinations: import('../services/feedback-outbox.js').FeedbackWebhookDestination[] | undefined,
   logTag: string,
 ): Promise<void> {
   try {
     const { getSkillFeedbackStore } = await import('../services/skill-feedback-store.js');
     const feedbackStore = await getSkillFeedbackStore(config.session.dataDir);
-    const context = {
-      runtime: effectiveCliId,
-      agent: effectiveCliId,
-      platform: 'lark',
-      session: ds.session.sessionId,
-      turn: turnId,
-    };
-    const interactionId = `lark:${ds.larkAppId}:${ds.session.sessionId}:${turnId}`;
-    const response = feedbackStore.createResponse({ interactionId, content, context });
-    feedbackStore.createDelivery({
-      responseId: response.responseId,
+    feedbackStore.recordTurnDelivery({
+      botAppId: ds.larkAppId,
+      sessionId: ds.session.sessionId,
+      turnId: msg.turnId,
+      nativeSessionId: msg.sourceHermesSessionId ?? ds.session.cliSessionId,
       platform: 'lark',
       platformAppId: ds.larkAppId,
       platformMessageId: messageId,
-      level: 'L1',
-      context,
+      chatId: ds.chatId,
+      topicRootId: ds.session.rootMessageId,
+      dispatchAttempt: msg.dispatchAttempt,
+      content,
+      cliId: effectiveCliId,
+      cliVersion: ds.cliVersion,
+      model: ds.session.model,
+      reasoningEffort: ds.session.reasoningEffort,
+      cardMode: 'feedback',
+      status: 'delivered',
+      usage: msg.usage,
+      policy,
+      baseCard,
+      requesterSubjectId,
+      webhookDestinations,
+      context: { ...(resolveFeedbackTeamId({ dataDir: config.session.dataDir, chatId: ds.chatId }) ? { teamId: resolveFeedbackTeamId({ dataDir: config.session.dataDir, chatId: ds.chatId }) } : {}) },
     });
   } catch (error) {
     logger.warn(
@@ -9800,7 +9816,12 @@ function deliverFinalOutput(
         : imOrigin?.replyTargetSenderOpenId
           ?? daemonCardFooterRecipientOpenId(ds, effectiveCliId);
       const localHomeLinkMode = daemonCardLocalHomeLinkMode(ds);
-      const feedback = managedReceiver ? undefined : { level: 'L1' as const };
+      // forkWorker snapshots the effective policy for this worker lifetime.
+      // Keep daemon fallback delivery aligned with the same frozen policy the
+      // worker/Riff environment received; live config applies on the next fork.
+      const feedbackPolicy = managedReceiver ? undefined : ds.feedbackPolicy;
+      const feedbackRequesterSubjectId = recipientOpenId;
+      const feedback = feedbackPolicy && feedbackRequesterSubjectId ? { policy: feedbackPolicy } : undefined;
       cardUsage ??= getDaemonReplyCardUsageSnapshot(ds, effectiveCliId);
       const cardJson = msg.kind === 'local-turn' || msg.kind === 'local-turn-headless'
         ? buildContextualReplyCard({
@@ -9828,6 +9849,7 @@ function deliverFinalOutput(
             localHomeLinkMode,
             usage: cardUsage,
           });
+      const baseFeedbackCard = feedback ? JSON.parse(cardJson) as Record<string, unknown> : undefined;
 
       const proposedOutput = {
         targetChatId: ds.chatId,
@@ -9916,8 +9938,8 @@ function deliverFinalOutput(
       };
       if (preparedListenerReply?.kind === 'succeeded' && preparedListenerReply.messageId) {
         recordPrimaryOutput(preparedListenerReply.messageId);
-        if (feedback) {
-          await persistFinalOutputFeedback(ds, msg.turnId, safeAssistantText, effectiveCliId, preparedListenerReply.messageId, t);
+        if (feedbackPolicy && baseFeedbackCard) {
+          await persistFinalOutputFeedback(ds, msg, safeAssistantText, effectiveCliId, preparedListenerReply.messageId, feedbackPolicy!, baseFeedbackCard, feedbackRequesterSubjectId, getBot(ds.larkAppId).config.feedbackWebhooks?.destinations, t);
         }
         ds.lastBridgeEmittedUuid = finalOutputDedupeKey(ds, msg);
         logger.info(
@@ -9974,8 +9996,8 @@ function deliverFinalOutput(
       }
       ds.lastBridgeEmittedUuid = finalOutputDedupeKey(ds, msg);
       logger.info(`[${t}] Bridge final_output forwarded (turn ${msg.turnId.substring(0, 8)}, ${msg.content.length} chars, kind=${msg.kind ?? 'bridge'}, attempt ${attempt + 1})`);
-      if (feedback && messageId) {
-        await persistFinalOutputFeedback(ds, msg.turnId, safeAssistantText, effectiveCliId, messageId, t);
+      if (feedbackPolicy && baseFeedbackCard && messageId) {
+        await persistFinalOutputFeedback(ds, msg, safeAssistantText, effectiveCliId, messageId, feedbackPolicy!, baseFeedbackCard, feedbackRequesterSubjectId, getBot(ds.larkAppId).config.feedbackWebhooks?.destinations, t);
       }
       onComplete?.(true);
     } catch (err: any) {

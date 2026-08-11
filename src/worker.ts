@@ -11435,6 +11435,7 @@ async function spawnCli(
     // drop apiOnly → getBotClient would not throw → `botmux send` could reach
     // Feishu. Thread the flag so the reconstructed config keeps the boundary.
     if (cfg.apiOnly) sessionEnv.BOTMUX_API_ONLY = '1';
+    if (cfg.feedback) sessionEnv.BOTMUX_FEEDBACK_POLICY = JSON.stringify(cfg.feedback);
     // Session scope for `botmux send` inside the sandbox. Thread sessions
     // anchor on a real om_ message (reply_in_thread); chat-scope sessions use
     // the chat id as anchor (sessionAnchorId), which is NOT a message id —
@@ -11467,6 +11468,10 @@ async function spawnCli(
     // Per-bot env (bots.json `env`) takes precedence over session context;
     // explicit riff config.env takes precedence over both.
     const mergedEnv: Record<string, string> = { ...sessionEnv, ...sanitizePerBotEnv(cfg.env), ...cfg.backendConfig.env };
+    // The effective policy is a host-resolved snapshot, not a user-overridable
+    // backend env knob. Re-freeze it after config.env/per-bot env merge.
+    if (cfg.feedback) mergedEnv.BOTMUX_FEEDBACK_POLICY = JSON.stringify(cfg.feedback);
+    else delete mergedEnv.BOTMUX_FEEDBACK_POLICY;
     // Re-freeze the no-transport capability keys AFTER the merge: a stale or
     // attacker-shaped backendConfig.env / per-bot env merges LAST and would
     // otherwise override the frozen values, restoring send capability for a
@@ -12233,7 +12238,7 @@ async function spawnCli(
       mkdirSync(dirname(credPath), { recursive: true });
       writeFileSync(
         credPath,
-        JSON.stringify({ larkAppId: cfg.larkAppId, larkAppSecret: cfg.larkAppSecret, brand: cfg.brand, apiOnly: cfg.apiOnly }),
+        JSON.stringify({ larkAppId: cfg.larkAppId, larkAppSecret: cfg.larkAppSecret, brand: cfg.brand, apiOnly: cfg.apiOnly, feedback: cfg.feedback }),
         { mode: 0o600 },
       );
     } catch (e) {

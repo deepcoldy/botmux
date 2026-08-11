@@ -4,6 +4,7 @@ import {
   createDashboardRouteState,
   loadAndRenderDashboardRoute,
 } from '../src/dashboard/web/route-lifecycle.js';
+import { findDashboardRoute } from '../src/dashboard/web/dashboard-routes.js';
 import type { DashboardRouteRenderer } from '../src/dashboard/web/dashboard-routes.js';
 
 function deferred<T>() {
@@ -13,6 +14,11 @@ function deferred<T>() {
 }
 
 describe('dashboard route lifecycle', () => {
+  it('registers feedback analytics as a lazy dashboard route', async () => {
+    const route = findDashboardRoute('#/feedback');
+    expect(route?.id).toBe('feedback');
+    expect(await route?.load()).toEqual(expect.any(Function));
+  });
   it('does not run a stale lazy route renderer after a newer route commits', async () => {
     const state = createDashboardRouteState();
     const root = { textContent: '' } as unknown as HTMLElement;

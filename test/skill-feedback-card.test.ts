@@ -1,65 +1,75 @@
 import { describe, expect, it } from 'vitest';
-import {
-  buildCanonicalFinalReplyCard,
-  buildContextualReplyCard,
-  buildMarkdownCard,
-} from '../src/im/lark/md-card.js';
-import { readFileSync } from 'node:fs';
+import { buildCanonicalFinalReplyCard, buildMarkdownCard } from '../src/im/lark/md-card.js';
+import { renderFeedbackCard } from '../src/im/lark/skill-feedback-card.js';
+import { normalizeFeedbackPolicy } from '../src/services/feedback-policy.js';
 
-function feedbackCodes(cardJson: string): string[] {
-  const card = JSON.parse(cardJson);
-  return (card.body?.elements ?? [])
-    .filter((element: any) => element.element_id === 'botmux_skill_feedback')
-    .flatMap((element: any) => element.columns ?? [])
-    .flatMap((column: any) => column.elements ?? [])
-    .map((action: any) => action.behaviors?.[0]?.value?.result)
-    .filter(Boolean);
-}
+const policy = normalizeFeedbackPolicy({
+  enabled: true,
+  negativeFollowup: { reasons: [{ key: 'missing_context', label: '缺少关键信息' }] },
+});
+const baseCard = JSON.parse(buildCanonicalFinalReplyCard({ markdown: 'final answer', feedback: { policy }, brand: 'botmux' }));
 
-describe('canonical final reply feedback card', () => {
-  it.each([
-    ['L0', ['helpful', 'incomplete', 'incorrect']],
-    ['L1', ['usable', 'progress', 'wrong']],
-    ['L2', ['completed', 'partial', 'blocked', 'wrong']],
-  ] as const)('renders %s action set before the footer', (level, expected) => {
-    const cardJson = buildCanonicalFinalReplyCard({
-      markdown: 'final answer',
-      feedback: { level },
-      brand: 'botmux',
-    });
-    expect(feedbackCodes(cardJson)).toEqual(expected);
+function visible(card: unknown): string { return JSON.stringify(card); }
 
-    const elements = JSON.parse(cardJson).body.elements;
-    const feedbackIndex = elements.findIndex((element: any) => element.element_id === 'botmux_skill_feedback');
-    const footerIndex = elements.findIndex((element: any) => element.element_id === 'botmux_reply_footer');
-    expect(feedbackIndex).toBeGreaterThanOrEqual(0);
-    expect(footerIndex).toBeGreaterThan(feedbackIndex);
+describe('final answer feedback card state machine', () => {
+  it('renders configured initial actions before the footer without internal levels', () => {
+    expect(visible(baseCard)).toContain('结论可用');
+    expect(visible(baseCard)).toContain('有效推进');
+    const elements = baseCard.body.elements;
+    expect(elements.findIndex((element: any) => element.element_id === 'botmux_feedback')).toBeLessThan(elements.findIndex((element: any) => element.element_id === 'botmux_reply_footer'));
+    expect(visible(baseCard)).not.toMatch(/L0|L1|L2/);
   });
 
-  it('defaults to L1 only when level is absent', () => {
-    expect(feedbackCodes(buildCanonicalFinalReplyCard({
-      markdown: 'final answer',
-      feedback: {},
-    }))).toEqual(['usable', 'progress', 'wrong']);
+  it('keeps button components, shows the selected label, and locks re-selection by default', () => {
+    const card = renderFeedbackCard(baseCard, policy, { result: 'conclusive_usable' });
+    expect(visible(card)).toContain('已选择：**结论可用**');
+    expect(visible(card)).toContain('"disabled":true');
+    expect(visible(card)).not.toContain('missing_context');
+    expect((card as any).body.elements.filter((element: any) => element.element_id === 'botmux_feedback')).toHaveLength(1);
   });
 
-  it('ordinary markdown cards remain feedback-free unless explicitly canonical', () => {
-    expect(buildMarkdownCard('streaming or progress')).not.toContain('botmux_skill_feedback');
+  it('keeps buttons enabled only when re-selection is configured', () => {
+    const reselectPolicy = normalizeFeedbackPolicy({ enabled: true, allowReselect: true });
+    const reselectBase = JSON.parse(buildCanonicalFinalReplyCard({ markdown: 'answer', feedback: { policy: reselectPolicy } }));
+    const card = renderFeedbackCard(reselectBase, reselectPolicy, { result: 'conclusive_usable' });
+    expect(visible(card)).toContain('已选择：**结论可用**');
+    expect(visible(card)).toContain('"disabled":false');
   });
 
-  it('ordinary botmux send stays feedback-free and only explicit feedback level opts in', () => {
-    const cli = readFileSync(new URL('../src/cli.ts', import.meta.url), 'utf8');
-    const workerPool = readFileSync(new URL('../src/core/worker-pool.ts', import.meta.url), 'utf8');
-    expect(cli).toContain('if (feedbackLevel)');
-    expect(cli).toContain("argValue(rest, '--feedback-level')");
-    expect(cli).toContain("feedback: { level: feedbackLevel }, brand: ''");
-    expect(workerPool).toContain('buildCanonicalFinalReplyCard');
+  it('preserves all non-feedback elements when the card has no footer', () => {
+    const noFooter = structuredClone(baseCard);
+    noFooter.body.elements = noFooter.body.elements.filter((element: any) =>
+      element.element_id !== 'botmux_reply_footer' && element.tag !== 'hr');
+    noFooter.body.elements.push({ tag: 'markdown', element_id: 'after_feedback', content: 'keep me' });
+    const card = renderFeedbackCard(noFooter, policy, { result: 'conclusive_usable' });
+    const elements = (card as any).body.elements;
+    expect(elements).toContainEqual(expect.objectContaining({ element_id: 'after_feedback', content: 'keep me' }));
+    expect(elements.filter((element: any) => element.element_id === 'botmux_feedback')).toHaveLength(1);
   });
 
-  it('contextual cards are feedback-free unless explicitly requested', () => {
-    const plain = JSON.parse(buildContextualReplyCard({ title: 'local', assistantText: 'done', assistantLabel: 'bot' }));
-    const final = JSON.parse(buildContextualReplyCard({ title: 'local', assistantText: 'done', assistantLabel: 'bot', feedback: { level: 'L2' } }));
-    expect(JSON.stringify(plain)).not.toContain('botmux_skill_feedback');
-    expect(JSON.stringify(final)).toContain('botmux_skill_feedback');
+  it('expands reasons and comment form for a negative choice', () => {
+    const card = renderFeedbackCard(baseCard, policy, { result: 'incorrect' });
+    expect(visible(card)).toContain('已选择：**结论有误**');
+    expect(visible(card)).toContain('缺少关键信息');
+    expect(visible(card)).toContain('可以补充哪里需要改进');
+    expect(visible(card)).toContain('提交补充');
+    expect(visible(card)).toContain('form_submit');
+  });
+
+  it('renders selected reason and completed comment without echoing text', () => {
+    const card = renderFeedbackCard(baseCard, policy, { result: 'incorrect', reasonKey: 'missing_context', comment: 'private detail' });
+    expect(visible(card)).toContain('✓ 缺少关键信息');
+    expect(visible(card)).toContain('已补充说明');
+    expect(visible(card)).not.toContain('private detail');
+  });
+
+  it('collapses negative follow-up after changing to positive', () => {
+    const card = renderFeedbackCard(baseCard, policy, { result: 'conclusive_usable', reasonKey: 'missing_context', comment: 'old' });
+    expect(visible(card)).not.toContain('缺少关键信息');
+    expect(visible(card)).not.toContain('已补充说明');
+  });
+
+  it('ordinary markdown cards remain feedback-free', () => {
+    expect(buildMarkdownCard('streaming or progress')).not.toContain('botmux_feedback');
   });
 });

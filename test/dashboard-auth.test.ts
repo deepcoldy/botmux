@@ -829,6 +829,10 @@ describe('decideDashboardAuth — publicReadOnly mode', () => {
       '/api/webhook-secrets',
       '/api/trigger-logs',
       '/api/trigger-logs/summary',
+      '/api/feedback/analytics/summary',
+      '/api/feedback/analytics/trend',
+      '/api/feedback/analytics/reasons',
+      '/api/feedback/analytics/deliveries',
       '/api/bot-onboarding/ob-1',
       // Allow-list is fail-closed: these read endpoints are NOT public-readable
       // (role/persona content, per-bot oncall config, CLI option metadata).

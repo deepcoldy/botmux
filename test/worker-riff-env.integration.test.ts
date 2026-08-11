@@ -1,4 +1,4 @@
-import { spawn, type ChildProcess } from 'node:child_process';
+import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer, type IncomingMessage, type Server } from 'node:http';
 import type { Socket } from 'node:net';
@@ -30,7 +30,36 @@ function readRequestBody(req: IncomingMessage): Promise<string> {
 }
 
 describe('Riff worker session environment', () => {
-  it('forwards a disabled reply-card usage switch into the remote sandbox', async () => {
+  it('reconstructs the effective feedback policy in an env-only Riff CLI', () => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-cli-riff-feedback-'));
+    try {
+      const result = spawnSync(process.execPath, [
+        '--import', 'tsx', resolve('src/cli.ts'),
+        'send', 'final answer without classification', '--no-mention',
+      ], {
+        cwd: resolve('.'),
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          HOME: root,
+          SESSION_DATA_DIR: root,
+          BOTMUX_SESSION_ID: 'sid-riff-feedback',
+          BOTMUX_CHAT_ID: 'oc_riff_feedback',
+          BOTMUX_LARK_APP_ID: 'app_riff_feedback',
+          BOTMUX_LARK_APP_SECRET: 'secret',
+          BOTMUX_FEEDBACK_POLICY: JSON.stringify({ enabled: true }),
+          BOTMUX_WORKFLOW: '',
+          BOTMUX_SEND_RELAY: '',
+        },
+      });
+      expect(result.status).toBe(2);
+      expect(result.stderr).toContain('必须显式指定 --response-kind progress|final');
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('forwards reply-card usage and the effective feedback policy into the remote sandbox', async () => {
     const root = mkdtempSync(join(tmpdir(), 'botmux-worker-riff-env-'));
     const sockets = new Set<Socket>();
     let child: ChildProcess | undefined;
@@ -145,6 +174,21 @@ describe('Riff worker session environment', () => {
         larkAppId: appId,
         larkAppSecret: 'secret',
         ownerOpenId: 'ou_authenticated_owner',
+        feedback: {
+          enabled: true,
+          audience: 'requester',
+          visibleSemantics: ['positive', 'progress', 'negative'],
+          buttons: [
+            { key: 'yes', label: 'Yes', semantic: 'positive', style: 'primary' },
+            { key: 'progress', label: 'Progress', semantic: 'progress', style: 'default' },
+            { key: 'no', label: 'No', semantic: 'negative', style: 'danger' },
+          ],
+          negativeFollowup: {
+            reasons: [],
+            comment: { enabled: false, required: false, placeholder: 'Explain', maxLength: 100 },
+          },
+          allowReselect: false,
+        },
       };
       child.send(init);
 
@@ -157,6 +201,10 @@ describe('Riff worker session environment', () => {
       expect(request.config?.env?.BOTMUX_USAGE_DISPLAY).toBe('footer');
       expect(request.config?.env?.BOTMUX_OWNER_OPEN_ID).toBe('ou_authenticated_owner');
       expect(request.config?.env?.__OWNER_OPEN_ID).toBe('ou_authenticated_owner');
+      expect(JSON.parse(request.config?.env?.BOTMUX_FEEDBACK_POLICY)).toMatchObject({
+        enabled: true,
+        buttons: [{ key: 'yes' }, { key: 'progress' }, { key: 'no' }],
+      });
     } finally {
       if (child && child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
       for (const socket of sockets) socket.destroy();

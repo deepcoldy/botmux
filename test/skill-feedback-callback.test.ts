@@ -4,77 +4,141 @@ import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { handleSkillFeedbackCardAction } from '../src/im/lark/skill-feedback-card.js';
 import { SkillFeedbackStore } from '../src/services/skill-feedback-store.js';
+import { normalizeFeedbackPolicy } from '../src/services/feedback-policy.js';
 
 const dirs: string[] = [];
 afterEach(() => dirs.splice(0).forEach(dir => rmSync(dir, { recursive: true, force: true })));
 
-describe('skill feedback callback trust boundary', () => {
-  it('looks up delivery by verified message, app and operator, ignoring forged identities and ids in action.value', async () => {
-    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-feedback-'));
-    dirs.push(dataDir);
-    const store = await SkillFeedbackStore.open(dataDir);
-    const response = store.createResponse({ interactionId: 'int_real', content: 'answer' });
-    const delivery = store.createDelivery({ responseId: response.responseId, platform: 'lark', platformAppId: 'app_test', platformMessageId: 'om_real', level: 'L0' });
+async function setup(overrides: Record<string, unknown> = {}) {
+  const dataDir = mkdtempSync(join(tmpdir(), 'botmux-feedback-')); dirs.push(dataDir);
+  const store = await SkillFeedbackStore.open(dataDir);
+  const policy = normalizeFeedbackPolicy({ enabled: true, negativeFollowup: { reasons: [{ key: 'wrong_result', label: '结论错误' }], comment: { enabled: true, ...overrides } } });
+  const response = store.createResponse({ interactionId: 'int', content: 'answer' });
+  const baseCard = { schema: '2.0', body: { elements: [{ tag: 'markdown', content: 'answer' }, { tag: 'column_set', element_id: 'botmux_feedback' }] } };
+  const delivery = store.createDelivery({ responseId: response.responseId, platform: 'lark', platformAppId: 'app', platformMessageId: 'om', policy, baseCard, requesterSubjectId: 'ou_user' });
+  return { store, delivery };
+}
 
-    const result = await handleSkillFeedbackCardAction({
-      context: { open_message_id: 'om_real' },
-      operator: { open_id: 'ou_real', union_id: 'on_real' },
-      action: { value: {
-        action: 'skill_feedback_submit', result: 'helpful',
-        delivery_id: 'del_forged', session_id: 'sid_forged', open_id: 'ou_forged', union_id: 'on_forged',
-      } },
-    }, 'app_test', { store });
+function event(action: Record<string, unknown>, operator = 'ou_user', formValue?: unknown, unionId?: string) {
+  return { context: { open_message_id: 'om' }, operator: { open_id: operator, ...(unionId ? { union_id: unionId } : {}) }, action: { value: action, form_value: formValue } } as any;
+}
 
-    expect(result.toast.type).toBe('success');
-    expect(store.listFeedbackRevisions(delivery.deliveryId, 'on_real')).toHaveLength(1);
-    expect(store.listFeedbackRevisions(delivery.deliveryId, 'on_forged')).toHaveLength(0);
+describe('feedback callback state machine', () => {
+  it('rebuilds a callback card from the platform card while the persisted template contains no answer', async () => {
+    const { store } = await setup();
+    const delivery = store.findDeliveryByPlatformMessage('lark', 'app', 'om')!;
+    expect(JSON.stringify(delivery.baseCard)).not.toContain('answer');
+    const platformCard = { schema: '2.0', body: { elements: [
+      { tag: 'markdown', content: 'answer from platform' },
+      { tag: 'column_set', element_id: 'botmux_feedback' },
+    ] } };
+    const result = await handleSkillFeedbackCardAction(
+      event({ action: 'feedback_submit', result: 'conclusive_usable' }),
+      'app',
+      { store, loadBaseCard: async () => platformCard },
+    );
+    expect(JSON.stringify(result.card.data)).toContain('answer from platform');
+    expect(JSON.stringify(result.card.data)).toContain('已选择：**结论可用**');
     store.close();
   });
 
-  it('fails closed without verified platform message or operator identity', async () => {
-    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-feedback-'));
-    dirs.push(dataDir);
-    const store = await SkillFeedbackStore.open(dataDir);
-    const result = await handleSkillFeedbackCardAction({
-      action: { value: { action: 'skill_feedback_submit', result: 'usable', delivery_id: 'forged' } },
-    }, 'app_test', { store });
-    expect(result.toast.type).toBe('error');
+  it('falls back to the content-free template when the platform card cannot be fetched', async () => {
+    const { store } = await setup();
+    const result = await handleSkillFeedbackCardAction(
+      event({ action: 'feedback_submit', result: 'conclusive_usable' }),
+      'app',
+      { store, loadBaseCard: async () => { throw new Error('platform unavailable'); } },
+    );
+    expect(JSON.stringify(result.card.data)).toContain('已选择：**结论可用**');
+    expect(JSON.stringify(result.card.data)).not.toContain('answer');
     store.close();
   });
 
-  it('rejects results outside the delivery level and arbitrary reasons', async () => {
-    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-feedback-'));
-    dirs.push(dataDir);
-    const store = await SkillFeedbackStore.open(dataDir);
-    const response = store.createResponse({ interactionId: 'int_invalid', content: 'answer' });
-    const delivery = store.createDelivery({ responseId: response.responseId, platform: 'lark', platformAppId: 'app_test', platformMessageId: 'om_invalid', level: 'L0' });
-    for (const value of [{ result: 'completed' }, { result: 'helpful', reason_key: 'forged' }]) {
-      const result = await handleSkillFeedbackCardAction({
-        context: { open_message_id: 'om_invalid' }, operator: { open_id: 'ou_real', union_id: 'on_real' },
-        action: { value: { action: 'skill_feedback_submit', ...value } },
-      }, 'app_test', { store });
-      expect(result.toast.type).toBe('error');
+  it('records a negative primary choice and defers the complex card update', async () => {
+    const { store, delivery } = await setup();
+    const result = await handleSkillFeedbackCardAction(event({ action: 'feedback_submit', result: 'incorrect' }), 'app', { store });
+    expect(result.toast).toBeUndefined();
+    expect(result.card).toBeUndefined();
+    expect(result.deferredCard).toMatchObject({ type: 'raw' });
+    expect(JSON.stringify(result.deferredCard.data)).toContain('结论错误');
+    expect(store.getLatestFeedback(delivery.deliveryId, 'ou_user')).toMatchObject({ result: 'incorrect' });
+    store.close();
+  });
+
+  it('accepts the requester when delivery stores open_id but the callback also carries a union_id', async () => {
+    const { store, delivery } = await setup();
+    const result = await handleSkillFeedbackCardAction(event({ action: 'feedback_submit', result: 'conclusive_usable' }, 'ou_user', undefined, 'on_user'), 'app', { store });
+    expect(result.card).toMatchObject({ type: 'raw' });
+    expect(store.getLatestFeedback(delivery.deliveryId, 'ou_user')).toMatchObject({ result: 'conclusive_usable' });
+    expect(store.getLatestFeedback(delivery.deliveryId, 'on_user')).toBeUndefined();
+    store.close();
+  });
+
+  it('rejects non-requesters and forged result/reason without mutation', async () => {
+    const { store, delivery } = await setup();
+    for (const input of [
+      event({ action: 'feedback_submit', result: 'conclusive_usable' }, 'on_other'),
+      event({ action: 'feedback_submit', result: 'forged' }),
+      event({ action: 'feedback_reason', reason_key: 'forged' }),
+    ]) expect((await handleSkillFeedbackCardAction(input, 'app', { store })).toast.type).toBe('error');
+    expect(store.listFeedbackRevisions(delivery.deliveryId, 'ou_user')).toHaveLength(0);
+    store.close();
+  });
+
+  it('records reason against latest negative result and renders selection', async () => {
+    const { store, delivery } = await setup();
+    await handleSkillFeedbackCardAction(event({ action: 'feedback_submit', result: 'incorrect' }), 'app', { store });
+    const result = await handleSkillFeedbackCardAction(event({ action: 'feedback_reason', reason_key: 'wrong_result' }), 'app', { store });
+    expect(JSON.stringify(result.card.data)).toContain('✓ 结论错误');
+    expect(store.getLatestFeedback(delivery.deliveryId, 'ou_user')).toMatchObject({ result: 'incorrect', reasonKey: 'wrong_result' });
+    store.close();
+  });
+
+  it('validates required comments and never coerces non-string values', async () => {
+    const { store, delivery } = await setup({ required: true, maxLength: 5 });
+    await handleSkillFeedbackCardAction(event({ action: 'feedback_submit', result: 'incorrect' }), 'app', { store });
+    for (const value of [{ comment: '   ' }, { comment: {} }, { comment: '123456' }]) {
+      const result = await handleSkillFeedbackCardAction(event({ action: 'feedback_comment' }, 'ou_user', value), 'app', { store });
+      expect(result.toast.type).toBe('warning');
     }
-    expect(store.listFeedbackRevisions(delivery.deliveryId, 'on_real')).toHaveLength(0);
+    expect(store.listFeedbackRevisions(delivery.deliveryId, 'ou_user')).toHaveLength(1);
+    const ok = await handleSkillFeedbackCardAction(event({ action: 'feedback_comment' }, 'ou_user', { comment: ' ok ' }), 'app', { store });
+    expect(JSON.stringify(ok.card.data)).toContain('已补充说明');
+    expect(JSON.stringify(ok.card.data)).not.toContain('ok');
+    expect(store.getLatestFeedback(delivery.deliveryId, 'ou_user')).toMatchObject({ comment: 'ok' });
     store.close();
   });
 
-  it('fails closed on malformed verified union id and cross-app message collision', async () => {
-    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-feedback-'));
-    dirs.push(dataDir);
+  it('keeps the first primary choice when re-selection is disabled by default', async () => {
+    const { store, delivery } = await setup();
+    const first = await handleSkillFeedbackCardAction(event({ action: 'feedback_submit', result: 'conclusive_usable' }), 'app', { store });
+    const second = await handleSkillFeedbackCardAction(event({ action: 'feedback_submit', result: 'incorrect' }), 'app', { store });
+    expect(JSON.stringify(first.card.data)).toContain('已选择：**结论可用**');
+    expect(second).toEqual(first);
+    expect(store.getLatestFeedback(delivery.deliveryId, 'ou_user')).toMatchObject({ result: 'conclusive_usable', revision: 1 });
+    store.close();
+  });
+
+  it('allows changing away and back only when re-selection is configured', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-feedback-')); dirs.push(dataDir);
     const store = await SkillFeedbackStore.open(dataDir);
-    const response = store.createResponse({ interactionId: 'int_closed', content: 'answer' });
-    store.createDelivery({ responseId: response.responseId, platform: 'lark', platformAppId: 'app_a', platformMessageId: 'om_same', level: 'L0' });
-    const malformed = await handleSkillFeedbackCardAction({
-      context: { open_message_id: 'om_same' }, operator: { open_id: 'ou_real', union_id: 'bad' },
-      action: { value: { action: 'skill_feedback_submit', result: 'helpful' } },
-    }, 'app_a', { store });
-    const crossApp = await handleSkillFeedbackCardAction({
-      context: { open_message_id: 'om_same' }, operator: { open_id: 'ou_real', union_id: 'on_real' },
-      action: { value: { action: 'skill_feedback_submit', result: 'helpful' } },
-    }, 'app_b', { store });
-    expect(malformed.toast.type).toBe('error');
-    expect(crossApp.toast.type).toBe('error');
+    const policy = normalizeFeedbackPolicy({ enabled: true, allowReselect: true });
+    const response = store.createResponse({ interactionId: 'int-reselect', content: 'answer' });
+    const baseCard = { schema: '2.0', body: { elements: [{ tag: 'markdown', content: 'answer' }, { tag: 'column_set', element_id: 'botmux_feedback' }] } };
+    const delivery = store.createDelivery({ responseId: response.responseId, platform: 'lark', platformAppId: 'app', platformMessageId: 'om', policy, baseCard, requesterSubjectId: 'ou_user' });
+    await handleSkillFeedbackCardAction(event({ action: 'feedback_submit', result: 'conclusive_usable' }), 'app', { store });
+    await handleSkillFeedbackCardAction(event({ action: 'feedback_submit', result: 'incorrect' }), 'app', { store });
+    const back = await handleSkillFeedbackCardAction(event({ action: 'feedback_submit', result: 'conclusive_usable' }), 'app', { store });
+    expect(JSON.stringify(back.card.data)).toContain('已选择：**结论可用**');
+    expect(store.getLatestFeedback(delivery.deliveryId, 'ou_user')).toMatchObject({ result: 'conclusive_usable', revision: 3 });
+    store.close();
+  });
+
+  it('returns a stable card for duplicate callbacks', async () => {
+    const { store } = await setup();
+    const first = await handleSkillFeedbackCardAction(event({ action: 'feedback_submit', result: 'conclusive_usable' }), 'app', { store });
+    const duplicate = await handleSkillFeedbackCardAction(event({ action: 'feedback_submit', result: 'conclusive_usable' }), 'app', { store });
+    expect(duplicate).toEqual(first);
     store.close();
   });
 });

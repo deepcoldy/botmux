@@ -22,6 +22,9 @@ import { normalizeSubstituteMode } from './services/substitute-mode-normalize.js
 import { normalizePluginIdList } from './core/plugins/ids.js';
 import { normalizeVcMeetingProfileInstructions } from './services/vc-meeting-profile-instructions.js';
 import { isGrantDurationOption } from './services/grant-policy.js';
+import type { FeedbackPolicy, FeedbackPolicyInput } from './services/feedback-policy.js';
+import { normalizeFeedbackPolicyLayer } from './services/feedback-policy-resolver.js';
+import type { FeedbackWebhookDestination } from './services/feedback-outbox.js';
 import type {
   VcMeetingConsumerAgentConfig,
   VcMeetingConsumerConfig,
@@ -204,6 +207,26 @@ export interface ContentTriggerConfig {
     type: ContentTriggerActionType;
     prompt: string;
   };
+}
+
+function normalizeFeedbackWebhookConfig(raw: unknown): { destinations: FeedbackWebhookDestination[] } | undefined {
+  if (!raw || typeof raw !== 'object' || !Array.isArray((raw as any).destinations)) return undefined;
+  const seen = new Set<string>();
+  const destinations: FeedbackWebhookDestination[] = [];
+  for (const item of (raw as any).destinations) {
+    if (!item || typeof item !== 'object') continue;
+    const id = typeof item.id === 'string' ? item.id.trim() : '';
+    const url = typeof item.url === 'string' ? item.url.trim() : '';
+    const secretRef = typeof item.secretRef === 'string' ? item.secretRef.trim() : '';
+    const eventTypes = Array.isArray(item.eventTypes)
+      ? [...new Set(item.eventTypes.filter((type: unknown) => type === 'turn.completed' || type === 'feedback.revised'))] as Array<'turn.completed' | 'feedback.revised'>
+      : [];
+    if (!id || seen.has(id) || !url || !secretRef || eventTypes.length === 0) continue;
+    seen.add(id);
+    destinations.push({ id, enabled: item.enabled !== false, url, eventTypes, secretRef,
+      ...(Number.isInteger(item.timeoutMs) && item.timeoutMs > 0 ? { timeoutMs: Math.min(item.timeoutMs, 30_000) } : {}) });
+  }
+  return destinations.length ? { destinations } : undefined;
 }
 
 function normalizeChatReplyModeConfig(raw: unknown): ChatReplyMode | undefined {
@@ -1092,6 +1115,11 @@ export interface BotConfig {
    * 缺省 / false 保持原有飞书 bot 行为字节不变。
    */
   apiOnly?: boolean;
+  /** Final-answer feedback policy. Missing/disabled is intentionally inert. */
+  feedback?: FeedbackPolicyInput | FeedbackPolicy;
+  /** Per-chat final-answer feedback overrides, scoped to this bot app id. */
+  chatFeedbackPolicies?: Record<string, FeedbackPolicyInput>;
+  feedbackWebhooks?: { destinations: FeedbackWebhookDestination[] };
   /**
    * 租户品牌：`'feishu'`（中国版，open.feishu.cn）或 `'lark'`（国际版，
    * open.larksuite.com）。缺省 / 旧 bots.json 无此字段 → 视为 `'feishu'`
@@ -2686,6 +2714,13 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       // upload etc. already degrade gracefully on an empty secret.
       larkAppSecret: entry.larkAppSecret ?? '',
       apiOnly: entry.apiOnly === true || undefined,
+      feedback: entry.feedback === undefined
+        ? undefined
+        : normalizeFeedbackPolicyLayer(entry.feedback),
+      chatFeedbackPolicies: entry.chatFeedbackPolicies && typeof entry.chatFeedbackPolicies === 'object' && !Array.isArray(entry.chatFeedbackPolicies)
+        ? Object.fromEntries(Object.entries(entry.chatFeedbackPolicies).map(([chatId, layer]) => [chatId, normalizeFeedbackPolicyLayer(layer)]))
+        : undefined,
+      feedbackWebhooks: normalizeFeedbackWebhookConfig(entry.feedbackWebhooks),
       // brand：只认精确的 'lark'，其余 → undefined（下游 normalizeBrand 当
       // feishu）。feishu 故意存成 undefined，保持旧 bots.json 干净、不写死字段。
       brand: entry.brand === 'lark' ? 'lark' : undefined,

@@ -6770,6 +6770,40 @@ describe('card.action.trigger — ack-safe slow handlers', () => {
     startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
   });
 
+  it('uses empty ACK plus message.patch for a fast deferred complex-card update', async () => {
+    handlers.handleCardAction.mockResolvedValue({ deferredCard: { type: 'raw', data: { type: 'negative-followup-card' } } });
+
+    const result = await capturedHandlers['card.action.trigger']({
+      action: { value: { action: 'feedback_submit', result: 'incomplete' } },
+      operator: { open_id: USER_OPEN_ID },
+      context: { open_message_id: 'om_feedback_negative' },
+    });
+
+    expect(result).toEqual({});
+    expect(mockUpdateMessage).not.toHaveBeenCalled();
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(mockUpdateMessage).toHaveBeenCalledWith(
+      MY_APP_ID,
+      'om_feedback_negative',
+      JSON.stringify({ type: 'negative-followup-card' }),
+    );
+  });
+
+  it('surfaces deferred patch failure as an empty ACK without returning an invalid card response', async () => {
+    mockUpdateMessage.mockRejectedValueOnce(new Error('HTTP 400 invalid card'));
+    handlers.handleCardAction.mockResolvedValue({ deferredCard: { type: 'raw', data: { type: 'invalid-negative-followup' } } });
+
+    const result = await capturedHandlers['card.action.trigger']({
+      action: { value: { action: 'feedback_submit', result: 'incomplete' } },
+      operator: { open_id: USER_OPEN_ID },
+      context: { open_message_id: 'om_feedback_invalid' },
+    });
+
+    expect(result).toEqual({});
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining('HTTP 400 invalid card'));
+  });
+
   it('preserves immediate card action responses when the handler is fast', async () => {
     handlers.handleCardAction.mockResolvedValue({ type: 'updated-card' });
 

@@ -41,6 +41,9 @@ export function buildBotmuxShellHints(locale?: Locale): string[] {
     t('ai.shell.heredoc_example', undefined, locale),
     t('ai.shell.helpers', undefined, locale),
     t('ai.shell.when_to_send', undefined, locale),
+    ...(locale === 'en'
+      ? ['If final-answer feedback is enabled for this bot, `botmux send` requires `--response-kind progress` for interim updates or `--response-kind final` for the final answer.']
+      : ['若此 bot 启用了最终回答反馈，`botmux send` 必须用 `--response-kind progress` 标记进度，或用 `--response-kind final` 标记最终回答。']),
     // Experimental anti-resend guidance — opt-in via dashboard Settings
     // (dashboard.noVisibleOutputHint). Default OFF, so the rendered hints match
     // the pre-feature baseline unless an operator flips it on. Live-read here so

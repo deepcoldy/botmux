@@ -6962,7 +6962,7 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
        --video-covers <path>           视频封面图片（可重复，按顺序对应 --videos）
        --card-file <path>              直接发送飞书/Lark interactive 卡片 JSON
        --card-json <json>              直接发送飞书/Lark interactive 卡片 JSON 字符串
-       --feedback-level L0|L1|L2       明确把本条作为最终答案并附反馈控件
+       --response-kind progress|final  启用最终回答反馈的 bot 必须声明本条性质
        --mention <open_id:name>        @提及（可重复）
        --mention-back                  @回本轮触发消息的发送者（open_id 自动取自会话）
        --no-mention                    明确声明本条不@任何人
@@ -7980,14 +7980,15 @@ function withCustomCardMentionFooter(
 // keeps using `buildImageCardElements` from there.
 import {
   appendReplyCardFooterToV2Card,
-  buildCanonicalFinalReplyCard,
   buildImageCardElements,
   buildReplyCardFooter,
   prepareCardMarkdown,
   type CardUsageSnapshot,
   type LocalHomeLinkMode,
 } from './im/lark/md-card.js';
-import type { SkillFeedbackLevel } from './services/skill-feedback-store.js';
+import { buildFeedbackElement } from './im/lark/skill-feedback-card.js';
+import { resolveFeedbackPolicyForDelivery, resolveFeedbackTeamId } from './services/feedback-policy-resolver.js';
+import { normalizeFeedbackPolicy } from './services/feedback-policy.js';
 import { applyInlineMentions } from './im/lark/inline-mentions.js';
 import { renderBrandTemplate } from './im/lark/brand-template.js';
 import { resolveBrandLabel, resolveUsageDisplay } from './bot-registry.js';
@@ -8047,7 +8048,7 @@ async function relaySend(
     // the dashboard hand anyway; excluding it would silently send the reason as a
     // bare message instead of the original loud "no content" failure. Plumbing
     // `--attention` through the relay is a separate change, out of this scope.
-    const pos = positionals(rest, ['--card', '--text', '--top-level', '--no-quote', '--mention-back', '--no-mention', '--anyway', '--voice', '--feedback-level']);
+    const pos = positionals(rest, ['--card', '--text', '--top-level', '--no-quote', '--mention-back', '--no-mention', '--anyway', '--voice']);
     content = pos.length > 0 ? pos.join(' ') : await readStdin();
   }
   const preparedCardContent = cardJsonArg === undefined && cardFile === undefined && !rest.includes('--voice')
@@ -8107,12 +8108,17 @@ async function relaySend(
   // routing (--chat-id/--into/--top-level) and --session-id flags are dropped —
   // content/attachments come from the outbox and session-id is forced host-side.
   const FLAGS_NOVAL = new Set(['--mention-back', '--no-mention', '--no-quote', '--voice']);
-  const FLAGS_VAL = new Set(['--mention', '--quote', '--feedback-level']);
+  const FLAGS_VAL = new Set(['--mention', '--quote', '--response-kind']);
   const flags: string[] = [];
   for (let i = 0; i < rest.length; i++) {
     const tok = rest[i];
     if (FLAGS_NOVAL.has(tok)) flags.push(tok);
     else if (FLAGS_VAL.has(tok) && i + 1 < rest.length) flags.push(tok, rest[++i]);
+    else {
+      const equals = tok.indexOf('=');
+      const flag = equals > 0 ? tok.slice(0, equals) : tok;
+      if (FLAGS_VAL.has(flag)) flags.push(flag, tok.slice(equals + 1));
+    }
     // else dropped
   }
   // 原子写：req.json 是 host watcher 的触发文件，rename 让它「完整出现」，
@@ -8291,7 +8297,7 @@ async function registerSelfFromCredFile(): Promise<void> {
   const sd = process.env.SESSION_DATA_DIR;
   if (!appId || !sd) return;
   const { sendCredFilePath } = await import('./adapters/cli/read-isolation.js');
-  let cred: { larkAppSecret?: string; brand?: string; apiOnly?: boolean };
+  let cred: { larkAppSecret?: string; brand?: string; apiOnly?: boolean; feedback?: import('./services/feedback-policy.js').FeedbackPolicyInput };
   try {
     // send-cred lives in the bot's BOT_HOME (<BOTMUX_HOME>/bots/<appId>/send-cred.json);
     // sendCredFilePath takes SESSION_DATA_DIR and derives BOTMUX_HOME (its parent).
@@ -8311,6 +8317,7 @@ async function registerSelfFromCredFile(): Promise<void> {
     apiOnly: cred.apiOnly === true || undefined,
     cliId: 'claude-code',
     brand: cred.brand as 'feishu' | 'lark' | undefined,
+    feedback: cred.feedback,
     usageDisplay:
       process.env.BOTMUX_USAGE_DISPLAY === 'streaming' ||
       process.env.BOTMUX_USAGE_DISPLAY === 'footer' ||
@@ -8374,6 +8381,14 @@ function riffModeSession(opts: { evenWithLocalSessions?: boolean } = {}): { sess
   const deferredTurnId = process.env.BOTMUX_DEFERRED_SCHEDULE_TURN_ID;
   const deferredRoutingAnchor = process.env.BOTMUX_DEFERRED_SCHEDULE_ROUTING_ANCHOR;
   const deferredCreatedAt = process.env.BOTMUX_DEFERRED_SCHEDULE_CREATED_AT;
+  let feedback: import('./services/feedback-policy.js').FeedbackPolicy | undefined;
+  try {
+    const rawFeedback = process.env.BOTMUX_FEEDBACK_POLICY;
+    if (rawFeedback) feedback = normalizeFeedbackPolicy(JSON.parse(rawFeedback));
+  } catch {
+    // A malformed/missing remote env snapshot must not accidentally enable UI.
+    feedback = undefined;
+  }
 
   const botConfig = {
     larkAppId: appId,
@@ -8382,6 +8397,7 @@ function riffModeSession(opts: { evenWithLocalSessions?: boolean } = {}): { sess
     brand,
     cliId: 'riff',
     allowedUsers: [],
+    feedback,
     usageDisplay:
       process.env.BOTMUX_USAGE_DISPLAY === 'streaming' ||
       process.env.BOTMUX_USAGE_DISPLAY === 'footer' ||
@@ -8741,10 +8757,9 @@ async function cmdSend(rest: string[]): Promise<void> {
   const cardJsonArg = argValue(rest, '--card-json');
   const cardFile = argValue(rest, '--card-file');
   const customCardRequested = cardJsonArg !== undefined || cardFile !== undefined;
-  const feedbackLevelRaw = argValue(rest, '--feedback-level');
-  const feedbackLevel = feedbackLevelRaw as SkillFeedbackLevel | undefined;
-  if (feedbackLevelRaw !== undefined && !['L0', 'L1', 'L2'].includes(feedbackLevelRaw)) {
-    console.error('botmux send: --feedback-level 必须是 L0、L1 或 L2');
+  const responseKind = argValue(rest, '--response-kind');
+  if (responseKind !== undefined && responseKind !== 'progress' && responseKind !== 'final') {
+    console.error('botmux send: --response-kind 必须是 progress 或 final');
     process.exit(2);
   }
   const managedCustomCardError = managedVcCustomCardError(
@@ -8808,10 +8823,6 @@ async function cmdSend(rest: string[]): Promise<void> {
   // text/card message. The content should be spoken-style prose (the 🔊 button
   // injects a condense-first instruction before the model calls this).
   const asVoice = rest.includes('--voice');
-  if (feedbackLevel && (customCardRequested || asVoice || sendTopLevel || !!overrideChatId || !!sendInto || !!vcMeetingManagedSendOrigin)) {
-    console.error('botmux send: --feedback-level 仅支持当前会话内的普通最终答案卡片');
-    process.exit(2);
-  }
   // Quote chain (chat scope): --quote <message_id> overrides the auto target,
   // --no-quote forces a plain (un-quoted) send.
   const explicitQuote = argValue(rest, '--quote');
@@ -9060,7 +9071,7 @@ async function cmdSend(rest: string[]): Promise<void> {
   let content = '';
   let customCard: Record<string, unknown> | undefined;
   if (customCardRequested) {
-    const unexpectedText = positionals(rest, ['--card', '--text', '--top-level', '--no-quote', '--mention-back', '--no-mention', '--anyway', '--voice', '--attention', '--feedback-level']);
+    const unexpectedText = positionals(rest, ['--card', '--text', '--top-level', '--no-quote', '--mention-back', '--no-mention', '--anyway', '--voice', '--attention']);
     if (unexpectedText.length > 0) {
       console.error('botmux send: --card-file/--card-json 发送自定义卡片时不接受正文参数；卡片内容请写入 JSON');
       process.exit(2);
@@ -9077,7 +9088,7 @@ async function cmdSend(rest: string[]): Promise<void> {
     if (!existsSync(contentFile)) { console.error(`文件不存在: ${contentFile}`); process.exit(1); }
     content = readFileSync(contentFile, 'utf-8');
   } else {
-    const pos = positionals(rest, ['--card', '--text', '--top-level', '--no-quote', '--mention-back', '--no-mention', '--anyway', '--voice', '--attention', '--feedback-level']);
+    const pos = positionals(rest, ['--card', '--text', '--top-level', '--no-quote', '--mention-back', '--no-mention', '--anyway', '--voice', '--attention']);
     if (pos.length > 0) {
       content = pos.join(' ');
     } else {
@@ -9402,6 +9413,33 @@ async function cmdSend(rest: string[]): Promise<void> {
   const { resolveRegularGroupMode } = await import('./services/chat-reply-mode-store.js');
   try { for (const cfg of loadBotConfigs()) registerBot(cfg); } catch { /* */ }
   if (envPinnedRiffBot) { try { registerBot(envPinnedRiffBot); } catch { /* */ } }
+  let feedbackPolicy: ReturnType<typeof resolveFeedbackPolicyForDelivery>;
+  let feedbackWebhookDestinations: import('./services/feedback-outbox.js').FeedbackWebhookDestination[] | undefined;
+  try {
+    const botConfig = getBot(s.larkAppId).config;
+    feedbackWebhookDestinations = botConfig.feedbackWebhooks?.destinations;
+    feedbackPolicy = resolveFeedbackPolicyForDelivery({
+      dataDir: config.session.dataDir,
+      larkAppId: s.larkAppId,
+      chatId: s.chatId,
+      bot: botConfig,
+    });
+  } catch {
+    feedbackPolicy = undefined;
+  }
+  const feedbackRequesterSubjectId = replyTargetSenderOpenId ?? s.ownerOpenId;
+  if (feedbackPolicy && responseKind === 'final' && !feedbackRequesterSubjectId) {
+    console.error('botmux send: 无法确认本次提问者身份，不能发送带反馈控件的最终回答');
+    process.exit(2);
+  }
+  if (feedbackPolicy && responseKind === undefined) {
+    console.error('botmux send: 启用最终回答反馈后，必须显式指定 --response-kind progress|final');
+    process.exit(2);
+  }
+  if (feedbackPolicy && responseKind === 'final' && (customCardRequested || asVoice || sendTopLevel || !!overrideChatId || !!sendInto || !!vcMeetingManagedSendOrigin)) {
+    console.error('botmux send: --response-kind final 仅支持当前会话内的普通最终答案卡片');
+    process.exit(2);
+  }
 
   // Ambiguity gate for --mention-back. --mention-back means "@ back the one
   // counterpart who triggered this turn"; that is only unambiguous when this
@@ -9964,6 +10002,7 @@ async function cmdSend(rest: string[]): Promise<void> {
     // we committed to sending — that's the boundary the gate cares about.
     const sentAtMs = Date.now();
     let messageId: string;
+    let feedbackBaseCard: Record<string, unknown> | undefined;
     let failedAttachments: { path: string; error: string }[] = [];
     let failedVideoAttachments: { path: string; coverPath: string; error: string }[] = [];
     const pureVideoSend = customCard
@@ -10111,15 +10150,13 @@ async function cmdSend(rest: string[]): Promise<void> {
         }
       }
 
-      if (feedbackLevel) {
-        const cardJson = buildCanonicalFinalReplyCard({ markdown: '', feedback: { level: feedbackLevel }, brand: '' });
-        const canonicalCard = JSON.parse(cardJson) as { body: { elements: unknown[] } };
-        canonicalCard.body.elements = [
-          ...elements.filter((element: any) => element?.element_id !== 'botmux_reply_footer'),
-          ...canonicalCard.body.elements,
-          ...elements.filter((element: any) => element?.element_id === 'botmux_reply_footer'),
-        ];
-        messageId = await dispatchPrimary(JSON.stringify(canonicalCard), 'interactive');
+      if (feedbackPolicy && responseKind === 'final') {
+        const canonicalCard = { schema: '2.0', config: { update_multi: true }, body: { direction: 'vertical', elements: [...elements] } } as { schema: string; config: Record<string, unknown>; body: { direction: string; elements: unknown[] } };
+        const feedbackElement = buildFeedbackElement(feedbackPolicy);
+        const footerIndex = canonicalCard.body.elements.findIndex((element: any) => element?.element_id === 'botmux_reply_footer');
+        canonicalCard.body.elements.splice(footerIndex >= 0 ? footerIndex : canonicalCard.body.elements.length, 0, feedbackElement);
+        feedbackBaseCard = canonicalCard as unknown as Record<string, unknown>;
+        messageId = await dispatchPrimary(JSON.stringify(feedbackBaseCard), 'interactive');
       } else {
         messageId = await dispatchPrimary(JSON.stringify({
           schema: '2.0', config: { update_multi: true }, body: { direction: 'vertical', elements },
@@ -10127,35 +10164,30 @@ async function cmdSend(rest: string[]): Promise<void> {
       }
     }
 
-    if (feedbackLevel && !customCard && !pureVideoSend && !vcMeetingManagedSendOrigin && messageId) {
+    if (feedbackPolicy && responseKind === 'final' && !customCard && !pureVideoSend && !vcMeetingManagedSendOrigin && messageId) {
       try {
         const { getSkillFeedbackStore } = await import('./services/skill-feedback-store.js');
         const feedbackStore = await getSkillFeedbackStore(resolveDataDir());
-        const interactionId = `lark:${appId}:${sid}:${currentTurnId ?? `send:${messageId}`}`;
-        const response = feedbackStore.createResponse({
-          interactionId,
-          content: text,
-          context: {
-            runtime: s.cliId,
-            agent: s.cliId,
-            platform: 'lark',
-            session: sid,
-            turn: currentTurnId ?? undefined,
-          },
-        });
-        feedbackStore.createDelivery({
-          responseId: response.responseId,
+        feedbackStore.recordTurnDelivery({
+          botAppId: appId,
+          sessionId: sid,
+          turnId: currentTurnId ?? `send:${messageId}`,
+          nativeSessionId: s.cliSessionId,
           platform: 'lark',
           platformAppId: appId,
           platformMessageId: messageId,
-          level: feedbackLevel,
-          context: {
-            runtime: s.cliId,
-            agent: s.cliId,
-            platform: 'lark',
-            session: sid,
-            turn: currentTurnId ?? undefined,
-          },
+          chatId: targetChatId,
+          topicRootId: sendTarget.mode === 'thread' ? sendTarget.rootMessageId : s.rootMessageId,
+          dispatchAttempt: originDispatchAttempt,
+          content: text,
+          cliId: s.cliId,
+          cardMode: 'feedback',
+          status: 'delivered',
+          policy: feedbackPolicy,
+          baseCard: feedbackBaseCard,
+          requesterSubjectId: feedbackRequesterSubjectId,
+          webhookDestinations: feedbackWebhookDestinations,
+          context: { ...(resolveFeedbackTeamId({ dataDir: resolveDataDir(), chatId: targetChatId }) ? { teamId: resolveFeedbackTeamId({ dataDir: resolveDataDir(), chatId: targetChatId }) } : {}) },
         });
       } catch (error) {
         console.error(

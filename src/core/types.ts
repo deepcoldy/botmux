@@ -83,6 +83,9 @@ export interface DaemonSession {
   hasHistory: boolean;   // true after CLI has run at least once for this session
   workingDir?: string;
   initConfig?: Extract<DaemonToWorker, { type: 'init' }>;   // stored for restart
+  /** Per-session snapshot of the final-answer feedback policy. New config takes
+   * effect on the next new/restarted session, matching sandbox send-cred state. */
+  feedbackPolicy?: import('../services/feedback-policy.js').FeedbackPolicy;
   /** Dashboard「复现命令」：worker 在 `ready` 时上报的、该 session 本次冷启的近似
    *  可复现 CLI 调用（bin + argv + cwd + 权威注入 env）。**只驻内存、绝不落盘**
    *  ——命令含 provider token / 凭证 env，写进默认 0644 的 sessions-*.json 会让同机

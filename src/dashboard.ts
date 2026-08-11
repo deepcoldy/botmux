@@ -55,6 +55,8 @@ import {
   redactSettingsForPublic,
 } from './dashboard/public-redact.js';
 import { handleWebhookRoute } from './dashboard/webhook-routes.js';
+import { handleFeedbackAnalyticsApi } from './dashboard/feedback-analytics-api.js';
+import { FeedbackAnalyticsService } from './services/feedback-analytics.js';
 import { handleFederationApi } from './dashboard/federation-api.js';
 import { buildFederatedRoster } from './services/federation-roster.js';
 import { resolveLiveBotTransport } from './services/team-roster.js';
@@ -2759,6 +2761,10 @@ const dashboardSummaryEndpoint = createDashboardSummaryEndpoint({
     logger.warn(`[dashboard-summary] live snapshot unavailable: ${error instanceof Error ? error.message : String(error)}`);
   },
 });
+let feedbackAnalyticsService: FeedbackAnalyticsService | undefined;
+function analyticsService(): FeedbackAnalyticsService {
+  return feedbackAnalyticsService ??= new FeedbackAnalyticsService(config.session.dataDir);
+}
 
 const server = createServer(async (req, res) => {
   try {
@@ -2962,6 +2968,11 @@ const server = createServer(async (req, res) => {
         error: 'legacy_workflow_retired',
         message: 'v2 workflow dashboard APIs are retired; use /api/v3/runs for v3 run visibility',
       });
+    }
+
+    if (url.pathname.startsWith('/api/feedback/analytics/')) {
+      await handleFeedbackAnalyticsApi(req, res, url, { service: analyticsService() });
+      return;
     }
 
     if (req.method === 'GET' && url.pathname === '/__dev/reload') {
@@ -5007,6 +5018,30 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    let mBotFeedback: RegExpMatchArray | null;
+    if (req.method === 'PUT' && (mBotFeedback = url.pathname.match(/^\/api\/bots\/([^/]+)\/feedback$/))) {
+      const appId = decodeURIComponent(mBotFeedback[1]);
+      const chunks: Buffer[] = [];
+      for await (const c of req) chunks.push(c as Buffer);
+      const raw = Buffer.concat(chunks).toString('utf8') || '{}';
+      const upstream = await proxyToDaemon(appId, `/api/bot-feedback`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: raw });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+
+    const mChatFeedback = url.pathname.match(/^\/api\/bots\/([^/]+)\/chats\/([^/]+)\/feedback$/);
+    if (req.method === 'PUT' && mChatFeedback) {
+      const chunks: Buffer[] = []; for await (const c of req) chunks.push(c as Buffer);
+      const upstream = await proxyToDaemon(decodeURIComponent(mChatFeedback[1]), `/api/chat-feedback/${encodeURIComponent(decodeURIComponent(mChatFeedback[2]))}`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: Buffer.concat(chunks).toString('utf8') || '{}' });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' }); res.end(await upstream.text()); return;
+    }
+    const mEffectiveFeedback = url.pathname.match(/^\/api\/bots\/([^/]+)\/feedback\/effective$/);
+    if (req.method === 'GET' && mEffectiveFeedback) {
+      const upstream = await proxyToDaemon(decodeURIComponent(mEffectiveFeedback[1]), `/api/feedback-effective${url.search}`, { method: 'GET' });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' }); res.end(await upstream.text()); return;
+    }
+
     // PUT /api/bots/:appId/env — proxy to that bot's daemon. Body
     // `{ env: string }` (raw JSON text; '' = clear).
     let mBotEnv: RegExpMatchArray | null;
@@ -6064,6 +6099,7 @@ function shutdown(): void {
   resourceMonitor.stop();
   platformTunnel?.stop();
   debugTerminalManager.shutdown();
+  feedbackAnalyticsService?.close();
   if (oauthCallbackServer.listening) oauthCallbackServer.close();
   server.close(() => process.exit(gracefulProcessExitCode()));
   // Hard-exit fallback after 5s

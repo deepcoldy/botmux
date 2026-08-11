@@ -74,6 +74,8 @@ import {
   type VcMeetingConsumerProfileConfig,
 } from './bot-registry.js';
 import { setDisplayNameRefresher, findConfigField, applyConfigField } from './services/bot-config-store.js';
+import { getSkillFeedbackStore } from './services/skill-feedback-store.js';
+import { FeedbackWebhookSecretStore, startFeedbackWebhookDispatcher } from './services/feedback-webhook-dispatcher.js';
 import { resolveRegularGroupMode } from './services/chat-reply-mode-store.js';
 import { renameBotOnOpenPlatform, changeBotAvatarOnOpenPlatform } from './services/open-platform-rename.js';
 import { migrateSandboxConfigAtStartup } from './services/sandbox-migration.js';
@@ -20060,6 +20062,14 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   }
   registerBot(cfg);
   selfDaemonLarkAppId = cfg.larkAppId;
+  const feedbackWebhookStore = await getSkillFeedbackStore(config.session.dataDir);
+  const feedbackWebhookSecrets = new FeedbackWebhookSecretStore(config.session.dataDir);
+  const feedbackWebhookDispatcher = startFeedbackWebhookDispatcher({
+    store: feedbackWebhookStore,
+    readSecret: ref => feedbackWebhookSecrets.get(ref),
+    onError: error => logger.warn(`[feedback-webhook] ${error instanceof Error ? error.message : String(error)}`),
+  });
+  await feedbackWebhookDispatcher.ready;
   // Establish the target-scoped daemon control credential before publishing
   // the daemon descriptor or accepting IPC traffic. Corruption fails startup
   // closed; silently rotating here could strand peers on mismatched tokens.
@@ -20386,7 +20396,21 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     },
     enforceLiveSessionCap: () => enforceLiveSessionCap('session_change'),
     onQueuedActivationSubmitted,
-    onTurnTerminal(ds, terminal, context) {
+    async onTurnTerminal(ds, terminal, context) {
+      try {
+        const { persistTurnTerminal } = await import('./services/turn-completion-events.js');
+        await persistTurnTerminal({
+          dataDir: config.session.dataDir,
+          botAppId: ds.larkAppId,
+          session: ds.session,
+          terminal,
+        });
+      } catch (error) {
+        logger.error(
+          `[turn-completion] persistence failed turn=${terminal.turnId.slice(0, 12)}: `
+          + `${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
       const enqueued = vcMeetingTerminalReconciler?.enqueue(terminal, context);
       if (terminal.dispatchAttempt !== undefined && enqueued?.accepted) {
         logger.info(
@@ -21328,6 +21352,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     }
 
     scheduler.stopScheduler();
+    await feedbackWebhookDispatcher.stop();
     stopMaintenance();
     vcMeetingTerminalReconciler?.stop();
     clearInterval(vcMeetingDeliveryLeaseTimer);

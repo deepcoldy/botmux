@@ -63,7 +63,8 @@ import { getDeploymentIdentity } from '../services/deployment-identity.js';
 import { getBotUnionId } from '../services/bot-union-ids-store.js';
 import * as grantPrefsStore from '../services/grant-prefs-store.js';
 import { applyExactChatGrantRequest } from '../services/exact-chat-grant.js';
-import { findConfigField, applyConfigField, coerceConfigValue } from '../services/bot-config-store.js';
+import { findConfigField, applyConfigField, coerceConfigValue, setChatFeedbackPolicy } from '../services/bot-config-store.js';
+import { traceFeedbackPolicyForDelivery } from '../services/feedback-policy-resolver.js';
 import { globalBuiltinSkillInjectionDefault, resolveSkillInjectionSupport } from '../skills/injection-mode.js';
 import { summaryRangeFromBotConfig, updateDashboardSummaryRange } from '../services/summary-range-store.js';
 import { config } from '../config.js';
@@ -3538,6 +3539,7 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
     regularGroupReplyMode: cardPrefs.regularGroupReplyMode,
     regularGroupMentionMode: cardPrefs.regularGroupMentionMode,
     substituteMode: substituteModeStore.getBotSubstituteMode(cachedLarkAppId) ?? null,
+    feedback: (() => { try { return getBot(cachedLarkAppId).config.feedback ?? null; } catch { return null; } })(),
     docSubscribeDefaultMode: cardPrefs.docSubscribeDefaultMode,
     restrictGrantCommands: grantPrefs.restrictGrantCommands,
     autoGrantRequestCards: grantPrefs.autoGrantRequestCards,
@@ -4165,6 +4167,44 @@ ipcRoute('PUT', '/api/bot-launch-shell', async (req, res) => {
   const r = await applyConfigField(cachedLarkAppId, spec, value);
   if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
   jsonRes(res, 200, { ok: true, launchShell: value ?? '' });
+});
+
+ipcRoute('PUT', '/api/bot-feedback', async (req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  let body: { feedback?: unknown };
+  try { body = await readJsonBody<{ feedback?: unknown }>(req); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  const spec = findConfigField('feedback');
+  if (!spec) return jsonRes(res, 500, { ok: false, error: 'spec_missing' });
+  const raw = typeof body.feedback === 'string' ? body.feedback : '';
+  let value: unknown = null;
+  if (raw.trim()) {
+    const coerced = coerceConfigValue(spec, raw);
+    if (!coerced.ok) return jsonRes(res, 400, { ok: false, error: coerced.reason });
+    value = coerced.value;
+  }
+  const r = await applyConfigField(cachedLarkAppId, spec, value);
+  if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
+  jsonRes(res, 200, { ok: true, feedback: value });
+});
+
+ipcRoute('PUT', '/api/chat-feedback/:chatId', async (req, res, params) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { ok: false, error: 'larkAppId_not_set' });
+  let body: { feedback?: unknown };
+  try { body = await readJsonBody<{ feedback?: unknown }>(req); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  const feedback = body.feedback === null || body.feedback === undefined ? null : body.feedback;
+  const result = await setChatFeedbackPolicy(cachedLarkAppId, decodeURIComponent(params.chatId), feedback as any);
+  if (!result.ok) return jsonRes(res, result.reason === 'bot_not_registered' ? 404 : 400, { ok: false, error: result.reason });
+  jsonRes(res, 200, { ok: true, feedback });
+});
+
+ipcRoute('GET', '/api/feedback-effective', async (req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { ok: false, error: 'larkAppId_not_set' });
+  const chatId = new URL(req.url ?? '/', 'http://localhost').searchParams.get('chatId') || undefined;
+  jsonRes(res, 200, { ok: true, trace: traceFeedbackPolicyForDelivery({
+    dataDir: config.session.dataDir, larkAppId: cachedLarkAppId, chatId, bot: getBot(cachedLarkAppId).config,
+  }) });
 });
 
 // Per-bot 环境变量 env。Body `{ env: string }`（原始 JSON 文本，如

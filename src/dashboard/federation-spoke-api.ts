@@ -25,7 +25,7 @@ import { getDeploymentIdentity, setDeploymentName } from '../services/deployment
 import { addMembership, listMemberships, removeMembership } from '../services/federation-membership-store.js';
 import type { FederatedBot } from '../services/federation-store.js';
 import { listFederatedDeployments } from '../services/federation-store.js';
-import { ensureDefaultTeam, DEFAULT_TEAM_ID, listTeams, createTeam, deleteTeam, getTeam } from '../services/team-store.js';
+import { ensureDefaultTeam, DEFAULT_TEAM_ID, listTeams, createTeam, deleteTeam, getTeam, setTeamFeedbackPolicy } from '../services/team-store.js';
 import { listTeamGroups, recordTeamGroup } from '../services/team-groups-store.js';
 import { createInvite, deleteInvitesForTeam } from '../services/invite-store.js';
 import { removeTeamFederation, removeDeployment } from '../services/federation-store.js';
@@ -349,7 +349,8 @@ export async function handleFederationSpokeApi(
   const localBotEdit = path.match(/^\/api\/team\/local-bots\/([^/]+)\/(capability|role)$/);
   const memberDel = path.match(/^\/api\/team\/hosted\/([^/]+)\/members\/([^/]+)$/);
   const hostedDel = path.match(/^\/api\/team\/hosted\/([^/]+)$/);
-  if (!LOCAL.has(path) && !REMOTE.has(path) && !localBotEdit && !memberDel && !hostedDel) return false;
+  const hostedFeedback = path.match(/^\/api\/team\/hosted\/([^/]+)\/feedback$/);
+  if (!LOCAL.has(path) && !REMOTE.has(path) && !localBotEdit && !memberDel && !hostedDel && !hostedFeedback) return false;
   const dataDir = deps.dataDir ?? config.session.dataDir;
   const fetcher = deps.fetcher ?? fetch;
   const method = req.method ?? 'GET';
@@ -533,7 +534,7 @@ export async function handleFederationSpokeApi(
     const me = getDeploymentIdentity(dataDir);
     const suggestedHubUrl = `http://${formatUrlHost(config.dashboard.externalHost)}:${config.dashboard.port}`;
     const teams = listTeams(dataDir).map(t => ({
-      teamId: t.id, name: t.name, isDefault: t.id === DEFAULT_TEAM_ID,
+      teamId: t.id, name: t.name, isDefault: t.id === DEFAULT_TEAM_ID, feedback: t.feedback ?? null,
       // dashboard 团队页发起过的协作群 —— 看板团队筛选的白名单之一
       groupChatIds: listTeamGroups(dataDir, t.id).map(b => b.chatId),
       ...buildFederatedRoster(dataDir, t.id, botConfigOrder(), undefined, live),
@@ -549,6 +550,16 @@ export async function handleFederationSpokeApi(
     if (listTeams(dataDir).length >= 100) { jsonRes(res, 400, { ok: false, error: 'too_many_teams' }); return true; } // guardrail (team-internal trust, not a security boundary)
     const t = createTeam(dataDir, name);
     jsonRes(res, 200, { ok: true, teamId: t.id, name: t.name });
+    return true;
+  }
+  if (hostedFeedback && method === 'PUT') {
+    const teamId = decodeURIComponent(hostedFeedback[1]);
+    if (!getTeam(dataDir, teamId)) { jsonRes(res, 404, { ok: false, error: 'team_not_found' }); return true; }
+    let body: any; try { body = await readBody(req); } catch { jsonRes(res, 400, { ok: false, error: 'bad_json' }); return true; }
+    try {
+      const team = setTeamFeedbackPolicy(dataDir, teamId, body?.feedback ?? null);
+      jsonRes(res, 200, { ok: true, feedback: team?.feedback ?? null });
+    } catch { jsonRes(res, 400, { ok: false, error: 'invalid_policy' }); }
     return true;
   }
   // Remove a member deployment from a team I host (hub kicks a joined spoke).

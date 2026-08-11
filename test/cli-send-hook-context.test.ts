@@ -224,9 +224,12 @@ describe('cmdSend hook context wiring', () => {
     }));
     const fixture = join(root, 'host-send.mjs');
     writeFileSync(fixture, `
+      import { readFileSync } from 'node:fs';
       const argv = process.argv.slice(2);
       process.stdout.write(JSON.stringify({
         command: argv[0],
+        content: readFileSync(argv[argv.indexOf('--content-file') + 1], 'utf8'),
+        responseKind: argv[argv.indexOf('--response-kind') + 1],
         sessionId: argv[argv.indexOf('--session-id') + 1],
         turnId: process.env.BOTMUX_TURN_ID,
         dispatchAttempt: process.env.BOTMUX_DISPATCH_ATTEMPT,
@@ -250,7 +253,7 @@ describe('cmdSend hook context wiring', () => {
     });
     try {
       const result = await runCli(
-        ['send', 'relay body', '--session-id', 'session', '--no-mention'],
+        ['send', '--response-kind', 'final', 'relay body', '--session-id', 'session', '--no-mention'],
         {
           ...process.env,
           SESSION_DATA_DIR: dataDir,
@@ -263,6 +266,8 @@ describe('cmdSend hook context wiring', () => {
       expect(result.code, result.stderr).toBe(0);
       expect(JSON.parse(result.stdout)).toEqual({
         command: 'send',
+        content: 'relay body',
+        responseKind: 'final',
         sessionId: 'session',
         turnId: 'turn-live',
         dispatchAttempt: '4',
@@ -503,14 +508,25 @@ describe('cmdSend hook context wiring', () => {
     expect(cmdSend).toContain('...(vcMeetingManagedSendOrigin ? { maxMessages: 1 } : {})');
   });
 
-  it('keeps feedback indexing best-effort after the primary send', () => {
+  it('enforces per-bot response kind and keeps feedback indexing best-effort after the primary send', () => {
     const cmdSendStart = cliSource.indexOf('async function cmdSend(');
     const cmdDispatchStart = cliSource.indexOf('async function cmdDispatch(', cmdSendStart);
     const cmdSend = cliSource.slice(cmdSendStart, cmdDispatchStart);
+    expect(cmdSend).toContain("argValue(rest, '--response-kind')");
+    expect(cmdSend).toContain('resolveFeedbackPolicyForDelivery(');
+    expect(cmdSend).toContain('启用最终回答反馈后，必须显式指定 --response-kind progress|final');
+    expect(cmdSend).toContain('无法确认本次提问者身份，不能发送带反馈控件的最终回答');
+    expect(cmdSend).toContain('requesterSubjectId: feedbackRequesterSubjectId');
+    expect(cmdSend).toContain("responseKind === 'final'");
+    expect(cmdSend).toContain("responseKind === 'final'");
+    expect(cmdSend).not.toContain('--feedback-level');
     const primarySend = cmdSend.indexOf('messageId = await dispatchPrimary');
     const feedbackIndex = cmdSend.indexOf('feedback indexing failed after delivery');
     expect(primarySend).toBeGreaterThanOrEqual(0);
     expect(feedbackIndex).toBeGreaterThan(primarySend);
     expect(cmdSend.slice(cmdSend.lastIndexOf('try {', feedbackIndex), feedbackIndex)).toContain('getSkillFeedbackStore');
+    expect(cmdSend).toContain('policy: feedbackPolicy');
+    expect(cmdSend).toContain('baseCard: feedbackBaseCard');
+    expect(cmdSend).toContain('buildFeedbackElement(feedbackPolicy)');
   });
 });

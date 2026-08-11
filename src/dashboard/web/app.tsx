@@ -87,6 +87,7 @@ const MANAGE_ROUTES = [
   'team',
   'connectors',
   'insights',
+  'feedback',
   'whiteboards',
 ];
 
@@ -130,6 +131,7 @@ const NAV_ITEMS: NavItem[] = [
     ),
   },
   { id: 'insights', href: '#/insights', labelKey: 'nav.insights', manage: true, icon: <><path d="M2 2v12h12M5 11V7M8.5 11V4.5M12 11V8.5" /></> },
+  { id: 'feedback', href: '#/feedback', labelKey: 'nav.feedback', manage: true, icon: <><path d="M2.2 3.2h11.6v8H8l-3.2 2.6v-2.6H2.2z" /><path d="M5 6.2h6M5 8.3h4" /></> },
   {
     id: 'workflows',
     href: '#/workflows',

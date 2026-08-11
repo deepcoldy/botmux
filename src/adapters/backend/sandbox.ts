@@ -836,7 +836,7 @@ export interface RelayRequest {
 // content/attachments come from validated outbox files, and session-id is
 // forced by the worker.
 const RELAY_FLAGS_NOVAL = new Set(['--mention-back', '--no-mention', '--no-quote', '--voice']);
-const RELAY_FLAGS_VAL = new Set(['--mention', '--quote', '--feedback-level']);
+const RELAY_FLAGS_VAL = new Set(['--mention', '--quote', '--response-kind']);
 
 export interface ValidatedRelay {
   contentName: string;
@@ -908,8 +908,8 @@ export function validateRelayRequest(req: RelayRequest): { ok: true; value: Vali
       // ['--mention','--session-id'] and have --session-id swallowed as the
       // value, corrupting the worker-forced session-id (self-DoS).
       if (v.startsWith('--')) return { ok: false, error: `flag ${f} value must not be a flag` };
-      if (f === '--feedback-level' && !['L0', 'L1', 'L2'].includes(v)) {
-        return { ok: false, error: 'flag --feedback-level must be L0, L1, or L2' };
+      if (f === '--response-kind' && !['progress', 'final'].includes(v)) {
+        return { ok: false, error: 'flag --response-kind must be progress or final' };
       }
       flags.push(f, v); i++; continue;
     }

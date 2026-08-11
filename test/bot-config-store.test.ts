@@ -87,6 +87,41 @@ describe('bot-config store', () => {
     expect(keys).toContain('skills');
     expect(keys).toContain('silentTurnReactions');
     expect(keys).toContain('codexAppCleanInput');
+    expect(keys).toContain('feedback');
+  });
+
+  it('strictly normalizes feedback JSON through the shared config field', async () => {
+    const { store } = await loaded();
+    const spec = store.findConfigField('feedback')!;
+    expect(store.coerceConfigValue(spec, '{"enabled":true}')).toMatchObject({
+      ok: true,
+      value: { enabled: true, audience: 'requester' },
+    });
+    expect(store.coerceConfigValue(spec, '{"enabled":true,"audience":"all"}')).toEqual({ ok: false, reason: 'invalid_json' });
+  });
+
+  it('persists bot and per-chat feedback layers and updates the live registry', async () => {
+    const { registry, store } = await loaded();
+    expect(await store.setBotFeedbackPolicy('app_default', { enabled: true, allowReselect: true })).toMatchObject({ ok: true });
+    expect(readConfig().feedback).toMatchObject({ enabled: true, allowReselect: true });
+    expect(registry.getBot('app_default').config.feedback).toMatchObject({ enabled: true, allowReselect: true });
+
+    expect(await store.setChatFeedbackPolicy('app_default', 'oc_chat', { enabled: false })).toMatchObject({ ok: true });
+    expect(readConfig().chatFeedbackPolicies.oc_chat).toEqual({ enabled: false });
+    expect(registry.getBot('app_default').config.chatFeedbackPolicies?.oc_chat).toEqual({ enabled: false });
+
+    expect(await store.setChatFeedbackPolicy('app_default', 'oc_chat', null)).toMatchObject({ ok: true });
+    expect(readConfig().chatFeedbackPolicies).toBeUndefined();
+    expect(registry.getBot('app_default').config.chatFeedbackPolicies).toBeUndefined();
+  });
+
+  it('rejects invalid feedback layers without changing disk or live memory', async () => {
+    const { registry, store } = await loaded({ feedback: { enabled: true } });
+    const beforeDisk = readConfig();
+    const beforeMemory = structuredClone(registry.getBot('app_default').config);
+    expect(await store.setChatFeedbackPolicy('app_default', 'oc_chat', { buttons: {} } as any)).toMatchObject({ ok: false, reason: 'invalid_policy' });
+    expect(readConfig()).toEqual(beforeDisk);
+    expect(registry.getBot('app_default').config).toEqual(beforeMemory);
   });
 
   it('parseBooleanValue accepts on/off variants and rejects junk', async () => {

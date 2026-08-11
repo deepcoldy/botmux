@@ -3,6 +3,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { SkillFeedbackStore } from '../src/services/skill-feedback-store.js';
+import { normalizeFeedbackPolicy } from '../src/services/feedback-policy.js';
 
 const dirs: string[] = [];
 
@@ -21,7 +22,9 @@ describe('SkillFeedbackStore', () => {
       platform: 'lark',
       platformAppId: 'app_a',
       platformMessageId: 'om_answer',
-      level: 'L2',
+      policy: normalizeFeedbackPolicy({ enabled: true }),
+      baseCard: { schema: '2.0', body: { elements: [{ tag: 'markdown', content: 'answer' }, { tag: 'column_set', element_id: 'botmux_feedback' }] } },
+      requesterSubjectId: 'on_requester',
       context: { runtime: 'codex', model: 'gpt', session: 'sid', turn: 'turn' },
     });
     first.close();
@@ -30,7 +33,9 @@ describe('SkillFeedbackStore', () => {
     expect(reopened.findDeliveryByPlatformMessage('lark', 'app_a', 'om_answer')).toMatchObject({
       deliveryId: delivery.deliveryId,
       responseId: response.responseId,
-      level: 'L2',
+      requesterSubjectId: 'on_requester',
+      policy: expect.objectContaining({ enabled: true }),
+      baseCard: expect.objectContaining({ schema: '2.0' }),
     });
     expect(reopened.getResponse(response.responseId)).toMatchObject({
       responseId: response.responseId,
@@ -38,7 +43,7 @@ describe('SkillFeedbackStore', () => {
     });
     expect(JSON.stringify(reopened.getResponse(response.responseId))).not.toContain('secret answer');
     expect(reopened.pragmas()).toMatchObject({ journalMode: 'wal', foreignKeys: 1, busyTimeout: 5000 });
-    expect(reopened.schemaVersion()).toBe(1);
+    expect(reopened.schemaVersion()).toBe(6);
     reopened.close();
   });
 
@@ -67,9 +72,9 @@ describe('SkillFeedbackStore', () => {
     dirs.push(dataDir);
     const { DatabaseSync } = await import('node:sqlite');
     const db = new DatabaseSync(join(dataDir, 'botmux-feedback.sqlite'));
-    db.exec('CREATE TABLE sentinel(value TEXT); INSERT INTO sentinel VALUES (\'keep\'); PRAGMA user_version=2;');
+    db.exec('CREATE TABLE sentinel(value TEXT); INSERT INTO sentinel VALUES (\'keep\'); PRAGMA user_version=7;');
     db.close();
-    await expect(SkillFeedbackStore.open(dataDir)).rejects.toThrow('skill_feedback_schema_newer:2');
+    await expect(SkillFeedbackStore.open(dataDir)).rejects.toThrow('skill_feedback_schema_newer:7');
     const verify = new DatabaseSync(join(dataDir, 'botmux-feedback.sqlite'));
     expect((verify.prepare('SELECT value FROM sentinel').get() as any).value).toBe('keep');
     verify.close();
@@ -80,25 +85,49 @@ describe('SkillFeedbackStore', () => {
     dirs.push(dataDir);
     const store = await SkillFeedbackStore.open(dataDir);
     const response = store.createResponse({ interactionId: 'int_1', content: 'answer' });
-    store.createDelivery({ responseId: response.responseId, platform: 'lark', platformAppId: 'app_a', platformMessageId: 'om_answer', level: 'L1' });
+    store.createDelivery({ responseId: response.responseId, platform: 'lark', platformAppId: 'app_a', platformMessageId: 'om_answer', policy: normalizeFeedbackPolicy({ enabled: true }), baseCard: {}, requesterSubjectId: 'on_user' });
 
     const first = store.recordFeedback({
       platform: 'lark', platformAppId: 'app_a', platformMessageId: 'om_answer', operatorSubjectId: 'on_user',
-      result: 'usable', callbackKey: 'cb_same',
+      result: 'helpful', callbackKey: 'cb_same',
     });
     const duplicate = store.recordFeedback({
       platform: 'lark', platformAppId: 'app_a', platformMessageId: 'om_answer', operatorSubjectId: 'on_user',
-      result: 'usable', callbackKey: 'cb_same',
+      result: 'helpful', callbackKey: 'cb_same',
     });
     const revised = store.recordFeedback({
       platform: 'lark', platformAppId: 'app_a', platformMessageId: 'om_answer', operatorSubjectId: 'on_user',
-      result: 'wrong', reasonKey: 'factual', callbackKey: 'cb_changed',
+      result: 'incorrect', reasonKey: 'factual', comment: 'needs correction', callbackKey: 'cb_changed',
     });
 
     expect(first.status).toBe('accepted');
     expect(duplicate).toMatchObject({ status: 'duplicate', feedbackId: first.feedback.feedbackId });
-    expect(revised).toMatchObject({ status: 'revised', feedback: { revision: 2, supersedesFeedbackId: first.feedback.feedbackId } });
+    expect(revised).toMatchObject({ status: 'revised', feedback: { revision: 2, comment: 'needs correction', supersedesFeedbackId: first.feedback.feedbackId } });
     expect(store.listFeedbackRevisions(first.feedback.deliveryId, 'on_user')).toHaveLength(2);
+    store.close();
+  });
+
+  it('migrates a v1 database and preserves old rows while adding v2 columns', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-feedback-'));
+    dirs.push(dataDir);
+    const { DatabaseSync } = await import('node:sqlite');
+    const db = new DatabaseSync(join(dataDir, 'botmux-feedback.sqlite'));
+    db.exec(`
+      CREATE TABLE interactions(interaction_id TEXT PRIMARY KEY, context_json TEXT, created_at TEXT NOT NULL);
+      CREATE TABLE skill_runs(skill_run_id TEXT PRIMARY KEY, interaction_id TEXT NOT NULL, skill_ref TEXT NOT NULL, context_json TEXT, created_at TEXT NOT NULL);
+      CREATE TABLE responses(response_id TEXT PRIMARY KEY, interaction_id TEXT NOT NULL, skill_run_id TEXT, content_hash TEXT NOT NULL, content_ref TEXT, created_at TEXT NOT NULL);
+      CREATE UNIQUE INDEX responses_identity ON responses(interaction_id, content_hash);
+      CREATE TABLE deliveries(delivery_id TEXT PRIMARY KEY, response_id TEXT NOT NULL, platform TEXT NOT NULL, platform_message_id TEXT NOT NULL, platform_app_id TEXT NOT NULL, level TEXT NOT NULL, context_json TEXT, created_at TEXT NOT NULL, UNIQUE(platform,platform_app_id,platform_message_id));
+      CREATE TABLE feedback_revisions(feedback_id TEXT PRIMARY KEY, delivery_id TEXT NOT NULL, operator_subject_id TEXT NOT NULL, revision INTEGER NOT NULL, result TEXT NOT NULL, reason_key TEXT, callback_key TEXT NOT NULL UNIQUE, supersedes_feedback_id TEXT, created_at TEXT NOT NULL, UNIQUE(delivery_id,operator_subject_id,revision));
+      INSERT INTO interactions VALUES('int','{}','now');
+      INSERT INTO responses VALUES('resp','int',NULL,'sha256:x',NULL,'now');
+      INSERT INTO deliveries VALUES('del','resp','lark','om_old','app','L1','{}','now');
+      PRAGMA user_version=1;
+    `);
+    db.close();
+    const store = await SkillFeedbackStore.open(dataDir);
+    expect(store.schemaVersion()).toBe(6);
+    expect(store.findDeliveryByPlatformMessage('lark', 'app', 'om_old')).toMatchObject({ policy: undefined, baseCard: undefined, requesterSubjectId: undefined });
     store.close();
   });
 

@@ -11,6 +11,7 @@
  *     (so any retransmit can still deliver)
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { normalizeFeedbackPolicy } from '../src/services/feedback-policy.js';
 
 const updateMessageMock = vi.fn(async () => {});
 const addReactionMock = vi.fn(async () => 'reaction_id');
@@ -108,7 +109,7 @@ import type { DaemonSession } from '../src/core/types.js';
 import type { WorkerToDaemon } from '../src/types.js';
 import { EventEmitter } from 'node:events';
 import { homedir, tmpdir } from 'node:os';
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import {
   acceptVcMeetingDelivery,
@@ -228,7 +229,9 @@ function seedSilentReceiverReceipt(): void {
 const SCOPED_DEDUPE_KEY = 'sid-final-out:uuid-1';
 
 describe('Bridge final_output delivery (P2 retry)', () => {
-  beforeEach(() => {
+  beforeEach(async () => {
+    const { __testOnly_closeSkillFeedbackStores } = await import('../src/services/skill-feedback-store.js');
+    await __testOnly_closeSkillFeedbackStores();
     vi.useFakeTimers();
     vi.clearAllMocks();
     vi.mocked(getBot).mockReturnValue({
@@ -244,7 +247,9 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     mkdirSync('/tmp/test-sessions', { recursive: true });
   });
 
-  afterEach(() => {
+  afterEach(async () => {
+    const { __testOnly_closeSkillFeedbackStores } = await import('../src/services/skill-feedback-store.js');
+    await __testOnly_closeSkillFeedbackStores();
     rmSync('/tmp/test-sessions', { recursive: true, force: true });
     clearMessageListenerRunPreviewStore();
     vi.useRealTimers();
@@ -290,12 +295,16 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     await dispatcher(finalOutputMsg());
     // First attempt is delayed 0ms; flush microtasks + timers
     await vi.advanceTimersByTimeAsync(10);
-    expect(sessionReply).toHaveBeenCalledTimes(1);
+    await vi.waitFor(() => expect(sessionReply).toHaveBeenCalledTimes(1));
     expect(sessionReply.mock.calls[0][4]).toBe('turn-1');
     expect(ds.lastBridgeEmittedUuid).toBe(SCOPED_DEDUPE_KEY);
   });
 
   it('records a feedback Delivery only after the canonical final_output send returns its platform message id', async () => {
+    vi.mocked(getBot).mockReturnValue({
+      config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code', feedback: { enabled: true } },
+      resolvedAllowedUsers: [], botOpenId: 'ou_bot', botName: 'TestBot',
+    } as any);
     const sessionReply = vi.fn(async () => 'om_feedback_answer');
     initWorkerPool({
       sessionReply,
@@ -304,6 +313,8 @@ describe('Bridge final_output delivery (P2 retry)', () => {
       closeSession: vi.fn(),
     });
     const ds = makeDs();
+    ds.session.ownerOpenId = 'ou_requester';
+    ds.feedbackPolicy = normalizeFeedbackPolicy({ enabled: true });
     const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
     const { getSkillFeedbackStore } = await import('../src/services/skill-feedback-store.js');
 
@@ -314,18 +325,87 @@ describe('Bridge final_output delivery (P2 retry)', () => {
 
     expect(feedbackStore.findDeliveryByPlatformMessage('lark', ds.larkAppId, 'om_feedback_answer')).toMatchObject({
       platformMessageId: 'om_feedback_answer',
-      level: 'L1',
+      policy: expect.objectContaining({ enabled: true }),
+      baseCard: expect.objectContaining({ schema: '2.0' }),
     });
   });
 
-  it('keeps feedback controls on ordinary local-turn output', async () => {
-    const sessionReply = vi.fn(async () => 'om_local_feedback');
+  it('uses the worker-start feedback policy snapshot after live config is disabled', async () => {
+    const sessionReply = vi.fn(async () => 'om_snapshot_feedback');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    const ds = makeDs();
+    ds.session.ownerOpenId = 'ou_requester';
+    ds.feedbackPolicy = normalizeFeedbackPolicy({ enabled: true });
+    // Simulate an admin disabling feedback while this worker/session remains alive.
+    vi.mocked(getBot).mockReturnValue({
+      config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code' },
+      resolvedAllowedUsers: [], botOpenId: 'ou_bot', botName: 'TestBot',
+    } as any);
+    const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+
+    __testOnly_deliverFinalOutput(ds, finalOutputMsg(), 'tag', 0);
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect(String((sessionReply as any).mock.calls[0][1])).toContain('botmux_feedback');
+  });
+
+  it('keeps feedback disabled for a worker whose startup snapshot was disabled', async () => {
+    vi.mocked(getBot).mockReturnValue({
+      config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code', feedback: { enabled: true } },
+      resolvedAllowedUsers: [], botOpenId: 'ou_bot', botName: 'TestBot',
+    } as any);
+    const sessionReply = vi.fn(async () => 'om_disabled_snapshot');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    const ds = makeDs();
+    ds.session.ownerOpenId = 'ou_requester';
+    ds.feedbackPolicy = undefined;
+    const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+
+    __testOnly_deliverFinalOutput(ds, finalOutputMsg(), 'tag', 0);
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect(String((sessionReply as any).mock.calls[0][1])).not.toContain('botmux_feedback');
+  });
+
+  it('does not render feedback when no requester identity can be proven', async () => {
+    vi.mocked(getBot).mockReturnValue({
+      config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code', feedback: { enabled: true } },
+      resolvedAllowedUsers: [], botOpenId: 'ou_bot', botName: 'TestBot',
+    } as any);
+    const sessionReply = vi.fn(async () => 'om_no_requester_feedback');
     initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
     const ds = makeDs();
     const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+    __testOnly_deliverFinalOutput(ds, finalOutputMsg(), 'tag', 0);
+    await vi.advanceTimersByTimeAsync(10);
+    expect(String(sessionReply.mock.calls[0][1])).not.toContain('botmux_feedback');
+  });
+
+  it('keeps feedback disabled by default and does not open the store', async () => {
+    const sessionReply = vi.fn(async () => 'om_plain_answer');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    const ds = makeDs();
+    const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+    __testOnly_deliverFinalOutput(ds, finalOutputMsg(), 'tag', 0);
+    await vi.advanceTimersByTimeAsync(10);
+    expect(String(sessionReply.mock.calls[0][1])).not.toContain('botmux_feedback');
+    expect(existsSync(join('/tmp/test-sessions', 'botmux-feedback.sqlite'))).toBe(false);
+  });
+
+  it('keeps feedback controls on ordinary local-turn output', async () => {
+    vi.mocked(getBot).mockReturnValue({
+      config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code', feedback: { enabled: true } },
+      resolvedAllowedUsers: [], botOpenId: 'ou_bot', botName: 'TestBot',
+    } as any);
+    const sessionReply = vi.fn(async () => 'om_local_feedback');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    const ds = makeDs();
+    ds.session.ownerOpenId = 'ou_requester';
+    ds.feedbackPolicy = normalizeFeedbackPolicy({ enabled: true });
+    const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
     __testOnly_deliverFinalOutput(ds, { ...finalOutputMsg(), kind: 'local-turn', userText: 'question' }, 'tag', 0);
     await vi.advanceTimersByTimeAsync(10);
-    expect(String(sessionReply.mock.calls[0][1])).toContain('botmux_skill_feedback');
+    expect(String(sessionReply.mock.calls[0][1])).toContain('botmux_feedback');
   });
 
   it('routes synthetic Codex App identities through their frozen reply turn and uses dispatch-stable Lark UUIDs', async () => {

@@ -186,18 +186,18 @@ describe('validateRelayRequest', () => {
     expect(r.value.flags).toEqual(['--mention-back', '--mention', 'ou:X', '--voice']);
   });
 
-  it('allows only validated feedback levels through the sandbox relay', () => {
+  it('allows only validated response kinds through the sandbox relay', () => {
     expect(validateRelayRequest({
       contentFile: 'c.content',
-      flags: ['--feedback-level', 'L2', '--no-mention'],
+      flags: ['--response-kind', 'final', '--no-mention'],
     })).toMatchObject({
       ok: true,
-      value: { flags: ['--feedback-level', 'L2', '--no-mention'] },
+      value: { flags: ['--response-kind', 'final', '--no-mention'] },
     });
     expect(validateRelayRequest({
       contentFile: 'c.content',
-      flags: ['--feedback-level', 'L9'],
-    })).toMatchObject({ ok: false, error: 'flag --feedback-level must be L0, L1, or L2' });
+      flags: ['--response-kind', 'draft'],
+    })).toMatchObject({ ok: false, error: 'flag --response-kind must be progress or final' });
   });
 
   it('accepts a custom card file as a plain outbox basename', () => {
