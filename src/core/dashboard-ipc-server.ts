@@ -201,6 +201,7 @@ import { sessionAnchorId, larkTransportEnabled, type DaemonSession } from './typ
 import { isRiffBackendSession } from './persistent-backend.js';
 import { attachSkillPolicy, detachSkillPolicy } from './skills/im-command.js';
 import { readSkillRegistry } from '../services/skill-registry-store.js';
+import { isSessionGroup } from '../services/session-groups-store.js';
 import {
   commitDeviceIsolationActivation,
   DEVICE_ISOLATION_COMMIT_PATH,
@@ -2736,7 +2737,17 @@ ipcRoute('GET', '/api/groups', async (_req, res) => {
       const observedBotNames = observedBotsStore
         .listObservedBots(config.session.dataDir, cachedLarkAppId, c.chatId)
         .map(b => b.name);
-      return { ...c, oncallChat: oncall ?? null, firstSeenAt: seenMap.get(c.chatId) ?? null, hasRole, hasMessageListener, observedBotNames };
+      return {
+        ...c,
+        oncallChat: oncall ?? null,
+        firstSeenAt: seenMap.get(c.chatId) ?? null,
+        hasRole,
+        hasMessageListener,
+        observedBotNames,
+        // 会话群分型（p2pMode=group 自动创建）：dashboard 群面板据此把它们
+        // 收进独立折叠区，避免淹没需要人工管理的常驻群。
+        ...(isSessionGroup(c.chatId) ? { sessionGroup: true } : {}),
+      };
     });
     jsonRes(res, 200, { chats: enriched });
   } catch (e) {
