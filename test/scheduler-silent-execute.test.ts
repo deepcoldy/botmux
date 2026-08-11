@@ -51,10 +51,12 @@ vi.mock('../src/services/message-queue.js', () => ({ ensureQueue: vi.fn() }));
 const sendMessageMock = vi.fn(async () => 'om_banner_123');
 const replyMessageMock = vi.fn(async () => 'om_reply_456');
 const getChatModeMock = vi.fn(async () => 'group');
+const getMessageThreadIdMock = vi.fn(async () => 'omt_target_thread');
 vi.mock('../src/im/lark/client.js', () => ({
   sendMessage: (...a: any[]) => sendMessageMock(...a),
   replyMessage: (...a: any[]) => replyMessageMock(...a),
   getChatMode: (...a: any[]) => getChatModeMock(...a),
+  getMessageThreadId: (...a: any[]) => getMessageThreadIdMock(...a),
   downloadMessageResource: vi.fn(),
   listChatBotMembers: vi.fn(async () => []),
   UserTokenMissingError: class extends Error {},
@@ -183,6 +185,8 @@ beforeEach(() => {
   replyMessageMock.mockClear();
   getChatModeMock.mockClear();
   getChatModeMock.mockResolvedValue('group');
+  getMessageThreadIdMock.mockClear();
+  getMessageThreadIdMock.mockResolvedValue('omt_target_thread');
   delete (BOT.config as typeof BOT.config & { regularGroupReplyMode?: string }).regularGroupReplyMode;
 });
 
@@ -333,13 +337,15 @@ describe('executeScheduledTask — chat-scope regular-group mode', () => {
       creatorRootMessageId: 'om_creator_root',
     }), active, refreshCliVersion);
 
-    expect(replyMessageMock).toHaveBeenCalledWith(
-      APP,
-      'om_creator_root',
-      expect.any(String),
-      'text',
-      true,
-    );
+    await vi.waitFor(() => {
+      expect(replyMessageMock).toHaveBeenCalledWith(
+        APP,
+        'om_creator_root',
+        expect.any(String),
+        'text',
+        true,
+      );
+    });
     expect(sendMessageMock).toHaveBeenCalledWith(APP, CHAT, expect.any(String));
     expect(active.get(sessionKey(CHAT, APP))).toBeUndefined();
     expect(active.get(sessionKey('om_banner_123', APP))?.scope).toBe('thread');
@@ -393,6 +399,77 @@ describe('executeScheduledTask — chat-scope regular-group mode', () => {
     const ds = active.get(sessionKey(CHAT, APP))!;
     expect(ds.scope).toBe('chat');
     expect(ds.silentScheduledTurns?.has(forkedTurnId())).toBe(true);
+  });
+});
+
+describe('executeScheduledTask — cross-target notice', () => {
+  it('links a cross-thread creator notice to the exact target topic', async () => {
+    const active = new Map<string, DaemonSession>();
+
+    await executeScheduledTask(baseTask({
+      rootMessageId: ROOT,
+      scope: 'thread',
+      creatorChatId: CHAT,
+      creatorRootMessageId: 'om_creator_root',
+    }), active, refreshCliVersion);
+
+    await vi.waitFor(() => {
+      expect(getMessageThreadIdMock).toHaveBeenCalledWith(APP, ROOT);
+      expect(replyMessageMock).toHaveBeenCalledWith(
+        APP,
+        'om_creator_root',
+        expect.stringContaining(
+          'https://applink.feishu.cn/client/thread/open?open_chat_id=oc_chat&open_thread_id=omt_target_thread',
+        ),
+        'text',
+        true,
+      );
+    });
+    expect(active.get(sessionKey(ROOT, APP))).toBeTruthy();
+  });
+
+  it('links a cross-chat creator notice to the target chat', async () => {
+    (BOT.config as typeof BOT.config & { regularGroupReplyMode?: string }).regularGroupReplyMode = 'new-topic';
+    const active = new Map<string, DaemonSession>();
+
+    await executeScheduledTask(baseTask({
+      scope: 'chat',
+      chatType: 'group',
+      creatorChatId: 'oc_creator_chat',
+      creatorRootMessageId: 'om_creator_root',
+    }), active, refreshCliVersion);
+
+    await vi.waitFor(() => {
+      expect(replyMessageMock).toHaveBeenCalledWith(
+        APP,
+        'om_creator_root',
+        expect.stringContaining('https://applink.feishu.cn/client/chat/open?openChatId=oc_chat'),
+        'text',
+        true,
+      );
+    });
+  });
+
+  it('falls back to the target chat link when topic resolution fails', async () => {
+    getMessageThreadIdMock.mockRejectedValueOnce(new Error('lookup failed'));
+    const active = new Map<string, DaemonSession>();
+
+    await executeScheduledTask(baseTask({
+      rootMessageId: ROOT,
+      scope: 'thread',
+      creatorChatId: CHAT,
+      creatorRootMessageId: 'om_creator_root',
+    }), active, refreshCliVersion);
+
+    await vi.waitFor(() => {
+      expect(replyMessageMock).toHaveBeenCalledWith(
+        APP,
+        'om_creator_root',
+        expect.stringContaining('https://applink.feishu.cn/client/chat/open?openChatId=oc_chat'),
+        'text',
+        true,
+      );
+    });
   });
 });
 

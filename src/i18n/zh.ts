@@ -1234,8 +1234,8 @@ export const messages: Record<string, string> = {
 
   // Scheduler announcements
   'scheduler.task_started': '🕐 定时任务「{name}」开始执行',
-  'scheduler.task_triggered_target_chat': '🕐 定时任务「{name}」已在目标群聊触发',
-  'scheduler.task_triggered_target_thread': '🕐 定时任务「{name}」已在目标话题触发',
+  'scheduler.task_triggered_target_chat': '🕐 定时任务「{name}」已在目标群聊触发\n打开目标群聊：{link}',
+  'scheduler.task_triggered_target_thread': '🕐 定时任务「{name}」已在目标话题触发\n打开目标话题：{link}',
 
   // External event trigger seed
   'trigger.external_event': '外部事件触发：{source}',

@@ -1233,8 +1233,8 @@ export const messages: Record<string, string> = {
 
   // Scheduler announcements
   'scheduler.task_started': '🕐 Scheduled task “{name}” started',
-  'scheduler.task_triggered_target_chat': '🕐 Scheduled task “{name}” triggered in the target chat',
-  'scheduler.task_triggered_target_thread': '🕐 Scheduled task “{name}” triggered in the target topic',
+  'scheduler.task_triggered_target_chat': '🕐 Scheduled task “{name}” triggered in the target chat\nOpen target chat: {link}',
+  'scheduler.task_triggered_target_thread': '🕐 Scheduled task “{name}” triggered in the target topic\nOpen target topic: {link}',
 
   // External event trigger seed
   'trigger.external_event': 'External event: {source}',
