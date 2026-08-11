@@ -5952,9 +5952,9 @@ function maybeFollowTraexSessionRotationViaPid(): void {
     ?? backend.getChildPid?.()
     ?? codexAdoptPendingPid;
   if (!pid) return;
-  const observed = findTraexRolloutByPid(pid);
-  if (!observed) return;
   const currentSid = codexSessionIdFromRolloutPath(codexBridgeRolloutPath);
+  const observed = findTraexRolloutByPid(pid, currentSid);
+  if (!observed) return;
   if (currentSid?.toLowerCase() === observed.cliSessionId.toLowerCase()) return;
   persistCliSessionId(observed.cliSessionId);
   codexBridgeNotifyCliSessionId(observed.cliSessionId);

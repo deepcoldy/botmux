@@ -3,7 +3,9 @@
  *
  * TRAE is a Codex-family CLI, but its terminal event is NOT byte-identical to
  * upstream Codex:
- *   - user input is a response_item role=user message, like Codex;
+ *   - genuine user input is confirmed by event_msg `user_message`; TRAE also
+ *     writes internal runtime injections as response_item role=user messages,
+ *     so those records alone are not user-attribution evidence;
  *   - assistant response_item messages have no `phase` and are emitted many
  *     times during tool use, so none of them is a safe turn boundary;
  *   - event_msg `task_complete` is the durable end-of-turn marker and carries
@@ -34,6 +36,7 @@ import {
   type CodexDrainResult,
   codexSessionIdFromRolloutPath,
 } from './codex-transcript.js';
+import { isInternalCodexSessionMeta } from './codex-session-meta.js';
 import { baselineJsonlCursor } from './jsonl-cursor.js';
 import { traeSessionsRoot } from './traex-paths.js';
 
@@ -54,24 +57,27 @@ export interface TraexRuntimeSnapshot {
 }
 
 const IS_LINUX = platform() === 'linux';
+const TRAEX_SESSION_META_SCAN_MAX_BYTES = 4 * 1024 * 1024;
+
+type TraexRolloutKind = 'user' | 'internal' | 'legacy' | 'empty' | 'pending';
+
+interface TraexRolloutRef {
+  path: string;
+  cliSessionId: string;
+  kind: TraexRolloutKind;
+  startedAtMs?: number;
+}
+
+const traexRolloutMetaCache = new Map<string, {
+  kind: TraexRolloutKind;
+  startedAtMs?: number;
+}>();
 
 /** Upper bound on how far back readLatestTraexRuntime scans for the newest
  * model/effort. The newest turn_context sits near the tail, so this is only a
  * pathological-file guard (cf. #740): never synchronously parse a multi-GB
  * rollout on attach just to surface advisory runtime identity. */
 const TRAEX_RUNTIME_SCAN_MAX_BYTES = 4 * 1024 * 1024;
-
-function joinInputText(content: unknown): string {
-  if (!Array.isArray(content)) return '';
-  const parts: string[] = [];
-  for (const block of content) {
-    if (block && typeof block === 'object' && (block as any).type === 'input_text') {
-      const text = (block as any).text;
-      if (typeof text === 'string') parts.push(text);
-    }
-  }
-  return parts.join('');
-}
 
 function eventTimestampMs(value: unknown): number {
   const parsed = typeof value === 'string' ? Date.parse(value) : NaN;
@@ -153,10 +159,10 @@ export function drainTraexRollout(path: string, fromOffset: number): TraexDrainR
       timestampMs: eventTimestampMs(obj.timestamp),
       ...(sourceSessionId ? { sourceSessionId } : {}),
     };
-    if (obj.type === 'response_item'
-      && payload.type === 'message'
-      && payload.role === 'user') {
-      const userText = joinInputText(payload.content);
+    if (obj.type === 'event_msg'
+      && payload.type === 'user_message'
+      && typeof payload.message === 'string') {
+      const userText = payload.message;
       if (userText) events.push({ ...base, kind: 'user', text: userText });
       continue;
     }
@@ -280,7 +286,7 @@ function normaliseInputText(text: string): string {
 }
 
 /** Authoritative submit confirmation used by the adapter. Only a complete
- * role=user rollout record appended after `fromOffset` can match. */
+ * event_msg/user_message record appended after `fromOffset` can match. */
 export function traexRolloutHasUserInputSince(
   path: string,
   fromOffset: number,
@@ -382,6 +388,123 @@ function matchTraexRolloutPath(target: string): { path: string; cliSessionId: st
   return { path: target, cliSessionId: sid };
 }
 
+function traexRolloutMeta(path: string): {
+  kind: TraexRolloutKind;
+  startedAtMs?: number;
+} {
+  const cached = traexRolloutMetaCache.get(path);
+  if (cached) return cached;
+
+  let size: number;
+  try { size = statSync(path).size; } catch { return { kind: 'empty' }; }
+  if (size <= 0) return { kind: 'empty' };
+
+  const length = Math.min(size, TRAEX_SESSION_META_SCAN_MAX_BYTES);
+  const buffer = Buffer.alloc(length);
+  let bytesRead = 0;
+  let fd: number | undefined;
+  try {
+    fd = openSync(path, 'r');
+    bytesRead = readSync(fd, buffer, 0, length, 0);
+  } catch {
+    return { kind: 'pending' };
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+  }
+
+  const content = buffer.subarray(0, bytesRead);
+  const newline = content.indexOf(0x0a);
+  if (newline < 0) return { kind: 'pending' };
+
+  let entry: any;
+  try { entry = JSON.parse(content.subarray(0, newline).toString('utf8')); } catch {
+    return { kind: 'pending' };
+  }
+  if (entry?.type !== 'session_meta' || !entry.payload || typeof entry.payload !== 'object') {
+    const result = { kind: 'legacy' as const };
+    traexRolloutMetaCache.set(path, result);
+    return result;
+  }
+
+  const payload = entry.payload;
+  const threadSource = payload.thread_source;
+  let kind: TraexRolloutKind = 'legacy';
+  if (isInternalCodexSessionMeta(payload)) {
+    kind = 'internal';
+  } else if (threadSource === 'user') {
+    kind = 'user';
+  }
+  const rawTimestamp = typeof payload.timestamp === 'string'
+    ? payload.timestamp
+    : typeof entry.timestamp === 'string'
+      ? entry.timestamp
+      : undefined;
+  const parsedTimestamp = rawTimestamp ? Date.parse(rawTimestamp) : NaN;
+  const result = {
+    kind,
+    ...(Number.isFinite(parsedTimestamp) ? { startedAtMs: parsedTimestamp } : {}),
+  };
+  if (traexRolloutMetaCache.size >= 512) {
+    const oldest = traexRolloutMetaCache.keys().next().value;
+    if (oldest) traexRolloutMetaCache.delete(oldest);
+  }
+  traexRolloutMetaCache.set(path, result);
+  return result;
+}
+
+function traexRolloutRefs(targets: Iterable<string>): TraexRolloutRef[] {
+  const refs = new Map<string, TraexRolloutRef>();
+  for (const target of targets) {
+    const hit = matchTraexRolloutPath(target);
+    if (!hit || refs.has(hit.path)) continue;
+    refs.set(hit.path, { ...hit, ...traexRolloutMeta(hit.path) });
+  }
+  return [...refs.values()];
+}
+
+function newestTraexRollout(refs: TraexRolloutRef[]): TraexRolloutRef | undefined {
+  const timestamped = refs.filter(
+    (ref): ref is TraexRolloutRef & { startedAtMs: number } => ref.startedAtMs !== undefined,
+  );
+  if (timestamped.length === 0) return undefined;
+  const maxStartedAt = Math.max(...timestamped.map(ref => ref.startedAtMs));
+  const newest = timestamped.filter(ref => ref.startedAtMs === maxStartedAt);
+  return newest.length === 1 ? newest[0] : undefined;
+}
+
+function selectableTraexRollouts(refs: TraexRolloutRef[]): TraexRolloutRef[] {
+  const userRefs = refs.filter(ref => ref.kind === 'user');
+  if (userRefs.length > 0) return userRefs;
+  const legacyRefs = refs.filter(ref => ref.kind === 'legacy');
+  if (legacyRefs.length > 0) return legacyRefs;
+  if (refs.some(ref => ref.kind === 'internal' || ref.kind === 'pending')) return [];
+  const emptyRefs = refs.filter(ref => ref.kind === 'empty');
+  return emptyRefs.length === 1 ? emptyRefs : [];
+}
+
+function selectTraexRollout(
+  refs: TraexRolloutRef[],
+  preferredSessionId?: string,
+): TraexRolloutRef | undefined {
+  const candidates = selectableTraexRollouts(refs);
+  if (candidates.length === 0) return undefined;
+
+  const preferred = preferredSessionId
+    ? candidates.find(ref => ref.cliSessionId.toLowerCase() === preferredSessionId.toLowerCase())
+    : undefined;
+  const newest = newestTraexRollout(candidates);
+  if (preferred) {
+    if (newest?.startedAtMs !== undefined
+      && preferred.startedAtMs !== undefined
+      && newest.startedAtMs > preferred.startedAtMs) {
+      return newest;
+    }
+    return preferred;
+  }
+  if (candidates.length === 1) return candidates[0];
+  return newest;
+}
+
 /** Enumerate the file paths a pid holds open (Linux /proc, else lsof). Shared
  *  by findTraexRolloutByPid (single) and findTraexRolloutSetByPid (ownership
  *  set) so both derive from one source. Returns undefined when enumeration is
@@ -412,17 +535,19 @@ function traexProcessOpenTargets(pid: number): string[] | undefined {
   return targets;
 }
 
-/** Find the rollout file an externally-running TRAE process has open.
- *  Same /proc/<pid>/fd strategy as findCodexRolloutByPid, but with a
- *  TRAE-specific path matcher so we never bind to a sibling Codex pane. */
-export function findTraexRolloutByPid(pid: number): { path: string; cliSessionId: string } | undefined {
+/** Find the visible top-level rollout an externally-running TRAE process owns.
+ *  TRAE can keep the parent rollout and internal guardian/subagent rollouts open
+ *  in the same process. Internal rollouts are never adoptable. When a current
+ *  top-level session is supplied it remains preferred unless a newer top-level
+ *  user rollout proves a real in-process `/new` rotation. */
+export function findTraexRolloutByPid(
+  pid: number,
+  preferredSessionId?: string,
+): { path: string; cliSessionId: string } | undefined {
   const targets = traexProcessOpenTargets(pid);
   if (!targets) return undefined;
-  for (const target of targets) {
-    const hit = matchTraexRolloutPath(target);
-    if (hit) return hit;
-  }
-  return undefined;
+  const selected = selectTraexRollout(traexRolloutRefs(targets), preferredSessionId);
+  return selected ? { path: selected.path, cliSessionId: selected.cliSessionId } : undefined;
 }
 
 /** Lowercased set of TRAE session ids whose rollout the pid holds open. The
@@ -436,9 +561,8 @@ export function findTraexRolloutSetByPid(pid: number): Set<string> | undefined {
   const targets = traexProcessOpenTargets(pid);
   if (!targets) return undefined;
   const set = new Set<string>();
-  for (const target of targets) {
-    const hit = matchTraexRolloutPath(target);
-    if (hit) set.add(hit.cliSessionId.toLowerCase());
+  for (const ref of selectableTraexRollouts(traexRolloutRefs(targets))) {
+    set.add(ref.cliSessionId.toLowerCase());
   }
   return set;
 }
