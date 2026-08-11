@@ -1368,8 +1368,12 @@ export async function handleCommand(
             );
             await sessionReply(
               rootId,
-              '⚠️ 会话关闭失败：远端会话未能确认取消，已保留 active 记录以便重试'
-              + `（${closed.result.error}）。远端会话可能仍在运行，请稍后重试 /close。`,
+              closed.result.taskId
+                ? t('cmd.close.refused_with_task', {
+                    error: closed.result.error,
+                    taskId: closed.result.taskId,
+                  }, loc)
+                : t('cmd.close.refused', { error: closed.result.error }, loc),
             );
             break;
           }

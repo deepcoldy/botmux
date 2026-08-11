@@ -247,6 +247,8 @@ export const messages: Record<string, string> = {
 
   // ─── Command responses ───────────────────────────────────────────────────
   'cmd.no_active_session': '当前话题没有活跃的会话。',
+  'cmd.close.refused': '⚠️ 会话关闭失败：远端会话未能确认取消，已保留 active 记录以便重试（{error}）。远端会话可能仍在运行，请稍后重试 /close。',
+  'cmd.close.refused_with_task': '⚠️ 会话关闭失败：远端会话未能确认取消，已保留 active 记录以便重试（{error}）。远端会话 id：`{taskId}`。远端会话可能仍在运行，请稍后重试 /close。',
   'cmd.insight.operator_only': '⚠️ 仅授权用户（allowedUsers）可以使用 /insight。',
   'cmd.insight.unsupported': 'ℹ️ 该 CLI 暂不支持 insight 分析（目前仅 Claude Code / Codex）。',
   'cmd.insight.no_transcript': 'ℹ️ 还没找到本会话的 transcript，跑几轮后再试。',
@@ -829,6 +831,8 @@ export const messages: Record<string, string> = {
   'card.action.write_link_sent': '🔑 操作链接已私密发送，请查收',
   'card.action.write_link_no_permission': '🔒 没有操作权限，无法获取操作链接',
   'card.action.session_gone': '⚠️ 会话已不在线，操作未完成',
+  'card.action.close_refused': '会话关闭失败：远端会话未能确认取消（{error}），已保留会话以便重试。远端可能仍在运行，请稍后重试。',
+  'card.action.close_refused_with_task': '会话关闭失败：远端会话未能确认取消（{error}），已保留会话以便重试。远端会话 id：{taskId}。远端可能仍在运行，请稍后重试。',
   'card.action.no_output': '(当前无输出内容)',
   'card.action.tui_select_title': 'Select options',
   'card.action.tui_custom_input': 'Custom input',
@@ -841,7 +845,7 @@ export const messages: Record<string, string> = {
 
   // ─── Worker → daemon notices ─────────────────────────────────────────────
   'worker.adopted_session_exited': '⏏ /adopt的 CLI 会话已断开',
-  'worker.riff_close_in_progress': '⏳ Riff 远程会话正在关闭，请等待关闭结果后再发送消息。',
+  'worker.remote_close_in_progress': '⏳ {backend} 远程会话正在关闭，请等待关闭结果后再发送消息。',
   'worker.crash_loop_stopped': '⚠️ {cliName} 在 1 分钟内崩溃 {count} 次，已停止自动重启。发消息可触发重新启动。',
   'worker.crash_diagnostic_terminal': 'Web 终端（若可用）保留了最后一次启动输出，可打开查看；修复问题后发新消息会重新启动。',
   'worker.crash_recent_output': '最近终端输出：',

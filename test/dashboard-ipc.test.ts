@@ -2887,6 +2887,60 @@ describe('PUT /api/bot-agent', () => {
     }
   });
 
+  it('does NOT commit an Agent switch when the durable session store is malformed', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-agent-store-unhealthy-'));
+    const configPath = join(dir, 'bots.json');
+    const appId = 'test-agent-store-unhealthy';
+    const prevBotsConfig = process.env.BOTS_CONFIG;
+    const prevDataDir = config.session.dataDir;
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      config.session.dataDir = dir;
+      writeFileSync(configPath, JSON.stringify([{
+        larkAppId: appId,
+        larkAppSecret: 'secret',
+        cliId: 'traex',
+        model: 'old-model',
+      }], null, 2));
+      // The per-bot store exists but cannot be parsed. The route's compatibility
+      // preflight sees an empty projection; the transaction helper must still
+      // refuse at its strict durable gate before bots.json is written.
+      writeFileSync(join(dir, `sessions-${appId}.json`), '{not-json');
+      loadBotConfigs().forEach((c: any) => registerBot(c));
+      sessionStore.init(appId);
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+
+      const res = await fetch(`http://127.0.0.1:${handle.port}/api/bot-agent`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ cliId: 'codex', model: 'kimi-k2.5' }),
+      });
+
+      expect(res.status).toBe(409);
+      expect(await res.json()).toMatchObject({
+        ok: false,
+        error: 'agent_switch_close_failed',
+        closedMismatchedSessions: 0,
+        closedMismatchedFailed: 1,
+      });
+      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0]).toMatchObject({
+        cliId: 'traex',
+        model: 'old-model',
+      });
+      expect(getBot(appId).config).toMatchObject({
+        cliId: 'traex',
+        model: 'old-model',
+      });
+    } finally {
+      sessionStore.init();
+      config.session.dataDir = prevDataDir;
+      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = prevBotsConfig;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('reports the closed sessions when the commit RETURNS not-ok (entry missing)', async () => {
     // The !ok return branch, distinct from the throw path below: a live bot exists
     // but the latest bots.json no longer contains its entry.

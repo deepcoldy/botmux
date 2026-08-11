@@ -246,6 +246,8 @@ export const messages: Record<string, string> = {
 
   // ─── Command responses ───────────────────────────────────────────────────
   'cmd.no_active_session': 'No active session in this topic.',
+  'cmd.close.refused': '⚠️ Could not close the session because remote cancellation was not proven ({error}). The active record was kept for retry; the remote session may still be running. Retry /close later.',
+  'cmd.close.refused_with_task': '⚠️ Could not close the session because remote cancellation was not proven ({error}). The active record was kept for retry. Remote session id: `{taskId}`. The remote session may still be running; retry /close later.',
   'cmd.insight.operator_only': '⚠️ Only authorized users (allowedUsers) can use /insight.',
   'cmd.insight.unsupported': 'ℹ️ Insight analysis is not available for this CLI (currently Claude Code / Codex only).',
   'cmd.insight.no_transcript': 'ℹ️ No transcript found for this session yet — try again after a few turns.',
@@ -828,6 +830,8 @@ export const messages: Record<string, string> = {
   'card.action.write_link_sent': '🔑 The action link has been sent to you privately — please check your messages.',
   'card.action.write_link_no_permission': '🔒 You do not have operate permission, so you cannot get the action link.',
   'card.action.session_gone': '⚠️ This session is no longer active; the action was not completed.',
+  'card.action.close_refused': 'Could not close the session because remote cancellation was not proven ({error}). The session was kept for retry and the remote may still be running. Retry later.',
+  'card.action.close_refused_with_task': 'Could not close the session because remote cancellation was not proven ({error}). The session was kept for retry. Remote session id: {taskId}. The remote may still be running; retry later.',
   'card.action.no_output': '(no output yet)',
   'card.action.tui_select_title': 'Select options',
   'card.action.tui_custom_input': 'Custom input',
@@ -840,7 +844,7 @@ export const messages: Record<string, string> = {
 
   // ─── Worker → daemon notices ─────────────────────────────────────────────
   'worker.adopted_session_exited': '⏏ Adopted CLI session has exited.',
-  'worker.riff_close_in_progress': '⏳ The remote Riff session is closing. Wait for the close result before sending another message.',
+  'worker.remote_close_in_progress': '⏳ The remote {backend} session is closing. Wait for the close result before sending another message.',
   'worker.crash_loop_stopped': '⚠️ {cliName} crashed {count} times in 1 minute. Auto-restart disabled. Send a message to retry.',
   'worker.crash_diagnostic_terminal': 'The web terminal, where available, preserves the last startup output. Fix the issue, then send a new message to retry.',
   'worker.crash_recent_output': 'Recent terminal output:',

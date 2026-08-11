@@ -2392,11 +2392,16 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         };
       }
       if (closed.status === 'close_refused') {
+        const locClose = localeForBot(larkAppId);
         return {
           toast: {
             type: 'warning',
-            content: `会话关闭失败：远端会话未能确认取消（${closed.result.error}），`
-              + '已保留会话以便重试。远端可能仍在运行，请稍后重试。',
+            content: closed.result.taskId
+              ? t('card.action.close_refused_with_task', {
+                  error: closed.result.error,
+                  taskId: closed.result.taskId,
+                }, locClose)
+              : t('card.action.close_refused', { error: closed.result.error }, locClose),
           },
         };
       }

@@ -11,6 +11,20 @@ import type { Session } from '../types.js';
 let sessions: Map<string, Session> = new Map();
 let loaded = false;
 let currentAppId: string | undefined;
+let loadFailure: Error | undefined;
+
+/**
+ * The compatibility reader deliberately exposes an empty projection after a
+ * read/parse failure. Destructive callers must use the strict API below so an
+ * unreadable store cannot be mistaken for "there are no durable sessions".
+ */
+export class SessionStoreUnavailableError extends Error {
+  override readonly name = 'SessionStoreUnavailableError';
+
+  constructor(readonly loadError: Error) {
+    super(`session store is unavailable: ${loadError.message}`);
+  }
+}
 
 // Legacy fields from the removed「处理中」placeholder-card PATCH delivery. They
 // no longer exist on Session and nothing reads them, but sessions persisted
@@ -88,6 +102,7 @@ export function init(appId?: string): void {
   currentAppId = appId;
   loaded = false;
   sessions = new Map();
+  loadFailure = undefined;
 }
 
 function getFilePath(): string {
@@ -132,6 +147,14 @@ function repairMissingChatScopes(): number {
   return repaired;
 }
 
+function parseSessionsProjectionStrict(raw: string, fp: string): Record<string, Session> {
+  const value = JSON.parse(raw) as unknown;
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error(`invalid sessions projection at ${fp}`);
+  }
+  return value as Record<string, Session>;
+}
+
 // Sessions persisted before 2026-04-29 lack `cliId`; consumers must fall back to 'unknown' at the render boundary.
 function load(): void {
   if (loaded) return;
@@ -140,7 +163,7 @@ function load(): void {
   withFileLockSync(fp, () => {
     if (existsSync(fp)) {
       try {
-        const data = JSON.parse(readFileSync(fp, 'utf-8'));
+        const data = parseSessionsProjectionStrict(readFileSync(fp, 'utf-8'), fp);
         sessions = new Map(Object.entries(data));
         const repaired = repairMissingChatScopes();
         if (repaired > 0) {
@@ -158,6 +181,7 @@ function load(): void {
         logger.info(`Loaded ${sessions.size} sessions from ${fp}`);
       } catch (err) {
         logger.error(`Failed to load sessions: ${err}`);
+        loadFailure = err instanceof Error ? err : new Error(String(err));
         sessions = new Map();
       }
     } else if (currentAppId) {
@@ -166,7 +190,7 @@ function load(): void {
       const legacyFp = join(config.session.dataDir, 'sessions.json');
       if (existsSync(legacyFp)) {
         try {
-          const data: Record<string, Session> = JSON.parse(readFileSync(legacyFp, 'utf-8'));
+          const data = parseSessionsProjectionStrict(readFileSync(legacyFp, 'utf-8'), legacyFp);
           sessions = new Map();
           for (const [k, v] of Object.entries(data)) {
             if (v.larkAppId === currentAppId) sessions.set(k, v);
@@ -184,6 +208,7 @@ function load(): void {
           }
         } catch (err) {
           logger.error(`Failed to migrate sessions from legacy file: ${err}`);
+          loadFailure = err instanceof Error ? err : new Error(String(err));
           sessions = new Map();
         }
       }
@@ -205,11 +230,7 @@ function readExistingSessionsFromDisk(fp: string): { raw: string; parsed: Record
 function readSessionsProjectionStrict(fp: string): { raw: string; parsed: Record<string, Session> } {
   if (!existsSync(fp)) return { raw: '', parsed: {} };
   const raw = readFileSync(fp, 'utf-8');
-  const value = JSON.parse(raw) as unknown;
-  if (!value || typeof value !== 'object' || Array.isArray(value)) {
-    throw new Error(`invalid sessions projection at ${fp}`);
-  }
-  return { raw, parsed: value as Record<string, Session> };
+  return { raw, parsed: parseSessionsProjectionStrict(raw, fp) };
 }
 
 function duplicateIds(ids: readonly string[]): string[] {
@@ -532,6 +553,154 @@ export function cleanupSessionBridgeSendMarkers(sessionId: string): void {
   cleanupSessionBridgeSendMarkersNow(sessionId);
 }
 
+export function isValidMojoCloseJournal(
+  value: unknown,
+): value is NonNullable<Session['mojoCloseJournal']> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const journal = value as Record<string, unknown>;
+  if (journal.phase !== 'preparing'
+      && journal.phase !== 'prepared'
+      && journal.phase !== 'uncertain') return false;
+  if (typeof journal.requestId !== 'string' || !journal.requestId.trim()) return false;
+  if (typeof journal.updatedAt !== 'string' || !journal.updatedAt.trim()) return false;
+  return journal.taskId === undefined
+    || (typeof journal.taskId === 'string' && !!journal.taskId.trim());
+}
+
+function mutateMojoCloseJournal(
+  sessionId: string,
+  mutate: (session: Session) => void,
+): Session {
+  load();
+  const session = sessions.get(sessionId);
+  if (!session || session.status !== 'active') {
+    throw new Error(`cannot mutate Mojo close journal for non-active session ${sessionId}`);
+  }
+  if (session.backendType !== 'mojo') {
+    throw new Error(`cannot mutate Mojo close journal for non-Mojo session ${sessionId}`);
+  }
+  const priorJournal = session.mojoCloseJournal
+    ? { ...session.mojoCloseJournal }
+    : undefined;
+  const priorTaskId = session.riffParentTaskId;
+  if (session.mojoCloseJournal && !isValidMojoCloseJournal(session.mojoCloseJournal)) {
+    throw new Error(`cannot mutate malformed Mojo close journal for ${sessionId}`);
+  }
+  mutate(session);
+  try {
+    save();
+  } catch (error) {
+    session.mojoCloseJournal = priorJournal;
+    session.riffParentTaskId = priorTaskId;
+    throw error;
+  }
+  return session;
+}
+
+/** Persist the admission fence before any authoritative Mojo cancel begins. */
+export function beginMojoCloseJournal(
+  sessionId: string,
+  requestId: string,
+  expectedTaskId?: string,
+): Session {
+  return mutateMojoCloseJournal(sessionId, (session) => {
+    if (session.riffParentTaskId !== expectedTaskId) {
+      throw new Error(`Mojo close lineage changed before prepare for ${sessionId}`);
+    }
+    const existing = session.mojoCloseJournal;
+    if (existing) {
+      if (existing.requestId !== requestId) {
+        throw new Error(`another Mojo close journal already owns ${sessionId}`);
+      }
+      if (existing.phase !== 'preparing') {
+        throw new Error(`cannot restart ${existing.phase} Mojo close journal for ${sessionId}`);
+      }
+      if (existing.taskId !== expectedTaskId) {
+        throw new Error(`Mojo close journal lineage changed before retry for ${sessionId}`);
+      }
+      return;
+    }
+    session.mojoCloseJournal = {
+      phase: 'preparing',
+      requestId,
+      ...(expectedTaskId ? { taskId: expectedTaskId } : {}),
+      updatedAt: new Date().toISOString(),
+    };
+  });
+}
+
+/** Publish irreversible remote-cancel proof before the local close commit. */
+export function markMojoClosePrepared(
+  sessionId: string,
+  requestId: string,
+  taskId?: string,
+): Session {
+  return mutateMojoCloseJournal(sessionId, (session) => {
+    const existing = session.mojoCloseJournal;
+    if (existing && existing.requestId !== requestId) {
+      throw new Error(`stale Mojo close prepare for ${sessionId}`);
+    }
+    if (existing?.phase === 'uncertain') {
+      throw new Error(`cannot promote uncertain Mojo close journal for ${sessionId}`);
+    }
+    if (existing?.taskId && taskId && existing.taskId !== taskId) {
+      throw new Error(`Mojo close proof changed journal lineage for ${sessionId}`);
+    }
+    const provenTaskId = taskId ?? existing?.taskId;
+    if (provenTaskId && session.riffParentTaskId
+        && session.riffParentTaskId !== provenTaskId) {
+      throw new Error(`Mojo close result lineage changed for ${sessionId}`);
+    }
+    if (provenTaskId) session.riffParentTaskId = provenTaskId;
+    session.mojoCloseJournal = {
+      phase: 'prepared',
+      requestId,
+      ...(provenTaskId ? { taskId: provenTaskId } : {}),
+      updatedAt: new Date().toISOString(),
+    };
+  });
+}
+
+/**
+ * Finish a failed prepare after worker admission restore. If restore was not
+ * proven, keep a durable uncertain fence; either way retain a newly discovered
+ * pre-init lineage for later reconciliation.
+ */
+export function finishMojoCloseAbort(
+  sessionId: string,
+  requestId: string,
+  options: { admissionRestored: boolean; taskId?: string },
+): Session {
+  return mutateMojoCloseJournal(sessionId, (session) => {
+    const existing = session.mojoCloseJournal;
+    if (!existing || existing.requestId !== requestId) {
+      throw new Error(`stale Mojo close abort for ${sessionId}`);
+    }
+    if (existing.phase === 'prepared') {
+      throw new Error(`cannot abort prepared Mojo close proof for ${sessionId}`);
+    }
+    if (existing.taskId && options.taskId && existing.taskId !== options.taskId) {
+      throw new Error(`Mojo close abort changed journal lineage for ${sessionId}`);
+    }
+    const retainedTaskId = options.taskId ?? existing.taskId;
+    if (retainedTaskId && session.riffParentTaskId
+        && session.riffParentTaskId !== retainedTaskId) {
+      throw new Error(`Mojo close abort lineage changed for ${sessionId}`);
+    }
+    if (retainedTaskId) session.riffParentTaskId = retainedTaskId;
+    if (options.admissionRestored) {
+      session.mojoCloseJournal = undefined;
+      return;
+    }
+    session.mojoCloseJournal = {
+      phase: 'uncertain',
+      requestId,
+      ...(retainedTaskId ? { taskId: retainedTaskId } : {}),
+      updatedAt: new Date().toISOString(),
+    };
+  });
+}
+
 export function closeSession(
   sessionId: string,
   opts: {
@@ -559,10 +728,14 @@ export function closeSession(
     const priorQueuedAttachments = session.queuedAttachments;
     const priorQuarantinedLineage = session.mojoQuarantinedLineage;
     const priorQuarantineNoticePending = session.mojoQuarantineNoticePending;
+    const priorMojoCloseJournal = session.mojoCloseJournal
+      ? { ...session.mojoCloseJournal }
+      : undefined;
     session.status = 'closed';
     session.closedAt = new Date().toISOString();
     session.dashboardAttachments = undefined;
     session.queuedAttachments = undefined;
+    session.mojoCloseJournal = undefined;
     if (opts.parkMojoLineage) {
       // Keep both ids when a different one was already parked: each is the only
       // handle left for manual cleanup of its remote session.
@@ -588,6 +761,7 @@ export function closeSession(
       // a new one — i.e. the "close failed, retry unchanged" guarantee is broken.
       session.mojoQuarantinedLineage = priorQuarantinedLineage;
       session.mojoQuarantineNoticePending = priorQuarantineNoticePending;
+      session.mojoCloseJournal = priorMojoCloseJournal;
       throw err;
     }
     if (session.larkAppId && priorDashboardAttachments?.length) {
@@ -642,6 +816,7 @@ export function reactivateClosedSession(
     queuedActivationTail: session.queuedActivationTail,
     queuedActivationTailNextOrder: session.queuedActivationTailNextOrder,
     pendingRepoSetup: session.pendingRepoSetup,
+    mojoCloseJournal: session.mojoCloseJournal,
   };
 
   session.status = 'active';
@@ -662,6 +837,7 @@ export function reactivateClosedSession(
   session.queuedActivationTail = undefined;
   session.queuedActivationTailNextOrder = undefined;
   session.pendingRepoSetup = undefined;
+  session.mojoCloseJournal = undefined;
 
   try {
     save();
@@ -751,6 +927,19 @@ export function persistActiveRiffLineageExact(
 
 export function listSessions(): Session[] {
   load();
+  return [...sessions.values()];
+}
+
+/**
+ * Return the current projection only when its backing file was loaded safely.
+ * Use this for decisions that delete, retire, or reconfigure resources: the
+ * legacy empty-on-error behaviour of listSessions() is unsafe at those gates.
+ * A failed load remains unhealthy until init() explicitly selects/reloads a
+ * store, avoiding a silent mid-transaction recovery against a different view.
+ */
+export function listSessionsStrict(): Session[] {
+  load();
+  if (loadFailure) throw new SessionStoreUnavailableError(loadFailure);
   return [...sessions.values()];
 }
 

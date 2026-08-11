@@ -32,6 +32,7 @@ import { codexServiceTierBadge } from '../services/codex-service-tier.js';
 import { loadFrozenCards, saveFrozenCards } from '../services/frozen-card-store.js';
 import { hashUrlForLog } from '../adapters/backend/riff-backend.js';
 import { cancelMojoSessionById } from '../adapters/backend/mojo-backend.js';
+import { MOJO_EXPLICIT_CLOSE_RESULT_TIMEOUT_MS } from '../adapters/backend/mojo-budgets.js';
 import {
   buildEffectiveMojoConfig,
   diffMojoSessionIdentity,
@@ -302,7 +303,7 @@ import {
   storedSessionAnchorId,
   isDocNativeSession,
   larkTransportEnabled,
-  riffRetirementAdmissionPhase,
+  remoteRetirementAdmissionPhase,
   type DaemonSession,
 } from './types.js';
 import { hasProtectedSessionMutationOwnership } from './session-mutation-guard.js';
@@ -538,16 +539,16 @@ function requireCallbacks(): WorkerPoolCallbacks {
 // linear-scan by sessionId.
 let activeSessionsRegistry: Map<string, DaemonSession> | undefined;
 
-type RiffWorkerCloseResult = {
+type RemoteWorkerCloseResult = {
   ok: boolean;
   taskId?: string;
   error?: string;
 };
 
-const pendingRiffWorkerCloses = new Map<string, {
+const pendingRemoteWorkerCloses = new Map<string, {
   sessionId: string;
   worker: ChildProcess;
-  resolve: (result: RiffWorkerCloseResult) => void;
+  resolve: (result: RemoteWorkerCloseResult) => void;
 }>();
 
 export function setActiveSessionsRegistry(m: Map<string, DaemonSession>): void {
@@ -2231,7 +2232,7 @@ export function ensureClaudeFolderTrust(workingDir: string, stateJsonPath: strin
 export function killWorker(
   ds: DaemonSession,
   opts: {
-    riffCloseCommitRequestId?: string;
+    remoteCloseCommitRequestId?: string;
     /** Set by the authoritative mojo close once its cancel is PROVEN, so the
      *  best-effort orphan teardown below does not cancel the same session again. */
     mojoCancelAlreadyProven?: boolean;
@@ -2240,7 +2241,7 @@ export function killWorker(
   const closeFrozenType = ds.initConfig?.backendType ?? ds.session.backendType;
   if (ds.worker && !ds.worker.killed
       && closeFrozenType === 'riff'
-      && !opts.riffCloseCommitRequestId) {
+      && !opts.remoteCloseCommitRequestId) {
     // A generic synchronous retirement cannot safely detach Riff. An accepted
     // create/follow-up may still be waiting for the task id that becomes the
     // only durable lineage anchor.
@@ -2275,25 +2276,25 @@ export function killWorker(
     destroyOrphanedBackingSession(ds, {
       ...(opts.mojoCancelAlreadyProven ? { skipRemoteCancel: true } : {}),
     });
-    if (opts.riffCloseCommitRequestId
-        && ds.riffCloseState?.requestId === opts.riffCloseCommitRequestId) {
-      ds.riffCloseState = undefined;
+    if (opts.remoteCloseCommitRequestId
+        && ds.remoteCloseState?.requestId === opts.remoteCloseCommitRequestId) {
+      ds.remoteCloseState = undefined;
     }
     return;
   }
   try {
-    if (opts.riffCloseCommitRequestId) {
+    if (opts.remoteCloseCommitRequestId) {
       ds.worker.send({
         type: 'close_commit',
-        requestId: opts.riffCloseCommitRequestId,
+        requestId: opts.remoteCloseCommitRequestId,
       } as DaemonToWorker);
     } else {
       ds.worker.send({ type: 'close' } as DaemonToWorker);
     }
   } catch { /* IPC already closed */ }
-  if (opts.riffCloseCommitRequestId
-      && ds.riffCloseState?.requestId === opts.riffCloseCommitRequestId) {
-    ds.riffCloseState = undefined;
+  if (opts.remoteCloseCommitRequestId
+      && ds.remoteCloseState?.requestId === opts.remoteCloseCommitRequestId) {
+    ds.remoteCloseState = undefined;
   }
   const w = ds.worker;
   trackLifecycleRetirement(ds, w);
@@ -2733,7 +2734,7 @@ function destroyOrphanedBackingSession(
   }
 }
 
-type RiffClosePreparation =
+type RemoteClosePreparation =
   | {
       ok: true;
       taskId?: string;
@@ -2757,6 +2758,8 @@ type RiffClosePreparation =
         // credential-bearing session that must be proven gone before the row is
         // published as closed), same retryable-failure shape.
         | 'mojo_cancel_failed'
+        | 'mojo_durable_close_failed'
+        | 'mojo_close_reconciliation_required'
         /** Bot deregistered — retryable once it is registered again. */
         | 'mojo_config_missing'
         /** Durable lineage with no active owner to cancel through. */
@@ -2765,19 +2768,19 @@ type RiffClosePreparation =
       taskId?: string;
     };
 
-async function abortLiveRiffWorkerClose(
+async function abortLiveRemoteWorkerClose(
   ds: DaemonSession,
   requestId: string,
   opts: { allowAbsentAfterProvenRestore?: boolean } = {},
 ): Promise<boolean> {
-  if (ds.riffCloseState?.requestId !== requestId) return false;
+  if (ds.remoteCloseState?.requestId !== requestId) return false;
   const worker = ds.worker;
   if (!worker || worker.killed) {
     if (opts.allowAbsentAfterProvenRestore) {
-      ds.riffCloseState = undefined;
+      ds.remoteCloseState = undefined;
       return true;
     }
-    ds.riffCloseState = { ...ds.riffCloseState, phase: 'uncertain' };
+    ds.remoteCloseState = { ...ds.remoteCloseState, phase: 'uncertain' };
     return false;
   }
 
@@ -2818,68 +2821,156 @@ async function abortLiveRiffWorkerClose(
     }
   });
 
-  if (restored.ok && ds.riffCloseState?.requestId === requestId) {
-    ds.riffCloseState = undefined;
+  if (restored.ok && ds.remoteCloseState?.requestId === requestId) {
+    ds.remoteCloseState = undefined;
     return true;
   }
   if (opts.allowAbsentAfterProvenRestore
-      && ds.riffCloseState?.requestId === requestId) {
-    ds.riffCloseState = undefined;
+      && ds.remoteCloseState?.requestId === requestId) {
+    ds.remoteCloseState = undefined;
     return true;
   }
-  if (ds.riffCloseState?.requestId === requestId) {
-    ds.riffCloseState = { ...ds.riffCloseState, phase: 'uncertain' };
+  if (ds.remoteCloseState?.requestId === requestId) {
+    ds.remoteCloseState = { ...ds.remoteCloseState, phase: 'uncertain' };
   }
   logger.warn(
-    `[${tag(ds)}] Riff close abort was not acknowledged (${restored.error ?? 'unknown'}); `
+    `[${tag(ds)}] Remote close abort was not acknowledged (${restored.error ?? 'unknown'}); `
     + 'retaining admission fence pending explicit lineage reconciliation',
   );
   return false;
 }
 
-async function prepareLiveRiffWorkerClose(ds: DaemonSession): Promise<RiffClosePreparation> {
+async function prepareLiveRemoteWorkerClose(
+  ds: DaemonSession,
+  backendType: 'riff' | 'mojo',
+): Promise<RemoteClosePreparation> {
   const worker = ds.worker;
   if (!worker || worker.killed) {
-    return { ok: false, error: 'riff_worker_close_failed', retryable: true };
-  }
-  if (ds.riffCloseState || ds.riffShutdownState) {
     return {
       ok: false,
-      error: 'riff_worker_close_failed',
+      error: backendType === 'riff' ? 'riff_worker_close_failed' : 'mojo_cancel_failed',
       retryable: true,
-      ...((ds.riffCloseState?.taskId ?? ds.riffShutdownState?.taskId)
-        ? { taskId: (ds.riffCloseState?.taskId ?? ds.riffShutdownState?.taskId)! }
+    };
+  }
+  if (backendType === 'mojo' && ds.remoteCloseState?.phase === 'abort_restored') {
+    const restoredState = ds.remoteCloseState;
+    try {
+      const committed = sessionStore.finishMojoCloseAbort(
+        ds.session.sessionId,
+        restoredState.requestId,
+        {
+          admissionRestored: true,
+          ...(restoredState.taskId ? { taskId: restoredState.taskId } : {}),
+        },
+      );
+      ds.session.mojoCloseJournal = committed.mojoCloseJournal;
+      ds.session.riffParentTaskId = committed.riffParentTaskId;
+      ds.remoteCloseState = undefined;
+    } catch (err) {
+      logger.error(
+        `[${tag(ds)}] Mojo admission restore proof could not clear the durable close journal: `
+        + `${err instanceof Error ? err.message : String(err)}`,
+      );
+      return {
+        ok: false,
+        error: 'mojo_durable_close_failed',
+        retryable: true,
+        ...(restoredState.taskId ? { taskId: restoredState.taskId } : {}),
+      };
+    }
+  }
+  if (backendType === 'mojo' && ds.remoteCloseState?.phase === 'prepared') {
+    try {
+      const committed = sessionStore.markMojoClosePrepared(
+        ds.session.sessionId,
+        ds.remoteCloseState.requestId,
+        ds.remoteCloseState.taskId,
+      );
+      ds.session.mojoCloseJournal = committed.mojoCloseJournal;
+      ds.session.riffParentTaskId = committed.riffParentTaskId;
+    } catch (err) {
+      logger.error(
+        `[${tag(ds)}] Mojo close proof could not be persisted for durable commit: `
+        + `${err instanceof Error ? err.message : String(err)}`,
+      );
+      return {
+        ok: false,
+        error: 'mojo_durable_close_failed',
+        retryable: true,
+        ...(ds.remoteCloseState.taskId ? { taskId: ds.remoteCloseState.taskId } : {}),
+      };
+    }
+    return {
+      ok: true,
+      ...(ds.remoteCloseState.taskId ? { taskId: ds.remoteCloseState.taskId } : {}),
+    };
+  }
+  if (ds.remoteCloseState || (backendType === 'riff' && ds.riffShutdownState)) {
+    return {
+      ok: false,
+      error: backendType === 'riff' ? 'riff_worker_close_failed' : 'mojo_cancel_failed',
+      retryable: true,
+      ...((ds.remoteCloseState?.taskId ?? ds.riffShutdownState?.taskId)
+        ? { taskId: (ds.remoteCloseState?.taskId ?? ds.riffShutdownState?.taskId)! }
         : {}),
     };
   }
   const requestId = randomUUID();
-  ds.riffCloseState = {
+  if (backendType === 'mojo') {
+    try {
+      const committed = sessionStore.beginMojoCloseJournal(
+        ds.session.sessionId,
+        requestId,
+        ds.session.riffParentTaskId,
+      );
+      ds.session.mojoCloseJournal = committed.mojoCloseJournal;
+    } catch (err) {
+      logger.error(
+        `[${tag(ds)}] Mojo close journal could not be persisted before cancellation: `
+        + `${err instanceof Error ? err.message : String(err)}`,
+      );
+      return {
+        ok: false,
+        error: 'mojo_durable_close_failed',
+        retryable: true,
+        ...(ds.session.riffParentTaskId ? { taskId: ds.session.riffParentTaskId } : {}),
+      };
+    }
+  }
+  ds.remoteCloseState = {
     phase: 'preparing',
     requestId,
     ...(ds.session.riffParentTaskId ? { taskId: ds.session.riffParentTaskId } : {}),
   };
   let matchedCloseResult = false;
-  const result = await new Promise<RiffWorkerCloseResult>((resolve) => {
+  const result = await new Promise<RemoteWorkerCloseResult>((resolve) => {
     let settled = false;
-    const finish = (value: RiffWorkerCloseResult): void => {
+    const finish = (value: RemoteWorkerCloseResult): void => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
       worker.removeListener?.('exit', onExit);
-      pendingRiffWorkerCloses.delete(requestId);
+      pendingRemoteWorkerCloses.delete(requestId);
       resolve(value);
     };
     const onExit = (): void => finish({
       ok: false,
       error: 'worker_exited_before_close_result',
     });
+    // Riff's adapter has its own 20s destroy deadline. Mojo may first spend 8s
+    // waiting for system/init, then up to 60s in `mojo session cancel`; aborting
+    // at the old 23s Riff budget re-opened admission while that irreversible
+    // cancellation was still in flight. Stay above both bounded Mojo phases.
+    const closeResultTimeoutMs = backendType === 'mojo'
+      ? MOJO_EXPLICIT_CLOSE_RESULT_TIMEOUT_MS
+      : 23_000;
     const timer = setTimeout(
       () => finish({ ok: false, error: 'worker_close_result_timeout' }),
-      23_000,
+      closeResultTimeoutMs,
     );
     timer.unref?.();
     worker.once?.('exit', onExit);
-    pendingRiffWorkerCloses.set(requestId, {
+    pendingRemoteWorkerCloses.set(requestId, {
       sessionId: ds.session.sessionId,
       worker,
       resolve: value => {
@@ -2895,14 +2986,98 @@ async function prepareLiveRiffWorkerClose(ds: DaemonSession): Promise<RiffCloseP
   });
 
   const taskId = result.taskId ?? ds.session.riffParentTaskId;
+  if (backendType === 'mojo') {
+    if (result.ok) {
+      try {
+        const committed = sessionStore.markMojoClosePrepared(
+          ds.session.sessionId,
+          requestId,
+          taskId,
+        );
+        ds.session.mojoCloseJournal = committed.mojoCloseJournal;
+        ds.session.riffParentTaskId = committed.riffParentTaskId;
+      } catch (err) {
+        // Cancellation is irreversible. The runtime proof stays prepared and
+        // admission remains fenced; a retry republishes that same proof without
+        // asking the worker to cancel twice. The durable `preparing` journal
+        // makes a daemon crash fail closed rather than resume this generation.
+        ds.remoteCloseState = {
+          phase: 'prepared',
+          requestId,
+          ...(taskId ? { taskId } : {}),
+        };
+        logger.error(
+          `[${tag(ds)}] Mojo close proof persistence failed after cancellation; `
+          + `retaining prepared commit: ${err instanceof Error ? err.message : String(err)}`,
+        );
+        return {
+          ok: false,
+          error: 'mojo_durable_close_failed',
+          retryable: true,
+          ...(taskId ? { taskId } : {}),
+        };
+      }
+
+      ds.remoteCloseState = {
+        phase: 'prepared',
+        requestId,
+        ...(taskId ? { taskId } : {}),
+      };
+      logger.info(`[${tag(ds)}] mojo worker close prepared and remote cancellation confirmed`);
+      return { ok: true, ...(taskId ? { taskId } : {}) };
+    }
+
+    const admissionRestored = await abortLiveRemoteWorkerClose(ds, requestId, {
+      allowAbsentAfterProvenRestore: matchedCloseResult,
+    });
+    try {
+      const committed = sessionStore.finishMojoCloseAbort(
+        ds.session.sessionId,
+        requestId,
+        { admissionRestored, ...(taskId ? { taskId } : {}) },
+      );
+      ds.session.mojoCloseJournal = committed.mojoCloseJournal;
+      ds.session.riffParentTaskId = committed.riffParentTaskId;
+    } catch (err) {
+      // The worker may have restored admission, but without a durable journal
+      // clear a crash would still be ambiguous. Keep the daemon fence aligned
+      // with the disk-side uncertainty instead of accepting new input.
+      ds.remoteCloseState = {
+        phase: admissionRestored ? 'abort_restored' : 'uncertain',
+        requestId,
+        ...(taskId ? { taskId } : {}),
+      };
+      logger.error(
+        `[${tag(ds)}] Mojo close abort could not be committed durably: `
+        + `${err instanceof Error ? err.message : String(err)}`,
+      );
+      return {
+        ok: false,
+        error: 'mojo_durable_close_failed',
+        retryable: true,
+        ...(taskId ? { taskId } : {}),
+      };
+    }
+    logger.warn(
+      `[${tag(ds)}] mojo worker close prepare failed: ${result.error ?? 'unknown'}; `
+      + `session remains active${taskId ? ` (task ${taskId})` : ''}`,
+    );
+    return {
+      ok: false,
+      error: 'mojo_cancel_failed',
+      retryable: true,
+      ...(taskId ? { taskId } : {}),
+    };
+  }
+
   if (result.taskId) {
     ds.session.riffParentTaskId = result.taskId;
     try {
       sessionStore.updateSession(ds.session);
     } catch (err) {
-      await abortLiveRiffWorkerClose(ds, requestId);
+      await abortLiveRemoteWorkerClose(ds, requestId);
       logger.error(
-        `[${tag(ds)}] Riff close lineage persistence failed; close aborted: `
+        `[${tag(ds)}] ${backendType} close lineage persistence failed; close aborted: `
         + `${err instanceof Error ? err.message : String(err)}`,
       );
       return {
@@ -2915,11 +3090,11 @@ async function prepareLiveRiffWorkerClose(ds: DaemonSession): Promise<RiffCloseP
   }
 
   if (!result.ok) {
-    await abortLiveRiffWorkerClose(ds, requestId, {
+    await abortLiveRemoteWorkerClose(ds, requestId, {
       allowAbsentAfterProvenRestore: matchedCloseResult,
     });
     logger.warn(
-      `[${tag(ds)}] Riff worker close prepare failed: ${result.error ?? 'unknown'}; `
+      `[${tag(ds)}] ${backendType} worker close prepare failed: ${result.error ?? 'unknown'}; `
       + `session remains active${taskId ? ` (task ${taskId})` : ''}`,
     );
     return {
@@ -2930,12 +3105,12 @@ async function prepareLiveRiffWorkerClose(ds: DaemonSession): Promise<RiffCloseP
     };
   }
 
-  ds.riffCloseState = {
+  ds.remoteCloseState = {
     phase: 'prepared',
     requestId,
     ...(taskId ? { taskId } : {}),
   };
-  logger.info(`[${tag(ds)}] Riff worker close prepared and remote task cancellation confirmed`);
+  logger.info(`[${tag(ds)}] ${backendType} worker close prepared and remote cancellation confirmed`);
   return { ok: true, ...(taskId ? { taskId } : {}) };
 }
 
@@ -2945,7 +3120,7 @@ async function prepareLiveRiffWorkerClose(ds: DaemonSession): Promise<RiffCloseP
 async function prepareRiffExplicitClose(
   ds: DaemonSession | undefined,
   stored: Session | undefined,
-): Promise<RiffClosePreparation> {
+): Promise<RemoteClosePreparation> {
   const session = ds?.session ?? stored;
   if (!session) return { ok: true };
   const backendType = ds?.initConfig?.backendType ?? session.backendType;
@@ -2961,12 +3136,12 @@ async function prepareRiffExplicitClose(
       ...(typeof fencedTaskId === 'string' && fencedTaskId ? { taskId: fencedTaskId } : {}),
     };
   }
-  if (ds?.riffCloseState) {
+  if (ds?.remoteCloseState) {
     return {
       ok: false,
       error: 'riff_close_reconciliation_required',
       retryable: true,
-      ...(ds.riffCloseState.taskId ? { taskId: ds.riffCloseState.taskId } : {}),
+      ...(ds.remoteCloseState.taskId ? { taskId: ds.remoteCloseState.taskId } : {}),
     };
   }
   if (backendType !== 'riff') return { ok: true };
@@ -2981,7 +3156,7 @@ async function prepareRiffExplicitClose(
         ...(taskId ? { taskId } : {}),
       };
     }
-    return prepareLiveRiffWorkerClose(ds);
+    return prepareLiveRemoteWorkerClose(ds, 'riff');
   }
 
   const durableBefore = sessionStore.getSession(session.sessionId);
@@ -3048,8 +3223,8 @@ async function prepareRiffExplicitClose(
 }
 
 /**
- * Prove a workerless mojo session's remote lineage is cancelled BEFORE its row is
- * published as closed — the mojo half of what prepareRiffExplicitClose does.
+ * Prove a mojo session's remote lineage is cancelled BEFORE its row is published
+ * as closed — the mojo half of what prepareRiffExplicitClose does.
  *
  * Without this, `/close` on a workerless mojo session marked the row closed and
  * returned success while the cancel was still in flight, so a failed cancel left
@@ -3059,10 +3234,10 @@ async function prepareRiffExplicitClose(
  * killWorker teardown), which a second `/close` can no longer reach because the
  * first close removed the session from the active registry.
  *
- * Only the WORKERLESS case is handled here. With a live worker the `close` IPC
- * makes the worker run MojoBackend.destroySession(), which already awaits the
- * cancel on its own side (and waits out the pre-init window, which the daemon
- * cannot observe).
+ * A live worker uses prepare/commit: MojoBackend.destroySession() awaits the
+ * cancel (including the pre-init window), then the daemon durably closes the row
+ * before committing worker retirement. A failed durable write keeps the exact
+ * generation prepared so retry commits without cancelling twice.
  *
  * An open durable row with no entry in the active registry cannot be cancelled
  * from here at all (every helper the cancel needs is keyed on DaemonSession), so
@@ -3072,7 +3247,7 @@ async function prepareRiffExplicitClose(
 async function prepareMojoExplicitClose(
   ds: DaemonSession | undefined,
   stored: Session | undefined,
-): Promise<RiffClosePreparation> {
+): Promise<RemoteClosePreparation> {
   const session = ds?.session ?? stored;
   if (!session) return { ok: true };
   if (ds?.initConfig?.adoptMode || ds?.adoptedFrom || session.adoptedFrom) return { ok: true };
@@ -3081,15 +3256,179 @@ async function prepareMojoExplicitClose(
   // a residual on every close of this row, including replays of an already-closed
   // one — which is what makes the outcome idempotent instead of degrading to a
   // failure once the owner is gone.
-  const parked = mojoCloseResidualForRow(session);
-  const remoteId = session.riffParentTaskId;
-  // Nothing ACTIVE to cancel: either a clean row, or a parked-only one.
-  if (!remoteId) return parked ? { ok: true, residual: parked } : { ok: true };
-  // Already closed: this is a replay, so there is nothing left to cancel. Report
-  // the same residual rather than failing on the missing owner below.
+  const parked = mojoCloseResidualForRow(stored ?? session);
+  const remoteId = stored ? stored.riffParentTaskId : session.riffParentTaskId;
+  const runtimeClose = ds?.session.mojoCloseJournal;
+  const storedClose = stored?.mojoCloseJournal;
+  if (ds && stored && ds.session !== stored && runtimeClose) {
+    const runtimeMatchesDurable = !!storedClose
+      && runtimeClose.phase === storedClose.phase
+      && runtimeClose.requestId === storedClose.requestId
+      && runtimeClose.taskId === storedClose.taskId
+      && runtimeClose.updatedAt === storedClose.updatedAt;
+    if (!runtimeMatchesDurable) {
+      // A runtime copy is not durable authority. In particular, a stale/forged
+      // in-memory `prepared` value must never bypass cancellation, while a real
+      // prepared store row must not be re-cancelled because a detached runtime
+      // copy missed the last sync.
+      logger.error(
+        `[${session.sessionId.slice(0, 8)}] explicit close refused: runtime/durable Mojo journal mismatch`,
+      );
+      return {
+        ok: false,
+        error: 'mojo_close_reconciliation_required',
+        retryable: true,
+        ...((storedClose?.taskId ?? runtimeClose.taskId ?? remoteId)
+          ? { taskId: (storedClose?.taskId ?? runtimeClose.taskId ?? remoteId)! }
+          : {}),
+      };
+    }
+  }
+  let durableClose = storedClose ?? runtimeClose;
+  if (durableClose && !sessionStore.isValidMojoCloseJournal(durableClose)) {
+    logger.error(
+      `[${session.sessionId.slice(0, 8)}] explicit close refused: malformed Mojo close journal`,
+    );
+    return {
+      ok: false,
+      error: 'mojo_close_reconciliation_required',
+      retryable: true,
+      ...(remoteId ? { taskId: remoteId } : {}),
+    };
+  }
+  // Already closed is normally an idempotent replay. A journal on a closed row
+  // is NOT normal (the status transition clears it atomically), so do not flatten
+  // that contradictory disk state into an ordinary success.
   if (stored && stored.status === 'closed') {
+    if (durableClose) {
+      return {
+        ok: false,
+        error: 'mojo_close_reconciliation_required',
+        retryable: true,
+        ...((durableClose.taskId ?? remoteId)
+          ? { taskId: (durableClose.taskId ?? remoteId)! }
+          : {}),
+      };
+    }
     return parked ? { ok: true, residual: parked } : { ok: true };
   }
+  if (durableClose?.phase === 'prepared') {
+    // A prior daemon already received and durably recorded the irreversible
+    // worker cancellation proof. Finish only the local status/lineage commit;
+    // repeating the CLI cancel would turn an idempotent recovery into failure.
+    return {
+      ok: true,
+      ...((durableClose.taskId ?? remoteId)
+        ? { taskId: (durableClose.taskId ?? remoteId)! }
+        : {}),
+      ...(parked ? { residual: parked } : {}),
+    };
+  }
+  const matchingRuntimePreparedProof = durableClose?.phase === 'preparing'
+    && ds?.remoteCloseState?.phase === 'prepared'
+    && ds.remoteCloseState.requestId === durableClose.requestId;
+  const matchingRuntimeAbortRestoreProof = durableClose?.phase === 'preparing'
+    && ds?.remoteCloseState?.phase === 'abort_restored'
+    && ds.remoteCloseState.requestId === durableClose.requestId;
+  const hasLiveWorker = !!ds?.worker && !ds.worker.killed;
+  if (ds && matchingRuntimePreparedProof && !hasLiveWorker) {
+    // Workerless cancellation is irreversible too. If publishing `prepared`
+    // failed after the CLI proved cancellation, retain the in-memory proof and
+    // let a retry publish that SAME proof before committing the row. Never issue
+    // a second cancel merely because the first durable write failed.
+    try {
+      const committed = sessionStore.markMojoClosePrepared(
+        session.sessionId,
+        ds.remoteCloseState!.requestId,
+        ds.remoteCloseState!.taskId,
+      );
+      session.mojoCloseJournal = committed.mojoCloseJournal;
+      session.riffParentTaskId = committed.riffParentTaskId;
+      return {
+        ok: true,
+        ...(ds.remoteCloseState!.taskId ? { taskId: ds.remoteCloseState!.taskId } : {}),
+        ...(parked ? { residual: parked } : {}),
+      };
+    } catch (err) {
+      logger.error(
+        `[${tag(ds)}] Workerless Mojo close proof could not be persisted for durable commit: `
+        + `${err instanceof Error ? err.message : String(err)}`,
+      );
+      return {
+        ok: false,
+        error: 'mojo_durable_close_failed',
+        retryable: true,
+        ...(ds.remoteCloseState!.taskId ? { taskId: ds.remoteCloseState!.taskId } : {}),
+      };
+    }
+  }
+  if (ds && matchingRuntimeAbortRestoreProof && !hasLiveWorker) {
+    // No worker admission changed on this path, but the durable intent must be
+    // cleared before another cancel attempt is allowed. A failed clear keeps the
+    // central admission fence aligned with disk.
+    try {
+      const restoredState = ds.remoteCloseState!;
+      const committed = sessionStore.finishMojoCloseAbort(
+        session.sessionId,
+        restoredState.requestId,
+        {
+          admissionRestored: true,
+          ...(restoredState.taskId ? { taskId: restoredState.taskId } : {}),
+        },
+      );
+      session.mojoCloseJournal = committed.mojoCloseJournal;
+      session.riffParentTaskId = committed.riffParentTaskId;
+      ds.remoteCloseState = undefined;
+      durableClose = undefined;
+    } catch (err) {
+      logger.error(
+        `[${tag(ds)}] Workerless Mojo abort proof could not clear the durable close journal: `
+        + `${err instanceof Error ? err.message : String(err)}`,
+      );
+      return {
+        ok: false,
+        error: 'mojo_durable_close_failed',
+        retryable: true,
+        ...(ds.remoteCloseState!.taskId ? { taskId: ds.remoteCloseState!.taskId } : {}),
+      };
+    }
+  }
+  const livePreparedProof = matchingRuntimePreparedProof
+    && !!ds.worker
+    && !ds.worker.killed;
+  const liveAbortRestoreProof = matchingRuntimeAbortRestoreProof
+    && !!ds.worker
+    && !ds.worker.killed;
+  if (durableClose && !livePreparedProof && !liveAbortRestoreProof) {
+    logger.warn(
+      `[${session.sessionId.slice(0, 8)}] explicit close requires Mojo reconciliation: `
+      + `durable journal is ${durableClose.phase} (${durableClose.requestId})`,
+    );
+    return {
+      ok: false,
+      error: 'mojo_close_reconciliation_required',
+      retryable: true,
+      ...((durableClose.taskId ?? remoteId)
+        ? { taskId: (durableClose.taskId ?? remoteId)! }
+        : {}),
+    };
+  }
+  // A live worker is the only authority that can cover the pre-init window:
+  // destroySession waits for system/init, then returns the exact lineage in its
+  // close_result. This must run even when the durable row has no id yet.
+  if (ds?.worker && !ds.worker.killed) {
+    if (!stored || stored.status !== 'active') {
+      return {
+        ok: false,
+        error: 'mojo_close_identity_missing',
+        retryable: true,
+        ...(remoteId ? { taskId: remoteId } : {}),
+      };
+    }
+    return prepareLiveRemoteWorkerClose(ds, 'mojo');
+  }
+  // Nothing ACTIVE to cancel: either a clean row, or a parked-only one.
+  if (!remoteId) return parked ? { ok: true, residual: parked } : { ok: true };
   if (!ds) {
     // An open durable row carrying a lineage, with no owner in the active
     // registry. Everything the cancel needs (frozen identity, launch identity)
@@ -3103,9 +3442,6 @@ async function prepareMojoExplicitClose(
     );
     return { ok: false, error: 'mojo_close_identity_missing', retryable: true, taskId: remoteId };
   }
-  // A live worker cancels remote-side itself on the `close` IPC.
-  if (ds.worker && !ds.worker.killed) return { ok: true };
-
   const resolved = resolveMojoCancelLaunch(ds, remoteId, 'explicit close');
   if (!resolved.ok) {
     if (resolved.reason === 'bot_gone') {
@@ -3128,11 +3464,62 @@ async function prepareMojoExplicitClose(
     };
   }
 
-  const outcome = await cancelMojoSessionById(resolved.launchCfg, remoteId);
+  const requestId = randomUUID();
+  try {
+    const committed = sessionStore.beginMojoCloseJournal(
+      session.sessionId,
+      requestId,
+      remoteId,
+    );
+    session.mojoCloseJournal = committed.mojoCloseJournal;
+    session.riffParentTaskId = committed.riffParentTaskId;
+  } catch (err) {
+    logger.error(
+      `[${tag(ds)}] Workerless Mojo close journal could not be persisted before cancellation: `
+      + `${err instanceof Error ? err.message : String(err)}`,
+    );
+    return {
+      ok: false,
+      error: 'mojo_durable_close_failed',
+      retryable: true,
+      taskId: remoteId,
+    };
+  }
+  ds.remoteCloseState = { phase: 'preparing', requestId, taskId: remoteId };
+  const outcome = await cancelMojoSessionById(resolved.launchCfg, remoteId).catch((err: unknown) => ({
+    kind: 'failed' as const,
+    message: err instanceof Error ? err.message : String(err),
+    retryable: true,
+  }));
   // Structured, NOT a boolean: `if (!outcome)` on an object is always false and
   // would turn every failure into a silent success. `already_terminal` counts as
   // gone, but only when the classifier could PROVE it (see MojoCancelOutcome).
   if (!isMojoRemoteGone(outcome)) {
+    try {
+      const committed = sessionStore.finishMojoCloseAbort(
+        session.sessionId,
+        requestId,
+        { admissionRestored: true, taskId: remoteId },
+      );
+      session.mojoCloseJournal = committed.mojoCloseJournal;
+      session.riffParentTaskId = committed.riffParentTaskId;
+      ds.remoteCloseState = undefined;
+    } catch (err) {
+      // There was no live worker admission to restore, but accepting input while
+      // disk still says `preparing` would recreate the same split-brain. Retain
+      // an abort-restored runtime proof so a retry clears the journal first.
+      ds.remoteCloseState = { phase: 'abort_restored', requestId, taskId: remoteId };
+      logger.error(
+        `[${tag(ds)}] Workerless Mojo close abort could not be committed durably: `
+        + `${err instanceof Error ? err.message : String(err)}`,
+      );
+      return {
+        ok: false,
+        error: 'mojo_durable_close_failed',
+        retryable: true,
+        taskId: remoteId,
+      };
+    }
     logger.warn(
       `[${tag(ds)}] explicit close refused: mojo session ${remoteId} could not be `
       + 'cancelled; the row stays open and the lineage is retained so the close is retryable'
@@ -3140,6 +3527,31 @@ async function prepareMojoExplicitClose(
     );
     return { ok: false, error: 'mojo_cancel_failed', retryable: true, taskId: remoteId };
   }
+  try {
+    const committed = sessionStore.markMojoClosePrepared(
+      session.sessionId,
+      requestId,
+      remoteId,
+    );
+    session.mojoCloseJournal = committed.mojoCloseJournal;
+    session.riffParentTaskId = committed.riffParentTaskId;
+  } catch (err) {
+    // Cancellation is proven and cannot be rolled back. Keep the runtime proof
+    // prepared so the same daemon can publish it on retry; after a crash the
+    // durable `preparing` journal remains fenced for explicit reconciliation.
+    ds.remoteCloseState = { phase: 'prepared', requestId, taskId: remoteId };
+    logger.error(
+      `[${tag(ds)}] Workerless Mojo close proof persistence failed after cancellation: `
+      + `${err instanceof Error ? err.message : String(err)}`,
+    );
+    return {
+      ok: false,
+      error: 'mojo_durable_close_failed',
+      retryable: true,
+      taskId: remoteId,
+    };
+  }
+  ds.remoteCloseState = { phase: 'prepared', requestId, taskId: remoteId };
   // Deliberately does NOT clear the runtime lineage here. sessionStore commonly
   // holds the very same Session object, so an early clear is visible to the durable
   // save — and if that save then fails, the rollback has already lost the id it
@@ -3535,7 +3947,7 @@ export type CloseSessionResult =
   | ({
       ok: false;
       alreadyClosed: false;
-    } & Exclude<RiffClosePreparation, { ok: true }>);
+    } & Exclude<RemoteClosePreparation, { ok: true }>);
 
 /**
  * Close from a BACKGROUND path — one with no user surface to report to
@@ -3557,7 +3969,8 @@ export async function closeSessionForBackgroundCleanup(
   if (!result.ok) {
     logger.error(
       `[${tagId}] ${context}: close REFUSED (${result.error}); the row stays active `
-      + 'and its remote session may still be running',
+      + 'and its remote session may still be running'
+      + (result.taskId ? ` (remote ${result.taskId})` : ''),
     );
     return result;
   }
@@ -3576,12 +3989,6 @@ export async function closeSession(
 ): Promise<CloseSessionResult> {
   const ds = findActiveBySessionId(sessionId);
   const stored = sessionStore.getOwnedSession(sessionId);
-  // Prove fail-closed ZMX teardown before any registry/store mutation. Repo
-  // replacement paths reuse the same helper before their own state transition.
-  const teardownTarget = ds ?? stored;
-  if (teardownTarget) {
-    teardownAuthoritativePersistentBackingBeforeCloseImpl(teardownTarget, true);
-  }
   const closeFrozenBackendType = ds?.initConfig?.backendType
     ?? ds?.session.backendType ?? stored?.backendType;
   const isOwnedClose = !ds?.initConfig?.adoptMode
@@ -3589,6 +3996,25 @@ export async function closeSession(
     && !stored?.adoptedFrom;
   const isOwnedRiffClose = isOwnedClose && closeFrozenBackendType === 'riff';
   const isOwnedMojoClose = isOwnedClose && closeFrozenBackendType === 'mojo';
+  const closeJournal = ds?.session.mojoCloseJournal ?? stored?.mojoCloseJournal;
+  if (closeJournal && !isOwnedMojoClose) {
+    // Never let a Mojo cancellation journal silently disappear through another
+    // backend's ordinary close path. It may be corrupt metadata, but only an
+    // explicit reconciliation/repair may remove that fence.
+    return {
+      ok: false,
+      alreadyClosed: false,
+      error: 'mojo_close_reconciliation_required',
+      retryable: true,
+      ...(closeJournal.taskId ? { taskId: closeJournal.taskId } : {}),
+    };
+  }
+  // Prove fail-closed ZMX teardown before any registry/store mutation. Repo
+  // replacement paths reuse the same helper before their own state transition.
+  const teardownTarget = ds ?? stored;
+  if (teardownTarget) {
+    teardownAuthoritativePersistentBackingBeforeCloseImpl(teardownTarget, true);
+  }
   let killedLive = false;
   const hadLiveWorker = !!ds?.worker && !ds.worker.killed;
   const closeWorkerGeneration = ds ? closeFenceGeneration(ds) : undefined;
@@ -3610,7 +4036,7 @@ export async function closeSession(
   // row — publishing "closed" while the cancel is still in flight is how a failed
   // cancel became a silent leak. Other backends retain master's synchronous
   // state-transition path.
-  const prepared: RiffClosePreparation = isOwnedRiffClose
+  const prepared: RemoteClosePreparation = isOwnedRiffClose
     ? await prepareRiffExplicitClose(ds, stored)
     : isOwnedMojoClose
       ? await prepareMojoExplicitClose(ds, stored)
@@ -3624,8 +4050,8 @@ export async function closeSession(
   // NOTE: the residual is derived from the COMMITTED row at the end of this
   // function, not captured here — the store merges parked ids, so a value computed
   // before the transaction can disagree with what was actually persisted.
-  const preparedRiffRequestId = ds?.riffCloseState?.phase === 'prepared'
-    ? ds.riffCloseState.requestId
+  const preparedRemoteRequestId = ds?.remoteCloseState?.phase === 'prepared'
+    ? ds.remoteCloseState.requestId
     : undefined;
 
   // 会话关闭即可回收其崩溃重启计数；否则每个曾崩溃过的 session 会在 daemon
@@ -3659,9 +4085,23 @@ export async function closeSession(
           : {}),
       });
     } catch (err) {
+      if (isOwnedMojoClose
+          && (preparedRemoteRequestId || stored?.mojoCloseJournal?.phase === 'prepared')) {
+        logger.error(
+          `[${sessionId.slice(0, 8)}] Durable session close failed after Mojo cancel; `
+          + `retaining prepared commit: ${err instanceof Error ? err.message : String(err)}`,
+        );
+        return {
+          ok: false,
+          alreadyClosed: false,
+          error: 'mojo_durable_close_failed',
+          retryable: true,
+          ...(prepared.taskId ? { taskId: prepared.taskId } : {}),
+        };
+      }
       if (!isOwnedRiffClose) throw err;
-      if (ds && preparedRiffRequestId) {
-        await abortLiveRiffWorkerClose(ds, preparedRiffRequestId);
+      if (ds && preparedRemoteRequestId) {
+        await abortLiveRemoteWorkerClose(ds, preparedRemoteRequestId);
       }
       logger.error(
         `[${sessionId.slice(0, 8)}] Durable session close failed after Riff prepare; `
@@ -3682,17 +4122,22 @@ export async function closeSession(
       // Sync the parking back from the store's committed row. Only reached after a
       // SUCCESSFUL save, and skipped when the two are the same object anyway, so
       // the runtime view cannot end up carrying a park the disk does not have.
+      if (after && after !== ds.session) {
+        ds.session.mojoCloseJournal = after.mojoCloseJournal;
+        if (clearMojoLineage || prepared.parkMojoLineage) {
+          ds.session.riffParentTaskId = after.riffParentTaskId;
+        }
+      }
       if (prepared.parkMojoLineage && after && after !== ds.session) {
         ds.session.mojoQuarantinedLineage = after.mojoQuarantinedLineage;
         ds.session.mojoQuarantineNoticePending = after.mojoQuarantineNoticePending;
-        ds.session.riffParentTaskId = after.riffParentTaskId;
       }
     }
   }
 
   if (ds) {
     killWorker(ds, {
-      ...(preparedRiffRequestId ? { riffCloseCommitRequestId: preparedRiffRequestId } : {}),
+      ...(preparedRemoteRequestId ? { remoteCloseCommitRequestId: preparedRemoteRequestId } : {}),
       // The prepare above already proved this cancel; the durable row cleared the
       // lineage in the same transaction. Suppress the best-effort repeat.
       ...(clearMojoLineage ? { mojoCancelAlreadyProven: true } : {}),
@@ -5867,20 +6312,23 @@ export function sendWorkerInput(
     codexAppSteerable?: true;
   } = {},
 ): boolean {
-  const riffRetirementPhase = riffRetirementAdmissionPhase(ds);
-  if (riffRetirementPhase) {
+  const remoteRetirementPhase = remoteRetirementAdmissionPhase(ds);
+  if (remoteRetirementPhase) {
+    const remoteBackend = (ds.initConfig?.backendType ?? ds.session.backendType) === 'mojo'
+      ? 'Mojo'
+      : 'Riff';
     logger.warn(
-      `[${tag(ds)}] Rejected turn ${turnId ?? '?'} while Riff retirement fence is ${riffRetirementPhase}`,
+      `[${tag(ds)}] Rejected turn ${turnId ?? '?'} while ${remoteBackend} retirement fence is ${remoteRetirementPhase}`,
     );
     void callbacks?.sessionReply(
       sessionAnchorId(ds),
-      tr('worker.riff_close_in_progress', undefined, localeForBot(ds.larkAppId)),
+      tr('worker.remote_close_in_progress', { backend: remoteBackend }, localeForBot(ds.larkAppId)),
       'text',
       ds.larkAppId,
       turnId,
     ).catch(err => {
       logger.warn(
-        `[${tag(ds)}] Failed to notify rejected Riff close-race turn: `
+        `[${tag(ds)}] Failed to notify rejected remote close-race turn: `
         + `${err instanceof Error ? err.message : String(err)}`,
       );
     });
@@ -6500,6 +6948,37 @@ export function forkWorker(
   resumeOrTurnId: ForkResumeOrTurnId = false,
 ): boolean {
   const gatedPrompt = typeof promptInput === 'string' ? { content: promptInput } : promptInput;
+  const remoteRetirementPhase = remoteRetirementAdmissionPhase(ds);
+  if (remoteRetirementPhase) {
+    // A close/shutdown coordinator owns this exact remote generation. Never
+    // spawn a replacement behind its back: a fork can materialize the opening
+    // prompt before sendWorkerInput gets a chance to reject it. Route non-empty
+    // input through the ordinary fence solely for the user-visible warning.
+    if (gatedPrompt.content !== '') {
+      const gatedTurnId = typeof resumeOrTurnId === 'string'
+        ? resumeOrTurnId
+        : typeof resumeOrTurnId === 'object' && resumeOrTurnId !== null
+        ? resumeOrTurnId.turnId
+        : undefined;
+      const gatedDispatchAttempt = typeof resumeOrTurnId === 'object' && resumeOrTurnId !== null
+        ? resumeOrTurnId.dispatchAttempt
+        : undefined;
+      sendWorkerInput(ds, promptInput, gatedTurnId, {
+        ...(gatedDispatchAttempt !== undefined
+          ? { dispatchAttempt: gatedDispatchAttempt }
+          : {}),
+        ...(gatedPrompt.codexAppSteerable === true
+          ? { codexAppSteerable: true as const }
+          : {}),
+      });
+    }
+    logger.warn(
+      `[${tag(ds)}] Refused worker fork while remote retirement fence is ${remoteRetirementPhase}`,
+    );
+    // The request was handled by the retirement fence; false is reserved for
+    // tail-only quarantine promotion failures by this function's contract.
+    return true;
+  }
   const transferGate = transferInputGates.get(ds);
   if (transferGate && !transferReplacementForkBypass.has(ds)) {
     if (gatedPrompt.content !== '') {
@@ -7026,14 +7505,14 @@ export function forkWorker(
         reparkQueuedActivationFollowUpTail(ds, 'worker error during activation follow-up handoff');
       }
       const retainExactRetirementGeneration = ds.riffShutdownState !== undefined
-        || ds.riffCloseState !== undefined;
+        || ds.remoteCloseState !== undefined;
       if (!retainExactRetirementGeneration) {
         ds.worker = null;
         ds.workerPort = null;
         ds.workerToken = null;
         ds.workerViewToken = null;
         ds.managedTurnOrigin = undefined;
-        ds.riffCloseState = undefined;
+        ds.remoteCloseState = undefined;
       }
       // The retirement coordinator owns a prepared generation. Keep the exact
       // ChildProcess pointer until exit so it can decide whether abort/commit
@@ -8899,7 +9378,7 @@ function setupWorkerHandlers(
         // accounting and tell the user how to recover, rather than logging an
         // "auto-restart" whose IPC is guaranteed to be a no-op.
         if (isRiffBackendSession(ds)) {
-          const retirementPhase = riffRetirementAdmissionPhase(ds);
+          const retirementPhase = remoteRetirementAdmissionPhase(ds);
           logger.warn(
             `[${t}] Riff backend exited; automatic restart is unsupported`
             + (retirementPhase ? ` (${retirementPhase})` : ''),
@@ -9074,15 +9553,15 @@ function setupWorkerHandlers(
       }
 
       case 'close_result': {
-        const pending = pendingRiffWorkerCloses.get(msg.requestId);
+        const pending = pendingRemoteWorkerCloses.get(msg.requestId);
         if (!pending
           || pending.worker !== worker
           || pending.sessionId !== ds.session.sessionId
           || ds.worker !== worker) {
-          logger.warn(`[${t}] Ignored stale/unmatched Riff close result ${msg.requestId}`);
+          logger.warn(`[${t}] Ignored stale/unmatched remote close result ${msg.requestId}`);
           break;
         }
-        pendingRiffWorkerCloses.delete(msg.requestId);
+        pendingRemoteWorkerCloses.delete(msg.requestId);
         pending.resolve({
           ok: msg.ok,
           ...(msg.taskId ? { taskId: msg.taskId } : {}),
@@ -9776,8 +10255,8 @@ function setupWorkerHandlers(
       ds.workerToken = null;
       ds.workerViewToken = null;
       ds.managedTurnOrigin = undefined;
-      if (ds.riffCloseState) {
-        ds.riffCloseState = { ...ds.riffCloseState, phase: 'uncertain' };
+      if (ds.remoteCloseState) {
+        ds.remoteCloseState = { ...ds.remoteCloseState, phase: 'uncertain' };
       }
       // Do not clear riffShutdownState here. Only the shutdown coordinator can
       // release a generation after lineage persistence or admission restore.

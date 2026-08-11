@@ -138,18 +138,18 @@ export interface SessionBackend {
   onAccessUrl?(cb: (url: string) => void): void;
   /**
    * Remote-task turn boundary — backends that execute discrete remote tasks
-   * (riff) invoke this when the current task finishes or fails. The worker
+   * (Riff/Mojo) invoke this when the current task finishes or fails. The worker
    * uses it to re-arm prompt-ready and flush queued follow-up messages: remote
    * backends have no PTY output, so the idle detector never fires for them and
    * nothing else would ever mark the session ready again after a write.
    * Optional — local backends never implement it.
    */
   onTaskDone?(cb: () => void): void;
-  /** Remote-task id updates (riff) — the worker forwards these to the daemon
+  /** Remote-session lineage updates — the worker forwards these to the daemon
    *  so the follow-up lineage survives daemon restarts. `null` clears the
    *  persisted lineage (follow-up failed → next message starts fresh). */
   onTaskId?(cb: (taskId: string | null) => void): void;
-  /** Async-capable teardown: Riff returns a confirmed cancellation result so
+  /** Async-capable teardown: remote backends return a confirmed cancellation result so
    * daemon-driven explicit close can fence late create/follow-up races before
    * publishing the durable closed row. Local backends remain synchronous. */
   destroySession?(): void | Promise<void | SessionDestroyResult>;

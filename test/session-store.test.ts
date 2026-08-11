@@ -61,6 +61,11 @@ import {
   getSession,
   getOwnedSession,
   listSessions,
+  listSessionsStrict,
+  SessionStoreUnavailableError,
+  beginMojoCloseJournal,
+  markMojoClosePrepared,
+  finishMojoCloseAbort,
   closeSession,
   reactivateClosedSession,
   updateSession,
@@ -349,6 +354,49 @@ describe('listSessions()', () => {
   });
 });
 
+describe('listSessionsStrict()', () => {
+  it('returns a healthy empty projection when no store exists', () => {
+    expect(listSessionsStrict()).toEqual([]);
+  });
+
+  it('rejects a malformed store instead of treating it as safely empty', () => {
+    writeFileSync(join(tempDir, 'sessions.json'), '{not-json');
+    init();
+
+    // Preserve the compatibility reader for non-transactional callers.
+    expect(listSessions()).toEqual([]);
+    expect(() => listSessionsStrict()).toThrow(SessionStoreUnavailableError);
+    expect(() => listSessionsStrict()).toThrow(/session store is unavailable/i);
+  });
+
+  it('stays unhealthy until an explicit init reloads the repaired projection', () => {
+    const fp = join(tempDir, 'sessions.json');
+    writeFileSync(fp, '{not-json');
+    init();
+
+    expect(() => listSessionsStrict()).toThrow(SessionStoreUnavailableError);
+    writeFileSync(fp, '{}');
+    expect(() => listSessionsStrict()).toThrow(SessionStoreUnavailableError);
+
+    init();
+    expect(listSessionsStrict()).toEqual([]);
+  });
+
+  it('rejects a malformed legacy projection during per-bot migration', () => {
+    writeFileSync(join(tempDir, 'sessions.json'), '{broken-legacy');
+    init('app-A');
+
+    expect(() => listSessionsStrict()).toThrow(SessionStoreUnavailableError);
+  });
+
+  it('rejects a JSON value that is not a session-record projection', () => {
+    writeFileSync(join(tempDir, 'sessions.json'), '[]');
+    init();
+
+    expect(() => listSessionsStrict()).toThrow(/invalid sessions projection/i);
+  });
+});
+
 // ─── closeSession() ──────────────────────────────────────────────────────
 
 describe('closeSession()', () => {
@@ -474,6 +522,148 @@ describe('closeSession()', () => {
     expect(reloaded).toMatchObject({ status: 'active', riffParentTaskId: 'mojo-sid-retry' });
     expect(reloaded?.mojoQuarantinedLineage).toBeUndefined();
     expect(reloaded?.mojoQuarantineNoticePending).toBeUndefined();
+  });
+
+  it('journals Mojo prepare/proof and clears it atomically with close', () => {
+    const session = createSession('chat1', 'root1', 'Close Mojo Journal');
+    session.backendType = 'mojo';
+    session.riffParentTaskId = 'mojo-sid-journal';
+    updateSession(session);
+
+    beginMojoCloseJournal(session.sessionId, 'request-1', 'mojo-sid-journal');
+    expect(getSession(session.sessionId)?.mojoCloseJournal).toMatchObject({
+      phase: 'preparing',
+      requestId: 'request-1',
+    });
+    markMojoClosePrepared(session.sessionId, 'request-1', 'mojo-sid-journal');
+    expect(getSession(session.sessionId)?.mojoCloseJournal).toMatchObject({
+      phase: 'prepared',
+      taskId: 'mojo-sid-journal',
+    });
+
+    closeSession(session.sessionId, { clearRiffParentTaskId: true });
+    init();
+    expect(getSession(session.sessionId)).toMatchObject({ status: 'closed' });
+    expect(getSession(session.sessionId)?.riffParentTaskId).toBeUndefined();
+    expect(getSession(session.sessionId)?.mojoCloseJournal).toBeUndefined();
+  });
+
+  it('never accepts a Mojo close journal as authority for another backend', () => {
+    const session = createSession('chat1', 'root1', 'Non Mojo Journal');
+    session.backendType = 'riff';
+    session.riffParentTaskId = 'riff-task';
+    updateSession(session);
+
+    expect(() => beginMojoCloseJournal(
+      session.sessionId,
+      'request-1',
+      'riff-task',
+    )).toThrow(/non-Mojo session/);
+    expect(getSession(session.sessionId)).toMatchObject({
+      status: 'active',
+      backendType: 'riff',
+      riffParentTaskId: 'riff-task',
+    });
+    expect(getSession(session.sessionId)?.mojoCloseJournal).toBeUndefined();
+  });
+
+  it('keeps a prepared Mojo journal in memory and on disk when close commit fails', () => {
+    const session = createSession('chat1', 'root1', 'Close Mojo Journal Failure');
+    session.backendType = 'mojo';
+    session.riffParentTaskId = 'mojo-sid-journal';
+    updateSession(session);
+    beginMojoCloseJournal(session.sessionId, 'request-1', 'mojo-sid-journal');
+    markMojoClosePrepared(session.sessionId, 'request-1', 'mojo-sid-journal');
+    fsControl.failSessionWrite = true;
+
+    expect(() => closeSession(
+      session.sessionId,
+      { clearRiffParentTaskId: true },
+    )).toThrow(/simulated session repair write failure/);
+    expect(getSession(session.sessionId)).toMatchObject({
+      status: 'active',
+      riffParentTaskId: 'mojo-sid-journal',
+      mojoCloseJournal: { phase: 'prepared', requestId: 'request-1' },
+    });
+
+    fsControl.failSessionWrite = false;
+    init();
+    expect(getSession(session.sessionId)).toMatchObject({
+      status: 'active',
+      riffParentTaskId: 'mojo-sid-journal',
+      mojoCloseJournal: { phase: 'prepared', requestId: 'request-1' },
+    });
+  });
+
+  it('rolls back a failed journal transition without publishing false proof', () => {
+    const session = createSession('chat1', 'root1', 'Mojo Journal Transition Failure');
+    session.backendType = 'mojo';
+    session.riffParentTaskId = 'mojo-sid-journal';
+    updateSession(session);
+    beginMojoCloseJournal(session.sessionId, 'request-1', 'mojo-sid-journal');
+    fsControl.failSessionWrite = true;
+
+    expect(() => markMojoClosePrepared(
+      session.sessionId,
+      'request-1',
+      'mojo-sid-journal',
+    )).toThrow(/simulated session repair write failure/);
+    expect(getSession(session.sessionId)?.mojoCloseJournal).toMatchObject({
+      phase: 'preparing',
+      requestId: 'request-1',
+    });
+
+    fsControl.failSessionWrite = false;
+    init();
+    expect(getSession(session.sessionId)?.mojoCloseJournal).toMatchObject({
+      phase: 'preparing',
+      requestId: 'request-1',
+    });
+  });
+
+  it('never rewrites a prepared proof to a different remote lineage', () => {
+    const session = createSession('chat1', 'root1', 'Mojo Journal Lineage CAS');
+    session.backendType = 'mojo';
+    session.riffParentTaskId = 'mojo-original';
+    updateSession(session);
+    beginMojoCloseJournal(session.sessionId, 'request-1', 'mojo-original');
+
+    expect(() => markMojoClosePrepared(
+      session.sessionId,
+      'request-1',
+      'mojo-different',
+    )).toThrow(/journal lineage/);
+    expect(getSession(session.sessionId)).toMatchObject({
+      riffParentTaskId: 'mojo-original',
+      mojoCloseJournal: {
+        phase: 'preparing',
+        requestId: 'request-1',
+        taskId: 'mojo-original',
+      },
+    });
+  });
+
+  it('clears a failed prepare only after admission restore, otherwise persists uncertainty', () => {
+    const session = createSession('chat1', 'root1', 'Abort Mojo Journal');
+    session.backendType = 'mojo';
+    updateSession(session);
+
+    beginMojoCloseJournal(session.sessionId, 'request-1');
+    finishMojoCloseAbort(session.sessionId, 'request-1', {
+      admissionRestored: false,
+      taskId: 'mojo-late-id',
+    });
+    expect(getSession(session.sessionId)).toMatchObject({
+      riffParentTaskId: 'mojo-late-id',
+      mojoCloseJournal: { phase: 'uncertain', taskId: 'mojo-late-id' },
+    });
+
+    finishMojoCloseAbort(session.sessionId, 'request-1', {
+      admissionRestored: true,
+      taskId: 'mojo-late-id',
+    });
+    expect(getSession(session.sessionId)?.mojoCloseJournal).toBeUndefined();
+    expect(getSession(session.sessionId)?.riffParentTaskId).toBe('mojo-late-id');
   });
 
   it('should call deleteFrozenCards with the sessionId', () => {

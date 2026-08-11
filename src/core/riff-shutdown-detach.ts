@@ -330,10 +330,10 @@ export async function prepareRiffSessionForShutdown(
   if (frozenBackend !== 'riff') {
     return unfencedRefusal(ds, 'not_riff_backend');
   }
-  if (ds.riffCloseState || ds.riffShutdownState) {
+  if (ds.remoteCloseState || ds.riffShutdownState) {
     return unfencedRefusal(
       ds,
-      ds.riffCloseState ? 'explicit_close_in_progress' : 'shutdown_detach_in_progress',
+      ds.remoteCloseState ? 'explicit_close_in_progress' : 'shutdown_detach_in_progress',
     );
   }
   const daemonBlockerBeforePrepare = daemonInputBlocker(ds);

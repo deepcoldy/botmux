@@ -201,7 +201,7 @@ describe("crash-loop diagnostic terminal (daemon 'claude_exit' handler)", () => 
     const ds = makeDs('sid-riff-closing', worker);
     ds.session.cliId = 'riff';
     ds.session.backendType = 'riff';
-    ds.riffCloseState = {
+    ds.remoteCloseState = {
       phase: 'preparing',
       requestId: 'close-riff',
       taskId: 'task-riff',

@@ -25,26 +25,59 @@ describe('worker Riff retirement protocol', () => {
     expect(replacement).toBeGreaterThan(guardBreak);
   });
 
-  it('refuses request-less Riff close before destroy or process exit', () => {
+  it('routes explicit Mojo close through prepare/commit while retaining request-less lifecycle teardown', () => {
     const start = workerSource.indexOf("case 'close':");
     const end = workerSource.indexOf("case 'close_commit':", start);
     const close = workerSource.slice(start, end);
 
-    const riffBranch = close.indexOf("if (effectiveBackendType === 'riff')");
-    const requestlessGuard = close.indexOf('if (!msg.requestId)', riffBranch);
-    const refusal = close.indexOf('Refused unsafe request-less Riff close', requestlessGuard);
+    const remoteBranch = close.indexOf("if (effectiveBackendType === 'riff'\n          || (effectiveBackendType === 'mojo' && msg.requestId))");
+    const requestlessGuard = close.indexOf('if (!msg.requestId)', remoteBranch);
+    const refusal = close.indexOf('Refused unsafe request-less ${effectiveBackendType} close', requestlessGuard);
     const guardBreak = close.indexOf('break;', refusal);
+    const unsupported = close.indexOf("error: 'remote_close_unsupported'", guardBreak);
+    const preparedSuccess = close.indexOf(': { ok: true };', unsupported);
     const localDestroy = close.lastIndexOf('backend?.destroySession?.()');
     const localExit = close.lastIndexOf('process.exit(0)');
 
     expect(start).toBeGreaterThanOrEqual(0);
     expect(end).toBeGreaterThan(start);
-    expect(riffBranch).toBeGreaterThanOrEqual(0);
-    expect(requestlessGuard).toBeGreaterThan(riffBranch);
+    expect(remoteBranch).toBeGreaterThanOrEqual(0);
+    expect(requestlessGuard).toBeGreaterThan(remoteBranch);
     expect(refusal).toBeGreaterThan(requestlessGuard);
     expect(guardBreak).toBeGreaterThan(refusal);
+    expect(unsupported).toBeGreaterThan(guardBreak);
+    expect(preparedSuccess).toBeGreaterThan(unsupported);
     expect(localDestroy).toBeGreaterThan(guardBreak);
     expect(localExit).toBeGreaterThan(localDestroy);
+  });
+
+  it('refuses a replacement fork before materializing input while remote close owns the generation', () => {
+    const start = workerPoolSource.indexOf('export function forkWorker(');
+    const end = workerPoolSource.indexOf('\n  const transferGate = transferInputGates.get(ds);', start);
+    const forkAdmission = workerPoolSource.slice(start, end);
+
+    const fence = forkAdmission.indexOf('remoteRetirementAdmissionPhase(ds)');
+    const warning = forkAdmission.indexOf('sendWorkerInput(ds, promptInput', fence);
+    const refusal = forkAdmission.indexOf('Refused worker fork while remote retirement fence', warning);
+    const handled = forkAdmission.indexOf('return true;', refusal);
+
+    expect(start).toBeGreaterThanOrEqual(0);
+    expect(end).toBeGreaterThan(start);
+    expect(fence).toBeGreaterThanOrEqual(0);
+    expect(warning).toBeGreaterThan(fence);
+    expect(refusal).toBeGreaterThan(warning);
+    expect(handled).toBeGreaterThan(refusal);
+  });
+
+  it('waits out Mojo system/init plus CLI cancellation instead of applying the shorter Riff deadline', () => {
+    const start = workerPoolSource.indexOf('async function prepareLiveRemoteWorkerClose(');
+    const end = workerPoolSource.indexOf('\n/** Await remote cancellation for any Riff owner', start);
+    const prepare = workerPoolSource.slice(start, end);
+
+    expect(start).toBeGreaterThanOrEqual(0);
+    expect(end).toBeGreaterThan(start);
+    expect(workerPoolSource).toContain('MOJO_EXPLICIT_CLOSE_RESULT_TIMEOUT_MS');
+    expect(prepare).toContain("backendType === 'mojo'\n      ? MOJO_EXPLICIT_CLOSE_RESULT_TIMEOUT_MS\n      : 23_000");
   });
 
   it('refuses request-less Riff suspend before teardown or process exit', () => {
@@ -122,16 +155,16 @@ describe('worker Riff retirement protocol', () => {
     const errorHandler = workerPoolSource.slice(errorStart, errorEnd);
     expect(errorStart).toBeGreaterThanOrEqual(0);
     expect(errorHandler).toContain('ds.riffShutdownState !== undefined');
-    expect(errorHandler).toContain('|| ds.riffCloseState !== undefined');
+    expect(errorHandler).toContain('|| ds.remoteCloseState !== undefined');
     expect(errorHandler.indexOf('if (!retainExactRetirementGeneration)'))
-      .toBeLessThan(errorHandler.indexOf('ds.riffCloseState = undefined'));
+      .toBeLessThan(errorHandler.indexOf('ds.remoteCloseState = undefined'));
 
     const exitStart = workerPoolSource.indexOf("worker.on('exit', (code, signal) => {");
     const exitEnd = workerPoolSource.indexOf('\n  return worker;', exitStart);
     const exitHandler = workerPoolSource.slice(exitStart, exitEnd);
     expect(exitStart).toBeGreaterThanOrEqual(0);
     expect(exitHandler).toContain("phase: 'uncertain'");
-    expect(exitHandler).not.toContain('ds.riffCloseState = undefined');
+    expect(exitHandler).not.toContain('ds.remoteCloseState = undefined');
   });
 
   it('rejects Riff cwd and role switches before mutating persisted workingDir', () => {

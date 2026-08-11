@@ -217,6 +217,10 @@ import {
 } from './core/session-manager.js';
 import { triggerSessionTurn, reconcileIdempotencyLeasesOnBoot, convergeIdempotentAsyncTurnOnWorkerExit } from './core/trigger-session.js';
 import {
+  runIdempotencyFailClose,
+  runWithdrawAutoClose,
+} from './core/daemon-background-close.js';
+import {
   runDetachedBotTurnMutation,
   tryWithBotTurnMutation,
   withBotTurnAdmission,
@@ -20370,19 +20374,11 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       // status becomes `closed` → trigger-result resolves `failed` (soft terminal),
       // and resolveIdempotencyHit sees a not-live session on retry. This is the
       // observable fail-closed path the round-8 finding requires.
-      // A REFUSED close resolves normally with {ok:false} — it does not throw — so
-      // the catch alone would let us log "fail-closed" for a row that is still
-      // active. Only claim fail-closed once the close actually succeeded.
-      void closeSessionHelper(ds.session.sessionId).then((result) => {
-        if (!result.ok) {
-          logger.error(
-            `[idempotency] could NOT fail-close session ${ds.session.sessionId.slice(0, 8)} `
-            + `after exit-convergence write failure (${result.error}); the row stays active`,
-          );
-          return;
-        }
-        logger.error(`[idempotency] fail-closed session ${ds.session.sessionId.slice(0, 8)} after exit-convergence write failure`);
-      }).catch(() => { /* idempotent; already terminal-intent */ });
+      void runIdempotencyFailClose(
+        ds.session.sessionId,
+        closeSessionForBackgroundCleanup,
+        logger,
+      );
     }
   };
   // Initialise worker pool with daemon callbacks
@@ -20402,25 +20398,11 @@ export async function startDaemon(botIndex?: number): Promise<void> {
           logger.info(`[${sessionId.substring(0, 8)}] Withdraw auto-close deferred: Codex App FIFO became unsettled`);
           return false;
         }
-        const result = await closeSessionHelper(sessionId);
-        if (!result.ok) {
-          // Returned refusal, not a throw. Reporting success here would be the same
-          // false success the close contract exists to prevent — and it would
-          // resurface the moment the live-worker handshake starts refusing.
-          logger.error(
-            `[${sessionId.substring(0, 8)}] Withdraw auto-close REFUSED (${result.error}); `
-            + 'session retained',
-          );
-          return false;
-        }
-        if (result.outcome === 'closed_with_residual') {
-          logger.warn(
-            `[${sessionId.substring(0, 8)}] Withdraw auto-close: closed locally, but remote `
-            + `session ${result.residual.taskId} was NOT cancelled; manual cleanup required`,
-          );
-        }
-        logger.info(`[${sessionId.substring(0, 8)}] Session auto-closed (message withdrawn)`);
-        return true;
+        return runWithdrawAutoClose(
+          sessionId,
+          closeSessionForBackgroundCleanup,
+          logger,
+        );
       }).catch((err) => {
         logger.warn(
           `[${sessionId.substring(0, 8)}] Withdraw auto-close mutation failed; session retained: `

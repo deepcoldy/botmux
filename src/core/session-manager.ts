@@ -550,18 +550,15 @@ export async function closeSessionsForAgentSwitch(
   // route already reads this same list for its protected preflight.
   let storedRows: Session[] = [];
   try {
-    storedRows = sessionStore.listSessions().filter(row =>
+    storedRows = sessionStore.listSessionsStrict().filter(row =>
       row.status === 'active'
       && (row.larkAppId === larkAppId || !row.larkAppId)
       && !seen.has(row.sessionId),
     );
   } catch (err) {
-    // Narrow on purpose: this only catches an error that listSessions() actually
-    // THROWS. It is NOT full fail-closed on store health — session-store's load()
-    // catches a read/parse failure itself, logs it and yields an empty Map, so a
-    // corrupt or unreadable file reaches us as "no durable rows" and this branch
-    // never runs. Closing that hole needs a health-aware store API; until then the
-    // durable pass is best-effort against an unreadable store.
+    // The strict projection turns a swallowed read/parse failure into a hard
+    // transaction refusal. An unreadable store must never mean "no old-agent
+    // rows" at the config commit gate.
     out.failed++;
     out.ok = false;
     logger.error(
@@ -1844,6 +1841,74 @@ export async function restoreActiveSessions(
     // pairing a lineage created on one tenant with another. Idempotent and cheap
     // for non-mojo rows.
     freezeMojoIdentityForSession(session, session.larkAppId ?? getAllBots()[0]?.config.larkAppId ?? '');
+
+    if (session.mojoCloseJournal
+        && !sessionStore.isValidMojoCloseJournal(session.mojoCloseJournal)) {
+      // Session JSON is a runtime boundary. A forged/truncated `prepared` object
+      // must not become proof that cancellation happened merely because the TS
+      // interface says its fields exist.
+      quarantineUnregisteredRestoreSession(session, 'mojo_close_journal_malformed');
+      continue;
+    }
+    if (session.mojoCloseJournal && session.backendType !== 'mojo') {
+      // A Mojo close proof on another backend is corrupt metadata, not authority
+      // to close that backend's row. Fence it for operator inspection; never let
+      // an untyped JSON field become a cross-backend teardown primitive.
+      session.mojoCloseJournal = {
+        ...session.mojoCloseJournal,
+        phase: 'uncertain',
+        updatedAt: new Date().toISOString(),
+      };
+      quarantineUnregisteredRestoreSession(session, 'mojo_close_journal_backend_mismatch');
+      continue;
+    }
+    if (session.mojoCloseJournal?.phase === 'prepared') {
+      if (session.mojoQuarantinedLineage) {
+        // The active lineage is proven gone, but an older PARKED lineage still
+        // needs a user-visible manual-cleanup warning. Auto-closing during boot
+        // has no reply surface and would strand the pending notice on a row that
+        // can never accept another turn. Keep the prepared row quarantined until
+        // an explicit close can return closed_with_residual to its caller.
+        quarantineUnregisteredRestoreSession(session, 'mojo_prepared_close_has_residual');
+        continue;
+      }
+      // The previous daemon durably recorded irreversible cancellation before it
+      // crashed. Complete only the local close; closeSession recognizes the
+      // prepared journal and never calls Mojo cancellation again.
+      try {
+        const recoveredClose = await closeSession(session.sessionId);
+        if (recoveredClose.ok) {
+          logger.info(
+            `[${session.sessionId.substring(0, 8)}] Recovered prepared Mojo close without re-cancelling`,
+          );
+          continue;
+        }
+        logger.error(
+          `[${session.sessionId.substring(0, 8)}] Prepared Mojo close recovery was refused: `
+          + `${recoveredClose.error}`,
+        );
+      } catch (err) {
+        logger.error(
+          `[${session.sessionId.substring(0, 8)}] Prepared Mojo close recovery failed: `
+          + `${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+      quarantineUnregisteredRestoreSession(session, 'mojo_prepared_close_commit_failed');
+      continue;
+    }
+    if (session.mojoCloseJournal) {
+      // A crash while the worker cancel was in flight cannot be classified as
+      // cancelled or safely resumable without a real remote status oracle. Turn
+      // the durable intent into an explicit uncertainty fence and reserve the
+      // routing anchor; never auto-cancel or launch a replacement generation.
+      session.mojoCloseJournal = {
+        ...session.mojoCloseJournal,
+        phase: 'uncertain',
+        updatedAt: new Date().toISOString(),
+      };
+      quarantineUnregisteredRestoreSession(session, 'mojo_close_reconciliation_required');
+      continue;
+    }
 
     // Restored sessions persisted before the scope field was added default to
     // 'thread' — that matches the legacy thread-only behaviour.

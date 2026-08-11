@@ -649,6 +649,35 @@ describe('Card integration: full event flow', () => {
       expect(deps.sessionReply).not.toHaveBeenCalled();
     });
 
+    it('close refusal reports the remote id and does not send a closed card', async () => {
+      const clientMod = await import('../src/im/lark/client.js');
+      const ds = makeDaemonSession();
+      const sessions = new Map<string, DaemonSession>();
+      sessions.set(activeSessionKey(ds), ds);
+      const deps = makeDeps(sessions);
+      vi.mocked(closeWorkerSession).mockResolvedValueOnce({
+        ok: false,
+        alreadyClosed: false,
+        error: 'mojo_close_reconciliation_required',
+        retryable: true,
+        taskId: 'mojo-uncertain-9',
+      } as never);
+
+      const result = await handleCardAction(
+        makeCloseEvent(ROOT_ID, 'ou_user', undefined, ds.session.sessionId),
+        deps,
+        APP_ID,
+      );
+
+      expect(result?.toast).toEqual(expect.objectContaining({
+        type: 'warning',
+        content: expect.stringContaining('mojo-uncertain-9'),
+      }));
+      expect(result?.toast?.content).toContain('mojo_close_reconciliation_required');
+      expect(vi.mocked(clientMod.sendEphemeralCard)).not.toHaveBeenCalled();
+      expect(deps.sessionReply).not.toHaveBeenCalled();
+    });
+
     it('close in private mode sends the closed card ephemeral to owners, not the group', async () => {
       const clientMod = await import('../src/im/lark/client.js');
       const botRegMod = await import('../src/bot-registry.js');

@@ -308,6 +308,24 @@ export interface Session {
   /** riff：最近一个任务 id（follow-up 血缘锚点）。持久化后 daemon 重启的下一条
    *  消息仍走 task-follow-up 延续沙箱与上下文，而非冷启新任务。 */
   riffParentTaskId?: string;
+  /**
+   * Crash journal for an explicit Mojo remote close.
+   *
+   * `preparing` is persisted BEFORE the worker is asked to cancel, so a daemon
+   * crash can never make an in-flight/possibly-completed cancellation look like
+   * an ordinary resumable session. `prepared` means the worker proved the remote
+   * session gone and a restart may finish only the durable local close. An
+   * interrupted `preparing` journal is treated as `uncertain` on restore and
+   * stays fenced pending explicit reconciliation; it is never auto-cancelled.
+   *
+   * No credential or control-plane secret is stored here.
+   */
+  mojoCloseJournal?: {
+    phase: 'preparing' | 'prepared' | 'uncertain';
+    requestId: string;
+    taskId?: string;
+    updatedAt: string;
+  };
   /** riff 多仓 stamp：多仓 worktree 流按用户选择顺序创建的 worktree 目录列表。
    *  仅该 stamp 存在时 riff 才做多仓推导（首仓=primary）；普通非 git 工作目录
    *  绝不扫描子目录乱带仓库。任何其它选仓路径都会清除本 stamp。 */

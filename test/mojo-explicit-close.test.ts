@@ -16,7 +16,11 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { activeSessionKey, type DaemonSession } from '../src/core/types.js';
+import {
+  activeSessionKey,
+  remoteRetirementAdmissionPhase,
+  type DaemonSession,
+} from '../src/core/types.js';
 
 const { getBotMock, cancelMojoMock } = vi.hoisted(() => ({
   getBotMock: vi.fn(),
@@ -68,16 +72,21 @@ import {
   __testOnly_setupWorkerHandlers,
   closeSession,
   closeSessionForBackgroundCleanup,
+  forkWorker,
   initWorkerPool,
+  sendWorkerInput,
   setActiveSessionsRegistry,
 } from '../src/core/worker-pool.js';
 import * as sessionStore from '../src/services/session-store.js';
 
 let dataDir: string;
 let previousDataDir: string;
+const sessionReplyMock = vi.fn(async () => 'om_reply');
 
 function createFixture(options: {
   liveWorker?: boolean;
+  closeOk?: boolean;
+  resultTaskId?: string;
   /** Omit the frozen identity so the lineage reads as quarantined. */
   legacyUnfrozen?: boolean;
   /** Restore-time quarantine PARKS the id here and clears the active slot. */
@@ -105,13 +114,32 @@ function createFixture(options: {
     worker.exitCode = null;
     worker.signalCode = null;
     worker.kill = vi.fn();
-    // A real worker exits after handling {type:'close'}; closeSession waits for it.
+    // Remote close is prepare/commit: only the matching commit retires the
+    // worker after the daemon has durably closed the row.
     worker.send = vi.fn((message: any) => {
-      if (message.type !== 'close') return;
-      queueMicrotask(() => {
-        worker.exitCode = 0;
-        worker.emit('exit', 0, null);
-      });
+      if (message.type === 'close_commit') {
+        queueMicrotask(() => {
+          worker.exitCode = 0;
+          worker.emit('exit', 0, null);
+        });
+        return;
+      }
+      if (message.type === 'close_abort') {
+        queueMicrotask(() => worker.emit('message', {
+          type: 'close_abort_result',
+          requestId: message.requestId,
+          ok: true,
+        }));
+        return;
+      }
+      if (message.type !== 'close' || !message.requestId) return;
+      queueMicrotask(() => worker.emit('message', {
+        type: 'close_result',
+        requestId: message.requestId,
+        ok: options.closeOk ?? true,
+        taskId: options.resultTaskId ?? 'mojo-sid-123',
+        ...((options.closeOk ?? true) ? {} : { error: 'mojo cancel HTTP 500' }),
+      }));
     });
   }
 
@@ -141,7 +169,7 @@ beforeEach(() => {
   });
   cancelMojoMock.mockResolvedValue({ kind: 'cancelled' });
   initWorkerPool({
-    sessionReply: vi.fn(async () => 'om_reply'),
+    sessionReply: sessionReplyMock,
     getSessionWorkingDir: () => '/repo',
     getActiveCount: () => 1,
     closeSession: vi.fn(),
@@ -170,7 +198,29 @@ describe('mojo explicit close', () => {
     const after = sessionStore.getSession(fixture.session.sessionId);
     expect(after).toMatchObject({ status: 'closed' });
     expect(after?.riffParentTaskId).toBeUndefined();
+    expect(after?.mojoCloseJournal).toBeUndefined();
+    expect(fixture.ds.remoteCloseState).toBeUndefined();
     expect(fixture.registry.size).toBe(0);
+  });
+
+  it('does not start a workerless cancel when its durable intent cannot be written', async () => {
+    const fixture = createFixture();
+    vi.spyOn(sessionStore, 'beginMojoCloseJournal')
+      .mockImplementationOnce(() => { throw new Error('journal disk full'); });
+
+    expect(await closeSession(fixture.session.sessionId)).toEqual({
+      ok: false,
+      alreadyClosed: false,
+      error: 'mojo_durable_close_failed',
+      retryable: true,
+      taskId: 'mojo-sid-123',
+    });
+    expect(cancelMojoMock).not.toHaveBeenCalled();
+    expect(sessionStore.getSession(fixture.session.sessionId)).toMatchObject({
+      status: 'active',
+      riffParentTaskId: 'mojo-sid-123',
+    });
+    expect(sessionStore.getSession(fixture.session.sessionId)?.mojoCloseJournal).toBeUndefined();
   });
 
   it('does NOT report success when the cancel fails; row and lineage survive', async () => {
@@ -191,7 +241,37 @@ describe('mojo explicit close', () => {
     // Lineage retained so the SAME close can be retried — and because the row is
     // still open, the session is still in the registry for that retry to find.
     expect(after?.riffParentTaskId).toBe('mojo-sid-123');
+    expect(after?.mojoCloseJournal).toBeUndefined();
+    expect(fixture.ds.remoteCloseState).toBeUndefined();
     expect(fixture.registry.size).toBe(1);
+  });
+
+  it('retries a workerless abort commit before issuing another cancel', async () => {
+    cancelMojoMock.mockResolvedValue({ kind: 'failed', message: 'HTTP 500', retryable: true });
+    const fixture = createFixture();
+    const realFinish = sessionStore.finishMojoCloseAbort;
+    vi.spyOn(sessionStore, 'finishMojoCloseAbort')
+      .mockImplementationOnce(() => { throw new Error('abort journal disk full'); })
+      .mockImplementation((...args) => realFinish(...args));
+
+    expect(await closeSession(fixture.session.sessionId)).toMatchObject({
+      ok: false,
+      error: 'mojo_durable_close_failed',
+      taskId: 'mojo-sid-123',
+    });
+    expect(fixture.ds.remoteCloseState).toMatchObject({ phase: 'abort_restored' });
+    expect(sessionStore.getSession(fixture.session.sessionId)?.mojoCloseJournal).toMatchObject({
+      phase: 'preparing',
+    });
+    expect(cancelMojoMock).toHaveBeenCalledTimes(1);
+
+    expect(await closeSession(fixture.session.sessionId)).toMatchObject({
+      ok: false,
+      error: 'mojo_cancel_failed',
+    });
+    expect(cancelMojoMock).toHaveBeenCalledTimes(2);
+    expect(fixture.ds.remoteCloseState).toBeUndefined();
+    expect(sessionStore.getSession(fixture.session.sessionId)?.mojoCloseJournal).toBeUndefined();
   });
 
   it('a retry after a failed cancel actually reaches the cancel again', async () => {
@@ -219,6 +299,83 @@ describe('mojo explicit close', () => {
     const fixture = createFixture();
     await closeSession(fixture.session.sessionId);
     expect(cancelMojoMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('retries only the local durable commit after a workerless cancel succeeds', async () => {
+    const fixture = createFixture();
+    const realClose = sessionStore.closeSession;
+    vi.spyOn(sessionStore, 'closeSession')
+      .mockImplementationOnce(() => { throw new Error('disk full'); })
+      .mockImplementation((...args) => realClose(...args));
+
+    expect(await closeSession(fixture.session.sessionId)).toEqual({
+      ok: false,
+      alreadyClosed: false,
+      error: 'mojo_durable_close_failed',
+      retryable: true,
+      taskId: 'mojo-sid-123',
+    });
+    expect(cancelMojoMock).toHaveBeenCalledTimes(1);
+    expect(fixture.ds.remoteCloseState).toMatchObject({ phase: 'prepared' });
+    expect(sessionStore.getSession(fixture.session.sessionId)?.mojoCloseJournal).toMatchObject({
+      phase: 'prepared',
+      taskId: 'mojo-sid-123',
+    });
+
+    expect((await closeSession(fixture.session.sessionId)).ok).toBe(true);
+    expect(cancelMojoMock).toHaveBeenCalledTimes(1);
+    expect(fixture.ds.remoteCloseState).toBeUndefined();
+    expect(sessionStore.getSession(fixture.session.sessionId)?.mojoCloseJournal).toBeUndefined();
+  });
+
+  it('re-publishes a workerless cancellation proof without cancelling twice', async () => {
+    const fixture = createFixture();
+    const realPrepare = sessionStore.markMojoClosePrepared;
+    vi.spyOn(sessionStore, 'markMojoClosePrepared')
+      .mockImplementationOnce(() => { throw new Error('proof disk full'); })
+      .mockImplementation((...args) => realPrepare(...args));
+
+    expect(await closeSession(fixture.session.sessionId)).toMatchObject({
+      ok: false,
+      error: 'mojo_durable_close_failed',
+      taskId: 'mojo-sid-123',
+    });
+    expect(cancelMojoMock).toHaveBeenCalledTimes(1);
+    expect(fixture.ds.remoteCloseState).toMatchObject({ phase: 'prepared' });
+    expect(sessionStore.getSession(fixture.session.sessionId)?.mojoCloseJournal).toMatchObject({
+      phase: 'preparing',
+    });
+
+    expect((await closeSession(fixture.session.sessionId)).ok).toBe(true);
+    expect(cancelMojoMock).toHaveBeenCalledTimes(1);
+    expect(sessionStore.getSession(fixture.session.sessionId)?.mojoCloseJournal).toBeUndefined();
+  });
+
+  it('recovers a workerless prepared close after daemon loss without cancelling again', async () => {
+    const fixture = createFixture();
+    const realClose = sessionStore.closeSession;
+    vi.spyOn(sessionStore, 'closeSession')
+      .mockImplementationOnce(() => { throw new Error('disk full'); })
+      .mockImplementation((...args) => realClose(...args));
+
+    expect((await closeSession(fixture.session.sessionId)).ok).toBe(false);
+    expect(cancelMojoMock).toHaveBeenCalledTimes(1);
+    expect(sessionStore.getSession(fixture.session.sessionId)?.mojoCloseJournal).toMatchObject({
+      phase: 'prepared',
+    });
+
+    // Lose every runtime-only proof and reload the row exactly as a new daemon.
+    fixture.ds.remoteCloseState = undefined;
+    setActiveSessionsRegistry(new Map());
+    sessionStore.init('app');
+
+    expect(await closeSession(fixture.session.sessionId)).toMatchObject({
+      ok: true,
+      outcome: 'closed',
+    });
+    expect(cancelMojoMock).toHaveBeenCalledTimes(1);
+    expect(sessionStore.getSession(fixture.session.sessionId)).toMatchObject({ status: 'closed' });
+    expect(sessionStore.getSession(fixture.session.sessionId)?.mojoCloseJournal).toBeUndefined();
   });
 
   it('never cancels a quarantined lineage: closes, but as an explicit residual', async () => {
@@ -281,15 +438,414 @@ describe('mojo explicit close', () => {
     expect(sessionStore.getSession(fixture.session.sessionId)?.status).not.toBe('closed');
   });
 
-  it('leaves cancellation to the worker when one is live', async () => {
-    // The `close` IPC makes the worker run MojoBackend.destroySession(), which
-    // awaits the cancel on its own side AND waits out the pre-init window the
-    // daemon cannot observe. A daemon-side cancel here would race it.
+  it('commits a live-worker cancellation only after its prepare result', async () => {
     const fixture = createFixture({ liveWorker: true });
 
-    expect((await closeSession(fixture.session.sessionId)).ok).toBe(true);
+    expect(await closeSession(fixture.session.sessionId)).toEqual({
+      ok: true,
+      outcome: 'closed',
+      alreadyClosed: false,
+      known: true,
+    });
     expect(cancelMojoMock).not.toHaveBeenCalled();
+    expect(fixture.worker.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'close',
+      requestId: expect.any(String),
+    }));
+    expect(fixture.worker.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'close_commit',
+      requestId: expect.any(String),
+    }));
+    expect(sessionStore.getSession(fixture.session.sessionId)?.mojoCloseJournal).toBeUndefined();
+  });
+
+  it('does not send the cancel when the durable preparing journal cannot be written', async () => {
+    const fixture = createFixture({ liveWorker: true });
+    vi.spyOn(sessionStore, 'beginMojoCloseJournal')
+      .mockImplementationOnce(() => { throw new Error('journal disk full'); });
+
+    expect(await closeSession(fixture.session.sessionId)).toEqual({
+      ok: false,
+      alreadyClosed: false,
+      error: 'mojo_durable_close_failed',
+      retryable: true,
+      taskId: 'mojo-sid-123',
+    });
+    expect(fixture.worker.send).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'close' }));
+    expect(sessionStore.getSession(fixture.session.sessionId)).toMatchObject({ status: 'active' });
+    expect(sessionStore.getSession(fixture.session.sessionId)?.mojoCloseJournal).toBeUndefined();
+  });
+
+  it('keeps a live session active when worker-side cancellation is not proven', async () => {
+    const fixture = createFixture({ liveWorker: true, closeOk: false });
+
+    expect(await closeSession(fixture.session.sessionId)).toEqual({
+      ok: false,
+      alreadyClosed: false,
+      error: 'mojo_cancel_failed',
+      retryable: true,
+      taskId: 'mojo-sid-123',
+    });
+    expect(fixture.worker.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'close_abort',
+      requestId: expect.any(String),
+    }));
+    expect(sessionStore.getSession(fixture.session.sessionId)).toMatchObject({
+      status: 'active',
+      riffParentTaskId: 'mojo-sid-123',
+    });
+  });
+
+  it('retries a durable abort commit after worker admission was already restored', async () => {
+    const fixture = createFixture({ liveWorker: true, closeOk: false });
+    const realFinish = sessionStore.finishMojoCloseAbort;
+    vi.spyOn(sessionStore, 'finishMojoCloseAbort')
+      .mockImplementationOnce(() => { throw new Error('abort journal disk full'); })
+      .mockImplementation((...args) => realFinish(...args));
+
+    expect(await closeSession(fixture.session.sessionId)).toMatchObject({
+      ok: false,
+      error: 'mojo_durable_close_failed',
+    });
+    expect(fixture.ds.remoteCloseState).toMatchObject({ phase: 'abort_restored' });
+    expect(sessionStore.getSession(fixture.session.sessionId)?.mojoCloseJournal).toMatchObject({
+      phase: 'preparing',
+    });
+    expect(sendWorkerInput(fixture.ds, 'must stay fenced', 'om_abort_commit_pending')).toBe(false);
+
+    expect(await closeSession(fixture.session.sessionId)).toMatchObject({
+      ok: false,
+      error: 'mojo_cancel_failed',
+    });
+    const sends = vi.mocked(fixture.worker.send).mock.calls.map(call => call[0]?.type);
+    expect(sends.filter(type => type === 'close')).toHaveLength(2);
+    expect(sends.filter(type => type === 'close_abort')).toHaveLength(2);
+    expect(fixture.ds.remoteCloseState).toBeUndefined();
+    expect(sessionStore.getSession(fixture.session.sessionId)?.mojoCloseJournal).toBeUndefined();
+    expect(sessionStore.getSession(fixture.session.sessionId)?.status).toBe('active');
+  });
+
+  it('uses the worker result when pre-init lineage was not durable yet', async () => {
+    const fixture = createFixture({
+      liveWorker: true,
+      noActiveLineage: true,
+      resultTaskId: 'mojo-from-system-init',
+    });
+
+    expect(await closeSession(fixture.session.sessionId)).toMatchObject({
+      ok: true,
+      outcome: 'closed',
+    });
     expect(fixture.worker.send).toHaveBeenCalledWith(expect.objectContaining({ type: 'close' }));
+    expect(sessionStore.getSession(fixture.session.sessionId)).toMatchObject({ status: 'closed' });
+    expect(sessionStore.getSession(fixture.session.sessionId)?.riffParentTaskId).toBeUndefined();
+  });
+
+  it('retries only the durable commit after irreversible live cancellation', async () => {
+    const fixture = createFixture({ liveWorker: true });
+    const realClose = sessionStore.closeSession;
+    const closeSpy = vi.spyOn(sessionStore, 'closeSession')
+      .mockImplementationOnce(() => { throw new Error('disk full'); })
+      .mockImplementation((...args) => realClose(...args));
+
+    expect(await closeSession(fixture.session.sessionId)).toEqual({
+      ok: false,
+      alreadyClosed: false,
+      error: 'mojo_durable_close_failed',
+      retryable: true,
+      taskId: 'mojo-sid-123',
+    });
+    expect(fixture.worker.send).not.toHaveBeenCalledWith(expect.objectContaining({
+      type: 'close_abort',
+    }));
+    expect(sessionStore.getSession(fixture.session.sessionId)?.status).toBe('active');
+    expect(sessionStore.getSession(fixture.session.sessionId)?.mojoCloseJournal).toMatchObject({
+      phase: 'prepared',
+      taskId: 'mojo-sid-123',
+    });
+    expect(sendWorkerInput(fixture.ds, 'must stay fenced', 'om_after_cancel')).toBe(false);
+    await new Promise(resolve => setImmediate(resolve));
+    expect(sessionReplyMock).toHaveBeenCalledWith(
+      'oc_mojo',
+      expect.stringMatching(/Mojo.*正在关闭/),
+      'text',
+      'app',
+      'om_after_cancel',
+    );
+
+    expect((await closeSession(fixture.session.sessionId)).ok).toBe(true);
+    const sends = vi.mocked(fixture.worker.send).mock.calls.map(call => call[0]?.type);
+    expect(sends.filter(type => type === 'close')).toHaveLength(1);
+    expect(sends.filter(type => type === 'close_commit')).toHaveLength(1);
+    expect(closeSpy).toHaveBeenCalledTimes(2);
+    expect(sessionStore.getSession(fixture.session.sessionId)?.mojoCloseJournal).toBeUndefined();
+  });
+
+  it('recovers a durable prepared close after daemon loss without cancelling again', async () => {
+    const fixture = createFixture({ liveWorker: true });
+    const realClose = sessionStore.closeSession;
+    vi.spyOn(sessionStore, 'closeSession')
+      .mockImplementationOnce(() => { throw new Error('disk full'); })
+      .mockImplementation((...args) => realClose(...args));
+
+    expect((await closeSession(fixture.session.sessionId)).ok).toBe(false);
+    expect(sessionStore.getSession(fixture.session.sessionId)?.mojoCloseJournal).toMatchObject({
+      phase: 'prepared',
+      taskId: 'mojo-sid-123',
+    });
+
+    // Simulate a daemon restart: the exact ChildProcess/runtime proof is gone;
+    // only the durable active row and its journal survive.
+    fixture.worker.killed = true;
+    fixture.ds.remoteCloseState = undefined;
+    setActiveSessionsRegistry(new Map());
+    sessionStore.init('app');
+
+    expect(await closeSession(fixture.session.sessionId)).toMatchObject({
+      ok: true,
+      outcome: 'closed',
+    });
+    const sends = vi.mocked(fixture.worker.send).mock.calls.map(call => call[0]?.type);
+    expect(sends.filter(type => type === 'close')).toHaveLength(1);
+    expect(sends.filter(type => type === 'close_commit')).toHaveLength(0);
+    expect(cancelMojoMock).not.toHaveBeenCalled();
+    expect(sessionStore.getSession(fixture.session.sessionId)).toMatchObject({ status: 'closed' });
+    expect(sessionStore.getSession(fixture.session.sessionId)?.riffParentTaskId).toBeUndefined();
+    expect(sessionStore.getSession(fixture.session.sessionId)?.mojoCloseJournal).toBeUndefined();
+  });
+
+  it('does not re-cancel when persisting a pre-init result lineage fails', async () => {
+    const fixture = createFixture({
+      liveWorker: true,
+      noActiveLineage: true,
+      resultTaskId: 'mojo-from-system-init',
+    });
+    const realPrepare = sessionStore.markMojoClosePrepared;
+    vi.spyOn(sessionStore, 'markMojoClosePrepared')
+      .mockImplementationOnce(() => { throw new Error('lineage disk full'); })
+      .mockImplementation((...args) => realPrepare(...args));
+
+    expect(await closeSession(fixture.session.sessionId)).toEqual({
+      ok: false,
+      alreadyClosed: false,
+      error: 'mojo_durable_close_failed',
+      retryable: true,
+      taskId: 'mojo-from-system-init',
+    });
+    expect(fixture.worker.send).not.toHaveBeenCalledWith(expect.objectContaining({
+      type: 'close_abort',
+    }));
+    expect(sessionStore.getSession(fixture.session.sessionId)?.mojoCloseJournal).toMatchObject({
+      phase: 'preparing',
+    });
+
+    expect((await closeSession(fixture.session.sessionId)).ok).toBe(true);
+    const sends = vi.mocked(fixture.worker.send).mock.calls.map(call => call[0]?.type);
+    expect(sends.filter(type => type === 'close')).toHaveLength(1);
+    expect(sends.filter(type => type === 'close_commit')).toHaveLength(1);
+  });
+
+  it('refuses an interrupted durable prepare instead of resuming or re-cancelling it', async () => {
+    const fixture = createFixture();
+    sessionStore.beginMojoCloseJournal(
+      fixture.session.sessionId,
+      'crashed-close-request',
+      'mojo-sid-123',
+    );
+    setActiveSessionsRegistry(new Map());
+    sessionStore.init('app');
+
+    expect(await closeSession(fixture.session.sessionId)).toEqual({
+      ok: false,
+      alreadyClosed: false,
+      error: 'mojo_close_reconciliation_required',
+      retryable: true,
+      taskId: 'mojo-sid-123',
+    });
+    expect(cancelMojoMock).not.toHaveBeenCalled();
+    expect(sessionStore.getSession(fixture.session.sessionId)).toMatchObject({
+      status: 'active',
+      mojoCloseJournal: { phase: 'preparing', requestId: 'crashed-close-request' },
+    });
+  });
+
+  it('does not accept a malformed prepared journal as cancellation proof', async () => {
+    const fixture = createFixture();
+    fixture.session.mojoCloseJournal = {
+      phase: 'prepared',
+      requestId: '',
+      taskId: 'mojo-sid-123',
+      updatedAt: '',
+    };
+    sessionStore.updateSession(fixture.session);
+
+    expect(await closeSession(fixture.session.sessionId)).toEqual({
+      ok: false,
+      alreadyClosed: false,
+      error: 'mojo_close_reconciliation_required',
+      retryable: true,
+      taskId: 'mojo-sid-123',
+    });
+    expect(cancelMojoMock).not.toHaveBeenCalled();
+    expect(sessionStore.getSession(fixture.session.sessionId)).toMatchObject({ status: 'active' });
+  });
+
+  it('does not accept a prepared journal that exists only on a detached runtime copy', async () => {
+    const fixture = createFixture();
+    (fixture.ds as unknown as { session: typeof fixture.session }).session = {
+      ...fixture.session,
+      mojoCloseJournal: {
+        phase: 'prepared',
+        requestId: 'runtime-only-proof',
+        taskId: 'mojo-sid-123',
+        updatedAt: new Date().toISOString(),
+      },
+    };
+
+    expect(await closeSession(fixture.session.sessionId)).toEqual({
+      ok: false,
+      alreadyClosed: false,
+      error: 'mojo_close_reconciliation_required',
+      retryable: true,
+      taskId: 'mojo-sid-123',
+    });
+    expect(cancelMojoMock).not.toHaveBeenCalled();
+    expect(sessionStore.getSession(fixture.session.sessionId)).toMatchObject({ status: 'active' });
+    expect(sessionStore.getSession(fixture.session.sessionId)?.mojoCloseJournal).toBeUndefined();
+  });
+
+  it('does not re-cancel a durable prepared proof missed by a detached runtime copy', async () => {
+    const fixture = createFixture();
+    sessionStore.beginMojoCloseJournal(
+      fixture.session.sessionId,
+      'durable-only-proof',
+      'mojo-sid-123',
+    );
+    sessionStore.markMojoClosePrepared(
+      fixture.session.sessionId,
+      'durable-only-proof',
+      'mojo-sid-123',
+    );
+    (fixture.ds as unknown as { session: typeof fixture.session }).session = {
+      ...fixture.session,
+      mojoCloseJournal: undefined,
+    };
+
+    expect(await closeSession(fixture.session.sessionId)).toEqual({
+      ok: true,
+      outcome: 'closed',
+      alreadyClosed: false,
+      known: true,
+    });
+    expect(cancelMojoMock).not.toHaveBeenCalled();
+    expect(sessionStore.getSession(fixture.session.sessionId)).toMatchObject({
+      status: 'closed',
+    });
+    expect(sessionStore.getSession(fixture.session.sessionId)?.mojoCloseJournal).toBeUndefined();
+  });
+
+  it('does not clear a Mojo journal through another backend close path', async () => {
+    const fixture = createFixture();
+    fixture.session.backendType = 'riff';
+    fixture.ds.initConfig = { backendType: 'riff' } as DaemonSession['initConfig'];
+    fixture.session.mojoCloseJournal = {
+      phase: 'prepared',
+      requestId: 'cross-backend-close',
+      taskId: 'mojo-sid-123',
+      updatedAt: new Date().toISOString(),
+    };
+    sessionStore.updateSession(fixture.session);
+
+    expect(await closeSession(fixture.session.sessionId)).toEqual({
+      ok: false,
+      alreadyClosed: false,
+      error: 'mojo_close_reconciliation_required',
+      retryable: true,
+      taskId: 'mojo-sid-123',
+    });
+    expect(cancelMojoMock).not.toHaveBeenCalled();
+    expect(sessionStore.getSession(fixture.session.sessionId)).toMatchObject({
+      status: 'active',
+      mojoCloseJournal: { phase: 'prepared' },
+    });
+  });
+
+  it('does not flatten a contradictory closed row with a journal into success', async () => {
+    const fixture = createFixture();
+    fixture.session.status = 'closed';
+    fixture.session.closedAt = new Date().toISOString();
+    fixture.session.mojoCloseJournal = {
+      phase: 'uncertain',
+      requestId: 'closed-but-uncertain',
+      taskId: 'mojo-sid-123',
+      updatedAt: new Date().toISOString(),
+    };
+    sessionStore.updateSession(fixture.session);
+    setActiveSessionsRegistry(new Map());
+
+    expect(await closeSession(fixture.session.sessionId)).toEqual({
+      ok: false,
+      alreadyClosed: false,
+      error: 'mojo_close_reconciliation_required',
+      retryable: true,
+      taskId: 'mojo-sid-123',
+    });
+    expect(cancelMojoMock).not.toHaveBeenCalled();
+    expect(sessionStore.getSession(fixture.session.sessionId)?.mojoCloseJournal).toMatchObject({
+      phase: 'uncertain',
+    });
+  });
+
+  it('does not fork a replacement generation while remote close reconciliation is fenced', async () => {
+    const fixture = createFixture();
+    fixture.ds.worker = null;
+    fixture.ds.remoteCloseState = {
+      phase: 'uncertain',
+      requestId: 'close-generation-1',
+      taskId: 'mojo-sid-123',
+    };
+
+    expect(forkWorker(fixture.ds, 'must not start a replacement', {
+      resume: true,
+      turnId: 'om_fenced_refork',
+    })).toBe(true);
+    expect(fixture.ds.worker).toBeNull();
+    await new Promise(resolve => setImmediate(resolve));
+    expect(sessionReplyMock).toHaveBeenCalledWith(
+      'oc_mojo',
+      expect.stringMatching(/Mojo.*正在关闭/),
+      'text',
+      'app',
+      'om_fenced_refork',
+    );
+  });
+
+  it('enforces the replacement fence from the durable journal alone', async () => {
+    const fixture = createFixture();
+    fixture.ds.worker = null;
+    fixture.ds.remoteCloseState = undefined;
+    fixture.session.mojoCloseJournal = {
+      phase: 'uncertain',
+      requestId: 'durable-close-generation',
+      taskId: 'mojo-sid-123',
+      updatedAt: new Date().toISOString(),
+    };
+    sessionStore.updateSession(fixture.session);
+
+    expect(remoteRetirementAdmissionPhase(fixture.ds)).toBe('close-uncertain');
+    expect(forkWorker(fixture.ds, 'must stay fenced after daemon recovery', {
+      resume: true,
+      turnId: 'om_durable_fenced_refork',
+    })).toBe(true);
+    expect(fixture.ds.worker).toBeNull();
+    await new Promise(resolve => setImmediate(resolve));
+    expect(sessionReplyMock).toHaveBeenCalledWith(
+      'oc_mojo',
+      expect.stringMatching(/Mojo.*正在关闭/),
+      'text',
+      'app',
+      'om_durable_fenced_refork',
+    );
   });
 
   it('reports a PARKED lineage as residual even with no active lineage', async () => {
@@ -411,6 +967,7 @@ describe('closeSessionForBackgroundCleanup', () => {
     expect(result).toMatchObject({ ok: true, outcome: 'closed_with_residual' });
     const warned = vi.mocked(logger.warn).mock.calls.map(c => String(c[0])).join('\n');
     expect(warned).toContain('mojo-sid-123');
+    expect(warned).toContain('mojo_lineage_quarantined');
     expect(warned).toContain('unit cleanup');
   });
 
@@ -428,5 +985,6 @@ describe('closeSessionForBackgroundCleanup', () => {
     const errored = vi.mocked(logger.error).mock.calls.map(c => String(c[0])).join('\n');
     expect(errored).toContain('close REFUSED');
     expect(errored).toContain('unit cleanup');
+    expect(errored).toContain('mojo-sid-123');
   });
 });

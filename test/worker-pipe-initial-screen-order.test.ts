@@ -37,7 +37,7 @@ describe('worker pipe initial screen ordering', () => {
       source.indexOf("case 'close':"),
       source.indexOf("case 'detach_for_transfer':", source.indexOf("case 'close':")),
     );
-    const localCloseIdx = closeCase.indexOf('// Local close:');
+    const localCloseIdx = closeCase.indexOf('// Local close destroys');
     const setCloseIdx = closeCase.lastIndexOf('closeRequested = true;', localCloseIdx);
     const ackIdx = closeCase.lastIndexOf("send({ type: 'session_close_ready', sessionId });", localCloseIdx);
     const stopBridgeIdx = closeCase.lastIndexOf('stopBridgeWatcher();', localCloseIdx);

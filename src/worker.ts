@@ -1747,7 +1747,7 @@ function backendScreenEvidenceIsAuthoritativeForMutation(): boolean {
  * generation. The daemon receives this over private IPC; child-writable PID
  * marker files remain diagnostics only. */
 let currentCliCredentialIsolated = false;
-/** Successful Riff close prepare awaiting durable daemon commit. */
+/** Successful remote close prepare awaiting durable daemon commit. */
 let preparedCloseRequestId: string | null = null;
 let closeRequestInFlightId: string | null = null;
 let lastAbortedCloseRequestId: string | null = null;
@@ -16805,11 +16805,15 @@ process.on('message', async (raw: unknown) => {
     case 'close': {
       log('Close requested');
       // destroySession kills tmux session permanently; kill() only detaches.
-      // riff 的 destroySession 是异步远端取消——必须有界 await：紧跟着的
-      // process.exit 会掐断未发出的 fetch，让已关闭话题的远端 agent 继续跑。
-      if (effectiveBackendType === 'riff') {
+      // Remote destroySession is an asynchronous cancellation. Explicit close
+      // must therefore use prepare/commit: an immediate process.exit would cut
+      // off the request and leave the remote agent running. A request-less Mojo
+      // close is retained for non-explicit lifecycle teardown, whose legacy
+      // best-effort path below still owns the bounded destroy-and-exit behavior.
+      if (effectiveBackendType === 'riff'
+          || (effectiveBackendType === 'mojo' && msg.requestId)) {
         if (!msg.requestId) {
-          log('Refused unsafe request-less Riff close; explicit close requires prepare/commit');
+          log(`Refused unsafe request-less ${effectiveBackendType} close; explicit close requires prepare/commit`);
           break;
         }
 
@@ -16835,10 +16839,14 @@ process.on('message', async (raw: unknown) => {
           lastAbortedCloseRequestId = null;
           closeRequestInFlightId = msg.requestId;
           try {
-            const raw = await backend?.destroySession?.();
-            result = raw && typeof raw === 'object' && 'ok' in raw
-              ? raw as SessionDestroyResult
-              : { ok: true };
+            if (!backend?.destroySession) {
+              result = { ok: false, error: 'remote_close_unsupported' };
+            } else {
+              const raw = await backend.destroySession();
+              result = raw && typeof raw === 'object' && 'ok' in raw
+                ? raw as SessionDestroyResult
+                : { ok: true };
+            }
           } catch (err) {
             result = { ok: false, error: err instanceof Error ? err.message : String(err) };
           }
@@ -16858,7 +16866,7 @@ process.on('message', async (raw: unknown) => {
           ...(result.error ? { error: result.error } : {}),
         });
         if (!result.ok) {
-          log(`Riff close prepare failed (${result.error ?? 'cancel failed'}); session stays active for retry`);
+          log(`${effectiveBackendType} close prepare failed (${result.error ?? 'cancel failed'}); session stays active for retry`);
         }
         break;
       }
@@ -16868,8 +16876,9 @@ process.on('message', async (raw: unknown) => {
       stopScreenshotLoop();
       stopBridgeWatcher();
       stopCodexBridge();
-      // Local close: destroySession kills persistent owned sessions. Riff has
-      // already been handled above and cannot enter this request-less path.
+      // Local close destroys persistent owned sessions. Request-less Mojo also
+      // enters here for non-explicit lifecycle teardown; Riff is always fenced
+      // by the remote branch above.
       const closeTeardown = backend?.destroySession?.();
       if (closeTeardown && typeof (closeTeardown as Promise<void>).then === 'function') {
         try { await Promise.race([closeTeardown, new Promise((r) => setTimeout(r, 22_000))]); }
@@ -17067,7 +17076,7 @@ process.on('message', async (raw: unknown) => {
         });
         break;
       }
-      log(`Close aborted (${msg.requestId}); Riff admission restored`);
+      log(`Close aborted (${msg.requestId}); remote admission restored`);
       let abortError: string | null = null;
       if (!alreadyRestored) {
         try { await backend?.abortDestroySession?.(); }

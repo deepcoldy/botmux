@@ -30,7 +30,7 @@
  * Run:  pnpm vitest run test/restore-zombie-close.test.ts
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { mkdtempSync, rmSync } from 'fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 
@@ -168,7 +168,13 @@ vi.mock('../src/core/worker-pool.js', () => ({
     }
     const store = await import('../src/services/session-store.js');
     const s = store.getSession(sid);
-    if (s && s.status !== 'closed') store.closeSession(sid);
+    if (s && s.status !== 'closed') {
+      store.closeSession(sid, {
+        ...(s.mojoCloseJournal?.phase === 'prepared'
+          ? { clearRiffParentTaskId: true }
+          : {}),
+      });
+    }
     return { ok: true, outcome: 'closed', alreadyClosed: false };
   }),
 }));
@@ -321,6 +327,151 @@ function makeActivePersistentSession(rootMessageId: string, backendType: 'tmux' 
 }
 
 describe('restoreActiveSessions — persistent-backend zombie-close decision', () => {
+  it('finishes a durable prepared Mojo close without registering or re-cancelling', async () => {
+    const s = makeActivePersistentSession('om_mojo_prepared_recovery');
+    s.backendType = 'mojo';
+    s.riffParentTaskId = 'mojo-prepared-id';
+    s.mojoIdentity = { cloud: true };
+    s.mojoCloseJournal = {
+      phase: 'prepared',
+      requestId: 'close-before-crash',
+      taskId: 'mojo-prepared-id',
+      updatedAt: new Date().toISOString(),
+    };
+    sessionStore.updateSession(s);
+    sessionStore.init();
+    const map = new Map<string, DaemonSession>();
+    wp.registry = map;
+
+    await restoreActiveSessions(map);
+
+    expect(closeSession).toHaveBeenCalledWith(s.sessionId);
+    expect(map.size).toBe(0);
+    expect(forkWorker).not.toHaveBeenCalled();
+    expect(sessionStore.getSession(s.sessionId)).toMatchObject({ status: 'closed' });
+    expect(sessionStore.getSession(s.sessionId)?.riffParentTaskId).toBeUndefined();
+    expect(sessionStore.getSession(s.sessionId)?.mojoCloseJournal).toBeUndefined();
+  });
+
+  it('keeps a prepared close quarantined when a parked residual still needs a user surface', async () => {
+    const s = makeActivePersistentSession('om_mojo_prepared_residual');
+    s.backendType = 'mojo';
+    s.riffParentTaskId = 'mojo-active-cancelled';
+    s.mojoQuarantinedLineage = 'mojo-parked-manual';
+    s.mojoQuarantineNoticePending = true;
+    s.mojoIdentity = { cloud: true };
+    s.mojoCloseJournal = {
+      phase: 'prepared',
+      requestId: 'close-before-crash',
+      taskId: 'mojo-active-cancelled',
+      updatedAt: new Date().toISOString(),
+    };
+    sessionStore.updateSession(s);
+    sessionStore.init();
+    const map = new Map<string, DaemonSession>();
+    wp.registry = map;
+
+    await restoreActiveSessions(map);
+
+    expect(closeSession).not.toHaveBeenCalled();
+    expect(map.size).toBe(0);
+    expect(sessionStore.getSession(s.sessionId)).toMatchObject({
+      status: 'active',
+      restoreQuarantinedAt: expect.any(String),
+      mojoQuarantinedLineage: 'mojo-parked-manual',
+      mojoCloseJournal: { phase: 'prepared' },
+    });
+  });
+
+  it('quarantines an interrupted Mojo prepare and never registers or forks it', async () => {
+    const s = makeActivePersistentSession('om_mojo_uncertain_recovery');
+    s.backendType = 'mojo';
+    s.riffParentTaskId = 'mojo-uncertain-id';
+    s.mojoIdentity = { cloud: true };
+    s.mojoCloseJournal = {
+      phase: 'preparing',
+      requestId: 'close-interrupted',
+      taskId: 'mojo-uncertain-id',
+      updatedAt: new Date().toISOString(),
+    };
+    sessionStore.updateSession(s);
+    sessionStore.init();
+    const map = new Map<string, DaemonSession>();
+    wp.registry = map;
+
+    await restoreActiveSessions(map);
+
+    expect(closeSession).not.toHaveBeenCalled();
+    expect(map.size).toBe(0);
+    expect(forkWorker).not.toHaveBeenCalled();
+    expect(sessionStore.getSession(s.sessionId)).toMatchObject({
+      status: 'active',
+      restoreQuarantinedAt: expect.any(String),
+      mojoCloseJournal: {
+        phase: 'uncertain',
+        requestId: 'close-interrupted',
+        taskId: 'mojo-uncertain-id',
+      },
+    });
+  });
+
+  it('quarantines a Mojo journal stamped onto another backend instead of closing it', async () => {
+    const s = makeActivePersistentSession('om_invalid_mojo_journal', 'riff');
+    s.riffParentTaskId = 'riff-task-must-survive';
+    s.mojoCloseJournal = {
+      phase: 'prepared',
+      requestId: 'invalid-cross-backend-proof',
+      taskId: 'riff-task-must-survive',
+      updatedAt: new Date().toISOString(),
+    };
+    sessionStore.updateSession(s);
+    sessionStore.init();
+    const map = new Map<string, DaemonSession>();
+    wp.registry = map;
+
+    await restoreActiveSessions(map);
+
+    expect(closeSession).not.toHaveBeenCalled();
+    expect(map.size).toBe(0);
+    expect(forkWorker).not.toHaveBeenCalled();
+    expect(sessionStore.getSession(s.sessionId)).toMatchObject({
+      status: 'active',
+      backendType: 'riff',
+      riffParentTaskId: 'riff-task-must-survive',
+      restoreQuarantinedAt: expect.any(String),
+      mojoCloseJournal: { phase: 'uncertain' },
+    });
+  });
+
+  it('quarantines a malformed prepared journal instead of treating it as proof', async () => {
+    const s = makeActivePersistentSession('om_malformed_mojo_journal');
+    s.backendType = 'mojo';
+    s.riffParentTaskId = 'mojo-must-not-be-cleared';
+    s.mojoIdentity = { cloud: true };
+    s.mojoCloseJournal = {
+      phase: 'prepared',
+      requestId: '',
+      taskId: 'mojo-must-not-be-cleared',
+      updatedAt: '',
+    };
+    sessionStore.updateSession(s);
+    sessionStore.init();
+    const map = new Map<string, DaemonSession>();
+    wp.registry = map;
+
+    await restoreActiveSessions(map);
+
+    expect(closeSession).not.toHaveBeenCalled();
+    expect(map.size).toBe(0);
+    expect(forkWorker).not.toHaveBeenCalled();
+    expect(sessionStore.getSession(s.sessionId)).toMatchObject({
+      status: 'active',
+      riffParentTaskId: 'mojo-must-not-be-cleared',
+      restoreQuarantinedAt: expect.any(String),
+      mojoCloseJournal: { phase: 'prepared', requestId: '' },
+    });
+  });
+
   it('shared Herdr restore probes the recorded managed agent, not a derived bmx-* session', async () => {
     const s = makeActivePersistentSession('om_shared_herdr');
     s.backendType = 'herdr';
@@ -1341,6 +1492,24 @@ describe('closeCliMismatchedSessionsForBot — runtime CLI hot-switch sweep', ()
       await expect(closeSessionsForAgentSwitch('app_test', target))
         .resolves.toMatchObject({ ok: true, closed: 1 });
       expect(closeSession).toHaveBeenCalledWith(durableOnly.sessionId);
+    });
+
+    it('BLOCKS the switch when the durable session projection is unreadable', async () => {
+      // load() historically swallowed this parse failure and exposed an empty
+      // Map, which let the config commit despite being unable to prove that no
+      // old-agent durable rows remained.
+      writeFileSync(join(tempDir, 'sessions.json'), '{not-json');
+      sessionStore.init();
+
+      await expect(closeSessionsForAgentSwitch('app_test', target)).resolves.toMatchObject({
+        ok: false,
+        closed: 0,
+        failed: 1,
+      });
+      expect(closeSession).not.toHaveBeenCalled();
+      expect(logger.error).toHaveBeenCalledWith(
+        expect.stringContaining('could not read the session store'),
+      );
     });
 
     it('blocks the switch when an unregistered durable row cannot be closed', async () => {

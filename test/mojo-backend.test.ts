@@ -20,9 +20,24 @@ vi.mock('../src/utils/logger.js', () => ({
 }));
 
 import { MojoBackend } from '../src/adapters/backend/mojo-backend.js';
+import {
+  MOJO_EXPLICIT_CLOSE_HEADROOM_MS,
+  MOJO_EXPLICIT_CLOSE_RESULT_TIMEOUT_MS,
+  MOJO_CLI_TIMEOUT_MS,
+  MOJO_DESTROY_SETTLE_MS,
+} from '../src/adapters/backend/mojo-budgets.js';
 import type { EffectiveMojoConfig } from '../src/adapters/backend/mojo-types.js';
 
 let binDir: string;
+
+describe('Mojo close budgets', () => {
+  it('keeps enough daemon headroom above settle plus CLI cancellation', () => {
+    expect(MOJO_EXPLICIT_CLOSE_RESULT_TIMEOUT_MS).toBe(
+      MOJO_DESTROY_SETTLE_MS + MOJO_CLI_TIMEOUT_MS + MOJO_EXPLICIT_CLOSE_HEADROOM_MS,
+    );
+    expect(MOJO_EXPLICIT_CLOSE_HEADROOM_MS).toBeGreaterThanOrEqual(5_000);
+  });
+});
 
 /** Write the fake mojo binary; `body` is bash executed on every invocation. */
 function fakeMojo(body: string): string {
@@ -116,12 +131,33 @@ echo '{"type":"result","status":"ok","result":"ok","session_id":"sid-late","warn
     // Close INSIDE the window: the turn is dispatched, init has not arrived.
     await new Promise<void>(r => setTimeout(r, 100));
     expect(backend.cliSessionIdForTest).toBeUndefined();
-    await backend.destroySession();
+    await expect(backend.destroySession()).resolves.toEqual({
+      ok: true,
+      taskId: 'sid-late',
+    });
 
     const argv = readFileSync(argvLog, 'utf-8');
     expect(argv, `argv was:\n${argv}`).toContain('session cancel sid-late');
     // The lineage must also reach the daemon, so its orphan fallback can retry.
     expect(taskIds).toContain('sid-late');
+  });
+
+  it('returns a failed prepare with the exact known lineage when cancel fails', async () => {
+    const bin = fakeMojo(`if [ "$1" = "session" ]; then echo 'cancel failed' >&2; exit 1; fi
+echo '{"type":"system","subtype":"init","session_id":"sid-known"}'
+echo '{"type":"result","status":"ok","result":"ok","session_id":"sid-known","warnings":[]}'`);
+    const backend = new MojoBackend({ bin }, 'session-under-test');
+    backend.spawn('', [], {} as never);
+    backend.write('start');
+
+    await vi.waitFor(() => expect(backend.cliSessionIdForTest).toBe('sid-known'));
+    await expect(backend.destroySession()).resolves.toMatchObject({
+      ok: false,
+      taskId: 'sid-known',
+      error: expect.stringContaining('cancel failed'),
+    });
+    // A failed prepare is reversible: write admission can be restored for retry.
+    backend.abortDestroySession();
   });
 });
 

@@ -271,10 +271,10 @@ export interface DaemonSession {
    *  "Web终端" button opens the riff sandbox. In-memory only — re-sent by the
    *  worker on each task. */
   riffAccessUrl?: string;
-  /** Explicit-close transaction: while present, no new Riff input may be
+  /** Remote explicit-close transaction: while present, no new input may be
    * admitted until cancellation commits or admission restoration is ACKed. */
-  riffCloseState?: {
-    phase: 'preparing' | 'prepared' | 'uncertain';
+  remoteCloseState?: {
+    phase: 'preparing' | 'prepared' | 'abort_restored' | 'uncertain';
     requestId: string;
     taskId?: string;
   };
@@ -441,11 +441,12 @@ export interface DaemonSession {
   };
 }
 
-/** A non-null value means this Riff generation is deliberately rejecting new
- * input until a close/shutdown commit or an ACKed admission restore. */
-export function riffRetirementAdmissionPhase(ds: DaemonSession): string | null {
+/** A non-null value means this remote generation is deliberately rejecting new
+ * input until a close commit, Riff shutdown commit, or ACKed admission restore. */
+export function remoteRetirementAdmissionPhase(ds: DaemonSession): string | null {
   if (ds.riffShutdownState) return `shutdown-${ds.riffShutdownState.phase}`;
-  if (ds.riffCloseState) return `close-${ds.riffCloseState.phase}`;
+  if (ds.remoteCloseState) return `close-${ds.remoteCloseState.phase}`;
+  if (ds.session.mojoCloseJournal) return `close-${ds.session.mojoCloseJournal.phase}`;
   return null;
 }
 

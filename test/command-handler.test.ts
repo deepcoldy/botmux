@@ -1782,6 +1782,7 @@ describe('handleCommand', () => {
       const reply = vi.mocked(deps.sessionReply).mock.calls[0]?.[1] as string;
       expect(reply).toContain('会话关闭失败');
       expect(reply).toContain('mojo_cancel_failed');
+      expect(reply).toContain('mojo-sid-123');
     });
 
     it('reports a residual instead of a plain closed card', async () => {

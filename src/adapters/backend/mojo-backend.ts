@@ -71,6 +71,7 @@ import type {
     MojoLineStyle,
     MojoStreamEvent,
 } from './mojo-types.js';
+import { MOJO_CLI_TIMEOUT_MS, MOJO_DESTROY_SETTLE_MS } from './mojo-budgets.js';
 
 /** mojo silently drops an agent clarifying question in headless mode and marks
  *  the turn cancelled. Matching this is the difference between a helpful nudge
@@ -105,7 +106,6 @@ const RESUME_DEAD_RE =
     /会话.*(不存在|已过期|已结束|无效|未找到)|session.*(not\s*found|expired|invalid|does not exist)|not_found|invalid_session/i;
 const BUSY_RETRY_DELAYS_MS: readonly number[] = [1_000, 2_000, 4_000, 8_000];
 
-
 /**
  * stdio is always `['ignore','pipe','pipe']` here (stdin MUST be closed — see
  * runTurn), so the child has NO stdin. `ChildProcessWithoutNullStreams` is the
@@ -137,11 +137,11 @@ export class MojoBackend implements SessionBackend {
     /** Set when --include-partial deltas have already rendered this turn's text,
      *  so the trailing whole-segment `text` event isn't printed twice. */
     private streamedThisTurn = false;
-    private readonly cliTimeoutMs = 60_000;
+    private readonly cliTimeoutMs = MOJO_CLI_TIMEOUT_MS;
     /** How long /close waits for an in-flight turn to publish its session id
      *  before tearing down. Must stay well under the worker's close/restart
      *  race so teardown never becomes the thing that times out. */
-    private readonly destroySettleMs = 8_000;
+    private readonly destroySettleMs = MOJO_DESTROY_SETTLE_MS;
     /**
      * Captured from spawn(). The worker owns the authoritative cwd + env (the
      * BOTMUX_* session context, per-bot `env`, credential paths, proxies) and
