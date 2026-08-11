@@ -217,6 +217,18 @@ function load(): void {
   loaded = true;
 }
 
+/**
+ * Mutations must never proceed from the compatibility reader's empty
+ * projection after a load failure. In particular, serialising that empty
+ * cache would replace the unreadable durable file and destroy the only copy
+ * of its rows. Keep the failure sticky until init() explicitly reloads the
+ * selected store, matching listSessionsStrict().
+ */
+function loadForWrite(): void {
+  load();
+  if (loadFailure) throw new SessionStoreUnavailableError(loadFailure);
+}
+
 function readExistingSessionsFromDisk(fp: string): { raw: string; parsed: Record<string, Session> } {
   if (!existsSync(fp)) return { raw: '', parsed: {} };
   try {
@@ -316,6 +328,7 @@ export function persistActiveRiffLineagesExactBatch(
     );
   }
 
+  loadForWrite();
   ensureDir();
   const fp = getFilePath();
   let published = false;
@@ -416,6 +429,7 @@ export function persistActiveRiffLineagesExactBatch(
 }
 
 function save(): void {
+  if (loadFailure) throw new SessionStoreUnavailableError(loadFailure);
   ensureDir();
   const fp = getFilePath();
   withFileLockSync(fp, () => {
@@ -444,7 +458,7 @@ export function createSession(
   chatType?: 'group' | 'p2p',
   scope?: 'thread' | 'chat',
 ): Session {
-  load();
+  loadForWrite();
   const session: Session = {
     sessionId: randomUUID(),
     chatId,
@@ -571,7 +585,7 @@ function mutateMojoCloseJournal(
   sessionId: string,
   mutate: (session: Session) => void,
 ): Session {
-  load();
+  loadForWrite();
   const session = sessions.get(sessionId);
   if (!session || session.status !== 'active') {
     throw new Error(`cannot mutate Mojo close journal for non-active session ${sessionId}`);
@@ -718,7 +732,7 @@ export function closeSession(
     parkMojoLineage?: string;
   } = {},
 ): void {
-  load();
+  loadForWrite();
   const session = sessions.get(sessionId);
   if (session) {
     const priorStatus = session.status;
@@ -792,7 +806,7 @@ export function reactivateClosedSession(
   sessionId: string,
 ): { ok: true; session: Session }
 | { ok: false; error: 'not_found' | 'not_closed' } {
-  load();
+  loadForWrite();
   const session = sessions.get(sessionId);
   if (!session) return { ok: false, error: 'not_found' };
   if (session.status !== 'closed') return { ok: false, error: 'not_closed' };
@@ -849,7 +863,7 @@ export function reactivateClosedSession(
 }
 
 export function updateSessionPid(sessionId: string, pid: number | null): void {
-  load();
+  loadForWrite();
   const session = sessions.get(sessionId);
   if (session) {
     session.pid = pid ?? undefined;
@@ -858,7 +872,7 @@ export function updateSessionPid(sessionId: string, pid: number | null): void {
 }
 
 export function updateSession(session: Session): void {
-  load();
+  loadForWrite();
   sessions.set(session.sessionId, session);
   save();
 }
@@ -875,7 +889,7 @@ export function persistActiveRiffLineageExact(
     expectedOwner?: RiffDurableOwner;
   } = {},
 ): Session {
-  load();
+  loadForWrite();
   ensureDir();
   const fp = getFilePath();
   return withFileLockSync(fp, () => {

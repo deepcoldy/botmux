@@ -70,6 +70,8 @@ import {
   reactivateClosedSession,
   updateSession,
   updateSessionPid,
+  persistActiveRiffLineageExact,
+  persistActiveRiffLineagesExactBatch,
   findActiveSessionsByRoot,
   repairMissingChatScope,
 } from '../src/services/session-store.js';
@@ -398,6 +400,98 @@ describe('listSessionsStrict()', () => {
 });
 
 // ─── closeSession() ──────────────────────────────────────────────────────
+
+describe('write health gate', () => {
+  const corruptCurrentStore = (): { session: ReturnType<typeof createSession>; fp: string } => {
+    const session = createSession('chat-write-gate', 'root-write-gate', 'Write Gate');
+    session.backendType = 'mojo';
+    updateSession(session);
+    const fp = join(tempDir, 'sessions.json');
+    writeFileSync(fp, '{not-json');
+    init();
+    return { session, fp };
+  };
+
+  it.each([
+    ['createSession', (_session: ReturnType<typeof createSession>) => {
+      createSession('chat-new', 'root-new', 'Must Not Create');
+    }],
+    ['updateSession', (session: ReturnType<typeof createSession>) => {
+      updateSession({ ...session, title: 'Must Not Update' });
+    }],
+    ['updateSessionPid', (session: ReturnType<typeof createSession>) => {
+      updateSessionPid(session.sessionId, 12345);
+    }],
+    ['closeSession', (session: ReturnType<typeof createSession>) => {
+      closeSession(session.sessionId);
+    }],
+    ['reactivateClosedSession', (session: ReturnType<typeof createSession>) => {
+      reactivateClosedSession(session.sessionId);
+    }],
+    ['Mojo close journal', (session: ReturnType<typeof createSession>) => {
+      beginMojoCloseJournal(session.sessionId, 'request-write-gate');
+    }],
+    ['single Riff lineage CAS', (session: ReturnType<typeof createSession>) => {
+      persistActiveRiffLineageExact(session.sessionId, 'task-next');
+    }],
+    ['batch Riff lineage CAS', (session: ReturnType<typeof createSession>) => {
+      persistActiveRiffLineagesExactBatch([{
+        sessionId: session.sessionId,
+        taskId: null,
+        owner: { pid: null, larkAppId: null, backendType: 'mojo' },
+        targetTaskId: 'task-next',
+        expectedCurrentTaskIds: [null],
+      }]);
+    }],
+  ])('rejects %s after a malformed current store load without changing disk or cache', (_name, mutate) => {
+    const { session, fp } = corruptCurrentStore();
+
+    expect(() => mutate(session)).toThrow(SessionStoreUnavailableError);
+    expect(readFileSync(fp, 'utf-8')).toBe('{not-json');
+    expect(listSessions()).toEqual([]);
+  });
+
+  it('keeps the write fence sticky after external repair until init reloads the store', () => {
+    const { fp } = corruptCurrentStore();
+    expect(() => createSession('chat-blocked', 'root-blocked', 'Blocked')).toThrow(
+      SessionStoreUnavailableError,
+    );
+
+    writeFileSync(fp, '{}');
+    expect(() => createSession('chat-still-blocked', 'root-still-blocked', 'Still Blocked')).toThrow(
+      SessionStoreUnavailableError,
+    );
+    expect(readFileSync(fp, 'utf-8')).toBe('{}');
+
+    init();
+    expect(createSession('chat-reloaded', 'root-reloaded', 'Reloaded').status).toBe('active');
+  });
+
+  it('does not create a per-bot projection after malformed legacy migration input', () => {
+    const legacyFp = join(tempDir, 'sessions.json');
+    const botFp = join(tempDir, 'sessions-app-A.json');
+    writeFileSync(legacyFp, '{broken-legacy');
+    init('app-A');
+
+    expect(() => createSession('chat-app-a', 'root-app-a', 'App A')).toThrow(
+      SessionStoreUnavailableError,
+    );
+    expect(readFileSync(legacyFp, 'utf-8')).toBe('{broken-legacy');
+    expect(existsSync(botFp)).toBe(false);
+  });
+
+  it('rejects writes after a valid JSON value that is not a session projection', () => {
+    const session = createSession('chat-array', 'root-array', 'Array Projection');
+    const fp = join(tempDir, 'sessions.json');
+    writeFileSync(fp, '[]');
+    init();
+
+    expect(() => updateSession({ ...session, title: 'Must Not Overwrite Array' })).toThrow(
+      SessionStoreUnavailableError,
+    );
+    expect(readFileSync(fp, 'utf-8')).toBe('[]');
+  });
+});
 
 describe('closeSession()', () => {
   it('should set status to closed and add closedAt timestamp', () => {
