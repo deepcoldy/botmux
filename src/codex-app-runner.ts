@@ -275,7 +275,7 @@ class AppServerClient {
     });
     this.child.on('error', err => {
       const hint = (err as NodeJS.ErrnoException).code === 'ENOENT'
-        ? '\nHint: install the Codex CLI, or set cliPathOverride to the Codex App bundled binary, for example /Applications/Codex.app/Contents/Resources/codex.'
+        ? '\nHint: install the Codex CLI, or set cliPathOverride to the desktop app bundled binary, for example /Applications/ChatGPT.app/Contents/Resources/codex (current) or /Applications/Codex.app/Contents/Resources/codex (legacy).'
         : '';
       this.failAll(new Error(`Failed to start Codex app-server with "${codexBin}": ${err.message}${hint}`));
     });

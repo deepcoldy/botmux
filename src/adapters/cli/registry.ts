@@ -80,6 +80,16 @@ export function rawCliExecutable(id: CliId, pathOverride?: string): string | und
 
 const RESOLVE_COMMAND_SCRIPT = 'command -v -- "$1"';
 
+/** macOS desktop apps bundle a standalone Codex binary even when `codex` is
+ * not installed on PATH. ChatGPT is the current app name; keep the legacy
+ * Codex.app locations so existing installations continue to work. */
+export function macOSBundledCodexCandidates(userHome = homedir()): string[] {
+  return ['ChatGPT.app', 'Codex.app'].flatMap(appName => [
+    join('/Applications', appName, 'Contents', 'Resources', 'codex'),
+    join(userHome, 'Applications', appName, 'Contents', 'Resources', 'codex'),
+  ]);
+}
+
 /** Resolve a command name to its absolute path via a login/interactive shell.
  *  Tries login shell first (-lc), then interactive shell (-ic) for tools
  *  whose installers add PATH entries to .bashrc/.zshrc only. The command is
@@ -125,11 +135,7 @@ export function resolveCommand(cmd: string): string {
     }
   }
   if (process.platform === 'darwin' && cmd === 'codex') {
-    const bundledCodexCandidates = [
-      '/Applications/Codex.app/Contents/Resources/codex',
-      join(homedir(), 'Applications', 'Codex.app', 'Contents', 'Resources', 'codex'),
-    ];
-    for (const candidate of bundledCodexCandidates) {
+    for (const candidate of macOSBundledCodexCandidates()) {
       if (existsSync(candidate)) return candidate;
     }
   }
