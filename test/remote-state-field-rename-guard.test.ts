@@ -20,11 +20,19 @@ const RETIRED_FIELD_NAMES = [
 
 function walk(dir: string): string[] {
   const out: string[] = [];
-  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+  let entries;
+  try {
+    entries = readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return out; // optional tree (packages/ may be absent in a slim checkout)
+  }
+  for (const entry of entries) {
     if (entry.name === 'node_modules' || entry.name === 'dist') continue;
     const full = `${dir}/${entry.name}`;
     if (entry.isDirectory()) out.push(...walk(full));
-    else if (/\.(ts|tsx)$/.test(entry.name)) out.push(full);
+    // Include plain JS/MJS/CJS too: scripts/ and packages/ are not TypeScript,
+    // so a .ts-only scan left a real (if today empty) blind spot.
+    else if (/\.(ts|tsx|js|mjs|cjs)$/.test(entry.name)) out.push(full);
   }
   return out;
 }
@@ -32,7 +40,12 @@ function walk(dir: string): string[] {
 describe('retired riff-scoped state field names stay retired', () => {
   it('finds no consumer of the pre-generalisation names in src/ or test/', () => {
     const root = new URL('..', import.meta.url).pathname.replace(/\/$/, '');
-    const files = [...walk(`${root}/src`), ...walk(`${root}/test`)]
+    const files = [
+      ...walk(`${root}/src`),
+      ...walk(`${root}/test`),
+      ...walk(`${root}/scripts`),
+      ...walk(`${root}/packages`),
+    ]
       // this guard necessarily spells the retired names out
       .filter(f => !f.endsWith('remote-state-field-rename-guard.test.ts'));
 

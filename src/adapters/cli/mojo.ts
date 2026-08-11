@@ -34,6 +34,13 @@ export function createMojoAdapter(_pathOverride?: string): CliAdapter {
         // When the bot injects X_JWT_TOKEN instead, `mojo auth status --json`
         // reports mode=jwt/source=env and credentials/ may be absent.
         authPaths: ['~/.mojo'],
+        // Where mojo keeps its skill packages. Empirically confirmed on a live
+        // mojo host: the agent's own skill watcher resolves to this exact path
+        // (MERLIN_SKILL_WATCH_ROOT=~/.mojo/skills, 53 packages present).
+        // Without this the dashboard's native-skill scan silently yields nothing
+        // for mojo: discoverNativeCliSkillGroups only consults
+        // claudeDataDir/skillsDir, and authPaths is NOT a skills source.
+        skillsDir: '~/.mojo/skills',
         // No binary is spawned by the worker — MojoBackend shells out per turn.
         resolvedBin: '',
         buildArgs(): string[] {

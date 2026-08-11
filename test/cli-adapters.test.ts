@@ -50,13 +50,20 @@ import { createGrokAdapter } from '../src/adapters/cli/grok.js';
 import { createKiroCliAdapter } from '../src/adapters/cli/kiro-cli.js';
 import { createReasonixAdapter } from '../src/adapters/cli/reasonix.js';
 import { buildBotmuxShellHints, buildBotmuxSystemPromptText } from '../src/adapters/cli/shared-hints.js';
+import { ALL_CLI_IDS as REGISTRY_ALL_CLI_IDS } from '../src/adapters/cli/registry.js';
+import { isRemoteCliId } from '../src/core/remote-cli-ids.js';
 import type { CliAdapter, CliId, PtyHandle } from '../src/adapters/cli/types.js';
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-const ALL_CLI_IDS: CliId[] = ['claude-code', 'seed', 'aiden', 'coco', 'codex', 'codex-app', 'gemini', 'genius', 'opencode', 'antigravity', 'mtr', 'hermes', 'mira', 'mir', 'traex', 'pi', 'copilot', 'oh-my-pi', 'kimi', 'grok', 'kiro-cli', 'reasonix'];
+// Derived from the registry's closed Record<CliId,…> instead of re-typed: the
+// hand-written copy this replaced had silently dropped mojo, cursor and relay,
+// so those adapters were never exercised by the loops below.
+// riff/mojo are remote backends whose adapter is a stub, but constructing one is
+// still valid — the assertions below only touch adapter-shape invariants.
+const ALL_CLI_IDS: readonly CliId[] = REGISTRY_ALL_CLI_IDS;
 
 // ---------------------------------------------------------------------------
 // 1. Factory: createCliAdapterSync
@@ -80,7 +87,12 @@ describe('createCliAdapterSync factory', () => {
 
   it.each(ALL_CLI_IDS)('adapter for "%s" has resolvedBin set', (id) => {
     const adapter = createCliAdapterSync(id, `/opt/${id}`);
-    if (id === 'codex-app' || id === 'mira' || id === 'mir') expect(adapter.resolvedBin).toBe(process.execPath);
+    // Remote backends (riff/mojo) never have the worker spawn a local binary —
+    // riff is pure HTTP and MojoBackend shells out per turn from the backend, so
+    // their adapter deliberately reports an empty resolvedBin. Exempting them via
+    // the shared predicate keeps this loop honest for every local CLI.
+    if (isRemoteCliId(id)) expect(adapter.resolvedBin).toBe('');
+    else if (id === 'codex-app' || id === 'mira' || id === 'mir') expect(adapter.resolvedBin).toBe(process.execPath);
     else expect(adapter.resolvedBin).toBe(`/opt/${id}`);
   });
 });
