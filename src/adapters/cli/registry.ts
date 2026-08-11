@@ -76,6 +76,18 @@ const RAW_CLI_EXECUTABLES: Readonly<Record<CliId, string | undefined>> = {
   mojo: 'mojo',
 };
 
+/**
+ * Every known CLI id, derived from the closed `Record<CliId, …>` above rather
+ * than re-typed by hand.
+ *
+ * A hand-maintained duplicate of this list in dashboard.ts silently went stale
+ * twice (it was missing both `reasonix` and `mojo`), because a plain
+ * `CliId[]` literal is only checked for *bad* members — never for missing ones.
+ * Deriving it means adding a CLI to RAW_CLI_EXECUTABLES (which tsc forces) is
+ * enough, and no consumer can drift again.
+ */
+export const ALL_CLI_IDS: readonly CliId[] = Object.keys(RAW_CLI_EXECUTABLES) as CliId[];
+
 /** Return the unresolved command without constructing an adapter or spawning a
  * shell.  This is deliberately safe for synchronous UI option enumeration. */
 export function rawCliExecutable(id: CliId, pathOverride?: string): string | undefined {
