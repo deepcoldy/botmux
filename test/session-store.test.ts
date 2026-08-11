@@ -70,8 +70,8 @@ import {
   reactivateClosedSession,
   updateSession,
   updateSessionPid,
-  persistActiveRiffLineageExact,
-  persistActiveRiffLineagesExactBatch,
+  persistActiveRemoteLineageExact,
+  persistActiveRemoteLineagesExactBatch,
   findActiveSessionsByRoot,
   repairMissingChatScope,
 } from '../src/services/session-store.js';
@@ -432,10 +432,10 @@ describe('write health gate', () => {
       beginMojoCloseJournal(session.sessionId, 'request-write-gate');
     }],
     ['single Riff lineage CAS', (session: ReturnType<typeof createSession>) => {
-      persistActiveRiffLineageExact(session.sessionId, 'task-next');
+      persistActiveRemoteLineageExact(session.sessionId, 'task-next');
     }],
     ['batch Riff lineage CAS', (session: ReturnType<typeof createSession>) => {
-      persistActiveRiffLineagesExactBatch([{
+      persistActiveRemoteLineagesExactBatch([{
         sessionId: session.sessionId,
         taskId: null,
         owner: { pid: null, larkAppId: null, backendType: 'mojo' },

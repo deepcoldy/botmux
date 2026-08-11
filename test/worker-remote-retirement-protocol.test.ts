@@ -6,7 +6,7 @@ const workerPoolSource = readFileSync(new URL('../src/core/worker-pool.ts', impo
 const commandHandlerSource = readFileSync(new URL('../src/core/command-handler.ts', import.meta.url), 'utf8');
 const dashboardIpcSource = readFileSync(new URL('../src/core/dashboard-ipc-server.ts', import.meta.url), 'utf8');
 
-describe('worker Riff retirement protocol', () => {
+describe('worker remote retirement protocol', () => {
   it('refuses Riff generation restart before the local restart helper can run', () => {
     const start = workerSource.indexOf("case 'restart':");
     const end = workerSource.indexOf("case 'expire_durable_turn':", start);
@@ -101,38 +101,41 @@ describe('worker Riff retirement protocol', () => {
   });
 
   it('checks every unsent input buffer before fencing the backend or allowing commit', () => {
-    const prepareStart = workerSource.indexOf("case 'riff_shutdown_prepare':");
-    const prepareEnd = workerSource.indexOf("case 'riff_shutdown_commit':", prepareStart);
+    const prepareStart = workerSource.indexOf("case 'remote_shutdown_prepare':");
+    const prepareEnd = workerSource.indexOf("case 'remote_shutdown_commit':", prepareStart);
     const prepare = workerSource.slice(prepareStart, prepareEnd);
-    const readiness = prepare.indexOf('riffWorkerShutdownInputBlocker({');
+    const readiness = prepare.indexOf('remoteWorkerShutdownInputBlocker({');
     const queueCount = prepare.indexOf('pendingMessages: pendingMessages.length', readiness);
     const rawCount = prepare.indexOf('pendingRawInputs: pendingRawInputs.length', readiness);
     const initFence = prepare.indexOf('initPromptMaterialized', readiness);
     const refusal = prepare.indexOf('worker_inputs_not_drained:', readiness);
     const backendPrepare = prepare.indexOf('backend?.prepareShutdownDetach?.()', refusal);
+    const remotePrepareGate = prepare.indexOf('if (!isRemoteBackendType(effectiveBackendType))');
 
     expect(readiness).toBeGreaterThanOrEqual(0);
+    expect(remotePrepareGate).toBeGreaterThanOrEqual(0);
     expect(initFence).toBeGreaterThan(readiness);
     expect(queueCount).toBeGreaterThan(readiness);
     expect(rawCount).toBeGreaterThan(queueCount);
     expect(refusal).toBeGreaterThan(rawCount);
     expect(backendPrepare).toBeGreaterThan(refusal);
 
-    const commitStart = workerSource.indexOf("case 'riff_shutdown_commit':", prepareEnd);
-    const commitEnd = workerSource.indexOf("case 'riff_shutdown_abort':", commitStart);
+    const commitStart = workerSource.indexOf("case 'remote_shutdown_commit':", prepareEnd);
+    const commitEnd = workerSource.indexOf("case 'remote_shutdown_abort':", commitStart);
     const commit = workerSource.slice(commitStart, commitEnd);
+    expect(commit).toContain('!isRemoteBackendType(effectiveBackendType)');
     expect(commit).toContain("shutdownDetachPhase !== 'prepared'");
     expect(commit.indexOf("shutdownDetachPhase !== 'prepared'"))
       .toBeLessThan(commit.indexOf('process.exit(0)'));
   });
 
   it('has no shutdown cancellation command that can discard accepted Riff work', () => {
-    expect(workerSource).not.toContain("case 'riff_shutdown_cancel':");
+    expect(workerSource).not.toContain("case 'remote_shutdown_cancel':");
     expect(workerSource).not.toContain('cancelShutdownDetach');
   });
 
   it('ACKs shutdown and explicit-close abort only after backend admission restoration', () => {
-    const shutdownStart = workerSource.indexOf("case 'riff_shutdown_abort':");
+    const shutdownStart = workerSource.indexOf("case 'remote_shutdown_abort':");
     const shutdownEnd = workerSource.indexOf("case 'close_commit':", shutdownStart);
     const shutdown = workerSource.slice(shutdownStart, shutdownEnd);
     const shutdownRestore = shutdown.indexOf('await backend?.abortShutdownDetach?.()');
@@ -154,7 +157,7 @@ describe('worker Riff retirement protocol', () => {
     const errorEnd = workerPoolSource.indexOf("worker.stdout?.on('data'", errorStart);
     const errorHandler = workerPoolSource.slice(errorStart, errorEnd);
     expect(errorStart).toBeGreaterThanOrEqual(0);
-    expect(errorHandler).toContain('ds.riffShutdownState !== undefined');
+    expect(errorHandler).toContain('ds.remoteShutdownState !== undefined');
     expect(errorHandler).toContain('|| ds.remoteCloseState !== undefined');
     expect(errorHandler.indexOf('if (!retainExactRetirementGeneration)'))
       .toBeLessThan(errorHandler.indexOf('ds.remoteCloseState = undefined'));

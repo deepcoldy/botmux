@@ -82,7 +82,7 @@ import {
   terminalReleasesDurableTurn,
   type PendingCliInput,
 } from './utils/pending-input-queue.js';
-import { riffWorkerShutdownInputBlocker } from './core/riff-worker-shutdown-readiness.js';
+import { remoteWorkerShutdownInputBlocker } from './core/remote-worker-shutdown-readiness.js';
 import { ReadyGate, shouldArmReadyGate } from './utils/ready-gate.js';
 import { shouldRunStartupCommandsOnSpawn, shouldDeferInitialPromptForStartup } from './core/startup-commands.js';
 import { sanitizePerBotEnv } from './core/per-bot-env.js';
@@ -16916,28 +16916,28 @@ process.on('message', async (raw: unknown) => {
       process.exit(0);
     }
 
-    case 'riff_shutdown_prepare': {
-      if (effectiveBackendType !== 'riff') {
+    case 'remote_shutdown_prepare': {
+      if (!isRemoteBackendType(effectiveBackendType)) {
         send({
-          type: 'riff_shutdown_result',
+          type: 'remote_shutdown_result',
           requestId: msg.requestId,
           phase: 'prepare',
           ok: false,
           taskId: null,
-          error: 'not_riff_backend',
+          error: 'not_remote_backend',
         });
         break;
       }
       let result: SessionShutdownDetachResult;
-      const inputBlocker = riffWorkerShutdownInputBlocker({
+      const inputBlocker = remoteWorkerShutdownInputBlocker({
         initPromptMaterialized,
         isFlushing,
         pendingMessages: pendingMessages.length,
         pendingRawInputs: pendingRawInputs.length,
         pendingSessionRename: pendingSessionRename !== null,
         // sessionRenameInFlight became a function in this branch's rename
-        // lifecycle rework; riffWorkerShutdownInputBlocker (added on master by
-        // the RIFF two-phase shutdown) still consumes it as a boolean field.
+        // lifecycle rework; remoteWorkerShutdownInputBlocker (added on master by
+        // the original Riff two-phase shutdown) still consumes it as a boolean field.
         sessionRenameInFlight: sessionRenameInFlight(),
         commandLineWritesPending,
       });
@@ -16973,7 +16973,7 @@ process.on('message', async (raw: unknown) => {
         }
       }
       send({
-        type: 'riff_shutdown_result',
+        type: 'remote_shutdown_result',
         requestId: msg.requestId,
         phase: 'prepare',
         ok: result.ok,
@@ -16983,14 +16983,14 @@ process.on('message', async (raw: unknown) => {
       break;
     }
 
-    case 'riff_shutdown_commit': {
-      if (effectiveBackendType !== 'riff'
+    case 'remote_shutdown_commit': {
+      if (!isRemoteBackendType(effectiveBackendType)
           || shutdownDetachRequestId !== msg.requestId
           || shutdownDetachPhase !== 'prepared') {
-        log(`Ignoring stale Riff shutdown commit ${msg.requestId}`);
+        log(`Ignoring stale remote shutdown commit ${msg.requestId}`);
         break;
       }
-      log(`Riff shutdown detach committed (${msg.requestId})`);
+      log(`Remote shutdown detach committed (${msg.requestId})`);
       shutdownDetachRequestId = null;
       shutdownDetachPhase = null;
       backend?.commitShutdownDetach?.();
@@ -17001,11 +17001,11 @@ process.on('message', async (raw: unknown) => {
       process.exit(0);
     }
 
-    case 'riff_shutdown_abort': {
+    case 'remote_shutdown_abort': {
       if (shutdownDetachRequestId !== msg.requestId) {
-        log(`Ignoring stale Riff shutdown abort ${msg.requestId}`);
+        log(`Ignoring stale remote shutdown abort ${msg.requestId}`);
         send({
-          type: 'riff_shutdown_result',
+          type: 'remote_shutdown_result',
           requestId: msg.requestId,
           phase: 'abort',
           ok: false,
@@ -17014,7 +17014,7 @@ process.on('message', async (raw: unknown) => {
         });
         break;
       }
-      log(`Riff shutdown detach aborted (${msg.requestId})`);
+      log(`Remote shutdown detach aborted (${msg.requestId})`);
       let result: SessionShutdownDetachResult;
       try {
         result = await backend?.abortShutdownDetach?.()
@@ -17031,7 +17031,7 @@ process.on('message', async (raw: unknown) => {
         shutdownDetachPhase = null;
       }
       send({
-        type: 'riff_shutdown_result',
+        type: 'remote_shutdown_result',
         requestId: msg.requestId,
         phase: 'abort',
         ok: result.ok,

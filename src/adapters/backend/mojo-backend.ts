@@ -52,7 +52,12 @@ import type { Readable } from 'node:stream';
 import { locateOnPath } from '../cli/registry.js';
 import { buildWrappedLaunch } from '../../setup/cli-selection.js';
 import { logger } from '../../utils/logger.js';
-import type { SessionBackend, SessionDestroyResult, SpawnOpts } from './types.js';
+import type {
+    SessionBackend,
+    SessionDestroyResult,
+    SessionShutdownDetachResult,
+    SpawnOpts,
+} from './types.js';
 import {
     buildEffectiveChildEnv,
     findReservedMojoCliFlags,
@@ -129,6 +134,21 @@ export class MojoBackend implements SessionBackend {
     private child: MojoChild | null = null;
     private killed = false;
     private closing = false;
+    /** Graceful daemon shutdown is a non-cancelling detach. Fence only writes
+     * arriving after prepare, then wait just long enough for an already accepted
+     * first turn to publish its `system/init` lineage. */
+    private shutdownDetaching = false;
+    private shutdownDetachPrepared = false;
+    private shutdownDetachAttempt: symbol | null = null;
+    private shutdownDetachInFlight: Promise<SessionShutdownDetachResult> | null = null;
+    private shutdownDetachAbortInFlight: Promise<SessionShutdownDetachResult> | null = null;
+    private shutdownDetachWake: (() => void) | null = null;
+    private lineageWaiters = new Set<() => void>();
+    /** At least one turn crossed the adapter boundary while no lineage was
+     * known. A later process exit without `system/init` cannot prove that no
+     * remote session was created, so shutdown must not persist authoritative
+     * null merely because the local write promise settled. */
+    private acceptedWriteWithoutLineage = false;
     /** True once the current turn has emitted its `result` event, so a late
      *  process exit cannot fire a second turn boundary. */
     private turnSettled = true;
@@ -381,10 +401,11 @@ export class MojoBackend implements SessionBackend {
         return this.config.cwd ?? this.spawnOpts?.cwd;
     }
 
-    write(data: string): void {
-        if (this.killed || this.closing) return;
+    write(data: string): boolean {
+        if (this.killed || this.closing || this.shutdownDetaching) return false;
         const text = data.trim();
-        if (!text) return;
+        if (!text) return false;
+        if (!this.cliSessionId) this.acceptedWriteWithoutLineage = true;
         // Serialize turns: mojo rejects a concurrent turn on the same session,
         // and a second message arriving before the first init event would fork a
         // duplicate session (cliSessionId still null).
@@ -395,6 +416,7 @@ export class MojoBackend implements SessionBackend {
                 this.emitLine(`❌ mojo 执行失败：${this.fmtErr(err)}`, 'err');
                 this.settleTurn();
             });
+        return true;
     }
 
     /**
@@ -453,6 +475,8 @@ export class MojoBackend implements SessionBackend {
     kill(): void {
         if (this.killed) return;
         this.killed = true;
+        this.shutdownDetachWake?.();
+        for (const wake of this.lineageWaiters) wake();
         this.child?.kill('SIGTERM');
         this.child = null;
         // Mirror RiffBackend: the server-side mojo session KEEPS RUNNING here.
@@ -471,6 +495,13 @@ export class MojoBackend implements SessionBackend {
     /** /close teardown — cancel the server-side session so it stops consuming
      *  cloud sandbox time after the IM session is gone. */
     async destroySession(): Promise<SessionDestroyResult> {
+        if (this.shutdownDetaching) {
+            return {
+                ok: false,
+                ...(this.cliSessionId ? { taskId: this.cliSessionId } : {}),
+                error: 'shutdown_detach_in_progress',
+            };
+        }
         // Gate FIRST so no new turn is accepted, then let the in-flight one settle
         // before tearing anything down. Killing the child here (as this used to)
         // destroyed the only source of the lineage: cliSessionId is adopted from
@@ -534,6 +565,117 @@ export class MojoBackend implements SessionBackend {
             return;
         }
         this.closing = false;
+    }
+
+    /**
+     * Prepare a daemon-restart detach without cancelling the remote Mojo
+     * session. Unlike Riff, a Mojo turn can legitimately run for 60 seconds;
+     * shutdown only needs the lineage from its first `system/init`, not the
+     * whole answer. Therefore a pre-init turn waits at most destroySettleMs,
+     * while a known lineage (or an idle backend with no accepted turn) prepares
+     * immediately.
+     */
+    async prepareShutdownDetach(): Promise<SessionShutdownDetachResult> {
+        if (this.shutdownDetachInFlight) return this.shutdownDetachInFlight;
+        if (this.shutdownDetachPrepared) {
+            return { ok: true, taskId: this.cliSessionId };
+        }
+        if (this.killed) {
+            return { ok: false, taskId: this.cliSessionId, error: 'backend_killed' };
+        }
+        if (this.closing) {
+            return { ok: false, taskId: this.cliSessionId, error: 'explicit_close_in_progress' };
+        }
+
+        const attempt = Symbol('mojo-shutdown-detach');
+        const acceptedWrites = this.writeChain;
+        const lineageExpected = this.acceptedWriteWithoutLineage;
+        this.shutdownDetachAttempt = attempt;
+        this.shutdownDetaching = true;
+
+        const prepare = (async (): Promise<SessionShutdownDetachResult> => {
+            if (!this.cliSessionId && lineageExpected) {
+                await new Promise<void>((resolve) => {
+                    let settled = false;
+                    const finish = (): void => {
+                        if (settled) return;
+                        settled = true;
+                        clearTimeout(timer);
+                        this.lineageWaiters.delete(finish);
+                        if (this.shutdownDetachWake === finish) this.shutdownDetachWake = null;
+                        resolve();
+                    };
+                    const timer = setTimeout(finish, this.destroySettleMs);
+                    timer.unref?.();
+                    this.lineageWaiters.add(finish);
+                    this.shutdownDetachWake = finish;
+                    void acceptedWrites.then(finish, finish);
+                    if (this.cliSessionId) finish();
+                });
+
+                if (this.killed || this.shutdownDetachAttempt !== attempt || !this.shutdownDetaching) {
+                    return { ok: false, taskId: this.cliSessionId, error: 'shutdown_detach_aborted' };
+                }
+                if (!this.cliSessionId) {
+                    return {
+                        ok: false,
+                        taskId: null,
+                        error: 'mojo_lineage_not_materialized',
+                    };
+                }
+            }
+
+            if (this.closing) {
+                return { ok: false, taskId: this.cliSessionId, error: 'explicit_close_in_progress' };
+            }
+            this.shutdownDetachPrepared = true;
+            logger.info(
+                `[mojo] graceful shutdown detach prepared`
+                + `${this.cliSessionId ? ` (session ${this.cliSessionId})` : ' (no session lineage)'}`,
+            );
+            return { ok: true, taskId: this.cliSessionId };
+        })();
+        this.shutdownDetachInFlight = prepare.finally(() => {
+            this.shutdownDetachInFlight = null;
+        });
+        return this.shutdownDetachInFlight;
+    }
+
+    async abortShutdownDetach(): Promise<SessionShutdownDetachResult> {
+        if (this.killed) {
+            return { ok: false, taskId: this.cliSessionId, error: 'backend_killed' };
+        }
+        if (this.shutdownDetachAbortInFlight) return this.shutdownDetachAbortInFlight;
+        const pending = this.shutdownDetachInFlight;
+        this.shutdownDetachAttempt = null;
+        this.shutdownDetachPrepared = false;
+        this.shutdownDetachWake?.();
+        this.shutdownDetachAbortInFlight = (async (): Promise<SessionShutdownDetachResult> => {
+            if (pending) await pending.catch(() => undefined);
+            if (this.killed) {
+                return { ok: false, taskId: this.cliSessionId, error: 'backend_killed' };
+            }
+            if (this.closing || this.shutdownDetachAttempt !== null) {
+                return {
+                    ok: false,
+                    taskId: this.cliSessionId,
+                    error: this.closing ? 'explicit_close_in_progress' : 'new_shutdown_detach_in_progress',
+                };
+            }
+            this.shutdownDetaching = false;
+            logger.info('[mojo] graceful shutdown detach aborted; write admission restored');
+            return { ok: true, taskId: this.cliSessionId };
+        })().finally(() => {
+            this.shutdownDetachAbortInFlight = null;
+        });
+        return this.shutdownDetachAbortInFlight;
+    }
+
+    commitShutdownDetach(): void {
+        this.shutdownDetachPrepared = false;
+        this.shutdownDetachAttempt = null;
+        // Keep admission fenced until the worker exits immediately after commit.
+        this.shutdownDetaching = true;
     }
 
     // ── One turn ─────────────────────────────────────────────────────────────
@@ -744,6 +886,8 @@ export class MojoBackend implements SessionBackend {
     private adoptSession(id?: string, model?: string): void {
         if (!id || id === this.cliSessionId) return;
         this.cliSessionId = id;
+        this.acceptedWriteWithoutLineage = false;
+        for (const wake of this.lineageWaiters) wake();
         // Available in the FIRST event, so the lineage is persisted even if the
         // turn later dies — no grok-style "recapture the id afterwards" needed.
         this.taskIdCb?.(id);

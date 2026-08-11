@@ -171,28 +171,14 @@ export function isRiffBackendSession(ds: DaemonSession): boolean {
  * Freezing here stops a live backendType edit from changing how a running session
  * tears down — e.g. detach-preserving a "herdr" session whose real pane is tmux.
  */
-export function shutdownBackendDisposition(ds: DaemonSession): 'riff-drain-detach' | 'detach' | 'close' {
-  // Riff 不能落进普通 detach 的直接 SIGTERM：create/follow-up 最长 10s 才返回
-  // task id，而 worker SIGTERM 会立即 exit，丢掉唯一血缘。独立 disposition 迫使
-  // daemon 先走 drain → durable ACK → commit 协议；类型检查防止未来回归。
-  if (isRiffBackendSession(ds)) return 'riff-drain-detach';
-  // mojo 走普通 detach，不复用上面的 drain：那条协议是 riff 专属的
-  // （prepareRiffFleetForShutdown 打的是 riff HTTP + fence/ACK），不该照搬。
-  //
-  // 但注意：mojo 并非「没有丢血缘的窗口」——早期注释这么写过，是错的。血缘来自
-  // 流式输出的第一条 `system/init` 事件，在「turn 已下发、init 未到」这段时间里
-  // cliSessionId 仍是空的；MojoBackend.destroySettleMs = 8_000 正是为这个窗口预留
-  // 的等待，destroySession() 的注释也记录了它曾导致远端会话带着注入的凭据泄漏。
-  // 普通 detach 走 SIGTERM → killCli() → backend.kill()，不等 writeChain，所以
-  // daemon 恰好在这个窗口重启时，远端会话既拿不到 id 也不会被取消。
-  //
-  // 窗口比 riff 的短，且 detach（而非 cancel）本身是对的——远端会话本就该跨 daemon
-  // 重启存活。缺的是「先拿到并持久化血缘再退出」的 drain。留作 follow-up：把 riff
-  // 的三阶段协议抽成通用 remote drain 再适配 mojo，而不是复用它的 HTTP 细节。
-  // 与 riff 相同的是：远端会话独立于本地进程存活，daemon 重启不该取消它
-  // （'close' 会经 worker 的 destroySession() 取消远端会话）。
+export function shutdownBackendDisposition(ds: DaemonSession): 'remote-drain-detach' | 'detach' | 'close' {
   const frozen = ds.initConfig?.backendType ?? ds.session.backendType;
-  if (frozen && isRemoteBackendType(frozen)) return 'detach';
+  // Every remote backend must publish its exact final lineage before the local
+  // worker exits. Riff may wait for create/follow-up HTTP; Mojo may wait for the
+  // first `system/init`. Their backend-specific implementations stay behind the
+  // common prepare/abort/commit interface, while the daemon owns one atomic
+  // fleet transaction. Detach never cancels the remote session.
+  if (frozen && isRemoteBackendType(frozen)) return 'remote-drain-detach';
   return getSessionPersistentBackendType(ds) ? 'detach' : 'close';
 }
 

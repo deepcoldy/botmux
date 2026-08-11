@@ -185,6 +185,26 @@ afterEach(() => {
 });
 
 describe('mojo explicit close', () => {
+  it('refuses explicit close while shutdown owns the exact Mojo generation', async () => {
+    const fixture = createFixture({ liveWorker: true });
+    fixture.ds.remoteShutdownState = {
+      phase: 'preparing',
+      requestId: 'shutdown-mojo',
+      taskId: 'mojo-sid-123',
+    };
+
+    expect(await closeSession(fixture.session.sessionId)).toEqual({
+      ok: false,
+      alreadyClosed: false,
+      error: 'remote_shutdown_fence_in_progress',
+      retryable: true,
+      taskId: 'mojo-sid-123',
+    });
+    expect(fixture.worker?.send).not.toHaveBeenCalled();
+    expect(cancelMojoMock).not.toHaveBeenCalled();
+    expect(sessionStore.getSession(fixture.session.sessionId)?.status).toBe('active');
+  });
+
   it('awaits worker-less cancellation before closing, then clears the lineage', async () => {
     const fixture = createFixture();
 

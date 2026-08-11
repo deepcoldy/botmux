@@ -9,10 +9,10 @@ import {
   FLEET_SUCCESSOR_SETTLE_MS,
   PM2_DAEMON_KILL_TIMEOUT_MS,
   PM2_DAEMON_RESTART_DELAY_MS,
-  RIFF_ADMISSION_RESTORE_TIMEOUT_MS,
-  RIFF_SHUTDOWN_BATCH_PERSIST_TIMEOUT_MS,
-  RIFF_SHUTDOWN_DRAIN_TIMEOUT_MS,
-  RIFF_SHUTDOWN_INITIAL_SNAPSHOT_TIMEOUT_MS,
+  REMOTE_ADMISSION_RESTORE_TIMEOUT_MS,
+  REMOTE_SHUTDOWN_BATCH_PERSIST_TIMEOUT_MS,
+  REMOTE_SHUTDOWN_DRAIN_TIMEOUT_MS,
+  REMOTE_SHUTDOWN_INITIAL_SNAPSHOT_TIMEOUT_MS,
 } from '../src/core/shutdown-budgets.js';
 import { DAEMON_GRACEFUL_EXIT_CODE } from '../src/core/supervisor-shutdown-protocol.js';
 import { PM2_GRACEFUL_EXIT_CODE } from '../src/pm2-graceful-exit.js';
@@ -74,10 +74,10 @@ describe('graceful shutdown supervisor contract', () => {
   it('keeps outer supervisor budgets beyond both success and abort-restore paths', () => {
     expect(DAEMON_SHUTDOWN_MAX_MS).toBe(
       BOT_TURN_MUTATION_SHUTDOWN_ACQUIRE_TIMEOUT_MS
-      + RIFF_SHUTDOWN_INITIAL_SNAPSHOT_TIMEOUT_MS
-      + RIFF_SHUTDOWN_DRAIN_TIMEOUT_MS
-      + RIFF_SHUTDOWN_BATCH_PERSIST_TIMEOUT_MS
-      + Math.max(RIFF_ADMISSION_RESTORE_TIMEOUT_MS, DAEMON_WORKER_EXIT_GRACE_MS)
+      + REMOTE_SHUTDOWN_INITIAL_SNAPSHOT_TIMEOUT_MS
+      + REMOTE_SHUTDOWN_DRAIN_TIMEOUT_MS
+      + REMOTE_SHUTDOWN_BATCH_PERSIST_TIMEOUT_MS
+      + Math.max(REMOTE_ADMISSION_RESTORE_TIMEOUT_MS, DAEMON_WORKER_EXIT_GRACE_MS)
       + DAEMON_SHUTDOWN_OVERHEAD_MS,
     );
     expect(DAEMON_SHUTDOWN_MAX_MS).toBeLessThanOrEqual(28_000);
@@ -145,7 +145,7 @@ describe('graceful shutdown supervisor contract', () => {
     expect(restart).toContain('PM2 delete left registry entries');
   });
 
-  it('takes one Riff snapshot, batch-persists, then generation-checks and commits before service stop', () => {
+  it('takes one remote snapshot, batch-persists, then generation-checks and commits before service stop', () => {
     const start = daemon.indexOf('const shutdown = async () => {');
     const stop = daemon.indexOf('scheduler.stopScheduler();', start);
     const boundedGate = daemon.indexOf('tryWithBotTurnMutation(', start);
@@ -153,14 +153,14 @@ describe('graceful shutdown supervisor contract', () => {
       'collectUniqueDaemonShutdownSessions(activeSessions.values())',
       boundedGate,
     );
-    const prepareAll = daemon.indexOf('prepareRiffFleetForShutdown(riffCandidates', initialUnique);
-    const persistAll = daemon.indexOf('persistPreparedRiffShutdownFleet(riffPrepared', prepareAll);
+    const prepareAll = daemon.indexOf('prepareRemoteFleetForShutdown(remoteCandidates', initialUnique);
+    const persistAll = daemon.indexOf('persistPreparedRemoteShutdownFleet(remotePrepared', prepareAll);
     const currentUnique = daemon.indexOf(
       'collectUniqueDaemonShutdownSessions(activeSessions.values())',
       initialUnique + 1,
     );
-    const secondCheck = daemon.indexOf('const riffGenerationMismatch', persistAll);
-    const commitAll = daemon.indexOf('commitPreparedRiffShutdown(ds, result)', secondCheck);
+    const secondCheck = daemon.indexOf('const remoteGenerationMismatch', persistAll);
+    const commitAll = daemon.indexOf('commitPreparedRemoteShutdown(ds, result)', secondCheck);
     const teardownUnique = daemon.indexOf(
       'for (const ds of currentShutdownFleet.sessions)',
       commitAll,
@@ -174,8 +174,8 @@ describe('graceful shutdown supervisor contract', () => {
     expect(commitAll).toBeGreaterThan(secondCheck);
     expect(teardownUnique).toBeGreaterThan(commitAll);
     expect(stop).toBeGreaterThan(commitAll);
-    expect(daemon.slice(start, stop)).toContain('abortRiffShutdownFleet(');
-    expect(daemon.slice(start, stop)).toContain('canAbortVerifiedExitedRiffPreparation(');
+    expect(daemon.slice(start, stop)).toContain('abortRemoteShutdownFleet(');
+    expect(daemon.slice(start, stop)).toContain('canAbortVerifiedExitedRemotePreparation(');
   });
 
   it('publishes shutdown capability only after both signal handlers are installed', () => {

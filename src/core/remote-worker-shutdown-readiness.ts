@@ -1,4 +1,4 @@
-export interface RiffWorkerShutdownInputSnapshot {
+export interface RemoteWorkerShutdownInputSnapshot {
   /** False while async init can still materialize an opening prompt later. */
   initPromptMaterialized: boolean;
   /** A normal prompt has been removed from pendingMessages but has not yet
@@ -13,9 +13,10 @@ export interface RiffWorkerShutdownInputSnapshot {
   commandLineWritesPending: number;
 }
 
-/** Describe worker-owned input not proven to be inside RiffBackend.writeChain. */
-export function riffWorkerShutdownInputBlocker(
-  snapshot: RiffWorkerShutdownInputSnapshot,
+/** Describe worker-owned input not proven to be inside the remote backend's
+ * accepted-write fence. */
+export function remoteWorkerShutdownInputBlocker(
+  snapshot: RemoteWorkerShutdownInputSnapshot,
 ): string | null {
   const parts: string[] = [];
   if (!snapshot.initPromptMaterialized) parts.push('init=materializing');

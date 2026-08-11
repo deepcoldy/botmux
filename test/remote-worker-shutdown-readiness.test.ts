@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { riffWorkerShutdownInputBlocker } from '../src/core/riff-worker-shutdown-readiness.js';
+import { remoteWorkerShutdownInputBlocker } from '../src/core/remote-worker-shutdown-readiness.js';
 
 const idle = {
   initPromptMaterialized: true,
@@ -11,18 +11,18 @@ const idle = {
   commandLineWritesPending: 0,
 };
 
-describe('Riff worker shutdown input ownership', () => {
+describe('Remote worker shutdown input ownership', () => {
   it('allows the current backend task itself when no unsent worker input exists', () => {
-    expect(riffWorkerShutdownInputBlocker(idle)).toBeNull();
+    expect(remoteWorkerShutdownInputBlocker(idle)).toBeNull();
   });
 
   it('refuses current-task detach when a follow-up is still in pendingMessages', () => {
-    expect(riffWorkerShutdownInputBlocker({ ...idle, pendingMessages: 1 }))
+    expect(remoteWorkerShutdownInputBlocker({ ...idle, pendingMessages: 1 }))
       .toBe('messages=1');
   });
 
   it('accounts for every worker-owned pre-backend input surface', () => {
-    expect(riffWorkerShutdownInputBlocker({
+    expect(remoteWorkerShutdownInputBlocker({
       initPromptMaterialized: false,
       isFlushing: true,
       pendingMessages: 2,

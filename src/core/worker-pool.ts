@@ -345,7 +345,7 @@ import { acknowledgeSessionReady } from './session-ready-handshake.js';
 import { recordDispatchInputCommit } from './dispatch.js';
 import { sendWorkerIpc } from './worker-ipc.js';
 import { cleanupExplicitSessionBacking } from './explicit-session-backing-cleanup.js';
-import { RIFF_ADMISSION_RESTORE_TIMEOUT_MS } from './shutdown-budgets.js';
+import { REMOTE_ADMISSION_RESTORE_TIMEOUT_MS } from './shutdown-budgets.js';
 import {
   managedOriginCapabilityPath,
   replaceManagedOriginCapabilityFile,
@@ -2753,7 +2753,7 @@ type RemoteClosePreparation =
         | 'riff_row_inconsistent'
         | 'riff_durable_close_failed'
         | 'riff_close_reconciliation_required'
-        | 'riff_shutdown_fence_in_progress'
+        | 'remote_shutdown_fence_in_progress'
         // mojo reuses this preparation contract: same problem (a remote,
         // credential-bearing session that must be proven gone before the row is
         // published as closed), same retryable-failure shape.
@@ -2809,7 +2809,7 @@ async function abortLiveRemoteWorkerClose(
     });
     const timer = setTimeout(
       () => finish({ ok: false, error: 'close_abort_result_timeout' }),
-      RIFF_ADMISSION_RESTORE_TIMEOUT_MS,
+      REMOTE_ADMISSION_RESTORE_TIMEOUT_MS,
     );
     timer.unref?.();
     worker.on?.('message', onMessage);
@@ -2905,14 +2905,22 @@ async function prepareLiveRemoteWorkerClose(
       ...(ds.remoteCloseState.taskId ? { taskId: ds.remoteCloseState.taskId } : {}),
     };
   }
-  if (ds.remoteCloseState || (backendType === 'riff' && ds.riffShutdownState)) {
+  if (ds.remoteShutdownState) {
+    return {
+      ok: false,
+      error: 'remote_shutdown_fence_in_progress',
+      retryable: true,
+      ...(typeof ds.remoteShutdownState.taskId === 'string' && ds.remoteShutdownState.taskId
+        ? { taskId: ds.remoteShutdownState.taskId }
+        : {}),
+    };
+  }
+  if (ds.remoteCloseState) {
     return {
       ok: false,
       error: backendType === 'riff' ? 'riff_worker_close_failed' : 'mojo_cancel_failed',
       retryable: true,
-      ...((ds.remoteCloseState?.taskId ?? ds.riffShutdownState?.taskId)
-        ? { taskId: (ds.remoteCloseState?.taskId ?? ds.riffShutdownState?.taskId)! }
-        : {}),
+      ...(ds.remoteCloseState.taskId ? { taskId: ds.remoteCloseState.taskId } : {}),
     };
   }
   const requestId = randomUUID();
@@ -3125,13 +3133,13 @@ async function prepareRiffExplicitClose(
   if (!session) return { ok: true };
   const backendType = ds?.initConfig?.backendType ?? session.backendType;
   const taskId = session.riffParentTaskId;
-  if (ds?.riffShutdownState) {
-    const fencedTaskId = Object.prototype.hasOwnProperty.call(ds.riffShutdownState, 'taskId')
-      ? ds.riffShutdownState.taskId
+  if (ds?.remoteShutdownState) {
+    const fencedTaskId = Object.prototype.hasOwnProperty.call(ds.remoteShutdownState, 'taskId')
+      ? ds.remoteShutdownState.taskId
       : taskId;
     return {
       ok: false,
-      error: 'riff_shutdown_fence_in_progress',
+      error: 'remote_shutdown_fence_in_progress',
       retryable: true,
       ...(typeof fencedTaskId === 'string' && fencedTaskId ? { taskId: fencedTaskId } : {}),
     };
@@ -7504,7 +7512,7 @@ export function forkWorker(
       } else {
         reparkQueuedActivationFollowUpTail(ds, 'worker error during activation follow-up handoff');
       }
-      const retainExactRetirementGeneration = ds.riffShutdownState !== undefined
+      const retainExactRetirementGeneration = ds.remoteShutdownState !== undefined
         || ds.remoteCloseState !== undefined;
       if (!retainExactRetirementGeneration) {
         ds.worker = null;
@@ -10258,7 +10266,7 @@ function setupWorkerHandlers(
       if (ds.remoteCloseState) {
         ds.remoteCloseState = { ...ds.remoteCloseState, phase: 'uncertain' };
       }
-      // Do not clear riffShutdownState here. Only the shutdown coordinator can
+      // Do not clear remoteShutdownState here. Only the shutdown coordinator can
       // release a generation after lineage persistence or admission restore.
       // This worker generation is gone. Invalidate any stuck-warning card it
       // posted so a late click cannot inject keys into a replacement worker.

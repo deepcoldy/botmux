@@ -240,7 +240,7 @@ describe('Riff explicit close', () => {
 
   it('refuses explicit close while the daemon shutdown fence owns the Riff worker', async () => {
     const fixture = createFixture({ liveWorker: true });
-    fixture.ds.riffShutdownState = {
+    fixture.ds.remoteShutdownState = {
       phase: 'preparing',
       requestId: 'shutdown-riff',
       taskId: 'task-riff-123',
@@ -249,7 +249,7 @@ describe('Riff explicit close', () => {
     expect(await closeSession(fixture.session.sessionId)).toEqual({
       ok: false,
       alreadyClosed: false,
-      error: 'riff_shutdown_fence_in_progress',
+      error: 'remote_shutdown_fence_in_progress',
       retryable: true,
       taskId: 'task-riff-123',
     });

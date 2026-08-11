@@ -9,7 +9,7 @@
  *
  * Run:  pnpm vitest run test/mojo-backend.test.ts
  */
-import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -158,6 +158,103 @@ echo '{"type":"result","status":"ok","result":"ok","session_id":"sid-known","war
     });
     // A failed prepare is reversible: write admission can be restored for retry.
     backend.abortDestroySession();
+  });
+});
+
+describe('MojoBackend graceful shutdown detach', () => {
+  it('waits for a pre-init lineage without cancelling the remote session', async () => {
+    const argvLog = join(binDir, 'shutdown-argv.log');
+    const bin = fakeMojo(`echo "$@" >> ${argvLog}
+if [ "$1" = "session" ]; then echo '{"status":"ok"}'; exit 0; fi
+sleep 0.4
+echo '{"type":"system","subtype":"init","session_id":"sid-shutdown-late"}'
+sleep 1
+echo '{"type":"result","status":"ok","result":"ok","session_id":"sid-shutdown-late","warnings":[]}'`);
+    const backend = new MojoBackend({ bin }, 'session-under-test');
+    backend.spawn('', [], {} as never);
+    expect(backend.write('accepted before shutdown')).toBe(true);
+
+    await new Promise<void>(r => setTimeout(r, 100));
+    expect(backend.cliSessionIdForTest).toBeUndefined();
+    const prepared = backend.prepareShutdownDetach();
+    // The fence applies synchronously to writes arriving after prepare.
+    expect(backend.write('must not be accepted')).toBe(false);
+    await expect(prepared).resolves.toEqual({ ok: true, taskId: 'sid-shutdown-late' });
+
+    const argv = readFileSync(argvLog, 'utf-8');
+    expect(argv, `argv was:\n${argv}`).not.toContain('session cancel');
+    // The answer is still running: prepare returned on system/init, not after
+    // waiting for the whole foreground turn to finish.
+    expect(backend.getChildPid()).not.toBeNull();
+    backend.commitShutdownDetach();
+    expect(backend.write('still fenced after commit')).toBe(false);
+    backend.kill();
+  });
+
+  it('prepares immediately with an authoritative null lineage when idle', async () => {
+    const backend = new MojoBackend({ bin: '/does/not/run' }, 'session-under-test');
+    backend.spawn('', [], {} as never);
+    await expect(backend.prepareShutdownDetach()).resolves.toEqual({ ok: true, taskId: null });
+    backend.kill();
+  });
+
+  it('never lets an overlapping explicit close cancel a shutdown-fenced session', async () => {
+    const argvLog = join(binDir, 'shutdown-close-race.log');
+    const bin = fakeMojo(`echo "$@" >> ${argvLog}
+if [ "$1" = "session" ]; then echo '{"status":"ok"}'; exit 0; fi`);
+    const backend = new MojoBackend({ bin, resumeCliSessionId: 'sid-fenced' }, 'session-under-test');
+    backend.spawn('', [], {} as never);
+
+    await expect(backend.prepareShutdownDetach()).resolves.toEqual({
+      ok: true,
+      taskId: 'sid-fenced',
+    });
+    await expect(backend.destroySession()).resolves.toEqual({
+      ok: false,
+      taskId: 'sid-fenced',
+      error: 'shutdown_detach_in_progress',
+    });
+    expect(existsSync(argvLog) ? readFileSync(argvLog, 'utf-8') : '').not.toContain('session cancel');
+    await expect(backend.abortShutdownDetach()).resolves.toEqual({
+      ok: true,
+      taskId: 'sid-fenced',
+    });
+    backend.kill();
+  });
+
+  it('fails closed when an accepted turn exits without publishing lineage', async () => {
+    const bin = fakeMojo(`exit 0`);
+    const backend = new MojoBackend({ bin }, 'session-under-test');
+    backend.spawn('', [], {} as never);
+    expect(backend.write('accepted but malformed')).toBe(true);
+    await vi.waitFor(() => expect(backend.getChildPid()).toBeNull());
+
+    await expect(backend.prepareShutdownDetach()).resolves.toEqual({
+      ok: false,
+      taskId: null,
+      error: 'mojo_lineage_not_materialized',
+    });
+    await expect(backend.abortShutdownDetach()).resolves.toEqual({ ok: true, taskId: null });
+    backend.kill();
+  });
+
+  it('abort wakes a pending prepare and restores write admission', async () => {
+    const bin = fakeMojo(`sleep 10`);
+    const backend = new MojoBackend({ bin }, 'session-under-test');
+    backend.spawn('', [], {} as never);
+    expect(backend.write('accepted before shutdown')).toBe(true);
+
+    const prepared = backend.prepareShutdownDetach();
+    await new Promise<void>(r => setTimeout(r, 50));
+    const aborted = backend.abortShutdownDetach();
+    await expect(prepared).resolves.toEqual({
+      ok: false,
+      taskId: null,
+      error: 'shutdown_detach_aborted',
+    });
+    await expect(aborted).resolves.toEqual({ ok: true, taskId: null });
+    expect(backend.write('accepted after abort')).toBe(true);
+    backend.kill();
   });
 });
 

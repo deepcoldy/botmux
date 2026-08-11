@@ -674,7 +674,7 @@ export class RiffBackend implements SessionBackend {
       return { ok: false, taskId: this.currentTaskId, error: 'explicit_close_in_progress' };
     }
 
-    const attempt = Symbol('riff-shutdown-detach');
+    const attempt = Symbol('remote-shutdown-detach');
     this.shutdownDetachAttempt = attempt;
     this.shutdownDetaching = true;
     // Existing SSE delivery is presentation-only. Stop it now, but do not

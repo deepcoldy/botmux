@@ -278,8 +278,8 @@ export interface DaemonSession {
     requestId: string;
     taskId?: string;
   };
-  /** Graceful-shutdown transaction for the exact Riff worker generation. */
-  riffShutdownState?: {
+  /** Graceful-shutdown transaction for the exact remote worker generation. */
+  remoteShutdownState?: {
     phase: 'preparing' | 'prepared';
     requestId: string;
     taskId?: string | null;
@@ -442,9 +442,9 @@ export interface DaemonSession {
 }
 
 /** A non-null value means this remote generation is deliberately rejecting new
- * input until a close commit, Riff shutdown commit, or ACKed admission restore. */
+ * input until a close commit, remote shutdown commit, or ACKed admission restore. */
 export function remoteRetirementAdmissionPhase(ds: DaemonSession): string | null {
-  if (ds.riffShutdownState) return `shutdown-${ds.riffShutdownState.phase}`;
+  if (ds.remoteShutdownState) return `shutdown-${ds.remoteShutdownState.phase}`;
   if (ds.remoteCloseState) return `close-${ds.remoteCloseState.phase}`;
   if (ds.session.mojoCloseJournal) return `close-${ds.session.mojoCloseJournal.phase}`;
   return null;

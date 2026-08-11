@@ -386,16 +386,16 @@ import { advanceDocCommentCursor, docCommentRepliesAfterCursor, latestDocComment
 import { renderBufferedSenderBlock } from './core/session-manager.js';
 import { shutdownBackendDisposition } from './core/persistent-backend.js';
 import {
-  abortRiffShutdownFleet,
-  canAbortVerifiedExitedRiffPreparation,
+  abortRemoteShutdownFleet,
+  canAbortVerifiedExitedRemotePreparation,
   collectUniqueDaemonShutdownSessions,
-  commitPreparedRiffShutdown,
-  isPreparedRiffSessionCurrent,
-  persistPreparedRiffShutdownFleet,
-  prepareRiffFleetForShutdown,
-  type FencedRiffShutdownParticipant,
-  type PreparedRiffShutdown,
-} from './core/riff-shutdown-detach.js';
+  commitPreparedRemoteShutdown,
+  isPreparedRemoteSessionCurrent,
+  persistPreparedRemoteShutdownFleet,
+  prepareRemoteFleetForShutdown,
+  type FencedRemoteShutdownParticipant,
+  type PreparedRemoteShutdown,
+} from './core/remote-shutdown-detach.js';
 import {
   BOT_TURN_MUTATION_SHUTDOWN_ACQUIRE_TIMEOUT_MS,
   DAEMON_SHUTDOWN_MAX_MS,
@@ -21212,8 +21212,8 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     overloadTimer.unref?.();
   }
 
-  // Graceful shutdown. Riff owners first run a three-phase non-cancelling drain
-  // that durably ACKs every exact final task lineage as one fleet transaction.
+  // Graceful shutdown. Remote owners first run a three-phase non-cancelling
+  // drain that durably ACKs every exact final lineage as one fleet transaction.
   // No worker exits until every participant is prepared and fresh-verified.
   // Ordinary workers then receive SIGTERM / close IPC and the daemon waits up
   // to DAEMON_WORKER_EXIT_GRACE_MS for them to exit
@@ -21244,34 +21244,34 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       return;
     }
 
-    // Preflight Riff before stopping services/removing descriptors. A failed
+    // Preflight all remote backends before stopping services/removing descriptors. A failed
     // drain or persistence write aborts every successfully prepared peer, so a
     // refused shutdown returns to a live fleet instead of leaving an early
     // participant workerless.
-    const riffCandidates = initialShutdownFleet.sessions
-      .filter(ds => shutdownBackendDisposition(ds) === 'riff-drain-detach');
-    const riffPrepareResults = await prepareRiffFleetForShutdown(riffCandidates, {
+    const remoteCandidates = initialShutdownFleet.sessions
+      .filter(ds => shutdownBackendDisposition(ds) === 'remote-drain-detach');
+    const remotePrepareResults = await prepareRemoteFleetForShutdown(remoteCandidates, {
       deadlineMs: shutdownDeadlineMs,
     });
-    const riffPrepared = riffPrepareResults.filter(
-      (entry): entry is { ds: DaemonSession; result: PreparedRiffShutdown } => entry.result.ok,
+    const remotePrepared = remotePrepareResults.filter(
+      (entry): entry is { ds: DaemonSession; result: PreparedRemoteShutdown } => entry.result.ok,
     );
-    const riffFenced = riffPrepareResults.filter(
-      (entry): entry is { ds: DaemonSession; result: FencedRiffShutdownParticipant } =>
+    const remoteFenced = remotePrepareResults.filter(
+      (entry): entry is { ds: DaemonSession; result: FencedRemoteShutdownParticipant } =>
         entry.result.fence !== 'none',
     );
 
-    const abortRiffFleet = async (
+    const abortRemoteFleet = async (
       reason: string,
       retainFenced: ReadonlySet<DaemonSession> = new Set(),
     ): Promise<void> => {
       for (const ds of retainFenced) {
         logger.error(
-          `[${ds.session.sessionId.slice(0, 8)}] Riff shutdown participant remains fenced: `
+          `[${ds.session.sessionId.slice(0, 8)}] Remote shutdown participant remains fenced: `
           + 'durable/runtime ownership could not be reconciled safely',
         );
       }
-      const aborts = await abortRiffShutdownFleet(riffFenced
+      const aborts = await abortRemoteShutdownFleet(remoteFenced
         .filter(({ ds }) => !retainFenced.has(ds))
         .map(({ ds, result }) => ({ ds, result })), {
           deadlineMs: shutdownDeadlineMs,
@@ -21279,7 +21279,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       for (const { ds, result } of aborts) {
         if (result.ok) continue;
         logger.error(
-          `[${ds.session.sessionId.slice(0, 8)}] Riff shutdown rollback was not ACKed: `
+          `[${ds.session.sessionId.slice(0, 8)}] Remote shutdown rollback was not ACKed: `
           + `${result.error ?? 'unknown'}; admission remains fail-closed`,
         );
       }
@@ -21288,32 +21288,32 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       logger.error(`Daemon remains online: ${reason}`);
     };
 
-    const riffPrepareFailures = riffPrepareResults.filter(entry => !entry.result.ok);
-    if (riffPrepareFailures.length > 0) {
-      for (const { ds, result } of riffPrepareFailures) {
+    const remotePrepareFailures = remotePrepareResults.filter(entry => !entry.result.ok);
+    if (remotePrepareFailures.length > 0) {
+      for (const { ds, result } of remotePrepareFailures) {
         if (result.ok) continue;
         logger.error(
           `[${ds.session.sessionId.slice(0, 8)}] Daemon shutdown prepare refused: `
           + `${result.error}${result.taskId ? ` (task ${result.taskId})` : ''}`,
         );
       }
-      await abortRiffFleet(
-        `${riffPrepareFailures.length} Riff owner(s) could not be safely drained`,
+      await abortRemoteFleet(
+        `${remotePrepareFailures.length} remote owner(s) could not be safely drained`,
       );
       return;
     }
 
-    const riffPersistence = persistPreparedRiffShutdownFleet(riffPrepared, {
+    const remotePersistence = persistPreparedRemoteShutdownFleet(remotePrepared, {
       deadlineMs: shutdownDeadlineMs,
     });
-    if (!riffPersistence.ok) {
-      const retainIds = new Set(riffPersistence.retainFencedSessionIds);
-      const retainFenced = new Set(riffPrepared
+    if (!remotePersistence.ok) {
+      const retainIds = new Set(remotePersistence.retainFencedSessionIds);
+      const retainFenced = new Set(remotePrepared
         .filter(({ ds }) => retainIds.has(ds.session.sessionId))
         .map(({ ds }) => ds));
-      logger.error(`Daemon shutdown lineage verification refused: ${riffPersistence.error}`);
-      await abortRiffFleet(
-        `${riffPersistence.sessionIds.length} Riff lineage row(s) could not be fresh-verified`,
+      logger.error(`Daemon shutdown lineage verification refused: ${remotePersistence.error}`);
+      await abortRemoteFleet(
+        `${remotePersistence.sessionIds.length} remote lineage row(s) could not be fresh-verified`,
         retainFenced,
       );
       return;
@@ -21324,28 +21324,28 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     const currentShutdownFleet = collectUniqueDaemonShutdownSessions(activeSessions.values());
     if (!currentShutdownFleet.ok) {
       const ambiguousSessionId = currentShutdownFleet.sessionId;
-      await abortRiffFleet(
-        `Riff ownership became ambiguous after shutdown preflight: ${currentShutdownFleet.error}`,
-        new Set(riffPrepared
+      await abortRemoteFleet(
+        `Remote ownership became ambiguous after shutdown preflight: ${currentShutdownFleet.error}`,
+        new Set(remotePrepared
           .filter(({ ds }) => ds.session.sessionId === ambiguousSessionId)
           .map(({ ds }) => ds)),
       );
       return;
     }
-    const currentRiffOwners = currentShutdownFleet.sessions
-      .filter(ds => shutdownBackendDisposition(ds) === 'riff-drain-detach');
-    const riffPreparedOwners = new Set(riffPrepared.map(entry => entry.ds));
-    const riffGenerationMismatch = currentRiffOwners.some(ds => !riffPreparedOwners.has(ds))
-      || riffPrepared.some(({ ds, result }) =>
-        !currentRiffOwners.includes(ds) || !isPreparedRiffSessionCurrent(ds, result));
-    if (riffGenerationMismatch) {
-      const retainFenced = new Set(riffPrepared
+    const currentRemoteOwners = currentShutdownFleet.sessions
+      .filter(ds => shutdownBackendDisposition(ds) === 'remote-drain-detach');
+    const remotePreparedOwners = new Set(remotePrepared.map(entry => entry.ds));
+    const remoteGenerationMismatch = currentRemoteOwners.some(ds => !remotePreparedOwners.has(ds))
+      || remotePrepared.some(({ ds, result }) =>
+        !currentRemoteOwners.includes(ds) || !isPreparedRemoteSessionCurrent(ds, result));
+    if (remoteGenerationMismatch) {
+      const retainFenced = new Set(remotePrepared
         .filter(({ ds, result }) =>
-          (!currentRiffOwners.includes(ds) || !isPreparedRiffSessionCurrent(ds, result))
-          && !canAbortVerifiedExitedRiffPreparation(ds, result))
+          (!currentRemoteOwners.includes(ds) || !isPreparedRemoteSessionCurrent(ds, result))
+          && !canAbortVerifiedExitedRemotePreparation(ds, result))
         .map(({ ds }) => ds));
-      await abortRiffFleet(
-        'Riff ownership changed after shutdown preflight',
+      await abortRemoteFleet(
+        'Remote ownership changed after shutdown preflight',
         retainFenced,
       );
       return;
@@ -21353,12 +21353,12 @@ export async function startDaemon(botIndex?: number): Promise<void> {
 
     // Validate-all above, then commit-all synchronously with no await or
     // callback boundary between peers.
-    const riffRetiredWorkers: ChildProcess[] = [];
-    for (const { ds, result } of riffPrepared) {
-      if (!commitPreparedRiffShutdown(ds, result)) {
-        throw new Error(`Riff shutdown commit invariant lost for ${ds.session.sessionId}`);
+    const remoteRetiredWorkers: ChildProcess[] = [];
+    for (const { ds, result } of remotePrepared) {
+      if (!commitPreparedRemoteShutdown(ds, result)) {
+        throw new Error(`Remote shutdown commit invariant lost for ${ds.session.sessionId}`);
       }
-      if (result.worker) riffRetiredWorkers.push(result.worker);
+      if (result.worker) remoteRetiredWorkers.push(result.worker);
     }
 
     scheduler.stopScheduler();
@@ -21404,14 +21404,14 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       }));
       survivors.push(w);
     };
-    for (const worker of riffRetiredWorkers) trackWorkerExit(worker);
+    for (const worker of remoteRetiredWorkers) trackWorkerExit(worker);
     for (const ds of currentShutdownFleet.sessions) {
       if (ds.worker && !ds.worker.killed) {
         logger.info(`Shutting down worker for session ${ds.session.sessionId}`);
         const w = ds.worker;
         const disposition = shutdownBackendDisposition(ds);
-        if (disposition === 'riff-drain-detach') {
-          throw new Error(`undrained Riff generation after atomic commit: ${ds.session.sessionId}`);
+        if (disposition === 'remote-drain-detach') {
+          throw new Error(`undrained remote generation after atomic commit: ${ds.session.sessionId}`);
         }
         // Capture the exit promise BEFORE killWorker nulls ds.worker.
         trackWorkerExit(w);

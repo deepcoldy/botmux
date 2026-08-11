@@ -177,6 +177,103 @@ async function runWorker(opts: {
 }
 
 describe('mojo worker wiring', () => {
+  it('drains a pre-init lineage through real worker prepare/commit without cancellation', async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), 'botmux-mojo-shutdown-')));
+    const started = join(root, 'started');
+    const argvLog = join(root, 'argv.log');
+    let child: ChildProcess | undefined;
+    const logs: string[] = [];
+    const messages: WorkerToDaemon[] = [];
+    try {
+      const appId = 'app_mojo_shutdown';
+      const botsPath = join(root, 'bots.json');
+      writeFileSync(botsPath, JSON.stringify([{
+        larkAppId: appId,
+        larkAppSecret: 'secret',
+        cliId: 'mojo',
+        backendType: 'mojo',
+        mojo: { cloud: true },
+      }]));
+      const bin = join(root, 'mojo');
+      writeFileSync(bin, `#!/usr/bin/env bash
+echo "$@" >> "${argvLog}"
+if [ "$1" = "session" ]; then exit 99; fi
+: > "${started}"
+sleep 0.4
+echo '{"type":"system","subtype":"init","session_id":"sid-worker-shutdown"}'
+sleep 2
+echo '{"type":"result","status":"ok","result":"ok","session_id":"sid-worker-shutdown","warnings":[]}'
+`);
+      chmodSync(bin, 0o755);
+
+      child = spawn(process.execPath, ['--import', 'tsx', resolve('src/worker.ts')], {
+        cwd: resolve('.'),
+        env: {
+          ...process.env,
+          HOME: root,
+          SESSION_DATA_DIR: root,
+          BOTS_CONFIG: botsPath,
+          BOTMUX_SESSION_ID: 'sid-mojo-shutdown',
+          LARK_APP_ID: appId,
+          LARK_APP_SECRET: 'secret',
+          PATH: `${root}:${process.env.PATH ?? ''}`,
+        },
+        stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+      });
+      child.stdout?.on('data', c => logs.push(c.toString()));
+      child.stderr?.on('data', c => logs.push(c.toString()));
+      child.on('message', raw => messages.push(raw as WorkerToDaemon));
+      child.send({
+        type: 'init',
+        sessionId: 'sid-mojo-shutdown',
+        chatId: 'oc_mojo_shutdown',
+        rootMessageId: 'om_mojo_shutdown',
+        workingDir: root,
+        cliId: 'mojo',
+        backendType: 'mojo',
+        backendConfig: { cloud: true },
+        prompt: 'turn before daemon shutdown',
+        larkAppId: appId,
+        larkAppSecret: 'secret',
+      } as DaemonToWorker);
+
+      await waitFor(
+        () => existsSync(started),
+        20_000,
+        () => `mojo turn never crossed the worker boundary\n${logs.join('')}`,
+      );
+      child.send({ type: 'remote_shutdown_prepare', requestId: 'shutdown-1' });
+      await waitFor(
+        () => messages.some(message =>
+          message.type === 'remote_shutdown_result'
+          && message.requestId === 'shutdown-1'
+          && message.phase === 'prepare'),
+        20_000,
+        () => `worker never prepared shutdown\n${logs.join('')}`,
+      );
+      const prepared = messages.find(message =>
+        message.type === 'remote_shutdown_result'
+        && message.requestId === 'shutdown-1'
+        && message.phase === 'prepare');
+      expect(prepared).toMatchObject({
+        ok: true,
+        taskId: 'sid-worker-shutdown',
+      });
+      expect(readFileSync(argvLog, 'utf-8')).not.toContain('session cancel');
+
+      child.send({ type: 'remote_shutdown_commit', requestId: 'shutdown-1' });
+      await waitFor(
+        () => child!.exitCode !== null || child!.signalCode !== null,
+        10_000,
+        () => `worker did not exit after shutdown commit\n${logs.join('')}`,
+      );
+      expect(readFileSync(argvLog, 'utf-8')).not.toContain('session cancel');
+    } finally {
+      if (child && child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 40_000);
+
   it('sends the first prompt promptly instead of waiting for the ready fallback', async () => {
     // Remote backends are marked prompt-ready right after spawn(). Without that,
     // isPromptReady stays false until the ~15s first-prompt fallback and every

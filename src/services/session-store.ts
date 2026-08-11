@@ -36,37 +36,37 @@ export function stripLegacyPendingCardFields(session: Record<string, unknown>): 
 }
 
 /** The active row no longer has the lineage/ownership sampled by the caller. */
-export class RiffLineageOwnershipError extends Error {
-  override readonly name = 'RiffLineageOwnershipError';
+export class RemoteLineageOwnershipError extends Error {
+  override readonly name = 'RemoteLineageOwnershipError';
 }
 
-export type RiffDurableOwner = {
+export type RemoteDurableOwner = {
   pid: number | null;
   larkAppId: string | null;
   backendType: string | null;
 };
 
-export type ActiveRiffShutdownSnapshot = {
+export type ActiveRemoteShutdownSnapshot = {
   sessionId: string;
   taskId: string | null;
-  owner: RiffDurableOwner;
+  owner: RemoteDurableOwner;
 };
 
-export type ActiveRiffLineageBatchUpdate = ActiveRiffShutdownSnapshot & {
+export type ActiveRemoteLineageBatchUpdate = ActiveRemoteShutdownSnapshot & {
   targetTaskId: string | null;
   expectedCurrentTaskIds: readonly (string | null)[];
 };
 
-export type RiffLineageBatchFailureStage =
+export type RemoteLineageBatchFailureStage =
   | 'prewrite_ownership'
   | 'prewrite_io'
   | 'postrename_ambiguity';
 
-export class RiffLineageBatchError extends Error {
-  override readonly name = 'RiffLineageBatchError';
+export class RemoteLineageBatchError extends Error {
+  override readonly name = 'RemoteLineageBatchError';
 
   constructor(
-    readonly stage: RiffLineageBatchFailureStage,
+    readonly stage: RemoteLineageBatchFailureStage,
     readonly sessionIds: readonly string[],
     message: string,
   ) {
@@ -74,7 +74,7 @@ export class RiffLineageBatchError extends Error {
   }
 }
 
-function riffDurableOwner(session: Session): RiffDurableOwner {
+function remoteDurableOwner(session: Session): RemoteDurableOwner {
   return {
     pid: session.pid ?? null,
     larkAppId: session.larkAppId ?? null,
@@ -82,15 +82,15 @@ function riffDurableOwner(session: Session): RiffDurableOwner {
   };
 }
 
-function riffOwnersEqual(left: RiffDurableOwner, right: RiffDurableOwner): boolean {
+function remoteOwnersEqual(left: RemoteDurableOwner, right: RemoteDurableOwner): boolean {
   return left.pid === right.pid
     && left.larkAppId === right.larkAppId
     && left.backendType === right.backendType;
 }
 
-let testOnlyAfterRiffBatchRename: (() => void) | undefined;
-export function __testOnly_setAfterRiffBatchRename(hook: (() => void) | undefined): void {
-  testOnlyAfterRiffBatchRename = hook;
+let testOnlyAfterRemoteBatchRename: (() => void) | undefined;
+export function __testOnly_setAfterRemoteBatchRename(hook: (() => void) | undefined): void {
+  testOnlyAfterRemoteBatchRename = hook;
 }
 
 /**
@@ -256,20 +256,20 @@ function duplicateIds(ids: readonly string[]): string[] {
 }
 
 /**
- * Sample every active Riff participant from one fresh sessions projection.
+ * Sample every active remote participant from one fresh sessions projection.
  * Fleet shutdown takes this snapshot before fencing any worker.
  */
-export function getActiveRiffShutdownSnapshotsBatch(
+export function getActiveRemoteShutdownSnapshotsBatch(
   sessionIds: readonly string[],
   options: { maxWaitMs?: number } = {},
-): ActiveRiffShutdownSnapshot[] {
+): ActiveRemoteShutdownSnapshot[] {
   if (sessionIds.length === 0) return [];
   const duplicates = duplicateIds(sessionIds);
   if (duplicates.length > 0) {
-    throw new RiffLineageBatchError(
+    throw new RemoteLineageBatchError(
       'prewrite_ownership',
       duplicates,
-      `duplicate Riff shutdown session ids: ${duplicates.join(', ')}`,
+      `duplicate remote shutdown session ids: ${duplicates.join(', ')}`,
     );
   }
 
@@ -283,10 +283,10 @@ export function getActiveRiffShutdownSnapshotsBatch(
         return !session || session.status !== 'active';
       });
       if (invalid.length > 0) {
-        throw new RiffLineageBatchError(
+        throw new RemoteLineageBatchError(
           'prewrite_ownership',
           invalid,
-          `cannot snapshot non-active Riff sessions: ${invalid.join(', ')}`,
+          `cannot snapshot non-active remote sessions: ${invalid.join(', ')}`,
         );
       }
       return sessionIds.map((sessionId) => {
@@ -294,37 +294,37 @@ export function getActiveRiffShutdownSnapshotsBatch(
         return {
           sessionId,
           taskId: session.riffParentTaskId ?? null,
-          owner: riffDurableOwner(session),
+          owner: remoteDurableOwner(session),
         };
       });
     }, { maxWaitMs: options.maxWaitMs });
   } catch (error) {
-    if (error instanceof RiffLineageBatchError) throw error;
-    throw new RiffLineageBatchError(
+    if (error instanceof RemoteLineageBatchError) throw error;
+    throw new RemoteLineageBatchError(
       'prewrite_io',
       [...sessionIds],
-      `failed to snapshot active Riff sessions: ${String(error)}`,
+      `failed to snapshot active remote sessions: ${String(error)}`,
     );
   }
 }
 
 /**
- * Commit every prepared Riff lineage as one compare-and-set transaction.
+ * Commit every prepared remote lineage as one compare-and-set transaction.
  * The published projection is read back under the same lock before workers
  * are allowed to exit.
  */
-export function persistActiveRiffLineagesExactBatch(
-  updates: readonly ActiveRiffLineageBatchUpdate[],
+export function persistActiveRemoteLineagesExactBatch(
+  updates: readonly ActiveRemoteLineageBatchUpdate[],
   options: { maxWaitMs?: number } = {},
-): ActiveRiffShutdownSnapshot[] {
+): ActiveRemoteShutdownSnapshot[] {
   if (updates.length === 0) return [];
   const sessionIds = updates.map(update => update.sessionId);
   const duplicates = duplicateIds(sessionIds);
   if (duplicates.length > 0) {
-    throw new RiffLineageBatchError(
+    throw new RemoteLineageBatchError(
       'prewrite_ownership',
       duplicates,
-      `duplicate Riff lineage batch session ids: ${duplicates.join(', ')}`,
+      `duplicate remote lineage batch session ids: ${duplicates.join(', ')}`,
     );
   }
 
@@ -343,15 +343,15 @@ export function persistActiveRiffLineagesExactBatch(
         if (!durable
             || durable.status !== 'active'
             || !update.expectedCurrentTaskIds.some(candidate => candidate === durableTaskId)
-            || !riffOwnersEqual(riffDurableOwner(durable), update.owner)) {
+            || !remoteOwnersEqual(remoteDurableOwner(durable), update.owner)) {
           conflicts.push(update.sessionId);
         }
       }
       if (conflicts.length > 0) {
-        throw new RiffLineageBatchError(
+        throw new RemoteLineageBatchError(
           'prewrite_ownership',
           conflicts,
-          `Riff lineage batch compare-and-set failed for: ${conflicts.join(', ')}`,
+          `Remote lineage batch compare-and-set failed for: ${conflicts.join(', ')}`,
         );
       }
 
@@ -372,17 +372,17 @@ export function persistActiveRiffLineagesExactBatch(
         renameSync(tmpFp, fp);
         tmpFp = undefined;
         published = true;
-        testOnlyAfterRiffBatchRename?.();
+        testOnlyAfterRemoteBatchRename?.();
       }
 
       let verifiedProjection: Record<string, Session>;
       try {
         verifiedProjection = readSessionsProjectionStrict(fp).parsed;
       } catch (error) {
-        throw new RiffLineageBatchError(
+        throw new RemoteLineageBatchError(
           published ? 'postrename_ambiguity' : 'prewrite_io',
           [...sessionIds],
-          `failed to read back Riff lineage batch: ${String(error)}`,
+          `failed to read back Remote lineage batch: ${String(error)}`,
         );
       }
 
@@ -391,20 +391,20 @@ export function persistActiveRiffLineagesExactBatch(
         return !durable
           || durable.status !== 'active'
           || (durable.riffParentTaskId ?? null) !== update.targetTaskId
-          || !riffOwnersEqual(riffDurableOwner(durable), update.owner);
+          || !remoteOwnersEqual(remoteDurableOwner(durable), update.owner);
       }).map(update => update.sessionId);
       if (ambiguous.length > 0) {
-        throw new RiffLineageBatchError(
+        throw new RemoteLineageBatchError(
           published ? 'postrename_ambiguity' : 'prewrite_ownership',
           ambiguous,
-          `Riff lineage batch readback mismatch for: ${ambiguous.join(', ')}`,
+          `Remote lineage batch readback mismatch for: ${ambiguous.join(', ')}`,
         );
       }
 
       const verified = updates.map((update) => ({
         sessionId: update.sessionId,
         taskId: update.targetTaskId,
-        owner: riffDurableOwner(verifiedProjection[update.sessionId]!),
+        owner: remoteDurableOwner(verifiedProjection[update.sessionId]!),
       }));
       if (loaded) {
         for (const update of updates) {
@@ -415,11 +415,11 @@ export function persistActiveRiffLineagesExactBatch(
       return verified;
     }, { maxWaitMs: options.maxWaitMs });
   } catch (error) {
-    if (error instanceof RiffLineageBatchError) throw error;
-    throw new RiffLineageBatchError(
+    if (error instanceof RemoteLineageBatchError) throw error;
+    throw new RemoteLineageBatchError(
       published ? 'postrename_ambiguity' : 'prewrite_io',
       [...sessionIds],
-      `failed to persist Riff lineage batch: ${String(error)}`,
+      `failed to persist Remote lineage batch: ${String(error)}`,
     );
   } finally {
     if (tmpFp) {
@@ -878,15 +878,15 @@ export function updateSession(session: Session): void {
 }
 
 /**
- * Persist one exact Riff follow-up lineage for an active durable owner.
+ * Persist one exact remote follow-up lineage for an active durable owner.
  * The process cache changes only after the atomic file replacement succeeds.
  */
-export function persistActiveRiffLineageExact(
+export function persistActiveRemoteLineageExact(
   sessionId: string,
   taskId: string | null,
   options: {
     expectedCurrentTaskIds?: readonly (string | null)[];
-    expectedOwner?: RiffDurableOwner;
+    expectedOwner?: RemoteDurableOwner;
   } = {},
 ): Session {
   loadForWrite();
@@ -896,22 +896,22 @@ export function persistActiveRiffLineageExact(
     const { raw, parsed } = readExistingSessionsFromDisk(fp);
     const durable = parsed[sessionId];
     if (!durable || durable.status !== 'active') {
-      throw new RiffLineageOwnershipError(
-        `cannot persist Riff lineage for non-active session ${sessionId}`,
+      throw new RemoteLineageOwnershipError(
+        `cannot persist remote lineage for non-active session ${sessionId}`,
       );
     }
     const durableTaskId = durable.riffParentTaskId ?? null;
     const expected = options.expectedCurrentTaskIds;
     if (expected && !expected.some(candidate => candidate === durableTaskId)) {
-      throw new RiffLineageOwnershipError(
-        `Riff lineage compare-and-set failed for ${sessionId} `
+      throw new RemoteLineageOwnershipError(
+        `Remote lineage compare-and-set failed for ${sessionId} `
         + `(current=${durableTaskId ?? 'none'}, expected=${expected.map(id => id ?? 'none').join('|')})`,
       );
     }
-    if (options.expectedOwner && !riffOwnersEqual(riffDurableOwner(durable), options.expectedOwner)) {
-      throw new RiffLineageOwnershipError(
-        `Riff owner compare-and-set failed for ${sessionId} `
-        + `(current=${JSON.stringify(riffDurableOwner(durable))}, `
+    if (options.expectedOwner && !remoteOwnersEqual(remoteDurableOwner(durable), options.expectedOwner)) {
+      throw new RemoteLineageOwnershipError(
+        `Remote owner compare-and-set failed for ${sessionId} `
+        + `(current=${JSON.stringify(remoteDurableOwner(durable))}, `
         + `expected=${JSON.stringify(options.expectedOwner)})`,
       );
     }
