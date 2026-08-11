@@ -1,6 +1,6 @@
 // src/dashboard.ts
-import { createServer, get as httpGet, request as httpRequest, type IncomingMessage, type ServerResponse } from 'node:http';
-import { createServer as createTcpServer, connect as netConnect } from 'node:net';
+import { createServer, get as httpGet, type IncomingMessage, type ServerResponse } from 'node:http';
+import { createServer as createTcpServer } from 'node:net';
 import type { Duplex } from 'node:stream';
 import {
   readFileSync, existsSync, mkdirSync, readdirSync, statSync, createReadStream, realpathSync,
@@ -9,7 +9,7 @@ import { atomicWriteFileSync } from './utils/atomic-write.js';
 import { join, dirname, extname, resolve, relative, isAbsolute } from 'node:path';
 import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
-import { randomBytes } from 'node:crypto';
+import { createHmac, randomBytes } from 'node:crypto';
 import { logger } from './utils/logger.js';
 import { config } from './config.js';
 import { listenWithProbe } from './utils/listen-with-probe.js';
@@ -25,6 +25,13 @@ import {
   proxyDashboardAskAnswer,
 } from './dashboard/desktop-asks.js';
 import { createDebugTerminalManager } from './dashboard/debug-terminal.js';
+import { createSessionPreviewProxy, type PreviewProxyResolution } from './dashboard/preview-proxy.js';
+import {
+  previewDescriptorFromRow,
+  projectSessionPreviewEventForBrowser,
+  projectSessionPreviewsForBrowser,
+  resolveSessionPreviewFromRow,
+} from './dashboard/preview-contract.js';
 import { pickCreatorForGroup } from './dashboard/operator-selector.js';
 import { buildTeamGroupCreatePayload, planGroupCreator } from './dashboard/team-group.js';
 import { jsonRes } from './dashboard/http.js';
@@ -51,6 +58,21 @@ import { handleFederationSpokeApi, syncAllMemberships, autoBindOwnerIfUnambiguou
 import type { TeamGroupCreateResult, TeamGroupOwnerTransferResult } from './dashboard/federated-group-core.js';
 import { BotOnboardingManager } from './dashboard/bot-onboarding.js';
 import { FeishuLoginManager } from './dashboard/feishu-login.js';
+import {
+  createDashboardH5AuthController,
+  DashboardSessionStore,
+  resolveDashboardH5AuthConfig,
+  type DashboardAuthIdentity,
+} from './dashboard/h5-auth.js';
+import { FileControlAuditSink } from './dashboard/control-audit.js';
+import {
+  TerminalControlManager,
+  terminalControlTtlFromEnv,
+  type TerminalDashboardActor,
+} from './dashboard/terminal-control.js';
+import { PreviewInteractionManager } from './dashboard/preview-interaction.js';
+import { createPreviewGuardPage } from './dashboard/preview-guard-page.js';
+import { createTerminalFrontProxy } from './dashboard/terminal-front-proxy.js';
 import {
   CLI_SELECT_OPTIONS,
   resolveCliSelection,
@@ -244,6 +266,51 @@ let boundDashboardPort = config.dashboard.port;
 
 const SECRET = loadOrCreateSecret();
 
+const dashboardControlAudit = new FileControlAuditSink();
+const dashboardH5AuthConfig = resolveDashboardH5AuthConfig();
+const dashboardSessions = new DashboardSessionStore({ ttlMs: dashboardH5AuthConfig.sessionTtlMs });
+const dashboardH5Auth = createDashboardH5AuthController({
+  config: dashboardH5AuthConfig,
+  sessions: dashboardSessions,
+  audit: dashboardControlAudit,
+});
+const terminalControl = new TerminalControlManager({
+  secret: SECRET,
+  audit: dashboardControlAudit,
+  ttlMs: terminalControlTtlFromEnv(),
+});
+const previewInteraction = new PreviewInteractionManager({ audit: dashboardControlAudit });
+
+interface DashboardRequestIdentity extends TerminalDashboardActor {
+  kind: 'legacy-dashboard' | DashboardAuthIdentity['kind'];
+}
+
+function legacyDashboardAuthSessionId(token: string): string {
+  return createHmac('sha256', SECRET)
+    .update('botmux-legacy-dashboard-session-id-v1\0')
+    .update(token)
+    .digest('base64url');
+}
+
+function dashboardRequestIdentity(req: IncomingMessage): DashboardRequestIdentity | null {
+  const legacyCookie = parseCookie(req.headers.cookie);
+  if (activeToken && legacyCookie === activeToken) {
+    return {
+      kind: 'legacy-dashboard',
+      userId: 'legacy-owner',
+      authSessionId: legacyDashboardAuthSessionId(activeToken),
+      // Terminal leases are independently capped to fifteen minutes or less.
+      expiresAt: Number.MAX_SAFE_INTEGER,
+    };
+  }
+  return dashboardH5Auth.resolve(req);
+}
+
+dashboardSessions.onEnd(identity => {
+  terminalControl.releaseByAuthSession(identity.authSessionId);
+  previewInteraction.relockAuthSession(identity.authSessionId);
+});
+
 function isWildcardBindHost(host: string): boolean {
   return host === '0.0.0.0' || host === '::' || host === '';
 }
@@ -300,6 +367,38 @@ function verifyDashboardBinding(port: number): Promise<boolean> {
 mkdirSync(REGISTRY_DIR, { recursive: true });
 const registry = new DaemonRegistry(REGISTRY_DIR);
 const aggregator = new Aggregator();
+function resolveDashboardSessionPreview(sessionId: string): PreviewProxyResolution {
+  const row = aggregator.getSession(sessionId);
+  const owner = aggregator.ownerOf(sessionId);
+  const resolution = resolveSessionPreviewFromRow({
+    row,
+    sessionId,
+    ownerLarkAppId: owner,
+  });
+  if (!resolution.ok) return resolution;
+  if (!owner || !registry.getByAppId(owner)) {
+    return { ok: false, status: 503, error: 'daemon_offline' };
+  }
+  return resolution;
+}
+const sessionPreviewProxy = createSessionPreviewProxy({
+  // Preview HTTP/WS never accepts ?t=. The user must first establish either
+  // the legacy management cookie or an allow-listed short H5 session.
+  authenticated: req => dashboardRequestIdentity(req) !== null,
+  resolve: resolveDashboardSessionPreview,
+});
+const previewGuardPage = createPreviewGuardPage({
+  authenticated: req => dashboardRequestIdentity(req) !== null,
+  resolve: resolveDashboardSessionPreview,
+});
+const terminalFrontProxy = createTerminalFrontProxy({
+  resolvePort: sessionId => aggregator.terminalProxyPortOf(sessionId),
+  resolveActor: dashboardRequestIdentity,
+  allowLegacyQueryCapabilities: actor => (
+    (actor as DashboardRequestIdentity).kind === 'legacy-dashboard'
+  ),
+  control: terminalControl,
+});
 const sessionPresentation = createSessionPresentationCoordinator(aggregator, getGitRepoInfo);
 
 // Keep Git-derived fields in the central read-model so REST snapshots and SSE
@@ -2390,13 +2489,36 @@ async function dashboardSkillReferences(skillName: string): Promise<SkillReferen
   return (await dashboardSkillReferencesMany([skillName])).get(skillName) ?? { bots: [] };
 }
 
-/** Extract the sessionId from a terminal path `/s/<sessionId>[/...]`. Returns
- *  the first path segment after `/s/` (stops at the next `/`; query/hash are
- *  already stripped by URL.pathname). undefined when there's no segment. */
-function parseTerminalSessionId(pathname: string): string | undefined {
-  if (!pathname.startsWith('/s/')) return undefined;
-  const seg = pathname.slice(3).split('/')[0];
-  return seg || undefined;
+function dashboardControlJson(res: ServerResponse, status: number, body: unknown): void {
+  res.writeHead(status, {
+    'content-type': 'application/json; charset=utf-8',
+    'cache-control': 'no-store',
+    'referrer-policy': 'no-referrer',
+  });
+  res.end(JSON.stringify(body));
+}
+
+function terminalControlAvailability(sessionId: string):
+  | { ok: true }
+  | { ok: false; status: number; error: string } {
+  const row = aggregator.getSession(sessionId) as {
+    status?: unknown;
+    larkAppId?: unknown;
+    webPort?: unknown;
+    proxyPort?: unknown;
+    riffAccessUrl?: unknown;
+  } | undefined;
+  if (!row || !aggregator.ownerOf(sessionId)) return { ok: false, status: 404, error: 'unknown_session' };
+  if (row.status === 'closed') return { ok: false, status: 409, error: 'session_not_active' };
+  if (typeof row.riffAccessUrl === 'string' && row.riffAccessUrl) {
+    return { ok: false, status: 409, error: 'terminal_external_only' };
+  }
+  const owner = aggregator.ownerOf(sessionId);
+  if (!owner || !registry.getByAppId(owner)) return { ok: false, status: 503, error: 'daemon_offline' };
+  if (!aggregator.terminalProxyPortOf(sessionId) || typeof row.webPort !== 'number') {
+    return { ok: false, status: 409, error: 'terminal_unavailable' };
+  }
+  return { ok: true };
 }
 
 const server = createServer(async (req, res) => {
@@ -2433,6 +2555,18 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    // Configurable Feishu/Lark H5 passwordless entry and code exchange. It is
+    // self-authenticating and must run before the ordinary Dashboard cookie
+    // gate; no authorization code or session capability is ever put in a URL.
+    if (await dashboardH5Auth.handle(req, res, url)) return;
+
+    // Session Web preview is an authenticated, same-origin reverse proxy to an
+    // agent-registered literal loopback target. It owns its auth gate because
+    // WebSocket upgrades do not pass through decideDashboardAuth; using one
+    // manager for HTTP + WS keeps the cookie/ownership/SSRF contract identical.
+    if (previewGuardPage.handle(req, res, url)) return;
+    if (await sessionPreviewProxy.handleHttp(req, res, url)) return;
+
     // Web terminal reverse-proxy: `/s/<sessionId>/*` → the owning bot daemon's
     // terminal proxy. The central platform only tunnels the dashboard port, so
     // terminal links served under the machine subdomain
@@ -2443,27 +2577,7 @@ const server = createServer(async (req, res) => {
     // response straight back. Mounted before the dashboard auth gate because the
     // worker independently requires a view/write capability or authenticated
     // dashboard cookie before serving either HTTP or WebSocket terminal data.
-    if (url.pathname === '/s' || url.pathname.startsWith('/s/')) {
-      const sessionId = parseTerminalSessionId(url.pathname);
-      const tport = sessionId ? aggregator.terminalProxyPortOf(sessionId) : undefined;
-      if (!tport) {
-        res.writeHead(404, { 'content-type': 'text/plain; charset=utf-8' });
-        return res.end('session terminal not available');
-      }
-      const upstream = httpRequest(
-        { host: '127.0.0.1', port: tport, method: req.method, path: req.url, headers: req.headers },
-        (up) => {
-          res.writeHead(up.statusCode ?? 502, up.headers);
-          up.pipe(res);
-        },
-      );
-      upstream.on('error', () => {
-        if (!res.headersSent) res.writeHead(502, { 'content-type': 'text/plain; charset=utf-8' });
-        res.end('terminal proxy error');
-      });
-      req.pipe(upstream);
-      return;
-    }
+    if (terminalFrontProxy.handleHttp(req, res, url)) return;
 
     if (await handleWebhookRoute(req, res, url, {
       proxyToDaemon,
@@ -2539,6 +2653,11 @@ const server = createServer(async (req, res) => {
     if (req.method === 'POST' && url.pathname === '/__cli/rotate') {
       const gate = verifyCliRequest(req, url.pathname);
       if (!gate.ok) return jsonRes(res, gate.status, gate.body);
+      if (activeToken) {
+        const previousSessionId = legacyDashboardAuthSessionId(activeToken);
+        terminalControl.releaseByAuthSession(previousSessionId);
+        previewInteraction.relockAuthSession(previousSessionId);
+      }
       activeToken = generateToken();
       try {
         persistToken(TOKEN_PATH, activeToken);
@@ -2580,19 +2699,24 @@ const server = createServer(async (req, res) => {
     }
 
     const presentedToken = authedToken(req, url);
+    const h5Identity = dashboardH5Auth.resolve(req);
+    const legacyAuthed = !!presentedToken && presentedToken === activeToken && !!activeToken;
+    const requestIdentity = dashboardRequestIdentity(req);
     const globalDashboardConfig = readGlobalConfig().dashboard;
-    const decision = decideDashboardAuth({
-      method: req.method ?? 'GET',
-      pathname: url.pathname,
-      hasTokenParam: url.searchParams.has('t'),
-      presentedToken,
-      activeToken: activeToken ?? '',
-      publicReadOnly: globalDashboardConfig?.publicReadOnly
-        ?? config.dashboard.publicReadOnly,
-    });
+    const decision = h5Identity
+      ? { kind: 'allow' as const }
+      : decideDashboardAuth({
+          method: req.method ?? 'GET',
+          pathname: url.pathname,
+          hasTokenParam: url.searchParams.has('t'),
+          presentedToken,
+          activeToken: activeToken ?? '',
+          publicReadOnly: globalDashboardConfig?.publicReadOnly
+            ?? config.dashboard.publicReadOnly,
+        });
     // `authed` is consumed by route handlers that distinguish the public-read
     // carve-out from a valid management cookie (notably v3 run details).
-    const authed = !!presentedToken && presentedToken === activeToken && !!activeToken;
+    const authed = requestIdentity !== null || legacyAuthed;
 
     if (decision.kind === 'deny401') {
       res.writeHead(401, { 'content-type': 'text/html; charset=utf-8' });
@@ -2615,6 +2739,91 @@ const server = createServer(async (req, res) => {
         error: 'legacy_workflow_retired',
         message: 'v2 workflow dashboard APIs are retired; use /api/v3/runs for v3 run visibility',
       });
+    }
+
+    // Authenticated, non-secret metadata used only to build Feishu appCenter
+    // and >=350px sidebar AppLinks. App secret and allowlist never cross this
+    // projection; the route is intentionally absent from public-read allowlists.
+    if (req.method === 'GET' && url.pathname === '/api/workbench/h5-context') {
+      return jsonRes(res, 200, {
+        ok: true,
+        h5: {
+          enabled: dashboardH5AuthConfig.enabled,
+          appId: dashboardH5AuthConfig.appId,
+          brand: dashboardH5AuthConfig.brand,
+          entryPath: dashboardH5AuthConfig.entryPath,
+        },
+      });
+    }
+
+    // Server-authoritative terminal control lease. The API returns only mode
+    // and timestamps; its signed read/write grant stays inside the central
+    // proxy and is never placed in a URL or response body.
+    let controlMatch = url.pathname.match(/^\/api\/sessions\/([^/]+)\/control(?:\/(takeover|release))?$/);
+    if (controlMatch) {
+      if (!requestIdentity) {
+        return dashboardControlJson(res, 401, { ok: false, error: 'authentication_required' });
+      }
+      let sessionId: string;
+      try { sessionId = decodeURIComponent(controlMatch[1]); }
+      catch { return dashboardControlJson(res, 400, { ok: false, error: 'invalid_session_id' }); }
+      const availability = terminalControlAvailability(sessionId);
+      if (!availability.ok) {
+        return dashboardControlJson(res, availability.status, { ok: false, error: availability.error });
+      }
+      const action = controlMatch[2];
+      if (req.method === 'GET' && !action) {
+        return dashboardControlJson(res, 200, { ok: true, ...terminalControl.state(requestIdentity, sessionId) });
+      }
+      if (req.method === 'POST' && action === 'takeover') {
+        const result = terminalControl.takeover(requestIdentity, sessionId);
+        const status = result.ok ? 200 : result.error === 'control_busy' ? 409 : 401;
+        return dashboardControlJson(
+          res,
+          status,
+          result.ok ? { ...result, owned: true } : { ok: false, error: result.error },
+        );
+      }
+      if (req.method === 'POST' && action === 'release') {
+        const result = terminalControl.release(requestIdentity, sessionId);
+        return dashboardControlJson(
+          res,
+          result.ok ? 200 : 403,
+          result.ok ? { ...result, owned: false } : { ok: false, error: result.error },
+        );
+      }
+      return dashboardControlJson(res, 405, { ok: false, error: 'method_not_allowed' });
+    }
+
+    // Preview interaction is separately scoped per authenticated browser
+    // session. Default is always the visibly labelled preview overlay; unlock
+    // and activity are explicit, and the server hard-relocks after 15m idle.
+    controlMatch = url.pathname.match(/^\/api\/sessions\/([^/]+)\/preview-interaction(?:\/(unlock|activity|lock))?$/);
+    if (controlMatch) {
+      if (!requestIdentity) {
+        return dashboardControlJson(res, 401, { ok: false, error: 'authentication_required' });
+      }
+      let sessionId: string;
+      try { sessionId = decodeURIComponent(controlMatch[1]); }
+      catch { return dashboardControlJson(res, 400, { ok: false, error: 'invalid_session_id' }); }
+      const resolution = resolveDashboardSessionPreview(sessionId);
+      if (!resolution.ok) {
+        return dashboardControlJson(res, resolution.status, { ok: false, error: resolution.error });
+      }
+      const action = controlMatch[2];
+      if (req.method === 'GET' && !action) {
+        return dashboardControlJson(res, 200, { ok: true, ...previewInteraction.state(requestIdentity, sessionId) });
+      }
+      if (req.method === 'POST' && action === 'unlock') {
+        return dashboardControlJson(res, 200, { ok: true, ...previewInteraction.unlock(requestIdentity, sessionId) });
+      }
+      if (req.method === 'POST' && action === 'activity') {
+        return dashboardControlJson(res, 200, { ok: true, ...previewInteraction.activity(requestIdentity, sessionId) });
+      }
+      if (req.method === 'POST' && action === 'lock') {
+        return dashboardControlJson(res, 200, { ok: true, ...previewInteraction.lock(requestIdentity, sessionId) });
+      }
+      return dashboardControlJson(res, 405, { ok: false, error: 'method_not_allowed' });
     }
 
     if (req.method === 'GET' && url.pathname === '/__dev/reload') {
@@ -2650,6 +2859,9 @@ const server = createServer(async (req, res) => {
       || url.pathname.startsWith('/api/debug-terminal/')
       || url.pathname.startsWith('/debug-terminal/')
     ) {
+      // H5 sessions are scoped to Dashboard/workbench control. They never
+      // inherit the legacy owner's unrestricted debug shell.
+      if (!legacyAuthed) return jsonRes(res, 403, { ok: false, error: 'legacy_owner_required' });
       if (debugTerminalManager.handleHttp(req, res, url)) return;
     }
 
@@ -2729,8 +2941,9 @@ const server = createServer(async (req, res) => {
           ? { ...s, botName: n }
           : s;
       });
+      const browserSessions = projectSessionPreviewsForBrowser(sessions);
       return jsonRes(res, 200, {
-        sessions: authed ? sessions : redactSessionsForPublic(sessions),
+        sessions: authed ? browserSessions : redactSessionsForPublic(browserSessions),
       });
     }
 
@@ -3852,6 +4065,10 @@ const server = createServer(async (req, res) => {
     // so decideDashboardAuth has already 401'd unauthenticated callers before we
     // get here — the token only reaches authenticated dashboard sessions.
     if (req.method === 'GET' && (m = url.pathname.match(/^\/api\/sessions\/([^/]+)\/write-link$/))) {
+      // Short H5 sessions use the tokenless /control/takeover lease. Returning
+      // the legacy stable capability here would bypass release/expiry/disconnect
+      // enforcement and leak a token into browser-visible JSON.
+      if (!legacyAuthed) return dashboardControlJson(res, 403, { ok: false, error: 'control_takeover_required' });
       const sid = decodeURIComponent(m[1]);
       const owner = aggregator.ownerOf(sid);
       if (!owner) return jsonRes(res, 404, { ok: false, error: 'unknown_session' });
@@ -3861,10 +4078,22 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    // Browser-safe preview metadata. The literal loopback host/port remains in
+    // the aggregator only; this authenticated API returns a same-origin path.
+    if (req.method === 'GET' && (m = url.pathname.match(/^\/api\/sessions\/([^/]+)\/preview$/))) {
+      const sid = decodeURIComponent(m[1]);
+      const resolution = resolveDashboardSessionPreview(sid);
+      if (!resolution.ok) return jsonRes(res, resolution.status, { ok: false, error: resolution.error });
+      const preview = previewDescriptorFromRow(aggregator.getSession(sid));
+      if (!preview) return jsonRes(res, 404, { ok: false, error: 'preview_not_registered' });
+      return jsonRes(res, 200, { ok: true, preview });
+    }
+
 
     // Dashboard「复现命令」：透传到 owning daemon 取该 session 的真实 CLI 调用。
     // 与 write-link 同样只在管理 cookie（写权限）下可达：命令含 token/凭证。
     if (req.method === 'GET' && (m = url.pathname.match(/^\/api\/sessions\/([^/]+)\/spawn-command$/))) {
+      if (!legacyAuthed) return dashboardControlJson(res, 403, { ok: false, error: 'legacy_owner_required' });
       const sid = decodeURIComponent(m[1]);
       const owner = aggregator.ownerOf(sid);
       if (!owner) return jsonRes(res, 404, { ok: false, error: 'unknown_session' });
@@ -5045,9 +5274,10 @@ const server = createServer(async (req, res) => {
         // full task object — strip the prompt AND workingDir for anonymous SSE
         // listeners, or the REST-side scrub would be trivially bypassed by
         // `/events`.
+        const projectedBody = projectSessionPreviewEventForBrowser(ev.type, ev.body) as typeof ev.body;
         let body = authed
-          ? ev.body
-          : redactSessionEventForPublic(ev.type, ev.body) as typeof ev.body;
+          ? projectedBody
+          : redactSessionEventForPublic(ev.type, projectedBody) as typeof ev.body;
         if (!authed && (ev.type === 'schedule.created' || ev.type === 'schedule.updated')) {
           const b = body as { schedule?: Record<string, unknown>; patch?: Record<string, unknown>; id?: string };
           body = {
@@ -5094,38 +5324,13 @@ const server = createServer(async (req, res) => {
 server.on('upgrade', (req: IncomingMessage, clientSocket: Duplex, head: Buffer) => {
   try {
     const rawUrl = req.url ?? '/';
+    if (sessionPreviewProxy.handleUpgrade(req, clientSocket, head)) return;
     // 调试终端 WS（owner-only）：manager 内部自校验管理 cookie。命中即接管。
     if (rawUrl.startsWith('/debug-terminal/')) {
       if (debugTerminalManager.handleUpgrade(req, clientSocket, head)) return;
     }
-    if (!(rawUrl === '/s' || rawUrl.startsWith('/s/') || rawUrl.startsWith('/s?'))) {
-      return clientSocket.destroy();
-    }
-    // Strip query/hash before extracting the sessionId path segment.
-    const pathname = rawUrl.split(/[?#]/)[0];
-    const sessionId = parseTerminalSessionId(pathname);
-    const tport = sessionId ? aggregator.terminalProxyPortOf(sessionId) : undefined;
-    if (!tport) return clientSocket.destroy();
-
-    const upstream = netConnect(tport, '127.0.0.1', () => {
-      // rawHeaders is a flat [k, v, k, v, ...] list — preserves casing/duplicates.
-      const lines = [`${req.method} ${req.url} HTTP/1.1`];
-      const rh = req.rawHeaders;
-      for (let i = 0; i + 1 < rh.length; i += 2) lines.push(`${rh[i]}: ${rh[i + 1]}`);
-      lines.push('', '');
-      upstream.write(lines.join('\r\n'));
-      if (head?.length) upstream.write(head);
-      upstream.pipe(clientSocket);
-      clientSocket.pipe(upstream);
-    });
-    const cleanup = () => {
-      try { upstream.destroy(); } catch { /* ignore */ }
-      try { clientSocket.destroy(); } catch { /* ignore */ }
-    };
-    upstream.on('error', cleanup);
-    clientSocket.on('error', cleanup);
-    upstream.on('close', () => clientSocket.destroy());
-    clientSocket.on('close', () => upstream.destroy());
+    if (terminalFrontProxy.handleUpgrade(req, clientSocket, head)) return;
+    clientSocket.destroy();
   } catch {
     try { clientSocket.destroy(); } catch { /* ignore */ }
   }

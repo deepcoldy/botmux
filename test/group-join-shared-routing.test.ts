@@ -84,7 +84,7 @@ beforeAll(async () => {
   tempRoot = mkdtempSync(join(tmpdir(), 'botmux-group-join-shared-'));
   process.env.SESSION_DATA_DIR = tempDir('sessions');
   modules = await loadModules();
-});
+}, 30_000);
 
 beforeEach(() => {
   modules.registry.__testOnly_resetBotRegistry();

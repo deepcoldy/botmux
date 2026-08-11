@@ -413,6 +413,23 @@ describe('updateSession()', () => {
     expect(reloaded!.webPort).toBe(9999);
   });
 
+  it('persists the explicitly registered preview target across a store restart', () => {
+    const session = createSession('chat1', 'root1', 'Preview target');
+    session.previewTarget = {
+      host: '127.0.0.1',
+      port: 4173,
+      registeredAt: '2026-08-11T12:00:00.000Z',
+    };
+    updateSession(session);
+
+    init();
+    expect(getSession(session.sessionId)?.previewTarget).toEqual({
+      host: '127.0.0.1',
+      port: 4173,
+      registeredAt: '2026-08-11T12:00:00.000Z',
+    });
+  });
+
   it('skips the disk write when an update produces byte-identical content', () => {
     // save() does writeFile(tmp) + rename(tmp → fp), so every REAL write
     // replaces the file's inode. A skipped write leaves the inode untouched.

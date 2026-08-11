@@ -11,7 +11,8 @@
 //   - /api/groups   → memberBots[].oncallChat = { chatId, workingDir }
 //   - /api/schedules → row carries `prompt` (business instructions) + `workingDir`
 //   - /api/settings → notifier carries recipient / delivery diagnostics
-//   - /api/sessions + /events → session rows/patches may carry `gitBranch`
+//   - /api/sessions + /events → session rows/patches may carry `gitBranch` or
+//                               authenticated preview metadata
 // The group/schedule `workingDir`s are repo / customer-project paths; stripping
 // them keeps the board functional (name-map, timing, status) while not leaking
 // bound dirs — and keeps the "/api/bots oncall config is private" boundary honest.
@@ -66,7 +67,12 @@ export function redactSchedulesForPublic(schedules: unknown[]): unknown[] {
  * for their shared session row shape. */
 export function redactSessionForPublic(session: unknown): unknown {
   if (!session || typeof session !== 'object' || Array.isArray(session)) return session;
-  const { gitBranch: _gitBranch, ...rest } = session as Record<string, unknown>;
+  const {
+    gitBranch: _gitBranch,
+    preview: _preview,
+    previewTarget: _previewTarget,
+    ...rest
+  } = session as Record<string, unknown>;
   return rest;
 }
 
@@ -88,7 +94,12 @@ export function redactSessionEventForPublic(type: string, body: unknown): unknow
     && typeof eventBody.patch === 'object'
     && !Array.isArray(eventBody.patch)
   ) {
-    const { gitBranch: _gitBranch, ...patch } = eventBody.patch as Record<string, unknown>;
+    const {
+      gitBranch: _gitBranch,
+      preview: _preview,
+      previewTarget: _previewTarget,
+      ...patch
+    } = eventBody.patch as Record<string, unknown>;
     return { ...eventBody, patch };
   }
   return body;

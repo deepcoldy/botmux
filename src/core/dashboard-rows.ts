@@ -13,6 +13,7 @@ import { getBotBrand } from '../bot-registry.js';
 import { type Brand, chatAppLink } from '../im/lark/lark-hosts.js';
 import { getSessionTokenUsage, type SessionTokenUsage } from './cost-calculator.js';
 import { getIdentity } from '../im/lark/identity-cache.js';
+import { safeSessionPreviewTarget, type SessionPreviewTarget } from './session-preview.js';
 
 export interface SessionRow {
   sessionId: string;
@@ -54,6 +55,9 @@ export interface SessionRow {
    *  up). When set, the terminal is reachable at {host}:{proxyPort}/s/{sessionId}.
    *  Mirrors the port buildTerminalUrl puts in card links so both agree. */
   proxyPort?: number;
+  /** Internal daemon→dashboard routing data. The central browser projection
+   * removes it and emits only `preview: { path, registeredAt }`. */
+  previewTarget?: SessionPreviewTarget;
   cliVersion?: string;
   hasHistory?: boolean;
   feishuChatLink: string;
@@ -173,6 +177,7 @@ export function composeRowFromActive(ds: DaemonSession): SessionRow {
     ownerOpenId: ds.session.ownerOpenId,
     webPort: ds.workerPort ?? null,
     proxyPort: getTerminalAdvertisedPort() || undefined,
+    previewTarget: safeSessionPreviewTarget(ds.session.previewTarget),
     riffAccessUrl: ds.riffAccessUrl,
     cliVersion: ds.cliVersion,
     hasHistory: ds.hasHistory,
@@ -213,6 +218,7 @@ export function composeRowFromClosed(s: Session): SessionRow {
     locked: !!s.locked,
     ownerOpenId: s.ownerOpenId,
     webPort: s.webPort ?? null,
+    previewTarget: safeSessionPreviewTarget(s.previewTarget),
     feishuChatLink: feishuChatLink(s.chatId, getBotBrand(s.larkAppId ?? '')),
     tokenUsage: sessionTokenUsage(s),
   };

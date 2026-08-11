@@ -140,6 +140,12 @@ import { repinSessionWorkingDir } from './session-cwd.js';
 import { authorizeSessionScopedIpc } from './daemon-ipc-session-auth.js';
 import { updateSessionTitle } from './session-title.js';
 import { requestAgentSessionRename } from './session-rename.js';
+import {
+  isPreviewLoopbackHost,
+  isPreviewPort,
+  probeSessionPreviewTarget,
+  sessionPreviewDescriptor,
+} from './session-preview.js';
 import type { DaemonToWorker, ScheduledTask, ParsedSchedule, ScheduleExecutionPosition, Session } from '../types.js';
 import { sessionAnchorId, type DaemonSession } from './types.js';
 import { attachSkillPolicy, detachSkillPolicy } from './skills/im-command.js';
@@ -402,7 +408,7 @@ function routeHasNarrowUntrustedAuth(method: string, pathname: string): boolean 
   // 该会话的 rotating per-turn
   // capability 并绑定到 URL 里的 sessionId（同 /api/asks 姿势）——capability 只
   // 证明「我是这个会话当前这一轮的 CLI」，选不了别的会话。
-  if (method === 'POST' && /^\/api\/sessions\/[^/]+\/(?:slash|cd|close)$/.test(pathname)) return true;
+  if (method === 'POST' && /^\/api\/sessions\/[^/]+\/(?:slash|cd|close|preview)$/.test(pathname)) return true;
   if (method === 'POST' && pathname === '/api/hooks/emit') return true;
   if (method === 'POST' && pathname === '/api/attention') return true;
   // Workflow v3 mutations carry their own domain-separated full-envelope
@@ -758,6 +764,72 @@ function sessionCliIpcAuth(
   });
   return decision.ok ? { ok: true } : { ok: false, error: decision.error };
 }
+
+/** Register one reachable loopback Web service for the exact calling session.
+ * This is the only route that can create preview routing state. An isolated CLI
+ * enters through the narrow capability aperture; a trusted host call is still
+ * path/port-bound by the outer daemon HMAC. The requested host is never DNS —
+ * only literal IPv4/IPv6 loopback is accepted, and the daemon connects before
+ * persisting the target. */
+ipcRoute('POST', '/api/sessions/:sessionId/preview', async (req, res, params) => {
+  let body: Record<string, unknown>;
+  try {
+    body = await readJsonBody<Record<string, unknown>>(req, 4_096);
+  } catch (error) {
+    return jsonRes(
+      res,
+      error instanceof JsonBodyTooLargeError ? 413 : 400,
+      { ok: false, error: error instanceof JsonBodyTooLargeError ? 'body_too_large' : 'bad_json' },
+    );
+  }
+  const ds = findActiveBySessionId(params.sessionId);
+  const auth = sessionCliIpcAuth(req, ds, params.sessionId, body);
+  if (!auth.ok) return jsonRes(res, 403, { ok: false, error: auth.error });
+  if (!ds) return jsonRes(res, 404, { ok: false, error: 'session_not_active' });
+  if (!isPreviewPort(body.port)) {
+    return jsonRes(res, 400, { ok: false, error: 'invalid_port' });
+  }
+  if (body.host !== undefined && !isPreviewLoopbackHost(body.host)) {
+    return jsonRes(res, 403, { ok: false, error: 'remote_host_forbidden' });
+  }
+  const target = await probeSessionPreviewTarget({
+    port: body.port,
+    ...(isPreviewLoopbackHost(body.host) ? { host: body.host } : {}),
+  });
+  if (!target) {
+    return jsonRes(res, 422, { ok: false, error: 'preview_unreachable' });
+  }
+
+  const previous = ds.session.previewTarget;
+  ds.session.previewTarget = target;
+  try {
+    sessionStore.updateSession(ds.session);
+  } catch {
+    ds.session.previewTarget = previous;
+    return jsonRes(res, 500, { ok: false, error: 'preview_persist_failed' });
+  }
+  dashboardEventBus.publish({
+    type: 'session.update',
+    body: { sessionId: params.sessionId, patch: { previewTarget: target } },
+  });
+  return jsonRes(res, 200, {
+    ok: true,
+    preview: sessionPreviewDescriptor(params.sessionId, target),
+  });
+});
+
+/** Host-only daemon read API. It intentionally returns the browser-safe
+ * descriptor, not the literal loopback host/port used inside daemon SSE. */
+ipcRoute('GET', '/api/sessions/:sessionId/preview', (req, res, params) => {
+  if (!isTrustedHostIpcRequest(req) && !ipcHmacAuthorized(req)) {
+    return jsonRes(res, 401, { ok: false, error: 'unauthorized' });
+  }
+  const ds = findActiveBySessionId(params.sessionId);
+  if (!ds) return jsonRes(res, 404, { ok: false, error: 'session_not_active' });
+  const preview = sessionPreviewDescriptor(params.sessionId, ds.session.previewTarget);
+  if (!preview) return jsonRes(res, 404, { ok: false, error: 'preview_not_registered' });
+  return jsonRes(res, 200, { ok: true, preview });
+});
 
 /** 向本会话 CLI 注入一条 allowlist 内的原生斜杠命令（idle 后生效）。
  *  鉴权双路径（见 sessionCliIpcAuth）：trusted-host 签名或本会话 rotating

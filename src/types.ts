@@ -217,6 +217,11 @@ export interface Session {
   pid?: number;
   workingDir?: string;
   webPort?: number;
+  /** Agent-registered local Web preview for this session. The daemon accepts
+   * only a reachable literal loopback target through the session-scoped CLI
+   * capability. Browser APIs/SSE replace this internal target with a
+   * same-origin path and never expose its host/port. */
+  previewTarget?: import('./core/session-preview.js').SessionPreviewTarget;
   /** riff：最近一个任务 id（follow-up 血缘锚点）。持久化后 daemon 重启的下一条
    *  消息仍走 task-follow-up 延续沙箱与上下文，而非冷启新任务。 */
   riffParentTaskId?: string;

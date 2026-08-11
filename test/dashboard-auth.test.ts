@@ -600,6 +600,14 @@ describe('decideDashboardAuth — publicReadOnly mode', () => {
       // Mints a token-bearing writable terminal URL — never public, even in
       // publicReadOnly (the daemon IPC behind it is also loopback-HMAC gated).
       '/api/sessions/sess-1/write-link',
+      // Preview metadata and proxied app bytes require the management cookie;
+      // public-read visitors may see neither, even though /api/sessions itself
+      // is available through its redacted projection.
+      '/api/sessions/sess-1/preview',
+      '/api/sessions/sess-1/control',
+      '/api/sessions/sess-1/preview-interaction',
+      '/api/workbench/h5-context',
+      '/preview/sess-1/',
       // A path that doesn't exist yet must also default to private.
       '/api/some-future-read',
     ]) {

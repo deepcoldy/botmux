@@ -7,6 +7,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { WebSocket } from 'ws';
 import type { DaemonToWorker, WorkerToDaemon } from '../src/types.js';
 import { deriveTerminalViewToken, deriveTerminalWriteToken } from '../src/core/terminal-write-auth.js';
+import { issueTerminalControlGrant } from '../src/core/terminal-control-grant.js';
 
 const children = new Set<ChildProcess>();
 const tempDirs = new Set<string>();
@@ -92,6 +93,7 @@ describe('worker terminal read authorization', () => {
     // keeps the PTY alive long enough to exercise the real worker server.
     const fakeCli = join(root, 'fake-claude');
     const inputLog = join(root, 'terminal-input.hex');
+    const controlAuditLog = join(root, 'dashboard-control.ndjson');
     writeFileSync(fakeCli, `#!/usr/bin/env node
 const { appendFileSync } = require('node:fs');
 process.stdin.setRawMode?.(true);
@@ -110,6 +112,7 @@ setInterval(() => {}, 1_000);
         HOME: root,
         SESSION_DATA_DIR: dataDir,
         BOTMUX_SESSION_ID: sessionId,
+        BOTMUX_DASHBOARD_CONTROL_AUDIT_PATH: controlAuditLog,
         LARK_APP_ID: 'app_terminal_auth',
         LARK_APP_SECRET: 'secret',
       },
@@ -157,6 +160,28 @@ setInterval(() => {}, 1_000);
     expect(write.status).toBe(200);
     expect(await write.text()).toContain('var hasToken=true');
 
+    const signedRead = issueTerminalControlGrant(secret, {
+      scope: 'read', sessionId, userId: 'ou_h5_owner', authSessionId: 'h5-auth-1',
+      issuedAt: Date.now() - 1_000, expiresAt: Date.now() + 10_000,
+    });
+    const signedReadResponse = await fetch(`${base}/`, {
+      headers: { 'x-botmux-terminal-control': signedRead },
+    });
+    expect(signedReadResponse.status).toBe(200);
+    expect(await signedReadResponse.text()).toContain('var hasToken=false');
+
+    const wrongSessionGrant = issueTerminalControlGrant(secret, {
+      scope: 'write', sessionId: 'another-session', userId: 'ou_h5_owner', authSessionId: 'h5-auth-1',
+      issuedAt: Date.now() - 1_000, expiresAt: Date.now() + 10_000,
+    });
+    expect((await fetch(`${base}/`, { headers: { 'x-botmux-terminal-control': wrongSessionGrant } })).status).toBe(403);
+
+    const expiredGrant = issueTerminalControlGrant(secret, {
+      scope: 'write', sessionId, userId: 'ou_h5_owner', authSessionId: 'h5-auth-1',
+      issuedAt: Date.now() - 20_000, expiresAt: Date.now() - 10_000,
+    });
+    expect((await fetch(`${base}/`, { headers: { 'x-botmux-terminal-control': expiredGrant } })).status).toBe(403);
+
     const rejectedWs = await rawWsHandshake(ready.port, '/');
     expect(rejectedWs).toContain('403 Forbidden');
 
@@ -174,6 +199,42 @@ setInterval(() => {}, 1_000);
     await new Promise(resolvePromise => setTimeout(resolvePromise, 150));
     expect(readFileSync(inputLog, 'utf8')).toBe('');
     ws.close();
+
+    // A valid short-lived Dashboard write grant is independently verified by
+    // the worker. Accepted input is audited with identity/session/action and a
+    // byte count only; neither the grant nor input content is retained.
+    writeFileSync(inputLog, '');
+    const signedWrite = issueTerminalControlGrant(secret, {
+      scope: 'write', sessionId, userId: 'ou_h5_owner', authSessionId: 'h5-auth-1',
+      issuedAt: Date.now() - 1_000, expiresAt: Date.now() + 10_000,
+    });
+    const controlledWs = new WebSocket(`ws://127.0.0.1:${ready.port}/`, {
+      headers: { 'x-botmux-terminal-control': signedWrite },
+    });
+    await new Promise<void>((resolvePromise, rejectPromise) => {
+      const timer = setTimeout(() => rejectPromise(new Error('controlled WS timeout')), 5_000);
+      controlledWs.once('open', () => { clearTimeout(timer); resolvePromise(); });
+      controlledWs.once('error', err => { clearTimeout(timer); rejectPromise(err); });
+    });
+    const controlledInput = 'H5_CONTROLLED_INPUT\n';
+    controlledWs.send(JSON.stringify({ type: 'input', data: controlledInput }));
+    const controlledWritten = await waitForFileText(
+      inputLog,
+      text => text.includes(Buffer.from(controlledInput).toString('hex')),
+    );
+    expect(controlledWritten).toContain(Buffer.from(controlledInput).toString('hex'));
+    const auditText = await waitForFileText(controlAuditLog, text => text.includes('terminal.input'));
+    const auditRows = auditText.trim().split('\n').map(line => JSON.parse(line));
+    expect(auditRows).toContainEqual(expect.objectContaining({
+      timestamp: expect.any(String),
+      user: 'ou_h5_owner',
+      session: sessionId,
+      action: 'terminal.input',
+      bytes: Buffer.byteLength(controlledInput),
+    }));
+    expect(auditText).not.toContain(controlledInput.trim());
+    expect(auditText).not.toContain(signedWrite);
+    controlledWs.close();
 
     // The write capability still reaches the PTY through the same server.
     const writeWs = new WebSocket(`ws://127.0.0.1:${ready.port}/?token=${encodeURIComponent(ready.token)}`);

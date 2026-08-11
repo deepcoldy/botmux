@@ -1021,6 +1021,21 @@ function DashboardShell(): JSX.Element {
     expiredShown = false;
     setAuthExpiredOpen(false);
   };
+  const workbenchSurface = activeHash.startsWith('#/agent-workbench-dock')
+    ? 'dock'
+    : activeHash.startsWith('#/agent-workbench')
+      ? 'appCenter'
+      : null;
+  if (workbenchSurface) {
+    return (
+      <>
+        <div className="workbench-route-host" data-workbench-surface={workbenchSurface}>
+          <main id="root" ref={setRouteRoot} />
+        </div>
+        <AuthExpiredOverlay open={authExpiredOpen} onClose={closeAuthExpired} />
+      </>
+    );
+  }
   return (
     <>
       <div className="aurora" aria-hidden="true"><i className="a1" /><i className="a2" /><i className="a3" /></div>

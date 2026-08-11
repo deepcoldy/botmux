@@ -99,6 +99,8 @@ import {
   safeTerminalTokenEqual,
   type TerminalAccessDecision,
 } from './core/terminal-write-auth.js';
+import { verifyTerminalControlGrant } from './core/terminal-control-grant.js';
+import { appendControlAudit, controlAuditRecord } from './dashboard/control-audit.js';
 import { readPlatformBinding } from './platform/binding.js';
 import { loadDashboardSecret, loadPersistedToken } from './dashboard/auth.js';
 import { InflightInputTracker } from './core/inflight-input-tracker.js';
@@ -1180,14 +1182,42 @@ function refreshTerminalWriteToken(): void {
  * `botmux bind`/unbind and dashboard token rotation are hot-reloaded without
  * restarting this worker, so a cached value would go stale.
  */
-function resolveTerminalAccessForReq(req: IncomingMessage, url: URL): TerminalAccessDecision {
-  return resolveTerminalAccessForRequest(
+interface WorkerTerminalAccess extends TerminalAccessDecision {
+  /** Signed Dashboard identity used only for content-free input audit rows. */
+  auditUser?: string;
+  /** Fixed grant expiry. Writable WS connections are closed at this boundary. */
+  controlExpiresAt?: number;
+}
+
+function resolveTerminalAccessForReq(req: IncomingMessage, url: URL): WorkerTerminalAccess {
+  const legacy = resolveTerminalAccessForRequest(
     req.headers,
     safeTerminalTokenEqual(url.searchParams.get('token'), writeToken),
     safeTerminalTokenEqual(url.searchParams.get('viewToken'), viewToken),
     () => readPlatformBinding() !== null,
     () => loadPersistedToken(DASHBOARD_TOKEN_PATH),
   );
+  const secret = loadDashboardSecret(DASHBOARD_SECRET_PATH);
+  if (!secret || !sessionId) return legacy;
+  const grant = verifyTerminalControlGrant(
+    secret,
+    req.headers['x-botmux-terminal-control'],
+    sessionId,
+  );
+  if (!grant.ok) return legacy;
+  return {
+    hasRead: true,
+    hasWrite: grant.claims.scope === 'write',
+    platformReadonly: grant.claims.scope === 'read',
+    auditUser: grant.claims.userId,
+    controlExpiresAt: grant.claims.expiresAt,
+  };
+}
+
+function auditTerminalInput(user: string | undefined, data: string): void {
+  appendControlAudit(controlAuditRecord(user ?? 'legacy-capability', sessionId, 'terminal.input', {
+    bytes: Buffer.byteLength(data),
+  }));
 }
 
 /** Lazily-written locked-mode zellij config for per-WS web-terminal attach
@@ -8795,9 +8825,26 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
         ws.close(1008, 'Bad Request');
         return;
       }
-      const { hasWrite } = resolveTerminalAccessForReq(req, url);
+      const access = resolveTerminalAccessForReq(req, url);
+      const { hasWrite, auditUser, controlExpiresAt } = access;
       if (hasWrite) authedClients.add(ws);
       log(`WS client connected (total: ${wsClients.size}, write: ${hasWrite})`);
+      // A signed Dashboard lease is fixed-expiry. Even if the central proxy's
+      // socket invalidation is delayed or bypassed, the worker independently
+      // removes write authority and closes this connection at the signed
+      // boundary; a reconnect then resolves as read-only.
+      let controlExpiryTimer: NodeJS.Timeout | undefined;
+      if (hasWrite && controlExpiresAt !== undefined) {
+        controlExpiryTimer = setTimeout(() => {
+          authedClients.delete(ws);
+          if (ws.readyState === WebSocket.OPEN) ws.close(4003, 'control expired');
+        }, Math.max(0, controlExpiresAt - Date.now()));
+        controlExpiryTimer.unref();
+      }
+      ws.once('close', () => {
+        if (controlExpiryTimer) clearTimeout(controlExpiryTimer);
+        authedClients.delete(ws);
+      });
 
       if (isTmuxMode && !isPipeMode && sessionId) {
         // ── Tmux-attach mode: per-client attach ──
@@ -8878,6 +8925,7 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
               // a mouse-aware TUI may bind any of them to approvals/actions.
               // A view capability therefore forwards no input bytes at all.
               if (!authedClients.has(ws)) return;
+              auditTerminalInput(auditUser, msg.data);
               if (cp) cp.write(msg.data);
               else pendingInput.push(msg.data);
             }
@@ -8948,6 +8996,7 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
               else cp.resize(msg.cols, msg.rows);
             } else if (msg.type === 'input' && typeof msg.data === 'string') {
               if (!authedClients.has(ws)) return;
+              auditTerminalInput(auditUser, msg.data);
               if (cp) cp.write(msg.data);
               else pendingInput.push(msg.data);
             }
@@ -9015,6 +9064,7 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
               // Mouse protocols can encode approvals/actions as well as wheel input.
               // A read-only view capability must never forward bytes to the backend.
               if (!authedClients.has(ws)) return;
+              auditTerminalInput(auditUser, msg.data);
               if (usesHerdrSnapshotWebHistory()) {
                 if (msg.data.includes('\x1b[<64;')) herdrWebScrollDirection = 'up';
                 else if (msg.data.includes('\x1b[<65;')) herdrWebScrollDirection = 'down';

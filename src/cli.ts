@@ -15,6 +15,7 @@
  *   botmux device enroll|status|logout — manage the host desktop device credential
  *   botmux list           — interactive session picker (TUI), attach to tmux
  *   botmux list --plain   — plain table output (for piping / scripts)
+ *   botmux preview <port> — register this session's loopback Web preview
  *   botmux delete <id>    — close a session by ID prefix
  *   botmux delete all     — close all active sessions
  *   botmux autostart enable|disable|status — manage boot-time autostart (launchd / user systemd / Windows Task Scheduler)
@@ -4082,14 +4083,14 @@ async function cmdSuspend(): Promise<void> {
   if (failed > 0) process.exitCode = 1;
 }
 
-/** 会话级 CLI IPC（slash/cd/close）的 POST：与 postAsk 同款双路径——能读 host secret
+/** 会话级 CLI IPC（slash/cd/close/preview）的 POST：与 postAsk 同款双路径——能读 host secret
  *  （非隔离进程）走 trusted-host HMAC 签名；读不到（沙箱 BOTMUX_SEND_RELAY /
  *  macOS 读隔离 carve-out）改带本会话当前轮换的 origin capability，由 daemon
  *  handler 与活跃记录比对。两条路都不读 bots.json。 */
 async function postSessionCliIpc(
   ipcPort: number,
   sessionId: string,
-  route: 'slash' | 'cd' | 'close',
+  route: 'slash' | 'cd' | 'close' | 'preview',
   payload: Record<string, unknown>,
 ): Promise<Response> {
   const requestBody: Record<string, unknown> = { ...payload };
@@ -4118,6 +4119,68 @@ async function postSessionCliIpc(
   return hostSecret
     ? fetchDaemonIpc(ipcPort, path, init, hostSecret)
     : fetch(`http://127.0.0.1:${ipcPort}${path}`, init);
+}
+
+/** `botmux preview <port>` registers a reachable loopback Web service for the
+ * exact current session. There is intentionally no `--session` escape hatch:
+ * ancestry/env resolution plus the rotating session capability prove which
+ * agent is volunteering the port. The daemon performs the authoritative port
+ * validation/probe and persists the result. */
+async function cmdPreview(rest: string[]): Promise<void> {
+  if (rest.length !== 1 || !/^\d+$/.test(rest[0])) {
+    console.error('用法: botmux preview <port>');
+    process.exit(1);
+  }
+  const port = Number(rest[0]);
+  if (!Number.isSafeInteger(port) || port < 1 || port > 65_535) {
+    console.error('✗ 端口必须是 1-65535 的整数');
+    process.exit(1);
+  }
+  const ctx = findAncestorSessionContext();
+  if (!ctx?.sessionId) {
+    console.error('✗ 无法定位当前会话；preview 只能在 botmux 会话内注册');
+    process.exit(1);
+  }
+
+  let discoveredPort: number | undefined;
+  try {
+    discoveredPort = findDaemon(process.env.BOTMUX_LARK_APP_ID)?.ipcPort;
+  } catch {
+    // Sandboxed/read-isolated sessions cannot enumerate daemon descriptors.
+  }
+  const ipcPort = resolveDaemonIpcPort(discoveredPort, process.env.BOTMUX_DAEMON_IPC_PORT);
+  if (!ipcPort) {
+    console.error('✗ 无法定位当前会话的 daemon；请确认 daemon 正在运行');
+    process.exit(1);
+  }
+
+  let response: Response;
+  try {
+    response = await postSessionCliIpc(ipcPort, ctx.sessionId, 'preview', { port });
+  } catch {
+    console.error('✗ 无法连接当前会话的 daemon');
+    process.exit(1);
+  }
+  const body = await response.json().catch(() => ({})) as {
+    ok?: boolean;
+    error?: string;
+    preview?: { path?: string };
+  };
+  if (response.ok && body.ok && typeof body.preview?.path === 'string') {
+    console.log(`✓ Web 预览已注册: ${body.preview.path}`);
+    return;
+  }
+  const error = body.error ?? `HTTP ${response.status}`;
+  if (error === 'preview_unreachable') {
+    console.error('✗ 端口不可达；请先让 Web 服务监听本机 loopback/0.0.0.0 后再注册');
+  } else if (error === 'remote_host_forbidden') {
+    console.error('✗ 只允许注册本机 loopback 服务');
+  } else if (error === 'origin_unproven' || error === 'managed_action_required') {
+    console.error('✗ 当前会话归属校验失败');
+  } else {
+    console.error(`✗ 预览注册失败: ${error}`);
+  }
+  process.exit(1);
 }
 
 /** botmux slash "<斜杠命令>"：请求 daemon 在本会话 idle 后把命令敲入自己的 CLI。
@@ -4812,6 +4875,8 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
   term-link [id]   获取活跃会话的「可操作终端」（带写 token）。不回显链接，改由
                    daemon 把可操作卡片私密发给 owner（群内仅你可见，话题/单聊回退 DM）。
                    单个活跃会话可省略 id
+  preview <port>   （会话内）注册当前会话已启动的本机 Web 服务；Dashboard 登录后通过
+                   同源 /preview/<sessionId>/ 访问，不暴露本机地址或任何 token
   autostart enable     注册开机自启（macOS launchd / Linux user systemd / Windows Task Scheduler，无需 sudo）
   autostart disable    注销开机自启
   autostart status     查看自启状态
@@ -9153,6 +9218,9 @@ if (process.env.BOTMUX_WORKFLOW === '1') {
     'bots',
     'skill',
     'hook',
+    // Local-only, session-capability-bound preview registration. It has no chat,
+    // workflow, deployment, or external messaging effect.
+    'preview',
     'session-ready',
     'mcp',
     'ask', // dedicated cmdAsk guard emits the humanGate-specific guidance
@@ -9944,6 +10012,7 @@ switch (command) {
     break;
   }
   case 'term-link': await cmdTermLink(process.argv.slice(3)); break;
+  case 'preview': await cmdPreview(process.argv.slice(3)); break;
   case 'schedule': await cmdSchedule(process.argv[3] ?? '', process.argv.slice(4)); break;
   case 'ask': {
     // `botmux ask buttons --options ...` → sub='buttons', rest=['--options', ...]
