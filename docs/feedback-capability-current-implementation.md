@@ -1,11 +1,12 @@
 # Botmux 反馈能力：现阶段实现说明
 
-> 文档状态：基于 `feat/skill-feedback` 实现与 schema v6 整理
+> 文档状态：基于 `feat/skill-feedback` commit `6d5136fa` 与 schema v6 整理
 >
 > 对照基线：Botmux 作者反馈能力技术方案 review 稿（revision 7）
 >
 > 对照日期：2026-08-11
-> 说明：本文描述当前实现能力与已知边界，不是未来设计稿。
+>
+> 说明：本文描述当前已提交、已部署能力与已知边界，不是未来设计稿。
 
 ## 1. 结论
 
@@ -16,7 +17,8 @@
 - 本地 SQLite 是事实源；事件和 webhook 是标准外发出口。
 - 语义固定为 `positive / progress / negative`，业务呈现可配置。
 - 策略支持 `team → bot → chat` 分层，优先级为 `chat > bot > team > built-in`。
-- 已实现强关联 delivery、统一 `turn.completed`、durable outbox/webhook 和 Dashboard 分析。
+- Core 统一持久化具备真实 worker terminal 信号且关联到 canonical Lark delivery 的 `turn.completed`；主动 `botmux send` 只有 delivery，没有 terminal/completion event。
+- 已实现强关联 delivery、durable outbox/webhook 和 Dashboard 分析 API/基础页面。
 
 当前实现已覆盖原方案 M1、M2 和 M3 的主体。仍未实现的主要增强项是：通用 card-action 插件注册表、Agent 交付时的动态反馈选项建议、native assistant message ID、Dashboard webhook secret 写入界面、通用本地事件订阅 API，以及非 Lark 平台适配。
 
@@ -30,13 +32,13 @@
 | 排除特殊 sink | 已实现 | doc-comment、VC receiver、HTTP wait/async、managed receiver、自定义卡、语音/视频等路径不创建普通 Lark 反馈 delivery |
 | 三态统一语义 | 已实现 | 固定 `positive / progress / negative`；默认 key/文案为 `conclusive_usable/结论可用`、`effective_progress/有效推进`、`incorrect/结论有误` |
 | 呈现层可配置 | 已实现 | 可配按钮 key、文案、style、顺序、可见语义、负向原因、说明框、是否必填、长度及 `allowReselect` |
-| 团队 / bot / 群配置 | 已实现 | local hosted team、bot、bot-scoped chat 三层；显式 `enabled:false` 可关闭继承；Dashboard 可编辑和预览有效策略 |
-| 策略快照 | 已实现 | 每条 delivery 保存发送时 effective policy；配置热更新只影响新卡 |
-| 强回答↔执行↔消息关联 | 已实现 | schema v6 保存 bot/session/turn/native session/platform message/chat/topic/attempt/hash/ref/CLI/model/Skill/workflow/task/status/usage 等 |
+| 团队 / bot / 群配置 | Core/API 已实现，Dashboard 基础 UI | local hosted team、bot、bot-scoped chat 三层；显式 `enabled:false` 可关闭继承；Dashboard 以 JSON textarea 编辑 team/bot policy，群下拉可保存覆盖并预览有效策略；尚不支持加载/删除既有 chat layer 的完整 CRUD |
+| 策略快照 | 已实现 | 每条 delivery 保存发送时 effective policy；配置热更新在 daemon worker 路径于下一次 session fork/restart 生效，主动 send 按发送时当前配置生成快照 |
+| 强回答↔执行↔消息关联 | 已实现 | schema v6 保存 bot/session/turn/native session/platform message/chat/topic/attempt/hash/ref/CLI/model/Skill/workflow/task/status/usage 等；delivery ID 包含 native session，terminal reconcile 使用 bot/session/turn/attempt |
 | 默认不存完整回答 | 已实现 | `responses` 只存 hash/ref；卡片快照只保留反馈区和 footer 结构；点击时优先从 Lark 回读原卡正文 |
-| 统一 turn 完成通知 | 已实现 | 持久化 `turn.completed`，支持 terminal-before-delivery 与 delivery-before-terminal，重复信号幂等 |
-| 标准 webhook 出口 | 已实现 | `turn.completed` 和 `feedback.revised` 进入 durable outbox；HMAC、事件 ID、重试、重启恢复、SSRF 防护 |
-| Dashboard 分析 | 已实现 | 私有认证 API 与反馈页面；覆盖率、正向率、三态趋势、原因、交付/出口失败、分页下钻 |
+| worker turn 完成通知 | 已实现但有边界 | 持久化匹配 worker terminal + canonical delivery 的 `turn.completed`，支持 terminal-before-delivery 与 delivery-before-terminal、重复信号幂等；主动 `botmux send` 不产生 terminal/completion event |
+| 标准 webhook 出口 | 已实现 | 已产生的 `turn.completed` 和每条 `feedback.revised` 可进入 durable outbox；HMAC、事件 ID、重试、重启恢复、SSRF 防护；无 destination 时仅落事件表 |
+| Dashboard 分析 | API 完整，页面基础 | 私有认证 API 支持覆盖率、正向率、三态趋势、原因、交付/出口失败、过滤与分页下钻；当前页面固定最近 30 天，显示 KPI、positive trend、原因和下钻，尚未暴露全量筛选控件和 progress trend |
 | card-off 首期不支持 | 符合建议 | 反馈依赖 interactive card；不会为纯文本模式额外发反馈卡 |
 | nativeMessageId P1 | 未实现 | 当前使用 turnId + nativeSessionId + dispatchAttempt + contentHash/ref + platformMessageId；没有原生 assistant row ID |
 | 通用 card-action 注册表 | 未实现 | 反馈 handler 已在 core 接入，但分发仍非面向第三方插件的公开注册表 |
@@ -69,7 +71,7 @@ Core 只接受三种语义：
 
 - 总开关默认关闭。
 - `apiOnly` bot 不展示反馈。
-- audience 当前固定为本次 requester。
+- audience 的鉴权主体固定为 delivery 中保存的 requester subject。正常 final 路径优先使用精确 turn sender；当该身份不可得时，当前实现会退化到已确认的 session owner/footer recipient，因此不是所有路径都能保证等同于“本次消息发送者”。
 - `allowReselect` 默认 `false`；只有显式设置 `true` 才允许改选。
 - 说明框默认开启、非必填，默认最大 1000 字。
 - 负向原因默认可为空，由业务配置。
@@ -229,15 +231,16 @@ botmux send --response-kind final ...
 
 ## 7. 统一 turn.completed
 
-### 7.1 事件生成
+### 7.1 事件生成边界
 
-Core 将真实 terminal 信号和真实成功 delivery 持久化后进行 reconcile：
+Core 将真实 worker terminal 信号和真实成功 canonical delivery 持久化后进行 reconcile：
 
 - terminal 先到、delivery 后到：后到时补发事件；
 - delivery 先到、terminal 后到：terminal 到达时生成事件；
 - 重复信号幂等；
 - 冲突 terminal 状态拒绝覆盖；
 - 没有 canonical Lark delivery 的特殊 sink 不伪装成 Lark 完成事件。
+- 主动 `botmux send --response-kind final` 会保存 delivery，但当前不产生 worker terminal，因此不会生成 `turn.completed`。
 
 ### 7.2 状态
 
@@ -280,7 +283,7 @@ daemon 启动时恢复 stale claims，运行中也周期恢复；claim/settle �
 - 默认只允许 HTTPS。
 - 禁止 URL credentials 和 fragment。
 - DNS 解析后阻断 loopback、link-local、private、reserved 等地址；连接固定到校验过的 IP，降低 DNS rebinding 风险。
-- 仅管理员级全局策略可以允许私网 destination。
+- 当前 daemon 未暴露允许私网 destination 的配置入口，运行时始终阻断 private/link-local/loopback/reserved 地址；dispatcher 的 `allowPrivateNetworks` 仅是未接生产配置的底层选项。
 - 禁止 redirect。
 - 请求体上限 256 KiB，超时限制 100 ms–30 s。
 - HMAC-SHA256 签名覆盖精确 event bytes 和 timestamp。
@@ -300,33 +303,36 @@ daemon 启动时恢复 stale claims，运行中也周期恢复；claim/settle �
 
 ### 9.1 配置面
 
-- local hosted team 反馈策略编辑。
+- local hosted team 反馈策略 JSON 编辑。
 - bot 反馈开关和高级 JSON。
-- 从 bot 已加入的群中选择 chat，保存 bot-scoped chat override。
-- effective policy 预览，显示 team/bot/chat layers、字段来源和 `enabled/disabled/api_only/ambiguous_team` 原因。
+- 从 bot 已加入的群中选择 chat，将当前 JSON 保存为 bot-scoped chat override，并预览 effective policy。
+- 当前 chat UI 尚不加载已有 override 供独立编辑，也未提供删除 override 的完整 CRUD。
+- effective policy 预览显示 team/bot/chat layers、字段来源和 `enabled/disabled/api_only/ambiguous_team` 原因。
 - 远端/platform team 只读，不把它当作本地策略 owner。
 
 ### 9.2 分析页
 
-新增私有认证的反馈页与 API，默认查看最近 30 天：
+新增私有认证的反馈页与 API。分析 API 默认被页面以最近 30 天调用，支持：
 
 - delivered turns；
 - rated deliveries / ratings；
 - rating coverage；
 - positive rate；
-- positive/progress/negative 趋势；
+- positive/progress/negative 趋势数据；
 - 负向原因分布；
 - delivery failures；
 - outbox failures；
 - redacted delivery drill-down 和 cursor pagination。
 
-可过滤 time、team、bot、chat/topic、semantic、verdict、reason、model、CLI/version、Skill/version、workflow/task、status。SQL 使用参数绑定、限制最大时间范围，并通过 v6 索引支持常见维度。
+API 可过滤 time、team、bot、chat/topic、semantic、verdict、reason、model、CLI/version、Skill/version、workflow/task、status。SQL 使用参数绑定、限制最大时间范围，并通过 v6 索引支持常见维度。
+
+当前页面只暴露固定最近 30 天视图，展示 KPI、positive trend、原因、失败和分页下钻；尚未暴露 API 的全量筛选控件，也未可视化 progress/negative trend。
 
 未认证分析请求返回 401；下钻不返回完整回答、operator ID、comment、base card 或 secret。
 
 ## 10. 运行与验证状态
 
-当前实现已通过构建、迁移和交互验证。能力运行时只依赖 core built-in feedback，不依赖旧 `skill-feedback` 插件进程。
+当前分支：`feat/skill-feedback`，实现 commit `6d5136fa`，PR #830。能力已构建并部署到本机 daemon，旧 `skill-feedback` 插件进程已移除，只运行 core built-in。
 
 已完成的验证包括：
 
@@ -386,13 +392,12 @@ daemon 启动时恢复 stale claims，运行中也周期恢复；claim/settle �
 
 按优先级建议：
 
-1. 把当前未提交实现拆成可 review 的小提交：policy/config、store/migration、card/callback、events/outbox、Dashboard、docs。
-2. 更新 README 中仍使用旧“有帮助/不完整/不正确”和 `sentiment` 的示例，改为三态默认值和 `semantic`。
-3. 补 Dashboard webhook destination 与 write-only secret 管理，并支持轮换/禁用/测试投递。
-4. 定义本地事件订阅/游标读取协议，供官方插件或离线任务消费，而不是直读 SQLite 内部表。
-5. 再评估通用 card-action 注册表；这是未来第三方卡片交互扩展的基础设施，不是当前反馈闭环的阻塞项。
-6. 与 Hermes/各 CLI 协作补 nativeMessageId，增强精确审计，但不改变当前 delivery 主键与平台消息关联。
-7. 将团队级 webhook destination 合并规则和远端 federation policy ownership 作为单独设计议题处理，避免静默跨部署继承。
+1. 对当前 PR 按 policy/config、store/migration、card/callback、events/outbox、Dashboard、docs 分模块 review；实现当前保持单个 feature commit。
+2. 补 Dashboard webhook destination 与 write-only secret 管理，并支持轮换/禁用/测试投递。
+3. 定义本地事件订阅/游标读取协议，供官方插件或离线任务消费，而不是直读 SQLite 内部表。
+4. 再评估通用 card-action 注册表；这是未来第三方卡片交互扩展的基础设施，不是当前反馈闭环的阻塞项。
+5. 与 Hermes/各 CLI 协作补 nativeMessageId，增强精确审计，但不改变当前 delivery 主键与平台消息关联。
+6. 将团队级 webhook destination 合并规则和远端 federation policy ownership 作为单独设计议题处理，避免静默跨部署继承。
 
 ## 13. 事实源与关键代码
 
