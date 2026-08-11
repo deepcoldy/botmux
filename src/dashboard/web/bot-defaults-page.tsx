@@ -3991,6 +3991,7 @@ export function GrantSection(props: { bot: BotDefaultsRow; patchBot: PatchBot })
   const tr = useT();
   const [autoCard, setAutoCard] = useState(props.bot.autoGrantRequestCards !== false);
   const [restrict, setRestrict] = useState(props.bot.restrictGrantCommands === true);
+  const [p2pOpen, setP2pOpen] = useState(props.bot.p2pOpen === true);
   const [duration, setDuration] = useState(typeof props.bot.grantDefaultDurationMs === 'number' ? props.bot.grantDefaultDurationMs : null);
   const [durationInput, setDurationInput] = useState(String(props.bot.grantDefaultDurationMs ?? DEFAULT_GRANT_DURATION_MS));
   const [quota, setQuota] = useState(typeof props.bot.messageQuotaDefaultLimit === 'number' ? props.bot.messageQuotaDefaultLimit : null);
@@ -4010,6 +4011,10 @@ export function GrantSection(props: { bot: BotDefaultsRow; patchBot: PatchBot })
   }, [props.bot.restrictGrantCommands]);
 
   useEffect(() => {
+    setP2pOpen(props.bot.p2pOpen === true);
+  }, [props.bot.p2pOpen]);
+
+  useEffect(() => {
     const nextDuration = typeof props.bot.grantDefaultDurationMs === 'number' ? props.bot.grantDefaultDurationMs : null;
     setDuration(nextDuration);
     setDurationInput(String(nextDuration ?? DEFAULT_GRANT_DURATION_MS));
@@ -4025,6 +4030,7 @@ export function GrantSection(props: { bot: BotDefaultsRow; patchBot: PatchBot })
     patch: {
       autoGrantRequestCards?: boolean;
       restrictGrantCommands?: boolean;
+      p2pOpen?: boolean;
       grantDefaultDurationMs?: number | null;
       messageQuotaDefaultLimit?: number | null;
     },
@@ -4040,6 +4046,7 @@ export function GrantSection(props: { bot: BotDefaultsRow; patchBot: PatchBot })
         const nextQuota = typeof res.body.messageQuotaDefaultLimit === 'number' ? res.body.messageQuotaDefaultLimit : null;
         setAutoCard(res.body.autoGrantRequestCards !== false);
         setRestrict(res.body.restrictGrantCommands === true);
+        setP2pOpen(res.body.p2pOpen === true);
         setDuration(nextDuration);
         setQuota(nextQuota);
         if ('grantDefaultDurationMs' in patch) setDurationInput(String(nextDuration ?? DEFAULT_GRANT_DURATION_MS));
@@ -4049,6 +4056,7 @@ export function GrantSection(props: { bot: BotDefaultsRow; patchBot: PatchBot })
         props.patchBot(props.bot.larkAppId, {
           autoGrantRequestCards: res.body.autoGrantRequestCards !== false,
           restrictGrantCommands: res.body.restrictGrantCommands === true,
+          p2pOpen: res.body.p2pOpen === true,
           grantDefaultDurationMs: nextDuration,
           messageQuotaDefaultLimit: nextQuota,
         });
@@ -4149,6 +4157,18 @@ export function GrantSection(props: { bot: BotDefaultsRow; patchBot: PatchBot })
             const previous = restrict;
             setRestrict(checked);
             void savePatch({ restrictGrantCommands: checked }, 'restrict', () => setRestrict(previous));
+          }}
+        />
+        <ToggleRow
+          checked={p2pOpen}
+          disabled={busy !== null}
+          dataAction="toggle-p2p-open"
+          title={tr('botDefaults.p2pOpen')}
+          help={tr('botDefaults.p2pOpenHelp')}
+          onChange={checked => {
+            const previous = p2pOpen;
+            setP2pOpen(checked);
+            void savePatch({ p2pOpen: checked }, 'p2pOpen', () => setP2pOpen(previous));
           }}
         />
       </div>

@@ -486,6 +486,7 @@ export const messages: Record<string, string> = {
   'config.label.autoStartOnNewTopic': 'Auto-start on new topic',
   'config.label.disableCliBypass': 'Disable bypass · safer',
   'config.label.restrictGrantCommands': 'Grantees chat-only',
+  'config.label.p2pOpen': 'Open DMs',
   'card.config.note': '🟢=on ⚪=off, tap to flip & refresh (model/cli take effect next session). Language: `/botconfig zh` | `/botconfig en`.\nMore fields via "✏️ Text fields"; allowedUsers / oncall use `/botconfig help`.',
   'card.config.text_btn': '✏️ Text fields',
   'card.config.text_title': '✏️ {name} · text fields',

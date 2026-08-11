@@ -917,6 +917,53 @@ describe('/botconfig canTalkDaemonCommands uses the field parser (not the passth
   });
 });
 
+describe('/botconfig set p2pOpen (私聊对话全开) via the real text command', () => {
+  it('turns DMs on and off through `/botconfig set`, keeping bots.json tidy', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-botconfig-p2popen-'));
+    const configPath = join(dir, 'bots.json');
+    process.env.BOTS_CONFIG = configPath;
+    writeFileSync(configPath, JSON.stringify([{
+      larkAppId: 'app-1',
+      larkAppSecret: 'secret-1',
+      cliId: 'codex',
+      allowedUsers: ['ou_sender'],
+    }]));
+    const bot = {
+      botName: 'Codex',
+      config: {
+        larkAppId: 'app-1',
+        larkAppSecret: 'secret-1',
+        cliId: 'codex' as const,
+        allowedUsers: ['ou_sender'],
+        workingDir: '~/projects',
+        workingDirs: ['~/projects'],
+      },
+      resolvedAllowedUsers: ['ou_sender'],
+    };
+    vi.mocked(getBot).mockReturnValue(bot as any);
+
+    // 真实入口是带 set 子命令的形式（`/botconfig` 只认 get/set/unset/help），
+    // 所以这里执行的是用户会打的那串字，而不是直接调 applyConfigField。
+    const run = (text: string) => handleCommand('/botconfig', ROOT_ID, makeLarkMessage(text, { senderId: 'ou_sender' }), makeDeps(), 'app-1');
+    const stored = () => JSON.parse(readFileSync(configPath, 'utf-8'))[0];
+
+    try {
+      await run('/botconfig set p2pOpen on');
+      expect(stored().p2pOpen).toBe(true);
+      expect((bot.config as any).p2pOpen).toBe(true);
+
+      // off → 删 key（缺省即关），内存同步成 undefined；与 dashboard 通道同语义。
+      await run('/botconfig set p2pOpen off');
+      expect('p2pOpen' in stored()).toBe(false);
+      expect((bot.config as any).p2pOpen).toBeUndefined();
+    } finally {
+      delete process.env.BOTS_CONFIG;
+      rmSync(dir, { recursive: true, force: true });
+      vi.mocked(getBot).mockImplementation(defaultGetBot as any);
+    }
+  });
+});
+
 describe('/botconfig string field goes through coerceConfigValue (maxLen)', () => {
   it('rejects an over-long displayName and persists a valid one', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'botmux-botconfig-displayname-'));

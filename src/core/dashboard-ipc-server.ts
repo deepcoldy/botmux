@@ -3541,6 +3541,7 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
     docSubscribeDefaultMode: cardPrefs.docSubscribeDefaultMode,
     restrictGrantCommands: grantPrefs.restrictGrantCommands,
     autoGrantRequestCards: grantPrefs.autoGrantRequestCards,
+    p2pOpen: grantPrefs.p2pOpen,
     messageQuotaDefaultLimit: grantPrefs.messageQuotaDefaultLimit,
     grantDefaultDurationMs: grantPrefs.grantDefaultDurationMs,
     p2pMode,
@@ -3699,6 +3700,7 @@ ipcRoute('PUT', '/api/bot-summary-trigger', async (req, res) => {
 // Per-bot 授权偏好。Body 任意子集：
 //   • restrictGrantCommands: boolean       — 限制被授权人只能纯对话
 //   • autoGrantRequestCards: boolean       — 未授权 @ 被挡住时是否发 grant 申请卡
+//   • p2pOpen: boolean                     — 私聊对话全开（talk-only；管理权仍只认 allowedUsers）
 //   • messageQuotaDefaultLimit: number|null — 卡片/Oncall 额度覆盖（null = 卡片内置 3 条、Oncall 不限）
 //   • grantDefaultDurationMs: number|null   — 新授权默认有限时长（null = 产品默认 1 小时）
 ipcRoute('PUT', '/api/bot-grant-prefs', async (req, res) => {
@@ -3713,6 +3715,7 @@ ipcRoute('PUT', '/api/bot-grant-prefs', async (req, res) => {
   const body = raw as {
     restrictGrantCommands?: unknown;
     autoGrantRequestCards?: unknown;
+    p2pOpen?: unknown;
     messageQuotaDefaultLimit?: unknown;
     grantDefaultDurationMs?: unknown;
   };
@@ -3720,11 +3723,13 @@ ipcRoute('PUT', '/api/bot-grant-prefs', async (req, res) => {
   const patch: {
     restrictGrantCommands?: boolean;
     autoGrantRequestCards?: boolean;
+    p2pOpen?: boolean;
     messageQuotaDefaultLimit?: number | null;
     grantDefaultDurationMs?: number | null;
   } = {};
   if (typeof body.restrictGrantCommands === 'boolean') patch.restrictGrantCommands = body.restrictGrantCommands;
   if (typeof body.autoGrantRequestCards === 'boolean') patch.autoGrantRequestCards = body.autoGrantRequestCards;
+  if (typeof body.p2pOpen === 'boolean') patch.p2pOpen = body.p2pOpen;
   // null（含 JSON null）= 恢复内置额度策略；number = 设定覆盖值（store 内校验 1–1000）。
   if (body.messageQuotaDefaultLimit === null) patch.messageQuotaDefaultLimit = null;
   else if (typeof body.messageQuotaDefaultLimit === 'number') patch.messageQuotaDefaultLimit = body.messageQuotaDefaultLimit;
