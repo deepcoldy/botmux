@@ -5885,24 +5885,31 @@ ipcRoute('GET', '/api/adopt-session/:pid', (_req, res, params) => {
 // 托管 service 场景（opencode2 的 ask 插件运行在所有客户端共用的 service 里）：
 // hook 子进程继承的是启动该 service 时固化的 ambient env，与当前会话无关；必须
 // 用 payload 携带的 native sessionID 显式反查，否则跨会话错投（多 bot/多会话
-// 会放行或错投到首个启动 service 的会话）。cliSessionId 全局唯一，无 PID 复用
-// 残留风险。
+// 会放行或错投到首个启动 service 的会话）。
+// cliSessionId 不代表 botmux 绑定唯一：两个话题/机器人并发导入同一外部会话可
+// 产生重复绑定。命中必须恰好一个；多命中返回 409 conflict，让反查侧 fail
+// closed（歧义时 passthrough），绝不按首个匹配错投。
 ipcRoute('GET', '/api/session-by-cli/:cliSessionId', (_req, res, params) => {
   const cliSessionId = params.cliSessionId;
   if (!cliSessionId || cliSessionId.length > 512) {
     return jsonRes(res, 400, { ok: false, error: 'bad_cli_session_id' });
   }
-  for (const ds of activeSessions.values()) {
-    if (ds.session.cliSessionId === cliSessionId) {
-      return jsonRes(res, 200, {
-        sessionId: ds.session.sessionId,
-        chatId: ds.chatId,
-        larkAppId: ds.larkAppId,
-        rootMessageId: sessionAnchorId(ds),
-      });
-    }
+  const matches = [...activeSessions.values()].filter(
+    (ds) => ds.session.cliSessionId === cliSessionId,
+  );
+  if (matches.length === 0) {
+    return jsonRes(res, 404, { ok: false, error: 'no_session' });
   }
-  return jsonRes(res, 404, { ok: false, error: 'no_session' });
+  if (matches.length > 1) {
+    return jsonRes(res, 409, { ok: false, error: 'ambiguous_cli_session' });
+  }
+  const ds = matches[0];
+  return jsonRes(res, 200, {
+    sessionId: ds.session.sessionId,
+    chatId: ds.chatId,
+    larkAppId: ds.larkAppId,
+    rootMessageId: sessionAnchorId(ds),
+  });
 });
 
 for (const path of ['/api/vc-meetings/members/register', '/api/vc-meetings/members/update']) {

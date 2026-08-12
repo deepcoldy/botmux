@@ -224,14 +224,29 @@ export async function resolveAdoptRoute(deps: {
 // ── CLI 原生会话 id 反查（托管 service 场景）────────────────────────────────
 
 /**
+ * 单 daemon 的 cliSessionId 反查结果。
+ * - hit：该 daemon 内恰好一个活跃会话绑定该 cliSessionId
+ * - conflict：该 daemon 内多个会话绑定同一 cliSessionId（两个话题/机器人并发
+ *   导入同一外部会话可正常产生重复绑定，cliSessionId 不代表 botmux 绑定唯一）
+ * - miss：该 daemon 明确无匹配
+ * - unknown：查询失败/超时，结果未知 → 上层必须视为「无法证明唯一」fail closed
+ */
+export type CliSessionLookup =
+  | { kind: 'hit'; route: AdoptRoute }
+  | { kind: 'conflict' }
+  | { kind: 'miss' }
+  | { kind: 'unknown' };
+
+/**
  * 查询某个 daemon 是否有该 CLI 原生会话 id（如 OpenCode 的 `ses_*`）的活跃
  * 会话。GET http://127.0.0.1:<ipcPort>/api/session-by-cli/<cliSessionId>
- * 200 → 解析 AdoptRoute；其它状态码或异常 → null（不抛）。超时 2s。
+ * 200 → hit；409（本 daemon 内重复绑定）→ conflict；404 → miss；
+ * 其它状态码 / 网络异常 → unknown（不抛）。超时 2s。
  */
 export async function queryCliSession(
   ipcPort: number,
   cliSessionId: string,
-): Promise<AdoptRoute | null> {
+): Promise<CliSessionLookup> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 2000);
   try {
@@ -240,9 +255,10 @@ export async function queryCliSession(
       `/api/session-by-cli/${encodeURIComponent(cliSessionId)}`,
       { signal: controller.signal },
     );
-    if (!res.ok) return null;
+    if (res.status === 409) return { kind: 'conflict' };
+    if (!res.ok) return { kind: 'miss' };
     const body = (await res.json()) as unknown;
-    if (!body || typeof body !== 'object') return null;
+    if (!body || typeof body !== 'object') return { kind: 'miss' };
     const b = body as Record<string, unknown>;
     if (
       typeof b.sessionId !== 'string' ||
@@ -250,16 +266,19 @@ export async function queryCliSession(
       typeof b.larkAppId !== 'string' ||
       typeof b.rootMessageId !== 'string'
     ) {
-      return null;
+      return { kind: 'miss' };
     }
     return {
-      sessionId: b.sessionId,
-      chatId: b.chatId,
-      larkAppId: b.larkAppId,
-      rootMessageId: b.rootMessageId,
+      kind: 'hit',
+      route: {
+        sessionId: b.sessionId,
+        chatId: b.chatId,
+        larkAppId: b.larkAppId,
+        rootMessageId: b.rootMessageId,
+      },
     };
   } catch {
-    return null;
+    return { kind: 'unknown' };
   } finally {
     clearTimeout(timer);
   }
@@ -271,7 +290,14 @@ export async function queryCliSession(
  * 托管 service 场景（opencode2 的 ask 插件运行在所有客户端共用的 service 里）：
  * hook 子进程继承的是「启动该 service 的会话」的 ambient env，与当前会话无关，
  * 不能拿来路由 —— 必须用 payload 携带的 native sessionID 显式反查，否则跨会话
- * 错投。cliSessionId（OpenCode 原生 id）全局唯一，最多命中一个 daemon。
+ * 错投。
+ *
+ * **fail closed（恰好一个完整命中才返回）**：必须证明命中唯一才返回路由，
+ * 以下任一情况都返回 null（由调用方 passthrough），绝不按网络时序挑一个命中：
+ * - 0 个命中 → 未命中
+ * - ≥2 个命中（并发导入同一外部会话的重复绑定）→ 歧义
+ * - 任一 daemon 报 conflict → 歧义
+ * - 任一候选在 budget 内未确定结果（挂起/异常/unknown）→ 无法证明唯一
  *
  * @param deps.cliSessionId   OpenCode 原生会话 id（payload.session_id）
  * @param deps.listDaemons    列出在线 daemon（ipcPort）
@@ -281,7 +307,7 @@ export async function queryCliSession(
 export async function resolveCliSessionRoute(deps: {
   cliSessionId: string;
   listDaemons: () => Array<{ ipcPort: number }>;
-  queryDaemon: (ipcPort: number, cliSessionId: string) => Promise<AdoptRoute | null>;
+  queryDaemon: (ipcPort: number, cliSessionId: string) => Promise<CliSessionLookup>;
   budgetMs?: number;
 }): Promise<AdoptRoute | null> {
   const { cliSessionId, listDaemons, queryDaemon } = deps;
@@ -289,16 +315,42 @@ export async function resolveCliSessionRoute(deps: {
   const daemons = listDaemons();
   if (daemons.length === 0) return null;
 
-  let winner: AdoptRoute | null = null;
+  // 并发查询全部 daemon（不做提前退出——必须等所有候选出结果才能证明唯一性），
+  // 整体耗时被 budget 封顶。
+  const hits: AdoptRoute[] = [];
+  let conflicted = false;
+  let indeterminate = false;
+  let settled = 0;
   const queries = daemons.map(async (daemon) => {
-    if (winner) return;
-    const route = await queryDaemon(daemon.ipcPort, cliSessionId);
-    if (route && !winner) winner = route;
+    try {
+      const lookup = await queryDaemon(daemon.ipcPort, cliSessionId);
+      if (lookup.kind === 'hit') hits.push(lookup.route);
+      else if (lookup.kind === 'conflict') conflicted = true;
+      else if (lookup.kind === 'unknown') indeterminate = true;
+    } catch {
+      // 查询异常 → 该候选结果未知，无法证明唯一
+      indeterminate = true;
+    } finally {
+      settled++;
+    }
   });
+
+  let timer: ReturnType<typeof setTimeout> | undefined;
   const budget = new Promise<void>((resolve) => {
-    const t = setTimeout(resolve, budgetMs);
-    t.unref?.();
+    timer = setTimeout(resolve, budgetMs);
+    timer.unref?.();
   });
-  await Promise.race([Promise.allSettled(queries), budget]);
-  return winner;
+  try {
+    await Promise.race([Promise.allSettled(queries), budget]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+
+  // budget 到期仍有候选未出结果 / 任一歧义 / 命中数≠1 → 全部 fail closed。
+  if (settled < daemons.length || conflicted || indeterminate) return null;
+  if (hits.length !== 1) return null;
+  if (process.env.BOTMUX_HOOK_DEBUG === '1') {
+    process.stderr.write(`[adopt-route] cli-session matched session=${hits[0].sessionId}\n`);
+  }
+  return hits[0];
 }

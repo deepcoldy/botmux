@@ -11588,14 +11588,16 @@ export async function runHook(
   // hook 子进程继承的是「启动该 service 的会话」的 ambient env，与当前会话无关，
   // 直接拿来路由会跨会话错投。payload.session_id 是 OpenCode 原生 id（ses_*），
   // 先按它在在线 daemon 的活跃会话里显式反查（cliSessionId 全局唯一）。
-  // 反查未命中时 env/PID 兜底只适用于进程私有 hook（ambient env 可信）；
-  // 共享 service 的 env 属于其它会话，回落即错投 → 对 opencode2 必须 fail closed。
+  // 整段反查只对共享 service hook 启用：进程私有 hook（opencode 等）的 ambient
+  // env 是当前进程的可信归属，让反查覆盖反而可能被另一重复绑定的命中错投。
+  // 反查未命中/歧义时 env/PID 兜底只适用于进程私有 hook；共享 service 的 env
+  // 属于其它会话，回落即错投 → 对 opencode2 必须 fail closed。
   const isSharedServiceHook = cliId === 'opencode2';
   const rawPayload = payload as Record<string, unknown> | undefined;
   const nativeSessionId = typeof rawPayload?.session_id === 'string'
     ? rawPayload.session_id.trim()
     : '';
-  if (/^ses_[0-9A-Za-z]+$/.test(nativeSessionId)) {
+  if (isSharedServiceHook && /^ses_[0-9A-Za-z]+$/.test(nativeSessionId)) {
     const { resolveCliSessionRoute, queryCliSession } = await import('./adapters/adopt-route.js');
     const resolver = resolveCliSessionRouteFn ?? ((cliSessionId: string) =>
       resolveCliSessionRoute({
@@ -11603,16 +11605,21 @@ export async function runHook(
         listDaemons: listOnlineDaemons,
         queryDaemon: queryCliSession,
       }));
-    explicitRoute = await resolver(nativeSessionId);
+    try {
+      explicitRoute = await resolver(nativeSessionId);
+    } catch {
+      // 反查异常 → 视同未命中（无法证明唯一），fail closed
+      explicitRoute = null;
+    }
     if (explicitRoute) {
       routeSessionId = explicitRoute.sessionId;
       routeChatId = explicitRoute.chatId;
       routeLarkAppId = explicitRoute.larkAppId;
       routeRoot = explicitRoute.rootMessageId;
-    } else if (isSharedServiceHook) {
-      // fail closed：反查未唯一命中（未命中 / 查询超时 / daemon 不可达 /
-      // cliSessionId 尚未上报）→ 直接 passthrough 把问题留给原生终端，
-      // 绝不回落 ambient env / PID adopt，避免跨会话错投。
+    } else {
+      // fail closed：反查未能证明「恰好一个完整命中」（未命中 / 双命中歧义 /
+      // 查询超时 / daemon 不可达 / cliSessionId 尚未上报）→ 直接 passthrough
+      // 把问题留给原生终端，绝不回落 ambient env / PID adopt，避免跨会话错投。
       return { stdout: adapter.passthrough(payload) };
     }
   }

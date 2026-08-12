@@ -222,10 +222,11 @@ describe('runHook', () => {
       expect(result.stdout).toBe('');
     });
 
-    it('opencode（进程私有 hook）反查未命中 → 回落 ambient env 路由（不 fail closed）', async () => {
-      // 进程私有 hook 的 ambient env 可信（hook 运行在 CLI 进程内）：
-      // 反查只是附加优化，未命中按 env 路由，旧行为不退化。
+    it('opencode（进程私有 hook）不走反查 → 直接按 ambient env 路由', async () => {
+      // 反查只对共享 service hook（opencode2）启用：V1 hook 的 ambient env 是
+      // 当前进程的可信归属，让反查覆盖反而可能被另一重复绑定的命中错投。
       let posted: Record<string, unknown> | undefined;
+      let resolved = 0;
       const stub = async (body: Record<string, unknown>): Promise<AskResult> => {
         posted = body;
         return { kind: 'answered', answers: [['继续']], by: 'ou_u', comment: null, timedOut: false };
@@ -233,14 +234,26 @@ describe('runHook', () => {
       const result = await runHook(
         openCodeAskPayload, STALE_ENV, stub, 'opencode',
         async () => null,
-        async () => null,                       // 反查未命中
+        async () => { resolved++; return EXPLICIT_ROUTE; },
       );
+      expect(resolved).toBe(0);
       expect(result.stdout).toBeTruthy();
       expect(posted?.sessionId).toBe('sess_first_service_owner');
       expect(posted?.chatId).toBe('oc_wrong_chat');
     });
 
-    it('session_id 非 ses_* 形状 → 不走反查（其它 CLI payload 不误路由）', async () => {
+    it('opencode2 反查 resolver 抛错 → fail closed（结果未知，绝不回落 env）', async () => {
+      const postAsk = vi.fn(makeAnsweredStub([['继续']]));
+      const result = await runHook(
+        openCodeAskPayload, STALE_ENV, postAsk, 'opencode2',
+        async () => null,
+        async () => { throw new Error('ipc down'); },
+      );
+      expect(postAsk).not.toHaveBeenCalled();
+      expect(result.stdout).toBe('');
+    });
+
+    it('session_id 非 ses_* 形状 → 不走反查（opencode2 其它事件不误路由）', async () => {
       let posted: Record<string, unknown> | undefined;
       let resolved = 0;
       const stub = async (body: Record<string, unknown>): Promise<AskResult> => {
@@ -249,7 +262,7 @@ describe('runHook', () => {
       };
       const payload = { ...openCodeAskPayload, session_id: 'some-other-format' };
       const result = await runHook(
-        payload, FULL_ENV, stub, 'opencode',
+        payload, FULL_ENV, stub, 'opencode2',
         async () => null,
         async () => { resolved++; return EXPLICIT_ROUTE; },
       );
@@ -267,7 +280,7 @@ describe('runHook', () => {
       };
       const env = { BOTMUX_ASK_TIMEOUT_MS: '5000' }; // 全缺 env（托管 service 真实场景）
       const result = await runHook(
-        openCodeAskPayload, env, stub, 'opencode',
+        openCodeAskPayload, env, stub, 'opencode2',
         async () => { adoptCalls++; return null; },
         async () => EXPLICIT_ROUTE,
       );

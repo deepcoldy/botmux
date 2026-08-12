@@ -5,8 +5,23 @@
  * 全部依赖注入，不访问真实 /proc / ps / 网络。
  */
 
-import { describe, it, expect } from 'vitest';
-import { getAncestorPids, resolveAdoptRoute, resolveCliSessionRoute, type AdoptRoute } from '../src/adapters/adopt-route.js';
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+import {
+  getAncestorPids,
+  queryCliSession,
+  resolveAdoptRoute,
+  resolveCliSessionRoute,
+  type AdoptRoute,
+  type CliSessionLookup,
+} from '../src/adapters/adopt-route.js';
+
+// queryCliSession 走 fetchDaemonIpc（真实 HTTP），mock 掉以便纯逻辑测试。
+const { fetchDaemonIpcMock } = vi.hoisted(() => ({
+  fetchDaemonIpcMock: vi.fn<(...args: unknown[]) => Promise<unknown>>(),
+}));
+vi.mock('../src/core/daemon-ipc-auth.js', () => ({
+  fetchDaemonIpc: (...args: unknown[]) => fetchDaemonIpcMock(...args),
+}));
 
 // ── getAncestorPids ────────────────────────────────────────────────────────────
 
@@ -164,25 +179,76 @@ describe('resolveAdoptRoute', () => {
     expect(result).toBeNull();
   });
 
-  describe('resolveCliSessionRoute（托管 service 显式反查）', () => {
-    it('单个 daemon 命中 → 返回反查结果', async () => {
+  describe('queryCliSession（单 daemon 反查，409 conflict 区分歧义）', () => {
+    const ROUTE_BODY = {
+      sessionId: 's_1',
+      chatId: 'c_1',
+      larkAppId: 'a_1',
+      rootMessageId: 'om_1',
+    };
+    const route = { sessionId: 's_1', chatId: 'c_1', larkAppId: 'a_1', rootMessageId: 'om_1' };
+
+    beforeEach(() => {
+      fetchDaemonIpcMock.mockReset();
+    });
+
+    it('200 恰好一个命中 → hit', async () => {
+      fetchDaemonIpcMock.mockResolvedValue({
+        ok: true,
+        status: 200,
+        json: async () => ROUTE_BODY,
+      });
+      const result = await queryCliSession(1234, 'ses_abc');
+      expect(result).toEqual({ kind: 'hit', route });
+    });
+
+    it('409 conflict（本 daemon 内重复绑定）→ conflict', async () => {
+      fetchDaemonIpcMock.mockResolvedValue({ ok: false, status: 409 });
+      const result = await queryCliSession(1234, 'ses_abc');
+      expect(result).toEqual({ kind: 'conflict' });
+    });
+
+    it('404 无匹配 → miss', async () => {
+      fetchDaemonIpcMock.mockResolvedValue({ ok: false, status: 404 });
+      const result = await queryCliSession(1234, 'ses_abc');
+      expect(result).toEqual({ kind: 'miss' });
+    });
+
+    it('网络异常（连接拒绝/超时）→ unknown（结果未知，上层 fail closed）', async () => {
+      fetchDaemonIpcMock.mockRejectedValue(new Error('ECONNREFUSED'));
+      const result = await queryCliSession(1234, 'ses_abc');
+      expect(result).toEqual({ kind: 'unknown' });
+    });
+
+    it('200 但 body 形状不完整 → miss', async () => {
+      fetchDaemonIpcMock.mockResolvedValue({ ok: true, status: 200, json: async () => ({ sessionId: 'x' }) });
+      const result = await queryCliSession(1234, 'ses_abc');
+      expect(result).toEqual({ kind: 'miss' });
+    });
+  });
+
+  describe('resolveCliSessionRoute（托管 service 显式反查，恰好一个完整命中才返回）', () => {
+    const hit = (route: AdoptRoute = MOCK_ROUTE): CliSessionLookup => ({ kind: 'hit', route });
+    const miss = (): CliSessionLookup => ({ kind: 'miss' });
+
+    it('单个 daemon 恰好一个命中 → 返回反查结果', async () => {
       const result = await resolveCliSessionRoute({
         cliSessionId: 'ses_abc',
         listDaemons: () => [{ ipcPort: 1 }],
         queryDaemon: async (port, id) => {
           expect(port).toBe(1);
           expect(id).toBe('ses_abc');
-          return MOCK_ROUTE;
+          return hit();
         },
       });
       expect(result).toEqual(MOCK_ROUTE);
     });
 
-    it('并发查询全部 daemon，命中即返回', async () => {
+    it('并发查询全部 daemon，恰一命中即返回', async () => {
       const result = await resolveCliSessionRoute({
         cliSessionId: 'ses_abc',
         listDaemons: () => [{ ipcPort: 1 }, { ipcPort: 2 }],
-        queryDaemon: async (port) => (port === 2 ? MOCK_ROUTE : null),
+        queryDaemon: async (port) => (port === 2 ? hit() : miss()),
       });
       expect(result).toEqual(MOCK_ROUTE);
     });
@@ -191,28 +257,80 @@ describe('resolveAdoptRoute', () => {
       const result = await resolveCliSessionRoute({
         cliSessionId: 'ses_abc',
         listDaemons: () => [{ ipcPort: 1 }, { ipcPort: 2 }],
-        queryDaemon: async () => null,
+        queryDaemon: async () => miss(),
       });
       expect(result).toBeNull();
     });
 
-    it('query 挂起 → budget 封顶返回 null（不被无响应 daemon 卡住）', async () => {
+    it('query 挂起 → budget 封顶返回 null（不被无响应 daemon 卡住，且无法证明唯一）', async () => {
       const t0 = Date.now();
       const result = await resolveCliSessionRoute({
         cliSessionId: 'ses_abc',
         listDaemons: () => [{ ipcPort: 1 }],
-        queryDaemon: () => new Promise<AdoptRoute | null>(() => {}),
+        queryDaemon: () => new Promise<CliSessionLookup>(() => {}),
         budgetMs: 60,
       });
       expect(result).toBeNull();
       expect(Date.now() - t0).toBeLessThan(1000);
     });
 
+    it('双 daemon 双命中（并发导入同一外部会话的重复绑定）→ null（歧义 fail closed）', async () => {
+      const result = await resolveCliSessionRoute({
+        cliSessionId: 'ses_abc',
+        listDaemons: () => [{ ipcPort: 1 }, { ipcPort: 2 }],
+        queryDaemon: async (port) => hit(
+          port === 1 ? MOCK_ROUTE : { ...MOCK_ROUTE, sessionId: 'sess_dup_2' },
+        ),
+      });
+      expect(result).toBeNull();
+    });
+
+    it('一命中 + 另一候选挂起 → budget 到期返回 null（无法证明唯一）', async () => {
+      const result = await resolveCliSessionRoute({
+        cliSessionId: 'ses_abc',
+        listDaemons: () => [{ ipcPort: 1 }, { ipcPort: 2 }],
+        queryDaemon: async (port) => (
+          port === 1 ? hit() : new Promise<CliSessionLookup>(() => {})
+        ),
+        budgetMs: 60,
+      });
+      expect(result).toBeNull();
+    });
+
+    it('任一 daemon 报 conflict → null（重复绑定歧义）', async () => {
+      const result = await resolveCliSessionRoute({
+        cliSessionId: 'ses_abc',
+        listDaemons: () => [{ ipcPort: 1 }, { ipcPort: 2 }],
+        queryDaemon: async (port) => (port === 1 ? { kind: 'conflict' } : miss()),
+      });
+      expect(result).toBeNull();
+    });
+
+    it('任一候选 unknown（查询失败/超时）→ null（结果未知，fail closed）', async () => {
+      const result = await resolveCliSessionRoute({
+        cliSessionId: 'ses_abc',
+        listDaemons: () => [{ ipcPort: 1 }, { ipcPort: 2 }],
+        queryDaemon: async (port) => (port === 1 ? { kind: 'unknown' } : miss()),
+      });
+      expect(result).toBeNull();
+    });
+
+    it('任一候选查询异常抛错 → null（结果未知，fail closed）', async () => {
+      const result = await resolveCliSessionRoute({
+        cliSessionId: 'ses_abc',
+        listDaemons: () => [{ ipcPort: 1 }, { ipcPort: 2 }],
+        queryDaemon: async (port) => (
+          port === 1 ? hit() : Promise.reject(new Error('ipc down'))
+        ),
+      });
+      expect(result).toBeNull();
+    });
+
     it('无在线 daemon → null', async () => {
       const result = await resolveCliSessionRoute({
         cliSessionId: 'ses_abc',
         listDaemons: () => [] as Array<{ ipcPort: number }>,
-        queryDaemon: async () => MOCK_ROUTE,
+        queryDaemon: async () => hit(),
       });
       expect(result).toBeNull();
     });
