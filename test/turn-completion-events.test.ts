@@ -105,6 +105,32 @@ describe('durable turn.completed events', () => {
     store.close();
   });
 
+  it('correlates multiple canonical deliveries of one turn to the same terminal', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-turn-event-')); dirs.push(dir);
+    const store = await SkillFeedbackStore.open(dir);
+    const first = store.recordTurnDelivery(delivery({
+      platformMessageId: 'om_multi_a',
+      correlationDiscriminator: 'om_multi_a',
+    }));
+    const second = store.recordTurnDelivery(delivery({
+      platformMessageId: 'om_multi_b',
+      correlationDiscriminator: 'om_multi_b',
+      content: 'second canonical proactive final',
+    }));
+
+    store.recordTurnTerminal(terminal());
+
+    expect(first.deliveryId).not.toBe(second.deliveryId);
+    expect(store.listTurnCompletionEvents().map(event => event.deliveryId)).toEqual([
+      first.deliveryId,
+      second.deliveryId,
+    ]);
+    expect(store.listFeedbackEvents().filter(event => event.type === 'turn.completed')).toHaveLength(2);
+    expect(store.findDeliveryByPlatformMessage('lark', 'app_a', 'om_multi_a')?.status).toBe('completed');
+    expect(store.findDeliveryByPlatformMessage('lark', 'app_a', 'om_multi_b')?.status).toBe('completed');
+    store.close();
+  });
+
   it('uses a stable delivery id for retries even when answer content changes', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'botmux-turn-event-')); dirs.push(dir);
     const store = await SkillFeedbackStore.open(dir);

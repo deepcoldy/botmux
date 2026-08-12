@@ -58,6 +58,8 @@ export interface RecordTurnDeliveryInput extends TurnDeliveryCorrelation {
   requesterSubjectId?: string;
   webhookDestinations?: FeedbackWebhookDestination[];
   context?: Record<string, unknown>;
+  /** Distinguishes multiple canonical deliveries of the same worker turn. */
+  correlationDiscriminator?: string;
 }
 
 export interface RecordTurnTerminalInput {
@@ -128,6 +130,7 @@ interface DeliveryRow {
   usage_json: string | null;
   completed_at: string | null;
   webhook_destinations_json: string | null;
+  correlation_discriminator: string | null;
 }
 
 interface FeedbackRow {
@@ -169,7 +172,15 @@ function feedbackCardTemplate(baseCard: Record<string, unknown> | undefined): Re
   return card as Record<string, unknown>;
 }
 
-const SCHEMA_VERSION = 6;
+const SCHEMA_VERSION = 7;
+
+const DELIVERY_V7_SCHEMA = `
+  ALTER TABLE deliveries ADD COLUMN correlation_discriminator TEXT NOT NULL DEFAULT '';
+  DROP INDEX deliveries_correlation_identity;
+  CREATE UNIQUE INDEX deliveries_correlation_identity
+    ON deliveries(bot_app_id, session_id, turn_id, IFNULL(native_session_id,''), IFNULL(dispatch_attempt,0), correlation_discriminator, response_id)
+    WHERE bot_app_id IS NOT NULL AND session_id IS NOT NULL AND turn_id IS NOT NULL;
+`;
 
 const ANALYTICS_V6_SCHEMA = `
   CREATE INDEX IF NOT EXISTS deliveries_analytics_created ON deliveries(created_at, delivery_id);
@@ -322,7 +333,8 @@ export class SkillFeedbackStore {
       ${COMPLETION_V4_SCHEMA}
       ${OUTBOX_V5_SCHEMA}
       ${ANALYTICS_V6_SCHEMA}
-      PRAGMA user_version=6;
+      ${DELIVERY_V7_SCHEMA}
+      PRAGMA user_version=7;
       COMMIT;
     `);
     if (version === 1) this.db.exec(`
@@ -359,6 +371,12 @@ export class SkillFeedbackStore {
       BEGIN IMMEDIATE;
       ${ANALYTICS_V6_SCHEMA}
       PRAGMA user_version=6;
+      COMMIT;
+    `);
+    if (version >= 1 && version <= 6) this.db.exec(`
+      BEGIN IMMEDIATE;
+      ${DELIVERY_V7_SCHEMA}
+      PRAGMA user_version=7;
       COMMIT;
     `);
     this.validateSchemaV1();
@@ -416,7 +434,10 @@ export class SkillFeedbackStore {
   recordTurnDelivery(input: RecordTurnDeliveryInput): ReturnType<SkillFeedbackStore['mapDelivery']> {
     const hash = contentHash(input.content);
     const attempt = input.dispatchAttempt ?? 0;
-    const deliveryId = stableId('del', input.botAppId, input.sessionId, input.turnId, input.nativeSessionId ?? '', String(attempt));
+    const discriminator = input.correlationDiscriminator ?? '';
+    const deliveryId = discriminator
+      ? stableId('del', input.botAppId, input.sessionId, input.turnId, input.nativeSessionId ?? '', String(attempt), discriminator)
+      : stableId('del', input.botAppId, input.sessionId, input.turnId, input.nativeSessionId ?? '', String(attempt));
     const interactionId = stableId('int', input.botAppId, input.sessionId, input.turnId);
     const responseId = stableId('resp', interactionId, hash);
     const createdAt = input.createdAt ?? new Date().toISOString();
@@ -429,8 +450,8 @@ export class SkillFeedbackStore {
       if (messageOwner && messageOwner.delivery_id !== deliveryId) throw new Error('turn_delivery_platform_message_rebind');
       const correlationOwner = this.db.prepare(`SELECT platform_message_id FROM deliveries
         WHERE bot_app_id=? AND session_id=? AND turn_id=? AND IFNULL(native_session_id,'')=?
-          AND IFNULL(dispatch_attempt,0)=?`).get(
-        input.botAppId, input.sessionId, input.turnId, input.nativeSessionId ?? '', attempt,
+          AND IFNULL(dispatch_attempt,0)=? AND correlation_discriminator=?`).get(
+        input.botAppId, input.sessionId, input.turnId, input.nativeSessionId ?? '', attempt, discriminator,
       ) as { platform_message_id: string } | undefined;
       if (correlationOwner && correlationOwner.platform_message_id !== input.platformMessageId) {
         throw new Error('turn_delivery_correlation_rebind');
@@ -443,8 +464,8 @@ export class SkillFeedbackStore {
         delivery_id,response_id,platform,platform_message_id,platform_app_id,level,policy_snapshot_json,base_card_json,
         requester_subject_id,context_json,created_at,bot_app_id,session_id,turn_id,native_session_id,dispatch_attempt,
         chat_id,topic_root_id,scope,workflow_id,task_id,parent_task_id,cli_id,cli_version,model,reasoning_effort,
-        skill_name,skill_version,card_mode,status,duration_ms,usage_json,completed_at,webhook_destinations_json
-      ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
+        skill_name,skill_version,card_mode,status,duration_ms,usage_json,completed_at,webhook_destinations_json,correlation_discriminator
+      ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
         deliveryId, responseId, input.platform, input.platformMessageId, input.platformAppId, 'L1',
         input.policy ? JSON.stringify(input.policy) : null, baseCard ? JSON.stringify(baseCard) : null,
         input.requesterSubjectId ?? null, input.context ? JSON.stringify(input.context) : null, createdAt, input.botAppId, input.sessionId, input.turnId,
@@ -453,7 +474,7 @@ export class SkillFeedbackStore {
         input.cliId ?? null, input.cliVersion ?? null, input.model ?? null, input.reasoningEffort ?? null,
         input.skillName ?? null, input.skillVersion ?? null, input.cardMode, input.status, input.durationMs ?? null,
         input.usage ? JSON.stringify(input.usage) : null, input.completedAt ?? null,
-        input.webhookDestinations ? JSON.stringify(input.webhookDestinations) : null,
+        input.webhookDestinations ? JSON.stringify(input.webhookDestinations) : null, discriminator,
       );
       const row = this.db.prepare('SELECT * FROM deliveries WHERE delivery_id=?').get(deliveryId) as unknown as DeliveryRow;
       if (row.response_id !== responseId) {
@@ -487,11 +508,12 @@ export class SkillFeedbackStore {
         input.botAppId, input.sessionId, input.turnId, attempt, input.status, completedAt,
         input.durationMs ?? null, input.usage ? JSON.stringify(input.usage) : null,
       );
-      const delivery = this.db.prepare(`SELECT delivery_id FROM deliveries WHERE bot_app_id=? AND session_id=? AND turn_id=?
-        AND IFNULL(dispatch_attempt,0)=?`).get(
+      const deliveries = this.db.prepare(`SELECT delivery_id FROM deliveries WHERE bot_app_id=? AND session_id=? AND turn_id=?
+        AND IFNULL(dispatch_attempt,0)=? ORDER BY created_at,delivery_id`).all(
         input.botAppId, input.sessionId, input.turnId, attempt,
-      ) as { delivery_id: string } | undefined;
-      const payload = delivery ? this.reconcileTurnCompletion(delivery.delivery_id) : undefined;
+      ) as Array<{ delivery_id: string }>;
+      let payload: TurnCompletionEventPayload | undefined;
+      for (const delivery of deliveries) payload = this.reconcileTurnCompletion(delivery.delivery_id) ?? payload;
       this.db.exec('COMMIT');
       return payload;
     } catch (error) {
@@ -639,7 +661,7 @@ export class SkillFeedbackStore {
       chat_id: null, topic_root_id: null, scope: null, workflow_id: null, task_id: null, parent_task_id: null,
       cli_id: null, cli_version: null, model: null, reasoning_effort: null, skill_name: null, skill_version: null,
       card_mode: null, status: null, duration_ms: null, usage_json: null, completed_at: null,
-      webhook_destinations_json: null,
+      webhook_destinations_json: null, correlation_discriminator: '',
     };
     const winner = this.db.prepare(`INSERT INTO deliveries(delivery_id,response_id,platform,platform_message_id,platform_app_id,level,policy_snapshot_json,base_card_json,requester_subject_id,context_json,created_at)
       VALUES (?,?,?,?,?,?,?,?,?,?,?)
@@ -765,6 +787,7 @@ export class SkillFeedbackStore {
       baseCard: row.base_card_json ? JSON.parse(row.base_card_json) as Record<string, unknown> : undefined,
       requesterSubjectId: row.requester_subject_id ?? undefined,
       webhookDestinations: row.webhook_destinations_json ? JSON.parse(row.webhook_destinations_json) as FeedbackWebhookDestination[] : undefined,
+      correlationDiscriminator: row.correlation_discriminator || undefined,
       context: row.context_json ? JSON.parse(row.context_json) : undefined, createdAt: row.created_at,
     };
   }

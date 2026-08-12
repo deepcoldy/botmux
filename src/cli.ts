@@ -10173,7 +10173,8 @@ async function cmdSend(rest: string[]): Promise<void> {
     }
 
     if (feedbackPolicy && effectiveResponseKind === 'final' && !customCard && !pureVideoSend && !vcMeetingManagedSendOrigin && messageId) {
-      const deliveryTurnId = `send:${messageId}`;
+      const deliveryTurnId = currentTurnId ?? `send:${messageId}`;
+      const correlationDiscriminator = currentTurnId ? messageId : undefined;
       try {
         const { getSkillFeedbackStore } = await import('./services/skill-feedback-store.js');
         const feedbackStore = await getSkillFeedbackStore(resolveDataDir());
@@ -10181,6 +10182,7 @@ async function cmdSend(rest: string[]): Promise<void> {
           botAppId: appId,
           sessionId: sid,
           turnId: deliveryTurnId,
+          correlationDiscriminator,
           nativeSessionId: s.cliSessionId,
           platform: 'lark',
           platformAppId: appId,

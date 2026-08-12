@@ -521,9 +521,11 @@ describe('cmdSend hook context wiring', () => {
     expect(cmdSend).toContain('requesterSubjectId: feedbackRequesterSubjectId');
     expect(cmdSend).not.toContain("feedbackPolicy && responseKind === 'final'");
     expect(cmdSend).toContain("feedbackPolicy && effectiveResponseKind === 'final'");
-    expect(cmdSend).toContain("const deliveryTurnId = `send:${messageId}`");
+    expect(cmdSend).toContain('const deliveryTurnId = currentTurnId ?? `send:${messageId}`');
+    expect(cmdSend).toContain('const correlationDiscriminator = currentTurnId ? messageId : undefined');
     expect(cmdSend).toContain('turnId: deliveryTurnId');
-    expect(cmdSend).not.toContain('turnId: currentTurnId ?? `send:${messageId}`');
+    expect(cmdSend).toContain('correlationDiscriminator,');
+    expect(cmdSend).not.toContain('const deliveryTurnId = `send:${messageId}`');
     expect(cmdSend).not.toContain('--feedback-level');
     const primarySend = cmdSend.indexOf('messageId = await dispatchPrimary');
     const feedbackIndex = cmdSend.indexOf('feedback indexing failed after delivery');

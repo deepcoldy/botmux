@@ -32,7 +32,7 @@ describe('feedback schema v5 durable event outbox', () => {
     db.recordTurnTerminal({ botAppId: 'app', sessionId: 'session', turnId: 'turn', status: 'completed', completedAt: '2026-08-11T00:00:00.000Z' });
     db.recordTurnDelivery(deliveryInput([destination('one'), destination('disabled'), { ...destination('off'), enabled: false }]));
 
-    expect(db.schemaVersion()).toBe(6);
+    expect(db.schemaVersion()).toBe(7);
     const events = db.listFeedbackEvents();
     expect(events).toHaveLength(1);
     expect(events[0].type).toBe('turn.completed');

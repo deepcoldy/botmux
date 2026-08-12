@@ -1,6 +1,6 @@
 # Botmux 反馈能力：现阶段实现说明
 
-> 文档状态：基于 `feat/skill-feedback` commit `6d5136fa` 与 schema v6 整理
+> 文档状态：基于 `feat/skill-feedback` commit `6d5136fa` 与 schema v7 整理
 >
 > 对照基线：Botmux 作者反馈能力技术方案 review 稿（revision 7）
 >
@@ -17,7 +17,8 @@
 - 本地 SQLite 是事实源；事件和 webhook 是标准外发出口。
 - 语义固定为 `positive / progress / negative`，业务呈现可配置。
 - 策略支持 `team → bot → chat` 分层，优先级为 `chat > bot > team > built-in`。
-- Core 统一持久化具备真实 worker terminal 信号且关联到 canonical Lark delivery 的 `turn.completed`；主动 `botmux send` 只有 delivery，没有 terminal/completion event。
+- Core 统一持久化具备真实 worker terminal 信号且关联到 canonical Lark delivery 的 `turn.completed`；同一 turn 的多条 canonical delivery 通过 correlation discriminator 区分，并分别生成 completion event。
+- 主动 `botmux send --response-kind final` 在真实 worker turn 内关联该 turn 并参与 completion reconcile；脱离 worker turn 的主动发送只有 delivery，没有 terminal/completion event。
 - 已实现强关联 delivery、durable outbox/webhook 和 Dashboard 分析 API/基础页面。
 
 当前实现已覆盖原方案 M1、M2 和 M3 的主体。仍未实现的主要增强项是：通用 card-action 插件注册表、Agent 交付时的动态反馈选项建议、native assistant message ID、Dashboard webhook secret 写入界面、通用本地事件订阅 API，以及非 Lark 平台适配。
@@ -34,9 +35,9 @@
 | 呈现层可配置 | 已实现 | 可配按钮 key、文案、style、顺序、可见语义、负向原因、说明框、是否必填、长度及 `allowReselect` |
 | 团队 / bot / 群配置 | Core/API 已实现，Dashboard 基础 UI | local hosted team、bot、bot-scoped chat 三层；显式 `enabled:false` 可关闭继承；Dashboard 以 JSON textarea 编辑 team/bot policy，群下拉可保存覆盖并预览有效策略；尚不支持加载/删除既有 chat layer 的完整 CRUD |
 | 策略快照 | 已实现 | 每条 delivery 保存发送时 effective policy；配置热更新在 daemon worker 路径于下一次 session fork/restart 生效，主动 send 按发送时当前配置生成快照 |
-| 强回答↔执行↔消息关联 | 已实现 | schema v6 保存 bot/session/turn/native session/platform message/chat/topic/attempt/hash/ref/CLI/model/Skill/workflow/task/status/usage 等；delivery ID 包含 native session，terminal reconcile 使用 bot/session/turn/attempt |
+| 强回答↔执行↔消息关联 | 已实现 | schema v7 保存 bot/session/turn/native session/platform message/chat/topic/attempt/hash/ref/CLI/model/Skill/workflow/task/status/usage 等；delivery ID 包含 native session，terminal reconcile 使用 bot/session/turn/attempt |
 | 默认不存完整回答 | 已实现 | `responses` 只存 hash/ref；卡片快照只保留反馈区和 footer 结构；点击时优先从 Lark 回读原卡正文 |
-| worker turn 完成通知 | 已实现但有边界 | 持久化匹配 worker terminal + canonical delivery 的 `turn.completed`，支持 terminal-before-delivery 与 delivery-before-terminal、重复信号幂等；主动 `botmux send` 不产生 terminal/completion event |
+| worker turn 完成通知 | 已实现但有边界 | 持久化匹配 worker terminal + canonical delivery 的 `turn.completed`，支持 terminal-before-delivery 与 delivery-before-terminal、重复信号幂等；同 turn 多 delivery 各自产生 completion；无真实 worker turn 的主动 `botmux send` 不产生 completion event |
 | 标准 webhook 出口 | 已实现 | 已产生的 `turn.completed` 和每条 `feedback.revised` 可进入 durable outbox；HMAC、事件 ID、重试、重启恢复、SSRF 防护；无 destination 时仅落事件表 |
 | Dashboard 分析 | API 完整，页面基础 | 私有认证 API 支持覆盖率、正向率、三态趋势、原因、交付/出口失败、过滤与分页下钻；当前页面固定最近 30 天，显示 KPI、positive trend、原因和下钻，尚未暴露全量筛选控件和 progress trend |
 | card-off 首期不支持 | 符合建议 | 反馈依赖 interactive card；不会为纯文本模式额外发反馈卡 |
@@ -185,9 +186,9 @@ botmux send --response-kind final ...
 - 自由文本写入本地事实表，但不会回显到群卡。
 - 原因/说明更新形成新 revision，并通过 `supersedes_feedback_id` 连接上一版。
 
-## 6. SQLite v6 数据模型
+## 6. SQLite v7 数据模型
 
-数据文件：`botmux-feedback.sqlite`。SQLite 开启 WAL、foreign keys 和 busy timeout，并支持 v1/v2 事务迁移到 v6。
+数据文件：`botmux-feedback.sqlite`。SQLite 开启 WAL、foreign keys 和 busy timeout，并支持 v1/v2 事务迁移到 v7。
 
 ### 6.1 interactions / responses
 
@@ -242,7 +243,8 @@ Core 将真实 worker terminal 信号和真实成功 canonical delivery 持久�
 - 重复信号幂等；
 - 冲突 terminal 状态拒绝覆盖；
 - 没有 canonical Lark delivery 的特殊 sink 不伪装成 Lark 完成事件。
-- 主动 `botmux send --response-kind final` 会保存 delivery，但当前不产生 worker terminal，因此不会生成 `turn.completed`。
+- 主动 `botmux send --response-kind final` 在存在真实 `currentTurnId` 时保存真实 turn 关联并参与 worker terminal reconcile；同 turn 多条 delivery 由独立 discriminator 区分。
+- 脱离 worker turn 的主动 final 使用 `send:<messageId>`，没有匹配 terminal，因此不生成 `turn.completed`。
 
 ### 7.2 状态
 
@@ -326,7 +328,7 @@ daemon 启动时恢复 stale claims，运行中也周期恢复；claim/settle �
 - outbox failures；
 - redacted delivery drill-down 和 cursor pagination。
 
-API 可过滤 time、team、bot、chat/topic、semantic、verdict、reason、model、CLI/version、Skill/version、workflow/task、status。SQL 使用参数绑定、限制最大时间范围，并通过 v6 索引支持常见维度。
+API 可过滤 time、team、bot、chat/topic、semantic、verdict、reason、model、CLI/version、Skill/version、workflow/task、status。SQL 使用参数绑定、限制最大时间范围，并通过 v7 索引支持常见维度。
 
 当前页面只暴露固定最近 30 天视图，展示 KPI、positive trend、原因、失败和分页下钻；尚未暴露 API 的全量筛选控件，也未可视化 progress/negative trend。
 
@@ -340,7 +342,7 @@ API 可过滤 time、team、bot、chat/topic、semantic、verdict、reason、mod
 
 - 策略、卡片、回调、SQLite migration、delivery、turn.completed、outbox/webhook、Dashboard、CLI/daemon 路径专项测试；
 - TypeScript 检查、`git diff --check`、完整 build、Dashboard bundle、domain/dist audit；
-- 真实数据库副本迁移到 v6，`integrity_check=ok`，foreign key check 无错误；
+- 真实数据库副本迁移到 v7，`integrity_check=ok`，foreign key check 无错误；
 - 未认证 Dashboard 分析 API 返回 401，认证 API 返回真实统计；
 - 真实 Lark 三态卡和负向二级交互；
 - 实际点击记录已验证写入 feedback revision 和 `feedback.revised` event，semantic 与 verdict key 一致；
@@ -354,7 +356,7 @@ API 可过滤 time、team、bot、chat/topic、semantic、verdict、reason、mod
 
 - 不只 team/bot，增加了 bot-scoped chat override 和有效策略来源预览。
 - feedback 不是覆盖更新，而是 immutable revision chain。
-- SQLite 从两张概念表演进为 schema v6 的 interaction/response/delivery/revision/completion event/event/outbox 体系。
+- SQLite 从两张概念表演进为 schema v7 的 interaction/response/delivery/revision/completion event/event/outbox 体系。
 - card 回调使用 ACK 后异步 patch，解决复杂 Lark form 的真实客户端错误。
 - webhook 增加 DNS pinning、token-fenced claim 和周期 stale recovery。
 - 分析支持 delivered 与 rated 两种分母，避免把未评分回答误当负向。
@@ -386,7 +388,7 @@ API 可过滤 time、team、bot、chat/topic、semantic、verdict、reason、mod
 
 #### 本地订阅 API
 
-底层数据能力已经存在：schema v6 包含 durable `feedback_events`、`turn_completion_events` 和 outbox，webhook 也支持可靠投递。但一个稳定的本地订阅 API 仍需明确 pull 或 stream/SSE 模式、cursor 和保留期、ack/重放、多 consumer 消费进度隔离、daemon IPC 认证与脱敏，以及事件 schema/version 的兼容承诺。
+底层数据能力已经存在：schema v7 包含 durable `feedback_events`、`turn_completion_events` 和 outbox，webhook 也支持可靠投递。但一个稳定的本地订阅 API 仍需明确 pull 或 stream/SSE 模式、cursor 和保留期、ack/重放、多 consumer 消费进度隔离、daemon IPC 认证与脱敏，以及事件 schema/version 的兼容承诺。
 
 在这些协议未拍板前直接鼓励插件读取 SQLite，会把内部表结构事实化为公共 API，阻碍未来迁移。因此当前提供本地事实表和 durable webhook，但暂不宣布稳定订阅协议。若继续建设扩展平台，建议按“本地订阅 API → Agent 受约束建议 → 通用 card-action 注册表”的顺序推进；越靠后的能力安全与兼容承诺越大。
 

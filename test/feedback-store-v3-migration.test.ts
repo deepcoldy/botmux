@@ -34,7 +34,7 @@ describe('SkillFeedbackStore v3 migration', () => {
     const dataDir = mkdtempSync(join(tmpdir(), 'botmux-feedback-v6-'));
     dirs.push(dataDir);
     const store = await SkillFeedbackStore.open(dataDir);
-    expect(store.schemaVersion()).toBe(6);
+    expect(store.schemaVersion()).toBe(7);
     store.close();
     const { DatabaseSync } = await import('node:sqlite');
     const db = new DatabaseSync(join(dataDir, 'botmux-feedback.sqlite'));
@@ -60,7 +60,7 @@ describe('SkillFeedbackStore v3 migration', () => {
     copyFileSync(join(fixtureDir, 'botmux-feedback.sqlite'), join(migratedDir, 'botmux-feedback.sqlite'));
 
     const store = await SkillFeedbackStore.open(migratedDir);
-    expect(store.schemaVersion()).toBe(6);
+    expect(store.schemaVersion()).toBe(7);
     const old = store.findDeliveryByPlatformMessage('lark', 'app_old', 'om_old');
     expect(old).toMatchObject({
       deliveryId: 'del_old', responseId: 'resp_old', requesterSubjectId: 'on_old',
@@ -97,6 +97,25 @@ describe('SkillFeedbackStore v3 migration', () => {
     expect(JSON.stringify(stored)).not.toContain('private final answer');
     expect(store.debugCounts()).toEqual({ responses: 1, deliveries: 1 });
     store.close();
+  });
+
+  it('preserves legacy delivery ids for retries after the v7 migration', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-feedback-v6-retry-'));
+    dirs.push(dataDir);
+    const store = await SkillFeedbackStore.open(dataDir);
+    const input = {
+      botAppId: 'app_a', sessionId: 'sid_retry', turnId: 'turn_retry', nativeSessionId: 'native_retry',
+      platform: 'lark' as const, platformMessageId: 'om_retry', platformAppId: 'app_a', dispatchAttempt: 3,
+      content: 'same canonical answer', cardMode: 'feedback' as const, status: 'delivered' as const,
+    };
+    const first = store.recordTurnDelivery(input);
+    store.close();
+
+    const reopened = await SkillFeedbackStore.open(dataDir);
+    const retry = reopened.recordTurnDelivery(input);
+    expect(retry.deliveryId).toBe(first.deliveryId);
+    expect(reopened.debugCounts()).toEqual({ responses: 1, deliveries: 1 });
+    reopened.close();
   });
 
   it('uses deterministic correlation ids and refuses platform-message rebinding', async () => {

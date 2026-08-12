@@ -1,11 +1,15 @@
-import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { spawn, type ChildProcess } from 'node:child_process';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer, type IncomingMessage, type Server } from 'node:http';
 import type { Socket } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import type { DaemonToWorker, WorkerToDaemon } from '../src/types.js';
+import {
+  RELAY_ORIGIN_CAPABILITY_BASENAME,
+  replaceManagedOriginCapabilityFile,
+} from '../src/core/managed-origin-capability.js';
 
 async function listen(server: Server): Promise<number> {
   await new Promise<void>((resolvePromise, rejectPromise) => {
@@ -30,14 +34,74 @@ function readRequestBody(req: IncomingMessage): Promise<string> {
 }
 
 describe('Riff worker session environment', () => {
-  it('defaults an omitted response kind to non-final in an env-only Riff CLI', () => {
-    const source = readFileSync(resolve('src/cli.ts'), 'utf8');
-    const cmdSendStart = source.indexOf('async function cmdSend(');
-    const cmdDispatchStart = source.indexOf('async function cmdDispatch(', cmdSendStart);
-    const cmdSend = source.slice(cmdSendStart, cmdDispatchStart);
-    expect(cmdSend).toContain("const effectiveResponseKind = responseKind ?? 'progress'");
-    expect(cmdSend).not.toContain('启用最终回答反馈后，必须显式指定 --response-kind progress|final');
-    expect(cmdSend).not.toContain("feedbackPolicy && responseKind === 'final'");
+  it('forwards an omitted response kind through the Riff relay as non-final', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-cli-riff-feedback-'));
+    const outbox = join(root, 'outbox');
+    const dataDir = join(root, 'data');
+    const capability = 'ab'.repeat(32);
+    writeFileSync(join(root, 'placeholder'), '');
+    const { mkdirSync } = await import('node:fs');
+    mkdirSync(outbox, { recursive: true });
+    mkdirSync(dataDir, { recursive: true });
+    replaceManagedOriginCapabilityFile(join(outbox, RELAY_ORIGIN_CAPABILITY_BASENAME), JSON.stringify({
+      token: capability,
+      turnId: 'turn-riff-feedback',
+      dispatchAttempt: 1,
+    }));
+    const fixture = join(root, 'host-send.mjs');
+    writeFileSync(fixture, `
+      import { readFileSync } from 'node:fs';
+      const argv = process.argv.slice(2);
+      process.stdout.write(JSON.stringify({
+        content: readFileSync(argv[argv.indexOf('--content-file') + 1], 'utf8'),
+        responseKind: argv.includes('--response-kind') ? argv[argv.indexOf('--response-kind') + 1] : null,
+      }));
+    `);
+    const stop = (await import('../src/adapters/backend/sandbox.js')).startOutboxWatcher(
+      outbox,
+      { ...process.env },
+      'sid-riff-feedback',
+      {
+        cliPath: fixture,
+        authorize: claim => claim.capability === capability
+          ? { ok: true as const, origin: { turnId: 'turn-riff-feedback', dispatchAttempt: 1 } }
+          : { ok: false as const, error: 'stale' },
+      },
+    );
+    try {
+      const childResult = await new Promise<{ status: number | null; stdout: string; stderr: string }>((resolvePromise, rejectPromise) => {
+        const cli = spawn(process.execPath, [
+          '--import', 'tsx', resolve('src/cli.ts'),
+          'send', 'unclassified Riff progress', '--session-id', 'sid-riff-feedback', '--no-mention',
+        ], {
+          cwd: resolve('.'),
+          env: {
+            ...process.env,
+            HOME: root,
+            SESSION_DATA_DIR: dataDir,
+            BOTMUX_SESSION_ID: 'sid-riff-feedback',
+            BOTMUX_SEND_RELAY: outbox,
+            BOTMUX_FEEDBACK_POLICY: JSON.stringify({ enabled: true }),
+            BOTMUX_WORKFLOW: '',
+          },
+          stdio: ['ignore', 'pipe', 'pipe'],
+        });
+        let stdout = '';
+        let stderr = '';
+        cli.stdout.on('data', chunk => { stdout += String(chunk); });
+        cli.stderr.on('data', chunk => { stderr += String(chunk); });
+        cli.once('error', rejectPromise);
+        cli.once('close', status => resolvePromise({ status, stdout, stderr }));
+      });
+      expect(childResult.status, childResult.stderr).toBe(0);
+      expect(JSON.parse(childResult.stdout)).toEqual({
+        content: 'unclassified Riff progress',
+        responseKind: null,
+      });
+    } finally {
+      stop();
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   it('forwards reply-card usage and the effective feedback policy into the remote sandbox', async () => {
