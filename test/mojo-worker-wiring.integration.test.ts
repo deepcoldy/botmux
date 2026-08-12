@@ -279,8 +279,25 @@ echo '{"type":"result","status":"ok","result":"ok","session_id":"sid-worker-shut
     // isPromptReady stays false until the ~15s first-prompt fallback and every
     // first message is needlessly delayed.
     const { invocation, elapsedMs } = await runWorker({ timeoutMs: 12_000 });
-    expect(invocation.argv).toContain('hello mojo');
+    // toContain on the array no longer holds: mojo is injectsSessionContext with a
+    // global skillsDir, so the default `prompt` mode prepends the built-in skill
+    // catalog and the positional prompt is a superset of the user text. Assert the
+    // LAST argv entry (the buildCliArgs contract) carries it instead.
+    expect(invocation.argv[invocation.argv.length - 1]).toContain('hello mojo');
     expect(elapsedMs).toBeLessThan(12_000);
+  }, 40_000);
+
+  it('delivers the built-in skill catalog through the real worker, not just the backend', async () => {
+    // End-to-end proof for the prompt-mode gap: the backend unit tests inject a
+    // synthetic block, so only this path shows that the WORKER actually resolves
+    // the mode (default `prompt`) and hands it to the CLI. Without the wiring the
+    // positional prompt is the bare user text.
+    const { invocation } = await runWorker({ timeoutMs: 12_000 });
+    const positional = invocation.argv[invocation.argv.length - 1];
+    expect(positional).toContain('<botmux_builtin_skills>');
+    // …and the user's turn still arrives after it.
+    expect(positional.indexOf('<botmux_builtin_skills>'))
+      .toBeLessThan(positional.indexOf('hello mojo'));
   }, 40_000);
 
   it('passes the session working dir, per-bot env and model through', async () => {
@@ -418,7 +435,9 @@ echo '{"type":"result","status":"ok","result":"ok","session_id":"sid-worker-shut
     });
     expect(invocation.env.WRAPPER_MARK).toBe('wrapped');
     // The prompt must still arrive — the prefix wraps, it does not replace.
-    expect(invocation.argv).toContain('hello mojo');
+    // Last entry, not array membership: the default `prompt` skill-injection mode
+    // prepends the built-in catalog to the positional prompt.
+    expect(invocation.argv[invocation.argv.length - 1]).toContain('hello mojo');
   }, 40_000);
 
   it('applies CLI_EXTRA_ARGS even with no wrapper configured', async () => {
