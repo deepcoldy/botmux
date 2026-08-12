@@ -21376,12 +21376,13 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     }
 
     scheduler.stopScheduler();
-    // Drain any in-flight turn-terminal persistence (bounded) BEFORE stopping
-    // the webhook dispatcher, so last-moment turn.completed events land in the
-    // outbox and are not lost by an immediate exit.
-    const undrained = await drainTurnTerminalQueue(3000);
-    if (undrained > 0) logger.warn(`[turn-completion] shutdown drain timed out with ${undrained} pending`);
-    await feedbackWebhookDispatcher?.stop();
+    // NOTE: turn-terminal queue drain + webhook dispatcher stop are deliberately
+    // deferred until AFTER workers have stopped producing (see below). Draining
+    // here would close queue admission while worker terminal IPC handlers are
+    // still alive, so a turn completing during shutdown would have its terminal
+    // refused and never persisted (delivery cannot be reconstructed to
+    // completed/failed/cancelled after the fact). Keep the queue and dispatcher
+    // live through worker teardown.
     stopMaintenance();
     vcMeetingTerminalReconciler?.stop();
     clearInterval(vcMeetingDeliveryLeaseTimer);
@@ -21412,19 +21413,36 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     ipcHandle.close().catch(() => { /* swallow */ });
     if (terminalProxy) terminalProxy.close().catch(() => { /* swallow */ });
 
-    const pendingExits: Array<Promise<void>> = [];
+    // Producer-closed fence. We must not close the turn-terminal queue admission
+    // until every worker's IPC channel is truly closed — a worker whose 'exit'
+    // fired can still have queued 'message' terminals in flight; ChildProcess
+    // 'close' fires only after stdio AND the IPC channel are fully closed, so it
+    // is the real "no more terminals from this producer" signal. Track by 'close'
+    // (falling back to 'exit' for a worker with no IPC channel), dedup by
+    // ChildProcess, and use the check → once → re-check closure so a child that
+    // already closed before we registered does not make us wait out the deadline.
+    const producerClosed: Array<Promise<void>> = [];
     const survivors: ChildProcess[] = [];
-    const trackWorkerExit = (w: ChildProcess): void => {
-      if (w.exitCode !== null || w.signalCode !== null) return;
-      pendingExits.push(new Promise<void>(resolve => {
-        w.once('exit', () => resolve());
-        // Close the check/listener race if exit landed between the first
-        // status read and once().
-        if (w.exitCode !== null || w.signalCode !== null) resolve();
+    const tracked = new Set<ChildProcess>();
+    const isChannelQuiet = (w: ChildProcess): boolean =>
+      // 'connected' is false once the IPC channel is closed; exited/ killed with
+      // no channel is also quiet. Either means no further 'message' can arrive.
+      (w.exitCode !== null || w.signalCode !== null) && w.connected !== true;
+    const trackWorkerClosed = (w: ChildProcess): void => {
+      if (tracked.has(w)) return; // dedup: same worker referenced twice
+      tracked.add(w);
+      if (isChannelQuiet(w)) return; // already fully closed — nothing to await
+      producerClosed.push(new Promise<void>(resolve => {
+        const done = (): void => resolve();
+        w.once('close', done);   // stdio + IPC fully closed → no more queued messages
+        w.once('exit', () => { if (w.connected !== true) done(); }); // no-IPC fallback
+        // Close the check/listener race if it became quiet between the first read
+        // and attaching the listeners.
+        if (isChannelQuiet(w)) done();
       }));
       survivors.push(w);
     };
-    for (const worker of riffRetiredWorkers) trackWorkerExit(worker);
+    for (const worker of riffRetiredWorkers) trackWorkerClosed(worker);
     for (const ds of currentShutdownFleet.sessions) {
       if (ds.worker && !ds.worker.killed) {
         logger.info(`Shutting down worker for session ${ds.session.sessionId}`);
@@ -21433,8 +21451,8 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         if (disposition === 'riff-drain-detach') {
           throw new Error(`undrained Riff generation after atomic commit: ${ds.session.sessionId}`);
         }
-        // Capture the exit promise BEFORE killWorker nulls ds.worker.
-        trackWorkerExit(w);
+        // Capture the close promise BEFORE killWorker nulls ds.worker.
+        trackWorkerClosed(w);
         // Branch by the session's FROZEN backend (stamped on Session.backendType
         // at spawn), NOT the bot's live config — a dashboard backendType edit must
         // not change how a running session is torn down, or we'd e.g. try to
@@ -21459,13 +21477,13 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       }
     }
 
-    if (pendingExits.length > 0) {
+    if (producerClosed.length > 0) {
       const exitGraceMs = Math.min(
         DAEMON_WORKER_EXIT_GRACE_MS,
         Math.max(0, shutdownDeadlineMs - Date.now()),
       );
-      const timeout = new Promise<void>(resolve => setTimeout(resolve, exitGraceMs));
-      await Promise.race([Promise.all(pendingExits), timeout]);
+      const timeout = new Promise<void>(resolve => { setTimeout(resolve, exitGraceMs); });
+      await Promise.race([Promise.all(producerClosed), timeout]);
       let stragglers = 0;
       for (const w of survivors) {
         if (w.exitCode === null && w.signalCode === null) {
@@ -21475,8 +21493,30 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       }
       if (stragglers > 0) {
         logger.warn(`${stragglers}/${survivors.length} worker(s) didn't exit within ${exitGraceMs}ms — SIGKILL'd to prevent ppid=1 orphans.`);
+        // A SIGKILL'd worker's 'close' (IPC channel teardown) lands slightly
+        // after the signal; wait a bounded extra window (within the overall
+        // shutdown deadline) for the producerClosed promises to settle, so we do
+        // not close queue admission while a just-killed worker's queued terminal
+        // is still being delivered. Best-effort: bounded by the deadline.
+        const closeGraceMs = Math.max(0, Math.min(2000, shutdownDeadlineMs - Date.now()));
+        if (closeGraceMs > 0) {
+          const closeTimeout = new Promise<void>(resolve => { setTimeout(resolve, closeGraceMs); });
+          await Promise.race([Promise.all(producerClosed), closeTimeout]);
+        }
       }
     }
+
+    // Workers have now stopped and their IPC channels are closed (or the bounded
+    // grace elapsed), so no more turn terminals can be produced. Only NOW is it
+    // safe to close queue admission and drain: draining earlier would refuse a
+    // terminal from a turn that completed during worker teardown, losing it
+    // permanently (a delivery cannot be reconstructed to completed/failed/
+    // cancelled after the fact). Drain (bounded, ref'd keepalive so a fire-and-
+    // forget shutdown does not exit mid-drain) so last turn.completed events
+    // reach the durable outbox, THEN stop the dispatcher.
+    const undrained = await drainTurnTerminalQueue(Math.max(500, Math.min(3000, shutdownDeadlineMs - Date.now())));
+    if (undrained > 0) logger.warn(`[turn-completion] shutdown drain timed out with ${undrained} pending`);
+    await feedbackWebhookDispatcher?.stop();
 
     // Flush any pending identity-cache writes before exit. The cache uses a
     // 2s debounce on disk persistence to dedupe writes from chatty groups; on

@@ -219,4 +219,36 @@ describe('turn-terminal nonblocking queue', () => {
     await first;
     blocker.close();
   });
+
+  it('shutdown ordering: a terminal enqueued while producers are still up is persisted through drain; only post-drain enqueues are refused', async () => {
+    // Mirrors the daemon shutdown contract: producers (workers) are stopped
+    // FIRST, so any terminal they emitted is enqueued BEFORE drain closes
+    // admission. That terminal must be persisted (event = 1). A terminal that
+    // somehow arrives AFTER drain closed admission (a producer that outlived the
+    // fence) is refused — surfaced, not silently dropped.
+    const dir = freshDir();
+    const store = await getSkillFeedbackStore(dir);
+    delivery(store, dir);
+
+    // Producer still "up": enqueue lands before drain (not awaited yet).
+    const inflight = enqueueTurnTerminal({
+      dataDir: dir, botAppId: 'app', sessionId: 'sess',
+      terminal: { turnId: 'turn-1', dispatchAttempt: 0, status: 'completed' },
+    });
+    // Now producers are considered stopped and we drain (closes admission).
+    const remaining = await drainTurnTerminalQueue(3000);
+    await inflight;
+    expect(remaining).toBe(0);
+    expect(store.listTurnCompletionEvents().length).toBe(1); // persisted, not lost
+
+    // A late terminal after the fence is refused (would be the bug if silently dropped).
+    const errors: unknown[] = [];
+    await enqueueTurnTerminal({
+      dataDir: dir, botAppId: 'app', sessionId: 'sess',
+      terminal: { turnId: 'turn-2', dispatchAttempt: 0, status: 'completed' },
+      onError: e => errors.push(e),
+    });
+    expect(String(errors[0])).toContain('turn_terminal_persist_refused_shutdown');
+    expect(store.listTurnCompletionEvents().length).toBe(1); // turn-2 not persisted (correctly refused)
+  });
 });

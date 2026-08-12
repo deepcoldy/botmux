@@ -190,18 +190,30 @@ function finish(key: string): void {
  */
 export async function drainTurnTerminalQueue(timeoutMs = 3000): Promise<number> {
   admissionClosed = true;
-  const deadline = Date.now() + timeoutMs;
-  while (pending.size > 0 && Date.now() < deadline) {
-    const remainingMs = Math.max(0, deadline - Date.now());
-    const all = Promise.all([...pending.values()].map(item => item.promise));
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    const timeout = new Promise<'timeout'>(resolve => { timer = setTimeout(() => resolve('timeout'), remainingMs); timer.unref?.(); });
-    await Promise.race([all.then(() => 'drained' as const), timeout]);
-    if (timer) clearTimeout(timer);
-    // Re-check pending.size: items rescheduled onto a backoff timer (whose
-    // promise was not in this snapshot's resolved set) are picked up next loop.
+  if (pending.size === 0) return 0;
+  // Keepalive: the queue's retry timers are unref'd (so they never hold the
+  // process open on their own), and graceful shutdown invokes this drain from a
+  // fire-and-forget SIGTERM handler that nobody awaits. Without a ref'd handle
+  // the event loop could see "nothing left to do" and exit while an unref'd
+  // retry is still pending, truncating the drain. Hold ONE ref'd timer for the
+  // drain's lifetime and release it in finally.
+  const keepalive = setInterval(() => { /* ref'd no-op: keep the loop alive during drain */ }, 1000);
+  try {
+    const deadline = Date.now() + timeoutMs;
+    while (pending.size > 0 && Date.now() < deadline) {
+      const remainingMs = Math.max(0, deadline - Date.now());
+      const all = Promise.all([...pending.values()].map(item => item.promise));
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const timeout = new Promise<'timeout'>(resolve => { timer = setTimeout(() => resolve('timeout'), remainingMs); timer.unref?.(); });
+      await Promise.race([all.then(() => 'drained' as const), timeout]);
+      if (timer) clearTimeout(timer);
+      // Re-check pending.size: items rescheduled onto a backoff timer (whose
+      // promise was not in this snapshot's resolved set) are picked up next loop.
+    }
+    return pending.size;
+  } finally {
+    clearInterval(keepalive);
   }
-  return pending.size;
 }
 
 /** Test-only: current in-flight count. */
