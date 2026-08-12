@@ -1,12 +1,13 @@
-import { homedir } from 'node:os';
-import { join } from 'node:path';
 import {
   cliAuthBind,
   loadDashboardSecret,
   signCliAuth,
 } from '../dashboard/auth.js';
+import { dashboardSecretPath } from './dashboard-secret.js';
 
-const DEFAULT_SECRET_PATH = join(homedir(), '.botmux', '.dashboard-secret');
+// Follows the credential root (BOTMUX_CREDENTIALS_DIR / breadcrumb): the daemon
+// reads the same path, so a redirected deployment stays HMAC-consistent.
+const DEFAULT_SECRET_PATH = dashboardSecretPath();
 
 /**
  * Build a route- and port-bound authorization header for the daemon's
