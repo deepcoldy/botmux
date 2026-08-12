@@ -100,12 +100,17 @@ drain 并 ACK → daemon 等此前 `final_output` 的**实际投递完成** → 
 
 ### 决策 1：改默认行为，不加开关
 
-有了"延迟兑现"之后默认开启是站得住的 —— 没有会话被漏掉，只是晚几十秒到几分钟。
+有了"延迟兑现"之后默认开启是站得住的 —— **目标会话不会因为 busy 就被跳过**
+（claim 记下来，转 idle 必兑现），只是晚几十秒到几分钟。注意这说的是「挂起请求
+不丢」，不等于「回复不丢」：交付边界仍有一个已知窗口，见 §2。
 
-对凭证轮换而言，**延迟兑现严格优于现在的立即切断**：正在跑的那一轮本来就已经
+对凭证轮换而言，延迟兑现**通常优于**现在的立即切断：正在跑的那一轮本来就已经
 持有旧凭证，切断它并不能让那一轮用上新凭证，只是白白丢掉一次回复。
 两种做法对"该会话何时开始用新凭证"的结果相同（都是下一轮），
 区别只在于当前这一轮是完成还是被丢弃。
+
+**最坏情况下退化为与立即切断相同**：若这一轮的回复正好落进 §2 那个交付窗口，
+它同样会丢 —— 那时两种做法的结果一样，延迟兑现并不更差，但也不再更好。
 
 因此不加 `--defer-busy` 之类的开关，直接改默认。
 
@@ -164,16 +169,23 @@ function runPendingSuspendIfSettled(ds: DaemonSession, ownsGeneration?: () => bo
   const reason = ds.pendingSuspendReason;
   if (!reason) return;
   if (ownsGeneration && !ownsGeneration()) return;
-  const st = ds.lastScreenStatus;
-  if (st !== 'idle' && st !== 'limited') return;
-  // worker 已经没了（崩溃 / 被别的路径挂起）：目标态已达成，清标志即可。
-  if (!ds.worker || ds.worker.killed) {
-    ds.pendingSuspendReason = undefined;
+  // claim 属于排队时那一代；到了更晚的 generation 说明它自己的兑现点没跑到，
+  // 就地消费而不是挂起一个它从未指向过的 worker（兜底，正常由下面两处消费）。
+  if (ds.pendingSuspendGeneration !== undefined
+      && ds.workerGeneration !== undefined
+      && ds.pendingSuspendGeneration !== ds.workerGeneration) {
+    clearPendingSuspendClaim(ds, 'generation changed');
     return;
   }
-  // 只在成功时清标志（见下）。
+  const st = ds.lastScreenStatus;
+  if (st !== 'idle' && st !== 'limited') return;
+  // worker 已经没了（崩溃 / 被别的路径挂起）：目标态已达成，清 claim 即可。
+  if (!ds.worker || ds.worker.killed) {
+    clearPendingSuspendClaim(ds, 'worker already gone');
+    return;
+  }
+  // 成功时 claim 由 suspendWorker 内部的 clearPendingSuspendClaim 消费，这里只补一条可区分的日志。
   if (suspendWorker(ds, reason)) {
-    ds.pendingSuspendReason = undefined;
     logger.info(`[${tag(ds)}] Deferred suspend fulfilled (${reason}) after turn completed`);
     return;
   }
@@ -184,17 +196,21 @@ function runPendingSuspendIfSettled(ds: DaemonSession, ownsGeneration?: () => bo
 
 三个细节都是正确性要求，不是讲究：
 
-**`ownsGeneration` 必须传，否则会挂掉替换上来的新 worker** —— 但原因不是本文早先
-写的那条。它**不是**「旧 worker 的陈旧消息能进入 `screenshot_uploaded`」：message
-handler 的统一 fence（`if (ds.worker !== worker) return`）排在 switch **之前**，
-被替换 worker 的消息一条也进不来。
+**`ownsGeneration` 要传，但它是 defense-in-depth，不是防一个已证实可达的 race。**
+本文先后写过两版「具体 race」的论证，两版都不成立，为免第三次重蹈，把结论记在这里：
 
-真正的窗口是**延迟兑现本身**。调用方必须用 `queueMicrotask` 推迟（理由见下），
-于是 fence 是在**消息到达**时检查的，而挂起在**一个微任务之后**才执行。两条消息
-可以在同一 tick 内都合法通过 fence：第一条的微任务挂起了会话、随后 refork 装上新
-worker，第二条的微任务这时才运行，面对的是一个全新的 worker。没有这道判定就会把
-它挂掉 —— 新 worker 若正在产出，正是原样复现本功能要消灭的截断 bug。
-不属于当前 generation 的 checkpoint **保留标志直接返回**。
+- **不是**「旧 worker 的陈旧消息进入 `screenshot_uploaded`」：message handler 的统一
+  fence（`if (ds.worker !== worker) return`）排在 switch **之前**，被替换 worker 的
+  消息一条也进不来。
+- **也不是**「同一 tick 两条微任务，第一条挂起并 refork、第二条撞上新 worker」：
+  `suspendWorker` 只把 `ds.worker` 置 null，**它不 refork**（refork 由外部输入驱动，
+  属于之后的宏任务），而微任务队列连续 drain 期间宏任务插不进来。所以第二条微任务
+  面对的是 `ds.worker === null`，`ownsGeneration` 判假直接早退 —— 不是一个新 worker。
+
+它真正买到的是：排队的回调**只可能在自己那一代仍持有会话时执行**。消费 claim 是对
+一个存活 worker 的破坏性操作，即便今天没有可达的 race，也值得为将来的调用方、
+enqueue 与 drain 之间新增的同步副作用、以及任何比现在更早开始 refork 的路径留住
+这道门。不属于当前 generation 的 checkpoint **保留标志直接返回**。
 
 （不要改成给 `screenshot_uploaded` 加前置 `ownsLifecycleMutation()` break：那会改掉
 该 case 的既有行为，影响面不明。把判定传进兑现函数是最小且封闭的改法。）
@@ -362,7 +378,7 @@ CLI 本地的 session store 这些判据一个都没有，要按 daemon 拉一�
 | 会话状态为 `undefined` | 不排队，走原有立即挂起路径（`undefined` 不属于 working/analyzing） |
 | daemon 重启 | 排队丢失，下一周期重新排队（决策 4） |
 | 兑现时 bridge 队列还有未发的回复 | **仍可能丢** —— 交付边界是 best-effort，见 §2 的已知残留窗口 |
-| 排队期间会话 refork，旧 worker 的 `screenshot_uploaded(idle)` 晚到 | `ownsGeneration` 判定为假 → **保留标志、不挂新 worker**（§5.2a） |
+| 排队期间会话 refork | claim 绑定在排队那一代，`suspendWorker` 成功或 worker exit 时即被消费；漏网的到下一代由 generation 门控就地消费，**绝不挂新 worker**（§5.1 / §5.2a） |
 | 兑现时 `suspendWorker` 拒绝（routing transfer 中） | 保留标志，并注册 `deferUntilSessionTransferSettled` 重试 —— 不能只靠"下一个 checkpoint"，安静会话可能再也没有（§5.2a） |
 | dry-run 遇到正在 routing transfer 的会话 | **预告不准**：会报"将排队/将挂起"，实际是 409 `session_transferring`。`/api/sessions` 行不暴露该状态，已在代码注释标明（§5.4） |
 
@@ -417,15 +433,19 @@ flush 产物在 daemon 侧被 fence 确定性丢弃，它依然全绿。这是�
 
 ### 生产验证
 
-改动部署后（`pnpm build`；worker 是每次冷启动 fork `dist/worker.js`，所以 §5.5 的
-worker 侧改动 build 完即生效；而 `worker-pool.ts` / `dashboard-ipc-server.ts` 跑在
-daemon 进程里，**必须重启 daemon**）：
+改动部署后（`pnpm build`），本设计只涉及 daemon 侧（`src/worker.ts` 零 diff —— §5.5 的
+worker 侧 flush 已移除），daemon 重启即全部生效。
 
 1. 找一个正在生成回复的会话（`botmux list --plain` 里 status 为 online 且屏幕在动）
 2. `botmux suspend <sid>` → 应输出 `⏳ 已排队`
 3. 等该会话回复完成 → daemon 日志应出现 `Deferred suspend fulfilled`
 4. `botmux list` 确认该会话已变成 dormant
 5. 关键回归：确认那条回复**完整发到了飞书**，没有被截断
+
+> ⚠️ 第 5 步观察到"完整送达"只是**一个样本的观测结果**，并不证明 §2 那个交付边界
+> 窗口消失 —— 那个窗口要求 `final_output` 与 idle 落在同一轮事件循环，日常抽查大
+> 概率碰不上。判断它是否发生，看 daemon 日志里有没有
+> `Bridge final_output abandoned — worker/session ownership changed`。
 
 也可直接观察下一次 6 小时周期的 `suspend all` 输出，排队数应与当时的
 busy 会话数吻合（历史 `p99=4, max=5`）。

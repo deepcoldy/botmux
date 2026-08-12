@@ -2852,21 +2852,28 @@ export function suspendWorker(ds: DaemonSession, reason = 'suspended_idle'): boo
  * card. Running it inline would skip exactly the turn-completion bookkeeping
  * this whole feature exists to protect.
  *
- * `ownsGeneration` is the calling handler's generation check (`ownsWorkerSession`)
- * and is REQUIRED for correctness, not a nicety — but NOT for the reason an
- * earlier draft of this comment gave. It is not about a stale worker's message
- * reaching `screenshot_uploaded`: the message handler's fence
- * (`if (ds.worker !== worker) return`) sits BEFORE the switch and already drops
- * every message from a replaced worker.
+ * `ownsGeneration` is the calling handler's generation check (`ownsWorkerSession`),
+ * and it is **defense-in-depth** — not a guard against a race anyone has shown to
+ * be reachable today. Two earlier drafts of this comment each claimed a concrete
+ * race; both were wrong, so the reasoning is spelled out here to stop a third:
  *
- * The real window is the deferral itself. Callers hand this to `queueMicrotask`
- * (they must — see above), so the fence is checked when the MESSAGE arrives while
- * the suspend runs one microtask later. Two messages can clear the fence in the
- * same tick; the first one's microtask suspends and the session re-forks, and the
- * second one's microtask then runs against a brand-new worker. Without this check
- * it would suspend that replacement — mid-reply — which is the exact truncation
- * bug this feature removes. A checkpoint from a generation that no longer owns
- * the session keeps the flag pending; only the owning generation may consume it.
+ *   - It is NOT "a stale worker's late `idle` reaches `screenshot_uploaded`":
+ *     the message handler's fence (`if (ds.worker !== worker) return`) sits
+ *     BEFORE the switch and already drops every message from a replaced worker.
+ *   - It is NOT "two microtasks in one tick, the first suspends + re-forks and
+ *     the second meets the replacement": `suspendWorker` only nulls `ds.worker`,
+ *     it never re-forks (a re-fork is driven by external input, i.e. a later
+ *     MACROtask), and the microtask queue drains without letting one in. The
+ *     second microtask therefore sees `ds.worker === null` and this predicate
+ *     early-returns on that — a replacement is not what it meets.
+ *
+ * What it does buy: a queued callback can only ever act while its own generation
+ * still owns the session. That keeps this deferral safe against future callers,
+ * new synchronous side effects between enqueue and drain, and any path that
+ * starts re-forking earlier than today. Consuming the claim is a destructive act
+ * on a live worker, so it is worth gating even without a demonstrated race.
+ * A checkpoint from a generation that no longer owns the session keeps the flag
+ * pending; only the owning generation may consume it.
  *
  * Deliberately the generation check ALONE, not `ownsLifecycleMutation` (which
  * also folds in "not transferring"): a routing transfer is a temporary refusal,
@@ -7839,10 +7846,12 @@ function setupWorkerHandlers(
         updateUsageLimitState(ds, msg.usageLimit);
         ds.lastScreenStatus = (msg.usageLimit ?? ds.usageLimit) ? 'limited' : msg.status;
         // Same deferred-suspend checkpoint as the screen_update branch, and
-        // deferred for the same reason (see runPendingSuspendIfSettled). This
-        // case has NO ownership guard of its own, so passing the predicate is
-        // what stops a stale worker's late `idle` from suspending its
-        // replacement — the assignment above is already unguarded today.
+        // deferred for the same reason (see runPendingSuspendIfSettled).
+        // The predicate is defense-in-depth here: the handler's fence already
+        // dropped every message from a replaced worker before the switch, so a
+        // stale `idle` cannot reach this case at all. Passing it keeps the
+        // deferred callback from acting on a generation that stopped owning the
+        // session between enqueue and drain.
         queueMicrotask(() => runPendingSuspendIfSettled(ds, ownsWorkerSession));
         emitSessionStateTransitionHook(ds, prevStatus, ds.lastScreenStatus, {
           source: 'screenshot_uploaded',
