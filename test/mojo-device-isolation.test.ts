@@ -34,14 +34,26 @@ function ds(opts: {
   mojoIdentity?: Record<string, unknown>;
   wrapperCli?: string;
   initWrapperCli?: string;
+  /**
+   * TOP-LEVEL `initConfig.env` — the per-bot env, PEER to backendConfig rather
+   * than nested inside the mojo block (see the `init` message in types.ts).
+   *
+   * This dimension was missing, and that is exactly why 44 green tests failed to
+   * catch a live-worker credential leak: every env case could only be expressed
+   * via backendConfig.env or mojoIdentity, so they all exercised the workerless
+   * branch. A live worker ALWAYS has initConfig.backendConfig and therefore never
+   * reaches it. The fixture was strictly more permissive than production.
+   */
+  initEnv?: Record<string, string>;
 }): never {
   return {
     larkAppId: 'app_x',
-    initConfig: opts.backendConfig || opts.initWrapperCli
+    initConfig: opts.backendConfig || opts.initWrapperCli || opts.initEnv
       ? {
         backendType: opts.backendType ?? 'mojo',
         ...(opts.backendConfig ? { backendConfig: opts.backendConfig } : {}),
         ...(opts.initWrapperCli ? { wrapperCli: opts.initWrapperCli } : {}),
+        ...(opts.initEnv ? { env: opts.initEnv } : {}),
       }
       : undefined,
     session: {
@@ -136,5 +148,82 @@ describe('resolveRemoteExecutionProven', () => {
 
   it('fails closed when the bot is deregistered and nothing is frozen', () => {
     expect(resolveRemoteExecutionProven(ds({}))).toBe(false);
+  });
+});
+
+/**
+ * The launcher env must void the proof on EVERY branch, not just the workerless
+ * one. A live worker always carries initConfig.backendConfig, so it can only ever
+ * reach the fromInit branch — which read backendConfig alone and therefore never
+ * saw the top-level per-bot env where PATH / LD_PRELOAD actually live.
+ *
+ * Why this matters: device-isolation is an independent credential boundary. For a
+ * cloud bot with sandbox disabled it is the ONLY guard, so the worker's own
+ * sandbox gate cannot be treated as a backstop. Misclassifying such a session as
+ * safe_remote activates the credential while a hooked local mojo client holds it.
+ */
+describe('resolveRemoteExecutionProven — launcher env voids the proof on all branches', () => {
+  beforeEach(() => { liveBotConfig = {}; });
+
+  it('LIVE WORKER (fromInit): a top-level env preload voids the proof', () => {
+    // The exact counter-example from review. Before the fix this returned true.
+    expect(resolveRemoteExecutionProven(ds({
+      backendConfig: { cloud: true },
+      initEnv: { PATH: '/tmp/fake-mojo', LD_PRELOAD: '/tmp/hook.so' },
+    }))).toBe(false);
+  });
+
+  it('LIVE WORKER (fromInit): a top-level PATH override alone voids it', () => {
+    // PATH decides which binary runs, so it is sufficient on its own.
+    expect(resolveRemoteExecutionProven(ds({
+      backendConfig: { cloud: true },
+      initEnv: { PATH: '/tmp/fake-mojo' },
+    }))).toBe(false);
+  });
+
+  it('LIVE WORKER (fromInit): a clean cloud session is still proven remote', () => {
+    // Guards against over-correcting into a proof nothing can satisfy.
+    expect(resolveRemoteExecutionProven(ds({ backendConfig: { cloud: true } }))).toBe(true);
+    // The canonical JWT name is the ONLY exemption in the allowlist, so a session
+    // whose sole launcher var is the credential itself stays provable.
+    expect(resolveRemoteExecutionProven(ds({
+      backendConfig: { cloud: true },
+      initEnv: { X_JWT_TOKEN: 'a.b.c' },
+    }))).toBe(true);
+  });
+
+  it('LIVE WORKER (fromInit): even a benign-looking top-level var voids it', () => {
+    // mojoUnprovableEnvKeys is an ALLOWLIST on purpose — execution-redirecting
+    // variables cannot be enumerated — so anything not known-harmless must void
+    // the proof. Asserted through the top-level field specifically, since that is
+    // the layer the live-worker branch used to ignore entirely.
+    expect(resolveRemoteExecutionProven(ds({
+      backendConfig: { cloud: true },
+      initEnv: { SOME_HARMLESS_FLAG: '1' },
+    }))).toBe(false);
+  });
+
+  it('LIVE WORKER (fromInit): the mojo-block env still wins the merge', () => {
+    expect(resolveRemoteExecutionProven(ds({
+      backendConfig: { cloud: true, env: { LD_PRELOAD: '/tmp/hook.so' } },
+      initEnv: { X_JWT_TOKEN: 'a.b.c' },
+    }))).toBe(false);
+  });
+
+  it('LEGACY branch: a top-level botCfg.env preload voids the proof', () => {
+    // Nothing frozen and no initConfig => legacy migration branch, which also
+    // read only botCfg.mojo and skipped the peer botCfg.env.
+    liveBotConfig = { mojo: { cloud: true }, env: { LD_PRELOAD: '/tmp/hook.so' } };
+    expect(resolveRemoteExecutionProven(ds({}))).toBe(false);
+  });
+
+  it('LEGACY branch: a clean cloud bot is still proven remote', () => {
+    liveBotConfig = { mojo: { cloud: true } };
+    expect(resolveRemoteExecutionProven(ds({}))).toBe(true);
+  });
+
+  it('WORKERLESS branch: stays fixed (top-level env folded in)', () => {
+    liveBotConfig = { mojo: {}, env: { LD_PRELOAD: '/tmp/hook.so' } };
+    expect(resolveRemoteExecutionProven(ds({ mojoIdentity: { cloud: true } }))).toBe(false);
   });
 });

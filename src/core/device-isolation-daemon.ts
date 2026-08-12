@@ -187,11 +187,27 @@ export function resolveRemoteExecutionProven(ds: DaemonSession): boolean {
   // without a refork), so MOJO_IDENTITY_KEYS excludes it. Reading it live is not a
   // weakness here — it is precisely the live value that decides what the next turn
   // executes, and that is what the proof has to cover.
+  //
+  // CRITICAL: the per-bot env is a TOP-LEVEL field (initConfig.env /
+  // botCfg.env, see the `init` message in types.ts), PEER to backendConfig — it is
+  // NOT inside the mojo block. Feeding only `backendConfig` to the proof therefore
+  // misses PATH / LD_PRELOAD entirely. All three branches must merge the same two
+  // layers, mojo-block env winning, or a `{cloud:true}` session with a top-level
+  // `env:{LD_PRELOAD}` is classified safe_remote while a hooked local mojo client
+  // is holding the activated credential. This is an independent credential
+  // boundary: for a cloud bot with sandbox off it is the ONLY guard, so the
+  // worker's sandbox gate cannot be relied on as a backstop.
   const wrapperCli = ds.initConfig?.wrapperCli ?? ds.session.wrapperCli;
   const fromInit = ds.initConfig?.backendConfig as
     { cloud?: boolean; localDaemon?: boolean; jwtEnv?: string; env?: Record<string, string> }
     | undefined;
-  if (fromInit) return isMojoFullyRemote({ ...fromInit, wrapperCli });
+  if (fromInit) {
+    return isMojoFullyRemote({
+      ...fromInit,
+      env: { ...(ds.initConfig?.env ?? {}), ...(fromInit.env ?? {}) },
+      wrapperCli,
+    });
+  }
   if (ds.session.mojoIdentity) {
     // initConfig is absent (worker-less / not yet forked), so the launcher env can
     // only come from live bot config. A missing bot means no proof at all.
@@ -212,7 +228,13 @@ export function resolveRemoteExecutionProven(ds: DaemonSession): boolean {
     // `mojoIdentity` AND has not been through migrateMojoSessionIdentities yet
     // (e.g. the bot was deregistered at restore time).
     const botCfg = getBot(ds.larkAppId).config;
-    return isMojoFullyRemote({ ...botCfg.mojo, wrapperCli: wrapperCli ?? botCfg.wrapperCli });
+    return isMojoFullyRemote({
+      ...botCfg.mojo,
+      // Same two-layer merge as the other branches — top-level botCfg.env is peer
+      // to the mojo block, so omitting it leaked PATH / LD_PRELOAD here too.
+      env: { ...(botCfg.env ?? {}), ...(botCfg.mojo?.env ?? {}) },
+      wrapperCli: wrapperCli ?? botCfg.wrapperCli,
+    });
   } catch {
     // Bot deregistered — no proof available, so assume local (fail closed).
     return false;
