@@ -39,6 +39,7 @@ import {
   MOJO_IDENTITY_KEYS,
   pickMojoLivePatch,
   isMojoRemoteGone,
+  mojoUnprovableEnvKeys,
   pickMojoSessionIdentity,
   type EffectiveMojoConfig,
   type MojoConfig,
@@ -2681,10 +2682,40 @@ function destroyLivePaneBeforeRestart(ds: DaemonSession): void {
  */
 export function latestPerBotEnvForRestart(ds: DaemonSession): Record<string, string> | null | undefined {
   try {
-    return getBot(ds.larkAppId).config.env ?? null;
+    const env = getBot(ds.larkAppId).config.env ?? null;
+    // Record what this generation is being handed BEFORE the restart is sent.
+    //
+    // This is the single choke point all four restart senders share
+    // (dashboard-ipc operator + working-dir, requestSessionRestart, cli_crash
+    // auto-restart), so recording here cannot be missed by adding a fifth caller
+    // — which is exactly how the device-isolation proof lost track of the env the
+    // running child had actually been given.
+    //
+    // Accumulate, never replace: the restart may fail or be coalesced, so a later
+    // clean env is not evidence that the dangerous child is gone. Only a brand-new
+    // worker generation clears this (see forkWorker).
+    rememberAppliedUnprovableEnvKeys(ds, env ?? undefined);
+    return env;
   } catch {
     return undefined;
   }
+}
+
+/**
+ * Fold the unprovable keys of an env payload into the generation's ledger.
+ *
+ * Names only — the values can be credentials, and the proof only inspects names.
+ * Exported for the restart-timeline tests, which must be able to assert the
+ * ledger itself rather than infer it from a classifier result.
+ */
+export function rememberAppliedUnprovableEnvKeys(
+  ds: DaemonSession,
+  env: Record<string, string> | undefined,
+): void {
+  const keys = mojoUnprovableEnvKeys({ env });
+  if (keys.length === 0) return;
+  const merged = new Set([...(ds.mojoAppliedUnprovableEnvKeys ?? []), ...keys]);
+  ds.mojoAppliedUnprovableEnvKeys = [...merged];
 }
 
 /** Join or start one correlated physical restart for a session. */
@@ -8033,6 +8064,12 @@ export function forkWorker(
     }
   }
   ds.initConfig = initMsg;
+  // A brand-new worker generation starts with a clean ledger: whatever env was
+  // handed to the PREVIOUS child died with it. This is the ONLY place the ledger
+  // is cleared — clearing it when a clean restart is merely sent would forget a
+  // dangerous child that a failed/coalesced restart left running.
+  ds.mojoAppliedUnprovableEnvKeys = undefined;
+  rememberAppliedUnprovableEnvKeys(ds, initMsg.env);
   // Cold-resume path: a workerless session goes straight here without passing
   // through sendWorkerInput, so without this the "notice on the next message"
   // promise was never kept for exactly the sessions most likely to need it.
@@ -8105,6 +8142,12 @@ export function forkWorker(
     throw err;
   }
   ds.initConfig = initMsg;
+  // A brand-new worker generation starts with a clean ledger: whatever env was
+  // handed to the PREVIOUS child died with it. This is the ONLY place the ledger
+  // is cleared — clearing it when a clean restart is merely sent would forget a
+  // dangerous child that a failed/coalesced restart left running.
+  ds.mojoAppliedUnprovableEnvKeys = undefined;
+  rememberAppliedUnprovableEnvKeys(ds, initMsg.env);
   try {
     sessionStore.updateSessionPid(ds.session.sessionId, worker.pid ?? null);
   } catch (err) {
@@ -11525,6 +11568,12 @@ export function forkAdoptWorker(ds: DaemonSession, opts?: { restoredFromMetadata
   };
   worker.send(initMsg);
   ds.initConfig = initMsg;
+  // A brand-new worker generation starts with a clean ledger: whatever env was
+  // handed to the PREVIOUS child died with it. This is the ONLY place the ledger
+  // is cleared — clearing it when a clean restart is merely sent would forget a
+  // dangerous child that a failed/coalesced restart left running.
+  ds.mojoAppliedUnprovableEnvKeys = undefined;
+  rememberAppliedUnprovableEnvKeys(ds, initMsg.env);
   // Stamp cliId on the persisted session so the dashboard can show a CLI badge
   // even after the session is closed. Adopt sessions inherit the adopted CLI's id.
   // Do this before installing worker handlers: a fast worker can emit `ready`

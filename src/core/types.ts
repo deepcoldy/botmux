@@ -83,6 +83,27 @@ export interface DaemonSession {
   hasHistory: boolean;   // true after CLI has run at least once for this session
   workingDir?: string;
   initConfig?: Extract<DaemonToWorker, { type: 'init' }>;   // stored for restart
+  /**
+   * Unprovable launcher-env keys this worker generation was ever HANDED, kept as
+   * a monotonically growing set for the life of the generation.
+   *
+   * `initConfig.env` is only written at spawn/refork, and a live `/restart`
+   * updates the worker's own copy without touching it — so neither the spawn-time
+   * snapshot nor the current live bot config can answer "what is the running
+   * child actually executing?". Three-phase counter-example: start clean → add
+   * `LD_PRELOAD` and `/restart` (child now hooked) → clear the config WITHOUT
+   * restarting. Both observable layers read clean while the child stays hooked,
+   * and the device-isolation proof wrongly returned safe_remote.
+   *
+   * Monotonic on purpose: a value is only ever removed by starting a brand-new
+   * worker generation (spawn/refork clears it). Clearing it when a *clean*
+   * restart is merely SENT would reintroduce the same amnesia, because a restart
+   * can fail or be coalesced and leave the dangerous child running.
+   *
+   * Only key NAMES are stored — never values — since the proof inspects names
+   * only and these keys can carry credentials.
+   */
+  mojoAppliedUnprovableEnvKeys?: string[];
   /** Dashboard「复现命令」：worker 在 `ready` 时上报的、该 session 本次冷启的近似
    *  可复现 CLI 调用（bin + argv + cwd + 权威注入 env）。**只驻内存、绝不落盘**
    *  ——命令含 provider token / 凭证 env，写进默认 0644 的 sessions-*.json 会让同机

@@ -228,6 +228,14 @@ export function resolveRemoteExecutionProven(ds: DaemonSession): boolean {
     // names only, so merging the objects is exactly a key union. The cost is being
     // conservative for a session that already restarted away from a dangerous env,
     // which is an availability nit, not a credential leak.
+    //
+    // Those two layers are still not enough on their own: a value can have been
+    // applied to the running child and then disappear from BOTH. Three-phase
+    // counter-example — start clean, add `LD_PRELOAD` + `/restart` (child now
+    // hooked), then clear the config without restarting. Snapshot and live both
+    // read clean while the child stays hooked. Hence the third input:
+    // `mojoAppliedUnprovableEnvKeys`, the monotonic ledger of what this worker
+    // generation was actually handed (see latestPerBotEnvForRestart).
     let liveTopLevelEnv: Record<string, string>;
     try {
       liveTopLevelEnv = getBot(ds.larkAppId).config.env ?? {};
@@ -237,11 +245,16 @@ export function resolveRemoteExecutionProven(ds: DaemonSession): boolean {
       // workerless branch below).
       return false;
     }
+    // Keys only, so a placeholder value is fine: the proof never reads values.
+    const appliedKeyEnv = Object.fromEntries(
+      (ds.mojoAppliedUnprovableEnvKeys ?? []).map((k) => [k, '1']),
+    );
     return isMojoFullyRemote({
       ...fromInit,
       env: {
         ...liveTopLevelEnv,
         ...(ds.initConfig?.env ?? {}),
+        ...appliedKeyEnv,
         ...(fromInit.env ?? {}),
       },
       wrapperCli,

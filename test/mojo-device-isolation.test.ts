@@ -26,6 +26,8 @@ vi.mock('../src/bot-registry.js', () => ({
 }));
 
 import { resolveRemoteExecutionProven } from '../src/core/device-isolation-daemon.js';
+import { rememberAppliedUnprovableEnvKeys } from '../src/core/worker-pool.js';
+import type { DaemonSession } from '../src/core/types.js';
 
 /** Minimal DaemonSession shape the classifier reads. */
 function ds(opts: {
@@ -45,9 +47,19 @@ function ds(opts: {
    * reaches it. The fixture was strictly more permissive than production.
    */
   initEnv?: Record<string, string>;
+  /**
+   * The generation's monotonic ledger of unprovable launcher-env keys actually
+   * handed to the running child (DaemonSession.mojoAppliedUnprovableEnvKeys).
+   *
+   * The previous fixture had only "spawn snapshot" and "live config", which
+   * cannot express an env that was applied to the child and then removed from
+   * both — the three-phase hole. Modelling it here is what makes that testable.
+   */
+  appliedKeys?: string[];
 }): never {
   return {
     larkAppId: 'app_x',
+    ...(opts.appliedKeys ? { mojoAppliedUnprovableEnvKeys: opts.appliedKeys } : {}),
     initConfig: opts.backendConfig || opts.initWrapperCli || opts.initEnv
       ? {
         backendType: opts.backendType ?? 'mojo',
@@ -295,5 +307,95 @@ describe('resolveRemoteExecutionProven — live-worker restart timeline', () => 
       backendConfig: { cloud: true },
       initEnv: {},
     }))).toBe(false);
+  });
+});
+
+/**
+ * The THREE-PHASE timeline, which neither the spawn snapshot nor the live config
+ * can express on its own:
+ *
+ *   1. clean start                        → child is clean
+ *   2. add LD_PRELOAD, then /restart      → child is now hooked
+ *   3. clear the config, but DO NOT restart → child is STILL hooked
+ *
+ * At phase 3 both observable layers read clean, so the proof used to return
+ * safe_remote while a hooked mojo client held the activated credential. The
+ * generation's applied-env ledger is the third input that closes it.
+ */
+describe('resolveRemoteExecutionProven — applied-env ledger (three-phase)', () => {
+  beforeEach(() => { liveBotConfig = {}; });
+
+  it('a key applied earlier in this generation still voids the proof', () => {
+    // Phase 3 exactly: snapshot clean, live clean, ledger remembers the restart.
+    liveBotConfig = { env: {} };
+    expect(resolveRemoteExecutionProven(ds({
+      backendConfig: { cloud: true },
+      initEnv: {},
+      appliedKeys: ['LD_PRELOAD'],
+    }))).toBe(false);
+  });
+
+  it('a failed or coalesced clean restart cannot clear the risk', () => {
+    // A clean env being SENT is not proof it was applied — the restart may fail or
+    // be merged away. The ledger is monotonic, so the risk persists.
+    liveBotConfig = { env: {} };
+    expect(resolveRemoteExecutionProven(ds({
+      backendConfig: { cloud: true },
+      initEnv: {},
+      appliedKeys: ['PATH'],
+    }))).toBe(false);
+  });
+
+  it('an empty ledger leaves a clean session provable', () => {
+    // Guards the third input from collapsing the proof for everyone.
+    liveBotConfig = { env: {} };
+    expect(resolveRemoteExecutionProven(ds({
+      backendConfig: { cloud: true },
+      initEnv: {},
+      appliedKeys: [],
+    }))).toBe(true);
+  });
+
+  it('a ledger holding only the canonical JWT name stays provable', () => {
+    // The credential itself is the one allowlisted name, on this path too.
+    liveBotConfig = { env: {} };
+    expect(resolveRemoteExecutionProven(ds({
+      backendConfig: { cloud: true },
+      initEnv: {},
+      appliedKeys: ['X_JWT_TOKEN'],
+    }))).toBe(true);
+  });
+});
+
+describe('rememberAppliedUnprovableEnvKeys — ledger bookkeeping', () => {
+  it('accumulates across restarts instead of replacing', () => {
+    const ds1 = { larkAppId: 'app_x' } as never as DaemonSession;
+    rememberAppliedUnprovableEnvKeys(ds1, { LD_PRELOAD: '/tmp/a.so' });
+    rememberAppliedUnprovableEnvKeys(ds1, { PATH: '/tmp/bin' });
+    // A later clean payload must NOT erase what was already handed out.
+    rememberAppliedUnprovableEnvKeys(ds1, {});
+    expect([...(ds1.mojoAppliedUnprovableEnvKeys ?? [])].sort())
+      .toEqual(['LD_PRELOAD', 'PATH']);
+  });
+
+  it('stores key NAMES only, never values', () => {
+    const ds1 = { larkAppId: 'app_x' } as never as DaemonSession;
+    rememberAppliedUnprovableEnvKeys(ds1, { LD_PRELOAD: '/tmp/secret-value.so' });
+    expect(ds1.mojoAppliedUnprovableEnvKeys).toEqual(['LD_PRELOAD']);
+    expect(JSON.stringify(ds1.mojoAppliedUnprovableEnvKeys))
+      .not.toContain('secret-value');
+  });
+
+  it('ignores the allowlisted canonical JWT name', () => {
+    const ds1 = { larkAppId: 'app_x' } as never as DaemonSession;
+    rememberAppliedUnprovableEnvKeys(ds1, { X_JWT_TOKEN: 'a.b.c' });
+    expect(ds1.mojoAppliedUnprovableEnvKeys).toBeUndefined();
+  });
+
+  it('deduplicates a key handed out repeatedly', () => {
+    const ds1 = { larkAppId: 'app_x' } as never as DaemonSession;
+    rememberAppliedUnprovableEnvKeys(ds1, { LD_PRELOAD: '/a' });
+    rememberAppliedUnprovableEnvKeys(ds1, { LD_PRELOAD: '/b' });
+    expect(ds1.mojoAppliedUnprovableEnvKeys).toEqual(['LD_PRELOAD']);
   });
 });

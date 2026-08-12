@@ -88,6 +88,31 @@ describe('latestPerBotEnvForRestart (daemon-side env snapshot carrier)', () => {
     expect(getBotMock).toHaveBeenCalledWith('cli_app1');
   });
 
+  it('records unprovable keys onto the generation ledger as a side effect', () => {
+    // Same choke point for all four restart senders, so recording here cannot be
+    // bypassed by a new caller. Without this the device-isolation proof forgets
+    // the env a live /restart actually handed to the running child: clean start →
+    // add LD_PRELOAD + restart → clear config without restarting leaves BOTH the
+    // spawn snapshot and the live config clean while the child stays hooked.
+    getBotMock.mockReturnValue({ config: { env: { LD_PRELOAD: '/tmp/hook.so' } } });
+    const { ds } = makeDs();
+    latestPerBotEnvForRestart(ds);
+    expect(ds.mojoAppliedUnprovableEnvKeys).toEqual(['LD_PRELOAD']);
+
+    // Clearing the config afterwards must NOT erase it: the restart carrying the
+    // clean env can still fail or be coalesced, leaving the hooked child alive.
+    getBotMock.mockReturnValue({ config: { env: {} } });
+    expect(latestPerBotEnvForRestart(ds)).toEqual({});
+    expect(ds.mojoAppliedUnprovableEnvKeys).toEqual(['LD_PRELOAD']);
+  });
+
+  it('leaves the ledger untouched for a harmless or credential-only env', () => {
+    getBotMock.mockReturnValue({ config: { env: { X_JWT_TOKEN: 'a.b.c' } } });
+    const { ds } = makeDs();
+    latestPerBotEnvForRestart(ds);
+    expect(ds.mojoAppliedUnprovableEnvKeys).toBeUndefined();
+  });
+
   it('returns null when the config has no env (worker must clear its snapshot)', () => {
     getBotMock.mockReturnValue({ config: {} });
     const { ds } = makeDs();
