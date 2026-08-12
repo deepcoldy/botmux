@@ -83,11 +83,21 @@ import { listOnlineDaemons } from '../utils/daemon-discovery.js';
 import { isSessionStopped } from './session-liveness.js';
 import { isSuspendableBackendType } from './persistent-backend.js';
 import { getChatMode, replyMessage, sendMessage, resolveUnionIdFromOpenId, listThreadMessages, listChatMessages, listChatMessagesUntil, listChatBotMembers, getUserProfile, getUserProfileStrict, resolveAllowedUsersWithMap, type ChatBotMember } from '../im/lark/client.js';
+import {
+  APP_SLASH_COMMAND_READ_SCOPE,
+  APP_SLASH_COMMAND_WRITE_SCOPE,
+  appSlashCommandErrorMessage,
+  buildAppSlashCommandCatalog,
+  inspectAppSlashCommands,
+  syncAppSlashCommands,
+  unknownAppSlashCommandSnapshot,
+} from '../im/lark/app-slash-commands.js';
 import { parseApiMessage, cardContentHasUpgradeFallback, resolveMergedCardContent, messageMentionsBot } from '../im/lark/message-parser.js';
 import { resumeSession, spawnDashboardSession, activateQueuedSession, closeCliMismatchedSessionsForBot } from './session-manager.js';
 import { parseSpawnRequest } from './session-create.js';
 import { cleanupMaterializedDashboardImages, materializeDashboardImages } from './dashboard-images.js';
 import { getCliDisplayName } from '../im/lark/card-builder.js';
+import { buildScopeDeepLink } from '../setup/verify-permissions.js';
 import { sessionConfiguredRuntimeDisplayName } from './cli-runtime-display.js';
 import { locateLimiter } from './dashboard-locate.js';
 import { buildTerminalUrl } from './terminal-url.js';
@@ -906,6 +916,24 @@ function composeDashboardSessionRows(): SessionRow[] {
 // endpoints below which proxy calls into groups-store on this bot's behalf.
 let cachedLarkAppId = '';
 export function setLarkAppId(id: string): void { cachedLarkAppId = id; }
+
+function currentAppSlashCommandCatalog() {
+  const config = getBot(cachedLarkAppId).config;
+  return buildAppSlashCommandCatalog({
+    cliId: config.cliId,
+    cliPathOverride: config.cliPathOverride,
+    cliDisplayName: getCliDisplayName(config.cliId),
+    customPassthroughCommands: config.customPassthroughCommands,
+  });
+}
+
+function appSlashCommandPermissionUrls() {
+  const brand = getBotBrand(cachedLarkAppId);
+  return {
+    read: buildScopeDeepLink(cachedLarkAppId, APP_SLASH_COMMAND_READ_SCOPE, brand),
+    write: buildScopeDeepLink(cachedLarkAppId, APP_SLASH_COMMAND_WRITE_SCOPE, brand),
+  };
+}
 
 async function handleDeviceIsolationActivationRoute(
   req: IncomingMessage,
@@ -3390,6 +3418,52 @@ ipcRoute('POST', '/api/role-profiles/:profileId/apply', async (req, res, p) => {
   }
   writeRoleFile(cachedLarkAppId, chatId, content);
   jsonRes(res, 200, { ok: true, changed: true, byteLength: Buffer.byteLength(content, 'utf-8') });
+});
+
+// ─── Native Lark slash-command catalog (dashboard) ─────────────────────────
+// Read and write through this daemon's registered Lark client so every bot is
+// bound to its own app credentials and apiOnly keeps the shared transport gate.
+// Sync is intentionally additive: create missing commands and update drifted
+// descriptions, but never delete app-owned commands that are outside botmux.
+ipcRoute('GET', '/api/bot-slash-commands', async (_req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { ok: false, error: 'larkAppId_not_set' });
+  const catalog = currentAppSlashCommandCatalog();
+  try {
+    const snapshot = await inspectAppSlashCommands(cachedLarkAppId, catalog);
+    return jsonRes(res, 200, { ok: true, ...snapshot });
+  } catch (error) {
+    return jsonRes(res, 502, {
+      ok: false,
+      error: appSlashCommandErrorMessage(error),
+      ...unknownAppSlashCommandSnapshot(catalog),
+      permissionUrls: appSlashCommandPermissionUrls(),
+    });
+  }
+});
+
+ipcRoute('POST', '/api/bot-slash-commands/sync', async (_req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { ok: false, error: 'larkAppId_not_set' });
+  const catalog = currentAppSlashCommandCatalog();
+  try {
+    const result = await syncAppSlashCommands(cachedLarkAppId, catalog);
+    const ok = result.report.failed === 0;
+    return jsonRes(res, 200, {
+      ok,
+      ...result.snapshot,
+      report: result.report,
+      ...(ok ? {} : {
+        error: 'slash_command_sync_partial_failure',
+        permissionUrls: appSlashCommandPermissionUrls(),
+      }),
+    });
+  } catch (error) {
+    return jsonRes(res, 502, {
+      ok: false,
+      error: appSlashCommandErrorMessage(error),
+      ...unknownAppSlashCommandSnapshot(catalog),
+      permissionUrls: appSlashCommandPermissionUrls(),
+    });
+  }
 });
 
 // ─── Per-bot defaultOncall (dashboard) ─────────────────────────────────────

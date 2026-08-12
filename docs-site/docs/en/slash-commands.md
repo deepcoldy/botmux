@@ -86,6 +86,10 @@ To allow more commands through, configure [`customPassthroughCommands`](/en/bots
 
 Permissions are the same as `/help`, and it doesn't occupy a session slot.
 
+Dashboard's **Bot Defaults → Security → Slash Commands** section also shows an app-wide native Lark command catalog. It combines botmux commands, the built-in passthrough allowlist, current CLI adapter defaults, and the bot's `customPassthroughCommands`, then marks each entry as synced, missing, or outdated. **Sync to Lark** uses `application:app_slash_command:read` / `application:app_slash_command:write` to create missing entries and update descriptions; it never deletes other commands already owned by the app. This capability is gated: users need Lark desktop 7.70+ and the FG allowlist.
+
+The native `/` panel may take about five minutes to refresh in Lark clients. Working-directory `.claude` discoveries, skills, plugins, and MCP prompts are not stable app-wide capabilities, so they remain visible only in botmux's `/slash` card and are not registered remotely.
+
 ## 📡 Session Onboarding
 
 | Command | Description |
