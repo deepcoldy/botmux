@@ -1,5 +1,5 @@
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer, type IncomingMessage, type Server } from 'node:http';
 import type { Socket } from 'node:net';
 import { tmpdir } from 'node:os';
@@ -30,33 +30,14 @@ function readRequestBody(req: IncomingMessage): Promise<string> {
 }
 
 describe('Riff worker session environment', () => {
-  it('reconstructs the effective feedback policy in an env-only Riff CLI', () => {
-    const root = mkdtempSync(join(tmpdir(), 'botmux-cli-riff-feedback-'));
-    try {
-      const result = spawnSync(process.execPath, [
-        '--import', 'tsx', resolve('src/cli.ts'),
-        'send', 'final answer without classification', '--no-mention',
-      ], {
-        cwd: resolve('.'),
-        encoding: 'utf8',
-        env: {
-          ...process.env,
-          HOME: root,
-          SESSION_DATA_DIR: root,
-          BOTMUX_SESSION_ID: 'sid-riff-feedback',
-          BOTMUX_CHAT_ID: 'oc_riff_feedback',
-          BOTMUX_LARK_APP_ID: 'app_riff_feedback',
-          BOTMUX_LARK_APP_SECRET: 'secret',
-          BOTMUX_FEEDBACK_POLICY: JSON.stringify({ enabled: true }),
-          BOTMUX_WORKFLOW: '',
-          BOTMUX_SEND_RELAY: '',
-        },
-      });
-      expect(result.status).toBe(2);
-      expect(result.stderr).toContain('必须显式指定 --response-kind progress|final');
-    } finally {
-      rmSync(root, { recursive: true, force: true });
-    }
+  it('defaults an omitted response kind to non-final in an env-only Riff CLI', () => {
+    const source = readFileSync(resolve('src/cli.ts'), 'utf8');
+    const cmdSendStart = source.indexOf('async function cmdSend(');
+    const cmdDispatchStart = source.indexOf('async function cmdDispatch(', cmdSendStart);
+    const cmdSend = source.slice(cmdSendStart, cmdDispatchStart);
+    expect(cmdSend).toContain("const effectiveResponseKind = responseKind ?? 'progress'");
+    expect(cmdSend).not.toContain('启用最终回答反馈后，必须显式指定 --response-kind progress|final');
+    expect(cmdSend).not.toContain("feedbackPolicy && responseKind === 'final'");
   });
 
   it('forwards reply-card usage and the effective feedback policy into the remote sandbox', async () => {

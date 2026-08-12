@@ -6962,7 +6962,7 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
        --video-covers <path>           视频封面图片（可重复，按顺序对应 --videos）
        --card-file <path>              直接发送飞书/Lark interactive 卡片 JSON
        --card-json <json>              直接发送飞书/Lark interactive 卡片 JSON 字符串
-       --response-kind progress|final  启用最终回答反馈的 bot 必须声明本条性质
+       --response-kind progress|final  可选；未声明按 progress/非 final，只有 final 挂反馈
        --mention <open_id:name>        @提及（可重复）
        --mention-back                  @回本轮触发消息的发送者（open_id 自动取自会话）
        --no-mention                    明确声明本条不@任何人
@@ -8757,11 +8757,18 @@ async function cmdSend(rest: string[]): Promise<void> {
   const cardJsonArg = argValue(rest, '--card-json');
   const cardFile = argValue(rest, '--card-file');
   const customCardRequested = cardJsonArg !== undefined || cardFile !== undefined;
-  const responseKind = argValue(rest, '--response-kind');
-  if (responseKind !== undefined && responseKind !== 'progress' && responseKind !== 'final') {
-    console.error('botmux send: --response-kind 必须是 progress 或 final');
+  if (flagPresentButValueMissing(rest, '--response-kind')) {
+    console.error('botmux send: --response-kind 仅支持 progress|final');
     process.exit(2);
   }
+  const responseKind = argValue(rest, '--response-kind');
+  if (responseKind !== undefined && responseKind !== 'progress' && responseKind !== 'final') {
+    console.error('botmux send: --response-kind 仅支持 progress|final');
+    process.exit(2);
+  }
+  // Backward-compatible default: an unclassified proactive send is non-final.
+  // Only an explicit `final` may opt into feedback controls and indexing.
+  const effectiveResponseKind = responseKind ?? 'progress';
   const managedCustomCardError = managedVcCustomCardError(
     !!vcMeetingManagedSendOrigin,
     customCardRequested,
@@ -9428,15 +9435,11 @@ async function cmdSend(rest: string[]): Promise<void> {
     feedbackPolicy = undefined;
   }
   const feedbackRequesterSubjectId = replyTargetSenderOpenId ?? s.ownerOpenId;
-  if (feedbackPolicy && responseKind === 'final' && !feedbackRequesterSubjectId) {
+  if (feedbackPolicy && effectiveResponseKind === 'final' && !feedbackRequesterSubjectId) {
     console.error('botmux send: 无法确认本次提问者身份，不能发送带反馈控件的最终回答');
     process.exit(2);
   }
-  if (feedbackPolicy && responseKind === undefined) {
-    console.error('botmux send: 启用最终回答反馈后，必须显式指定 --response-kind progress|final');
-    process.exit(2);
-  }
-  if (feedbackPolicy && responseKind === 'final' && (customCardRequested || asVoice || sendTopLevel || !!overrideChatId || !!sendInto || !!vcMeetingManagedSendOrigin)) {
+  if (feedbackPolicy && effectiveResponseKind === 'final' && (customCardRequested || asVoice || sendTopLevel || !!overrideChatId || !!sendInto || !!vcMeetingManagedSendOrigin)) {
     console.error('botmux send: --response-kind final 仅支持当前会话内的普通最终答案卡片');
     process.exit(2);
   }
@@ -10150,7 +10153,7 @@ async function cmdSend(rest: string[]): Promise<void> {
         }
       }
 
-      if (feedbackPolicy && responseKind === 'final') {
+      if (feedbackPolicy && effectiveResponseKind === 'final') {
         const canonicalCard = { schema: '2.0', config: { update_multi: true }, body: { direction: 'vertical', elements: [...elements] } } as { schema: string; config: Record<string, unknown>; body: { direction: string; elements: unknown[] } };
         const feedbackElement = buildFeedbackElement(feedbackPolicy);
         const footerIndex = canonicalCard.body.elements.findIndex((element: any) => element?.element_id === 'botmux_reply_footer');
@@ -10164,7 +10167,7 @@ async function cmdSend(rest: string[]): Promise<void> {
       }
     }
 
-    if (feedbackPolicy && responseKind === 'final' && !customCard && !pureVideoSend && !vcMeetingManagedSendOrigin && messageId) {
+    if (feedbackPolicy && effectiveResponseKind === 'final' && !customCard && !pureVideoSend && !vcMeetingManagedSendOrigin && messageId) {
       try {
         const { getSkillFeedbackStore } = await import('./services/skill-feedback-store.js');
         const feedbackStore = await getSkillFeedbackStore(resolveDataDir());

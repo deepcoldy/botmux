@@ -28,7 +28,7 @@
 |---|---|---|
 | 核心内置 UI、身份、关联、幂等 | 已实现 | Lark 最终卡内置反馈区；使用平台校验后的 operator 身份；SQLite revision 链和 callback key 幂等 |
 | 原回答同卡反馈，不额外发消息 | 已实现 | 提交后 patch 原卡；按钮保留；独立展示“已选择”；负向可展开原因和说明 |
-| 只评价 canonical final output | 已实现 | daemon `final_output` 正常 Lark 交付路径挂反馈；主动发送必须声明 `--response-kind final`；progress 不挂反馈 |
+| 只评价 canonical final output | 已实现 | daemon `final_output` 正常 Lark 交付路径挂反馈；主动发送只有显式 `--response-kind final` 才挂反馈，未声明和显式 progress 都按非 final 发送 |
 | 排除特殊 sink | 已实现 | doc-comment、VC receiver、HTTP wait/async、managed receiver、自定义卡、语音/视频等路径不创建普通 Lark 反馈 delivery |
 | 三态统一语义 | 已实现 | 固定 `positive / progress / negative`；默认 key/文案为 `conclusive_usable/结论可用`、`effective_progress/有效推进`、`incorrect/结论有误` |
 | 呈现层可配置 | 已实现 | 可配按钮 key、文案、style、顺序、可见语义、负向原因、说明框、是否必填、长度及 `allowReselect` |
@@ -158,12 +158,14 @@ built-in defaults
 - `apiOnly` bot；
 - card-off 纯文本模式。
 
-主动 `botmux send` 在启用反馈时必须显式声明：
+主动 `botmux send` 可显式声明：
 
 ```bash
 botmux send --response-kind progress ...
 botmux send --response-kind final ...
 ```
+
+未声明 `--response-kind` 时默认按 `progress` / 非 final 处理，消息仍正常发送且不挂反馈；只有显式 `final` 才进入反馈卡和 delivery 索引路径。
 
 ### 5.2 提交流程
 
