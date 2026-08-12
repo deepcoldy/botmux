@@ -6,6 +6,7 @@ import {
   enqueueTurnTerminal,
   drainTurnTerminalQueue,
   __testOnly_pendingTurnTerminalCount,
+  __testOnly_reopenTurnTerminalAdmission,
 } from '../src/services/turn-completion-events.ts';
 import {
   getSkillFeedbackStore,
@@ -20,6 +21,7 @@ function freshDir(): string {
   return d;
 }
 afterEach(async () => {
+  __testOnly_reopenTurnTerminalAdmission();
   await __testOnly_closeSkillFeedbackStores();
   for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true });
 });
@@ -140,6 +142,81 @@ describe('turn-terminal nonblocking queue', () => {
     // Cleanup: release and let it settle so afterEach can close cleanly.
     (blocker as any).db.exec('COMMIT;');
     await drainTurnTerminalQueue(3000);
+    blocker.close();
+  });
+
+  it('closes admission on drain: a terminal enqueued after drain begins is refused, not silently dropped', async () => {
+    const dir = freshDir();
+    const store = await getSkillFeedbackStore(dir);
+    delivery(store, dir);
+    // Drain with an empty queue closes admission immediately and returns 0.
+    const remaining = await drainTurnTerminalQueue(500);
+    expect(remaining).toBe(0);
+    // A post-drain enqueue must be refused (surfaced via onError, resolves), so
+    // it cannot be a lost write that a naive snapshot-drain would have missed.
+    const errors: unknown[] = [];
+    await enqueueTurnTerminal({
+      dataDir: dir, botAppId: 'app', sessionId: 'sess',
+      terminal: { turnId: 'turn-late', dispatchAttempt: 0, status: 'completed' },
+      onError: e => errors.push(e),
+    });
+    expect(__testOnly_pendingTurnTerminalCount()).toBe(0);
+    expect(String(errors[0])).toContain('turn_terminal_persist_refused_shutdown');
+  });
+
+  it('retries a transient store-open failure instead of permanently losing the terminal', async () => {
+    // Point the store at a path that is initially unopenable (a FILE where the
+    // dataDir should be a directory), then repair it mid-retry. A naive "finish
+    // on any error" queue would drop the terminal; the bounded retry recovers.
+    const parent = freshDir();
+    const dataDir = join(parent, 'store');
+    // Create a regular file at dataDir so mkdirSync/open throws (EEXIST/ENOTDIR).
+    const { writeFileSync, rmSync: rm } = await import('node:fs');
+    writeFileSync(dataDir, 'blocker');
+
+    const errors: unknown[] = [];
+    const p = enqueueTurnTerminal({
+      dataDir, botAppId: 'app', sessionId: 'sess',
+      terminal: { turnId: 'turn-1', dispatchAttempt: 0, status: 'completed' },
+      onError: e => errors.push(e), retryBaseMs: 40, maxRetryMs: 80, maxAttempts: 50,
+    });
+    // Let a couple of attempts fail while the path is blocked.
+    await new Promise(r => setTimeout(r, 120));
+    expect(__testOnly_pendingTurnTerminalCount()).toBe(1); // still retrying, not dropped
+    // Repair: remove the blocking file so the next attempt can create the dir + DB.
+    rm(dataDir, { force: true });
+    await p;
+    expect(__testOnly_pendingTurnTerminalCount()).toBe(0);
+    // A delivery + terminal now both exist; the completion event is present.
+    const store = await getSkillFeedbackStore(dataDir);
+    delivery(store, dataDir);
+    expect(store.listTurnCompletionEvents().length).toBe(1);
+    expect(errors.length).toBeGreaterThan(0); // transient failures were surfaced
+  });
+
+  it('surfaces a conflict when the same key is re-enqueued with a different status', async () => {
+    const dir = freshDir();
+    const store = await getSkillFeedbackStore(dir);
+    delivery(store, dir);
+    const errors: unknown[] = [];
+    // First enqueue (completed) — hold it in flight by blocking the write lock.
+    const blocker = await SkillFeedbackStore.open(dir);
+    (blocker as any).db.exec('BEGIN IMMEDIATE;');
+    const first = enqueueTurnTerminal({
+      dataDir: dir, botAppId: 'app', sessionId: 'sess',
+      terminal: { turnId: 'turn-1', dispatchAttempt: 0, status: 'completed' },
+      retryBaseMs: 30, maxRetryMs: 60, maxAttempts: 100,
+    });
+    // Same key, different status → must surface a conflict, not silently reuse.
+    const second = enqueueTurnTerminal({
+      dataDir: dir, botAppId: 'app', sessionId: 'sess',
+      terminal: { turnId: 'turn-1', dispatchAttempt: 0, status: 'failed' },
+      onError: e => errors.push(e),
+    });
+    expect(second).toBe(first); // dedup still returns the in-flight promise
+    expect(String(errors[0])).toContain('turn_terminal_status_conflict_enqueue');
+    (blocker as any).db.exec('COMMIT;');
+    await first;
     blocker.close();
   });
 });
