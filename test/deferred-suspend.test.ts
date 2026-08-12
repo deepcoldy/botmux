@@ -133,9 +133,11 @@ describe('runPendingSuspendIfSettled', () => {
     expect(src).not.toContain('runPendingSuspendIfSettled(ds, ownsLifecycleMutation)');
   });
 
-  // 最危险的一条：`screenshot_uploaded` 自己没有 ownership 守卫，旧 worker 退出前
-  // 排队的 idle 可能晚到并落在已经 refork 过的会话上。放行就会把**刚起来的**
-  // worker 挂掉 —— 正在产出时就是原样复现本功能要消灭的截断 bug。
+  // 钉住 predicate 的防御语义（defense-in-depth）：当传入的 generation 判定为假
+  // —— 排队那一代已不再持有会话 —— 兑现必须早退，且不能吃掉排队，留给真正属主的
+  // 那一代 settle 时再兑现。此前这里写过两版「陈旧 idle 落在 refork 后的会话上」的
+  // 具体 race，均已被推翻为不可达；predicate 为何仍值得保留，见 worker-pool.ts
+  // runPendingSuspendIfSettled 上方注释。
   it('refuses to fulfill from a stale worker generation', () => {
     const { ds, worker } = busySession('idle');
 
