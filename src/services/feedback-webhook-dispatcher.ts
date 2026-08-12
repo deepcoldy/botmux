@@ -144,7 +144,7 @@ export function startFeedbackWebhookDispatcher(options: {
   store: SkillFeedbackStore; readSecret: (ref: string) => string | undefined;
   dispatch?: typeof dispatchWebhookAttempt; intervalMs?: number; staleClaimMs?: number; batchSize?: number; shutdownMs?: number;
   allowPrivateNetworks?: boolean; onError?: (error: unknown) => void;
-}): { ready: Promise<void>; stop: () => Promise<void> } {
+}): { ready: Promise<void>; stop: (timeoutMs?: number) => Promise<void> } {
   let stopped = false, timer: NodeJS.Timeout | undefined, running: Promise<void> | undefined;
   const controller = new AbortController();
   const dispatch = options.dispatch ?? dispatchWebhookAttempt;
@@ -194,8 +194,13 @@ export function startFeedbackWebhookDispatcher(options: {
       installInterval();
     }
   })();
-  return { ready, stop: async () => {
+  return { ready, stop: async (timeoutMs?: number) => {
     stopped = true; if (timer) clearInterval(timer); controller.abort();
-    const pending = running; if (pending) await Promise.race([pending, new Promise<void>(resolve => setTimeout(resolve, options.shutdownMs ?? 5_000))]);
+    // Caller (daemon shutdown) passes the REMAINING shared deadline budget so
+    // this stop cannot add its own default window on top of the total shutdown
+    // deadline. Falls back to shutdownMs/5s only when called without a budget.
+    const budget = timeoutMs ?? options.shutdownMs ?? 5_000;
+    const pending = running;
+    if (pending && budget > 0) await Promise.race([pending, new Promise<void>(resolve => { setTimeout(resolve, budget); })]);
   } };
 }

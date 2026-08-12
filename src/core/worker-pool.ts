@@ -9440,6 +9440,27 @@ function setupWorkerHandlers(
 const FINAL_OUTPUT_RETRY_BACKOFF_MS = [0, 5000, 15000];  // immediate, +5s, +15s
 const codexAppFinalSettlementInFlight = new Map<string, Promise<boolean>>();
 
+/**
+ * Shutdown-only view of the in-flight Codex App final-settlement promises. Each
+ * entry is a `deliverFinalOutput` awaited inside the IPC message handler that
+ * has NOT yet reached its `cb.onTurnTerminal` call; a settlement resolving
+ * enqueues the turn terminal. During graceful shutdown, after all worker IPC
+ * channels have disconnected (so no NEW settlement can be created), the daemon
+ * bounded-waits these to settle BEFORE closing the turn-terminal queue
+ * admission — otherwise a settlement that resolves post-close would have its
+ * terminal refused and lost. Returns a snapshot array (safe to Promise.all).
+ */
+export function snapshotCodexAppFinalSettlements(): Promise<boolean>[] {
+  return [...codexAppFinalSettlementInFlight.values()];
+}
+
+/** Current in-flight Codex App final-settlement count. After all worker IPC has
+ *  disconnected the map cannot grow, so a re-read of 0 after awaiting the
+ *  snapshot confirms settlement quiescence. */
+export function codexAppFinalSettlementCount(): number {
+  return codexAppFinalSettlementInFlight.size;
+}
+
 function finalOutputDedupeKey(ds: DaemonSession, msg: Extract<WorkerToDaemon, { type: 'final_output' }>): string {
   return `${msg.sessionId ?? ds.session.sessionId}:${msg.lastUuid || msg.turnId}`;
 }

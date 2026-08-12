@@ -172,8 +172,11 @@ import {
   getDaemonStreamingCardUsageSnapshot,
   postTurnStartingCard,
   isSessionTransferring,
+  snapshotCodexAppFinalSettlements,
+  codexAppFinalSettlementCount,
   type WorkerSessionReplyOptions,
 } from './core/worker-pool.js';
+import { waitAllWithin, trackProducerQuiet } from './core/producer-quiescence.js';
 import { AbortDeadlineError, hasExactSafeJsonKeys, ipcRoute, isTrustedHostIpcRequest, JsonBodyTooLargeError, jsonRes, readJsonBody, runWithAbortDeadline, setBotName, setLarkAppId, startIpcServer, setBotRenamer, setBotAvatarChanger, armCoreOnlyReadinessGate, setCoreOnlyReady, setSupervisorShutdownHandler } from './core/dashboard-ipc-server.js';
 import { setDeviceIsolationDaemonIdentity } from './core/device-isolation-daemon.js';
 import {
@@ -21415,31 +21418,20 @@ export async function startDaemon(botIndex?: number): Promise<void> {
 
     // Producer-closed fence. We must not close the turn-terminal queue admission
     // until every worker's IPC channel is truly closed — a worker whose 'exit'
-    // fired can still have queued 'message' terminals in flight; ChildProcess
-    // 'close' fires only after stdio AND the IPC channel are fully closed, so it
-    // is the real "no more terminals from this producer" signal. Track by 'close'
-    // (falling back to 'exit' for a worker with no IPC channel), dedup by
-    // ChildProcess, and use the check → once → re-check closure so a child that
-    // already closed before we registered does not make us wait out the deadline.
+    // Producer-quiescence fence. A worker whose 'exit' fired can still have
+    // queued 'message' terminals in flight; the IPC `disconnect` event is the
+    // real "no more terminals from this producer" signal (see producer-quiescence
+    // helper — it deliberately keys on disconnect, not 'close', which stdio
+    // inherited by grandchildren can delay). Dedup by ChildProcess.
     const producerClosed: Array<Promise<void>> = [];
     const survivors: ChildProcess[] = [];
     const tracked = new Set<ChildProcess>();
-    const isChannelQuiet = (w: ChildProcess): boolean =>
-      // 'connected' is false once the IPC channel is closed; exited/ killed with
-      // no channel is also quiet. Either means no further 'message' can arrive.
-      (w.exitCode !== null || w.signalCode !== null) && w.connected !== true;
     const trackWorkerClosed = (w: ChildProcess): void => {
       if (tracked.has(w)) return; // dedup: same worker referenced twice
       tracked.add(w);
-      if (isChannelQuiet(w)) return; // already fully closed — nothing to await
-      producerClosed.push(new Promise<void>(resolve => {
-        const done = (): void => resolve();
-        w.once('close', done);   // stdio + IPC fully closed → no more queued messages
-        w.once('exit', () => { if (w.connected !== true) done(); }); // no-IPC fallback
-        // Close the check/listener race if it became quiet between the first read
-        // and attaching the listeners.
-        if (isChannelQuiet(w)) done();
-      }));
+      const { alreadyQuiet, done } = trackProducerQuiet(w);
+      if (alreadyQuiet || !done) return; // already quiet — nothing to await
+      producerClosed.push(done);
       survivors.push(w);
     };
     for (const worker of riffRetiredWorkers) trackWorkerClosed(worker);
@@ -21477,13 +21469,32 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       }
     }
 
+    // --- Staged producer quiescence before touching the feedback queue -------
+    // Contract (fail-closed): the turn-terminal queue admission may be closed
+    // (inside drainTurnTerminalQueue) ONLY after BOTH fences confirm quiescent
+    // within the shared absolute deadline:
+    //   (1) every worker IPC channel disconnected — no NEW terminal message can
+    //       be delivered; and
+    //   (2) every in-flight Codex App final-settlement resolved — an already
+    //       delivered final_output whose handler is awaiting network delivery
+    //       has finished its cb.onTurnTerminal (which synchronously enqueues).
+    // If either fence is not quiescent by the deadline we DO NOT close admission
+    // (closing it would refuse a terminal a still-live producer may yet emit —
+    // strictly worse than the pre-feature behaviour). We keep admission open,
+    // warn loudly, and let the process exit on its budget.
+    // Every wait shares the single absolute `shutdownDeadlineMs`; a ref'd
+    // keepalive (waitAllWithin) holds the loop so a fire-and-forget SIGTERM
+    // handler cannot exit mid-wait once workers/services have stopped.
+    const remainingBudget = (): number => Math.max(0, shutdownDeadlineMs - Date.now());
+
+    let disconnectQuiesced = true;
     if (producerClosed.length > 0) {
-      const exitGraceMs = Math.min(
-        DAEMON_WORKER_EXIT_GRACE_MS,
-        Math.max(0, shutdownDeadlineMs - Date.now()),
-      );
-      const timeout = new Promise<void>(resolve => { setTimeout(resolve, exitGraceMs); });
-      await Promise.race([Promise.all(producerClosed), timeout]);
+      // Give producers a normal grace to disconnect, then SIGKILL stragglers,
+      // then keep waiting their disconnect up to the SHARED deadline (a late
+      // disconnect that lands before the deadline still counts as quiescent —
+      // we do not freeze failure at the grace boundary).
+      const exitGraceMs = Math.min(DAEMON_WORKER_EXIT_GRACE_MS, remainingBudget());
+      await waitAllWithin(producerClosed, Date.now() + exitGraceMs);
       let stragglers = 0;
       for (const w of survivors) {
         if (w.exitCode === null && w.signalCode === null) {
@@ -21493,30 +21504,43 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       }
       if (stragglers > 0) {
         logger.warn(`${stragglers}/${survivors.length} worker(s) didn't exit within ${exitGraceMs}ms — SIGKILL'd to prevent ppid=1 orphans.`);
-        // A SIGKILL'd worker's 'close' (IPC channel teardown) lands slightly
-        // after the signal; wait a bounded extra window (within the overall
-        // shutdown deadline) for the producerClosed promises to settle, so we do
-        // not close queue admission while a just-killed worker's queued terminal
-        // is still being delivered. Best-effort: bounded by the deadline.
-        const closeGraceMs = Math.max(0, Math.min(2000, shutdownDeadlineMs - Date.now()));
-        if (closeGraceMs > 0) {
-          const closeTimeout = new Promise<void>(resolve => { setTimeout(resolve, closeGraceMs); });
-          await Promise.race([Promise.all(producerClosed), closeTimeout]);
-        }
       }
+      // Keep waiting for actual IPC disconnect up to the shared deadline.
+      disconnectQuiesced = await waitAllWithin(producerClosed, shutdownDeadlineMs);
     }
 
-    // Workers have now stopped and their IPC channels are closed (or the bounded
-    // grace elapsed), so no more turn terminals can be produced. Only NOW is it
-    // safe to close queue admission and drain: draining earlier would refuse a
-    // terminal from a turn that completed during worker teardown, losing it
-    // permanently (a delivery cannot be reconstructed to completed/failed/
-    // cancelled after the fact). Drain (bounded, ref'd keepalive so a fire-and-
-    // forget shutdown does not exit mid-drain) so last turn.completed events
-    // reach the durable outbox, THEN stop the dispatcher.
-    const undrained = await drainTurnTerminalQueue(Math.max(500, Math.min(3000, shutdownDeadlineMs - Date.now())));
-    if (undrained > 0) logger.warn(`[turn-completion] shutdown drain timed out with ${undrained} pending`);
-    await feedbackWebhookDispatcher?.stop();
+    // Settlement fence: only meaningful once IPC is confirmed disconnected (no
+    // new settlement can be created). Await the snapshot, then re-read the count
+    // — 0 confirms every in-flight settlement (and its enqueue) has completed.
+    let settlementQuiesced = false;
+    if (disconnectQuiesced) {
+      await waitAllWithin(snapshotCodexAppFinalSettlements(), shutdownDeadlineMs);
+      settlementQuiesced = codexAppFinalSettlementCount() === 0;
+    }
+
+    if (disconnectQuiesced && settlementQuiesced) {
+      // Both fences quiescent: safe to close admission and drain the last
+      // terminals into the durable outbox, bounded by the remaining budget.
+      const drainBudget = remainingBudget();
+      if (drainBudget > 0) {
+        const undrained = await drainTurnTerminalQueue(drainBudget);
+        if (undrained > 0) logger.warn(`[turn-completion] shutdown drain timed out with ${undrained} pending`);
+      } else {
+        logger.warn('[turn-completion] shutdown deadline exhausted before drain; queued terminals persist in the durable store for next-boot reconcile');
+      }
+    } else {
+      // Fail-closed: a producer may still emit a terminal. Do NOT close
+      // admission (that would refuse and lose it). Hold open, warn, and let the
+      // process exit on its budget; unfinished work stays in the durable store.
+      logger.error(
+        `[turn-completion] shutdown producer quiescence NOT confirmed `
+        + `(ipcDisconnected=${disconnectQuiesced} settlementsSettled=${settlementQuiesced}); `
+        + `leaving feedback queue admission OPEN to avoid refusing a late terminal`,
+      );
+    }
+    // Dispatcher stop always receives the hard-clamped remaining budget (never
+    // its internal 5s default), success or failure path alike.
+    await feedbackWebhookDispatcher?.stop(remainingBudget());
 
     // Flush any pending identity-cache writes before exit. The cache uses a
     // 2s debounce on disk persistence to dedupe writes from chatty groups; on
