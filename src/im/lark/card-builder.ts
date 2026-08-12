@@ -2487,7 +2487,6 @@ export function buildAdoptSelectCard(
   const labelKind    = t('card.adopt.field_kind',    undefined, locale);
   const labelCli     = t('card.adopt.field_cli',     undefined, locale);
   const labelDir     = t('card.adopt.field_dir',     undefined, locale);
-  const labelSession = t('card.adopt.field_session', undefined, locale);
   const labelTarget  = t('card.adopt.field_target',  undefined, locale);
   const selectedTag  = t('card.adopt.selected_tag',  undefined, locale);
   const selectedEntry = selectedKey ? filtered.find(e => e.key === selectedKey) : undefined;
@@ -2514,7 +2513,6 @@ export function buildAdoptSelectCard(
       `${labelKind}: ${kindTag}`,
       `${labelCli}: ${escapeMd(cliName)}`,
       `${labelDir}: \`${escapeMd(e.cwd)}\``,
-      `${labelSession}: \`${escapeMd(e.sessionId || sessionUnknown)}\``,
     ];
     if (e.kind === 'live' && e.target) lines.push(`${labelTarget}: \`${escapeMd(e.target)}\``);
     lines.push(`${timeLabel}: ${timeVal}`);

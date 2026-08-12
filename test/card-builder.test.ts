@@ -110,9 +110,10 @@ describe('buildAdoptSelectCard (V2 picker)', () => {
     expect(texts.length).toBe(1);
     expect(texts[0]).toContain('Pi');          // CLI name
     expect(texts[0]).toContain('collie:w3:p1'); // live target label
+    expect(texts[0]).not.toContain('Session ID:');
   });
 
-  it('renders a resume (history) session card carrying the session id and a resume: key', () => {
+  it('renders a resume (history) session card with a hidden session id and a resume: key', () => {
     const card = parse(buildAdoptSelectCard(
       [],
       'om_root',
@@ -121,7 +122,7 @@ describe('buildAdoptSelectCard (V2 picker)', () => {
     ));
     const texts = cardTexts(card);
     expect(texts.length).toBe(1);
-    expect(texts[0]).toContain('codex-rollout-abc123'); // session id is visible
+    expect(texts[0]).not.toContain('codex-rollout-abc123');
     // The selectable container carries a resume: entry_key.
     const container = card.body.elements.find((e: any) => e.tag === 'interactive_container');
     expect(container.behaviors[0].value.entry_key).toBe('resume:codex-rollout-abc123');
