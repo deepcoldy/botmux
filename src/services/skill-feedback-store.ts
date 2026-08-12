@@ -375,12 +375,25 @@ export class SkillFeedbackStore {
     mkdirSync(dataDir, { recursive: true });
     this.path = join(dataDir, 'botmux-feedback.sqlite');
     this.db = db;
-    this.db.exec('PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;');
+    // Connection init ordering matters under a shared dataDir: busy_timeout MUST
+    // be set FIRST so every subsequent lock acquisition (including the WAL-mode
+    // switch, which takes a write lock to rewrite the DB header on a fresh file)
+    // is protected. journal_mode=WAL is issued separately and wrapped in a
+    // bounded busy retry, because on a brand-new file many cold-start processes
+    // race for that first write lock and would otherwise fail open with
+    // `database is locked` before ever reaching the migration path.
+    this.db.exec('PRAGMA busy_timeout=5000;');
+    this.db.exec('PRAGMA foreign_keys=ON;');
+    this.enableWalWithRetry();
     const version = Number((this.db.prepare('PRAGMA user_version').get() as any)?.user_version ?? 0);
     if (version > SCHEMA_VERSION) {
       throw new Error(`skill_feedback_schema_newer:${version}`);
     }
-    this.runMigrations();
+    // Fast path: an already-current DB must NOT enter the migration loop — that
+    // would take (and re-take) the write lock only to no-op, turning every plain
+    // `botmux send` open into a writer and amplifying the very lock contention
+    // we are fixing. Only a stale reader falls through to guarded migration.
+    if (version < SCHEMA_VERSION) this.runMigrations();
     this.validateSchemaV1();
   }
 
@@ -410,22 +423,53 @@ export class SkillFeedbackStore {
       { from: 1, to: 5, target: 6, sql: ANALYTICS_V6_SCHEMA },
       { from: 1, to: 6, target: 7, sql: DELIVERY_V7_SCHEMA },
     ];
-    for (const step of steps) this.migrateStep(step.from, step.to, step.target, step.sql);
+    for (const step of steps) {
+      // Stop as soon as the DB is fully migrated: a loser that lost every race
+      // sees SCHEMA_VERSION on its first guarded step and exits, instead of
+      // taking the write lock once per remaining step only to no-op each time.
+      if (this.migrateStep(step.from, step.to, step.target, step.sql) >= SCHEMA_VERSION) break;
+    }
   }
 
   /**
    * Apply one migration step atomically and idempotently across processes.
    * Re-reads user_version after acquiring the write lock and only mutates when
    * still in the step's applicable range, so a process that lost the race is a
-   * no-op instead of replaying DDL the winner already committed.
+   * no-op instead of replaying DDL the winner already committed. Returns the
+   * version observed under the lock so the caller can stop once fully migrated.
    */
-  private migrateStep(from: number, to: number, target: number, sql: string): void {
+  private migrateStep(from: number, to: number, target: number, sql: string): number {
+    let observed = 0;
     this.withImmediateWrite(() => {
-      const live = Number((this.db.prepare('PRAGMA user_version').get() as any)?.user_version ?? 0);
-      if (live < from || live > to) return; // another process already advanced past this step
+      observed = Number((this.db.prepare('PRAGMA user_version').get() as any)?.user_version ?? 0);
+      if (observed < from || observed > to) return; // another process already advanced past this step
       this.db.exec(sql);
       this.db.exec(`PRAGMA user_version=${target};`);
+      observed = target;
     });
+    return observed;
+  }
+
+  /**
+   * Switch to WAL with bounded retry. `PRAGMA journal_mode=WAL` takes a write
+   * lock to rewrite the DB header on a fresh file; under a cold-start stampede
+   * it may either throw `database is locked` OR silently return the prior mode
+   * (e.g. "delete") without switching. Both are retried — we verify the query
+   * result actually reports "wal" rather than trusting a non-throwing call.
+   */
+  private enableWalWithRetry(): void {
+    const maxAttempts = 10;
+    for (let attempt = 1; ; attempt++) {
+      try {
+        const mode = String((this.db.prepare('PRAGMA journal_mode=WAL').get() as any)?.journal_mode ?? '').toLowerCase();
+        if (mode === 'wal') return;
+        if (attempt < maxAttempts) { sleepShort(attempt); continue; }
+        throw new Error(`skill_feedback_wal_mode_not_set:${mode || 'unknown'}`);
+      } catch (error) {
+        if (isSqliteBusyError(error) && attempt < maxAttempts) { sleepShort(attempt); continue; }
+        throw error;
+      }
+    }
   }
 
   /**
@@ -566,33 +610,74 @@ export class SkillFeedbackStore {
   }
 
   recordTurnTerminal(input: RecordTurnTerminalInput): TurnCompletionEventPayload | undefined {
-    const attempt = input.dispatchAttempt ?? 0;
-    const completedAt = input.completedAt ?? new Date().toISOString();
     this.db.exec('BEGIN IMMEDIATE');
     try {
-      const prior = this.db.prepare(`SELECT status FROM turn_terminals WHERE bot_app_id=? AND session_id=? AND turn_id=?
-        AND dispatch_attempt=?`).get(
-        input.botAppId, input.sessionId, input.turnId, attempt,
-      ) as { status: string } | undefined;
-      if (prior && prior.status !== input.status) throw new Error('turn_terminal_status_conflict');
-      this.db.prepare(`INSERT OR IGNORE INTO turn_terminals(
-        bot_app_id,session_id,turn_id,dispatch_attempt,status,completed_at,duration_ms,usage_json
-      ) VALUES(?,?,?,?,?,?,?,?)`).run(
-        input.botAppId, input.sessionId, input.turnId, attempt, input.status, completedAt,
-        input.durationMs ?? null, input.usage ? JSON.stringify(input.usage) : null,
-      );
-      const deliveries = this.db.prepare(`SELECT delivery_id FROM deliveries WHERE bot_app_id=? AND session_id=? AND turn_id=?
-        AND IFNULL(dispatch_attempt,0)=? ORDER BY created_at,delivery_id`).all(
-        input.botAppId, input.sessionId, input.turnId, attempt,
-      ) as Array<{ delivery_id: string }>;
-      let payload: TurnCompletionEventPayload | undefined;
-      for (const delivery of deliveries) payload = this.reconcileTurnCompletion(delivery.delivery_id) ?? payload;
+      const payload = this.applyTurnTerminal(input);
       this.db.exec('COMMIT');
       return payload;
     } catch (error) {
       this.db.exec('ROLLBACK');
       throw error;
     }
+  }
+
+  /**
+   * Nonblocking variant for the daemon's per-turn hot path. Acquiring the write
+   * lock with `DatabaseSync` + busy_timeout>0 SYNCHRONOUSLY blocks the whole
+   * Node event loop until the lock frees (measured multi-second stalls when a
+   * `botmux send` subprocess held the lock). Here we temporarily drop
+   * busy_timeout to 0 so `BEGIN IMMEDIATE` fails FAST on contention, return a
+   * discriminable {busy:true} instead of throwing, and restore the timeout in
+   * finally. The set/try/restore never crosses an await, and no Store method
+   * holds a transaction across an await, so no same-process caller can observe
+   * the borrowed 0 timeout. The daemon retries busy turns on a timer (which
+   * yields the loop between attempts) instead of blocking inline.
+   */
+  tryRecordTurnTerminal(input: RecordTurnTerminalInput): { done: true; payload: TurnCompletionEventPayload | undefined } | { done: false; busy: true } {
+    this.db.exec('PRAGMA busy_timeout=0;');
+    try {
+      try {
+        this.db.exec('BEGIN IMMEDIATE;');
+      } catch (error) {
+        if (isSqliteBusyError(error)) return { done: false, busy: true };
+        throw error;
+      }
+      try {
+        const payload = this.applyTurnTerminal(input);
+        this.db.exec('COMMIT');
+        return { done: true, payload };
+      } catch (error) {
+        try { this.db.exec('ROLLBACK;'); } catch { /* already unwound */ }
+        if (isSqliteBusyError(error)) return { done: false, busy: true };
+        throw error;
+      }
+    } finally {
+      this.db.exec('PRAGMA busy_timeout=5000;');
+    }
+  }
+
+  /** Shared turn-terminal transaction body (caller owns BEGIN/COMMIT/ROLLBACK). */
+  private applyTurnTerminal(input: RecordTurnTerminalInput): TurnCompletionEventPayload | undefined {
+    const attempt = input.dispatchAttempt ?? 0;
+    const completedAt = input.completedAt ?? new Date().toISOString();
+    const prior = this.db.prepare(`SELECT status FROM turn_terminals WHERE bot_app_id=? AND session_id=? AND turn_id=?
+      AND dispatch_attempt=?`).get(
+      input.botAppId, input.sessionId, input.turnId, attempt,
+    ) as { status: string } | undefined;
+    if (prior && prior.status !== input.status) throw new Error('turn_terminal_status_conflict');
+    this.db.prepare(`INSERT OR IGNORE INTO turn_terminals(
+      bot_app_id,session_id,turn_id,dispatch_attempt,status,completed_at,duration_ms,usage_json
+    ) VALUES(?,?,?,?,?,?,?,?)`).run(
+      input.botAppId, input.sessionId, input.turnId, attempt, input.status, completedAt,
+      input.durationMs ?? null, input.usage ? JSON.stringify(input.usage) : null,
+    );
+    const deliveries = this.db.prepare(`SELECT delivery_id FROM deliveries WHERE bot_app_id=? AND session_id=? AND turn_id=?
+      AND IFNULL(dispatch_attempt,0)=? ORDER BY created_at,delivery_id`).all(
+      input.botAppId, input.sessionId, input.turnId, attempt,
+    ) as Array<{ delivery_id: string }>;
+    let payload: TurnCompletionEventPayload | undefined;
+    for (const delivery of deliveries) payload = this.reconcileTurnCompletion(delivery.delivery_id) ?? payload;
+    return payload;
   }
 
   listTurnCompletionEvents(): Array<{ eventId: string; eventType: 'turn.completed'; version: 1; deliveryId: string; createdAt: string; payload: TurnCompletionEventPayload }> {

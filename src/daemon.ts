@@ -75,6 +75,7 @@ import {
 } from './bot-registry.js';
 import { setDisplayNameRefresher, findConfigField, applyConfigField } from './services/bot-config-store.js';
 import { getSkillFeedbackStore } from './services/skill-feedback-store.js';
+import { enqueueTurnTerminal, drainTurnTerminalQueue } from './services/turn-completion-events.js';
 import { FeedbackWebhookSecretStore, startFeedbackWebhookDispatcher } from './services/feedback-webhook-dispatcher.js';
 import { resolveRegularGroupMode } from './services/chat-reply-mode-store.js';
 import { renameBotOnOpenPlatform, changeBotAvatarOnOpenPlatform } from './services/open-platform-rename.js';
@@ -20421,34 +20422,25 @@ export async function startDaemon(botIndex?: number): Promise<void> {
           + `session=${ds.session.sessionId.slice(0, 8)} attempt=${terminal.dispatchAttempt}`,
         );
       }
-      // Feedback turn-completion persistence is a synchronous node:sqlite write
-      // (recordTurnTerminal). Keeping it OFF this handler's critical path avoids
-      // the whole daemon event loop stalling up to busy_timeout when another
-      // process (a `botmux send --response-kind final` subprocess) holds the
-      // shared feedback DB write lock — measured multi-second freezes affected
-      // every session's IPC, including bots with feedback disabled. apiOnly bots
+      // Feedback turn-completion persistence is a synchronous node:sqlite write.
+      // Route it through the nonblocking, tracked retry queue so a cross-process
+      // write-lock (a `botmux send --response-kind final` subprocess) can never
+      // stall the daemon event loop up to busy_timeout — the queue fails fast on
+      // contention and retries on a timer that yields the loop. apiOnly bots
       // never produce a feedback delivery, so skip them outright; everyone else
-      // persists (a hosted-team may have enabled feedback with no bot-level
-      // config, so we must not gate on bot config alone), just not inline.
+      // enqueues (a hosted-team may have enabled feedback with no bot-level
+      // config, so we must not gate on bot config alone).
       if (!getBot(ds.larkAppId).config.apiOnly) {
-        const botAppId = ds.larkAppId;
-        const sessionId = ds.session.sessionId;
-        void (async () => {
-          try {
-            const { persistTurnTerminal } = await import('./services/turn-completion-events.js');
-            await persistTurnTerminal({
-              dataDir: config.session.dataDir,
-              botAppId,
-              session: { sessionId },
-              terminal,
-            });
-          } catch (error) {
-            logger.error(
-              `[turn-completion] persistence failed turn=${terminal.turnId.slice(0, 12)}: `
-              + `${error instanceof Error ? error.message : String(error)}`,
-            );
-          }
-        })();
+        void enqueueTurnTerminal({
+          dataDir: config.session.dataDir,
+          botAppId: ds.larkAppId,
+          sessionId: ds.session.sessionId,
+          terminal: { turnId: terminal.turnId, dispatchAttempt: terminal.dispatchAttempt, status: terminal.status },
+          onError: error => logger.error(
+            `[turn-completion] persistence failed turn=${terminal.turnId.slice(0, 12)}: `
+            + `${error instanceof Error ? error.message : String(error)}`,
+          ),
+        });
       }
     },
     onDeferredScheduleTurnSettled(ds, context) {
@@ -21384,6 +21376,11 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     }
 
     scheduler.stopScheduler();
+    // Drain any in-flight turn-terminal persistence (bounded) BEFORE stopping
+    // the webhook dispatcher, so last-moment turn.completed events land in the
+    // outbox and are not lost by an immediate exit.
+    const undrained = await drainTurnTerminalQueue(3000);
+    if (undrained > 0) logger.warn(`[turn-completion] shutdown drain timed out with ${undrained} pending`);
     await feedbackWebhookDispatcher?.stop();
     stopMaintenance();
     vcMeetingTerminalReconciler?.stop();
