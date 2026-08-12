@@ -1187,6 +1187,8 @@ export interface BotConfig {
    * `modelChoices` for the curated candidates surfaced in `botmux setup`.
    */
   model?: string;
+  /** Default Codex reasoning effort for newly created sessions. */
+  reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh';
   /**
    * If true, botmux does not add CLI-default approval/sandbox bypass flags
    * such as --yolo or --dangerously-*. Missing/false preserves legacy behavior.
@@ -2762,6 +2764,12 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         : undefined,
       model: typeof entry.model === 'string' && entry.model.trim()
         ? entry.model.trim()
+        : undefined,
+      reasoningEffort: entry.reasoningEffort === 'low'
+        || entry.reasoningEffort === 'medium'
+        || entry.reasoningEffort === 'high'
+        || entry.reasoningEffort === 'xhigh'
+        ? entry.reasoningEffort
         : undefined,
       disableCliBypass: entry.disableCliBypass === true,
       codexAppCleanInput: entry.codexAppCleanInput === true || undefined,

@@ -3448,6 +3448,7 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
   let cliPathOverride: string | null = null;
   let wrapperCli: string | null = null;
   let model: string | null = null;
+  let reasoningEffort: 'low' | 'medium' | 'high' | 'xhigh' | null = null;
   let agentSelectionKey = '';
   try {
     const cfg = getBot(cachedLarkAppId).config;
@@ -3462,6 +3463,7 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
       : null;
     wrapperCli = typeof cfg.wrapperCli === 'string' && cfg.wrapperCli.trim() ? cfg.wrapperCli : null;
     model = typeof cfg.model === 'string' && cfg.model.trim() ? cfg.model : null;
+    reasoningEffort = cfg.reasoningEffort ?? null;
     agentSelectionKey = selectionKeyForBot(cliId, wrapperCli ?? undefined);
   } catch { /* no registered bot */ }
   let maxLiveWorkers: number | null = null;
@@ -3536,6 +3538,7 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
     cliPathOverride,
     wrapperCli,
     model,
+    reasoningEffort,
     agentSelectionKey,
     defaultOncall: defaultOncall ?? { enabled: false, workingDir: '', since: 0 },
     defaultWorkingDir,
@@ -3876,8 +3879,8 @@ ipcRoute('PUT', '/api/bot-avatar', async (req, res) => {
 ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
   if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
   const larkAppId = cachedLarkAppId;
-  let body: { cliId?: unknown; model?: unknown; cliRuntime?: unknown };
-  try { body = await readJsonBody<{ cliId?: unknown; model?: unknown; cliRuntime?: unknown }>(req); }
+  let body: { cliId?: unknown; model?: unknown; reasoningEffort?: unknown; cliRuntime?: unknown };
+  try { body = await readJsonBody<{ cliId?: unknown; model?: unknown; reasoningEffort?: unknown; cliRuntime?: unknown }>(req); }
   catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
 
   const key = typeof body.cliId === 'string' && body.cliId.trim() ? body.cliId.trim() : '';
@@ -3889,6 +3892,16 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
     return jsonRes(res, 400, { ok: false, error: 'invalid_cli', message: err?.message ?? String(err) });
   }
   const model = typeof body.model === 'string' ? body.model.trim() : '';
+  const reasoningEffortFieldPresent = Object.prototype.hasOwnProperty.call(body, 'reasoningEffort');
+  const reasoningEffort = body.reasoningEffort === 'low'
+    || body.reasoningEffort === 'medium'
+    || body.reasoningEffort === 'high'
+    || body.reasoningEffort === 'xhigh'
+    ? body.reasoningEffort
+    : null;
+  if (body.reasoningEffort !== undefined && body.reasoningEffort !== '' && reasoningEffort === null) {
+    return jsonRes(res, 400, { ok: false, error: 'invalid_reasoning_effort' });
+  }
   const currentBotConfig = getBot(larkAppId).config;
   const runtimeFieldPresent = Object.prototype.hasOwnProperty.call(body, 'cliRuntime');
   const currentSelectionKey = selectionKeyForBot(currentBotConfig.cliId, currentBotConfig.wrapperCli);
@@ -4000,6 +4013,11 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
     }
     if (model) entry.model = model;
     else delete entry.model;
+    if (selected.cliId !== 'codex') delete entry.reasoningEffort;
+    else if (reasoningEffortFieldPresent) {
+      if (reasoningEffort) entry.reasoningEffort = reasoningEffort;
+      else delete entry.reasoningEffort;
+    }
     if (entry.readIsolation === true &&
         !readIsolationEnforceableFor({ cliId: selected.cliId, cliPathOverride: effectivePath, wrapperCli: selected.wrapperCli })) {
       delete entry.readIsolation;
@@ -4025,6 +4043,8 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
     if (selected.wrapperCli) bot.config.wrapperCli = selected.wrapperCli;
     else bot.config.wrapperCli = undefined;
     bot.config.model = model || undefined;
+    if (selected.cliId !== 'codex') bot.config.reasoningEffort = undefined;
+    else if (reasoningEffortFieldPresent) bot.config.reasoningEffort = reasoningEffort ?? undefined;
     if (readIsolationCleared) bot.config.readIsolation = false;
     if (selected.cliId === 'riff') {
       bot.config.backendType = 'riff';
@@ -4044,6 +4064,7 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
       cliPathOverride: nextRuntime ? null : nextLegacyPath ?? null,
       wrapperCli: selected.wrapperCli ?? null,
       model: model || null,
+      reasoningEffort: selected.cliId === 'codex' ? bot.config.reasoningEffort ?? null : null,
       selectionKey,
       closedMismatchedSessions,
       // Report the (possibly auto-cleared) read-isolation state + whether the new

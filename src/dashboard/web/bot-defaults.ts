@@ -58,6 +58,7 @@ export type BotDefaultsRow = {
   cliPathOverride?: string | null;
   wrapperCli?: string | null;
   model?: string;
+  reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh';
   agentSelectionKey?: string;
   defaultOncall?: { enabled?: boolean; workingDir?: string; since?: number };
   defaultWorkingDir?: string | null;

@@ -1036,7 +1036,7 @@ function storedSessionCliDisplayName(ds: DaemonSession): string {
 
 function sessionAgentConfig(
   ds: DaemonSession,
-  botCfg: { cliId: CliId; cliRuntime?: CliRuntimeConfig; cliPathOverride?: string; wrapperCli?: string; model?: string },
+  botCfg: { cliId: CliId; cliRuntime?: CliRuntimeConfig; cliPathOverride?: string; wrapperCli?: string; model?: string; reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' },
 ): { cliId: CliId; cliRuntime?: CliRuntimeSnapshot; cliPathOverride?: string; wrapperCli?: string; model?: string; reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' } {
   // Freeze the agent launch config (cli / runtime / cliPath / wrapper / model) onto the
   // session the first time a worker forks, so later bot-level edits never
@@ -1070,6 +1070,7 @@ function sessionAgentConfig(
       ?? botCfg.cliPathOverride;
     ds.session.wrapperCli = ds.session.wrapperCli ?? botCfg.wrapperCli;
     ds.session.model = ds.session.model ?? botCfg.model;
+    ds.session.reasoningEffort = ds.session.reasoningEffort ?? botCfg.reasoningEffort;
     ds.session.agentFrozen = true;
     sessionStore.updateSession(ds.session);
   } else {
