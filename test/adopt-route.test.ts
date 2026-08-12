@@ -208,10 +208,39 @@ describe('resolveAdoptRoute', () => {
       expect(result).toEqual({ kind: 'conflict' });
     });
 
-    it('404 明确无匹配 → miss', async () => {
-      fetchDaemonIpcMock.mockResolvedValue({ ok: false, status: 404 });
+    it('404 + 本 endpoint 专用 body {error:"no_session"} → miss（明确无匹配）', async () => {
+      fetchDaemonIpcMock.mockResolvedValue({
+        ok: false,
+        status: 404,
+        json: async () => ({ ok: false, error: 'no_session' }),
+      });
       const result = await queryCliSession(1234, 'ses_abc');
       expect(result).toEqual({ kind: 'miss' });
+    });
+
+    it('404 + generic {error:"not_found"}（旧 daemon 无此路由）→ unknown', async () => {
+      // 滚动升级/部分 daemon 未重启时，旧 daemon 没有 /api/session-by-cli 路由，
+      // 撞 IPC 全局兜底 404 {error:'not_found',path}——status 与真 miss 相同但
+      // 语义是「无法回答」，必须 unknown，否则新 daemon hit + 旧 daemon generic
+      // 404 会被误证唯一命中。
+      fetchDaemonIpcMock.mockResolvedValue({
+        ok: false,
+        status: 404,
+        json: async () => ({ error: 'not_found', path: '/api/session-by-cli/ses_abc' }),
+      });
+      const result = await queryCliSession(1234, 'ses_abc');
+      expect(result).toEqual({ kind: 'unknown' });
+    });
+
+    it('404 + 无 body / JSON 解析失败 → unknown', async () => {
+      fetchDaemonIpcMock.mockResolvedValue({
+        ok: false,
+        status: 404,
+        json: async () => { throw new Error('empty body'); },
+      });
+      expect(await queryCliSession(1234, 'ses_abc')).toEqual({ kind: 'unknown' });
+      fetchDaemonIpcMock.mockResolvedValue({ ok: false, status: 404, json: async () => null });
+      expect(await queryCliSession(1234, 'ses_abc')).toEqual({ kind: 'unknown' });
     });
 
     it('非 2xx 其它状态（401/403/5xx）→ unknown（不是否定答案，必须 fail closed）', async () => {
@@ -329,6 +358,39 @@ describe('resolveAdoptRoute', () => {
         queryDaemon: async (port) => (
           port === 1 ? hit() : Promise.reject(new Error('ipc down'))
         ),
+      });
+      expect(result).toBeNull();
+    });
+
+    it('新 daemon hit + 旧 daemon generic 404（混合版本 fleet）→ null', async () => {
+      // R6 回归：滚动升级窗口里旧 daemon 没有 /api/session-by-cli 路由，对同一
+      // cliSessionId 撞全局兜底 404 {error:'not_found',path}（语义=无法回答）；
+      // 升级过的 daemon 返回 200 hit。若 generic 404 被当 miss，「1 hit + 1 miss」
+      // 会误证唯一 → 错投。端到端走真实 queryCliSession：generic 404 必须映射
+      // 为 unknown，聚合结果必须为 null。
+      fetchDaemonIpcMock.mockImplementation(async (port: number) => {
+        if (port === 2) {
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({
+              sessionId: 'sess_new',
+              chatId: 'c_new',
+              larkAppId: 'a_new',
+              rootMessageId: 'om_new',
+            }),
+          };
+        }
+        return {
+          ok: false,
+          status: 404,
+          json: async () => ({ error: 'not_found', path: '/api/session-by-cli/ses_abc' }),
+        };
+      });
+      const result = await resolveCliSessionRoute({
+        cliSessionId: 'ses_abc',
+        listDaemons: () => [{ ipcPort: 1 }, { ipcPort: 2 }],
+        queryDaemon: queryCliSession,
       });
       expect(result).toBeNull();
     });

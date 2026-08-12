@@ -240,9 +240,10 @@ export type CliSessionLookup =
 /**
  * 查询某个 daemon 是否有该 CLI 原生会话 id（如 OpenCode 的 `ses_*`）的活跃
  * 会话。GET http://127.0.0.1:<ipcPort>/api/session-by-cli/<cliSessionId>
- * 200 → hit；409（本 daemon 内重复绑定）→ conflict；404 → miss（明确无匹配）；
- * 其它状态（401/403/5xx 等）与无效 body → unknown（协议/查询结果未知，
- * 上层必须视为「无法证明唯一」fail closed）。超时 2s。
+ * 200 → hit；409（本 daemon 内重复绑定）→ conflict；404 且 body 为本 endpoint
+ * 专用响应 `{error:'no_session'}` → miss（明确无匹配）；generic 404 / 401 /
+ * 403 / 5xx 等其它状态与无效 body → unknown（协议/查询结果未知，上层必须视为
+ * 「无法证明唯一」fail closed）。超时 2s。
  */
 export async function queryCliSession(
   ipcPort: number,
@@ -257,9 +258,24 @@ export async function queryCliSession(
       { signal: controller.signal },
     );
     if (res.status === 409) return { kind: 'conflict' };
-    // 只有明确 404 才是「确定无匹配」；401/403/5xx 等非 2xx 不是否定答案
-    // ——另一 daemon 可能命中，必须按 unknown 让聚合器 fail closed。
-    if (res.status === 404) return { kind: 'miss' };
+    if (res.status === 404) {
+      // 只有本 endpoint 自己稳定的专用 404（{ok:false,error:'no_session'}）才算
+      // 「明确无匹配」。IPC 路由全局兜底（core/dashboard-ipc-server.ts）对未注册
+      // 路径统一返回 404 {error:'not_found',path}——滚动升级/部分 daemon 未重启
+      // 时旧 daemon 没有本路由会撞 generic 404，status 与真 miss 相同但语义是
+      // 「无法回答」；若当 miss 处理，「新 daemon hit + 旧 daemon generic 404」
+      // 会被聚合器误证唯一命中。generic 404 / 无 body / 畸形 body / JSON 解析
+      // 失败（json() 抛错落到外层 catch）一律按 unknown fail closed。
+      const body = (await res.json()) as unknown;
+      if (
+        body && typeof body === 'object'
+        && (body as Record<string, unknown>).error === 'no_session'
+      ) {
+        return { kind: 'miss' };
+      }
+      return { kind: 'unknown' };
+    }
+    // 401/403/5xx 等非 2xx 不是否定答案——另一 daemon 可能命中，必须按 unknown。
     if (!res.ok) return { kind: 'unknown' };
     const body = (await res.json()) as unknown;
     if (!body || typeof body !== 'object') return { kind: 'unknown' };
