@@ -9,6 +9,14 @@ export interface BotmuxUpdateResult {
   restartError?: string;
   /** True when a restart was already in progress (another driver claimed the lease). */
   alreadyScheduled?: boolean;
+  /** True when the new binary is installed but a normal restart is refused
+   * because live daemons still run the pre-signal-death-autorestart PM2 policy.
+   * The operator must run the one-time `--bootstrap-shutdown-protocol` upgrade
+   * from a terminal. Distinct from restartError so the UI shows a precise,
+   * actionable message instead of a generic failure. */
+  bootstrapRequired?: boolean;
+  /** Canonical PM2 names still on the old policy (best-effort, may be empty). */
+  unsafeDaemons?: string[];
 }
 
 type FetchLike = (input: string, init?: RequestInit) => Promise<Response>;
@@ -71,6 +79,16 @@ export async function updateAndRestartBotmux(
     }),
   });
   const restart = await responseBody(restartResponse);
+  if (restart.error === 'bootstrap_shutdown_protocol_required') {
+    // Installed successfully, but the fleet predates the signal-death
+    // autorestart protocol: a normal restart fails closed. Surface this as its
+    // own state so the UI can point the operator at the one-time bootstrap
+    // command rather than polling a reconnect that will never happen.
+    const unsafe = Array.isArray(restart.unsafeDaemons)
+      ? restart.unsafeDaemons.filter((name): name is string => typeof name === 'string')
+      : [];
+    return { ...result, restarted: false, bootstrapRequired: true, unsafeDaemons: unsafe };
+  }
   if (!restartResponse.ok || restart.ok === false) {
     // The update itself succeeded — the new version is already installed.
     // Return restarted:false instead of throwing so the caller can surface a
