@@ -6962,7 +6962,7 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
        --video-covers <path>           视频封面图片（可重复，按顺序对应 --videos）
        --card-file <path>              直接发送飞书/Lark interactive 卡片 JSON
        --card-json <json>              直接发送飞书/Lark interactive 卡片 JSON 字符串
-       --response-kind progress|final  可选；未声明按 progress/非 final，只有 final 挂反馈
+       --response-kind progress|final|auxiliary  可选；未声明按 progress/非 final，只有 final 挂反馈
        --mention <open_id:name>        @提及（可重复）
        --mention-back                  @回本轮触发消息的发送者（open_id 自动取自会话）
        --no-mention                    明确声明本条不@任何人
@@ -8763,16 +8763,18 @@ async function cmdSend(rest: string[]): Promise<void> {
     process.exit(2);
   }
   if (flagPresentButValueMissing(rest, '--response-kind')) {
-    console.error('botmux send: --response-kind 仅支持 progress|final');
+    console.error('botmux send: --response-kind 仅支持 progress|final|auxiliary');
     process.exit(2);
   }
   const responseKind = argValue(rest, '--response-kind');
-  if (responseKind !== undefined && responseKind !== 'progress' && responseKind !== 'final') {
-    console.error('botmux send: --response-kind 仅支持 progress|final');
+  if (responseKind !== undefined && responseKind !== 'progress' && responseKind !== 'final' && responseKind !== 'auxiliary') {
+    console.error('botmux send: --response-kind 仅支持 progress|final|auxiliary');
     process.exit(2);
   }
   // Backward-compatible default: an unclassified proactive send is non-final.
-  // Only an explicit `final` may opt into feedback controls and indexing.
+  // Only an explicit `final` may opt into feedback controls and indexing;
+  // `progress` and `auxiliary` (interim / supplementary output) both deliver
+  // normally without a feedback region, matching the requirement's three roles.
   const effectiveResponseKind = responseKind ?? 'progress';
   const managedCustomCardError = managedVcCustomCardError(
     !!vcMeetingManagedSendOrigin,

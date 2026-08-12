@@ -196,8 +196,15 @@ describe('validateRelayRequest', () => {
     });
     expect(validateRelayRequest({
       contentFile: 'c.content',
+      flags: ['--response-kind', 'auxiliary'],
+    })).toMatchObject({
+      ok: true,
+      value: { flags: ['--response-kind', 'auxiliary'] },
+    });
+    expect(validateRelayRequest({
+      contentFile: 'c.content',
       flags: ['--response-kind', 'draft'],
-    })).toMatchObject({ ok: false, error: 'flag --response-kind must be progress or final' });
+    })).toMatchObject({ ok: false, error: 'flag --response-kind must be progress, final, or auxiliary' });
   });
 
   it('accepts a custom card file as a plain outbox basename', () => {

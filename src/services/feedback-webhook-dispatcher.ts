@@ -170,13 +170,29 @@ export function startFeedbackWebhookDispatcher(options: {
     })().finally(() => { running = undefined; });
     await running;
   };
-  const ready = (async () => {
-    options.store.resetExpiredFeedbackOutboxClaims(Date.now(), options.staleClaimMs ?? 60_000);
-    await tick();
-    if (!stopped) { timer = setInterval(() => {
-      options.store.resetExpiredFeedbackOutboxClaims(Date.now(), options.staleClaimMs ?? 60_000);
+  const installInterval = (): void => {
+    if (stopped || timer) return;
+    timer = setInterval(() => {
+      try { options.store.resetExpiredFeedbackOutboxClaims(Date.now(), options.staleClaimMs ?? 60_000); }
+      catch (error) { options.onError?.(error); }
       void tick().catch(error => options.onError?.(error));
-    }, options.intervalMs ?? 5_000); timer.unref?.(); }
+    }, options.intervalMs ?? 5_000);
+    timer.unref?.();
+  };
+  const ready = (async () => {
+    // The recurring poll MUST be armed regardless of the bootstrap tick's fate:
+    // a transient SQLite BUSY during the first reset/tick previously threw
+    // before setInterval ran, leaving the outbox permanently unpolled (queued
+    // webhooks never delivered until process restart). Report the bootstrap
+    // failure but let the self-healing interval take over.
+    try {
+      options.store.resetExpiredFeedbackOutboxClaims(Date.now(), options.staleClaimMs ?? 60_000);
+      await tick();
+    } catch (error) {
+      options.onError?.(error);
+    } finally {
+      installInterval();
+    }
   })();
   return { ready, stop: async () => {
     stopped = true; if (timer) clearInterval(timer); controller.abort();

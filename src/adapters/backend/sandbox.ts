@@ -908,8 +908,8 @@ export function validateRelayRequest(req: RelayRequest): { ok: true; value: Vali
       // ['--mention','--session-id'] and have --session-id swallowed as the
       // value, corrupting the worker-forced session-id (self-DoS).
       if (v.startsWith('--')) return { ok: false, error: `flag ${f} value must not be a flag` };
-      if (f === '--response-kind' && !['progress', 'final'].includes(v)) {
-        return { ok: false, error: 'flag --response-kind must be progress or final' };
+      if (f === '--response-kind' && !['progress', 'final', 'auxiliary'].includes(v)) {
+        return { ok: false, error: 'flag --response-kind must be progress, final, or auxiliary' };
       }
       flags.push(f, v); i++; continue;
     }

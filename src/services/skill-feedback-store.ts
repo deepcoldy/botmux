@@ -5,6 +5,30 @@ import type { DatabaseSync as DatabaseSyncType } from 'node:sqlite';
 import { normalizeFeedbackPolicy, type FeedbackPolicy } from './feedback-policy.js';
 import { effectiveWebhookDestinations, type FeedbackEventEnvelope, type FeedbackEventType, type FeedbackWebhookDestination, type FrozenWebhookDestination } from './feedback-outbox.js';
 
+/** True when a node:sqlite error is the recoverable write-lock contention that
+ *  a burst of concurrent cold-start opens against a shared dataDir produces. */
+function isSqliteBusyError(error: unknown): boolean {
+  const code = (error as { code?: unknown })?.code;
+  if (code === 'ERR_SQLITE_ERROR' || code === 'SQLITE_BUSY' || code === 'SQLITE_LOCKED') {
+    // ERR_SQLITE_ERROR is generic; fall through to the message check for it.
+    if (code !== 'ERR_SQLITE_ERROR') return true;
+  }
+  const message = String((error as { message?: unknown })?.message ?? error).toLowerCase();
+  return message.includes('database is locked') || message.includes('database table is locked')
+    || message.includes('sqlite_busy') || message.includes('sqlite_locked');
+}
+
+/** Synchronous backoff sleep (the store constructor / migration path is sync).
+ *  Uses Atomics.wait on a throwaway buffer so it yields the CPU instead of
+ *  spinning. Backoff grows with the attempt, capped, with jitter to de-sync
+ *  concurrent cold-start racers. */
+function sleepShort(attempt: number): void {
+  const base = Math.min(20 * attempt, 120);
+  const jitter = Math.floor((Number(process.hrtime.bigint() % 17n))); // 0..16ms, no Math.random needed
+  try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, base + jitter); }
+  catch { /* Atomics.wait unavailable (should not happen in Node); fall through */ }
+}
+
 export type SkillFeedbackLevel = 'L0' | 'L1' | 'L2';
 
 export interface SkillFeedbackContext {
@@ -264,6 +288,85 @@ const DELIVERY_V3_COLUMNS = `
     WHERE bot_app_id IS NOT NULL AND session_id IS NOT NULL AND turn_id IS NOT NULL;
 `;
 
+/** Fresh-build DDL for a brand-new DB (version 0 → 7). No BEGIN/COMMIT/PRAGMA:
+ *  migrateStep() owns the transaction and the user_version bump. Base tables use
+ *  IF NOT EXISTS so a loser that somehow re-enters is a no-op on them; the later
+ *  ${...} fragments (bare ALTER/CREATE) are guarded by migrateStep re-reading
+ *  user_version under the write lock, so the loser never reaches this SQL. */
+const FRESH_V7_SCHEMA = `
+  CREATE TABLE IF NOT EXISTS interactions (
+    interaction_id TEXT PRIMARY KEY,
+    context_json TEXT,
+    created_at TEXT NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS skill_runs (
+    skill_run_id TEXT PRIMARY KEY,
+    interaction_id TEXT NOT NULL REFERENCES interactions(interaction_id),
+    skill_ref TEXT NOT NULL,
+    context_json TEXT,
+    created_at TEXT NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS responses (
+    response_id TEXT PRIMARY KEY,
+    interaction_id TEXT NOT NULL REFERENCES interactions(interaction_id),
+    skill_run_id TEXT REFERENCES skill_runs(skill_run_id),
+    content_hash TEXT NOT NULL,
+    content_ref TEXT,
+    created_at TEXT NOT NULL
+  );
+  CREATE UNIQUE INDEX IF NOT EXISTS responses_identity
+    ON responses(interaction_id, content_hash);
+  CREATE TABLE IF NOT EXISTS deliveries (
+    delivery_id TEXT PRIMARY KEY,
+    response_id TEXT NOT NULL REFERENCES responses(response_id),
+    platform TEXT NOT NULL,
+    platform_message_id TEXT NOT NULL,
+    platform_app_id TEXT NOT NULL,
+    level TEXT NOT NULL DEFAULT 'L1' CHECK(level IN ('L0','L1','L2')),
+    policy_snapshot_json TEXT,
+    base_card_json TEXT,
+    requester_subject_id TEXT,
+    context_json TEXT,
+    created_at TEXT NOT NULL,
+    UNIQUE(platform, platform_app_id, platform_message_id)
+  );
+  CREATE TABLE IF NOT EXISTS feedback_revisions (
+    feedback_id TEXT PRIMARY KEY,
+    delivery_id TEXT NOT NULL REFERENCES deliveries(delivery_id),
+    operator_subject_id TEXT NOT NULL,
+    revision INTEGER NOT NULL,
+    result TEXT NOT NULL,
+    semantic TEXT,
+    reason_key TEXT,
+    comment_text TEXT,
+    callback_key TEXT NOT NULL UNIQUE,
+    supersedes_feedback_id TEXT REFERENCES feedback_revisions(feedback_id),
+    created_at TEXT NOT NULL,
+    UNIQUE(delivery_id, operator_subject_id, revision)
+  );
+  ${DELIVERY_V3_COLUMNS}
+  ${COMPLETION_V4_SCHEMA}
+  ${OUTBOX_V5_SCHEMA}
+  ${ANALYTICS_V6_SCHEMA}
+  ${DELIVERY_V7_SCHEMA}
+`;
+
+/** Legacy v1→v2 columns (no BEGIN/COMMIT/PRAGMA — migrateStep owns those). */
+const MIGRATE_V1_TO_V2 = `
+  ALTER TABLE deliveries ADD COLUMN policy_snapshot_json TEXT;
+  ALTER TABLE deliveries ADD COLUMN base_card_json TEXT;
+  ALTER TABLE deliveries ADD COLUMN requester_subject_id TEXT;
+  ALTER TABLE feedback_revisions ADD COLUMN comment_text TEXT;
+`;
+
+/** Legacy v4→v5: semantic column + outbox tables + backfill events. */
+const MIGRATE_V4_TO_V5 = `
+  ALTER TABLE feedback_revisions ADD COLUMN semantic TEXT;
+  ${OUTBOX_V5_SCHEMA}
+  INSERT OR IGNORE INTO feedback_events(event_id,event_type,version,aggregate_id,payload_json,created_at)
+    SELECT event_id,event_type,version,delivery_id,payload_json,created_at FROM turn_completion_events;
+`;
+
 export class SkillFeedbackStore {
   readonly path: string;
   private readonly db: DatabaseSyncType;
@@ -277,109 +380,79 @@ export class SkillFeedbackStore {
     if (version > SCHEMA_VERSION) {
       throw new Error(`skill_feedback_schema_newer:${version}`);
     }
-    if (version === 0) this.db.exec(`
-      BEGIN IMMEDIATE;
-      CREATE TABLE IF NOT EXISTS interactions (
-        interaction_id TEXT PRIMARY KEY,
-        context_json TEXT,
-        created_at TEXT NOT NULL
-      );
-      CREATE TABLE IF NOT EXISTS skill_runs (
-        skill_run_id TEXT PRIMARY KEY,
-        interaction_id TEXT NOT NULL REFERENCES interactions(interaction_id),
-        skill_ref TEXT NOT NULL,
-        context_json TEXT,
-        created_at TEXT NOT NULL
-      );
-      CREATE TABLE IF NOT EXISTS responses (
-        response_id TEXT PRIMARY KEY,
-        interaction_id TEXT NOT NULL REFERENCES interactions(interaction_id),
-        skill_run_id TEXT REFERENCES skill_runs(skill_run_id),
-        content_hash TEXT NOT NULL,
-        content_ref TEXT,
-        created_at TEXT NOT NULL
-      );
-      CREATE UNIQUE INDEX IF NOT EXISTS responses_identity
-        ON responses(interaction_id, content_hash);
-      CREATE TABLE IF NOT EXISTS deliveries (
-        delivery_id TEXT PRIMARY KEY,
-        response_id TEXT NOT NULL REFERENCES responses(response_id),
-        platform TEXT NOT NULL,
-        platform_message_id TEXT NOT NULL,
-        platform_app_id TEXT NOT NULL,
-        level TEXT NOT NULL DEFAULT 'L1' CHECK(level IN ('L0','L1','L2')),
-        policy_snapshot_json TEXT,
-        base_card_json TEXT,
-        requester_subject_id TEXT,
-        context_json TEXT,
-        created_at TEXT NOT NULL,
-        UNIQUE(platform, platform_app_id, platform_message_id)
-      );
-      CREATE TABLE IF NOT EXISTS feedback_revisions (
-        feedback_id TEXT PRIMARY KEY,
-        delivery_id TEXT NOT NULL REFERENCES deliveries(delivery_id),
-        operator_subject_id TEXT NOT NULL,
-        revision INTEGER NOT NULL,
-        result TEXT NOT NULL,
-        semantic TEXT,
-        reason_key TEXT,
-        comment_text TEXT,
-        callback_key TEXT NOT NULL UNIQUE,
-        supersedes_feedback_id TEXT REFERENCES feedback_revisions(feedback_id),
-        created_at TEXT NOT NULL,
-        UNIQUE(delivery_id, operator_subject_id, revision)
-      );
-      ${DELIVERY_V3_COLUMNS}
-      ${COMPLETION_V4_SCHEMA}
-      ${OUTBOX_V5_SCHEMA}
-      ${ANALYTICS_V6_SCHEMA}
-      ${DELIVERY_V7_SCHEMA}
-      PRAGMA user_version=7;
-      COMMIT;
-    `);
-    if (version === 1) this.db.exec(`
-      BEGIN IMMEDIATE;
-      ALTER TABLE deliveries ADD COLUMN policy_snapshot_json TEXT;
-      ALTER TABLE deliveries ADD COLUMN base_card_json TEXT;
-      ALTER TABLE deliveries ADD COLUMN requester_subject_id TEXT;
-      ALTER TABLE feedback_revisions ADD COLUMN comment_text TEXT;
-      PRAGMA user_version=2;
-      COMMIT;
-    `);
-    if (version === 1 || version === 2) this.db.exec(`
-      BEGIN IMMEDIATE;
-      ${DELIVERY_V3_COLUMNS}
-      PRAGMA user_version=3;
-      COMMIT;
-    `);
-    if (version >= 1 && version <= 3) this.db.exec(`
-      BEGIN IMMEDIATE;
-      ${COMPLETION_V4_SCHEMA}
-      PRAGMA user_version=4;
-      COMMIT;
-    `);
-    if (version >= 1 && version <= 4) this.db.exec(`
-      BEGIN IMMEDIATE;
-      ALTER TABLE feedback_revisions ADD COLUMN semantic TEXT;
-      ${OUTBOX_V5_SCHEMA}
-      INSERT OR IGNORE INTO feedback_events(event_id,event_type,version,aggregate_id,payload_json,created_at)
-        SELECT event_id,event_type,version,delivery_id,payload_json,created_at FROM turn_completion_events;
-      PRAGMA user_version=5;
-      COMMIT;
-    `);
-    if (version >= 1 && version <= 5) this.db.exec(`
-      BEGIN IMMEDIATE;
-      ${ANALYTICS_V6_SCHEMA}
-      PRAGMA user_version=6;
-      COMMIT;
-    `);
-    if (version >= 1 && version <= 6) this.db.exec(`
-      BEGIN IMMEDIATE;
-      ${DELIVERY_V7_SCHEMA}
-      PRAGMA user_version=7;
-      COMMIT;
-    `);
+    this.runMigrations();
     this.validateSchemaV1();
+  }
+
+  /**
+   * Cross-process-safe migration. Multiple OS processes (each PM2 bot daemon
+   * plus every `botmux send` subprocess) legitimately open the SAME
+   * botmux-feedback.sqlite under a shared dataDir at cold start. The version is
+   * therefore re-read INSIDE each step's BEGIN IMMEDIATE write lock: SQLite
+   * serializes the writers, so a loser that raced in at version 0 sees the
+   * winner's committed version and skips — instead of re-running bare
+   * `ALTER TABLE ADD COLUMN` (no IF NOT EXISTS) and throwing `duplicate column`.
+   * `BEGIN IMMEDIATE` acquisition is retried on `database is locked` beyond the
+   * 5s busy_timeout so a burst of concurrent cold starts settles rather than
+   * failing the open (which would poison the module-level store cache).
+   */
+  private runMigrations(): void {
+    // Each step: [applicableFrom, applicableToInclusive, targetVersion, sql].
+    // Guarded so it only runs when the version RE-READ under the write lock is
+    // still within [from,to]; the fresh-build step (from 0) creates the full v7
+    // schema, later steps are incremental ALTER/CREATE for legacy DBs.
+    const steps: Array<{ from: number; to: number; target: number; sql: string }> = [
+      { from: 0, to: 0, target: 7, sql: FRESH_V7_SCHEMA },
+      { from: 1, to: 1, target: 2, sql: MIGRATE_V1_TO_V2 },
+      { from: 1, to: 2, target: 3, sql: DELIVERY_V3_COLUMNS },
+      { from: 1, to: 3, target: 4, sql: COMPLETION_V4_SCHEMA },
+      { from: 1, to: 4, target: 5, sql: MIGRATE_V4_TO_V5 },
+      { from: 1, to: 5, target: 6, sql: ANALYTICS_V6_SCHEMA },
+      { from: 1, to: 6, target: 7, sql: DELIVERY_V7_SCHEMA },
+    ];
+    for (const step of steps) this.migrateStep(step.from, step.to, step.target, step.sql);
+  }
+
+  /**
+   * Apply one migration step atomically and idempotently across processes.
+   * Re-reads user_version after acquiring the write lock and only mutates when
+   * still in the step's applicable range, so a process that lost the race is a
+   * no-op instead of replaying DDL the winner already committed.
+   */
+  private migrateStep(from: number, to: number, target: number, sql: string): void {
+    this.withImmediateWrite(() => {
+      const live = Number((this.db.prepare('PRAGMA user_version').get() as any)?.user_version ?? 0);
+      if (live < from || live > to) return; // another process already advanced past this step
+      this.db.exec(sql);
+      this.db.exec(`PRAGMA user_version=${target};`);
+    });
+  }
+
+  /**
+   * Run `fn` inside a BEGIN IMMEDIATE / COMMIT, retrying the transaction when
+   * the write lock cannot be acquired (`database is locked` / `SQLITE_BUSY`)
+   * even after busy_timeout — expected when many bot daemons cold-start against
+   * a shared dataDir at once. Non-lock errors roll back and rethrow.
+   */
+  private withImmediateWrite(fn: () => void): void {
+    const maxAttempts = 10;
+    for (let attempt = 1; ; attempt++) {
+      try {
+        this.db.exec('BEGIN IMMEDIATE;');
+      } catch (error) {
+        if (isSqliteBusyError(error) && attempt < maxAttempts) { sleepShort(attempt); continue; }
+        throw error;
+      }
+      try {
+        fn();
+        this.db.exec('COMMIT;');
+        return;
+      } catch (error) {
+        try { this.db.exec('ROLLBACK;'); } catch { /* connection may already be unwound */ }
+        if (isSqliteBusyError(error) && attempt < maxAttempts) { sleepShort(attempt); continue; }
+        throw error;
+      }
+    }
   }
 
   static async open(dataDir: string): Promise<SkillFeedbackStore> {
@@ -603,7 +676,11 @@ export class SkillFeedbackStore {
       ...(row.workflow_id ? { workflowId: row.workflow_id } : {}), ...(row.task_id ? { taskId: row.task_id } : {}),
       ...(row.parent_task_id ? { parentTaskId: row.parent_task_id } : {}),
     };
-    this.db.prepare('UPDATE deliveries SET status=?,duration_ms=?,usage_json=?,completed_at=? WHERE delivery_id=?').run(
+    // COALESCE so a terminal that carries no usage/duration (the turn-terminal
+    // path only records status) does not clobber the usage/duration_ms the
+    // delivery captured at send time. status/completed_at are authoritative from
+    // the terminal and intentionally overwrite.
+    this.db.prepare('UPDATE deliveries SET status=?,duration_ms=COALESCE(?,duration_ms),usage_json=COALESCE(?,usage_json),completed_at=? WHERE delivery_id=?').run(
       row.terminal_status, row.terminal_duration_ms, row.terminal_usage_json, row.terminal_completed_at, deliveryId,
     );
     this.db.prepare(`INSERT INTO turn_completion_events(event_id,delivery_id,event_type,version,payload_json,created_at)
@@ -802,7 +879,14 @@ const stores = new Map<string, Promise<SkillFeedbackStore>>();
 export function getSkillFeedbackStore(dataDir: string): Promise<SkillFeedbackStore> {
   let store = stores.get(dataDir);
   if (!store) {
-    store = SkillFeedbackStore.open(dataDir);
+    // Evict on rejection so a transient first-open failure (disk full, a
+    // concurrent cold-start lock that outlasted retries, corruption later
+    // repaired) is retried on the next call instead of poisoning the cache and
+    // silently disabling all feedback persistence for the rest of the process.
+    store = SkillFeedbackStore.open(dataDir).catch(error => {
+      if (stores.get(dataDir) === store) stores.delete(dataDir);
+      throw error;
+    });
     stores.set(dataDir, store);
   }
   return store;

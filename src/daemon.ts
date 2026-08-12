@@ -20062,14 +20062,29 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   }
   registerBot(cfg);
   selfDaemonLarkAppId = cfg.larkAppId;
-  const feedbackWebhookStore = await getSkillFeedbackStore(config.session.dataDir);
-  const feedbackWebhookSecrets = new FeedbackWebhookSecretStore(config.session.dataDir);
-  const feedbackWebhookDispatcher = startFeedbackWebhookDispatcher({
-    store: feedbackWebhookStore,
-    readSecret: ref => feedbackWebhookSecrets.get(ref),
-    onError: error => logger.warn(`[feedback-webhook] ${error instanceof Error ? error.message : String(error)}`),
-  });
-  await feedbackWebhookDispatcher.ready;
+  // The final-answer feedback subsystem is OPTIONAL: a bot with feedback
+  // disabled still opens the shared feedback DB here for turn-completion
+  // indexing, but a bootstrap failure (shared-dataDir lock storm, corruption,
+  // disk full) must NOT abort daemon startup for that bot — that would let one
+  // optional subsystem take down every PM2 bot sharing the dataDir. Fail soft:
+  // log and continue; delivery-time paths degrade to best-effort on their own.
+  let feedbackWebhookDispatcher: ReturnType<typeof startFeedbackWebhookDispatcher> | undefined;
+  try {
+    const feedbackWebhookStore = await getSkillFeedbackStore(config.session.dataDir);
+    const feedbackWebhookSecrets = new FeedbackWebhookSecretStore(config.session.dataDir);
+    feedbackWebhookDispatcher = startFeedbackWebhookDispatcher({
+      store: feedbackWebhookStore,
+      readSecret: ref => feedbackWebhookSecrets.get(ref),
+      onError: error => logger.warn(`[feedback-webhook] ${error instanceof Error ? error.message : String(error)}`),
+    });
+    await feedbackWebhookDispatcher.ready;
+  } catch (error) {
+    logger.error(
+      `[feedback] subsystem bootstrap failed; continuing without feedback indexing/webhooks: `
+      + `${error instanceof Error ? error.message : String(error)}`,
+    );
+    feedbackWebhookDispatcher = undefined;
+  }
   // Establish the target-scoped daemon control credential before publishing
   // the daemon descriptor or accepting IPC traffic. Corruption fails startup
   // closed; silently rotating here could strand peers on mismatched tokens.
@@ -20397,26 +20412,43 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     enforceLiveSessionCap: () => enforceLiveSessionCap('session_change'),
     onQueuedActivationSubmitted,
     async onTurnTerminal(ds, terminal, context) {
-      try {
-        const { persistTurnTerminal } = await import('./services/turn-completion-events.js');
-        await persistTurnTerminal({
-          dataDir: config.session.dataDir,
-          botAppId: ds.larkAppId,
-          session: ds.session,
-          terminal,
-        });
-      } catch (error) {
-        logger.error(
-          `[turn-completion] persistence failed turn=${terminal.turnId.slice(0, 12)}: `
-          + `${error instanceof Error ? error.message : String(error)}`,
-        );
-      }
+      // VC reconcile first: it is in-memory and latency-sensitive, and must not
+      // sit behind a synchronous SQLite write. (Master did only this enqueue.)
       const enqueued = vcMeetingTerminalReconciler?.enqueue(terminal, context);
       if (terminal.dispatchAttempt !== undefined && enqueued?.accepted) {
         logger.info(
           `[vc-delivery] terminal queued ${terminal.status} turn=${terminal.turnId.slice(0, 12)} `
           + `session=${ds.session.sessionId.slice(0, 8)} attempt=${terminal.dispatchAttempt}`,
         );
+      }
+      // Feedback turn-completion persistence is a synchronous node:sqlite write
+      // (recordTurnTerminal). Keeping it OFF this handler's critical path avoids
+      // the whole daemon event loop stalling up to busy_timeout when another
+      // process (a `botmux send --response-kind final` subprocess) holds the
+      // shared feedback DB write lock — measured multi-second freezes affected
+      // every session's IPC, including bots with feedback disabled. apiOnly bots
+      // never produce a feedback delivery, so skip them outright; everyone else
+      // persists (a hosted-team may have enabled feedback with no bot-level
+      // config, so we must not gate on bot config alone), just not inline.
+      if (!getBot(ds.larkAppId).config.apiOnly) {
+        const botAppId = ds.larkAppId;
+        const sessionId = ds.session.sessionId;
+        void (async () => {
+          try {
+            const { persistTurnTerminal } = await import('./services/turn-completion-events.js');
+            await persistTurnTerminal({
+              dataDir: config.session.dataDir,
+              botAppId,
+              session: { sessionId },
+              terminal,
+            });
+          } catch (error) {
+            logger.error(
+              `[turn-completion] persistence failed turn=${terminal.turnId.slice(0, 12)}: `
+              + `${error instanceof Error ? error.message : String(error)}`,
+            );
+          }
+        })();
       }
     },
     onDeferredScheduleTurnSettled(ds, context) {
@@ -21352,7 +21384,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     }
 
     scheduler.stopScheduler();
-    await feedbackWebhookDispatcher.stop();
+    await feedbackWebhookDispatcher?.stop();
     stopMaintenance();
     vcMeetingTerminalReconciler?.stop();
     clearInterval(vcMeetingDeliveryLeaseTimer);
