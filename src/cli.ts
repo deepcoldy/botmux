@@ -8757,6 +8757,11 @@ async function cmdSend(rest: string[]): Promise<void> {
   const cardJsonArg = argValue(rest, '--card-json');
   const cardFile = argValue(rest, '--card-file');
   const customCardRequested = cardJsonArg !== undefined || cardFile !== undefined;
+  const responseKindOccurrences = rest.filter(token => token === '--response-kind' || token.startsWith('--response-kind=')).length;
+  if (responseKindOccurrences > 1) {
+    console.error('botmux send: --response-kind 只能指定一次');
+    process.exit(2);
+  }
   if (flagPresentButValueMissing(rest, '--response-kind')) {
     console.error('botmux send: --response-kind 仅支持 progress|final');
     process.exit(2);
@@ -10168,13 +10173,14 @@ async function cmdSend(rest: string[]): Promise<void> {
     }
 
     if (feedbackPolicy && effectiveResponseKind === 'final' && !customCard && !pureVideoSend && !vcMeetingManagedSendOrigin && messageId) {
+      const deliveryTurnId = `send:${messageId}`;
       try {
         const { getSkillFeedbackStore } = await import('./services/skill-feedback-store.js');
         const feedbackStore = await getSkillFeedbackStore(resolveDataDir());
         feedbackStore.recordTurnDelivery({
           botAppId: appId,
           sessionId: sid,
-          turnId: currentTurnId ?? `send:${messageId}`,
+          turnId: deliveryTurnId,
           nativeSessionId: s.cliSessionId,
           platform: 'lark',
           platformAppId: appId,

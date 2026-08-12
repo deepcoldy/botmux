@@ -512,7 +512,8 @@ describe('cmdSend hook context wiring', () => {
     const cmdSendStart = cliSource.indexOf('async function cmdSend(');
     const cmdDispatchStart = cliSource.indexOf('async function cmdDispatch(', cmdSendStart);
     const cmdSend = cliSource.slice(cmdSendStart, cmdDispatchStart);
-    expect(cmdSend).toContain("argValue(rest, '--response-kind')");
+    expect(cmdSend).toContain("const responseKindOccurrences = rest.filter(token => token === '--response-kind' || token.startsWith('--response-kind=')).length");
+    expect(cmdSend).toContain("responseKindOccurrences > 1");
     expect(cmdSend).toContain("flagPresentButValueMissing(rest, '--response-kind')");
     expect(cmdSend).toContain("const effectiveResponseKind = responseKind ?? 'progress'");
     expect(cmdSend).not.toContain('启用最终回答反馈后，必须显式指定 --response-kind progress|final');
@@ -520,6 +521,9 @@ describe('cmdSend hook context wiring', () => {
     expect(cmdSend).toContain('requesterSubjectId: feedbackRequesterSubjectId');
     expect(cmdSend).not.toContain("feedbackPolicy && responseKind === 'final'");
     expect(cmdSend).toContain("feedbackPolicy && effectiveResponseKind === 'final'");
+    expect(cmdSend).toContain("const deliveryTurnId = `send:${messageId}`");
+    expect(cmdSend).toContain('turnId: deliveryTurnId');
+    expect(cmdSend).not.toContain('turnId: currentTurnId ?? `send:${messageId}`');
     expect(cmdSend).not.toContain('--feedback-level');
     const primarySend = cmdSend.indexOf('messageId = await dispatchPrimary');
     const feedbackIndex = cmdSend.indexOf('feedback indexing failed after delivery');
