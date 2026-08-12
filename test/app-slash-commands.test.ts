@@ -18,7 +18,7 @@ import {
   type AppSlashCommandSpec,
   type RemoteAppSlashCommand,
 } from '../src/im/lark/app-slash-commands.js';
-import { DAEMON_COMMANDS } from '../src/core/passthrough-commands.js';
+import { DAEMON_COMMANDS, PASSTHROUGH_COMMANDS } from '../src/core/passthrough-commands.js';
 
 function description(zh: string, en = zh): AppSlashCommandDescription {
   return { default_value: zh, i18n: { zh_cn: zh, en_us: en } };
@@ -29,7 +29,7 @@ function spec(command: string, zh: string): AppSlashCommandSpec {
 }
 
 describe('native Lark slash-command catalog', () => {
-  it('combines botmux, passthrough, adapter and custom commands without duplicates', () => {
+  it('combines botmux, adapter and custom commands without registering global passthrough commands', () => {
     const catalog = buildAppSlashCommandCatalog({
       cliId: 'codex',
       cliDisplayName: 'Codex',
@@ -39,10 +39,14 @@ describe('native Lark slash-command catalog', () => {
 
     expect(names).toContain('help');
     expect(names).toContain('slash');
-    expect(names).toContain('compact');
     expect(names).toContain('goal');
     expect(names).toContain('export');
     expect(names).not.toContain('mcp:prompt');
+    expect(
+      [...PASSTHROUGH_COMMANDS]
+        .map(name => name.slice(1))
+        .filter(name => names.includes(name)),
+    ).toEqual([]);
     expect(names.filter(name => name === 'status')).toHaveLength(1);
     expect(new Set(names).size).toBe(names.length);
     expect(names.length).toBeLessThanOrEqual(APP_SLASH_COMMAND_LIMIT);

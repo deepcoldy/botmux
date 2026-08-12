@@ -56,7 +56,7 @@ type JsonResponse = {
 type NativeSlashCommandRow = {
   command: string;
   description: { default_value?: string };
-  source: 'botmux' | 'passthrough' | 'adapter' | 'custom';
+  source: 'botmux' | 'adapter' | 'custom';
   status: 'synced' | 'missing' | 'outdated' | 'unknown';
 };
 
@@ -3684,7 +3684,6 @@ export function NativeSlashCommandRegistration(props: { bot: BotDefaultsRow }) {
 
   const sourceLabel: Record<NativeSlashCommandRow['source'], string> = {
     botmux: tr('botDefaults.nativeSlashSourceBotmux'),
-    passthrough: tr('botDefaults.nativeSlashSourcePassthrough'),
     adapter: tr('botDefaults.nativeSlashSourceAdapter'),
     custom: tr('botDefaults.nativeSlashSourceCustom'),
   };

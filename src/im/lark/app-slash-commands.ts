@@ -1,7 +1,6 @@
 import { createCliAdapterSync } from '../../adapters/cli/registry.js';
 import type { CliId } from '../../adapters/cli/types.js';
 import { formatLarkError, getBotClient } from '../../bot-registry.js';
-import { PASSTHROUGH_COMMANDS } from '../../core/passthrough-commands.js';
 
 export const APP_SLASH_COMMAND_READ_SCOPE = 'application:app_slash_command:read';
 export const APP_SLASH_COMMAND_WRITE_SCOPE = 'application:app_slash_command:write';
@@ -18,7 +17,7 @@ export interface AppSlashCommandDescription {
   i18n?: Record<string, string>;
 }
 
-export type AppSlashCommandSource = 'botmux' | 'passthrough' | 'adapter' | 'custom';
+export type AppSlashCommandSource = 'botmux' | 'adapter' | 'custom';
 
 export interface AppSlashCommandSpec {
   /** Command name without the leading slash, as required by the Lark API. */
@@ -206,11 +205,6 @@ export function buildAppSlashCommandCatalog(
 ): AppSlashCommandSpec[] {
   const cliName = options.cliDisplayName?.trim() || options.cliId?.trim() || 'CLI';
   const candidates: AppSlashCommandSpec[] = [...BOTMUX_APP_SLASH_COMMANDS];
-
-  for (const command of PASSTHROUGH_COMMANDS) {
-    const spec = dynamicCommandSpec(command, 'passthrough', cliName);
-    if (spec) candidates.push(spec);
-  }
 
   if (options.cliId) {
     try {

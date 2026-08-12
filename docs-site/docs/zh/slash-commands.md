@@ -20,6 +20,7 @@
 | `/fork --create <新群名>` | 把当前空闲会话分身到一个新建群，源会话原样保留继续（仅 Claude 系 / Codex 终端模式；需在源会话所在话题内发起） |
 | `/card` | 手动召唤当前会话的流式卡片（关流式时也能召唤并恢复实时刷新；私密卡片模式下改发仅授权人可见的静态快照） |
 | `/term` | 获取当前会话的「可操作终端」（带写权限）链接，私密发给 owner（群内仅你可见，话题/单聊回退私信，不在群里暴露） |
+| `/introduce` | 让当前群内的机器人互相登记 open_id，便于协作时精确 @ 对方 |
 | `/dashboard [模块]` | 在飞书里打开 Dashboard 控制卡片（sessions/schedules/groups/settings/help 等） |
 | `/insight` | owner 专用：在当前会话即时回一张「本会话洞察摘要」卡片（聚合指标 + 规则建议；动作 span 明细 / 逐轮对账 / 对话回放在 Dashboard「洞察」页看） |
 | `/vc prepare <会议链接或会议号>` | 将当前普通群设为会议准备群，并在开会后复用同一 Agent 会话 |
@@ -86,7 +87,7 @@
 
 权限同 `/help`，不占用会话槽位。
 
-Dashboard 的「Bot 默认设置 → 安全 → Slash 命令」还会展示一份应用级的飞书原生命令清单：它合并 botmux 命令、固定透传白名单、当前 CLI adapter 默认命令与该 Bot 的 `customPassthroughCommands`，并标出每一项在飞书后台是已同步、待新增还是待更新。点击「同步到飞书」后，botmux 通过 `application:app_slash_command:read` / `application:app_slash_command:write` 新增缺失命令并更新说明；不会删除应用后台已有的其它命令。该能力处于灰度，用户侧需飞书 7.70+ PC 端及 FG 白名单。
+Dashboard 的「Bot 默认设置 → 安全 → Slash 命令」还会展示一份应用级的飞书原生命令清单：它合并 botmux 命令、当前 CLI adapter 明确声明的默认命令与该 Bot 的 `customPassthroughCommands`，并标出每一项在飞书后台是已同步、待新增还是待更新。固定透传白名单不会注册，因为不同 CLI 对同名命令的支持和语义可能不同。点击「同步到飞书」后，botmux 通过 `application:app_slash_command:read` / `application:app_slash_command:write` 新增缺失命令并更新说明；不会删除应用后台已有的其它命令。该能力处于灰度，用户侧需飞书 7.70+ PC 端及 FG 白名单。
 
 飞书客户端的原生 `/` 面板可能需要约 5 分钟刷新。按工作目录发现的 `.claude` 命令、skill、插件和 MCP prompt 不是应用级稳定能力，因此仍只在 `/slash` 卡片里展示，不会注册到飞书后台。
 
