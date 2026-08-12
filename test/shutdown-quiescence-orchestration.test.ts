@@ -199,4 +199,3 @@ describe('shutdown reaping / producer-fence separation (real ChildProcess)', () 
     expect(child.signalCode).toBe('SIGKILL');       // reaped by our SIGKILL
   });
 });
-
