@@ -8,6 +8,8 @@
  *
  * Run:  pnpm vitest run test/mojo-device-isolation.test.ts
  */
+import { readFileSync } from 'node:fs';
+
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('../src/utils/logger.js', () => ({
@@ -26,7 +28,7 @@ vi.mock('../src/bot-registry.js', () => ({
 }));
 
 import { resolveRemoteExecutionProven } from '../src/core/device-isolation-daemon.js';
-import { rememberAppliedUnprovableEnvKeys } from '../src/core/worker-pool.js';
+import { rememberAppliedUnprovableEnvKeys, startNewGenerationEnvLedger } from '../src/core/worker-pool.js';
 import type { DaemonSession } from '../src/core/types.js';
 
 /** Minimal DaemonSession shape the classifier reads. */
@@ -56,10 +58,21 @@ function ds(opts: {
    * both — the three-phase hole. Modelling it here is what makes that testable.
    */
   appliedKeys?: string[];
+  /**
+   * Keys parked from a generation whose worker has NOT been observed to exit
+   * (DaemonSession.mojoRetiringUnprovableEnvKeys).
+   *
+   * forkWorker's double-fork guard only SENDS close/kill and then spawns the
+   * replacement synchronously, so "new generation" does not imply the old
+   * (possibly injected) child is gone. Without this dimension the reset looked
+   * safe in every test.
+   */
+  retiringKeys?: string[];
 }): never {
   return {
     larkAppId: 'app_x',
     ...(opts.appliedKeys ? { mojoAppliedUnprovableEnvKeys: opts.appliedKeys } : {}),
+    ...(opts.retiringKeys ? { mojoRetiringUnprovableEnvKeys: opts.retiringKeys } : {}),
     initConfig: opts.backendConfig || opts.initWrapperCli || opts.initEnv
       ? {
         backendType: opts.backendType ?? 'mojo',
@@ -364,6 +377,154 @@ describe('resolveRemoteExecutionProven — applied-env ledger (three-phase)', ()
       initEnv: {},
       appliedKeys: ['X_JWT_TOKEN'],
     }))).toBe(true);
+  });
+});
+
+/**
+ * The DOUBLE-FORK window: a new generation does NOT prove the old child is gone.
+ *
+ * forkWorker's guard does `send({type:'close'})` + `kill()` + `ds.worker = null`
+ * and then continues synchronously to spawn the replacement, clearing the ledger
+ * at `ds.initConfig = initMsg`. `kill()` is a signal delivered, not an exit
+ * observed, and for mojo a request-less close degrades to best-effort teardown —
+ * so an LD_PRELOAD-injected child can still be alive, holding a credential, while
+ * the new generation starts with an empty ledger and the proof flips to
+ * safe_remote. This is reachable on the ordinary replacement path.
+ */
+describe('resolveRemoteExecutionProven — double-fork retiring generation', () => {
+  beforeEach(() => { liveBotConfig = {}; });
+
+  it('parked keys from a not-yet-exited generation still void the proof', () => {
+    // The new generation's own ledger is clean (fresh reseed) — only the parked
+    // layer knows the old child was handed LD_PRELOAD.
+    liveBotConfig = { env: {} };
+    expect(resolveRemoteExecutionProven(ds({
+      backendConfig: { cloud: true },
+      initEnv: {},
+      appliedKeys: [],
+      retiringKeys: ['LD_PRELOAD'],
+    }))).toBe(false);
+  });
+
+  it('a parked PATH override alone voids it', () => {
+    liveBotConfig = { env: {} };
+    expect(resolveRemoteExecutionProven(ds({
+      backendConfig: { cloud: true },
+      initEnv: {},
+      retiringKeys: ['PATH'],
+    }))).toBe(false);
+  });
+
+  it('an empty parked layer leaves a clean new generation provable', () => {
+    // After the retiring worker fires exit the parked layer is released, so a
+    // genuinely clean replacement must not stay poisoned forever.
+    liveBotConfig = { env: {} };
+    expect(resolveRemoteExecutionProven(ds({
+      backendConfig: { cloud: true },
+      initEnv: {},
+      appliedKeys: [],
+      retiringKeys: [],
+    }))).toBe(true);
+  });
+});
+
+/**
+ * Every worker-generation boundary must go through the ledger helper.
+ *
+ * Deleting the three call sites used to leave 109 tests across 4 files green:
+ * the reset had no behavioural guard at all, and it was hand-written per site
+ * (twice for normal fork, once for adopt) so it could silently drift.
+ *
+ * Exhaustive rather than a fixed count: a FOURTH generation boundary added later
+ * without the ledger is exactly the regression this must catch.
+ */
+describe('worker-generation boundaries all maintain the env ledger', () => {
+  const pool = readFileSync(
+    new URL('../src/core/worker-pool.ts', import.meta.url),
+    'utf8',
+  );
+
+  it('pairs every `ds.initConfig = initMsg` with a ledger handoff', () => {
+    const lines = pool.split('\n');
+    const boundaries = lines
+      .map((line, i) => ({ line: line.trim(), i }))
+      .filter(({ line }) => line === 'ds.initConfig = initMsg;');
+
+    // Sentinel: the known generation boundaries (2 fork paths + adopt). If this
+    // number changes, the new site must be reviewed, not silently accepted.
+    expect(boundaries.length).toBeGreaterThanOrEqual(3);
+
+    for (const { i } of boundaries) {
+      // The handoff must sit in the same block, right after the assignment.
+      const window = lines.slice(i, i + 8).join('\n');
+      expect(window, `generation boundary at line ${i + 1} must hand off the env ledger`)
+        .toContain('startNewGenerationEnvLedger(ds, initMsg.env)');
+    }
+  });
+
+  it('keeps the ledger reset out of the call sites (single implementation)', () => {
+    // A hand-written `= undefined` at a call site would bypass the parking rule
+    // and reopen the double-fork window; only the helper may clear it.
+    const resets = pool.split('\n')
+      .filter((l) => l.includes('mojoAppliedUnprovableEnvKeys = undefined'));
+    expect(resets).toHaveLength(1);
+    const helperBody = pool.slice(pool.indexOf('export function startNewGenerationEnvLedger'));
+    expect(helperBody).toContain('ds.mojoAppliedUnprovableEnvKeys = undefined;');
+  });
+
+  it('releases parked keys only from an exit-driven path', () => {
+    // `kill()` sent is not `exit` observed. The release helper must be reachable
+    // only from the retirement exit hooks.
+    expect(pool).toContain('function releaseRetiringEnvLedgerIfSettled');
+    const release = pool.slice(
+      pool.indexOf('function releaseRetiringEnvLedgerIfSettled'),
+      pool.indexOf('function releaseRetiringEnvLedgerIfSettled') + 400,
+    );
+    expect(release).toContain('if (lifecycleRetiringWorkers.has(ds)) return;');
+    // Called from the once('exit') release and the worker 'exit' handler path.
+    expect(pool).toContain("worker.once('exit', release);");
+  });
+});
+
+describe('startNewGenerationEnvLedger — parking rule at a generation boundary', () => {
+  function session(applied?: string[], retiring?: string[]): DaemonSession {
+    return {
+      larkAppId: 'app_x',
+      ...(applied ? { mojoAppliedUnprovableEnvKeys: applied } : {}),
+      ...(retiring ? { mojoRetiringUnprovableEnvKeys: retiring } : {}),
+    } as never as DaemonSession;
+  }
+
+  it('PARKS the old ledger while the previous worker has not exited', () => {
+    // Double-fork: kill was sent, exit not observed.
+    const s = session(['LD_PRELOAD']);
+    startNewGenerationEnvLedger(s, {}, { previousGenerationStillAlive: () => true });
+    expect(s.mojoAppliedUnprovableEnvKeys).toBeUndefined();   // fresh generation
+    expect(s.mojoRetiringUnprovableEnvKeys).toEqual(['LD_PRELOAD']); // but remembered
+  });
+
+  it('drops the old ledger only when the previous worker is already gone', () => {
+    const s = session(['LD_PRELOAD']);
+    startNewGenerationEnvLedger(s, {}, { previousGenerationStillAlive: () => false });
+    expect(s.mojoAppliedUnprovableEnvKeys).toBeUndefined();
+    expect(s.mojoRetiringUnprovableEnvKeys).toBeUndefined();
+  });
+
+  it('accumulates parked keys across repeated double-forks', () => {
+    const s = session(['LD_PRELOAD'], ['PATH']);
+    startNewGenerationEnvLedger(s, {}, { previousGenerationStillAlive: () => true });
+    expect([...(s.mojoRetiringUnprovableEnvKeys ?? [])].sort())
+      .toEqual(['LD_PRELOAD', 'PATH']);
+  });
+
+  it('reseeds the new generation from its own init env', () => {
+    const s = session(['LD_PRELOAD']);
+    startNewGenerationEnvLedger(
+      s,
+      { NODE_OPTIONS: '--require /tmp/x.js' },
+      { previousGenerationStillAlive: () => false },
+    );
+    expect(s.mojoAppliedUnprovableEnvKeys).toEqual(['NODE_OPTIONS']);
   });
 });
 

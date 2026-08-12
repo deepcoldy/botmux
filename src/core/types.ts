@@ -104,6 +104,23 @@ export interface DaemonSession {
    * only and these keys can carry credentials.
    */
   mojoAppliedUnprovableEnvKeys?: string[];
+  /**
+   * Same ledger, inherited from a PREVIOUS generation whose worker has not been
+   * observed to exit yet.
+   *
+   * `forkWorker`'s double-fork guard sends `close` + `kill()` and then continues
+   * synchronously to spawn the replacement — it never awaits the old worker's
+   * exit. `kill()` is only a signal delivered, and for mojo a request-less close
+   * degrades to best-effort teardown, so the old (possibly LD_PRELOAD-injected)
+   * child can still be alive and holding a credential while the new generation
+   * starts with an empty ledger. Clearing on "new generation" therefore assumed
+   * something double-fork disproves.
+   *
+   * Parked here instead, and only released once the retiring worker actually
+   * fires `exit` (the existing trackLifecycleRetirement hook). A worker that
+   * never exits keeps the keys forever — fail-closed on purpose.
+   */
+  mojoRetiringUnprovableEnvKeys?: string[];
   /** Dashboard「复现命令」：worker 在 `ready` 时上报的、该 session 本次冷启的近似
    *  可复现 CLI 调用（bin + argv + cwd + 权威注入 env）。**只驻内存、绝不落盘**
    *  ——命令含 provider token / 凭证 env，写进默认 0644 的 sessions-*.json 会让同机

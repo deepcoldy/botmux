@@ -246,8 +246,16 @@ export function resolveRemoteExecutionProven(ds: DaemonSession): boolean {
       return false;
     }
     // Keys only, so a placeholder value is fine: the proof never reads values.
+    // Both ledger layers are folded in: the current generation's, and any parked
+    // from a generation whose worker has not been observed to exit. The latter
+    // matters because forkWorker's double-fork guard only SENDS close/kill and
+    // then spawns the replacement synchronously — so a hooked old child can still
+    // be running while the new generation's own ledger is empty.
     const appliedKeyEnv = Object.fromEntries(
-      (ds.mojoAppliedUnprovableEnvKeys ?? []).map((k) => [k, '1']),
+      [
+        ...(ds.mojoAppliedUnprovableEnvKeys ?? []),
+        ...(ds.mojoRetiringUnprovableEnvKeys ?? []),
+      ].map((k) => [k, '1']),
     );
     return isMojoFullyRemote({
       ...fromInit,

@@ -113,6 +113,7 @@ function trackLifecycleRetirement(ds: DaemonSession, worker: ChildProcess): void
     const current = lifecycleRetiringWorkers.get(ds);
     current?.delete(worker);
     if (current?.size === 0) lifecycleRetiringWorkers.delete(ds);
+    releaseRetiringEnvLedgerIfSettled(ds);
   };
   worker.once('exit', release);
 }
@@ -121,6 +122,48 @@ function clearLifecycleRetirement(ds: DaemonSession, worker: ChildProcess): void
   const workers = lifecycleRetiringWorkers.get(ds);
   workers?.delete(worker);
   if (workers?.size === 0) lifecycleRetiringWorkers.delete(ds);
+  releaseRetiringEnvLedgerIfSettled(ds);
+}
+
+/**
+ * Drop the parked launcher-env keys once no retiring worker is left.
+ *
+ * Only ever called from an `exit` path, which is the point of the whole design:
+ * a *sent* kill proves nothing, an observed exit does. While any retiring worker
+ * is still tracked the keys stay, so the device-isolation proof keeps treating
+ * the old child's env as live.
+ */
+function releaseRetiringEnvLedgerIfSettled(ds: DaemonSession): void {
+  if (lifecycleRetiringWorkers.has(ds)) return;
+  ds.mojoRetiringUnprovableEnvKeys = undefined;
+}
+
+/**
+ * Start a new worker generation's launcher-env ledger.
+ *
+ * The previous generation's keys are PARKED rather than dropped when its worker
+ * has not been observed to exit (double-fork: `kill()` is sent and the
+ * replacement spawns synchronously). Only `releaseRetiringEnvLedgerIfSettled`,
+ * driven by a real `exit` event, can retire them.
+ *
+ * Exported so the behavioural guards can assert this directly — deleting the
+ * three call sites used to leave every test green.
+ */
+export function startNewGenerationEnvLedger(
+  ds: DaemonSession,
+  initEnv: Record<string, string> | undefined,
+  deps: { previousGenerationStillAlive?: (ds: DaemonSession) => boolean } = {},
+): void {
+  // Injected only so the parking rule can be unit-tested without spawning a real
+  // worker (same dependency-seam style as cleanupExplicitSessionBacking). The
+  // default is the single production source of truth.
+  const stillAlive = deps.previousGenerationStillAlive
+    ?? ((s: DaemonSession) => lifecycleRetiringWorkers.has(s));
+  const carried = stillAlive(ds) ? (ds.mojoAppliedUnprovableEnvKeys ?? []) : [];
+  const parked = new Set([...(ds.mojoRetiringUnprovableEnvKeys ?? []), ...carried]);
+  ds.mojoRetiringUnprovableEnvKeys = parked.size > 0 ? [...parked] : undefined;
+  ds.mojoAppliedUnprovableEnvKeys = undefined;
+  rememberAppliedUnprovableEnvKeys(ds, initEnv);
 }
 
 /** Symmetric lifecycle fence: relay must not start while another operation is
@@ -8064,12 +8107,10 @@ export function forkWorker(
     }
   }
   ds.initConfig = initMsg;
-  // A brand-new worker generation starts with a clean ledger: whatever env was
-  // handed to the PREVIOUS child died with it. This is the ONLY place the ledger
-  // is cleared — clearing it when a clean restart is merely sent would forget a
-  // dangerous child that a failed/coalesced restart left running.
-  ds.mojoAppliedUnprovableEnvKeys = undefined;
-  rememberAppliedUnprovableEnvKeys(ds, initMsg.env);
+  // New generation ledger. NOT a plain reset: the previous generation's keys are
+  // parked until its worker is observed to exit, because the double-fork guard
+  // kills asynchronously and spawns the replacement synchronously.
+  startNewGenerationEnvLedger(ds, initMsg.env);
   // Cold-resume path: a workerless session goes straight here without passing
   // through sendWorkerInput, so without this the "notice on the next message"
   // promise was never kept for exactly the sessions most likely to need it.
@@ -8142,12 +8183,10 @@ export function forkWorker(
     throw err;
   }
   ds.initConfig = initMsg;
-  // A brand-new worker generation starts with a clean ledger: whatever env was
-  // handed to the PREVIOUS child died with it. This is the ONLY place the ledger
-  // is cleared — clearing it when a clean restart is merely sent would forget a
-  // dangerous child that a failed/coalesced restart left running.
-  ds.mojoAppliedUnprovableEnvKeys = undefined;
-  rememberAppliedUnprovableEnvKeys(ds, initMsg.env);
+  // New generation ledger. NOT a plain reset: the previous generation's keys are
+  // parked until its worker is observed to exit, because the double-fork guard
+  // kills asynchronously and spawns the replacement synchronously.
+  startNewGenerationEnvLedger(ds, initMsg.env);
   try {
     sessionStore.updateSessionPid(ds.session.sessionId, worker.pid ?? null);
   } catch (err) {
@@ -11568,12 +11607,10 @@ export function forkAdoptWorker(ds: DaemonSession, opts?: { restoredFromMetadata
   };
   worker.send(initMsg);
   ds.initConfig = initMsg;
-  // A brand-new worker generation starts with a clean ledger: whatever env was
-  // handed to the PREVIOUS child died with it. This is the ONLY place the ledger
-  // is cleared — clearing it when a clean restart is merely sent would forget a
-  // dangerous child that a failed/coalesced restart left running.
-  ds.mojoAppliedUnprovableEnvKeys = undefined;
-  rememberAppliedUnprovableEnvKeys(ds, initMsg.env);
+  // New generation ledger. NOT a plain reset: the previous generation's keys are
+  // parked until its worker is observed to exit, because the double-fork guard
+  // kills asynchronously and spawns the replacement synchronously.
+  startNewGenerationEnvLedger(ds, initMsg.env);
   // Stamp cliId on the persisted session so the dashboard can show a CLI badge
   // even after the session is closed. Adopt sessions inherit the adopted CLI's id.
   // Do this before installing worker handlers: a fast worker can emit `ready`
