@@ -6,7 +6,6 @@ import {
   readFileSync, existsSync, mkdirSync, readdirSync, statSync, createReadStream, realpathSync,
 } from 'node:fs';
 import { atomicWriteFileSync } from './utils/atomic-write.js';
-import { resolveCredentialsDir } from './core/credentials-dir.js';
 import { join, dirname, extname, resolve, relative, isAbsolute } from 'node:path';
 import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
@@ -242,7 +241,7 @@ import {
 import { createDashboardSummaryEndpoint } from './dashboard/dashboard-summary-endpoint.js';
 
 const SECRET_PATH = dashboardSecretPath();
-const TOKEN_PATH = join(resolveCredentialsDir(), '.dashboard-token');
+const TOKEN_PATH = join(homedir(), '.botmux', '.dashboard-token');
 /** Per-daemon budget for the cross-daemon insight overview fan-out — bounds
  *  aggregate latency when one daemon's insight parse is slow or hung. */
 const INSIGHT_FANOUT_TIMEOUT_MS = 10_000;

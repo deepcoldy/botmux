@@ -17,7 +17,6 @@ import { chmodSync, mkdirSync, writeFileSync, unlinkSync, rmdirSync, existsSync,
 import { atomicWriteFileSync } from './utils/atomic-write.js';
 import { join, basename, dirname, delimiter } from 'node:path';
 import { resolveBotmuxWrapperBinDir, prependBotmuxBin } from './core/botmux-wrapper.js';
-import { resolveCredentialsDir } from './core/credentials-dir.js';
 import { homedir, tmpdir, userInfo } from 'node:os';
 import { spawnSync } from 'node:child_process';
 import {
@@ -1779,8 +1778,8 @@ let viewToken = randomBytes(32).toString('base64url');
 // path (mirrors dashboard.ts TOKEN_PATH). The platform proxy injects it as the
 // `botmux_dashboard_token` cookie on every request it fronts, so its presence
 // proves a request traversed the platform's authenticated front door.
-const DASHBOARD_TOKEN_PATH = join(resolveCredentialsDir(), '.dashboard-token');
-const DASHBOARD_SECRET_PATH = join(resolveCredentialsDir(), '.dashboard-secret');
+const DASHBOARD_TOKEN_PATH = join(homedir(), '.botmux', '.dashboard-token');
+const DASHBOARD_SECRET_PATH = join(homedir(), '.botmux', '.dashboard-secret');
 
 function refreshTerminalViewToken(): void {
   const secret = loadDashboardSecret(DASHBOARD_SECRET_PATH);

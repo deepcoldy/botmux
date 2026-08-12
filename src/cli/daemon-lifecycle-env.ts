@@ -18,10 +18,6 @@ const DAEMON_ENV_KEYS = [
   // from a bot session (whose pane wrapper unsets BOTMUX_*) silently demoted
   // all web-terminal links back to raw ip:port.
   'BOTMUX_PUBLIC_URL',
-  // Credential-root redirect (multi-tenant hosts where ~/.botmux's ancestor
-  // chain fails secure-host-file). Baked so the daemon's breadcrumb write and
-  // every managed process agree with the shell that started them.
-  'BOTMUX_CREDENTIALS_DIR',
 ] as const;
 
 /**
@@ -48,6 +44,5 @@ export function resolveDaemonEnv(
     BOTMUX_DAEMON_IPC_BASE_PORT: resolve('BOTMUX_DAEMON_IPC_BASE_PORT'),
     BOTMUX_DASHBOARD_PUBLIC_READONLY: resolve('BOTMUX_DASHBOARD_PUBLIC_READONLY'),
     BOTMUX_PUBLIC_URL: resolve('BOTMUX_PUBLIC_URL'),
-    BOTMUX_CREDENTIALS_DIR: resolve('BOTMUX_CREDENTIALS_DIR'),
   };
 }

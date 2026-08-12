@@ -112,20 +112,20 @@ describe('classifyDashboard401', () => {
 describe('callDashboard', () => {
   it('returns no-secret when the secret file is missing', async () => {
     rmSync(join(dir, '.dashboard-secret'));
-    const r = await callDashboard({ configDir: dir, defaultPort: 7891, secretPath: join(dir, '.dashboard-secret'), path: '/__cli/rotate', fetchImpl: makeFetch({}) });
+    const r = await callDashboard({ configDir: dir, defaultPort: 7891, path: '/__cli/rotate', fetchImpl: makeFetch({}) });
     expect(r).toEqual({ ok: false, reason: 'no-secret' });
   });
 
   it('returns no-secret when the secret file is whitespace-only', async () => {
     writeFileSync(join(dir, '.dashboard-secret'), ' \n');
-    const r = await callDashboard({ configDir: dir, defaultPort: 7891, secretPath: join(dir, '.dashboard-secret'), path: '/__cli/rotate', fetchImpl: makeFetch({}) });
+    const r = await callDashboard({ configDir: dir, defaultPort: 7891, path: '/__cli/rotate', fetchImpl: makeFetch({}) });
     expect(r).toEqual({ ok: false, reason: 'no-secret' });
   });
 
   it('rotates against the recorded port when it IS the dashboard', async () => {
     setPort(7891);
     const r = await callDashboard({
-      configDir: dir, defaultPort: 7891, secretPath: join(dir, '.dashboard-secret'), path: '/__cli/rotate',
+      configDir: dir, defaultPort: 7891, path: '/__cli/rotate',
       fetchImpl: makeFetch({ 7891: { kind: 'dashboard', hasToken: false } }),
     });
     expect(r).toEqual({ ok: true, url: 'http://host:7891/?t=fresh' });
@@ -137,7 +137,7 @@ describe('callDashboard', () => {
   ])('ensure gets a usable URL without replacing an existing token: $hasToken', async ({ hasToken, token }) => {
     setPort(7891);
     const r = await callDashboard({
-      configDir: dir, defaultPort: 7891, secretPath: join(dir, '.dashboard-secret'), path: '/__cli/ensure',
+      configDir: dir, defaultPort: 7891, path: '/__cli/ensure',
       fetchImpl: makeFetch({ 7891: { kind: 'dashboard', hasToken } }),
     });
     expect(r).toEqual({ ok: true, url: `http://host:7891/?t=${token}` });
@@ -150,7 +150,7 @@ describe('callDashboard', () => {
       JSON.stringify({ url: 'https://m-x.example/?t=fresh', localUrl: 'http://10.0.0.1:7891/?t=fresh' }),
       { status: 200 },
     )) as unknown as typeof fetch;
-    const r = await callDashboard({ configDir: dir, defaultPort: 7891, secretPath: join(dir, '.dashboard-secret'), path: '/__cli/rotate', fetchImpl });
+    const r = await callDashboard({ configDir: dir, defaultPort: 7891, path: '/__cli/rotate', fetchImpl });
     expect(r).toEqual({ ok: true, url: 'https://m-x.example/?t=fresh', localUrl: 'http://10.0.0.1:7891/?t=fresh' });
   });
 
@@ -158,7 +158,7 @@ describe('callDashboard', () => {
     // Recorded port points at daemon IPC (the reported bug); real dashboard is 7901.
     setPort(7893);
     const r = await callDashboard({
-      configDir: dir, defaultPort: 7891, secretPath: join(dir, '.dashboard-secret'), path: '/__cli/rotate',
+      configDir: dir, defaultPort: 7891, path: '/__cli/rotate',
       fetchImpl: makeFetch({
         7893: { kind: 'ipc' },
         7901: { kind: 'dashboard', hasToken: true },
@@ -172,7 +172,7 @@ describe('callDashboard', () => {
   it('self-heals when the recorded loopback port returns sig_mismatch', async () => {
     setPort(7891);
     const r = await callDashboard({
-      configDir: dir, defaultPort: 7891, secretPath: join(dir, '.dashboard-secret'), path: '/__cli/rotate',
+      configDir: dir, defaultPort: 7891, path: '/__cli/rotate',
       fetchImpl: makeFetch({
         7891: { kind: 'auth-fail' },
         7897: { kind: 'dashboard', hasToken: true },
@@ -185,7 +185,7 @@ describe('callDashboard', () => {
   it('reports wrong-service when the recorded port is IPC and no dashboard is found in range', async () => {
     setPort(7893);
     const r = await callDashboard({
-      configDir: dir, defaultPort: 7891, secretPath: join(dir, '.dashboard-secret'), path: '/__cli/rotate',
+      configDir: dir, defaultPort: 7891, path: '/__cli/rotate',
       fetchImpl: makeFetch({ 7893: { kind: 'ipc' } }),
     });
     expect(r.ok).toBe(false);
@@ -198,7 +198,7 @@ describe('callDashboard', () => {
     const base = makeFetch({ 7901: { kind: 'dashboard', hasToken: true } });
     const counting = (async (...a: Parameters<typeof fetch>) => { calls++; return base(...a); }) as typeof fetch;
     const r = await callDashboard({
-      configDir: dir, defaultPort: 7891, secretPath: join(dir, '.dashboard-secret'), path: '/__cli/current', fetchImpl: counting,
+      configDir: dir, defaultPort: 7891, path: '/__cli/current', fetchImpl: counting,
     });
     expect(r).toEqual({ ok: false, reason: 'unreachable' });
     expect(calls).toBe(1); // only the recorded port — no range scan on unreachable
@@ -212,7 +212,7 @@ describe('callDashboard', () => {
       seen.push(`${new URL(input).port} ${new URL(input).pathname}`);
       return base(input, init);
     }) as unknown as typeof fetch;
-    await callDashboard({ configDir: dir, defaultPort: 7891, secretPath: join(dir, '.dashboard-secret'), path: '/__cli/rotate', fetchImpl: spy });
+    await callDashboard({ configDir: dir, defaultPort: 7891, path: '/__cli/rotate', fetchImpl: spy });
     // The dashboard port (7901) is first identified via /__cli/current, and only
     // then issued the requested /__cli/rotate.
     const dashHits = seen.filter(s => s.startsWith('7901 '));
@@ -223,7 +223,7 @@ describe('callDashboard', () => {
   it('current path returns no-active-token from a genuine dashboard with no token', async () => {
     setPort(7891);
     const r = await callDashboard({
-      configDir: dir, defaultPort: 7891, secretPath: join(dir, '.dashboard-secret'), path: '/__cli/current',
+      configDir: dir, defaultPort: 7891, path: '/__cli/current',
       fetchImpl: makeFetch({ 7891: { kind: 'dashboard', hasToken: false } }),
     });
     expect(r.ok).toBe(false);
@@ -241,7 +241,7 @@ describe('requestDashboardAt HMAC headers', () => {
       headers = (init?.headers ?? {}) as Record<string, string>;
       return new Response(JSON.stringify({ url: 'http://host:7891/?t=x' }), { status: 200 });
     }) as unknown as typeof fetch;
-    await callDashboard({ configDir: dir, defaultPort: 7891, secretPath: join(dir, '.dashboard-secret'), path: '/__cli/rotate', fetchImpl: spy });
+    await callDashboard({ configDir: dir, defaultPort: 7891, path: '/__cli/rotate', fetchImpl: spy });
     const ts = headers['X-Botmux-Cli-Ts'];
     const nonce = headers['X-Botmux-Cli-Nonce'];
     const bind = cliAuthBind('POST', '/__cli/rotate', 7891);

@@ -19,7 +19,6 @@ import {
 import { readGlobalConfig, repoPickerScanOptions } from './global-config.js';
 import { buildDashboardUrls } from './core/dashboard-url.js';
 import { resolveBotmuxDataDir } from './core/data-dir.js';
-import { resolveCredentialsDir, persistCredentialsDirBreadcrumb } from './core/credentials-dir.js';
 import { reloadExactDaemonBotConfig } from './core/daemon-config-fence.js';
 import { writeHeartbeat } from './core/daemon-heartbeat.js';
 import { botmuxWrapperFiles, resolveBotmuxWrapperBinDir } from './core/botmux-wrapper.js';
@@ -3480,9 +3479,6 @@ function writePidFile(): void {
       mkdirSync(join(homedir(), '.botmux'), { recursive: true });
       atomicWriteFileSync(breadcrumb, config.session.dataDir);
     } catch { /* best effort */ }
-    // Credential-root breadcrumb: follow the deployment when the operator
-    // redirected credentials to a trusted mount point (BOTMUX_CREDENTIALS_DIR).
-    persistCredentialsDirBreadcrumb(resolveCredentialsDir());
   }
 
   // Write a thin wrapper script so `botmux` is always in PATH for CLI sessions,
@@ -19924,7 +19920,7 @@ function dashboardUrlForReport(): { url?: string; localUrl?: string } {
     const dir = join(homedir(), '.botmux');
     const portFile = join(dir, '.dashboard-port');
     const port = existsSync(portFile) ? readFileSync(portFile, 'utf8').trim() : String(config.dashboard.port);
-    const tok = loadPersistedToken(join(resolveCredentialsDir(), '.dashboard-token')) ?? '';
+    const tok = loadPersistedToken(join(dir, '.dashboard-token')) ?? '';
     // buildDashboardUrls swaps in the central-platform machine subdomain when
     // 远程访问 is on and this host is bound, so the restart-report DM links to the
     // platform dashboard instead of an unreachable local host:port. In that case

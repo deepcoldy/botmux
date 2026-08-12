@@ -260,7 +260,6 @@ export function detachedRestartEnv(inheritedEnv: NodeJS.ProcessEnv = process.env
     'BOTMUX_DAEMON_IPC_BASE_PORT',
     'BOTMUX_DASHBOARD_PUBLIC_READONLY',
     'BOTMUX_PUBLIC_URL',
-    'BOTMUX_CREDENTIALS_DIR',
   ]) delete env[key];
   return env;
 }

@@ -8,7 +8,6 @@
  */
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import { resolveCredentialsDir } from '../core/credentials-dir.js';
 import {
   readSecureHostFileSync,
   unlinkSecureHostFileSync,
@@ -95,7 +94,7 @@ export class DeviceCredentialError extends Error {
 
 export function deviceCredentialsPath(options: DeviceCredentialPathOptions = {}): string {
   return options.filePath
-    ?? deviceCredentialFile(resolveCredentialsDir({ homeDir: options.homeDir ?? homedir() }));
+    ?? deviceCredentialFile(join(options.homeDir ?? homedir(), '.botmux'));
 }
 
 function isLoopbackHostname(hostname: string): boolean {

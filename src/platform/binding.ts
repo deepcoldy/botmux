@@ -1,6 +1,6 @@
 // 平台绑定状态：存在 ~/.botmux/platform.json，记录这台机器绑到了哪个平台。
 import { join } from 'node:path';
-import { resolveCredentialsDir } from '../core/credentials-dir.js';
+import { homedir } from 'node:os';
 import {
   readSecureHostFileSync,
   unlinkSecureHostFileSync,
@@ -30,7 +30,7 @@ export interface PlatformTeam {
   teamName: string;
 }
 
-export const PLATFORM_BINDING_PATH = join(resolveCredentialsDir(), 'platform.json');
+export const PLATFORM_BINDING_PATH = join(homedir(), '.botmux', 'platform.json');
 
 export function readPlatformBinding(): PlatformBinding | null {
   try {

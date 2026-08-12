@@ -6502,7 +6502,7 @@ async function cmdWorkflowCancelV3(runId: string | undefined, rest: string[]): P
 function requireDashboardSecret(): string {
   let secret: string | null;
   try {
-    secret = loadDashboardSecret(dashboardSecretPath());
+    secret = loadDashboardSecret(join(CONFIG_DIR, '.dashboard-secret'));
   } catch (err: any) {
     throw new Error(`无法读取 .dashboard-secret: ${err?.message ?? err}`);
   }

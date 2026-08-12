@@ -21,7 +21,6 @@
  */
 
 import { createHash } from 'node:crypto';
-import { resolveCredentialsDir } from '../../core/credentials-dir.js';
 import {
   DEVICE_AUTHORITY_DIRECTORY,
   DEVICE_CREDENTIAL_FILE,
@@ -124,7 +123,7 @@ function hostDeviceAuthorityPaths(root: string): string[] {
 
 /** Fixed host marker; deliberately independent of SESSION_DATA_DIR and child env. */
 export function deviceCredentialIsolationMarkerPath(homeDir: string): string {
-  return `${resolveCredentialsDir({ homeDir }).replace(/\/+$/, '')}/${DEVICE_CREDENTIAL_ISOLATION_MARKER_BASENAME}`;
+  return `${homeDir.replace(/\/+$/, '')}/.botmux/${DEVICE_CREDENTIAL_ISOLATION_MARKER_BASENAME}`;
 }
 
 /** Match current atomic-write sidecars and legacy backups as well as the

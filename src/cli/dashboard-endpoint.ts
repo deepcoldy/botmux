@@ -2,7 +2,6 @@ import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { cliAuthBind, loadDashboardSecret, signCliAuth } from '../dashboard/auth.js';
-import { dashboardSecretPath } from '../core/dashboard-secret.js';
 
 /**
  * Loopback HMAC client for the dashboard process's `/__cli/*` endpoints, used by
@@ -158,15 +157,13 @@ export async function callDashboard(opts: {
   persistPort?: boolean;
   path: DashboardEndpoint;
   fetchImpl?: FetchImpl;
-  /** Override the secret path (tests); defaults to the credential root. */
-  secretPath?: string;
 }): Promise<DashboardResult> {
   const host = opts.host ?? '127.0.0.1';
   const probeSpan = opts.probeSpan ?? 20;
   const persistPort = opts.persistPort ?? true;
   const fetchImpl = opts.fetchImpl ?? fetch;
 
-  const secretPath = opts.secretPath ?? dashboardSecretPath();
+  const secretPath = join(opts.configDir, '.dashboard-secret');
   let secret: string | null;
   try {
     secret = loadDashboardSecret(secretPath);
