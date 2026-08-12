@@ -38,6 +38,9 @@ describe('dashboard bot payload helpers', () => {
     expect(botSummaryPayload({
       larkAppId: 'cli_vendor',
       botName: 'Vendor Bot',
+      larkAppId: 'cli_traex',
+      botOpenId: 'ou_traex',
+      botName: 'TraeX',
       botAvatarUrl: 'https://example.test/avatar.png',
       cliId: 'codex',
       cliRuntime,
@@ -45,6 +48,9 @@ describe('dashboard bot payload helpers', () => {
     })).toEqual({
       larkAppId: 'cli_vendor',
       botName: 'Vendor Bot',
+      larkAppId: 'cli_traex',
+      botOpenId: 'ou_traex',
+      botName: 'TraeX',
       botAvatarUrl: 'https://example.test/avatar.png',
       cliId: 'codex',
     });

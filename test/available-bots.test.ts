@@ -12,6 +12,7 @@ vi.mock('../src/im/lark/client.js', () => ({
 
 import { listChatBotMembers } from '../src/im/lark/client.js';
 import { getAvailableBots } from '../src/core/session-manager.js';
+import { registerBot } from '../src/bot-registry.js';
 
 type Member = Awaited<ReturnType<typeof listChatBotMembers>>[number];
 const member = (over: Partial<Member>): Member => ({
@@ -40,6 +41,16 @@ describe('getAvailableBots filtering', () => {
     ]);
     const bots = await getAvailableBots('cli_self', 'oc_x');
     expect(bots.map(b => b.displayName).sort()).toEqual(['External', 'Reliable']);
+  });
+
+  it('excludes the goal-panel relay from worker candidates', async () => {
+    registerBot({ larkAppId: 'cli_panel_for_available_bots', larkAppSecret: 's', cliId: 'claude-code', handler: 'goal-panel' });
+    (listChatBotMembers as any).mockResolvedValue([
+      member({ larkAppId: 'cli_panel_for_available_bots', displayName: 'loopy-中控', openId: 'ou_panel', mentionable: true }),
+      member({ larkAppId: 'cli_worker_for_available_bots', displayName: 'Worker', openId: 'ou_worker', mentionable: true }),
+    ]);
+    const bots = await getAvailableBots('cli_self', 'oc_x');
+    expect(bots.map(b => b.displayName)).toEqual(['Worker']);
   });
 
   it('returns [] on listing error', async () => {

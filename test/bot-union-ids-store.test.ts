@@ -23,7 +23,6 @@ describe('bot-union-ids-store', () => {
   it('is idempotent — same value reports no change', () => {
     recordBotUnionId(dataDir, 'cli_a', 'on_a');
     expect(recordBotUnionId(dataDir, 'cli_a', 'on_a')).toBe(false);
-    // a corrected value still writes
     expect(recordBotUnionId(dataDir, 'cli_a', 'on_b')).toBe(true);
     expect(getBotUnionId(dataDir, 'cli_a')).toBe('on_b');
   });
@@ -49,18 +48,17 @@ describe('bot-union-ids-store', () => {
     ];
     expect(recordBotUnionIdFromMentions(dataDir, 'cli_a', 'ou_self', mentions)).toBe(true);
     expect(getBotUnionId(dataDir, 'cli_a')).toBe('on_self');
-    // idempotent on repeat
     expect(recordBotUnionIdFromMentions(dataDir, 'cli_a', 'ou_self', mentions)).toBe(false);
   });
 
   it('ignores mentions that are not self, lack union_id, or use string/app_id ids', () => {
     expect(recordBotUnionIdFromMentions(dataDir, 'cli_a', 'ou_self', [
-      { id: { open_id: 'ou_other', union_id: 'on_other' } }, // 别人
-      { id: { open_id: 'ou_self' } },                        // 自己但没盖 union_id
-      { id: 'cli_a' },                                        // app_id 字符串形态
+      { id: { open_id: 'ou_other', union_id: 'on_other' } },
+      { id: { open_id: 'ou_self' } },
+      { id: 'cli_a' },
     ])).toBe(false);
     expect(recordBotUnionIdFromMentions(dataDir, 'cli_a', undefined, [
-      { id: { open_id: 'ou_self', union_id: 'on_self' } },   // 自己 open_id 未知 → 无从匹配
+      { id: { open_id: 'ou_self', union_id: 'on_self' } },
     ])).toBe(false);
     expect(recordBotUnionIdFromMentions(dataDir, 'cli_a', 'ou_self', undefined)).toBe(false);
     expect(getBotUnionId(dataDir, 'cli_a')).toBeUndefined();

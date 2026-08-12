@@ -839,6 +839,7 @@ describe('Worker ready: set_display_mode re-sync', () => {
     const ds = makeDs({
       worker: fakeWorker,
       pendingRawInput: '/goal RESTORED_RAW_N',
+      pendingRawTurnId: 'stale-pre-restart-turn',
       initialStartPending: true,
     } as Partial<DaemonSession>);
     Object.assign(ds.session, {

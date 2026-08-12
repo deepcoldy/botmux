@@ -445,6 +445,8 @@ export interface WorkerPoolCallbacks {
    * `void` is retained for older embedders/tests that implement a synchronous
    * best-effort close; the production daemon always returns an exact boolean. */
   closeSession: (ds: DaemonSession) => boolean | void | Promise<boolean | void>;
+  /** Turn boundary signal used by goal watchdog to inspect unreported tasks. */
+  onSessionIdleOrExit?: (ds: DaemonSession, reason: 'idle' | 'limited' | 'exit') => void;
   /** Re-check the per-bot resident-session cap after a process starts or an
    * over-cap busy session becomes idle. Optional for unit-test callers. */
   enforceLiveSessionCap?: () => void;
@@ -8014,6 +8016,7 @@ function setupWorkerHandlers(
             if (prevStatus === 'working' || prevStatus === 'analyzing') {
               void finishTurnReactions(ds);
             }
+            callbacks?.onSessionIdleOrExit?.(ds, ds.lastScreenStatus);
           }
           if (
             ds.lastScreenStatus === 'idle'
@@ -8021,6 +8024,7 @@ function setupWorkerHandlers(
             && ds.session.deferredScheduleRun?.turnId === msg.turnId
           ) {
             void cb.onDeferredScheduleTurnSettled?.(ds, { turnId: msg.turnId, source: 'idle' });
+            void finishTurnReactions(ds);
           }
           // If every over-cap process was busy, the earlier check deliberately
           // left them alone. Re-check on the first idle edge so capacity is
@@ -9561,6 +9565,7 @@ function setupWorkerHandlers(
         code,
       });
     }
+    callbacks?.onSessionIdleOrExit?.(ds, 'exit');
   });
 }
 

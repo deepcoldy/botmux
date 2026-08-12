@@ -27,6 +27,8 @@ export interface AggregatedRosterBot {
   larkTransportEnabled?: boolean;
   /** Tenant-stable bot id (kept now so P2 拉群 by union_id needs no schema change). */
   botUnionId?: string;
+  botmuxVersion?: string;
+  a2aCapabilities?: string[];
   /** Owner (person) of this bot — union_id is tenant-stable, used to pull the
    *  owner into a federated group regardless of app scope. */
   owner?: { unionId?: string; name?: string };
@@ -87,6 +89,8 @@ export function buildFederatedRoster(dataDir: string, teamId: string = DEFAULT_T
         // pre-capability spoke → treated as legacy normal (transport-enabled).
         larkTransportEnabled: b.larkTransportEnabled,
         botUnionId: b.botUnionId,
+        botmuxVersion: b.botmuxVersion,
+        a2aCapabilities: b.a2aCapabilities,
         owner: (b.ownerUnionId || b.ownerName) ? { unionId: b.ownerUnionId, name: b.ownerName } : undefined,
         deployment: { id: dep.deploymentId, name: dep.name, local: false, stale },
       });

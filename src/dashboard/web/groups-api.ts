@@ -1,5 +1,7 @@
 export interface GroupBot {
   larkAppId: string;
+  /** Bot open_id used to resolve readable worker and reviewer names. */
+  botOpenId?: string;
   botName?: string;
   botAvatarUrl?: string;
 }

@@ -122,6 +122,7 @@ export type ChatReplyMode = 'chat' | 'new-topic' | 'shared' | 'chat-topic';
 export type UsageDisplayMode = 'streaming' | 'footer' | 'off';
 /** Default when a bot sets nothing: usage rides the live streaming card. */
 export const DEFAULT_USAGE_DISPLAY: UsageDisplayMode = 'streaming';
+export type BotHandler = 'goal-panel';
 export type ContentTriggerScope = 'topic' | 'regularGroup' | 'both';
 export type ContentTriggerMatchType = 'keyword' | 'regex';
 export type ContentTriggerActionType = 'start-or-wake-session';
@@ -205,7 +206,6 @@ export interface ContentTriggerConfig {
     prompt: string;
   };
 }
-
 function normalizeChatReplyModeConfig(raw: unknown): ChatReplyMode | undefined {
   if (typeof raw !== 'string') return undefined;
   const v = raw.trim().toLowerCase();
@@ -1093,6 +1093,13 @@ export interface BotConfig {
    */
   apiOnly?: boolean;
   /**
+   * Optional runtime handler for non-CLI bot identities.
+   *   - goal-panel: sender-only relay for goal parent notifications/replies.
+   *     It owns Lark events but never spawns a CLI session and is hidden from
+   *     worker/collaboration candidate lists.
+   */
+  handler?: BotHandler;
+  /**
    * 租户品牌：`'feishu'`（中国版，open.feishu.cn）或 `'lark'`（国际版，
    * open.larksuite.com）。缺省 / 旧 bots.json 无此字段 → 视为 `'feishu'`
    * （见 {@link normalizeBrand}），向后兼容。决定 SDK Client / WSClient 的
@@ -1657,6 +1664,7 @@ export interface BotState {
 }
 
 const bots = new Map<string, BotState>();
+const transientBotClients = new Map<string, Lark.Client>();
 
 export function __testOnly_resetBotRegistry(): void {
   bots.clear();
@@ -1820,6 +1828,7 @@ export function registerBot(cfg: BotConfig): BotState {
       ? new Lark.Client({ ...clientParams, httpInstance: uploadHttpInstance as any })
       : client;
   }
+  transientBotClients.delete(cfg.larkAppId);
   const state: BotState = {
     config: cfg,
     client,
@@ -1936,11 +1945,48 @@ export function getBotOpenId(larkAppId: string): string | undefined {
  * 会话）→ 归一为 'feishu'。仅用于派生 applink 等 host，缺省 feishu 安全。
  */
 export function getBotBrand(larkAppId: string | undefined): Brand {
-  return normalizeBrand(larkAppId ? bots.get(larkAppId)?.config.brand : undefined);
+  return normalizeBrand(larkAppId ? getConfiguredBotConfig(larkAppId)?.brand : undefined);
 }
 
 export function getAllBots(): BotState[] {
   return Array.from(bots.values());
+}
+
+function configuredBotConfigs(): BotConfig[] {
+  const inMem = Array.from(bots.values()).map((bot) => bot.config);
+  try {
+    const fromDisk = loadBotConfigs();
+    const seen = new Set(inMem.map((cfg) => cfg.larkAppId));
+    for (const cfg of fromDisk) {
+      if (!seen.has(cfg.larkAppId)) inMem.push(cfg);
+    }
+  } catch {
+    // Some unit tests intentionally run without a bots.json. In-memory configs
+    // remain authoritative in that case.
+  }
+  return inMem;
+}
+
+export function getConfiguredBotConfig(larkAppId: string | undefined): BotConfig | undefined {
+  if (!larkAppId) return undefined;
+  return bots.get(larkAppId)?.config
+    ?? configuredBotConfigs().find((cfg) => cfg.larkAppId === larkAppId);
+}
+
+export function isGoalPanelConfig(cfg: Pick<BotConfig, 'handler'> | undefined): boolean {
+  return cfg?.handler === 'goal-panel';
+}
+
+export function isGoalPanelApp(larkAppId: string | undefined): boolean {
+  return isGoalPanelConfig(getConfiguredBotConfig(larkAppId));
+}
+
+export function getGoalPanelConfig(): BotConfig | undefined {
+  return configuredBotConfigs().find((cfg) => isGoalPanelConfig(cfg));
+}
+
+export function getGoalPanelBot(): BotState | undefined {
+  return Array.from(bots.values()).find((bot) => isGoalPanelConfig(bot.config));
 }
 
 /**
@@ -2686,6 +2732,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       // upload etc. already degrade gracefully on an empty secret.
       larkAppSecret: entry.larkAppSecret ?? '',
       apiOnly: entry.apiOnly === true || undefined,
+      handler: entry.handler === 'goal-panel' ? 'goal-panel' : undefined,
       // brand：只认精确的 'lark'，其余 → undefined（下游 normalizeBrand 当
       // feishu）。feishu 故意存成 undefined，保持旧 bots.json 干净、不写死字段。
       brand: entry.brand === 'lark' ? 'lark' : undefined,

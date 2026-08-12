@@ -148,6 +148,13 @@ let exactChatGrantHandler: typeof applyExactChatGrantRequest = applyExactChatGra
 export function setExactChatGrantHandler(handler: typeof applyExactChatGrantRequest | null): void {
   exactChatGrantHandler = handler ?? applyExactChatGrantRequest;
 }
+import { buildGoalBoard } from '../verified-delivery/goal-board.js';
+import {
+  buildGoalAttentionBoardWithContext,
+  buildLocalGoalAttentionLiveRisks,
+  withGoalAttentionLiveRisks,
+} from './goal-attention.js';
+
 // 机器人真·改名 renamer，由 daemon 启动时注册（开放平台自动化 + daemon 侧
 // botName/descriptor/bots-info 同步都在 daemon 的闭包里做）。未注册（测试环境）
 // 时 PUT /api/bot-rename 降级为仅改 displayName。
@@ -644,6 +651,14 @@ function routeHasNarrowUntrustedAuth(method: string, pathname: string): boolean 
   // the handler writes the authoritative tuple into a host-owned read-only
   // proof sidecar, so loopback response spoofing cannot confer authority.
   if (method === 'POST' && pathname === MANAGED_ORIGIN_ATTEST_ROUTE) return true;
+  // Goal commands are issued by the active L1/L2/worker CLI itself. Their
+  // handlers bind the request to that exact live session via the rotating
+  // origin capability before accepting any caller-selectable coordinates.
+  if (method === 'POST' && pathname === '/api/goal/supervise') return true;
+  if (method === 'POST' && pathname === '/api/goal/notify-parent') return true;
+  if (method === 'POST' && pathname === '/api/goal/watchdog') return true;
+  if (method === 'POST' && pathname === '/api/goal/release-check') return true;
+  if (method === 'POST' && pathname === '/api/goal/release-action') return true;
   // Workflow v3 mutations carry their own domain-separated full-envelope
   // protocol (request signature over method/path/exact body with nonce
   // anti-replay + boot audience, signed response), keyed on the same host
@@ -1057,6 +1072,27 @@ ipcRoute('POST', '/api/sessions/:sessionId/prune', async (_req, res, params) => 
     const r = await closeSession(params.sessionId);
     jsonRes(res, r.ok ? 200 : 502, r);
   });
+});
+
+// Close THIS daemon's chat-scope sessions bound to a goal chat. The goal-cleanup
+// card button fans this out to every online daemon, because each bot's workers
+// live in their own daemon process — a card-owner-local loop (the old behavior)
+// left cross-bot workers orphaned. Idempotent: re-running just closes nothing.
+ipcRoute('POST', '/api/goal/:goalChatId/cleanup-local', async (_req, res, params) => {
+  const goalChatId = params.goalChatId;
+  if (!goalChatId) return jsonRes(res, 400, { closed: 0, error: 'missing_goal_chat' });
+  const targets = listActiveSessions().filter(s => s.chatId === goalChatId && s.scope === 'chat');
+  let closed = 0;
+  for (const ds of targets) {
+    try {
+      await closeSession(ds.session.sessionId);
+      closed++;
+    } catch (err) {
+      logger.warn(`[goal-cleanup-local] close ${ds.session.sessionId} failed: ${err}`);
+    }
+  }
+  if (closed > 0) logger.info(`[goal-cleanup-local] closed ${closed} chat-scope sessions for goal=${goalChatId}`);
+  jsonRes(res, 200, { closed });
 });
 
 /** Post a scope-aware "restarting" notice into the session's Lark thread/chat,
@@ -2641,6 +2677,40 @@ ipcRoute('PATCH', '/api/schedules/:id', async (req, res, p) => {
 ipcRoute('DELETE', '/api/schedules/:id', (_req, res, p) => {
   jsonRes(res, 200, scheduler.removeTaskForDashboard(p.id));
 });
+ipcRoute('GET', '/api/goals', (_req, res) => {
+  jsonRes(res, 200, buildGoalBoard());
+});
+
+ipcRoute('GET', '/api/goals/attention', (req, res) => {
+  const url = new URL(req.url ?? '/api/goals/attention', 'http://127.0.0.1');
+  const chatId = url.searchParams.get('chatId')?.trim() || undefined;
+  const board = buildGoalAttentionBoardWithContext({ chatId });
+  const liveRisks = buildLocalGoalAttentionLiveRisks({
+    board,
+    activeSessions: getActiveSessionsRegistry(),
+    larkAppId: cachedLarkAppId,
+  });
+  jsonRes(res, 200, withGoalAttentionLiveRisks(board, liveRisks));
+});
+
+ipcRoute('GET', '/api/goals/attention/live', (req, res) => {
+  const url = new URL(req.url ?? '/api/goals/attention/live', 'http://127.0.0.1');
+  const chatId = url.searchParams.get('chatId')?.trim() || undefined;
+  const board = buildGoalAttentionBoardWithContext({ chatId });
+  const liveRisks = buildLocalGoalAttentionLiveRisks({
+    board,
+    activeSessions: getActiveSessionsRegistry(),
+    larkAppId: cachedLarkAppId,
+  });
+  jsonRes(res, 200, { systemRisk: liveRisks });
+});
+
+ipcRoute('POST', '/api/schedules/:id/run',    (_req, res, p) => jsonRes(res, 200, scheduler.runNow(p.id)));
+ipcRoute('POST', '/api/schedules/:id/pause',  (_req, res, p) => jsonRes(res, 200, scheduler.setEnabled(p.id, false)));
+ipcRoute('POST', '/api/schedules/:id/resume', (_req, res, p) => jsonRes(res, 200, scheduler.setEnabled(p.id, true)));
+// Toggle delivery mode between 'origin' (reply in original thread) and
+// 'new-topic' (open a brand-new topic + fresh session on every fire).
+ipcRoute('POST', '/api/schedules/:id/delivery', (_req, res, p) => jsonRes(res, 200, scheduler.toggleDelivery(p.id)));
 
 ipcRoute('POST', '/api/trigger', async (req, res) => {
   if (!cachedLarkAppId) return jsonRes(res, 503, { ok: false, errorCode: 'bot_not_found', error: 'larkAppId_not_set' });
@@ -2790,6 +2860,24 @@ ipcRoute('POST', '/api/grants/chat', async (req, res) => {
 
 // ─── Groups (Phase B) ──────────────────────────────────────────────────────
 
+function currentBotForGroups() {
+  if (!cachedLarkAppId) return null;
+  let bot: ReturnType<typeof getBot> | null = null;
+  try {
+    bot = getBot(cachedLarkAppId);
+  } catch {
+    // Tests and older daemon startup windows can have larkAppId before the
+    // registry entry is hydrated. Keep /api/groups best-effort.
+  }
+  return {
+    larkAppId: cachedLarkAppId,
+    botOpenId: getBotOpenId(cachedLarkAppId),
+    botName: getBotName() || bot?.botName || cachedLarkAppId,
+    cliId: bot?.config?.cliId,
+    defaultOncall: bot?.config?.defaultOncall,
+  };
+}
+
 ipcRoute('GET', '/api/groups', async (_req, res) => {
   if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
   try {
@@ -2811,7 +2899,8 @@ ipcRoute('GET', '/api/groups', async (_req, res) => {
         .map(b => b.name);
       return { ...c, oncallChat: oncall ?? null, firstSeenAt: seenMap.get(c.chatId) ?? null, hasRole, hasMessageListener, observedBotNames };
     });
-    jsonRes(res, 200, { chats: enriched });
+    const selfBot = currentBotForGroups();
+    jsonRes(res, 200, { chats: enriched, bots: selfBot ? [selfBot] : [] });
   } catch (e) {
     jsonRes(res, 502, { error: String(e) });
   }

@@ -4,6 +4,8 @@ import { join } from 'node:path';
 export interface DaemonInfo {
   larkAppId: string;
   botName: string;
+  /** Bot open_id from /bot/v3/info; used to resolve ou_ ids in dashboard read models. */
+  botOpenId?: string;
   /** CLI adapter id from bots.json, e.g. codex / claude-code / traex. */
   cliId?: string;
   /** Lark app avatar URL (from /bot/v3/info); absent until the open_id probe lands. */

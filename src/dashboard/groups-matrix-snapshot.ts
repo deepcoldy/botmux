@@ -7,7 +7,7 @@ export interface GroupMatrixChat {
 
 export interface GroupsMatrix {
   chats: GroupMatrixChat[];
-  bots: unknown[];
+  bots: Array<Record<string, unknown>>;
 }
 
 export interface GroupPresentation {

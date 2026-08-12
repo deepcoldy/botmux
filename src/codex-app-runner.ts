@@ -110,12 +110,12 @@ interface ActiveTurn {
   /** The authoritative terminal `turn/completed` payload, once observed for the
    * proven canonical id. */
   terminalCompletion?: JsonObject;
+  /** A non-canonical completion observed while a start/steer RPC barrier was
+   * still in flight. The foreign payload is never completion authority. */
+  deferredNonCanonicalCompletion?: { observedNativeTurnId?: string };
   /** The single in-flight steer RPC (at most one), and the id it targets. */
   steerInFlight?: { dispatch: Dispatch; expectedTurnId: string };
-  /** The canonical native `turn/completed` has been observed. Distinct from
-   * `completed` (which means the logical group has settled + done resolved): a
-   * completion seen while a steer RPC is still in flight is buffered here as a
-   * barrier and only settles the group after the steer response resolves. */
+  /** A native `turn/completed` relevant to this group has been observed. */
   completionSeen?: boolean;
 }
 
@@ -1057,6 +1057,9 @@ function handleNotification(msg: JsonObject, replayedAfterResponse = false): voi
       // one terminal turn that contains the full ordered group; fail closed
       // (identity error, no foreign text) on 0 / multiple / partial matches.
       if (turn.steerInFlight || turn.startResponsePending) {
+        turn.deferredNonCanonicalCompletion ??= {
+          ...(completedId ? { observedNativeTurnId: completedId } : {}),
+        };
         emitLifecycle({ kind: 'completion_race', appTurnId: completedId ?? '', category: 'steer_in_flight' });
         return;
       }
@@ -1559,6 +1562,26 @@ async function reconcileSteeredGroupFromHistory(
   await turn.reconciliation;
 }
 
+function resumeCompletionAfterRpcBarrier(turn: ActiveTurn): boolean {
+  if (activeTurn !== turn || turn.completed || !turn.completionSeen) return false;
+  if (turn.steerInFlight || turn.startResponsePending) return true;
+
+  if (turn.terminalCompletion) {
+    settleSteeredCompletion(turn, turn.terminalCompletion);
+    return true;
+  }
+
+  const deferred = turn.deferredNonCanonicalCompletion;
+  if (!deferred) return false;
+  const observedNativeTurnId = deferred.observedNativeTurnId;
+  if ((turn.accepted?.length ?? 0) > 1) {
+    void reconcileSteeredGroupFromHistory(turn, observedNativeTurnId);
+  } else {
+    void reconcileCompletedTurn(turn, observedNativeTurnId);
+  }
+  return true;
+}
+
 
 /**
  * Opportunistically admit the queue head as a pre-final `turn/steer` into the
@@ -1627,7 +1650,7 @@ async function tryAdmitSteer(): Promise<void> {
       // once this native turn completes the head starts its own turn.
       turn.steeringClosed = true;
       emitLifecycle({ kind: 'steer_rejected_fallback', appTurnId: expectedTurnId, category: 'definite_rejection' });
-      if (turn.completionSeen && turn.terminalCompletion) settleSteeredCompletion(turn, turn.terminalCompletion);
+      resumeCompletionAfterRpcBarrier(turn);
       return;
     }
     // Unknown outcome (transport/timeout/generic rpc/protocol): fence — never
@@ -1665,12 +1688,8 @@ async function tryAdmitSteer(): Promise<void> {
     appTurnId: expectedTurnId,
     ...(replyTurnId ? { replyTurnId } : {}),
   });
-  // A completion may have arrived while this steer was in flight (barrier): settle
-  // now that the group is final. Otherwise chain the next queued follow-up.
-  if (turn.completionSeen && turn.terminalCompletion) {
-    settleSteeredCompletion(turn, turn.terminalCompletion);
-    return;
-  }
+  // Resume a canonical or non-canonical completion after the steer barrier.
+  if (resumeCompletionAfterRpcBarrier(turn)) return;
   void tryAdmitSteer();
 }
 
@@ -1950,6 +1969,7 @@ async function runTurn(message: QueuedInput): Promise<void> {
   if (settleBufferedCanonical) {
     settleSteeredCompletion(turn, turn.terminalCompletion!);
   }
+  if (!turn.completed) resumeCompletionAfterRpcBarrier(turn);
   const pendingNotifications = turn.pendingNotifications.splice(0);
   for (const notification of pendingNotifications) {
     const notificationTurnId = notification.params?.turnId ?? notification.params?.turn?.id;
