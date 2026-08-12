@@ -6,7 +6,7 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import { getAncestorPids, resolveAdoptRoute, type AdoptRoute } from '../src/adapters/adopt-route.js';
+import { getAncestorPids, resolveAdoptRoute, resolveCliSessionRoute, type AdoptRoute } from '../src/adapters/adopt-route.js';
 
 // ── getAncestorPids ────────────────────────────────────────────────────────────
 
@@ -162,6 +162,60 @@ describe('resolveAdoptRoute', () => {
       getAncestors,
     });
     expect(result).toBeNull();
+  });
+
+  describe('resolveCliSessionRoute（托管 service 显式反查）', () => {
+    it('单个 daemon 命中 → 返回反查结果', async () => {
+      const result = await resolveCliSessionRoute({
+        cliSessionId: 'ses_abc',
+        listDaemons: () => [{ ipcPort: 1 }],
+        queryDaemon: async (port, id) => {
+          expect(port).toBe(1);
+          expect(id).toBe('ses_abc');
+          return MOCK_ROUTE;
+        },
+      });
+      expect(result).toEqual(MOCK_ROUTE);
+    });
+
+    it('并发查询全部 daemon，命中即返回', async () => {
+      const result = await resolveCliSessionRoute({
+        cliSessionId: 'ses_abc',
+        listDaemons: () => [{ ipcPort: 1 }, { ipcPort: 2 }],
+        queryDaemon: async (port) => (port === 2 ? MOCK_ROUTE : null),
+      });
+      expect(result).toEqual(MOCK_ROUTE);
+    });
+
+    it('全部未命中 → null', async () => {
+      const result = await resolveCliSessionRoute({
+        cliSessionId: 'ses_abc',
+        listDaemons: () => [{ ipcPort: 1 }, { ipcPort: 2 }],
+        queryDaemon: async () => null,
+      });
+      expect(result).toBeNull();
+    });
+
+    it('query 挂起 → budget 封顶返回 null（不被无响应 daemon 卡住）', async () => {
+      const t0 = Date.now();
+      const result = await resolveCliSessionRoute({
+        cliSessionId: 'ses_abc',
+        listDaemons: () => [{ ipcPort: 1 }],
+        queryDaemon: () => new Promise<AdoptRoute | null>(() => {}),
+        budgetMs: 60,
+      });
+      expect(result).toBeNull();
+      expect(Date.now() - t0).toBeLessThan(1000);
+    });
+
+    it('无在线 daemon → null', async () => {
+      const result = await resolveCliSessionRoute({
+        cliSessionId: 'ses_abc',
+        listDaemons: () => [] as Array<{ ipcPort: number }>,
+        queryDaemon: async () => MOCK_ROUTE,
+      });
+      expect(result).toBeNull();
+    });
   });
 
   it('无在线 daemon（listDaemons 返回空数组）→ 返回 null', async () => {

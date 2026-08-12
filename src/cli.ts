@@ -11547,6 +11547,9 @@ export async function runHook(
   postAskFn: (body: Record<string, unknown>) => Promise<import('./core/ask-types.js').AskResult>,
   cliId: string,
   resolveAdoptRouteFn?: () => Promise<import('./adapters/adopt-route.js').AdoptRoute | null>,
+  /** 按 OpenCode 原生会话 id（payload.session_id，ses_*）反查所属 botmux 会话；
+   *  缺省用真实实现（在线 daemon 并发查询 + budget 封顶）。测试注入 stub。 */
+  resolveCliSessionRouteFn?: (cliSessionId: string) => Promise<import('./adapters/adopt-route.js').AdoptRoute | null>,
 ): Promise<{ stdout: string }> {
   const { getHookAdapter } = await import('./core/ask-hook/registry.js');
 
@@ -11572,13 +11575,40 @@ export async function runHook(
   const chatId = env.BOTMUX_CHAT_ID;
   const larkAppId = env.BOTMUX_LARK_APP_ID;
 
-  // 路由变量：优先用 env，env 缺失时尝试 adopt 路由
+  // 路由变量：优先用 payload 携带的 OpenCode 原生会话 id 反查所属 botmux 会话；
+  // 未命中回落 env，env 缺失时再尝试 adopt 路由。
   let routeSessionId = sessionId;
   let routeChatId = chatId;
   let routeLarkAppId = larkAppId;
   let routeRoot: string | null = env.BOTMUX_ROOT_MESSAGE_ID || null;
+  let explicitRoute: import('./adapters/adopt-route.js').AdoptRoute | null = null;
 
-  if (!sessionId || !chatId || !larkAppId) {
+  // 托管 service 场景（opencode2）：ask 插件运行在所有客户端共用的 service 里，
+  // hook 子进程继承的是「启动该 service 的会话」的 ambient env，与当前会话无关，
+  // 直接拿来路由会跨会话错投。payload.session_id 是 OpenCode 原生 id（ses_*），
+  // 先按它在在线 daemon 的活跃会话里显式反查（cliSessionId 全局唯一）。
+  const rawPayload = payload as Record<string, unknown> | undefined;
+  const nativeSessionId = typeof rawPayload?.session_id === 'string'
+    ? rawPayload.session_id.trim()
+    : '';
+  if (/^ses_[0-9A-Za-z]+$/.test(nativeSessionId)) {
+    const { resolveCliSessionRoute, queryCliSession } = await import('./adapters/adopt-route.js');
+    const resolver = resolveCliSessionRouteFn ?? ((cliSessionId: string) =>
+      resolveCliSessionRoute({
+        cliSessionId,
+        listDaemons: listOnlineDaemons,
+        queryDaemon: queryCliSession,
+      }));
+    explicitRoute = await resolver(nativeSessionId);
+    if (explicitRoute) {
+      routeSessionId = explicitRoute.sessionId;
+      routeChatId = explicitRoute.chatId;
+      routeLarkAppId = explicitRoute.larkAppId;
+      routeRoot = explicitRoute.rootMessageId;
+    }
+  }
+
+  if (!explicitRoute && (!sessionId || !chatId || !larkAppId)) {
     // env 缺失 → 尝试通过祖先 PID 匹配在线 adopt 会话
     const resolver = resolveAdoptRouteFn ?? (() => {
       // 延迟 import 避免冷启动开销

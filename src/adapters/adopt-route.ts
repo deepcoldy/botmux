@@ -220,3 +220,85 @@ export async function resolveAdoptRoute(deps: {
   }
   return best;
 }
+
+// ── CLI 原生会话 id 反查（托管 service 场景）────────────────────────────────
+
+/**
+ * 查询某个 daemon 是否有该 CLI 原生会话 id（如 OpenCode 的 `ses_*`）的活跃
+ * 会话。GET http://127.0.0.1:<ipcPort>/api/session-by-cli/<cliSessionId>
+ * 200 → 解析 AdoptRoute；其它状态码或异常 → null（不抛）。超时 2s。
+ */
+export async function queryCliSession(
+  ipcPort: number,
+  cliSessionId: string,
+): Promise<AdoptRoute | null> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 2000);
+  try {
+    const res = await fetchDaemonIpc(
+      ipcPort,
+      `/api/session-by-cli/${encodeURIComponent(cliSessionId)}`,
+      { signal: controller.signal },
+    );
+    if (!res.ok) return null;
+    const body = (await res.json()) as unknown;
+    if (!body || typeof body !== 'object') return null;
+    const b = body as Record<string, unknown>;
+    if (
+      typeof b.sessionId !== 'string' ||
+      typeof b.chatId !== 'string' ||
+      typeof b.larkAppId !== 'string' ||
+      typeof b.rootMessageId !== 'string'
+    ) {
+      return null;
+    }
+    return {
+      sessionId: b.sessionId,
+      chatId: b.chatId,
+      larkAppId: b.larkAppId,
+      rootMessageId: b.rootMessageId,
+    };
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * 并发反查全部在线 daemon，按 cliSessionId 找所属 botmux 会话。
+ *
+ * 托管 service 场景（opencode2 的 ask 插件运行在所有客户端共用的 service 里）：
+ * hook 子进程继承的是「启动该 service 的会话」的 ambient env，与当前会话无关，
+ * 不能拿来路由 —— 必须用 payload 携带的 native sessionID 显式反查，否则跨会话
+ * 错投。cliSessionId（OpenCode 原生 id）全局唯一，最多命中一个 daemon。
+ *
+ * @param deps.cliSessionId   OpenCode 原生会话 id（payload.session_id）
+ * @param deps.listDaemons    列出在线 daemon（ipcPort）
+ * @param deps.queryDaemon    查询某 daemon 是否有该 cliSessionId 的活跃会话
+ * @param deps.budgetMs       整体耗时上限（默认 1500ms；可注入便于测试）
+ */
+export async function resolveCliSessionRoute(deps: {
+  cliSessionId: string;
+  listDaemons: () => Array<{ ipcPort: number }>;
+  queryDaemon: (ipcPort: number, cliSessionId: string) => Promise<AdoptRoute | null>;
+  budgetMs?: number;
+}): Promise<AdoptRoute | null> {
+  const { cliSessionId, listDaemons, queryDaemon } = deps;
+  const budgetMs = deps.budgetMs ?? 1500;
+  const daemons = listDaemons();
+  if (daemons.length === 0) return null;
+
+  let winner: AdoptRoute | null = null;
+  const queries = daemons.map(async (daemon) => {
+    if (winner) return;
+    const route = await queryDaemon(daemon.ipcPort, cliSessionId);
+    if (route && !winner) winner = route;
+  });
+  const budget = new Promise<void>((resolve) => {
+    const t = setTimeout(resolve, budgetMs);
+    t.unref?.();
+  });
+  await Promise.race([Promise.allSettled(queries), budget]);
+  return winner;
+}

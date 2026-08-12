@@ -153,6 +153,101 @@ describe('runHook', () => {
     });
   });
 
+  describe('(d) OpenCode 原生会话 id 显式反查（托管 service 场景，P1 回归）', () => {
+    const openCodeAskPayload = {
+      hook_event_name: 'question.asked',
+      question_id: 'que_1',
+      session_id: 'ses_abc123',
+      tool_input: { questions: [{ question: '继续？', options: [{ label: '继续' }, { label: '取消' }] }] },
+    };
+    const EXPLICIT_ROUTE = {
+      sessionId: 'sess_real_target',
+      chatId: 'oc_real_chat',
+      larkAppId: 'cli_real_app',
+      rootMessageId: 'oc_real_root',
+    };
+    // env 指向首个启动 service 的会话（错投目标），必须被显式反查覆盖。
+    const STALE_ENV = {
+      ...FULL_ENV,
+      BOTMUX_SESSION_ID: 'sess_first_service_owner',
+      BOTMUX_CHAT_ID: 'oc_wrong_chat',
+      BOTMUX_LARK_APP_ID: 'cli_wrong_app',
+    };
+
+    it('反查命中 → 按反查结果路由（覆盖 ambient env，防跨会话错投）', async () => {
+      let posted: Record<string, unknown> | undefined;
+      const stub = async (body: Record<string, unknown>): Promise<AskResult> => {
+        posted = body;
+        return { kind: 'answered', answers: [['继续']], by: 'ou_u', comment: null, timedOut: false };
+      };
+      const result = await runHook(
+        openCodeAskPayload, STALE_ENV, stub, 'opencode',
+        async () => null,                       // adopt 兜底不应被触达
+        async (cliSessionId) => {
+          expect(cliSessionId).toBe('ses_abc123');
+          return EXPLICIT_ROUTE;
+        },
+      );
+      expect(result.stdout).toBeTruthy();
+      expect(posted?.sessionId).toBe('sess_real_target');
+      expect(posted?.chatId).toBe('oc_real_chat');
+      expect(posted?.larkAppId).toBe('cli_real_app');
+      expect(posted?.rootMessageId).toBe('oc_real_root');
+    });
+
+    it('反查未命中 → 回落 ambient env 路由（旧行为不退化）', async () => {
+      let posted: Record<string, unknown> | undefined;
+      const stub = async (body: Record<string, unknown>): Promise<AskResult> => {
+        posted = body;
+        return { kind: 'answered', answers: [['继续']], by: 'ou_u', comment: null, timedOut: false };
+      };
+      const result = await runHook(
+        openCodeAskPayload, STALE_ENV, stub, 'opencode',
+        async () => null,
+        async () => null,                       // 反查未命中
+      );
+      expect(result.stdout).toBeTruthy();
+      expect(posted?.sessionId).toBe('sess_first_service_owner');
+      expect(posted?.chatId).toBe('oc_wrong_chat');
+    });
+
+    it('session_id 非 ses_* 形状 → 不走反查（其它 CLI payload 不误路由）', async () => {
+      let posted: Record<string, unknown> | undefined;
+      let resolved = 0;
+      const stub = async (body: Record<string, unknown>): Promise<AskResult> => {
+        posted = body;
+        return { kind: 'answered', answers: [['继续']], by: 'ou_u', comment: null, timedOut: false };
+      };
+      const payload = { ...openCodeAskPayload, session_id: 'some-other-format' };
+      const result = await runHook(
+        payload, FULL_ENV, stub, 'opencode',
+        async () => null,
+        async () => { resolved++; return EXPLICIT_ROUTE; },
+      );
+      expect(result.stdout).toBeTruthy();
+      expect(resolved).toBe(0);
+      expect(posted?.sessionId).toBe('sess_test_1');
+    });
+
+    it('反查命中后 adopt 兜底分支不被触达（env 即使缺失也直接路由）', async () => {
+      let posted: Record<string, unknown> | undefined;
+      let adoptCalls = 0;
+      const stub = async (body: Record<string, unknown>): Promise<AskResult> => {
+        posted = body;
+        return { kind: 'answered', answers: [['继续']], by: 'ou_u', comment: null, timedOut: false };
+      };
+      const env = { BOTMUX_ASK_TIMEOUT_MS: '5000' }; // 全缺 env（托管 service 真实场景）
+      const result = await runHook(
+        openCodeAskPayload, env, stub, 'opencode',
+        async () => { adoptCalls++; return null; },
+        async () => EXPLICIT_ROUTE,
+      );
+      expect(result.stdout).toBeTruthy();
+      expect(adoptCalls).toBe(0);
+      expect(posted?.sessionId).toBe('sess_real_target');
+    });
+  });
+
   describe('env 缺失 → passthrough 放行', () => {
     // 注：runHook 第 5 参数是可选的 resolveAdoptRouteFn。
     // 这里传 null-returning stub，确保测试不依赖真实 daemon 环境，

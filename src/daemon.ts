@@ -5880,6 +5880,31 @@ ipcRoute('GET', '/api/adopt-session/:pid', (_req, res, params) => {
   return jsonRes(res, 404, { ok: false, error: 'no_adopt_session' });
 });
 
+// GET /api/session-by-cli/:cliSessionId — 按 CLI 原生会话 id（如 OpenCode 的
+// ses_*，worker 经 cli_session_id 上报并持久化）反查活跃 botmux 会话路由。
+// 托管 service 场景（opencode2 的 ask 插件运行在所有客户端共用的 service 里）：
+// hook 子进程继承的是启动该 service 时固化的 ambient env，与当前会话无关；必须
+// 用 payload 携带的 native sessionID 显式反查，否则跨会话错投（多 bot/多会话
+// 会放行或错投到首个启动 service 的会话）。cliSessionId 全局唯一，无 PID 复用
+// 残留风险。
+ipcRoute('GET', '/api/session-by-cli/:cliSessionId', (_req, res, params) => {
+  const cliSessionId = params.cliSessionId;
+  if (!cliSessionId || cliSessionId.length > 512) {
+    return jsonRes(res, 400, { ok: false, error: 'bad_cli_session_id' });
+  }
+  for (const ds of activeSessions.values()) {
+    if (ds.session.cliSessionId === cliSessionId) {
+      return jsonRes(res, 200, {
+        sessionId: ds.session.sessionId,
+        chatId: ds.chatId,
+        larkAppId: ds.larkAppId,
+        rootMessageId: sessionAnchorId(ds),
+      });
+    }
+  }
+  return jsonRes(res, 404, { ok: false, error: 'no_session' });
+});
+
 for (const path of ['/api/vc-meetings/members/register', '/api/vc-meetings/members/update']) {
   ipcRoute('POST', path, async (req, res) => {
     if (!guardVcMeetingDaemonControlRoute(req, res)) return;
