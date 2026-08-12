@@ -227,3 +227,73 @@ describe('resolveRemoteExecutionProven — launcher env voids the proof on all b
     expect(resolveRemoteExecutionProven(ds({ mojoIdentity: { cloud: true } }))).toBe(false);
   });
 });
+
+/**
+ * The RESTART timeline, which the static merge above does not cover.
+ *
+ * `ds.initConfig` is written only at spawn/refork, but a live-worker `/restart`
+ * (operator, working-dir change, cli_crash auto-restart) ships
+ * `latestPerBotEnvForRestart(ds)` — i.e. live `getBot().config.env` — and the
+ * worker overwrites its own copy before respawning. So the child can be running
+ * an env the daemon's snapshot has never seen.
+ *
+ * The classifier is recomputed on every device-isolation snapshot rather than
+ * cached at init, so it must consult BOTH layers: whichever one is dangerous, the
+ * credential boundary has to close.
+ */
+describe('resolveRemoteExecutionProven — live-worker restart timeline', () => {
+  beforeEach(() => { liveBotConfig = {}; });
+
+  it('a LIVE env preload voids the proof even though the snapshot is clean', () => {
+    // The reported P1: start clean, add LD_PRELOAD to bots.json, /restart. The
+    // respawned child carries it; the daemon snapshot still says `env:{}`.
+    liveBotConfig = { env: { LD_PRELOAD: '/tmp/hook.so' } };
+    expect(resolveRemoteExecutionProven(ds({
+      backendConfig: { cloud: true },
+      initEnv: {},
+    }))).toBe(false);
+  });
+
+  it('a LIVE PATH override alone voids it', () => {
+    liveBotConfig = { env: { PATH: '/tmp/fake-mojo' } };
+    expect(resolveRemoteExecutionProven(ds({
+      backendConfig: { cloud: true },
+      initEnv: {},
+    }))).toBe(false);
+  });
+
+  it('a STALE dangerous snapshot still voids it before any restart lands', () => {
+    // Opposite direction: bots.json was cleaned up but no restart has happened,
+    // so the running child is still hooked. Trusting live-only would flip this to
+    // provable while the hooked client holds the credential.
+    liveBotConfig = { env: {} };
+    expect(resolveRemoteExecutionProven(ds({
+      backendConfig: { cloud: true },
+      initEnv: { LD_PRELOAD: '/tmp/hook.so' },
+    }))).toBe(false);
+  });
+
+  it('stays provable when BOTH the snapshot and the live config are clean', () => {
+    // Guards the union from collapsing into a proof nothing can satisfy.
+    liveBotConfig = { env: {} };
+    expect(resolveRemoteExecutionProven(ds({
+      backendConfig: { cloud: true },
+      initEnv: {},
+    }))).toBe(true);
+    liveBotConfig = { env: { X_JWT_TOKEN: 'a.b.c' } };
+    expect(resolveRemoteExecutionProven(ds({
+      backendConfig: { cloud: true },
+      initEnv: { X_JWT_TOKEN: 'a.b.c' },
+    }))).toBe(true);
+  });
+
+  it('fails closed when the bot is deregistered mid-session', () => {
+    // No live launcher env to prove anything with; the stale snapshot alone is not
+    // evidence about what the next restart will execute.
+    liveBotConfig = undefined;
+    expect(resolveRemoteExecutionProven(ds({
+      backendConfig: { cloud: true },
+      initEnv: {},
+    }))).toBe(false);
+  });
+});

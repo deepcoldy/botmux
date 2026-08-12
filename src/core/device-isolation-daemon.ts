@@ -202,9 +202,48 @@ export function resolveRemoteExecutionProven(ds: DaemonSession): boolean {
     { cloud?: boolean; localDaemon?: boolean; jwtEnv?: string; env?: Record<string, string> }
     | undefined;
   if (fromInit) {
+    // The top-level per-bot env must be read LIVE, not from initConfig.
+    //
+    // `ds.initConfig` is only assigned at spawn/refork, but a live-worker
+    // `/restart` (operator, working-dir change, or cli_crash auto-restart) sends
+    // `{type:'restart', env: latestPerBotEnvForRestart(ds)}` — which reads
+    // getBot().config.env — and the worker overwrites its own lastInitConfig.env
+    // before respawning. So after a restart the CHILD runs with the live env while
+    // `ds.initConfig.env` still holds the stale spawn-time snapshot. Reading the
+    // snapshot here reopened exactly the hole this proof exists to close: start
+    // clean, add `env:{LD_PRELOAD}` to bots.json, `/restart`, and the session was
+    // still classified safe_remote while a hooked mojo client held the credential.
+    //
+    // The mojo-block env keeps coming from the frozen `fromInit`, and that is not
+    // an oversight: it has no hot-update channel (MOJO_LIVE_PATCH_KEYS is `jwt`
+    // only, and restart overwrites just the top-level env), so the frozen value IS
+    // what the next turn executes.
+    //
+    // The two top-level layers are UNIONED rather than live-replacing the snapshot,
+    // because the daemon cannot tell whether a restart has already happened:
+    //   - stale clean + live dangerous  → a restart WOULD arm the hook
+    //   - stale dangerous + live clean  → the child is STILL running the old env
+    //     until a restart lands
+    // Only a union is fail-closed for both. mojoUnprovableEnvKeys inspects key
+    // names only, so merging the objects is exactly a key union. The cost is being
+    // conservative for a session that already restarted away from a dangerous env,
+    // which is an availability nit, not a credential leak.
+    let liveTopLevelEnv: Record<string, string>;
+    try {
+      liveTopLevelEnv = getBot(ds.larkAppId).config.env ?? {};
+    } catch {
+      // Bot deregistered — no live launcher env to prove anything with. Fail
+      // closed rather than trust the stale snapshot alone (same rule as the
+      // workerless branch below).
+      return false;
+    }
     return isMojoFullyRemote({
       ...fromInit,
-      env: { ...(ds.initConfig?.env ?? {}), ...(fromInit.env ?? {}) },
+      env: {
+        ...liveTopLevelEnv,
+        ...(ds.initConfig?.env ?? {}),
+        ...(fromInit.env ?? {}),
+      },
       wrapperCli,
     });
   }
