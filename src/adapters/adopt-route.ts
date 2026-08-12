@@ -240,8 +240,9 @@ export type CliSessionLookup =
 /**
  * 查询某个 daemon 是否有该 CLI 原生会话 id（如 OpenCode 的 `ses_*`）的活跃
  * 会话。GET http://127.0.0.1:<ipcPort>/api/session-by-cli/<cliSessionId>
- * 200 → hit；409（本 daemon 内重复绑定）→ conflict；404 → miss；
- * 其它状态码 / 网络异常 → unknown（不抛）。超时 2s。
+ * 200 → hit；409（本 daemon 内重复绑定）→ conflict；404 → miss（明确无匹配）；
+ * 其它状态（401/403/5xx 等）与无效 body → unknown（协议/查询结果未知，
+ * 上层必须视为「无法证明唯一」fail closed）。超时 2s。
  */
 export async function queryCliSession(
   ipcPort: number,
@@ -256,9 +257,12 @@ export async function queryCliSession(
       { signal: controller.signal },
     );
     if (res.status === 409) return { kind: 'conflict' };
-    if (!res.ok) return { kind: 'miss' };
+    // 只有明确 404 才是「确定无匹配」；401/403/5xx 等非 2xx 不是否定答案
+    // ——另一 daemon 可能命中，必须按 unknown 让聚合器 fail closed。
+    if (res.status === 404) return { kind: 'miss' };
+    if (!res.ok) return { kind: 'unknown' };
     const body = (await res.json()) as unknown;
-    if (!body || typeof body !== 'object') return { kind: 'miss' };
+    if (!body || typeof body !== 'object') return { kind: 'unknown' };
     const b = body as Record<string, unknown>;
     if (
       typeof b.sessionId !== 'string' ||
@@ -266,7 +270,8 @@ export async function queryCliSession(
       typeof b.larkAppId !== 'string' ||
       typeof b.rootMessageId !== 'string'
     ) {
-      return { kind: 'miss' };
+      // 畸形 200 body：协议未知，不能当作否定答案
+      return { kind: 'unknown' };
     }
     return {
       kind: 'hit',

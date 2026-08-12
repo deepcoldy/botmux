@@ -253,22 +253,33 @@ describe('runHook', () => {
       expect(result.stdout).toBe('');
     });
 
-    it('session_id 非 ses_* 形状 → 不走反查（opencode2 其它事件不误路由）', async () => {
-      let posted: Record<string, unknown> | undefined;
+    it('opencode2 session_id 非 ses_* 形状 → fail closed passthrough（不落 env 路由）', async () => {
+      // 共享 service 的 ambient env 永远不可信：无法验证 native identity 时
+      // 直接 passthrough，绝不把问题投到首个启动 service 的 botmux 会话。
+      const postAsk = vi.fn(makeAnsweredStub([['继续']]));
       let resolved = 0;
-      const stub = async (body: Record<string, unknown>): Promise<AskResult> => {
-        posted = body;
-        return { kind: 'answered', answers: [['继续']], by: 'ou_u', comment: null, timedOut: false };
-      };
       const payload = { ...openCodeAskPayload, session_id: 'some-other-format' };
       const result = await runHook(
-        payload, FULL_ENV, stub, 'opencode2',
+        payload, FULL_ENV, postAsk, 'opencode2',
         async () => null,
         async () => { resolved++; return EXPLICIT_ROUTE; },
       );
-      expect(result.stdout).toBeTruthy();
       expect(resolved).toBe(0);
-      expect(posted?.sessionId).toBe('sess_test_1');
+      expect(postAsk).not.toHaveBeenCalled();
+      expect(result.stdout).toBe('');
+    });
+
+    it('opencode2 session_id 缺失 → fail closed passthrough（不落 env 路由）', async () => {
+      const postAsk = vi.fn(makeAnsweredStub([['继续']]));
+      const payload = { ...openCodeAskPayload };
+      delete (payload as Record<string, unknown>).session_id;
+      const result = await runHook(
+        payload, STALE_ENV, postAsk, 'opencode2',
+        async () => null,
+        async () => EXPLICIT_ROUTE,
+      );
+      expect(postAsk).not.toHaveBeenCalled();
+      expect(result.stdout).toBe('');
     });
 
     it('反查命中后 adopt 兜底分支不被触达（env 即使缺失也直接路由）', async () => {

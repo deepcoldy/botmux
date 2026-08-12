@@ -208,10 +208,16 @@ describe('resolveAdoptRoute', () => {
       expect(result).toEqual({ kind: 'conflict' });
     });
 
-    it('404 无匹配 → miss', async () => {
+    it('404 明确无匹配 → miss', async () => {
       fetchDaemonIpcMock.mockResolvedValue({ ok: false, status: 404 });
       const result = await queryCliSession(1234, 'ses_abc');
       expect(result).toEqual({ kind: 'miss' });
+    });
+
+    it('非 2xx 其它状态（401/403/5xx）→ unknown（不是否定答案，必须 fail closed）', async () => {
+      fetchDaemonIpcMock.mockResolvedValue({ ok: false, status: 500 });
+      const result = await queryCliSession(1234, 'ses_abc');
+      expect(result).toEqual({ kind: 'unknown' });
     });
 
     it('网络异常（连接拒绝/超时）→ unknown（结果未知，上层 fail closed）', async () => {
@@ -220,10 +226,11 @@ describe('resolveAdoptRoute', () => {
       expect(result).toEqual({ kind: 'unknown' });
     });
 
-    it('200 但 body 形状不完整 → miss', async () => {
+    it('200 但 body 形状不完整/为空 → unknown（畸形响应，不能当作否定答案）', async () => {
       fetchDaemonIpcMock.mockResolvedValue({ ok: true, status: 200, json: async () => ({ sessionId: 'x' }) });
-      const result = await queryCliSession(1234, 'ses_abc');
-      expect(result).toEqual({ kind: 'miss' });
+      expect(await queryCliSession(1234, 'ses_abc')).toEqual({ kind: 'unknown' });
+      fetchDaemonIpcMock.mockResolvedValue({ ok: true, status: 200, json: async () => null });
+      expect(await queryCliSession(1234, 'ses_abc')).toEqual({ kind: 'unknown' });
     });
   });
 

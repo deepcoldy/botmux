@@ -11587,17 +11587,19 @@ export async function runHook(
   // 共享 service 场景（opencode2）：ask 插件运行在所有客户端共用的托管 service 里，
   // hook 子进程继承的是「启动该 service 的会话」的 ambient env，与当前会话无关，
   // 直接拿来路由会跨会话错投。payload.session_id 是 OpenCode 原生 id（ses_*），
-  // 先按它在在线 daemon 的活跃会话里显式反查（cliSessionId 全局唯一）。
   // 整段反查只对共享 service hook 启用：进程私有 hook（opencode 等）的 ambient
   // env 是当前进程的可信归属，让反查覆盖反而可能被另一重复绑定的命中错投。
-  // 反查未命中/歧义时 env/PID 兜底只适用于进程私有 hook；共享 service 的 env
-  // 属于其它会话，回落即错投 → 对 opencode2 必须 fail closed。
+  // 共享 service 的 env 永远不可信：session_id 缺失或非 ses_* 形状时无法验证
+  // native identity，同样 fail closed（passthrough），绝不落 env 路由。
   const isSharedServiceHook = cliId === 'opencode2';
   const rawPayload = payload as Record<string, unknown> | undefined;
   const nativeSessionId = typeof rawPayload?.session_id === 'string'
     ? rawPayload.session_id.trim()
     : '';
-  if (isSharedServiceHook && /^ses_[0-9A-Za-z]+$/.test(nativeSessionId)) {
+  if (isSharedServiceHook && !/^ses_[0-9A-Za-z]+$/.test(nativeSessionId)) {
+    return { stdout: adapter.passthrough(payload) };
+  }
+  if (isSharedServiceHook) {
     const { resolveCliSessionRoute, queryCliSession } = await import('./adapters/adopt-route.js');
     const resolver = resolveCliSessionRouteFn ?? ((cliSessionId: string) =>
       resolveCliSessionRoute({
