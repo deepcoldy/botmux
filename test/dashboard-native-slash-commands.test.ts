@@ -12,6 +12,14 @@ const command = {
   status: 'missing',
 };
 
+const remoteExtra = {
+  command: 'external',
+  description: { default_value: '飞书后台已有命令' },
+  source: 'remote',
+  status: 'remote-extra',
+  commandId: 'id-external',
+};
+
 function response(body: unknown, ok = true, status = 200) {
   return { ok, status, json: async () => body } as Response;
 }
@@ -64,6 +72,63 @@ describe('Dashboard native Lark slash commands', () => {
     expect(fetchMock).toHaveBeenCalledWith('/api/bots/cli_test/slash-commands/sync', expect.objectContaining({ method: 'POST' }));
     expect(root.findByProps({ 'data-slash-status': 'synced' })).toBeTruthy();
     expect(JSON.stringify(renderer.toJSON())).toContain('同步完成：新增 1，更新 0');
+  });
+
+  it('lets the user sync one candidate and delete remote commands independently', async () => {
+    const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
+      if (url.endsWith('/sync-one')) {
+        expect(JSON.parse(String(init?.body))).toEqual({ command: 'help' });
+        return response({
+          ok: true,
+          commands: [{ ...command, status: 'synced', commandId: 'id-help' }, remoteExtra],
+          summary: { total: 1, synced: 1, missing: 0, outdated: 0, remoteExtra: 1 },
+          report: { created: 1, updated: 0, deleted: 0, failed: 0 },
+        });
+      }
+      if (url.endsWith('/delete')) {
+        expect(JSON.parse(String(init?.body))).toEqual({ command: 'external' });
+        return response({
+          ok: true,
+          commands: [{ ...command, status: 'synced', commandId: 'id-help' }],
+          summary: { total: 1, synced: 1, missing: 0, outdated: 0, remoteExtra: 0 },
+          report: { created: 0, updated: 0, deleted: 1, failed: 0 },
+        });
+      }
+      return response({
+        ok: true,
+        commands: [command, remoteExtra],
+        summary: { total: 1, synced: 0, missing: 1, outdated: 0, remoteExtra: 1 },
+      });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    vi.stubGlobal('confirm', vi.fn(() => true));
+
+    let renderer!: TestRenderer.ReactTestRenderer;
+    await act(async () => {
+      renderer = TestRenderer.create(React.createElement(NativeSlashCommandRegistration, {
+        bot: { larkAppId: 'cli_test', cliId: 'codex' },
+      }));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    const root = renderer.root;
+    expect(root.findByProps({ 'data-slash-status': 'remote-extra' })).toBeTruthy();
+
+    await act(async () => {
+      root.findByProps({ 'data-action': 'sync-native-slash-command', 'data-command': 'help' }).props.onClick();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(fetchMock).toHaveBeenCalledWith('/api/bots/cli_test/slash-commands/sync-one', expect.objectContaining({ method: 'POST' }));
+
+    await act(async () => {
+      root.findByProps({ 'data-action': 'delete-native-slash-command', 'data-command': 'external' }).props.onClick();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(fetchMock).toHaveBeenCalledWith('/api/bots/cli_test/slash-commands/delete', expect.objectContaining({ method: 'POST' }));
+    expect(root.findAllByProps({ 'data-slash-status': 'remote-extra' })).toHaveLength(0);
   });
 
   it('keeps the catalog visible and shows scope deep links when inspection is denied', async () => {

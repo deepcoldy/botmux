@@ -87,7 +87,7 @@
 
 权限同 `/help`，不占用会话槽位。
 
-Dashboard 的「Bot 默认设置 → 安全 → Slash 命令」还会展示一份应用级的飞书原生命令清单：它合并 botmux 命令、当前 CLI adapter 明确声明的默认命令与该 Bot 的 `customPassthroughCommands`，并标出每一项在飞书后台是已同步、待新增还是待更新。固定透传白名单不会注册，因为不同 CLI 对同名命令的支持和语义可能不同。点击「同步到飞书」后，botmux 通过 `application:app_slash_command:read` / `application:app_slash_command:write` 新增缺失命令并更新说明；不会删除应用后台已有的其它命令。该能力处于灰度，用户侧需飞书 7.70+ PC 端及 FG 白名单。
+Dashboard 的「Bot 默认设置 → 安全 → Slash 命令」还会展示一份应用级的飞书原生命令清单：它把 botmux 命令、固定透传白名单、当前 CLI adapter 明确声明的默认命令与该 Bot 的 `customPassthroughCommands` 作为候选项，并标出每一项在飞书后台是已同步、待新增还是待更新。因为不同 CLI 对透传命令的支持和语义可能不同，是否注册由用户通过每行的「同步」按钮决定；飞书后台额外存在的命令也会显示在清单中，可由用户逐条删除。「全部同步到飞书」仍是显式批量操作，只新增缺失命令并更新说明，不会隐式删除。上述操作通过 `application:app_slash_command:read` / `application:app_slash_command:write` 完成。该能力处于灰度，用户侧需飞书 7.70+ PC 端及 FG 白名单。
 
 飞书客户端的原生 `/` 面板可能需要约 5 分钟刷新。按工作目录发现的 `.claude` 命令、skill、插件和 MCP prompt 不是应用级稳定能力，因此仍只在 `/slash` 卡片里展示，不会注册到飞书后台。
 

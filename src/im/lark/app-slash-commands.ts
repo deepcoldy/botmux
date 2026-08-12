@@ -1,6 +1,7 @@
 import { createCliAdapterSync } from '../../adapters/cli/registry.js';
 import type { CliId } from '../../adapters/cli/types.js';
 import { formatLarkError, getBotClient } from '../../bot-registry.js';
+import { PASSTHROUGH_COMMANDS } from '../../core/passthrough-commands.js';
 
 export const APP_SLASH_COMMAND_READ_SCOPE = 'application:app_slash_command:read';
 export const APP_SLASH_COMMAND_WRITE_SCOPE = 'application:app_slash_command:write';
@@ -17,7 +18,7 @@ export interface AppSlashCommandDescription {
   i18n?: Record<string, string>;
 }
 
-export type AppSlashCommandSource = 'botmux' | 'adapter' | 'custom';
+export type AppSlashCommandSource = 'botmux' | 'passthrough' | 'adapter' | 'custom' | 'remote';
 
 export interface AppSlashCommandSpec {
   /** Command name without the leading slash, as required by the Lark API. */
@@ -32,7 +33,7 @@ export interface RemoteAppSlashCommand {
   description?: Partial<AppSlashCommandDescription>;
 }
 
-export type AppSlashCommandSyncStatus = 'synced' | 'missing' | 'outdated' | 'unknown';
+export type AppSlashCommandSyncStatus = 'synced' | 'missing' | 'outdated' | 'unknown' | 'remote-extra';
 
 export interface AppSlashCommandView extends AppSlashCommandSpec {
   status: AppSlashCommandSyncStatus;
@@ -58,7 +59,7 @@ export interface AppSlashCommandPlan {
 }
 
 export interface AppSlashCommandApplyOutcome {
-  action: 'create' | 'update';
+  action: 'create' | 'update' | 'delete';
   command: string;
   ok: boolean;
   code?: number;
@@ -69,6 +70,7 @@ export interface AppSlashCommandApplyReport {
   outcomes: AppSlashCommandApplyOutcome[];
   created: number;
   updated: number;
+  deleted: number;
   failed: number;
 }
 
@@ -85,7 +87,7 @@ interface LarkApiEnvelope {
 }
 
 export type AppSlashCommandRequester = (payload: {
-  method: 'GET' | 'POST' | 'PATCH';
+  method: 'GET' | 'POST' | 'PATCH' | 'DELETE';
   url: string;
   data?: unknown;
 }) => Promise<unknown>;
@@ -175,7 +177,7 @@ const PASSTHROUGH_DESCRIPTIONS: Record<string, { zh: string; en: string }> = {
 
 function dynamicCommandSpec(
   rawCommand: string,
-  source: Exclude<AppSlashCommandSource, 'botmux'>,
+  source: Exclude<AppSlashCommandSource, 'botmux' | 'remote'>,
   cliName: string,
 ): AppSlashCommandSpec | null {
   const command = rawCommand.replace(/^\/+/, '').trim().toLowerCase();
@@ -205,6 +207,15 @@ export function buildAppSlashCommandCatalog(
 ): AppSlashCommandSpec[] {
   const cliName = options.cliDisplayName?.trim() || options.cliId?.trim() || 'CLI';
   const candidates: AppSlashCommandSpec[] = [...BOTMUX_APP_SLASH_COMMANDS];
+
+  // The global allowlist is an application-level candidate set, not a claim
+  // that every configured CLI supports every entry. Dashboard users decide
+  // which candidates to register on Lark, one command at a time or explicitly
+  // with the bulk action.
+  for (const command of PASSTHROUGH_COMMANDS) {
+    const spec = dynamicCommandSpec(command, 'passthrough', cliName);
+    if (spec) candidates.push(spec);
+  }
 
   if (options.cliId) {
     try {
@@ -277,7 +288,7 @@ function snapshotFromPlan(
   const remoteByName = new Map(existing.map(command => [command.command, command]));
   const missing = new Set(plan.toCreate.map(command => command.command));
   const outdated = new Set(plan.toUpdate.map(({ spec }) => spec.command));
-  const commands: AppSlashCommandView[] = catalog.map(spec => {
+  const catalogCommands: AppSlashCommandView[] = catalog.map(spec => {
     const remote = remoteByName.get(spec.command);
     return {
       ...spec,
@@ -285,10 +296,20 @@ function snapshotFromPlan(
       ...(remote?.command_id ? { commandId: remote.command_id } : {}),
     };
   });
+  const remoteCommands: AppSlashCommandView[] = plan.remoteExtra.map(remote => ({
+    command: remote.command,
+    source: 'remote',
+    description: {
+      default_value: remote.description?.default_value?.trim() || '飞书后台已有命令',
+      ...(remote.description?.i18n ? { i18n: remote.description.i18n } : {}),
+    },
+    status: 'remote-extra',
+    commandId: remote.command_id,
+  }));
   return {
-    commands,
+    commands: [...catalogCommands, ...remoteCommands],
     summary: {
-      total: commands.length,
+      total: catalogCommands.length,
       synced: plan.unchanged.length,
       missing: plan.toCreate.length,
       outdated: plan.toUpdate.length,
@@ -372,13 +393,24 @@ export async function inspectAppSlashCommands(
 
 const ALREADY_EXISTS = /already\s+exists|duplicate|重复|已存在/i;
 
-export async function syncAppSlashCommands(
+function reportFromOutcomes(outcomes: AppSlashCommandApplyOutcome[]): AppSlashCommandApplyReport {
+  return {
+    outcomes,
+    created: outcomes.filter(outcome => outcome.action === 'create' && outcome.ok).length,
+    updated: outcomes.filter(outcome => outcome.action === 'update' && outcome.ok).length,
+    deleted: outcomes.filter(outcome => outcome.action === 'delete' && outcome.ok).length,
+    failed: outcomes.filter(outcome => !outcome.ok).length,
+  };
+}
+
+async function syncSelectedAppSlashCommands(
   larkAppId: string,
-  catalog: readonly AppSlashCommandSpec[],
+  selected: readonly AppSlashCommandSpec[],
+  snapshotCatalog: readonly AppSlashCommandSpec[],
   requester: AppSlashCommandRequester = requesterFor(larkAppId),
 ): Promise<AppSlashCommandSyncResult> {
   const existing = await listRemoteAppSlashCommands(larkAppId, requester);
-  const plan = diffAppSlashCommands(catalog, existing);
+  const plan = diffAppSlashCommands(selected, existing);
   const outcomes: AppSlashCommandApplyOutcome[] = [];
   let remoteIndex: Map<string, string> | null = null;
 
@@ -440,14 +472,63 @@ export async function syncAppSlashCommands(
     });
   }
 
-  const report: AppSlashCommandApplyReport = {
-    outcomes,
-    created: outcomes.filter(outcome => outcome.action === 'create' && outcome.ok).length,
-    updated: outcomes.filter(outcome => outcome.action === 'update' && outcome.ok).length,
-    failed: outcomes.filter(outcome => !outcome.ok).length,
-  };
-  const snapshot = await inspectAppSlashCommands(larkAppId, catalog, requester);
+  const report = reportFromOutcomes(outcomes);
+  const snapshot = await inspectAppSlashCommands(larkAppId, snapshotCatalog, requester);
   return { report, snapshot };
+}
+
+export async function syncAppSlashCommands(
+  larkAppId: string,
+  catalog: readonly AppSlashCommandSpec[],
+  requester: AppSlashCommandRequester = requesterFor(larkAppId),
+): Promise<AppSlashCommandSyncResult> {
+  return syncSelectedAppSlashCommands(larkAppId, catalog, catalog, requester);
+}
+
+function normalizedSelection(command: string): string | null {
+  const normalized = command.trim().replace(/^\/+/, '').toLowerCase();
+  return /^[a-z0-9][a-z0-9_-]*$/.test(normalized) ? normalized : null;
+}
+
+export async function syncAppSlashCommand(
+  larkAppId: string,
+  catalog: readonly AppSlashCommandSpec[],
+  command: string,
+  requester: AppSlashCommandRequester = requesterFor(larkAppId),
+): Promise<AppSlashCommandSyncResult> {
+  const normalized = normalizedSelection(command);
+  const spec = normalized ? catalog.find(candidate => candidate.command === normalized) : undefined;
+  if (!spec) throw new Error('slash_command_not_in_catalog');
+  return syncSelectedAppSlashCommands(larkAppId, [spec], catalog, requester);
+}
+
+export async function deleteAppSlashCommand(
+  larkAppId: string,
+  catalog: readonly AppSlashCommandSpec[],
+  command: string,
+  requester: AppSlashCommandRequester = requesterFor(larkAppId),
+): Promise<AppSlashCommandSyncResult> {
+  const normalized = normalizedSelection(command);
+  if (!normalized) throw new Error('invalid_slash_command');
+  const existing = await listRemoteAppSlashCommands(larkAppId, requester);
+  const remote = existing.find(candidate => candidate.command === normalized);
+  const outcomes: AppSlashCommandApplyOutcome[] = [];
+  if (remote) {
+    const envelope = await call(requester, {
+      method: 'DELETE',
+      url: `${APP_SLASH_COMMANDS_PATH}/${encodeURIComponent(remote.command_id)}`,
+    });
+    outcomes.push({
+      action: 'delete',
+      command: normalized,
+      ok: envelope.code === 0,
+      ...(envelope.code !== 0 ? { code: envelope.code, message: envelope.msg } : {}),
+    });
+  }
+  return {
+    report: reportFromOutcomes(outcomes),
+    snapshot: await inspectAppSlashCommands(larkAppId, catalog, requester),
+  };
 }
 
 export function appSlashCommandErrorMessage(error: unknown): string {

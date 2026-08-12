@@ -88,7 +88,9 @@ import {
   APP_SLASH_COMMAND_WRITE_SCOPE,
   appSlashCommandErrorMessage,
   buildAppSlashCommandCatalog,
+  deleteAppSlashCommand,
   inspectAppSlashCommands,
+  syncAppSlashCommand,
   syncAppSlashCommands,
   unknownAppSlashCommandSnapshot,
 } from '../im/lark/app-slash-commands.js';
@@ -3423,8 +3425,8 @@ ipcRoute('POST', '/api/role-profiles/:profileId/apply', async (req, res, p) => {
 // ─── Native Lark slash-command catalog (dashboard) ─────────────────────────
 // Read and write through this daemon's registered Lark client so every bot is
 // bound to its own app credentials and apiOnly keeps the shared transport gate.
-// Sync is intentionally additive: create missing commands and update drifted
-// descriptions, but never delete app-owned commands that are outside botmux.
+// Bulk sync is intentionally additive. Explicit per-row deletion is handled by
+// a separate route so remote state is only removed after a user action.
 ipcRoute('GET', '/api/bot-slash-commands', async (_req, res) => {
   if (!cachedLarkAppId) return jsonRes(res, 503, { ok: false, error: 'larkAppId_not_set' });
   const catalog = currentAppSlashCommandCatalog();
@@ -3453,6 +3455,72 @@ ipcRoute('POST', '/api/bot-slash-commands/sync', async (_req, res) => {
       report: result.report,
       ...(ok ? {} : {
         error: 'slash_command_sync_partial_failure',
+        permissionUrls: appSlashCommandPermissionUrls(),
+      }),
+    });
+  } catch (error) {
+    return jsonRes(res, 502, {
+      ok: false,
+      error: appSlashCommandErrorMessage(error),
+      ...unknownAppSlashCommandSnapshot(catalog),
+      permissionUrls: appSlashCommandPermissionUrls(),
+    });
+  }
+});
+
+ipcRoute('POST', '/api/bot-slash-commands/sync-one', async (req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { ok: false, error: 'larkAppId_not_set' });
+  let body: { command?: unknown };
+  try { body = await readJsonBody(req); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  if (typeof body.command !== 'string') {
+    return jsonRes(res, 400, { ok: false, error: 'slash_command_required' });
+  }
+  const requestedCommand = body.command;
+  const catalog = currentAppSlashCommandCatalog();
+  if (!catalog.some(command => command.command === requestedCommand.trim().replace(/^\/+/, '').toLowerCase())) {
+    return jsonRes(res, 400, { ok: false, error: 'slash_command_not_in_catalog' });
+  }
+  try {
+    const result = await syncAppSlashCommand(cachedLarkAppId, catalog, requestedCommand);
+    const ok = result.report.failed === 0;
+    return jsonRes(res, 200, {
+      ok,
+      ...result.snapshot,
+      report: result.report,
+      ...(ok ? {} : {
+        error: 'slash_command_sync_failed',
+        permissionUrls: appSlashCommandPermissionUrls(),
+      }),
+    });
+  } catch (error) {
+    return jsonRes(res, 502, {
+      ok: false,
+      error: appSlashCommandErrorMessage(error),
+      ...unknownAppSlashCommandSnapshot(catalog),
+      permissionUrls: appSlashCommandPermissionUrls(),
+    });
+  }
+});
+
+ipcRoute('POST', '/api/bot-slash-commands/delete', async (req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { ok: false, error: 'larkAppId_not_set' });
+  let body: { command?: unknown };
+  try { body = await readJsonBody(req); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  if (typeof body.command !== 'string' || !/^\/?[a-z0-9][a-z0-9_-]*$/i.test(body.command.trim())) {
+    return jsonRes(res, 400, { ok: false, error: 'invalid_slash_command' });
+  }
+  const catalog = currentAppSlashCommandCatalog();
+  try {
+    const result = await deleteAppSlashCommand(cachedLarkAppId, catalog, body.command);
+    const ok = result.report.failed === 0;
+    return jsonRes(res, 200, {
+      ok,
+      ...result.snapshot,
+      report: result.report,
+      ...(ok ? {} : {
+        error: 'slash_command_delete_failed',
         permissionUrls: appSlashCommandPermissionUrls(),
       }),
     });

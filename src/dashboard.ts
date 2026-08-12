@@ -4866,6 +4866,22 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    if (req.method === 'POST' && (mBotSlash = url.pathname.match(/^\/api\/bots\/([^/]+)\/slash-commands\/(sync-one|delete)$/))) {
+      const appId = decodeURIComponent(mBotSlash[1]);
+      const action = mBotSlash[2];
+      const chunks: Buffer[] = [];
+      for await (const c of req) chunks.push(c as Buffer);
+      const raw = Buffer.concat(chunks).toString('utf8') || '{}';
+      const upstream = await proxyToDaemon(appId, `/api/bot-slash-commands/${action}`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: raw,
+      });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+
     let mBotDef: RegExpMatchArray | null;
     if (req.method === 'PUT' && (mBotDef = url.pathname.match(/^\/api\/bots\/([^/]+)\/default-oncall$/))) {
       const appId = decodeURIComponent(mBotDef[1]);

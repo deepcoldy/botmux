@@ -6768,7 +6768,7 @@ dialog.onboarding-dialog::backdrop {
 }
 .bot-defaults-page .bd-native-slash-row {
   display: grid;
-  grid-template-columns: minmax(150px, .85fr) minmax(250px, 2fr) minmax(74px, auto);
+  grid-template-columns: minmax(120px, .8fr) minmax(180px, 1.5fr) minmax(70px, auto) minmax(96px, auto);
   gap: 12px;
   align-items: center;
   min-width: 560px;
@@ -6812,6 +6812,17 @@ dialog.onboarding-dialog::backdrop {
 .bot-defaults-page .bd-native-slash-state.synced { color: var(--success); }
 .bot-defaults-page .bd-native-slash-state.missing,
 .bot-defaults-page .bd-native-slash-state.outdated { color: var(--warning, #9a6700); }
+.bot-defaults-page .bd-native-slash-state.remote-extra { color: var(--danger, #d1242f); }
+.bot-defaults-page .bd-native-slash-row-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 6px;
+}
+.bot-defaults-page .bd-native-slash-row-actions button {
+  min-height: 28px;
+  padding: 3px 9px;
+  font-size: 11px;
+}
 
 @media (max-width: 980px) {
   .app-shell {
