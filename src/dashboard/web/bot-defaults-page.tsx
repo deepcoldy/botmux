@@ -1355,7 +1355,7 @@ export function BotAgentSection(props: {
   const [cliKey, setCliKey] = useState(initialKey);
   const [cliSelectionTouched, setCliSelectionTouched] = useState(false);
   const [model, setModel] = useState(typeof bot.model === 'string' ? bot.model : '');
-  const [reasoningEffort, setReasoningEffort] = useState(bot.reasoningEffort ?? 'medium');
+  const [reasoningEffort, setReasoningEffort] = useState(bot.reasoningEffort ?? '');
   const [runtimeDraft, setRuntimeDraft] = useState<RuntimeDraft>(() => runtimeDraftFromBot(bot));
   const [runtimeTouched, setRuntimeTouched] = useState(false);
   const [runtimeStatus, setRuntimeStatus] = useState<StatusMessage>(null);
@@ -1369,7 +1369,7 @@ export function BotAgentSection(props: {
     setCliKey(agentSelectionKey(bot, props.sessionFallback));
     setCliSelectionTouched(false);
     setModel(typeof bot.model === 'string' ? bot.model : '');
-    setReasoningEffort(bot.reasoningEffort ?? 'medium');
+    setReasoningEffort(bot.reasoningEffort ?? '');
     setRuntimeDraft(runtimeDraftFromBot(bot));
     setRuntimeTouched(false);
     setSkillValue(skillInjectionResolved(bot));
@@ -1468,7 +1468,7 @@ export function BotAgentSection(props: {
       const body = {
         cliId: cliKey,
         model,
-        reasoningEffort: (cliKey === 'codex' || cliKey.endsWith('-codex')) ? reasoningEffort : '',
+        reasoningEffort: (cliKey === 'codex' || cliKey === 'codex-app' || cliKey.endsWith('-codex')) ? reasoningEffort : '',
         ...(runtimeTouched ? { cliRuntime } : {}),
       };
       const res = await sendJson('PUT', `/api/bots/${encodeURIComponent(bot.larkAppId)}/agent`, body);
@@ -1577,7 +1577,7 @@ export function BotAgentSection(props: {
 
   const siSupport = bot.skillInjectionSupport === 'dynamic' ? 'dynamic' : bot.skillInjectionSupport === 'global' ? 'global' : 'none';
   const isRiff = cliKey === 'riff';
-  const isCodexSelection = cliKey === 'codex' || cliKey.endsWith('-codex');
+  const isCodexSelection = cliKey === 'codex' || cliKey === 'codex-app' || cliKey.endsWith('-codex');
   // Old dashboard payloads can omit agentSelectionKey while still carrying a
   // legacy wrapperCli. Keep the custom-runtime editor hidden until the user
   // explicitly selects bare Codex; structured runtimes and wrappers cannot mix.
@@ -1776,11 +1776,16 @@ export function BotAgentSection(props: {
               ariaLabel={tr('botDefaults.agentReasoningEffort')}
               value={reasoningEffort}
               disabled={agentBusy}
-              options={['low', 'medium', 'high', 'xhigh'].map(value => ({
-                value,
-                label: value === 'medium' ? tr('botDefaults.agentReasoningEffortMedium') : value,
-              }))}
-              onChange={next => setReasoningEffort(next as 'low' | 'medium' | 'high' | 'xhigh')}
+              options={[
+                { value: '', label: tr('botDefaults.agentReasoningEffortDefault') },
+                { value: 'low', label: tr('botDefaults.agentReasoningEffortLow') },
+                { value: 'medium', label: tr('botDefaults.agentReasoningEffortMedium') },
+                { value: 'high', label: tr('botDefaults.agentReasoningEffortHigh') },
+                { value: 'xhigh', label: tr('botDefaults.agentReasoningEffortXhigh') },
+                { value: 'max', label: tr('botDefaults.agentReasoningEffortMax') },
+                { value: 'ultra', label: tr('botDefaults.agentReasoningEffortUltra') },
+              ]}
+              onChange={next => setReasoningEffort(next as 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra')}
             />
           </div>
         </div>

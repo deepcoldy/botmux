@@ -239,8 +239,9 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
       }
       if (reasoningEffort) {
         // Per-turn reasoning effort → codex model_reasoning_effort（进程级 -c 覆盖，
-        // 不动用户全局 config）。Codex 0.145 实测接受 low/medium/high/xhigh（xhigh
-        // 原样回显），故原样透传，不做降级——收敛会静默改变用户请求的档位。
+        // 不动用户全局 config）。Codex 0.146.1 实测接受
+        // low/medium/high/xhigh/max/ultra，故原样透传，不做降级——收敛会静默改变
+        // 用户请求的档位。
         baseArgs.push('-c', `model_reasoning_effort=${JSON.stringify(reasoningEffort)}`);
       }
       // Codex app-server can keep its own cwd at $HOME; -C pins fresh agent roots.

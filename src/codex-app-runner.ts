@@ -1308,8 +1308,8 @@ async function ensureThread(startupDeadlineAtMs?: number): Promise<string> {
     config: {
       shell_environment_policy: { inherit: 'all' },
       // Per-turn reasoning effort → codex config key (ThreadStartParams accepts an
-      // arbitrary config map). Codex 0.145 accepts low/medium/high/xhigh and echoes
-      // xhigh back verbatim, so pass it through unchanged (no downgrade).
+      // arbitrary config map). Codex 0.146.1 accepts
+      // low/medium/high/xhigh/max/ultra, so pass it through unchanged (no downgrade).
       ...(args.reasoningEffort ? { model_reasoning_effort: args.reasoningEffort } : {}),
     },
     // Per-turn model override → ThreadStartParams top-level model. Only set on a

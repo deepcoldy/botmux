@@ -3448,7 +3448,7 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
   let cliPathOverride: string | null = null;
   let wrapperCli: string | null = null;
   let model: string | null = null;
-  let reasoningEffort: 'low' | 'medium' | 'high' | 'xhigh' | null = null;
+  let reasoningEffort: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra' | null = null;
   let agentSelectionKey = '';
   try {
     const cfg = getBot(cachedLarkAppId).config;
@@ -3897,6 +3897,8 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
     || body.reasoningEffort === 'medium'
     || body.reasoningEffort === 'high'
     || body.reasoningEffort === 'xhigh'
+    || body.reasoningEffort === 'max'
+    || body.reasoningEffort === 'ultra'
     ? body.reasoningEffort
     : null;
   if (body.reasoningEffort !== undefined && body.reasoningEffort !== '' && reasoningEffort === null) {
@@ -3995,6 +3997,7 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
     // read-isolation toggle validates at enable time; changing the agent afterwards
     // is the other way a bot could end up configured-but-unenforceable.)
     let readIsolationCleared = false;
+    const supportsReasoningEffort = selected.cliId === 'codex' || selected.cliId === 'codex-app';
     const r = await rmwBotEntry(larkAppId, (entry) => {
     entry.cliId = selected.cliId;
     if (selected.wrapperCli) entry.wrapperCli = selected.wrapperCli;
@@ -4013,7 +4016,7 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
     }
     if (model) entry.model = model;
     else delete entry.model;
-    if (selected.cliId !== 'codex') delete entry.reasoningEffort;
+    if (!supportsReasoningEffort) delete entry.reasoningEffort;
     else if (reasoningEffortFieldPresent) {
       if (reasoningEffort) entry.reasoningEffort = reasoningEffort;
       else delete entry.reasoningEffort;
@@ -4043,7 +4046,7 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
     if (selected.wrapperCli) bot.config.wrapperCli = selected.wrapperCli;
     else bot.config.wrapperCli = undefined;
     bot.config.model = model || undefined;
-    if (selected.cliId !== 'codex') bot.config.reasoningEffort = undefined;
+    if (!supportsReasoningEffort) bot.config.reasoningEffort = undefined;
     else if (reasoningEffortFieldPresent) bot.config.reasoningEffort = reasoningEffort ?? undefined;
     if (readIsolationCleared) bot.config.readIsolation = false;
     if (selected.cliId === 'riff') {
@@ -4064,7 +4067,7 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
       cliPathOverride: nextRuntime ? null : nextLegacyPath ?? null,
       wrapperCli: selected.wrapperCli ?? null,
       model: model || null,
-      reasoningEffort: selected.cliId === 'codex' ? bot.config.reasoningEffort ?? null : null,
+      reasoningEffort: supportsReasoningEffort ? bot.config.reasoningEffort ?? null : null,
       selectionKey,
       closedMismatchedSessions,
       // Report the (possibly auto-cleared) read-isolation state + whether the new

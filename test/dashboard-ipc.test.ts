@@ -2888,7 +2888,7 @@ describe('PUT /api/bot-agent', () => {
       const res = await fetch(`http://127.0.0.1:${handle.port}/api/bot-agent`, {
         method: 'PUT',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ cliId: 'ttadk-x-codex', model: 'kimi-k2.5', reasoningEffort: 'xhigh' }),
+        body: JSON.stringify({ cliId: 'ttadk-x-codex', model: 'kimi-k2.5', reasoningEffort: 'ultra' }),
       });
 
       expect(res.status).toBe(200);
@@ -2897,7 +2897,7 @@ describe('PUT /api/bot-agent', () => {
         cliId: 'codex',
         wrapperCli: 'ttadk codex',
         model: 'kimi-k2.5',
-        reasoningEffort: 'xhigh',
+        reasoningEffort: 'ultra',
         selectionKey: 'ttadk-x-codex',
       });
       const stored = JSON.parse(readFileSync(configPath, 'utf-8'))[0];
@@ -2905,7 +2905,7 @@ describe('PUT /api/bot-agent', () => {
         cliId: 'codex',
         wrapperCli: 'ttadk codex',
         model: 'kimi-k2.5',
-        reasoningEffort: 'xhigh',
+        reasoningEffort: 'ultra',
       });
     } finally {
       if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;

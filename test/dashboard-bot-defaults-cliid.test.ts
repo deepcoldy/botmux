@@ -140,7 +140,7 @@ describe('Codex-compatible runtime editor', () => {
   it('defaults old payloads to Official Codex and keeps wrapper or non-Codex selections unchanged', () => {
     const official = renderAgent({ cliId: 'codex' });
     expect(official.root.findByProps({ 'data-input': 'agentRuntimeMode' }).props.value).toBe('official');
-    expect(official.root.findByProps({ dataInput: 'agentReasoningEffort' }).props.value).toBe('medium');
+    expect(official.root.findByProps({ dataInput: 'agentReasoningEffort' }).props.value).toBe('');
     expect(official.root.findAllByProps({ 'data-input': 'agentRuntimeId' })).toHaveLength(0);
 
     const otherCli = renderAgent({ cliId: 'traex', agentSelectionKey: 'traex' });
@@ -173,13 +173,13 @@ describe('Codex-compatible runtime editor', () => {
       const { root } = renderAgent({ cliId: 'codex', reasoningEffort: 'high' });
       const picker = root.findByProps({ dataInput: 'agentReasoningEffort' });
       expect(picker.props.value).toBe('high');
-      act(() => picker.props.onChange('xhigh'));
+      act(() => picker.props.onChange('ultra'));
       await act(async () => {
         root.findByProps({ 'data-action': 'save-agent' }).props.onClick();
         await Promise.resolve();
         await Promise.resolve();
       });
-      expect(requests).toEqual([{ cliId: 'codex', model: '', reasoningEffort: 'xhigh' }]);
+      expect(requests).toEqual([{ cliId: 'codex', model: '', reasoningEffort: 'ultra' }]);
     } finally {
       (globalThis as any).fetch = previousFetch;
     }
@@ -227,7 +227,7 @@ describe('Codex-compatible runtime editor', () => {
         await Promise.resolve();
       });
 
-      expect(requests).toEqual([{ cliId: 'codex', model: 'new-model', reasoningEffort: 'medium' }]);
+      expect(requests).toEqual([{ cliId: 'codex', model: 'new-model', reasoningEffort: '' }]);
       expect(patchBot).toHaveBeenCalledWith('cli_runtime', expect.objectContaining({
         cliRuntime: null,
         cliPathOverride: legacyPath,
@@ -270,7 +270,7 @@ describe('Codex-compatible runtime editor', () => {
         await Promise.resolve();
       });
 
-      expect(requests).toEqual([{ cliId: 'codex', model: '', reasoningEffort: 'medium', cliRuntime: null }]);
+      expect(requests).toEqual([{ cliId: 'codex', model: '', reasoningEffort: '', cliRuntime: null }]);
       expect(root.findByProps({ 'data-agent-status': '' }).children.join('')).toContain('2');
     } finally {
       (globalThis as any).fetch = previousFetch;
@@ -317,7 +317,7 @@ describe('Codex-compatible runtime editor', () => {
         await Promise.resolve();
       });
 
-      expect(requests).toEqual([{ cliId: 'codex', model: '', reasoningEffort: 'medium', cliRuntime: savedRuntime }]);
+      expect(requests).toEqual([{ cliId: 'codex', model: '', reasoningEffort: '', cliRuntime: savedRuntime }]);
     } finally {
       (globalThis as any).fetch = previousFetch;
     }
@@ -372,7 +372,7 @@ describe('Codex-compatible runtime editor', () => {
         await Promise.resolve();
         await Promise.resolve();
       });
-      expect(requests).toEqual([{ cliId: 'codex', model: 'gpt-next', reasoningEffort: 'medium' }]);
+      expect(requests).toEqual([{ cliId: 'codex', model: 'gpt-next', reasoningEffort: '' }]);
     } finally {
       (globalThis as any).fetch = previousFetch;
     }
@@ -421,7 +421,7 @@ describe('Codex-compatible runtime editor', () => {
 
       expect(requests).toEqual([{
         url: '/api/bots/cli_runtime/agent',
-        body: { cliId: 'codex', model: '', reasoningEffort: 'medium', cliRuntime: savedRuntime },
+        body: { cliId: 'codex', model: '', reasoningEffort: '', cliRuntime: savedRuntime },
       }]);
       expect(patchBot).toHaveBeenCalledWith('cli_runtime', expect.objectContaining({ cliRuntime: savedRuntime }));
       const probeText = root.findByProps({ 'data-runtime-status': '' }).children.join('');
@@ -460,7 +460,7 @@ describe('Codex-compatible runtime editor', () => {
         await Promise.resolve();
         await Promise.resolve();
       });
-      expect(requests[requests.length - 1]).toEqual({ cliId: 'codex', model: '', reasoningEffort: 'medium', cliRuntime: null });
+      expect(requests[requests.length - 1]).toEqual({ cliId: 'codex', model: '', reasoningEffort: '', cliRuntime: null });
     } finally {
       (globalThis as any).fetch = previousFetch;
     }

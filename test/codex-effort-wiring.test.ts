@@ -33,7 +33,7 @@ describe('codex adapter buildArgs — reasoningEffort injection', () => {
   });
 
   it('passes each effort level through unchanged', () => {
-    for (const e of ['low', 'medium', 'high', 'xhigh'] as const) {
+    for (const e of ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'] as const) {
       const args = createCodexAdapter('/usr/bin/codex').buildArgs({ ...BASE, reasoningEffort: e });
       expect(args.join(' ')).toContain(`model_reasoning_effort="${e}"`);
     }
@@ -60,6 +60,14 @@ describe('codex-app adapter buildArgs — runner flags', () => {
     expect(args[ei + 1]).toBe('xhigh');
   });
 
+  it('passes each effort level to the runner unchanged', () => {
+    for (const e of ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'] as const) {
+      const args = createCodexAppAdapter('/usr/bin/codex').buildArgs({ ...BASE, reasoningEffort: e });
+      const i = args.indexOf('--reasoning-effort');
+      expect(args[i + 1]).toBe(e);
+    }
+  });
+
   it('omits both flags when neither is given', () => {
     const args = createCodexAppAdapter('/usr/bin/codex').buildArgs({ ...BASE });
     expect(args).not.toContain('--model');
@@ -81,5 +89,12 @@ describe('worker → CodexRpcEngine effort wiring (source lock)', () => {
     const body = source.slice(ctor, end);
     expect(body).toContain('model: cfg.model');
     expect(body).toContain('reasoningEffort: cfg.reasoningEffort');
+  });
+
+  it('freezes the per-Bot default onto a newly created session', () => {
+    const source = readFileSync(new URL('../src/core/worker-pool.ts', import.meta.url), 'utf8');
+    expect(source).toContain(
+      'ds.session.reasoningEffort = ds.session.reasoningEffort ?? botCfg.reasoningEffort;',
+    );
   });
 });
