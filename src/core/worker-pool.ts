@@ -2853,12 +2853,20 @@ export function suspendWorker(ds: DaemonSession, reason = 'suspended_idle'): boo
  * this whole feature exists to protect.
  *
  * `ownsGeneration` is the calling handler's generation check (`ownsWorkerSession`)
- * and is REQUIRED for correctness, not a nicety: `screenshot_uploaded` writes
- * `lastScreenStatus` with no ownership check of its own, so a stale `idle` from a
- * replaced worker can land on a session that has since re-forked. Without this
- * check the microtask would then suspend the *replacement* worker — mid-reply —
- * which is the exact truncation bug this feature removes. A stale checkpoint
- * keeps the flag pending; only the owning generation may consume it.
+ * and is REQUIRED for correctness, not a nicety — but NOT for the reason an
+ * earlier draft of this comment gave. It is not about a stale worker's message
+ * reaching `screenshot_uploaded`: the message handler's fence
+ * (`if (ds.worker !== worker) return`) sits BEFORE the switch and already drops
+ * every message from a replaced worker.
+ *
+ * The real window is the deferral itself. Callers hand this to `queueMicrotask`
+ * (they must — see above), so the fence is checked when the MESSAGE arrives while
+ * the suspend runs one microtask later. Two messages can clear the fence in the
+ * same tick; the first one's microtask suspends and the session re-forks, and the
+ * second one's microtask then runs against a brand-new worker. Without this check
+ * it would suspend that replacement — mid-reply — which is the exact truncation
+ * bug this feature removes. A checkpoint from a generation that no longer owns
+ * the session keeps the flag pending; only the owning generation may consume it.
  *
  * Deliberately the generation check ALONE, not `ownsLifecycleMutation` (which
  * also folds in "not transferring"): a routing transfer is a temporary refusal,

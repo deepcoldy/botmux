@@ -33,7 +33,7 @@
 
 **目标**
 
-- 挂起请求不再切断正在产出的回复
+- 挂起请求不再切断**正在产出中**的回合 —— 等它产完再挂
 - 不漏掉任何会话 —— 语义从"立即挂起"变成"最终挂起"
 - 调用方能看到有多少被排队
 
@@ -43,6 +43,44 @@
 - 不改 `suspend` 之外的挂起路径（`idle-worker-sweeper` / `host_overload_sweep`
   本来就有 busy 守卫，无需改动）
 - 不引入新的配置项或环境变量
+- **不保证「一条回复都不丢」** —— 见下方「交付边界仍是 best-effort」
+
+### ⚠️ 交付边界仍是 best-effort（已知残留窗口）
+
+本设计解决的是「**回合还在产出时被一刀切断**」。它**没有**建立
+「回复交付完成 → 才撤销 worker ownership」这个 happens-before，因此
+idle 与交付的交界处仍有一个窗口会丢回复：
+
+1. worker 在 idle 路径先 drain bridge、依次 `process.send(final_output)`，再发 idle `screen_update`；
+2. daemon 收到 `final_output` 后**并不立即投递** —— `deliverFinalOutput()` 把真正的
+   `sessionReply` 放进 `setTimeout(...)`，同步返回；
+3. daemon 随后收到 idle，排一个 `queueMicrotask` 兑现挂起；
+4. **微任务先于 timer 执行**（JS 事件循环规范）：挂起先跑，同一同步栈里 `ds.worker = null`；
+5. `setTimeout` 的投递这才运行，首行 `isStillOwned()` 已为假 → 放弃投递，
+   日志留下 `Bridge final_output abandoned — worker/session ownership changed`。
+
+即使 worker→daemon 的 IPC 是 FIFO（`final_output` 先于 idle 到达），只要两者落在
+**同一轮事件循环**批量到达，这个顺序就是确定的，不是概率窗口。另外若本轮
+transcript terminal 在 idle 时尚未落盘，`stopBridgeWatcher()` 的 `clearPending()`
+会让答案同样消失。
+
+几点必须说清楚：
+
+- **这不是本设计引入的**。`idle-worker-sweeper` / `host_overload_sweep` 同样按
+  `lastScreenStatus === 'idle'` 挂起，窗口一直存在，只是它们跑在定时器上、有几秒
+  余量遮着。
+- **但本设计放大了它**：排队兑现把挂起时机从「定时器几秒后」拉到了「idle 的那一刻」，
+  正好贴着窗口边界。
+- **影响面**：只涉及靠 bridge 兜底投递的回合（模型自己调了 `botmux send` 的回合，
+  消息在挂起前早已发出，不受影响）。某台生产机器上这个比例约 4.3%
+  （`Bridge fallback suppressed` 3935 次 vs `kind=bridge` 175 次），
+  且该机器至今 `final_output abandoned` **0 次** —— 属于「理论真实、尚未观测」。
+
+彻底解法是做两阶段 barrier：先进 retiring（保留 ownership、禁止 refork）→ worker
+drain 并 ACK → daemon 等此前 `final_output` 的**实际投递完成** → 再 commit suspend、
+清 `ds.worker`；配一条把 `final_output + idle` 同批送入、断言 `sessionReply` 完成
+先于 ownership 撤销的行为测试。**这属于 ownership 生命周期的改动，比本设计大一个
+量级，留作后续单独的改动**，不在本设计范围内。
 
 ## 3. 机制
 
@@ -105,6 +143,12 @@
    *  （见 worker-pool.ts runPendingSuspendIfSettled）。仅存内存：daemon 重启即丢，
    *  下一个 `suspend all` 周期会重新排队，代价只是延后一个周期。 */
   pendingSuspendReason?: string;
+  /** 排队时那一代 worker 的 generation。claim 只针对「当时正在产出的那一代」，
+   *  绝不能活过它：该 generation 一旦被挂起（任何路径）或退出，目标态即达成、
+   *  claim 就地消费。否则兑现 checkpoint 没跑到的场景（worker 崩溃、或 `/cd` /
+   *  读隔离切换先挂起）会让标志活到下一代，在它第一次 idle 时把它平白挂掉。
+   *  见 worker-pool.ts clearPendingSuspendClaim。 */
+  pendingSuspendGeneration?: number;
 ```
 
 ### 5.2 `src/core/worker-pool.ts`
@@ -140,13 +184,17 @@ function runPendingSuspendIfSettled(ds: DaemonSession, ownsGeneration?: () => bo
 
 三个细节都是正确性要求，不是讲究：
 
-**`ownsGeneration` 必须传，否则会挂掉替换上来的新 worker。** `screenshot_uploaded`
-这个 case **没有** `ownsLifecycleMutation()` 守卫（`screen_update` 第一行就有），
-它今天就无门槛地写 `ds.lastScreenStatus`。把「写状态」升级成「杀 worker」之后：
-旧 worker 被 refork 替换 → 它退出前排队的 `screenshot_uploaded(idle)` 晚到 →
-覆写成 idle → 微任务看到 `pendingSuspendReason` 和**新 worker** 还活着 → 把刚起来的
-新 worker 挂了。新 worker 若正在产出，这就是原样复现本功能要消灭的截断 bug。
-陈旧的 checkpoint **保留标志直接返回** —— 只有当前 generation 有资格消费它。
+**`ownsGeneration` 必须传，否则会挂掉替换上来的新 worker** —— 但原因不是本文早先
+写的那条。它**不是**「旧 worker 的陈旧消息能进入 `screenshot_uploaded`」：message
+handler 的统一 fence（`if (ds.worker !== worker) return`）排在 switch **之前**，
+被替换 worker 的消息一条也进不来。
+
+真正的窗口是**延迟兑现本身**。调用方必须用 `queueMicrotask` 推迟（理由见下），
+于是 fence 是在**消息到达**时检查的，而挂起在**一个微任务之后**才执行。两条消息
+可以在同一 tick 内都合法通过 fence：第一条的微任务挂起了会话、随后 refork 装上新
+worker，第二条的微任务这时才运行，面对的是一个全新的 worker。没有这道判定就会把
+它挂掉 —— 新 worker 若正在产出，正是原样复现本功能要消灭的截断 bug。
+不属于当前 generation 的 checkpoint **保留标志直接返回**。
 
 （不要改成给 `screenshot_uploaded` 加前置 `ownsLifecycleMutation()` break：那会改掉
 该 case 的既有行为，影响面不明。把判定传进兑现函数是最小且封闭的改法。）
@@ -283,51 +331,24 @@ CLI 本地的 session store 这些判据一个都没有，要按 daemon 拉一�
 原则不变：dry-run 不该因为某个 daemon 抽风而失败，但也绝不该把"读不到"伪装成
 "已确认"——反过来，把**本来可确定**的结果报成"未知"同样是失职。
 
-### 5.5 `src/worker.ts` + `src/types.ts`：挂起前 flush 输出
+### 5.5 挂起前 flush 输出：**已从本改动移除**
 
-**只改 daemon 侧不够。** `final_output` 由 transcript 驱动（bridge 的 fs.watch + 1s
-poller），而触发挂起的 idle `screen_update` 由屏幕分析器驱动 —— 两个互相独立的生产者，
-没有顺序保证。在 idle 边沿兑现挂起时，这一轮的回复可能还躺在 bridge 队列里，而
-`case 'suspend'` 的自身拆解会把它毁掉两次：`stopBridgeWatcher()` 调 `clearPending()`，
-`process.exit(0)` 又丢掉 `process.send()` 只排队、还没写出的 IPC。
+早先的草案在 `case 'suspend'` 里插入 `await flushBridgeOutputBeforeSuspend()`，
+想在 teardown 前把 bridge 队列里已就绪的回复推出去。**该实现已整体删除**，原因是
+它的产物在 daemon 侧会被确定性丢弃：
 
-这就是本设计要消灭的「回复被切断」换了个入口复现。而且这个洞**现在就存在** ——
-`idle-worker-sweeper` 和 `host_overload_sweep` 同样按 `lastScreenStatus === 'idle'`
-挂起，只是它们跑在定时器上、有几秒余量遮着；兑现函数挂在 idle 边沿、零余量，会放大它。
+`suspendWorker` 发出 `{ type: 'suspend' }` 之后，在**同一同步调用栈内**就把
+`ds.worker = null`；worker 要收到该消息后才开始 flush，等 `final_output` /
+`suspend_ready` 回到 daemon 时，message handler 在 switch **之前**的统一 fence
+（`if (ds.worker !== worker) return`）已经把它们全部丢弃。也就是说那条路径在当前
+接线下**无法成功**，不是「尚未观测到正向场景」。
 
-在 `case 'suspend'` 的 `stopBridgeWatcher()` 与 `destroySession` **之前**插入
-`await flushBridgeOutputBeforeSuspend()`（CLI 还活着时 drain，transcript 才完整）。
-该函数做两件事：
+要让 flush 真正落地，需要在那道 fence 上开一个「正在 suspend 的这一个 worker」的
+定向例外 —— 那道 fence 护着 cards / tokens / readiness / durable turn state，属于
+安全边界，值得单独一个改动连同 daemon 侧行为测试一起做。
 
-1. **drain 两条 transcript 桥**：`bridgeDrainAndMaybeEmit()`（Claude）+
-   `codexBridgeDrainAndMaybeEmit({ signalIdle: false })`（codex/grok/traex/pi/hermes/mtr）。
-   配对方式抄既有的 `drainReliableTerminalBeforeInterrupt`，但**去掉它的
-   `reliableTurnTerminal` 门** —— 这里 drain 只是提前发布下一个 poller tick 本来就会发的
-   东西，对所有 CLI 都安全。两个 drain 各自 try/catch：坏掉的 transcript 不能把会话
-   钉在内存里，挂起本身就是内存回收手段。
-2. **写屏障**：追一条 `suspend_ready` 走 `sendAndFlush`。`process.send` 是 FIFO，
-   它的回调触发就意味着前面的 `final_output` 已经落到管道上。用 `Promise.race`
-   加 500ms 上界，写法对齐 `flushTransferDetachAck`。
+由此带来的残留窗口已在 §2「交付边界仍是 best-effort」如实记录。
 
-**这是尽最大努力，不是保证。** 超时分支被选中时屏障并未成立，后面照常
-teardown + `process.exit(0)`，队列里没写出去的消息仍会丢。窗口比现状（完全不 flush）
-小得多，但不为零 —— 注释、文档、测试都不该声称"保证"。
-
-为什么**不能**去掉这个上界改成无限等：`suspendWorker` 在发出 suspend 消息的同时就
-arm 了 daemon 侧的 kill backstop（`WORKER_SIGTERM_BACKSTOP_MS = 2_000`，
-SIGKILL 7s）。所以无限等根本不是无限等 —— 2 秒后照样被 SIGTERM 打断，区别只在于
-**被打断时 `destroySession()` 和 `cleanup()` 还没跑**，backing tmux session 和 CLI 留在
-那儿，挂起要回收的内存一点没回收。2 秒总预算必须在 flush 和其后的 teardown 之间分，
-500ms 是留够 teardown 余量的切分。
-
-`src/types.ts` 的 `WorkerToDaemon` 相应新增 `{ type: 'suspend_ready'; sessionId: string }`。
-daemon 侧**不需要 handler**：它是写屏障不是命令，daemon 早就决定要挂起了，
-除了 flush 本身不需要它任何东西（worker-pool 的 switch 没有 `default` 分支，未知
-类型天然忽略）。
-
-**残留窗口**：drain 用的是 `drainEmittable({ terminalBoundary: true })`。若这一轮的
-terminal 行在 drain 那一刻还没落到 transcript 里，仍然会漏 —— 窗口从秒级压到微秒级，
-但没有归零。彻底归零需要让挂起等一个显式的 turn-terminal 信号，那是另一个设计。
 
 ## 6. 边界情况
 
@@ -340,7 +361,7 @@ terminal 行在 drain 那一刻还没落到 transcript 里，仍然会漏 ——
 | adopt / 不可挂起 backend | 保持现有守卫，**在排队检查之前** return，不排队 |
 | 会话状态为 `undefined` | 不排队，走原有立即挂起路径（`undefined` 不属于 working/analyzing） |
 | daemon 重启 | 排队丢失，下一周期重新排队（决策 4） |
-| 兑现时 bridge 队列还有未发的回复 | worker 侧 `flushBridgeOutputBeforeSuspend` 先 drain + flush（§5.5） |
+| 兑现时 bridge 队列还有未发的回复 | **仍可能丢** —— 交付边界是 best-effort，见 §2 的已知残留窗口 |
 | 排队期间会话 refork，旧 worker 的 `screenshot_uploaded(idle)` 晚到 | `ownsGeneration` 判定为假 → **保留标志、不挂新 worker**（§5.2a） |
 | 兑现时 `suspendWorker` 拒绝（routing transfer 中） | 保留标志，并注册 `deferUntilSessionTransferSettled` 重试 —— 不能只靠"下一个 checkpoint"，安静会话可能再也没有（§5.2a） |
 | dry-run 遇到正在 routing transfer 的会话 | **预告不准**：会报"将排队/将挂起"，实际是 409 `session_transferring`。`/api/sessions` 行不暴露该状态，已在代码注释标明（§5.4） |
@@ -381,23 +402,18 @@ terminal 行在 drain 那一刻还没落到 transcript 里，仍然会漏 ——
 11. 幂等分支（无 worker）仍返回 `reason:'no_live_worker'`，不被误判为 deferred
 12. `backend_not_suspendable` / `adopt_suspend_unsupported` 两道守卫都排在排队之前
 
-`test/worker-suspend-output-flush.test.ts` — §5.5 的接线。worker.ts 的 IPC handler
-模块级副作用太重、单测里无法独立驱动，这里按仓库既有惯例（见
-`test/worker-pipe-initial-screen-order.test.ts`）用源码断言：
+`test/worker-suspend-output-flush.test.ts` — **已随 §5.5 的实现一并删除。**
+那组用例只对 worker 侧做源码顺序断言，完全没有跨过 daemon 的接收边界，所以即使
+flush 产物在 daemon 侧被 fence 确定性丢弃，它依然全绿。这是个值得记住的教训：
+**跨进程的承诺，必须由跨过那道边界的行为测试来钉，源码断言证明不了任何交付。**
 
-13. `flushBridgeOutputBeforeSuspend()` 排在 `stopBridgeWatcher()` 和 `destroySession` 之前，
-    且**带 `await`**（漏掉 await 会让 `process.exit(0)` 直接越过整个 flush）
-14. 两条 transcript 桥都被 drain，codex 那条精确匹配 `{ signalIdle: false }`
-15. **写屏障的位置在两个 drain 之后**（排在前面就毫无意义）
-16. 屏障等待有界，且预算 `< 2000ms`（必须留在 daemon SIGTERM backstop 之内并给
-    teardown 余量）
-17. **两个 drain 各自独立 try/catch**（单个 `try`+`catch` 同时存在挡不住"第一个 drain
-    抛异常带走第二个"）
+`test/deferred-suspend.test.ts` 另有一组 claim 生命周期用例（真行为断言）：
 
-⚠️ 这个文件是**接线测试而非行为测试**，测试头部已如实注明：它能挡住顺序被改坏、
-参数被改回、兜底被删掉，挡不住 helper 内部逻辑写错但形状没变。要覆盖后者需要把
-flush helper 拆成可注入 `sendAndFlush`/drain/timer 的独立模块 —— 那是一次独立重构，
-为测试改写 worker.ts 的退出路径，风险大于收益。
+13. 任何成功的 `suspendWorker` 都消费 claim —— 不只是兑现 checkpoint，`/cd` /
+    读隔离切换 / idle sweeper 这些不路过 checkpoint 的路径同样算目标态达成
+14. 被拒绝时 claim 与其 generation 一并保留（暂时性拒绝不能吃掉请求）
+15. claim 属于更早的 generation 时**就地消费、绝不挂起新 worker**
+16. 同代时照常兑现（上一条门控不能把正常路径也挡掉）
 
 ### 生产验证
 
@@ -419,9 +435,11 @@ busy 会话数吻合（历史 `p99=4, max=5`）。
 改动集中在六个文件、且互相独立：`dashboard-ipc-server.ts` 的排队分支去掉后即恢复
 原行为，`pendingSuspendReason` 永不被设置，兑现函数自然变成空操作。
 
-§5.5 的 worker 侧 flush 是**独立可回滚**的另一半：它不依赖排队机制，删掉它排队仍然
-工作（只是回到「兑现时可能漏掉一条回复」的窗口）；反过来留着它也独立改善现有的
-`idle-worker-sweeper` / `host_overload_sweep` 两条挂起路径。
+§5.5 的 worker 侧 flush **已在本改动中删除**（原因见该节），所以不存在回滚它的问题；
+它留下的交付边界窗口已在 §2 如实记录为已知项。
+
+generation 绑定（`pendingSuspendGeneration` + `clearPendingSuspendClaim`）同样独立：
+去掉它排队机制仍然工作，只是回到「claim 可能残留到下一代」的行为。
 
 ## 9. 参考：本文结论的数据来源
 
