@@ -93,3 +93,24 @@ export function trackProducerQuiet(w: ProducerHandle): { alreadyQuiet: boolean; 
   });
   return { alreadyQuiet: false, done };
 }
+
+/**
+ * Track PROCESS EXIT (not IPC quiescence) for orphan-prevention reaping. This is
+ * a SEPARATE concern from trackProducerQuiet: a worker can disconnect its IPC
+ * (terminal source quiet) long before — or without ever — its process exiting
+ * (detached / SIGTERM-ignoring). Reaping must key on the process being gone
+ * (`exitCode`/`signalCode` set), regardless of `connected`, so the daemon can
+ * escalate to SIGKILL and never leave a ppid=1 orphan. Returns whether the
+ * process is ALREADY dead, and (if not) a promise resolving on `exit`.
+ */
+export function trackProcessExited(w: ProducerHandle): { alreadyExited: boolean; done?: Promise<void> } {
+  const isDead = (): boolean => w.exitCode !== null || w.signalCode !== null;
+  if (isDead()) return { alreadyExited: true };
+  const done = new Promise<void>(resolve => {
+    const settleIfDead = (): void => { if (isDead()) resolve(); };
+    w.once('exit', settleIfDead);
+    w.once('close', settleIfDead);
+    settleIfDead(); // check → listen → re-check race
+  });
+  return { alreadyExited: false, done };
+}

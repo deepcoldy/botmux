@@ -1,7 +1,7 @@
 import { describe, it, expect, afterEach } from 'vitest';
 import { spawn, type ChildProcess } from 'node:child_process';
 import { EventEmitter } from 'node:events';
-import { waitAllWithin, trackProducerQuiet, type ProducerHandle } from '../src/core/producer-quiescence.ts';
+import { waitAllWithin, trackProducerQuiet, trackProcessExited, type ProducerHandle } from '../src/core/producer-quiescence.ts';
 
 // Real child processes so the fence is exercised against actual IPC
 // 'disconnect' / 'close' / 'exit' ordering, PLUS a controlled fake ProducerHandle
@@ -152,6 +152,40 @@ describe('producer-quiescence fence (controlled: exit must NOT resolve while con
     p.emit('disconnect');
     await new Promise(r => setTimeout(r, 10));
     expect(resolved).toBe(true);
+  });
+});
+
+describe('trackProcessExited (reaping — keys on process death, NOT connected)', () => {
+  it('a live worker whose IPC is ALREADY disconnected is NOT already-exited (must still be reaped)', () => {
+    // The exact regression: connected=false but process alive. Producer fence
+    // treats it quiet, but reaping must NOT — it still has to exit/be killed.
+    const p = fakeProducer({ connected: false });
+    expect(trackProducerQuiet(p).alreadyQuiet).toBe(true);   // producer fence: quiet
+    expect(trackProcessExited(p).alreadyExited).toBe(false); // reaping: still alive
+  });
+
+  it('resolves only when the process actually exits (disconnect alone does not count)', async () => {
+    const p = fakeProducer({ connected: true });
+    const { alreadyExited, done } = trackProcessExited(p);
+    expect(alreadyExited).toBe(false);
+    let resolved = false;
+    void done!.then(() => { resolved = true; });
+    // IPC disconnects but process is alive → reaping must stay pending.
+    p.set({ connected: false });
+    p.emit('disconnect');
+    await new Promise(r => setTimeout(r, 20));
+    expect(resolved).toBe(false);
+    // Process exits → reaping resolves.
+    p.set({ exitCode: 0 });
+    p.emit('exit');
+    await new Promise(r => setTimeout(r, 10));
+    expect(resolved).toBe(true);
+  });
+
+  it('reports already-exited for a dead process', () => {
+    const p = fakeProducer({ connected: false });
+    p.set({ signalCode: 'SIGKILL' });
+    expect(trackProcessExited(p).alreadyExited).toBe(true);
   });
 });
 

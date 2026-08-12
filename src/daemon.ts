@@ -176,7 +176,7 @@ import {
   codexAppFinalSettlementCount,
   type WorkerSessionReplyOptions,
 } from './core/worker-pool.js';
-import { waitAllWithin, trackProducerQuiet } from './core/producer-quiescence.js';
+import { waitAllWithin, trackProducerQuiet, trackProcessExited } from './core/producer-quiescence.js';
 import { AbortDeadlineError, hasExactSafeJsonKeys, ipcRoute, isTrustedHostIpcRequest, JsonBodyTooLargeError, jsonRes, readJsonBody, runWithAbortDeadline, setBotName, setLarkAppId, startIpcServer, setBotRenamer, setBotAvatarChanger, armCoreOnlyReadinessGate, setCoreOnlyReady, setSupervisorShutdownHandler } from './core/dashboard-ipc-server.js';
 import { setDeviceIsolationDaemonIdentity } from './core/device-isolation-daemon.js';
 import {
@@ -21423,29 +21423,46 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     // real "no more terminals from this producer" signal (see producer-quiescence
     // helper — it deliberately keys on disconnect, not 'close', which stdio
     // inherited by grandchildren can delay). Dedup by ChildProcess.
+    // Two INDEPENDENT shutdown concerns, tracked over the same worker set but
+    // never conflated (conflating them regresses process reaping):
+    //   • reaping (workersToReap / workerExited): every live worker PROCESS must
+    //     exit or be SIGKILLed — orphan prevention. Keys on process death, NOT
+    //     on `connected`.
+    //   • producer fence (producerClosed): every worker's IPC channel must
+    //     disconnect — the "no more terminal messages" signal that gates closing
+    //     the feedback queue admission. Keys on `disconnect`, NOT on exit.
     const producerClosed: Array<Promise<void>> = [];
-    const survivors: ChildProcess[] = [];
-    const tracked = new Set<ChildProcess>();
-    const trackWorkerClosed = (w: ChildProcess): void => {
-      if (tracked.has(w)) return; // dedup: same worker referenced twice
-      tracked.add(w);
-      const { alreadyQuiet, done } = trackProducerQuiet(w);
-      if (alreadyQuiet || !done) return; // already quiet — nothing to await
-      producerClosed.push(done);
-      survivors.push(w);
+    const workerExited: Array<Promise<void>> = [];
+    const reapCandidates: ChildProcess[] = [];
+    const trackedProducers = new Set<ChildProcess>();
+    const trackedReap = new Set<ChildProcess>();
+    const trackWorker = (w: ChildProcess): void => {
+      // Producer fence: disconnect-based, gates feedback admission only.
+      if (!trackedProducers.has(w)) {
+        trackedProducers.add(w);
+        const q = trackProducerQuiet(w);
+        if (!q.alreadyQuiet && q.done) producerClosed.push(q.done);
+      }
+      // Reaping: exit-based, orphan prevention. Registered BEFORE any signal so
+      // a fast exit is not missed; dedup by ChildProcess.
+      if (!trackedReap.has(w)) {
+        trackedReap.add(w);
+        const e = trackProcessExited(w);
+        if (!e.alreadyExited && e.done) { workerExited.push(e.done); reapCandidates.push(w); }
+      }
     };
-    for (const worker of riffRetiredWorkers) trackWorkerClosed(worker);
+    for (const worker of riffRetiredWorkers) trackWorker(worker);
     for (const ds of currentShutdownFleet.sessions) {
       const w = ds.worker;
       if (!w) continue;
-      // Track EVERY non-null worker unconditionally. `ChildProcess.killed` only
-      // means a signal was already sent — NOT that the process exited or the IPC
-      // channel disconnected (a worker can be `killed=true && connected=true`
-      // right after .kill(), e.g. the promoted-activation IPC-failure path that
-      // kills but defers ds.worker cleanup to the exit handler). In that window a
-      // queued terminal can still arrive, so it MUST be inside the fence.
-      // `killed` only decides whether we still need to send a stop signal.
-      trackWorkerClosed(w);
+      // Track EVERY non-null worker (both concerns) unconditionally. `killed`
+      // only means a signal was already sent — NOT that the process exited or
+      // the IPC channel disconnected (a worker can be `killed=true &&
+      // connected=true` right after .kill(), e.g. the promoted-activation
+      // IPC-failure path that kills but defers ds.worker cleanup). `killed` only
+      // decides whether we still need to SEND a stop signal; it never decides
+      // whether the worker is tracked for reaping or the producer fence.
+      trackWorker(w);
       if (!w.killed) {
         logger.info(`Shutting down worker for session ${ds.session.sessionId}`);
         const disposition = shutdownBackendDisposition(ds);
@@ -21494,31 +21511,37 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     // handler cannot exit mid-wait once workers/services have stopped.
     const remainingBudget = (): number => Math.max(0, shutdownDeadlineMs - Date.now());
 
-    let disconnectQuiesced = true;
-    if (producerClosed.length > 0) {
-      // Give producers a normal grace to disconnect, then SIGKILL stragglers,
-      // then keep waiting their disconnect up to the SHARED deadline (a late
-      // disconnect that lands before the deadline still counts as quiescent —
-      // we do not freeze failure at the grace boundary).
-      // Absolute grace deadline, hard-capped by the shared shutdown deadline.
-      // Using Math.min on the absolute value (not `Date.now()+clampedGrace`)
-      // avoids the two-clock-read skew that could push the grace fractionally
-      // past shutdownDeadlineMs.
+    // --- Phase 1: process reaping (orphan prevention) ------------------------
+    // Give every live worker PROCESS a normal grace to exit, then SIGKILL any
+    // still alive, then confirm exit within the shared deadline. This is keyed
+    // on process death (exitCode/signalCode), independent of IPC state, so a
+    // worker that ignores SIGTERM — or that already disconnected its IPC but is
+    // still running — is still reaped and cannot become a ppid=1 orphan.
+    if (workerExited.length > 0) {
       const exitGraceDeadline = Math.min(shutdownDeadlineMs, Date.now() + DAEMON_WORKER_EXIT_GRACE_MS);
-      await waitAllWithin(producerClosed, exitGraceDeadline);
+      await waitAllWithin(workerExited, exitGraceDeadline);
       let stragglers = 0;
-      for (const w of survivors) {
+      for (const w of reapCandidates) {
         if (w.exitCode === null && w.signalCode === null) {
           stragglers++;
           try { w.kill('SIGKILL'); } catch { /* already dead */ }
         }
       }
       if (stragglers > 0) {
-        logger.warn(`${stragglers}/${survivors.length} worker(s) didn't disconnect before grace — SIGKILL'd to prevent ppid=1 orphans.`);
+        logger.warn(`${stragglers}/${reapCandidates.length} worker(s) didn't exit within grace — SIGKILL'd to prevent ppid=1 orphans.`);
+        // Confirm the SIGKILLed processes actually exit, still within the deadline.
+        await waitAllWithin(workerExited, shutdownDeadlineMs);
       }
-      // Keep waiting for actual IPC disconnect up to the shared deadline.
-      disconnectQuiesced = await waitAllWithin(producerClosed, shutdownDeadlineMs);
     }
+
+    // --- Phase 2: producer disconnect fence (gates feedback admission) -------
+    // Separate from reaping: this only decides whether it is safe to close the
+    // feedback queue admission. A late (but in-deadline) disconnect still counts
+    // as quiescent — we do not force it via SIGKILL here (Phase 1 already
+    // handled process liveness). By this point most workers have exited (which
+    // also disconnects their IPC), so producerClosed is typically already
+    // settled; we still await it explicitly under the shared deadline.
+    const disconnectQuiesced = await waitAllWithin(producerClosed, shutdownDeadlineMs);
 
     // Settlement fence: only meaningful once IPC is confirmed disconnected (no
     // new settlement can be created). Await the snapshot, then re-read the count
