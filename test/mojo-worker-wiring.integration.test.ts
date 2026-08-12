@@ -300,6 +300,27 @@ echo '{"type":"result","status":"ok","result":"ok","session_id":"sid-worker-shut
       .toBeLessThan(positional.indexOf('hello mojo'));
   }, 40_000);
 
+  it('resolves the catalog for a CLI with NO routing block (hasRoutingBlock:false)', async () => {
+    // Locks the worker's `hasRoutingBlock: false` argument, which nothing else
+    // covers: the resolver unit tests pass the flag themselves, and the assertion
+    // above only proves *some* block arrived. Flipping the worker back to `true`
+    // left 98 tests green while silently reopening the original bug.
+    //
+    // mojo emits no <botmux_routing>, so the catalog is the ONLY documentation for
+    // history/quoted/bots and must not cite a block that does not exist.
+    const { invocation } = await runWorker({ timeoutMs: 12_000 });
+    const positional = invocation.argv[invocation.argv.length - 1];
+
+    for (const name of ['botmux-history', 'botmux-quoted', 'botmux-bots']) {
+      expect(positional, `${name} must be documented in the mojo prompt`)
+        .toContain(`- ${name}:`);
+    }
+    // A false claim about a block mojo never emits would send the agent looking
+    // for it. Checked on the FULL prompt, so a routing block appearing anywhere
+    // (not just inside the catalog) also fails.
+    expect(positional).not.toContain('botmux_routing');
+  }, 40_000);
+
   it('passes the session working dir, per-bot env and model through', async () => {
     const { invocation } = await runWorker({
       botEntry: {
