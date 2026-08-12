@@ -77,11 +77,19 @@ export function trackProducerQuiet(w: ProducerHandle): { alreadyQuiet: boolean; 
   const isQuiet = (): boolean => w.connected !== true;
   if (isQuiet()) return { alreadyQuiet: true };
   const done = new Promise<void>(resolve => {
-    const settle = (): void => resolve();
-    w.once('disconnect', settle);  // IPC channel closed → no more messages
-    w.once('exit', settle);        // belt-and-suspenders (channel-less child)
-    w.once('close', settle);       // belt-and-suspenders
-    if (isQuiet()) settle();       // became quiet between the read and listener attach
+    const settleIfQuiet = (): void => { if (isQuiet()) resolve(); };
+    // `disconnect` is the authoritative signal: it fires exactly when the IPC
+    // channel closes (connected → false), so on disconnect isQuiet() is true.
+    w.once('disconnect', settleIfQuiet);
+    // exit/close are belt-and-suspenders for a channel-less child (whose only
+    // signal is death). They must NOT resolve unconditionally: an `exit` can be
+    // observed while `connected` is still true / queued IPC messages are not yet
+    // drained, and resolving there would reopen the late-terminal race. Re-check
+    // isQuiet() so they only settle once the channel is actually gone.
+    w.once('exit', settleIfQuiet);
+    w.once('close', settleIfQuiet);
+    // Close the check → listen → re-check race if it became quiet in between.
+    settleIfQuiet();
   });
   return { alreadyQuiet: false, done };
 }

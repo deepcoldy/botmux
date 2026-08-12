@@ -21436,15 +21436,22 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     };
     for (const worker of riffRetiredWorkers) trackWorkerClosed(worker);
     for (const ds of currentShutdownFleet.sessions) {
-      if (ds.worker && !ds.worker.killed) {
+      const w = ds.worker;
+      if (!w) continue;
+      // Track EVERY non-null worker unconditionally. `ChildProcess.killed` only
+      // means a signal was already sent — NOT that the process exited or the IPC
+      // channel disconnected (a worker can be `killed=true && connected=true`
+      // right after .kill(), e.g. the promoted-activation IPC-failure path that
+      // kills but defers ds.worker cleanup to the exit handler). In that window a
+      // queued terminal can still arrive, so it MUST be inside the fence.
+      // `killed` only decides whether we still need to send a stop signal.
+      trackWorkerClosed(w);
+      if (!w.killed) {
         logger.info(`Shutting down worker for session ${ds.session.sessionId}`);
-        const w = ds.worker;
         const disposition = shutdownBackendDisposition(ds);
         if (disposition === 'riff-drain-detach') {
           throw new Error(`undrained Riff generation after atomic commit: ${ds.session.sessionId}`);
         }
-        // Capture the close promise BEFORE killWorker nulls ds.worker.
-        trackWorkerClosed(w);
         // Branch by the session's FROZEN backend (stamped on Session.backendType
         // at spawn), NOT the bot's live config — a dashboard backendType edit must
         // not change how a running session is torn down, or we'd e.g. try to
@@ -21493,8 +21500,12 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       // then keep waiting their disconnect up to the SHARED deadline (a late
       // disconnect that lands before the deadline still counts as quiescent —
       // we do not freeze failure at the grace boundary).
-      const exitGraceMs = Math.min(DAEMON_WORKER_EXIT_GRACE_MS, remainingBudget());
-      await waitAllWithin(producerClosed, Date.now() + exitGraceMs);
+      // Absolute grace deadline, hard-capped by the shared shutdown deadline.
+      // Using Math.min on the absolute value (not `Date.now()+clampedGrace`)
+      // avoids the two-clock-read skew that could push the grace fractionally
+      // past shutdownDeadlineMs.
+      const exitGraceDeadline = Math.min(shutdownDeadlineMs, Date.now() + DAEMON_WORKER_EXIT_GRACE_MS);
+      await waitAllWithin(producerClosed, exitGraceDeadline);
       let stragglers = 0;
       for (const w of survivors) {
         if (w.exitCode === null && w.signalCode === null) {
@@ -21503,7 +21514,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         }
       }
       if (stragglers > 0) {
-        logger.warn(`${stragglers}/${survivors.length} worker(s) didn't exit within ${exitGraceMs}ms — SIGKILL'd to prevent ppid=1 orphans.`);
+        logger.warn(`${stragglers}/${survivors.length} worker(s) didn't disconnect before grace — SIGKILL'd to prevent ppid=1 orphans.`);
       }
       // Keep waiting for actual IPC disconnect up to the shared deadline.
       disconnectQuiesced = await waitAllWithin(producerClosed, shutdownDeadlineMs);
@@ -21526,7 +21537,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         const undrained = await drainTurnTerminalQueue(drainBudget);
         if (undrained > 0) logger.warn(`[turn-completion] shutdown drain timed out with ${undrained} pending`);
       } else {
-        logger.warn('[turn-completion] shutdown deadline exhausted before drain; queued terminals persist in the durable store for next-boot reconcile');
+        logger.error('[turn-completion] shutdown deadline exhausted before drain — in-memory queued turn terminals were NOT persisted and are LOST (they are not yet in the durable store)');
       }
     } else {
       // Fail-closed: a producer may still emit a terminal. Do NOT close

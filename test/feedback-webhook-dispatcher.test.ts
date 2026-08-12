@@ -92,6 +92,20 @@ describe('feedback webhook attempt contract', () => {
     await dispatcher.stop(); db.close();
   });
 
+  it('stop(0) returns immediately without waiting the internal default window', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-webhook-stop0-')); dirs.push(dir);
+    const db = await SkillFeedbackStore.open(dir);
+    // A dispatch that never resolves would, under the old internal 5s default,
+    // make stop() block up to 5s. With an explicit 0 budget stop must not wait.
+    const dispatcher = startFeedbackWebhookDispatcher({ store: db, readSecret: () => 'secret', intervalMs: 100_000, shutdownMs: 5000,
+      dispatch: () => new Promise(() => { /* never resolves */ }) });
+    await dispatcher.ready;
+    const t0 = Date.now();
+    await dispatcher.stop(0);           // shared-budget = 0 → return now
+    expect(Date.now() - t0).toBeLessThan(500);
+    db.close();
+  });
+
   it('inherits frozen delivery destinations for feedback.revised fan-out', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'botmux-feedback-outbox-inherit-')); dirs.push(dir);
     const db = await SkillFeedbackStore.open(dir);
