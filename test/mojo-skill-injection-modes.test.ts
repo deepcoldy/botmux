@@ -23,12 +23,39 @@ vi.mock('../src/utils/logger.js', () => ({
   logger: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() },
 }));
 
+/**
+ * Drive the REAL mode resolver rather than hand-feeding a block. The first
+ * version of this file passed synthetic `builtinSkillBlock` values, so it proved
+ * only that MojoBackend concatenates a string it was given — swapping the off/
+ * global branches inside the resolver left every case green.
+ */
+let botSkillInjection: string | undefined;
+vi.mock('../src/bot-registry.js', () => ({
+  loadBotConfigs: () => [{ larkAppId: 'app-under-test', skillInjection: botSkillInjection }],
+}));
+vi.mock('../src/global-config.js', () => ({
+  readGlobalConfig: () => ({}),
+  config: {},
+}));
+vi.mock('../src/services/whiteboard-store.js', () => ({ whiteboardEnabled: () => false }));
+
 import { MojoBackend } from '../src/adapters/backend/mojo-backend.js';
 import {
   MOJO_INTERNAL_CONFIG_KEYS,
   buildEffectiveMojoConfig,
   normalizeMojoConfig,
 } from '../src/adapters/backend/mojo-types.js';
+import { builtinSkillBlockForInjectsSessionContext } from '../src/skills/injection-mode.js';
+
+/** What the worker actually computes for a mojo session in the given mode. */
+function resolvedBlockForMode(mode: string | undefined): string {
+  botSkillInjection = mode;
+  return builtinSkillBlockForInjectsSessionContext('app-under-test', 'en', {
+    asksViaHook: false,
+    whiteboardEnabled: false,
+    hasRoutingBlock: false,
+  });
+}
 
 let binDir: string;
 
@@ -67,27 +94,67 @@ async function promptSentToCli(extra: Record<string, unknown>): Promise<string> 
   return argv[argv.length - 1] ?? '';
 }
 
-describe('mojo built-in skill delivery — all three modes reach the CLI', () => {
-  it('prompt mode: the catalog block is in the prompt mojo receives', async () => {
-    const prompt = await promptSentToCli({
-      builtinSkillBlock: '<botmux_builtin_skills>\nCATALOG-MARKER\n</botmux_builtin_skills>',
+describe('mojo built-in skill delivery — the real resolver distinguishes all three modes', () => {
+  it('prompt mode yields a catalog, off yields a help pointer, global yields nothing', () => {
+    const prompt = resolvedBlockForMode('prompt');
+    const off = resolvedBlockForMode('off');
+    const global = resolvedBlockForMode('global');
+
+    // global must be empty — files are installed on disk by ensureCliSkills.
+    expect(global).toBe('');
+    // The other two are non-empty AND different from each other. Swapping the
+    // off/global branches in the resolver now breaks this.
+    expect(prompt).not.toBe('');
+    expect(off).not.toBe('');
+    expect(prompt).not.toBe(off);
+    // Catalog lists skills; the pointer does not.
+    expect(prompt).toMatch(/- botmux-send:/);
+    expect(off).not.toMatch(/- botmux-send:/);
+    expect(off).toContain('botmux --help');
+  });
+
+  it('keeps the routing-covered skills for mojo, which emits no <botmux_routing>', () => {
+    // These are filtered out for genius/grok because routing teaches them. mojo
+    // has no routing block, so dropping them documents them NOWHERE.
+    const prompt = resolvedBlockForMode('prompt');
+    for (const name of ['botmux-history', 'botmux-quoted', 'botmux-bots', 'botmux-send']) {
+      expect(prompt, `${name} must stay in the mojo catalog`).toContain(`- ${name}:`);
+    }
+  });
+
+  it('never cites a <botmux_routing> block that mojo does not emit', () => {
+    // The shared prose says "<botmux_routing> covers basic communication only",
+    // which is simply false for mojo and would send the agent looking for it.
+    expect(resolvedBlockForMode('prompt')).not.toContain('botmux_routing');
+    expect(resolvedBlockForMode('off')).not.toContain('botmux_routing');
+  });
+
+  it('still filters them out for a CLI that DOES emit routing (genius/grok)', () => {
+    botSkillInjection = 'prompt';
+    const withRouting = builtinSkillBlockForInjectsSessionContext('app-under-test', 'en', {
+      asksViaHook: false, whiteboardEnabled: false, hasRoutingBlock: true,
     });
+    expect(withRouting).not.toContain('- botmux-history:');
+    expect(withRouting).toContain('botmux_routing');
+  });
+});
+
+describe('mojo built-in skill delivery — the block reaches the CLI', () => {
+  it('prompt mode: the resolved catalog is in the prompt mojo receives', async () => {
+    const block = resolvedBlockForMode('prompt');
+    const prompt = await promptSentToCli({ builtinSkillBlock: block });
     expect(prompt).toContain('<botmux_builtin_skills>');
-    expect(prompt).toContain('CATALOG-MARKER');
+    expect(prompt).toContain('- botmux-send:');
     expect(prompt).toContain('USER TURN TEXT');
   });
 
-  it('off mode: the help pointer is in the prompt mojo receives', async () => {
-    const prompt = await promptSentToCli({
-      builtinSkillBlock: '<botmux_builtin_skills>\nHELP-POINTER-MARKER\n</botmux_builtin_skills>',
-    });
-    expect(prompt).toContain('HELP-POINTER-MARKER');
+  it('off mode: the resolved help pointer is in the prompt mojo receives', async () => {
+    const prompt = await promptSentToCli({ builtinSkillBlock: resolvedBlockForMode('off') });
+    expect(prompt).toContain('botmux --help');
   });
 
   it('global mode: nothing is injected (files already live on disk)', async () => {
-    // buildBuiltinSkillBlockForInjectsSessionContext returns '' for global; the
-    // builder drops empty strings, so the prompt must be untouched.
-    const prompt = await promptSentToCli({ builtinSkillBlock: '' });
+    const prompt = await promptSentToCli({ builtinSkillBlock: resolvedBlockForMode('global') });
     expect(prompt).toBe('USER TURN TEXT');
     expect(prompt).not.toContain('botmux_builtin_skills');
   });

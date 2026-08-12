@@ -11500,6 +11500,14 @@ async function spawnCli(
       builtinSkillBlock: builtinSkillBlockForInjectsSessionContext(cfg.larkAppId, cfg.locale, {
         asksViaHook: false,
         whiteboardEnabled: whiteboardEnabled(),
+        // mojo emits NO <botmux_routing> block (unlike genius/grok, which build one
+        // via buildBotmuxSystemPromptText). So the catalog must keep the
+        // routing-covered skills (history/quoted/bots) — otherwise they are
+        // documented nowhere — and must not cite a routing block that is absent.
+        // Full routing/identity injection for mojo is deliberately out of scope
+        // here: a sandboxed remote session cannot reuse the normal CLI's routing
+        // semantics verbatim (see the --mention-back note in adapters/cli/mojo.ts).
+        hasRoutingBlock: false,
       }),
     });
     const resumed = (riffBackendConfig as EffectiveMojoConfig).resumeCliSessionId;

@@ -51,9 +51,17 @@ export function createMojoAdapter(_pathOverride?: string): CliAdapter {
             // MojoBackend.write() performs the actual CLI call.
             pty.write(content);
         },
-        // MojoBackend prepends its own routing/identity prompt, mirroring riff:
-        // the shared <botmux_routing> block recommends --mention-back, which is
-        // wrong for a sandboxed remote session whose sender is frozen at creation.
+        // No <botmux_routing> is emitted for mojo, by omission rather than design:
+        // the shared block recommends --mention-back, which is wrong for a
+        // sandboxed remote session whose sender is frozen at creation. Unlike riff
+        // (DEFAULT_RIFF_SYSTEM_PROMPT) mojo has no replacement yet, so
+        // MojoBackend.decorate() prepends only the operator systemPrompt and the
+        // built-in skill block.
+        //
+        // Consequence for skill delivery: the worker passes hasRoutingBlock:false
+        // so the catalog keeps send/history/quoted/bots instead of assuming a
+        // routing block teaches them. Designing mojo's own routing/identity block
+        // is tracked separately — it cannot copy the local-CLI wording verbatim.
         injectsSessionContext: true,
         systemHints: [],
         altScreen: false,

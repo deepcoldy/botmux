@@ -82,6 +82,14 @@ describe('native skill discovery reaches every CLI that ships skills', () => {
       aiden: 'none', 'codex-app': 'none', antigravity: 'none', hermes: 'none',
       mira: 'none', mir: 'none', copilot: 'none', kimi: 'none', riff: 'none',
     };
+    // Two-way key equality. `Record<CliId, …>` looks like tsc enforces
+    // exhaustiveness, but this file lives in test/ and tsconfig only includes
+    // `src/**/*` — nothing type-checks it. So a DELETED CLI would leave a stale
+    // entry here forever, and the loop below would never visit it. Compare the
+    // key sets in both directions at runtime instead of trusting the annotation.
+    const expectedIds = Object.keys(EXPECTED).sort();
+    expect(expectedIds, 'stale or missing entries in EXPECTED').toEqual([...ALL_CLI_IDS].sort());
+
     for (const id of ALL_CLI_IDS) {
       expect(resolveSkillInjectionSupport(id), `support for ${id}`).toBe(EXPECTED[id]);
     }
