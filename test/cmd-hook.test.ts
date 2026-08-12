@@ -181,7 +181,7 @@ describe('runHook', () => {
         return { kind: 'answered', answers: [['继续']], by: 'ou_u', comment: null, timedOut: false };
       };
       const result = await runHook(
-        openCodeAskPayload, STALE_ENV, stub, 'opencode',
+        openCodeAskPayload, STALE_ENV, stub, 'opencode2',
         async () => null,                       // adopt 兜底不应被触达
         async (cliSessionId) => {
           expect(cliSessionId).toBe('ses_abc123');
@@ -195,7 +195,36 @@ describe('runHook', () => {
       expect(posted?.rootMessageId).toBe('oc_real_root');
     });
 
-    it('反查未命中 → 回落 ambient env 路由（旧行为不退化）', async () => {
+    it('opencode2 反查未命中（独立终端会话 + 陈旧完整 env）→ fail closed，postAsk 未调用且 stdout 为空', async () => {
+      // 独立终端会话的 ses_* 不属于任何 active daemon → 反查必然 null；
+      // 若回落 STALE_ENV 会把问题投到首个启动 service 的 botmux 会话（泄露路径）。
+      // 共享 service hook 必须 fail closed：不发卡、问题留给原生终端。
+      const postAsk = vi.fn(makeAnsweredStub([['继续']]));
+      const result = await runHook(
+        openCodeAskPayload, STALE_ENV, postAsk, 'opencode2',
+        async () => null,
+        async () => null,                       // 反查未命中
+      );
+      expect(postAsk).not.toHaveBeenCalled();
+      expect(result.stdout).toBe('');
+    });
+
+    it('opencode2 反查超时（budget 耗尽 / daemon 不可达 → 返回 null）→ fail closed passthrough', async () => {
+      // 1.5s budget 耗尽、daemon 短暂不可达、cliSessionId 刚产生尚未上报时反查同样
+      // 返回 null——与未命中同一安全语义：直接 passthrough，绝不回落陈旧 ambient env。
+      const postAsk = vi.fn(makeAnsweredStub([['继续']]));
+      const result = await runHook(
+        openCodeAskPayload, STALE_ENV, postAsk, 'opencode2',
+        async () => null,
+        async () => null,                       // 反查超时未返回结果
+      );
+      expect(postAsk).not.toHaveBeenCalled();
+      expect(result.stdout).toBe('');
+    });
+
+    it('opencode（进程私有 hook）反查未命中 → 回落 ambient env 路由（不 fail closed）', async () => {
+      // 进程私有 hook 的 ambient env 可信（hook 运行在 CLI 进程内）：
+      // 反查只是附加优化，未命中按 env 路由，旧行为不退化。
       let posted: Record<string, unknown> | undefined;
       const stub = async (body: Record<string, unknown>): Promise<AskResult> => {
         posted = body;

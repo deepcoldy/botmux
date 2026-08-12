@@ -11576,17 +11576,21 @@ export async function runHook(
   const larkAppId = env.BOTMUX_LARK_APP_ID;
 
   // 路由变量：优先用 payload 携带的 OpenCode 原生会话 id 反查所属 botmux 会话；
-  // 未命中回落 env，env 缺失时再尝试 adopt 路由。
+  // 未命中：共享 service hook（opencode2）直接 passthrough（fail closed），
+  // 进程私有 hook 回落 env，env 缺失时再尝试 adopt 路由。
   let routeSessionId = sessionId;
   let routeChatId = chatId;
   let routeLarkAppId = larkAppId;
   let routeRoot: string | null = env.BOTMUX_ROOT_MESSAGE_ID || null;
   let explicitRoute: import('./adapters/adopt-route.js').AdoptRoute | null = null;
 
-  // 托管 service 场景（opencode2）：ask 插件运行在所有客户端共用的 service 里，
+  // 共享 service 场景（opencode2）：ask 插件运行在所有客户端共用的托管 service 里，
   // hook 子进程继承的是「启动该 service 的会话」的 ambient env，与当前会话无关，
   // 直接拿来路由会跨会话错投。payload.session_id 是 OpenCode 原生 id（ses_*），
   // 先按它在在线 daemon 的活跃会话里显式反查（cliSessionId 全局唯一）。
+  // 反查未命中时 env/PID 兜底只适用于进程私有 hook（ambient env 可信）；
+  // 共享 service 的 env 属于其它会话，回落即错投 → 对 opencode2 必须 fail closed。
+  const isSharedServiceHook = cliId === 'opencode2';
   const rawPayload = payload as Record<string, unknown> | undefined;
   const nativeSessionId = typeof rawPayload?.session_id === 'string'
     ? rawPayload.session_id.trim()
@@ -11605,6 +11609,11 @@ export async function runHook(
       routeChatId = explicitRoute.chatId;
       routeLarkAppId = explicitRoute.larkAppId;
       routeRoot = explicitRoute.rootMessageId;
+    } else if (isSharedServiceHook) {
+      // fail closed：反查未唯一命中（未命中 / 查询超时 / daemon 不可达 /
+      // cliSessionId 尚未上报）→ 直接 passthrough 把问题留给原生终端，
+      // 绝不回落 ambient env / PID adopt，避免跨会话错投。
+      return { stdout: adapter.passthrough(payload) };
     }
   }
 
