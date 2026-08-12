@@ -3,6 +3,8 @@ import { describe, expect, it } from 'vitest';
 
 import { ALL_CLI_IDS, createCliAdapterSync } from '../src/adapters/cli/registry.js';
 import { discoverNativeCliSkillGroups } from '../src/core/skills/discovery.js';
+import { resolveSkillInjectionSupport, type SkillInjectionSupport } from '../src/skills/injection-mode.js';
+import type { CliId } from '../src/adapters/cli/types.js';
 
 /**
  * `CliId[]` literals are checked for *bad* members but never for *missing*
@@ -60,19 +62,46 @@ describe('native skill discovery reaches every CLI that ships skills', () => {
     expect(groups.some(g => g.rootDir.endsWith('/.mojo/skills'))).toBe(true);
   });
 
-  it('declares skillsDir for every CLI whose adapter claims a home dir of skills', () => {
-    // Guard the general shape, not just mojo: an adapter that lists ~/.x in
-    // authPaths and is known to keep skills there must say so explicitly,
-    // because authPaths is a sandbox carve-out and never a skills source.
-    const offenders: string[] = [];
+  it('pins each CLI to a reviewed skill-delivery classification', () => {
+    // The previous version of this guard was circular: it skipped any adapter
+    // with no skill source, i.e. exactly the adapters that FORGOT to declare one
+    // (the mojo bug). It could never have caught a repeat.
+    //
+    // A closed Record<CliId, …> instead: tsc forces a new CLI to be classified,
+    // so adding one is a deliberate decision, and dropping a skillsDir from an
+    // adapter classified 'global' turns this red.
+    const EXPECTED: Readonly<Record<CliId, SkillInjectionSupport>> = {
+      // per-session --plugin-dir (claude family)
+      'claude-code': 'dynamic', seed: 'dynamic', relay: 'dynamic',
+      // shared global skills dir → global|prompt|off all apply
+      coco: 'global', codex: 'global', cursor: 'global', gemini: 'global',
+      genius: 'global', opencode: 'global', mtr: 'global', traex: 'global',
+      pi: 'global', 'oh-my-pi': 'global', grok: 'global', 'kiro-cli': 'global',
+      reasonix: 'global', mojo: 'global',
+      // no skill mechanism at all
+      aiden: 'none', 'codex-app': 'none', antigravity: 'none', hermes: 'none',
+      mira: 'none', mir: 'none', copilot: 'none', kimi: 'none', riff: 'none',
+    };
     for (const id of ALL_CLI_IDS) {
-      let adapter;
-      try { adapter = createCliAdapterSync(id); } catch { continue; }
-      const hasSkillSource = !!adapter.skillsDir || !!adapter.claudeDataDir;
-      if (!hasSkillSource) continue;
-      // If it claims a skill source, discovery must actually resolve a root.
-      if (discoverNativeCliSkillGroups([id]).length === 0) offenders.push(id);
+      expect(resolveSkillInjectionSupport(id), `support for ${id}`).toBe(EXPECTED[id]);
     }
-    expect(offenders).toEqual([]);
+  });
+
+  it('makes every "global" CLI resolve a real discovery root', () => {
+    // Complements the classification: 'global' is derived from skillsDir being
+    // set, so this proves the declared dir is also reachable by discovery
+    // (the roster/adapter/discovery chain, end to end).
+    const offenders = ALL_CLI_IDS.filter(id =>
+      resolveSkillInjectionSupport(id) === 'global'
+      && discoverNativeCliSkillGroups([id]).length === 0);
+    // Shared-root dedup means a CLI can legitimately yield no group of its own
+    // when an earlier CLI already claimed the same dir, so allow that case only.
+    const unexplained = offenders.filter(id => {
+      const dir = createCliAdapterSync(id).skillsDir;
+      return !ALL_CLI_IDS.some(other => other !== id
+        && createCliAdapterSync(other).skillsDir === dir
+        && discoverNativeCliSkillGroups([other]).length > 0);
+    });
+    expect(unexplained).toEqual([]);
   });
 });

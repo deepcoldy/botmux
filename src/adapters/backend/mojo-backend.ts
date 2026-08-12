@@ -984,10 +984,22 @@ export class MojoBackend implements SessionBackend {
         return oneLine ? ` ${oneLine.length > 120 ? `${oneLine.slice(0, 120)}…` : oneLine}` : '';
     }
 
+    /**
+     * Prepend the platform-owned skill block and the operator's systemPrompt.
+     *
+     * Order matters and is deliberate: the skill catalog is APPENDED after the
+     * operator prompt, never merged into it. Folding it into `systemPrompt` would
+     * mean a bot that sets its own prompt silently loses skill discovery — the
+     * same trap riff documented for its mandatory routing rules.
+     *
+     * `builtinSkillBlock` is only populated for `prompt` / `off`; in `global`
+     * mode the files are already on disk (~/.mojo/skills) so it stays empty.
+     */
     private decorate(prompt: string): string {
-        return this.config.systemPrompt
-            ? `${this.config.systemPrompt}\n\n---\n\n${prompt}`
-            : prompt;
+        const preamble = [this.config.systemPrompt?.trim(), this.config.builtinSkillBlock?.trim()]
+            .filter((s): s is string => !!s)
+            .join('\n\n');
+        return preamble ? `${preamble}\n\n---\n\n${prompt}` : prompt;
     }
 
     private buildEnv(): NodeJS.ProcessEnv {

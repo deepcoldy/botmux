@@ -69,6 +69,7 @@ export const MOJO_INTERNAL_CONFIG_KEYS = [
     'wrapperCli',
     'resumeCliSessionId',
     'extraCliArgs',
+    'builtinSkillBlock',
 ] as const;
 
 /** The top-level bot field that owns each internal key, for error messages. */
@@ -80,6 +81,7 @@ export const MOJO_INTERNAL_KEY_OWNER: Readonly<Record<string, string>> = {
     wrapperCli: 'wrapperCli',
     resumeCliSessionId: '(managed by botmux)',
     extraCliArgs: 'CLI_EXTRA_ARGS',
+    builtinSkillBlock: 'skillInjection',
 };
 
 /**
@@ -277,6 +279,19 @@ export interface EffectiveMojoConfig extends MojoConfig {
      * silently inverted last-value-wins precedence.
      */
     extraCliArgs?: string[];
+    /**
+     * Resolved built-in skill delivery for the `prompt` / `off` modes.
+     *
+     * mojo is `injectsSessionContext` + global `skillsDir`, the same shape as
+     * genius/grok — session-manager therefore skips the per-message skill
+     * envelope for it, so the catalog (or the `off` help pointer) can only reach
+     * the agent by riding on the prompt the backend builds. Without this only
+     * `global` did anything and the other two modes silently no-oped.
+     *
+     * Computed by the worker (which owns larkAppId/locale) rather than here:
+     * mode resolution reads bot config, and MojoBackend has neither.
+     */
+    builtinSkillBlock?: string;
 }
 
 /** `mojo auth status --json`. */
@@ -358,6 +373,12 @@ export interface MojoGenericLaunchInput {
     wrapperCli?: string;
     /** Generic extra CLI args (CLI_EXTRA_ARGS), applied after the backend flags. */
     extraCliArgs?: readonly string[];
+    /**
+     * Built-in skill catalog / help pointer for `prompt` / `off` mode, already
+     * resolved by the caller. Empty or absent for `global` (files on disk) and
+     * for `dynamic` CLIs.
+     */
+    builtinSkillBlock?: string;
 }
 
 /**
@@ -414,6 +435,9 @@ export function buildEffectiveMojoConfig(
     if (generic.extraCliArgs && generic.extraCliArgs.length > 0) {
         merged.extraCliArgs = [...generic.extraCliArgs];
     }
+
+    const builtinSkillBlock = emptyToUndefined(generic.builtinSkillBlock);
+    if (builtinSkillBlock !== undefined) merged.builtinSkillBlock = builtinSkillBlock;
 
     return merged;
 }

@@ -255,6 +255,8 @@ import {
   type RiffBackendConfig,
 } from './adapters/backend/riff-backend.js';
 import { buildEffectiveChildEnv, buildEffectiveMojoConfig, findReservedMojoCliFlags, normalizeMojoConfig, normalizeMojoLivePatch, type EffectiveMojoConfig, type MojoLivePatch } from './adapters/backend/mojo-types.js';
+import { builtinSkillBlockForInjectsSessionContext } from './skills/injection-mode.js';
+import { whiteboardEnabled } from './services/whiteboard-store.js';
 import {
   prepareDirectSandbox,
   prepareCredentialOnlySandbox,
@@ -11489,6 +11491,16 @@ async function spawnCli(
       // backend.onTaskId hook and therefore already carrying mojo ids).
       resumeCliSessionId: cfg.riffParentTaskId,
       wrapperCli: cfg.wrapperCli,
+      // mojo is injectsSessionContext + global skillsDir (same shape as
+      // genius/grok), so session-manager does NOT wrap the per-message skill
+      // envelope for it — the catalog for `prompt` mode, and the help pointer for
+      // `off`, must ride on the prompt MojoBackend builds. Resolved here because
+      // the mode lookup needs larkAppId and the backend has no bot context.
+      // `global` resolves to '' (files already installed under ~/.mojo/skills).
+      builtinSkillBlock: builtinSkillBlockForInjectsSessionContext(cfg.larkAppId, cfg.locale, {
+        asksViaHook: false,
+        whiteboardEnabled: whiteboardEnabled(),
+      }),
     });
     const resumed = (riffBackendConfig as EffectiveMojoConfig).resumeCliSessionId;
     if (resumed) log(`mojo resuming session lineage ${resumed}`);
