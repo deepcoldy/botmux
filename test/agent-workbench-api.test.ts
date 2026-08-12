@@ -67,6 +67,15 @@ describe('Agent Workbench API integration contract', () => {
     } satisfies Partial<WorkbenchApiError>);
   });
 
+  it('accepts a fixed writable platform-owner role without inventing a lease expiry', async () => {
+    const api = createWorkbenchApi(async () => jsonResponse({
+      ok: true, mode: 'controlled', owned: true, fixed: true,
+    }));
+    await expect(api.getTerminalControl('s1')).resolves.toEqual({
+      mode: 'controlled', owned: true, fixed: true,
+    });
+  });
+
   it('fails closed on malformed metadata while preserving stable server errors', async () => {
     const malformed = createWorkbenchApi(async () => jsonResponse({
       ok: true,

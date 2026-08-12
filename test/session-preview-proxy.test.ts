@@ -1,4 +1,5 @@
 import { createServer, type IncomingMessage, type Server } from 'node:http';
+import { PassThrough } from 'node:stream';
 import { afterEach, describe, expect, it } from 'vitest';
 import { WebSocket, WebSocketServer } from 'ws';
 import {
@@ -113,6 +114,18 @@ function websocketStatus(url: string, headers?: Record<string, string>): Promise
 }
 
 describe('session preview same-origin reverse proxy', () => {
+  it('attaches a client error handler synchronously on validation/auth failures', () => {
+    const manager = createSessionPreviewProxy({
+      authenticated: () => false,
+      resolve: () => ({ ok: false, status: 404, error: 'unknown_session' }),
+    });
+    const socket = new PassThrough();
+    const req = { url: '/preview/s1/ws', method: 'GET', headers: {} } as IncomingMessage;
+    expect(manager.handleUpgrade(req, socket, Buffer.alloc(0))).toBe(true);
+    expect(socket.listenerCount('error')).toBeGreaterThan(0);
+    expect(() => socket.emit('error', new Error('browser disconnected'))).not.toThrow();
+  });
+
   it('drops hop-by-hop and Connection-nominated headers while preserving a WS upgrade', () => {
     const target = { host: '127.0.0.1' as const, port: 3000, registeredAt: TARGET_TIME };
     const headers = previewRequestHeaders({

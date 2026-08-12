@@ -100,7 +100,7 @@ describe('Agent Workbench pure model', () => {
     expect(window.start).toBeGreaterThan(100);
   });
 
-  it('formats relative times and keeps terminal URLs same-origin on HTTPS', () => {
+  it('formats relative times and keeps terminal URLs on the signed same-origin front proxy', () => {
     const now = 10_000_000;
     expect(formatWorkbenchRelativeTime(now, now + 10, 'en')).toBe('just now');
     expect(formatWorkbenchRelativeTime(now - 3_600_000, now, 'en')).toContain('hr');
@@ -108,6 +108,14 @@ describe('Agent Workbench pure model', () => {
       session(1, { webPort: 9000, proxyPort: 8080 }),
       { protocol: 'https:', origin: 'https://dashboard.example', hostname: 'dashboard.example' },
     )).toBe('https://dashboard.example/s/session-1');
+    expect(workbenchTerminalHref(
+      session(1, { webPort: 9000, proxyPort: 8080 }),
+      { protocol: 'http:', origin: 'http://dashboard.local:24000', hostname: 'dashboard.local' },
+    )).toBe('http://dashboard.local:24000/s/session-1');
+    expect(workbenchTerminalHref(
+      session(1, { webPort: 9000 }),
+      { protocol: 'http:', origin: 'http://dashboard.local:24000', hostname: 'dashboard.local' },
+    )).toBeNull();
     expect(workbenchExternalTerminalHref(session(1, { riffAccessUrl: 'javascript:alert(1)' }))).toBeNull();
     expect(workbenchPreviewHref(session(1, {
       preview: { path: '/preview/session-2/', registeredAt: new Date().toISOString() },

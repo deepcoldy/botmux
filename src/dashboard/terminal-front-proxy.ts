@@ -9,7 +9,9 @@ import { requestLiteralLoopback } from '../core/loopback-target.js';
 import type { TerminalControlManager, TerminalDashboardActor } from './terminal-control.js';
 
 export const TERMINAL_CONTROL_HEADER = 'x-botmux-terminal-control';
-const CONNECT_TIMEOUT_MS = 5_000;
+/** Covers daemon wake-up (up to 10s) plus a bounded worker handshake. Cleared
+ * as soon as response/upgrade headers arrive, so live streams stay unbounded. */
+export const TERMINAL_UPSTREAM_RESPONSE_TIMEOUT_MS = 30_000;
 
 export interface TerminalFrontProxyOptions {
   resolvePort(sessionId: string): number | undefined;
@@ -148,7 +150,7 @@ export function createTerminalFrontProxy(options: TerminalFrontProxyOptions): {
       res.writeHead(up.statusCode ?? 502, up.headers);
       up.pipe(res);
     });
-    upstream.setTimeout(CONNECT_TIMEOUT_MS, () => upstream.destroy());
+    upstream.setTimeout(TERMINAL_UPSTREAM_RESPONSE_TIMEOUT_MS, () => upstream.destroy());
     upstream.on('error', () => {
       if (!res.headersSent) plainError(res, 502, 'terminal proxy error');
       else res.end();
@@ -162,6 +164,16 @@ export function createTerminalFrontProxy(options: TerminalFrontProxyOptions): {
     let url: URL;
     try { url = new URL(req.url ?? '/', 'http://localhost'); } catch { return false; }
     if (!(url.pathname === '/s' || url.pathname.startsWith('/s/'))) return false;
+    // Install this synchronously for every claimed upgrade path. Browser
+    // disconnects can race DNS/connect/401/404/502 handling; an EventEmitter
+    // `error` without a listener would otherwise terminate the Dashboard.
+    let upstreamRequest: ReturnType<typeof requestLiteralLoopback> | undefined;
+    let bridgedSocket: Duplex | undefined;
+    clientSocket.on('error', () => {
+      upstreamRequest?.destroy();
+      bridgedSocket?.destroy();
+      if (!clientSocket.destroyed) clientSocket.destroy();
+    });
     const prepared = prepare(req, url.pathname);
     if (!prepared?.port) {
       socketError(clientSocket, 404, 'session terminal not available');
@@ -174,14 +186,16 @@ export function createTerminalFrontProxy(options: TerminalFrontProxyOptions): {
       path: req.url,
       headers: prepared.headers,
     });
-    upstream.setTimeout(CONNECT_TIMEOUT_MS, () => upstream.destroy());
+    upstreamRequest = upstream;
+    upstream.setTimeout(TERMINAL_UPSTREAM_RESPONSE_TIMEOUT_MS, () => upstream.destroy());
     upstream.on('upgrade', (upRes, upstreamSocket, upstreamHead) => {
       responded = true;
+      bridgedSocket = upstreamSocket;
       upstream.setTimeout(0);
       upstreamSocket.setTimeout(0);
 
       let leaseMarker: string | undefined;
-      if (prepared.actor && prepared.proxyGrant?.scope === 'write') {
+      if (prepared.actor && prepared.proxyGrant?.scope === 'write' && prepared.proxyGrant.leaseMarker) {
         const registered = options.control.registerWritableSocket(
           prepared.actor,
           prepared.sessionId,
@@ -228,7 +242,6 @@ export function createTerminalFrontProxy(options: TerminalFrontProxyOptions): {
         clientSocket.destroy();
       };
       upstreamSocket.on('error', cleanup);
-      clientSocket.on('error', cleanup);
       upstreamSocket.on('close', () => { releaseOnDisconnect(); clientSocket.destroy(); });
       clientSocket.on('close', () => { releaseOnDisconnect(); upstreamSocket.destroy(); });
     });

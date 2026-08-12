@@ -58,6 +58,20 @@ describe('signed terminal control grants', () => {
 });
 
 describe('terminal server-side takeover lifecycle', () => {
+  it('preserves trusted platform owner write while guests stay read-only and cannot take over', () => {
+    const manager = new TerminalControlManager({
+      secret: SECRET, audit: new MemoryAudit(), ttlMs: 10_000, now: () => 1_000,
+    });
+    const owner = { ...actor('platform-owner'), terminalCapability: 'owner' as const };
+    const guest = { ...actor('platform-guest'), terminalCapability: 'readonly' as const };
+    expect(manager.state(owner, 's1')).toEqual({ mode: 'controlled', owned: true, fixed: true });
+    expect(manager.grantForProxy(owner, 's1').scope).toBe('write');
+    expect(manager.state(guest, 's1')).toEqual({ mode: 'readonly', owned: false });
+    expect(manager.grantForProxy(guest, 's1').scope).toBe('read');
+    expect(manager.takeover(guest, 's1')).toEqual({ ok: false, error: 'terminal_operation_forbidden' });
+    expect(manager.release(owner, 's1')).toEqual({ ok: false, error: 'terminal_operation_forbidden' });
+  });
+
   it('starts read-only, reuses one short write grant, and excludes another auth session', () => {
     let now = 1_000;
     const audit = new MemoryAudit();

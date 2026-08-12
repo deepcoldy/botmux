@@ -1,4 +1,5 @@
-import { createServer, type Server } from 'node:http';
+import { createServer, type IncomingMessage, type Server } from 'node:http';
+import { PassThrough } from 'node:stream';
 import { describe, expect, it } from 'vitest';
 import {
   createTerminalFrontProxy,
@@ -23,6 +24,19 @@ function close(server: Server): Promise<void> {
 }
 
 describe('central terminal front proxy boundary', () => {
+  it('attaches a client error handler synchronously on early failure paths', () => {
+    const proxy = createTerminalFrontProxy({
+      resolvePort: () => undefined,
+      resolveActor: () => null,
+      control: {} as any,
+    });
+    const socket = new PassThrough();
+    const req = { url: '/s/s1/', method: 'GET', headers: {} } as IncomingMessage;
+    expect(proxy.handleUpgrade(req, socket, Buffer.alloc(0))).toBe(true);
+    expect(socket.listenerCount('error')).toBeGreaterThan(0);
+    expect(() => socket.emit('error', new Error('browser disconnected'))).not.toThrow();
+  });
+
   it('decodes exactly one session path segment and rejects malformed IDs', () => {
     expect(parseTerminalFrontPath('/s/session%20one/')).toEqual({ sessionId: 'session one' });
     expect(parseTerminalFrontPath('/s/session%2Fescape/')).toBeNull();

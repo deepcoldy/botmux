@@ -351,13 +351,12 @@ export function workbenchTerminalHref(
 ): string | null {
   const external = workbenchExternalTerminalHref(session);
   if (external) return external;
-  if (!session.webPort || !location) return null;
-  if (location.protocol === 'https:') {
-    return session.proxyPort ? `${location.origin}/s/${encodeURIComponent(session.sessionId)}` : null;
-  }
-  const port = session.proxyPort ?? session.webPort;
-  const suffix = session.proxyPort ? `/s/${encodeURIComponent(session.sessionId)}` : '';
-  return `http://${location.hostname}:${port}${suffix}`;
+  if (!session.webPort || !session.proxyPort || !location) return null;
+  // All Workbench terminals use the same-origin central front proxy. That hop
+  // strips browser credentials and injects the short signed read/write grant;
+  // dialing proxyPort directly on HTTP would bypass it and make takeover a
+  // silent no-op at the worker.
+  return `${location.origin}/s/${encodeURIComponent(session.sessionId)}`;
 }
 
 /** Session metadata may originate in another daemon. Treat external URLs and

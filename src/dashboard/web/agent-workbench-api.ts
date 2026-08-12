@@ -5,6 +5,8 @@ export interface TerminalControlState {
   owned: boolean;
   expiresAt?: number;
   reused?: boolean;
+  /** Trusted platform owners have a fixed role, not a releasable takeover lease. */
+  fixed?: boolean;
 }
 
 export interface PreviewInteractionState {
@@ -64,12 +66,19 @@ function terminalControlState(value: unknown, fallbackOwned?: boolean): Terminal
   const owned = typeof body.owned === 'boolean' ? body.owned : fallbackOwned;
   if (typeof owned !== 'boolean') throw new WorkbenchApiError(502, 'invalid_control_response');
   const expiresAt = optionalDeadline(body.expiresAt, 'invalid_control_response');
+  const fixed = body.fixed === undefined ? undefined : body.fixed;
+  if (fixed !== undefined && typeof fixed !== 'boolean') {
+    throw new WorkbenchApiError(502, 'invalid_control_response');
+  }
   if ((body.mode === 'readonly' && (owned || expiresAt !== undefined))
-    || (body.mode === 'controlled' && expiresAt === undefined)) {
+    || (body.mode === 'controlled' && expiresAt === undefined && fixed !== true)) {
     throw new WorkbenchApiError(502, 'invalid_control_response');
   }
   const reused = body.reused === undefined ? undefined : body.reused;
   if (reused !== undefined && typeof reused !== 'boolean') {
+    throw new WorkbenchApiError(502, 'invalid_control_response');
+  }
+  if (fixed === true && (body.mode !== 'controlled' || !owned || expiresAt !== undefined)) {
     throw new WorkbenchApiError(502, 'invalid_control_response');
   }
   return {
@@ -77,6 +86,7 @@ function terminalControlState(value: unknown, fallbackOwned?: boolean): Terminal
     owned,
     ...(expiresAt === undefined ? {} : { expiresAt }),
     ...(reused === undefined ? {} : { reused }),
+    ...(fixed === undefined ? {} : { fixed }),
   };
 }
 

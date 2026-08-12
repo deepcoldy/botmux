@@ -16,10 +16,11 @@ export interface PreviewGuardPageOptions {
 }
 
 function exactRootSessionId(url: URL): string | undefined {
-  if (url.search || !url.pathname.startsWith(`${PREVIEW_ROUTE_PREFIX}/`) || !url.pathname.endsWith('/')) {
+  if (url.search || !url.pathname.startsWith(`${PREVIEW_ROUTE_PREFIX}/`)) {
     return undefined;
   }
-  const raw = url.pathname.slice(PREVIEW_ROUTE_PREFIX.length + 1, -1);
+  const afterPrefix = url.pathname.slice(PREVIEW_ROUTE_PREFIX.length + 1);
+  const raw = afterPrefix.endsWith('/') ? afterPrefix.slice(0, -1) : afterPrefix;
   if (!raw || raw.includes('/')) return undefined;
   let decoded: string;
   try { decoded = decodeURIComponent(raw); } catch { return undefined; }

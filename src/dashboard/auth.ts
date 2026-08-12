@@ -214,6 +214,67 @@ export type AuthDecision =
   | { kind: 'allow+set-cookie'; token: string; redirectTo: string }
   | { kind: 'deny401' };
 
+/**
+ * Feishu/Lark H5 sessions are deliberately narrower than the legacy owner
+ * cookie.  They can render the Workbench, observe its session stream, and use
+ * the two explicitly leased interaction surfaces; they can never fall through
+ * into Dashboard administration merely because a new route was added.
+ *
+ * Keep this as a positive capability map.  In particular, broad rules such as
+ * "all GETs" would expose config/secrets, while "all POSTs under /api/sessions"
+ * would turn an H5 viewer into a host operator.
+ */
+export type WorkbenchH5Capability =
+  | 'workbench.view'
+  | 'terminal.view'
+  | 'terminal.operate'
+  | 'preview.view'
+  | 'preview.operate';
+
+export function workbenchH5Capability(method: string, pathname: string): WorkbenchH5Capability | null {
+  const normalizedMethod = method.toUpperCase();
+  if ((normalizedMethod === 'GET' || normalizedMethod === 'HEAD')
+    && (pathname === '/api/sessions' || pathname === '/events' || pathname === '/api/workbench/h5-context')) {
+    return 'workbench.view';
+  }
+
+  const terminal = pathname.match(/^\/api\/sessions\/[^/]+\/control(?:\/(takeover|release))?$/);
+  if (terminal) {
+    if (normalizedMethod === 'GET' && !terminal[1]) return 'terminal.view';
+    if (normalizedMethod === 'POST' && terminal[1]) return 'terminal.operate';
+    return null;
+  }
+
+  const preview = pathname.match(/^\/api\/sessions\/[^/]+\/preview-interaction(?:\/(unlock|activity|lock))?$/);
+  if (preview) {
+    if (normalizedMethod === 'GET' && !preview[1]) return 'preview.view';
+    if (normalizedMethod === 'POST' && preview[1]) return 'preview.operate';
+    return null;
+  }
+  return null;
+}
+
+/** Fail-closed auth decision for an already-authenticated H5/readonly-platform
+ * identity. Static shell reads retain the ordinary public behavior; everything
+ * else must name one of the Workbench capabilities above. */
+export function decideWorkbenchH5Auth(opts: {
+  method: string;
+  pathname: string;
+}): AuthDecision {
+  if (workbenchH5Capability(opts.method, opts.pathname)) return { kind: 'allow' };
+  return decideDashboardAuth({
+    method: opts.method,
+    pathname: opts.pathname,
+    hasTokenParam: false,
+    presentedToken: undefined,
+    activeToken: '',
+    // An authenticated Workbench identity is not an anonymous public-read
+    // viewer. Do not let a deployment-wide publicReadOnly flag broaden this
+    // capability set to settings/schedules/groups.
+    publicReadOnly: false,
+  });
+}
+
 /** Tokenless-readable API paths when `config.dashboard.publicReadOnly` is on.
  *  ALLOW-LIST (fail-closed): only the "watch work" surfaces the read-only
  *  dashboard renders. Anything NOT in this set stays behind the active token

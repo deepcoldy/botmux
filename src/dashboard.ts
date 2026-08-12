@@ -15,6 +15,7 @@ import { config } from './config.js';
 import { listenWithProbe } from './utils/listen-with-probe.js';
 import {
   generateToken, parseCookie, buildSetCookie, verifyHmac, cliAuthBind, decideDashboardAuth,
+  decideWorkbenchH5Auth,
   loadPersistedToken, persistToken, loadDashboardSecret, loadOrCreateDashboardSecret,
 } from './dashboard/auth.js';
 import { DaemonRegistry, botsRosterSignature } from './dashboard/registry.js';
@@ -28,6 +29,7 @@ import { createDebugTerminalManager } from './dashboard/debug-terminal.js';
 import { createSessionPreviewProxy, type PreviewProxyResolution } from './dashboard/preview-proxy.js';
 import {
   previewDescriptorFromRow,
+  projectSessionDetailForBrowser,
   projectSessionPreviewEventForBrowser,
   projectSessionPreviewsForBrowser,
   resolveSessionPreviewFromRow,
@@ -282,7 +284,8 @@ const terminalControl = new TerminalControlManager({
 const previewInteraction = new PreviewInteractionManager({ audit: dashboardControlAudit });
 
 interface DashboardRequestIdentity extends TerminalDashboardActor {
-  kind: 'legacy-dashboard' | DashboardAuthIdentity['kind'];
+  kind: 'legacy-dashboard' | 'platform-dashboard' | DashboardAuthIdentity['kind'];
+  previewCapability: 'operate' | 'readonly';
 }
 
 function legacyDashboardAuthSessionId(token: string): string {
@@ -295,15 +298,47 @@ function legacyDashboardAuthSessionId(token: string): string {
 function dashboardRequestIdentity(req: IncomingMessage): DashboardRequestIdentity | null {
   const legacyCookie = parseCookie(req.headers.cookie);
   if (activeToken && legacyCookie === activeToken) {
+    // The central platform proves its boundary by injecting the active machine
+    // cookie after stripping the browser's Cookie header. Preserve its role in
+    // the signed loopback actor instead of collapsing owner/guest to one
+    // legacy-owner. A direct local owner can only lower their own privilege by
+    // adding this header; knowing the active cookie is already owner authority.
+    const rawRole = req.headers['x-botmux-role'];
+    const platformBinding = readPlatformBinding();
+    const platformRole = platformBinding && typeof rawRole === 'string'
+      && (rawRole === 'owner' || rawRole === 'teammate' || rawRole === 'guest')
+      ? rawRole
+      : undefined;
+    if (platformRole && platformBinding) {
+      const machineScope = createHmac('sha256', SECRET)
+        .update('botmux-platform-dashboard-actor-v1\0')
+        .update(platformBinding.machineId)
+        .digest('base64url');
+      return {
+        kind: 'platform-dashboard',
+        userId: `platform:${machineScope}:${platformRole}`,
+        authSessionId: `${machineScope}:${platformRole}`,
+        expiresAt: Number.MAX_SAFE_INTEGER,
+        terminalCapability: platformRole === 'owner' ? 'owner' : 'readonly',
+        previewCapability: platformRole === 'owner' ? 'operate' : 'readonly',
+      };
+    }
     return {
       kind: 'legacy-dashboard',
       userId: 'legacy-owner',
       authSessionId: legacyDashboardAuthSessionId(activeToken),
       // Terminal leases are independently capped to fifteen minutes or less.
       expiresAt: Number.MAX_SAFE_INTEGER,
+      terminalCapability: 'controlled',
+      previewCapability: 'operate',
     };
   }
-  return dashboardH5Auth.resolve(req);
+  const h5 = dashboardH5Auth.resolve(req);
+  return h5 ? {
+    ...h5,
+    terminalCapability: 'controlled',
+    previewCapability: 'operate',
+  } : null;
 }
 
 dashboardSessions.onEnd(identity => {
@@ -2698,25 +2733,38 @@ const server = createServer(async (req, res) => {
       return jsonRes(res, 200, { ok: true });
     }
 
-    const presentedToken = authedToken(req, url);
     const h5Identity = dashboardH5Auth.resolve(req);
-    const legacyAuthed = !!presentedToken && presentedToken === activeToken && !!activeToken;
     const requestIdentity = dashboardRequestIdentity(req);
+    // Only the local legacy Dashboard cookie is management authority. Platform
+    // identities — owner included — retain terminal/preview capability through
+    // signed proxy grants, but cannot cross into host administration APIs.
+    const legacyAuthed = requestIdentity?.kind === 'legacy-dashboard';
+    const workbenchOnlyIdentity = !!h5Identity
+      || requestIdentity?.kind === 'platform-dashboard';
+    // For a trusted platform viewer, the injected owner cookie authenticates
+    // the machine hop but the platform role is the user's authority. Do not
+    // let authedToken reinterpret that cookie as the legacy owner capability.
+    const presentedToken = workbenchOnlyIdentity ? undefined : authedToken(req, url);
     const globalDashboardConfig = readGlobalConfig().dashboard;
-    const decision = h5Identity
-      ? { kind: 'allow' as const }
+    const publicReadOnly = globalDashboardConfig?.publicReadOnly
+      ?? config.dashboard.publicReadOnly;
+    const decision = workbenchOnlyIdentity
+      ? decideWorkbenchH5Auth({
+          method: req.method ?? 'GET',
+          pathname: url.pathname,
+        })
       : decideDashboardAuth({
           method: req.method ?? 'GET',
           pathname: url.pathname,
           hasTokenParam: url.searchParams.has('t'),
           presentedToken,
           activeToken: activeToken ?? '',
-          publicReadOnly: globalDashboardConfig?.publicReadOnly
-            ?? config.dashboard.publicReadOnly,
+          publicReadOnly,
         });
-    // `authed` is consumed by route handlers that distinguish the public-read
-    // carve-out from a valid management cookie (notably v3 run details).
-    const authed = requestIdentity !== null || legacyAuthed;
+    // `authed` is deliberately the local management capability, not merely a
+    // valid Workbench/platform identity. Route-local redaction and privileged
+    // mutations therefore cannot be widened by H5 authentication.
+    const authed = legacyAuthed;
 
     if (decision.kind === 'deny401') {
       res.writeHead(401, { 'content-type': 'text/html; charset=utf-8' });
@@ -2775,6 +2823,9 @@ const server = createServer(async (req, res) => {
       if (req.method === 'GET' && !action) {
         return dashboardControlJson(res, 200, { ok: true, ...terminalControl.state(requestIdentity, sessionId) });
       }
+      if (requestIdentity.terminalCapability === 'readonly') {
+        return dashboardControlJson(res, 403, { ok: false, error: 'terminal_operation_forbidden' });
+      }
       if (req.method === 'POST' && action === 'takeover') {
         const result = terminalControl.takeover(requestIdentity, sessionId);
         const status = result.ok ? 200 : result.error === 'control_busy' ? 409 : 401;
@@ -2813,6 +2864,9 @@ const server = createServer(async (req, res) => {
       const action = controlMatch[2];
       if (req.method === 'GET' && !action) {
         return dashboardControlJson(res, 200, { ok: true, ...previewInteraction.state(requestIdentity, sessionId) });
+      }
+      if (requestIdentity.previewCapability === 'readonly') {
+        return dashboardControlJson(res, 403, { ok: false, error: 'preview_operation_forbidden' });
       }
       if (req.method === 'POST' && action === 'unlock') {
         return dashboardControlJson(res, 200, { ok: true, ...previewInteraction.unlock(requestIdentity, sessionId) });
@@ -4018,9 +4072,16 @@ const server = createServer(async (req, res) => {
       const owner = aggregator.ownerOf(sid);
       if (!owner) return jsonRes(res, 404, { ok: false, error: 'unknown_session' });
       const upstream = await proxyToDaemon(owner, `/api/sessions/${sid}`, { method: 'GET' });
-      res.writeHead(upstream.status, { 'content-type': 'application/json' });
-      res.end(await upstream.text());
-      return;
+      const raw = await upstream.text();
+      if (!upstream.ok) {
+        res.writeHead(upstream.status, { 'content-type': 'application/json' });
+        res.end(raw);
+        return;
+      }
+      let body: unknown;
+      try { body = JSON.parse(raw); }
+      catch { return jsonRes(res, 502, { ok: false, error: 'invalid_daemon_response' }); }
+      return jsonRes(res, upstream.status, projectSessionDetailForBrowser(body));
     }
 
     // 异步 trigger 结果轮询（asyncReturnSessionId 模式的权威查询端点）。

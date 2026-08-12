@@ -15044,6 +15044,7 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
   // routing into thread-scope so the bot's first reply seeds a Lark thread.
   let scope = ctx.scope;
   let anchor = ctx.anchor;
+  let quotaConsumedBeforeSessionGroupBirth = false;
 
   // ─── p2pMode='group'：会话群出生 ────────────────────────────────────────
   // group 模式下，顶层 DM 消息在任何会话机制启动前先改道：建一个专属会话群
@@ -15065,8 +15066,27 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
     // 语境属于既有话题，绝不当全新会话建群（回退 thread 旧行为）。
     && !data?.message?.thread_id
   ) {
+    // A quota denial must have zero external side effects. Charge the original
+    // DM before creating the real Feishu chat, then mark the rewritten turn so
+    // the ordinary pre-worker gate below does not charge it a second time.
+    const quotaSenderOpenId: string | undefined = data.sender?.sender_id?.open_id;
+    const quotaSenderUnionId: string | undefined = data.sender?.sender_id?.union_id;
+    const quotaTeamTrustUnionId = (data.sender?.sender_type === 'app' || data.sender?.sender_type === 'bot')
+      ? quotaSenderUnionId
+      : undefined;
+    if (!await enforceMessageQuotaForCliInput(
+      larkAppId,
+      chatId,
+      quotaSenderOpenId,
+      messageId,
+      anchor,
+      quotaTeamTrustUnionId,
+      quotaSenderUnionId,
+      chatType,
+    )) return;
+    quotaConsumedBeforeSessionGroupBirth = true;
     const reborn = await maybeBirthSessionGroup(data, ctx);
-    if (reborn) return handleNewTopic(data, reborn);
+    if (reborn) return handleNewTopic(data, { ...reborn, sessionGroupQuotaConsumed: true });
   }
 
   // ─── 会话群同群续聊 ─────────────────────────────────────────────────────
@@ -15390,7 +15410,18 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
     }
   }
 
-  if (!await enforceMessageQuotaForCliInput(larkAppId, chatId, senderOpenId, messageId, anchor, teamTrustUnionId, senderUnionId, chatType)) {
+  if (!ctx.sessionGroupQuotaConsumed
+    && !quotaConsumedBeforeSessionGroupBirth
+    && !await enforceMessageQuotaForCliInput(
+      larkAppId,
+      chatId,
+      senderOpenId,
+      messageId,
+      anchor,
+      teamTrustUnionId,
+      senderUnionId,
+      chatType,
+    )) {
     return;
   }
 

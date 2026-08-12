@@ -38,4 +38,12 @@ describe('Agent Workbench route and surface integration', () => {
     expect(dashboard).toContain("result.ok ? { ...result, owned: false }");
     expect(dashboard).toContain("url.pathname === '/api/workbench/h5-context'");
   });
+
+  it('does not reinterpret a Workbench-only platform cookie as legacy owner authority', () => {
+    const dashboard = readFileSync(join(process.cwd(), 'src/dashboard.ts'), 'utf8');
+    expect(dashboard).toContain('const presentedToken = workbenchOnlyIdentity ? undefined : authedToken(req, url)');
+    expect(dashboard).toContain('decideWorkbenchH5Auth');
+    expect(dashboard).toContain("requestIdentity.terminalCapability === 'readonly'");
+    expect(dashboard).toContain("requestIdentity.previewCapability === 'readonly'");
+  });
 });

@@ -11,6 +11,7 @@ import {
 import {
   projectSessionPreviewEventForBrowser,
   projectSessionPreviewForBrowser,
+  projectSessionDetailForBrowser,
   resolveSessionPreviewFromRow,
 } from '../src/dashboard/preview-contract.js';
 import {
@@ -138,6 +139,15 @@ describe('session preview REST/SSE contract', () => {
       sessionId: 's1', patch: { preview: { path: 'javascript:alert(1)' }, unrelated: true },
     }) as any;
     expect(injected.patch).toEqual({ unrelated: true });
+  });
+
+  it('projects single-session daemon envelopes without leaking the loopback target', () => {
+    const projected = projectSessionDetailForBrowser({
+      session: { sessionId: 's1', title: 'one', previewTarget },
+    }) as any;
+    expect(projected.session.preview.path).toBe('/preview/s1/');
+    expect(projected.session).not.toHaveProperty('previewTarget');
+    expect(JSON.stringify(projected)).not.toContain('127.0.0.1');
   });
 
   it('removes preview metadata from anonymous REST and SSE', () => {

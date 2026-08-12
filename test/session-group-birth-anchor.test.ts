@@ -137,6 +137,7 @@ function birthCtx(overrides: Partial<RoutingContext> = {}): RoutingContext {
     larkAppId: APP,
     replyRootId: undefined,
     sessionGroupBirth: true,
+    sessionGroupQuotaConsumed: true,
     replyAnchorMessageId: INTRO_MSG,
     ...overrides,
   };

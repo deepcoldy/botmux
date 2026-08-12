@@ -2738,11 +2738,12 @@ function SessionGroupTagRow(props: { bot: BotDefaultsRow }) {
   const [authBusy, setAuthBusy] = useState(false);
   const [modeBusy, setModeBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
+  const lifecycle = useRef({ generation: 0, mounted: true });
 
-  const fetchStatus = async (): Promise<boolean> => {
+  const fetchStatus = async (generation = lifecycle.current.generation): Promise<boolean> => {
     try {
       const res = await sendJson('GET', `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/session-group-tag-status`);
-      if (res.ok && res.body.ok) {
+      if (lifecycle.current.mounted && generation === lifecycle.current.generation && res.ok && res.body.ok) {
         setStatus({ authorized: !!res.body.authorized, tagMode: String(res.body.tagMode ?? 'chat-tag') });
         return !!res.body.authorized;
       }
@@ -2750,7 +2751,21 @@ function SessionGroupTagRow(props: { bot: BotDefaultsRow }) {
     return false;
   };
 
-  useEffect(() => { void fetchStatus(); }, [props.bot.larkAppId]);
+  useEffect(() => {
+    lifecycle.current.mounted = true;
+    const generation = ++lifecycle.current.generation;
+    // The row instance can survive a bot switch. Clear the previous bot's
+    // in-flight UI state as well as invalidating its polling generation.
+    setStatus(null);
+    setAuthBusy(false);
+    setModeBusy(false);
+    setErr(null);
+    void fetchStatus(generation);
+    return () => {
+      lifecycle.current.mounted = false;
+      lifecycle.current.generation += 1;
+    };
+  }, [props.bot.larkAppId]);
 
   async function saveMode(next: string): Promise<void> {
     setModeBusy(true);
@@ -2770,6 +2785,7 @@ function SessionGroupTagRow(props: { bot: BotDefaultsRow }) {
   }
 
   async function startAuth(): Promise<void> {
+    const generation = ++lifecycle.current.generation;
     setAuthBusy(true);
     setErr(null);
     try {
@@ -2782,13 +2798,18 @@ function SessionGroupTagRow(props: { bot: BotDefaultsRow }) {
       // 轮询授权结果：3s × 60 次（授权链接 5 分钟有效期同量级）。
       for (let i = 0; i < 60; i++) {
         await new Promise(r => setTimeout(r, 3000));
-        if (await fetchStatus()) return;
+        if (!lifecycle.current.mounted || generation !== lifecycle.current.generation) return;
+        if (await fetchStatus(generation)) return;
       }
-      setErr(tr('botDefaults.sgTagAuthTimeout'));
+      if (lifecycle.current.mounted && generation === lifecycle.current.generation) {
+        setErr(tr('botDefaults.sgTagAuthTimeout'));
+      }
     } catch (e: any) {
-      setErr(caughtErrorText(e));
+      if (lifecycle.current.mounted && generation === lifecycle.current.generation) {
+        setErr(caughtErrorText(e));
+      }
     } finally {
-      setAuthBusy(false);
+      if (lifecycle.current.mounted && generation === lifecycle.current.generation) setAuthBusy(false);
     }
   }
 

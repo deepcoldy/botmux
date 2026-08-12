@@ -35,6 +35,7 @@ import {
   isSessionGroup,
   getSessionGroup,
   touchSessionGroup,
+  markSessionGroupTitleFailed,
   markSessionGroupTitled,
   removeSessionGroup,
   listSessionGroups,
@@ -81,6 +82,18 @@ describe('session-groups-store', () => {
     const entry = getSessionGroup('oc_a')!;
     expect(entry.lastSessionId).toBe('sess-1');
     expect(entry.titled).toBe(true);
+  });
+
+  it('persists bounded title retry metadata and clears the retry deadline on success', () => {
+    registerSessionGroup('oc_a', { ownerOpenId: 'ou_owner', lastSessionId: 'sess-1' });
+    const failed = markSessionGroupTitleFailed('oc_a', 1_000)!;
+    expect(failed.titleAttempts).toBe(1);
+    expect(failed.titleRetryAt).toBe(31_000);
+    initSessionGroups('cli_testapp');
+    expect(getSessionGroup('oc_a')).toMatchObject({ titleAttempts: 1, titleRetryAt: 31_000 });
+    markSessionGroupTitled('oc_a');
+    expect(getSessionGroup('oc_a')).toMatchObject({ titled: true, titleAttempts: 1 });
+    expect(getSessionGroup('oc_a')!.titleRetryAt).toBeUndefined();
   });
 
   it('is per-appId: another app does not see the entries', () => {

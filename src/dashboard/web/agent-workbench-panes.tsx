@@ -151,7 +151,7 @@ export function TerminalPane(props: PaneCommonProps & { location: WorkbenchTermi
         </div>
         <div className="wb-pane-actions">
           {terminalUrl ? <a href={terminalUrl} target="_blank" rel="noopener noreferrer">Open tab</a> : null}
-          {!externalTerminalUrl && terminalUrl && props.authenticated ? (
+          {!externalTerminalUrl && terminalUrl && props.authenticated && !control?.fixed ? (
             controlled
               ? <button type="button" disabled={phase === 'busy'} onClick={() => void mutate('release')}>Release</button>
               : <button type="button" disabled={phase === 'busy'} onClick={() => void mutate('takeover')}>Take control</button>
@@ -159,7 +159,9 @@ export function TerminalPane(props: PaneCommonProps & { location: WorkbenchTermi
         </div>
       </header>
       <div className="wb-pane-feedback" role="status" aria-live="polite">
-        {phase === 'loading' ? 'Checking terminal access…' : error || (controlled ? 'Keyboard input is enabled for this lease.' : 'Viewing without input permission.')}
+        {phase === 'loading' ? 'Checking terminal access…' : error || (control?.fixed
+          ? 'Keyboard input is enabled for the authenticated platform owner.'
+          : controlled ? 'Keyboard input is enabled for this lease.' : 'Viewing without input permission.')}
       </div>
       <div className="wb-pane-frame-shell">
         {externalTerminalUrl ? (

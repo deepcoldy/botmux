@@ -1,4 +1,13 @@
-import { appendFileSync, chmodSync, mkdirSync } from 'node:fs';
+import {
+  appendFileSync,
+  chmodSync,
+  close,
+  createWriteStream,
+  fchmod,
+  open,
+  mkdirSync,
+  type WriteStream,
+} from 'node:fs';
 import { dirname, join } from 'node:path';
 import { homedir } from 'node:os';
 
@@ -38,7 +47,6 @@ export interface ControlAuditSink {
 
 export interface FileControlAuditSinkOptions {
   path?: string;
-  now?: () => Date;
 }
 
 export function defaultControlAuditPath(): string {
@@ -89,11 +97,77 @@ export class FileControlAuditSink implements ControlAuditSink {
   }
 }
 
+/**
+ * High-frequency, best-effort sink for terminal input counters. Directory and
+ * permissions are established exactly once, then compact records are queued to
+ * one O_APPEND stream so a slow/NFS home directory never blocks the worker's
+ * PTY event loop for every keystroke. Security-boundary actions keep using the
+ * synchronous FileControlAuditSink above so takeover can remain fail-closed.
+ */
+export class AsyncFileControlAuditSink implements ControlAuditSink {
+  private readonly path: string;
+  private stream: WriteStream | undefined;
+  private opening: Promise<WriteStream | undefined> | undefined;
+  private pending: string[] = [];
+  private unavailable = false;
+
+  constructor(opts: FileControlAuditSinkOptions = {}) {
+    this.path = opts.path ?? defaultControlAuditPath();
+  }
+
+  append(record: ControlAuditRecord): void {
+    if (this.unavailable) return;
+    const line = `${JSON.stringify(record)}\n`;
+    if (this.stream) {
+      this.stream.write(line, 'utf8');
+      return;
+    }
+    this.pending.push(line);
+    void (this.opening ??= this.openStream()).then(stream => {
+      if (!stream) return;
+      for (const item of this.pending.splice(0)) stream.write(item, 'utf8');
+    });
+  }
+
+  private async openStream(): Promise<WriteStream | undefined> {
+    try {
+      const { mkdir } = await import('node:fs/promises');
+      await mkdir(dirname(this.path), { recursive: true, mode: 0o700 });
+      const fd = await new Promise<number>((resolve, reject) => {
+        open(this.path, 'a', 0o600, (error, value) => error ? reject(error) : resolve(value));
+      });
+      await new Promise<void>((resolve, reject) => {
+        fchmod(fd, 0o600, error => error ? reject(error) : resolve());
+      }).catch(error => {
+        close(fd, () => {});
+        throw error;
+      });
+      const stream = createWriteStream(this.path, {
+        fd,
+        flags: 'a',
+        autoClose: true,
+        encoding: 'utf8',
+      });
+      stream.on('error', () => {
+        this.unavailable = true;
+        // autoClose owns the descriptor once the stream is constructed.
+        // Closing it again here can race the stream's own error cleanup.
+      });
+      this.stream = stream;
+      return stream;
+    } catch {
+      this.unavailable = true;
+      this.pending.length = 0;
+      return undefined;
+    }
+  }
+}
+
 let defaultSink: ControlAuditSink | undefined;
 
 export function appendControlAudit(record: ControlAuditRecord): void {
   try {
-    (defaultSink ??= new FileControlAuditSink()).append(record);
+    (defaultSink ??= new AsyncFileControlAuditSink()).append(record);
   } catch {
     // Never include the record or underlying error in logs: either could carry
     // an operator-controlled path/identifier. Runtime remains available.

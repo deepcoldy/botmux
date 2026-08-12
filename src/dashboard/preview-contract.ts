@@ -29,6 +29,15 @@ export function projectSessionPreviewsForBrowser(sessions: unknown[]): unknown[]
   return sessions.map(projectSessionPreviewForBrowser);
 }
 
+/** Projection for daemon `GET /api/sessions/:id` envelopes. Keep this beside
+ * the list/SSE projectors so every browser delivery path shares one rule. */
+export function projectSessionDetailForBrowser(body: unknown): unknown {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return body;
+  const source = body as Record<string, unknown>;
+  if (!Object.prototype.hasOwnProperty.call(source, 'session')) return body;
+  return { ...source, session: projectSessionPreviewForBrowser(source.session) };
+}
+
 /** Apply the identical projection to the central SSE stream. A future clear
  * patch maps to `preview: null`, ensuring browser stores discard stale state. */
 export function projectSessionPreviewEventForBrowser(type: string, body: unknown): unknown {

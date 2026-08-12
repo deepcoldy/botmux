@@ -14,6 +14,12 @@ export interface TerminalDashboardActor {
   userId: string;
   authSessionId: string;
   expiresAt: number;
+  /**
+   * `controlled` is the Workbench lease model. A trusted central-platform
+   * owner retains its historical always-write role; teammate/guest identities
+   * are permanently read-only and cannot promote themselves via takeover.
+   */
+  terminalCapability?: 'controlled' | 'owner' | 'readonly';
 }
 
 export interface TerminalControlSocket {
@@ -35,11 +41,11 @@ interface TerminalControlLease {
 
 export type TerminalControlTakeoverResult =
   | { ok: true; mode: 'controlled'; expiresAt: number; reused: boolean }
-  | { ok: false; error: 'authentication_expired' | 'control_busy' };
+  | { ok: false; error: 'authentication_expired' | 'control_busy' | 'terminal_operation_forbidden' };
 
 export type TerminalControlReleaseResult =
   | { ok: true; mode: 'readonly'; released: boolean }
-  | { ok: false; error: 'control_owned_by_another_session' };
+  | { ok: false; error: 'control_owned_by_another_session' | 'terminal_operation_forbidden' };
 
 /** Internal central-proxy material. The browser receives neither the signed
  * token nor the lease marker; both stay on the loopback hop. */
@@ -92,6 +98,17 @@ export class TerminalControlManager {
 
   takeover(actor: TerminalDashboardActor, sessionId: string): TerminalControlTakeoverResult {
     const now = this.now();
+    if (actor.terminalCapability === 'readonly') {
+      return { ok: false, error: 'terminal_operation_forbidden' };
+    }
+    if (actor.terminalCapability === 'owner') {
+      return {
+        ok: true,
+        mode: 'controlled',
+        expiresAt: Math.min(actor.expiresAt, now + READ_GRANT_TTL_MS),
+        reused: true,
+      };
+    }
     this.expireSessionIfDue(sessionId, now);
     if (!Number.isSafeInteger(actor.expiresAt) || actor.expiresAt <= now) {
       return { ok: false, error: 'authentication_expired' };
@@ -139,6 +156,9 @@ export class TerminalControlManager {
   }
 
   release(actor: TerminalDashboardActor, sessionId: string): TerminalControlReleaseResult {
+    if (actor.terminalCapability === 'readonly' || actor.terminalCapability === 'owner') {
+      return { ok: false, error: 'terminal_operation_forbidden' };
+    }
     const now = this.now();
     this.expireSessionIfDue(sessionId, now);
     const lease = this.leases.get(sessionId);
@@ -154,8 +174,13 @@ export class TerminalControlManager {
     mode: 'readonly' | 'controlled';
     owned: boolean;
     expiresAt?: number;
+    fixed?: boolean;
   } {
     const now = this.now();
+    if (actor.terminalCapability === 'readonly') return { mode: 'readonly', owned: false };
+    if (actor.terminalCapability === 'owner') {
+      return { mode: 'controlled', owned: true, fixed: true };
+    }
     this.expireSessionIfDue(sessionId, now);
     const lease = this.leases.get(sessionId);
     if (!lease) return { mode: 'readonly', owned: false };
@@ -171,8 +196,22 @@ export class TerminalControlManager {
    * the asynchronous worker WebSocket handshake completes. */
   grantForProxy(actor: TerminalDashboardActor, sessionId: string): TerminalProxyGrant {
     const now = this.now();
+    if (actor.terminalCapability === 'owner') {
+      const expiresAt = Math.min(actor.expiresAt, now + READ_GRANT_TTL_MS);
+      return {
+        token: issueTerminalControlGrant(this.secret, {
+          scope: 'write',
+          sessionId,
+          userId: actor.userId,
+          authSessionId: actor.authSessionId,
+          issuedAt: now,
+          expiresAt,
+        }),
+        scope: 'write',
+      };
+    }
     this.expireSessionIfDue(sessionId, now);
-    const lease = this.leases.get(sessionId);
+    const lease = actor.terminalCapability === 'readonly' ? undefined : this.leases.get(sessionId);
     if (lease && lease.authSessionId === actor.authSessionId && lease.userId === actor.userId) {
       return { token: lease.grant, scope: 'write', leaseMarker: lease.grantId };
     }

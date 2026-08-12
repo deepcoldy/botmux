@@ -9,6 +9,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   verifyHmac, generateToken, parseCookie, decideDashboardAuth,
+  decideWorkbenchH5Auth, workbenchH5Capability,
   loadPersistedToken, persistToken, loadDashboardSecret, loadOrCreateDashboardSecret,
 } from '../src/dashboard/auth.js';
 
@@ -635,5 +636,39 @@ describe('decideDashboardAuth — publicReadOnly mode', () => {
       presentedToken: TOK, activeToken: TOK, publicReadOnly: true,
     });
     expect(d.kind).toBe('allow');
+  });
+});
+
+describe('Workbench H5 capability boundary', () => {
+  it('allows only session observation and explicitly scoped terminal/preview control', () => {
+    expect(workbenchH5Capability('GET', '/api/sessions')).toBe('workbench.view');
+    expect(workbenchH5Capability('GET', '/events')).toBe('workbench.view');
+    expect(workbenchH5Capability('GET', '/api/workbench/h5-context')).toBe('workbench.view');
+    expect(workbenchH5Capability('GET', '/api/sessions/s1/control')).toBe('terminal.view');
+    expect(workbenchH5Capability('POST', '/api/sessions/s1/control/takeover')).toBe('terminal.operate');
+    expect(workbenchH5Capability('POST', '/api/sessions/s1/preview-interaction/unlock')).toBe('preview.operate');
+  });
+
+  it('fails closed for every management mutation and sensitive read', () => {
+    for (const [method, pathname] of [
+      ['PUT', '/api/bots/app/env'],
+      ['PUT', '/api/settings'],
+      ['POST', '/api/schedules'],
+      ['DELETE', '/api/skills/tool'],
+      ['POST', '/api/sessions/s1/close'],
+      ['GET', '/api/sessions/s1/write-link'],
+      ['GET', '/api/bots'],
+      ['GET', '/api/settings'],
+      ['GET', '/api/some-future-route'],
+    ] as const) {
+      expect(workbenchH5Capability(method, pathname), `${method} ${pathname}`).toBeNull();
+      expect(decideWorkbenchH5Auth({ method, pathname }).kind, `${method} ${pathname}`).toBe('deny401');
+    }
+  });
+
+  it('retains the static Workbench shell without broadening APIs', () => {
+    expect(decideWorkbenchH5Auth({ method: 'GET', pathname: '/' }).kind).toBe('allow');
+    expect(decideWorkbenchH5Auth({ method: 'GET', pathname: '/assets/dashboard.js' }).kind).toBe('allow');
+    expect(decideWorkbenchH5Auth({ method: 'GET', pathname: '/api/settings' }).kind).toBe('deny401');
   });
 });

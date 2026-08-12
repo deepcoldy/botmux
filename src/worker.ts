@@ -1197,6 +1197,10 @@ function resolveTerminalAccessForReq(req: IncomingMessage, url: URL): WorkerTerm
     () => readPlatformBinding() !== null,
     () => loadPersistedToken(DASHBOARD_TOKEN_PATH),
   );
+  // Most terminal HTTP/WS requests use legacy view/write capabilities. Avoid a
+  // synchronous secret-file read on that hot path; only the central front
+  // proxy supplies this internal header.
+  if (req.headers['x-botmux-terminal-control'] === undefined) return legacy;
   const secret = loadDashboardSecret(DASHBOARD_SECRET_PATH);
   if (!secret || !sessionId) return legacy;
   const grant = verifyTerminalControlGrant(

@@ -17,7 +17,9 @@ import {
 import { requestLiteralLoopback } from '../core/loopback-target.js';
 import type { SessionPreviewResolution } from './preview-contract.js';
 
-const UPSTREAM_CONNECT_TIMEOUT_MS = 2_000;
+/** Dev servers commonly cold-compile their first response for 3–30 seconds.
+ * This bounds only the pre-header phase and is cleared once headers arrive. */
+export const PREVIEW_UPSTREAM_RESPONSE_TIMEOUT_MS = 45_000;
 const MAX_WEBSOCKET_REJECTION_BYTES = 64 * 1024;
 
 export type PreviewProxyResolution = SessionPreviewResolution | {
@@ -296,7 +298,7 @@ export function createSessionPreviewProxy(options: SessionPreviewProxyOptions): 
       if (!res.headersSent) jsonError(res, 502, 'preview_unreachable');
       else res.end();
     };
-    upstream.setTimeout(UPSTREAM_CONNECT_TIMEOUT_MS, () => upstream.destroy());
+    upstream.setTimeout(PREVIEW_UPSTREAM_RESPONSE_TIMEOUT_MS, () => upstream.destroy());
     upstream.on('error', fail);
     req.on('aborted', () => upstream.destroy());
     req.pipe(upstream);
@@ -309,6 +311,16 @@ export function createSessionPreviewProxy(options: SessionPreviewProxyOptions): 
     catch { return false; }
     const parsed = parseSessionPreviewRequest(url);
     if (!parsed.matched) return false;
+    // Attach before validation/dial so a browser disconnect on every claimed
+    // 400/401/404/502 path is handled instead of becoming an uncaught process
+    // `error` event.
+    let upstreamRequest: ReturnType<typeof requestLiteralLoopback> | undefined;
+    let bridgedSocket: Duplex | undefined;
+    clientSocket.on('error', () => {
+      upstreamRequest?.destroy();
+      bridgedSocket?.destroy();
+      if (!clientSocket.destroyed) clientSocket.destroy();
+    });
     if (!parsed.ok) {
       socketError(clientSocket, 400, parsed.error);
       return true;
@@ -325,9 +337,11 @@ export function createSessionPreviewProxy(options: SessionPreviewProxyOptions): 
       path: parsed.upstreamPath,
       headers: previewRequestHeaders(req.headers, target, { upgrade: true }),
     });
-    upstream.setTimeout(UPSTREAM_CONNECT_TIMEOUT_MS, () => upstream.destroy());
+    upstreamRequest = upstream;
+    upstream.setTimeout(PREVIEW_UPSTREAM_RESPONSE_TIMEOUT_MS, () => upstream.destroy());
     upstream.on('upgrade', (upRes, upstreamSocket, upstreamHead) => {
       responded = true;
+      bridgedSocket = upstreamSocket;
       upstream.setTimeout(0);
       upstreamSocket.setTimeout(0);
       const lines = [`HTTP/1.1 ${upRes.statusCode ?? 101} ${upRes.statusMessage ?? 'Switching Protocols'}`];
@@ -348,7 +362,6 @@ export function createSessionPreviewProxy(options: SessionPreviewProxyOptions): 
         clientSocket.destroy();
       };
       upstreamSocket.on('error', cleanup);
-      clientSocket.on('error', cleanup);
       upstreamSocket.on('close', () => clientSocket.destroy());
       clientSocket.on('close', () => upstreamSocket.destroy());
     });

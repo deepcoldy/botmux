@@ -62,6 +62,9 @@ describe('guarded web preview shell', () => {
     expect(allowed.headers.get('content-security-policy')).toContain('https://*.feishu.cn');
     expect(allowed.headers.get('content-security-policy')).toContain('https://*.larksuite.com');
     expect(await allowed.text()).toContain(PREVIEW_DEFAULT_MODE_LABEL);
+    const noSlash = await fetch(`${allowedBase}/preview/s1`);
+    expect(noSlash.status).toBe(200);
+    expect(await noSlash.text()).toContain(PREVIEW_DEFAULT_MODE_LABEL);
     expect((await fetch(`${allowedBase}/preview/unknown/`)).status).toBe(404);
     // Reserved iframe content requests deliberately bypass the shell and are
     // left for the hardened preview proxy mounted immediately afterwards.

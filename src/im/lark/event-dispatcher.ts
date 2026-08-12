@@ -1475,6 +1475,9 @@ export interface RoutingContext {
    *  re-homed this turn from a DM into a freshly-created session group —
    *  prevents the birth logic from re-triggering on the rewritten context. */
   sessionGroupBirth?: boolean;
+  /** Quota was consumed against the source DM before a session-group side
+   * effect was allowed. The rewritten group turn must not charge it twice. */
+  sessionGroupQuotaConsumed?: boolean;
   /** Session-group birth only: the in-group intro message id used as the
    *  turn's REPLY anchor (quote target / session rootMessageId), so the first
    *  turn's outputs land in the group. `messageId` stays the ORIGINAL inbound
