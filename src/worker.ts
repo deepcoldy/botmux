@@ -11365,6 +11365,7 @@ async function spawnCli(
     let available = true;
     let reason = '';
     let hasExistingSession = false;
+    let existingSessionUnknown = false;
     if (effectiveBackend === 'tmux') {
       hasExistingSession = TmuxBackend.hasSession(TmuxBackend.sessionName(cfg.sessionId));
       if (!hasExistingSession) {
@@ -11376,10 +11377,22 @@ async function spawnCli(
       // Like tmux, zellij's probe is a disposable background session, so a
       // live named session is more authoritative than a transient probe
       // failure (PR#249 semantics) — check it first so we reattach, not gate.
-      hasExistingSession = ZellijBackend.hasSession(ZellijBackend.sessionName(cfg.sessionId));
-      if (!hasExistingSession) {
+      //
+      // Tri-state on purpose: `hasSession()` is `probeSession() === 'exists'`,
+      // so it answers `false` BOTH for "no such session" and for "the probe got
+      // no answer" (`list-sessions` timed out / spawn failed). Under host load
+      // that second case is real — the probe needs a fork+exec before zellij
+      // ever runs — and collapsing it into "no session" then let the functional
+      // probe (which spawns a background session, so it times out under the
+      // same pressure) gate a session whose pane was alive the whole time.
+      const probeState = ZellijBackend.probeSession(ZellijBackend.sessionName(cfg.sessionId));
+      hasExistingSession = probeState === 'exists';
+      existingSessionUnknown = probeState === 'unknown';
+      if (probeState === 'missing') {
         available = ZellijBackend.isAvailable();
         reason = 'zellij 功能性探针失败（需 zellij >= 0.44）';
+      } else if (existingSessionUnknown) {
+        log('zellij list-sessions probe returned no answer (host load); spawning to let reattach decide instead of gating');
       }
     } else if (effectiveBackend === 'zmx') {
       // The local controller version is a protocol requirement even when the
@@ -11413,7 +11426,7 @@ async function spawnCli(
       available = HerdrBackend.isAvailable();
       reason = 'herdr 功能性探针失败';
     }
-    const decision = decideBackendGate({ requested: effectiveBackend, available, hasExistingSession });
+    const decision = decideBackendGate({ requested: effectiveBackend, available, hasExistingSession, existingSessionUnknown });
     if (decision.action === 'gate') {
       const detail = reason || decision.reason;
       log(`${effectiveBackend} backend unavailable and silent PTY fallback is disabled (set BACKEND_TYPE=pty to opt in): ${detail}`);

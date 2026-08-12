@@ -45,6 +45,56 @@ describe('decideBackendGate (PTY 退役 hard gate)', () => {
     ).toEqual({ action: 'spawn' });
   });
 
+  /**
+   * Regression: `hasSession()` is `probeSession() === 'exists'`, so it answers
+   * `false` both for "no such session" and for "the probe got no answer".
+   * Under host load the zellij existence check (`list-sessions`, needs a
+   * fork+exec) can be killed by its own timeout; the functional probe then
+   * spawns a background session and times out under the same pressure, and a
+   * session whose pane was alive the whole time got gated with
+   * "zellij 不可用".
+   */
+  it('does NOT gate zellij when the existence check itself got no answer', () => {
+    expect(
+      decideBackendGate({
+        requested: 'zellij',
+        available: false,
+        hasExistingSession: false,
+        existingSessionUnknown: true,
+      }),
+    ).toEqual({ action: 'spawn' });
+  });
+
+  it('still gates zellij when the session is PROVABLY absent and the probe failed', () => {
+    // The guard must keep its teeth: an authoritative "no such session" plus a
+    // failed capability probe is the real "zellij is broken" case.
+    expect(
+      decideBackendGate({
+        requested: 'zellij',
+        available: false,
+        hasExistingSession: false,
+        existingSessionUnknown: false,
+      }).action,
+    ).toBe('gate');
+  });
+
+  it('still gates ZMX on an indeterminate ownership probe (opposite asymmetry, unchanged)', () => {
+    // ZMX deliberately gates when ownership/protocol cannot be established —
+    // adopting someone else's session is the worse outcome there. It never sets
+    // existingSessionUnknown, so the zellij/tmux exemption must not reach it.
+    expect(
+      decideBackendGate({ requested: 'zmx', available: false, hasExistingSession: false }).action,
+    ).toBe('gate');
+  });
+
+  it('gates on an indeterminate zellij probe ONLY via the explicit flag, not via available=false', () => {
+    // Sanity: the exemption is opt-in per call site. A caller that never sets
+    // the flag keeps the old fail-closed behaviour.
+    expect(
+      decideBackendGate({ requested: 'zellij', available: false, hasExistingSession: false }).action,
+    ).toBe('gate');
+  });
+
   it('requires the ZMX protocol version before considering a managed live session', () => {
     const start = workerSource.indexOf("} else if (effectiveBackend === 'zmx') {");
     const end = workerSource.indexOf("} else if (effectiveBackend === 'herdr')", start);
@@ -55,6 +105,24 @@ describe('decideBackendGate (PTY 退役 hard gate)', () => {
     expect(gate.indexOf('probeZmxVersion()')).toBeLessThan(gate.indexOf('probeOwnedZmxSession('));
     expect(gate).toContain("resolvedZmxSessionProbe = 'unknown'");
     expect(gate).toContain('hasExistingSession = false');
+    // ZMX must NOT opt into the indeterminate-existence exemption: an unproven
+    // ownership/protocol result has to keep gating.
+    expect(gate).not.toContain('existingSessionUnknown = true');
+  });
+
+  it('wires the zellij gate through the tri-state probe, not the boolean hasSession', () => {
+    const start = workerSource.indexOf("} else if (effectiveBackend === 'zellij') {");
+    const end = workerSource.indexOf("} else if (effectiveBackend === 'zmx')", start);
+    const gate = workerSource.slice(start, end);
+
+    expect(start).toBeGreaterThan(-1);
+    expect(end).toBeGreaterThan(start);
+    expect(gate).toContain('ZellijBackend.probeSession(ZellijBackend.sessionName(cfg.sessionId))');
+    expect(gate).not.toContain('ZellijBackend.hasSession(');
+    // The capability probe runs ONLY on an authoritative 'missing'; an
+    // indeterminate answer must not fall through into it and then gate.
+    expect(gate).toContain("if (probeState === 'missing')");
+    expect(gate).toContain('existingSessionUnknown');
   });
 });
 
