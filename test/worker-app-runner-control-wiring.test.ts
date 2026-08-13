@@ -8,6 +8,7 @@ import {
   CodexRunnerFreshnessInputQueue,
   type CodexRunnerFreshnessState,
 } from '../src/services/codex-runner-freshness.js';
+import { RunnerControlDecoder, RUNNER_CONTROL_PREFIX, RUNNER_CONTROL_END } from '../src/adapters/cli/runner-control-channel.js';
 
 const workerSource = readFileSync(new URL('../src/worker.ts', import.meta.url), 'utf8');
 
@@ -374,5 +375,33 @@ describe('worker app-runner control-channel wiring', () => {
     expect(marker).not.toContain('finalText: deliverableContent');
     // The send payload still posts the stripped deliverable, not the raw final.
     expect(marker).toContain('content: (suppressDelivery || isSuperseded) ? \'\' : deliverableContent,');
+  });
+
+  it('enables OSC decoding for dsh and routes final frames to the generic path', () => {
+    // The worker only decodes runner OSC frames for cliIds in this set.
+    expect(workerSource).toContain("const APP_RUNNER_OSC_CLI_IDS = new Set(['mira', 'mir', 'dsh']);");
+    // dsh finals go through the generic (non-codex-app) settlement path.
+    const markerStart = workerSource.indexOf('if (kind === \'final\' && typeof payload.content === \'string\')');
+    expect(markerStart).toBeGreaterThan(-1);
+    const genericPath = workerSource.indexOf('// Mira/Mir retain their terminal OSC control path', markerStart);
+    expect(genericPath).toBeGreaterThan(markerStart);
+  });
+
+  it('decodes a dsh final OSC frame without leaking control bytes to display', () => {
+    // Behavioral mirror of the worker's splitCodexAppControl: when the cliId
+    // is in the decode set, a `final` frame is stripped from the display
+    // stream and handed to the marker callback.
+    const decoder = new RunnerControlDecoder();
+    const markers: Array<{ kind: string; payload: unknown }> = [];
+    const content = '你好，我是 dsh。';
+    const frame = `${RUNNER_CONTROL_PREFIX}final:${Buffer.from(JSON.stringify({ content })).toString('base64')}${RUNNER_CONTROL_END}`;
+    const display = decoder.push(frame, true, body => {
+      const colon = body.indexOf(':');
+      markers.push({ kind: body.slice(0, colon), payload: JSON.parse(Buffer.from(body.slice(colon + 1), 'base64').toString('utf8')) });
+    });
+    expect(display).toBe('');
+    expect(markers).toHaveLength(1);
+    expect(markers[0].kind).toBe('final');
+    expect((markers[0].payload as { content: string }).content).toBe(content);
   });
 });

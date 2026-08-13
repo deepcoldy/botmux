@@ -8101,11 +8101,11 @@ function handleVisibleStartupInteraction(data: string): boolean {
   return true;
 }
 
-// Mira/Mir still send terminal OSC control messages. Codex App deliberately
+// Mira/Mir/dsh send terminal OSC control messages. Codex App deliberately
 // does not (PR #597): its signed Unix-socket channel is independent of the
 // terminal/backend rendering (including Herdr and Zellij), so it is no longer
 // in the terminal-OSC decode set.
-const APP_RUNNER_OSC_CLI_IDS = new Set(['mira', 'mir']);
+const APP_RUNNER_OSC_CLI_IDS = new Set(['mira', 'mir', 'dsh']);
 const appRunnerControlDecoder = new RunnerControlDecoder();
 let kiroSessionIdCaptureArmed = false;
 let kiroSessionIdCaptureBuffer = '';
