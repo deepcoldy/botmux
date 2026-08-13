@@ -55,6 +55,7 @@ vi.mock('../src/core/worker-pool.js', () => ({
   sweepDeadPidMarkers: vi.fn(),
   getCurrentCliVersion: vi.fn(() => '1.0.0-test'),
   restoreUsageLimitRuntimeState: vi.fn(),
+  ensureOrdinaryTurnRecoveryAttached: vi.fn(),
   // Default: promotion succeeds. A specific test overrides this to false to
   // exercise the restore-time transient-failure quarantine path.
   promoteQueuedActivationTail: vi.fn(() => true),
@@ -175,6 +176,7 @@ vi.mock('../src/core/session-activity.js', () => ({
 import { restoreActiveSessions, resumeSession } from '../src/core/session-manager.js';
 import {
   closeSession,
+  ensureOrdinaryTurnRecoveryAttached,
   forkAdoptWorker,
   killStalePids,
   promoteQueuedActivationTail,
@@ -194,6 +196,7 @@ beforeEach(() => {
   sessionStore.init();
   wp.registry = null;
   vi.mocked(closeSession).mockClear();
+  vi.mocked(ensureOrdinaryTurnRecoveryAttached).mockClear();
   vi.mocked(promoteQueuedActivationTail).mockReset();
   vi.mocked(promoteQueuedActivationTail).mockReturnValue(true);
 });
@@ -567,6 +570,36 @@ describe('resumeSession', () => {
       expect(restored?.session.sessionId).toBe(materialized.sessionId);
       expect(restored?.session.rootMessageId).toBe('om_materialized_root');
       expect(restored?.session.replyThreadAliases?.om_materialized_root).toBeDefined();
+    });
+
+    it('re-attaches persisted ordinary-turn recovery only after the winning owner is restored', async () => {
+      const recovering = sessionStore.createSession(
+        'oc_recovery',
+        'om_recovery',
+        'recovering turn',
+        'group',
+      );
+      recovering.larkAppId = 'app_test';
+      recovering.scope = 'thread';
+      recovering.cliId = 'claude-code';
+      recovering.workingDir = '/tmp/proj';
+      recovering.ordinaryTurnRecovery = {
+        logicalTurnId: 'om_original',
+        currentTurnId: 'om_original',
+        continuationsStarted: 0,
+        status: 'backoff',
+        nextAttemptAt: Date.now() + 2_000,
+        lastErrorCode: 'provider_unexpected_eof',
+      };
+      sessionStore.updateSession(recovering);
+      const map = new Map<string, DaemonSession>();
+
+      await restoreActiveSessions(map);
+
+      const restored = map.get(sessionKey('om_recovery', 'app_test'));
+      expect(restored?.session.sessionId).toBe(recovering.sessionId);
+      expect(ensureOrdinaryTurnRecoveryAttached).toHaveBeenCalledTimes(1);
+      expect(ensureOrdinaryTurnRecoveryAttached).toHaveBeenCalledWith(restored);
     });
 
     it.each([

@@ -5086,6 +5086,10 @@ function emitReadyTurns(opts: { explicitTerminalOnly?: boolean } = {}): void {
   const nothingToSendTurns = new Set<(typeof ready)[number]>();
   for (let i = 0; i < ready.length; i++) {
     const turn = ready[i];
+    // Claude API-error text is execution metadata, not a model answer. The
+    // structured terminal below owns retry/attention; never leak the raw
+    // provider error through transcript fallback (regardless of send markers).
+    if (turn.terminalOutcome && turn.terminalOutcome.status !== 'completed') continue;
     const nextBoundaryMs = (i + 1 < ready.length ? ready[i + 1].markTimeMs : nextPendingMarkTimeMs);
     if (turn.isLocal && shouldSuppressBridgeEmit({ markTimeMs: turn.markTimeMs, isLocal: turn.isLocal }, nextBoundaryMs, markers, adoptMode)) {
       const reason = turn.isLocal ? 'local-typed' : 'model called botmux send within window';
@@ -5191,7 +5195,18 @@ function emitReadyTurns(opts: { explicitTerminalOnly?: boolean } = {}): void {
   // after the model used `botmux send`. Completion is not optional. Emit it
   // only after all corresponding final_output IPC messages have been queued so
   // the daemon observes a stable per-turn ordering.
-  for (const turn of ready) emitTurnTerminal(turn.turnId, 'completed', undefined, turn.dispatchAttempt, nothingToSendTurns.has(turn) ? 'nothing_to_send' : undefined);
+  for (const turn of ready) {
+    if (turn.rateLimited) continue;
+    const outcome = turn.terminalOutcome;
+    emitTurnTerminal(
+      turn.turnId,
+      outcome?.status ?? 'completed',
+      outcome && outcome.status !== 'completed' ? outcome.errorCode : undefined,
+      turn.dispatchAttempt,
+      nothingToSendTurns.has(turn) ? 'nothing_to_send' : undefined,
+      outcome && outcome.status !== 'completed' ? outcome.retryable : undefined,
+    );
+  }
 }
 
 /** Drain `path` from `fromOffset` and feed the events to the bridge queue
@@ -15635,6 +15650,7 @@ function emitTurnTerminal(
   errorCode?: string,
   dispatchAttempt?: number,
   outputDisposition?: 'nothing_to_send',
+  retryable?: boolean,
 ): void {
   if (!sessionId || !turnId) return;
   if (!emittedTurnTerminals.claim(sessionId, turnId, dispatchAttempt)) return;
@@ -15655,6 +15671,7 @@ function emitTurnTerminal(
     ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
     ...(errorCode ? { errorCode } : {}),
     ...(outputDisposition ? { outputDisposition } : {}),
+    ...(retryable !== undefined ? { retryable } : {}),
   });
   if (terminalReleasesDurableTurn(
     { turnId: currentBotmuxTurnId, dispatchAttempt: currentBotmuxDispatchAttempt },
@@ -15836,7 +15853,7 @@ process.on('message', async (raw: unknown) => {
       const ordinaryImTurnId = !msg.adoptMode
         && msg.dispatchAttempt === undefined
         && !!msg.prompt
-        && msg.turnId?.startsWith('om_')
+        && (msg.turnId?.startsWith('om_') || msg.turnId?.startsWith('bmx-recovery-'))
         ? msg.turnId
         : undefined;
       if (lastInitConfig) {
@@ -16168,7 +16185,7 @@ process.on('message', async (raw: unknown) => {
       const messageAdoptMode = lastInitConfig?.adoptMode === true;
       const ordinaryImTurnId = !messageAdoptMode
         && msg.dispatchAttempt === undefined
-        && msg.turnId?.startsWith('om_')
+        && (msg.turnId?.startsWith('om_') || msg.turnId?.startsWith('bmx-recovery-'))
         ? msg.turnId
         : undefined;
       if (ordinaryImTurnId) {

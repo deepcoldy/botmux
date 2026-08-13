@@ -87,9 +87,32 @@ describe('BridgeTurnQueue', () => {
     expect(q.drainEmittable()).toEqual([]);
   });
 
-  it('still forwards a non-rate API error (server_error) as the turn text', () => {
-    // server_error / auth failures have no `limited` surface, so their text is
-    // the user's only failure signal — keep attributing them (pre-existing behavior).
+  it('keeps 429 on the limited path when turn_duration follows it', () => {
+    const q = new BridgeTurnQueue();
+    q.mark('om_limited');
+    q.ingest([
+      user('u-limit'),
+      {
+        type: 'assistant',
+        uuid: 'rl-duration',
+        isApiErrorMessage: true,
+        error: 'rate_limit',
+        apiErrorStatus: 429,
+        message: { role: 'assistant', content: [], stop_reason: 'stop_sequence' },
+      },
+      { type: 'system', subtype: 'turn_duration', uuid: 'duration-limit' },
+    ]);
+
+    expect(q.drainEmittable({ explicitTerminalOnly: true })).toEqual([
+      expect.objectContaining({
+        turnId: 'om_limited',
+        rateLimited: true,
+      }),
+    ]);
+    expect(q.peek()).toEqual([]);
+  });
+
+  it('records a structured retryable failure without treating its error text as an answer', () => {
     const q = new BridgeTurnQueue();
     q.mark('t1');
     const srvErr: TranscriptEvent = {
@@ -100,9 +123,69 @@ describe('BridgeTurnQueue', () => {
       message: { role: 'assistant', content: [{ type: 'text', text: 'API Error: 500 internal server error' }], stop_reason: 'stop_sequence' },
     };
     q.ingest([user('u1'), srvErr]);
-    const ready = q.drainEmittable();
+    const ready = q.drainEmittable({ explicitTerminalOnly: true });
     expect(ready.length).toBe(1);
-    expect(ready[0].assistantUuids).toEqual(['se1']);
+    expect(ready[0].assistantUuids).toEqual([]);
+    expect(ready[0].terminalOutcome).toEqual({
+      status: 'failed',
+      errorCode: 'provider_server_error',
+      retryable: true,
+    });
+  });
+
+  it('preserves an unexpected EOF failure when turn_duration closes the boundary', () => {
+    const q = new BridgeTurnQueue();
+    q.mark('om_original');
+    const eof: TranscriptEvent = {
+      type: 'assistant',
+      uuid: 'fixture-error',
+      isApiErrorMessage: true,
+      error: 'unknown',
+      message: {
+        role: 'assistant',
+        stop_reason: 'stop_sequence',
+        content: [{ type: 'text', text: 'API Error: provider disconnected: unexpected EOF' }],
+      },
+    };
+    const duration: TranscriptEvent = {
+      type: 'system',
+      subtype: 'turn_duration',
+      uuid: 'fixture-duration',
+    };
+
+    q.ingest([user('u1'), eof, duration]);
+
+    expect(q.drainEmittable({ explicitTerminalOnly: true })).toEqual([
+      expect.objectContaining({
+        turnId: 'om_original',
+        assistantUuids: [],
+        terminalOutcome: {
+          status: 'failed',
+          errorCode: 'provider_unexpected_eof',
+          retryable: true,
+        },
+      }),
+    ]);
+  });
+
+  it('treats a bare turn_duration boundary without an outcome as ambiguous', () => {
+    const q = new BridgeTurnQueue();
+    q.mark('om_boundary_only');
+    q.ingest([
+      user('u-boundary'),
+      { type: 'system', subtype: 'turn_duration', uuid: 'duration-only' },
+    ]);
+
+    expect(q.drainEmittable({ explicitTerminalOnly: true })).toEqual([
+      expect.objectContaining({
+        turnId: 'om_boundary_only',
+        terminalOutcome: {
+          status: 'ambiguous',
+          errorCode: 'provider_terminal_outcome_missing',
+          retryable: false,
+        },
+      }),
+    ]);
   });
 
   it('back-to-back Lark messages without idle: each turn keeps its own uuids', () => {

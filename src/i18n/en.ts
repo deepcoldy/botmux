@@ -859,6 +859,11 @@ export const messages: Record<string, string> = {
   'worker.empty_final_failed_invalid_request': '⚠️ The {cliName} request was rejected: {reason}\nCheck the CLI, model gateway, and tool schema configuration, then resend the message.',
   'worker.empty_final_failed_auth': '⚠️ {cliName} authentication failed: {reason}\nCheck the CLI login and model-service credentials, then resend the message.',
   'worker.empty_final_failed_connection': '⚠️ {cliName} could not connect to the model service: {reason}\nCheck the network and model-service status, then resend the message.',
+  'worker.ordinary_recovery_exhausted': '⚠️ Claude stopped because of a transient model-service failure. Botmux continued the session twice, but it still did not recover. Automatic continuation is now stopped to avoid repeating external side effects. Check the Web Terminal and model-service status, then send a message to continue.',
+  'worker.ordinary_recovery_enqueue_failed': '⚠️ Claude stopped because of a transient model-service failure, but Botmux could not safely submit the automatic continuation. Automatic processing is now stopped. Check the Web Terminal, then send a message to continue.',
+  'worker.ordinary_recovery_delivery_failed': '⚠️ Claude stopped because of a transient model-service failure, but the automatic continuation could not be delivered to the worker. Automatic processing is now stopped. Check the Web Terminal, then send a message to continue.',
+  'worker.ordinary_recovery_dispatch_interrupted': '⚠️ Botmux restarted while an automatic Claude continuation was being handed off, so its execution state is unknown. To avoid repeating external side effects, Botmux did not replay it. Check the Web Terminal, then send a message to continue.',
+  'worker.ordinary_recovery_non_retryable': '⚠️ This Claude turn failed, and the current error cannot be retried safely. Botmux stopped automatic processing to avoid repeating external side effects. Check the Web Terminal and model-service status, then send a message to continue.',
 
   // ─── CLI setup wizard / pm2 lifecycle (no per-bot context) ───────────────
   'setup.lark_create_app': 'First create a Lark app at: https://open.feishu.cn/app',
