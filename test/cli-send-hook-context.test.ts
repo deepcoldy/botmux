@@ -492,7 +492,7 @@ describe('cmdSend hook context wiring', () => {
     expect(cmdSend).toContain('containsNativeAtTag: containsLarkAtTag(content)');
     expect(cmdSend).toContain('const managedRenderedPayloadError = managedVcSendPayloadError({');
     expect(cmdSend).toContain('containsNativeAtTag: containsLarkAtTag(text)');
-    expect(cmdSend).toContain('if (!noMention && !vcMeetingManagedSendOrigin)');
+    expect(cmdSend).toContain('if (!noMention && !isSlashSend && !vcMeetingManagedSendOrigin)');
     expect(cmdSend).toContain('if (!sendTopLevel && !vcMeetingManagedSendOrigin)');
     expect(cmdSend.indexOf('const managedPayloadError = managedVcSendPayloadError({'))
       .toBeLessThan(cmdSend.indexOf("const { sendMessage, replyMessage, uploadImage, uploadFile"));

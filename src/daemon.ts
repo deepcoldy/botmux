@@ -66,6 +66,7 @@ import {
   setResolvedAllowedUsersRepublishHook,
   setAllowedUsersResolveRetryHook,
   vcMeetingAgentConfigActive,
+  botAcceptsSlashFromBots,
   type BotConfig,
   type BotState,
   type OncallChat,
@@ -249,7 +250,7 @@ import {
 import { claimInitialUserTurn, isInitialUserTurnPending, releaseInitialUserTurn } from './core/initial-user-turn.js';
 import { applyQueuedCodexAppLegacyFallback, mergeQueuedCodexAppTurn } from './core/session-create.js';
 import { findOnlineDaemon, listOnlineDaemons } from './utils/daemon-discovery.js';
-import { beginReplyTargetTurn, buildTurnParticipantsFrom, fallbackTurnId, isSubstituteTurn, resolveSessionReplyTarget, syncReplyTargetState } from './core/reply-target.js';
+import { beginReplyTargetTurn, buildTurnParticipantsFrom, fallbackTurnId, isSubstituteTurn, resolveInboundReplyTarget, resolveSessionReplyTarget, syncReplyTargetState } from './core/reply-target.js';
 import { readDeferredTopicBinding } from './core/deferred-topic-binding.js';
 import {
   buildBotmuxLarkNativeSessionTitle,
@@ -4499,6 +4500,39 @@ const commandDeps: CommandHandlerDeps = {
   prewarmDocCommentSession,
 };
 
+/** Bind every reply produced by one slash-command invocation to the routing
+ * decision already made for its inbound Lark message. Commands return before
+ * the normal turn-registration path, and lifecycle commands may remove or
+ * replace their session before replying, so mutable session state cannot be
+ * the authority for placement here. */
+function commandDepsForInvocation(input: {
+  scope: 'chat' | 'thread';
+  chatId: string;
+  anchor: string;
+  messageId: string;
+  replyRootId?: string;
+}): CommandHandlerDeps {
+  const replyTarget = resolveInboundReplyTarget({
+    scope: input.scope,
+    chatId: input.chatId,
+    threadRootId: input.anchor,
+    replyRootId: input.replyRootId,
+  });
+  return {
+    ...commandDeps,
+    invocationReplyTarget: replyTarget,
+    sessionReply: (rootId, content, msgType, larkAppId, turnId, opts) =>
+      sessionReply(
+        rootId,
+        content,
+        msgType,
+        larkAppId,
+        turnId ?? input.messageId,
+        opts?.replyTarget ? opts : { ...opts, replyTarget },
+      ),
+  };
+}
+
 /**
  * Fire a session-less daemon command (`/group`, `/g`) WITHOUT blocking the Lark
  * event ACK on its slow work — the fast-ACK path.
@@ -4524,8 +4558,9 @@ function fireSessionlessCommandDetached(
   anchor: string,
   message: LarkMessage,
   larkAppId: string,
+  deps: CommandHandlerDeps,
 ): void {
-  void handleCommand(cmd, anchor, message, commandDeps, larkAppId).catch((err) =>
+  void handleCommand(cmd, anchor, message, deps, larkAppId).catch((err) =>
     logger.error(`[sessionless ${cmd}] ${anchor.substring(0, 12)} failed: ${err?.message ?? err}`),
   );
 }
@@ -17213,17 +17248,31 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
   }
 
   // Intercept daemon commands in new topics (no session needed for some commands)
-  const invocation = parseSlashCommandInvocation(cmdContent);
+  // acceptSlashFromBots gate: a bot sender's slash command is only routed as a
+  // command when this bot opts in (default on). When off, fall through to
+  // ordinary message handling — the peer bot can still talk, it just can't drive
+  // /clear /model /close … into this bot. Human senders are never gated here.
+  const senderIsBotForSlashGate = isBotSenderType || isForeignBotSender;
+  const invocation = (senderIsBotForSlashGate && !botAcceptsSlashFromBots(larkAppId))
+    ? null
+    : parseSlashCommandInvocation(cmdContent);
   if (invocation) {
     const { cmd, content: commandContent } = invocation;
+    const invocationDeps = commandDepsForInvocation({
+      scope,
+      chatId,
+      anchor,
+      messageId: parsed.messageId,
+      replyRootId,
+    });
     const restrictedText = grantRestrictedSlashCommandText(larkAppId, chatId, senderOpenId, cmd);
     if (restrictedText) {
-      await sessionReply(anchor, restrictedText, 'text', larkAppId);
+      await invocationDeps.sessionReply(anchor, restrictedText, 'text', larkAppId);
       return;
     }
     if (cmd === '/vc-auth') {
       if (!canOperate(larkAppId, chatId, senderOpenId, teamTrustUnionId)) {
-        await sessionReply(anchor, tr('daemon.cmd_allowed_users_only', { cmd }, localeForBot(larkAppId)), 'text', larkAppId);
+        await invocationDeps.sessionReply(anchor, tr('daemon.cmd_allowed_users_only', { cmd }, localeForBot(larkAppId)), 'text', larkAppId);
         return;
       }
       await handleVcMeetingTemporaryAuthCommand({
@@ -17244,14 +17293,14 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     // summon has nothing to show in a brand-new topic. Route here so the generic
     // daemon-command block below does not pre-create a worker=null session.
     if (cmd === '/card') {
-      await handleCardCommand(anchor, larkAppId, chatId, senderOpenId, commandContent, commandDeps);
+      await handleCardCommand(anchor, larkAppId, chatId, senderOpenId, commandContent, invocationDeps);
       return;
     }
     // /term needs a live session's terminal; in a brand-new topic there's none.
     // Route here (own owner-gate inside) so the generic block below doesn't
     // pre-create a worker=null phantom session just to reply "no session".
     if (cmd === '/term') {
-      await handleTermLinkCommand(anchor, larkAppId, chatId, senderOpenId, commandContent, commandDeps);
+      await handleTermLinkCommand(anchor, larkAppId, chatId, senderOpenId, commandContent, invocationDeps);
       return;
     }
     if (resolvePassthroughCommands(larkAppId).has(cmd)) {
@@ -17291,7 +17340,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
         });
         return;
       }
-      await sessionReply(anchor, tr('daemon.cmd_requires_session', { cmd }, localeForBot(larkAppId)), 'text', larkAppId);
+      await invocationDeps.sessionReply(anchor, tr('daemon.cmd_requires_session', { cmd }, localeForBot(larkAppId)), 'text', larkAppId);
       return;
     }
     if (DAEMON_COMMANDS.has(cmd)) {
@@ -17303,7 +17352,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
       // canRunDaemonCommand = canOperate ∪（cmd ∈ canTalkDaemonCommands && canTalk）：
       // bot 可通过名单把选定命令（如 /status）降到 canTalk；未配置时与 canOperate 全等。
       if (!canRunDaemonCommand(larkAppId, chatId, senderOpenId, teamTrustUnionId, cmd, senderUnionId, chatType, isBotSenderType, isBotSenderType)) {
-        await sessionReply(anchor, tr('daemon.cmd_allowed_users_only', { cmd }, localeForBot(larkAppId)), 'text', larkAppId);
+        await invocationDeps.sessionReply(anchor, tr('daemon.cmd_allowed_users_only', { cmd }, localeForBot(larkAppId)), 'text', larkAppId);
         return;
       }
       // `/group` (`/g`) doesn't open a conversation — creating a sessionStore
@@ -17314,7 +17363,13 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
         // Fast-ACK: run detached so the WS event ack isn't blocked on /group's
         // slow Lark API work → no Feishu redelivery → no duplicate group.
         // See fireSessionlessCommandDetached.
-        fireSessionlessCommandDetached(cmd, anchor, { ...parsed, content: commandContent, chatId }, larkAppId);
+        fireSessionlessCommandDetached(
+          cmd,
+          anchor,
+          { ...parsed, content: commandContent, chatId },
+          larkAppId,
+          invocationDeps,
+        );
         return;
       }
       // These commands operate on an EXISTING session; a brand-new topic has none. Route
@@ -17325,7 +17380,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
       // permission gates inside their handlers) this branch MUST stay after
       // the canOperate gate above — their handlers do not repeat that gate.
       if (EXISTING_SESSION_ONLY_DAEMON_COMMANDS.has(cmd)) {
-        await handleCommand(cmd, anchor, { ...parsed, content: commandContent }, commandDeps, larkAppId);
+        await handleCommand(cmd, anchor, { ...parsed, content: commandContent }, invocationDeps, larkAppId);
         return;
       }
       // Same rootMessageId reasoning as below in the main spawn path:
@@ -17391,7 +17446,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
         });
       }
       // Pass mention-stripped content so /command argument parsing works.
-      await handleCommand(cmd, anchor, { ...parsed, content: commandContent }, commandDeps, larkAppId);
+      await handleCommand(cmd, anchor, { ...parsed, content: commandContent }, invocationDeps, larkAppId);
       return;
     }
   }
@@ -18526,19 +18581,31 @@ async function handleThreadReplyAdmitted(
   }
 
   // Intercept daemon commands
-  const invocation = parseSlashCommandInvocation(cmdContent);
+  // acceptSlashFromBots gate (mirror of the new-topic path): a bot sender's
+  // slash is only routed as a command when this bot opts in (default on); when
+  // off it falls through to ordinary message handling. Human senders unaffected.
+  const invocation = ((isBotSenderType || isForeignBot) && !botAcceptsSlashFromBots(larkAppId))
+    ? null
+    : parseSlashCommandInvocation(cmdContent);
   if (invocation) {
     const { cmd, content: commandContent } = invocation;
+    const invocationDeps = commandDepsForInvocation({
+      scope,
+      chatId: ctxChatId,
+      anchor,
+      messageId: parsed.messageId,
+      replyRootId,
+    });
     const existingDs = activeSessions.get(sessionKey(anchor, larkAppId));
     const effectiveThreadChatId = existingDs?.chatId ?? threadChatId;
     const restrictedText = grantRestrictedSlashCommandText(larkAppId, effectiveThreadChatId, threadSenderOpenId, cmd);
     if (restrictedText) {
-      await sessionReply(anchor, restrictedText, 'text', larkAppId);
+      await invocationDeps.sessionReply(anchor, restrictedText, 'text', larkAppId);
       return;
     }
     if (cmd === '/vc-auth') {
       if (!canOperate(larkAppId, effectiveThreadChatId, threadSenderOpenId, threadTeamTrustUnionId)) {
-        await sessionReply(anchor, tr('daemon.cmd_allowed_users_only', { cmd }, localeForBot(larkAppId)), 'text', larkAppId);
+        await invocationDeps.sessionReply(anchor, tr('daemon.cmd_allowed_users_only', { cmd }, localeForBot(larkAppId)), 'text', larkAppId);
         return;
       }
       await handleVcMeetingTemporaryAuthCommand({
@@ -18605,7 +18672,7 @@ async function handleThreadReplyAdmitted(
       // 收紧到与 daemon 命令同档；这会同时改变真人 oncall 成员的现有行为，应单独评估。
       const ds = existingDs;
       if (ds?.worker && !ds.worker.killed && hasQueuedActivationAdmissionGate(ds)) {
-        sessionReply(
+        invocationDeps.sessionReply(
           anchor,
           tr('daemon.cmd_activation_pending', { cmd }, localeForBot(larkAppId)),
           'text',
@@ -18623,7 +18690,7 @@ async function handleThreadReplyAdmitted(
         // a clear message rather than deliver a silent no-op (or spawn junk Riff
         // tasks). Other passthrough commands are unaffected.
         if (cmd === '/fast' && fastToggleUnsupportedBackend(ds)) {
-          await sessionReply(anchor, tr('daemon.fast_unsupported_backend', undefined, localeForBot(larkAppId)), 'text', larkAppId);
+          await invocationDeps.sessionReply(anchor, tr('daemon.fast_unsupported_backend', undefined, localeForBot(larkAppId)), 'text', larkAppId);
           return;
         }
         deliverPassthroughToExistingSession(ds, cmd, commandContent, anchor, larkAppId, {
@@ -18635,7 +18702,7 @@ async function handleThreadReplyAdmitted(
           onDelivered: () => markIngressAdmitted(ctx),
         });
       }
-      else void sessionReply(anchor, tr('daemon.cmd_needs_active_cli', { cmd }, localeForBot(larkAppId)), 'text', larkAppId);
+      else void invocationDeps.sessionReply(anchor, tr('daemon.cmd_needs_active_cli', { cmd }, localeForBot(larkAppId)), 'text', larkAppId);
       return;
     }
     if (DAEMON_COMMANDS.has(cmd)) {
@@ -18646,7 +18713,7 @@ async function handleThreadReplyAdmitted(
       // /term in a thread with no existingDs would spawn a worker:null phantom
       // session and pollute the dashboard before replying not_ready/owner_only.
       if (cmd === '/term') {
-        await handleTermLinkCommand(anchor, larkAppId, threadChatId ?? '', threadSenderOpenId, commandContent, commandDeps);
+        await handleTermLinkCommand(anchor, larkAppId, threadChatId ?? '', threadSenderOpenId, commandContent, invocationDeps);
         return;
       }
       // canOperate gate for thread-reply daemon commands — required in every chat
@@ -18654,7 +18721,7 @@ async function handleThreadReplyAdmitted(
       // canRunDaemonCommand：canTalkDaemonCommands 名单内的命令降到 canTalk，
       // 与 new-topic 路径的统一闸同款（未配置时与 canOperate 全等）。
       if (!canRunDaemonCommand(larkAppId, effectiveThreadChatId, threadSenderOpenId, threadTeamTrustUnionId, cmd, threadSenderUnionId, ctxChatType, isBotSenderType || isForeignBot, isBotSenderType)) {
-        sessionReply(anchor, tr('daemon.cmd_allowed_users_only', { cmd }, localeForBot(larkAppId)), 'text', larkAppId);
+        invocationDeps.sessionReply(anchor, tr('daemon.cmd_allowed_users_only', { cmd }, localeForBot(larkAppId)), 'text', larkAppId);
         return;
       }
       // First message of a fresh thread carrying a session-needing daemon command
@@ -18722,12 +18789,12 @@ async function handleThreadReplyAdmitted(
       const cmdMessage = { ...parsed, content: commandContent, chatId: threadChatId };
       if (isSessionlessCommandInvocation(cmd, commandContent)) {
         // Fast-ACK for /group invoked mid-thread. See fireSessionlessCommandDetached.
-        fireSessionlessCommandDetached(cmd, anchor, cmdMessage, larkAppId);
+        fireSessionlessCommandDetached(cmd, anchor, cmdMessage, larkAppId, invocationDeps);
         return;
       }
       // 命令路径不打接纳标：handleCommand 内部 catch 吞掉一切异常并记日志
       //（command-handler.ts 收口），异常到不了 ingress catch，标记永远读不到。
-      await handleCommand(cmd, anchor, cmdMessage, commandDeps, larkAppId);
+      await handleCommand(cmd, anchor, cmdMessage, invocationDeps, larkAppId);
       return;
     }
   }

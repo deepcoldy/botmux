@@ -2107,14 +2107,13 @@ export async function deliverSubstituteControlCard(ds: DaemonSession): Promise<S
  * reply (`reply`). `content` is the card JSON when msgType==='interactive',
  * otherwise the plain text. Topic-group / p2p behavior is unchanged.
  *
- * IMPORTANT: ephemeral is only attempted for flat **chat-scope** sessions. The
+ * IMPORTANT: ephemeral is only attempted for a flat **chat-scope** destination. The
  * ephemeral API (`ephemeral/v1/send`) takes a `chat_id` only — it has no
  * thread/root anchoring — so for a **thread-scope** session (a 话题 inside a
  * 普通群, or a 话题群 topic) an ephemeral card would escape the topic and land at
- * the group top-level. 话题群 happened to reject ephemeral with 18053 and fall
- * back to the in-thread reply, but a 话题 inside a 普通群 succeeds and leaks the
- * card out of the thread. So thread-scope sessions always take the visible
- * `reply()` path, which routes back into the thread (`reply_in_thread`).
+ * the group top-level. The same applies when a chat-scope session is invoked
+ * from a folded thread: callers pass its frozen reply target, and any explicit
+ * thread/quote destination takes the visible `reply()` path.
  */
 export async function deliverEphemeralOrReply(
   ds: DaemonSession,
@@ -2122,8 +2121,16 @@ export async function deliverEphemeralOrReply(
   content: string,
   msgType: 'text' | 'interactive',
   reply: () => Promise<unknown>,
+  replyTarget?: FrozenSessionReplyTarget,
 ): Promise<void> {
-  if (operatorOpenId && ds.chatType !== 'p2p' && ds.scope === 'chat') {
+  // A chat-scope session can still be invoked from a folded thread. The
+  // ephemeral API has no root/thread field, so an explicitly frozen thread or
+  // quote target must take the visible reply path even though the session
+  // itself remains chat-scoped.
+  const allowsEphemeral = replyTarget
+    ? replyTarget.mode === 'plain'
+    : ds.scope === 'chat';
+  if (operatorOpenId && ds.chatType !== 'p2p' && allowsEphemeral) {
     try {
       // The ephemeral API is card-only (msg_type=text → 10003), so wrap a plain
       // confirmation line into a minimal markdown card.

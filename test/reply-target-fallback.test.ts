@@ -21,6 +21,7 @@ import {
   frozenReplyContextForTurn,
   isSubstituteTurn,
   pickTurnReplyTarget,
+  resolveInboundReplyTarget,
   resolveSessionReplyTarget,
 } from '../src/core/reply-target.js';
 import type { DaemonSession } from '../src/core/types.js';
@@ -110,6 +111,44 @@ describe('fallbackTurnId × resolveSessionReplyTarget (the leak fix)', () => {
     });
     const target = resolveSessionReplyTarget(ds, fallbackTurnId(ds as DaemonSession, undefined));
     expect(target).toEqual({ mode: 'quote', rootMessageId: 'om_trigger' });
+  });
+});
+
+describe('resolveInboundReplyTarget', () => {
+  it('anchors a chat-scope thread reply to the inbound reply root', () => {
+    expect(resolveInboundReplyTarget({
+      scope: 'chat',
+      chatId: 'oc_chat',
+      threadRootId: 'om_session_root',
+      replyRootId: 'om_reply_root',
+    })).toEqual({ mode: 'thread', rootMessageId: 'om_reply_root' });
+  });
+
+  it('keeps a chat-scope message without a reply root at chat top level', () => {
+    expect(resolveInboundReplyTarget({
+      scope: 'chat',
+      chatId: 'oc_chat',
+      threadRootId: 'om_session_root',
+    })).toEqual({ mode: 'plain', chatId: 'oc_chat' });
+  });
+
+  it('anchors a thread-scope message to the session thread root', () => {
+    expect(resolveInboundReplyTarget({
+      scope: 'thread',
+      chatId: 'oc_chat',
+      threadRootId: 'om_session_root',
+      replyRootId: 'om_child_reply_root',
+    })).toEqual({ mode: 'thread', rootMessageId: 'om_session_root' });
+  });
+
+  it('uses ordinary quote semantics for a quote-only chat-scope reply', () => {
+    expect(resolveInboundReplyTarget({
+      scope: 'chat',
+      chatId: 'oc_chat',
+      threadRootId: 'om_session_root',
+      replyRootId: 'om_quote_root',
+      quoteOnly: true,
+    })).toEqual({ mode: 'quote', rootMessageId: 'om_quote_root' });
   });
 });
 

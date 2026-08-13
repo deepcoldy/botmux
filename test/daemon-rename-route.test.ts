@@ -42,6 +42,7 @@ const mocks = vi.hoisted(() => {
     dataDir,
     replyMessage: vi.fn(async () => 'om_reply'),
     sendMessage: vi.fn(async () => 'om_top'),
+    sendEphemeralCard: vi.fn(async () => 'om_ephemeral'),
     addReaction: vi.fn(async () => 'reaction_received'),
     getChatMode: vi.fn(async () => 'group' as 'group' | 'topic' | 'p2p'),
     getChatNameAndMode: vi.fn(async () => ({ name: null, mode: 'group' as const })),
@@ -73,6 +74,12 @@ const mocks = vi.hoisted(() => {
     forkWorker: vi.fn((ds: any) => {
       ds.worker = { killed: false, send: vi.fn() };
     }),
+    closeWorkerPoolSession: vi.fn(async () => undefined),
+    discoverAdoptableSessions: vi.fn(() => [] as any[]),
+    discoverAdoptableZellijSessions: vi.fn(() => [] as any[]),
+    discoverClaudeFamilySessions: vi.fn(() => [] as any[]),
+    discoverRolloutSessions: vi.fn(() => [] as any[]),
+    discoverAntigravitySessions: vi.fn(() => [] as any[]),
     scanMultipleProjects: vi.fn(() => [] as any[]),
     getAvailableBots: vi.fn(async () => [] as any[]),
     downloadResources: vi.fn(async () => ({ attachments: [], needLogin: false })),
@@ -100,6 +107,7 @@ vi.mock('../src/im/lark/client.js', async () => {
     ...actual,
     replyMessage: mocks.replyMessage,
     sendMessage: mocks.sendMessage,
+    sendEphemeralCard: mocks.sendEphemeralCard,
     addReaction: mocks.addReaction,
     getChatMode: mocks.getChatMode,
     getChatNameAndMode: mocks.getChatNameAndMode,
@@ -119,7 +127,31 @@ vi.mock('../src/services/session-store.js', async () => {
 
 vi.mock('../src/core/worker-pool.js', async () => {
   const actual = await vi.importActual<any>('../src/core/worker-pool.js');
-  return { ...actual, forkWorker: mocks.forkWorker };
+  return {
+    ...actual,
+    forkWorker: mocks.forkWorker,
+    closeSession: mocks.closeWorkerPoolSession,
+  };
+});
+
+vi.mock('../src/core/session-discovery.js', async () => {
+  const actual = await vi.importActual<any>('../src/core/session-discovery.js');
+  return { ...actual, discoverAdoptableSessions: mocks.discoverAdoptableSessions };
+});
+
+vi.mock('../src/core/zellij-adopt-discovery.js', async () => {
+  const actual = await vi.importActual<any>('../src/core/zellij-adopt-discovery.js');
+  return { ...actual, discoverAdoptableZellijSessions: mocks.discoverAdoptableZellijSessions };
+});
+
+vi.mock('../src/services/resumable-session-discovery.js', async () => {
+  const actual = await vi.importActual<any>('../src/services/resumable-session-discovery.js');
+  return {
+    ...actual,
+    discoverClaudeFamilySessions: mocks.discoverClaudeFamilySessions,
+    discoverRolloutSessions: mocks.discoverRolloutSessions,
+    discoverAntigravitySessions: mocks.discoverAntigravitySessions,
+  };
 });
 
 vi.mock('../src/core/session-manager.js', async () => {
@@ -489,13 +521,28 @@ describe('/rename production routing — must not pre-create a session (review P
     vi.clearAllMocks();
     mocks.replyMessage.mockResolvedValue('om_reply');
     mocks.sendMessage.mockResolvedValue('om_top');
+    mocks.sendEphemeralCard.mockResolvedValue('om_ephemeral');
     mocks.getChatMode.mockResolvedValue('group');
     mocks.getChatNameAndMode.mockResolvedValue({ name: null, mode: 'group' });
     mocks.sessions.clear();
     mocks.forkWorker.mockImplementation((ds: any) => {
       ds.worker = { killed: false, send: vi.fn() };
     });
+    mocks.closeWorkerPoolSession.mockImplementation(async (sessionId: string) => {
+      for (const [key, candidate] of activeSessions) {
+        if (candidate.session.sessionId !== sessionId) continue;
+        candidate.session.status = 'closed';
+        activeSessions.delete(key);
+        mocks.closeSession(sessionId);
+        return;
+      }
+    });
     mocks.scanMultipleProjects.mockReturnValue([]);
+    mocks.discoverAdoptableSessions.mockReturnValue([]);
+    mocks.discoverAdoptableZellijSessions.mockReturnValue([]);
+    mocks.discoverClaudeFamilySessions.mockReturnValue([]);
+    mocks.discoverRolloutSessions.mockReturnValue([]);
+    mocks.discoverAntigravitySessions.mockReturnValue([]);
     mocks.getAvailableBots.mockResolvedValue([]);
     mocks.downloadResources.mockResolvedValue({ attachments: [], needLogin: false });
     activeSessions.clear();
@@ -821,6 +868,317 @@ describe('/rename production routing — must not pre-create a session (review P
     expect(mocks.closeSession).not.toHaveBeenCalled();
     expect(repliedText()).not.toContain('会话已关闭');
     expect(activeSessions.get(sessionKey(rootId, APP))?.workingDir).toBe('/tmp');
+  });
+
+  it('pinned cwd + bare `/t` followed by `/adopt` keeps the picker card inside that thread', async () => {
+    const bot = registerBot({
+      larkAppId: APP,
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      allowedUsers: [OWNER],
+      defaultWorkingDir: '/tmp',
+      disableStreamingCard: true,
+    });
+    bot.resolvedAllowedUsers = [OWNER];
+    mocks.discoverAdoptableSessions.mockReturnValue([{
+      tmuxTarget: '0:1.0',
+      panePid: 1000,
+      cliPid: 1001,
+      cliId: 'claude-code',
+      cwd: '/tmp',
+      paneCols: 120,
+      paneRows: 40,
+    }]);
+    const rootId = 'om_bare_force_topic_then_adopt';
+
+    await handleNewTopic(makeEventData(rootId, '/t'), makeCtx(rootId, rootId));
+    mocks.replyMessage.mockClear();
+    mocks.sendMessage.mockClear();
+
+    const adoptReply = makeEventData('om_first_adopt_in_force_topic', '/adopt', rootId);
+    adoptReply.message.thread_id = 'omt_bare_force_topic_then_adopt';
+    await handleNewTopic(
+      adoptReply,
+      makeCtx(rootId, 'om_first_adopt_in_force_topic'),
+    );
+
+    expect(mocks.replyMessage.mock.calls[0]?.slice(0, 5)).toEqual([
+      APP,
+      rootId,
+      expect.any(String),
+      'interactive',
+      true,
+    ]);
+    expect(mocks.sendMessage).not.toHaveBeenCalled();
+    expect(mocks.discoverAdoptableSessions).toHaveBeenCalled();
+    expect(mocks.forkWorker).not.toHaveBeenCalled();
+    expect(JSON.stringify(JSON.parse(String(mocks.replyMessage.mock.calls[0]?.[2])))).toContain('adopt_pick');
+  });
+
+  it('chat-scope `/adopt` picker stays in the invoking group thread', async () => {
+    const ds = seedLiveChatSession();
+    mocks.discoverAdoptableSessions.mockReturnValue([{
+      tmuxTarget: '0:1.0',
+      panePid: 1000,
+      cliPid: 1001,
+      cliId: 'claude-code',
+      cwd: '/tmp',
+      paneCols: 120,
+      paneRows: 40,
+    }]);
+    const topicRoot = 'om_chat_scope_adopt_topic';
+    const messageId = 'om_chat_scope_adopt_command';
+    const event = makeEventData(messageId, '/adopt', topicRoot);
+    event.message.thread_id = 'omt_chat_scope_adopt';
+
+    await handleThreadReply(event, {
+      chatId: CHAT,
+      messageId,
+      chatType: 'group',
+      scope: 'chat',
+      anchor: CHAT,
+      replyRootId: topicRoot,
+      larkAppId: APP,
+    });
+
+    expect(activeSessions.get(sessionKey(CHAT, APP))).toBe(ds);
+    expect(mocks.replyMessage.mock.calls[0]?.slice(0, 5)).toEqual([
+      APP,
+      topicRoot,
+      expect.any(String),
+      'interactive',
+      true,
+    ]);
+    expect(mocks.sendMessage).not.toHaveBeenCalled();
+    expect(mocks.sendEphemeralCard).not.toHaveBeenCalled();
+    expect(mocks.discoverAdoptableSessions).toHaveBeenCalled();
+    expect(JSON.stringify(JSON.parse(String(mocks.replyMessage.mock.calls[0]?.[2])))).toContain('adopt_pick');
+  });
+
+  it('chat-scope command denial stays in the invoking group thread', async () => {
+    const ds = seedLiveChatSession();
+    const topicRoot = 'om_chat_scope_denied_topic';
+    const messageId = 'om_chat_scope_denied_command';
+    const event = makeEventData(messageId, '/rename Hacked', topicRoot);
+    event.message.thread_id = 'omt_chat_scope_denied';
+    event.sender.sender_id.open_id = 'ou_stranger';
+
+    await handleThreadReply(event, {
+      chatId: CHAT,
+      messageId,
+      chatType: 'group',
+      scope: 'chat',
+      anchor: CHAT,
+      replyRootId: topicRoot,
+      larkAppId: APP,
+    });
+
+    expect(ds.session.title).toBe('live chat');
+    expect(mocks.replyMessage.mock.calls[0]?.slice(0, 5)).toEqual([
+      APP,
+      topicRoot,
+      expect.stringContaining('仅 allowedUsers 可执行'),
+      'text',
+      true,
+    ]);
+    expect(mocks.sendMessage).not.toHaveBeenCalled();
+    expect(mocks.sendEphemeralCard).not.toHaveBeenCalled();
+  });
+
+  it('`/t /adopt` opens the picker inside the new thread without starting a CLI', async () => {
+    const bot = registerBot({
+      larkAppId: APP,
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      allowedUsers: [OWNER],
+      defaultWorkingDir: '/tmp',
+      disableStreamingCard: true,
+    });
+    bot.resolvedAllowedUsers = [OWNER];
+    mocks.discoverAdoptableSessions.mockReturnValue([{
+      tmuxTarget: '0:1.0',
+      panePid: 1000,
+      cliPid: 1001,
+      cliId: 'claude-code',
+      cwd: '/tmp',
+      paneCols: 120,
+      paneRows: 40,
+    }]);
+    const rootId = 'om_force_topic_adopt_composed';
+
+    await handleNewTopic(
+      makeEventData(rootId, '/t /adopt'),
+      makeCtx(rootId, rootId),
+    );
+
+    expect(mocks.replyMessage.mock.calls[0]?.slice(0, 5)).toEqual([
+      APP,
+      rootId,
+      expect.any(String),
+      'interactive',
+      true,
+    ]);
+    expect(mocks.sendMessage).not.toHaveBeenCalled();
+    expect(mocks.discoverAdoptableSessions).toHaveBeenCalled();
+    expect(mocks.forkWorker).not.toHaveBeenCalled();
+    expect(JSON.stringify(JSON.parse(String(mocks.replyMessage.mock.calls[0]?.[2])))).toContain('adopt_pick');
+  });
+
+  it('chat-scope `/close` confirmation stays in the invoking group thread', async () => {
+    const ds = seedLiveChatSession();
+    const topicRoot = 'om_chat_scope_close_topic';
+    const messageId = 'om_chat_scope_close_command';
+    const event = makeEventData(messageId, '/close', topicRoot);
+    event.message.thread_id = 'omt_chat_scope_close';
+
+    await handleThreadReply(event, {
+      chatId: CHAT,
+      messageId,
+      chatType: 'group',
+      scope: 'chat',
+      anchor: CHAT,
+      replyRootId: topicRoot,
+      larkAppId: APP,
+    });
+
+    expect(mocks.closeWorkerPoolSession).toHaveBeenCalledWith(ds.session.sessionId);
+    expect(activeSessions.has(sessionKey(CHAT, APP))).toBe(false);
+    expect(mocks.replyMessage.mock.calls[0]?.slice(0, 5)).toEqual([
+      APP,
+      topicRoot,
+      expect.any(String),
+      'interactive',
+      true,
+    ]);
+    expect(mocks.sendMessage).not.toHaveBeenCalled();
+    expect(mocks.sendEphemeralCard).not.toHaveBeenCalled();
+  });
+
+  it('chat-scope adopted `/detach` confirmation stays in the invoking group thread', async () => {
+    const ds = seedLiveChatSession();
+    const adoptedFrom = {
+      source: 'tmux' as const,
+      tmuxTarget: '0:1.0',
+      originalCliPid: 1001,
+      cwd: '/tmp',
+    };
+    ds.adoptedFrom = adoptedFrom;
+    ds.session.adoptedFrom = adoptedFrom;
+    const topicRoot = 'om_chat_scope_detach_topic';
+    const messageId = 'om_chat_scope_detach_command';
+    const event = makeEventData(messageId, '/detach', topicRoot);
+    event.message.thread_id = 'omt_chat_scope_detach';
+
+    await handleThreadReply(event, {
+      chatId: CHAT,
+      messageId,
+      chatType: 'group',
+      scope: 'chat',
+      anchor: CHAT,
+      replyRootId: topicRoot,
+      larkAppId: APP,
+    });
+
+    expect(mocks.closeWorkerPoolSession).toHaveBeenCalledWith(ds.session.sessionId);
+    expect(activeSessions.has(sessionKey(CHAT, APP))).toBe(false);
+    expect(mocks.replyMessage.mock.calls[0]?.slice(0, 5)).toEqual([
+      APP,
+      topicRoot,
+      expect.any(String),
+      'text',
+      true,
+    ]);
+    expect(mocks.sendMessage).not.toHaveBeenCalled();
+    expect(mocks.sendEphemeralCard).not.toHaveBeenCalled();
+  });
+
+  it('chat-scope `/close` confirmation stays in the invoking DM thread', async () => {
+    const ds = seedLiveChatSession();
+    ds.chatType = 'p2p';
+    ds.session.chatType = 'p2p';
+    const topicRoot = 'om_dm_close_topic';
+    const messageId = 'om_dm_close_command';
+    const event = makeEventData(messageId, '/close', topicRoot);
+    event.message.thread_id = 'omt_dm_close';
+
+    await handleThreadReply(event, {
+      chatId: CHAT,
+      messageId,
+      chatType: 'p2p',
+      scope: 'chat',
+      anchor: CHAT,
+      replyRootId: topicRoot,
+      larkAppId: APP,
+    });
+
+    expect(mocks.closeWorkerPoolSession).toHaveBeenCalledWith(ds.session.sessionId);
+    expect(activeSessions.has(sessionKey(CHAT, APP))).toBe(false);
+    expect(mocks.replyMessage.mock.calls[0]?.slice(0, 5)).toEqual([
+      APP,
+      topicRoot,
+      expect.any(String),
+      'interactive',
+      true,
+    ]);
+    expect(mocks.sendMessage).not.toHaveBeenCalled();
+    expect(mocks.sendEphemeralCard).not.toHaveBeenCalled();
+  });
+
+  it('thread-scope `/close` keeps its existing in-thread confirmation route', async () => {
+    const topicRoot = 'om_thread_scope_close_topic';
+    const messageId = 'om_thread_scope_close_command';
+    const ds = seedThreadSession(topicRoot, 'live thread close');
+    const event = makeEventData(messageId, '/close', topicRoot);
+    event.message.thread_id = 'omt_thread_scope_close';
+
+    await handleThreadReply(event, {
+      ...makeCtx(topicRoot, messageId),
+      replyRootId: topicRoot,
+    });
+
+    expect(mocks.closeWorkerPoolSession).toHaveBeenCalledWith(ds.session.sessionId);
+    expect(activeSessions.has(sessionKey(topicRoot, APP))).toBe(false);
+    expect(mocks.replyMessage.mock.calls[0]?.slice(0, 5)).toEqual([
+      APP,
+      topicRoot,
+      expect.any(String),
+      'interactive',
+      true,
+    ]);
+    expect(mocks.sendMessage).not.toHaveBeenCalled();
+    expect(mocks.sendEphemeralCard).not.toHaveBeenCalled();
+  });
+
+  it('chat-scope mid-session `/repo <path>` keeps both lifecycle replies in the invoking group thread', async () => {
+    const ds = seedLiveChatSession();
+    const oldSessionId = ds.session.sessionId;
+    const topicRoot = 'om_chat_scope_repo_topic';
+    const messageId = 'om_chat_scope_repo_command';
+    const event = makeEventData(messageId, '/repo /tmp', topicRoot);
+    event.message.thread_id = 'omt_chat_scope_repo';
+
+    await handleThreadReply(event, {
+      chatId: CHAT,
+      messageId,
+      chatType: 'group',
+      scope: 'chat',
+      anchor: CHAT,
+      replyRootId: topicRoot,
+      larkAppId: APP,
+    });
+
+    expect(mocks.closeWorkerPoolSession).toHaveBeenCalledWith(oldSessionId);
+    expect(activeSessions.get(sessionKey(CHAT, APP))).toBe(ds);
+    expect(activeSessions.has(sessionKey(topicRoot, APP))).toBe(false);
+    expect(ds.session.sessionId).not.toBe(oldSessionId);
+    expect(ds.workingDir).toBe('/tmp');
+    expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
+    expect(mocks.replyMessage.mock.calls.map(call => call.slice(0, 5))).toEqual([
+      [APP, topicRoot, expect.stringContaining('会话已关闭'), 'interactive', true],
+      [APP, topicRoot, expect.stringContaining('已切换到'), 'text', true],
+    ]);
+    expect(mocks.sendMessage).not.toHaveBeenCalled();
+    expect(mocks.sendEphemeralCard).not.toHaveBeenCalled();
   });
 
   it('`/t /repo <path>` selects the first Session repository in one message', async () => {

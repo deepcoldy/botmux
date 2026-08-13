@@ -1371,6 +1371,20 @@ export interface BotConfig {
    */
   p2pOpen?: boolean;
   /**
+   * 是否接受**其他 bot** 通过 `botmux send --slash` 发来的原生斜杠命令
+   * （/clear、/model、/close…）。默认开（undefined = 开）；只有显式 false 才关。
+   *
+   * 关掉后，来自 bot 发送方的 slash 命令不进 passthrough / daemon-command 路由，
+   * 退化为普通消息（与任何非 bot-slash 消息一样按 talk 门处理）——给 owner 一个
+   * 「不让别的 bot 清我上下文 / 敲我 CLI」的逃生阀。对**真人**发送方无影响
+   * （真人在飞书直接打字发 /clear 仍照常）。
+   *
+   * 安全边界不变：daemon 管理命令（/close /restart 等）从 bot 来**仍只认
+   * allowedUsers**（canOperate），本开关只控制「是否接受 bot 的 slash 进入路由」，
+   * 不放宽任何 operate 权限。
+   */
+  acceptSlashFromBots?: boolean;
+  /**
    * 消息额度覆盖配置：
    *   • 未配置（undefined）→ 卡片使用产品默认 3 条；oncall 不自动计数。
    *   • 配置正整数 D    → 卡片默认 D 条，同时作为 oncall 默认额度。
@@ -2187,6 +2201,15 @@ export function getBotTuiSlashAllow(larkAppId: string): string[] | undefined {
 }
 
 /**
+ * 该 bot 是否接受**其他 bot** 发来的原生斜杠命令（--slash）。默认开：只有
+ * 配置里显式 `acceptSlashFromBots: false` 才关。未知 bot（无注册项）→ 默认开
+ * （与其它 default-on 开关一致，缺配置不 fail-closed 成"全拒"）。
+ */
+export function botAcceptsSlashFromBots(larkAppId: string): boolean {
+  return bots.get(larkAppId)?.config.acceptSlashFromBots !== false;
+}
+
+/**
  * Load bot configurations from one of (in priority order):
  * 1. BOTS_CONFIG env var — path to a JSON file
  * 2. ~/.botmux/bots.json — default config path
@@ -2821,6 +2844,8 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       restrictGrantCommands: entry.restrictGrantCommands === true || undefined,
       // Default is ON, so only explicit false is meaningful/persisted.
       autoGrantRequestCards: entry.autoGrantRequestCards === false ? false : undefined,
+      // Default is ON (accept bot-sent slash), so only explicit false persists.
+      acceptSlashFromBots: entry.acceptSlashFromBots === false ? false : undefined,
       customPassthroughCommands,
       canTalkDaemonCommands,
       tuiSlashAllow,

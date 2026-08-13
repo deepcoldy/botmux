@@ -918,7 +918,7 @@ export const messages: Record<string, string> = {
   'daemon.auto_start_join_title': 'Proactive start (joined chat)',
   'daemon.auto_start_join_seed': '🚀 Joined this chat — getting to work…',
   'daemon.cmd_requires_session': '{cmd} requires an existing session (send a normal message first to start the CLI).',
-  'daemon.cmd_allowed_users_only': '⚠️ {cmd} is restricted to `allowedUsers`.',
+  'daemon.cmd_allowed_users_only': '⚠️ {cmd} is a management command, restricted to `allowedUsers`. To authorize, ask the owner to add you to this bot\'s `allowedUsers` (Dashboard or bots.json).',
   'daemon.download_failed_need_login': '⚠️ Some images/files failed to download (missing User Token). Send `/login` in this topic to authorize, then resend.',
   'daemon.foreign_bot_mention_prefix': '[@mention from {botName}]',
   'daemon.ordinary_ingress_failed': '⚠️ This message did not reach the CLI. Please resend; if it keeps failing, `/close` and reopen the topic.',

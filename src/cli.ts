@@ -128,7 +128,7 @@ import {
   startExactPm2ProcessIds,
   type Pm2ExactStartClient,
 } from './cli/pm2-exact-start.js';
-import { dispatchPrimaryMessage, findStdinAliasAttachment, normalizeInteractiveCardInput, sendFileAttachments, sendVideoAttachments, shouldSendAsPureVideo, validateVideoAttachments } from './cli/send-dispatch.js';
+import { dispatchPrimaryMessage, findStdinAliasAttachment, normalizeInteractiveCardInput, sendFileAttachments, sendVideoAttachments, shouldSendAsPureVideo, validateSlashSend, validateVideoAttachments } from './cli/send-dispatch.js';
 import { dispatchDeferredTopicSend, reusableDeferredTopicRoot, type DeferredScheduleRunData } from './cli/deferred-topic-send.js';
 import { readDeferredTopicBinding } from './core/deferred-topic-binding.js';
 import { resolveDaemonEnv } from './cli/daemon-lifecycle-env.js';
@@ -7952,7 +7952,7 @@ async function relaySend(
     // the dashboard hand anyway; excluding it would silently send the reason as a
     // bare message instead of the original loud "no content" failure. Plumbing
     // `--attention` through the relay is a separate change, out of this scope.
-    const pos = positionals(rest, ['--card', '--text', '--top-level', '--no-quote', '--mention-back', '--no-mention', '--anyway', '--voice']);
+    const pos = positionals(rest, ['--card', '--text', '--top-level', '--no-quote', '--mention-back', '--no-mention', '--anyway', '--voice', '--slash']);
     content = pos.length > 0 ? pos.join(' ') : await readStdin();
   }
   const preparedCardContent = cardJsonArg === undefined && cardFile === undefined && !rest.includes('--voice')
@@ -8011,7 +8011,7 @@ async function relaySend(
   // Forward only presentation flags (must match the watcher's allowlist); path,
   // routing (--chat-id/--into/--top-level) and --session-id flags are dropped —
   // content/attachments come from the outbox and session-id is forced host-side.
-  const FLAGS_NOVAL = new Set(['--mention-back', '--no-mention', '--no-quote', '--voice']);
+  const FLAGS_NOVAL = new Set(['--mention-back', '--no-mention', '--no-quote', '--voice', '--slash']);
   const FLAGS_VAL = new Set(['--mention', '--quote', '--response-kind']);
   const flags: string[] = [];
   for (let i = 0; i < rest.length; i++) {
@@ -8780,6 +8780,29 @@ async function cmdSend(rest: string[]): Promise<void> {
     console.error('botmux send: --card-file/--card-json 不能与 --voice 混用');
     process.exit(2);
   }
+  // --slash: send a NATIVE slash command (e.g. /clear /model /close) as a
+  // single-line plain-`text` message instead of the usual interactive card.
+  // The card path appends a `[🔊 语音总结]` footer, turning the body multi-line
+  // so the receiving daemon's parseSlashCommandInvocation drops it to an
+  // ordinary prompt (never reaching the passthrough / daemon-command router).
+  // A --slash send skips the card so a peer bot (or self) can consume it. It is
+  // deliberately exclusive with every richer payload — a slash command is one
+  // line of text, nothing else.
+  const isSlashSend = rest.includes('--slash');
+  if (isSlashSend) {
+    if (customCardRequested || asVoice) {
+      console.error('botmux send: --slash 不能与 --card-file/--card-json/--voice 混用（斜杠命令只发单行纯文本）');
+      process.exit(2);
+    }
+    if (images.length > 0 || files.length > 0 || videos.length > 0 || videoCovers.length > 0) {
+      console.error('botmux send: --slash 不能带附件（--images/--files/--videos）；斜杠命令只发单行纯文本');
+      process.exit(2);
+    }
+    if (attention.requested) {
+      console.error('botmux send: --slash 不能与 --attention 混用');
+      process.exit(2);
+    }
+  }
 
   const sid = sessionIdArg ?? ancestorCtx?.sessionId ?? process.env.BOTMUX_SESSION_ID ?? null;
   if (!sid) {
@@ -9006,7 +9029,7 @@ async function cmdSend(rest: string[]): Promise<void> {
     if (!existsSync(contentFile)) { console.error(`文件不存在: ${contentFile}`); process.exit(1); }
     content = readFileSync(contentFile, 'utf-8');
   } else {
-    const pos = positionals(rest, ['--card', '--text', '--top-level', '--no-quote', '--mention-back', '--no-mention', '--anyway', '--voice', '--attention']);
+    const pos = positionals(rest, ['--card', '--text', '--top-level', '--no-quote', '--mention-back', '--no-mention', '--anyway', '--voice', '--attention', '--slash']);
     if (pos.length > 0) {
       content = pos.join(' ');
     } else {
@@ -9797,7 +9820,9 @@ async function cmdSend(rest: string[]): Promise<void> {
       // --no-mention 显式不 @ 任何人：跳过正文 @BotName 的自动注入，否则正文里
       // 出现的 @名字 仍会被注入成 <at>，破坏 --no-mention 语义、还可能误触发对方
       // bot（正是要避免的循环 @）。botEntries/crossRef 仍需加载供 footer 寻址用。
-      if (!noMention && !vcMeetingManagedSendOrigin) {
+      // --slash 同理跳过：斜杠命令正文（如 `/clear`）不该被扫成 @，收件人只认
+      // 显式 --mention（下面的 slash 分支只用 explicit mentions 拼 <at> 前缀）。
+      if (!noMention && !isSlashSend && !vcMeetingManagedSendOrigin) {
       const alreadyMentioned = new Set(mentions.map(m => m.open_id));
       // Scan a code-span-stripped copy so a bot name quoted inside backticks or a
       // fenced block (e.g. an example `botmux send --mention @Bot …` or an
@@ -9930,6 +9955,19 @@ async function cmdSend(rest: string[]): Promise<void> {
         });
     if (customCard) {
       messageId = await dispatchPrimary(JSON.stringify(customCard), 'interactive');
+    } else if (isSlashSend) {
+      // --slash: deliver the command as a single-line plain-`text` message so the
+      // receiving daemon's parseSlashCommandInvocation sees a bare `/cmd` (the
+      // card path's `[🔊 语音总结]` footer would make it multi-line and demote it
+      // to an ordinary prompt). Inline an `<at>` for each --mention so a peer
+      // bot in a group is actually triggered AND the receiver can strip the
+      // mention back to a clean command (Feishu keys the <at>, the receiver's
+      // resolveMentions→stripLeadingMentions removes the leading `@Name`).
+      const slash = validateSlashSend(content);
+      if (!slash.ok) { console.error(`botmux send: ${slash.error}`); process.exit(2); }
+      const atPrefix = mentions.map(m => `<at user_id="${m.open_id}"></at>`).join(' ');
+      const slashText = atPrefix ? `${atPrefix} ${slash.command}` : slash.command;
+      messageId = await dispatchPrimary(slashText, 'text');
     } else if (pureVideoSend) {
       // Pure-video fast path: send the preview as a standalone media message.
       // A send that also carries mentions is deliberately excluded (media messages
