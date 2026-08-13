@@ -121,6 +121,15 @@ export const messages: Record<string, string> = {
   'card.grant.result_expiry': '有效至：{time}',
   'card.grant.result_quota': '消息额度：{n} 条',
 
+  // 仅发起人可见卡（采纳后转全群可见）
+  'card.owner_publish.only_you': '👁 仅对你可见',
+  'card.owner_publish.accept': '采纳（转为所有人可见）',
+  'card.owner_publish.toast_stale': '该卡片已失效',
+  'card.owner_publish.toast_owner_only': '仅发起人可采纳',
+  'card.owner_publish.toast_already': '已采纳过，或该卡片已失效',
+  'card.owner_publish.toast_published': '已转为所有人可见',
+  'card.owner_publish.toast_publish_failed': '发布失败，请稍后重试',
+
   // 消息额度用尽
   'quota.exhausted_notify': '⚠️ {at} 的消息额度已用尽（{limit}/{limit}），已收回与我的对话授权。如需继续，请联系 owner 重新 /grant。',
 

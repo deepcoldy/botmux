@@ -118,6 +118,15 @@ export const messages: Record<string, string> = {
   'card.grant.result_expiry': 'Expires at: {time}',
   'card.grant.result_quota': 'Message quota: {n}',
 
+  // Owner-only card (publish to everyone on acceptance)
+  'card.owner_publish.only_you': '👁 Only visible to you',
+  'card.owner_publish.accept': 'Accept (make visible to everyone)',
+  'card.owner_publish.toast_stale': 'This card has expired',
+  'card.owner_publish.toast_owner_only': 'Only the sender can accept',
+  'card.owner_publish.toast_already': 'Already accepted, or the card has expired',
+  'card.owner_publish.toast_published': 'Now visible to everyone',
+  'card.owner_publish.toast_publish_failed': 'Publish failed, please retry',
+
   // Message quota exhausted
   'quota.exhausted_notify': '⚠️ {at} has used up their message quota ({limit}/{limit}); talk access has been revoked. Ask the owner to /grant again to continue.',
 

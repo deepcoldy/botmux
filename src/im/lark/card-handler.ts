@@ -78,6 +78,11 @@ import {
   type V3DistillationCardHandlerDeps,
 } from './v3-distillation-card-handler.js';
 import { handleAskCardAction, isAskCardAction } from './ask-card.js';
+import {
+  handleOwnerPublishAction,
+  isOwnerPublishAction,
+  type OwnerPublishActionValue,
+} from './owner-publish-card.js';
 import { createCliAdapterSync } from '../../adapters/cli/registry.js';
 import { buildClosedSessionCard } from '../../core/closed-session-card.js';
 import { ttadkConfigModelChoices } from '../../setup/cli-selection.js';
@@ -967,6 +972,17 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
   // Use the receiving bot's allowedUsers — the operator open_id in card actions
   // is scoped to the app that received the callback.
   const operatorOpenId = data?.operator?.open_id;
+  // ─── 仅发起人可见卡「采纳（转为所有人可见）」动作 ────────────────────────────
+  // 不绑 session，必须在 session 解析前处理。owner 强闸门 + nonce 一次性核销；
+  // 采纳后删私密卡 + 向全群重发公开卡。cardMessageId 是私密卡 id，用于删除。
+  if (isOwnerPublishAction(value?.action) && larkAppId) {
+    return handleOwnerPublishAction(
+      value as OwnerPublishActionValue,
+      operatorOpenId,
+      cardMessageId,
+      larkAppId,
+    );
+  }
   // ─── 机器过载告警卡动作（overload_clean_stopped / overload_suspend_idle / noop）──
   // 不绑 session。owner 强闸门 + nonce 一次性核销（每按钮各一次，防重复点/超时重投/旧卡）。
   // 点完不替换成死卡：重建同一张卡，把点过的按钮标 done+数量并 disabled，另一个仍可点。
