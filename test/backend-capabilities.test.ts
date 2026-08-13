@@ -17,7 +17,7 @@ describe('backendSupportsWebTerminal', () => {
 
 describe('backendCliCompatibilityError', () => {
   it('fails closed for runner CLIs whose final/thread events require hidden OSC on zmx', () => {
-    for (const cliId of ['codex-app', 'mira', 'mir'] as const) {
+    for (const cliId of ['codex-app', 'mira', 'mir', 'dsh'] as const) {
       expect(backendCliCompatibilityError('zmx', cliId)).toContain('hidden OSC');
       expect(backendCliCompatibilityError('tmux', cliId)).toBeUndefined();
     }
