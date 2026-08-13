@@ -105,20 +105,20 @@ export interface DaemonSession {
    */
   mojoAppliedUnprovableEnvKeys?: string[];
   /**
-   * Same ledger, inherited from a PREVIOUS generation whose worker has not been
-   * observed to exit yet.
+   * Same ledger, inherited from EVERY previous generation of this session.
    *
    * `forkWorker`'s double-fork guard sends `close` + `kill()` and then continues
    * synchronously to spawn the replacement — it never awaits the old worker's
-   * exit. `kill()` is only a signal delivered, and for mojo a request-less close
-   * degrades to best-effort teardown, so the old (possibly LD_PRELOAD-injected)
-   * child can still be alive and holding a credential while the new generation
-   * starts with an empty ledger. Clearing on "new generation" therefore assumed
-   * something double-fork disproves.
+   * exit. And even that exit would not be enough: the dangerous env acts on the
+   * mojo CLI *child*, whose `kill()` is a bare SIGTERM with no escalation and no
+   * wait, which a trapping/detached child survives (its descendants too). So no
+   * observable exit signal proves the injected process is gone.
    *
-   * Parked here instead, and only released once the retiring worker actually
-   * fires `exit` (the existing trackLifecycleRetirement hook). A worker that
-   * never exits keeps the keys forever — fail-closed on purpose.
+   * Therefore monotonic for the life of the DaemonSession: parked on every
+   * generation boundary, never released. Being in-memory, it disappears only when
+   * the session ends or the daemon restarts. Cost: a session ever handed a
+   * dangerous launcher env stays unprovable until it ends — an availability
+   * trade, not a credential leak.
    */
   mojoRetiringUnprovableEnvKeys?: string[];
   /** Dashboard「复现命令」：worker 在 `ready` 时上报的、该 session 本次冷启的近似

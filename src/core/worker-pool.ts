@@ -113,7 +113,6 @@ function trackLifecycleRetirement(ds: DaemonSession, worker: ChildProcess): void
     const current = lifecycleRetiringWorkers.get(ds);
     current?.delete(worker);
     if (current?.size === 0) lifecycleRetiringWorkers.delete(ds);
-    releaseRetiringEnvLedgerIfSettled(ds);
   };
   worker.once('exit', release);
 }
@@ -122,29 +121,36 @@ function clearLifecycleRetirement(ds: DaemonSession, worker: ChildProcess): void
   const workers = lifecycleRetiringWorkers.get(ds);
   workers?.delete(worker);
   if (workers?.size === 0) lifecycleRetiringWorkers.delete(ds);
-  releaseRetiringEnvLedgerIfSettled(ds);
-}
-
-/**
- * Drop the parked launcher-env keys once no retiring worker is left.
- *
- * Only ever called from an `exit` path, which is the point of the whole design:
- * a *sent* kill proves nothing, an observed exit does. While any retiring worker
- * is still tracked the keys stay, so the device-isolation proof keeps treating
- * the old child's env as live.
- */
-function releaseRetiringEnvLedgerIfSettled(ds: DaemonSession): void {
-  if (lifecycleRetiringWorkers.has(ds)) return;
-  ds.mojoRetiringUnprovableEnvKeys = undefined;
 }
 
 /**
  * Start a new worker generation's launcher-env ledger.
  *
- * The previous generation's keys are PARKED rather than dropped when its worker
- * has not been observed to exit (double-fork: `kill()` is sent and the
- * replacement spawns synchronously). Only `releaseRetiringEnvLedgerIfSettled`,
- * driven by a real `exit` event, can retire them.
+ * The previous generation's keys are PARKED, never dropped — and deliberately
+ * WITHOUT consulting whether that worker has exited.
+ *
+ * A worker exit does not prove the dangerous process is gone, and the dangerous
+ * env acts on the mojo CLI *child*, not on the worker that parents it:
+ *   - `MojoBackend.kill()` sends a bare `SIGTERM`, nulls its handle and reports
+ *     `exitCb(0)` immediately — no SIGKILL escalation, no wait. A child that
+ *     traps/ignores TERM, or is slow, survives it.
+ *   - the worker's close path then runs `killCli()` and `process.exit(0)` without
+ *     awaiting the child, so worker exit can precede child death.
+ *   - a mojo child may also have detached descendants, so even a per-PID exit
+ *     proof would not cover the process tree.
+ * `PATH`-substituted launchers and `LD_PRELOAD` hooks live in exactly that child,
+ * which is what holds the activated device credential.
+ *
+ * So the ledger is monotonic for the life of this DaemonSession: it disappears
+ * only when the session ends or the daemon restarts (it is in-memory), never on
+ * an exit signal we cannot verify. A stricter alternative — escalating to SIGKILL
+ * and waiting for process-GROUP quiescence before releasing — is the only way to
+ * make release sound, and is deliberately out of scope here: it needs new
+ * teardown machinery and would still have to cover descendants, whereas monotonic
+ * retention is fail-closed by construction.
+ *
+ * Cost: a session that was ever handed a dangerous launcher env stays
+ * unprovable until it ends. That is an availability trade, not a credential leak.
  *
  * Exported so the behavioural guards can assert this directly — deleting the
  * three call sites used to leave every test green.
@@ -152,15 +158,11 @@ function releaseRetiringEnvLedgerIfSettled(ds: DaemonSession): void {
 export function startNewGenerationEnvLedger(
   ds: DaemonSession,
   initEnv: Record<string, string> | undefined,
-  deps: { previousGenerationStillAlive?: (ds: DaemonSession) => boolean } = {},
 ): void {
-  // Injected only so the parking rule can be unit-tested without spawning a real
-  // worker (same dependency-seam style as cleanupExplicitSessionBacking). The
-  // default is the single production source of truth.
-  const stillAlive = deps.previousGenerationStillAlive
-    ?? ((s: DaemonSession) => lifecycleRetiringWorkers.has(s));
-  const carried = stillAlive(ds) ? (ds.mojoAppliedUnprovableEnvKeys ?? []) : [];
-  const parked = new Set([...(ds.mojoRetiringUnprovableEnvKeys ?? []), ...carried]);
+  const parked = new Set([
+    ...(ds.mojoRetiringUnprovableEnvKeys ?? []),
+    ...(ds.mojoAppliedUnprovableEnvKeys ?? []),
+  ]);
   ds.mojoRetiringUnprovableEnvKeys = parked.size > 0 ? [...parked] : undefined;
   ds.mojoAppliedUnprovableEnvKeys = undefined;
   rememberAppliedUnprovableEnvKeys(ds, initEnv);
