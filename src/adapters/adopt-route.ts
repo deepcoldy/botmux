@@ -239,11 +239,14 @@ export type CliSessionLookup =
 
 /**
  * 查询某个 daemon 是否有该 CLI 原生会话 id（如 OpenCode 的 `ses_*`）的活跃
- * 会话。GET http://127.0.0.1:<ipcPort>/api/session-by-cli/<cliSessionId>
- * 200 → hit；409（本 daemon 内重复绑定）→ conflict；404 且 body 为本 endpoint
- * 专用响应 `{error:'no_session'}` → miss（明确无匹配）；generic 404 / 401 /
- * 403 / 5xx 等其它状态与无效 body → unknown（协议/查询结果未知，上层必须视为
- * 「无法证明唯一」fail closed）。超时 2s。
+ * 会话。反查 identity 是 (cliId, cliSessionId)：OpenCode V1→V2 迁移会原样保留
+ * ses_* id，必须带上发起反查的适配器 cliId，否则 V1 会话会被误当成唯一 hit。
+ * 本端点只服务 opencode2 共享托管 service 的反查（服务端强制 cliId===opencode2）。
+ * GET http://127.0.0.1:<ipcPort>/api/session-by-cli/opencode2/<cliSessionId>
+ * 200 → hit；409（重复绑定）→ conflict；404 且 body 为本 endpoint 专用响应
+ * `{error:'no_session'}` → miss（明确无匹配）；generic 404 / 401 / 403 / 5xx
+ * 等其它状态与无效 body → unknown（协议/查询结果未知，上层必须视为「无法证明
+ * 唯一」fail closed）。超时 2s。
  */
 export async function queryCliSession(
   ipcPort: number,
@@ -254,7 +257,7 @@ export async function queryCliSession(
   try {
     const res = await fetchDaemonIpc(
       ipcPort,
-      `/api/session-by-cli/${encodeURIComponent(cliSessionId)}`,
+      `/api/session-by-cli/opencode2/${encodeURIComponent(cliSessionId)}`,
       { signal: controller.signal },
     );
     if (res.status === 409) return { kind: 'conflict' };
