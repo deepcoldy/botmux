@@ -34,6 +34,9 @@ export const CLI_ID_CHOICES: Record<string, CliId> = {
   '24': 'riff',
   '25': 'reasonix',
   '26': 'opencode2',
+  // 新增 CLI 一律追加到尾部：序号是脚本化 setup（非 TTY 管道喂数字）的稳定接口，
+  // 插位会让老脚本静默选错 CLI。
+  '27': 'dsh',
 };
 
 const VALID_CLI_IDS: ReadonlySet<string> = new Set(Object.values(CLI_ID_CHOICES));
@@ -70,6 +73,7 @@ const CLI_DISPLAY_LABELS: Record<CliId, string> = {
   'kiro-cli': 'Kiro',
   'riff': 'Riff',
   'reasonix': 'Reasonix',
+  'dsh': 'DeepSeek Harness',
 };
 
 /**
