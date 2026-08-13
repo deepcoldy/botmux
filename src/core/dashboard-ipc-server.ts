@@ -8,6 +8,8 @@ import { logger } from '../utils/logger.js';
 import { cliAuthBind, verifyHmac } from '../dashboard/auth.js';
 import { WORKFLOW_DAEMON_IPC_ROUTE_PREFIX } from '../workflows/v3/daemon-ipc-auth.js';
 import { V3_SESSION_RUN_MUTATION_ROUTE_PREFIX } from '../workflows/v3/session-relay.js';
+import { REPORT_SESSION_RELAY_ROUTE } from './report-session-relay.js';
+import { DISPATCH_REPORT_REGISTER_ROUTE } from './dispatch-report-binding.js';
 import { listenWithProbe } from '../utils/listen-with-probe.js';
 import { dashboardSecretPath } from './dashboard-secret.js';
 import {
@@ -636,6 +638,11 @@ function routeHasNarrowUntrustedAuth(method: string, pathname: string): boolean 
   if (method === 'POST' && /^\/api\/sessions\/[^/]+\/(?:slash|cd|close|chat-rename)$/.test(pathname)) return true;
   if (method === 'POST' && pathname === '/api/hooks/emit') return true;
   if (method === 'POST' && pathname === '/api/attention') return true;
+  // A sandboxed report cannot read the host HMAC secret. This narrow route
+  // validates the current session's rotating capability, binds the dispatch
+  // root server-side, then lets the trusted daemon relay to the orchestrator.
+  if (method === 'POST' && pathname === REPORT_SESSION_RELAY_ROUTE) return true;
+  if (method === 'POST' && pathname === DISPATCH_REPORT_REGISTER_ROUTE) return true;
   // macOS read-isolated `botmux send` presents a rotating worker capability;
   // the handler writes the authoritative tuple into a host-owned read-only
   // proof sidecar, so loopback response spoofing cannot confer authority.
@@ -886,7 +893,7 @@ export { composeRowFromActive, composeRowFromClosed, composeRowFromPersistedActi
 export function setBotName(name: string): void { setRowsBotName(name); }
 
 function composeDashboardSessionRows(): SessionRow[] {
-  const active = listActiveSessions().map(composeRowFromActive);
+  const active = listActiveSessions().map((ds) => composeRowFromActive(ds));
   const activeIds = new Set(active.map(row => row.sessionId));
   const persisted = sessionStore.listSessions();
   const unregisteredActive = persisted
@@ -1160,6 +1167,27 @@ ipcRoute('POST', '/api/sessions/:sessionId/suspend', async (_req, res, params) =
     // Worker already gone (idle-suspended / crash-stopped) — the goal state is
     // already reached, so report idempotent success without a live kill.
     return jsonRes(res, 200, { ok: true, sessionId: params.sessionId, suspended: false, reason: 'no_live_worker' });
+  }
+  // Producing a reply — killing the worker now would drop this turn. Queue
+  // instead; worker-pool's runPendingSuspendIfSettled cashes it in on the
+  // idle/limited edge. Ordering matters: the idempotent no-worker branch above
+  // must win, so "worker was already gone" never reports as deferred.
+  //
+  // The suspendability check is part of the queueing condition, not a new guard
+  // ahead of it: a non-suspendable (pty) backend must keep falling through to
+  // suspendWorker's existing 409 rather than get a `deferred` that could only
+  // fail silently at fulfillment time.
+  if (
+    (ds.lastScreenStatus === 'working' || ds.lastScreenStatus === 'analyzing')
+    && isSuspendableBackendType(ds.initConfig?.backendType)
+  ) {
+    ds.pendingSuspendReason = 'manual_suspend';
+    // Bind the claim to the generation that is producing right now: it must not
+    // outlive that worker (see clearPendingSuspendClaim).
+    ds.pendingSuspendGeneration = ds.workerGeneration;
+    return jsonRes(res, 200, {
+      ok: true, sessionId: params.sessionId, suspended: false, reason: 'deferred',
+    });
   }
   if (!suspendWorker(ds, 'manual_suspend')) {
     // Live worker but a non-suspendable (pty) backend: killing it would drop the
@@ -1546,6 +1574,53 @@ function buildAsyncTriggerLookupResponse(sessionId: string, triggerId?: string):
 
   const memTriggerId = triggerId || ds?.latestAsyncTriggerId;
   const memResult = ds && memTriggerId ? ds.asyncTriggerResults?.get(memTriggerId) : undefined;
+
+  // Best-effort poll-side convergence for the double-fault turn (codex #818 P1-8):
+  // the CONTRACT is that a double-fault returns 5xx and the caller retries with the
+  // same key (that retry path is the authoritative recovery). This block is only a
+  // bonus for a client that happens to poll first — if this turn is flagged
+  // postBarrierFault (post-barrier throw AND the durable terminalize then threw),
+  // nothing dispatched and no durable result exists, yet a live shared worker keeps
+  // `liveActive` true so resolveAsyncTriggerState would otherwise report `running`.
+  // Re-attempt the strict terminalize opportunistically; a persistent EIO simply
+  // falls through to `running` and is converged by a same-key retry or boot reconcile.
+  if (ds && memTriggerId) {
+    const faultEntry = ds.idempotentAsyncTurns?.get(memTriggerId);
+    if (faultEntry?.postBarrierFault) {
+      // COMPLETED-WINS (codex #818 P1-8 race): the AUTHORITATIVE decision is
+      // recordFailedStrict's IN-LOCK outcome (no TOCTOU). A pre-read fast-path
+      // avoids the write when already visibly completed; else the in-lock return
+      // (`already_completed` vs `written_failed`) decides. Never terminalize over a
+      // completion that landed after the pre-read.
+      const durable = asyncTriggerStore.lookup(sessionId, memTriggerId);
+      const ownedCompleted = durable?.result.status === 'completed'
+        && durable.ownerLarkAppId === faultEntry.ownerLarkAppId;
+      if (ownedCompleted) {
+        ds.idempotentAsyncTurns?.delete(memTriggerId);
+        // fall through to normal resolution → reports completed.
+      } else {
+        try {
+          const outcome = asyncTriggerStore.recordFailedStrict(sessionId, memTriggerId, Date.now(), faultEntry.ownerLarkAppId, 'dispatch_unknown');
+          ds.idempotentAsyncTurns?.delete(memTriggerId);
+          if (outcome === 'written_failed') {
+            ds.asyncTriggerResults?.delete(memTriggerId);
+            return {
+              ok: true, state: 'failed', triggerId: memTriggerId,
+              target: { kind: 'turn', sessionId, chatId: ds.chatId ?? stored?.chatId },
+              errorCode: 'no_output',
+              error: 'previous dispatch was interrupted with unknown outcome; not re-run (at-most-once)',
+              message: 'async trigger terminated without output',
+            };
+          }
+          // outcome === 'already_completed': a completion was seen under the lock —
+          // fall through to normal resolution (which reports the completed result).
+        } catch {
+          // Genuine I/O failure — leave the flag for the next poll / retry / boot
+          // reconcile; fall through to `running` rather than a phantom terminal.
+        }
+      }
+    }
+  }
 
   const resolved = resolveAsyncTriggerState({
     sessionId,
@@ -3510,6 +3585,7 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
     docSubscribeDefaultMode: cardPrefs.docSubscribeDefaultMode,
     restrictGrantCommands: grantPrefs.restrictGrantCommands,
     autoGrantRequestCards: grantPrefs.autoGrantRequestCards,
+    p2pOpen: grantPrefs.p2pOpen,
     messageQuotaDefaultLimit: grantPrefs.messageQuotaDefaultLimit,
     grantDefaultDurationMs: grantPrefs.grantDefaultDurationMs,
     p2pMode,
@@ -3668,6 +3744,7 @@ ipcRoute('PUT', '/api/bot-summary-trigger', async (req, res) => {
 // Per-bot 授权偏好。Body 任意子集：
 //   • restrictGrantCommands: boolean       — 限制被授权人只能纯对话
 //   • autoGrantRequestCards: boolean       — 未授权 @ 被挡住时是否发 grant 申请卡
+//   • p2pOpen: boolean                     — 私聊对话全开（talk-only；管理权仍只认 allowedUsers）
 //   • messageQuotaDefaultLimit: number|null — 卡片/Oncall 额度覆盖（null = 卡片内置 3 条、Oncall 不限）
 //   • grantDefaultDurationMs: number|null   — 新授权默认有限时长（null = 产品默认 1 小时）
 ipcRoute('PUT', '/api/bot-grant-prefs', async (req, res) => {
@@ -3682,6 +3759,7 @@ ipcRoute('PUT', '/api/bot-grant-prefs', async (req, res) => {
   const body = raw as {
     restrictGrantCommands?: unknown;
     autoGrantRequestCards?: unknown;
+    p2pOpen?: unknown;
     messageQuotaDefaultLimit?: unknown;
     grantDefaultDurationMs?: unknown;
   };
@@ -3689,11 +3767,13 @@ ipcRoute('PUT', '/api/bot-grant-prefs', async (req, res) => {
   const patch: {
     restrictGrantCommands?: boolean;
     autoGrantRequestCards?: boolean;
+    p2pOpen?: boolean;
     messageQuotaDefaultLimit?: number | null;
     grantDefaultDurationMs?: number | null;
   } = {};
   if (typeof body.restrictGrantCommands === 'boolean') patch.restrictGrantCommands = body.restrictGrantCommands;
   if (typeof body.autoGrantRequestCards === 'boolean') patch.autoGrantRequestCards = body.autoGrantRequestCards;
+  if (typeof body.p2pOpen === 'boolean') patch.p2pOpen = body.p2pOpen;
   // null（含 JSON null）= 恢复内置额度策略；number = 设定覆盖值（store 内校验 1–1000）。
   if (body.messageQuotaDefaultLimit === null) patch.messageQuotaDefaultLimit = null;
   else if (typeof body.messageQuotaDefaultLimit === 'number') patch.messageQuotaDefaultLimit = body.messageQuotaDefaultLimit;

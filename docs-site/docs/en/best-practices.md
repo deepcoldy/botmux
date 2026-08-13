@@ -28,10 +28,11 @@ As Shen Han's on-call bot, you'll receive questions from users:
 
 ## Scenario 2 · Alert operations
 
-Monitoring alerts / CI / ticket triggers — let external systems proactively push events to the bot to handle.
+Monitoring alerts / CI / ticket triggers — let external systems proactively push events to the bot to handle. Two integration approaches; pick by what your alerting pipeline already looks like:
 
-- **Try the Webhook integration point** (Dashboard "Connectors (beta)", see [Connectors (Webhook)](/en/webhook)): let external systems (monitoring alerts, CI, tickets…) trigger the bot to speak in a group or run a workflow via a webhook. You can configure: the bot to trigger, the trigger mode (single-round conversation / workflow), which group to deliver to, the verification method (a **token** in the URL so a single curl can trigger it / an **HMAC signature** for more security), and the **handling instructions** (telling the bot what to do when it receives the event).
-- **Auto-create a group per alert**: you can configure it to "auto-create a group for every incoming alert and add the bot **and the on-call person together**"; if you set a dedup key, similar alerts are merged into the same group, and if left empty, each alert gets a new group — the on-call person follows up right in the group.
+- **Approach 1 · Webhook push** (Dashboard "Connectors (beta)", see [Connectors (Webhook)](/en/webhook)): let external systems (monitoring alerts, CI, tickets…) trigger the bot to speak in a group or run a workflow via a webhook. You can configure: the bot to trigger, the trigger mode (single-round conversation / workflow), which group to deliver to, the verification method (a **token** in the URL so a single curl can trigger it / an **HMAC signature** for more security), and the **handling instructions** (telling the bot what to do when it receives the event).
+- **Approach 2 · Listen to an existing alert group** (see [Group message listener](/en/bots-json#group-message-listener)): if your monitoring/alerting system **already has its own Lark bot posting alerts into a group**, you don't need a webhook at all — add the bot to that group and enable the listener in the Dashboard "Roles → Message Listener" tab, and every alert starts an investigation session automatically. Use **blacklist mode + check "bot"** to watch a third-party alert bot (e.g. Argos). Note that non-@ / other-bot messages are backfilled by a history poll roughly every 30s, so up to ~30s of latency.
+- **Auto-create a group per alert**: you can configure it to "auto-create a group for every incoming alert and add the bot **and the on-call person together**"; if you set a dedup key, similar alerts are merged into the same group, and if left empty, each alert gets a new group — the on-call person follows up right in the group. Combined with the bot's `autoStartOnGroupJoin` (see [`bots.json` · Proactive start](/en/bots-json#proactive-start)), the bot starts working the moment it's added to the new group, with no manual @.
 - **Different alert bots for different projects**: give each project its own alert bot, each configured with a default role prompt carrying that project's background.
 - **Different on-call directories for different alert bots**: `/oncall bind` each alert bot to the corresponding project directory, so incoming alerts get investigated right in that repository.
 - You can also stack [scheduled tasks](/en/schedule) for **proactive inspection broadcasts**: `/schedule every day at 9:00 check yesterday's alert trends and summarize`, only @ing people when there's an anomaly.
@@ -55,8 +56,7 @@ Multiple people on a team, with their own bots working together.
 
 - **A Lark limitation**: bots still are not triggered by each other's regular messages; relay requires an explicit `--mention` to the target bot.
 - **Default discovery**: `botmux bots list` discovers bots in the current group through the group bot roster and shows `mentionable`; models also see relay targets in the `<available_bots>` block.
-- **Team feature (recommended)**: in the Dashboard "Teams" section, tag bots under multiple people's names and pull them into a team for **cross-deployment discovery**, then directly select them to create a group and start collaborating — the main path no longer needs `/introduce`.
-- **Legacy fallback**: only run `@everyone's bot /introduce` when an external bot is missing or shows `mentionable=false`.
+- **Team feature (recommended)**: in the Dashboard "Teams" section, tag bots under multiple people's names and pull them into a team for **cross-deployment discovery**, then directly select them to create a group and start collaborating.
 
 ![Dashboard Teams · cross-deployment collaboration](https://magic-builder.tos-cn-beijing.volces.com/uploads/1780033301213_dash-team.png)
 

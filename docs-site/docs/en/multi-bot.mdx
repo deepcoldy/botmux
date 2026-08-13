@@ -12,7 +12,7 @@ Multiple Lark bots can run on the same machine, and each bot can be bound to a d
 
 ## Letting bots know each other
 
-The main path no longer requires a manual `/introduce`: botmux discovers bots in the current Lark group via the group bot roster by default. **Cross-deployment** recognition has two paths, both entering the **same team-trust gate and skipping `/grant`**: one is the federation in the Dashboard "Teams" panel (invite someone else's deployment into the same team, create cross-deployment groups); the other is central-platform team-sync (the platform pushes down teams and groups). A plain `/group` or the Dashboard "New Group" flow creates an ordinary same-deployment group that uses neither path and carries no cross-deployment team trust.
+botmux discovers bots in the current Lark group via the group bot roster by default. **Cross-deployment** recognition has two paths, both entering the **same team-trust gate and skipping `/grant`**: one is the federation in the Dashboard "Teams" panel (invite someone else's deployment into the same team, create cross-deployment groups); the other is central-platform team-sync (the platform pushes down teams and groups). A plain `/group` or the Dashboard "New Group" flow creates an ordinary same-deployment group that uses neither path and carries no cross-deployment team trust.
 
 For handoffs, have the model check:
 
@@ -21,7 +21,7 @@ For handoffs, have the model check:
 
 After that, a bot can explicitly @ the other from its own session with `botmux send --mention <the other's openId>`, triggering the relay.
 
-> A hard fact about cross-bot collaboration: **if you don't `--mention` the other bot, it won't be triggered at all**. `/introduce` is still kept as a legacy / external-bot fallback: use `@botA @botB /introduce` only when the target is missing from `botmux bots list` or shows `mentionable=false`.
+> A hard fact about cross-bot collaboration: **if you don't `--mention` the other bot, it won't be triggered at all**.
 
 ## Typical scenarios
 

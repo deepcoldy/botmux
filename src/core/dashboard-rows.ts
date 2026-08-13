@@ -13,6 +13,7 @@ import { getTerminalAdvertisedPort } from './terminal-url.js';
 import { getBotBrand } from '../bot-registry.js';
 import { type Brand, chatAppLink } from '../im/lark/lark-hosts.js';
 import { getSessionTokenUsage, type SessionTokenUsage } from './cost-calculator.js';
+import { readSessionOpenTodos } from '../services/todo-state.js';
 import { getIdentity } from '../im/lark/identity-cache.js';
 import {
   buildSessionMessagePreview,
@@ -89,6 +90,11 @@ export interface SessionRow extends SessionMessagePreview {
    *  was raised) so the UI shows a true "waiting since" time — NOT lastMessageAt,
    *  which a silent raise never bumps. Feeds the needs-you column. */
   agentAttention?: { kind: string; reason: string; at: number };
+  /** 任务态（会话状态重设计 P2）：从 CLI transcript 读到的当前 TODO 完成度。
+   *  与运行态正交——「运行态=空闲 + 有未完成 todo」正是要抓的「机器停了活没干完」。
+   *  仅 Claude / Codex 家族能提取；其它 CLI、无 transcript、从未建 todo 时为 undefined
+   *  （= 未知/不支持，前端不据此判「已交付」）。 */
+  openTodos?: { total: number; done: number; remaining: number; hasInProgress: boolean; items: Array<{ status: string; text: string }> };
   /** Native Agent CLI token usage for this session. Null means unavailable. */
   tokenUsage?: SessionTokenUsage | null;
   /** Worker process PID, active rows only. Used by dashboard resource attribution. */
@@ -144,6 +150,17 @@ function sessionTokenUsage(s: Session, workingDir?: string): SessionTokenUsage |
   });
 }
 
+function sessionOpenTodos(s: Session, workingDir?: string, fresh?: boolean): SessionRow['openTodos'] {
+  return readSessionOpenTodos({
+    cliId: s.cliId ?? 'unknown',
+    sessionId: s.sessionId,
+    cliSessionId: s.cliSessionId,
+    cwd: workingDir ?? s.workingDir,
+    larkAppId: s.larkAppId,
+    fresh,
+  }) ?? undefined;
+}
+
 function directChatDisplayName(s: Session, larkAppId?: string): string | undefined {
   if (s.chatType !== 'p2p') return undefined;
   const persisted = String(s.chatDisplayName ?? '').trim();
@@ -179,7 +196,7 @@ function sessionRuntimeFields(s: Session): Pick<SessionRow, 'runtimeId' | 'runti
   return {};
 }
 
-export function composeRowFromActive(ds: DaemonSession): SessionRow {
+export function composeRowFromActive(ds: DaemonSession, opts?: { fresh?: boolean }): SessionRow {
   return {
     sessionId: ds.session.sessionId,
     larkAppId: ds.larkAppId,
@@ -231,6 +248,7 @@ export function composeRowFromActive(ds: DaemonSession): SessionRow {
       ? { kind: ds.agentAttention.kind, reason: ds.agentAttention.reason, at: ds.agentAttention.at }
       : undefined,
     tokenUsage: sessionTokenUsage(ds.session, ds.workingDir),
+    openTodos: sessionOpenTodos(ds.session, ds.workingDir, opts?.fresh),
     ...(ds.worker?.pid !== undefined ? { workerPid: ds.worker.pid } : {}),
     ...(ds.adoptedFrom?.originalCliPid !== undefined ? { adoptCliPid: ds.adoptedFrom.originalCliPid } : {}),
     ...buildSessionMessagePreview(ds.session),

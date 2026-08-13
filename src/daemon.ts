@@ -167,6 +167,7 @@ import {
   withActiveSessionKeyLock,
   getDaemonBootId,
   getDaemonStreamingCardUsageSnapshot,
+  postTurnStartingCard,
   isSessionTransferring,
   type WorkerSessionReplyOptions,
 } from './core/worker-pool.js';
@@ -177,11 +178,24 @@ import {
   waitForSessionReadyAck,
 } from './core/session-ready-handshake.js';
 import { loadOrCreateDashboardSecret, loadPersistedToken } from './dashboard/auth.js';
-import { daemonIpcAuthHeaders, loadDaemonIpcSecret } from './core/daemon-ipc-auth.js';
+import { daemonIpcAuthHeaders, fetchDaemonIpc, loadDaemonIpcSecret } from './core/daemon-ipc-auth.js';
 import {
   authorizeSessionScopedIpc,
   bindSessionScopedIpcIdentity,
 } from './core/daemon-ipc-session-auth.js';
+import {
+  authorizeReportSessionRelayRequest,
+  buildOrchestratorReportTrigger,
+  REPORT_SESSION_RELAY_MAX_BYTES,
+  REPORT_SESSION_RELAY_ROUTE,
+} from './core/report-session-relay.js';
+import {
+  createDispatchReportBinding,
+  dispatchReportBindingSecretPath,
+  DISPATCH_REPORT_REGISTER_MAX_BYTES,
+  DISPATCH_REPORT_REGISTER_ROUTE,
+} from './core/dispatch-report-binding.js';
+import { recordDispatchRegistryEntry } from './core/dispatch-registry.js';
 import { saveFrozenCards, deleteFrozenCards } from './services/frozen-card-store.js';
 import { DAEMON_COMMANDS, SESSIONLESS_DAEMON_COMMANDS, EXISTING_SESSION_ONLY_DAEMON_COMMANDS, resolvePassthroughCommands, resolveAdapterDefaultPassthroughCommands, handleCommand, handleCardCommand, handleTermLinkCommand, parseSlashCommandInvocation, parseForceTopicInvocation } from './core/command-handler.js';
 import { docWatchCommandNeedsSession } from './core/doc-watch-command.js';
@@ -213,7 +227,7 @@ import {
   resumeSession,
   closeCliMismatchedSessionsForBot,
 } from './core/session-manager.js';
-import { triggerSessionTurn, reconcileIdempotencyLeasesOnBoot, convergeIdempotentAsyncTurnOnWorkerExit } from './core/trigger-session.js';
+import { triggerSessionTurn, reconcileIdempotencyLeasesOnBoot, convergeIdempotentAsyncTurnOnWorkerExit, externalEventOpensOwnTopic } from './core/trigger-session.js';
 import {
   runDetachedBotTurnMutation,
   tryWithBotTurnMutation,
@@ -430,6 +444,7 @@ import {
   markVcTranscriptItemsFlushed,
 } from './vc-agent/meeting-state.js';
 import {
+  ensureLarkCliBotProfile,
   fetchMeetingEventsAsBot,
   joinMeetingAsBot,
   sendMeetingTextMessageAsBot,
@@ -1652,6 +1667,8 @@ type VcMeetingDaemonSession = {
    * replayed exactly. */
   consumerRestoreCatchUpRequired?: boolean;
   consumerRecoveryGapNotified?: boolean;
+  /** De-dupes the owner DM sent when a meeting invite fails to join. */
+  inviteFailureNotified?: boolean;
   consumerRecoveryGap?: VcMeetingDeliveryGap;
   consumerTranscriptRevisions: Record<string, number>;
   consumerLastInjectedAtMs?: number;
@@ -1885,6 +1902,18 @@ const VC_MEETING_ACTIVATION_CONTEXT_FIELD = 'vc_meeting_activation_context';
 const VC_MEETING_ACTIVATION_CONTEXT_MAX_CHARS = 2_000;
 const vcMeetingEndedTombstones = new BoundedMap<string, number>(2_000);
 const vcMeetingPendingInvites = new BoundedMap<string, VcMeetingPendingInvite>(2_000);
+/**
+ * De-dupes the owner DM for an eager-join failure that happens BEFORE a session
+ * exists (invite carries only a meeting_no, no meeting.id — so there is no
+ * session to hang `inviteFailureNotified` on). Keyed by `${larkAppId}:${no}`;
+ * bounded and best-effort. Cleared once the meeting is successfully joined so a
+ * later genuine failure can still notify. */
+const vcMeetingEagerJoinFailureNotified = new BoundedMap<string, number>(2_000);
+const VC_MEETING_EAGER_JOIN_FAILURE_TTL_MS = 30 * 60 * 1000;
+
+function vcMeetingEagerJoinFailureKey(larkAppId: string, meetingNo: string): string {
+  return `${larkAppId}:${meetingNo}`;
+}
 
 function vcMeetingSessionKey(larkAppId: string, meetingId: string): string {
   return `${larkAppId}:${meetingId}`;
@@ -2100,6 +2129,94 @@ function vcMeetingConfiguredBotConfigs(): BotConfig[] {
 
 function vcMeetingConfiguredBotConfig(larkAppId: string): BotConfig | undefined {
   return vcMeetingConfiguredBotConfigs().find(cfg => cfg.larkAppId === larkAppId);
+}
+
+export type VcMeetingJoinProfileResult =
+  | { ok: true; profile: string; created: boolean }
+  | { ok: false; reason: 'no_profile' | 'missing_secret' | 'add_failed'; profile?: string; error: string };
+
+/**
+ * Ensure the lark-cli bot profile used for `--as bot` meeting join actually
+ * exists, provisioning it from the bot's stored appSecret when absent.
+ *
+ * Historically `larkCliProfile` defaulted to the bot's own appId (see the
+ * dashboard managed-listener bootstrap) but nothing ever registered that
+ * profile with lark-cli, so the first real invite failed with "profile not
+ * found" and the bot was stuck ringing. This closes the gap in the trusted
+ * daemon process (the secret only reaches lark-cli's encrypted store, never a
+ * worker/sandbox and never argv). Idempotent: a present profile is a no-op.
+ */
+function ensureVcMeetingJoinProfile(
+  larkAppId: string,
+  cfg: VcMeetingAgentConfig,
+): VcMeetingJoinProfileResult {
+  const profile = cfg.larkCliProfile?.trim();
+  if (!profile) {
+    return { ok: false, reason: 'no_profile', error: '缺少 vcMeetingAgent.larkCliProfile' };
+  }
+  const botCfg = vcMeetingLocalBotConfig(larkAppId) ?? vcMeetingConfiguredBotConfig(larkAppId);
+  const result = ensureLarkCliBotProfile({
+    profileName: profile,
+    appId: larkAppId,
+    appSecret: botCfg?.larkAppSecret ?? '',
+    ...(botCfg?.brand ? { brand: botCfg.brand } : {}),
+  });
+  if (result.ok) {
+    if (result.created) {
+      logger.info(`[vc-agent] auto-provisioned lark-cli profile ${profile} for ${larkAppId} before join`);
+    }
+    return { ok: true, profile, created: result.created };
+  }
+  return { ok: false, reason: result.reason, profile, error: result.error };
+}
+
+/** Actionable, operator-facing text for a failed join-profile provision. */
+function vcMeetingJoinProfileErrorText(
+  larkAppId: string,
+  result: Extract<VcMeetingJoinProfileResult, { ok: false }>,
+): string {
+  switch (result.reason) {
+    case 'no_profile':
+      return '缺少 vcMeetingAgent.larkCliProfile，拒绝使用 lark-cli 默认 profile 入会';
+    case 'missing_secret':
+      return `无法为 ${larkAppId} 自动创建 lark-cli profile「${result.profile}」：配置里没有该 bot 的 appSecret（apiOnly bot 无法入会）`;
+    case 'add_failed':
+      return `自动创建 lark-cli profile「${result.profile}」失败：${result.error}`;
+  }
+}
+
+/**
+ * DM the meeting-agent owner when an invite fails, so a broken join no longer
+ * shows up only as a silently-ringing bot + one log line. Best-effort and
+ * de-duped per session so retries don't spam. `errorText` is already the
+ * actionable operator-facing message from startVcMeetingMonitoring.
+ */
+function notifyVcMeetingInviteFailure(
+  larkAppId: string,
+  cfg: VcMeetingAgentConfig,
+  session: VcMeetingDaemonSession | undefined,
+  meeting: VcMeetingPushContext['meeting'],
+  errorText: string,
+): void {
+  if (session) {
+    if (session.inviteFailureNotified) return;
+    session.inviteFailureNotified = true;
+  }
+  const target = vcMeetingTargetOpenId(larkAppId, cfg);
+  if (!target) return;
+  const title = vcMeetingTitle(meeting);
+  void sendUserMessage(
+    larkAppId,
+    target,
+    `⚠️ 机器人未能加入会议「${title}」。\n\n原因：${errorText}\n\n`
+    + '请到 dashboard 检查该会议 bot 的 lark-cli profile / appSecret / VC 权限后重新邀请。',
+    'text',
+  ).catch((err) => {
+    logger.warn(
+      `[vc-agent] invite failure notice failed meeting=${meeting.id || '?'}: `
+      + `${err instanceof Error ? err.message : String(err)}`,
+    );
+  });
 }
 
 function vcMeetingConsumerBotOnline(larkAppId: string): boolean {
@@ -2327,6 +2444,12 @@ async function ensureVcMeetingReceiverSession(
       `receiver agent ${selfAppId} has no managed side-effect isolation: ${isolation.decision.error}`,
     );
   }
+  // Plan B: the receiver runs sandboxed only when the bot actually opted in and
+  // the boundary is deliverable. An unsandboxed opt-out (isolated:false) must
+  // spawn WITHOUT the sandbox — hardcoding sandbox=true here would confine a bot
+  // whose environment/working dir was never set up for bwrap, and the CLI would
+  // fail to spawn or be unable to work (the "joined but never replies" bug).
+  const receiverSandboxed = isolation.decision.isolated;
   const rawWorkingDir = findOncallChat(selfAppId, chatId)?.workingDir
     ?? effectiveDefaultWorkingDir(bot.config)
     ?? bot.config.workingDir
@@ -2354,11 +2477,12 @@ async function ensureVcMeetingReceiverSession(
   session.cliId = bot.config.cliId;
   // Freeze the security-critical launch decision at receiver creation.  A
   // later live Bot-config edit must neither weaken this session nor make an
-  // old unisolated receiver appear eligible retroactively.
-  session.sandbox = true;
-  session.sandboxHidePaths = bot.config.sandboxHidePaths ?? [];
-  session.sandboxReadonlyPaths = bot.config.sandboxReadonlyPaths ?? [];
-  session.sandboxNetwork = bot.config.sandboxNetwork !== false;
+  // old unisolated receiver appear eligible retroactively. Under plan B the
+  // frozen value follows the bot's opt-in, not a hardcoded true.
+  session.sandbox = receiverSandboxed;
+  session.sandboxHidePaths = receiverSandboxed ? (bot.config.sandboxHidePaths ?? []) : [];
+  session.sandboxReadonlyPaths = receiverSandboxed ? (bot.config.sandboxReadonlyPaths ?? []) : [];
+  session.sandboxNetwork = receiverSandboxed ? (bot.config.sandboxNetwork !== false) : true;
   session.backendType = isolation.backendType;
   sessionStore.updateSession(session);
 
@@ -4209,7 +4333,7 @@ function getActiveCount(): number {
  * this, passthrough commands silently PATCH the previous card and the user
  * sees no visible response.
  */
-function beginNewTurn(ds: DaemonSession, title: string): void {
+function beginNewTurn(ds: DaemonSession, title: string, turnId: string): void {
   // docCommentTargets 改为 per-turn map（按 turnId 索引），不再需要每轮清空：
   // 非文档轮的 BOTMUX_TURN_ID 不会命中 map，天然不会误投；旧 entry 由
   // deliverFinalOutput / botmux send 成功路径清理。
@@ -4260,9 +4384,12 @@ function beginNewTurn(ds: DaemonSession, title: string): void {
   }
   ds.usageLimit = undefined;
   ds.streamCardPending = true;
+  ds.streamCardPendingTurnId = turnId;
+  ds.streamCardTurnGeneration = (ds.streamCardTurnGeneration ?? 0) + 1;
   ds.currentTurnTitle = title.substring(0, 50);
   ds.currentImageKey = undefined;
   persistStreamCardState(ds);
+  void postTurnStartingCard(ds, sessionReply, turnId);
 }
 
 /**
@@ -4302,7 +4429,7 @@ async function prewarmDocCommentSession(ds: DaemonSession, sub: DocSubscription)
     );
   }
 
-  beginNewTurn(ds, title);
+  beginNewTurn(ds, title, turnId);
   ds.lastMessageAt = Date.now();
   ds.session.lastMessageAt = new Date(ds.lastMessageAt).toISOString();
   if (sub.workingDir && (!ds.worker || ds.worker.killed)) {
@@ -5277,6 +5404,196 @@ workflowDaemonMutationRoute('grant', async (reply, params, body, identity) => {
   // granted / already-granted → make sure the run is moving.
   v3GateRunner.driveDetached(runId);
   return reply(202, { ok: true, runId, ...outcome });
+});
+
+// ─── report session relay：隔离 CLI 的 dispatch 完成回注 ──────────────────
+//
+// Linux credential-only bwrap / macOS read isolation 都
+// 不允许 CLI 读取 `.dashboard-secret`。这里验证 source session 当前轮换的
+// capability，并把 dispatch root 与 daemon 自己的 live session 绑定；目标
+// app/session 只从宿主签名的 dispatch binding 派生，再由本 daemon 用 HMAC 转发。
+ipcRoute('POST', DISPATCH_REPORT_REGISTER_ROUTE, async (req, res) => {
+  let raw: unknown;
+  try {
+    raw = await readJsonBody<unknown>(req, DISPATCH_REPORT_REGISTER_MAX_BYTES);
+  } catch (error) {
+    if (error instanceof JsonBodyTooLargeError) {
+      return jsonRes(res, 413, { ok: false, error: 'body_too_large' });
+    }
+    return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+  }
+  const body = raw && typeof raw === 'object' && !Array.isArray(raw)
+    ? raw as Record<string, unknown>
+    : undefined;
+  const sessionId = typeof body?.sessionId === 'string' ? body.sessionId.trim() : '';
+  const seedText = typeof body?.seedText === 'string' ? body.seedText.trim() : '';
+  const targetChatId = typeof body?.targetChatId === 'string' ? body.targetChatId.trim() : '';
+  const title = typeof body?.title === 'string' ? body.title.trim().slice(0, 200) : '';
+  if (!sessionId) return jsonRes(res, 400, { ok: false, error: 'missing_session_id' });
+  if (!seedText) {
+    return jsonRes(res, 400, { ok: false, error: 'missing_seed_text' });
+  }
+  if (!/^oc_[A-Za-z0-9_-]{1,128}$/.test(targetChatId)) {
+    return jsonRes(res, 400, { ok: false, error: 'bad_target_chat_id' });
+  }
+  const ds = findActiveBySessionId(sessionId);
+  const verified = authorizeSessionScopedIpc({
+    trustedHost: isTrustedHostIpcRequest(req),
+    sessionExists: !!ds && ds.session.sessionId === sessionId,
+    receiverSession: !!ds?.session.vcMeetingReceiver,
+    allowReceiver: false,
+    sessionId,
+    ...(ds?.managedTurnOrigin ? { liveOrigin: ds.managedTurnOrigin } : {}),
+    ...(typeof body?.originCapability === 'string'
+      ? { claimedCapability: body.originCapability }
+      : {}),
+    ...(typeof body?.originTurnId === 'string' ? { claimedTurnId: body.originTurnId } : {}),
+    ...(typeof body?.originDispatchAttempt === 'number'
+      ? { claimedDispatchAttempt: body.originDispatchAttempt }
+      : {}),
+  });
+  if (!verified.ok) return jsonRes(res, 403, { ok: false, error: verified.error });
+  if (!ds || !ds.larkAppId || ds.larkAppId !== selfDaemonLarkAppId) {
+    return jsonRes(res, 403, { ok: false, error: 'session_identity_incomplete' });
+  }
+
+  let dispatchRoot: string;
+  try {
+    dispatchRoot = await sendMessage(ds.larkAppId, targetChatId, seedText, 'text');
+  } catch (error) {
+    return jsonRes(res, 502, {
+      ok: false,
+      error: 'dispatch_seed_send_failed',
+      detail: error instanceof Error ? error.message : String(error),
+    });
+  }
+
+  const bindingSecret = loadOrCreateDashboardSecret(
+    dispatchReportBindingSecretPath(config.session.dataDir),
+  );
+  const issuedAt = new Date().toISOString();
+  const reportBinding = createDispatchReportBinding(bindingSecret, {
+    dispatchRoot,
+    targetLarkAppId: ds.larkAppId,
+    targetSessionId: ds.session.sessionId,
+    sourceName: title || 'dispatched subtask',
+    issuedAt,
+  });
+  const stringArray = (value: unknown): string[] => Array.isArray(value)
+    ? value.filter((item): item is string => typeof item === 'string')
+      .map(item => item.trim()).filter(Boolean).slice(0, 64)
+    : [];
+  try {
+    await recordDispatchRegistryEntry(
+      join(config.session.dataDir, 'orchestrate-dispatch.json'),
+      dispatchRoot,
+      {
+        orchRoot: ds.session.rootMessageId ?? '',
+        orchChatId: ds.session.chatId,
+        orchScope: ds.scope ?? ds.session.scope ?? 'thread',
+        orchAppId: ds.larkAppId,
+        orchSessionId: ds.session.sessionId,
+        targetChatId,
+        targetAppIds: stringArray(body?.targetAppIds),
+        title,
+        bots: stringArray(body?.bots),
+        createdAt: issuedAt,
+        reportBinding,
+      },
+    );
+  } catch (error) {
+    return jsonRes(res, 500, {
+      ok: false,
+      error: 'dispatch_registry_write_failed',
+      detail: error instanceof Error ? error.message : String(error),
+    });
+  }
+  return jsonRes(res, 201, { ok: true, dispatchRoot });
+});
+
+ipcRoute('POST', REPORT_SESSION_RELAY_ROUTE, async (req, res) => {
+  let raw: unknown;
+  try {
+    raw = await readJsonBody<unknown>(req, REPORT_SESSION_RELAY_MAX_BYTES);
+  } catch (error) {
+    if (error instanceof JsonBodyTooLargeError) {
+      return jsonRes(res, 413, { ok: false, error: 'body_too_large' });
+    }
+    return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+  }
+  const claimedSessionId = raw && typeof raw === 'object' && !Array.isArray(raw)
+    ? (raw as Record<string, unknown>).sessionId
+    : undefined;
+  const ds = typeof claimedSessionId === 'string'
+    ? findActiveBySessionId(claimedSessionId)
+    : undefined;
+  let registry: Record<string, unknown> = {};
+  try {
+    const parsed = JSON.parse(readFileSync(
+      join(config.session.dataDir, 'orchestrate-dispatch.json'),
+      'utf8',
+    ));
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      registry = parsed as Record<string, unknown>;
+    }
+  } catch { /* missing/malformed registry fails closed below */ }
+
+  const decision = authorizeReportSessionRelayRequest({
+    raw,
+    trustedHost: isTrustedHostIpcRequest(req),
+    session: ds
+      ? {
+          sessionId: ds.session.sessionId,
+          larkAppId: ds.larkAppId,
+          receiver: !!ds.session.vcMeetingReceiver,
+          scope: ds.scope ?? ds.session.scope,
+          rootMessageId: ds.session.rootMessageId,
+          ...(ds.managedTurnOrigin ? { liveOrigin: ds.managedTurnOrigin } : {}),
+          ...(ds.session.quoteTargetId ? { quoteTargetId: ds.session.quoteTargetId } : {}),
+          ...(ds.session.replyTargets ? { replyTargets: ds.session.replyTargets } : {}),
+          ...((ds.currentReplyTarget ?? ds.session.currentReplyTarget)
+            ? { currentReplyTarget: ds.currentReplyTarget ?? ds.session.currentReplyTarget }
+            : {}),
+        }
+      : undefined,
+    selfLarkAppId: selfDaemonLarkAppId,
+    registry,
+    bindingSecret: loadOrCreateDashboardSecret(
+      dispatchReportBindingSecretPath(config.session.dataDir),
+    ),
+  });
+  if (!decision.ok) {
+    return jsonRes(res, decision.status, { ok: false, error: decision.error });
+  }
+
+  const targetDaemon = findOnlineDaemon(decision.target.larkAppId);
+  if (!targetDaemon) {
+    return jsonRes(res, 503, { ok: false, error: 'orchestrator_daemon_offline' });
+  }
+  const trigger = buildOrchestratorReportTrigger(decision, {
+    requestId: `report:${decision.source.sessionId}:${Date.now()}`,
+    receivedAt: new Date().toISOString(),
+  });
+  try {
+    const response = await fetchDaemonIpc(targetDaemon.ipcPort, '/api/trigger', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(trigger),
+    });
+    const responseBody: unknown = await response.json().catch(() => ({}));
+    return jsonRes(res, response.status, {
+      ...(responseBody && typeof responseBody === 'object' && !Array.isArray(responseBody)
+        ? responseBody as Record<string, unknown>
+        : {}),
+      reportTarget: decision.target,
+    });
+  } catch (error) {
+    return jsonRes(res, 502, {
+      ok: false,
+      error: 'orchestrator_daemon_unreachable',
+      detail: error instanceof Error ? error.message : String(error),
+    });
+  }
 });
 
 // ─── v3 session relay：sandbox / read-isolation 会话的 workflow 变更通道 ─────
@@ -13592,13 +13909,14 @@ async function startVcMeetingMonitoring(input: {
       }
 
       if (input.forceJoin || !session.joined || session.listenerPresenceStale) {
-        if (!input.cfg.larkCliProfile) {
-          throw new Error('缺少 vcMeetingAgent.larkCliProfile，拒绝使用 lark-cli 默认 profile 入会');
+        const provisioned = ensureVcMeetingJoinProfile(input.larkAppId, input.cfg);
+        if (!provisioned.ok) {
+          throw new Error(vcMeetingJoinProfileErrorText(input.larkAppId, provisioned));
         }
         if (!meeting.meetingNo) {
           throw new Error('会议事件没有 meeting_no，无法执行 BotJoinMeeting');
         }
-        const joined = joinMeetingAsBot({ meetingNumber: meeting.meetingNo, profile: input.cfg.larkCliProfile });
+        const joined = joinMeetingAsBot({ meetingNumber: meeting.meetingNo, profile: provisioned.profile });
         if (joined.meetingId && joined.meetingId !== meeting.id) {
           if (input.forceJoin || session.listenerPresenceStale) {
             throw new Error(
@@ -15105,14 +15423,40 @@ async function handleVcMeetingPush(ctx: VcMeetingPushContext): Promise<void> {
   if (ctx.kind === 'meeting_invited') {
     let meeting = ctx.meeting;
     let joinedByInvite = false;
-    if (!meeting.id && meeting.meetingNo && cfg.larkCliProfile) {
+    // Eager join: an invite that carries only a meeting_no (no meeting.id) must
+    // be joined here to learn the id. A failure in THIS block used to only WARN
+    // and then fall through to the silent "no meeting id yet" return below — so
+    // the original "profile not found → bot rings forever" bug produced no user
+    // signal at all (there is no session yet for the manual-invite DM path). We
+    // now DM the owner here too, deduped per meeting_no so redelivered invites
+    // don't spam.
+    if (!meeting.id && meeting.meetingNo) {
+      const eagerNo = meeting.meetingNo;
+      const notifyEagerFailure = (errorText: string): void => {
+        const dmKey = vcMeetingEagerJoinFailureKey(ctx.larkAppId, eagerNo);
+        const last = vcMeetingEagerJoinFailureNotified.get(dmKey);
+        const now = Date.now();
+        if (last !== undefined && now - last <= VC_MEETING_EAGER_JOIN_FAILURE_TTL_MS) return;
+        vcMeetingEagerJoinFailureNotified.set(dmKey, now);
+        // session is undefined here → notify skips per-session dedup and sends.
+        notifyVcMeetingInviteFailure(ctx.larkAppId, cfg, undefined, meeting, errorText);
+      };
       try {
-        const joined = joinMeetingAsBot({ meetingNumber: meeting.meetingNo, profile: cfg.larkCliProfile });
+        // A missing larkCliProfile previously skipped this whole block (the old
+        // `&& cfg.larkCliProfile` guard) and died silently; surface it instead.
+        const provisioned = ensureVcMeetingJoinProfile(ctx.larkAppId, cfg);
+        if (!provisioned.ok) throw new Error(vcMeetingJoinProfileErrorText(ctx.larkAppId, provisioned));
+        const joined = joinMeetingAsBot({ meetingNumber: eagerNo, profile: provisioned.profile });
         meeting = { ...meeting, id: joined.meetingId };
         joinedByInvite = true;
-        logger.info(`[vc-agent] manual invite joined before session create meeting=${meeting.id} meetingNo=${meeting.meetingNo} profile=${cfg.larkCliProfile}`);
+        // Success → clear any prior failure tombstone so a later real failure
+        // (e.g. rotated secret on a subsequent meeting) can notify again.
+        vcMeetingEagerJoinFailureNotified.delete(vcMeetingEagerJoinFailureKey(ctx.larkAppId, eagerNo));
+        logger.info(`[vc-agent] manual invite joined before session create meeting=${meeting.id} meetingNo=${eagerNo} profile=${provisioned.profile}`);
       } catch (err) {
-        logger.warn(`[vc-agent] manual invite join failed meetingNo=${meeting.meetingNo}: ${err instanceof Error ? err.message : String(err)}`);
+        const message = err instanceof Error ? err.message : String(err);
+        logger.warn(`[vc-agent] manual invite join failed meetingNo=${eagerNo}: ${message}`);
+        notifyEagerFailure(message);
       }
     }
     if (!meeting.id) {
@@ -15136,6 +15480,7 @@ async function handleVcMeetingPush(ctx: VcMeetingPushContext): Promise<void> {
     });
     if (!result.ok) {
       logger.warn(`[vc-agent] manual invite start failed meeting=${meeting.id}: ${result.error}`);
+      notifyVcMeetingInviteFailure(ctx.larkAppId, cfg, session, meeting, result.error);
     } else {
       deleteVcMeetingPendingInvite(key);
       if (result.key !== key) deleteVcMeetingPendingInvite(result.key);
@@ -15479,6 +15824,7 @@ export const __vcMeetingAgentTest = {
     vcMeetingConsumerCloseTimingOverrideForTest = undefined;
     vcMeetingEndedTombstones.clear();
     for (const key of [...vcMeetingPendingInvites.keys()]) deleteVcMeetingPendingInvite(key);
+    vcMeetingEagerJoinFailureNotified.clear();
   },
 };
 
@@ -16262,7 +16608,7 @@ function deliverPassthroughToExistingSession(
     // clearing the marker would lose the opening for the next real turn.
     // `/model` on an empty-started session therefore stays literal and the
     // FOLLOWING business message still opens as a new topic.
-    beginNewTurn(ds, commandContent);
+    beginNewTurn(ds, commandContent, turn.messageId);
     sendWorkerSessionInput(ds, {
       type: 'raw_input',
       content: commandContent,
@@ -17512,11 +17858,16 @@ async function handleBotAdded(
     // UserMessage; reuse the localized session title only in its clean sidecar.
     const codexAppText = promptBody || title;
 
-    // Pick scope + anchor. 话题群 → seed a topic and anchor thread-scope there;
-    // 普通群 → chat-scope anchored at chatId.
+    // Pick scope + anchor. 话题群 或 普通群 new-topic 模式 → seed a topic and
+    // anchor thread-scope there；其余普通群 → chat-scope anchored at chatId。
+    // 复用入站 @ 的路由判据（externalEventOpensOwnTopic）：否则「自动进群主动开工」
+    // 会无视群配的 new-topic，把首轮平铺进群顶层 chat-scope，而不是像用户手动 @
+    // 那样开一个独立话题。
+    const regularGroupMode = resolveRegularGroupMode(larkAppId, chatId);
+    const opensOwnTopic = externalEventOpensOwnTopic(mode, regularGroupMode);
     let scope: 'thread' | 'chat';
     let anchor: string;
-    if (mode === 'topic') {
+    if (opensOwnTopic) {
       const seedText = tr('daemon.auto_start_join_seed', undefined, localeForBot(larkAppId));
       anchor = await sendMessage(larkAppId, chatId, seedText, 'text');
       scope = 'thread';
@@ -17530,7 +17881,7 @@ async function handleBotAdded(
       return;
     }
     const needsSharedReply = mode === 'group'
-      && resolveRegularGroupMode(larkAppId, chatId) === 'shared';
+      && regularGroupMode === 'shared';
 
     const { pinnedWorkingDir, pinnedFromBotDefault } = await resolvePinnedWorkingDir({ scope, anchor, chatId, chatType, larkAppId });
     const autoWt = willAutoWorktree(larkAppId, pinnedWorkingDir, pinnedFromBotDefault);
@@ -18100,7 +18451,12 @@ async function handleThreadReplyAdmitted(
       });
       return;
     }
-    if (resolvePassthroughCommands(larkAppId).has(cmd)) {
+    // Existing sessions freeze their CLI independently from the bot's current
+    // config. Route passthrough capability from that frozen runtime so changing
+    // `/botconfig cli` cannot make an old Codex App session receive raw_input
+    // (or make an old interactive TUI lose its native slash commands).
+    const passthroughCliId = existingDs?.session.cliId ?? getBot(larkAppId).config.cliId;
+    if (resolvePassthroughCommands(larkAppId, passthroughCliId).has(cmd)) {
       if (!existingDs && threadChatId && isInitialSessionPassthrough(larkAppId, cmd)) {
         await startInitialPassthroughSession({
           larkAppId,
@@ -19024,7 +19380,7 @@ async function handleThreadReplyAdmitted(
           codexAppApplicationContext,
           codexAppMessageContext,
         });
-    beginNewTurn(ds, parsed.content);
+    beginNewTurn(ds, parsed.content, parsed.messageId);
     await noteTurnReceived(ds, parsed.messageId, parsed.content, turnSender, parsed.messageId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
     // Codex App steer authorization was computed ONCE before the branch split
     // above (R4-B1); reuse the same frozen value here for the live-worker path.
@@ -19073,6 +19429,8 @@ async function handleThreadReplyAdmitted(
     // new Worker card until the next screenshot upload, which makes a fresh
     // @mention appear to resurrect the wrong CLI UI.
     ds.streamCardPending = true;
+    ds.streamCardPendingTurnId = parsed.messageId;
+    ds.streamCardTurnGeneration = (ds.streamCardTurnGeneration ?? 0) + 1;
     ds.currentImageKey = undefined;
     persistStreamCardState(ds);
     // Wrap the user message in the same `<user_message>` / `<session_id>` /
@@ -19659,7 +20017,7 @@ async function handleDocCommentAdmitted(ctx: DocCommentContext): Promise<boolean
           sender,
           mode: 'live',
         });
-        beginNewTurn(ds, text);
+        beginNewTurn(ds, text, turnId);
         (ds.session.docCommentTargets ??= {})[turnId] = docTarget; // per-turn map，不覆盖其他并发轮
         // rememberLastCliInput persists both the exact comment target and the
         // structured sidecar before any worker-visible delivery can occur.
@@ -19685,6 +20043,8 @@ async function handleDocCommentAdmitted(ctx: DocCommentContext): Promise<boolean
       ds.streamCardId = undefined;
       ds.streamCardNonce = undefined;
       ds.streamCardPending = true;
+      ds.streamCardPendingTurnId = turnId;
+      ds.streamCardTurnGeneration = (ds.streamCardTurnGeneration ?? 0) + 1;
       ds.currentImageKey = undefined;
       persistStreamCardState(ds);
       // Skip whiteboard ensure for adopted (bridge) sessions on re-fork — mirrors
@@ -20579,6 +20939,13 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // capability-gated receiver/readiness apertures in dashboard-ipc-server.
   loadOrCreateDashboardSecret(
     join(homedir(), '.botmux', '.dashboard-secret'),
+  );
+  // Create the dispatch-binding key before any credential-only child spawns.
+  // Linux bwrap snapshots `.dashboard-secret.*` authority leaves at launch;
+  // creating this later would leave the new key visible through its writable
+  // host-root bind until the pane cold-started.
+  loadOrCreateDashboardSecret(
+    dispatchReportBindingSecretPath(config.session.dataDir),
   );
   let markIpcReady!: () => void;
   const ipcReady = new Promise<void>((resolve) => { markIpcReady = resolve; });

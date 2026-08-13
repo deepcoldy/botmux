@@ -229,6 +229,78 @@ describe('dashboard grant defaults', () => {
     expect(root.findByProps({ 'data-grant-defaults-state': true }).children.join('')).toContain('授权卡每人 3 条；Oncall 不限');
   });
 
+  it('saves the DM-open toggle through the grant-prefs endpoint', async () => {
+    const requests: Array<{ url: string; body: any }> = [];
+    (globalThis as any).fetch = vi.fn(async (url: string, init?: any) => {
+      requests.push({ url, body: JSON.parse(init?.body ?? '{}') });
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          ok: true,
+          autoGrantRequestCards: true,
+          restrictGrantCommands: false,
+          p2pOpen: true,
+          grantDefaultDurationMs: null,
+          messageQuotaDefaultLimit: null,
+        }),
+      } as any;
+    });
+
+    const { root, patchBot } = renderGrantSection();
+    const toggle = root.findByProps({ 'data-action': 'toggle-p2p-open' });
+    expect(toggle.props.checked).toBe(false);
+    await flushAction(() => toggle.props.onChange({ currentTarget: { checked: true } }));
+
+    expect(requests).toEqual([{ url: '/api/bots/app_grant/grant-prefs', body: { p2pOpen: true } }]);
+    expect(patchBot).toHaveBeenCalledWith('app_grant', expect.objectContaining({ p2pOpen: true }));
+    expect(root.findByProps({ 'data-action': 'toggle-p2p-open' }).props.checked).toBe(true);
+  });
+
+  it('rolls the DM-open toggle back when the save fails', async () => {
+    (globalThis as any).fetch = vi.fn(async () => ({
+      ok: false,
+      status: 500,
+      json: async () => ({ ok: false, error: 'write_failed' }),
+    } as any));
+
+    const { root } = renderGrantSection({ p2pOpen: true });
+    const toggle = root.findByProps({ 'data-action': 'toggle-p2p-open' });
+    expect(toggle.props.checked).toBe(true);
+    await flushAction(() => toggle.props.onChange({ currentTarget: { checked: false } }));
+
+    // A failed write must not leave the UI claiming DMs are closed.
+    expect(root.findByProps({ 'data-action': 'toggle-p2p-open' }).props.checked).toBe(true);
+    expect(root.findByProps({ 'data-grant-status': '' }).children.join('')).toContain('write_failed');
+  });
+
+  it('keeps p2pOpen on when another grant pref is saved (response is a full snapshot)', async () => {
+    (globalThis as any).fetch = vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        ok: true,
+        autoGrantRequestCards: true,
+        restrictGrantCommands: true,
+        p2pOpen: true,
+        grantDefaultDurationMs: null,
+        messageQuotaDefaultLimit: null,
+      }),
+    } as any));
+
+    // Local state says DMs are closed, but the authoritative post-write snapshot
+    // says they are open (another admin / the IM config card flipped it in between).
+    const { root, patchBot } = renderGrantSection({ p2pOpen: false });
+    await flushAction(() => root
+      .findByProps({ 'data-action': 'toggle-restrict-grant' })
+      .props.onChange({ currentTarget: { checked: true } }));
+
+    // savePatch refills every field from the response, so the toggle must follow
+    // the snapshot instead of keeping a stale "closed" reading of the DM gate.
+    expect(root.findByProps({ 'data-action': 'toggle-p2p-open' }).props.checked).toBe(true);
+    expect(patchBot).toHaveBeenCalledWith('app_grant', expect.objectContaining({ p2pOpen: true }));
+  });
+
   it('shows a field-level accessible error for an invalid quota', () => {
     const { root } = renderGrantSection();
     act(() => root.findByProps({ 'data-input': 'quotaLimit' }).props.onChange({ currentTarget: { value: '1001' } }));

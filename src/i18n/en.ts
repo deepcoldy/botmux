@@ -320,6 +320,8 @@ export const messages: Record<string, string> = {
   'cmd.repo.scan_dir_not_exist': 'Scan dirs do not exist: {dirs}\nCheck that workingDir in bots.json points to a valid directory.',
   'cmd.repo.working_dir_not_exist': '❌ Configured working directory does not exist or is not a directory: {dirs}\nCheck workingDir / workingDirs in ~/.botmux/bots.json, or run `botmux setup` and choose an existing directory.',
   'cmd.repo.no_git_repos': 'No git repositories found under {dirs}.',
+  'cmd.repo.scan_budget_no_repos': '⚠️ Scanning {dirs} hit too many directories (or was too slow) and stopped at the budget before finding any git repo.\nThis usually means the scan root is too large (e.g. pointed at your home dir `~`). Use `/repo <path-to-repo>` to open one directly, or narrow workingDir / workingDirs in ~/.botmux/bots.json.\nNote: if a directory hangs at the OS level (not just "too many dirs"), this guard cannot interrupt it — narrowing the root is still required.',
+  'cmd.repo.scan_budget_partial': '⚠️ Too many directories (or too slow); the scan stopped at the budget, so the list below may be incomplete.\nIf your repo is missing, use `/repo <path-to-repo>`, or narrow workingDir / workingDirs in ~/.botmux/bots.json.',
   'cmd.repo.worktree_usage': 'Usage: `/repo wt <N|name|path> [new-branch]` — create a worktree off the repo\'s remote default branch and open it; without a branch, Botmux auto-names it from the topic title / first prompt when possible.',
   'cmd.repo.worktree_creating': '🌿 Creating a worktree for `{repo}` (includes a git fetch, may take a few seconds)…',
   'card.repo.riff_worktree_push_failed': '⚠️ Failed to push branch `{branch}` to origin: {error}\nThe riff sandbox will use the default branch (push manually and retry).',
@@ -485,6 +487,7 @@ export const messages: Record<string, string> = {
   'config.label.autoStartOnNewTopic': 'Auto-start on new topic',
   'config.label.disableCliBypass': 'Disable bypass · safer',
   'config.label.restrictGrantCommands': 'Grantees chat-only',
+  'config.label.p2pOpen': 'Open DMs',
   'card.config.note': '🟢=on ⚪=off, tap to flip & refresh (model/cli take effect next session). Language: `/botconfig zh` | `/botconfig en`.\nMore fields via "✏️ Text fields"; allowedUsers / oncall use `/botconfig help`.',
   'card.config.text_btn': '✏️ Text fields',
   'card.config.text_title': '✏️ {name} · text fields',
@@ -688,7 +691,7 @@ export const messages: Record<string, string> = {
   'ai.routing.must_use_botmux': 'To make the user see something, you MUST send it via the `botmux send` command. Terminal output does NOT reach the chat.',
   'ai.routing.no_visible_output_ok': 'IMPORTANT: a successful `botmux send` (exit code 0 / returns `{"success":true,...}`) means the message was DELIVERED to the user. So ending a turn with NO visible terminal text is entirely normal and expected here — not a failure. If you later see a note like "your previous response had no visible output, please continue", that is a false alarm from the underlying CLI: do NOT resend. Only retry when `botmux send` itself failed (non-zero exit or printed a send error).',
   'ai.routing.usage_heading': 'How to use it:',
-  'ai.routing.usage_send_when': '- Use `botmux send` for: key conclusions, plans (wait for user approval before acting), final results, progress updates. If you have anything for the user, you MUST `botmux send` it first, or the user sees nothing; only when the turn genuinely needs no reply (the message was not for you / was addressed to another bot) make the final assistant message just the single word `BOTMUX_NOTHING_TO_SEND`.',
+  'ai.routing.usage_send_when': '- Respond to messages addressed to you at least once via `botmux send` — never stay silent; what and how many times to send is your call. Only when a message is not for you at all (addressed to another bot / pure system noise) make the final assistant message just the single word `BOTMUX_NOTHING_TO_SEND`.',
   'ai.routing.usage_send_text': '- Plain text is fine: `botmux send "your message"`. Formatting is auto-handled.',
   'ai.routing.usage_heredoc': '- Multi-line body text MUST use a quoted heredoc / stdin (or a UTF-8 `--content-file`). Never write `botmux send "line1\\nline2"` or pass `JSON.stringify` / JSON-escaped text as a positional argument; shell / botmux do not turn literal `\\n` back into newlines.',
   'ai.routing.heredoc_example': "  Correct multi-line example:\n```bash\nbotmux send <<'EOF'\nline 1\nline 2\nEOF\n```",
@@ -720,7 +723,7 @@ export const messages: Record<string, string> = {
   'ai.shell.multiline_heredoc': 'Multi-line body text MUST use a quoted heredoc / stdin (or a UTF-8 `--content-file`). Never write `botmux send "line1\\nline2"` or pass `JSON.stringify` / JSON-escaped text as a positional argument; shell / botmux do not turn literal `\\n` back into newlines.',
   'ai.shell.heredoc_example': "Correct multi-line example:\n```bash\nbotmux send <<'EOF'\nline 1\nline 2\nEOF\n```",
   'ai.shell.helpers': 'Helpers: `botmux history` (read this session\'s history — thread/topic sessions are topic-scoped; regular-group chat-scope sessions are group-wide), `botmux quoted <message_id>` (fetch a quoted message — only use it when the prompt header shows `[user quoted message ...]`), `botmux bots list` (list other bots in the group).',
-  'ai.shell.when_to_send': 'When to send: key conclusions, plans (wait for user approval before acting), final results, progress updates. A bare `print`/`echo` does NOT count as a reply. If you have anything for the user, you MUST `botmux send` it first, or the user sees nothing; only when the turn genuinely needs no reply (the message was not for you / was addressed to another bot) make the final assistant message just the single word `BOTMUX_NOTHING_TO_SEND`.',
+  'ai.shell.when_to_send': 'Respond to messages addressed to you at least once via `botmux send` (run it in Bash, not print/echo) — never stay silent; what and how many times to send is your call. Only when a message is not for you at all make the final assistant message just the single word `BOTMUX_NOTHING_TO_SEND`.',
   'ai.shell.no_visible_output_ok': 'A successful `botmux send` (exit code 0) means it reached the user; ending a turn with no visible terminal text is normal. If you see a note like "your previous response had no visible output, please continue and produce a user-visible response", that is a false alarm from the underlying CLI — do NOT resend unless `botmux send` itself errored.',
   'ai.shell.mention_gate': '@ decision (mandatory): every `botmux send` MUST explicitly pick one or it errors — `--mention <open_id:name>` (name a specific person/bot; REQUIRED to communicate or collaborate with another bot) / `--mention-back` (@ the triggerer of THIS turn) / `--no-mention` (none). First decide WHETHER to @ by VALUE: substantive conclusion the other party should read/confirm/decide → @ someone; pure record / low-priority / short ack → --no-mention; a contentless "got it" is better not sent. Then pick HOW by recipient: it is the person/bot that triggered this turn → --mention-back; it is someone else (in a multi-person chat the right recipient is often not the triggerer) → --mention to name them. Do not default to --no-mention, and do not @ people for nothing.',
 
@@ -730,8 +733,8 @@ export const messages: Record<string, string> = {
   'ai.available_bots.hint': 'To communicate or collaborate with a bot listed here you MUST --mention its open_id (botmux send --mention ou_xxx ...). Without --mention the other bot receives nothing.',
   'ai.available_bots.hint_collapsed': 'To communicate or collaborate with another bot, first run `botmux bots list` to get its open_id, then --mention it. Without --mention the other bot receives nothing.',
   'ai.available_bots.collapsed_line': 'There are {count} collaborator bots in this chat: {names}.',
-  'ai.followup.reminder': 'If you have anything for the user, you MUST `botmux send` it first; only when the turn genuinely needs no reply (message was not for you / addressed to another bot) make the final just the single word BOTMUX_NOTHING_TO_SEND.',
-  'ai.followup.reminder_no_resend': 'If you have anything for the user, you MUST `botmux send` it first; only when the turn genuinely needs no reply (message was not for you / addressed to another bot) make the final just the single word BOTMUX_NOTHING_TO_SEND. A successful send is already delivered; ending a turn with no visible text is normal, so do not resend on a "no visible output" nudge.',
+  'ai.followup.reminder': 'Respond to messages addressed to you at least once via `botmux send`, never stay silent; what and how many to send is your call. Only when a message is not for you make the final just the single word BOTMUX_NOTHING_TO_SEND.',
+  'ai.followup.reminder_no_resend': 'Respond to messages addressed to you at least once via `botmux send`, never stay silent; what and how many to send is your call. Only when a message is not for you make the final just the single word BOTMUX_NOTHING_TO_SEND. A successful send is already delivered; ending a turn with no visible text is normal, so do not resend on a "no visible output" nudge.',
   'ai.cursor.sender_note': 'The sender tag is metadata identifying the current speaker — never copy its open_id or name (e.g. ou_xxx:Alice) into your botmux send body or opening line; to @ the triggerer use botmux send --mention-back.',
   'ai.bridge.attachments_label': '[Attachments]',
   'ai.bridge.mentions_label': '[@Mentions]',
@@ -1232,8 +1235,8 @@ export const messages: Record<string, string> = {
 
   // Scheduler announcements
   'scheduler.task_started': '🕐 Scheduled task “{name}” started',
-  'scheduler.task_triggered_target_chat': '🕐 Scheduled task “{name}” triggered in the target chat',
-  'scheduler.task_triggered_target_thread': '🕐 Scheduled task “{name}” triggered in the target topic',
+  'scheduler.task_triggered_target_chat': '🕐 Scheduled task “{name}” triggered in the target chat\nOpen target chat: {link}',
+  'scheduler.task_triggered_target_thread': '🕐 Scheduled task “{name}” triggered in the target topic\nOpen target topic: {link}',
 
   // External event trigger seed
   'trigger.external_event': 'External event: {source}',

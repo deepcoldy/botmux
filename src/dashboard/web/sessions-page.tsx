@@ -28,6 +28,7 @@ import { mountReactPage, type PageDisposer } from './react-mount.js';
 import { useStoreSelector, useT } from './react-hooks.js';
 import { copyText } from './clipboard.js';
 import { FeedGroupPicker } from './feed-group-picker.js';
+import { BotMultiSelect } from './bot-multi-select.js';
 import {
   KANBAN_TEAM_STORAGE_KEY,
   normalizeHiddenTableColumns,
@@ -67,6 +68,7 @@ import {
   repoBasename,
   restartConfirmMessage,
   sessionLocationText,
+  preferChatFilterLabel,
   sessionLocationTitle,
   sessionExchangePreview,
   sessionRuntimeCounts,
@@ -215,6 +217,134 @@ function windowStorage(): Storage | undefined {
 function StatusBadge(props: { status: unknown }): React.JSX.Element {
   const raw = String(props.status ?? 'unknown');
   return <span className={`status status-${cssToken(raw)}`}>{sessionStatusText(raw)}</span>;
+}
+
+/** 任务态徽标：机器可能空闲，但 transcript 里还有未完成的 TODO。挂在卡片上让人
+ *  一眼看出「为什么这张卡在待办列」——运行态（空闲）与任务态（未完成 TODO）正交，
+ *  单看运行态徽标解释不了列归属。openTodos 缺失或已全部完成时不渲染。 */
+function TodoBadge(props: { row: any }): React.JSX.Element | null {
+  const todos = props.row?.openTodos;
+  // 两种打开态：hover=悬浮预览（移开即关）；pinned=点击固定（不自动消失，可选中复制）。
+  const [pos, setPos] = useState<{ x: number; y: number } | null>(null);
+  const [pinned, setPinned] = useState(false);
+  const [copied, setCopied] = useState(false);
+  const anchorRef = useRef<HTMLSpanElement | null>(null);
+  const popRef = useRef<HTMLDivElement | null>(null);
+
+  // 固定态下：点浮层与徽标之外关闭；Esc 关闭。
+  useEffect(() => {
+    if (!pinned) return;
+    const onDown = (e: globalThis.MouseEvent) => {
+      const tgt = e.target as Node;
+      if (popRef.current?.contains(tgt) || anchorRef.current?.contains(tgt)) return;
+      setPinned(false);
+      setPos(null);
+    };
+    const onKey = (e: globalThis.KeyboardEvent) => {
+      if (e.key === 'Escape') { setPinned(false); setPos(null); }
+    };
+    document.addEventListener('mousedown', onDown, true);
+    document.addEventListener('keydown', onKey, true);
+    return () => {
+      document.removeEventListener('mousedown', onDown, true);
+      document.removeEventListener('keydown', onKey, true);
+    };
+  }, [pinned]);
+
+  if (!todos || typeof todos.remaining !== 'number' || todos.remaining <= 0) return null;
+  const total = Number(todos.total ?? 0);
+  const done = Number(todos.done ?? 0);
+  const label = t('sessions.board.todoBadge', { done, total });
+  const title = t('sessions.board.todoBadgeTitle', { remaining: todos.remaining, total, done });
+  const items: Array<{ status: string; text: string }> = Array.isArray(todos.items) ? todos.items : [];
+  const glyph = (s: string) => (s === 'completed' ? '✓' : s === 'in_progress' ? '▶' : '○');
+  // 卡片/列都是 overflow:hidden，纯 CSS 绝对定位浮层会被裁。改用 fixed + 打开时按
+  // 徽标位置定位，再 portal 到 body 逃出裁剪。
+  const locate = (el: HTMLElement) => {
+    const r = el.getBoundingClientRect();
+    setPos({ x: r.left, y: r.bottom + 6 });
+  };
+  // 复制用纯文本清单：每行「[状态] 文字」，含顶部摘要，方便贴到别处。
+  const plainText = (): string => {
+    const mark = (s: string) => (s === 'completed' ? '[x]' : s === 'in_progress' ? '[>]' : '[ ]');
+    const lines = items.map((it, i) => `${mark(it.status)} ${it.text || `#${i + 1}`}`);
+    return `${title}\n${lines.join('\n')}`;
+  };
+  const doCopy = async () => {
+    const text = plainText();
+    try {
+      if (navigator.clipboard?.writeText) await navigator.clipboard.writeText(text);
+      else {
+        const ta = document.createElement('textarea');
+        ta.value = text;
+        ta.style.position = 'fixed';
+        ta.style.opacity = '0';
+        document.body.appendChild(ta);
+        ta.select();
+        document.execCommand('copy');
+        document.body.removeChild(ta);
+      }
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 1500);
+    } catch {
+      // 复制失败静默：用户仍可手动选中浮层文字。
+    }
+  };
+  const showPop = pinned || pos;
+  return (
+    <span
+      ref={anchorRef}
+      className={`session-todo-badge${todos.hasInProgress ? ' active' : ''}${pinned ? ' pinned' : ''}`}
+      tabIndex={0}
+      onMouseEnter={e => { if (!pinned) locate(e.currentTarget); }}
+      onFocus={e => { if (!pinned) locate(e.currentTarget); }}
+      onMouseLeave={() => { if (!pinned) setPos(null); }}
+      onBlur={() => { if (!pinned) setPos(null); }}
+      onClick={e => {
+        e.stopPropagation();
+        if (pinned) { setPinned(false); setPos(null); }
+        else { locate(e.currentTarget); setPinned(true); }
+      }}
+    >
+      {todos.hasInProgress ? <span className="session-todo-dot" aria-hidden="true" /> : null}
+      {label}
+      {showPop && items.length
+        ? createPortal(
+            <div
+              ref={popRef}
+              className={`session-todo-pop${pinned ? ' pinned' : ''}`}
+              role={pinned ? 'dialog' : 'tooltip'}
+              style={{ left: `${pos?.x ?? 0}px`, top: `${pos?.y ?? 0}px` }}
+              onMouseDown={e => e.stopPropagation()}
+            >
+              <div className="session-todo-pop-head">
+                <span className="session-todo-pop-title">{title}</span>
+                {pinned ? (
+                  <button
+                    type="button"
+                    className="session-todo-pop-copy"
+                    onClick={e => { e.stopPropagation(); void doCopy(); }}
+                  >
+                    {copied ? t('sessions.board.todoCopied') : t('sessions.board.todoCopy')}
+                  </button>
+                ) : (
+                  <span className="session-todo-pop-hint">{t('sessions.board.todoClickHint')}</span>
+                )}
+              </div>
+              <div className="session-todo-pop-list">
+                {items.map((it, i) => (
+                  <div key={i} className={`session-todo-pop-item st-${cssToken(it.status)}`}>
+                    <span className="session-todo-pop-glyph" aria-hidden="true">{glyph(it.status)}</span>
+                    <span className="session-todo-pop-text">{it.text || `#${i + 1}`}</span>
+                  </div>
+                ))}
+              </div>
+            </div>,
+            document.body,
+          )
+        : null}
+    </span>
+  );
 }
 
 function LockChip(props: { row: any }): React.JSX.Element | null {
@@ -915,7 +1045,7 @@ function SessionsTable(props: {
       case 'cliId':
         return <td data-label={labels.cliId}><span className={`badge cli-${cssToken(row.cliId)}`} title={row.runtimeId && row.runtimeId !== row.cliId ? `${row.cliId} / ${row.runtimeId}` : undefined}>{sessionCliDisplayName(row)}</span></td>;
       case 'status':
-        return <td data-label={labels.status}><StatusBadge status={row.status} /><LockChip row={row} /></td>;
+        return <td data-label={labels.status}><StatusBadge status={row.status} /><TodoBadge row={row} /><LockChip row={row} /></td>;
       case 'chat':
         return <td className="session-location-cell" data-label={labels.chat} title={sessionLocationTitle(row)}>{sessionLocationText(row)}</td>;
       case 'tokenIn':
@@ -1261,6 +1391,7 @@ function BoardCard(props: {
         </div>
         <span className="session-card-status-group">
           <StatusBadge status={row.status} />
+          <TodoBadge row={row} />
           <LockChip row={row} />
         </span>
       </div>
@@ -1878,6 +2009,7 @@ function Drawer(props: {
             </div>
             <span className="drawer-status-line">
               <StatusBadge status={row.status} />
+              <TodoBadge row={row} />
               <LockChip row={row} />
             </span>
             <p><code>{row.sessionId}</code> <CopyButton value={row.sessionId} /></p>
@@ -1972,7 +2104,6 @@ function CreateSessionDialog(props: {
   const [bindWorkingDir, setBindWorkingDir] = useState('');
   const [advancedOpen, setAdvancedOpen] = useState(false);
   const [submitting, setSubmitting] = useState(false);
-  const [botQuery, setBotQuery] = useState('');
   const [keepOpen, setKeepOpen] = useState(() => readStoredCreateKeepOpen(windowStorage()));
   const [keptSuccess, setKeptSuccess] = useState<any>(null);
   const [feedGroups, setFeedGroups] = useState<Array<{ groupId: string; name: string }>>([]);
@@ -2001,7 +2132,6 @@ function CreateSessionDialog(props: {
     setBindWorkingDir('');
     setAdvancedOpen(false);
     setSubmitting(false);
-    setBotQuery('');
     setKeptSuccess(null);
     setFeedGroupId('');
     setNewFeedGroupName('');
@@ -2123,11 +2253,6 @@ function CreateSessionDialog(props: {
   const checkedIds = [...selectedBots];
   const leadOptions = checkedIds;
   const nameOf = (id: string) => bots.find(bot => bot.larkAppId === id)?.botName ?? id;
-  const botQueryNorm = botQuery.trim().toLowerCase();
-  const visibleBots = botQueryNorm
-    ? bots.filter(bot =>
-      bot.botName.toLowerCase().includes(botQueryNorm) || bot.larkAppId.toLowerCase().includes(botQueryNorm))
-    : bots;
   const mentionBots = mentionTrigger
     ? filterMentionBots(bots, mentionTrigger.query).slice(0, 8)
     : [];
@@ -2365,44 +2490,23 @@ function CreateSessionDialog(props: {
         </fieldset>
         <fieldset className="cs-bots">
           <legend>{t('sessions.create.bots')}</legend>
-          {bots.length ? (
-            <>
-              <input
-                className="cs-bot-search"
-                type="search"
-                name="botSearch"
-                placeholder={t('sessions.create.botSearchPlaceholder')}
-                aria-label={t('sessions.create.botSearchPlaceholder')}
-                value={botQuery}
-                onChange={event => setBotQuery(event.currentTarget.value)}
-              />
-              {visibleBots.length ? (
-                <div className="cs-bot-list">
-                  {visibleBots.map(bot => (
-                    <label key={bot.larkAppId} className="cs-bot">
-                      <input
-                        type="checkbox"
-                        name="bot"
-                        value={bot.larkAppId}
-                        checked={selectedBots.has(bot.larkAppId)}
-                        onChange={event => {
-                          const checked = event.currentTarget.checked;
-                          setSelectedBots(prev => {
-                            const next = new Set(prev);
-                            if (checked) next.add(bot.larkAppId);
-                            else next.delete(bot.larkAppId);
-                            if (!next.has(lead)) setLead(next.values().next().value ?? '');
-                            return next;
-                          });
-                        }}
-                      /> <span>{bot.botName}</span>
-                    </label>
-                  ))}
-                </div>
-              ) : <p className="cs-empty">{t('sessions.create.noBotMatch')}</p>}
-              {checkedIds.length ? <small>{t('sessions.create.selectedCount', { n: String(checkedIds.length) })}</small> : null}
-            </>
-          ) : <p className="cs-empty">{t('sessions.create.noBots')}</p>}
+          <BotMultiSelect
+            bots={bots}
+            selected={selectedBots}
+            onToggle={(id, checked) => {
+              setSelectedBots(prev => {
+                const next = new Set(prev);
+                if (checked) next.add(id);
+                else next.delete(id);
+                if (!next.has(lead)) setLead(next.values().next().value ?? '');
+                return next;
+              });
+            }}
+            searchPlaceholder={t('botPicker.searchPlaceholder')}
+            noMatchLabel={t('botPicker.noMatch')}
+            emptyLabel={t('sessions.create.noBots')}
+            selectedCountLabel={n => t('botPicker.selectedCount', { n: String(n) })}
+          />
         </fieldset>
         <fieldset className="cs-mode">
           <legend>{t('sessions.create.mode')}</legend>
@@ -2605,8 +2709,7 @@ function SessionsPage(): React.JSX.Element {
       if (!chatId) continue;
       if (!filters.showUnknownChats && isUnknownChatSession(row)) continue;
       const label = sessionLocationText(row);
-      const existing = options.get(chatId);
-      if (!existing || label < existing) options.set(chatId, label);
+      options.set(chatId, preferChatFilterLabel(options.get(chatId), label, chatId));
     }
     return [...options.entries()]
       .sort((a, b) => a[1].localeCompare(b[1]))

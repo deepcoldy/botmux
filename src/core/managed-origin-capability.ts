@@ -48,8 +48,25 @@ export function managedOriginCapabilityPath(
   sessionId: string,
   channelId: string,
 ): string {
+  return join(
+    managedOriginCapabilityDirectory(dataDir, sessionId, channelId),
+    RELAY_ORIGIN_CAPABILITY_BASENAME,
+  );
+}
+
+/**
+ * Stable per-pane directory that can be mounted read-only into a
+ * credential-only bwrap child. Binding the directory (instead of the file)
+ * keeps atomic capability rotations visible while the hidden parent prevents
+ * the child from enumerating another session's channel.
+ */
+export function managedOriginCapabilityDirectory(
+  dataDir: string,
+  sessionId: string,
+  channelId: string,
+): string {
   const digest = managedOriginChannelDigest(sessionId, channelId);
-  return join(dataDir, 'read-isolation', `origin-${digest}.json`);
+  return join(dataDir, 'read-isolation', `origin-${digest}`);
 }
 
 /** Host-written, child-read-only proof directory for live daemon attestation. */
@@ -474,8 +491,27 @@ export function sweepManagedOriginAttestationProofs(
  * symlinks for user-managed dotfiles; authority files need the opposite
  * contract so an isolated child cannot redirect the worker's next rotation.
  */
+function ensureManagedOriginChannelParent(parent: string): void {
+  if (!/^origin-[a-f0-9]{64}$/.test(basename(parent))) return;
+  const channelParent = dirname(parent);
+  try {
+    const channelParentStat = lstatSync(channelParent);
+    if (!channelParentStat.isDirectory() || channelParentStat.isSymbolicLink()) {
+      throw new Error(`managed origin capability parent is not a real directory: ${channelParent}`);
+    }
+  } catch (error: any) {
+    if (error?.code !== 'ENOENT') throw error;
+    mkdirSync(channelParent, { recursive: true, mode: 0o700 });
+    const channelParentStat = lstatSync(channelParent);
+    if (!channelParentStat.isDirectory() || channelParentStat.isSymbolicLink()) {
+      throw new Error(`managed origin capability parent is not a real directory: ${channelParent}`);
+    }
+  }
+}
+
 export function replaceManagedOriginCapabilityFile(filePath: string, body: string): void {
   const parent = dirname(filePath);
+  ensureManagedOriginChannelParent(parent);
   mkdirSync(parent, { recursive: true, mode: 0o700 });
   const parentStat = lstatSync(parent);
   if (!parentStat.isDirectory() || parentStat.isSymbolicLink()) {
@@ -499,6 +535,7 @@ export function replaceManagedOriginCapabilityFile(filePath: string, body: strin
  * current-worker publication path. */
 export function ensureManagedOriginCapabilityLeafSafe(filePath: string): void {
   const parent = dirname(filePath);
+  ensureManagedOriginChannelParent(parent);
   mkdirSync(parent, { recursive: true, mode: 0o700 });
   const parentStat = lstatSync(parent);
   if (!parentStat.isDirectory() || parentStat.isSymbolicLink()) {

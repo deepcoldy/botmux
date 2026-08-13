@@ -34,6 +34,7 @@ const LIVENESS_MS = 1000;
 const CLEAR_HOME = '\x1b[H\x1b[2J';
 
 export class ZellijObserveBackend implements ObserveBackend {
+  readonly supportsRawCommandPasteLine = true;
   private readonly session: string;
   private readonly paneId: string;
   private readonly cliPid: number | null;
@@ -201,10 +202,11 @@ export class ZellijObserveBackend implements ObserveBackend {
   }
 
   /** Bracketed paste — wrap so TUIs detect the boundary (mirrors paste-buffer -p). */
-  pasteText(text: string): void {
-    this.writeBytes('\x1b[200~');
-    this.sendText(text);
-    this.writeBytes('\x1b[201~');
+  pasteText(text: string): boolean {
+    if (!this.writeBytes('\x1b[200~')) return false;
+    const bodyAccepted = this.sendText(text);
+    const closeAccepted = this.writeBytes('\x1b[201~');
+    return bodyAccepted && closeAccepted;
   }
 
   /** Write arbitrary bytes via `action write <decimal>…` (handles control/escape).

@@ -38,6 +38,11 @@ export async function recordDispatchRegistryEntry(
   entry: unknown,
 ): Promise<void> {
   await updateDispatchRegistry(path, registry => {
+    const existing = registry[seedId];
+    if (existing !== undefined) {
+      if (JSON.stringify(existing) === JSON.stringify(entry)) return;
+      throw new Error(`dispatch registry entry already exists for ${seedId}`);
+    }
     registry[seedId] = entry;
   });
 }

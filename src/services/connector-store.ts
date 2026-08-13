@@ -6,7 +6,18 @@ import { config } from '../config.js';
 export type ConnectorVerifyType = 'hmac-sha256' | 'token';
 export type ConnectorTargetMode = 'dynamic' | 'fixed' | 'new-group';
 export type ConnectorTargetKind = 'turn' | 'workflow';
-export type ConnectorTopicMessageMode = 'default' | 'custom' | 'none';
+export type ConnectorTopicMessageMode = 'default' | 'custom' | 'template' | 'none';
+
+export interface ConnectorTopicMessageExtractor {
+  path: string;
+  kind: 'text' | 'mention';
+  /** Relative path within each extracted mention object. Omit when the
+   *  extracted value itself is the identity string. */
+  identityPath?: string;
+  /** Optional relative path for the display name used inside/fallback from a
+   *  native Lark mention. */
+  namePath?: string;
+}
 
 export interface ConnectorDefinition {
   id: string;
@@ -46,6 +57,9 @@ export interface ConnectorDefinition {
     mode: ConnectorTopicMessageMode;
     /** Custom text may contain `{source}`, resolved from promptEnvelope.sourceName. */
     text?: string;
+    /** Connector-owner allowlist used only by `template` mode. Aliases become
+     *  `{{alias}}` or `{{mention alias}}` tokens in `text`. */
+    extractors?: Record<string, ConnectorTopicMessageExtractor>;
   };
   /** When true, the daemon drops the trailing final_output reply for turns this
    *  webhook fires (the live streaming card / start notice still show). Lets a

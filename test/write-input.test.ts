@@ -55,6 +55,7 @@ import { createMtrAdapter } from '../src/adapters/cli/mtr.js';
 import { createHermesAdapter } from '../src/adapters/cli/hermes.js';
 import { createMiraAdapter } from '../src/adapters/cli/mira.js';
 import { createPiAdapter } from '../src/adapters/cli/pi.js';
+import { createKimiAdapter } from '../src/adapters/cli/kimi.js';
 import { createGrokAdapter } from '../src/adapters/cli/grok.js';
 import { createKiroCliAdapter } from '../src/adapters/cli/kiro-cli.js';
 import type { CliAdapter, PtyHandle } from '../src/adapters/cli/types.js';
@@ -171,7 +172,6 @@ const PLAIN_ADAPTERS: AdapterEntry[] = [
 ];
 
 const OPENCODE_ADAPTER: AdapterEntry = ['opencode', createOpenCodeAdapter('/bin/opencode')];
-
 /** Node runner adapters use a one-line base64 control protocol so multiline
  *  content cannot be split by terminal Enter semantics. */
 const APP_RUNNER_ADAPTERS: AdapterEntry[] = [
@@ -184,18 +184,19 @@ const HUMAN_TYPING_ADAPTERS: AdapterEntry[] = [
 ];
 
 /** Adapters that use tmux pasteText (load-buffer + paste-buffer -d) with
- *  delayed Enter — CoCo / Trae CLI, Codex, and Pi. See coco.ts for the Trae 0.120.31
- *  burst bug, and codex.ts for the per-line-submit bug bracketed paste fixes
+ *  delayed Enter — CoCo / Trae CLI, Codex, Kimi, and Pi. See coco.ts for the
+ *  Trae 0.120.31 burst bug, and codex.ts for the per-line-submit bug bracketed paste fixes
  *  (Codex 0.134+ handles bracketed paste correctly — the old "Codex exits on
  *  bracketed paste" note was true only for a much earlier build). */
 const PASTE_BUFFER_ADAPTERS: AdapterEntry[] = [
   ['coco', createCocoAdapter('/bin/coco')],
   ['codex', createCodexAdapter('/bin/codex')],
+  ['kimi', createKimiAdapter('/bin/kimi')],
   ['pi', createPiAdapter('/bin/pi')],
 ];
 
 /** Adapters that wrap content in bracketed-paste markers (\x1b[200~ ... \x1b[201~)
- *  in non-tmux mode — claude-code and coco. */
+ *  in non-tmux mode. */
 const BRACKETED_PASTE_FALLBACK_ADAPTERS: AdapterEntry[] = [
   ...HUMAN_TYPING_ADAPTERS,
   ...PASTE_BUFFER_ADAPTERS,
@@ -582,6 +583,7 @@ describe('writeInput: multiline preserves unicode and session IDs', () => {
     expect(pty.pasteText).toHaveBeenCalledWith(followUp);
     expect(pty.sendSpecialKeys).toHaveBeenLastCalledWith('Enter');
   });
+
 });
 
 // =========================================================================
@@ -656,6 +658,120 @@ describe('writeInput: edge cases', () => {
     const pty = makeTmuxPty();
     await adapter.writeInput(pty, '');
     expect(pty.sendSpecialKeys).toHaveBeenCalledWith('Enter');
+  });
+
+  it('kimi: settles only the first write for each backend instance', async () => {
+    vi.useFakeTimers();
+    try {
+      const adapter = createKimiAdapter('/bin/kimi');
+      const pty = makeTmuxPty();
+
+      const first = adapter.writeInput(pty, 'first');
+      expect(pty.pasteText).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(Math.round(250 * TIME_SCALE));
+      expect(pty.pasteText).toHaveBeenCalledOnce();
+      await vi.runAllTimersAsync();
+      await first;
+
+      const second = adapter.writeInput(pty, 'second');
+      expect(pty.pasteText).toHaveBeenCalledTimes(2);
+      await vi.runAllTimersAsync();
+      await second;
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('kimi: treats a side-effecting false paste result as assume-issued', async () => {
+    const adapter = createKimiAdapter('/bin/kimi');
+    const pasted: string[] = [];
+    const pty = {
+      write: vi.fn(),
+      pasteText: vi.fn((content: string) => {
+        pasted.push(content);
+        return false;
+      }),
+      sendSpecialKeys: vi.fn(),
+    } satisfies PtyHandle;
+
+    const result = await adapter.writeInput(pty, MULTILINE);
+
+    expect(pasted).toEqual([MULTILINE]);
+    expect(pty.pasteText).toHaveBeenCalledTimes(1);
+    expect(pty.sendSpecialKeys).toHaveBeenCalledTimes(1);
+    expect(result).toBeUndefined();
+  });
+
+  it('kimi: treats a side-effecting false Enter result as assume-issued', async () => {
+    const adapter = createKimiAdapter('/bin/kimi');
+    const submittedKeys: string[] = [];
+    const pty = {
+      write: vi.fn(),
+      pasteText: vi.fn(),
+      sendSpecialKeys: vi.fn((...keys: string[]) => {
+        submittedKeys.push(...keys);
+        return false;
+      }),
+    } satisfies PtyHandle;
+
+    const result = await adapter.writeInput(pty, MULTILINE);
+
+    expect(pty.pasteText).toHaveBeenCalledTimes(1);
+    expect(submittedKeys).toEqual(['Enter']);
+    expect(pty.sendSpecialKeys).toHaveBeenCalledTimes(1);
+    expect(result).toBeUndefined();
+  });
+
+  it('kimi: sends large prompts through pasteText instead of argv-bound sendText', async () => {
+    const adapter = createKimiAdapter('/bin/kimi');
+    const pty = makeTmuxPty();
+    const content = 'routing-context\n' + 'x'.repeat(64 * 1024);
+
+    const result = await adapter.writeInput(pty, content);
+
+    expect(pty.pasteText).toHaveBeenCalledWith(content);
+    expect(pty.sendText).not.toHaveBeenCalled();
+    expect(result).toBeUndefined();
+  });
+
+  it('kimi: does not retry when paste transport throws after a side effect', async () => {
+    const adapter = createKimiAdapter('/bin/kimi');
+    const pasted: string[] = [];
+    const pty = {
+      write: vi.fn(),
+      pasteText: vi.fn((content: string) => {
+        pasted.push(content);
+        throw new Error('confirmation timed out');
+      }),
+      sendSpecialKeys: vi.fn(),
+    } satisfies PtyHandle;
+
+    const result = await adapter.writeInput(pty, MULTILINE);
+
+    expect(pasted).toEqual([MULTILINE]);
+    expect(pty.pasteText).toHaveBeenCalledTimes(1);
+    expect(pty.sendSpecialKeys).not.toHaveBeenCalled();
+    expect(result).toBeUndefined();
+  });
+
+  it('kimi: raw PTY false writes remain assume-issued instead of clean non-submit', async () => {
+    const adapter = createKimiAdapter('/bin/kimi');
+    const writes: string[] = [];
+    const pty = {
+      write: vi.fn((data: string) => {
+        writes.push(data);
+        return false;
+      }),
+    } satisfies PtyHandle;
+
+    const result = await adapter.writeInput(pty, MULTILINE);
+
+    expect(writes).toEqual([
+      `\x1b[200~${MULTILINE}\x1b[201~`,
+      '\r',
+    ]);
+    expect(pty.write).toHaveBeenCalledTimes(2);
+    expect(result).toBeUndefined();
   });
 
   it('claude-code: image path in multiline still types via sendText', async () => {

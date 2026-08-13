@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 import {
   buildConnectorInstructionUpdateBody,
   buildConnectorKindOptions,
+  buildConnectorTopicMessageConfig,
   replaceConnectorById,
 } from '../src/dashboard/web/connectors-page.js';
 
@@ -58,5 +59,53 @@ describe('dashboard connector list updates', () => {
     expect(result).toEqual([original[0], updated]);
     expect(result).not.toBe(original);
     expect(original[1].name).toBe('Before edit');
+  });
+});
+
+describe('dashboard trusted topic templates', () => {
+  it('builds a template config from JSON extractors', () => {
+    const result = buildConnectorTopicMessageConfig(
+      'template',
+      'Meego启动开发：{{title}} {{mention owner}}负责人',
+      JSON.stringify({
+        title: { path: '$.issue.title', kind: 'text' },
+        owner: { path: '$.owner', kind: 'mention', identityPath: '$.email', namePath: '$.name' },
+      }),
+    );
+
+    expect(result).toEqual({
+      ok: true,
+      value: {
+        mode: 'template',
+        text: 'Meego启动开发：{{title}} {{mention owner}}负责人',
+        extractors: {
+          title: { path: '$.issue.title', kind: 'text' },
+          owner: { path: '$.owner', kind: 'mention', identityPath: '$.email', namePath: '$.name' },
+        },
+      },
+    });
+  });
+
+  it('rejects malformed extractor JSON before submitting and drops it outside template mode', () => {
+    expect(buildConnectorTopicMessageConfig('template', '{{title}}', '{bad json')).toEqual({
+      ok: false,
+      error: 'connectors.errTopicExtractors',
+    });
+    expect(buildConnectorTopicMessageConfig('template', '{{title}}', 'null')).toEqual({
+      ok: false,
+      error: 'connectors.errTopicExtractors',
+    });
+    expect(buildConnectorTopicMessageConfig('template', '{{title}}', '[]')).toEqual({
+      ok: false,
+      error: 'connectors.errTopicExtractors',
+    });
+    expect(buildConnectorTopicMessageConfig('custom', 'Alert from {source}', '{bad json')).toEqual({
+      ok: true,
+      value: { mode: 'custom', text: 'Alert from {source}' },
+    });
+    expect(buildConnectorTopicMessageConfig('none', '', '{bad json')).toEqual({
+      ok: true,
+      value: { mode: 'none' },
+    });
   });
 });

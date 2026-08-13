@@ -593,8 +593,8 @@ export class HerdrBackend implements SessionBackend {
     );
   }
 
-  pasteText(text: string): void {
-    this.write(text);
+  pasteText(text: string): boolean {
+    return this.write(text);
   }
 
   resize(cols: number, rows: number): void {

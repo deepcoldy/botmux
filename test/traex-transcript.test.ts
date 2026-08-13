@@ -23,6 +23,20 @@ function line(value: unknown): string {
 function user(text: string, timestamp = '2000-01-01T00:00:01.000Z') {
   return {
     timestamp,
+    type: 'event_msg',
+    payload: {
+      type: 'user_message',
+      message: text,
+      images: [],
+      local_images: [],
+      text_elements: [],
+    },
+  };
+}
+
+function userResponseItem(text: string, timestamp = '2000-01-01T00:00:01.000Z') {
+  return {
+    timestamp,
     type: 'response_item',
     payload: {
       type: 'message',
@@ -184,6 +198,27 @@ describe('drainTraexRollout', () => {
         kind: 'assistant_final',
         text: 'durable final answer',
         sourceSessionId: SID,
+      }),
+    ]);
+  });
+
+  it('ignores internal role=user injections without a user_message event', () => {
+    writeFileSync(path, [
+      line(userResponseItem('<environment_context>runtime context</environment_context>')),
+      line(userResponseItem('Warning: runtime-generated process limit notice')),
+      line(userResponseItem('real terminal input')),
+      line(user('real terminal input')),
+      line(taskComplete('done')),
+    ].join(''));
+
+    expect(drainTraexRollout(path, 0).events).toEqual([
+      expect.objectContaining({
+        kind: 'user',
+        text: 'real terminal input',
+      }),
+      expect.objectContaining({
+        kind: 'assistant_final',
+        text: 'done',
       }),
     ]);
   });

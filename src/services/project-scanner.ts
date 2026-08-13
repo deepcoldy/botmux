@@ -34,7 +34,38 @@ export interface ProjectInfo {
 
 export interface ProjectScanOptions {
   includeWorktrees?: boolean;
+  /** Hard cap on directories visited during a single scan. Guards against a
+   *  misconfigured scan root (e.g. `~`) turning the synchronous walk into a
+   *  minutes-long event-loop stall. Defaults to DEFAULT_MAX_SCAN_DIRS. */
+  maxScanDirs?: number;
+  /** Wall-clock budget (ms) for a single scan, checked between filesystem
+   *  calls. A dir-count cap alone doesn't bound a "repo storm" root where
+   *  each repo spawns a slow `git` subprocess; this stops the walk once the
+   *  budget is spent. Defaults to DEFAULT_MAX_SCAN_MS. Note: this cannot
+   *  interrupt a single syscall already blocked in the kernel (e.g. a
+   *  readdir that hangs on a protected/stale directory) — only the space
+   *  between calls. Narrowing the scan root remains the real fix. */
+  maxScanMs?: number;
+  /** Invoked once, after the walk, if either budget (dirs or wall-clock) was
+   *  hit — meaning the returned list may be incomplete. Lets a caller surface a
+   *  "scan root too large / narrow it" hint to the user instead of silently
+   *  showing a partial list or a misleading "no repos found". Not called when
+   *  the scan completes within budget. `reason` says which cap tripped. */
+  onBudgetExceeded?: (info: { reason: 'dirs' | 'time'; dirsVisited: number; baseDir: string }) => void;
 }
+
+/** Upper bound on directories a single `scanProjects` walk will visit before
+ *  bailing out. `scanProjects` is fully synchronous (readdirSync + a `git`
+ *  subprocess per repo), so an unbounded walk over a huge root such as the
+ *  home directory blocks the daemon's event loop — no repo card is ever sent
+ *  and the whole bot appears hung. 4000 dirs comfortably covers a normal
+ *  projects root while capping the worst case. */
+export const DEFAULT_MAX_SCAN_DIRS = 4000;
+
+/** Wall-clock budget for one scan. A normal projects root scans in well under
+ *  a second; anything past a few seconds means the root is misconfigured
+ *  (pointed at `~` or similar). Bailing keeps the daemon responsive. */
+export const DEFAULT_MAX_SCAN_MS = 4000;
 
 /**
  * Describe a single directory as a project: the main worktree basename +
@@ -146,9 +177,22 @@ export function scanProjects(baseDir: string, maxDepth: number = 3, options: Pro
   const projects: ProjectInfo[] = [];
   const seenRepos = new Set<string>();   // by git-common-dir
   const seenPaths = new Set<string>();   // by absolute path
+  const maxScanDirs = options.maxScanDirs ?? DEFAULT_MAX_SCAN_DIRS;
+  const maxScanMs = options.maxScanMs ?? DEFAULT_MAX_SCAN_MS;
+  const deadline = Date.now() + maxScanMs;
+  let dirsVisited = 0;
+  let budgetReason: 'dirs' | 'time' | null = null;
+
+  function overBudget(): boolean {
+    if (dirsVisited >= maxScanDirs) { budgetReason ??= 'dirs'; return true; }
+    if (Date.now() >= deadline) { budgetReason ??= 'time'; return true; }
+    return false;
+  }
 
   function walk(dir: string, depth: number): void {
     if (depth > maxDepth) return;
+    if (overBudget()) return;
+    dirsVisited++;
 
     let entries: string[];
     try {
@@ -173,6 +217,7 @@ export function scanProjects(baseDir: string, maxDepth: number = 3, options: Pro
 
     for (const entry of entries) {
       if (entry.startsWith('.') || entry === 'node_modules' || entry === 'vendor' || entry === 'dist') continue;
+      if (overBudget()) return;
       const fullPath = join(dir, entry);
       try {
         if (statSync(fullPath).isDirectory()) {
@@ -187,7 +232,13 @@ export function scanProjects(baseDir: string, maxDepth: number = 3, options: Pro
   walk(baseDir, 0);
   projects.sort(compareProjects);
 
-  logger.info(`Scanned ${baseDir}: found ${projects.length} project(s)`);
+  if (budgetReason) {
+    const limit = budgetReason === 'dirs' ? `${maxScanDirs}-dir` : `${maxScanMs}ms`;
+    logger.warn(`Scanned ${baseDir}: hit ${limit} budget after ${dirsVisited} dirs, found ${projects.length} project(s) so far — results may be incomplete. Configure a narrower workingDirs to avoid scanning a huge root.`);
+    options.onBudgetExceeded?.({ reason: budgetReason, dirsVisited, baseDir });
+  } else {
+    logger.info(`Scanned ${baseDir}: found ${projects.length} project(s)`);
+  }
   return projects;
 }
 

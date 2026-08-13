@@ -26,6 +26,38 @@ export const CLAUDE_SESSION_MARKER_ENV_KEYS = [
   'CLAUDE_PID',
 ] as const;
 
+/**
+ * Runtime markers that belong only to a v3 workflow/goal worker.
+ *
+ * A workflow worker may invoke `botmux restart`; PM2 persists that caller env
+ * into the long-lived daemons. If these keys survive, every ordinary worker
+ * forked by those daemons mistakes itself for a workflow worker: it skips
+ * screen/status updates and goal-only CLI restrictions leak into chat
+ * sessions. Keep the complete file-backed goal contract together with the
+ * workflow identity fields so a partial scrub cannot leave a normal worker in
+ * a hybrid mode.
+ *
+ * Do not apply this scrub at worker.ts boot: real workflow workers share that
+ * entry point and receive these keys explicitly from the ephemeral pool.
+ */
+export const WORKFLOW_WORKER_ENV_KEYS = [
+  'BOTMUX_WORKFLOW',
+  'BOTMUX_WORKFLOW_PTY_LOG_PATH',
+  'BOTMUX_WORKFLOW_RUN_ID',
+  'BOTMUX_WORKFLOW_NODE_ID',
+  'BOTMUX_GOAL_PATH',
+  'BOTMUX_GOAL_INPUTS_PATH',
+  'BOTMUX_GOAL_OUTPUT_DIR',
+  'BOTMUX_GOAL_MANIFEST_PATH',
+  'BOTMUX_GOAL_ATTEMPT_DIR',
+  'BOTMUX_V3_GOAL',
+] as const;
+
+/** Remove workflow-only identity from a non-workflow process boundary. */
+export function scrubWorkflowWorkerEnv(env: NodeJS.ProcessEnv): void {
+  for (const key of WORKFLOW_WORKER_ENV_KEYS) delete env[key];
+}
+
 /** Boundary-only companion to the markers. A CLAUDE_EFFORT inherited THROUGH
  *  pm2 → daemon → worker is indistinguishable from the issuing Claude
  *  session's own override and would silently pin that session's
@@ -134,6 +166,26 @@ export const REDACTED_CHILD_ENV_KEYS = [
  */
 export const SESSION_CLI_HOME_ENV_KEYS = ['CLAUDE_CONFIG_DIR', 'CODEX_HOME'] as const;
 
+/**
+ * Pin the daemon-selected session owner under the public BOTMUX_* contract and
+ * the legacy private name used by older wrappers. ownerOpenId is the only
+ * authority: every worker backend must call this after config-controlled env
+ * merges, and an ownerless session must delete both keys. Otherwise a managed
+ * CLI can observe a stale/different app-scoped owner across backends.
+ */
+export function applySessionOwnerEnv(
+  env: NodeJS.ProcessEnv,
+  ownerOpenId: string | undefined,
+): void {
+  if (ownerOpenId) {
+    env.BOTMUX_OWNER_OPEN_ID = ownerOpenId;
+    env.__OWNER_OPEN_ID = ownerOpenId;
+    return;
+  }
+  delete env.BOTMUX_OWNER_OPEN_ID;
+  delete env.__OWNER_OPEN_ID;
+}
+
 /** Delete inherited session-level CLI data-root pointers from `env` in place
  *  (see SESSION_CLI_HOME_ENV_KEYS). Values a session actually needs are
  *  computed and re-set AFTER this scrub (worker isolation pins / adapter
@@ -179,6 +231,24 @@ export const BOTMUX_INJECTED_ENV_KEYS = [
   // v3 host effects / schedule delivery need chatType inside the pane.
   'BOTMUX_CHAT_TYPE',
   'BOTMUX_LARK_APP_ID',
+  // The EXACT bots.json the daemon loaded (getLoadedConfigPath, frozen host-side
+  // and pinned by spawnCli). Injected so a CLI child reads the SAME registry even
+  // when the daemon runs under a non-default HOME (`HOME=~/alt botmux start`): the
+  // child inherits cwd and the BOTMUX_* family but never HOME, so without this it
+  // resolves the *default* ~/.botmux, misses its own appId, and every `botmux
+  // send` from inside that session fails "Bot not registered". A path, not a
+  // credential (the file it names holds secrets; the name does not).
+  //
+  // Being on THIS list is load-bearing in three separate ways, so do not move it:
+  //  · buildBotmuxEnvAssignments forwards it into tmux/zellij panes (without it,
+  //    only the pty backend would be fixed);
+  //  · isBotmuxManagedTmuxEnvKey strips it from the tmux CLIENT env, so botmux
+  //    never seeds a shared server's GLOBAL env with a fleet's registry path;
+  //  · PANE_ENV_UNSET_CLAUSE unsets it in the pane wrapper, so a stale value
+  //    already in a co-tenant server's global env cannot outrank the pinned one
+  //    (BOTS_CONFIG is the TOP of the registry precedence chain — a stale value
+  //    silently redirects the child to a foreign registry).
+  'BOTS_CONFIG',
   'BOTMUX_ROOT_MESSAGE_ID',
   // Session owner (standard name; `__OWNER_OPEN_ID` above is the legacy
   // channel). Custom CLI wrappers read it for per-user permission isolation.

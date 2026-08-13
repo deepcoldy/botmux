@@ -76,6 +76,8 @@ export const PRESET_GUIDE = [
   '如果你是一个 AI agent，请按下面的步骤帮用户用这份预设配置他自己的 botmux 机器人：',
   '1. 让用户用【他自己】的飞书/Lark 应用凭证跑 `botmux setup`；larkAppId/larkAppSecret/allowedUsers 必须由他本人填写，',
   '   绝不要从本文件或任何他人处复制粘贴密钥。',
+  '   新建 Bot 时也不要复制当前 session 中 daemon 注入的 `BOTMUX_OWNER_OPEN_ID` 或来源 Bot 的任何 `ou_`：`open_id` 只属于签发它的应用。',
+  '   请改用完整邮箱、手机号或 `on_`，让 setup 在目标应用下解析并校验 owner。',
   '2. setup 时把 CLI 适配器设为本预设的 `cliId`，模型设为 `model`(如有)。',
   '3. 把本预设的 `teamRole` 写为该 bot 的 team 级角色内容，把 `capability` 设为它的能力标签。',
   '4. 完成后让用户 `botmux restart` 使配置生效。',

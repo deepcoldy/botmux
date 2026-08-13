@@ -27,6 +27,13 @@ describe('skill registry store', () => {
     rmSync(src, { recursive: true, force: true });
   });
 
+  it('does not expose Object prototype properties as installed skills', () => {
+    const skills = readSkillRegistry().skills;
+
+    expect(Object.hasOwn(skills, 'constructor')).toBe(false);
+    expect(skills.constructor).toBeUndefined();
+  });
+
   it('discovers direct children when the supplied source is a native skills root', () => {
     const skillsRoot = join(src, '.claude', 'skills');
     write(join(skillsRoot, 'deploy', 'SKILL.md'), '---\nname: deploy\n---\n# Deploy');

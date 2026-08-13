@@ -1604,6 +1604,147 @@ describe('/rename production routing — must not pre-create a session (review P
     expect(repliedText()).toMatch(/需要活跃的 CLI 进程|需要在已有会话内使用/);
   });
 
+  it('routes slash text by the frozen session CLI: Codex App structured, interactive Codex raw', async () => {
+    const bot = registerBot({
+      larkAppId: APP,
+      larkAppSecret: 's',
+      cliId: 'codex',
+      allowedUsers: [OWNER],
+      oncallChats: [{ chatId: CHAT, workingDir: '/tmp' }],
+    });
+    bot.resolvedAllowedUsers = [OWNER];
+
+    // The bot currently defaults to interactive Codex, but this existing
+    // session was created as Codex App. `/model` must enter the ordinary App
+    // Server turn lane so worker dispatch attribution is reserved.
+    const appSend = vi.fn();
+    const appSession = seedLiveChatSession(appSend);
+    appSession.session.cliId = 'codex-app';
+    await handleThreadReply(
+      makeEventData('om_model_app', '/model', 'om_model_app_root'),
+      {
+        chatId: CHAT,
+        messageId: 'om_model_app',
+        chatType: 'group',
+        scope: 'chat',
+        anchor: CHAT,
+        replyRootId: 'om_model_app_root',
+        larkAppId: APP,
+      },
+    );
+    expect(appSend).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'raw_input' }));
+    expect(appSend).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'message',
+      turnId: 'om_model_app',
+      content: expect.stringContaining('/model'),
+    }));
+
+    // Inverse control: changing the bot default to Codex App must not remove
+    // native slash support from an already-running interactive Codex session.
+    activeSessions.clear();
+    const appDefault = registerBot({
+      larkAppId: APP,
+      larkAppSecret: 's',
+      cliId: 'codex-app',
+      allowedUsers: [OWNER],
+      oncallChats: [{ chatId: CHAT, workingDir: '/tmp' }],
+    });
+    appDefault.resolvedAllowedUsers = [OWNER];
+    const tuiSend = vi.fn();
+    const tuiSession = seedLiveChatSession(tuiSend);
+    tuiSession.session.cliId = 'codex';
+    await handleThreadReply(
+      makeEventData('om_model_tui', '/model', 'om_model_tui_root'),
+      {
+        chatId: CHAT,
+        messageId: 'om_model_tui',
+        chatType: 'group',
+        scope: 'chat',
+        anchor: CHAT,
+        replyRootId: 'om_model_tui_root',
+        larkAppId: APP,
+      },
+    );
+    expect(tuiSend).toHaveBeenCalledWith({
+      type: 'raw_input',
+      content: '/model',
+      turnId: 'om_model_tui',
+    });
+  });
+
+  it('routes the ADAPTER-SCOPED /goal by frozen CLI too (not just builtin /model)', async () => {
+    // Builtin `/model` lives in PASSTHROUGH_COMMANDS and never touches the
+    // adapter layer, so it can mask a bug where the frozen CLI fails to reach
+    // resolveAdapterDefaultPassthroughCommands. `/goal` IS adapter-scoped
+    // (codex only), so it is the command that actually proves the override is
+    // threaded all the way through. Before the fix, the first leg below sent a
+    // structured `message` instead of `raw_input`.
+    const bot = registerBot({
+      larkAppId: APP,
+      larkAppSecret: 's',
+      cliId: 'codex-app',
+      allowedUsers: [OWNER],
+      oncallChats: [{ chatId: CHAT, workingDir: '/tmp' }],
+    });
+    bot.resolvedAllowedUsers = [OWNER];
+
+    // Bot default flipped to Codex App, but this session is frozen as
+    // interactive Codex → its native adapter `/goal` must stay raw_input.
+    const tuiSend = vi.fn();
+    const tuiSession = seedLiveChatSession(tuiSend);
+    tuiSession.session.cliId = 'codex';
+    await handleThreadReply(
+      makeEventData('om_goal_tui', '/goal', 'om_goal_tui_root'),
+      {
+        chatId: CHAT,
+        messageId: 'om_goal_tui',
+        chatType: 'group',
+        scope: 'chat',
+        anchor: CHAT,
+        replyRootId: 'om_goal_tui_root',
+        larkAppId: APP,
+      },
+    );
+    expect(tuiSend).toHaveBeenCalledWith({
+      type: 'raw_input',
+      content: '/goal',
+      turnId: 'om_goal_tui',
+    });
+
+    // Inverse: bot default is interactive Codex, but a frozen Codex App session
+    // has NO passthrough surface → `/goal` must go structured, never raw_input.
+    activeSessions.clear();
+    const codexDefault = registerBot({
+      larkAppId: APP,
+      larkAppSecret: 's',
+      cliId: 'codex',
+      allowedUsers: [OWNER],
+      oncallChats: [{ chatId: CHAT, workingDir: '/tmp' }],
+    });
+    codexDefault.resolvedAllowedUsers = [OWNER];
+    const appSend = vi.fn();
+    const appSession = seedLiveChatSession(appSend);
+    appSession.session.cliId = 'codex-app';
+    await handleThreadReply(
+      makeEventData('om_goal_app', '/goal', 'om_goal_app_root'),
+      {
+        chatId: CHAT,
+        messageId: 'om_goal_app',
+        chatType: 'group',
+        scope: 'chat',
+        anchor: CHAT,
+        replyRootId: 'om_goal_app_root',
+        larkAppId: APP,
+      },
+    );
+    expect(appSend).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'raw_input' }));
+    expect(appSend).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'message',
+      turnId: 'om_goal_app',
+      content: expect.stringContaining('/goal'),
+    }));
+  });
+
   it('fails closed on /fast for RPC-input / Riff backends (no raw_input, clear reply)', async () => {
     const bot = registerBot({
       larkAppId: APP,

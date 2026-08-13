@@ -14,7 +14,7 @@ describe('TRAE worker structured-bridge wiring', () => {
     expect(envSetup).toContain('engineEnv.BOTMUX_LARK_APP_ID = cfg.larkAppId;');
     expect(envSetup).toContain('engineEnv.BOTMUX_ROOT_MESSAGE_ID = cfg.rootMessageId;');
     expect(envSetup).toContain("engineEnv.BOTMUX_SESSION_SCOPE = cfg.rootMessageId?.startsWith('om_') ? 'thread' : 'chat';");
-    expect(envSetup).toContain('engineEnv.BOTMUX_OWNER_OPEN_ID = cfg.ownerOpenId;');
+    expect(envSetup).toContain('applySessionOwnerEnv(engineEnv, cfg.ownerOpenId);');
     expect(envSetup).not.toContain('BOTMUX_LARK_APP_SECRET');
   });
 
@@ -174,7 +174,7 @@ describe('TRAE worker structured-bridge wiring', () => {
     const end = workerSource.indexOf('\n}\n', start);
     const follower = workerSource.slice(start, end);
 
-    expect(follower).toContain('findTraexRolloutByPid(pid)');
+    expect(follower).toContain('findTraexRolloutByPid(pid, currentSid)');
     expect(follower).toContain('persistCliSessionId(observed.cliSessionId);');
     expect(follower).toContain('codexBridgeNotifyCliSessionId(observed.cliSessionId);');
   });

@@ -211,6 +211,46 @@ describe('shouldSuppressBridgeEmit', () => {
     )).toBe(true);
   });
 
+  it('non-adopt: trailing sentinel + ANY in-window send suppresses long narration (real-world leak)', () => {
+    // The reported bug: the model `botmux send`s a short message, then writes a
+    // long block of NARRATION/thinking it deliberately keeps out of chat, and
+    // ends the final with the sentinel. The narration is materially LONGER than
+    // the send, so the length heuristic (markerSetCoversFinal) alone judged it a
+    // new substantive answer and RE-POSTED the narration. A trailing sentinel +
+    // any in-window marker now suppresses unconditionally: the sentinel is the
+    // model's explicit "nothing more to send" after it already sent.
+    const shortSend = 'On it.';
+    const longNarration =
+      "The screenshot subagent is running. I'll wait for it to save the file(s), "
+      + 'then send them via botmux send --images and stop the server. No message '
+      + 'needed until I have the files.';
+    expect(longNarration.length).toBeGreaterThan(shortSend.length * 2); // would trip material-longer
+    expect(shouldSuppressBridgeEmit(
+      { ...turn(100), finalText: `${longNarration}\n\n${BRIDGE_NOTHING_TO_SEND_SENTINEL}` },
+      500,
+      [{ sentAtMs: 200, ...buildBridgeSendMarkerContent(shortSend) }],
+      false,
+    )).toBe(true);
+  });
+
+  it('non-adopt: NO trailing sentinel + long final still posts even with a short prior send (unchanged)', () => {
+    // Guard the narrowing: the sentinel is what flips a longer-than-send final to
+    // suppressed. WITHOUT a trailing sentinel, a materially longer final is still
+    // treated as a genuine follow-up answer and posts (preserves the pre-existing
+    // "short progress update then a substantive final" behavior).
+    const shortSend = 'Working on it.';
+    const longFinal = 'Here is the complete, substantive answer that is materially '
+      + 'longer than the short progress note I sent earlier, with real content '
+      + 'that clearly exceeds the material-longer threshold by a wide margin here.';
+    // sanity: this final IS materially longer than the send (would post on its own)
+    expect(shouldSuppressBridgeEmit(
+      { ...turn(100), finalText: longFinal },
+      500,
+      [{ sentAtMs: 200, ...buildBridgeSendMarkerContent(shortSend) }],
+      false,
+    )).toBe(false);
+  });
+
   it('non-adopt: token inline in a prose sentence is not guessed away', () => {
     // Last non-empty line is a full sentence (token mid-line), not a bare
     // sentinel — a normal answer that merely mentions the token.

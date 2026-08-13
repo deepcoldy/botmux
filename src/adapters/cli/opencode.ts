@@ -191,6 +191,8 @@ export function createOpenCodeAdapter(pathOverride?: string): CliAdapter {
     // OpenCode 只在"新会话"应用 --prompt，`-s` 续接时静默忽略（消息会丢）。
     // 置位后 worker 在 resume spawn 时把初始 prompt 转入常规输入队列。
     initialPromptArgsIgnoredOnResume: true,
+    rawCommandInputMode: 'paste-line',
+    rawCommandSettleMs: 300,
 
     buildResumeCommand({ sessionId, cliSessionId }) {
       const sid = isOpenCodeSessionId(cliSessionId) ? cliSessionId : latestOpenCodeSessionForBotmuxSession(sessionId);

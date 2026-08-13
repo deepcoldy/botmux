@@ -71,7 +71,13 @@ Yes. Both Feishu (feishu.cn) and Lark (international, larksuite.com) work: when 
 
 ## How do multiple bots collaborate with each other?
 
-Use `botmux bots list` or the `<available_bots>` block to find the target bot's `openId`, then explicitly trigger it with `botmux send --mention <the other's openId>`. Without `--mention`, the other bot won't be triggered. `/introduce` is now only a legacy / external-bot fallback: use it when the target is missing or shows `mentionable=false`.
+**It works by default — no extra setup.** Just add the bots you want to collaborate to the same group.
+
+- **Just you and one bot**: talk to it directly; it responds automatically, no @ needed.
+- **A group with multiple bots / people**: @ the bot you want to hand the work to.
+- When bots need to relay (e.g. one writes, one reviews), the bots @ each other to pass it along — you just hand the work to the first one.
+
+See [Multi-bot Collaboration](/en/multi-bot) for details.
 
 ## Does restarting the daemon lose context?
 

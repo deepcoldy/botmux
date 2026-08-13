@@ -334,6 +334,189 @@ describe('worker sendRawCommandLine helper', () => {
 describe('raw command backend acceptance', () => {
   const immediateDelay = vi.fn(async () => {});
 
+  it('uses pasteText before Enter when pasteLine is enabled', async () => {
+    const calls: string[] = [];
+    const write = vi.fn(() => true);
+    const sendText = vi.fn((text: string) => {
+      calls.push(`sendText:${text}`);
+      return true;
+    });
+    const pasteText = vi.fn((text: string) => {
+      calls.push(`pasteText:${text}`);
+      return true;
+    });
+    const sendSpecialKeys = vi.fn((key: string) => {
+      calls.push(`sendSpecialKeys:${key}`);
+      return true;
+    });
+    const delay = vi.fn(async (ms: number) => {
+      calls.push(`delay:${ms}`);
+    });
+    const fake = { supportsRawCommandPasteLine: true, write, sendText, sendSpecialKeys, pasteText };
+    const pasteLineOptions = { pasteLine: true, pasteSettleMs: 300, delay };
+
+    await expect(writeRawCommandLine(
+      fake,
+      '/mr-review-team 127',
+      pasteLineOptions,
+    )).resolves.toBe(true);
+
+    expect(pasteText).toHaveBeenCalledOnce();
+    expect(pasteText).toHaveBeenCalledWith('/mr-review-team 127');
+    expect(sendText).not.toHaveBeenCalled();
+    expect(sendSpecialKeys).toHaveBeenCalledWith('Enter');
+    expect(delay).toHaveBeenCalledWith(300);
+    expect(calls).toEqual([
+      'pasteText:/mr-review-team 127',
+      'delay:300',
+      'sendSpecialKeys:Enter',
+    ]);
+  });
+
+  it('falls back to sendText when pasteLine is enabled but the backend has no paste-line contract', async () => {
+    const calls: string[] = [];
+    const write = vi.fn(() => true);
+    const sendText = vi.fn((text: string) => {
+      calls.push(`sendText:${text}`);
+      return true;
+    });
+    const pasteText = vi.fn((text: string) => {
+      calls.push(`pasteText:${text}`);
+      return true;
+    });
+    const sendSpecialKeys = vi.fn((key: string) => {
+      calls.push(`sendSpecialKeys:${key}`);
+      return true;
+    });
+    const delay = vi.fn(async (ms: number) => {
+      calls.push(`delay:${ms}`);
+    });
+    const fake = { write, sendText, sendSpecialKeys, pasteText };
+
+    await expect(writeRawCommandLine(
+      fake,
+      '/mr-review-team 127',
+      { pasteLine: true, pasteSettleMs: 300, delay },
+    )).resolves.toBe(true);
+
+    expect(pasteText).not.toHaveBeenCalled();
+    expect(sendText).toHaveBeenCalledWith('/mr-review-team 127');
+    expect(sendSpecialKeys).toHaveBeenCalledWith('Enter');
+    expect(calls).toEqual([
+      'sendText:/mr-review-team 127',
+      'delay:200',
+      'sendSpecialKeys:Enter',
+    ]);
+  });
+
+  it('falls back to sendText plus Enter when pasteLine is enabled without pasteText', async () => {
+    const calls: string[] = [];
+    const write = vi.fn(() => true);
+    const sendText = vi.fn((text: string) => {
+      calls.push(`sendText:${text}`);
+      return true;
+    });
+    const sendSpecialKeys = vi.fn((key: string) => {
+      calls.push(`sendSpecialKeys:${key}`);
+      return true;
+    });
+    const delay = vi.fn(async (ms: number) => {
+      calls.push(`delay:${ms}`);
+    });
+    const fake = { write, sendText, sendSpecialKeys };
+    const pasteLineOptions = { pasteLine: true, pasteSettleMs: 300, delay };
+
+    await expect(writeRawCommandLine(
+      fake,
+      '/mr-review-team 127',
+      pasteLineOptions,
+    )).resolves.toBe(true);
+
+    expect(sendText).toHaveBeenCalledWith('/mr-review-team 127');
+    expect(sendSpecialKeys).toHaveBeenCalledWith('Enter');
+    expect(calls).toEqual([
+      'sendText:/mr-review-team 127',
+      'delay:200',
+      'sendSpecialKeys:Enter',
+    ]);
+  });
+
+  it('uses pasteText with Enter when pasteLine is enabled even without sendText', async () => {
+    const calls: string[] = [];
+    const write = vi.fn(() => {
+      calls.push('write');
+      return true;
+    });
+    const pasteText = vi.fn((text: string) => {
+      calls.push(`pasteText:${text}`);
+      return true;
+    });
+    const sendSpecialKeys = vi.fn((key: string) => {
+      calls.push(`sendSpecialKeys:${key}`);
+      return true;
+    });
+    const delay = vi.fn(async (ms: number) => {
+      calls.push(`delay:${ms}`);
+    });
+    const fake = { supportsRawCommandPasteLine: true, write, sendSpecialKeys, pasteText };
+
+    await expect(writeRawCommandLine(
+      fake,
+      '/mr-review-team 127',
+      { pasteLine: true, delay },
+    )).resolves.toBe(true);
+
+    expect(pasteText).toHaveBeenCalledWith('/mr-review-team 127');
+    expect(sendSpecialKeys).toHaveBeenCalledWith('Enter');
+    expect(write).not.toHaveBeenCalled();
+    expect(calls).toEqual([
+      'pasteText:/mr-review-team 127',
+      'delay:200',
+      'sendSpecialKeys:Enter',
+    ]);
+  });
+
+  it('keeps CoCo char-by-char sendText precedence when pasteLine is enabled', async () => {
+    const calls: string[] = [];
+    const write = vi.fn(() => true);
+    const sendText = vi.fn((text: string) => {
+      calls.push(`sendText:${text}`);
+      return true;
+    });
+    const pasteText = vi.fn((text: string) => {
+      calls.push(`pasteText:${text}`);
+      return true;
+    });
+    const sendSpecialKeys = vi.fn((key: string) => {
+      calls.push(`sendSpecialKeys:${key}`);
+      return true;
+    });
+    const delay = vi.fn(async (ms: number) => {
+      calls.push(`delay:${ms}`);
+    });
+    const fake = { supportsRawCommandPasteLine: true, write, sendText, sendSpecialKeys, pasteText };
+    const pasteLineOptions = {
+      coco: true,
+      cocoThrottleMs: 7,
+      pasteLine: true,
+      pasteSettleMs: 300,
+      delay,
+    };
+
+    await expect(writeRawCommandLine(
+      fake,
+      '/mr-review-team 127',
+      pasteLineOptions,
+    )).resolves.toBe(true);
+
+    expect(pasteText).not.toHaveBeenCalled();
+    expect(sendText).toHaveBeenCalledTimes('/mr-review-team 127'.length);
+    expect(sendText).toHaveBeenNthCalledWith(1, '/');
+    expect(sendSpecialKeys).toHaveBeenCalledWith('Enter');
+    expect(delay).toHaveBeenCalledWith(7);
+    expect(calls.at(-1)).toBe('sendSpecialKeys:Enter');
+  });
+
   it('fails closed when the text write is rejected', async () => {
     const sendText = vi.fn(() => false);
     const sendSpecialKeys = vi.fn(() => true);
@@ -483,7 +666,7 @@ describe('late bare-shell launch recovery', () => {
   });
 
   it('generation-fences PTY data before it can feed the active idle detector', () => {
-    const wiring = caseRegion(workerSrc, 'const observedBackend = backend;', 2300);
+    const wiring = caseRegion(workerSrc, 'const observedBackend = backend;', 3400);
     const onData = wiring.indexOf('observedBackend.onData((data) =>');
     const fence = wiring.indexOf('if (backend !== observedBackend) return;', onData);
     const feed = wiring.indexOf('onPtyData(data)', fence);

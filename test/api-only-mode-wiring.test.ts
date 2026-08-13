@@ -445,7 +445,17 @@ describe('API-only bot mode — no-transport fs-policy authority provenance (wor
     // getLoadedConfigPath() is host-frozen; the worker must not re-guess from env.
     const block = region(workerPoolSource, 'apiOnly: botCfg.apiOnly,', 'brand: normalizeBrand(botCfg.brand),');
     expect(block).toContain('loadedBotsConfigPath: getLoadedConfigPath(),');
-    expect(workerPoolSource).toContain("import { getBot, getAllBots, loadBotConfigs, resolveBrandLabel, getLoadedConfigPath, resolveUsageDisplay }");
+    // ...and its PROVENANCE travels with it, so the child-pin decision is made
+    // from a host-owned fact instead of an existence probe (see config-dir.ts).
+    expect(block).toContain('loadedBotsConfigProvenance: getLoadedConfigProvenance(),');
+    // Assert the import contents, not one frozen line: pinning the exact string
+    // makes this fail on any unrelated addition to the same import.
+    const importLine = workerPoolSource.match(/import \{[^}]*\} from '\.\.\/bot-registry\.js';/)?.[0];
+    expect(importLine).toBeDefined();
+    for (const sym of ['getBot', 'getAllBots', 'loadBotConfigs', 'resolveBrandLabel',
+      'getLoadedConfigPath', 'getLoadedConfigProvenance', 'resolveUsageDisplay']) {
+      expect(importLine, `missing ${sym}`).toContain(sym);
+    }
   });
 });
 

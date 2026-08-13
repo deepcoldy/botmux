@@ -86,6 +86,18 @@ describe('redactGroupsForPublic', () => {
     ]);
   });
 
+  it('never leaks per-bot permission config even if a roster row starts carrying it', () => {
+    // p2pOpen (私聊对话全开) is admin-only Bot Defaults config. The roster today
+    // is built from botSummaryPayload, which does not carry it — this pins the
+    // allow-list so a future upstream change to the roster shape cannot make an
+    // anonymous visitor able to read which bots accept DMs from anyone.
+    const chats = sampleChats();
+    (chats[0].memberBots[0] as Record<string, unknown>).p2pOpen = true;
+    const out = redactGroupsForPublic(chats) as any[];
+    expect(out[0].memberBots[0]).not.toHaveProperty('p2pOpen');
+    expect(JSON.stringify(out)).not.toContain('p2pOpen');
+  });
+
   it('does not mutate the input (authed callers keep the original oncallChat/description)', () => {
     const input = sampleChats();
     redactGroupsForPublic(input);
@@ -237,6 +249,29 @@ describe('session presentation redaction', () => {
     const updated = redactSessionEventForPublic('session.update', updateBody) as any;
     expect(updated.patch).toEqual({ webPort: 3007 });
     expect(updateBody.patch.riffAccessUrl).toBe('https://def456.sandbox.example/term');
+  });
+
+  it('strips openTodos (task-state plaintext from transcripts) from anonymous REST rows and SSE bodies', () => {
+    // openTodos.items[].text is CLI transcript plaintext — equivalent to preview
+    // content. Anonymous read-only visitors must not receive it (they get no TODO
+    // badge); the field is entirely blacklisted, both in the full REST projection
+    // and in incremental SSE patches (where worker-pool publishes openTodos on
+    // every runtime status edge).
+    const todoSession = {
+      sessionId: 's-todo',
+      status: 'idle',
+      openTodos: { total: 3, done: 1, remaining: 2, hasInProgress: true, items: [{ status: 'in_progress', text: 'secret task text' }] },
+    };
+    const rest = redactSessionsForPublic([todoSession]) as any[];
+    expect(rest[0]).toEqual({ sessionId: 's-todo', status: 'idle' });
+    expect(todoSession.openTodos.remaining).toBe(2);
+
+    const spawned = redactSessionEventForPublic('session.spawned', { session: todoSession }) as any;
+    expect(spawned.session).not.toHaveProperty('openTodos');
+
+    const updateBody = { sessionId: 's-todo', patch: { status: 'working', openTodos: { total: 1, done: 0, remaining: 1, hasInProgress: false, items: [{ status: 'pending', text: 'x' }] } } };
+    const updated = redactSessionEventForPublic('session.update', updateBody) as any;
+    expect(updated.patch).toEqual({ status: 'working' });
   });
 
   it('fails closed for future preview-prefixed fields on anonymous REST and SSE surfaces', () => {

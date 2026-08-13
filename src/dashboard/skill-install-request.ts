@@ -105,24 +105,24 @@ export function parseDashboardSkillInstallRequest(body: Record<string, unknown>)
 }
 
 export async function discoverDashboardSkills(request: DashboardSkillInstallRequest): Promise<SkillSourceDiscovery> {
-  // agentbuddy resolves its own skill set — tell the UI to install directly
-  // (works for pasted `agentbuddy:` identifiers AND marketplace URLs, which the
-  // client can't recognize on its own since the parser is server-only).
+  // agentbuddy resolves its own skill set — tell the UI to install directly.
+  // Covers the canonical `agentbuddy:` identifiers and pasted agentbuddy
+  // install commands. Marketplace *URLs* are NOT supported: no parser exists
+  // for them, so they are classified as git remotes like any other URL.
   if (request.kind === 'agentbuddy') return { skills: [], directInstall: true };
-  if (request.kind === 'local') return discoverLocalSkillCandidates(request.value, { fullDepth: request.fullDepth });
-  if (request.kind === 'git') {
-    return discoverGitSkillCandidatesAsync({
-      url: request.url,
-      ref: request.ref,
-      path: request.path,
+  if (request.kind === 'local') {
+    return discoverLocalSkillCandidates(request.value, {
       fullDepth: request.fullDepth,
+      fallbackToFullDepth: !request.fullDepth,
     });
   }
+  const url = request.kind === 'git' ? request.url : githubToGitUrl(request.owner, request.repo);
   return discoverGitSkillCandidatesAsync({
-    url: githubToGitUrl(request.owner, request.repo),
+    url,
     ref: request.ref,
     path: request.path,
     fullDepth: request.fullDepth,
+    fallbackToFullDepth: !request.fullDepth,
   });
 }
 

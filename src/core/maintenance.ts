@@ -44,6 +44,7 @@ import {
   type GlobalInstallPlan,
 } from '../utils/global-install.js';
 import { withFileLockSync } from '../utils/file-lock.js';
+import { scrubWorkflowWorkerEnv } from '../utils/child-env.js';
 
 export interface MaintenanceState {
   /** Local date the auto-update run was last handled (fired or skipped). */
@@ -245,6 +246,10 @@ export function buildRestartLauncher(
 
 export function detachedRestartEnv(inheritedEnv: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
   const env = { ...inheritedEnv };
+  // Defense in depth for dashboard/daemon processes resurrected from a stale
+  // PM2 snapshot. `botmux restart` checks workflow mode before pm2Env(), so it
+  // must not inherit node-worker identity even if a host boot scrub regresses.
+  scrubWorkflowWorkerEnv(env);
   // The dashboard/daemon snapshot may outlive a ~/.botmux/.env edit. Let the
   // fresh CLI reload these settings from the file.
   //

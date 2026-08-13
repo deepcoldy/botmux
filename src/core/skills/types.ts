@@ -27,10 +27,33 @@ export interface SkillPackage {
   updatedAt?: string;
 }
 
-export type SkillSelector = `skill:${string}`;
+export type SkillSelector = `skill:${string}` | `pack:${string}`;
 
 export interface BotSkillPolicy {
   include?: SkillSelector[];
+}
+
+/** A reusable, named collection of `skill:*` references assigned to one or more
+ *  bots. Packs are declarative references — they do not copy skill files. At
+ *  session resolution time `pack:<id>` selectors are expanded into the member
+ *  `skill:*` selectors before the existing dedup / delivery pipeline runs. */
+export interface SkillPack {
+  id: string;
+  name: string;
+  description?: string;
+  tags?: string[];
+  /** Only `skill:*` selectors are allowed; packs cannot nest (no `pack:*`). */
+  include: Array<`skill:${string}`>;
+  /** Monotonically increasing on every content change; used for optimistic
+   *  concurrency control between dashboard tabs. */
+  revision: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface SkillPackRegistryFile {
+  schemaVersion: 1;
+  packs: Record<string, SkillPack>;
 }
 
 export interface ResolvedSkill extends SkillPackage {

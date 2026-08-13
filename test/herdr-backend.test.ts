@@ -949,6 +949,7 @@ describe('HerdrBackend message writing', () => {
     });
     expect(be.sendText('/goal x')).toBe(false);
     expect(be.sendSpecialKeys('Enter')).toBe(false);
+    expect(be.pasteText('/goal x')).toBe(false);
     be.kill();
   });
 

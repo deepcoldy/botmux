@@ -14,23 +14,42 @@ vi.mock('node:child_process', () => ({
   execSync: vi.fn(),
 }));
 
-vi.mock('node:fs', () => ({
-  existsSync: vi.fn(() => false),
-  readdirSync: vi.fn(() => []),
-  readFileSync: vi.fn(),
-  readlinkSync: vi.fn(),
-}));
+vi.mock('node:fs', async () => {
+  const actual = await vi.importActual<typeof import('node:fs')>('node:fs');
+  return {
+    ...actual,
+    existsSync: vi.fn(() => false),
+    readdirSync: vi.fn(() => []),
+    readFileSync: vi.fn(),
+    readlinkSync: vi.fn(),
+  };
+});
 
-vi.mock('node:os', () => ({
-  homedir: () => '/home/testuser',
-  // session-discovery 用 platform() 决定 Linux /proc 快路径 vs macOS ps/lsof 兜底。
-  // 既有 mock 数据全部按 Linux 形态准备，所以这里固定为 'linux'。
-  // macOS 兜底路径的覆盖见 test/session-discovery.smoke.test.ts。
-  platform: () => 'linux',
-}));
+vi.mock('node:os', async () => {
+  const actual = await vi.importActual<typeof import('node:os')>('node:os');
+  return {
+    ...actual,
+    homedir: () => '/home/testuser',
+    // session-discovery 用 platform() 决定 Linux /proc 快路径 vs macOS ps/lsof 兜底。
+    // 既有 mock 数据全部按 Linux 形态准备，所以这里固定为 'linux'。
+    // macOS 兜底路径的覆盖见 test/session-discovery.smoke.test.ts。
+    platform: () => 'linux',
+  };
+});
 
 import { execSync } from 'node:child_process';
-import { readFileSync, readlinkSync, existsSync, readdirSync } from 'node:fs';
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  readlinkSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import {
   discoverAdoptableSessions,
   discoverAdoptableSessionByTarget,
@@ -919,26 +938,47 @@ describe('discoverAdoptableSessions', () => {
   // the ~/.trae/cli/sessions layout.
 
   it('detects a TRAE (traex) CLI process and captures sessionId from the open rollout fd', () => {
-    setupMocks({
-      paneLines: 'work:0.0 9000\n',
-      commMap: { 9000: 'bash', 9001: 'traex' },
-      childMap: { 9000: [9001] },
-      cwdMap: { 9001: '/workspace/proj' },
-      dimsMap: { 'work:0.0': '120 30' },
-      procFdMap: {
-        9001: [
-          '/dev/null',
-          '/home/testuser/.trae/cli/sessions/2026/06/11/rollout-2026-06-11T10-00-00-8db7d911-96f3-4764-a310-e42ae4cb626f.jsonl',
-        ],
+    const sessionId = '8db7d911-96f3-4764-a310-e42ae4cb626f';
+    const root = mkdtempSync(join(tmpdir(), 'botmux-traex-discovery-'));
+    const rolloutDir = join(root, '.trae', 'cli', 'sessions', '2026', '06', '11');
+    const rolloutPath = join(
+      rolloutDir,
+      `rollout-2026-06-11T10-00-00-${sessionId}.jsonl`,
+    );
+    mkdirSync(rolloutDir, { recursive: true });
+    writeFileSync(rolloutPath, `${JSON.stringify({
+      timestamp: '2026-06-11T10:00:00.000Z',
+      type: 'session_meta',
+      payload: {
+        id: sessionId,
+        timestamp: '2026-06-11T10:00:00.000Z',
+        cwd: '/workspace/proj',
+        source: 'cli',
+        thread_source: 'user',
       },
-    });
+    })}\n`);
 
-    const results = discoverAdoptableSessions();
+    try {
+      setupMocks({
+        paneLines: 'work:0.0 9000\n',
+        commMap: { 9000: 'bash', 9001: 'traex' },
+        childMap: { 9000: [9001] },
+        cwdMap: { 9001: '/workspace/proj' },
+        dimsMap: { 'work:0.0': '120 30' },
+        procFdMap: {
+          9001: ['/dev/null', rolloutPath],
+        },
+      });
 
-    expect(results).toHaveLength(1);
-    expect(results[0]!.cliId).toBe('traex');
-    expect(results[0]!.cwd).toBe('/workspace/proj');
-    expect(results[0]!.sessionId).toBe('8db7d911-96f3-4764-a310-e42ae4cb626f');
+      const results = discoverAdoptableSessions();
+
+      expect(results).toHaveLength(1);
+      expect(results[0]!.cliId).toBe('traex');
+      expect(results[0]!.cwd).toBe('/workspace/proj');
+      expect(results[0]!.sessionId).toBe(sessionId);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   it('returns traex discovery without sessionId when no rollout fd is open', () => {

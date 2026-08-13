@@ -186,7 +186,10 @@ describe('worker pipe initial screen ordering', () => {
     const idleStart = source.search(/idleDetector\.onIdle\(async \(/);
     const idleEnd = source.indexOf('observedBackend.onData((data) =>', idleStart);
     const idle = source.slice(idleStart, idleEnd);
-    const deferIdx = idle.indexOf("deferPromptReadyWhileBusy(`${cliName()} screen-idle`, idleBackend)");
+    // The defer label is templated by evidence source (`screen-idle` /
+    // `external-idle`) since Pi's transcript final is guarded by the same
+    // helper; pin the call itself and its ordering before the ready drain.
+    const deferIdx = idle.indexOf("deferPromptReadyWhileBusy(`${cliName()} ${evidenceSource}-idle`, idleBackend)");
     const drainIdx = idle.indexOf('drainBridgesThenMarkReady(evidenceSource);');
     const adoptStart = source.indexOf('function setupAdoptIdleDetection');
     const adoptEnd = source.indexOf('function seedBackendScreen', adoptStart);

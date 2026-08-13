@@ -380,6 +380,232 @@ describe('RiffBackend', () => {
     });
   });
 
+  describe('stdout log line separation (finding: app_server char-wall)', () => {
+    // riff ships each stdout log line BARE (no trailing newline). The relay must
+    // re-add a separator per log event, else consecutive events concatenate into
+    // one unreadable "wall" — the exact symptom seen with codex_app_server, whose
+    // stdout logs are one JSON.stringify(event) per line (thread.started, etc).
+    it('separates consecutive stdout log events instead of concatenating them', () => {
+      const be = makeBackend({ injectStatusLines: false });
+      const lines: string[] = [];
+      be.onData(d => lines.push(d));
+      (be as any).currentTaskId = 'task-1';
+      // Use content-bearing lines (not thread.started/turn.started lifecycle
+      // markers — those are now suppressed by the route-B noise backstop). The
+      // char-wall invariant under test is: consecutive bare stdout lines get a
+      // separator, never butt together into `}{`.
+      (be as any).handleSseEvent('event:log\ndata:{"group":"stdout","text":"{\\"type\\":\\"item.completed\\",\\"n\\":1}"}', 'task-1');
+      (be as any).handleSseEvent('event:log\ndata:{"group":"stdout","text":"{\\"type\\":\\"item.completed\\",\\"n\\":2}"}', 'task-1');
+      const out = lines.join('');
+      // The two events must not butt together (…}{… would be the wall).
+      expect(out).not.toContain('}{');
+      // Each event renders on its own line (emitText normalizes \n → \r\n).
+      expect(out).toContain('{"type":"item.completed","n":1}\r\n');
+      expect(out).toContain('{"type":"item.completed","n":2}\r\n');
+    });
+
+    it('does not double-space a stdout log (bare line + exactly one separator)', () => {
+      const be = makeBackend({ injectStatusLines: false });
+      const lines: string[] = [];
+      be.onData(d => lines.push(d));
+      (be as any).currentTaskId = 'task-1';
+      (be as any).handleSseEvent('event:log\ndata:{"group":"stdout","text":"hello"}', 'task-1');
+      expect(lines.join('')).toBe('hello\r\n');
+    });
+
+    it('leaves the output/chunk path raw (chunks may be partial lines)', () => {
+      const be = makeBackend({ injectStatusLines: false });
+      const lines: string[] = [];
+      be.onData(d => lines.push(d));
+      (be as any).currentTaskId = 'task-1';
+      (be as any).handleSseEvent('event:output\ndata:{"chunk":"par"}', 'task-1');
+      (be as any).handleSseEvent('event:output\ndata:{"chunk":"tial"}', 'task-1');
+      // No synthetic newline injected between chunks — they join seamlessly.
+      expect(lines.join('')).toBe('partial');
+    });
+  });
+
+  describe('route-B display projection (feat/riff-agent-log-display)', () => {
+    // riff attaches a per-line `display: TaskLogDisplay` on stdout log events —
+    // a human-readable projection of a codex app-server event. We render a
+    // timeline row from it instead of the raw JSON line.
+    const logEvt = (payload: Record<string, unknown>) =>
+      `event:log\ndata:${JSON.stringify(payload)}`;
+
+    it('renders an agent_message display as a [回答] row, not raw JSON', () => {
+      const be = makeBackend({ injectStatusLines: false });
+      const lines: string[] = [];
+      be.onData(d => lines.push(d));
+      (be as any).currentTaskId = 'task-1';
+      (be as any).handleSseEvent(
+        logEvt({ group: 'stdout', text: '{"type":"item.completed",...}', display: { kind: 'message', title: '回答', text: 'Hello there' } }),
+        'task-1',
+      );
+      const out = lines.join('');
+      expect(out).toContain('[回答] Hello there');
+      // The raw JSON `text` is NOT emitted when a display projection exists.
+      expect(out).not.toContain('item.completed');
+    });
+
+    it('renders a completed command as [命令] <cmd> (exit 0) in green (no output case)', () => {
+      const be = makeBackend({ injectStatusLines: false });
+      const lines: string[] = [];
+      be.onData(d => lines.push(d));
+      (be as any).currentTaskId = 'task-1';
+      // A command with no captured output: riff omits `text`, so header only.
+      (be as any).handleSseEvent(
+        logEvt({ group: 'stdout', text: '{}', display: { kind: 'command', title: '命令执行', command: 'ls -la', status: 'completed', exitCode: 0, summary: '命令执行完成' } }),
+        'task-1',
+      );
+      const out = lines.join('');
+      expect(out).toContain('[命令执行] ls -la (exit 0)');
+      expect(out).toContain('\x1b[32m'); // green for exit 0
+      // MUST NOT print `summary` ('命令执行完成') as a fake output line.
+      expect(out).not.toContain('命令执行完成');
+    });
+
+    it('renders captured command output (riff folds stdout into display.text) below the header', () => {
+      const be = makeBackend({ injectStatusLines: false });
+      const lines: string[] = [];
+      be.onData(d => lines.push(d));
+      (be as any).currentTaskId = 'task-1';
+      // riff's collapseCommandOutputIntoPrimary puts the real stdout in `text`.
+      (be as any).handleSseEvent(
+        logEvt({ group: 'stdout', text: '{}', display: { kind: 'command', title: '命令执行', command: 'echo hello', status: 'completed', exitCode: 0, summary: '命令执行完成', text: 'hello' } }),
+        'task-1',
+      );
+      const out = lines.join('');
+      expect(out).toContain('[命令执行] echo hello (exit 0)');
+      expect(out).toContain('hello'); // the real output IS rendered
+      expect(out).not.toContain('命令执行完成'); // summary still never rendered
+    });
+
+    it('renders multi-line command output verbatim with CRLF normalization', () => {
+      const be = makeBackend({ injectStatusLines: false });
+      const lines: string[] = [];
+      be.onData(d => lines.push(d));
+      (be as any).currentTaskId = 'task-1';
+      (be as any).handleSseEvent(
+        logEvt({ group: 'stdout', text: '{}', display: { kind: 'command', title: '命令', command: 'ls', status: 'completed', exitCode: 0, text: 'file1\nfile2' } }),
+        'task-1',
+      );
+      const out = lines.join('');
+      expect(out).toContain('file1\r\nfile2');
+      expect(out).not.toMatch(/[^\r]\n/); // no bare LF (would stair-step)
+    });
+
+    it('renders a failed command in red with its exit code', () => {
+      const be = makeBackend({ injectStatusLines: false });
+      const lines: string[] = [];
+      be.onData(d => lines.push(d));
+      (be as any).currentTaskId = 'task-1';
+      (be as any).handleSseEvent(
+        logEvt({ group: 'stdout', text: '{}', display: { kind: 'command', title: '命令', command: 'false', status: 'failed', exitCode: 2, summary: '命令执行失败' } }),
+        'task-1',
+      );
+      const out = lines.join('');
+      expect(out).toContain('[命令] false (exit 2)');
+      expect(out).toContain('\x1b[31m'); // red
+      expect(out).not.toContain('命令执行失败'); // summary not printed as output
+    });
+
+    it('does NOT color a still-running command green (no exit code yet)', () => {
+      const be = makeBackend({ injectStatusLines: false });
+      const lines: string[] = [];
+      be.onData(d => lines.push(d));
+      (be as any).currentTaskId = 'task-1';
+      (be as any).handleSseEvent(
+        logEvt({ group: 'stdout', text: '{}', display: { kind: 'command', title: '命令', command: 'sleep 5', status: 'running' } }),
+        'task-1',
+      );
+      const out = lines.join('');
+      expect(out).toContain('[命令] sleep 5');
+      expect(out).not.toContain('(exit'); // no exit code segment while running
+      expect(out).not.toContain('\x1b[32m'); // NOT green while running
+    });
+
+    it('dims reasoning/usage rows (actual ANSI dim, not a no-op)', () => {
+      const be = makeBackend({ injectStatusLines: false });
+      const lines: string[] = [];
+      be.onData(d => lines.push(d));
+      (be as any).currentTaskId = 'task-1';
+      (be as any).handleSseEvent(
+        logEvt({ group: 'stdout', text: '{}', display: { kind: 'reasoning', title: '思路', text: 'thinking...' } }),
+        'task-1',
+      );
+      const out = lines.join('');
+      expect(out).toContain('[思路] thinking...');
+      expect(out).toContain('\x1b[2m'); // faint
+    });
+
+    it('does not double-space consecutive display rows', () => {
+      const be = makeBackend({ injectStatusLines: false });
+      const lines: string[] = [];
+      be.onData(d => lines.push(d));
+      (be as any).currentTaskId = 'task-1';
+      (be as any).handleSseEvent(logEvt({ group: 'stdout', text: '{}', display: { kind: 'message', title: '回答', text: 'A' } }), 'task-1');
+      (be as any).handleSseEvent(logEvt({ group: 'stdout', text: '{}', display: { kind: 'message', title: '回答', text: 'B' } }), 'task-1');
+      const out = lines.join('');
+      // No blank line between the two rows: no CRLFCRLF anywhere in the stream.
+      expect(out).not.toContain('\r\n\r\n');
+    });
+
+    it('normalizes internal newlines in a multi-line display body (no stair-step)', () => {
+      const be = makeBackend({ injectStatusLines: false });
+      const lines: string[] = [];
+      be.onData(d => lines.push(d));
+      (be as any).currentTaskId = 'task-1';
+      (be as any).handleSseEvent(
+        logEvt({ group: 'stdout', text: '{}', display: { kind: 'tool', title: '工具调用', text: 'line1\nline2' } }),
+        'task-1',
+      );
+      const out = lines.join('');
+      // Every newline in the emitted row is a CRLF — no bare \n left to stair-step.
+      expect(out).not.toMatch(/[^\r]\n/);
+      expect(out).toContain('line1\r\nline2');
+    });
+
+    it('falls back to raw line (with separator) when display is absent (#805)', () => {
+      const be = makeBackend({ injectStatusLines: false });
+      const lines: string[] = [];
+      be.onData(d => lines.push(d));
+      (be as any).currentTaskId = 'task-1';
+      (be as any).handleSseEvent(logEvt({ group: 'stdout', text: 'plain shell output' }), 'task-1');
+      expect(lines.join('')).toBe('plain shell output\r\n');
+    });
+
+    it('defensively suppresses a bare codex noise line that slipped through un-projected', () => {
+      const be = makeBackend({ injectStatusLines: false });
+      const lines: string[] = [];
+      be.onData(d => lines.push(d));
+      (be as any).currentTaskId = 'task-1';
+      // No display + a bare lifecycle event = riff would normally have downgraded
+      // it to channel:'raw'; if it slips through, we must not re-wall.
+      (be as any).handleSseEvent(logEvt({ group: 'stdout', text: '{"type":"thread.started","thread_id":"t1"}' }), 'task-1');
+      expect(lines.join('')).toBe('');
+    });
+
+    it('suppresses response.completed / response.done noise (kept in sync with riff)', () => {
+      const be = makeBackend({ injectStatusLines: false });
+      const lines: string[] = [];
+      be.onData(d => lines.push(d));
+      (be as any).currentTaskId = 'task-1';
+      (be as any).handleSseEvent(logEvt({ group: 'stdout', text: '{"type":"response.completed"}' }), 'task-1');
+      (be as any).handleSseEvent(logEvt({ group: 'stdout', text: '{"type":"response.done"}' }), 'task-1');
+      expect(lines.join('')).toBe('');
+    });
+
+    it('does NOT suppress plain output that merely contains braces', () => {
+      const be = makeBackend({ injectStatusLines: false });
+      const lines: string[] = [];
+      be.onData(d => lines.push(d));
+      (be as any).currentTaskId = 'task-1';
+      (be as any).handleSseEvent(logEvt({ group: 'stdout', text: '{"result": 42} done' }), 'task-1');
+      // Not a bare codex lifecycle event → passes through as normal output.
+      expect(lines.join('')).toBe('{"result": 42} done\r\n');
+    });
+  });
+
   describe('task isolation (finding F)', () => {
     it('stale stream events are inert once a newer task is current', () => {
       const be = makeBackend({ injectStatusLines: false });

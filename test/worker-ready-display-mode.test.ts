@@ -668,6 +668,42 @@ describe('Worker ready: set_display_mode re-sync', () => {
     expect(ds.streamCardPending).toBe(false);
   });
 
+  it('does not let an older ready POST consume a newer turn pending state', async () => {
+    let resolveFirst!: (messageId: string) => void;
+    sessionReplyMock
+      .mockImplementationOnce(() => new Promise<string>(resolve => { resolveFirst = resolve; }))
+      .mockResolvedValueOnce('om_newer_card');
+    const fakeWorker = makeFakeWorker();
+    const ds = makeDs({
+      streamCardPending: true,
+      streamCardId: undefined,
+      streamCardTurnGeneration: 1,
+      streamCardPendingTurnId: 'om_turn_1',
+      worker: fakeWorker,
+    });
+
+    __testOnly_setupWorkerHandlers(ds, fakeWorker);
+    fakeWorker.emit('message', {
+      type: 'ready', port: 9999, token: 'tok_abc', turnId: 'om_turn_1',
+    });
+    await flush();
+    expect(ds.streamCardId).toBe(CARD_POSTING_SENTINEL);
+
+    ds.streamCardPending = true;
+    ds.streamCardTurnGeneration = 2;
+    ds.streamCardPendingTurnId = 'om_turn_2';
+    ds.currentTurnTitle = 'newer turn';
+    resolveFirst('om_older_card');
+    await flush();
+    await flush();
+
+    expect(sessionReplyMock).toHaveBeenCalledTimes(2);
+    expect(sessionReplyMock.mock.calls[1][4]).toBe('om_turn_2');
+    expect(ds.streamCardId).toBe('om_newer_card');
+    expect(ds.streamCardPending).toBe(false);
+    expect(ds.streamCardPendingTurnId).toBeUndefined();
+  });
+
   it('patches the active card when cli_session_id makes local resume ready', async () => {
     const fakeWorker = makeFakeWorker();
     const ds = makeDs({

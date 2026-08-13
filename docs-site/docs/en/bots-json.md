@@ -141,7 +141,7 @@ You can also add it to the corresponding bot entry directly (manual `bots.json` 
 
 | Field | Description |
 |------|------|
-| `allowedUsers` | The operate-permission list (**full email** or `ou_xxx`). When `allowedChatGroups` is configured, at least one is required to serve as owner |
+| `allowedUsers` | The operate-permission list. Prefer a **full email**, mobile number, or `on_xxx`; an `ou_xxx` is valid only for the same app that issued it and must never be copied across Bots. When `allowedChatGroups` is configured, at least one is required to serve as owner |
 | `allowedChatGroups` | Conversable groups (`oc_xxx`). Any member of the group can converse (only `canTalk`); sensitive operations are still controlled by `allowedUsers` |
 | `p2pOpen` | When `true`, any user within the Lark app's availability scope may DM this bot (only `canTalk`). Group behavior is unchanged and sensitive operations still require `allowedUsers`. Always configure at least one `allowedUsers` owner |
 | `oncallChats` | Oncall bindings, `[{ "chatId": "oc_xxx", "workingDir": "~/projects/foo" }]`. See [oncall](/en/oncall) |
@@ -183,6 +183,44 @@ You can also add it to the corresponding bot entry directly (manual `bots.json` 
 | `autoStartOnGroupJoin` | When `true`, the bot starts working automatically when added to a new group containing at least one `allowedUsers` member (no @ needed). Requires subscribing the `im.chat.member.bot.added_v1` event for this app in the Lark admin console |
 | `autoStartOnGroupJoinPrompt` | Paired with the above: the first-round prompt for proactive start; if empty / blank, opens with an empty message and lets the bot read the group context itself. Meaningless when `autoStartOnGroupJoin` is off |
 | `autoStartOnNewTopic` | When `true`, the first message of every new topic in a topic group starts working automatically without an @ (no effect in plain groups). Defaults to passive (only @ triggers) |
+
+## Group message listener
+
+Have a bot **actively watch a group**: matching group messages start a session automatically, no @ required. The classic use is **alert operations** — your monitoring/alerting system usually already has its own Lark bot posting alerts into a group, so just add this bot to that group and enable the listener; every alert triggers an investigation session, with no need to set up a separate [Webhook integration point](/en/webhook).
+
+Configure it per-group in the **Dashboard "Roles → Message Listener"** tab (with **Preview** of the last 24h of matches and a **dry run** to validate); or write `messageListeners` directly in `bots.json` (keyed by `chat_id`, valued by the config below):
+
+| Field | Description |
+|------|------|
+| `enabled` | Whether the listener is on for this chat. `prompt` is required when enabled, otherwise the whole entry is ignored |
+| `prompt` | Listener prompt: tells the bot which messages to handle and how to reply. A matched message is replied to in a **new topic beneath it** |
+| `name` | Listener name (optional), e.g. "Alert listener", shown in the Dashboard |
+| `replyCardTitle` | Reply card title (optional); blank uses the default |
+| `workingDir` | Working directory for sessions this listener starts (optional); blank uses the bot's default |
+| `senderPolicy.mode` | `all_except_excluded` (blacklist, default): handle every matching sender type except the excluded ones; `include_only` (whitelist): handle only the senders in `includeSenderOpenIds` |
+| `senderPolicy.includeSenderTypes` | Sender types to listen to: `["user"]` / `["bot"]` / both. **Listening to a third-party alert bot must include `"bot"`** |
+| `senderPolicy.includeSenderOpenIds` / `excludeSenderOpenIds` | Exact whitelist / blacklist by `open_id` |
+| `senderPolicy.excludeSelf` | Default `true`; always excludes the bot's own messages (prevents self-triggering) |
+| `messagePolicy.includeMsgTypes` | Message types to listen to; defaults to text + rich text (`post`) |
+
+```json
+{
+  "messageListeners": {
+    "oc_xxxxxxxxxxxxxxxx": {
+      "enabled": true,
+      "name": "Alert listener",
+      "prompt": "Every alert in this group is a production event. Identify the affected service and give an initial investigation direction; if it's a false alarm, explain why.",
+      "senderPolicy": { "mode": "all_except_excluded", "includeSenderTypes": ["bot"] }
+    }
+  }
+}
+```
+
+Conventions and limits (V1):
+
+- **Top-level group messages only**: ordinary replies inside an existing topic are not handled; a message that explicitly @s this bot still goes through normal @ routing (no double trigger).
+- **One session per matched message**, replied to in a new topic beneath it.
+- **Delivery**: the realtime event path covers messages Lark pushes; **messages from other bots, and non-@ messages, are backfilled by a history poll roughly every 30s** (so up to ~30s of latency). That's why listening to a third-party alert bot works most reliably in blacklist mode (`all_except_excluded` + include `"bot"`) — whitelist matches by `open_id`, but the history API reports third-party bots by `app_id`, which may not resolve to an `open_id` and therefore won't match.
 
 ## Summary command
 
