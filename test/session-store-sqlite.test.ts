@@ -11,6 +11,7 @@
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, mkdirSync, writeFileSync, existsSync, readFileSync, rmSync } from 'fs';
+import { spawn } from 'node:child_process';
 import { join } from 'path';
 import { tmpdir } from 'os';
 
@@ -104,7 +105,7 @@ describe('first-start JSON import', () => {
     // repairMissingChatScope 发生在导入期
     expect(imported.broken.scope).toBe('chat');
     // .db 落位，JSON 原地冻结（一个字节都不动）
-    expect(existsSync(join(tempDir, 'sessions-appA.db'))).toBe(true);
+    expect(existsSync(join(tempDir, 'session-stores', 'appA', 'sessions.db'))).toBe(true);
     expect(readFileSync(jsonFp, 'utf-8')).toBe(jsonBefore);
   });
 
@@ -117,7 +118,7 @@ describe('first-start JSON import', () => {
 
     init('app-A');
     expect(listSessions().map(s => s.sessionId)).toEqual(['a1']);
-    expect(existsSync(join(tempDir, 'sessions-app-A.db'))).toBe(true);
+    expect(existsSync(join(tempDir, 'session-stores', 'app-A', 'sessions.db'))).toBe(true);
     // 旧行为会把行迁移写进 sessions-app-A.json；现在 JSON 全部冻结
     expect(existsSync(join(tempDir, 'sessions-app-A.json'))).toBe(false);
     expect(readFileSync(legacyFp, 'utf-8')).toBe(legacyBefore);
@@ -137,14 +138,15 @@ describe('first-start JSON import', () => {
 
   it('publishes the store atomically: no .db.tmp survives, and stale tmp leftovers are replaced', () => {
     // 上次导入中途崩溃的残留 tmp（垃圾内容）不得阻塞、也不得泄漏进结果
-    mkdirSync(tempDir, { recursive: true });
-    writeFileSync(join(tempDir, 'sessions-appA.db.tmp'), 'garbage from a crashed import');
+    const storeDir = join(tempDir, 'session-stores', 'appA');
+    mkdirSync(storeDir, { recursive: true });
+    writeFileSync(join(storeDir, 'sessions.db.tmp'), 'garbage from a crashed import');
     seedJson('sessions-appA.json', { s1: row('s1') });
 
     init('appA');
     expect(getSession('s1')?.title).toBe('s1');
-    expect(existsSync(join(tempDir, 'sessions-appA.db'))).toBe(true);
-    expect(existsSync(join(tempDir, 'sessions-appA.db.tmp'))).toBe(false);
+    expect(existsSync(join(storeDir, 'sessions.db'))).toBe(true);
+    expect(existsSync(join(storeDir, 'sessions.db.tmp'))).toBe(false);
   });
 
   it('daemon writes after import go to the .db only — the frozen JSON never changes again', () => {
@@ -168,12 +170,12 @@ describe('first-start JSON import', () => {
 
     init('appA', { owner: false });
     expect(getSession('s1')?.title).toBe('s1'); // 读 JSON 照常
-    expect(existsSync(join(tempDir, 'sessions-appA.db'))).toBe(false);
+    expect(existsSync(join(tempDir, 'session-stores', 'appA', 'sessions.db'))).toBe(false);
 
     // daemon（owner）随后启动才导入
     init('appA');
     expect(getSession('s1')?.title).toBe('s1');
-    expect(existsSync(join(tempDir, 'sessions-appA.db'))).toBe(true);
+    expect(existsSync(join(tempDir, 'session-stores', 'appA', 'sessions.db'))).toBe(true);
   });
 });
 
@@ -288,6 +290,51 @@ describe('mixed-window db-else-json resolution', () => {
     );
     expect(published?.status).toBe('closed');
     expect(published?.workerGeneration).toBe(7);
+  });
+});
+
+// ─── cutover 竞态：daemon 首次 load × 在途离线写者 ───────────────────────────
+
+describe('first-load serialization against an in-flight offline writer', () => {
+  it('load blocks on a held BEGIN IMMEDIATE and reads the post-commit row (lost-update regression)', async () => {
+    // 复现评审时序：离线 CLI 已通过双 abortIf 探测、持有 BEGIN IMMEDIATE 且改了
+    // 行但未 commit；daemon 此刻首次 load。纯 SELECT 不被写事务排斥——若 load
+    // 不进排他事务，会把 commit 前的旧行读进终身缓存，稍后的行写回覆盖 CLI 的
+    // 提交。修复后 load 的排他读必须等 CLI commit，读到新值。
+    seedJson('sessions-appA.json', { s1: row('s1', { larkAppId: 'appA' }) });
+    init('appA');
+    listSessions(); // 触发导入 → .db
+    init();         // 释放连接，模拟 daemon 尚未启动
+    const dbPath = join(tempDir, 'session-stores', 'appA', 'sessions.db');
+
+    const child = spawn(process.execPath, ['-e', `
+      const { DatabaseSync } = require('node:sqlite');
+      const db = new DatabaseSync(${JSON.stringify(dbPath)});
+      db.exec('PRAGMA busy_timeout = 3000');
+      db.exec('BEGIN IMMEDIATE');
+      const current = JSON.parse(db.prepare('SELECT row FROM sessions WHERE session_id = ?').get('s1').row);
+      current.title = 'offline-cli-write';
+      db.prepare('UPDATE sessions SET row = ? WHERE session_id = ?').run(JSON.stringify(current), 's1');
+      process.stdout.write('HELD\\n'); // 已持写锁 + 已过双探测的时刻
+      setTimeout(() => { db.exec('COMMIT'); db.close(); }, 600);
+    `], { stdio: ['ignore', 'pipe', 'inherit'] });
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error('offline writer never signalled HELD')), 5000);
+        child.stdout!.on('data', (chunk: Buffer) => {
+          if (chunk.toString().includes('HELD')) { clearTimeout(timer); resolve(); }
+        });
+        child.once('exit', (code) => { clearTimeout(timer); reject(new Error(`writer exited early (${code})`)); });
+      });
+
+      init('appA');
+      const t0 = Date.now();
+      const loaded = getSession('s1'); // 首次 load：排他读必须等 COMMIT
+      expect(loaded?.title).toBe('offline-cli-write');
+      expect(Date.now() - t0).toBeGreaterThanOrEqual(300); // 确实等待了，而非读旧行
+    } finally {
+      try { child.kill('SIGKILL'); } catch { /* already gone */ }
+    }
   });
 });
 

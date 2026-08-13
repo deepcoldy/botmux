@@ -98,7 +98,7 @@ function makeTempDir(): string {
 import { DatabaseSync } from 'node:sqlite';
 
 function persistedStorePath(dir: string, appId?: string): string | undefined {
-  const dbPath = join(dir, appId ? `sessions-${appId}.db` : 'sessions.db');
+  const dbPath = appId ? join(dir, 'session-stores', appId, 'sessions.db') : join(dir, 'sessions.db');
   if (existsSync(dbPath)) return dbPath;
   const jsonPath = join(dir, appId ? `sessions-${appId}.json` : 'sessions.json');
   return existsSync(jsonPath) ? jsonPath : undefined;

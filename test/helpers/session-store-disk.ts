@@ -9,7 +9,7 @@ import { DatabaseSync } from 'node:sqlite';
 
 function storePaths(dataDir: string, appId?: string): { db: string; json: string } {
   return {
-    db: join(dataDir, appId ? `sessions-${appId}.db` : 'sessions.db'),
+    db: appId ? join(dataDir, 'session-stores', appId, 'sessions.db') : join(dataDir, 'sessions.db'),
     json: join(dataDir, appId ? `sessions-${appId}.json` : 'sessions.json'),
   };
 }
