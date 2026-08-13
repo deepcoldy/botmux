@@ -82,6 +82,7 @@ import {
 } from '../adapters/backend/session-backend-selector.js';
 import { isRemoteBackendType, isRiffBackendSession, isSuspendableBackendType, getSessionPersistentBackendType, persistentBackendTargetForSession, persistentSessionName, killPersistentBackendTarget, killPersistentSession, managedTargetsForCliChange, probePersistentBackendTarget, resolvePairedSpawnBackendType, resolvePersistentBackendTarget } from './persistent-backend.js';
 import { withBotTurnMutation } from './bot-turn-mutation-gate.js';
+import { recordQuarantinedLauncherEnvKeys } from './mojo-launcher-env-quarantine.js';
 import { freezeMojoIdentityForSession } from './mojo-session-identity.js';
 import { getBot, getAllBots, loadBotConfigs, resolveBrandLabel, getLoadedConfigPath, getLoadedConfigProvenance, resolveUsageDisplay } from '../bot-registry.js';
 import { RestartCoordinator, type RestartObserver } from './restart-coordinator.js';
@@ -2763,6 +2764,22 @@ export function rememberAppliedUnprovableEnvKeys(
   if (keys.length === 0) return;
   const merged = new Set([...(ds.mojoAppliedUnprovableEnvKeys ?? []), ...keys]);
   ds.mojoAppliedUnprovableEnvKeys = [...merged];
+  // Also persist, because the in-memory ledger cannot answer the question after
+  // a daemon restart or an explicit /close: the SIGTERM-ed mojo child (and any
+  // detached descendants) can outlive both, while still holding an activated
+  // credential. The durable record is keyed by session id and never retracted.
+  const sessionId = ds.session?.sessionId;
+  if (sessionId) {
+    recordQuarantinedLauncherEnvKeys(sessionId, keys);
+  } else {
+    // Cannot key the durable record without a session id. Never swallow this:
+    // silently keeping the risk in memory only is the fail-open direction, and
+    // this branch should be unreachable for a real DaemonSession.
+    logger.error(
+      '[mojo-quarantine] refusing to lose an unprovable launcher env: session id missing'
+      + ` (keys: ${keys.join(', ')})`,
+    );
+  }
 }
 
 /** Join or start one correlated physical restart for a session. */

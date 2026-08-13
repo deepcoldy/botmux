@@ -15,6 +15,7 @@ import type {
 } from '../adapters/backend/types.js';
 import { deviceCredentialIsolationMarkerPath } from '../adapters/cli/read-isolation.js';
 import { getBot } from '../bot-registry.js';
+import { quarantinedLauncherEnvKeys, quarantinedSessionIds } from './mojo-launcher-env-quarantine.js';
 import { config } from '../config.js';
 import { isMojoFullyRemote } from '../adapters/backend/sandbox.js';
 import { readSecureHostFileSync } from '../platform/secure-host-file.js';
@@ -53,11 +54,23 @@ export type DeviceIsolationBlocker =
   | 'stale_attestation'
   | 'process_identity_unavailable'
   | 'backend_probe_unknown'
-  | 'backend_inconsistent';
+  | 'backend_inconsistent'
+  /**
+   * A durable mojo launcher-env quarantine record with no session row left.
+   *
+   * An explicit `/close` deletes the row, but the mojo child it SIGTERM-ed was
+   * never proven dead (no escalation, no wait, possible detached descendants).
+   * Without this the inventory silently loses the only evidence that a hooked
+   * client may still hold an activated credential on this host.
+   */
+  | 'mojo_launcher_env_residual';
 
 export interface DeviceIsolationRuntimeSession {
   sessionId: string;
   adopted: boolean;
+  /** Present only for a session re-admitted from the durable quarantine record
+   *  because no row survives (see appendResidualMojoLauncherEnvSessions). */
+  mojoLauncherEnvResidual?: boolean;
   /** Backend stamped by daemon-owned state, if this session predates no stamp. */
   frozenBackend?: BackendType;
   /** Exact worker-selected persistent resource. Shared Herdr carries both the
@@ -198,6 +211,22 @@ export function resolveRemoteExecutionProven(ds: DaemonSession): boolean {
   // boundary: for a cloud bot with sandbox off it is the ONLY guard, so the
   // worker's sandbox gate cannot be relied on as a backstop.
   const wrapperCli = ds.initConfig?.wrapperCli ?? ds.session.wrapperCli;
+  // Every unprovable launcher-env key this SESSION is known to have been handed,
+  // from all three sources that can each miss the others:
+  //   - the current worker generation's in-memory ledger
+  //   - generations parked by a double-fork whose child was never proven dead
+  //   - the DURABLE record, which is the only one that survives a daemon restart
+  //     or an explicit /close (both of which can outlive a hooked mojo child)
+  // Shared by all three branches below: the workerless and legacy paths used to
+  // ignore the ledger entirely, so a session reaching them was classified
+  // safe_remote no matter what env its child had been given.
+  const sessionUnprovableEnvKeys = [
+    ...(ds.mojoAppliedUnprovableEnvKeys ?? []),
+    ...(ds.mojoRetiringUnprovableEnvKeys ?? []),
+    ...quarantinedLauncherEnvKeys(ds.session.sessionId),
+  ];
+  // Keys only, so a placeholder value is fine: the proof never reads values.
+  const ledgerEnv = Object.fromEntries(sessionUnprovableEnvKeys.map((k) => [k, '1']));
   const fromInit = ds.initConfig?.backendConfig as
     { cloud?: boolean; localDaemon?: boolean; jwtEnv?: string; env?: Record<string, string> }
     | undefined;
@@ -245,24 +274,12 @@ export function resolveRemoteExecutionProven(ds: DaemonSession): boolean {
       // workerless branch below).
       return false;
     }
-    // Keys only, so a placeholder value is fine: the proof never reads values.
-    // Both ledger layers are folded in: the current generation's, and any parked
-    // from a generation whose worker has not been observed to exit. The latter
-    // matters because forkWorker's double-fork guard only SENDS close/kill and
-    // then spawns the replacement synchronously — so a hooked old child can still
-    // be running while the new generation's own ledger is empty.
-    const appliedKeyEnv = Object.fromEntries(
-      [
-        ...(ds.mojoAppliedUnprovableEnvKeys ?? []),
-        ...(ds.mojoRetiringUnprovableEnvKeys ?? []),
-      ].map((k) => [k, '1']),
-    );
     return isMojoFullyRemote({
       ...fromInit,
       env: {
         ...liveTopLevelEnv,
         ...(ds.initConfig?.env ?? {}),
-        ...appliedKeyEnv,
+        ...ledgerEnv,
         ...(fromInit.env ?? {}),
       },
       wrapperCli,
@@ -276,7 +293,11 @@ export function resolveRemoteExecutionProven(ds: DaemonSession): boolean {
       const cfg = getBot(ds.larkAppId).config;
       liveLauncher = {
         jwtEnv: cfg.mojo?.jwtEnv,
-        env: { ...(cfg.env ?? {}), ...(cfg.mojo?.env ?? {}) },
+        // The ledger is folded in here too. A workerless session still has a
+        // remote session that /close must cancel, and the env its last child ran
+        // with is exactly what decides whether a local hook could be holding the
+        // credential right now.
+        env: { ...(cfg.env ?? {}), ...(cfg.mojo?.env ?? {}), ...ledgerEnv },
       };
     } catch {
       return false;
@@ -290,9 +311,10 @@ export function resolveRemoteExecutionProven(ds: DaemonSession): boolean {
     const botCfg = getBot(ds.larkAppId).config;
     return isMojoFullyRemote({
       ...botCfg.mojo,
-      // Same two-layer merge as the other branches — top-level botCfg.env is peer
-      // to the mojo block, so omitting it leaked PATH / LD_PRELOAD here too.
-      env: { ...(botCfg.env ?? {}), ...(botCfg.mojo?.env ?? {}) },
+      // Same layering as the other branches — top-level botCfg.env is peer to the
+      // mojo block (omitting it leaked PATH / LD_PRELOAD here too), and the
+      // ledger covers what this session's child was actually handed.
+      env: { ...(botCfg.env ?? {}), ...(botCfg.mojo?.env ?? {}), ...ledgerEnv },
       wrapperCli: wrapperCli ?? botCfg.wrapperCli,
     });
   } catch {
@@ -401,7 +423,41 @@ function defaultRuntimeSessions(): DeviceIsolationRuntimeSession[] {
   });
   // sessionStore is initialized for this daemon's own bot partition. Do not
   // scan sibling files: every daemon proves only the local resources it owns.
-  return mergePersistedDeviceIsolationSessions(runtime, sessionStore.listSessions());
+  const merged = mergePersistedDeviceIsolationSessions(runtime, sessionStore.listSessions());
+  return appendResidualMojoLauncherEnvSessions(merged);
+}
+
+/**
+ * Re-admit sessions that exist ONLY as a durable launcher-env quarantine record.
+ *
+ * Both other sources can lose them: an explicit `/close` deletes the row, and a
+ * daemon restart drops the in-memory ledger — yet the mojo child that was handed
+ * `LD_PRELOAD`/`PATH` may still be running, because its teardown is an
+ * unescalated `SIGTERM` that nothing waits on. Such a session must keep blocking
+ * credential activation instead of vanishing from the inventory.
+ *
+ * Exported for tests: the whole point is a session with no row anywhere.
+ */
+export function appendResidualMojoLauncherEnvSessions(
+  sessions: readonly DeviceIsolationRuntimeSession[],
+  quarantinedIds: readonly string[] = quarantinedSessionIds(),
+): DeviceIsolationRuntimeSession[] {
+  const out = [...sessions];
+  const known = new Set(sessions.map((session) => session.sessionId));
+  for (const sessionId of quarantinedIds) {
+    if (known.has(sessionId)) continue;   // already represented, keeps its own classification
+    out.push({
+      sessionId,
+      adopted: false,
+      frozenBackend: 'mojo',
+      // Not provable by construction: there is a recorded dangerous env and no
+      // termination proof for the child that received it.
+      remoteExecutionProven: false,
+      workerPresent: false,
+      mojoLauncherEnvResidual: true,
+    });
+  }
+  return out;
 }
 
 const defaultDependencies: DeviceIsolationDaemonDependencies = {
@@ -450,6 +506,11 @@ function blockerEntry(
 
 function classifySession(session: DeviceIsolationRuntimeSession): DeviceIsolationInventoryEntry {
   const backendType = resolvedBackend(session);
+  // Before anything else: a residual record means an unproven hooked child may
+  // still be alive with no row to reason about, so nothing here can clear it.
+  if (session.mojoLauncherEnvResidual) {
+    return blockerEntry(session, backendType, 'mojo_launcher_env_residual');
+  }
   if (session.adopted) return blockerEntry(session, backendType, 'adopted_session');
   if (backendType === 'unknown') return blockerEntry(session, backendType, 'unknown_backend');
   if (

@@ -525,6 +525,7 @@ describe('resolveRemoteExecutionProven — worker exit is not proof the mojo chi
     // in exactly this state.
     const s1 = {
       larkAppId: 'app_x',
+      session: { sessionId: 'sid-boundary' },
       mojoAppliedUnprovableEnvKeys: ['LD_PRELOAD'],
     } as never as DaemonSession;
     startNewGenerationEnvLedger(s1, {});
@@ -543,6 +544,7 @@ describe('startNewGenerationEnvLedger — monotonic parking at a generation boun
   function session(applied?: string[], retiring?: string[]): DaemonSession {
     return {
       larkAppId: 'app_x',
+      session: { sessionId: 'sid-generation' },
       ...(applied ? { mojoAppliedUnprovableEnvKeys: applied } : {}),
       ...(retiring ? { mojoRetiringUnprovableEnvKeys: retiring } : {}),
     } as never as DaemonSession;
@@ -588,7 +590,7 @@ describe('startNewGenerationEnvLedger — monotonic parking at a generation boun
 
 describe('rememberAppliedUnprovableEnvKeys — ledger bookkeeping', () => {
   it('accumulates across restarts instead of replacing', () => {
-    const ds1 = { larkAppId: 'app_x' } as never as DaemonSession;
+    const ds1 = { larkAppId: 'app_x', session: { sessionId: 'sid-ledger' } } as never as DaemonSession;
     rememberAppliedUnprovableEnvKeys(ds1, { LD_PRELOAD: '/tmp/a.so' });
     rememberAppliedUnprovableEnvKeys(ds1, { PATH: '/tmp/bin' });
     // A later clean payload must NOT erase what was already handed out.
@@ -598,7 +600,7 @@ describe('rememberAppliedUnprovableEnvKeys — ledger bookkeeping', () => {
   });
 
   it('stores key NAMES only, never values', () => {
-    const ds1 = { larkAppId: 'app_x' } as never as DaemonSession;
+    const ds1 = { larkAppId: 'app_x', session: { sessionId: 'sid-ledger' } } as never as DaemonSession;
     rememberAppliedUnprovableEnvKeys(ds1, { LD_PRELOAD: '/tmp/secret-value.so' });
     expect(ds1.mojoAppliedUnprovableEnvKeys).toEqual(['LD_PRELOAD']);
     expect(JSON.stringify(ds1.mojoAppliedUnprovableEnvKeys))
@@ -606,13 +608,13 @@ describe('rememberAppliedUnprovableEnvKeys — ledger bookkeeping', () => {
   });
 
   it('ignores the allowlisted canonical JWT name', () => {
-    const ds1 = { larkAppId: 'app_x' } as never as DaemonSession;
+    const ds1 = { larkAppId: 'app_x', session: { sessionId: 'sid-ledger' } } as never as DaemonSession;
     rememberAppliedUnprovableEnvKeys(ds1, { X_JWT_TOKEN: 'a.b.c' });
     expect(ds1.mojoAppliedUnprovableEnvKeys).toBeUndefined();
   });
 
   it('deduplicates a key handed out repeatedly', () => {
-    const ds1 = { larkAppId: 'app_x' } as never as DaemonSession;
+    const ds1 = { larkAppId: 'app_x', session: { sessionId: 'sid-ledger' } } as never as DaemonSession;
     rememberAppliedUnprovableEnvKeys(ds1, { LD_PRELOAD: '/a' });
     rememberAppliedUnprovableEnvKeys(ds1, { LD_PRELOAD: '/b' });
     expect(ds1.mojoAppliedUnprovableEnvKeys).toEqual(['LD_PRELOAD']);
