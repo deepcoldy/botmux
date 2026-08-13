@@ -31,7 +31,6 @@ import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { randomUUID } from 'node:crypto';
 import { RunnerControlWriter } from './adapters/cli/runner-control-channel.js';
 
 const DSH_MARKER = '::botmux-dsh:';
@@ -95,6 +94,15 @@ interface PendingTurn {
   usage?: DshUsage;
   toolNames: Map<string, string>;
   timer: NodeJS.Timeout;
+  /** Set from the session/prompt ACK; the turn only owns events at/after
+   *  the matching agent/inbox/spliced receipt. */
+  messageId?: string;
+  /** Notifications buffered until the spliced receipt for messageId arrives. */
+  pending: Array<{ method: string; params: Record<string, unknown> }>;
+  receiptReceived: boolean;
+  /** Set from a turn/end event whose reason is an error, so a failed turn
+   *  surfaces in the reply instead of completing with an empty final. */
+  turnError?: string;
 }
 
 interface DshUsage {
@@ -318,7 +326,10 @@ try {
 }
 
 const cwd = args.cwd ? resolve(args.cwd) : process.cwd();
-const dshSessionId = `session-${randomUUID()}`;
+// Stable across runner restarts so a respawned runner resumes the same dsh
+// session (the worker's stop/cancel path kills and restarts the runner).
+// dsh SessionId is opaque but constrained to a slug charset.
+const dshSessionId = `session-${args.sessionId.replace(/[^a-zA-Z0-9-]/g, '-')}`;
 let client: DshJsonRpcClient;
 let activeTurn: PendingTurn | undefined;
 let shuttingDown = false;
@@ -341,9 +352,32 @@ function buildPreamble(): string {
   ].join('\n');
 }
 
-function handleSessionEvent(event: unknown): void {
-  const turn = activeTurn;
-  if (!turn || !event || typeof event !== 'object') return;
+/** Whether a session event is the durable enqueue receipt for `messageId`
+ *  (same correlation as the official SDK client's isInboxReceipt). */
+function isInboxReceipt(event: unknown, messageId: string): boolean {
+  if (!event || typeof event !== 'object') return false;
+  const ev = event as { type?: string; data?: { inserted?: unknown } };
+  if (ev.type !== 'agent/inbox/spliced' || !ev.data || !Array.isArray(ev.data.inserted)) return false;
+  return ev.data.inserted.some(m =>
+    m && typeof m === 'object' && (m as { id?: unknown }).id === messageId);
+}
+
+/** Claim the turn's receipt boundary: once messageId is known, scan buffered
+ *  notifications for its agent/inbox/spliced and replay only what follows.
+ *  Notifications before the receipt belong to a previous turn and are dropped. */
+function tryClaimReceipt(turn: PendingTurn): void {
+  if (turn.receiptReceived || !turn.messageId) return;
+  const idx = turn.pending.findIndex(item =>
+    item.method === 'session.event' && isInboxReceipt(item.params.event, turn.messageId!));
+  if (idx < 0) return;
+  turn.receiptReceived = true;
+  const queued = turn.pending.splice(idx + 1);
+  turn.pending.length = 0;
+  for (const item of queued) processTurnNotification(turn, item.method, item.params);
+}
+
+function handleSessionEvent(turn: PendingTurn, event: unknown): void {
+  if (!event || typeof event !== 'object') return;
   const ev = event as { type?: string; data?: Record<string, unknown> };
   switch (ev.type) {
     case 'tool/call': {
@@ -362,6 +396,13 @@ function handleSessionEvent(event: unknown): void {
       writeLine(`${isError ? '✗' : '✓'} ${name}`);
       break;
     }
+    case 'turn/end': {
+      const reason = ev.data?.reason as { kind?: string; error?: { message?: string } } | undefined;
+      if (reason?.kind === 'error') {
+        turn.turnError = reason.error?.message || `turn failed (${reason.kind})`;
+      }
+      break;
+    }
     case 'assistant/message': {
       const message = ev.data?.message as { content?: Array<{ type?: string; text?: string }> } | undefined;
       const blocks = message?.content;
@@ -369,11 +410,12 @@ function handleSessionEvent(event: unknown): void {
         // dsh emits one assistant/message per step. The turn's final response
         // is the LAST assistant message's text (same semantics as the SDK's
         // finalResponse): replace, don't append, so intermediate step chatter
-        // never leaks into the reply.
+        // never leaks into the reply. Multiple text blocks in one message
+        // concatenate with no separator (official SDK behavior).
         const parts = blocks
           .filter((b): b is { type: 'text'; text: string } => b?.type === 'text' && typeof b.text === 'string')
           .map(b => b.text);
-        turn.textBuffer = parts.join('\n');
+        turn.textBuffer = parts.join('');
       }
       // usage is per model call; accumulate across steps for a turn total.
       const usage = normalizeUsage(ev.data?.usage);
@@ -385,27 +427,39 @@ function handleSessionEvent(event: unknown): void {
   }
 }
 
+function processTurnNotification(turn: PendingTurn, method: string, p: Record<string, unknown>): void {
+  if (method === 'session.event') {
+    handleSessionEvent(turn, p.event);
+    return;
+  }
+  if (method === 'session.status' && p.status === 'idle' && activeTurn === turn) {
+    activeTurn = undefined;
+    clearTimeout(turn.timer);
+    lastTurnText = turn.textBuffer;
+    lastTurnUsage = turn.usage;
+    lastTurnError = turn.turnError;
+    turn.resolve();
+  }
+}
+
 function handleNotification(method: string, params: unknown): void {
   if (!params || typeof params !== 'object') return;
   const p = params as Record<string, unknown>;
+  if (method === 'session.event' || method === 'session.status') {
+    if (p.sessionId !== dshSessionId) return;
+    const turn = activeTurn;
+    if (!turn) return;
+    // Buffer until the spliced receipt for our messageId: stale notifications
+    // from a previous turn (notably a late idle) must not settle this one.
+    if (!turn.receiptReceived) {
+      turn.pending.push({ method, params: p });
+      tryClaimReceipt(turn);
+      return;
+    }
+    processTurnNotification(turn, method, p);
+    return;
+  }
   switch (method) {
-    case 'session.event': {
-      if (p.sessionId !== dshSessionId) return;
-      handleSessionEvent(p.event);
-      break;
-    }
-    case 'session.status': {
-      if (p.sessionId !== dshSessionId) return;
-      if (p.status === 'idle' && activeTurn) {
-        const turn = activeTurn;
-        activeTurn = undefined;
-        clearTimeout(turn.timer);
-        lastTurnText = turn.textBuffer;
-        lastTurnUsage = turn.usage;
-        turn.resolve();
-      }
-      break;
-    }
     case 'subagent.started':
       writeLine('↳ 子任务开始');
       break;
@@ -421,6 +475,7 @@ function handleNotification(method: string, params: unknown): void {
 // so runTurn can build the final marker after the promise resolves.
 let lastTurnText = '';
 let lastTurnUsage: DshUsage | undefined;
+let lastTurnError: string | undefined;
 
 async function runTurn(content: string): Promise<void> {
   const startedAtMs = Date.now();
@@ -443,15 +498,24 @@ async function runTurn(content: string): Promise<void> {
       startedAtMs,
       textBuffer: '',
       toolNames: new Map(),
+      pending: [],
+      receiptReceived: false,
       timer,
     };
   });
 
   try {
-    await client.request('session/prompt', {
+    const ack = await client.request<{ messageId?: string }>('session/prompt', {
       sessionId: dshSessionId,
       contentBlocks: [{ type: 'text', text: promptContent }],
     }, PROMPT_ACK_TIMEOUT_MS);
+    // The ACK's messageId correlates this turn's events: notifications may
+    // already be buffered (they can precede the response), and a late idle
+    // from the previous turn must not settle this one.
+    if (activeTurn && typeof ack.messageId === 'string') {
+      activeTurn.messageId = ack.messageId;
+      tryClaimReceipt(activeTurn);
+    }
     // Commit firstTurn only after the prompt was accepted: a rejected first
     // prompt must keep the identity preamble for the retry (double-send guard).
     firstTurn = false;
@@ -466,7 +530,8 @@ async function runTurn(content: string): Promise<void> {
   await turnPromise;
 
   const completedAtMs = Date.now();
-  const finalText = lastTurnText;
+  const finalText = lastTurnText
+    || (lastTurnError ? `dsh 执行出错：${lastTurnError}` : '');
   const finalUsage = lastTurnUsage;
   emitMarker('final', {
     content: finalText,

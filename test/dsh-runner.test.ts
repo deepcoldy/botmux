@@ -185,6 +185,42 @@ describe('dsh-runner', () => {
     });
   });
 
+  it('surfaces a turn-level error in the final instead of an empty reply', async () => {
+    h = spawnRunner('turn-error');
+    await waitFor(() => h.stdout.includes('›'), { label: 'ready marker' });
+
+    h.child.stdin.write(makeFrame('触发 turn 错误'));
+    await waitFor(() => parseMarkers(h.stdout).some(m => m.kind === 'final'), { label: 'final marker' });
+
+    const final = parseMarkers(h.stdout).find(m => m.kind === 'final')!;
+    expect(final.payload.content).toContain('Authentication Fails');
+  });
+
+  it('drops stale notifications that arrive before the inbox receipt', async () => {
+    h = spawnRunner('stale');
+    await waitFor(() => h.stdout.includes('›'), { label: 'ready marker' });
+
+    h.child.stdin.write(makeFrame('有旧通知'));
+    await waitFor(() => parseMarkers(h.stdout).some(m => m.kind === 'final'), { label: 'final marker' });
+
+    const final = parseMarkers(h.stdout).find(m => m.kind === 'final')!;
+    // The stale assistant/message and idle must not settle or pollute this turn.
+    expect(final.payload.content).toBe('你好，我是 dsh。');
+    expect(final.payload.content).not.toContain('STALE');
+    expect(final.payload.usage).toEqual({ inputTokens: 10, outputTokens: 5, cacheReadTokens: 0, cacheCreateTokens: 0 });
+  });
+
+  it('claims the receipt when notifications arrive before the JSON-RPC response', async () => {
+    h = spawnRunner('early-receipt');
+    await waitFor(() => h.stdout.includes('›'), { label: 'ready marker' });
+
+    h.child.stdin.write(makeFrame('通知先到'));
+    await waitFor(() => parseMarkers(h.stdout).some(m => m.kind === 'final'), { label: 'final marker' });
+
+    const final = parseMarkers(h.stdout).find(m => m.kind === 'final')!;
+    expect(final.payload.content).toContain('你好，我是 dsh。');
+  });
+
   it('keeps the identity preamble for the retry after a rejected first prompt', async () => {
     h = spawnRunner('retry');
     await waitFor(() => h.stdout.includes('›'), { label: 'ready marker' });

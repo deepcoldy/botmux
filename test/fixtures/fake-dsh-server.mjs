@@ -14,10 +14,18 @@ import { appendFileSync } from 'node:fs';
  * Scenarios via FAKE_DSH_SCENARIO:
  *   happy (default) - full event stream with assistant text + usage
  *   multi-step      - two assistant/message events; only the last is the final
- *                     answer, and usage must accumulate across both
+ *                     answer, usage accumulates, and its two text blocks join
+ *                     with no separator
+ *   stale           - stale assistant/message + idle BEFORE this turn's
+ *                     inbox receipt; the runner must drop them
+ *   early-receipt   - receipt + events + idle are sent BEFORE the JSON-RPC
+ *                     response (real async ordering)
  *   retry           - first session/prompt fails with a JSON-RPC error, the
  *                     second runs the happy path (preamble must survive)
  *   error           - session/prompt fails with a JSON-RPC error
+ *   turn-error      - prompt accepted, but the turn ends with an LLM error
+ *                     (like the real 401 path): no assistant/message, a
+ *                     turn/end with reason.error — the runner must surface it
  *   empty           - tool calls only, no assistant text (empty final)
  *   hang            - never goes idle (exercises the turn watchdog)
  */
@@ -41,7 +49,15 @@ function sessionEvent(sessionId, event) {
   notify('session.event', { sessionId, event });
 }
 
-function runHappyTurn(sessionId) {
+function sendInboxReceipt(sessionId, messageId) {
+  sessionEvent(sessionId, {
+    type: 'agent/inbox/spliced',
+    data: { inserted: [{ id: messageId, role: 'user' }] },
+  });
+}
+
+function runHappyTurn(sessionId, messageId) {
+  sendInboxReceipt(sessionId, messageId);
   const callId = 'call_test_1';
   sessionEvent(sessionId, {
     type: 'tool/call',
@@ -72,7 +88,8 @@ function runHappyTurn(sessionId) {
   notify('session.status', { sessionId, status: 'idle' });
 }
 
-function runMultiStepTurn(sessionId) {
+function runMultiStepTurn(sessionId, messageId) {
+  sendInboxReceipt(sessionId, messageId);
   const callId = 'call_multi_1';
   sessionEvent(sessionId, {
     type: 'tool/call',
@@ -97,14 +114,50 @@ function runMultiStepTurn(sessionId) {
   sessionEvent(sessionId, {
     type: 'assistant/message',
     data: {
-      message: { role: 'assistant', content: [{ type: 'text', text: finalText }] },
+      // Two text blocks in one message concatenate with no separator.
+      message: { role: 'assistant', content: [{ type: 'text', text: '你好，' }, { type: 'text', text: '我是 dsh。' }] },
       usage: { inputTokens: 50, outputTokens: 30, cacheReadTokens: 2, cacheWriteTokens: 1 },
     },
   });
   notify('session.status', { sessionId, status: 'idle' });
 }
 
-function runEmptyTurn(sessionId) {
+/** Stale notifications from a previous turn arrive BEFORE this turn's
+ *  receipt; the runner must drop them and only own what follows the receipt. */
+function runStaleTurn(sessionId, messageId) {
+  sessionEvent(sessionId, {
+    type: 'assistant/message',
+    data: {
+      message: { role: 'assistant', content: [{ type: 'text', text: 'STALE' }] },
+      usage: { inputTokens: 999, outputTokens: 999 },
+    },
+  });
+  notify('session.status', { sessionId, status: 'idle' });
+  sendInboxReceipt(sessionId, messageId);
+  sessionEvent(sessionId, {
+    type: 'assistant/message',
+    data: {
+      message: { role: 'assistant', content: [{ type: 'text', text: finalText }] },
+      usage: { inputTokens: 10, outputTokens: 5 },
+    },
+  });
+  notify('session.status', { sessionId, status: 'idle' });
+}
+
+/** A turn that fails at the LLM call (mirrors the real 401 path): no
+ *  assistant/message, just a turn/end with an error reason. */
+function runTurnErrorTurn(sessionId, messageId) {
+  sendInboxReceipt(sessionId, messageId);
+  sessionEvent(sessionId, { type: 'turn/start', data: { turn: 1 } });
+  sessionEvent(sessionId, {
+    type: 'turn/end',
+    data: { turn: 1, reason: { kind: 'error', error: { message: 'Authentication Fails', code: 'AUTH', status: 401 } } },
+  });
+  notify('session.status', { sessionId, status: 'idle' });
+}
+
+function runEmptyTurn(sessionId, messageId) {
+  sendInboxReceipt(sessionId, messageId);
   sessionEvent(sessionId, {
     type: 'tool/call',
     data: { callId: 'call_empty', name: 'bash', arguments: '{}' },
@@ -148,14 +201,23 @@ function handleLine(line) {
       return;
     }
     promptCount++;
-    send({ jsonrpc: '2.0', id: msg.id, result: { messageId: `msg-${msg.id}` } });
+    const messageId = `msg-${msg.id}`;
     const sessionId = msg.params?.sessionId ?? 'unknown';
+    if (scenario === 'early-receipt') {
+      // Notifications before the JSON-RPC response.
+      setImmediate(() => runHappyTurn(sessionId, messageId));
+      send({ jsonrpc: '2.0', id: msg.id, result: { messageId } });
+      return;
+    }
+    send({ jsonrpc: '2.0', id: msg.id, result: { messageId } });
     if (scenario === 'hang') return;
     // Notifications land after the enqueue receipt, like the real server.
     setImmediate(() => {
-      if (scenario === 'empty') runEmptyTurn(sessionId);
-      else if (scenario === 'multi-step') runMultiStepTurn(sessionId);
-      else runHappyTurn(sessionId);
+      if (scenario === 'empty') runEmptyTurn(sessionId, messageId);
+      else if (scenario === 'multi-step') runMultiStepTurn(sessionId, messageId);
+      else if (scenario === 'stale') runStaleTurn(sessionId, messageId);
+      else if (scenario === 'turn-error') runTurnErrorTurn(sessionId, messageId);
+      else runHappyTurn(sessionId, messageId);
     });
     return;
   }
