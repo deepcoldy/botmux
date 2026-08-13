@@ -3902,14 +3902,18 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
   if (body.reasoningEffort !== undefined && body.reasoningEffort !== '' && reasoningEffort === null) {
     return jsonRes(res, 400, { ok: false, error: 'invalid_reasoning_effort' });
   }
-  if (reasoningEffort && !codexModelSupportsReasoningEffort(model, reasoningEffort)) {
+  const currentBotConfig = getBot(larkAppId).config;
+  const supportsReasoningEffort = isCodexReasoningCliId(selected.cliId);
+  const nextReasoningEffort = supportsReasoningEffort
+    ? (reasoningEffortFieldPresent ? reasoningEffort ?? undefined : currentBotConfig.reasoningEffort)
+    : undefined;
+  if (nextReasoningEffort && !codexModelSupportsReasoningEffort(model || undefined, nextReasoningEffort)) {
     return jsonRes(res, 400, {
       ok: false,
       error: 'reasoning_effort_not_supported_by_model',
-      message: `模型 ${model || '（Codex 默认模型）'} 不支持思考强度 ${reasoningEffort}`,
+      message: `模型 ${model || '（Codex 默认模型）'} 不支持思考强度 ${nextReasoningEffort}`,
     });
   }
-  const currentBotConfig = getBot(larkAppId).config;
   const runtimeFieldPresent = Object.prototype.hasOwnProperty.call(body, 'cliRuntime');
   const currentSelectionKey = selectionKeyForBot(currentBotConfig.cliId, currentBotConfig.wrapperCli);
   const selectionChanged = key !== currentSelectionKey;
@@ -4002,7 +4006,6 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
     // read-isolation toggle validates at enable time; changing the agent afterwards
     // is the other way a bot could end up configured-but-unenforceable.)
     let readIsolationCleared = false;
-    const supportsReasoningEffort = isCodexReasoningCliId(selected.cliId);
     const r = await rmwBotEntry(larkAppId, (entry) => {
     entry.cliId = selected.cliId;
     if (selected.wrapperCli) entry.wrapperCli = selected.wrapperCli;

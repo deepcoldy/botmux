@@ -243,6 +243,30 @@ describe('triggerSessionTurn rootMessageId target', () => {
     expect(ds?.session.reasoningEffort).toBe('xhigh');
   });
 
+  it('rejects a model-only override that forms an unsupported effective pair', async () => {
+    mockGetBot.mockReturnValue({
+      config: {
+        larkAppId: APP,
+        cliId: 'codex',
+        workingDir: '/tmp',
+        model: 'gpt-5.6-sol',
+        reasoningEffort: 'ultra',
+      },
+      botName: 'Bot',
+      botOpenId: 'ou_bot',
+    });
+    const req = request();
+    (req.options as any) = { model: 'gpt-5.4' };
+    const activeSessions = new Map<string, DaemonSession>();
+
+    const res = await triggerSessionTurn(req, { larkAppId: APP, activeSessions });
+
+    expect(res).toMatchObject({ ok: false, errorCode: 'trigger_failed' });
+    expect(mockCreateSession).not.toHaveBeenCalled();
+    expect(mockSendMessage).not.toHaveBeenCalled();
+    expect(activeSessions.size).toBe(0);
+  });
+
   it('does NOT stamp model/effort onto a non-codex (claude) session', async () => {
     // Harness default bot is claude-code. The gate must keep the override from
     // silently changing a non-codex bot's model.
