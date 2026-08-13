@@ -567,6 +567,7 @@ function TopbarVersionControl(props: {
   const { status } = props;
   const [open, setOpen] = useState(false);
   const [phase, setPhase] = useState<TopbarUpdatePhase>('idle');
+  const [progress, setProgress] = useState(0);
   const [refreshing, setRefreshing] = useState(false);
   const [refreshFailed, setRefreshFailed] = useState(false);
   const [errorDetail, setErrorDetail] = useState('');
@@ -579,6 +580,7 @@ function TopbarVersionControl(props: {
   const [activeRollback, setActiveRollback] = useState<string | null>(null);
   const actionInFlightRef = useRef(false);
   const reconnectTimerRef = useRef<number | null>(null);
+  const progressTimerRef = useRef<number | null>(null);
   const rootRef = useRef<HTMLDivElement>(null);
   const triggerRef = useRef<HTMLButtonElement>(null);
   const popoverRef = useRef<HTMLElement>(null);
@@ -590,9 +592,16 @@ function TopbarVersionControl(props: {
     reconnectTimerRef.current = null;
   };
 
+  const clearProgressTimer = () => {
+    if (progressTimerRef.current === null) return;
+    window.clearInterval(progressTimerRef.current);
+    progressTimerRef.current = null;
+  };
+
   useEffect(() => {
     actionInFlightRef.current = false;
     setPhase('idle');
+    setProgress(0);
     setRefreshing(false);
     setRefreshFailed(false);
     setErrorDetail('');
@@ -604,6 +613,25 @@ function TopbarVersionControl(props: {
     setSelectedRollback(null);
     setActiveRollback(null);
   }, [status?.current, status?.latest]);
+
+  // Faux progress bar. npm install gives no reliable percentage, so we creep a
+  // deliberately-capped bar per phase: install climbs toward 50% (the real
+  // install ends there), restart+reconnect climbs toward ~95%; the actual
+  // reconnect reload finishes the job, so we never fake a 100%. Reset to 0 on
+  // idle/error clears it.
+  useEffect(() => {
+    clearProgressTimer();
+    if (phase === 'idle' || phase === 'error') {
+      setProgress(0);
+      return;
+    }
+    const cap = phase === 'updating' ? 50 : 95;
+    if (phase === 'restarting') setProgress(value => Math.max(value, 50));
+    progressTimerRef.current = window.setInterval(() => {
+      setProgress(value => (value >= cap ? cap : value + Math.max(0.5, (cap - value) * 0.08)));
+    }, 400);
+    return () => clearProgressTimer();
+  }, [phase]);
 
   useEffect(() => {
     if (status) setRefreshFailed(status.versionLookupOk === false);
@@ -653,7 +681,7 @@ function TopbarVersionControl(props: {
     };
   }, [open]);
 
-  useEffect(() => () => clearReconnectTimer(), []);
+  useEffect(() => () => { clearReconnectTimer(); clearProgressTimer(); }, []);
 
   useEffect(() => {
     if (!open) return;
@@ -682,6 +710,11 @@ function TopbarVersionControl(props: {
   const automatic = behind && status.updateSupported && !status.localDevInstall && status.node.ok;
   const rollbackSupported = status.updateSupported && !status.localDevInstall && status.node.ok;
   const busy = phase === 'updating' || phase === 'restarting';
+  // Progress-ring geometry. R=20 → circumference C; the arc fills clockwise
+  // from 12 o'clock for `progress`%.
+  const RING_R = 20;
+  const RING_C = 2 * Math.PI * RING_R;
+  const ringDashoffset = RING_C * (1 - Math.max(2, Math.round(progress)) / 100);
   const command = status.updateCommand ?? 'botmux update';
   const currentVersion = `v${status.current}`;
   const latestVersion = status.latest ? `v${status.latest}` : '';
@@ -858,12 +891,10 @@ function TopbarVersionControl(props: {
         onClick={() => setOpen(value => !value)}
       >
         <span>{currentVersion}</span>
-        {busy
-          ? <span className="dashboard-update-spinner" aria-hidden="true" />
-          : <span
-              className={`dashboard-version-state ${versionSignal.className}`}
-              aria-hidden="true"
-            >{versionSignal.symbol}</span>}
+        <span
+          className={`dashboard-version-state ${versionSignal.className}`}
+          aria-hidden="true"
+        >{versionSignal.symbol}</span>
       </button>
       {open && popoverPosition && typeof document !== 'undefined' ? createPortal((
         <section
@@ -901,9 +932,35 @@ function TopbarVersionControl(props: {
           <div className="dashboard-version-popover-body">
             <div className="dashboard-version-current">
               <strong>{currentVersion}</strong>
-              <span className={versionSignal.className} aria-hidden="true">
-                {busy ? <span className="dashboard-update-spinner" /> : versionSignal.symbol}
-              </span>
+              {busy ? (
+                <span
+                  className="dashboard-version-ring"
+                  role="progressbar"
+                  aria-valuemin={0}
+                  aria-valuemax={100}
+                  aria-valuenow={Math.round(progress)}
+                  aria-label={message}
+                >
+                  <svg viewBox="0 0 44 44" width="44" height="44" aria-hidden="true">
+                    <defs>
+                      <linearGradient id="dvr-grad" x1="0%" y1="100%" x2="100%" y2="0%">
+                        <stop offset="0%" stopColor="var(--brand-accent-cyan)" />
+                        <stop offset="55%" stopColor="var(--accent)" />
+                        <stop offset="100%" stopColor="var(--brand-accent-pink)" />
+                      </linearGradient>
+                    </defs>
+                    <circle className="dvr-track" cx="22" cy="22" r="20" />
+                    <circle
+                      className="dvr-arc"
+                      cx="22" cy="22" r="20"
+                      style={{ strokeDasharray: RING_C, strokeDashoffset: ringDashoffset }}
+                    />
+                  </svg>
+                  <span className="dvr-pct">{Math.round(progress)}%</span>
+                </span>
+              ) : (
+                <span className={versionSignal.className} aria-hidden="true">{versionSignal.symbol}</span>
+              )}
             </div>
             <p
               className={`dashboard-version-message${phase === 'error' || refreshFailed ? ' is-error' : ''}`}
@@ -1037,7 +1094,6 @@ function TopbarVersionControl(props: {
                 disabled={busy}
                 onClick={() => void run()}
               >
-                {busy ? <span className="dashboard-update-spinner" aria-hidden="true" /> : null}
                 {action}
               </button>
             </footer>

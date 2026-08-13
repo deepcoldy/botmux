@@ -17,6 +17,7 @@ The table lists the current built-in adapters (the **authoritative source** for 
 | `gemini` | Gemini | local process | ✅ |
 | `cursor` | Cursor (cursor-agent) | local process | ✅ |
 | `opencode` | OpenCode | local process | ✅ |
+| `opencode2` | OpenCode 2 (beta, `opencode2`) | local process | |
 | `antigravity` | Antigravity (agy) | local process | |
 | `copilot` | GitHub Copilot | local process | ✅ |
 | `grok` | Grok (grok-cli) | local process | ✅ |

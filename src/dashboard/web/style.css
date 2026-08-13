@@ -8601,6 +8601,13 @@ button.dashboard-version-refresh.is-refreshing svg {
   color: var(--danger);
   overflow-wrap: anywhere;
 }
+.dashboard-version-current > span.dashboard-version-ring { position: relative; display: inline-flex; place-items: unset; flex: none; width: 44px; height: 44px; border-radius: 0; }
+.dashboard-version-ring svg { display: block; width: 44px; height: 44px; }
+.dvr-track { fill: none; stroke: color-mix(in srgb, var(--muted) 26%, transparent); stroke-width: 4; }
+.dvr-arc { fill: none; stroke: url(#dvr-grad); stroke-width: 4; stroke-linecap: round; transform: rotate(-90deg); transform-origin: 50% 50%; transition: stroke-dashoffset 0.4s ease; animation: dvr-breathe 1.8s ease-in-out infinite; }
+@keyframes dvr-breathe { 0%, 100% { opacity: 1; } 50% { opacity: 0.55; } }
+.dvr-pct { position: absolute; inset: 0; display: grid; place-items: center; font-family: "Geist Mono", var(--mono); font-size: 11px; font-weight: 700; line-height: 1; text-align: center; font-variant-numeric: tabular-nums; color: var(--accent-strong); }
+@media (prefers-reduced-motion: reduce) { .dvr-arc { transition: none; animation: none; opacity: 1; } }
 .dashboard-version-release-link {
   display: inline-flex;
   align-items: center;

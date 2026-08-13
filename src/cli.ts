@@ -11555,6 +11555,9 @@ export async function runHook(
   postAskFn: (body: Record<string, unknown>) => Promise<import('./core/ask-types.js').AskResult>,
   cliId: string,
   resolveAdoptRouteFn?: () => Promise<import('./adapters/adopt-route.js').AdoptRoute | null>,
+  /** 按 OpenCode 原生会话 id（payload.session_id，ses_*）反查所属 botmux 会话；
+   *  缺省用真实实现（在线 daemon 并发查询 + budget 封顶）。测试注入 stub。 */
+  resolveCliSessionRouteFn?: (cliSessionId: string) => Promise<import('./adapters/adopt-route.js').AdoptRoute | null>,
 ): Promise<{ stdout: string }> {
   const { getHookAdapter } = await import('./core/ask-hook/registry.js');
 
@@ -11580,13 +11583,58 @@ export async function runHook(
   const chatId = env.BOTMUX_CHAT_ID;
   const larkAppId = env.BOTMUX_LARK_APP_ID;
 
-  // 路由变量：优先用 env，env 缺失时尝试 adopt 路由
+  // 路由变量：优先用 payload 携带的 OpenCode 原生会话 id 反查所属 botmux 会话；
+  // 未命中：共享 service hook（opencode2）直接 passthrough（fail closed），
+  // 进程私有 hook 回落 env，env 缺失时再尝试 adopt 路由。
   let routeSessionId = sessionId;
   let routeChatId = chatId;
   let routeLarkAppId = larkAppId;
   let routeRoot: string | null = env.BOTMUX_ROOT_MESSAGE_ID || null;
+  let explicitRoute: import('./adapters/adopt-route.js').AdoptRoute | null = null;
 
-  if (!sessionId || !chatId || !larkAppId) {
+  // 共享 service 场景（opencode2）：ask 插件运行在所有客户端共用的托管 service 里，
+  // hook 子进程继承的是「启动该 service 的会话」的 ambient env，与当前会话无关，
+  // 直接拿来路由会跨会话错投。payload.session_id 是 OpenCode 原生 id（ses_*），
+  // 整段反查只对共享 service hook 启用：进程私有 hook（opencode 等）的 ambient
+  // env 是当前进程的可信归属，让反查覆盖反而可能被另一重复绑定的命中错投。
+  // 共享 service 的 env 永远不可信：session_id 缺失或非 ses_* 形状时无法验证
+  // native identity，同样 fail closed（passthrough），绝不落 env 路由。
+  const isSharedServiceHook = cliId === 'opencode2';
+  const rawPayload = payload as Record<string, unknown> | undefined;
+  const nativeSessionId = typeof rawPayload?.session_id === 'string'
+    ? rawPayload.session_id.trim()
+    : '';
+  if (isSharedServiceHook && !/^ses_[0-9A-Za-z]+$/.test(nativeSessionId)) {
+    return { stdout: adapter.passthrough(payload) };
+  }
+  if (isSharedServiceHook) {
+    const { resolveCliSessionRoute, queryCliSession } = await import('./adapters/adopt-route.js');
+    const resolver = resolveCliSessionRouteFn ?? ((cliSessionId: string) =>
+      resolveCliSessionRoute({
+        cliSessionId,
+        listDaemons: listOnlineDaemons,
+        queryDaemon: queryCliSession,
+      }));
+    try {
+      explicitRoute = await resolver(nativeSessionId);
+    } catch {
+      // 反查异常 → 视同未命中（无法证明唯一），fail closed
+      explicitRoute = null;
+    }
+    if (explicitRoute) {
+      routeSessionId = explicitRoute.sessionId;
+      routeChatId = explicitRoute.chatId;
+      routeLarkAppId = explicitRoute.larkAppId;
+      routeRoot = explicitRoute.rootMessageId;
+    } else {
+      // fail closed：反查未能证明「恰好一个完整命中」（未命中 / 双命中歧义 /
+      // 查询超时 / daemon 不可达 / cliSessionId 尚未上报）→ 直接 passthrough
+      // 把问题留给原生终端，绝不回落 ambient env / PID adopt，避免跨会话错投。
+      return { stdout: adapter.passthrough(payload) };
+    }
+  }
+
+  if (!explicitRoute && (!sessionId || !chatId || !larkAppId)) {
     // env 缺失 → 尝试通过祖先 PID 匹配在线 adopt 会话
     const resolver = resolveAdoptRouteFn ?? (() => {
       // 延迟 import 避免冷启动开销

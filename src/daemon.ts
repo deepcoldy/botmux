@@ -6215,6 +6215,63 @@ ipcRoute('GET', '/api/adopt-session/:pid', (_req, res, params) => {
   return jsonRes(res, 404, { ok: false, error: 'no_adopt_session' });
 });
 
+/**
+ * 按 (cliId, cliSessionId) 在活跃会话里反查 CLI 原生会话绑定。
+ *
+ * 反查 identity 必须是组合键：OpenCode V1→V2 迁移会原样保留 ses_* id（同一
+ * id 同时存在于 V1 session 与 V2 session_v2），只按 cliSessionId 匹配会把
+ * V1 会话（cliId=opencode）当成唯一 hit，错投到 V1 话题。本查询只服务
+ * opencode2 共享托管 service，命中必须恰好一个：0 个 → miss，≥2 个
+ * （两个话题/机器人并发导入同一外部会话的重复绑定）→ conflict。
+ */
+export function matchCliSession(
+  activeSessions: Iterable<DaemonSession>,
+  cliId: string,
+  cliSessionId: string,
+): { kind: 'hit'; session: DaemonSession } | { kind: 'miss' } | { kind: 'conflict' } {
+  const matches = [...activeSessions].filter(
+    (ds) => ds.session.cliId === cliId && ds.session.cliSessionId === cliSessionId,
+  );
+  if (matches.length === 0) return { kind: 'miss' };
+  if (matches.length > 1) return { kind: 'conflict' };
+  return { kind: 'hit', session: matches[0] };
+}
+
+// GET /api/session-by-cli/:cliId/:cliSessionId — 按 (cliId, cliSessionId) 反查
+// 活跃 botmux 会话路由。托管 service 场景（opencode2 的 ask 插件运行在所有
+// 客户端共用的 service 里）：hook 子进程继承的是启动该 service 时固化的 ambient
+// env，与当前会话无关；必须用 payload 携带的 native sessionID 显式反查，否则
+// 跨会话错投（多 bot/多会话会放行或错投到首个启动 service 的会话）。
+// 反查 identity 必须是 (cliId, cliSessionId)：OpenCode V1→V2 迁移会原样保留
+// ses_* id（真实环境验证同一 id 同时存在于 V1 session 与 V2 session_v2），
+// 只按 cliSessionId 匹配会把 V1 会话当成唯一 hit，V2 hook 的问题被投到 V1 话题。
+// 本端点只服务 opencode2 共享托管 service 的反查，强制 cliId === 'opencode2'；
+// 多命中返回 409 conflict，让反查侧 fail closed（歧义时 passthrough）。
+ipcRoute('GET', '/api/session-by-cli/:cliId/:cliSessionId', (_req, res, params) => {
+  const cliId = params.cliId;
+  const cliSessionId = params.cliSessionId;
+  if (cliId !== 'opencode2') {
+    return jsonRes(res, 400, { ok: false, error: 'unsupported_cli' });
+  }
+  if (!cliSessionId || cliSessionId.length > 512) {
+    return jsonRes(res, 400, { ok: false, error: 'bad_cli_session_id' });
+  }
+  const match = matchCliSession(activeSessions.values(), cliId, cliSessionId);
+  if (match.kind === 'miss') {
+    return jsonRes(res, 404, { ok: false, error: 'no_session' });
+  }
+  if (match.kind === 'conflict') {
+    return jsonRes(res, 409, { ok: false, error: 'ambiguous_cli_session' });
+  }
+  const ds = match.session;
+  return jsonRes(res, 200, {
+    sessionId: ds.session.sessionId,
+    chatId: ds.chatId,
+    larkAppId: ds.larkAppId,
+    rootMessageId: sessionAnchorId(ds),
+  });
+});
+
 for (const path of ['/api/vc-meetings/members/register', '/api/vc-meetings/members/update']) {
   ipcRoute('POST', path, async (req, res) => {
     if (!guardVcMeetingDaemonControlRoute(req, res)) return;
