@@ -37,6 +37,12 @@ function senderLabel(message: ChatMessage): string {
   return '我';
 }
 
+/** Extra provenance badge for model-initiated (botmux send) replies. */
+function sourceBadge(message: ChatMessage): string | null {
+  if (message.source !== 'send-marker') return null;
+  return '模型直发';
+}
+
 function timeLabel(ts: number): string {
   if (!Number.isFinite(ts) || ts <= 0) return '';
   return new Date(ts).toLocaleString();
@@ -49,10 +55,12 @@ function MessageBubble({ message }: { message: ChatMessage }) {
   const content = isBot
     ? previewMarkdownHtml(text)
     : `<div class="chat-msg-plain">${escapeHtml(text)}</div>`;
+  const badge = sourceBadge(message);
   return (
     <div className={`chat-msg ${isBot ? 'chat-msg-bot' : 'chat-msg-user'}`}>
       <div className="chat-msg-meta">
         <span className="chat-msg-sender">{senderLabel(message)}</span>
+        {badge ? <span className="chat-msg-badge">{badge}</span> : null}
         {timeLabel(message.createTime) ? <span className="chat-msg-time">{timeLabel(message.createTime)}</span> : null}
       </div>
       <div className="chat-msg-body" dangerouslySetInnerHTML={rawHtml(content)} />
@@ -98,6 +106,7 @@ function ChatPage() {
   const snapshot = useDashboardStore();
   const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [markerMessages, setMarkerMessages] = useState<ChatMessage[]>([]);
   const [historyLoading, setHistoryLoading] = useState(false);
   const [historyError, setHistoryError] = useState<string | null>(null);
   const [hasOlder, setHasOlder] = useState(false);
@@ -128,12 +137,14 @@ function ChatPage() {
   useEffect(() => {
     if (!selectedSessionId) {
       setMessages([]);
+      setMarkerMessages([]);
       setHasOlder(false);
       olderCursorRef.current = undefined;
       return;
     }
     store.clearChatMessages(selectedSessionId);
     setMessages([]);
+    setMarkerMessages([]);
     setHistoryLoading(true);
     setHistoryError(null);
     setHasOlder(false);
@@ -150,6 +161,9 @@ function ChatPage() {
         }
         const list: ChatMessage[] = Array.isArray(body.messages) ? body.messages : [];
         setMessages([...list].sort((a, b) => a.seq - b.seq));
+        // Model-initiated `botmux send` replies (turn-sends supplement).
+        const markers: ChatMessage[] = Array.isArray(body.sendMarkers) ? body.sendMarkers : [];
+        setMarkerMessages([...markers].sort((a, b) => b.createTime - a.createTime));
         const total = Number(body.total ?? list.length);
         setHasOlder(Number.isFinite(total) && total > list.length);
       } catch (e) {
@@ -161,18 +175,21 @@ function ChatPage() {
     return () => { alive = false; };
   }, [selectedSessionId]);
 
-  // Fold live SSE messages into the rendered list (newest-last). Dedupe by
-  // turnId when present (optimistic console bubbles carry a fake large seq but
-  // share the server turnId once the SSE event lands, so the optimistic bubble
-  // is replaced rather than duplicated); fall back to seq for archive rows.
+  // Fold live SSE messages + turn-sends markers into the rendered list,
+  // ordered by wall-clock createTime (markers carry synthetic negative seqs,
+  // so seq ordering would misplace them). Dedupe by turnId when present
+  // (optimistic console bubbles share the server turnId once the SSE event
+  // lands, so the optimistic bubble is replaced rather than duplicated);
+  // fall back to seq for archive rows.
   const liveMessages = selectedSessionId ? snapshot.chatMessages.get(selectedSessionId) : undefined;
   const merged = useMemo(() => {
     const keyOf = (m: ChatMessage): string => (m.turnId ? `t:${m.turnId}` : `s:${m.seq}`);
     const byKey = new Map<string, ChatMessage>();
     for (const m of messages) byKey.set(keyOf(m), m);
+    for (const m of markerMessages) byKey.set(`m:${m.messageId ?? m.seq}`, m);
     for (const m of liveMessages ?? []) byKey.set(keyOf(m), m);
-    return [...byKey.values()].sort((a, b) => a.seq - b.seq);
-  }, [messages, liveMessages]);
+    return [...byKey.values()].sort((a, b) => a.createTime - b.createTime);
+  }, [messages, markerMessages, liveMessages]);
 
   // Auto-scroll to the newest message when the list grows.
   useEffect(() => {
@@ -187,7 +204,11 @@ function ChatPage() {
 
   const loadOlder = async (): Promise<void> => {
     if (!selectedSessionId || loadingOlder) return;
-    const beforeSeq = merged[0]?.seq;
+    // Oldest ARCHIVE seq (markers carry negative seqs and must not drive the
+    // cursor); undefined when only markers are loaded.
+    const oldestArchive = messages[0];
+    if (!oldestArchive || oldestArchive.seq < 0) return;
+    const beforeSeq = oldestArchive.seq;
     if (beforeSeq === undefined) return;
     setLoadingOlder(true);
     try {

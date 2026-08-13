@@ -105,7 +105,7 @@ import {
 } from '../services/role-profile-store.js';
 import { triggerSessionTurn } from './trigger-session.js';
 import { validateTriggerRequest, type TriggerResponse } from '../services/trigger-types.js';
-import { appendSessionMessage, listSessionMessages, countSessionMessages } from '../services/session-message-store.js';
+import { appendSessionMessage, listSessionMessages, listSendMarkerMessages, countSessionMessages } from '../services/session-message-store.js';
 import { resolveCliSelection, selectionKeyForBot } from '../setup/cli-selection.js';
 import { checkCliAvailability } from '../setup/cli-availability.js';
 import { enrichHistorySenders, type HistoryBotInfo } from '../dashboard/history-senders.js';
@@ -1823,10 +1823,14 @@ ipcRoute('GET', '/api/sessions/:sessionId/messages', (req, res, params) => {
     ? Math.max(0, Math.floor(Number(beforeSeqRaw)))
     : undefined;
   const messages = listSessionMessages(params.sessionId, { limit, ...(beforeSeq !== undefined ? { beforeSeq } : {}) });
+  // Model-initiated `botmux send` replies (daemon-memory-outside) merged from
+  // the turn-sends supplement so the console shows the full conversation.
+  const sendMarkers = listSendMarkerMessages(params.sessionId, messages);
   jsonRes(res, 200, {
     ok: true,
     sessionId: params.sessionId,
     messages,
+    sendMarkers,
     total: countSessionMessages(params.sessionId),
     hasMore: messages.length === limit && (beforeSeq === undefined || messages.at(-1)?.seq !== undefined),
   });

@@ -20,7 +20,7 @@
 //   { seq, role: 'user'|'bot', content, senderId?, senderName?, turnId?,
 //     messageId?, createTime (epoch ms) }
 
-import { appendFileSync, closeSync, existsSync, fstatSync, mkdirSync, openSync, readSync, statSync, writeFileSync } from 'node:fs';
+import { appendFileSync, closeSync, existsSync, fstatSync, mkdirSync, openSync, readFileSync, readSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { config } from '../config.js';
 import { logger } from '../utils/logger.js';
@@ -37,6 +37,9 @@ export interface SessionMessage {
   messageId?: string;
   /** Epoch ms. */
   createTime: number;
+  /** Provenance marker. `send-marker` = model-initiated `botmux send` reply
+   *  merged from the turn-sends supplement (bounded preview text). */
+  source?: 'send-marker';
 }
 
 export interface ListSessionMessagesOptions {
@@ -225,6 +228,70 @@ export function hasSessionMessages(sessionId: string): boolean {
   if (!existsSync(path)) return false;
   const stat = statSync(path);
   return stat.size > 0;
+}
+
+// ─── turn-sends supplement ───────────────────────────────────────────────────
+//
+// Model-initiated replies (`botmux send` from inside the CLI) never pass
+// through the daemon's final_output pipeline, so they are not archived by
+// worker-pool. They DO append a marker to `<dataDir>/turn-sends/<sid>.jsonl`
+// (see cli.ts cmdSend / bridge-fallback-gate.ts BridgeSendMarker). The chat
+// console merges these markers as supplementary bot messages so a session's
+// full conversation shows up even when the reply was posted directly by the
+// model. Markers carry only a bounded preview, not the full text.
+
+const SEND_MARKER_FILE_MAX_ROWS = 2_000;
+
+function turnSendsPath(sessionId: string): string {
+  return join(config.session.dataDir, 'turn-sends', `${sessionId}.jsonl`);
+}
+
+/**
+ * Read the turn-sends markers for a session as supplementary bot messages.
+ * Returns them newest-first. `seq` is synthesised as negative numbers so they
+ * never collide with the 0-based archive seq; `source: 'send-marker'` lets the
+ * UI label them (e.g. "模型直发（预览）"). Best-effort: a missing/corrupt file
+ * yields []. If the archive already contains a bot reply for the same
+ * messageId, that marker is skipped (the daemon-side copy is authoritative).
+ */
+export function listSendMarkerMessages(
+  sessionId: string,
+  archived: readonly SessionMessage[] = [],
+): SessionMessage[] {
+  const path = turnSendsPath(sessionId);
+  if (!existsSync(path)) return [];
+  const archivedMessageIds = new Set(
+    archived.map(m => m.messageId).filter((id): id is string => !!id),
+  );
+  let raw: string;
+  try {
+    raw = readFileSync(path, 'utf8');
+  } catch {
+    return [];
+  }
+  const markers: Array<{ sentAtMs: number; messageId?: string; previewText?: string }> = [];
+  for (const line of raw.split('\n')) {
+    if (!line.trim()) continue;
+    try {
+      const parsed = JSON.parse(line);
+      if (typeof parsed?.sentAtMs === 'number') markers.push(parsed);
+    } catch { /* skip malformed line */ }
+  }
+  const result: SessionMessage[] = [];
+  for (const marker of markers.reverse()) {
+    if (!marker.previewText || !marker.previewText.trim()) continue;
+    if (marker.messageId && archivedMessageIds.has(marker.messageId)) continue;
+    result.push({
+      seq: -1 - result.length,
+      role: 'bot',
+      content: marker.previewText,
+      ...(marker.messageId ? { messageId: marker.messageId } : {}),
+      createTime: marker.sentAtMs,
+      senderName: 'bot',
+      source: 'send-marker',
+    });
+  }
+  return result;
 }
 
 /** Test-only helper: wipe one session's archive (mirrors session-store delete). */

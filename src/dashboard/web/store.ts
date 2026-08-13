@@ -10,6 +10,9 @@ export interface ChatMessage {
   turnId?: string;
   messageId?: string;
   createTime: number;
+  /** Provenance marker: 'send-marker' = model-initiated botmux send reply
+   *  merged from the turn-sends supplement (bounded preview text). */
+  source?: 'send-marker';
 }
 
 export interface StoreSnapshot {

@@ -26412,3 +26412,13 @@ button.ui-refresh-button.is-loading .ui-action-icon {
   .chat-rail { width: 200px; min-width: 150px; }
   .chat-msg { max-width: 92%; }
 }
+
+.chat-msg-badge {
+  padding: 0 6px;
+  border: 1px solid color-mix(in srgb, var(--accent) 40%, var(--border-soft));
+  border-radius: var(--radius-full);
+  color: var(--accent);
+  font-size: 9px;
+  font-weight: 700;
+  line-height: 16px;
+}

@@ -1,10 +1,11 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, rmSync, readFileSync, existsSync, appendFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, readFileSync, existsSync, appendFileSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   appendSessionMessage,
   listSessionMessages,
+  listSendMarkerMessages,
   countSessionMessages,
   hasSessionMessages,
   deleteSessionMessages,
@@ -99,5 +100,47 @@ describe('session-message-store', () => {
     const listed = listSessionMessages('sess-8');
     expect(listed.length).toBe(1);
     expect(listed[0]?.content).toBe('good');
+  });
+
+  it('listSendMarkerMessages merges model-initiated botmux send replies', () => {
+    const markersDir = join(dataDir, 'turn-sends');
+    mkdirSync(markersDir, { recursive: true });
+    appendFileSync(join(markersDir, 'sess-9.jsonl'),
+      `${JSON.stringify({ sentAtMs: 1000, messageId: 'om_send_1', previewText: 'direct reply **bold**' })}\n` +
+      `${JSON.stringify({ sentAtMs: 2000, messageId: 'om_send_2', previewText: 'second direct' })}\n`);
+
+    const markers = listSendMarkerMessages('sess-9');
+    expect(markers).toHaveLength(2);
+    // Newest-first: sentAtMs 2000 first.
+    expect(markers[0]).toMatchObject({ role: 'bot', content: 'second direct', messageId: 'om_send_2', source: 'send-marker' });
+    expect(markers[0].seq).toBeLessThan(0); // synthetic negative seq
+    expect(markers[1]).toMatchObject({ role: 'bot', content: 'direct reply **bold**', messageId: 'om_send_1' });
+    expect(markers.map(m => m.messageId)).toEqual(['om_send_2', 'om_send_1']);
+  });
+
+  it('skips send markers already covered by the archive (authoritative daemon copy)', () => {
+    appendSessionMessage('sess-10', { role: 'bot', content: 'archived reply', messageId: 'om_send_1' });
+    const markersDir = join(dataDir, 'turn-sends');
+    mkdirSync(markersDir, { recursive: true });
+    appendFileSync(join(markersDir, 'sess-10.jsonl'),
+      `${JSON.stringify({ sentAtMs: 1000, messageId: 'om_send_1', previewText: 'dup' })}\n` +
+      `${JSON.stringify({ sentAtMs: 2000, messageId: 'om_send_2', previewText: 'fresh' })}\n`);
+
+    const archived = listSessionMessages('sess-10');
+    const markers = listSendMarkerMessages('sess-10', archived);
+    expect(markers).toHaveLength(1);
+    expect(markers[0]?.messageId).toBe('om_send_2');
+  });
+
+  it('ignores send markers without previewText and malformed lines', () => {
+    const markersDir = join(dataDir, 'turn-sends');
+    mkdirSync(markersDir, { recursive: true });
+    appendFileSync(join(markersDir, 'sess-11.jsonl'),
+      `${JSON.stringify({ sentAtMs: 1000, messageId: 'no-preview' })}\n` +
+      `{broken\n` +
+      `${JSON.stringify({ sentAtMs: 3000, messageId: 'ok', previewText: '  ' })}\n`);
+
+    const markers = listSendMarkerMessages('sess-11');
+    expect(markers).toEqual([]);
   });
 });
