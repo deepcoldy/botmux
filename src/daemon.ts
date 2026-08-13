@@ -84,6 +84,8 @@ import * as scheduleStore from './services/schedule-store.js';
 import { migrateSharedSchedulesAtStartup } from './services/schedule-split-migration.js';
 import { migrateOverloadAlertAtStartup } from './services/overload-alert-migration.js';
 import * as messageQueue from './services/message-queue.js';
+import { appendSessionMessage } from './services/session-message-store.js';
+import { dashboardEventBus } from './core/dashboard-events.js';
 import { emitHookEvent, emitHookEventLocal, HOOK_EVENTS, type HookEvent } from './services/hook-runner.js';
 import { setSessionLifecycleShutdown } from './services/session-lifecycle-hooks.js';
 import { createImgNumberer, extractPostAtParticipants, parseEventMessage, resolveNonsupportMessage, stripLeadingMentions, type MessageResource } from './im/lark/message-parser.js';
@@ -3011,6 +3013,36 @@ function readSessionFreshFromDisk(sessionId: string, larkAppId: string): import(
     } catch { /* ignore corrupt/racing session file */ }
   }
   return undefined;
+}
+
+/**
+ * Archive an inbound Lark user message into the local session-message store
+ * and broadcast it over the dashboard event bus. Call right after
+ * `messageQueue.appendMessage` so the chat console sees every IM turn even
+ * when Lark history is unavailable. Best-effort: archive/publish failures
+ * never break the turn pipeline.
+ */
+function archiveInboundLarkMessage(
+  ds: DaemonSession,
+  parsed: { messageId?: string; content?: string; senderId?: string; senderType?: string; createTime?: string },
+): void {
+  const sessionId = ds.session.sessionId;
+  if (!sessionId || !parsed?.content?.trim()) return;
+  const archived = appendSessionMessage(
+    sessionId,
+    {
+      role: 'user',
+      content: parsed.content,
+      ...(parsed.senderId ? { senderId: parsed.senderId } : {}),
+      turnId: parsed.messageId,
+      messageId: parsed.messageId,
+      createTime: parsed.createTime ? Number(parsed.createTime) || Date.now() : Date.now(),
+    },
+    parsed.messageId,
+  );
+  if (archived) {
+    dashboardEventBus.publish({ type: 'chat.message', body: { sessionId, message: archived } });
+  }
 }
 
 export async function noteTurnReceived(
@@ -16384,6 +16416,7 @@ async function startInitialPassthroughSession(args: {
   }
   messageQueue.ensureQueue(anchor);
   messageQueue.appendMessage(anchor, { ...parsed, content: commandContent });
+  archiveInboundLarkMessage(ds, { ...parsed, content: commandContent });
 
   if (pinnedWorkingDir && autoWt) {
     if (await replyInvalidWorkingDirs(anchor, larkAppId, ds)) return;
@@ -17065,6 +17098,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
   }
   messageQueue.ensureQueue(anchor);
   messageQueue.appendMessage(anchor, parsed);
+  archiveInboundLarkMessage(ds, parsed);
 
   // Auto-worktree: session is registered PENDING; build the worktree off the
   // critical path, then commitRepoSelection pins it + forks (folding in any
@@ -18700,6 +18734,7 @@ async function handleThreadReplyAdmitted(
     // creator re-enters the canonical route above, which appends exactly once.
     messageQueue.ensureQueue(anchor);
     messageQueue.appendMessage(anchor, parsed);
+    archiveInboundLarkMessage(newDs, parsed);
 
     // Auto-worktree: register PENDING, build worktree off-path, commit+fork later.
     if (pinnedWorkingDir && autoWt) {
@@ -18757,6 +18792,7 @@ async function handleThreadReplyAdmitted(
   // Existing-owner route: append once after all pending-repo early returns.
   messageQueue.ensureQueue(anchor);
   messageQueue.appendMessage(anchor, parsed);
+  archiveInboundLarkMessage(ds, parsed);
   publishSessionMessagePreviewPatch(ds);
 
   // codexAppSteerable was computed ONCE above (R5-B1-1), before every admission /

@@ -59,6 +59,12 @@ export interface TriggerSessionInternalOptions {
    *  of botmux's persisted Session.lastUserPrompt/lastCliInput fields; receipt
    *  recovery asks the hub to resend the frozen envelope instead. */
   persistInputHistory?: boolean;
+  /** When set, the turn is injected as a CLEAN user message (the dashboard
+   *  chat console): the prompt, Codex App visible text, and untrusted-event
+   *  contexts are all replaced by this literal text instead of the
+   *  `<botmux_external_event>` envelope wrapper. The CLI sees the user's own
+   *  words, not an "external event" framing. */
+  userInputOverride?: string;
 }
 
 function triggerTitle(req: TriggerRequest): string {
@@ -762,11 +768,17 @@ async function triggerSessionTurnAdmitted(
   }
 
   const dryRun = !!req.options?.dryRun;
-  const prompt = buildUntrustedEventPrompt(req, triggerId);
+  // Dashboard chat console: inject the user's literal text as a clean message
+  // instead of wrapping it in the untrusted external-event envelope (which
+  // would make the CLI treat a plain chat line as an "external event").
+  const cleanUserText = internal?.userInputOverride?.trim();
+  const prompt = cleanUserText
+    ? cleanUserText
+    : buildUntrustedEventPrompt(req, triggerId);
   const topicMessage = buildExternalEventTopicMessage(req, larkAppId);
-  const codexAppText = buildExternalEventVisibleText(req, larkAppId);
-  const codexAppApplicationContext = buildExternalEventApplicationContext(req);
-  const codexAppMessageContext = buildExternalEventDataContext(req, triggerId);
+  const codexAppText = cleanUserText ?? buildExternalEventVisibleText(req, larkAppId);
+  const codexAppApplicationContext = cleanUserText ? '' : buildExternalEventApplicationContext(req);
+  const codexAppMessageContext = cleanUserText ? '' : buildExternalEventDataContext(req, triggerId);
   const promptPreview = prompt.length > 4000 ? prompt.slice(0, 4000) + '\n...[truncated]' : prompt;
 
   // ── Idempotency (fresh async virtual only — validator guarantees the shape) ──

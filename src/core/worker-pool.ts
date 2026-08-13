@@ -249,6 +249,7 @@ export function getDaemonStreamingCardUsageSnapshot(
 
 import { normalizeBrand } from '../im/lark/lark-hosts.js';
 import { dashboardEventBus } from './dashboard-events.js';
+import { appendSessionMessage } from '../services/session-message-store.js';
 import { composeRowFromActive, composeRowFromClosed } from './dashboard-rows.js';
 import { publishAttentionPatch, publishClosedSessionPatch } from './session-activity.js';
 import { knownBotOpenIdsFromCrossRef, type BotMentionEntry } from '../utils/bot-routing.js';
@@ -8882,6 +8883,28 @@ function setupWorkerHandlers(
         if (!msg.content || !msg.content.trim()) break;
         if (shouldDropMismatchedFinalOutput(ds, msg, t)) break;
         if (shouldDropMismatchedHermesFinalOutput(ds, msg, t)) break;
+        // Archive the assistant reply into the local session-message store for
+        // the dashboard chat console. This runs BEFORE the suppressed/dedupe
+        // gates so console turns (suppressFinalOutput) still persist their
+        // reply even though nothing is posted to Feishu. The archive itself
+        // dedupes by turnId so a worker replay can't append the same reply twice.
+        {
+          const archived = appendSessionMessage(
+            ds.session.sessionId,
+            {
+              role: 'bot',
+              content: msg.content,
+              turnId: msg.turnId,
+            },
+            msg.turnId,
+          );
+          if (archived) {
+            dashboardEventBus.publish({
+              type: 'chat.message',
+              body: { sessionId: ds.session.sessionId, message: archived },
+            });
+          }
+        }
         if (managedFinalOutputSuppressed(msg.turnId, msg.dispatchAttempt)) {
           logger.debug(`[${t}] final_output captured/discarded for silent turn ${msg.turnId.substring(0, 8)}`);
           break;

@@ -106,6 +106,17 @@ const NAV_ITEMS: NavItem[] = [
   },
   { id: 'sessions', href: '#/sessions', labelKey: 'nav.sessions', icon: <path d="M2 3.5h12v7H6l-3 3v-3H2z" /> },
   {
+    id: 'chat',
+    href: '#/chat',
+    labelKey: 'nav.chat',
+    icon: (
+      <>
+        <path d="M2.5 3.5h11v7.5H6.5L4 13.5v-2.5H2.5z" />
+        <path d="M5.5 6.2h5M5.5 8.2h3.4" />
+      </>
+    ),
+  },
+  {
     id: 'groups',
     href: '#/groups',
     labelKey: 'nav.groups',

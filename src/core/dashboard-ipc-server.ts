@@ -1,6 +1,7 @@
 // src/core/dashboard-ipc-server.ts
 import { createServer, type IncomingMessage, type ServerResponse, type Server } from 'node:http';
 import { execFileSync } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import { readFileSync, unlinkSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
@@ -104,6 +105,7 @@ import {
 } from '../services/role-profile-store.js';
 import { triggerSessionTurn } from './trigger-session.js';
 import { validateTriggerRequest, type TriggerResponse } from '../services/trigger-types.js';
+import { appendSessionMessage, listSessionMessages, countSessionMessages } from '../services/session-message-store.js';
 import { resolveCliSelection, selectionKeyForBot } from '../setup/cli-selection.js';
 import { checkCliAvailability } from '../setup/cli-availability.js';
 import { enrichHistorySenders, type HistoryBotInfo } from '../dashboard/history-senders.js';
@@ -1806,6 +1808,123 @@ ipcRoute('GET', '/api/sessions/:sessionId/history', async (req, res, params) => 
     });
   } catch (err: any) {
     jsonRes(res, 502, { ok: false, error: String(err?.message ?? err) });
+  }
+});
+
+// ─── Chat console: local per-session message archive ─────────────────────────
+
+/** 聊天控制台历史：读本地 session-message-store（每轮 user 输入 + bot 最终回复
+ *  的本地留存，不依赖飞书 API）。limit/beforeSeq 游标分页，newest-first 返回。 */
+ipcRoute('GET', '/api/sessions/:sessionId/messages', (req, res, params) => {
+  const url = new URL(req.url ?? '/', 'http://localhost');
+  const limit = Math.min(Math.max(parseInt(url.searchParams.get('limit') ?? '100', 10) || 100, 1), 500);
+  const beforeSeqRaw = url.searchParams.get('beforeSeq');
+  const beforeSeq = beforeSeqRaw !== null && Number.isFinite(Number(beforeSeqRaw))
+    ? Math.max(0, Math.floor(Number(beforeSeqRaw)))
+    : undefined;
+  const messages = listSessionMessages(params.sessionId, { limit, ...(beforeSeq !== undefined ? { beforeSeq } : {}) });
+  jsonRes(res, 200, {
+    ok: true,
+    sessionId: params.sessionId,
+    messages,
+    total: countSessionMessages(params.sessionId),
+    hasMore: messages.length === limit && (beforeSeq === undefined || messages.at(-1)?.seq !== undefined),
+  });
+});
+
+/** 聊天控制台发消息：把一段文本作为用户 turn 注入既有会话（复用
+ *  triggerSessionTurn 的 existing-session 路径：live worker 直投 / 休眠重 fork）。
+ *  - `suppressFeishuReply: true`（默认）→ 回复不进飞书，只通过本地 archive +
+ *    SSE chat.message 回流前端；飞书里 @bot 的正常对话完全不受影响。
+ *  - `suppressFeishuReply: false` → 与在飞书里发消息等价（回复走卡片）。
+ *  权限：dashboard 外层 authed-only；IPC 层 loopback-trusted（与 /api/trigger 同边界）。 */
+ipcRoute('POST', '/api/sessions/:sessionId/messages', async (req, res, params) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { ok: false, error: 'bot_not_found' });
+  const activeSessions = getActiveSessionsRegistry();
+  if (!activeSessions) return jsonRes(res, 503, { ok: false, error: 'registry_unavailable' });
+  const session = findSessionRecord(params.sessionId);
+  if (!session) return jsonRes(res, 404, { ok: false, error: 'session_not_found' });
+  const appId = session.larkAppId || cachedLarkAppId;
+  let body: { content?: unknown; suppressFeishuReply?: unknown; clientTurnId?: unknown } & Record<string, unknown>;
+  try {
+    body = await readJsonBody<{ content?: unknown; suppressFeishuReply?: unknown; clientTurnId?: unknown } & Record<string, unknown>>(req);
+  } catch {
+    return jsonRes(res, 400, { ok: false, error: 'invalid_json' });
+  }
+  const content = typeof body.content === 'string' ? body.content.trim() : '';
+  if (!content || content.length > 64 * 1024) {
+    return jsonRes(res, 400, { ok: false, error: 'content_required' });
+  }
+  // Client-provided turn id: lets the console's optimistic bubble match the
+  // archived user message (SSE chat.message carries the same turnId) so the
+  // live event replaces — never duplicates — the local bubble. Length-capped
+  // and sanitized; never trusted for routing.
+  const rawClientTurnId = typeof body.clientTurnId === 'string' ? body.clientTurnId.trim() : '';
+  const clientTurnId = /^[A-Za-z0-9_-]{1,64}$/.test(rawClientTurnId) ? rawClientTurnId : undefined;
+  const suppressFeishuReply = body.suppressFeishuReply !== false;
+  const triggerId = clientTurnId ?? `ui_${randomUUID()}`;
+  const request: import('../services/trigger-types.js').TriggerRequest = {
+    source: {
+      type: 'ui',
+      connectorId: 'dashboard-chat',
+      requestId: triggerId,
+      receivedAt: new Date().toISOString(),
+    },
+    target: {
+      kind: 'turn',
+      botId: appId,
+      sessionId: params.sessionId,
+    },
+    envelope: {
+      format: 'botmux-console/v1',
+      sourceName: 'dashboard',
+      trusted: false,
+      rawText: content,
+    },
+    ...(suppressFeishuReply
+      ? {
+          presentation: { topicMessage: null },
+          options: { suppressFinalOutput: true, asyncReturnSessionId: false },
+        }
+      : {}),
+  };
+  try {
+    // NOTE: intentionally NO `stableTurnId` — the loud-suppression path
+    // (`options.suppressFinalOutput`) requires `!stableTurnId` to arm; a stable
+    // id would silently skip the gate and leak the reply into Feishu.
+    // `userInputOverride` makes the CLI see a clean user message rather than
+    // an "external event" envelope.
+    const result = await triggerSessionTurn(request, { larkAppId: appId, activeSessions }, {
+      persistInputHistory: true,
+      userInputOverride: content,
+    });
+    // Archive only AFTER the dispatch was accepted: a rejected console send
+    // must not leave a phantom user message (the frontend rolls its optimistic
+    // bubble back on !ok, and an archived row would resurface it via the SSE
+    // buffer). Successful dispatch → archive + broadcast.
+    if (result.ok) {
+      const archived = appendSessionMessage(params.sessionId, {
+        role: 'user',
+        content,
+        turnId: triggerId,
+        senderName: 'console',
+      });
+      if (archived) {
+        dashboardEventBus.publish({
+          type: 'chat.message',
+          body: { sessionId: params.sessionId, message: archived },
+        });
+      }
+    }
+    const status = result.ok
+      ? 200
+      : result.errorCode === 'session_not_found' ? 404
+      : result.errorCode === 'idempotency_conflict' ? 409
+      : result.errorCode === 'chat_not_allowed' ? 403
+      : 500;
+    return jsonRes(res, status, { ...result, sessionId: params.sessionId });
+  } catch (err: any) {
+    return jsonRes(res, 500, { ok: false, errorCode: 'trigger_failed', error: err?.message ?? String(err) });
   }
 });
 

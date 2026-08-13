@@ -1,6 +1,16 @@
 // Reactive client cache + SSE consumer for the botmux dashboard SPA.
 type Session = Record<string, any> & { sessionId: string; status: string };
 type Schedule = Record<string, any> & { id: string };
+export interface ChatMessage {
+  seq: number;
+  role: 'user' | 'bot';
+  content: string;
+  senderId?: string;
+  senderName?: string;
+  turnId?: string;
+  messageId?: string;
+  createTime: number;
+}
 
 export interface StoreSnapshot {
   sessions: ReadonlyMap<string, Session>;
@@ -11,6 +21,9 @@ export interface StoreSnapshot {
    *  schedule nextRunAt/lastRunAt in the SAME zone regardless of browser zone.
    *  Empty ⇒ fall back to the browser's local zone (legacy behavior). */
   scheduleTimeZone: string;
+  /** Live chat-console messages, appended from `chat.message` SSE events.
+   *  Keyed by sessionId; arrays are newest-last. */
+  chatMessages: ReadonlyMap<string, ChatMessage[]>;
 }
 
 class Store {
@@ -18,6 +31,9 @@ class Store {
   schedules = new Map<string, Schedule>();
   online = true;
   scheduleTimeZone = '';
+  /** Bounded per-session live chat buffer (SSE only; full history comes from
+   *  GET /api/sessions/:id/messages on selection). */
+  private chatMessages = new Map<string, ChatMessage[]>();
   private version = 0;
   private snapshot: StoreSnapshot = {
     sessions: this.sessions,
@@ -25,12 +41,29 @@ class Store {
     online: this.online,
     version: this.version,
     scheduleTimeZone: this.scheduleTimeZone,
+    chatMessages: this.chatMessages,
   };
   private listeners = new Set<() => void>();
   // Bot roster changes don't live in this cache (the Bot 配置 page owns its own
   // /api/bots fetch), so relay them through a dedicated listener set instead of
   // bumping the snapshot version. Signature-deduped server-side.
   private botsListeners = new Set<() => void>();
+
+  /** Append a live chat message to the SSE buffer for a session (bounded). */
+  private pushChatMessage(sessionId: string, message: ChatMessage) {
+    const list = this.chatMessages.get(sessionId);
+    if (list) {
+      list.push(message);
+      if (list.length > 500) list.splice(0, list.length - 500);
+    } else {
+      this.chatMessages.set(sessionId, [message]);
+    }
+  }
+
+  /** Reset the live chat buffer for a session (called when history is loaded). */
+  clearChatMessages(sessionId: string) {
+    this.chatMessages.delete(sessionId);
+  }
 
   setScheduleTimeZone(tz: string) {
     if (typeof tz === 'string' && tz && this.scheduleTimeZone !== tz) {
@@ -56,6 +89,10 @@ class Store {
     } else if (type === 'session.exited') {
       const cur = this.sessions.get(body.sessionId);
       if (cur) this.sessions.set(body.sessionId, { ...cur, status: 'closed' });
+    } else if (type === 'chat.message') {
+      if (typeof body?.sessionId === 'string' && body?.message) {
+        this.pushChatMessage(body.sessionId, body.message as ChatMessage);
+      }
     } else if (type === 'schedule.created') {
       this.schedules.set(body.schedule.id, body.schedule);
     } else if (type === 'schedule.updated') {
@@ -91,6 +128,7 @@ class Store {
       online: this.online,
       version: this.version,
       scheduleTimeZone: this.scheduleTimeZone,
+      chatMessages: this.chatMessages,
     };
     for (const fn of this.listeners) fn();
   }
@@ -105,7 +143,7 @@ export async function bootstrap() {
   let snapshotReady = false;
   const es = new EventSource('/events');
   const types = [
-    'session.spawned', 'session.update', 'session.exited',
+    'session.spawned', 'session.update', 'session.exited', 'chat.message',
     'schedule.created', 'schedule.updated', 'schedule.deleted',
     'schedule.fired', 'schedule.timezone', 'bots.changed', 'heartbeat',
   ];

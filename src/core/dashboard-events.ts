@@ -12,6 +12,7 @@ export type DashboardEvent =
   | { type: 'schedule.fired';    body: { id: string; runAt: number; status: 'ok'|'error'; error?: string } }
   | { type: 'schedule.timezone'; body: { timezone: string } }
   | { type: 'bots.changed';      body: { signature: string } }
+  | { type: 'chat.message';      body: { sessionId: string; message: import('../services/session-message-store.js').SessionMessage } }
   | { type: 'heartbeat';         body: { ts: number } };
 
 export type Subscriber = (event: DashboardEvent) => void;

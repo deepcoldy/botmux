@@ -4073,6 +4073,17 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    // 聊天控制台：本地留存消息历史（会话对话流）。owner-only，与 history 同白名单边界。
+    if (req.method === 'GET' && (m = url.pathname.match(/^\/api\/sessions\/([^/]+)\/messages$/))) {
+      const sid = decodeURIComponent(m[1]);
+      const owner = aggregator.ownerOf(sid);
+      if (!owner) return jsonRes(res, 404, { ok: false, error: 'unknown_session' });
+      const upstream = await proxyToDaemon(owner, `/api/sessions/${sid}/messages${url.search ?? ''}`, { method: 'GET' });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+
     // 单会话元信息（状态/标题/cli/工作目录等）。dashboard 之前只代理了
     // GET /api/sessions（列表），没有单会话 :id 路由，编程式调用方（如任务
     // 编排器的「任务详情」面板）走 getMeta 会落到最底的 404 not_found_yet。

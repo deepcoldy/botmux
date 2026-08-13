@@ -17,6 +17,7 @@ botmux dashboard rotate   # 轮换 token 并输出新 URL
 ## 功能
 
 - **Sessions**：跨所有 bot 列出活跃 + 已关闭会话，可按 CLI / 状态 / adopt / 文本过滤。点进 detail 可复制各种 ID、关闭会话、多选批量关闭；「定位话题」会让机器人在原话题发一条 **@会话 owner** 的提醒（纯 @、无其它正文）帮你跳回上下文。chat-scope 的会话行还带一个飞书群 AppLink 直达群聊。
+- **Chat（对话）**：覆盖全部会话池的对话控制台——左侧按群列出所有会话，中间展示该会话的本地归档对话（用户输入 + bot 最终回复，Markdown 渲染），底部输入框直接给会话发消息、无需碰飞书。每一轮对话（IM 与控制台发的一样）都会在本地 `<dataDir>/messages/<sessionId>.jsonl` 追加归档，飞书 API 不可达时历史依旧可读；默认控制台回复**不进飞书**（取消勾选「回复不进飞书」则与普通 IM 回合一样发卡片），飞书机器人对其他人照常工作。
 - **Schedules**：列出所有定时任务，可 Run now / Pause / Resume。
 - **Groups**：一键拉新群（自动 @ 通知被邀请人）、拉 bot 入群、自动转让群主；解散群聊、bot 退群（关联会话自动清理）。
 - **团队 / Roles / Bot Defaults**：团队面板做[跨部署协作](/roles)（邀请别人的部署进团队、跨部署拉群）；Roles 管理各 bot 按群人设；Bot Defaults（Bot 配置）配默认行为（新群 oncall、卡片签名、**默认角色**等）。
