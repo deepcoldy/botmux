@@ -50,6 +50,9 @@ describe('buildArchitectGoal', () => {
     expect(goal).toContain('/r/spec.md');
     expect(goal).toContain('dag.json');
     expect(goal).toContain('architect-notes.md');
+    expect(goal).toContain('$BOTMUX_GOAL_OUTPUT_DIR');
+    expect(goal).toContain('$BOTMUX_GOAL_MANIFEST_PATH');
+    expect(goal).toMatch(/relative to.*BOTMUX_GOAL_OUTPUT_DIR/i);
     expect(goal).toContain('Do not start or run the workflow');
     expect(goal).toContain('The host will validate dag.json');
   });
