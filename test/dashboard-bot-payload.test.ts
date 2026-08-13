@@ -21,7 +21,7 @@ describe('dashboard bot payload helpers', () => {
       'defaultWorkingDirAutoWorktree', 'disableStreamingCard', 'docSubscribeDefaultMode',
       'env', 'grantDefaultDurationMs', 'launchShell', 'maxLiveWorkers', 'messageQuotaDefaultLimit', 'model',
       'feedback',
-      'overloadAlert', 'p2pMode', 'privateCard', 'regularGroupMentionMode',
+      'overloadAlert', 'p2pMode', 'p2pOpen', 'privateCard', 'regularGroupMentionMode',
       'regularGroupReplyMode', 'restrictGrantCommands', 'riff', 'sandbox', 'sandboxPaths',
       'silentTurnReactions', 'skillInjection', 'startupCommands', 'substituteMode',
       'summaryMemory', 'summaryMemoryPath', 'summaryRange', 'writableTerminalLinkInCard',

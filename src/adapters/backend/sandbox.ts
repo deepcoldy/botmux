@@ -72,6 +72,7 @@ export function buildCredentialOnlySandboxArgs(input: {
   hideDirectories: string[];
   hideFiles: string[];
   readonlyPaths?: string[];
+  privateReadonlyDirectories?: Array<{ parent: string; directory: string }>;
   workingDir: string;
   cliBin: string;
   cliArgs: string[];
@@ -91,6 +92,20 @@ export function buildCredentialOnlySandboxArgs(input: {
     '--bind', '/', '/',
     '--proc', '/proc',
   ];
+  for (const entry of input.privateReadonlyDirectories ?? []) {
+    const parent = assertCredentialIsolationPath(entry.parent, 'private readonly parent');
+    const directory = assertCredentialIsolationPath(
+      entry.directory,
+      'private readonly directory',
+    );
+    if (!directory.startsWith(`${parent}/`)) {
+      throw new Error(`private readonly directory must be below its parent: ${directory}`);
+    }
+    // Hide every sibling channel first, then expose only the owning directory.
+    // A directory bind (rather than a file bind) observes the worker's atomic
+    // rename-based capability rotations without pinning the old inode.
+    args.push('--tmpfs', parent, '--ro-bind', directory, directory);
+  }
   for (const path of [...new Set(input.readonlyPaths ?? [])].sort()) {
     const normalized = assertCredentialIsolationPath(path, 'readonly path');
     args.push('--ro-bind', normalized, normalized);
@@ -186,6 +201,7 @@ export function prepareCredentialOnlySandbox(input: {
   hideDirectories: string[];
   hideFiles: string[];
   readonlyPaths?: string[];
+  privateReadonlyDirectories?: Array<{ parent: string; directory: string }>;
   workingDir: string;
   cliBin: string;
   cliArgs: string[];

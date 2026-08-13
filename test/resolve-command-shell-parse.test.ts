@@ -2,7 +2,10 @@ import { chmodSync, existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
-import { resolveCommand } from '../src/adapters/cli/registry.js';
+import {
+  macOSBundledCodexCandidates,
+  resolveCommand,
+} from '../src/adapters/cli/registry.js';
 import { shellPathProbes } from '../src/desktop/shared/shell-path-probes.js';
 
 describe('shellPathProbes ladder', () => {
@@ -104,5 +107,16 @@ describe('resolveCommand shell output parsing', () => {
     const command = `botmux-test-missing$(touch ${marker})`;
     expect(resolveCommand(command)).toBe(command);
     expect(existsSync(marker)).toBe(false);
+  });
+});
+
+describe('macOS bundled Codex CLI discovery', () => {
+  it('prefers the current ChatGPT app and retains legacy Codex.app paths', () => {
+    expect(macOSBundledCodexCandidates('/Users/example')).toEqual([
+      '/Applications/ChatGPT.app/Contents/Resources/codex',
+      '/Users/example/Applications/ChatGPT.app/Contents/Resources/codex',
+      '/Applications/Codex.app/Contents/Resources/codex',
+      '/Users/example/Applications/Codex.app/Contents/Resources/codex',
+    ]);
   });
 });

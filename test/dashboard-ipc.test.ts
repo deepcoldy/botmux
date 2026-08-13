@@ -740,6 +740,68 @@ describe('PUT /api/bot-card-prefs — Codex App clean history', () => {
   });
 });
 
+describe('PUT /api/bot-grant-prefs — p2pOpen (私聊对话全开)', () => {
+  it('surfaces it in the Bot Defaults payload and persists explicit on/off', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-p2p-open-'));
+    const configPath = join(dir, 'bots.json');
+    const appId = 'test-p2p-open-app';
+    const prevBotsConfig = process.env.BOTS_CONFIG;
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      writeFileSync(configPath, JSON.stringify([{
+        larkAppId: appId,
+        larkAppSecret: 'secret',
+        cliId: 'claude-code',
+        allowedUsers: ['ou_owner'],
+      }], null, 2));
+      loadBotConfigs().forEach((c: any) => registerBot(c));
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const base = `http://127.0.0.1:${handle.port}`;
+
+      const initial = await (await fetch(`${base}/api/bot-default-oncall`)).json();
+      expect(initial.p2pOpen).toBe(false);
+
+      const on = await fetch(`${base}/api/bot-grant-prefs`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ p2pOpen: true }),
+      });
+      expect(on.status).toBe(200);
+      expect(await on.json()).toMatchObject({ ok: true, p2pOpen: true });
+      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].p2pOpen).toBe(true);
+      expect((await (await fetch(`${base}/api/bot-default-oncall`)).json()).p2pOpen).toBe(true);
+
+      const off = await fetch(`${base}/api/bot-grant-prefs`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ p2pOpen: false }),
+      });
+      expect(off.status).toBe(200);
+      expect(await off.json()).toMatchObject({ ok: true, p2pOpen: false });
+      // Off = key deleted (缺省即关闭)，bots.json 保持干净。
+      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].p2pOpen).toBeUndefined();
+
+      // Non-boolean must not reach the store: it is dropped, so a body carrying
+      // only a bogus p2pOpen is rejected as "no valid fields" (no silent write).
+      const bogus = await fetch(`${base}/api/bot-grant-prefs`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ p2pOpen: 'yes' }),
+      });
+      expect(bogus.status).toBe(400);
+      expect(await bogus.json()).toMatchObject({ ok: false, error: 'no_valid_fields' });
+      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].p2pOpen).toBeUndefined();
+    } finally {
+      if (handle) await handle.close();
+      handle = null;
+      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = prevBotsConfig;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
 describe('PUT/GET /api/message-listeners/:chatId — disabled draft persistence (Bug2: 二刷消失)', () => {
   it('persists a disabled listener that still has a prompt, and GET returns it after reload', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-listener-draft-'));

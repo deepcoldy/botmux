@@ -86,6 +86,18 @@ describe('redactGroupsForPublic', () => {
     ]);
   });
 
+  it('never leaks per-bot permission config even if a roster row starts carrying it', () => {
+    // p2pOpen (私聊对话全开) is admin-only Bot Defaults config. The roster today
+    // is built from botSummaryPayload, which does not carry it — this pins the
+    // allow-list so a future upstream change to the roster shape cannot make an
+    // anonymous visitor able to read which bots accept DMs from anyone.
+    const chats = sampleChats();
+    (chats[0].memberBots[0] as Record<string, unknown>).p2pOpen = true;
+    const out = redactGroupsForPublic(chats) as any[];
+    expect(out[0].memberBots[0]).not.toHaveProperty('p2pOpen');
+    expect(JSON.stringify(out)).not.toContain('p2pOpen');
+  });
+
   it('does not mutate the input (authed callers keep the original oncallChat/description)', () => {
     const input = sampleChats();
     redactGroupsForPublic(input);

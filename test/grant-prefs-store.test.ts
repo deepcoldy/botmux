@@ -162,9 +162,61 @@ describe('grant-prefs store', () => {
     expect(store.getBotGrantPrefs('app_missing')).toEqual({
       restrictGrantCommands: false,
       autoGrantRequestCards: true,
+      p2pOpen: false,
       messageQuotaDefaultLimit: null,
       grantDefaultDurationMs: null,
     });
+  });
+
+  it('defaults p2pOpen to false when unset', async () => {
+    writeConfig();
+    const { registry, store } = await freshModules();
+    registry.loadBotConfigs().forEach(c => registry.registerBot(c));
+
+    expect(store.getBotGrantPrefs('app_default').p2pOpen).toBe(false);
+  });
+
+  it('persists p2pOpen=true and syncs in-memory config (talk gate needs no restart)', async () => {
+    writeConfig({ allowedUsers: ['ou_owner'] });
+    const { registry, store } = await freshModules();
+    registry.loadBotConfigs().forEach(c => registry.registerBot(c));
+
+    const r = await store.updateBotGrantPrefs('app_default', { p2pOpen: true });
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.prefs.p2pOpen).toBe(true);
+
+    expect(readConfig().p2pOpen).toBe(true);
+    // evaluateTalk 读的是内存 config：不同步这里，开关要等 daemon 重启才生效。
+    expect(registry.getBot('app_default').config.p2pOpen).toBe(true);
+  });
+
+  it('removes the p2pOpen key when toggled off (keeps bots.json tidy)', async () => {
+    writeConfig({ p2pOpen: true });
+    const { registry, store } = await freshModules();
+    registry.loadBotConfigs().forEach(c => registry.registerBot(c));
+    // Sanity: the explicit opt-in is parsed before we flip it back off.
+    expect(store.getBotGrantPrefs('app_default').p2pOpen).toBe(true);
+
+    const r = await store.updateBotGrantPrefs('app_default', { p2pOpen: false });
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.prefs.p2pOpen).toBe(false);
+
+    expect(readConfig().p2pOpen).toBeUndefined();
+    expect(registry.getBot('app_default').config.p2pOpen).toBeUndefined();
+  });
+
+  it('partial patch preserves an explicit p2pOpen=true', async () => {
+    writeConfig({ p2pOpen: true });
+    const { registry, store } = await freshModules();
+    registry.loadBotConfigs().forEach(c => registry.registerBot(c));
+
+    // Flip only restrict; the DM opt-in must survive the read-modify-write.
+    await store.updateBotGrantPrefs('app_default', { restrictGrantCommands: true });
+
+    const disk = readConfig();
+    expect(disk.restrictGrantCommands).toBe(true);
+    expect(disk.p2pOpen).toBe(true);
+    expect(registry.getBot('app_default').config.p2pOpen).toBe(true);
   });
 
   it('null defaultLimit deletes messageQuota but preserves quotaState counters', async () => {

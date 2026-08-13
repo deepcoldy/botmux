@@ -200,6 +200,9 @@ export interface CliAdapter {
    *  triggered the resume would be lost. */
   readonly initialPromptArgsIgnoredOnResume?: boolean;
 
+  readonly rawCommandInputMode?: 'paste-line';
+  readonly rawCommandSettleMs?: number;
+
   /** Build a shell command string the user can paste into a terminal to
    *  resume this CLI session locally — independent of botmux. Used by the
    *  "session closed" card so users have an obvious way to keep the

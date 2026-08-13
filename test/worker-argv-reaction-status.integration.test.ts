@@ -250,6 +250,176 @@ setInterval(() => {}, 1_000);
     expect(updates.at(-1)?.status).toBe('idle');
   }, 25_000);
 
+  it('publishes a working card during an argv-baked first turn before it completes', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-worker-pi-first-turn-'));
+    tempDirs.add(root);
+    const dataDir = join(root, 'session');
+    mkdirSync(dataDir, { recursive: true });
+
+    // Argv-baked first prompt (no flushPending). The fake stays running for the
+    // whole first turn, then clears the screen so the turn settles idle. The
+    // window must span at least a couple of SCREEN_UPDATE_INTERVAL_MS ticks so the
+    // first-turn publisher gets a chance to emit the projected working.
+    const fakePi = join(root, 'fake-pi');
+    writeFileSync(fakePi, `#!/usr/bin/env node
+process.stdout.write('Working...\\n');
+setTimeout(() => process.stdout.write('\\x1b[2J\\x1b[HDone without transcript final\\n'), 6_000);
+setInterval(() => {}, 1_000);
+`);
+    chmodSync(fakePi, 0o755);
+
+    const messages: WorkerToDaemon[] = [];
+    const logs: string[] = [];
+    const child = spawn(process.execPath, ['--import', 'tsx', resolve('src/worker.ts')], {
+      cwd: resolve('.'),
+      env: {
+        ...process.env,
+        HOME: root,
+        SESSION_DATA_DIR: dataDir,
+        BOTMUX_SESSION_ID: 'sid-worker-pi-first-turn',
+        LARK_APP_ID: 'app_test',
+        LARK_APP_SECRET: 'secret',
+      },
+      stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+    });
+    children.add(child);
+    child.on('message', raw => messages.push(raw as WorkerToDaemon));
+    child.stdout?.on('data', chunk => logs.push(chunk.toString()));
+    child.stderr?.on('data', chunk => logs.push(chunk.toString()));
+
+    child.send({
+      type: 'init',
+      sessionId: 'sid-worker-pi-first-turn',
+      chatId: 'oc_test',
+      rootMessageId: 'om_root',
+      workingDir: dataDir,
+      cliId: 'pi',
+      cliPathOverride: fakePi,
+      backendType: 'pty',
+      prompt: 'hello from argv',
+      larkAppId: 'app_test',
+      larkAppSecret: 'secret',
+      turnId: 'om_turn',
+    } satisfies DaemonToWorker);
+
+    // The publisher must emit `working` WHILE the first turn is still running —
+    // i.e. before prompt_ready. This log line is the proof it fired through the
+    // first-turn gate (the async sampler stays gated until then). It publishes the
+    // projected status ('working' because isPromptReady is still false), not a
+    // scraped busy marker.
+    await waitForLog(child, logs, 'Argv-baked first prompt in flight — publishing projected working');
+
+    // A working screen_update reached the daemon before the turn ended, and no
+    // prompt_ready has escaped yet. (Without the fix the whole first turn is
+    // silent — the card would sit at `starting` until the terminal idle.)
+    const preReady = messages.filter(
+      (message): message is Extract<WorkerToDaemon, { type: 'screen_update' }> =>
+        message.type === 'screen_update',
+    );
+    expect(preReady.some(message => message.status === 'working'), JSON.stringify(messages)).toBe(true);
+    expect(messages.some(message => message.type === 'prompt_ready'), JSON.stringify(messages)).toBe(false);
+    // Dedup: the publisher sends `working` at most once per first turn even
+    // though it runs every tick (lastSentStatus guard). Count the working
+    // updates emitted before the first prompt_ready lands.
+    await waitForPromptReady(child, messages, logs);
+    const readyIdx = messages.findIndex(message => message.type === 'prompt_ready');
+    const workingBeforeReady = messages
+      .slice(0, readyIdx)
+      .filter(message => message.type === 'screen_update' && message.status === 'working');
+    expect(workingBeforeReady.length, JSON.stringify(messages)).toBe(1);
+
+    // Once the fake clears Working..., the turn settles idle as usual.
+    const updates = await waitForScreenUpdates(child, messages, 1, logs);
+    expect(updates.at(-1)?.status).toBe('idle');
+  }, 25_000);
+
+  it('never lets an idle escape between the two working edges on a Grok-class first turn', async () => {
+    // Grok arms spawnArgvInitialPromptBusy (argv-baked prompt + injectsReadyHook +
+    // reliableTurnTerminal): its FIRST ready edge is pre-execution — the argv-baked
+    // first prompt is still running. markPromptReady() would otherwise publish a
+    // generic snapshot (projected idle, since isPromptReady was just set true)
+    // BEFORE the busy arm re-publishes working. Combined with the first-turn
+    // publisher's working, the daemon would see working→idle and fire
+    // finishTurnReactions() — a premature DONE mid-turn. This regression asserts the
+    // fix: after the first working, no idle may reach the daemon before the busy arm.
+    const root = mkdtempSync(join(tmpdir(), 'botmux-worker-grok-first-turn-'));
+    tempDirs.add(root);
+    const dataDir = join(root, 'session');
+    mkdirSync(dataDir, { recursive: true });
+
+    // Fake Grok: emit output for ~4s (so the 2s first-turn publisher tick fires and
+    // sends the projected working while awaitingFirstPrompt), WITHOUT ever rendering
+    // Grok's busy marker (`Waiting for response…` / `Ctrl+c:cancel`) — otherwise the
+    // screen-idle busy guard would defer readiness and markPromptReady()'s seed
+    // (the code under test) would never run. Then go quiet so the idle detector
+    // drives markPromptReady() (the ready-gate preflight fails without an installed
+    // SessionStart hook, so readiness falls to the idle path — no session_ready IPC
+    // needed). The composer `❯` renders idle-looking; the busy arm is what keeps the
+    // turn `working`, exactly the pre-execution SessionStart shape.
+    const fakeGrok = join(root, 'fake-grok');
+    writeFileSync(fakeGrok, `#!/usr/bin/env node
+process.stdout.write('❯ booting\\n');
+let n = 0;
+const iv = setInterval(() => { process.stdout.write('.'); if (++n >= 8) clearInterval(iv); }, 500);
+setInterval(() => {}, 1_000);
+`);
+    chmodSync(fakeGrok, 0o755);
+
+    const messages: WorkerToDaemon[] = [];
+    const logs: string[] = [];
+    const child = spawn(process.execPath, ['--import', 'tsx', resolve('src/worker.ts')], {
+      cwd: resolve('.'),
+      env: {
+        ...process.env,
+        HOME: root,
+        SESSION_DATA_DIR: dataDir,
+        BOTMUX_SESSION_ID: 'sid-worker-grok-first-turn',
+        LARK_APP_ID: 'app_test',
+        LARK_APP_SECRET: 'secret',
+      },
+      stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+    });
+    children.add(child);
+    child.on('message', raw => messages.push(raw as WorkerToDaemon));
+    child.stdout?.on('data', chunk => logs.push(chunk.toString()));
+    child.stderr?.on('data', chunk => logs.push(chunk.toString()));
+
+    child.send({
+      type: 'init',
+      sessionId: 'sid-worker-grok-first-turn',
+      chatId: 'oc_test',
+      rootMessageId: 'om_root',
+      workingDir: dataDir,
+      cliId: 'grok',
+      cliPathOverride: fakeGrok,
+      backendType: 'pty',
+      prompt: 'hello from argv',
+      larkAppId: 'app_test',
+      larkAppSecret: 'secret',
+      turnId: 'om_turn',
+    } satisfies DaemonToWorker);
+
+    // The first-turn publisher emits the projected working before any ready edge.
+    await waitForLog(child, logs, 'Argv-baked first prompt in flight — publishing projected working');
+    // Then the Grok-class busy arm runs inside markPromptReady() and re-publishes
+    // working. Reaching this log proves we passed the generic-snapshot point (9337)
+    // that the fix must keep from emitting idle.
+    await waitForLog(child, logs, 'reporting working (not idle) so turn reactions can settle later');
+    // Let any stray snapshot land.
+    await new Promise(resolvePromise => setTimeout(resolvePromise, 500));
+
+    // The daemon-visible sequence up to the busy arm must be all-working, no idle:
+    // the publisher's working, then the arm's working — and crucially NO idle in
+    // between (that idle is what fired the premature DONE / the 工作中→等待输入→工作中
+    // flicker).
+    const statuses = messages
+      .filter((m): m is Extract<WorkerToDaemon, { type: 'screen_update' }> => m.type === 'screen_update')
+      .map(m => m.status);
+    expect(statuses.length, JSON.stringify(messages)).toBeGreaterThanOrEqual(1);
+    expect(statuses.includes('working'), JSON.stringify(messages)).toBe(true);
+    expect(statuses.includes('idle'), JSON.stringify(messages)).toBe(false);
+  }, 25_000);
+
   it.skipIf(!tmuxAvailable)('keeps an adopted Pi pane working until its viewport loses Working...', async () => {
     const root = mkdtempSync(join(tmpdir(), 'botmux-worker-pi-adopt-busy-'));
     tempDirs.add(root);

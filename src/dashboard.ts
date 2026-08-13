@@ -17,7 +17,7 @@ import { listenWithProbe } from './utils/listen-with-probe.js';
 import {
   parseCookie, buildSetCookie, verifyHmac, cliAuthBind, decideDashboardAuth,
   loadPersistedToken, loadOrCreatePersistedToken, rotatePersistedToken,
-  loadDashboardSecret, loadOrCreateDashboardSecret,
+  loadDashboardSecret, loadOrCreateDashboardSecret, describeDashboardTokenError,
 } from './dashboard/auth.js';
 import { DaemonRegistry, botsRosterSignature } from './dashboard/registry.js';
 import { Aggregator, subscribeDaemon } from './dashboard/aggregator.js';
@@ -825,7 +825,7 @@ function vcMeetingConsumerProfilesApiDeps(): VcMeetingConsumerProfilesApiDeps {
         return false;
       }
     },
-    managedSideEffectIsolation: bot => evaluateVcMeetingConsumerIsolation({
+    managedSideEffectEligible: bot => evaluateVcMeetingConsumerIsolation({
       sandbox: bot.sandbox,
       platform: process.platform,
       backendType: resolvePairedSpawnBackendType(
@@ -835,6 +835,19 @@ function vcMeetingConsumerProfilesApiDeps(): VcMeetingConsumerProfilesApiDeps {
         config.daemon.backendType,
       ),
     }).ok,
+    sandboxIsolated: bot => {
+      const decision = evaluateVcMeetingConsumerIsolation({
+        sandbox: bot.sandbox,
+        platform: process.platform,
+        backendType: resolvePairedSpawnBackendType(
+          bot.cliId ?? config.daemon.cliId,
+          undefined,
+          bot.backendType,
+          config.daemon.backendType,
+        ),
+      });
+      return decision.ok && decision.isolated;
+    },
     reloadDaemons: reloadVcMeetingBotConfigOnDaemons,
   };
 }
@@ -2872,7 +2885,7 @@ const server = createServer(async (req, res) => {
         return jsonRes(res, 200, dashboardUrlsFor(token));
       } catch (e) {
         logger.warn(`[dashboard] Failed to persist token to ${TOKEN_PATH}: ${(e as Error).message}`);
-        return jsonRes(res, 500, { error: 'token_persist_failed' });
+        return jsonRes(res, 500, describeDashboardTokenError('token_persist_failed', e, TOKEN_PATH));
       }
     }
 
@@ -2886,7 +2899,7 @@ const server = createServer(async (req, res) => {
         return jsonRes(res, 200, dashboardUrlsFor(token));
       } catch (e) {
         logger.warn(`[dashboard] Failed to ensure token at ${TOKEN_PATH}: ${(e as Error).message}`);
-        return jsonRes(res, 500, { error: 'token_persist_failed' });
+        return jsonRes(res, 500, describeDashboardTokenError('token_persist_failed', e, TOKEN_PATH));
       }
     }
 
@@ -2900,7 +2913,7 @@ const server = createServer(async (req, res) => {
         token = loadPersistedToken(TOKEN_PATH);
       } catch (e) {
         logger.warn(`[dashboard] Failed to read token from ${TOKEN_PATH}: ${(e as Error).message}`);
-        return jsonRes(res, 500, { error: 'token_unavailable' });
+        return jsonRes(res, 500, describeDashboardTokenError('token_unavailable', e, TOKEN_PATH));
       }
       if (!token) return jsonRes(res, 404, { error: 'no_active_token' });
       return jsonRes(res, 200, dashboardUrlsFor(token));
@@ -5288,7 +5301,8 @@ const server = createServer(async (req, res) => {
 
     // PUT /api/bots/:appId/grant-prefs — proxy to that bot's daemon. Body carries
     // any subset of `{ restrictGrantCommands?: boolean, autoGrantRequestCards?: boolean,
-    // messageQuotaDefaultLimit?: number|null, grantDefaultDurationMs?: number|null }`.
+    // p2pOpen?: boolean, messageQuotaDefaultLimit?: number|null,
+    // grantDefaultDurationMs?: number|null }`.
     let mBotGrantPrefs: RegExpMatchArray | null;
     if (req.method === 'PUT' && (mBotGrantPrefs = url.pathname.match(/^\/api\/bots\/([^/]+)\/grant-prefs$/))) {
       const appId = decodeURIComponent(mBotGrantPrefs[1]);

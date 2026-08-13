@@ -51,6 +51,7 @@ describe('buildBotmuxEnvAssignments()', () => {
       IS_SANDBOX: '1',
       BOTMUX_LARK_APP_ID: 'cli_namespaced',
       BOTMUX_TURN_ID: 'om_turn',
+      BOTMUX_ORIGIN_CHANNEL_ID: 'ab'.repeat(32),
       // None of the rest should appear — those come from rcfile.
       PATH: '/usr/bin',
       HOME: '/home/u',
@@ -64,6 +65,7 @@ describe('buildBotmuxEnvAssignments()', () => {
       'IS_SANDBOX=1',
       'BOTMUX_LARK_APP_ID=cli_namespaced',
       'BOTMUX_TURN_ID=om_turn',
+      `BOTMUX_ORIGIN_CHANNEL_ID=${'ab'.repeat(32)}`,
     ]);
     expect(out.some(s => s.startsWith('LARK_APP_ID='))).toBe(false);
     expect(out.some(s => s.startsWith('LARK_APP_SECRET='))).toBe(false);

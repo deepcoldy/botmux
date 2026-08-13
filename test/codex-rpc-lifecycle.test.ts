@@ -394,7 +394,7 @@ describe('killAndVerifyPersistentPane — verifies the resolved name without re-
     const probed: string[] = [];
     const gone = await killAndVerifyPersistentPane('bmx-12345678', {
       kill: (name) => { killed.push(name); },
-      isLive: (name) => { probed.push(name); return true; },
+      probeLive: (name) => { probed.push(name); return 'live'; },
       wait: async () => {},
     }, 2, 0);
     expect(gone).toBe(false);
@@ -407,11 +407,43 @@ describe('killAndVerifyPersistentPane — verifies the resolved name without re-
     let kills = 0;
     const gone = await killAndVerifyPersistentPane('bmx-abcdef12', {
       kill: () => { kills += 1; if (kills === 2) live = false; },
-      isLive: () => live,
+      probeLive: () => (live ? 'live' : 'gone'),
       wait: async () => {},
     }, 4, 0);
     expect(gone).toBe(true);
     expect(kills).toBe(2);
+  });
+
+  /**
+   * Regression: an unanswered liveness probe must never be reported as a
+   * verified kill. `TmuxBackend.hasSession()` (and its zellij/herdr/zmx peers)
+   * return `false` for BOTH "session absent" and "probe timed out", because
+   * they collapse the tri-state `probeSession()` to `=== 'exists'`. Feeding
+   * that boolean into this function turned a load-induced timeout into proof of
+   * absence, letting a surviving dead-`--remote` pane be reattached to the
+   * fresh-port engine — the P0 freeze this layer exists to prevent.
+   */
+  it('does NOT report a verified kill when every probe is indeterminate', async () => {
+    let kills = 0;
+    const gone = await killAndVerifyPersistentPane('bmx-deadbeef', {
+      kill: () => { kills += 1; },
+      probeLive: () => 'unknown',
+      wait: async () => {},
+    }, 3, 0);
+    expect(gone).toBe(false);
+    // 'unknown' is a reason to look again, so the retries are still spent.
+    expect(kills).toBe(3);
+  });
+
+  it('accepts a later authoritative "gone" after earlier indeterminate probes', async () => {
+    const answers: Array<'unknown' | 'gone'> = ['unknown', 'unknown', 'gone'];
+    let i = 0;
+    const gone = await killAndVerifyPersistentPane('bmx-cafe1234', {
+      kill: () => {},
+      probeLive: () => answers[Math.min(i++, answers.length - 1)],
+      wait: async () => {},
+    }, 4, 0);
+    expect(gone).toBe(true);
   });
 });
 

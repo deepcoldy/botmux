@@ -2868,6 +2868,30 @@ function reclaimParkedCrashDiagnostic(ds: DaemonSession): void {
   try { unlinkSync(join(config.session.dataDir, 'crash-diagnostics', `${ds.session.sessionId}.ansi`)); } catch { /* absent — benign */ }
 }
 
+/**
+ * Consume a queued suspend claim once its goal state is reached.
+ *
+ * A claim only ever means "suspend the generation that is producing right now".
+ * It is therefore consumed the moment that generation stops running, by ANY
+ * route — the deferred checkpoint itself, a `/cd` or read-isolation switch that
+ * suspended first, or an outright crash. Leaving it set is not a harmless
+ * no-op: `runPendingSuspendIfSettled` fires on the NEXT generation's first
+ * screen checkpoint, and its `ownsGeneration` predicate passes there (that
+ * worker legitimately owns the session), so the replacement gets suspended for
+ * a request that was never about it.
+ *
+ * The old code did have a "worker already gone → drop the flag" branch, but it
+ * lived inside the checkpoint — which by definition stops running once the
+ * session goes quiet. The clear needs to hang off the lifecycle events instead.
+ */
+function clearPendingSuspendClaim(ds: DaemonSession, why: string): void {
+  if (ds.pendingSuspendReason === undefined && ds.pendingSuspendGeneration === undefined) return;
+  const reason = ds.pendingSuspendReason;
+  ds.pendingSuspendReason = undefined;
+  ds.pendingSuspendGeneration = undefined;
+  logger.debug(`[${tag(ds)}] Cleared queued suspend claim (${reason ?? 'none'}): ${why}`);
+}
+
 export function suspendWorker(ds: DaemonSession, reason = 'suspended_idle'): boolean {
   if (hasProtectedSessionMutationOwnership(ds)) {
     logger.warn(`[${tag(ds)}] Refused worker suspend (${reason}) while Codex App dispatch ownership is non-empty`);
@@ -2941,9 +2965,100 @@ export function suspendWorker(ds: DaemonSession, reason = 'suspended_idle'): boo
       },
     });
   }
+  // Goal state reached. Whoever queued a suspend for this generation got what
+  // they asked for — including the paths that never touch the deferred
+  // checkpoint (`/cd`, read-isolation switch, sweepIdleWorkers).
+  clearPendingSuspendClaim(ds, `suspended (${reason})`);
   logger.info(`[${tag(ds)}] Worker + CLI suspended (${reason}); session stays active, cold-resumes from transcript on next message`);
   return true;
 }
+
+/**
+ * Cash in a queued suspend. Called once the session leaves the producing states
+ * it was queued for; a no-op during working/analyzing — that IS why it queued.
+ *
+ * Callers MUST defer this out of the status handler's synchronous body
+ * (queueMicrotask) — suspendWorker clears `ds.worker` and `ds.lastScreenStatus`,
+ * and the rest of that handler still reads both to record the usage delta, flip
+ * the turn reaction ✋→✅, emit the state-transition hook, and render the final
+ * card. Running it inline would skip exactly the turn-completion bookkeeping
+ * this whole feature exists to protect.
+ *
+ * `ownsGeneration` is the calling handler's generation check (`ownsWorkerSession`),
+ * and it is **defense-in-depth** — not a guard against a race anyone has shown to
+ * be reachable today. Two earlier drafts of this comment each claimed a concrete
+ * race; both were wrong, so the reasoning is spelled out here to stop a third:
+ *
+ *   - It is NOT "a stale worker's late `idle` reaches `screenshot_uploaded`":
+ *     the message handler's fence (`if (ds.worker !== worker) return`) sits
+ *     BEFORE the switch and already drops every message from a replaced worker.
+ *   - It is NOT "two microtasks in one tick, the first suspends + re-forks and
+ *     the second meets the replacement": `suspendWorker` only nulls `ds.worker`,
+ *     it never re-forks (a re-fork is driven by external input, i.e. a later
+ *     MACROtask), and the microtask queue drains without letting one in. The
+ *     second microtask therefore sees `ds.worker === null` and this predicate
+ *     early-returns on that — a replacement is not what it meets.
+ *
+ * What it does buy: a queued callback can only ever act while its own generation
+ * still owns the session. That keeps this deferral safe against future callers,
+ * new synchronous side effects between enqueue and drain, and any path that
+ * starts re-forking earlier than today. Consuming the claim is a destructive act
+ * on a live worker, so it is worth gating even without a demonstrated race.
+ * A checkpoint from a generation that no longer owns the session keeps the flag
+ * pending; only the owning generation may consume it.
+ *
+ * Deliberately the generation check ALONE, not `ownsLifecycleMutation` (which
+ * also folds in "not transferring"): a routing transfer is a temporary refusal,
+ * not a lost claim, and it is suspendWorker's own guard to make. Screen updates
+ * stop once a session sits quiet, so treating transfer as "not ours" would park
+ * the flag with no later checkpoint to revive it — hence the explicit
+ * transfer-settled retry below.
+ */
+function runPendingSuspendIfSettled(ds: DaemonSession, ownsGeneration?: () => boolean): void {
+  const reason = ds.pendingSuspendReason;
+  if (!reason) return;
+  if (ownsGeneration && !ownsGeneration()) return;
+  // A claim belongs to the generation that was producing when it was queued.
+  // Reaching a LATER generation means its own fulfilment checkpoint never ran
+  // (crash, or another path suspended first) — consume it rather than suspend a
+  // worker the request never asked about. clearPendingSuspendClaim covers the
+  // normal exits; this is the backstop for a claim that slipped past them.
+  if (
+    ds.pendingSuspendGeneration !== undefined
+    && ds.workerGeneration !== undefined
+    && ds.pendingSuspendGeneration !== ds.workerGeneration
+  ) {
+    clearPendingSuspendClaim(ds, 'generation changed');
+    return;
+  }
+  const st = ds.lastScreenStatus;
+  if (st !== 'idle' && st !== 'limited') return;
+  // Worker already gone (crash / suspended by another path): the goal state is
+  // reached, so drop the flag. Falling through to suspendWorker would take its
+  // no-worker branch and clear managedTurnOrigin/workerReady for a generation
+  // this queued request never owned.
+  if (!ds.worker || ds.worker.killed) {
+    clearPendingSuspendClaim(ds, 'worker already gone');
+    return;
+  }
+  // Clear only on success. suspendWorker refuses mid-routing-transfer (and for a
+  // backend that stopped being suspendable), and that refusal is temporary —
+  // eating the flag would silently drop the request until the next `suspend all`.
+  if (suspendWorker(ds, reason)) {
+    // suspendWorker already consumed the claim (goal state reached); logging
+    // here keeps the "fulfilled by the deferred path" signal distinguishable
+    // from a suspend that came from anywhere else.
+    logger.info(`[${tag(ds)}] Deferred suspend fulfilled (${reason}) after turn completed`);
+    return;
+  }
+  // Refused by an in-flight transfer: keeping the flag is not enough on its own.
+  // A settled session emits no further screen updates, so there may be no next
+  // checkpoint — re-run when the relay gate releases. Returns false when no
+  // transfer is active (a non-transfer refusal, e.g. pty), which needs no retry.
+  deferUntilSessionTransferSettled(ds, () => runPendingSuspendIfSettled(ds, ownsGeneration));
+}
+
+export const __testOnly_runPendingSuspendIfSettled = runPendingSuspendIfSettled;
 
 function armWorkerKillBackstop(w: ChildProcess, label: string, sigtermMs: number = WORKER_SIGTERM_BACKSTOP_MS): void {
   const sigterm = setTimeout(() => {
@@ -7843,6 +7958,11 @@ function setupWorkerHandlers(
         updateUsageLimitState(ds, msg.usageLimit);
         ds.lastScreenContent = msg.content;
         ds.lastScreenStatus = (msg.usageLimit ?? ds.usageLimit) ? 'limited' : msg.status;
+        // A suspend that arrived mid-turn parked itself here. Defer until this
+        // screen_update has finished using process state — suspendWorker nulls
+        // `worker` + `lastScreenStatus`, which everything below still reads
+        // (usage ledger, turn reactions, transition hook, final card).
+        queueMicrotask(() => runPendingSuspendIfSettled(ds, ownsWorkerSession));
 
         // State-boundary clear: the moment we leave `working` (→ idle/limited),
         // stop the periodic usage refresh immediately — BEFORE the aux-UI /
@@ -8064,6 +8184,14 @@ function setupWorkerHandlers(
         const prevStatus = ds.lastScreenStatus;
         updateUsageLimitState(ds, msg.usageLimit);
         ds.lastScreenStatus = (msg.usageLimit ?? ds.usageLimit) ? 'limited' : msg.status;
+        // Same deferred-suspend checkpoint as the screen_update branch, and
+        // deferred for the same reason (see runPendingSuspendIfSettled).
+        // The predicate is defense-in-depth here: the handler's fence already
+        // dropped every message from a replaced worker before the switch, so a
+        // stale `idle` cannot reach this case at all. Passing it keeps the
+        // deferred callback from acting on a generation that stopped owning the
+        // session between enqueue and drain.
+        queueMicrotask(() => runPendingSuspendIfSettled(ds, ownsWorkerSession));
         emitSessionStateTransitionHook(ds, prevStatus, ds.lastScreenStatus, {
           source: 'screenshot_uploaded',
           imageKey: msg.imageKey,
@@ -8907,12 +9035,13 @@ function setupWorkerHandlers(
           logger.warn(`[${t}] Dropped managed_turn_origin with mismatched sessionId`);
           break;
         }
-        // macOS uses one stable per-session pathname visible inside Seatbelt.
+        // Isolated children use one stable per-session pathname visible through
+        // an exact Seatbelt/bwrap read carve-out.
         // Only the daemon handler for the CURRENT ChildProcess generation may
         // replace it. Stale workers can still emit IPC, but the identity guard
         // above drops them before filesystem mutation, so they cannot overwrite
         // a successor capability (or unlink it during teardown).
-        if (process.platform === 'darwin' && msg.originChannelId) {
+        if (msg.originChannelId) {
           if (!/^[a-f0-9]{64}$/.test(msg.originChannelId)) {
             ds.managedTurnOrigin = undefined;
             logger.error(`[${t}] Refused managed origin publication with an invalid pane channel`);
@@ -9368,6 +9497,11 @@ function setupWorkerHandlers(
       ds.worker = null;
       ds.workerReady = false;
       ds.workerPort = null;
+      // A queued suspend for THIS generation is now moot — the worker it was
+      // about is gone. Leaving it set would suspend the replacement on its
+      // first idle (the deferred checkpoint's own "worker gone" branch cannot
+      // help: it only runs on a screen update that will never arrive).
+      clearPendingSuspendClaim(ds, 'worker exited');
       // Dead worker generation — stop the periodic usage refresh immediately
       // instead of waiting a tick for it to self-clear on !workerHasInitialized.
       clearUsageRefreshTimer(ds);

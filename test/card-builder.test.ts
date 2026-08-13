@@ -393,6 +393,7 @@ describe('buildConfigCard', () => {
         { key: 'autoStartOnNewTopic', on: false },
         { key: 'disableCliBypass', on: false },
         { key: 'restrictGrantCommands', on: false },
+        { key: 'p2pOpen', on: true },
       ],
     });
 
@@ -412,6 +413,34 @@ describe('buildConfigCard', () => {
       (a: any) => a.value?.field === 'usageDisplay' || a.value?.field === 'showUsageInCardFooter',
     );
     expect(usageToggle).toBeFalsy();
+  });
+
+  it('renders the p2pOpen quick-toggle in the security section (zh + en)', () => {
+    const en = parse(buildConfigCard(configData(null), 'en'));
+    const toggle = allActions(en).find((a: any) => a.value?.field === 'p2pOpen');
+    expect(toggle).toBeTruthy();
+    expect(toggle.value.action).toBe('config_toggle');
+    // Fixture has it on → primary + 🟢, same convention as its neighbours.
+    expect(toggle.type).toBe('primary');
+    expect(toggle.text.content).toBe('🟢 Open DMs');
+
+    const zh = parse(buildConfigCard(configData(null), 'zh'));
+    expect(allActions(zh).find((a: any) => a.value?.field === 'p2pOpen').text.content).toBe('🟢 私聊全开');
+
+    // It rides the existing 安全/授权 group — three buttons, no new action row.
+    const securityRow = en.elements
+      .filter((e: any) => e.tag === 'action')
+      .find((e: any) => (e.actions ?? []).some((a: any) => a.value?.field === 'p2pOpen'));
+    expect((securityRow.actions ?? []).map((a: any) => a.value?.field))
+      .toEqual(['disableCliBypass', 'restrictGrantCommands', 'p2pOpen']);
+  });
+
+  it('shows the p2pOpen toggle as off when the bot has not opted in', () => {
+    const data = configData(null);
+    data.booleans = data.booleans.map(b => (b.key === 'p2pOpen' ? { key: 'p2pOpen', on: false } : b));
+    const toggle = allActions(parse(buildConfigCard(data, 'en'))).find((a: any) => a.value?.field === 'p2pOpen');
+    expect(toggle.type).toBe('default');
+    expect(toggle.text.content).toBe('⚪ Open DMs');
   });
 
   it('describes the built-in grant-card and Oncall quota defaults', () => {

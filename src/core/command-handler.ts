@@ -151,11 +151,25 @@ export function formatSlashGroupName(name: string, prefix = ''): string {
  */
 export const EXISTING_SESSION_ONLY_DAEMON_COMMANDS = new Set(['/rename', '/fork', '/forklist']);
 
-export function resolveAdapterDefaultPassthroughCommands(larkAppId?: string): string[] {
+/**
+ * Adapter-scoped default passthrough commands (e.g. Codex's `/goal`).
+ *
+ * `cliIdOverride` lets a caller resolve against a session's FROZEN CLI instead
+ * of the bot's current config — an existing session keeps the runtime it was
+ * created with, so changing `/botconfig cli` must not silently strip an old
+ * interactive Codex session's adapter-scoped `/goal` (nor grant one to a Codex
+ * App session). `defaultPassthroughCommands` is a static per-adapter list and
+ * does not depend on the resolved binary, so when the override diverges from
+ * the bot's current CLI we intentionally drop `cliPathOverride` (it belongs to
+ * the other CLI) and let the adapter resolve with no path hint.
+ */
+export function resolveAdapterDefaultPassthroughCommands(larkAppId?: string, cliIdOverride?: string): string[] {
   if (!larkAppId) return [];
   try {
     const bot = getBot(larkAppId);
-    const adapter = createCliAdapterSync(bot.config.cliId, bot.config.cliPathOverride);
+    const cliId = (cliIdOverride ?? bot.config.cliId) as CliId;
+    const cliPathOverride = cliId === bot.config.cliId ? bot.config.cliPathOverride : undefined;
+    const adapter = createCliAdapterSync(cliId, cliPathOverride);
     const normalized = (adapter.defaultPassthroughCommands ?? [])
       .map(normalizePassthroughCommand)
       .filter((c): c is string => !!c);
@@ -172,12 +186,33 @@ export function resolveAdapterDefaultPassthroughCommands(larkAppId?: string): st
  * daemon commands must keep their daemon semantics, and passthrough is checked
  * BEFORE DAEMON_COMMANDS in the router, so an un-filtered custom `/status`
  * would hijack the daemon's own.
- * Unknown / no bot → falls back to the builtin set unchanged.
+ * Codex App deliberately resolves to an empty set because its runner speaks
+ * App Server rather than an interactive TUI; slash-looking text must use the
+ * structured turn lane. Unknown / no bot → falls back to the builtin set.
  */
-export function resolvePassthroughCommands(larkAppId?: string): Set<string> {
+export function resolvePassthroughCommands(larkAppId?: string, cliIdOverride?: string): Set<string> {
   const effective = new Set(PASSTHROUGH_COMMANDS);
   if (!larkAppId) return effective;
-  for (const c of resolveAdapterDefaultPassthroughCommands(larkAppId)) {
+  // Resolve the EFFECTIVE CLI once and thread it through every layer below
+  // (early return, adapter defaults). An existing session freezes its CLI, so
+  // the override must reach the adapter-scoped defaults too — otherwise a bot
+  // switched to Codex App would still read the current config there and drop a
+  // frozen interactive Codex session's `/goal` (or vice versa). undefined when
+  // the bot is unknown → builtin set only.
+  let effectiveCliId: string | undefined;
+  try {
+    effectiveCliId = cliIdOverride ?? getBot(larkAppId).config.cliId;
+  } catch {
+    /* unknown bot — builtin set only */
+  }
+  // Codex App speaks the structured app-server protocol: its PTY only hosts
+  // botmux's runner/viewer and is not an interactive Codex TUI. Sending a
+  // slash command through raw_input therefore bypasses the App Server turn
+  // ledger; the model still completes the text as an ordinary turn, but the
+  // worker has no pending dispatch to attribute that final to and the session
+  // remains stuck. Keep these messages on the normal structured turn path.
+  if (effectiveCliId === 'codex-app') return new Set();
+  for (const c of resolveAdapterDefaultPassthroughCommands(larkAppId, effectiveCliId)) {
     effective.add(c);
   }
   try {
@@ -3813,29 +3848,44 @@ export async function handleCommand(
         //   ③ 用户在 bots.json 自定义配置的额外透传命令（customPassthroughCommands）
         //   ④ 文件系统自动发现的 CLI 自定义命令 / skill / 插件
         // MCP 的 /mcp__<server>__<prompt> 需运行时握手才能枚举，这里仅按 .mcp.json 提示 server 名。
+        // 展示口径必须与 resolvePassthroughCommands 的实际路由一致：既有会话按其
+        // 冻结的 CLI（session.cliId）解析，不偷读当前 bot 配置——否则切换默认 CLI 后
+        // 清单会与真正生效的透传集合漂移（Codex App 会话展示伪 passthrough，或旧交互
+        // 式会话丢掉 adapter-scoped 命令）。
         const botCfg = ds
           ? getBot(ds.larkAppId).config
           : (larkAppId ? getBot(larkAppId).config : getAllBots()[0]?.config);
-        const cliId = botCfg?.cliId ?? 'claude-code';
+        const effectiveCliId = (ds?.session.cliId ?? botCfg?.cliId ?? 'claude-code') as CliId;
         const cliName = ds
           ? sessionCliDisplayName(ds)
-          : configuredRuntimeDisplayName(botCfg?.cliRuntime) ?? getCliDisplayName(cliId);
+          : configuredRuntimeDisplayName(botCfg?.cliRuntime) ?? getCliDisplayName(effectiveCliId);
         const workingDir = getSessionWorkingDir(ds);
-        const builtin = [...PASSTHROUGH_COMMANDS];
-        const adapterDefaults = resolveAdapterDefaultPassthroughCommands(larkAppId);
+        // Codex App routes everything through the structured turn lane, so it has
+        // NO passthrough surface at all — mirror resolvePassthroughCommands's
+        // early empty return here and skip filesystem discovery (its PTY is the
+        // App Server runner, not an interactive TUI that would honor those).
+        const isCodexApp = effectiveCliId === 'codex-app';
+        const builtin = isCodexApp ? [] : [...PASSTHROUGH_COMMANDS];
+        const adapterDefaults = isCodexApp ? [] : resolveAdapterDefaultPassthroughCommands(larkAppId, effectiveCliId);
         // 只展示「实际生效」的 custom 命令：用与 resolvePassthroughCommands 同一套
         // normalize 过滤掉手写 bots.json 里遮蔽 daemon 命令 / 非法的项（parser 出于
         // 兼容会保留它们，但路由会丢弃），避免 `/status` 之类被展示成可用却走 daemon。
-        const custom = [...new Set(
+        // Codex App 无透传面，custom 也不生效 → 与路由一致清空。
+        const custom = isCodexApp ? [] : [...new Set(
           (botCfg?.customPassthroughCommands ?? [])
             .map(normalizePassthroughCommand)
             .filter((c): c is string => !!c),
         )];
+        // 文件发现按有效会话 CLI 解析；跨 CLI（冻结 ≠ 当前配置）时不套用当前配置的
+        // cliPathOverride（它属于另一个 CLI）。Codex App 直接跳过发现。
+        const adapterPathOverride = effectiveCliId === botCfg?.cliId ? botCfg?.cliPathOverride : undefined;
         let cliAdapter;
-        try {
-          cliAdapter = createCliAdapterSync(cliId, botCfg?.cliPathOverride);
-        } catch (err) {
-          logger.warn(`[${logTag}] /list-slash-command could not create adapter for ${cliId}: ${err instanceof Error ? err.message : String(err)}`);
+        if (!isCodexApp) {
+          try {
+            cliAdapter = createCliAdapterSync(effectiveCliId, adapterPathOverride);
+          } catch (err) {
+            logger.warn(`[${logTag}] /list-slash-command could not create adapter for ${effectiveCliId}: ${err instanceof Error ? err.message : String(err)}`);
+          }
         }
         const discoverySupported = supportsFilesystemCommandDiscovery(cliAdapter);
         const discovered = cliAdapter && discoverySupported
@@ -3859,7 +3909,7 @@ export async function handleCommand(
           ? sessionCliDisplayName(ds)
           : configuredRuntimeDisplayName(botCfg?.cliRuntime)
             ?? getCliDisplayName(botCfg?.cliId ?? 'claude-code');
-        const passthroughCommands = [...resolvePassthroughCommands(helpAppId)];
+        const passthroughCommands = [...resolvePassthroughCommands(helpAppId, ds?.session.cliId)];
         const help = [
           t('help.heading_session', undefined, loc),
           t('help.close', { cliName }, loc),
