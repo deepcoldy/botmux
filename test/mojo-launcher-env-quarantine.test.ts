@@ -120,7 +120,10 @@ describe('the audit file is never the authority (same-user attacker)', () => {
       const entry = buildDeviceIsolationInventory().entries[0];
       expect(entry.disposition, 'deleting the audit file must not grant safe_remote')
         .toBe('blocked');
-      expect(entry.blocker).toBe('mojo_remote_unattested');
+      // The audit record is gone (ENOENT reads as empty, by design), so the block
+      // comes from the unconditional mojo rule — which is exactly the point: the
+      // file's absence changes nothing.
+      expect(entry.blocker).toBe('mojo_local_turn_unconfined');
     } finally {
       resetDeviceIsolationDaemonForTest();
     }
@@ -169,7 +172,7 @@ describe('the audit file is never the authority (same-user attacker)', () => {
       }],
     });
     try {
-      expect(buildDeviceIsolationInventory().entries[0].disposition).not.toBe('safe_remote');
+      expect(buildDeviceIsolationInventory().entries[0].disposition).toBe('blocked');
     } finally {
       resetDeviceIsolationDaemonForTest();
     }
@@ -188,7 +191,7 @@ describe('the audit file is never the authority (same-user attacker)', () => {
       }],
     });
     try {
-      expect(buildDeviceIsolationInventory().entries[0].disposition).not.toBe('safe_remote');
+      expect(buildDeviceIsolationInventory().entries[0].disposition).toBe('blocked');
     } finally {
       resetDeviceIsolationDaemonForTest();
     }
@@ -209,26 +212,85 @@ describe('the audit file is never the authority (same-user attacker)', () => {
       }],
     });
     try {
-      expect(buildDeviceIsolationInventory().entries[0].disposition).not.toBe('safe_remote');
+      expect(buildDeviceIsolationInventory().entries[0].disposition).toBe('blocked');
     } finally {
       resetDeviceIsolationDaemonForTest();
     }
   });
 
-  it('a fully attested live mojo session IS safe_remote (not over-blocking)', () => {
+  it('a FULLY attested live mojo session is STILL blocked', () => {
+    // Production shape, deliberately: `credentialIsolated: false` and no `cliPid`.
+    // A fully-remote mojo takes the credential remote-bypass, so no isolation is
+    // applied and the flag can never be true; and the attestation is emitted right
+    // after spawn, when MojoBackend holds no persistent child. The previous version
+    // of this case passed `credentialIsolated: true` — an input production cannot
+    // produce — and asserted safe_remote, so its "not over-blocking" guarantee was
+    // vacuous.
+    //
+    // Every signal here is as good as mojo can ever look: config proves remote, the
+    // worker is live, the attestation says mojo and matches the generation. It must
+    // still block, because MojoBackend.runTurn() spawns a credentialed local CLI on
+    // THIS host every turn and nothing proves that child is confined or gone.
     setDeviceIsolationDaemonDependenciesForTest({
       listSessions: () => [{
-        sessionId: 'sid-good',
+        sessionId: 'sid-best-case',
         adopted: false,
         frozenBackend: 'mojo' as const,
         workerPresent: true,
         workerGeneration: 5,
         remoteExecutionProven: true,
-        attestation: { backendType: 'mojo' as const, credentialIsolated: true, workerGeneration: 5 },
+        attestation: { backendType: 'mojo' as const, credentialIsolated: false, workerGeneration: 5 },
+      }],
+    });
+    try {
+      const entry = buildDeviceIsolationInventory().entries[0];
+      expect(entry.disposition).toBe('blocked');
+      expect(entry.blocker).toBe('mojo_local_turn_unconfined');
+    } finally {
+      resetDeviceIsolationDaemonForTest();
+    }
+  });
+
+  it('riff KEEPS safe_remote — the exemption is not removed for everyone', () => {
+    // riff genuinely runs off-box over HTTP and owns no local process. Without this
+    // the "block mojo" rule could silently over-block the one backend that does
+    // qualify.
+    setDeviceIsolationDaemonDependenciesForTest({
+      listSessions: () => [{
+        sessionId: 'sid-riff',
+        adopted: false,
+        frozenBackend: 'riff' as const,
+        workerPresent: true,
+        workerGeneration: 2,
       }],
     });
     try {
       expect(buildDeviceIsolationInventory().entries[0].disposition).toBe('safe_remote');
+    } finally {
+      resetDeviceIsolationDaemonForTest();
+    }
+  });
+
+  it('a deleted ledger + clean worker + matching attestation is still blocked', () => {
+    // The reviewer's second counter-example, end to end: record a risk, let the
+    // same-user child delete the audit file, then present a pristine new
+    // generation. The old child has no process-group termination proof, so this
+    // must not become safe_remote.
+    recordQuarantinedLauncherEnvKeys('sid-wiped', ['LD_PRELOAD']);
+    rmSync(join(dir, FILE));
+    setDeviceIsolationDaemonDependenciesForTest({
+      listSessions: () => [{
+        sessionId: 'sid-wiped',
+        adopted: false,
+        frozenBackend: 'mojo' as const,
+        workerPresent: true,
+        workerGeneration: 11,
+        remoteExecutionProven: true,
+        attestation: { backendType: 'mojo' as const, credentialIsolated: false, workerGeneration: 11 },
+      }],
+    });
+    try {
+      expect(buildDeviceIsolationInventory().entries[0].disposition).toBe('blocked');
     } finally {
       resetDeviceIsolationDaemonForTest();
     }
@@ -532,7 +594,7 @@ describe('quarantined sessions stay blocked whether or not a row survives', () =
     try {
       const entry = buildDeviceIsolationInventory().entries[0];
       expect(entry.disposition).toBe('blocked');
-      expect(entry.blocker).toBe('mojo_remote_unattested');
+      expect(entry.blocker).toBe('mojo_local_turn_unconfined');
     } finally {
       resetDeviceIsolationDaemonForTest();
     }
