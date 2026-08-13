@@ -31,6 +31,7 @@ import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
+import { randomUUID } from 'node:crypto';
 import { RunnerControlWriter } from './adapters/cli/runner-control-channel.js';
 
 const DSH_MARKER = '::botmux-dsh:';
@@ -326,10 +327,11 @@ try {
 }
 
 const cwd = args.cwd ? resolve(args.cwd) : process.cwd();
-// Stable across runner restarts so a respawned runner resumes the same dsh
-// session (the worker's stop/cancel path kills and restarts the runner).
-// dsh SessionId is opaque but constrained to a slug charset.
-const dshSessionId = `session-${args.sessionId.replace(/[^a-zA-Z0-9-]/g, '-')}`;
+// One runner process owns one dsh session. The id is random per runner: the
+// dsh SDK server has no create-or-resume, and its persistence layer rejects
+// creating a session whose id already has a log on disk. Cross-restart resume
+// therefore stays a limitation (a restarted runner starts a fresh session).
+const dshSessionId = `session-${randomUUID()}`;
 let client: DshJsonRpcClient;
 let activeTurn: PendingTurn | undefined;
 let shuttingDown = false;

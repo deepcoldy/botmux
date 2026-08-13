@@ -4,6 +4,10 @@
 状态：已实现（v1）
 作者：Monday（AI）
 
+> 2026-08-14 更新：v2 的跨重启 resume/取消经评审回退。dsh SDK server 的 `createSession` 走 `agents.create`，
+> 不调用 `agents.resume`；持久化层拒绝用同 ID 覆盖已有日志。稳定 sessionId 会导致重启后首个 prompt 永久失败。
+> 跨重启 resume 需要 dsh 上游提供 create-or-resume 能力，列为已知限制。
+
 ## 1. 背景与目标
 
 让 botmux 支持把 [deepseek-harness](https://github.com/deepseek-ai/deepseek-harness)（下称 dsh）作为群机器人的 agent 后端：飞书群 @ 机器人 → dsh 执行 → 结果回群，支持同会话多轮。
@@ -203,11 +207,11 @@ runner 在首轮用户消息前插入（后续轮不插）：
 4. **双重沙箱**：默认 cordis.yml 不含 landlock 沙箱插件，v1 靠 botmux 沙箱兜底，无冲突。
 5. **密钥**：DEEPSEEK_API_KEY 走 bots.json env 注入，不进配置文件、不落盘。
 
-## 11. v2 backlog
+## 11. 已知限制（v2 backlog）
 
-- 跨重启 resume（依赖风险 2 的结论）
-- 中断/取消（ACP 或协议扩展）
-- 工具调用卡片化展示（替代纯文本进度行）
-- 权限请求桥接群内人工确认（若走 ACP）
-- 图片消息（resource_link 或多模态块，视 dsh 协议演进）
-- 多 session 并发（一个 runner 多群/多话题）
+- **跨重启 resume**：dsh SDK server 无 create-or-resume；`agents.create` 不 resume，持久化层拒绝同 ID 覆盖。runner 重启后开新会话（随机 sessionId）。需要 dsh 上游支持。
+- **中断/取消**：SDK 协议无 cancel；worker 杀 runner 重拉即取消，但会丢当前会话上下文（配合上一条，无法 resume）。
+- 工具调用卡片化展示（替代纯文本进度行）：worker/渲染层工作，另开。
+- 权限请求桥接群内人工确认：SDK 协议无权限请求语义。
+- 图片消息：协议只收 text；botmux 已有的附件提示会把文件路径写进 prompt，dsh 工具可读取。
+- 多 session 并发：botmux 本来就是一个 bot 会话一个 runner，无实际场景。

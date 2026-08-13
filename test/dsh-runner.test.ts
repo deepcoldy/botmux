@@ -219,6 +219,9 @@ describe('dsh-runner', () => {
 
     const final = parseMarkers(h.stdout).find(m => m.kind === 'final')!;
     expect(final.payload.content).toContain('你好，我是 dsh。');
+    // The fixture logs phase markers: notifications must precede the response.
+    const phases = readPrompts(h).filter((r: any) => r.phase).map((r: any) => r.phase);
+    expect(phases).toEqual(['notifications', 'response']);
   });
 
   it('keeps the identity preamble for the retry after a rejected first prompt', async () => {

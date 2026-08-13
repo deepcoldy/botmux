@@ -204,9 +204,12 @@ function handleLine(line) {
     const messageId = `msg-${msg.id}`;
     const sessionId = msg.params?.sessionId ?? 'unknown';
     if (scenario === 'early-receipt') {
-      // Notifications before the JSON-RPC response.
-      setImmediate(() => runHappyTurn(sessionId, messageId));
+      // Notifications BEFORE the JSON-RPC response (real async ordering:
+      // the real server emits the spliced receipt before returning the ACK).
+      if (logPath) appendFileSync(logPath, JSON.stringify({ phase: 'notifications' }) + '\n');
+      runHappyTurn(sessionId, messageId);
       send({ jsonrpc: '2.0', id: msg.id, result: { messageId } });
+      if (logPath) appendFileSync(logPath, JSON.stringify({ phase: 'response' }) + '\n');
       return;
     }
     send({ jsonrpc: '2.0', id: msg.id, result: { messageId } });
