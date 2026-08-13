@@ -80,6 +80,15 @@ describe('buildArchitectGoal', () => {
     expect(goal).toContain('never emit `permissionMode`');
     expect(goal).toContain('systemPromptAppend');
   });
+
+  it('只生成 schemaVersion 2，并用稳定 output key 编排公开产物', () => {
+    const goal = buildArchitectGoal('/r/spec.md', '/r/spec.json');
+    expect(goal).toContain('"schemaVersion": 2');
+    expect(goal).toContain('"outputs"');
+    expect(goal).toContain('"output": "<stable-output-key>"');
+    expect(goal).toContain('Do not emit legacy `select.name` or `select.path`');
+    expect(goal).toContain('artifact contract table');
+  });
 });
 
 describe('runArchitect', () => {

@@ -37,6 +37,7 @@ import {
 import { finalizeSpec, validateSpec, SpecValidationError } from './spec.js';
 import { runArchitect as realRunArchitect, type RunArchitectInput, type RunArchitectResult } from './architect.js';
 import { loadDag } from './dag-loader.js';
+import { DagValidationError } from './dag.js';
 import { isValidRunId } from './ops-projection.js';
 import {
   botToSnapshot,
@@ -363,7 +364,10 @@ export async function hostArchitect(runDir: string, deps: ArchitectDeps, now: Da
 
     // Assertion 2: do NOT trust architect's self-claim — host validates the dag.
     try {
-      deps.loadDag(res.dagPath);
+      const dag = deps.loadDag(res.dagPath);
+      if (typeof dag !== 'object' || dag === null || (dag as { schemaVersion?: unknown }).schemaVersion !== 2) {
+        throw new DagValidationError(['architect dag.json must use schemaVersion 2']);
+      }
     } catch (err) {
       const problems = (err as { problems?: string[] }).problems ?? [err instanceof Error ? err.message : String(err)];
       const state = transition(runDir, 'spec_approved', { problems }, now);

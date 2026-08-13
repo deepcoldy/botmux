@@ -21,6 +21,7 @@ import {
 
 function baseline(goal = '研究上海并输出上海报告'): SavedWorkflowRevisionDraft {
   const dagTemplate = {
+    schemaVersion: 2 as const,
     nodes: [{
       id: 'research-private-id',
       type: 'goal' as const,
@@ -168,6 +169,7 @@ describe('v3 deterministic parameter distillation compiler', () => {
   it('supports the same allowlist recursively inside a structured-loop body', () => {
     const draft = baseline('prepare');
     const loopDag = {
+      schemaVersion: 2 as const,
       nodes: [{
         id: 'loop', type: 'loop' as const, bot: 'cli_test', depends: [], inputs: [],
         maxIterations: 2,

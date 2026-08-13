@@ -76,6 +76,7 @@ function prepareInput(requestKey = 'om_request_1'): PrepareV3DistillationProposa
 
 function compiledBody(): V3DistillationCompiledBodyV1 {
   const dagTemplate = {
+    schemaVersion: 2 as const,
     nodes: [{
       id: 'research',
       type: 'goal' as const,

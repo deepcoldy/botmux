@@ -50,6 +50,7 @@ function seedSucceededAdHocRun(base: string, runId = 'source-run', goal = 'write
   const runDir = join(base, runId);
   mkdirSync(runDir, { recursive: true });
   const dag = {
+    schemaVersion: 2,
     runId,
     nodes: [{ id: 'work', type: 'goal', goal, depends: [], inputs: [] }],
   };
@@ -173,6 +174,7 @@ describe('Saved Workflow compiler', () => {
       const legacyRevision = {
         ...compiled.revision,
         dagTemplate: {
+          schemaVersion: compiled.revision.dagTemplate.schemaVersion,
           nodes: compiled.revision.dagTemplate.nodes.map((node) =>
             node.type === 'goal'
               ? { ...node, goal: `${node.goal ?? ''}；完成后 botmux send --mention ou_owner "done"` }

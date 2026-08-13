@@ -37,6 +37,10 @@ import {
   type V3ResultSchema,
 } from './dag.js';
 import {
+  validateManifestArtifactContract,
+  type V3ArtifactOutputs,
+} from './artifact-contract-declarations.js';
+import {
   matchLoopExitWhen,
   revisitBudgetStatus,
 } from './core-control.js';
@@ -131,6 +135,7 @@ export function renderGoalFile(
   loopCtx?: { loopId: string; iteration: number; maxIterations: number },
   nodeInstructions?: string,
   hasWorkflowParams = false,
+  outputs?: V3ArtifactOutputs,
 ): string {
   const E = GOAL_ENV;
   const kinds = MANIFEST_FILE_KINDS.join(' | ');
@@ -150,6 +155,18 @@ export function renderGoalFile(
             ]
           : []),
         `List \`result.json\` in the manifest \`files\` array like any other product (its \`path\` is exactly "result.json"). A missing or schema-violating result.json blocks this node.`,
+        '',
+      ]
+    : [];
+  const artifactSection = outputs
+    ? [
+        '## Public artifact outputs (REQUIRED for this node)',
+        'These stable output keys are part of the Workflow interface. Write every declared path under the output directory and list it in the success Manifest with the exact kind:',
+        '',
+        '  ' + JSON.stringify(outputs),
+        '',
+        'Manifest `name` is presentation-only and may be human-readable; downstream nodes resolve these products by output key → declared path.',
+        'A missing path or mismatched kind blocks the run and requires a Workflow revision; ordinary retry is disabled.',
         '',
       ]
     : [];
@@ -185,6 +202,7 @@ export function renderGoalFile(
     ...instructionsSection,
     ...paramsSection,
     ...loopSection,
+    ...artifactSection,
     '## How to complete this node',
     'You are an autonomous agent completing exactly ONE botmux v3 workflow node.',
     'Work toward the goal above until it is done, then stop. Do NOT ask the user with interactive tools (they are disabled in this mode). If you genuinely need a human DECISION to proceed, use the human-ask escape hatch described below (also available as the `botmux-goal-ask` skill).',
@@ -241,6 +259,7 @@ export function classifyTerminal(
   if (opts?.selfReportedFail) return opts.retryable === false ? 'failed' : 'blocked';
   switch (errorClass) {
     case 'manifestInvalid': // agent wrote a bad manifest — a retry may fix it
+    case 'artifactContractInvalid': // definition/manifest public product mismatch
     case 'resultInvalid':   // result.json missing/violating — same
       return 'blocked';
     case 'workerError':     // process crash = infrastructure
@@ -2444,6 +2463,7 @@ export async function runWorkflow(
         loopCtx,
         node.override?.systemPromptAppend,
         !!workflowDataPath,
+        node.outputs,
       ),
     );
 
@@ -2702,6 +2722,17 @@ export async function runWorkflow(
               });
               return;
             }
+          }
+          const artifactContract = validateManifestArtifactContract(node.outputs, verdict.manifest!);
+          if (!artifactContract.ok) {
+            appendWorkerOutcome({
+              type: 'nodeBlocked', nodeId: node.id, ...(instanceId ? { instanceId } : {}), attemptId,
+              errorClass: 'artifactContractInvalid',
+              errorCode: 'OUTPUT_CONTRACT_VIOLATION',
+              recovery: 'reviseWorkflow',
+              message: artifactContract.problems.join('; '),
+            });
+            return;
           }
           appendWorkerOutcome({
             type: 'nodeSucceeded', nodeId: node.id, ...(instanceId ? { instanceId } : {}), attemptId, manifestPath: result.manifestPath,
@@ -3300,6 +3331,7 @@ export async function runWorkflow(
       label: string,
       nodeId: string,
       filter?: (f: Manifest['files'][number]) => boolean,
+      output?: string,
     ): void => {
       // Pin to the source's current effective instance (falls back to nodeId for
       // loop bodies / legacy with no instance).
@@ -3312,6 +3344,7 @@ export async function runWorkflow(
         if (filter && !filter(f)) continue;
         inputs.push({
           from: label,
+          ...(output ? { output } : {}),
           ...(succ.instanceId ? { instanceId: succ.instanceId } : {}),
           name: f.name,
           path: join(upstreamOutputDir, f.path),
@@ -3354,12 +3387,19 @@ export async function runWorkflow(
     // so the agent reads the gap as a known contract issue, not silence.
     const selectorMisses: Array<{ from: string; reason: 'selectorMiss' }> = [];
     const pushRef = (ref: V3InputRef): void => {
-      const filter = ref.select
+      const source = nodesById.get(ref.from);
+      const declaredOutputs = source?.type === 'loop'
+        ? source.body?.nodes.find((bodyNode) => bodyNode.id === source.output?.from)?.outputs
+        : source?.outputs;
+      const declared = ref.output ? declaredOutputs?.[ref.output] : undefined;
+      const filter = declared
+        ? (f: Manifest['files'][number]) => f.path === declared.path
+        : ref.select
         ? (f: Manifest['files'][number]) =>
             ref.select!.name !== undefined ? f.name === ref.select!.name : f.path === ref.select!.path
         : undefined;
       const before = inputs.length;
-      pushFrom(ref.from, ref.from, filter);
+      pushFrom(ref.from, ref.from, filter, ref.output);
       if (ref.select && inputs.length === before) {
         selectorMisses.push({ from: ref.from, reason: 'selectorMiss' });
       }
