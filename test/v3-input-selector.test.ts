@@ -142,6 +142,30 @@ describe('validateDag: v2 output key 契约', () => {
     expect(check(oversized).join('\n')).toContain('exceeds 4096 serialized bytes');
   });
 
+  it.each(['__proto__', 'prototype', 'constructor'])(
+    '保留来自 JSON 的特殊 output key %s 并纳入契约校验',
+    (key) => {
+      const raw = JSON.parse(JSON.stringify({
+        schemaVersion: 2,
+        runId: `special-output-${key}`,
+        nodes: [goal('up')],
+      })) as Record<string, unknown>;
+      const nodes = raw.nodes as Array<Record<string, unknown>>;
+      nodes[0].outputs = JSON.parse(
+        `{${JSON.stringify(key)}:{"path":"special.md","kind":"markdown"}}`,
+      ) as unknown;
+
+      const dag = validateDag(raw);
+      const outputs = dag.nodes[0].outputs!;
+      expect(Object.keys(outputs)).toEqual([key]);
+      expect(Object.prototype.hasOwnProperty.call(outputs, key)).toBe(true);
+      expect(outputs[key]).toEqual({ path: 'special.md', kind: 'markdown' });
+      expect(JSON.parse(JSON.stringify(outputs))).toEqual({
+        [key]: { path: 'special.md', kind: 'markdown' },
+      });
+    },
+  );
+
   it('Loop body 内部同样静态校验 output key', () => {
     const problems = problemsOf(() => validateDag({
       schemaVersion: 2,
@@ -307,6 +331,78 @@ describe('buildInputs: selector 注入与 miss', () => {
         name: 'Human readable report',
         kind: 'markdown',
       }]);
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  it('Loop body 实例保留 output key，仅注入声明的公开产物', async () => {
+    const base = mkdtempSync(join(tmpdir(), 'v3-loop-output-key-'));
+    try {
+      const dag = validateDag({
+        schemaVersion: 2,
+        runId: 'loop-output-key-run',
+        nodes: [{
+          id: 'repair',
+          type: 'loop',
+          depends: [],
+          inputs: [],
+          maxIterations: 1,
+          body: { nodes: [
+            goal('write', {
+              outputs: { patch: { path: 'patch.md', kind: 'markdown' } },
+            }),
+            goal('verify', {
+              depends: ['write'],
+              inputs: [{ from: 'write', output: 'patch' }],
+              resultSchema: {
+                type: 'object',
+                properties: { passed: { type: 'boolean' } },
+                required: ['passed'],
+              },
+            }),
+          ] },
+          exit: { node: 'verify', when: { path: 'result.passed', equals: true } },
+          output: { from: 'write' },
+        }],
+      });
+      let received: GoalInputs | undefined;
+      const runNode: RunNode = async (req) => {
+        if (req.node.id.endsWith('.write')) {
+          return okResult(req, [
+            fileEntry(req.outputDir, 'patch.md', 'PUBLIC PATCH'),
+            fileEntry(req.outputDir, 'private.md', 'PRIVATE NOTES'),
+          ]);
+        }
+        received = JSON.parse(readFileSync(req.inputsPath, 'utf-8')) as GoalInputs;
+        const manifestPath = req.env[GOAL_ENV.MANIFEST_PATH]!;
+        const verified = fileEntry(req.outputDir, 'result.json', JSON.stringify({ passed: true }));
+        verified.kind = 'json';
+        verified.mime = 'application/json';
+        writeFileSync(manifestPath, JSON.stringify({
+          schemaVersion: 1,
+          status: 'ok',
+          summary: 'verified',
+          result: { passed: true },
+          files: [verified],
+        }));
+        return { status: 'ok', manifestPath };
+      };
+
+      const outcome = await runWorkflow(
+        dag,
+        { runNode, validateManifest, resolveBotSnapshot, attemptLeaseProvider },
+        { baseDir: base },
+      );
+
+      expect(outcome).toMatchObject({ reason: 'terminal', runStatus: 'succeeded' });
+      expect(received?.inputs).toHaveLength(1);
+      expect(received?.inputs[0]).toMatchObject({
+        from: 'repair.i001.write',
+        output: 'patch',
+        name: 'patch.md',
+      });
+      expect(readFileSync(received!.inputs[0].path, 'utf-8')).toBe('PUBLIC PATCH');
     } finally {
       rmSync(base, { recursive: true, force: true });
     }

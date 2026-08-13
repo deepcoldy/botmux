@@ -3050,6 +3050,7 @@ export async function runWorkflow(
       inputs: bodyDef.inputs.map((r) => ({
         from: loopInstanceId(ref.loopId, ref.iteration, r.from),
         ...(r.select ? { select: r.select } : {}), // P3: 实例化时保留 selector
+        ...(r.output !== undefined ? { output: r.output } : {}),
       })),
     };
   }
@@ -3387,7 +3388,15 @@ export async function runWorkflow(
     // so the agent reads the gap as a known contract issue, not silence.
     const selectorMisses: Array<{ from: string; reason: 'selectorMiss' }> = [];
     const pushRef = (ref: V3InputRef): void => {
-      const source = nodesById.get(ref.from);
+      // Loop-body refs have already been rewritten to iteration-qualified ids,
+      // which are intentionally absent from the outer DAG map. Resolve the
+      // matching authored body definition so output keys still map to their
+      // declared path instead of degrading to whole-manifest injection.
+      const source = nodesById.get(ref.from) ?? (loopRef
+        ? (nodesById.get(loopRef.loopId) as V3LoopNode).body.nodes.find(
+            (bodyNode) => loopInstanceId(loopRef.loopId, loopRef.iteration, bodyNode.id) === ref.from,
+          )
+        : undefined);
       const declaredOutputs = source?.type === 'loop'
         ? source.body?.nodes.find((bodyNode) => bodyNode.id === source.output?.from)?.outputs
         : source?.outputs;

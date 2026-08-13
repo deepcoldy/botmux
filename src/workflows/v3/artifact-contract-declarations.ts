@@ -45,7 +45,11 @@ export function normalizeArtifactOutputs(
     problems.push(`${where}.outputs exceeds ${V3_ARTIFACT_OUTPUT_MAX_BYTES} serialized bytes`);
   }
 
-  const out: V3ArtifactOutputs = {};
+  // Output keys are authored data and the grammar intentionally permits names
+  // such as "__proto__", "prototype", and "constructor". A normal object would
+  // invoke Object.prototype.__proto__'s setter for the first of those keys and
+  // silently drop the declaration, bypassing contract enforcement.
+  const out = Object.create(null) as V3ArtifactOutputs;
   const paths = new Set<string>();
   for (const [key, raw] of entries) {
     const itemWhere = `${where}.outputs.${JSON.stringify(key)}`;
