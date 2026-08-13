@@ -92,6 +92,149 @@ function mojoDs(opts: {
   } as never as DaemonSession;
 }
 
+/**
+ * TRUST DOMAIN. The audit file is an ordinary same-user file, and the attacker it
+ * describes is a same-user mojo child (`PATH` / `LD_PRELOAD` hijack) that can
+ * simply delete it. These cases pin the property that makes that harmless:
+ * safety comes from POSITIVE live proof over the private parent<->worker IPC, so
+ * removing, truncating or chmod-ing the file can never unblock a session.
+ */
+describe('the audit file is never the authority (same-user attacker)', () => {
+  function workerlessMojoRow() {
+    return [{
+      sessionId: 'sid-attacked',
+      adopted: false,
+      frozenBackend: 'mojo' as const,
+      workerPresent: false,
+    }];
+  }
+
+  it('DELETING the ledger does not unblock a mojo session', () => {
+    recordQuarantinedLauncherEnvKeys('sid-attacked', ['LD_PRELOAD']);
+    expect(existsSync(join(dir, FILE))).toBe(true);
+    // The hijacked child does exactly this.
+    rmSync(join(dir, FILE));
+
+    setDeviceIsolationDaemonDependenciesForTest({ listSessions: workerlessMojoRow });
+    try {
+      const entry = buildDeviceIsolationInventory().entries[0];
+      expect(entry.disposition, 'deleting the audit file must not grant safe_remote')
+        .toBe('blocked');
+      expect(entry.blocker).toBe('mojo_remote_unattested');
+    } finally {
+      resetDeviceIsolationDaemonForTest();
+    }
+  });
+
+  it('DELETING the ledger does not make the proof provable either', () => {
+    rememberAppliedUnprovableEnvKeys(mojoDs({ sessionId: 'sid-attacked2' }), {
+      LD_PRELOAD: '/tmp/hook.so',
+    });
+    rmSync(join(dir, FILE));
+    // A fresh DaemonSession (post-restart, empty in-memory ledger) with a clean
+    // live config: the OLD design returned true here. It must not be the deciding
+    // input any more — provability now needs live attestation, checked by the
+    // inventory case above.
+    const proven = resolveRemoteExecutionProven(mojoDs({
+      sessionId: 'sid-attacked2', backendConfig: { cloud: true },
+    }));
+    // Even if the config-level proof passes, classification must still refuse.
+    setDeviceIsolationDaemonDependenciesForTest({
+      listSessions: () => [{
+        sessionId: 'sid-attacked2',
+        adopted: false,
+        frozenBackend: 'mojo' as const,
+        workerPresent: false,
+        remoteExecutionProven: proven,
+      }],
+    });
+    try {
+      expect(buildDeviceIsolationInventory().entries[0].disposition).toBe('blocked');
+    } finally {
+      resetDeviceIsolationDaemonForTest();
+    }
+  });
+
+  it('a live worker WITHOUT private-IPC attestation is not safe_remote', () => {
+    // workerPresent alone is not evidence: the attestation is what the CLI cannot
+    // forge, so its absence must block.
+    setDeviceIsolationDaemonDependenciesForTest({
+      listSessions: () => [{
+        sessionId: 'sid-noattest',
+        adopted: false,
+        frozenBackend: 'mojo' as const,
+        workerPresent: true,
+        workerGeneration: 7,
+        remoteExecutionProven: true,
+      }],
+    });
+    try {
+      expect(buildDeviceIsolationInventory().entries[0].disposition).not.toBe('safe_remote');
+    } finally {
+      resetDeviceIsolationDaemonForTest();
+    }
+  });
+
+  it('an attestation from a REPLACED generation does not vouch for its successor', () => {
+    setDeviceIsolationDaemonDependenciesForTest({
+      listSessions: () => [{
+        sessionId: 'sid-stalegen',
+        adopted: false,
+        frozenBackend: 'mojo' as const,
+        workerPresent: true,
+        workerGeneration: 9,
+        remoteExecutionProven: true,
+        attestation: { backendType: 'mojo' as const, credentialIsolated: false, workerGeneration: 8 },
+      }],
+    });
+    try {
+      expect(buildDeviceIsolationInventory().entries[0].disposition).not.toBe('safe_remote');
+    } finally {
+      resetDeviceIsolationDaemonForTest();
+    }
+  });
+
+  it('an attestation naming a LOCAL backend does not inherit the remote exemption', () => {
+    // Row says mojo, but the worker actually selected pty — the private IPC is the
+    // one source that knows which backend really started.
+    setDeviceIsolationDaemonDependenciesForTest({
+      listSessions: () => [{
+        sessionId: 'sid-localbackend',
+        adopted: false,
+        frozenBackend: 'mojo' as const,
+        workerPresent: true,
+        workerGeneration: 3,
+        remoteExecutionProven: true,
+        attestation: { backendType: 'pty' as const, credentialIsolated: false, workerGeneration: 3 },
+      }],
+    });
+    try {
+      expect(buildDeviceIsolationInventory().entries[0].disposition).not.toBe('safe_remote');
+    } finally {
+      resetDeviceIsolationDaemonForTest();
+    }
+  });
+
+  it('a fully attested live mojo session IS safe_remote (not over-blocking)', () => {
+    setDeviceIsolationDaemonDependenciesForTest({
+      listSessions: () => [{
+        sessionId: 'sid-good',
+        adopted: false,
+        frozenBackend: 'mojo' as const,
+        workerPresent: true,
+        workerGeneration: 5,
+        remoteExecutionProven: true,
+        attestation: { backendType: 'mojo' as const, credentialIsolated: true, workerGeneration: 5 },
+      }],
+    });
+    try {
+      expect(buildDeviceIsolationInventory().entries[0].disposition).toBe('safe_remote');
+    } finally {
+      resetDeviceIsolationDaemonForTest();
+    }
+  });
+});
+
 describe('quarantine durability and integrity', () => {
   it('survives a daemon restart (every read hits disk, no cache to lose)', () => {
     recordQuarantinedLauncherEnvKeys('sid-1', ['LD_PRELOAD'], dir);
@@ -123,6 +266,42 @@ describe('quarantine durability and integrity', () => {
     writeFileSync(join(dir, FILE), JSON.stringify({ version: 1, sessions: 'nope' }));
     expect(() => quarantinedLauncherEnvKeys('sid-1', dir))
       .toThrow(MojoQuarantineUnavailableError);
+  });
+
+  it('THROWS on EACCES instead of reading it as "file absent"', () => {
+    recordQuarantinedLauncherEnvKeys('sid-1', ['LD_PRELOAD'], dir);
+    chmodSync(join(dir, FILE), 0o000);
+    try {
+      expect(() => quarantinedLauncherEnvKeys('sid-1', dir))
+        .toThrow(MojoQuarantineUnavailableError);
+    } finally {
+      chmodSync(join(dir, FILE), 0o600);
+    }
+  });
+
+  it('THROWS on a non-string key name instead of emptying that session', () => {
+    // `{"sid":[42]}` used to filter down to nothing, silently unquarantining it.
+    writeFileSync(join(dir, FILE), JSON.stringify({ version: 1, sessions: { 'sid-1': [42] } }));
+    expect(() => quarantinedLauncherEnvKeys('sid-1', dir))
+      .toThrow(MojoQuarantineUnavailableError);
+  });
+
+  it('REJECTS an unsupported version', () => {
+    writeFileSync(join(dir, FILE), JSON.stringify({ version: 99, sessions: { 'sid-1': ['PATH'] } }));
+    expect(() => quarantinedLauncherEnvKeys('sid-1', dir))
+      .toThrow(MojoQuarantineUnavailableError);
+  });
+
+  it('holds the cross-process lock while mutating', () => {
+    // The lock is what makes the fresh RMW safe for several per-bot daemons on one
+    // data dir; assert the implementation still takes it.
+    const src = readFileSync(
+      new URL('../src/core/mojo-launcher-env-quarantine.ts', import.meta.url), 'utf8');
+    expect(src).toContain('withFileLockSync(path, () => {');
+    const mutate = src.slice(src.indexOf('export function recordQuarantinedLauncherEnvKeys'));
+    expect(mutate).toContain('withFileLockSync');
+    // …and that the read inside it is fresh, not a cached snapshot.
+    expect(mutate).toContain('const data = readStrict(dataDir);');
   });
 
   it('PROPAGATES a write failure instead of logging and swallowing it', () => {
@@ -336,7 +515,12 @@ describe('quarantined sessions stay blocked whether or not a row survives', () =
     }
   });
 
-  it('leaves an unquarantined workerless row quiescent (no over-blocking)', () => {
+  it('BLOCKS even an unquarantined workerless row (no false quiescence)', () => {
+    // Deliberately stricter than before. The audit ledger is a same-user file the
+    // hijacked child can delete, so "no record" proves nothing — and mojo's
+    // teardown is an unescalated SIGTERM nothing waits on. With no live worker
+    // there is no private-IPC attestation either, so the honest answer is
+    // "cannot prove", not "nothing to tear down".
     setDeviceIsolationDaemonDependenciesForTest({
       listSessions: () => [{
         sessionId: 'sid-clean-workerless',
@@ -346,7 +530,9 @@ describe('quarantined sessions stay blocked whether or not a row survives', () =
       }],
     });
     try {
-      expect(buildDeviceIsolationInventory().entries[0].disposition).toBe('quiescent');
+      const entry = buildDeviceIsolationInventory().entries[0];
+      expect(entry.disposition).toBe('blocked');
+      expect(entry.blocker).toBe('mojo_remote_unattested');
     } finally {
       resetDeviceIsolationDaemonForTest();
     }

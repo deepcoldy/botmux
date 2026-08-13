@@ -63,7 +63,18 @@ export type DeviceIsolationBlocker =
    * Without this the inventory silently loses the only evidence that a hooked
    * client may still hold an activated credential on this host.
    */
-  | 'mojo_launcher_env_residual';
+  | 'mojo_launcher_env_residual'
+  /**
+   * A mojo session that cannot be POSITIVELY proven to run off-box right now.
+   *
+   * The durable quarantine file is a same-user JSON, i.e. inside the very trust
+   * domain it was meant to police: the hijacked mojo child runs as this user and
+   * can simply delete it, which used to flip the proof false -> true. So safety
+   * can no longer rest on remembering past danger — it rests on live evidence the
+   * CLI cannot forge (the private parent<->worker attestation IPC). Absence of
+   * that evidence is this blocker, never `quiescent`.
+   */
+  | 'mojo_remote_unattested';
 
 export interface DeviceIsolationRuntimeSession {
   sessionId: string;
@@ -548,6 +559,32 @@ function hasDurableMojoQuarantine(sessionId: string): boolean {
   }
 }
 
+/**
+ * Is this mojo session provably running off-box RIGHT NOW?
+ *
+ * Every input here is either a live config read or evidence delivered over the
+ * private parent<->worker IPC, which the CLI child cannot forge or delete —
+ * deliberately NOT the durable quarantine file, which is a same-user JSON the
+ * hijacked child can remove. The ledger may still ADD a blocker (defence in
+ * depth); it can never grant provability, so deleting it changes nothing here.
+ */
+function mojoRemoteExecutionAttested(session: DeviceIsolationRuntimeSession): boolean {
+  // Live config proof: cloud on, localDaemon off, no dangerous launcher env, no
+  // wrapper (see resolveRemoteExecutionProven / isMojoFullyRemote).
+  if (session.remoteExecutionProven !== true) return false;
+  // A worker we still own, so the generation below is a live one.
+  if (!session.workerPresent) return false;
+  // Attestation arrives on the private IPC channel and states the backend the
+  // worker actually selected — a session whose row says mojo but which spawned a
+  // local backend must not inherit the remote exemption.
+  const attestation = session.attestation;
+  if (!attestation || attestation.backendType !== 'mojo') return false;
+  // Bind to the current generation: a late attestation from a replaced worker
+  // must never vouch for its replacement (same rule as stale_attestation below).
+  if (session.workerGeneration === undefined) return false;
+  return attestation.workerGeneration === session.workerGeneration;
+}
+
 function classifySession(session: DeviceIsolationRuntimeSession): DeviceIsolationInventoryEntry {
   const backendType = resolvedBackend(session);
   // Before anything else: a durable quarantine record means an unproven hooked
@@ -588,7 +625,7 @@ function classifySession(session: DeviceIsolationRuntimeSession): DeviceIsolatio
   // local path below, where a live worker must still supply process identity.
   // Treating an unproven mojo session as safe_remote would let credential
   // activation proceed while a local `mojo` child is mid-turn.
-  if (backendType === 'riff' || (backendType === 'mojo' && session.remoteExecutionProven === true)) {
+  if (backendType === 'riff' || (backendType === 'mojo' && mojoRemoteExecutionAttested(session))) {
     return {
       sessionId: session.sessionId,
       backendType,
@@ -614,6 +651,13 @@ function classifySession(session: DeviceIsolationRuntimeSession): DeviceIsolatio
     : undefined;
 
   if (!session.workerPresent) {
+    // mojo owns no persistent backing, so it used to land in the `quiescent`
+    // branch below — "nothing to tear down" — even though its last child was only
+    // sent an unescalated SIGTERM that nothing waited on. With no live worker
+    // there is no attestation to prove otherwise, so fail closed instead.
+    if (backendType === 'mojo') {
+      return blockerEntry(session, backendType, 'mojo_remote_unattested');
+    }
     if (!persistent || persistent.probe === 'missing') {
       return {
         sessionId: session.sessionId,

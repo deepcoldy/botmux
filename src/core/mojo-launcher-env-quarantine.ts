@@ -1,52 +1,40 @@
 /**
- * Durable quarantine of dangerous mojo launcher-env KEY NAMES.
+ * AUDIT RECORD of dangerous mojo launcher-env KEY NAMES. NOT a security boundary.
  *
- * Why this has to be on disk, and why it outlives the session row
- * ---------------------------------------------------------------
- * The device-isolation proof must answer "can a hooked mojo client still be
- * running on this host?". Everything that could answer it in memory has been
- * shown to be insufficient:
+ * Trust domain — read this before relying on anything here
+ * -------------------------------------------------------
+ * This is an ordinary file owned by the same user as the daemon, while the threat
+ * it describes is a mojo child hijacked via `PATH` / `LD_PRELOAD` — running as
+ * THAT SAME USER. Such a child can simply delete this file. So it cannot be, and
+ * is not, the authority for device isolation: an earlier design let a missing file
+ * flip `resolveRemoteExecutionProven` from false to true, a credential-boundary
+ * fail-open reachable by the very process being policed.
  *
- *   - `initConfig.env` is a spawn-time snapshot; a live `/restart` hands the
- *     child a different env without updating it.
- *   - the live bot config can be edited back to clean while the child keeps
- *     running the old env.
- *   - a per-generation in-memory ledger dies with the daemon process, and a
- *     `SIGTERM`-ed mojo child (plus any detached descendants) can outlive it.
- *   - the session ROW disappears on an explicit `/close`, while that same
- *     unproven child may still hold an activated credential.
+ * The authority lives on evidence the CLI cannot forge or delete:
+ *   - the private parent<->worker attestation IPC (`local_process_attestation`)
+ *   - live bot config, read at classification time
+ *   - the daemon's in-memory per-generation ledger, untouchable by any child
+ *     within a daemon lifetime
+ * and the rule is POSITIVE proof: a mojo session is `safe_remote` only while all
+ * of that is present, otherwise it is blocked (see mojoRemoteExecutionAttested).
  *
- * So the record is host-scoped and persisted: it survives a daemon restart and
- * survives session deletion. It is keyed by session id purely to bound the blast
- * radius — an unrelated clean session must not be penalised.
+ * What this file is still good for
+ *   - operator-facing audit: WHICH keys a session was handed, across restarts
+ *   - defence in depth: it may only ever ADD a blocker. Its absence must never
+ *     unblock anything — which is precisely why safety no longer depends on it.
  *
- * Only KEY NAMES are stored, never values. `mojoUnprovableEnvKeys` inspects
- * names only, and these keys routinely carry credentials (`X_JWT_TOKEN` is the
- * one allowlisted name and is therefore never recorded here).
- *
- * Failure policy: every operation fails LOUD, never silently "empty"
- * ------------------------------------------------------------------
- * This is a security ledger, so the usual "best-effort store" conventions are
- * inverted:
- *   - a corrupt/unreadable file THROWS instead of degrading to "nothing is
- *     quarantined" (that is the fail-open direction, and it was the first
- *     version's bug — a truncated file silently unblocked every session).
- *   - a failed write PROPAGATES to the caller rather than being logged and
- *     swallowed, so the daemon cannot believe it recorded a risk it did not.
- *   - every mutation runs a FRESH read-modify-write inside a cross-process file
- *     lock. Reusing a cached snapshot loses updates when several per-bot daemons
- *     share one data dir, and a lost update here means a forgotten hook.
- *
- * Clearing
- * --------
- * There is deliberately NO clearing API. Removing an entry would assert that the
- * injected process is gone, and nothing available here proves that:
- * `MojoBackend.kill()` sends a bare `SIGTERM` with no escalation and no wait, the
- * worker exits without awaiting its child, and the child may leave detached
- * descendants — so neither a worker exit nor a per-PID check covers the tree. A
- * sound clear needs trustworthy termination of the whole mojo PROCESS GROUP
- * (escalate to SIGKILL, then confirm group quiescence); that machinery does not
- * exist yet, and until it does, retention is the fail-closed side.
+ * Integrity rules (an honest audit record still has to be honest)
+ *   - only KEY NAMES are stored, never values (they routinely carry credentials;
+ *     `X_JWT_TOKEN` is the one allowlisted name and is never recorded)
+ *   - unreadable / malformed / unknown-version content THROWS rather than reading
+ *     as "nothing recorded" — including EACCES, which must not be mistaken for
+ *     "file absent"
+ *   - every mutation is a FRESH read-modify-write inside a cross-process file
+ *     lock, so per-bot daemons sharing a data dir cannot lose updates
+ *   - there is deliberately NO clearing API: removal would assert the injected
+ *     process is gone, and proving that needs trustworthy termination of the whole
+ *     mojo PROCESS GROUP (SIGKILL escalation + group quiescence), which does not
+ *     exist yet
  */
 import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import { randomBytes } from 'node:crypto';
@@ -83,13 +71,21 @@ function filePath(dataDir?: string): string {
  */
 function readStrict(dataDir?: string): QuarantineFile {
   const path = filePath(dataDir);
-  if (!existsSync(path)) return { version: 1, sessions: {} };
   let raw: string;
   try {
     raw = readFileSync(path, 'utf8');
   } catch (err) {
+    // ONLY a genuinely absent file is an empty record. `existsSync` also returns
+    // false for EACCES, so gating on it turned "cannot read this" into "nothing is
+    // quarantined" — the fail-open direction, and trivially arranged by a
+    // same-user process chmod-ing the file.
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+      return { version: 1, sessions: {} };
+    }
     throw new MojoQuarantineUnavailableError(
-      `cannot read mojo launcher-env quarantine at ${path}; refusing to treat sessions as unquarantined`,
+      `cannot read mojo launcher-env quarantine at ${path} `
+      + `(${(err as NodeJS.ErrnoException).code ?? 'unknown'}); `
+      + 'refusing to treat sessions as unquarantined',
       err,
     );
   }
@@ -100,6 +96,14 @@ function readStrict(dataDir?: string): QuarantineFile {
     throw new MojoQuarantineUnavailableError(
       `mojo launcher-env quarantine at ${path} is corrupt; refusing to treat sessions as unquarantined`,
       err,
+    );
+  }
+  // An unknown version means a writer this build does not understand; applying
+  // today's rules could silently drop entries it does not recognise.
+  const version = (parsed as { version?: unknown } | null)?.version;
+  if (version !== 1) {
+    throw new MojoQuarantineUnavailableError(
+      `mojo launcher-env quarantine at ${path} has unsupported version ${JSON.stringify(version)}`,
     );
   }
   const sessionsRaw = (parsed as { sessions?: unknown } | null)?.sessions;
@@ -115,8 +119,16 @@ function readStrict(dataDir?: string): QuarantineFile {
         `mojo launcher-env quarantine at ${path} has a non-array entry for ${sessionId}`,
       );
     }
-    const names = keys.filter((k): k is string => typeof k === 'string' && k.length > 0);
-    if (names.length > 0) sessions[sessionId] = [...new Set(names)];
+    // Filtering these out silently EMPTIED that session's quarantine, so one junk
+    // element (`{"sid":[42]}`) unblocked it. Reject the whole file instead.
+    for (const k of keys) {
+      if (typeof k !== 'string' || k.length === 0) {
+        throw new MojoQuarantineUnavailableError(
+          `mojo launcher-env quarantine at ${path} has a non-string key name for ${sessionId}`,
+        );
+      }
+    }
+    sessions[sessionId] = [...new Set(keys as string[])];
   }
   return { version: 1, sessions };
 }
