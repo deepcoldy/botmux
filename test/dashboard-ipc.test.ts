@@ -126,6 +126,32 @@ afterEach(async () => {
 });
 
 describe('dashboard IPC server', () => {
+  it('writes bot-scoped chat feedback and returns an effective trace', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-feedback-'));
+    const configPath = join(dir, 'bots.json');
+    const appId = 'feedback-app';
+    const prevBotsConfig = process.env.BOTS_CONFIG;
+    const prevDataDir = config.session.dataDir;
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      config.session.dataDir = dir;
+      writeFileSync(configPath, JSON.stringify([{ larkAppId: appId, larkAppSecret: 'secret', feedback: { enabled: true } }]));
+      loadBotConfigs().forEach((c: any) => registerBot(c));
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const base = `http://127.0.0.1:${handle.port}`;
+      const put = await fetch(`${base}/api/chat-feedback/chat-a`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ feedback: { enabled: false } }) });
+      expect(put.status).toBe(200);
+      expect(JSON.parse(readFileSync(configPath, 'utf8'))[0].chatFeedbackPolicies['chat-a']).toEqual({ enabled: false });
+      const preview = await (await fetch(`${base}/api/feedback-effective?chatId=chat-a`)).json();
+      expect(preview).toMatchObject({ ok: true, trace: { reason: 'disabled', effective: null, layers: { chat: { enabled: false } }, sources: { enabled: 'chat' } } });
+    } finally {
+      if (handle) await handle.close(); handle = null;
+      config.session.dataDir = prevDataDir;
+      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG; else process.env.BOTS_CONFIG = prevBotsConfig;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
   it('binds to 127.0.0.1 and serves /__health', async () => {
     handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
     const res = await fetch(`http://127.0.0.1:${handle.port}/__health`);
@@ -706,6 +732,68 @@ describe('PUT /api/bot-card-prefs — Codex App clean history', () => {
       expect(off.status).toBe(200);
       expect(await off.json()).toMatchObject({ ok: true, codexAppCleanInput: false });
       expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].codexAppCleanInput).toBeUndefined();
+    } finally {
+      if (handle) await handle.close();
+      handle = null;
+      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = prevBotsConfig;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('PUT /api/bot-grant-prefs — p2pOpen (私聊对话全开)', () => {
+  it('surfaces it in the Bot Defaults payload and persists explicit on/off', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-p2p-open-'));
+    const configPath = join(dir, 'bots.json');
+    const appId = 'test-p2p-open-app';
+    const prevBotsConfig = process.env.BOTS_CONFIG;
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      writeFileSync(configPath, JSON.stringify([{
+        larkAppId: appId,
+        larkAppSecret: 'secret',
+        cliId: 'claude-code',
+        allowedUsers: ['ou_owner'],
+      }], null, 2));
+      loadBotConfigs().forEach((c: any) => registerBot(c));
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const base = `http://127.0.0.1:${handle.port}`;
+
+      const initial = await (await fetch(`${base}/api/bot-default-oncall`)).json();
+      expect(initial.p2pOpen).toBe(false);
+
+      const on = await fetch(`${base}/api/bot-grant-prefs`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ p2pOpen: true }),
+      });
+      expect(on.status).toBe(200);
+      expect(await on.json()).toMatchObject({ ok: true, p2pOpen: true });
+      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].p2pOpen).toBe(true);
+      expect((await (await fetch(`${base}/api/bot-default-oncall`)).json()).p2pOpen).toBe(true);
+
+      const off = await fetch(`${base}/api/bot-grant-prefs`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ p2pOpen: false }),
+      });
+      expect(off.status).toBe(200);
+      expect(await off.json()).toMatchObject({ ok: true, p2pOpen: false });
+      // Off = key deleted (缺省即关闭)，bots.json 保持干净。
+      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].p2pOpen).toBeUndefined();
+
+      // Non-boolean must not reach the store: it is dropped, so a body carrying
+      // only a bogus p2pOpen is rejected as "no valid fields" (no silent write).
+      const bogus = await fetch(`${base}/api/bot-grant-prefs`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ p2pOpen: 'yes' }),
+      });
+      expect(bogus.status).toBe(400);
+      expect(await bogus.json()).toMatchObject({ ok: false, error: 'no_valid_fields' });
+      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].p2pOpen).toBeUndefined();
     } finally {
       if (handle) await handle.close();
       handle = null;

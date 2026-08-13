@@ -66,6 +66,30 @@ botmux start                 # 启动 daemon（botmux autostart enable 设开机
 
 当前完整 `cliId` 以 [`src/adapters/cli/registry.ts`](https://github.com/deepcoldy/botmux/blob/master/src/adapters/cli/registry.ts) 为准；各 CLI 的配置与套 wrapper / 网关方法见 [多 CLI 适配器](https://deepcoldy.github.io/botmux/adapters)。
 
+### 最终回答反馈（按 bot、默认关闭）
+
+在单个 `bots.json` 条目中设置 `feedback.enabled: true`，可在最终回答卡片中收集固定三态语义 `positive / progress / negative` 的反馈；默认按钮为“结论可用 / 有效推进 / 结论有误”。按钮文案、样式、顺序、可见语义、负向原因、说明框与是否允许改选均可配置。默认关闭，`apiOnly` bot、进度卡、自定义卡、通知和语音不显示反馈控件。当前仅本次提问者可反馈，提交后原卡片原地更新，自由文本不会回显到群卡。
+
+```json
+{
+  "feedback": {
+    "enabled": true,
+    "visibleSemantics": ["positive", "progress", "negative"],
+    "buttons": [
+      { "key": "conclusive_usable", "label": "结论可用", "semantic": "positive", "style": "primary" },
+      { "key": "effective_progress", "label": "有效推进", "semantic": "progress", "style": "default" },
+      { "key": "incorrect", "label": "结论有误", "semantic": "negative", "style": "danger" }
+    ],
+    "negativeFollowup": {
+      "reasons": [{ "key": "wrong_result", "label": "结论或结果错误" }],
+      "comment": { "enabled": true, "required": false, "maxLength": 1000 }
+    }
+  }
+}
+```
+
+也可在 Dashboard 的「Bot 配置 → 卡片 → 最终回答反馈」编辑，或用 `/botconfig set feedback '<json>'` 热更新。策略支持本地团队 → bot → bot-scoped chat 分层，优先级为 chat > bot > team；Dashboard 可预览最终生效策略。策略修改只影响之后交付的新卡；已发送卡片继续使用发送时快照。Agent 主动发送可声明 `botmux send --response-kind progress ...` 或 `botmux send --response-kind final ...`；未声明时默认按 progress/非 final 发送，只有显式 final 才挂反馈。数据仅落在本机 `botmux-feedback.sqlite`；可选 webhook 通过 durable outbox 投递 `turn.completed` 与 `feedback.revised` 事件。完整实现和边界见 [`docs/feedback-capability-current-implementation.md`](docs/feedback-capability-current-implementation.md)。
+
 严格兼容 Codex 参数、交互与会话存储的独立发行版无需新增适配器：保留 `cliId: "codex"`，通过 `cliRuntime` 声明自己的 executable、展示名和更新源。BotMux 会按发行版隔离版本与会话身份，未知更新源不会回落到官方 Codex。详见 [Codex 兼容发行版](https://deepcoldy.github.io/botmux/adapters#codex-兼容发行版)。
 
 ## 设计理念：直接桥接 CLI，不做 SDK wrapper

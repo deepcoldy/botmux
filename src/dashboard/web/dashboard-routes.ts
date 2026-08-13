@@ -58,6 +58,7 @@ export const dashboardRoutes: DashboardRoute[] = [
   pageRoute('monitor-room', '#/monitor-room', () => import('./monitor-room.js'), 'renderMonitorRoomPage', true),
   pageRoute('office', '#/office', () => import('./office-page.js'), 'renderOfficePage'),
   pageRoute('insights', '#/insights', () => import('./insights-page.js'), 'renderInsightsPage'),
+  pageRoute('feedback', '#/feedback', () => import('./feedback-page.js'), 'renderFeedbackPage'),
 ];
 
 export function findDashboardRoute(hash: string): DashboardRoute | undefined {

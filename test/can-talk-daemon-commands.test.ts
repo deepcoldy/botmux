@@ -118,6 +118,28 @@ describe('canRunDaemonCommand gate', () => {
     // p2p 里名单外的命令仍拒
     expect(canRunDaemonCommand('ct1', 'p2p_chat', 'ou_p2p_user', undefined, '/restart', undefined, 'p2p')).toBe(false);
   });
+
+  it('p2pOpen alone never reaches a dangerous command — only an explicit downgrade does', () => {
+    const bot = getBot('ct1');
+    bot.config.p2pOpen = true;
+    const stranger = () =>
+      canRunDaemonCommand('ct1', 'p2p_chat', 'ou_p2p_user', undefined, '/restart', undefined, 'p2p', false, false);
+
+    // 只开 p2pOpen：陌生私聊者拿到 canTalk，但 /restart 不在降级名单 → 仍走 canOperate，拒。
+    expect(canTalk('ct1', 'p2p_chat', 'ou_p2p_user', undefined, undefined, 'p2p')).toBe(true);
+    expect(canOperate('ct1', 'p2p_chat', 'ou_p2p_user')).toBe(false);
+    expect(stranger()).toBe(false);
+
+    // owner 显式把 /restart 降级到「能对话即可用」后，p2pOpen 这条 talk 腿就能命中它。
+    // 这是 canTalkDaemonCommands 的既定语义（见 event-dispatcher 的 canRunDaemonCommand 注释），
+    // 所以 p2pOpen 的文案不能承诺「管理动作永远只认管理员」——本例就是那个例外。
+    bot.config.canTalkDaemonCommands = ['/status', '/help', '/restart'];
+    expect(stranger()).toBe(true);
+
+    // 收回降级即恢复：名单是唯一开关，p2pOpen 自己不放大命令面。
+    bot.config.canTalkDaemonCommands = ['/status', '/help'];
+    expect(stranger()).toBe(false);
+  });
 });
 
 describe('canRunDaemonCommand /repo trusted same-deployment peer exception', () => {

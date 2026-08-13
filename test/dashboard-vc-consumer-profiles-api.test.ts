@@ -308,7 +308,8 @@ function makeDeps(over: Partial<VcMeetingConsumerProfilesApiDeps> = {}): VcMeeti
     onlineBotName: vi.fn(() => 'agent-online-name'),
     isOnline: vi.fn(() => true),
     adapterReliableTurnTerminal: vi.fn(() => true),
-    managedSideEffectIsolation: vi.fn(() => true),
+    managedSideEffectEligible: vi.fn(() => true),
+    sandboxIsolated: vi.fn(() => true),
     reloadDaemons: vi.fn(async () => {}),
     ...over,
   };
@@ -335,7 +336,8 @@ describe('buildVcMeetingAgentOptions', () => {
       online: true,
       workingDirReady: true,
       reliableTurnTerminal: true,
-      managedSideEffectIsolation: true,
+      managedSideEffectEligible: true,
+      sandboxIsolated: true,
     }]);
   });
 
@@ -354,7 +356,8 @@ describe('buildVcMeetingAgentOptions', () => {
       online: false,
       workingDirReady: false,
       reliableTurnTerminal: false,
-      managedSideEffectIsolation: true,
+      managedSideEffectEligible: true,
+      sandboxIsolated: true,
     }]);
   });
 
@@ -384,7 +387,8 @@ function agentOption(
     online: true,
     workingDirReady: true,
     reliableTurnTerminal: true,
-    managedSideEffectIsolation: true,
+    managedSideEffectEligible: true,
+    sandboxIsolated: true,
     ...over,
   };
 }
@@ -401,7 +405,7 @@ describe('default VC consumer profile bootstrap', () => {
     const options = [
       agentOption('app_no_dir', { workingDirReady: false }),
       agentOption('app_no_terminal', { reliableTurnTerminal: false }),
-      agentOption('app_no_isolation', { managedSideEffectIsolation: false }),
+      agentOption('app_ineligible', { managedSideEffectEligible: false }),
       agentOption('app_offline_ready', { online: false }),
     ];
     expect(selectVcMeetingDefaultConsumerAgent('app_no_dir', options)?.appId)

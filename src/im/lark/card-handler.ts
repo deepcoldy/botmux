@@ -1228,6 +1228,26 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     return handleAskCardAction(data);
   }
 
+  if (['feedback_submit', 'feedback_reason', 'feedback_comment', 'skill_feedback_submit'].includes(value?.action ?? '') && larkAppId) {
+    const { handleSkillFeedbackCardAction } = await import('./skill-feedback-card.js');
+    const { getSkillFeedbackStore } = await import('../../services/skill-feedback-store.js');
+    const { config } = await import('../../config.js');
+    return handleSkillFeedbackCardAction(data, larkAppId, {
+      store: await getSkillFeedbackStore(config.session.dataDir),
+      loadBaseCard: async (platformMessageId) => {
+        const detail = await getMessageDetail(larkAppId, platformMessageId);
+        const content = detail?.items?.[0]?.body?.content ?? detail?.body?.content;
+        if (typeof content !== 'string') return undefined;
+        try {
+          const parsed = JSON.parse(content);
+          return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : undefined;
+        } catch {
+          return undefined;
+        }
+      },
+    });
+  }
+
   if (
     (value?.action === 'codex_notifier_continue' || value?.action === 'codex_notifier_open_app')
     && larkAppId

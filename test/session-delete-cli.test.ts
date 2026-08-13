@@ -18,7 +18,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
   managedOriginCapabilityPath,
@@ -98,7 +98,7 @@ function writeRelayCapability(relayDir: string): void {
 
 function writeReadIsolatedCapability(dataDir: string, sessionId: string): void {
   const path = managedOriginCapabilityPath(dataDir, sessionId, ORIGIN_CHANNEL);
-  mkdirSync(join(dataDir, 'read-isolation'), { recursive: true });
+  mkdirSync(dirname(path), { recursive: true });
   writeFileSync(path, JSON.stringify({
     sessionId,
     channelId: ORIGIN_CHANNEL,

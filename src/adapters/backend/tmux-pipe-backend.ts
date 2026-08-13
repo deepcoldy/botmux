@@ -99,6 +99,7 @@ export function tmuxLifecycleInitialDelayMs(target: string): number {
 }
 
 export class TmuxPipeBackend implements SessionBackend {
+  readonly supportsRawCommandPasteLine = true;
   /** Real tmux pane address (e.g. "0:2.0") or botmux session name (bmx-*). */
   private readonly paneTarget: string;
   private readonly fifoPath: string;
@@ -285,14 +286,14 @@ export class TmuxPipeBackend implements SessionBackend {
    * paste as a rapid input burst and swallows the trailing Enter as a soft
    * newline, stranding the message in the input box (it then gets submitted
    * by the *next* paste — the "replies to the previous message" off-by-one).
-   * NB: TmuxPipeBackend is the only backend used at runtime (see
-   * selectSessionBackend), so this is the path that actually matters.
+   * NB: this is the default/local tmux runtime backend path (see
+   * selectSessionBackend), not the only backend type in the repo.
    */
-  pasteText(text: string): void {
-    if (this.exited) return;
+  pasteText(text: string): boolean {
+    if (this.exited) return false;
     this.exitCopyModeIfNeeded();
     const bufferName = `botmux-${randomBytes(8).toString('hex')}`;
-    this.guardedSend('paste-buffer', () => {
+    return this.guardedSend('paste-buffer', () => {
       let loaded = false;
       try {
         execFileSync('tmux', ['load-buffer', '-b', bufferName, '-'], {

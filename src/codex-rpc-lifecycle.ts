@@ -326,14 +326,26 @@ export async function orchestrateCodexRpcInit(
 
 export interface PersistentPaneKillEffects {
   kill: (sessionName: string) => void;
-  isLive: (sessionName: string) => boolean;
+  /** Tri-state on purpose. A boolean cannot distinguish "the pane is gone" from
+   *  "the liveness probe got no answer", and this function's return value is
+   *  read as PROOF of absence. `hasSession()`-style helpers collapse a probe
+   *  timeout into `false`, which is exactly the wrong direction here. */
+  probeLive: (sessionName: string) => 'live' | 'gone' | 'unknown';
   wait: (ms: number) => Promise<void>;
 }
 
 /** Kill a resolved persistent-session name and verify that exact name is gone.
  *  Keeping the resolved name opaque avoids accidentally applying sessionName()
  *  twice (`bmx-1234` -> `bmx-bmx-`), which would turn every failed kill into a
- *  false success and reattach the stale RPC pane. */
+ *  false success and reattach the stale RPC pane.
+ *
+ *  Returns true ONLY on an authoritative 'gone'. An indeterminate probe is not
+ *  proof: under host load even a cheap `has-session` (~20ms healthy) can be
+ *  killed by its own timeout, and reporting that as a verified kill lets a
+ *  surviving dead-`--remote` pane be reattached to the fresh-port engine — the
+ *  exact P0 freeze this verification layer exists to prevent. When every
+ *  attempt comes back 'unknown' we fail closed: the caller then aborts init
+ *  and tells the user, instead of silently proceeding on an unproven kill. */
 export async function killAndVerifyPersistentPane(
   sessionName: string,
   fx: PersistentPaneKillEffects,
@@ -342,10 +354,12 @@ export async function killAndVerifyPersistentPane(
 ): Promise<boolean> {
   for (let attempt = 0; attempt < attempts; attempt++) {
     try { fx.kill(sessionName); } catch { /* verify below */ }
-    if (!fx.isLive(sessionName)) return true;
+    // Retry on 'unknown' as well as 'live': an unanswered probe is a reason to
+    // look again, never a reason to declare success.
+    if (fx.probeLive(sessionName) === 'gone') return true;
     if (attempt + 1 < attempts) await fx.wait(retryMs);
   }
-  return !fx.isLive(sessionName);
+  return fx.probeLive(sessionName) === 'gone';
 }
 
 function tmuxPanePid(sessionName: string): number | undefined {

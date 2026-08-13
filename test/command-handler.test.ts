@@ -755,6 +755,35 @@ describe('/list-slash-command discovery', () => {
     }
   });
 
+  it('mirrors the frozen CLI in the listing: Codex App shows NO passthrough, interactive Codex keeps /goal', async () => {
+    mockCodexAppBot(); // bot CURRENT config.cliId = 'codex-app'
+
+    // A session frozen as Codex App: the runner has no passthrough surface, so
+    // builtin + adapter + custom must all render empty (matching the router's
+    // early empty return) — never a fake `/model`/`/compact` passthrough list.
+    const appDs = makeDaemonSession({
+      larkAppId: CODEX_APP_ID,
+      session: makeSession({ cliId: 'codex-app' }),
+    });
+    await handleCommand('/slash', ROOT_ID, makeLarkMessage('/slash'), makeDeps(appDs), CODEX_APP_ID);
+    expect(buildSlashListCard).toHaveBeenLastCalledWith(
+      expect.objectContaining({ builtin: [], adapterDefaults: [], custom: [] }),
+      expect.anything(),
+    );
+
+    // Inverse: bot flipped to Codex App but this session is frozen as
+    // interactive Codex → listing keeps builtin + the adapter-scoped /goal.
+    vi.mocked(buildSlashListCard).mockClear();
+    const tuiDs = makeDaemonSession({
+      larkAppId: CODEX_APP_ID,
+      session: makeSession({ cliId: 'codex' }),
+    });
+    await handleCommand('/slash', ROOT_ID, makeLarkMessage('/slash'), makeDeps(tuiDs), CODEX_APP_ID);
+    const call = vi.mocked(buildSlashListCard).mock.calls.at(-1)?.[0] as any;
+    expect(call.builtin).toContain('/model');
+    expect(call.adapterDefaults).toContain('/goal');
+  });
+
   it('shows only effective custom passthrough commands (drops daemon-shadow + junk, normalizes)', async () => {
     // 手写 bots.json 可能留下 `/status`（遮蔽 daemon 命令，parser 出于兼容会保留但
     // 路由会丢弃）、非法项、大小写不一；展示侧须与 resolvePassthroughCommands 同口径。
@@ -917,6 +946,53 @@ describe('/botconfig canTalkDaemonCommands uses the field parser (not the passth
   });
 });
 
+describe('/botconfig set p2pOpen (私聊对话全开) via the real text command', () => {
+  it('turns DMs on and off through `/botconfig set`, keeping bots.json tidy', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-botconfig-p2popen-'));
+    const configPath = join(dir, 'bots.json');
+    process.env.BOTS_CONFIG = configPath;
+    writeFileSync(configPath, JSON.stringify([{
+      larkAppId: 'app-1',
+      larkAppSecret: 'secret-1',
+      cliId: 'codex',
+      allowedUsers: ['ou_sender'],
+    }]));
+    const bot = {
+      botName: 'Codex',
+      config: {
+        larkAppId: 'app-1',
+        larkAppSecret: 'secret-1',
+        cliId: 'codex' as const,
+        allowedUsers: ['ou_sender'],
+        workingDir: '~/projects',
+        workingDirs: ['~/projects'],
+      },
+      resolvedAllowedUsers: ['ou_sender'],
+    };
+    vi.mocked(getBot).mockReturnValue(bot as any);
+
+    // 真实入口是带 set 子命令的形式（`/botconfig` 只认 get/set/unset/help），
+    // 所以这里执行的是用户会打的那串字，而不是直接调 applyConfigField。
+    const run = (text: string) => handleCommand('/botconfig', ROOT_ID, makeLarkMessage(text, { senderId: 'ou_sender' }), makeDeps(), 'app-1');
+    const stored = () => JSON.parse(readFileSync(configPath, 'utf-8'))[0];
+
+    try {
+      await run('/botconfig set p2pOpen on');
+      expect(stored().p2pOpen).toBe(true);
+      expect((bot.config as any).p2pOpen).toBe(true);
+
+      // off → 删 key（缺省即关），内存同步成 undefined；与 dashboard 通道同语义。
+      await run('/botconfig set p2pOpen off');
+      expect('p2pOpen' in stored()).toBe(false);
+      expect((bot.config as any).p2pOpen).toBeUndefined();
+    } finally {
+      delete process.env.BOTS_CONFIG;
+      rmSync(dir, { recursive: true, force: true });
+      vi.mocked(getBot).mockImplementation(defaultGetBot as any);
+    }
+  });
+});
+
 describe('/botconfig string field goes through coerceConfigValue (maxLen)', () => {
   it('rejects an over-long displayName and persists a valid one', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'botmux-botconfig-displayname-'));
@@ -1051,6 +1127,40 @@ describe('PASSTHROUGH_COMMANDS set', () => {
     for (const cmd of PASSTHROUGH_COMMANDS) {
       expect(DAEMON_COMMANDS.has(cmd), `${cmd} must not be in both sets`).toBe(false);
     }
+  });
+
+  it('keeps raw passthrough off Codex App while honoring a frozen session CLI override', () => {
+    mockCodexAppBot();
+
+    // App Server turns must use the structured message lane; raw_input has no
+    // matching dispatch reservation and would leave the session stuck after
+    // the model final arrives.
+    expect(resolvePassthroughCommands(CODEX_APP_ID).size).toBe(0);
+
+    // Existing sessions freeze their CLI. A pre-switch interactive Codex
+    // session must retain native slash passthrough even if the bot config now
+    // points at Codex App, while the inverse must stay structured.
+    expect(resolvePassthroughCommands(CODEX_APP_ID, 'codex').has('/model')).toBe(true);
+    expect(resolvePassthroughCommands(LARK_APP_ID, 'codex-app').size).toBe(0);
+  });
+
+  it('threads the frozen CLI through the ADAPTER-SCOPED layer, not just the builtin set', () => {
+    // Regression for the earlier miss: the override only guarded the codex-app
+    // early return, so `resolveAdapterDefaultPassthroughCommands` still read the
+    // bot's CURRENT config. When the bot default flips codex→codex-app, a frozen
+    // interactive Codex session then LOST its adapter-scoped `/goal` (it fell
+    // through as a plain message instead of raw_input). Builtin `/model` masked
+    // this because it never touches the adapter layer — so assert `/goal`.
+    mockCodexAppBot(); // bot CURRENT config.cliId = 'codex-app'
+
+    // Frozen interactive Codex session (override='codex'): keeps native /goal.
+    expect(resolvePassthroughCommands(CODEX_APP_ID, 'codex').has('/goal')).toBe(true);
+    expect(resolveAdapterDefaultPassthroughCommands(CODEX_APP_ID, 'codex')).toContain('/goal');
+    // No override → reads current codex-app config → adapter layer is empty.
+    expect(resolveAdapterDefaultPassthroughCommands(CODEX_APP_ID)).not.toContain('/goal');
+    // Inverse: a bot whose current CLI is codex, frozen as codex-app → nothing.
+    expect(resolvePassthroughCommands('app-2', 'codex-app').size).toBe(0);
+    expect(resolveAdapterDefaultPassthroughCommands('app-2', 'codex-app')).not.toContain('/goal');
   });
 
   it('keeps /goal out of the global passthrough list but enables it for Claude and Codex adapters', () => {

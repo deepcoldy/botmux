@@ -121,6 +121,9 @@ export interface DaemonSession {
    * trade, not a credential leak.
    */
   mojoRetiringUnprovableEnvKeys?: string[];
+  /** Per-session snapshot of the final-answer feedback policy. New config takes
+   * effect on the next new/restarted session, matching sandbox send-cred state. */
+  feedbackPolicy?: import('../services/feedback-policy.js').FeedbackPolicy;
   /** Dashboard「复现命令」：worker 在 `ready` 时上报的、该 session 本次冷启的近似
    *  可复现 CLI 调用（bin + argv + cwd + 权威注入 env）。**只驻内存、绝不落盘**
    *  ——命令含 provider token / 凭证 env，写进默认 0644 的 sessions-*.json 会让同机
@@ -302,6 +305,21 @@ export interface DaemonSession {
   activeReasoningEffort?: string;
   /** Runtime change arrived while a streaming-card POST was in flight. */
   pendingActiveRuntimeCardRefresh?: boolean;
+  /** Queued suspend: the request arrived while the session was producing
+   *  (working/analyzing), where killing the worker would drop that turn's reply.
+   *  Record the reason instead and cash it in once screen_update settles into
+   *  idle/limited (see worker-pool.ts runPendingSuspendIfSettled). In-memory
+   *  only: lost on daemon restart, and the next `suspend all` cycle re-queues
+   *  it — the cost is one cycle of delay, not a missed session. */
+  pendingSuspendReason?: string;
+  /** Worker generation that owned the queued suspend above. A claim is only
+   *  ever about the generation that was producing when the request arrived, so
+   *  it must not outlive it: once that worker is suspended (by ANY path) or
+   *  exits, the goal state is reached and the claim is consumed. Without this,
+   *  a claim whose fulfilment checkpoint never ran (worker crashed, or `/cd` /
+   *  read-isolation switch suspended first) survives into the NEXT generation
+   *  and suspends it on its first idle. See clearPendingSuspendClaim. */
+  pendingSuspendGeneration?: number;
   /** Executor-observed Codex settings for this worker/rollout generation. */
   codexServiceTier?: CodexServiceTierSnapshot;
   /** Tier change arrived while a card POST was in-flight. */

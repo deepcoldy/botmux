@@ -275,7 +275,7 @@ class AppServerClient {
     });
     this.child.on('error', err => {
       const hint = (err as NodeJS.ErrnoException).code === 'ENOENT'
-        ? '\nHint: install the Codex CLI, or set cliPathOverride to the Codex App bundled binary, for example /Applications/Codex.app/Contents/Resources/codex.'
+        ? '\nHint: install the Codex CLI, or set cliPathOverride to the desktop app bundled binary, for example /Applications/ChatGPT.app/Contents/Resources/codex (current) or /Applications/Codex.app/Contents/Resources/codex (legacy).'
         : '';
       this.failAll(new Error(`Failed to start Codex app-server with "${codexBin}": ${err.message}${hint}`));
     });
@@ -361,22 +361,46 @@ class AppServerClient {
     this.pending.clear();
   }
 
+  /**
+   * Message ordering must not depend on pipe chunk boundaries. Dispatching
+   * line N+1 synchronously after line N starves the microtask continuations
+   * line N scheduled: a response resolving `await request(...)` runs its
+   * awaiting caller (which records protocol state, e.g. "steer accepted,
+   * group grew") only AFTER the whole synchronous loop — so a notification
+   * coalesced into the same chunk behind its own request's response was
+   * processed against stale state and the turn stalled forever. The kernel
+   * coalesces adjacent writes whenever this reader is scheduled late (routine
+   * on loaded CI runners, possible anywhere), so yield a MICROtask between
+   * lines: already-queued continuations run before the next dispatch, while
+   * anything the runner deliberately defers past the current burst (e.g.
+   * macrotask-deferred publications) still sees the burst as one unit.
+   */
+  private stdoutDraining = false;
+
   private onStdout(data: string): void {
     this.stdoutBuffer += data;
-    for (;;) {
+    if (this.stdoutDraining) return;
+    this.stdoutDraining = true;
+    const step = (): void => {
       const nl = this.stdoutBuffer.indexOf('\n');
-      if (nl < 0) return;
+      if (nl < 0) {
+        this.stdoutDraining = false;
+        return;
+      }
       const line = this.stdoutBuffer.slice(0, nl).trim();
       this.stdoutBuffer = this.stdoutBuffer.slice(nl + 1);
-      if (!line) continue;
-      let msg: JsonObject;
-      try {
-        msg = JSON.parse(line);
-      } catch {
-        continue;
+      if (line) {
+        let msg: JsonObject | undefined;
+        try {
+          msg = JSON.parse(line);
+        } catch {
+          msg = undefined;
+        }
+        if (msg) this.dispatch(msg);
       }
-      this.dispatch(msg);
-    }
+      queueMicrotask(step);
+    };
+    step();
   }
 
   private dispatch(msg: JsonObject): void {

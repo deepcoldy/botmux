@@ -2,14 +2,18 @@
  * commands. Historical backends return void on success; guarded backends
  * return false when the target pane/process is already unavailable. */
 export interface RawCommandWriter {
+  readonly supportsRawCommandPasteLine?: boolean;
   write(data: string): void | boolean;
   sendText?: (text: string) => void | boolean;
   sendSpecialKeys?: (...keys: string[]) => void | boolean;
+  pasteText?: (text: string) => void | boolean;
 }
 
 export interface RawCommandWriteOptions {
   coco?: boolean;
   cocoThrottleMs?: number;
+  pasteLine?: boolean;
+  pasteSettleMs?: number;
   submitBeatMs?: number;
   delay?: (ms: number) => Promise<void>;
 }
@@ -26,9 +30,10 @@ export async function writeRawCommandLine(
   const beatMs = opts.submitBeatMs ?? 200;
   const sendText = backend.sendText?.bind(backend);
   const sendSpecialKeys = backend.sendSpecialKeys?.bind(backend);
+  const pasteText = backend.pasteText?.bind(backend);
 
-  if (sendText && sendSpecialKeys) {
-    if (opts.coco) {
+  if (sendSpecialKeys) {
+    if (opts.coco && sendText) {
       const cmd = content.trim();
       const typed = cmd.includes(' ') ? cmd : `${cmd} `;
       for (const ch of typed) {
@@ -38,9 +43,16 @@ export async function writeRawCommandLine(
       await delay(beatMs);
       return sendSpecialKeys('Enter') !== false;
     }
-    if (sendText(content) === false) return false;
-    await delay(beatMs);
-    return sendSpecialKeys('Enter') !== false;
+    if (opts.pasteLine && backend.supportsRawCommandPasteLine && pasteText) {
+      if (pasteText(content) === false) return false;
+      await delay(opts.pasteSettleMs ?? beatMs);
+      return sendSpecialKeys('Enter') !== false;
+    }
+    if (sendText) {
+      if (sendText(content) === false) return false;
+      await delay(beatMs);
+      return sendSpecialKeys('Enter') !== false;
+    }
   }
 
   if (backend.write(content) === false) return false;

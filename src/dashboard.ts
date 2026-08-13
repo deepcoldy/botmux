@@ -17,7 +17,7 @@ import { listenWithProbe } from './utils/listen-with-probe.js';
 import {
   parseCookie, buildSetCookie, verifyHmac, cliAuthBind, decideDashboardAuth,
   loadPersistedToken, loadOrCreatePersistedToken, rotatePersistedToken,
-  loadDashboardSecret, loadOrCreateDashboardSecret,
+  loadDashboardSecret, loadOrCreateDashboardSecret, describeDashboardTokenError,
 } from './dashboard/auth.js';
 import { DaemonRegistry, botsRosterSignature } from './dashboard/registry.js';
 import { Aggregator, subscribeDaemon } from './dashboard/aggregator.js';
@@ -55,6 +55,8 @@ import {
   redactSettingsForPublic,
 } from './dashboard/public-redact.js';
 import { handleWebhookRoute } from './dashboard/webhook-routes.js';
+import { handleFeedbackAnalyticsApi } from './dashboard/feedback-analytics-api.js';
+import { FeedbackAnalyticsService } from './services/feedback-analytics.js';
 import { handleFederationApi } from './dashboard/federation-api.js';
 import { buildFederatedRoster } from './services/federation-roster.js';
 import { resolveLiveBotTransport } from './services/team-roster.js';
@@ -824,7 +826,7 @@ function vcMeetingConsumerProfilesApiDeps(): VcMeetingConsumerProfilesApiDeps {
         return false;
       }
     },
-    managedSideEffectIsolation: bot => evaluateVcMeetingConsumerIsolation({
+    managedSideEffectEligible: bot => evaluateVcMeetingConsumerIsolation({
       sandbox: bot.sandbox,
       platform: process.platform,
       backendType: resolvePairedSpawnBackendType(
@@ -834,6 +836,19 @@ function vcMeetingConsumerProfilesApiDeps(): VcMeetingConsumerProfilesApiDeps {
         config.daemon.backendType,
       ),
     }).ok,
+    sandboxIsolated: bot => {
+      const decision = evaluateVcMeetingConsumerIsolation({
+        sandbox: bot.sandbox,
+        platform: process.platform,
+        backendType: resolvePairedSpawnBackendType(
+          bot.cliId ?? config.daemon.cliId,
+          undefined,
+          bot.backendType,
+          config.daemon.backendType,
+        ),
+      });
+      return decision.ok && decision.isolated;
+    },
     reloadDaemons: reloadVcMeetingBotConfigOnDaemons,
   };
 }
@@ -2763,6 +2778,10 @@ const dashboardSummaryEndpoint = createDashboardSummaryEndpoint({
     logger.warn(`[dashboard-summary] live snapshot unavailable: ${error instanceof Error ? error.message : String(error)}`);
   },
 });
+let feedbackAnalyticsService: FeedbackAnalyticsService | undefined;
+function analyticsService(): FeedbackAnalyticsService {
+  return feedbackAnalyticsService ??= new FeedbackAnalyticsService(config.session.dataDir);
+}
 
 const server = createServer(async (req, res) => {
   try {
@@ -2870,7 +2889,7 @@ const server = createServer(async (req, res) => {
         return jsonRes(res, 200, dashboardUrlsFor(token));
       } catch (e) {
         logger.warn(`[dashboard] Failed to persist token to ${TOKEN_PATH}: ${(e as Error).message}`);
-        return jsonRes(res, 500, { error: 'token_persist_failed' });
+        return jsonRes(res, 500, describeDashboardTokenError('token_persist_failed', e, TOKEN_PATH));
       }
     }
 
@@ -2884,7 +2903,7 @@ const server = createServer(async (req, res) => {
         return jsonRes(res, 200, dashboardUrlsFor(token));
       } catch (e) {
         logger.warn(`[dashboard] Failed to ensure token at ${TOKEN_PATH}: ${(e as Error).message}`);
-        return jsonRes(res, 500, { error: 'token_persist_failed' });
+        return jsonRes(res, 500, describeDashboardTokenError('token_persist_failed', e, TOKEN_PATH));
       }
     }
 
@@ -2898,7 +2917,7 @@ const server = createServer(async (req, res) => {
         token = loadPersistedToken(TOKEN_PATH);
       } catch (e) {
         logger.warn(`[dashboard] Failed to read token from ${TOKEN_PATH}: ${(e as Error).message}`);
-        return jsonRes(res, 500, { error: 'token_unavailable' });
+        return jsonRes(res, 500, describeDashboardTokenError('token_unavailable', e, TOKEN_PATH));
       }
       if (!token) return jsonRes(res, 404, { error: 'no_active_token' });
       return jsonRes(res, 200, dashboardUrlsFor(token));
@@ -2966,6 +2985,11 @@ const server = createServer(async (req, res) => {
         error: 'legacy_workflow_retired',
         message: 'v2 workflow dashboard APIs are retired; use /api/v3/runs for v3 run visibility',
       });
+    }
+
+    if (url.pathname.startsWith('/api/feedback/analytics/')) {
+      await handleFeedbackAnalyticsApi(req, res, url, { service: analyticsService() });
+      return;
     }
 
     if (req.method === 'GET' && url.pathname === '/__dev/reload') {
@@ -5016,6 +5040,30 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    let mBotFeedback: RegExpMatchArray | null;
+    if (req.method === 'PUT' && (mBotFeedback = url.pathname.match(/^\/api\/bots\/([^/]+)\/feedback$/))) {
+      const appId = decodeURIComponent(mBotFeedback[1]);
+      const chunks: Buffer[] = [];
+      for await (const c of req) chunks.push(c as Buffer);
+      const raw = Buffer.concat(chunks).toString('utf8') || '{}';
+      const upstream = await proxyToDaemon(appId, `/api/bot-feedback`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: raw });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+
+    const mChatFeedback = url.pathname.match(/^\/api\/bots\/([^/]+)\/chats\/([^/]+)\/feedback$/);
+    if (req.method === 'PUT' && mChatFeedback) {
+      const chunks: Buffer[] = []; for await (const c of req) chunks.push(c as Buffer);
+      const upstream = await proxyToDaemon(decodeURIComponent(mChatFeedback[1]), `/api/chat-feedback/${encodeURIComponent(decodeURIComponent(mChatFeedback[2]))}`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: Buffer.concat(chunks).toString('utf8') || '{}' });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' }); res.end(await upstream.text()); return;
+    }
+    const mEffectiveFeedback = url.pathname.match(/^\/api\/bots\/([^/]+)\/feedback\/effective$/);
+    if (req.method === 'GET' && mEffectiveFeedback) {
+      const upstream = await proxyToDaemon(decodeURIComponent(mEffectiveFeedback[1]), `/api/feedback-effective${url.search}`, { method: 'GET' });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' }); res.end(await upstream.text()); return;
+    }
+
     // PUT /api/bots/:appId/env — proxy to that bot's daemon. Body
     // `{ env: string }` (raw JSON text; '' = clear).
     let mBotEnv: RegExpMatchArray | null;
@@ -5262,7 +5310,8 @@ const server = createServer(async (req, res) => {
 
     // PUT /api/bots/:appId/grant-prefs — proxy to that bot's daemon. Body carries
     // any subset of `{ restrictGrantCommands?: boolean, autoGrantRequestCards?: boolean,
-    // messageQuotaDefaultLimit?: number|null, grantDefaultDurationMs?: number|null }`.
+    // p2pOpen?: boolean, messageQuotaDefaultLimit?: number|null,
+    // grantDefaultDurationMs?: number|null }`.
     let mBotGrantPrefs: RegExpMatchArray | null;
     if (req.method === 'PUT' && (mBotGrantPrefs = url.pathname.match(/^\/api\/bots\/([^/]+)\/grant-prefs$/))) {
       const appId = decodeURIComponent(mBotGrantPrefs[1]);
@@ -5928,8 +5977,14 @@ function startPlatformTunnelIfBound(): void {
     const binding = readPlatformBinding();
     if (!binding) return;
     const existingToken = currentDashboardToken();
-    loadOrCreatePersistedToken(TOKEN_PATH);
+    // An already-materialized dashboard token is sufficient to start the
+    // tunnel. Avoid re-validating its path via secureHostFilePath(): on Linux
+    // the request-time read is descriptor-pinned, while deployments whose HOME
+    // is a root-owned symlink (common on managed dev hosts) can make the
+    // path-returning helper fail even though the 0600 file is safely readable.
+    // Only the first token creation needs the path+lock helper.
     if (!existingToken) {
+      loadOrCreatePersistedToken(TOKEN_PATH);
       logger.info('[platform-tunnel] 已初始化 dashboard token');
     }
     const version = readBotmuxVersion();
@@ -6067,6 +6122,7 @@ function shutdown(): void {
   resourceMonitor.stop();
   platformTunnel?.stop();
   debugTerminalManager.shutdown();
+  feedbackAnalyticsService?.close();
   if (oauthCallbackServer.listening) oauthCallbackServer.close();
   server.close(() => process.exit(gracefulProcessExitCode()));
   // Hard-exit fallback after 5s

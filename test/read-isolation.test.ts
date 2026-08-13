@@ -397,7 +397,22 @@ describe('worker capability carve-out ordering', () => {
     expect(macPathAt).toBeGreaterThanOrEqual(0);
     expect(macPublishAt).toBeGreaterThan(macPathAt);
     expect(policyAt).toBeGreaterThan(macPublishAt);
-    expect(source).toContain('mandatoryReadOnlyPaths.push(readIsolationOriginCapabilityFile)');
+    expect(source).toContain('mandatoryReadOnlyPaths.push(managedOriginCapabilityDirectory(');
+
+    const credentialPathAt = source.indexOf(
+      'if (readIsolationOriginChannelId && !sandboxRequested)',
+    );
+    const credentialPublishAt = source.indexOf(
+      'publishSandboxRelayCapability({ failClosed: true })',
+      credentialPathAt,
+    );
+    const credentialWrapperAt = source.indexOf(
+      'if (!willReattachPersistent && credentialOnlyBwrap)',
+      credentialPublishAt,
+    );
+    expect(credentialPathAt).toBeGreaterThanOrEqual(0);
+    expect(credentialPublishAt).toBeGreaterThan(credentialPathAt);
+    expect(credentialWrapperAt).toBeGreaterThan(credentialPublishAt);
 
     const relayAt = source.indexOf('sandboxRelayOutbox = sbx.outbox');
     const relayPublishAt = source.indexOf('publishSandboxRelayCapability();', relayAt);

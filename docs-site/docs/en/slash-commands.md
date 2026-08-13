@@ -181,7 +181,7 @@ See [Workflow](/en/workflow) for details.
 
 ## 👥 Multi-Bot Collaboration
 
-`@botA @botB /t <prompt>` (each opens a new topic) · `botmux bots list` (show bots available in the current group)
+`@botA @botB /t <prompt>` (each opens a new topic) · `@botA @botB /introduce` (register the bots in this chat with each other by open_id for precise collaboration mentions) · `botmux bots list` (show bots available in the current group)
 
 ## ⏰ Scheduling & ❓ Help
 

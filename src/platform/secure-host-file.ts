@@ -26,6 +26,7 @@ import {
 } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
+import { withFileLockSync } from '../utils/file-lock.js';
 
 export class UnsafeHostAuthorityFileError extends Error {
   constructor(message: string) {
@@ -275,39 +276,150 @@ function writePinnedSecureHostFileSync(
   }
 }
 
+/**
+ * Strict, durable atomic replace of a leaf under an already-acquired parent.
+ * Every path is resolved through `parent.path` (the pinned /proc/self/fd anchor
+ * on Linux), so a caller that holds the parent across several operations never
+ * re-resolves the swappable directory name between them.
+ */
+function writeSecureLeafFromParentSync(
+  parent: SecureHostParent,
+  leafName: string,
+  data: string,
+): void {
+  const resolved = join(parent.path, leafName);
+  let leafExists = false;
+  try {
+    lstatSync(resolved);
+    leafExists = true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+  }
+  if (leafExists) {
+    // Pin and validate the existing leaf before replacement. The final
+    // rename never follows a leaf symlink.
+    readSecureHostFileFromParentSync(parent, leafName, 64 * 1024);
+  }
+  if (parent.fd !== undefined) {
+    writePinnedSecureHostFileSync(parent, parent.fd, leafName, data);
+  } else {
+    atomicWriteFileSync(resolved, data, {
+      mode: 0o600,
+      durable: true,
+      followTargetSymlink: false,
+    });
+  }
+}
+
 /** Strict, durable atomic replace that never follows a leaf symlink. */
 export function writeSecureHostFileSync(filePath: string, data: string): void {
   const parent = acquireSecureHostParent(filePath);
-  const leafName = basename(filePath);
-  const resolved = join(parent.path, leafName);
   try {
-    let leafExists = false;
-    try {
-      lstatSync(resolved);
-      leafExists = true;
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
-    }
-    if (leafExists) {
-      // Pin and validate the existing leaf before replacement. The final
-      // rename never follows a leaf symlink.
-      readSecureHostFileFromParentSync(parent, leafName, 64 * 1024);
-    }
-    if (parent.fd !== undefined) {
-      writePinnedSecureHostFileSync(
-        parent,
-        parent.fd,
-        leafName,
-        data,
-      );
-    } else {
-      atomicWriteFileSync(resolved, data, {
-        mode: 0o600,
-        durable: true,
-        followTargetSymlink: false,
-      });
-    }
+    writeSecureLeafFromParentSync(parent, basename(filePath), data);
   } finally {
+    releaseSecureHostParent(parent);
+  }
+}
+
+/**
+ * A pinned view of the credential directory that stays valid ONLY for the
+ * synchronous duration of the callback. On Linux every operation resolves
+ * through the opened directory descriptor (`/proc/self/fd/<fd>`), so an
+ * ancestor rename/replacement after acquisition cannot redirect subsequent
+ * lock/read/write operations into an attacker-substituted directory. On other
+ * platforms (and Linux without procfs) the parent is the canonical real path
+ * and the strict ancestor-chain check has already run.
+ *
+ * The handle is single-use and fail-closed. It deliberately exposes NO raw
+ * filesystem path: the `/proc/self/fd/<fd>` anchor is a live capability that
+ * cannot be revoked once handed out as a string, so a caller could stash it,
+ * let the fd be recycled after release, and hand the stale string to `fs` or a
+ * lock — landing on a directory that never passed the 0700/owner checks. Every
+ * capability is therefore a method that re-checks `active` at call time: once
+ * the owning {@link withSecureHostParentSync} call returns and releases the
+ * descriptor, `readLeaf`/`writeLeaf`/`withLeafLock` throw
+ * {@link UnsafeHostAuthorityFileError} instead of touching the recycled fd.
+ */
+export interface SecureHostParentHandle {
+  /** Basename of the credential leaf (informational; carries no path capability). */
+  readonly leafName: string;
+  /** Read the pinned leaf (fail-closed on unsafe shapes); null if absent. */
+  readLeaf(maxBytes?: number): string | null;
+  /** Durably, atomically replace the pinned leaf without following a symlink. */
+  writeLeaf(data: string): void;
+  /**
+   * Run `fn` while holding a cross-process advisory lock on the pinned leaf,
+   * serialized against other processes doing the same get-or-create. The lock
+   * path is derived from the internal anchor and never exposed, so it cannot be
+   * reused after release. `fn` must be synchronous (see {@link NonThenable}).
+   */
+  withLeafLock<R>(fn: () => NonThenable<R>): R;
+}
+
+/**
+ * `T` constrained to a non-thenable so an `async` callback (or any callback
+ * returning a Promise) is a compile-time error. The pinned descriptor is
+ * released synchronously when the callback returns; an awaited continuation
+ * would run after release, on a possibly-recycled fd. See
+ * {@link withSecureHostParentSync}.
+ */
+type NonThenable<T> = T extends PromiseLike<unknown> ? never : T;
+
+/**
+ * Acquire the secure parent directory once and expose it to `fn` as a pinned
+ * handle for the SYNCHRONOUS duration of the call, releasing the descriptor
+ * afterwards. Use this instead of chaining {@link secureHostFilePath} +
+ * independent read/write calls when a credential needs a serialized
+ * get-or-create (lock → read → write): resolving the lock and the leaf through
+ * the same descriptor keeps the whole critical section on one directory inode.
+ * Unlike {@link secureHostFilePath}, this does not force the strict
+ * ancestor-chain assertion on Linux — the pinned descriptor already makes later
+ * operations independent of ancestor renames — so it works under a symlinked
+ * HOME or a shared-drive/0777 ancestor while `~/.botmux` itself stays 0700 and
+ * owned by the current user.
+ *
+ * Fail-closed lifetime: `fn` MUST be synchronous. The `NonThenable` return
+ * bound rejects `async`/Promise-returning callbacks at compile time; the handle
+ * exposes no raw path (only guarded methods); and every method re-checks
+ * `active` at runtime — after this function returns, any escaped handle traps
+ * instead of touching the released (and possibly fd-recycled) anchor.
+ */
+export function withSecureHostParentSync<T>(
+  filePath: string,
+  fn: (handle: SecureHostParentHandle) => NonThenable<T>,
+): T {
+  const parent = acquireSecureHostParent(filePath);
+  const leafName = basename(filePath);
+  // Kept in the closure only — never exposed as a string on the handle.
+  const anchoredLeafPath = join(parent.path, leafName);
+  let released = false;
+  const assertActive = (): void => {
+    if (released) {
+      throw new UnsafeHostAuthorityFileError('宿主凭证目录句柄已释放，禁止在回调返回后继续使用');
+    }
+  };
+  try {
+    const handle: SecureHostParentHandle = {
+      leafName,
+      readLeaf: (maxBytes = 64 * 1024) => {
+        assertActive();
+        return readSecureHostFileFromParentSync(parent, leafName, maxBytes);
+      },
+      writeLeaf: (data: string) => {
+        assertActive();
+        writeSecureLeafFromParentSync(parent, leafName, data);
+      },
+      withLeafLock: <R>(inner: () => NonThenable<R>): R => {
+        assertActive();
+        return withFileLockSync(anchoredLeafPath, inner);
+      },
+    };
+    return fn(handle);
+  } finally {
+    // Invalidate the handle BEFORE closing the fd so a post-return caller
+    // (leaked closure, or an async continuation that slipped past the type
+    // bound) can never act on a recycled descriptor.
+    released = true;
     releaseSecureHostParent(parent);
   }
 }

@@ -13,7 +13,7 @@ import { tmpdir } from 'os';
 
 // ─── Mocks ────────────────────────────────────────────────────────────────
 
-const fsControl = vi.hoisted(() => ({ failSessionWrite: false }));
+const fsControl = vi.hoisted(() => ({ failSessionWrite: false, failReaddir: false }));
 vi.mock('node:fs', async (importOriginal) => {
   const actual = await importOriginal<typeof import('node:fs')>();
   return {
@@ -23,6 +23,12 @@ vi.mock('node:fs', async (importOriginal) => {
         throw new Error('simulated session repair write failure');
       }
       return actual.writeFileSync(...args);
+    },
+    readdirSync: (...args: Parameters<typeof actual.readdirSync>) => {
+      // Simulates the CLI file sandbox: per-bot files readable, data dir
+      // enumeration denied (EPERM-like failure).
+      if (fsControl.failReaddir) throw new Error('simulated readdir denial');
+      return actual.readdirSync(...args);
     },
   };
 });
@@ -74,6 +80,10 @@ import {
   persistActiveRemoteLineagesExactBatch,
   findActiveSessionsByRoot,
   repairMissingChatScope,
+  loadAllSessionsSnapshot,
+  mutateSessionRowOffline,
+  readSessionRowFromDisk,
+  readSessionRowCopiesAcrossStores,
 } from '../src/services/session-store.js';
 
 // ─── Helpers ──────────────────────────────────────────────────────────────
@@ -1102,5 +1112,213 @@ describe('legacy placeholder-card field stripping', () => {
     expect(onDisk.s1).not.toHaveProperty('pendingResponseCardId');
     expect(onDisk.s1).not.toHaveProperty('pendingResponseCardState');
     expect(onDisk.s1).not.toHaveProperty('lastPatchedResponseCardId');
+  });
+});
+
+// ─── cross-process offline access ────────────────────────────────────────────
+// The absorbed CLI-side persistence (formerly cli.ts loadSessions /
+// mutateSessionOffline / saveSession) and the daemon/provenance direct reads.
+
+function seedFile(name: string, rows: Record<string, unknown>): void {
+  mkdirSync(tempDir, { recursive: true });
+  writeFileSync(join(tempDir, name), JSON.stringify(rows, null, 2));
+}
+
+function row(sessionId: string, extra: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    sessionId, chatId: 'oc_chat', rootMessageId: `om_${sessionId}`, title: sessionId,
+    status: 'active', createdAt: '2026-01-01T00:00:00.000Z', ...extra,
+  };
+}
+
+describe('loadAllSessionsSnapshot()', () => {
+  it('merges legacy + per-bot files, per-bot wins duplicates and gets larkAppId stamped', () => {
+    seedFile('sessions.json', {
+      legacy1: row('legacy1'),
+      dup: row('dup', { title: 'legacy copy' }),
+    });
+    seedFile('sessions-appA.json', {
+      dup: row('dup', { title: 'per-bot copy' }),
+      a1: row('a1'),
+    });
+
+    const snapshot = loadAllSessionsSnapshot({ dataDir: tempDir });
+    expect(snapshot.size).toBe(3);
+    expect(snapshot.get('legacy1')?.larkAppId).toBeUndefined();
+    expect(snapshot.get('dup')?.title).toBe('per-bot copy');
+    expect(snapshot.get('dup')?.larkAppId).toBe('appA');
+    expect(snapshot.get('a1')?.larkAppId).toBe('appA');
+  });
+
+  it('applies the scope repair and skips malformed entries', () => {
+    seedFile('sessions.json', {
+      broken: { notASession: true },
+      chatScoped: { ...row('chatScoped'), chatId: 'oc_x', rootMessageId: 'oc_x' },
+    });
+    const snapshot = loadAllSessionsSnapshot({ dataDir: tempDir });
+    expect(snapshot.size).toBe(1);
+    expect(snapshot.get('chatScoped')?.scope).toBe('chat');
+  });
+
+  it('falls back to the exact per-bot file when the data dir cannot be enumerated', () => {
+    seedFile('sessions-appB.json', { b1: row('b1') });
+    seedFile('sessions-appC.json', { c1: row('c1') });
+    fsControl.failReaddir = true;
+    try {
+      const snapshot = loadAllSessionsSnapshot({ dataDir: tempDir, fallbackAppId: 'appB' });
+      // The sandboxed fallback loads only the injected bot's own file.
+      expect([...snapshot.keys()]).toEqual(['b1']);
+      expect(snapshot.get('b1')?.larkAppId).toBe('appB');
+    } finally {
+      fsControl.failReaddir = false;
+    }
+  });
+});
+
+describe('readSessionRowFromDisk()', () => {
+  it('prefers the owning per-bot file and falls back to legacy', () => {
+    seedFile('sessions.json', { s1: row('s1', { title: 'legacy' }) });
+    seedFile('sessions-appA.json', { s1: row('s1', { title: 'per-bot' }) });
+    expect(readSessionRowFromDisk('s1', 'appA', tempDir)?.title).toBe('per-bot');
+    expect(readSessionRowFromDisk('s1', 'appMissing', tempDir)?.title).toBe('legacy');
+    expect(readSessionRowFromDisk('s1', undefined, tempDir)?.title).toBe('legacy');
+    expect(readSessionRowFromDisk('nope', 'appA', tempDir)).toBeUndefined();
+  });
+
+  it('skips a corrupt per-bot file and still reads the legacy copy', () => {
+    mkdirSync(tempDir, { recursive: true });
+    writeFileSync(join(tempDir, 'sessions-appA.json'), '{corrupt');
+    seedFile('sessions.json', { s1: row('s1', { title: 'legacy' }) });
+    expect(readSessionRowFromDisk('s1', 'appA', tempDir)?.title).toBe('legacy');
+  });
+});
+
+describe('readSessionRowCopiesAcrossStores()', () => {
+  it('returns one entry per file that holds the id', () => {
+    seedFile('sessions.json', { s1: row('s1', { title: 'legacy' }) });
+    seedFile('sessions-appA.json', { s1: row('s1', { title: 'per-bot' }) });
+    seedFile('sessions-appB.json', { other: row('other') });
+    const copies = readSessionRowCopiesAcrossStores('s1', tempDir);
+    expect(copies.map(c => c.title).sort()).toEqual(['legacy', 'per-bot']);
+    expect(readSessionRowCopiesAcrossStores('other', tempDir)).toHaveLength(1);
+    expect(readSessionRowCopiesAcrossStores('missing', tempDir)).toHaveLength(0);
+  });
+
+  it('skips corrupt files and key-mismatched rows without failing the scan', () => {
+    mkdirSync(tempDir, { recursive: true });
+    writeFileSync(join(tempDir, 'sessions-appA.json'), 'not json');
+    seedFile('sessions-appB.json', { s1: row('someOtherId') }); // key ≠ row.sessionId
+    seedFile('sessions.json', { s1: row('s1') });
+    const copies = readSessionRowCopiesAcrossStores('s1', tempDir);
+    expect(copies).toHaveLength(1);
+  });
+
+  it('throws when the data dir itself cannot be listed (fail-closed identity scan)', () => {
+    expect(() => readSessionRowCopiesAcrossStores('s1', join(tempDir, 'no-such-dir')))
+      .toThrow();
+  });
+});
+
+describe('mutateSessionRowOffline()', () => {
+  it('mutates the FRESH on-disk row, never the caller snapshot (stale-clobber regression)', () => {
+    // The row gained a newer field on disk after the caller took its snapshot.
+    // The old cli.ts saveSession() would have written the stale snapshot back,
+    // erasing workerGeneration; the locked mutation must preserve it.
+    seedFile('sessions-appA.json', {
+      s1: row('s1', { workerGeneration: 7, larkAppId: 'appA' }),
+    });
+
+    const published = mutateSessionRowOffline(
+      { sessionId: 's1', larkAppId: 'appA' },
+      current => {
+        current.status = 'closed';
+        current.closedAt = '2026-08-13T00:00:00.000Z';
+        return true;
+      },
+      { dataDir: tempDir },
+    );
+
+    expect(published?.status).toBe('closed');
+    expect(published?.workerGeneration).toBe(7);
+    const onDisk = JSON.parse(readFileSync(join(tempDir, 'sessions-appA.json'), 'utf-8'));
+    expect(onDisk.s1.status).toBe('closed');
+    expect(onDisk.s1.workerGeneration).toBe(7);
+  });
+
+  it('returns the fresh row without writing when mutate declines', () => {
+    seedFile('sessions-appA.json', { s1: row('s1', { larkAppId: 'appA' }) });
+    const before = readFileSync(join(tempDir, 'sessions-appA.json'), 'utf-8');
+    const current = mutateSessionRowOffline(
+      { sessionId: 's1', larkAppId: 'appA' },
+      () => false,
+      { dataDir: tempDir },
+    );
+    expect(current?.sessionId).toBe('s1');
+    expect(readFileSync(join(tempDir, 'sessions-appA.json'), 'utf-8')).toBe(before);
+  });
+
+  it('returns undefined for a missing row', () => {
+    seedFile('sessions-appA.json', { s1: row('s1') });
+    expect(mutateSessionRowOffline(
+      { sessionId: 'ghost', larkAppId: 'appA' },
+      () => true,
+      { dataDir: tempDir },
+    )).toBeUndefined();
+  });
+
+  it('aborts untouched when abortIf trips at entry', () => {
+    seedFile('sessions-appA.json', { s1: row('s1') });
+    const before = readFileSync(join(tempDir, 'sessions-appA.json'), 'utf-8');
+    const result = mutateSessionRowOffline(
+      { sessionId: 's1', larkAppId: 'appA' },
+      current => { current.status = 'closed'; return true; },
+      { dataDir: tempDir, abortIf: () => true },
+    );
+    expect(result).toBeUndefined();
+    expect(readFileSync(join(tempDir, 'sessions-appA.json'), 'utf-8')).toBe(before);
+  });
+
+  it('re-checks abortIf immediately before publication and leaves the file untouched', () => {
+    // A daemon that appears during the read/decision phase becomes
+    // authoritative — the second probe must catch it.
+    seedFile('sessions-appA.json', { s1: row('s1') });
+    const before = readFileSync(join(tempDir, 'sessions-appA.json'), 'utf-8');
+    let probes = 0;
+    const result = mutateSessionRowOffline(
+      { sessionId: 's1', larkAppId: 'appA' },
+      current => { current.status = 'closed'; return true; },
+      { dataDir: tempDir, abortIf: () => ++probes > 1 },
+    );
+    expect(result).toBeUndefined();
+    expect(probes).toBe(2);
+    expect(readFileSync(join(tempDir, 'sessions-appA.json'), 'utf-8')).toBe(before);
+  });
+
+  it('converges the file on write: drops key-mismatched rows and legacy card fields', () => {
+    seedFile('sessions-appA.json', {
+      s1: row('s1', { pendingResponseCardId: 'om_old' }),
+      wrongKey: row('actualId'),
+    });
+    mutateSessionRowOffline(
+      { sessionId: 's1', larkAppId: 'appA' },
+      current => { current.title = 'touched'; return true; },
+      { dataDir: tempDir },
+    );
+    const onDisk = JSON.parse(readFileSync(join(tempDir, 'sessions-appA.json'), 'utf-8'));
+    expect(onDisk.s1.title).toBe('touched');
+    expect(onDisk.s1).not.toHaveProperty('pendingResponseCardId');
+    expect(onDisk).not.toHaveProperty('wrongKey');
+  });
+
+  it('targets the legacy sessions.json when the row carries no larkAppId', () => {
+    seedFile('sessions.json', { s1: row('s1') });
+    const published = mutateSessionRowOffline(
+      { sessionId: 's1' },
+      current => { current.status = 'closed'; return true; },
+      { dataDir: tempDir },
+    );
+    expect(published?.status).toBe('closed');
+    const onDisk = JSON.parse(readFileSync(join(tempDir, 'sessions.json'), 'utf-8'));
+    expect(onDisk.s1.status).toBe('closed');
   });
 });

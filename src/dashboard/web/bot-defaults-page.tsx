@@ -37,6 +37,7 @@ import {
   dropdownLabel,
 } from './dashboard-components.js';
 import { botAvatarHtml, larkConsoleUrl, loadNameMaps, overrideBotAvatar, ui } from './ui.js';
+import { fetchGroupsSnapshot, type GroupChat } from './groups-api.js';
 import {
   DEFAULT_GRANT_DURATION_MS,
   DEFAULT_GRANT_QUOTA,
@@ -889,6 +890,7 @@ function BotDefaultsCard(props: {
         >
           <BdTabGrid>
             <section className="bd-tile bd-tile-wide"><CardBehaviorSection bot={bot} putCardPref={putCardPref} /></section>
+            <section className="bd-tile bd-tile-wide"><FeedbackSettingsSection bot={bot} patchBot={patchBot} /></section>
             <section className="bd-tile"><BrandSection bot={bot} patchBot={patchBot} /></section>
           </BdTabGrid>
         </div>
@@ -917,6 +919,71 @@ function BotDefaultsCard(props: {
         </div>
       </div>
     </article>
+  );
+}
+
+function FeedbackSettingsSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
+  const enabled = props.bot.feedback?.enabled === true;
+  const [on, setOn] = useState(enabled);
+  const [json, setJson] = useState(JSON.stringify(props.bot.feedback ?? { enabled: true }, null, 2));
+  const [status, setStatus] = useState<StatusMessage>(null);
+  const [busy, setBusy] = useState(false);
+  const [chatId, setChatId] = useState('');
+  const [chats, setChats] = useState<GroupChat[]>([]);
+  const [preview, setPreview] = useState<any>(null);
+  useEffect(() => {
+    setOn(props.bot.feedback?.enabled === true);
+    setJson(JSON.stringify(props.bot.feedback ?? { enabled: true }, null, 2));
+  }, [props.bot.feedback]);
+  useEffect(() => {
+    void fetchGroupsSnapshot().then(snapshot => {
+      setChats(snapshot.chats.filter(chat => chat.memberBots.some(member => member.larkAppId === props.bot.larkAppId && member.inChat)));
+    }).catch(() => setChats([]));
+  }, [props.bot.larkAppId]);
+  async function save(nextOn = on): Promise<void> {
+    setBusy(true); setStatus(null);
+    try {
+      let policy: Record<string, unknown> = { enabled: false };
+      if (nextOn) {
+        const parsed = JSON.parse(json);
+        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('高级 JSON 必须是对象');
+        policy = { ...parsed, enabled: true };
+      }
+      const res = await sendJson('PUT', `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/feedback`, { feedback: JSON.stringify(policy) });
+      if (!res.ok) throw new Error(responseErrorText(res));
+      props.patchBot(props.bot.larkAppId, { feedback: res.body.feedback ?? null });
+      setStatus({ text: '✓ 已保存', ok: true });
+    } catch (e: any) { setStatus({ text: `✗ ${caughtErrorText(e)}` }); }
+    finally { setBusy(false); }
+  }
+  async function loadPreview(): Promise<void> {
+    const q = chatId.trim() ? `?chatId=${encodeURIComponent(chatId.trim())}` : '';
+    const res = await fetch(`/api/bots/${encodeURIComponent(props.bot.larkAppId)}/feedback/effective${q}`);
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(body?.error ?? `HTTP ${res.status}`);
+    setPreview(body.trace);
+  }
+  async function saveChat(): Promise<void> {
+    if (!chatId.trim()) return setStatus({ text: '✗ 请输入聊天 ID' });
+    setBusy(true); setStatus(null);
+    try {
+      const feedback = JSON.parse(json);
+      const res = await sendJson('PUT', `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/chats/${encodeURIComponent(chatId.trim())}/feedback`, { feedback });
+      if (!res.ok) throw new Error(responseErrorText(res));
+      await loadPreview(); setStatus({ text: '✓ 聊天覆盖已保存', ok: true });
+    } catch (e: any) { setStatus({ text: `✗ ${caughtErrorText(e)}` }); } finally { setBusy(false); }
+  }
+  return (
+    <section className="bd-section" aria-busy={busy}>
+      <h3 className="bd-section-title">最终回答反馈</h3>
+      <ToggleRow checked={on} disabled={busy} title="最终回答反馈" help="默认关闭；只对这个 bot 的最终回答生效" onChange={checked => { setOn(checked); void save(checked); }} />
+      <label className="bd-row"><span>高级 JSON</span><textarea value={json} disabled={busy || !on} rows={10} onChange={e => setJson(e.target.value)} /></label>
+      <div className="actions"><button type="button" className="primary" disabled={busy || !on} onClick={() => void save()}>保存反馈配置</button><StatusSpan status={status} /></div>
+      <h4>每聊天覆盖</h4>
+      <label className="bd-row"><span>聊天</span><select value={chatId} onChange={e => setChatId(e.target.value)}><option value="">选择聊天</option>{chats.map(chat => <option key={chat.chatId} value={chat.chatId}>{chat.name || chat.chatId}</option>)}</select></label>
+      <div className="actions"><button type="button" disabled={busy || !chatId.trim()} onClick={() => void saveChat()}>保存聊天覆盖</button><button type="button" disabled={busy} onClick={() => void loadPreview()}>生效预览</button></div>
+      {preview ? <pre className="code-block">{JSON.stringify(preview, null, 2)}</pre> : null}
+    </section>
   );
 }
 
@@ -4119,6 +4186,7 @@ export function GrantSection(props: { bot: BotDefaultsRow; patchBot: PatchBot })
   const tr = useT();
   const [autoCard, setAutoCard] = useState(props.bot.autoGrantRequestCards !== false);
   const [restrict, setRestrict] = useState(props.bot.restrictGrantCommands === true);
+  const [p2pOpen, setP2pOpen] = useState(props.bot.p2pOpen === true);
   const [duration, setDuration] = useState(typeof props.bot.grantDefaultDurationMs === 'number' ? props.bot.grantDefaultDurationMs : null);
   const [durationInput, setDurationInput] = useState(String(props.bot.grantDefaultDurationMs ?? DEFAULT_GRANT_DURATION_MS));
   const [quota, setQuota] = useState(typeof props.bot.messageQuotaDefaultLimit === 'number' ? props.bot.messageQuotaDefaultLimit : null);
@@ -4138,6 +4206,10 @@ export function GrantSection(props: { bot: BotDefaultsRow; patchBot: PatchBot })
   }, [props.bot.restrictGrantCommands]);
 
   useEffect(() => {
+    setP2pOpen(props.bot.p2pOpen === true);
+  }, [props.bot.p2pOpen]);
+
+  useEffect(() => {
     const nextDuration = typeof props.bot.grantDefaultDurationMs === 'number' ? props.bot.grantDefaultDurationMs : null;
     setDuration(nextDuration);
     setDurationInput(String(nextDuration ?? DEFAULT_GRANT_DURATION_MS));
@@ -4153,6 +4225,7 @@ export function GrantSection(props: { bot: BotDefaultsRow; patchBot: PatchBot })
     patch: {
       autoGrantRequestCards?: boolean;
       restrictGrantCommands?: boolean;
+      p2pOpen?: boolean;
       grantDefaultDurationMs?: number | null;
       messageQuotaDefaultLimit?: number | null;
     },
@@ -4168,6 +4241,7 @@ export function GrantSection(props: { bot: BotDefaultsRow; patchBot: PatchBot })
         const nextQuota = typeof res.body.messageQuotaDefaultLimit === 'number' ? res.body.messageQuotaDefaultLimit : null;
         setAutoCard(res.body.autoGrantRequestCards !== false);
         setRestrict(res.body.restrictGrantCommands === true);
+        setP2pOpen(res.body.p2pOpen === true);
         setDuration(nextDuration);
         setQuota(nextQuota);
         if ('grantDefaultDurationMs' in patch) setDurationInput(String(nextDuration ?? DEFAULT_GRANT_DURATION_MS));
@@ -4177,6 +4251,7 @@ export function GrantSection(props: { bot: BotDefaultsRow; patchBot: PatchBot })
         props.patchBot(props.bot.larkAppId, {
           autoGrantRequestCards: res.body.autoGrantRequestCards !== false,
           restrictGrantCommands: res.body.restrictGrantCommands === true,
+          p2pOpen: res.body.p2pOpen === true,
           grantDefaultDurationMs: nextDuration,
           messageQuotaDefaultLimit: nextQuota,
         });
@@ -4277,6 +4352,18 @@ export function GrantSection(props: { bot: BotDefaultsRow; patchBot: PatchBot })
             const previous = restrict;
             setRestrict(checked);
             void savePatch({ restrictGrantCommands: checked }, 'restrict', () => setRestrict(previous));
+          }}
+        />
+        <ToggleRow
+          checked={p2pOpen}
+          disabled={busy !== null}
+          dataAction="toggle-p2p-open"
+          title={tr('botDefaults.p2pOpen')}
+          help={tr('botDefaults.p2pOpenHelp')}
+          onChange={checked => {
+            const previous = p2pOpen;
+            setP2pOpen(checked);
+            void savePatch({ p2pOpen: checked }, 'p2pOpen', () => setP2pOpen(previous));
           }}
         />
       </div>

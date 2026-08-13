@@ -25,10 +25,14 @@ vi.mock('node:fs', async () => {
     ...actual,
     openSync: vi.fn(() => 7),
     createReadStream: vi.fn(() => {
-      const handlers: Record<string, Array<(...a: any[]) => void>> = {};
+      const handlers: Record<string, Array<(...a: unknown[]) => void>> = {};
       return {
-        on(event: string, cb: any) { (handlers[event] ??= []).push(cb); return this; },
-        emit(event: string, ...args: any[]) { for (const cb of handlers[event] ?? []) cb(...args); },
+        on(event: string, cb: (...args: unknown[]) => void) {
+          handlers[event] ??= [];
+          handlers[event].push(cb);
+          return this;
+        },
+        emit(event: string, ...args: unknown[]) { for (const cb of handlers[event] ?? []) cb(...args); },
         destroy: vi.fn(),
       };
     }),
@@ -185,6 +189,28 @@ describe('TmuxPipeBackend input addressing', () => {
     const deleteArgs = calls.find(args => args.includes('delete-buffer'));
     expect(deleteArgs).toBeDefined();
     expect(deleteArgs![deleteArgs!.indexOf('-b') + 1]).toBe(bufferName);
+  });
+
+  it('reports paste rejection when paste-buffer fails after load-buffer cleanup', () => {
+    const be = new TmuxPipeBackend('0:5.0');
+    be.spawn('', [], spawnOpts());
+    mockedExecFileSync.mockClear();
+    mockedExecFileSync.mockImplementation(((_cmd: string, args?: string[]) => {
+      if (Array.isArray(args) && args.includes('paste-buffer')) throw new Error('no server running');
+      return Buffer.from('');
+    }));
+
+    expect(be.pasteText('boom')).toBe(false);
+  });
+
+  it('reports paste rejection after backend exit without sending Enter-bound content', () => {
+    const be = new TmuxPipeBackend('0:5.0');
+    be.spawn('', [], spawnOpts());
+    be.kill();
+    mockedExecFileSync.mockClear();
+
+    expect(be.pasteText('after exit')).toBe(false);
+    expect(mockedExecFileSync).not.toHaveBeenCalled();
   });
 
   it('write delegates to sendText (literal send-keys)', () => {

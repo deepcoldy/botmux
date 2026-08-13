@@ -954,4 +954,32 @@ describe('handleBotAdded — 普通群 shared 路由', () => {
     expect(ds?.session.currentReplyTarget).toBeUndefined();
     expect(mocks.forkWorker).toHaveBeenCalledWith(ds, expect.anything(), false);
   });
+
+  it('普通群 new-topic 模式开话题并锚定独立 thread-scope session', async () => {
+    const { daemon, registry, types } = modules;
+    const appId = 'app_join_new_topic';
+    const chatId = 'oc_join_new_topic';
+    registry.registerBot({
+      larkAppId: appId,
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      allowedUsers: ['ou_owner'],
+      autoStartOnGroupJoin: true,
+      autoStartOnGroupJoinPrompt: '开始排查',
+      defaultWorkingDir: tempDir('repo-new-topic'),
+      regularGroupReplyMode: 'new-topic',
+    });
+
+    await daemon.__testOnly_handleBotAdded(chatId, 'ou_owner', appId);
+
+    // 普通群（mode='group'）但 reply mode 是 new-topic：应像话题群一样开一个
+    // 独立话题（seed + thread-scope），而不是平铺进群顶层 chat-scope。
+    const ds = daemon.__testOnly_activeSessions.get(types.sessionKey('om_join_seed', appId));
+    expect(mocks.sendMessage).toHaveBeenCalledTimes(1);
+    expect(ds?.scope).toBe('thread');
+    expect(ds?.session.rootMessageId).toBe('om_join_seed');
+    // new-topic 是独立会话（非 shared 复用），不 arm shared reply target。
+    expect(ds?.session.currentReplyTarget).toBeUndefined();
+    expect(mocks.forkWorker).toHaveBeenCalledWith(ds, expect.anything(), false);
+  });
 });

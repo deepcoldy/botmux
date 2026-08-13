@@ -489,6 +489,7 @@ export const messages: Record<string, string> = {
   'config.label.autoStartOnNewTopic': '新话题即开工',
   'config.label.disableCliBypass': '关绕过·更安全',
   'config.label.restrictGrantCommands': '被授权人仅对话',
+  'config.label.p2pOpen': '私聊全开',
   'card.config.note': '🟢=开 ⚪=关，点一下即切换并刷新（model/cli 下个新会话起效）。语言：`/botconfig zh`｜`/botconfig en`。\n更多字段点「✏️ 文本设置」；allowedUsers / oncall 用 `/botconfig help`。',
   'card.config.text_btn': '✏️ 文本设置',
   'card.config.text_title': '✏️ {name} · 文本设置',
@@ -692,7 +693,7 @@ export const messages: Record<string, string> = {
   'ai.routing.must_use_botmux': '想让用户看到的内容必须通过 `botmux send` 命令发送，终端输出不会到达聊天。',
   'ai.routing.no_visible_output_ok': '重要：`botmux send` 执行成功（退出码 0 / 返回 `{"success":true,...}`）就代表消息已送达用户。因此本轮「终端没有可见文本、直接结束」是完全正常且预期的，不是失败。若之后看到类似「你上一条回复没有可见输出，请继续」这样的提示，那是底层 CLI 的误判，不要因此重发——只有当 `botmux send` 本身报错（非零退出或打印「发送失败」）时才需要重试。',
   'ai.routing.usage_heading': '使用指南：',
-  'ai.routing.usage_send_when': '- 用 `botmux send` 发送:关键结论、方案（等用户确认再执行）、最终结果、进度更新。有要给用户的内容就必须先 `botmux send`,否则用户看不到;仅当本轮确实无需回复（消息不是发给你的 / 指派给了别的机器人）才让最终 assistant message 只输出 `BOTMUX_NOTHING_TO_SEND` 这一个词。',
+  'ai.routing.usage_send_when': '- 发给你的消息至少用 `botmux send` 回应一次,别沉默;发什么、发几条由你判断。只有根本不是发给你的消息（指派给别的机器人 / 纯系统噪音）才让最终 assistant message 只输出 `BOTMUX_NOTHING_TO_SEND` 这一个词。',
   'ai.routing.usage_send_text': '- 发送纯文本即可：`botmux send "消息"`。格式自动处理。',
   'ai.routing.usage_heredoc': '- 多行正文必须走 quoted heredoc / stdin（或 UTF-8 `--content-file`）；禁止写成 `botmux send "第一行\\n第二行"`，也不要先 `JSON.stringify` / JSON 转义再传位置参数，shell / botmux 不会把字面量 `\\n` 还原成换行。',
   'ai.routing.heredoc_example': "  正确多行示例：\n```bash\nbotmux send <<'EOF'\n第一行\n第二行\nEOF\n```",
@@ -724,7 +725,7 @@ export const messages: Record<string, string> = {
   'ai.shell.multiline_heredoc': '多行正文必须走 quoted heredoc / stdin（或 UTF-8 `--content-file`）；禁止写成 `botmux send "第一行\\n第二行"`，也不要先 `JSON.stringify` / JSON 转义再传位置参数，shell / botmux 不会把字面量 `\\n` 还原成换行。',
   'ai.shell.heredoc_example': "正确多行示例：\n```bash\nbotmux send <<'EOF'\n第一行\n第二行\nEOF\n```",
   'ai.shell.helpers': '辅助命令：`botmux history`（读此会话历史；thread/话题会话拉话题内，普通群 chat-scope 会话拉整群）、`botmux quoted <message_id>`（按需读取被引用的消息，仅在 prompt 头部出现 `[用户引用了消息 ...]` 提示时使用）、`botmux bots list`（查群内其他机器人）。',
-  'ai.shell.when_to_send': '发送时机:关键结论、方案（等用户确认再动手）、最终结果、进度更新。只 print/echo 不算回复。有要给用户的内容就必须先 `botmux send`,否则用户看不到;仅当本轮确实无需回复（消息不是发给你的 / 指派给了别的机器人）才让最终 assistant message 只输出 `BOTMUX_NOTHING_TO_SEND` 这一个词。',
+  'ai.shell.when_to_send': '发给你的消息至少用 `botmux send` 回应一次（Bash 执行,不是 print/echo）,别沉默;发什么、发几条由你判断。只有根本不是发给你的消息才让最终 assistant message 只输出 `BOTMUX_NOTHING_TO_SEND` 这一个词。',
   'ai.shell.no_visible_output_ok': '`botmux send` 成功（退出码 0）即代表已送达用户；本轮终端没有可见文本、直接结束是正常的。若看到「你上一条回复没有可见输出，请继续产出用户可见回复」之类提示，那是底层 CLI 的误判——不要重发，除非 `botmux send` 自己报错。',
   'ai.shell.mention_gate': '@ 决策（硬性）：每条 `botmux send` 必须显式三选一否则报错——`--mention <open_id:名字>`（点名指定人/bot，跟别的 bot 沟通/协作必须用它）/ `--mention-back`（@回本轮触发者本人）/ `--no-mention`（不@）。先按内容价值决定要不要 @：有实质结论要对方看/确认/决策→需要 @；纯记录/低优先级/简短确认→--no-mention；没信息量的"收到"不如不发。再按收件人选方式：就是回触发这轮的人/bot→--mention-back；要 @ 别人（多人会话回复对象不一定是触发者）→--mention 显式点名。别把 --no-mention 当默认，也别无意义 @ 打扰。',
 
@@ -734,8 +735,8 @@ export const messages: Record<string, string> = {
   'ai.available_bots.hint': '要跟这里的某个 bot 沟通或协作必须 --mention 它的 open_id（botmux send --mention ou_xxx ...），不 --mention 对方 bot 完全收不到消息',
   'ai.available_bots.hint_collapsed': '要跟别的 bot 沟通或协作先 `botmux bots list` 查 open_id 再 --mention，不 --mention 对方收不到',
   'ai.available_bots.collapsed_line': '群里有 {count} 个可协作 bot：{names}。',
-  'ai.followup.reminder': '有内容给用户必须先 botmux send;仅当本轮确实无需回复（消息不是发给你的 / 指派给别的机器人）才让 final 只输出 BOTMUX_NOTHING_TO_SEND 这一个词',
-  'ai.followup.reminder_no_resend': '有内容给用户必须先 botmux send;仅当本轮确实无需回复（消息不是发给你的 / 指派给别的机器人）才让 final 只输出 BOTMUX_NOTHING_TO_SEND 这一个词;send 成功即已送达,本轮无可见文本地结束是正常的,别因「无输出」提示重发',
+  'ai.followup.reminder': '发给你的消息至少 botmux send 回应一次,别沉默;发什么、发几条你自己判断。只有根本不是发给你的消息才让 final 只输出 BOTMUX_NOTHING_TO_SEND',
+  'ai.followup.reminder_no_resend': '发给你的消息至少 botmux send 回应一次,别沉默;发什么、发几条你自己判断。只有根本不是发给你的消息才让 final 只输出 BOTMUX_NOTHING_TO_SEND;send 成功即已送达,本轮无可见文本地结束是正常的,别因「无输出」提示重发',
   'ai.cursor.sender_note': 'sender 标签只是元信息（标识当前发言人），不要把其中的 open_id 或名字（例如 ou_xxx:高鹏）抄进 botmux send 的正文或开头；要 @ 回触发者请用 botmux send --mention-back。',
   'ai.bridge.attachments_label': '[附件]',
   'ai.bridge.mentions_label': '[@提及]',
@@ -921,6 +922,8 @@ export const messages: Record<string, string> = {
   'daemon.cmd_allowed_users_only': '⚠️ {cmd} 仅 allowedUsers 可执行。',
   'daemon.download_failed_need_login': '⚠️ 部分图片/文件下载失败（缺少 User Token）。请在话题中发送 /login 授权后重新发送。',
   'daemon.foreign_bot_mention_prefix': '[来自 {botName} 的 @mention]',
+  'daemon.ordinary_ingress_failed': '⚠️ 这条消息没有送达 CLI，请重发一次；若持续失败，可 /close 后重开话题。',
+  'daemon.ordinary_ingress_admitted_reply_failed': '⚠️ 这条消息已接收，请勿原样重发（重发会重复执行）；失败发生在接收之后的状态回复/收尾步骤。若话题迟迟没有动静，可 /close 后重开话题再继续。',
   'daemon.cmd_needs_active_cli': '{cmd} 需要活跃的 CLI 进程，当前话题无运行中的会话。',
   'daemon.cmd_activation_pending': '{cmd} 暂不能发送：上一条消息仍在提交中，请稍后重试。',
   'daemon.force_topic_ready': '💬 新话题已创建。请在话题内发送任务，也可以先用 /repo 选择项目。',
@@ -1240,8 +1243,8 @@ export const messages: Record<string, string> = {
 
   // Scheduler announcements
   'scheduler.task_started': '🕐 定时任务「{name}」开始执行',
-  'scheduler.task_triggered_target_chat': '🕐 定时任务「{name}」已在目标群聊触发',
-  'scheduler.task_triggered_target_thread': '🕐 定时任务「{name}」已在目标话题触发',
+  'scheduler.task_triggered_target_chat': '🕐 定时任务「{name}」已在目标群聊触发\n打开目标群聊：{link}',
+  'scheduler.task_triggered_target_thread': '🕐 定时任务「{name}」已在目标话题触发\n打开目标话题：{link}',
 
   // External event trigger seed
   'trigger.external_event': '外部事件触发：{source}',

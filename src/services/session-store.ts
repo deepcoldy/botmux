@@ -1039,6 +1039,178 @@ export function collectBotmuxSessionIdentities(dataDir: string = config.session.
   return ids;
 }
 
+// ─── Cross-process offline access ───────────────────────────────────────────
+// The only sanctioned ways to touch session rows from OUTSIDE the owning
+// daemon process (agent-facing CLI subcommands, caller-identity proofs). Until
+// 2026-08 the CLI kept its own parallel copies of these (loadSessions /
+// saveSession / mutateSessionOffline in cli.ts) — one of which wrote the whole
+// file WITHOUT the lock; they were absorbed here so persistence mechanics
+// (file layout, lock, tmp+rename, legacy-field strip) stay private to this
+// module.
+
+/**
+ * Read-only snapshot of every session row across the legacy `sessions.json`
+ * and all per-bot `sessions-<appId>.json` files. Per-bot rows win duplicate
+ * sessionIds and get `larkAppId` stamped from their filename so a later
+ * offline mutation resolves the owning file. Deliberately lock-free: atomic
+ * tmp+rename publication keeps each file self-consistent, and snapshot
+ * composition must stay a pure reader (an older CLI opportunistically migrated
+ * legacy rows here, which made even `botmux list` a whole-file writer able to
+ * race a daemon save).
+ */
+export function loadAllSessionsSnapshot(options: {
+  dataDir?: string;
+  /** Per-bot fallback when the data dir cannot be enumerated (the CLI file
+   *  sandbox exposes sessions-<self>.json but NOT a listing of data/). */
+  fallbackAppId?: string;
+} = {}): Map<string, Session> {
+  const dataDir = options.dataDir ?? config.session.dataDir;
+  const out = new Map<string, Session>();
+  const readInto = (file: string, stampAppId?: string): void => {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(readFileSync(join(dataDir, file), 'utf-8'));
+    } catch { return; /* missing or corrupt file → skip */ }
+    // Arrays are deliberately tolerated (Object.values yields their rows):
+    // the historical CLI loader accepted array-shaped files and existing
+    // fixtures/tools rely on that.
+    if (!parsed || typeof parsed !== 'object') return;
+    for (const value of Object.values(parsed as Record<string, unknown>)) {
+      const session = value as Session;
+      if (!session || typeof session !== 'object' || !session.sessionId) continue;
+      repairMissingChatScope(session);
+      if (stampAppId && !session.larkAppId) session.larkAppId = stampAppId;
+      out.set(session.sessionId, session);
+    }
+  };
+  readInto('sessions.json');
+  try {
+    for (const file of readdirSync(dataDir)) {
+      if (file.startsWith('sessions-') && file.endsWith('.json')) {
+        readInto(file, file.slice('sessions-'.length, -'.json'.length));
+      }
+    }
+  } catch {
+    if (options.fallbackAppId) {
+      readInto(`sessions-${options.fallbackAppId}.json`, options.fallbackAppId);
+    }
+  }
+  return out;
+}
+
+/**
+ * Unlocked point-read of one row straight from disk, bypassing this process's
+ * in-memory cache: the owning per-bot file first, then the legacy
+ * `sessions.json`. Atomic tmp+rename publication keeps each file
+ * self-consistent, so this never blocks on (or throws from) the store lock —
+ * safe on hot paths that only need a freshness hint.
+ */
+export function readSessionRowFromDisk(
+  sessionId: string,
+  larkAppId?: string,
+  dataDir: string = config.session.dataDir,
+): Session | undefined {
+  const files = larkAppId
+    ? [`sessions-${larkAppId}.json`, 'sessions.json']
+    : ['sessions.json'];
+  for (const file of files) {
+    const fp = join(dataDir, file);
+    if (!existsSync(fp)) continue;
+    try {
+      const data = JSON.parse(readFileSync(fp, 'utf-8')) as Record<string, Session>;
+      if (data[sessionId]) return data[sessionId];
+    } catch { /* ignore corrupt/racing session file */ }
+  }
+  return undefined;
+}
+
+/**
+ * Fail-closed identity scan: every file's copy of one session row across the
+ * legacy and all per-bot files — one entry per file that holds the id. An
+ * unlistable data dir THROWS: a caller proving "this row resolves exactly
+ * once" must not mistake an unreadable store for an empty one. A corrupt
+ * individual file is skipped: an unrelated bot's bad file must neither block
+ * nor impersonate a valid record; the target row still has to resolve from a
+ * readable file.
+ */
+export function readSessionRowCopiesAcrossStores(
+  sessionId: string,
+  dataDir: string = config.session.dataDir,
+): Session[] {
+  const files = readdirSync(dataDir).filter((name) => (
+    name === 'sessions.json'
+    || (name.startsWith('sessions-') && name.endsWith('.json'))
+  ));
+  const matches: Session[] = [];
+  for (const file of files) {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(readFileSync(join(dataDir, file), 'utf-8')) as unknown;
+    } catch { continue; }
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) continue;
+    const keyed = (parsed as Record<string, unknown>)[sessionId];
+    if (!keyed || typeof keyed !== 'object' || Array.isArray(keyed)) continue;
+    const session = keyed as Session;
+    if (session.sessionId !== sessionId) continue;
+    matches.push(session);
+  }
+  return matches;
+}
+
+/**
+ * Locked offline mutation of one exact row in its owning file (per-bot when
+ * the caller-observed row carries `larkAppId`, legacy `sessions.json`
+ * otherwise). Re-reads the row under the SAME lock the owning daemon uses for
+ * every save and hands the FRESH copy to `mutate` — never publishing the
+ * caller's possibly-stale snapshot — then republishes with the daemon's own
+ * tmp+rename / mismatched-key cleanup / legacy-field strip.
+ *
+ * `abortIf` is evaluated under the lock at entry and re-evaluated immediately
+ * before publication; returning true abandons the mutation with `undefined`
+ * (callers pass a daemon-liveness probe so an owning daemon that appears
+ * mid-flight stays authoritative and the file is left untouched).
+ *
+ * Returns the fresh row — mutated when `mutate` returned true, otherwise
+ * unmodified (so `() => false` is a locked fresh read) — or undefined when
+ * the row is absent or `abortIf` aborted.
+ */
+export function mutateSessionRowOffline(
+  target: { sessionId: string; larkAppId?: string },
+  mutate: (current: Session) => boolean,
+  options: { dataDir?: string; abortIf?: () => boolean } = {},
+): Session | undefined {
+  const dataDir = options.dataDir ?? config.session.dataDir;
+  const fileName = target.larkAppId ? `sessions-${target.larkAppId}.json` : 'sessions.json';
+  const fp = join(dataDir, fileName);
+  return withFileLockSync(fp, () => {
+    if (options.abortIf?.()) return undefined;
+    let data: Record<string, Session> = {};
+    if (existsSync(fp)) {
+      try { data = JSON.parse(readFileSync(fp, 'utf-8')); } catch { /* start fresh */ }
+    }
+    const current = data[target.sessionId];
+    if (!current || !mutate(current)) return current;
+    data[target.sessionId] = current;
+
+    // Clean up entries where the file key doesn't match the entry's sessionId
+    // (data corruption), and strip removed placeholder-card fields — the same
+    // convergence the daemon's save() applies.
+    for (const [key, val] of Object.entries(data)) {
+      if (val && typeof val === 'object' && 'sessionId' in val && (val as Session).sessionId !== key) {
+        delete data[key];
+        continue;
+      }
+      if (val && typeof val === 'object') stripLegacyPendingCardFields(val as unknown as Record<string, unknown>);
+    }
+
+    if (options.abortIf?.()) return undefined;
+    const tmpFp = `${fp}.${process.pid}.${randomUUID()}.tmp`;
+    writeFileSync(tmpFp, JSON.stringify(data, null, 2), 'utf-8');
+    renameSync(tmpFp, fp);
+    return current;
+  });
+}
+
 function findActiveSessionsMatching(predicate: (s: Session) => boolean): Session[] {
   load();
   const matches: Session[] = [];

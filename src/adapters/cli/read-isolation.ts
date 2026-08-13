@@ -321,10 +321,13 @@ export function buildSeatbeltProfile(
 //     (sandboxReadonlyPaths) so goal-mode stops wedging on the TRAE first-run
 //     migration prompt. That is a new spawn-time mount; a pane predating it warm-
 //     reattaches with the old mount set and still wedges, so it must cold-spawn.
+//   · 9 → 10: credential-only Seatbelt/bwrap panes receive a private rotating
+//     managed-origin channel for capability-gated daemon IPC. A warm pane with
+//     the v9 marker lacks both the env and the private read carve-out.
 // #709 (→8) merged first; this PR (#714) rebased on top and takes 9. Numbers stay
 // strictly monotonic — a pane at any intermediate version must be rejected so it
 // cold-spawns under the current contract rather than bypassing a migration.
-export const ISOLATION_PANE_MARKER_VERSION = 9;
+export const ISOLATION_PANE_MARKER_VERSION = 10;
 
 export type IsolationCapability = 'credential' | 'read' | 'write';
 
@@ -410,7 +413,7 @@ export function isolationPaneMarkerContent(
   if (policy
     && (!/^[a-f0-9]{64}$/.test(policy.originChannelId)
       || !/^[a-f0-9]{64}$/.test(policy.policyDigest))) {
-    throw new Error('invalid Darwin isolation marker policy');
+    throw new Error('invalid isolation marker policy');
   }
   return JSON.stringify({
     version: ISOLATION_PANE_MARKER_VERSION,

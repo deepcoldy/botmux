@@ -818,6 +818,15 @@ describe('opencode buildArgs', () => {
     expect(adapter.passesInitialPromptViaArgs).toBe(true);
   });
 
+  it('exposes paste-line raw command delivery capability', () => {
+    const rawAdapter = createOpenCodeAdapter('/bin/opencode');
+
+    expect(rawAdapter.rawCommandInputMode).toBe('paste-line');
+    expect(rawAdapter.rawCommandSettleMs).toEqual(expect.any(Number));
+    expect(Number.isFinite(rawAdapter.rawCommandSettleMs)).toBe(true);
+    expect(rawAdapter.rawCommandSettleMs).toBeGreaterThan(0);
+  });
+
   it('does not include session id or resume', () => {
     const args = adapter.buildArgs({ sessionId: 'sess-6', resume: true });
     expect(args).not.toContain('sess-6');

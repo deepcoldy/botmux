@@ -19,11 +19,15 @@ import { resolveAllowedUsersWithMap } from '../im/lark/client.js';
 import { CLI_OPTIONS, resolveCliId } from '../setup/bot-config-editor.js';
 import { expandHomePath } from '../utils/working-dir.js';
 import { resolveTeamRoleFile } from '../core/role-resolver.js';
-import { statSync } from 'node:fs';
+import { existsSync, readFileSync, statSync } from 'node:fs';
+import { atomicWriteFileSync } from '../utils/atomic-write.js';
+import { sendCredFilePath } from '../adapters/cli/read-isolation.js';
 import { logger } from '../utils/logger.js';
 import { parseCustomPassthroughInput, parseCanTalkDaemonCommandsInput } from '../core/passthrough-commands.js';
 import { parseStartupCommandsInput } from '../core/startup-commands.js';
 import { isReservedPerBotEnvKey, sanitizePerBotEnv } from '../core/per-bot-env.js';
+import { normalizeFeedbackPolicy } from './feedback-policy.js';
+import { normalizeFeedbackPolicyLayer, type FeedbackPolicyLayer } from './feedback-policy-resolver.js';
 
 /**
  * 生效时机：
@@ -74,6 +78,7 @@ export const CONFIG_FIELDS: readonly ConfigFieldSpec[] = [
   { key: 'autoStartPrompt', configKey: 'autoStartOnGroupJoinPrompt', kind: 'string', effect: 'immediate', clearable: true, hint: '被拉进新群主动开工的首轮 prompt（配合 autoStartOnGroupJoin）' },
   { key: 'allowedUsers', configKey: 'allowedUsers', kind: 'allowedUsers', effect: 'immediate', clearable: false, hint: '管理员名单（邮箱/on_/ou_，逗号或空格分隔）；改后需加 确认' },
   { key: 'skills', configKey: 'skills', kind: 'json', effect: 'next-session', clearable: true, hint: 'bot 级 skill policy JSON；unset 回底层 CLI 默认行为' },
+  { key: 'feedback', configKey: 'feedback', kind: 'json', effect: 'immediate', clearable: true, hint: '最终回答反馈 JSON；默认关闭，enabled=true 后按本 bot 启用；unset 关闭' },
   { key: 'disableStreamingCard', configKey: 'disableStreamingCard', kind: 'boolean', effect: 'immediate', clearable: false, hint: '关闭实时流式卡片 on|off' },
   { key: 'silentTurnReactions', configKey: 'silentTurnReactions', kind: 'boolean', effect: 'immediate', clearable: false, hint: '关闭无卡片模式下的 GoGoGo/DONE 消息 reaction on|off' },
   { key: 'writableTerminalLinkInCard', configKey: 'writableTerminalLinkInCard', kind: 'boolean', effect: 'immediate', clearable: false, hint: '卡片内嵌可写终端链接 on|off' },
@@ -86,6 +91,7 @@ export const CONFIG_FIELDS: readonly ConfigFieldSpec[] = [
   { key: 'disableCliBypass', configKey: 'disableCliBypass', kind: 'boolean', effect: 'next-session', clearable: false, hint: '不加 CLI 审批/sandbox 绕过参数 on|off' },
   { key: 'codexAppCleanInput', configKey: 'codexAppCleanInput', kind: 'boolean', effect: 'immediate', clearable: false, hint: '实验性：Codex App 用户气泡只保留真实输入，Botmux 元数据走隐藏上下文；默认 off，从下一次 turn 派发生效，不改已有历史' },
   { key: 'restrictGrantCommands', configKey: 'restrictGrantCommands', kind: 'boolean', effect: 'immediate', clearable: false, hint: '被授权人仅能纯对话、拦截斜杠命令 on|off' },
+  { key: 'p2pOpen', configKey: 'p2pOpen', kind: 'boolean', effect: 'immediate', clearable: false, hint: '私聊对话全开 on|off：任何能看到本 bot 的人都可私聊（只放行对话；管理操作默认仍只认 allowedUsers，被 canTalkDaemonCommands 显式降级的命令除外）；不影响群聊' },
   { key: 'p2pMode', configKey: 'p2pMode', kind: 'enum', effect: 'immediate', clearable: true, enumValues: ['thread', 'chat'], hint: '私聊单聊模式 thread|chat；默认 chat=扁平连续会话，thread=每条 DM 独立会话（chat/unset 回默认）' },
   { key: 'maxLiveWorkers', configKey: 'maxLiveWorkers', kind: 'number', effect: 'immediate', clearable: true, hint: '最大常驻会话数；超过后最久未用的会话自动休眠（退出后台进程和 CLI、回收内存，下条消息冷恢复）；unset=默认 30' },
   { key: 'customPassthroughCommands', configKey: 'customPassthroughCommands', kind: 'stringList', effect: 'immediate', clearable: true, hint: '额外放行透传给 CLI 的 slash 命令（逗号/空格分隔，如 /goal /export）；unset 回仅内置白名单' },
@@ -244,11 +250,65 @@ export async function applyConfigField(
     (bot.config as any)[spec.configKey] = effective;
   }
   const newText = formatFieldValue(spec, (bot.config as any)[spec.configKey]);
+  if (spec.configKey === 'feedback') {
+    try {
+      const path = sendCredFilePath(config.session.dataDir, larkAppId);
+      if (existsSync(path)) {
+        const cred = JSON.parse(readFileSync(path, 'utf8')) as Record<string, unknown>;
+        if (effective === null || (effective as any)?.enabled !== true) delete cred.feedback;
+        else cred.feedback = effective;
+        atomicWriteFileSync(path, JSON.stringify(cred), { mode: 0o600 });
+      }
+    } catch (error) {
+      logger.warn(`[config:${larkAppId}] failed to refresh sandbox feedback policy: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
   if (spec.configKey === 'displayName') {
     try { displayNameRefresher?.(); } catch { /* best effort */ }
   }
   logger.info(`[config:${larkAppId}] set ${spec.key}: ${oldText} -> ${newText}`);
   return { ok: true, oldText, newText, effect: spec.effect };
+}
+
+export type SetFeedbackPolicyResult = { ok: true } | { ok: false; reason: string };
+
+export async function setBotFeedbackPolicy(larkAppId: string, policy: FeedbackPolicyLayer | null): Promise<SetFeedbackPolicyResult> {
+  let normalized: FeedbackPolicyLayer | undefined;
+  try { normalized = policy === null ? undefined : normalizeFeedbackPolicyLayer(policy); }
+  catch { return { ok: false, reason: 'invalid_policy' }; }
+  let bot;
+  try { bot = getBot(larkAppId); } catch { return { ok: false, reason: 'bot_not_registered' }; }
+  const r = await rmwBotEntry<null>(larkAppId, entry => {
+    if (normalized === undefined) delete entry.feedback;
+    else entry.feedback = normalized;
+    return { write: true, result: null };
+  });
+  if (!r.ok) return { ok: false, reason: r.reason };
+  bot.config.feedback = normalized;
+  return { ok: true };
+}
+
+export async function setChatFeedbackPolicy(larkAppId: string, chatId: string, policy: FeedbackPolicyLayer | null): Promise<SetFeedbackPolicyResult> {
+  let normalized: FeedbackPolicyLayer | undefined;
+  try { normalized = policy === null ? undefined : normalizeFeedbackPolicyLayer(policy); }
+  catch { return { ok: false, reason: 'invalid_policy' }; }
+  let bot;
+  try { bot = getBot(larkAppId); } catch { return { ok: false, reason: 'bot_not_registered' }; }
+  const r = await rmwBotEntry<null>(larkAppId, entry => {
+    const current: Record<string, FeedbackPolicyLayer> = entry.chatFeedbackPolicies && typeof entry.chatFeedbackPolicies === 'object' && !Array.isArray(entry.chatFeedbackPolicies)
+      ? { ...entry.chatFeedbackPolicies } : {};
+    if (normalized === undefined) delete current[chatId];
+    else current[chatId] = normalized;
+    if (Object.keys(current).length === 0) delete entry.chatFeedbackPolicies;
+    else entry.chatFeedbackPolicies = current;
+    return { write: true, result: null };
+  });
+  if (!r.ok) return { ok: false, reason: r.reason };
+  const current = { ...(bot.config.chatFeedbackPolicies ?? {}) };
+  if (normalized === undefined) delete current[chatId];
+  else current[chatId] = normalized;
+  bot.config.chatFeedbackPolicies = Object.keys(current).length ? current : undefined;
+  return { ok: true };
 }
 
 export type SetAllowedUsersResult =
@@ -363,6 +423,12 @@ export function coerceConfigValue(spec: ConfigFieldSpec, raw: unknown): CoerceRe
         if (spec.configKey === 'skills') {
           const policy = readBotSkillPolicy(parsed);
           return policy ? { ok: true, value: policy } : { ok: false, reason: 'invalid_json' };
+        }
+        if (spec.configKey === 'feedback') {
+          if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return { ok: false, reason: 'invalid_json' };
+          if ((parsed as { enabled?: unknown }).enabled !== true) return { ok: true, value: { enabled: false } };
+          try { return { ok: true, value: normalizeFeedbackPolicy(parsed) }; }
+          catch { return { ok: false, reason: 'invalid_json' }; }
         }
         if (spec.configKey === 'env') {
           // Must be a JSON object; sanitize to valid env keys + primitive values.

@@ -1,5 +1,6 @@
 import { store } from './store.js';
 import type { CliRuntimeConfig as SharedCliRuntimeConfig } from '../../adapters/cli/runtime.js';
+import type { FeedbackPolicyLayer } from '../../services/feedback-policy-resolver.js';
 
 export type CliOption = {
   id: string;
@@ -88,6 +89,7 @@ export type BotDefaultsRow = {
   regularGroupReplyMode?: string;
   regularGroupMentionMode?: string;
   substituteMode?: BotSubstituteMode | null;
+  feedback?: FeedbackPolicyLayer | null;
   docSubscribeDefaultMode?: string;
   maxLiveWorkers?: number | null;
   logicalSessionCount?: number;
@@ -104,6 +106,7 @@ export type BotDefaultsRow = {
   autoStartOnNewTopic?: boolean;
   autoGrantRequestCards?: boolean;
   restrictGrantCommands?: boolean;
+  p2pOpen?: boolean;
   grantDefaultDurationMs?: number | null;
   messageQuotaDefaultLimit?: number | null;
   skillInjectionSupport?: 'dynamic' | 'global' | 'none' | string;

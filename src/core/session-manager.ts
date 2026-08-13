@@ -82,6 +82,7 @@ import { resolveRegularGroupMode } from '../services/chat-reply-mode-store.js';
 import { beginReplyTargetTurn } from './reply-target.js';
 import { readDeferredTopicBinding, removeDeferredTopicBinding } from './deferred-topic-binding.js';
 import { escapeXmlTagLikeTokens } from '../utils/xml.js';
+import { chatAppLink, threadAppLink, normalizeBrand } from '../im/lark/lark-hosts.js';
 
 export { getAttachmentsDir } from './attachment-path.js';
 
@@ -2954,6 +2955,37 @@ export function resolveScheduledTaskExecutionPosition(
   return task.scope !== 'chat' && task.rootMessageId ? 'topic' : 'top-level';
 }
 
+async function buildScheduledTargetNotice(params: {
+  kind: 'chat' | 'thread';
+  taskName: string;
+  targetAppId: string;
+  targetChatId: string;
+  targetRootMessageId?: string;
+  targetBrand?: unknown;
+  locale?: Locale;
+}): Promise<string> {
+  const { getMessageThreadId } = await import('../im/lark/client.js');
+  const brand = normalizeBrand(params.targetBrand);
+  let link = chatAppLink(params.targetChatId, brand);
+  if (params.kind === 'thread' && params.targetRootMessageId) {
+    try {
+      const threadId = await getMessageThreadId(params.targetAppId, params.targetRootMessageId);
+      if (threadId) link = threadAppLink(params.targetChatId, threadId, brand);
+    } catch (err: any) {
+      logger.warn(
+        `[scheduler] Failed to resolve target topic ${params.targetRootMessageId}; falling back to chat link (${err.message})`,
+      );
+    }
+  }
+  return t(
+    params.kind === 'thread'
+      ? 'scheduler.task_triggered_target_thread'
+      : 'scheduler.task_triggered_target_chat',
+    { name: params.taskName, link },
+    params.locale,
+  );
+}
+
 export async function executeScheduledTask(
   task: ScheduledTask,
   activeSessions: Map<string, DaemonSession>,
@@ -3023,13 +3055,20 @@ export async function executeScheduledTask(
     } else {
       if (task.creatorRootMessageId && task.creatorChatId !== task.chatId) {
         const creatorAppId = task.creatorLarkAppId ?? larkAppId;
-        replyMessage(
+        buildScheduledTargetNotice({
+          kind: 'chat',
+          taskName: task.name,
+          targetAppId: larkAppId,
+          targetChatId: task.chatId,
+          targetBrand: bot.config.brand,
+          locale: localeForBot(creatorAppId),
+        }).then(content => replyMessage(
           creatorAppId,
-          task.creatorRootMessageId,
-          t('scheduler.task_triggered_target_chat', { name: task.name }, localeForBot(creatorAppId)),
+          task.creatorRootMessageId!,
+          content,
           'text',
           true,
-        ).catch((err: any) => {
+        )).catch((err: any) => {
           logger.warn(`[scheduler] Failed to notify creator thread ${task.creatorRootMessageId} (${err.message})`);
         });
       }
@@ -3053,13 +3092,20 @@ export async function executeScheduledTask(
       // target bot/chat's shared or independent-topic regular-group mode.
       if (task.creatorRootMessageId && task.creatorChatId !== task.chatId) {
         const creatorAppId = task.creatorLarkAppId ?? larkAppId;
-        replyMessage(
+        buildScheduledTargetNotice({
+          kind: 'chat',
+          taskName: task.name,
+          targetAppId: larkAppId,
+          targetChatId: task.chatId,
+          targetBrand: bot.config.brand,
+          locale: localeForBot(creatorAppId),
+        }).then(content => replyMessage(
           creatorAppId,
-          task.creatorRootMessageId,
-          t('scheduler.task_triggered_target_chat', { name: task.name }, localeForBot(creatorAppId)),
+          task.creatorRootMessageId!,
+          content,
           'text',
           true,
-        ).catch((err: any) => {
+        )).catch((err: any) => {
           logger.warn(`[scheduler] Failed to notify creator thread ${task.creatorRootMessageId} (${err.message})`);
         });
       }
@@ -3100,13 +3146,21 @@ export async function executeScheduledTask(
     if (isCrossThread) {
       if (!silent) {
         const creatorAppId = task.creatorLarkAppId ?? larkAppId;
-        replyMessage(
+        buildScheduledTargetNotice({
+          kind: 'thread',
+          taskName: task.name,
+          targetAppId: larkAppId,
+          targetChatId: task.chatId,
+          targetRootMessageId: task.rootMessageId,
+          targetBrand: bot.config.brand,
+          locale: localeForBot(creatorAppId),
+        }).then(content => replyMessage(
           creatorAppId,
           task.creatorRootMessageId!,
-          t('scheduler.task_triggered_target_thread', { name: task.name }, localeForBot(creatorAppId)),
+          content,
           'text',
           true,
-        ).catch((err: any) => {
+        )).catch((err: any) => {
           logger.warn(`[scheduler] Failed to notify creator thread ${task.creatorRootMessageId} (${err.message})`);
         });
       }

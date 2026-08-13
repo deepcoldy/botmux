@@ -73,6 +73,7 @@ export function buildCredentialOnlySandboxArgs(input: {
   hideDirectories: string[];
   hideFiles: string[];
   readonlyPaths?: string[];
+  privateReadonlyDirectories?: Array<{ parent: string; directory: string }>;
   workingDir: string;
   cliBin: string;
   cliArgs: string[];
@@ -92,6 +93,20 @@ export function buildCredentialOnlySandboxArgs(input: {
     '--bind', '/', '/',
     '--proc', '/proc',
   ];
+  for (const entry of input.privateReadonlyDirectories ?? []) {
+    const parent = assertCredentialIsolationPath(entry.parent, 'private readonly parent');
+    const directory = assertCredentialIsolationPath(
+      entry.directory,
+      'private readonly directory',
+    );
+    if (!directory.startsWith(`${parent}/`)) {
+      throw new Error(`private readonly directory must be below its parent: ${directory}`);
+    }
+    // Hide every sibling channel first, then expose only the owning directory.
+    // A directory bind (rather than a file bind) observes the worker's atomic
+    // rename-based capability rotations without pinning the old inode.
+    args.push('--tmpfs', parent, '--ro-bind', directory, directory);
+  }
   for (const path of [...new Set(input.readonlyPaths ?? [])].sort()) {
     const normalized = assertCredentialIsolationPath(path, 'readonly path');
     args.push('--ro-bind', normalized, normalized);
@@ -187,6 +202,7 @@ export function prepareCredentialOnlySandbox(input: {
   hideDirectories: string[];
   hideFiles: string[];
   readonlyPaths?: string[];
+  privateReadonlyDirectories?: Array<{ parent: string; directory: string }>;
   workingDir: string;
   cliBin: string;
   cliArgs: string[];
@@ -864,7 +880,7 @@ export interface RelayRequest {
 // content/attachments come from validated outbox files, and session-id is
 // forced by the worker.
 const RELAY_FLAGS_NOVAL = new Set(['--mention-back', '--no-mention', '--no-quote', '--voice']);
-const RELAY_FLAGS_VAL = new Set(['--mention', '--quote']);
+const RELAY_FLAGS_VAL = new Set(['--mention', '--quote', '--response-kind']);
 
 export interface ValidatedRelay {
   contentName: string;
@@ -936,6 +952,9 @@ export function validateRelayRequest(req: RelayRequest): { ok: true; value: Vali
       // ['--mention','--session-id'] and have --session-id swallowed as the
       // value, corrupting the worker-forced session-id (self-DoS).
       if (v.startsWith('--')) return { ok: false, error: `flag ${f} value must not be a flag` };
+      if (f === '--response-kind' && !['progress', 'final', 'auxiliary'].includes(v)) {
+        return { ok: false, error: 'flag --response-kind must be progress, final, or auxiliary' };
+      }
       flags.push(f, v); i++; continue;
     }
     return { ok: false, error: `flag not allowed: ${f}` };

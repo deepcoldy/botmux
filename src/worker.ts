@@ -38,6 +38,7 @@ import {
 import { buildFsPolicy, compileToSeatbelt, migrateLegacySandboxFields, resolveRedirectedAdapterAuthPaths, FsPolicyConfigError } from './adapters/cli/fs-policy.js';
 import { isRemoteBackendType, killPersistentBackendTarget, killPersistentSession, probePersistentBackendTarget, probePersistentSession, shouldRejectPersistentPostKillProbe, type PersistentBackendType } from './core/persistent-backend.js';
 import { finalizeRawCommandDelivery, writeRawCommandLine } from './core/raw-command-writer.js';
+import { rawCommandWriteOptionsFor } from './core/raw-command-write-options.js';
 import { publishCliSessionIdToDaemon } from './core/cli-session-id-publisher.js';
 import { readProcessStartIdentity } from './core/session-marker.js';
 import { roleLibraryRoot, roleLibrarySubtree } from './core/role-library.js';
@@ -338,6 +339,7 @@ import {
   managedOriginDataRootProbeAccess,
   managedOriginIsolationSentinelAccess,
   managedOriginAttestationDirectory,
+  managedOriginCapabilityDirectory,
   managedOriginCapabilityPath,
   managedOriginRootLocatorPath,
   readManagedOriginAuthorityFile,
@@ -735,11 +737,23 @@ function persistentPaneInfo(backendType: string, sessionId: string): { name: str
   return { name, live };
 }
 
-function persistentPaneLive(backendType: PersistentBackendType, name: string): boolean {
-  if (backendType === 'tmux') return TmuxBackend.hasSession(name);
-  if (backendType === 'zellij') return ZellijBackend.hasSession(name);
-  if (backendType === 'herdr') return HerdrBackend.hasSession(name);
-  return ZmxBackend.hasSession(name);
+/** Tri-state pane liveness, for callers that must not read "no answer" as an
+ *  answer. The `hasSession()` helpers collapse an unanswered probe into
+ *  `false`, which is safe where a wrong guess just means "treat as fresh" but
+ *  NOT where the boolean is consumed as proof that a kill succeeded. Every
+ *  backend already classifies this correctly; only the boolean wrapper threw
+ *  the distinction away. */
+function persistentPaneProbe(
+  backendType: PersistentBackendType,
+  name: string,
+): 'live' | 'gone' | 'unknown' {
+  const probe: SessionProbe = backendType === 'tmux' ? TmuxBackend.probeSession(name)
+    : backendType === 'zellij' ? ZellijBackend.probeSession(name)
+      : backendType === 'herdr' ? HerdrBackend.probeSession(name)
+        : ZmxBackend.probeSession(name);
+  if (probe === 'exists') return 'live';
+  if (probe === 'missing') return 'gone';
+  return 'unknown';
 }
 
 function probeOwnedZmxSession(
@@ -777,7 +791,7 @@ async function killPersistentSessionVerified(
 ): Promise<boolean> {
   return killAndVerifyPersistentPane(name, {
     kill: (resolvedName) => killPersistentSession(backendType, resolvedName, sessionId),
-    isLive: (resolvedName) => persistentPaneLive(backendType, resolvedName),
+    probeLive: (resolvedName) => persistentPaneProbe(backendType, resolvedName),
     wait: delay,
   });
 }
@@ -2011,18 +2025,14 @@ function releaseReadyGate(reason: string, opts?: { promptReadyAfterSettle?: bool
 const STARTUP_CMD_QUIET_MS = 500;
 const STARTUP_CMD_CAP_MS = 4_000;
 
-/** Inter-keystroke spacing when typing a slash command into CoCo char-by-char.
- *  CoCo (Trae CLI, Ink TUI) treats "several bytes delivered in one PTY read" as a
- *  paste, which skips command mode + the slash picker — so each char must land as
- *  its own keystroke. 40ms is comfortably above CoCo's coalescing window (verified
- *  against Trae CLI 0.120.45) while keeping a short command sub-second. */
-const COCO_SLASH_TYPE_THROTTLE_MS = 40;
-
 /** Type one literal input LINE into the CLI exactly like a passthrough slash
- *  command: raw text → a 200ms beat (so the TUI's slash-command picker registers
- *  the match before submit) → a separate Enter. Non-TUI backends fall back to a
- *  single write + CR. Shared by the `raw_input` IPC handler and runStartupCommands
- *  so both stay in lockstep. */
+ *  command. Delivery is adapter-derived: adapters that declare a paste-line
+ *  input mode (e.g. OpenCode) paste the line up front, then wait out the
+ *  adapter's settle window before pressing Enter; generic backends keep the
+ *  classic raw text → a 200ms beat (so the TUI's slash-command picker
+ *  registers the match before submit) → a separate Enter, or fall back to a
+ *  single write + CR. Shared by the `raw_input` IPC handler and
+ *  runStartupCommands so both stay in lockstep. */
 async function sendRawCommandLine(be: NonNullable<typeof backend>, content: string): Promise<void> {
   // PR #597 extracted the CoCo/pty keystroke choreography into the shared
   // writeRawCommandLine helper (unit-tested in raw-command-writer.ts). It
@@ -2030,11 +2040,11 @@ async function sendRawCommandLine(be: NonNullable<typeof backend>, content: stri
   // recovery-fence transaction detects a failed submission by a thrown error, so
   // bridge the two: turn an explicit `false` into the same throw the inline
   // implementation used, letting runAmbiguousSubmissionTransaction cancel the WAL.
-  const accepted = await writeRawCommandLine(be, content, {
-    coco: lastInitConfig?.cliId === 'coco',
-    cocoThrottleMs: COCO_SLASH_TYPE_THROTTLE_MS,
-    submitBeatMs: 200,
-  });
+  const accepted = await writeRawCommandLine(
+    be,
+    content,
+    rawCommandWriteOptionsFor(cliAdapter ?? undefined, lastInitConfig?.cliId),
+  );
   if (accepted === false) {
     throw new Error('backend rejected command text or submit key input');
   }
@@ -2469,6 +2479,7 @@ let currentBotmuxDispatchAttempt: number | undefined;
 let currentVcMeetingImTurnOrigin: VcMeetingImTurnOrigin | undefined;
 let durableTurnInFlight = false;
 function publishSandboxRelayCapability(opts: { failClosed?: boolean } = {}): boolean {
+  const daemonIpcPort = parseDaemonIpcPort(process.env.BOTMUX_DAEMON_IPC_PORT);
   const capability = {
     token: randomBytes(32).toString('hex'),
     ...(currentBotmuxTurnId ? { turnId: currentBotmuxTurnId } : {}),
@@ -2481,6 +2492,25 @@ function publishSandboxRelayCapability(opts: { failClosed?: boolean } = {}): boo
       ? [{
           path: join(sandboxRelayOutbox, RELAY_ORIGIN_CAPABILITY_BASENAME),
           body: JSON.stringify({ token: capability.token }),
+        }]
+      : []),
+    ...(readIsolationOriginChannelId
+      ? [{
+          path: managedOriginCapabilityPath(
+            process.env.SESSION_DATA_DIR ?? config.session.dataDir,
+            sessionId!,
+            readIsolationOriginChannelId,
+          ),
+          body: JSON.stringify({
+            sessionId,
+            channelId: readIsolationOriginChannelId,
+            capability: capability.token,
+            ...(capability.turnId ? { turnId: capability.turnId } : {}),
+            ...(capability.dispatchAttempt !== undefined
+              ? { dispatchAttempt: capability.dispatchAttempt }
+              : {}),
+            ...(daemonIpcPort !== undefined ? { ipcPort: daemonIpcPort } : {}),
+          }),
         }]
       : []),
   ];
@@ -9344,7 +9374,17 @@ function markPromptReady(): void {
   // make the CLI busy, so the idle state is transient and shouldn't appear
   // in the card.  This avoids a false "就绪" flash on daemon restart
   // (where the initial prompt is queued before the CLI becomes idle).
-  if (renderer && pendingMessages.length === 0 && pendingAdoptMessages.length === 0 && pendingRawInputs.length === 0 && pendingSessionRename === null && !isFlushing) {
+  //
+  // ALSO skip when the Grok-class busy arm is pending (spawnArgvInitialPromptBusy):
+  // for these adapters the FIRST ready is a pre-execution SessionStart edge, not a
+  // turn boundary — the argv-baked first prompt is still running. isPromptReady was
+  // just set true above, so this generic snapshot would project 'idle' and reach the
+  // daemon BEFORE the busy arm below re-publishes 'working'. Combined with the
+  // first-turn working already sent by startScreenUpdates, the daemon would then see
+  // working→idle and fire finishTurnReactions() — a premature ✅ DONE mid-turn (and a
+  // 「工作中→等待输入→工作中」 flicker on the open card). The busy arm below owns the
+  // correct 'working' publish for this path, so this idle must not escape first.
+  if (renderer && !spawnArgvInitialPromptBusy && pendingMessages.length === 0 && pendingAdoptMessages.length === 0 && pendingRawInputs.length === 0 && pendingSessionRename === null && !isFlushing) {
     const { content } = renderer.snapshot();
     send({
       type: 'screen_update',
@@ -10778,7 +10818,48 @@ function startScreenUpdates(): void {
   // watermark — there we must capture every tick (see shouldCaptureScreen).
   let lastSnapshotPtyActivity = -1;
   screenUpdateTimer = setInterval(() => {
-    if (awaitingFirstPrompt) return;
+    if (awaitingFirstPrompt) {
+      // First-turn 「工作中」 publisher. The async sampler below is fully gated
+      // until the first turn ends (markPromptReady flips awaitingFirstPrompt) or
+      // the 15s soft timeout, so an argv-baked first prompt (Pi/Grok/…, delivered
+      // via the launch command — it never goes through flushPending) would emit
+      // NO screen_update for the whole turn: the daemon card sits at 'starting'
+      // and jumps straight to 「等待输入」 on the first idle, skipping 「工作中」.
+      //
+      // The status projection already reads 'working' during turn one (isPromptReady
+      // is still false — same rule that makes every post-submit turn working), so we
+      // simply PUBLISH that projection once instead of scraping the screen for a busy
+      // marker. This is the general "sent to the CLI ⇒ working" model: it fires for
+      // every argv-baked first prompt (spawnArgvNeedsWorkingSeed), not just CLIs that
+      // happen to render a detectable busyPattern.
+      //
+      // Gate on spawnArgvNeedsWorkingSeed so it stays a no-op for a NON-argv first
+      // turn (Claude/Codex/type-ahead): there the prompt is still queued and the CLI
+      // is genuinely booting — not working — until flushPending() submits it after
+      // the ready edge. Empty-prompt adopt sessions also don't arm the flag, so an
+      // attach never falsely claims working.
+      //
+      // Pure publisher: it only send()s a status and updates the local lastSentStatus
+      // dedup — it never touches isPromptReady, the idle detector, or the argv seed
+      // flags (spawnArgvInitialPromptBusy / -NeedsWorkingSeed), so the first-prompt
+      // evidence machinery and the end-of-turn seed are unchanged.
+      if (spawnArgvNeedsWorkingSeed && lastSentStatus !== 'working' && renderer) {
+        const projected = projectedRuntimeScreenStatus();
+        if (projected === 'working') {
+          const { content } = renderer.snapshot();
+          lastSentStatus = 'working';
+          send({
+            type: 'screen_update',
+            content,
+            status: 'working',
+            turnId: currentBotmuxTurnId,
+            dispatchAttempt: currentBotmuxDispatchAttempt,
+          });
+          log('Argv-baked first prompt in flight — publishing projected working before first prompt');
+        }
+      }
+      return;
+    }
 
     void (async () => {
       const { snapshot, status } = await snapshotWithLatestRuntimeStatus(async () => {
@@ -11541,6 +11622,7 @@ async function spawnCli(
     // drop apiOnly → getBotClient would not throw → `botmux send` could reach
     // Feishu. Thread the flag so the reconstructed config keeps the boundary.
     if (cfg.apiOnly) sessionEnv.BOTMUX_API_ONLY = '1';
+    if (cfg.feedback) sessionEnv.BOTMUX_FEEDBACK_POLICY = JSON.stringify(cfg.feedback);
     // Session scope for `botmux send` inside the sandbox. Thread sessions
     // anchor on a real om_ message (reply_in_thread); chat-scope sessions use
     // the chat id as anchor (sessionAnchorId), which is NOT a message id —
@@ -11573,6 +11655,10 @@ async function spawnCli(
     // Per-bot env (bots.json `env`) takes precedence over session context;
     // explicit riff config.env takes precedence over both.
     const mergedEnv: Record<string, string> = { ...sessionEnv, ...sanitizePerBotEnv(cfg.env), ...riffCfg.env };
+    // The effective policy is a host-resolved snapshot, not a user-overridable
+    // backend env knob. Re-freeze it after config.env/per-bot env merge.
+    if (cfg.feedback) mergedEnv.BOTMUX_FEEDBACK_POLICY = JSON.stringify(cfg.feedback);
+    else delete mergedEnv.BOTMUX_FEEDBACK_POLICY;
     // Re-freeze the no-transport capability keys AFTER the merge: a stale or
     // attacker-shaped backendConfig.env / per-bot env merges LAST and would
     // otherwise override the frozen values, restoring send capability for a
@@ -11740,6 +11826,19 @@ async function spawnCli(
         resolvedBin: canonicalPolicyPath(cliAdapter.resolvedBin),
       })
     : undefined;
+  const managedOriginChannelRequired = willReadIsolate
+    || credentialOnlySeatbelt
+    || credentialOnlyBwrap;
+  const managedOriginChannelPolicyDigest = (willReadIsolate || willWriteSandbox)
+    ? darwinIsolationPolicyDigest
+    : managedOriginChannelRequired
+      ? createHash('sha256').update(JSON.stringify({
+          domain: 'botmux.credential-origin-channel.v1',
+          platform: process.platform,
+          configuredBotmuxHome: canonicalPolicyPath(configuredBotmuxHome),
+          defaultBotmuxHome: canonicalPolicyPath(defaultBotmuxHome),
+        })).digest('hex')
+      : undefined;
 
   let mcpRuntimeManifest: SessionMcpRuntimeManifest | null = readSessionMcpRuntimeManifest(
     cfg.sessionId,
@@ -11905,8 +12004,7 @@ async function spawnCli(
         isolationRuntimeDataDir, 'read-isolation', `${cfg.sessionId}.boot`,
       );
       const marker = readManagedOriginAuthorityFile(markerPath);
-      const darwinPolicyExpected = process.platform === 'darwin'
-        && (willReadIsolate || willWriteSandbox);
+      const originChannelPolicyExpected = !!managedOriginChannelPolicyDigest;
       // A stamped pane must match even when the new policy is OFF. Otherwise a
       // disable followed by restart could reattach the still-confined process
       // without rebuilding its authority/profile. An unsafe planted marker
@@ -11915,16 +12013,16 @@ async function spawnCli(
         ? isolatedPaneReattachSafe(marker, {
             requiredCapabilities: appliedIsolationCapabilities,
             exactCapabilities: true,
-            ...(darwinPolicyExpected ? {
+            ...(originChannelPolicyExpected ? {
               readIsolation: willReadIsolate,
               writeSandbox: willWriteSandbox,
               requireOriginChannel: true,
-              policyDigest: darwinIsolationPolicyDigest!,
+              policyDigest: managedOriginChannelPolicyDigest,
             } : {}),
           })
         : marker === null && !hostEntryExistsNoFollow(markerPath);
       if (policyMatches) {
-        if (darwinPolicyExpected) {
+        if (originChannelPolicyExpected) {
           persistentPaneOriginChannelId = isolatedPaneOriginChannel(marker);
         }
         // Pane was spawned under the current isolation policy → still confined
@@ -11992,7 +12090,7 @@ async function spawnCli(
       }
     }
   }
-  readIsolationOriginChannelId = willReadIsolate
+  readIsolationOriginChannelId = managedOriginChannelRequired
     ? (persistentPaneOriginChannelId ?? randomBytes(32).toString('hex'))
     : null;
   if (readIsolationOriginChannelId) {
@@ -12359,7 +12457,7 @@ async function spawnCli(
       mkdirSync(dirname(credPath), { recursive: true });
       writeFileSync(
         credPath,
-        JSON.stringify({ larkAppId: cfg.larkAppId, larkAppSecret: cfg.larkAppSecret, brand: cfg.brand, apiOnly: cfg.apiOnly }),
+        JSON.stringify({ larkAppId: cfg.larkAppId, larkAppSecret: cfg.larkAppSecret, brand: cfg.brand, apiOnly: cfg.apiOnly, feedback: cfg.feedback }),
         { mode: 0o600 },
       );
     } catch (e) {
@@ -12635,7 +12733,23 @@ async function spawnCli(
       throw new Error('[read-isolation] origin channel is unavailable');
     }
     childEnv.BOTMUX_READ_ISOLATED = '1';
+  }
+  if (readIsolationOriginChannelId) {
     childEnv.BOTMUX_ORIGIN_CHANNEL_ID = readIsolationOriginChannelId;
+  }
+
+  // Credential-only children have no writable relay outbox. Publish the same
+  // rotating managed-origin claim through a host-owned per-channel directory
+  // before the Seatbelt/bwrap wrapper is compiled, then expose only that
+  // directory read-only below.
+  if (readIsolationOriginChannelId && !sandboxRequested) {
+    readIsolationOriginCapabilityFile = managedOriginCapabilityPath(
+      isolationRuntimeDataDir,
+      cfg.sessionId,
+      readIsolationOriginChannelId,
+    );
+    ensureManagedOriginCapabilityLeafSafe(readIsolationOriginCapabilityFile);
+    publishSandboxRelayCapability({ failClosed: true });
   }
 
   // Per-bot env (bots.json `env`): extra vars for THIS bot's CLI only — e.g.
@@ -12869,7 +12983,11 @@ async function spawnCli(
     if (readIsolationOriginCapabilityFile) {
       ensureManagedOriginCapabilityLeafSafe(readIsolationOriginCapabilityFile);
       publishSandboxRelayCapability({ failClosed: true });
-      mandatoryReadOnlyPaths.push(readIsolationOriginCapabilityFile);
+      mandatoryReadOnlyPaths.push(managedOriginCapabilityDirectory(
+        dataDir,
+        cfg.sessionId,
+        readIsolationOriginChannelId!,
+      ));
       mandatoryReadOnlyPaths.push(managedOriginAttestationDirectory(
         dataDir,
         cfg.sessionId,
@@ -13157,12 +13275,12 @@ async function spawnCli(
         isolationPaneMarkerContent(
           cfg.daemonBootId ?? '',
           appliedIsolationCapabilities,
-          willReadIsolate || willWriteSandbox
+          managedOriginChannelPolicyDigest
             ? {
                 originChannelId: persistentPaneOriginChannelId!,
                 readIsolation: willReadIsolate,
                 writeSandbox: willWriteSandbox,
-                policyDigest: darwinIsolationPolicyDigest!,
+                policyDigest: managedOriginChannelPolicyDigest,
               }
             : undefined,
         ),
@@ -13290,12 +13408,17 @@ async function spawnCli(
     });
     const profileDir = join(isolationRuntimeDataDir, 'read-isolation');
     mkdirSync(profileDir, { recursive: true });
+    const originDirectory = managedOriginCapabilityDirectory(
+      isolationRuntimeDataDir,
+      cfg.sessionId,
+      readIsolationOriginChannelId!,
+    );
     const profilePath = join(profileDir, `${cfg.sessionId}.sb`);
     replaceManagedOriginCapabilityFile(profilePath, buildSeatbeltProfile(
-      rules.denyPaths.map(canonical),
+      [...rules.denyPaths.map(canonical), canonical(profileDir)],
+      [canonical(originDirectory)],
       [],
-      [],
-      [],
+      [canonical(profileDir)],
       rules.denyRegexes,
       undefined,
       {
@@ -13390,7 +13513,14 @@ async function spawnCli(
     const credentialSandbox = prepareCredentialOnlySandbox({
       hideDirectories: [...hideDirectories],
       hideFiles: [...hideFiles],
-      readonlyPaths: [realpathSync(panePolicyDir)],
+      privateReadonlyDirectories: [{
+        parent: realpathSync(panePolicyDir),
+        directory: realpathSync(managedOriginCapabilityDirectory(
+          isolationRuntimeDataDir,
+          cfg.sessionId,
+          readIsolationOriginChannelId!,
+        )),
+      }],
       workingDir: spawnCwd,
       cliBin: credentialCliBin,
       cliArgs: spawnArgs,
