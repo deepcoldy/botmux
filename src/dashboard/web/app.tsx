@@ -889,12 +889,10 @@ function TopbarVersionControl(props: {
         onClick={() => setOpen(value => !value)}
       >
         <span>{currentVersion}</span>
-        {busy
-          ? <span className="dashboard-update-spinner" aria-hidden="true" />
-          : <span
-              className={`dashboard-version-state ${versionSignal.className}`}
-              aria-hidden="true"
-            >{versionSignal.symbol}</span>}
+        <span
+          className={`dashboard-version-state ${versionSignal.className}`}
+          aria-hidden="true"
+        >{versionSignal.symbol}</span>
       </button>
       {open && popoverPosition && typeof document !== 'undefined' ? createPortal((
         <section
