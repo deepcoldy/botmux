@@ -147,6 +147,7 @@ import {
   recordAndNotifyRestartBootstrapFailure,
   restartFailurePathIn,
 } from './cli/restart-failure-notification.js';
+import { resolveRestartFailureOwner } from './cli/restart-failure-owner.js';
 import { assertIncludePm2RestartAdmission } from './cli/pm2-god-admission.js';
 import {
   requestAttestedDaemonShutdown,
@@ -587,33 +588,16 @@ function loadBotsJson(): any[] {
 }
 
 /**
- * Resolve one DM target inside the SAME bot application that will send it.
- * `ownerOpenId` is already app-scoped and authoritative for scanner-created
- * bots; stable allowedUsers entries are resolved through this app so their
- * resulting `ou_` is never copied across applications.
+/**
+ * Resolve one DM target inside the SAME bot application that will send it,
+ * registering that app in this fresh CLI process's bot registry first. See
+ * cli/restart-failure-owner.ts for why registration must happen on both the
+ * ownerOpenId and allowedUsers paths.
  */
-async function resolveRestartFailureOwner(bot: any): Promise<string | undefined> {
-  if (typeof bot?.ownerOpenId === 'string' && bot.ownerOpenId.startsWith('ou_')) {
-    return bot.ownerOpenId;
-  }
-  const allowedUsers = Array.isArray(bot?.allowedUsers)
-    ? bot.allowedUsers.filter((entry: unknown): entry is string => (
-        typeof entry === 'string'
-        && !!entry.trim()
-        // A literal ou_ has no independent proof that it belongs to this app.
-        // Only the app's persisted ownerOpenId above may use that shape; all
-        // allowedUsers fallbacks must cross the stable email/mobile/union-id
-        // boundary and be resolved by the sending app itself.
-        && !entry.startsWith('ou_')
-      ))
-    : [];
-  if (allowedUsers.length === 0) return undefined;
-
+async function resolveRestartFailureOwnerInProcess(bot: any): Promise<string | undefined> {
   const { registerBot } = await import('./bot-registry.js');
   const { resolveAllowedUsers } = await import('./im/lark/client.js');
-  registerBot(normalizeBotConfig(bot));
-  return (await resolveAllowedUsers(bot.larkAppId, allowedUsers))
-    .find(openId => openId.startsWith('ou_'));
+  return resolveRestartFailureOwner(bot, { registerBot, resolveAllowedUsers });
 }
 
 async function persistAndNotifyRestartBootstrapFailure(
@@ -623,26 +607,38 @@ async function persistAndNotifyRestartBootstrapFailure(
   unsafeDaemonNames: string[],
   detail: string,
 ): Promise<void> {
-  const { sendUserMessage } = await import('./im/lark/client.js');
-  const outcome = await recordAndNotifyRestartBootstrapFailure({
-    dataDir,
-    bots,
-    unsafeDaemonNames,
-    detail,
-    restartIntent: stagedRestartIntent,
-    resolveOwner: resolveRestartFailureOwner,
-    sendText: ({ larkAppId, ownerOpenId }, text) => (
-      sendUserMessage(larkAppId, ownerOpenId, text)
-    ),
-  });
-  const status = outcome.notification.status;
-  const destination = outcome.notification.larkAppId
-    ? ` via app ${outcome.notification.larkAppId}`
-    : '';
-  console.error(
-    `[restart] bootstrap-required failure persisted at ${restartFailurePathIn(dataDir)}; `
-    + `owner notification=${status}${destination}`,
-  );
+  // Persistence + delivery are best-effort telemetry around a failure that is
+  // ALSO surfaced by the throw below. If anything here throws (file write,
+  // dynamic import, SDK), never let it mask the clear bootstrap-required error
+  // the caller is about to raise — degrade to a logged warning instead.
+  try {
+    const { sendUserMessage } = await import('./im/lark/client.js');
+    const outcome = await recordAndNotifyRestartBootstrapFailure({
+      dataDir,
+      bots,
+      unsafeDaemonNames,
+      detail,
+      restartIntent: stagedRestartIntent,
+      resolveOwner: resolveRestartFailureOwnerInProcess,
+      sendText: ({ larkAppId, ownerOpenId }, text) => (
+        sendUserMessage(larkAppId, ownerOpenId, text)
+      ),
+    });
+    const status = outcome.notification.status;
+    const destination = outcome.notification.larkAppId
+      ? ` via app ${outcome.notification.larkAppId}`
+      : '';
+    console.error(
+      `[restart] bootstrap-required failure persisted at ${restartFailurePathIn(dataDir)}; `
+      + `owner notification=${status}${destination}`,
+    );
+  } catch (error) {
+    console.error(
+      `[restart] bootstrap-required failure notification could not be persisted/sent `
+      + `(${error instanceof Error ? error.message : String(error)}); `
+      + 'the terminal error below remains authoritative',
+    );
+  }
 }
 
 function ensureBotWorkingDirsExist(bot: Record<string, any>, context = 'workingDir'): boolean {

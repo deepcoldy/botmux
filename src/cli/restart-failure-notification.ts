@@ -105,7 +105,10 @@ function updateRestartFailureTo(
   });
 }
 
-export function buildRestartBootstrapRequiredText(record: RestartFailureRecord): string {
+export function buildRestartBootstrapRequiredText(
+  record: RestartFailureRecord,
+  dataDir: string,
+): string {
   const daemonLine = record.unsafeDaemonNames.length > 0
     ? `\n受影响 daemon：${record.unsafeDaemonNames.join('、')}`
     : '';
@@ -117,7 +120,10 @@ export function buildRestartBootstrapRequiredText(record: RestartFailureRecord):
     + daemonLine
     + '\n请先确认所有 Session / Riff 工作均已空闲，再在机器终端执行：'
     + '\nbotmux restart --bootstrap-shutdown-protocol --yes'
-    + `\n失败记录：${restartFailurePathIn('~/.botmux/data')}`;
+    // Report the ACTUAL failure-record location: dataDir may be redirected by
+    // SESSION_DATA_DIR or the `.data-dir` breadcrumb, and a literal `~` does not
+    // expand in Feishu text. See PR #843 R2 review.
+    + `\n失败记录：${restartFailurePathIn(dataDir)}`;
 }
 
 /**
@@ -171,7 +177,10 @@ export async function recordAndNotifyRestartBootstrapFailure(
   if (!target) return pending;
 
   try {
-    const messageId = await input.sendText(target, buildRestartBootstrapRequiredText(pending));
+    const messageId = await input.sendText(
+      target,
+      buildRestartBootstrapRequiredText(pending, input.dataDir),
+    );
     return updateRestartFailureTo(input.dataDir, record.failureId, current => ({
       ...current,
       notification: {

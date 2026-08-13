@@ -136,9 +136,12 @@ describe('restart bootstrap failure notification', () => {
       detail: 'detail',
       unsafeDaemonNames: ['botmux-local'],
       notification: { status: 'pending', attempts: 0, updatedAt: new Date(T0).toISOString() },
-    });
+    }, '/custom/data-dir');
     expect(text).toContain('botmux restart --bootstrap-shutdown-protocol --yes');
     expect(text).toContain('botmux-local');
     expect(text).not.toContain('appSecret');
+    // The DM points at the real (possibly redirected) dataDir, not a literal ~.
+    expect(text).toContain('/custom/data-dir/restart-failure.json');
+    expect(text).not.toContain('~/.botmux/data');
   });
 });
