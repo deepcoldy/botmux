@@ -17040,7 +17040,9 @@ process.on('message', async (raw: unknown) => {
       // must not be appended to the bot's chat-session registry.  The
       // workflow's own event log is the source of truth for run state.
       if (msg.larkAppId && process.env.BOTMUX_WORKFLOW !== '1') {
-        sessionStore.init(msg.larkAppId);
+        // owner:false —— worker 可能由仍在跑旧代码的 daemon 从新 dist spawn 出来，
+        // 不许它首启导入/建 .db（引擎切换只能由 daemon 自己做），只按 db-else-json 读。
+        sessionStore.init(msg.larkAppId, { owner: false });
       }
       if (msg.cliId === 'codex-app') {
         codexAppRecoveredDispatches = (msg.codexAppRecoveredDispatches ?? []).map(entry => ({

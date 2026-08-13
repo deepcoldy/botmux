@@ -102,7 +102,7 @@
     ]
   },
   "engines": {
-    "node": ">=22"
+    "node": "^22.13.0 || >=23.4.0"
   },
   "packageManager": "pnpm@9.5.0",
   "repository": {

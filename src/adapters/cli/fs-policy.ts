@@ -607,8 +607,15 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
   push(ctx.outbox ? [ctx.outbox] : [], 'readWrite', 'internal');
   push(dropAuthority(ctx.extraWritePaths), 'readWrite', 'internal');
   push(dropAuthority(ctx.readonlyRoots), 'readOnly', 'internal');
-  // Own routing metadata (`botmux send` reply routing) — read-only.
-  push([`${ctx.sessionDataDir}/sessions-${ctx.currentAppId}.json`], 'readOnly', 'internal');
+  // Own routing metadata (`botmux send` reply routing) — read-only. The store
+  // is SQLite (db-else-json mixed window keeps the .json grant); WAL readers
+  // additionally need the -wal/-shm sidecars a live daemon maintains.
+  push([
+    `${ctx.sessionDataDir}/sessions-${ctx.currentAppId}.json`,
+    `${ctx.sessionDataDir}/sessions-${ctx.currentAppId}.db`,
+    `${ctx.sessionDataDir}/sessions-${ctx.currentAppId}.db-wal`,
+    `${ctx.sessionDataDir}/sessions-${ctx.currentAppId}.db-shm`,
+  ], 'readOnly', 'internal');
   // Own upload bucket — readWRITE: `botmux quoted` / downloadResources writes the
   // downloaded attachment under attachments/<self>/<messageId>/… (not just reads
   // pre-uploaded files). The worker mkdirs it pre-spawn so it survives the
@@ -711,6 +718,9 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
     push([
       `${ctx.sessionDataDir}/bots-info.json`,               // display names for <available_bots> (public-ish)
       `${ctx.sessionDataDir}/sessions-${ctx.currentAppId}.json`,
+      `${ctx.sessionDataDir}/sessions-${ctx.currentAppId}.db`,
+      `${ctx.sessionDataDir}/sessions-${ctx.currentAppId}.db-wal`,
+      `${ctx.sessionDataDir}/sessions-${ctx.currentAppId}.db-shm`,
       `${ctx.sessionDataDir}/bot-openids-${ctx.currentAppId}.json`,
       // Core-only writes its `botmux` wrapper into <dataDir>/bin (dedicated, NOT
       // the shared ~/.botmux/bin) and prepends it to the worker PATH — read-only
