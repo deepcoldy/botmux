@@ -17,32 +17,43 @@
  *     unproven child may still hold an activated credential.
  *
  * So the record is host-scoped and persisted: it survives a daemon restart and
- * survives session deletion. It is keyed by session id purely to bound the
- * blast radius — an unrelated clean session must not be penalised.
+ * survives session deletion. It is keyed by session id purely to bound the blast
+ * radius — an unrelated clean session must not be penalised.
  *
  * Only KEY NAMES are stored, never values. `mojoUnprovableEnvKeys` inspects
  * names only, and these keys routinely carry credentials (`X_JWT_TOKEN` is the
  * one allowlisted name and is therefore never recorded here).
  *
+ * Failure policy: every operation fails LOUD, never silently "empty"
+ * ------------------------------------------------------------------
+ * This is a security ledger, so the usual "best-effort store" conventions are
+ * inverted:
+ *   - a corrupt/unreadable file THROWS instead of degrading to "nothing is
+ *     quarantined" (that is the fail-open direction, and it was the first
+ *     version's bug — a truncated file silently unblocked every session).
+ *   - a failed write PROPAGATES to the caller rather than being logged and
+ *     swallowed, so the daemon cannot believe it recorded a risk it did not.
+ *   - every mutation runs a FRESH read-modify-write inside a cross-process file
+ *     lock. Reusing a cached snapshot loses updates when several per-bot daemons
+ *     share one data dir, and a lost update here means a forgotten hook.
+ *
  * Clearing
  * --------
- * There is deliberately NO automatic clear. Removing an entry would assert that
- * the injected process is gone, and nothing available here proves that:
- * `MojoBackend.kill()` sends a bare `SIGTERM` with no escalation and no wait,
- * the worker exits without awaiting its child, and the child may leave detached
- * descendants — so neither a worker exit nor a per-PID check covers the tree.
- * A sound clear needs trustworthy termination of the whole mojo PROCESS GROUP
+ * There is deliberately NO clearing API. Removing an entry would assert that the
+ * injected process is gone, and nothing available here proves that:
+ * `MojoBackend.kill()` sends a bare `SIGTERM` with no escalation and no wait, the
+ * worker exits without awaiting its child, and the child may leave detached
+ * descendants — so neither a worker exit nor a per-PID check covers the tree. A
+ * sound clear needs trustworthy termination of the whole mojo PROCESS GROUP
  * (escalate to SIGKILL, then confirm group quiescence); that machinery does not
  * exist yet, and until it does, retention is the fail-closed side.
- *
- * Cost: a host that once ran a mojo session with a dangerous launcher env keeps
- * that session id unprovable. Device isolation for OTHER sessions is unaffected.
  */
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
+import { randomBytes } from 'node:crypto';
 import { dirname, join } from 'node:path';
 
 import { config } from '../config.js';
-import { logger } from '../utils/logger.js';
+import { withFileLockSync } from '../utils/file-lock.js';
 
 const FILE_NAME = 'mojo-launcher-env-quarantine.json';
 
@@ -52,64 +63,77 @@ interface QuarantineFile {
   sessions: Record<string, string[]>;
 }
 
-/** Cache keyed by resolved path so a dataDir switch (tests) re-reads from disk. */
-let cache: { path: string; data: QuarantineFile } | undefined;
+/** Thrown instead of degrading to an empty (fail-open) ledger. */
+export class MojoQuarantineUnavailableError extends Error {
+  constructor(message: string, readonly cause?: unknown) {
+    super(message);
+    this.name = 'MojoQuarantineUnavailableError';
+  }
+}
 
 function filePath(dataDir?: string): string {
   return join(dataDir ?? config.session.dataDir, FILE_NAME);
 }
 
-function emptyFile(): QuarantineFile {
-  return { version: 1, sessions: {} };
-}
-
-function load(dataDir?: string): QuarantineFile {
+/**
+ * Read the ledger from disk. No caching, by design: a cached snapshot would both
+ * hide another daemon's writes and let a lost update drop a recorded risk.
+ *
+ * A missing file is a legitimate empty ledger; anything unparseable is not.
+ */
+function readStrict(dataDir?: string): QuarantineFile {
   const path = filePath(dataDir);
-  if (cache?.path === path) return cache.data;
-  let data = emptyFile();
+  if (!existsSync(path)) return { version: 1, sessions: {} };
+  let raw: string;
   try {
-    if (existsSync(path)) {
-      const parsed = JSON.parse(readFileSync(path, 'utf8')) as unknown;
-      // Hand-editable file on a security path: validate rather than trust. A
-      // malformed file must not silently become "nothing is quarantined".
-      if (parsed && typeof parsed === 'object') {
-        const sessions = (parsed as { sessions?: unknown }).sessions;
-        if (sessions && typeof sessions === 'object') {
-          const clean: Record<string, string[]> = {};
-          for (const [sessionId, keys] of Object.entries(sessions as Record<string, unknown>)) {
-            if (!Array.isArray(keys)) continue;
-            const names = keys.filter((k): k is string => typeof k === 'string' && k.length > 0);
-            if (names.length > 0) clean[sessionId] = [...new Set(names)];
-          }
-          data = { version: 1, sessions: clean };
-        }
-      }
-    }
+    raw = readFileSync(path, 'utf8');
   } catch (err) {
-    // Unreadable/corrupt file. Do NOT fall back to "empty" silently — that is
-    // the fail-OPEN direction. Keep whatever is cached and make the failure loud.
-    logger.error(
-      `[mojo-quarantine] failed to read ${path}: ${err instanceof Error ? err.message : String(err)}`
-      + ' — treating previously known entries as still quarantined',
+    throw new MojoQuarantineUnavailableError(
+      `cannot read mojo launcher-env quarantine at ${path}; refusing to treat sessions as unquarantined`,
+      err,
     );
-    if (cache?.path === path) return cache.data;
   }
-  cache = { path, data };
-  return data;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (err) {
+    throw new MojoQuarantineUnavailableError(
+      `mojo launcher-env quarantine at ${path} is corrupt; refusing to treat sessions as unquarantined`,
+      err,
+    );
+  }
+  const sessionsRaw = (parsed as { sessions?: unknown } | null)?.sessions;
+  if (!parsed || typeof parsed !== 'object' || !sessionsRaw || typeof sessionsRaw !== 'object') {
+    throw new MojoQuarantineUnavailableError(
+      `mojo launcher-env quarantine at ${path} has an unexpected shape; refusing to treat sessions as unquarantined`,
+    );
+  }
+  const sessions: Record<string, string[]> = {};
+  for (const [sessionId, keys] of Object.entries(sessionsRaw as Record<string, unknown>)) {
+    if (!Array.isArray(keys)) {
+      throw new MojoQuarantineUnavailableError(
+        `mojo launcher-env quarantine at ${path} has a non-array entry for ${sessionId}`,
+      );
+    }
+    const names = keys.filter((k): k is string => typeof k === 'string' && k.length > 0);
+    if (names.length > 0) sessions[sessionId] = [...new Set(names)];
+  }
+  return { version: 1, sessions };
 }
 
-function persist(data: QuarantineFile, dataDir?: string): void {
+/** Atomic replace via a UNIQUE temp file — a shared `.tmp` name races between daemons. */
+function writeStrict(data: QuarantineFile, dataDir?: string): void {
   const path = filePath(dataDir);
+  const tmp = `${path}.${process.pid}.${randomBytes(6).toString('hex')}.tmp`;
   try {
     mkdirSync(dirname(path), { recursive: true });
-    // Atomic replace so a crash mid-write cannot truncate the record into an
-    // empty (fail-open) file.
-    const tmp = `${path}.tmp`;
     writeFileSync(tmp, `${JSON.stringify(data, null, 2)}\n`, { mode: 0o600 });
     renameSync(tmp, path);
   } catch (err) {
-    logger.error(
-      `[mojo-quarantine] failed to persist ${path}: ${err instanceof Error ? err.message : String(err)}`,
+    try { if (existsSync(tmp)) unlinkSync(tmp); } catch { /* best-effort cleanup */ }
+    throw new MojoQuarantineUnavailableError(
+      `cannot persist mojo launcher-env quarantine at ${path}; the recorded risk would be lost`,
+      err,
     );
   }
 }
@@ -119,6 +143,9 @@ function persist(data: QuarantineFile, dataDir?: string): void {
  *
  * Monotonic union — callers pass whatever the session was handed, and a later
  * clean payload never retracts an earlier dangerous one.
+ *
+ * THROWS on any read/write failure: the caller must not proceed believing the
+ * risk was recorded.
  */
 export function recordQuarantinedLauncherEnvKeys(
   sessionId: string,
@@ -126,22 +153,27 @@ export function recordQuarantinedLauncherEnvKeys(
   dataDir?: string,
 ): void {
   if (keys.length === 0) return;
-  const data = load(dataDir);
-  const before = data.sessions[sessionId] ?? [];
-  const merged = [...new Set([...before, ...keys])];
-  if (merged.length === before.length) return;   // nothing new
-  data.sessions[sessionId] = merged;
-  cache = { path: filePath(dataDir), data };
-  persist(data, dataDir);
-  logger.warn(
-    `[mojo-quarantine] session ${sessionId.slice(0, 8)} recorded unprovable launcher env `
-    + `(${merged.join(', ')}); device isolation will not treat it as safe_remote`,
-  );
+  const path = filePath(dataDir);
+  mkdirSync(dirname(path), { recursive: true });
+  withFileLockSync(path, () => {
+    // Fresh read INSIDE the lock: another daemon may have added entries since.
+    const data = readStrict(dataDir);
+    const before = data.sessions[sessionId] ?? [];
+    const merged = [...new Set([...before, ...keys])];
+    if (merged.length === before.length) return;   // nothing new
+    data.sessions[sessionId] = merged;
+    writeStrict(data, dataDir);
+  });
 }
 
-/** Durable key names for one session (empty when nothing was ever recorded). */
+/**
+ * Durable key names for one session (empty only when nothing was ever recorded).
+ *
+ * THROWS when the ledger cannot be read — callers on the isolation path must
+ * fail closed rather than interpret the error as "clean".
+ */
 export function quarantinedLauncherEnvKeys(sessionId: string, dataDir?: string): string[] {
-  return load(dataDir).sessions[sessionId] ?? [];
+  return readStrict(dataDir).sessions[sessionId] ?? [];
 }
 
 /**
@@ -151,10 +183,5 @@ export function quarantinedLauncherEnvKeys(sessionId: string, dataDir?: string):
  * the inventory would otherwise lose every trace of an unproven hooked child.
  */
 export function quarantinedSessionIds(dataDir?: string): string[] {
-  return Object.keys(load(dataDir).sessions);
-}
-
-/** Test seam: drop the in-memory cache so the next read hits disk. */
-export function resetQuarantineCacheForTest(): void {
-  cache = undefined;
+  return Object.keys(readStrict(dataDir).sessions);
 }

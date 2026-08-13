@@ -2729,24 +2729,33 @@ function destroyLivePaneBeforeRestart(ds: DaemonSession): void {
  * forkWorker init 注释），cliId 换 CLI 会踩 resume transcript 对齐，均不带。
  */
 export function latestPerBotEnvForRestart(ds: DaemonSession): Record<string, string> | null | undefined {
+  // Two failure modes that must NOT be conflated. The old single try/catch
+  // swallowed both, so a quarantine write failure silently returned `undefined`
+  // (restart proceeds, risk unrecorded) — the exact fail-open this ledger exists
+  // to prevent.
+  let env: Record<string, string> | null;
   try {
-    const env = getBot(ds.larkAppId).config.env ?? null;
-    // Record what this generation is being handed BEFORE the restart is sent.
-    //
-    // This is the single choke point all four restart senders share
-    // (dashboard-ipc operator + working-dir, requestSessionRestart, cli_crash
-    // auto-restart), so recording here cannot be missed by adding a fifth caller
-    // — which is exactly how the device-isolation proof lost track of the env the
-    // running child had actually been given.
-    //
-    // Accumulate, never replace: the restart may fail or be coalesced, so a later
-    // clean env is not evidence that the dangerous child is gone. Only a brand-new
-    // worker generation clears this (see forkWorker).
-    rememberAppliedUnprovableEnvKeys(ds, env ?? undefined);
-    return env;
+    env = getBot(ds.larkAppId).config.env ?? null;
   } catch {
+    // Bot deregistered: nothing to hot-update. Keep the worker's snapshot (legacy
+    // behaviour) — this is a benign, expected state.
     return undefined;
   }
+  // Record what this generation is being handed BEFORE the restart is sent.
+  //
+  // This is the single choke point all four restart senders share (dashboard-ipc
+  // operator + working-dir, requestSessionRestart, cli_crash auto-restart), so
+  // recording here cannot be missed by adding a fifth caller — which is exactly
+  // how the device-isolation proof lost track of the env the running child had
+  // actually been given.
+  //
+  // Accumulate, never replace: the restart may fail or be coalesced, so a later
+  // clean env is not evidence that the dangerous child is gone.
+  //
+  // Any throw here propagates on purpose: the caller must not send a restart while
+  // believing a risk was recorded when it was not.
+  rememberAppliedUnprovableEnvKeys(ds, env ?? undefined);
+  return env;
 }
 
 /**
@@ -2760,7 +2769,19 @@ export function rememberAppliedUnprovableEnvKeys(
   ds: DaemonSession,
   env: Record<string, string> | undefined,
 ): void {
-  const keys = mojoUnprovableEnvKeys({ env });
+  // MOJO ONLY. This choke point is shared by every backend's restart, so an
+  // ungated call quarantined codex/tmux sessions as "mojo" forever: a bot with
+  // LD_PRELOAD in bots.json env poisoned unrelated backends (cross-backend
+  // contamination + permanent unprovability). The ledger exists solely to answer
+  // "could a hooked MOJO client still be running", so only mojo may write to it.
+  if (!isMojoSession(ds)) return;
+
+  // BOTH env layers. `mojoUnprovableEnvKeys` is fed the top-level per-bot env AND
+  // the mojo block's own env: they are peers (see the `init` message), the mojo
+  // block wins the merge, and a dangerous key living only in `mojo.env` used to be
+  // recorded nowhere — so it survived a daemon restart as "clean".
+  const mojoBlockEnv = sessionMojoBlockEnv(ds);
+  const keys = mojoUnprovableEnvKeys({ env: { ...(env ?? {}), ...mojoBlockEnv } });
   if (keys.length === 0) return;
   const merged = new Set([...(ds.mojoAppliedUnprovableEnvKeys ?? []), ...keys]);
   ds.mojoAppliedUnprovableEnvKeys = [...merged];
@@ -2769,16 +2790,37 @@ export function rememberAppliedUnprovableEnvKeys(
   // detached descendants) can outlive both, while still holding an activated
   // credential. The durable record is keyed by session id and never retracted.
   const sessionId = ds.session?.sessionId;
-  if (sessionId) {
-    recordQuarantinedLauncherEnvKeys(sessionId, keys);
-  } else {
+  if (!sessionId) {
     // Cannot key the durable record without a session id. Never swallow this:
-    // silently keeping the risk in memory only is the fail-open direction, and
-    // this branch should be unreachable for a real DaemonSession.
-    logger.error(
+    // keeping the risk in memory only is the fail-open direction, and this branch
+    // should be unreachable for a real DaemonSession.
+    throw new Error(
       '[mojo-quarantine] refusing to lose an unprovable launcher env: session id missing'
       + ` (keys: ${keys.join(', ')})`,
     );
+  }
+  // Deliberately NOT wrapped in try/catch: a failed persist means the daemon
+  // cannot prove this host is clean, and swallowing it would hand back a false
+  // "recorded" to every restart sender.
+  recordQuarantinedLauncherEnvKeys(sessionId, keys);
+}
+
+/** Is this session frozen onto the mojo backend? Prefers the live worker stamp. */
+function isMojoSession(ds: DaemonSession): boolean {
+  return (ds.initConfig?.backendType ?? ds.session?.backendType) === 'mojo';
+}
+
+/**
+ * The mojo block's own `env`, from whichever layer the next turn will actually
+ * use: the config frozen onto the live worker, else the live bot config.
+ */
+function sessionMojoBlockEnv(ds: DaemonSession): Record<string, string> {
+  const fromInit = (ds.initConfig?.backendConfig as MojoConfig | undefined)?.env;
+  if (fromInit) return fromInit;
+  try {
+    return getBot(ds.larkAppId).config.mojo?.env ?? {};
+  } catch {
+    return {};
   }
 }
 

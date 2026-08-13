@@ -164,6 +164,10 @@ interface ActivationTransaction {
 let daemonIdentity: DeviceIsolationDaemonIdentity | null = null;
 let transaction: ActivationTransaction | null = null;
 
+/** Not a real env var: a name the allowlist can never accept, used to force the
+ *  proof closed when the durable ledger cannot be read. */
+const QUARANTINE_UNREADABLE_SENTINEL = 'BOTMUX_MOJO_QUARANTINE_UNREADABLE';
+
 function isPersistentBackend(value: InventoryBackend): value is LocalPersistentBackend {
   return value === 'tmux' || value === 'herdr' || value === 'zellij' || value === 'zmx';
 }
@@ -220,10 +224,21 @@ export function resolveRemoteExecutionProven(ds: DaemonSession): boolean {
   // Shared by all three branches below: the workerless and legacy paths used to
   // ignore the ledger entirely, so a session reaching them was classified
   // safe_remote no matter what env its child had been given.
+  //
+  // A read failure must fail CLOSED: an unreadable ledger means the daemon cannot
+  // rule out a hooked child, which is the opposite of "clean". Fabricating a
+  // sentinel key is how that is expressed to isMojoFullyRemote, whose allowlist
+  // rejects anything but the canonical JWT name.
+  let durableKeys: string[];
+  try {
+    durableKeys = quarantinedLauncherEnvKeys(ds.session.sessionId);
+  } catch {
+    durableKeys = [QUARANTINE_UNREADABLE_SENTINEL];
+  }
   const sessionUnprovableEnvKeys = [
     ...(ds.mojoAppliedUnprovableEnvKeys ?? []),
     ...(ds.mojoRetiringUnprovableEnvKeys ?? []),
-    ...quarantinedLauncherEnvKeys(ds.session.sessionId),
+    ...durableKeys,
   ];
   // Keys only, so a placeholder value is fine: the proof never reads values.
   const ledgerEnv = Object.fromEntries(sessionUnprovableEnvKeys.map((k) => [k, '1']));
@@ -428,6 +443,21 @@ function defaultRuntimeSessions(): DeviceIsolationRuntimeSession[] {
 }
 
 /**
+ * Quarantined ids, or a hard failure. An unreadable ledger must not silently
+ * become "no residual sessions"; the isolation transaction is refused instead.
+ */
+function safeQuarantinedSessionIds(): string[] {
+  try {
+    return quarantinedSessionIds();
+  } catch (err) {
+    throw new Error(
+      'refusing device-isolation activation: mojo launcher-env quarantine is unreadable '
+      + `(${err instanceof Error ? err.message : String(err)})`,
+    );
+  }
+}
+
+/**
  * Re-admit sessions that exist ONLY as a durable launcher-env quarantine record.
  *
  * Both other sources can lose them: an explicit `/close` deletes the row, and a
@@ -440,7 +470,7 @@ function defaultRuntimeSessions(): DeviceIsolationRuntimeSession[] {
  */
 export function appendResidualMojoLauncherEnvSessions(
   sessions: readonly DeviceIsolationRuntimeSession[],
-  quarantinedIds: readonly string[] = quarantinedSessionIds(),
+  quarantinedIds: readonly string[] = safeQuarantinedSessionIds(),
 ): DeviceIsolationRuntimeSession[] {
   const out = [...sessions];
   const known = new Set(sessions.map((session) => session.sessionId));
@@ -504,11 +534,31 @@ function blockerEntry(
   };
 }
 
+/**
+ * Any durable quarantine record for this session?
+ *
+ * An unreadable ledger counts as quarantined: the daemon cannot prove the host is
+ * clean, and treating the error as "no record" is the fail-open direction.
+ */
+function hasDurableMojoQuarantine(sessionId: string): boolean {
+  try {
+    return quarantinedLauncherEnvKeys(sessionId).length > 0;
+  } catch {
+    return true;
+  }
+}
+
 function classifySession(session: DeviceIsolationRuntimeSession): DeviceIsolationInventoryEntry {
   const backendType = resolvedBackend(session);
-  // Before anything else: a residual record means an unproven hooked child may
-  // still be alive with no row to reason about, so nothing here can clear it.
-  if (session.mojoLauncherEnvResidual) {
+  // Before anything else: a durable quarantine record means an unproven hooked
+  // child may still be alive, so nothing below can clear it.
+  //
+  // Checked HERE rather than only on the synthesised no-row entries, because a
+  // row that still exists takes the opposite path: mojo is not a persistent
+  // backend, so a workerless mojo row has no persistent target and fell straight
+  // through to `quiescent` — a known, quarantined session was therefore reported
+  // as nothing-to-tear-down.
+  if (session.mojoLauncherEnvResidual || hasDurableMojoQuarantine(session.sessionId)) {
     return blockerEntry(session, backendType, 'mojo_launcher_env_residual');
   }
   if (session.adopted) return blockerEntry(session, backendType, 'adopted_session');
