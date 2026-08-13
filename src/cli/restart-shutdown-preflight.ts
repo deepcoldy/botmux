@@ -1,7 +1,6 @@
 /**
- * Non-throwing shutdown-capability preflight shared by read-only surfaces
- * (chiefly the dashboard's `/api/update/restart` endpoint) and the maintenance
- * auto-update path.
+ * Shutdown-capability preflight shared by the dashboard's read-only
+ * `/api/update/restart` guard and the newly installed CLI restart driver.
  *
  * Why this exists: `botmux restart` fails closed at the shutdown-capability
  * boundary when live daemons still run an old PM2 policy that cannot prove
