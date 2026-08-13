@@ -170,7 +170,7 @@ describe('Codex-compatible runtime editor', () => {
       } as any;
     });
     try {
-      const { root } = renderAgent({ cliId: 'codex', reasoningEffort: 'high' });
+      const { root } = renderAgent({ cliId: 'codex', model: 'gpt-5.6-sol', reasoningEffort: 'high' });
       const picker = root.findByProps({ dataInput: 'agentReasoningEffort' });
       expect(picker.props.value).toBe('high');
       act(() => picker.props.onChange('ultra'));
@@ -179,7 +179,7 @@ describe('Codex-compatible runtime editor', () => {
         await Promise.resolve();
         await Promise.resolve();
       });
-      expect(requests).toEqual([{ cliId: 'codex', model: '', reasoningEffort: 'ultra' }]);
+      expect(requests).toEqual([{ cliId: 'codex', model: 'gpt-5.6-sol', reasoningEffort: 'ultra' }]);
     } finally {
       (globalThis as any).fetch = previousFetch;
     }

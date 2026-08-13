@@ -25,6 +25,7 @@ import { isGrantDurationOption } from './services/grant-policy.js';
 import type { FeedbackPolicy, FeedbackPolicyInput } from './services/feedback-policy.js';
 import { normalizeFeedbackPolicyLayer } from './services/feedback-policy-resolver.js';
 import type { FeedbackWebhookDestination } from './services/feedback-outbox.js';
+import { codexModelSupportsReasoningEffort, isCodexReasoningCliId, isCodexReasoningEffort } from './services/codex-reasoning-effort.js';
 import type {
   VcMeetingConsumerAgentConfig,
   VcMeetingConsumerConfig,
@@ -2765,14 +2766,13 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       model: typeof entry.model === 'string' && entry.model.trim()
         ? entry.model.trim()
         : undefined,
-      reasoningEffort: entry.reasoningEffort === 'low'
-        || entry.reasoningEffort === 'medium'
-        || entry.reasoningEffort === 'high'
-        || entry.reasoningEffort === 'xhigh'
-        || entry.reasoningEffort === 'max'
-        || entry.reasoningEffort === 'ultra'
-        ? entry.reasoningEffort
-        : undefined,
+      reasoningEffort: isCodexReasoningCliId(entryCliId)
+        && isCodexReasoningEffort(entry.reasoningEffort)
+        && codexModelSupportsReasoningEffort(
+          typeof entry.model === 'string' ? entry.model : undefined,
+          entry.reasoningEffort,
+        )
+        ? entry.reasoningEffort : undefined,
       disableCliBypass: entry.disableCliBypass === true,
       codexAppCleanInput: entry.codexAppCleanInput === true || undefined,
       codexRpcInput: entry.codexRpcInput === true,

@@ -29,6 +29,7 @@ import { fallbackTurnId, frozenReplyContextForTurn, isSubstituteTurn } from './r
 import { updateMessage, deleteMessage, sendEphemeralCard, sendUserMessage, addReaction, removeReaction, getMessageChatId, MessageWithdrawnError } from '../im/lark/client.js';
 import { buildStreamingCard, buildPrivateSnapshotCard, buildSessionCard, buildTuiPromptCard, buildTuiPromptResolvedCard, buildTuiPromptFailedCard, buildRelayedFrozenCard, getCliDisplayName } from '../im/lark/card-builder.js';
 import { codexServiceTierBadge } from '../services/codex-service-tier.js';
+import { isCodexReasoningCliId } from '../services/codex-reasoning-effort.js';
 import { loadFrozenCards, saveFrozenCards } from '../services/frozen-card-store.js';
 import { hashUrlForLog } from '../adapters/backend/riff-backend.js';
 import { logger } from '../utils/logger.js';
@@ -1070,7 +1071,9 @@ function sessionAgentConfig(
       ?? botCfg.cliPathOverride;
     ds.session.wrapperCli = ds.session.wrapperCli ?? botCfg.wrapperCli;
     ds.session.model = ds.session.model ?? botCfg.model;
-    ds.session.reasoningEffort = ds.session.reasoningEffort ?? botCfg.reasoningEffort;
+    ds.session.reasoningEffort = isCodexReasoningCliId(ds.session.cliId)
+      ? ds.session.reasoningEffort ?? botCfg.reasoningEffort
+      : undefined;
     ds.session.agentFrozen = true;
     sessionStore.updateSession(ds.session);
   } else {

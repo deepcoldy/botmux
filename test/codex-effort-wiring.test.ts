@@ -93,8 +93,8 @@ describe('worker → CodexRpcEngine effort wiring (source lock)', () => {
 
   it('freezes the per-Bot default onto a newly created session', () => {
     const source = readFileSync(new URL('../src/core/worker-pool.ts', import.meta.url), 'utf8');
-    expect(source).toContain(
-      'ds.session.reasoningEffort = ds.session.reasoningEffort ?? botCfg.reasoningEffort;',
-    );
+    expect(source).toContain('ds.session.reasoningEffort = isCodexReasoningCliId(ds.session.cliId)');
+    expect(source).toContain('? ds.session.reasoningEffort ?? botCfg.reasoningEffort');
+    expect(source).toContain(': undefined;');
   });
 });

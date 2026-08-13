@@ -20,6 +20,11 @@ import {
 } from './managed-origin-attestation.js';
 import * as sessionStore from '../services/session-store.js';
 import { cliSupportsNativeUsage } from '../services/transcript-resolver.js';
+import {
+  codexModelSupportsReasoningEffort,
+  isCodexReasoningCliId,
+  isCodexReasoningEffort,
+} from '../services/codex-reasoning-effort.js';
 import * as asyncTriggerStore from '../services/async-trigger-store.js';
 import { resolveAsyncTriggerState, decideAsyncOwnership } from '../services/async-trigger-state.js';
 import * as scheduleStore from '../services/schedule-store.js';
@@ -3893,16 +3898,16 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
   }
   const model = typeof body.model === 'string' ? body.model.trim() : '';
   const reasoningEffortFieldPresent = Object.prototype.hasOwnProperty.call(body, 'reasoningEffort');
-  const reasoningEffort = body.reasoningEffort === 'low'
-    || body.reasoningEffort === 'medium'
-    || body.reasoningEffort === 'high'
-    || body.reasoningEffort === 'xhigh'
-    || body.reasoningEffort === 'max'
-    || body.reasoningEffort === 'ultra'
-    ? body.reasoningEffort
-    : null;
+  const reasoningEffort = isCodexReasoningEffort(body.reasoningEffort) ? body.reasoningEffort : null;
   if (body.reasoningEffort !== undefined && body.reasoningEffort !== '' && reasoningEffort === null) {
     return jsonRes(res, 400, { ok: false, error: 'invalid_reasoning_effort' });
+  }
+  if (reasoningEffort && !codexModelSupportsReasoningEffort(model, reasoningEffort)) {
+    return jsonRes(res, 400, {
+      ok: false,
+      error: 'reasoning_effort_not_supported_by_model',
+      message: `模型 ${model || '（Codex 默认模型）'} 不支持思考强度 ${reasoningEffort}`,
+    });
   }
   const currentBotConfig = getBot(larkAppId).config;
   const runtimeFieldPresent = Object.prototype.hasOwnProperty.call(body, 'cliRuntime');
@@ -3997,7 +4002,7 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
     // read-isolation toggle validates at enable time; changing the agent afterwards
     // is the other way a bot could end up configured-but-unenforceable.)
     let readIsolationCleared = false;
-    const supportsReasoningEffort = selected.cliId === 'codex' || selected.cliId === 'codex-app';
+    const supportsReasoningEffort = isCodexReasoningCliId(selected.cliId);
     const r = await rmwBotEntry(larkAppId, (entry) => {
     entry.cliId = selected.cliId;
     if (selected.wrapperCli) entry.wrapperCli = selected.wrapperCli;

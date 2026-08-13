@@ -2885,10 +2885,18 @@ describe('PUT /api/bot-agent', () => {
       setLarkAppId(appId);
       handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
 
+      const invalid = await fetch(`http://127.0.0.1:${handle.port}/api/bot-agent`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ cliId: 'codex', model: 'gpt-5.4', reasoningEffort: 'ultra' }),
+      });
+      expect(invalid.status).toBe(400);
+      expect(await invalid.json()).toMatchObject({ error: 'reasoning_effort_not_supported_by_model' });
+
       const res = await fetch(`http://127.0.0.1:${handle.port}/api/bot-agent`, {
         method: 'PUT',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ cliId: 'ttadk-x-codex', model: 'kimi-k2.5', reasoningEffort: 'ultra' }),
+        body: JSON.stringify({ cliId: 'ttadk-x-codex', model: 'kimi-k2.5', reasoningEffort: 'xhigh' }),
       });
 
       expect(res.status).toBe(200);
@@ -2897,7 +2905,7 @@ describe('PUT /api/bot-agent', () => {
         cliId: 'codex',
         wrapperCli: 'ttadk codex',
         model: 'kimi-k2.5',
-        reasoningEffort: 'ultra',
+        reasoningEffort: 'xhigh',
         selectionKey: 'ttadk-x-codex',
       });
       const stored = JSON.parse(readFileSync(configPath, 'utf-8'))[0];
@@ -2905,7 +2913,7 @@ describe('PUT /api/bot-agent', () => {
         cliId: 'codex',
         wrapperCli: 'ttadk codex',
         model: 'kimi-k2.5',
-        reasoningEffort: 'ultra',
+        reasoningEffort: 'xhigh',
       });
     } finally {
       if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;

@@ -43,6 +43,7 @@ import {
   GRANT_DURATION_OPTIONS,
   MAX_GRANT_QUOTA,
 } from '../../services/grant-policy.js';
+import { codexReasoningEffortsForModel } from '../../services/codex-reasoning-effort.js';
 
 type StatusMessage = { text: string; ok?: boolean } | null;
 type PatchBot = (appId: string, patch: Partial<BotDefaultsRow> | ((bot: BotDefaultsRow) => BotDefaultsRow)) => void;
@@ -1355,7 +1356,7 @@ export function BotAgentSection(props: {
   const [cliKey, setCliKey] = useState(initialKey);
   const [cliSelectionTouched, setCliSelectionTouched] = useState(false);
   const [model, setModel] = useState(typeof bot.model === 'string' ? bot.model : '');
-  const [reasoningEffort, setReasoningEffort] = useState(bot.reasoningEffort ?? '');
+  const [reasoningEffort, setReasoningEffort] = useState<'' | 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra'>(bot.reasoningEffort ?? '');
   const [runtimeDraft, setRuntimeDraft] = useState<RuntimeDraft>(() => runtimeDraftFromBot(bot));
   const [runtimeTouched, setRuntimeTouched] = useState(false);
   const [runtimeStatus, setRuntimeStatus] = useState<StatusMessage>(null);
@@ -1578,6 +1579,11 @@ export function BotAgentSection(props: {
   const siSupport = bot.skillInjectionSupport === 'dynamic' ? 'dynamic' : bot.skillInjectionSupport === 'global' ? 'global' : 'none';
   const isRiff = cliKey === 'riff';
   const isCodexSelection = cliKey === 'codex' || cliKey === 'codex-app' || cliKey.endsWith('-codex');
+  const reasoningEffortOptions = useMemo(() => codexReasoningEffortsForModel(model), [model]);
+
+  useEffect(() => {
+    if (reasoningEffort && !reasoningEffortOptions.includes(reasoningEffort)) setReasoningEffort('');
+  }, [reasoningEffort, reasoningEffortOptions]);
   // Old dashboard payloads can omit agentSelectionKey while still carrying a
   // legacy wrapperCli. Keep the custom-runtime editor hidden until the user
   // explicitly selects bare Codex; structured runtimes and wrappers cannot mix.
@@ -1778,12 +1784,10 @@ export function BotAgentSection(props: {
               disabled={agentBusy}
               options={[
                 { value: '', label: tr('botDefaults.agentReasoningEffortDefault') },
-                { value: 'low', label: tr('botDefaults.agentReasoningEffortLow') },
-                { value: 'medium', label: tr('botDefaults.agentReasoningEffortMedium') },
-                { value: 'high', label: tr('botDefaults.agentReasoningEffortHigh') },
-                { value: 'xhigh', label: tr('botDefaults.agentReasoningEffortXhigh') },
-                { value: 'max', label: tr('botDefaults.agentReasoningEffortMax') },
-                { value: 'ultra', label: tr('botDefaults.agentReasoningEffortUltra') },
+                ...reasoningEffortOptions.map(value => ({
+                  value,
+                  label: tr(`botDefaults.agentReasoningEffort${value === 'xhigh' ? 'Xhigh' : value[0]!.toUpperCase() + value.slice(1)}`),
+                })),
               ]}
               onChange={next => setReasoningEffort(next as 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra')}
             />
