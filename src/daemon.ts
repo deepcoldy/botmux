@@ -21619,9 +21619,11 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // so riff never triggers into a racing durable restore (codex P1).
 
   // Publish daemon ownership immediately after IPC binds, then perform the
-  // first session-file load under SessionStore's cross-process lock. An
-  // offline CLI either observes this descriptor and delegates, or it already
-  // holds the file lock; in the latter case this load waits and sees its atomic
+  // first session-store load under the store's cross-process write exclusion
+  // (the shared file lock on JSON, a BEGIN IMMEDIATE read on SQLite — a plain
+  // SELECT would NOT wait for an in-flight offline writer). An offline CLI
+  // either observes this descriptor and delegates, or it already holds the
+  // write exclusion; in the latter case this load waits and sees its atomic
   // mutation. Never load a stale cache in an unadvertised startup window.
   desc.lastHeartbeat = Date.now();
   writeDaemonDescriptor(desc);

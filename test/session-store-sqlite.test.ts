@@ -307,7 +307,12 @@ describe('first-load serialization against an in-flight offline writer', () => {
     init();         // 释放连接，模拟 daemon 尚未启动
     const dbPath = join(tempDir, 'session-stores', 'appA', 'sessions.db');
 
+    // 握手协议保证确定性：子进程持锁改行后发 HELD；父进程落下 loading 标记后
+    // 立刻进入 load；子进程看到标记再等 300ms 才 COMMIT——父进程无论多慢都
+    // 一定在锁被持有期间发起排他读。
+    const loadingMarker = join(tempDir, 'race-parent-loading');
     const child = spawn(process.execPath, ['-e', `
+      const fs = require('node:fs');
       const { DatabaseSync } = require('node:sqlite');
       const db = new DatabaseSync(${JSON.stringify(dbPath)});
       db.exec('PRAGMA busy_timeout = 3000');
@@ -316,7 +321,11 @@ describe('first-load serialization against an in-flight offline writer', () => {
       current.title = 'offline-cli-write';
       db.prepare('UPDATE sessions SET row = ? WHERE session_id = ?').run(JSON.stringify(current), 's1');
       process.stdout.write('HELD\\n'); // 已持写锁 + 已过双探测的时刻
-      setTimeout(() => { db.exec('COMMIT'); db.close(); }, 600);
+      const tick = () => {
+        if (!fs.existsSync(${JSON.stringify(loadingMarker)})) return setTimeout(tick, 50);
+        setTimeout(() => { db.exec('COMMIT'); db.close(); }, 300);
+      };
+      tick();
     `], { stdio: ['ignore', 'pipe', 'inherit'] });
     try {
       await new Promise<void>((resolve, reject) => {
@@ -328,10 +337,11 @@ describe('first-load serialization against an in-flight offline writer', () => {
       });
 
       init('appA');
+      writeFileSync(loadingMarker, '1');
       const t0 = Date.now();
       const loaded = getSession('s1'); // 首次 load：排他读必须等 COMMIT
       expect(loaded?.title).toBe('offline-cli-write');
-      expect(Date.now() - t0).toBeGreaterThanOrEqual(300); // 确实等待了，而非读旧行
+      expect(Date.now() - t0).toBeGreaterThanOrEqual(200); // 确实等待了，而非读旧行
     } finally {
       try { child.kill('SIGKILL'); } catch { /* already gone */ }
     }
