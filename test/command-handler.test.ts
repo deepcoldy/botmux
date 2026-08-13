@@ -1142,6 +1142,11 @@ describe('PASSTHROUGH_COMMANDS set', () => {
     // points at Codex App, while the inverse must stay structured.
     expect(resolvePassthroughCommands(CODEX_APP_ID, 'codex').has('/model')).toBe(true);
     expect(resolvePassthroughCommands(LARK_APP_ID, 'codex-app').size).toBe(0);
+    // Runner adapters (mira/mir/dsh) only accept framed input; raw slash
+    // passthrough would be rejected by the runner and wedge the session.
+    expect(resolvePassthroughCommands(LARK_APP_ID, 'mira').size).toBe(0);
+    expect(resolvePassthroughCommands(LARK_APP_ID, 'mir').size).toBe(0);
+    expect(resolvePassthroughCommands(LARK_APP_ID, 'dsh').size).toBe(0);
   });
 
   it('threads the frozen CLI through the ADAPTER-SCOPED layer, not just the builtin set', () => {

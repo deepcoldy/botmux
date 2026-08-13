@@ -211,7 +211,14 @@ export function resolvePassthroughCommands(larkAppId?: string, cliIdOverride?: s
   // ledger; the model still completes the text as an ordinary turn, but the
   // worker has no pending dispatch to attribute that final to and the session
   // remains stuck. Keep these messages on the normal structured turn path.
-  if (effectiveCliId === 'codex-app') return new Set();
+  // Runner adapters (codex-app/mira/mir/dsh) speak a framed stdin protocol,
+  // not an interactive TUI: a slash command through raw_input bypasses the
+  // turn ledger and the runner rejects non-frame input, wedging the session.
+  // Keep these messages on the normal structured turn path.
+  if (effectiveCliId === 'codex-app'
+    || effectiveCliId === 'mira'
+    || effectiveCliId === 'mir'
+    || effectiveCliId === 'dsh') return new Set();
   for (const c of resolveAdapterDefaultPassthroughCommands(larkAppId, effectiveCliId)) {
     effective.add(c);
   }
