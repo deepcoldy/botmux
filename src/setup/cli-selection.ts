@@ -422,6 +422,19 @@ export function ttadkConfigModelChoices(wrapperCli: string | undefined): string[
  *   - ttadk 网关走专门分支注入 `-m <model> --skip-check`（见 {@link buildTtadkLaunch}）
  * 前缀为空时返回 `{ bin: '', args }`，调用方据此跳过（不改写 spawn）。
  */
+/**
+ * Wrapper-specific launch ENVIRONMENT — the single source of truth shared by
+ * the worker spawn branch and one-shot child processes (session-group AI
+ * titling). cjadk launches its agent inside an interactive wrapper (startup
+ * selector + terminal quirks) unless CJADK_INTERACTIVE=0; without it a
+ * non-TTY one-shot call can hang on the selector.
+ */
+export function wrapperLaunchEnv(wrapperCli: string | undefined): Record<string, string> | undefined {
+  if (!wrapperCli?.trim()) return undefined;
+  if (parseWrapperCli(wrapperCli)[0] === 'cjadk') return { CJADK_INTERACTIVE: '0' };
+  return undefined;
+}
+
 export function buildWrappedLaunch(
   wrapperCli: string,
   cliArgs: ReadonlyArray<string>,
