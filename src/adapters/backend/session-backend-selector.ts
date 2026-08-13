@@ -149,14 +149,24 @@ export type BackendGateDecision =
  * abandoning it would spawn a duplicate CLI and orphan the real conversation.
  * tmux/zellij capability probes use disposable sessions; ZMX checks its
  * version and full-list control plane; Herdr uses `herdr --version`.
+ *
+ * `existingSessionUnknown` covers the third state: the existence check itself
+ * got no answer (timeout under host load). Gating on that is what produced
+ * "本机 tmux 不可用" cards for sessions whose tmux panes were alive the whole
+ * time — a false negative on the *cheap* check overrode a live session. When
+ * existence is indeterminate we spawn rather than gate: selectSessionBackend
+ * re-probes and takes the create branch, which absorbs a "duplicate session"
+ * error as a reattach, whereas a wrong gate strands a working conversation.
  */
 export function decideBackendGate(opts: {
   requested: BackendType;
   available: boolean;
   hasExistingSession: boolean;
+  existingSessionUnknown?: boolean;
 }): BackendGateDecision {
   if (opts.requested === 'pty') return { action: 'spawn' };
   if (opts.hasExistingSession) return { action: 'spawn' };
+  if (opts.existingSessionUnknown) return { action: 'spawn' };
   if (opts.available) return { action: 'spawn' };
   return { action: 'gate', reason: `${opts.requested} 后端在本机不可用` };
 }
@@ -401,7 +411,13 @@ export function selectSessionBackend(opts: {
   }
 
   const sessionName = TmuxBackend.sessionName(opts.sessionId);
-  if (TmuxBackend.hasSession(sessionName)) {
+  // Retry first so a load-induced timeout doesn't decide this at all. Only an
+  // authoritative 'exists' takes the reattach branch; a residual 'unknown'
+  // falls through to create, which absorbs a wrong guess (see
+  // createDetachedSession: a "duplicate session" error is treated as reattach).
+  // The reverse bet is NOT safe — reattaching a session that is really gone
+  // leaves pipe-pane with no pane and no way to recover.
+  if (TmuxBackend.probeSessionWithRetry(sessionName) === 'exists') {
     return {
       backend: new TmuxPipeBackend(sessionName, { ownsSession: true, isReattach: true }),
       isTmuxMode: true,

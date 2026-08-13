@@ -618,23 +618,37 @@ export class TmuxPipeBackend implements SessionBackend {
   private createDetachedSession(bin: string, args: string[], opts: SpawnOpts): void {
     const shellSpec = resolveUserShell(process.env, opts.launchShell);
     const envAssignments = buildBotmuxEnvAssignments(opts.env, opts.injectEnv);
-    execFileSync('tmux', [
-      'new-session',
-      '-d',
-      '-s', this.paneTarget,
-      '-x', String(opts.cols),
-      '-y', String(opts.rows),
-      '--',
-      ...shellLaunchArgv(shellSpec.shell, shellSpec.flags), '-c', shellWrapperScript(resolveBotmuxWrapperBinDir(opts.env ?? process.env)), '_',
-      opts.cwd,
-      ...envAssignments,
-      bin, ...args,
-    ], {
-      cwd: opts.cwd,
-      stdio: 'ignore',
-      timeout: 5000,
-      env: tmuxEnv(opts.env),
-    });
+    try {
+      execFileSync('tmux', [
+        'new-session',
+        '-d',
+        '-s', this.paneTarget,
+        '-x', String(opts.cols),
+        '-y', String(opts.rows),
+        '--',
+        ...shellLaunchArgv(shellSpec.shell, shellSpec.flags), '-c', shellWrapperScript(resolveBotmuxWrapperBinDir(opts.env ?? process.env)), '_',
+        opts.cwd,
+        ...envAssignments,
+        bin, ...args,
+      ], {
+        cwd: opts.cwd,
+        stdio: ['ignore', 'ignore', 'pipe'],
+        timeout: 5000,
+        env: tmuxEnv(opts.env),
+      });
+    } catch (e: any) {
+      // "duplicate session" means the session we were about to create already
+      // exists, so the create branch was chosen on a stale/indeterminate
+      // existence check (e.g. `has-session` timed out under host load). That is
+      // recoverable and MUST NOT kill the spawn: the pane is alive, so fall
+      // through to reattach — pipe-pane below subscribes to it either way.
+      // Any other failure is a real spawn error and still propagates.
+      const stderr = (e?.stderr?.toString?.() ?? '').trim();
+      if (!/duplicate session/i.test(stderr)) throw e;
+      // stderr, not a logger: this backend deliberately avoids importing the
+      // logger (circular import), same as the read-error path above.
+      process.stderr.write(`[tmux-pipe-backend] session ${this.paneTarget} already existed; reattaching instead of creating\n`);
+    }
     this.applySessionOptions();
   }
 

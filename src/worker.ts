@@ -11425,12 +11425,20 @@ async function spawnCli(
     let available = true;
     let reason = '';
     let hasExistingSession = false;
+    let existingSessionUnknown = false;
     if (effectiveBackend === 'tmux') {
-      hasExistingSession = TmuxBackend.hasSession(TmuxBackend.sessionName(cfg.sessionId));
-      if (!hasExistingSession) {
+      // Tri-state on purpose: under heavy host load even `has-session` (~20ms
+      // healthy) can time out, and collapsing that 'unknown' into "no session"
+      // used to gate sessions whose tmux panes were alive the whole time.
+      const probeState = TmuxBackend.probeSessionWithRetry(TmuxBackend.sessionName(cfg.sessionId));
+      hasExistingSession = probeState === 'exists';
+      existingSessionUnknown = probeState === 'unknown';
+      if (probeState === 'missing') {
         const probe = probeTmuxFunctionalWithRetry();
         available = probe.ok;
         if (!probe.ok) reason = probe.reason;
+      } else if (existingSessionUnknown) {
+        log('tmux has-session probe returned no answer (host load); spawning to let reattach decide instead of gating');
       }
     } else if (effectiveBackend === 'zellij') {
       // Like tmux, zellij's probe is a disposable background session, so a
@@ -11473,7 +11481,7 @@ async function spawnCli(
       available = HerdrBackend.isAvailable();
       reason = 'herdr 功能性探针失败';
     }
-    const decision = decideBackendGate({ requested: effectiveBackend, available, hasExistingSession });
+    const decision = decideBackendGate({ requested: effectiveBackend, available, hasExistingSession, existingSessionUnknown });
     if (decision.action === 'gate') {
       const detail = reason || decision.reason;
       log(`${effectiveBackend} backend unavailable and silent PTY fallback is disabled (set BACKEND_TYPE=pty to opt in): ${detail}`);

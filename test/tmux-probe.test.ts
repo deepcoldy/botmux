@@ -95,3 +95,47 @@ describe('TmuxBackend.killSession', () => {
     );
   });
 });
+
+/**
+ * Regression: 2026-08-12. `has-session` is cheap (~20ms) but still needs a
+ * fork+exec, so at load ~70 it was killed by its own timeout before tmux ran.
+ * One such timeout was reported as a verdict, and the caller treated a live
+ * session as gone — gating five healthy sessions with "本机 tmux 不可用".
+ */
+describe('TmuxBackend.probeSessionWithRetry', () => {
+  it('retries a timeout and returns "exists" when a later attempt gets through', () => {
+    let calls = 0;
+    mockedExecFileSync.mockImplementation((() => {
+      calls += 1;
+      if (calls === 1) throw err({ signal: 'SIGTERM', status: null, killed: true });
+      return '';
+    }) as any);
+
+    expect(TmuxBackend.probeSessionWithRetry(NAME, { baseDelayMs: 0 })).toBe('exists');
+    expect(calls).toBe(2);
+  });
+
+  it('does NOT retry an authoritative answer — "missing" costs exactly one call', () => {
+    // Retrying a clean exit 1 would add latency to the common cold-start path
+    // and could mask a genuine absence, so authoritative answers return at once.
+    let calls = 0;
+    mockedExecFileSync.mockImplementation((() => {
+      calls += 1;
+      throw err({ status: 1, signal: null });
+    }) as any);
+
+    expect(TmuxBackend.probeSessionWithRetry(NAME, { baseDelayMs: 0 })).toBe('missing');
+    expect(calls).toBe(1);
+  });
+
+  it('still reports "unknown" when every attempt times out (no false verdict)', () => {
+    let calls = 0;
+    mockedExecFileSync.mockImplementation((() => {
+      calls += 1;
+      throw err({ signal: 'SIGTERM', status: null, killed: true });
+    }) as any);
+
+    expect(TmuxBackend.probeSessionWithRetry(NAME, { attempts: 3, baseDelayMs: 0 })).toBe('unknown');
+    expect(calls).toBe(3);
+  });
+});

@@ -115,12 +115,41 @@ export class TmuxBackend implements SessionBackend {
    */
   static probeSession(name: string): SessionProbe {
     try {
-      execFileSync('tmux', ['has-session', '-t', name], { stdio: 'ignore', env: tmuxEnv(), timeout: 3000 });
+      execFileSync('tmux', ['has-session', '-t', name], { stdio: 'ignore', env: tmuxEnv(), timeout: 10_000 });
       return 'exists';
     } catch (e: any) {
       if (e && typeof e.status === 'number' && !e.signal) return 'missing';
       return 'unknown';
     }
+  }
+
+  /**
+   * Existence probe with a short retry on 'unknown'.
+   *
+   * `has-session` is cheap (~20ms on a healthy host) but it still needs a
+   * fork+exec, so under heavy host load the timeout can expire before tmux is
+   * ever scheduled — signal=SIGTERM, no numeric status → 'unknown'.
+   * A single timeout must not be reported as a verdict, because callers that
+   * collapse 'unknown' into 'missing' then act as if a live session were gone.
+   *
+   * Only 'unknown' is retried: 'exists' and 'missing' are authoritative
+   * answers from tmux and are returned immediately.
+   */
+  static probeSessionWithRetry(name: string, opts: { attempts?: number; baseDelayMs?: number } = {}): SessionProbe {
+    const attempts = Math.max(1, Math.floor(opts.attempts ?? 3));
+    const baseDelayMs = Math.max(0, Math.floor(opts.baseDelayMs ?? 150));
+    let result = TmuxBackend.probeSession(name);
+
+    for (let completed = 1; result === 'unknown' && completed < attempts; completed += 1) {
+      const backoff = baseDelayMs * (2 ** (completed - 1));
+      const jitter = baseDelayMs > 0 ? Math.floor(Math.random() * baseDelayMs) : 0;
+      try {
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, backoff + jitter);
+      } catch { /* SharedArrayBuffer unavailable: retry immediately */ }
+      result = TmuxBackend.probeSession(name);
+    }
+
+    return result;
   }
 
   /** Kill a named tmux session (no-op if it doesn't exist). */

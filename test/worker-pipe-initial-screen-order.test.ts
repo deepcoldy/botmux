@@ -738,8 +738,14 @@ describe('worker pipe initial screen ordering', () => {
     expect(guardStart).toBeGreaterThan(-1);
     expect(guardEnd).toBeGreaterThan(guardStart);
     // A live tmux session is checked before probing so it can reattach (PR#249).
-    expect(guard).toContain('TmuxBackend.hasSession(TmuxBackend.sessionName(cfg.sessionId))');
-    expect(guard.indexOf('TmuxBackend.hasSession')).toBeLessThan(guard.indexOf('probeTmuxFunctional'));
+    // Uses the retrying tri-state probe: a load-induced `has-session` timeout
+    // must not be read as "no session" and gate a live pane (2026-08-12).
+    expect(guard).toContain('TmuxBackend.probeSessionWithRetry(TmuxBackend.sessionName(cfg.sessionId))');
+    expect(guard.indexOf('TmuxBackend.probeSessionWithRetry')).toBeLessThan(guard.indexOf('probeTmuxFunctional'));
+    // The functional probe runs ONLY on an authoritative 'missing' — an
+    // indeterminate answer must not fall through into the gate.
+    expect(guard).toContain("if (probeState === 'missing')");
+    expect(guard).toContain('existingSessionUnknown');
     // The decision is made by the pure gate helper, and a gate posts an
     // actionable error IPC + throws — it must NOT silently downgrade to pty.
     // The daemon renders WorkerToDaemon.error to Lark, avoiding the old

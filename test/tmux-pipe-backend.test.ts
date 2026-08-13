@@ -414,6 +414,51 @@ describe('normaliseCaptureLineEndings', () => {
 });
 
 describe('TmuxPipeBackend managed session', () => {
+  /**
+   * Regression: 2026-08-12. When the existence probe can't get an answer
+   * (has-session timed out under host load) the selector picks the create
+   * branch. If the session actually exists, tmux refuses with
+   * "duplicate session" — verified against real tmux as exit 1 on stderr,
+   * with the live session left intact. That must degrade to reattach rather
+   * than throwing away a working conversation.
+   */
+  it('absorbs "duplicate session" and still subscribes to the existing pane', () => {
+    mockedExecFileSync.mockImplementation(((_bin: string, args: string[]) => {
+      if (args.includes('new-session')) {
+        throw Object.assign(new Error('Command failed'), {
+          status: 1,
+          stderr: Buffer.from('duplicate session: bmx-owned\n'),
+        });
+      }
+      return Buffer.from('') as any;
+    }) as any);
+
+    const be = new TmuxPipeBackend('bmx-owned', { createSession: true, ownsSession: true });
+    expect(() => be.spawn('/bin/echo', ['hello'], spawnOpts())).not.toThrow();
+
+    // The whole point: the pane stream is still wired up after the failed create.
+    const pipeCalls = mockedExecSync.mock.calls
+      .map(c => String(c[0]))
+      .filter(c => c.includes('pipe-pane'));
+    expect(pipeCalls.length).toBe(1);
+    expect(pipeCalls[0]).toContain("'bmx-owned'");
+  });
+
+  it('still propagates a NON-duplicate new-session failure (guard keeps its teeth)', () => {
+    mockedExecFileSync.mockImplementation(((_bin: string, args: string[]) => {
+      if (args.includes('new-session')) {
+        throw Object.assign(new Error('Command failed'), {
+          status: 1,
+          stderr: Buffer.from('no space left on device\n'),
+        });
+      }
+      return Buffer.from('') as any;
+    }) as any);
+
+    const be = new TmuxPipeBackend('bmx-owned', { createSession: true, ownsSession: true });
+    expect(() => be.spawn('/bin/echo', ['hello'], spawnOpts())).toThrow();
+  });
+
   it('creates detached session and applies botmux tmux options', () => {
     const be = new TmuxPipeBackend('bmx-owned', { createSession: true, ownsSession: true });
     be.spawn('/bin/echo', ['hello'], spawnOpts());

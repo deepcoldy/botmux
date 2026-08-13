@@ -8,6 +8,7 @@ vi.mock('../src/adapters/backend/tmux-backend.js', () => ({
   TmuxBackend: class MockTmuxBackend {
     static sessionName = vi.fn((id: string) => `bmx-${id.slice(0, 8)}`);
     static hasSession = vi.fn();
+    static probeSessionWithRetry = vi.fn();
     constructor(public sessionName: string) {}
   },
 }));
@@ -63,6 +64,7 @@ describe('selectSessionBackend', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     vi.mocked(TmuxBackend.hasSession).mockReset();
+    vi.mocked(TmuxBackend.probeSessionWithRetry).mockReset();
     vi.mocked(TmuxBackend.sessionName).mockClear();
     vi.mocked(HerdrBackend.hasSession).mockReturnValue(false);
     vi.mocked(HerdrBackend.probeSession).mockReturnValue('missing');
@@ -72,7 +74,7 @@ describe('selectSessionBackend', () => {
   });
 
   it('uses owned pipe backend when reattaching to an existing tmux session', () => {
-    vi.mocked(TmuxBackend.hasSession).mockReturnValue(true);
+    vi.mocked(TmuxBackend.probeSessionWithRetry).mockReturnValue('exists');
 
     const selected = selectSessionBackend({ sessionId: '9cfa0024-197d-4781-845b-c541dceb8980', backendType: 'tmux' });
 
@@ -88,7 +90,7 @@ describe('selectSessionBackend', () => {
   });
 
   it('uses managed pipe backend for a new tmux session', () => {
-    vi.mocked(TmuxBackend.hasSession).mockReturnValue(false);
+    vi.mocked(TmuxBackend.probeSessionWithRetry).mockReturnValue('missing');
 
     const selected = selectSessionBackend({ sessionId: '9cfa0024-197d-4781-845b-c541dceb8980', backendType: 'tmux' });
 
@@ -96,6 +98,21 @@ describe('selectSessionBackend', () => {
     expect(selected.isPipeMode).toBe(true);
     expect(selected.backend.constructor.name).toBe('MockTmuxPipeBackend');
     expect((selected.backend as any).paneTarget).toBe('bmx-9cfa0024');
+    expect((selected.backend as any).opts).toEqual({ createSession: true, ownsSession: true });
+  });
+
+  /**
+   * Regression: 2026-08-12. An indeterminate probe (has-session timed out under
+   * host load) must take the create branch, because createDetachedSession
+   * absorbs a "duplicate session" error as a reattach. Choosing reattach here
+   * would be unrecoverable if the session were genuinely gone: pipe-pane would
+   * have no pane to subscribe to.
+   */
+  it('takes the create branch when existence is indeterminate (unknown, not missing)', () => {
+    vi.mocked(TmuxBackend.probeSessionWithRetry).mockReturnValue('unknown');
+
+    const selected = selectSessionBackend({ sessionId: '9cfa0024-197d-4781-845b-c541dceb8980', backendType: 'tmux' });
+
     expect((selected.backend as any).opts).toEqual({ createSession: true, ownsSession: true });
   });
 

@@ -33,6 +33,39 @@ describe('decideBackendGate (PTY 退役 hard gate)', () => {
     ).toEqual({ action: 'spawn' });
   });
 
+  /**
+   * Regression: 2026-08-12. Under host load ~70 the cheap `has-session` probe
+   * timed out (signal=SIGTERM, no exit status). That 'unknown' was collapsed
+   * into hasExistingSession:false, the disposable functional probe then also
+   * timed out, and five sessions whose tmux panes were alive the whole time
+   * got "本机 tmux 不可用，无法启动会话" cards telling the user to
+   * `brew install tmux` — which was already installed and healthy.
+   */
+  it('does NOT gate when the existence check itself got no answer (timeout, not absence)', () => {
+    expect(
+      decideBackendGate({
+        requested: 'tmux',
+        available: false,
+        hasExistingSession: false,
+        existingSessionUnknown: true,
+      }),
+    ).toEqual({ action: 'spawn' });
+  });
+
+  it('still gates when the session is PROVABLY absent and the backend is unavailable', () => {
+    // The guard must keep its teeth: an authoritative "no such session" plus a
+    // failed functional probe is the real "tmux is broken" case the gate exists
+    // for, and must not be softened by the unknown-state exemption above.
+    expect(
+      decideBackendGate({
+        requested: 'tmux',
+        available: false,
+        hasExistingSession: false,
+        existingSessionUnknown: false,
+      }).action,
+    ).toBe('gate');
+  });
+
   it('gates herdr / zellij / zmx when unavailable instead of degrading to PTY', () => {
     expect(decideBackendGate({ requested: 'herdr', available: false, hasExistingSession: false }).action).toBe('gate');
     expect(decideBackendGate({ requested: 'zellij', available: false, hasExistingSession: false }).action).toBe('gate');
