@@ -162,9 +162,10 @@ function resolveConfigPath(): string {
   return path;
 }
 
-/** Map dsh's usage shape onto botmux's four-bucket final usage. The worker
- *  drops the whole usage unless every bucket is a non-negative integer, so
- *  missing buckets default to 0. */
+/** Map dsh's per-model-call usage onto botmux's four-bucket final usage.
+ *  dsh reports cacheWriteTokens where botmux says cacheCreateTokens. The
+ *  worker drops the whole usage unless every bucket is a non-negative
+ *  integer, so missing buckets default to 0. */
 function normalizeUsage(raw: unknown): DshUsage | undefined {
   if (!raw || typeof raw !== 'object') return undefined;
   const r = raw as Record<string, unknown>;
@@ -177,7 +178,18 @@ function normalizeUsage(raw: unknown): DshUsage | undefined {
     inputTokens,
     outputTokens,
     cacheReadTokens: num(r.cacheReadTokens) ?? 0,
-    cacheCreateTokens: 0,
+    cacheCreateTokens: num(r.cacheWriteTokens) ?? 0,
+  };
+}
+
+/** Accumulate per-step usage into a turn total (dsh meters each model call,
+ *  not the whole turn). */
+function addUsage(a: DshUsage, b: DshUsage): DshUsage {
+  return {
+    inputTokens: a.inputTokens + b.inputTokens,
+    outputTokens: a.outputTokens + b.outputTokens,
+    cacheReadTokens: a.cacheReadTokens + b.cacheReadTokens,
+    cacheCreateTokens: a.cacheCreateTokens + b.cacheCreateTokens,
   };
 }
 
@@ -354,14 +366,18 @@ function handleSessionEvent(event: unknown): void {
       const message = ev.data?.message as { content?: Array<{ type?: string; text?: string }> } | undefined;
       const blocks = message?.content;
       if (Array.isArray(blocks)) {
-        for (const block of blocks) {
-          if (block?.type === 'text' && typeof block.text === 'string') {
-            turn.textBuffer += turn.textBuffer ? `\n${block.text}` : block.text;
-          }
-        }
+        // dsh emits one assistant/message per step. The turn's final response
+        // is the LAST assistant message's text (same semantics as the SDK's
+        // finalResponse): replace, don't append, so intermediate step chatter
+        // never leaks into the reply.
+        const parts = blocks
+          .filter((b): b is { type: 'text'; text: string } => b?.type === 'text' && typeof b.text === 'string')
+          .map(b => b.text);
+        turn.textBuffer = parts.join('\n');
       }
+      // usage is per model call; accumulate across steps for a turn total.
       const usage = normalizeUsage(ev.data?.usage);
-      if (usage) turn.usage = usage;
+      if (usage) turn.usage = turn.usage ? addUsage(turn.usage, usage) : usage;
       break;
     }
     default:
@@ -415,7 +431,6 @@ async function runTurn(content: string): Promise<void> {
   writeLine('[dsh] thinking...');
 
   const promptContent = firstTurn ? `${buildPreamble()}${content}` : content;
-  firstTurn = false;
 
   const turnPromise = new Promise<void>((resolve, reject) => {
     const timer = setTimeout(() => {
@@ -437,6 +452,9 @@ async function runTurn(content: string): Promise<void> {
       sessionId: dshSessionId,
       contentBlocks: [{ type: 'text', text: promptContent }],
     }, PROMPT_ACK_TIMEOUT_MS);
+    // Commit firstTurn only after the prompt was accepted: a rejected first
+    // prompt must keep the identity preamble for the retry (double-send guard).
+    firstTurn = false;
   } catch (err) {
     if (activeTurn) {
       clearTimeout(activeTurn.timer);

@@ -594,6 +594,10 @@ describe('dsh buildArgs (runner model)', () => {
     expect(adapter.readyPattern?.test('› ')).toBe(true);
   });
 
+  it('defers the first prompt until the runner is ready (slow handshake)', () => {
+    expect(adapter.deferFirstPromptTimeoutUntilReady).toBe(true);
+  });
+
   it('does not type ahead (serial turns)', () => {
     expect(adapter.supportsTypeAhead).not.toBe(true);
   });

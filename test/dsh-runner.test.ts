@@ -165,6 +165,46 @@ describe('dsh-runner', () => {
     expect(h.stdout).toContain('completed without text output');
   });
 
+  it('takes only the last assistant message as the final text and accumulates usage', async () => {
+    h = spawnRunner('multi-step');
+    await waitFor(() => h.stdout.includes('›'), { label: 'ready marker' });
+
+    h.child.stdin.write(makeFrame('多步任务'));
+    await waitFor(() => parseMarkers(h.stdout).some(m => m.kind === 'final'), { label: 'final marker' });
+
+    const final = parseMarkers(h.stdout).find(m => m.kind === 'final')!;
+    // The intermediate step text must not leak into the reply.
+    expect(final.payload.content).toBe('你好，我是 dsh。');
+    expect(final.payload.content).not.toContain('中间步骤');
+    // Per-model-call usage accumulates into a turn total.
+    expect(final.payload.usage).toEqual({
+      inputTokens: 150,
+      outputTokens: 50,
+      cacheReadTokens: 7,
+      cacheCreateTokens: 4,
+    });
+  });
+
+  it('keeps the identity preamble for the retry after a rejected first prompt', async () => {
+    h = spawnRunner('retry');
+    await waitFor(() => h.stdout.includes('›'), { label: 'ready marker' });
+
+    h.child.stdin.write(makeFrame('第一次'));
+    await waitFor(() => parseMarkers(h.stdout).filter(m => m.kind === 'final').length >= 1, { label: 'error final' });
+    const errorFinal = parseMarkers(h.stdout).find(m => m.kind === 'final')!;
+    expect(errorFinal.payload.content).toContain('boom');
+
+    h.child.stdin.write(makeFrame('第二次'));
+    await waitFor(() => parseMarkers(h.stdout).filter(m => m.kind === 'final').length >= 2, { label: 'success final' });
+
+    const prompts = readPrompts(h);
+    expect(prompts).toHaveLength(2);
+    // The first prompt was rejected, so the second one is still the first
+    // EXECUTED turn and must carry the identity preamble.
+    expect(prompts[1].prompt.contentBlocks[0].text).toContain('<botmux_identity>');
+    expect(prompts[1].prompt.contentBlocks[0].text).toContain('第二次');
+  });
+
   it('reaps a wedged turn with the watchdog and exits for restart', async () => {
     h = spawnRunner('hang', ['--turn-timeout-ms', '500']);
     await waitFor(() => h.stdout.includes('›'), { label: 'ready marker' });

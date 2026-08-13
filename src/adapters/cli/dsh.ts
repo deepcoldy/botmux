@@ -80,6 +80,10 @@ export function createDshAdapter(pathOverride?: string): CliAdapter {
     supportsTypeAhead: false,
     completionPattern: undefined,
     readyPattern: /›/,
+    // The runner only attaches its stdin listener after the JSON-RPC handshake
+    // (up to 30s). Without this, the worker's 15s soft timeout would flush the
+    // first prompt into an un-drained PTY and risk a dirty_unknown generation.
+    deferFirstPromptTimeoutUntilReady: true,
     systemHints: [],
     injectsSessionContext: true,
     altScreen: false,
