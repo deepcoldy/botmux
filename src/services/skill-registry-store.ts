@@ -1,10 +1,12 @@
-import { closeSync, cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readSync, readdirSync, realpathSync, rmSync, statSync } from 'node:fs';
+import { closeSync, cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readSync, readdirSync, realpathSync, renameSync, rmSync, statSync } from 'node:fs';
+import { rm as rmAsync } from 'node:fs/promises';
 import { execFile, execFileSync, spawn } from 'node:child_process';
-import { createHash } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { promisify } from 'node:util';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { withFileLock, withFileLockSync } from '../utils/file-lock.js';
+import { logger } from '../utils/logger.js';
 import { githubGitAuthEnv } from '../core/github-auth.js';
 import { loadSkillPackage } from '../core/skills/package.js';
 import { skillRegistryPath, skillSourcesDir, skillStoreDir } from '../core/skills/registry-paths.js';
@@ -1282,6 +1284,96 @@ export function removeInstalledSkill(name: string): { ok: true } | { ok: false; 
   return result.ok ? { ok: true } : { ok: false, reason: result.reason };
 }
 
+/** Prefix marking a store subdirectory as scheduled-for-deletion garbage. The
+ *  store is never enumerated to discover skills (the registry is the source of
+ *  truth, keyed by name → rootDir), so a `.trash-*` sibling is inert; it only
+ *  needs a name that can never collide with a real skill name (skill names
+ *  cannot begin with a dot). */
+const STORE_TRASH_PREFIX = '.trash-';
+
+/** Remove a store-managed skill tree WITHOUT blocking the caller (and, on the
+ *  dashboard, its whole event loop) on a large synchronous `rmSync`.
+ *
+ *  A same-filesystem `renameSync` into a sibling `.trash-*` dir is an O(1)
+ *  metadata operation (measured <1ms even for a 700MB / 7k-file tree), so the
+ *  skill disappears from its rootDir instantly and the caller returns. The
+ *  actual recursive unlink then runs fire-and-forget off the event loop.
+ *
+ *  A rename failure aborts before the registry is changed. Falling back to the
+ *  old recursive rmSync would both reintroduce the dashboard freeze and make a
+ *  partial batch impossible to roll back safely. */
+type StoreTreeRemovalOps = {
+  rename: (from: string, to: string) => void;
+  removeAsync: (path: string) => Promise<unknown>;
+};
+
+type StagedStoreTreeRemoval = {
+  rootDir: string;
+  trashDir: string;
+  ops: StoreTreeRemovalOps;
+};
+
+const REAL_STORE_TREE_REMOVAL_OPS: StoreTreeRemovalOps = {
+  rename: renameSync,
+  removeAsync: (path) => rmAsync(path, { recursive: true, force: true }),
+};
+let storeTreeRemovalTestOps: StoreTreeRemovalOps | undefined;
+
+function stageStoreTreeRemoval(rootDir: string): StagedStoreTreeRemoval {
+  const trashDir = join(skillStoreDir(), `${STORE_TRASH_PREFIX}${randomBytes(8).toString('hex')}`);
+  const ops = storeTreeRemovalTestOps ?? REAL_STORE_TREE_REMOVAL_OPS;
+  // Same-filesystem rename creates trashDir and moves the tree in one O(1)
+  // metadata op; the unique random suffix cannot collide with a live tree.
+  ops.rename(rootDir, trashDir);
+  return { rootDir, trashDir, ops };
+}
+
+function rollbackStagedStoreTreeRemovals(staged: readonly StagedStoreTreeRemoval[]): void {
+  for (const item of [...staged].reverse()) {
+    item.ops.rename(item.trashDir, item.rootDir);
+  }
+}
+
+function finishStagedStoreTreeRemoval(staged: StagedStoreTreeRemoval): void {
+  // Background unlink of the renamed tree. Detached on purpose: the delete has
+  // already succeeded from the caller's perspective. A failure only leaves a
+  // `.trash-*` dir that the next startup sweep reclaims.
+  void staged.ops.removeAsync(staged.trashDir).catch((err) => {
+    logger.warn(
+      `[skills] Background removal of ${basename(staged.trashDir)} failed; startup sweep will retry: `
+      + `${err instanceof Error ? err.message : String(err)}`,
+    );
+  });
+}
+
+/** Test seam for deterministic rename failures without touching host filesystem
+ * permissions. Production callers always use the real operations. */
+export function __testOnly_setStoreTreeRemovalOps(ops: StoreTreeRemovalOps | undefined): void {
+  storeTreeRemovalTestOps = ops;
+}
+
+/** Best-effort reclamation of `.trash-*` dirs left behind by an interrupted
+ *  background unlink (process crash/restart mid-delete). Fire-and-forget; a
+ *  failure just defers reclamation to a later startup. Safe to call at boot. */
+export function sweepStoreTrash(): void {
+  let entries: string[];
+  try {
+    entries = readdirSync(skillStoreDir());
+  } catch {
+    return; // store dir absent → nothing to sweep
+  }
+  for (const entry of entries) {
+    if (!entry.startsWith(STORE_TRASH_PREFIX)) continue;
+    void rmAsync(join(skillStoreDir(), entry), { recursive: true, force: true })
+      .catch((err) => {
+        logger.warn(
+          `[skills] Startup sweep could not remove ${entry}; a later startup will retry: `
+          + `${err instanceof Error ? err.message : String(err)}`,
+        );
+      });
+  }
+}
+
 export function removeInstalledSkills(names: readonly string[]):
   | { ok: true; removed: string[] }
   | { ok: false; reason: string; missing?: string[] } {
@@ -1291,13 +1383,39 @@ export function removeInstalledSkills(names: readonly string[]):
   const missing = uniqueNames.filter(name => !registry.skills[name]);
   if (missing.length > 0) return { ok: false, reason: 'skill_not_installed', missing };
   const packages = uniqueNames.map(name => registry.skills[name]);
-  for (const name of uniqueNames) delete registry.skills[name];
-  writeSkillRegistry(registry);
-  for (const pkg of packages) {
-    if (pkg.source.type !== 'local-link' && isStoreManagedRoot(pkg.rootDir)) {
-      rmSync(pkg.rootDir, { recursive: true, force: true });
+  const staged: StagedStoreTreeRemoval[] = [];
+  try {
+    for (const pkg of packages) {
+      if (pkg.source.type !== 'local-link'
+          && isStoreManagedRoot(pkg.rootDir)
+          && existsSync(pkg.rootDir)) {
+        staged.push(stageStoreTreeRemoval(pkg.rootDir));
+      }
     }
+  } catch (err) {
+    try {
+      rollbackStagedStoreTreeRemovals(staged);
+    } catch (rollbackErr) {
+      logger.error(
+        `[skills] Failed to roll back a staged skill removal: `
+        + `${rollbackErr instanceof Error ? rollbackErr.message : String(rollbackErr)}`,
+      );
+    }
+    logger.warn(
+      `[skills] Skill removal aborted before registry update: `
+      + `${err instanceof Error ? err.message : String(err)}`,
+    );
+    return { ok: false, reason: 'skill_tree_remove_failed' };
   }
+
+  for (const name of uniqueNames) delete registry.skills[name];
+  try {
+    writeSkillRegistry(registry);
+  } catch (err) {
+    rollbackStagedStoreTreeRemovals(staged);
+    throw err;
+  }
+  for (const item of staged) finishStagedStoreTreeRemoval(item);
   return { ok: true, removed: uniqueNames };
 }
 

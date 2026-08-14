@@ -152,9 +152,11 @@ import {
   readSkillRegistry,
   removeInstalledSkill,
   removeInstalledSkills,
+  sweepStoreTrash,
   updateInstalledSkillAsync,
 } from './services/skill-registry-store.js';
 import { readSkillPackRegistry } from './services/skill-pack-store.js';
+import { dashboardSessionActionTimeoutMs, type DashboardSessionAction } from './dashboard/session-action-timeout.js';
 import {
   cloneSkillPack,
   createSkillPack,
@@ -4222,10 +4224,27 @@ const server = createServer(async (req, res) => {
 
     let m: RegExpMatchArray | null;
     if (req.method === 'POST' && (m = url.pathname.match(/^\/api\/sessions\/([^/]+)\/(close|locate|resume|restart|start)$/))) {
-      const sid = decodeURIComponent(m[1]); const op = m[2];
+      const sid = decodeURIComponent(m[1]); const op = m[2] as DashboardSessionAction;
       const owner = aggregator.ownerOf(sid);
       if (!owner) return jsonRes(res, 404, { ok: false, error: 'unknown_session' });
-      const upstream = await proxyToDaemon(owner, `/api/sessions/${sid}/${op}`, { method: 'POST' });
+      // Defensive client-side deadline: the daemon side of every op here replies
+      // promptly (close resolves its fence on the worker's flushed ACK; restart/
+      // resume/start return after a fire-and-forget IPC). Close gets a separate
+      // 60s budget because Riff's 23s remote-cancel prepare and 29s worker-kill
+      // backstop are serialized; all other actions stay bounded at 15s.
+      let upstream: Response;
+      try {
+        upstream = await proxyToDaemon(owner, `/api/sessions/${sid}/${op}`, {
+          method: 'POST',
+          signal: AbortSignal.timeout(dashboardSessionActionTimeoutMs(op)),
+        });
+      } catch (err: any) {
+        const timedOut = err?.name === 'TimeoutError' || err?.name === 'AbortError';
+        return jsonRes(res, timedOut ? 504 : 502, {
+          ok: false,
+          error: timedOut ? 'daemon_timeout' : (err?.message ?? String(err)),
+        });
+      }
       res.writeHead(upstream.status, { 'content-type': 'application/json' });
       res.end(await upstream.text());
       return;
@@ -5877,6 +5896,9 @@ listenWithProbe({
     logger.warn(`[dashboard] Failed to persist port to ${PORT_PATH}: ${(e as Error).message}`);
   }
   logger.info(`[dashboard] listening on ${config.dashboard.host}:${port}`);
+  // Reclaim any `.trash-*` skill trees left by an interrupted background unlink
+  // (crash/restart mid-delete). Best-effort and fire-and-forget.
+  sweepStoreTrash();
   startPlatformTunnelIfBound();
 }).catch((err) => {
   logger.error(`[dashboard] could not bind near ${config.dashboard.host}:${config.dashboard.port} after probing — set BOTMUX_DASHBOARD_PORT to a free port. ${(err as Error).message}`);

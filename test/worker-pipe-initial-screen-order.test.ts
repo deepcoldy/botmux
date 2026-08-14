@@ -39,7 +39,10 @@ describe('worker pipe initial screen ordering', () => {
     );
     const localCloseIdx = closeCase.indexOf('// Local close destroys');
     const setCloseIdx = closeCase.lastIndexOf('closeRequested = true;', localCloseIdx);
-    const ackIdx = closeCase.lastIndexOf("send({ type: 'session_close_ready', sessionId });", localCloseIdx);
+    // The ACK is flushed (sendAndFlush), not fire-and-forget send(): a queued
+    // send() is dropped when process.exit(0) wedges in node-pty's native exit
+    // teardown, stranding /close behind the daemon's 7s SIGKILL backstop.
+    const ackIdx = closeCase.lastIndexOf("await sendAndFlush({ type: 'session_close_ready', sessionId });", localCloseIdx);
     const stopBridgeIdx = closeCase.lastIndexOf('stopBridgeWatcher();', localCloseIdx);
     const teardownIdx = closeCase.indexOf('backend?.destroySession?.();', localCloseIdx);
     const clearIdx = closeCase.indexOf('clearSendMarkers();', localCloseIdx);

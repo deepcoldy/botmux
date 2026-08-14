@@ -17066,7 +17066,17 @@ process.on('message', async (raw: unknown) => {
       }
 
       closeRequested = true;
-      send({ type: 'session_close_ready', sessionId });
+      // This ACK is what resolves the daemon's close fence (worker-pool
+      // resolveCloseFence) so `/close` can return. It MUST be flushed: a plain
+      // send() only queues on process.send's async IPC buffer, and the fully
+      // synchronous teardown + process.exit(0) below never yield the event loop
+      // to drain it. Worse, process.exit(0) can wedge in node-pty's native
+      // reader-thread join whenever a web-terminal client PTY was attached — so
+      // the queued ACK would be lost entirely and the fence would only resolve
+      // on the daemon's 7s SIGKILL backstop (the ~7s dashboard/card close stall).
+      // closeRequested already fences bridge-marker reads, so ACKing before
+      // teardown stays safe; sendAndFlush yields so the ACK truly departs.
+      await sendAndFlush({ type: 'session_close_ready', sessionId });
       stopScreenshotLoop();
       stopBridgeWatcher();
       stopCodexBridge();
@@ -17246,7 +17256,11 @@ process.on('message', async (raw: unknown) => {
       lastAbortedCloseRequestId = null;
       backend?.commitDestroySession?.();
       closeRequested = true;
-      send({ type: 'session_close_ready', sessionId });
+      // Flush the fence-resolving ACK before the synchronous teardown +
+      // process.exit(0); see the local-close case for the node-pty exit-wedge
+      // rationale (a queued send() would be dropped and strand `/close` behind
+      // the daemon's 7s SIGKILL backstop).
+      await sendAndFlush({ type: 'session_close_ready', sessionId });
       stopScreenshotLoop();
       stopBridgeWatcher();
       stopCodexBridge();
