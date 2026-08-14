@@ -305,9 +305,9 @@ describe('live-only observer screen rebase', () => {
 
   it('shares update and trust dialog handling with incremental PTY output', () => {
     const helperStart = workerSource.indexOf('function handleVisibleStartupInteraction(');
-    // PR #597 moved codex-app OFF terminal OSC; the comment after this helper now
-    // reads "// Mira/Mir still send terminal OSC" (was "// Codex App runner sends").
-    const helperEnd = workerSource.indexOf('// Mira/Mir still send terminal OSC', helperStart);
+    // Use the next stable declaration as the end delimiter (not a comment,
+    // which changes when runner CLIs are added to the OSC set).
+    const helperEnd = workerSource.indexOf('const APP_RUNNER_OSC_CLI_IDS', helperStart);
     const helper = workerSource.slice(helperStart, helperEnd);
     const ptyStart = workerSource.indexOf('function onPtyData(');
     const ptyEnd = workerSource.indexOf('function onBackendScreenResync(', ptyStart);
