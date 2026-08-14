@@ -1,8 +1,8 @@
 # 接入 DeepSeek Harness（dsh）
 
-botmux 的 dsh 适配器把飞书机器人接到 deepseek-harness：会话由 dsh 的 agent 组合驱动，模型调用走组合里的 `llm-deepseek`。适配器在 PR #858 加入，先用 dashboard 确认 CLI 下拉里有 **DeepSeek Harness**——没有就是 botmux 版本太旧，升级再说。
+botmux 的 dsh 适配器把飞书机器人接到 deepseek-harness：会话由 dsh 的 agent 组合驱动，模型调用走组合里的 `llm-deepseek`。需要包含 dsh 适配器的 botmux 版本——dashboard 的 CLI 下拉里能看到 **DeepSeek Harness** 即说明版本满足；看不到说明版本过旧，先升级。
 
-> 最反直觉的一点先放前面：**dsh 的凭据不读 `~/.dsh`**。`settings.yaml`、`.credentials.yaml` 里配了也不生效，key 只能靠环境变量进进程。第一次接入基本都卡在这，详见[配置凭据](#配置凭据)。
+> 最反直觉的一点先放前面：**dsh 的凭据不读 `~/.dsh`**。`settings.yaml`、`.credentials.yaml` 里配了也不生效，key 只能靠环境变量进进程。第一次接入最容易在这里卡住，详见[配置凭据](#配置凭据)。
 
 ## 跑起来
 
@@ -18,11 +18,11 @@ pip install deepseek-harness-sdk   # 会带上 deepseek-harness-runtime-bin 平�
 
 然后 dashboard → 机器人 →「Agent 配置」→ CLI 选 **DeepSeek Harness**（`cliId: "dsh"`），填这几个：
 
-- `model`：默认 `deepseek-v4-flash`，想要更强就选 `deepseek-v4-pro`
+- `model`：默认 `deepseek-v4-flash`，需要更强可选 `deepseek-v4-pro`
 - `workingDir`：会话工作目录
-- `provider`：别动。runner 固定走 `deepseek-official` 路由；想改这条路由的 key / baseURL，只能通过环境变量和组合配置（见下），换不了其它路由
+- `provider`：无需配置。runner 固定走 `deepseek-official` 路由；想改这条路由的 key / baseURL，只能通过环境变量和组合配置（见下），换不了其它路由
 
-key 配好（下一节）就能 @机器人 开聊。报错先翻文末[排错速查](#排错速查)。
+key 按下一节配好后，@机器人 发消息即可。报错对照文末[排错速查](#排错速查)。
 
 ## 配置凭据
 
@@ -46,13 +46,13 @@ dsh 在 botmux 里的凭据链路和单独用 dsh 时不一样。botmux 的组�
 - **per-bot env**：`bots.json` 的 `env` 字段，或 dashboard 机器人配置页的「运行时环境变量」。按会话注入，新会话生效，不影响别的机器人。
 - **daemon 环境**：export 之后重启 daemon。注意 pm2 只保留首次启动时捕获的环境，改过之后要 `pm2 restart --update-env`（或者 delete + start）才生效，只 `botmux restart` 不行。
 
-per-bot env 在沙箱模式下偶尔透传不进去（这块实现上比较保守），遇到就退回 daemon 环境。
+per-bot env 在沙箱模式下偶尔透传不进去，遇到这种情况退回 daemon 环境即可。
 
 ### 自定义组合（可选）
 
 runner 每次启动会把内置的默认组合**覆写**到 `~/.botmux/dsh/cordis.yml`——直接改这个文件没用，改完下次启动就被覆盖。要自定义，设置 `DSH_CORDIS_CONFIG=<绝对路径>`，runner 优先读这个文件。
 
-默认组合长这样，需要改路由时照着抄、改 `llm-deepseek` 那一段就行。下面是走 zen/go 网关的完整示例：
+默认组合的完整内容如下；需要改路由时复制一份，只调整 `llm-deepseek` 那一段即可。下面是走 zen/go 网关的示例：
 
 ```yaml
 - id: sdk-jsonrpc-server
