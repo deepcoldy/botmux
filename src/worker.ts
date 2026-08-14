@@ -15711,7 +15711,7 @@ if(isTouch&&hasToken){(function(){
   var mode=BUFFER;
 
   // ── grapheme-aware edit-sequence mirror (from woof mobile_live_input.js) ──
-  var CL='\x1b[D',CR='\x1b[C',BS='\x7f';
+  var CL='\\x1b[D',CR='\\x1b[C',BS='\\x7f';
   function graphs(s){s=String(s||'');
     if(typeof Intl!=='undefined'&&typeof Intl.Segmenter==='function'){
       return Array.from(new Intl.Segmenter(undefined,{granularity:'grapheme'}).segment(s),function(p){return p.segment});}
@@ -15740,22 +15740,22 @@ if(isTouch&&hasToken){(function(){
 
   function sendBuffered(appendEnter){
     var text=ta.value;
-    var payload=appendEnter?text+'\n':text;
+    var payload=appendEnter?text+'\\n':text;
     if(!payload)return;
-    sendInput(payload.replace(/\x1b/g,''));
+    sendInput(payload.replace(/\\x1b/g,''));
     ta.value='';resizeTa();
     if(mode===LIVE){mirror.sent=mirror.held='';}
     showKeyboard();}
   function sendLiveCommit(appendEnter){
     var seq=mirrorCommit();
     if(seq)sendInput(seq);
-    if(appendEnter)sendInput('\r');
+    if(appendEnter)sendInput('\\r');
     ta.value='';resizeTa();
     showKeyboard();}
   function submit(){if(mode===LIVE)sendLiveCommit(true);else sendBuffered(true);}
 
   // shortcut keys row
-  var sk={ctrlc:'\x03',esc:'\x1b',tab:'\t',ctrlD:'\x04'};
+  var sk={ctrlc:'\\x03',esc:'\\x1b',tab:'\\t',ctrlD:'\\x04'};
   var keyBtns=document.querySelectorAll('#mobile-bar-keys button');
   for(var i=0;i<keyBtns.length;i++){(function(btn){
     btn.addEventListener('click',function(){btn.blur();
@@ -15770,9 +15770,9 @@ if(isTouch&&hasToken){(function(){
     if(mode===LIVE){mirror.sent=mirror.held='';hint.textContent='实时输入 · 点击显示键盘';}
     showKeyboard();});
 
-  upBtn.addEventListener('click',function(){upBtn.blur();if(mode===LIVE){var s=mirrorCommit();if(s)sendInput(s);ta.value='';}sendInput('\x1b[A');});
-  downBtn.addEventListener('click',function(){downBtn.blur();if(mode===LIVE){var s=mirrorCommit();if(s)sendInput(s);ta.value='';}sendInput('\x1b[B');});
-  bsBtn.addEventListener('click',function(){bsBtn.blur();if(mode===LIVE){var s=mirrorCommit();if(s)sendInput(s);ta.value='';}sendInput('\x7f');});
+  upBtn.addEventListener('click',function(){upBtn.blur();if(mode===LIVE){var s=mirrorCommit();if(s)sendInput(s);ta.value='';}sendInput('\\x1b[A');});
+  downBtn.addEventListener('click',function(){downBtn.blur();if(mode===LIVE){var s=mirrorCommit();if(s)sendInput(s);ta.value='';}sendInput('\\x1b[B');});
+  bsBtn.addEventListener('click',function(){bsBtn.blur();if(mode===LIVE){var s=mirrorCommit();if(s)sendInput(s);ta.value='';}sendInput('\\x7f');});
   enterBtn.addEventListener('click',function(){enterBtn.blur();submit();});
   bar.addEventListener('submit',function(e){e.preventDefault();submit();});
 
@@ -15787,7 +15787,7 @@ if(isTouch&&hasToken){(function(){
     if(mode===LIVE&&!mirror.composing&&!e.isComposing&&['Tab','Escape','ArrowUp','ArrowDown'].indexOf(e.key)>=0){
       e.preventDefault();
       var s=mirrorCommit();if(s)sendInput(s);ta.value='';
-      sendInput({Tab:'\t',Escape:'\x1b',ArrowUp:'\x1b[A',ArrowDown:'\x1b[B'}[e.key]);return;}
+      sendInput({Tab:'\\t',Escape:'\\x1b',ArrowUp:'\\x1b[A',ArrowDown:'\\x1b[B'}[e.key]);return;}
     if(e.key==='Enter'&&!e.shiftKey&&!mirror.composing&&!e.isComposing){e.preventDefault();submit();}});
 
   setMode(BUFFER);resizeTa();
