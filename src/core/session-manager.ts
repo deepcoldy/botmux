@@ -1260,7 +1260,10 @@ function resolveEnvelopeInjectionMode(opts?: FollowUpOpts): 'hook' | 'inline' {
   if (!opts?.cliId) return 'inline';
   // 远端后端（riff 等）没有本地 Claude hook 进程，sidecar 写了没人读，
   // 必须用会话冻结的 backendType（不是当前 bot 配置，那是 next-session 生效）。
-  if (opts.sessionBackendType === 'riff') return 'inline';
+  // 只有确知在本地跑 CLI 的后端才允许 hook 模式（白名单）。未来新增远端后端
+  // 时默认 inline，不会静默丢 reminder（review hardening：黑名单会漏）。
+  const LOCAL_BACKENDS = new Set(['pty', 'tmux', 'herdr', 'zellij', 'zmx']);
+  if (opts.sessionBackendType && !LOCAL_BACKENDS.has(opts.sessionBackendType)) return 'inline';
   let adapter: CliAdapter;
   try {
     adapter = createCliAdapterSync(opts.cliId, opts.cliPathOverride);

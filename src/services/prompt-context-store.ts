@@ -82,8 +82,12 @@ export function writePromptContext(sessionId: string, ptyText: string, envelope:
  * 未命中/损坏/不可读 → undefined。
  */
 export function readPromptContext(sessionId: string, prompt: string): string | undefined {
-  // inline 模式的 prompt 已含 reminder，不注入（auto→off 切换后 hook 仍触发时防双注入）
-  if (prompt.includes('<botmux_reminder>')) return undefined;
+  // inline 检测：只查 <user_message> 之前的文本。inline 模式的 reminder 在
+  // user_message 之前；hook 模式的用户正文在标签内，即使包含字面
+  // <botmux_reminder> 也不应误判为 inline（review P3：用户正文可伪造检测信号）。
+  const userMessageIdx = prompt.indexOf('<user_message>');
+  const beforeUserMessage = userMessageIdx >= 0 ? prompt.slice(0, userMessageIdx) : prompt;
+  if (beforeUserMessage.includes('<botmux_reminder>')) return undefined;
   try {
     const dir = sessionDir(sessionId);
     if (!existsSync(dir)) return undefined;

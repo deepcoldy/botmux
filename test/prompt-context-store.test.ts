@@ -56,13 +56,20 @@ describe('prompt-context-store', () => {
     expect(readPromptContext('别的session', '内容')).toBeUndefined();
   });
 
-  it('inline 检测：prompt 含 <botmux_reminder> 时不注入（防 auto→off 双注入）', () => {
+  it('inline 检测：<user_message> 之前有 <botmux_reminder> 时不注入', () => {
     writePromptContext('sess-inline', '<user_message>\n你好\n</user_message>', '<botmux_reminder>隐藏</botmux_reminder>');
-    // inline 模式的 prompt 已含 reminder 标签
+    // inline 模式的 prompt：reminder 在 user_message 之前
     const inlinePrompt = '<botmux_reminder>正文提醒</botmux_reminder>\n\n<user_message>\n你好\n</user_message>';
     expect(readPromptContext('sess-inline', inlinePrompt)).toBeUndefined();
     // sidecar 未被消费（inline 检测在匹配之前）
     expect(readPromptContext('sess-inline', '<user_message>\n你好\n</user_message>')).toBe('<botmux_reminder>隐藏</botmux_reminder>');
+  });
+
+  it('inline 检测：用户正文含 <botmux_reminder> 不误判（P3）', () => {
+    writePromptContext('sess-p3', '<user_message>\n请帮我处理 <botmux_reminder> 标签\n</user_message>', '<botmux_reminder>隐藏</botmux_reminder>');
+    // 用户正文里有 <botmux_reminder>，但在 <user_message> 之后，不应误判为 inline
+    const userContent = '<user_message>\n请帮我处理 <botmux_reminder> 标签\n</user_message>';
+    expect(readPromptContext('sess-p3', userContent)).toBe('<botmux_reminder>隐藏</botmux_reminder>');
   });
 
   it('前缀兜底：尾部被 paste 污染（软换行变字面量）仍能命中', () => {

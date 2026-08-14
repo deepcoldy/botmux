@@ -224,12 +224,17 @@ describe('buildFollowUpCliInput — hook 注入模式', () => {
       config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code', envelopeInjection: 'auto' as const, sandbox: true, backendType: 'riff' as const },
     });
     preflightMock.mockClear();
-    const result = buildFollowUpCliInput('帮我修个 bug', SESSION_ID, followUpOpts());
-    expect(result.content).not.toContain('<botmux_reminder>');
-    expect(preflightMock).toHaveBeenCalledTimes(1);
-    const checkedPath = preflightMock.mock.calls[0][0] as string;
-    // 全局路径（~/.claude/settings.json），不是 BOT_HOME
-    expect(checkedPath).not.toContain('bots/');
-    expect(checkedPath).toContain('.claude');
+    const result = buildFollowUpCliInput('帮我修个 bug', SESSION_ID, followUpOpts({ sessionBackendType: 'riff' as const }));
+    expect(result.content).toContain('<botmux_reminder>');
+    expect(readPromptContext(SESSION_ID, result.content)).toBeUndefined();
+  });
+
+  it('未知后端类型（白名单外）：强制 inline（hardening）', () => {
+    getBotMock.mockReturnValue({
+      config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code', envelopeInjection: 'auto' as const },
+    });
+    const result = buildFollowUpCliInput('帮我修个 bug', SESSION_ID, followUpOpts({ sessionBackendType: 'future-remote' as any }));
+    expect(result.content).toContain('<botmux_reminder>');
+    expect(readPromptContext(SESSION_ID, result.content)).toBeUndefined();
   });
 });
