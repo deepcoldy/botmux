@@ -5,7 +5,7 @@
  */
 import { existsSync, statSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
-import { basename, join, resolve } from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
 import { expandHome } from './working-dir.js';
 import { config } from '../config.js';
 import * as sessionStore from '../services/session-store.js';
@@ -14,6 +14,8 @@ import { downloadMessageResource, listChatBotMembers, UserTokenMissingError } fr
 import { logger } from '../utils/logger.js';
 import { forkWorker, sendWorkerInput, promoteQueuedActivationTail, forkAdoptWorker, adoptSandboxBlocked, killStalePids, sweepDeadPidMarkers, getCurrentCliVersion, restoreUsageLimitRuntimeState, setActiveSessionSafe, setActiveSessionIfActive, isDisposableCommandScratch, isRelayableRealSession, closeSession, getActiveSessionsRegistry, suspendWorker, withActiveSessionKeyLock, isSessionTransferring, deferUntilSessionTransferSettled } from './worker-pool.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
+import type { CliAdapter } from '../adapters/cli/types.js';
+import { botHomePath } from '../adapters/cli/read-isolation.js';
 import { buildBotmuxShellHints } from '../adapters/cli/shared-hints.js';
 import {
   resolveSkillInjectionModeForApp,
@@ -1227,7 +1229,8 @@ const HOOK_ENVELOPE_MAX_CHARS = 8000;
  * 判定该 follow-up 是否走 hook 注入模式（#794 P1 方向 B）。四重条件全部满足：
  *  1. 适配器支持不可见 system-reminder 注入（目前仅 claude-code）；
  *  2. per-bot 开关 envelopeInjection=auto（默认 off）；
- *  3. preflight：botmux 的 UserPromptSubmit hook 已装进 CLI 实际读的 settings；
+ *  3. preflight：botmux 的 UserPromptSubmit hook 已装进 **CLI 实际读取的** settings
+ *     （read-isolation 下是 per-bot BOT_HOME 那份，不是全局）；
  *  4. （在 buildFollowUpCliInput 里）envelope 不超 8k。
  * 任一不满足 → inline（现状字节不变）。
  */
@@ -1235,17 +1238,46 @@ function resolveEnvelopeInjectionMode(
   opts?: { cliId?: CliId; cliPathOverride?: string; larkAppId?: string },
 ): 'hook' | 'inline' {
   if (!opts?.cliId) return 'inline';
-  let adapter;
+  let adapter: CliAdapter;
   try {
     adapter = createCliAdapterSync(opts.cliId, opts.cliPathOverride);
   } catch { return 'inline'; }
   if (!adapter.supportsInvisiblePromptHook || !adapter.hookInstall?.userPromptSubmitCommand) return 'inline';
   if (!opts.larkAppId) return 'inline';
+  let botConfig: BotConfig;
   try {
-    if (getBot(opts.larkAppId).config.envelopeInjection !== 'auto') return 'inline';
+    botConfig = getBot(opts.larkAppId).config;
   } catch { return 'inline'; }
-  if (!hasInstalledPromptHookCached(adapter.hookInstall)) return 'inline';
+  if (botConfig.envelopeInjection !== 'auto') return 'inline';
+  const effectivePath = effectivePromptHookConfigPath(adapter, botConfig, opts.larkAppId);
+  if (!effectivePath || !hasInstalledPromptHookCached(effectivePath)) return 'inline';
   return 'hook';
+}
+
+/**
+ * 与 worker 的 willRedirectCliData 同条件，算出 CLI 实际读取的 Claude settings 路径。
+ * read-isolation（sandbox + supportsReadIsolation + 无 wrapperCli）下，CLI 经
+ * CLAUDE_CONFIG_DIR 读 per-bot `<BOT_HOME>/claude/settings.json`；preflight 必须查
+ * 这份而不是全局——per-bot 安装是 best-effort（provisionIsolatedBotHome 吞异常），
+ * 查全局会把安装失败误判为已装，导致该 session 每轮系统性丢 reminder。
+ */
+function effectivePromptHookConfigPath(
+  adapter: CliAdapter,
+  botConfig: BotConfig,
+  larkAppId: string,
+): string | undefined {
+  const base = adapter.hookInstall?.configPath;
+  if (!base) return undefined;
+  const sandboxRequested = botConfig.sandbox === true
+    || botConfig.readIsolation === true
+    || process.env.BOTMUX_SANDBOX === '1';
+  const willRedirect = sandboxRequested
+    && adapter.supportsReadIsolation === true
+    && !botConfig.wrapperCli
+    && !!config.session.dataDir;
+  if (!willRedirect) return base;
+  const botmuxHome = dirname(config.session.dataDir);
+  return join(botHomePath(botmuxHome, larkAppId), 'claude', 'settings.json');
 }
 
 /** Follow-up counterpart of buildNewTopicCliInput. */

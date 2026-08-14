@@ -11900,9 +11900,16 @@ async function cmdUserPromptHook(): Promise<void> {
     const { readPromptContext } = await import('./services/prompt-context-store.js');
     const envelope = readPromptContext(sessionId, prompt);
     if (envelope) {
-      process.stdout.write(JSON.stringify({
+      const payload = JSON.stringify({
         hookSpecificOutput: { hookEventName: 'UserPromptSubmit', additionalContext: envelope },
-      }));
+      });
+      // stdout.write 对 pipe 是异步的：直接 process.exit 可能截断（8k 远小于
+      // 64k pipe buffer，几乎不会中，但中了就是 reminder 丢失）。写完再退出，
+      // 并留 1s 兜底防 callback 不触发。
+      process.stdout.write(payload, () => process.exit(0));
+      const timer = setTimeout(() => process.exit(0), 1000);
+      if (typeof timer.unref === 'function') timer.unref();
+      return;
     }
   } catch { /* sidecar 读失败 → no-op */ }
   process.exit(0);

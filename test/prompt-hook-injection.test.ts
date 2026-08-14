@@ -84,7 +84,7 @@ vi.mock('../src/core/worker-pool.js', () => ({
   getCurrentCliVersion: vi.fn(() => '1.0.0'),
 }));
 
-const preflightMock = vi.fn(() => true);
+const preflightMock = vi.fn((..._args: unknown[]) => true);
 vi.mock('../src/adapters/hook-installer.js', () => ({
   hasInstalledPromptHookCached: (...args: unknown[]) => preflightMock(...args),
 }));
@@ -178,5 +178,32 @@ describe('buildFollowUpCliInput — hook 注入模式', () => {
     const envelope = readPromptContext(SESSION_ID, result.content);
     expect(envelope).toContain('<botmux_reminder>');
     expect(envelope).not.toContain('<whiteboard');
+  });
+
+  it('read-isolation（sandbox）下 preflight 查 per-bot BOT_HOME 的 settings，不是全局', () => {
+    // 沙盒 + supportsReadIsolation 的 bot，CLI 经 CLAUDE_CONFIG_DIR 读
+    // <BOT_HOME>/claude/settings.json；preflight 必须查这份，否则 per-bot
+    // 安装失败时会误判已装 → 每轮系统性丢 reminder。
+    getBotMock.mockReturnValue({
+      config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code', envelopeInjection: 'auto' as const, sandbox: true },
+    });
+    preflightMock.mockClear();
+    const result = buildFollowUpCliInput('帮我修个 bug', SESSION_ID, followUpOpts());
+    expect(result.content).not.toContain('<botmux_reminder>');
+    expect(preflightMock).toHaveBeenCalledTimes(1);
+    const checkedPath = preflightMock.mock.calls[0][0] as string;
+    // config.session.dataDir = /tmp/test-sessions → BOTMUX_HOME = /tmp → BOT_HOME = /tmp/bots/app_test
+    expect(checkedPath).toBe('/tmp/bots/app_test/claude/settings.json');
+    expect(checkedPath).not.toContain('.claude');
+  });
+
+  it('read-isolation 下 per-bot 未装 hook（preflight false）→ 回退 inline', () => {
+    getBotMock.mockReturnValue({
+      config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code', envelopeInjection: 'auto' as const, sandbox: true },
+    });
+    preflightMock.mockReturnValue(false);
+    const result = buildFollowUpCliInput('帮我修个 bug', SESSION_ID, followUpOpts());
+    expect(result.content).toContain('<botmux_reminder>');
+    expect(readPromptContext(SESSION_ID, result.content)).toBeUndefined();
   });
 });

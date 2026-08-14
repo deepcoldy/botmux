@@ -24,7 +24,7 @@ afterEach(() => {
   else process.env.SESSION_DATA_DIR = prevDataDir;
 });
 
-const { writePromptContext, readPromptContext, fingerprintPromptText } = await import('../src/services/prompt-context-store.js');
+const { writePromptContext, readPromptContext, fingerprintPromptText, removePromptContextDir } = await import('../src/services/prompt-context-store.js');
 
 describe('prompt-context-store', () => {
   it('写入后按相同文本读回 envelope', () => {
@@ -69,6 +69,34 @@ describe('prompt-context-store', () => {
     const files = readdirSync(join(tmpRoot, 'prompt-ctx', 'sess-5'));
     expect(files).toHaveLength(1);
     expect(readPromptContext('sess-5', '内容')).toBe('ENV-2');
+  });
+
+  it('指纹只取前缀：尾部被 paste 模式污染（软换行变字面量）仍能命中', () => {
+    // 模拟 claude-code writeInput 的 paste 模式事故：首行是长行（触发 paste 模式），
+    // 之后的 \n 软换行退化成字面 \r。hook 看到的 prompt 尾部与 daemon 的 ptyText
+    // 不一致，但首行（含 <user_message> 骨架）完好，64 字符前缀仍匹配。
+    const longLine = '这是一行足够长的内容，用来模拟把 Ink 顶进 paste 模式的那一行，超过六十四个字符';
+    const clean = `<user_message>\n${longLine}\n第二行\n第三行\n</user_message>`;
+    writePromptContext('sess-paste', clean, 'ENV');
+    // hook 侧：首行之后的换行变成字面量 \r（两字符），尾部全脏
+    const corrupted = `<user_message>\n${longLine}\\r第二行\\r第三行\\r</user_message>`;
+    expect(readPromptContext('sess-paste', corrupted)).toBe('ENV');
+    // 前缀本身不同（用户改了开头）→ 不命中
+    expect(readPromptContext('sess-paste', '<user_message>\n完全不同的开头\n</user_message>')).toBeUndefined();
+  });
+
+  it('removePromptContextDir 删除整个 session 的 sidecar', () => {
+    writePromptContext('sess-rm', '内容1', 'ENV-1');
+    writePromptContext('sess-rm', '内容2', 'ENV-2');
+    expect(readdirSync(join(tmpRoot, 'prompt-ctx', 'sess-rm'))).toHaveLength(2);
+    removePromptContextDir('sess-rm');
+    expect(existsSync(join(tmpRoot, 'prompt-ctx', 'sess-rm'))).toBe(false);
+    // 幂等：再删不抛
+    removePromptContextDir('sess-rm');
+    // 不影响别的 session
+    writePromptContext('sess-other', 'x', 'Y');
+    removePromptContextDir('sess-rm');
+    expect(readPromptContext('sess-other', 'x')).toBe('Y');
   });
 
   it('淘汰：超过 100 个文件时最旧的被 prune', () => {

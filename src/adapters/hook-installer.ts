@@ -265,27 +265,33 @@ export function hasInstalledSessionReadyHook(hookInstall: HookInstallConfig): bo
 export function hasInstalledPromptHook(hookInstall: HookInstallConfig): boolean {
   if (!hookInstall.userPromptSubmitCommand) return false;
   if (hookInstall.format !== 'claude-settings') return false;
-  const settings = readJsonFile<ClaudeSettings>(expandHome(hookInstall.configPath));
+  return hasInstalledPromptHookAtPath(hookInstall.configPath);
+}
+
+/** 按实际 settings 路径做 preflight。read-isolation 下 CLI 经 CLAUDE_CONFIG_DIR
+ *  实际读的是 per-bot BOT_HOME/claude/settings.json，不是全局那份——调用方需传入
+ *  effective 路径（与 worker 的 effectiveReadyHookInstall 改写同逻辑）。 */
+export function hasInstalledPromptHookAtPath(configPath: string): boolean {
+  const settings = readJsonFile<ClaudeSettings>(expandHome(configPath));
   const groups = settings?.hooks?.UserPromptSubmit;
   return Array.isArray(groups) && groups.some((group) => isBotmuxPromptHookGroup(group));
 }
 
 /**
  * 带 60s TTL 缓存的 preflight——每个 follow-up turn 都会判定一次模式，读文件虽便宜
- * 也没必要每 turn 读。缓存按 configPath 键控；安装发生在 daemon 启动时
- * （ensureCliSkills），60s 内的滞后可接受（最坏情况是新装 hook 后 60s 内仍走 inline）。
+ * 也没必要每 turn 读。缓存按 configPath 键控（全局 vs per-bot 自然分键）；安装发生在
+ * daemon 启动时（ensureCliSkills），60s 内的滞后可接受（最坏情况是新装 hook 后
+ * 60s 内仍走 inline）。
  */
 const promptHookPreflightCache = new Map<string, { at: number; ok: boolean }>();
 const PROMPT_HOOK_PREFLIGHT_TTL_MS = 60_000;
 
-export function hasInstalledPromptHookCached(hookInstall: HookInstallConfig): boolean {
-  if (!hookInstall.userPromptSubmitCommand) return false;
-  const key = hookInstall.configPath;
+export function hasInstalledPromptHookCached(configPath: string): boolean {
   const now = Date.now();
-  const cached = promptHookPreflightCache.get(key);
+  const cached = promptHookPreflightCache.get(configPath);
   if (cached && now - cached.at < PROMPT_HOOK_PREFLIGHT_TTL_MS) return cached.ok;
-  const ok = hasInstalledPromptHook(hookInstall);
-  promptHookPreflightCache.set(key, { at: now, ok });
+  const ok = hasInstalledPromptHookAtPath(configPath);
+  promptHookPreflightCache.set(configPath, { at: now, ok });
   return ok;
 }
 

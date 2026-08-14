@@ -17,7 +17,7 @@
  * （type-ahead 多轮排队时按内容取交集，而非按时间取最新）。
  */
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { config } from '../config.js';
 import { normaliseForFingerprint } from './claude-transcript.js';
@@ -26,14 +26,28 @@ import { normaliseForFingerprint } from './claude-transcript.js';
 const SIDECAR_MAX_FILES = 100;
 /** sidecar 最长保留 24h（resume 后旧轮的 hook 不会重放，只有新轮才触发）。 */
 const SIDECAR_TTL_MS = 24 * 60 * 60 * 1000;
+/**
+ * 指纹只取正常化文本的前缀，不取全串：
+ * writeInput 逐行 send-keys 时，长行会把 Ink 顶进 paste 模式，此后 `\`+Enter
+ * 软换行退化成字面量（见 claude-code.ts writeInput 注释），Claude 记到 prompt 里
+ * 的尾部文本与 daemon 写入的 ptyText 不一致。全串 sha256 会因此失配 → sidecar
+ * miss → 该轮 reminder 静默丢失。
+ *
+ * 前缀策略：paste 模式只污染「触发它的那行之后」的软换行，首行（含 <user_message>
+ * 骨架）始终完好。30 字符前缀与久经考验的 makeSubmitFingerprint 同长，始终落在
+ * 完好区内（首行短则前缀跨入第二行内容，污染在第二行之后的换行，仍完好）。
+ * 同会话内前缀碰撞是 benign 的：envelope（reminder/whiteboard）是会话级稳定的。
+ */
+const FINGERPRINT_PREFIX_LEN = 30;
 
 function sessionDir(sessionId: string): string {
   return join(config.session.dataDir, 'prompt-ctx', sessionId);
 }
 
-/** 与 hook 子进程共享的指纹算法：空白折叠后全量 sha256（hex）。 */
+/** 与 hook 子进程共享的指纹算法：空白折叠后取前缀 sha256（hex）。 */
 export function fingerprintPromptText(text: string): string {
-  return createHash('sha256').update(normaliseForFingerprint(text), 'utf8').digest('hex');
+  const prefix = normaliseForFingerprint(text).slice(0, FINGERPRINT_PREFIX_LEN);
+  return createHash('sha256').update(prefix, 'utf8').digest('hex');
 }
 
 /**
@@ -78,5 +92,15 @@ function pruneSidecars(dir: string): void {
         try { unlinkSync(join(dir, entry.f)); } catch { /* */ }
       }
     }
+  } catch { /* */ }
+}
+
+/**
+ * 会话关闭时删除整个 sidecar 目录（与 turn-sends marker 同生命周期）。
+ * best-effort：目录不存在/权限问题都静默，避免影响关闭主路径。
+ */
+export function removePromptContextDir(sessionId: string): void {
+  try {
+    rmSync(sessionDir(sessionId), { recursive: true, force: true });
   } catch { /* */ }
 }
