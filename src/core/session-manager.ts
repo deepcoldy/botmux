@@ -1263,7 +1263,10 @@ function resolveEnvelopeInjectionMode(opts?: FollowUpOpts): 'hook' | 'inline' {
   // 只有确知在本地跑 CLI 的后端才允许 hook 模式（白名单）。未来新增远端后端
   // 时默认 inline，不会静默丢 reminder（review hardening：黑名单会漏）。
   const LOCAL_BACKENDS = new Set(['pty', 'tmux', 'herdr', 'zellij', 'zmx']);
-  if (opts.sessionBackendType && !LOCAL_BACKENDS.has(opts.sessionBackendType)) return 'inline';
+  // fail-closed（review B3）：sessionBackendType 缺失（null/undefined）时不再短路
+  // 放过，强制 inline。现网 spawn 的 reconcileRiffBackendType 已把 claude-code 钉在
+  // 本地后端，此条是防未来远端后端的硬化；所有调用点都传 ds.session.backendType。
+  if (!opts.sessionBackendType || !LOCAL_BACKENDS.has(opts.sessionBackendType)) return 'inline';
   let adapter: CliAdapter;
   try {
     adapter = createCliAdapterSync(opts.cliId, opts.cliPathOverride);

@@ -11862,12 +11862,20 @@ async function cmdSessionReady(): Promise<void> {
 // ─── botmux user-prompt-hook ─────────────────────────────────────────────────
 //
 // Claude 家族 UserPromptSubmit hook 客户端（#794 P1 方向 B）。按 stdin 里
-// `prompt` 的内容指纹，读回 daemon 在提交 user turn 前写好的 per-turn sidecar
+// `prompt` 的内容指纹，经 daemon IPC 向宿主 claim/pop 该轮的 per-turn envelope
 // （reminder/whiteboard），以 additionalContext 注入为该轮 system-reminder。
 //
-// fail-open 铁律：任何失败（env 缺失 = 非 botmux 会话、sidecar 不存在 = 用户手输
-// 或 inline 模式、JSON 损坏）都空输出 + exit 0。绝不 exit 2（会阻塞该轮 prompt），
-// 绝不抛错（Claude 对 hook 失败的兜底是放弃注入，正合预期）。
+// 为什么走 IPC 而不是直接读文件（review HIGH-1/HIGH-2）：
+// - HIGH-2：`prompt-ctx/<sid>` 在沙箱里是 read-only bind，hook 子进程在沙箱内
+//   unlink 必失败，「读后消费」形同虚设。消费（pop）改到宿主 daemon 执行。
+// - HIGH-1：同正文多轮的 envelope 各存一条，宿主按 FIFO 原子弹出，不再互相覆盖。
+//
+// 鉴权双路径（与 /close、/slash 同构）：能读 host secret（非沙箱）走 HMAC；
+// 读不到（沙箱/read-isolation）带本会话 rotating per-turn capability。
+//
+// fail-open 铁律：任何失败（env 缺失 = 非 botmux 会话、daemon 不可达、未命中 =
+// 用户手输或 inline 模式、403/404）都空输出 + exit 0。绝不 exit 2（会阻塞该轮
+// prompt），绝不抛错（Claude 对 hook 失败的兜底是放弃注入，正合预期）。
 async function cmdUserPromptHook(): Promise<void> {
   // 5s 自限时读 stdin：Claude 写完 payload 会关 stdin，正常情况下立即结束；
   // 万一上游不关管道，也不能挂住 hook（settings.json 里的 10s timeout 是第二道）。
@@ -11896,9 +11904,62 @@ async function cmdUserPromptHook(): Promise<void> {
   } catch { /* 非 JSON → no-op */ }
   if (!prompt) process.exit(0);
 
+  // inline 检测：inline 模式的 envelope 在 <user_message> 之前有
+  // <botmux_reminder>，不注入（防双注入）。收严后的检测抗 role 文案伪造
+  // <user_message> 截断（review 绕过项）。检测失败 → 继续 claim（fail-open）。
   try {
-    const { readPromptContext } = await import('./services/prompt-context-store.js');
-    const envelope = readPromptContext(sessionId, prompt);
+    const { looksLikeInlineEnvelope } = await import('./services/prompt-context-store.js');
+    if (looksLikeInlineEnvelope(prompt)) process.exit(0);
+  } catch { /* 检测不可用 → 继续 */ }
+
+  // 经 daemon IPC claim/pop。沙箱内不能直接 unlink read-only 的 sidecar，
+  // 也不能把目录改可写（会给沙箱里的模型伪造 sidecar 的能力）。
+  try {
+    const [{ fingerprintPromptText, prefixOf }] = await Promise.all([
+      import('./services/prompt-context-store.js'),
+    ]);
+    const larkAppId = process.env.BOTMUX_LARK_APP_ID;
+    let discoveredPort: number | undefined;
+    try { discoveredPort = findDaemon(larkAppId)?.ipcPort; } catch { /* masked/unreadable registry */ }
+    const ipcPort = resolveDaemonIpcPort(
+      discoveredPort,
+      process.env.BOTMUX_DAEMON_IPC_PORT,
+    );
+    if (!ipcPort) process.exit(0);
+
+    const body: Record<string, unknown> = {
+      fingerprint: fingerprintPromptText(prompt),
+      prefix: prefixOf(prompt),
+    };
+    let hostSecret: string | undefined;
+    if (!process.env.BOTMUX_SEND_RELAY) {
+      try { hostSecret = loadDaemonIpcSecret(); } catch { /* Seatbelt/read-isolated CLI */ }
+    }
+    if (!hostSecret) {
+      const claim = readManagedOriginCapability(
+        resolveDataDir(),
+        sessionId,
+        process.env.BOTMUX_SEND_RELAY,
+        process.env.BOTMUX_ORIGIN_CHANNEL_ID,
+      );
+      if (claim) {
+        body.originCapability = claim.capability;
+        if (claim.turnId) body.originTurnId = claim.turnId;
+        if (claim.dispatchAttempt !== undefined) body.originDispatchAttempt = claim.dispatchAttempt;
+      }
+    }
+    const init = {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    } satisfies RequestInit;
+    const path = `/api/sessions/${encodeURIComponent(sessionId)}/prompt-ctx/claim`;
+    const res = hostSecret
+      ? await fetchDaemonIpc(ipcPort, path, init, hostSecret)
+      : await fetch(`http://127.0.0.1:${ipcPort}${path}`, init);
+    if (res.status !== 200) process.exit(0);
+    const data = await res.json() as { envelope?: unknown };
+    const envelope = typeof data?.envelope === 'string' ? data.envelope : undefined;
     if (envelope) {
       const payload = JSON.stringify({
         hookSpecificOutput: { hookEventName: 'UserPromptSubmit', additionalContext: envelope },
@@ -11911,7 +11972,7 @@ async function cmdUserPromptHook(): Promise<void> {
       if (typeof timer.unref === 'function') timer.unref();
       return;
     }
-  } catch { /* sidecar 读失败 → no-op */ }
+  } catch { /* daemon 不可达 / claim 失败 → no-op */ }
   process.exit(0);
 }
 
