@@ -2937,6 +2937,64 @@ describe('PUT /api/bot-agent', () => {
     }
   });
 
+  // BEHAVIOURAL: a legacy row may OMIT cliId while still carrying a legacy
+  // cliPathOverride. The loader normalises a missing cliId to 'claude-code', so
+  // the authority snapshot must apply the SAME default — otherwise the selection
+  // looks changed, runtime/path preservation is skipped, and an old client's
+  // model-only save silently deletes the persisted path.
+  it('applies the loader default cliId so a legacy path survives a model-only save', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-agent-legacy-default-'));
+    const configPath = join(dir, 'bots.json');
+    const appId = 'test-agent-legacy-default';
+    const prevBotsConfig = process.env.BOTS_CONFIG;
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      // No cliId: historically means claude-code. Legacy path override present.
+      writeFileSync(configPath, JSON.stringify([{
+        larkAppId: appId,
+        larkAppSecret: 'secret',
+        model: 'old-model',
+        cliPathOverride: '/opt/legacy/claude',
+      }], null, 2));
+      loadBotConfigs().forEach((c: any) => registerBot(c));
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+
+      const targets: any[] = [];
+      const originalCloseHook = agentSwitchCloseHook.run;
+      agentSwitchCloseHook.run = async (...args: Parameters<typeof originalCloseHook>) => {
+        targets.push(args[1]);
+        return originalCloseHook(...args);
+      };
+      let saved: Response;
+      try {
+        // Old client: same (defaulted) selection, model only, no cliRuntime.
+        saved = await fetch(`http://127.0.0.1:${handle.port}/api/bot-agent`, {
+          method: 'PUT',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ cliId: 'claude-code', model: 'new-model' }),
+        });
+      } finally {
+        agentSwitchCloseHook.run = originalCloseHook;
+      }
+      expect(saved.status).toBe(200);
+      expect(await saved.json()).toMatchObject({ cliPathOverride: '/opt/legacy/claude' });
+
+      const stored = JSON.parse(readFileSync(configPath, 'utf-8'))[0];
+      expect(
+        stored.cliPathOverride,
+        'a model-only save on a defaulted-cliId row must not erase the legacy path',
+      ).toBe('/opt/legacy/claude');
+      for (const t of targets) {
+        expect(t.cliPathOverride).toBe('/opt/legacy/claude');
+      }
+    } finally {
+      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = prevBotsConfig;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   // BEHAVIOURAL: if the authority cannot be read, the request must FAIL CLOSED.
   // Swallowing the error and deferring to the in-transaction backstop means the
   // irreversible closes run first, so a request that is never committed still

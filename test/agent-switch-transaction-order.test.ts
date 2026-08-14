@@ -93,6 +93,27 @@ describe('agent switch — no precondition runs after the irreversible close', (
       .not.toContain('getBot(');
   });
 
+  it('normalises the raw row with the loader default instead of a local literal', () => {
+    // A raw row may omit cliId; the loader treats that as claude-code. Deriving a
+    // selection without that default made a legacy row look changed and deleted
+    // its cliPathOverride. Re-declaring the literal here would let the two drift
+    // apart again, so the shared constant must be used.
+    const registry = readFileSync(
+      new URL('../src/bot-registry.ts', import.meta.url), 'utf8');
+    expect(registry, 'the legacy default must have exactly one definition')
+      .toContain("export const LEGACY_DEFAULT_CLI_ID = 'claude-code'");
+    expect(registry, 'the loader itself must use that constant')
+      .toContain('entry.cliId ?? LEGACY_DEFAULT_CLI_ID');
+
+    const selectionAt = ipc.indexOf('const currentSelectionKey = selectionKeyForBot(');
+    expect(selectionAt, 'selection key derivation').toBeGreaterThan(0);
+    const block = ipc.slice(selectionAt, ipc.indexOf(');', selectionAt));
+    expect(block, 'the raw row must get the loader default')
+      .toContain('LEGACY_DEFAULT_CLI_ID');
+    expect(block, 'no local copy of the default literal')
+      .not.toContain("'claude-code'");
+  });
+
   it('FAILS CLOSED when the authority cannot be read', () => {
     // Swallowing the read error and deferring to the locked backstop means the
     // irreversible closes run first, so a request that never commits still tears

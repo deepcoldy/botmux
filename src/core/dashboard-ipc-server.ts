@@ -204,7 +204,7 @@ import {
   getBotName,
   type SessionRow,
 } from './dashboard-rows.js';
-import { getBotBrand, getBot, getBotOpenId, loadBotConfigs, readBotSkillPolicy, getBotTuiSlashAllow, type UsageDisplayMode, type MessageListenerConfig } from '../bot-registry.js';
+import { getBotBrand, getBot, getBotOpenId, loadBotConfigs, readBotSkillPolicy, getBotTuiSlashAllow, LEGACY_DEFAULT_CLI_ID, type UsageDisplayMode, type MessageListenerConfig } from '../bot-registry.js';
 import { normalizeKanbanColumn, normalizeKanbanPosition, normalizeSessionTitle } from './session-board.js';
 import { validateSlashInjection } from './slash-inject.js';
 import { validateRoleLibraryPath } from './role-library.js';
@@ -4003,10 +4003,17 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
     });
   }
   const runtimeFieldPresent = Object.prototype.hasOwnProperty.call(body, 'cliRuntime');
-  // A row may legitimately omit cliId (bot on the daemon default). Then there is
-  // no persisted selection to match, so the key cannot equal `key` and runtime
-  // preservation below is a no-op anyway — such a row carries no cliRuntime.
-  const currentSelectionKey = selectionKeyForBot(currentBotConfig.cliId ?? '', currentBotConfig.wrapperCli);
+  // A legacy row may OMIT cliId. That is not "no selection": parseBotConfigFile
+  // normalises it to claude-code (`entry.cliId ?? 'claude-code'`), so the bot IS
+  // on claude-code and may well carry a legacy cliPathOverride. Reading the raw
+  // row without that default made the selection look changed, which skipped the
+  // preservation branch below and silently deleted the persisted path on an old
+  // client's model-only save. The authority snapshot must therefore carry the
+  // same normalisation the loader applies.
+  const currentSelectionKey = selectionKeyForBot(
+    currentBotConfig.cliId ?? LEGACY_DEFAULT_CLI_ID,
+    currentBotConfig.wrapperCli,
+  );
   const selectionChanged = key !== currentSelectionKey;
   let nextRuntime: CliRuntimeConfig | undefined;
   let nextLegacyPath: string | undefined;
