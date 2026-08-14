@@ -11859,6 +11859,55 @@ async function cmdSessionReady(): Promise<void> {
   process.exit(0);
 }
 
+// ─── botmux user-prompt-hook ─────────────────────────────────────────────────
+//
+// Claude 家族 UserPromptSubmit hook 客户端（#794 P1 方向 B）。按 stdin 里
+// `prompt` 的内容指纹，读回 daemon 在提交 user turn 前写好的 per-turn sidecar
+// （reminder/whiteboard），以 additionalContext 注入为该轮 system-reminder。
+//
+// fail-open 铁律：任何失败（env 缺失 = 非 botmux 会话、sidecar 不存在 = 用户手输
+// 或 inline 模式、JSON 损坏）都空输出 + exit 0。绝不 exit 2（会阻塞该轮 prompt），
+// 绝不抛错（Claude 对 hook 失败的兜底是放弃注入，正合预期）。
+async function cmdUserPromptHook(): Promise<void> {
+  // 5s 自限时读 stdin：Claude 写完 payload 会关 stdin，正常情况下立即结束；
+  // 万一上游不关管道，也不能挂住 hook（settings.json 里的 10s timeout 是第二道）。
+  let payloadText = '';
+  try {
+    const chunks: Buffer[] = [];
+    let timedOut = false;
+    const timer = setTimeout(() => { timedOut = true; try { process.stdin.destroy(); } catch { /* */ } }, 5000);
+    if (typeof timer.unref === 'function') timer.unref();
+    for await (const chunk of process.stdin) {
+      if (timedOut) break;
+      chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+    }
+    clearTimeout(timer);
+    payloadText = Buffer.concat(chunks).toString('utf-8');
+  } catch { /* stdin 读不到 → no-op */ }
+
+  const sessionId = process.env.BOTMUX_SESSION_ID;
+  // env 缺失 → adopt / 非 botmux 会话 / 用户手输，静默放行。
+  if (!sessionId) process.exit(0);
+
+  let prompt: string | undefined;
+  try {
+    const p = JSON.parse(payloadText) as { prompt?: unknown };
+    if (typeof p?.prompt === 'string') prompt = p.prompt;
+  } catch { /* 非 JSON → no-op */ }
+  if (!prompt) process.exit(0);
+
+  try {
+    const { readPromptContext } = await import('./services/prompt-context-store.js');
+    const envelope = readPromptContext(sessionId, prompt);
+    if (envelope) {
+      process.stdout.write(JSON.stringify({
+        hookSpecificOutput: { hookEventName: 'UserPromptSubmit', additionalContext: envelope },
+      }));
+    }
+  } catch { /* sidecar 读失败 → no-op */ }
+  process.exit(0);
+}
+
 async function cmdBots(sub: string, rest: string[]): Promise<void> {
   process.env.SESSION_DATA_DIR ??= resolveDataDir();
 
@@ -13166,6 +13215,12 @@ switch (command) {
     // `botmux session-ready` — Claude 家族 SessionStart hook 客户端，通知 daemon
     // 已越过外层 selector；worker 再等待 hook 后的新 prompt 证据。
     await cmdSessionReady();
+    break;
+  }
+  case 'user-prompt-hook': {
+    // `botmux user-prompt-hook` — Claude 家族 UserPromptSubmit hook 客户端，
+    // 按内容指纹读回 per-turn sidecar 并注入为该轮 system-reminder（#794）。
+    await cmdUserPromptHook();
     break;
   }
   case 'workflow': {

@@ -614,6 +614,10 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
   // pre-uploaded files). The worker mkdirs it pre-spawn so it survives the
   // existence-filter and gets bound rw. Siblings' buckets stay uncovered.
   push([`${ctx.sessionDataDir}/attachments/${ctx.currentAppId}`], 'readWrite', 'internal');
+  // Own per-turn hook context（UserPromptSubmit sidecar，#794）——read-only。
+  // daemon 在每次提交 user turn 前把 reminder/whiteboard 写到这里；hook 子进程
+  // （在沙盒内）按内容指纹读回。worker 预创建目录以通过 existence-filter。
+  if (ctx.sessionId) push([`${ctx.sessionDataDir}/prompt-ctx/${ctx.sessionId}`], 'readOnly', 'internal');
   // Own per-bot lark-cli config (agent-facing lark-cli identity). Withheld from
   // a no-transport turn — it IS this bot's Feishu credential surface.
   if (larkTransport) push([`${ctx.homeDir}/.lark-cli-bots/${ctx.currentAppId}`], 'readWrite', 'internal');

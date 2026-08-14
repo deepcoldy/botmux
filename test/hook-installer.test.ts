@@ -13,6 +13,7 @@ import { tmpdir } from 'node:os';
 import {
   cleanupTraexAskHooks,
   hasInstalledSessionReadyHook,
+  hasInstalledPromptHook,
   installHook,
 } from '../src/adapters/hook-installer.js';
 
@@ -150,6 +151,80 @@ describe('installHook — claude-settings', () => {
     installHook('claude-code', { configPath, format: 'claude-settings' }, hookCommand);
     const settings = JSON.parse(readFileSync(configPath, 'utf-8'));
     expect(settings.hooks?.SessionStart).toBeUndefined();
+  });
+
+  it('(f) userPromptSubmitCommand 时写入 UserPromptSubmit hook，幂等且结构化识别', () => {
+    const promptCmd = '/usr/bin/node /path/to/cli.js user-prompt-hook';
+    const hookInstall = {
+      configPath,
+      format: 'claude-settings' as const,
+      userPromptSubmitCommand: promptCmd,
+    };
+    expect(hasInstalledPromptHook(hookInstall)).toBe(false);
+    installHook('claude-code', hookInstall, hookCommand);
+
+    let settings = JSON.parse(readFileSync(configPath, 'utf-8'));
+    let ups: any[] = settings.hooks?.UserPromptSubmit ?? [];
+    const entry = ups.find((g) => g.hooks?.some((e: any) => e.command === promptCmd));
+    expect(entry).toBeDefined();
+    // 无 matcher（对所有 prompt 生效），timeout 10s
+    expect(entry.matcher).toBeUndefined();
+    expect(entry.hooks[0].timeout).toBe(10);
+    expect(hasInstalledPromptHook(hookInstall)).toBe(true);
+
+    // 幂等：换 cli.js 绝对路径再装，应替换而非叠加
+    const promptCmd2 = '/opt/npm/lib/node_modules/botmux/dist/cli.js user-prompt-hook';
+    installHook('claude-code', { configPath, format: 'claude-settings', userPromptSubmitCommand: promptCmd2 }, hookCommand);
+    settings = JSON.parse(readFileSync(configPath, 'utf-8'));
+    ups = settings.hooks?.UserPromptSubmit ?? [];
+    const botmuxUps = ups.filter((g) => g.hooks?.some((e: any) => e.command.includes('cli.js') && e.command.trimEnd().endsWith('user-prompt-hook')));
+    expect(botmuxUps.length).toBe(1);
+    expect(botmuxUps[0].hooks[0].command).toBe(promptCmd2);
+    // 结构化识别：换路径后 preflight 仍为 true（与 hasInstalledSessionReadyHook 的精确字符串匹配不同）
+    expect(hasInstalledPromptHook({ configPath, format: 'claude-settings', userPromptSubmitCommand: promptCmd2 })).toBe(true);
+  });
+
+  it('(g) UserPromptSubmit preflight 对损坏/无关配置 fail-closed', () => {
+    mkdirSync(join(tmpDir, '.claude'), { recursive: true });
+    writeFileSync(configPath, JSON.stringify({
+      hooks: {
+        UserPromptSubmit: [
+          { matcher: 'malformed' },
+          { hooks: [{ type: 'command', command: '/usr/bin/other-tool' }] },
+        ],
+      },
+    }));
+    expect(hasInstalledPromptHook({
+      configPath,
+      format: 'claude-settings',
+      userPromptSubmitCommand: '/usr/bin/node /path/to/cli.js user-prompt-hook',
+    })).toBe(false);
+  });
+
+  it('(h) 不传 userPromptSubmitCommand 时不写 UserPromptSubmit（保持旧行为）', () => {
+    installHook('claude-code', { configPath, format: 'claude-settings' }, hookCommand);
+    const settings = JSON.parse(readFileSync(configPath, 'utf-8'));
+    expect(settings.hooks?.UserPromptSubmit).toBeUndefined();
+  });
+
+  it('(i) UserPromptSubmit 与用户自装 hook 共存（合并而非覆盖）', () => {
+    mkdirSync(join(tmpDir, '.claude'), { recursive: true });
+    writeFileSync(configPath, JSON.stringify({
+      hooks: {
+        UserPromptSubmit: [
+          { hooks: [{ type: 'command', command: '/usr/bin/my-own-hook' }] },
+        ],
+      },
+    }));
+    installHook('claude-code', {
+      configPath,
+      format: 'claude-settings',
+      userPromptSubmitCommand: '/usr/bin/node /path/to/cli.js user-prompt-hook',
+    }, hookCommand);
+    const settings = JSON.parse(readFileSync(configPath, 'utf-8'));
+    const ups: any[] = settings.hooks?.UserPromptSubmit ?? [];
+    expect(ups.some((g) => g.hooks?.some((e: any) => e.command === '/usr/bin/my-own-hook'))).toBe(true);
+    expect(ups.some((g) => g.hooks?.some((e: any) => e.command.endsWith('user-prompt-hook')))).toBe(true);
   });
 
   it('read-isolation inherits only the global Claude env map and refreshes rotated auth', () => {

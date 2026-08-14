@@ -82,6 +82,8 @@ import { beginReplyTargetTurn } from './reply-target.js';
 import { readDeferredTopicBinding, removeDeferredTopicBinding } from './deferred-topic-binding.js';
 import { escapeXmlTagLikeTokens } from '../utils/xml.js';
 import { chatAppLink, threadAppLink, normalizeBrand } from '../im/lark/lark-hosts.js';
+import { writePromptContext } from '../services/prompt-context-store.js';
+import { hasInstalledPromptHookCached } from '../adapters/hook-installer.js';
 
 export { getAttachmentsDir } from './attachment-path.js';
 
@@ -1139,12 +1141,19 @@ export function buildNewTopicCliInput(
  * Mirrors buildNewTopicPrompt structure but for subsequent messages.
  * Session ID is omitted for adopt mode and CLIs with injectsSessionContext.
  */
-export function buildFollowUpContent(
+type FollowUpBlockKey = 'sessionId' | 'role' | 'summaryMemory' | 'reminder' | 'whiteboard' | 'userMessage' | 'sender' | 'substitute' | 'senderNote' | 'attachments' | 'mentions';
+
+/**
+ * 按既有顺序构造 follow-up 的各个块。inline 模式直接 join；hook 模式
+ * （#794）把 reminder/whiteboard 挪进 sidecar，其余块照常 join 进 PTY 文本。
+ */
+function buildFollowUpBlocks(
   content: string,
   sessionId: string,
   opts?: { attachments?: LarkAttachment[]; mentions?: LarkMention[]; isAdoptMode?: boolean; cliId?: CliId; cliPathOverride?: string; locale?: Locale; sender?: ResolvedSender; larkAppId?: string; chatId?: string; whiteboardId?: string; substituteTrigger?: SubstituteTrigger; codexAppText?: string; codexAppApplicationContext?: string; codexAppMessageContext?: string },
-): string {
-  const parts: string[] = [];
+  hookMode = false,
+): Array<{ key: FollowUpBlockKey; text: string }> {
+  const blocks: Array<{ key: FollowUpBlockKey; text: string }> = [];
   const roleBlock = renderRoleContextBlock(opts?.larkAppId, opts?.chatId, { followUp: true });
   const whiteboardBlock = renderWhiteboardBlock({ whiteboardId: opts?.whiteboardId });
   const summaryMemoryBlock = renderSummaryMemoryBlock(opts?.larkAppId);
@@ -1157,9 +1166,9 @@ export function buildFollowUpContent(
   // per-turn available context, so place it right after <botmux_reminder> and
   // before <user_message> — consistent with new-topic/refork — not after the
   // user's text. Per-turn attribution (sender/attachments/mentions) stays after.
-  if (!skipSessionId) parts.push(`<session_id>${xmlEscape(sessionId)}</session_id>`);
-  if (roleBlock) parts.push(roleBlock);
-  if (summaryMemoryBlock) parts.push(summaryMemoryBlock);
+  if (!skipSessionId) blocks.push({ key: 'sessionId', text: `<session_id>${xmlEscape(sessionId)}</session_id>` });
+  if (roleBlock) blocks.push({ key: 'role', text: roleBlock });
+  if (summaryMemoryBlock) blocks.push({ key: 'summaryMemory', text: summaryMemoryBlock });
   if (opts?.cliId !== 'mira') {
     // All non-Mira CLIs — including Hermes, which no longer gets reverse
     // send-first guidance (#653) and now shares this standard path — get the
@@ -1167,31 +1176,76 @@ export function buildFollowUpContent(
     // (config.noVisibleOutputHint, default OFF); otherwise the reminder is
     // byte-for-byte the pre-feature baseline. Live-read so a Settings flip
     // applies to the next follow-up turn without a daemon restart.
-    const reminder = t(config.noVisibleOutputHint ? 'ai.followup.reminder_no_resend' : 'ai.followup.reminder', undefined, opts?.locale);
-    parts.push(`<botmux_reminder>${reminder}</botmux_reminder>`);
+    // hook 模式（#794）：reminder 经 system-reminder 离带注入，命令式措辞可能触发
+    // 模型的注入防御被表面化，改用描述式的 reminder_hook。
+    const reminderKey = hookMode
+      ? 'ai.followup.reminder_hook'
+      : config.noVisibleOutputHint ? 'ai.followup.reminder_no_resend' : 'ai.followup.reminder';
+    const reminder = t(reminderKey, undefined, opts?.locale);
+    blocks.push({ key: 'reminder', text: `<botmux_reminder>${reminder}</botmux_reminder>` });
   }
-  if (whiteboardBlock) parts.push(whiteboardBlock);
+  if (whiteboardBlock) blocks.push({ key: 'whiteboard', text: whiteboardBlock });
 
-  parts.push(`<user_message>\n${content}\n</user_message>`);
+  blocks.push({ key: 'userMessage', text: `<user_message>\n${content}\n</user_message>` });
 
   const senderBlock = renderSenderTag(opts?.sender);
-  if (senderBlock) parts.push(senderBlock);
+  if (senderBlock) blocks.push({ key: 'sender', text: senderBlock });
 
   const substituteBlock = renderSubstituteTrigger(opts?.substituteTrigger);
-  if (substituteBlock) parts.push(substituteBlock);
+  if (substituteBlock) blocks.push({ key: 'substitute', text: substituteBlock });
 
   const senderNote = renderCursorSenderNote(opts?.cliId, !!senderBlock, opts?.locale);
-  if (senderNote) parts.push(senderNote);
+  if (senderNote) blocks.push({ key: 'senderNote', text: senderNote });
 
   const attachHint = opts?.attachments && opts.attachments.length > 0
     ? formatAttachmentsHint(opts.attachments, opts.locale)
     : '';
-  if (attachHint) parts.push(attachHint);
+  if (attachHint) blocks.push({ key: 'attachments', text: attachHint });
 
   const mentionBlock = renderMentionBlock(opts?.mentions);
-  if (mentionBlock) parts.push(mentionBlock);
+  if (mentionBlock) blocks.push({ key: 'mentions', text: mentionBlock });
 
-  return parts.join('\n\n');
+  return blocks;
+}
+
+export function buildFollowUpContent(
+  content: string,
+  sessionId: string,
+  opts?: { attachments?: LarkAttachment[]; mentions?: LarkMention[]; isAdoptMode?: boolean; cliId?: CliId; cliPathOverride?: string; locale?: Locale; sender?: ResolvedSender; larkAppId?: string; chatId?: string; whiteboardId?: string; substituteTrigger?: SubstituteTrigger; codexAppText?: string; codexAppApplicationContext?: string; codexAppMessageContext?: string },
+): string {
+  return buildFollowUpBlocks(content, sessionId, opts).map((b) => b.text).join('\n\n');
+}
+
+/**
+ * UserPromptSubmit hook 注入的单条 additionalContext 大小上限（#794）。
+ * Claude Code 对超过 10k 字符的 additionalContext 会落文件传路径（模型需额外
+ * 工具调用读取，行为分叉）；8k 留余量。超限的轮次回退 inline 模式。
+ */
+const HOOK_ENVELOPE_MAX_CHARS = 8000;
+
+/**
+ * 判定该 follow-up 是否走 hook 注入模式（#794 P1 方向 B）。四重条件全部满足：
+ *  1. 适配器支持不可见 system-reminder 注入（目前仅 claude-code）；
+ *  2. per-bot 开关 envelopeInjection=auto（默认 off）；
+ *  3. preflight：botmux 的 UserPromptSubmit hook 已装进 CLI 实际读的 settings；
+ *  4. （在 buildFollowUpCliInput 里）envelope 不超 8k。
+ * 任一不满足 → inline（现状字节不变）。
+ */
+function resolveEnvelopeInjectionMode(
+  opts?: { cliId?: CliId; cliPathOverride?: string; larkAppId?: string },
+): 'hook' | 'inline' {
+  if (!opts?.cliId) return 'inline';
+  let adapter;
+  try {
+    adapter = createCliAdapterSync(opts.cliId, opts.cliPathOverride);
+  } catch { return 'inline'; }
+  if (!adapter.supportsInvisiblePromptHook || !adapter.hookInstall?.userPromptSubmitCommand) return 'inline';
+  if (!opts.larkAppId) return 'inline';
+  try {
+    if (getBot(opts.larkAppId).config.envelopeInjection !== 'auto') return 'inline';
+  } catch { return 'inline'; }
+  if (!hasInstalledPromptHookCached(adapter.hookInstall)) return 'inline';
+  return 'hook';
 }
 
 /** Follow-up counterpart of buildNewTopicCliInput. */
@@ -1200,6 +1254,24 @@ export function buildFollowUpCliInput(
   sessionId: string,
   opts?: { attachments?: LarkAttachment[]; mentions?: LarkMention[]; isAdoptMode?: boolean; cliId?: CliId; cliPathOverride?: string; locale?: Locale; sender?: ResolvedSender; larkAppId?: string; chatId?: string; whiteboardId?: string; substituteTrigger?: SubstituteTrigger; codexAppText?: string; codexAppApplicationContext?: string; codexAppMessageContext?: string },
 ): CliTurnPayload {
+  // hook 注入模式（#794）：reminder/whiteboard 写入 per-turn sidecar，PTY 文本只保留
+  // 其余块。超限或无条件时回退 inline（legacy 路径），行为与历史完全一致。
+  if (resolveEnvelopeInjectionMode(opts) === 'hook') {
+    const blocks = buildFollowUpBlocks(content, sessionId, opts, true);
+    const ptyText = blocks
+      .filter((b) => b.key !== 'reminder' && b.key !== 'whiteboard')
+      .map((b) => b.text)
+      .join('\n\n');
+    const hookEnvelope = blocks
+      .filter((b) => b.key === 'reminder' || b.key === 'whiteboard')
+      .map((b) => b.text)
+      .join('\n\n');
+    if (hookEnvelope && hookEnvelope.length <= HOOK_ENVELOPE_MAX_CHARS) {
+      writePromptContext(sessionId, ptyText, hookEnvelope);
+      return { content: ptyText };
+    }
+    // 无 envelope（理论上不会发生：claude-code 必有 reminder）或超限 → 回退 inline。
+  }
   const legacyContent = buildFollowUpContent(content, sessionId, opts);
   if (opts?.cliId !== 'codex-app' || opts.isAdoptMode) return { content: legacyContent };
   const roleBlock = renderRoleContextBlock(opts.larkAppId, opts.chatId, { followUp: true });

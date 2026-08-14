@@ -26,6 +26,9 @@ export interface HookInstallConfig {
    *  - grok-hooks：写 `~/.grok/hooks/*.json` 的 SessionStart
    *  见 adapters/cli/types.ts 同名字段。 */
   readonly sessionStartCommand?: string;
+  /** 可选：UserPromptSubmit per-turn 上下文 hook 命令（#794）。
+   *  仅 claude-settings：写全局 settings.json 的 hooks.UserPromptSubmit。 */
+  readonly userPromptSubmitCommand?: string;
 }
 
 // ─── 工具函数 ─────────────────────────────────────────────────────────────────
@@ -211,6 +214,29 @@ function removeBotmuxReadyHookGroups(hooks: Record<string, ClaudeHookGroup[]>, e
 }
 
 /**
+ * 判断某 hook group 是否是 botmux UserPromptSubmit 上下文 hook（用于幂等替换）。
+ * 与 ready hook 同策略：结构化识别（命令引用 botmux 的 cli.js 且尾部是
+ * `user-prompt-hook`），不按完整字符串比对。
+ */
+function isBotmuxPromptHookGroup(group: ClaudeHookGroup): boolean {
+  return Array.isArray(group?.hooks) && group.hooks.some(
+    (e) =>
+      !!e &&
+      e.type === 'command' &&
+      typeof e.command === 'string' &&
+      e.command.includes('cli.js') &&
+      e.command.trimEnd().endsWith('user-prompt-hook'),
+  );
+}
+
+function removeBotmuxPromptHookGroups(hooks: Record<string, ClaudeHookGroup[]>, eventName: string): void {
+  const existing = hooks[eventName] ?? [];
+  const filtered = existing.filter((g) => !isBotmuxPromptHookGroup(g));
+  if (filtered.length === 0) delete hooks[eventName];
+  else hooks[eventName] = filtered;
+}
+
+/**
  * Read-only preflight used by the worker before it arms the ready gate.
  * Installation is intentionally best-effort, so the gate must not assume that
  * a requested SessionStart hook actually reached the CLI's effective config.
@@ -231,6 +257,39 @@ export function hasInstalledSessionReadyHook(hookInstall: HookInstallConfig): bo
 }
 
 /**
+ * Read-only preflight: is the botmux UserPromptSubmit hook present in the
+ * settings file the CLI actually reads? 结构化匹配（不像
+ * hasInstalledSessionReadyHook 那样按完整字符串相等——dev checkout 与 npm global
+ * 的 cli.js 路径不同，精确匹配会把已安装的 hook 误判为未安装）。
+ */
+export function hasInstalledPromptHook(hookInstall: HookInstallConfig): boolean {
+  if (!hookInstall.userPromptSubmitCommand) return false;
+  if (hookInstall.format !== 'claude-settings') return false;
+  const settings = readJsonFile<ClaudeSettings>(expandHome(hookInstall.configPath));
+  const groups = settings?.hooks?.UserPromptSubmit;
+  return Array.isArray(groups) && groups.some((group) => isBotmuxPromptHookGroup(group));
+}
+
+/**
+ * 带 60s TTL 缓存的 preflight——每个 follow-up turn 都会判定一次模式，读文件虽便宜
+ * 也没必要每 turn 读。缓存按 configPath 键控；安装发生在 daemon 启动时
+ * （ensureCliSkills），60s 内的滞后可接受（最坏情况是新装 hook 后 60s 内仍走 inline）。
+ */
+const promptHookPreflightCache = new Map<string, { at: number; ok: boolean }>();
+const PROMPT_HOOK_PREFLIGHT_TTL_MS = 60_000;
+
+export function hasInstalledPromptHookCached(hookInstall: HookInstallConfig): boolean {
+  if (!hookInstall.userPromptSubmitCommand) return false;
+  const key = hookInstall.configPath;
+  const now = Date.now();
+  const cached = promptHookPreflightCache.get(key);
+  if (cached && now - cached.at < PROMPT_HOOK_PREFLIGHT_TTL_MS) return cached.ok;
+  const ok = hasInstalledPromptHook(hookInstall);
+  promptHookPreflightCache.set(key, { at: now, ok });
+  return ok;
+}
+
+/**
  * 向 Claude settings.json 的 hooks.PreToolUse 合并 botmux ask hook entry。
  * AskUserQuestion 在 bypassPermissions 模式下不会经过 PermissionRequest，
  * 但 PreToolUse 仍会在工具执行前触发，因此这里必须挂 PreToolUse。
@@ -245,6 +304,7 @@ function installClaudeSettings(
   hookCommand: string,
   sessionStartCommand?: string,
   inheritClaudeEnvFrom?: string,
+  userPromptSubmitCommand?: string,
 ): void {
   const settings: ClaudeSettings = readJsonFile<ClaudeSettings>(configPath) ?? {};
   let inheritedEnvState: { path: string; content: string } | undefined;
@@ -293,6 +353,16 @@ function installClaudeSettings(
     existingHooks['SessionStart'] = [
       ...(existingHooks['SessionStart'] ?? []),
       { hooks: [{ type: 'command', command: sessionStartCommand }] },
+    ];
+  }
+
+  // UserPromptSubmit per-turn 上下文 hook（#794，幂等替换旧的 botmux 条目）。
+  // timeout 10s：hook 本身是纯文件读，10s 足够；防任何意外挂起。
+  if (userPromptSubmitCommand) {
+    removeBotmuxPromptHookGroups(existingHooks, 'UserPromptSubmit');
+    existingHooks['UserPromptSubmit'] = [
+      ...(existingHooks['UserPromptSubmit'] ?? []),
+      { hooks: [{ type: 'command', command: userPromptSubmitCommand, timeout: 10 }] },
     ];
   }
 
@@ -706,6 +776,7 @@ export function installHook(
           hookCommand,
           hookInstall.sessionStartCommand,
           hookInstall.inheritClaudeEnvFrom,
+          hookInstall.userPromptSubmitCommand,
         );
         break;
       case 'opencode-plugin':
