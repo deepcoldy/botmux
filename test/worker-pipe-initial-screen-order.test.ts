@@ -412,7 +412,7 @@ describe('worker pipe initial screen ordering', () => {
     expect(finalizeIdx).toBeGreaterThan(spawnIdx);
     expect(onDataIdx).toBeGreaterThan(finalizeIdx);
     expect(finalize).toContain("codexAppControlProven && codexAppControlStateValue?.status === 'active'");
-    expect(source).toContain("const APP_RUNNER_OSC_CLI_IDS = new Set(['mira', 'mir']);");
+    expect(source).toContain("const APP_RUNNER_OSC_CLI_IDS = new Set(['mira', 'mir', 'dsh']);");
     expect(source).not.toContain('CODEX_APP_CONTROL_NONCE_ENV');
     expect(source).not.toContain('codexAppControlNonceForSpawn');
   });

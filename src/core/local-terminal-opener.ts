@@ -68,7 +68,7 @@ function isCodexFamily(cliId: string): boolean {
 function defaultLocalExecutable(cliId: CliId, adapterResolvedBin: string, cliPathOverride?: string): string | null {
   if (cliPathOverride?.trim()) return cliPathOverride.trim();
   if (cliId === 'codex-app') return 'codex';
-  if (cliId === 'mira') return null;
+  if (cliId === 'mira' || cliId === 'dsh') return null;
   if (cliId === 'mir') return 'mircli';
   return adapterResolvedBin;
 }

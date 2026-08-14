@@ -310,6 +310,25 @@ interface CliPersistOutcome {
   note: string;
 }
 
+/**
+ * Did this response come AFTER the irreversible agent-switch closes?
+ *
+ * Detected by the presence of the close-summary fields, deliberately NOT by
+ * enumerating error codes. The enumeration was the bug: the server grew a fourth
+ * post-close exit (`reasoning_effort_not_supported_by_model`) that carries the
+ * same summary, but the client only recognised the two it knew, so the surviving
+ * remote task ids were silently dropped and an operator had no handle to clean
+ * them up. Any future post-close exit is now rendered without touching this file.
+ */
+function carriesAgentSwitchCloseSummary(body: unknown): boolean {
+  if (!body || typeof body !== 'object') return false;
+  const record = body as Record<string, unknown>;
+  return 'closedMismatchedSessions' in record
+    || 'closedMismatchedFailed' in record
+    || 'closedMismatchedResidual' in record
+    || 'closedMismatchedResidualTaskIds' in record;
+}
+
 function parseAgentSwitchSummary(body: unknown): {
   closed: number;
   failed: number;
@@ -1595,11 +1614,10 @@ export function BotAgentSection(props: {
         // The switch transaction refused: say what actually happened rather than
         // surfacing a bare error code — the config is unchanged, some rows closed,
         // and some remote sessions may need manual cleanup.
-        // Both post-close exits: the switch aborted because a close failed, OR the
-        // closes ran and the config commit failed. Either way some rows are closed
-        // and their remote ids are only reported here.
-        const aborted = res.body?.error === 'agent_switch_close_failed'
-          || res.body?.error === 'agent_switch_commit_failed';
+        // ANY post-close exit, detected by the summary fields rather than a list of
+        // error codes — see carriesAgentSwitchCloseSummary. Some rows are closed
+        // and their remote ids are only ever reported here.
+        const aborted = carriesAgentSwitchCloseSummary(res.body);
         const abortSummary = parseAgentSwitchSummary(res.body);
         const detail = aborted
           ? [
@@ -1660,8 +1678,7 @@ export function BotAgentSection(props: {
       }
       // Aborted switch (close refused, or commit failed after closes ran): the
       // config did NOT change and some remote sessions may need manual cleanup.
-      const aborted = res.body?.error === 'agent_switch_close_failed'
-        || res.body?.error === 'agent_switch_commit_failed';
+      const aborted = carriesAgentSwitchCloseSummary(res.body);
       const note = aborted
         ? [
           // Riff-specific wording: by this point the /riff write already

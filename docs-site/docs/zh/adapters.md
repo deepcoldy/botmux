@@ -36,8 +36,18 @@ botmux 通过适配器桥接不同 CLI / Agent，`bots.json` 里用 `cliId` 选�
 | `mira` | Mira APP | API / 远端 | |
 | `mir` | Mir CLI（本地 mircli + MCP bridge） | 本地进程 | |
 | `riff` | riff | 云 Agent（API） | |
+| `dsh` | DeepSeek Harness（dsh-jsonrpc-agent） | 本地进程（SDK JSON-RPC） | ✅ |
 
 > `model` 字段只对支持模型参数的适配器生效，其它忽略。Mir CLI 的额外前置（登录 / miramcp）见下方专节。
+
+## DeepSeek Harness（dsh）
+
+`cliId: "dsh"` 通过内置 runner 驱动本机的 `dsh-jsonrpc-agent`（[deepseek-harness](https://github.com/deepseekai/deepseek-harness) 的打包 runtime），走 SDK JSON-RPC 协议。前置条件：
+
+1. `dsh-jsonrpc-agent` 在 PATH 上（或用 `cliPathOverride` 指定路径）。
+2. `bots.json` 的 `env` 里配置 `DEEPSEEK_API_KEY`。
+
+会话 JSONL 落在 `~/.botmux/dsh/sessions/`；同一 runner 连接内多轮，daemon 重启后开新会话（不续上下文）。
 
 ## Mir CLI 与 MCP Bridge
 

@@ -36,8 +36,18 @@ The table lists the current built-in adapters (the **authoritative source** for 
 | `mira` | Mira APP | API / remote | |
 | `mir` | Mir CLI (local mircli + MCP bridge) | local process | |
 | `riff` | riff | cloud agent (API) | |
+| `dsh` | DeepSeek Harness (dsh-jsonrpc-agent) | local process (SDK JSON-RPC) | ✅ |
 
 > The `model` field only takes effect for adapters that support a model parameter; others ignore it. Mir CLI's extra prerequisites (login / miramcp) are in the section below.
+
+## DeepSeek Harness (dsh)
+
+`cliId: "dsh"` drives a local `dsh-jsonrpc-agent` (the packaged runtime of [deepseek-harness](https://github.com/deepseekai/deepseek-harness)) through the bundled runner over the SDK JSON-RPC protocol. Prerequisites:
+
+1. `dsh-jsonrpc-agent` on PATH (or point `cliPathOverride` at it).
+2. Set `DEEPSEEK_API_KEY` in the bot's `env`.
+
+Session JSONL lives under `~/.botmux/dsh/sessions/`. Turns are multi-turn within one runner connection; a daemon restart starts a fresh session (no context resume).
 
 ## Mir CLI and MCP Bridge
 

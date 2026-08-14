@@ -49,6 +49,7 @@ import { createKimiAdapter } from '../src/adapters/cli/kimi.js';
 import { createGrokAdapter } from '../src/adapters/cli/grok.js';
 import { createKiroCliAdapter } from '../src/adapters/cli/kiro-cli.js';
 import { createReasonixAdapter } from '../src/adapters/cli/reasonix.js';
+import { createDshAdapter } from '../src/adapters/cli/dsh.js';
 import { buildBotmuxShellHints, buildBotmuxSystemPromptText } from '../src/adapters/cli/shared-hints.js';
 import { ALL_CLI_IDS as REGISTRY_ALL_CLI_IDS } from '../src/adapters/cli/registry.js';
 import { isRemoteCliId } from '../src/core/remote-cli-ids.js';
@@ -92,7 +93,9 @@ describe('createCliAdapterSync factory', () => {
     // their adapter deliberately reports an empty resolvedBin. Exempting them via
     // the shared predicate keeps this loop honest for every local CLI.
     if (isRemoteCliId(id)) expect(adapter.resolvedBin).toBe('');
-    else if (id === 'codex-app' || id === 'mira' || id === 'mir') expect(adapter.resolvedBin).toBe(process.execPath);
+    // dsh joins the bundled-Node-runner group (upstream #858): its resolvedBin is
+    // the node binary, not the pinned path.
+    else if (id === 'codex-app' || id === 'mira' || id === 'mir' || id === 'dsh') expect(adapter.resolvedBin).toBe(process.execPath);
     else expect(adapter.resolvedBin).toBe(`/opt/${id}`);
   });
 });
@@ -560,6 +563,75 @@ describe('mira buildArgs', () => {
     });
     expect(args).toContain('--mira-session-id');
     expect(args).toContain('mira-session-123');
+  });
+});
+
+describe('dsh buildArgs (runner model)', () => {
+  const adapter = createDshAdapter('/opt/dsh/bin/dsh-jsonrpc-agent');
+
+  it('spawns the node runner and passes the dsh runtime binary', () => {
+    const args = adapter.buildArgs({ sessionId: 'sess-dsh', resume: false, workingDir: '/repo/root' });
+    expect(adapter.resolvedBin).toBe(process.execPath);
+    expect(args[0]).toMatch(/dsh-runner\.js$/);
+    expect(args).toContain('--session-id');
+    expect(args).toContain('sess-dsh');
+    expect(args).toContain('--dsh-bin');
+    expect(args).toContain('/opt/dsh/bin/dsh-jsonrpc-agent');
+    expect(args).toContain('--cwd');
+    expect(args).toContain('/repo/root');
+  });
+
+  it('forwards bot identity, locale and model to the runner', () => {
+    const args = adapter.buildArgs({
+      sessionId: 's', resume: false, botName: 'Monday', botOpenId: 'ou_x', locale: 'zh', model: 'deepseek-v4-pro',
+    });
+    expect(args).toContain('--bot-name');
+    expect(args).toContain('Monday');
+    expect(args).toContain('--bot-open-id');
+    expect(args).toContain('ou_x');
+    expect(args).toContain('--locale');
+    expect(args).toContain('zh');
+    expect(args).toContain('--model');
+    expect(args).toContain('deepseek-v4-pro');
+  });
+
+  it('omits --model when no model is configured', () => {
+    const args = adapter.buildArgs({ sessionId: 's', resume: false });
+    expect(args).not.toContain('--model');
+  });
+
+  it('has no portable copy-paste resume command', () => {
+    expect(adapter.buildResumeCommand?.({ sessionId: 'sess-dsh', cliSessionId: 'session-abc' })).toBeNull();
+  });
+
+  it('readyPattern matches the runner prompt indicator', () => {
+    expect(adapter.readyPattern?.test('› ')).toBe(true);
+  });
+
+  it('defers the first prompt until the runner is ready (slow handshake)', () => {
+    expect(adapter.deferFirstPromptTimeoutUntilReady).toBe(true);
+  });
+
+  it('does not type ahead (serial turns)', () => {
+    expect(adapter.supportsTypeAhead).not.toBe(true);
+  });
+
+  it('advertises the deepseek model choices', () => {
+    expect(adapter.modelChoices).toEqual(['deepseek-v4-flash', 'deepseek-v4-pro']);
+  });
+
+  it('writeInput frames content with the dsh marker', async () => {
+    const written: string[] = [];
+    const pty = {
+      write: (data: string) => { written.push(data); return true; },
+    } as unknown as PtyHandle;
+    const result = await adapter.writeInput!(pty, 'hello dsh', { turnId: 'turn-1' });
+    expect(result).toEqual({ submitted: true, submissionDisposition: 'submitted' });
+    const line = written.join('');
+    expect(line.startsWith('::botmux-dsh:')).toBe(true);
+    const decoded = JSON.parse(Buffer.from(line.slice('::botmux-dsh:'.length).trim(), 'base64').toString('utf8'));
+    expect(decoded.content).toBe('hello dsh');
+    expect(decoded.replyTurnId).toBe('turn-1');
   });
 });
 

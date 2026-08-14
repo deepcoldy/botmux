@@ -283,6 +283,7 @@ const cliDisplayNames: Record<CliId, string> = {
   'kiro-cli': 'Kiro',
   'riff': 'Riff',
   'reasonix': 'Reasonix',
+  'dsh': 'DeepSeek Harness',
   'mojo': 'Mojo',
 };
 

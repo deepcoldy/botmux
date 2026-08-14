@@ -1382,7 +1382,7 @@ function loadKnownBotOpenIdsForApp(larkAppId: string): Set<string> {
  *  mircli runner). They can't @-trigger a peer bot themselves, so for bot-to-bot
  *  handoffs the fallback card must carry the real <at> back to the dispatcher. */
 function isRunnerDeliveryCli(cliId?: string): boolean {
-  return cliId === 'mira' || cliId === 'mir';
+  return cliId === 'mira' || cliId === 'mir' || cliId === 'dsh';
 }
 
 function daemonCardFooterRecipientOpenId(ds: DaemonSession, effectiveCliId?: string): string | undefined {

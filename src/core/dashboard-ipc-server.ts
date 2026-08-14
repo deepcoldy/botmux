@@ -3933,6 +3933,30 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
   }
   const currentBotConfig = getBot(larkAppId).config;
   const supportsReasoningEffort = isCodexReasoningCliId(selected.cliId);
+  // PRECONDITION, checked before any irreversible work.
+  //
+  // The model-support check also exists inside the rmwBotEntry transaction below,
+  // but that runs AFTER agentSwitchCloseHook has already closed every session
+  // frozen on the old agent — closes that cannot be undone. So a request that is
+  // simply invalid (e.g. codex + a model that rejects `ultra`) used to tear down
+  // live sessions and only then answer 400, breaking "a failed validation
+  // produces no side effects".
+  //
+  // Evaluated against the persisted value the transaction would fall back to when
+  // the field is absent, so the two agree. The in-transaction copy is deliberately
+  // KEPT as a backstop: only it sees the row under the write lock, and if the
+  // entry moved in between, its rejection still carries the close summary.
+  const preflightReasoningEffort = supportsReasoningEffort
+    ? (reasoningEffortFieldPresent ? reasoningEffort ?? undefined : currentBotConfig.reasoningEffort)
+    : undefined;
+  if (preflightReasoningEffort
+      && !codexModelSupportsReasoningEffort(model || undefined, preflightReasoningEffort)) {
+    return jsonRes(res, 400, {
+      ok: false,
+      error: 'reasoning_effort_not_supported_by_model',
+      message: `模型 ${model || '（Codex 默认模型）'} 不支持当前思考强度`,
+    });
+  }
   const runtimeFieldPresent = Object.prototype.hasOwnProperty.call(body, 'cliRuntime');
   const currentSelectionKey = selectionKeyForBot(currentBotConfig.cliId, currentBotConfig.wrapperCli);
   const selectionChanged = key !== currentSelectionKey;

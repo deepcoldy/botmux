@@ -190,6 +190,16 @@ export function resolveAdapterDefaultPassthroughCommands(larkAppId?: string, cli
  * App Server rather than an interactive TUI; slash-looking text must use the
  * structured turn lane. Unknown / no bot → falls back to the builtin set.
  */
+/** Runner adapters speak a framed stdin protocol, not an interactive TUI:
+ * raw slash passthrough would bypass the turn ledger and the runner rejects
+ * non-frame input. Both the routing and the /list-slash-command display must
+ * agree on this set. */
+const NO_RAW_PASSTHROUGH_CLI_IDS = new Set(['codex-app', 'mira', 'mir', 'dsh']);
+
+export function cliHasNoRawPassthroughSurface(cliId: string | undefined): boolean {
+  return !!cliId && NO_RAW_PASSTHROUGH_CLI_IDS.has(cliId);
+}
+
 export function resolvePassthroughCommands(larkAppId?: string, cliIdOverride?: string): Set<string> {
   const effective = new Set(PASSTHROUGH_COMMANDS);
   if (!larkAppId) return effective;
@@ -211,7 +221,11 @@ export function resolvePassthroughCommands(larkAppId?: string, cliIdOverride?: s
   // ledger; the model still completes the text as an ordinary turn, but the
   // worker has no pending dispatch to attribute that final to and the session
   // remains stuck. Keep these messages on the normal structured turn path.
-  if (effectiveCliId === 'codex-app') return new Set();
+  // Runner adapters (codex-app/mira/mir/dsh) speak a framed stdin protocol,
+  // not an interactive TUI: a slash command through raw_input bypasses the
+  // turn ledger and the runner rejects non-frame input, wedging the session.
+  // Keep these messages on the normal structured turn path.
+  if (cliHasNoRawPassthroughSurface(effectiveCliId)) return new Set();
   for (const c of resolveAdapterDefaultPassthroughCommands(larkAppId, effectiveCliId)) {
     effective.add(c);
   }
@@ -3949,18 +3963,19 @@ export async function handleCommand(
           ? sessionCliDisplayName(ds)
           : configuredRuntimeDisplayName(botCfg?.cliRuntime) ?? getCliDisplayName(effectiveCliId);
         const workingDir = getSessionWorkingDir(ds);
-        // Codex App routes everything through the structured turn lane, so it has
-        // NO passthrough surface at all — mirror resolvePassthroughCommands's
-        // early empty return here and skip filesystem discovery (its PTY is the
-        // App Server runner, not an interactive TUI that would honor those).
-        const isCodexApp = effectiveCliId === 'codex-app';
-        const builtin = isCodexApp ? [] : [...PASSTHROUGH_COMMANDS];
-        const adapterDefaults = isCodexApp ? [] : resolveAdapterDefaultPassthroughCommands(larkAppId, effectiveCliId);
+        // Runner adapters route everything through the structured turn lane,
+        // so they have NO passthrough surface at all — mirror
+        // resolvePassthroughCommands's early empty return here and skip
+        // filesystem discovery (their PTY is the runner, not an interactive
+        // TUI that would honor those).
+        const noPassthrough = cliHasNoRawPassthroughSurface(effectiveCliId);
+        const builtin = noPassthrough ? [] : [...PASSTHROUGH_COMMANDS];
+        const adapterDefaults = noPassthrough ? [] : resolveAdapterDefaultPassthroughCommands(larkAppId, effectiveCliId);
         // 只展示「实际生效」的 custom 命令：用与 resolvePassthroughCommands 同一套
         // normalize 过滤掉手写 bots.json 里遮蔽 daemon 命令 / 非法的项（parser 出于
         // 兼容会保留它们，但路由会丢弃），避免 `/status` 之类被展示成可用却走 daemon。
         // Codex App 无透传面，custom 也不生效 → 与路由一致清空。
-        const custom = isCodexApp ? [] : [...new Set(
+        const custom = noPassthrough ? [] : [...new Set(
           (botCfg?.customPassthroughCommands ?? [])
             .map(normalizePassthroughCommand)
             .filter((c): c is string => !!c),
@@ -3969,7 +3984,7 @@ export async function handleCommand(
         // cliPathOverride（它属于另一个 CLI）。Codex App 直接跳过发现。
         const adapterPathOverride = effectiveCliId === botCfg?.cliId ? botCfg?.cliPathOverride : undefined;
         let cliAdapter;
-        if (!isCodexApp) {
+        if (!noPassthrough) {
           try {
             cliAdapter = createCliAdapterSync(effectiveCliId, adapterPathOverride);
           } catch (err) {
