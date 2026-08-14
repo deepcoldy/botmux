@@ -854,6 +854,10 @@ function BotDefaultsCard(props: {
             {bot.cliId === 'codex-app' ? (
               <section className="bd-tile"><CodexAppDisplaySection bot={bot} putCardPref={putCardPref} /></section>
             ) : null}
+            {/* #794 hook 注入目前只验证了 claude-code，其它 CLI 隐藏避免误开。 */}
+            {bot.cliId === 'claude-code' ? (
+              <section className="bd-tile"><EnvelopeInjectionSection bot={bot} patchBot={patchBot} /></section>
+            ) : null}
             <section className="bd-tile"><RuntimeEnvironmentSection bot={bot} patchBot={patchBot} /></section>
           </BdTabGrid>
         </div>
@@ -2805,6 +2809,57 @@ export function CodexAppDisplaySection(props: { bot: BotDefaultsRow; putCardPref
       <small className="bd-section-note">{tr('botDefaults.codexAppCleanInputCompat')}</small>
       <div className="actions">
         <StatusSpan status={status} attr={{ 'data-codex-app-clean-input-status': '' }} />
+      </div>
+    </section>
+  );
+}
+
+export function EnvelopeInjectionSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
+  const tr = useT();
+  const [auto, setAuto] = useState(props.bot.envelopeInjection === 'auto');
+  const [status, setStatus] = useState<StatusMessage>(null);
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => setAuto(props.bot.envelopeInjection === 'auto'), [props.bot.envelopeInjection]);
+
+  async function save(next: boolean): Promise<void> {
+    const previous = auto;
+    setAuto(next);
+    setBusy(true);
+    setStatus(null);
+    try {
+      const res = await sendJson('PUT', `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/envelope-injection`, { envelopeInjection: next ? 'auto' : 'off' });
+      if (res.ok && res.body.ok) {
+        const saved = res.body.envelopeInjection === 'auto';
+        setAuto(saved);
+        props.patchBot(props.bot.larkAppId, { envelopeInjection: saved ? 'auto' : 'off' });
+        setStatus({ text: `✓ ${tr('botDefaults.cardPrefSaved')}`, ok: true });
+      } else {
+        setAuto(previous);
+        setStatus({ text: `✗ ${responseErrorText(res)}` });
+      }
+    } catch (e: any) {
+      setAuto(previous);
+      setStatus({ text: `✗ ${caughtErrorText(e)}` });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <section className="bd-section" data-envelope-injection>
+      <h3 className="bd-section-title">{tr('botDefaults.envelopeInjection')}</h3>
+      <ToggleRow
+        checked={auto}
+        disabled={busy}
+        dataAction="toggle-envelope-injection"
+        title={tr('botDefaults.envelopeInjectionAuto')}
+        help={tr('botDefaults.envelopeInjectionHelp')}
+        onChange={checked => void save(checked)}
+      />
+      <small className="bd-section-note">{tr('botDefaults.envelopeInjectionNote')}</small>
+      <div className="actions">
+        <StatusSpan status={status} attr={{ 'data-envelope-injection-status': '' }} />
       </div>
     </section>
   );
