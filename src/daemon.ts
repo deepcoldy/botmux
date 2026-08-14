@@ -19757,36 +19757,12 @@ async function handleThreadReplyAdmitted(
     // its normal `--resume` instead of being cold-spawned over.
     const hadPriorCliInput = !!(ds.lastCliInput ?? ds.session.lastCliInput);
     const openingTurn = wantsOpening && claimInitialUserTurn(ds);
-    const builtReforkInput = buildReforkCliInput(ds, reforkContent, {
-      attachments: queuedHasDurableTail ? undefined : attachments,
-      mentions: queuedHasDurableTail ? undefined : parsed.mentions,
-      cliId: ds.session.cliId ?? dsBotCfgForFork.cliId,
-      cliPathOverride: ds.session.cliPathOverride ?? dsBotCfgForFork.cliPathOverride,
-      selfMention: { name: selfBot.botName, openId: selfBot.botOpenId },
-      sender: queuedHasDurableTail ? undefined : reforkSender,
-      substituteTrigger: queuedHasDurableTail ? undefined : substituteTrigger,
-      codexAppText: reforkCodexApp.text,
-      codexAppApplicationContext: queuedHasDurableTail ? undefined : codexAppApplicationContext,
-      codexAppMessageContext: reforkCodexApp.messageContext,
-      turnId: parsed.messageId,
-    });
-    let wrappedInput = applyQueuedCodexAppLegacyFallback(builtReforkInput, {
-      queued: queuedDashboardTurn,
-      queuedText: queuedCodexAppText,
-    });
-    if (wrappedInput !== builtReforkInput && dsBotCfgForFork.codexAppCleanInput === true) {
-      // Backlog sessions persisted before clean-input have no raw queued text.
-      // Keep this activation entirely legacy: reforkContent already contains
-      // queuedPrompt + the current reply, whereas a structured turn could only
-      // contain the reply and would silently discard the original task.
-      logger.warn(`[${tag(ds)}] Legacy queued dashboard task has no clean-input text; using the full legacy activation prompt`);
-    }
+    // 先选 builder：opening 轮用 buildNewTopicCliInput，非 opening 才 buildRefork。
+    // 不能无条件先跑 buildRefork——它现在有副作用（写 follow-up sidecar），opening 时
+    // 结果会被 buildNewTopicCliInput 覆盖丢弃，但 sidecar 已写入 opening 的 turnId，
+    // opening 的 hook 会领到这份从没发出去的 speculative reminder → 双注入。
+    let wrappedInput: CliTurnPayload;
     if (openingTurn) {
-      // Replace the follow-up envelope built above with the real opening. The
-      // discarded build is pure string assembly (no side effects) — keeping the
-      // refork statement unconditional keeps the queued/substitute wiring, and
-      // its guard test, on a single code path. (openingTurn is mutually
-      // exclusive with queuedDashboardTurn/queuedHasDurableTail.)
       wrappedInput = buildNewTopicCliInput(
         reforkContent,
         ds.session.sessionId,
@@ -19809,6 +19785,31 @@ async function handleThreadReplyAdmitted(
           codexAppMessageContext: reforkCodexApp.messageContext,
         },
       );
+    } else {
+      const builtReforkInput = buildReforkCliInput(ds, reforkContent, {
+        attachments: queuedHasDurableTail ? undefined : attachments,
+        mentions: queuedHasDurableTail ? undefined : parsed.mentions,
+        cliId: ds.session.cliId ?? dsBotCfgForFork.cliId,
+        cliPathOverride: ds.session.cliPathOverride ?? dsBotCfgForFork.cliPathOverride,
+        selfMention: { name: selfBot.botName, openId: selfBot.botOpenId },
+        sender: queuedHasDurableTail ? undefined : reforkSender,
+        substituteTrigger: queuedHasDurableTail ? undefined : substituteTrigger,
+        codexAppText: reforkCodexApp.text,
+        codexAppApplicationContext: queuedHasDurableTail ? undefined : codexAppApplicationContext,
+        codexAppMessageContext: reforkCodexApp.messageContext,
+        turnId: parsed.messageId,
+      });
+      wrappedInput = applyQueuedCodexAppLegacyFallback(builtReforkInput, {
+        queued: queuedDashboardTurn,
+        queuedText: queuedCodexAppText,
+      });
+      if (wrappedInput !== builtReforkInput && dsBotCfgForFork.codexAppCleanInput === true) {
+        // Backlog sessions persisted before clean-input have no raw queued text.
+        // Keep this activation entirely legacy: reforkContent already contains
+        // queuedPrompt + the current reply, whereas a structured turn could only
+        // contain the reply and would silently discard the original task.
+        logger.warn(`[${tag(ds)}] Legacy queued dashboard task has no clean-input text; using the full legacy activation prompt`);
+      }
     }
     if (!queuedHasDurableTail) {
       await noteTurnReceived(ds, parsed.messageId, parsed.content, reforkSender, parsed.messageId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
