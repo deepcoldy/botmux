@@ -204,6 +204,32 @@ describe('agent switch — no precondition runs after the irreversible close', (
     expect(casBlock).toContain("'bot_config_changed_during_switch'");
   });
 
+  it('re-verifies the authority BEFORE the irreversible close, not only at commit', () => {
+    // The commit CAS protects the file; it cannot protect sessions, because the
+    // closes already ran. A concurrent writer's new runtime makes our target stale,
+    // and sessions frozen on the new runtime would be closed as "mismatched".
+    // Refusing to write afterwards cannot resurrect them.
+    const closeAt = ipc.indexOf('await agentSwitchCloseHook.run(');
+    const targetAt = ipc.indexOf('const switchTarget = {');
+    const verifyAt = ipc.indexOf('const recheck = await rmwBotEntry<string>(');
+    expect(verifyAt, 'a pre-close re-verify must exist').toBeGreaterThan(0);
+    expect(
+      verifyAt,
+      'the re-verify must sit between building the target and closing with it',
+    ).toBeGreaterThan(targetAt);
+    expect(verifyAt, 'and strictly before the irreversible close').toBeLessThan(closeAt);
+
+    // It must compare against the SAME version the commit CAS uses, under the lock.
+    const block = ipc.slice(verifyAt, closeAt);
+    expect(block).toContain('agentAuthorityFingerprint(');
+    expect(block).toContain('write: false');
+    expect(block, 'a mismatch must abort').toContain("error: 'bot_config_changed_during_switch'");
+    // Pre-close exits must NOT pretend anything was closed.
+    expect(block, 'nothing was closed yet, so no close summary').not.toContain('closeSummaryPayload');
+    // An unreadable authority here must fail closed too, not fall through.
+    expect(block).toContain("error: 'bot_config_unreadable'");
+  });
+
   it('reports the CAS refusal as a post-close exit with the close summary', () => {
     // These closes are irreversible, so the new exit owes the same summary as the
     // other four; and it must not answer 200.

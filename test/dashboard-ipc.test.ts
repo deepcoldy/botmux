@@ -7,6 +7,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { ipcRoute, startIpcServer, setLarkAppId, setIpcAuthSecret, setBotRenamer, setBotAvatarChanger, setExactChatGrantHandler, armCoreOnlyReadinessGate, setCoreOnlyReady, __testOnly_resetCoreOnlyReadiness, type IpcServerHandle,
   agentSwitchCloseHook,
+  __testOnly_agentSwitchBeforePreCloseVerify,
 } from '../src/core/dashboard-ipc-server.js';
 import { cliAuthBind, signCliAuth } from '../src/dashboard/auth.js';
 import { dashboardEventBus } from '../src/core/dashboard-events.js';
@@ -3204,6 +3205,77 @@ describe('PUT /api/bot-agent', () => {
       // …and the other writer's unrelated edit must still be there.
       expect(stored.oncallChats).toMatchObject([{ chatId: 'oc_other' }]);
     } finally {
+      agentSwitchCloseHook.run = originalCloseHook;
+      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = prevBotsConfig;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  // BEHAVIOURAL (stale close): the commit's CAS protects the FILE, but the closes
+  // run before it and are IRREVERSIBLE. If another process commits runtime-B in
+  // our window, sessions frozen on B are not mismatched against B — yet a stale
+  // target still describes A, so they would be killed and only then would the
+  // commit refuse. Refusing to write cannot resurrect a closed session, so the
+  // authority must be re-verified BEFORE the close.
+  it('aborts before closing anything when another writer changed the row', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-agent-staleclose-'));
+    const configPath = join(dir, 'bots.json');
+    const appId = 'test-agent-staleclose';
+    const prevBotsConfig = process.env.BOTS_CONFIG;
+    const originalCloseHook = agentSwitchCloseHook.run;
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      const binA = join(dir, 'runtime-a');
+      const binB = join(dir, 'runtime-b');
+      symlinkSync(process.execPath, binA);
+      symlinkSync(process.execPath, binB);
+      writeFileSync(configPath, JSON.stringify([{
+        larkAppId: appId,
+        larkAppSecret: 'secret',
+        cliId: 'codex',
+        model: 'old-model',
+        cliRuntime: { id: 'runtime-a', displayName: 'RuntimeA', executable: binA },
+        cliPathOverride: binA,
+      }], null, 2));
+      loadBotConfigs().forEach((c: any) => registerBot(c));
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+
+      let closeHookCalls = 0;
+      agentSwitchCloseHook.run = async (...args: Parameters<typeof originalCloseHook>) => {
+        closeHookCalls += 1;
+        return originalCloseHook(...args);
+      };
+      // Another process commits runtime-B after our authority read, before the
+      // close would run.
+      __testOnly_agentSwitchBeforePreCloseVerify.run = () => {
+        const rows = JSON.parse(readFileSync(configPath, 'utf-8'));
+        rows[0].cliRuntime = { id: 'runtime-b', displayName: 'RuntimeB', executable: binB };
+        rows[0].cliPathOverride = binB;
+        writeFileSync(configPath, JSON.stringify(rows, null, 2));
+      };
+
+      const saved = await fetch(`http://127.0.0.1:${handle.port}/api/bot-agent`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ cliId: 'codex', model: 'new-model' }),
+      });
+
+      expect(saved.status).toBe(409);
+      expect(await saved.json()).toMatchObject({
+        ok: false,
+        error: 'bot_config_changed_during_switch',
+      });
+      expect(
+        closeHookCalls,
+        'no session may be closed against a target the authority no longer backs',
+      ).toBe(0);
+      const stored = JSON.parse(readFileSync(configPath, 'utf-8'))[0];
+      expect(stored.cliRuntime?.id, "the other writer's runtime must survive").toBe('runtime-b');
+      expect(stored.model, 'nothing may be committed').toBe('old-model');
+    } finally {
+      delete __testOnly_agentSwitchBeforePreCloseVerify.run;
       agentSwitchCloseHook.run = originalCloseHook;
       if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
       else process.env.BOTS_CONFIG = prevBotsConfig;

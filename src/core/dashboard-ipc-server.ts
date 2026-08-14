@@ -102,6 +102,14 @@ import { resumeSession, spawnDashboardSession, activateQueuedSession, closeCliMi
 export const agentSwitchCloseHook = {
   run: closeSessionsForAgentSwitch as typeof closeSessionsForAgentSwitch,
 };
+
+/**
+ * Deterministic interleaving point for tests only: fires immediately before the
+ * agent-switch handler re-verifies the authority version under the file lock, so
+ * a test can simulate another process committing in that window. Never set in
+ * runtime code (same pattern as file-lock's test hooks).
+ */
+export const __testOnly_agentSwitchBeforePreCloseVerify: { run?: () => void | Promise<void> } = {};
 import { parseSpawnRequest } from './session-create.js';
 import { cleanupMaterializedDashboardImages, materializeDashboardImages } from './dashboard-images.js';
 import { getCliDisplayName } from '../im/lark/card-builder.js';
@@ -4175,6 +4183,49 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
       cliPathOverride: nextRuntime?.executable ?? nextLegacyPath,
       wrapperCli: selected.wrapperCli,
     };
+
+    // PRE-CLOSE AUTHORITY RE-VERIFY, under the cross-process file lock.
+    //
+    // The commit's CAS protects the FILE, but by then the closes have already
+    // happened — and they are irreversible. Between our authority read and here,
+    // another daemon/CLI may have committed a new runtime; sessions frozen on THAT
+    // runtime are not mismatched against it, yet `switchTarget` still describes the
+    // old row, so the hook would close the wrong sessions and only afterwards would
+    // the commit refuse. Killing live sessions cannot be undone by refusing to
+    // write, so the check has to happen BEFORE the close, not just at commit time.
+    //
+    // withFileLock is not reentrant and the closes are slow, so the lock cannot be
+    // held across them; this is therefore a re-verify (write:false rmw), and the
+    // commit keeps its own CAS for the remaining close-duration window.
+    if (__testOnly_agentSwitchBeforePreCloseVerify.run) {
+      await __testOnly_agentSwitchBeforePreCloseVerify.run();
+    }
+    try {
+      const recheck = await rmwBotEntry<string>(larkAppId, (entry) => ({
+        write: false,
+        result: agentAuthorityFingerprint(entry as Record<string, unknown>),
+      }));
+      if (!recheck.ok) {
+        return jsonRes(res, 404, { ok: false, error: recheck.reason });
+      }
+      if (recheck.result !== authorityVersion) {
+        // No close has run yet, so there is nothing to report and no side effect
+        // to undo — a plain 409 the caller can retry against the new state.
+        return jsonRes(res, 409, {
+          ok: false,
+          error: 'bot_config_changed_during_switch',
+          message: '配置在本次切换过程中被其它进程修改，已在关闭任何会话前中止；请重试。',
+        });
+      }
+    } catch (err) {
+      // Cannot prove the target is still valid ⇒ fail closed, before any close.
+      return jsonRes(res, 503, {
+        ok: false,
+        error: 'bot_config_unreadable',
+        message: err instanceof Error ? err.message : String(err),
+      });
+    }
+
     const closedMismatchedSessions = await agentSwitchCloseHook.run(larkAppId, switchTarget);
     // ONE shape for every post-close exit. These closes are irreversible, so each
     // exit after them is the only report of a surviving remote session; three
