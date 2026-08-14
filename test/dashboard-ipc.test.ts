@@ -3125,10 +3125,14 @@ describe('PUT /api/bot-agent', () => {
       const targets: any[] = [];
       agentSwitchCloseHook.run = async (...args: Parameters<typeof originalCloseHook>) => {
         targets.push(args[1]);
-        const rows = JSON.parse(readFileSync(configPath, 'utf-8'));
-        rows[0].cliRuntime = { id: 'runtime-b', displayName: 'RuntimeB', executable: binB };
-        rows[0].cliPathOverride = binB;
-        writeFileSync(configPath, JSON.stringify(rows, null, 2));
+        // The REAL locked primitive, i.e. what another daemon/CLI uses. A bare
+        // writeFileSync would bypass the generation stamp and so could not model a
+        // legitimate concurrent commit at all.
+        await rmwBotEntry(appId, (entry: any) => {
+          entry.cliRuntime = { id: 'runtime-b', displayName: 'RuntimeB', executable: binB };
+          entry.cliPathOverride = binB;
+          return { write: true, result: null };
+        });
         return originalCloseHook(...args);
       };
 
@@ -3184,9 +3188,10 @@ describe('PUT /api/bot-agent', () => {
       handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
 
       agentSwitchCloseHook.run = async (...args: Parameters<typeof originalCloseHook>) => {
-        const rows = JSON.parse(readFileSync(configPath, 'utf-8'));
-        rows[0].oncallChats = [{ chatId: 'oc_other', workingDir: dir }];
-        writeFileSync(configPath, JSON.stringify(rows, null, 2));
+        await rmwBotEntry(appId, (entry: any) => {
+          entry.oncallChats = [{ chatId: 'oc_other', workingDir: dir }];
+          return { write: true, result: null };
+        });
         return originalCloseHook(...args);
       };
 
@@ -3250,11 +3255,12 @@ describe('PUT /api/bot-agent', () => {
       };
       // Another process commits runtime-B after our authority read, before the
       // close would run.
-      __testOnly_agentSwitchBeforePreCloseVerify.run = () => {
-        const rows = JSON.parse(readFileSync(configPath, 'utf-8'));
-        rows[0].cliRuntime = { id: 'runtime-b', displayName: 'RuntimeB', executable: binB };
-        rows[0].cliPathOverride = binB;
-        writeFileSync(configPath, JSON.stringify(rows, null, 2));
+      __testOnly_agentSwitchBeforePreCloseVerify.run = async () => {
+        await rmwBotEntry(appId, (entry: any) => {
+          entry.cliRuntime = { id: 'runtime-b', displayName: 'RuntimeB', executable: binB };
+          entry.cliPathOverride = binB;
+          return { write: true, result: null };
+        });
       };
 
       const saved = await fetch(`http://127.0.0.1:${handle.port}/api/bot-agent`, {
@@ -3992,6 +3998,180 @@ describe('PUT /api/bot-agent', () => {
       expect(out.storedRow.cliRuntime?.id).toBe('runtime-c');
     } finally {
       rmSync(binDir, { recursive: true, force: true });
+    }
+  });
+
+  // ABA. The case a content hash structurally cannot catch.
+  //
+  // An external writer changes the identity A->C and then puts it back C->A,
+  // straddling the close window. Hashing the current identity sees "A" at the
+  // proposal, "C" during the closes (so the gate skips them) and "A" again at the
+  // commit (so a hash CAS passes) — the switch answers 200 with
+  // closedMismatchedSessions=0 while the session frozen on the OLD A is still
+  // active: a zombie on the previous engine that keeps receiving traffic.
+  //
+  // A monotonic generation lands on gen+2, so both checks refuse.
+  it('ABA: refuses when the identity is changed and changed back around the close', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-agent-aba-'));
+    const dataDir = join(dir, 'data');
+    const configPath = join(dir, 'bots.json');
+    const appId = 'test-agent-aba';
+    const prevBotsConfig = process.env.BOTS_CONFIG;
+    const prevDataDir = config.session.dataDir;
+    const originalCloseHook = agentSwitchCloseHook.run;
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      config.session.dataDir = dataDir;
+      // A = claude-code.
+      writeFileSync(configPath, JSON.stringify([{
+        larkAppId: appId, larkAppSecret: 'secret', cliId: 'claude-code', model: 'old-model',
+      }], null, 2));
+      loadBotConfigs().forEach((c: any) => registerBot(c));
+      sessionStore.init(appId);
+
+      // A live session frozen on the OLD identity A. It mismatches our proposal B,
+      // so a correct switch would close it — but this switch must not succeed at
+      // all, and it must not be left half-done.
+      const session = sessionStore.createSession('oc_aba', 'om_aba', 'ABA', 'group');
+      session.larkAppId = appId;
+      session.cliId = 'claude-code';
+      session.agentFrozen = true;
+      sessionStore.updateSession(session);
+      const registry = new Map<string, any>([[sessionKey(session.rootMessageId, appId), {
+        session, worker: null, workerPort: null, workerToken: null,
+        larkAppId: appId, chatId: session.chatId, chatType: 'group', scope: 'thread',
+        spawnedAt: Date.now(), cliVersion: 'test', lastMessageAt: Date.now(),
+        hasHistory: true,
+      }]]);
+      workerPool.setActiveSessionsRegistry(registry);
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+
+      // Both halves of the ABA go through the REAL locked primitive, and the
+      // restore happens AFTER the close hook returns — i.e. inside the remaining
+      // window before the commit. A single pre-close write would not be an ABA.
+      let phase = 0;
+      agentSwitchCloseHook.run = async (...args: Parameters<typeof originalCloseHook>) => {
+        if (phase === 0) {
+          phase = 1;
+          // A -> C
+          await rmwBotEntry(appId, (entry: any) => {
+            entry.cliId = 'traex';
+            return { write: true, result: null };
+          });
+        }
+        const result = await originalCloseHook(...args);
+        if (phase === 1) {
+          phase = 2;
+          // C -> A: the content is identical to the proposal's snapshot again.
+          await rmwBotEntry(appId, (entry: any) => {
+            entry.cliId = 'claude-code';
+            return { write: true, result: null };
+          });
+        }
+        return result;
+      };
+
+      const res = await fetch(`http://127.0.0.1:${handle.port}/api/bot-agent`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ cliId: 'codex', model: 'new-model' }),
+      });
+      const body = await res.json();
+      const storedRow = JSON.parse(readFileSync(configPath, 'utf-8'))[0];
+
+      expect(phase, 'both halves of the ABA must have run').toBe(2);
+      expect(res.status, 'an A->C->A round trip must not be answered with 200').toBe(409);
+      expect(body).toMatchObject({ error: 'bot_config_changed_during_switch' });
+      // The external value is what survives; nothing of ours is committed.
+      expect(storedRow.cliId, "the writer's final value must survive").toBe('claude-code');
+      expect(storedRow.model, 'our model must NOT be committed').toBe('old-model');
+      // The whole point: no half-done switch. Reporting success while a session
+      // frozen on the old engine stays active is the zombie this guards.
+      expect(
+        sessionStore.getSession(session.sessionId)!.status,
+        'a refused switch must not leave a zombie: the session must not be closed',
+      ).toBe('active');
+      expect(body.closedMismatchedSessions ?? 0).toBe(0);
+    } finally {
+      agentSwitchCloseHook.run = originalCloseHook;
+      workerPool.setActiveSessionsRegistry(new Map());
+      sessionStore.init();
+      config.session.dataDir = prevDataDir;
+      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = prevBotsConfig;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('ABA: same protection on the DURABLE-only close loop', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-agent-aba-durable-'));
+    const dataDir = join(dir, 'data');
+    const configPath = join(dir, 'bots.json');
+    const appId = 'test-agent-aba-durable';
+    const prevBotsConfig = process.env.BOTS_CONFIG;
+    const prevDataDir = config.session.dataDir;
+    const originalCloseHook = agentSwitchCloseHook.run;
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      config.session.dataDir = dataDir;
+      writeFileSync(configPath, JSON.stringify([{
+        larkAppId: appId, larkAppSecret: 'secret', cliId: 'claude-code', model: 'old-model',
+      }], null, 2));
+      loadBotConfigs().forEach((c: any) => registerBot(c));
+      sessionStore.init(appId);
+
+      // Active on disk, absent from the runtime registry: the second close loop.
+      const session = sessionStore.createSession('oc_abad', 'om_abad', 'ABAd', 'group');
+      session.larkAppId = appId;
+      session.cliId = 'claude-code';
+      session.agentFrozen = true;
+      sessionStore.updateSession(session);
+      workerPool.setActiveSessionsRegistry(new Map());
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+
+      let phase = 0;
+      agentSwitchCloseHook.run = async (...args: Parameters<typeof originalCloseHook>) => {
+        if (phase === 0) {
+          phase = 1;
+          await rmwBotEntry(appId, (entry: any) => {
+            entry.cliId = 'traex';
+            return { write: true, result: null };
+          });
+        }
+        const result = await originalCloseHook(...args);
+        if (phase === 1) {
+          phase = 2;
+          await rmwBotEntry(appId, (entry: any) => {
+            entry.cliId = 'claude-code';
+            return { write: true, result: null };
+          });
+        }
+        return result;
+      };
+
+      const res = await fetch(`http://127.0.0.1:${handle.port}/api/bot-agent`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ cliId: 'codex', model: 'new-model' }),
+      });
+
+      expect(phase).toBe(2);
+      expect(res.status).toBe(409);
+      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].cliId).toBe('claude-code');
+      expect(
+        sessionStore.getSession(session.sessionId)!.status,
+        'the durable-only loop must not leave a zombie either',
+      ).toBe('active');
+    } finally {
+      agentSwitchCloseHook.run = originalCloseHook;
+      workerPool.setActiveSessionsRegistry(new Map());
+      sessionStore.init();
+      config.session.dataDir = prevDataDir;
+      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = prevBotsConfig;
+      rmSync(dir, { recursive: true, force: true });
     }
   });
 

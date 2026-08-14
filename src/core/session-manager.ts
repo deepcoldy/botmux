@@ -473,7 +473,16 @@ async function closeActiveSessionIfCliMismatch(ds: DaemonSession): Promise<CliMi
  * state expressed as a comparison target, for diagnostics.
  */
 export interface CommittedAuthoritySnapshot {
-  version: string;
+  /**
+   * Monotonic per-bot generation (config-gen.ts), NOT a content hash.
+   *
+   * A hash cannot distinguish "unchanged" from "changed and changed back": with
+   * A->C->A the gate skipped its closes during the C phase and the commit's CAS
+   * then saw A again and passed, so the switch reported success while sessions
+   * frozen on the old A stayed active. A counter that only increases lands on
+   * gen+2, so neither check can be fooled.
+   */
+  version: number;
   target: CliMismatchTargetConfig;
 }
 
@@ -484,8 +493,8 @@ export interface CommittedAuthoritySnapshot {
 export interface FreshAuthorityGuard {
   /** Re-reads the committed authority. Must hit the store on every call. */
   read: () => Promise<CommittedAuthoritySnapshot | undefined | 'unreadable'>;
-  /** Version the caller's proposal (and close target) was derived from. */
-  expectedVersion: string;
+  /** Generation the caller's proposal (and close target) was derived from. */
+  expectedVersion: number;
 }
 
 export async function closeSessionsForAgentSwitch(
@@ -511,7 +520,9 @@ export async function closeSessionsForAgentSwitch(
    *                           retry converge. Missing a close is recoverable;
    *                           closing a correct session is not.
    *
-   * Gating on the version covers every identity axis at once. Re-deriving a
+   * Gating on the generation covers every identity axis at once, and — unlike the
+   * content fingerprint this replaced — it also catches an A->C->A round trip.
+   * Re-deriving a
    * "fresh target" instead was not enough: it only tracked the runtime-preserve
    * branch and still carried the request's own cliId/wrapperCli, so a concurrent
    * selection or wrapper change was invisible and its sessions were still closed.

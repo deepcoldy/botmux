@@ -77,6 +77,7 @@ import { summaryRangeFromBotConfig, updateDashboardSummaryRange } from '../servi
 import { config } from '../config.js';
 import { buildSafeInsightConversation, buildSafeInsightOverview, buildSafeInsightReport, buildSafeInsightTurnDetail } from '../services/insight/report.js';
 import type { InsightConversationRole, InsightDetail, InsightSeverity, SafeSpanTag } from '../services/insight/types.js';
+import { configGenOf } from '../services/config-gen.js';
 import { readRawConfig, findEntryIndex, requireConfigPath, rmwBotEntry } from '../services/config-store.js';
 import { setDefaultLocale, localeForBot, t } from '../i18n/index.js';
 import { isLocale, type Locale } from '../i18n/types.js';
@@ -3142,36 +3143,6 @@ async function readMessageListenerPreviewRequest(req: IncomingMessage): Promise<
   return { ok: true, listener, limit: normalizeMessageListenerPreviewLimit(raw.limit) };
 }
 
-/**
- * Fingerprint of exactly the persisted fields the agent-switch handler derives
- * its proposal from. Used as an optimistic-concurrency version: the mutation gate
- * only serialises THIS process, but another daemon/CLI may hold the bots.json
- * file lock and commit legitimately inside our read -> irreversible-close ->
- * commit window. Writing our pre-close proposal afterwards would overwrite that
- * newer value, so the commit re-checks this fingerprint under the write lock and
- * refuses on any change.
- *
- * Only the derived-from fields are included: an unrelated edit (e.g. oncall
- * bindings) must not reject a legitimate agent switch.
- */
-function agentAuthorityFingerprint(row: Record<string, unknown> | undefined): string {
-  const stable = (v: unknown): string => {
-    if (v === null || v === undefined) return 'null';
-    if (Array.isArray(v)) return `[${v.map(stable).join(',')}]`;
-    if (typeof v === 'object') {
-      const o = v as Record<string, unknown>;
-      return `{${Object.keys(o).sort().map((k) => `${JSON.stringify(k)}:${stable(o[k])}`).join(',')}}`;
-    }
-    return JSON.stringify(v);
-  };
-  return stable({
-    cliId: row?.cliId ?? null,
-    wrapperCli: row?.wrapperCli ?? null,
-    cliRuntime: row?.cliRuntime ?? null,
-    cliPathOverride: row?.cliPathOverride ?? null,
-    reasoningEffort: row?.reasoningEffort ?? null,
-  });
-}
 
 async function collectMessageListenerPreviewMatches(
   larkAppId: string,
@@ -4004,17 +3975,20 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
     // rmw), so the snapshot and its fingerprint always describe the same
     // committed state — a plain read could observe a row mid-update. The lock is
     // released before the closes (they are slow and must not hold it), so the
-    // fingerprint is re-checked at commit time; see agentAuthorityFingerprint.
+    // generation is re-checked at commit time; see config-gen.ts.
     let persistedBotRow: Record<string, unknown>;
-    let authorityVersion: string;
+    let authorityVersion: number;
     try {
-      const snapshot = await rmwBotEntry<{ row: Record<string, unknown>; version: string }>(
+      const snapshot = await rmwBotEntry<{ row: Record<string, unknown>; version: number }>(
         larkAppId,
         (entry) => ({
           write: false,
           result: {
             row: { ...(entry as Record<string, unknown>) },
-            version: agentAuthorityFingerprint(entry as Record<string, unknown>),
+            // Monotonic generation, NOT a content hash: a hash cannot tell
+            // "unchanged" from "changed and changed back" (A->C->A), and that ABA
+            // was invisible to both the per-close gate and the commit CAS at once.
+            version: configGenOf(entry as Record<string, unknown>),
           },
         }),
       );
@@ -4226,9 +4200,9 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
       await __testOnly_agentSwitchBeforePreCloseVerify.run();
     }
     try {
-      const recheck = await rmwBotEntry<string>(larkAppId, (entry) => ({
+      const recheck = await rmwBotEntry<number>(larkAppId, (entry) => ({
         write: false,
-        result: agentAuthorityFingerprint(entry as Record<string, unknown>),
+        result: configGenOf(entry as Record<string, unknown>),
       }));
       if (!recheck.ok) {
         return jsonRes(res, 404, { ok: false, error: recheck.reason });
@@ -4259,7 +4233,7 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
     // session cannot be restored by refusing the commit, so the check has to be
     // per-close, not per-request.
     const readCommittedAuthority = async (): Promise<
-      { version: string; target: {
+      { version: number; target: {
         cliId?: typeof selected.cliId; wrapperCli?: string;
         cliRuntime?: CliRuntimeConfig; cliPathOverride?: string;
       } } | undefined | 'unreadable'
@@ -4276,7 +4250,7 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
           // instead and only tracked the runtime-preserve branch — it kept the
           // request's own cliId and wrapperCli, so a concurrent selection or
           // wrapper change stayed invisible and its sessions were still closed.
-          version: agentAuthorityFingerprint(row),
+          version: configGenOf(row),
           // The committed identity itself, for diagnostics.
           target: {
             cliId: (row.cliId ?? LEGACY_DEFAULT_CLI_ID) as typeof selected.cliId,
@@ -4337,7 +4311,7 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
     // against — describes the OLD row, so committing it now would silently
     // overwrite the other writer and answer 200 with a stale target. Refuse
     // instead; the caller can retry against the new state.
-    if (agentAuthorityFingerprint(entry as Record<string, unknown>) !== authorityVersion) {
+    if (configGenOf(entry as Record<string, unknown>) !== authorityVersion) {
       return { write: false, result: { error: 'bot_config_changed_during_switch' as const } };
     }
     const nextReasoningEffort = supportsReasoningEffort

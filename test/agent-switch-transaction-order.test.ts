@@ -177,8 +177,15 @@ describe('agent switch — no precondition runs after the irreversible close', (
     // NOT held across the irreversible closes, so another daemon/CLI can commit
     // inside our window. The commit must therefore re-verify the authority
     // version under the write lock and refuse rather than overwrite.
-    expect(ipc, 'authority fingerprint helper').toContain('function agentAuthorityFingerprint(');
-    const readAt = ipc.indexOf('let authorityVersion: string;');
+    // A MONOTONIC generation, never a content hash: a hash cannot distinguish
+    // "unchanged" from "changed and changed back", and that ABA slipped past the
+    // per-close gate and the commit CAS simultaneously.
+    expect(ipc, 'the gate must read the monotonic generation').toContain('configGenOf(');
+    expect(
+      ipc,
+      'a locally recomputed content fingerprint would reintroduce the ABA hole',
+    ).not.toContain('function agentAuthorityFingerprint(');
+    const readAt = ipc.indexOf('let authorityVersion: number;');
     expect(readAt, 'the authority version must be captured').toBeGreaterThan(0);
 
     // The snapshot read must itself be inside the cross-process lock, otherwise
@@ -211,7 +218,7 @@ describe('agent switch — no precondition runs after the irreversible close', (
     // Refusing to write afterwards cannot resurrect them.
     const closeAt = ipc.indexOf('await agentSwitchCloseHook.run(');
     const targetAt = ipc.indexOf('const switchTarget = {');
-    const verifyAt = ipc.indexOf('const recheck = await rmwBotEntry<string>(');
+    const verifyAt = ipc.indexOf('const recheck = await rmwBotEntry<');
     expect(verifyAt, 'a pre-close re-verify must exist').toBeGreaterThan(0);
     expect(
       verifyAt,
@@ -221,7 +228,7 @@ describe('agent switch — no precondition runs after the irreversible close', (
 
     // It must compare against the SAME version the commit CAS uses, under the lock.
     const block = ipc.slice(verifyAt, closeAt);
-    expect(block).toContain('agentAuthorityFingerprint(');
+    expect(block).toContain('configGenOf(');
     expect(block).toContain('write: false');
     expect(block, 'a mismatch must abort').toContain("error: 'bot_config_changed_during_switch'");
     // Pre-close exits must NOT pretend anything was closed.
@@ -252,7 +259,7 @@ describe('agent switch — no precondition runs after the irreversible close', (
     expect(readerBlock).toContain('findEntryIndex(raw, larkAppId)');
     // The version must fingerprint the row itself — NOT a target re-derived from
     // the request, which is how the selection/wrapper axes went missing.
-    expect(readerBlock).toContain('version: agentAuthorityFingerprint(row)');
+    expect(readerBlock).toContain('version: configGenOf(row)');
     expect(
       readerBlock,
       'the fresh identity must not be taken from the request',
@@ -265,15 +272,51 @@ describe('agent switch — no precondition runs after the irreversible close', (
     expect(readerBlock).toContain("'unreadable'");
   });
 
-  it('fingerprints the whole launch-identity axis', () => {
-    // Dropping any axis re-opens the hole for that axis specifically.
-    const at = ipc.indexOf('function agentAuthorityFingerprint(');
-    const body = ipc.slice(at, ipc.indexOf('\n}', at));
+  it('bumps the generation for the whole launch-identity axis', () => {
+    // The generation is what both checks compare, so an axis missing from the
+    // bump trigger is an axis whose concurrent change stays invisible.
+    const gen = readFileSync(
+      new URL('../src/services/config-gen.ts', import.meta.url), 'utf8');
+    const at = gen.indexOf('export const AUTHORITY_IDENTITY_FIELDS');
+    expect(at, 'identity field list').toBeGreaterThan(0);
+    const list = gen.slice(at, gen.indexOf('] as const', at));
     for (const field of [
       'cliId', 'wrapperCli', 'cliRuntime', 'cliPathOverride', 'reasoningEffort',
     ]) {
-      expect(body, `${field} must be part of the identity fingerprint`).toContain(field);
+      expect(list, `${field} must trigger a generation bump`).toContain(field);
     }
+  });
+
+  it('stamps the generation at the write choke points so no writer can skip it', () => {
+    // Bumping at call sites would let any forgotten writer produce an
+    // identity change that neither check can see.
+    const store = readFileSync(
+      new URL('../src/services/config-store.ts', import.meta.url), 'utf8');
+    const at = store.indexOf('export async function writeRawConfigAtomic(');
+    expect(at, 'the async write choke point').toBeGreaterThan(0);
+    const body = store.slice(at, store.indexOf('\n}', at));
+    expect(body, 'the async writer must stamp generations').toContain('stampConfigGenerations(');
+    // Previous rows must come from DISK, or a caller whose object dropped the
+    // field could roll the counter back and forge an old generation.
+    expect(body, 'the floor must be read from disk').toContain('await readRawConfig(path)');
+
+    // The setup/CLI path writes the whole file without going through the async
+    // primitive, so it needs the same stamping.
+    const bots = readFileSync(
+      new URL('../src/setup/bots-store.ts', import.meta.url), 'utf8');
+    expect(bots, 'the sync whole-file writer must stamp too')
+      .toContain('stampConfigGenerations(readBotsJsonOrEmpty(botsJsonPath), bots)');
+  });
+
+  it('never lets the generation decrease', () => {
+    const gen = readFileSync(
+      new URL('../src/services/config-gen.ts', import.meta.url), 'utf8');
+    const at = gen.indexOf('export function stampConfigGenerations(');
+    const body = gen.slice(at);
+    // Unchanged identity keeps the disk value as a floor; changed identity is
+    // strictly prevGen + 1. Neither branch can emit a smaller number.
+    expect(body).toContain('prevGen + 1');
+    expect(body).toContain('Math.max(prevGen, configGenOf(next))');
   });
 
   it('re-justifies EVERY close against the fresh authority, in both loops', () => {
@@ -320,15 +363,17 @@ describe('agent switch — no precondition runs after the irreversible close', (
   it('keeps the version check NARROW so unrelated edits do not reject a switch', () => {
     // Fingerprinting the whole row would make any concurrent edit (oncall
     // bindings, rename…) reject a legitimate agent switch.
-    const at = ipc.indexOf('function agentAuthorityFingerprint(');
-    const body = ipc.slice(at, ipc.indexOf('\n}', at));
+    const gen = readFileSync(
+      new URL('../src/services/config-gen.ts', import.meta.url), 'utf8');
+    const at = gen.indexOf('export const AUTHORITY_IDENTITY_FIELDS');
+    const list = gen.slice(at, gen.indexOf('] as const', at));
     for (const field of [
       'cliId', 'wrapperCli', 'cliRuntime', 'cliPathOverride', 'reasoningEffort',
     ]) {
-      expect(body, `${field} is derived from and must be guarded`).toContain(field);
+      expect(list, `${field} is derived from and must be guarded`).toContain(field);
     }
     for (const unrelated of ['oncallChats', 'larkAppSecret', 'botName', 'allowedChatGroups']) {
-      expect(body, `${unrelated} must NOT widen the check`).not.toContain(unrelated);
+      expect(list, `${unrelated} must NOT widen the bump trigger`).not.toContain(unrelated);
     }
   });
 

@@ -5,6 +5,7 @@
 import { promises as fsp } from 'node:fs';
 import { getLoadedConfigPath } from '../bot-registry.js';
 import { withFileLock } from '../utils/file-lock.js';
+import { stampConfigGenerations } from './config-gen.js';
 
 export async function readRawConfig(path: string): Promise<any[]> {
   const raw = JSON.parse(await fsp.readFile(path, 'utf-8'));
@@ -12,7 +13,24 @@ export async function readRawConfig(path: string): Promise<any[]> {
   return raw;
 }
 
+/**
+ * Single write choke point for bots.json.
+ *
+ * Stamps the monotonic per-bot generation here rather than at each call site, so
+ * no writer can bypass it. The previous rows are read from disk (every caller is
+ * already inside the file lock), which is what makes the counter impossible to
+ * roll back even if a caller round-tripped through a shape that dropped it.
+ */
 export async function writeRawConfigAtomic(path: string, raw: any[]): Promise<void> {
+  let prevRows: any[] = [];
+  try {
+    prevRows = await readRawConfig(path);
+  } catch {
+    // No readable predecessor (first write, or a corrupt file being replaced):
+    // stampConfigGenerations then treats every row as changed, so generations
+    // still only move forward.
+  }
+  stampConfigGenerations(prevRows, raw);
   const tmp = path + '.tmp.' + process.pid;
   // bots.json 含 appSecret —— 临时文件即以 0o600 写入，rename 后保持私有权限。
   await fsp.writeFile(tmp, JSON.stringify(raw, null, 2) + '\n', { encoding: 'utf-8', mode: 0o600 });
