@@ -46,6 +46,38 @@ describe('discoverClaudeFamilySessions', () => {
     });
   });
 
+  it('prefers a customTitle that appears after the first user prompt', async () => {
+    writeSession('-root-proj', 'rename-after-prompt', [
+      { type: 'user', cwd: '/root/proj', message: { role: 'user', content: 'fix the parser bug' } },
+      { type: 'assistant', message: { role: 'assistant', content: 'ok' } },
+      { type: 'custom-title', customTitle: '  Parser reliability  ' },
+    ]);
+    const out = await discoverClaudeFamilySessions(dataDir, 10);
+    expect(out[0]?.title).toBe('Parser reliability');
+  });
+
+  it('uses the latest valid customTitle across multiple renames', async () => {
+    writeSession('-root-proj', 'multiple-renames', [
+      { type: 'user', cwd: '/root/proj', message: { role: 'user', content: 'initial prompt' } },
+      { type: 'custom-title', customTitle: 'First name' },
+      { type: 'custom-title', customTitle: 'Latest name' },
+      { type: 'custom-title', customTitle: '   ' },
+      { type: 'custom-title', customTitle: null },
+    ]);
+    const out = await discoverClaudeFamilySessions(dataDir, 10);
+    expect(out[0]?.title).toBe('Latest name');
+  });
+
+  it('falls back to the first real user prompt when customTitle is absent or invalid', async () => {
+    writeSession('-root-proj', 'rename-fallback', [
+      { type: 'user', cwd: '/root/proj', message: { role: 'user', content: 'the fallback prompt' } },
+      { type: 'custom-title', customTitle: '' },
+      { type: 'custom-title', customTitle: 123 },
+    ]);
+    const out = await discoverClaudeFamilySessions(dataDir, 10);
+    expect(out[0]?.title).toBe('the fallback prompt');
+  });
+
   it('skips sidechain entries and slash-command meta lines when picking a title', async () => {
     writeSession('-root-proj', 'bbbb2222-0000-0000-0000-000000000002', [
       { type: 'user', cwd: '/root/proj', isSidechain: true, message: { role: 'user', content: 'subagent noise' } },
