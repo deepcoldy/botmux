@@ -3087,8 +3087,8 @@ export async function executeScheduledTask(
           larkAppId,
           chatId: task.chatId,
           whiteboardId: existing.session.whiteboardId,
-        });
           sessionBackendType: existing.session.backendType,
+        });
         rememberLastCliInput(existing, task.prompt, input);
         if (silent) armSilentScheduledTurn(existing, scheduledTurnId);
         if (existing.worker && !existing.worker.killed) {

@@ -1195,7 +1195,10 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
       // UserPromptSubmit per-turn 上下文 hook（#794）：同样写全局 settings.json。
       // 仅当 per-bot envelopeInjection=auto 时 daemon 才写 sidecar 走注入路径，
       // 其余情况 hook 触发但读不到 sidecar，空输出 no-op。
-      userPromptSubmitCommand: userPromptHookCommand(),
+      // 仅 claude-code 安装 UserPromptSubmit hook；seed/relay 等共享 adapter 的
+      // variant 不装（supportsInvisiblePromptHook 也只对 claude-code 为 true，
+      // 装了也是每轮空跑一个子进程）。
+      userPromptSubmitCommand: variant.id === 'claude-code' ? userPromptHookCommand() : undefined,
     },
     // Claude Code 把 UserPromptSubmit 的 additionalContext 注入为不可见的
     // system-reminder（TUI transcript 不可见，仅落 JSONL）。codex 会渲染成可见的
