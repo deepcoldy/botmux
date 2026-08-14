@@ -163,7 +163,12 @@ function prompt(): void {
  *  vendored composition is materialized under ~/.botmux/dsh. */
 function resolveConfigPath(): string {
   const fromEnv = process.env.DSH_CORDIS_CONFIG?.trim();
-  if (fromEnv && existsSync(fromEnv)) return fromEnv;
+  if (fromEnv) {
+    if (!existsSync(fromEnv)) {
+      throw new Error(`DSH_CORDIS_CONFIG does not exist: ${fromEnv}`);
+    }
+    return fromEnv;
+  }
   const dir = join(homedir(), '.botmux', 'dsh');
   mkdirSync(dir, { recursive: true });
   const path = join(dir, 'cordis.yml');
