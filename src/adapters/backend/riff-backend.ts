@@ -349,6 +349,12 @@ interface RiffTaskResponse {
   };
 }
 
+/** Terminal riff task statuses (riff openApiDocs task contract). Once a task
+ *  reaches one of these it will emit no further progress — an `init` replay or
+ *  a `done` event carrying one of these IS the task's completion. Non-terminal:
+ *  pending / creating_session / running. */
+const TERMINAL_RIFF_STATUSES = new Set(['completed', 'failed', 'cancelled', 'timeout']);
+
 /**
  * RiffBackend — bridges botmux's SessionBackend interface to riff's HTTP API.
  *
@@ -387,11 +393,41 @@ export class RiffBackend implements SessionBackend {
    *  cleared past 64 entries (a session rarely exceeds a few dozen turns). */
   private completedTaskIds = new Set<string>();
   private reconnectAttempts = 0;
-  private maxReconnectAttempts = 3;
+  private maxReconnectAttempts = 6;
+  /** Wall-clock ms when the CURRENT SSE connection was established, or `null`
+   *  when none is open / the last fetch never connected. Typed `number | null`
+   *  (not a 0 sentinel) on purpose: 0 is both "not connected" AND a valid number
+   *  you could subtract, so a future edit dropping the guard would compute a
+   *  bogus multi-decade lifetime from `Date.now() - 0` and refund forever. `null`
+   *  makes "never connected" un-subtractable and forces the guard at the type
+   *  level. The reconnect budget is refunded only when a broken connection had
+   *  LIVED long enough to be a healthy long connection merely severed by the
+   *  upstream proxy's fixed ~183s lifetime cap — NOT merely because a connection
+   *  opened. Keying on "connection lived ≥ reconnectHealthyConnMs" (not on
+   *  receiving init, and not on any data event — both were falsified/
+   *  insufficient) is what separates the two cases that look identical from the
+   *  client:
+   *    • healthy cap:   connection lives ~183s, EOFs → refund → task streams on
+   *    • dead/hot-loop: connection opens then EOFs within ~1s, repeatedly →
+   *      NO refund → budget exhausts and bails. Covers BOTH a fetch that never
+   *      connects (stays null) AND a "connect→init→instant-EOF" loop against a
+   *      stale-running orphan (lives <threshold) — the latter is exactly the
+   *      infinite-retry hole a naive "reset on connect/init" would reopen. */
+  private connectionStartedAtMs: number | null = null;
   /** 预算层级（单调覆盖，见 destroySession 注释）；字段化以便测试注入边界。 */
   private cancelTimeoutMs = 4_000;
   private createTimeoutMs = 10_000;
   private destroyDeadlineMs = 20_000;
+  /** SSE 重连退避基数（指数退避的第一档）；字段化以便测试把重连间隔压到 0。 */
+  private reconnectBaseDelayMs = 1_000;
+  private reconnectMaxDelayMs = 30_000;
+  /** A broken SSE connection that lived at least this long is treated as a
+   *  healthy long connection severed by the ~183s proxy cap → refund the
+   *  reconnect budget. Shorter-lived breaks (dead endpoint / instant-EOF hot
+   *  loop) do NOT refund. 30s: the cap is metronomic at ~181-183s (6× margin)
+   *  while pathological EOFs are sub-second, so the two separate cleanly.
+   *  Field-ized for test injection. */
+  private reconnectHealthyConnMs = 30_000;
   /** Exact late/current task whose close cancellation failed. Retained across
    * the prepare-close handshake so the daemon can persist a retry handle. */
   private closeFailureTaskId: string | null = null;
@@ -1236,16 +1272,27 @@ export class RiffBackend implements SessionBackend {
     if (jwt) headers['x-jwt-token'] = jwt;
 
     this.abortController = new AbortController();
+    // Per-connection lifetime clock (see field doc): null until this connection
+    // is confirmed established below. Reset PER streamTask invocation so a fetch
+    // that never connects can't inherit the previous connection's start time.
+    this.connectionStartedAtMs = null;
 
     try {
       const resp = await fetch(url, { headers, signal: this.abortController.signal });
       if (!resp.ok || !resp.body) {
         throw new Error(`SSE HTTP ${resp.status}`);
       }
+      // Connection established — start its lifetime clock. On break, catch
+      // compares elapsed against reconnectHealthyConnMs to decide whether this
+      // was a healthy ~183s-capped connection (refund budget) or a short-lived
+      // dead/hot-loop break (do not refund).
+      this.connectionStartedAtMs = Date.now();
 
-      // NOTE: reconnectAttempts is reset per TASK (createTask/followUp), not
-      // here — resetting on every 200 would let a "connect OK → immediate
-      // clean EOF" loop retry forever.
+      // NOTE: reconnectAttempts is reset per TASK (createTask/followUp) AND
+      // whenever a broken connection had LIVED ≥ reconnectHealthyConnMs (see the
+      // catch) — NOT unconditionally on every 200, which would let a "connect OK
+      // → instant EOF" loop retry forever (the hole the per-task-only reset
+      // originally guarded, which a naive "reset on connect/init" reopens).
       const reader = resp.body.getReader();
       const decoder = new TextDecoder();
       let buffer = '';
@@ -1288,10 +1335,29 @@ export class RiffBackend implements SessionBackend {
       if (taskId !== this.currentTaskId || this.completedTaskIds.has(taskId)) return;
       logger.warn(`[riff] SSE stream error: ${err}`);
 
+      // Core fix: an upstream proxy caps each task-stream connection at a fixed
+      // ~183s lifetime and closes it with a clean EOF (no done event) — verified
+      // against live data: tasks that "重连失败" had actually COMPLETED server-
+      // side; botmux gave up ~22s early on one, 16min early on another. A healthy
+      // long runner task thus breaks every ~183s. If this just-broken connection
+      // had LIVED long enough (≥ reconnectHealthyConnMs), it was such a healthy
+      // capped connection — refund the reconnect budget so those periodic caps
+      // never accumulate into a false failure, letting the task stream until it
+      // truly finishes. A short-lived break (dead endpoint that never connected,
+      // or a connect→instant-EOF hot loop against a stale-running orphan) does
+      // NOT refund, so it still exhausts the budget and bails (no infinite
+      // retry). Keyed on connection LIFETIME — not on connect/init receipt,
+      // which would refund every attempt and reopen the infinite-retry hole.
+      const connLivedMs = this.connectionStartedAtMs !== null ? Date.now() - this.connectionStartedAtMs : 0;
+      if (connLivedMs >= this.reconnectHealthyConnMs) this.reconnectAttempts = 0;
+
       // Attempt reconnect if task is still running
       if (!this.killed && !this.taskDone && this.reconnectAttempts < this.maxReconnectAttempts) {
         this.reconnectAttempts++;
-        const delay = 1000 * this.reconnectAttempts;
+        // Exponential backoff with a cap: 1s,2s,4s,8s,16s,30s(cap). Linear 1s/2s/3s
+        // was negligible against a ~180s connection lifetime anyway; the cap keeps
+        // a truly-unreachable gateway from stalling teardown for minutes.
+        const delay = Math.min(this.reconnectMaxDelayMs, this.reconnectBaseDelayMs * 2 ** (this.reconnectAttempts - 1));
         logger.info(`[riff] SSE reconnect attempt ${this.reconnectAttempts}/${this.maxReconnectAttempts} in ${delay}ms`);
         this.emitLine(`[riff] 连接中断，正在重连 (${this.reconnectAttempts}/${this.maxReconnectAttempts})`, 'warn');
         await new Promise((r) => setTimeout(r, delay));
@@ -1302,6 +1368,47 @@ export class RiffBackend implements SessionBackend {
       } else if (!this.killed && !this.taskDone) {
         this.emitError(`SSE 连接中断，重连失败`);
       }
+    }
+  }
+
+  /**
+   * Fire a task's completion exactly once — the turn boundary + final-output
+   * fetch. Called from BOTH the `done` SSE event AND an `init` replay carrying a
+   * terminal status (the task finished while a prior connection was dead and its
+   * `done` was lost with the closed stream). Idempotency & staleness — per TASK,
+   * not per backend: streams can deliver done more than once (observed ~500ms
+   * apart live), and by the time a duplicate (or a reconnect's init replay)
+   * arrives, a queued follow-up may already be running as the NEXT task (write()
+   * reset the global taskDone). A plain boolean guard would re-fire the boundary
+   * mid-way through that next task and falsely mark it done, so gate on:
+   *   1) the completion must belong to the CURRENT task (stale streams no-op)
+   *   2) each task fires the boundary at most once (completedTaskIds)
+   */
+  private completeTask(taskId: string, status: string | undefined, exitCode: number | undefined): void {
+    if (taskId !== this.currentTaskId) return;
+    if (this.completedTaskIds.has(taskId)) return;
+    this.completedTaskIds.add(taskId);
+    // Bounded FIFO eviction — never a blanket clear(), which would drop the id
+    // just added and let its ~500ms duplicate done re-fire.
+    while (this.completedTaskIds.size > 64) {
+      const oldest = this.completedTaskIds.values().next().value!;
+      if (oldest === taskId) break;
+      this.completedTaskIds.delete(oldest);
+    }
+    this.taskDone = true;
+    if (this.config.injectStatusLines !== false) {
+      this.emitLine(`[riff] 任务完成${status ? ` (${status}${exitCode != null ? `, exit=${exitCode}` : ''})` : ''}`, status === 'failed' ? 'warn' : 'ok');
+    }
+    // Fetch final output from task-detail API (SSE has no output events for
+    // runner tasks) BEFORE firing the turn boundary: the boundary flushes queued
+    // follow-ups → currentTaskId flips to the next task → the stale guard would
+    // (correctly) drop THIS task's only report.
+    if (status === 'completed' || status === 'failed') {
+      void this.fetchAndEmitOutput(taskId)
+        .catch(() => { /* logged inside */ })
+        .finally(() => { this.taskDoneCb?.(); });
+    } else {
+      this.taskDoneCb?.();
     }
   }
 
@@ -1362,44 +1469,27 @@ export class RiffBackend implements SessionBackend {
           if (changed && !this.accessUrlIsDirect) {
             void this.fetchDirectAccessUrl(taskId);
           }
+          // init REPLAYS the full accumulated task state, including a terminal
+          // `status` when the task finished while our previous connection was
+          // dead (the ~183s cap closes mid-flight and the `done` event is lost
+          // with it). Consume that replay: a terminal status here IS the missed
+          // completion — route it through the same completion path so the turn
+          // ends cleanly instead of the budget eventually exhausting into a
+          // false "重连失败". Non-terminal (running/pending/…) just means the
+          // reconnect resumed a still-live task — no completion, keep streaming.
+          if (eventType === 'init') {
+            const initStatus = data['status'] as string | undefined;
+            if (initStatus && TERMINAL_RIFF_STATUSES.has(initStatus)) {
+              const exitCode = data['exitCode'] as number | undefined;
+              this.completeTask(taskId, initStatus, exitCode);
+            }
+          }
           break;
         }
         case 'done': {
-          // Idempotency & staleness — per TASK, not per backend: streams can
-          // deliver done more than once (observed ~500ms apart live), and by
-          // the time the duplicate arrives a queued follow-up may already be
-          // running as the NEXT task (write() reset the global taskDone). A
-          // plain boolean guard would re-fire the turn-boundary callback mid-
-          // way through that next task and falsely mark it done, so gate on:
-          //   1) the done must belong to the CURRENT task (stale streams no-op)
-          //   2) each task fires the boundary at most once (completedTaskIds)
-          if (taskId !== this.currentTaskId) break;
-          if (this.completedTaskIds.has(taskId)) break;
-          this.completedTaskIds.add(taskId);
-          // Bounded FIFO eviction — never a blanket clear(), which would drop
-          // the id just added and let its ~500ms duplicate done re-fire.
-          while (this.completedTaskIds.size > 64) {
-            const oldest = this.completedTaskIds.values().next().value!;
-            if (oldest === taskId) break;
-            this.completedTaskIds.delete(oldest);
-          }
-          this.taskDone = true;
           const status = data['status'] as string | undefined;
           const exitCode = data['exitCode'] as number | undefined;
-          if (this.config.injectStatusLines !== false) {
-            this.emitLine(`[riff] 任务完成${status ? ` (${status}${exitCode != null ? `, exit=${exitCode}` : ''})` : ''}`, status === 'failed' ? 'warn' : 'ok');
-          }
-          // Fetch final output from task-detail API (SSE has no output events
-          // for runner tasks) BEFORE firing the turn boundary: the boundary
-          // flushes queued follow-ups → currentTaskId flips to the next task →
-          // the stale guard would (correctly) drop THIS task's only report.
-          if (status === 'completed' || status === 'failed') {
-            void this.fetchAndEmitOutput(taskId)
-              .catch(() => { /* logged inside */ })
-              .finally(() => { this.taskDoneCb?.(); });
-          } else {
-            this.taskDoneCb?.();
-          }
+          this.completeTask(taskId, status, exitCode);
           // NOTE: task done does NOT trigger onExit — session stays alive
           // for follow-up messages. Only /close or unrecoverable errors exit.
           break;

@@ -4283,7 +4283,9 @@ export function GrantSection(props: { bot: BotDefaultsRow; patchBot: PatchBot })
     rollback?: () => void,
   ): Promise<void> {
     setBusy(key);
-    setStatus(null);
+    setStatus(key === 'duration' || key === 'quota'
+      ? { text: tr('botDefaults.grantDefaultsSaving') }
+      : null);
     try {
       const res = await sendJson('PUT', `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/grant-prefs`, patch);
       if (res.ok && res.body.ok) {
@@ -4305,7 +4307,7 @@ export function GrantSection(props: { bot: BotDefaultsRow; patchBot: PatchBot })
           grantDefaultDurationMs: nextDuration,
           messageQuotaDefaultLimit: nextQuota,
         });
-        if (key === 'defaults') setQuotaError(null);
+        if ('messageQuotaDefaultLimit' in patch) setQuotaError(null);
         setStatus({ text: `✓ ${tr('botDefaults.cardPrefSaved')}`, ok: true });
       } else {
         rollback?.();
@@ -4319,32 +4321,38 @@ export function GrantSection(props: { bot: BotDefaultsRow; patchBot: PatchBot })
     }
   }
 
-  function saveDefaults(): void {
-    const parsed = positiveIntegerOrNull(quotaInput);
-    const quotaChanged = parsed !== quota;
+  function saveDuration(nextInput: string): void {
+    setDurationInput(nextInput);
     setStatus(null);
-    if (quotaChanged && (parsed === 'invalid'
-      || (typeof parsed === 'number' && parsed > MAX_GRANT_QUOTA))) {
-      setQuotaError(tr('botDefaults.quotaInvalid'));
-      return;
-    }
-    setQuotaError(null);
-    const durationMs = Number(durationInput);
+    const durationMs = Number(nextInput);
     if (!GRANT_DURATION_VALUES.includes(durationMs as (typeof GRANT_DURATION_VALUES)[number])) {
       setStatus({ text: `✗ ${tr('botDefaults.grantDurationInvalid')}` });
       return;
     }
-    const patch: {
-      grantDefaultDurationMs?: number | null;
-      messageQuotaDefaultLimit?: number | null;
-    } = {};
-    if (durationMs !== (duration ?? DEFAULT_GRANT_DURATION_MS)) {
-      patch.grantDefaultDurationMs = durationMs === DEFAULT_GRANT_DURATION_MS ? null : durationMs;
+    const nextDuration = durationMs === DEFAULT_GRANT_DURATION_MS ? null : durationMs;
+    if (nextDuration === duration) return;
+    const previousInput = String(duration ?? DEFAULT_GRANT_DURATION_MS);
+    void savePatch(
+      { grantDefaultDurationMs: nextDuration },
+      'duration',
+      () => setDurationInput(previousInput),
+    );
+  }
+
+  function saveQuota(): void {
+    const parsed = positiveIntegerOrNull(quotaInput);
+    const quotaChanged = parsed !== quota;
+    setStatus(null);
+    if (!quotaChanged) {
+      setQuotaError(null);
+      return;
     }
-    if (quotaChanged) {
-      patch.messageQuotaDefaultLimit = parsed;
+    if (parsed === 'invalid' || (typeof parsed === 'number' && parsed > MAX_GRANT_QUOTA)) {
+      setQuotaError(tr('botDefaults.quotaInvalid'));
+      return;
     }
-    if (Object.keys(patch).length > 0) void savePatch(patch, 'defaults');
+    setQuotaError(null);
+    void savePatch({ messageQuotaDefaultLimit: parsed }, 'quota');
   }
 
   const durationOptions: DropdownFieldOption<string>[] = [
@@ -4357,11 +4365,22 @@ export function GrantSection(props: { bot: BotDefaultsRow; patchBot: PatchBot })
   const currentDurationLabel = currentDuration === DEFAULT_GRANT_DURATION_MS
     ? tr('botDefaults.grantDuration1HourValue')
     : String(durationOptions.find(option => option.value === String(currentDuration))?.label ?? '');
-  const parsedQuotaInput = positiveIntegerOrNull(quotaInput);
-  const quotaInputDirty = parsedQuotaInput === 'invalid' || parsedQuotaInput !== quota;
-  const defaultsDirty = durationInput !== String(currentDuration) || quotaInputDirty;
+  const quotaHelp = quota === null
+    ? tr('botDefaults.quotaHelpBuiltIn', { count: DEFAULT_GRANT_QUOTA })
+    : quota > MAX_GRANT_QUOTA
+      ? tr('botDefaults.quotaHelpLegacy', {
+        cardCount: MAX_GRANT_QUOTA,
+        oncallCount: quota,
+        defaultCount: DEFAULT_GRANT_QUOTA,
+      })
+      : tr('botDefaults.quotaHelpCustom', {
+        count: quota,
+        defaultCount: DEFAULT_GRANT_QUOTA,
+      });
   const currentState = quota === null
-    ? tr('botDefaults.grantDefaultsCurrentBuiltIn', {
+    ? tr(duration === null
+      ? 'botDefaults.grantDefaultsCurrentBuiltIn'
+      : 'botDefaults.grantDefaultsCurrentCustomBuiltInQuota', {
       duration: currentDurationLabel,
       count: DEFAULT_GRANT_QUOTA,
     })
@@ -4422,7 +4441,7 @@ export function GrantSection(props: { bot: BotDefaultsRow; patchBot: PatchBot })
         noValidate
         onSubmit={event => {
           event.preventDefault();
-          saveDefaults();
+          saveQuota();
         }}
       >
         <div className="bd-row bd-grant-duration">
@@ -4434,23 +4453,20 @@ export function GrantSection(props: { bot: BotDefaultsRow; patchBot: PatchBot })
               options={durationOptions}
               disabled={busy !== null}
               ariaLabel={tr('botDefaults.grantDurationDefault')}
-              onChange={value => {
-                setDurationInput(value);
-                setStatus(null);
-              }}
+              onChange={saveDuration}
             />
           </div>
         </div>
         <div className="bd-row bd-quota">
           <label>
-            <FieldTitle help={tr('botDefaults.quotaHelp')}>{tr('botDefaults.quotaDefault')}</FieldTitle>
+            <FieldTitle help={quotaHelp}>{tr('botDefaults.quotaDefault')}</FieldTitle>
             <input
               type="number"
               min={1}
               max={MAX_GRANT_QUOTA}
               step={1}
               data-input="quotaLimit"
-              placeholder={tr('botDefaults.quotaPlaceholder')}
+              placeholder={tr('botDefaults.quotaPlaceholder', { count: DEFAULT_GRANT_QUOTA })}
               value={quotaInput}
               disabled={busy !== null}
               aria-label={tr('botDefaults.quotaDefault')}
@@ -4461,15 +4477,18 @@ export function GrantSection(props: { bot: BotDefaultsRow; patchBot: PatchBot })
                 setQuotaError(null);
                 setStatus(null);
               }}
+              onBlur={saveQuota}
+              onKeyDown={event => {
+                if (event.key !== 'Enter') return;
+                event.preventDefault();
+                event.currentTarget.blur();
+              }}
             />
           </label>
           {quotaError ? <small id="grant-default-quota-error" className="bd-field-error" role="alert">{quotaError}</small> : null}
           <small id="grant-defaults-state" data-grant-defaults-state>{currentState}</small>
         </div>
         <div className="actions">
-          <button type="submit" className="primary" data-action="save-grant-defaults" disabled={busy !== null || !defaultsDirty}>
-            {busy === 'defaults' ? tr('botDefaults.grantDefaultsSaving') : tr('botDefaults.grantDefaultsSave')}
-          </button>
           <StatusSpan status={status} attr={{ 'data-grant-status': '' }} />
         </div>
       </form>
