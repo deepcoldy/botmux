@@ -250,6 +250,11 @@ whiteboard 块本就是操作指南（陈述句式），基本平移。spike 对
 
 - [x] webui 开关（bot-defaults 高级标签页，仅 claude-code 显示；`PUT /api/bots/:appId/envelope-injection` → daemon `/api/bot-envelope-injection` → applyConfigField）
 - [x] 文案改造（新增 `ai.followup.reminder_hook` 描述式文案，hook 模式专用）
+- [x] review 反馈修复（2026-08-14，第三个提交）：
+  - MEDIUM 1：指纹从全串 sha256 改为 30 字符前缀（与 makeSubmitFingerprint 同长），抗 paste 模式尾部污染
+  - MEDIUM 2：read-isolation 下 preflight 改查 per-bot BOT_HOME/claude/settings.json（与 worker 的 effectiveReadyHookInstall 同逻辑）
+  - LOW 1：stdout.write 回调后 exit + 1s 兜底
+  - LOW 2：会话关闭清理 prompt-ctx/<sid>/
 - [ ] 真实会话验证（Q1 JSONL 形态、Q2 TUI 不可见、Q3 沙盒可读、Q4 type-ahead、Q7 共存）
 - [ ] 默认值翻 auto（灰度后）
 
