@@ -1,58 +1,57 @@
-# 接入 DeepSeek Harness（dsh）
+# DeepSeek Harness（dsh）机器人接入指南
 
-botmux 的 dsh 适配器把飞书机器人接到 deepseek-harness：会话由 dsh 的 agent 组合驱动，模型调用走组合里的 `llm-deepseek`。需要包含 dsh 适配器的 botmux 版本——dashboard 的 CLI 下拉里能看到 **DeepSeek Harness** 即说明版本满足；看不到说明版本过旧，先升级。
+> dsh 适配器把飞书机器人接到 deepseek-harness 运行时：botmux 内置的 `dsh-runner.js` 启动 `dsh-jsonrpc-agent`（需单独安装），后者加载 cordis 组合，模型调用走组合里的 `llm-deepseek`。要求 botmux 包含 dsh 适配器——dashboard 的 CLI 下拉里能看到 **DeepSeek Harness** 即满足要求。
 
-> 最反直觉的一点先放前面：**dsh 的凭据不读 `~/.dsh`**。`settings.yaml`、`.credentials.yaml` 里配了也不生效，key 只能靠环境变量进进程。第一次接入最容易在这里卡住，详见[配置凭据](#配置凭据)。
+## 快速接入
 
-## 跑起来
+1. 前提：botmux daemon 正常运行；已安装 `dsh-jsonrpc-agent`（见「安装 dsh 运行时」）；有一个飞书机器人。
+2. 打开 dashboard → 选中机器人 →「Agent 配置」→ CLI 下拉选择 **DeepSeek Harness**（`cliId: "dsh"`）。
+3. 配置项：
 
-要装的东西只有一样：dsh 运行时本体。
+   | 字段 | 说明 |
+   |------|------|
+   | `model` | 默认 `deepseek-v4-flash`，可选 `deepseek-v4-pro` |
+   | `workingDir` | 会话工作目录 |
+   | `provider` | 无需配置。runner 固定使用 `deepseek-official` 路由；该路由的 key / baseURL 只能通过环境变量与组合配置调整（见下），不支持更换其它 provider 路由 |
 
-botmux 自带的桥接层 `dsh-runner.js` 随构建分发，不用管；要装的是 `dsh-jsonrpc-agent`，deepseek-harness 的单文件运行时：
+4. 配置凭据（见「凭据配置」）。
+5. 群里 @机器人 发消息即可。报错对照文末「常见问题」逐条排查。
+
+## 安装 dsh 运行时
+
+`dsh-runner.js` 随 botmux 构建分发，无需安装；需要安装的是 `dsh-jsonrpc-agent`，deepseek-harness 的单文件运行时：
 
 ```bash
-pip install deepseek-harness-sdk   # 会带上 deepseek-harness-runtime-bin 平台 wheel，提供 dsh-jsonrpc-agent
+pip install deepseek-harness-sdk   # 依赖 deepseek-harness-runtime-bin，提供 dsh-jsonrpc-agent
 ```
 
-装完确认 `dsh-jsonrpc-agent` 在 daemon 的 PATH 上；不在就给机器人配 `pathOverride` 指绝对路径。运行时内部捆绑了组合要用的 8 个插件，不需要再装任何插件。
+安装后确认 `dsh-jsonrpc-agent` 在 daemon 的 PATH 上；不在则给机器人配置 `pathOverride` 指定绝对路径。组合所需插件（sdk-jsonrpc-server / agent-spine-demo / llm-deepseek / session-persistence-jsonl / session-checkpoint-policy / subprocess-local / bash-local / fs-local）捆绑在运行时内部，配置里只写 `name`，无需单独安装。
 
-然后 dashboard → 机器人 →「Agent 配置」→ CLI 选 **DeepSeek Harness**（`cliId: "dsh"`），填这几个：
+## 凭据配置
 
-- `model`：默认 `deepseek-v4-flash`，需要更强可选 `deepseek-v4-pro`
-- `workingDir`：会话工作目录
-- `provider`：无需配置。runner 固定走 `deepseek-official` 路由；想改这条路由的 key / baseURL，只能通过环境变量和组合配置（见下），换不了其它路由
+dsh 适配器**不读取 `~/.dsh` 全局配置**：botmux 的组合里没有挂载 `dsh-settings-file` / `dsh-credentials-local` / `llm-pi-ai`，`~/.dsh/settings.yaml` 与 `~/.dsh/.credentials.yaml` 均不生效，凭据只能通过环境变量传入进程（报错 "export DEEPSEEK_API_KEY in the launching environment" 即由此而来）。
 
-key 按下一节配好后，@机器人 发消息即可。报错对照文末[排错速查](#排错速查)。
-
-## 配置凭据
-
-dsh 在 botmux 里的凭据链路和单独用 dsh 时不一样。botmux 的组合里没有 `dsh-settings-file` / `dsh-credentials-local` / `llm-pi-ai` 这几个插件，所以 `~/.dsh/settings.yaml`（默认模型、路由那些）和 `~/.dsh/.credentials.yaml`（key）**全部不生效**——报错提示 "export DEEPSEEK_API_KEY in the launching environment" 就是这个原因。
-
-想复刻 `~/.dsh` 里的配置，把它拆成三处：环境变量（key）、组合配置（路由的 key 引用和 baseURL）、bot 的 `model` 字段（模型）。
+要复刻 `~/.dsh` 的配置效果，将其拆成三处：环境变量（key）、组合配置（key 引用与 baseURL）、bot 的 `model` 字段（模型）。
 
 ### 环境变量
 
-| 变量 | 什么时候要 | 作用 |
-|------|-----------|------|
-| `DEEPSEEK_API_KEY` | 走官方 API | `llm-deepseek` 默认读的 key |
-| `OPENCODE_GO_API_KEY` | 走 zen/go 网关 | 自定义组合里把 `apiKeyEnv` 指到它 |
-| `DSH_CORDIS_CONFIG` | 用了自定义组合 | 指向自定义 cordis.yml 的绝对路径 |
-| `DEEPSEEK_BASE_URL` | 可选 | 组合里没写 `baseURL` 时用这个兜底 |
+| 变量 | 何时需要 | 作用 |
+|------|---------|------|
+| `DEEPSEEK_API_KEY` | 走官方 API | `llm-deepseek` 默认读取的 key |
+| `OPENCODE_GO_API_KEY` | 走 zen/go 网关 | 自定义组合中把 `apiKeyEnv` 指向它 |
+| `DSH_CORDIS_CONFIG` | 使用自定义组合 | 自定义 cordis.yml 的绝对路径 |
+| `DEEPSEEK_BASE_URL` | 可选 | 组合未配置 `baseURL` 时的兜底端点 |
 
-### 怎么把变量送进进程
+### 注入方式
 
-两种方式，推荐第一种：
+- **per-bot env（推荐）**：`bots.json` 的 `env` 字段，或 dashboard 机器人配置页「运行时环境变量」。按会话注入，新会话生效，不影响其它机器人。沙箱模式下该变量可能不会传递，遇到时改用 daemon 环境。
+- **daemon 环境**：export 后重启 daemon。pm2 保留首次启动时捕获的环境，修改后需 `pm2 restart --update-env`（或 delete + start）才会更新。
 
-- **per-bot env**：`bots.json` 的 `env` 字段，或 dashboard 机器人配置页的「运行时环境变量」。按会话注入，新会话生效，不影响别的机器人。
-- **daemon 环境**：export 之后重启 daemon。注意 pm2 只保留首次启动时捕获的环境，改过之后要 `pm2 restart --update-env`（或者 delete + start）才生效，只 `botmux restart` 不行。
+## 自定义组合（可选）
 
-per-bot env 在沙箱模式下偶尔透传不进去，遇到这种情况退回 daemon 环境即可。
+runner 每次启动会把内置的默认组合覆写到 `~/.botmux/dsh/cordis.yml`，直接修改该文件无效。需要自定义时设置 `DSH_CORDIS_CONFIG=<绝对路径>`，runner 优先读取该文件。
 
-### 自定义组合（可选）
-
-runner 每次启动会把内置的默认组合**覆写**到 `~/.botmux/dsh/cordis.yml`——直接改这个文件没用，改完下次启动就被覆盖。要自定义，设置 `DSH_CORDIS_CONFIG=<绝对路径>`，runner 优先读这个文件。
-
-默认组合的完整内容如下；需要改路由时复制一份，只调整 `llm-deepseek` 那一段即可。下面是走 zen/go 网关的示例：
+默认组合如下；需要改路由时复制一份，仅调整 `llm-deepseek` 段。以下为走 zen/go 网关的示例：
 
 ```yaml
 - id: sdk-jsonrpc-server
@@ -76,23 +75,19 @@ runner 每次启动会把内置的默认组合**覆写**到 `~/.botmux/dsh/cordi
   name: '@deepseek-ai/dsh-fs-local'
 ```
 
-## 原理速览
+## 会话与版本
 
-一条链：飞书消息 → botmux daemon → worker → `dsh-runner.js`（botmux 的桥接层）→ `dsh-jsonrpc-agent`（你装的运行时）→ 组合里的 `llm-deepseek` → HTTP 调模型。
+- **会话目录**：`~/.botmux/dsh/`，runner 自动创建，适配器将其声明为 `authPaths`，文件沙箱内可写。
+- **版本兼容**：botmux 内置默认组合与 dsh 运行时的协议版本绑定，升级 dsh 运行时前需确认与当前 botmux runner 的协议兼容。
 
-两个容易忽略的点：
+## 常见问题
 
-- **升级 dsh 运行时要谨慎**：botmux 内置的默认组合和 dsh 的协议版本绑定，运行时大版本升级前先确认和当前 botmux 的 runner 兼容。
-- **会话落在哪**：`~/.botmux/dsh/`，runner 自动创建，适配器把它声明为 `authPaths`，文件沙箱里也可写。
+| 现象 | 原因与处理 |
+|------|-----------|
+| dashboard 无 DeepSeek Harness 选项 | botmux 版本过旧，无 dsh 适配器。升级 botmux |
+| 报找不到 dsh-jsonrpc-agent | 运行时未安装或不在 PATH。安装 `deepseek-harness-sdk` 并将 `dsh-jsonrpc-agent` 加入 PATH（或配置 `pathOverride`） |
+| `no API key for provider route "deepseek-official"` | key 未进入进程环境（`~/.dsh/.credentials.yaml` 不生效）。通过 per-bot env 或 daemon 环境配置 key |
+| per-bot env 已配置仍报缺 key | 沙箱未传递该环境变量。改用 daemon 环境（export 后 `pm2 restart --update-env`） |
+| `UNKNOWN_MODEL` 或 401 | model 不在该路由的模型列表，或 key 有误。核对 model 字段、key、baseURL |
 
-## 排错速查
-
-| 现象 | 原因 | 处理 |
-|------|------|------|
-| dashboard 里没有 DeepSeek Harness 选项 | botmux 版本旧，没有 dsh 适配器 | 升级 botmux |
-| 有选项，但报找不到 dsh-jsonrpc-agent | 运行时没装，或不在 PATH | `pip install deepseek-harness-sdk`，把 `dsh-jsonrpc-agent` 放进 PATH（或配 `pathOverride`） |
-| `no API key for provider route "deepseek-official"` | key 没进进程环境，`~/.dsh/.credentials.yaml` 不算数 | 用 per-bot env 或 daemon 环境配 key |
-| per-bot env 配了还是报缺 key | 沙箱可能没透传这个变量 | 退回 daemon 环境：export 后 `pm2 restart --update-env` |
-| `UNKNOWN_MODEL` 或 401 | model 不在该路由的模型列表里，或 key 不对 | 核对 model 字段、key、baseURL 三者 |
-
-`GET /api/cli-options` 返回 `dsh: available: true/false`，可以快速确认适配器本身是否可用。
+`GET /api/cli-options` 返回 `dsh: available: true/false`，可确认适配器是否可用。
