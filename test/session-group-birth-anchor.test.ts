@@ -17,6 +17,13 @@
  * split — plus a non-birth control so the default path stays keyed on the
  * inbound message id.
  *
+ * They also guard the TURN-IDENTITY chain (PR review blocking bug): the first
+ * turn's fork turnId must equal the reply anchor, because
+ * resolveCurrentTurnProvenance() requires session.quoteTargetId ===
+ * marker.turnId (and currentReplyTarget.turnId === marker.turnId when set) —
+ * otherwise every agent-side mutating command fails closed on the session's
+ * first turn.
+ *
  * Run:  pnpm vitest run test/session-group-birth-anchor.test.ts
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
@@ -118,6 +125,13 @@ import {
   __testOnly_activeSessions as activeSessions,
   __testOnly_handleNewTopic as handleNewTopic,
 } from '../src/daemon.js';
+// Deliberately UNMOCKED: the provenance tests below run the real resolver
+// against a real (self-pid) authenticated ancestor marker.
+import {
+  resolveCurrentTurnProvenance,
+  CurrentTurnProvenanceError,
+} from '../src/core/current-turn-provenance.js';
+import { readProcessStartIdentity } from '../src/core/session-marker.js';
 import type { RoutingContext } from '../src/im/lark/event-dispatcher.js';
 
 const APP = 'sg_anchor_app';
@@ -200,7 +214,17 @@ beforeEach(() => {
   mocks.downloadResources.mockClear();
   mocks.expandMergeForward.mockClear();
   mocks.createSession.mockClear();
+  mocks.forkWorker.mockClear();
 });
+
+/** forkWorker(ds, input, resumeOrTurnId) — the 3rd arg is `false | string |
+ * { turnId?, ... }`; the new-topic spawn path passes `{ turnId }`. */
+function forkedTurnId(call: any[]): string | undefined {
+  const resumeOrTurnId = call[2];
+  if (typeof resumeOrTurnId === 'string') return resumeOrTurnId;
+  if (resumeOrTurnId && typeof resumeOrTurnId === 'object') return resumeOrTurnId.turnId;
+  return undefined;
+}
 
 describe('session-group birth first-turn anchoring (image/file/merge_forward)', () => {
   it('downloads first-turn image resources with the ORIGINAL DM message id, not the intro anchor', async () => {
@@ -276,5 +300,71 @@ describe('session-group birth first-turn anchoring (image/file/merge_forward)', 
     expect(mocks.createdSessions).toHaveLength(1);
     expect(mocks.createdSessions[0].rootMessageId).toBe(SOURCE_MSG);
     expect(mocks.createdSessions[0].quoteTargetId).toBe(SOURCE_MSG);
+  });
+
+  it('birth first turn: fork turnId === quoteTargetId, and the REAL current-turn provenance resolver accepts it', async () => {
+    await handleNewTopic(makeImageEventData(), birthCtx());
+
+    // The worker's turn-identity chain starts at forkWorker's { turnId } — the
+    // worker writes it into the .botmux-cli-pids ancestor marker that
+    // resolveCurrentTurnProvenance() later authenticates.
+    expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
+    const forkTurnId = forkedTurnId(mocks.forkWorker.mock.calls[0]);
+    expect(forkTurnId).toBe(INTRO_MSG);
+
+    expect(mocks.createdSessions).toHaveLength(1);
+    const session = mocks.createdSessions[0];
+    // Provenance contract, leg 1: quoteTargetId === marker.turnId.
+    expect(session.quoteTargetId).toBe(forkTurnId);
+    // Provenance contract, leg 2: a persisted currentReplyTarget (if any) must
+    // carry the same turn id. Birth turns have no chat reply thread root
+    // (replyRootId undefined), so this is normally unset — but if a future
+    // change sets one, it must match or provenance fails closed.
+    if (session.currentReplyTarget) {
+      expect(session.currentReplyTarget.turnId).toBe(forkTurnId);
+    }
+
+    // Now run the REAL resolver end-to-end: persist the exact session object
+    // the daemon just built (what sessions.json would contain), plus a real
+    // authenticated ancestor marker for THIS test process — its own pid and
+    // true procStart — carrying the fork turnId.
+    const provDir = join(mocks.dataDir, `prov-${session.sessionId}`);
+    mkdirSync(join(provDir, '.botmux-cli-pids'), { recursive: true });
+    writeFileSync(join(provDir, 'sessions.json'), JSON.stringify({ [session.sessionId]: session }));
+    const procStart = readProcessStartIdentity(process.pid);
+    expect(procStart).toBeTruthy();
+    const writeMarker = (turnId: string) => writeFileSync(
+      join(provDir, '.botmux-cli-pids', String(process.pid)),
+      JSON.stringify({ sessionId: session.sessionId, turnId, procStart }),
+    );
+
+    writeMarker(forkTurnId!);
+    const provenance = resolveCurrentTurnProvenance({ dataDir: provDir, startPid: process.pid });
+    expect(provenance).not.toBeNull();
+    expect(provenance!.turnId).toBe(INTRO_MSG);
+    expect(provenance!.sessionId).toBe(session.sessionId);
+    expect(provenance!.callerOpenId).toBe(OWNER);
+    expect(provenance!.chatId).toBe(GROUP_CHAT);
+
+    // Regression guard for the fixed bug: a worker chain still keyed on the
+    // ORIGINAL DM id would make first-turn agent commands fail closed
+    // (quoteTargetId=om_intro vs marker.turnId=om_source mismatch).
+    writeMarker(SOURCE_MSG);
+    expect(() => resolveCurrentTurnProvenance({ dataDir: provDir, startPid: process.pid }))
+      .toThrow(CurrentTurnProvenanceError);
+  });
+
+  it('non-birth control: fork turnId and quoteTargetId both equal the inbound message id', async () => {
+    await handleNewTopic(makeImageEventData(), birthCtx({
+      sessionGroupBirth: undefined,
+      replyAnchorMessageId: undefined,
+    }));
+
+    expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
+    const forkTurnId = forkedTurnId(mocks.forkWorker.mock.calls[0]);
+    expect(forkTurnId).toBe(SOURCE_MSG);
+    expect(mocks.createdSessions).toHaveLength(1);
+    expect(mocks.createdSessions[0].quoteTargetId).toBe(SOURCE_MSG);
+    expect(mocks.createdSessions[0].quoteTargetId).toBe(forkTurnId);
   });
 });

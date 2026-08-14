@@ -17463,7 +17463,9 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
       } else if (cmdDs.pendingRepo) {
         stageClaimedPendingRepoSetup(activeSessions, cmdDs, {
           mode: 'picker',
-          turnId: messageId,
+          // Turn identity unified on the reply anchor (slash commands never
+          // birth a session group, so this always equals messageId today).
+          turnId: replyAnchorId,
         });
       }
       // Pass mention-stripped content so /command argument parsing works.
@@ -17677,7 +17679,10 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     initialStartPending: true,
     pendingRepo: !pinnedWorkingDir || autoWt,
     pendingPrompt: promptContent,
-    pendingTurnId: messageId,
+    // Turn identity must equal the reply anchor so current-turn provenance
+    // (quoteTargetId === marker.turnId) holds on session-group first turns.
+    // Outside a birth replyAnchorId === messageId, so plain paths are unchanged.
+    pendingTurnId: replyAnchorId,
     pendingCodexAppText: codexAppVisibleText,
     pendingCodexAppApplicationContext: codexAppApplicationContext || undefined,
     pendingCodexAppMessageContext: codexAppMessageContext,
@@ -17725,7 +17730,10 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
   // exact same set (a race-losing scratch's seed @s must not vanish).
   const newTopicPostAt = collectPostAtMentions(data?.message, ctx.forwardSeedData?.message);
   const newTopicWindow = buildTurnParticipants(larkAppId, senderOpenId, senderIsBotTriState(parsed.senderType, isForeignBotSender), parsed.mentions, newTopicSender?.name, newTopicPostAt);
-  beginReplyTargetTurn(ds, replyRootId, messageId, new Date().toISOString(), { quoteOnly: substituteReplyMode === 'quote', substitute: !!substituteTrigger, senderOpenId, participants: newTopicWindow.participants, participantsIncomplete: newTopicWindow.incomplete });
+  // Turn key is the reply anchor (== messageId outside session-group births) so
+  // the per-turn reply context and currentReplyTarget.turnId line up with the
+  // worker's turn id — current-turn provenance requires that equality.
+  beginReplyTargetTurn(ds, replyRootId, replyAnchorId, new Date().toISOString(), { quoteOnly: substituteReplyMode === 'quote', substitute: !!substituteTrigger, senderOpenId, participants: newTopicWindow.participants, participantsIncomplete: newTopicWindow.incomplete });
   sessionStore.updateSession(ds.session);
   const registration = await claimNewDaemonSession(activeSessions, ds);
   if (!registration.accepted) {
@@ -17756,7 +17764,10 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     stageClaimedPendingRepoSetup(activeSessions, ds, {
       mode: autoWt ? 'auto_worktree' : 'picker',
       ...(autoWt && pinnedWorkingDir ? { baseDir: pinnedWorkingDir } : {}),
-      turnId: messageId,
+      // Persisted turn identity feeds the eventual fork's turnId; it must be the
+      // reply anchor so provenance (quoteTargetId === marker.turnId) holds on
+      // session-group first turns that go through the repo picker / worktree.
+      turnId: replyAnchorId,
     });
   }
   messageQueue.ensureQueue(anchor);
@@ -17788,7 +17799,9 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
       messageId,
     });
     const availableBots = await getAvailableBots(larkAppId, chatId);
-    await noteTurnReceived(ds, messageId, content, newTopicSender, messageId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
+    // Ack reaction targets the ORIGINAL inbound message (2nd arg); the turn id
+    // (5th arg) is the reply anchor so provenance holds on session-group births.
+    await noteTurnReceived(ds, messageId, content, newTopicSender, replyAnchorId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
     forkReservedInitialSession(ds, availableBots);
     // fork 成功即开场已交给 CLI；fork 抛错则开场只存在于内存，保持重发提示。
     markIngressAdmitted(ctx);
@@ -17837,7 +17850,9 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
       messageId,
     });
     const availableBots = await getAvailableBots(larkAppId, chatId);
-    await noteTurnReceived(ds, messageId, content, newTopicSender, messageId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
+    // Ack reaction targets the ORIGINAL inbound message (2nd arg); the turn id
+    // (5th arg) is the reply anchor so provenance holds on session-group births.
+    await noteTurnReceived(ds, messageId, content, newTopicSender, replyAnchorId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
     forkReservedInitialSession(ds, availableBots);
     logger.info(`Session ${session.sessionId} ready (no projects to select), total active: ${getActiveCount()}`);
   }
