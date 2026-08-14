@@ -1554,7 +1554,7 @@ async function triggerSessionTurnAdmitted(
       && !codexModelSupportsReasoningEffort(effectiveModel, effectiveReasoningEffort)) {
     return {
       ok: false,
-      errorCode: 'trigger_failed',
+      errorCode: 'bad_request',
       error: `模型 ${effectiveModel || '（Codex 默认模型）'} 不支持思考强度 ${effectiveReasoningEffort}`,
     };
   }

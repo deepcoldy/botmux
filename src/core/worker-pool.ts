@@ -1074,10 +1074,6 @@ function sessionAgentConfig(
     ds.session.reasoningEffort = isCodexReasoningCliId(ds.session.cliId)
       ? ds.session.reasoningEffort ?? botCfg.reasoningEffort
       : undefined;
-    if (ds.session.reasoningEffort
-        && !codexModelSupportsReasoningEffort(ds.session.model, ds.session.reasoningEffort)) {
-      ds.session.reasoningEffort = undefined;
-    }
     ds.session.agentFrozen = true;
     sessionStore.updateSession(ds.session);
   } else {
@@ -1107,6 +1103,11 @@ function sessionAgentConfig(
       }
     }
     if (repaired) sessionStore.updateSession(ds.session);
+  }
+  if (ds.session.reasoningEffort
+      && !codexModelSupportsReasoningEffort(ds.session.model, ds.session.reasoningEffort)) {
+    ds.session.reasoningEffort = undefined;
+    sessionStore.updateSession(ds.session);
   }
   return {
     cliId: ds.session.cliId ?? botCfg.cliId,

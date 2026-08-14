@@ -2923,6 +2923,11 @@ describe('PUT /api/bot-agent', () => {
       });
       expect(sol.status).toBe(200);
 
+      // Simulate a stale in-memory snapshot while the locked bots.json entry
+      // already contains the newer ultra value. Validation must use the entry
+      // read inside rmwBotEntry, not this stale live config.
+      getBot(appId).config.reasoningEffort = 'xhigh';
+
       const omittedEffort = await fetch(`http://127.0.0.1:${handle.port}/api/bot-agent`, {
         method: 'PUT',
         headers: { 'content-type': 'application/json' },

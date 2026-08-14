@@ -96,6 +96,10 @@ describe('worker → CodexRpcEngine effort wiring (source lock)', () => {
     expect(source).toContain('ds.session.reasoningEffort = isCodexReasoningCliId(ds.session.cliId)');
     expect(source).toContain('? ds.session.reasoningEffort ?? botCfg.reasoningEffort');
     expect(source).toContain(': undefined;');
-    expect(source).toContain('codexModelSupportsReasoningEffort(ds.session.model, ds.session.reasoningEffort)');
+    const frozenBranch = source.indexOf('if (!ds.session.agentFrozen)');
+    const compatibilityGuard = source.indexOf('codexModelSupportsReasoningEffort(ds.session.model, ds.session.reasoningEffort)');
+    const returnConfig = source.indexOf('return {', frozenBranch);
+    expect(compatibilityGuard).toBeGreaterThan(frozenBranch);
+    expect(compatibilityGuard).toBeLessThan(returnConfig);
   });
 });

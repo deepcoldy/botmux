@@ -3904,16 +3904,6 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
   }
   const currentBotConfig = getBot(larkAppId).config;
   const supportsReasoningEffort = isCodexReasoningCliId(selected.cliId);
-  const nextReasoningEffort = supportsReasoningEffort
-    ? (reasoningEffortFieldPresent ? reasoningEffort ?? undefined : currentBotConfig.reasoningEffort)
-    : undefined;
-  if (nextReasoningEffort && !codexModelSupportsReasoningEffort(model || undefined, nextReasoningEffort)) {
-    return jsonRes(res, 400, {
-      ok: false,
-      error: 'reasoning_effort_not_supported_by_model',
-      message: `模型 ${model || '（Codex 默认模型）'} 不支持思考强度 ${nextReasoningEffort}`,
-    });
-  }
   const runtimeFieldPresent = Object.prototype.hasOwnProperty.call(body, 'cliRuntime');
   const currentSelectionKey = selectionKeyForBot(currentBotConfig.cliId, currentBotConfig.wrapperCli);
   const selectionChanged = key !== currentSelectionKey;
@@ -4006,7 +3996,16 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
     // read-isolation toggle validates at enable time; changing the agent afterwards
     // is the other way a bot could end up configured-but-unenforceable.)
     let readIsolationCleared = false;
-    const r = await rmwBotEntry(larkAppId, (entry) => {
+    const r = await rmwBotEntry<{
+      error?: 'reasoning_effort_not_supported_by_model';
+      nextReasoningEffort?: typeof reasoningEffort;
+    }>(larkAppId, (entry) => {
+    const nextReasoningEffort = supportsReasoningEffort
+      ? (reasoningEffortFieldPresent ? reasoningEffort ?? undefined : entry.reasoningEffort)
+      : undefined;
+    if (nextReasoningEffort && !codexModelSupportsReasoningEffort(model || undefined, nextReasoningEffort)) {
+      return { write: false, result: { error: 'reasoning_effort_not_supported_by_model' } };
+    }
     entry.cliId = selected.cliId;
     if (selected.wrapperCli) entry.wrapperCli = selected.wrapperCli;
     else delete entry.wrapperCli;
@@ -4043,9 +4042,16 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
       // 任务）。手动的 pty/tmux/herdr/zellij override 不受影响（它们不会是 riff）。
       delete entry.backendType;
     }
-    return { write: true, result: null };
+    return { write: true, result: { nextReasoningEffort } };
     });
     if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
+    if (r.result.error) {
+      return jsonRes(res, 400, {
+        ok: false,
+        error: r.result.error,
+        message: `模型 ${model || '（Codex 默认模型）'} 不支持当前思考强度`,
+      });
+    }
 
     const bot = getBot(larkAppId);
     bot.config.cliId = selected.cliId;
@@ -4055,7 +4061,7 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
     else bot.config.wrapperCli = undefined;
     bot.config.model = model || undefined;
     if (!supportsReasoningEffort) bot.config.reasoningEffort = undefined;
-    else if (reasoningEffortFieldPresent) bot.config.reasoningEffort = reasoningEffort ?? undefined;
+    else bot.config.reasoningEffort = r.result.nextReasoningEffort ?? undefined;
     if (readIsolationCleared) bot.config.readIsolation = false;
     if (selected.cliId === 'riff') {
       bot.config.backendType = 'riff';
