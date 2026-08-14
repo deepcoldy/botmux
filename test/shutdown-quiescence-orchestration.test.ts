@@ -146,8 +146,10 @@ describe('shutdown reaping / producer-fence separation (real ChildProcess)', () 
   const kids: ChildProcess[] = [];
   afterEach(() => { for (const k of kids.splice(0)) { try { k.kill('SIGKILL'); } catch { /* */ } } });
 
-  async function spawnIpcChild(body: string): Promise<ChildProcess> {
-    const child = spawn(process.execPath, ['-e', `process.send && process.send({ready:true}); ${body}`], { stdio: ['ignore', 'pipe', 'pipe', 'ipc'] });
+  async function spawnIpcChild(setup: string): Promise<ChildProcess> {
+    // `ready` is a happens-before barrier: the parent signals immediately after
+    // it, so every handler needed by that signal must already be installed.
+    const child = spawn(process.execPath, ['-e', `${setup}\nprocess.send?.({ ready: true });`], { stdio: ['ignore', 'pipe', 'pipe', 'ipc'] });
     kids.push(child);
     await new Promise<void>((res, rej) => { const t = setTimeout(() => rej(new Error('no ready')), 5000); child.once('message', (m: any) => { if (m?.ready) { clearTimeout(t); res(); } }); });
     return child;

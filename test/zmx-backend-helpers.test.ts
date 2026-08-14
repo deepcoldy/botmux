@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, mkdirSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdtempSync, readFileSync, renameSync, rmSync, mkdirSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -54,16 +54,27 @@ function makeExecutableShell(name: 'fish' | 'sh'): string {
   return shellPath;
 }
 
-function waitForPath(path: string, timeoutMs: number): Promise<void> {
+function waitForFileContent(path: string, expected: string, timeoutMs: number): Promise<void> {
   const startedAt = Date.now();
+  let lastObserved = '<missing>';
   return new Promise((resolve, reject) => {
     const poll = () => {
-      if (existsSync(path)) {
-        resolve();
-        return;
+      try {
+        const value = readFileSync(path, 'utf8');
+        lastObserved = JSON.stringify(value);
+        if (value === expected) {
+          resolve();
+          return;
+        }
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
+          lastObserved = `<read error: ${err instanceof Error ? err.message : String(err)}>`;
+        }
       }
       if (Date.now() - startedAt >= timeoutMs) {
-        reject(new Error(`Timed out waiting for ${path}`));
+        reject(new Error(
+          `Timed out waiting for ${path} to contain ${JSON.stringify(expected)}; last observed ${lastObserved}`,
+        ));
         return;
       }
       setTimeout(poll, 10);
@@ -72,15 +83,30 @@ function waitForPath(path: string, timeoutMs: number): Promise<void> {
   });
 }
 
-function waitForExit(child: ReturnType<typeof spawn>): Promise<{ readonly code: number | null; readonly stdout: string; readonly stderr: string }> {
+function waitForExit(
+  child: ReturnType<typeof spawn>,
+  timeoutMs: number,
+): Promise<{ readonly code: number | null; readonly stdout: string; readonly stderr: string }> {
   let stdout = '';
   let stderr = '';
   child.stdout?.setEncoding('utf8');
   child.stderr?.setEncoding('utf8');
   child.stdout?.on('data', chunk => { stdout += chunk; });
   child.stderr?.on('data', chunk => { stderr += chunk; });
-  return new Promise((resolve) => {
-    child.on('close', code => {
+  return new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      child.kill('SIGKILL');
+      reject(new Error(
+        `Timed out after ${timeoutMs}ms waiting for generated ZMX launch to exit; ` +
+        `stdout=${JSON.stringify(stdout)} stderr=${JSON.stringify(stderr)}`,
+      ));
+    }, timeoutMs);
+    child.once('error', err => {
+      clearTimeout(timeout);
+      reject(err);
+    });
+    child.once('close', code => {
+      clearTimeout(timeout);
       resolve({ code, stdout, stderr });
     });
   });
@@ -556,6 +582,7 @@ describe('zmx backend pure helpers', () => {
     const payloadPath = join(launchDir, 'payload.fish');
     const readyPath = join(launchDir, 'ready');
     const releasePath = join(launchDir, 'release');
+    const releaseTempPath = join(launchDir, 'release.tmp');
     const outputPath = join(root, 'cli-output.txt');
     const readyNonce = '0123456789abcdef0123456789abcdef';
     const releaseToken = 'fedcba9876543210fedcba9876543210';
@@ -589,15 +616,21 @@ describe('zmx backend pure helpers', () => {
       env: { PATH: '/usr/bin:/bin', HOME: root },
       stdio: ['ignore', 'pipe', 'pipe'],
     });
-    const exitPromise = waitForExit(child);
-    await waitForPath(readyPath, 1000);
-    expect(readFileSync(readyPath, 'utf8')).toBe(`${readyNonce}\n`);
-    writeFileSync(releasePath, `${releaseToken}\n`);
-    const result = await exitPromise;
+    // Starts at spawn: 5s readiness + 3s history grace + 2s execution/scheduler slack.
+    // The outer 12s test deadline leaves roughly 2s for assertions and cleanup.
+    const exitPromise = waitForExit(child, 10_000);
+    try {
+      await waitForFileContent(readyPath, `${readyNonce}\n`, 5000);
+      writeFileSync(releaseTempPath, `${releaseToken}\n`, { mode: 0o600, flag: 'wx' });
+      renameSync(releaseTempPath, releasePath);
+      const result = await exitPromise;
 
-    expect(result).toMatchObject({ code: 0 });
-    expect(result.stderr).not.toContain(payloadPath);
-    expect(readFileSync(outputPath, 'utf8')).toBe(`PWD:${workDir}\nSAFE:fish-safe\nARG:fish-arg\n`);
-    expect(existsSync(payloadPath)).toBe(false);
-  }, 10_000);
+      expect(result).toMatchObject({ code: 0 });
+      expect(result.stderr).not.toContain(payloadPath);
+      expect(readFileSync(outputPath, 'utf8')).toBe(`PWD:${workDir}\nSAFE:fish-safe\nARG:fish-arg\n`);
+      expect(existsSync(payloadPath)).toBe(false);
+    } finally {
+      if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+    }
+  }, 12_000);
 });

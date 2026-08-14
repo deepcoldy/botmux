@@ -38,21 +38,25 @@ async function waitForScreenUpdates(
   messages: WorkerToDaemon[],
   count: number,
   logs: string[],
+  predicate: (
+    message: Extract<WorkerToDaemon, { type: 'screen_update' }>,
+  ) => boolean = () => true,
+  description = 'screen updates',
 ): Promise<Array<Extract<WorkerToDaemon, { type: 'screen_update' }>>> {
   const deadline = Date.now() + 10_000;
   while (Date.now() < deadline) {
     const updates = messages.filter(
       (message): message is Extract<WorkerToDaemon, { type: 'screen_update' }> =>
-        message.type === 'screen_update',
+        message.type === 'screen_update' && predicate(message),
     );
     if (updates.length >= count) return updates;
     if (child.exitCode !== null || child.signalCode !== null) {
-      throw new Error(`worker exited before ${count} screen updates\n${logs.join('')}`);
+      throw new Error(`worker exited before ${count} ${description}\n${logs.join('')}`);
     }
     await new Promise(resolvePromise => setTimeout(resolvePromise, 25));
   }
   throw new Error(
-    `timed out waiting for ${count} screen updates: ${JSON.stringify(messages)}\n${logs.join('')}`,
+    `timed out waiting for ${count} ${description}: ${JSON.stringify(messages)}\n${logs.join('')}`,
   );
 }
 
@@ -246,7 +250,14 @@ setInterval(() => {}, 1_000);
     // clear redraw's quiescence, whichever matures first).
     await waitForPromptReady(child, messages, logs);
 
-    const updates = await waitForScreenUpdates(child, messages, 1, logs);
+    const updates = await waitForScreenUpdates(
+      child,
+      messages,
+      1,
+      logs,
+      update => update.status === 'idle',
+      'idle screen update',
+    );
     expect(updates.at(-1)?.status).toBe('idle');
   }, 25_000);
 
@@ -329,7 +340,14 @@ setInterval(() => {}, 1_000);
     expect(workingBeforeReady.length, JSON.stringify(messages)).toBe(1);
 
     // Once the fake clears Working..., the turn settles idle as usual.
-    const updates = await waitForScreenUpdates(child, messages, 1, logs);
+    const updates = await waitForScreenUpdates(
+      child,
+      messages,
+      1,
+      logs,
+      update => update.status === 'idle',
+      'idle screen update',
+    );
     expect(updates.at(-1)?.status).toBe('idle');
   }, 25_000);
 
