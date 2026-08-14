@@ -2870,6 +2870,126 @@ describe('PUT /api/bot-substitute-mode', () => {
 });
 
 describe('PUT /api/bot-agent', () => {
+  // BEHAVIOURAL: the runtime/selection proposal must come from the same disk row
+  // the transaction writes. A stale in-memory cliId made the handler believe the
+  // agent changed, which (a) handed agentSwitchCloseHook the WRONG switchTarget
+  // — losing the persisted vendor runtime — and (b) then silently deleted
+  // cliRuntime/cliPathOverride from disk on an old client's {cliId, model} save.
+  it('derives runtime preservation from the persisted row, not a stale live snapshot', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-agent-runtime-drift-'));
+    const configPath = join(dir, 'bots.json');
+    const appId = 'test-agent-runtime-drift';
+    const prevBotsConfig = process.env.BOTS_CONFIG;
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      writeFileSync(configPath, JSON.stringify([{
+        larkAppId: appId,
+        larkAppSecret: 'secret',
+        cliId: 'codex',
+        model: 'old-model',
+        cliRuntime: { id: 'vendor-codex', displayName: 'VendorCodex', executable: '/opt/vendor/vendor-codex' },
+        cliPathOverride: '/opt/vendor/vendor-codex',
+      }], null, 2));
+      loadBotConfigs().forEach((c: any) => registerBot(c));
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+
+      // Live snapshot drifts to a different agent while disk still says codex.
+      getBot(appId).config.cliId = 'claude-code' as any;
+      delete (getBot(appId).config as any).cliRuntime;
+      delete (getBot(appId).config as any).cliPathOverride;
+
+      const targets: any[] = [];
+      const originalCloseHook = agentSwitchCloseHook.run;
+      agentSwitchCloseHook.run = async (...args: Parameters<typeof originalCloseHook>) => {
+        targets.push(args[1]);
+        return originalCloseHook(...args);
+      };
+      let saved: Response;
+      try {
+        // Old dashboard client: knows only {cliId, model}.
+        saved = await fetch(`http://127.0.0.1:${handle.port}/api/bot-agent`, {
+          method: 'PUT',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ cliId: 'codex', model: 'new-model' }),
+        });
+      } finally {
+        agentSwitchCloseHook.run = originalCloseHook;
+      }
+      expect(saved.status).toBe(200);
+
+      const stored = JSON.parse(readFileSync(configPath, 'utf-8'))[0];
+      expect(
+        stored.cliRuntime,
+        'a model-only save must not erase the persisted vendor runtime',
+      ).toMatchObject({ id: 'vendor-codex', executable: '/opt/vendor/vendor-codex' });
+      expect(stored.cliPathOverride).toBe('/opt/vendor/vendor-codex');
+      // The close target must describe what actually gets written, otherwise the
+      // irreversible closes were computed against a bot that does not exist.
+      for (const t of targets) {
+        expect(t.cliRuntime).toMatchObject({ id: 'vendor-codex', executable: '/opt/vendor/vendor-codex' });
+        expect(t.cliPathOverride).toBe('/opt/vendor/vendor-codex');
+      }
+    } finally {
+      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = prevBotsConfig;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  // BEHAVIOURAL: if the authority cannot be read, the request must FAIL CLOSED.
+  // Swallowing the error and deferring to the in-transaction backstop means the
+  // irreversible closes run first, so a request that is never committed still
+  // tears down live sessions.
+  it('fails closed without closing sessions when the persisted row is unreadable', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-agent-authority-fail-'));
+    const configPath = join(dir, 'bots.json');
+    const appId = 'test-agent-authority-fail';
+    const prevBotsConfig = process.env.BOTS_CONFIG;
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      writeFileSync(configPath, JSON.stringify([{
+        larkAppId: appId,
+        larkAppSecret: 'secret',
+        cliId: 'codex',
+        model: 'old-model',
+      }], null, 2));
+      loadBotConfigs().forEach((c: any) => registerBot(c));
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+
+      let closeHookCalls = 0;
+      const originalCloseHook = agentSwitchCloseHook.run;
+      agentSwitchCloseHook.run = async (...args: Parameters<typeof originalCloseHook>) => {
+        closeHookCalls += 1;
+        return originalCloseHook(...args);
+      };
+      // Corrupt the authority so readRawConfig throws (parse failure); an EACCES
+      // read is the same code path.
+      writeFileSync(configPath, '{ this is not valid json');
+      let broken: Response;
+      try {
+        broken = await fetch(`http://127.0.0.1:${handle.port}/api/bot-agent`, {
+          method: 'PUT',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ cliId: 'ttadk-x-codex', model: 'kimi-k2.5' }),
+        });
+      } finally {
+        agentSwitchCloseHook.run = originalCloseHook;
+      }
+      expect(broken.status).toBe(503);
+      expect(await broken.json()).toMatchObject({ error: 'bot_config_unreadable' });
+      expect(
+        closeHookCalls,
+        'an unreadable authority must not close any session',
+      ).toBe(0);
+    } finally {
+      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = prevBotsConfig;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('updates cli selection and model through bots.json and live config', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'botmux-agent-ipc-'));
     const configPath = join(dir, 'bots.json');
@@ -3101,19 +3221,19 @@ describe('PUT /api/bot-agent', () => {
       loadBotConfigs().forEach((c: any) => registerBot(c));
       setLarkAppId(appId);
       handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
-      agentSwitchCloseHook.run = async () => ({
-        ok: true,
-        closed: 2,
-        residual: 1,
-        failed: 0,
-        residualTaskIds: ['mojo-parked-9'],
-      });
-      // Valid JSON, but the target entry is gone → rmwBotEntry returns !ok.
-      writeFileSync(configPath, JSON.stringify([{
-        larkAppId: 'some-other-bot',
-        larkAppSecret: 'secret',
-        cliId: 'traex',
-      }], null, 2));
+      // The row must disappear AFTER the preflight authority read and AFTER the
+      // closes — i.e. exactly in the request-time window the locked backstop
+      // exists for. Corrupting it before the request would (correctly) be
+      // refused by the fail-closed preflight and would never reach the commit.
+      agentSwitchCloseHook.run = async () => {
+        // Valid JSON, but the target entry is gone → rmwBotEntry returns !ok.
+        writeFileSync(configPath, JSON.stringify([{
+          larkAppId: 'some-other-bot',
+          larkAppSecret: 'secret',
+          cliId: 'traex',
+        }], null, 2));
+        return { ok: true, closed: 2, residual: 1, failed: 0, residualTaskIds: ['mojo-parked-9'] };
+      };
 
       const res = await fetch(`http://127.0.0.1:${handle.port}/api/bot-agent`, {
         method: 'PUT',
@@ -3157,17 +3277,15 @@ describe('PUT /api/bot-agent', () => {
       loadBotConfigs().forEach((c: any) => registerBot(c));
       setLarkAppId(appId);
       handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
-      agentSwitchCloseHook.run = async () => ({
-        ok: true,
-        closed: 2,
-        residual: 1,
-        failed: 0,
-        residualTaskIds: ['mojo-parked-9'],
-      });
-      // Make the durable write fail AFTER the closes have run.
-      rmSync(configPath);
-      mkdtempSync(join(dir, 'blocker-'));
-      writeFileSync(configPath, 'not json at all');
+      // Make the durable write fail AFTER the closes have run — and after the
+      // preflight has already read a healthy row, so this exercises the locked
+      // backstop's throw path rather than the fail-closed preflight.
+      agentSwitchCloseHook.run = async () => {
+        rmSync(configPath);
+        mkdtempSync(join(dir, 'blocker-'));
+        writeFileSync(configPath, 'not json at all');
+        return { ok: true, closed: 2, residual: 1, failed: 0, residualTaskIds: ['mojo-parked-9'] };
+      };
 
       const res = await fetch(`http://127.0.0.1:${handle.port}/api/bot-agent`, {
         method: 'PUT',

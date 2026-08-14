@@ -53,27 +53,57 @@ describe('agent switch — no precondition runs after the irreversible close', (
     expect(preflight).toContain('return jsonRes(res, 400');
   });
 
-  it('reads the SAME authority the transaction falls back to (disk, not memory)', () => {
+  it('reads the SAME authority the transaction uses (disk), before any close', () => {
     // This assertion previously pinned `currentBotConfig.reasoningEffort` — i.e. it
     // froze the bug into a contract, so the correct fix would have failed the guard.
-    // The check is not a pure function of the request: with the field absent the
-    // transaction reads the persisted bots.json row. getBot().config is a separate
-    // in-memory snapshot that can ALREADY disagree with disk before the request
-    // arrives, so the preflight must read the row too.
-    const preflightAt = ipc.indexOf('let persistedReasoningEffort');
-    expect(preflightAt, 'preflight must resolve the persisted value').toBeGreaterThan(0);
+    // getBot().config is a separate in-memory snapshot that can ALREADY disagree
+    // with disk before the request arrives, so every value this handler derives
+    // must come from the persisted row.
+    const authorityAt = ipc.indexOf('let persistedBotRow');
+    expect(authorityAt, 'a single authority snapshot must be read').toBeGreaterThan(0);
     const closeAt = ipc.indexOf('await agentSwitchCloseHook.run(');
-    const preflight = ipc.slice(preflightAt, closeAt);
+    const preflight = ipc.slice(authorityAt, closeAt);
 
     // Same source as the transaction: the on-disk row.
     expect(preflight).toContain('readRawConfig(requireConfigPath())');
     expect(preflight).toContain('findEntryIndex(raw, larkAppId)');
-    expect(preflight).toContain('reasoningEffort');
-    // And explicitly NOT the live in-memory snapshot.
+    // Positional, not a substring that appears everywhere: the authority must be
+    // resolved before the irreversible close.
+    expect(
+      authorityAt,
+      'the authority snapshot must be read before any irreversible close',
+    ).toBeLessThan(closeAt);
+    // The derived selection/runtime/reasoning values must all come from that
+    // snapshot. `currentBotConfig` is now the persisted row, so the live snapshot
+    // must not be consulted anywhere between the snapshot and the close.
     expect(
       preflight,
-      'the absent-field fallback must not come from the live in-memory config',
-    ).not.toContain('currentBotConfig.reasoningEffort');
+      'no decision between the authority read and the close may use the live config',
+    ).not.toContain('getBot(larkAppId).config');
+  });
+
+  it('derives the close target from the persisted row, not the live snapshot', () => {
+    // The switch target decides WHICH sessions are irreversibly closed and which
+    // runtime fields get written. Deriving it from memory closed the wrong target
+    // and silently erased a persisted cliRuntime/cliPathOverride.
+    const targetAt = ipc.indexOf('const switchTarget = {');
+    expect(targetAt, 'switch target must exist').toBeGreaterThan(0);
+    const targetBlock = ipc.slice(targetAt, ipc.indexOf('};', targetAt));
+    expect(targetBlock, 'close target must not read the live config')
+      .not.toContain('getBot(');
+  });
+
+  it('FAILS CLOSED when the authority cannot be read', () => {
+    // Swallowing the read error and deferring to the locked backstop means the
+    // irreversible closes run first, so a request that never commits still tears
+    // down live sessions.
+    const authorityAt = ipc.indexOf('let persistedBotRow');
+    const closeAt = ipc.indexOf('await agentSwitchCloseHook.run(');
+    const region = ipc.slice(authorityAt, closeAt);
+    expect(region, 'read failure must return, not continue')
+      .toContain("error: 'bot_config_unreadable'");
+    expect(region, 'a missing row must also refuse before the closes')
+      .toContain("error: 'bot_not_in_config'");
   });
 
   it('KEEPS the in-transaction check as a backstop', () => {
@@ -93,6 +123,21 @@ describe('agent switch — no precondition runs after the irreversible close', (
       summaries.length,
       'each post-close failure exit must carry closeSummaryPayload',
     ).toBeGreaterThanOrEqual(exits.length);
+
+    // The single shape is only worth having if it is COMPLETE: the operator needs
+    // the surviving task ids, not just a count. Pin all four fields at the source
+    // so a future edit cannot quietly drop one for every exit at once.
+    const payloadAt = ipc.indexOf('const closeSummaryPayload = (');
+    expect(payloadAt, 'closeSummaryPayload definition').toBeGreaterThan(0);
+    const payload = ipc.slice(payloadAt, ipc.indexOf('});', payloadAt));
+    for (const field of [
+      'closedMismatchedSessions',
+      'closedMismatchedResidual',
+      'closedMismatchedFailed',
+      'closedMismatchedResidualTaskIds',
+    ]) {
+      expect(payload, `${field} must be reported by every post-close exit`).toContain(field);
+    }
   });
 });
 

@@ -3931,7 +3931,47 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
   if (body.reasoningEffort !== undefined && body.reasoningEffort !== '' && reasoningEffort === null) {
     return jsonRes(res, 400, { ok: false, error: 'invalid_reasoning_effort' });
   }
-  const currentBotConfig = getBot(larkAppId).config;
+  // SINGLE AUTHORITY SNAPSHOT for every decision this handler makes.
+  //
+  // `getBot().config` is the live in-memory snapshot; the transaction below
+  // mutates the bots.json row. They are different sources and can already
+  // disagree BEFORE the request arrives, so anything derived from memory may
+  // describe a bot that no longer exists on disk. That matters because these
+  // derived values do not merely gate a 4xx — they feed
+  //   1. `switchTarget`, i.e. WHICH sessions agentSwitchCloseHook irreversibly
+  //      closes, and
+  //   2. the runtime fields written back,
+  // so a stale read closes the wrong sessions and can silently erase a persisted
+  // cliRuntime / cliPathOverride. Read the row ONCE, up front, and derive
+  // selection, runtime preservation and reasoning effort from that one snapshot.
+  //
+  // Both a read failure and a missing row are FAIL-CLOSED. Preconditions cannot
+  // be decided against the authority, and deferring to the in-transaction
+  // backstop would mean running the irreversible closes first; refusing keeps
+  // "a failed validation produces no side effects" true. A missing row is the
+  // same condition rmwBotEntry reports as `bot_not_in_config`.
+  let persistedBotRow: Record<string, unknown>;
+  try {
+    const raw = await readRawConfig(requireConfigPath());
+    const idx = findEntryIndex(raw, larkAppId);
+    if (idx < 0) return jsonRes(res, 404, { ok: false, error: 'bot_not_in_config' });
+    persistedBotRow = raw[idx] as Record<string, unknown>;
+  } catch (err) {
+    return jsonRes(res, 503, {
+      ok: false,
+      error: 'bot_config_unreadable',
+      message: err instanceof Error ? err.message : String(err),
+    });
+  }
+  // Narrow to exactly the fields this handler is allowed to derive from, so
+  // reaching for any other field forces a deliberate decision about authority.
+  const currentBotConfig = persistedBotRow as unknown as {
+    cliId?: string;
+    wrapperCli?: string;
+    cliRuntime?: CliRuntimeConfig;
+    cliPathOverride?: string;
+    reasoningEffort?: typeof reasoningEffort;
+  };
   const supportsReasoningEffort = isCodexReasoningCliId(selected.cliId);
   // PRECONDITION, checked before any irreversible work.
   //
@@ -3946,25 +3986,11 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
   // row under the write lock, so it still covers a genuine request-time race, and
   // its rejection carries the close summary.
   //
-  // The absent-field fallback MUST come from the same authority the transaction
-  // reads — the bots.json row on disk — not from getBot().config. Those two are
-  // different sources and can already disagree before the request arrives: a live
-  // snapshot saying `xhigh` (supported) over a persisted `ultra` (not supported)
-  // let the preflight pass, the irreversible close run, and only then the locked
-  // read reject. No request-time race is needed; pre-existing drift is enough.
-  let persistedReasoningEffort: typeof reasoningEffort | undefined;
-  if (supportsReasoningEffort && !reasoningEffortFieldPresent) {
-    try {
-      const raw = await readRawConfig(requireConfigPath());
-      const idx = findEntryIndex(raw, larkAppId);
-      persistedReasoningEffort = idx >= 0 ? raw[idx]?.reasoningEffort : undefined;
-    } catch {
-      // Cannot read the row the transaction will use, so this precondition cannot
-      // be decided here. Leave it to the in-transaction backstop, which reads the
-      // row under the write lock and whose rejection carries the close summary.
-      persistedReasoningEffort = undefined;
-    }
-  }
+  // The absent-field fallback comes from the authority snapshot above, i.e. the
+  // same bots.json row the transaction reads. Drift example this closes: live
+  // `xhigh` (supported) over persisted `ultra` (not supported) let the preflight
+  // pass, the irreversible close run, and only then the locked read reject.
+  const persistedReasoningEffort = currentBotConfig.reasoningEffort;
   const preflightReasoningEffort = supportsReasoningEffort
     ? (reasoningEffortFieldPresent ? reasoningEffort ?? undefined : persistedReasoningEffort)
     : undefined;
@@ -3977,7 +4003,10 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
     });
   }
   const runtimeFieldPresent = Object.prototype.hasOwnProperty.call(body, 'cliRuntime');
-  const currentSelectionKey = selectionKeyForBot(currentBotConfig.cliId, currentBotConfig.wrapperCli);
+  // A row may legitimately omit cliId (bot on the daemon default). Then there is
+  // no persisted selection to match, so the key cannot equal `key` and runtime
+  // preservation below is a no-op anyway — such a row carries no cliRuntime.
+  const currentSelectionKey = selectionKeyForBot(currentBotConfig.cliId ?? '', currentBotConfig.wrapperCli);
   const selectionChanged = key !== currentSelectionKey;
   let nextRuntime: CliRuntimeConfig | undefined;
   let nextLegacyPath: string | undefined;
