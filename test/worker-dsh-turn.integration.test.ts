@@ -8,7 +8,7 @@
  */
 import { spawn, type ChildProcess } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
-import { chmodSync, copyFileSync, mkdtempSync, rmSync } from 'node:fs';
+import { chmodSync, copyFileSync, existsSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -30,7 +30,10 @@ async function stopChild(child: ChildProcess): Promise<void> {
 afterEach(async () => {
   await Promise.all([...children].map(stopChild));
   children.clear();
-  for (const dir of tempDirs) rmSync(dir, { recursive: true, force: true });
+  for (const dir of tempDirs) {
+    try { rmSync(dir, { recursive: true, force: true }); }
+    catch { /* sandbox may leave root-owned mount points; best effort */ }
+  }
   tempDirs.clear();
 });
 
@@ -139,6 +142,77 @@ describe('dsh worker final_output integration', () => {
         .filter(m => m.type === 'screen_update' || m.type === 'display')
         .filter(m => JSON.stringify(m).includes('\x1b]777;botmux:'));
       expect(screenLeaks).toHaveLength(0);
+    } finally {
+      await stopChild(child);
+    }
+  }, 60_000);
+
+  it('survives the file sandbox and persists config/sessions to the real HOME', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-worker-dsh-sb-'));
+    tempDirs.add(root);
+    const fakeDsh = join(root, 'fake-dsh-server');
+    copyFileSync(resolve('test/fixtures/fake-dsh-server.mjs'), fakeDsh);
+    chmodSync(fakeDsh, 0o755);
+
+    const sessionId = `dsh-sb-${randomBytes(4).toString('hex')}-${process.pid}`;
+    const logs: string[] = [];
+    const messages: WorkerToDaemon[] = [];
+    const child = spawn(process.execPath, ['--import', 'tsx', resolve('src/worker.ts')], {
+      cwd: resolve('.'),
+      env: {
+        ...process.env,
+        HOME: root,
+        NODE_ENV: 'test',
+        NODE_OPTIONS: [process.env.NODE_OPTIONS, '--import=tsx'].filter(Boolean).join(' '),
+        BOTMUX_TEST_DSH_RUNNER_PATH: resolve('src/dsh-runner.ts'),
+        SESSION_DATA_DIR: root,
+        BOTMUX_SESSION_ID: sessionId,
+        LARK_APP_ID: 'app_dsh_sb',
+        LARK_APP_SECRET: 'secret',
+        FAKE_DSH_SCENARIO: 'happy',
+      },
+      stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+    });
+    children.add(child);
+    child.stdout?.on('data', chunk => logs.push(chunk.toString()));
+    child.stderr?.on('data', chunk => logs.push(chunk.toString()));
+    child.on('message', raw => {
+      const message = raw as WorkerToDaemon;
+      messages.push(message);
+      if (message.type === 'error') logs.push(`[worker-ipc-error] ${message.message}\n`);
+    });
+
+    const init: DaemonToWorker = {
+      type: 'init',
+      sessionId,
+      chatId: 'oc_dsh_sb',
+      rootMessageId: 'om_dsh_sb_root',
+      workingDir: resolve('.'),
+      cliId: 'dsh',
+      cliPathOverride: fakeDsh,
+      backendType: 'pty',
+      sandbox: true,
+      prompt: '<user_message>沙盒测试</user_message>',
+      larkAppId: 'app_dsh_sb',
+      larkAppSecret: 'secret',
+      turnId: 'om_dsh_sb_turn_1',
+    };
+
+    try {
+      child.send(init);
+      await waitFor(child, logs, () =>
+        messages.some(m => m.type === 'final_output'));
+
+      const finals = messages.filter(
+        (m): m is Extract<WorkerToDaemon, { type: 'final_output' }> => m.type === 'final_output',
+      );
+      expect(finals).toHaveLength(1);
+      expect(finals[0].content).toContain('你好，我是 dsh。');
+
+      // The vendored config and session JSONL must land in the REAL HOME,
+      // not in a throwaway tmpfs that dies with the sandbox.
+      expect(existsSync(join(root, '.botmux', 'dsh', 'cordis.yml'))).toBe(true);
+      expect(existsSync(join(root, '.botmux', 'dsh', 'sessions', sessionId))).toBe(true);
     } finally {
       await stopChild(child);
     }

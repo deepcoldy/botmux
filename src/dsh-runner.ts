@@ -621,7 +621,7 @@ function handleInput(data: Buffer): void {
 
 async function main(): Promise<void> {
   const configPath = resolveConfigPath();
-  const sessionRoot = join(homedir(), '.botmux', 'dsh-sessions', args.sessionId);
+  const sessionRoot = join(homedir(), '.botmux', 'dsh', 'sessions', args.sessionId);
   mkdirSync(sessionRoot, { recursive: true });
 
   client = new DshJsonRpcClient(args.dshBin, configPath, {

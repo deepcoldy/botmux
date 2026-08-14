@@ -1,6 +1,7 @@
 import { fileURLToPath } from 'node:url';
-import { existsSync } from 'node:fs';
-import { dirname, resolve } from 'node:path';
+import { existsSync, mkdirSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { dirname, join, resolve } from 'node:path';
 import { resolveCommand } from './registry.js';
 import type { CliAdapter, PtyHandle } from './types.js';
 import { writeRunnerInput } from './runner-input.js';
@@ -36,9 +37,11 @@ export function createDshAdapter(pathOverride?: string): CliAdapter {
   let cachedDshBin: string | undefined;
   return {
     id: 'dsh',
-    // Session JSONL lives here; keep it REAL under the file sandbox so
-    // history persists across sessions (see adapters CLAUDE.md sandbox notes).
-    authPaths: ['~/.botmux/dsh-sessions'],
+    // The runner writes its vendored cordis.yml and session JSONL under
+    // ~/.botmux/dsh/. Keep the whole dir REAL under the file sandbox so
+    // both survive (see adapters CLAUDE.md sandbox notes). Pre-created in
+    // buildArgs so the sandbox's keepExisting filter doesn't drop it.
+    authPaths: ['~/.botmux/dsh'],
     resolvedBin: process.execPath,
 
     // resolvedBin is node-running-the-runner; the real dsh runtime is spawned
@@ -51,6 +54,10 @@ export function createDshAdapter(pathOverride?: string): CliAdapter {
     },
 
     buildArgs({ sessionId, workingDir, botName, botOpenId, locale, model }) {
+      // Pre-create the persistent dsh dir in the real HOME before the worker
+      // enters the sandbox: the sandbox's keepExisting filter drops authPaths
+      // that don't exist yet, and the runner can't create them from inside.
+      mkdirSync(join(homedir(), '.botmux', 'dsh'), { recursive: true });
       const args = [
         runnerPath(),
         '--session-id', sessionId,
