@@ -163,6 +163,51 @@ describe('resolveAsyncTriggerState — running', () => {
 });
 
 describe('resolveAsyncTriggerState — failed', () => {
+  it('reports an explicit worker terminal immediately even while the session stays open', () => {
+    const r = resolveAsyncTriggerState({
+      sessionId: 's1',
+      liveActive: true,
+      storedStatus: 'open',
+      memTriggerId: 'trg_a',
+      memResult: {
+        status: 'failed',
+        failedAt: 7000,
+        errorCode: 'trigger_failed',
+        terminalErrorCode: 'provider_unexpected_eof',
+      },
+    });
+    expect(r).toMatchObject({
+      state: 'failed',
+      triggerId: 'trg_a',
+      errorCode: 'trigger_failed',
+      error: expect.stringContaining('provider_unexpected_eof'),
+      finishedAt: new Date(7000).toISOString(),
+    });
+  });
+
+  it('rebuilds an explicit worker terminal from durable state after restart', () => {
+    const r = resolveAsyncTriggerState({
+      sessionId: 's1',
+      liveActive: false,
+      storedStatus: 'open',
+      persisted: {
+        triggerId: 'trg_a',
+        result: {
+          status: 'failed',
+          failedAt: 7000,
+          errorCode: 'trigger_failed',
+          reason: 'turn_terminal',
+          terminalErrorCode: 'provider_server_error',
+        },
+      },
+    });
+    expect(r).toMatchObject({
+      state: 'failed',
+      errorCode: 'trigger_failed',
+      error: expect.stringContaining('provider_server_error'),
+    });
+  });
+
   it('closed session, no captured output → failed(no_output)', () => {
     const r = resolveAsyncTriggerState({
       sessionId: 's1',

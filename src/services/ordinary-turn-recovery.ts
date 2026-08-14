@@ -88,6 +88,15 @@ export class OrdinaryTurnRecoveryCoordinator<TTimer = unknown> {
   }
 
   begin(logicalTurnId: string): OrdinaryTurnRecoveryState {
+    // Claude can accept type-ahead while the preceding turn is still running.
+    // A session-level slot must keep owning that earlier terminal instead of
+    // being overwritten by the queued successor; otherwise the earlier failed
+    // terminal has no recovery consumer. Once the current turn has actually
+    // entered backoff (or reached a terminal state), a fresh admitted user turn
+    // may replace it as before.
+    if (this.state?.status === 'running' || this.state?.status === 'dispatching') {
+      return this.state;
+    }
     const wasBackoff = this.state?.status === 'backoff';
     this.cancelTimer();
     try {
@@ -365,12 +374,29 @@ export function handleOrdinaryTurnRecoveryTerminal(
   return attached.coordinator.onTerminal(current, terminal);
 }
 
+/** Positive proof that this exact terminal currently has an attached recovery
+ * consumer. Callers use it before suppressing any fallback notification. */
+export function ordinaryTurnRecoveryHandlesTerminal(
+  session: OrdinaryTurnRecoverySession,
+  terminal: OrdinaryTurnRecoveryTerminal,
+): boolean {
+  const current = session.ordinaryTurnRecovery;
+  return attachedRecoveries.get(session.sessionId)?.session === session
+    && current?.currentTurnId === terminal.turnId;
+}
+
 export function beginOrdinaryTurnRecovery(
   session: OrdinaryTurnRecoverySession,
   logicalTurnId: string,
 ): OrdinaryTurnRecoveryState | undefined {
   const attached = attachedRecoveries.get(session.sessionId);
   if (!attached) return session.ordinaryTurnRecovery;
+  // The persisted session projection is authoritative. Re-sync before intake
+  // so restore/reconciliation (or a prior transactional rollback) cannot leave
+  // the runtime coordinator making an admission decision from stale state.
+  if (session.ordinaryTurnRecovery) {
+    attached.coordinator.restore(session.ordinaryTurnRecovery);
+  }
   return attached.coordinator.begin(logicalTurnId);
 }
 
@@ -380,7 +406,7 @@ export function cancelOrdinaryTurnRecoveryForUserInput(
 ): OrdinaryTurnRecoveryState | undefined {
   const attached = attachedRecoveries.get(session.sessionId);
   if (!attached || !session.ordinaryTurnRecovery
-    || !['running', 'backoff', 'exhausted', 'attention_required']
+    || !['backoff', 'exhausted', 'attention_required']
       .includes(session.ordinaryTurnRecovery.status)) return session.ordinaryTurnRecovery;
   return attached.coordinator.cancelForUserInput(turnId);
 }

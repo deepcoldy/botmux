@@ -261,6 +261,7 @@ import {
   cancelOrdinaryTurnRecoveryForUserInput as cancelOrdinaryRecoveryForUserInput,
   disposeOrdinaryTurnRecovery,
   handleOrdinaryTurnRecoveryTerminal,
+  ordinaryTurnRecoveryHandlesTerminal,
   requireOrdinaryTurnRecoveryAttention,
   type OrdinaryTurnRecoveryDispatch,
 } from '../services/ordinary-turn-recovery.js';
@@ -5830,11 +5831,14 @@ function recordAdmittedOrdinaryUserTurn(
   let recoveryBookkeepingSucceeded = false;
   try {
     if (opts.beginRecovery) {
-      beginOrdinaryTurnRecovery(ds.session, turnId);
+      const state = beginOrdinaryTurnRecovery(ds.session, turnId);
+      recoveryBookkeepingSucceeded = state?.logicalTurnId === turnId
+        && state.currentTurnId === turnId;
     } else {
-      cancelOrdinaryRecoveryForUserInput(ds.session, turnId);
+      const state = cancelOrdinaryRecoveryForUserInput(ds.session, turnId);
+      recoveryBookkeepingSucceeded = state?.status === 'cancelled'
+        && state.cancelledByTurnId === turnId;
     }
-    recoveryBookkeepingSucceeded = true;
   } catch (err) {
     logger.error(
       `[${tag(ds)}] Failed to persist ordinary-turn recovery bookkeeping `
@@ -9132,6 +9136,11 @@ function setupWorkerHandlers(
           && ds.managedTurnOrigin.dispatchAttempt === msg.dispatchAttempt) {
           ds.managedTurnOrigin = undefined;
         }
+        const isClaudeProviderFailure = msg.status !== 'completed'
+          && sessionCliId(ds, botCfg) === 'claude-code'
+          && (msg.errorCode?.startsWith('provider_') ?? false);
+        const recoveryOwnsTerminal = ordinaryTurnRecoveryHandlesTerminal(ds.session, msg);
+        let recoveryHandled = false;
         try {
           await cb.onTurnTerminal?.(ds, msg, { workerGeneration });
         } catch (err: any) {
@@ -9141,6 +9150,7 @@ function setupWorkerHandlers(
         }
         try {
           handleOrdinaryTurnRecoveryTerminal(ds.session, msg);
+          recoveryHandled = recoveryOwnsTerminal;
         } catch (err) {
           // Recovery projection is durable fail-closed state, but a temporary
           // session-store failure must not escape the worker IPC handler. The
@@ -9151,6 +9161,102 @@ function setupWorkerHandlers(
             + `${msg.turnId.substring(0, 8)}: `
             + `${err instanceof Error ? err.message : String(err)}`,
           );
+        }
+        let nonLarkFailureHandled = false;
+        if (isClaudeProviderFailure && !ds.session.vcMeetingReceiver) {
+          const failureCode = msg.errorCode ?? msg.status;
+          const waitPromise = ds.pendingWaitPromises?.get(msg.turnId);
+          if (waitPromise) {
+            nonLarkFailureHandled = true;
+            ds.pendingWaitPromises?.delete(msg.turnId);
+            const failure = new Error(`Claude turn failed: ${failureCode}`);
+            if (waitPromise.reject) waitPromise.reject(failure);
+            else waitPromise.resolve(`ERROR: ${failure.message}`);
+            logger.info(
+              `[${t}] Settled Wait Mode HTTP turn ${msg.turnId.substring(0, 8)} `
+              + `failed (${failureCode})`,
+            );
+          }
+
+          const asyncResult = ds.asyncTriggerResults?.get(msg.turnId);
+          const asyncSink = !!asyncResult || ds.chatId.startsWith('http_async_');
+          if (asyncSink) {
+            nonLarkFailureHandled = true;
+            const failedAt = Date.now();
+            if (asyncResult?.status === 'completed') {
+              // final_output is stronger and may have settled immediately before
+              // the ordered terminal IPC. Never replace known output with a
+              // later failure boundary, even if its best-effort durable write
+              // has not landed yet.
+              ds.idempotentAsyncTurns?.delete(msg.turnId);
+              logger.info(
+                `[${t}] Ignored failed terminal for completed async HTTP turn `
+                + msg.turnId.substring(0, 8),
+              );
+            } else {
+              if (asyncResult?.status === 'pending') {
+                asyncResult.status = 'failed';
+                asyncResult.failedAt = failedAt;
+                asyncResult.errorCode = 'trigger_failed';
+                asyncResult.terminalErrorCode = failureCode;
+              }
+              try {
+                const outcome = asyncTriggerStore.recordTerminalFailureStrict(
+                  ds.session.sessionId,
+                  msg.turnId,
+                  failedAt,
+                  ds.larkAppId,
+                  failureCode,
+                );
+                if (outcome === 'already_completed') {
+                  // Durable completed proof is stronger. Drop a stale in-memory
+                  // pending/failed projection so trigger-result reads that proof.
+                  ds.asyncTriggerResults?.delete(msg.turnId);
+                }
+              } catch (err) {
+                // The live failed projection still terminates current-daemon
+                // polling. Keep it when durable persistence is unavailable and
+                // report the lost restart guarantee explicitly.
+                logger.error(
+                  `[${t}] Failed to persist async worker terminal for `
+                  + `${msg.turnId.substring(0, 8)}: `
+                  + `${err instanceof Error ? err.message : String(err)}`,
+                );
+              }
+              ds.idempotentAsyncTurns?.delete(msg.turnId);
+              logger.info(
+                `[${t}] Settled async HTTP turn ${msg.turnId.substring(0, 8)} `
+                + `failed (${failureCode})`,
+              );
+            }
+          }
+        }
+
+        if (isClaudeProviderFailure
+          && !nonLarkFailureHandled
+          && !recoveryHandled
+          && !managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt)) {
+          const failureCode = msg.errorCode ?? msg.status;
+          const warning = tr(
+            'worker.claude_terminal_failure_unrecovered',
+            { errorCode: failureCode },
+            loc,
+          );
+          ds.agentAttention = { kind: 'blocked', reason: warning, at: Date.now() };
+          publishAttentionPatch(ds);
+          emitSessionLifecycleHook(ds, 'session.requires_attention', {
+            reason: 'claude_terminal_failure_unrecovered',
+            errorCode: failureCode,
+            turnId: msg.turnId,
+          });
+          try {
+            await scopedReply(warning, 'text', msg.turnId);
+          } catch (err) {
+            logger.error(
+              `[${t}] Failed to deliver Claude terminal failure warning: `
+              + `${err instanceof Error ? err.message : String(err)}`,
+            );
+          }
         }
         // Async-HTTP settle-on-terminal (core-only completion bug #70): a turn
         // the worker's bridge gate suppressed as GENUINE SILENCE (the model

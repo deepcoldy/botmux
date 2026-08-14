@@ -572,6 +572,99 @@ describe('ordinary Claude semantic recovery', () => {
       .filter(message => message?.turnId?.startsWith('bmx-recovery-'))).toHaveLength(0);
   });
 
+  it('warns an adopt user when a suppressed provider failure has no recovery consumer', async () => {
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'claude-code' }));
+    const sessionReply = vi.fn(async () => 'om_warning');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const ds = makeDs({
+      adoptedFrom: { sessionId: 'external', cliId: 'claude-code', cwd: '/repo' },
+    } as any);
+    forkWorker(ds, 'adopted turn', 'om_adopted');
+    const worker = forkMock.mock.results.at(-1)!.value;
+
+    worker.emit('message', {
+      type: 'turn_terminal',
+      sessionId: ds.session.sessionId,
+      turnId: 'om_adopted',
+      status: 'failed',
+      errorCode: 'provider_unexpected_eof',
+      retryable: true,
+    });
+
+    await vi.waitFor(() => expect(sessionReply).toHaveBeenCalledWith(
+      'om_root',
+      expect.stringContaining('provider_unexpected_eof'),
+      'text',
+      'app_test',
+      'om_adopted',
+      undefined,
+    ));
+    expect(ds.session.ordinaryTurnRecovery).toBeUndefined();
+    expect(ds.agentAttention).toEqual(expect.objectContaining({
+      kind: 'blocked',
+      reason: expect.stringContaining('provider_unexpected_eof'),
+    }));
+  });
+
+  it('keeps turn N as recovery owner when type-ahead N+1 is admitted', async () => {
+    vi.useFakeTimers();
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'claude-code' }));
+    const sessionReply = vi.fn(async () => 'om_warning');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const ds = makeDs();
+    forkWorker(ds, 'turn N', 'om_turn_n');
+    const worker = forkMock.mock.results.at(-1)!.value;
+    worker.emit('message', { type: 'turn_input_received', turnId: 'om_turn_n' });
+
+    expect(sendWorkerInput(ds, 'turn N+1', 'om_turn_n_plus_1')).toBe(true);
+    expect(ds.session.ordinaryTurnRecovery).toMatchObject({
+      logicalTurnId: 'om_turn_n',
+      currentTurnId: 'om_turn_n',
+      status: 'running',
+    });
+
+    worker.emit('message', {
+      type: 'turn_terminal',
+      sessionId: ds.session.sessionId,
+      turnId: 'om_turn_n',
+      status: 'failed',
+      errorCode: 'provider_unexpected_eof',
+      retryable: true,
+    });
+    await Promise.resolve();
+    await vi.advanceTimersByTimeAsync(2_000);
+
+    expect(vi.mocked(worker.send).mock.calls
+      .map(call => call[0])
+      .filter(message => message?.turnId?.startsWith('bmx-recovery-'))).toHaveLength(1);
+    expect(sessionReply).not.toHaveBeenCalled();
+  });
+
+  it('does not cancel the running terminal owner when N+1 is staged behind activation', () => {
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'claude-code' }));
+    const ds = makeDs();
+    forkWorker(ds, 'turn N', 'om_turn_n');
+    ds.session.queuedActivationPending = true;
+    ds.session.queuedActivationInput = { content: 'turn N' };
+
+    expect(sendWorkerInput(ds, 'turn N+1', 'om_turn_n_plus_1')).toBe(true);
+    expect(ds.session.ordinaryTurnRecovery).toMatchObject({
+      logicalTurnId: 'om_turn_n',
+      currentTurnId: 'om_turn_n',
+      status: 'running',
+    });
+  });
+
   it('cancels a pending backoff when a fresh user message is admitted', async () => {
     vi.useFakeTimers();
     vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'claude-code' }));

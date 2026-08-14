@@ -182,6 +182,24 @@ describe('OrdinaryTurnRecoveryCoordinator', () => {
     expect(scheduled).toHaveLength(2);
   });
 
+  it('does not let an admitted type-ahead turn replace the running terminal owner', () => {
+    const persist = vi.fn();
+    const coordinator = new OrdinaryTurnRecoveryCoordinator({
+      schedule: (_delayMs, run) => run,
+      cancel: vi.fn(),
+      persist,
+      enqueue: vi.fn(() => true),
+      warn: vi.fn(),
+    });
+    const running = state();
+    coordinator.restore(running);
+
+    const current = coordinator.begin('om_type_ahead');
+
+    expect(current).toEqual(running);
+    expect(persist).not.toHaveBeenCalled();
+  });
+
   it('ignores stale, duplicate, non-retryable, and rate-limited terminals', () => {
     const schedule = vi.fn();
     const coordinator = new OrdinaryTurnRecoveryCoordinator({

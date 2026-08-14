@@ -168,7 +168,7 @@ describe('BridgeTurnQueue', () => {
     ]);
   });
 
-  it('treats a bare turn_duration boundary without an outcome as ambiguous', () => {
+  it('treats a bare turn_duration boundary as completed like next-turn-start', () => {
     const q = new BridgeTurnQueue();
     q.mark('om_boundary_only');
     q.ingest([
@@ -179,11 +179,39 @@ describe('BridgeTurnQueue', () => {
     expect(q.drainEmittable({ explicitTerminalOnly: true })).toEqual([
       expect.objectContaining({
         turnId: 'om_boundary_only',
-        terminalOutcome: {
-          status: 'ambiguous',
-          errorCode: 'provider_terminal_outcome_missing',
-          retryable: false,
+        terminalOutcome: { status: 'completed' },
+      }),
+    ]);
+  });
+
+  it('keeps visible text when stop_reason is null and turn_duration closes the turn', () => {
+    const q = new BridgeTurnQueue();
+    q.mark('om_null_reason');
+    q.ingest([
+      user('u-null-reason'),
+      {
+        type: 'assistant',
+        uuid: 'a-null-reason',
+        message: {
+          role: 'assistant',
+          content: [{ type: 'text', text: 'Visible successful answer' }],
+          stop_reason: null,
         },
+      },
+      {
+        type: 'system',
+        subtype: 'stop_hook_summary',
+        uuid: 'stop-hook-null-reason',
+        preventedContinuation: false,
+      } as TranscriptEvent,
+      { type: 'system', subtype: 'turn_duration', uuid: 'duration-null-reason' },
+    ]);
+
+    expect(q.drainEmittable({ explicitTerminalOnly: true })).toEqual([
+      expect.objectContaining({
+        turnId: 'om_null_reason',
+        assistantUuids: ['a-null-reason'],
+        terminalOutcome: { status: 'completed' },
       }),
     ]);
   });

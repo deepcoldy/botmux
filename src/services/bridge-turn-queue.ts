@@ -342,16 +342,15 @@ export class BridgeTurnQueue {
         }
       } else if (isClaudeTurnTerminalEvent(ev)) {
         // Claude normally writes this as `system/turn_duration` immediately
-        // after the final assistant line. It is a second marker for the same
-        // logical boundary; setting a bit is naturally idempotent.
+        // after the final assistant line. A local transcript can legitimately
+        // contain visible text with `stop_reason:null`; the duration marker is
+        // still authoritative proof that the turn completed. Keep a previously
+        // classified API failure, but otherwise use the same completed default
+        // as the next-turn-start compatibility boundary below.
         if (this.collecting) {
           this.collecting.terminalObserved = true;
           if (!this.collecting.rateLimited) {
-            this.collecting.terminalOutcome ??= {
-              status: 'ambiguous',
-              errorCode: 'provider_terminal_outcome_missing',
-              retryable: false,
-            };
+            this.collecting.terminalOutcome ??= { status: 'completed' };
           }
         }
       }

@@ -336,10 +336,13 @@ export interface DaemonSession {
    *  `latestAsyncTriggerId`; callers that need exact-match semantics can also
    *  pass the triggerId returned by the initial async activation response. */
   asyncTriggerResults?: Map<string, {
-    status: 'pending' | 'completed';
+    status: 'pending' | 'completed' | 'failed';
     createdAt: number;
     completedAt?: number;
+    failedAt?: number;
     content?: string;
+    errorCode?: 'trigger_failed';
+    terminalErrorCode?: string;
     usage?: { inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheCreateTokens: number };
   }>;
   latestAsyncTriggerId?: string;
