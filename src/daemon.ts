@@ -3764,7 +3764,17 @@ function refreshCliVersion(botCfg: Pick<BotConfig, 'cliId' | 'cliRuntime' | 'cli
     // Remote backends (riff) have no local binary to version-check — skip.
     if (!adapter.resolvedBin && !adapter.versionCommand) return false;
     const versionCommand = adapter.versionCommand?.() ?? { bin: adapter.resolvedBin, args: ['--version'] };
-    const raw = execFileSync(versionCommand.bin, versionCommand.args, {
+    // Windows: npm-global CLIs are `.cmd` shims which child_process.execFileSync
+    // cannot run directly (EINVAL) — resolve the shim's target exe/script via
+    // cmd.exe. node-pty (the actual session spawn) handles .cmd natively, so
+    // this only affects the version probe.
+    let probeBin = versionCommand.bin;
+    let probeArgs = versionCommand.args;
+    if (process.platform === 'win32' && /\.(cmd|bat)$/i.test(probeBin)) {
+      probeArgs = ['/d', '/c', probeBin, ...probeArgs];
+      probeBin = process.env.COMSPEC || 'cmd.exe';
+    }
+    const raw = execFileSync(probeBin, probeArgs, {
       encoding: 'utf-8',
       timeout: 5_000,
     }).trim();
