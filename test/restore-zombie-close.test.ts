@@ -1374,6 +1374,87 @@ describe('closeCliMismatchedSessionsForBot — runtime CLI hot-switch sweep', ()
       expect(closeSession).toHaveBeenCalledWith(s1.sessionId);
     });
 
+    // THE WINDOW A DOUBLE CAS CANNOT CLOSE.
+    //
+    // `target` is captured before the closes start. The closes then run unlocked
+    // for as long as a remote CLI needs, so another process can commit a new
+    // authority in that span. Judging sessions by the stale proposal closes the
+    // WRONG rows: a session frozen on the newly committed runtime looks
+    // mismatched against our old target and is destroyed, while the genuinely
+    // stale one is missed. Refusing the commit afterwards cannot bring it back.
+    //
+    // So each close is re-justified against the row on disk at that moment: when
+    // the authority no longer marks a session as stale we SKIP it (a recoverable
+    // missed close) instead of killing it (unrecoverable).
+    it('does NOT close a session that the CURRENT authority still backs', async () => {
+      // Frozen on 'codex' — the runtime the concurrent writer commits.
+      const frozenOnB = makeActivePersistentSession('om_sw_fresh_b');
+      frozenOnB.cliId = 'codex';
+      sessionStore.updateSession(frozenOnB);
+      registerDs(frozenOnB);
+
+      // Our proposal switches the bot to traex, so against THIS target the
+      // codex-frozen session looks mismatched and would be closed.
+      const staleTarget = { cliId: 'traex' as const };
+
+      // The authority on disk says codex by the time the close is attempted.
+      const readPersistedTarget = async () => ({ cliId: 'codex' as const });
+
+      const result = await closeSessionsForAgentSwitch(
+        'app_test',
+        staleTarget,
+        readPersistedTarget,
+      );
+
+      expect(
+        closeSession,
+        'a session that matches the authority on disk must never be closed',
+      ).not.toHaveBeenCalledWith(frozenOnB.sessionId);
+      expect(result.closed).toBe(0);
+      expect(
+        sessionStore.getSession(frozenOnB.sessionId)!.status,
+        'the session must survive',
+      ).toBe('active');
+    });
+
+    it('still closes a session the CURRENT authority marks as stale', async () => {
+      // Frozen on codex; both the proposal and the disk row say traex, so this row
+      // really is stale and must still be closed — the guard must not disable the
+      // feature it protects.
+      const genuinelyStale = makeActivePersistentSession('om_sw_fresh_a');
+      genuinelyStale.cliId = 'codex';
+      sessionStore.updateSession(genuinelyStale);
+      registerDs(genuinelyStale);
+
+      const result = await closeSessionsForAgentSwitch(
+        'app_test',
+        { cliId: 'traex' as const },
+        async () => ({ cliId: 'traex' as const }),
+      );
+
+      expect(closeSession).toHaveBeenCalledWith(genuinelyStale.sessionId);
+      expect(result).toMatchObject({ ok: true, closed: 1 });
+    });
+
+    it('refuses the switch instead of closing when the authority is unreadable', async () => {
+      // Cannot prove the close is still correct ⇒ fail closed rather than destroy a
+      // session on a guess.
+      const s1 = makeActivePersistentSession('om_sw_fresh_unreadable');
+      s1.cliId = 'codex';
+      sessionStore.updateSession(s1);
+      registerDs(s1);
+
+      const result = await closeSessionsForAgentSwitch(
+        'app_test',
+        { cliId: 'traex' as const },
+        async () => 'unreadable' as const,
+      );
+
+      expect(closeSession).not.toHaveBeenCalledWith(s1.sessionId);
+      expect(result).toMatchObject({ ok: false, closed: 0, failed: 1 });
+      expect(sessionStore.getSession(s1.sessionId)!.status).toBe('active');
+    });
+
     it('BLOCKS the switch when a close is refused', async () => {
       // The whole point of the reorder: the caller must not commit, so the bot keeps
       // running the same agent this still-active row is frozen on.

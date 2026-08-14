@@ -162,8 +162,8 @@ describe('agent switch — no precondition runs after the irreversible close', (
     const closeAt = ipc.indexOf('await agentSwitchCloseHook.run(');
     for (const marker of [
       'const currentSelectionKey = selectionKeyForBot(',
-      'nextRuntime = currentBotConfig.cliRuntime;',
-      'nextLegacyPath = nextRuntime ? undefined : currentBotConfig.cliPathOverride;',
+      'const deriveRuntimeForRow = (row: {',
+      '({ nextRuntime, nextLegacyPath } = deriveRuntimeForRow(currentBotConfig));',
     ]) {
       const at = ipc.indexOf(marker);
       expect(at, `${marker} must exist`).toBeGreaterThan(0);
@@ -228,6 +228,74 @@ describe('agent switch — no precondition runs after the irreversible close', (
     expect(block, 'nothing was closed yet, so no close summary').not.toContain('closeSummaryPayload');
     // An unreadable authority here must fail closed too, not fall through.
     expect(block).toContain("error: 'bot_config_unreadable'");
+  });
+
+  it('hands the close a FRESH-authority reader, not just the captured target', () => {
+    // A guard on the helper alone would be false green: the helper can support
+    // per-close re-verification while the route never passes it. The window this
+    // closes is the close DURATION, which neither CAS covers.
+    const closeAt = ipc.indexOf('await agentSwitchCloseHook.run(');
+    expect(closeAt, 'close call site').toBeGreaterThan(0);
+    const callBlock = ipc.slice(closeAt, ipc.indexOf(');', closeAt));
+    expect(
+      callBlock,
+      'the close must receive a persisted-target reader as its third argument',
+    ).toContain('readPersistedTarget');
+
+    // The reader must read the AUTHORITY (disk), and must be defined before the
+    // close so it cannot accidentally capture post-close state.
+    const readerAt = ipc.indexOf('const readPersistedTarget = async ()');
+    expect(readerAt, 'reader definition').toBeGreaterThan(0);
+    expect(readerAt, 'defined before the close').toBeLessThan(closeAt);
+    const readerBlock = ipc.slice(readerAt, closeAt);
+    expect(readerBlock).toContain('readRawConfig(requireConfigPath())');
+    expect(readerBlock).toContain('findEntryIndex(raw, larkAppId)');
+    // It must RE-DERIVE the proposal through the SAME helper the commit path uses.
+    // Returning the row's own config instead would call every genuinely stale
+    // session "backed by disk" and skip every close — disabling the switch — and a
+    // second, parallel derivation here could drift from the committed one, which is
+    // the whole class of bug this handler kept hitting.
+    expect(readerBlock).toContain('deriveRuntimeForRow(row)');
+    // Exactly two CALL SITES (the definition reads `= (row: {`, so it is not
+    // matched here): the committed proposal and the fresh re-derivation. A third
+    // hand-rolled derivation is what would let them drift apart again.
+    const callSites = [...ipc.matchAll(/deriveRuntimeForRow\((?!row: )/g)];
+    expect(
+      callSites.length,
+      'the proposal and the per-close re-derivation must be the only call sites',
+    ).toBe(2);
+    expect(ipc, 'and there must be exactly one definition')
+      .toContain('const deriveRuntimeForRow = (row: {');
+    // An unreadable authority must be reported, not silently treated as "no
+    // change" (which would re-open the stale-close hole).
+    expect(readerBlock).toContain("'unreadable'");
+  });
+
+  it('re-justifies EVERY close against the fresh authority, in both loops', () => {
+    // The registry loop and the durable-row loop both close sessions; guarding
+    // only one leaves the other able to kill a session the authority still backs.
+    const sm = readFileSync(
+      new URL('../src/core/session-manager.ts', import.meta.url), 'utf8');
+    const helperAt = sm.indexOf('const stillJustifiedByDisk = async (');
+    expect(helperAt, 'per-close re-justification helper').toBeGreaterThan(0);
+
+    // Fail closed when the authority cannot be read.
+    const helperBlock = sm.slice(helperAt, sm.indexOf('  for (const ds of', helperAt));
+    expect(helperBlock).toContain("=== 'unreadable'");
+    expect(helperBlock).toContain('out.ok = false');
+
+    const guards = [...sm.matchAll(/if \(!await stillJustifiedByDisk\(/g)];
+    expect(
+      guards.length,
+      'both the registry loop and the durable-row loop must re-justify',
+    ).toBe(2);
+    // Each guard must sit before its close call.
+    for (const g of guards) {
+      const closeAt = sm.indexOf('await closeSession(', g.index!);
+      expect(closeAt, 'a close must follow each guard').toBeGreaterThan(g.index!);
+      const between = sm.slice(g.index!, closeAt);
+      expect(between, 'the guard must skip rather than fall through').toContain('continue;');
+    }
   });
 
   it('reports the CAS refusal as a post-close exit with the close summary', () => {

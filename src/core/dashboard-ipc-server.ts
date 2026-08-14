@@ -4075,11 +4075,39 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
     // preservation branch below and silently deleted the persisted path on an old
     // client's model-only save. The authority snapshot must therefore carry the
     // same normalisation the loader applies.
+    /**
+     * Runtime/path proposal derived from ONE persisted row.
+     *
+     * Shared by the initial proposal and by the per-close re-derivation during the
+     * closes, so the two cannot drift: whatever decides "this session is stale"
+     * must be computed exactly like whatever gets committed.
+     */
+    const deriveRuntimeForRow = (row: {
+      cliId?: string; wrapperCli?: string;
+      cliRuntime?: CliRuntimeConfig; cliPathOverride?: string;
+    }): { nextRuntime?: CliRuntimeConfig; nextLegacyPath?: string } => {
+      // An explicit cliRuntime in the body does not depend on the row at all.
+      if (runtimeFieldPresent) return { nextRuntime: explicitRuntime };
+      const rowSelectionKey = selectionKeyForBot(
+        row.cliId ?? LEGACY_DEFAULT_CLI_ID,
+        row.wrapperCli,
+      );
+      // Different agent ⇒ nothing to preserve.
+      if (key !== rowSelectionKey) return {};
+      // Old dashboard clients know only `{cliId, model}`. Preserve the runtime on
+      // same-agent saves so editing a model cannot silently erase new config.
+      const preserved = row.cliRuntime;
+      return {
+        nextRuntime: preserved,
+        nextLegacyPath: preserved ? undefined : row.cliPathOverride,
+      };
+    };
     const currentSelectionKey = selectionKeyForBot(
       currentBotConfig.cliId ?? LEGACY_DEFAULT_CLI_ID,
       currentBotConfig.wrapperCli,
     );
     const selectionChanged = key !== currentSelectionKey;
+    let explicitRuntime: CliRuntimeConfig | undefined;
     let nextRuntime: CliRuntimeConfig | undefined;
     let nextLegacyPath: string | undefined;
     if (runtimeFieldPresent) {
@@ -4091,7 +4119,7 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
           return jsonRes(res, 400, { ok: false, error: 'runtime_wrapper_conflict' });
         }
         try {
-          nextRuntime = normalizeCliRuntimeConfig(body.cliRuntime, 'cliRuntime');
+          explicitRuntime = normalizeCliRuntimeConfig(body.cliRuntime, 'cliRuntime');
         } catch (err) {
           return jsonRes(res, 400, {
             ok: false,
@@ -4102,12 +4130,9 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
       }
       // null explicitly means built-in runtime; both structured and legacy
       // executable overrides are cleared.
-    } else if (!selectionChanged) {
-      // Old dashboard clients know only `{cliId, model}`. Preserve the runtime on
-      // same-agent saves so editing a model cannot silently erase new config.
-      nextRuntime = currentBotConfig.cliRuntime;
-      nextLegacyPath = nextRuntime ? undefined : currentBotConfig.cliPathOverride;
     }
+    // Single derivation path for the proposal actually used below.
+    ({ nextRuntime, nextLegacyPath } = deriveRuntimeForRow(currentBotConfig));
     const effectivePath = nextRuntime?.executable ?? nextLegacyPath;
     const availability = checkCliAvailability({
       cliId: selected.cliId,
@@ -4226,7 +4251,50 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
       });
     }
 
-    const closedMismatchedSessions = await agentSwitchCloseHook.run(larkAppId, switchTarget);
+    // Each close is re-justified against the row on disk at that moment. The
+    // pre-close verify above only proves the target was valid when the lock was
+    // released; the closes then run unlocked for as long as a remote CLI needs, so
+    // a writer committing in that span would otherwise make us close sessions that
+    // are correct under the new authority and miss the ones that are not. A closed
+    // session cannot be restored by refusing the commit, so the check has to be
+    // per-close, not per-request.
+    const readPersistedTarget = async (): Promise<
+      { cliId?: typeof selected.cliId; cliRuntime?: CliRuntimeConfig; cliPathOverride?: string; wrapperCli?: string }
+      | undefined | 'unreadable'
+    > => {
+      try {
+        const raw = await readRawConfig(requireConfigPath());
+        const idx = findEntryIndex(raw, larkAppId);
+        if (idx < 0) return undefined;
+        const row = raw[idx] as {
+          cliId?: string; wrapperCli?: string;
+          cliRuntime?: CliRuntimeConfig; cliPathOverride?: string;
+        };
+        // RE-DERIVE THE PROPOSAL from the row as it stands now — do not return the
+        // row's own config. The bot is still on the OLD agent at this point
+        // (nothing is committed until after the closes), so comparing sessions
+        // against the row itself would call every genuinely stale session "backed
+        // by disk" and skip every close, silently disabling the switch. What must
+        // stay stable is the TARGET: same request fields, runtime preserved from
+        // the current row. If another process committed a different runtime, the
+        // re-derived target follows it, so a session frozen on that runtime is no
+        // longer considered stale and is left alone.
+        const fresh = deriveRuntimeForRow(row);
+        return {
+          cliId: selected.cliId,
+          cliRuntime: fresh.nextRuntime,
+          cliPathOverride: fresh.nextRuntime?.executable ?? fresh.nextLegacyPath,
+          wrapperCli: selected.wrapperCli,
+        };
+      } catch {
+        return 'unreadable';
+      }
+    };
+    const closedMismatchedSessions = await agentSwitchCloseHook.run(
+      larkAppId,
+      switchTarget,
+      readPersistedTarget,
+    );
     // ONE shape for every post-close exit. These closes are irreversible, so each
     // exit after them is the only report of a surviving remote session; three
     // hand-written copies would drift.
