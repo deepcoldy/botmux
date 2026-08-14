@@ -51,10 +51,12 @@ export function prefixOf(text: string): string {
   return normaliseForFingerprint(text).slice(0, PREFIX_FALLBACK_LEN);
 }
 
-/** turnId 文件名安全化：保留字母数字 _-，其余替换为 _。claim 侧同一函数，双向一致。 */
-function sanitizeTurnId(turnId: string): string {
-  const cleaned = turnId.replace(/[^a-zA-Z0-9_-]/g, '_');
-  return cleaned || createHash('sha256').update(turnId, 'utf8').digest('hex').slice(0, 16);
+/** turnId 文件名键：全量 sha256(turnId) hex。
+ * 不用 lossy sanitize（非字母数字转 _）：两个近似 turnId（如 `turn/a` 与 `turn?a`）
+ * 会撞同一文件名，后写覆盖前写，exact pop 又不回校验 payload → 跨轮串投。
+ * 全量 hash 使碰撞密码学不可行；payload 另存 raw turnId 供回校验（defense-in-depth）。 */
+function turnIdKey(turnId: string): string {
+  return createHash('sha256').update(turnId, 'utf8').digest('hex');
 }
 
 /**
@@ -67,7 +69,7 @@ export function writePromptContext(sessionId: string, turnId: string, ptyText: s
   try {
     const dir = sessionDir(sessionId);
     mkdirSync(dir, { recursive: true, mode: 0o700 });
-    const file = join(dir, `${fingerprintPromptText(ptyText)}.${sanitizeTurnId(turnId)}.json`);
+    const file = join(dir, `${fingerprintPromptText(ptyText)}.${turnIdKey(turnId)}.json`);
     const tmp = `${file}.tmp-${process.pid}`;
     const payload = JSON.stringify({
       version: 3,
@@ -104,10 +106,18 @@ export function claimPromptContext(
     const dir = sessionDir(sessionId);
     if (!existsSync(dir)) return undefined;
 
-    // 1. 精确匹配 (fingerprint, turnId)
-    const exactFile = join(dir, `${fingerprint}.${sanitizeTurnId(turnId)}.json`);
+    // 1. 精确匹配 (fingerprint, turnId)。文件名用全量 hash 不碰撞，但仍回校验
+    //    payload 的 raw turnId + fingerprint（defense-in-depth：防文件名碰撞/伪造）。
+    const exactFile = join(dir, `${fingerprint}.${turnIdKey(turnId)}.json`);
     if (existsSync(exactFile)) {
-      return popSidecar(exactFile);
+      try {
+        const parsed = JSON.parse(readFileSync(exactFile, 'utf8'));
+        if (typeof parsed?.envelope === 'string'
+          && parsed.turnId === turnId
+          && parsed.fingerprint === fingerprint) {
+          return popSidecar(exactFile, parsed.envelope);
+        }
+      } catch { /* 损坏/不符 → 落到前缀兜底或 miss */ }
     }
 
     // 2. 前缀兜底（paste 污染：尾部软换行变字面量，全量指纹失配）

@@ -99,6 +99,18 @@ describe('prompt-context-store', () => {
     expect(claimByPrompt('sess-t', 'turn-A', '内容')).toBe('ENV-A');
   });
 
+  it('sanitize 碰撞回归：含特殊字符的 turnId 不撞文件名（旧 lossy sanitize 会串轮）', () => {
+    // 旧实现 sanitize 把非字母数字转 _：`turn/a` 和 `turn?a` 都变成 `turn_a`，
+    // 后写覆盖前写，claim(`turn/a`) 取到 `turn?a` 的 envelope（跨轮串投）。
+    // 现用全量 sha256(turnId) 做文件名键，两个 turnId 落不同文件，各取各的。
+    writePromptContext('sess-col', 'turn/a', '<user_message>\n相同\n</user_message>', 'ENV-斜杠');
+    writePromptContext('sess-col', 'turn?a', '<user_message>\n相同\n</user_message>', 'ENV-问号');
+    const files = readdirSync(join(tmpRoot, 'prompt-ctx', 'sess-col'));
+    expect(files).toHaveLength(2);
+    expect(claimByPrompt('sess-col', 'turn/a', '<user_message>\n相同\n</user_message>')).toBe('ENV-斜杠');
+    expect(claimByPrompt('sess-col', 'turn?a', '<user_message>\n相同\n</user_message>')).toBe('ENV-问号');
+  });
+
   it('前缀兜底：尾部被 paste 污染（软换行变字面量）仍能命中（按 turnId 定域）', () => {
     const longLine = '这是一行足够长的内容，用来模拟把 Ink 顶进 paste 模式的那一行，超过三十个字符';
     const clean = `<user_message>\n${longLine}\n第二行\n第三行\n</user_message>`;

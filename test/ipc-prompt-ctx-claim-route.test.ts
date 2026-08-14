@@ -175,4 +175,21 @@ describe('POST /api/sessions/:sessionId/prompt-ctx/claim', () => {
     expect(res.status).toBe(404);
     expect(await res.json()).toEqual({ ok: false, error: 'not_found' });
   });
+
+  it('accepts a VC receiver session with the correct capability (allowReceiver: true)', async () => {
+    // review 三审：sessionCliIpcAuth 默认 allowReceiver:false 会 403 receiver 会话；
+    // claim 只读自己本轮的 reminder/whiteboard（非 managed action），单独 allowReceiver:true。
+    vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue({
+      session: { sessionId: 's-receiver', vcMeetingReceiver: {} },
+      managedTurnOrigin: { capability: CAP, turnId: 'turn-1' },
+      larkAppId: 'app-1',
+    } as any);
+    claimMock.mockReturnValue('<botmux_reminder>提醒</botmux_reminder>');
+
+    const res = await postClaim('s-receiver', VALID_BODY);
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ ok: true, envelope: '<botmux_reminder>提醒</botmux_reminder>' });
+    expect(claimMock).toHaveBeenCalledWith('s-receiver', 'turn-1', 'a'.repeat(64), 'some-prefix');
+  });
 });

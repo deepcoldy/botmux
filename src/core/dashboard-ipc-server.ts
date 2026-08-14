@@ -1075,7 +1075,9 @@ ipcRoute('POST', '/api/sessions/:sessionId/prompt-ctx/claim', async (req, res, p
     prefix?: unknown;
   } & Record<string, unknown>);
   const ds = findActiveBySessionId(params.sessionId);
-  const auth = sessionCliIpcAuth(req, ds, params.sessionId, body);
+  // claim 只读 daemon 自有本轮非凭证上下文（reminder/whiteboard），receiver 会话
+  // 也允许（allowReceiver: true）；close/slash/cd 等 managed action 仍默认拒绝。
+  const auth = sessionCliIpcAuth(req, ds, params.sessionId, body, { allowReceiver: true });
   if (!auth.ok) return jsonRes(res, 403, { ok: false, error: auth.error });
   const fingerprint = typeof body?.fingerprint === 'string' ? body.fingerprint : '';
   if (!/^[a-f0-9]{64}$/.test(fingerprint)) {
@@ -1334,6 +1336,7 @@ function sessionCliIpcAuth(
   ds: DaemonSession | undefined,
   sessionId: string,
   body: Record<string, unknown> | undefined,
+  opts: { allowReceiver?: boolean } = {},
 ): { ok: true } | { ok: false; error: string } {
   const claimedAttempt = typeof body?.originDispatchAttempt === 'number'
     && Number.isSafeInteger(body.originDispatchAttempt)
@@ -1344,7 +1347,9 @@ function sessionCliIpcAuth(
     trustedHost: isTrustedHostIpcRequest(req),
     sessionExists: !!ds,
     receiverSession: !!ds?.session.vcMeetingReceiver,
-    allowReceiver: false,
+    // close/slash/cd 是 managed action，默认拒绝 receiver；claim 只读 daemon 自有
+    // 本轮非凭证上下文（reminder/whiteboard），读自己本轮 reminder 非提权，单独放开。
+    allowReceiver: opts.allowReceiver === true,
     sessionId,
     liveOrigin: ds?.managedTurnOrigin,
     claimedCapability: typeof body?.originCapability === 'string' ? body.originCapability : undefined,
