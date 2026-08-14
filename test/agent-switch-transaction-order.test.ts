@@ -114,6 +114,45 @@ describe('agent switch — no precondition runs after the irreversible close', (
       .not.toContain("'claude-code'");
   });
 
+  it('reads the authority INSIDE the mutation gate, not before it', () => {
+    // The gate serialises per bot. Reading the authority before admission lets a
+    // queued request commit a proposal built from a pre-queue row: an old
+    // model-only client rolls a newer runtime back (lost update) and the close
+    // hook gets a stale target. Admission must come first.
+    const gateAt = ipc.indexOf('return withBotTurnMutation(larkAppId, async () => {',
+      ipc.indexOf('const runtimeFieldPresent') - 4000);
+    const authorityAt = ipc.indexOf('let persistedBotRow');
+    const closeAt = ipc.indexOf('await agentSwitchCloseHook.run(');
+    expect(gateAt, 'agent-switch mutation gate').toBeGreaterThan(0);
+    expect(authorityAt, 'authority read').toBeGreaterThan(0);
+    expect(
+      authorityAt,
+      'the authority must be read only after the mutation gate admits the request',
+    ).toBeGreaterThan(gateAt);
+    expect(
+      authorityAt,
+      'and still before the irreversible close',
+    ).toBeLessThan(closeAt);
+  });
+
+  it('builds the runtime/path proposal inside the gate too', () => {
+    // Re-reading the row but keeping a proposal computed outside would preserve
+    // the stale runtime just the same.
+    const gateAt = ipc.indexOf('return withBotTurnMutation(larkAppId, async () => {',
+      ipc.indexOf('const runtimeFieldPresent') - 4000);
+    const closeAt = ipc.indexOf('await agentSwitchCloseHook.run(');
+    for (const marker of [
+      'const currentSelectionKey = selectionKeyForBot(',
+      'nextRuntime = currentBotConfig.cliRuntime;',
+      'nextLegacyPath = nextRuntime ? undefined : currentBotConfig.cliPathOverride;',
+    ]) {
+      const at = ipc.indexOf(marker);
+      expect(at, `${marker} must exist`).toBeGreaterThan(0);
+      expect(at, `${marker} must be derived inside the gate`).toBeGreaterThan(gateAt);
+      expect(at, `${marker} must be derived before the close`).toBeLessThan(closeAt);
+    }
+  });
+
   it('FAILS CLOSED when the authority cannot be read', () => {
     // Swallowing the read error and deferring to the locked backstop means the
     // irreversible closes run first, so a request that never commits still tears

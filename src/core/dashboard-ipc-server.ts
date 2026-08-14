@@ -3931,159 +3931,168 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
   if (body.reasoningEffort !== undefined && body.reasoningEffort !== '' && reasoningEffort === null) {
     return jsonRes(res, 400, { ok: false, error: 'invalid_reasoning_effort' });
   }
-  // SINGLE AUTHORITY SNAPSHOT for every decision this handler makes.
+  // EVERYTHING below runs INSIDE the mutation gate.
   //
-  // `getBot().config` is the live in-memory snapshot; the transaction below
-  // mutates the bots.json row. They are different sources and can already
-  // disagree BEFORE the request arrives, so anything derived from memory may
-  // describe a bot that no longer exists on disk. That matters because these
-  // derived values do not merely gate a 4xx — they feed
-  //   1. `switchTarget`, i.e. WHICH sessions agentSwitchCloseHook irreversibly
-  //      closes, and
-  //   2. the runtime fields written back,
-  // so a stale read closes the wrong sessions and can silently erase a persisted
-  // cliRuntime / cliPathOverride. Read the row ONCE, up front, and derive
-  // selection, runtime preservation and reasoning effort from that one snapshot.
-  //
-  // Both a read failure and a missing row are FAIL-CLOSED. Preconditions cannot
-  // be decided against the authority, and deferring to the in-transaction
-  // backstop would mean running the irreversible closes first; refusing keeps
-  // "a failed validation produces no side effects" true. A missing row is the
-  // same condition rmwBotEntry reports as `bot_not_in_config`.
-  let persistedBotRow: Record<string, unknown>;
-  try {
-    const raw = await readRawConfig(requireConfigPath());
-    const idx = findEntryIndex(raw, larkAppId);
-    if (idx < 0) return jsonRes(res, 404, { ok: false, error: 'bot_not_in_config' });
-    persistedBotRow = raw[idx] as Record<string, unknown>;
-  } catch (err) {
-    return jsonRes(res, 503, {
-      ok: false,
-      error: 'bot_config_unreadable',
-      message: err instanceof Error ? err.message : String(err),
-    });
-  }
-  // Narrow to exactly the fields this handler is allowed to derive from, so
-  // reaching for any other field forces a deliberate decision about authority.
-  const currentBotConfig = persistedBotRow as unknown as {
-    cliId?: string;
-    wrapperCli?: string;
-    cliRuntime?: CliRuntimeConfig;
-    cliPathOverride?: string;
-    reasoningEffort?: typeof reasoningEffort;
-  };
-  const supportsReasoningEffort = isCodexReasoningCliId(selected.cliId);
-  // PRECONDITION, checked before any irreversible work.
-  //
-  // The model-support check also exists inside the rmwBotEntry transaction below,
-  // but that runs AFTER agentSwitchCloseHook has already closed every session
-  // frozen on the old agent — closes that cannot be undone. So a request that is
-  // simply invalid (e.g. codex + a model that rejects `ultra`) used to tear down
-  // live sessions and only then answer 400, breaking "a failed validation
-  // produces no side effects".
-  //
-  // The in-transaction copy is deliberately KEPT as a backstop: only it sees the
-  // row under the write lock, so it still covers a genuine request-time race, and
-  // its rejection carries the close summary.
-  //
-  // The absent-field fallback comes from the authority snapshot above, i.e. the
-  // same bots.json row the transaction reads. Drift example this closes: live
-  // `xhigh` (supported) over persisted `ultra` (not supported) let the preflight
-  // pass, the irreversible close run, and only then the locked read reject.
-  const persistedReasoningEffort = currentBotConfig.reasoningEffort;
-  const preflightReasoningEffort = supportsReasoningEffort
-    ? (reasoningEffortFieldPresent ? reasoningEffort ?? undefined : persistedReasoningEffort)
-    : undefined;
-  if (preflightReasoningEffort
-      && !codexModelSupportsReasoningEffort(model || undefined, preflightReasoningEffort)) {
-    return jsonRes(res, 400, {
-      ok: false,
-      error: 'reasoning_effort_not_supported_by_model',
-      message: `模型 ${model || '（Codex 默认模型）'} 不支持当前思考强度`,
-    });
-  }
-  const runtimeFieldPresent = Object.prototype.hasOwnProperty.call(body, 'cliRuntime');
-  // A legacy row may OMIT cliId. That is not "no selection": parseBotConfigFile
-  // normalises it to claude-code (`entry.cliId ?? 'claude-code'`), so the bot IS
-  // on claude-code and may well carry a legacy cliPathOverride. Reading the raw
-  // row without that default made the selection look changed, which skipped the
-  // preservation branch below and silently deleted the persisted path on an old
-  // client's model-only save. The authority snapshot must therefore carry the
-  // same normalisation the loader applies.
-  const currentSelectionKey = selectionKeyForBot(
-    currentBotConfig.cliId ?? LEGACY_DEFAULT_CLI_ID,
-    currentBotConfig.wrapperCli,
-  );
-  const selectionChanged = key !== currentSelectionKey;
-  let nextRuntime: CliRuntimeConfig | undefined;
-  let nextLegacyPath: string | undefined;
-  if (runtimeFieldPresent) {
-    if (body.cliRuntime !== null) {
-      if (selected.cliId !== 'codex') {
-        return jsonRes(res, 400, { ok: false, error: 'runtime_requires_codex' });
+  // The gate serialises mutations per bot, so a request that reads the authority
+  // BEFORE entering it can be admitted long after another request committed. A
+  // queued old client (model-only, no cliRuntime) would then preserve the runtime
+  // it saw pre-queue and write it back over the newer one — a lost update — and
+  // hand the close hook a target describing a bot that no longer exists. So the
+  // authority read AND every proposal derived from it must happen after admission
+  // and before the irreversible close.
+  return withBotTurnMutation(larkAppId, async () => {
+    // SINGLE AUTHORITY SNAPSHOT for every decision this handler makes.
+    //
+    // `getBot().config` is the live in-memory snapshot; the transaction below
+    // mutates the bots.json row. They are different sources and can already
+    // disagree BEFORE the request arrives, so anything derived from memory may
+    // describe a bot that no longer exists on disk. That matters because these
+    // derived values do not merely gate a 4xx — they feed
+    //   1. `switchTarget`, i.e. WHICH sessions agentSwitchCloseHook irreversibly
+    //      closes, and
+    //   2. the runtime fields written back,
+    // so a stale read closes the wrong sessions and can silently erase a persisted
+    // cliRuntime / cliPathOverride. Read the row ONCE, up front, and derive
+    // selection, runtime preservation and reasoning effort from that one snapshot.
+    //
+    // Both a read failure and a missing row are FAIL-CLOSED. Preconditions cannot
+    // be decided against the authority, and deferring to the in-transaction
+    // backstop would mean running the irreversible closes first; refusing keeps
+    // "a failed validation produces no side effects" true. A missing row is the
+    // same condition rmwBotEntry reports as `bot_not_in_config`.
+    let persistedBotRow: Record<string, unknown>;
+    try {
+      const raw = await readRawConfig(requireConfigPath());
+      const idx = findEntryIndex(raw, larkAppId);
+      if (idx < 0) return jsonRes(res, 404, { ok: false, error: 'bot_not_in_config' });
+      persistedBotRow = raw[idx] as Record<string, unknown>;
+    } catch (err) {
+      return jsonRes(res, 503, {
+        ok: false,
+        error: 'bot_config_unreadable',
+        message: err instanceof Error ? err.message : String(err),
+      });
+    }
+    // Narrow to exactly the fields this handler is allowed to derive from, so
+    // reaching for any other field forces a deliberate decision about authority.
+    const currentBotConfig = persistedBotRow as unknown as {
+      cliId?: string;
+      wrapperCli?: string;
+      cliRuntime?: CliRuntimeConfig;
+      cliPathOverride?: string;
+      reasoningEffort?: typeof reasoningEffort;
+    };
+    const supportsReasoningEffort = isCodexReasoningCliId(selected.cliId);
+    // PRECONDITION, checked before any irreversible work.
+    //
+    // The model-support check also exists inside the rmwBotEntry transaction below,
+    // but that runs AFTER agentSwitchCloseHook has already closed every session
+    // frozen on the old agent — closes that cannot be undone. So a request that is
+    // simply invalid (e.g. codex + a model that rejects `ultra`) used to tear down
+    // live sessions and only then answer 400, breaking "a failed validation
+    // produces no side effects".
+    //
+    // The in-transaction copy is deliberately KEPT as a backstop: only it sees the
+    // row under the write lock, so it still covers a genuine request-time race, and
+    // its rejection carries the close summary.
+    //
+    // The absent-field fallback comes from the authority snapshot above, i.e. the
+    // same bots.json row the transaction reads. Drift example this closes: live
+    // `xhigh` (supported) over persisted `ultra` (not supported) let the preflight
+    // pass, the irreversible close run, and only then the locked read reject.
+    const persistedReasoningEffort = currentBotConfig.reasoningEffort;
+    const preflightReasoningEffort = supportsReasoningEffort
+      ? (reasoningEffortFieldPresent ? reasoningEffort ?? undefined : persistedReasoningEffort)
+      : undefined;
+    if (preflightReasoningEffort
+        && !codexModelSupportsReasoningEffort(model || undefined, preflightReasoningEffort)) {
+      return jsonRes(res, 400, {
+        ok: false,
+        error: 'reasoning_effort_not_supported_by_model',
+        message: `模型 ${model || '（Codex 默认模型）'} 不支持当前思考强度`,
+      });
+    }
+    const runtimeFieldPresent = Object.prototype.hasOwnProperty.call(body, 'cliRuntime');
+    // A legacy row may OMIT cliId. That is not "no selection": parseBotConfigFile
+    // normalises it to claude-code (`entry.cliId ?? 'claude-code'`), so the bot IS
+    // on claude-code and may well carry a legacy cliPathOverride. Reading the raw
+    // row without that default made the selection look changed, which skipped the
+    // preservation branch below and silently deleted the persisted path on an old
+    // client's model-only save. The authority snapshot must therefore carry the
+    // same normalisation the loader applies.
+    const currentSelectionKey = selectionKeyForBot(
+      currentBotConfig.cliId ?? LEGACY_DEFAULT_CLI_ID,
+      currentBotConfig.wrapperCli,
+    );
+    const selectionChanged = key !== currentSelectionKey;
+    let nextRuntime: CliRuntimeConfig | undefined;
+    let nextLegacyPath: string | undefined;
+    if (runtimeFieldPresent) {
+      if (body.cliRuntime !== null) {
+        if (selected.cliId !== 'codex') {
+          return jsonRes(res, 400, { ok: false, error: 'runtime_requires_codex' });
+        }
+        if (selected.wrapperCli) {
+          return jsonRes(res, 400, { ok: false, error: 'runtime_wrapper_conflict' });
+        }
+        try {
+          nextRuntime = normalizeCliRuntimeConfig(body.cliRuntime, 'cliRuntime');
+        } catch (err) {
+          return jsonRes(res, 400, {
+            ok: false,
+            error: 'invalid_cli_runtime',
+            message: err instanceof Error ? err.message : String(err),
+          });
+        }
       }
-      if (selected.wrapperCli) {
-        return jsonRes(res, 400, { ok: false, error: 'runtime_wrapper_conflict' });
+      // null explicitly means built-in runtime; both structured and legacy
+      // executable overrides are cleared.
+    } else if (!selectionChanged) {
+      // Old dashboard clients know only `{cliId, model}`. Preserve the runtime on
+      // same-agent saves so editing a model cannot silently erase new config.
+      nextRuntime = currentBotConfig.cliRuntime;
+      nextLegacyPath = nextRuntime ? undefined : currentBotConfig.cliPathOverride;
+    }
+    const effectivePath = nextRuntime?.executable ?? nextLegacyPath;
+    const availability = checkCliAvailability({
+      cliId: selected.cliId,
+      wrapperCli: selected.wrapperCli,
+      cliPathOverride: effectivePath,
+    });
+    let runtimeProbe: { version: string; updateProvider: string } | undefined;
+    if (runtimeFieldPresent && nextRuntime) {
+      if (!availability.available) {
+        return jsonRes(res, 400, {
+          ok: false,
+          error: 'runtime_unavailable',
+          message: availability.reason ?? 'runtime executable is unavailable',
+        });
       }
       try {
-        nextRuntime = normalizeCliRuntimeConfig(body.cliRuntime, 'cliRuntime');
+        const raw = execFileSync(availability.resolvedPath ?? nextRuntime.executable, ['--version'], {
+          encoding: 'utf8',
+          timeout: 5_000,
+          stdio: ['ignore', 'pipe', 'pipe'],
+          maxBuffer: 2 * 1024 * 1024,
+        }).trim();
+        const version = raw.match(/\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?/)?.[0];
+        if (!version) throw new Error(`无法识别 --version 输出：${raw.slice(0, 120)}`);
+        runtimeProbe = { version, updateProvider: nextRuntime.update?.provider ?? 'auto' };
       } catch (err) {
         return jsonRes(res, 400, {
           ok: false,
-          error: 'invalid_cli_runtime',
+          error: 'runtime_version_probe_failed',
           message: err instanceof Error ? err.message : String(err),
         });
       }
     }
-    // null explicitly means built-in runtime; both structured and legacy
-    // executable overrides are cleared.
-  } else if (!selectionChanged) {
-    // Old dashboard clients know only `{cliId, model}`. Preserve the runtime on
-    // same-agent saves so editing a model cannot silently erase new config.
-    nextRuntime = currentBotConfig.cliRuntime;
-    nextLegacyPath = nextRuntime ? undefined : currentBotConfig.cliPathOverride;
-  }
-  const effectivePath = nextRuntime?.executable ?? nextLegacyPath;
-  const availability = checkCliAvailability({
-    cliId: selected.cliId,
-    wrapperCli: selected.wrapperCli,
-    cliPathOverride: effectivePath,
-  });
-  let runtimeProbe: { version: string; updateProvider: string } | undefined;
-  if (runtimeFieldPresent && nextRuntime) {
-    if (!availability.available) {
-      return jsonRes(res, 400, {
-        ok: false,
-        error: 'runtime_unavailable',
-        message: availability.reason ?? 'runtime executable is unavailable',
-      });
-    }
-    try {
-      const raw = execFileSync(availability.resolvedPath ?? nextRuntime.executable, ['--version'], {
-        encoding: 'utf8',
-        timeout: 5_000,
-        stdio: ['ignore', 'pipe', 'pipe'],
-        maxBuffer: 2 * 1024 * 1024,
-      }).trim();
-      const version = raw.match(/\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?/)?.[0];
-      if (!version) throw new Error(`无法识别 --version 输出：${raw.slice(0, 120)}`);
-      runtimeProbe = { version, updateProvider: nextRuntime.update?.provider ?? 'auto' };
-    } catch (err) {
-      return jsonRes(res, 400, {
-        ok: false,
-        error: 'runtime_version_probe_failed',
-        message: err instanceof Error ? err.message : String(err),
-      });
-    }
-  }
-  // Existing Bot edits remain saveable (operators may intentionally configure
-  // first and install second), but the response is explicit so Dashboard never
-  // claims a missing Agent was saved successfully without qualification.
-  const availabilityWarning = availability.available
-    ? undefined
-    : `配置已保存，但所选 Agent 当前无法启动：${availability.reason ?? '本地启动依赖不可用'}。请先在 daemon 所在机器安装或修正 PATH / CLI 路径。`;
+    // Existing Bot edits remain saveable (operators may intentionally configure
+    // first and install second), but the response is explicit so Dashboard never
+    // claims a missing Agent was saved successfully without qualification.
+    const availabilityWarning = availability.available
+      ? undefined
+      : `配置已保存，但所选 Agent 当前无法启动：${availability.reason ?? '本地启动依赖不可用'}。请先在 daemon 所在机器安装或修正 PATH / CLI 路径。`;
 
-  return withBotTurnMutation(larkAppId, async () => {
     // Agent selection can replace every live worker generation and may also
     // auto-clear readIsolation. Close admission and drain in-flight acceptance
     // before inspecting both the registry and restart source of truth. A

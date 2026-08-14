@@ -1,7 +1,7 @@
 // test/dashboard-ipc.test.ts
 import { describe, it, expect, afterEach, vi } from 'vitest';
 import { createHmac, randomBytes } from 'node:crypto';
-import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { request as httpRequest } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -2989,6 +2989,99 @@ describe('PUT /api/bot-agent', () => {
         expect(t.cliPathOverride).toBe('/opt/legacy/claude');
       }
     } finally {
+      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = prevBotsConfig;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  // BEHAVIOURAL (concurrency): the mutation gate serialises per bot, but a queued
+  // request that built its proposal BEFORE entering the gate commits stale data.
+  // A switches the runtime explicitly; B (old client, model-only) reads the old
+  // row, queues, and after A commits still writes A's runtime back — a lost
+  // update — and hands the close hook a stale target.
+  it('re-reads the authority inside the gate so a queued model-only save cannot lose an update', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-agent-lostupdate-'));
+    const configPath = join(dir, 'bots.json');
+    const appId = 'test-agent-lostupdate';
+    const prevBotsConfig = process.env.BOTS_CONFIG;
+    const originalCloseHook = agentSwitchCloseHook.run;
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      // An explicit runtime switch validates the executable AND probes --version,
+      // so both runtimes must be real, runnable binaries with parseable output.
+      // Symlink to the node binary, which the existing runtime tests also use.
+      const binA = join(dir, 'runtime-a');
+      const binB = join(dir, 'runtime-b');
+      symlinkSync(process.execPath, binA);
+      symlinkSync(process.execPath, binB);
+      writeFileSync(configPath, JSON.stringify([{
+        larkAppId: appId,
+        larkAppSecret: 'secret',
+        cliId: 'codex',
+        model: 'old-model',
+        cliRuntime: { id: 'runtime-a', displayName: 'RuntimeA', executable: binA },
+        cliPathOverride: binA,
+      }], null, 2));
+      loadBotConfigs().forEach((c: any) => registerBot(c));
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+
+      // Hold A inside the gate (after its authority read) until B is queued, so B
+      // is guaranteed to have been admitted only after A committed.
+      const targets: any[] = [];
+      let releaseA!: () => void;
+      const held = new Promise<void>((r) => { releaseA = r; });
+      let signalHolding!: () => void;
+      const aIsHolding = new Promise<void>((r) => { signalHolding = r; });
+      let first = true;
+      agentSwitchCloseHook.run = async (...args: Parameters<typeof originalCloseHook>) => {
+        targets.push(args[1]);
+        if (first) {
+          first = false;
+          signalHolding();
+          await held;
+        }
+        return originalCloseHook(...args);
+      };
+
+      const put = (body: unknown) => fetch(`http://127.0.0.1:${handle.port}/api/bot-agent`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+
+      // A: explicit switch to runtime B.
+      const aDone = put({
+        cliId: 'codex',
+        model: 'old-model',
+        cliRuntime: { id: 'runtime-b', displayName: 'RuntimeB', executable: binB },
+      });
+      await aIsHolding;
+      // B: old client, model only — must queue behind A.
+      const bDone = put({ cliId: 'codex', model: 'new-model' });
+      await new Promise((r) => setTimeout(r, 60));
+      releaseA();
+
+      expect((await aDone).status).toBe(200);
+      expect((await bDone).status).toBe(200);
+
+      const stored = JSON.parse(readFileSync(configPath, 'utf-8'))[0];
+      expect(
+        stored.cliRuntime?.id,
+        'a queued model-only save must not roll the runtime back to the pre-A value',
+      ).toBe('runtime-b');
+      expect(stored.cliPathOverride).toBe(binB);
+      expect(stored.model).toBe('new-model');
+
+      // B's close target must describe the row as it exists once B holds the gate.
+      expect(targets.length).toBe(2);
+      expect(
+        targets[1].cliRuntime?.id,
+        "the queued request's close target must be built from the fresh row",
+      ).toBe('runtime-b');
+    } finally {
+      agentSwitchCloseHook.run = originalCloseHook;
       if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
       else process.env.BOTS_CONFIG = prevBotsConfig;
       rmSync(dir, { recursive: true, force: true });
