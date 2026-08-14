@@ -3134,6 +3134,37 @@ async function readMessageListenerPreviewRequest(req: IncomingMessage): Promise<
   return { ok: true, listener, limit: normalizeMessageListenerPreviewLimit(raw.limit) };
 }
 
+/**
+ * Fingerprint of exactly the persisted fields the agent-switch handler derives
+ * its proposal from. Used as an optimistic-concurrency version: the mutation gate
+ * only serialises THIS process, but another daemon/CLI may hold the bots.json
+ * file lock and commit legitimately inside our read -> irreversible-close ->
+ * commit window. Writing our pre-close proposal afterwards would overwrite that
+ * newer value, so the commit re-checks this fingerprint under the write lock and
+ * refuses on any change.
+ *
+ * Only the derived-from fields are included: an unrelated edit (e.g. oncall
+ * bindings) must not reject a legitimate agent switch.
+ */
+function agentAuthorityFingerprint(row: Record<string, unknown> | undefined): string {
+  const stable = (v: unknown): string => {
+    if (v === null || v === undefined) return 'null';
+    if (Array.isArray(v)) return `[${v.map(stable).join(',')}]`;
+    if (typeof v === 'object') {
+      const o = v as Record<string, unknown>;
+      return `{${Object.keys(o).sort().map((k) => `${JSON.stringify(k)}:${stable(o[k])}`).join(',')}}`;
+    }
+    return JSON.stringify(v);
+  };
+  return stable({
+    cliId: row?.cliId ?? null,
+    wrapperCli: row?.wrapperCli ?? null,
+    cliRuntime: row?.cliRuntime ?? null,
+    cliPathOverride: row?.cliPathOverride ?? null,
+    reasoningEffort: row?.reasoningEffort ?? null,
+  });
+}
+
 async function collectMessageListenerPreviewMatches(
   larkAppId: string,
   chatId: string,
@@ -3960,12 +3991,28 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
     // backstop would mean running the irreversible closes first; refusing keeps
     // "a failed validation produces no side effects" true. A missing row is the
     // same condition rmwBotEntry reports as `bot_not_in_config`.
+    //
+    // The read itself happens INSIDE the cross-process file lock (a write:false
+    // rmw), so the snapshot and its fingerprint always describe the same
+    // committed state — a plain read could observe a row mid-update. The lock is
+    // released before the closes (they are slow and must not hold it), so the
+    // fingerprint is re-checked at commit time; see agentAuthorityFingerprint.
     let persistedBotRow: Record<string, unknown>;
+    let authorityVersion: string;
     try {
-      const raw = await readRawConfig(requireConfigPath());
-      const idx = findEntryIndex(raw, larkAppId);
-      if (idx < 0) return jsonRes(res, 404, { ok: false, error: 'bot_not_in_config' });
-      persistedBotRow = raw[idx] as Record<string, unknown>;
+      const snapshot = await rmwBotEntry<{ row: Record<string, unknown>; version: string }>(
+        larkAppId,
+        (entry) => ({
+          write: false,
+          result: {
+            row: { ...(entry as Record<string, unknown>) },
+            version: agentAuthorityFingerprint(entry as Record<string, unknown>),
+          },
+        }),
+      );
+      if (!snapshot.ok) return jsonRes(res, 404, { ok: false, error: snapshot.reason });
+      persistedBotRow = snapshot.result.row;
+      authorityVersion = snapshot.result.version;
     } catch (err) {
       return jsonRes(res, 503, {
         ok: false,
@@ -4154,14 +4201,26 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
     // declared here. The close hook above already ran, so a rejection here is one
     // more post-close exit and must carry the same summary (see below).
     let r: Awaited<ReturnType<typeof rmwBotEntry<{
-      error?: 'reasoning_effort_not_supported_by_model';
+      error?: 'reasoning_effort_not_supported_by_model' | 'bot_config_changed_during_switch';
       nextReasoningEffort?: typeof reasoningEffort;
     }>>>;
     try {
       r = await rmwBotEntry<{
-        error?: 'reasoning_effort_not_supported_by_model';
+        error?: 'reasoning_effort_not_supported_by_model' | 'bot_config_changed_during_switch';
         nextReasoningEffort?: typeof reasoningEffort;
       }>(larkAppId, (entry) => {
+    // OPTIMISTIC CONCURRENCY CHECK, under the cross-process write lock.
+    //
+    // Between our authority read and here, another daemon/CLI may have committed
+    // a legitimate change (the irreversible closes sit in that window and the
+    // file lock is not held across them). Our proposal — including the runtime we
+    // preserve for old model-only clients and the target we already closed
+    // against — describes the OLD row, so committing it now would silently
+    // overwrite the other writer and answer 200 with a stale target. Refuse
+    // instead; the caller can retry against the new state.
+    if (agentAuthorityFingerprint(entry as Record<string, unknown>) !== authorityVersion) {
+      return { write: false, result: { error: 'bot_config_changed_during_switch' as const } };
+    }
     const nextReasoningEffort = supportsReasoningEffort
       ? (reasoningEffortFieldPresent ? reasoningEffort ?? undefined : entry.reasoningEffort)
       : undefined;
@@ -4220,6 +4279,16 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
       // carry the same summary as the 409 branch — otherwise a commit failure
       // silently destroys the only handle for a surviving remote session.
       return jsonRes(res, 400, closeSummaryPayload('agent_switch_commit_failed', r.reason));
+    }
+    if (r.result.error === 'bot_config_changed_during_switch') {
+      // Fifth post-close exit. Another writer committed inside our window, so the
+      // proposal (and the target we closed against) is stale and must NOT be
+      // written. bots.json keeps the other writer's value; the closes already
+      // happened, so this owes the same summary as every other post-close exit.
+      return jsonRes(res, 409, {
+        ...closeSummaryPayload(r.result.error),
+        message: '配置在本次切换过程中被其它进程修改，未写入以免覆盖更新的值；请重试。',
+      });
     }
     if (r.result.error) {
       // Fourth post-close exit (upstream #838's reasoning-effort precondition).

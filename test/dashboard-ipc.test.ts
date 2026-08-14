@@ -3088,6 +3088,129 @@ describe('PUT /api/bot-agent', () => {
     }
   });
 
+  // BEHAVIOURAL (cross-process): the mutation gate only serialises THIS process.
+  // Another daemon/CLI holding the bots.json file lock may legitimately commit a
+  // new runtime inside our read -> irreversible-close -> commit window. Writing
+  // our pre-close proposal afterwards would silently overwrite that newer value
+  // and answer 200 with a stale close target.
+  it('refuses to commit a stale proposal when another writer changed the row', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-agent-cas-'));
+    const configPath = join(dir, 'bots.json');
+    const appId = 'test-agent-cas';
+    const prevBotsConfig = process.env.BOTS_CONFIG;
+    const originalCloseHook = agentSwitchCloseHook.run;
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      const binA = join(dir, 'runtime-a');
+      const binB = join(dir, 'runtime-b');
+      symlinkSync(process.execPath, binA);
+      symlinkSync(process.execPath, binB);
+      writeFileSync(configPath, JSON.stringify([{
+        larkAppId: appId,
+        larkAppSecret: 'secret',
+        cliId: 'codex',
+        model: 'old-model',
+        cliRuntime: { id: 'runtime-a', displayName: 'RuntimeA', executable: binA },
+        cliPathOverride: binA,
+      }], null, 2));
+      loadBotConfigs().forEach((c: any) => registerBot(c));
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+
+      // Simulate a SECOND writer (another process) committing runtime-B while our
+      // request sits between its authority read and its commit. The close hook is
+      // exactly that window.
+      const targets: any[] = [];
+      agentSwitchCloseHook.run = async (...args: Parameters<typeof originalCloseHook>) => {
+        targets.push(args[1]);
+        const rows = JSON.parse(readFileSync(configPath, 'utf-8'));
+        rows[0].cliRuntime = { id: 'runtime-b', displayName: 'RuntimeB', executable: binB };
+        rows[0].cliPathOverride = binB;
+        writeFileSync(configPath, JSON.stringify(rows, null, 2));
+        return originalCloseHook(...args);
+      };
+
+      // Old client, model-only: its preserved proposal still carries runtime-A.
+      const saved = await fetch(`http://127.0.0.1:${handle.port}/api/bot-agent`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ cliId: 'codex', model: 'new-model' }),
+      });
+
+      const body = await saved.json();
+      expect(
+        saved.status,
+        'a cross-process change must not be answered with 200',
+      ).not.toBe(200);
+      const stored = JSON.parse(readFileSync(configPath, 'utf-8'))[0];
+      expect(
+        stored.cliRuntime?.id,
+        "the other writer's runtime must survive",
+      ).toBe('runtime-b');
+      expect(stored.cliPathOverride).toBe(binB);
+      // The closes already happened, so this exit owes the same close summary.
+      expect(body).toMatchObject({ ok: false });
+      expect(body).toHaveProperty('closedMismatchedResidualTaskIds');
+    } finally {
+      agentSwitchCloseHook.run = originalCloseHook;
+      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = prevBotsConfig;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  // The concurrency check must be NARROW: it guards only the fields the proposal
+  // is derived from. An unrelated concurrent edit (oncall bindings, a rename…)
+  // must not reject a legitimate agent switch, or the dashboard becomes unusable
+  // on a busy bot.
+  it('does not reject when a concurrent writer touched an unrelated field', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-agent-cas-narrow-'));
+    const configPath = join(dir, 'bots.json');
+    const appId = 'test-agent-cas-narrow';
+    const prevBotsConfig = process.env.BOTS_CONFIG;
+    const originalCloseHook = agentSwitchCloseHook.run;
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      writeFileSync(configPath, JSON.stringify([{
+        larkAppId: appId,
+        larkAppSecret: 'secret',
+        cliId: 'codex',
+        model: 'old-model',
+      }], null, 2));
+      loadBotConfigs().forEach((c: any) => registerBot(c));
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+
+      agentSwitchCloseHook.run = async (...args: Parameters<typeof originalCloseHook>) => {
+        const rows = JSON.parse(readFileSync(configPath, 'utf-8'));
+        rows[0].oncallChats = [{ chatId: 'oc_other', workingDir: dir }];
+        writeFileSync(configPath, JSON.stringify(rows, null, 2));
+        return originalCloseHook(...args);
+      };
+
+      const saved = await fetch(`http://127.0.0.1:${handle.port}/api/bot-agent`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ cliId: 'traex', model: 'new-model' }),
+      });
+
+      expect(
+        saved.status,
+        'an unrelated concurrent edit must not block the switch',
+      ).toBe(200);
+      const stored = JSON.parse(readFileSync(configPath, 'utf-8'))[0];
+      expect(stored.cliId).toBe('traex');
+      expect(stored.model).toBe('new-model');
+      // …and the other writer's unrelated edit must still be there.
+      expect(stored.oncallChats).toMatchObject([{ chatId: 'oc_other' }]);
+    } finally {
+      agentSwitchCloseHook.run = originalCloseHook;
+      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = prevBotsConfig;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   // BEHAVIOURAL: if the authority cannot be read, the request must FAIL CLOSED.
   // Swallowing the error and deferring to the in-transaction backstop means the
   // irreversible closes run first, so a request that is never committed still

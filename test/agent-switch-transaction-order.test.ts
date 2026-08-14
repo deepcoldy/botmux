@@ -28,6 +28,26 @@ const ipc = readFileSync(
 const page = readFileSync(
   new URL('../src/dashboard/web/bot-defaults-page.tsx', import.meta.url), 'utf8');
 
+/**
+ * Start offset of the agent-switch handler. Anchored on the route registration
+ * rather than an offset from some nearby variable: earlier guards computed the
+ * gate position as `indexOf(marker) - 4000`, which silently pointed at the NEXT
+ * handler's gate once code was inserted above, turning real ordering assertions
+ * into false failures.
+ */
+function agentHandlerAt(): number {
+  const at = ipc.indexOf("ipcRoute('PUT', '/api/bot-agent'");
+  expect(at, 'agent-switch route registration').toBeGreaterThan(0);
+  return at;
+}
+
+/** The mutation gate belonging to the agent-switch handler. */
+function agentGateAt(): number {
+  const at = ipc.indexOf('return withBotTurnMutation(larkAppId, async () => {', agentHandlerAt());
+  expect(at, 'agent-switch mutation gate').toBeGreaterThan(0);
+  return at;
+}
+
 /** Body of the agent-switch handler, from the close hook to the success commit. */
 function postCloseRegion(): string {
   const closeAt = ipc.indexOf('await agentSwitchCloseHook.run(');
@@ -64,9 +84,11 @@ describe('agent switch — no precondition runs after the irreversible close', (
     const closeAt = ipc.indexOf('await agentSwitchCloseHook.run(');
     const preflight = ipc.slice(authorityAt, closeAt);
 
-    // Same source as the transaction: the on-disk row.
-    expect(preflight).toContain('readRawConfig(requireConfigPath())');
-    expect(preflight).toContain('findEntryIndex(raw, larkAppId)');
+    // Same source as the transaction: the on-disk row, read under the same
+    // cross-process lock the commit uses (a write:false rmw), so the snapshot and
+    // its version always describe one committed state.
+    expect(preflight).toContain('rmwBotEntry<');
+    expect(preflight).toContain('write: false');
     // Positional, not a substring that appears everywhere: the authority must be
     // resolved before the irreversible close.
     expect(
@@ -119,11 +141,9 @@ describe('agent switch — no precondition runs after the irreversible close', (
     // queued request commit a proposal built from a pre-queue row: an old
     // model-only client rolls a newer runtime back (lost update) and the close
     // hook gets a stale target. Admission must come first.
-    const gateAt = ipc.indexOf('return withBotTurnMutation(larkAppId, async () => {',
-      ipc.indexOf('const runtimeFieldPresent') - 4000);
+    const gateAt = agentGateAt();
     const authorityAt = ipc.indexOf('let persistedBotRow');
     const closeAt = ipc.indexOf('await agentSwitchCloseHook.run(');
-    expect(gateAt, 'agent-switch mutation gate').toBeGreaterThan(0);
     expect(authorityAt, 'authority read').toBeGreaterThan(0);
     expect(
       authorityAt,
@@ -138,8 +158,7 @@ describe('agent switch — no precondition runs after the irreversible close', (
   it('builds the runtime/path proposal inside the gate too', () => {
     // Re-reading the row but keeping a proposal computed outside would preserve
     // the stale runtime just the same.
-    const gateAt = ipc.indexOf('return withBotTurnMutation(larkAppId, async () => {',
-      ipc.indexOf('const runtimeFieldPresent') - 4000);
+    const gateAt = agentGateAt();
     const closeAt = ipc.indexOf('await agentSwitchCloseHook.run(');
     for (const marker of [
       'const currentSelectionKey = selectionKeyForBot(',
@@ -153,6 +172,64 @@ describe('agent switch — no precondition runs after the irreversible close', (
     }
   });
 
+  it('guards the commit with a cross-process version check (CAS)', () => {
+    // The mutation gate only serialises this process. The bots.json file lock is
+    // NOT held across the irreversible closes, so another daemon/CLI can commit
+    // inside our window. The commit must therefore re-verify the authority
+    // version under the write lock and refuse rather than overwrite.
+    expect(ipc, 'authority fingerprint helper').toContain('function agentAuthorityFingerprint(');
+    const readAt = ipc.indexOf('let authorityVersion: string;');
+    expect(readAt, 'the authority version must be captured').toBeGreaterThan(0);
+
+    // The snapshot read must itself be inside the cross-process lock, otherwise
+    // the row and its fingerprint can describe different states.
+    const snapshotBlock = ipc.slice(readAt, ipc.indexOf('} catch (err) {', readAt));
+    expect(snapshotBlock, 'the snapshot must be read under the file lock')
+      .toContain('rmwBotEntry<');
+    expect(snapshotBlock).toContain('write: false');
+
+    // The check must run INSIDE the committing transaction, before any mutation.
+    const commitAt = ipc.indexOf('}>(larkAppId, (entry) => {');
+    expect(commitAt, 'commit transaction').toBeGreaterThan(0);
+    const casAt = ipc.indexOf('!== authorityVersion', commitAt);
+    expect(casAt, 'the commit must re-check the version').toBeGreaterThan(commitAt);
+    const firstWriteAt = ipc.indexOf('entry.cliId = selected.cliId;', commitAt);
+    expect(
+      casAt,
+      'the version check must precede every field mutation',
+    ).toBeLessThan(firstWriteAt);
+    // A mismatch must not write.
+    const casBlock = ipc.slice(casAt, firstWriteAt);
+    expect(casBlock).toContain('write: false');
+    expect(casBlock).toContain("'bot_config_changed_during_switch'");
+  });
+
+  it('reports the CAS refusal as a post-close exit with the close summary', () => {
+    // These closes are irreversible, so the new exit owes the same summary as the
+    // other four; and it must not answer 200.
+    const region = postCloseRegion();
+    const at = region.indexOf("r.result.error === 'bot_config_changed_during_switch'");
+    expect(at, 'CAS refusal must have its own exit').toBeGreaterThan(0);
+    const block = region.slice(at, at + 600);
+    expect(block, 'must carry the shared close summary').toContain('closeSummaryPayload(');
+    expect(block, 'must be a conflict, not a success').toContain('409');
+  });
+
+  it('keeps the version check NARROW so unrelated edits do not reject a switch', () => {
+    // Fingerprinting the whole row would make any concurrent edit (oncall
+    // bindings, rename…) reject a legitimate agent switch.
+    const at = ipc.indexOf('function agentAuthorityFingerprint(');
+    const body = ipc.slice(at, ipc.indexOf('\n}', at));
+    for (const field of [
+      'cliId', 'wrapperCli', 'cliRuntime', 'cliPathOverride', 'reasoningEffort',
+    ]) {
+      expect(body, `${field} is derived from and must be guarded`).toContain(field);
+    }
+    for (const unrelated of ['oncallChats', 'larkAppSecret', 'botName', 'allowedChatGroups']) {
+      expect(body, `${unrelated} must NOT widen the check`).not.toContain(unrelated);
+    }
+  });
+
   it('FAILS CLOSED when the authority cannot be read', () => {
     // Swallowing the read error and deferring to the locked backstop means the
     // irreversible closes run first, so a request that never commits still tears
@@ -162,8 +239,10 @@ describe('agent switch — no precondition runs after the irreversible close', (
     const region = ipc.slice(authorityAt, closeAt);
     expect(region, 'read failure must return, not continue')
       .toContain("error: 'bot_config_unreadable'");
+    // A missing row is reported by rmwBotEntry as `bot_not_in_config`; the handler
+    // must surface that reason instead of continuing into the closes.
     expect(region, 'a missing row must also refuse before the closes')
-      .toContain("error: 'bot_not_in_config'");
+      .toContain('error: snapshot.reason');
   });
 
   it('KEEPS the in-transaction check as a backstop', () => {
