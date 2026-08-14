@@ -174,6 +174,8 @@ describe('Candidate RCA recursion isolation', () => {
       releaseId: 'release-a',
       releaseManifestSha256: '1'.repeat(64),
       runtimeBundleId: 'runtime-a',
+      runtimeName: 'coco' as const,
+      searchRcaCommit: 'c'.repeat(40),
       botmuxCommit,
       botmuxArtifactSha256,
       workspaceSnapshot: {
@@ -260,6 +262,8 @@ describe('Candidate RCA recursion isolation', () => {
       releaseId: 'release-a',
       releaseManifestSha256: '1'.repeat(64),
       runtimeBundleId: 'runtime-a',
+      runtimeName: 'coco' as const,
+      searchRcaCommit: 'c'.repeat(40),
       botmuxCommit: build.commit,
       botmuxArtifactSha256: build.artifactSha256,
       workspaceSnapshot: {
@@ -320,6 +324,8 @@ describe('Candidate RCA recursion isolation', () => {
       releaseId: 'release-a',
       releaseManifestSha256: '1'.repeat(64),
       runtimeBundleId: 'runtime-a',
+      runtimeName: 'coco' as const,
+      searchRcaCommit: 'c'.repeat(40),
       botmuxCommit: commit,
       botmuxArtifactSha256: '6'.repeat(64),
       workspaceSnapshot: {

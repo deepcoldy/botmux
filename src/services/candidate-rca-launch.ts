@@ -112,6 +112,25 @@ export function readCandidateRcaLaunchReceipt(
   return value.candidateDispatchId === candidateDispatchId ? value : undefined;
 }
 
+export function findCandidateRcaLaunchByIncidentAndDispatch(
+  dataDir: string,
+  incidentKey: string,
+  candidateDispatchId: string,
+): { rootMessageId: string; botmuxSessionId: string } | null {
+  const receipt = readCandidateRcaLaunchReceipt(dataDir, candidateDispatchId);
+  if (!receipt
+    || receipt.incidentKey !== incidentKey
+    || receipt.status !== 'launched'
+    || !receipt.rootMessageId
+    || !receipt.botmuxSessionId) {
+    return null;
+  }
+  return {
+    rootMessageId: receipt.rootMessageId,
+    botmuxSessionId: receipt.botmuxSessionId,
+  };
+}
+
 function sameIdentity(receipt: CandidateRcaLaunchReceipt, request: CandidateRcaLaunchRequest): boolean {
   return receipt.incidentKey === request.incidentKey
     && receipt.candidateDispatchId === request.candidateDispatchId
@@ -196,8 +215,8 @@ export async function launchCandidateRca(
       assertCandidateRuntimeArtifacts(persistedContract, deps);
       receipt = { ...receipt, launchContext: persistedContract };
     }
-    if (receipt?.status === 'launched' && receipt.rootMessageId && receipt.botmuxSessionId) {
-      return successful(receipt);
+    if (findCandidateRcaLaunchByIncidentAndDispatch(deps.dataDir, incidentKey, candidateDispatchId)) {
+      return successful(receipt!);
     }
 
     if (!receipt) {

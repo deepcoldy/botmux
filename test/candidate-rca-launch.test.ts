@@ -56,6 +56,7 @@ vi.mock('../src/services/default-worktree.js', () => ({ botAutoWorktreeEnabled: 
 vi.mock('../src/im/lark/card-handler.js', () => ({ runAutoWorktreeCommit: vi.fn() }));
 import {
   candidateRcaLaunchReceiptPath,
+  findCandidateRcaLaunchByIncidentAndDispatch,
   launchCandidateRca,
   readCandidateRcaLaunchReceipt,
   type CandidateRcaLaunchDeps,
@@ -102,6 +103,8 @@ const runtimeContract = () => ({
   releaseId: 'release-a',
   releaseManifestSha256: '1'.repeat(64),
   runtimeBundleId: 'runtime-a',
+  runtimeName: 'coco' as const,
+  searchRcaCommit: 'c'.repeat(40),
   botmuxCommit: BOTMUX_COMMIT,
   botmuxArtifactSha256: BOTMUX_ARTIFACT_SHA256,
   workspaceSnapshot: {
@@ -411,6 +414,31 @@ describe('Candidate RCA launch identity', () => {
       .resolves.toEqual({ ok: false, reason: 'identity_conflict' });
   });
 
+  it('incidentKey + candidateDispatchId uniquely reverse-lookup root and Session after restart', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-candidate-lookup-'));
+    const h = harness(root);
+    await launchCandidateRca(request(), h.deps);
+
+    expect(findCandidateRcaLaunchByIncidentAndDispatch(
+      root,
+      request().incidentKey,
+      request().candidateDispatchId,
+    )).toEqual({
+      rootMessageId: 'om_1',
+      botmuxSessionId: 'session-1',
+    });
+    expect(findCandidateRcaLaunchByIncidentAndDispatch(
+      root,
+      'argos:other-alarm',
+      request().candidateDispatchId,
+    )).toBeNull();
+    expect(findCandidateRcaLaunchByIncidentAndDispatch(
+      root,
+      request().incidentKey,
+      'cand_not_this_dispatch',
+    )).toBeNull();
+  });
+
   it('the daemon production entry reconciles a lost Feishu response before stable Session dispatch', async () => {
     const root = mkdtempSync(join(tmpdir(), 'botmux-candidate-production-'));
     const activeSessions = new Map();
@@ -462,7 +490,8 @@ describe('Candidate RCA launch identity', () => {
     expect(productionMocks.sendMessage).toHaveBeenCalledTimes(1);
     expect(productionMocks.forkWorker).toHaveBeenCalledTimes(1);
     expect(productionMocks.forkWorker.mock.calls[0][0].session).toMatchObject({
-      cliId: 'coco',
+      // The frozen `coco` bundle selects BotMux's rollout-backed TRAE adapter.
+      cliId: 'traex',
       cliPathOverride: runtimeContract().executable.realpath,
       workingDir: runtimeContract().workspaceSnapshot.realpath,
       candidateRuntimeContract: runtimeContract(),
