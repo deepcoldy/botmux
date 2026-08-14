@@ -6,7 +6,7 @@
  *   - off / 不支持的 CLI / preflight 失败 → inline（历史行为）
  * Run: pnpm vitest run test/prompt-hook-injection.test.ts
  */
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 // ─── Mocks（与 prompt-builder.test.ts 同一套） ─────────────────────────────
 
@@ -108,11 +108,18 @@ function followUpOpts(overrides: Record<string, unknown> = {}) {
 }
 
 describe('buildFollowUpCliInput — hook 注入模式', () => {
+  let prevDataDir: string | undefined;
   beforeEach(() => {
+    prevDataDir = process.env.SESSION_DATA_DIR;
+    process.env.SESSION_DATA_DIR = '/tmp/test-sessions';
     getBotMock.mockReturnValue({
       config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code', envelopeInjection: 'auto' as const },
     });
     preflightMock.mockReturnValue(true);
+  });
+  afterEach(() => {
+    if (prevDataDir === undefined) delete process.env.SESSION_DATA_DIR;
+    else process.env.SESSION_DATA_DIR = prevDataDir;
   });
 
   it('auto + claude-code + preflight 通过：reminder/whiteboard 进 sidecar，PTY 文本只留其余块', () => {
@@ -192,8 +199,10 @@ describe('buildFollowUpCliInput — hook 注入模式', () => {
     expect(result.content).not.toContain('<botmux_reminder>');
     expect(preflightMock).toHaveBeenCalledTimes(1);
     const checkedPath = preflightMock.mock.calls[0][0] as string;
-    // config.session.dataDir = /tmp/test-sessions → BOTMUX_HOME = /tmp → BOT_HOME = /tmp/bots/app_test
-    expect(checkedPath).toBe('/tmp/bots/app_test/claude/settings.json');
+    // effectivePath 基于 process.env.SESSION_DATA_DIR（与 worker 一致），不是 mock 的 config
+    const dataDir = process.env.SESSION_DATA_DIR ?? '';
+    const botmuxHome = dataDir.replace(/\/$/, '').replace(/\/[^\/]*$/, '');
+    expect(checkedPath).toBe(`${botmuxHome}/bots/app_test/claude/settings.json`);
     expect(checkedPath).not.toContain('.claude');
   });
 
@@ -205,5 +214,22 @@ describe('buildFollowUpCliInput — hook 注入模式', () => {
     const result = buildFollowUpCliInput('帮我修个 bug', SESSION_ID, followUpOpts());
     expect(result.content).toContain('<botmux_reminder>');
     expect(readPromptContext(SESSION_ID, result.content)).toBeUndefined();
+  });
+
+  it('riff 后端 + sandbox：不重定向，preflight 查全局路径（不是 BOT_HOME）', () => {
+    // riff 的 CLI 跑在远端，本地 settings 不适用；willRedirect 必须排除 riff，
+    // 否则会去查不存在的 BOT_HOME 文件 → 误判 inline（或更糟：BOT_HOME 有旧文件
+    // 时误判 hook 模式，但远端 CLI 根本没有 hook → reminder 丢）。
+    getBotMock.mockReturnValue({
+      config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code', envelopeInjection: 'auto' as const, sandbox: true, backendType: 'riff' as const },
+    });
+    preflightMock.mockClear();
+    const result = buildFollowUpCliInput('帮我修个 bug', SESSION_ID, followUpOpts());
+    expect(result.content).not.toContain('<botmux_reminder>');
+    expect(preflightMock).toHaveBeenCalledTimes(1);
+    const checkedPath = preflightMock.mock.calls[0][0] as string;
+    // 全局路径（~/.claude/settings.json），不是 BOT_HOME
+    expect(checkedPath).not.toContain('bots/');
+    expect(checkedPath).toContain('.claude');
   });
 });

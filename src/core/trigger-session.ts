@@ -697,6 +697,7 @@ function buildExistingSessionContent(
     // Only data enters untrusted structured context; connector-owner task and
     // HTTP response directives are carried separately at application priority.
     codexAppMessageContext,
+  sessionBackendType: ds.session.backendType,
   });
 }
 

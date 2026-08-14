@@ -12,12 +12,17 @@
  * SESSION_DATA_DIR 下的路径会被沙盒 allow-list 绑定（见 fs-policy.ts），纯文件读
  * 即可。任何读失败/未命中 → undefined（调用方空输出，fail-open）。
  *
- * 指纹对齐：两端都对「实际写入 PTY 的文本」做 normaliseForFingerprint（空白折叠）
- * 后再 sha256——容忍 tmux send-keys 逐行写入带来的空白差异，且不依赖写入/触发时序
- * （type-ahead 多轮排队时按内容取交集，而非按时间取最新）。
+ * 指纹策略（review 阻断 2 修复）：
+ * - 主键 = 全量 sha256(normalise(text))：精确匹配，无前缀碰撞。
+ * - 兜底 = 30 字符前缀：仅当全量未命中时（paste 模式污染尾部），扫描 sidecar
+ *   按前缀匹配；恰好 1 个匹配才用，0 或 >1 都不注入（fail-safe）。
+ * - 读后消费：成功读取后删除 sidecar，防止 stale 双注入（auto→off 切换后
+ *   hook 仍触发时读到旧 sidecar）。
+ * - inline 检测：prompt 含 <botmux_reminder> 说明是 inline 模式，不注入。
+ * - 原子写：tmp + rename，避免 type-ahead 并发写导致 JSON 截断。
  */
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { config } from '../config.js';
 import { normaliseForFingerprint } from './claude-transcript.js';
@@ -26,73 +31,128 @@ import { normaliseForFingerprint } from './claude-transcript.js';
 const SIDECAR_MAX_FILES = 100;
 /** sidecar 最长保留 24h（resume 后旧轮的 hook 不会重放，只有新轮才触发）。 */
 const SIDECAR_TTL_MS = 24 * 60 * 60 * 1000;
-/**
- * 指纹只取正常化文本的前缀，不取全串：
- * writeInput 逐行 send-keys 时，长行会把 Ink 顶进 paste 模式，此后 `\`+Enter
- * 软换行退化成字面量（见 claude-code.ts writeInput 注释），Claude 记到 prompt 里
- * 的尾部文本与 daemon 写入的 ptyText 不一致。全串 sha256 会因此失配 → sidecar
- * miss → 该轮 reminder 静默丢失。
- *
- * 前缀策略：paste 模式只污染「触发它的那行之后」的软换行，首行（含 <user_message>
- * 骨架）始终完好。30 字符前缀与久经考验的 makeSubmitFingerprint 同长，始终落在
- * 完好区内（首行短则前缀跨入第二行内容，污染在第二行之后的换行，仍完好）。
- * 同会话内前缀碰撞是 benign 的：envelope（reminder/whiteboard）是会话级稳定的。
- */
-const FINGERPRINT_PREFIX_LEN = 30;
+/** 前缀兜底匹配长度：与 makeSubmitFingerprint 一致，足以覆盖 paste 污染前的完好区。 */
+const PREFIX_FALLBACK_LEN = 30;
 
 function sessionDir(sessionId: string): string {
   return join(config.session.dataDir, 'prompt-ctx', sessionId);
 }
 
-/** 与 hook 子进程共享的指纹算法：空白折叠后取前缀 sha256（hex）。 */
+/** 全量指纹：normalise 后 sha256（hex）。主键，无前缀碰撞。 */
 export function fingerprintPromptText(text: string): string {
-  const prefix = normaliseForFingerprint(text).slice(0, FINGERPRINT_PREFIX_LEN);
-  return createHash('sha256').update(prefix, 'utf8').digest('hex');
+  return createHash('sha256').update(normaliseForFingerprint(text), 'utf8').digest('hex');
+}
+
+/** 前缀指纹：normalise 后取前 N 字符。仅用于 paste 污染时的兜底匹配。 */
+function prefixOf(text: string): string {
+  return normaliseForFingerprint(text).slice(0, PREFIX_FALLBACK_LEN);
 }
 
 /**
  * daemon 侧：写 per-turn sidecar。best-effort——写失败只意味着该轮 hook no-op
- * （reminder 丢失），不允许影响消息主路径。
+ * （reminder 丢失），不允许影响消息主路径。原子写（tmp + rename）。
  */
 export function writePromptContext(sessionId: string, ptyText: string, envelope: string): void {
   try {
     const dir = sessionDir(sessionId);
     mkdirSync(dir, { recursive: true, mode: 0o700 });
     const file = join(dir, `${fingerprintPromptText(ptyText)}.json`);
-    const payload = JSON.stringify({ version: 1, envelope, createdAt: Date.now() }) + '\n';
-    writeFileSync(file, payload, { mode: 0o600 });
-    pruneSidecars(dir);
+    const tmp = `${file}.tmp-${process.pid}`;
+    const payload = JSON.stringify({
+      version: 1,
+      envelope,
+      prefix: prefixOf(ptyText),
+      createdAt: Date.now(),
+    }) + '\n';
+    writeFileSync(tmp, payload, { mode: 0o600 });
+    renameSync(tmp, file);
+    pruneSidecars(dir, file);
   } catch { /* best-effort */ }
 }
 
 /**
- * hook 侧：按 prompt 内容指纹读回 envelope。未命中/损坏/不可读 → undefined。
+ * hook 侧：按 prompt 内容指纹读回 envelope。
+ *
+ * 匹配策略：
+ * 1. inline 检测：prompt 含 <botmux_reminder> → inline 模式，不注入（防双注入）。
+ * 2. 全量指纹精确匹配。
+ * 3. 未命中时前缀兜底：扫描 sidecar，前缀恰好 1 个匹配才用（paste 污染场景）。
+ * 4. 读后消费：成功读取后删除 sidecar（防 stale 双注入）。
+ *
+ * 未命中/损坏/不可读 → undefined。
  */
-export function readPromptContext(sessionId: string, ptyText: string): string | undefined {
+export function readPromptContext(sessionId: string, prompt: string): string | undefined {
+  // inline 模式的 prompt 已含 reminder，不注入（auto→off 切换后 hook 仍触发时防双注入）
+  if (prompt.includes('<botmux_reminder>')) return undefined;
   try {
-    const file = join(sessionDir(sessionId), `${fingerprintPromptText(ptyText)}.json`);
-    if (!existsSync(file)) return undefined;
+    const dir = sessionDir(sessionId);
+    if (!existsSync(dir)) return undefined;
+
+    // 1. 全量指纹精确匹配
+    const exactFile = join(dir, `${fingerprintPromptText(prompt)}.json`);
+    let file = existsSync(exactFile) ? exactFile : undefined;
+
+    // 2. 前缀兜底（paste 污染：尾部软换行变字面量，全量指纹失配）
+    if (!file) {
+      const prefix = prefixOf(prompt);
+      if (prefix) {
+        const matches = readdirSync(dir)
+          .filter((f) => f.endsWith('.json'))
+          .filter((f) => {
+            try {
+              const meta = JSON.parse(readFileSync(join(dir, f), 'utf8'));
+              return typeof meta?.prefix === 'string' && meta.prefix === prefix;
+            } catch { return false; }
+          });
+        // 恰好 1 个匹配才用；0 或 >1（碰撞）都不注入，fail-safe
+        if (matches.length === 1) file = join(dir, matches[0]);
+      }
+    }
+
+    if (!file) return undefined;
     const parsed = JSON.parse(readFileSync(file, 'utf8'));
-    return typeof parsed?.envelope === 'string' ? parsed.envelope : undefined;
+    const envelope = typeof parsed?.envelope === 'string' ? parsed.envelope : undefined;
+    if (envelope) {
+      // 3. 读后消费：删除 sidecar，防止后续轮次读到 stale 内容
+      try { unlinkSync(file); } catch { /* */ }
+    }
+    return envelope;
   } catch {
     return undefined;
   }
 }
 
-/** 淘汰过期/超量 sidecar。best-effort，任何异常静默。 */
-function pruneSidecars(dir: string): void {
+/**
+ * 淘汰过期/超量 sidecar。best-effort，任何异常静默。
+ * currentFile 显式保护：刚写的文件即使 mtime 相同也不淘汰（review 阻断 3）。
+ * 同 mtime 按文件名稳定排序，消除淘汰不确定性。
+ */
+function pruneSidecars(dir: string, currentFile: string): void {
   try {
     const now = Date.now();
     const files = readdirSync(dir)
       .filter((f) => f.endsWith('.json'))
-      .map((f) => ({ f, mtime: statSync(join(dir, f)).mtimeMs }))
-      .sort((a, b) => b.mtime - a.mtime);
-    for (const [i, entry] of files.entries()) {
-      if (i >= SIDECAR_MAX_FILES || now - entry.mtime > SIDECAR_TTL_MS) {
-        try { unlinkSync(join(dir, entry.f)); } catch { /* */ }
+      .map((f) => {
+        const full = join(dir, f);
+        return { f, full, mtime: statSync(full).mtimeMs };
+      })
+      .sort((a, b) => {
+        // 新的在前；同 mtime 按文件名升序（确定性）
+        if (b.mtime !== a.mtime) return b.mtime - a.mtime;
+        return a.f < b.f ? -1 : a.f > b.f ? 1 : 0;
+      });
+    let kept = 0;
+    for (const entry of files) {
+      const isCurrent = entry.full === currentFile;
+      const expired = now - entry.mtime > SIDECAR_TTL_MS;
+      const overLimit = kept >= SIDECAR_MAX_FILES;
+      if (!isCurrent && (expired || overLimit)) {
+        try { unlinkSync(entry.full); } catch { /* */ }
+      } else {
+        kept++;
       }
     }
-  } catch { /* */ }
+  } catch { /* best-effort */ }
 }
 
 /**
@@ -102,5 +162,5 @@ function pruneSidecars(dir: string): void {
 export function removePromptContextDir(sessionId: string): void {
   try {
     rmSync(sessionDir(sessionId), { recursive: true, force: true });
-  } catch { /* */ }
+  } catch { /* best-effort */ }
 }

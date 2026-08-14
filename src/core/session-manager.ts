@@ -1149,10 +1149,32 @@ type FollowUpBlockKey = 'sessionId' | 'role' | 'summaryMemory' | 'reminder' | 'w
  * 按既有顺序构造 follow-up 的各个块。inline 模式直接 join；hook 模式
  * （#794）把 reminder/whiteboard 挪进 sidecar，其余块照常 join 进 PTY 文本。
  */
+/** follow-up 构建选项。sessionBackendType 取会话冻结的后端类型（非当前 bot 配置，
+ *  那些是 next-session 生效），用于判断该会话是否有本地 Claude hook 进程。 */
+type FollowUpOpts = {
+  attachments?: LarkAttachment[];
+  mentions?: LarkMention[];
+  isAdoptMode?: boolean;
+  cliId?: CliId;
+  cliPathOverride?: string;
+  locale?: Locale;
+  sender?: ResolvedSender;
+  larkAppId?: string;
+  chatId?: string;
+  whiteboardId?: string;
+  substituteTrigger?: SubstituteTrigger;
+  codexAppText?: string;
+  codexAppApplicationContext?: string;
+  codexAppMessageContext?: string;
+  /** 会话冻结的后端类型（ds.session.backendType）。riff 等远端后端没有本地
+   *  Claude hook 进程，强制 inline 模式。 */
+  sessionBackendType?: BackendType;
+};
+
 function buildFollowUpBlocks(
   content: string,
   sessionId: string,
-  opts?: { attachments?: LarkAttachment[]; mentions?: LarkMention[]; isAdoptMode?: boolean; cliId?: CliId; cliPathOverride?: string; locale?: Locale; sender?: ResolvedSender; larkAppId?: string; chatId?: string; whiteboardId?: string; substituteTrigger?: SubstituteTrigger; codexAppText?: string; codexAppApplicationContext?: string; codexAppMessageContext?: string },
+  opts?: FollowUpOpts,
   hookMode = false,
 ): Array<{ key: FollowUpBlockKey; text: string }> {
   const blocks: Array<{ key: FollowUpBlockKey; text: string }> = [];
@@ -1213,7 +1235,7 @@ function buildFollowUpBlocks(
 export function buildFollowUpContent(
   content: string,
   sessionId: string,
-  opts?: { attachments?: LarkAttachment[]; mentions?: LarkMention[]; isAdoptMode?: boolean; cliId?: CliId; cliPathOverride?: string; locale?: Locale; sender?: ResolvedSender; larkAppId?: string; chatId?: string; whiteboardId?: string; substituteTrigger?: SubstituteTrigger; codexAppText?: string; codexAppApplicationContext?: string; codexAppMessageContext?: string },
+  opts?: FollowUpOpts,
 ): string {
   return buildFollowUpBlocks(content, sessionId, opts).map((b) => b.text).join('\n\n');
 }
@@ -1234,10 +1256,11 @@ const HOOK_ENVELOPE_MAX_CHARS = 8000;
  *  4. （在 buildFollowUpCliInput 里）envelope 不超 8k。
  * 任一不满足 → inline（现状字节不变）。
  */
-function resolveEnvelopeInjectionMode(
-  opts?: { cliId?: CliId; cliPathOverride?: string; larkAppId?: string },
-): 'hook' | 'inline' {
+function resolveEnvelopeInjectionMode(opts?: FollowUpOpts): 'hook' | 'inline' {
   if (!opts?.cliId) return 'inline';
+  // 远端后端（riff 等）没有本地 Claude hook 进程，sidecar 写了没人读，
+  // 必须用会话冻结的 backendType（不是当前 bot 配置，那是 next-session 生效）。
+  if (opts.sessionBackendType === 'riff') return 'inline';
   let adapter: CliAdapter;
   try {
     adapter = createCliAdapterSync(opts.cliId, opts.cliPathOverride);
@@ -1249,22 +1272,30 @@ function resolveEnvelopeInjectionMode(
     botConfig = getBot(opts.larkAppId).config;
   } catch { return 'inline'; }
   if (botConfig.envelopeInjection !== 'auto') return 'inline';
-  const effectivePath = effectivePromptHookConfigPath(adapter, botConfig, opts.larkAppId);
+  const effectivePath = effectivePromptHookConfigPath(adapter, botConfig, opts.larkAppId, opts.sessionBackendType);
   if (!effectivePath || !hasInstalledPromptHookCached(effectivePath)) return 'inline';
   return 'hook';
 }
 
 /**
  * 与 worker 的 willRedirectCliData 同条件，算出 CLI 实际读取的 Claude settings 路径。
- * read-isolation（sandbox + supportsReadIsolation + 无 wrapperCli）下，CLI 经
- * CLAUDE_CONFIG_DIR 读 per-bot `<BOT_HOME>/claude/settings.json`；preflight 必须查
- * 这份而不是全局——per-bot 安装是 best-effort（provisionIsolatedBotHome 吞异常），
- * 查全局会把安装失败误判为已装，导致该 session 每轮系统性丢 reminder。
+ * read-isolation（sandbox + supportsReadIsolation + 无 wrapperCli + 非 riff 后端）
+ * 下，CLI 经 CLAUDE_CONFIG_DIR 读 per-bot `<BOT_HOME>/claude/settings.json`；
+ * preflight 必须查这份而不是全局——per-bot 安装是 best-effort（provisionIsolatedBotHome
+ * 吞异常），查全局会把安装失败误判为已装，导致该 session 每轮系统性丢 reminder。
+ *
+ * 与 worker willRedirectCliData 的微差保持一致：
+ *  - backendType !== 'riff'：riff 后端的 CLI 跑在远端，本地 settings 不适用，
+ *    hook 模式对它无意义（远端没有 botmux hook，sidecar 写了没人读）。
+ *  - process.env.SESSION_DATA_DIR（不用 config.session.dataDir 的 packagedDataDir
+ *    fallback）：daemon 进程必有此 env，与 worker 严格一致。
+ *  - dirname 派生：与 worker 的 botHomePath(dirname(SESSION_DATA_DIR), appId) 相同。
  */
 function effectivePromptHookConfigPath(
   adapter: CliAdapter,
   botConfig: BotConfig,
   larkAppId: string,
+  sessionBackendType?: BackendType,
 ): string | undefined {
   const base = adapter.hookInstall?.configPath;
   if (!base) return undefined;
@@ -1274,9 +1305,12 @@ function effectivePromptHookConfigPath(
   const willRedirect = sandboxRequested
     && adapter.supportsReadIsolation === true
     && !botConfig.wrapperCli
-    && !!config.session.dataDir;
+    && (sessionBackendType ?? botConfig.backendType) !== 'riff'
+    && !!process.env.SESSION_DATA_DIR;
   if (!willRedirect) return base;
-  const botmuxHome = dirname(config.session.dataDir);
+  const dataDir = process.env.SESSION_DATA_DIR;
+  if (!dataDir) return base;
+  const botmuxHome = dirname(dataDir);
   return join(botHomePath(botmuxHome, larkAppId), 'claude', 'settings.json');
 }
 
@@ -1284,7 +1318,7 @@ function effectivePromptHookConfigPath(
 export function buildFollowUpCliInput(
   content: string,
   sessionId: string,
-  opts?: { attachments?: LarkAttachment[]; mentions?: LarkMention[]; isAdoptMode?: boolean; cliId?: CliId; cliPathOverride?: string; locale?: Locale; sender?: ResolvedSender; larkAppId?: string; chatId?: string; whiteboardId?: string; substituteTrigger?: SubstituteTrigger; codexAppText?: string; codexAppApplicationContext?: string; codexAppMessageContext?: string },
+  opts?: FollowUpOpts,
 ): CliTurnPayload {
   // hook 注入模式（#794）：reminder/whiteboard 写入 per-turn sidecar，PTY 文本只保留
   // 其余块。超限或无条件时回退 inline（legacy 路径），行为与历史完全一致。
@@ -1466,6 +1500,7 @@ export function buildReforkPrompt(
     larkAppId: ds.larkAppId,
     chatId: ds.session.chatId,
     whiteboardId: ds.session.whiteboardId,
+    sessionBackendType: ds.session.backendType,
   });
 }
 
@@ -1510,6 +1545,7 @@ export function buildReforkCliInput(
     larkAppId: ds.larkAppId,
     chatId: ds.session.chatId,
     whiteboardId: ds.session.whiteboardId,
+    sessionBackendType: ds.session.backendType,
     substituteTrigger: opts?.substituteTrigger,
     codexAppText: opts?.codexAppText,
     codexAppApplicationContext: opts?.codexAppApplicationContext,
@@ -3049,6 +3085,7 @@ export async function executeScheduledTask(
           chatId: task.chatId,
           whiteboardId: existing.session.whiteboardId,
         });
+          sessionBackendType: existing.session.backendType,
         rememberLastCliInput(existing, task.prompt, input);
         if (silent) armSilentScheduledTurn(existing, scheduledTurnId);
         if (existing.worker && !existing.worker.killed) {

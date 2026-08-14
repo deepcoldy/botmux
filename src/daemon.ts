@@ -16353,6 +16353,7 @@ function releaseQueuedActivationReservation(ds: DaemonSession, acknowledgedToken
         chatId: ds.chatId,
         whiteboardId: ds.session.whiteboardId,
         codexAppText: rawCodexText || buffered.join('\n\n'),
+        sessionBackendType: ds.session.backendType,
         codexAppApplicationContext: ds.pendingCodexAppApplicationContext,
         codexAppMessageContext: (ds.pendingCodexAppFollowUpContexts ?? [])
           .filter(Boolean)
@@ -19006,6 +19007,7 @@ async function handleThreadReplyAdmitted(
         codexAppText: parsed.content,
         codexAppApplicationContext,
         codexAppMessageContext,
+      sessionBackendType: ds.session.backendType,
       });
       // R5-B1-1: freeze the admission-time steer authorization onto this earliest
       // (initialStartPending follower) tail entry — the strip-proof admit rebuild
@@ -19144,6 +19146,7 @@ async function handleThreadReplyAdmitted(
           codexAppText: parsed.content,
           codexAppApplicationContext,
           codexAppMessageContext,
+        sessionBackendType: ds.session.backendType,
         });
         ds.session.queuedPrompt ??= ds.pendingPrompt;
         ds.session.queuedCodexAppText ??= ds.pendingCodexAppText;
@@ -19539,6 +19542,7 @@ async function handleThreadReplyAdmitted(
           codexAppText: parsed.content,
           codexAppApplicationContext,
           codexAppMessageContext,
+        sessionBackendType: ds.session.backendType,
         });
     beginNewTurn(ds, parsed.content, parsed.messageId);
     await noteTurnReceived(ds, parsed.messageId, parsed.content, turnSender, parsed.messageId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
@@ -19629,6 +19633,7 @@ async function handleThreadReplyAdmitted(
           codexAppText: parsed.content,
           codexAppApplicationContext,
           codexAppMessageContext,
+        sessionBackendType: ds.session.backendType,
         });
         // R4-B1: freeze the admission-time steer authorization onto the queued
         // opening payload so the worker-null re-fork path carries it exactly like
