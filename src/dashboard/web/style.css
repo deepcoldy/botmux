@@ -11434,6 +11434,15 @@ button.contrast:hover { background: var(--danger-soft); border-color: var(--dang
   max-height: 460px;
 }
 
+.skills-install-selection-body > .skills-candidate-list {
+  min-height: 0;
+  max-height: 100%;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-width: thin;
+  -webkit-overflow-scrolling: touch;
+}
+
 .skills-local-discovery-panel {
   justify-content: space-between;
   padding: 10px;
