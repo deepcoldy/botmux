@@ -55,7 +55,7 @@ dsh 是 DeepSeek 开源的 agent harness（cordis 插件架构，opencode 血统
       ▼
 dsh-runner.js（长驻 Node 进程）
   ├─ spawn: dsh-jsonrpc-agent --config <cordis.yml>
-  │    env: DSH_SESSION_ROOT=~/.botmux/dsh-sessions/<id>, DSH_CWD, DEEPSEEK_API_KEY
+  │    env: DSH_SESSION_ROOT=~/.botmux/dsh/sessions/<id>, DSH_CWD, DEEPSEEK_API_KEY
   ├─ initialize（握手，provider=deepseek-official, model）
   ├─ 每 turn：session/prompt（固定 sessionId，连接内多轮）
   ├─ session.event → 工具调用渲染成进度行写 stdout（worker 当卡片渲染）
@@ -85,7 +85,7 @@ worker 解码 final → 投递飞书
 | `readyPattern` | `/›/`（runner 握手完成后打印 `›`） |
 | `deferFirstPromptTimeoutUntilReady` | `true` |
 | `modelChoices` | `['deepseek-v4-flash', 'deepseek-v4-pro']` |
-| `authPaths` | `['~/.botmux/dsh-sessions']` |
+| `authPaths` | `['~/.botmux/dsh']`（adapter 在进沙盒前预创建） |
 | `buildResumeCommand` | `() => null`（v1 不支持） |
 
 ### 5.2 `src/dsh-runner.ts`（新增，~450 行）
@@ -94,7 +94,7 @@ worker 解码 final → 投递飞书
 
 **boot**：
 1. 解析 config 路径：`--dsh-config` > `$DSH_CORDIS_CONFIG` > botmux 内置 `assets/dsh/cordis.yml`（vendored，见 5.4）。
-2. `spawn(dshBin, [configPath], {env: {...process.env, DSH_SESSION_ROOT: ~/.botmux/dsh-sessions/<session-id>, DSH_CWD: cwd}})`。
+2. `spawn(dshBin, [configPath], {env: {...process.env, DSH_SESSION_ROOT: ~/.botmux/dsh/sessions/<session-id>, DSH_CWD: cwd}})`。
 3. NDJSON 握手：发 `initialize {cwd, provider: 'deepseek-official', model, maxTokens: 49152}`，等 result；超时 30s → lifecycle fatal 退出。
 4. 成功后 stdout 打印 `›`（ready 标记）。
 

@@ -47,7 +47,7 @@ botmux 通过适配器桥接不同 CLI / Agent，`bots.json` 里用 `cliId` 选�
 1. `dsh-jsonrpc-agent` 在 PATH 上（或用 `cliPathOverride` 指定路径）。
 2. `bots.json` 的 `env` 里配置 `DEEPSEEK_API_KEY`。
 
-会话 JSONL 落在 `~/.botmux/dsh-sessions/`；同一 runner 连接内多轮，daemon 重启后开新会话（不续上下文）。
+会话 JSONL 落在 `~/.botmux/dsh/sessions/`；同一 runner 连接内多轮，daemon 重启后开新会话（不续上下文）。
 
 ## Mir CLI 与 MCP Bridge
 

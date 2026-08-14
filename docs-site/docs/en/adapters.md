@@ -47,7 +47,7 @@ The table lists the current built-in adapters (the **authoritative source** for 
 1. `dsh-jsonrpc-agent` on PATH (or point `cliPathOverride` at it).
 2. Set `DEEPSEEK_API_KEY` in the bot's `env`.
 
-Session JSONL lives under `~/.botmux/dsh-sessions/`. Turns are multi-turn within one runner connection; a daemon restart starts a fresh session (no context resume).
+Session JSONL lives under `~/.botmux/dsh/sessions/`. Turns are multi-turn within one runner connection; a daemon restart starts a fresh session (no context resume).
 
 ## Mir CLI and MCP Bridge
 
