@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+﻿import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -24,6 +24,7 @@ describe('session skill runtime preparation', () => {
     dataDir = mkdtempSync(join(tmpdir(), 'botmux-skill-data-'));
     src = mkdtempSync(join(tmpdir(), 'botmux-skill-src-'));
     vi.stubEnv('HOME', home);
+    vi.stubEnv('USERPROFILE', home); // Windows: os.homedir() reads USERPROFILE, keep isolation
     vi.stubEnv('SESSION_DATA_DIR', dataDir);
   });
 

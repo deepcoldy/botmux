@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+﻿import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -54,6 +54,7 @@ describe('plugin service lifecycle guard', () => {
     home = mkdtempSync(join(tmpdir(), 'botmux-plugin-lifecycle-'));
     source = join(home, 'source');
     vi.stubEnv('HOME', home);
+    vi.stubEnv('USERPROFILE', home); // Windows: os.homedir() reads USERPROFILE, keep isolation
     pm2.capture.mockReset();
     pm2.run.mockReset();
     pm2.capture.mockReturnValue('[]');

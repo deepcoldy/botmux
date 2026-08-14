@@ -1,4 +1,4 @@
-import { EventEmitter } from 'node:events';
+﻿import { EventEmitter } from 'node:events';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -75,6 +75,7 @@ describe('TraeX herdr plugin installation', () => {
     home = mkdtempSync(join(tmpdir(), 'botmux-herdr-int-'));
     markerPath = join(home, '.botmux', 'state', 'herdr-traex-plugin.json');
     vi.stubEnv('HOME', home);
+    vi.stubEnv('USERPROFILE', home); // Windows: os.homedir() reads USERPROFILE, keep isolation
     vi.stubEnv('BOTMUX_HERDR_TRAEX_PLUGIN_ENABLED', '');
     vi.stubEnv('BOTMUX_HERDR_TRAEX_PLUGIN_SOURCE', '');
     vi.stubEnv('BOTMUX_HERDR_TRAEX_PLUGIN_REF', '');
@@ -171,7 +172,7 @@ describe('TraeX herdr plugin installation', () => {
     const { installTraexPluginNow } = await loadSubject();
     const result = await installTraexPluginNow('trusted/repo', 'reviewed-sha');
     expect(result.failed).toMatchObject({ step: 'install' });
-    expect(result.failed?.reason).toContain('元数据不匹配');
+    expect(result.failed?.reason).toContain('鍏冩暟鎹笉鍖归厤');
     expect(spawn.mock.calls.filter(([, args]) => args?.[1] === 'action')).toHaveLength(0);
     expect(existsSync(markerPath)).toBe(false);
   });

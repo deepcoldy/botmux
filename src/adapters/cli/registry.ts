@@ -87,6 +87,28 @@ const RESOLVE_COMMAND_SCRIPT = 'command -v -- "$1"';
  *  spaces and shell metacharacters therefore remain one literal filename. */
 export function resolveCommand(cmd: string): string {
   if (isAbsolute(cmd)) return cmd;
+  if (process.platform === 'win32') {
+    // Windows: npm global installs are `.cmd` shims (no shell `command -v`).
+    // Probe with `cmd.exe /c where <name>` — spawnSync without a shell cannot
+    // resolve `.cmd`, so `where` returns the real shim path for downstream
+    // `cmd /c` wrapping. Keeps the lazy-probe contract (nothing resolves at
+    // adapter construction; first resolvedBin read shells out).
+    const probe = spawnSync('cmd.exe', ['/d', '/c', 'where', cmd], {
+      encoding: 'utf-8',
+      timeout: 5_000,
+      stdio: ['ignore', 'pipe', 'ignore'],
+      windowsHide: true,
+    });
+    if (probe.status === 0) {
+      const lines = (probe.stdout ?? '')
+        .split(/\r?\n/)
+        .map(line => line.trim())
+        .filter(Boolean);
+      const found = lines.reverse().find(line => isAbsolute(line));
+      if (found) return found;
+    }
+    return cmd;
+  }
   const shell = process.env.SHELL || '/bin/zsh';
   const shells = [shell, '/bin/zsh', '/bin/bash'].filter((v, i, a) => a.indexOf(v) === i);
   // `setsid` (util-linux) runs the probe in its own session with NO controlling

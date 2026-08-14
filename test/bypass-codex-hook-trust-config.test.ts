@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+﻿import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -7,8 +7,8 @@ import { config } from '../src/config.js';
 
 /**
  * `config.bypassCodexHookTrust` is a live getter over
- * `~/.botmux/config.json` → dashboard.bypassCodexHookTrust with DEFAULT-ON
- * semantics: absent ⇒ ON, and ONLY an explicit stored `false` disables it. This
+ * `~/.botmux/config.json` 鈫?dashboard.bypassCodexHookTrust with DEFAULT-ON
+ * semantics: absent 鈬?ON, and ONLY an explicit stored `false` disables it. This
  * differs from most toggles (which are default-OFF `=== true`) because a headless
  * fleet must not wedge on codex 0.14x's "Press t to trust" gate out of the box.
  * The worker ANDs this with each bot's `!disableCliBypass` before the adapter emits
@@ -21,6 +21,7 @@ describe('config.bypassCodexHookTrust (default-ON global toggle)', () => {
   beforeEach(() => {
     home = mkdtempSync(join(tmpdir(), 'botmux-hook-trust-'));
     vi.stubEnv('HOME', home);
+    vi.stubEnv('USERPROFILE', home); // Windows: os.homedir() reads USERPROFILE, keep isolation
     mkdirSync(dirname(globalConfigPath()), { recursive: true });
   });
 
@@ -55,7 +56,7 @@ describe('config.bypassCodexHookTrust (default-ON global toggle)', () => {
 
   it('a non-boolean value is ignored and falls through to the default ON', () => {
     // readDashboard only keeps a boolean; garbage is dropped, so the getter's
-    // `!== false` sees `undefined` → ON.
+    // `!== false` sees `undefined` 鈫?ON.
     writeFileSync(globalConfigPath(), JSON.stringify({ dashboard: { bypassCodexHookTrust: 'no' } }));
     expect(config.bypassCodexHookTrust).toBe(true);
   });

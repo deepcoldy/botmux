@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+﻿import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -27,6 +27,7 @@ describe('CLI plugin generation', () => {
     home = mkdtempSync(join(tmpdir(), 'botmux-plugin-generation-'));
     dataDir = join(home, '.botmux', 'data');
     vi.stubEnv('HOME', home);
+    vi.stubEnv('USERPROFILE', home); // Windows: os.homedir() reads USERPROFILE, keep isolation
     vi.stubEnv('SESSION_DATA_DIR', dataDir);
   });
 

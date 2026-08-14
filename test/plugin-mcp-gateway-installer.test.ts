@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+﻿import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -14,6 +14,7 @@ describe('plugin MCP Gateway installer', () => {
   beforeEach(() => {
     home = mkdtempSync(join(tmpdir(), 'botmux-gateway-installer-'));
     vi.stubEnv('HOME', home);
+    vi.stubEnv('USERPROFILE', home); // Windows: os.homedir() reads USERPROFILE, keep isolation
     vi.stubEnv('BOTMUX_BIN_PATH', join(home, '.botmux', 'bin', 'botmux'));
   });
 

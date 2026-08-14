@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+﻿import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { execFileSync } from 'node:child_process';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
@@ -125,6 +125,7 @@ describe('git skill install', () => {
     home = mkdtempSync(join(tmpdir(), 'botmux-skill-home-'));
     repo = mkdtempSync(join(tmpdir(), 'botmux-skill-repo-'));
     vi.stubEnv('HOME', home);
+    vi.stubEnv('USERPROFILE', home); // Windows: os.homedir() reads USERPROFILE, keep isolation
     run('git', ['init'], repo);
     run('git', ['config', 'user.email', 'botmux@example.com'], repo);
     run('git', ['config', 'user.name', 'botmux'], repo);

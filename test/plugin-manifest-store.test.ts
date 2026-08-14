@@ -22,7 +22,14 @@ describe('plugin manifest and registry basics', () => {
 
   beforeEach(() => {
     home = mkdtempSync(join(tmpdir(), 'botmux-plugin-'));
+    // os.homedir() honours $HOME on POSIX but reads USERPROFILE (then
+    // HOMEDRIVE+HOMEPATH) on Windows — without stubbing both, plugin paths
+    // (botmuxHome → ~/.botmux) resolve to the REAL user home on Windows and
+    // tests can pollute ~/.botmux/plugins-registry.json (e.g. the
+    // legacy-malformed migration test). Stub both so isolation holds on every
+    // platform.
     vi.stubEnv('HOME', home);
+    vi.stubEnv('USERPROFILE', home);
     vi.stubEnv('CODEX_HOME', join(home, '.codex'));
   });
 

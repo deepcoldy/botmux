@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+﻿import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -18,6 +18,7 @@ describe('resolveChatBotDiscoveryConfig', () => {
   beforeEach(() => {
     home = mkdtempSync(join(tmpdir(), 'botmux-chatbot-discovery-'));
     vi.stubEnv('HOME', home);
+    vi.stubEnv('USERPROFILE', home); // Windows: os.homedir() reads USERPROFILE, keep isolation
     mkdirSync(dirname(globalConfigPath()), { recursive: true });
   });
 

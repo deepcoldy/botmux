@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+﻿import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -17,6 +17,7 @@ describe('plugin PM2 environment', () => {
   beforeEach(() => {
     home = mkdtempSync(join(tmpdir(), 'botmux-plugin-pm2-env-'));
     vi.stubEnv('HOME', home);
+    vi.stubEnv('USERPROFILE', home); // Windows: os.homedir() reads USERPROFILE, keep isolation
     vi.stubEnv('kill_timeout', '3500');
     vi.resetModules();
     childProcess.spawnSync.mockReset();
@@ -47,7 +48,7 @@ describe('plugin PM2 environment', () => {
     // The sentinel (BOTMUX_PM2_GRACEFUL_EXIT_CODE) is baked into the
     // daemon/dashboard env. Dashboard starts plugin services via `pm2 start
     // --update-env`, so pm2Env's raw process.env copy would otherwise write 90
-    // into the plugin app's env — and a plugin service that later launches a
+    // into the plugin app's env 鈥?and a plugin service that later launches a
     // foreground botmux would exit 90 on a clean stop. pm2Env must strip it.
     const { PM2_GRACEFUL_EXIT_CODE_ENV } = await import('../src/pm2-graceful-exit.js');
     vi.stubEnv(PM2_GRACEFUL_EXIT_CODE_ENV, '90');

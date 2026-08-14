@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+﻿import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
@@ -103,6 +103,7 @@ describe('plugin init', () => {
     home = mkdtempSync(join(tmpdir(), 'botmux-plugin-init-home-'));
     workspace = mkdtempSync(join(tmpdir(), 'botmux-plugin-init-workspace-'));
     vi.stubEnv('HOME', home);
+    vi.stubEnv('USERPROFILE', home); // Windows: os.homedir() reads USERPROFILE, keep isolation
   });
 
   afterEach(() => {

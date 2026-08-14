@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+﻿import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -22,6 +22,7 @@ describe('global dashboard config', () => {
   beforeEach(() => {
     home = mkdtempSync(join(tmpdir(), 'botmux-global-config-'));
     vi.stubEnv('HOME', home);
+    vi.stubEnv('USERPROFILE', home); // Windows: os.homedir() reads USERPROFILE, keep isolation
     mkdirSync(dirname(globalConfigPath()), { recursive: true });
   });
 
@@ -134,10 +135,10 @@ describe('global dashboard config', () => {
     for (const groupNamePrefix of [
       42,
       '   ',
-      'AI\n讨论·',
-      'AI\u0080讨论·',
-      'AI\u0085讨论·',
-      'AI\u009f讨论·',
+      'AI\n璁ㄨ路',
+      'AI\u0080璁ㄨ路',
+      'AI\u0085璁ㄨ路',
+      'AI\u009f璁ㄨ路',
       'x'.repeat(GROUP_NAME_PREFIX_MAX_LENGTH + 1),
     ]) {
       writeFileSync(globalConfigPath(), JSON.stringify({ groupNamePrefix }));
@@ -148,8 +149,8 @@ describe('global dashboard config', () => {
 
   it('round-trips and clears groupNamePrefix without losing unknown keys', () => {
     writeFileSync(globalConfigPath(), JSON.stringify({ futureSetting: 'keep-me' }));
-    mergeGlobalConfig({ groupNamePrefix: 'AI讨论·' });
-    expect(readGlobalConfig().groupNamePrefix).toBe('AI讨论·');
+    mergeGlobalConfig({ groupNamePrefix: 'AI璁ㄨ路' });
+    expect(readGlobalConfig().groupNamePrefix).toBe('AI璁ㄨ路');
     expect(JSON.parse(readFileSync(globalConfigPath(), 'utf8')).futureSetting).toBe('keep-me');
 
     mergeGlobalConfig({ groupNamePrefix: null });
@@ -292,13 +293,13 @@ describe('global dashboard config', () => {
   it('drops invalid hostOverloadAlert fields (blank target, non-finite / out-of-range thresholds)', () => {
     writeFileSync(globalConfigPath(), JSON.stringify({
       hostOverloadAlert: {
-        enabled: 'yes',        // not a boolean → dropped
-        targetBotAppId: '   ',  // blank → dropped
-        enterLoadRatio: -1,     // not positive → dropped
-        enterMemUsedFrac: 1.5,  // > 1 → dropped
+        enabled: 'yes',        // not a boolean 鈫?dropped
+        targetBotAppId: '   ',  // blank 鈫?dropped
+        enterLoadRatio: -1,     // not positive 鈫?dropped
+        enterMemUsedFrac: 1.5,  // > 1 鈫?dropped
       },
     }));
-    // Every field was invalid → the whole object collapses to undefined.
+    // Every field was invalid 鈫?the whole object collapses to undefined.
     expect(readGlobalConfig().hostOverloadAlert).toBeUndefined();
   });
 
@@ -306,7 +307,7 @@ describe('global dashboard config', () => {
     writeFileSync(globalConfigPath(), JSON.stringify({
       hostOverloadAlert: {
         enabled: true,
-        enterLoadRatio: 0,       // not > 0 → dropped
+        enterLoadRatio: 0,       // not > 0 鈫?dropped
         enterMemUsedFrac: 0.5,   // valid
       },
     }));
@@ -327,8 +328,8 @@ describe('global dashboard config', () => {
     }));
 
     // "Full known config" writer (mirrors writeCodexNotifierConfig): every known
-    // key is replaced by exactly what `config` carries — an omitted known key
-    // (here enterLoadRatio) is wiped, not preserved — while unknown siblings stay.
+    // key is replaced by exactly what `config` carries 鈥?an omitted known key
+    // (here enterLoadRatio) is wiped, not preserved 鈥?while unknown siblings stay.
     writeHostOverloadAlertConfig({
       enabled: false,
       targetBotAppId: 'cli_new',
@@ -363,7 +364,7 @@ describe('global dashboard config', () => {
     expect(readGlobalConfig().dashboard?.publicReadOnly).toBe(false);
   });
 
-  it('httpProxy survives a merge→read roundtrip (HD2D office download proxy)', () => {
+  it('httpProxy survives a merge鈫抮ead roundtrip (HD2D office download proxy)', () => {
     // Regression: readGlobalConfig() used to drop httpProxy, so the office-tab
     // proxy persisted by mergeGlobalConfig was never read back by the downloader.
     expect(readGlobalConfig().httpProxy).toBeUndefined();

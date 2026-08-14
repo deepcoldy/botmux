@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+﻿import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -25,6 +25,7 @@ describe('botmux skills diagnostics commands', () => {
     src = mkdtempSync(join(tmpdir(), 'botmux-skill-src-'));
     repo = mkdtempSync(join(tmpdir(), 'botmux-skill-repo-'));
     vi.stubEnv('HOME', home);
+    vi.stubEnv('USERPROFILE', home); // Windows: os.homedir() reads USERPROFILE, keep isolation
   });
 
   afterEach(() => {

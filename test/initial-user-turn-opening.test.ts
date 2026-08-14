@@ -1,24 +1,24 @@
-/**
+﻿/**
  * Route-level regression guard for the **empty-start opening turn**.
  *
- * `/repo homelab`（或选仓卡 / 跳过 / mid-session 切仓）会在没有任何 buffered 用户
- * 输入时以 `forkWorker(ds, '', false)` 把 CLI 空启动：进程活着，但从没见过
- * `<botmux_routing>` / `<botmux_builtin_skills>` / `<identity>` 这套开场上下文
- * （只有 `buildNewTopicCliInput` 会产出它们）。
+ * `/repo homelab`锛堟垨閫変粨鍗?/ 璺宠繃 / mid-session 鍒囦粨锛変細鍦ㄦ病鏈変换浣?buffered 鐢ㄦ埛
+ * 杈撳叆鏃朵互 `forkWorker(ds, '', false)` 鎶?CLI 绌哄惎鍔細杩涚▼娲荤潃锛屼絾浠庢病瑙佽繃
+ * `<botmux_routing>` / `<botmux_builtin_skills>` / `<identity>` 杩欏寮€鍦轰笂涓嬫枃
+ * 锛堝彧鏈?`buildNewTopicCliInput` 浼氫骇鍑哄畠浠級銆?
  *
- * 修复前，下一条真实业务消息只按「worker 活没活」判定，一律走
- * `buildFollowUpCliInput` / `buildReforkCliInput`，PR #477 的 opening routing +
- * built-in skill discovery 永久丢失。这里驱动**真实**路由 handler
- * （`handleThreadReply`）钉住：
+ * 淇鍓嶏紝涓嬩竴鏉＄湡瀹炰笟鍔℃秷鎭彧鎸夈€寃orker 娲绘病娲汇€嶅垽瀹氾紝涓€寰嬭蛋
+ * `buildFollowUpCliInput` / `buildReforkCliInput`锛孭R #477 鐨?opening routing +
+ * built-in skill discovery 姘镐箙涓㈠け銆傝繖閲岄┍鍔?*鐪熷疄**璺敱 handler
+ * 锛坄handleThreadReply`锛夐拤浣忥細
  *
- *   - live worker 与 worker-null/refork 两条路都用 new-topic 开场构造首条业务输入；
- *   - 第二条消息回落成普通 follow-up，开场块不重复；
- *   - 空启动后重启（hasHistory:true + 持久标记）仍然生效，且不会错误 `--resume`；
- *   - 并发/紧邻两条首消息只有一个 opener；
- *   - botmux 控制命令 / CLI passthrough 不消费状态；
- *   - sender / mentions / attachments / quoted 侧车不丢；
- *   - prompt / off / global / dynamic 四种 skill 注入模式按**能力**断言；
- *   - 没有该标记的普通会话行为不回归。
+ *   - live worker 涓?worker-null/refork 涓ゆ潯璺兘鐢?new-topic 寮€鍦烘瀯閫犻鏉′笟鍔¤緭鍏ワ紱
+ *   - 绗簩鏉℃秷鎭洖钀芥垚鏅€?follow-up锛屽紑鍦哄潡涓嶉噸澶嶏紱
+ *   - 绌哄惎鍔ㄥ悗閲嶅惎锛坔asHistory:true + 鎸佷箙鏍囪锛変粛鐒剁敓鏁堬紝涓斾笉浼氶敊璇?`--resume`锛?
+ *   - 骞跺彂/绱ч偦涓ゆ潯棣栨秷鎭彧鏈変竴涓?opener锛?
+ *   - botmux 鎺у埗鍛戒护 / CLI passthrough 涓嶆秷璐圭姸鎬侊紱
+ *   - sender / mentions / attachments / quoted 渚ц溅涓嶄涪锛?
+ *   - prompt / off / global / dynamic 鍥涚 skill 娉ㄥ叆妯″紡鎸?*鑳藉姏**鏂█锛?
+ *   - 娌℃湁璇ユ爣璁扮殑鏅€氫細璇濊涓轰笉鍥炲綊銆?
  *
  * Run:  pnpm vitest run test/initial-user-turn-opening.test.ts
  */
@@ -42,7 +42,7 @@ const mocks = vi.hoisted(() => {
         ? {
             openId,
             type: senderType === 'app' || senderType === 'bot' ? 'bot' as const : 'user' as const,
-            name: openId === 'ou_owner' ? '凡辞' : undefined,
+            name: openId === 'ou_owner' ? '鍑¤緸' : undefined,
           }
         : undefined
     )),
@@ -90,8 +90,8 @@ vi.mock('../src/im/lark/identity-cache.js', async () => {
   return { ...actual, resolveSender: (...args: any[]) => mocks.resolveSender(...args) };
 });
 
-// Only the network-facing attachment download is stubbed — every prompt builder
-// (buildNewTopicCliInput / buildFollowUpCliInput / …) stays REAL so the
+// Only the network-facing attachment download is stubbed 鈥?every prompt builder
+// (buildNewTopicCliInput / buildFollowUpCliInput / 鈥? stays REAL so the
 // assertions below observe the actual opening bytes.
 vi.mock('../src/core/session-manager.js', async () => {
   const actual = await vi.importActual<any>('../src/core/session-manager.js');
@@ -240,11 +240,12 @@ function openingExpectations(cliId: CliId, mode: 'prompt' | 'off' | 'global') {
   return { inlineRouting, builtinBlock };
 }
 
-describe('empty-started session — first real business turn must use the new-topic opening', () => {
+describe('empty-started session 鈥?first real business turn must use the new-topic opening', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     home = mkdtempSync(join(tmpdir(), 'botmux-initial-turn-'));
     vi.stubEnv('HOME', home);
+    vi.stubEnv('USERPROFILE', home); // Windows: os.homedir() reads USERPROFILE, keep isolation
     vi.stubEnv('CODEX_HOME', '');
     invalidateGlobalConfigCache();
     mocks.replyMessage.mockResolvedValue('om_reply');
@@ -273,14 +274,14 @@ describe('empty-started session — first real business turn must use the new-to
     rmSync(home, { recursive: true, force: true });
   });
 
-  // ─── live worker ────────────────────────────────────────────────────────────
+  // 鈹€鈹€鈹€ live worker 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
   it('live worker: first business message opens with new-topic context, second is a plain follow-up', async () => {
     const anchor = 'om_live_root';
     const ds = seedEmptyStarted(anchor);
 
     await handleThreadReply(
-      makeEventData('om_first', '帮我看看这个 bug', anchor),
+      makeEventData('om_first', '甯垜鐪嬬湅杩欎釜 bug', anchor),
       makeCtx(anchor, 'om_first'),
     );
 
@@ -289,7 +290,7 @@ describe('empty-started session — first real business turn must use the new-to
     expect(opening).toContain('<botmux_routing>');
     expect(opening).toContain('<identity>');
     expect(opening).toContain(`<session_id>${ds.session.sessionId}</session_id>`);
-    expect(opening).toContain('<user_message>\n帮我看看这个 bug\n</user_message>');
+    expect(opening).toContain('<user_message>\n甯垜鐪嬬湅杩欎釜 bug\n</user_message>');
     // New-topic openings never carry the follow-up reminder envelope.
     expect(opening).not.toContain('<botmux_reminder>');
 
@@ -298,7 +299,7 @@ describe('empty-started session — first real business turn must use the new-to
     expect(mocks.updateSession).toHaveBeenCalledWith(ds.session);
 
     await handleThreadReply(
-      makeEventData('om_second', '继续', anchor),
+      makeEventData('om_second', '缁х画', anchor),
       makeCtx(anchor, 'om_second'),
     );
 
@@ -321,16 +322,16 @@ describe('empty-started session — first real business turn must use the new-to
       needLogin: false,
     });
 
-    const data = makeEventData('om_meta', '@_user_1 看下这个', anchor, {
+    const data = makeEventData('om_meta', '@_user_1 鐪嬩笅杩欎釜', anchor, {
       mentions: [{ key: '@_user_1', name: 'Peer', id: { open_id: 'ou_peer' } }],
     });
     await handleThreadReply(data, makeCtx(anchor, 'om_meta'));
 
     const opening = liveInputs()[0]!.content;
-    // Opening shape (the regression) …
+    // Opening shape (the regression) 鈥?
     expect(opening).toContain('<botmux_routing>');
     expect(opening).not.toContain('<botmux_reminder>');
-    // … with every per-turn datum still threaded through.
+    // 鈥?with every per-turn datum still threaded through.
     expect(opening).toContain('<sender type="user" open_id="ou_owner"');
     expect(opening).toContain('<mentions>');
     expect(opening).toContain('ou_peer');
@@ -343,14 +344,14 @@ describe('empty-started session — first real business turn must use the new-to
     const anchor = 'om_live_quote_root';
     seedEmptyStarted(anchor);
 
-    // parent_id != root_id ⇒ the router prepends the `botmux quoted` hint.
-    const data = makeEventData('om_quoted', '按引用里的说明改', anchor, { parentId: 'om_quoted_target' });
+    // parent_id != root_id 鈬?the router prepends the `botmux quoted` hint.
+    const data = makeEventData('om_quoted', '鎸夊紩鐢ㄩ噷鐨勮鏄庢敼', anchor, { parentId: 'om_quoted_target' });
     await handleThreadReply(data, makeCtx(anchor, 'om_quoted'));
 
     const opening = liveInputs()[0]!.content;
     expect(opening).toContain('<botmux_routing>');
     expect(opening).toContain('om_quoted_target');
-    expect(opening).toContain('按引用里的说明改');
+    expect(opening).toContain('鎸夊紩鐢ㄩ噷鐨勮鏄庢敼');
   });
 
   it('live worker: Codex App keeps its clean-input sidecar on the opening turn', async () => {
@@ -365,13 +366,13 @@ describe('empty-started session — first real business turn must use the new-to
     }).resolvedAllowedUsers = [OWNER];
     seedEmptyStarted(anchor, { cliId: 'codex-app' });
 
-    const data = makeEventData('om_codex_app_msg', '接着上一条改', anchor, { parentId: 'om_codex_quote_target' });
+    const data = makeEventData('om_codex_app_msg', '鎺ョ潃涓婁竴鏉℃敼', anchor, { parentId: 'om_codex_quote_target' });
     await handleThreadReply(data, makeCtx(anchor, 'om_codex_app_msg'));
 
     const payload = liveInputs()[0]!;
     // Visible user text stays exactly the Lark bytes; the quote hint and sender
     // ride the structured sidecar instead of polluting the message.
-    expect(payload.codexAppInput?.text).toBe('接着上一条改');
+    expect(payload.codexAppInput?.text).toBe('鎺ョ潃涓婁竴鏉℃敼');
     expect(payload.codexAppInput?.additionalContext?.botmux_message_context?.value)
       .toContain('om_codex_quote_target');
     expect(payload.codexAppInput?.additionalContext?.botmux_sender?.value)
@@ -390,12 +391,12 @@ describe('empty-started session — first real business turn must use the new-to
     seedEmptyStarted(anchor, { cliId: 'codex-app' });
 
     await handleThreadReply(
-      makeEventData('om_steer_live_msg', '第一条真实交互消息', anchor),
+      makeEventData('om_steer_live_msg', '绗竴鏉＄湡瀹炰氦浜掓秷鎭?, anchor),
       makeCtx(anchor, 'om_steer_live_msg'),
     );
 
     // The daemon computes codexAppSteerable and passes it as sendWorkerInput's
-    // 4th arg (opts) — this is the production path the worker init COPY depends
+    // 4th arg (opts) 鈥?this is the production path the worker init COPY depends
     // on. The test does NOT hand-inject the flag anywhere.
     const opts = mocks.sendWorkerInput.mock.calls[0]?.[3];
     expect(opts?.codexAppSteerable).toBe(true);
@@ -413,7 +414,7 @@ describe('empty-started session — first real business turn must use the new-to
     seedEmptyStarted(anchor, { live: false, hasHistory: true, cliId: 'codex-app' });
 
     await handleThreadReply(
-      makeEventData('om_steer_cold_msg', '冷启后的第一条真实交互消息', anchor),
+      makeEventData('om_steer_cold_msg', '鍐峰惎鍚庣殑绗竴鏉＄湡瀹炰氦浜掓秷鎭?, anchor),
       makeCtx(anchor, 'om_steer_cold_msg'),
     );
 
@@ -425,23 +426,23 @@ describe('empty-started session — first real business turn must use the new-to
     expect(openingPayload?.codexAppSteerable).toBe(true);
   });
 
-  // ─── worker-null / refork ───────────────────────────────────────────────────
+  // 鈹€鈹€鈹€ worker-null / refork 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
   it('worker-null refork: opens with new-topic context and does NOT resume a never-used CLI', async () => {
     const anchor = 'om_refork_root';
     // hasHistory:true is exactly what restoreActiveSessions sets after a daemon
-    // restart — the empty-start marker must still win over it.
+    // restart 鈥?the empty-start marker must still win over it.
     const ds = seedEmptyStarted(anchor, { live: false, hasHistory: true });
 
     await handleThreadReply(
-      makeEventData('om_cold_first', '重启之后的第一条真实消息', anchor),
+      makeEventData('om_cold_first', '閲嶅惎涔嬪悗鐨勭涓€鏉＄湡瀹炴秷鎭?, anchor),
       makeCtx(anchor, 'om_cold_first'),
     );
 
     expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
     const opening = forkInputs()[0]!.content;
     expect(opening).toContain('<botmux_routing>');
-    expect(opening).toContain('<user_message>\n重启之后的第一条真实消息\n</user_message>');
+    expect(opening).toContain('<user_message>\n閲嶅惎涔嬪悗鐨勭涓€鏉＄湡瀹炴秷鎭痋n</user_message>');
     expect(opening).not.toContain('<botmux_reminder>');
     expect(mocks.forkWorker.mock.calls[0]?.[2]).toEqual({ resume: false, turnId: 'om_cold_first' });
     expect(ds.session.initialUserTurnPending).toBeUndefined();
@@ -454,11 +455,11 @@ describe('empty-started session — first real business turn must use the new-to
     const anchor = 'om_prior_input_root';
     const ds = seedEmptyStarted(anchor, { live: false, hasHistory: true });
     // Both mirrors, exactly as restoreActiveSessions / rememberLastCliInput leave them.
-    ds.lastCliInput = '<user_message>\n定时任务的一轮\n</user_message>';
+    ds.lastCliInput = '<user_message>\n瀹氭椂浠诲姟鐨勪竴杞甛n</user_message>';
     ds.session.lastCliInput = ds.lastCliInput;
 
     await handleThreadReply(
-      makeEventData('om_after_schedule', '人类的第一条消息', anchor),
+      makeEventData('om_after_schedule', '浜虹被鐨勭涓€鏉℃秷鎭?, anchor),
       makeCtx(anchor, 'om_after_schedule'),
     );
 
@@ -472,7 +473,7 @@ describe('empty-started session — first real business turn must use the new-to
     seedEmptyStarted(anchor, { live: false, hasHistory: true, pending: false });
 
     await handleThreadReply(
-      makeEventData('om_plain_cold', '普通冷启回话', anchor),
+      makeEventData('om_plain_cold', '鏅€氬喎鍚洖璇?, anchor),
       makeCtx(anchor, 'om_plain_cold'),
     );
 
@@ -483,7 +484,7 @@ describe('empty-started session — first real business turn must use the new-to
     expect(mocks.forkWorker.mock.calls[0]?.[2]).toEqual({ resume: true, turnId: 'om_plain_cold' });
   });
 
-  // ─── restart durability ─────────────────────────────────────────────────────
+  // 鈹€鈹€鈹€ restart durability 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
   it('survives a daemon restart: the marker lives on the persisted Session record', async () => {
     const anchor = 'om_restart_root';
@@ -503,7 +504,7 @@ describe('empty-started session — first real business turn must use the new-to
     activeSessions.set(sessionKey(anchor, APP), restored);
 
     await handleThreadReply(
-      makeEventData('om_after_restart', '重启后第一条', anchor),
+      makeEventData('om_after_restart', '閲嶅惎鍚庣涓€鏉?, anchor),
       makeCtx(anchor, 'om_after_restart'),
     );
 
@@ -511,15 +512,15 @@ describe('empty-started session — first real business turn must use the new-to
     expect(restored.session.initialUserTurnPending).toBeUndefined();
   });
 
-  // ─── concurrency ────────────────────────────────────────────────────────────
+  // 鈹€鈹€鈹€ concurrency 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
   it('two back-to-back first messages produce exactly one opener', async () => {
     const anchor = 'om_race_root';
     seedEmptyStarted(anchor);
 
     await Promise.all([
-      handleThreadReply(makeEventData('om_race_a', '第一条', anchor), makeCtx(anchor, 'om_race_a')),
-      handleThreadReply(makeEventData('om_race_b', '第二条', anchor), makeCtx(anchor, 'om_race_b')),
+      handleThreadReply(makeEventData('om_race_a', '绗竴鏉?, anchor), makeCtx(anchor, 'om_race_a')),
+      handleThreadReply(makeEventData('om_race_b', '绗簩鏉?, anchor), makeCtx(anchor, 'om_race_b')),
     ]);
 
     const openings = liveInputs().filter(p => p.content.includes('<botmux_routing>'));
@@ -527,7 +528,7 @@ describe('empty-started session — first real business turn must use the new-to
     expect(openings).toHaveLength(1);
   });
 
-  // ─── control traffic must not consume the state ─────────────────────────────
+  // 鈹€鈹€鈹€ control traffic must not consume the state 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
   it('a botmux daemon command does not consume the pending opening', async () => {
     const anchor = 'om_cmd_root';
@@ -542,7 +543,7 @@ describe('empty-started session — first real business turn must use the new-to
     expect(ds.session.initialUserTurnPending).toBe(true);
 
     await handleThreadReply(
-      makeEventData('om_after_cmd', '现在才是真正的任务', anchor),
+      makeEventData('om_after_cmd', '鐜板湪鎵嶆槸鐪熸鐨勪换鍔?, anchor),
       makeCtx(anchor, 'om_after_cmd'),
     );
     expect(liveInputs()[0]!.content).toContain('<botmux_routing>');
@@ -557,7 +558,7 @@ describe('empty-started session — first real business turn must use the new-to
       makeCtx(anchor, 'om_model'),
     );
 
-    // Literal command straight to the CLI — never wrapped in botmux XML.
+    // Literal command straight to the CLI 鈥?never wrapped in botmux XML.
     expect(ds.worker.send).toHaveBeenCalledWith({
       type: 'raw_input',
       content: '/model opus',
@@ -567,7 +568,7 @@ describe('empty-started session — first real business turn must use the new-to
     expect(ds.session.initialUserTurnPending).toBe(true);
   });
 
-  // ─── skill-injection modes, asserted by capability ──────────────────────────
+  // 鈹€鈹€鈹€ skill-injection modes, asserted by capability 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
   for (const mode of ['prompt', 'off', 'global'] as const) {
     for (const cliId of ['codex', 'claude-code'] as CliId[]) {
@@ -578,7 +579,7 @@ describe('empty-started session — first real business turn must use the new-to
         seedEmptyStarted(anchor, { cliId });
 
         await handleThreadReply(
-          makeEventData(`${anchor}_msg`, '开工', anchor),
+          makeEventData(`${anchor}_msg`, '寮€宸?, anchor),
           makeCtx(anchor, `${anchor}_msg`),
         );
 
@@ -605,35 +606,35 @@ describe('empty-started session — first real business turn must use the new-to
         } else {
           expect(opening).not.toContain('<botmux_builtin_skills>');
         }
-        // Always a real user turn, never an empty boilerplate opening — and
+        // Always a real user turn, never an empty boilerplate opening 鈥?and
         // never the follow-up envelope (the single mode-independent tell that
         // this went through buildNewTopicCliInput, incl. for claude-family).
-        expect(opening).toContain('<user_message>\n开工\n</user_message>');
+        expect(opening).toContain('<user_message>\n寮€宸n</user_message>');
         expect(opening).not.toContain('<botmux_reminder>');
       });
     }
   }
 
-  // ─── adopt / bridge must never be touched ───────────────────────────────────
+  // 鈹€鈹€鈹€ adopt / bridge must never be touched 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
   it('adopt-bridge sessions never receive a botmux opening envelope', async () => {
     const anchor = 'om_adopt_root';
     const ds = seedEmptyStarted(anchor, { adoptedFrom: 'tmux:user-session' });
 
     await handleThreadReply(
-      makeEventData('om_adopt_msg', '桥接会话的一条消息', anchor),
+      makeEventData('om_adopt_msg', '妗ユ帴浼氳瘽鐨勪竴鏉℃秷鎭?, anchor),
       makeCtx(anchor, 'om_adopt_msg'),
     );
 
     const content = liveInputs()[0]!.content;
     expect(content).not.toContain('<botmux_routing>');
     expect(content).not.toContain('<user_message>');
-    expect(content).toContain('桥接会话的一条消息');
+    expect(content).toContain('妗ユ帴浼氳瘽鐨勪竴鏉℃秷鎭?);
     // Bridge sessions must not consume (or even see) the marker.
     expect(ds.session.initialUserTurnPending).toBe(true);
   });
 
-  // ─── failure handling ───────────────────────────────────────────────────────
+  // 鈹€鈹€鈹€ failure handling 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
   it('a rejected live send restores the pending opening for the next message', async () => {
     const anchor = 'om_reject_root';
@@ -641,17 +642,17 @@ describe('empty-started session — first real business turn must use the new-to
     mocks.sendWorkerInput.mockReturnValueOnce(false);
 
     await handleThreadReply(
-      makeEventData('om_rejected', '这条会被 worker 拒绝', anchor),
+      makeEventData('om_rejected', '杩欐潯浼氳 worker 鎷掔粷', anchor),
       makeCtx(anchor, 'om_rejected'),
     );
 
-    // The opening WAS built and offered …
+    // The opening WAS built and offered 鈥?
     expect(liveInputs()[0]!.content).toContain('<botmux_routing>');
-    // … but the worker refused it, so the one-shot state goes back.
+    // 鈥?but the worker refused it, so the one-shot state goes back.
     expect(ds.session.initialUserTurnPending).toBe(true);
 
     await handleThreadReply(
-      makeEventData('om_retry', '再试一次', anchor),
+      makeEventData('om_retry', '鍐嶈瘯涓€娆?, anchor),
       makeCtx(anchor, 'om_retry'),
     );
     expect(liveInputs()[1]!.content).toContain('<botmux_routing>');
@@ -664,7 +665,7 @@ describe('empty-started session — first real business turn must use the new-to
     mocks.forkWorker.mockImplementationOnce(() => { throw new Error('fork boom'); });
 
     await expect(handleThreadReply(
-      makeEventData('om_fork_boom', '冷启失败', anchor),
+      makeEventData('om_fork_boom', '鍐峰惎澶辫触', anchor),
       makeCtx(anchor, 'om_fork_boom'),
     )).rejects.toThrow('fork boom');
 
@@ -672,7 +673,7 @@ describe('empty-started session — first real business turn must use the new-to
     expect(ds.session.initialUserTurnPending).toBe(true);
   });
 
-  // ─── regression: a FAILED delivery must not poison last* / --resume ──────────
+  // 鈹€鈹€鈹€ regression: a FAILED delivery must not poison last* / --resume 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
   //
   // The refork branch decides `resume` from `hadPriorCliInput`, i.e. whether the
   // session already has a real `lastCliInput`. An empty-started CLI never took a
@@ -688,17 +689,17 @@ describe('empty-started session — first real business turn must use the new-to
     mocks.forkWorker.mockImplementationOnce(() => { throw new Error('fork boom'); });
 
     await expect(handleThreadReply(
-      makeEventData('om_boom_first', '冷启失败的第一条', anchor),
+      makeEventData('om_boom_first', '鍐峰惎澶辫触鐨勭涓€鏉?, anchor),
       makeCtx(anchor, 'om_boom_first'),
     )).rejects.toThrow('fork boom');
 
-    // The failed attempt must NOT have recorded a phantom prior input …
+    // The failed attempt must NOT have recorded a phantom prior input 鈥?
     expect(ds.session.initialUserTurnPending).toBe(true);
     expect(ds.lastCliInput ?? ds.session.lastCliInput).toBeFalsy();
 
-    // … so the retry re-opens AND cold-spawns (never --resume a never-run CLI).
+    // 鈥?so the retry re-opens AND cold-spawns (never --resume a never-run CLI).
     await handleThreadReply(
-      makeEventData('om_boom_retry', '重试', anchor),
+      makeEventData('om_boom_retry', '閲嶈瘯', anchor),
       makeCtx(anchor, 'om_boom_retry'),
     );
     const retryInput = forkInputs()[forkInputs().length - 1]!;
@@ -709,16 +710,16 @@ describe('empty-started session — first real business turn must use the new-to
   });
 
   it('a rejected live send that loses its worker still cold-spawns on the refork retry (resume:false)', async () => {
-    // live worker rejects the opening (returns false) → marker restored. The
+    // live worker rejects the opening (returns false) 鈫?marker restored. The
     // worker then dies before the next message, so the retry hits the
-    // worker-null refork branch — which must still see no prior CLI input and
+    // worker-null refork branch 鈥?which must still see no prior CLI input and
     // cold-spawn, not resume the empty CLI.
     const anchor = 'om_reject_then_dead_root';
     const ds = seedEmptyStarted(anchor, { hasHistory: true });
     mocks.sendWorkerInput.mockReturnValueOnce(false);
 
     await handleThreadReply(
-      makeEventData('om_live_reject', '被拒的第一条', anchor),
+      makeEventData('om_live_reject', '琚嫆鐨勭涓€鏉?, anchor),
       makeCtx(anchor, 'om_live_reject'),
     );
     // Offered as an opening, refused, marker returned, no phantom prior input.
@@ -729,7 +730,7 @@ describe('empty-started session — first real business turn must use the new-to
     // Worker dies; next message re-forks cold.
     ds.worker = null;
     await handleThreadReply(
-      makeEventData('om_after_death', '重试', anchor),
+      makeEventData('om_after_death', '閲嶈瘯', anchor),
       makeCtx(anchor, 'om_after_death'),
     );
     const retryInput = forkInputs()[forkInputs().length - 1]!;
@@ -740,7 +741,7 @@ describe('empty-started session — first real business turn must use the new-to
   });
 });
 
-describe('computeCodexAppSteerable — fail-closed positive-human gate (R7-B1)', () => {
+describe('computeCodexAppSteerable 鈥?fail-closed positive-human gate (R7-B1)', () => {
   const humanFacts = {
     humanSender: true,
     adopted: false,
@@ -757,9 +758,9 @@ describe('computeCodexAppSteerable — fail-closed positive-human gate (R7-B1)',
     expect(computeCodexAppSteerable({ ...humanFacts })).toBe(true);
   });
 
-  it('is fail-closed: NO humanSender ⇒ serial even when every exclusion is absent (the fail-open root)', () => {
+  it('is fail-closed: NO humanSender 鈬?serial even when every exclusion is absent (the fail-open root)', () => {
     // The bug codex caught: excluding a list of known non-human sources is not
-    // enough — an un-enumerated non-user source (humanSender:false) must still be
+    // enough 鈥?an un-enumerated non-user source (humanSender:false) must still be
     // denied. This is the core positive-assert guarantee.
     expect(computeCodexAppSteerable({ ...humanFacts, humanSender: false })).toBe(false);
   });

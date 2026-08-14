@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+﻿import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -33,6 +33,7 @@ describe('maintenance global config', () => {
   beforeEach(() => {
     home = mkdtempSync(join(tmpdir(), 'botmux-maint-config-'));
     vi.stubEnv('HOME', home);
+    vi.stubEnv('USERPROFILE', home); // Windows: os.homedir() reads USERPROFILE, keep isolation
     mkdirSync(dirname(globalConfigPath()), { recursive: true });
   });
 
@@ -62,7 +63,7 @@ describe('maintenance global config', () => {
   it('drops invalid autoUpdate time / non-boolean enabled, keeps the rest', () => {
     writeFileSync(globalConfigPath(), JSON.stringify({
       maintenance: {
-        autoUpdate: { enabled: 'yes', time: '99:99' }, // both invalid → dropped
+        autoUpdate: { enabled: 'yes', time: '99:99' }, // both invalid 鈫?dropped
         autoRestart: { enabled: false },
       },
     }));

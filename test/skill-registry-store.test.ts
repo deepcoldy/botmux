@@ -18,7 +18,11 @@ describe('skill registry store', () => {
   beforeEach(() => {
     home = mkdtempSync(join(tmpdir(), 'botmux-skill-home-'));
     src = mkdtempSync(join(tmpdir(), 'botmux-skill-src-'));
+    // os.homedir() honours $HOME on POSIX but reads USERPROFILE on Windows —
+    // stub both so skillRegistryPath() (→ ~/.botmux/skills) stays isolated on
+    // every platform instead of mutating the real user home.
     vi.stubEnv('HOME', home);
+    vi.stubEnv('USERPROFILE', home);
   });
 
   afterEach(() => {

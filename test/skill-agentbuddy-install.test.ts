@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+﻿import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -18,19 +18,19 @@ import {
 // so the wrapper's capture + telemetry-scrub + register path is exercised
 // without any network/SSO. FAKE_AB_TELEMETRY=1 makes installs carry telemetry.
 // Env knobs used by individual tests:
-//   FAKE_AB_FAIL=1         → exit 1 with "needs login" (unauthenticated)
-//   FAKE_AB_EMPTY=1        → exit 0 producing nothing
-//   FAKE_AB_TELEMETRY=1    → produced skills carry a @telemetry block + spans/
-//   FAKE_AB_SCRUB_NOOP=1   → clear-embedded-telemetry exits 0 but strips nothing
-//   FAKE_AB_DELAY_MS=<n>   → sync-sleep before producing (force concurrency overlap)
-//   FAKE_AB_PRODUCE=a,b    → produce these skill names instead of the requested/default set
+//   FAKE_AB_FAIL=1         鈫?exit 1 with "needs login" (unauthenticated)
+//   FAKE_AB_EMPTY=1        鈫?exit 0 producing nothing
+//   FAKE_AB_TELEMETRY=1    鈫?produced skills carry a @telemetry block + spans/
+//   FAKE_AB_SCRUB_NOOP=1   鈫?clear-embedded-telemetry exits 0 but strips nothing
+//   FAKE_AB_DELAY_MS=<n>   鈫?sync-sleep before producing (force concurrency overlap)
+//   FAKE_AB_PRODUCE=a,b    鈫?produce these skill names instead of the requested/default set
 const FAKE_AGENTBUDDY = `
 const { mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, readdirSync } = require('node:fs');
 const { join } = require('node:path');
 if (process.env.FAKE_AB_FAIL === '1') { process.stderr.write('needs login\\n'); process.exit(1); }
 if (process.env.FAKE_AB_EMPTY === '1') { process.exit(0); }
 // Simulate an expired download credential: print the interactive-auth prompt,
-// then poll "forever" (never touch stdin) — mirrors real agentbuddy so the
+// then poll "forever" (never touch stdin) 鈥?mirrors real agentbuddy so the
 // wrapper must detect the prompt and kill, not wait out the timeout.
 if (process.env.FAKE_AB_LOGIN_HANG === '1') {
   process.stdout.write('[INFO] Downloading...\\nNo valid credentials. Logging in...\\n\\n  To login, open this URL in any browser:\\n  https://host/auth/api/v1/lark/login?session=X\\n\\n  Waiting for authorization...\\n');
@@ -93,6 +93,7 @@ describe('agentbuddy skill install', () => {
   beforeEach(() => {
     home = mkdtempSync(join(tmpdir(), 'botmux-ab-home-'));
     vi.stubEnv('HOME', home);
+    vi.stubEnv('USERPROFILE', home); // Windows: os.homedir() reads USERPROFILE, keep isolation
     fakeBin = join(mkdtempSync(join(tmpdir(), 'botmux-ab-bin-')), 'fake-agentbuddy.cjs');
     writeFileSync(fakeBin, FAKE_AGENTBUDDY);
     vi.stubEnv('BOTMUX_AGENTBUDDY_CMD', `node ${fakeBin}`);
@@ -219,9 +220,9 @@ describe('agentbuddy skill install', () => {
 
   it('fails fast even when a shim grandchild (npx-style) holds the pipes open', async () => {
     // Reproduces the real deploy shape: BOTMUX_AGENTBUDDY_CMD is a shim
-    // (`npx agentbuddy@latest …`) whose grandchild is the real CLI. Killing only
+    // (`npx agentbuddy@latest 鈥) whose grandchild is the real CLI. Killing only
     // the direct child leaves the grandchild alive holding stdout/stderr, so
-    // 'close' never fires — the runner must kill the whole process group and
+    // 'close' never fires 鈥?the runner must kill the whole process group and
     // settle on 'exit'. The shim runs the login-hang fake WITHOUT exec, so node
     // is a true grandchild that would outlive a direct-child-only kill.
     const shim = join(mkdtempSync(join(tmpdir(), 'botmux-ab-shim-')), 'shim.sh');
@@ -270,7 +271,7 @@ describe('agentbuddy skill install', () => {
   });
 
   it('collection update aborts (no re-sync of others) when the member was removed', () => {
-    installAgentbuddySkill({ collection: 'col1' }); // → col1-alpha, col1-beta
+    installAgentbuddySkill({ collection: 'col1' }); // 鈫?col1-alpha, col1-beta
     const betaBefore = readSkillRegistry().skills['col1-beta'].updatedAt;
     vi.stubEnv('FAKE_AB_PRODUCE', 'col1-beta'); // collection dropped col1-alpha
     expect(updateInstalledSkill('col1-alpha')).toEqual({ ok: false, reason: 'agentbuddy_update_failed' });
