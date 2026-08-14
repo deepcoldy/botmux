@@ -681,6 +681,7 @@ function buildExistingSessionContent(
   codexAppText: string,
   codexAppApplicationContext: string,
   codexAppMessageContext: string,
+  turnId: string,
 ) {
   ensureSessionWhiteboard(ds);
   const botCfg = getBot(larkAppId).config;
@@ -698,6 +699,7 @@ function buildExistingSessionContent(
     // HTTP response directives are carried separately at application priority.
     codexAppMessageContext,
     sessionBackendType: ds.session.backendType,
+    turnId,
   });
 }
 
@@ -1140,7 +1142,7 @@ async function triggerSessionTurnAdmitted(
       };
     }
     const content = buildExistingSessionContent(
-      target, prompt, larkAppId, chatId, codexAppText, codexAppApplicationContext, codexAppMessageContext,
+      target, prompt, larkAppId, chatId, codexAppText, codexAppApplicationContext, codexAppMessageContext, triggerId,
     );
     const queuedBehindActivation = workerIsLive
       && hasQueuedActivationAdmissionGate(target);

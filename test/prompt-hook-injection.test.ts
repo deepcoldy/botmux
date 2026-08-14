@@ -96,10 +96,11 @@ import { claimPromptContext, fingerprintPromptText, prefixOf } from '../src/serv
 
 const SESSION_ID = 'hook-session-789';
 const LARK_APP_ID = 'app_test';
+const TURN_ID = 'turn-test-1';
 
-/** 模拟 hook 客户端：按 PTY 文本算指纹 + 前缀后向宿主 claim。 */
-function claimByPrompt(sessionId: string, ptyText: string): string | undefined {
-  return claimPromptContext(sessionId, fingerprintPromptText(ptyText), prefixOf(ptyText));
+/** 模拟 hook 客户端：按 PTY 文本算指纹 + 前缀后，按 turnId 向宿主 claim。 */
+function claimByPrompt(sessionId: string, turnId: string, ptyText: string): string | undefined {
+  return claimPromptContext(sessionId, turnId, fingerprintPromptText(ptyText), prefixOf(ptyText));
 }
 
 function followUpOpts(overrides: Record<string, unknown> = {}) {
@@ -109,6 +110,8 @@ function followUpOpts(overrides: Record<string, unknown> = {}) {
     // claude-code 经 spawn chokepoint 钉在本地后端；B3 fail-closed 后必须显式传
     // 本地后端类型才允许 hook 模式（undefined 一律 inline）。
     sessionBackendType: 'pty' as const,
+    // hook 模式按 (turnId, fingerprint) 绑定 sidecar；缺失 turnId 会回退 inline。
+    turnId: TURN_ID,
     sender: { openId: 'ou_sender', type: 'user' as const, name: 'Sender' },
     mentions: [{ name: 'Bob', openId: 'ou_bob' }],
     ...overrides,
@@ -141,7 +144,7 @@ describe('buildFollowUpCliInput — hook 注入模式', () => {
     expect(result.content).not.toContain('<whiteboard');
 
     // sidecar：按 PTY 文本指纹读回，含 reminder + whiteboard
-    const envelope = claimByPrompt(SESSION_ID, result.content);
+    const envelope = claimByPrompt(SESSION_ID, TURN_ID, result.content);
     expect(envelope).toBeDefined();
     expect(envelope).toContain('<botmux_reminder>');
     expect(envelope).toContain('<whiteboard');
@@ -156,7 +159,7 @@ describe('buildFollowUpCliInput — hook 注入模式', () => {
     });
     const result = buildFollowUpCliInput('帮我修个 bug', SESSION_ID, followUpOpts());
     expect(result.content).toContain('<botmux_reminder>');
-    expect(claimByPrompt(SESSION_ID, result.content)).toBeUndefined();
+    expect(claimByPrompt(SESSION_ID, TURN_ID, result.content)).toBeUndefined();
   });
 
   it('缺省（未配置 envelopeInjection）：inline', () => {
@@ -170,14 +173,14 @@ describe('buildFollowUpCliInput — hook 注入模式', () => {
   it('不支持的 CLI（codex）即使 auto 也 inline', () => {
     const result = buildFollowUpCliInput('帮我修个 bug', SESSION_ID, followUpOpts({ cliId: 'codex' }));
     expect(result.content).toContain('<botmux_reminder>');
-    expect(claimByPrompt(SESSION_ID, result.content)).toBeUndefined();
+    expect(claimByPrompt(SESSION_ID, TURN_ID, result.content)).toBeUndefined();
   });
 
   it('preflight 失败（hook 未安装）：inline', () => {
     preflightMock.mockReturnValue(false);
     const result = buildFollowUpCliInput('帮我修个 bug', SESSION_ID, followUpOpts());
     expect(result.content).toContain('<botmux_reminder>');
-    expect(claimByPrompt(SESSION_ID, result.content)).toBeUndefined();
+    expect(claimByPrompt(SESSION_ID, TURN_ID, result.content)).toBeUndefined();
   });
 
   it('hook 模式下指纹容忍空白差异：hook 侧按带额外空白的文本也能读回', () => {
@@ -185,12 +188,12 @@ describe('buildFollowUpCliInput — hook 注入模式', () => {
     expect(result.content).not.toContain('<botmux_reminder>');
     // 模拟 hook 看到的文本（空白被 CLI 归一化）
     const withExtraWhitespace = result.content.replace('第一行\n第二行', '第一行  第二行');
-    expect(claimByPrompt(SESSION_ID, withExtraWhitespace)).toContain('<botmux_reminder>');
+    expect(claimByPrompt(SESSION_ID, TURN_ID, withExtraWhitespace)).toContain('<botmux_reminder>');
   });
 
   it('无 whiteboardId 时 sidecar 只含 reminder', () => {
     const result = buildFollowUpCliInput('帮我修个 bug', SESSION_ID, followUpOpts({ whiteboardId: undefined }));
-    const envelope = claimByPrompt(SESSION_ID, result.content);
+    const envelope = claimByPrompt(SESSION_ID, TURN_ID, result.content);
     expect(envelope).toContain('<botmux_reminder>');
     expect(envelope).not.toContain('<whiteboard');
   });
@@ -221,7 +224,7 @@ describe('buildFollowUpCliInput — hook 注入模式', () => {
     preflightMock.mockReturnValue(false);
     const result = buildFollowUpCliInput('帮我修个 bug', SESSION_ID, followUpOpts());
     expect(result.content).toContain('<botmux_reminder>');
-    expect(claimByPrompt(SESSION_ID, result.content)).toBeUndefined();
+    expect(claimByPrompt(SESSION_ID, TURN_ID, result.content)).toBeUndefined();
   });
 
   it('riff 后端 + sandbox：不重定向，preflight 查全局路径（不是 BOT_HOME）', () => {
@@ -234,7 +237,7 @@ describe('buildFollowUpCliInput — hook 注入模式', () => {
     preflightMock.mockClear();
     const result = buildFollowUpCliInput('帮我修个 bug', SESSION_ID, followUpOpts({ sessionBackendType: 'riff' as const }));
     expect(result.content).toContain('<botmux_reminder>');
-    expect(claimByPrompt(SESSION_ID, result.content)).toBeUndefined();
+    expect(claimByPrompt(SESSION_ID, TURN_ID, result.content)).toBeUndefined();
   });
 
   it('未知后端类型（白名单外）：强制 inline（hardening）', () => {
@@ -243,7 +246,7 @@ describe('buildFollowUpCliInput — hook 注入模式', () => {
     });
     const result = buildFollowUpCliInput('帮我修个 bug', SESSION_ID, followUpOpts({ sessionBackendType: 'future-remote' as any }));
     expect(result.content).toContain('<botmux_reminder>');
-    expect(claimByPrompt(SESSION_ID, result.content)).toBeUndefined();
+    expect(claimByPrompt(SESSION_ID, TURN_ID, result.content)).toBeUndefined();
   });
 
   it('B3 fail-closed：sessionBackendType 缺失（undefined）时强制 inline，不短路进 hook', () => {
@@ -254,6 +257,6 @@ describe('buildFollowUpCliInput — hook 注入模式', () => {
     });
     const result = buildFollowUpCliInput('帮我修个 bug', SESSION_ID, followUpOpts({ sessionBackendType: undefined }));
     expect(result.content).toContain('<botmux_reminder>');
-    expect(claimByPrompt(SESSION_ID, result.content)).toBeUndefined();
+    expect(claimByPrompt(SESSION_ID, TURN_ID, result.content)).toBeUndefined();
   });
 });

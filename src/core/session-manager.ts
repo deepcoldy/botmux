@@ -1169,6 +1169,10 @@ type FollowUpOpts = {
   /** 会话冻结的后端类型（ds.session.backendType）。riff 等远端后端没有本地
    *  Claude hook 进程，强制 inline 模式。 */
   sessionBackendType?: BackendType;
+  /** 本轮的权威 turnId（= 发给 worker 的 turnId，最终成为 managedTurnOrigin.turnId）。
+   *  hook 模式下 sidecar 按 (turnId, fingerprint) 绑定，claim 时按权威 turnId 精确取。
+   *  缺失时无法做 turn 绑定，回退 inline（避免 reminder 被剥离却无 sidecar 可领）。 */
+  turnId?: string;
 };
 
 function buildFollowUpBlocks(
@@ -1328,7 +1332,10 @@ export function buildFollowUpCliInput(
 ): CliTurnPayload {
   // hook 注入模式（#794）：reminder/whiteboard 写入 per-turn sidecar，PTY 文本只保留
   // 其余块。超限或无条件时回退 inline（legacy 路径），行为与历史完全一致。
-  if (resolveEnvelopeInjectionMode(opts) === 'hook') {
+  // turnId 是 claim 的权威键：缺失时无法做 turn 绑定，回退 inline（避免 reminder 被
+  // 剥离却无 sidecar 可领）。
+  const hookTurnId = opts?.turnId;
+  if (resolveEnvelopeInjectionMode(opts) === 'hook' && hookTurnId) {
     const blocks = buildFollowUpBlocks(content, sessionId, opts, true);
     const ptyText = blocks
       .filter((b) => b.key !== 'reminder' && b.key !== 'whiteboard')
@@ -1339,7 +1346,7 @@ export function buildFollowUpCliInput(
       .map((b) => b.text)
       .join('\n\n');
     if (hookEnvelope && hookEnvelope.length <= HOOK_ENVELOPE_MAX_CHARS) {
-      writePromptContext(sessionId, ptyText, hookEnvelope);
+      writePromptContext(sessionId, hookTurnId, ptyText, hookEnvelope);
       return { content: ptyText };
     }
     // 无 envelope（理论上不会发生：claude-code 必有 reminder）或超限 → 回退 inline。
@@ -1527,6 +1534,7 @@ export function buildReforkCliInput(
     codexAppText?: string;
     codexAppApplicationContext?: string;
     codexAppMessageContext?: string;
+    turnId?: string;
   },
 ): CliTurnPayload {
   const locale = opts?.locale ?? localeForBot(ds.larkAppId);
@@ -1552,6 +1560,7 @@ export function buildReforkCliInput(
     chatId: ds.session.chatId,
     whiteboardId: ds.session.whiteboardId,
     sessionBackendType: ds.session.backendType,
+    turnId: opts?.turnId,
     substituteTrigger: opts?.substituteTrigger,
     codexAppText: opts?.codexAppText,
     codexAppApplicationContext: opts?.codexAppApplicationContext,
@@ -3091,6 +3100,7 @@ export async function executeScheduledTask(
           chatId: task.chatId,
           whiteboardId: existing.session.whiteboardId,
           sessionBackendType: existing.session.backendType,
+          turnId: scheduledTurnId,
         });
         rememberLastCliInput(existing, task.prompt, input);
         if (silent) armSilentScheduledTurn(existing, scheduledTurnId);

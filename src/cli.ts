@@ -11868,7 +11868,9 @@ async function cmdSessionReady(): Promise<void> {
 // 为什么走 IPC 而不是直接读文件（review HIGH-1/HIGH-2）：
 // - HIGH-2：`prompt-ctx/<sid>` 在沙箱里是 read-only bind，hook 子进程在沙箱内
 //   unlink 必失败，「读后消费」形同虚设。消费（pop）改到宿主 daemon 执行。
-// - HIGH-1：同正文多轮的 envelope 各存一条，宿主按 FIFO 原子弹出，不再互相覆盖。
+// - HIGH-1：宿主按 managedTurnOrigin.turnId 权威 turn 绑定精确取，不用 FIFO 猜。
+//   某轮漏 claim 只孤儿化自己那条，不串轮到后续轮；上一轮的 stale sidecar 永远
+//   不会被返回，因此也不需要 inline 文本启发式防双注入。
 //
 // 鉴权双路径（与 /close、/slash 同构）：能读 host secret（非沙箱）走 HMAC；
 // 读不到（沙箱/read-isolation）带本会话 rotating per-turn capability。
@@ -11904,16 +11906,9 @@ async function cmdUserPromptHook(): Promise<void> {
   } catch { /* 非 JSON → no-op */ }
   if (!prompt) process.exit(0);
 
-  // inline 检测：inline 模式的 envelope 在 <user_message> 之前有
-  // <botmux_reminder>，不注入（防双注入）。收严后的检测抗 role 文案伪造
-  // <user_message> 截断（review 绕过项）。检测失败 → 继续 claim（fail-open）。
-  try {
-    const { looksLikeInlineEnvelope } = await import('./services/prompt-context-store.js');
-    if (looksLikeInlineEnvelope(prompt)) process.exit(0);
-  } catch { /* 检测不可用 → 继续 */ }
-
   // 经 daemon IPC claim/pop。沙箱内不能直接 unlink read-only 的 sidecar，
   // 也不能把目录改可写（会给沙箱里的模型伪造 sidecar 的能力）。
+  // 不需要 inline 检测：daemon 按权威 turnId 取，上一轮的 stale sidecar 不会被返回。
   try {
     const [{ fingerprintPromptText, prefixOf }] = await Promise.all([
       import('./services/prompt-context-store.js'),

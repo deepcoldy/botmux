@@ -4437,6 +4437,7 @@ async function prewarmDocCommentSession(ds: DaemonSession, sub: DocSubscription)
       botCliPathOverride: botCfg.cliPathOverride,
       sender,
       mode: 'live',
+      turnId,
     });
     rememberLastCliInput(ds, promptContent, cliInput);
     sessionStore.updateSession(ds.session);
@@ -4454,6 +4455,7 @@ async function prewarmDocCommentSession(ds: DaemonSession, sub: DocSubscription)
       botIdentity: { name: bot.botName, openId: bot.botOpenId },
       sender,
       mode: 'refork',
+      turnId,
     });
     rememberLastCliInput(ds, promptContent, wrappedInput);
     sessionStore.updateSession(ds.session);
@@ -16342,6 +16344,10 @@ function releaseQueuedActivationReservation(ds: DaemonSession, acknowledgedToken
     const bot = getBot(ds.larkAppId);
     const cliId = ds.session.cliId ?? bot.config.cliId;
     const rawCodexText = (ds.pendingCodexAppFollowUps ?? []).join('\n\n');
+    const bufferedTurnIds = ds.pendingFollowUpTurnIds ?? [];
+    const turnId = bufferedTurnIds[bufferedTurnIds.length - 1]
+      ?? ds.currentReplyTarget?.turnId
+      ?? `queued-activation-followup-${randomUUID()}`;
     const followUp = buildFollowUpCliInput(
       buffered.join('\n\n'),
       ds.session.sessionId,
@@ -16354,16 +16360,13 @@ function releaseQueuedActivationReservation(ds: DaemonSession, acknowledgedToken
         whiteboardId: ds.session.whiteboardId,
         codexAppText: rawCodexText || buffered.join('\n\n'),
         sessionBackendType: ds.session.backendType,
+        turnId,
         codexAppApplicationContext: ds.pendingCodexAppApplicationContext,
         codexAppMessageContext: (ds.pendingCodexAppFollowUpContexts ?? [])
           .filter(Boolean)
           .join('\n\n'),
       },
     );
-    const bufferedTurnIds = ds.pendingFollowUpTurnIds ?? [];
-    const turnId = bufferedTurnIds[bufferedTurnIds.length - 1]
-      ?? ds.currentReplyTarget?.turnId
-      ?? `queued-activation-followup-${randomUUID()}`;
     const reservation = reserveQueuedActivationTailAdmission(ds);
     const bufferedGateDecisions = ds.pendingCodexAppFollowUpGateAccepted ?? [];
     // Runtime buffers are rolling-upgrade compatibility only. If they carry an
@@ -19008,6 +19011,7 @@ async function handleThreadReplyAdmitted(
         codexAppApplicationContext,
         codexAppMessageContext,
       sessionBackendType: ds.session.backendType,
+      turnId: parsed.messageId,
       });
       // R5-B1-1: freeze the admission-time steer authorization onto this earliest
       // (initialStartPending follower) tail entry — the strip-proof admit rebuild
@@ -19147,6 +19151,7 @@ async function handleThreadReplyAdmitted(
           codexAppApplicationContext,
           codexAppMessageContext,
         sessionBackendType: ds.session.backendType,
+        turnId: parsed.messageId,
         });
         ds.session.queuedPrompt ??= ds.pendingPrompt;
         ds.session.queuedCodexAppText ??= ds.pendingCodexAppText;
@@ -19543,6 +19548,7 @@ async function handleThreadReplyAdmitted(
           codexAppApplicationContext,
           codexAppMessageContext,
         sessionBackendType: ds.session.backendType,
+        turnId: parsed.messageId,
         });
     beginNewTurn(ds, parsed.content, parsed.messageId);
     await noteTurnReceived(ds, parsed.messageId, parsed.content, turnSender, parsed.messageId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
@@ -19634,6 +19640,7 @@ async function handleThreadReplyAdmitted(
           codexAppApplicationContext,
           codexAppMessageContext,
         sessionBackendType: ds.session.backendType,
+        turnId: parsed.messageId,
         });
         // R4-B1: freeze the admission-time steer authorization onto the queued
         // opening payload so the worker-null re-fork path carries it exactly like
@@ -19761,6 +19768,7 @@ async function handleThreadReplyAdmitted(
       codexAppText: reforkCodexApp.text,
       codexAppApplicationContext: queuedHasDurableTail ? undefined : codexAppApplicationContext,
       codexAppMessageContext: reforkCodexApp.messageContext,
+      turnId: parsed.messageId,
     });
     let wrappedInput = applyQueuedCodexAppLegacyFallback(builtReforkInput, {
       queued: queuedDashboardTurn,
@@ -20193,6 +20201,7 @@ async function handleDocCommentAdmitted(ctx: DocCommentContext): Promise<boolean
           botIdentity: { name: selfBot.botName, openId: selfBot.botOpenId },
           sender,
           mode: 'live',
+          turnId,
         });
         beginNewTurn(ds, text, turnId);
         (ds.session.docCommentTargets ??= {})[turnId] = docTarget; // per-turn map，不覆盖其他并发轮
@@ -20235,6 +20244,7 @@ async function handleDocCommentAdmitted(ctx: DocCommentContext): Promise<boolean
         botIdentity: { name: selfBot.botName, openId: selfBot.botOpenId },
         sender,
         mode: 'refork',
+        turnId,
       });
       (ds.session.docCommentTargets ??= {})[turnId] = docTarget; // per-turn map，不覆盖其他并发轮
       rememberLastCliInput(ds, promptContent, wrappedInput);
