@@ -3942,12 +3942,31 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
   // live sessions and only then answer 400, breaking "a failed validation
   // produces no side effects".
   //
-  // Evaluated against the persisted value the transaction would fall back to when
-  // the field is absent, so the two agree. The in-transaction copy is deliberately
-  // KEPT as a backstop: only it sees the row under the write lock, and if the
-  // entry moved in between, its rejection still carries the close summary.
+  // The in-transaction copy is deliberately KEPT as a backstop: only it sees the
+  // row under the write lock, so it still covers a genuine request-time race, and
+  // its rejection carries the close summary.
+  //
+  // The absent-field fallback MUST come from the same authority the transaction
+  // reads — the bots.json row on disk — not from getBot().config. Those two are
+  // different sources and can already disagree before the request arrives: a live
+  // snapshot saying `xhigh` (supported) over a persisted `ultra` (not supported)
+  // let the preflight pass, the irreversible close run, and only then the locked
+  // read reject. No request-time race is needed; pre-existing drift is enough.
+  let persistedReasoningEffort: typeof reasoningEffort | undefined;
+  if (supportsReasoningEffort && !reasoningEffortFieldPresent) {
+    try {
+      const raw = await readRawConfig(requireConfigPath());
+      const idx = findEntryIndex(raw, larkAppId);
+      persistedReasoningEffort = idx >= 0 ? raw[idx]?.reasoningEffort : undefined;
+    } catch {
+      // Cannot read the row the transaction will use, so this precondition cannot
+      // be decided here. Leave it to the in-transaction backstop, which reads the
+      // row under the write lock and whose rejection carries the close summary.
+      persistedReasoningEffort = undefined;
+    }
+  }
   const preflightReasoningEffort = supportsReasoningEffort
-    ? (reasoningEffortFieldPresent ? reasoningEffort ?? undefined : currentBotConfig.reasoningEffort)
+    ? (reasoningEffortFieldPresent ? reasoningEffort ?? undefined : persistedReasoningEffort)
     : undefined;
   if (preflightReasoningEffort
       && !codexModelSupportsReasoningEffort(model || undefined, preflightReasoningEffort)) {

@@ -2926,17 +2926,36 @@ describe('PUT /api/bot-agent', () => {
       expect(sol.status).toBe(200);
 
       // Simulate a stale in-memory snapshot while the locked bots.json entry
-      // already contains the newer ultra value. Validation must use the entry
-      // read inside rmwBotEntry, not this stale live config.
+      // already contains the newer ultra value. Validation must use the persisted
+      // row, not this stale live config.
       getBot(appId).config.reasoningEffort = 'xhigh';
 
-      const omittedEffort = await fetch(`http://127.0.0.1:${handle.port}/api/bot-agent`, {
-        method: 'PUT',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ cliId: 'ttadk-x-codex', model: 'gpt-5.4' }),
-      });
+      // BEHAVIOURAL assertion, not just the final status: a request that is simply
+      // invalid must be rejected BEFORE the irreversible agent-switch closes. The
+      // 400 below was already green while the close hook had in fact run once —
+      // sessions torn down for a request that never should have got that far.
+      let closeHookCalls = 0;
+      const originalCloseHook = agentSwitchCloseHook.run;
+      agentSwitchCloseHook.run = async (...args: Parameters<typeof originalCloseHook>) => {
+        closeHookCalls += 1;
+        return originalCloseHook(...args);
+      };
+      let omittedEffort: Response;
+      try {
+        omittedEffort = await fetch(`http://127.0.0.1:${handle.port}/api/bot-agent`, {
+          method: 'PUT',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ cliId: 'ttadk-x-codex', model: 'gpt-5.4' }),
+        });
+      } finally {
+        agentSwitchCloseHook.run = originalCloseHook;
+      }
       expect(omittedEffort.status).toBe(400);
       expect(await omittedEffort.json()).toMatchObject({ error: 'reasoning_effort_not_supported_by_model' });
+      expect(
+        closeHookCalls,
+        'live/disk drift must be rejected before any irreversible close',
+      ).toBe(0);
       expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0]).toMatchObject({
         model: 'gpt-5.6-sol',
         reasoningEffort: 'ultra',

@@ -53,14 +53,27 @@ describe('agent switch — no precondition runs after the irreversible close', (
     expect(preflight).toContain('return jsonRes(res, 400');
   });
 
-  it('evaluates the preflight against the value the transaction would fall back to', () => {
+  it('reads the SAME authority the transaction falls back to (disk, not memory)', () => {
+    // This assertion previously pinned `currentBotConfig.reasoningEffort` — i.e. it
+    // froze the bug into a contract, so the correct fix would have failed the guard.
     // The check is not a pure function of the request: with the field absent the
-    // transaction reads the persisted `entry.reasoningEffort`. The preflight has to
-    // consult the same persisted value or the two can disagree.
-    const preflightAt = ipc.indexOf('const preflightReasoningEffort =');
-    const preflight = ipc.slice(preflightAt, preflightAt + 400);
-    expect(preflight).toContain('reasoningEffortFieldPresent');
-    expect(preflight).toContain('currentBotConfig.reasoningEffort');
+    // transaction reads the persisted bots.json row. getBot().config is a separate
+    // in-memory snapshot that can ALREADY disagree with disk before the request
+    // arrives, so the preflight must read the row too.
+    const preflightAt = ipc.indexOf('let persistedReasoningEffort');
+    expect(preflightAt, 'preflight must resolve the persisted value').toBeGreaterThan(0);
+    const closeAt = ipc.indexOf('await agentSwitchCloseHook.run(');
+    const preflight = ipc.slice(preflightAt, closeAt);
+
+    // Same source as the transaction: the on-disk row.
+    expect(preflight).toContain('readRawConfig(requireConfigPath())');
+    expect(preflight).toContain('findEntryIndex(raw, larkAppId)');
+    expect(preflight).toContain('reasoningEffort');
+    // And explicitly NOT the live in-memory snapshot.
+    expect(
+      preflight,
+      'the absent-field fallback must not come from the live in-memory config',
+    ).not.toContain('currentBotConfig.reasoningEffort');
   });
 
   it('KEEPS the in-transaction check as a backstop', () => {
