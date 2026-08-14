@@ -59,9 +59,39 @@ export interface McpGatewayInstallSpec {
   readonly format: 'codex-toml' | 'claude-json';
 }
 
+export interface CandidateStartupContract {
+  readonly schemaVersion: 1;
+  readonly readyEvidence: 'runtime_ready';
+  readonly acceptEvidence: readonly ['cli_transcript', 'native_rpc'];
+  readonly responseEvidence: readonly ['cli_transcript_terminal', 'native_rpc_terminal'];
+  readonly incompatibleError: 'runtime_incompatible';
+  readonly readinessTimeoutMs: number;
+}
+
+/** One provider-independent contract for every Runtime allowed to host a
+ * managed Candidate. Declaring it is opt-in: the Candidate production path
+ * rejects adapters that cannot prove all three boundaries. */
+export const CANDIDATE_STARTUP_CONTRACT = Object.freeze({
+  schemaVersion: 1,
+  readyEvidence: 'runtime_ready',
+  acceptEvidence: ['cli_transcript', 'native_rpc'] as const,
+  responseEvidence: ['cli_transcript_terminal', 'native_rpc_terminal'] as const,
+  incompatibleError: 'runtime_incompatible',
+  readinessTimeoutMs: 15_000,
+} as const satisfies CandidateStartupContract);
+
 export interface CliAdapter {
   /** Unique identifier */
   readonly id: string;
+
+  /** Required by the managed Candidate production path. PTY writes are
+   * deliberately absent from the accepted evidence vocabulary. */
+  readonly candidateStartupContract?: CandidateStartupContract;
+
+  /** Candidate-only positive readiness marker. This must not match generic
+   * TUI cursors used by startup pickers; hook-backed adapters may omit it and
+   * provide the explicit SessionStart signal instead. */
+  readonly candidateReadyPattern?: RegExp;
 
   /** Declarative config target for the process-scoped Botmux MCP Gateway. */
   readonly mcpGateway?: McpGatewayInstallSpec;

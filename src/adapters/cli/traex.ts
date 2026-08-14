@@ -2,7 +2,7 @@ import { existsSync, statSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { resolveCommand } from './registry.js';
 import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
-import type { CliAdapter, PtyHandle } from './types.js';
+import { CANDIDATE_STARTUP_CONTRACT, type CliAdapter, type PtyHandle } from './types.js';
 import { traeStateDbPath, traeSessionsRoot } from '../../services/traex-paths.js';
 import { traexRolloutHasUserInputSince } from '../../services/traex-transcript.js';
 import { discoverRolloutSessions } from '../../services/resumable-session-discovery.js';
@@ -184,13 +184,14 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
   let cachedBin: string | undefined;
   return {
     id: 'traex',
+    candidateStartupContract: CANDIDATE_STARTUP_CONTRACT,
     // Whole ~/.trae/cli kept REAL: traex is codex-based and keeps the same SQLite
     // state/log DBs there (state_*.sqlite / logs_*.sqlite) — the sandbox home
     // overlay lacks the fcntl locks SQLite needs (same failure as codex.ts).
     authPaths: ['~/.trae/cli'],
     get resolvedBin(): string { return (cachedBin ??= resolveCommand(rawBin)); },
 
-    buildArgs({ sessionId, resume, resumeSessionId, workingDir, model, disableCliBypass, remoteWsUrl, remoteThreadId }) {
+    buildArgs({ sessionId, resume, resumeSessionId, workingDir, model, disableCliBypass, disabledFeatures, remoteWsUrl, remoteThreadId }) {
       // Hybrid RPC input mode (codex-family): attach the TUI to the botmux-owned
       // app-server thread; input flows via JSON-RPC (see codex-rpc-engine + worker)
       // instead of a drop-prone paste. TRAE CLI shares codex's --remote/resume
@@ -202,6 +203,7 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
         return ['--remote', remoteWsUrl, 'resume', '--no-alt-screen', '-c', 'check_for_update_on_startup=false', remoteThreadId];
       }
       const baseArgs = [
+        ...(disabledFeatures ?? []).flatMap(feature => ['--disable', feature]),
         ...(!disableCliBypass ? [
           '--dangerously-bypass-approvals-and-sandbox',
           // Supported TRAE baseline 0.200.16+ has a second interactive
@@ -274,8 +276,8 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
         const match = detectSubmittedThread(beforeSnap, content);
         if (match.found) {
           return match.cliSessionId
-            ? { submitted: true, cliSessionId: match.cliSessionId }
-            : { submitted: true };
+            ? { submitted: true, confirmation: 'transcript', cliSessionId: match.cliSessionId }
+            : { submitted: true, confirmation: 'transcript' };
         }
         await delay(800);
         if (!trySendEnter()) return { submitted: false };
@@ -283,8 +285,8 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
       const finalMatch = detectSubmittedThread(beforeSnap, content);
       if (finalMatch.found) {
         return finalMatch.cliSessionId
-          ? { submitted: true, cliSessionId: finalMatch.cliSessionId }
-          : { submitted: true };
+          ? { submitted: true, confirmation: 'transcript', cliSessionId: finalMatch.cliSessionId }
+          : { submitted: true, confirmation: 'transcript' };
       }
       const recheck = () => {
         const late = detectSubmittedThread(beforeSnap, content);
@@ -302,6 +304,7 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
     // exclude numbered selector rows; otherwise botmux flushes the first prompt
     // into the advisory instead of TRAE's real composer.
     readyPattern: /(?:^|[\n\r])\s*[›❯](?!\s*\d+\.)|\d+% left/,
+    candidateReadyPattern: /(?:Context\s+)?\d+%\s+left/i,
     systemHints: BOTMUX_SHELL_HINTS,
     // TRAE 0.200+ shares Codex's type-ahead behaviour: input submitted while
     // a turn is running is parked and merged into the active turn.

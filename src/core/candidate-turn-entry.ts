@@ -90,3 +90,36 @@ export async function settleCandidateTurnFromWorker(input: {
   }
   return receipt;
 }
+
+/** A dispatched Candidate turn with no native Runtime identity sits in the
+ * crash window between PTY submit and native transcript discovery. Its submit
+ * outcome is ambiguous, so replay is unsafe. Persist a terminal failure for
+ * the exact attempt instead of manufacturing another dispatch. */
+export async function settleCandidateTurnWithUnknownRuntimeIdentity(
+  receipt: CandidateTurnReceipt,
+  deps: CandidateTurnEntryDeps,
+): Promise<CandidateTurnReceipt> {
+  if (receipt.status !== 'accepted'
+    || receipt.dispatchAttempt < 1
+    || receipt.nativeSessionId) {
+    throw new Error('Candidate unknown-runtime recovery requires a dispatched accepted turn');
+  }
+  return settleCandidateTurnFromWorker({
+    candidateDispatchId: receipt.candidateDispatchId,
+    turnId: receipt.turnId,
+    dispatchAttempt: receipt.dispatchAttempt,
+    workerGeneration: receipt.workerGeneration,
+    status: 'failed',
+    evidence: {
+      kind: 'runtime_terminal',
+      nativeSessionId: `unresolved:${receipt.botmuxSessionId}`,
+      transcriptRef: [
+        'recovery',
+        receipt.candidateDispatchId,
+        receipt.turnId,
+        `attempt-${receipt.dispatchAttempt}`,
+        'native_session_unknown',
+      ].join(':'),
+    },
+  }, deps);
+}

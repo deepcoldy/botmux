@@ -2,7 +2,7 @@ import { existsSync, statSync, openSync, readSync, closeSync } from 'node:fs';
 import { join } from 'node:path';
 import { resolveCommand } from './registry.js';
 import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
-import type { CliAdapter, PtyHandle } from './types.js';
+import { CANDIDATE_STARTUP_CONTRACT, type CliAdapter, type PtyHandle } from './types.js';
 import { codexHistoryPath, codexHome, codexSessionsRoot } from '../../services/codex-paths.js';
 import { discoverRolloutSessions } from '../../services/resumable-session-discovery.js';
 import { delay, scaleMs } from '../../utils/timing.js';
@@ -125,6 +125,7 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
   let cachedBin: string | undefined;
   return {
     id: 'codex',
+    candidateStartupContract: CANDIDATE_STARTUP_CONTRACT,
     mcpGateway: {
       configPath: '~/.codex/config.toml',
       format: 'codex-toml',
@@ -308,6 +309,7 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
     // but reject numbered menu choices. This remains necessary for wrappers
     // such as Aiden that cannot forward the startup-update config override.
     readyPattern: /›(?!\s*\d+\.)|\d+% left/,
+    candidateReadyPattern: /(?:Context\s+)?\d+%\s+left/i,
     defaultPassthroughCommands: ['/goal'],
     buildSessionRenameCommand: (title) => `/rename ${title}`,
     systemHints: BOTMUX_SHELL_HINTS,

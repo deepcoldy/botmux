@@ -19,6 +19,7 @@ import { homedir, platform } from 'node:os';
 import { dirname, isAbsolute, join, normalize, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
+import type { CliId, PtyHandle } from '../adapters/cli/types.js';
 
 const SHA256 = /^[0-9a-f]{64}$/;
 const COMMIT = /^[0-9a-f]{40}$/;
@@ -34,6 +35,8 @@ export interface CandidateRuntimeContract {
   releaseId: string;
   releaseManifestSha256: string;
   runtimeBundleId: string;
+  runtimeName: CliId;
+  searchRcaCommit: string;
   botmuxCommit: string;
   botmuxArtifactSha256: string;
   workspaceSnapshot: {
@@ -73,6 +76,13 @@ export interface CandidateBotmuxBuildIdentity {
   artifactSha256: string;
 }
 
+/** Search RCA's frozen `coco` bundle is TRAE CLI Next (0.200.x). Keep the
+ * release-facing Runtime identity stable while selecting BotMux's rollout-
+ * backed TRAE adapter instead of the legacy Coco events.jsonl adapter. */
+export function candidateRuntimeCliId(runtimeName: CliId): CliId {
+  return runtimeName === 'coco' ? 'traex' : runtimeName;
+}
+
 interface CandidateBuildManifest {
   schemaVersion: 1;
   botmuxCommit: string;
@@ -89,6 +99,7 @@ export interface CandidateRuntimeAttestation {
   releaseId: string;
   releaseManifestSha256: string;
   runtimeBundleId: string;
+  searchRcaCommit: string;
   botmuxCommit: string;
   botmuxArtifactSha256: string;
   capabilityLockSha256: string;
@@ -98,11 +109,103 @@ export interface CandidateRuntimeAttestation {
   skills: { realpath: string; effectiveRoot: string; sha256: string };
   isolation: {
     home: string;
-    traeHome: string;
-    cocoCacheRoot: string;
+    runtimeName: CliId;
+    runtimeHome: string;
+    environment: Record<string, string>;
+    traeHome?: string;
+    cocoCacheRoot?: string;
     disabledFeatures: ['memories'];
   };
   createdAt: string;
+}
+
+export type CandidateRuntimeStartupStatus =
+  | 'starting'
+  | 'ready'
+  | 'accepted'
+  | 'responded'
+  | 'runtime_incompatible';
+
+export interface CandidateRuntimeStartupEvidence {
+  schemaVersion: 1;
+  status: CandidateRuntimeStartupStatus;
+  runtimeName: string;
+  sessionId: string;
+  workerGeneration: number;
+  phase: 'fresh' | 'resume';
+  candidateDispatchId: string;
+  releaseId: string;
+  releaseManifestSha256: string;
+  runtimeBundleId: string;
+  searchRcaCommit: string;
+  botmuxCommit: string;
+  botmuxArtifactSha256: string;
+  freshIsolatedEnvironment: boolean;
+  humanInteractionCount: number;
+  taskAcceptedByRuntime: boolean;
+  responseObserved: boolean;
+  transitions: Array<{
+    status: CandidateRuntimeStartupStatus;
+    occurredAt: string;
+    evidence?: Record<string, unknown>;
+  }>;
+  diagnostic?: { readinessTimeoutMs: number; terminalTail: string };
+  createdAt: string;
+  updatedAt: string;
+}
+
+type CandidateRuntimeReadyEvidence = {
+  kind: 'runtime_ready';
+  evidenceRef: string;
+};
+
+type CandidateRuntimeAcceptEvidence = {
+  kind: 'cli_transcript' | 'native_rpc';
+  nativeSessionId: string;
+  transcriptRef: string;
+};
+
+type CandidateRuntimeResponseEvidence = {
+  kind: 'cli_transcript_terminal' | 'native_rpc_terminal';
+  nativeSessionId: string;
+  transcriptRef: string;
+  output: string;
+};
+
+const STARTUP_DIAGNOSTIC_LIMIT = 64 * 1024;
+const KNOWN_TRUST_PROMPT = /Yes, I trust this folder|Yes, continue/;
+
+export function createCandidateRuntimeStartupInteractionHandler(): {
+  readonly humanInteractionCount: 0;
+  readonly automatedInteractionCount: number;
+  handle(output: string, pty: PtyHandle): boolean;
+} {
+  let trustHandled = false;
+  let automatedInteractionCount = 0;
+  return {
+    humanInteractionCount: 0,
+    get automatedInteractionCount() { return automatedInteractionCount; },
+    handle(output, pty) {
+      if (trustHandled) return false;
+      const plain = output.replace(/\x1b\[[0-9;?]*[a-zA-Z]/g, '');
+      if (!KNOWN_TRUST_PROMPT.test(plain)) return false;
+      trustHandled = true;
+      automatedInteractionCount += 1;
+      if (pty.sendSpecialKeys) pty.sendSpecialKeys('Enter');
+      else pty.write('\r');
+      return true;
+    },
+  };
+}
+
+export function candidateRuntimeReadyOutput(
+  adapter: { candidateReadyPattern?: RegExp },
+  output: string,
+): boolean {
+  if (!adapter.candidateReadyPattern || !output) return false;
+  const plain = output.replace(/\x1b\[[0-9;?]*[a-zA-Z]/g, '');
+  adapter.candidateReadyPattern.lastIndex = 0;
+  return adapter.candidateReadyPattern.test(plain);
 }
 
 function nonEmpty(value: unknown): value is string {
@@ -159,6 +262,8 @@ export function validateCandidateRuntimeContract(
     || !nonEmpty(contract.candidateDispatchId)
     || !nonEmpty(contract.releaseId)
     || !nonEmpty(contract.runtimeBundleId)
+    || !nonEmpty(contract.runtimeName)
+    || !COMMIT.test(contract.searchRcaCommit ?? '')
     || !COMMIT.test(contract.botmuxCommit ?? '')
     || !SHA256.test(contract.botmuxArtifactSha256 ?? '')
     || !nonEmpty(contract.skillsRoot)
@@ -251,6 +356,356 @@ function candidateRuntimeRoot(dataDir: string, sessionId: string): string {
   return join(dataDir, CANDIDATE_RUNTIME_DIR, sessionId);
 }
 
+export function candidateRuntimeStartupProbePath(
+  dataDir: string,
+  sessionId: string,
+  workerGeneration: number,
+  phase: 'fresh' | 'resume',
+): string {
+  return join(
+    candidateRuntimeRoot(dataDir, sessionId),
+    'startup-probes',
+    `${workerGeneration}-${phase}.json`,
+  );
+}
+
+class CandidateRuntimeStartupProbe {
+  readonly evidencePath: string;
+  private readonly readinessTimeoutMs: number;
+  private readonly onIncompatible?: (
+    evidence: CandidateRuntimeStartupEvidence & { status: 'runtime_incompatible' },
+  ) => void;
+  private readonly evidence: CandidateRuntimeStartupEvidence;
+  private readinessTimer: NodeJS.Timeout | undefined;
+  private terminalTail = '';
+  private acceptedNativeSessionId: string | undefined;
+
+  constructor(input: {
+    contract: CandidateRuntimeContract;
+    runtimeName: string;
+    sessionId: string;
+    workerGeneration: number;
+    phase: 'fresh' | 'resume';
+    isolatedHome: string;
+    dataDir: string;
+    readinessTimeoutMs?: number;
+    onIncompatible?: (
+      evidence: CandidateRuntimeStartupEvidence & { status: 'runtime_incompatible' },
+    ) => void;
+  }) {
+    const runtimeName = input.runtimeName.trim();
+    if (!runtimeName) throw new Error('Candidate startup probe requires runtimeName');
+    if (!Number.isSafeInteger(input.workerGeneration) || input.workerGeneration < 1) {
+      throw new Error('Candidate startup probe requires a worker generation');
+    }
+    this.readinessTimeoutMs = input.readinessTimeoutMs ?? 15_000;
+    if (!Number.isSafeInteger(this.readinessTimeoutMs) || this.readinessTimeoutMs < 1) {
+      throw new Error('Candidate startup probe readiness timeout is invalid');
+    }
+    const expectedHome = join(candidateRuntimeRoot(input.dataDir, input.sessionId), 'home');
+    if (realpathSync(input.isolatedHome) !== realpathSync(expectedHome)) {
+      throw new Error('Candidate startup probe HOME is not the isolated session HOME');
+    }
+    const now = new Date().toISOString();
+    this.evidencePath = candidateRuntimeStartupProbePath(
+      input.dataDir,
+      input.sessionId,
+      input.workerGeneration,
+      input.phase,
+    );
+    this.onIncompatible = input.onIncompatible;
+    this.evidence = {
+      schemaVersion: 1,
+      status: 'starting',
+      runtimeName,
+      sessionId: input.sessionId,
+      workerGeneration: input.workerGeneration,
+      phase: input.phase,
+      candidateDispatchId: input.contract.candidateDispatchId,
+      releaseId: input.contract.releaseId,
+      releaseManifestSha256: input.contract.releaseManifestSha256,
+      runtimeBundleId: input.contract.runtimeBundleId,
+      searchRcaCommit: input.contract.searchRcaCommit,
+      botmuxCommit: input.contract.botmuxCommit,
+      botmuxArtifactSha256: input.contract.botmuxArtifactSha256,
+      freshIsolatedEnvironment: input.phase === 'fresh',
+      humanInteractionCount: 0,
+      taskAcceptedByRuntime: false,
+      responseObserved: false,
+      transitions: [{ status: 'starting', occurredAt: now }],
+      createdAt: now,
+      updatedAt: now,
+    };
+    this.persist();
+    this.readinessTimer = setTimeout(() => this.failIncompatible(), this.readinessTimeoutMs);
+    this.readinessTimer.unref?.();
+  }
+
+  observeTerminalOutput(output: string): void {
+    if (!['starting', 'ready'].includes(this.evidence.status) || !output) return;
+    this.terminalTail = `${this.terminalTail}${output}`.slice(-STARTUP_DIAGNOSTIC_LIMIT);
+  }
+
+  recordHumanInteraction(): void {
+    if (this.evidence.status === 'responded' || this.evidence.status === 'runtime_incompatible') return;
+    this.evidence.humanInteractionCount += 1;
+    this.evidence.updatedAt = new Date().toISOString();
+    this.persist();
+  }
+
+  markReady(evidence: CandidateRuntimeReadyEvidence): void {
+    if (this.evidence.status !== 'starting') {
+      throw new Error(`Candidate Runtime ready transition is invalid from ${this.evidence.status}`);
+    }
+    if (evidence.kind !== 'runtime_ready' || !nonEmpty(evidence.evidenceRef)) {
+      throw new Error('Candidate Runtime ready evidence is invalid');
+    }
+    this.transition('ready', evidence);
+    this.armIncompatibleTimer();
+  }
+
+  markAccepted(evidence: CandidateRuntimeAcceptEvidence | Record<string, unknown>): void {
+    if (this.evidence.status !== 'ready') {
+      throw new Error(`Candidate Runtime accepted transition is invalid from ${this.evidence.status}`);
+    }
+    if (!['cli_transcript', 'native_rpc'].includes(String(evidence.kind))
+      || !nonEmpty(evidence.nativeSessionId) || !nonEmpty(evidence.transcriptRef)) {
+      throw new Error('Candidate Runtime acceptance evidence must be a durable transcript or native RPC');
+    }
+    this.acceptedNativeSessionId = evidence.nativeSessionId;
+    this.evidence.taskAcceptedByRuntime = true;
+    this.clearReadinessTimer();
+    this.transition('accepted', evidence);
+  }
+
+  markResponse(evidence: CandidateRuntimeResponseEvidence | Record<string, unknown>): void {
+    if (this.evidence.status !== 'accepted') {
+      throw new Error(`Candidate Runtime response transition is invalid from ${this.evidence.status}`);
+    }
+    if (!['cli_transcript_terminal', 'native_rpc_terminal'].includes(String(evidence.kind))
+      || !nonEmpty(evidence.nativeSessionId) || !nonEmpty(evidence.transcriptRef)
+      || !nonEmpty(evidence.output)
+      || evidence.nativeSessionId !== this.acceptedNativeSessionId) {
+      throw new Error('Candidate Runtime response evidence is invalid');
+    }
+    this.evidence.responseObserved = true;
+    this.transition('responded', evidence);
+  }
+
+  dispose(): void {
+    this.clearReadinessTimer();
+  }
+
+  private transition(status: CandidateRuntimeStartupStatus, evidence: Record<string, unknown>): void {
+    const now = new Date().toISOString();
+    this.evidence.status = status;
+    this.evidence.updatedAt = now;
+    this.evidence.transitions.push({ status, occurredAt: now, evidence: structuredClone(evidence) });
+    this.persist();
+  }
+
+  private clearReadinessTimer(): void {
+    if (this.readinessTimer) clearTimeout(this.readinessTimer);
+    this.readinessTimer = undefined;
+  }
+
+  private armIncompatibleTimer(): void {
+    this.clearReadinessTimer();
+    this.readinessTimer = setTimeout(() => this.failIncompatible(), this.readinessTimeoutMs);
+    this.readinessTimer.unref?.();
+  }
+
+  private failIncompatible(): void {
+    if (!['starting', 'ready'].includes(this.evidence.status)) return;
+    this.readinessTimer = undefined;
+    const now = new Date().toISOString();
+    this.evidence.status = 'runtime_incompatible';
+    this.evidence.updatedAt = now;
+    this.evidence.diagnostic = {
+      readinessTimeoutMs: this.readinessTimeoutMs,
+      terminalTail: this.terminalTail,
+    };
+    this.evidence.transitions.push({
+      status: 'runtime_incompatible',
+      occurredAt: now,
+      evidence: {
+        errorCode: 'runtime_incompatible',
+        readinessTimeoutMs: this.readinessTimeoutMs,
+      },
+    });
+    this.persist();
+    this.onIncompatible?.(structuredClone(
+      this.evidence as CandidateRuntimeStartupEvidence & { status: 'runtime_incompatible' },
+    ));
+  }
+
+  private persist(): void {
+    mkdirSync(dirname(this.evidencePath), { recursive: true });
+    atomicWriteFileSync(this.evidencePath, `${JSON.stringify(this.evidence, null, 2)}\n`, { mode: 0o600 });
+    syncPath(this.evidencePath);
+    syncPath(dirname(this.evidencePath));
+  }
+}
+
+export function createCandidateRuntimeStartupProbe(
+  input: ConstructorParameters<typeof CandidateRuntimeStartupProbe>[0],
+): CandidateRuntimeStartupProbe {
+  return new CandidateRuntimeStartupProbe(input);
+}
+
+export type CandidateRuntimeStartupCoordinatorInput =
+  ConstructorParameters<typeof CandidateRuntimeStartupProbe>[0] & {
+  turnId?: string;
+  dispatchAttempt?: number;
+  log?: (message: string) => void;
+};
+
+export interface CandidateRuntimeStartupSubmitted {
+  turnId: string;
+  dispatchAttempt?: number;
+  kind: 'cli_transcript' | 'native_rpc';
+  nativeSessionId: string;
+  transcriptRef: string;
+}
+
+export interface CandidateRuntimeStartupTerminal {
+  turnId: string;
+  dispatchAttempt?: number;
+  status: 'completed' | 'failed' | 'ambiguous' | 'cancelled';
+  evidence?: { nativeSessionId: string; transcriptRef: string };
+  responseOutput?: string;
+}
+
+/** Production coordinator for the Candidate startup proof. It deliberately
+ * treats proof-state drift as diagnostic-only: turn IPC is authoritative and
+ * must never be suppressed because a duplicate/redelivered transition reached
+ * this auxiliary evidence state machine. */
+export function createCandidateRuntimeStartupCoordinator(
+  input: CandidateRuntimeStartupCoordinatorInput,
+): {
+  readonly evidencePath: string;
+  readonly humanInteractionCount: number;
+  readonly automatedInteractionCount: number;
+  observeTerminalOutput(output: string): void;
+  handleTerminalOutput(
+    output: string,
+    adapter: { id?: string; candidateReadyPattern?: RegExp },
+    pty: PtyHandle,
+  ): boolean;
+  markPromptReady(adapterId: string, evidenceRef?: string): boolean;
+  recordSubmitted(submission: CandidateRuntimeStartupSubmitted): void;
+  recordFinalOutput(output: { turnId: string; dispatchAttempt?: number; content: string }): void;
+  recordTerminal(terminal: CandidateRuntimeStartupTerminal): void;
+  recordHumanInteraction(): void;
+  dispose(): void;
+} {
+  const probe = createCandidateRuntimeStartupProbe(input);
+  const interactions = createCandidateRuntimeStartupInteractionHandler();
+  const log = input.log ?? (() => undefined);
+  const startupTurnId = input.turnId;
+  const startupAttempt = input.dispatchAttempt;
+  let retired = false;
+  let ready = false;
+  let finalOutput: string | undefined;
+  let humanInteractionCount = 0;
+
+  const sameStartupTurn = (turnId: string, dispatchAttempt?: number): boolean => (
+    !retired
+    && (!startupTurnId || turnId === startupTurnId)
+    && (startupAttempt === undefined || dispatchAttempt === startupAttempt)
+  );
+  const ignored = (transition: string, reason: string): void => {
+    log(`Candidate Runtime startup ${transition} ignored: ${reason}`);
+  };
+  const safely = (transition: string, action: () => void): boolean => {
+    try {
+      action();
+      return true;
+    } catch (error) {
+      ignored(transition, error instanceof Error ? error.message : String(error));
+      return false;
+    }
+  };
+  const markReady = (adapterId: string, evidenceRef: string): boolean => {
+    if (retired) return false;
+    if (ready) return true;
+    ready = safely('ready', () => probe.markReady({
+      kind: 'runtime_ready',
+      evidenceRef: evidenceRef || `adapter:${adapterId || 'unknown'}:runtime-ready`,
+    }));
+    return ready;
+  };
+
+  return {
+    evidencePath: probe.evidencePath,
+    get humanInteractionCount() { return humanInteractionCount; },
+    get automatedInteractionCount() { return interactions.automatedInteractionCount; },
+    observeTerminalOutput(output) {
+      if (!retired) probe.observeTerminalOutput(output);
+    },
+    handleTerminalOutput(output, adapter, pty) {
+      if (retired) return false;
+      probe.observeTerminalOutput(output);
+      if (interactions.handle(output, pty)) return true;
+      if (candidateRuntimeReadyOutput(adapter, output)) {
+        markReady(
+          adapter.id ?? 'unknown',
+          `adapter:${adapter.id ?? 'unknown'}:candidate-ready-pattern`,
+        );
+      }
+      return false;
+    },
+    markPromptReady(adapterId, evidenceRef) {
+      if (evidenceRef) return markReady(adapterId, evidenceRef);
+      if (!ready) ignored('ready', `adapter=${adapterId} has no Candidate readiness evidence`);
+      return ready;
+    },
+    recordSubmitted(submission) {
+      if (!sameStartupTurn(submission.turnId, submission.dispatchAttempt)) {
+        ignored('accepted', `turn=${submission.turnId} attempt=${submission.dispatchAttempt ?? '-'}`);
+        return;
+      }
+      safely('accepted', () => probe.markAccepted({
+        kind: submission.kind,
+        nativeSessionId: submission.nativeSessionId,
+        transcriptRef: submission.transcriptRef,
+      }));
+    },
+    recordFinalOutput(output) {
+      if (!sameStartupTurn(output.turnId, output.dispatchAttempt) || !nonEmpty(output.content)) return;
+      finalOutput = output.content;
+    },
+    recordTerminal(terminal) {
+      if (!sameStartupTurn(terminal.turnId, terminal.dispatchAttempt)) {
+        ignored('response', `turn=${terminal.turnId} attempt=${terminal.dispatchAttempt ?? '-'}`);
+        return;
+      }
+      const output = terminal.responseOutput ?? finalOutput;
+      if (terminal.status === 'completed' && terminal.evidence && nonEmpty(output)) {
+        safely('response', () => probe.markResponse({
+          kind: 'cli_transcript_terminal',
+          nativeSessionId: terminal.evidence!.nativeSessionId,
+          transcriptRef: terminal.evidence!.transcriptRef,
+          output,
+        }));
+      } else {
+        ignored('response', `terminal=${terminal.status} evidence=${Boolean(terminal.evidence)} output=${Boolean(output)}`);
+      }
+      retired = true;
+      probe.dispose();
+    },
+    recordHumanInteraction() {
+      if (retired) return;
+      humanInteractionCount += 1;
+      probe.recordHumanInteraction();
+    },
+    dispose() {
+      retired = true;
+      probe.dispose();
+    },
+  };
+}
+
 function linkReleaseSkills(sourceRoot: string, effectiveRoot: string): void {
   mkdirSync(effectiveRoot, { recursive: true });
   for (const entry of readdirSync(sourceRoot, { withFileTypes: true })) {
@@ -289,6 +744,12 @@ export function prepareCandidateCocoHome(input: {
   const traeHome = join(home, '.trae');
   const effectiveSkillsRoot = join(traeHome, 'skills');
   mkdirSync(join(traeHome, 'cli'), { recursive: true, mode: 0o700 });
+  const migrationSkipMarker = join(traeHome, '.coco-migration-skip-all');
+  if (existsSync(migrationSkipMarker) && !lstatSync(migrationSkipMarker).isFile()) {
+    throw new Error(`Candidate Coco migration marker conflicts at ${migrationSkipMarker}`);
+  }
+  // Candidate isolation forbids importing ambient legacy CLI data.
+  atomicWriteFileSync(migrationSkipMarker, '', { mode: 0o600 });
   linkReleaseSkills(sourceSkills, effectiveSkillsRoot);
 
   // Coco authentication is the sole imported host state. Memory, Skills and
@@ -326,6 +787,59 @@ export function prepareCandidateCocoHome(input: {
     traeHome,
     skillsRoot: effectiveSkillsRoot,
     cocoCacheRoot,
+  };
+}
+
+export function prepareCandidateRuntimeHome(input: {
+  contract: CandidateRuntimeContract;
+  dataDir: string;
+  sessionId: string;
+  authFile?: string;
+  cocoCacheRoot?: string;
+}, botmuxIdentity: CandidateBotmuxIdentityOptions = {}): {
+  home: string;
+  runtimeHome: string;
+  skillsRoot: string;
+  env: Record<string, string>;
+  traeHome?: string;
+  cocoCacheRoot?: string;
+} {
+  if (input.contract.runtimeName === 'coco' || input.contract.runtimeName === 'traex') {
+    const coco = prepareCandidateCocoHome(input, botmuxIdentity);
+    return {
+      ...coco,
+      runtimeHome: coco.traeHome,
+      env: { HOME: coco.home, TRAE_HOME: coco.traeHome },
+    };
+  }
+  if (!['codex', 'claude-code'].includes(input.contract.runtimeName)) {
+    throw new Error(`Candidate Runtime ${input.contract.runtimeName} lacks isolated HOME preparation`);
+  }
+  assertCandidateRuntimeArtifacts(input.contract, botmuxIdentity);
+  const home = join(candidateRuntimeRoot(input.dataDir, input.sessionId), 'home');
+  const runtimeDirName = input.contract.runtimeName === 'codex' ? '.codex' : '.claude';
+  const runtimeHome = join(home, runtimeDirName);
+  const skillsRoot = join(runtimeHome, 'skills');
+  mkdirSync(runtimeHome, { recursive: true, mode: 0o700 });
+  linkReleaseSkills(input.contract.skillsRoot, skillsRoot);
+  const defaultAuthFile = input.contract.runtimeName === 'codex'
+    ? join(homedir(), '.codex', 'auth.json')
+    : join(homedir(), '.claude', '.credentials.json');
+  const authFile = input.authFile ?? defaultAuthFile;
+  if (existsSync(authFile)) {
+    const target = join(runtimeHome, input.contract.runtimeName === 'codex'
+      ? 'auth.json'
+      : '.credentials.json');
+    copyFileSync(authFile, target);
+    chmodSync(target, 0o600);
+  }
+  return {
+    home,
+    runtimeHome,
+    skillsRoot,
+    env: input.contract.runtimeName === 'codex'
+      ? { HOME: home, CODEX_HOME: runtimeHome }
+      : { HOME: home, CLAUDE_CONFIG_DIR: runtimeHome },
   };
 }
 
@@ -513,20 +1027,22 @@ export function attestCandidateRuntimeSpawn(input: {
   if (skillsSha256 !== input.contract.skillsSha256) {
     throw new Error('Candidate Skills digest mismatch');
   }
-  const expectedRuntime = prepareCandidateCocoHome({
+  const expectedRuntime = prepareCandidateRuntimeHome({
     contract: input.contract,
     dataDir: input.dataDir,
     sessionId: input.sessionId,
     authFile: input.authFile,
     cocoCacheRoot: input.cocoCacheRoot,
   }, { observeBotmuxIdentity: () => observedBotmux });
-  if (input.env.HOME !== expectedRuntime.home || input.env.TRAE_HOME !== expectedRuntime.traeHome) {
+  if (Object.entries(expectedRuntime.env).some(([key, value]) => input.env[key] !== value)) {
     throw new Error('Candidate HOME isolation mismatch');
   }
-  const disableAt = input.args.findIndex((arg, index) => (
-    arg === '--disable' && input.args[index + 1] === 'memories'
-  ));
-  if (disableAt < 0) throw new Error('Candidate runtime did not disable memories');
+  if (input.contract.runtimeName === 'coco' || input.contract.runtimeName === 'traex') {
+    const disableAt = input.args.findIndex((arg, index) => (
+      arg === '--disable' && input.args[index + 1] === 'memories'
+    ));
+    if (disableAt < 0) throw new Error('Candidate runtime did not disable memories');
+  }
   if (!Number.isSafeInteger(input.workerGeneration) || input.workerGeneration < 1) {
     throw new Error('Candidate worker generation is invalid');
   }
@@ -540,6 +1056,7 @@ export function attestCandidateRuntimeSpawn(input: {
     releaseId: input.contract.releaseId,
     releaseManifestSha256: input.contract.releaseManifestSha256,
     runtimeBundleId: input.contract.runtimeBundleId,
+    searchRcaCommit: input.contract.searchRcaCommit,
     botmuxCommit: observedBotmux.commit,
     botmuxArtifactSha256: observedBotmux.artifactSha256,
     capabilityLockSha256: input.contract.capabilityLockSha256,
@@ -553,8 +1070,11 @@ export function attestCandidateRuntimeSpawn(input: {
     },
     isolation: {
       home: expectedRuntime.home,
-      traeHome: expectedRuntime.traeHome,
-      cocoCacheRoot: expectedRuntime.cocoCacheRoot,
+      runtimeName: input.contract.runtimeName,
+      runtimeHome: expectedRuntime.runtimeHome,
+      environment: expectedRuntime.env,
+      ...(expectedRuntime.traeHome ? { traeHome: expectedRuntime.traeHome } : {}),
+      ...(expectedRuntime.cocoCacheRoot ? { cocoCacheRoot: expectedRuntime.cocoCacheRoot } : {}),
       disabledFeatures: ['memories'],
     },
     createdAt: new Date().toISOString(),

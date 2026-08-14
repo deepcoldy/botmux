@@ -5,7 +5,7 @@ import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
 import { cocoCacheRoot } from '../../services/coco-paths.js';
 import { delay, scaleMs } from '../../utils/timing.js';
 import { installCocoAskPlugin } from '../coco-ask-plugin.js';
-import type { CliAdapter, PtyHandle } from './types.js';
+import { CANDIDATE_STARTUP_CONTRACT, type CliAdapter, type PtyHandle } from './types.js';
 
 /** Global submit log — CoCo appends one JSON line here on every successful
  *  user submit across all sessions (mode:"user"). Format observed:
@@ -119,6 +119,7 @@ export function createCocoAdapter(pathOverride?: string): CliAdapter {
   let cachedBin: string | undefined;
   return {
     id: 'coco',
+    candidateStartupContract: CANDIDATE_STARTUP_CONTRACT,
     // ~/.trae/cli kept REAL (shared with traex): login + shared Trae state incl.
     // the codex-style SQLite DBs (fcntl locks don't work on the overlay home).
     // ~/.cache/coco kept REAL too: the transcript bridge reads events.jsonl at
@@ -266,7 +267,12 @@ export function createCocoAdapter(pathOverride?: string): CliAdapter {
     // so the status bar shows just the model badge `⬡ <model>` instead. Match
     // either — without this, idle detection never fires for adopt mode and the
     // transcript bridge never drains.
-    readyPattern: /⏵⏵|⬡/,
+    // Current Coco builds render the Codex-style status line (`Context 100%
+    // left`) while older Trae builds use ⏵⏵ / ⬡. Do not match the generic ❯
+    // cursor: startup pickers also use it and must instead hit the Candidate
+    // runtime_incompatible timeout unless explicitly handled.
+    readyPattern: /⏵⏵|⬡|Context \d+% left/,
+    candidateReadyPattern: /⏵⏵|⬡|Context\s+\d+%\s+left/i,
     systemHints: BOTMUX_SHELL_HINTS,
     // CoCo 0.120.32+ accepts a new message while the current turn is still
     // running: it parks it in the TUI's own queue ("↑ Press up to edit queued

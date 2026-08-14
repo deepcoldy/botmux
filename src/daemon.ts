@@ -31,6 +31,7 @@ import { resolveCandidateFeishuConversation } from './core/candidate-feishu-conv
 import {
   acceptCandidateTurnFromDaemon,
   settleCandidateTurnFromWorker,
+  settleCandidateTurnWithUnknownRuntimeIdentity,
   submitCandidateTurnFromWorker,
   type CandidateTurnEntryDeps,
 } from './core/candidate-turn-entry.js';
@@ -40,7 +41,7 @@ import {
   type CandidateTurnDispatch,
   type CandidateTurnReceipt,
 } from './services/candidate-turn-durability.js';
-import { reconcileCandidateCocoTranscript } from './services/candidate-turn-transcript.js';
+import { reconcileCandidateRuntimeTranscript } from './services/candidate-turn-transcript.js';
 import { deliverCandidateTurnReceiptHistory } from './services/rca-shadow-mirror.js';
 import { CandidateTurnReceiptReporter } from './services/candidate-turn-reporter.js';
 import { statSync } from 'node:fs';
@@ -577,8 +578,27 @@ async function recoverCandidateTurn(ds: DaemonSession, original: CandidateTurnRe
     ?? (ds.session.candidateRuntimeContract && ds.session.cliId === 'coco'
       ? ds.session.sessionId
       : undefined);
+  if (!nativeSessionId
+    && receipt.status === 'accepted'
+    && receipt.dispatchAttempt > 0
+    && ds.session.candidateRuntimeContract) {
+    await settleCandidateTurnWithUnknownRuntimeIdentity(
+      receipt,
+      candidateTurnEntryDeps(ds, (ds.workerGeneration ?? receipt.workerGeneration) + 1),
+    );
+    clearCandidateTurnRecoveryTimer(receipt);
+    return;
+  }
   if (nativeSessionId) {
-    const transcript = reconcileCandidateCocoTranscript(receipt, nativeSessionId);
+    const runtimeName = ds.session.candidateRuntimeContract?.runtimeName;
+    const transcript = runtimeName
+      ? reconcileCandidateRuntimeTranscript(receipt, {
+          runtimeName,
+          nativeSessionId,
+          dataDir: config.session.dataDir,
+          botmuxSessionId: receipt.botmuxSessionId,
+        })
+      : { kind: 'not_found' as const };
     if (transcript.kind !== 'not_found' && receipt.status === 'accepted') {
       receipt = await submitCandidateTurnFromWorker({
         candidateDispatchId: receipt.candidateDispatchId,

@@ -71,6 +71,7 @@ import { emitSessionLifecycleHook, emitSessionStateTransitionHook } from '../ser
 import { anchorUsageForDaemonSession, recordOwnershipForDaemonSession, recordUsageForDaemonSession, reconcileUsageForDaemonSession } from '../services/usage-ledger.js';
 import type { CliId } from '../adapters/cli/types.js';
 import { isStructuredBridgeAdoptCli } from '../services/structured-bridge-clis.js';
+import { candidateRuntimeCliId } from '../services/candidate-runtime-contract.js';
 import { resolveEffectivePluginIds } from './plugins/effective.js';
 import { ensureGatewayEntry } from './plugins/mcp/gateway-installer.js';
 import type { CliTurnPayload, CodexAppTurnInput, DaemonToWorker, WorkerToDaemon, Session, DisplayMode } from '../types.js';
@@ -458,14 +459,19 @@ export function sessionAgentConfig(
 ): { cliId: CliId; cliPathOverride?: string; wrapperCli?: string; model?: string } {
   const candidate = ds.session.candidateRuntimeContract;
   if (candidate) {
-    if (ds.session.cliId !== 'coco'
+    const runtimeName = candidateRuntimeCliId(candidate.runtimeName);
+    const runtimeAdapter = createCliAdapterSync(runtimeName, candidate.executable.realpath);
+    if (!runtimeAdapter.candidateStartupContract) {
+      throw new Error(`Candidate Runtime adapter ${runtimeName} lacks the unattended startup contract`);
+    }
+    if (ds.session.cliId !== runtimeName
       || ds.session.cliPathOverride !== candidate.executable.realpath
       || ds.session.wrapperCli
       || ds.session.workingDir !== candidate.workspaceSnapshot.realpath) {
       throw new Error('Candidate Session launch fields conflict with its frozen runtime contract');
     }
     return {
-      cliId: 'coco',
+      cliId: runtimeName,
       cliPathOverride: candidate.executable.realpath,
       model: candidate.model,
     };

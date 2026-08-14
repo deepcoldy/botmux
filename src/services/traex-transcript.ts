@@ -220,8 +220,10 @@ export function findTraexRolloutByPid(pid: number): { path: string; cliSessionId
 /** Locate the rollout file for a given TRAE session UUID. Filename shape is
  *  identical to Codex: `rollout-<ts>-<sid>.jsonl`, so a suffix match over the
  *  TRAE sessions tree is unambiguous. */
-export function findTraexRolloutBySessionId(cliSessionId: string): string | undefined {
-  const sessionsRoot = traeSessionsRoot();
+export function findTraexRolloutBySessionId(
+  cliSessionId: string,
+  sessionsRoot = traeSessionsRoot(),
+): string | undefined {
   if (!cliSessionId || !existsSync(sessionsRoot)) return undefined;
   const suffix = `-${cliSessionId}.jsonl`;
   const stack: string[] = [sessionsRoot];

@@ -3,7 +3,12 @@ import { homedir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 import { resolveCommand } from './registry.js';
 import { sessionReadyHookCommand } from '../hook-command.js';
-import type { CliAdapter, CliId, PtyHandle } from './types.js';
+import {
+  CANDIDATE_STARTUP_CONTRACT,
+  type CliAdapter,
+  type CliId,
+  type PtyHandle,
+} from './types.js';
 import { findJsonlContainingFingerprint, jsonlContainsFingerprint, normaliseForFingerprint } from '../../services/claude-transcript.js';
 import { GOAL_ENV } from '../../workflows/v3/contract.js';
 import { buildBotmuxSystemPromptText } from './shared-hints.js';
@@ -533,6 +538,9 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
   let cachedBin: string | undefined;
   return {
     id: variant.id,
+    ...(variant.id === 'claude-code'
+      ? { candidateStartupContract: CANDIDATE_STARTUP_CONTRACT }
+      : {}),
     mcpGateway: {
       configPath: variant.stateJsonPath,
       format: 'claude-json',

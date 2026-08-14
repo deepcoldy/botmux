@@ -101,10 +101,14 @@ import { CodexBridgeQueue } from './services/codex-bridge-queue.js';
 import { drainCodexRollout, findCodexRolloutBySessionId, findCodexRolloutByPid, splitCodexEventsByCutoff, extractLastCodexTurn, codexSessionIdFromRolloutPath, type CodexBridgeEvent } from './services/codex-transcript.js';
 import { drainTraexRollout, findTraexRolloutBySessionId, findTraexRolloutByPid } from './services/traex-transcript.js';
 import { cocoEventsPathForSession, drainCocoEvents, findCocoSessionByPid } from './services/coco-transcript.js';
-import { candidateCocoTranscriptEvidence } from './services/candidate-turn-transcript.js';
+import {
+  candidateCocoTranscriptEvidence,
+  candidateRuntimeSubmissionEvidence,
+} from './services/candidate-turn-transcript.js';
 import {
   attestCandidateRuntimeSpawn,
-  prepareCandidateCocoHome,
+  createCandidateRuntimeStartupCoordinator,
+  prepareCandidateRuntimeHome,
 } from './services/candidate-runtime-contract.js';
 import { currentHermesStateOffset, drainHermesStateDb, resolveHermesStateDbPath } from './services/hermes-transcript.js';
 import { filterHermesEventsForBotmuxSession } from './services/hermes-session-filter.js';
@@ -852,6 +856,7 @@ const reportedDeferredTopicRoots = new Set<string>();
 const CLI_DISPLAY_NAMES: Record<string, string> = { 'claude-code': 'Claude', seed: 'Seed', relay: 'Relay', aiden: 'Aiden', coco: 'CoCo', codex: 'Codex', 'codex-app': 'Codex App', cursor: 'Cursor', gemini: 'Gemini', genius: 'Genius', opencode: 'OpenCode', antigravity: 'Antigravity', mtr: 'MTR', hermes: 'Hermes', mira: 'Mira', mir: 'Mir CLI', traex: 'TRAE', pi: 'Pi', copilot: 'Copilot', 'oh-my-pi': 'Oh My Pi', kimi: 'Kimi', grok: 'Grok Build', 'kiro-cli': 'Kiro', riff: 'Riff' };
 function cliName(): string { return CLI_DISPLAY_NAMES[lastInitConfig?.cliId ?? ''] ?? 'CLI'; }
 let isPromptReady = false;
+let candidateRuntimeStartupCoordinator: ReturnType<typeof createCandidateRuntimeStartupCoordinator> | null = null;
 /** Mutex for async flushPending — prevents concurrent flush loops. */
 let isFlushing = false;
 /** True from the moment an owned CLI restart begins until the replacement
@@ -2749,7 +2754,14 @@ function emitReadyTurns(opts: { explicitTerminalOnly?: boolean } = {}): void {
   // after the model used `botmux send`. Completion is not optional. Emit it
   // only after all corresponding final_output IPC messages have been queued so
   // the daemon observes a stable per-turn ordering.
-  for (const turn of ready) emitTurnTerminal(turn.turnId, 'completed', undefined, turn.dispatchAttempt);
+  for (const turn of ready) {
+    const path = turn.sourceJsonlPath ?? bridgeJsonlPath;
+    const drained = path ? cache.get(path) : undefined;
+    const responseOutput = drained
+      ? trailingAssistantText(drained.events, turn.assistantUuids)
+      : undefined;
+    emitTurnTerminal(turn.turnId, 'completed', undefined, turn.dispatchAttempt, undefined, responseOutput);
+  }
 }
 
 /** Drain `path` from `fromOffset` and feed the events to the bridge queue
@@ -3394,6 +3406,8 @@ function emitReadyCodexTurns(): void {
       turn.terminalStatus ?? 'completed',
       turn.terminalErrorCode,
       turn.dispatchAttempt,
+      undefined,
+      turn.finalText,
     );
   }
 }
@@ -4488,6 +4502,11 @@ function onPtyData(data: string): void {
   // row; never let its selection marker reach the first-prompt idle detector.
   if (dismissAidenCodexUpdateDialog(data)) return;
 
+  // Candidate runtimes automate only this shared, audited startup interaction.
+  // Anything else remains on screen and the short startup probe fails it as
+  // runtime_incompatible with a persisted terminal tail.
+  if (candidateRuntimeStartupCoordinator?.handleTerminalOutput(data, cliAdapter ?? {}, backend!)) return;
+
   // Trust dialog auto-accept
   if (!trustHandled) {
     const stripped = data.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '');
@@ -4531,6 +4550,11 @@ function markPromptReady(): void {
   if (isSettlingFirstFlush) {
     promptReadyDetectedDuringSettle = true;
     log('Idle detected during ready-gate settle; deferring prompt-ready until settle completes');
+    return;
+  }
+  if (candidateRuntimeStartupCoordinator
+    && !candidateRuntimeStartupCoordinator.markPromptReady(cliAdapter?.id ?? 'unknown')) {
+    log('Candidate prompt-ready ignored until adapter-safe Runtime readiness evidence arrives');
     return;
   }
   isPromptReady = true;
@@ -6462,17 +6486,26 @@ async function spawnCli(
     if (claudeDataDir) childEnv.CLAUDE_CONFIG_DIR = claudeDataDir; // = <BOT_HOME>/claude
     else childEnv.CODEX_HOME = isolatedCodexHome!;
   }
+  let candidateRuntimeEnv: Record<string, string> | undefined;
+  let candidateRuntimeHome: string | undefined;
   if (cfg.candidateRuntimeContract) {
     if (!process.env.SESSION_DATA_DIR) {
       throw new Error('Candidate runtime requires SESSION_DATA_DIR');
     }
-    const runtimeHome = prepareCandidateCocoHome({
+    const runtimeHome = prepareCandidateRuntimeHome({
       contract: cfg.candidateRuntimeContract,
       dataDir: process.env.SESSION_DATA_DIR,
       sessionId: cfg.sessionId,
     });
-    childEnv.HOME = runtimeHome.home;
-    childEnv.TRAE_HOME = runtimeHome.traeHome;
+    candidateRuntimeEnv = runtimeHome.env;
+    candidateRuntimeHome = runtimeHome.home;
+    Object.assign(childEnv, candidateRuntimeEnv);
+    // Candidate workers are session-dedicated. Transcript/SQLite resolvers run
+    // in this Node process (not the CLI child), so they must resolve the same
+    // isolated Runtime home that the child writes.
+    for (const [key, value] of Object.entries(candidateRuntimeEnv)) {
+      if (key !== 'HOME') process.env[key] = value;
+    }
   }
 
   // Per-bot env (bots.json `env`): extra vars for THIS bot's CLI only — e.g.
@@ -6482,10 +6515,7 @@ async function spawnCli(
   // `/usr/bin/env` prefix and never into the shared backing-server global env,
   // keeping it from leaking across bots. Re-sanitized here (crossed IPC).
   const perBotInjectEnv = sanitizePerBotEnv(cfg.env);
-  if (cfg.candidateRuntimeContract) {
-    perBotInjectEnv.HOME = childEnv.HOME!;
-    perBotInjectEnv.TRAE_HOME = childEnv.TRAE_HOME!;
-  }
+  if (candidateRuntimeEnv) Object.assign(perBotInjectEnv, candidateRuntimeEnv);
   const perBotInjectKeys = Object.keys(perBotInjectEnv);
   if (perBotInjectKeys.length) log(`Injecting ${perBotInjectKeys.length} per-bot env var(s): ${perBotInjectKeys.join(', ')}`);
   const hermesUsesBotmuxSessionProfile = basename(cfg.cliPathOverride ?? '') === 'hermes-botmux-session';
@@ -6865,6 +6895,47 @@ async function spawnCli(
       cwd: spawnCwd,
       env: childEnv,
       dataDir: process.env.SESSION_DATA_DIR,
+    });
+    const startupContract = cliAdapter.candidateStartupContract;
+    if (!startupContract || !candidateRuntimeHome) {
+      throw new Error(`runtime_incompatible: ${cliAdapter.id} has no Candidate startup contract`);
+    }
+    candidateRuntimeStartupCoordinator?.dispose();
+    const candidateTurnId = cfg.turnId;
+    const candidateDispatchAttempt = cfg.dispatchAttempt;
+    candidateRuntimeStartupCoordinator = createCandidateRuntimeStartupCoordinator({
+      contract: cfg.candidateRuntimeContract,
+      runtimeName: cfg.candidateRuntimeContract.runtimeName,
+      sessionId: cfg.sessionId,
+      workerGeneration: cfg.workerGeneration,
+      phase: effectiveResume ? 'resume' : 'fresh',
+      isolatedHome: candidateRuntimeHome,
+      dataDir: process.env.SESSION_DATA_DIR,
+      turnId: candidateTurnId,
+      dispatchAttempt: candidateDispatchAttempt,
+      log,
+      readinessTimeoutMs: startupContract.readinessTimeoutMs,
+      onIncompatible(evidence) {
+        log(`Candidate Runtime startup incompatible; diagnostic=${candidateRuntimeStartupCoordinator?.evidencePath ?? '-'}`);
+        if (candidateTurnId && candidateDispatchAttempt !== undefined) {
+          emitTurnTerminal(
+            candidateTurnId,
+            'failed',
+            startupContract.incompatibleError,
+            candidateDispatchAttempt,
+            {
+              nativeSessionId: cfg.cliSessionId ?? cfg.sessionId,
+              transcriptRef: candidateRuntimeStartupCoordinator?.evidencePath
+                ?? `startup:${evidence.workerGeneration}`,
+            },
+          );
+        }
+        void sendFatalWorkerErrorAndExit(
+          new Error(`runtime_incompatible: ${evidence.runtimeName} did not become ready within ${startupContract.readinessTimeoutMs}ms`),
+          candidateTurnId,
+          candidateDispatchAttempt,
+        );
+      },
     });
   }
   if (cfg.cliId === 'coco' && cfg.candidateRuntimeContract) {
@@ -7660,6 +7731,7 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
               // a mouse-aware TUI may bind any of them to approvals/actions.
               // A view capability therefore forwards no input bytes at all.
               if (!authedClients.has(ws)) return;
+              candidateRuntimeStartupCoordinator?.recordHumanInteraction();
               if (cp) cp.write(msg.data);
               else pendingInput.push(msg.data);
             }
@@ -7730,6 +7802,7 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
               else cp.resize(msg.cols, msg.rows);
             } else if (msg.type === 'input' && typeof msg.data === 'string') {
               if (!authedClients.has(ws)) return;
+              candidateRuntimeStartupCoordinator?.recordHumanInteraction();
               if (cp) cp.write(msg.data);
               else pendingInput.push(msg.data);
             }
@@ -7797,6 +7870,7 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
               // Mouse protocols can encode approvals/actions as well as wheel input.
               // A read-only view capability must never forward bytes to the backend.
               if (!authedClients.has(ws)) return;
+              candidateRuntimeStartupCoordinator?.recordHumanInteraction();
               if (usesHerdrSnapshotWebHistory()) {
                 if (msg.data.includes('\x1b[<64;')) herdrWebScrollDirection = 'up';
                 else if (msg.data.includes('\x1b[<65;')) herdrWebScrollDirection = 'down';
@@ -8613,14 +8687,15 @@ function emitTurnSubmitted(
 ): void {
   if (!sessionId || !turnId) return;
   let evidence = durableTranscriptEvidence();
-  if (evidence && confirmation === 'transcript' && lastInitConfig?.candidateRuntimeContract) {
-    const expected = expectedContent.replace(/\r\n/g, '\n').trim();
-    const userEvent = drainCocoEvents(evidence.transcriptRef, 0).events.find(event => (
-      event.kind === 'user' && event.text.replace(/\r\n/g, '\n').trim() === expected
-    ));
-    evidence = userEvent
-      ? { nativeSessionId: evidence.nativeSessionId, transcriptRef: userEvent.uuid }
-      : undefined;
+  if (evidence
+    && confirmation === 'transcript'
+    && lastInitConfig?.candidateRuntimeContract) {
+    evidence = candidateRuntimeSubmissionEvidence({
+      runtimeName: lastInitConfig.candidateRuntimeContract.runtimeName,
+      nativeSessionId: evidence.nativeSessionId,
+      transcriptPath: evidence.transcriptRef,
+      expectedPrompt: expectedContent,
+    });
   }
   if (!evidence || !emittedTurnSubmissions.claim(sessionId, turnId, dispatchAttempt)) return;
   send({
@@ -8629,6 +8704,12 @@ function emitTurnSubmitted(
     turnId,
     dispatchAttempt,
     evidenceKind: confirmation === 'native_rpc' ? 'native_rpc' : 'cli_transcript',
+    ...evidence,
+  });
+  candidateRuntimeStartupCoordinator?.recordSubmitted({
+    turnId,
+    dispatchAttempt,
+    kind: confirmation === 'native_rpc' ? 'native_rpc' : 'cli_transcript',
     ...evidence,
   });
 }
@@ -8641,6 +8722,8 @@ function emitTurnTerminal(
   status: TurnTerminalStatus,
   errorCode?: string,
   dispatchAttempt?: number,
+  explicitEvidence?: { nativeSessionId: string; transcriptRef: string },
+  responseOutput?: string,
 ): void {
   if (!sessionId || !turnId) return;
   if (!emittedTurnTerminals.claim(sessionId, turnId, dispatchAttempt)) return;
@@ -8653,6 +8736,7 @@ function emitTurnTerminal(
   // Revoke before publishing terminal. The daemon receives same-worker IPC in
   // order, and the worker-side relay becomes unusable synchronously.
   revokeManagedTurnOriginForTerminal(turnId, dispatchAttempt);
+  const terminalEvidence = explicitEvidence ?? durableTranscriptEvidence();
   send({
     type: 'turn_terminal',
     sessionId,
@@ -8660,7 +8744,14 @@ function emitTurnTerminal(
     status,
     ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
     ...(errorCode ? { errorCode } : {}),
-    ...(durableTranscriptEvidence() ?? {}),
+    ...(terminalEvidence ?? {}),
+  });
+  candidateRuntimeStartupCoordinator?.recordTerminal({
+    turnId,
+    dispatchAttempt,
+    status,
+    evidence: terminalEvidence,
+    responseOutput,
   });
   if (terminalReleasesDurableTurn(
     { turnId: currentBotmuxTurnId, dispatchAttempt: currentBotmuxDispatchAttempt },
@@ -8686,6 +8777,13 @@ function workerIpcPayload(msg: WorkerToDaemon): WorkerToDaemon {
 
 function send(msg: WorkerToDaemon): void {
   const payload = workerIpcPayload(msg);
+  if (payload.type === 'final_output' && payload.content.trim().length > 0) {
+    candidateRuntimeStartupCoordinator?.recordFinalOutput({
+      turnId: payload.turnId,
+      dispatchAttempt: payload.dispatchAttempt,
+      content: payload.content,
+    });
+  }
   if (isWorkflowWorker() && payload.type === 'final_output') {
     workflowFinalOutputSent = true;
   }
@@ -9221,6 +9319,10 @@ process.on('message', async (raw: unknown) => {
       // ready-gate and deliver any held first prompt. Idempotent: a later
       // duplicate (clear/compact source) is a no-op.
       log(`SessionStart ready signal received (source=${msg.source ?? '?'})`);
+      candidateRuntimeStartupCoordinator?.markPromptReady(
+        cliAdapter?.id ?? 'unknown',
+        `adapter:${cliAdapter?.id ?? 'unknown'}:session-ready-hook`,
+      );
       // 先记下 gate 是否已被 45s fallback 释放：ReadyGate.receive() 是一次性
       // 语义，fallback 抢先后 releaseReadyGate 会整块跳过迟到的真信号。
       const lateAfterFallback = readyGate.isArmed && readyGate.isReceived;

@@ -15,9 +15,13 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
 import { describe, expect, it, vi } from 'vitest';
+import { createClaudeCodeAdapter } from '../src/adapters/cli/claude-code.js';
 import { createCocoAdapter } from '../src/adapters/cli/coco.js';
+import { createCodexAdapter } from '../src/adapters/cli/codex.js';
+import { createTraexAdapter } from '../src/adapters/cli/traex.js';
 import { sessionAgentConfig } from '../src/core/worker-pool.js';
 import { launchCandidateRca } from '../src/services/candidate-rca-launch.js';
+import * as candidateRuntimeModule from '../src/services/candidate-runtime-contract.js';
 import {
   attestCandidateRuntimeSpawn,
   candidateBotmuxBuildIdentity,
@@ -86,6 +90,8 @@ function fixture(): { root: string; contract: CandidateRuntimeContract } {
       releaseId: 'release-a',
       releaseManifestSha256: sha256(manifest),
       runtimeBundleId: 'runtime-a',
+      runtimeName: 'coco',
+      searchRcaCommit: 'e'.repeat(40),
       botmuxCommit: candidateBotmuxCommit(),
       botmuxArtifactSha256: BOTMUX_ARTIFACT_SHA256,
       workspaceSnapshot: {
@@ -313,7 +319,7 @@ process.exit(result.status ?? 1);
         status: 'active',
         createdAt: '2026-08-13T00:00:00.000Z',
         workingDir: contract.workspaceSnapshot.realpath,
-        cliId: 'coco',
+        cliId: 'traex',
         cliPathOverride: contract.executable.realpath,
         model: contract.model,
         agentFrozen: true,
@@ -328,9 +334,42 @@ process.exit(result.status ?? 1);
       wrapperCli: 'release-b-wrapper',
       model: 'candidate-model-b',
     })).toEqual({
-      cliId: 'coco',
+      cliId: 'traex',
       cliPathOverride: contract.executable.realpath,
       model: 'candidate-model-a',
+    });
+  });
+
+  it('restores the Runtime selected by the frozen contract instead of hard-coding Coco', () => {
+    const { contract } = fixture();
+    const codexContract = { ...contract, runtimeName: 'codex' };
+    const restored = {
+      session: {
+        sessionId: 'session-codex-a',
+        chatId: 'oc_shadow',
+        rootMessageId: 'om_root',
+        title: 'Candidate Codex A',
+        status: 'active',
+        createdAt: '2026-08-13T00:00:00.000Z',
+        workingDir: contract.workspaceSnapshot.realpath,
+        cliId: 'codex',
+        cliPathOverride: contract.executable.realpath,
+        model: contract.model,
+        agentFrozen: true,
+        candidateRuntimeContract: codexContract,
+      },
+      larkAppId: 'cli_candidate',
+      chatId: 'oc_shadow',
+    } as any;
+
+    expect(sessionAgentConfig(restored, {
+      cliId: 'coco',
+      cliPathOverride: '/ambient/coco',
+      model: 'ambient-model',
+    })).toEqual({
+      cliId: 'codex',
+      cliPathOverride: contract.executable.realpath,
+      model: contract.model,
     });
   });
 
@@ -386,6 +425,352 @@ process.exit(result.status ?? 1);
       expect(JSON.parse(readFileSync(candidateRuntimeAttestationPath(root, 'session-a', 1, phase), 'utf8')))
         .toEqual(attestation);
     }
+  });
+
+  it.each([
+    ['coco', () => createCocoAdapter(COCO)],
+    ['codex', () => createCodexAdapter('/release/bin/codex')],
+    ['claude-code', () => createClaudeCodeAdapter('/release/bin/claude')],
+    ['traex', () => createTraexAdapter(COCO)],
+  ])('%s exposes the same unattended Candidate ready/accept/response contract',
+    (_runtimeName, createAdapter) => {
+      const adapter = createAdapter() as ReturnType<typeof createCocoAdapter> & {
+        candidateStartupContract?: unknown;
+      };
+
+      expect(adapter.candidateStartupContract).toEqual({
+        schemaVersion: 1,
+        readyEvidence: 'runtime_ready',
+        acceptEvidence: ['cli_transcript', 'native_rpc'],
+        responseEvidence: ['cli_transcript_terminal', 'native_rpc_terminal'],
+        incompatibleError: 'runtime_incompatible',
+        readinessTimeoutMs: 15_000,
+      });
+    });
+
+  it.each([
+    ['coco', 'TRAE_HOME', '.trae'],
+    ['codex', 'CODEX_HOME', '.codex'],
+    ['claude-code', 'CLAUDE_CONFIG_DIR', '.claude'],
+  ])('prepares a fresh isolated %s HOME and release-owned Skills without ambient fallback',
+    (runtimeName, runtimeHomeEnv, runtimeHomeDir) => {
+      const prepareRuntime = (candidateRuntimeModule as any).prepareCandidateRuntimeHome;
+      expect(prepareRuntime).toBeTypeOf('function');
+      const { root, contract } = fixture();
+      const selected = { ...contract, runtimeName };
+      const runtime = prepareRuntime({
+        contract: selected,
+        dataDir: root,
+        sessionId: `session-${runtimeName}`,
+        authFile: join(root, 'missing-auth.json'),
+        cocoCacheRoot: testCocoCache(root),
+      }, botmuxIdentity(selected));
+
+      expect(runtime.env.HOME).toBe(runtime.home);
+      expect(runtime.env[runtimeHomeEnv]).toBe(join(runtime.home, runtimeHomeDir));
+      expect(realpathSync(join(runtime.skillsRoot, 'release-only')))
+        .toBe(realpathSync(join(contract.skillsRoot, 'release-only')));
+      expect(runtime.home.startsWith(join(root, 'candidate-runtime'))).toBe(true);
+    });
+
+  it('persists one release-bound startup proof only after ready, Runtime acceptance, and response', () => {
+    const createProbe = (candidateRuntimeModule as any).createCandidateRuntimeStartupProbe;
+    expect(createProbe).toBeTypeOf('function');
+    const { root, contract } = fixture();
+    const runtime = prepareCandidateCocoHome({
+      contract,
+      dataDir: root,
+      sessionId: 'session-startup-proof',
+      authFile: join(root, 'missing-auth.json'),
+      cocoCacheRoot: testCocoCache(root),
+    }, botmuxIdentity(contract));
+    const probe = createProbe({
+      contract,
+      runtimeName: 'coco',
+      sessionId: 'session-startup-proof',
+      workerGeneration: 3,
+      phase: 'fresh',
+      isolatedHome: runtime.home,
+      dataDir: root,
+    });
+
+    probe.observeTerminalOutput('runtime booting\n');
+    probe.markReady({ kind: 'runtime_ready', evidenceRef: 'pty:ready-pattern' });
+    expect(() => probe.markAccepted({
+      kind: 'pty_write', nativeSessionId: 'native-a', transcriptRef: 'pty:12',
+    })).toThrow(/Runtime acceptance evidence/i);
+    probe.markAccepted({
+      kind: 'cli_transcript', nativeSessionId: 'native-a', transcriptRef: 'events:user-1',
+    });
+    probe.markResponse({
+      kind: 'cli_transcript_terminal',
+      nativeSessionId: 'native-a',
+      transcriptRef: 'events:assistant-1',
+      output: 'candidate startup probe response',
+    });
+
+    const evidence = JSON.parse(readFileSync(probe.evidencePath, 'utf8'));
+    expect(evidence).toMatchObject({
+      status: 'responded',
+      runtimeName: 'coco',
+      sessionId: 'session-startup-proof',
+      workerGeneration: 3,
+      phase: 'fresh',
+      releaseId: contract.releaseId,
+      releaseManifestSha256: contract.releaseManifestSha256,
+      searchRcaCommit: contract.searchRcaCommit,
+      botmuxCommit: contract.botmuxCommit,
+      botmuxArtifactSha256: contract.botmuxArtifactSha256,
+      freshIsolatedEnvironment: true,
+      humanInteractionCount: 0,
+      taskAcceptedByRuntime: true,
+      responseObserved: true,
+    });
+    expect(evidence.transitions.map((transition: { status: string }) => transition.status))
+      .toEqual(['starting', 'ready', 'accepted', 'responded']);
+  });
+
+  it('keeps probe state errors non-fatal across a second turn and a replay attempt', () => {
+    const createCoordinator = (candidateRuntimeModule as any).createCandidateRuntimeStartupCoordinator;
+    expect(createCoordinator).toBeTypeOf('function');
+    const { root, contract } = fixture();
+    const runtime = prepareCandidateCocoHome({
+      contract,
+      dataDir: root,
+      sessionId: 'session-coordinator-replay',
+      authFile: join(root, 'missing-auth.json'),
+      cocoCacheRoot: testCocoCache(root),
+    }, botmuxIdentity(contract));
+    const diagnostics: string[] = [];
+    const coordinator = createCoordinator({
+      contract,
+      runtimeName: 'coco',
+      sessionId: 'session-coordinator-replay',
+      workerGeneration: 1,
+      phase: 'fresh',
+      isolatedHome: runtime.home,
+      dataDir: root,
+      turnId: 'turn-1',
+      dispatchAttempt: 1,
+      log(message: string) { diagnostics.push(message); },
+    });
+
+    coordinator.handleTerminalOutput(
+      'Context 100% left',
+      createTraexAdapter(COCO),
+      { write() {} },
+    );
+    coordinator.markPromptReady('traex');
+    coordinator.recordHumanInteraction();
+    coordinator.recordSubmitted({
+      turnId: 'turn-1', dispatchAttempt: 1, kind: 'cli_transcript',
+      nativeSessionId: 'native-1', transcriptRef: 'rollout-1.jsonl',
+    });
+    expect(() => coordinator.recordSubmitted({
+      turnId: 'turn-1', dispatchAttempt: 2, kind: 'cli_transcript',
+      nativeSessionId: 'native-1', transcriptRef: 'rollout-1.jsonl',
+    })).not.toThrow();
+    coordinator.recordTerminal({
+      turnId: 'turn-1', dispatchAttempt: 1, status: 'completed',
+      evidence: { nativeSessionId: 'native-1', transcriptRef: 'rollout-1.jsonl' },
+    });
+    expect(() => coordinator.recordSubmitted({
+      turnId: 'turn-2', dispatchAttempt: 1, kind: 'cli_transcript',
+      nativeSessionId: 'native-1', transcriptRef: 'rollout-1.jsonl',
+    })).not.toThrow();
+    expect(diagnostics.some(message => message.includes('ignored'))).toBe(true);
+    expect(JSON.parse(readFileSync(coordinator.evidencePath, 'utf8')).humanInteractionCount).toBe(1);
+  });
+
+  it.each([
+    ['coco', '❯ Continue', () => createCocoAdapter(COCO)],
+    ['codex', '› Continue', () => createCodexAdapter('/release/bin/codex')],
+    ['traex', '❯ Continue', () => createTraexAdapter(COCO)],
+  ])('%s Candidate readiness rejects an unnumbered startup picker cursor',
+    (_runtimeName, picker, createAdapter) => {
+      const readyOutput = (candidateRuntimeModule as any).candidateRuntimeReadyOutput;
+      expect(readyOutput(createAdapter(), `\n${picker}\n`)).toBe(false);
+      expect(readyOutput(createAdapter(), '\nContext 100% left\n')).toBe(true);
+    });
+
+  it('times out as runtime_incompatible when ready is not followed by Runtime acceptance', async () => {
+    vi.useFakeTimers();
+    try {
+      const { root, contract } = fixture();
+      const runtime = prepareCandidateCocoHome({
+        contract,
+        dataDir: root,
+        sessionId: 'session-ready-without-accept',
+        authFile: join(root, 'missing-auth.json'),
+        cocoCacheRoot: testCocoCache(root),
+      }, botmuxIdentity(contract));
+      const onIncompatible = vi.fn();
+      const coordinator = (candidateRuntimeModule as any).createCandidateRuntimeStartupCoordinator({
+        contract,
+        runtimeName: 'coco',
+        sessionId: 'session-ready-without-accept',
+        workerGeneration: 1,
+        phase: 'fresh',
+        isolatedHome: runtime.home,
+        dataDir: root,
+        turnId: 'turn-ready-without-accept',
+        dispatchAttempt: 1,
+        readinessTimeoutMs: 25,
+        onIncompatible,
+      });
+
+      coordinator.handleTerminalOutput(
+        'Context 100% left',
+        createTraexAdapter(COCO),
+        { write() {} },
+      );
+      await vi.advanceTimersByTimeAsync(25);
+
+      expect(onIncompatible).toHaveBeenCalledTimes(1);
+      const evidence = JSON.parse(readFileSync(coordinator.evidencePath, 'utf8'));
+      expect(evidence.status).toBe('runtime_incompatible');
+      expect(evidence.transitions.map((entry: { status: string }) => entry.status))
+        .toEqual(['starting', 'ready', 'runtime_incompatible']);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('keeps an unknown unnumbered TRAE startup picker under the fail-fast timer', async () => {
+    vi.useFakeTimers();
+    try {
+      const { root, contract } = fixture();
+      const runtime = prepareCandidateCocoHome({
+        contract,
+        dataDir: root,
+        sessionId: 'session-unknown-trae-picker',
+        authFile: join(root, 'missing-auth.json'),
+        cocoCacheRoot: testCocoCache(root),
+      }, botmuxIdentity(contract));
+      const onIncompatible = vi.fn();
+      const coordinator = (candidateRuntimeModule as any).createCandidateRuntimeStartupCoordinator({
+        contract,
+        runtimeName: 'coco',
+        sessionId: 'session-unknown-trae-picker',
+        workerGeneration: 1,
+        phase: 'fresh',
+        isolatedHome: runtime.home,
+        dataDir: root,
+        turnId: 'turn-unknown-picker',
+        dispatchAttempt: 1,
+        readinessTimeoutMs: 25,
+        onIncompatible,
+      });
+
+      coordinator.handleTerminalOutput(
+        '\n❯ Continue\n',
+        createTraexAdapter(COCO),
+        { write() {} },
+      );
+      await vi.advanceTimersByTimeAsync(25);
+
+      expect(onIncompatible).toHaveBeenCalledTimes(1);
+      const evidence = JSON.parse(readFileSync(coordinator.evidencePath, 'utf8'));
+      expect(evidence.transitions.map((entry: { status: string }) => entry.status))
+        .toEqual(['starting', 'runtime_incompatible']);
+      expect(evidence.diagnostic.terminalTail).toContain('❯ Continue');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('fails an unknown startup interaction quickly as runtime_incompatible with terminal diagnostics', async () => {
+    vi.useFakeTimers();
+    try {
+      const createProbe = (candidateRuntimeModule as any).createCandidateRuntimeStartupProbe;
+      expect(createProbe).toBeTypeOf('function');
+      const { root, contract } = fixture();
+      const runtime = prepareCandidateCocoHome({
+        contract,
+        dataDir: root,
+        sessionId: 'session-unknown-ui',
+        authFile: join(root, 'missing-auth.json'),
+        cocoCacheRoot: testCocoCache(root),
+      }, botmuxIdentity(contract));
+      const onIncompatible = vi.fn();
+      const probe = createProbe({
+        contract,
+        runtimeName: 'future-runtime',
+        sessionId: 'session-unknown-ui',
+        workerGeneration: 1,
+        phase: 'fresh',
+        isolatedHome: runtime.home,
+        dataDir: root,
+        readinessTimeoutMs: 25,
+        onIncompatible,
+      });
+      probe.observeTerminalOutput('Choose a migration source:\n  1. unknown-host-state\n');
+
+      await vi.advanceTimersByTimeAsync(25);
+
+      expect(onIncompatible).toHaveBeenCalledTimes(1);
+      const evidence = JSON.parse(readFileSync(probe.evidencePath, 'utf8'));
+      expect(evidence.status).toBe('runtime_incompatible');
+      expect(evidence.taskAcceptedByRuntime).toBe(false);
+      expect(evidence.responseObserved).toBe(false);
+      expect(evidence.diagnostic.terminalTail).toContain('Choose a migration source');
+      expect(evidence.diagnostic.readinessTimeoutMs).toBe(25);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('automates only the shared known trust prompt without counting a human interaction', () => {
+    const createHandler = (candidateRuntimeModule as any).createCandidateRuntimeStartupInteractionHandler;
+    expect(createHandler).toBeTypeOf('function');
+    const writes: string[] = [];
+    const handler = createHandler();
+    const pty = { write(value: string) { writes.push(value); } };
+
+    expect(handler.handle('❯ 1. Yes, continue\n2. No, quit', pty)).toBe(true);
+    expect(handler.handle('❯ 1. Yes, continue\n2. No, quit', pty)).toBe(false);
+    expect(handler.handle('Choose an unknown migration source', pty)).toBe(false);
+    expect(writes).toEqual(['\r']);
+    expect(handler.humanInteractionCount).toBe(0);
+    expect(handler.automatedInteractionCount).toBe(1);
+  });
+
+  it('opts the isolated Candidate home out of Coco legacy migration before spawn', () => {
+    const { root, contract } = fixture();
+    const runtime = prepareCandidateCocoHome({
+      contract,
+      dataDir: root,
+      sessionId: 'session-migration',
+      authFile: join(root, 'missing-auth.json'),
+      cocoCacheRoot: testCocoCache(root),
+    }, botmuxIdentity(contract));
+    const adapter = createCocoAdapter(contract.executable.realpath);
+    const args = adapter.buildArgs({
+      sessionId: 'session-migration',
+      resume: false,
+      workingDir: contract.workspaceSnapshot.realpath,
+      model: contract.model,
+      disabledFeatures: contract.disabledFeatures,
+    });
+    const attestation = attestCandidateRuntimeSpawn({
+      contract,
+      phase: 'fresh',
+      sessionId: 'session-migration',
+      workerGeneration: 1,
+      bin: adapter.resolvedBin,
+      args,
+      cwd: contract.workspaceSnapshot.realpath,
+      env: { HOME: runtime.home, TRAE_HOME: runtime.traeHome },
+      dataDir: root,
+      authFile: join(root, 'missing-auth.json'),
+      cocoCacheRoot: testCocoCache(root),
+      ...botmuxIdentity(contract),
+    });
+
+    expect(readFileSync(contract.executable.realpath)
+      .includes(Buffer.from('.coco-migration-skip-all'))).toBe(true);
+    expect(attestation.argv).toEqual([contract.executable.realpath, ...args]);
+    expect(readFileSync(join(runtime.traeHome, '.coco-migration-skip-all'), 'utf8')).toBe('');
   });
 
   it('fails closed before spawn when executable, commit, or Skills drift', () => {

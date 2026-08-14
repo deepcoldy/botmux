@@ -189,8 +189,10 @@ export interface CodexDrainResult {
  *  `rollout-<ts>-<sid>.jsonl`, so a suffix match is unambiguous. The
  *  directory tree is small (year/month/day) — a one-shot recursive scan
  *  is cheap enough that we don't bother caching. */
-export function findCodexRolloutBySessionId(cliSessionId: string): string | undefined {
-  const sessionsRoot = codexSessionsRoot();
+export function findCodexRolloutBySessionId(
+  cliSessionId: string,
+  sessionsRoot = codexSessionsRoot(),
+): string | undefined {
   if (!cliSessionId || !existsSync(sessionsRoot)) return undefined;
   const suffix = `-${cliSessionId}.jsonl`;
   const stack: string[] = [sessionsRoot];

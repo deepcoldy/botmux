@@ -16,7 +16,7 @@ import type { DaemonSession } from './types.js';
 import { sessionKey } from './types.js';
 import type { TriggerRequest, TriggerResponse } from '../services/trigger-types.js';
 import type { CliTurnPayload } from '../types.js';
-import type { CandidateRuntimeContract } from '../services/candidate-runtime-contract.js';
+import { candidateRuntimeCliId, type CandidateRuntimeContract } from '../services/candidate-runtime-contract.js';
 
 export interface TriggerSessionDeps {
   larkAppId: string;
@@ -560,7 +560,7 @@ export async function triggerSessionTurn(
   session.lastMessageAt = new Date(now).toISOString();
   session.workingDir = wd.workingDir;
   if (internal?.candidateRuntimeContract) {
-    session.cliId = 'coco';
+    session.cliId = candidateRuntimeCliId(internal.candidateRuntimeContract.runtimeName);
     session.cliPathOverride = internal.candidateRuntimeContract.executable.realpath;
     session.wrapperCli = undefined;
     session.model = internal.candidateRuntimeContract.model;

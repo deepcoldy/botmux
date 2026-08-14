@@ -1,5 +1,5 @@
 import { EventEmitter } from 'node:events';
-import { mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -14,9 +14,11 @@ import {
   settleCandidateTurnFromWorker,
   submitCandidateTurnFromWorker,
 } from '../src/core/candidate-turn-entry.js';
+import * as candidateTurnEntry from '../src/core/candidate-turn-entry.js';
 import {
   candidateCocoTranscriptEvidence,
   reconcileCandidateCocoTranscript,
+  reconcileCandidateRuntimeTranscript,
 } from '../src/services/candidate-turn-transcript.js';
 import { deliverCandidateTurnReceiptHistory } from '../src/services/rca-shadow-mirror.js';
 import { CandidateTurnReceiptDeliveryError } from '../src/services/rca-shadow-mirror.js';
@@ -235,6 +237,98 @@ describe('Candidate durable continuation', () => {
       },
     });
     expect(restarted.get('cand_alarm_42', 'om_submitted')?.status).toBe('completed');
+  });
+
+  it('recovers a release-named Coco turn from the mapped TRAE rollout after worker restart', async () => {
+    const { dataDir, turns } = fixture();
+    const turnId = 'om_trae_recovery';
+    const prompt = `prompt:${turnId}`;
+    const nativeSessionId = '00000000-0000-7000-8000-000000000041';
+    await turns.accept(input(turnId, prompt));
+    await turns.claimHead('cand_alarm_42', { receiverBootId: 'boot-a', workerGeneration: 9 });
+
+    const sessionsDir = join(
+      dataDir,
+      'candidate-runtime',
+      'botmux-session-1',
+      'home',
+      '.trae',
+      'cli',
+      'sessions',
+      '2026',
+      '08',
+      '14',
+    );
+    mkdirSync(sessionsDir, { recursive: true });
+    const rollout = join(sessionsDir, `rollout-2026-08-14T00-00-00-${nativeSessionId}.jsonl`);
+    writeFileSync(rollout, [
+      JSON.stringify({
+        timestamp: '2026-08-14T00:00:01.000Z',
+        type: 'response_item',
+        payload: {
+          type: 'message', role: 'user',
+          content: [{ type: 'input_text', text: prompt }],
+        },
+      }),
+      JSON.stringify({
+        timestamp: '2026-08-14T00:00:02.000Z',
+        type: 'event_msg',
+        payload: {
+          type: 'task_complete', turn_id: '00000000-0000-7000-8000-000000000042',
+          last_agent_message: 'recovered TRAE conclusion',
+        },
+      }),
+      '',
+    ].join('\n'));
+
+    const recovered = reconcileCandidateRuntimeTranscript(
+      turns.get('cand_alarm_42', turnId)!,
+      {
+        runtimeName: 'coco',
+        nativeSessionId,
+        dataDir,
+        botmuxSessionId: 'botmux-session-1',
+      },
+    );
+
+    expect(recovered).toMatchObject({
+      kind: 'completed',
+      nativeSessionId,
+      output: 'recovered TRAE conclusion',
+    });
+  });
+
+  it('fails an accepted dispatched turn with unknown native identity instead of replaying it', async () => {
+    const settleUnknown = (candidateTurnEntry as any).settleCandidateTurnWithUnknownRuntimeIdentity;
+    expect(settleUnknown).toBeTypeOf('function');
+    const { dataDir, turns } = fixture();
+    await turns.accept(input('om_unknown_native'));
+    await turns.claimHead('cand_alarm_42', { receiverBootId: 'boot-a', workerGeneration: 9 });
+    const receipt = turns.get('cand_alarm_42', 'om_unknown_native')!;
+    const redispatched: CandidateTurnDispatch[] = [];
+
+    await settleUnknown(receipt, {
+      dataDir,
+      receiverBootId: 'boot-b',
+      workerGeneration: 10,
+      dispatch(turn: CandidateTurnDispatch) { redispatched.push(turn); },
+    });
+
+    expect(redispatched).toEqual([]);
+    expect(turns.get('cand_alarm_42', 'om_unknown_native')).toMatchObject({
+      status: 'failed',
+      dispatchAttempt: 1,
+      transitions: [
+        { status: 'accepted' },
+        {
+          status: 'failed',
+          evidence: {
+            kind: 'runtime_terminal',
+            transcriptRef: expect.stringContaining('native_session_unknown'),
+          },
+        },
+      ],
+    });
   });
 
   it('records an explicit failed terminal when a submitted native runtime is gone', async () => {
