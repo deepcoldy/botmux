@@ -104,6 +104,25 @@ export function buildV3RunDetailUrl(runId: string, opts: { host: string; port: n
 }
 
 /**
+ * Build a deep link to a v3 run's live terminal page (the mobile-friendly
+ * `getTerminalHtml` view), used by the progress card's「终端」button.
+ *
+ * On the central HTTPS platform the same-origin `/s/<sessionId>` reverse proxy
+ * reaches the worker; on a self-hosted LAN box the worker's own `webPort` is
+ * used directly (mirrors `buildSessionTerminalUrl`). Returns null when no
+ * reachable URL can be built (no webPort in LAN mode).
+ */
+export function buildV3TerminalUrl(
+  sessionId: string,
+  opts: { host: string; webPort?: number },
+): string | null {
+  const base = remotePublicBase();
+  if (base) return `${base}/s/${encodeURIComponent(sessionId)}`;
+  if (!opts.webPort || opts.webPort <= 0) return null;
+  return `http://${formatUrlHost(String(opts.host))}:${opts.webPort}`;
+}
+
+/**
  * Build the platform owner-login URL advertised by an unauthenticated
  * Dashboard response. The SPA replaces only the hash-route `next` value, so
  * the server never exposes the Dashboard token or machine tunnel credential.

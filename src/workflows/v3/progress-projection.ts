@@ -93,6 +93,16 @@ export interface V3ProgressView {
   upstreamNonHostFinished?: boolean;
   /** Number only: external payloads and provider errors never enter the card. */
   uncertainHostEffectCount?: number;
+  /**
+   * Most recent live terminal session reported by a `nodeSessionReady` event.
+   * Lets the card deep-link straight into the (now mobile-friendly) terminal
+   * page instead of forcing the SPA round-trip. Absent for runs that never
+   * span a worker (pure gates / finished before any session came up).
+   */
+  terminal?: {
+    sessionId: string;
+    webPort?: number;
+  };
   /** Last usable journal timestamp, falling back to run.json.createdAt. */
   updatedAt: string;
 }
@@ -286,6 +296,23 @@ export function projectV3Progress(input: V3ProgressProjectionInput): V3ProgressV
     .map((node) => node.id)
     .filter((nodeId) => refreshed.has(nodeId));
 
+  // Latest live terminal session across all nodes. Events are stored in
+  // journal order, so the last nodeSessionReady wins. Only outer-node sessions
+  // are surfaced (inner loop bodies stay private, like the rest of the view).
+  let terminal: V3ProgressView['terminal'];
+  for (const event of events) {
+    if (
+      event.type === 'nodeSessionReady' &&
+      outerIds.has(event.nodeId) &&
+      event.sessionInfo?.sessionId
+    ) {
+      terminal = {
+        sessionId: event.sessionInfo.sessionId,
+        ...(event.sessionInfo.webPort ? { webPort: event.sessionInfo.webPort } : {}),
+      };
+    }
+  }
+
   // runStarted is a durable start intent, not evidence that any worker/gate
   // actually began. A retry/revisit with every node temporarily pending is
   // still active because it has journal activity beyond that boundary.
@@ -316,6 +343,7 @@ export function projectV3Progress(input: V3ProgressProjectionInput): V3ProgressV
     ...(snapshot.uncertainHostEffects && snapshot.uncertainHostEffects.length > 0
       ? { uncertainHostEffectCount: snapshot.uncertainHostEffects.length }
       : {}),
+    ...(terminal ? { terminal } : {}),
     updatedAt: lastTs === undefined ? envelope.createdAt : new Date(lastTs).toISOString(),
   };
 }
