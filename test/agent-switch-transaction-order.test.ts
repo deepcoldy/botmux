@@ -230,45 +230,50 @@ describe('agent switch — no precondition runs after the irreversible close', (
     expect(block).toContain("error: 'bot_config_unreadable'");
   });
 
-  it('hands the close a FRESH-authority reader, not just the captured target', () => {
+  it('gates every close on the FULL committed identity, read fresh', () => {
     // A guard on the helper alone would be false green: the helper can support
-    // per-close re-verification while the route never passes it. The window this
-    // closes is the close DURATION, which neither CAS covers.
+    // per-close re-verification while the route feeds it request-side values. That
+    // is exactly what shipped before — the reader re-derived only the runtime
+    // preserve branch and kept the request's own cliId/wrapperCli, so a concurrent
+    // selection or wrapper change was invisible and its sessions were still closed.
     const closeAt = ipc.indexOf('await agentSwitchCloseHook.run(');
     expect(closeAt, 'close call site').toBeGreaterThan(0);
     const callBlock = ipc.slice(closeAt, ipc.indexOf(');', closeAt));
-    expect(
-      callBlock,
-      'the close must receive a persisted-target reader as its third argument',
-    ).toContain('readPersistedTarget');
+    expect(callBlock, 'the close must receive the fresh-authority guard')
+      .toContain('read: readCommittedAuthority');
+    expect(callBlock, 'and the version its proposal was derived from')
+      .toContain('expectedVersion: authorityVersion');
 
-    // The reader must read the AUTHORITY (disk), and must be defined before the
-    // close so it cannot accidentally capture post-close state.
-    const readerAt = ipc.indexOf('const readPersistedTarget = async ()');
+    const readerAt = ipc.indexOf('const readCommittedAuthority = async ()');
     expect(readerAt, 'reader definition').toBeGreaterThan(0);
     expect(readerAt, 'defined before the close').toBeLessThan(closeAt);
     const readerBlock = ipc.slice(readerAt, closeAt);
     expect(readerBlock).toContain('readRawConfig(requireConfigPath())');
     expect(readerBlock).toContain('findEntryIndex(raw, larkAppId)');
-    // It must RE-DERIVE the proposal through the SAME helper the commit path uses.
-    // Returning the row's own config instead would call every genuinely stale
-    // session "backed by disk" and skip every close — disabling the switch — and a
-    // second, parallel derivation here could drift from the committed one, which is
-    // the whole class of bug this handler kept hitting.
-    expect(readerBlock).toContain('deriveRuntimeForRow(row)');
-    // Exactly two CALL SITES (the definition reads `= (row: {`, so it is not
-    // matched here): the committed proposal and the fresh re-derivation. A third
-    // hand-rolled derivation is what would let them drift apart again.
-    const callSites = [...ipc.matchAll(/deriveRuntimeForRow\((?!row: )/g)];
+    // The version must fingerprint the row itself — NOT a target re-derived from
+    // the request, which is how the selection/wrapper axes went missing.
+    expect(readerBlock).toContain('version: agentAuthorityFingerprint(row)');
     expect(
-      callSites.length,
-      'the proposal and the per-close re-derivation must be the only call sites',
-    ).toBe(2);
-    expect(ipc, 'and there must be exactly one definition')
-      .toContain('const deriveRuntimeForRow = (row: {');
-    // An unreadable authority must be reported, not silently treated as "no
-    // change" (which would re-open the stale-close hole).
+      readerBlock,
+      'the fresh identity must not be taken from the request',
+    ).not.toContain('cliId: selected.cliId');
+    expect(
+      readerBlock,
+      'nor the wrapper',
+    ).not.toContain('wrapperCli: selected.wrapperCli');
+    // An unreadable authority must be reported, not downgraded to "no change".
     expect(readerBlock).toContain("'unreadable'");
+  });
+
+  it('fingerprints the whole launch-identity axis', () => {
+    // Dropping any axis re-opens the hole for that axis specifically.
+    const at = ipc.indexOf('function agentAuthorityFingerprint(');
+    const body = ipc.slice(at, ipc.indexOf('\n}', at));
+    for (const field of [
+      'cliId', 'wrapperCli', 'cliRuntime', 'cliPathOverride', 'reasoningEffort',
+    ]) {
+      expect(body, `${field} must be part of the identity fingerprint`).toContain(field);
+    }
   });
 
   it('re-justifies EVERY close against the fresh authority, in both loops', () => {
@@ -279,17 +284,20 @@ describe('agent switch — no precondition runs after the irreversible close', (
     const helperAt = sm.indexOf('const stillJustifiedByDisk = async (');
     expect(helperAt, 'per-close re-justification helper').toBeGreaterThan(0);
 
+    const helperBlock = sm.slice(helperAt, sm.indexOf('  const recordClose = (', helperAt));
     // Fail closed when the authority cannot be read.
-    const helperBlock = sm.slice(helperAt, sm.indexOf('  for (const ds of', helperAt));
     expect(helperBlock).toContain("=== 'unreadable'");
     expect(helperBlock).toContain('out.ok = false');
+    // Version gate: a moved identity must skip the close entirely.
+    expect(helperBlock).toContain('fresh.version !== freshAuthority.expectedVersion');
+    // Read per call, never cached across closes.
+    expect(helperBlock).toContain('await freshAuthority.read()');
 
     const guards = [...sm.matchAll(/if \(!await stillJustifiedByDisk\(/g)];
     expect(
       guards.length,
       'both the registry loop and the durable-row loop must re-justify',
     ).toBe(2);
-    // Each guard must sit before its close call.
     for (const g of guards) {
       const closeAt = sm.indexOf('await closeSession(', g.index!);
       expect(closeAt, 'a close must follow each guard').toBeGreaterThan(g.index!);

@@ -4258,42 +4258,42 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
     // are correct under the new authority and miss the ones that are not. A closed
     // session cannot be restored by refusing the commit, so the check has to be
     // per-close, not per-request.
-    const readPersistedTarget = async (): Promise<
-      { cliId?: typeof selected.cliId; cliRuntime?: CliRuntimeConfig; cliPathOverride?: string; wrapperCli?: string }
-      | undefined | 'unreadable'
+    const readCommittedAuthority = async (): Promise<
+      { version: string; target: {
+        cliId?: typeof selected.cliId; wrapperCli?: string;
+        cliRuntime?: CliRuntimeConfig; cliPathOverride?: string;
+      } } | undefined | 'unreadable'
     > => {
       try {
         const raw = await readRawConfig(requireConfigPath());
         const idx = findEntryIndex(raw, larkAppId);
         if (idx < 0) return undefined;
-        const row = raw[idx] as {
-          cliId?: string; wrapperCli?: string;
-          cliRuntime?: CliRuntimeConfig; cliPathOverride?: string;
-        };
-        // RE-DERIVE THE PROPOSAL from the row as it stands now — do not return the
-        // row's own config. The bot is still on the OLD agent at this point
-        // (nothing is committed until after the closes), so comparing sessions
-        // against the row itself would call every genuinely stale session "backed
-        // by disk" and skip every close, silently disabling the switch. What must
-        // stay stable is the TARGET: same request fields, runtime preserved from
-        // the current row. If another process committed a different runtime, the
-        // re-derived target follows it, so a session frozen on that runtime is no
-        // longer considered stale and is left alone.
-        const fresh = deriveRuntimeForRow(row);
+        const row = raw[idx] as Record<string, unknown>;
         return {
-          cliId: selected.cliId,
-          cliRuntime: fresh.nextRuntime,
-          cliPathOverride: fresh.nextRuntime?.executable ?? fresh.nextLegacyPath,
-          wrapperCli: selected.wrapperCli,
+          // Fingerprints the WHOLE launch-identity axis, so a concurrent change to
+          // cliId / wrapperCli / cliRuntime / cliPathOverride / reasoningEffort is
+          // all equally visible. An earlier version re-derived a "fresh target"
+          // instead and only tracked the runtime-preserve branch — it kept the
+          // request's own cliId and wrapperCli, so a concurrent selection or
+          // wrapper change stayed invisible and its sessions were still closed.
+          version: agentAuthorityFingerprint(row),
+          // The committed identity itself, for diagnostics.
+          target: {
+            cliId: (row.cliId ?? LEGACY_DEFAULT_CLI_ID) as typeof selected.cliId,
+            wrapperCli: row.wrapperCli as string | undefined,
+            cliRuntime: row.cliRuntime as CliRuntimeConfig | undefined,
+            cliPathOverride: row.cliPathOverride as string | undefined,
+          },
         };
       } catch {
+        // Never downgrade to "nothing changed": that would re-open the hole.
         return 'unreadable';
       }
     };
     const closedMismatchedSessions = await agentSwitchCloseHook.run(
       larkAppId,
       switchTarget,
-      readPersistedTarget,
+      { read: readCommittedAuthority, expectedVersion: authorityVersion },
     );
     // ONE shape for every post-close exit. These closes are irreversible, so each
     // exit after them is the only report of a surviving remote session; three

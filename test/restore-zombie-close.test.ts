@@ -1374,84 +1374,136 @@ describe('closeCliMismatchedSessionsForBot — runtime CLI hot-switch sweep', ()
       expect(closeSession).toHaveBeenCalledWith(s1.sessionId);
     });
 
-    // THE WINDOW A DOUBLE CAS CANNOT CLOSE.
+    // THE WINDOW NO COMPARE-AND-SWAP CAN CLOSE.
     //
-    // `target` is captured before the closes start. The closes then run unlocked
-    // for as long as a remote CLI needs, so another process can commit a new
-    // authority in that span. Judging sessions by the stale proposal closes the
-    // WRONG rows: a session frozen on the newly committed runtime looks
-    // mismatched against our old target and is destroyed, while the genuinely
-    // stale one is missed. Refusing the commit afterwards cannot bring it back.
+    // `target` is fixed before the closes start; the closes then run unlocked for
+    // as long as a remote CLI needs. A writer landing in that span makes the
+    // target describe a bot that no longer exists, so sessions frozen on the NEW
+    // identity get closed as "mismatched" while the genuinely stale ones are
+    // missed — and refusing the commit afterwards cannot reopen them.
     //
-    // So each close is re-justified against the row on disk at that moment: when
-    // the authority no longer marks a session as stale we SKIP it (a recoverable
-    // missed close) instead of killing it (unrecoverable).
-    it('does NOT close a session that the CURRENT authority still backs', async () => {
-      // Frozen on 'codex' — the runtime the concurrent writer commits.
-      const frozenOnB = makeActivePersistentSession('om_sw_fresh_b');
-      frozenOnB.cliId = 'codex';
-      sessionStore.updateSession(frozenOnB);
-      registerDs(frozenOnB);
+    // The guard is a VERSION GATE: if the committed authority moved, this request
+    // is already doomed (the commit's CAS will refuse it), so close nothing.
+    const guardFor = (
+      expectedVersion: string,
+      versions: Array<string | undefined | 'unreadable'>,
+    ) => {
+      const queue = [...versions];
+      const calls = { n: 0 };
+      return {
+        calls,
+        guard: {
+          expectedVersion,
+          read: async () => {
+            calls.n++;
+            const v = queue.length > 1 ? queue.shift()! : queue[0];
+            if (v === 'unreadable') return 'unreadable' as const;
+            if (v === undefined) return undefined;
+            return { version: v, target: { cliId: 'codex' as const } };
+          },
+        },
+      };
+    };
 
-      // Our proposal switches the bot to traex, so against THIS target the
-      // codex-frozen session looks mismatched and would be closed.
-      const staleTarget = { cliId: 'traex' as const };
+    it('does NOT close when the committed identity moved mid-switch', async () => {
+      const frozenOnC = makeActivePersistentSession('om_sw_axis_moved');
+      frozenOnC.cliId = 'codex';
+      sessionStore.updateSession(frozenOnC);
+      registerDs(frozenOnC);
 
-      // The authority on disk says codex by the time the close is attempted.
-      const readPersistedTarget = async () => ({ cliId: 'codex' as const });
-
+      // Proposal was derived from version "A"; disk now says "C".
+      const { guard } = guardFor('v-A', ['v-C']);
       const result = await closeSessionsForAgentSwitch(
         'app_test',
-        staleTarget,
-        readPersistedTarget,
+        { cliId: 'traex' as const },
+        guard,
       );
 
       expect(
         closeSession,
-        'a session that matches the authority on disk must never be closed',
-      ).not.toHaveBeenCalledWith(frozenOnB.sessionId);
+        'a session must never be closed once the committed identity moved',
+      ).not.toHaveBeenCalledWith(frozenOnC.sessionId);
       expect(result.closed).toBe(0);
-      expect(
-        sessionStore.getSession(frozenOnB.sessionId)!.status,
-        'the session must survive',
-      ).toBe('active');
+      expect(sessionStore.getSession(frozenOnC.sessionId)!.status).toBe('active');
     });
 
-    it('still closes a session the CURRENT authority marks as stale', async () => {
-      // Frozen on codex; both the proposal and the disk row say traex, so this row
-      // really is stale and must still be closed — the guard must not disable the
-      // feature it protects.
-      const genuinelyStale = makeActivePersistentSession('om_sw_fresh_a');
+    it('still closes when the committed identity is unchanged', async () => {
+      // The guard must not disable the feature it protects.
+      const genuinelyStale = makeActivePersistentSession('om_sw_axis_same');
       genuinelyStale.cliId = 'codex';
       sessionStore.updateSession(genuinelyStale);
       registerDs(genuinelyStale);
 
+      const { guard } = guardFor('v-A', ['v-A']);
       const result = await closeSessionsForAgentSwitch(
         'app_test',
         { cliId: 'traex' as const },
-        async () => ({ cliId: 'traex' as const }),
+        guard,
       );
 
       expect(closeSession).toHaveBeenCalledWith(genuinelyStale.sessionId);
       expect(result).toMatchObject({ ok: true, closed: 1 });
     });
 
+    it('re-reads the authority before EVERY close, without caching', async () => {
+      // A writer landing between two closes must stop the second one.
+      const first = makeActivePersistentSession('om_sw_axis_first');
+      first.cliId = 'codex';
+      sessionStore.updateSession(first);
+      registerDs(first);
+      const second = makeActivePersistentSession('om_sw_axis_second');
+      second.cliId = 'codex';
+      sessionStore.updateSession(second);
+      registerDs(second);
+
+      // Unchanged for the first close, moved for the second.
+      const { guard, calls } = guardFor('v-A', ['v-A', 'v-C']);
+      const result = await closeSessionsForAgentSwitch(
+        'app_test',
+        { cliId: 'traex' as const },
+        guard,
+      );
+
+      expect(calls.n, 'the authority must be read once per close, not cached').toBe(2);
+      expect(result.closed).toBe(1);
+      expect(closeSession).toHaveBeenCalledWith(first.sessionId);
+      expect(closeSession).not.toHaveBeenCalledWith(second.sessionId);
+      expect(sessionStore.getSession(second.sessionId)!.status).toBe('active');
+    });
+
     it('refuses the switch instead of closing when the authority is unreadable', async () => {
-      // Cannot prove the close is still correct ⇒ fail closed rather than destroy a
-      // session on a guess.
-      const s1 = makeActivePersistentSession('om_sw_fresh_unreadable');
+      const s1 = makeActivePersistentSession('om_sw_axis_unreadable');
       s1.cliId = 'codex';
       sessionStore.updateSession(s1);
       registerDs(s1);
 
+      const { guard } = guardFor('v-A', ['unreadable']);
       const result = await closeSessionsForAgentSwitch(
         'app_test',
         { cliId: 'traex' as const },
-        async () => 'unreadable' as const,
+        guard,
       );
 
       expect(closeSession).not.toHaveBeenCalledWith(s1.sessionId);
       expect(result).toMatchObject({ ok: false, closed: 0, failed: 1 });
+      expect(sessionStore.getSession(s1.sessionId)!.status).toBe('active');
+    });
+
+    it('skips the close when the bot row disappeared mid-switch', async () => {
+      const s1 = makeActivePersistentSession('om_sw_axis_gone');
+      s1.cliId = 'codex';
+      sessionStore.updateSession(s1);
+      registerDs(s1);
+
+      const { guard } = guardFor('v-A', [undefined]);
+      const result = await closeSessionsForAgentSwitch(
+        'app_test',
+        { cliId: 'traex' as const },
+        guard,
+      );
+
+      expect(closeSession).not.toHaveBeenCalledWith(s1.sessionId);
+      expect(result.closed).toBe(0);
       expect(sessionStore.getSession(s1.sessionId)!.status).toBe('active');
     });
 

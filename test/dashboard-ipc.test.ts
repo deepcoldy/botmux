@@ -9,6 +9,7 @@ import { ipcRoute, startIpcServer, setLarkAppId, setIpcAuthSecret, setBotRenamer
   agentSwitchCloseHook,
   __testOnly_agentSwitchBeforePreCloseVerify,
 } from '../src/core/dashboard-ipc-server.js';
+import { rmwBotEntry } from '../src/services/config-store.js';
 import { cliAuthBind, signCliAuth } from '../src/dashboard/auth.js';
 import { dashboardEventBus } from '../src/core/dashboard-events.js';
 import * as groupsStore from '../src/services/groups-store.js';
@@ -3794,6 +3795,203 @@ describe('PUT /api/bot-agent', () => {
       if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
       else process.env.BOTS_CONFIG = prevBotsConfig;
       rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  // END-TO-END, THROUGH THE REAL ROUTE READER.
+  //
+  // Three-state concurrency: authority A, this request proposes B, and a REAL
+  // rmwBotEntry writer commits C while the close hook runs. A session frozen on C
+  // must survive: it is correct under the committed authority, and closing it
+  // cannot be undone by the commit's 409.
+  //
+  // Handing the helper a hand-written reader would not prove this. The earlier
+  // version of this fix passed such a test while the route still sent the
+  // request's own cliId/wrapperCli, so a concurrent SELECTION change stayed
+  // invisible. These cases therefore drive the real HTTP route.
+  const threeStateFixture = async (
+    appId: string,
+    dirPrefix: string,
+    initialRow: Record<string, unknown>,
+    frozen: { cliId: string; wrapperCli?: string; cliRuntime?: unknown },
+    commitDuringClose: (row: Record<string, unknown>) => void,
+    requestBody: unknown,
+    opts: { durableOnly?: boolean } = {},
+  ) => {
+    const dir = mkdtempSync(join(tmpdir(), dirPrefix));
+    const dataDir = join(dir, 'data');
+    const configPath = join(dir, 'bots.json');
+    const prevBotsConfig = process.env.BOTS_CONFIG;
+    const prevDataDir = config.session.dataDir;
+    const originalCloseHook = agentSwitchCloseHook.run;
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      config.session.dataDir = dataDir;
+      writeFileSync(configPath, JSON.stringify([
+        { larkAppId: appId, larkAppSecret: 'secret', ...initialRow },
+      ], null, 2));
+      loadBotConfigs().forEach((c: any) => registerBot(c));
+      sessionStore.init(appId);
+
+      // A live session FROZEN on the identity the concurrent writer commits.
+      const session = sessionStore.createSession('oc_3s', 'om_3s', '3state', 'group');
+      session.larkAppId = appId;
+      session.cliId = frozen.cliId as any;
+      // The wrapper / runtime axes are only compared for agentFrozen rows
+      // (sessionRowMismatchesTargetCli): a legacy unfrozen session has no reliable
+      // wrapper snapshot. Without this flag those two fixtures are VACUOUS — the
+      // session never looks mismatched, so they pass even with the guard removed.
+      session.agentFrozen = true;
+      if (frozen.wrapperCli) session.wrapperCli = frozen.wrapperCli;
+      if (frozen.cliRuntime) (session as any).cliRuntime = frozen.cliRuntime;
+      sessionStore.updateSession(session);
+
+      const registry = new Map<string, any>();
+      if (!opts.durableOnly) {
+        registry.set(sessionKey(session.rootMessageId, appId), {
+          session, worker: null, workerPort: null, workerToken: null,
+          larkAppId: appId, chatId: session.chatId, chatType: 'group', scope: 'thread',
+          spawnedAt: Date.now(), cliVersion: 'test', lastMessageAt: Date.now(),
+          hasHistory: true,
+        });
+      }
+      workerPool.setActiveSessionsRegistry(registry);
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+
+      // The concurrent writer uses the REAL locked read-modify-write, i.e. exactly
+      // what another daemon/CLI does, and lands inside the close span.
+      let writerDone = false;
+      agentSwitchCloseHook.run = async (...args: Parameters<typeof originalCloseHook>) => {
+        if (!writerDone) {
+          writerDone = true;
+          await rmwBotEntry(appId, (entry: any) => {
+            commitDuringClose(entry);
+            return { write: true, result: null };
+          });
+        }
+        return originalCloseHook(...args);
+      };
+
+      const res = await fetch(`http://127.0.0.1:${handle.port}/api/bot-agent`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(requestBody),
+      });
+      const body = await res.json();
+      const storedRow = JSON.parse(readFileSync(configPath, 'utf-8'))[0];
+      const sessionAfter = sessionStore.getSession(session.sessionId);
+
+      return { res, body, storedRow, sessionAfter, writerDone };
+    } finally {
+      agentSwitchCloseHook.run = originalCloseHook;
+      workerPool.setActiveSessionsRegistry(new Map());
+      sessionStore.init();
+      config.session.dataDir = prevDataDir;
+      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = prevBotsConfig;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  };
+
+  it('three-state selection: a session frozen on the concurrently committed cliId survives', async () => {
+    const out = await threeStateFixture(
+      'test-agent-3s-sel',
+      'botmux-agent-3s-sel-',
+      // A = claude-code; request proposes B = codex; the writer commits C = traex.
+      // The session is frozen on C, so it MISMATCHES our proposal B (and would be
+      // closed) but MATCHES the committed authority C (so it must not be).
+      { cliId: 'claude-code', model: 'old-model' },
+      { cliId: 'traex' },
+      (entry) => { entry.cliId = 'traex'; },
+      { cliId: 'codex', model: 'new-model' },
+    );
+
+    expect(out.writerDone, 'the concurrent writer must have run').toBe(true);
+    expect(
+      out.sessionAfter!.status,
+      'a session frozen on the committed cliId must NOT be closed',
+    ).toBe('active');
+    expect(out.res.status, 'the doomed request must be refused').toBe(409);
+    expect(out.body).toMatchObject({ error: 'bot_config_changed_during_switch' });
+    expect(out.storedRow.cliId, "the writer's commit must survive").toBe('traex');
+    expect(out.storedRow.model, 'nothing of ours may be committed').toBe('old-model');
+  });
+
+  it('three-state selection: same protection for a DURABLE-only row', async () => {
+    const out = await threeStateFixture(
+      'test-agent-3s-durable',
+      'botmux-agent-3s-durable-',
+      { cliId: 'claude-code', model: 'old-model' },
+      { cliId: 'traex' },
+      (entry) => { entry.cliId = 'traex'; },
+      { cliId: 'codex', model: 'new-model' },
+      { durableOnly: true },
+    );
+
+    expect(out.writerDone).toBe(true);
+    expect(
+      out.sessionAfter!.status,
+      'the durable-row close path must honour the fresh authority too',
+    ).toBe('active');
+    expect(out.res.status).toBe(409);
+    expect(out.storedRow.cliId).toBe('traex');
+  });
+
+  it('three-state wrapper: a session frozen on the concurrently committed wrapper survives', async () => {
+    const out = await threeStateFixture(
+      'test-agent-3s-wrap',
+      'botmux-agent-3s-wrap-',
+      { cliId: 'codex', model: 'old-model' },
+      { cliId: 'codex', wrapperCli: 'ttadk codex' },
+      (entry) => { entry.wrapperCli = 'ttadk codex'; },
+      { cliId: 'codex', model: 'new-model' },
+    );
+
+    expect(out.writerDone).toBe(true);
+    expect(
+      out.sessionAfter!.status,
+      'the wrapper axis must be part of the identity check',
+    ).toBe('active');
+    expect(out.res.status).toBe(409);
+    expect(out.storedRow.wrapperCli).toBe('ttadk codex');
+  });
+
+  it('three-state explicit runtime: body runtime cannot override a concurrent commit', async () => {
+    const binDir = mkdtempSync(join(tmpdir(), 'botmux-agent-3s-rt-bins-'));
+    const binB = join(binDir, 'runtime-b');
+    const binC = join(binDir, 'runtime-c');
+    symlinkSync(process.execPath, binB);
+    symlinkSync(process.execPath, binC);
+    try {
+      const out = await threeStateFixture(
+        'test-agent-3s-rt',
+        'botmux-agent-3s-rt-',
+        { cliId: 'codex', model: 'old-model' },
+        {
+          cliId: 'codex',
+          cliRuntime: { id: 'runtime-c', displayName: 'RuntimeC', executable: binC },
+        },
+        (entry) => {
+          entry.cliRuntime = { id: 'runtime-c', displayName: 'RuntimeC', executable: binC };
+          entry.cliPathOverride = binC;
+        },
+        {
+          cliId: 'codex',
+          model: 'new-model',
+          cliRuntime: { id: 'runtime-b', displayName: 'RuntimeB', executable: binB },
+        },
+      );
+
+      expect(out.writerDone).toBe(true);
+      expect(
+        out.sessionAfter!.status,
+        'an explicit body runtime must not license closing a session the authority backs',
+      ).toBe('active');
+      expect(out.res.status).toBe(409);
+      expect(out.storedRow.cliRuntime?.id).toBe('runtime-c');
+    } finally {
+      rmSync(binDir, { recursive: true, force: true });
     }
   });
 
