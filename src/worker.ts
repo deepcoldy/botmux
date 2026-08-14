@@ -208,6 +208,7 @@ import {
   readComm,
   isBareShellComm,
   bareShellLaunchKind,
+  bareShellLaunchGuidance,
   settleLaunchComm,
 } from './core/session-discovery.js';
 import { CODEX_RPC_TERMINAL_HYDRATION_DELAYS_MS, RpcEngagementFence, codexRpcEligible, paneRunsRemoteTui, orchestrateCodexRpcInit, rolloutUserTurnMatches, decideStartupDialogAction, shouldQueueInitialPrompt, shouldPreMarkFirstTurn, killAndVerifyPersistentPane, rpcTranscriptIngestBlockedByAwaitingActivation, type EngageOutcome } from './codex-rpc-lifecycle.js';
@@ -9780,7 +9781,9 @@ async function detectBareShellLaunch(): Promise<boolean> {
   // rcfile may still finish and exec the CLI after this bounded check.
   const launchShell = (lastInitConfig?.launchShell || process.env.SHELL || '').trim();
   const expectedShell = launchShell ? basename(launchShell) : '';
-  const trampolined = bareShellLaunchKind(comm!, expectedShell) === 'trampoline';
+  if (!comm) return false;
+  const shellComm = comm;
+  const trampolined = bareShellLaunchKind(shellComm, expectedShell) === 'trampoline';
   bareShellLaunchBlocked = true;
   // Injection-first flushes can enter while isPromptReady is still true. Make
   // this a real busy/blocked transition so a later PTY-ready event re-enters
@@ -9796,16 +9799,17 @@ async function detectBareShellLaunch(): Promise<boolean> {
   const cli = cliName();
   let message: string;
   if (trampolined) {
+    const guidance = bareShellLaunchGuidance(shellComm, expectedShell);
     message =
-      `⚠️ 会话没能启动：pane 里现在是裸 \`${comm}\`，${cli} 没真正跑起来——所以我没把你的消息打进去（否则会被当 shell 命令执行，报 \`parse error\`）。\n\n` +
-      `最可能原因：botmux 用 \`${expectedShell}\` 启动 CLI，但 pane 落到了 \`${comm}\`。通常是 rc 文件（如 \`~/.${expectedShell}rc\`）里有 \`exec ${comm}\` 这类跳转——\`${expectedShell} -i\` 会 source rc，于是 shell 被顶替，CLI 的启动命令没机会跑。\n\n` +
+      `⚠️ 会话没能启动：pane 里现在是裸 \`${shellComm}\`，${cli} 没真正跑起来——所以我没把你的消息打进去（否则会被当 shell 命令执行，报 \`parse error\`）。\n\n` +
+      `最可能原因：botmux 用 \`${expectedShell}\` 启动 CLI，但 pane 落到了 \`${shellComm}\`。通常是 rc 文件（如 \`${guidance.rcFileHint}\`）里有 \`exec ${shellComm}\` 这类跳转——\`${expectedShell} -i\` 会 source rc，于是 shell 被顶替，CLI 的启动命令没机会跑。\n\n` +
       `两种修法（任选其一，改完重启 daemon 再发一条消息）：\n` +
-      `① 给那行加守卫，只在手动开终端时切：\`[ -z "$BASH_EXECUTION_STRING" ] && [ -t 1 ] && exec ${comm}\`（注意 PATH/nvm 等导出放在它之前）\n` +
-      `② 给这个 bot 配 \`launchShell: ${comm}\`（dashboard 机器人配置，或 \`/config launchShell ${comm}\`），直接用 \`${comm}\` 启动绕开 \`${expectedShell}\` 的 rc——但要确保 PATH/nvm 在 \`${comm}\` 的 rc 里。`;
+      `① 给那行加守卫，只在手动开终端时切：\`${guidance.manualTerminalGuard}\`（注意 PATH/nvm 等导出放在它之前）\n` +
+      `② 给这个 bot 配 \`launchShell: ${shellComm}\`（dashboard 机器人配置，或 \`/config launchShell ${shellComm}\`），直接用 \`${shellComm}\` 启动绕开 \`${expectedShell}\` 的 rc——但要确保 PATH/nvm 在 \`${shellComm}\` 的 rc 里。`;
   } else {
     message =
-      `⚠️ ${cli} 启动时间较长：pane 里暂时仍是 \`${comm}\`。我没有把消息写进 shell，消息还在队列里；检测到真实输入框后会自动继续投递，无需重发。\n\n` +
-      `仅凭进程仍是 \`${comm}\` 无法判断具体原因，可能只是 rc 文件或机器负载让启动变慢。若长时间没有恢复，请打开 Web 终端查看当前提示，处理后等待自动继续，或使用 \`/restart\` 重启会话。`;
+      `⚠️ ${cli} 启动时间较长：pane 里暂时仍是 \`${shellComm}\`。我没有把消息写进 shell，消息还在队列里；检测到真实输入框后会自动继续投递，无需重发。\n\n` +
+      `仅凭进程仍是 \`${shellComm}\` 无法判断具体原因，可能只是 rc 文件或机器负载让启动变慢。若长时间没有恢复，请打开 Web 终端查看当前提示，处理后等待自动继续，或使用 \`/restart\` 重启会话。`;
   }
   const pendingTurn = pendingMessages[0];
   send({

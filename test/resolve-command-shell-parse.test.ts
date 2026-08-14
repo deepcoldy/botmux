@@ -32,8 +32,10 @@ describe('shellPathProbes ladder', () => {
     ]);
   });
 
-  it('ignores non-POSIX shells like fish', () => {
+  it('probes the fish login shell before the zsh fallback for fish users', () => {
     expect(shellPathProbes({ SHELL: '/usr/local/bin/fish' })).toEqual([
+      { shell: '/usr/local/bin/fish', flags: '-ic' },
+      { shell: '/usr/local/bin/fish', flags: '-lc' },
       { shell: '/bin/zsh', flags: '-ic' },
       { shell: '/bin/zsh', flags: '-lc' },
     ]);

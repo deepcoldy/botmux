@@ -104,15 +104,17 @@ describe('trigger request contract', () => {
     if (!v.ok) expect(v.body.errorCode).toBe('bad_request');
   });
 
-  it('accepts per-turn model + reasoningEffort overrides', () => {
-    const req = request();
-    req.options = { model: 'gpt-5.6-terra', reasoningEffort: 'high' };
-    expect(validateTriggerRequest(req).ok).toBe(true);
+  it('accepts per-turn model + every supported reasoningEffort override', () => {
+    for (const reasoningEffort of ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'] as const) {
+      const req = request();
+      req.options = { model: 'gpt-5.6-terra', reasoningEffort };
+      expect(validateTriggerRequest(req).ok).toBe(true);
+    }
   });
 
   it('rejects an invalid reasoningEffort value', () => {
     const req = request();
-    (req.options as any) = { reasoningEffort: 'ultra' };
+    (req.options as any) = { reasoningEffort: 'extreme' };
     const v = validateTriggerRequest(req);
     expect(v.ok).toBe(false);
     if (!v.ok) expect(v.body.errorCode).toBe('bad_request');

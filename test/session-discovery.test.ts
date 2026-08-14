@@ -56,6 +56,7 @@ import {
   validateAdoptTarget,
   isBareShellComm,
   bareShellLaunchKind,
+  bareShellLaunchGuidance,
   settleLaunchComm,
 } from '../src/core/session-discovery.js';
 import type { CliId } from '../src/adapters/cli/types.js';
@@ -113,6 +114,23 @@ describe('settleLaunchComm()', () => {
     }
   });
 
+  it('does not classify a fish launch wrapper as failed when it execs the CLI shortly afterward', async () => {
+    vi.useFakeTimers();
+    try {
+      const reads = ['fish', 'codex'];
+      const settled = settleLaunchComm(
+        () => reads.shift() ?? 'codex',
+        { timeoutMs: 2_000, pollMs: 100 },
+      );
+
+      await vi.advanceTimersByTimeAsync(100);
+
+      expect(await settled).toBe('codex');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('returns a persistent bare shell after the bounded launch grace period', async () => {
     vi.useFakeTimers();
     try {
@@ -127,6 +145,38 @@ describe('settleLaunchComm()', () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it('returns a persistent fish shell after the bounded launch grace period', async () => {
+    vi.useFakeTimers();
+    try {
+      const settled = settleLaunchComm(
+        () => 'fish',
+        { timeoutMs: 300, pollMs: 100 },
+      );
+
+      await vi.advanceTimersByTimeAsync(300);
+
+      expect(await settled).toBe('fish');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe('bareShellLaunchGuidance()', () => {
+  it('points fish trampoline diagnostics at config.fish and fish-compatible guards', () => {
+    const guidance = bareShellLaunchGuidance('zsh', 'fish');
+
+    expect(guidance.rcFileHint).toBe('~/.config/fish/config.fish');
+    expect(guidance.manualTerminalGuard).toBe('status is-interactive; and isatty stdout; and not set -q BOTMUX_MANAGED_SHELL; and exec zsh');
+  });
+
+  it('preserves POSIX rc and guard guidance for bash/zsh launches', () => {
+    const guidance = bareShellLaunchGuidance('fish', 'zsh');
+
+    expect(guidance.rcFileHint).toBe('~/.zshrc');
+    expect(guidance.manualTerminalGuard).toBe('[ -z "$BASH_EXECUTION_STRING" ] && [ -t 1 ] && exec fish');
   });
 });
 

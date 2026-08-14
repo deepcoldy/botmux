@@ -627,14 +627,20 @@ describe('core-only entrypoint hardening (codex 4 P1s — source lock)', () => {
     // arg; call sites resolve via resolveBotmuxWrapperBinDir(opts.env). NO hardcoded
     // $HOME/.botmux/bin and NO runtime-env shell resolution.
     const tmuxSrc = readFileSync(resolve('src/adapters/backend/tmux-backend.ts'), 'utf8');
-    expect(tmuxSrc).toContain('export function shellWrapperScript(binDir: string)');
-    expect(tmuxSrc).toContain('resolveBotmuxWrapperBinDir(opts.env ?? process.env)');
+    expect(tmuxSrc).toContain("export function shellWrapperScript(binDir: string, kind: ShellKind = 'sh')");
+    expect(tmuxSrc).toContain('const wrapperBinDir = resolveBotmuxWrapperBinDir(opts.env ?? process.env);');
+    expect(tmuxSrc).toContain(': shellWrapperScript(wrapperBinDir, shellKind);');
     expect(tmuxSrc).not.toContain('export PATH="$HOME/.botmux/bin:$PATH"');
     expect(tmuxSrc).not.toContain('botmuxWrapperPathExportSh'); // footgun removed
-    // The other two persistent backends resolve host-side too (not the old const).
-    for (const f of ['src/adapters/backend/tmux-pipe-backend.ts', 'src/adapters/backend/zellij-backend.ts']) {
+    const fishAwarePersistentBackendCalls: Record<string, RegExp> = {
+      'src/adapters/backend/tmux-pipe-backend.ts': /shellWrapperScript\(\s*resolveBotmuxWrapperBinDir\(opts\.env \?\? process\.env\),\s*shellKindForPath\(shellSpec\.shell\),\s*\)/,
+      'src/adapters/backend/zellij-backend.ts': /shellWrapperScript\(resolveBotmuxWrapperBinDir\(opts\.env \?\? process\.env\), kind\)/,
+      'src/adapters/backend/zmx-backend.ts': /shellWrapperScript\(wrapperBinDir, shellKind\)/,
+    };
+    for (const [f, callPattern] of Object.entries(fishAwarePersistentBackendCalls)) {
       const src = readFileSync(resolve(f), 'utf8');
-      expect(src, f).toContain('shellWrapperScript(resolveBotmuxWrapperBinDir(opts.env ?? process.env))');
+      expect(src, f).toContain('resolveBotmuxWrapperBinDir(opts.env ?? process.env)');
+      expect(src, f).toMatch(callPattern);
       // No longer IMPORTS or CALLS the old const (a lingering mention in a prose
       // comment is fine — assert the import + call-site are gone, not the word).
       expect(src, f).not.toMatch(/import \{[^}]*\bSHELL_WRAPPER_SCRIPT\b/);

@@ -140,6 +140,7 @@ describe('Codex-compatible runtime editor', () => {
   it('defaults old payloads to Official Codex and keeps wrapper or non-Codex selections unchanged', () => {
     const official = renderAgent({ cliId: 'codex' });
     expect(official.root.findByProps({ 'data-input': 'agentRuntimeMode' }).props.value).toBe('official');
+    expect(official.root.findByProps({ dataInput: 'agentReasoningEffort' }).props.value).toBe('');
     expect(official.root.findAllByProps({ 'data-input': 'agentRuntimeId' })).toHaveLength(0);
 
     const otherCli = renderAgent({ cliId: 'traex', agentSelectionKey: 'traex' });
@@ -154,6 +155,34 @@ describe('Codex-compatible runtime editor', () => {
 
     const oldWrapperPayload = renderAgent({ cliId: 'codex', wrapperCli: 'custom-launcher codex' });
     expect(oldWrapperPayload.root.findAllByProps({ 'data-codex-runtime': '' })).toHaveLength(0);
+  });
+
+  it('shows and saves the configured Codex reasoning effort', async () => {
+    const previousFetch = globalThis.fetch;
+    const requests: any[] = [];
+    (globalThis as any).fetch = vi.fn(async (_url: string, init?: any) => {
+      const body = JSON.parse(init?.body ?? '{}');
+      requests.push(body);
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ ok: true, cliId: 'codex', model: '', reasoningEffort: body.reasoningEffort, selectionKey: 'codex' }),
+      } as any;
+    });
+    try {
+      const { root } = renderAgent({ cliId: 'codex', model: 'gpt-5.6-sol', reasoningEffort: 'high' });
+      const picker = root.findByProps({ dataInput: 'agentReasoningEffort' });
+      expect(picker.props.value).toBe('high');
+      act(() => picker.props.onChange('ultra'));
+      await act(async () => {
+        root.findByProps({ 'data-action': 'save-agent' }).props.onClick();
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+      expect(requests).toEqual([{ cliId: 'codex', model: 'gpt-5.6-sol', reasoningEffort: 'ultra' }]);
+    } finally {
+      (globalThis as any).fetch = previousFetch;
+    }
   });
 
   it('shows a legacy path as read-only and omits cliRuntime on a model-only save', async () => {
@@ -198,7 +227,7 @@ describe('Codex-compatible runtime editor', () => {
         await Promise.resolve();
       });
 
-      expect(requests).toEqual([{ cliId: 'codex', model: 'new-model' }]);
+      expect(requests).toEqual([{ cliId: 'codex', model: 'new-model', reasoningEffort: '' }]);
       expect(patchBot).toHaveBeenCalledWith('cli_runtime', expect.objectContaining({
         cliRuntime: null,
         cliPathOverride: legacyPath,
@@ -424,7 +453,7 @@ describe('Codex-compatible runtime editor', () => {
         await Promise.resolve();
       });
 
-      expect(requests).toEqual([{ cliId: 'codex', model: '', cliRuntime: null }]);
+      expect(requests).toEqual([{ cliId: 'codex', model: '', reasoningEffort: '', cliRuntime: null }]);
       expect(root.findByProps({ 'data-agent-status': '' }).children.join('')).toContain('2');
     } finally {
       (globalThis as any).fetch = previousFetch;
@@ -471,7 +500,7 @@ describe('Codex-compatible runtime editor', () => {
         await Promise.resolve();
       });
 
-      expect(requests).toEqual([{ cliId: 'codex', model: '', cliRuntime: savedRuntime }]);
+      expect(requests).toEqual([{ cliId: 'codex', model: '', reasoningEffort: '', cliRuntime: savedRuntime }]);
     } finally {
       (globalThis as any).fetch = previousFetch;
     }
@@ -526,7 +555,7 @@ describe('Codex-compatible runtime editor', () => {
         await Promise.resolve();
         await Promise.resolve();
       });
-      expect(requests).toEqual([{ cliId: 'codex', model: 'gpt-next' }]);
+      expect(requests).toEqual([{ cliId: 'codex', model: 'gpt-next', reasoningEffort: '' }]);
     } finally {
       (globalThis as any).fetch = previousFetch;
     }
@@ -575,7 +604,7 @@ describe('Codex-compatible runtime editor', () => {
 
       expect(requests).toEqual([{
         url: '/api/bots/cli_runtime/agent',
-        body: { cliId: 'codex', model: '', cliRuntime: savedRuntime },
+        body: { cliId: 'codex', model: '', reasoningEffort: '', cliRuntime: savedRuntime },
       }]);
       expect(patchBot).toHaveBeenCalledWith('cli_runtime', expect.objectContaining({ cliRuntime: savedRuntime }));
       const probeText = root.findByProps({ 'data-runtime-status': '' }).children.join('');
@@ -614,7 +643,7 @@ describe('Codex-compatible runtime editor', () => {
         await Promise.resolve();
         await Promise.resolve();
       });
-      expect(requests[requests.length - 1]).toEqual({ cliId: 'codex', model: '', cliRuntime: null });
+      expect(requests[requests.length - 1]).toEqual({ cliId: 'codex', model: '', reasoningEffort: '', cliRuntime: null });
     } finally {
       (globalThis as any).fetch = previousFetch;
     }
