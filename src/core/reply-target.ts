@@ -87,6 +87,28 @@ export type SessionReplyTarget =
   | { mode: 'thread'; rootMessageId: string }
   | { mode: 'quote'; rootMessageId: string };
 
+/** Freeze the visible Lark destination for one inbound turn before any
+ * lifecycle mutation can replace or remove its session. `replyRootId` is
+ * supplied only for a real chat-scope thread fold-back; quote-only turns keep
+ * the same root but use ordinary reply semantics instead of reply_in_thread. */
+export function resolveInboundReplyTarget(args: {
+  scope: 'chat' | 'thread';
+  chatId: string;
+  threadRootId: string;
+  replyRootId?: string;
+  quoteOnly?: boolean;
+}): SessionReplyTarget {
+  if (args.scope === 'chat') {
+    if (args.replyRootId) {
+      return args.quoteOnly
+        ? { mode: 'quote', rootMessageId: args.replyRootId }
+        : { mode: 'thread', rootMessageId: args.replyRootId };
+    }
+    return { mode: 'plain', chatId: args.chatId };
+  }
+  return { mode: 'thread', rootMessageId: args.threadRootId };
+}
+
 /** Bound on `Session.replyTargets`: long-lived sessions could otherwise grow
  * without limit. An evicted turn may use a legacy slot only when its turnId
  * still matches exactly; it never borrows a later turn's sender. */
@@ -237,13 +259,13 @@ export function beginReplyTargetTurn(
   // #597: the frozen per-turn dispatch context — the authoritative reply target
   // for THIS turn's Codex App dispatch (steer/queued/opening). Independent of the
   // mention-back participant record below; both are written per turn.
-  const exactTarget: SessionReplyTarget = ds.scope === 'chat'
-    ? replyRootId
-      ? opts?.quoteOnly
-        ? { mode: 'quote', rootMessageId: replyRootId }
-        : { mode: 'thread', rootMessageId: replyRootId }
-      : { mode: 'plain', chatId: ds.chatId }
-    : { mode: 'thread', rootMessageId: ds.session.rootMessageId };
+  const exactTarget = resolveInboundReplyTarget({
+    scope: ds.scope,
+    chatId: ds.chatId,
+    threadRootId: ds.session.rootMessageId,
+    replyRootId,
+    quoteOnly: opts?.quoteOnly,
+  });
   const exactContexts = { ...(ds.session.turnReplyContexts ?? {}) };
   // Re-insertion keeps the newest turn at the end for deterministic bounding.
   delete exactContexts[turnId];

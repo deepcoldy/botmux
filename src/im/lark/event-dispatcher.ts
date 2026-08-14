@@ -687,6 +687,11 @@ function cardActionKey(larkAppId: string, data: any): string {
     messageId: cardActionMessageId(data),
     operator: data?.operator?.open_id,
     action: value?.action ?? action?.option ?? action?.tag,
+    // Feedback primary/reason buttons share an action name. Include their
+    // semantic target so a rapid change of choice is not mistaken for a
+    // duplicate in-flight click on the previous button.
+    feedbackResult: value?.result,
+    feedbackReason: value?.reason_key,
     rootId: value?.root_id,
     sessionId: value?.session_id,
     // Detail actions can share action labels across rows; include row ids so
@@ -721,7 +726,7 @@ function shapeCardActionResult(result: any): any {
   // The handler may return:
   //   - an already-shaped Lark response ({toast} and/or {card}) -> pass through;
   //   - a raw card body (e.g. toggle_stream) -> wrap as an in-place card patch.
-  if (result && (result.toast || result.card)) return result;
+  if (result && (result.toast || result.card || result.deferredCard)) return result;
   if (result) return { card: { type: 'raw', data: result } };
   // The Lark WS SDK only serializes callback `data` for truthy results. An
   // empty object therefore means "ACK with no UI update", while undefined
@@ -736,8 +741,8 @@ function serializeRawCardForPatch(cardData: any): string | undefined {
 
 async function patchTimedOutCardActionResult(larkAppId: string, data: any, shapedResult: any): Promise<void> {
   const messageId = cardActionMessageId(data);
-  if (!messageId || !shapedResult?.card) return;
-  const card = shapedResult.card;
+  const card = shapedResult?.card ?? shapedResult?.deferredCard;
+  if (!messageId || !card) return;
   const raw = card.type === 'raw' ? card.data : card;
   const body = serializeRawCardForPatch(raw);
   if (!body) return;
@@ -769,6 +774,17 @@ async function handleCardActionAckSafe(data: any, larkAppId: string, handlers: E
   let timedOut = false;
   const work = handlers.handleCardAction(data, larkAppId)
     .then(shapeCardActionResult)
+    .then(result => {
+      if (!result?.deferredCard) return result;
+      // ACK the callback before patching. If we await message.patch here, Lark
+      // applies the callback completion after the API patch and can restore the
+      // pre-click card, making the expanded follow-up flash and disappear.
+      setTimeout(() => {
+        void patchTimedOutCardActionResult(larkAppId, data, result)
+          .catch(err => logger.warn(`Failed to patch deferred card action result: ${err}`));
+      }, 0);
+      return {};
+    })
     .catch(err => {
       logger.error(`Error handling card action: ${err}`);
       return {};
@@ -1780,6 +1796,12 @@ export interface RoutingContext {
    *  using it (the resource keys belong to the source message, PR review P1). */
   replyAnchorMessageId?: string;
   larkAppId: string;
+  /** 本轮 inbound 的接纳阶段标记，由 daemon 的普通消息入口初始化、各接纳点翻转。
+   *  必须是共享 mutable box 而非布尔字段：reroute 交接会浅拷贝 ctx
+   *  （`{ ...ctx, scope, anchor }`），box 引用随拷贝共享，接纳发生在拷贝之后
+   *  也能被最外层 ingress catch 看到。admitted 为 true 后该 catch 不得再提示
+   *  重发——本轮已进 durable queue / worker，重发会让同一任务再次入队执行。 */
+  ingressAdmission?: { admitted: boolean };
 }
 
 interface PendingForwardTopicPayload {

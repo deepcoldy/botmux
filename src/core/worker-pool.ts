@@ -29,6 +29,7 @@ import { fallbackTurnId, frozenReplyContextForTurn, isSubstituteTurn } from './r
 import { updateMessage, deleteMessage, sendEphemeralCard, sendUserMessage, addReaction, removeReaction, getMessageChatId, MessageWithdrawnError } from '../im/lark/client.js';
 import { buildStreamingCard, buildPrivateSnapshotCard, buildSessionCard, buildTuiPromptCard, buildTuiPromptResolvedCard, buildTuiPromptFailedCard, buildRelayedFrozenCard, getCliDisplayName } from '../im/lark/card-builder.js';
 import { codexServiceTierBadge } from '../services/codex-service-tier.js';
+import { codexModelSupportsReasoningEffort, isCodexReasoningCliId } from '../services/codex-reasoning-effort.js';
 import { loadFrozenCards, saveFrozenCards } from '../services/frozen-card-store.js';
 import { hashUrlForLog } from '../adapters/backend/riff-backend.js';
 import { logger } from '../utils/logger.js';
@@ -47,6 +48,7 @@ import { claudeJsonlPathForSession } from '../adapters/cli/claude-code.js';
 import { findUniqueClaudeSessionByCwd } from './session-discovery.js';
 import {
   buildMarkdownCard,
+  buildCanonicalFinalReplyCard,
   buildContextualReplyCard,
   type CardUsageSnapshot,
   type LocalHomeLinkMode,
@@ -70,6 +72,7 @@ import { getBot, getAllBots, loadBotConfigs, resolveBrandLabel, getLoadedConfigP
 import { RestartCoordinator, type RestartObserver } from './restart-coordinator.js';
 import { runtimeBuildIdentity } from '../utils/runtime-build-id.js';
 import { scrubWorkflowWorkerEnv } from '../utils/child-env.js';
+import { resolveFeedbackPolicyForDelivery, resolveFeedbackTeamId } from '../services/feedback-policy-resolver.js';
 
 /** A random id minted once per daemon process (this lifetime). Stamped onto
  *  isolated persistent panes so a suspend→resume reattach (same id) is
@@ -1034,8 +1037,8 @@ function storedSessionCliDisplayName(ds: DaemonSession): string {
 
 function sessionAgentConfig(
   ds: DaemonSession,
-  botCfg: { cliId: CliId; cliRuntime?: CliRuntimeConfig; cliPathOverride?: string; wrapperCli?: string; model?: string },
-): { cliId: CliId; cliRuntime?: CliRuntimeSnapshot; cliPathOverride?: string; wrapperCli?: string; model?: string; reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' } {
+  botCfg: { cliId: CliId; cliRuntime?: CliRuntimeConfig; cliPathOverride?: string; wrapperCli?: string; model?: string; reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra' },
+): { cliId: CliId; cliRuntime?: CliRuntimeSnapshot; cliPathOverride?: string; wrapperCli?: string; model?: string; reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra' } {
   // Freeze the agent launch config (cli / runtime / cliPath / wrapper / model) onto the
   // session the first time a worker forks, so later bot-level edits never
   // retroactively change a live session — same discipline as `sandbox`.
@@ -1068,6 +1071,9 @@ function sessionAgentConfig(
       ?? botCfg.cliPathOverride;
     ds.session.wrapperCli = ds.session.wrapperCli ?? botCfg.wrapperCli;
     ds.session.model = ds.session.model ?? botCfg.model;
+    ds.session.reasoningEffort = isCodexReasoningCliId(ds.session.cliId)
+      ? ds.session.reasoningEffort ?? botCfg.reasoningEffort
+      : undefined;
     ds.session.agentFrozen = true;
     sessionStore.updateSession(ds.session);
   } else {
@@ -1097,6 +1103,11 @@ function sessionAgentConfig(
       }
     }
     if (repaired) sessionStore.updateSession(ds.session);
+  }
+  if (ds.session.reasoningEffort
+      && !codexModelSupportsReasoningEffort(ds.session.model, ds.session.reasoningEffort)) {
+    ds.session.reasoningEffort = undefined;
+    sessionStore.updateSession(ds.session);
   }
   return {
     cliId: ds.session.cliId ?? botCfg.cliId,
@@ -1134,7 +1145,7 @@ function loadKnownBotOpenIdsForApp(larkAppId: string): Set<string> {
  *  mircli runner). They can't @-trigger a peer bot themselves, so for bot-to-bot
  *  handoffs the fallback card must carry the real <at> back to the dispatcher. */
 function isRunnerDeliveryCli(cliId?: string): boolean {
-  return cliId === 'mira' || cliId === 'mir';
+  return cliId === 'mira' || cliId === 'mir' || cliId === 'dsh';
 }
 
 function daemonCardFooterRecipientOpenId(ds: DaemonSession, effectiveCliId?: string): string | undefined {
@@ -1868,14 +1879,13 @@ export async function deliverSubstituteControlCard(ds: DaemonSession): Promise<S
  * reply (`reply`). `content` is the card JSON when msgType==='interactive',
  * otherwise the plain text. Topic-group / p2p behavior is unchanged.
  *
- * IMPORTANT: ephemeral is only attempted for flat **chat-scope** sessions. The
+ * IMPORTANT: ephemeral is only attempted for a flat **chat-scope** destination. The
  * ephemeral API (`ephemeral/v1/send`) takes a `chat_id` only — it has no
  * thread/root anchoring — so for a **thread-scope** session (a 话题 inside a
  * 普通群, or a 话题群 topic) an ephemeral card would escape the topic and land at
- * the group top-level. 话题群 happened to reject ephemeral with 18053 and fall
- * back to the in-thread reply, but a 话题 inside a 普通群 succeeds and leaks the
- * card out of the thread. So thread-scope sessions always take the visible
- * `reply()` path, which routes back into the thread (`reply_in_thread`).
+ * the group top-level. The same applies when a chat-scope session is invoked
+ * from a folded thread: callers pass its frozen reply target, and any explicit
+ * thread/quote destination takes the visible `reply()` path.
  */
 export async function deliverEphemeralOrReply(
   ds: DaemonSession,
@@ -1883,8 +1893,16 @@ export async function deliverEphemeralOrReply(
   content: string,
   msgType: 'text' | 'interactive',
   reply: () => Promise<unknown>,
+  replyTarget?: FrozenSessionReplyTarget,
 ): Promise<void> {
-  if (operatorOpenId && ds.chatType !== 'p2p' && ds.scope === 'chat') {
+  // A chat-scope session can still be invoked from a folded thread. The
+  // ephemeral API has no root/thread field, so an explicitly frozen thread or
+  // quote target must take the visible reply path even though the session
+  // itself remains chat-scoped.
+  const allowsEphemeral = replyTarget
+    ? replyTarget.mode === 'plain'
+    : ds.scope === 'chat';
+  if (operatorOpenId && ds.chatType !== 'p2p' && allowsEphemeral) {
     try {
       // The ephemeral API is card-only (msg_type=text → 10003), so wrap a plain
       // confirmation line into a minimal markdown card.
@@ -5029,7 +5047,7 @@ export async function forkSession(
   //   • model / reasoningEffort / cliPathOverride / wrapperCli / agentFrozen:
   //     without these the child's sessionAgentConfig() sees !agentFrozen and
   //     re-freezes from the CURRENT bot config, silently dropping any per-session
-  //     /model or /effort override the source carried (reasoningEffort has no
+  //     model or effort override the source carried (reasoningEffort has no
   //     botCfg fallback at all → drops to undefined). Copying the frozen tuple
   //     keeps the clone's launch identity == the source's.
   // readIsolation is intentionally NOT copied: it is not a persisted Session
@@ -6360,7 +6378,7 @@ export function forkWorker(
   let spawnedWorker: ChildProcess | undefined;
   let worker!: ChildProcess;
   let startupState!: WorkerStartupState;
-  let initMsg!: DaemonToWorker;
+  let initMsg!: Extract<DaemonToWorker, { type: 'init' }>;
   let agentCfg!: ReturnType<typeof sessionAgentConfig>;
   const t = tag(ds);
   ds.localProcessAttestation = undefined;
@@ -6782,6 +6800,8 @@ export function forkWorker(
 
   // Send init config — use per-bot settings
   const runtimeIdentity = runtimeBuildIdentity();
+  const feedbackPolicy = resolveFeedbackPolicyForDelivery({ dataDir: config.session.dataDir, larkAppId: ds.larkAppId, chatId: ds.chatId, bot: botCfg });
+  ds.feedbackPolicy = feedbackPolicy;
   initMsg = {
     type: 'init',
     sessionId: ds.session.sessionId,
@@ -6868,6 +6888,7 @@ export function forkWorker(
     // Feishu (uploader/cred-write are also skipped downstream on the same test).
     larkAppSecret: larkTransportEnabled({ chatId: ds.chatId, apiOnly: botCfg.apiOnly }) ? botCfg.larkAppSecret : '',
     apiOnly: botCfg.apiOnly,
+    feedback: feedbackPolicy,
     // Freeze the ACTUAL loaded bots-config path (getLoadedConfigPath) so a
     // no-transport worker's fs-policy denies it from a HOST-owned fact, not a
     // guess off BOTS_CONFIG env (which the agent could see/forge). When it lives
@@ -9569,6 +9590,27 @@ function setupWorkerHandlers(
 const FINAL_OUTPUT_RETRY_BACKOFF_MS = [0, 5000, 15000];  // immediate, +5s, +15s
 const codexAppFinalSettlementInFlight = new Map<string, Promise<boolean>>();
 
+/**
+ * Shutdown-only view of the in-flight Codex App final-settlement promises. Each
+ * entry is a `deliverFinalOutput` awaited inside the IPC message handler that
+ * has NOT yet reached its `cb.onTurnTerminal` call; a settlement resolving
+ * enqueues the turn terminal. During graceful shutdown, after all worker IPC
+ * channels have disconnected (so no NEW settlement can be created), the daemon
+ * bounded-waits these to settle BEFORE closing the turn-terminal queue
+ * admission — otherwise a settlement that resolves post-close would have its
+ * terminal refused and lost. Returns a snapshot array (safe to Promise.all).
+ */
+export function snapshotCodexAppFinalSettlements(): Promise<boolean>[] {
+  return [...codexAppFinalSettlementInFlight.values()];
+}
+
+/** Current in-flight Codex App final-settlement count. After all worker IPC has
+ *  disconnected the map cannot grow, so a re-read of 0 after awaiting the
+ *  snapshot confirms settlement quiescence. */
+export function codexAppFinalSettlementCount(): number {
+  return codexAppFinalSettlementInFlight.size;
+}
+
 function finalOutputDedupeKey(ds: DaemonSession, msg: Extract<WorkerToDaemon, { type: 'final_output' }>): string {
   return `${msg.sessionId ?? ds.session.sessionId}:${msg.lastUuid || msg.turnId}`;
 }
@@ -9657,6 +9699,53 @@ async function finishTurnReactions(ds: DaemonSession): Promise<void> {
  *  same provider key; the daemon owns bounded transient retries. After 3 attempts we log
  *  and give up — the user's answer is lost; better than leaking memory
  *  via an unbounded retry loop. */
+async function persistFinalOutputFeedback(
+  ds: DaemonSession,
+  msg: Extract<WorkerToDaemon, { type: 'final_output' }>,
+  content: string,
+  effectiveCliId: string,
+  messageId: string,
+  policy: import('../services/feedback-policy.js').FeedbackPolicy,
+  baseCard: Record<string, unknown>,
+  requesterSubjectId: string | undefined,
+  webhookDestinations: import('../services/feedback-outbox.js').FeedbackWebhookDestination[] | undefined,
+  logTag: string,
+): Promise<void> {
+  try {
+    const { getSkillFeedbackStore } = await import('../services/skill-feedback-store.js');
+    const feedbackStore = await getSkillFeedbackStore(config.session.dataDir);
+    feedbackStore.recordTurnDelivery({
+      botAppId: ds.larkAppId,
+      sessionId: ds.session.sessionId,
+      turnId: msg.turnId,
+      nativeSessionId: msg.sourceHermesSessionId ?? ds.session.cliSessionId,
+      platform: 'lark',
+      platformAppId: ds.larkAppId,
+      platformMessageId: messageId,
+      chatId: ds.chatId,
+      topicRootId: ds.session.rootMessageId,
+      dispatchAttempt: msg.dispatchAttempt,
+      content,
+      cliId: effectiveCliId,
+      cliVersion: ds.cliVersion,
+      model: ds.session.model,
+      reasoningEffort: ds.session.reasoningEffort,
+      cardMode: 'feedback',
+      status: 'delivered',
+      usage: msg.usage,
+      policy,
+      baseCard,
+      requesterSubjectId,
+      webhookDestinations,
+      context: { ...(resolveFeedbackTeamId({ dataDir: config.session.dataDir, chatId: ds.chatId }) ? { teamId: resolveFeedbackTeamId({ dataDir: config.session.dataDir, chatId: ds.chatId }) } : {}) },
+    });
+  } catch (error) {
+    logger.warn(
+      `[${logTag}] Failed to persist final-output feedback delivery: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+}
+
 function deliverFinalOutput(
   ds: DaemonSession,
   msg: Extract<WorkerToDaemon, { type: 'final_output' }>,
@@ -9898,6 +9987,12 @@ function deliverFinalOutput(
         : imOrigin?.replyTargetSenderOpenId
           ?? daemonCardFooterRecipientOpenId(ds, effectiveCliId);
       const localHomeLinkMode = daemonCardLocalHomeLinkMode(ds);
+      // forkWorker snapshots the effective policy for this worker lifetime.
+      // Keep daemon fallback delivery aligned with the same frozen policy the
+      // worker/Riff environment received; live config applies on the next fork.
+      const feedbackPolicy = managedReceiver ? undefined : ds.feedbackPolicy;
+      const feedbackRequesterSubjectId = recipientOpenId;
+      const feedback = feedbackPolicy && feedbackRequesterSubjectId ? { policy: feedbackPolicy } : undefined;
       cardUsage ??= getDaemonReplyCardUsageSnapshot(ds, effectiveCliId);
       const cardJson = msg.kind === 'local-turn' || msg.kind === 'local-turn-headless'
         ? buildContextualReplyCard({
@@ -9913,16 +10008,19 @@ function deliverFinalOutput(
             workingDir: ds.workingDir,
             localHomeLinkMode,
             usage: cardUsage,
+            ...(feedback ? { feedback } : {}),
           })
-        : buildMarkdownCard(
-            safeAssistantText,
+        : buildCanonicalFinalReplyCard({
+            markdown: safeAssistantText,
+            ...(feedback ? { feedback } : {}),
             recipientOpenId,
-            renderBrandTemplate(resolveBrandLabel(ds.larkAppId), ds.workingDir),
-            localeForBot(ds.larkAppId),
-            ds.workingDir,
+            brand: renderBrandTemplate(resolveBrandLabel(ds.larkAppId), ds.workingDir),
+            locale: localeForBot(ds.larkAppId),
+            workingDir: ds.workingDir,
             localHomeLinkMode,
-            cardUsage,
-          );
+            usage: cardUsage,
+          });
+      const baseFeedbackCard = feedback ? JSON.parse(cardJson) as Record<string, unknown> : undefined;
 
       const proposedOutput = {
         targetChatId: ds.chatId,
@@ -10011,6 +10109,9 @@ function deliverFinalOutput(
       };
       if (preparedListenerReply?.kind === 'succeeded' && preparedListenerReply.messageId) {
         recordPrimaryOutput(preparedListenerReply.messageId);
+        if (feedbackPolicy && baseFeedbackCard) {
+          await persistFinalOutputFeedback(ds, msg, safeAssistantText, effectiveCliId, preparedListenerReply.messageId, feedbackPolicy!, baseFeedbackCard, feedbackRequesterSubjectId, getBot(ds.larkAppId).config.feedbackWebhooks?.destinations, t);
+        }
         ds.lastBridgeEmittedUuid = finalOutputDedupeKey(ds, msg);
         logger.info(
           `[${t}] VC listener fallback replayed existing provider result `
@@ -10066,6 +10167,9 @@ function deliverFinalOutput(
       }
       ds.lastBridgeEmittedUuid = finalOutputDedupeKey(ds, msg);
       logger.info(`[${t}] Bridge final_output forwarded (turn ${msg.turnId.substring(0, 8)}, ${msg.content.length} chars, kind=${msg.kind ?? 'bridge'}, attempt ${attempt + 1})`);
+      if (feedbackPolicy && baseFeedbackCard && messageId) {
+        await persistFinalOutputFeedback(ds, msg, safeAssistantText, effectiveCliId, messageId, feedbackPolicy!, baseFeedbackCard, feedbackRequesterSubjectId, getBot(ds.larkAppId).config.feedbackWebhooks?.destinations, t);
+      }
       onComplete?.(true);
     } catch (err: any) {
       if (!isStillOwned()) { onComplete?.(false); return; }

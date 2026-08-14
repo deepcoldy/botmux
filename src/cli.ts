@@ -127,7 +127,7 @@ import {
   startExactPm2ProcessIds,
   type Pm2ExactStartClient,
 } from './cli/pm2-exact-start.js';
-import { dispatchPrimaryMessage, findStdinAliasAttachment, normalizeInteractiveCardInput, sendFileAttachments, sendVideoAttachments, shouldSendAsPureVideo, validateVideoAttachments } from './cli/send-dispatch.js';
+import { dispatchPrimaryMessage, findStdinAliasAttachment, normalizeInteractiveCardInput, sendFileAttachments, sendVideoAttachments, shouldSendAsPureVideo, validateSlashSend, validateVideoAttachments } from './cli/send-dispatch.js';
 import { dispatchDeferredTopicSend, reusableDeferredTopicRoot, type DeferredScheduleRunData } from './cli/deferred-topic-send.js';
 import { readDeferredTopicBinding } from './core/deferred-topic-binding.js';
 import { resolveDaemonEnv } from './cli/daemon-lifecycle-env.js';
@@ -234,7 +234,7 @@ import {
   writeManualIntentIfAbsentTo,
   writeRestartAttemptIntentTo,
 } from './services/restart-intent-store.js';
-import { repairMissingChatScope, stripLegacyPendingCardFields } from './services/session-store.js';
+import { loadAllSessionsSnapshot, mutateSessionRowOffline } from './services/session-store.js';
 import {
   evaluateVcMeetingManagedSend,
   isTrustedVcMeetingHostRelayParent,
@@ -4426,156 +4426,42 @@ function resolveDataDir(): string {
   return resolveBotmuxDataDir();
 }
 
-/** Load sessions from all session files (legacy + per-bot). */
+/** Load sessions from all session files (legacy + per-bot). Snapshot mechanics
+ * live in session-store; the CLI only supplies its own data-dir resolution and
+ * the sandbox fallback appId (the file sandbox exposes sessions-<self>.json
+ * but not a listing of data/). */
 function loadSessions(): Map<string, SessionData> {
-  const dataDir = resolveDataDir();
-  const sessions = new Map<string, SessionData>();
-
-  // Read legacy sessions.json
-  const legacyFp = join(dataDir, 'sessions.json');
-  let legacyData: Record<string, SessionData> = {};
-  if (existsSync(legacyFp)) {
-    try {
-      legacyData = JSON.parse(readFileSync(legacyFp, 'utf-8'));
-      for (const [, v] of Object.entries(legacyData)) {
-        const s = v as SessionData;
-        if (!s || typeof s !== 'object' || !s.sessionId) continue;
-        repairMissingChatScope(s);
-        sessions.set(s.sessionId, s);
-      }
-    } catch { /* ignore */ }
-  }
-
-  // Read per-bot session files (sessions-{appId}.json).
-  const loadPerBot = (appId: string) => {
-    try {
-      const data = JSON.parse(readFileSync(join(dataDir, `sessions-${appId}.json`), 'utf-8'));
-      for (const [, v] of Object.entries(data)) {
-        const session = v as SessionData;
-        if (!session || typeof session !== 'object' || !session.sessionId) continue;
-        repairMissingChatScope(session);
-        if (!session.larkAppId) session.larkAppId = appId;  // stamp so saveSession writes back correctly
-        sessions.set(session.sessionId, session);
-      }
-    } catch { /* ignore */ }
-  };
-  try {
-    for (const file of readdirSync(dataDir)) {
-      if (file.startsWith('sessions-') && file.endsWith('.json')) {
-        loadPerBot(file.slice('sessions-'.length, -'.json'.length));
-      }
-    }
-  } catch {
-    // readdir(dataDir) EPERMs under the file sandbox (the deny-by-default policy
-    // exposes sessions-<self>.json but NOT a listing of data/). Fall back to the
-    // OWN per-bot file directly via the injected appId — the sandboxed agent only
-    // ever operates its own session, so no enumeration is needed.
-    if (process.env.BOTMUX_LARK_APP_ID) loadPerBot(process.env.BOTMUX_LARK_APP_ID);
-  }
-
-  // Deliberately read-only. Older CLIs opportunistically migrated legacy rows
-  // here, which made even `botmux list` a whole-file writer capable of racing a
-  // daemon ledger save. Durable migration belongs to daemon startup under the
-  // session-store lock; this generic discovery path only composes snapshots.
-
-  return sessions;
-}
-
-function loadSessionFresh(session: SessionData): SessionData | undefined {
-  return loadSessions().get(session.sessionId);
-}
-
-/** Save a single session back to its appropriate file based on larkAppId. */
-function saveSession(session: SessionData): void {
-  const dataDir = resolveDataDir();
-  const fileName = session.larkAppId ? `sessions-${session.larkAppId}.json` : 'sessions.json';
-  const fp = join(dataDir, fileName);
-
-  // Read current file, update session, write back
-  let data: Record<string, SessionData> = {};
-  if (existsSync(fp)) {
-    try { data = JSON.parse(readFileSync(fp, 'utf-8')); } catch { /* start fresh */ }
-  }
-  data[session.sessionId] = session;
-
-  // Clean up entries where file key doesn't match the entry's sessionId (data
-  // corruption), and strip legacy placeholder-card fields so the file converges
-  // to clean (see stripLegacyPendingCardFields in services/session-store).
-  for (const [key, val] of Object.entries(data)) {
-    if (val && typeof val === 'object' && 'sessionId' in val && (val as SessionData).sessionId !== key) {
-      delete data[key];
-      continue;
-    }
-    if (val && typeof val === 'object') stripLegacyPendingCardFields(val as unknown as Record<string, unknown>);
-  }
-
-  const tmpFp = fp + '.tmp';
-  writeFileSync(tmpFp, JSON.stringify(data, null, 2), 'utf-8');
-  renameSync(tmpFp, fp);
-
-  // Remove duplicate from legacy file if session moved to per-bot file (or vice versa)
-  const otherFile = session.larkAppId ? 'sessions.json' : null;
-  if (otherFile) {
-    const otherFp = join(dataDir, otherFile);
-    if (existsSync(otherFp)) {
-      try {
-        const otherData: Record<string, SessionData> = JSON.parse(readFileSync(otherFp, 'utf-8'));
-        if (otherData[session.sessionId]) {
-          delete otherData[session.sessionId];
-          const otherTmp = otherFp + '.tmp';
-          writeFileSync(otherTmp, JSON.stringify(otherData, null, 2), 'utf-8');
-          renameSync(otherTmp, otherFp);
-        }
-      } catch { /* ignore */ }
-    }
-  }
+  return loadAllSessionsSnapshot({
+    dataDir: resolveDataDir(),
+    fallbackAppId: process.env.BOTMUX_LARK_APP_ID,
+  }) as unknown as Map<string, SessionData>;
 }
 
 /** Offline-only narrow session mutation. Callers must prefer the owning daemon
- * while it is available; rereading the exact row here prevents stale CLI
- * snapshots from copying FIFO fields during offline maintenance. */
+ * while it is available; session-store rereads the exact row under the shared
+ * session-file lock so stale CLI snapshots can never be written back. The
+ * daemon-liveness probe runs under that same lock (entry + pre-publication) so
+ * two CLIs cannot race each other and an already-published daemon cannot be
+ * bypassed by the offline fallback. */
 function mutateSessionOffline(
   session: SessionData,
   mutate: (current: SessionData) => boolean,
 ): SessionData | undefined {
-  const dataDir = resolveDataDir();
-  const fileName = session.larkAppId ? `sessions-${session.larkAppId}.json` : 'sessions.json';
-  const fp = join(dataDir, fileName);
-  return withFileLockSync(fp, () => {
-    // The owning daemon uses the same session-file lock for every save. Check
-    // absence while holding it so two CLIs cannot race each other and an
-    // already-published daemon cannot be bypassed by the offline fallback.
-    if (session.larkAppId) {
-      try { if (findDaemon(session.larkAppId)) return undefined; } catch { /* offline */ }
-    }
-    let data: Record<string, SessionData> = {};
-    if (existsSync(fp)) {
-      try { data = JSON.parse(readFileSync(fp, 'utf-8')); } catch { /* start fresh */ }
-    }
-    const current = data[session.sessionId];
-    if (!current || !mutate(current)) return current;
-    data[session.sessionId] = current;
-
-    // Clean up entries where file key doesn't match the entry's sessionId
-    // (data corruption), and strip removed placeholder-card fields.
-    for (const [key, val] of Object.entries(data)) {
-      if (val && typeof val === 'object' && 'sessionId' in val && (val as SessionData).sessionId !== key) {
-        delete data[key];
-        continue;
-      }
-      if (val && typeof val === 'object') stripLegacyPendingCardFields(val as unknown as Record<string, unknown>);
-    }
-
-    // Recheck immediately before publication. A daemon that appears during
-    // the read/decision phase becomes authoritative; leave the file untouched.
-    if (session.larkAppId) {
-      try { if (findDaemon(session.larkAppId)) return undefined; } catch { /* offline */ }
-    }
-    const tmpFp = `${fp}.${process.pid}.${randomBytes(4).toString('hex')}.tmp`;
-    writeFileSync(tmpFp, JSON.stringify(data, null, 2), 'utf-8');
-    renameSync(tmpFp, fp);
-    return current;
-  });
+  const larkAppId = session.larkAppId;
+  return mutateSessionRowOffline(
+    { sessionId: session.sessionId, ...(larkAppId ? { larkAppId } : {}) },
+    current => mutate(current as unknown as SessionData),
+    {
+      dataDir: resolveDataDir(),
+      ...(larkAppId
+        ? {
+            abortIf: () => {
+              try { return !!findDaemon(larkAppId); } catch { return false; /* offline */ }
+            },
+          }
+        : {}),
+    },
+  ) as unknown as SessionData | undefined;
 }
 
 type OfflineAbandonResult =
@@ -4998,113 +4884,6 @@ function isAdoptedSession(s: SessionData): s is SessionData & { adoptedFrom: Ado
 function adoptedCliPid(s: SessionData): number | undefined {
   const pid = isAdoptedSession(s) ? s.adoptedFrom.originalCliPid : undefined;
   return typeof pid === 'number' && pid > 0 ? pid : undefined;
-}
-
-type SessionDeleteCloseResult =
-  | { ok: true; via: 'daemon' | 'offline' }
-  | { ok: false; error: string };
-
-/** Offline-only fallback for `botmux delete`. When the owning daemon is live,
- *  it must own the whole close transition so its activeSessions registry,
- *  persistent row, lifecycle hooks, subscriptions, and backend teardown stay
- *  coherent. This legacy local path is safe only when there is no daemon
- *  process whose in-memory state could be stranded. */
-function closeSessionOffline(s: SessionData): SessionDeleteCloseResult {
-  const originalPid = adoptedCliPid(s);
-  // Adopted sessions own only the botmux worker/viewer, never the user's CLI.
-  if (s.pid && s.pid !== originalPid && isProcessAlive(s.pid)) {
-    killProcess(s.pid);
-  }
-
-  // Adopted panes belong to the user. Ordinary bmx-* sessions are botmux-owned
-  // and still need direct cleanup when no daemon exists to run killWorker().
-  if (!isAdoptedSession(s)) {
-    if (isSuspendableBackendType(s.backendType)) {
-      const target = resolvePersistentBackendTarget(
-        s.backendType,
-        s.sessionId,
-        s.persistentBackendTarget,
-      );
-      try {
-        killPersistentBackendTarget(target, s.sessionId);
-      } catch (err) {
-        // ZMX destruction is identity-verified against the complete botmux
-        // session UUID and waits for confirmed disappearance. Swallowing an
-        // inconclusive/mismatched kill would hide the sole control row while
-        // its CLI remains alive. Older mux backends retain their historical
-        // best-effort offline-close compatibility.
-        if (target.backendType === 'zmx') {
-          return {
-            ok: false,
-            error: `ZMX 离线删除未完成：${err instanceof Error ? err.message : String(err)}`,
-          };
-        }
-      }
-    } else {
-      // Legacy rows without backendType were historically tmux-backed.
-      const tmuxName = `bmx-${s.sessionId.substring(0, 8)}`;
-      try {
-        execSync(`tmux kill-session -t '${tmuxName}' 2>/dev/null`, {
-          stdio: 'ignore',
-          env: tmuxEnv(),
-        });
-      } catch { /* no tmux session */ }
-    }
-  }
-
-  s.status = 'closed';
-  s.closedAt = new Date().toISOString();
-  saveSession(s);
-  return { ok: true, via: 'offline' };
-}
-
-/** Close through the owning daemon whenever it is online. The IPC request is
- *  deliberately sent BEFORE any local kill: deleting the current bmx-* tmux
- *  first would terminate this very CLI before it can evict daemon memory.
- *
- *  Trusted host callers use the dashboard HMAC. A sandboxed/read-isolated CLI
- *  can only authorize the exact current session with its rotating per-turn
- *  capability, so `delete <other-id>` remains fail-closed. */
-async function closeSessionForDelete(
-  s: SessionData,
-  online = listOnlineDaemons(),
-): Promise<SessionDeleteCloseResult> {
-  // Legacy sessions without larkAppId live in sessions.json. A per-bot daemon
-  // writes only its own sessions-<appId>.json and silently no-ops on close
-  // (sessionStore.closeSession only touches the current file), so routing a
-  // legacy session to it yields "200 OK" with no actual state change. This must
-  // hold on BOTH ways a daemon port is discovered — the descriptor lookup AND
-  // the injected-port current-session fallback below — so gate the whole daemon
-  // path on larkAppId with one authoritative guard. A live daemon-spawned
-  // session always carries larkAppId, so this never diverts the legitimate
-  // sandboxed current-session close (which reaches its daemon via the injected
-  // port); it only keeps larkAppId-less legacy records on the offline fallback,
-  // whose saveSession() persists to the legacy file correctly.
-  if (!s.larkAppId) {
-    return closeSessionOffline(s);
-  }
-
-  const daemon = online.find(d => d.larkAppId === s.larkAppId);
-  const isCurrentSession = process.env.BOTMUX_SESSION_ID === s.sessionId;
-  const injectedPort = isCurrentSession
-    ? resolveDaemonIpcPort(undefined, process.env.BOTMUX_DAEMON_IPC_PORT)
-    : undefined;
-  const ipcPort = daemon?.ipcPort ?? injectedPort;
-
-  if (ipcPort) {
-    try {
-      const res = await postSessionCliIpc(ipcPort, s.sessionId, 'close', {});
-      const body: any = await res.json().catch(() => ({}));
-      if (res.ok && body?.ok) return { ok: true, via: 'daemon' };
-      return { ok: false, error: body?.error ?? `HTTP ${res.status}` };
-    } catch (err: any) {
-      // A fresh daemon descriptor means there may still be authoritative
-      // in-memory state. Never fall back to a partial local kill in this case.
-      return { ok: false, error: `连接 daemon 失败: ${err?.message ?? err}` };
-    }
-  }
-
-  return closeSessionOffline(s);
 }
 
 function adoptTargetLabel(s: SessionData): string {
@@ -7045,6 +6824,7 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
        --video-covers <path>           视频封面图片（可重复，按顺序对应 --videos）
        --card-file <path>              直接发送飞书/Lark interactive 卡片 JSON
        --card-json <json>              直接发送飞书/Lark interactive 卡片 JSON 字符串
+       --response-kind progress|final|auxiliary  可选；未声明按 progress/非 final，只有 final 挂反馈
        --mention <open_id:name>        @提及（可重复）
        --mention-back                  @回本轮触发消息的发送者（open_id 自动取自会话）
        --no-mention                    明确声明本条不@任何人
@@ -8068,6 +7848,9 @@ import {
   type CardUsageSnapshot,
   type LocalHomeLinkMode,
 } from './im/lark/md-card.js';
+import { buildFeedbackElement } from './im/lark/skill-feedback-card.js';
+import { resolveFeedbackPolicyForDelivery, resolveFeedbackTeamId } from './services/feedback-policy-resolver.js';
+import { normalizeFeedbackPolicy } from './services/feedback-policy.js';
 import { applyInlineMentions } from './im/lark/inline-mentions.js';
 import { renderBrandTemplate } from './im/lark/brand-template.js';
 import { resolveBrandLabel, resolveUsageDisplay } from './bot-registry.js';
@@ -8127,7 +7910,7 @@ async function relaySend(
     // the dashboard hand anyway; excluding it would silently send the reason as a
     // bare message instead of the original loud "no content" failure. Plumbing
     // `--attention` through the relay is a separate change, out of this scope.
-    const pos = positionals(rest, ['--card', '--text', '--top-level', '--no-quote', '--mention-back', '--no-mention', '--anyway', '--voice']);
+    const pos = positionals(rest, ['--card', '--text', '--top-level', '--no-quote', '--mention-back', '--no-mention', '--anyway', '--voice', '--slash']);
     content = pos.length > 0 ? pos.join(' ') : await readStdin();
   }
   const preparedCardContent = cardJsonArg === undefined && cardFile === undefined && !rest.includes('--voice')
@@ -8186,13 +7969,18 @@ async function relaySend(
   // Forward only presentation flags (must match the watcher's allowlist); path,
   // routing (--chat-id/--into/--top-level) and --session-id flags are dropped —
   // content/attachments come from the outbox and session-id is forced host-side.
-  const FLAGS_NOVAL = new Set(['--mention-back', '--no-mention', '--no-quote', '--voice']);
-  const FLAGS_VAL = new Set(['--mention', '--quote']);
+  const FLAGS_NOVAL = new Set(['--mention-back', '--no-mention', '--no-quote', '--voice', '--slash']);
+  const FLAGS_VAL = new Set(['--mention', '--quote', '--response-kind']);
   const flags: string[] = [];
   for (let i = 0; i < rest.length; i++) {
     const tok = rest[i];
     if (FLAGS_NOVAL.has(tok)) flags.push(tok);
     else if (FLAGS_VAL.has(tok) && i + 1 < rest.length) flags.push(tok, rest[++i]);
+    else {
+      const equals = tok.indexOf('=');
+      const flag = equals > 0 ? tok.slice(0, equals) : tok;
+      if (FLAGS_VAL.has(flag)) flags.push(flag, tok.slice(equals + 1));
+    }
     // else dropped
   }
   // 原子写：req.json 是 host watcher 的触发文件，rename 让它「完整出现」，
@@ -8371,7 +8159,7 @@ async function registerSelfFromCredFile(): Promise<void> {
   const sd = process.env.SESSION_DATA_DIR;
   if (!appId || !sd) return;
   const { sendCredFilePath } = await import('./adapters/cli/read-isolation.js');
-  let cred: { larkAppSecret?: string; brand?: string; apiOnly?: boolean };
+  let cred: { larkAppSecret?: string; brand?: string; apiOnly?: boolean; feedback?: import('./services/feedback-policy.js').FeedbackPolicyInput };
   try {
     // send-cred lives in the bot's BOT_HOME (<BOTMUX_HOME>/bots/<appId>/send-cred.json);
     // sendCredFilePath takes SESSION_DATA_DIR and derives BOTMUX_HOME (its parent).
@@ -8391,6 +8179,7 @@ async function registerSelfFromCredFile(): Promise<void> {
     apiOnly: cred.apiOnly === true || undefined,
     cliId: 'claude-code',
     brand: cred.brand as 'feishu' | 'lark' | undefined,
+    feedback: cred.feedback,
     usageDisplay:
       process.env.BOTMUX_USAGE_DISPLAY === 'streaming' ||
       process.env.BOTMUX_USAGE_DISPLAY === 'footer' ||
@@ -8454,6 +8243,14 @@ function riffModeSession(opts: { evenWithLocalSessions?: boolean } = {}): { sess
   const deferredTurnId = process.env.BOTMUX_DEFERRED_SCHEDULE_TURN_ID;
   const deferredRoutingAnchor = process.env.BOTMUX_DEFERRED_SCHEDULE_ROUTING_ANCHOR;
   const deferredCreatedAt = process.env.BOTMUX_DEFERRED_SCHEDULE_CREATED_AT;
+  let feedback: import('./services/feedback-policy.js').FeedbackPolicy | undefined;
+  try {
+    const rawFeedback = process.env.BOTMUX_FEEDBACK_POLICY;
+    if (rawFeedback) feedback = normalizeFeedbackPolicy(JSON.parse(rawFeedback));
+  } catch {
+    // A malformed/missing remote env snapshot must not accidentally enable UI.
+    feedback = undefined;
+  }
 
   const botConfig = {
     larkAppId: appId,
@@ -8462,6 +8259,7 @@ function riffModeSession(opts: { evenWithLocalSessions?: boolean } = {}): { sess
     brand,
     cliId: 'riff',
     allowedUsers: [],
+    feedback,
     usageDisplay:
       process.env.BOTMUX_USAGE_DISPLAY === 'streaming' ||
       process.env.BOTMUX_USAGE_DISPLAY === 'footer' ||
@@ -8821,6 +8619,25 @@ async function cmdSend(rest: string[]): Promise<void> {
   const cardJsonArg = argValue(rest, '--card-json');
   const cardFile = argValue(rest, '--card-file');
   const customCardRequested = cardJsonArg !== undefined || cardFile !== undefined;
+  const responseKindOccurrences = rest.filter(token => token === '--response-kind' || token.startsWith('--response-kind=')).length;
+  if (responseKindOccurrences > 1) {
+    console.error('botmux send: --response-kind 只能指定一次');
+    process.exit(2);
+  }
+  if (flagPresentButValueMissing(rest, '--response-kind')) {
+    console.error('botmux send: --response-kind 仅支持 progress|final|auxiliary');
+    process.exit(2);
+  }
+  const responseKind = argValue(rest, '--response-kind');
+  if (responseKind !== undefined && responseKind !== 'progress' && responseKind !== 'final' && responseKind !== 'auxiliary') {
+    console.error('botmux send: --response-kind 仅支持 progress|final|auxiliary');
+    process.exit(2);
+  }
+  // Backward-compatible default: an unclassified proactive send is non-final.
+  // Only an explicit `final` may opt into feedback controls and indexing;
+  // `progress` and `auxiliary` (interim / supplementary output) both deliver
+  // normally without a feedback region, matching the requirement's three roles.
+  const effectiveResponseKind = responseKind ?? 'progress';
   const managedCustomCardError = managedVcCustomCardError(
     !!vcMeetingManagedSendOrigin,
     customCardRequested,
@@ -8920,6 +8737,29 @@ async function cmdSend(rest: string[]): Promise<void> {
   if (customCardRequested && asVoice) {
     console.error('botmux send: --card-file/--card-json 不能与 --voice 混用');
     process.exit(2);
+  }
+  // --slash: send a NATIVE slash command (e.g. /clear /model /close) as a
+  // single-line plain-`text` message instead of the usual interactive card.
+  // The card path appends a `[🔊 语音总结]` footer, turning the body multi-line
+  // so the receiving daemon's parseSlashCommandInvocation drops it to an
+  // ordinary prompt (never reaching the passthrough / daemon-command router).
+  // A --slash send skips the card so a peer bot (or self) can consume it. It is
+  // deliberately exclusive with every richer payload — a slash command is one
+  // line of text, nothing else.
+  const isSlashSend = rest.includes('--slash');
+  if (isSlashSend) {
+    if (customCardRequested || asVoice) {
+      console.error('botmux send: --slash 不能与 --card-file/--card-json/--voice 混用（斜杠命令只发单行纯文本）');
+      process.exit(2);
+    }
+    if (images.length > 0 || files.length > 0 || videos.length > 0 || videoCovers.length > 0) {
+      console.error('botmux send: --slash 不能带附件（--images/--files/--videos）；斜杠命令只发单行纯文本');
+      process.exit(2);
+    }
+    if (attention.requested) {
+      console.error('botmux send: --slash 不能与 --attention 混用');
+      process.exit(2);
+    }
   }
 
   const sid = sessionIdArg ?? ancestorCtx?.sessionId ?? process.env.BOTMUX_SESSION_ID ?? null;
@@ -9147,7 +8987,7 @@ async function cmdSend(rest: string[]): Promise<void> {
     if (!existsSync(contentFile)) { console.error(`文件不存在: ${contentFile}`); process.exit(1); }
     content = readFileSync(contentFile, 'utf-8');
   } else {
-    const pos = positionals(rest, ['--card', '--text', '--top-level', '--no-quote', '--mention-back', '--no-mention', '--anyway', '--voice', '--attention']);
+    const pos = positionals(rest, ['--card', '--text', '--top-level', '--no-quote', '--mention-back', '--no-mention', '--anyway', '--voice', '--attention', '--slash']);
     if (pos.length > 0) {
       content = pos.join(' ');
     } else {
@@ -9472,6 +9312,29 @@ async function cmdSend(rest: string[]): Promise<void> {
   const { resolveRegularGroupMode } = await import('./services/chat-reply-mode-store.js');
   try { for (const cfg of loadBotConfigs()) registerBot(cfg); } catch { /* */ }
   if (envPinnedRiffBot) { try { registerBot(envPinnedRiffBot); } catch { /* */ } }
+  let feedbackPolicy: ReturnType<typeof resolveFeedbackPolicyForDelivery>;
+  let feedbackWebhookDestinations: import('./services/feedback-outbox.js').FeedbackWebhookDestination[] | undefined;
+  try {
+    const botConfig = getBot(s.larkAppId).config;
+    feedbackWebhookDestinations = botConfig.feedbackWebhooks?.destinations;
+    feedbackPolicy = resolveFeedbackPolicyForDelivery({
+      dataDir: config.session.dataDir,
+      larkAppId: s.larkAppId,
+      chatId: s.chatId,
+      bot: botConfig,
+    });
+  } catch {
+    feedbackPolicy = undefined;
+  }
+  const feedbackRequesterSubjectId = replyTargetSenderOpenId ?? s.ownerOpenId;
+  if (feedbackPolicy && effectiveResponseKind === 'final' && !feedbackRequesterSubjectId) {
+    console.error('botmux send: 无法确认本次提问者身份，不能发送带反馈控件的最终回答');
+    process.exit(2);
+  }
+  if (feedbackPolicy && effectiveResponseKind === 'final' && (customCardRequested || asVoice || sendTopLevel || !!overrideChatId || !!sendInto || !!vcMeetingManagedSendOrigin)) {
+    console.error('botmux send: --response-kind final 仅支持当前会话内的普通最终答案卡片');
+    process.exit(2);
+  }
 
   // Ambiguity gate for --mention-back. --mention-back means "@ back the one
   // counterpart who triggered this turn"; that is only unambiguous when this
@@ -9915,7 +9778,9 @@ async function cmdSend(rest: string[]): Promise<void> {
       // --no-mention 显式不 @ 任何人：跳过正文 @BotName 的自动注入，否则正文里
       // 出现的 @名字 仍会被注入成 <at>，破坏 --no-mention 语义、还可能误触发对方
       // bot（正是要避免的循环 @）。botEntries/crossRef 仍需加载供 footer 寻址用。
-      if (!noMention && !vcMeetingManagedSendOrigin) {
+      // --slash 同理跳过：斜杠命令正文（如 `/clear`）不该被扫成 @，收件人只认
+      // 显式 --mention（下面的 slash 分支只用 explicit mentions 拼 <at> 前缀）。
+      if (!noMention && !isSlashSend && !vcMeetingManagedSendOrigin) {
       const alreadyMentioned = new Set(mentions.map(m => m.open_id));
       // Scan a code-span-stripped copy so a bot name quoted inside backticks or a
       // fenced block (e.g. an example `botmux send --mention @Bot …` or an
@@ -10034,6 +9899,7 @@ async function cmdSend(rest: string[]): Promise<void> {
     // we committed to sending — that's the boundary the gate cares about.
     const sentAtMs = Date.now();
     let messageId: string;
+    let feedbackBaseCard: Record<string, unknown> | undefined;
     let failedAttachments: { path: string; error: string }[] = [];
     let failedVideoAttachments: { path: string; coverPath: string; error: string }[] = [];
     const pureVideoSend = customCard
@@ -10047,6 +9913,19 @@ async function cmdSend(rest: string[]): Promise<void> {
         });
     if (customCard) {
       messageId = await dispatchPrimary(JSON.stringify(customCard), 'interactive');
+    } else if (isSlashSend) {
+      // --slash: deliver the command as a single-line plain-`text` message so the
+      // receiving daemon's parseSlashCommandInvocation sees a bare `/cmd` (the
+      // card path's `[🔊 语音总结]` footer would make it multi-line and demote it
+      // to an ordinary prompt). Inline an `<at>` for each --mention so a peer
+      // bot in a group is actually triggered AND the receiver can strip the
+      // mention back to a clean command (Feishu keys the <at>, the receiver's
+      // resolveMentions→stripLeadingMentions removes the leading `@Name`).
+      const slash = validateSlashSend(content);
+      if (!slash.ok) { console.error(`botmux send: ${slash.error}`); process.exit(2); }
+      const atPrefix = mentions.map(m => `<at user_id="${m.open_id}"></at>`).join(' ');
+      const slashText = atPrefix ? `${atPrefix} ${slash.command}` : slash.command;
+      messageId = await dispatchPrimary(slashText, 'text');
     } else if (pureVideoSend) {
       // Pure-video fast path: send the preview as a standalone media message.
       // A send that also carries mentions is deliberately excluded (media messages
@@ -10181,12 +10060,53 @@ async function cmdSend(rest: string[]): Promise<void> {
         }
       }
 
-      const cardJson = JSON.stringify({
-        schema: '2.0',
-        config: { update_multi: true },
-        body: { direction: 'vertical', elements },
-      });
-      messageId = await dispatchPrimary(cardJson, 'interactive');
+      if (feedbackPolicy && effectiveResponseKind === 'final') {
+        const canonicalCard = { schema: '2.0', config: { update_multi: true }, body: { direction: 'vertical', elements: [...elements] } } as { schema: string; config: Record<string, unknown>; body: { direction: string; elements: unknown[] } };
+        const feedbackElement = buildFeedbackElement(feedbackPolicy);
+        const footerIndex = canonicalCard.body.elements.findIndex((element: any) => element?.element_id === 'botmux_reply_footer');
+        canonicalCard.body.elements.splice(footerIndex >= 0 ? footerIndex : canonicalCard.body.elements.length, 0, feedbackElement);
+        feedbackBaseCard = canonicalCard as unknown as Record<string, unknown>;
+        messageId = await dispatchPrimary(JSON.stringify(feedbackBaseCard), 'interactive');
+      } else {
+        messageId = await dispatchPrimary(JSON.stringify({
+          schema: '2.0', config: { update_multi: true }, body: { direction: 'vertical', elements },
+        }), 'interactive');
+      }
+    }
+
+    if (feedbackPolicy && effectiveResponseKind === 'final' && !customCard && !pureVideoSend && !vcMeetingManagedSendOrigin && messageId) {
+      const deliveryTurnId = currentTurnId ?? `send:${messageId}`;
+      const correlationDiscriminator = currentTurnId ? messageId : undefined;
+      try {
+        const { getSkillFeedbackStore } = await import('./services/skill-feedback-store.js');
+        const feedbackStore = await getSkillFeedbackStore(resolveDataDir());
+        feedbackStore.recordTurnDelivery({
+          botAppId: appId,
+          sessionId: sid,
+          turnId: deliveryTurnId,
+          correlationDiscriminator,
+          nativeSessionId: s.cliSessionId,
+          platform: 'lark',
+          platformAppId: appId,
+          platformMessageId: messageId,
+          chatId: targetChatId,
+          topicRootId: sendTarget.mode === 'thread' ? sendTarget.rootMessageId : s.rootMessageId,
+          dispatchAttempt: originDispatchAttempt,
+          content: text,
+          cliId: s.cliId,
+          cardMode: 'feedback',
+          status: 'delivered',
+          policy: feedbackPolicy,
+          baseCard: feedbackBaseCard,
+          requesterSubjectId: feedbackRequesterSubjectId,
+          webhookDestinations: feedbackWebhookDestinations,
+          context: { ...(resolveFeedbackTeamId({ dataDir: resolveDataDir(), chatId: targetChatId }) ? { teamId: resolveFeedbackTeamId({ dataDir: resolveDataDir(), chatId: targetChatId }) } : {}) },
+        });
+      } catch (error) {
+        console.error(
+          `botmux send: feedback indexing failed after delivery: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
     }
 
     // Bridge fallback marker — append-only jsonl per session. Same-thread
@@ -11631,6 +11551,9 @@ export async function runHook(
   postAskFn: (body: Record<string, unknown>) => Promise<import('./core/ask-types.js').AskResult>,
   cliId: string,
   resolveAdoptRouteFn?: () => Promise<import('./adapters/adopt-route.js').AdoptRoute | null>,
+  /** 按 OpenCode 原生会话 id（payload.session_id，ses_*）反查所属 botmux 会话；
+   *  缺省用真实实现（在线 daemon 并发查询 + budget 封顶）。测试注入 stub。 */
+  resolveCliSessionRouteFn?: (cliSessionId: string) => Promise<import('./adapters/adopt-route.js').AdoptRoute | null>,
 ): Promise<{ stdout: string }> {
   const { getHookAdapter } = await import('./core/ask-hook/registry.js');
 
@@ -11656,13 +11579,58 @@ export async function runHook(
   const chatId = env.BOTMUX_CHAT_ID;
   const larkAppId = env.BOTMUX_LARK_APP_ID;
 
-  // 路由变量：优先用 env，env 缺失时尝试 adopt 路由
+  // 路由变量：优先用 payload 携带的 OpenCode 原生会话 id 反查所属 botmux 会话；
+  // 未命中：共享 service hook（opencode2）直接 passthrough（fail closed），
+  // 进程私有 hook 回落 env，env 缺失时再尝试 adopt 路由。
   let routeSessionId = sessionId;
   let routeChatId = chatId;
   let routeLarkAppId = larkAppId;
   let routeRoot: string | null = env.BOTMUX_ROOT_MESSAGE_ID || null;
+  let explicitRoute: import('./adapters/adopt-route.js').AdoptRoute | null = null;
 
-  if (!sessionId || !chatId || !larkAppId) {
+  // 共享 service 场景（opencode2）：ask 插件运行在所有客户端共用的托管 service 里，
+  // hook 子进程继承的是「启动该 service 的会话」的 ambient env，与当前会话无关，
+  // 直接拿来路由会跨会话错投。payload.session_id 是 OpenCode 原生 id（ses_*），
+  // 整段反查只对共享 service hook 启用：进程私有 hook（opencode 等）的 ambient
+  // env 是当前进程的可信归属，让反查覆盖反而可能被另一重复绑定的命中错投。
+  // 共享 service 的 env 永远不可信：session_id 缺失或非 ses_* 形状时无法验证
+  // native identity，同样 fail closed（passthrough），绝不落 env 路由。
+  const isSharedServiceHook = cliId === 'opencode2';
+  const rawPayload = payload as Record<string, unknown> | undefined;
+  const nativeSessionId = typeof rawPayload?.session_id === 'string'
+    ? rawPayload.session_id.trim()
+    : '';
+  if (isSharedServiceHook && !/^ses_[0-9A-Za-z]+$/.test(nativeSessionId)) {
+    return { stdout: adapter.passthrough(payload) };
+  }
+  if (isSharedServiceHook) {
+    const { resolveCliSessionRoute, queryCliSession } = await import('./adapters/adopt-route.js');
+    const resolver = resolveCliSessionRouteFn ?? ((cliSessionId: string) =>
+      resolveCliSessionRoute({
+        cliSessionId,
+        listDaemons: listOnlineDaemons,
+        queryDaemon: queryCliSession,
+      }));
+    try {
+      explicitRoute = await resolver(nativeSessionId);
+    } catch {
+      // 反查异常 → 视同未命中（无法证明唯一），fail closed
+      explicitRoute = null;
+    }
+    if (explicitRoute) {
+      routeSessionId = explicitRoute.sessionId;
+      routeChatId = explicitRoute.chatId;
+      routeLarkAppId = explicitRoute.larkAppId;
+      routeRoot = explicitRoute.rootMessageId;
+    } else {
+      // fail closed：反查未能证明「恰好一个完整命中」（未命中 / 双命中歧义 /
+      // 查询超时 / daemon 不可达 / cliSessionId 尚未上报）→ 直接 passthrough
+      // 把问题留给原生终端，绝不回落 ambient env / PID adopt，避免跨会话错投。
+      return { stdout: adapter.passthrough(payload) };
+    }
+  }
+
+  if (!explicitRoute && (!sessionId || !chatId || !larkAppId)) {
     // env 缺失 → 尝试通过祖先 PID 匹配在线 adopt 会话
     const resolver = resolveAdoptRouteFn ?? (() => {
       // 延迟 import 避免冷启动开销

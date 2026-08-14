@@ -15,6 +15,7 @@ import { createCursorAdapter } from './cursor.js';
 import { createGeminiAdapter } from './gemini.js';
 import { createGeniusAdapter } from './genius.js';
 import { createOpenCodeAdapter } from './opencode.js';
+import { createOpenCode2Adapter } from './opencode2.js';
 import { createAntigravityAdapter } from './antigravity.js';
 import { createMtrAdapter } from './mtr.js';
 import { createHermesAdapter } from './hermes.js';
@@ -29,6 +30,7 @@ import { createGrokAdapter } from './grok.js';
 import { createKiroCliAdapter } from './kiro-cli.js';
 import { createRiffAdapter } from './riff.js';
 import { createReasonixAdapter } from './reasonix.js';
+import { createDshAdapter } from './dsh.js';
 
 /**
  * The first CLI executable (or nested runner dependency) before shell
@@ -50,6 +52,7 @@ const RAW_CLI_EXECUTABLES: Readonly<Record<CliId, string | undefined>> = {
   gemini: 'gemini',
   genius: 'genius',
   opencode: 'opencode',
+  opencode2: 'opencode2',
   antigravity: 'agy',
   mtr: 'mtr',
   hermes: 'hermes',
@@ -68,6 +71,9 @@ const RAW_CLI_EXECUTABLES: Readonly<Record<CliId, string | undefined>> = {
   // API-backed; no local executable is required.
   riff: undefined,
   reasonix: 'reasonix',
+  // The adapter itself launches a bundled Node runner; dsh-jsonrpc-agent is
+  // its real second-stage dependency.
+  dsh: 'dsh-jsonrpc-agent',
 };
 
 /** Return the unresolved command without constructing an adapter or spawning a
@@ -167,7 +173,7 @@ export async function createCliAdapter(id: CliId, pathOverride?: string): Promis
   return adapter;
 }
 
-export { createClaudeCodeAdapter, createSeedAdapter, createRelayAdapter, createAidenAdapter, createCocoAdapter, createCodexAdapter, createCodexAppAdapter, createCursorAdapter, createGeminiAdapter, createGeniusAdapter, createOpenCodeAdapter, createAntigravityAdapter, createMtrAdapter, createHermesAdapter, createMiraAdapter, createMirAdapter, createTraexAdapter, createPiAdapter, createCopilotAdapter, createOhMyPiAdapter, createKimiAdapter, createGrokAdapter, createKiroCliAdapter, createRiffAdapter, createReasonixAdapter };
+export { createClaudeCodeAdapter, createSeedAdapter, createRelayAdapter, createAidenAdapter, createCocoAdapter, createCodexAdapter, createCodexAppAdapter, createCursorAdapter, createGeminiAdapter, createGeniusAdapter, createOpenCodeAdapter, createOpenCode2Adapter, createAntigravityAdapter, createMtrAdapter, createHermesAdapter, createMiraAdapter, createMirAdapter, createTraexAdapter, createPiAdapter, createCopilotAdapter, createOhMyPiAdapter, createKimiAdapter, createGrokAdapter, createKiroCliAdapter, createRiffAdapter, createReasonixAdapter, createDshAdapter };
 
 /** Synchronous version for use in worker process. */
 export function createCliAdapterSync(id: CliId, pathOverride?: string): CliAdapter {
@@ -183,6 +189,7 @@ export function createCliAdapterSync(id: CliId, pathOverride?: string): CliAdapt
     case 'gemini': return createGeminiAdapter(pathOverride);
     case 'genius': return createGeniusAdapter(pathOverride);
     case 'opencode': return createOpenCodeAdapter(pathOverride);
+    case 'opencode2': return createOpenCode2Adapter(pathOverride);
     case 'antigravity': return createAntigravityAdapter(pathOverride);
     case 'mtr': return createMtrAdapter(pathOverride);
     case 'hermes': return createHermesAdapter(pathOverride);
@@ -197,6 +204,7 @@ export function createCliAdapterSync(id: CliId, pathOverride?: string): CliAdapt
     case 'kiro-cli': return createKiroCliAdapter(pathOverride);
     case 'riff': return createRiffAdapter(pathOverride);
     case 'reasonix': return createReasonixAdapter(pathOverride);
+    case 'dsh': return createDshAdapter(pathOverride);
     default: throw new Error(`Unknown CLI adapter: ${id}`);
   }
 }

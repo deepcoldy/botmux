@@ -21,7 +21,7 @@ export function backendCliCompatibilityError(
   backendType: BackendType,
   cliId: CliId,
 ): string | undefined {
-  if (backendType === 'zmx' && ['codex-app', 'mira', 'mir'].includes(cliId)) {
+  if (backendType === 'zmx' && ['codex-app', 'mira', 'mir', 'dsh'].includes(cliId)) {
     return `backend "zmx" cannot carry ${cliId}'s hidden OSC final/thread events; use tmux/pty`;
   }
   return undefined;

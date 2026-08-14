@@ -84,16 +84,22 @@ describe('bot defaults focused layout', () => {
     }
   });
 
-  it('adds duration without replacing the familiar full-width quota editor', () => {
+  it('auto-saves duration and quota without action buttons', () => {
     expect(page).toContain('dataInput="grantDefaultDurationMs"');
     expect(page).toContain('data-input="quotaLimit"');
-    expect(page).toContain('data-action="save-grant-defaults"');
+    expect(page).not.toContain('data-action="save-grant-defaults"');
+    expect(page).not.toContain('data-action="reset-grant-defaults"');
+    expect(page).toContain('onBlur={saveQuota}');
+    expect(page).toContain('onChange={saveDuration}');
     expect(page).toContain('className="bd-row bd-grant-duration"');
     expect(page).toContain('className="bd-row bd-quota"');
     expect(page).not.toContain('data-action="toggle-grant-quota-oncall"');
-    expect(page).not.toContain('data-action="reset-grant-defaults"');
-    expect(i18n).toContain("'botDefaults.quotaPlaceholder': '留空＝授权卡每人 3 条'");
-    expect(i18n).toContain("'botDefaults.grantDefaultsCurrentBuiltIn': '当前：{duration} · 授权卡每人 {count} 条；Oncall 不限'");
+    expect(i18n).toContain("'botDefaults.quotaPlaceholder': '留空＝内置默认：授权卡每人 {count} 条'");
+    expect(i18n).toContain("'botDefaults.quotaDefault': '消息额度覆盖'");
+    expect(i18n).toContain("'botDefaults.grantDefaultsCurrentBuiltIn': '当前内置默认：{duration} · 授权卡每人 {count} 条；Oncall 不限'");
+    expect(i18n).toContain("'botDefaults.grantDefaultsCurrentCustom': '当前自定义：{duration} · 每人 {count} 条（授权卡与 Oncall）'");
+    expect(i18n).not.toContain("'botDefaults.grantDefaultsReset'");
+    expect(i18n).not.toContain('点击“恢复默认限制”');
     expect(i18n).not.toContain('产品默认 3 条');
     expect(i18n).not.toContain('product default of 3');
     expect(css).not.toContain('.bot-defaults-page .bd-grant-default-grid');

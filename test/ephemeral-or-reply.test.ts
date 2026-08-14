@@ -71,6 +71,26 @@ describe('deliverEphemeralOrReply', () => {
     expect(reply).not.toHaveBeenCalled();
   });
 
+  it('REGRESSION: a chat-scope session with a frozen thread reply target must stay visible in that thread', async () => {
+    const reply = vi.fn().mockResolvedValue('reply_id');
+    await deliverEphemeralOrReply(ds({ scope: 'chat' }), OP, 'restarted', 'text', reply, {
+      mode: 'thread',
+      rootMessageId: 'om_topic',
+    });
+    expect(sendEphemeralCardMock).not.toHaveBeenCalled();
+    expect(reply).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps ephemeral delivery for an explicitly frozen flat-chat target', async () => {
+    const reply = vi.fn().mockResolvedValue('reply_id');
+    await deliverEphemeralOrReply(ds({ scope: 'chat' }), OP, 'restarted', 'text', reply, {
+      mode: 'plain',
+      chatId: 'oc_here',
+    });
+    expect(sendEphemeralCardMock).toHaveBeenCalledTimes(1);
+    expect(reply).not.toHaveBeenCalled();
+  });
+
   it('wraps a plain text confirmation into a markdown card before sending ephemeral', async () => {
     await deliverEphemeralOrReply(ds({ scope: 'chat' }), OP, 'restarted', 'text', vi.fn());
     const cardJson = sendEphemeralCardMock.mock.calls[0][3];

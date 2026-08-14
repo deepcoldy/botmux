@@ -58,8 +58,27 @@ if (logPath) {
   }) + '\n');
 }
 
+// FAKE_CODEX_COALESCE=1: batch every line written within one synchronous pass
+// into a SINGLE stdout write. Adjacent pipe writes coalesce into one read
+// whenever the reader is scheduled late (routine on loaded CI runners), and
+// the runner's message ordering must not depend on chunk boundaries — this
+// knob makes that transport condition deterministic instead of scheduler-luck.
+let coalesceBuffer = null;
 function write(message) {
-  process.stdout.write(JSON.stringify({ jsonrpc: '2.0', ...message }) + '\n');
+  const line = JSON.stringify({ jsonrpc: '2.0', ...message }) + '\n';
+  if (process.env.FAKE_CODEX_COALESCE === '1') {
+    if (coalesceBuffer === null) {
+      coalesceBuffer = '';
+      setImmediate(() => {
+        const out = coalesceBuffer;
+        coalesceBuffer = null;
+        process.stdout.write(out);
+      });
+    }
+    coalesceBuffer += line;
+    return;
+  }
+  process.stdout.write(line);
 }
 
 function respond(id, result) {

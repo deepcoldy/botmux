@@ -66,6 +66,7 @@ import {
   setResolvedAllowedUsersRepublishHook,
   setAllowedUsersResolveRetryHook,
   vcMeetingAgentConfigActive,
+  botAcceptsSlashFromBots,
   type BotConfig,
   type BotState,
   type OncallChat,
@@ -74,6 +75,9 @@ import {
   type VcMeetingConsumerProfileConfig,
 } from './bot-registry.js';
 import { setDisplayNameRefresher, findConfigField, applyConfigField } from './services/bot-config-store.js';
+import { getSkillFeedbackStore } from './services/skill-feedback-store.js';
+import { enqueueTurnTerminal, drainTurnTerminalQueue } from './services/turn-completion-events.js';
+import { FeedbackWebhookSecretStore, startFeedbackWebhookDispatcher } from './services/feedback-webhook-dispatcher.js';
 import { resolveRegularGroupMode } from './services/chat-reply-mode-store.js';
 import { renameBotOnOpenPlatform, changeBotAvatarOnOpenPlatform } from './services/open-platform-rename.js';
 import { migrateSandboxConfigAtStartup } from './services/sandbox-migration.js';
@@ -169,8 +173,11 @@ import {
   getDaemonStreamingCardUsageSnapshot,
   postTurnStartingCard,
   isSessionTransferring,
+  snapshotCodexAppFinalSettlements,
+  codexAppFinalSettlementCount,
   type WorkerSessionReplyOptions,
 } from './core/worker-pool.js';
+import { waitAllWithin, trackProducerQuiet, trackProcessExited } from './core/producer-quiescence.js';
 import { AbortDeadlineError, hasExactSafeJsonKeys, ipcRoute, isTrustedHostIpcRequest, JsonBodyTooLargeError, jsonRes, readJsonBody, runWithAbortDeadline, setBotName, setLarkAppId, startIpcServer, setBotRenamer, setBotAvatarChanger, armCoreOnlyReadinessGate, setCoreOnlyReady, setSupervisorShutdownHandler } from './core/dashboard-ipc-server.js';
 import { setDeviceIsolationDaemonIdentity } from './core/device-isolation-daemon.js';
 import {
@@ -237,7 +244,7 @@ import {
 import { claimInitialUserTurn, isInitialUserTurnPending, releaseInitialUserTurn } from './core/initial-user-turn.js';
 import { applyQueuedCodexAppLegacyFallback, mergeQueuedCodexAppTurn } from './core/session-create.js';
 import { findOnlineDaemon, listOnlineDaemons } from './utils/daemon-discovery.js';
-import { beginReplyTargetTurn, buildTurnParticipantsFrom, fallbackTurnId, isSubstituteTurn, resolveSessionReplyTarget, syncReplyTargetState } from './core/reply-target.js';
+import { beginReplyTargetTurn, buildTurnParticipantsFrom, fallbackTurnId, isSubstituteTurn, resolveInboundReplyTarget, resolveSessionReplyTarget, syncReplyTargetState } from './core/reply-target.js';
 import { readDeferredTopicBinding } from './core/deferred-topic-binding.js';
 import {
   buildBotmuxLarkNativeSessionTitle,
@@ -3127,21 +3134,6 @@ function receivedReactionEmojiFor(ds: DaemonSession): string {
   } catch { return RECEIVED_REACTION_EMOJI_TYPE; }
 }
 
-function readSessionFreshFromDisk(sessionId: string, larkAppId: string): import('./types.js').Session | undefined {
-  const paths = [
-    join(config.session.dataDir, `sessions-${larkAppId}.json`),
-    join(config.session.dataDir, 'sessions.json'),
-  ];
-  for (const fp of paths) {
-    if (!existsSync(fp)) continue;
-    try {
-      const data = JSON.parse(readFileSync(fp, 'utf-8')) as Record<string, import('./types.js').Session>;
-      if (data[sessionId]) return data[sessionId];
-    } catch { /* ignore corrupt/racing session file */ }
-  }
-  return undefined;
-}
-
 export async function noteTurnReceived(
   ds: DaemonSession,
   triggerMessageId: string,
@@ -3346,7 +3338,7 @@ async function sessionReply(
       return replyWithHookPolicy(root.rootMessageId, content, msgType, true, opts.uuid);
     }
     if (ds?.scope === 'chat') {
-      const fresh = readSessionFreshFromDisk(ds.session.sessionId, ds.larkAppId);
+      const fresh = sessionStore.readSessionRowFromDisk(ds.session.sessionId, ds.larkAppId);
       if (fresh) syncReplyTargetState(ds, fresh);
       // Resolve through fallbackTurnId so daemon-side sends that carry no turn of
       // their own (the repo-select card, skip/switch confirmations, crash notices)
@@ -4485,6 +4477,39 @@ const commandDeps: CommandHandlerDeps = {
   prewarmDocCommentSession,
 };
 
+/** Bind every reply produced by one slash-command invocation to the routing
+ * decision already made for its inbound Lark message. Commands return before
+ * the normal turn-registration path, and lifecycle commands may remove or
+ * replace their session before replying, so mutable session state cannot be
+ * the authority for placement here. */
+function commandDepsForInvocation(input: {
+  scope: 'chat' | 'thread';
+  chatId: string;
+  anchor: string;
+  messageId: string;
+  replyRootId?: string;
+}): CommandHandlerDeps {
+  const replyTarget = resolveInboundReplyTarget({
+    scope: input.scope,
+    chatId: input.chatId,
+    threadRootId: input.anchor,
+    replyRootId: input.replyRootId,
+  });
+  return {
+    ...commandDeps,
+    invocationReplyTarget: replyTarget,
+    sessionReply: (rootId, content, msgType, larkAppId, turnId, opts) =>
+      sessionReply(
+        rootId,
+        content,
+        msgType,
+        larkAppId,
+        turnId ?? input.messageId,
+        opts?.replyTarget ? opts : { ...opts, replyTarget },
+      ),
+  };
+}
+
 /**
  * Fire a session-less daemon command (`/group`, `/g`) WITHOUT blocking the Lark
  * event ACK on its slow work — the fast-ACK path.
@@ -4510,8 +4535,9 @@ function fireSessionlessCommandDetached(
   anchor: string,
   message: LarkMessage,
   larkAppId: string,
+  deps: CommandHandlerDeps,
 ): void {
-  void handleCommand(cmd, anchor, message, commandDeps, larkAppId).catch((err) =>
+  void handleCommand(cmd, anchor, message, deps, larkAppId).catch((err) =>
     logger.error(`[sessionless ${cmd}] ${anchor.substring(0, 12)} failed: ${err?.message ?? err}`),
   );
 }
@@ -6199,6 +6225,63 @@ ipcRoute('GET', '/api/adopt-session/:pid', (_req, res, params) => {
     }
   }
   return jsonRes(res, 404, { ok: false, error: 'no_adopt_session' });
+});
+
+/**
+ * 按 (cliId, cliSessionId) 在活跃会话里反查 CLI 原生会话绑定。
+ *
+ * 反查 identity 必须是组合键：OpenCode V1→V2 迁移会原样保留 ses_* id（同一
+ * id 同时存在于 V1 session 与 V2 session_v2），只按 cliSessionId 匹配会把
+ * V1 会话（cliId=opencode）当成唯一 hit，错投到 V1 话题。本查询只服务
+ * opencode2 共享托管 service，命中必须恰好一个：0 个 → miss，≥2 个
+ * （两个话题/机器人并发导入同一外部会话的重复绑定）→ conflict。
+ */
+export function matchCliSession(
+  activeSessions: Iterable<DaemonSession>,
+  cliId: string,
+  cliSessionId: string,
+): { kind: 'hit'; session: DaemonSession } | { kind: 'miss' } | { kind: 'conflict' } {
+  const matches = [...activeSessions].filter(
+    (ds) => ds.session.cliId === cliId && ds.session.cliSessionId === cliSessionId,
+  );
+  if (matches.length === 0) return { kind: 'miss' };
+  if (matches.length > 1) return { kind: 'conflict' };
+  return { kind: 'hit', session: matches[0] };
+}
+
+// GET /api/session-by-cli/:cliId/:cliSessionId — 按 (cliId, cliSessionId) 反查
+// 活跃 botmux 会话路由。托管 service 场景（opencode2 的 ask 插件运行在所有
+// 客户端共用的 service 里）：hook 子进程继承的是启动该 service 时固化的 ambient
+// env，与当前会话无关；必须用 payload 携带的 native sessionID 显式反查，否则
+// 跨会话错投（多 bot/多会话会放行或错投到首个启动 service 的会话）。
+// 反查 identity 必须是 (cliId, cliSessionId)：OpenCode V1→V2 迁移会原样保留
+// ses_* id（真实环境验证同一 id 同时存在于 V1 session 与 V2 session_v2），
+// 只按 cliSessionId 匹配会把 V1 会话当成唯一 hit，V2 hook 的问题被投到 V1 话题。
+// 本端点只服务 opencode2 共享托管 service 的反查，强制 cliId === 'opencode2'；
+// 多命中返回 409 conflict，让反查侧 fail closed（歧义时 passthrough）。
+ipcRoute('GET', '/api/session-by-cli/:cliId/:cliSessionId', (_req, res, params) => {
+  const cliId = params.cliId;
+  const cliSessionId = params.cliSessionId;
+  if (cliId !== 'opencode2') {
+    return jsonRes(res, 400, { ok: false, error: 'unsupported_cli' });
+  }
+  if (!cliSessionId || cliSessionId.length > 512) {
+    return jsonRes(res, 400, { ok: false, error: 'bad_cli_session_id' });
+  }
+  const match = matchCliSession(activeSessions.values(), cliId, cliSessionId);
+  if (match.kind === 'miss') {
+    return jsonRes(res, 404, { ok: false, error: 'no_session' });
+  }
+  if (match.kind === 'conflict') {
+    return jsonRes(res, 409, { ok: false, error: 'ambiguous_cli_session' });
+  }
+  const ds = match.session;
+  return jsonRes(res, 200, {
+    sessionId: ds.session.sessionId,
+    chatId: ds.chatId,
+    larkAppId: ds.larkAppId,
+    rootMessageId: sessionAnchorId(ds),
+  });
 });
 
 for (const path of ['/api/vc-meetings/members/register', '/api/vc-meetings/members/update']) {
@@ -8316,6 +8399,9 @@ type VcMeetingTemporaryAuthApplyInput = {
   mentions?: LarkMessage['mentions'];
   senderOpenId?: string;
   senderUnionId?: string;
+  /** 见 handleVcMeetingTemporaryAuthCommand.onMutating：即将真实变更授权状态时
+   *  触发；operator 拒绝 / list / 空目标等只回复的分支不触发。 */
+  onMutating?: () => void;
 };
 
 async function applyVcMeetingTemporaryAuthCommand(
@@ -8348,6 +8434,7 @@ async function applyVcMeetingTemporaryAuthCommand(
     return true;
   }
 
+  input.onMutating?.();
   const changed: string[] = [];
   const unchanged: string[] = [];
   for (const target of parsed.targets) {
@@ -8483,6 +8570,9 @@ async function handleVcMeetingTemporaryAuthCommand(input: {
   mentions?: LarkMessage['mentions'];
   senderOpenId?: string;
   senderUnionId?: string;
+  /** 临时授权状态即将发生真实变更时回调（纯拒绝/usage/list 等只回复的分支不触发），
+   *  供 ingress 调用方打接纳标——之后结果回复失败不得再诱导重发重复执行。 */
+  onMutating?: () => void;
 }): Promise<boolean> {
   const parsed = parseVcMeetingTemporaryAuthCommand(
     input.commandContent,
@@ -8510,6 +8600,7 @@ async function handleVcMeetingTemporaryAuthCommand(input: {
     mentions: input.mentions,
     senderOpenId: input.senderOpenId,
     senderUnionId: input.senderUnionId,
+    onMutating: input.onMutating,
   });
 }
 
@@ -16575,6 +16666,10 @@ function deliverPassthroughToExistingSession(
     senderOpenId?: string;
     senderIsBot: boolean;
     substitute: boolean;
+    /** raw input 已写入 worker 后回调（worker 不在线的拒绝分支不触发），供 ingress
+     *  调用方打接纳标——其后同步收尾（落盘/事件派发）抛错不得再诱导重发，否则
+     *  /compact 这类非幂等 passthrough 会被重发重复执行。 */
+    onDelivered?: () => void;
   },
 ): void {
   if ((ds.worker && !ds.worker.killed) || isSessionTransferring(ds)) {
@@ -16614,6 +16709,7 @@ function deliverPassthroughToExistingSession(
       content: commandContent,
       turnId: turn.messageId,
     });
+    turn.onDelivered?.();
     markSessionActivity(ds);
     logger.info(`[${anchor.substring(0, 12)}] Passthrough ${cmd} → worker`);
     return;
@@ -16666,12 +16762,15 @@ async function startInitialPassthroughSession(args: {
   /** This raw cold start came from `/t ...`; seed a visible thread only on the
    *  direct-fork branches that otherwise produce no immediate reply. */
   cardlessForceTopicSeed: boolean;
+  /** 本轮 inbound 进入 durable 队列（staging + append）后回调，供调用方翻转
+   *  ingress 接纳标记——之后的 repo card / 状态回复失败不得再诱导重发。 */
+  onDurablyAdmitted?: () => void;
 }): Promise<void> {
   const {
     larkAppId, chatId, chatType, scope, anchor, messageId, replyRootId,
     parsed, cmd, commandContent, senderOpenId, substitute, senderUnionId,
     memberUnionId, ownerOpenId, ownerUnionId, creatorOpenId, botSender,
-    senderIsBot, cardlessForceTopicSeed,
+    senderIsBot, cardlessForceTopicSeed, onDurablyAdmitted,
     routeToCanonicalOwner,
   } = args;
   if (!await enforceMessageQuotaForCliInput(larkAppId, chatId, senderOpenId, messageId, anchor, senderUnionId, memberUnionId, chatType, botSender)) {
@@ -16766,9 +16865,14 @@ async function startInitialPassthroughSession(args: {
   }
   messageQueue.ensureQueue(anchor);
   messageQueue.appendMessage(anchor, { ...parsed, content: commandContent });
+  // 接纳标记按分支下沉，不绑在 appendMessage 上：queues/*.jsonl 仅供 dashboard
+  // 预览，无投递重放语义；且 replyInvalidWorkingDirs 是「放弃本轮」分支（关闭
+  // 会话后才回复），放弃前的失败必须保持「请重发」提示。
 
   if (pinnedWorkingDir && autoWt) {
     if (await replyInvalidWorkingDirs(anchor, larkAppId, ds)) return;
+    // 已 durable staging（auto_worktree）且通过放弃闸：detached 建库流程接管投递。
+    onDurablyAdmitted?.();
     ds.initialStartPending = false; // pendingRepo/worktree now owns buffering
     // 挂起态提交：worktree 建好后经 runAutoWorktreeCommit → commitRepoSelection 拉起
     // pendingRawInput 冷启动会话。detach → 立即返回，不阻塞本条消息处理。
@@ -16786,6 +16890,8 @@ async function startInitialPassthroughSession(args: {
     });
     const availableBots = await getAvailableBots(larkAppId, chatId);
     forkReservedInitialRawSession(ds, availableBots);
+    // fork 成功即开场已交给 CLI；fork 抛错则本轮只存在于内存，保持重发提示。
+    onDurablyAdmitted?.();
     const reason = oncallEntry
       ? `oncall-bound chat ${chatId}`
       : inheritedFrom
@@ -16801,6 +16907,9 @@ async function startInitialPassthroughSession(args: {
   if (projects.length > 0) {
     ds.initialStartPending = false; // pendingRepo/card now owns buffering
     lastRepoScan.set(chatId, projects);
+    // 已 durable staging（picker）且通过放弃闸；接下来卡片发送失败不得诱导重发
+    //（重发会在 pendingRepo 缓冲里再入一份）。
+    onDurablyAdmitted?.();
     const cardJson = buildRepoSelectCard(projects, getSessionWorkingDir(ds), anchor, localeForBot(larkAppId), getBot(larkAppId).config.worktreeMultiPicker);
     ds.repoCardMessageId = await sessionReply(anchor, cardJson, 'interactive', larkAppId);
     persistPendingRepoCardMessageId(ds, ds.repoCardMessageId);
@@ -16809,6 +16918,9 @@ async function startInitialPassthroughSession(args: {
     return;
   }
 
+  // 已 durable staging（picker，含 rawInput）且通过放弃闸：fork 失败后本条 raw
+  // passthrough 仍 durable 挂在会话上，重发会重复执行非幂等命令——先打接纳标。
+  onDurablyAdmitted?.();
   ds.pendingRepo = false;
   await maybeSeedCardlessForceTopicTurn({
     ds,
@@ -16842,11 +16954,58 @@ function mergeVcMeetingApplicationContext(
   return `${[...new Set(lines)].join('\n')}\n`;
 }
 
+/** 本轮 inbound 已被真正接纳后打标：durable 写入（queuedActivationTail /
+ * pendingRepo staging）且已通过 replyInvalidWorkingDirs 之类的放弃闸，或已实际
+ * 送达 worker（live send 被接受 / refork·初次冷 fork 成功 / PTY raw input 已写入 /
+ * vc-auth 真实变更开始）。标记落在 ctx.ingressAdmission 共享 box 上（见其字段
+ * 注释），notifyOrdinaryIngressFailure 据此区分「没送达请重发」与「已接纳勿重发」。
+ * messageQueue.appendMessage 不算接纳——queues/*.jsonl 仅供 dashboard 预览，
+ * 没有投递重放语义；handleCommand 命令路径不参与（其内部 catch 吞掉一切异常）。 */
+function markIngressAdmitted(ctx: RoutingContext): void {
+  if (ctx.ingressAdmission) ctx.ingressAdmission.admitted = true;
+  else ctx.ingressAdmission = { admitted: true };
+}
+
+/**
+ * 普通消息处理链的终态失败收口：transport 已 ACK（用户看到消息发出去了），但
+ * 异常把整条投递链掀翻——此前只剩 dispatcher 的 log-only catch，用户视角就是
+ * 机器人吞消息。best-effort 回一条可行动提示后原样重抛，dispatcher 既有的错误
+ * 日志与调用方语义不变。rejected 类失败（quota/权限拦截）由各自路径回复后正常
+ * return，不会走到这里。
+ *
+ * 提示文案按接纳阶段二选一：本轮一旦被 durable queue / worker 接纳
+ * （ctx.ingressAdmission.admitted，各接纳点经 markIngressAdmitted 翻转），失败
+ * 只可能出在接纳之后的状态回复等 UX 支路——此时绝不能提示「请重发」，否则一次
+ * Lark 瞬时发送故障会被放大成同一任务再次入队、CLI 重复执行；改为「已接收，
+ * 勿重发」的澄清。未接纳的失败保持原有重发提示。
+ */
+async function notifyOrdinaryIngressFailure(ctx: RoutingContext, err: unknown): Promise<never> {
+  const replyAnchor = ctx.scope === 'thread' ? ctx.anchor : ctx.chatId;
+  const noticeKey = ctx.ingressAdmission?.admitted
+    ? 'daemon.ordinary_ingress_admitted_reply_failed'
+    : 'daemon.ordinary_ingress_failed';
+  try {
+    await sessionReply(
+      replyAnchor,
+      tr(noticeKey, undefined, localeForBot(ctx.larkAppId)),
+      'text',
+      ctx.larkAppId,
+    );
+  } catch (noticeErr) {
+    logger.warn(
+      `[${ctx.larkAppId}] ordinary ingress failure notice for ${ctx.messageId.substring(0, 12)} `
+      + `could not be delivered: ${noticeErr instanceof Error ? noticeErr.message : String(noticeErr)}`,
+    );
+  }
+  throw err;
+}
+
 async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
+  ctx.ingressAdmission ??= { admitted: false };
   return withBotTurnAdmission(
     ctx.larkAppId,
     () => handleNewTopicAdmitted(data, ctx),
-  );
+  ).catch(err => notifyOrdinaryIngressFailure(ctx, err));
 }
 
 /**
@@ -17110,17 +17269,31 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
   }
 
   // Intercept daemon commands in new topics (no session needed for some commands)
-  const invocation = parseSlashCommandInvocation(cmdContent);
+  // acceptSlashFromBots gate: a bot sender's slash command is only routed as a
+  // command when this bot opts in (default on). When off, fall through to
+  // ordinary message handling — the peer bot can still talk, it just can't drive
+  // /clear /model /close … into this bot. Human senders are never gated here.
+  const senderIsBotForSlashGate = isBotSenderType || isForeignBotSender;
+  const invocation = (senderIsBotForSlashGate && !botAcceptsSlashFromBots(larkAppId))
+    ? null
+    : parseSlashCommandInvocation(cmdContent);
   if (invocation) {
     const { cmd, content: commandContent } = invocation;
+    const invocationDeps = commandDepsForInvocation({
+      scope,
+      chatId,
+      anchor,
+      messageId: parsed.messageId,
+      replyRootId,
+    });
     const restrictedText = grantRestrictedSlashCommandText(larkAppId, chatId, senderOpenId, cmd);
     if (restrictedText) {
-      await sessionReply(anchor, restrictedText, 'text', larkAppId);
+      await invocationDeps.sessionReply(anchor, restrictedText, 'text', larkAppId);
       return;
     }
     if (cmd === '/vc-auth') {
       if (!canOperate(larkAppId, chatId, senderOpenId, teamTrustUnionId)) {
-        await sessionReply(anchor, tr('daemon.cmd_allowed_users_only', { cmd }, localeForBot(larkAppId)), 'text', larkAppId);
+        await invocationDeps.sessionReply(anchor, tr('daemon.cmd_allowed_users_only', { cmd }, localeForBot(larkAppId)), 'text', larkAppId);
         return;
       }
       await handleVcMeetingTemporaryAuthCommand({
@@ -17131,6 +17304,9 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
         mentions: parsed.mentions,
         senderOpenId,
         senderUnionId,
+        // help/invalid/无监听等纯拒绝分支不打接纳标（回复失败应保持「请重发」）；
+        // 只有真正开始改临时授权状态后，结果回复失败才不得诱导重发。
+        onMutating: () => markIngressAdmitted(ctx),
       });
       return;
     }
@@ -17138,14 +17314,14 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     // summon has nothing to show in a brand-new topic. Route here so the generic
     // daemon-command block below does not pre-create a worker=null session.
     if (cmd === '/card') {
-      await handleCardCommand(anchor, larkAppId, chatId, senderOpenId, commandContent, commandDeps);
+      await handleCardCommand(anchor, larkAppId, chatId, senderOpenId, commandContent, invocationDeps);
       return;
     }
     // /term needs a live session's terminal; in a brand-new topic there's none.
     // Route here (own owner-gate inside) so the generic block below doesn't
     // pre-create a worker=null phantom session just to reply "no session".
     if (cmd === '/term') {
-      await handleTermLinkCommand(anchor, larkAppId, chatId, senderOpenId, commandContent, commandDeps);
+      await handleTermLinkCommand(anchor, larkAppId, chatId, senderOpenId, commandContent, invocationDeps);
       return;
     }
     if (resolvePassthroughCommands(larkAppId).has(cmd)) {
@@ -17176,6 +17352,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
           ownerOpenId: senderOpenId,
           ownerUnionId: senderUnionId,
           creatorOpenId: senderOpenId,
+          onDurablyAdmitted: () => markIngressAdmitted(ctx),
           routeToCanonicalOwner: () => handleThreadReplyAdmitted(data, {
             ...ctx,
             scope,
@@ -17184,7 +17361,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
         });
         return;
       }
-      await sessionReply(anchor, tr('daemon.cmd_requires_session', { cmd }, localeForBot(larkAppId)), 'text', larkAppId);
+      await invocationDeps.sessionReply(anchor, tr('daemon.cmd_requires_session', { cmd }, localeForBot(larkAppId)), 'text', larkAppId);
       return;
     }
     if (DAEMON_COMMANDS.has(cmd)) {
@@ -17196,7 +17373,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
       // canRunDaemonCommand = canOperate ∪（cmd ∈ canTalkDaemonCommands && canTalk）：
       // bot 可通过名单把选定命令（如 /status）降到 canTalk；未配置时与 canOperate 全等。
       if (!canRunDaemonCommand(larkAppId, chatId, senderOpenId, teamTrustUnionId, cmd, senderUnionId, chatType, isBotSenderType, isBotSenderType)) {
-        await sessionReply(anchor, tr('daemon.cmd_allowed_users_only', { cmd }, localeForBot(larkAppId)), 'text', larkAppId);
+        await invocationDeps.sessionReply(anchor, tr('daemon.cmd_allowed_users_only', { cmd }, localeForBot(larkAppId)), 'text', larkAppId);
         return;
       }
       // `/group` (`/g`) doesn't open a conversation — creating a sessionStore
@@ -17207,7 +17384,13 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
         // Fast-ACK: run detached so the WS event ack isn't blocked on /group's
         // slow Lark API work → no Feishu redelivery → no duplicate group.
         // See fireSessionlessCommandDetached.
-        fireSessionlessCommandDetached(cmd, anchor, { ...parsed, content: commandContent, chatId }, larkAppId);
+        fireSessionlessCommandDetached(
+          cmd,
+          anchor,
+          { ...parsed, content: commandContent, chatId },
+          larkAppId,
+          invocationDeps,
+        );
         return;
       }
       // These commands operate on an EXISTING session; a brand-new topic has none. Route
@@ -17218,7 +17401,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
       // permission gates inside their handlers) this branch MUST stay after
       // the canOperate gate above — their handlers do not repeat that gate.
       if (EXISTING_SESSION_ONLY_DAEMON_COMMANDS.has(cmd)) {
-        await handleCommand(cmd, anchor, { ...parsed, content: commandContent }, commandDeps, larkAppId);
+        await handleCommand(cmd, anchor, { ...parsed, content: commandContent }, invocationDeps, larkAppId);
         return;
       }
       // Same rootMessageId reasoning as below in the main spawn path:
@@ -17284,7 +17467,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
         });
       }
       // Pass mention-stripped content so /command argument parsing works.
-      await handleCommand(cmd, anchor, { ...parsed, content: commandContent }, commandDeps, larkAppId);
+      await handleCommand(cmd, anchor, { ...parsed, content: commandContent }, invocationDeps, larkAppId);
       return;
     }
   }
@@ -17578,12 +17761,17 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
   }
   messageQueue.ensureQueue(anchor);
   messageQueue.appendMessage(anchor, parsed);
+  // 接纳标记按分支下沉，不绑在 appendMessage 上：queues/*.jsonl 仅供 dashboard
+  // 预览，无投递重放语义；且 replyInvalidWorkingDirs 是「放弃本轮」分支（关闭
+  // 会话后才回复），放弃前的失败必须保持「请重发」提示。
 
   // Auto-worktree: session is registered PENDING; build the worktree off the
   // critical path, then commitRepoSelection pins it + forks (folding in any
   // messages buffered during creation). detach → return immediately.
   if (pinnedWorkingDir && autoWt) {
     if (await replyInvalidWorkingDirs(anchor, larkAppId, ds)) return;
+    // 已 durable staging（auto_worktree）且通过放弃闸：detached 建库流程接管投递。
+    markIngressAdmitted(ctx);
     ds.initialStartPending = false; // pendingRepo/worktree now owns buffering
     startAutoWorktreePending(ds, { anchor, baseDir: pinnedWorkingDir, title: session.title, prompt: promptContent, operatorOpenId: senderOpenId });
     return;
@@ -17602,6 +17790,8 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     const availableBots = await getAvailableBots(larkAppId, chatId);
     await noteTurnReceived(ds, messageId, content, newTopicSender, messageId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
     forkReservedInitialSession(ds, availableBots);
+    // fork 成功即开场已交给 CLI；fork 抛错则开场只存在于内存，保持重发提示。
+    markIngressAdmitted(ctx);
     const reason = oncallEntry
       ? `oncall-bound chat ${chatId}`
       : inheritedFrom
@@ -17623,6 +17813,9 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
   if (projects.length > 0) {
     ds.initialStartPending = false; // pendingRepo/card now owns buffering
     lastRepoScan.set(chatId, projects);
+    // 已 durable staging（picker）且通过放弃闸；接下来卡片发送失败不得诱导重发
+    //（重发会在 pendingRepo 缓冲里再入一份）。
+    markIngressAdmitted(ctx);
     const currentCwd = getSessionWorkingDir(ds);
     const cardJson = buildRepoSelectCard(projects, currentCwd, anchor, localeForBot(larkAppId), getBot(larkAppId).config.worktreeMultiPicker);
     ds.repoCardMessageId = await sessionReply(anchor, cardJson, 'interactive', larkAppId);
@@ -17630,7 +17823,11 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     announcePendingRepoSession(ds);
     logger.info(`[${tag(ds)}] Waiting for repo selection (${projects.length} projects)`);
   } else {
-    // No projects found — skip repo selection, spawn directly
+    // No projects found — skip repo selection, spawn directly.
+    // 已 durable staging（picker）且通过放弃闸：即使下面 fork 失败，opening 仍由
+    // 会话 durable 持有（pre-init 回滚恢复 queued journal，重启复活），重发会
+    // 重复执行——先打接纳标。
+    markIngressAdmitted(ctx);
     ds.pendingRepo = false;
     ensureSessionWhiteboard(ds);
     await maybeSeedCardlessForceTopicTurn({
@@ -18201,6 +18398,7 @@ async function handleThreadReply(
   // quota/resource/sender preparation awaits. Synthetic keys share the same
   // lock registry without occupying or mutating an active-session slot.
   const deliveryKey = `\u0000thread-delivery:${ctx.larkAppId}:${ctx.scope}:${ctx.anchor}`;
+  ctx.ingressAdmission ??= { admitted: false };
   return withActiveSessionKeyLock(
     activeSessions,
     deliveryKey,
@@ -18208,7 +18406,7 @@ async function handleThreadReply(
       ctx.larkAppId,
       () => handleThreadReplyAdmitted(data, ctx, prepared),
     ),
-  );
+  ).catch(err => notifyOrdinaryIngressFailure(ctx, err));
 }
 
 async function handleThreadReplyAdmitted(
@@ -18425,19 +18623,31 @@ async function handleThreadReplyAdmitted(
   }
 
   // Intercept daemon commands
-  const invocation = parseSlashCommandInvocation(cmdContent);
+  // acceptSlashFromBots gate (mirror of the new-topic path): a bot sender's
+  // slash is only routed as a command when this bot opts in (default on); when
+  // off it falls through to ordinary message handling. Human senders unaffected.
+  const invocation = ((isBotSenderType || isForeignBot) && !botAcceptsSlashFromBots(larkAppId))
+    ? null
+    : parseSlashCommandInvocation(cmdContent);
   if (invocation) {
     const { cmd, content: commandContent } = invocation;
+    const invocationDeps = commandDepsForInvocation({
+      scope,
+      chatId: ctxChatId,
+      anchor,
+      messageId: parsed.messageId,
+      replyRootId,
+    });
     const existingDs = activeSessions.get(sessionKey(anchor, larkAppId));
     const effectiveThreadChatId = existingDs?.chatId ?? threadChatId;
     const restrictedText = grantRestrictedSlashCommandText(larkAppId, effectiveThreadChatId, threadSenderOpenId, cmd);
     if (restrictedText) {
-      await sessionReply(anchor, restrictedText, 'text', larkAppId);
+      await invocationDeps.sessionReply(anchor, restrictedText, 'text', larkAppId);
       return;
     }
     if (cmd === '/vc-auth') {
       if (!canOperate(larkAppId, effectiveThreadChatId, threadSenderOpenId, threadTeamTrustUnionId)) {
-        await sessionReply(anchor, tr('daemon.cmd_allowed_users_only', { cmd }, localeForBot(larkAppId)), 'text', larkAppId);
+        await invocationDeps.sessionReply(anchor, tr('daemon.cmd_allowed_users_only', { cmd }, localeForBot(larkAppId)), 'text', larkAppId);
         return;
       }
       await handleVcMeetingTemporaryAuthCommand({
@@ -18448,6 +18658,8 @@ async function handleThreadReplyAdmitted(
         mentions: parsed.mentions,
         senderOpenId: threadSenderOpenId,
         senderUnionId: threadSenderUnionId,
+        // 同 new-topic 路径：仅在真正开始改状态后打接纳标。
+        onMutating: () => markIngressAdmitted(ctx),
       });
       return;
     }
@@ -18484,6 +18696,7 @@ async function handleThreadReplyAdmitted(
           ownerOpenId: isForeignBot ? undefined : threadSenderOpenId,
           ownerUnionId: isForeignBot ? undefined : data?.sender?.sender_id?.union_id,
           creatorOpenId: threadSenderOpenId,
+          onDurablyAdmitted: () => markIngressAdmitted(ctx),
           routeToCanonicalOwner: () => handleThreadReplyAdmitted(data, {
             ...ctx,
             scope,
@@ -18501,7 +18714,7 @@ async function handleThreadReplyAdmitted(
       // 收紧到与 daemon 命令同档；这会同时改变真人 oncall 成员的现有行为，应单独评估。
       const ds = existingDs;
       if (ds?.worker && !ds.worker.killed && hasQueuedActivationAdmissionGate(ds)) {
-        sessionReply(
+        invocationDeps.sessionReply(
           anchor,
           tr('daemon.cmd_activation_pending', { cmd }, localeForBot(larkAppId)),
           'text',
@@ -18519,7 +18732,7 @@ async function handleThreadReplyAdmitted(
         // a clear message rather than deliver a silent no-op (or spawn junk Riff
         // tasks). Other passthrough commands are unaffected.
         if (cmd === '/fast' && fastToggleUnsupportedBackend(ds)) {
-          await sessionReply(anchor, tr('daemon.fast_unsupported_backend', undefined, localeForBot(larkAppId)), 'text', larkAppId);
+          await invocationDeps.sessionReply(anchor, tr('daemon.fast_unsupported_backend', undefined, localeForBot(larkAppId)), 'text', larkAppId);
           return;
         }
         deliverPassthroughToExistingSession(ds, cmd, commandContent, anchor, larkAppId, {
@@ -18528,9 +18741,10 @@ async function handleThreadReplyAdmitted(
           senderOpenId: threadSenderOpenId,
           senderIsBot: isForeignBot,
           substitute: !!substituteTrigger,
+          onDelivered: () => markIngressAdmitted(ctx),
         });
       }
-      else void sessionReply(anchor, tr('daemon.cmd_needs_active_cli', { cmd }, localeForBot(larkAppId)), 'text', larkAppId);
+      else void invocationDeps.sessionReply(anchor, tr('daemon.cmd_needs_active_cli', { cmd }, localeForBot(larkAppId)), 'text', larkAppId);
       return;
     }
     if (DAEMON_COMMANDS.has(cmd)) {
@@ -18541,7 +18755,7 @@ async function handleThreadReplyAdmitted(
       // /term in a thread with no existingDs would spawn a worker:null phantom
       // session and pollute the dashboard before replying not_ready/owner_only.
       if (cmd === '/term') {
-        await handleTermLinkCommand(anchor, larkAppId, threadChatId ?? '', threadSenderOpenId, commandContent, commandDeps);
+        await handleTermLinkCommand(anchor, larkAppId, threadChatId ?? '', threadSenderOpenId, commandContent, invocationDeps);
         return;
       }
       // canOperate gate for thread-reply daemon commands — required in every chat
@@ -18549,7 +18763,7 @@ async function handleThreadReplyAdmitted(
       // canRunDaemonCommand：canTalkDaemonCommands 名单内的命令降到 canTalk，
       // 与 new-topic 路径的统一闸同款（未配置时与 canOperate 全等）。
       if (!canRunDaemonCommand(larkAppId, effectiveThreadChatId, threadSenderOpenId, threadTeamTrustUnionId, cmd, threadSenderUnionId, ctxChatType, isBotSenderType || isForeignBot, isBotSenderType)) {
-        sessionReply(anchor, tr('daemon.cmd_allowed_users_only', { cmd }, localeForBot(larkAppId)), 'text', larkAppId);
+        invocationDeps.sessionReply(anchor, tr('daemon.cmd_allowed_users_only', { cmd }, localeForBot(larkAppId)), 'text', larkAppId);
         return;
       }
       // First message of a fresh thread carrying a session-needing daemon command
@@ -18617,10 +18831,12 @@ async function handleThreadReplyAdmitted(
       const cmdMessage = { ...parsed, content: commandContent, chatId: threadChatId };
       if (isSessionlessCommandInvocation(cmd, commandContent)) {
         // Fast-ACK for /group invoked mid-thread. See fireSessionlessCommandDetached.
-        fireSessionlessCommandDetached(cmd, anchor, cmdMessage, larkAppId);
+        fireSessionlessCommandDetached(cmd, anchor, cmdMessage, larkAppId, invocationDeps);
         return;
       }
-      await handleCommand(cmd, anchor, cmdMessage, commandDeps, larkAppId);
+      // 命令路径不打接纳标：handleCommand 内部 catch 吞掉一切异常并记日志
+      //（command-handler.ts 收口），异常到不了 ingress catch，标记永远读不到。
+      await handleCommand(cmd, anchor, cmdMessage, invocationDeps, larkAppId);
       return;
     }
   }
@@ -18872,6 +19088,7 @@ async function handleThreadReplyAdmitted(
         cliInput: followUp,
         turnId: parsed.messageId,
       }, tailReservation);
+      markIngressAdmitted(ctx);
     } finally {
       settleAsyncQueuedActivationTailAdmission(ds);
     }
@@ -19011,6 +19228,9 @@ async function handleThreadReplyAdmitted(
           turnId: parsed.messageId,
         }, durableTailReservation!);
       }
+      // 本轮已持久化接纳（durable opening 或 durable tail）；下面的状态回复再
+      // 失败也不得诱导重发（PR #846 review）。
+      markIngressAdmitted(ctx);
       const pendingReplyKey = ds.worktreeCreating
         ? 'daemon.worktree_building_wait'
         : 'daemon.choose_repo_first';
@@ -19248,10 +19468,13 @@ async function handleThreadReplyAdmitted(
     // creator re-enters the canonical route above, which appends exactly once.
     messageQueue.ensureQueue(anchor);
     messageQueue.appendMessage(anchor, parsed);
+    // 接纳标记按分支下沉（同 handleNewTopicAdmitted）：append 仅供 dashboard 预览，
+    // replyInvalidWorkingDirs 是放弃分支，放弃前的失败必须保持「请重发」提示。
 
     // Auto-worktree: register PENDING, build worktree off-path, commit+fork later.
     if (pinnedWorkingDir && autoWt) {
       if (await replyInvalidWorkingDirs(anchor, larkAppId, newDs)) return;
+      markIngressAdmitted(ctx);
       newDs.initialStartPending = false; // pendingRepo/worktree now owns buffering
       startAutoWorktreePending(newDs, { anchor, baseDir: pinnedWorkingDir, title: parsed.content.substring(0, 50), prompt: promptContent, operatorOpenId: ownerOpenId });
       return;
@@ -19265,6 +19488,8 @@ async function handleThreadReplyAdmitted(
       const availableBots = await getAvailableBots(larkAppId, autoCreateChatId);
       await noteTurnReceived(newDs, parsed.messageId, parsed.content, autoCreateSender, parsed.messageId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
       forkReservedInitialSession(newDs, availableBots);
+      // fork 成功即开场已交给 CLI；fork 抛错则开场只存在于内存，保持重发提示。
+      markIngressAdmitted(ctx);
       const reason = oncallEntry
         ? `oncall-bound chat ${autoCreateChatId}`
         : inheritedFrom
@@ -19284,6 +19509,8 @@ async function handleThreadReplyAdmitted(
     if (projects.length > 0) {
       newDs.initialStartPending = false; // pendingRepo/card now owns buffering
       lastRepoScan.set(autoCreateChatId, projects);
+      // 已 durable staging（picker）且通过放弃闸；卡片发送失败不得诱导重发。
+      markIngressAdmitted(ctx);
       const currentCwd = getSessionWorkingDir(newDs);
       const cardJson = buildRepoSelectCard(projects, currentCwd, anchor, localeForBot(larkAppId), getBot(larkAppId).config.worktreeMultiPicker);
       newDs.repoCardMessageId = await sessionReply(anchor, cardJson, 'interactive', larkAppId);
@@ -19291,7 +19518,10 @@ async function handleThreadReplyAdmitted(
       announcePendingRepoSession(newDs);
       logger.info(`[${tag(newDs)}] Waiting for repo selection (${projects.length} projects)`);
     } else {
-      // No projects found — skip repo selection, spawn directly
+      // No projects found — skip repo selection, spawn directly.
+      // 已 durable staging（picker）：fork 失败后 opening 仍由会话 durable 持有，
+      // 先打接纳标（同 handleNewTopicAdmitted 的 no-projects 分支）。
+      markIngressAdmitted(ctx);
       newDs.pendingRepo = false;
       ensureSessionWhiteboard(newDs);
       const availableBots = await getAvailableBots(larkAppId, autoCreateChatId);
@@ -19303,6 +19533,8 @@ async function handleThreadReplyAdmitted(
   }
 
   // Existing-owner route: append once after all pending-repo early returns.
+  // 接纳标记不打在这里：append 仅供 dashboard 预览，真正的接纳在下方 live worker
+  // 送达 / durable tail staging / refork 成功之后。
   messageQueue.ensureQueue(anchor);
   messageQueue.appendMessage(anchor, parsed);
   publishSessionMessagePreviewPatch(ds);
@@ -19394,7 +19626,11 @@ async function handleThreadReplyAdmitted(
       // reached the CLI; a rejected send then left that poison behind, and the
       // next message's worker-null refork would read it as `hadPriorCliInput`
       // and wrongly `--resume` a CLI that never took a real turn.
-      if (accepted) rememberLastCliInput(ds, promptContent, cliInput);
+      if (accepted) {
+        // 消息已实际送入 live worker——之后的收尾失败不得再诱导重发。
+        markIngressAdmitted(ctx);
+        rememberLastCliInput(ds, promptContent, cliInput);
+      }
       else logger.warn(`[${tag(ds)}] Inbound ${parsed.messageId} was not accepted by the live worker`);
     } finally {
       // The opening is one-shot: give it back when the worker died / refused,
@@ -19476,6 +19712,9 @@ async function handleThreadReplyAdmitted(
           cliInput: currentFollowUp,
           turnId: parsed.messageId,
         }, tailReservation);
+        // 本轮已进 durable tail——之后 fork/回执失败可由重启或下一条 inbound 恢复，
+        // 不得再诱导重发。
+        markIngressAdmitted(ctx);
       } finally {
         settleAsyncQueuedActivationTailAdmission(ds);
       }
@@ -19633,6 +19872,7 @@ async function handleThreadReplyAdmitted(
     if (!queuedHasDurableTail) {
       await noteTurnReceived(ds, parsed.messageId, parsed.content, reforkSender, parsed.messageId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
     }
+    let reforkAccepted = true;
     try {
       // Adopt sessions must re-fork via forkAdoptWorker, NOT forkWorker: the
       // latter would spawn a fresh botmux-managed bmx-* CLI in the adopt cwd,
@@ -19654,7 +19894,7 @@ async function handleThreadReplyAdmitted(
         if (codexAppSteerable && !queuedDashboardTurn && !queuedHasDurableTail) {
           wrappedInput.codexAppSteerable = true;
         }
-        forkWorker(ds, wrappedInput, {
+        reforkAccepted = forkWorker(ds, wrappedInput, {
           // See `hadPriorCliInput` above — an opening on a CLI that never took any
           // input cold-spawns rather than `--resume`-ing an empty session.
           resume: ds.hasHistory && !(openingTurn && !hadPriorCliInput),
@@ -19667,6 +19907,10 @@ async function handleThreadReplyAdmitted(
       if (openingTurn) releaseInitialUserTurn(ds);
       throw e;
     }
+    // refork 成功才算本轮已交给 CLI。fork 抛错（rethrow）或返回 false（quarantine /
+    // 会话已非 active 的不抛错拒绝腿）时，本轮只存在于内存、无 durable 兜底，
+    // 必须保持「请重发」提示——与 live 分支按 accepted 打标对称。
+    if (reforkAccepted) markIngressAdmitted(ctx);
     // Record the input as the session's last real CLI turn ONLY after the fork
     // succeeded. Recording before the fork (the old order) persisted lastCliInput
     // for a turn that never launched when forkWorker threw; the retry then read
@@ -20484,6 +20728,29 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   }
   registerBot(cfg);
   selfDaemonLarkAppId = cfg.larkAppId;
+  // The final-answer feedback subsystem is OPTIONAL: a bot with feedback
+  // disabled still opens the shared feedback DB here for turn-completion
+  // indexing, but a bootstrap failure (shared-dataDir lock storm, corruption,
+  // disk full) must NOT abort daemon startup for that bot — that would let one
+  // optional subsystem take down every PM2 bot sharing the dataDir. Fail soft:
+  // log and continue; delivery-time paths degrade to best-effort on their own.
+  let feedbackWebhookDispatcher: ReturnType<typeof startFeedbackWebhookDispatcher> | undefined;
+  try {
+    const feedbackWebhookStore = await getSkillFeedbackStore(config.session.dataDir);
+    const feedbackWebhookSecrets = new FeedbackWebhookSecretStore(config.session.dataDir);
+    feedbackWebhookDispatcher = startFeedbackWebhookDispatcher({
+      store: feedbackWebhookStore,
+      readSecret: ref => feedbackWebhookSecrets.get(ref),
+      onError: error => logger.warn(`[feedback-webhook] ${error instanceof Error ? error.message : String(error)}`),
+    });
+    await feedbackWebhookDispatcher.ready;
+  } catch (error) {
+    logger.error(
+      `[feedback] subsystem bootstrap failed; continuing without feedback indexing/webhooks: `
+      + `${error instanceof Error ? error.message : String(error)}`,
+    );
+    feedbackWebhookDispatcher = undefined;
+  }
   // Establish the target-scoped daemon control credential before publishing
   // the daemon descriptor or accepting IPC traffic. Corruption fails startup
   // closed; silently rotating here could strand peers on mismatched tokens.
@@ -20811,13 +21078,35 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     },
     enforceLiveSessionCap: () => enforceLiveSessionCap('session_change'),
     onQueuedActivationSubmitted,
-    onTurnTerminal(ds, terminal, context) {
+    async onTurnTerminal(ds, terminal, context) {
+      // VC reconcile first: it is in-memory and latency-sensitive, and must not
+      // sit behind a synchronous SQLite write. (Master did only this enqueue.)
       const enqueued = vcMeetingTerminalReconciler?.enqueue(terminal, context);
       if (terminal.dispatchAttempt !== undefined && enqueued?.accepted) {
         logger.info(
           `[vc-delivery] terminal queued ${terminal.status} turn=${terminal.turnId.slice(0, 12)} `
           + `session=${ds.session.sessionId.slice(0, 8)} attempt=${terminal.dispatchAttempt}`,
         );
+      }
+      // Feedback turn-completion persistence is a synchronous node:sqlite write.
+      // Route it through the nonblocking, tracked retry queue so a cross-process
+      // write-lock (a `botmux send --response-kind final` subprocess) can never
+      // stall the daemon event loop up to busy_timeout — the queue fails fast on
+      // contention and retries on a timer that yields the loop. apiOnly bots
+      // never produce a feedback delivery, so skip them outright; everyone else
+      // enqueues (a hosted-team may have enabled feedback with no bot-level
+      // config, so we must not gate on bot config alone).
+      if (!getBot(ds.larkAppId).config.apiOnly) {
+        void enqueueTurnTerminal({
+          dataDir: config.session.dataDir,
+          botAppId: ds.larkAppId,
+          sessionId: ds.session.sessionId,
+          terminal: { turnId: terminal.turnId, dispatchAttempt: terminal.dispatchAttempt, status: terminal.status },
+          onError: error => logger.error(
+            `[turn-completion] persistence failed turn=${terminal.turnId.slice(0, 12)}: `
+            + `${error instanceof Error ? error.message : String(error)}`,
+          ),
+        });
       }
     },
     onDeferredScheduleTurnSettled(ds, context) {
@@ -21760,6 +22049,13 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     }
 
     scheduler.stopScheduler();
+    // NOTE: turn-terminal queue drain + webhook dispatcher stop are deliberately
+    // deferred until AFTER workers have stopped producing (see below). Draining
+    // here would close queue admission while worker terminal IPC handlers are
+    // still alive, so a turn completing during shutdown would have its terminal
+    // refused and never persisted (delivery cannot be reconstructed to
+    // completed/failed/cancelled after the fact). Keep the queue and dispatcher
+    // live through worker teardown.
     stopMaintenance();
     vcMeetingTerminalReconciler?.stop();
     clearInterval(vcMeetingDeliveryLeaseTimer);
@@ -21790,29 +22086,59 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     ipcHandle.close().catch(() => { /* swallow */ });
     if (terminalProxy) terminalProxy.close().catch(() => { /* swallow */ });
 
-    const pendingExits: Array<Promise<void>> = [];
-    const survivors: ChildProcess[] = [];
-    const trackWorkerExit = (w: ChildProcess): void => {
-      if (w.exitCode !== null || w.signalCode !== null) return;
-      pendingExits.push(new Promise<void>(resolve => {
-        w.once('exit', () => resolve());
-        // Close the check/listener race if exit landed between the first
-        // status read and once().
-        if (w.exitCode !== null || w.signalCode !== null) resolve();
-      }));
-      survivors.push(w);
+    // Producer-closed fence. We must not close the turn-terminal queue admission
+    // until every worker's IPC channel is truly closed — a worker whose 'exit'
+    // Producer-quiescence fence. A worker whose 'exit' fired can still have
+    // queued 'message' terminals in flight; the IPC `disconnect` event is the
+    // real "no more terminals from this producer" signal (see producer-quiescence
+    // helper — it deliberately keys on disconnect, not 'close', which stdio
+    // inherited by grandchildren can delay). Dedup by ChildProcess.
+    // Two INDEPENDENT shutdown concerns, tracked over the same worker set but
+    // never conflated (conflating them regresses process reaping):
+    //   • reaping (workersToReap / workerExited): every live worker PROCESS must
+    //     exit or be SIGKILLed — orphan prevention. Keys on process death, NOT
+    //     on `connected`.
+    //   • producer fence (producerClosed): every worker's IPC channel must
+    //     disconnect — the "no more terminal messages" signal that gates closing
+    //     the feedback queue admission. Keys on `disconnect`, NOT on exit.
+    const producerClosed: Array<Promise<void>> = [];
+    const workerExited: Array<Promise<void>> = [];
+    const reapCandidates: ChildProcess[] = [];
+    const trackedProducers = new Set<ChildProcess>();
+    const trackedReap = new Set<ChildProcess>();
+    const trackWorker = (w: ChildProcess): void => {
+      // Producer fence: disconnect-based, gates feedback admission only.
+      if (!trackedProducers.has(w)) {
+        trackedProducers.add(w);
+        const q = trackProducerQuiet(w);
+        if (!q.alreadyQuiet && q.done) producerClosed.push(q.done);
+      }
+      // Reaping: exit-based, orphan prevention. Registered BEFORE any signal so
+      // a fast exit is not missed; dedup by ChildProcess.
+      if (!trackedReap.has(w)) {
+        trackedReap.add(w);
+        const e = trackProcessExited(w);
+        if (!e.alreadyExited && e.done) { workerExited.push(e.done); reapCandidates.push(w); }
+      }
     };
-    for (const worker of riffRetiredWorkers) trackWorkerExit(worker);
+    for (const worker of riffRetiredWorkers) trackWorker(worker);
     for (const ds of currentShutdownFleet.sessions) {
-      if (ds.worker && !ds.worker.killed) {
+      const w = ds.worker;
+      if (!w) continue;
+      // Track EVERY non-null worker (both concerns) unconditionally. `killed`
+      // only means a signal was already sent — NOT that the process exited or
+      // the IPC channel disconnected (a worker can be `killed=true &&
+      // connected=true` right after .kill(), e.g. the promoted-activation
+      // IPC-failure path that kills but defers ds.worker cleanup). `killed` only
+      // decides whether we still need to SEND a stop signal; it never decides
+      // whether the worker is tracked for reaping or the producer fence.
+      trackWorker(w);
+      if (!w.killed) {
         logger.info(`Shutting down worker for session ${ds.session.sessionId}`);
-        const w = ds.worker;
         const disposition = shutdownBackendDisposition(ds);
         if (disposition === 'riff-drain-detach') {
           throw new Error(`undrained Riff generation after atomic commit: ${ds.session.sessionId}`);
         }
-        // Capture the exit promise BEFORE killWorker nulls ds.worker.
-        trackWorkerExit(w);
         // Branch by the session's FROZEN backend (stamped on Session.backendType
         // at spawn), NOT the bot's live config — a dashboard backendType edit must
         // not change how a running session is torn down, or we'd e.g. try to
@@ -21837,24 +22163,88 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       }
     }
 
-    if (pendingExits.length > 0) {
-      const exitGraceMs = Math.min(
-        DAEMON_WORKER_EXIT_GRACE_MS,
-        Math.max(0, shutdownDeadlineMs - Date.now()),
-      );
-      const timeout = new Promise<void>(resolve => setTimeout(resolve, exitGraceMs));
-      await Promise.race([Promise.all(pendingExits), timeout]);
+    // --- Staged producer quiescence before touching the feedback queue -------
+    // Contract (fail-closed): the turn-terminal queue admission may be closed
+    // (inside drainTurnTerminalQueue) ONLY after BOTH fences confirm quiescent
+    // within the shared absolute deadline:
+    //   (1) every worker IPC channel disconnected — no NEW terminal message can
+    //       be delivered; and
+    //   (2) every in-flight Codex App final-settlement resolved — an already
+    //       delivered final_output whose handler is awaiting network delivery
+    //       has finished its cb.onTurnTerminal (which synchronously enqueues).
+    // If either fence is not quiescent by the deadline we DO NOT close admission
+    // (closing it would refuse a terminal a still-live producer may yet emit —
+    // strictly worse than the pre-feature behaviour). We keep admission open,
+    // warn loudly, and let the process exit on its budget.
+    // Every wait shares the single absolute `shutdownDeadlineMs`; a ref'd
+    // keepalive (waitAllWithin) holds the loop so a fire-and-forget SIGTERM
+    // handler cannot exit mid-wait once workers/services have stopped.
+    const remainingBudget = (): number => Math.max(0, shutdownDeadlineMs - Date.now());
+
+    // --- Phase 1: process reaping (orphan prevention) ------------------------
+    // Give every live worker PROCESS a normal grace to exit, then SIGKILL any
+    // still alive, then confirm exit within the shared deadline. This is keyed
+    // on process death (exitCode/signalCode), independent of IPC state, so a
+    // worker that ignores SIGTERM — or that already disconnected its IPC but is
+    // still running — is still reaped and cannot become a ppid=1 orphan.
+    if (workerExited.length > 0) {
+      const exitGraceDeadline = Math.min(shutdownDeadlineMs, Date.now() + DAEMON_WORKER_EXIT_GRACE_MS);
+      await waitAllWithin(workerExited, exitGraceDeadline);
       let stragglers = 0;
-      for (const w of survivors) {
+      for (const w of reapCandidates) {
         if (w.exitCode === null && w.signalCode === null) {
           stragglers++;
           try { w.kill('SIGKILL'); } catch { /* already dead */ }
         }
       }
       if (stragglers > 0) {
-        logger.warn(`${stragglers}/${survivors.length} worker(s) didn't exit within ${exitGraceMs}ms — SIGKILL'd to prevent ppid=1 orphans.`);
+        logger.warn(`${stragglers}/${reapCandidates.length} worker(s) didn't exit within grace — SIGKILL'd to prevent ppid=1 orphans.`);
+        // Confirm the SIGKILLed processes actually exit, still within the deadline.
+        await waitAllWithin(workerExited, shutdownDeadlineMs);
       }
     }
+
+    // --- Phase 2: producer disconnect fence (gates feedback admission) -------
+    // Separate from reaping: this only decides whether it is safe to close the
+    // feedback queue admission. A late (but in-deadline) disconnect still counts
+    // as quiescent — we do not force it via SIGKILL here (Phase 1 already
+    // handled process liveness). By this point most workers have exited (which
+    // also disconnects their IPC), so producerClosed is typically already
+    // settled; we still await it explicitly under the shared deadline.
+    const disconnectQuiesced = await waitAllWithin(producerClosed, shutdownDeadlineMs);
+
+    // Settlement fence: only meaningful once IPC is confirmed disconnected (no
+    // new settlement can be created). Await the snapshot, then re-read the count
+    // — 0 confirms every in-flight settlement (and its enqueue) has completed.
+    let settlementQuiesced = false;
+    if (disconnectQuiesced) {
+      await waitAllWithin(snapshotCodexAppFinalSettlements(), shutdownDeadlineMs);
+      settlementQuiesced = codexAppFinalSettlementCount() === 0;
+    }
+
+    if (disconnectQuiesced && settlementQuiesced) {
+      // Both fences quiescent: safe to close admission and drain the last
+      // terminals into the durable outbox, bounded by the remaining budget.
+      const drainBudget = remainingBudget();
+      if (drainBudget > 0) {
+        const undrained = await drainTurnTerminalQueue(drainBudget);
+        if (undrained > 0) logger.warn(`[turn-completion] shutdown drain timed out with ${undrained} pending`);
+      } else {
+        logger.error('[turn-completion] shutdown deadline exhausted before drain — in-memory queued turn terminals were NOT persisted and are LOST (they are not yet in the durable store)');
+      }
+    } else {
+      // Fail-closed: a producer may still emit a terminal. Do NOT close
+      // admission (that would refuse and lose it). Hold open, warn, and let the
+      // process exit on its budget; unfinished work stays in the durable store.
+      logger.error(
+        `[turn-completion] shutdown producer quiescence NOT confirmed `
+        + `(ipcDisconnected=${disconnectQuiesced} settlementsSettled=${settlementQuiesced}); `
+        + `leaving feedback queue admission OPEN to avoid refusing a late terminal`,
+      );
+    }
+    // Dispatcher stop always receives the hard-clamped remaining budget (never
+    // its internal 5s default), success or failure path alike.
+    await feedbackWebhookDispatcher?.stop(remainingBudget());
 
     // Flush any pending identity-cache writes before exit. The cache uses a
     // 2s debounce on disk persistence to dedupe writes from chatty groups; on

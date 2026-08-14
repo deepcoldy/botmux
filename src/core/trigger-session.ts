@@ -34,6 +34,7 @@ import type { CliTurnPayload } from '../types.js';
 import { withBotTurnAdmission } from './bot-turn-mutation-gate.js';
 import { stagePendingRepoSetup } from './pending-repo-journal.js';
 import { hasProtectedSessionMutationOwnership } from './session-mutation-guard.js';
+import { codexModelSupportsReasoningEffort, isCodexReasoningCliId } from '../services/codex-reasoning-effort.js';
 
 export interface TriggerSessionDeps {
   larkAppId: string;
@@ -1544,6 +1545,19 @@ async function triggerSessionTurnAdmitted(
   }
 
   const bot = getBot(larkAppId);
+  const isCodexFamily = isCodexReasoningCliId(bot.config.cliId);
+  const effectiveModel = typeof req.options?.model === 'string' && req.options.model.trim()
+    ? req.options.model.trim()
+    : bot.config.model;
+  const effectiveReasoningEffort = req.options?.reasoningEffort ?? bot.config.reasoningEffort;
+  if (isCodexFamily && effectiveReasoningEffort
+      && !codexModelSupportsReasoningEffort(effectiveModel, effectiveReasoningEffort)) {
+    return {
+      ok: false,
+      errorCode: 'bad_request',
+      error: `模型 ${effectiveModel || '（Codex 默认模型）'} 不支持思考强度 ${effectiveReasoningEffort}`,
+    };
+  }
   const chatMode: ChatMode = httpVirtual
     ? 'group'
     : await getChatMode(larkAppId, chatId, { forceRefresh: true });
@@ -1595,7 +1609,6 @@ async function triggerSessionTurnAdmitted(
     // changes the model of a Claude/Gemini/CoCo bot, and a fold-in to an existing
     // worker never reaches here. reasoningEffort is codex-only regardless (other
     // adapters ignore it); model is gated here so it can't leak to non-codex CLIs.
-    const isCodexFamily = bot.config.cliId === 'codex' || bot.config.cliId === 'codex-app';
     if (isCodexFamily) {
       if (typeof req.options?.model === 'string' && req.options.model.trim()) {
         session.model = req.options.model.trim();

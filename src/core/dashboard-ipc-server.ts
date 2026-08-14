@@ -20,6 +20,11 @@ import {
 } from './managed-origin-attestation.js';
 import * as sessionStore from '../services/session-store.js';
 import { cliSupportsNativeUsage } from '../services/transcript-resolver.js';
+import {
+  codexModelSupportsReasoningEffort,
+  isCodexReasoningCliId,
+  isCodexReasoningEffort,
+} from '../services/codex-reasoning-effort.js';
 import * as asyncTriggerStore from '../services/async-trigger-store.js';
 import { resolveAsyncTriggerState, decideAsyncOwnership } from '../services/async-trigger-state.js';
 import * as scheduleStore from '../services/schedule-store.js';
@@ -65,7 +70,8 @@ import { getDeploymentIdentity } from '../services/deployment-identity.js';
 import { getBotUnionId } from '../services/bot-union-ids-store.js';
 import * as grantPrefsStore from '../services/grant-prefs-store.js';
 import { applyExactChatGrantRequest } from '../services/exact-chat-grant.js';
-import { findConfigField, applyConfigField, coerceConfigValue } from '../services/bot-config-store.js';
+import { findConfigField, applyConfigField, coerceConfigValue, setChatFeedbackPolicy } from '../services/bot-config-store.js';
+import { traceFeedbackPolicyForDelivery } from '../services/feedback-policy-resolver.js';
 import { globalBuiltinSkillInjectionDefault, resolveSkillInjectionSupport } from '../skills/injection-mode.js';
 import { summaryRangeFromBotConfig, updateDashboardSummaryRange } from '../services/summary-range-store.js';
 import { config } from '../config.js';
@@ -3463,6 +3469,7 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
   let cliPathOverride: string | null = null;
   let wrapperCli: string | null = null;
   let model: string | null = null;
+  let reasoningEffort: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra' | null = null;
   let agentSelectionKey = '';
   try {
     const cfg = getBot(cachedLarkAppId).config;
@@ -3477,6 +3484,7 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
       : null;
     wrapperCli = typeof cfg.wrapperCli === 'string' && cfg.wrapperCli.trim() ? cfg.wrapperCli : null;
     model = typeof cfg.model === 'string' && cfg.model.trim() ? cfg.model : null;
+    reasoningEffort = cfg.reasoningEffort ?? null;
     agentSelectionKey = selectionKeyForBot(cliId, wrapperCli ?? undefined);
   } catch { /* no registered bot */ }
   let maxLiveWorkers: number | null = null;
@@ -3551,6 +3559,7 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
     cliPathOverride,
     wrapperCli,
     model,
+    reasoningEffort,
     agentSelectionKey,
     defaultOncall: defaultOncall ?? { enabled: false, workingDir: '', since: 0 },
     defaultWorkingDir,
@@ -3582,6 +3591,7 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
     regularGroupReplyMode: cardPrefs.regularGroupReplyMode,
     regularGroupMentionMode: cardPrefs.regularGroupMentionMode,
     substituteMode: substituteModeStore.getBotSubstituteMode(cachedLarkAppId) ?? null,
+    feedback: (() => { try { return getBot(cachedLarkAppId).config.feedback ?? null; } catch { return null; } })(),
     docSubscribeDefaultMode: cardPrefs.docSubscribeDefaultMode,
     restrictGrantCommands: grantPrefs.restrictGrantCommands,
     autoGrantRequestCards: grantPrefs.autoGrantRequestCards,
@@ -3890,8 +3900,8 @@ ipcRoute('PUT', '/api/bot-avatar', async (req, res) => {
 ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
   if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
   const larkAppId = cachedLarkAppId;
-  let body: { cliId?: unknown; model?: unknown; cliRuntime?: unknown };
-  try { body = await readJsonBody<{ cliId?: unknown; model?: unknown; cliRuntime?: unknown }>(req); }
+  let body: { cliId?: unknown; model?: unknown; reasoningEffort?: unknown; cliRuntime?: unknown };
+  try { body = await readJsonBody<{ cliId?: unknown; model?: unknown; reasoningEffort?: unknown; cliRuntime?: unknown }>(req); }
   catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
 
   const key = typeof body.cliId === 'string' && body.cliId.trim() ? body.cliId.trim() : '';
@@ -3903,7 +3913,13 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
     return jsonRes(res, 400, { ok: false, error: 'invalid_cli', message: err?.message ?? String(err) });
   }
   const model = typeof body.model === 'string' ? body.model.trim() : '';
+  const reasoningEffortFieldPresent = Object.prototype.hasOwnProperty.call(body, 'reasoningEffort');
+  const reasoningEffort = isCodexReasoningEffort(body.reasoningEffort) ? body.reasoningEffort : null;
+  if (body.reasoningEffort !== undefined && body.reasoningEffort !== '' && reasoningEffort === null) {
+    return jsonRes(res, 400, { ok: false, error: 'invalid_reasoning_effort' });
+  }
   const currentBotConfig = getBot(larkAppId).config;
+  const supportsReasoningEffort = isCodexReasoningCliId(selected.cliId);
   const runtimeFieldPresent = Object.prototype.hasOwnProperty.call(body, 'cliRuntime');
   const currentSelectionKey = selectionKeyForBot(currentBotConfig.cliId, currentBotConfig.wrapperCli);
   const selectionChanged = key !== currentSelectionKey;
@@ -3996,7 +4012,16 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
     // read-isolation toggle validates at enable time; changing the agent afterwards
     // is the other way a bot could end up configured-but-unenforceable.)
     let readIsolationCleared = false;
-    const r = await rmwBotEntry(larkAppId, (entry) => {
+    const r = await rmwBotEntry<{
+      error?: 'reasoning_effort_not_supported_by_model';
+      nextReasoningEffort?: typeof reasoningEffort;
+    }>(larkAppId, (entry) => {
+    const nextReasoningEffort = supportsReasoningEffort
+      ? (reasoningEffortFieldPresent ? reasoningEffort ?? undefined : entry.reasoningEffort)
+      : undefined;
+    if (nextReasoningEffort && !codexModelSupportsReasoningEffort(model || undefined, nextReasoningEffort)) {
+      return { write: false, result: { error: 'reasoning_effort_not_supported_by_model' } };
+    }
     entry.cliId = selected.cliId;
     if (selected.wrapperCli) entry.wrapperCli = selected.wrapperCli;
     else delete entry.wrapperCli;
@@ -4014,6 +4039,11 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
     }
     if (model) entry.model = model;
     else delete entry.model;
+    if (!supportsReasoningEffort) delete entry.reasoningEffort;
+    else if (reasoningEffortFieldPresent) {
+      if (reasoningEffort) entry.reasoningEffort = reasoningEffort;
+      else delete entry.reasoningEffort;
+    }
     if (entry.readIsolation === true &&
         !readIsolationEnforceableFor({ cliId: selected.cliId, cliPathOverride: effectivePath, wrapperCli: selected.wrapperCli })) {
       delete entry.readIsolation;
@@ -4028,9 +4058,16 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
       // 任务）。手动的 pty/tmux/herdr/zellij override 不受影响（它们不会是 riff）。
       delete entry.backendType;
     }
-    return { write: true, result: null };
+    return { write: true, result: { nextReasoningEffort } };
     });
     if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
+    if (r.result.error) {
+      return jsonRes(res, 400, {
+        ok: false,
+        error: r.result.error,
+        message: `模型 ${model || '（Codex 默认模型）'} 不支持当前思考强度`,
+      });
+    }
 
     const bot = getBot(larkAppId);
     bot.config.cliId = selected.cliId;
@@ -4039,6 +4076,8 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
     if (selected.wrapperCli) bot.config.wrapperCli = selected.wrapperCli;
     else bot.config.wrapperCli = undefined;
     bot.config.model = model || undefined;
+    if (!supportsReasoningEffort) bot.config.reasoningEffort = undefined;
+    else bot.config.reasoningEffort = r.result.nextReasoningEffort ?? undefined;
     if (readIsolationCleared) bot.config.readIsolation = false;
     if (selected.cliId === 'riff') {
       bot.config.backendType = 'riff';
@@ -4058,6 +4097,7 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
       cliPathOverride: nextRuntime ? null : nextLegacyPath ?? null,
       wrapperCli: selected.wrapperCli ?? null,
       model: model || null,
+      reasoningEffort: supportsReasoningEffort ? bot.config.reasoningEffort ?? null : null,
       selectionKey,
       closedMismatchedSessions,
       // Report the (possibly auto-cleared) read-isolation state + whether the new
@@ -4294,6 +4334,44 @@ ipcRoute('PUT', '/api/bot-launch-shell', async (req, res) => {
   const r = await applyConfigField(cachedLarkAppId, spec, value);
   if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
   jsonRes(res, 200, { ok: true, launchShell: value ?? '' });
+});
+
+ipcRoute('PUT', '/api/bot-feedback', async (req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  let body: { feedback?: unknown };
+  try { body = await readJsonBody<{ feedback?: unknown }>(req); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  const spec = findConfigField('feedback');
+  if (!spec) return jsonRes(res, 500, { ok: false, error: 'spec_missing' });
+  const raw = typeof body.feedback === 'string' ? body.feedback : '';
+  let value: unknown = null;
+  if (raw.trim()) {
+    const coerced = coerceConfigValue(spec, raw);
+    if (!coerced.ok) return jsonRes(res, 400, { ok: false, error: coerced.reason });
+    value = coerced.value;
+  }
+  const r = await applyConfigField(cachedLarkAppId, spec, value);
+  if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
+  jsonRes(res, 200, { ok: true, feedback: value });
+});
+
+ipcRoute('PUT', '/api/chat-feedback/:chatId', async (req, res, params) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { ok: false, error: 'larkAppId_not_set' });
+  let body: { feedback?: unknown };
+  try { body = await readJsonBody<{ feedback?: unknown }>(req); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  const feedback = body.feedback === null || body.feedback === undefined ? null : body.feedback;
+  const result = await setChatFeedbackPolicy(cachedLarkAppId, decodeURIComponent(params.chatId), feedback as any);
+  if (!result.ok) return jsonRes(res, result.reason === 'bot_not_registered' ? 404 : 400, { ok: false, error: result.reason });
+  jsonRes(res, 200, { ok: true, feedback });
+});
+
+ipcRoute('GET', '/api/feedback-effective', async (req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { ok: false, error: 'larkAppId_not_set' });
+  const chatId = new URL(req.url ?? '/', 'http://localhost').searchParams.get('chatId') || undefined;
+  jsonRes(res, 200, { ok: true, trace: traceFeedbackPolicyForDelivery({
+    dataDir: config.session.dataDir, larkAppId: cachedLarkAppId, chatId, bot: getBot(cachedLarkAppId).config,
+  }) });
 });
 
 // Per-bot 环境变量 env。Body `{ env: string }`（原始 JSON 文本，如

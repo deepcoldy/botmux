@@ -35,7 +35,10 @@ import {
   buildBotmuxEnvAssignments,
   buildDebugKeepShellScript,
   resolveUserShell,
+  shellCommandArgv,
+  shellKindForPath,
   shellWrapperScript,
+  type ShellKind,
 } from './tmux-backend.js';
 import { resolveBotmuxWrapperBinDir } from '../../core/botmux-wrapper.js';
 import { TERMINAL_CANCEL_COOLDOWN_MS } from './critical-control-key.js';
@@ -2302,6 +2305,39 @@ function shellSingleQuote(value: string): string {
   return `'${value.replace(/'/g, `'\\''`)}'`;
 }
 
+function fishSingleQuote(value: string): string {
+  return `'${value.replace(/\\/g, '\\\\').replace(/'/g, "\\'")}'`;
+}
+
+function buildZmxPayload(kind: ShellKind, argv: readonly string[]): string {
+  if (kind === 'fish') return `set -g __botmux_zmx_argv ${argv.map(fishSingleQuote).join(' ')}\n`;
+  return `set -- ${argv.map(shellSingleQuote).join(' ')}\n`;
+}
+
+function buildZmxUserScript(kind: ShellKind, wrapped: string): string {
+  if (kind === 'fish') {
+    return [
+      'set -l payload $argv[1]',
+      'if test ! -r "$payload"; printf "[botmux] ZMX launch payload unavailable\\n" >&2; exit 126; end',
+      'source "$payload"; or exit 126',
+      'set -l payload_argv $__botmux_zmx_argv',
+      'set -e __botmux_zmx_argv',
+      'rm -f -- "$payload"',
+      'set -e payload ZMX_SESSION ZMX_SESSION_PREFIX',
+      'set argv $payload_argv',
+      wrapped,
+    ].join('\n');
+  }
+  return [
+    'payload=$1',
+    'if [ ! -r "$payload" ]; then printf "[botmux] ZMX launch payload unavailable\\n" >&2; exit 126; fi',
+    '. "$payload" || exit 126',
+    'rm -f -- "$payload"',
+    'unset payload ZMX_SESSION ZMX_SESSION_PREFIX',
+    wrapped,
+  ].join('\n');
+}
+
 /** Render the private bootstrap and payload used by a fresh session. */
 export function buildZmxLaunchFiles(
   bin: string,
@@ -2314,29 +2350,20 @@ export function buildZmxLaunchFiles(
   releaseToken: string,
 ): { bootstrap: string; payload: string } {
   const shellSpec = resolveUserShell(process.env, opts.launchShell);
+  const shellKind = shellKindForPath(shellSpec.shell);
   const envAssignments = buildBotmuxEnvAssignments(opts.env, opts.injectEnv)
     .filter(assignment => !/^ZMX_(?:SESSION|SESSION_PREFIX)=/.test(assignment));
   const debugKeepShell = process.env.BOTMUX_DEBUG_KEEP_SHELL === '1';
   const wrapperBinDir = resolveBotmuxWrapperBinDir(opts.env ?? process.env);
   const wrapped = debugKeepShell
-    ? buildDebugKeepShellScript(shellSpec.shell, wrapperBinDir)
-    : shellWrapperScript(wrapperBinDir);
+    ? buildDebugKeepShellScript(shellSpec.shell, wrapperBinDir, shellKind)
+    : shellWrapperScript(wrapperBinDir, shellKind);
   const payloadArgv = [opts.cwd, ...envAssignments, bin, ...args];
-  const payload = `set -- ${payloadArgv.map(shellSingleQuote).join(' ')}\n`;
-  const userScript = [
-    'payload=$1',
-    'if [ ! -r "$payload" ]; then printf "[botmux] ZMX launch payload unavailable\\n" >&2; exit 126; fi',
-    '. "$payload" || exit 126',
-    'rm -f -- "$payload"',
-    'unset payload ZMX_SESSION ZMX_SESSION_PREFIX',
-    wrapped,
-  ].join('\n');
-  const shellCommand = [
-    shellSingleQuote(shellSpec.shell),
-    ...shellSpec.flags.map(shellSingleQuote),
-    '-c', shellSingleQuote(userScript),
-    '_', shellSingleQuote(payloadPath),
-  ].join(' ');
+  const payload = buildZmxPayload(shellKind, payloadArgv);
+  const userScript = buildZmxUserScript(shellKind, wrapped);
+  const shellCommand = shellCommandArgv(shellSpec, userScript, [payloadPath])
+    .map(shellSingleQuote)
+    .join(' ');
   const launchDir = payloadPath.slice(0, payloadPath.lastIndexOf('/'));
   const cliPidPath = join(launchDir, 'cli-pid');
   const gateScript = [

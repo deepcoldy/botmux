@@ -18,11 +18,15 @@ import { resolveAllowedUsersWithMap } from '../im/lark/client.js';
 import { CLI_OPTIONS, resolveCliId } from '../setup/bot-config-editor.js';
 import { expandHomePath } from '../utils/working-dir.js';
 import { resolveTeamRoleFile } from '../core/role-resolver.js';
-import { statSync } from 'node:fs';
+import { existsSync, readFileSync, statSync } from 'node:fs';
+import { atomicWriteFileSync } from '../utils/atomic-write.js';
+import { sendCredFilePath } from '../adapters/cli/read-isolation.js';
 import { logger } from '../utils/logger.js';
 import { parseCustomPassthroughInput, parseCanTalkDaemonCommandsInput } from '../core/passthrough-commands.js';
 import { parseStartupCommandsInput } from '../core/startup-commands.js';
 import { isReservedPerBotEnvKey, sanitizePerBotEnv } from '../core/per-bot-env.js';
+import { normalizeFeedbackPolicy } from './feedback-policy.js';
+import { normalizeFeedbackPolicyLayer, type FeedbackPolicyLayer } from './feedback-policy-resolver.js';
 
 /**
  * 生效时机：
@@ -64,7 +68,7 @@ export const CONFIG_FIELDS: readonly ConfigFieldSpec[] = [
   { key: 'displayName', configKey: 'displayName', kind: 'string', effect: 'immediate', clearable: true, maxLen: 64, hint: '自定义展示名（dashboard 名册/会话列表用，≤64 字符）；不改飞书群内应用名；unset 回飞书名称' },
   { key: 'model', configKey: 'model', kind: 'string', effect: 'next-session', clearable: true, hint: 'CLI 模型名（如 opus）；unset 回 CLI 默认' },
   { key: 'cli', configKey: 'cliId', kind: 'cli', effect: 'next-session', clearable: false, hint: 'CLI 适配器（序号 1-16 或 id，如 claude-code）' },
-  { key: 'launchShell', configKey: 'launchShell', kind: 'string', effect: 'next-session', clearable: true, hint: '启动 CLI 用的 shell（zsh|bash|sh 或绝对路径），覆盖 $SHELL；用于 .bashrc/.zshrc 里 exec 切到别的 shell 导致会话起不来的场景；注意 PATH/nvm 要放进所选 shell 的 rc；unset 回 $SHELL' },
+  { key: 'launchShell', configKey: 'launchShell', kind: 'string', effect: 'next-session', clearable: true, hint: '启动 CLI 用的 shell（zsh|bash|fish|sh 或绝对路径），覆盖 $SHELL；用于 .bashrc/.zshrc 里 exec 切到别的 shell 导致会话起不来的场景；fish 用户把 PATH/nvm 放进 ~/.config/fish/config.fish，无需回填 bash/zsh；unset 回 $SHELL' },
   { key: 'lang', configKey: 'lang', kind: 'enum', effect: 'immediate', clearable: true, enumValues: ['zh', 'en'], hint: '机器人 UI 语言 zh|en；unset 回全局默认' },
   { key: 'skillInjection', configKey: 'skillInjection', kind: 'enum', effect: 'next-session', clearable: true, enumValues: ['global', 'prompt', 'off'], hint: 'botmux skills 注入方式（仅影响 codex/gemini 等全局 skills 目录的 CLI）：prompt=注入会话不落全局盘(默认)｜global=装进 CLI 全局目录(会被独立 CLI 看到)｜off=只留提示+botmux --help；切到/离开 global 需重启 daemon 才完全生效；unset 回机器级默认' },
   { key: 'defaultWorkingDir', configKey: 'defaultWorkingDir', kind: 'dir', effect: 'next-session', clearable: true, hint: '新话题默认工作目录（跳过仓库选择卡片）' },
@@ -73,6 +77,7 @@ export const CONFIG_FIELDS: readonly ConfigFieldSpec[] = [
   { key: 'autoStartPrompt', configKey: 'autoStartOnGroupJoinPrompt', kind: 'string', effect: 'immediate', clearable: true, hint: '被拉进新群主动开工的首轮 prompt（配合 autoStartOnGroupJoin）' },
   { key: 'allowedUsers', configKey: 'allowedUsers', kind: 'allowedUsers', effect: 'immediate', clearable: false, hint: '管理员名单（邮箱/on_/ou_，逗号或空格分隔）；改后需加 确认' },
   { key: 'skills', configKey: 'skills', kind: 'json', effect: 'next-session', clearable: true, hint: 'bot 级 skill policy JSON；unset 回底层 CLI 默认行为' },
+  { key: 'feedback', configKey: 'feedback', kind: 'json', effect: 'immediate', clearable: true, hint: '最终回答反馈 JSON；默认关闭，enabled=true 后按本 bot 启用；unset 关闭' },
   { key: 'disableStreamingCard', configKey: 'disableStreamingCard', kind: 'boolean', effect: 'immediate', clearable: false, hint: '关闭实时流式卡片 on|off' },
   { key: 'silentTurnReactions', configKey: 'silentTurnReactions', kind: 'boolean', effect: 'immediate', clearable: false, hint: '关闭无卡片模式下的 GoGoGo/DONE 消息 reaction on|off' },
   { key: 'writableTerminalLinkInCard', configKey: 'writableTerminalLinkInCard', kind: 'boolean', effect: 'immediate', clearable: false, hint: '卡片内嵌可写终端链接 on|off' },
@@ -241,11 +246,65 @@ export async function applyConfigField(
     (bot.config as any)[spec.configKey] = effective;
   }
   const newText = formatFieldValue(spec, (bot.config as any)[spec.configKey]);
+  if (spec.configKey === 'feedback') {
+    try {
+      const path = sendCredFilePath(config.session.dataDir, larkAppId);
+      if (existsSync(path)) {
+        const cred = JSON.parse(readFileSync(path, 'utf8')) as Record<string, unknown>;
+        if (effective === null || (effective as any)?.enabled !== true) delete cred.feedback;
+        else cred.feedback = effective;
+        atomicWriteFileSync(path, JSON.stringify(cred), { mode: 0o600 });
+      }
+    } catch (error) {
+      logger.warn(`[config:${larkAppId}] failed to refresh sandbox feedback policy: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
   if (spec.configKey === 'displayName') {
     try { displayNameRefresher?.(); } catch { /* best effort */ }
   }
   logger.info(`[config:${larkAppId}] set ${spec.key}: ${oldText} -> ${newText}`);
   return { ok: true, oldText, newText, effect: spec.effect };
+}
+
+export type SetFeedbackPolicyResult = { ok: true } | { ok: false; reason: string };
+
+export async function setBotFeedbackPolicy(larkAppId: string, policy: FeedbackPolicyLayer | null): Promise<SetFeedbackPolicyResult> {
+  let normalized: FeedbackPolicyLayer | undefined;
+  try { normalized = policy === null ? undefined : normalizeFeedbackPolicyLayer(policy); }
+  catch { return { ok: false, reason: 'invalid_policy' }; }
+  let bot;
+  try { bot = getBot(larkAppId); } catch { return { ok: false, reason: 'bot_not_registered' }; }
+  const r = await rmwBotEntry<null>(larkAppId, entry => {
+    if (normalized === undefined) delete entry.feedback;
+    else entry.feedback = normalized;
+    return { write: true, result: null };
+  });
+  if (!r.ok) return { ok: false, reason: r.reason };
+  bot.config.feedback = normalized;
+  return { ok: true };
+}
+
+export async function setChatFeedbackPolicy(larkAppId: string, chatId: string, policy: FeedbackPolicyLayer | null): Promise<SetFeedbackPolicyResult> {
+  let normalized: FeedbackPolicyLayer | undefined;
+  try { normalized = policy === null ? undefined : normalizeFeedbackPolicyLayer(policy); }
+  catch { return { ok: false, reason: 'invalid_policy' }; }
+  let bot;
+  try { bot = getBot(larkAppId); } catch { return { ok: false, reason: 'bot_not_registered' }; }
+  const r = await rmwBotEntry<null>(larkAppId, entry => {
+    const current: Record<string, FeedbackPolicyLayer> = entry.chatFeedbackPolicies && typeof entry.chatFeedbackPolicies === 'object' && !Array.isArray(entry.chatFeedbackPolicies)
+      ? { ...entry.chatFeedbackPolicies } : {};
+    if (normalized === undefined) delete current[chatId];
+    else current[chatId] = normalized;
+    if (Object.keys(current).length === 0) delete entry.chatFeedbackPolicies;
+    else entry.chatFeedbackPolicies = current;
+    return { write: true, result: null };
+  });
+  if (!r.ok) return { ok: false, reason: r.reason };
+  const current = { ...(bot.config.chatFeedbackPolicies ?? {}) };
+  if (normalized === undefined) delete current[chatId];
+  else current[chatId] = normalized;
+  bot.config.chatFeedbackPolicies = Object.keys(current).length ? current : undefined;
+  return { ok: true };
 }
 
 export type SetAllowedUsersResult =
@@ -358,6 +417,12 @@ export function coerceConfigValue(spec: ConfigFieldSpec, raw: unknown): CoerceRe
         if (spec.configKey === 'skills') {
           const policy = readBotSkillPolicy(parsed);
           return policy ? { ok: true, value: policy } : { ok: false, reason: 'invalid_json' };
+        }
+        if (spec.configKey === 'feedback') {
+          if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return { ok: false, reason: 'invalid_json' };
+          if ((parsed as { enabled?: unknown }).enabled !== true) return { ok: true, value: { enabled: false } };
+          try { return { ok: true, value: normalizeFeedbackPolicy(parsed) }; }
+          catch { return { ok: false, reason: 'invalid_json' }; }
         }
         if (spec.configKey === 'env') {
           // Must be a JSON object; sanitize to valid env keys + primitive values.

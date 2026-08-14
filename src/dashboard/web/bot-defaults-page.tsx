@@ -36,12 +36,14 @@ import {
   dropdownLabel,
 } from './dashboard-components.js';
 import { botAvatarHtml, larkConsoleUrl, loadNameMaps, overrideBotAvatar, ui } from './ui.js';
+import { fetchGroupsSnapshot, type GroupChat } from './groups-api.js';
 import {
   DEFAULT_GRANT_DURATION_MS,
   DEFAULT_GRANT_QUOTA,
   GRANT_DURATION_OPTIONS,
   MAX_GRANT_QUOTA,
 } from '../../services/grant-policy.js';
+import { codexReasoningEffortsForModel } from '../../services/codex-reasoning-effort.js';
 
 type StatusMessage = { text: string; ok?: boolean } | null;
 type PatchBot = (appId: string, patch: Partial<BotDefaultsRow> | ((bot: BotDefaultsRow) => BotDefaultsRow)) => void;
@@ -830,6 +832,7 @@ function BotDefaultsCard(props: {
         >
           <BdTabGrid>
             <section className="bd-tile bd-tile-wide"><CardBehaviorSection bot={bot} putCardPref={putCardPref} /></section>
+            <section className="bd-tile bd-tile-wide"><FeedbackSettingsSection bot={bot} patchBot={patchBot} /></section>
             <section className="bd-tile"><BrandSection bot={bot} patchBot={patchBot} /></section>
           </BdTabGrid>
         </div>
@@ -856,6 +859,71 @@ function BotDefaultsCard(props: {
         </div>
       </div>
     </article>
+  );
+}
+
+function FeedbackSettingsSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
+  const enabled = props.bot.feedback?.enabled === true;
+  const [on, setOn] = useState(enabled);
+  const [json, setJson] = useState(JSON.stringify(props.bot.feedback ?? { enabled: true }, null, 2));
+  const [status, setStatus] = useState<StatusMessage>(null);
+  const [busy, setBusy] = useState(false);
+  const [chatId, setChatId] = useState('');
+  const [chats, setChats] = useState<GroupChat[]>([]);
+  const [preview, setPreview] = useState<any>(null);
+  useEffect(() => {
+    setOn(props.bot.feedback?.enabled === true);
+    setJson(JSON.stringify(props.bot.feedback ?? { enabled: true }, null, 2));
+  }, [props.bot.feedback]);
+  useEffect(() => {
+    void fetchGroupsSnapshot().then(snapshot => {
+      setChats(snapshot.chats.filter(chat => chat.memberBots.some(member => member.larkAppId === props.bot.larkAppId && member.inChat)));
+    }).catch(() => setChats([]));
+  }, [props.bot.larkAppId]);
+  async function save(nextOn = on): Promise<void> {
+    setBusy(true); setStatus(null);
+    try {
+      let policy: Record<string, unknown> = { enabled: false };
+      if (nextOn) {
+        const parsed = JSON.parse(json);
+        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('高级 JSON 必须是对象');
+        policy = { ...parsed, enabled: true };
+      }
+      const res = await sendJson('PUT', `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/feedback`, { feedback: JSON.stringify(policy) });
+      if (!res.ok) throw new Error(responseErrorText(res));
+      props.patchBot(props.bot.larkAppId, { feedback: res.body.feedback ?? null });
+      setStatus({ text: '✓ 已保存', ok: true });
+    } catch (e: any) { setStatus({ text: `✗ ${caughtErrorText(e)}` }); }
+    finally { setBusy(false); }
+  }
+  async function loadPreview(): Promise<void> {
+    const q = chatId.trim() ? `?chatId=${encodeURIComponent(chatId.trim())}` : '';
+    const res = await fetch(`/api/bots/${encodeURIComponent(props.bot.larkAppId)}/feedback/effective${q}`);
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(body?.error ?? `HTTP ${res.status}`);
+    setPreview(body.trace);
+  }
+  async function saveChat(): Promise<void> {
+    if (!chatId.trim()) return setStatus({ text: '✗ 请输入聊天 ID' });
+    setBusy(true); setStatus(null);
+    try {
+      const feedback = JSON.parse(json);
+      const res = await sendJson('PUT', `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/chats/${encodeURIComponent(chatId.trim())}/feedback`, { feedback });
+      if (!res.ok) throw new Error(responseErrorText(res));
+      await loadPreview(); setStatus({ text: '✓ 聊天覆盖已保存', ok: true });
+    } catch (e: any) { setStatus({ text: `✗ ${caughtErrorText(e)}` }); } finally { setBusy(false); }
+  }
+  return (
+    <section className="bd-section" aria-busy={busy}>
+      <h3 className="bd-section-title">最终回答反馈</h3>
+      <ToggleRow checked={on} disabled={busy} title="最终回答反馈" help="默认关闭；只对这个 bot 的最终回答生效" onChange={checked => { setOn(checked); void save(checked); }} />
+      <label className="bd-row"><span>高级 JSON</span><textarea value={json} disabled={busy || !on} rows={10} onChange={e => setJson(e.target.value)} /></label>
+      <div className="actions"><button type="button" className="primary" disabled={busy || !on} onClick={() => void save()}>保存反馈配置</button><StatusSpan status={status} /></div>
+      <h4>每聊天覆盖</h4>
+      <label className="bd-row"><span>聊天</span><select value={chatId} onChange={e => setChatId(e.target.value)}><option value="">选择聊天</option>{chats.map(chat => <option key={chat.chatId} value={chat.chatId}>{chat.name || chat.chatId}</option>)}</select></label>
+      <div className="actions"><button type="button" disabled={busy || !chatId.trim()} onClick={() => void saveChat()}>保存聊天覆盖</button><button type="button" disabled={busy} onClick={() => void loadPreview()}>生效预览</button></div>
+      {preview ? <pre className="code-block">{JSON.stringify(preview, null, 2)}</pre> : null}
+    </section>
   );
 }
 
@@ -1288,6 +1356,7 @@ export function BotAgentSection(props: {
   const [cliKey, setCliKey] = useState(initialKey);
   const [cliSelectionTouched, setCliSelectionTouched] = useState(false);
   const [model, setModel] = useState(typeof bot.model === 'string' ? bot.model : '');
+  const [reasoningEffort, setReasoningEffort] = useState<'' | 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra'>(bot.reasoningEffort ?? '');
   const [runtimeDraft, setRuntimeDraft] = useState<RuntimeDraft>(() => runtimeDraftFromBot(bot));
   const [runtimeTouched, setRuntimeTouched] = useState(false);
   const [runtimeStatus, setRuntimeStatus] = useState<StatusMessage>(null);
@@ -1301,6 +1370,7 @@ export function BotAgentSection(props: {
     setCliKey(agentSelectionKey(bot, props.sessionFallback));
     setCliSelectionTouched(false);
     setModel(typeof bot.model === 'string' ? bot.model : '');
+    setReasoningEffort(bot.reasoningEffort ?? '');
     setRuntimeDraft(runtimeDraftFromBot(bot));
     setRuntimeTouched(false);
     setSkillValue(skillInjectionResolved(bot));
@@ -1309,6 +1379,7 @@ export function BotAgentSection(props: {
     bot.cliId,
     bot.larkAppId,
     bot.model,
+    bot.reasoningEffort,
     runtimeConfigKey,
     bot.wrapperCli,
     bot.skillInjection,
@@ -1398,6 +1469,7 @@ export function BotAgentSection(props: {
       const body = {
         cliId: cliKey,
         model,
+        reasoningEffort: (cliKey === 'codex' || cliKey === 'codex-app' || cliKey.endsWith('-codex')) ? reasoningEffort : '',
         ...(runtimeTouched ? { cliRuntime } : {}),
       };
       const res = await sendJson('PUT', `/api/bots/${encodeURIComponent(bot.larkAppId)}/agent`, body);
@@ -1421,6 +1493,7 @@ export function BotAgentSection(props: {
             : res.body.cliPathOverride,
           wrapperCli: res.body.wrapperCli ?? null,
           model: res.body.model ?? '',
+          reasoningEffort: res.body.reasoningEffort ?? undefined,
           agentSelectionKey: res.body.selectionKey ?? cliKey,
         });
         setRuntimeTouched(false);
@@ -1505,6 +1578,12 @@ export function BotAgentSection(props: {
 
   const siSupport = bot.skillInjectionSupport === 'dynamic' ? 'dynamic' : bot.skillInjectionSupport === 'global' ? 'global' : 'none';
   const isRiff = cliKey === 'riff';
+  const isCodexSelection = cliKey === 'codex' || cliKey === 'codex-app' || cliKey.endsWith('-codex');
+  const reasoningEffortOptions = useMemo(() => codexReasoningEffortsForModel(model), [model]);
+
+  useEffect(() => {
+    if (reasoningEffort && !reasoningEffortOptions.includes(reasoningEffort)) setReasoningEffort('');
+  }, [reasoningEffort, reasoningEffortOptions]);
   // Old dashboard payloads can omit agentSelectionKey while still carrying a
   // legacy wrapperCli. Keep the custom-runtime editor hidden until the user
   // explicitly selects bare Codex; structured runtimes and wrappers cannot mix.
@@ -1692,6 +1771,27 @@ export function BotAgentSection(props: {
               {suggestions.map(item => <option value={item} key={item} />)}
             </datalist>
           </label>
+        </div>
+      )}
+      {isCodexSelection && (
+        <div className="bd-row">
+          <div className="bd-field">
+            <FieldTitle help={tr('botDefaults.agentReasoningEffortHelp')}>{tr('botDefaults.agentReasoningEffort')}</FieldTitle>
+            <DropdownField
+              dataInput="agentReasoningEffort"
+              ariaLabel={tr('botDefaults.agentReasoningEffort')}
+              value={reasoningEffort}
+              disabled={agentBusy}
+              options={[
+                { value: '', label: tr('botDefaults.agentReasoningEffortDefault') },
+                ...reasoningEffortOptions.map(value => ({
+                  value,
+                  label: tr(`botDefaults.agentReasoningEffort${value === 'xhigh' ? 'Xhigh' : value[0]!.toUpperCase() + value.slice(1)}`),
+                })),
+              ]}
+              onChange={next => setReasoningEffort(next as 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra')}
+            />
+          </div>
         </div>
       )}
       {isRiff && <RiffSection bot={bot} patchBot={patchBot} persistCliSelection={persistRiffCliSelection} />}
@@ -4159,7 +4259,9 @@ export function GrantSection(props: { bot: BotDefaultsRow; patchBot: PatchBot })
     rollback?: () => void,
   ): Promise<void> {
     setBusy(key);
-    setStatus(null);
+    setStatus(key === 'duration' || key === 'quota'
+      ? { text: tr('botDefaults.grantDefaultsSaving') }
+      : null);
     try {
       const res = await sendJson('PUT', `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/grant-prefs`, patch);
       if (res.ok && res.body.ok) {
@@ -4181,7 +4283,7 @@ export function GrantSection(props: { bot: BotDefaultsRow; patchBot: PatchBot })
           grantDefaultDurationMs: nextDuration,
           messageQuotaDefaultLimit: nextQuota,
         });
-        if (key === 'defaults') setQuotaError(null);
+        if ('messageQuotaDefaultLimit' in patch) setQuotaError(null);
         setStatus({ text: `✓ ${tr('botDefaults.cardPrefSaved')}`, ok: true });
       } else {
         rollback?.();
@@ -4195,32 +4297,38 @@ export function GrantSection(props: { bot: BotDefaultsRow; patchBot: PatchBot })
     }
   }
 
-  function saveDefaults(): void {
-    const parsed = positiveIntegerOrNull(quotaInput);
-    const quotaChanged = parsed !== quota;
+  function saveDuration(nextInput: string): void {
+    setDurationInput(nextInput);
     setStatus(null);
-    if (quotaChanged && (parsed === 'invalid'
-      || (typeof parsed === 'number' && parsed > MAX_GRANT_QUOTA))) {
-      setQuotaError(tr('botDefaults.quotaInvalid'));
-      return;
-    }
-    setQuotaError(null);
-    const durationMs = Number(durationInput);
+    const durationMs = Number(nextInput);
     if (!GRANT_DURATION_VALUES.includes(durationMs as (typeof GRANT_DURATION_VALUES)[number])) {
       setStatus({ text: `✗ ${tr('botDefaults.grantDurationInvalid')}` });
       return;
     }
-    const patch: {
-      grantDefaultDurationMs?: number | null;
-      messageQuotaDefaultLimit?: number | null;
-    } = {};
-    if (durationMs !== (duration ?? DEFAULT_GRANT_DURATION_MS)) {
-      patch.grantDefaultDurationMs = durationMs === DEFAULT_GRANT_DURATION_MS ? null : durationMs;
+    const nextDuration = durationMs === DEFAULT_GRANT_DURATION_MS ? null : durationMs;
+    if (nextDuration === duration) return;
+    const previousInput = String(duration ?? DEFAULT_GRANT_DURATION_MS);
+    void savePatch(
+      { grantDefaultDurationMs: nextDuration },
+      'duration',
+      () => setDurationInput(previousInput),
+    );
+  }
+
+  function saveQuota(): void {
+    const parsed = positiveIntegerOrNull(quotaInput);
+    const quotaChanged = parsed !== quota;
+    setStatus(null);
+    if (!quotaChanged) {
+      setQuotaError(null);
+      return;
     }
-    if (quotaChanged) {
-      patch.messageQuotaDefaultLimit = parsed;
+    if (parsed === 'invalid' || (typeof parsed === 'number' && parsed > MAX_GRANT_QUOTA)) {
+      setQuotaError(tr('botDefaults.quotaInvalid'));
+      return;
     }
-    if (Object.keys(patch).length > 0) void savePatch(patch, 'defaults');
+    setQuotaError(null);
+    void savePatch({ messageQuotaDefaultLimit: parsed }, 'quota');
   }
 
   const durationOptions: DropdownFieldOption<string>[] = [
@@ -4233,11 +4341,22 @@ export function GrantSection(props: { bot: BotDefaultsRow; patchBot: PatchBot })
   const currentDurationLabel = currentDuration === DEFAULT_GRANT_DURATION_MS
     ? tr('botDefaults.grantDuration1HourValue')
     : String(durationOptions.find(option => option.value === String(currentDuration))?.label ?? '');
-  const parsedQuotaInput = positiveIntegerOrNull(quotaInput);
-  const quotaInputDirty = parsedQuotaInput === 'invalid' || parsedQuotaInput !== quota;
-  const defaultsDirty = durationInput !== String(currentDuration) || quotaInputDirty;
+  const quotaHelp = quota === null
+    ? tr('botDefaults.quotaHelpBuiltIn', { count: DEFAULT_GRANT_QUOTA })
+    : quota > MAX_GRANT_QUOTA
+      ? tr('botDefaults.quotaHelpLegacy', {
+        cardCount: MAX_GRANT_QUOTA,
+        oncallCount: quota,
+        defaultCount: DEFAULT_GRANT_QUOTA,
+      })
+      : tr('botDefaults.quotaHelpCustom', {
+        count: quota,
+        defaultCount: DEFAULT_GRANT_QUOTA,
+      });
   const currentState = quota === null
-    ? tr('botDefaults.grantDefaultsCurrentBuiltIn', {
+    ? tr(duration === null
+      ? 'botDefaults.grantDefaultsCurrentBuiltIn'
+      : 'botDefaults.grantDefaultsCurrentCustomBuiltInQuota', {
       duration: currentDurationLabel,
       count: DEFAULT_GRANT_QUOTA,
     })
@@ -4298,7 +4417,7 @@ export function GrantSection(props: { bot: BotDefaultsRow; patchBot: PatchBot })
         noValidate
         onSubmit={event => {
           event.preventDefault();
-          saveDefaults();
+          saveQuota();
         }}
       >
         <div className="bd-row bd-grant-duration">
@@ -4310,23 +4429,20 @@ export function GrantSection(props: { bot: BotDefaultsRow; patchBot: PatchBot })
               options={durationOptions}
               disabled={busy !== null}
               ariaLabel={tr('botDefaults.grantDurationDefault')}
-              onChange={value => {
-                setDurationInput(value);
-                setStatus(null);
-              }}
+              onChange={saveDuration}
             />
           </div>
         </div>
         <div className="bd-row bd-quota">
           <label>
-            <FieldTitle help={tr('botDefaults.quotaHelp')}>{tr('botDefaults.quotaDefault')}</FieldTitle>
+            <FieldTitle help={quotaHelp}>{tr('botDefaults.quotaDefault')}</FieldTitle>
             <input
               type="number"
               min={1}
               max={MAX_GRANT_QUOTA}
               step={1}
               data-input="quotaLimit"
-              placeholder={tr('botDefaults.quotaPlaceholder')}
+              placeholder={tr('botDefaults.quotaPlaceholder', { count: DEFAULT_GRANT_QUOTA })}
               value={quotaInput}
               disabled={busy !== null}
               aria-label={tr('botDefaults.quotaDefault')}
@@ -4337,15 +4453,18 @@ export function GrantSection(props: { bot: BotDefaultsRow; patchBot: PatchBot })
                 setQuotaError(null);
                 setStatus(null);
               }}
+              onBlur={saveQuota}
+              onKeyDown={event => {
+                if (event.key !== 'Enter') return;
+                event.preventDefault();
+                event.currentTarget.blur();
+              }}
             />
           </label>
           {quotaError ? <small id="grant-default-quota-error" className="bd-field-error" role="alert">{quotaError}</small> : null}
           <small id="grant-defaults-state" data-grant-defaults-state>{currentState}</small>
         </div>
         <div className="actions">
-          <button type="submit" className="primary" data-action="save-grant-defaults" disabled={busy !== null || !defaultsDirty}>
-            {busy === 'defaults' ? tr('botDefaults.grantDefaultsSaving') : tr('botDefaults.grantDefaultsSave')}
-          </button>
           <StatusSpan status={status} attr={{ 'data-grant-status': '' }} />
         </div>
       </form>

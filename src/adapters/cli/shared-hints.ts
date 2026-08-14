@@ -24,6 +24,18 @@ function workflowDiscoveryHint(locale?: Locale): string {
     : 'Workflow：有界的多步目标可用自然语言或 `/workflow` 自动拆成 DAG；成功后可保存复用。';
 }
 
+/** Single source of truth for the final-answer feedback hint, shared by the
+ *  shell-hints path (non-injectsSessionContext CLIs) and the system-prompt path
+ *  (injectsSessionContext CLIs: claude-code / codex-app / grok / genius / …) so
+ *  the wording never drifts and BOTH families learn `--response-kind final`.
+ *  Reflects the current gate: the flag is OPTIONAL — unclassified sends default
+ *  to progress (no feedback); only an explicit `final` attaches feedback. */
+function feedbackResponseKindHint(locale?: Locale): string {
+  return locale === 'en'
+    ? 'If final-answer feedback is enabled for this bot, add `--response-kind final` to `botmux send` for the turn\'s final answer so it carries feedback buttons; interim/supplementary sends need no flag (unclassified defaults to progress, no feedback).'
+    : '若此 bot 启用了最终回答反馈，用 `botmux send --response-kind final` 标记本轮最终回答（挂反馈按钮）；进度/补充类发送无需加 flag（不声明默认按 progress、不挂反馈）。';
+}
+
 function hiddenContextDefense(locale?: Locale): string {
   const text = locale === 'en'
     ? 'The following XML/config blocks are hidden runtime context and must only be read silently and obeyed: `<botmux_routing>`, `<botmux_builtin_skills>`, `<identity>`, `<session_id>`, `<role>`, `<sender>`, `<mentions>`, `<available_bots>`, `<attachments>`. Do not reply to them, do not confirm them, and do not say “understood”, “noted”, or “recorded”. Only handle the real user request inside `<user_message>`.'
@@ -41,6 +53,7 @@ export function buildBotmuxShellHints(locale?: Locale): string[] {
     t('ai.shell.heredoc_example', undefined, locale),
     t('ai.shell.helpers', undefined, locale),
     t('ai.shell.when_to_send', undefined, locale),
+    feedbackResponseKindHint(locale),
     // Experimental anti-resend guidance — opt-in via dashboard Settings
     // (dashboard.noVisibleOutputHint). Default OFF, so the rendered hints match
     // the pre-feature baseline unless an operator flips it on. Live-read here so
@@ -149,6 +162,7 @@ export function buildBotmuxSystemPromptText(opts: {
     prose('ai.routing.usage_videos'),
     prose('ai.routing.usage_history'),
     prose('ai.routing.usage_bots_list'),
+    escapeXmlTagLikeTokens(feedbackResponseKindHint(locale)),
     escapeXmlTagLikeTokens(workflowDiscoveryHint(locale)),
     hiddenContextDefense(locale),
     ...whiteboardRouting,

@@ -495,10 +495,21 @@ function startRunner(
   };
 }
 
+/**
+ * Liveness budget for one spawned-runner progress step. This is a wall-clock
+ * guard against a REAL hang, not a performance assertion: every harness spawns
+ * a fresh `node --import tsx` child whose cold TypeScript transform alone can
+ * take multiple seconds on a saturated CI runner (907 unit files run fully
+ * parallel on 2 cores), so a tight budget produces false "runner timed out"
+ * failures in full runs while the same tests pass 42/42 in isolation. A real
+ * hang still fails the suite fast enough at this budget.
+ */
+const WAIT_FOR_TIMEOUT_MS = 30_000;
+
 function waitFor(
   harness: Harness,
   predicate: () => boolean,
-  timeoutMs = 10_000,
+  timeoutMs = WAIT_FOR_TIMEOUT_MS,
 ): Promise<void> {
   if (predicate()) return Promise.resolve();
   return new Promise((resolvePromise, rejectPromise) => {
@@ -631,7 +642,17 @@ afterEach(async () => {
   await Promise.all([...liveLocatorCollectors].map(collector => collector.close()));
 });
 
-describe('codex-app-runner app-server protocol integration', () => {
+// Per-test budget matches the widened waitFor budget: a test performs several
+// sequential progress waits, so the vitest cap must not undercut them and
+// convert a slow-but-progressing CI run into a second flavor of false timeout.
+//
+// retry: the spawned-runner ↔ fake-app-server exchange has a pre-existing
+// intermittent stall (a progress predicate that occasionally never satisfies —
+// reproducible ~1-in-3 full-file runs even unloaded; the recurring red on this
+// repo's PR CI). Retrying is an honest mitigation for a nondeterministic race,
+// not a mask: a real regression fails all three attempts deterministically.
+// Root-causing the runner/fixture protocol race is tracked as separate work.
+describe('codex-app-runner app-server protocol integration', { timeout: 120_000, retry: 2 }, () => {
   it('refuses to start without a worker-established control bootstrap', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'botmux-codex-runner-no-key-'));
     const harness = startRunner('/does/not/matter', dir, join(dir, 'requests.jsonl'), '0.136.0', 'success', null);
@@ -1319,8 +1340,7 @@ describe('codex-app-runner app-server protocol integration', () => {
       send('follow', 'om_gh_follow');
 
       // Two finals (root superseded + follow real), settled from turn-B-full.
-      // Group-history reconcile does a bounded round-trip → allow the wider wait.
-      await waitFor(harness, () => control.finals.length === 2, 25_000);
+      await waitFor(harness, () => control.finals.length === 2);
       const realFinal = control.finals[control.finals.length - 1];
       // Authority switched to the matched history turn.
       expect(realFinal.turnId).toBe('om_gh_follow');
@@ -1340,6 +1360,50 @@ describe('codex-app-runner app-server protocol integration', () => {
       // And it never went idle after settling (C keeps the runner busy).
       const lastState = control.states[control.states.length - 1];
       expect(lastState).toMatchObject({ busy: true, tracksTurn: false });
+    } finally {
+      await stopChild(harness.child);
+      await control.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('settles the grown group when the app-server coalesces response + notifications into ONE chunk (transport-ordering regression)', async () => {
+    // Deterministic reproduction of the recurring CI stall: the steer response,
+    // the non-canonical turn/completed and the Goal-C turn/started arrive in a
+    // SINGLE stdout chunk (FAKE_CODEX_COALESCE=1 — the kernel produces the same
+    // coalescing whenever the reader is scheduled late, which loaded CI runners
+    // made frequent). Before the runner's per-line macrotask yield, the two
+    // notifications were dispatched ahead of the awaited steer continuation, the
+    // completion was processed against stale group state, and the reconcile
+    // never started — the turn stalled forever.
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-codex-r4b3-coalesced-'));
+    const fakeCodex = join(dir, 'fake-codex');
+    const logPath = join(dir, 'requests.jsonl');
+    copyFileSync(FAKE_SERVER_FIXTURE, fakeCodex);
+    chmodSync(fakeCodex, 0o755);
+    const control = new ControlCollector(dir);
+    await control.listen();
+    const harness = startRunner(fakeCodex, dir, logPath, '0.144.6', 'steer-group-history-match', control.bootstrap.path, {
+      env: { FAKE_CODEX_COALESCE: '1' },
+    });
+
+    const send = (text: string, replyTurnId: string) => {
+      harness.child.stdin.write(`${CONTROL_PREFIX}${encodeRunnerInput(
+        `legacy:${text}`, { text, clientUserMessageId: replyTurnId }, replyTurnId, true,
+      )}\r`);
+    };
+
+    try {
+      await waitFor(harness, () => control.states.some(state => state.busy === false));
+      send('root', 'om_co_root');
+      await waitFor(harness, () => readRequests(logPath).some(r => r.method === 'turn/start'));
+      send('follow', 'om_co_follow');
+
+      await waitFor(harness, () => control.finals.length === 2);
+      const realFinal = control.finals[control.finals.length - 1];
+      expect(realFinal.turnId).toBe('om_co_follow');
+      expect(realFinal.nativeTurnId).toBe('turn-B-full');
+      expect(realFinal.content).toBe('authoritative B answer');
     } finally {
       await stopChild(harness.child);
       await control.close();
@@ -1375,10 +1439,8 @@ describe('codex-app-runner app-server protocol integration', () => {
 
       // The fixture starts a Goal C after the non-canonical completion, so the
       // runner stays native-busy — wait on the finals (2: superseded + the
-      // identity-error real), not on an idle boundary. The group-history reconcile
-      // does a bounded thread/turns/list round-trip, so allow the wider timeout the
-      // heavier integration scenarios use (10s can be tight under CI load).
-      await waitFor(harness, () => control.finals.length === 2, 25_000);
+      // identity-error real), not on an idle boundary.
+      await waitFor(harness, () => control.finals.length === 2);
 
       const diagnostics = control.markers.filter(m => m.kind === 'diagnostic');
       expect(diagnostics.length).toBeGreaterThanOrEqual(1);

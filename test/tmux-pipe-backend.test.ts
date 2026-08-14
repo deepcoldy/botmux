@@ -12,6 +12,9 @@
  *   - captureCurrentScreen issues capture-pane -e -p -S -
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { chmodSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 vi.mock('node:child_process', () => ({
   execSync: vi.fn(),
@@ -54,6 +57,23 @@ const mockedExecFileSync = vi.mocked(execFileSync);
 const mockedSpawnSync = vi.mocked(spawnSync);
 const mockedUnlinkSync = vi.mocked(unlinkSync);
 
+type FakeShell = {
+  readonly dir: string;
+  readonly path: string;
+};
+
+function createFakeShell(name: 'fish'): FakeShell {
+  const dir = mkdtempSync(join(tmpdir(), 'bmx-fake-shell-'));
+  const path = join(dir, name);
+  writeFileSync(path, '#!/bin/sh\nexec "$@"\n');
+  chmodSync(path, 0o755);
+  return { dir, path };
+}
+
+function cleanupFakeShell(shell: FakeShell): void {
+  rmSync(shell.dir, { recursive: true, force: true });
+}
+
 function getExecFileCalls() {
   return mockedExecFileSync.mock.calls
     .filter(call => !(call[1] as string[]).includes('display-message'));
@@ -66,6 +86,20 @@ function spawnOpts() {
     rows: 50,
     env: process.env as Record<string, string>,
   };
+}
+
+function newSessionArgs(): string[] {
+  const call = mockedExecFileSync.mock.calls.find(([_, args]) => {
+    return Array.isArray(args) && args.includes('new-session');
+  });
+  if (!call) throw new Error('expected tmux new-session call');
+  return call[1] as string[];
+}
+
+function scriptIndex(args: readonly string[]): number {
+  const index = args.indexOf('-c');
+  if (index < 0) throw new Error('expected shell -c script in argv');
+  return index;
 }
 
 beforeEach(() => {
@@ -432,6 +466,32 @@ describe('TmuxPipeBackend managed session', () => {
     expect(optionCalls.some(c => c.includes('set-option') && c.includes('history-limit 50000'))).toBe(true);
     expect(optionCalls.some(c => c.includes('set-option') && c.includes('window-size largest'))).toBe(true);
     expect(optionCalls.some(c => c.includes('set-option -s set-clipboard on'))).toBe(true);
+  });
+
+  it('uses fish script syntax and omits the POSIX _ sentinel when launchShell is fish', () => {
+    const shell = createFakeShell('fish');
+    try {
+      const be = new TmuxPipeBackend('bmx-fish-pipe', { createSession: true, ownsSession: true });
+      be.spawn('/bin/echo', ['hello'], {
+        ...spawnOpts(),
+        launchShell: shell.path,
+      });
+
+      const args = newSessionArgs();
+      const cIdx = scriptIndex(args);
+      const script = args[cIdx + 1] ?? '';
+      expect(args.slice(cIdx - 2, cIdx + 2)).toEqual([shell.path, '-i', '-c', script]);
+      expect(args[cIdx + 2]).toBe('/tmp');
+      expect(args[cIdx + 2]).not.toBe('_');
+      expect(script).toContain('cd -- $argv[1]');
+      expect(script).toContain('set -e argv[1]');
+      expect(script).toContain('exec /usr/bin/env $argv');
+      expect(script).not.toContain('cd -- "$1" && shift');
+      expect(script).not.toContain('"$@"');
+      expect(script).not.toMatch(/\bshift\b/);
+    } finally {
+      cleanupFakeShell(shell);
+    }
   });
 
   it('resizes owned tmux sessions and only records adopted pane resize', () => {

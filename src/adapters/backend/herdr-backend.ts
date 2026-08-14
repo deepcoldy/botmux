@@ -79,6 +79,7 @@ const PANE_AGENT_KIND_BY_EXECUTABLE: Readonly<Record<string, string>> = {
   agy: 'agy',
   omp: 'omp',
   opencode: 'opencode',
+  opencode2: 'opencode2',
   copilot: 'copilot',
   kimi: 'kimi',
   'kiro-cli': 'kiro',

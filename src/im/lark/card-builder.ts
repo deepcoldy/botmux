@@ -274,6 +274,7 @@ const cliDisplayNames: Record<CliId, string> = {
   'gemini': 'Gemini',
   'genius': 'Genius',
   'opencode': 'OpenCode',
+  'opencode2': 'OpenCode 2',
   'antigravity': 'Antigravity',
   'mtr': 'MTR',
   'hermes': 'Hermes',
@@ -288,6 +289,7 @@ const cliDisplayNames: Record<CliId, string> = {
   'kiro-cli': 'Kiro',
   'riff': 'Riff',
   'reasonix': 'Reasonix',
+  'dsh': 'DeepSeek Harness',
 };
 
 export function getCliDisplayName(cliId: CliId): string {

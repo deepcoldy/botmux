@@ -31,7 +31,7 @@ import { randomBytes } from 'node:crypto';
 import { StringDecoder } from 'node:string_decoder';
 import type { SessionBackend, SessionProbe, SpawnOpts } from './types.js';
 import { tmuxEnv } from '../../setup/ensure-tmux.js';
-import { buildBotmuxEnvAssignments, resolveUserShell, shellWrapperScript, shellLaunchArgv, TmuxBackend } from './tmux-backend.js';
+import { buildBotmuxEnvAssignments, resolveUserShell, shellWrapperScript, shellCommandArgv, shellKindForPath, TmuxBackend } from './tmux-backend.js';
 import { resolveBotmuxWrapperBinDir } from '../../core/botmux-wrapper.js';
 import { LivenessGate, ADOPT_LIVENESS_MAX_FAILURES } from './liveness-gate.js';
 
@@ -618,6 +618,10 @@ export class TmuxPipeBackend implements SessionBackend {
   private createDetachedSession(bin: string, args: string[], opts: SpawnOpts): void {
     const shellSpec = resolveUserShell(process.env, opts.launchShell);
     const envAssignments = buildBotmuxEnvAssignments(opts.env, opts.injectEnv);
+    const script = shellWrapperScript(
+      resolveBotmuxWrapperBinDir(opts.env ?? process.env),
+      shellKindForPath(shellSpec.shell),
+    );
     execFileSync('tmux', [
       'new-session',
       '-d',
@@ -625,10 +629,11 @@ export class TmuxPipeBackend implements SessionBackend {
       '-x', String(opts.cols),
       '-y', String(opts.rows),
       '--',
-      ...shellLaunchArgv(shellSpec.shell, shellSpec.flags), '-c', shellWrapperScript(resolveBotmuxWrapperBinDir(opts.env ?? process.env)), '_',
-      opts.cwd,
-      ...envAssignments,
-      bin, ...args,
+      ...shellCommandArgv(shellSpec, script, [
+        opts.cwd,
+        ...envAssignments,
+        bin, ...args,
+      ]),
     ], {
       cwd: opts.cwd,
       stdio: 'ignore',

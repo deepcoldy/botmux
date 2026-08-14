@@ -22,6 +22,10 @@ import { normalizeSubstituteMode } from './services/substitute-mode-normalize.js
 import { normalizePluginIdList } from './core/plugins/ids.js';
 import { normalizeVcMeetingProfileInstructions } from './services/vc-meeting-profile-instructions.js';
 import { isGrantDurationOption } from './services/grant-policy.js';
+import type { FeedbackPolicy, FeedbackPolicyInput } from './services/feedback-policy.js';
+import { normalizeFeedbackPolicyLayer } from './services/feedback-policy-resolver.js';
+import type { FeedbackWebhookDestination } from './services/feedback-outbox.js';
+import { codexModelSupportsReasoningEffort, isCodexReasoningCliId, isCodexReasoningEffort } from './services/codex-reasoning-effort.js';
 import type {
   VcMeetingConsumerAgentConfig,
   VcMeetingConsumerConfig,
@@ -204,6 +208,26 @@ export interface ContentTriggerConfig {
     type: ContentTriggerActionType;
     prompt: string;
   };
+}
+
+function normalizeFeedbackWebhookConfig(raw: unknown): { destinations: FeedbackWebhookDestination[] } | undefined {
+  if (!raw || typeof raw !== 'object' || !Array.isArray((raw as any).destinations)) return undefined;
+  const seen = new Set<string>();
+  const destinations: FeedbackWebhookDestination[] = [];
+  for (const item of (raw as any).destinations) {
+    if (!item || typeof item !== 'object') continue;
+    const id = typeof item.id === 'string' ? item.id.trim() : '';
+    const url = typeof item.url === 'string' ? item.url.trim() : '';
+    const secretRef = typeof item.secretRef === 'string' ? item.secretRef.trim() : '';
+    const eventTypes = Array.isArray(item.eventTypes)
+      ? [...new Set(item.eventTypes.filter((type: unknown) => type === 'turn.completed' || type === 'feedback.revised'))] as Array<'turn.completed' | 'feedback.revised'>
+      : [];
+    if (!id || seen.has(id) || !url || !secretRef || eventTypes.length === 0) continue;
+    seen.add(id);
+    destinations.push({ id, enabled: item.enabled !== false, url, eventTypes, secretRef,
+      ...(Number.isInteger(item.timeoutMs) && item.timeoutMs > 0 ? { timeoutMs: Math.min(item.timeoutMs, 30_000) } : {}) });
+  }
+  return destinations.length ? { destinations } : undefined;
 }
 
 function normalizeChatReplyModeConfig(raw: unknown): ChatReplyMode | undefined {
@@ -1153,6 +1177,11 @@ export interface BotConfig {
    * 缺省 / false 保持原有飞书 bot 行为字节不变。
    */
   apiOnly?: boolean;
+  /** Final-answer feedback policy. Missing/disabled is intentionally inert. */
+  feedback?: FeedbackPolicyInput | FeedbackPolicy;
+  /** Per-chat final-answer feedback overrides, scoped to this bot app id. */
+  chatFeedbackPolicies?: Record<string, FeedbackPolicyInput>;
+  feedbackWebhooks?: { destinations: FeedbackWebhookDestination[] };
   /**
    * 租户品牌：`'feishu'`（中国版，open.feishu.cn）或 `'lark'`（国际版，
    * open.larksuite.com）。缺省 / 旧 bots.json 无此字段 → 视为 `'feishu'`
@@ -1200,14 +1229,14 @@ export interface BotConfig {
   /**
    * Per-bot launch-shell override for the persistent backends (tmux/zellij/zmx).
    * When set, botmux launches the CLI under this shell instead of the daemon's
-   * `$SHELL`. Accepts a bare name (`zsh`/`bash`/`sh`) or an absolute path
-   * (`/usr/bin/zsh`). The escape hatch for a login `$SHELL` (e.g. bash) whose
+   * `$SHELL`. Accepts a bare name (`zsh`/`bash`/`fish`/`sh`) or an absolute path
+   * (`/usr/bin/fish`). The escape hatch for a login `$SHELL` (e.g. bash) whose
    * rcfile `exec`-trampolines into another shell: that trampoline replaces the
    * launch shell before it can `exec` the CLI, leaving a bare shell the first
-   * prompt gets typed into (`zsh: parse error`). Pinning `launchShell: zsh`
-   * launches under zsh directly and bypasses the bash `.bashrc`. CAVEAT:
-   * PATH/nvm/pnpm shims must then live in the pinned shell's rcfiles (e.g.
-   * `.zshrc`/`.zprofile`), not the bypassed one. Ignored by the pty backend
+   * prompt gets typed into (`zsh: parse error`). Pinning `launchShell: fish`
+   * launches under fish directly and bypasses the bash `.bashrc`. CAVEAT:
+   * PATH/nvm/pnpm shims must then live in the pinned shell's rcfiles (for
+   * example `.zshrc`/`.zprofile` or `~/.config/fish/config.fish`), not the bypassed one. Ignored by the pty backend
    * (which `exec`s the CLI directly, no shell wrapper, so it's trampoline-immune).
    */
   launchShell?: string;
@@ -1220,6 +1249,8 @@ export interface BotConfig {
    * `modelChoices` for the curated candidates surfaced in `botmux setup`.
    */
   model?: string;
+  /** Default Codex reasoning effort for newly created sessions. */
+  reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
   /**
    * If true, botmux does not add CLI-default approval/sandbox bypass flags
    * such as --yolo or --dangerously-*. Missing/false preserves legacy behavior.
@@ -1394,6 +1425,20 @@ export interface BotConfig {
    * 不影响群：群里仍按 allowedUsers / allowedChatGroups / oncall / grants 判定。
    */
   p2pOpen?: boolean;
+  /**
+   * 是否接受**其他 bot** 通过 `botmux send --slash` 发来的原生斜杠命令
+   * （/clear、/model、/close…）。默认开（undefined = 开）；只有显式 false 才关。
+   *
+   * 关掉后，来自 bot 发送方的 slash 命令不进 passthrough / daemon-command 路由，
+   * 退化为普通消息（与任何非 bot-slash 消息一样按 talk 门处理）——给 owner 一个
+   * 「不让别的 bot 清我上下文 / 敲我 CLI」的逃生阀。对**真人**发送方无影响
+   * （真人在飞书直接打字发 /clear 仍照常）。
+   *
+   * 安全边界不变：daemon 管理命令（/close /restart 等）从 bot 来**仍只认
+   * allowedUsers**（canOperate），本开关只控制「是否接受 bot 的 slash 进入路由」，
+   * 不放宽任何 operate 权限。
+   */
+  acceptSlashFromBots?: boolean;
   /**
    * 消息额度覆盖配置：
    *   • 未配置（undefined）→ 卡片使用产品默认 3 条；oncall 不自动计数。
@@ -2221,6 +2266,15 @@ export function getBotTuiSlashAllow(larkAppId: string): string[] | undefined {
 }
 
 /**
+ * 该 bot 是否接受**其他 bot** 发来的原生斜杠命令（--slash）。默认开：只有
+ * 配置里显式 `acceptSlashFromBots: false` 才关。未知 bot（无注册项）→ 默认开
+ * （与其它 default-on 开关一致，缺配置不 fail-closed 成"全拒"）。
+ */
+export function botAcceptsSlashFromBots(larkAppId: string): boolean {
+  return bots.get(larkAppId)?.config.acceptSlashFromBots !== false;
+}
+
+/**
  * Load bot configurations from one of (in priority order):
  * 1. BOTS_CONFIG env var — path to a JSON file
  * 2. ~/.botmux/bots.json — default config path
@@ -2757,6 +2811,13 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       // upload etc. already degrade gracefully on an empty secret.
       larkAppSecret: entry.larkAppSecret ?? '',
       apiOnly: entry.apiOnly === true || undefined,
+      feedback: entry.feedback === undefined
+        ? undefined
+        : normalizeFeedbackPolicyLayer(entry.feedback),
+      chatFeedbackPolicies: entry.chatFeedbackPolicies && typeof entry.chatFeedbackPolicies === 'object' && !Array.isArray(entry.chatFeedbackPolicies)
+        ? Object.fromEntries(Object.entries(entry.chatFeedbackPolicies).map(([chatId, layer]) => [chatId, normalizeFeedbackPolicyLayer(layer)]))
+        : undefined,
+      feedbackWebhooks: normalizeFeedbackWebhookConfig(entry.feedbackWebhooks),
       // brand：只认精确的 'lark'，其余 → undefined（下游 normalizeBrand 当
       // feishu）。feishu 故意存成 undefined，保持旧 bots.json 干净、不写死字段。
       brand: entry.brand === 'lark' ? 'lark' : undefined,
@@ -2776,6 +2837,13 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       model: typeof entry.model === 'string' && entry.model.trim()
         ? entry.model.trim()
         : undefined,
+      reasoningEffort: isCodexReasoningCliId(entryCliId)
+        && isCodexReasoningEffort(entry.reasoningEffort)
+        && codexModelSupportsReasoningEffort(
+          typeof entry.model === 'string' ? entry.model : undefined,
+          entry.reasoningEffort,
+        )
+        ? entry.reasoningEffort : undefined,
       disableCliBypass: entry.disableCliBypass === true,
       codexAppCleanInput: entry.codexAppCleanInput === true || undefined,
       codexRpcInput: entry.codexRpcInput === true,
@@ -2833,6 +2901,8 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       restrictGrantCommands: entry.restrictGrantCommands === true || undefined,
       // Default is ON, so only explicit false is meaningful/persisted.
       autoGrantRequestCards: entry.autoGrantRequestCards === false ? false : undefined,
+      // Default is ON (accept bot-sent slash), so only explicit false persists.
+      acceptSlashFromBots: entry.acceptSlashFromBots === false ? false : undefined,
       customPassthroughCommands,
       canTalkDaemonCommands,
       tuiSlashAllow,

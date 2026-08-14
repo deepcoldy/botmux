@@ -182,7 +182,7 @@
 
 ## 👥 多机器人协作
 
-`@botA @botB /t <prompt>`（各自开新话题）· `botmux bots list`（查看当前群可协作 bot）
+`@botA @botB /t <prompt>`（各自开新话题）· `@botA @botB /introduce`（让本群机器人互相登记 open_id，协作时可精确 @ 对方）· `botmux bots list`（查看当前群可协作 bot）
 
 ## ⏰ 定时 & ❓帮助
 

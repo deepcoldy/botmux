@@ -44,15 +44,19 @@ function runCli(args: string[], env: NodeJS.ProcessEnv): Promise<{
 }
 
 describe('cmdSend hook context wiring', () => {
-  it('repairs scope-less chat records in both CLI session file loaders', () => {
+  it('delegates CLI session snapshot loading to the session-store gate (scope repair lives behind it)', () => {
     const loadSessionsStart = cliSource.indexOf('function loadSessions()');
-    const saveSessionStart = cliSource.indexOf('function saveSession(', loadSessionsStart);
-    const loadSessions = cliSource.slice(loadSessionsStart, saveSessionStart);
-
     expect(loadSessionsStart).toBeGreaterThanOrEqual(0);
-    expect(loadSessions.match(/repairMissingChatScope\(/g)).toHaveLength(2);
-    expect(loadSessions).toMatch(/repairMissingChatScope\(s\);[\s\S]*?sessions\.set\(s\.sessionId, s\)/);
-    expect(loadSessions).toMatch(/repairMissingChatScope\(session\);[\s\S]*?sessions\.set\(session\.sessionId, session\)/);
+    const loadSessionsEnd = cliSource.indexOf('\nfunction ', loadSessionsStart);
+    const loadSessions = cliSource.slice(loadSessionsStart, loadSessionsEnd);
+
+    // The scope repair moved behind the store gate together with the loader
+    // itself — repair-on-load behavior is asserted in test/session-store.test.ts
+    // (loadAllSessionsSnapshot). The CLI must not regrow a parallel reader or
+    // the unlocked whole-file writer it once had.
+    expect(loadSessions).toContain('loadAllSessionsSnapshot(');
+    expect(loadSessions).not.toContain('readFileSync');
+    expect(cliSource).not.toContain('function saveSession(');
   });
 
   it('passes the current session id into outbound send/reply hooks', () => {
@@ -224,9 +228,12 @@ describe('cmdSend hook context wiring', () => {
     }));
     const fixture = join(root, 'host-send.mjs');
     writeFileSync(fixture, `
+      import { readFileSync } from 'node:fs';
       const argv = process.argv.slice(2);
       process.stdout.write(JSON.stringify({
         command: argv[0],
+        content: readFileSync(argv[argv.indexOf('--content-file') + 1], 'utf8'),
+        responseKind: argv.includes('--response-kind') ? argv[argv.indexOf('--response-kind') + 1] : null,
         sessionId: argv[argv.indexOf('--session-id') + 1],
         turnId: process.env.BOTMUX_TURN_ID,
         dispatchAttempt: process.env.BOTMUX_DISPATCH_ATTEMPT,
@@ -263,6 +270,8 @@ describe('cmdSend hook context wiring', () => {
       expect(result.code, result.stderr).toBe(0);
       expect(JSON.parse(result.stdout)).toEqual({
         command: 'send',
+        content: 'relay body',
+        responseKind: null,
         sessionId: 'session',
         turnId: 'turn-live',
         dispatchAttempt: '4',
@@ -483,7 +492,7 @@ describe('cmdSend hook context wiring', () => {
     expect(cmdSend).toContain('containsNativeAtTag: containsLarkAtTag(content)');
     expect(cmdSend).toContain('const managedRenderedPayloadError = managedVcSendPayloadError({');
     expect(cmdSend).toContain('containsNativeAtTag: containsLarkAtTag(text)');
-    expect(cmdSend).toContain('if (!noMention && !vcMeetingManagedSendOrigin)');
+    expect(cmdSend).toContain('if (!noMention && !isSlashSend && !vcMeetingManagedSendOrigin)');
     expect(cmdSend).toContain('if (!sendTopLevel && !vcMeetingManagedSendOrigin)');
     expect(cmdSend.indexOf('const managedPayloadError = managedVcSendPayloadError({'))
       .toBeLessThan(cmdSend.indexOf("const { sendMessage, replyMessage, uploadImage, uploadFile"));
@@ -501,5 +510,34 @@ describe('cmdSend hook context wiring', () => {
     expect(cmdSend).toContain('...(prepared ? { suppressHook: true } : {})');
     expect(cmdSend).toContain('const managedProviderOptions = outboundMessageOptions(!!prepared);');
     expect(cmdSend).toContain('...(vcMeetingManagedSendOrigin ? { maxMessages: 1 } : {})');
+  });
+
+  it('defaults an omitted response kind to non-final while keeping feedback indexing final-only', () => {
+    const cmdSendStart = cliSource.indexOf('async function cmdSend(');
+    const cmdDispatchStart = cliSource.indexOf('async function cmdDispatch(', cmdSendStart);
+    const cmdSend = cliSource.slice(cmdSendStart, cmdDispatchStart);
+    expect(cmdSend).toContain("const responseKindOccurrences = rest.filter(token => token === '--response-kind' || token.startsWith('--response-kind=')).length");
+    expect(cmdSend).toContain("responseKindOccurrences > 1");
+    expect(cmdSend).toContain("flagPresentButValueMissing(rest, '--response-kind')");
+    expect(cmdSend).toContain("const effectiveResponseKind = responseKind ?? 'progress'");
+    expect(cmdSend).not.toContain('启用最终回答反馈后，必须显式指定 --response-kind progress|final');
+    expect(cmdSend).toContain('无法确认本次提问者身份，不能发送带反馈控件的最终回答');
+    expect(cmdSend).toContain('requesterSubjectId: feedbackRequesterSubjectId');
+    expect(cmdSend).not.toContain("feedbackPolicy && responseKind === 'final'");
+    expect(cmdSend).toContain("feedbackPolicy && effectiveResponseKind === 'final'");
+    expect(cmdSend).toContain('const deliveryTurnId = currentTurnId ?? `send:${messageId}`');
+    expect(cmdSend).toContain('const correlationDiscriminator = currentTurnId ? messageId : undefined');
+    expect(cmdSend).toContain('turnId: deliveryTurnId');
+    expect(cmdSend).toContain('correlationDiscriminator,');
+    expect(cmdSend).not.toContain('const deliveryTurnId = `send:${messageId}`');
+    expect(cmdSend).not.toContain('--feedback-level');
+    const primarySend = cmdSend.indexOf('messageId = await dispatchPrimary');
+    const feedbackIndex = cmdSend.indexOf('feedback indexing failed after delivery');
+    expect(primarySend).toBeGreaterThanOrEqual(0);
+    expect(feedbackIndex).toBeGreaterThan(primarySend);
+    expect(cmdSend.slice(cmdSend.lastIndexOf('try {', feedbackIndex), feedbackIndex)).toContain('getSkillFeedbackStore');
+    expect(cmdSend).toContain('policy: feedbackPolicy');
+    expect(cmdSend).toContain('baseCard: feedbackBaseCard');
+    expect(cmdSend).toContain('buildFeedbackElement(feedbackPolicy)');
   });
 });

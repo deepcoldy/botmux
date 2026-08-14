@@ -39,7 +39,10 @@ describe('worker pipe initial screen ordering', () => {
     );
     const localCloseIdx = closeCase.indexOf('// Local close:');
     const setCloseIdx = closeCase.lastIndexOf('closeRequested = true;', localCloseIdx);
-    const ackIdx = closeCase.lastIndexOf("send({ type: 'session_close_ready', sessionId });", localCloseIdx);
+    // The ACK is flushed (sendAndFlush), not fire-and-forget send(): a queued
+    // send() is dropped when process.exit(0) wedges in node-pty's native exit
+    // teardown, stranding /close behind the daemon's 7s SIGKILL backstop.
+    const ackIdx = closeCase.lastIndexOf("await sendAndFlush({ type: 'session_close_ready', sessionId });", localCloseIdx);
     const stopBridgeIdx = closeCase.lastIndexOf('stopBridgeWatcher();', localCloseIdx);
     const teardownIdx = closeCase.indexOf('backend?.destroySession?.();', localCloseIdx);
     const clearIdx = closeCase.indexOf('clearSendMarkers();', localCloseIdx);
@@ -412,7 +415,7 @@ describe('worker pipe initial screen ordering', () => {
     expect(finalizeIdx).toBeGreaterThan(spawnIdx);
     expect(onDataIdx).toBeGreaterThan(finalizeIdx);
     expect(finalize).toContain("codexAppControlProven && codexAppControlStateValue?.status === 'active'");
-    expect(source).toContain("const APP_RUNNER_OSC_CLI_IDS = new Set(['mira', 'mir']);");
+    expect(source).toContain("const APP_RUNNER_OSC_CLI_IDS = new Set(['mira', 'mir', 'dsh']);");
     expect(source).not.toContain('CODEX_APP_CONTROL_NONCE_ENV');
     expect(source).not.toContain('codexAppControlNonceForSpawn');
   });

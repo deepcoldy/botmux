@@ -8,6 +8,9 @@
  * Run:  pnpm vitest run test/tmux-backend-input.test.ts
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { chmodSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 // Mock child_process before importing TmuxBackend
 vi.mock('node:child_process', () => ({
@@ -36,6 +39,32 @@ function createBackend(sessionName = 'bmx-test1234'): TmuxBackend {
   return new TmuxBackend(sessionName);
 }
 
+type FakeShell = {
+  readonly dir: string;
+  readonly path: string;
+};
+
+function createFakeShell(name: 'fish'): FakeShell {
+  const dir = mkdtempSync(join(tmpdir(), 'bmx-fake-shell-'));
+  const path = join(dir, name);
+  writeFileSync(path, '#!/bin/sh\nexec "$@"\n');
+  chmodSync(path, 0o755);
+  return { dir, path };
+}
+
+function cleanupFakeShell(shell: FakeShell): void {
+  rmSync(shell.dir, { recursive: true, force: true });
+}
+
+function makeNewSessionProbeMiss(): void {
+  mockedExecFileSync.mockImplementation((_command, args) => {
+    if (Array.isArray(args) && args.includes('has-session')) {
+      throw Object.assign(new Error('missing session'), { status: 1, signal: null });
+    }
+    return Buffer.from('');
+  });
+}
+
 function getCalls(): Array<{ cmd: string; args: string[]; opts?: any }> {
   return mockedExecFileSync.mock.calls
     .map((call: any[]) => ({
@@ -46,9 +75,156 @@ function getCalls(): Array<{ cmd: string; args: string[]; opts?: any }> {
     .filter(call => !call.args.includes('display-message'));
 }
 
+function lastPtySpawnArgs(): string[] {
+  const call = mockedPtySpawn.mock.calls.at(-1);
+  if (!call) throw new Error('expected pty.spawn call');
+  return call[1];
+}
+
+function tmuxNewSessionArgs(): string[] {
+  const call = mockedExecFileSync.mock.calls.find(([_, args]) => {
+    return Array.isArray(args) && args.includes('new-session');
+  });
+  if (!call) throw new Error('expected tmux new-session call');
+  return call[1];
+}
+
+function scriptIndex(args: readonly string[]): number {
+  const index = args.indexOf('-c');
+  if (index < 0) throw new Error('expected shell -c script in argv');
+  return index;
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+describe('TmuxBackend fish launch wrapping', () => {
+  beforeEach(() => {
+    mockedExecFileSync.mockReset();
+    mockedExecSync.mockReset();
+    mockedPtySpawn.mockReset();
+    mockedPtySpawn.mockReturnValue({
+      onData: () => {},
+      onExit: () => {},
+      write: () => {},
+      resize: () => {},
+      kill: () => {},
+    } as pty.IPty);
+    makeNewSessionProbeMiss();
+  });
+
+  it('uses fish script syntax and omits the POSIX _ sentinel when launchShell is fish', () => {
+    const shell = createFakeShell('fish');
+    try {
+      const be = createBackend('bmx-fish');
+      be.spawn('/bin/echo', ['hello'], {
+        cwd: '/tmp',
+        cols: 80,
+        rows: 24,
+        env: { PATH: '/usr/bin:/bin' },
+        launchShell: shell.path,
+      });
+
+      const args = lastPtySpawnArgs();
+      const cIdx = scriptIndex(args);
+      const script = args[cIdx + 1] ?? '';
+      expect(args.slice(cIdx - 2, cIdx + 2)).toEqual([shell.path, '-i', '-c', script]);
+      expect(args[cIdx + 2]).toBe('/tmp');
+      expect(args[cIdx + 2]).not.toBe('_');
+      expect(script).toContain('cd -- $argv[1]');
+      expect(script).toContain('set -e argv[1]');
+      expect(script).toContain('exec /usr/bin/env $argv');
+      expect(script).not.toContain('cd -- "$1" && shift');
+      expect(script).not.toContain('"$@"');
+      expect(script).not.toMatch(/\bshift\b/);
+    } finally {
+      cleanupFakeShell(shell);
+    }
+  });
+
+  it('uses fish debug keep-shell script when BOTMUX_DEBUG_KEEP_SHELL=1 and launchShell is fish', () => {
+    const shell = createFakeShell('fish');
+    const previous = process.env.BOTMUX_DEBUG_KEEP_SHELL;
+    process.env.BOTMUX_DEBUG_KEEP_SHELL = '1';
+    try {
+      const be = createBackend('bmx-fish-debug');
+      be.spawn('/bin/echo', ['hello'], {
+        cwd: '/tmp',
+        cols: 80,
+        rows: 24,
+        env: { PATH: '/usr/bin:/bin' },
+        launchShell: shell.path,
+      });
+
+      const args = lastPtySpawnArgs();
+      const cIdx = scriptIndex(args);
+      const script = args[cIdx + 1] ?? '';
+      expect(args[cIdx + 2]).toBe('/tmp');
+      expect(script).toContain('/usr/bin/env $argv');
+      expect(script).toContain('[botmux debug]');
+      expect(script).toContain(`exec '${shell.path}' -i`);
+      expect(script).not.toContain('/usr/bin/env "$@"');
+      expect(script).not.toMatch(/\bshift\b/);
+    } finally {
+      if (previous === undefined) delete process.env.BOTMUX_DEBUG_KEEP_SHELL;
+      else process.env.BOTMUX_DEBUG_KEEP_SHELL = previous;
+      cleanupFakeShell(shell);
+    }
+  });
+
+  it('keeps the POSIX launch argv unchanged for sh-compatible shells', () => {
+    const be = createBackend('bmx-posix');
+    be.spawn('/bin/echo', ['hello'], {
+      cwd: '/tmp',
+      cols: 80,
+      rows: 24,
+      env: { PATH: '/usr/bin:/bin' },
+      launchShell: '/bin/sh',
+    });
+
+    const args = lastPtySpawnArgs();
+    const cIdx = scriptIndex(args);
+    const script = args[cIdx + 1] ?? '';
+    expect(args.slice(cIdx - 1, cIdx + 4)).toEqual(['/bin/sh', '-c', script, '_', '/tmp']);
+    expect(script).toContain('cd -- "$1" && shift');
+    expect(script).toContain('exec /usr/bin/env "$@"');
+  });
+
+  it('parks fish diagnostic sessions with fish argv and diagnostic syntax', () => {
+    const shell = createFakeShell('fish');
+    const previousShell = process.env.SHELL;
+    process.env.SHELL = shell.path;
+    try {
+      const parked = TmuxBackend.parkDiagnosticSession('bmx-diag-fish', {
+        cwd: '/tmp',
+        cols: 80,
+        rows: 24,
+        contentPath: '/tmp/diagnostic.ansi',
+      });
+
+      expect(parked).toBe(true);
+      const args = tmuxNewSessionArgs();
+      const cIdx = scriptIndex(args);
+      const script = args[cIdx + 1] ?? '';
+      expect(args.slice(cIdx - 2, cIdx + 2)).toEqual([shell.path, '-i', '-c', script]);
+      expect(args[cIdx + 2]).toBe('/tmp');
+      expect(args[cIdx + 2]).not.toBe('_');
+      expect(args[cIdx + 3]).toBe('/tmp/diagnostic.ansi');
+      expect(args[cIdx + 4]).toBe(shell.path);
+      expect(script).toContain('cd -- $argv[1]');
+      expect(script).toContain('cat -- $argv[2]');
+      expect(script).toContain('exec $argv[3] -i');
+      expect(script).not.toContain('cd -- "$1"');
+      expect(script).not.toContain('"$@');
+      expect(script).not.toMatch(/\bshift\b/);
+    } finally {
+      if (previousShell === undefined) delete process.env.SHELL;
+      else process.env.SHELL = previousShell;
+      cleanupFakeShell(shell);
+    }
+  });
+});
 
 describe('TmuxBackend.sendText', () => {
   beforeEach(() => mockedExecFileSync.mockReset());

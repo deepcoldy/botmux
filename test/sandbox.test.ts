@@ -222,6 +222,27 @@ describe('validateRelayRequest', () => {
     expect(r.value.flags).toEqual(['--mention-back', '--mention', 'ou:X', '--voice']);
   });
 
+  it('allows only validated response kinds through the sandbox relay', () => {
+    expect(validateRelayRequest({
+      contentFile: 'c.content',
+      flags: ['--response-kind', 'final', '--no-mention'],
+    })).toMatchObject({
+      ok: true,
+      value: { flags: ['--response-kind', 'final', '--no-mention'] },
+    });
+    expect(validateRelayRequest({
+      contentFile: 'c.content',
+      flags: ['--response-kind', 'auxiliary'],
+    })).toMatchObject({
+      ok: true,
+      value: { flags: ['--response-kind', 'auxiliary'] },
+    });
+    expect(validateRelayRequest({
+      contentFile: 'c.content',
+      flags: ['--response-kind', 'draft'],
+    })).toMatchObject({ ok: false, error: 'flag --response-kind must be progress, final, or auxiliary' });
+  });
+
   it('accepts a custom card file as a plain outbox basename', () => {
     const r = validateRelayRequest({
       contentFile: 'c.content',
