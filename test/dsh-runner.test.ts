@@ -244,6 +244,38 @@ describe('dsh-runner', () => {
     expect(prompts[1].prompt.contentBlocks[0].text).toContain('第二次');
   });
 
+  it('rejects a prompt ACK without a message id instead of waiting for the turn watchdog', async () => {
+    h = spawnRunner('bad-prompt-ack', ['--turn-timeout-ms', '10000']);
+    await waitFor(() => h.stdout.includes('›'), { label: 'ready marker' });
+
+    h.child.stdin.write(makeFrame('第一次'));
+    await waitFor(() => parseMarkers(h.stdout).filter(m => m.kind === 'final').length >= 1, {
+      timeout: 3000,
+      label: 'protocol error final',
+    });
+    const errorFinal = parseMarkers(h.stdout).find(m => m.kind === 'final')!;
+    expect(errorFinal.payload.content).toContain('session/prompt returned no message id');
+
+    h.child.stdin.write(makeFrame('第二次'));
+    await waitFor(() => parseMarkers(h.stdout).filter(m => m.kind === 'final').length >= 2, { label: 'success final' });
+
+    const prompts = readPrompts(h);
+    expect(prompts).toHaveLength(2);
+    expect(prompts[1].prompt.contentBlocks[0].text).toContain('<botmux_identity>');
+    expect(prompts[1].prompt.contentBlocks[0].text).toContain('第二次');
+  });
+
+  it('rejects an initialize response without a server identity', async () => {
+    h = spawnRunner('bad-initialize');
+    const exitPromise = new Promise<number | null>(resolve => h!.child.on('exit', resolve));
+    const code = await exitPromise;
+
+    expect(code).toBe(1);
+    expect(h.stderr).toContain('initialize returned no server identity');
+    expect(h.stdout).not.toContain('dsh connected');
+    expect(h.stdout).not.toContain('›');
+  });
+
   it('reaps a wedged turn with the watchdog and exits for restart', async () => {
     h = spawnRunner('hang', ['--turn-timeout-ms', '500']);
     await waitFor(() => h.stdout.includes('›'), { label: 'ready marker' });
