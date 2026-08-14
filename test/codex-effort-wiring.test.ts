@@ -19,6 +19,11 @@ vi.mock('../src/adapters/cli/registry.js', async (orig) => {
 
 import { createCodexAdapter } from '../src/adapters/cli/codex.js';
 import { createCodexAppAdapter } from '../src/adapters/cli/codex-app.js';
+import {
+  botToSnapshot,
+  parseFrozenBotSnapshots,
+  serializeFrozenBotSnapshots,
+} from '../src/workflows/v3/bot-resolve.js';
 
 const BASE = { sessionId: 's1', resume: false, workingDir: '/tmp' } as const;
 
@@ -101,5 +106,32 @@ describe('worker → CodexRpcEngine effort wiring (source lock)', () => {
     const returnConfig = source.indexOf('return {', frozenBranch);
     expect(compatibilityGuard).toBeGreaterThan(frozenBranch);
     expect(compatibilityGuard).toBeLessThan(returnConfig);
+  });
+});
+
+describe('v3 frozen BotSnapshot reasoning effort', () => {
+  it('round-trips a compatible effort and rejects tampered CLI/model combinations', () => {
+    const snapshot = botToSnapshot({
+      larkAppId: 'app-codex',
+      larkAppSecret: 'secret',
+      cliId: 'codex',
+      model: 'gpt-5.6-luna',
+      reasoningEffort: 'max',
+    });
+    expect(snapshot.reasoningEffort).toBe('max');
+    expect(parseFrozenBotSnapshots(serializeFrozenBotSnapshots(new Map([['', snapshot]]))).get(''))
+      .toMatchObject({ model: 'gpt-5.6-luna', reasoningEffort: 'max' });
+
+    expect(() => parseFrozenBotSnapshots({
+      '': { ...snapshot, cliId: 'claude-code' },
+    })).toThrow('reasoningEffort is not supported by its Codex CLI/model');
+    expect(() => parseFrozenBotSnapshots({
+      '': { ...snapshot, reasoningEffort: 'ultra' },
+    })).toThrow('reasoningEffort is not supported by its Codex CLI/model');
+  });
+
+  it('passes the frozen effort into the v3 worker init message', () => {
+    const source = readFileSync(new URL('../src/workflows/v3/ephemeral-pool.ts', import.meta.url), 'utf8');
+    expect(source).toContain('reasoningEffort: req.botSnapshot.reasoningEffort');
   });
 });
