@@ -6,6 +6,7 @@ import { logger } from '../utils/logger.js';
 import { withFileLockSync } from '../utils/file-lock.js';
 import { cleanupMaterializedDashboardImages } from '../core/dashboard-images.js';
 import { deleteFrozenCards } from './frozen-card-store.js';
+import { removePromptContextDir } from './prompt-context-store.js';
 import type { Session } from '../types.js';
 
 let sessions: Map<string, Session> = new Map();
@@ -790,6 +791,9 @@ export function closeSession(
     // user-visible, so workerless/forced closes must apply the same cleanup;
     // otherwise closed sessions retain private reply text indefinitely.
     if (opts.cleanupBridgeMarkers !== false) cleanupSessionBridgeSendMarkers(sessionId);
+    // #794: per-turn hook sidecar 与 turn-sends 同生命周期，关会话一并清掉，
+    // 否则 prompt-ctx/<sid>/ 成为孤儿目录（24h TTL 兜底但 daemon 长命会累积）。
+    removePromptContextDir(sessionId);
     deleteFrozenCards(sessionId);
     logger.info(`Closed session ${sessionId}`);
   }

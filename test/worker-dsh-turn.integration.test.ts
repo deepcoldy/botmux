@@ -12,7 +12,23 @@ import { chmodSync, copyFileSync, existsSync, mkdtempSync, rmSync } from 'node:f
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
+import { probeHostCredentialIsolationMechanism } from '../src/adapters/backend/sandbox.js';
 import type { DaemonToWorker, WorkerToDaemon } from '../src/types.js';
+
+// Dep gate for the sandbox case (same shape as sandbox.test.ts): the direct
+// sandbox must actually ESTABLISH bwrap's namespaces (--unshare-user & co.),
+// not merely find bwrap on PATH. Stock Ubuntu 23.10+ (incl. GitHub's
+// ubuntu-24.04 runners and colima VMs) sets
+// kernel.apparmor_restrict_unprivileged_userns=1 and the 24.04 bubblewrap
+// package ships no AppArmor profile, so bwrap dies instantly with
+// "bwrap: setting up uid map: Permission denied" (exit 1) — an environment
+// limitation, not a code bug. Probe the product's own namespace set and skip
+// loudly when the host can't do it; ci.yml lifts the restriction so the case
+// still truly runs on CI runners.
+const sandboxHost = probeHostCredentialIsolationMechanism();
+if (!sandboxHost.supported) {
+  console.warn(`[worker-dsh-turn] sandbox case will SKIP — host cannot establish the file sandbox: ${sandboxHost.reason}`);
+}
 
 const children = new Set<ChildProcess>();
 const tempDirs = new Set<string>();
@@ -147,7 +163,7 @@ describe('dsh worker final_output integration', () => {
     }
   }, 60_000);
 
-  it('survives the file sandbox and persists config/sessions to the real HOME', async () => {
+  it.skipIf(!sandboxHost.supported)('survives the file sandbox and persists config/sessions to the real HOME', async () => {
     const root = mkdtempSync(join(tmpdir(), 'botmux-worker-dsh-sb-'));
     tempDirs.add(root);
     const fakeDsh = join(root, 'fake-dsh-server');

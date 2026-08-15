@@ -22,6 +22,9 @@ import { appendFileSync } from 'node:fs';
  *                     response (real async ordering)
  *   retry           - first session/prompt fails with a JSON-RPC error, the
  *                     second runs the happy path (preamble must survive)
+ *   bad-prompt-ack  - first session/prompt returns no messageId, the second
+ *                     runs the happy path (preamble must survive)
+ *   bad-initialize  - initialize returns no server identity
  *   error           - session/prompt fails with a JSON-RPC error
  *   turn-error      - prompt accepted, but the turn ends with an LLM error
  *                     (like the real 401 path): no assistant/message, a
@@ -182,6 +185,10 @@ function handleLine(line) {
     return;
   }
   if (msg.method === 'initialize') {
+    if (scenario === 'bad-initialize') {
+      send({ jsonrpc: '2.0', id: msg.id, result: {} });
+      return;
+    }
     send({
       jsonrpc: '2.0',
       id: msg.id,
@@ -191,6 +198,11 @@ function handleLine(line) {
   }
   if (msg.method === 'session/prompt') {
     if (logPath) appendFileSync(logPath, JSON.stringify({ prompt: msg.params }) + '\n');
+    if (scenario === 'bad-prompt-ack' && promptCount === 0) {
+      promptCount++;
+      send({ jsonrpc: '2.0', id: msg.id, result: {} });
+      return;
+    }
     if (scenario === 'error' || (scenario === 'retry' && promptCount === 0)) {
       promptCount++;
       send({

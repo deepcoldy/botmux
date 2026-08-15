@@ -108,6 +108,7 @@ export function buildDocWatchWarmupTurnInput(args: {
   botIdentity?: { name?: string | null; openId?: string | null };
   sender?: ResolvedSender;
   mode: 'live' | 'refork';
+  turnId?: string;
 }): { promptContent: string; cliInput: CliTurnPayload } {
   const { ds, promptInput } = args;
   const promptContent = buildDocWatchWarmupPrompt(promptInput);
@@ -123,6 +124,8 @@ export function buildDocWatchWarmupTurnInput(args: {
         cliPathOverride,
         sender: args.sender,
         larkAppId: ds.larkAppId,
+        sessionBackendType: ds.session.backendType,
+        turnId: args.turnId,
         chatId: ds.session.chatId,
         whiteboardId: ds.session.whiteboardId,
         codexAppText,
@@ -137,6 +140,7 @@ export function buildDocWatchWarmupTurnInput(args: {
       cliPathOverride,
       selfMention: args.botIdentity,
       sender: args.sender,
+      turnId: args.turnId,
       codexAppText,
       codexAppApplicationContext: promptContent,
     }),
@@ -256,6 +260,7 @@ export function buildDocCommentTurnInput(args: {
   botIdentity?: { name?: string | null; openId?: string | null };
   sender?: ResolvedSender;
   mode: 'live' | 'refork';
+  turnId?: string;
 }): { promptContent: string; cliInput: CliTurnPayload } {
   const { ds, promptInput } = args;
   const promptContent = buildDocCommentPrompt(promptInput);
@@ -287,6 +292,8 @@ export function buildDocCommentTurnInput(args: {
         cliPathOverride,
         sender: args.sender,
         larkAppId: ds.larkAppId,
+        sessionBackendType: ds.session.backendType,
+        turnId: args.turnId,
         chatId: ds.session.chatId,
         whiteboardId: ds.session.whiteboardId,
         ...cleanContext,
@@ -300,6 +307,7 @@ export function buildDocCommentTurnInput(args: {
       cliPathOverride,
       selfMention: args.botIdentity,
       sender: args.sender,
+      turnId: args.turnId,
       ...cleanContext,
     }),
   };

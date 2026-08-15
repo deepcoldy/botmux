@@ -51,3 +51,15 @@ export function sessionReadyHookCommand(): string {
   const cliEntry = join(__dirname, '..', 'cli.js');
   return `"${process.execPath}" "${cliEntry}" session-ready`;
 }
+
+/**
+ * 构造 Claude 家族 `UserPromptSubmit` hook 的 shell 命令字符串 → `botmux user-prompt-hook`。
+ * 与 sessionReadyHookCommand 同策略：写进全局 settings.json（aiden wrapper 会剥进程级
+ * --settings，全局是唯一可靠渠道）。hook 子进程靠继承的 BOTMUX_SESSION_ID /
+ * SESSION_DATA_DIR 定位 per-turn sidecar；缺 env / 读不到 sidecar 时空输出 exit 0
+ * （fail-open：上下文丢失 < 卡住 prompt），且结构性保证永不 exit 2。
+ */
+export function userPromptHookCommand(): string {
+  const cliEntry = join(__dirname, '..', 'cli.js');
+  return `"${process.execPath}" "${cliEntry}" user-prompt-hook`;
+}

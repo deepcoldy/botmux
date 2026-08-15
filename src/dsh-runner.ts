@@ -147,6 +147,29 @@ function truncate(text: string, max: number): string {
   return text.length > max ? `${text.slice(0, max)}…` : text;
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+/** Keep the wire checks aligned with the official dsh SDK client. A successful
+ *  JSON-RPC envelope with a malformed result is still a protocol failure. */
+function parseInitializeResult(result: unknown): { serverInfo: { name: string; version: string } } {
+  if (!isRecord(result)
+    || !isRecord(result.serverInfo)
+    || typeof result.serverInfo.name !== 'string'
+    || typeof result.serverInfo.version !== 'string') {
+    throw new Error(`dsh protocol error: initialize returned no server identity: ${JSON.stringify(result)}`);
+  }
+  return { serverInfo: { name: result.serverInfo.name, version: result.serverInfo.version } };
+}
+
+function parsePromptMessageId(result: unknown): string {
+  if (!isRecord(result) || typeof result.messageId !== 'string') {
+    throw new Error(`dsh protocol error: session/prompt returned no message id: ${JSON.stringify(result)}`);
+  }
+  return result.messageId;
+}
+
 function emitMarker(kind: string, payload: unknown): void {
   output.marker(kind, payload);
 }
@@ -163,7 +186,12 @@ function prompt(): void {
  *  vendored composition is materialized under ~/.botmux/dsh. */
 function resolveConfigPath(): string {
   const fromEnv = process.env.DSH_CORDIS_CONFIG?.trim();
-  if (fromEnv && existsSync(fromEnv)) return fromEnv;
+  if (fromEnv) {
+    if (!existsSync(fromEnv)) {
+      throw new Error(`DSH_CORDIS_CONFIG does not exist: ${fromEnv}`);
+    }
+    return fromEnv;
+  }
   const dir = join(homedir(), '.botmux', 'dsh');
   mkdirSync(dir, { recursive: true });
   const path = join(dir, 'cordis.yml');
@@ -507,15 +535,16 @@ async function runTurn(content: string): Promise<void> {
   });
 
   try {
-    const ack = await client.request<{ messageId?: string }>('session/prompt', {
+    const ack = await client.request<unknown>('session/prompt', {
       sessionId: dshSessionId,
       contentBlocks: [{ type: 'text', text: promptContent }],
     }, PROMPT_ACK_TIMEOUT_MS);
+    const messageId = parsePromptMessageId(ack);
     // The ACK's messageId correlates this turn's events: notifications may
     // already be buffered (they can precede the response), and a late idle
     // from the previous turn must not settle this one.
-    if (activeTurn && typeof ack.messageId === 'string') {
-      activeTurn.messageId = ack.messageId;
+    if (activeTurn) {
+      activeTurn.messageId = messageId;
       tryClaimReceipt(activeTurn);
     }
     // Commit firstTurn only after the prompt was accepted: a rejected first
@@ -645,12 +674,13 @@ async function main(): Promise<void> {
   client.start();
 
   const model = args.model?.trim() || DEFAULT_MODEL;
-  const serverInfo = await client.request<{ serverInfo?: { name?: string; version?: string } }>(
+  const initializeResult = await client.request<unknown>(
     'initialize',
     { cwd, provider: 'deepseek-official', model, maxTokens: DEFAULT_MAX_TOKENS },
     HANDSHAKE_TIMEOUT_MS,
   );
-  writeLine(`dsh connected (${serverInfo?.serverInfo?.name ?? 'unknown'} ${serverInfo?.serverInfo?.version ?? ''}).`);
+  const { serverInfo } = parseInitializeResult(initializeResult);
+  writeLine(`dsh connected (${serverInfo.name} ${serverInfo.version}).`);
 
   if (process.stdin.isTTY) process.stdin.setRawMode(true);
   process.stdin.resume();

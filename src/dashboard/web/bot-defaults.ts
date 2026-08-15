@@ -87,6 +87,8 @@ export type BotDefaultsRow = {
   summaryMemory?: boolean;
   summaryMemoryPath?: string;
   p2pMode?: string;
+  /** #794: per-turn 上下文注入方式。'auto' = 支持的 CLI 走 hook 注入；缺省/'off' = 内联。 */
+  envelopeInjection?: 'auto' | 'off' | null;
   regularGroupReplyMode?: string;
   regularGroupMentionMode?: string;
   substituteMode?: BotSubstituteMode | null;

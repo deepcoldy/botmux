@@ -4464,6 +4464,7 @@ async function prewarmDocCommentSession(ds: DaemonSession, sub: DocSubscription)
       botCliPathOverride: botCfg.cliPathOverride,
       sender,
       mode: 'live',
+      turnId,
     });
     rememberLastCliInput(ds, promptContent, cliInput);
     sessionStore.updateSession(ds.session);
@@ -4481,6 +4482,7 @@ async function prewarmDocCommentSession(ds: DaemonSession, sub: DocSubscription)
       botIdentity: { name: bot.botName, openId: bot.botOpenId },
       sender,
       mode: 'refork',
+      turnId,
     });
     rememberLastCliInput(ds, promptContent, wrappedInput);
     sessionStore.updateSession(ds.session);
@@ -16369,6 +16371,10 @@ function releaseQueuedActivationReservation(ds: DaemonSession, acknowledgedToken
     const bot = getBot(ds.larkAppId);
     const cliId = ds.session.cliId ?? bot.config.cliId;
     const rawCodexText = (ds.pendingCodexAppFollowUps ?? []).join('\n\n');
+    const bufferedTurnIds = ds.pendingFollowUpTurnIds ?? [];
+    const turnId = bufferedTurnIds[bufferedTurnIds.length - 1]
+      ?? ds.currentReplyTarget?.turnId
+      ?? `queued-activation-followup-${randomUUID()}`;
     const followUp = buildFollowUpCliInput(
       buffered.join('\n\n'),
       ds.session.sessionId,
@@ -16380,16 +16386,14 @@ function releaseQueuedActivationReservation(ds: DaemonSession, acknowledgedToken
         chatId: ds.chatId,
         whiteboardId: ds.session.whiteboardId,
         codexAppText: rawCodexText || buffered.join('\n\n'),
+        sessionBackendType: ds.session.backendType,
+        turnId,
         codexAppApplicationContext: ds.pendingCodexAppApplicationContext,
         codexAppMessageContext: (ds.pendingCodexAppFollowUpContexts ?? [])
           .filter(Boolean)
           .join('\n\n'),
       },
     );
-    const bufferedTurnIds = ds.pendingFollowUpTurnIds ?? [];
-    const turnId = bufferedTurnIds[bufferedTurnIds.length - 1]
-      ?? ds.currentReplyTarget?.turnId
-      ?? `queued-activation-followup-${randomUUID()}`;
     const reservation = reserveQueuedActivationTailAdmission(ds);
     const bufferedGateDecisions = ds.pendingCodexAppFollowUpGateAccepted ?? [];
     // Runtime buffers are rolling-upgrade compatibility only. If they carry an
@@ -19036,6 +19040,8 @@ async function handleThreadReplyAdmitted(
         codexAppText: parsed.content,
         codexAppApplicationContext,
         codexAppMessageContext,
+      sessionBackendType: ds.session.backendType,
+      turnId: parsed.messageId,
       });
       // R5-B1-1: freeze the admission-time steer authorization onto this earliest
       // (initialStartPending follower) tail entry — the strip-proof admit rebuild
@@ -19174,6 +19180,8 @@ async function handleThreadReplyAdmitted(
           codexAppText: parsed.content,
           codexAppApplicationContext,
           codexAppMessageContext,
+        sessionBackendType: ds.session.backendType,
+        turnId: parsed.messageId,
         });
         ds.session.queuedPrompt ??= ds.pendingPrompt;
         ds.session.queuedCodexAppText ??= ds.pendingCodexAppText;
@@ -19569,6 +19577,8 @@ async function handleThreadReplyAdmitted(
           codexAppText: parsed.content,
           codexAppApplicationContext,
           codexAppMessageContext,
+        sessionBackendType: ds.session.backendType,
+        turnId: parsed.messageId,
         });
     beginNewTurn(ds, parsed.content, parsed.messageId);
     await noteTurnReceived(ds, parsed.messageId, parsed.content, turnSender, parsed.messageId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
@@ -19659,6 +19669,8 @@ async function handleThreadReplyAdmitted(
           codexAppText: parsed.content,
           codexAppApplicationContext,
           codexAppMessageContext,
+        sessionBackendType: ds.session.backendType,
+        turnId: parsed.messageId,
         });
         // R4-B1: freeze the admission-time steer authorization onto the queued
         // opening payload so the worker-null re-fork path carries it exactly like
@@ -19775,35 +19787,12 @@ async function handleThreadReplyAdmitted(
     // its normal `--resume` instead of being cold-spawned over.
     const hadPriorCliInput = !!(ds.lastCliInput ?? ds.session.lastCliInput);
     const openingTurn = wantsOpening && claimInitialUserTurn(ds);
-    const builtReforkInput = buildReforkCliInput(ds, reforkContent, {
-      attachments: queuedHasDurableTail ? undefined : attachments,
-      mentions: queuedHasDurableTail ? undefined : parsed.mentions,
-      cliId: ds.session.cliId ?? dsBotCfgForFork.cliId,
-      cliPathOverride: ds.session.cliPathOverride ?? dsBotCfgForFork.cliPathOverride,
-      selfMention: { name: selfBot.botName, openId: selfBot.botOpenId },
-      sender: queuedHasDurableTail ? undefined : reforkSender,
-      substituteTrigger: queuedHasDurableTail ? undefined : substituteTrigger,
-      codexAppText: reforkCodexApp.text,
-      codexAppApplicationContext: queuedHasDurableTail ? undefined : codexAppApplicationContext,
-      codexAppMessageContext: reforkCodexApp.messageContext,
-    });
-    let wrappedInput = applyQueuedCodexAppLegacyFallback(builtReforkInput, {
-      queued: queuedDashboardTurn,
-      queuedText: queuedCodexAppText,
-    });
-    if (wrappedInput !== builtReforkInput && dsBotCfgForFork.codexAppCleanInput === true) {
-      // Backlog sessions persisted before clean-input have no raw queued text.
-      // Keep this activation entirely legacy: reforkContent already contains
-      // queuedPrompt + the current reply, whereas a structured turn could only
-      // contain the reply and would silently discard the original task.
-      logger.warn(`[${tag(ds)}] Legacy queued dashboard task has no clean-input text; using the full legacy activation prompt`);
-    }
+    // 先选 builder：opening 轮用 buildNewTopicCliInput，非 opening 才 buildRefork。
+    // 不能无条件先跑 buildRefork——它现在有副作用（写 follow-up sidecar），opening 时
+    // 结果会被 buildNewTopicCliInput 覆盖丢弃，但 sidecar 已写入 opening 的 turnId，
+    // opening 的 hook 会领到这份从没发出去的 speculative reminder → 双注入。
+    let wrappedInput: CliTurnPayload;
     if (openingTurn) {
-      // Replace the follow-up envelope built above with the real opening. The
-      // discarded build is pure string assembly (no side effects) — keeping the
-      // refork statement unconditional keeps the queued/substitute wiring, and
-      // its guard test, on a single code path. (openingTurn is mutually
-      // exclusive with queuedDashboardTurn/queuedHasDurableTail.)
       wrappedInput = buildNewTopicCliInput(
         reforkContent,
         ds.session.sessionId,
@@ -19826,6 +19815,31 @@ async function handleThreadReplyAdmitted(
           codexAppMessageContext: reforkCodexApp.messageContext,
         },
       );
+    } else {
+      const builtReforkInput = buildReforkCliInput(ds, reforkContent, {
+        attachments: queuedHasDurableTail ? undefined : attachments,
+        mentions: queuedHasDurableTail ? undefined : parsed.mentions,
+        cliId: ds.session.cliId ?? dsBotCfgForFork.cliId,
+        cliPathOverride: ds.session.cliPathOverride ?? dsBotCfgForFork.cliPathOverride,
+        selfMention: { name: selfBot.botName, openId: selfBot.botOpenId },
+        sender: queuedHasDurableTail ? undefined : reforkSender,
+        substituteTrigger: queuedHasDurableTail ? undefined : substituteTrigger,
+        codexAppText: reforkCodexApp.text,
+        codexAppApplicationContext: queuedHasDurableTail ? undefined : codexAppApplicationContext,
+        codexAppMessageContext: reforkCodexApp.messageContext,
+        turnId: parsed.messageId,
+      });
+      wrappedInput = applyQueuedCodexAppLegacyFallback(builtReforkInput, {
+        queued: queuedDashboardTurn,
+        queuedText: queuedCodexAppText,
+      });
+      if (wrappedInput !== builtReforkInput && dsBotCfgForFork.codexAppCleanInput === true) {
+        // Backlog sessions persisted before clean-input have no raw queued text.
+        // Keep this activation entirely legacy: reforkContent already contains
+        // queuedPrompt + the current reply, whereas a structured turn could only
+        // contain the reply and would silently discard the original task.
+        logger.warn(`[${tag(ds)}] Legacy queued dashboard task has no clean-input text; using the full legacy activation prompt`);
+      }
     }
     if (!queuedHasDurableTail) {
       await noteTurnReceived(ds, parsed.messageId, parsed.content, reforkSender, parsed.messageId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
@@ -20218,6 +20232,7 @@ async function handleDocCommentAdmitted(ctx: DocCommentContext): Promise<boolean
           botIdentity: { name: selfBot.botName, openId: selfBot.botOpenId },
           sender,
           mode: 'live',
+          turnId,
         });
         beginNewTurn(ds, text, turnId);
         (ds.session.docCommentTargets ??= {})[turnId] = docTarget; // per-turn map，不覆盖其他并发轮
@@ -20260,6 +20275,7 @@ async function handleDocCommentAdmitted(ctx: DocCommentContext): Promise<boolean
         botIdentity: { name: selfBot.botName, openId: selfBot.botOpenId },
         sender,
         mode: 'refork',
+        turnId,
       });
       (ds.session.docCommentTargets ??= {})[turnId] = docTarget; // per-turn map，不覆盖其他并发轮
       rememberLastCliInput(ds, promptContent, wrappedInput);
