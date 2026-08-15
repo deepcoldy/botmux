@@ -997,6 +997,14 @@ function normalizeMessageListeners(raw: unknown, botIndex: number): Record<strin
   return Object.keys(out).length > 0 ? out : undefined;
 }
 
+/**
+ * A bots.json row may omit `cliId`. Historically that means claude-code, and such
+ * a row can still carry a legacy `cliPathOverride`. Anything that derives a
+ * selection from a RAW row must apply this same default, otherwise the selection
+ * looks changed and preservation logic is skipped. Exported so there is exactly
+ * one definition of the legacy default.
+ */
+export const LEGACY_DEFAULT_CLI_ID = 'claude-code';
 export interface OncallChat {
   /** Lark chat_id (oc_xxx) the bot was pulled into. */
   chatId: string;
@@ -2495,7 +2503,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
     // also persist an exactly-equal path shadow so a rollback to an older
     // BotMux still launches the same distribution. Any unequal pair would make
     // old and new versions disagree, so it fails closed below.
-    const entryCliId = entry.cliId ?? 'claude-code';
+    const entryCliId = entry.cliId ?? LEGACY_DEFAULT_CLI_ID;
     if (entry.cliRuntime !== undefined && entryCliId !== 'codex') {
       throw new Error(`Bot config [${i}]: cliRuntime is currently supported only for cliId "codex"`);
     }

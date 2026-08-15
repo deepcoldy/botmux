@@ -12,6 +12,7 @@ import * as sessionStore from '../services/session-store.js';
 import * as messageQueue from '../services/message-queue.js';
 import { downloadMessageResource, listChatBotMembers, UserTokenMissingError } from '../im/lark/client.js';
 import { logger } from '../utils/logger.js';
+import { findEntryIndex, readRawConfig, requireConfigPath } from '../services/config-store.js';
 import { forkWorker, sendWorkerInput, promoteQueuedActivationTail, forkAdoptWorker, adoptSandboxBlocked, killStalePids, sweepDeadPidMarkers, getCurrentCliVersion, restoreUsageLimitRuntimeState, setActiveSessionSafe, setActiveSessionIfActive, isDisposableCommandScratch, isRelayableRealSession, closeSession, getActiveSessionsRegistry, suspendWorker, withActiveSessionKeyLock, isSessionTransferring, deferUntilSessionTransferSettled } from './worker-pool.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import { buildBotmuxShellHints } from '../adapters/cli/shared-hints.js';
@@ -34,7 +35,7 @@ import {
 } from './persistent-backend.js';
 import type { PersistentBackendTarget } from '../adapters/backend/types.js';
 import { adoptTargetLabel, validateAdoptTargetState } from './session-discovery.js';
-import { getBot, getAllBots, getOwnerOpenId, findOncallChat, effectiveDefaultWorkingDir } from '../bot-registry.js';
+import { getBot, getAllBots, getOwnerOpenId, findOncallChat, effectiveDefaultWorkingDir, LEGACY_DEFAULT_CLI_ID } from '../bot-registry.js';
 import type { BotConfig } from '../bot-registry.js';
 import type { CliId } from '../adapters/cli/types.js';
 import { sameRuntimeIdentity, type CliRuntimeConfig, type CliRuntimeSnapshot } from '../adapters/cli/runtime.js';
@@ -239,13 +240,46 @@ function sameUsageLimit(a: DaemonSession['usageLimit'], b: DaemonSession['usageL
   return usageLimitStateKey(a) === usageLimitStateKey(b) && a.retryReady === b.retryReady;
 }
 
-function sessionBotCliMismatch(ds: DaemonSession): { sessionCli: string; botCli: string } | null {
-  const sessionCliId = ds.session.cliId;
+/** The launch identity a session is compared against. */
+export interface CliMismatchTargetConfig {
+  cliId?: CliId;
+  cliRuntime?: CliRuntimeConfig;
+  cliPathOverride?: string;
+  wrapperCli?: string;
+}
+
+/**
+ * Compare a session's FROZEN launch identity against a target config.
+ *
+ * `target` is explicit so the agent-switch transaction can ask "which sessions
+ * WOULD mismatch if I committed this config" BEFORE writing it. Deriving the
+ * answer from live bot config forces a commit-then-reconcile order, which is
+ * exactly the ordering that let a failed close leave the config switched while
+ * old-agent sessions stayed routable.
+ */
+export function sessionMismatchesTargetCli(
+  ds: DaemonSession,
+  target: CliMismatchTargetConfig,
+): { sessionCli: string; botCli: string } | null {
+  return sessionRowMismatchesTargetCli(ds.session, target);
+}
+
+/**
+ * Same comparison against a DURABLE row.
+ *
+ * The agent switch must also consider rows that are active on disk but absent
+ * from the runtime registry — every field this compares lives on Session, so
+ * there is no need to fabricate a DaemonSession to reach them.
+ */
+export function sessionRowMismatchesTargetCli(
+  row: Session,
+  target: CliMismatchTargetConfig,
+): { sessionCli: string; botCli: string } | null {
+  const sessionCliId = row.cliId;
   if (!sessionCliId) return null;
-  let botCfg: { cliId?: CliId; cliRuntime?: CliRuntimeConfig; cliPathOverride?: string; wrapperCli?: string };
-  try { botCfg = getBot(ds.larkAppId).config; } catch { return null; }
+  const botCfg = target;
   if (!botCfg.cliId) return null;
-  const sessionWrapper = ds.session.wrapperCli?.trim() || undefined;
+  const sessionWrapper = row.wrapperCli?.trim() || undefined;
   const botWrapper = botCfg.wrapperCli?.trim() || undefined;
   const describe = (
     cliId: CliId,
@@ -258,7 +292,7 @@ function sessionBotCliMismatch(ds: DaemonSession): { sessionCli: string; botCli:
   };
   if (sessionCliId !== botCfg.cliId) {
     return {
-      sessionCli: describe(sessionCliId, ds.session.cliRuntime, ds.session.cliPathOverride, sessionWrapper),
+      sessionCli: describe(sessionCliId, row.cliRuntime, row.cliPathOverride, sessionWrapper),
       botCli: describe(botCfg.cliId, botCfg.cliRuntime, botCfg.cliPathOverride, botWrapper),
     };
   }
@@ -266,11 +300,11 @@ function sessionBotCliMismatch(ds: DaemonSession): { sessionCli: string; botCli:
   // 启动选择（selectionKeyForBot 以 cliId+wrapperCli 为键），wrapper 间切换同样不能
   // 复活旧会话。仅 agentFrozen 的会话有可靠的 wrapper 快照——legacy 未冻结会话下次
   // fork 会从 live bot 配置回填 wrapper，天然不会在这条轴上失配。
-  if (ds.session.agentFrozen && !sameRuntimeIdentity(
+  if (row.agentFrozen && !sameRuntimeIdentity(
     {
       cliId: sessionCliId,
-      cliRuntime: ds.session.cliRuntime,
-      cliPathOverride: ds.session.cliPathOverride,
+      cliRuntime: row.cliRuntime,
+      cliPathOverride: row.cliPathOverride,
       wrapperCli: sessionWrapper,
     },
     {
@@ -281,11 +315,106 @@ function sessionBotCliMismatch(ds: DaemonSession): { sessionCli: string; botCli:
     },
   )) {
     return {
-      sessionCli: describe(sessionCliId, ds.session.cliRuntime, ds.session.cliPathOverride, sessionWrapper),
+      sessionCli: describe(sessionCliId, row.cliRuntime, row.cliPathOverride, sessionWrapper),
       botCli: describe(botCfg.cliId, botCfg.cliRuntime, botCfg.cliPathOverride, botWrapper),
     };
   }
   return null;
+}
+
+/** Live-config comparison — the restore / reattach / sweep paths. */
+function sessionBotCliMismatch(ds: DaemonSession): { sessionCli: string; botCli: string } | null {
+  let botCfg: CliMismatchTargetConfig;
+  try { botCfg = getBot(ds.larkAppId).config; } catch { return null; }
+  return sessionMismatchesTargetCli(ds, botCfg);
+}
+
+/**
+ * The bot's launch identity as it exists ON DISK right now.
+ *
+ * `getBot().config` is a per-process mirror: another daemon committing to
+ * bots.json does not update it. Every close in this module is irreversible, so a
+ * close must never be justified by that mirror alone — see
+ * `confirmMismatchAgainstDisk`.
+ *
+ * Returns 'unreadable' rather than a guess, and undefined when the row is gone.
+ */
+async function readPersistedBotIdentity(
+  larkAppId: string,
+): Promise<CliMismatchTargetConfig | undefined | 'unreadable' | 'no_persisted_config'> {
+  let path: string;
+  try {
+    // No persisted config at all (a deployment that never wrote one, or a unit
+    // test): there is no durable authority to consult, so the live config IS the
+    // authority. This is NOT the same as "a config exists but cannot be read",
+    // which is untrustworthy and must fail closed.
+    path = requireConfigPath();
+  } catch {
+    return 'no_persisted_config';
+  }
+  try {
+    const raw = await readRawConfig(path);
+    const idx = findEntryIndex(raw, larkAppId);
+    if (idx < 0) return undefined;
+    const row = raw[idx] as Record<string, unknown>;
+    return {
+      // Same loader default as everywhere else: a legacy row omitting cliId means
+      // claude-code, not "no selection".
+      cliId: (row.cliId ?? LEGACY_DEFAULT_CLI_ID) as CliMismatchTargetConfig['cliId'],
+      wrapperCli: row.wrapperCli as string | undefined,
+      cliRuntime: row.cliRuntime as CliMismatchTargetConfig['cliRuntime'],
+      cliPathOverride: row.cliPathOverride as string | undefined,
+    };
+  } catch {
+    return 'unreadable';
+  }
+}
+
+/**
+ * Re-justify a mismatch against the DURABLE config, immediately before closing.
+ *
+ * This is the single choke point for every mismatch-driven close in this module,
+ * including the deferred ones. That matters because a deferred callback runs an
+ * unbounded time later: `armCliMismatchResweep` waits for a transfer to settle,
+ * and `onCodexAppLedgerDrained` waits for a FIFO to drain. Proving the authority
+ * had not diverged when the retry was ARMED proves nothing about when it RUNS —
+ * another process can commit in between, and this process's mirror would still
+ * show the old value. Closing then destroys a session the durable config
+ * endorses, which nothing downstream can undo.
+ *
+ * Fail-closed: an unreadable authority or a missing row skips the close. Missing
+ * a close is recoverable (the next sweep/restore retries it); mis-closing is not.
+ */
+async function confirmMismatchAgainstDisk(ds: DaemonSession): Promise<boolean> {
+  const disk = await readPersistedBotIdentity(ds.larkAppId);
+  // Nothing durable to check against ⇒ the live decision already made by the
+  // caller stands. Refusing here would disable mismatch convergence entirely for
+  // such deployments.
+  if (disk === 'no_persisted_config') return true;
+  if (disk === 'unreadable') {
+    logger.error(
+      `[${ds.session.sessionId.substring(0, 8)}] CLI mismatch close skipped: the persisted bot `
+      + 'config could not be read, so the close cannot be justified',
+    );
+    return false;
+  }
+  if (!disk) {
+    logger.warn(
+      `[${ds.session.sessionId.substring(0, 8)}] CLI mismatch close skipped: the bot row is gone `
+      + 'from the persisted config',
+    );
+    return false;
+  }
+  if (!sessionMismatchesTargetCli(ds, disk)) {
+    // The durable config now endorses this session (typically another process
+    // committed after our decision, or after this retry was armed).
+    logger.warn(
+      `[${ds.session.sessionId.substring(0, 8)}] CLI mismatch close skipped: the persisted config `
+      + 'no longer marks this session as stale',
+    );
+    return false;
+  }
+  return true;
 }
 
 type CliMismatchCloseResult =
@@ -317,6 +446,12 @@ function armCliMismatchResweep(ds: DaemonSession): void {
 async function closeActiveSessionIfCliMismatch(ds: DaemonSession): Promise<CliMismatchCloseResult> {
   const mismatch = sessionBotCliMismatch(ds);
   if (!mismatch) return 'not_mismatched';
+
+  // The live mirror said "stale"; the DURABLE config has the final word. Placed
+  // here so every caller is covered at once — the bot-level sweep, the deferred
+  // transfer resweep, the ledger-drained resweep and restore — instead of each one
+  // having to remember to consult the authority itself.
+  if (!await confirmMismatchAgainstDisk(ds)) return 'not_mismatched';
 
   // A config mismatch is not an explicit user close. In particular, bots.json
   // may be edited while the daemon is down, leaving a persisted backend-neutral
