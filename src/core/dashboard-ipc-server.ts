@@ -4099,6 +4099,10 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
     // the window. bots.json is also editable by hand and by older daemons, so no
     // cooperative protocol could have closed that window anyway.
     let readIsolationCleared = false;
+    // Mirrored from the entry the transaction wrote, so the live config cannot
+    // disagree with what is on disk.
+    let committedReadIsolation: boolean = false;
+    let committedBackendType: ReturnType<typeof getBot>['config']['backendType'];
     let committedRuntime: CliRuntimeConfig | undefined;
     let committedLegacyPath: string | undefined;
     let availabilityWarning: string | undefined;
@@ -4121,14 +4125,13 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
         const nextRuntime = derived.nextRuntime;
         const nextLegacyPath = derived.nextLegacyPath;
         const effectivePath = nextRuntime?.executable ?? nextLegacyPath;
-        // Availability only inspects the filesystem/PATH — no child process, so it
-        // is safe to hold the lock across it. The --version probe, which does spawn
-        // one, ran before this transaction.
-        const availability = checkCliAvailability({
-          cliId: selected.cliId,
-          wrapperCli: selected.wrapperCli,
-          cliPathOverride: effectivePath,
-        });
+        // NOTE: availability is deliberately NOT computed here. Its default path
+        // resolves a command through `sh -lc` / `-ic` (registry.resolveCommand),
+        // measured at ~325ms on this box for a CLI that is not directly on PATH,
+        // versus ~0ms without it. Holding the bots.json lock that long can push a
+        // concurrent writer into the 5s lock timeout. It is response-only data, so
+        // it is computed after the transaction — with full shell fidelity, so the
+        // reported availability is unchanged.
 
         const nextReasoningEffort = supportsReasoningEffort
           ? (reasoningEffortFieldPresent ? reasoningEffort ?? undefined : entry.reasoningEffort)
@@ -4167,6 +4170,7 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
           delete entry.readIsolation;
           readIsolationCleared = true;
         }
+        committedReadIsolation = entry.readIsolation === true;
         // 远端 CLI（riff / mojo）→ backendType 自动设为同名后端（否则 spawn 走 pty
         // 后端，而它们的 resolvedBin 是空串）。
         if (isRemoteCliId(selected.cliId)) {
@@ -4177,18 +4181,11 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
           // turn）。手动的 pty/tmux/herdr/zellij override 不受影响。
           delete entry.backendType;
         }
+        committedBackendType = entry.backendType as typeof committedBackendType;
 
         // Published to the response and to the live config below.
         committedRuntime = nextRuntime;
         committedLegacyPath = nextLegacyPath;
-        agentAvailable = availability.available;
-        requiredCommand = availability.command;
-        // Existing Bot edits remain saveable (operators may intentionally configure
-        // first and install second), but the response is explicit so Dashboard never
-        // claims a missing Agent was saved successfully without qualification.
-        availabilityWarning = availability.available
-          ? undefined
-          : `配置已保存，但所选 Agent 当前无法启动：${availability.reason ?? '本地启动依赖不可用'}。请先在 daemon 所在机器安装或修正 PATH / CLI 路径。`;
         return { write: true, result: { nextReasoningEffort } };
       });
     } catch (err) {
@@ -4208,6 +4205,23 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
       });
     }
 
+    // Availability AFTER the lock, with the shell fallback enabled, so an agent
+    // installed only via a login-shell shim (nvm/npm) is still reported available.
+    // Response-only, so computing it here changes no persisted decision.
+    const availability = checkCliAvailability({
+      cliId: selected.cliId,
+      wrapperCli: selected.wrapperCli,
+      cliPathOverride: committedRuntime?.executable ?? committedLegacyPath,
+    });
+    agentAvailable = availability.available;
+    requiredCommand = availability.command;
+    // Existing Bot edits remain saveable (operators may intentionally configure
+    // first and install second), but the response is explicit so Dashboard never
+    // claims a missing Agent was saved successfully without qualification.
+    availabilityWarning = availability.available
+      ? undefined
+      : `配置已保存，但所选 Agent 当前无法启动：${availability.reason ?? '本地启动依赖不可用'}。请先在 daemon 所在机器安装或修正 PATH / CLI 路径。`;
+
     const bot = getBot(larkAppId);
     bot.config.cliId = selected.cliId;
     bot.config.cliRuntime = committedRuntime;
@@ -4217,12 +4231,13 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
     bot.config.model = model || undefined;
     if (!supportsReasoningEffort) bot.config.reasoningEffort = undefined;
     else bot.config.reasoningEffort = r.result.nextReasoningEffort ?? undefined;
-    if (readIsolationCleared) bot.config.readIsolation = false;
-    if (isRemoteCliId(selected.cliId)) {
-      bot.config.backendType = selected.cliId as typeof bot.config.backendType;
-    } else if (bot.config.backendType && isRemoteBackendType(bot.config.backendType)) {
-      bot.config.backendType = undefined;
-    }
+    // Mirror the COMMITTED values, not a re-derivation from the pre-request live
+    // object. Deciding these from `bot.config` again could disagree with the entry
+    // that was actually written: readIsolation was only mirrored when the
+    // transaction cleared it (so a row that kept `true` could leave live at
+    // `false`), and backendType was re-derived from the stale in-memory value.
+    bot.config.readIsolation = committedReadIsolation;
+    bot.config.backendType = committedBackendType;
 
     // ── SWEEP AFTER the commit ────────────────────────────────────────────
     //
@@ -4237,7 +4252,40 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
     // slips through is RECOVERABLE — the resweep closes it. Closing before the
     // commit instead made the failure mode unrecoverable: a stale target killed
     // sessions that were correct, and no later refusal could bring them back.
-    const closedMismatchedSessions = await agentSwitchCloseHook.run(larkAppId);
+    //
+    // The guard reads the DURABLE row, not this process's mirror above: another
+    // daemon can commit right after us without touching our memory, and a sweep
+    // driven by that mirror would close sessions the new config endorses. If disk
+    // no longer matches what we committed, the sweep stops and the newer writer's
+    // own sweep (plus armCliMismatchResweep) converges instead.
+    const committedIdentity = {
+      cliId: selected.cliId,
+      wrapperCli: selected.wrapperCli,
+      cliRuntime: committedRuntime,
+      cliPathOverride: committedRuntime?.executable ?? committedLegacyPath,
+    };
+    const closedMismatchedSessions = await agentSwitchCloseHook.run(larkAppId, undefined, {
+      committed: committedIdentity,
+      read: async () => {
+        try {
+          const raw = await readRawConfig(requireConfigPath());
+          const idx = findEntryIndex(raw, larkAppId);
+          if (idx < 0) return undefined;
+          const row = raw[idx] as Record<string, unknown>;
+          return {
+            // Same loader default as everywhere else: a legacy row omitting cliId
+            // means claude-code, not "no selection".
+            cliId: (row.cliId ?? LEGACY_DEFAULT_CLI_ID) as typeof selected.cliId,
+            wrapperCli: row.wrapperCli as string | undefined,
+            cliRuntime: row.cliRuntime as CliRuntimeConfig | undefined,
+            cliPathOverride: row.cliPathOverride as string | undefined,
+          };
+        } catch {
+          // Never degrade to "unchanged": that is the fail-open this guards.
+          return 'unreadable';
+        }
+      },
+    });
 
     const selectionKey = selectionKeyForBot(selected.cliId, selected.wrapperCli);
     jsonRes(res, 200, {
@@ -4259,7 +4307,8 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
       // Report the (possibly auto-cleared) read-isolation state + whether the new
       // agent can still enforce it, so the dashboard updates its toggle immediately
       // instead of showing a stale enabled/supported state until a full refetch.
-      readIsolation: bot.config.readIsolation === true,
+      // Reported from the committed entry, same source the live config mirrors.
+      readIsolation: committedReadIsolation,
       readIsolationSupported: readIsolationEnforceableFor(bot.config),
       readIsolationCleared,
       agentAvailable,

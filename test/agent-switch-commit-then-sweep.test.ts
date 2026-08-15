@@ -31,6 +31,7 @@ import {
 import * as workerPool from '../src/core/worker-pool.js';
 import * as sessionStore from '../src/services/session-store.js';
 import { sessionKey } from '../src/core/types.js';
+import { rmwBotEntry } from '../src/services/config-store.js';
 
 let handle: IpcServerHandle | undefined;
 
@@ -188,34 +189,110 @@ describe('agent switch — commit then sweep', () => {
     });
   });
 
-  it('a writer landing during the sweep cannot make the sweep close a correct session', async () => {
-    // A->B requested; an external writer commits C while the sweep is running. The
-    // session is frozen on C. Because the sweep re-reads the committed authority
-    // per session, C is not stale and must survive.
+  // A CROSS-PROCESS writer commits during the sweep.
+  //
+  // Crucially this does NOT hand-sync `getBot().config`: another daemon writing
+  // bots.json cannot touch this process's memory, and an earlier version of this
+  // test did sync it by hand — which hid a real bug, because the sweep was judging
+  // closes by that in-memory mirror. Removing the one manual line turned it red.
+  // So the writer here only does what a real one can: a locked write to disk.
+  const sweepRaceCase = (label: string, inRegistry: boolean) => {
+    it(label, async () => {
+      await withBot({ cliId: 'claude-code', model: 'old-model' }, async (ctx) => {
+        const sessionId = sessionStore.listSessions()[0].sessionId;
+        const original = agentSwitchCloseHook.run;
+        agentSwitchCloseHook.run = async (...args: Parameters<typeof original>) => {
+          // Real locked read-modify-write, i.e. exactly what another daemon does.
+          // Deliberately no getBot() update: it is another process.
+          await rmwBotEntry(ctx.appId, (entry: any) => {
+            entry.cliId = 'traex';
+            return { write: true, result: null };
+          });
+          return original(...args);
+        };
+        try {
+          const res = await ctx.put({ cliId: 'codex', model: 'new-model' });
+          expect(res.status).toBe(200);
+        } finally {
+          agentSwitchCloseHook.run = original;
+        }
+
+        // Disk is C; the session is frozen on C, so C endorses it. Closing it would
+        // be the unrecoverable error, and no response code could undo it.
+        expect(ctx.rows()[0].cliId, 'the other writer must have won on disk').toBe('traex');
+        expect(
+          sessionStore.getSession(sessionId)!.status,
+          'a session the DURABLE authority endorses must never be closed',
+        ).toBe('active');
+      }, { frozenCliId: 'traex', inRegistry });
+    });
+  };
+  sweepRaceCase(
+    'a cross-process commit during the sweep does not close a now-correct session (registry)',
+    true,
+  );
+  sweepRaceCase(
+    'a cross-process commit during the sweep does not close a now-correct session (durable-only)',
+    false,
+  );
+
+  it('stops the whole sweep once disk diverges, rather than closing more rows', async () => {
+    // "Miss rather than mis-close": with the authority no longer matching what we
+    // committed, no remaining row may be closed either — the newer writer's own
+    // sweep and armCliMismatchResweep converge instead.
     await withBot({ cliId: 'claude-code', model: 'old-model' }, async (ctx) => {
+      // A second stale session, so there IS a remaining row after the first.
+      const extra = sessionStore.createSession('oc_extra', 'om_extra', 'extra', 'group');
+      extra.larkAppId = ctx.appId;
+      extra.cliId = 'claude-code' as any;
+      extra.agentFrozen = true;
+      sessionStore.updateSession(extra);
+
       const original = agentSwitchCloseHook.run;
       agentSwitchCloseHook.run = async (...args: Parameters<typeof original>) => {
-        // Plain file edit + live-config update, i.e. what another daemon's commit
-        // looks like from this process's point of view.
-        const rows = ctx.rows();
-        rows[0].cliId = 'traex';
-        writeFileSync(ctx.configPath, JSON.stringify(rows, null, 2));
-        getBot(ctx.appId).config.cliId = 'traex' as any;
+        await rmwBotEntry(ctx.appId, (entry: any) => {
+          entry.cliId = 'traex';
+          return { write: true, result: null };
+        });
         return original(...args);
       };
-      let sessionId: string;
       try {
-        sessionId = sessionStore.listSessions()[0].sessionId;
         const res = await ctx.put({ cliId: 'codex', model: 'new-model' });
         expect(res.status).toBe(200);
+        expect(await res.json()).toMatchObject({ closedMismatchedSessions: 0 });
+      } finally {
+        agentSwitchCloseHook.run = original;
+      }
+      // Both rows survive: stale relative to what WE wrote, but we no longer own
+      // the authority, so we close nothing.
+      for (const row of sessionStore.listSessions()) {
+        expect(row.status, `${row.sessionId} must be left to the newer writer`).toBe('active');
+      }
+    }, { frozenCliId: 'claude-code' });
+  });
+
+  it('stops the sweep when the durable authority cannot be read', async () => {
+    await withBot({ cliId: 'claude-code', model: 'old-model' }, async (ctx) => {
+      const sessionId = sessionStore.listSessions()[0].sessionId;
+      const original = agentSwitchCloseHook.run;
+      agentSwitchCloseHook.run = async (...args: Parameters<typeof original>) => {
+        // Corrupt the file after the commit: the sweep can no longer prove that a
+        // close is justified.
+        writeFileSync(ctx.configPath, '{ not json');
+        return original(...args);
+      };
+      try {
+        const res = await ctx.put({ cliId: 'codex', model: 'new-model' });
+        expect(res.status).toBe(200);
+        expect(await res.json()).toMatchObject({ closedMismatchedFailed: 1 });
       } finally {
         agentSwitchCloseHook.run = original;
       }
       expect(
-        sessionStore.getSession(sessionId!)!.status,
-        'a session matching the committed authority must never be closed',
+        sessionStore.getSession(sessionId)!.status,
+        'an unreadable authority must not license a close',
       ).toBe('active');
-    }, { frozenCliId: 'traex' });
+    }, { frozenCliId: 'claude-code' });
   });
 
   it('still closes a session the committed authority marks as stale', async () => {
@@ -280,6 +357,47 @@ describe('agent switch — commit then sweep', () => {
         'the persisted path must be preserved from the locked row',
       ).toBe('/opt/legacy/vendor-codex');
       expect(await res.json()).toMatchObject({ cliPathOverride: '/opt/legacy/vendor-codex' });
+    });
+  });
+
+  it('mirrors the COMMITTED readIsolation into the live config, not a re-derivation', async () => {
+    // The live mirror was only written when the transaction CLEARED the flag, so a
+    // row that legitimately kept `true` could leave this process reporting/serving
+    // `false` until a full refetch.
+    await withBot({ cliId: 'claude-code', model: 'old-model', readIsolation: true }, async (ctx) => {
+      // Drift the mirror away from disk, which is what a partially applied reload
+      // or another code path can leave behind.
+      (getBot(ctx.appId).config as any).readIsolation = false;
+
+      const res = await ctx.put({ cliId: 'claude-code', model: 'new-model' });
+      expect(res.status).toBe(200);
+      // Disk still enforces it…
+      expect(ctx.rows()[0].readIsolation).toBe(true);
+      // …so both the live config and the response must say so.
+      expect(
+        getBot(ctx.appId).config.readIsolation,
+        'the live mirror must follow the committed entry',
+      ).toBe(true);
+      expect(await res.json()).toMatchObject({ readIsolation: true });
+    });
+  });
+
+  it('mirrors the COMMITTED backendType into the live config, not a re-derivation', async () => {
+    // The old code decided the live value from the pre-request `bot.config`, so a
+    // manual non-remote override that only existed on disk was dropped from the
+    // mirror while the entry kept it.
+    await withBot({ cliId: 'claude-code', model: 'old-model', backendType: 'tmux' }, async (ctx) => {
+      delete (getBot(ctx.appId).config as any).backendType;
+
+      const res = await ctx.put({ cliId: 'codex', model: 'new-model' });
+      expect(res.status).toBe(200);
+      // A manual, non-remote override must survive an agent switch…
+      expect(ctx.rows()[0].backendType).toBe('tmux');
+      // …and the mirror must agree with it.
+      expect(
+        getBot(ctx.appId).config.backendType,
+        'the live mirror must follow the committed entry',
+      ).toBe('tmux');
     });
   });
 

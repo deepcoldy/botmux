@@ -464,32 +464,52 @@ async function closeActiveSessionIfCliMismatch(ds: DaemonSession): Promise<CliMi
  * A `closed_with_residual` does NOT block the commit: the local row IS closed, so
  * nothing can route to it. Its surviving remote id is reported for manual cleanup.
  */
+/**
+ * Durable authority guard for the post-commit sweep.
+ *
+ * `getBot().config` is a PER-PROCESS mirror. Another daemon committing to
+ * bots.json does not update it, so judging closes by it means judging by a value
+ * that may already be wrong — the sweep would then close a session that the
+ * durable config actually endorses, which no later response code can undo.
+ */
+export interface SweepAuthorityGuard {
+  /** Reads the DURABLE authority: undefined if the row is gone, 'unreadable' on failure. */
+  read: () => Promise<CliMismatchTargetConfig | undefined | 'unreadable'>;
+  /** What this request committed. The sweep stops as soon as disk diverges from it. */
+  committed: CliMismatchTargetConfig;
+}
+
 export async function closeSessionsForAgentSwitch(
   larkAppId: string,
   /**
-   * Optional explicit target. The agent-switch route deliberately omits it and
-   * runs this AFTER its commit, so every decision below is made against the
-   * authority that is already durable.
-   *
-   * WHY THIS RUNS AFTER THE COMMIT
-   * ------------------------------
-   * Closing sessions before the commit put an irreversible action inside the
-   * transaction window: the proposal had to stay valid across a close that takes
-   * seconds for remote CLIs, while the bots.json lock cannot be held that long
-   * (it is not reentrant). Every attempt to police that window leaked —
-   * lost updates, a partially covered identity axis, stale targets, cross-process
-   * writes, ABA on a content hash, and a read->close TOCTOU — because bots.json
-   * is also editable by hand and by older daemons, so no cooperative protocol
-   * (counter, lease, reservation) can be relied on. Closing after the commit
-   * removes the window instead of guarding it: the config on disk is already the
-   * new truth, so a close can only ever be justified by it.
-   *
-   * Consequence: a message could still reach a session on the old engine between
-   * the commit and this sweep. `withBotTurnMutation` holds admission for this bot
-   * across both, and anything that slips through is RECOVERABLE — the resweep
-   * closes it — unlike killing a session that was correct, which is not.
+   * Explicit target for callers that already hold one (and for unit tests). The
+   * agent-switch route passes `authority` instead.
    */
   target?: CliMismatchTargetConfig,
+  /**
+   * Supplied by the agent-switch route, which runs this AFTER its atomic commit.
+   *
+   * WHY THE COMMITTED CONFIG IS NOT ENOUGH ON ITS OWN
+   * -------------------------------------------------
+   * Closing before the commit put an irreversible action inside the transaction
+   * window and leaked six different ways. Closing after the commit fixes that, but
+   * only if "committed" means DURABLE: this process's in-memory mirror is not
+   * cross-process truth, and a writer landing right after our commit makes it
+   * stale, so a sweep driven by it closes sessions the new config endorses.
+   *
+   * So every close is re-justified against the row on disk, and the moment disk
+   * stops matching what we committed the sweep STOPS — "miss rather than
+   * mis-close". Convergence is not lost: whoever committed that newer authority
+   * runs its own commit-then-sweep, and `armCliMismatchResweep` retries.
+   *
+   * Residual, stated honestly: the decision is correct when made, against durable
+   * state, but a close takes time (seconds for a remote CLI) and disk can change
+   * during it. Eliminating that too requires either a per-bot fence honoured by
+   * EVERY writer — unreachable while bots.json stays hand-editable — or moving
+   * convergence to turn admission. What this rules out is the far worse case of
+   * deciding against state that was already wrong.
+   */
+  authority?: SweepAuthorityGuard,
 ): Promise<{
   ok: boolean;
   closed: number;
@@ -497,19 +517,61 @@ export async function closeSessionsForAgentSwitch(
   failed: number;
   residualTaskIds: string[];
 }> {
-  /**
-   * The committed authority, re-read per session rather than captured once.
-   *
-   * `getBot().config` is updated from the same transaction that wrote bots.json,
-   * so this is the value the bot actually launches with now.
-   */
-  const currentTarget = (): CliMismatchTargetConfig | undefined => {
-    if (target) return target;
-    try { return getBot(larkAppId).config; } catch { return undefined; }
-  };
   const registry = getActiveSessionsRegistry();
   const out = { ok: true, closed: 0, residual: 0, failed: 0, residualTaskIds: [] as string[] };
   const seen = new Set<string>();
+
+  /** Set once disk diverges (or cannot be trusted): no further row may be closed. */
+  let sweepAborted = false;
+
+  /**
+   * The authority a close may be justified by, re-read per session.
+   *
+   * Returns undefined to skip this row. Never falls back to the in-memory mirror
+   * when a durable read fails: that is the fail-open that reintroduces the bug.
+   */
+  const authorityForClose = async (
+    sessionId: string,
+  ): Promise<CliMismatchTargetConfig | undefined> => {
+    if (target) return target;
+    if (!authority) {
+      // No guard supplied (non-route caller): the live config is all such callers
+      // have, and they are not racing an irreversible switch.
+      try { return getBot(larkAppId).config; } catch { return undefined; }
+    }
+    if (sweepAborted) return undefined;
+    const disk = await authority.read();
+    if (disk === 'unreadable') {
+      sweepAborted = true;
+      out.failed++;
+      out.ok = false;
+      logger.error(
+        `[${sessionId.substring(0, 8)}] agent switch sweep: cannot read the durable authority; `
+        + 'stopping the sweep instead of closing on a guess',
+      );
+      return undefined;
+    }
+    if (!disk) {
+      sweepAborted = true;
+      logger.warn(
+        `[${sessionId.substring(0, 8)}] agent switch sweep: the bot row disappeared; stopping the `
+        + 'sweep (nothing on disk can justify a close)',
+      );
+      return undefined;
+    }
+    if (!sameRuntimeIdentity(disk, authority.committed)) {
+      // Someone committed a different agent after us. Sessions are stale or fresh
+      // relative to THAT, not to what we wrote, so stop and let its own sweep and
+      // the resweep converge.
+      sweepAborted = true;
+      logger.warn(
+        `[${sessionId.substring(0, 8)}] agent switch sweep: the durable authority changed after our `
+        + 'commit; stopping the sweep so the newer writer converges it',
+      );
+      return undefined;
+    }
+    return disk;
+  };
 
   const recordClose = (
     sessionId: string,
@@ -541,7 +603,7 @@ export async function closeSessionsForAgentSwitch(
     if (ds.adoptedFrom || ds.session.adoptedFrom || ds.session.title?.startsWith('Adopt:')) continue;
     // Compared against the COMMITTED config (see currentTarget), which is what
     // the bot launches with from now on.
-    const dsTarget = currentTarget();
+    const dsTarget = await authorityForClose(ds.session.sessionId);
     if (!dsTarget || !sessionMismatchesTargetCli(ds, dsTarget)) continue;
     // A protected owner is NOT an exemption like adopt/queued: it is a session
     // that would keep running the old agent and cannot be closed right now, so it
@@ -606,7 +668,7 @@ export async function closeSessionsForAgentSwitch(
   for (const row of storedRows) {
     if (row.queued) continue;
     if (row.adoptedFrom || row.title?.startsWith('Adopt:')) continue;
-    const rowTarget = currentTarget();
+    const rowTarget = await authorityForClose(row.sessionId);
     if (!rowTarget || !sessionRowMismatchesTargetCli(row, rowTarget)) continue;
     if (hasProtectedSessionMutationOwnership(row)) {
       out.failed++;
