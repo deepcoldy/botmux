@@ -8,5 +8,16 @@
 export const MOJO_CLI_TIMEOUT_MS = 60_000;
 export const MOJO_DESTROY_SETTLE_MS = 8_000;
 export const MOJO_EXPLICIT_CLOSE_RESULT_TIMEOUT_MS = 75_000;
+/**
+ * Budget for PROVING the local mojo child is gone during an explicit close.
+ *
+ * SIGTERM alone is not proof: a child that ignores it keeps running while the row
+ * is published as closed, and a closed row is filtered out of the device-isolation
+ * inventory — so the blocker disappears with the process still alive. Split as
+ * SIGTERM grace, then SIGKILL, then a final wait.
+ */
+export const MOJO_CHILD_TERMINATION_PROOF_MS = 2_000;
+
 export const MOJO_EXPLICIT_CLOSE_HEADROOM_MS =
-  MOJO_EXPLICIT_CLOSE_RESULT_TIMEOUT_MS - MOJO_CLI_TIMEOUT_MS - MOJO_DESTROY_SETTLE_MS;
+  MOJO_EXPLICIT_CLOSE_RESULT_TIMEOUT_MS - MOJO_CLI_TIMEOUT_MS - MOJO_DESTROY_SETTLE_MS
+  - MOJO_CHILD_TERMINATION_PROOF_MS;

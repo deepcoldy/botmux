@@ -17039,9 +17039,22 @@ process.on('message', async (raw: unknown) => {
               result = { ok: false, error: 'remote_close_unsupported' };
             } else {
               const raw = await backend.destroySession();
-              result = raw && typeof raw === 'object' && 'ok' in raw
+              const structured = raw && typeof raw === 'object' && 'ok' in raw;
+              // Local multiplexers legitimately return void: their destroy is a
+              // synchronous, already-completed teardown, so "no result" really
+              // does mean success and must keep defaulting to ok:true.
+              //
+              // Remote backends (mojo, riff) are the opposite. Their teardown is
+              // an asynchronous cancellation that can only be reported through
+              // SessionDestroyResult, so a missing or malformed result is an
+              // UNKNOWN outcome -- and treating unknown as success is what lets
+              // the daemon publish a closed row while a credentialed remote
+              // session (and its local mojo child) keeps running.
+              result = structured
                 ? raw as SessionDestroyResult
-                : { ok: true };
+                : isRemoteBackendType(effectiveBackendType)
+                  ? { ok: false, error: 'remote_close_result_missing' }
+                  : { ok: true };
             }
           } catch (err) {
             result = { ok: false, error: err instanceof Error ? err.message : String(err) };

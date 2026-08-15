@@ -407,7 +407,20 @@ export function mergePersistedDeviceIsolationSessions(
       || !!session.persistentBackendTarget
       || isPersistentBackend(frozenBackend ?? 'unknown')
       || (typeof session.pid === 'number' && session.pid > 0)
-      || !!session.cliSessionId;
+      || !!session.cliSessionId
+      // mojo is NOT in isPersistentBackend (it is no local multiplexer), so a
+      // mojo row whose pid was cleared by a daemon restart and whose lineage
+      // never reached cliSessionId used to match none of the clauses above and
+      // was dropped from the inventory entirely -- silently removing its
+      // blocker. But MojoBackend.runTurn spawns a credentialed local child every
+      // turn, so an active mojo row is exactly the "possibly-live local
+      // resource" this merge exists to surface.
+      //
+      // This only forces the row to be CONSIDERED. Genuinely fully-remote mojo
+      // sessions are still exempted downstream by isMojoFullyRemote, so this
+      // widens the proof, it does not blanket-block cloud mojo.
+      || frozenBackend === 'mojo'
+      || !!session.mojoIdentity;
     if (!hasDurableLocalEvidence) continue;
     merged.push({
       sessionId: session.sessionId,
@@ -461,7 +474,17 @@ function defaultRuntimeSessions(): DeviceIsolationRuntimeSession[] {
   });
   // sessionStore is initialized for this daemon's own bot partition. Do not
   // scan sibling files: every daemon proves only the local resources it owns.
-  const merged = mergePersistedDeviceIsolationSessions(runtime, sessionStore.listSessions());
+  //
+  // listSessionsStrict, NOT listSessions: the compatible reader swallows a
+  // read/parse failure and returns an empty Map, so a corrupt store made the
+  // isolation proof run against an empty world and prepare answered 200. Strict
+  // throws SessionStoreUnavailableError, which prepareDeviceIsolationActivation
+  // already converts into `503 inventory_unavailable`.
+  //
+  // Same principle this module already applies to the quarantine ledger via
+  // QUARANTINE_UNREADABLE_SENTINEL: unreadable durable state must fail CLOSED,
+  // because "cannot read" is not "nothing there".
+  const merged = mergePersistedDeviceIsolationSessions(runtime, sessionStore.listSessionsStrict());
   return appendResidualMojoLauncherEnvSessions(merged);
 }
 

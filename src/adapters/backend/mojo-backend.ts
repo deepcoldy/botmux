@@ -76,7 +76,7 @@ import type {
     MojoLineStyle,
     MojoStreamEvent,
 } from './mojo-types.js';
-import { MOJO_CLI_TIMEOUT_MS, MOJO_DESTROY_SETTLE_MS } from './mojo-budgets.js';
+import { MOJO_CLI_TIMEOUT_MS, MOJO_DESTROY_SETTLE_MS, MOJO_CHILD_TERMINATION_PROOF_MS } from './mojo-budgets.js';
 
 /** mojo silently drops an agent clarifying question in headless mode and marks
  *  the turn cancelled. Matching this is the difference between a helpful nudge
@@ -472,6 +472,61 @@ export class MojoBackend implements SessionBackend {
     getPaneSize(): { cols: number; rows: number } | null { return null; }
     getChildPid(): number | null { return this.child?.pid ?? null; }
 
+    /**
+     * SIGTERM, then PROVE the child is gone (escalating to SIGKILL).
+     *
+     * `child.kill('SIGTERM')` returning true only means the signal was delivered.
+     * A child that ignores it keeps executing with the injected credential while
+     * the explicit close publishes the row as `closed` — and a closed row is
+     * filtered out of the device-isolation inventory
+     * (mergePersistedDeviceIsolationSessions), so the blocker vanishes with the
+     * process still alive. That is exactly the state this backend must never
+     * report as a successful teardown.
+     *
+     * Returns false when termination could not be proven; the caller must then
+     * refuse the close rather than let the row be published as closed.
+     */
+    private async terminateChildProven(): Promise<boolean> {
+        const child = this.child;
+        this.child = null;
+        if (!child) return true;
+        // Already reaped by the runtime: exitCode/signalCode are set only after the
+        // process actually ended, so this IS proof.
+        if (child.exitCode !== null || child.signalCode !== null) return true;
+
+        const exited = new Promise<boolean>(resolve => {
+            const done = (): void => resolve(true);
+            child.once('exit', done);
+            child.once('close', done);
+            // A child that is already gone but whose 'exit' fired before we
+            // subscribed would otherwise hang until the timeout.
+            if (child.exitCode !== null || child.signalCode !== null) resolve(true);
+        });
+        const grace = Math.max(1, Math.floor(MOJO_CHILD_TERMINATION_PROOF_MS / 2));
+
+        try { child.kill('SIGTERM'); } catch { /* already gone */ }
+        const afterTerm = await Promise.race([
+            exited,
+            new Promise<false>(r => setTimeout(() => r(false), grace).unref?.()),
+        ]);
+        if (afterTerm) return true;
+
+        // Escalate. SIGKILL cannot be caught, so a still-running process after this
+        // means we genuinely cannot prove anything (e.g. uninterruptible state).
+        try { child.kill('SIGKILL'); } catch { /* already gone */ }
+        const afterKill = await Promise.race([
+            exited,
+            new Promise<false>(r => setTimeout(() => r(false), MOJO_CHILD_TERMINATION_PROOF_MS - grace).unref?.()),
+        ]);
+        if (!afterKill) {
+            logger.error(
+                `[mojo] child pid ${child.pid ?? '?'} survived SIGTERM+SIGKILL; refusing to report `
+                + 'the close as successful (a closed row would drop the device-isolation blocker)',
+            );
+        }
+        return afterKill;
+    }
+
     kill(): void {
         if (this.killed) return;
         this.killed = true;
@@ -514,14 +569,23 @@ export class MojoBackend implements SessionBackend {
         // Budget sits under the worker's own close/restart race (see
         // RiffBackend.destroySession for the layered deadlines).
         this.closing = true;
-        if (this.child && !this.cliSessionId) {
+        // Gate on "a turn was dispatched and its lineage has not arrived", NOT on
+        // `this.child`. Keying it on a live child meant a mojo that accepted the
+        // write and then exited before emitting `system/init` skipped the wait
+        // entirely — and with cliSessionId still null the cancel below was skipped
+        // too, so this returned ok:true for a remote session we cannot even name.
+        // `prepareShutdownDetach` already uses this exact predicate
+        // (`lineageExpected`); the two protocols must agree about what "proven
+        // gone" means.
+        const lineageExpected = this.acceptedWriteWithoutLineage;
+        if (lineageExpected && !this.cliSessionId) {
             await Promise.race([
                 this.writeChain.catch(() => undefined),
                 new Promise<void>(r => setTimeout(r, this.destroySettleMs).unref?.()),
             ]);
         }
-        this.child?.kill('SIGTERM');
-        this.child = null;
+        // SIGTERM is not proof — see terminateChildProven.
+        const childTerminated = await this.terminateChildProven();
         if (this.cliSessionId) {
             let outcome: MojoCancelOutcome;
             try {
@@ -547,6 +611,26 @@ export class MojoBackend implements SessionBackend {
                     error: outcome.kind === 'failed' ? outcome.message : 'cancel not proven',
                 };
             }
+        }
+        // A turn was dispatched but its lineage never materialised: there may be a
+        // remote session we have no id for, so we cannot claim it is gone. Same
+        // verdict prepareShutdownDetach reaches from the same state.
+        if (lineageExpected && !this.cliSessionId) {
+            this.closing = false;
+            // taskId is deliberately omitted rather than null: SessionDestroyResult
+            // types it as an optional string, and "absent" is the honest answer —
+            // there is no id to hand back for retry.
+            return { ok: false, error: 'mojo_lineage_not_materialized' };
+        }
+        // The local child could not be proven dead. Refusing here keeps the durable
+        // row active, which is what keeps the device-isolation blocker in place.
+        if (!childTerminated) {
+            this.closing = false;
+            return {
+                ok: false,
+                ...(this.cliSessionId ? { taskId: this.cliSessionId } : {}),
+                error: 'mojo_local_child_termination_unproven',
+            };
         }
         this.killed = true;
         return { ok: true, ...(this.cliSessionId ? { taskId: this.cliSessionId } : {}) };

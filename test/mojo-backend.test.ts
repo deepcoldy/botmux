@@ -25,17 +25,27 @@ import {
   MOJO_EXPLICIT_CLOSE_RESULT_TIMEOUT_MS,
   MOJO_CLI_TIMEOUT_MS,
   MOJO_DESTROY_SETTLE_MS,
+  MOJO_CHILD_TERMINATION_PROOF_MS,
 } from '../src/adapters/backend/mojo-budgets.js';
 import type { EffectiveMojoConfig } from '../src/adapters/backend/mojo-types.js';
 
 let binDir: string;
 
 describe('Mojo close budgets', () => {
-  it('keeps enough daemon headroom above settle plus CLI cancellation', () => {
+  it('keeps enough daemon headroom above settle, CLI cancellation and kill proof', () => {
+    // The worker-side deadline must still bound every step the backend can take:
+    // waiting for the lineage, cancelling remotely, and PROVING the local child is
+    // gone (SIGTERM -> SIGKILL). Leaving the termination proof out of this sum is
+    // how a step silently eats the headroom.
     expect(MOJO_EXPLICIT_CLOSE_RESULT_TIMEOUT_MS).toBe(
-      MOJO_DESTROY_SETTLE_MS + MOJO_CLI_TIMEOUT_MS + MOJO_EXPLICIT_CLOSE_HEADROOM_MS,
+      MOJO_DESTROY_SETTLE_MS
+      + MOJO_CLI_TIMEOUT_MS
+      + MOJO_CHILD_TERMINATION_PROOF_MS
+      + MOJO_EXPLICIT_CLOSE_HEADROOM_MS,
     );
     expect(MOJO_EXPLICIT_CLOSE_HEADROOM_MS).toBeGreaterThanOrEqual(5_000);
+    // Long enough for a graceful exit, short enough that it cannot dominate.
+    expect(MOJO_CHILD_TERMINATION_PROOF_MS).toBeGreaterThanOrEqual(1_000);
   });
 });
 
