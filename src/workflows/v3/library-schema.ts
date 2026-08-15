@@ -24,7 +24,7 @@ import { assertSavedWorkflowTemplateBindings } from './template-bindings.js';
 export { canonicalJsonStringify } from '../../utils/canonical-json.js';
 
 export const SAVED_WORKFLOW_METADATA_SCHEMA_VERSION = 1 as const;
-export const SAVED_WORKFLOW_REVISION_SCHEMA_VERSION = 1 as const;
+export const SAVED_WORKFLOW_REVISION_SCHEMA_VERSION = 2 as const;
 
 export const SAVED_WORKFLOW_ID_RE = /^wf_[0-9a-f]{32}$/;
 export const SAVED_WORKFLOW_REVISION_ID_RE = /^rev_[0-9a-f]{64}$/;
@@ -87,6 +87,8 @@ export type SavedWorkflowBuiltinContextRef =
   | 'initiatorOpenId';
 
 export interface V3DagTemplate {
+  /** Missing/1 is a legacy selector-based template; new revisions require 2. */
+  schemaVersion?: 1 | 2;
   nodes: V3Node[];
 }
 
@@ -400,7 +402,11 @@ export function validateDagTemplate(raw: unknown): V3DagTemplate {
   }
   let nodes: V3Node[];
   try {
-    nodes = validateDag({ runId: 'saved-template', nodes: raw.nodes }).nodes;
+    nodes = validateDag({
+      ...(raw.schemaVersion !== undefined ? { schemaVersion: raw.schemaVersion } : {}),
+      runId: 'saved-template',
+      nodes: raw.nodes,
+    }).nodes;
   } catch (err) {
     if (err instanceof DagValidationError) throw new SavedWorkflowSchemaError(err.problems.map((p) => `dagTemplate: ${p}`));
     throw err;
@@ -415,7 +421,10 @@ export function validateDagTemplate(raw: unknown): V3DagTemplate {
   // before the lint existed. The policy check runs only at authoring boundaries
   // (buildSavedWorkflowRevisionBaseline / validateSavedWorkflowRevisionDraft /
   // v2 migration) via assertNoSavedWorkflowChatSideEffects.
-  return { nodes };
+  return {
+    ...(raw.schemaVersion !== undefined ? { schemaVersion: raw.schemaVersion as 1 | 2 } : {}),
+    nodes,
+  };
 }
 
 function validateDirectBotSelectors(
@@ -717,6 +726,11 @@ export function validateSavedWorkflowRevisionDraft(raw: unknown): SavedWorkflowR
   // validateSavedWorkflowRevisionPayload so the READ path (loadSavedWorkflowRevision)
   // never applies the policy to already-saved revisions.
   assertNoSavedWorkflowChatSideEffects(normalized.dagTemplate);
+  if (normalized.dagTemplate.schemaVersion !== 2) {
+    throw new SavedWorkflowSchemaError([
+      'new Saved Workflow revision requires dagTemplate.schemaVersion=2 and stable outputs/output keys',
+    ]);
+  }
   const {
     workflowId: _workflowId,
     humanVersion: _humanVersion,
@@ -751,7 +765,11 @@ type RevisionMigration = (payload: unknown) => unknown;
  * Read migrations are pure and one-way. Immutable files are never rewritten;
  * future schema bumps add `N: payload => payloadV(N+1)` entries here.
  */
-const REVISION_MIGRATIONS: Readonly<Partial<Record<number, RevisionMigration>>> = Object.freeze({});
+const REVISION_MIGRATIONS: Readonly<Partial<Record<number, RevisionMigration>>> = Object.freeze({
+  // v2 changes the authoring boundary, not historical bytes. Old revisions
+  // remain selector-based and executable; no output contracts are invented.
+  1: (payload) => payload,
+});
 
 export function migrateSavedWorkflowRevisionPayload(
   schemaVersion: number,

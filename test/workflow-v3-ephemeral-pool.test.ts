@@ -435,7 +435,7 @@ describe('v3 ephemeral pool', () => {
     expect(worker.rawInputs[0]).toContain(`$${GOAL_ENV.GOAL_PATH}`);
     expect(worker.rawInputs[0]).toContain(`$${GOAL_ENV.MANIFEST_PATH}`);
     expect(worker.rawInputs[0]).not.toContain(GOAL_ENV.INPUTS_PATH);
-    expect(worker.rawInputs[0]).not.toContain(GOAL_ENV.OUTPUT_DIR);
+    expect(worker.rawInputs[0]).toContain(`$${GOAL_ENV.OUTPUT_DIR}`);
     worker.emitExit(0);
     await promise;
   });
@@ -525,7 +525,9 @@ describe('v3 ephemeral pool', () => {
     const cmd = buildGoalCommand(request());
     expect(cmd.startsWith(`${GOAL_COMMAND} `)).toBe(true);
     expect(cmd).toContain(`$${GOAL_ENV.GOAL_PATH}`);
+    expect(cmd).toContain(`$${GOAL_ENV.OUTPUT_DIR}`);
     expect(cmd).toContain(`$${GOAL_ENV.MANIFEST_PATH}`);
+    expect(cmd).toContain('manifest paths are relative to output dir');
     expect(cmd).not.toContain(request().env[GOAL_ENV.GOAL_PATH]);
     expect(cmd).not.toContain('schemaVersion');
     expect(cmd).not.toContain('status:"ok"');

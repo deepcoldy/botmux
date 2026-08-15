@@ -5394,6 +5394,7 @@ workflowDaemonMutationRoute('retry', async (reply, params, body, identity) => {
         outcome.reason === 'missing' ? 'unknown_run'
         : outcome.reason === 'loop-node' ? 'loop_node_use_grant'
         : outcome.reason === 'host-effect-uncertain' ? 'host_effect_reconcile_required'
+        : outcome.reason === 'revise-workflow-required' ? 'workflow_revision_required'
         : 'not_blocked',
     });
   }

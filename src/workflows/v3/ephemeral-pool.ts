@@ -484,7 +484,7 @@ async function runNodeImpl(
 
 export function buildGoalCommand(req: RunNodeRequest): string {
   const env = GOAL_ENV;
-  return `${GOAL_COMMAND} Read $${env.GOAL_PATH} and complete it. You are done only when $${env.MANIFEST_PATH} and all files it lists exist.`;
+  return `${GOAL_COMMAND} Read $${env.GOAL_PATH}. Write files in $${env.OUTPUT_DIR} and manifest at $${env.MANIFEST_PATH}; manifest paths are relative to output dir. Complete it.`;
 }
 
 function defaultWorkerPath(): string {

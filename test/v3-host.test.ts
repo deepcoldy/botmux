@@ -150,7 +150,7 @@ function okArchitectDeps(): ArchitectDeps {
       notesPath: join(input.runDir, 'architect/attempts/001/work/architect-notes.md'),
       manifestPath: join(input.runDir, 'architect/attempts/001/manifest.json'),
     }),
-    loadDag: () => ({ runId: 'r', nodes: [] }),
+    loadDag: () => ({ schemaVersion: 2, runId: 'r', nodes: [] }),
     botSnapshot: DUMMY_BOT,
     resolveLarkAppSecret: () => undefined,
   };
@@ -238,7 +238,7 @@ describe('host — architect（codex 3 断言）', () => {
       const { runDir } = hostNew({ goal: 'g', baseDir: b, runId: 'r' });
       const deps: ArchitectDeps = {
         runArchitect: async () => { throw new Error('不该被调用'); },
-        loadDag: () => ({}),
+        loadDag: () => ({ schemaVersion: 2 }),
         botSnapshot: DUMMY_BOT,
         resolveLarkAppSecret: () => undefined,
       };
@@ -259,7 +259,7 @@ describe('host — architect（codex 3 断言）', () => {
           notesPath: join(input.runDir, 'architect/attempts/001/work/architect-notes.md'),
           manifestPath: join(input.runDir, 'architect/attempts/001/manifest.json'),
         }),
-        loadDag: () => ({ runId: 'r', nodes: [] }), // 校验通过（不抛）
+        loadDag: () => ({ schemaVersion: 2, runId: 'r', nodes: [] }), // 校验通过（不抛）
         botSnapshot: DUMMY_BOT,
         resolveLarkAppSecret: () => undefined,
       };
@@ -359,6 +359,30 @@ describe('host — architect（codex 3 断言）', () => {
     }
   });
 
+  it('Architect 生成 legacy DAG 时拒绝进入 dag_ready', async () => {
+    const b = base();
+    try {
+      const { runDir } = toApprovedSpec(b);
+      const deps: ArchitectDeps = {
+        runArchitect: async (input) => ({
+          status: 'ok',
+          dagPath: join(input.runDir, 'dag.json'),
+          notesPath: join(input.runDir, 'notes.md'),
+          manifestPath: join(input.runDir, 'manifest.json'),
+        }),
+        loadDag: () => ({ runId: 'legacy', nodes: [] }),
+        botSnapshot: DUMMY_BOT,
+        resolveLarkAppSecret: () => undefined,
+      };
+
+      const out = await hostArchitect(runDir, deps);
+      expect(out).toMatchObject({ ok: false, state: { status: 'spec_approved' } });
+      expect(out.problems).toContain('architect dag.json must use schemaVersion 2');
+    } finally {
+      rmSync(b, { recursive: true, force: true });
+    }
+  });
+
   it('并发 architect 共享 run 级 async transaction：attempt001 只启动一个 worker，竞争调用明确 busy', async () => {
     const b = base();
     let releaseWorker: () => void = () => {};
@@ -417,7 +441,7 @@ describe('host — approve-dag（gate-2）', () => {
           notesPath: join(input.runDir, 'notes.md'),
           manifestPath: join(input.runDir, 'manifest.json'),
         }),
-        loadDag: () => ({}),
+        loadDag: () => ({ schemaVersion: 2 }),
         botSnapshot: DUMMY_BOT,
         resolveLarkAppSecret: () => undefined,
       };

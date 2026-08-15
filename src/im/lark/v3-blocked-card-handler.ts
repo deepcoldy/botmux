@@ -125,6 +125,7 @@ export async function handleV3BlockedAction(
           : outcome.reason === 'stale-attempt' ? '该节点已进入新一轮 attempt，这张旧卡失效（看最新那张卡）'
           : outcome.reason === 'invalid-answer' ? '这个选项不属于当前问题，卡片已失效'
           : outcome.reason === 'host-effect-uncertain' ? '该节点可能已产生外部副作用，禁止普通重试；请先完成 host effect 对账'
+          : outcome.reason === 'revise-workflow-required' ? '产物契约与 Workflow 定义不一致，禁止普通重试；请修订并发布新版本'
           : `该节点已不在受阻状态，${verb}卡失效`,
       },
     };

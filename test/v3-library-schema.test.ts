@@ -22,6 +22,7 @@ const OWNER = { openId: 'ou_owner', larkAppId: 'cli_owner' };
 
 function dagTemplate(goal = '研究并输出报告'): V3DagTemplate {
   return {
+    schemaVersion: 2,
     nodes: [{
       id: 'research',
       type: 'goal',
@@ -206,7 +207,7 @@ describe('v3 Saved Workflow library schema', () => {
 
   it('fails loud on a future revision schema instead of guessing', () => {
     const stored = buildSavedWorkflowRevision(payload());
-    const schemaVersion = 2;
+    const schemaVersion = 3;
     const contentHash = computeSavedWorkflowRevisionContentHash(schemaVersion, stored.payload);
     const future = {
       ...stored,
@@ -215,5 +216,26 @@ describe('v3 Saved Workflow library schema', () => {
       revisionId: `rev_${contentHash.slice('sha256:'.length)}`,
     };
     expect(() => loadSavedWorkflowRevision(future)).toThrow(/newer than supported/);
+  });
+
+  it('读取旧 revision 时保留 v1 DAG，但新建 draft 必须使用 schemaVersion 2', () => {
+    const legacyPayload = payload({
+      dagTemplate: { nodes: dagTemplate().nodes },
+    });
+    const contentHash = computeSavedWorkflowRevisionContentHash(1, legacyPayload);
+    const legacyStored = {
+      schemaVersion: 1,
+      contentHash,
+      revisionId: `rev_${contentHash.slice('sha256:'.length)}`,
+      payload: legacyPayload,
+    };
+
+    const loaded = loadSavedWorkflowRevision(legacyStored);
+    expect(loaded).toMatchObject({ storedSchemaVersion: 1, schemaVersion: 2, migrated: true });
+    expect(loaded.payload.dagTemplate.schemaVersion).toBeUndefined();
+
+    const { workflowId: _w, humanVersion: _h, createdAt: _c, createdBy: _b, ...legacyDraft } = legacyPayload;
+    expect(() => validateSavedWorkflowRevisionDraft(legacyDraft))
+      .toThrow(/new Saved Workflow revision requires dagTemplate.schemaVersion=2/);
   });
 });
