@@ -1217,4 +1217,12 @@ export type WorkerToDaemon =
       ok: boolean;
       taskId?: string;
       error?: string;
+      /**
+       * May the daemon roll this failed prepare back?
+       *
+       * Without it on the wire the tri-state existed only inside the worker: the
+       * daemon saw a bare ok:false and sent close_abort unconditionally, which
+       * laundered `uncertain` back into `retryable`. See SessionDestroyResult.
+       */
+      recovery?: 'retryable' | 'uncertain' | 'irreversible';
     };

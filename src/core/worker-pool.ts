@@ -598,6 +598,8 @@ type RemoteWorkerCloseResult = {
   ok: boolean;
   taskId?: string;
   error?: string;
+  /** Absent means `retryable`, the historical behaviour. See SessionDestroyResult. */
+  recovery?: 'retryable' | 'uncertain' | 'irreversible';
 };
 
 const pendingRemoteWorkerCloses = new Map<string, {
@@ -3244,9 +3246,12 @@ async function prepareLiveRemoteWorkerClose(
       pendingRemoteWorkerCloses.delete(requestId);
       resolve(value);
     };
+    // The worker died mid-prepare, so whatever destroySession() had already done
+    // is unknown -- including a completed irreversible cancel. Fence.
     const onExit = (): void => finish({
       ok: false,
       error: 'worker_exited_before_close_result',
+      recovery: 'uncertain',
     });
     // Riff's adapter has its own 20s destroy deadline. Mojo may first spend 8s
     // waiting for system/init, then up to 60s in `mojo session cancel`; aborting
@@ -3256,7 +3261,8 @@ async function prepareLiveRemoteWorkerClose(
       ? MOJO_EXPLICIT_CLOSE_RESULT_TIMEOUT_MS
       : 23_000;
     const timer = setTimeout(
-      () => finish({ ok: false, error: 'worker_close_result_timeout' }),
+      // A timed-out prepare may still be running remotely; the outcome is unknown.
+      () => finish({ ok: false, error: 'worker_close_result_timeout', recovery: 'uncertain' }),
       closeResultTimeoutMs,
     );
     timer.unref?.();
@@ -3318,6 +3324,35 @@ async function prepareLiveRemoteWorkerClose(
       return { ok: true, ...(taskId ? { taskId } : {}) };
     }
 
+    // Only a REVERSIBLE failure may be rolled back. Sending close_abort for every
+    // ok:false re-opened write admission after an `uncertain` verdict (an unnamed
+    // remote session may exist) and after an `irreversible` one (the remote side is
+    // already gone), which laundered both back into `retryable` end to end.
+    const recovery = result.recovery ?? 'retryable';
+    if (recovery !== 'retryable') {
+      // No abort, and no journal clear: the runtime fence and the durable row both
+      // stay as they are, so the session remains active and keeps its
+      // device-isolation blocker while the operator retries.
+      ds.remoteCloseState = {
+        phase: 'uncertain',
+        requestId,
+        ...(taskId ? { taskId } : {}),
+      };
+      logger.error(
+        `[${tag(ds)}] mojo worker close prepare failed as ${recovery} `
+        + `(${result.error ?? 'unknown'}); admission stays fenced and the session `
+        + 'remains active for retry',
+      );
+      // Reuses the existing code: the caller-visible contract is unchanged (a
+      // failed, retryable close). What differs is that no rollback was attempted,
+      // which the log line above states explicitly.
+      return {
+        ok: false,
+        error: 'mojo_cancel_failed',
+        retryable: true,
+        ...(taskId ? { taskId } : {}),
+      };
+    }
     const admissionRestored = await abortLiveRemoteWorkerClose(ds, requestId, {
       allowAbsentAfterProvenRestore: matchedCloseResult,
     });
@@ -10200,6 +10235,7 @@ function setupWorkerHandlers(
           ok: msg.ok,
           ...(msg.taskId ? { taskId: msg.taskId } : {}),
           ...(msg.error ? { error: msg.error } : {}),
+          ...(msg.recovery ? { recovery: msg.recovery } : {}),
         });
         break;
       }

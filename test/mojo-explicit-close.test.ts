@@ -84,6 +84,7 @@ let previousDataDir: string;
 const sessionReplyMock = vi.fn(async () => 'om_reply');
 
 function createFixture(options: {
+  closeRecovery?: 'retryable' | 'uncertain' | 'irreversible';
   liveWorker?: boolean;
   closeOk?: boolean;
   resultTaskId?: string;
@@ -139,6 +140,7 @@ function createFixture(options: {
         ok: options.closeOk ?? true,
         taskId: options.resultTaskId ?? 'mojo-sid-123',
         ...((options.closeOk ?? true) ? {} : { error: 'mojo cancel HTTP 500' }),
+        ...(options.closeRecovery ? { recovery: options.closeRecovery } : {}),
       }));
     });
   }
@@ -185,6 +187,50 @@ afterEach(() => {
 });
 
 describe('mojo explicit close', () => {
+  it('does NOT roll back an uncertain close prepare', async () => {
+    // The tri-state existed only inside the worker: the daemon saw a bare ok:false
+    // and sent close_abort unconditionally, laundering `uncertain` straight back
+    // into `retryable`. This drives the REAL worker->daemon IPC, so a regression
+    // here cannot hide behind an isolated helper unit test.
+    const fixture = createFixture({ liveWorker: true, closeOk: false, closeRecovery: 'uncertain' });
+
+    const result = await closeSession(fixture.ds.session.sessionId, fixture.registry);
+
+    expect(result.ok).toBe(false);
+    // The abort is what re-opens write admission; it must not have been sent.
+    const sent = (fixture.worker.send as unknown as { mock: { calls: Array<[{ type: string }]> } }).mock.calls
+      .map(([message]) => message.type);
+    expect(sent).toContain('close');
+    expect(sent).not.toContain('close_abort');
+    expect(sent).not.toContain('close_commit');
+    // The row stays active, which is what keeps its device-isolation blocker.
+    expect(sessionStore.getSession(fixture.ds.session.sessionId)?.status).toBe('active');
+  });
+
+  it('does NOT roll back an irreversible close prepare', async () => {
+    // Restoring admission after the remote side is gone yields a session that looks
+    // writable but can never continue.
+    const fixture = createFixture({ liveWorker: true, closeOk: false, closeRecovery: 'irreversible' });
+
+    await closeSession(fixture.ds.session.sessionId, fixture.registry);
+
+    const sent = (fixture.worker.send as unknown as { mock: { calls: Array<[{ type: string }]> } }).mock.calls
+      .map(([message]) => message.type);
+    expect(sent).not.toContain('close_abort');
+  });
+
+  it('still rolls back a retryable close prepare', async () => {
+    // The historical behaviour must survive: a reversible failure DOES restore
+    // admission, and an absent `recovery` still means retryable (riff sends none).
+    const fixture = createFixture({ liveWorker: true, closeOk: false });
+
+    await closeSession(fixture.ds.session.sessionId, fixture.registry);
+
+    const sent = (fixture.worker.send as unknown as { mock: { calls: Array<[{ type: string }]> } }).mock.calls
+      .map(([message]) => message.type);
+    expect(sent).toContain('close_abort');
+  });
+
   it('refuses explicit close while shutdown owns the exact Mojo generation', async () => {
     const fixture = createFixture({ liveWorker: true });
     fixture.ds.remoteShutdownState = {

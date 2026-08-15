@@ -31,8 +31,12 @@ export function normalizeDestroyResult(
     && typeof raw === 'object'
     && typeof (raw as { ok?: unknown }).ok === 'boolean';
   if (structured) return raw as SessionDestroyResult;
+  // `uncertain`, NOT `retryable`: the comment above already called this outcome
+  // UNKNOWN, but returning retryable told the caller to roll back and re-open
+  // write admission — on a session whose remote teardown may well have completed.
+  // An unknown outcome must fence, not roll back.
   return opts.remote
-    ? { ok: false, error: 'remote_close_result_missing', recovery: 'retryable' }
+    ? { ok: false, error: 'remote_close_result_missing', recovery: 'uncertain' }
     : { ok: true };
 }
 
@@ -49,4 +53,33 @@ export function normalizeDestroyResult(
 export function mayRestoreWriteAdmission(result: SessionDestroyResult): boolean {
   if (result.ok) return false;
   return (result.recovery ?? 'retryable') === 'retryable';
+}
+
+/**
+ * The `close_result` payload a worker sends back for a close prepare.
+ *
+ * This is a function, not an inline object literal, because the daemon owns the
+ * rollback decision: dropping `recovery` here silently laundered every
+ * `uncertain` / `irreversible` verdict back into `retryable` at the IPC boundary,
+ * and an inline literal inside worker.ts was not reachable from any test.
+ */
+export function buildCloseResultMessage(
+  requestId: string,
+  result: SessionDestroyResult,
+): {
+  type: 'close_result';
+  requestId: string;
+  ok: boolean;
+  taskId?: string;
+  error?: string;
+  recovery?: 'retryable' | 'uncertain' | 'irreversible';
+} {
+  return {
+    type: 'close_result',
+    requestId,
+    ok: result.ok,
+    ...(result.taskId ? { taskId: result.taskId } : {}),
+    ...(result.error ? { error: result.error } : {}),
+    ...(result.recovery ? { recovery: result.recovery } : {}),
+  };
 }

@@ -6,7 +6,7 @@
  * accepted { ok: 'yes' } as a successful teardown.
  */
 import { describe, expect, it } from 'vitest';
-import { mayRestoreWriteAdmission, normalizeDestroyResult } from '../src/adapters/backend/destroy-result.js';
+import { buildCloseResultMessage, mayRestoreWriteAdmission, normalizeDestroyResult } from '../src/adapters/backend/destroy-result.js';
 
 describe('normalizeDestroyResult', () => {
   it('rejects a truthy non-boolean ok from a remote backend', () => {
@@ -15,12 +15,17 @@ describe('normalizeDestroyResult', () => {
     expect(normalizeDestroyResult({ ok: 'yes' }, { remote: true })).toMatchObject({
       ok: false,
       error: 'remote_close_result_missing',
+      // An UNKNOWN outcome must FENCE, not roll back. Asserting only ok:false let
+      // `recovery: 'retryable'` slip through, which restores write admission on a
+      // session whose remote teardown may already have completed.
+      recovery: 'uncertain',
     });
   });
 
   it('treats a missing remote result as an unknown outcome, not success', () => {
     for (const raw of [undefined, null, 'ok', 42, {}]) {
-      expect(normalizeDestroyResult(raw, { remote: true }).ok, `raw=${String(raw)}`).toBe(false);
+      expect(normalizeDestroyResult(raw, { remote: true }), `raw=${String(raw)}`)
+        .toMatchObject({ ok: false, recovery: 'uncertain' });
     }
   });
 
@@ -54,5 +59,37 @@ describe('mayRestoreWriteAdmission', () => {
 
   it('never rolls back a successful prepare', () => {
     expect(mayRestoreWriteAdmission({ ok: true })).toBe(false);
+  });
+});
+
+describe('buildCloseResultMessage', () => {
+  it('carries recovery across the IPC boundary', () => {
+    // Without this field the daemon sees a bare ok:false and sends close_abort
+    // unconditionally, so the tri-state would exist only inside the worker.
+    expect(buildCloseResultMessage('req-1', {
+      ok: false,
+      error: 'mojo_lineage_not_materialized',
+      recovery: 'uncertain',
+    })).toEqual({
+      type: 'close_result',
+      requestId: 'req-1',
+      ok: false,
+      error: 'mojo_lineage_not_materialized',
+      recovery: 'uncertain',
+    });
+  });
+
+  it('omits absent optional fields rather than sending undefined', () => {
+    expect(buildCloseResultMessage('req-2', { ok: true })).toEqual({
+      type: 'close_result',
+      requestId: 'req-2',
+      ok: true,
+    });
+  });
+
+  it('forwards the exact lineage for a retryable failure', () => {
+    expect(buildCloseResultMessage('req-3', {
+      ok: false, taskId: 'sid-9', error: 'cancel failed', recovery: 'retryable',
+    })).toMatchObject({ taskId: 'sid-9', recovery: 'retryable' });
   });
 });

@@ -896,3 +896,11 @@ export function normalizeMojoConfig(raw: unknown): MojoConfigNormalizeResult {
 
     return errors.length > 0 ? { ok: false, errors } : { ok: true, value: value as MojoConfig };
 }
+
+/** Result of one subtree scan during termination. `scanned:false` means the tree
+ *  could not be enumerated, which must never be read as "nothing is running". */
+export interface MojoTreeScanOutcome {
+  scanned: boolean;
+  pids: number[];
+  reason?: string;
+}

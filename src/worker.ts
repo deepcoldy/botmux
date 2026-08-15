@@ -36,7 +36,7 @@ import {
   type IsolationCapability,
 } from './adapters/cli/read-isolation.js';
 import { buildFsPolicy, compileToSeatbelt, migrateLegacySandboxFields, resolveRedirectedAdapterAuthPaths, FsPolicyConfigError } from './adapters/cli/fs-policy.js';
-import { normalizeDestroyResult, mayRestoreWriteAdmission } from './adapters/backend/destroy-result.js';
+import { buildCloseResultMessage, normalizeDestroyResult, mayRestoreWriteAdmission } from './adapters/backend/destroy-result.js';
 import { isRemoteBackendType, killPersistentBackendTarget, killPersistentSession, probePersistentBackendTarget, probePersistentSession, shouldRejectPersistentPostKillProbe, type PersistentBackendType } from './core/persistent-backend.js';
 import { finalizeRawCommandDelivery, writeRawCommandLine } from './core/raw-command-writer.js';
 import { rawCommandWriteOptionsFor } from './core/raw-command-write-options.js';
@@ -17047,7 +17047,15 @@ process.on('message', async (raw: unknown) => {
               );
             }
           } catch (err) {
-            result = { ok: false, error: err instanceof Error ? err.message : String(err) };
+            // A THROWN destroySession leaves the outcome unknown: it may already
+            // have cancelled the remote session or spawned side effects. Defaulting
+            // this to retryable re-opened write admission on a possibly-dead
+            // lineage, so an unknown outcome must fence instead.
+            result = {
+              ok: false,
+              error: err instanceof Error ? err.message : String(err),
+              recovery: 'uncertain',
+            };
           }
         }
         if (result.ok) {
@@ -17071,13 +17079,9 @@ process.on('message', async (raw: unknown) => {
           }
         }
         if (closeRequestInFlightId === msg.requestId) closeRequestInFlightId = null;
-        send({
-          type: 'close_result',
-          requestId: msg.requestId,
-          ok: result.ok,
-          ...(result.taskId ? { taskId: result.taskId } : {}),
-          ...(result.error ? { error: result.error } : {}),
-        });
+        // Built by the shared helper so the payload (notably `recovery`, which the
+        // daemon needs to decide whether a rollback is legal) is covered by tests.
+        send(buildCloseResultMessage(msg.requestId, result));
         if (!result.ok) {
           log(`${effectiveBackendType} close prepare failed (${result.error ?? 'cancel failed'}); session stays active for retry`);
         }

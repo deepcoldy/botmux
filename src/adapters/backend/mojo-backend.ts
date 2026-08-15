@@ -45,7 +45,9 @@
  * or `result_complete` exists on a foreground result. Also `error` is an OBJECT
  * ({code, message, retryable}), not a string.
  */
+import { randomBytes } from 'node:crypto';
 import { spawn as spawnProcess, type ChildProcessByStdio } from 'node:child_process';
+import { MOJO_TREE_NONCE_ENV, scanMojoTree } from './mojo-process-tree.js';
 import { accessSync, constants as fsConstants } from 'node:fs';
 import { delimiter, join } from 'node:path';
 import type { Readable } from 'node:stream';
@@ -66,7 +68,7 @@ import {
     MOJO_CANONICAL_JWT_ENV_KEY,
     MOJO_CONTROL_ENV_KEYS,
 } from './mojo-types.js';
-import type {
+import type { MojoTreeScanOutcome,
     MojoAuthStatus,
     MojoLivePatch,
     EffectiveMojoConfig,
@@ -149,6 +151,18 @@ export class MojoBackend implements SessionBackend {
      * remote session was created, so shutdown must not persist authoritative
      * null merely because the local write promise settled. */
     private acceptedWriteWithoutLineage = false;
+    /** Inherited by every descendant of every turn, so the subtree stays
+     *  enumerable after setsid/reparenting. Per BACKEND, not per turn: a tool left
+     *  behind by an earlier turn must still be found. */
+    private readonly treeNonce = `botmux-mojo-${randomBytes(12).toString('hex')}`;
+    /**
+     * Root pid of the most recent turn, kept AFTER `this.child` is cleared.
+     *
+     * The child's own `close` handler nulls `this.child`, so a later `/close` had
+     * nothing left to check and skipped the subtree scan entirely — the exact hole
+     * that let a survivor go unnoticed once its parent had exited.
+     */
+    private lastTurnPid: number | null = null;
     /** True once the current turn has emitted its `result` event, so a late
      *  process exit cannot fire a second turn boundary. */
     private turnSettled = true;
@@ -486,105 +500,121 @@ export class MojoBackend implements SessionBackend {
      * Returns false when termination could not be proven; the caller must then
      * refuse the close rather than let the row be published as closed.
      */
-    /** Is any process still alive in `pgid`'s group? A zombie counts as alive
-     *  until it is reaped, which is why the direct child's `exit` is awaited too. */
-    private groupHasMembers(pgid: number): boolean {
-        try {
-            process.kill(-pgid, 0);
-            return true;
-        } catch (err: unknown) {
-            // ESRCH = empty group, the only answer that proves absence. EPERM means
-            // members exist that we may not signal, which is NOT proof of absence.
-            return (err as NodeJS.ErrnoException)?.code !== 'ESRCH';
-        }
-    }
-
     /** Overridable so a behaviour test can exercise the escalation ladder without
      *  burning the production budget in wall-clock. Production never changes it. */
     protected get terminationProofBudgetMs(): number {
         return MOJO_CHILD_TERMINATION_PROOF_MS;
     }
 
+    /** Overridable so a test can point the scan at a synthetic /proc. */
+    protected get procRoot(): string { return '/proc'; }
+
     /**
-     * SIGTERM the whole process GROUP, then PROVE nothing in it survives
+     * SIGTERM the whole turn SUBTREE, then PROVE nothing in it survives
      * (escalating to SIGKILL).
      *
-     * Two distinct fail-open paths are closed here.
+     * Three fail-open paths are closed here.
      *
-     * 1. `child.kill()` returning true only means the signal was delivered. A
+     * 1. `child.kill()` returning true only means the signal was DELIVERED. A
      *    child that ignores SIGTERM keeps executing with the injected credential
-     *    while the explicit close publishes the row as `closed` -- and a closed
-     *    row is filtered out of the device-isolation inventory
-     *    (mergePersistedDeviceIsolationSessions), so the blocker vanishes with the
-     *    process still alive.
-     * 2. Signalling only the direct pid leaves DESCENDANTS alive. mojo runs tools
-     *    and can leave a detached grandchild holding the inherited X_JWT_TOKEN;
-     *    the parent exits, the direct-pid proof succeeds, and the credentialed
-     *    descendant keeps running unblocked. Group-level signalling plus an
-     *    ESRCH probe is what makes "gone" mean the whole subtree.
+     *    while the close publishes the row as `closed` — and a closed row is
+     *    filtered out of the device-isolation inventory, so the blocker vanishes
+     *    with the process still alive.
+     * 2. Signalling the direct pid leaves DESCENDANTS alive.
+     * 3. Signalling the process GROUP still leaves descendants that escaped it via
+     *    setsid/detached. Enumeration therefore unions PGID, the inherited env
+     *    nonce and the PPID chain — see mojo-process-tree.
      *
-     * Returns false when termination cannot be proven; the caller must then refuse
-     * the close rather than let the row be published as closed. `this.child` is
-     * only cleared once termination IS proven, so a refused close can be retried
-     * against the same process.
+     * Returns false when quiescence cannot be proven, INCLUDING when the scan
+     * itself fails: "cannot enumerate" must never read as "nothing is running".
+     * The caller then refuses the close, which keeps the row active and so keeps
+     * the device-isolation blocker in place.
+     *
+     * A clean scan is deliberately NOT claimed to be absolute proof — see the
+     * trust-domain note in mojo-process-tree.
      */
     private async terminateChildProven(): Promise<boolean> {
         const child = this.child;
-        if (!child) return true;
-        const pid = child.pid;
-        const reaped = child.exitCode !== null || child.signalCode !== null;
-        // spawn() failed outright: there is no process and no group to probe.
-        if (typeof pid !== 'number' || pid <= 0) {
-            if (reaped) { this.child = null; return true; }
-            return false;
+        // lastTurnPid, not just `child`: the child's own `close` handler clears
+        // `this.child`, and an escaped descendant outlives its parent. Falling back
+        // to the remembered root pid is what keeps the subtree checkable.
+        const rootPid = (typeof child?.pid === 'number' && child.pid > 0) ? child.pid : this.lastTurnPid;
+        if (rootPid === null) {
+            // No turn ever spawned, so there is no subtree. (A spawn that failed
+            // outright leaves lastTurnPid null.)
+            this.child = null;
+            return true;
         }
 
         const exited = new Promise<void>(resolve => {
+            if (!child) return resolve();
             const done = (): void => resolve();
             child.once('exit', done);
             child.once('close', done);
-            // Already gone but its 'exit' fired before we subscribed: without this
-            // the wait below would burn the whole budget for nothing.
             if (child.exitCode !== null || child.signalCode !== null) resolve();
         });
 
         const budget = this.terminationProofBudgetMs;
         const grace = Math.max(1, Math.floor(budget / 2));
-        // Proof needs BOTH: the direct child reaped (a zombie keeps the group
-        // non-empty) and the group drained of every descendant.
-        const proven = async (deadlineMs: number): Promise<boolean> => {
+        // Never signal ourselves: the daemon shares neither nonce nor group, but an
+        // explicit guard is cheaper than trusting that while sending SIGKILL.
+        const excludePids = [process.pid, process.ppid].filter(pid => typeof pid === 'number' && pid > 0);
+
+        const survivors = (): MojoTreeScanOutcome => {
+            const scan = scanMojoTree(rootPid, this.treeNonce, { procRoot: this.procRoot, excludePids });
+            if (!scan.ok) return { scanned: false, pids: [], reason: scan.reason };
+            // A zombie is not executing and cannot use the credential; it only waits
+            // to be reaped, so it must not keep the close blocked forever.
+            return { scanned: true, pids: scan.members.map(m => m.pid) };
+        };
+
+        const proven = async (deadlineMs: number): Promise<'proven' | 'alive' | 'unscannable'> => {
             const deadline = Date.now() + deadlineMs;
             for (;;) {
-                if (!this.groupHasMembers(pid)) return true;
-                if (Date.now() >= deadline) return false;
-                await Promise.race([
-                    exited,
-                    new Promise<void>(r => setTimeout(r, Math.min(25, Math.max(1, deadline - Date.now()))).unref?.()),
-                ]);
+                const now = survivors();
+                if (!now.scanned) {
+                    logger.error(`[mojo] cannot enumerate turn subtree: ${now.reason ?? 'unknown'}`);
+                    return 'unscannable';
+                }
+                if (now.pids.length === 0) return 'proven';
+                if (Date.now() >= deadline) return 'alive';
+                // Plain sleep: racing an ALREADY-RESOLVED `exited` here span the
+                // loop as fast as the event loop allowed (a busy loop until the
+                // deadline). The direct child's exit is not the condition anyway —
+                // the scan is.
+                await new Promise<void>(r => setTimeout(r, 25).unref?.());
             }
         };
 
-        // Negative pid = whole group. Fall back to the direct child only if the
-        // group signal cannot be delivered (e.g. it already drained).
-        const signalGroup = (signal: NodeJS.Signals): void => {
-            try { process.kill(-pid, signal); return; } catch { /* try direct */ }
-            try { child.kill(signal); } catch { /* already gone */ }
+        const signalTree = (signal: NodeJS.Signals): void => {
+            // Group first: it reaches processes that /proc may not have listed yet.
+            try { process.kill(-rootPid, signal); } catch { /* group already gone */ }
+            const scan = survivors();
+            for (const pid of scan.pids) {
+                try { process.kill(pid, signal); } catch { /* raced us */ }
+            }
+            if (!scan.scanned) { try { child?.kill(signal); } catch { /* gone */ } }
         };
 
-        signalGroup('SIGTERM');
-        if (await proven(grace)) { this.child = null; return true; }
+        signalTree('SIGTERM');
+        let verdict = await proven(grace);
+        if (verdict === 'proven') { this.child = null; await exited.catch?.(() => undefined); return true; }
 
-        // Escalate. SIGKILL cannot be caught, so a surviving group after this means
-        // we genuinely cannot prove anything (e.g. uninterruptible state).
-        signalGroup('SIGKILL');
-        if (await proven(budget - grace)) { this.child = null; return true; }
+        if (verdict === 'alive') {
+            // Escalate. SIGKILL cannot be caught, so a survivor after this means we
+            // genuinely cannot prove quiescence (e.g. uninterruptible state).
+            signalTree('SIGKILL');
+            verdict = await proven(budget - grace);
+            if (verdict === 'proven') { this.child = null; return true; }
+        }
 
         logger.error(
-            `[mojo] process group ${pid} survived SIGTERM+SIGKILL; refusing to report `
-            + 'the close as successful (a closed row would drop the device-isolation blocker)',
+            `[mojo] turn subtree rooted at ${rootPid} could not be proven quiescent (${verdict}); `
+            + 'refusing to report the close as successful — the session row stays active so its '
+            + 'device-isolation blocker is retained',
         );
-        // Deliberately NOT clearing this.child: the close is refused, so a retry
-        // must be able to signal the same process again.
+        // Deliberately NOT clearing this.child / lastTurnPid: the close is refused,
+        // so a retry must be able to signal the same subtree again.
         return false;
     }
 
@@ -669,7 +699,12 @@ export class MojoBackend implements SessionBackend {
         // remote session we have no id for, so it cannot be cancelled and cannot be
         // claimed gone. Same verdict prepareShutdownDetach reaches from this state.
         if (lineageExpected && !this.cliSessionId) {
-            this.closing = false;
+            // `closing` deliberately STAYS true. Clearing it here re-opened write
+            // admission (a probe called write() straight after and it returned
+            // true), which is exactly what `uncertain` must prevent: an unnamed
+            // remote session may exist, so a fresh turn must not be layered on top
+            // of a possible orphan. abortDestroySession() is the only legitimate
+            // way back, and the worker must not call it for this verdict.
             // taskId is deliberately omitted rather than null: SessionDestroyResult
             // types it as an optional string, and "absent" is the honest answer —
             // there is no id to hand back for retry.
@@ -922,6 +957,7 @@ export class MojoBackend implements SessionBackend {
                 detached: true,
             });
             this.child = child;
+            if (typeof child.pid === 'number' && child.pid > 0) this.lastTurnPid = child.pid;
             let stderr = '';
 
             child.stdout.on('data', (chunk: Buffer) => this.consume(chunk.toString()));
@@ -1190,6 +1226,11 @@ export class MojoBackend implements SessionBackend {
             botEnv: this.spawnOpts?.injectEnv,
             mojoEnv: this.config.env,
         });
+        // Termination authority, not configuration: this value is what makes the
+        // subtree enumerable in /proc after a descendant escapes the process group
+        // via setsid. It carries no privilege and is safe to expose to the child.
+        // Set LAST so neither bots.json `env` nor `mojo.env` can shadow it.
+        env[MOJO_TREE_NONCE_ENV] = this.treeNonce;
         // Prefer an injected JWT so the bot never depends on an interactive
         // `mojo auth login` on the host. Verified: X_JWT_TOKEN makes
         // `mojo auth status --json` report mode=jwt / source=env.

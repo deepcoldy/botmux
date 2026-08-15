@@ -70,6 +70,10 @@ exit 0`);
       error: 'mojo_lineage_not_materialized',
       recovery: 'uncertain',
     });
+    // The returned object is not the guarantee -- the FENCE is. Asserting only the
+    // verdict left `this.closing = false` free to re-open admission, and a probe
+    // could then write() successfully on a session with a possible unnamed orphan.
+    expect(backend.write('a turn that must be refused')).toBe(false);
   });
 
   it('refuses the close when the local child cannot be proven dead', async () => {
@@ -125,31 +129,107 @@ echo '{"type":"result","status":"ok","result":"ok","session_id":"sid-stuck","war
     expect((backend as unknown as { child: unknown }).child).toBe(unkillable);
   });
 
-  it('kills a detached descendant that inherited the credential', async () => {
-    // mojo runs tools and can leave a detached grandchild holding X_JWT_TOKEN.
-    // The parent exits immediately, so a direct-pid proof succeeds while the
-    // credentialed descendant keeps running -- and the closed row then drops its
-    // device-isolation blocker. Only group-level termination catches this.
-    const pidFile = join(binDir, 'descendant.pid');
-    const bin = fakeMojo('mojo-descendant', `if [ "$1" = "session" ]; then echo '{"status":"ok"}'; exit 0; fi
-# A descendant that ignores SIGTERM and outlives its parent.
-( trap '' TERM; sleep 60 & echo $! > ${pidFile}; wait ) &
-echo '{"type":"system","subtype":"init","session_id":"sid-desc"}'
-echo '{"type":"result","status":"ok","result":"ok","session_id":"sid-desc","warnings":[]}'`);
+  it('kills a descendant that ESCAPED the process group via setsid', async () => {
+    // The earlier version of this case only started a background shell, which
+    // stays in the SAME process group -- so it passed against a plain kill(-pgid)
+    // and proved nothing about escapes. `setsid` makes the descendant the leader of
+    // a NEW group and session, so it survives every kill aimed at the original
+    // group while still holding the inherited X_JWT_TOKEN. Only the env-nonce scan
+    // finds it.
+    const pidFile = join(binDir, 'escaped.pid');
+    const bin = fakeMojo('mojo-escaped', `if [ "$1" = "session" ]; then echo '{"status":"ok"}'; exit 0; fi
+setsid bash -c 'trap "" TERM; echo $$ > ${pidFile}; sleep 60' &
+echo '{"type":"system","subtype":"init","session_id":"sid-escaped"}'
+echo '{"type":"result","status":"ok","result":"ok","session_id":"sid-escaped","warnings":[]}'`);
 
     const backend = new FastProofBackend({ bin }, 'session-under-test');
     backend.spawn('', [], {} as never);
-    backend.write('spawn a tool');
-    await vi.waitFor(() => expect(backend.cliSessionIdForTest).toBe('sid-desc'));
+    backend.write('spawn a tool that escapes');
+    await vi.waitFor(() => expect(backend.cliSessionIdForTest).toBe('sid-escaped'));
     await vi.waitFor(() => expect(existsSync(pidFile)).toBe(true));
-    const descendant = Number(readFileSync(pidFile, 'utf-8').trim());
-    expect(Number.isInteger(descendant)).toBe(true);
-    expect(alive(descendant)).toBe(true);
+    const escaped = Number(readFileSync(pidFile, 'utf-8').trim());
+    const rootPid = backend.getChildPid();
+    expect(Number.isInteger(escaped)).toBe(true);
+    expect(alive(escaped)).toBe(true);
+
+    // Precondition of the whole case: it really did leave the group, so a
+    // group-only teardown cannot reach it.
+    const escapedPgid = Number(execFileSync('ps', ['-o', 'pgid=', '-p', String(escaped)], { encoding: 'utf-8' }).trim());
+    expect(escapedPgid).not.toBe(rootPid);
 
     await expect(backend.destroySession()).resolves.toMatchObject({ ok: true });
+    // Success was claimed, so the whole credentialed subtree must be gone.
+    await vi.waitFor(() => expect(alive(escaped)).toBe(false), { timeout: 5_000 });
+  }, 20_000);
 
-    // The close claimed success, so the whole credentialed subtree must be gone.
-    await vi.waitFor(() => expect(alive(descendant)).toBe(false), { timeout: 5_000 });
+  it('refuses the close while the escaped descendant cannot be killed', async () => {
+    // Same escape, but the survivor cannot be signalled away. The close must fail
+    // closed so the row stays active and its device-isolation blocker is retained,
+    // instead of reporting ok:true with a credentialed process still running.
+    const pidFile = join(binDir, 'immortal.pid');
+    const bin = fakeMojo('mojo-immortal', `if [ "$1" = "session" ]; then echo '{"status":"ok"}'; exit 0; fi
+setsid bash -c 'trap "" TERM; echo $$ > ${pidFile}; sleep 60' &
+echo '{"type":"system","subtype":"init","session_id":"sid-immortal"}'
+echo '{"type":"result","status":"ok","result":"ok","session_id":"sid-immortal","warnings":[]}'`);
+
+    const backend = new FastProofBackend({ bin }, 'session-under-test');
+    backend.spawn('', [], {} as never);
+    backend.write('spawn an unkillable tool');
+    await vi.waitFor(() => expect(backend.cliSessionIdForTest).toBe('sid-immortal'));
+    await vi.waitFor(() => expect(existsSync(pidFile)).toBe(true));
+    const escaped = Number(readFileSync(pidFile, 'utf-8').trim());
+
+    // Swallow signals aimed at the survivor only (signal 0 stays real, since it is
+    // the liveness probe, not a kill). A real process cannot resist SIGKILL, so
+    // this is the only way to reproduce a non-quiescent subtree.
+    const realKill = process.kill.bind(process);
+    const killSpy = vi.spyOn(process, 'kill').mockImplementation(((pid: number, signal?: string | number) => {
+      if (signal === 0) return realKill(pid, signal);
+      if (pid === escaped) return true;
+      return realKill(pid, signal as NodeJS.Signals);
+    }) as typeof process.kill);
+
+    let result: Awaited<ReturnType<typeof backend.destroySession>>;
+    try {
+      result = await backend.destroySession();
+    } finally {
+      killSpy.mockRestore();
+      try { realKill(escaped, 'SIGKILL'); } catch { /* already gone */ }
+    }
+    expect(result).toMatchObject({
+      ok: false,
+      error: 'mojo_local_child_termination_unproven',
+      recovery: 'retryable',
+    });
+  }, 20_000);
+
+  it('still scans the subtree after the direct child has been reaped', async () => {
+    // The child's own `close` handler clears this.child, so a /close arriving after
+    // the turn finished had nothing left to check and skipped the scan entirely --
+    // which is precisely when an escaped descendant is the only thing left.
+    const pidFile = join(binDir, 'orphaned.pid');
+    const bin = fakeMojo('mojo-orphaned', `if [ "$1" = "session" ]; then echo '{"status":"ok"}'; exit 0; fi
+setsid bash -c 'trap "" TERM; echo $$ > ${pidFile}; sleep 60' &
+echo '{"type":"system","subtype":"init","session_id":"sid-orphan"}'
+echo '{"type":"result","status":"ok","result":"ok","session_id":"sid-orphan","warnings":[]}'
+exit 0`);
+
+    const backend = new FastProofBackend({ bin }, 'session-under-test');
+    backend.spawn('', [], {} as never);
+    backend.write('finish the turn, leave a descendant');
+    await vi.waitFor(() => expect(existsSync(pidFile)).toBe(true));
+    const escaped = Number(readFileSync(pidFile, 'utf-8').trim());
+    // Model the state the bug needed: the direct child has been reaped and its
+    // `close` handler cleared the handle. Pinning it is deterministic -- waiting is
+    // not, because a retried turn can spawn a fresh child at any moment and restore
+    // the handle we are trying to test without.
+    (backend as unknown as { child: unknown }).child = null;
+    expect(alive(escaped)).toBe(true);
+    // The remembered root pid is the ONLY remaining way to reach the subtree.
+    expect((backend as unknown as { lastTurnPid: number | null }).lastTurnPid).toBeGreaterThan(0);
+
+    await backend.destroySession();
+    await vi.waitFor(() => expect(alive(escaped)).toBe(false), { timeout: 5_000 });
   }, 20_000);
 
   it('escalates to SIGKILL for a child that ignores SIGTERM', async () => {
