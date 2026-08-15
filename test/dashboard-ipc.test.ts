@@ -2926,12 +2926,15 @@ describe('PUT /api/bot-agent', () => {
         'a model-only save must not erase the persisted vendor runtime',
       ).toMatchObject({ id: 'vendor-codex', executable: '/opt/vendor/vendor-codex' });
       expect(stored.cliPathOverride).toBe('/opt/vendor/vendor-codex');
-      // The close target must describe what actually gets written, otherwise the
-      // irreversible closes were computed against a bot that does not exist.
-      for (const t of targets) {
-        expect(t.cliRuntime).toMatchObject({ id: 'vendor-codex', executable: '/opt/vendor/vendor-codex' });
-        expect(t.cliPathOverride).toBe('/opt/vendor/vendor-codex');
-      }
+      // The sweep runs AFTER the commit and judges sessions against the committed
+      // authority, so what matters is that the live config the sweep reads matches
+      // what was written — not a target captured from the request.
+      expect(targets.length, 'the sweep must run once, after the commit').toBe(1);
+      expect(
+        getBot(appId).config.cliRuntime,
+        'the sweep must see the committed runtime',
+      ).toMatchObject({ id: 'vendor-codex', executable: '/opt/vendor/vendor-codex' });
+      expect(getBot(appId).config.cliPathOverride).toBe('/opt/vendor/vendor-codex');
     } finally {
       if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
       else process.env.BOTS_CONFIG = prevBotsConfig;
@@ -2987,9 +2990,11 @@ describe('PUT /api/bot-agent', () => {
         stored.cliPathOverride,
         'a model-only save on a defaulted-cliId row must not erase the legacy path',
       ).toBe('/opt/legacy/claude');
-      for (const t of targets) {
-        expect(t.cliPathOverride).toBe('/opt/legacy/claude');
-      }
+      expect(targets.length, 'the sweep must run once, after the commit').toBe(1);
+      expect(
+        getBot(appId).config.cliPathOverride,
+        'the sweep must see the committed legacy path',
+      ).toBe('/opt/legacy/claude');
     } finally {
       if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
       else process.env.BOTS_CONFIG = prevBotsConfig;
@@ -2997,504 +3002,65 @@ describe('PUT /api/bot-agent', () => {
     }
   });
 
-  // BEHAVIOURAL (concurrency): the mutation gate serialises per bot, but a queued
-  // request that built its proposal BEFORE entering the gate commits stale data.
-  // A switches the runtime explicitly; B (old client, model-only) reads the old
-  // row, queues, and after A commits still writes A's runtime back — a lost
-  // update — and hands the close hook a stale target.
-  it('re-reads the authority inside the gate so a queued model-only save cannot lose an update', async () => {
-    const dir = mkdtempSync(join(tmpdir(), 'botmux-agent-lostupdate-'));
+  // ORDERING TRADE-OFF, stated explicitly.
+  //
+  // The sweep runs AFTER the commit, so a close that fails at RUNTIME (e.g. a
+  // remote cancel that errors) can no longer veto the config write. The config is
+  // the new truth and the still-open session is reported, then retried by the
+  // resweep. That is deliberate: vetoing required keeping the proposal valid
+  // across an irreversible close, which is the window that produced lost updates,
+  // stale targets, ABA and a read->close TOCTOU — and bots.json is hand-editable,
+  // so no protocol could have closed it. A session left open one moment longer is
+  // recoverable; a correct session that was killed is not.
+  //
+  // Conditions that make convergence IMPOSSIBLE are still rejected before the
+  // commit (see the malformed-store case above), so this only covers failures that
+  // cannot be predicted.
+  it('commits and REPORTS a runtime close failure instead of vetoing the switch', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-agent-closefail-'));
+    const dataDir = join(dir, 'data');
     const configPath = join(dir, 'bots.json');
-    const appId = 'test-agent-lostupdate';
+    const appId = 'test-agent-closefail';
     const prevBotsConfig = process.env.BOTS_CONFIG;
-    const originalCloseHook = agentSwitchCloseHook.run;
+    const prevDataDir = config.session.dataDir;
+    const originalHook = agentSwitchCloseHook.run;
     try {
       process.env.BOTS_CONFIG = configPath;
-      // An explicit runtime switch validates the executable AND probes --version,
-      // so both runtimes must be real, runnable binaries with parseable output.
-      // Symlink to the node binary, which the existing runtime tests also use.
-      const binA = join(dir, 'runtime-a');
-      const binB = join(dir, 'runtime-b');
-      symlinkSync(process.execPath, binA);
-      symlinkSync(process.execPath, binB);
+      config.session.dataDir = dataDir;
       writeFileSync(configPath, JSON.stringify([{
-        larkAppId: appId,
-        larkAppSecret: 'secret',
-        cliId: 'codex',
-        model: 'old-model',
-        cliRuntime: { id: 'runtime-a', displayName: 'RuntimeA', executable: binA },
-        cliPathOverride: binA,
+        larkAppId: appId, larkAppSecret: 'secret', cliId: 'traex', model: 'old-model',
       }], null, 2));
       loadBotConfigs().forEach((c: any) => registerBot(c));
+      sessionStore.init(appId);
       setLarkAppId(appId);
       handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
 
-      // Hold A inside the gate (after its authority read) until B is queued, so B
-      // is guaranteed to have been admitted only after A committed.
-      const targets: any[] = [];
-      let releaseA!: () => void;
-      const held = new Promise<void>((r) => { releaseA = r; });
-      let signalHolding!: () => void;
-      const aIsHolding = new Promise<void>((r) => { signalHolding = r; });
-      let first = true;
-      agentSwitchCloseHook.run = async (...args: Parameters<typeof originalCloseHook>) => {
-        targets.push(args[1]);
-        if (first) {
-          first = false;
-          signalHolding();
-          await held;
-        }
-        return originalCloseHook(...args);
-      };
-
-      const put = (body: unknown) => fetch(`http://127.0.0.1:${handle.port}/api/bot-agent`, {
-        method: 'PUT',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify(body),
+      // A close that fails only when actually attempted.
+      agentSwitchCloseHook.run = async () => ({
+        ok: false, closed: 0, residual: 0, failed: 1, residualTaskIds: [],
       });
-
-      // A: explicit switch to runtime B.
-      const aDone = put({
-        cliId: 'codex',
-        model: 'old-model',
-        cliRuntime: { id: 'runtime-b', displayName: 'RuntimeB', executable: binB },
-      });
-      await aIsHolding;
-      // B: old client, model only — must queue behind A.
-      const bDone = put({ cliId: 'codex', model: 'new-model' });
-      await new Promise((r) => setTimeout(r, 60));
-      releaseA();
-
-      expect((await aDone).status).toBe(200);
-      expect((await bDone).status).toBe(200);
-
-      const stored = JSON.parse(readFileSync(configPath, 'utf-8'))[0];
-      expect(
-        stored.cliRuntime?.id,
-        'a queued model-only save must not roll the runtime back to the pre-A value',
-      ).toBe('runtime-b');
-      expect(stored.cliPathOverride).toBe(binB);
-      expect(stored.model).toBe('new-model');
-
-      // B's close target must describe the row as it exists once B holds the gate.
-      expect(targets.length).toBe(2);
-      expect(
-        targets[1].cliRuntime?.id,
-        "the queued request's close target must be built from the fresh row",
-      ).toBe('runtime-b');
-    } finally {
-      agentSwitchCloseHook.run = originalCloseHook;
-      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
-      else process.env.BOTS_CONFIG = prevBotsConfig;
-      rmSync(dir, { recursive: true, force: true });
-    }
-  });
-
-  // BEHAVIOURAL (cross-process): the mutation gate only serialises THIS process.
-  // Another daemon/CLI holding the bots.json file lock may legitimately commit a
-  // new runtime inside our read -> irreversible-close -> commit window. Writing
-  // our pre-close proposal afterwards would silently overwrite that newer value
-  // and answer 200 with a stale close target.
-  it('refuses to commit a stale proposal when another writer changed the row', async () => {
-    const dir = mkdtempSync(join(tmpdir(), 'botmux-agent-cas-'));
-    const configPath = join(dir, 'bots.json');
-    const appId = 'test-agent-cas';
-    const prevBotsConfig = process.env.BOTS_CONFIG;
-    const originalCloseHook = agentSwitchCloseHook.run;
-    try {
-      process.env.BOTS_CONFIG = configPath;
-      const binA = join(dir, 'runtime-a');
-      const binB = join(dir, 'runtime-b');
-      symlinkSync(process.execPath, binA);
-      symlinkSync(process.execPath, binB);
-      writeFileSync(configPath, JSON.stringify([{
-        larkAppId: appId,
-        larkAppSecret: 'secret',
-        cliId: 'codex',
-        model: 'old-model',
-        cliRuntime: { id: 'runtime-a', displayName: 'RuntimeA', executable: binA },
-        cliPathOverride: binA,
-      }], null, 2));
-      loadBotConfigs().forEach((c: any) => registerBot(c));
-      setLarkAppId(appId);
-      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
-
-      // Simulate a SECOND writer (another process) committing runtime-B while our
-      // request sits between its authority read and its commit. The close hook is
-      // exactly that window.
-      const targets: any[] = [];
-      agentSwitchCloseHook.run = async (...args: Parameters<typeof originalCloseHook>) => {
-        targets.push(args[1]);
-        // The REAL locked primitive, i.e. what another daemon/CLI uses. A bare
-        // writeFileSync would bypass the generation stamp and so could not model a
-        // legitimate concurrent commit at all.
-        await rmwBotEntry(appId, (entry: any) => {
-          entry.cliRuntime = { id: 'runtime-b', displayName: 'RuntimeB', executable: binB };
-          entry.cliPathOverride = binB;
-          return { write: true, result: null };
-        });
-        return originalCloseHook(...args);
-      };
-
-      // Old client, model-only: its preserved proposal still carries runtime-A.
-      const saved = await fetch(`http://127.0.0.1:${handle.port}/api/bot-agent`, {
-        method: 'PUT',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ cliId: 'codex', model: 'new-model' }),
-      });
-
-      const body = await saved.json();
-      expect(
-        saved.status,
-        'a cross-process change must not be answered with 200',
-      ).not.toBe(200);
-      const stored = JSON.parse(readFileSync(configPath, 'utf-8'))[0];
-      expect(
-        stored.cliRuntime?.id,
-        "the other writer's runtime must survive",
-      ).toBe('runtime-b');
-      expect(stored.cliPathOverride).toBe(binB);
-      // The closes already happened, so this exit owes the same close summary.
-      expect(body).toMatchObject({ ok: false });
-      expect(body).toHaveProperty('closedMismatchedResidualTaskIds');
-    } finally {
-      agentSwitchCloseHook.run = originalCloseHook;
-      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
-      else process.env.BOTS_CONFIG = prevBotsConfig;
-      rmSync(dir, { recursive: true, force: true });
-    }
-  });
-
-  // The concurrency check must be NARROW: it guards only the fields the proposal
-  // is derived from. An unrelated concurrent edit (oncall bindings, a rename…)
-  // must not reject a legitimate agent switch, or the dashboard becomes unusable
-  // on a busy bot.
-  it('does not reject when a concurrent writer touched an unrelated field', async () => {
-    const dir = mkdtempSync(join(tmpdir(), 'botmux-agent-cas-narrow-'));
-    const configPath = join(dir, 'bots.json');
-    const appId = 'test-agent-cas-narrow';
-    const prevBotsConfig = process.env.BOTS_CONFIG;
-    const originalCloseHook = agentSwitchCloseHook.run;
-    try {
-      process.env.BOTS_CONFIG = configPath;
-      writeFileSync(configPath, JSON.stringify([{
-        larkAppId: appId,
-        larkAppSecret: 'secret',
-        cliId: 'codex',
-        model: 'old-model',
-      }], null, 2));
-      loadBotConfigs().forEach((c: any) => registerBot(c));
-      setLarkAppId(appId);
-      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
-
-      agentSwitchCloseHook.run = async (...args: Parameters<typeof originalCloseHook>) => {
-        await rmwBotEntry(appId, (entry: any) => {
-          entry.oncallChats = [{ chatId: 'oc_other', workingDir: dir }];
-          return { write: true, result: null };
-        });
-        return originalCloseHook(...args);
-      };
-
-      const saved = await fetch(`http://127.0.0.1:${handle.port}/api/bot-agent`, {
-        method: 'PUT',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ cliId: 'traex', model: 'new-model' }),
-      });
-
-      expect(
-        saved.status,
-        'an unrelated concurrent edit must not block the switch',
-      ).toBe(200);
-      const stored = JSON.parse(readFileSync(configPath, 'utf-8'))[0];
-      expect(stored.cliId).toBe('traex');
-      expect(stored.model).toBe('new-model');
-      // …and the other writer's unrelated edit must still be there.
-      expect(stored.oncallChats).toMatchObject([{ chatId: 'oc_other' }]);
-    } finally {
-      agentSwitchCloseHook.run = originalCloseHook;
-      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
-      else process.env.BOTS_CONFIG = prevBotsConfig;
-      rmSync(dir, { recursive: true, force: true });
-    }
-  });
-
-  // BEHAVIOURAL (stale close): the commit's CAS protects the FILE, but the closes
-  // run before it and are IRREVERSIBLE. If another process commits runtime-B in
-  // our window, sessions frozen on B are not mismatched against B — yet a stale
-  // target still describes A, so they would be killed and only then would the
-  // commit refuse. Refusing to write cannot resurrect a closed session, so the
-  // authority must be re-verified BEFORE the close.
-  it('aborts before closing anything when another writer changed the row', async () => {
-    const dir = mkdtempSync(join(tmpdir(), 'botmux-agent-staleclose-'));
-    const configPath = join(dir, 'bots.json');
-    const appId = 'test-agent-staleclose';
-    const prevBotsConfig = process.env.BOTS_CONFIG;
-    const originalCloseHook = agentSwitchCloseHook.run;
-    try {
-      process.env.BOTS_CONFIG = configPath;
-      const binA = join(dir, 'runtime-a');
-      const binB = join(dir, 'runtime-b');
-      symlinkSync(process.execPath, binA);
-      symlinkSync(process.execPath, binB);
-      writeFileSync(configPath, JSON.stringify([{
-        larkAppId: appId,
-        larkAppSecret: 'secret',
-        cliId: 'codex',
-        model: 'old-model',
-        cliRuntime: { id: 'runtime-a', displayName: 'RuntimeA', executable: binA },
-        cliPathOverride: binA,
-      }], null, 2));
-      loadBotConfigs().forEach((c: any) => registerBot(c));
-      setLarkAppId(appId);
-      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
-
-      let closeHookCalls = 0;
-      agentSwitchCloseHook.run = async (...args: Parameters<typeof originalCloseHook>) => {
-        closeHookCalls += 1;
-        return originalCloseHook(...args);
-      };
-      // Another process commits runtime-B after our authority read, before the
-      // close would run.
-      __testOnly_agentSwitchBeforePreCloseVerify.run = async () => {
-        await rmwBotEntry(appId, (entry: any) => {
-          entry.cliRuntime = { id: 'runtime-b', displayName: 'RuntimeB', executable: binB };
-          entry.cliPathOverride = binB;
-          return { write: true, result: null };
-        });
-      };
-
-      const saved = await fetch(`http://127.0.0.1:${handle.port}/api/bot-agent`, {
-        method: 'PUT',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ cliId: 'codex', model: 'new-model' }),
-      });
-
-      expect(saved.status).toBe(409);
-      expect(await saved.json()).toMatchObject({
-        ok: false,
-        error: 'bot_config_changed_during_switch',
-      });
-      expect(
-        closeHookCalls,
-        'no session may be closed against a target the authority no longer backs',
-      ).toBe(0);
-      const stored = JSON.parse(readFileSync(configPath, 'utf-8'))[0];
-      expect(stored.cliRuntime?.id, "the other writer's runtime must survive").toBe('runtime-b');
-      expect(stored.model, 'nothing may be committed').toBe('old-model');
-    } finally {
-      delete __testOnly_agentSwitchBeforePreCloseVerify.run;
-      agentSwitchCloseHook.run = originalCloseHook;
-      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
-      else process.env.BOTS_CONFIG = prevBotsConfig;
-      rmSync(dir, { recursive: true, force: true });
-    }
-  });
-
-  // BEHAVIOURAL: if the authority cannot be read, the request must FAIL CLOSED.
-  // Swallowing the error and deferring to the in-transaction backstop means the
-  // irreversible closes run first, so a request that is never committed still
-  // tears down live sessions.
-  it('fails closed without closing sessions when the persisted row is unreadable', async () => {
-    const dir = mkdtempSync(join(tmpdir(), 'botmux-agent-authority-fail-'));
-    const configPath = join(dir, 'bots.json');
-    const appId = 'test-agent-authority-fail';
-    const prevBotsConfig = process.env.BOTS_CONFIG;
-    try {
-      process.env.BOTS_CONFIG = configPath;
-      writeFileSync(configPath, JSON.stringify([{
-        larkAppId: appId,
-        larkAppSecret: 'secret',
-        cliId: 'codex',
-        model: 'old-model',
-      }], null, 2));
-      loadBotConfigs().forEach((c: any) => registerBot(c));
-      setLarkAppId(appId);
-      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
-
-      let closeHookCalls = 0;
-      const originalCloseHook = agentSwitchCloseHook.run;
-      agentSwitchCloseHook.run = async (...args: Parameters<typeof originalCloseHook>) => {
-        closeHookCalls += 1;
-        return originalCloseHook(...args);
-      };
-      // Corrupt the authority so readRawConfig throws (parse failure); an EACCES
-      // read is the same code path.
-      writeFileSync(configPath, '{ this is not valid json');
-      let broken: Response;
-      try {
-        broken = await fetch(`http://127.0.0.1:${handle.port}/api/bot-agent`, {
-          method: 'PUT',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ cliId: 'ttadk-x-codex', model: 'kimi-k2.5' }),
-        });
-      } finally {
-        agentSwitchCloseHook.run = originalCloseHook;
-      }
-      expect(broken.status).toBe(503);
-      expect(await broken.json()).toMatchObject({ error: 'bot_config_unreadable' });
-      expect(
-        closeHookCalls,
-        'an unreadable authority must not close any session',
-      ).toBe(0);
-    } finally {
-      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
-      else process.env.BOTS_CONFIG = prevBotsConfig;
-      rmSync(dir, { recursive: true, force: true });
-    }
-  });
-
-  it('updates cli selection and model through bots.json and live config', async () => {
-    const dir = mkdtempSync(join(tmpdir(), 'botmux-agent-ipc-'));
-    const configPath = join(dir, 'bots.json');
-    const appId = 'test-agent-app';
-    const prevBotsConfig = process.env.BOTS_CONFIG;
-    try {
-      process.env.BOTS_CONFIG = configPath;
-      writeFileSync(configPath, JSON.stringify([{
-        larkAppId: appId,
-        larkAppSecret: 'secret',
-        cliId: 'traex',
-        model: 'old-model',
-      }], null, 2));
-      loadBotConfigs().forEach((c: any) => registerBot(c));
-      setLarkAppId(appId);
-      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
-
-      const invalid = await fetch(`http://127.0.0.1:${handle.port}/api/bot-agent`, {
-        method: 'PUT',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ cliId: 'codex', model: 'gpt-5.4', reasoningEffort: 'ultra' }),
-      });
-      expect(invalid.status).toBe(400);
-      expect(await invalid.json()).toMatchObject({ error: 'reasoning_effort_not_supported_by_model' });
 
       const res = await fetch(`http://127.0.0.1:${handle.port}/api/bot-agent`, {
         method: 'PUT',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ cliId: 'ttadk-x-codex', model: 'kimi-k2.5', reasoningEffort: 'xhigh' }),
+        body: JSON.stringify({ cliId: 'codex', model: 'new-model' }),
       });
 
+      // Committed, and the failure is surfaced rather than swallowed.
       expect(res.status).toBe(200);
       expect(await res.json()).toMatchObject({
         ok: true,
         cliId: 'codex',
-        wrapperCli: 'ttadk codex',
-        model: 'kimi-k2.5',
-        reasoningEffort: 'xhigh',
-        selectionKey: 'ttadk-x-codex',
-      });
-      const stored = JSON.parse(readFileSync(configPath, 'utf-8'))[0];
-      expect(stored).toMatchObject({
-        cliId: 'codex',
-        wrapperCli: 'ttadk codex',
-        model: 'kimi-k2.5',
-        reasoningEffort: 'xhigh',
-      });
-
-      const sol = await fetch(`http://127.0.0.1:${handle.port}/api/bot-agent`, {
-        method: 'PUT',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ cliId: 'ttadk-x-codex', model: 'gpt-5.6-sol', reasoningEffort: 'ultra' }),
-      });
-      expect(sol.status).toBe(200);
-
-      // Simulate a stale in-memory snapshot while the locked bots.json entry
-      // already contains the newer ultra value. Validation must use the persisted
-      // row, not this stale live config.
-      getBot(appId).config.reasoningEffort = 'xhigh';
-
-      // BEHAVIOURAL assertion, not just the final status: a request that is simply
-      // invalid must be rejected BEFORE the irreversible agent-switch closes. The
-      // 400 below was already green while the close hook had in fact run once —
-      // sessions torn down for a request that never should have got that far.
-      let closeHookCalls = 0;
-      const originalCloseHook = agentSwitchCloseHook.run;
-      agentSwitchCloseHook.run = async (...args: Parameters<typeof originalCloseHook>) => {
-        closeHookCalls += 1;
-        return originalCloseHook(...args);
-      };
-      let omittedEffort: Response;
-      try {
-        omittedEffort = await fetch(`http://127.0.0.1:${handle.port}/api/bot-agent`, {
-          method: 'PUT',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ cliId: 'ttadk-x-codex', model: 'gpt-5.4' }),
-        });
-      } finally {
-        agentSwitchCloseHook.run = originalCloseHook;
-      }
-      expect(omittedEffort.status).toBe(400);
-      expect(await omittedEffort.json()).toMatchObject({ error: 'reasoning_effort_not_supported_by_model' });
-      expect(
-        closeHookCalls,
-        'live/disk drift must be rejected before any irreversible close',
-      ).toBe(0);
-      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0]).toMatchObject({
-        model: 'gpt-5.6-sol',
-        reasoningEffort: 'ultra',
-      });
-    } finally {
-      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
-      else process.env.BOTS_CONFIG = prevBotsConfig;
-      rmSync(dir, { recursive: true, force: true });
-    }
-  });
-
-  it('does NOT write bots.json or live config when a mismatched close fails', async () => {
-    // The transaction's whole claim: config commit happens only after every
-    // old-agent session is proven closed. Injected through a narrow seam because
-    // this suite runs against the real session-manager.
-    const dir = mkdtempSync(join(tmpdir(), 'botmux-agent-abort-'));
-    const configPath = join(dir, 'bots.json');
-    const appId = 'test-agent-abort';
-    const prevBotsConfig = process.env.BOTS_CONFIG;
-    const originalHook = agentSwitchCloseHook.run;
-    try {
-      process.env.BOTS_CONFIG = configPath;
-      writeFileSync(configPath, JSON.stringify([{
-        larkAppId: appId,
-        larkAppSecret: 'secret',
-        cliId: 'traex',
-        model: 'old-model',
-      }], null, 2));
-      loadBotConfigs().forEach((c: any) => registerBot(c));
-      setLarkAppId(appId);
-      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
-      // One row closed with a surviving remote, one row refused → abort.
-      agentSwitchCloseHook.run = async () => ({
-        ok: false,
-        closed: 1,
-        residual: 1,
-        failed: 1,
-        residualTaskIds: ['mojo-parked-9'],
-      });
-
-      const res = await fetch(`http://127.0.0.1:${handle.port}/api/bot-agent`, {
-        method: 'PUT',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ cliId: 'codex', model: 'kimi-k2.5' }),
-      });
-
-      expect(res.status).toBe(409);
-      expect(await res.json()).toMatchObject({
-        ok: false,
-        error: 'agent_switch_close_failed',
-        closedMismatchedSessions: 1,
         closedMismatchedFailed: 1,
-        // The surviving id must reach the client on THIS branch too — those rows
-        // did close, so this is the only report of their remote sessions.
-        closedMismatchedResidualTaskIds: ['mojo-parked-9'],
       });
-      // Disk untouched.
       expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0]).toMatchObject({
-        cliId: 'traex',
-        model: 'old-model',
+        cliId: 'codex', model: 'new-model',
       });
-      // In-memory config untouched.
-      expect(getBot(appId).config.cliId).toBe('traex');
-      expect(getBot(appId).config.model).toBe('old-model');
+      expect(getBot(appId).config.cliId).toBe('codex');
     } finally {
       agentSwitchCloseHook.run = originalHook;
+      sessionStore.init();
+      config.session.dataDir = prevDataDir;
       if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
       else process.env.BOTS_CONFIG = prevBotsConfig;
       rmSync(dir, { recursive: true, force: true });
@@ -3549,115 +3115,6 @@ describe('PUT /api/bot-agent', () => {
     } finally {
       sessionStore.init();
       config.session.dataDir = prevDataDir;
-      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
-      else process.env.BOTS_CONFIG = prevBotsConfig;
-      rmSync(dir, { recursive: true, force: true });
-    }
-  });
-
-  it('reports the closed sessions when the commit RETURNS not-ok (entry missing)', async () => {
-    // The !ok return branch, distinct from the throw path below: a live bot exists
-    // but the latest bots.json no longer contains its entry.
-    const dir = mkdtempSync(join(tmpdir(), 'botmux-agent-commitnotok-'));
-    const configPath = join(dir, 'bots.json');
-    const appId = 'test-agent-commitnotok';
-    const prevBotsConfig = process.env.BOTS_CONFIG;
-    const originalHook = agentSwitchCloseHook.run;
-    try {
-      process.env.BOTS_CONFIG = configPath;
-      writeFileSync(configPath, JSON.stringify([{
-        larkAppId: appId,
-        larkAppSecret: 'secret',
-        cliId: 'traex',
-        model: 'old-model',
-      }], null, 2));
-      loadBotConfigs().forEach((c: any) => registerBot(c));
-      setLarkAppId(appId);
-      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
-      // The row must disappear AFTER the preflight authority read and AFTER the
-      // closes — i.e. exactly in the request-time window the locked backstop
-      // exists for. Corrupting it before the request would (correctly) be
-      // refused by the fail-closed preflight and would never reach the commit.
-      agentSwitchCloseHook.run = async () => {
-        // Valid JSON, but the target entry is gone → rmwBotEntry returns !ok.
-        writeFileSync(configPath, JSON.stringify([{
-          larkAppId: 'some-other-bot',
-          larkAppSecret: 'secret',
-          cliId: 'traex',
-        }], null, 2));
-        return { ok: true, closed: 2, residual: 1, failed: 0, residualTaskIds: ['mojo-parked-9'] };
-      };
-
-      const res = await fetch(`http://127.0.0.1:${handle.port}/api/bot-agent`, {
-        method: 'PUT',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ cliId: 'codex', model: 'kimi-k2.5' }),
-      });
-
-      expect(res.ok).toBe(false);
-      expect(await res.json()).toMatchObject({
-        ok: false,
-        error: 'agent_switch_commit_failed',
-        closedMismatchedSessions: 2,
-        closedMismatchedResidual: 1,
-        closedMismatchedResidualTaskIds: ['mojo-parked-9'],
-      });
-      expect(getBot(appId).config.cliId).toBe('traex');
-    } finally {
-      agentSwitchCloseHook.run = originalHook;
-      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
-      else process.env.BOTS_CONFIG = prevBotsConfig;
-      rmSync(dir, { recursive: true, force: true });
-    }
-  });
-
-  it('still reports the closed sessions when the config commit itself fails', async () => {
-    // Third post-close exit. The closes already ran and are irreversible, so this
-    // response is the only place a surviving remote id is ever reported.
-    const dir = mkdtempSync(join(tmpdir(), 'botmux-agent-commitfail-'));
-    const configPath = join(dir, 'bots.json');
-    const appId = 'test-agent-commitfail';
-    const prevBotsConfig = process.env.BOTS_CONFIG;
-    const originalHook = agentSwitchCloseHook.run;
-    try {
-      process.env.BOTS_CONFIG = configPath;
-      writeFileSync(configPath, JSON.stringify([{
-        larkAppId: appId,
-        larkAppSecret: 'secret',
-        cliId: 'traex',
-        model: 'old-model',
-      }], null, 2));
-      loadBotConfigs().forEach((c: any) => registerBot(c));
-      setLarkAppId(appId);
-      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
-      // Make the durable write fail AFTER the closes have run — and after the
-      // preflight has already read a healthy row, so this exercises the locked
-      // backstop's throw path rather than the fail-closed preflight.
-      agentSwitchCloseHook.run = async () => {
-        rmSync(configPath);
-        mkdtempSync(join(dir, 'blocker-'));
-        writeFileSync(configPath, 'not json at all');
-        return { ok: true, closed: 2, residual: 1, failed: 0, residualTaskIds: ['mojo-parked-9'] };
-      };
-
-      const res = await fetch(`http://127.0.0.1:${handle.port}/api/bot-agent`, {
-        method: 'PUT',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ cliId: 'codex', model: 'kimi-k2.5' }),
-      });
-
-      expect(res.ok).toBe(false);
-      const body = await res.json();
-      expect(body).toMatchObject({
-        ok: false,
-        error: 'agent_switch_commit_failed',
-        closedMismatchedSessions: 2,
-        closedMismatchedResidualTaskIds: ['mojo-parked-9'],
-      });
-      // In-memory config unchanged: the switch did not take effect.
-      expect(getBot(appId).config.cliId).toBe('traex');
-    } finally {
-      agentSwitchCloseHook.run = originalHook;
       if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
       else process.env.BOTS_CONFIG = prevBotsConfig;
       rmSync(dir, { recursive: true, force: true });
@@ -3795,377 +3252,6 @@ describe('PUT /api/bot-agent', () => {
       });
       expect(JSON.parse(readFileSync(configPath, 'utf8'))[0].cliId).toBe('traex');
     } finally {
-      workerPool.setActiveSessionsRegistry(new Map());
-      sessionStore.init();
-      config.session.dataDir = prevDataDir;
-      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
-      else process.env.BOTS_CONFIG = prevBotsConfig;
-      rmSync(dir, { recursive: true, force: true });
-    }
-  });
-
-  // END-TO-END, THROUGH THE REAL ROUTE READER.
-  //
-  // Three-state concurrency: authority A, this request proposes B, and a REAL
-  // rmwBotEntry writer commits C while the close hook runs. A session frozen on C
-  // must survive: it is correct under the committed authority, and closing it
-  // cannot be undone by the commit's 409.
-  //
-  // Handing the helper a hand-written reader would not prove this. The earlier
-  // version of this fix passed such a test while the route still sent the
-  // request's own cliId/wrapperCli, so a concurrent SELECTION change stayed
-  // invisible. These cases therefore drive the real HTTP route.
-  const threeStateFixture = async (
-    appId: string,
-    dirPrefix: string,
-    initialRow: Record<string, unknown>,
-    frozen: { cliId: string; wrapperCli?: string; cliRuntime?: unknown },
-    commitDuringClose: (row: Record<string, unknown>) => void,
-    requestBody: unknown,
-    opts: { durableOnly?: boolean } = {},
-  ) => {
-    const dir = mkdtempSync(join(tmpdir(), dirPrefix));
-    const dataDir = join(dir, 'data');
-    const configPath = join(dir, 'bots.json');
-    const prevBotsConfig = process.env.BOTS_CONFIG;
-    const prevDataDir = config.session.dataDir;
-    const originalCloseHook = agentSwitchCloseHook.run;
-    try {
-      process.env.BOTS_CONFIG = configPath;
-      config.session.dataDir = dataDir;
-      writeFileSync(configPath, JSON.stringify([
-        { larkAppId: appId, larkAppSecret: 'secret', ...initialRow },
-      ], null, 2));
-      loadBotConfigs().forEach((c: any) => registerBot(c));
-      sessionStore.init(appId);
-
-      // A live session FROZEN on the identity the concurrent writer commits.
-      const session = sessionStore.createSession('oc_3s', 'om_3s', '3state', 'group');
-      session.larkAppId = appId;
-      session.cliId = frozen.cliId as any;
-      // The wrapper / runtime axes are only compared for agentFrozen rows
-      // (sessionRowMismatchesTargetCli): a legacy unfrozen session has no reliable
-      // wrapper snapshot. Without this flag those two fixtures are VACUOUS — the
-      // session never looks mismatched, so they pass even with the guard removed.
-      session.agentFrozen = true;
-      if (frozen.wrapperCli) session.wrapperCli = frozen.wrapperCli;
-      if (frozen.cliRuntime) (session as any).cliRuntime = frozen.cliRuntime;
-      sessionStore.updateSession(session);
-
-      const registry = new Map<string, any>();
-      if (!opts.durableOnly) {
-        registry.set(sessionKey(session.rootMessageId, appId), {
-          session, worker: null, workerPort: null, workerToken: null,
-          larkAppId: appId, chatId: session.chatId, chatType: 'group', scope: 'thread',
-          spawnedAt: Date.now(), cliVersion: 'test', lastMessageAt: Date.now(),
-          hasHistory: true,
-        });
-      }
-      workerPool.setActiveSessionsRegistry(registry);
-      setLarkAppId(appId);
-      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
-
-      // The concurrent writer uses the REAL locked read-modify-write, i.e. exactly
-      // what another daemon/CLI does, and lands inside the close span.
-      let writerDone = false;
-      agentSwitchCloseHook.run = async (...args: Parameters<typeof originalCloseHook>) => {
-        if (!writerDone) {
-          writerDone = true;
-          await rmwBotEntry(appId, (entry: any) => {
-            commitDuringClose(entry);
-            return { write: true, result: null };
-          });
-        }
-        return originalCloseHook(...args);
-      };
-
-      const res = await fetch(`http://127.0.0.1:${handle.port}/api/bot-agent`, {
-        method: 'PUT',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify(requestBody),
-      });
-      const body = await res.json();
-      const storedRow = JSON.parse(readFileSync(configPath, 'utf-8'))[0];
-      const sessionAfter = sessionStore.getSession(session.sessionId);
-
-      return { res, body, storedRow, sessionAfter, writerDone };
-    } finally {
-      agentSwitchCloseHook.run = originalCloseHook;
-      workerPool.setActiveSessionsRegistry(new Map());
-      sessionStore.init();
-      config.session.dataDir = prevDataDir;
-      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
-      else process.env.BOTS_CONFIG = prevBotsConfig;
-      rmSync(dir, { recursive: true, force: true });
-    }
-  };
-
-  it('three-state selection: a session frozen on the concurrently committed cliId survives', async () => {
-    const out = await threeStateFixture(
-      'test-agent-3s-sel',
-      'botmux-agent-3s-sel-',
-      // A = claude-code; request proposes B = codex; the writer commits C = traex.
-      // The session is frozen on C, so it MISMATCHES our proposal B (and would be
-      // closed) but MATCHES the committed authority C (so it must not be).
-      { cliId: 'claude-code', model: 'old-model' },
-      { cliId: 'traex' },
-      (entry) => { entry.cliId = 'traex'; },
-      { cliId: 'codex', model: 'new-model' },
-    );
-
-    expect(out.writerDone, 'the concurrent writer must have run').toBe(true);
-    expect(
-      out.sessionAfter!.status,
-      'a session frozen on the committed cliId must NOT be closed',
-    ).toBe('active');
-    expect(out.res.status, 'the doomed request must be refused').toBe(409);
-    expect(out.body).toMatchObject({ error: 'bot_config_changed_during_switch' });
-    expect(out.storedRow.cliId, "the writer's commit must survive").toBe('traex');
-    expect(out.storedRow.model, 'nothing of ours may be committed').toBe('old-model');
-  });
-
-  it('three-state selection: same protection for a DURABLE-only row', async () => {
-    const out = await threeStateFixture(
-      'test-agent-3s-durable',
-      'botmux-agent-3s-durable-',
-      { cliId: 'claude-code', model: 'old-model' },
-      { cliId: 'traex' },
-      (entry) => { entry.cliId = 'traex'; },
-      { cliId: 'codex', model: 'new-model' },
-      { durableOnly: true },
-    );
-
-    expect(out.writerDone).toBe(true);
-    expect(
-      out.sessionAfter!.status,
-      'the durable-row close path must honour the fresh authority too',
-    ).toBe('active');
-    expect(out.res.status).toBe(409);
-    expect(out.storedRow.cliId).toBe('traex');
-  });
-
-  it('three-state wrapper: a session frozen on the concurrently committed wrapper survives', async () => {
-    const out = await threeStateFixture(
-      'test-agent-3s-wrap',
-      'botmux-agent-3s-wrap-',
-      { cliId: 'codex', model: 'old-model' },
-      { cliId: 'codex', wrapperCli: 'ttadk codex' },
-      (entry) => { entry.wrapperCli = 'ttadk codex'; },
-      { cliId: 'codex', model: 'new-model' },
-    );
-
-    expect(out.writerDone).toBe(true);
-    expect(
-      out.sessionAfter!.status,
-      'the wrapper axis must be part of the identity check',
-    ).toBe('active');
-    expect(out.res.status).toBe(409);
-    expect(out.storedRow.wrapperCli).toBe('ttadk codex');
-  });
-
-  it('three-state explicit runtime: body runtime cannot override a concurrent commit', async () => {
-    const binDir = mkdtempSync(join(tmpdir(), 'botmux-agent-3s-rt-bins-'));
-    const binB = join(binDir, 'runtime-b');
-    const binC = join(binDir, 'runtime-c');
-    symlinkSync(process.execPath, binB);
-    symlinkSync(process.execPath, binC);
-    try {
-      const out = await threeStateFixture(
-        'test-agent-3s-rt',
-        'botmux-agent-3s-rt-',
-        { cliId: 'codex', model: 'old-model' },
-        {
-          cliId: 'codex',
-          cliRuntime: { id: 'runtime-c', displayName: 'RuntimeC', executable: binC },
-        },
-        (entry) => {
-          entry.cliRuntime = { id: 'runtime-c', displayName: 'RuntimeC', executable: binC };
-          entry.cliPathOverride = binC;
-        },
-        {
-          cliId: 'codex',
-          model: 'new-model',
-          cliRuntime: { id: 'runtime-b', displayName: 'RuntimeB', executable: binB },
-        },
-      );
-
-      expect(out.writerDone).toBe(true);
-      expect(
-        out.sessionAfter!.status,
-        'an explicit body runtime must not license closing a session the authority backs',
-      ).toBe('active');
-      expect(out.res.status).toBe(409);
-      expect(out.storedRow.cliRuntime?.id).toBe('runtime-c');
-    } finally {
-      rmSync(binDir, { recursive: true, force: true });
-    }
-  });
-
-  // ABA. The case a content hash structurally cannot catch.
-  //
-  // An external writer changes the identity A->C and then puts it back C->A,
-  // straddling the close window. Hashing the current identity sees "A" at the
-  // proposal, "C" during the closes (so the gate skips them) and "A" again at the
-  // commit (so a hash CAS passes) — the switch answers 200 with
-  // closedMismatchedSessions=0 while the session frozen on the OLD A is still
-  // active: a zombie on the previous engine that keeps receiving traffic.
-  //
-  // A monotonic generation lands on gen+2, so both checks refuse.
-  it('ABA: refuses when the identity is changed and changed back around the close', async () => {
-    const dir = mkdtempSync(join(tmpdir(), 'botmux-agent-aba-'));
-    const dataDir = join(dir, 'data');
-    const configPath = join(dir, 'bots.json');
-    const appId = 'test-agent-aba';
-    const prevBotsConfig = process.env.BOTS_CONFIG;
-    const prevDataDir = config.session.dataDir;
-    const originalCloseHook = agentSwitchCloseHook.run;
-    try {
-      process.env.BOTS_CONFIG = configPath;
-      config.session.dataDir = dataDir;
-      // A = claude-code.
-      writeFileSync(configPath, JSON.stringify([{
-        larkAppId: appId, larkAppSecret: 'secret', cliId: 'claude-code', model: 'old-model',
-      }], null, 2));
-      loadBotConfigs().forEach((c: any) => registerBot(c));
-      sessionStore.init(appId);
-
-      // A live session frozen on the OLD identity A. It mismatches our proposal B,
-      // so a correct switch would close it — but this switch must not succeed at
-      // all, and it must not be left half-done.
-      const session = sessionStore.createSession('oc_aba', 'om_aba', 'ABA', 'group');
-      session.larkAppId = appId;
-      session.cliId = 'claude-code';
-      session.agentFrozen = true;
-      sessionStore.updateSession(session);
-      const registry = new Map<string, any>([[sessionKey(session.rootMessageId, appId), {
-        session, worker: null, workerPort: null, workerToken: null,
-        larkAppId: appId, chatId: session.chatId, chatType: 'group', scope: 'thread',
-        spawnedAt: Date.now(), cliVersion: 'test', lastMessageAt: Date.now(),
-        hasHistory: true,
-      }]]);
-      workerPool.setActiveSessionsRegistry(registry);
-      setLarkAppId(appId);
-      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
-
-      // Both halves of the ABA go through the REAL locked primitive, and the
-      // restore happens AFTER the close hook returns — i.e. inside the remaining
-      // window before the commit. A single pre-close write would not be an ABA.
-      let phase = 0;
-      agentSwitchCloseHook.run = async (...args: Parameters<typeof originalCloseHook>) => {
-        if (phase === 0) {
-          phase = 1;
-          // A -> C
-          await rmwBotEntry(appId, (entry: any) => {
-            entry.cliId = 'traex';
-            return { write: true, result: null };
-          });
-        }
-        const result = await originalCloseHook(...args);
-        if (phase === 1) {
-          phase = 2;
-          // C -> A: the content is identical to the proposal's snapshot again.
-          await rmwBotEntry(appId, (entry: any) => {
-            entry.cliId = 'claude-code';
-            return { write: true, result: null };
-          });
-        }
-        return result;
-      };
-
-      const res = await fetch(`http://127.0.0.1:${handle.port}/api/bot-agent`, {
-        method: 'PUT',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ cliId: 'codex', model: 'new-model' }),
-      });
-      const body = await res.json();
-      const storedRow = JSON.parse(readFileSync(configPath, 'utf-8'))[0];
-
-      expect(phase, 'both halves of the ABA must have run').toBe(2);
-      expect(res.status, 'an A->C->A round trip must not be answered with 200').toBe(409);
-      expect(body).toMatchObject({ error: 'bot_config_changed_during_switch' });
-      // The external value is what survives; nothing of ours is committed.
-      expect(storedRow.cliId, "the writer's final value must survive").toBe('claude-code');
-      expect(storedRow.model, 'our model must NOT be committed').toBe('old-model');
-      // The whole point: no half-done switch. Reporting success while a session
-      // frozen on the old engine stays active is the zombie this guards.
-      expect(
-        sessionStore.getSession(session.sessionId)!.status,
-        'a refused switch must not leave a zombie: the session must not be closed',
-      ).toBe('active');
-      expect(body.closedMismatchedSessions ?? 0).toBe(0);
-    } finally {
-      agentSwitchCloseHook.run = originalCloseHook;
-      workerPool.setActiveSessionsRegistry(new Map());
-      sessionStore.init();
-      config.session.dataDir = prevDataDir;
-      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
-      else process.env.BOTS_CONFIG = prevBotsConfig;
-      rmSync(dir, { recursive: true, force: true });
-    }
-  });
-
-  it('ABA: same protection on the DURABLE-only close loop', async () => {
-    const dir = mkdtempSync(join(tmpdir(), 'botmux-agent-aba-durable-'));
-    const dataDir = join(dir, 'data');
-    const configPath = join(dir, 'bots.json');
-    const appId = 'test-agent-aba-durable';
-    const prevBotsConfig = process.env.BOTS_CONFIG;
-    const prevDataDir = config.session.dataDir;
-    const originalCloseHook = agentSwitchCloseHook.run;
-    try {
-      process.env.BOTS_CONFIG = configPath;
-      config.session.dataDir = dataDir;
-      writeFileSync(configPath, JSON.stringify([{
-        larkAppId: appId, larkAppSecret: 'secret', cliId: 'claude-code', model: 'old-model',
-      }], null, 2));
-      loadBotConfigs().forEach((c: any) => registerBot(c));
-      sessionStore.init(appId);
-
-      // Active on disk, absent from the runtime registry: the second close loop.
-      const session = sessionStore.createSession('oc_abad', 'om_abad', 'ABAd', 'group');
-      session.larkAppId = appId;
-      session.cliId = 'claude-code';
-      session.agentFrozen = true;
-      sessionStore.updateSession(session);
-      workerPool.setActiveSessionsRegistry(new Map());
-      setLarkAppId(appId);
-      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
-
-      let phase = 0;
-      agentSwitchCloseHook.run = async (...args: Parameters<typeof originalCloseHook>) => {
-        if (phase === 0) {
-          phase = 1;
-          await rmwBotEntry(appId, (entry: any) => {
-            entry.cliId = 'traex';
-            return { write: true, result: null };
-          });
-        }
-        const result = await originalCloseHook(...args);
-        if (phase === 1) {
-          phase = 2;
-          await rmwBotEntry(appId, (entry: any) => {
-            entry.cliId = 'claude-code';
-            return { write: true, result: null };
-          });
-        }
-        return result;
-      };
-
-      const res = await fetch(`http://127.0.0.1:${handle.port}/api/bot-agent`, {
-        method: 'PUT',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ cliId: 'codex', model: 'new-model' }),
-      });
-
-      expect(phase).toBe(2);
-      expect(res.status).toBe(409);
-      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].cliId).toBe('claude-code');
-      expect(
-        sessionStore.getSession(session.sessionId)!.status,
-        'the durable-only loop must not leave a zombie either',
-      ).toBe('active');
-    } finally {
-      agentSwitchCloseHook.run = originalCloseHook;
       workerPool.setActiveSessionsRegistry(new Map());
       sessionStore.init();
       config.session.dataDir = prevDataDir;

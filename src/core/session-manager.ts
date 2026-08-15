@@ -464,78 +464,32 @@ async function closeActiveSessionIfCliMismatch(ds: DaemonSession): Promise<CliMi
  * A `closed_with_residual` does NOT block the commit: the local row IS closed, so
  * nothing can route to it. Its surviving remote id is reported for manual cleanup.
  */
-/**
- * Snapshot of the CURRENTLY COMMITTED authority for a bot.
- *
- * `version` fingerprints the full launch-identity axis (cliId, wrapperCli,
- * cliRuntime, cliPathOverride and reasoningEffort), so any committed change to
- * any of them is visible as a different version. `target` is that same committed
- * state expressed as a comparison target, for diagnostics.
- */
-export interface CommittedAuthoritySnapshot {
-  /**
-   * Monotonic per-bot generation (config-gen.ts), NOT a content hash.
-   *
-   * A hash cannot distinguish "unchanged" from "changed and changed back": with
-   * A->C->A the gate skipped its closes during the C phase and the commit's CAS
-   * then saw A again and passed, so the switch reported success while sessions
-   * frozen on the old A stayed active. A counter that only increases lands on
-   * gen+2, so neither check can be fooled.
-   */
-  version: number;
-  target: CliMismatchTargetConfig;
-}
-
-/**
- * Guard supplied by the agent-switch route so each irreversible close can be
- * re-justified against the authority as it stands at that instant.
- */
-export interface FreshAuthorityGuard {
-  /** Re-reads the committed authority. Must hit the store on every call. */
-  read: () => Promise<CommittedAuthoritySnapshot | undefined | 'unreadable'>;
-  /** Generation the caller's proposal (and close target) was derived from. */
-  expectedVersion: number;
-}
-
 export async function closeSessionsForAgentSwitch(
   larkAppId: string,
-  target: CliMismatchTargetConfig,
   /**
-   * Optional in the type, always passed by the agent-switch route.
+   * Optional explicit target. The agent-switch route deliberately omits it and
+   * runs this AFTER its commit, so every decision below is made against the
+   * authority that is already durable.
    *
-   * `target` is the PROPOSED config, fixed before the closes start. The closes are
-   * irreversible and, for remote CLIs, take seconds; the bots.json lock cannot be
-   * held across them (it is not reentrant). So another process may legitimately
-   * commit a different authority mid-close, and judging sessions by the stale
-   * proposal then destroys the WRONG ones: a session frozen on the newly
-   * committed identity looks mismatched against our old target and is killed,
-   * while the genuinely stale rows are missed. Neither a pre-close check nor the
-   * commit's compare-and-swap can undo that — a closed session does not return.
+   * WHY THIS RUNS AFTER THE COMMIT
+   * ------------------------------
+   * Closing sessions before the commit put an irreversible action inside the
+   * transaction window: the proposal had to stay valid across a close that takes
+   * seconds for remote CLIs, while the bots.json lock cannot be held that long
+   * (it is not reentrant). Every attempt to police that window leaked —
+   * lost updates, a partially covered identity axis, stale targets, cross-process
+   * writes, ABA on a content hash, and a read->close TOCTOU — because bots.json
+   * is also editable by hand and by older daemons, so no cooperative protocol
+   * (counter, lease, reservation) can be relied on. Closing after the commit
+   * removes the window instead of guarding it: the config on disk is already the
+   * new truth, so a close can only ever be justified by it.
    *
-   * The rule below is therefore a VERSION GATE rather than a re-derived target:
-   *
-   *   - version unchanged  -> our proposal is still the right answer; close.
-   *   - version changed    -> this request is already doomed (the commit's CAS
-   *                           will refuse it), so close NOTHING and let the
-   *                           retry converge. Missing a close is recoverable;
-   *                           closing a correct session is not.
-   *
-   * Gating on the generation covers every identity axis at once, and — unlike the
-   * content fingerprint this replaced — it also catches an A->C->A round trip.
-   * Re-deriving a
-   * "fresh target" instead was not enough: it only tracked the runtime-preserve
-   * branch and still carried the request's own cliId/wrapperCli, so a concurrent
-   * selection or wrapper change was invisible and its sessions were still closed.
-   *
-   * Note on the tempting stronger-sounding rule "never close a session whose
-   * frozen identity equals the committed authority": taken literally it disables
-   * the feature. Until the commit runs, the committed authority IS the old agent,
-   * and sessions frozen on the old agent are exactly what an agent switch must
-   * close (measured: judging against the row itself took a legitimate
-   * closedMismatchedSessions from 1 to 0). It only holds once the authority has
-   * moved, which is precisely what the version gate detects.
+   * Consequence: a message could still reach a session on the old engine between
+   * the commit and this sweep. `withBotTurnMutation` holds admission for this bot
+   * across both, and anything that slips through is RECOVERABLE — the resweep
+   * closes it — unlike killing a session that was correct, which is not.
    */
-  freshAuthority?: FreshAuthorityGuard,
+  target?: CliMismatchTargetConfig,
 ): Promise<{
   ok: boolean;
   closed: number;
@@ -543,54 +497,19 @@ export async function closeSessionsForAgentSwitch(
   failed: number;
   residualTaskIds: string[];
 }> {
+  /**
+   * The committed authority, re-read per session rather than captured once.
+   *
+   * `getBot().config` is updated from the same transaction that wrote bots.json,
+   * so this is the value the bot actually launches with now.
+   */
+  const currentTarget = (): CliMismatchTargetConfig | undefined => {
+    if (target) return target;
+    try { return getBot(larkAppId).config; } catch { return undefined; }
+  };
   const registry = getActiveSessionsRegistry();
   const out = { ok: true, closed: 0, residual: 0, failed: 0, residualTaskIds: [] as string[] };
   const seen = new Set<string>();
-
-  /**
-   * True when the CURRENTLY COMMITTED authority still justifies closing this row.
-   *
-   * Called immediately before every irreversible close (not once per request), so
-   * a writer landing between two closes is caught before the next one.
-   */
-  const stillJustifiedByDisk = async (sessionId: string): Promise<boolean> => {
-    if (!freshAuthority) return true;
-    const fresh = await freshAuthority.read();
-    if (fresh === 'unreadable') {
-      // Cannot prove the close is still correct ⇒ refuse the switch rather than
-      // destroy a session on a guess.
-      out.failed++;
-      out.ok = false;
-      logger.error(
-        `[${sessionId.substring(0, 8)}] agent switch: cannot re-read the committed authority; `
-        + 'refusing to close on a stale target — the switch will NOT be committed',
-      );
-      return false;
-    }
-    if (!fresh) {
-      // Row gone: another process removed the bot. Nothing justifies closing now.
-      logger.warn(
-        `[${sessionId.substring(0, 8)}] agent switch: the bot row disappeared mid-switch; `
-        + 'skipping this close (the commit will refuse the switch)',
-      );
-      return false;
-    }
-    if (fresh.version !== freshAuthority.expectedVersion) {
-      // The launch identity moved under us — cliId, wrapper, runtime, legacy path
-      // or reasoning effort. Our target describes a bot that no longer exists, so
-      // sessions frozen on the NEW identity would be closed as "mismatched" and
-      // the genuinely stale ones missed. The commit's CAS is already going to
-      // refuse this request, so close nothing: a missed close is recoverable by
-      // retrying, a wrongly closed session is not.
-      logger.warn(
-        `[${sessionId.substring(0, 8)}] agent switch: the committed authority changed mid-switch `
-        + `(${freshAuthority.expectedVersion} -> ${fresh.version}); skipping this close so the `
-        + 'retry can converge',
-      );
-      return false;
-    }
-    return true;
-  };
 
   const recordClose = (
     sessionId: string,
@@ -620,8 +539,10 @@ export async function closeSessionsForAgentSwitch(
     seen.add(ds.session.sessionId);
     if (ds.session.queued) continue;
     if (ds.adoptedFrom || ds.session.adoptedFrom || ds.session.title?.startsWith('Adopt:')) continue;
-    // Compared against the PROPOSED config, not the live one.
-    if (!sessionMismatchesTargetCli(ds, target)) continue;
+    // Compared against the COMMITTED config (see currentTarget), which is what
+    // the bot launches with from now on.
+    const dsTarget = currentTarget();
+    if (!dsTarget || !sessionMismatchesTargetCli(ds, dsTarget)) continue;
     // A protected owner is NOT an exemption like adopt/queued: it is a session
     // that would keep running the old agent and cannot be closed right now, so it
     // BLOCKS the switch. The route has its own preflight, but this helper is
@@ -642,9 +563,6 @@ export async function closeSessionsForAgentSwitch(
       out.ok = false;
       continue;
     }
-    // Re-justify against the row on disk RIGHT NOW, not the proposal we captured
-    // before the closes started.
-    if (!await stillJustifiedByDisk(ds.session.sessionId)) continue;
     try {
       // The close uses the session's own FROZEN identity, so it does not depend on
       // the config we are about to (not) write.
@@ -688,7 +606,8 @@ export async function closeSessionsForAgentSwitch(
   for (const row of storedRows) {
     if (row.queued) continue;
     if (row.adoptedFrom || row.title?.startsWith('Adopt:')) continue;
-    if (!sessionRowMismatchesTargetCli(row, target)) continue;
+    const rowTarget = currentTarget();
+    if (!rowTarget || !sessionRowMismatchesTargetCli(row, rowTarget)) continue;
     if (hasProtectedSessionMutationOwnership(row)) {
       out.failed++;
       out.ok = false;
@@ -698,9 +617,6 @@ export async function closeSessionsForAgentSwitch(
       );
       continue;
     }
-    // Same re-justification as the registry loop: a durable row must also be
-    // stale relative to the authority as it stands now, not as we proposed it.
-    if (!await stillJustifiedByDisk(row.sessionId)) continue;
     try {
       // closeSession supports the stored-only shape. When cancelling genuinely
       // needs a runtime owner it returns mojo_close_identity_missing, which

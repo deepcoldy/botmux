@@ -77,7 +77,6 @@ import { summaryRangeFromBotConfig, updateDashboardSummaryRange } from '../servi
 import { config } from '../config.js';
 import { buildSafeInsightConversation, buildSafeInsightOverview, buildSafeInsightReport, buildSafeInsightTurnDetail } from '../services/insight/report.js';
 import type { InsightConversationRole, InsightDetail, InsightSeverity, SafeSpanTag } from '../services/insight/types.js';
-import { configGenOf } from '../services/config-gen.js';
 import { readRawConfig, findEntryIndex, requireConfigPath, rmwBotEntry } from '../services/config-store.js';
 import { setDefaultLocale, localeForBot, t } from '../i18n/index.js';
 import { isLocale, type Locale } from '../i18n/types.js';
@@ -104,13 +103,6 @@ export const agentSwitchCloseHook = {
   run: closeSessionsForAgentSwitch as typeof closeSessionsForAgentSwitch,
 };
 
-/**
- * Deterministic interleaving point for tests only: fires immediately before the
- * agent-switch handler re-verifies the authority version under the file lock, so
- * a test can simulate another process committing in that window. Never set in
- * runtime code (same pattern as file-lock's test hooks).
- */
-export const __testOnly_agentSwitchBeforePreCloseVerify: { run?: () => void | Promise<void> } = {};
 import { parseSpawnRequest } from './session-create.js';
 import { cleanupMaterializedDashboardImages, materializeDashboardImages } from './dashboard-images.js';
 import { getCliDisplayName } from '../im/lark/card-builder.js';
@@ -3951,97 +3943,16 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
   // authority read AND every proposal derived from it must happen after admission
   // and before the irreversible close.
   return withBotTurnMutation(larkAppId, async () => {
-    // SINGLE AUTHORITY SNAPSHOT for every decision this handler makes.
-    //
-    // `getBot().config` is the live in-memory snapshot; the transaction below
-    // mutates the bots.json row. They are different sources and can already
-    // disagree BEFORE the request arrives, so anything derived from memory may
-    // describe a bot that no longer exists on disk. That matters because these
-    // derived values do not merely gate a 4xx — they feed
-    //   1. `switchTarget`, i.e. WHICH sessions agentSwitchCloseHook irreversibly
-    //      closes, and
-    //   2. the runtime fields written back,
-    // so a stale read closes the wrong sessions and can silently erase a persisted
-    // cliRuntime / cliPathOverride. Read the row ONCE, up front, and derive
-    // selection, runtime preservation and reasoning effort from that one snapshot.
-    //
-    // Both a read failure and a missing row are FAIL-CLOSED. Preconditions cannot
-    // be decided against the authority, and deferring to the in-transaction
-    // backstop would mean running the irreversible closes first; refusing keeps
-    // "a failed validation produces no side effects" true. A missing row is the
-    // same condition rmwBotEntry reports as `bot_not_in_config`.
-    //
-    // The read itself happens INSIDE the cross-process file lock (a write:false
-    // rmw), so the snapshot and its fingerprint always describe the same
-    // committed state — a plain read could observe a row mid-update. The lock is
-    // released before the closes (they are slow and must not hold it), so the
-    // generation is re-checked at commit time; see config-gen.ts.
-    let persistedBotRow: Record<string, unknown>;
-    let authorityVersion: number;
-    try {
-      const snapshot = await rmwBotEntry<{ row: Record<string, unknown>; version: number }>(
-        larkAppId,
-        (entry) => ({
-          write: false,
-          result: {
-            row: { ...(entry as Record<string, unknown>) },
-            // Monotonic generation, NOT a content hash: a hash cannot tell
-            // "unchanged" from "changed and changed back" (A->C->A), and that ABA
-            // was invisible to both the per-close gate and the commit CAS at once.
-            version: configGenOf(entry as Record<string, unknown>),
-          },
-        }),
-      );
-      if (!snapshot.ok) return jsonRes(res, 404, { ok: false, error: snapshot.reason });
-      persistedBotRow = snapshot.result.row;
-      authorityVersion = snapshot.result.version;
-    } catch (err) {
-      return jsonRes(res, 503, {
-        ok: false,
-        error: 'bot_config_unreadable',
-        message: err instanceof Error ? err.message : String(err),
-      });
-    }
-    // Narrow to exactly the fields this handler is allowed to derive from, so
-    // reaching for any other field forces a deliberate decision about authority.
-    const currentBotConfig = persistedBotRow as unknown as {
-      cliId?: string;
-      wrapperCli?: string;
-      cliRuntime?: CliRuntimeConfig;
-      cliPathOverride?: string;
-      reasoningEffort?: typeof reasoningEffort;
-    };
     const supportsReasoningEffort = isCodexReasoningCliId(selected.cliId);
-    // PRECONDITION, checked before any irreversible work.
+    // NO PRECONDITION IS EVALUATED HERE.
     //
-    // The model-support check also exists inside the rmwBotEntry transaction below,
-    // but that runs AFTER agentSwitchCloseHook has already closed every session
-    // frozen on the old agent — closes that cannot be undone. So a request that is
-    // simply invalid (e.g. codex + a model that rejects `ultra`) used to tear down
-    // live sessions and only then answer 400, breaking "a failed validation
-    // produces no side effects".
-    //
-    // The in-transaction copy is deliberately KEPT as a backstop: only it sees the
-    // row under the write lock, so it still covers a genuine request-time race, and
-    // its rejection carries the close summary.
-    //
-    // The absent-field fallback comes from the authority snapshot above, i.e. the
-    // same bots.json row the transaction reads. Drift example this closes: live
-    // `xhigh` (supported) over persisted `ultra` (not supported) let the preflight
-    // pass, the irreversible close run, and only then the locked read reject.
-    const persistedReasoningEffort = currentBotConfig.reasoningEffort;
-    const preflightReasoningEffort = supportsReasoningEffort
-      ? (reasoningEffortFieldPresent ? reasoningEffort ?? undefined : persistedReasoningEffort)
-      : undefined;
-    if (preflightReasoningEffort
-        && !codexModelSupportsReasoningEffort(model || undefined, preflightReasoningEffort)) {
-      return jsonRes(res, 400, {
-        ok: false,
-        error: 'reasoning_effort_not_supported_by_model',
-        message: `模型 ${model || '（Codex 默认模型）'} 不支持当前思考强度`,
-      });
-    }
+    // Everything that depends on the persisted row — the preserved runtime, the
+    // reasoning-effort support check, the availability warning — is decided inside
+    // the single rmwBotEntry transaction below, against the entry the same
+    // transaction writes. That is what makes the window zero: there is no span in
+    // which a proposal derived from one state could be committed against another.
     const runtimeFieldPresent = Object.prototype.hasOwnProperty.call(body, 'cliRuntime');
+    let explicitRuntime: CliRuntimeConfig | undefined;
     // A legacy row may OMIT cliId. That is not "no selection": parseBotConfigFile
     // normalises it to claude-code (`entry.cliId ?? 'claude-code'`), so the bot IS
     // on claude-code and may well carry a legacy cliPathOverride. Reading the raw
@@ -4076,14 +3987,6 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
         nextLegacyPath: preserved ? undefined : row.cliPathOverride,
       };
     };
-    const currentSelectionKey = selectionKeyForBot(
-      currentBotConfig.cliId ?? LEGACY_DEFAULT_CLI_ID,
-      currentBotConfig.wrapperCli,
-    );
-    const selectionChanged = key !== currentSelectionKey;
-    let explicitRuntime: CliRuntimeConfig | undefined;
-    let nextRuntime: CliRuntimeConfig | undefined;
-    let nextLegacyPath: string | undefined;
     if (runtimeFieldPresent) {
       if (body.cliRuntime !== null) {
         if (selected.cliId !== 'codex') {
@@ -4105,33 +4008,35 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
       // null explicitly means built-in runtime; both structured and legacy
       // executable overrides are cleared.
     }
-    // Single derivation path for the proposal actually used below.
-    ({ nextRuntime, nextLegacyPath } = deriveRuntimeForRow(currentBotConfig));
-    const effectivePath = nextRuntime?.executable ?? nextLegacyPath;
-    const availability = checkCliAvailability({
-      cliId: selected.cliId,
-      wrapperCli: selected.wrapperCli,
-      cliPathOverride: effectivePath,
-    });
+    // An explicitly supplied runtime does not depend on the persisted row, so its
+    // availability and --version probe are done here — deliberately OUTSIDE the
+    // transaction, because a probe spawns a process and must never run while the
+    // bots.json lock is held. The preserve branch needs the row and is therefore
+    // resolved inside the transaction, where it only does a (process-free)
+    // availability lookup.
     let runtimeProbe: { version: string; updateProvider: string } | undefined;
-    if (runtimeFieldPresent && nextRuntime) {
-      if (!availability.available) {
+    if (runtimeFieldPresent && explicitRuntime) {
+      const explicitAvailability = checkCliAvailability({
+        cliId: selected.cliId,
+        wrapperCli: selected.wrapperCli,
+        cliPathOverride: explicitRuntime.executable,
+      });
+      if (!explicitAvailability.available) {
         return jsonRes(res, 400, {
           ok: false,
           error: 'runtime_unavailable',
-          message: availability.reason ?? 'runtime executable is unavailable',
+          message: explicitAvailability.reason ?? 'runtime executable is unavailable',
         });
       }
       try {
-        const raw = execFileSync(availability.resolvedPath ?? nextRuntime.executable, ['--version'], {
-          encoding: 'utf8',
-          timeout: 5_000,
-          stdio: ['ignore', 'pipe', 'pipe'],
-          maxBuffer: 2 * 1024 * 1024,
-        }).trim();
+        const raw = execFileSync(
+          explicitAvailability.resolvedPath ?? explicitRuntime.executable,
+          ['--version'],
+          { encoding: 'utf8', timeout: 5_000, stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 2 * 1024 * 1024 },
+        ).trim();
         const version = raw.match(/\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?/)?.[0];
         if (!version) throw new Error(`无法识别 --version 输出：${raw.slice(0, 120)}`);
-        runtimeProbe = { version, updateProvider: nextRuntime.update?.provider ?? 'auto' };
+        runtimeProbe = { version, updateProvider: explicitRuntime.update?.provider ?? 'auto' };
       } catch (err) {
         return jsonRes(res, 400, {
           ok: false,
@@ -4140,12 +4045,6 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
         });
       }
     }
-    // Existing Bot edits remain saveable (operators may intentionally configure
-    // first and install second), but the response is explicit so Dashboard never
-    // claims a missing Agent was saved successfully without qualification.
-    const availabilityWarning = availability.available
-      ? undefined
-      : `配置已保存，但所选 Agent 当前无法启动：${availability.reason ?? '本地启动依赖不可用'}。请先在 daemon 所在机器安装或修正 PATH / CLI 路径。`;
 
     // Agent selection can replace every live worker generation and may also
     // auto-clear readIsolation. Close admission and drain in-flight acceptance
@@ -4163,240 +4062,156 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
     ])) return;
 
     // If the new CLI/wrapper can no longer enforce a currently-on read isolation,
-    // auto-clear the flag here so the next session doesn't fail-close on it. (The
-    // read-isolation toggle validates at enable time; changing the agent afterwards
-    // is the other way a bot could end up configured-but-unenforceable.)
-    let readIsolationCleared = false;
-    // ── close BEFORE commit ────────────────────────────────────────────────
-    // Every session frozen on the OLD agent is closed first, compared against the
-    // PROPOSED config. If any close fails we do not write bots.json and do not
-    // touch the in-memory config, so the bot keeps running the old agent — the
-    // same one those still-active rows are frozen on. Committing first was what
-    // allowed "config says new agent, next message resurrects the old one".
+    // the flag is auto-cleared inside the transaction below, so the next session
+    // doesn't fail-close on it. (The read-isolation toggle validates at enable
+    // time; changing the agent afterwards is the other way a bot could end up
+    // configured-but-unenforceable.)
+    // CAN THIS SWITCH BE CONVERGED AT ALL? — pure check, no side effects.
     //
-    // We are inside withBotTurnMutation, so no new turn can be admitted for this
-    // bot between the closes and the commit.
-    const switchTarget = {
-      cliId: selected.cliId,
-      cliRuntime: nextRuntime,
-      cliPathOverride: nextRuntime?.executable ?? nextLegacyPath,
-      wrapperCli: selected.wrapperCli,
-    };
-
-    // PRE-CLOSE AUTHORITY RE-VERIFY, under the cross-process file lock.
-    //
-    // The commit's CAS protects the FILE, but by then the closes have already
-    // happened — and they are irreversible. Between our authority read and here,
-    // another daemon/CLI may have committed a new runtime; sessions frozen on THAT
-    // runtime are not mismatched against it, yet `switchTarget` still describes the
-    // old row, so the hook would close the wrong sessions and only afterwards would
-    // the commit refuse. Killing live sessions cannot be undone by refusing to
-    // write, so the check has to happen BEFORE the close, not just at commit time.
-    //
-    // withFileLock is not reentrant and the closes are slow, so the lock cannot be
-    // held across them; this is therefore a re-verify (write:false rmw), and the
-    // commit keeps its own CAS for the remaining close-duration window.
-    if (__testOnly_agentSwitchBeforePreCloseVerify.run) {
-      await __testOnly_agentSwitchBeforePreCloseVerify.run();
-    }
+    // The sweep below runs after the commit, so it cannot un-commit. Conditions
+    // that make convergence IMPOSSIBLE must therefore be rejected before writing.
+    // An unreadable durable store is exactly that: sessions frozen on the old
+    // agent could not even be enumerated, so committing would strand them with no
+    // way to find them again. Failing closed here keeps the bot on its current
+    // agent. (Runtime close failures — e.g. a remote cancel that errors — cannot
+    // be predicted; those are reported and retried by the resweep.)
     try {
-      const recheck = await rmwBotEntry<number>(larkAppId, (entry) => ({
-        write: false,
-        result: configGenOf(entry as Record<string, unknown>),
-      }));
-      if (!recheck.ok) {
-        return jsonRes(res, 404, { ok: false, error: recheck.reason });
-      }
-      if (recheck.result !== authorityVersion) {
-        // No close has run yet, so there is nothing to report and no side effect
-        // to undo — a plain 409 the caller can retry against the new state.
-        return jsonRes(res, 409, {
-          ok: false,
-          error: 'bot_config_changed_during_switch',
-          message: '配置在本次切换过程中被其它进程修改，已在关闭任何会话前中止；请重试。',
-        });
-      }
+      sessionStore.listSessionsStrict();
     } catch (err) {
-      // Cannot prove the target is still valid ⇒ fail closed, before any close.
-      return jsonRes(res, 503, {
+      return jsonRes(res, 409, {
         ok: false,
-        error: 'bot_config_unreadable',
-        message: err instanceof Error ? err.message : String(err),
+        error: 'agent_switch_close_failed',
+        reason: err instanceof Error ? err.message : String(err),
+        closedMismatchedSessions: 0,
+        closedMismatchedResidual: 0,
+        closedMismatchedFailed: 1,
+        closedMismatchedResidualTaskIds: [],
       });
     }
 
-    // Each close is re-justified against the row on disk at that moment. The
-    // pre-close verify above only proves the target was valid when the lock was
-    // released; the closes then run unlocked for as long as a remote CLI needs, so
-    // a writer committing in that span would otherwise make us close sessions that
-    // are correct under the new authority and miss the ones that are not. A closed
-    // session cannot be restored by refusing the commit, so the check has to be
-    // per-close, not per-request.
-    const readCommittedAuthority = async (): Promise<
-      { version: number; target: {
-        cliId?: typeof selected.cliId; wrapperCli?: string;
-        cliRuntime?: CliRuntimeConfig; cliPathOverride?: string;
-      } } | undefined | 'unreadable'
-    > => {
-      try {
-        const raw = await readRawConfig(requireConfigPath());
-        const idx = findEntryIndex(raw, larkAppId);
-        if (idx < 0) return undefined;
-        const row = raw[idx] as Record<string, unknown>;
-        return {
-          // Fingerprints the WHOLE launch-identity axis, so a concurrent change to
-          // cliId / wrapperCli / cliRuntime / cliPathOverride / reasoningEffort is
-          // all equally visible. An earlier version re-derived a "fresh target"
-          // instead and only tracked the runtime-preserve branch — it kept the
-          // request's own cliId and wrapperCli, so a concurrent selection or
-          // wrapper change stayed invisible and its sessions were still closed.
-          version: configGenOf(row),
-          // The committed identity itself, for diagnostics.
-          target: {
-            cliId: (row.cliId ?? LEGACY_DEFAULT_CLI_ID) as typeof selected.cliId,
-            wrapperCli: row.wrapperCli as string | undefined,
-            cliRuntime: row.cliRuntime as CliRuntimeConfig | undefined,
-            cliPathOverride: row.cliPathOverride as string | undefined,
-          },
-        };
-      } catch {
-        // Never downgrade to "nothing changed": that would re-open the hole.
-        return 'unreadable';
-      }
-    };
-    const closedMismatchedSessions = await agentSwitchCloseHook.run(
-      larkAppId,
-      switchTarget,
-      { read: readCommittedAuthority, expectedVersion: authorityVersion },
-    );
-    // ONE shape for every post-close exit. These closes are irreversible, so each
-    // exit after them is the only report of a surviving remote session; three
-    // hand-written copies would drift.
-    const closeSummaryPayload = (error: string, reason?: string) => ({
-      ok: false as const,
-      error,
-      ...(reason ? { reason } : {}),
-      closedMismatchedSessions: closedMismatchedSessions.closed,
-      closedMismatchedResidual: closedMismatchedSessions.residual,
-      closedMismatchedFailed: closedMismatchedSessions.failed,
-      closedMismatchedResidualTaskIds: closedMismatchedSessions.residualTaskIds,
-    });
-    if (!closedMismatchedSessions.ok) {
-      // Rows that DID close stay closed (a cancelled remote session cannot be
-      // brought back); the ones that refused are still active on the old agent,
-      // which is still the configured agent. Consistent, and retryable by saving
-      // again.
-      return jsonRes(res, 409, closeSummaryPayload('agent_switch_close_failed'));
-    }
-
-    // Upstream #838 added a reasoning-effort precondition; it returns write:false
-    // so it must stay INSIDE the transaction, and its result type has to be
-    // declared here. The close hook above already ran, so a rejection here is one
-    // more post-close exit and must carry the same summary (see below).
+    // ── ONE TRANSACTION: derive, validate and write, all under the lock ──
+    //
+    // The proposal is computed from the very `entry` this transaction writes, so
+    // there is no window between deciding and committing. Everything that used to
+    // guard such a window (a pre-close re-verify, a per-close authority gate, a
+    // commit-time compare-and-swap over a fingerprint, then a monotonic counter)
+    // is gone: it was only ever needed because an irreversible close sat inside
+    // the window. bots.json is also editable by hand and by older daemons, so no
+    // cooperative protocol could have closed that window anyway.
+    let readIsolationCleared = false;
+    let committedRuntime: CliRuntimeConfig | undefined;
+    let committedLegacyPath: string | undefined;
+    let availabilityWarning: string | undefined;
+    let agentAvailable = true;
+    let requiredCommand: string | undefined;
     let r: Awaited<ReturnType<typeof rmwBotEntry<{
-      error?: 'reasoning_effort_not_supported_by_model' | 'bot_config_changed_during_switch';
+      error?: 'reasoning_effort_not_supported_by_model';
       nextReasoningEffort?: typeof reasoningEffort;
     }>>>;
     try {
       r = await rmwBotEntry<{
-        error?: 'reasoning_effort_not_supported_by_model' | 'bot_config_changed_during_switch';
+        error?: 'reasoning_effort_not_supported_by_model';
         nextReasoningEffort?: typeof reasoningEffort;
       }>(larkAppId, (entry) => {
-    // OPTIMISTIC CONCURRENCY CHECK, under the cross-process write lock.
-    //
-    // Between our authority read and here, another daemon/CLI may have committed
-    // a legitimate change (the irreversible closes sit in that window and the
-    // file lock is not held across them). Our proposal — including the runtime we
-    // preserve for old model-only clients and the target we already closed
-    // against — describes the OLD row, so committing it now would silently
-    // overwrite the other writer and answer 200 with a stale target. Refuse
-    // instead; the caller can retry against the new state.
-    if (configGenOf(entry as Record<string, unknown>) !== authorityVersion) {
-      return { write: false, result: { error: 'bot_config_changed_during_switch' as const } };
-    }
-    const nextReasoningEffort = supportsReasoningEffort
-      ? (reasoningEffortFieldPresent ? reasoningEffort ?? undefined : entry.reasoningEffort)
-      : undefined;
-    if (nextReasoningEffort && !codexModelSupportsReasoningEffort(model || undefined, nextReasoningEffort)) {
-      return { write: false, result: { error: 'reasoning_effort_not_supported_by_model' } };
-    }
-    entry.cliId = selected.cliId;
-    if (selected.wrapperCli) entry.wrapperCli = selected.wrapperCli;
-    else delete entry.wrapperCli;
-    if (nextRuntime) {
-      entry.cliRuntime = nextRuntime;
-      // Downgrade shadow: older BotMux versions ignore cliRuntime but retain
-      // cliPathOverride, so a rollback still launches this distribution.
-      entry.cliPathOverride = nextRuntime.executable;
-    } else if (nextLegacyPath) {
-      entry.cliPathOverride = nextLegacyPath;
-      delete entry.cliRuntime;
-    } else {
-      delete entry.cliRuntime;
-      delete entry.cliPathOverride;
-    }
-    if (model) entry.model = model;
-    else delete entry.model;
-    if (!supportsReasoningEffort) delete entry.reasoningEffort;
-    else if (reasoningEffortFieldPresent) {
-      if (reasoningEffort) entry.reasoningEffort = reasoningEffort;
-      else delete entry.reasoningEffort;
-    }
-    if (entry.readIsolation === true &&
-        !readIsolationEnforceableFor({ cliId: selected.cliId, cliPathOverride: effectivePath, wrapperCli: selected.wrapperCli })) {
-      delete entry.readIsolation;
-      readIsolationCleared = true;
-    }
-    // 远端 CLI（riff / mojo）→ backendType 自动设为同名后端（否则 spawn 走 pty
-    // 后端，而它们的 resolvedBin 是空串）。
-    if (isRemoteCliId(selected.cliId)) {
-      entry.backendType = selected.cliId as typeof entry.backendType;
-    } else if (entry.backendType && isRemoteBackendType(entry.backendType)) {
-      // 从远端 CLI 切回其它 CLI：清掉这个自动配对的 backend override，回落 daemon
-      // 默认后端——否则新 CLI 会跑在远端 Backend 上（PTY 分块输入被当成一串远端
-      // turn）。手动的 pty/tmux/herdr/zellij override 不受影响（它们不是远端后端）。
-      delete entry.backendType;
-    }
-    return { write: true, result: { nextReasoningEffort } };
+        // Derived from THIS entry, not from a snapshot taken earlier.
+        const derived = deriveRuntimeForRow(entry as {
+          cliId?: string; wrapperCli?: string;
+          cliRuntime?: CliRuntimeConfig; cliPathOverride?: string;
+        });
+        const nextRuntime = derived.nextRuntime;
+        const nextLegacyPath = derived.nextLegacyPath;
+        const effectivePath = nextRuntime?.executable ?? nextLegacyPath;
+        // Availability only inspects the filesystem/PATH — no child process, so it
+        // is safe to hold the lock across it. The --version probe, which does spawn
+        // one, ran before this transaction.
+        const availability = checkCliAvailability({
+          cliId: selected.cliId,
+          wrapperCli: selected.wrapperCli,
+          cliPathOverride: effectivePath,
+        });
+
+        const nextReasoningEffort = supportsReasoningEffort
+          ? (reasoningEffortFieldPresent ? reasoningEffort ?? undefined : entry.reasoningEffort)
+          : undefined;
+        if (nextReasoningEffort
+            && !codexModelSupportsReasoningEffort(model || undefined, nextReasoningEffort)) {
+          // Rejected before anything is written and before any session is touched.
+          return { write: false, result: { error: 'reasoning_effort_not_supported_by_model' as const } };
+        }
+
+        entry.cliId = selected.cliId;
+        if (selected.wrapperCli) entry.wrapperCli = selected.wrapperCli;
+        else delete entry.wrapperCli;
+        if (nextRuntime) {
+          entry.cliRuntime = nextRuntime;
+          // Downgrade shadow: older BotMux versions ignore cliRuntime but retain
+          // cliPathOverride, so a rollback still launches this distribution.
+          entry.cliPathOverride = nextRuntime.executable;
+        } else if (nextLegacyPath) {
+          entry.cliPathOverride = nextLegacyPath;
+          delete entry.cliRuntime;
+        } else {
+          delete entry.cliRuntime;
+          delete entry.cliPathOverride;
+        }
+        if (model) entry.model = model;
+        else delete entry.model;
+        if (!supportsReasoningEffort) delete entry.reasoningEffort;
+        else if (reasoningEffortFieldPresent) {
+          if (reasoningEffort) entry.reasoningEffort = reasoningEffort;
+          else delete entry.reasoningEffort;
+        }
+        if (entry.readIsolation === true && !readIsolationEnforceableFor({
+          cliId: selected.cliId, cliPathOverride: effectivePath, wrapperCli: selected.wrapperCli,
+        })) {
+          delete entry.readIsolation;
+          readIsolationCleared = true;
+        }
+        // 远端 CLI（riff / mojo）→ backendType 自动设为同名后端（否则 spawn 走 pty
+        // 后端，而它们的 resolvedBin 是空串）。
+        if (isRemoteCliId(selected.cliId)) {
+          entry.backendType = selected.cliId as typeof entry.backendType;
+        } else if (entry.backendType && isRemoteBackendType(entry.backendType)) {
+          // 从远端 CLI 切回其它 CLI：清掉这个自动配对的 backend override，回落 daemon
+          // 默认后端——否则新 CLI 会跑在远端 Backend 上（PTY 分块输入被当成一串远端
+          // turn）。手动的 pty/tmux/herdr/zellij override 不受影响。
+          delete entry.backendType;
+        }
+
+        // Published to the response and to the live config below.
+        committedRuntime = nextRuntime;
+        committedLegacyPath = nextLegacyPath;
+        agentAvailable = availability.available;
+        requiredCommand = availability.command;
+        // Existing Bot edits remain saveable (operators may intentionally configure
+        // first and install second), but the response is explicit so Dashboard never
+        // claims a missing Agent was saved successfully without qualification.
+        availabilityWarning = availability.available
+          ? undefined
+          : `配置已保存，但所选 Agent 当前无法启动：${availability.reason ?? '本地启动依赖不可用'}。请先在 daemon 所在机器安装或修正 PATH / CLI 路径。`;
+        return { write: true, result: { nextReasoningEffort } };
       });
     } catch (err) {
-      // A read/rename/atomic-write throw would otherwise escape this handler with
-      // no body at all, losing the same summary the !ok branch preserves.
-      return jsonRes(res, 500, closeSummaryPayload(
-        'agent_switch_commit_failed',
-        err instanceof Error ? err.message : String(err),
-      ));
-    }
-    if (!r.ok) {
-      // Third post-close exit. The closes above are IRREVERSIBLE, so this must
-      // carry the same summary as the 409 branch — otherwise a commit failure
-      // silently destroys the only handle for a surviving remote session.
-      return jsonRes(res, 400, closeSummaryPayload('agent_switch_commit_failed', r.reason));
-    }
-    if (r.result.error === 'bot_config_changed_during_switch') {
-      // Fifth post-close exit. Another writer committed inside our window, so the
-      // proposal (and the target we closed against) is stale and must NOT be
-      // written. bots.json keeps the other writer's value; the closes already
-      // happened, so this owes the same summary as every other post-close exit.
-      return jsonRes(res, 409, {
-        ...closeSummaryPayload(r.result.error),
-        message: '配置在本次切换过程中被其它进程修改，未写入以免覆盖更新的值；请重试。',
+      // Nothing was written and no session was touched.
+      return jsonRes(res, 500, {
+        ok: false,
+        error: 'agent_switch_commit_failed',
+        message: err instanceof Error ? err.message : String(err),
       });
     }
+    if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
     if (r.result.error) {
-      // Fourth post-close exit (upstream #838's reasoning-effort precondition).
-      // It returns write:false from INSIDE the transaction, so bots.json is
-      // untouched — but the closes already happened, so it owes the same summary.
       return jsonRes(res, 400, {
-        ...closeSummaryPayload(r.result.error),
+        ok: false,
+        error: r.result.error,
         message: `模型 ${model || '（Codex 默认模型）'} 不支持当前思考强度`,
       });
     }
 
     const bot = getBot(larkAppId);
     bot.config.cliId = selected.cliId;
-    bot.config.cliRuntime = nextRuntime;
-    bot.config.cliPathOverride = nextRuntime?.executable ?? nextLegacyPath;
+    bot.config.cliRuntime = committedRuntime;
+    bot.config.cliPathOverride = committedRuntime?.executable ?? committedLegacyPath;
     if (selected.wrapperCli) bot.config.wrapperCli = selected.wrapperCli;
     else bot.config.wrapperCli = undefined;
     bot.config.model = model || undefined;
@@ -4409,12 +4224,27 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
       bot.config.backendType = undefined;
     }
 
+    // ── SWEEP AFTER the commit ────────────────────────────────────────────
+    //
+    // Now that bots.json and the live config both hold the new agent, sessions
+    // still frozen on the old one are closed. Each decision is made against that
+    // committed authority (re-read per session), so a close can only happen while
+    // the config actually justifies it.
+    //
+    // Ordering trade-off, deliberately taken this way round: a message could still
+    // reach an old-engine session between the commit and this sweep.
+    // `withBotTurnMutation` holds admission for this bot across both, and whatever
+    // slips through is RECOVERABLE — the resweep closes it. Closing before the
+    // commit instead made the failure mode unrecoverable: a stale target killed
+    // sessions that were correct, and no later refusal could bring them back.
+    const closedMismatchedSessions = await agentSwitchCloseHook.run(larkAppId);
+
     const selectionKey = selectionKeyForBot(selected.cliId, selected.wrapperCli);
     jsonRes(res, 200, {
       ok: true,
       cliId: selected.cliId,
-      cliRuntime: nextRuntime ?? null,
-      cliPathOverride: nextRuntime ? null : nextLegacyPath ?? null,
+      cliRuntime: committedRuntime ?? null,
+      cliPathOverride: committedRuntime ? null : committedLegacyPath ?? null,
       wrapperCli: selected.wrapperCli ?? null,
       model: model || null,
       reasoningEffort: supportsReasoningEffort ? bot.config.reasoningEffort ?? null : null,
@@ -4432,9 +4262,9 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
       readIsolation: bot.config.readIsolation === true,
       readIsolationSupported: readIsolationEnforceableFor(bot.config),
       readIsolationCleared,
-      agentAvailable: availability.available,
+      agentAvailable,
       availabilityWarning,
-      requiredCommand: availability.command,
+      requiredCommand,
       runtimeProbe,
     });
   });
