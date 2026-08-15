@@ -36,6 +36,7 @@ import {
   type IsolationCapability,
 } from './adapters/cli/read-isolation.js';
 import { buildFsPolicy, compileToSeatbelt, migrateLegacySandboxFields, resolveRedirectedAdapterAuthPaths, FsPolicyConfigError } from './adapters/cli/fs-policy.js';
+import { normalizeDestroyResult, mayRestoreWriteAdmission } from './adapters/backend/destroy-result.js';
 import { isRemoteBackendType, killPersistentBackendTarget, killPersistentSession, probePersistentBackendTarget, probePersistentSession, shouldRejectPersistentPostKillProbe, type PersistentBackendType } from './core/persistent-backend.js';
 import { finalizeRawCommandDelivery, writeRawCommandLine } from './core/raw-command-writer.js';
 import { rawCommandWriteOptionsFor } from './core/raw-command-write-options.js';
@@ -17040,23 +17041,10 @@ process.on('message', async (raw: unknown) => {
             if (!backend?.destroySession) {
               result = { ok: false, error: 'remote_close_unsupported' };
             } else {
-              const raw = await backend.destroySession();
-              const structured = raw && typeof raw === 'object' && 'ok' in raw;
-              // Local multiplexers legitimately return void: their destroy is a
-              // synchronous, already-completed teardown, so "no result" really
-              // does mean success and must keep defaulting to ok:true.
-              //
-              // Remote backends (mojo, riff) are the opposite. Their teardown is
-              // an asynchronous cancellation that can only be reported through
-              // SessionDestroyResult, so a missing or malformed result is an
-              // UNKNOWN outcome -- and treating unknown as success is what lets
-              // the daemon publish a closed row while a credentialed remote
-              // session (and its local mojo child) keeps running.
-              result = structured
-                ? raw as SessionDestroyResult
-                : isRemoteBackendType(effectiveBackendType)
-                  ? { ok: false, error: 'remote_close_result_missing' }
-                  : { ok: true };
+              result = normalizeDestroyResult(
+                await backend.destroySession(),
+                { remote: isRemoteBackendType(effectiveBackendType) },
+              );
             }
           } catch (err) {
             result = { ok: false, error: err instanceof Error ? err.message : String(err) };
@@ -17065,8 +17053,22 @@ process.on('message', async (raw: unknown) => {
         if (result.ok) {
           preparedCloseRequestId = msg.requestId;
         } else if (attemptedPrepare) {
-          await backend?.abortDestroySession?.();
-          lastAbortedCloseRequestId = msg.requestId;
+          // Only a REVERSIBLE failure may restore write admission. Aborting on
+          // every ok:false re-opened writes on a lineage that had already been
+          // cancelled remotely (a session that looks writable but can never
+          // continue), and it also started a fresh lineage on top of a possible
+          // unnamed orphan when the outcome was merely unknown. Absent recovery
+          // keeps the historical rollback behaviour.
+          if (mayRestoreWriteAdmission(result)) {
+            await backend?.abortDestroySession?.();
+            lastAbortedCloseRequestId = msg.requestId;
+          } else {
+            log(
+              `${effectiveBackendType} close prepare failed as `
+              + `${result.recovery ?? 'retryable'}; write admission stays fenced `
+              + '(session remains active for retry)',
+            );
+          }
         }
         if (closeRequestInFlightId === msg.requestId) closeRequestInFlightId = null;
         send({

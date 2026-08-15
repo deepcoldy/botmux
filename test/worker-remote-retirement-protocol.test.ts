@@ -35,7 +35,12 @@ describe('worker remote retirement protocol', () => {
     const refusal = close.indexOf('Refused unsafe request-less ${effectiveBackendType} close', requestlessGuard);
     const guardBreak = close.indexOf('break;', refusal);
     const unsupported = close.indexOf("error: 'remote_close_unsupported'", guardBreak);
-    const preparedSuccess = close.indexOf(': { ok: true };', unsupported);
+    // The `: { ok: true };` literal this used to pin now lives in
+    // adapters/backend/destroy-result.ts (normalizeDestroyResult), because a
+    // missing result must stay success for local muxes but become a failure for
+    // remote backends. What matters here is unchanged: the prepare path still
+    // normalizes the backend's answer after the unsupported branch.
+    const preparedSuccess = close.indexOf('normalizeDestroyResult(', unsupported);
     const localDestroy = close.lastIndexOf('backend?.destroySession?.()');
     const localExit = close.lastIndexOf('process.exit(0)');
 

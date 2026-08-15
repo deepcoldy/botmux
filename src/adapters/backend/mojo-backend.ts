@@ -486,45 +486,106 @@ export class MojoBackend implements SessionBackend {
      * Returns false when termination could not be proven; the caller must then
      * refuse the close rather than let the row be published as closed.
      */
+    /** Is any process still alive in `pgid`'s group? A zombie counts as alive
+     *  until it is reaped, which is why the direct child's `exit` is awaited too. */
+    private groupHasMembers(pgid: number): boolean {
+        try {
+            process.kill(-pgid, 0);
+            return true;
+        } catch (err: unknown) {
+            // ESRCH = empty group, the only answer that proves absence. EPERM means
+            // members exist that we may not signal, which is NOT proof of absence.
+            return (err as NodeJS.ErrnoException)?.code !== 'ESRCH';
+        }
+    }
+
+    /** Overridable so a behaviour test can exercise the escalation ladder without
+     *  burning the production budget in wall-clock. Production never changes it. */
+    protected get terminationProofBudgetMs(): number {
+        return MOJO_CHILD_TERMINATION_PROOF_MS;
+    }
+
+    /**
+     * SIGTERM the whole process GROUP, then PROVE nothing in it survives
+     * (escalating to SIGKILL).
+     *
+     * Two distinct fail-open paths are closed here.
+     *
+     * 1. `child.kill()` returning true only means the signal was delivered. A
+     *    child that ignores SIGTERM keeps executing with the injected credential
+     *    while the explicit close publishes the row as `closed` -- and a closed
+     *    row is filtered out of the device-isolation inventory
+     *    (mergePersistedDeviceIsolationSessions), so the blocker vanishes with the
+     *    process still alive.
+     * 2. Signalling only the direct pid leaves DESCENDANTS alive. mojo runs tools
+     *    and can leave a detached grandchild holding the inherited X_JWT_TOKEN;
+     *    the parent exits, the direct-pid proof succeeds, and the credentialed
+     *    descendant keeps running unblocked. Group-level signalling plus an
+     *    ESRCH probe is what makes "gone" mean the whole subtree.
+     *
+     * Returns false when termination cannot be proven; the caller must then refuse
+     * the close rather than let the row be published as closed. `this.child` is
+     * only cleared once termination IS proven, so a refused close can be retried
+     * against the same process.
+     */
     private async terminateChildProven(): Promise<boolean> {
         const child = this.child;
-        this.child = null;
         if (!child) return true;
-        // Already reaped by the runtime: exitCode/signalCode are set only after the
-        // process actually ended, so this IS proof.
-        if (child.exitCode !== null || child.signalCode !== null) return true;
+        const pid = child.pid;
+        const reaped = child.exitCode !== null || child.signalCode !== null;
+        // spawn() failed outright: there is no process and no group to probe.
+        if (typeof pid !== 'number' || pid <= 0) {
+            if (reaped) { this.child = null; return true; }
+            return false;
+        }
 
-        const exited = new Promise<boolean>(resolve => {
-            const done = (): void => resolve(true);
+        const exited = new Promise<void>(resolve => {
+            const done = (): void => resolve();
             child.once('exit', done);
             child.once('close', done);
-            // A child that is already gone but whose 'exit' fired before we
-            // subscribed would otherwise hang until the timeout.
-            if (child.exitCode !== null || child.signalCode !== null) resolve(true);
+            // Already gone but its 'exit' fired before we subscribed: without this
+            // the wait below would burn the whole budget for nothing.
+            if (child.exitCode !== null || child.signalCode !== null) resolve();
         });
-        const grace = Math.max(1, Math.floor(MOJO_CHILD_TERMINATION_PROOF_MS / 2));
 
-        try { child.kill('SIGTERM'); } catch { /* already gone */ }
-        const afterTerm = await Promise.race([
-            exited,
-            new Promise<false>(r => setTimeout(() => r(false), grace).unref?.()),
-        ]);
-        if (afterTerm) return true;
+        const budget = this.terminationProofBudgetMs;
+        const grace = Math.max(1, Math.floor(budget / 2));
+        // Proof needs BOTH: the direct child reaped (a zombie keeps the group
+        // non-empty) and the group drained of every descendant.
+        const proven = async (deadlineMs: number): Promise<boolean> => {
+            const deadline = Date.now() + deadlineMs;
+            for (;;) {
+                if (!this.groupHasMembers(pid)) return true;
+                if (Date.now() >= deadline) return false;
+                await Promise.race([
+                    exited,
+                    new Promise<void>(r => setTimeout(r, Math.min(25, Math.max(1, deadline - Date.now()))).unref?.()),
+                ]);
+            }
+        };
 
-        // Escalate. SIGKILL cannot be caught, so a still-running process after this
-        // means we genuinely cannot prove anything (e.g. uninterruptible state).
-        try { child.kill('SIGKILL'); } catch { /* already gone */ }
-        const afterKill = await Promise.race([
-            exited,
-            new Promise<false>(r => setTimeout(() => r(false), MOJO_CHILD_TERMINATION_PROOF_MS - grace).unref?.()),
-        ]);
-        if (!afterKill) {
-            logger.error(
-                `[mojo] child pid ${child.pid ?? '?'} survived SIGTERM+SIGKILL; refusing to report `
-                + 'the close as successful (a closed row would drop the device-isolation blocker)',
-            );
-        }
-        return afterKill;
+        // Negative pid = whole group. Fall back to the direct child only if the
+        // group signal cannot be delivered (e.g. it already drained).
+        const signalGroup = (signal: NodeJS.Signals): void => {
+            try { process.kill(-pid, signal); return; } catch { /* try direct */ }
+            try { child.kill(signal); } catch { /* already gone */ }
+        };
+
+        signalGroup('SIGTERM');
+        if (await proven(grace)) { this.child = null; return true; }
+
+        // Escalate. SIGKILL cannot be caught, so a surviving group after this means
+        // we genuinely cannot prove anything (e.g. uninterruptible state).
+        signalGroup('SIGKILL');
+        if (await proven(budget - grace)) { this.child = null; return true; }
+
+        logger.error(
+            `[mojo] process group ${pid} survived SIGTERM+SIGKILL; refusing to report `
+            + 'the close as successful (a closed row would drop the device-isolation blocker)',
+        );
+        // Deliberately NOT clearing this.child: the close is refused, so a retry
+        // must be able to signal the same process again.
+        return false;
     }
 
     kill(): void {
@@ -584,8 +645,41 @@ export class MojoBackend implements SessionBackend {
                 new Promise<void>(r => setTimeout(r, this.destroySettleMs).unref?.()),
             ]);
         }
-        // SIGTERM is not proof — see terminateChildProven.
-        const childTerminated = await this.terminateChildProven();
+        // Order matters: the local subtree is torn down BEFORE the remote cancel,
+        // and a failure here returns immediately. The cancel is the only
+        // irreversible step, so it must never run while an earlier step can still
+        // veto the close -- previously an unproven local child still fell through
+        // to a successful cancel, producing a failure the caller was told to roll
+        // back even though the remote session was already gone forever.
+        //
+        // SIGTERM is not proof, and neither is the direct pid — see
+        // terminateChildProven.
+        if (!await this.terminateChildProven()) {
+            this.closing = false;
+            return {
+                ok: false,
+                ...(this.cliSessionId ? { taskId: this.cliSessionId } : {}),
+                error: 'mojo_local_child_termination_unproven',
+                // Nothing irreversible has happened yet (the cancel below has NOT
+                // run), so admission may be restored and the close retried.
+                recovery: 'retryable',
+            };
+        }
+        // A turn was dispatched but its lineage never materialised: there may be a
+        // remote session we have no id for, so it cannot be cancelled and cannot be
+        // claimed gone. Same verdict prepareShutdownDetach reaches from this state.
+        if (lineageExpected && !this.cliSessionId) {
+            this.closing = false;
+            // taskId is deliberately omitted rather than null: SessionDestroyResult
+            // types it as an optional string, and "absent" is the honest answer —
+            // there is no id to hand back for retry.
+            //
+            // `uncertain`, not `retryable`: an unnamed remote session may exist, so
+            // admission must stay fenced instead of starting a fresh lineage on top
+            // of a possible orphan. The row stays active, which keeps the
+            // device-isolation blocker in place.
+            return { ok: false, error: 'mojo_lineage_not_materialized', recovery: 'uncertain' };
+        }
         if (this.cliSessionId) {
             let outcome: MojoCancelOutcome;
             try {
@@ -602,35 +696,17 @@ export class MojoBackend implements SessionBackend {
                 // daemon published a closed row while the remote session kept
                 // running and holding the injected credential.
                 //
-                // `killed` deliberately stays false: the session was NOT torn down,
-                // and abortDestroySession() must be able to restore admission.
+                // `killed` deliberately stays false and recovery is `retryable`:
+                // the remote session was NOT torn down, so restoring admission is
+                // both safe and required for the retry.
                 this.closing = false;
                 return {
                     ok: false,
                     taskId: this.cliSessionId,
                     error: outcome.kind === 'failed' ? outcome.message : 'cancel not proven',
+                    recovery: 'retryable',
                 };
             }
-        }
-        // A turn was dispatched but its lineage never materialised: there may be a
-        // remote session we have no id for, so we cannot claim it is gone. Same
-        // verdict prepareShutdownDetach reaches from the same state.
-        if (lineageExpected && !this.cliSessionId) {
-            this.closing = false;
-            // taskId is deliberately omitted rather than null: SessionDestroyResult
-            // types it as an optional string, and "absent" is the honest answer —
-            // there is no id to hand back for retry.
-            return { ok: false, error: 'mojo_lineage_not_materialized' };
-        }
-        // The local child could not be proven dead. Refusing here keeps the durable
-        // row active, which is what keeps the device-isolation blocker in place.
-        if (!childTerminated) {
-            this.closing = false;
-            return {
-                ok: false,
-                ...(this.cliSessionId ? { taskId: this.cliSessionId } : {}),
-                error: 'mojo_local_child_termination_unproven',
-            };
         }
         this.killed = true;
         return { ok: true, ...(this.cliSessionId ? { taskId: this.cliSessionId } : {}) };
@@ -831,6 +907,19 @@ export class MojoBackend implements SessionBackend {
                 // stdin MUST be closed: mojo waits on socket-type stdin and an open
                 // pipe makes `-p` block until EOF (observed as a silent hang).
                 stdio: ['ignore', 'pipe', 'pipe'],
+                // Own process GROUP, so teardown can prove the whole subtree is
+                // gone instead of only the direct child. mojo runs tools and can
+                // leave detached descendants that inherited X_JWT_TOKEN; those
+                // survive a kill aimed at the direct pid, and the close would
+                // still publish a `closed` row -- dropping the device-isolation
+                // blocker while a credentialed process is still executing.
+                //
+                // Without a dedicated group there is no safe fix: the child would
+                // share the daemon's group, so `kill(-pgid)` would take down the
+                // daemon itself. detached only changes group/session membership
+                // here; the pipes are still owned and awaited, so nothing is
+                // orphaned by this flag on its own.
+                detached: true,
             });
             this.child = child;
             let stderr = '';

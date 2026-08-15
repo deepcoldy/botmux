@@ -177,6 +177,25 @@ export interface SessionDestroyResult {
   /** Exact remote task that failed cancellation and must remain retryable. */
   taskId?: string;
   error?: string;
+  /**
+   * May a FAILED prepare restore write admission?
+   *
+   * A single boolean `ok` cannot answer this, and treating every failure as
+   * rollbackable is unsafe: once the remote session is cancelled, restoring
+   * admission produces a session that looks writable but can never continue.
+   *
+   *  - `retryable`     no irreversible side effect happened; admission may be
+   *                    restored and the same close retried.
+   *  - `uncertain`     an unknown side effect MAY have happened (for example a
+   *                    dispatched turn whose lineage never materialised, so a
+   *                    remote session may exist that we cannot name). Admission
+   *                    must stay fenced; the row stays active for a retry.
+   *  - `irreversible`  the remote side is already gone. Admission must never be
+   *                    restored.
+   *
+   * Absent means `retryable`, which is the historical behaviour.
+   */
+  recovery?: 'retryable' | 'uncertain' | 'irreversible';
 }
 
 export interface SessionShutdownDetachResult {
