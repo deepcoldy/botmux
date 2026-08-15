@@ -75,6 +75,33 @@ vi.mock('../src/services/frozen-card-store.js', () => ({
 // Map the test passes into restoreActiveSessions — production's closeSession
 // evicts from activeSessionsRegistry, which IS that Map.
 const wp = vi.hoisted(() => ({ registry: null as Map<string, any> | null }));
+/**
+ * The DURABLE bot identity, independently controllable from the in-memory `bot`.
+ *
+ * That split is the whole point: a close must be justified by what is on disk, not
+ * by this process's mirror, and only a fixture that can make them disagree can
+ * prove it.
+ */
+const disk = vi.hoisted(() => ({
+  /** undefined ⇒ no persisted config at all (live config is then the authority). */
+  rows: undefined as any[] | undefined,
+  unreadable: false,
+}));
+
+vi.mock('../src/services/config-store.js', () => ({
+  requireConfigPath: vi.fn(() => {
+    if (!disk.rows && !disk.unreadable) throw new Error('Bot config path unknown');
+    return '/tmp/fixture-bots.json';
+  }),
+  readRawConfig: vi.fn(async () => {
+    if (disk.unreadable) throw new Error('EACCES');
+    return disk.rows ?? [];
+  }),
+  findEntryIndex: vi.fn((rows: any[], id: string) => rows.findIndex(r => r?.larkAppId === id)),
+  rmwBotEntry: vi.fn(),
+  writeRawConfigAtomic: vi.fn(),
+}));
+
 const transferState = vi.hoisted(() => ({
   active: new WeakSet<object>(),
   callbacks: new WeakMap<object, Set<() => void>>(),
@@ -297,6 +324,8 @@ beforeEach(() => {
   zmxSnapshot.unhealthySessions = [];
   herdrProbe.result = 'exists';
   bot.cliId = 'claude-code';
+  disk.rows = undefined;
+  disk.unreadable = false;
   bot.cliRuntime = undefined;
   bot.cliPathOverride = undefined;
   bot.wrapperCli = undefined;
@@ -1457,6 +1486,116 @@ describe('closeCliMismatchedSessionsForBot — runtime CLI hot-switch sweep', ()
       await expect(closeSessionsForAgentSwitch('app_test', target))
         .resolves.toMatchObject({ ok: true, closed: 0, failed: 0 });
       expect(closeSession).not.toHaveBeenCalled();
+    });
+
+    it('does NOT close when the persisted config exists but cannot be read', async () => {
+      // A config that exists yet cannot be read is untrustworthy — distinct from
+      // having no persisted config at all, where the live config legitimately IS
+      // the authority. Falling back to the mirror here would close on a guess, and
+      // a close cannot be undone.
+      const s1 = makeActivePersistentSession('om_sw_unreadable_disk');
+      sessionStore.updateSession(s1);
+      registerDs(s1);
+      bot.cliId = target.cliId;
+      disk.unreadable = true;
+
+      await expect(closeSessionsForAgentSwitch('app_test', target))
+        .resolves.toMatchObject({ closed: 0 });
+      expect(closeSession).not.toHaveBeenCalledWith(s1.sessionId);
+      expect(sessionStore.getSession(s1.sessionId)!.status).toBe('active');
+    });
+
+    it('does NOT close a DURABLE-only row when the persisted config cannot be read', async () => {
+      // The durable-row loop is a second, independent close path that also calls
+      // closeSession directly, so it needs its own durable re-check.
+      const durableOnly = makeActivePersistentSession('om_sw_unreadable_durable');
+      durableOnly.cliId = 'claude-code';
+      sessionStore.updateSession(durableOnly);
+      // Deliberately NOT registerDs(...): it exists only in the store.
+      bot.cliId = target.cliId;
+      disk.unreadable = true;
+
+      // deferred (not failed): the row is left for a later sweep/restore, and the
+      // caller can see it was not converged.
+      await expect(closeSessionsForAgentSwitch('app_test', target))
+        .resolves.toMatchObject({ closed: 0, deferred: 1 });
+      expect(closeSession).not.toHaveBeenCalledWith(durableOnly.sessionId);
+      expect(sessionStore.getSession(durableOnly.sessionId)!.status).toBe('active');
+    });
+
+    it('a DEFERRED retry re-reads DISK, so a commit during the wait cannot mis-close', async () => {
+      // The retry runs an unbounded time later (a transfer settling, a FIFO
+      // draining). Showing the authority had not diverged when the retry was ARMED
+      // proves nothing about when it RUNS — and this process's mirror still holds
+      // the old value. So the durable re-check must sit at the close itself.
+      const relaying = makeActivePersistentSession('om_sw_deferred_disk');
+      relaying.cliId = 'claude-code';
+      sessionStore.updateSession(relaying);
+      const ds = registerDs(relaying);
+      transferState.active.add(ds);
+      // Our request committed codex, and mirrored it live.
+      bot.cliId = 'codex';
+      disk.rows = [{ larkAppId: 'app_test', cliId: 'codex' }];
+
+      await expect(closeSessionsForAgentSwitch('app_test', undefined, { committed: { cliId: 'codex' } }))
+        .resolves.toMatchObject({ closed: 0, deferred: 1 });
+
+      // While the transfer settles, ANOTHER process commits claude-code back — the
+      // session is frozen on that, so disk now endorses it. The live mirror is not
+      // updated, because that write happened in a different process.
+      disk.rows = [{ larkAppId: 'app_test', cliId: 'claude-code' }];
+
+      const callbacks = [...(transferState.callbacks.get(ds) ?? [])];
+      expect(callbacks, 'a retry must have been armed').toHaveLength(1);
+      transferState.active.delete(ds);
+      for (const callback of callbacks) callback();
+
+      // Let the async retry run and (wrongly) close.
+      await new Promise((resolve) => setTimeout(resolve, 80));
+      expect(
+        closeSession,
+        'the deferred retry must re-read disk, not inherit the stale live mirror',
+      ).not.toHaveBeenCalledWith(relaying.sessionId);
+      expect(sessionStore.getSession(relaying.sessionId)!.status).toBe('active');
+    });
+
+    it('arms a retry when a close is REFUSED, not only when it throws', async () => {
+      // A refusal (mojo_cancel_failed and friends) is a MODELLED failure path, so
+      // it needs the same compensation as an exception. Without it the config is
+      // committed while the old-agent session stays alive with nothing scheduled to
+      // converge it.
+      const refused = makeActivePersistentSession('om_sw_refused_arm');
+      sessionStore.updateSession(refused);
+      // The retry judges by the live config (then re-confirms against disk), so
+      // mirror the commit as the real route does. Without this the retry sees no
+      // mismatch and the test would "pass" for the wrong reason.
+      bot.cliId = target.cliId;
+      const ds = registerDs(refused);
+      // NOT transferring: the row must actually reach closeSession and be refused
+      // there. Marking it transferring would defer it instead, and this test would
+      // then pass without ever exercising the refusal path.
+      vi.mocked(closeSession).mockResolvedValueOnce({
+        ok: false,
+        alreadyClosed: false,
+        error: 'mojo_cancel_failed',
+        retryable: true,
+        taskId: 'mojo-sid-arm',
+      } as never);
+
+      await expect(closeSessionsForAgentSwitch('app_test', target))
+        .resolves.toMatchObject({ ok: false, closed: 0, failed: 1 });
+      expect(sessionStore.getSession(refused.sessionId)!.status).toBe('active');
+
+      // The refusal must have scheduled a retry. With no transfer gate to wait on,
+      // armCliMismatchResweep runs on a microtask, so the observable proof is that
+      // the row converges on its own — closeSession is called a SECOND time (the
+      // first was the refusal) and the row ends up closed.
+      void ds;
+      await vi.waitFor(() => {
+        expect(vi.mocked(closeSession).mock.calls.filter(([id]) => id === refused.sessionId))
+          .toHaveLength(2);
+        expect(sessionStore.getSession(refused.sessionId)!.status).toBe('closed');
+      });
     });
 
     it('defers a transferring row and CONVERGES it once the transfer settles', async () => {

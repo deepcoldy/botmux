@@ -12,6 +12,8 @@ import * as sessionStore from '../services/session-store.js';
 import * as messageQueue from '../services/message-queue.js';
 import { downloadMessageResource, listChatBotMembers, UserTokenMissingError } from '../im/lark/client.js';
 import { logger } from '../utils/logger.js';
+import { findEntryIndex, readRawConfig, requireConfigPath } from '../services/config-store.js';
+import { LEGACY_DEFAULT_CLI_ID } from '../bot-registry.js';
 import { forkWorker, sendWorkerInput, promoteQueuedActivationTail, forkAdoptWorker, adoptSandboxBlocked, killStalePids, sweepDeadPidMarkers, getCurrentCliVersion, restoreUsageLimitRuntimeState, setActiveSessionSafe, setActiveSessionIfActive, isDisposableCommandScratch, isRelayableRealSession, closeSession, getActiveSessionsRegistry, suspendWorker, withActiveSessionKeyLock, isSessionTransferring, deferUntilSessionTransferSettled } from './worker-pool.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import { buildBotmuxShellHints } from '../adapters/cli/shared-hints.js';
@@ -329,6 +331,94 @@ function sessionBotCliMismatch(ds: DaemonSession): { sessionCli: string; botCli:
   return sessionMismatchesTargetCli(ds, botCfg);
 }
 
+/**
+ * The bot's launch identity as it exists ON DISK right now.
+ *
+ * `getBot().config` is a per-process mirror: another daemon committing to
+ * bots.json does not update it. Every close in this module is irreversible, so a
+ * close must never be justified by that mirror alone — see
+ * `confirmMismatchAgainstDisk`.
+ *
+ * Returns 'unreadable' rather than a guess, and undefined when the row is gone.
+ */
+async function readPersistedBotIdentity(
+  larkAppId: string,
+): Promise<CliMismatchTargetConfig | undefined | 'unreadable' | 'no_persisted_config'> {
+  let path: string;
+  try {
+    // No persisted config at all (a deployment that never wrote one, or a unit
+    // test): there is no durable authority to consult, so the live config IS the
+    // authority. This is NOT the same as "a config exists but cannot be read",
+    // which is untrustworthy and must fail closed.
+    path = requireConfigPath();
+  } catch {
+    return 'no_persisted_config';
+  }
+  try {
+    const raw = await readRawConfig(path);
+    const idx = findEntryIndex(raw, larkAppId);
+    if (idx < 0) return undefined;
+    const row = raw[idx] as Record<string, unknown>;
+    return {
+      // Same loader default as everywhere else: a legacy row omitting cliId means
+      // claude-code, not "no selection".
+      cliId: (row.cliId ?? LEGACY_DEFAULT_CLI_ID) as CliMismatchTargetConfig['cliId'],
+      wrapperCli: row.wrapperCli as string | undefined,
+      cliRuntime: row.cliRuntime as CliMismatchTargetConfig['cliRuntime'],
+      cliPathOverride: row.cliPathOverride as string | undefined,
+    };
+  } catch {
+    return 'unreadable';
+  }
+}
+
+/**
+ * Re-justify a mismatch against the DURABLE config, immediately before closing.
+ *
+ * This is the single choke point for every mismatch-driven close in this module,
+ * including the deferred ones. That matters because a deferred callback runs an
+ * unbounded time later: `armCliMismatchResweep` waits for a transfer to settle,
+ * and `onCodexAppLedgerDrained` waits for a FIFO to drain. Proving the authority
+ * had not diverged when the retry was ARMED proves nothing about when it RUNS —
+ * another process can commit in between, and this process's mirror would still
+ * show the old value. Closing then destroys a session the durable config
+ * endorses, which nothing downstream can undo.
+ *
+ * Fail-closed: an unreadable authority or a missing row skips the close. Missing
+ * a close is recoverable (the next sweep/restore retries it); mis-closing is not.
+ */
+async function confirmMismatchAgainstDisk(ds: DaemonSession): Promise<boolean> {
+  const disk = await readPersistedBotIdentity(ds.larkAppId);
+  // Nothing durable to check against ⇒ the live decision already made by the
+  // caller stands. Refusing here would disable mismatch convergence entirely for
+  // such deployments.
+  if (disk === 'no_persisted_config') return true;
+  if (disk === 'unreadable') {
+    logger.error(
+      `[${ds.session.sessionId.substring(0, 8)}] CLI mismatch close skipped: the persisted bot `
+      + 'config could not be read, so the close cannot be justified',
+    );
+    return false;
+  }
+  if (!disk) {
+    logger.warn(
+      `[${ds.session.sessionId.substring(0, 8)}] CLI mismatch close skipped: the bot row is gone `
+      + 'from the persisted config',
+    );
+    return false;
+  }
+  if (!sessionMismatchesTargetCli(ds, disk)) {
+    // The durable config now endorses this session (typically another process
+    // committed after our decision, or after this retry was armed).
+    logger.warn(
+      `[${ds.session.sessionId.substring(0, 8)}] CLI mismatch close skipped: the persisted config `
+      + 'no longer marks this session as stale',
+    );
+    return false;
+  }
+  return true;
+}
+
 type CliMismatchCloseResult =
   | 'not_mismatched'
   | 'closed'
@@ -362,6 +452,12 @@ function armCliMismatchResweep(ds: DaemonSession): void {
 async function closeActiveSessionIfCliMismatch(ds: DaemonSession): Promise<CliMismatchCloseResult> {
   const mismatch = sessionBotCliMismatch(ds);
   if (!mismatch) return 'not_mismatched';
+
+  // The live mirror said "stale"; the DURABLE config has the final word. Placed
+  // here so every caller is covered at once — the bot-level sweep, the deferred
+  // transfer resweep, the ledger-drained resweep and restore — instead of each
+  // one having to remember to pass an authority along.
+  if (!await confirmMismatchAgainstDisk(ds)) return 'not_mismatched';
 
   // A config mismatch is not an explicit user close. In particular, bots.json
   // may be edited while the daemon is down, leaving a persisted backend-neutral
@@ -465,17 +561,16 @@ async function closeActiveSessionIfCliMismatch(ds: DaemonSession): Promise<CliMi
  * nothing can route to it. Its surviving remote id is reported for manual cleanup.
  */
 /**
- * Durable authority guard for the post-commit sweep.
+ * What an agent-switch request committed, so its sweep can tell "the authority
+ * moved on" from "this session is stale".
  *
- * `getBot().config` is a PER-PROCESS mirror. Another daemon committing to
- * bots.json does not update it, so judging closes by it means judging by a value
- * that may already be wrong — the sweep would then close a session that the
- * durable config actually endorses, which no later response code can undo.
+ * Only the expected value is needed: every individual close already re-reads the
+ * durable config through `confirmMismatchAgainstDisk`, which is the single choke
+ * point covering the deferred retries too. This guard adds the request-scoped
+ * decision on top: once disk no longer matches what WE wrote, this request stops
+ * sweeping entirely rather than continuing row by row.
  */
 export interface SweepAuthorityGuard {
-  /** Reads the DURABLE authority: undefined if the row is gone, 'unreadable' on failure. */
-  read: () => Promise<CliMismatchTargetConfig | undefined | 'unreadable'>;
-  /** What this request committed. The sweep stops as soon as disk diverges from it. */
   committed: CliMismatchTargetConfig;
 }
 
@@ -527,74 +622,94 @@ export async function closeSessionsForAgentSwitch(
    * be able to see that one session is still on the old agent.
    */
   deferred: number;
+  /**
+   * The durable authority stopped matching what this request committed (or the
+   * row vanished), so the sweep stopped early. Surfaced so a 200 is never read as
+   * "everything converged".
+   */
+  authorityChanged: boolean;
   residualTaskIds: string[];
 }> {
   const registry = getActiveSessionsRegistry();
-  const out = { ok: true, closed: 0, residual: 0, failed: 0, deferred: 0, residualTaskIds: [] as string[] };
+  const out = { ok: true, closed: 0, residual: 0, failed: 0, deferred: 0, authorityChanged: false, residualTaskIds: [] as string[] };
   const seen = new Set<string>();
 
-  /** Set once disk diverges (or cannot be trusted): no further row may be closed. */
+  /** Set once disk diverges from what we committed: this request stops sweeping. */
   let sweepAborted = false;
 
   /**
-   * The authority a close may be justified by, re-read per session.
+   * Whether this request may still act on `sessionId`.
    *
-   * Returns undefined to skip this row. Never falls back to the in-memory mirror
-   * when a durable read fails: that is the fail-open that reintroduces the bug.
+   * The per-close durable re-check lives in `confirmMismatchAgainstDisk` and
+   * applies to every caller. What is request-scoped is this: if the durable
+   * authority is no longer the one we committed, we are not the owner of this
+   * convergence any more, so we stop instead of walking the remaining rows. The
+   * writer that committed the newer authority runs its own commit-then-sweep.
    */
-  const authorityForClose = async (
-    sessionId: string,
-  ): Promise<CliMismatchTargetConfig | undefined> => {
-    if (target) return target;
-    if (!authority) {
-      // No guard supplied (non-route caller): the live config is all such callers
-      // have, and they are not racing an irreversible switch.
-      try { return getBot(larkAppId).config; } catch { return undefined; }
-    }
-    if (sweepAborted) return undefined;
-    const disk = await authority.read();
+  const mayStillSweep = async (sessionId: string): Promise<boolean> => {
+    if (target || !authority) return true;
+    if (sweepAborted) return false;
+    const disk = await readPersistedBotIdentity(larkAppId);
+    if (disk === 'no_persisted_config') return true;
     if (disk === 'unreadable') {
       sweepAborted = true;
       out.failed++;
       out.ok = false;
+      out.authorityChanged = true;
       logger.error(
         `[${sessionId.substring(0, 8)}] agent switch sweep: cannot read the durable authority; `
         + 'stopping the sweep instead of closing on a guess',
       );
-      return undefined;
+      return false;
     }
     if (!disk) {
       sweepAborted = true;
+      // Reported, not silent: the caller answered 200 for a switch whose row then
+      // vanished, and the operator needs to see that the sweep did not finish.
+      out.authorityChanged = true;
+      out.deferred++;
       logger.warn(
         `[${sessionId.substring(0, 8)}] agent switch sweep: the bot row disappeared; stopping the `
         + 'sweep (nothing on disk can justify a close)',
       );
-      return undefined;
+      return false;
     }
     if (!sameRuntimeIdentity(disk, authority.committed)) {
-      // Someone committed a different agent after us. Sessions are stale or fresh
-      // relative to THAT, not to what we wrote, so stop and let its own sweep and
-      // the resweep converge.
       sweepAborted = true;
+      out.authorityChanged = true;
+      out.deferred++;
       logger.warn(
         `[${sessionId.substring(0, 8)}] agent switch sweep: the durable authority changed after our `
         + 'commit; stopping the sweep so the newer writer converges it',
       );
-      return undefined;
+      return false;
     }
-    return disk;
+    return true;
   };
 
   const recordClose = (
     sessionId: string,
     result: Awaited<ReturnType<typeof closeSession>>,
+    /** Present for registry rows; a durable-only row has no DaemonSession. */
+    ds?: DaemonSession,
   ): void => {
     if (!result.ok) {
       out.failed++;
       out.ok = false;
+      // A REFUSAL is a modelled failure path (e.g. mojo_cancel_failed), not an
+      // exception — so it needs the same compensation as the throw path. Without
+      // it the config is committed while the old-agent session stays alive with
+      // nothing scheduled to converge it. The retry re-reads the durable
+      // authority before closing (confirmMismatchAgainstDisk), so arming it
+      // cannot resurrect the stale-target problem.
+      //
+      // Every modelled refusal from closeSession carries retryable:true, so no
+      // extra filter is needed here; a future non-retryable shape would show up as
+      // a type error on this branch rather than silently skipping compensation.
+      if (ds) armCliMismatchResweep(ds);
       logger.error(
         `[${sessionId.substring(0, 8)}] agent switch sweep: close REFUSED (${result.error}); `
-        + 'reported to the caller for retry',
+        + `reported${ds ? ' and resweep armed' : ''}`,
       );
       return;
     }
@@ -615,7 +730,12 @@ export async function closeSessionsForAgentSwitch(
     if (ds.adoptedFrom || ds.session.adoptedFrom || ds.session.title?.startsWith('Adopt:')) continue;
     // Compared against the COMMITTED config (see currentTarget), which is what
     // the bot launches with from now on.
-    const dsTarget = await authorityForClose(ds.session.sessionId);
+    if (!await mayStillSweep(ds.session.sessionId)) continue;
+    // Screening only: the authoritative durable re-check happens inside
+    // closeActiveSessionIfCliMismatch / immediately before the close below.
+    const dsTarget = target ?? (() => {
+      try { return getBot(larkAppId).config; } catch { return undefined; }
+    })();
     if (!dsTarget || !sessionMismatchesTargetCli(ds, dsTarget)) continue;
     // A protected owner cannot be closed right now (an unsettled Codex App FIFO
     // must survive for recovery). It is NOT a failure of this sweep: the daemon
@@ -639,10 +759,18 @@ export async function closeSessionsForAgentSwitch(
       armCliMismatchResweep(ds);
       continue;
     }
+    // Final durable re-check, immediately before the irreversible call. This sweep
+    // calls closeSession directly rather than going through
+    // closeActiveSessionIfCliMismatch, so without this line the explicit-target
+    // path would skip the very guard that covers every other caller.
+    if (!await confirmMismatchAgainstDisk(ds)) {
+      out.deferred++;
+      continue;
+    }
     try {
       // The close uses the session's own FROZEN identity, so it does not depend on
       // the config we are about to (not) write.
-      recordClose(ds.session.sessionId, await closeSession(ds.session.sessionId));
+      recordClose(ds.session.sessionId, await closeSession(ds.session.sessionId), ds);
     } catch (err) {
       // Collected, not thrown: every remaining row must still be evaluated.
       // The config is ALREADY committed at this point, so this is not a veto — it
@@ -687,7 +815,10 @@ export async function closeSessionsForAgentSwitch(
   for (const row of storedRows) {
     if (row.queued) continue;
     if (row.adoptedFrom || row.title?.startsWith('Adopt:')) continue;
-    const rowTarget = await authorityForClose(row.sessionId);
+    if (!await mayStillSweep(row.sessionId)) continue;
+    const rowTarget = target ?? (() => {
+      try { return getBot(larkAppId).config; } catch { return undefined; }
+    })();
     if (!rowTarget || !sessionRowMismatchesTargetCli(row, rowTarget)) continue;
     if (hasProtectedSessionMutationOwnership(row)) {
       out.deferred++;
@@ -699,6 +830,22 @@ export async function closeSessionsForAgentSwitch(
         `[${row.sessionId.substring(0, 8)}] agent switch sweep: durable mismatched row has `
         + 'protected mutation ownership; leaving it to restore/ledger-drained convergence',
       );
+      continue;
+    }
+    // Same final durable re-check as the registry loop. A durable-only row has no
+    // DaemonSession, so the comparison is done directly against the row.
+    const diskForRow = await readPersistedBotIdentity(larkAppId);
+    if (diskForRow === 'unreadable' || (diskForRow && diskForRow !== 'no_persisted_config'
+      && !sessionRowMismatchesTargetCli(row, diskForRow))) {
+      out.deferred++;
+      logger.warn(
+        `[${row.sessionId.substring(0, 8)}] agent switch sweep: durable row close skipped — the `
+        + 'persisted config does not (or can no longer) justify it',
+      );
+      continue;
+    }
+    if (diskForRow === undefined) {
+      out.deferred++;
       continue;
     }
     try {

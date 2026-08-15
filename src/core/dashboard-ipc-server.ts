@@ -4265,25 +4265,11 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
       cliPathOverride: committedRuntime?.executable ?? committedLegacyPath,
     };
     const closedMismatchedSessions = await agentSwitchCloseHook.run(larkAppId, undefined, {
-      committed: committedIdentity,
-      read: async () => {
-        try {
-          const raw = await readRawConfig(requireConfigPath());
-          const idx = findEntryIndex(raw, larkAppId);
-          if (idx < 0) return undefined;
-          const row = raw[idx] as Record<string, unknown>;
-          return {
-            // Same loader default as everywhere else: a legacy row omitting cliId
-            // means claude-code, not "no selection".
-            cliId: (row.cliId ?? LEGACY_DEFAULT_CLI_ID) as typeof selected.cliId,
-            wrapperCli: row.wrapperCli as string | undefined,
-            cliRuntime: row.cliRuntime as CliRuntimeConfig | undefined,
-            cliPathOverride: row.cliPathOverride as string | undefined,
-          };
-        } catch {
-          // Never degrade to "unchanged": that is the fail-open this guards.
-          return 'unreadable';
-        }
+      committed: {
+        cliId: selected.cliId,
+        wrapperCli: selected.wrapperCli,
+        cliRuntime: committedRuntime,
+        cliPathOverride: committedRuntime?.executable ?? committedLegacyPath,
       },
     });
 
@@ -4306,6 +4292,10 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
       // Mismatched sessions intentionally left for a later resweep/restore, so a
       // 200 never implies "everything already converged".
       closedMismatchedDeferred: closedMismatchedSessions.deferred,
+      // The durable config moved on (or the row vanished) mid-sweep, so this 200
+      // means "committed", not "fully converged". Surfaced instead of silent: the
+      // remaining old-agent sessions are converged by the newer writer's own sweep.
+      agentSwitchAuthorityChanged: closedMismatchedSessions.authorityChanged,
       closedMismatchedResidualTaskIds: closedMismatchedSessions.residualTaskIds,
       // Report the (possibly auto-cleared) read-isolation state + whether the new
       // agent can still enforce it, so the dashboard updates its toggle immediately
