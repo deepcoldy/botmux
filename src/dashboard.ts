@@ -25,6 +25,7 @@ import { createSessionPresentationCoordinator } from './dashboard/session-presen
 import {
   compactGroupsMatrix,
   createGroupsMatrixSnapshot,
+  dashboardEventInvalidatesGroupsMatrix,
   enrichSessionsWithGroupNames,
   roleWriteShouldInvalidate,
   type GroupsMatrix,
@@ -375,6 +376,9 @@ registry.on((online) => {
 // `git rev-parse` per session per turn, bounded by the resolver's concurrency
 // cap, NOT a slow background poll.
 aggregator.on(sessionPresentation.onEvent);
+aggregator.on((event) => {
+  if (dashboardEventInvalidatesGroupsMatrix(event)) groupsMatrixSnapshot.invalidate();
+});
 
 // 调试终端（owner-only 裸 bash）。默认工作目录取当前所有 session 的工作目录去重，
 // 让 owner 从熟悉的目录起终端复现问题；都没有时模块内退回 homedir。
@@ -2355,7 +2359,7 @@ async function buildGroupsMatrix(): Promise<GroupsMatrix> {
       if (!r.ok) return;
       const j = await r.json() as { chats?: any[] };
       for (const c of j.chats ?? []) {
-        const { oncallChat, firstSeenAt, hasRole, hasMessageListener, observedBotNames, ...chatBase } = c;
+        const { oncallChat, firstSeenAt, hasRole, hasMessageListener, observedBotNames, replyPolicy, ...chatBase } = c;
         const cur = out.get(c.chatId) ?? {
           ...chatBase,
           memberBots: [] as any[],
@@ -2373,6 +2377,7 @@ async function buildGroupsMatrix(): Promise<GroupsMatrix> {
           oncallChat: oncallChat ?? null,
           hasRole: hasRole ?? false,
           hasMessageListener: hasMessageListener ?? false,
+          ...(replyPolicy ? { replyPolicy } : {}),
         });
         if (typeof firstSeenAt === 'number') {
           cur._firstSeenAt = cur._firstSeenAt === null
@@ -4480,6 +4485,41 @@ const server = createServer(async (req, res) => {
       });
     }
 
+    // Per-(chat × bot) reply policy. These routes intentionally stay outside
+    // PUBLIC_READ_PATHS: the anonymous groups projection may show membership,
+    // but must not expose or mutate operator configuration.
+    let mGroupReplyMode: RegExpMatchArray | null;
+    if ((mGroupReplyMode = url.pathname.match(/^\/api\/groups\/([^/]+)\/reply-mode\/([^/]+)$/))) {
+      const chatId = decodeURIComponent(mGroupReplyMode[1]);
+      const larkAppId = decodeURIComponent(mGroupReplyMode[2]);
+      const daemonPath = `/api/chat-reply-mode?chatId=${encodeURIComponent(chatId)}`;
+      let upstream: Response;
+      if (req.method === 'GET' || req.method === 'DELETE') {
+        upstream = await proxyToDaemon(larkAppId, daemonPath, { method: req.method });
+      } else if (req.method === 'PUT') {
+        let body: unknown;
+        try { body = await readJsonBody(req); }
+        catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+        const rawMode = typeof (body as any)?.mode === 'string' ? (body as any).mode : '';
+        const mode = rawMode === 'topic' ? 'shared' : rawMode;
+        if (!['chat', 'chat-topic', 'shared', 'new-topic'].includes(mode)) {
+          return jsonRes(res, 400, { ok: false, error: 'invalid_mode' });
+        }
+        upstream = await proxyToDaemon(larkAppId, '/api/chat-reply-mode', {
+          method: 'PUT',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ chatId, mode }),
+        });
+      } else {
+        return jsonRes(res, 405, { ok: false, error: 'method_not_allowed' });
+      }
+      const upstreamText = await upstream.text();
+      if (upstream.ok && req.method !== 'GET') groupsMatrixSnapshot.invalidate();
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(upstreamText);
+      return;
+    }
+
     // ─── Roles (proxy to daemon) ────────────────────────────────────────────
     // POST   /api/roles/batch → collapse role reads to one request per daemon
     // GET    /api/roles/:larkAppId/:chatId → read role file
@@ -5201,13 +5241,23 @@ const server = createServer(async (req, res) => {
       const chunks: Buffer[] = [];
       for await (const c of req) chunks.push(c as Buffer);
       const raw = Buffer.concat(chunks).toString('utf8') || '{}';
+      let requestedPrefs: Record<string, unknown> = {};
+      try {
+        const parsed = JSON.parse(raw);
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) requestedPrefs = parsed;
+      } catch { /* daemon returns the canonical bad_json response */ }
       const upstream = await proxyToDaemon(appId, `/api/bot-card-prefs`, {
         method: 'PUT',
         headers: { 'content-type': 'application/json' },
         body: raw,
       });
+      const upstreamText = await upstream.text();
+      if (upstream.ok && typeof requestedPrefs.regularGroupReplyMode === 'string') {
+        // Every inherited chat derives default/effective from this bot value.
+        groupsMatrixSnapshot.invalidate();
+      }
       res.writeHead(upstream.status, { 'content-type': 'application/json' });
-      res.end(await upstream.text());
+      res.end(upstreamText);
       return;
     }
 

@@ -14297,6 +14297,7 @@ tbody tr[data-chat]:hover {
   justify-content: center;
   gap: 6px;
   max-width: 172px;
+  min-width: 0;
   box-sizing: border-box;
   height: 24px;
   min-height: 24px;
@@ -14328,7 +14329,11 @@ tbody tr[data-chat]:hover {
 }
 
 .groups-bot-state {
-  flex: none;
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   color: var(--faint);
   font-size: 10px;
   line-height: 1;

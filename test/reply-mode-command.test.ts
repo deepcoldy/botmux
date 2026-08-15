@@ -20,10 +20,10 @@ vi.mock('../src/im/lark/message-parser.js', () => ({
   stripLeadingMentions: (s: string) => s,
 }));
 
-const mockGetChatMode = vi.fn(async () => 'group' as 'group' | 'topic' | 'p2p');
+const mockGetChatModeStrict = vi.fn(async () => 'group' as 'group' | 'topic' | 'p2p' | 'unknown');
 const mockReplyMessage = vi.fn(async () => 'msg-id');
 vi.mock('../src/im/lark/client.js', () => ({
-  getChatMode: (...a: any[]) => mockGetChatMode(...a),
+  getChatModeStrict: (...a: any[]) => mockGetChatModeStrict(...a),
   replyMessage: (...a: any[]) => mockReplyMessage(...a),
 }));
 
@@ -35,6 +35,14 @@ vi.mock('../src/i18n/index.js', () => ({
 
 const mockApplyConfigField = vi.fn(async () => ({ ok: true as const }));
 const mockSetChatReplyMode = vi.fn(async (_a: string, _c: string, mode: string) => ({ ok: true as const, mode }));
+const mockClearChatReplyMode = vi.fn(async () => ({
+  ok: true as const,
+  cleared: true,
+  override: null,
+  default: 'chat' as const,
+  effective: 'chat' as const,
+  inherited: true,
+}));
 vi.mock('../src/services/bot-config-store.js', () => ({
   findConfigField: () => ({ key: 'p2pMode' }),
   applyConfigField: (...a: any[]) => mockApplyConfigField(...a),
@@ -45,7 +53,13 @@ vi.mock('../src/services/chat-reply-mode-store.js', async (importOriginal) => {
   return {
     ...actual,
     setChatReplyMode: (...a: any[]) => mockSetChatReplyMode(...a),
-    resolveRegularGroupMode: () => 'chat',
+    clearChatReplyMode: (...a: any[]) => mockClearChatReplyMode(...a),
+    getChatReplyModeState: () => ({
+      override: null,
+      default: 'chat',
+      effective: 'chat',
+      inherited: true,
+    }),
   };
 });
 
@@ -79,7 +93,7 @@ describe('tryHandleReplyModeCommand — DM (p2p) session mode', () => {
     mockGetBot.mockReturnValue({ config: { larkAppId: APP, p2pMode: undefined }, botOpenId: 'ou_bot' });
     mockIsBotMentioned.mockReturnValue(true);
     mockCanOperate.mockReturnValue(true);
-    mockGetChatMode.mockResolvedValue('group');
+    mockGetChatModeStrict.mockResolvedValue('group');
   });
 
   it('not a /reply-mode message → returns false (lets dispatch continue)', async () => {
@@ -137,7 +151,7 @@ describe('tryHandleReplyModeCommand — group (tri-state incl. shared)', () => {
     mockGetBot.mockReturnValue({ config: { larkAppId: APP }, botOpenId: 'ou_bot' });
     mockIsBotMentioned.mockReturnValue(true);
     mockCanOperate.mockReturnValue(true);
-    mockGetChatMode.mockResolvedValue('group');
+    mockGetChatModeStrict.mockResolvedValue('group');
   });
 
   it('group `/reply-mode topic` (owner) → setChatReplyMode("shared") + updated', async () => {
@@ -168,6 +182,30 @@ describe('tryHandleReplyModeCommand — group (tri-state incl. shared)', () => {
     expect(handled).toBe(true);
     expect(mockSetChatReplyMode).toHaveBeenCalledWith(APP, 'oc_group', 'chat-topic');
     expect(lastReply()).toBe('cmd.reply_mode.updated');
+  });
+
+  it('group `/reply-mode inherit` clears the override and resumes the bot default', async () => {
+    await tryHandleReplyModeCommand(APP, msg('/reply-mode inherit', 'group'), USER, true);
+    expect(mockClearChatReplyMode).toHaveBeenCalledWith(APP, 'oc_group');
+    expect(mockSetChatReplyMode).not.toHaveBeenCalled();
+    expect(lastReply()).toBe('cmd.reply_mode.inherited');
+  });
+
+  it('group status reports that the effective mode is inherited', async () => {
+    await tryHandleReplyModeCommand(APP, msg('/reply-mode status', 'group'), USER, true);
+    expect(lastReply()).toBe('cmd.reply_mode.status_inherited');
+  });
+
+  it('fails closed when the chat topology is topic or unconfirmed', async () => {
+    mockGetChatModeStrict.mockResolvedValueOnce('topic').mockResolvedValueOnce('unknown');
+    await tryHandleReplyModeCommand(APP, msg('/reply-mode chat', 'group'), USER, true);
+    await tryHandleReplyModeCommand(APP, msg('/reply-mode new-topic', 'group'), USER, true);
+    expect(mockSetChatReplyMode).not.toHaveBeenCalled();
+    expect(mockClearChatReplyMode).not.toHaveBeenCalled();
+    expect(mockReplyMessage.mock.calls.map(call => call[2])).toEqual([
+      'cmd.reply_mode.unsupported',
+      'cmd.reply_mode.unsupported',
+    ]);
   });
 
   it('group without @mention → silently owned by the @mentioned bot only', async () => {

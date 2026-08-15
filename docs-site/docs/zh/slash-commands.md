@@ -56,12 +56,13 @@
 | 命令 | 说明 |
 |------|------|
 | `/reply-mode` `/reply-mode status` | 查看当前群回复模式 |
+| `/reply-mode inherit` | 清除当前群覆盖，恢复跟随 Bot 默认 |
 | `/reply-mode chat` | 整群连续会话（顶层 @ 都进同一个会话） |
 | `/reply-mode chat-topic` | 顶层连续、原生话题各自独立会话 |
 | `/reply-mode new-topic` | 每次 @ 新建话题与独立会话 |
 | `/reply-mode topic` `/reply-mode shared` | 话题展示但共享同一会话（`topic` 是 `shared` 的兼容别名） |
 
-群级设置会覆盖 dashboard「Bot 配置 → 普通群模式」的默认值。
+群级设置会覆盖 dashboard「Bot 配置 → 普通群模式」的默认值；在 Dashboard 选“继承 Bot 默认”或执行 `/reply-mode inherit` 可清除该群覆盖。例如：A 普通群设 `topic` 可以话题形式回复但共享上下文；B 普通群设 `chat` 后平铺回复；C 话题群不配置，自动在当前话题内回复。如果 A 需要每个话题同时隔离上下文，用 `new-topic` 而不是 `topic`。
 
 `/substitute [status|on|off]` —— 查看或切换当前群的**替身模式**开关（修改需 owner）。
 

@@ -82,14 +82,20 @@ import { readRawConfig, findEntryIndex, requireConfigPath, rmwBotEntry } from '.
 import { setDefaultLocale, localeForBot, t } from '../i18n/index.js';
 import { isLocale, type Locale } from '../i18n/types.js';
 import { readGlobalConfig } from '../global-config.js';
-import { normalizeChatReplyMode, setChatReplyMode, type ChatReplyMode } from '../services/chat-reply-mode-store.js';
+import {
+  clearChatReplyMode,
+  getChatReplyModeState,
+  normalizeChatReplyMode,
+  setChatReplyMode,
+  type ChatReplyMode,
+} from '../services/chat-reply-mode-store.js';
 import * as chatFirstSeenStore from '../services/chat-first-seen-store.js';
 import * as scheduler from './scheduler.js';
 import { listActiveSessions, findActiveBySessionId, closeSession, getActiveSessionsRegistry, transferSession, deliverWriteLinkCardToOwners, forkWorker, suspendWorker, killWorker, latestPerBotEnvForRestart, getDaemonReplyCardUsageSnapshot, sessionSupportsWebTerminal, sendWorkerSessionInput, isSessionTransferring } from './worker-pool.js';
 import { listOnlineDaemons } from '../utils/daemon-discovery.js';
 import { isSessionStopped } from './session-liveness.js';
 import { isSuspendableBackendType } from './persistent-backend.js';
-import { getChatMode, replyMessage, sendMessage, resolveUnionIdFromOpenId, listThreadMessages, listChatMessages, listChatMessagesUntil, listChatBotMembers, getUserProfile, getUserProfileStrict, resolveAllowedUsersWithMap, type ChatBotMember } from '../im/lark/client.js';
+import { getChatMode, getChatModeStrict, replyMessage, sendMessage, resolveUnionIdFromOpenId, listThreadMessages, listChatMessages, listChatMessagesUntil, listChatBotMembers, getUserProfile, getUserProfileStrict, resolveAllowedUsersWithMap, type ChatBotMember } from '../im/lark/client.js';
 import { parseApiMessage, cardContentHasUpgradeFallback, resolveMergedCardContent, messageMentionsBot } from '../im/lark/message-parser.js';
 import { resumeSession, spawnDashboardSession, activateQueuedSession, closeCliMismatchedSessionsForBot } from './session-manager.js';
 import { parseSpawnRequest } from './session-create.js';
@@ -1840,6 +1846,31 @@ ipcRoute('POST', '/api/sessions/spawn', async (req, res) => {
   });
 });
 
+ipcRoute('GET', '/api/chat-reply-mode', async (req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { ok: false, reason: 'larkAppId_not_set' });
+  const url = new URL(req.url ?? '/', 'http://localhost');
+  const chatId = url.searchParams.get('chatId')?.trim() ?? '';
+  if (!chatId) return jsonRes(res, 400, { ok: false, reason: 'chatId_required' });
+  jsonRes(res, 200, { ok: true, chatId, ...getChatReplyModeState(cachedLarkAppId, chatId) });
+});
+
+async function rejectNonRegularGroupReplyModeWrite(
+  res: ServerResponse,
+  larkAppId: string,
+  chatId: string,
+): Promise<boolean> {
+  const chatMode = await getChatModeStrict(larkAppId, chatId);
+  if (chatMode === 'group') return false;
+  if (chatMode === 'unknown') {
+    jsonRes(res, 503, { ok: false, reason: 'chat_mode_unconfirmed' });
+  } else if (chatMode === 'topic') {
+    jsonRes(res, 409, { ok: false, reason: 'topic_group_not_configurable' });
+  } else {
+    jsonRes(res, 409, { ok: false, reason: 'regular_group_required' });
+  }
+  return true;
+}
+
 ipcRoute('POST', '/api/chat-reply-mode', async (req, res) => {
   if (!cachedLarkAppId) return jsonRes(res, 503, { ok: false, reason: 'larkAppId_not_set' });
   let body: unknown;
@@ -1848,9 +1879,39 @@ ipcRoute('POST', '/api/chat-reply-mode', async (req, res) => {
   const mode = normalizeChatReplyMode(typeof (body as any)?.mode === 'string' ? (body as any).mode : undefined);
   if (!chatId) return jsonRes(res, 400, { ok: false, reason: 'chatId_required' });
   if (!mode) return jsonRes(res, 400, { ok: false, reason: 'invalid_mode' });
+  // Backward-compatible internal write path used by VC meeting setup. It must
+  // remain a local config mutation: the consumer may have just joined the chat
+  // and Lark's chat-detail API can still be eventually consistent. New operator
+  // writes use the strict PUT route below.
   const result = await setChatReplyMode(cachedLarkAppId, chatId, mode);
   if (!result.ok) return jsonRes(res, 500, { ok: false, reason: result.reason });
-  jsonRes(res, 200, { ok: true, mode: result.mode });
+  jsonRes(res, 200, { ...result, chatId });
+});
+
+ipcRoute('PUT', '/api/chat-reply-mode', async (req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { ok: false, reason: 'larkAppId_not_set' });
+  let body: unknown;
+  try { body = await readJsonBody(req); } catch { return jsonRes(res, 400, { ok: false, reason: 'bad_json' }); }
+  const chatId = typeof (body as any)?.chatId === 'string' ? (body as any).chatId.trim() : '';
+  const mode = normalizeChatReplyMode(typeof (body as any)?.mode === 'string' ? (body as any).mode : undefined);
+  if (!chatId) return jsonRes(res, 400, { ok: false, reason: 'chatId_required' });
+  if (!mode) return jsonRes(res, 400, { ok: false, reason: 'invalid_mode' });
+  if (await rejectNonRegularGroupReplyModeWrite(res, cachedLarkAppId, chatId)) return;
+  const result = await setChatReplyMode(cachedLarkAppId, chatId, mode);
+  if (!result.ok) return jsonRes(res, 500, { ok: false, reason: result.reason });
+  jsonRes(res, 200, { ...result, chatId });
+});
+
+ipcRoute('DELETE', '/api/chat-reply-mode', async (req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { ok: false, reason: 'larkAppId_not_set' });
+  const url = new URL(req.url ?? '/', 'http://localhost');
+  const chatId = url.searchParams.get('chatId')?.trim() ?? '';
+  if (!chatId) return jsonRes(res, 400, { ok: false, reason: 'chatId_required' });
+  // Clearing a dormant regular-group override is safe even after the chat was
+  // converted to a topic group, and must also work while topology is unknown.
+  const result = await clearChatReplyMode(cachedLarkAppId, chatId);
+  if (!result.ok) return jsonRes(res, 500, { ok: false, reason: result.reason });
+  jsonRes(res, 200, { ...result, chatId });
 });
 
 // 会话历史：实时拉取该会话所在话题/群的飞书消息（与 botmux history 同链路，
@@ -2865,7 +2926,15 @@ ipcRoute('GET', '/api/groups', async (_req, res) => {
       const observedBotNames = observedBotsStore
         .listObservedBots(config.session.dataDir, cachedLarkAppId, c.chatId)
         .map(b => b.name);
-      return { ...c, oncallChat: oncall ?? null, firstSeenAt: seenMap.get(c.chatId) ?? null, hasRole, hasMessageListener, observedBotNames };
+      return {
+        ...c,
+        oncallChat: oncall ?? null,
+        firstSeenAt: seenMap.get(c.chatId) ?? null,
+        hasRole,
+        hasMessageListener,
+        observedBotNames,
+        replyPolicy: { chatId: c.chatId, ...getChatReplyModeState(cachedLarkAppId, c.chatId) },
+      };
     });
     jsonRes(res, 200, { chats: enriched });
   } catch (e) {

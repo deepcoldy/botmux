@@ -24,6 +24,13 @@ function sampleChats() {
           botName: 'Claude',
           inChat: true,
           hasRole: true,
+          replyPolicy: {
+            chatId: 'oc_chat1',
+            override: 'new-topic',
+            default: 'chat',
+            effective: 'new-topic',
+            inherited: false,
+          },
           oncallChat: { chatId: 'oc_chat1', workingDir: '/root/iserver/customer-secret' },
         },
         {
@@ -54,7 +61,7 @@ function sampleSchedules() {
 }
 
 describe('redactGroupsForPublic', () => {
-  it('drops ALL non-board fields for anonymous visitors (oncall/description/ownerId/hasRole)', () => {
+  it('drops ALL non-board fields for anonymous visitors (oncall/reply policy/description/ownerId/hasRole)', () => {
     const out = redactGroupsForPublic(sampleChats()) as any[];
     // chat-level config/PII gone
     expect(out[0]).not.toHaveProperty('description');
@@ -63,6 +70,7 @@ describe('redactGroupsForPublic', () => {
     for (const mb of out[0].memberBots) {
       expect(mb).not.toHaveProperty('oncallChat');
       expect(mb).not.toHaveProperty('hasRole');
+      expect(mb).not.toHaveProperty('replyPolicy');
     }
     const json = JSON.stringify(out);
     for (const leaked of ['workingDir', 'customer-secret', 'private description', 'ou_owner']) {
@@ -102,6 +110,7 @@ describe('redactGroupsForPublic', () => {
     const input = sampleChats();
     redactGroupsForPublic(input);
     expect(input[0].memberBots[0].oncallChat).toEqual({ chatId: 'oc_chat1', workingDir: '/root/iserver/customer-secret' });
+    expect(input[0].memberBots[0].replyPolicy?.override).toBe('new-topic');
     expect(input[0].description).toBe('private description');
   });
 

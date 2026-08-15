@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { createPortal } from 'react-dom';
 import { openBotOnboarding } from './bot-onboarding.js';
+import { invalidateGroupsSnapshotCache } from './groups-api.js';
 import {
   agentSelectionKey,
   cliIdOf,
@@ -3088,14 +3089,17 @@ function SessionModeSection(props: {
     }
   }
 
-  async function saveCardMode(key: string, patch: CardPrefPatch, setStatus: (status: StatusMessage) => void): Promise<void> {
+  async function saveCardMode(key: string, patch: CardPrefPatch, setStatus: (status: StatusMessage) => void): Promise<boolean> {
     setBusy(key);
     setStatus(null);
     try {
       const res = await props.putCardPref(patch);
-      setStatus(res.ok ? { text: `✓ ${tr('botDefaults.cardPrefSaved')}`, ok: true } : { text: `✗ ${responseErrorText(res)}` });
+      const ok = res.ok && res.body?.ok !== false;
+      setStatus(ok ? { text: `✓ ${tr('botDefaults.cardPrefSaved')}`, ok: true } : { text: `✗ ${responseErrorText(res)}` });
+      return ok;
     } catch (e: any) {
       setStatus({ text: `✗ ${caughtErrorText(e)}` });
+      return false;
     } finally {
       setBusy(null);
     }
@@ -3149,8 +3153,13 @@ function SessionModeSection(props: {
             disabled={busy === 'regular'}
             options={regularOptions}
             onChange={next => {
+              const previous = regular;
               setRegular(next);
-              void saveCardMode('regular', { regularGroupReplyMode: next }, setRegularStatus);
+              void saveCardMode('regular', { regularGroupReplyMode: next }, setRegularStatus)
+                .then(ok => {
+                  if (!ok) setRegular(previous);
+                  else invalidateGroupsSnapshotCache();
+                });
             }}
           />
         </div>

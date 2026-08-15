@@ -3746,7 +3746,22 @@ describe('GET /api/groups (Phase B)', () => {
     // null instead of failing the request — see chat-first-seen-store.
     // `hasMessageListener` lets the roles tree mark bots with active listener
     // configs without issuing one request per chat.
-    expect(body.chats).toEqual([{ chatId: 'oc_1', name: 'team', oncallChat: null, firstSeenAt: null, hasRole: false, hasMessageListener: false, observedBotNames: [] }]);
+    expect(body.chats).toEqual([{
+      chatId: 'oc_1',
+      name: 'team',
+      oncallChat: null,
+      firstSeenAt: null,
+      hasRole: false,
+      hasMessageListener: false,
+      observedBotNames: [],
+      replyPolicy: {
+        chatId: 'oc_1',
+        override: null,
+        default: 'chat-topic',
+        effective: 'chat-topic',
+        inherited: true,
+      },
+    }]);
     spy.mockRestore();
   });
 });

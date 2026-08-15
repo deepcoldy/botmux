@@ -28,6 +28,7 @@
  */
 import { rmwBotEntry } from './config-store.js';
 import { getBot, type ChatReplyMode } from '../bot-registry.js';
+import { dashboardEventBus } from '../core/dashboard-events.js';
 import { logger } from '../utils/logger.js';
 
 export type { ChatReplyMode } from '../bot-registry.js';
@@ -42,6 +43,17 @@ export function normalizeChatReplyMode(raw: string | undefined): ChatReplyMode |
   return undefined;
 }
 
+function normalizeChatReplyModes(raw: unknown): Record<string, ChatReplyMode> {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {};
+  const out: Record<string, ChatReplyMode> = {};
+  for (const [chatId, value] of Object.entries(raw)) {
+    if (!chatId.trim() || typeof value !== 'string') continue;
+    const mode = normalizeChatReplyMode(value);
+    if (mode) out[chatId] = mode;
+  }
+  return out;
+}
+
 /** Short command-word label for status / confirmation messages. */
 export function replyModeLabel(mode: ChatReplyMode): 'chat' | 'topic' | 'new-topic' | 'chat-topic' {
   if (mode === 'shared') return 'topic';
@@ -51,12 +63,35 @@ export function replyModeLabel(mode: ChatReplyMode): 'chat' | 'topic' | 'new-top
 }
 
 /** Per-bot default regular-group mode (`regularGroupReplyMode`, default 'chat-topic'). */
-function regularGroupDefaultMode(larkAppId: string): ChatReplyMode {
+export function regularGroupDefaultMode(larkAppId: string): ChatReplyMode {
   try {
     return getBot(larkAppId).config.regularGroupReplyMode ?? 'chat-topic';
   } catch {
     return 'chat-topic';
   }
+}
+
+export interface ChatReplyModeState {
+  /** Explicit per-chat override. `null` means this chat inherits the bot default. */
+  override: ChatReplyMode | null;
+  default: ChatReplyMode;
+  effective: ChatReplyMode;
+  inherited: boolean;
+}
+
+/** Read the complete per bot x chat policy, including where the effective value came from. */
+export function getChatReplyModeState(larkAppId: string, chatId: string): ChatReplyModeState {
+  const defaultMode = regularGroupDefaultMode(larkAppId);
+  let override: ChatReplyMode | undefined;
+  try {
+    override = getBot(larkAppId).config.chatReplyModes?.[chatId];
+  } catch { /* keep the same safe default semantics as resolveRegularGroupMode */ }
+  return {
+    override: override ?? null,
+    default: defaultMode,
+    effective: override ?? defaultMode,
+    inherited: override === undefined,
+  };
 }
 
 export type GroupMentionMode = 'always' | 'topic' | 'never' | 'ambient';
@@ -96,34 +131,62 @@ export async function setChatReplyMode(
   larkAppId: string,
   chatId: string,
   mode: ChatReplyMode,
-): Promise<{ ok: true; mode: ChatReplyMode } | { ok: false; reason: string }> {
+): Promise<({ ok: true; mode: ChatReplyMode } & ChatReplyModeState) | { ok: false; reason: string }> {
   let bot;
   try { bot = getBot(larkAppId); } catch { return { ok: false, reason: 'bot_not_registered' }; }
 
-  // Persist only when the per-chat mode differs from the per-bot default, so
-  // bots.json stays tidy in the common default-off case while an explicit
-  // opt-out (e.g. per-bot default new-topic, this chat pinned back to chat)
-  // still sticks instead of being silently dropped.
-  const redundant = mode === regularGroupDefaultMode(larkAppId);
-
-  const r = await rmwBotEntry<ChatReplyMode>(larkAppId, (entry) => {
-    if (!entry.chatReplyModes || typeof entry.chatReplyModes !== 'object' || Array.isArray(entry.chatReplyModes)) {
-      entry.chatReplyModes = {};
-    }
-    if (redundant) {
-      delete entry.chatReplyModes[chatId];
-      if (Object.keys(entry.chatReplyModes).length === 0) delete entry.chatReplyModes;
-    } else {
-      entry.chatReplyModes[chatId] = mode;
-    }
-    return { write: true, result: mode };
+  // A set is always an explicit pin, even when it currently equals the bot
+  // default. Otherwise a later default change would silently alter this chat.
+  // Only clearChatReplyMode() restores inheritance.
+  const r = await rmwBotEntry<Record<string, ChatReplyMode>>(larkAppId, (entry) => {
+    const next = normalizeChatReplyModes(entry.chatReplyModes);
+    next[chatId] = mode;
+    entry.chatReplyModes = next;
+    return { write: true, result: next };
   });
   if (!r.ok) return { ok: false, reason: r.reason };
 
-  const next = { ...(bot.config.chatReplyModes ?? {}) };
-  if (redundant) delete next[chatId];
-  else next[chatId] = mode;
-  bot.config.chatReplyModes = Object.keys(next).length > 0 ? next : undefined;
+  bot.config.chatReplyModes = r.result;
   logger.info(`[reply-mode:${larkAppId}] chat=${chatId} mode=${mode}`);
-  return { ok: true, mode };
+  dashboardEventBus.publish({
+    type: 'groups.reply-policy.changed',
+    body: { chatId },
+  });
+  return { ok: true, mode, ...getChatReplyModeState(larkAppId, chatId) };
+}
+
+/** Remove the explicit per-chat override so the chat follows the bot default again. */
+export async function clearChatReplyMode(
+  larkAppId: string,
+  chatId: string,
+): Promise<({ ok: true; cleared: boolean } & ChatReplyModeState) | { ok: false; reason: string }> {
+  let bot;
+  try { bot = getBot(larkAppId); } catch { return { ok: false, reason: 'bot_not_registered' }; }
+
+  const r = await rmwBotEntry<{ cleared: boolean; chatReplyModes?: Record<string, ChatReplyMode> }>(larkAppId, (entry) => {
+    const rawModes = entry.chatReplyModes;
+    const rawRecord = rawModes && typeof rawModes === 'object' && !Array.isArray(rawModes)
+      ? rawModes as Record<string, unknown>
+      : undefined;
+    const next = normalizeChatReplyModes(rawModes);
+    const cleared = rawRecord !== undefined && Object.prototype.hasOwnProperty.call(rawRecord, chatId);
+    delete next[chatId];
+    const remaining = Object.keys(next).length > 0 ? next : undefined;
+    const normalizedChanged = JSON.stringify(rawRecord ?? null) !== JSON.stringify(remaining ?? null);
+    if (remaining) entry.chatReplyModes = remaining;
+    else delete entry.chatReplyModes;
+    // Even an idempotent clear returns the latest disk snapshot. This heals a
+    // stale in-memory registry instead of accidentally retaining the old pin;
+    // a legacy alias or invalid sibling entry is canonicalized at the same time.
+    return { write: normalizedChanged, result: { cleared, chatReplyModes: remaining } };
+  });
+  if (!r.ok) return { ok: false, reason: r.reason };
+
+  bot.config.chatReplyModes = r.result.chatReplyModes;
+  logger.info(`[reply-mode:${larkAppId}] chat=${chatId} mode=inherit cleared=${r.result.cleared}`);
+  dashboardEventBus.publish({
+    type: 'groups.reply-policy.changed',
+    body: { chatId },
+  });
+  return { ok: true, cleared: r.result.cleared, ...getChatReplyModeState(larkAppId, chatId) };
 }

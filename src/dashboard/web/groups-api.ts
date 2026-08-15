@@ -9,6 +9,7 @@ export interface GroupMemberBot extends GroupBot {
   hasRole?: boolean;
   error?: unknown;
   oncallChat?: { workingDir?: string } | null;
+  replyPolicy?: GroupReplyPolicy;
 }
 
 export interface GroupChat {
@@ -16,7 +17,19 @@ export interface GroupChat {
   name?: string;
   ownerId?: string | null;
   avatar?: string;
+  chatMode?: string;
   memberBots: GroupMemberBot[];
+}
+
+export type GroupReplyMode = 'chat' | 'chat-topic' | 'shared' | 'new-topic';
+export type GroupReplyModeSelection = 'inherit' | 'chat' | 'chat-topic' | 'topic' | 'new-topic';
+
+export interface GroupReplyPolicy {
+  chatId: string;
+  override: GroupReplyMode | null;
+  default: GroupReplyMode;
+  effective: GroupReplyMode;
+  inherited: boolean;
 }
 
 export interface GroupsSnapshot {
@@ -49,9 +62,98 @@ function normalizeGroupsSnapshot(body: any): GroupsSnapshot {
   };
 }
 
+function normalizeReplyMode(value: unknown): GroupReplyMode | null {
+  if (value === 'chat' || value === 'chat-topic' || value === 'new-topic') return value;
+  if (value === 'shared' || value === 'topic') return 'shared';
+  return null;
+}
+
+export function normalizeGroupReplyPolicy(value: unknown, chatId = ''): GroupReplyPolicy | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const record = value as Record<string, unknown>;
+  const defaultMode = normalizeReplyMode(record.default);
+  const effective = normalizeReplyMode(record.effective);
+  const override = record.override == null ? null : normalizeReplyMode(record.override);
+  if (!defaultMode || !effective || (record.override != null && !override)) return null;
+  return {
+    chatId: typeof record.chatId === 'string' && record.chatId ? record.chatId : chatId,
+    override,
+    default: defaultMode,
+    effective,
+    inherited: record.inherited === true || override === null,
+  };
+}
+
+async function readReplyPolicyResponse(response: Response, chatId: string): Promise<GroupReplyPolicy> {
+  const body = await response.json().catch(() => ({}));
+  if (!response.ok || body?.ok === false) {
+    throw new Error(String(body?.error ?? body?.reason ?? `HTTP ${response.status}`));
+  }
+  const policy = normalizeGroupReplyPolicy(body, chatId);
+  if (!policy) throw new Error('invalid_reply_policy_response');
+  return policy;
+}
+
+function replyPolicyUrl(chatId: string, larkAppId: string): string {
+  return `/api/groups/${encodeURIComponent(chatId)}/reply-mode/${encodeURIComponent(larkAppId)}`;
+}
+
+export async function fetchGroupReplyPolicy(chatId: string, larkAppId: string): Promise<GroupReplyPolicy> {
+  const response = await fetch(replyPolicyUrl(chatId, larkAppId));
+  return readReplyPolicyResponse(response, chatId);
+}
+
+export async function setGroupReplyMode(
+  chatId: string,
+  larkAppId: string,
+  selection: GroupReplyModeSelection,
+): Promise<GroupReplyPolicy> {
+  const url = replyPolicyUrl(chatId, larkAppId);
+  const response = selection === 'inherit'
+    ? await fetch(url, { method: 'DELETE' })
+    : await fetch(url, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ mode: selection === 'topic' ? 'shared' : selection }),
+      });
+  return readReplyPolicyResponse(response, chatId);
+}
+
+/** Apply a successful per-chat write to the client snapshot without mutating it. */
+export function withGroupReplyPolicy(
+  snapshot: GroupsSnapshot,
+  chatId: string,
+  larkAppId: string,
+  policy: GroupReplyPolicy,
+): GroupsSnapshot {
+  let changed = false;
+  const chats = snapshot.chats.map(chat => {
+    if (chat.chatId !== chatId) return chat;
+    const memberBots = chat.memberBots.map(member => {
+      if (member.larkAppId !== larkAppId) return member;
+      changed = true;
+      return { ...member, replyPolicy: policy };
+    });
+    return changed ? { ...chat, memberBots } : chat;
+  });
+  return changed ? { ...snapshot, chats } : snapshot;
+}
+
 export function primeGroupsSnapshotCache(snapshot: GroupsSnapshot): void {
   cachedSnapshot = snapshot;
   cachedAt = Date.now();
+}
+
+/**
+ * Drop the browser-side Groups snapshot after another page changes data that
+ * contributes to the matrix (for example a bot's regular-group default).
+ * Advancing the request sequence also prevents an older in-flight response
+ * from repopulating the cache after this invalidation.
+ */
+export function invalidateGroupsSnapshotCache(): void {
+  cachedAt = 0;
+  latestRequestSeq = ++requestSeq;
+  inFlight = null;
 }
 
 export async function fetchGroupsSnapshot(options: FetchGroupsSnapshotOptions = {}): Promise<GroupsSnapshot> {
@@ -72,10 +174,11 @@ export async function fetchGroupsSnapshot(options: FetchGroupsSnapshotOptions = 
   })();
 
   if (!options.force) {
-    inFlight = request.finally(() => {
-      inFlight = null;
+    const tracked = request.finally(() => {
+      if (inFlight === tracked) inFlight = null;
     });
-    return inFlight;
+    inFlight = tracked;
+    return tracked;
   }
 
   return request;

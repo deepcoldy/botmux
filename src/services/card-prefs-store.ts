@@ -20,7 +20,7 @@
  *                                  of the group-visible live card
  *   • regularGroupReplyMode     — per-bot DEFAULT session mode for regular
  *                                  groups: chat | chat-topic | new-topic | shared
- *                                  (see chat-reply-mode-store). Default 'chat'.
+ *                                  (see chat-reply-mode-store). Default 'chat-topic'.
  */
 import { rmwBotEntry } from './config-store.js';
 import {

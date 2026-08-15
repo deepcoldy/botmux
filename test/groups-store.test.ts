@@ -33,8 +33,17 @@ vi.mock('../src/bot-registry.js', () => ({
                 name: 'one',
                 description: 'first chat',
                 chat_mode: 'group',
+                group_message_type: 'chat',
                 owner_id: 'ou_owner',
                 avatar: 'https://avatar.example/c1.png',
+              },
+              {
+                chat_id: 'c2',
+                name: 'converted topic group',
+                description: 'thread layout on a group-mode chat',
+                chat_mode: 'group',
+                group_message_type: 'thread',
+                owner_id: 'ou_owner',
               },
             ],
             has_more: false,
@@ -80,13 +89,23 @@ describe('groups-store wrappers', () => {
 
   it('listChats returns ChatBrief array', async () => {
     const out = await listChats('appA');
-    expect(out).toHaveLength(1);
+    expect(out).toHaveLength(2);
     expect(out[0].chatId).toBe('c1');
     expect(out[0].name).toBe('one');
     expect(out[0].description).toBe('first chat');
     expect(out[0].chatMode).toBe('group');
+    expect(out[0].groupMessageType).toBe('chat');
     expect(out[0].ownerId).toBe('ou_owner');
     expect(out[0].avatar).toBe('https://avatar.example/c1.png');
+  });
+
+  it("listChats treats group_message_type='thread' as a topic group", async () => {
+    const out = await listChats('appA');
+    expect(out[1]).toMatchObject({
+      chatId: 'c2',
+      chatMode: 'topic',
+      groupMessageType: 'thread',
+    });
   });
 
   it('isInChat returns boolean', async () => {

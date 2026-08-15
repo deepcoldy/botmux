@@ -1,3 +1,5 @@
+import type { DashboardEvent } from "../core/dashboard-events.js";
+
 export interface GroupMatrixChat {
   chatId: string;
   name?: string;
@@ -38,6 +40,13 @@ export interface GroupsMatrixSnapshot {
   warm: () => void;
   invalidate: () => void;
   peekPresentation: () => ReadonlyMap<string, GroupPresentation>;
+}
+
+/** Daemon SSE events that make the aggregated Groups matrix stale. */
+export function dashboardEventInvalidatesGroupsMatrix(
+  event: Pick<DashboardEvent, "type">,
+): boolean {
+  return event.type === "groups.reply-policy.changed";
 }
 
 function optionalTrimmedString(value: unknown): string | undefined {

@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 import {
   compactGroupsMatrix,
   createGroupsMatrixSnapshot,
+  dashboardEventInvalidatesGroupsMatrix,
   enrichSessionsWithGroupNames,
   roleWriteShouldInvalidate,
   type GroupsMatrix,
@@ -24,6 +25,11 @@ function matrix(name = "Release room"): GroupsMatrix {
 }
 
 describe("groups matrix snapshot", () => {
+  it("invalidates for daemon reply-policy changes only", () => {
+    expect(dashboardEventInvalidatesGroupsMatrix({ type: "groups.reply-policy.changed" })).toBe(true);
+    expect(dashboardEventInvalidatesGroupsMatrix({ type: "heartbeat" })).toBe(false);
+  });
+
   it("coalesces concurrent builds and reuses the value within the TTL", async () => {
     let resolveBuild!: (value: GroupsMatrix) => void;
     const build = vi.fn(

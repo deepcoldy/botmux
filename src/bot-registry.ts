@@ -1345,7 +1345,7 @@ export interface BotConfig {
    * Codex flagged in review.
    */
   defaultOncallAutoboundChats?: string[];
-  /** Per-chat reply mode: chat_id → 普通群 @bot 后回复形态。缺省为 chat（保持现状）。 */
+  /** Per-chat reply mode override: chat_id → 普通群 @bot 后回复形态。缺省时继承 regularGroupReplyMode。 */
   chatReplyModes?: { [chatId: string]: ChatReplyMode };
   /** Per-chat per-user grants: chat_id → 被授权的 open_id 列表。仅放行 canTalk，不给管理命令权。 */
   chatGrants?: { [chatId: string]: string[] };
@@ -1614,7 +1614,8 @@ export interface BotConfig {
    * Per-bot DEFAULT session mode for regular Lark groups (overridable per-chat
    * via `/reply-mode` → `chatReplyModes`). Resolved by
    * `chat-reply-mode-store.regularGroupDefaultMode`.
-   *   • 'chat' (or undefined) — whole group shares one flat chat-scope session
+   *   • 'chat'              — whole group shares one flat chat-scope session
+   *   • 'chat-topic' (or undefined) — top-level chat is shared; native topics are isolated
    *   • 'new-topic'           — each top-level @mention forks its own thread-scope session
    *   • 'shared'              — replies fold into a topic but reuse the one chat-scope session
    */
@@ -2569,8 +2570,8 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
     const substituteMode: SubstituteModeConfig | undefined = normalizeSubstituteMode(entry.substituteMode);
 
     // chatReplyModes：只保留每群显式设置，非法值丢弃。四态 chat｜chat-topic｜
-    // new-topic｜shared 都保留解析；写入路径会删除「与 per-bot 默认相同」的条目
-    // 以保持 bots.json 干净（见 chat-reply-mode-store.setChatReplyMode）。
+    // new-topic｜shared 都保留解析。显式值即使与当前 per-bot 默认相同也保留；
+    // 只有 clearChatReplyMode 才删除键并恢复继承。
     let chatReplyModes: { [chatId: string]: ChatReplyMode } | undefined;
     if (entry.chatReplyModes && typeof entry.chatReplyModes === 'object' && !Array.isArray(entry.chatReplyModes)) {
       const out: { [chatId: string]: ChatReplyMode } = {};

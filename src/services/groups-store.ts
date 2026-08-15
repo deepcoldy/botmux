@@ -17,7 +17,10 @@ export interface ChatBrief {
   chatId: string;
   name?: string;
   description?: string;
+  /** Effective topology used by the dashboard (`thread` groups normalize to `topic`). */
   chatMode?: string;
+  /** Raw Feishu group-message layout; converted topic groups report `thread` here. */
+  groupMessageType?: string;
   ownerId?: string;
   /** 群头像 URL（/open-apis/im/v1/chats 的 avatar 字段）。 */
   avatar?: string;
@@ -41,11 +44,23 @@ export async function listChats(larkAppId: string): Promise<ChatBrief[]> {
       throw new Error(`Failed to list chats: ${res.msg} (code: ${res.code})`);
     }
     for (const c of res.data?.items ?? []) {
+      const rawChatMode = typeof c.chat_mode === 'string' ? c.chat_mode.toLowerCase() : undefined;
+      const groupMessageType = typeof c.group_message_type === 'string'
+        ? c.group_message_type.toLowerCase()
+        : undefined;
       out.push({
         chatId: c.chat_id,
         name: c.name,
         description: c.description,
-        chatMode: c.chat_mode,
+        // Feishu can represent a topic group in two ways: chats created as a
+        // topic group use chat_mode=topic, while regular groups toggled to the
+        // topic layout keep chat_mode=group and set group_message_type=thread.
+        // Match getChatModeStrict so the dashboard never offers regular-group
+        // reply modes for either kind of topic group.
+        chatMode: rawChatMode === 'topic' || groupMessageType === 'thread'
+          ? 'topic'
+          : rawChatMode,
+        groupMessageType,
         ownerId: c.owner_id,
         avatar: c.avatar,
       });

@@ -94,4 +94,9 @@ describe('i18n help.* 对称', () => {
     const zhOnly = [...zhKeys].filter(k => !enKeys.has(k));
     expect({ enOnly, zhOnly }).toEqual({ enOnly: [], zhOnly: [] });
   });
+
+  it('/reply-mode help lists inherit in both locales', () => {
+    expect(en['help.reply_mode']).toContain('inherit');
+    expect(zh['help.reply_mode']).toContain('inherit');
+  });
 });

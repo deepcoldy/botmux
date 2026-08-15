@@ -55,6 +55,16 @@ import {
   type RoleProfileContext,
   type SaveProfileEntry,
 } from './groups.js';
+import {
+  fetchGroupReplyPolicy,
+  primeGroupsSnapshotCache,
+  setGroupReplyMode,
+  withGroupReplyPolicy,
+  type GroupMemberBot,
+  type GroupReplyMode,
+  type GroupReplyModeSelection,
+  type GroupReplyPolicy,
+} from './groups-api.js';
 
 type Translator = ReturnType<typeof useT>;
 
@@ -225,8 +235,38 @@ function groupBotStatusLabel(status: ReturnType<typeof groupBotStatus>, tr: Tran
   }
 }
 
+function replyModeSelection(mode: GroupReplyMode | null | undefined): Exclude<GroupReplyModeSelection, 'inherit'> {
+  return mode === 'shared' ? 'topic' : mode ?? 'chat-topic';
+}
+
+function replyModeLabel(mode: GroupReplyMode | null | undefined, tr: Translator): string {
+  return tr(`groups.replyMode.${replyModeSelection(mode)}`);
+}
+
+export function replyPolicySummary(policy: GroupReplyPolicy | undefined, tr: Translator): string | null {
+  if (!policy) return null;
+  return policy.inherited
+    ? tr('groups.replyModeInheritedSummary', {
+        effective: replyModeLabel(policy.effective, tr),
+        default: replyModeLabel(policy.default, tr),
+      })
+    : tr('groups.replyModeOverrideSummary', {
+        override: replyModeLabel(policy.override, tr),
+        effective: replyModeLabel(policy.effective, tr),
+      });
+}
+
+export function replyPolicyShortSummary(policy: GroupReplyPolicy | undefined, tr: Translator): string | null {
+  if (!policy) return null;
+  return tr(
+    policy.inherited ? 'groups.replyModeInheritedShort' : 'groups.replyModeOverrideShort',
+    { effective: replyModeSelection(policy.effective) },
+  );
+}
+
 function GroupBotCoverage(props: { chat: GroupChat; bots: GroupBot[]; tr: Translator }) {
   const members = new Map((props.chat.memberBots ?? []).map(member => [member.larkAppId, member]));
+  const nativeTopic = props.chat.chatMode === 'topic' || props.chat.chatMode === 'thread';
   return (
     <div className="groups-bot-strip" aria-label={props.tr('groups.botCoverage')}>
       {props.bots.map(bot => {
@@ -234,15 +274,27 @@ function GroupBotCoverage(props: { chat: GroupChat; bots: GroupBot[]; tr: Transl
         const status = groupBotStatus(member);
         const label = groupBotStatusLabel(status, props.tr);
         const name = bot.botName ?? bot.larkAppId;
+        const replySummary = member?.inChat
+          ? nativeTopic
+            ? props.tr('groups.replyModeNativeTopic')
+            : replyPolicySummary(member.replyPolicy, props.tr)
+          : null;
+        const replyShort = member?.inChat
+          ? nativeTopic
+            ? props.tr('groups.replyModeNativeTopicShort')
+            : replyPolicyShortSummary(member.replyPolicy, props.tr)
+          : null;
+        const accessibleLabel = `${name}: ${label}${replySummary ? ` · ${replySummary}` : ''}${member?.error ? ` (${String(member.error)})` : ''}`;
         return (
           <span
             className={`groups-bot-pill groups-bot-${status}`}
-            title={`${name}: ${label}${member?.error ? ` (${String(member.error)})` : ''}`}
+            title={accessibleLabel}
+            aria-label={accessibleLabel}
             key={bot.larkAppId}
           >
             <i aria-hidden="true" />
             <span className="groups-bot-name">{name}</span>
-            <span className="groups-bot-state">{label}</span>
+            <span className="groups-bot-state">{label}{replyShort ? ` · ${replyShort}` : ''}</span>
           </span>
         );
       })}
@@ -1072,10 +1124,108 @@ function OncallRow(props: {
   );
 }
 
+function ReplyModeRow(props: {
+  chat: GroupChat;
+  member: GroupMemberBot;
+  tr: Translator;
+  onSaved(policy: GroupReplyPolicy): Promise<void>;
+}) {
+  const { chat, member, tr } = props;
+  const nativeTopic = chat.chatMode === 'topic' || chat.chatMode === 'thread';
+  const [policy, setPolicy] = useState<GroupReplyPolicy | undefined>(member.replyPolicy);
+  const [loading, setLoading] = useState(!nativeTopic && !member.replyPolicy);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState('');
+
+  useEffect(() => {
+    if (nativeTopic) return undefined;
+    let alive = true;
+    setLoading(true);
+    setError('');
+    void fetchGroupReplyPolicy(chat.chatId, member.larkAppId)
+      .then(next => { if (alive) setPolicy(next); })
+      .catch(err => { if (alive) setError(err instanceof Error ? err.message : String(err)); })
+      .finally(() => { if (alive) setLoading(false); });
+    return () => { alive = false; };
+  }, [chat.chatId, member.larkAppId, nativeTopic]);
+
+  const selected: GroupReplyModeSelection = policy?.inherited
+    ? 'inherit'
+    : replyModeSelection(policy?.override ?? policy?.effective);
+
+  async function changeMode(selection: GroupReplyModeSelection): Promise<void> {
+    setSaving(true);
+    setError('');
+    try {
+      const next = await setGroupReplyMode(chat.chatId, member.larkAppId, selection);
+      setPolicy(next);
+      await props.onSaved(next).catch(() => { /* the authoritative write already succeeded */ });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <div className="oncall-row" data-reply-mode-bot={member.larkAppId}>
+      <div className="checkbox-row">
+        <strong>{member.botName ?? member.larkAppId}</strong>
+        <small>({member.larkAppId})</small>
+      </div>
+      <div className="oncall-row-body">
+        {nativeTopic ? (
+          <>
+            <span className="hint-ok">{tr('groups.replyModeNativeTopic')}</span>
+            {policy?.override ? (
+              <button
+                type="button"
+                disabled={saving}
+                onClick={() => void changeMode('inherit')}
+              >{tr('groups.replyModeClearDormant')}</button>
+            ) : null}
+          </>
+        ) : (
+          <select
+            aria-label={tr('groups.replyModeSelectFor', { bot: member.botName ?? member.larkAppId })}
+            value={selected}
+            disabled={loading || saving || !policy}
+            onChange={event => void changeMode(event.currentTarget.value as GroupReplyModeSelection)}
+          >
+            <option value="inherit">
+              {tr('groups.replyMode.inherit')}{policy ? ` (${replyModeLabel(policy.default, tr)})` : ''}
+            </option>
+            <option value="chat">{tr('groups.replyMode.chat')}</option>
+            <option value="chat-topic">{tr('groups.replyMode.chat-topic')}</option>
+            <option value="topic">{tr('groups.replyMode.topic')}</option>
+            <option value="new-topic">{tr('groups.replyMode.new-topic')}</option>
+          </select>
+        )}
+        <span className={error ? 'hint-warn-inline' : ''} aria-live="polite">
+          {error
+            ? tr('groups.replyModeError', { reason: error })
+            : saving
+              ? tr('groups.replyModeSaving')
+              : nativeTopic
+                ? policy?.override
+                  ? tr('groups.replyModeDormantOverride', { mode: replyModeLabel(policy.override, tr) })
+                  : tr('groups.replyModeNativeTopicHelp')
+                : loading
+                  ? tr('common.loading')
+                  : policy
+                    ? replyPolicySummary(policy, tr)
+                    : ''}
+        </span>
+      </div>
+    </div>
+  );
+}
+
 function ManageDialog(props: {
   chat: GroupChat;
   tr: Translator;
   onClose(): void;
+  onReplyPolicySaved(larkAppId: string, policy: GroupReplyPolicy): void;
   onReloadGroups(options?: { force?: boolean }): Promise<GroupsSnapshot>;
 }) {
   const { chat, tr } = props;
@@ -1166,6 +1316,25 @@ function ManageDialog(props: {
       </div>
 
       <fieldset>
+        <legend>{tr('groups.replyModeTitle')}</legend>
+        <p><small>{tr('groups.replyModeHelp')}</small></p>
+        {inChat.length === 0 ? (
+          <p className="empty">{tr('groups.noBotsInChat')}</p>
+        ) : inChat.map(member => (
+          <ReplyModeRow
+            key={member.larkAppId}
+            chat={chat}
+            member={member}
+            tr={tr}
+            onSaved={async policy => {
+              props.onReplyPolicySaved(member.larkAppId, policy);
+              await props.onReloadGroups({ force: true });
+            }}
+          />
+        ))}
+      </fieldset>
+
+      <fieldset>
         <legend>{tr('groups.oncall')}</legend>
         <p><small>{tr('groups.oncallHelp')}</small></p>
         {inChat.length === 0 ? (
@@ -1222,6 +1391,7 @@ function DialogHost(props: {
   tr: Translator;
   onClose(): void;
   onCreated(resp: any, selectedIds: string[], name: string): void;
+  onReplyPolicySaved(chatId: string, larkAppId: string, policy: GroupReplyPolicy): void;
   onReloadGroups(options?: { force?: boolean }): Promise<GroupsSnapshot>;
   onRefreshRoleContext(): Promise<void>;
   setTimer(fn: () => void, ms: number): number;
@@ -1277,11 +1447,15 @@ function DialogHost(props: {
       />
     );
   } else if (props.dialog?.type === 'manage') {
+    const manageChat = props.dialog.chat;
     content = (
       <ManageDialog
-        chat={props.dialog.chat}
+        chat={manageChat}
         tr={props.tr}
         onClose={props.onClose}
+        onReplyPolicySaved={(larkAppId, policy) => {
+          props.onReplyPolicySaved(manageChat.chatId, larkAppId, policy);
+        }}
         onReloadGroups={props.onReloadGroups}
       />
     );
@@ -1460,6 +1634,17 @@ function GroupsPage() {
     void refreshUntilSeen(chatId, expectedBotIds).catch(() => { /* tolerate */ });
   }
 
+  const handleReplyPolicySaved = useCallback((
+    chatId: string,
+    larkAppId: string,
+    policy: GroupReplyPolicy,
+  ): void => {
+    const next = withGroupReplyPolicy(snapshotRef.current, chatId, larkAppId, policy);
+    if (next === snapshotRef.current) return;
+    primeGroupsSnapshotCache(next);
+    setSnapshot(next);
+  }, [setSnapshot]);
+
   const openAddBotsDialog = useCallback((chat: GroupChat): void => {
     const inChatSet = new Set((chat.memberBots ?? []).filter(member => member.inChat).map(member => member.larkAppId));
     const missing = snapshotRef.current.bots.filter(bot => !inChatSet.has(bot.larkAppId));
@@ -1589,6 +1774,7 @@ function GroupsPage() {
         tr={tr}
         onClose={() => setDialog(null)}
         onCreated={handleCreated}
+        onReplyPolicySaved={handleReplyPolicySaved}
         onReloadGroups={reloadGroups}
         onRefreshRoleContext={() => refreshRoleProfileContext()}
         setTimer={setTimer}

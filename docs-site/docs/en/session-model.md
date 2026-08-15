@@ -9,10 +9,21 @@ The key to understanding botmux is figuring out "which session a given message l
 | Shape | Behavior |
 |------|------|
 | **Topic group (THREAD)** | Each new topic = an independent CLI session. Messages within the same topic go to the same session; different topics are isolated from each other. Most recommended. |
-| **Regular group (DEFAULT)** | Does not auto-open topics by default. `/t <text>` opens a topic and submits the first task, starting after repository selection when needed; bare `/t` opens the topic setup entry: it shows the repository picker when selection is needed, while a pinned working directory or no selectable project waits for the next task or `/repo` without starting an empty session. |
+| **Regular group (DEFAULT)** | By default, top-level @mentions reply flat and reuse the group session, while user-created native topics are isolated (`chat-topic`). A per-chat reply mode can make the group fully flat, use topic UI with shared context, or open a fresh topic every time. `/t <text>` always forces a new topic. |
 | **Direct message** | Chat directly with the bot, effectively a single long-running session. |
 
 > When “show a status card while a task runs” is off, `/t <text>` still produces a visible topic reply first so Lark expands the thread immediately; reactions are only progress indicators.
+
+## Per-chat reply modes for regular groups
+
+| Mode | Top-level reply | Session and context |
+|------|------|------|
+| `chat` | Flat in the group | One session for the whole group; native topics fold back into it too |
+| `chat-topic` | Flat in the group | Shared top-level session, isolated native-topic sessions (default) |
+| `topic` / `shared` | A thread under the trigger | Display-only change; the whole group still shares one session |
+| `new-topic` | A new thread under the trigger | Every top-level @mention gets an isolated session and context |
+
+The effective priority is “this bot's per-chat override > this bot's `regularGroupReplyMode` > `chat-topic`.” For example, if Agent1 defaults to `chat` and only Group A overrides to `new-topic`, every other group inherits `chat`. Choosing “Inherit bot default” for A clears its override, after which A follows later changes to Agent1's default too. A concrete selection remains pinned instead. Native topic groups do not participate in this precedence and always reply independently in the current topic.
 
 ## On-call groups & chat-scope groups
 

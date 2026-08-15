@@ -152,6 +152,41 @@
 | `restrictGrantCommands` | `true` 时，仅靠 per-user 授权（`chatGrants` / `globalGrants`）放行的人禁用**所有斜杠命令**，只能普通对话；owner / `allowedUsers` / oncall / 整群成员不受影响。默认 `false` |
 | `autoGrantRequestCards` | 默认开启。显式设为 `false` 时，群里未授权的人或外部 bot @ 本 bot 但被对话权限闸挡住时，不再自动给 owner 发 `/grant` 申请卡，改为静默丢弃 |
 
+## 普通群回复模式
+
+| 字段 | 说明 |
+|------|------|
+| `regularGroupReplyMode` | 这个 bot 在普通群的默认模式：`chat` / `chat-topic` / `shared` / `new-topic`。缺省为 `chat-topic` |
+| `chatReplyModes` | 按群覆盖，格式为 `{ "<chat_id>": "<mode>" }`。它属于当前 bot，因此同一群内的不同 bot 可以用不同模式。删除某个 `chat_id` 即恢复继承 bot 默认值 |
+
+```json
+{
+  "regularGroupReplyMode": "chat-topic",
+  "chatReplyModes": {
+    "oc_group_A": "shared",
+    "oc_group_B": "chat"
+  }
+}
+```
+
+- A 群是普通群，`shared`（聊天命令中显示为 `topic`）会在触发消息下以话题形式回复，但仍复用整群的同一个 session。
+- B 群是普通群，`chat` 在群顶层平铺回复，不创建话题。
+- C 群若是飞书话题群，无需也不会应用这两个字段；botmux 会根据 `chat_mode=topic` 或 `group_message_type=thread` 自动在当前话题内回复。
+- `shared` 只改变飞书中的展示位置，不分隔上下文；`new-topic` 则是每次顶层 @ 都建立独立话题、session、worker 和上下文。
+- Dashboard 中的“继承 Bot 默认”等价于不在 `chatReplyModes` 中保留该群键；显式选中某个模式则是固定的群级覆盖。
+
+两层配置示例：Agent1 默认在所有普通群平铺回复，仅 A 群每次开独立话题：
+
+```json
+{
+  "name": "Agent1",
+  "regularGroupReplyMode": "chat",
+  "chatReplyModes": { "oc_group_A": "new-topic" }
+}
+```
+
+此时 A 群的有效值是 `new-topic`，其他群因为没有键而继承 `chat`。在 Dashboard 清除 A 群覆盖后，A 群也立即回到 `chat`；之后若把 Agent1 默认改为 `chat-topic`，A 群和其他未覆盖的群都会一起跟随。
+
 ## 文件沙盒
 
 | 字段 | 说明 |

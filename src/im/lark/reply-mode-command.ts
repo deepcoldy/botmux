@@ -5,9 +5,15 @@
  */
 import { isBotMentioned, canOperate, extractMessageTextForRouting } from './event-dispatcher.js';
 import { stripLeadingMentions } from './message-parser.js';
-import { getChatMode, replyMessage } from './client.js';
+import { getChatModeStrict, replyMessage } from './client.js';
 import { localeForBot, t } from '../../i18n/index.js';
-import { normalizeChatReplyMode, replyModeLabel, resolveRegularGroupMode, setChatReplyMode } from '../../services/chat-reply-mode-store.js';
+import {
+  clearChatReplyMode,
+  getChatReplyModeState,
+  normalizeChatReplyMode,
+  replyModeLabel,
+  setChatReplyMode,
+} from '../../services/chat-reply-mode-store.js';
 import { findConfigField, applyConfigField } from '../../services/bot-config-store.js';
 import { getBot } from '../../bot-registry.js';
 import { logger } from '../../utils/logger.js';
@@ -83,20 +89,25 @@ export async function tryHandleReplyModeCommand(
     return true;
   }
 
-  if (!chatId || (await getChatMode(larkAppId, chatId)) !== 'group') {
+  if (!chatId || (await getChatModeStrict(larkAppId, chatId)) !== 'group') {
     await reply(t('cmd.reply_mode.unsupported', undefined, loc));
     return true;
   }
 
   if (isStatus) {
     if (!canTalk) return true;
-    const mode = resolveRegularGroupMode(larkAppId, chatId);
-    await reply(t('cmd.reply_mode.status', { mode: replyModeLabel(mode) }, loc));
+    const state = getChatReplyModeState(larkAppId, chatId);
+    await reply(t(
+      state.inherited ? 'cmd.reply_mode.status_inherited' : 'cmd.reply_mode.status_override',
+      { mode: replyModeLabel(state.effective), default: replyModeLabel(state.default) },
+      loc,
+    ));
     return true;
   }
 
+  const clearRequested = arg === 'inherit' || arg === 'default' || arg === 'reset';
   const mode = normalizeChatReplyMode(arg);
-  if (!mode) {
+  if (!clearRequested && !mode) {
     await reply(t('cmd.reply_mode.usage', undefined, loc));
     return true;
   }
@@ -104,6 +115,19 @@ export async function tryHandleReplyModeCommand(
     await reply(t('cmd.reply_mode.owner_only', undefined, loc));
     return true;
   }
+  if (clearRequested) {
+    const res = await clearChatReplyMode(larkAppId, chatId);
+    if (!res.ok) {
+      await reply(t('cmd.reply_mode.failed', { reason: res.reason }, loc));
+      return true;
+    }
+    await reply(t('cmd.reply_mode.inherited', {
+      mode: replyModeLabel(res.effective),
+      default: replyModeLabel(res.default),
+    }, loc));
+    return true;
+  }
+  if (!mode) return true; // guarded by the usage branch above
   const res = await setChatReplyMode(larkAppId, chatId, mode);
   if (!res.ok) {
     await reply(t('cmd.reply_mode.failed', { reason: res.reason }, loc));

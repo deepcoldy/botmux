@@ -152,6 +152,41 @@ You can also add it to the corresponding bot entry directly (manual `bots.json` 
 | `restrictGrantCommands` | When `true`, people granted only via per-user authorization (`chatGrants` / `globalGrants`) are disabled from **all slash commands** and can only have plain conversations; owner / `allowedUsers` / oncall / whole-group members are unaffected. Defaults to `false` |
 | `autoGrantRequestCards` | Enabled by default. Set to `false` to stop automatically sending `/grant` request cards to the owner when an unauthorized person or external bot @mentions this bot in a group and the talk gate blocks it; the message is dropped silently instead |
 
+## Regular-group reply modes
+
+| Field | Description |
+|------|------|
+| `regularGroupReplyMode` | This bot's default in regular groups: `chat` / `chat-topic` / `shared` / `new-topic`. Defaults to `chat-topic` |
+| `chatReplyModes` | Per-chat overrides in the form `{ "<chat_id>": "<mode>" }`. The map belongs to this bot, so different bots in the same chat can use different modes. Remove a `chat_id` entry to inherit the bot default again |
+
+```json
+{
+  "regularGroupReplyMode": "chat-topic",
+  "chatReplyModes": {
+    "oc_group_A": "shared",
+    "oc_group_B": "chat"
+  }
+}
+```
+
+- Group A is a regular group. `shared` (shown as `topic` by the chat command) replies in a thread under the trigger while reusing the one group session.
+- Group B is a regular group. `chat` sends flat top-level replies and does not create a topic.
+- If Group C is a native Lark topic group, neither field is needed or applied. Botmux detects either `chat_mode=topic` or `group_message_type=thread` and replies in the current topic automatically.
+- `shared` changes only where the reply is displayed; it does not isolate context. `new-topic` gives every top-level @mention its own topic, session, worker, and context.
+- In the Dashboard, “Inherit bot default” means the chat has no key in `chatReplyModes`; selecting a concrete mode creates a pinned per-chat override.
+
+Two-layer example: Agent1 replies flat by default in every regular group, except Group A, where each trigger gets an isolated topic:
+
+```json
+{
+  "name": "Agent1",
+  "regularGroupReplyMode": "chat",
+  "chatReplyModes": { "oc_group_A": "new-topic" }
+}
+```
+
+Group A resolves to `new-topic`; every other group inherits `chat` because it has no map entry. Clearing A's override in the Dashboard makes it inherit `chat` too. If Agent1's default later changes to `chat-topic`, A and every other unpinned group follow that new default together.
+
 ## File sandbox
 
 | Field | Description |

@@ -30,4 +30,9 @@ describe('dashboard mobile layout', () => {
     expect(css).toMatch(/main:has\(\.sessions-page\) \.sessions-topic-view\s*\{[\s\S]*?height:\s*auto;[\s\S]*?overflow:\s*visible;/);
     expect(css).toMatch(/main:has\(\.sessions-page\) \.session-topic-members\s*\{\s*grid-template-columns:\s*1fr;/);
   });
+
+  it('keeps group bot reply-policy pills inside their width budget', () => {
+    expect(css).toMatch(/\.groups-bot-pill\s*\{[\s\S]*?max-width:\s*172px;[\s\S]*?min-width:\s*0;/);
+    expect(css).toMatch(/\.groups-bot-state\s*\{[\s\S]*?flex:\s*0 1 auto;[\s\S]*?min-width:\s*0;[\s\S]*?overflow:\s*hidden;[\s\S]*?text-overflow:\s*ellipsis;[\s\S]*?white-space:\s*nowrap;/);
+  });
 });
