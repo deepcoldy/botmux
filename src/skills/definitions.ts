@@ -1052,7 +1052,7 @@ botmux ask buttons --options "yes=继续,no=停止" "继续吗？"
 
 兼容 alias：\`botmux ask --options "yes,no" "继续吗？"\` 可以用，但文档和新脚本优先写 \`botmux ask buttons\`，给未来 \`ask text\` / \`ask confirm\` 留空间。
 
-多选加 \`--multi\`，stdout 返回逗号分隔的 key；需要完整结构时加 \`--json\` 读取 \`answers[0]\`：
+多选加 \`--multi\`，stdout 返回逗号分隔的 key；需要完整结构时加 \`--json\` 读取 \`answers[0]\`（多选下 \`selected\` 恒为 \`null\`，因为它只表示单问单选的兼容值）：
 
 \`\`\`bash
 choices=$(botmux ask buttons --multi --options "lint=Lint,test=测试,build=构建" "要执行哪些检查？")
@@ -1086,7 +1086,7 @@ stdout 为一行 JSON。注意：\`--json\` 覆盖所有结果类型；超时 / 
 
 - \`--options\` 必填，至少 2 项，逗号分隔
 - 推荐 \`key=label\`，key 用稳定英文短词，label 给用户看
-- \`--multi\` 开启多选；\`--json\` 的 \`answers[0]\` 保留完整 key 数组
+- \`--multi\` 开启多选；\`--json\` 的 \`answers[0]\` 保留完整 key 数组，且 \`selected\` 恒为 \`null\`（多选不要读 \`selected\`）
 - 默认超时 300 秒，可用 \`--timeout <seconds>\` 调整
 `;
 

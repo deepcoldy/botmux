@@ -9369,7 +9369,11 @@ async function cmdAsk(sub: string, rest: string[]): Promise<void> {
 
   if (useJson) {
     const out: AskJsonOutput = {
-      selected,
+      // `selected` 是「单问单选」的向后兼容值（= toLegacySelected 的形状判据：
+      // 恰好 1 问且恰好 1 个 key）。`--multi` 下调用方明确按多选语义读 `answers[0]`，
+      // 此时 `selected` 必须恒为 null——否则「多选恰好 1 项」会因形状巧合退化出一个
+      // key，令 `selected` 的含义随选中数量漂移（违反公开契约）。
+      selected: multiSelect ? null : selected,
       answers: result.kind === 'answered' ? (result.answers as string[][]) : null,
       by: result.kind === 'answered' ? result.by : null,
       comment: result.kind === 'answered' ? result.comment : null,
@@ -9387,7 +9391,11 @@ async function cmdAsk(sub: string, rest: string[]): Promise<void> {
           ' 用 `--json` 读 comment 字段取回原文。',
       );
     }
-    const value = selected ?? (multiSelect ? result.answers[0]?.join(',') : '') ?? '';
+    // 单选走 `selected`（单问单选的 key，与旧行为字节一致）；多选直接拼 `answers[0]`
+    // 的完整 key 数组，与 selected 的单选语义解耦——多选 0 项→空行、1 项→单 key、
+    // N 项→逗号分隔，全程 exit 0。文字作答时 answers[0] 为空数组同样落空行（上面已在
+    // stderr 提示改读 --json 的 comment）。
+    const value = multiSelect ? (result.answers[0]?.join(',') ?? '') : (selected ?? '');
     process.stdout.write(value + '\n');
   }
 
