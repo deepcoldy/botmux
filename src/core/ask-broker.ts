@@ -233,6 +233,9 @@ export function submitAsk(args: {
   nonce: string;
   by: string;
   selections?: ReadonlyArray<ReadonlyArray<string>>;
+  /** 空提交二次确认已通过（用户在 arm 卡片上再点了一次）。仅影响「全多选 + 全空」
+   *  这一种可确认的空提交；其它情形不看它。缺省 false。 */
+  confirmEmpty?: boolean;
 }): AskClickOutcome {
   gcSettled();
   const ask = pending.get(args.askId);
@@ -266,6 +269,18 @@ export function submitAsk(args: {
       built.push([...sel]);
     }
     answers = built;
+  }
+
+  // 空提交二次确认（防手滑）：鉴权 + nonce + 单选约束都过了，若「每个问题都允许空集
+  // （全多选）」且当前所有问题都没选任何 key，第一次提交先不 settle，返回
+  // needs_empty_confirm 让卡片 arm 一个确认按钮；带 confirmEmpty 再点才真正落空答案。
+  // 只在全多选时触发：只要有一个单选问题，空集在上面的单选约束里已被判 stale，空提交
+  // 本就不是有效答案，不进二次确认（否则 arm 后二次点击必然 stale，形成死路）。
+  if (!args.confirmEmpty
+      && ask.questions.length > 0
+      && ask.questions.every((q) => q.multiSelect)
+      && answers.every((keys) => keys.length === 0)) {
+    return 'needs_empty_confirm';
   }
 
   settle(args.askId, {

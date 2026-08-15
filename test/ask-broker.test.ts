@@ -565,6 +565,77 @@ describe('toggleAsk + submitAsk', () => {
     expect(_pendingCount()).toBe(1);
   });
 
+  it('submitAsk 全多选 + 全空 + 无 confirmEmpty → needs_empty_confirm（不 settle）', async () => {
+    _resetForTest();
+    setCanTalkChecker((_app, _chat, openId) => DEFAULT_TALKERS.has(openId));
+    setCardDispatcher({ send: async () => ({ messageId: 'm1' }) });
+    registerAsk({
+      larkAppId: 'a', chatId: 'c', rootMessageId: null, sessionId: 's',
+      questions: [{ prompt: 'pick', options: [{ key: 'a', label: 'A' }, { key: 'b', label: 'B' }], multiSelect: true }],
+      timeoutMs: 60_000,
+    });
+    const askId = _allAskIds()[0]!;
+    const nonce = _getPending(askId)!.nonce;
+    // 一个都没勾直接 submit：全多选 → 空是合法答案，但先要二次确认
+    expect(submitAsk({ askId, nonce, by: 'ou_u' })).toBe('needs_empty_confirm');
+    expect(_getPending(askId)?.settled).toBe(false); // 不 settle
+  });
+
+  it('submitAsk 全多选 + 全空 + confirmEmpty:true → accepted（settle 空答案）', async () => {
+    _resetForTest();
+    setCanTalkChecker((_app, _chat, openId) => DEFAULT_TALKERS.has(openId));
+    setCardDispatcher({ send: async () => ({ messageId: 'm1' }) });
+    const p = registerAsk({
+      larkAppId: 'a', chatId: 'c', rootMessageId: null, sessionId: 's',
+      questions: [{ prompt: 'pick', options: [{ key: 'a', label: 'A' }, { key: 'b', label: 'B' }], multiSelect: true }],
+      timeoutMs: 60_000,
+    });
+    const askId = _allAskIds()[0]!;
+    const nonce = _getPending(askId)!.nonce;
+    expect(submitAsk({ askId, nonce, by: 'ou_u', confirmEmpty: true })).toBe('accepted');
+    const r = await p;
+    if (r.kind === 'answered') expect(r.answers).toEqual([[]]); // 空答案
+  });
+
+  it('submitAsk 混合 [单选,多选] 全空 → stale（不进 needs_empty_confirm）', async () => {
+    _resetForTest();
+    setCanTalkChecker((_app, _chat, openId) => DEFAULT_TALKERS.has(openId));
+    setCardDispatcher({ send: async () => ({ messageId: 'm1' }) });
+    registerAsk({
+      larkAppId: 'a', chatId: 'c', rootMessageId: null, sessionId: 's',
+      questions: [
+        { prompt: 'q1', options: [{ key: 'y', label: 'Y' }, { key: 'n', label: 'N' }], multiSelect: false },
+        { prompt: 'q2', options: [{ key: 'a', label: 'A' }, { key: 'b', label: 'B' }], multiSelect: true },
+      ],
+      timeoutMs: 60_000,
+    });
+    const askId = _allAskIds()[0]!;
+    const nonce = _getPending(askId)!.nonce;
+    // 有单选未选 → 空非有效答案，单选约束先判 stale，绝不 arm（否则二次确认死路）
+    expect(submitAsk({ askId, nonce, by: 'ou_u' })).toBe('stale');
+    // confirmEmpty:true 也一样 stale（单选约束不因确认而放宽）
+    expect(submitAsk({ askId, nonce, by: 'ou_u', confirmEmpty: true })).toBe('stale');
+    expect(_getPending(askId)?.settled).toBe(false);
+  });
+
+  it('submitAsk 全多选全空：坏 nonce / 未授权 优先于 needs_empty_confirm', async () => {
+    _resetForTest();
+    setCanTalkChecker((_app, _chat, openId) => DEFAULT_TALKERS.has(openId));
+    setCardDispatcher({ send: async () => ({ messageId: 'm1' }) });
+    registerAsk({
+      larkAppId: 'a', chatId: 'c', rootMessageId: null, sessionId: 's',
+      questions: [{ prompt: 'pick', options: [{ key: 'a', label: 'A' }, { key: 'b', label: 'B' }], multiSelect: true }],
+      timeoutMs: 60_000,
+    });
+    const askId = _allAskIds()[0]!;
+    const nonce = _getPending(askId)!.nonce;
+    // 坏 nonce → stale（不 arm）
+    expect(submitAsk({ askId, nonce: 'wrong', by: 'ou_u' })).toBe('stale');
+    // 未授权 → unauthorized（不 arm）
+    expect(submitAsk({ askId, nonce, by: 'ou_other' })).toBe('unauthorized');
+    expect(_getPending(askId)?.settled).toBe(false);
+  });
+
   it('_allAskIds 返回所有未 settle 及已 settle(retention 内)的 askId', async () => {
     _resetForTest();
     setCanTalkChecker((_app, _chat, openId) => DEFAULT_TALKERS.has(openId));

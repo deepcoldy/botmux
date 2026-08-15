@@ -122,12 +122,17 @@ export async function handleAskCardAction(
   // 新 Submit 路径：优先从按钮累积态提交；兼容旧 form_value 回调。
   // 同 ASK_SELECT_ACTION：accepted 时同步返回终态卡片。
   if (action === ASK_SUBMIT_ACTION) {
+    // 空提交二次确认标志。飞书按钮 value 回传只可靠保留字符串（对齐 settings-card 的
+    // next_value:'true' 与 toggle 的 String(i)），故按字符串判定；同时容忍真布尔，
+    // 兼容潜在的非飞书调用方。true = 用户已在 arm 卡片上再点了一次，允许空提交落地。
+    const confirmEmpty = value?.confirm_empty === 'true' || value?.confirm_empty === true;
     const formValue = data.action?.form_value ?? {};
     if (Object.keys(formValue).length > 0) {
       // 推断问题数量：找最大 qN 的 N+1
       const questionCount = guessQuestionCount(formValue);
       const selections = parseFormSelections(formValue, questionCount);
-      const outcome = submitAsk({ askId, nonce, by, selections });
+      const outcome = submitAsk({ askId, nonce, by, selections, confirmEmpty });
+      if (outcome === 'needs_empty_confirm') return armEmptyConfirmResponse(askId, locale);
       if (outcome !== 'accepted') return toastForOutcome(outcome, locale);
       return settledCardResponse(askId, {
         kind: 'answered',
@@ -137,21 +142,11 @@ export async function handleAskCardAction(
         timedOut: false,
       });
     }
-    // 累积按钮路径。空提交二次确认：用户没勾任何选项就点提交，且至少一问是多选
-    // （多选允许空集作答，但极可能是手滑）。第一次拦下——重渲染卡片 arm 一个「确认
-    // 空提交」按钮 + 警示 + toast，不 settle；用户再点（按钮带 confirm_empty）才真正
-    // 提交空答案。单选问题空集本就被 submitAsk 判 stale，不在此列。
-    // Feishu 回传的按钮 value 是字符串（见 buildAskCard 里 confirm_empty:'true' 注释）；
-    // 同时容忍真布尔，兼容潜在的非飞书调用方。
-    const confirmEmpty = value?.confirm_empty === 'true' || value?.confirm_empty === true;
-    const peek = getAskSnapshot(askId);
-    if (!confirmEmpty && peek && !peek.settled && isEmptyMultiSubmit(peek)) {
-      return {
-        ...(JSON.parse(buildAskCard(peek, undefined, { confirmEmptyArmed: true })) as Record<string, unknown>),
-        toast: { type: 'warning', content: t('card.ask.toast.empty_confirm_needed', undefined, locale) },
-      };
-    }
-    const outcome = submitAsk({ askId, nonce, by });
+    // 累积按钮路径。submitAsk 在鉴权 + nonce + 单选约束全过后，若「全多选且全空」返回
+    // needs_empty_confirm（防手滑）——空提交二次确认的判定全在 broker 内，卡片不再自行
+    // 预检（否则会绕过 nonce/canTalk，且需重复 mixed-question 规则）。
+    const outcome = submitAsk({ askId, nonce, by, confirmEmpty });
+    if (outcome === 'needs_empty_confirm') return armEmptyConfirmResponse(askId, locale);
     if (outcome !== 'accepted') return toastForOutcome(outcome, locale);
     const updated = getAskSnapshot(askId);
     const answers = updated?.selections ?? updated?.questions.map(() => []) ?? [];
@@ -164,6 +159,27 @@ export async function handleAskCardAction(
     });
   }
   return staleToast(locale);
+}
+
+/**
+ * 空提交二次确认的卡片响应：重渲染当前 pending ask，arm 一个红色「确认空提交」按钮
+ * + 警示条，并附 warning toast。
+ *
+ * 关键：必须包成 `{ card: { type: 'raw', data } }` —— event-dispatcher 的
+ * shapeCardActionResult 认「已整形响应」的标志是顶层 `toast`/`card`/`deferredCard`
+ * 之一；若把 card 字段摊在顶层再塞个 toast，它只认 toast、raw card 不会被 patch，
+ * 用户只看到 toast、arm 按钮不出现（codex B-1）。这里同时带 card + toast，二者都生效。
+ */
+function armEmptyConfirmResponse(askId: string, locale?: Locale): Record<string, unknown> | undefined {
+  const ask = getAskSnapshot(askId);
+  if (!ask) return staleToast(locale);
+  return {
+    card: {
+      type: 'raw',
+      data: JSON.parse(buildAskCard(ask, undefined, { confirmEmptyArmed: true })) as Record<string, unknown>,
+    },
+    toast: { type: 'warning', content: t('card.ask.toast.empty_confirm_needed', undefined, locale) },
+  };
 }
 
 /**
@@ -386,24 +402,15 @@ function toastForOutcome(outcome: AskClickOutcome, locale?: Locale): { toast: { 
     case 'toggled':
       // 累积勾选，不弹 toast
       return undefined;
+    case 'needs_empty_confirm':
+      // 正常路径由 handleAskCardAction 提前拦成 arm 卡片响应，不会走到这里；
+      // 兜底给个 warning toast，避免静默。
+      return { toast: { type: 'warning', content: t('card.ask.toast.empty_confirm_needed', undefined, locale) } };
   }
 }
 
 function staleToast(locale?: Locale): { toast: { type: string; content: string } } {
   return { toast: { type: 'warning', content: t('card.ask.toast.stale', undefined, locale) } };
-}
-
-/**
- * 判定一次「累积态提交」是否为需二次确认的空多选提交：
- *   - 至少有一个问题是多选（单选空集会被 submitAsk 直接判 stale，无需确认）；
- *   - 且当前所有问题的累积勾选都为空。
- * selections 缺省（尚未 toggle 过任何项）视同全空。
- */
-function isEmptyMultiSubmit(ask: PendingAsk): boolean {
-  const hasMulti = ask.questions.some((q) => q.multiSelect);
-  if (!hasMulti) return false;
-  const selections = ask.selections ?? ask.questions.map(() => []);
-  return selections.every((keys) => (keys?.length ?? 0) === 0);
 }
 
 /**
