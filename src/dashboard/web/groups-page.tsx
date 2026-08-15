@@ -1420,10 +1420,15 @@ function GroupsPage() {
     };
   }, [reloadGroups]);
 
-  const rows = useMemo(
+  // 会话群（p2pMode=group 自动创建，session-groups-store 分型标记）与常驻群
+  // 分开管理：主列表只展示常驻群，会话群收进下方折叠区——它们由 bot 自动
+  // 创建/命名/管理，数量随会话增长，混排会淹没真正需要人工管理的常驻群。
+  const allMatched = useMemo(
     () => filterGroupChats(snapshot.chats, filters),
     [snapshot.chats, filters],
   );
+  const rows = useMemo(() => allMatched.filter(c => !(c as any).sessionGroup), [allMatched]);
+  const sessionRows = useMemo(() => allMatched.filter(c => (c as any).sessionGroup), [allMatched]);
   const pageWindow = useMemo(
     () => paginateGroupRows(rows, page),
     [rows, page],
@@ -1592,6 +1597,28 @@ function GroupsPage() {
           </div>
         )}
       </section>
+      {!loading && sessionRows.length > 0 ? (
+        <details className="overview-block groups-session-section" open={!!filters.q} data-session-groups>
+          <summary style={{ cursor: 'pointer', padding: '10px 4px', fontWeight: 600, opacity: 0.85 }}>
+            🤖 {tr('groups.sessionSection')}（{sessionRows.length}）
+            <span style={{ fontWeight: 400, opacity: 0.7, marginLeft: 8 }}>{tr('groups.sessionSectionHint')}</span>
+          </summary>
+          <OverviewList id="g-session-body" className="groups-list">
+            {sessionRows.map(chat => (
+              <GroupListRow
+                chat={chat}
+                bots={snapshot.bots}
+                roleContext={roleContext}
+                tr={tr}
+                key={chat.chatId}
+                onAddBots={openAddBotsDialog}
+                onSaveProfile={openSaveProfileDialog}
+                onManage={openManageDialog}
+              />
+            ))}
+          </OverviewList>
+        </details>
+      ) : null}
       <DialogHost
         dialog={dialog}
         snapshot={snapshot}

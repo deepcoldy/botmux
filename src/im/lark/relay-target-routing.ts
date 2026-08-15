@@ -45,11 +45,12 @@ export function resolveRelayTargetRouting(input: {
   // 私聊 chat 模式（默认，扁平连续）：整段 DM 折进同一个 chat-scope 会话，relay
   // 目标也落在同一个 chatId 锚上。必须先于 real-thread 分支 —— 与 decideRouting
   // 同序，否则在 DM 残留 thread 里敲 /relay 会被分流成 thread 目标，破坏
-  // 「连续单聊会话」语义。p2pMode 默认 'chat'；只有显式 'thread' 回到每条 DM 独立。
+  // 「连续单聊会话」语义。p2pMode 默认 'chat'；显式 'thread' / 'group' 回到每条
+  // DM 独立（group 的会话群改道只发生在 handleNewTopic，relay 目标按 thread 同形）。
   if (chatMode === 'p2p') {
-    let p2pMode: 'thread' | 'chat' | undefined;
+    let p2pMode: 'thread' | 'chat' | 'group' | undefined;
     try { p2pMode = getBot(larkAppId)?.config?.p2pMode; } catch { /* unregistered bot → default chat */ }
-    if (p2pMode !== 'thread') return { scope: 'chat', anchor: chatId };
+    if (p2pMode !== 'thread' && p2pMode !== 'group') return { scope: 'chat', anchor: chatId };
   }
 
   // A reply *inside* an existing Lark thread carries both root_id and

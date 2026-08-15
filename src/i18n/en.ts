@@ -281,7 +281,7 @@ export const messages: Record<string, string> = {
   'cmd.reply_mode.failed': '⚠️ Failed to update reply mode: {reason}',
   'cmd.reply_mode.dm_status': 'Current DM session mode: {mode}\nCommands: /reply-mode chat | topic',
   'cmd.reply_mode.dm_updated': '✅ DM session mode updated to: {mode}',
-  'cmd.reply_mode.dm_usage': 'Usage (DM): /reply-mode chat | topic\nchat = the whole DM shares one continuous session (default); topic = each message starts its own session.',
+  'cmd.reply_mode.dm_usage': 'Usage (DM): /reply-mode chat | topic | group\nchat = the whole DM shares one continuous session (default); topic = each message starts its own session; group = each message births a dedicated session group and the conversation continues there.',
   'cmd.reply_mode.dm_shared_unsupported': '⚠️ shared / chat-topic only make sense in regular groups; DMs support chat | topic only.',
   'cmd.substitute.status_on': 'Current substitute mode for this group: ON (default). When a configured substitute target is @mentioned, I will answer on their behalf.',
   'cmd.substitute.status_off': 'Current substitute mode for this group: OFF. Use @me /substitute on to enable it again.',
@@ -479,6 +479,7 @@ export const messages: Record<string, string> = {
   'card.config.p2p.placeholder': 'DM mode',
   'card.config.p2p.thread': '🧵 thread (separate session/DM)',
   'card.config.p2p.chat': '💬 chat (continuous session, default)',
+  'card.config.p2p.group': '👥 group (a dedicated session group per DM)',
   'config.label.disableStreamingCard': 'Disable live card',
   'config.label.usageDisplay': 'Usage display',
   'config.label.silentTurnReactions': 'Disable status reactions',
@@ -1296,4 +1297,16 @@ export const messages: Record<string, string> = {
   'cmd.createSession.lead_preamble_no_subs': '(No other collaborating sub-bots in this chat yet)',
   'cmd.createSession.lead_preamble_outro': 'You decide when and to whom to assign work. Here is the overall task assigned by the user:',
   'cmd.createSession.collab_note': '{peers} are also working on this same task in parallel with you — coordinate and avoid duplicating effort.',
+
+  // ─── Session-group mode (p2pMode=group) ───────────────────────────────────
+  'sg.placeholder_untitled': 'New conversation',
+  'sg.intro': 'started this conversation from DM:',
+  'sg.intro_no_text': '(non-text message)',
+  'sg.receipt': '✅ Created a dedicated group for this conversation — continue there: {link}',
+  'sg.birth_failed': '⚠️ Group creation failed ({error}); falling back to a DM topic for this conversation.',
+  'sg.cmd_unsupported': '⚠️ {cmd} is not supported in session groups: they are auto-created and managed by the bot with a fixed continuous-session mode.',
+  'sg.tag_auth_nudge': '🏷️ Session group created, but the sidebar feed group could not be applied ({reason}): feed groups are your personal data and need a one-time authorization:\n{url}\n\n⚠️ After authorizing, the browser lands on an unreachable localhost callback (127.0.0.1) — this is expected: copy the full URL from the address bar and send it back to me to finish. Alternatively switch to the zero-auth "chat tag" mode in the Dashboard.',
+  'sg.tag_scope_nudge': '🏷️ Session group created, but the chat tag could not be applied: the app is missing the "{scope}" tenant scope. One-click enable (admin, no auth flow, effective immediately):\n{url}\n\nOnce enabled, new session groups are tagged automatically.',
+  'cmd.login.tags_title': '🏷️ Session-group tag authorization (feed groups)',
+  'cmd.login.tags_footer': 'Once authorized, new session groups automatically join the sidebar feed group (one-time authorization, token auto-refreshes).',
 };

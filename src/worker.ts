@@ -200,7 +200,7 @@ import {
   resolveRenderDimensions,
 } from './utils/render-dimensions.js';
 import { createCliAdapterSync, locateOnPath } from './adapters/cli/registry.js';
-import { buildWrappedLaunch, parseWrapperCli, isTtadkWrapper } from './setup/cli-selection.js';
+import { buildWrappedLaunch, parseWrapperCli, isTtadkWrapper, wrapperLaunchEnv } from './setup/cli-selection.js';
 import { cliUnavailableMessage } from './setup/cli-availability.js';
 import {
   findLaunchedCliPid,
@@ -13375,11 +13375,13 @@ async function spawnCli(
         // the input box). cjadk's own botmux integration (`cjadk feishu`, see its
         // botmux-wrapper-writer) sets CJADK_INTERACTIVE=0 to disable all of that.
         // We mirror it here so a `cjadk <agent>` wrapperCli is driven the way
-        // cjadk intends — no selector, clean soft-newline input. Keyed on the
-        // wrapper's leading token so only cjadk launches are affected.
-        if (parseWrapperCli(cfg.wrapperCli)[0] === 'cjadk') {
-          (childEnv as Record<string, string>).CJADK_INTERACTIVE = '0';
-          log('cjadk launcher: set CJADK_INTERACTIVE=0 (non-interactive, mirrors cjadk feishu wrapper)');
+        // cjadk intends — no selector, clean soft-newline input. The env set
+        // comes from wrapperLaunchEnv — the shared single source of truth also
+        // used by one-shot children (session-group AI titling).
+        const wrapperEnv = wrapperLaunchEnv(cfg.wrapperCli);
+        if (wrapperEnv) {
+          Object.assign(childEnv as Record<string, string>, wrapperEnv);
+          log(`wrapper launcher env applied: ${Object.keys(wrapperEnv).join(', ')} (mirrors the wrapper's own non-interactive integration)`);
         }
       }
     }

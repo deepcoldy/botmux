@@ -282,7 +282,7 @@ export const messages: Record<string, string> = {
   'cmd.reply_mode.failed': '⚠️ 切换失败：{reason}',
   'cmd.reply_mode.dm_status': '当前私聊会话模式：{mode}\n可用命令：/reply-mode chat｜topic',
   'cmd.reply_mode.dm_updated': '✅ 已切换私聊会话模式为：{mode}',
-  'cmd.reply_mode.dm_usage': '用法（私聊）：/reply-mode chat｜topic\nchat=整段 DM 共用一个连续会话（默认）；topic=每条消息各自起独立会话。',
+  'cmd.reply_mode.dm_usage': '用法（私聊）：/reply-mode chat｜topic｜group\nchat=整段 DM 共用一个连续会话（默认）；topic=每条消息各自起独立会话；group=每条消息自动创建专属会话群并在群里对话。',
   'cmd.reply_mode.dm_shared_unsupported': '⚠️ shared / chat-topic 仅对普通群有意义；私聊只支持 chat｜topic。',
   'cmd.substitute.status_on': '当前群替身模式：已开启（默认）。群里 @ 到配置的替身对象时，我会代答。',
   'cmd.substitute.status_off': '当前群替身模式：已关闭。可用 @我 /substitute on 重新开启。',
@@ -480,6 +480,7 @@ export const messages: Record<string, string> = {
   'card.config.p2p.placeholder': '私聊模式',
   'card.config.p2p.thread': '🧵 thread（每条 DM 独立会话）',
   'card.config.p2p.chat': '💬 chat（连续单聊会话，默认）',
+  'card.config.p2p.group': '👥 group（每条 DM 自动建专属会话群）',
   'config.label.disableStreamingCard': '关闭实时卡片',
   'config.label.usageDisplay': '用量显示位置',
   'config.label.silentTurnReactions': '关闭状态 reaction',
@@ -1297,4 +1298,16 @@ export const messages: Record<string, string> = {
   'cmd.createSession.lead_preamble_no_subs': '（本群暂无其它可协作的 sub bot）',
   'cmd.createSession.lead_preamble_outro': '由你决定何时、给谁分配什么。下面是用户分配的整体工作：',
   'cmd.createSession.collab_note': '本群还有 {peers} 在和你一起并行处理同一个任务，注意协作、别重复劳动。',
+
+  // ─── 会话群模式（p2pMode=group）───────────────────────────────────────────
+  'sg.placeholder_untitled': '新会话',
+  'sg.intro': '发起的私聊会话：',
+  'sg.intro_no_text': '（非文本消息）',
+  'sg.receipt': '✅ 已为本次会话创建专属群，后续请在群里继续：{link}',
+  'sg.birth_failed': '⚠️ 建群失败（{error}），本次会话回退为私聊话题。',
+  'sg.cmd_unsupported': '⚠️ 会话群不支持 {cmd}：会话群由 bot 自动创建和管理，固定为连续会话模式。',
+  'sg.tag_auth_nudge': '🏷️ 会话群已创建，但侧边栏分组还挂不上（{reason}）：消息分组是你的个人数据，需要你授权一次。点此授权：\n{url}\n\n⚠️ 授权完成后浏览器会跳到一个打不开的本机回调地址（127.0.0.1）——这是正常的，请把浏览器地址栏的完整链接复制发给我即可完成授权。也可以在 Dashboard 改用「群标签」模式（无需任何授权）。',
+  'sg.tag_scope_nudge': '🏷️ 会话群已创建，但群标签还打不上：应用缺少「{scope}」租户权限。点此一键开通（管理员，无需授权流程，即时生效）：\n{url}\n\n开通后新建的会话群会自动打上标签。',
+  'cmd.login.tags_title': '🏷️ 会话群标签授权（消息分组）',
+  'cmd.login.tags_footer': '授权后，新建的会话群会自动进入侧边栏「Botmux群会话」分组（一次授权长期有效，token 自动续期）。',
 };
