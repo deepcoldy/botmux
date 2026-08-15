@@ -631,6 +631,116 @@ describe('handleAskCardAction: ask_submit 路径', () => {
   });
 });
 
+// ─── 空多选提交二次确认（B）─────────────────────────────────────────────────
+describe('handleAskCardAction: 空多选提交二次确认', () => {
+  async function registerMulti(overrides: Partial<Parameters<typeof registerAsk>[0]> = {}) {
+    let captured: PendingAsk | undefined;
+    setCardDispatcher({
+      async send(ask) { captured = ask; return { messageId: 'om_ask' }; },
+    });
+    registerAsk({
+      larkAppId: 'cli_ask',
+      chatId: 'oc_chat',
+      rootMessageId: 'om_root',
+      sessionId: 'sess-1',
+      questions: [
+        { prompt: 'q', multiSelect: true, options: [{ key: 'a', label: 'A' }, { key: 'b', label: 'B' }] },
+      ],
+      timeoutMs: 10_000,
+      ...overrides,
+    });
+    await Promise.resolve();
+    return captured!;
+  }
+
+  it('全空提交（未勾任何项）→ 不 settle，返回 arm 卡片 + 警示 + toast', async () => {
+    const ask = await registerMulti();
+
+    const result = await handleAskCardAction({
+      operator: { open_id: 'ou_owner' },
+      action: { value: { action: ASK_SUBMIT_ACTION, ask_id: ask.askId, nonce: ask.nonce } },
+    });
+
+    // 第一次全空提交绝不落 settle
+    expect(mockedSubmitAsk).not.toHaveBeenCalled();
+    const card = result as Record<string, any>;
+    // 卡片没结束，仍是未作答态（蓝头、非「已结束」）
+    expect(card.header?.title?.content).not.toContain('已结束');
+    // 携带二次确认 toast + 警示文案 + confirm_empty 标志按钮
+    expect((result as any)?.toast?.type).toBe('warning');
+    const blob = JSON.stringify(card);
+    expect(blob).toContain('确认空提交');
+    expect(blob).toContain('confirm_empty');
+    // 该 ask 仍 pending，可继续操作
+    expect(_getPending(ask.askId)?.settled).toBe(false);
+  });
+
+  it('arm 后再次点击（confirm_empty=\'true\'）→ 真正 settle 空答案', async () => {
+    const ask = await registerMulti();
+
+    // 第一次：拦下
+    await handleAskCardAction({
+      operator: { open_id: 'ou_owner' },
+      action: { value: { action: ASK_SUBMIT_ACTION, ask_id: ask.askId, nonce: ask.nonce } },
+    });
+    expect(mockedSubmitAsk).not.toHaveBeenCalled();
+
+    // 第二次：带 confirm_empty 字符串（飞书按钮 value 回传即字符串）
+    const result = await handleAskCardAction({
+      operator: { open_id: 'ou_owner' },
+      action: { value: { action: ASK_SUBMIT_ACTION, ask_id: ask.askId, nonce: ask.nonce, confirm_empty: 'true' } },
+    });
+
+    // 这次确实调用 submitAsk 并 settle 成终态卡片
+    expect(mockedSubmitAsk).toHaveBeenCalledWith({ askId: ask.askId, nonce: ask.nonce, by: 'ou_owner' });
+    const card = result as Record<string, any>;
+    expect(card.header?.title?.content).toContain('已结束');
+    expect(_getPending(ask.askId)?.settled).toBe(true);
+  });
+
+  it('勾了至少一项再提交 → 不触发二次确认，直接 settle', async () => {
+    const ask = await registerMulti();
+
+    // 勾选 a
+    await handleAskCardAction({
+      operator: { open_id: 'ou_owner' },
+      action: { value: { action: ASK_TOGGLE_ACTION, ask_id: ask.askId, nonce: ask.nonce, question_index: '0', key: 'a' } },
+    });
+
+    // 提交（非空）→ 直接 settle，无二次确认
+    const result = await handleAskCardAction({
+      operator: { open_id: 'ou_owner' },
+      action: { value: { action: ASK_SUBMIT_ACTION, ask_id: ask.askId, nonce: ask.nonce } },
+    });
+
+    expect(mockedSubmitAsk).toHaveBeenCalledWith({ askId: ask.askId, nonce: ask.nonce, by: 'ou_owner' });
+    const card = result as Record<string, any>;
+    expect(card.header?.title?.content).toContain('已结束');
+    expect(JSON.stringify(card)).not.toContain('确认空提交');
+  });
+
+  it('纯单选问题的空提交不进二次确认（交由 submitAsk 判 stale）', async () => {
+    // 单选 ask：全空提交不该被 B 拦（B 只管多选）；submitAsk 对单选空集返回 stale。
+    let captured: PendingAsk | undefined;
+    setCardDispatcher({ async send(ask) { captured = ask; return { messageId: 'om_ask' }; } });
+    registerAsk({
+      larkAppId: 'cli_ask', chatId: 'oc_chat', rootMessageId: 'om_root', sessionId: 'sess-1',
+      questions: [{ prompt: 'q', multiSelect: false, options: [{ key: 'y', label: 'Y' }, { key: 'n', label: 'N' }] }],
+      timeoutMs: 10_000,
+    });
+    await Promise.resolve();
+
+    const result = await handleAskCardAction({
+      operator: { open_id: 'ou_owner' },
+      action: { value: { action: ASK_SUBMIT_ACTION, ask_id: captured!.askId, nonce: captured!.nonce } },
+    });
+
+    // 走到 submitAsk（真实实现返回 stale）→ 不进 B 的 arm 分支
+    expect(mockedSubmitAsk).toHaveBeenCalled();
+    expect(JSON.stringify(result)).not.toContain('确认空提交');
+  });
+});
+
 describe('createLarkAskCardDispatcher', () => {
   it('replies into the root thread when rootMessageId exists', async () => {
     const reply = vi.fn(async () => 'om_reply');
