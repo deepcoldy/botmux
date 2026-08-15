@@ -14871,7 +14871,7 @@ body.touch.has-token #mobile-input-bar{
 #mobile-bar-keys{display:flex;gap:6px;margin-bottom:5px;overflow-x:auto;scrollbar-width:none;-webkit-overflow-scrolling:touch}
 #mobile-bar-keys::-webkit-scrollbar{display:none}
 #mobile-bar-keys button{
-  flex:none;min-width:44px;height:32px;padding:0 12px;border:1px solid #2a2b3d;border-radius:16px;
+  flex:none;min-width:44px;height:32px;padding:0 12px;border:1px solid #2a2b3d;border-radius:8px;
   background:#1c1c24;color:#9d9fb0;font:500 13px/1 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
   touch-action:manipulation;-webkit-tap-highlight-color:transparent;user-select:none;white-space:nowrap}
 #mobile-bar-keys button:active{background:#3a3b4d;color:#e4e6f0}
@@ -14879,17 +14879,17 @@ body.touch.has-token #mobile-input-bar{
 #mobile-input-wrap{flex:1;position:relative;min-width:0;display:flex}
 #mobile-input{
   flex:1;min-width:0;min-height:38px;max-height:120px;resize:none;overflow-y:auto;
-  padding:9px 14px;border:1px solid #2a2b3d;border-radius:19px;background:#1c1c24;color:#e4e6f0;
+  padding:9px 14px;border:1px solid #2a2b3d;border-radius:10px;background:#1c1c24;color:#e4e6f0;
   font:14px/1.3 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
   -webkit-text-size-adjust:100%;text-size-adjust:100%}
 #mobile-input::placeholder{color:#565f89}
 #mobile-bar-row button{
-  flex:none;width:38px;min-height:38px;height:38px;padding:0;border:1px solid #2a2b3d;border-radius:50%;
+  flex:none;width:38px;min-height:38px;height:38px;padding:0;border:1px solid #2a2b3d;border-radius:8px;
   background:#1c1c24;color:#9d9fb0;font:500 15px/1 -apple-system,BlinkMacSystemFont,sans-serif;
   touch-action:manipulation;-webkit-tap-highlight-color:transparent;user-select:none}
 #mobile-bar-row button:active{background:#3a3b4d;color:#e4e6f0}
-#mobile-send{min-width:52px;border-radius:19px;font:600 13px/1 -apple-system,BlinkMacSystemFont,sans-serif;background:#7aa2f7;color:#1a1b26;border-color:#7aa2f7}
-#mobile-mode{min-width:48px;border-radius:19px;font:600 11px/1.1 -apple-system,BlinkMacSystemFont,sans-serif;white-space:nowrap}
+#mobile-send{min-width:52px;border-radius:8px;font:600 13px/1 -apple-system,BlinkMacSystemFont,sans-serif;background:#7aa2f7;color:#1a1b26;border-color:#7aa2f7}
+#mobile-mode{min-width:48px;border-radius:8px;font:600 11px/1.1 -apple-system,BlinkMacSystemFont,sans-serif;white-space:nowrap}
 /* live mode: the textarea holds the IME draft but the typed text is already in
    the terminal, so render the textarea transparent to avoid double-vision. */
 body.touch.has-token #mobile-input-bar[data-mode="live"] #mobile-input{color:transparent;caret-color:transparent}
