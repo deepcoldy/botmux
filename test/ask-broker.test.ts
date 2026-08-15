@@ -19,6 +19,7 @@ import {
   setCardDispatcher,
   setCanTalkChecker,
   submitAsk,
+  submitAskFromDesktop,
   submitCustomReply,
   toggleAsk,
   tryResolveAsk,
@@ -633,6 +634,64 @@ describe('toggleAsk + submitAsk', () => {
     expect(submitAsk({ askId, nonce: 'wrong', by: 'ou_u' })).toBe('stale');
     // 未授权 → unauthorized（不 arm）
     expect(submitAsk({ askId, nonce, by: 'ou_other' })).toBe('unauthorized');
+    expect(_getPending(askId)?.settled).toBe(false);
+  });
+
+  it('submitAsk 拒绝超出真实问题数的 selections（额外槽不绕过确认、不进结果）', async () => {
+    _resetForTest();
+    setCanTalkChecker((_app, _chat, openId) => DEFAULT_TALKERS.has(openId));
+    setCardDispatcher({ send: async () => ({ messageId: 'm1' }) });
+    const p = registerAsk({
+      larkAppId: 'a', chatId: 'c', rootMessageId: null, sessionId: 's',
+      questions: [{ prompt: 'pick', options: [{ key: 'a', label: 'A' }, { key: 'b', label: 'B' }], multiSelect: true }],
+      timeoutMs: 60_000,
+    });
+    const askId = _allAskIds()[0]!;
+    const nonce = _getPending(askId)!.nonce;
+    // 单问 ask 却传 2 槽（q0 空 + 伪造 q1 非空）：额外槽不得让 needs_empty_confirm 被绕过，
+    // 也不得混进结果。规范化后长度 > questions.length → 直接 stale。
+    expect(submitAsk({ askId, nonce, by: 'ou_u', selections: [[], ['bogus']] })).toBe('stale');
+    expect(_getPending(askId)?.settled).toBe(false);
+    // 真正的全空提交仍走二次确认（证明上面的 stale 来自「超长」而非误伤空提交）
+    expect(submitAsk({ askId, nonce, by: 'ou_u', selections: [[]] })).toBe('needs_empty_confirm');
+    expect(_getPending(askId)?.settled).toBe(false);
+    // confirmEmpty 落地空答案，结果恰好 1 槽、无越界内容
+    expect(submitAsk({ askId, nonce, by: 'ou_u', selections: [[]], confirmEmpty: true })).toBe('accepted');
+    const r = await p;
+    if (r.kind === 'answered') expect(r.answers).toEqual([[]]);
+  });
+
+  it('submitAsk 缺失尾部 selections 按空集补齐（兼容旧 form 只回前 N 问）', async () => {
+    _resetForTest();
+    setCanTalkChecker((_app, _chat, openId) => DEFAULT_TALKERS.has(openId));
+    setCardDispatcher({ send: async () => ({ messageId: 'm1' }) });
+    const p = registerAsk({
+      larkAppId: 'a', chatId: 'c', rootMessageId: null, sessionId: 's',
+      questions: [
+        { prompt: 'q1', options: [{ key: 'y', label: 'Y' }, { key: 'n', label: 'N' }], multiSelect: false },
+        { prompt: 'q2', options: [{ key: 'a', label: 'A' }, { key: 'b', label: 'B' }], multiSelect: true },
+      ],
+      timeoutMs: 60_000,
+    });
+    const askId = _allAskIds()[0]!;
+    const nonce = _getPending(askId)!.nonce;
+    // 只传 q0（单选选 y），省略尾部多选 q1 → 规范化补 [] → 合法 settle 为 [['y'],[]]
+    expect(submitAsk({ askId, nonce, by: 'ou_u', selections: [['y']] })).toBe('accepted');
+    const r = await p;
+    if (r.kind === 'answered') expect(r.answers).toEqual([['y'], []]);
+  });
+
+  it('submitAskFromDesktop 同样拒绝超长 selections', async () => {
+    _resetForTest();
+    setCanTalkChecker((_app, _chat, openId) => DEFAULT_TALKERS.has(openId));
+    setCardDispatcher({ send: async () => ({ messageId: 'm1' }) });
+    registerAsk({
+      larkAppId: 'a', chatId: 'c', rootMessageId: null, sessionId: 's',
+      questions: [{ prompt: 'pick', options: [{ key: 'a', label: 'A' }, { key: 'b', label: 'B' }], multiSelect: true }],
+      timeoutMs: 60_000,
+    });
+    const askId = _allAskIds()[0]!;
+    expect(submitAskFromDesktop({ askId, selections: [[], ['bogus']], by: 'ou_desk' })).toBe('stale');
     expect(_getPending(askId)?.settled).toBe(false);
   });
 

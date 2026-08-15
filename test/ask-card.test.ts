@@ -666,7 +666,7 @@ describe('handleAskCardAction: 空多选提交二次确认', () => {
     });
 
     const r = result as Record<string, any>;
-    // 关键（codex B-1）：arm 响应必须包成 { card: { type:'raw', data }, toast }，
+    // 关键（外层整形契约）：arm 响应必须包成 { card: { type:'raw', data }, toast }，
     // 不能把 card 字段摊在顶层——否则 event-dispatcher 只认 toast、raw card 不 patch。
     expect(r.card?.type).toBe('raw');
     expect(r.card?.data?.elements).toBeDefined();
@@ -714,7 +714,7 @@ describe('handleAskCardAction: 空多选提交二次确认', () => {
       action: { value: { action: ASK_SUBMIT_ACTION, ask_id: ask.askId, nonce: 'WRONG' } },
     });
 
-    // codex B-2：arm 判定在 broker 里、位于 nonce/canTalk 校验之后 → 坏 nonce 走 stale
+    // 鉴权与 nonce 顺序：arm 判定在 broker 里、位于 nonce/canTalk 校验之后 → 坏 nonce 走 stale
     expect(JSON.stringify(result)).not.toContain('确认空提交');
     expect((result as any)?.toast?.content).toContain('失效');
     expect(_getPending(ask.askId)?.settled).toBe(false);
@@ -728,14 +728,14 @@ describe('handleAskCardAction: 空多选提交二次确认', () => {
       action: { value: { action: ASK_SUBMIT_ACTION, ask_id: ask.askId, nonce: ask.nonce } },
     });
 
-    // codex B-2：无权用户不该拿到 arm，应是 unauthorized
+    // 鉴权顺序：无权用户不该拿到 arm，应是 unauthorized
     expect(JSON.stringify(result)).not.toContain('确认空提交');
     expect((result as any)?.toast?.content).toContain('权限');
     expect(_getPending(ask.askId)?.settled).toBe(false);
   });
 
   it('混合 [单选,多选] 全空 → 直接 stale，绝不 arm（避免二次点击死路）', async () => {
-    // codex B-3：只要有一个单选问题，空集非有效答案，submitAsk 直接判 stale；
+    // 混合题约束：只要有一个单选问题，空集非有效答案，submitAsk 直接判 stale；
     // 若误 arm，二次确认后仍因单选未选而 stale，形成永远提交不了的死路。
     let captured: PendingAsk | undefined;
     setCardDispatcher({ async send(ask) { captured = ask; return { messageId: 'om_ask' }; } });

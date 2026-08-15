@@ -244,21 +244,25 @@ export function submitAsk(args: {
   if (ask.settled) return 'already_settled';
   if (!isAuthorizedToAnswer(ask, args.by)) return 'unauthorized';
 
-  // 构建最终答案数组（按问题顺序）
+  // 构建最终答案数组（严格按 ask.questions 规范化，长度恒 = questions.length）
   let answers: ReadonlyArray<ReadonlyArray<string>>;
 
   if (args.selections !== undefined) {
-    // 显式传入：逐问校验单选约束 + key 合法性
-    answers = args.selections;
+    // 显式传入：拒绝超出真实问题数的输入（form_value 是外部输入，未绑定真实 question
+    // 的额外槽既不能影响确认策略、也不能进入结果）；缺失的尾部按空集补齐（兼容旧 form
+    // 只回传前 N 问的情形）。随后逐问按 canonical 槽校验单选约束 + key 合法性。
+    if (args.selections.length > ask.questions.length) return 'stale';
+    const canonical: string[][] = [];
     for (let i = 0; i < ask.questions.length; i++) {
       const q = ask.questions[i]!;
-      const sel = answers[i] ?? [];
+      const sel = args.selections[i] ?? [];
       if (!q.multiSelect && sel.length !== 1) return 'stale';
-      // 校验每个选中的 key 必须在该问题的 options 中
       for (const key of sel) {
         if (!q.options.some((o) => o.key === key)) return 'stale';
       }
+      canonical.push([...sel]);
     }
+    answers = canonical;
   } else {
     // 使用累积的勾选状态
     const built: string[][] = [];
@@ -276,6 +280,7 @@ export function submitAsk(args: {
   // needs_empty_confirm 让卡片 arm 一个确认按钮；带 confirmEmpty 再点才真正落空答案。
   // 只在全多选时触发：只要有一个单选问题，空集在上面的单选约束里已被判 stale，空提交
   // 本就不是有效答案，不进二次确认（否则 arm 后二次点击必然 stale，形成死路）。
+  // answers 已按 questions 规范化（长度恒等、无越界槽），故 every() 只看真实问题。
   if (!args.confirmEmpty
       && ask.questions.length > 0
       && ask.questions.every((q) => q.multiSelect)
@@ -508,15 +513,19 @@ export function submitAskFromDesktop(args: {
   if (!ask) return 'stale';
   if (ask.settled) return 'already_settled';
 
-  const answers = args.selections;
+  // 同 submitAsk：按 ask.questions 规范化，拒绝超长输入、缺失尾部补空集，越界槽不进结果。
+  if (args.selections.length > ask.questions.length) return 'stale';
+  const canonical: string[][] = [];
   for (let i = 0; i < ask.questions.length; i++) {
     const q = ask.questions[i]!;
-    const sel = answers[i] ?? [];
+    const sel = args.selections[i] ?? [];
     if (!q.multiSelect && sel.length !== 1) return 'stale';
     for (const key of sel) {
       if (!q.options.some((o) => o.key === key)) return 'stale';
     }
+    canonical.push([...sel]);
   }
+  const answers = canonical;
 
   settle(args.askId, {
     kind: 'answered',

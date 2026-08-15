@@ -168,7 +168,7 @@ export async function handleAskCardAction(
  * 关键：必须包成 `{ card: { type: 'raw', data } }` —— event-dispatcher 的
  * shapeCardActionResult 认「已整形响应」的标志是顶层 `toast`/`card`/`deferredCard`
  * 之一；若把 card 字段摊在顶层再塞个 toast，它只认 toast、raw card 不会被 patch，
- * 用户只看到 toast、arm 按钮不出现（codex B-1）。这里同时带 card + toast，二者都生效。
+ * 用户只看到 toast、arm 按钮不出现（外层整形契约）。这里同时带 card + toast，二者都生效。
  */
 function armEmptyConfirmResponse(askId: string, locale?: Locale): Record<string, unknown> | undefined {
   const ask = getAskSnapshot(askId);
