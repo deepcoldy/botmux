@@ -14876,6 +14876,7 @@ body.touch.has-token #mobile-input-bar{
   touch-action:manipulation;-webkit-tap-highlight-color:transparent;user-select:none;white-space:nowrap}
 #mobile-bar-keys button:active{background:#3a3b4d;color:#e4e6f0}
 #mobile-bar-row{display:flex;align-items:flex-end;gap:5px}
+#mobile-input-wrap{flex:1;position:relative;min-width:0;display:flex}
 #mobile-input{
   flex:1;min-width:0;min-height:38px;max-height:120px;resize:none;overflow-y:auto;
   padding:9px 14px;border:1px solid #2a2b3d;border-radius:19px;background:#1c1c24;color:#e4e6f0;
@@ -14934,8 +14935,10 @@ ${loginUrl ? `<a id="login-banner" href="${loginUrl}" target="_top" rel="noopene
   </div>
   <div id="mobile-bar-row">
     <button id="mobile-mode" type="button" title="切换输入模式" aria-label="切换输入模式">缓冲</button>
-    <textarea id="mobile-input" rows="1" inputmode="text" enterkeyhint="send" placeholder="Type a command..." autocomplete="off" autocapitalize="off" spellcheck="false" aria-label="终端输入"></textarea>
-    <span id="mobile-live-hint" aria-hidden="true">实时输入 · 点击显示键盘</span>
+    <div id="mobile-input-wrap">
+      <textarea id="mobile-input" rows="1" inputmode="text" enterkeyhint="send" placeholder="Type a command..." autocomplete="off" autocapitalize="off" spellcheck="false" aria-label="终端输入"></textarea>
+      <span id="mobile-live-hint" aria-hidden="true">实时输入 · 点击显示键盘</span>
+    </div>
     <button id="mobile-up" type="button" title="上移" aria-label="上移">↑</button>
     <button id="mobile-bs" type="button" title="删除终端字符" aria-label="删除终端字符">⌫</button>
     <button id="mobile-down" type="button" title="下移" aria-label="下移">↓</button>
