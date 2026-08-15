@@ -68,18 +68,32 @@ function agentChunk(sessionId: string, text: string, eventId: string, ts = 1_000
   };
 }
 
-function turnDone(sessionId: string, eventId: string, ts = 1_000_200, stopReason = 'end_turn') {
+function turnDone(
+  sessionId: string,
+  eventId: string,
+  ts = 1_000_200,
+  stopReason = 'end_turn',
+  opts?: { cancelTrigger?: string; metaOn?: 'update' | 'params' | 'split' },
+) {
+  const update: Record<string, unknown> = {
+    sessionUpdate: 'turn_completed',
+    stop_reason: stopReason,
+  };
+  const params: Record<string, unknown> = { sessionId, update };
+  const metaOn = opts?.metaOn ?? 'update';
+  if (metaOn === 'split') {
+    update._meta = { eventId, agentTimestampMs: ts };
+    params._meta = opts?.cancelTrigger ? { cancelTrigger: opts.cancelTrigger } : {};
+  } else {
+    const meta: Record<string, unknown> = { eventId, agentTimestampMs: ts };
+    if (opts?.cancelTrigger) meta.cancelTrigger = opts.cancelTrigger;
+    if (metaOn === 'params') params._meta = meta;
+    else update._meta = meta;
+  }
   return {
     timestamp: ts,
-    method: 'session/update',
-    params: {
-      sessionId,
-      update: {
-        sessionUpdate: 'turn_completed',
-        stop_reason: stopReason,
-        _meta: { eventId, agentTimestampMs: ts },
-      },
-    },
+    method: metaOn === 'update' ? 'session/update' : '_x.ai/session/update',
+    params,
   };
 }
 
@@ -212,10 +226,10 @@ describe('drainGrokUpdates', () => {
   });
 
   it.each([
-    ['error', 'failed', 'grok_turn_error'],
-    ['cancelled', 'failed', 'grok_turn_cancelled'],
-    ['future reason', 'failed', 'grok_stop_reason:future_reason'],
-  ] as const)('maps %s turn_completed to %s even with an empty final', (reason, status, errorCode) => {
+    ['error', 'failed', 'grok_turn_error', 'turn error'],
+    ['cancelled', 'failed', 'grok_turn_cancelled', 'turn cancelled'],
+    ['future reason', 'failed', 'grok_stop_reason:future_reason', 'stop reason: future_reason'],
+  ] as const)('maps %s turn_completed to %s even with an empty final', (reason, status, errorCode, summary) => {
     const sid = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
     const path = writeUpdates(sid, '/tmp/proj', [
       userChunk(sid, 'q', 'e1'),
@@ -232,6 +246,70 @@ describe('drainGrokUpdates', () => {
         sourceSessionId: sid,
         terminalStatus: status,
         terminalErrorCode: errorCode,
+        terminalErrorSummary: summary,
+      }),
+    ]);
+  });
+
+  it.each([
+    ['params'] as const,
+    ['update'] as const,
+  ])('maps cancelled + send_now on %s._meta to ambiguous', (metaOn) => {
+    const sid = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+    const path = writeUpdates(sid, '/tmp/proj', [
+      userChunk(sid, 'q', 'e1'),
+      turnDone(sid, 'e2', 1_000_200, 'cancelled', { cancelTrigger: 'send_now', metaOn }),
+    ]);
+
+    const r = drainGrokUpdates(path, 0);
+    const finals = r.events.filter((e) => e.kind === 'assistant_final');
+
+    expect(finals).toEqual([
+      expect.objectContaining({
+        kind: 'assistant_final',
+        text: '',
+        sourceSessionId: sid,
+        terminalStatus: 'ambiguous',
+        terminalErrorCode: 'grok_turn_cancelled',
+      }),
+    ]);
+    expect(finals[0]).not.toHaveProperty('terminalErrorSummary');
+  });
+
+  it('drops buffered agent text when cancelled by send_now', () => {
+    const sid = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+    const path = writeUpdates(sid, '/tmp/proj', [
+      userChunk(sid, 'q', 'e1'),
+      agentChunk(sid, 'partial answer already streamed', 'e2'),
+      turnDone(sid, 'e3', 1_000_200, 'cancelled', { cancelTrigger: 'send_now', metaOn: 'params' }),
+    ]);
+
+    const r = drainGrokUpdates(path, 0);
+    expect(r.events.filter((e) => e.kind === 'assistant_final')).toEqual([
+      expect.objectContaining({
+        kind: 'assistant_final',
+        text: '',
+        sourceSessionId: sid,
+        terminalStatus: 'ambiguous',
+        terminalErrorCode: 'grok_turn_cancelled',
+      }),
+    ]);
+  });
+
+  it('reads cancelTrigger from params._meta when update._meta has no trigger', () => {
+    const sid = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+    const path = writeUpdates(sid, '/tmp/proj', [
+      userChunk(sid, 'q', 'e1'),
+      turnDone(sid, 'e2', 1_000_200, 'cancelled', { cancelTrigger: 'send_now', metaOn: 'split' }),
+    ]);
+
+    const r = drainGrokUpdates(path, 0);
+    expect(r.events.filter((e) => e.kind === 'assistant_final')).toEqual([
+      expect.objectContaining({
+        kind: 'assistant_final',
+        text: '',
+        terminalStatus: 'ambiguous',
+        terminalErrorCode: 'grok_turn_cancelled',
       }),
     ]);
   });

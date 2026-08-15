@@ -10383,21 +10383,19 @@ function scheduleSubmitFailureNotify(
       case 'suppress-active':
         redriveRejectedStructuredReady();
         log(`Deferred recheck missing but later ${action.evidence} shows ${cliName()} is active — suppressing submit warning. preview="${preview}"`);
-        // For a durable turn, activity is evidence of possible submission, not
-        // a terminal result. Keep the arbiter closed and re-check until either
-        // the transcript confirms it or a quiet interval proves it stuck.
-        if (turnIdentity?.dispatchAttempt !== undefined) {
-          scheduleSubmitFailureNotify(
-            msg,
-            recheck,
-            transcriptLabel,
-            bridgeTurnId,
-            undefined,
-            turnSeq,
-            turnIdentity,
-            durableTerminalStatus,
-          );
-        }
+        // activity 证据只能说明 CLI 仍在动，不能证明本次输入已提交
+        // 普通 IM 和 durable turn 都继续重查，直到 transcript 命中或安静窗口落到 submit_unconfirmed
+        scheduleSubmitFailureNotify(
+          msg,
+          recheck,
+          transcriptLabel,
+          bridgeTurnId,
+          undefined,
+          turnSeq,
+          turnIdentity,
+          durableTerminalStatus,
+          structuredTarget,
+        );
         return;
       case 'notify-hard-failure':
         // failureReason is handled synchronously above.
