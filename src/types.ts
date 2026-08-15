@@ -9,6 +9,8 @@ import type { RiffBackendConfig } from './adapters/backend/riff-backend.js';
 import type { CliUsageLimitState } from './utils/cli-usage-limit.js';
 import type { VcMeetingActivityType } from './vc-agent/types.js';
 import type { CodexServiceTierSnapshot } from './services/codex-service-tier.js';
+import type { CliId } from './adapters/cli/types.js';
+import type { CliRuntimeSnapshot } from './adapters/cli/runtime.js';
 
 /** Managed meeting sinks supported by the first multi-consumer slice. */
 export type VcMeetingConsumerManagedSink = 'meeting_text' | 'meeting_voice';
@@ -598,6 +600,8 @@ export interface Session {
   suspendedColdResume?: boolean;
   /** CLI used to spawn this session, frozen at creation so bot-level CLI edits only affect new sessions. */
   cliId?: import('./adapters/cli/types.js').CliId;
+  /** Bot-owned /cli selection, authoritative when present. */
+  cliLaunchSnapshot?: SessionCliLaunchSnapshotV1;
   /** Concrete CLI distribution frozen with cliId. New sessions carry this
    * structured snapshot while cliPathOverride remains shadow-written for
    * downgrade compatibility with older botmux builds. */
@@ -753,6 +757,20 @@ export interface Session {
     paneCols?: number;
     paneRows?: number;
   };
+}
+
+export interface SessionCliLaunchSnapshotV1 {
+  version: 1;
+  state: 'pending' | 'resolved';
+  entryId: string;
+  cliId: CliId;
+  cliRuntime: CliRuntimeSnapshot | null;
+  cliPathOverride: string | null;
+  wrapperCli: string | null;
+  model: string | null;
+  reasoningEffort: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra' | null;
+  launchShell: string | null;
+  startupCommands: string[];
 }
 
 export interface LarkAttachment {

@@ -32,6 +32,7 @@ import { updateMessage, deleteMessage, sendEphemeralCard, sendUserMessage, addRe
 import { buildStreamingCard, buildPrivateSnapshotCard, buildSessionCard, buildTuiPromptCard, buildTuiPromptResolvedCard, buildTuiPromptFailedCard, buildRelayedFrozenCard, getCliDisplayName } from '../im/lark/card-builder.js';
 import { codexServiceTierBadge } from '../services/codex-service-tier.js';
 import { cliModelSupportsReasoningEffort, isConfigurableReasoningCliId } from '../services/codex-reasoning-effort.js';
+import { RPC_CAPABLE_CLIS } from '../codex-rpc-lifecycle.js';
 import { loadFrozenCards, saveFrozenCards } from '../services/frozen-card-store.js';
 import { hashUrlForLog } from '../adapters/backend/riff-backend.js';
 import { cancelMojoSessionById } from '../adapters/backend/mojo-backend.js';
@@ -737,6 +738,7 @@ export function getActiveSessionsRegistry(): Map<string, DaemonSession> | undefi
  */
 export function isRelayableRealSession(ds: DaemonSession): boolean {
   if (ds.worker) return true;
+  if (ds.session.cliLaunchSnapshot) return true;
   if (ds.session.cliId) return true;
   if (ds.session.lastCliInput) return true;
   return false;
@@ -1309,8 +1311,41 @@ function recordLaunchModel(ds: DaemonSession, model: string | undefined): void {
 
 function sessionAgentConfig(
   ds: DaemonSession,
-  botCfg: { cliId: CliId; cliRuntime?: CliRuntimeConfig; cliPathOverride?: string; wrapperCli?: string; model?: string; reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra' },
-): { cliId: CliId; cliRuntime?: CliRuntimeSnapshot; cliPathOverride?: string; wrapperCli?: string; model?: string; reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra' } {
+  botCfg: { cliId: CliId; cliRuntime?: CliRuntimeConfig; cliPathOverride?: string; wrapperCli?: string; model?: string; reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra'; launchShell?: string; startupCommands?: string[]; env?: Record<string, string>; backendType?: string; riff?: unknown; codexRpcInput?: boolean },
+): { cliId: CliId; cliRuntime?: CliRuntimeSnapshot; cliPathOverride?: string; wrapperCli?: string; model?: string; reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra'; launchShell?: string; startupCommands?: string[] } {
+  const selected = ds.session.cliLaunchSnapshot;
+  if (selected) {
+    if (botCfg.env && Object.keys(botCfg.env).length > 0) throw new Error('entry-selected session rejected: bot env is configured');
+    if (botCfg.backendType === 'riff' || botCfg.riff !== undefined) throw new Error('entry-selected session rejected: Riff is configured');
+    if (botCfg.codexRpcInput === true && !RPC_CAPABLE_CLIS.has(selected.cliId)) {
+      throw new Error(`entry-selected session rejected: ${selected.cliId} cannot use codexRpcInput`);
+    }
+    const runtime = selected.cliRuntime ?? undefined;
+    const legacyPath = selected.cliPathOverride ?? undefined;
+    const wrapperCli = selected.wrapperCli ?? undefined;
+    const reasoningEffort = selected.reasoningEffort ?? undefined;
+    const launchShell = selected.launchShell ?? undefined;
+    const startupCommands = [...selected.startupCommands];
+    if (selected.state === 'pending') {
+      selected.state = 'resolved';
+      ds.session.cliId = selected.cliId;
+      ds.session.cliRuntime = runtime;
+      ds.session.cliPathOverride = legacyPath;
+      ds.session.wrapperCli = wrapperCli;
+      ds.session.reasoningEffort = reasoningEffort;
+      ds.session.agentFrozen = true;
+      sessionStore.updateSession(ds.session);
+    }
+    // Model is NOT frozen from the snapshot (which carries none): resolve it live
+    // like every other spawn (#773) AFTER cliId is stamped, so resolveSessionLaunchModel
+    // compares against the selected CLI. Cross-CLI (the /cli use case) → cliMatchesBot
+    // is false → no bot model leaks to a different CLI; same-CLI keeps the bot's model
+    // and stays consistent with in-place restarts (latestModelForRespawn), which never
+    // pass through this snapshot branch. spawnModelOverride is honored automatically.
+    const model = resolveSessionLaunchModel(ds, botCfg);
+    recordLaunchModel(ds, model);
+    return { cliId: selected.cliId, cliRuntime: runtime, cliPathOverride: legacyPath, wrapperCli, model, reasoningEffort, launchShell, startupCommands };
+  }
   // Freeze the agent launch config (cli / runtime / cliPath / wrapper) onto the
   // session the first time a worker forks, so later bot-level edits never
   // retroactively change a live session — same discipline as `sandbox`.
@@ -1400,6 +1435,8 @@ function sessionAgentConfig(
     wrapperCli: ds.session.wrapperCli,
     model,
     reasoningEffort: ds.session.reasoningEffort,
+    launchShell: botCfg.launchShell,
+    startupCommands: botCfg.startupCommands,
   };
 }
 
@@ -7305,6 +7342,15 @@ export async function forkSession(
   childSession.sandboxNetwork = ds.session.sandboxNetwork;
   childSession.reasoningEffort = ds.session.reasoningEffort;
   childSession.model = ds.session.model;
+  childSession.cliLaunchSnapshot = ds.session.cliLaunchSnapshot
+    ? {
+        ...ds.session.cliLaunchSnapshot,
+        cliRuntime: ds.session.cliLaunchSnapshot.cliRuntime
+          ? { ...ds.session.cliLaunchSnapshot.cliRuntime, update: { ...ds.session.cliLaunchSnapshot.cliRuntime.update } }
+          : null,
+        startupCommands: [...ds.session.cliLaunchSnapshot.startupCommands],
+      }
+    : undefined;
   childSession.cliRuntime = ds.session.cliRuntime
     ? { ...ds.session.cliRuntime, update: { ...ds.session.cliRuntime.update } }
     : undefined;
@@ -9442,7 +9488,7 @@ export function forkWorker(
     cliRuntime: agentCfg.cliRuntime,
     cliPathOverride: agentCfg.cliPathOverride,
     wrapperCli: agentCfg.wrapperCli,
-    launchShell: botCfg.launchShell,
+    launchShell: agentCfg.launchShell,
     model: agentCfg.model,
     reasoningEffort: agentCfg.reasoningEffort,
     // dsh runner turn timeout: read live from bot config so tuning bots.json
@@ -9457,16 +9503,16 @@ export function forkWorker(
     // through its terminal and must never trigger BotMux's self-owned RPC engine.
     codexRpcInput: existingAppServerEndpoint
       ? false
-      : botCfg.codexRpcInput === true || config.codexRpcInputDefault,
+      : (botCfg.codexRpcInput === true && RPC_CAPABLE_CLIS.has(agentCfg.cliId)) || config.codexRpcInputDefault,
     ...(existingAppServerEndpoint ? { existingAppServerEndpoint } : {}),
     // Startup commands run on every fresh spawn (incl. resume) so session-only
     // settings like `/effort ultracode` are re-established. Adopt sessions are
     // observed, not driven — forkAdoptWorker intentionally omits this.
-    startupCommands: botCfg.startupCommands,
+    startupCommands: agentCfg.startupCommands,
     // Per-bot env (bots.json `env`) — injected into the CLI process only (e.g.
     // ANTHROPIC_BASE_URL/AUTH_TOKEN for a GLM/3rd-party bot). Adopt sessions are
     // observed, not driven, so forkAdoptWorker intentionally omits it.
-    env: botCfg.env,
+    env: ds.session.cliLaunchSnapshot ? undefined : botCfg.env,
     // Use the decision recorded on the session (above), NOT the live bot flag, so
     // historical sessions never get retroactively sandboxed on restart.
     sandbox: ds.session.sandbox === true,
