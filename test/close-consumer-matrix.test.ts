@@ -40,7 +40,6 @@ type Category =
 const SINKS = new Set([
   'closeSession',
   'closeSessionForBackgroundCleanup',
-  'closeSessionsForAgentSwitch',
   'closeCliMismatchedSessionsForBot',
   'runIdempotencyFailClose',
   'runWithdrawAutoClose',
@@ -94,6 +93,13 @@ const CONSUMERS: Record<string, Rule> = {
     category: 'user_surface',
     why: 'Card repo switch: aborts rather than spawning over an uncancelled remote.',
   },
+  'core/dashboard-ipc-server.ts::<module>::closeCliMismatchedSessionsForBot': {
+    category: 'user_surface',
+    why: 'Agent-switch route: the sweep returns { closed, residual, failed } and the '
+      + 'route forwards all three to the dashboard, so a remote session that survived '
+      + 'its close is reported rather than flattened into "closed N".',
+    count: 1,
+  },
   'core/dashboard-ipc-server.ts::<module>::closeSession': {
     category: 'user_surface',
     why: 'Close route: serialises the whole result; the closed-row fast path '
@@ -110,11 +116,6 @@ const CONSUMERS: Record<string, Rule> = {
     category: 'background',
     why: 'Returns close_failed / closed_with_residual to the sweep; a refusal is '
       + 'never reported as closed.',
-  },
-  'core/session-manager.ts::closeSessionsForAgentSwitch::closeSession': {
-    category: 'background',
-    why: 'Agent-switch transaction: collects refusal + residual, blocks the commit.',
-    count: 2,
   },
   'core/session-manager.ts::restoreActiveSessions::closeSession': {
     category: 'background',

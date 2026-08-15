@@ -90,7 +90,7 @@ import { isSessionStopped } from './session-liveness.js';
 import { isRemoteBackendType, isRemoteCliId, isSuspendableBackendType } from './persistent-backend.js';
 import { getChatMode, replyMessage, sendMessage, resolveUnionIdFromOpenId, listThreadMessages, listChatMessages, listChatMessagesUntil, listChatBotMembers, getUserProfile, getUserProfileStrict, resolveAllowedUsersWithMap, type ChatBotMember } from '../im/lark/client.js';
 import { parseApiMessage, cardContentHasUpgradeFallback, resolveMergedCardContent, messageMentionsBot } from '../im/lark/message-parser.js';
-import { resumeSession, spawnDashboardSession, activateQueuedSession, closeCliMismatchedSessionsForBot, closeSessionsForAgentSwitch } from './session-manager.js';
+import { resumeSession, spawnDashboardSession, activateQueuedSession, closeCliMismatchedSessionsForBot } from './session-manager.js';
 
 /**
  * Indirection so a test can inject a failing close WITHOUT mocking the whole
@@ -99,9 +99,6 @@ import { resumeSession, spawnDashboardSession, activateQueuedSession, closeCliMi
  * The transaction's correctness is "config is not written when a close fails",
  * and that can only be proven by driving the real route with a failing close.
  */
-export const agentSwitchCloseHook = {
-  run: closeSessionsForAgentSwitch as typeof closeSessionsForAgentSwitch,
-};
 
 import { parseSpawnRequest } from './session-create.js';
 import { cleanupMaterializedDashboardImages, materializeDashboardImages } from './dashboard-images.js';
@@ -3933,119 +3930,80 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
   if (body.reasoningEffort !== undefined && body.reasoningEffort !== '' && reasoningEffort === null) {
     return jsonRes(res, 400, { ok: false, error: 'invalid_reasoning_effort' });
   }
-  // EVERYTHING below runs INSIDE the mutation gate.
-  //
-  // The gate serialises mutations per bot, so a request that reads the authority
-  // BEFORE entering it can be admitted long after another request committed. A
-  // queued old client (model-only, no cliRuntime) would then preserve the runtime
-  // it saw pre-queue and write it back over the newer one — a lost update — and
-  // hand the close hook a target describing a bot that no longer exists. So the
-  // authority read AND every proposal derived from it must happen after admission
-  // and before the irreversible close.
-  return withBotTurnMutation(larkAppId, async () => {
-    const supportsReasoningEffort = isCodexReasoningCliId(selected.cliId);
-    // NO PRECONDITION IS EVALUATED HERE.
-    //
-    // Everything that depends on the persisted row — the preserved runtime, the
-    // reasoning-effort support check, the availability warning — is decided inside
-    // the single rmwBotEntry transaction below, against the entry the same
-    // transaction writes. That is what makes the window zero: there is no span in
-    // which a proposal derived from one state could be committed against another.
-    const runtimeFieldPresent = Object.prototype.hasOwnProperty.call(body, 'cliRuntime');
-    let explicitRuntime: CliRuntimeConfig | undefined;
-    // A legacy row may OMIT cliId. That is not "no selection": parseBotConfigFile
-    // normalises it to claude-code (`entry.cliId ?? 'claude-code'`), so the bot IS
-    // on claude-code and may well carry a legacy cliPathOverride. Reading the raw
-    // row without that default made the selection look changed, which skipped the
-    // preservation branch below and silently deleted the persisted path on an old
-    // client's model-only save. The authority snapshot must therefore carry the
-    // same normalisation the loader applies.
-    /**
-     * Runtime/path proposal derived from ONE persisted row.
-     *
-     * Shared by the initial proposal and by the per-close re-derivation during the
-     * closes, so the two cannot drift: whatever decides "this session is stale"
-     * must be computed exactly like whatever gets committed.
-     */
-    const deriveRuntimeForRow = (row: {
-      cliId?: string; wrapperCli?: string;
-      cliRuntime?: CliRuntimeConfig; cliPathOverride?: string;
-    }): { nextRuntime?: CliRuntimeConfig; nextLegacyPath?: string } => {
-      // An explicit cliRuntime in the body does not depend on the row at all.
-      if (runtimeFieldPresent) return { nextRuntime: explicitRuntime };
-      const rowSelectionKey = selectionKeyForBot(
-        row.cliId ?? LEGACY_DEFAULT_CLI_ID,
-        row.wrapperCli,
-      );
-      // Different agent ⇒ nothing to preserve.
-      if (key !== rowSelectionKey) return {};
-      // Old dashboard clients know only `{cliId, model}`. Preserve the runtime on
-      // same-agent saves so editing a model cannot silently erase new config.
-      const preserved = row.cliRuntime;
-      return {
-        nextRuntime: preserved,
-        nextLegacyPath: preserved ? undefined : row.cliPathOverride,
-      };
-    };
-    if (runtimeFieldPresent) {
-      if (body.cliRuntime !== null) {
-        if (selected.cliId !== 'codex') {
-          return jsonRes(res, 400, { ok: false, error: 'runtime_requires_codex' });
-        }
-        if (selected.wrapperCli) {
-          return jsonRes(res, 400, { ok: false, error: 'runtime_wrapper_conflict' });
-        }
-        try {
-          explicitRuntime = normalizeCliRuntimeConfig(body.cliRuntime, 'cliRuntime');
-        } catch (err) {
-          return jsonRes(res, 400, {
-            ok: false,
-            error: 'invalid_cli_runtime',
-            message: err instanceof Error ? err.message : String(err),
-          });
-        }
+  const currentBotConfig = getBot(larkAppId).config;
+  const supportsReasoningEffort = isCodexReasoningCliId(selected.cliId);
+  const runtimeFieldPresent = Object.prototype.hasOwnProperty.call(body, 'cliRuntime');
+  const currentSelectionKey = selectionKeyForBot(currentBotConfig.cliId, currentBotConfig.wrapperCli);
+  const selectionChanged = key !== currentSelectionKey;
+  let nextRuntime: CliRuntimeConfig | undefined;
+  let nextLegacyPath: string | undefined;
+  if (runtimeFieldPresent) {
+    if (body.cliRuntime !== null) {
+      if (selected.cliId !== 'codex') {
+        return jsonRes(res, 400, { ok: false, error: 'runtime_requires_codex' });
       }
-      // null explicitly means built-in runtime; both structured and legacy
-      // executable overrides are cleared.
-    }
-    // An explicitly supplied runtime does not depend on the persisted row, so its
-    // availability and --version probe are done here — deliberately OUTSIDE the
-    // transaction, because a probe spawns a process and must never run while the
-    // bots.json lock is held. The preserve branch needs the row and is therefore
-    // resolved inside the transaction, where it only does a (process-free)
-    // availability lookup.
-    let runtimeProbe: { version: string; updateProvider: string } | undefined;
-    if (runtimeFieldPresent && explicitRuntime) {
-      const explicitAvailability = checkCliAvailability({
-        cliId: selected.cliId,
-        wrapperCli: selected.wrapperCli,
-        cliPathOverride: explicitRuntime.executable,
-      });
-      if (!explicitAvailability.available) {
-        return jsonRes(res, 400, {
-          ok: false,
-          error: 'runtime_unavailable',
-          message: explicitAvailability.reason ?? 'runtime executable is unavailable',
-        });
+      if (selected.wrapperCli) {
+        return jsonRes(res, 400, { ok: false, error: 'runtime_wrapper_conflict' });
       }
       try {
-        const raw = execFileSync(
-          explicitAvailability.resolvedPath ?? explicitRuntime.executable,
-          ['--version'],
-          { encoding: 'utf8', timeout: 5_000, stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 2 * 1024 * 1024 },
-        ).trim();
-        const version = raw.match(/\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?/)?.[0];
-        if (!version) throw new Error(`无法识别 --version 输出：${raw.slice(0, 120)}`);
-        runtimeProbe = { version, updateProvider: explicitRuntime.update?.provider ?? 'auto' };
+        nextRuntime = normalizeCliRuntimeConfig(body.cliRuntime, 'cliRuntime');
       } catch (err) {
         return jsonRes(res, 400, {
           ok: false,
-          error: 'runtime_version_probe_failed',
+          error: 'invalid_cli_runtime',
           message: err instanceof Error ? err.message : String(err),
         });
       }
     }
+    // null explicitly means built-in runtime; both structured and legacy
+    // executable overrides are cleared.
+  } else if (!selectionChanged) {
+    // Old dashboard clients know only `{cliId, model}`. Preserve the runtime on
+    // same-agent saves so editing a model cannot silently erase new config.
+    nextRuntime = currentBotConfig.cliRuntime;
+    nextLegacyPath = nextRuntime ? undefined : currentBotConfig.cliPathOverride;
+  }
+  const effectivePath = nextRuntime?.executable ?? nextLegacyPath;
+  const availability = checkCliAvailability({
+    cliId: selected.cliId,
+    wrapperCli: selected.wrapperCli,
+    cliPathOverride: effectivePath,
+  });
+  let runtimeProbe: { version: string; updateProvider: string } | undefined;
+  if (runtimeFieldPresent && nextRuntime) {
+    if (!availability.available) {
+      return jsonRes(res, 400, {
+        ok: false,
+        error: 'runtime_unavailable',
+        message: availability.reason ?? 'runtime executable is unavailable',
+      });
+    }
+    try {
+      const raw = execFileSync(availability.resolvedPath ?? nextRuntime.executable, ['--version'], {
+        encoding: 'utf8',
+        timeout: 5_000,
+        stdio: ['ignore', 'pipe', 'pipe'],
+        maxBuffer: 2 * 1024 * 1024,
+      }).trim();
+      const version = raw.match(/\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?/)?.[0];
+      if (!version) throw new Error(`无法识别 --version 输出：${raw.slice(0, 120)}`);
+      runtimeProbe = { version, updateProvider: nextRuntime.update?.provider ?? 'auto' };
+    } catch (err) {
+      return jsonRes(res, 400, {
+        ok: false,
+        error: 'runtime_version_probe_failed',
+        message: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+  // Existing Bot edits remain saveable (operators may intentionally configure
+  // first and install second), but the response is explicit so Dashboard never
+  // claims a missing Agent was saved successfully without qualification.
+  const availabilityWarning = availability.available
+    ? undefined
+    : `配置已保存，但所选 Agent 当前无法启动：${availability.reason ?? '本地启动依赖不可用'}。请先在 daemon 所在机器安装或修正 PATH / CLI 路径。`;
 
+  return withBotTurnMutation(larkAppId, async () => {
     // Agent selection can replace every live worker generation and may also
     // auto-clear readIsolation. Close admission and drain in-flight acceptance
     // before inspecting both the registry and restart source of truth. A
@@ -4062,140 +4020,60 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
     ])) return;
 
     // If the new CLI/wrapper can no longer enforce a currently-on read isolation,
-    // the flag is auto-cleared inside the transaction below, so the next session
-    // doesn't fail-close on it. (The read-isolation toggle validates at enable
-    // time; changing the agent afterwards is the other way a bot could end up
-    // configured-but-unenforceable.)
-    // CAN THIS SWITCH BE CONVERGED AT ALL? — pure check, no side effects.
-    //
-    // The sweep below runs after the commit, so it cannot un-commit. Conditions
-    // that make convergence IMPOSSIBLE must therefore be rejected before writing.
-    // An unreadable durable store is exactly that: sessions frozen on the old
-    // agent could not even be enumerated, so committing would strand them with no
-    // way to find them again. Failing closed here keeps the bot on its current
-    // agent. (Runtime close failures — e.g. a remote cancel that errors — cannot
-    // be predicted; those are reported and retried by the resweep.)
-    try {
-      sessionStore.listSessionsStrict();
-    } catch (err) {
-      return jsonRes(res, 409, {
-        ok: false,
-        error: 'agent_switch_close_failed',
-        reason: err instanceof Error ? err.message : String(err),
-        closedMismatchedSessions: 0,
-        closedMismatchedResidual: 0,
-        closedMismatchedFailed: 1,
-        closedMismatchedResidualTaskIds: [],
-      });
-    }
-
-    // ── ONE TRANSACTION: derive, validate and write, all under the lock ──
-    //
-    // The proposal is computed from the very `entry` this transaction writes, so
-    // there is no window between deciding and committing. Everything that used to
-    // guard such a window (a pre-close re-verify, a per-close authority gate, a
-    // commit-time compare-and-swap over a fingerprint, then a monotonic counter)
-    // is gone: it was only ever needed because an irreversible close sat inside
-    // the window. bots.json is also editable by hand and by older daemons, so no
-    // cooperative protocol could have closed that window anyway.
+    // auto-clear the flag here so the next session doesn't fail-close on it. (The
+    // read-isolation toggle validates at enable time; changing the agent afterwards
+    // is the other way a bot could end up configured-but-unenforceable.)
     let readIsolationCleared = false;
-    // Mirrored from the entry the transaction wrote, so the live config cannot
-    // disagree with what is on disk.
-    let committedReadIsolation: boolean = false;
-    let committedBackendType: ReturnType<typeof getBot>['config']['backendType'];
-    let committedRuntime: CliRuntimeConfig | undefined;
-    let committedLegacyPath: string | undefined;
-    let availabilityWarning: string | undefined;
-    let agentAvailable = true;
-    let requiredCommand: string | undefined;
-    let r: Awaited<ReturnType<typeof rmwBotEntry<{
+    const r = await rmwBotEntry<{
       error?: 'reasoning_effort_not_supported_by_model';
       nextReasoningEffort?: typeof reasoningEffort;
-    }>>>;
-    try {
-      r = await rmwBotEntry<{
-        error?: 'reasoning_effort_not_supported_by_model';
-        nextReasoningEffort?: typeof reasoningEffort;
-      }>(larkAppId, (entry) => {
-        // Derived from THIS entry, not from a snapshot taken earlier.
-        const derived = deriveRuntimeForRow(entry as {
-          cliId?: string; wrapperCli?: string;
-          cliRuntime?: CliRuntimeConfig; cliPathOverride?: string;
-        });
-        const nextRuntime = derived.nextRuntime;
-        const nextLegacyPath = derived.nextLegacyPath;
-        const effectivePath = nextRuntime?.executable ?? nextLegacyPath;
-        // NOTE: availability is deliberately NOT computed here. Its default path
-        // resolves a command through `sh -lc` / `-ic` (registry.resolveCommand),
-        // measured at ~325ms on this box for a CLI that is not directly on PATH,
-        // versus ~0ms without it. Holding the bots.json lock that long can push a
-        // concurrent writer into the 5s lock timeout. It is response-only data, so
-        // it is computed after the transaction — with full shell fidelity, so the
-        // reported availability is unchanged.
-
-        const nextReasoningEffort = supportsReasoningEffort
-          ? (reasoningEffortFieldPresent ? reasoningEffort ?? undefined : entry.reasoningEffort)
-          : undefined;
-        if (nextReasoningEffort
-            && !codexModelSupportsReasoningEffort(model || undefined, nextReasoningEffort)) {
-          // Rejected before anything is written and before any session is touched.
-          return { write: false, result: { error: 'reasoning_effort_not_supported_by_model' as const } };
-        }
-
-        entry.cliId = selected.cliId;
-        if (selected.wrapperCli) entry.wrapperCli = selected.wrapperCli;
-        else delete entry.wrapperCli;
-        if (nextRuntime) {
-          entry.cliRuntime = nextRuntime;
-          // Downgrade shadow: older BotMux versions ignore cliRuntime but retain
-          // cliPathOverride, so a rollback still launches this distribution.
-          entry.cliPathOverride = nextRuntime.executable;
-        } else if (nextLegacyPath) {
-          entry.cliPathOverride = nextLegacyPath;
-          delete entry.cliRuntime;
-        } else {
-          delete entry.cliRuntime;
-          delete entry.cliPathOverride;
-        }
-        if (model) entry.model = model;
-        else delete entry.model;
-        if (!supportsReasoningEffort) delete entry.reasoningEffort;
-        else if (reasoningEffortFieldPresent) {
-          if (reasoningEffort) entry.reasoningEffort = reasoningEffort;
-          else delete entry.reasoningEffort;
-        }
-        if (entry.readIsolation === true && !readIsolationEnforceableFor({
-          cliId: selected.cliId, cliPathOverride: effectivePath, wrapperCli: selected.wrapperCli,
-        })) {
-          delete entry.readIsolation;
-          readIsolationCleared = true;
-        }
-        committedReadIsolation = entry.readIsolation === true;
-        // 远端 CLI（riff / mojo）→ backendType 自动设为同名后端（否则 spawn 走 pty
-        // 后端，而它们的 resolvedBin 是空串）。
-        if (isRemoteCliId(selected.cliId)) {
-          entry.backendType = selected.cliId as typeof entry.backendType;
-        } else if (entry.backendType && isRemoteBackendType(entry.backendType)) {
-          // 从远端 CLI 切回其它 CLI：清掉这个自动配对的 backend override，回落 daemon
-          // 默认后端——否则新 CLI 会跑在远端 Backend 上（PTY 分块输入被当成一串远端
-          // turn）。手动的 pty/tmux/herdr/zellij override 不受影响。
-          delete entry.backendType;
-        }
-        committedBackendType = entry.backendType as typeof committedBackendType;
-
-        // Published to the response and to the live config below.
-        committedRuntime = nextRuntime;
-        committedLegacyPath = nextLegacyPath;
-        return { write: true, result: { nextReasoningEffort } };
-      });
-    } catch (err) {
-      // Nothing was written and no session was touched.
-      return jsonRes(res, 500, {
-        ok: false,
-        error: 'agent_switch_commit_failed',
-        message: err instanceof Error ? err.message : String(err),
-      });
+    }>(larkAppId, (entry) => {
+    const nextReasoningEffort = supportsReasoningEffort
+      ? (reasoningEffortFieldPresent ? reasoningEffort ?? undefined : entry.reasoningEffort)
+      : undefined;
+    if (nextReasoningEffort && !codexModelSupportsReasoningEffort(model || undefined, nextReasoningEffort)) {
+      return { write: false, result: { error: 'reasoning_effort_not_supported_by_model' } };
     }
+    entry.cliId = selected.cliId;
+    if (selected.wrapperCli) entry.wrapperCli = selected.wrapperCli;
+    else delete entry.wrapperCli;
+    if (nextRuntime) {
+      entry.cliRuntime = nextRuntime;
+      // Downgrade shadow: older BotMux versions ignore cliRuntime but retain
+      // cliPathOverride, so a rollback still launches this distribution.
+      entry.cliPathOverride = nextRuntime.executable;
+    } else if (nextLegacyPath) {
+      entry.cliPathOverride = nextLegacyPath;
+      delete entry.cliRuntime;
+    } else {
+      delete entry.cliRuntime;
+      delete entry.cliPathOverride;
+    }
+    if (model) entry.model = model;
+    else delete entry.model;
+    if (!supportsReasoningEffort) delete entry.reasoningEffort;
+    else if (reasoningEffortFieldPresent) {
+      if (reasoningEffort) entry.reasoningEffort = reasoningEffort;
+      else delete entry.reasoningEffort;
+    }
+    if (entry.readIsolation === true &&
+        !readIsolationEnforceableFor({ cliId: selected.cliId, cliPathOverride: effectivePath, wrapperCli: selected.wrapperCli })) {
+      delete entry.readIsolation;
+      readIsolationCleared = true;
+    }
+    // 远端 CLI（riff / mojo）→ backendType 自动设为同名后端（否则 spawn 走 pty 后端，
+    // 而它们的 resolvedBin 是空串）。mojo 加入后这里必须按「是否远端」判断，不能再
+    // 硬编码 riff。
+    if (isRemoteCliId(selected.cliId)) {
+      entry.backendType = selected.cliId as typeof entry.backendType;
+    } else if (entry.backendType && isRemoteBackendType(entry.backendType)) {
+      // 从远端 CLI 切回其它 CLI：清掉这个自动配对的 backend override，回落 daemon
+      // 默认后端——否则新 CLI 会跑在远端 Backend 上（PTY 分块输入被当成一串远端
+      // turn）。手动的 pty/tmux/herdr/zellij override 不受影响（它们不是远端后端）。
+      delete entry.backendType;
+    }
+    return { write: true, result: { nextReasoningEffort } };
+    });
     if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
     if (r.result.error) {
       return jsonRes(res, 400, {
@@ -4205,108 +4083,52 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
       });
     }
 
-    // Availability AFTER the lock, with the shell fallback enabled, so an agent
-    // installed only via a login-shell shim (nvm/npm) is still reported available.
-    // Response-only, so computing it here changes no persisted decision.
-    const availability = checkCliAvailability({
-      cliId: selected.cliId,
-      wrapperCli: selected.wrapperCli,
-      cliPathOverride: committedRuntime?.executable ?? committedLegacyPath,
-    });
-    agentAvailable = availability.available;
-    requiredCommand = availability.command;
-    // Existing Bot edits remain saveable (operators may intentionally configure
-    // first and install second), but the response is explicit so Dashboard never
-    // claims a missing Agent was saved successfully without qualification.
-    availabilityWarning = availability.available
-      ? undefined
-      : `配置已保存，但所选 Agent 当前无法启动：${availability.reason ?? '本地启动依赖不可用'}。请先在 daemon 所在机器安装或修正 PATH / CLI 路径。`;
-
     const bot = getBot(larkAppId);
     bot.config.cliId = selected.cliId;
-    bot.config.cliRuntime = committedRuntime;
-    bot.config.cliPathOverride = committedRuntime?.executable ?? committedLegacyPath;
+    bot.config.cliRuntime = nextRuntime;
+    bot.config.cliPathOverride = nextRuntime?.executable ?? nextLegacyPath;
     if (selected.wrapperCli) bot.config.wrapperCli = selected.wrapperCli;
     else bot.config.wrapperCli = undefined;
     bot.config.model = model || undefined;
     if (!supportsReasoningEffort) bot.config.reasoningEffort = undefined;
     else bot.config.reasoningEffort = r.result.nextReasoningEffort ?? undefined;
-    // Mirror the COMMITTED values, not a re-derivation from the pre-request live
-    // object. Deciding these from `bot.config` again could disagree with the entry
-    // that was actually written: readIsolation was only mirrored when the
-    // transaction cleared it (so a row that kept `true` could leave live at
-    // `false`), and backendType was re-derived from the stale in-memory value.
-    bot.config.readIsolation = committedReadIsolation;
-    bot.config.backendType = committedBackendType;
+    if (readIsolationCleared) bot.config.readIsolation = false;
+    if (isRemoteCliId(selected.cliId)) {
+      bot.config.backendType = selected.cliId as typeof bot.config.backendType;
+    } else if (bot.config.backendType && isRemoteBackendType(bot.config.backendType)) {
+      bot.config.backendType = undefined;
+    }
 
-    // ── SWEEP AFTER the commit ────────────────────────────────────────────
-    //
-    // Now that bots.json and the live config both hold the new agent, sessions
-    // still frozen on the old one are closed. Each decision is made against that
-    // committed authority (re-read per session), so a close can only happen while
-    // the config actually justifies it.
-    //
-    // Ordering trade-off, deliberately taken this way round: a message could still
-    // reach an old-engine session between the commit and this sweep.
-    // `withBotTurnMutation` holds admission for this bot across both, and whatever
-    // slips through is RECOVERABLE — the resweep closes it. Closing before the
-    // commit instead made the failure mode unrecoverable: a stale target killed
-    // sessions that were correct, and no later refusal could bring them back.
-    //
-    // The guard reads the DURABLE row, not this process's mirror above: another
-    // daemon can commit right after us without touching our memory, and a sweep
-    // driven by that mirror would close sessions the new config endorses. If disk
-    // no longer matches what we committed, the sweep stops and the newer writer's
-    // own sweep (plus armCliMismatchResweep) converges instead.
-    const committedIdentity = {
-      cliId: selected.cliId,
-      wrapperCli: selected.wrapperCli,
-      cliRuntime: committedRuntime,
-      cliPathOverride: committedRuntime?.executable ?? committedLegacyPath,
-    };
-    const closedMismatchedSessions = await agentSwitchCloseHook.run(larkAppId, undefined, {
-      committed: {
-        cliId: selected.cliId,
-        wrapperCli: selected.wrapperCli,
-        cliRuntime: committedRuntime,
-        cliPathOverride: committedRuntime?.executable ?? committedLegacyPath,
-      },
-    });
+    // 热切后立刻清掉本 bot 名下失配的存量会话——否则它们冻结的旧 CLI 会被下一条
+    // 消息 lazy resume 复活，要等下次 daemon 重启才被 restore 守卫清理。
+    const closedMismatchedSessions = await closeCliMismatchedSessionsForBot(larkAppId);
 
     const selectionKey = selectionKeyForBot(selected.cliId, selected.wrapperCli);
     jsonRes(res, 200, {
       ok: true,
       cliId: selected.cliId,
-      cliRuntime: committedRuntime ?? null,
-      cliPathOverride: committedRuntime ? null : committedLegacyPath ?? null,
+      cliRuntime: nextRuntime ?? null,
+      cliPathOverride: nextRuntime ? null : nextLegacyPath ?? null,
       wrapperCli: selected.wrapperCli ?? null,
       model: model || null,
       reasoningEffort: supportsReasoningEffort ? bot.config.reasoningEffort ?? null : null,
       selectionKey,
       // Number kept for compatibility with an older dashboard bundle; the residual
-      // count rides alongside so a hot CLI switch cannot silently strand remote
-      // sessions behind a plain "closed N".
+      // count rides alongside so a hot CLI switch cannot silently strand a remote
+      // session behind a plain "closed N". (mojo/riff sessions live off-box, so a
+      // local row can close while the remote one survives.)
       closedMismatchedSessions: closedMismatchedSessions.closed,
       closedMismatchedResidual: closedMismatchedSessions.residual,
       closedMismatchedFailed: closedMismatchedSessions.failed,
-      // Mismatched sessions intentionally left for a later resweep/restore, so a
-      // 200 never implies "everything already converged".
-      closedMismatchedDeferred: closedMismatchedSessions.deferred,
-      // The durable config moved on (or the row vanished) mid-sweep, so this 200
-      // means "committed", not "fully converged". Surfaced instead of silent: the
-      // remaining old-agent sessions are converged by the newer writer's own sweep.
-      agentSwitchAuthorityChanged: closedMismatchedSessions.authorityChanged,
-      closedMismatchedResidualTaskIds: closedMismatchedSessions.residualTaskIds,
       // Report the (possibly auto-cleared) read-isolation state + whether the new
       // agent can still enforce it, so the dashboard updates its toggle immediately
       // instead of showing a stale enabled/supported state until a full refetch.
-      // Reported from the committed entry, same source the live config mirrors.
-      readIsolation: committedReadIsolation,
+      readIsolation: bot.config.readIsolation === true,
       readIsolationSupported: readIsolationEnforceableFor(bot.config),
       readIsolationCleared,
-      agentAvailable,
+      agentAvailable: availability.available,
       availabilityWarning,
-      requiredCommand,
+      requiredCommand: availability.command,
       runtimeProbe,
     });
   });
