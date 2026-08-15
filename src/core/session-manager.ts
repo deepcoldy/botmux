@@ -12,8 +12,6 @@ import * as sessionStore from '../services/session-store.js';
 import * as messageQueue from '../services/message-queue.js';
 import { downloadMessageResource, listChatBotMembers, UserTokenMissingError } from '../im/lark/client.js';
 import { logger } from '../utils/logger.js';
-import { findEntryIndex, readRawConfig, requireConfigPath } from '../services/config-store.js';
-import { LEGACY_DEFAULT_CLI_ID } from '../bot-registry.js';
 import { forkWorker, sendWorkerInput, promoteQueuedActivationTail, forkAdoptWorker, adoptSandboxBlocked, killStalePids, sweepDeadPidMarkers, getCurrentCliVersion, restoreUsageLimitRuntimeState, setActiveSessionSafe, setActiveSessionIfActive, isDisposableCommandScratch, isRelayableRealSession, closeSession, getActiveSessionsRegistry, suspendWorker, withActiveSessionKeyLock, isSessionTransferring, deferUntilSessionTransferSettled } from './worker-pool.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import { buildBotmuxShellHints } from '../adapters/cli/shared-hints.js';
@@ -413,18 +411,13 @@ async function closeActiveSessionIfCliMismatch(ds: DaemonSession): Promise<CliMi
  * adopt 会话接管的是用户自己的外部 CLI，其 cliId 与 bot 配置不同是合法状态。
  */
 /**
- * Close every live session that would run the OLD agent under `target`, and say
- * whether the switch may be committed.
+ * 返回值区分三种结果，而不是一个 closed 计数：远端 CLI（mojo / riff）的会话活在
+ * 本机之外，本地行关掉了而远端仍存活是真实可能的结果。
  *
- * Ordering is the whole point: this runs BEFORE bots.json / the in-memory config
- * change, inside the caller's `withBotTurnMutation` lock. If any close fails, the
- * caller must not commit — leaving the config on the OLD agent, which is the same
- * agent those still-active sessions are frozen on. That is consistent (a routed
- * message runs the agent the config names) instead of the previous state, where a
- * committed switch coexisted with rows that resurrect the old CLI.
- *
- * A `closed_with_residual` does NOT block the commit: the local row IS closed, so
- * nothing can route to it. Its surviving remote id is reported for manual cleanup.
+ * - `closed`：本地行已关闭，且没有需要人工处理的残留。
+ * - `residual`：本地行已关闭（因此不会再被路由到），但远端会话还在，其 taskId 需要
+ *   上报给运维，否则调用方只看到「closed N」而拿不到清理线索。
+ * - `failed`：关闭被拒绝（例如远端取消无法证明），该行仍然 active。
  */
 export async function closeCliMismatchedSessionsForBot(
   larkAppId: string,

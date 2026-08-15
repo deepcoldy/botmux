@@ -6,7 +6,6 @@ import { request as httpRequest } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { ipcRoute, startIpcServer, setLarkAppId, setIpcAuthSecret, setBotRenamer, setBotAvatarChanger, setExactChatGrantHandler, armCoreOnlyReadinessGate, setCoreOnlyReady, __testOnly_resetCoreOnlyReadiness, type IpcServerHandle,
-  agentSwitchCloseHook,
   __testOnly_agentSwitchBeforePreCloseVerify,
 } from '../src/core/dashboard-ipc-server.js';
 import { rmwBotEntry } from '../src/services/config-store.js';
@@ -3365,6 +3364,141 @@ describe('PUT /api/bot-riff config safety (finding H)', () => {
 });
 
 describe('PUT /api/bot-agent riff backend pairing', () => {
+  it('reports a mismatch close that left a REMOTE session behind', async () => {
+    // mojo / riff sessions live off-box: the local row can close while the remote
+    // one survives. Flattening that into "closed N" loses the only handle an
+    // operator has for cleanup, so the route must forward residual/failed too.
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-agent-residual-'));
+    const dataDir = join(dir, 'data');
+    const configPath = join(dir, 'bots.json');
+    const appId = 'test-agent-residual';
+    const prevBotsConfig = process.env.BOTS_CONFIG;
+    const prevDataDir = config.session.dataDir;
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      config.session.dataDir = dataDir;
+      writeFileSync(configPath, JSON.stringify([{
+        larkAppId: appId, larkAppSecret: 'secret', cliId: 'claude-code',
+      }], null, 2));
+      loadBotConfigs().forEach((c: any) => registerBot(c));
+      sessionStore.init(appId);
+
+      // A live session frozen on the old agent, so the sweep has something to do.
+      const session = sessionStore.createSession('oc_res', 'om_res', 'residual', 'group');
+      session.larkAppId = appId;
+      session.cliId = 'claude-code';
+      session.agentFrozen = true;
+      sessionStore.updateSession(session);
+      workerPool.setActiveSessionsRegistry(new Map([[sessionKey(session.rootMessageId, appId), {
+        session, worker: null, workerPort: null, workerToken: null,
+        larkAppId: appId, chatId: session.chatId, chatType: 'group', scope: 'thread',
+        spawnedAt: Date.now(), cliVersion: 'test', lastMessageAt: Date.now(),
+        hasHistory: true,
+      } as any]]));
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+
+      const res = await fetch(`http://127.0.0.1:${handle.port}/api/bot-agent`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ cliId: 'codex', model: '' }),
+      });
+      expect(res.status).toBe(200);
+      const body = await res.json();
+
+      // All three counters must be present — not just the closed count.
+      expect(body).toMatchObject({ closedMismatchedSessions: 1 });
+      expect(body, 'residual must be reported alongside the count')
+        .toHaveProperty('closedMismatchedResidual');
+      expect(body, 'a refused close must be reportable too')
+        .toHaveProperty('closedMismatchedFailed');
+    } finally {
+      workerPool.setActiveSessionsRegistry(new Map());
+      sessionStore.init();
+      config.session.dataDir = prevDataDir;
+      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = prevBotsConfig;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('auto-pairs backendType=mojo when switching TO mojo', async () => {
+    // The pairing must be driven by "is this a remote CLI", not by a hardcoded
+    // 'riff'. mojo runs off-box and its resolvedBin is the empty string, so a bot
+    // left on the default pty backend cannot spawn at all.
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-agent-mojo-pair-'));
+    const configPath = join(dir, 'bots.json');
+    const appId = 'test-agent-mojo-pair';
+    const prevBotsConfig = process.env.BOTS_CONFIG;
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      writeFileSync(configPath, JSON.stringify([{
+        larkAppId: appId,
+        larkAppSecret: 'secret',
+        cliId: 'codex',
+      }], null, 2));
+      loadBotConfigs().forEach((c: any) => registerBot(c));
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+
+      const res = await fetch(`http://127.0.0.1:${handle.port}/api/bot-agent`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ cliId: 'mojo', model: '' }),
+      });
+      expect(res.status).toBe(200);
+
+      const stored = JSON.parse(readFileSync(configPath, 'utf-8'))[0];
+      expect(stored.cliId).toBe('mojo');
+      expect(stored.backendType, 'mojo must be paired with the mojo backend').toBe('mojo');
+      const { getBot } = await import('../src/bot-registry.js');
+      expect(getBot(appId).config.backendType).toBe('mojo');
+    } finally {
+      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = prevBotsConfig;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('clears the auto-paired backendType=mojo when switching back to a local CLI', async () => {
+    // Symmetric to the riff case: the clear branch must also test "is remote",
+    // otherwise a mojo-paired bot keeps backendType=mojo after moving to codex and
+    // every turn is dispatched as a remote mojo turn.
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-agent-mojo-unpair-'));
+    const configPath = join(dir, 'bots.json');
+    const appId = 'test-agent-mojo-unpair';
+    const prevBotsConfig = process.env.BOTS_CONFIG;
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      writeFileSync(configPath, JSON.stringify([{
+        larkAppId: appId,
+        larkAppSecret: 'secret',
+        cliId: 'mojo',
+        backendType: 'mojo',
+      }], null, 2));
+      loadBotConfigs().forEach((c: any) => registerBot(c));
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+
+      const res = await fetch(`http://127.0.0.1:${handle.port}/api/bot-agent`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ cliId: 'codex', model: '' }),
+      });
+      expect(res.status).toBe(200);
+
+      const stored = JSON.parse(readFileSync(configPath, 'utf-8'))[0];
+      expect(stored.cliId).toBe('codex');
+      expect(stored.backendType, 'the remote pairing must be cleared').toBeUndefined();
+      const { getBot } = await import('../src/bot-registry.js');
+      expect(getBot(appId).config.backendType).toBeUndefined();
+    } finally {
+      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = prevBotsConfig;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('clears the auto-paired backendType=riff when switching back to a non-riff CLI', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'botmux-agent-riff-ipc-'));
     const configPath = join(dir, 'bots.json');

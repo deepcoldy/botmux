@@ -92,14 +92,6 @@ import { getChatMode, replyMessage, sendMessage, resolveUnionIdFromOpenId, listT
 import { parseApiMessage, cardContentHasUpgradeFallback, resolveMergedCardContent, messageMentionsBot } from '../im/lark/message-parser.js';
 import { resumeSession, spawnDashboardSession, activateQueuedSession, closeCliMismatchedSessionsForBot } from './session-manager.js';
 
-/**
- * Indirection so a test can inject a failing close WITHOUT mocking the whole
- * session-manager module (this route's suite runs against the real one).
- *
- * The transaction's correctness is "config is not written when a close fails",
- * and that can only be proven by driving the real route with a failing close.
- */
-
 import { parseSpawnRequest } from './session-create.js';
 import { cleanupMaterializedDashboardImages, materializeDashboardImages } from './dashboard-images.js';
 import { getCliDisplayName } from '../im/lark/card-builder.js';
@@ -202,7 +194,7 @@ import {
   getBotName,
   type SessionRow,
 } from './dashboard-rows.js';
-import { getBotBrand, getBot, getBotOpenId, loadBotConfigs, readBotSkillPolicy, getBotTuiSlashAllow, LEGACY_DEFAULT_CLI_ID, type UsageDisplayMode, type MessageListenerConfig } from '../bot-registry.js';
+import { getBotBrand, getBot, getBotOpenId, loadBotConfigs, readBotSkillPolicy, getBotTuiSlashAllow, type UsageDisplayMode, type MessageListenerConfig } from '../bot-registry.js';
 import { normalizeKanbanColumn, normalizeKanbanPosition, normalizeSessionTitle } from './session-board.js';
 import { validateSlashInjection } from './slash-inject.js';
 import { validateRoleLibraryPath } from './role-library.js';

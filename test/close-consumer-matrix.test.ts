@@ -106,10 +106,6 @@ const CONSUMERS: Record<string, Rule> = {
       + 'replays the residual.',
     count: 4,
   },
-  // NOTE: the agent-switch call goes through agentSwitchCloseHook.run (a test
-  // seam), so it is a property call on a local object rather than a resolvable
-  // import. Covered instead by the route tests that assert the config is not
-  // committed on refusal.
 
   // ── background: no UI, so refusal/residual must be logged ────────────────
   'core/session-manager.ts::closeActiveSessionIfCliMismatch::closeSession': {
