@@ -482,6 +482,7 @@ describe('resumeSession', () => {
     it('restores usage-limit runtime state for active sessions after daemon restart', async () => {
       const s = sessionStore.createSession('oc_chat_limit', 'om_limit', 'Limited topic');
       s.larkAppId = 'app_test';
+      s.cliId = 'claude-code';
       s.scope = 'thread';
       s.usageLimit = {
         limited: true,

@@ -14,7 +14,11 @@ import { downloadMessageResource, listChatBotMembers, UserTokenMissingError } fr
 import { logger } from '../utils/logger.js';
 import { forkWorker, sendWorkerInput, forkAdoptWorker, killStalePids, getCurrentCliVersion, restoreUsageLimitRuntimeState, setActiveSessionSafe, isRelayableRealSession, closeSession, getActiveSessionsRegistry, suspendWorker } from './worker-pool.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
-import { buildBotmuxShellHints } from '../adapters/cli/shared-hints.js';
+import {
+  buildBotmuxShellHints,
+  buildCandidateManagedDeliveryHints,
+  candidateManagedDeliveryReminder,
+} from '../adapters/cli/shared-hints.js';
 import {
   resolveSkillInjectionModeForApp,
   builtinSkillEntries,
@@ -625,17 +629,26 @@ export function buildNewTopicPrompt(
   botIdentity?: { name?: string; openId?: string },
   locale?: Locale,
   sender?: ResolvedSender,
-  opts?: { larkAppId?: string; chatId?: string; whiteboardId?: string; substituteTrigger?: SubstituteTrigger },
+  opts?: { larkAppId?: string; chatId?: string; whiteboardId?: string; substituteTrigger?: SubstituteTrigger; candidateManagedDelivery?: boolean },
 ): string {
   const adapter = createCliAdapterSync(cliId, cliPathOverride);
+  // Managed Candidate sessions never self-deliver: replace the botmux-send
+  // routing (and everything that references it below — skill catalog,
+  // multi-bot mention identity, whiteboard) with the managed-delivery block.
+  const candidateManaged = opts?.candidateManagedDelivery === true;
   // Non-Claude CLIs receive the botmux routing hints inline via the prompt
   // (Claude Code builds its own via --append-system-prompt). Source hints
   // freshly from i18n so they respect the resolved locale instead of the
   // static `adapter.systemHints` array that was baked at module load.
-  const hints = adapter.injectsSessionContext ? [] : (cliId === 'hermes' ? buildHermesBotmuxHints(locale) : buildBotmuxShellHints(locale));
+  const hints = adapter.injectsSessionContext
+    ? []
+    : candidateManaged
+      ? buildCandidateManagedDeliveryHints(locale)
+      : (cliId === 'hermes' ? buildHermesBotmuxHints(locale) : buildBotmuxShellHints(locale));
 
+  const routingTag = candidateManaged ? 'botmux_managed_delivery' : 'botmux_routing';
   const routingBlock = hints.length > 0
-    ? `<botmux_routing>\n${hints.join('\n')}\n</botmux_routing>`
+    ? `<${routingTag}>\n${hints.join('\n')}\n</${routingTag}>`
     : '';
 
   // Built-in skill delivery for CLIs without a per-session skill channel
@@ -646,7 +659,7 @@ export function buildNewTopicPrompt(
   // nothing to the prompt. Claude-family (injectsSessionContext) inject skills
   // via --plugin-dir, so they're excluded.
   let skillBlock = '';
-  if (!adapter.injectsSessionContext && adapter.skillsDir) {
+  if (!candidateManaged && !adapter.injectsSessionContext && adapter.skillsDir) {
     const mode = resolveSkillInjectionModeForApp(opts?.larkAppId);
     if (mode === 'prompt') {
       // history/quoted/bots are fully covered by <botmux_routing>; send stays in
@@ -660,7 +673,10 @@ export function buildNewTopicPrompt(
 
   const unknown = t('ai.identity.unknown', undefined, locale);
   let identityBlock = '';
-  if (botIdentity && (botIdentity.name || botIdentity.openId)) {
+  // Candidate sessions run alone in their managed Shadow topic; the multi-bot
+  // mention/identity rules are all phrased around `botmux send` and would
+  // reintroduce the self-delivery guidance this mode removes.
+  if (!candidateManaged && botIdentity && (botIdentity.name || botIdentity.openId)) {
     identityBlock = [
       '<identity>',
       `  <name>${xmlEscape(botIdentity.name ?? unknown)}</name>`,
@@ -671,10 +687,16 @@ export function buildNewTopicPrompt(
   }
 
   const roleBlock = renderRoleContextBlock(opts?.larkAppId, opts?.chatId);
-  const whiteboardBlock = renderWhiteboardBlock({ whiteboardId: opts?.whiteboardId });
+  const whiteboardBlock = candidateManaged
+    ? ''
+    : renderWhiteboardBlock({ whiteboardId: opts?.whiteboardId });
 
   const mentionBlock = renderMentionBlock(mentions);
-  const botBlock = renderAvailableBotsBlock(availableBots, mentions, locale);
+  // The available-bots hint teaches `botmux send --mention` collaboration;
+  // a managed Candidate session never self-delivers, so it gets no bot roster.
+  const botBlock = candidateManaged
+    ? ''
+    : renderAvailableBotsBlock(availableBots, mentions, locale);
 
   // Messages the user sent while the repo-selection card was still pending are
   // buffered as followUps. Fold them into the single <user_message> body
@@ -750,6 +772,7 @@ export function buildNewTopicCliInput(
     chatId?: string;
     whiteboardId?: string;
     substituteTrigger?: SubstituteTrigger;
+    candidateManagedDelivery?: boolean;
     codexAppText?: string;
     codexAppApplicationContext?: string;
     codexAppMessageContext?: string;
@@ -764,14 +787,21 @@ export function buildNewTopicCliInput(
   // Legacy pending buffers contain enriched strings. Only materialize those as
   // clean input when the caller also preserved their matching raw texts.
   if (cliId !== 'codex-app' || (followUps && followUps.length > 0 && !opts?.codexAppFollowUps)) return { content };
+  // Mirror the main content path's candidateManaged gating: the whiteboard and
+  // available-bots blocks both teach `botmux send` self-delivery.
+  const sidecarCandidateManaged = opts?.candidateManagedDelivery === true;
   const roleBlock = renderRoleContextBlock(opts?.larkAppId, opts?.chatId);
-  const whiteboardBlock = renderWhiteboardBlock({ whiteboardId: opts?.whiteboardId });
+  const whiteboardBlock = sidecarCandidateManaged
+    ? ''
+    : renderWhiteboardBlock({ whiteboardId: opts?.whiteboardId });
   const senderBlock = renderSenderTag(sender);
   const substitutePolicyBlock = renderSubstitutePolicy(opts?.substituteTrigger);
   const substituteTargetBlock = renderSubstituteTarget(opts?.substituteTrigger);
   const attachmentBlock = formatAttachmentsHint(attachments, locale);
   const mentionBlock = renderMentionBlock(mentions);
-  const availableBotsBlock = renderAvailableBotsBlock(availableBots, mentions, locale);
+  const availableBotsBlock = sidecarCandidateManaged
+    ? ''
+    : renderAvailableBotsBlock(availableBots, mentions, locale);
   return {
     content,
     codexAppInput: buildCodexAppTurnInput({
@@ -800,11 +830,14 @@ export function buildNewTopicCliInput(
 export function buildFollowUpContent(
   content: string,
   sessionId: string,
-  opts?: { attachments?: LarkAttachment[]; mentions?: LarkMention[]; isAdoptMode?: boolean; cliId?: CliId; cliPathOverride?: string; locale?: Locale; sender?: ResolvedSender; larkAppId?: string; chatId?: string; whiteboardId?: string; substituteTrigger?: SubstituteTrigger; codexAppText?: string; codexAppApplicationContext?: string; codexAppMessageContext?: string },
+  opts?: { attachments?: LarkAttachment[]; mentions?: LarkMention[]; isAdoptMode?: boolean; cliId?: CliId; cliPathOverride?: string; locale?: Locale; sender?: ResolvedSender; larkAppId?: string; chatId?: string; whiteboardId?: string; substituteTrigger?: SubstituteTrigger; candidateManagedDelivery?: boolean; codexAppText?: string; codexAppApplicationContext?: string; codexAppMessageContext?: string },
 ): string {
   const parts: string[] = [];
+  const candidateManaged = opts?.candidateManagedDelivery === true;
   const roleBlock = renderRoleContextBlock(opts?.larkAppId, opts?.chatId, { followUp: true });
-  const whiteboardBlock = renderWhiteboardBlock({ whiteboardId: opts?.whiteboardId });
+  const whiteboardBlock = candidateManaged
+    ? ''
+    : renderWhiteboardBlock({ whiteboardId: opts?.whiteboardId });
   const skipSessionId = opts?.isAdoptMode || (opts?.cliId
     ? createCliAdapterSync(opts.cliId, opts.cliPathOverride).injectsSessionContext
     : false);
@@ -817,9 +850,11 @@ export function buildFollowUpContent(
   if (!skipSessionId) parts.push(`<session_id>${xmlEscape(sessionId)}</session_id>`);
   if (roleBlock) parts.push(roleBlock);
   if (opts?.cliId !== 'mira') {
-    const reminder = opts?.cliId === 'hermes'
-      ? hermesFollowupReminder(opts?.locale)
-      : t('ai.followup.reminder', undefined, opts?.locale);
+    const reminder = candidateManaged
+      ? candidateManagedDeliveryReminder(opts?.locale)
+      : opts?.cliId === 'hermes'
+        ? hermesFollowupReminder(opts?.locale)
+        : t('ai.followup.reminder', undefined, opts?.locale);
     parts.push(`<botmux_reminder>${reminder}</botmux_reminder>`);
   }
   if (whiteboardBlock) parts.push(whiteboardBlock);
@@ -850,12 +885,14 @@ export function buildFollowUpContent(
 export function buildFollowUpCliInput(
   content: string,
   sessionId: string,
-  opts?: { attachments?: LarkAttachment[]; mentions?: LarkMention[]; isAdoptMode?: boolean; cliId?: CliId; cliPathOverride?: string; locale?: Locale; sender?: ResolvedSender; larkAppId?: string; chatId?: string; whiteboardId?: string; substituteTrigger?: SubstituteTrigger; codexAppText?: string; codexAppApplicationContext?: string; codexAppMessageContext?: string },
+  opts?: { attachments?: LarkAttachment[]; mentions?: LarkMention[]; isAdoptMode?: boolean; cliId?: CliId; cliPathOverride?: string; locale?: Locale; sender?: ResolvedSender; larkAppId?: string; chatId?: string; whiteboardId?: string; substituteTrigger?: SubstituteTrigger; candidateManagedDelivery?: boolean; codexAppText?: string; codexAppApplicationContext?: string; codexAppMessageContext?: string },
 ): CliTurnPayload {
   const legacyContent = buildFollowUpContent(content, sessionId, opts);
   if (opts?.cliId !== 'codex-app' || opts.isAdoptMode) return { content: legacyContent };
   const roleBlock = renderRoleContextBlock(opts.larkAppId, opts.chatId, { followUp: true });
-  const whiteboardBlock = renderWhiteboardBlock({ whiteboardId: opts.whiteboardId });
+  const whiteboardBlock = opts.candidateManagedDelivery === true
+    ? ''
+    : renderWhiteboardBlock({ whiteboardId: opts.whiteboardId });
   const senderBlock = renderSenderTag(opts.sender);
   const substitutePolicyBlock = renderSubstitutePolicy(opts.substituteTrigger);
   const substituteTargetBlock = renderSubstituteTarget(opts.substituteTrigger);
@@ -1013,6 +1050,7 @@ export function buildReforkPrompt(
     larkAppId: ds.larkAppId,
     chatId: ds.session.chatId,
     whiteboardId: ds.session.whiteboardId,
+    candidateManagedDelivery: !!ds.session.candidateRuntimeContract,
   });
 }
 
@@ -1057,6 +1095,7 @@ export function buildReforkCliInput(
     larkAppId: ds.larkAppId,
     chatId: ds.session.chatId,
     whiteboardId: ds.session.whiteboardId,
+    candidateManagedDelivery: !!ds.session.candidateRuntimeContract,
     substituteTrigger: opts?.substituteTrigger,
     codexAppText: opts?.codexAppText,
     codexAppApplicationContext: opts?.codexAppApplicationContext,
@@ -1197,6 +1236,7 @@ export async function restoreActiveSessions(activeSessions: Map<string, DaemonSe
   logger.info(`Registering ${active.length} active session(s) (no CLI spawn until new messages arrive)...`);
 
   for (const session of active) {
+    try {
     // Restored sessions persisted before the scope field was added default to
     // 'thread' — that matches the legacy thread-only behaviour.
     const scope: 'thread' | 'chat' = session.scope === 'chat' ? 'chat' : 'thread';
@@ -1311,6 +1351,21 @@ export async function restoreActiveSessions(activeSessions: Map<string, DaemonSe
       continue;
     }
 
+    // A non-adopt, non-queued active record with no cliId is an unrecoverable
+    // legacy row: it claims prior CLI history (hasHistory below) but the CLI
+    // that owns that transcript is unknown, so lazy resume cannot be trusted.
+    // Skip it with locatable diagnostics instead of letting a legacy record
+    // crash-loop daemon startup; the store row is left untouched as evidence.
+    if (typeof session.cliId !== 'string' || !session.cliId.trim()) {
+      logger.warn(
+        `[restore] Skipping unrecoverable legacy session record ${session.sessionId} `
+        + `(missing cliId): chat=${session.chatId} anchor=${session.rootMessageId} `
+        + `app=${session.larkAppId ?? '(unset)'} title=${JSON.stringify(session.title ?? '')} `
+        + `createdAt=${session.createdAt}`,
+      );
+      continue;
+    }
+
     const larkAppId = session.larkAppId ?? getAllBots()[0]?.config.larkAppId ?? '';
     const ds: DaemonSession = {
       session,
@@ -1383,6 +1438,17 @@ export async function restoreActiveSessions(activeSessions: Map<string, DaemonSe
     announceSessionRow(ds);
 
     logger.debug(`Registered session ${session.sessionId} (scope: ${scope}, anchor: ${anchor})`);
+    } catch (error) {
+      // One rotten record must never crash-loop daemon startup: contain it,
+      // leave the store row as diagnosable evidence, and keep restoring the
+      // rest of the batch.
+      logger.warn(
+        `[restore] Skipping session record ${session.sessionId} after restore failure: `
+        + `chat=${session.chatId} anchor=${session.rootMessageId} `
+        + `app=${session.larkAppId ?? '(unset)'} cliId=${session.cliId ?? '(unset)'} `
+        + `error=${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
   }
 
   // Persistent backends: auto-fork workers for sessions whose backing session

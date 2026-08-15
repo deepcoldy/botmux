@@ -125,6 +125,7 @@ export function buildDocWatchWarmupTurnInput(args: {
         larkAppId: ds.larkAppId,
         chatId: ds.session.chatId,
         whiteboardId: ds.session.whiteboardId,
+        candidateManagedDelivery: !!ds.session.candidateRuntimeContract,
         codexAppText,
         codexAppApplicationContext: promptContent,
       }),
@@ -289,6 +290,7 @@ export function buildDocCommentTurnInput(args: {
         larkAppId: ds.larkAppId,
         chatId: ds.session.chatId,
         whiteboardId: ds.session.whiteboardId,
+        candidateManagedDelivery: !!ds.session.candidateRuntimeContract,
         ...cleanContext,
       }),
     };

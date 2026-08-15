@@ -55,6 +55,49 @@ export const BOTMUX_SHELL_HINTS: string[] = [
 ];
 
 /**
+ * Managed Candidate RCA sessions never deliver their own output: the worker
+ * captures the final answer and BotMux's receipt-endorsed pipeline posts it to
+ * the Shadow topic. These hints replace every `botmux send` routing block for
+ * such sessions so the agent neither shells out to botmux nor fabricates
+ * "delivery failed" wording about a send it was never supposed to perform.
+ */
+export function buildCandidateManagedDeliveryHints(locale?: Locale): string[] {
+  if (locale === 'en') {
+    return [
+      'You are running inside a managed Candidate RCA session. Your final assistant output is delivered to the Feishu topic automatically by BotMux through its receipt-endorsed managed delivery pipeline.',
+      'Do not run `botmux send` or any other botmux command to deliver messages — write the complete user-facing conclusion as your final assistant output and stop.',
+      'Delivery is owned by the platform and recorded with receipts. Never state in your conclusion that a message "failed to deliver" or "was not sent successfully", and never re-send or duplicate a conclusion because you doubt delivery.',
+    ];
+  }
+  return [
+    '你运行在受管的 Candidate RCA 会话中。你的最终输出会由 BotMux 的受管投递（带回执背书）自动送达用户所在的飞书话题。',
+    '不要执行 `botmux` 命令投递消息——把面向用户的完整结论作为你的最终输出即可，无需自行发送。',
+    '投递由平台负责并有回执记录。禁止在结论里声称「未成功投递」「投递失败」「发送失败」等；也不要因为怀疑投递而重复补发同一结论。',
+  ];
+}
+
+/** System-prompt counterpart of `buildCandidateManagedDeliveryHints` for
+ * `injectsSessionContext` adapters (claude-code / genius / grok). Replaces
+ * `buildBotmuxSystemPromptText` wholesale — no send usage, no multi-bot
+ * mention rules — for managed Candidate sessions. */
+export function buildCandidateManagedDeliverySystemPromptText(opts: {
+  locale?: Locale;
+} = {}): string {
+  return [
+    '<botmux_managed_delivery>',
+    ...buildCandidateManagedDeliveryHints(opts.locale),
+    '</botmux_managed_delivery>',
+  ].join('\n');
+}
+
+/** Follow-up `<botmux_reminder>` body for managed Candidate sessions. */
+export function candidateManagedDeliveryReminder(locale?: Locale): string {
+  return locale === 'en'
+    ? 'Your final assistant output is delivered automatically by BotMux managed delivery; do not shell out to deliver messages and never claim a delivery failed.'
+    : '最终输出由 BotMux 受管投递自动送达，无需也不要自行执行命令发送；禁止声称「未成功投递/发送失败」。';
+}
+
+/**
  * Build the `<botmux_routing>` (+ optional `<identity>`) text injected via a
  * CLI's system-prompt flag (`--append-system-prompt`) for adapters that set
  * `injectsSessionContext`. Single source of truth shared by claude-code and

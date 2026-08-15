@@ -16137,6 +16137,7 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
           larkAppId,
           chatId: ds.session.chatId,
           whiteboardId: ds.session.whiteboardId,
+          candidateManagedDelivery: candidateConversation.kind === 'candidate',
           substituteTrigger,
           codexAppText: parsed.content,
           codexAppApplicationContext,

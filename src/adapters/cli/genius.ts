@@ -2,7 +2,7 @@ import { existsSync, statSync, openSync, readSync, closeSync, realpathSync } fro
 import { homedir } from 'node:os';
 import { basename, join } from 'node:path';
 import { resolveCommand } from './registry.js';
-import { buildBotmuxSystemPromptText } from './shared-hints.js';
+import { buildBotmuxSystemPromptText, buildCandidateManagedDeliverySystemPromptText } from './shared-hints.js';
 import type { CliAdapter, PtyHandle } from './types.js';
 import { discoverClaudeFamilySessions } from '../../services/resumable-session-discovery.js';
 import { delay, scaleMs } from '../../utils/timing.js';
@@ -102,7 +102,7 @@ export function createGeniusAdapter(pathOverride?: string): CliAdapter {
       }
     },
 
-    buildArgs({ sessionId, resume, resumeSessionId, botName, botOpenId, larkAppId, locale, model, disableCliBypass, workingDir, skillPluginDir }) {
+    buildArgs({ sessionId, resume, resumeSessionId, botName, botOpenId, larkAppId, locale, model, disableCliBypass, workingDir, skillPluginDir, candidateManagedDelivery }) {
       const args: string[] = [];
       if (workingDir) args.push('--add-dir', workingDir);
       if (resume) {
@@ -131,15 +131,17 @@ export function createGeniusAdapter(pathOverride?: string): CliAdapter {
       // <botmux_routing> from session-manager), so the built-in skill catalog
       // for `prompt` mode (or the help pointer for `off`) must ride along here.
       // Catalog rides on system prompt (injectsSessionContext + global skillsDir).
-      args.push('--append-system-prompt', buildBotmuxSystemPromptText({
-        locale,
-        botName,
-        botOpenId,
-        builtinSkillBlock: builtinSkillBlockForInjectsSessionContext(larkAppId, locale, {
-          asksViaHook: false,
-          whiteboardEnabled: whiteboardEnabled(),
-        }),
-      }));
+      args.push('--append-system-prompt', candidateManagedDelivery
+        ? buildCandidateManagedDeliverySystemPromptText({ locale })
+        : buildBotmuxSystemPromptText({
+          locale,
+          botName,
+          botOpenId,
+          builtinSkillBlock: builtinSkillBlockForInjectsSessionContext(larkAppId, locale, {
+            asksViaHook: false,
+            whiteboardEnabled: whiteboardEnabled(),
+          }),
+        }));
       if (skillPluginDir) args.push('--plugin-dir', skillPluginDir);
       return args;
     },

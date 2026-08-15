@@ -11,7 +11,7 @@ import {
 } from './types.js';
 import { findJsonlContainingFingerprint, jsonlContainsFingerprint, normaliseForFingerprint } from '../../services/claude-transcript.js';
 import { GOAL_ENV } from '../../workflows/v3/contract.js';
-import { buildBotmuxSystemPromptText } from './shared-hints.js';
+import { buildBotmuxSystemPromptText, buildCandidateManagedDeliverySystemPromptText } from './shared-hints.js';
 import { delay, scaleMs } from '../../utils/timing.js';
 import { discoverClaudeFamilySessions } from '../../services/resumable-session-discovery.js';
 
@@ -612,7 +612,7 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
       return discoverClaudeFamilySessions(variant.dataDir, limit, exclude);
     },
 
-    buildArgs({ sessionId, resume, resumeSessionId, botName, botOpenId, locale, model, disableCliBypass, skillPluginDir }) {
+    buildArgs({ sessionId, resume, resumeSessionId, botName, botOpenId, locale, model, disableCliBypass, skillPluginDir, candidateManagedDelivery }) {
       const args: string[] = [];
       if (resume) {
         args.push('--resume', resumeSessionId ?? sessionId);
@@ -660,7 +660,9 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
       // `claude` never surfaces/mis-fires `botmux send` etc.
       args.push('--plugin-dir', CLAUDE_PLUGIN_DIR);
       if (skillPluginDir) args.push('--plugin-dir', skillPluginDir);
-      args.push('--append-system-prompt', buildBotmuxSystemPromptText({ locale, botName, botOpenId }));
+      args.push('--append-system-prompt', candidateManagedDelivery
+        ? buildCandidateManagedDeliverySystemPromptText({ locale })
+        : buildBotmuxSystemPromptText({ locale, botName, botOpenId }));
       return args;
     },
 

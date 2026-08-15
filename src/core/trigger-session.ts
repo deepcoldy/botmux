@@ -239,7 +239,10 @@ async function validateRootMessageTarget(
   return { ok: true, chatId };
 }
 
-function buildExistingSessionContent(
+/** Exported for the candidate prompt-hygiene gate: this is the construction
+ * both existing-session dispatch branches of triggerSessionTurn feed to the
+ * worker, including candidate launch retry / restart continuation. */
+export function buildExistingSessionContent(
   ds: DaemonSession,
   prompt: string,
   larkAppId: string,
@@ -258,6 +261,7 @@ function buildExistingSessionContent(
     larkAppId,
     chatId,
     whiteboardId: ds.session.whiteboardId,
+    candidateManagedDelivery: !!ds.session.candidateRuntimeContract,
     codexAppText,
     codexAppApplicationContext,
     // Only data enters untrusted structured context; connector-owner task and
@@ -644,6 +648,7 @@ export async function triggerSessionTurn(
       larkAppId,
       chatId,
       whiteboardId: newDs.session.whiteboardId,
+      candidateManagedDelivery: !!internal?.candidateRuntimeContract,
       codexAppText,
       codexAppApplicationContext,
       codexAppMessageContext,

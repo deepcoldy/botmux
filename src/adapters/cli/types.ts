@@ -128,6 +128,11 @@ export interface CliAdapter {
     disableCliBypass?: boolean;
     /** Release-frozen CLI feature gates for managed Candidate sessions. */
     disabledFeatures?: string[];
+    /** True for managed Candidate sessions whose final output is delivered by
+     *  BotMux's receipt-endorsed pipeline. `injectsSessionContext` adapters
+     *  swap their `botmux send` routing system prompt for the managed-delivery
+     *  text so the agent never self-delivers or claims a delivery failed. */
+    candidateManagedDelivery?: boolean;
     /** Optional session-scoped skill plugin/root prepared by botmux. */
     skillPluginDir?: string;
     /** True when this session runs under per-bot read isolation (the worker

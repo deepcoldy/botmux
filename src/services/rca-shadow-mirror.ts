@@ -258,6 +258,16 @@ export async function deliverCandidateTurnReceipt(
             && typeof transition.evidence.output === 'string'
             ? { result: transition.evidence.output }
             : {}),
+          ...(transition.status === 'completed'
+            && receipt.outputDelivery?.status === 'delivered'
+            && receipt.outputDelivery.messageId
+            ? {
+                outputDelivery: {
+                  provider: 'lark',
+                  messageId: receipt.outputDelivery.messageId,
+                },
+              }
+            : {}),
           occurredAt: transition.occurredAt,
         }),
         signal: controller.signal,

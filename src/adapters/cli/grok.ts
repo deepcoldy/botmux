@@ -1,7 +1,7 @@
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { resolveCommand } from './registry.js';
-import { buildBotmuxSystemPromptText } from './shared-hints.js';
+import { buildBotmuxSystemPromptText, buildCandidateManagedDeliverySystemPromptText } from './shared-hints.js';
 import type { CliAdapter, PtyHandle } from './types.js';
 import { sessionReadyHookCommand } from '../hook-command.js';
 import { delay, scaleMs } from '../../utils/timing.js';
@@ -133,6 +133,7 @@ export function createGrokAdapter(pathOverride?: string): CliAdapter {
       botOpenId,
       locale,
       larkAppId,
+      candidateManagedDelivery,
     }) {
       const args: string[] = [];
       if (!disableCliBypass) {
@@ -163,15 +164,17 @@ export function createGrokAdapter(pathOverride?: string): CliAdapter {
       // Do NOT use --system-prompt-override — that replaces Grok's agent prompt.
       args.push(
         '--rules',
-        buildBotmuxSystemPromptText({
-          locale,
-          botName,
-          botOpenId,
-          builtinSkillBlock: builtinSkillBlockForInjectsSessionContext(larkAppId, locale, {
-            asksViaHook: false,
-            whiteboardEnabled: whiteboardEnabled(),
+        candidateManagedDelivery
+          ? buildCandidateManagedDeliverySystemPromptText({ locale })
+          : buildBotmuxSystemPromptText({
+            locale,
+            botName,
+            botOpenId,
+            builtinSkillBlock: builtinSkillBlockForInjectsSessionContext(larkAppId, locale, {
+              asksViaHook: false,
+              whiteboardEnabled: whiteboardEnabled(),
+            }),
           }),
-        }),
       );
 
       // Positional initial prompt — processed after TUI startup (works for

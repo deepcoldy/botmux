@@ -6338,6 +6338,7 @@ async function spawnCli(
     model: ttadkGateway ? undefined : cfg.model,
     disableCliBypass: cfg.disableCliBypass === true,
     disabledFeatures: cfg.candidateRuntimeContract?.disabledFeatures,
+    candidateManagedDelivery: !!cfg.candidateRuntimeContract,
     skillPluginDir: cfg.skillPluginDir,
     readIsolation: willReadIsolate,
     // Set (as a pair) by the init handler when hybrid RPC input is engaged;
