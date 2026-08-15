@@ -4303,6 +4303,9 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
       closedMismatchedSessions: closedMismatchedSessions.closed,
       closedMismatchedResidual: closedMismatchedSessions.residual,
       closedMismatchedFailed: closedMismatchedSessions.failed,
+      // Mismatched sessions intentionally left for a later resweep/restore, so a
+      // 200 never implies "everything already converged".
+      closedMismatchedDeferred: closedMismatchedSessions.deferred,
       closedMismatchedResidualTaskIds: closedMismatchedSessions.residualTaskIds,
       // Report the (possibly auto-cleared) read-isolation state + whether the new
       // agent can still enforce it, so the dashboard updates its toggle immediately

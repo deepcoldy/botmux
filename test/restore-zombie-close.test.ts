@@ -1459,11 +1459,46 @@ describe('closeCliMismatchedSessionsForBot — runtime CLI hot-switch sweep', ()
       expect(closeSession).not.toHaveBeenCalled();
     });
 
-    it('BLOCKS the switch on a protected mismatched owner (not a silent skip)', async () => {
-      // Protected is NOT an exemption like adopt/queued: this row would keep
-      // running the old agent and cannot be closed now, so committing the switch
-      // would recreate the config/execution mismatch. The route has its own
-      // preflight; this helper is exported and must fail closed on its own.
+    it('defers a transferring row and CONVERGES it once the transfer settles', async () => {
+      // The sweep runs after the commit, so a row it cannot close now would stay on
+      // the OLD agent forever unless a retry is armed. Master arms one for exactly
+      // this case; not arming it was a real regression — the config said the new
+      // agent while the session kept serving the old one.
+      const relaying = makeActivePersistentSession('om_sw_transfer');
+      sessionStore.updateSession(relaying);
+      const ds = registerDs(relaying);
+      transferState.active.add(ds);
+      // The route commits and mirrors the live config BEFORE sweeping, and the
+      // armed resweep judges by that live config. Reproduce that ordering, or the
+      // retry would compare the session against the pre-switch agent and find
+      // nothing to do — which would make this test pass for the wrong reason.
+      bot.cliId = target.cliId;
+
+      await expect(closeSessionsForAgentSwitch('app_test', target))
+        .resolves.toMatchObject({ closed: 0, failed: 0, deferred: 1 });
+      expect(closeSession).not.toHaveBeenCalledWith(relaying.sessionId);
+
+      // Settle the relay: the armed resweep must finish the job.
+      const callbacks = [...(transferState.callbacks.get(ds) ?? [])];
+      expect(callbacks, 'a deferred resweep must have been armed').toHaveLength(1);
+      transferState.active.delete(ds);
+      for (const callback of callbacks) callback();
+
+      await vi.waitFor(() => {
+        expect(closeSession).toHaveBeenCalledWith(relaying.sessionId);
+        expect(sessionStore.getSession(relaying.sessionId)!.status).toBe('closed');
+      });
+    });
+
+    it('REPORTS a protected mismatched owner as deferred (not a silent skip)', async () => {
+      // Protected is NOT an exemption like adopt/queued: this row keeps running the
+      // OLD agent and cannot be closed yet, so it must never vanish silently.
+      //
+      // It is also not a failure. The sweep runs after the commit, so there is
+      // nothing left to veto, and the daemon already re-runs the bot-level sweep
+      // when the Codex App ledger drains. Reporting it as `failed` would raise an
+      // alarm the operator cannot act on; reporting it as `deferred` tells them a
+      // session is still on the old agent and will converge.
       const protectedRow = makeActivePersistentSession('om_sw_protected');
       // A pending activation head is one of the protected-ownership reasons.
       protectedRow.queuedActivationPending = true;
@@ -1471,7 +1506,7 @@ describe('closeCliMismatchedSessionsForBot — runtime CLI hot-switch sweep', ()
       registerDs(protectedRow);
 
       await expect(closeSessionsForAgentSwitch('app_test', target))
-        .resolves.toMatchObject({ ok: false, closed: 0, failed: 1 });
+        .resolves.toMatchObject({ closed: 0, failed: 0, deferred: 1 });
       expect(closeSession).not.toHaveBeenCalled();
       expect(sessionStore.getSession(protectedRow.sessionId)!.status).toBe('active');
     });

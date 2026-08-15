@@ -511,14 +511,26 @@ export async function closeSessionsForAgentSwitch(
    */
   authority?: SweepAuthorityGuard,
 ): Promise<{
+  /**
+   * Fully converged. NOT a veto — the caller has already committed by the time
+   * this runs, so a false here means "some mismatched row is still alive and is
+   * reported / retried", never "undo the switch".
+   */
   ok: boolean;
   closed: number;
   residual: number;
   failed: number;
+  /**
+   * Mismatched rows deliberately left alive because they cannot be closed yet
+   * (protected ownership, a transfer in flight). Not failures — a deferred
+   * resweep or restore converges them — but NOT silent either: the operator must
+   * be able to see that one session is still on the old agent.
+   */
+  deferred: number;
   residualTaskIds: string[];
 }> {
   const registry = getActiveSessionsRegistry();
-  const out = { ok: true, closed: 0, residual: 0, failed: 0, residualTaskIds: [] as string[] };
+  const out = { ok: true, closed: 0, residual: 0, failed: 0, deferred: 0, residualTaskIds: [] as string[] };
   const seen = new Set<string>();
 
   /** Set once disk diverges (or cannot be trusted): no further row may be closed. */
@@ -581,8 +593,8 @@ export async function closeSessionsForAgentSwitch(
       out.failed++;
       out.ok = false;
       logger.error(
-        `[${sessionId.substring(0, 8)}] agent switch: close REFUSED (${result.error}); `
-        + 'the switch will NOT be committed',
+        `[${sessionId.substring(0, 8)}] agent switch sweep: close REFUSED (${result.error}); `
+        + 'reported to the caller for retry',
       );
       return;
     }
@@ -605,24 +617,26 @@ export async function closeSessionsForAgentSwitch(
     // the bot launches with from now on.
     const dsTarget = await authorityForClose(ds.session.sessionId);
     if (!dsTarget || !sessionMismatchesTargetCli(ds, dsTarget)) continue;
-    // A protected owner is NOT an exemption like adopt/queued: it is a session
-    // that would keep running the old agent and cannot be closed right now, so it
-    // BLOCKS the switch. The route has its own preflight, but this helper is
-    // exported and must not hand back ok:true with such a row still live.
+    // A protected owner cannot be closed right now (an unsettled Codex App FIFO
+    // must survive for recovery). It is NOT a failure of this sweep: the daemon
+    // already re-runs the bot-level sweep when that ledger drains
+    // (onCodexAppLedgerDrained), which is where such a row converges. Counting it
+    // as failed would report an alarm the operator cannot act on.
     if (hasProtectedSessionMutationOwnership(ds)) {
-      out.failed++;
-      out.ok = false;
-      logger.error(
-        `[${ds.session.sessionId.substring(0, 8)}] agent switch: mismatched session has protected `
-        + 'mutation ownership and cannot be closed; the switch will NOT be committed',
+      out.deferred++;
+      logger.warn(
+        `[${ds.session.sessionId.substring(0, 8)}] agent switch sweep: mismatched session has `
+        + 'protected mutation ownership; leaving it to the ledger-drained resweep',
       );
       continue;
     }
     if (isSessionTransferring(ds)) {
-      // A relay in flight cannot be closed here, and committing would strand it on
-      // the old agent — treat it as a blocking failure rather than deferring.
-      out.failed++;
-      out.ok = false;
+      // A relay in flight cannot be closed mid-transfer. Arm the deferred resweep
+      // so it converges once the transfer settles — without this the session stays
+      // on the OLD agent indefinitely, which is the exact symptom this whole
+      // mechanism exists to prevent.
+      out.deferred++;
+      armCliMismatchResweep(ds);
       continue;
     }
     try {
@@ -630,13 +644,17 @@ export async function closeSessionsForAgentSwitch(
       // the config we are about to (not) write.
       recordClose(ds.session.sessionId, await closeSession(ds.session.sessionId));
     } catch (err) {
-      // Collected, not thrown: every remaining row must still be evaluated, or an
-      // early exit leaves unchecked sessions behind a refused switch.
+      // Collected, not thrown: every remaining row must still be evaluated.
+      // The config is ALREADY committed at this point, so this is not a veto — it
+      // is a report plus a retry. Arming the resweep matters: the authority still
+      // matches what we committed (no divergence was detected above), so the
+      // deferred bot-level sweep can safely finish the job.
       out.failed++;
       out.ok = false;
+      armCliMismatchResweep(ds);
       logger.error(
-        `[${ds.session.sessionId.substring(0, 8)}] agent switch: close threw; the switch will NOT `
-        + `be committed: ${err instanceof Error ? err.message : String(err)}`,
+        `[${ds.session.sessionId.substring(0, 8)}] agent switch sweep: close threw; reported and `
+        + `resweep armed: ${err instanceof Error ? err.message : String(err)}`,
       );
     }
   }
@@ -654,14 +672,15 @@ export async function closeSessionsForAgentSwitch(
       && !seen.has(row.sessionId),
     );
   } catch (err) {
-    // The strict projection turns a swallowed read/parse failure into a hard
-    // transaction refusal. An unreadable store must never mean "no old-agent
-    // rows" at the config commit gate.
+    // The strict projection refuses to let a swallowed read/parse failure look
+    // like "no old-agent rows". The route pre-checks this before committing, so
+    // reaching it here means the store broke mid-request: report it rather than
+    // claim a clean sweep.
     out.failed++;
     out.ok = false;
     logger.error(
-      `agent switch: could not read the session store to check durable rows; the switch `
-      + `will NOT be committed: ${err instanceof Error ? err.message : String(err)}`,
+      `agent switch sweep: could not read the session store to check durable rows; `
+      + `reported as incomplete: ${err instanceof Error ? err.message : String(err)}`,
     );
     return out;
   }
@@ -671,25 +690,28 @@ export async function closeSessionsForAgentSwitch(
     const rowTarget = await authorityForClose(row.sessionId);
     if (!rowTarget || !sessionRowMismatchesTargetCli(row, rowTarget)) continue;
     if (hasProtectedSessionMutationOwnership(row)) {
-      out.failed++;
-      out.ok = false;
-      logger.error(
-        `[${row.sessionId.substring(0, 8)}] agent switch: durable mismatched row has protected `
-        + 'mutation ownership; the switch will NOT be committed',
+      out.deferred++;
+      // Same reasoning as the registry loop: not a failure, and not actionable.
+      // A durable-only row has no DaemonSession to arm a deferred resweep on, so
+      // it converges where master already handles such rows — restoreActiveSessions
+      // on the next daemon start, or the ledger-drained resweep once it registers.
+      logger.warn(
+        `[${row.sessionId.substring(0, 8)}] agent switch sweep: durable mismatched row has `
+        + 'protected mutation ownership; leaving it to restore/ledger-drained convergence',
       );
       continue;
     }
     try {
       // closeSession supports the stored-only shape. When cancelling genuinely
-      // needs a runtime owner it returns mojo_close_identity_missing, which
-      // blocks the commit rather than publishing a false success.
+      // needs a runtime owner it returns mojo_close_identity_missing, which is
+      // reported rather than publishing a false success.
       recordClose(row.sessionId, await closeSession(row.sessionId));
     } catch (err) {
       out.failed++;
       out.ok = false;
       logger.error(
-        `[${row.sessionId.substring(0, 8)}] agent switch: durable-row close threw; the switch `
-        + `will NOT be committed: ${err instanceof Error ? err.message : String(err)}`,
+        `[${row.sessionId.substring(0, 8)}] agent switch sweep: durable-row close threw; `
+        + `reported as incomplete: ${err instanceof Error ? err.message : String(err)}`,
       );
     }
   }
