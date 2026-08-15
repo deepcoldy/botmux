@@ -23,7 +23,7 @@
  * Run:  pnpm vitest run test/initial-user-turn-opening.test.ts
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 
@@ -106,6 +106,12 @@ vi.mock('../src/core/worker-pool.js', async () => {
     sendWorkerInput: (...args: any[]) => mocks.sendWorkerInput(...args),
   };
 });
+
+// hook 注入的 preflight：默认 false（不影响现有 codex 测试），特定用例置 true。
+const preflightMock = vi.fn(() => false);
+vi.mock('../src/adapters/hook-installer.js', () => ({
+  hasInstalledPromptHookCached: (...args: any[]) => preflightMock(...args),
+}));
 
 import { registerBot } from '../src/bot-registry.js';
 import { sessionKey } from '../src/core/types.js';
@@ -445,6 +451,42 @@ describe('empty-started session — first real business turn must use the new-to
     expect(opening).not.toContain('<botmux_reminder>');
     expect(mocks.forkWorker.mock.calls[0]?.[2]).toEqual({ resume: false, turnId: 'om_cold_first' });
     expect(ds.session.initialUserTurnPending).toBeUndefined();
+  });
+
+  it('worker-null refork + auto hook: opening 轮不写 speculative sidecar（review 三审 HIGH-3）', async () => {
+    // 三审发现：opening 分支曾无条件先跑 buildReforkCliInput（有写 sidecar 的副作用），
+    // 结果被 buildNewTopicCliInput 覆盖丢弃，但 sidecar 已写入 opening 的 turnId，
+    // opening 的 hook 会领到这份没发出去的 speculative reminder → 双注入。
+    // 修复后 opening 分支直接用 buildNewTopicCliInput（不写 sidecar）。
+    const anchor = 'om_hook_opening_root';
+    const ds = seedEmptyStarted(anchor, { live: false, hasHistory: true, cliId: 'claude-code' });
+    ds.session.backendType = 'pty';
+    // 切到 claude-code + auto hook + preflight 通过
+    const bot = registerBot({
+      larkAppId: APP,
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      allowedUsers: [OWNER],
+      oncallChats: [{ chatId: CHAT, workingDir: '/tmp' }],
+      envelopeInjection: 'auto' as const,
+    });
+    bot.resolvedAllowedUsers = [OWNER];
+    bot.botName = 'TestBot';
+    bot.botOpenId = 'ou_selfbot';
+    preflightMock.mockReturnValue(true);
+
+    await handleThreadReply(
+      makeEventData('om_hook_first', '第一条消息', anchor),
+      makeCtx(anchor, 'om_hook_first'),
+    );
+
+    // opening 用 new-topic 构造，不应有 sidecar 写入
+    const sidecarDir = join(process.env.SESSION_DATA_DIR!, 'prompt-ctx', ds.session.sessionId);
+    expect(existsSync(sidecarDir)).toBe(false);
+    // opening 内容应包含 user_message（new-topic 开场）；claude 系列不内联 routing 块
+    const opening = forkInputs()[0]!.content;
+    expect(opening).toContain('<user_message>');
+    expect(opening).not.toContain('<botmux_reminder>');
   });
 
   it('worker-null refork keeps --resume when a non-IM path already fed the CLI', async () => {

@@ -301,6 +301,12 @@ export interface CliAdapter {
      *  - grok-hooks：写进 `~/.grok/hooks/*.json` 的 SessionStart
      *  命令缺 BOTMUX_* env 时静默 exit 0，不扰独立 CLI。 */
     readonly sessionStartCommand?: string;
+    /** 可选：UserPromptSubmit per-turn 上下文 hook 命令（#794）。
+     *  - claude-settings：写进全局 settings.json 的 hooks.UserPromptSubmit
+     *  hook 子进程按 stdin 的 prompt 内容指纹读回 daemon 预写的 sidecar，
+     *  以 additionalContext 注入为该轮 system-reminder；缺 env/未命中时
+     *  空输出 exit 0（fail-open）。 */
+    readonly userPromptSubmitCommand?: string;
   };
 
   /** true = 该 CLI 的 Hook 已接管 askUserQuestion（不再装 botmux-ask
@@ -368,6 +374,15 @@ export interface CliAdapter {
    *  assistant_final). CodexBridgeQueue's HOL-block-drop keeps attribution
    *  correct for both shapes. */
   readonly supportsTypeAhead?: boolean;
+
+  /** True when this CLI supports a UserPromptSubmit hook whose additionalContext
+   *  is injected as an INVISIBLE system-reminder (not rendered into the visible
+   *  transcript). When true and the per-bot `envelopeInjection` setting is
+   *  `auto`, the daemon moves the per-turn reminder/whiteboard blocks out of the
+   *  user turn text and into a sidecar that `botmux user-prompt-hook` reads back.
+   *  Only set for CLIs verified end-to-end; codex renders hook context as a
+   *  visible developer message and must NOT set this. */
+  readonly supportsInvisiblePromptHook?: boolean;
 
   /** The adapter exposes a transcript-backed end-of-turn boundary that the
    *  worker can report independently of whether fallback output is visible.

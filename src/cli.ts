@@ -11859,6 +11859,118 @@ async function cmdSessionReady(): Promise<void> {
   process.exit(0);
 }
 
+// ─── botmux user-prompt-hook ─────────────────────────────────────────────────
+//
+// Claude 家族 UserPromptSubmit hook 客户端（#794 P1 方向 B）。按 stdin 里
+// `prompt` 的内容指纹，经 daemon IPC 向宿主 claim/pop 该轮的 per-turn envelope
+// （reminder/whiteboard），以 additionalContext 注入为该轮 system-reminder。
+//
+// 为什么走 IPC 而不是直接读文件（review HIGH-1/HIGH-2）：
+// - HIGH-2：`prompt-ctx/<sid>` 在沙箱里是 read-only bind，hook 子进程在沙箱内
+//   unlink 必失败，「读后消费」形同虚设。消费（pop）改到宿主 daemon 执行。
+// - HIGH-1：宿主按 managedTurnOrigin.turnId 权威 turn 绑定精确取，不用 FIFO 猜。
+//   某轮漏 claim 只孤儿化自己那条，不串轮到后续轮；上一轮的 stale sidecar 永远
+//   不会被返回，因此也不需要 inline 文本启发式防双注入。
+//
+// 鉴权双路径（与 /close、/slash 同构）：能读 host secret（非沙箱）走 HMAC；
+// 读不到（沙箱/read-isolation）带本会话 rotating per-turn capability。
+//
+// fail-open 铁律：任何失败（env 缺失 = 非 botmux 会话、daemon 不可达、未命中 =
+// 用户手输或 inline 模式、403/404）都空输出 + exit 0。绝不 exit 2（会阻塞该轮
+// prompt），绝不抛错（Claude 对 hook 失败的兜底是放弃注入，正合预期）。
+async function cmdUserPromptHook(): Promise<void> {
+  // 5s 自限时读 stdin：Claude 写完 payload 会关 stdin，正常情况下立即结束；
+  // 万一上游不关管道，也不能挂住 hook（settings.json 里的 10s timeout 是第二道）。
+  let payloadText = '';
+  try {
+    const chunks: Buffer[] = [];
+    let timedOut = false;
+    const timer = setTimeout(() => { timedOut = true; try { process.stdin.destroy(); } catch { /* */ } }, 5000);
+    if (typeof timer.unref === 'function') timer.unref();
+    for await (const chunk of process.stdin) {
+      if (timedOut) break;
+      chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+    }
+    clearTimeout(timer);
+    payloadText = Buffer.concat(chunks).toString('utf-8');
+  } catch { /* stdin 读不到 → no-op */ }
+
+  const sessionId = process.env.BOTMUX_SESSION_ID;
+  // env 缺失 → adopt / 非 botmux 会话 / 用户手输，静默放行。
+  if (!sessionId) process.exit(0);
+
+  let prompt: string | undefined;
+  try {
+    const p = JSON.parse(payloadText) as { prompt?: unknown };
+    if (typeof p?.prompt === 'string') prompt = p.prompt;
+  } catch { /* 非 JSON → no-op */ }
+  if (!prompt) process.exit(0);
+
+  // 经 daemon IPC claim/pop。沙箱内不能直接 unlink read-only 的 sidecar，
+  // 也不能把目录改可写（会给沙箱里的模型伪造 sidecar 的能力）。
+  // 不需要 inline 检测：daemon 按权威 turnId 取，上一轮的 stale sidecar 不会被返回。
+  try {
+    const [{ fingerprintPromptText, prefixOf }] = await Promise.all([
+      import('./services/prompt-context-store.js'),
+    ]);
+    const larkAppId = process.env.BOTMUX_LARK_APP_ID;
+    let discoveredPort: number | undefined;
+    try { discoveredPort = findDaemon(larkAppId)?.ipcPort; } catch { /* masked/unreadable registry */ }
+    const ipcPort = resolveDaemonIpcPort(
+      discoveredPort,
+      process.env.BOTMUX_DAEMON_IPC_PORT,
+    );
+    if (!ipcPort) process.exit(0);
+
+    const body: Record<string, unknown> = {
+      fingerprint: fingerprintPromptText(prompt),
+      prefix: prefixOf(prompt),
+    };
+    let hostSecret: string | undefined;
+    if (!process.env.BOTMUX_SEND_RELAY) {
+      try { hostSecret = loadDaemonIpcSecret(); } catch { /* Seatbelt/read-isolated CLI */ }
+    }
+    if (!hostSecret) {
+      const claim = readManagedOriginCapability(
+        resolveDataDir(),
+        sessionId,
+        process.env.BOTMUX_SEND_RELAY,
+        process.env.BOTMUX_ORIGIN_CHANNEL_ID,
+      );
+      if (claim) {
+        body.originCapability = claim.capability;
+        if (claim.turnId) body.originTurnId = claim.turnId;
+        if (claim.dispatchAttempt !== undefined) body.originDispatchAttempt = claim.dispatchAttempt;
+      }
+    }
+    const init = {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    } satisfies RequestInit;
+    const path = `/api/sessions/${encodeURIComponent(sessionId)}/prompt-ctx/claim`;
+    const res = hostSecret
+      ? await fetchDaemonIpc(ipcPort, path, init, hostSecret)
+      : await fetch(`http://127.0.0.1:${ipcPort}${path}`, init);
+    if (res.status !== 200) process.exit(0);
+    const data = await res.json() as { envelope?: unknown };
+    const envelope = typeof data?.envelope === 'string' ? data.envelope : undefined;
+    if (envelope) {
+      const payload = JSON.stringify({
+        hookSpecificOutput: { hookEventName: 'UserPromptSubmit', additionalContext: envelope },
+      });
+      // stdout.write 对 pipe 是异步的：直接 process.exit 可能截断（8k 远小于
+      // 64k pipe buffer，几乎不会中，但中了就是 reminder 丢失）。写完再退出，
+      // 并留 1s 兜底防 callback 不触发。
+      process.stdout.write(payload, () => process.exit(0));
+      const timer = setTimeout(() => process.exit(0), 1000);
+      if (typeof timer.unref === 'function') timer.unref();
+      return;
+    }
+  } catch { /* daemon 不可达 / claim 失败 → no-op */ }
+  process.exit(0);
+}
+
 async function cmdBots(sub: string, rest: string[]): Promise<void> {
   process.env.SESSION_DATA_DIR ??= resolveDataDir();
 
@@ -13166,6 +13278,12 @@ switch (command) {
     // `botmux session-ready` — Claude 家族 SessionStart hook 客户端，通知 daemon
     // 已越过外层 selector；worker 再等待 hook 后的新 prompt 证据。
     await cmdSessionReady();
+    break;
+  }
+  case 'user-prompt-hook': {
+    // `botmux user-prompt-hook` — Claude 家族 UserPromptSubmit hook 客户端，
+    // 按内容指纹读回 per-turn sidecar 并注入为该轮 system-reminder（#794）。
+    await cmdUserPromptHook();
     break;
   }
   case 'workflow': {

@@ -927,6 +927,46 @@ describe('RiffBackend', () => {
     });
   });
 
+  describe('JWT resolved after attachment prep (safety-window sampling point)', () => {
+    it('reads the JWT AFTER slow attachment reads, right before fetch', async () => {
+      const be = makeBackend({ injectStatusLines: false });
+      be.spawn('', [], {} as any);
+
+      const order: string[] = [];
+      // Slow attachment read: records its ordering and yields to the event loop.
+      (be as any).readFileAsBlob = async (_p: string) => {
+        order.push('readFileAsBlob');
+        await new Promise((r) => setTimeout(r, 5));
+        return new Blob(['x']);
+      };
+      // getJwt must be sampled AFTER the attachment prep so the safety-window
+      // freshness check reflects the token that actually goes on the wire.
+      const realGetJwt = (be as any).getJwt.bind(be);
+      (be as any).getJwt = () => { order.push('getJwt'); return realGetJwt(); };
+
+      be.write('hello <attachments><file path="/tmp/a.bin" name="a.bin"/></attachments>');
+      // The write runs through the async writeChain, then a 5ms attachment read,
+      // then fetch — give it enough turns to reach the (manually-resolved) fetch.
+      for (let i = 0; i < 6; i++) await flush();
+      await new Promise((r) => setTimeout(r, 10));
+      for (let i = 0; i < 4; i++) await flush();
+      resolvers.shift()?.(taskResponse('task-1'));
+      await flush();
+
+      // The upload actually carried the JWT header…
+      const exec = calls.find((c) => c.url.includes('/api/task-execute'));
+      expect(exec, `no task-execute; calls=${calls.map((c) => c.url).join(',')}; order=${JSON.stringify(order)}`).toBeTruthy();
+      expect((exec!.init?.headers as any)?.['x-jwt-token']).toBe('test-jwt');
+      // …and the create-path JWT was sampled AFTER the attachment read (a later
+      // getJwt from the SSE stream connection may follow — we only require that
+      // the FIRST getJwt, the one on the create request, comes after the read).
+      const firstRead = order.indexOf('readFileAsBlob');
+      const firstJwt = order.indexOf('getJwt');
+      expect(firstRead).toBeGreaterThanOrEqual(0);
+      expect(firstJwt).toBeGreaterThan(firstRead);
+    });
+  });
+
   describe('agent hardcode + reasoning effort', () => {
     it('always sends agent=codex, even when legacy config still says aiden', async () => {
       const be = makeBackend({ injectStatusLines: false, agent: 'aiden' });

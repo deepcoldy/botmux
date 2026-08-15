@@ -1262,6 +1262,13 @@ export interface BotConfig {
    * preserves the legacy XML-ish prompt byte-for-byte. Codex App only. */
   codexAppCleanInput?: boolean;
   /**
+   * Per-turn 上下文注入方式（#794）。`auto`：对支持的 CLI（目前仅 claude-code），
+   * 把 reminder/whiteboard 从 user turn 文本挪到 UserPromptSubmit hook 注入的
+   * system-reminder，终端输入框只保留消息本身；不支持的 CLI 自动回退内联。
+   * 缺省/`off`：保持内联 envelope（历史行为）。从下一个 follow-up turn 生效。
+   */
+  envelopeInjection?: 'auto' | 'off';
+  /**
    * Codex only (opt-in, experimental): deliver user input via the app-server
    * JSON-RPC channel instead of a tmux paste. The pane runs `codex --remote`
    * attached to a botmux-owned app-server thread, so input can't be dropped by

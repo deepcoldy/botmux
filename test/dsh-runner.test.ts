@@ -51,7 +51,11 @@ async function waitFor(
   throw new Error(`timed out waiting for ${label}`);
 }
 
-function spawnRunner(scenario: string, extraArgs: string[] = []): Harness {
+function spawnRunner(
+  scenario: string,
+  extraArgs: string[] = [],
+  envOverrides: NodeJS.ProcessEnv = {},
+): Harness {
   const home = mkdtempSync(join(tmpdir(), 'dsh-runner-test-'));
   const logPath = join(home, 'prompts.jsonl');
   const child = spawn(process.execPath, ['--import', 'tsx', RUNNER_PATH,
@@ -67,6 +71,8 @@ function spawnRunner(scenario: string, extraArgs: string[] = []): Harness {
       HOME: home,
       FAKE_DSH_SCENARIO: scenario,
       FAKE_DSH_LOG: logPath,
+      DSH_CORDIS_CONFIG: '',
+      ...envOverrides,
     },
   });
   liveChildren.add(child);
@@ -120,6 +126,29 @@ describe('dsh-runner', () => {
     expect(h.stdout).toContain('✓ bash');
     // The vendored config was materialized under HOME.
     expect(existsSync(join(h.home, '.botmux', 'dsh', 'cordis.yml'))).toBe(true);
+  });
+
+  it('fails fast when DSH_CORDIS_CONFIG points to a missing file', async () => {
+    const missingConfig = join(tmpdir(), `botmux-dsh-missing-config-${process.pid}-${Date.now()}.yml`);
+    h = spawnRunner('happy', [], { DSH_CORDIS_CONFIG: missingConfig });
+    const exitPromise = new Promise<number | null>(resolve => h!.child.on('exit', resolve));
+    const code = await exitPromise;
+
+    expect(code).toBe(1);
+    expect(h.stderr).toContain(`DSH_CORDIS_CONFIG does not exist: ${missingConfig}`);
+    expect(h.stdout).not.toContain('dsh connected');
+    expect(h.stdout).not.toContain('›');
+    expect(existsSync(join(h.home, '.botmux', 'dsh', 'cordis.yml'))).toBe(false);
+  });
+
+  it('uses an existing DSH_CORDIS_CONFIG without materializing the vendored config', async () => {
+    h = spawnRunner('happy', [], { DSH_CORDIS_CONFIG: FAKE_SERVER });
+    await waitFor(() => h.stdout.includes('›'), { label: 'ready marker' });
+
+    h.child.stdin.write(makeFrame('使用显式配置'));
+    await waitFor(() => parseMarkers(h.stdout).some(m => m.kind === 'final'), { label: 'final marker' });
+
+    expect(existsSync(join(h.home, '.botmux', 'dsh', 'cordis.yml'))).toBe(false);
   });
 
   it('injects the identity preamble only on the first turn (multi-turn)', async () => {
@@ -242,6 +271,38 @@ describe('dsh-runner', () => {
     // EXECUTED turn and must carry the identity preamble.
     expect(prompts[1].prompt.contentBlocks[0].text).toContain('<botmux_identity>');
     expect(prompts[1].prompt.contentBlocks[0].text).toContain('第二次');
+  });
+
+  it('rejects a prompt ACK without a message id instead of waiting for the turn watchdog', async () => {
+    h = spawnRunner('bad-prompt-ack', ['--turn-timeout-ms', '10000']);
+    await waitFor(() => h.stdout.includes('›'), { label: 'ready marker' });
+
+    h.child.stdin.write(makeFrame('第一次'));
+    await waitFor(() => parseMarkers(h.stdout).filter(m => m.kind === 'final').length >= 1, {
+      timeout: 3000,
+      label: 'protocol error final',
+    });
+    const errorFinal = parseMarkers(h.stdout).find(m => m.kind === 'final')!;
+    expect(errorFinal.payload.content).toContain('session/prompt returned no message id');
+
+    h.child.stdin.write(makeFrame('第二次'));
+    await waitFor(() => parseMarkers(h.stdout).filter(m => m.kind === 'final').length >= 2, { label: 'success final' });
+
+    const prompts = readPrompts(h);
+    expect(prompts).toHaveLength(2);
+    expect(prompts[1].prompt.contentBlocks[0].text).toContain('<botmux_identity>');
+    expect(prompts[1].prompt.contentBlocks[0].text).toContain('第二次');
+  });
+
+  it('rejects an initialize response without a server identity', async () => {
+    h = spawnRunner('bad-initialize');
+    const exitPromise = new Promise<number | null>(resolve => h!.child.on('exit', resolve));
+    const code = await exitPromise;
+
+    expect(code).toBe(1);
+    expect(h.stderr).toContain('initialize returned no server identity');
+    expect(h.stdout).not.toContain('dsh connected');
+    expect(h.stdout).not.toContain('›');
   });
 
   it('reaps a wedged turn with the watchdog and exits for restart', async () => {

@@ -5,7 +5,7 @@
  */
 import { existsSync, statSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
-import { basename, join, resolve } from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
 import { expandHome } from './working-dir.js';
 import { config } from '../config.js';
 import * as sessionStore from '../services/session-store.js';
@@ -14,6 +14,8 @@ import { downloadMessageResource, listChatBotMembers, UserTokenMissingError } fr
 import { logger } from '../utils/logger.js';
 import { forkWorker, sendWorkerInput, promoteQueuedActivationTail, forkAdoptWorker, adoptSandboxBlocked, killStalePids, sweepDeadPidMarkers, getCurrentCliVersion, restoreUsageLimitRuntimeState, setActiveSessionSafe, setActiveSessionIfActive, isDisposableCommandScratch, isRelayableRealSession, closeSession, getActiveSessionsRegistry, suspendWorker, withActiveSessionKeyLock, isSessionTransferring, deferUntilSessionTransferSettled } from './worker-pool.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
+import type { CliAdapter } from '../adapters/cli/types.js';
+import { botHomePath } from '../adapters/cli/read-isolation.js';
 import { buildBotmuxShellHints } from '../adapters/cli/shared-hints.js';
 import {
   resolveSkillInjectionModeForApp,
@@ -82,6 +84,8 @@ import { beginReplyTargetTurn } from './reply-target.js';
 import { readDeferredTopicBinding, removeDeferredTopicBinding } from './deferred-topic-binding.js';
 import { escapeXmlTagLikeTokens } from '../utils/xml.js';
 import { chatAppLink, threadAppLink, normalizeBrand } from '../im/lark/lark-hosts.js';
+import { writePromptContext } from '../services/prompt-context-store.js';
+import { hasInstalledPromptHookCached } from '../adapters/hook-installer.js';
 
 export { getAttachmentsDir } from './attachment-path.js';
 
@@ -1139,12 +1143,45 @@ export function buildNewTopicCliInput(
  * Mirrors buildNewTopicPrompt structure but for subsequent messages.
  * Session ID is omitted for adopt mode and CLIs with injectsSessionContext.
  */
-export function buildFollowUpContent(
+type FollowUpBlockKey = 'sessionId' | 'role' | 'summaryMemory' | 'reminder' | 'whiteboard' | 'userMessage' | 'sender' | 'substitute' | 'senderNote' | 'attachments' | 'mentions';
+
+/**
+ * 按既有顺序构造 follow-up 的各个块。inline 模式直接 join；hook 模式
+ * （#794）把 reminder/whiteboard 挪进 sidecar，其余块照常 join 进 PTY 文本。
+ */
+/** follow-up 构建选项。sessionBackendType 取会话冻结的后端类型（非当前 bot 配置，
+ *  那些是 next-session 生效），用于判断该会话是否有本地 Claude hook 进程。 */
+type FollowUpOpts = {
+  attachments?: LarkAttachment[];
+  mentions?: LarkMention[];
+  isAdoptMode?: boolean;
+  cliId?: CliId;
+  cliPathOverride?: string;
+  locale?: Locale;
+  sender?: ResolvedSender;
+  larkAppId?: string;
+  chatId?: string;
+  whiteboardId?: string;
+  substituteTrigger?: SubstituteTrigger;
+  codexAppText?: string;
+  codexAppApplicationContext?: string;
+  codexAppMessageContext?: string;
+  /** 会话冻结的后端类型（ds.session.backendType）。riff 等远端后端没有本地
+   *  Claude hook 进程，强制 inline 模式。 */
+  sessionBackendType?: BackendType;
+  /** 本轮的权威 turnId（= 发给 worker 的 turnId，最终成为 managedTurnOrigin.turnId）。
+   *  hook 模式下 sidecar 按 (turnId, fingerprint) 绑定，claim 时按权威 turnId 精确取。
+   *  缺失时无法做 turn 绑定，回退 inline（避免 reminder 被剥离却无 sidecar 可领）。 */
+  turnId?: string;
+};
+
+function buildFollowUpBlocks(
   content: string,
   sessionId: string,
-  opts?: { attachments?: LarkAttachment[]; mentions?: LarkMention[]; isAdoptMode?: boolean; cliId?: CliId; cliPathOverride?: string; locale?: Locale; sender?: ResolvedSender; larkAppId?: string; chatId?: string; whiteboardId?: string; substituteTrigger?: SubstituteTrigger; codexAppText?: string; codexAppApplicationContext?: string; codexAppMessageContext?: string },
-): string {
-  const parts: string[] = [];
+  opts?: FollowUpOpts,
+  hookMode = false,
+): Array<{ key: FollowUpBlockKey; text: string }> {
+  const blocks: Array<{ key: FollowUpBlockKey; text: string }> = [];
   const roleBlock = renderRoleContextBlock(opts?.larkAppId, opts?.chatId, { followUp: true });
   const whiteboardBlock = renderWhiteboardBlock({ whiteboardId: opts?.whiteboardId });
   const summaryMemoryBlock = renderSummaryMemoryBlock(opts?.larkAppId);
@@ -1157,9 +1194,9 @@ export function buildFollowUpContent(
   // per-turn available context, so place it right after <botmux_reminder> and
   // before <user_message> — consistent with new-topic/refork — not after the
   // user's text. Per-turn attribution (sender/attachments/mentions) stays after.
-  if (!skipSessionId) parts.push(`<session_id>${xmlEscape(sessionId)}</session_id>`);
-  if (roleBlock) parts.push(roleBlock);
-  if (summaryMemoryBlock) parts.push(summaryMemoryBlock);
+  if (!skipSessionId) blocks.push({ key: 'sessionId', text: `<session_id>${xmlEscape(sessionId)}</session_id>` });
+  if (roleBlock) blocks.push({ key: 'role', text: roleBlock });
+  if (summaryMemoryBlock) blocks.push({ key: 'summaryMemory', text: summaryMemoryBlock });
   if (opts?.cliId !== 'mira') {
     // All non-Mira CLIs — including Hermes, which no longer gets reverse
     // send-first guidance (#653) and now shares this standard path — get the
@@ -1167,39 +1204,153 @@ export function buildFollowUpContent(
     // (config.noVisibleOutputHint, default OFF); otherwise the reminder is
     // byte-for-byte the pre-feature baseline. Live-read so a Settings flip
     // applies to the next follow-up turn without a daemon restart.
-    const reminder = t(config.noVisibleOutputHint ? 'ai.followup.reminder_no_resend' : 'ai.followup.reminder', undefined, opts?.locale);
-    parts.push(`<botmux_reminder>${reminder}</botmux_reminder>`);
+    // hook 模式（#794）：reminder 经 system-reminder 离带注入，命令式措辞可能触发
+    // 模型的注入防御被表面化，改用描述式的 reminder_hook。
+    const reminderKey = hookMode
+      ? 'ai.followup.reminder_hook'
+      : config.noVisibleOutputHint ? 'ai.followup.reminder_no_resend' : 'ai.followup.reminder';
+    const reminder = t(reminderKey, undefined, opts?.locale);
+    blocks.push({ key: 'reminder', text: `<botmux_reminder>${reminder}</botmux_reminder>` });
   }
-  if (whiteboardBlock) parts.push(whiteboardBlock);
+  if (whiteboardBlock) blocks.push({ key: 'whiteboard', text: whiteboardBlock });
 
-  parts.push(`<user_message>\n${content}\n</user_message>`);
+  blocks.push({ key: 'userMessage', text: `<user_message>\n${content}\n</user_message>` });
 
   const senderBlock = renderSenderTag(opts?.sender);
-  if (senderBlock) parts.push(senderBlock);
+  if (senderBlock) blocks.push({ key: 'sender', text: senderBlock });
 
   const substituteBlock = renderSubstituteTrigger(opts?.substituteTrigger);
-  if (substituteBlock) parts.push(substituteBlock);
+  if (substituteBlock) blocks.push({ key: 'substitute', text: substituteBlock });
 
   const senderNote = renderCursorSenderNote(opts?.cliId, !!senderBlock, opts?.locale);
-  if (senderNote) parts.push(senderNote);
+  if (senderNote) blocks.push({ key: 'senderNote', text: senderNote });
 
   const attachHint = opts?.attachments && opts.attachments.length > 0
     ? formatAttachmentsHint(opts.attachments, opts.locale)
     : '';
-  if (attachHint) parts.push(attachHint);
+  if (attachHint) blocks.push({ key: 'attachments', text: attachHint });
 
   const mentionBlock = renderMentionBlock(opts?.mentions);
-  if (mentionBlock) parts.push(mentionBlock);
+  if (mentionBlock) blocks.push({ key: 'mentions', text: mentionBlock });
 
-  return parts.join('\n\n');
+  return blocks;
+}
+
+export function buildFollowUpContent(
+  content: string,
+  sessionId: string,
+  opts?: FollowUpOpts,
+): string {
+  return buildFollowUpBlocks(content, sessionId, opts).map((b) => b.text).join('\n\n');
+}
+
+/**
+ * UserPromptSubmit hook 注入的单条 additionalContext 大小上限（#794）。
+ * Claude Code 对超过 10k 字符的 additionalContext 会落文件传路径（模型需额外
+ * 工具调用读取，行为分叉）；8k 留余量。超限的轮次回退 inline 模式。
+ */
+const HOOK_ENVELOPE_MAX_CHARS = 8000;
+
+/**
+ * 判定该 follow-up 是否走 hook 注入模式（#794 P1 方向 B）。四重条件全部满足：
+ *  1. 适配器支持不可见 system-reminder 注入（目前仅 claude-code）；
+ *  2. per-bot 开关 envelopeInjection=auto（默认 off）；
+ *  3. preflight：botmux 的 UserPromptSubmit hook 已装进 **CLI 实际读取的** settings
+ *     （read-isolation 下是 per-bot BOT_HOME 那份，不是全局）；
+ *  4. （在 buildFollowUpCliInput 里）envelope 不超 8k。
+ * 任一不满足 → inline（现状字节不变）。
+ */
+function resolveEnvelopeInjectionMode(opts?: FollowUpOpts): 'hook' | 'inline' {
+  if (!opts?.cliId) return 'inline';
+  // 远端后端（riff 等）没有本地 Claude hook 进程，sidecar 写了没人读，
+  // 必须用会话冻结的 backendType（不是当前 bot 配置，那是 next-session 生效）。
+  // 只有确知在本地跑 CLI 的后端才允许 hook 模式（白名单）。未来新增远端后端
+  // 时默认 inline，不会静默丢 reminder（review hardening：黑名单会漏）。
+  const LOCAL_BACKENDS = new Set(['pty', 'tmux', 'herdr', 'zellij', 'zmx']);
+  // fail-closed（review B3）：sessionBackendType 缺失（null/undefined）时不再短路
+  // 放过，强制 inline。现网 spawn 的 reconcileRiffBackendType 已把 claude-code 钉在
+  // 本地后端，此条是防未来远端后端的硬化；所有调用点都传 ds.session.backendType。
+  if (!opts.sessionBackendType || !LOCAL_BACKENDS.has(opts.sessionBackendType)) return 'inline';
+  let adapter: CliAdapter;
+  try {
+    adapter = createCliAdapterSync(opts.cliId, opts.cliPathOverride);
+  } catch { return 'inline'; }
+  if (!adapter.supportsInvisiblePromptHook || !adapter.hookInstall?.userPromptSubmitCommand) return 'inline';
+  if (!opts.larkAppId) return 'inline';
+  let botConfig: BotConfig;
+  try {
+    botConfig = getBot(opts.larkAppId).config;
+  } catch { return 'inline'; }
+  if (botConfig.envelopeInjection !== 'auto') return 'inline';
+  const effectivePath = effectivePromptHookConfigPath(adapter, botConfig, opts.larkAppId, opts.sessionBackendType);
+  if (!effectivePath || !hasInstalledPromptHookCached(effectivePath)) return 'inline';
+  return 'hook';
+}
+
+/**
+ * 与 worker 的 willRedirectCliData 同条件，算出 CLI 实际读取的 Claude settings 路径。
+ * read-isolation（sandbox + supportsReadIsolation + 无 wrapperCli + 非 riff 后端）
+ * 下，CLI 经 CLAUDE_CONFIG_DIR 读 per-bot `<BOT_HOME>/claude/settings.json`；
+ * preflight 必须查这份而不是全局——per-bot 安装是 best-effort（provisionIsolatedBotHome
+ * 吞异常），查全局会把安装失败误判为已装，导致该 session 每轮系统性丢 reminder。
+ *
+ * 与 worker willRedirectCliData 的微差保持一致：
+ *  - backendType !== 'riff'：riff 后端的 CLI 跑在远端，本地 settings 不适用，
+ *    hook 模式对它无意义（远端没有 botmux hook，sidecar 写了没人读）。
+ *  - process.env.SESSION_DATA_DIR（不用 config.session.dataDir 的 packagedDataDir
+ *    fallback）：daemon 进程必有此 env，与 worker 严格一致。
+ *  - dirname 派生：与 worker 的 botHomePath(dirname(SESSION_DATA_DIR), appId) 相同。
+ */
+function effectivePromptHookConfigPath(
+  adapter: CliAdapter,
+  botConfig: BotConfig,
+  larkAppId: string,
+  sessionBackendType?: BackendType,
+): string | undefined {
+  const base = adapter.hookInstall?.configPath;
+  if (!base) return undefined;
+  const sandboxRequested = botConfig.sandbox === true
+    || botConfig.readIsolation === true
+    || process.env.BOTMUX_SANDBOX === '1';
+  const willRedirect = sandboxRequested
+    && adapter.supportsReadIsolation === true
+    && !botConfig.wrapperCli
+    && (sessionBackendType ?? botConfig.backendType) !== 'riff'
+    && !!process.env.SESSION_DATA_DIR;
+  if (!willRedirect) return base;
+  const dataDir = process.env.SESSION_DATA_DIR;
+  if (!dataDir) return base;
+  const botmuxHome = dirname(dataDir);
+  return join(botHomePath(botmuxHome, larkAppId), 'claude', 'settings.json');
 }
 
 /** Follow-up counterpart of buildNewTopicCliInput. */
 export function buildFollowUpCliInput(
   content: string,
   sessionId: string,
-  opts?: { attachments?: LarkAttachment[]; mentions?: LarkMention[]; isAdoptMode?: boolean; cliId?: CliId; cliPathOverride?: string; locale?: Locale; sender?: ResolvedSender; larkAppId?: string; chatId?: string; whiteboardId?: string; substituteTrigger?: SubstituteTrigger; codexAppText?: string; codexAppApplicationContext?: string; codexAppMessageContext?: string },
+  opts?: FollowUpOpts,
 ): CliTurnPayload {
+  // hook 注入模式（#794）：reminder/whiteboard 写入 per-turn sidecar，PTY 文本只保留
+  // 其余块。超限或无条件时回退 inline（legacy 路径），行为与历史完全一致。
+  // turnId 是 claim 的权威键：缺失时无法做 turn 绑定，回退 inline（避免 reminder 被
+  // 剥离却无 sidecar 可领）。
+  const hookTurnId = opts?.turnId;
+  if (resolveEnvelopeInjectionMode(opts) === 'hook' && hookTurnId) {
+    const blocks = buildFollowUpBlocks(content, sessionId, opts, true);
+    const ptyText = blocks
+      .filter((b) => b.key !== 'reminder' && b.key !== 'whiteboard')
+      .map((b) => b.text)
+      .join('\n\n');
+    const hookEnvelope = blocks
+      .filter((b) => b.key === 'reminder' || b.key === 'whiteboard')
+      .map((b) => b.text)
+      .join('\n\n');
+    if (hookEnvelope && hookEnvelope.length <= HOOK_ENVELOPE_MAX_CHARS) {
+      writePromptContext(sessionId, hookTurnId, ptyText, hookEnvelope);
+      return { content: ptyText };
+    }
+    // 无 envelope（理论上不会发生：claude-code 必有 reminder）或超限 → 回退 inline。
+  }
   const legacyContent = buildFollowUpContent(content, sessionId, opts);
   if (opts?.cliId !== 'codex-app' || opts.isAdoptMode) return { content: legacyContent };
   const roleBlock = renderRoleContextBlock(opts.larkAppId, opts.chatId, { followUp: true });
@@ -1362,6 +1513,7 @@ export function buildReforkPrompt(
     larkAppId: ds.larkAppId,
     chatId: ds.session.chatId,
     whiteboardId: ds.session.whiteboardId,
+    sessionBackendType: ds.session.backendType,
   });
 }
 
@@ -1382,6 +1534,7 @@ export function buildReforkCliInput(
     codexAppText?: string;
     codexAppApplicationContext?: string;
     codexAppMessageContext?: string;
+    turnId?: string;
   },
 ): CliTurnPayload {
   const locale = opts?.locale ?? localeForBot(ds.larkAppId);
@@ -1406,6 +1559,8 @@ export function buildReforkCliInput(
     larkAppId: ds.larkAppId,
     chatId: ds.session.chatId,
     whiteboardId: ds.session.whiteboardId,
+    sessionBackendType: ds.session.backendType,
+    turnId: opts?.turnId,
     substituteTrigger: opts?.substituteTrigger,
     codexAppText: opts?.codexAppText,
     codexAppApplicationContext: opts?.codexAppApplicationContext,
@@ -2944,6 +3099,8 @@ export async function executeScheduledTask(
           larkAppId,
           chatId: task.chatId,
           whiteboardId: existing.session.whiteboardId,
+          sessionBackendType: existing.session.backendType,
+          turnId: scheduledTurnId,
         });
         rememberLastCliInput(existing, task.prompt, input);
         if (silent) armSilentScheduledTurn(existing, scheduledTurnId);

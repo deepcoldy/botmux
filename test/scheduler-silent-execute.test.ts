@@ -142,6 +142,12 @@ vi.mock('../src/services/whiteboard-store.js', () => ({
   ensureDefaultWhiteboard: vi.fn(),
 }));
 
+// 让 hook 模式的 preflight 通过：否则 riff 守卫的接线测试会因为 preflight false 而
+// 恒为 inline，锁不住 executeScheduledTask → buildFollowUpCliInput 的 sessionBackendType 传参。
+vi.mock('../src/adapters/hook-installer.js', () => ({
+  hasInstalledPromptHookCached: vi.fn(() => true),
+}));
+
 import { executeScheduledTask, rememberLastCliInput } from '../src/core/session-manager.js';
 import { sessionKey } from '../src/core/types.js';
 
@@ -507,6 +513,57 @@ describe('executeScheduledTask — live-session injection', () => {
     const injected = sendWorkerInputMock.mock.calls[0][1];
     const content = typeof injected === 'string' ? injected : injected.content;
     expect(content).toContain('<botmux_silent_schedule');
+  });
+
+  it('riff-backed claude-code session: scheduled fire stays inline（锁 sessionBackendType 传参）', async () => {
+    // review 要求：executeScheduledTask → buildFollowUpCliInput 必须传 sessionBackendType。
+    // 删掉该实参，旧代码（&& 短路）会让 riff 会话误进 hook 模式（reminder 不在 PTY 文本里，
+    // 远端又读不到 sidecar → reminder 丢失）。preflight 已 mock 为 true，唯一拦它的就是 riff 白名单。
+    const prev = (BOT.config as Record<string, unknown>).envelopeInjection;
+    (BOT.config as Record<string, unknown>).envelopeInjection = 'auto';
+    try {
+      const active = new Map<string, DaemonSession>();
+      const existing = liveSession('idle');
+      existing.session.cliId = 'claude-code';
+      existing.session.backendType = 'riff' as never;
+      active.set(sessionKey(ROOT, APP), existing);
+
+      await executeScheduledTask(baseTask({ rootMessageId: ROOT, scope: 'thread', silent: true }), active, refreshCliVersion);
+
+      expect(sendWorkerInputMock).toHaveBeenCalledTimes(1);
+      const injected = sendWorkerInputMock.mock.calls[0][1];
+      const content = typeof injected === 'string' ? injected : injected.content;
+      // riff 后端没有本地 hook 进程 → 必须 inline（reminder 在 PTY 文本里）
+      expect(content).toContain('<botmux_reminder>');
+    } finally {
+      (BOT.config as Record<string, unknown>).envelopeInjection = prev;
+    }
+  });
+
+  it('local-backend claude-code session + auto: scheduled fire 走 hook 模式（锁 sessionBackendType 传参）', async () => {
+    // 与上一条互补：本地后端（pty）+ auto 应走 hook 模式（reminder 不在 PTY 文本里）。
+    // 若有人删掉 executeScheduledTask 里的 sessionBackendType 实参，B3 fail-closed 会把
+    // undefined 判为非本地 → 强制 inline → reminder 出现在 PTY 文本里 → 本测试失败。
+    const prev = (BOT.config as Record<string, unknown>).envelopeInjection;
+    (BOT.config as Record<string, unknown>).envelopeInjection = 'auto';
+    try {
+      const active = new Map<string, DaemonSession>();
+      const existing = liveSession('idle');
+      existing.session.cliId = 'claude-code';
+      existing.session.backendType = 'pty' as never;
+      active.set(sessionKey(ROOT, APP), existing);
+
+      await executeScheduledTask(baseTask({ rootMessageId: ROOT, scope: 'thread', silent: true }), active, refreshCliVersion);
+
+      expect(sendWorkerInputMock).toHaveBeenCalledTimes(1);
+      const injected = sendWorkerInputMock.mock.calls[0][1];
+      const content = typeof injected === 'string' ? injected : injected.content;
+      // 本地后端 + auto → hook 模式：reminder 进 sidecar，PTY 文本里没有
+      expect(content).not.toContain('<botmux_reminder>');
+      expect(content).toContain('<user_message>');
+    } finally {
+      (BOT.config as Record<string, unknown>).envelopeInjection = prev;
+    }
   });
 
   it('busy session: arms only the queued scheduled turn without hushing the user turn', async () => {
