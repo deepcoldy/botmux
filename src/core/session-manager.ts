@@ -593,16 +593,31 @@ export async function closeSessionsForAgentSwitch(
    * stale, so a sweep driven by it closes sessions the new config endorses.
    *
    * So every close is re-justified against the row on disk, and the moment disk
-   * stops matching what we committed the sweep STOPS — "miss rather than
-   * mis-close". Convergence is not lost: whoever committed that newer authority
-   * runs its own commit-then-sweep, and `armCliMismatchResweep` retries.
+   * stops matching what we committed the sweep STOPS, leaving the remaining rows
+   * to whoever committed that newer authority.
    *
-   * Residual, stated honestly: the decision is correct when made, against durable
-   * state, but a close takes time (seconds for a remote CLI) and disk can change
-   * during it. Eliminating that too requires either a per-bot fence honoured by
-   * EVERY writer — unreachable while bots.json stays hand-editable — or moving
-   * convergence to turn admission. What this rules out is the far worse case of
-   * deciding against state that was already wrong.
+   * KNOWN LIMIT — READ -> CLOSE IS NOT ATOMIC
+   * -----------------------------------------
+   * This narrows the window; it does NOT close it, and the residual failure mode
+   * includes MIS-CLOSING, not just missing a close:
+   *
+   *   session frozen on C; disk says B
+   *   -> the check reads B and correctly rules the session stale
+   *   -> closeSession() runs (seconds, for a remote CLI)
+   *   -> another writer commits C while that close is in flight
+   *   -> the session was re-endorsed by the new authority, yet it is closed
+   *
+   * The guarantee is therefore only "the decision was correct against durable
+   * state at the instant it was made", not "no session the current authority
+   * endorses is ever closed". Do not describe this as merely losing a close.
+   *
+   * Eliminating it needs one of:
+   *   1. a per-bot cross-process fence honoured by EVERY authority writer and held
+   *      across the close — out of reach while bots.json stays hand-editable and
+   *      older daemons can write it; or
+   *   2. not closing from the config-switch request at all: let turn
+   *      admission/resume read the fresh authority and isolate/refuse the stale
+   *      session there, so nothing irreversible happens on a stale premise.
    */
   authority?: SweepAuthorityGuard,
 ): Promise<{
@@ -618,7 +633,8 @@ export async function closeSessionsForAgentSwitch(
   /**
    * Mismatched rows deliberately left alive because they cannot be closed yet
    * (protected ownership, a transfer in flight). Not failures — a deferred
-   * resweep or restore converges them — but NOT silent either: the operator must
+   * resweep or restore is EXPECTED to pick them up — best effort, not guaranteed —
+   * but NOT silent either: the operator must
    * be able to see that one session is still on the old agent.
    */
   deferred: number;
@@ -697,15 +713,20 @@ export async function closeSessionsForAgentSwitch(
       out.failed++;
       out.ok = false;
       // A REFUSAL is a modelled failure path (e.g. mojo_cancel_failed), not an
-      // exception — so it needs the same compensation as the throw path. Without
-      // it the config is committed while the old-agent session stays alive with
-      // nothing scheduled to converge it. The retry re-reads the durable
-      // authority before closing (confirmMismatchAgainstDisk), so arming it
-      // cannot resurrect the stale-target problem.
+      // exception, so it gets the same treatment as the throw path: report it and
+      // schedule ONE retry. The retry re-reads the durable authority before
+      // closing (confirmMismatchAgainstDisk), so arming it cannot resurrect the
+      // stale-target problem.
+      //
+      // BEST EFFORT, NOT GUARANTEED CONVERGENCE: if that retry refuses again, the
+      // bot-level sweep it runs through only counts the failure and returns — no
+      // further attempt is scheduled. A row can therefore stay on the old agent
+      // until some later trigger (a restore, a ledger drain, another switch). The
+      // failure is reported to the caller so it is at least visible.
       //
       // Every modelled refusal from closeSession carries retryable:true, so no
       // extra filter is needed here; a future non-retryable shape would show up as
-      // a type error on this branch rather than silently skipping compensation.
+      // a type error on this branch rather than silently skipping the retry.
       if (ds) armCliMismatchResweep(ds);
       logger.error(
         `[${sessionId.substring(0, 8)}] agent switch sweep: close REFUSED (${result.error}); `
@@ -740,7 +761,8 @@ export async function closeSessionsForAgentSwitch(
     // A protected owner cannot be closed right now (an unsettled Codex App FIFO
     // must survive for recovery). It is NOT a failure of this sweep: the daemon
     // already re-runs the bot-level sweep when that ledger drains
-    // (onCodexAppLedgerDrained), which is where such a row converges. Counting it
+    // (onCodexAppLedgerDrained), which is where such a row is normally picked up.
+    // That is a trigger, not a guarantee. Counting it
     // as failed would report an alarm the operator cannot act on.
     if (hasProtectedSessionMutationOwnership(ds)) {
       out.deferred++;
