@@ -14896,6 +14896,8 @@ body.touch.has-token #mobile-input-bar[data-mode="live"] #mobile-input{color:tra
 #mobile-live-hint{display:none;position:absolute;inset:0;pointer-events:none;align-items:center;
   padding:0 56px 0 14px;color:#565f89;font:12px -apple-system,sans-serif;white-space:nowrap;overflow:hidden}
 body.touch.has-token #mobile-input-bar[data-mode="live"] #mobile-live-hint{display:flex}
+/* live mode: the hint replaces the placeholder — hide both to avoid overlap */
+body.touch.has-token #mobile-input-bar[data-mode="live"] #mobile-input::placeholder{color:transparent}
 </style>
 </head>
 <body>
