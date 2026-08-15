@@ -421,6 +421,7 @@ describe('worker structured-turn status wiring', () => {
     expect(stop).toContain('for (const [ownerKey, identity] of [...rpcTurnsAwaitingActivationIdentities])');
     expect(stop).toContain("'rpc_engine_teardown_before_turn_start_ack'");
     const notify = functionSlice('notifyRpcTeardownBeforeActivation', 'stopCodexRpcEngine');
+    expect(notify).toContain('settlesTurn: true');
     expect(notify).toContain('为避免重复执行未自动重发');
     expect(notify).toContain('兜底输出可能未被捕获');
     expect(stop).toContain('turn.finalText === undefined');

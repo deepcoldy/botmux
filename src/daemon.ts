@@ -49,7 +49,7 @@ import {
 } from './core/supervisor-shutdown-protocol.js';
 import { readSupervisorProcessStartIdentity } from './core/process-start-identity.js';
 import { statSync } from 'node:fs';
-import { addReaction, deleteMessage, getChatContext, getChatMode, getChatNameAndMode, getMessageChatId, listChatMemberOpenIds, MessageWithdrawnError, replyMessage, resolveAllowedUsersWithMap, sendMessage, sendUserMessage, updateMessage, type EntryResolveStatus } from './im/lark/client.js';
+import { addReaction, deleteMessage, getChatContext, getChatMode, getChatNameAndMode, getMessageChatId, listChatMemberOpenIds, MessageWithdrawnError, removeReaction, replyMessage, resolveAllowedUsersWithMap, sendMessage, sendUserMessage, updateMessage, type EntryResolveStatus } from './im/lark/client.js';
 import { resolveGroupJoinPrompt, waitForAllowedUserInChat } from './core/auto-start.js';
 import {
   loadBotConfigAtIndex,
@@ -157,7 +157,6 @@ import {
   setCurrentCliVersion,
   getCurrentCliVersion,
   CARD_POSTING_SENTINEL,
-  parkStreamCard,
   closeSession as closeSessionHelper,
   setActiveSessionIfActive,
   rollbackRejectedSessionAndGetWinner,
@@ -172,6 +171,7 @@ import {
   getDaemonBootId,
   getDaemonStreamingCardUsageSnapshot,
   postTurnStartingCard,
+  reuseThreadStreamingCardForTurn,
   isSessionTransferring,
   snapshotCodexAppFinalSettlements,
   codexAppFinalSettlementCount,
@@ -3135,7 +3135,7 @@ export async function noteTurnReceived(
   triggerMessageId: string,
   _prompt?: string,
   _sender?: { name?: string },
-  _turnId?: string,
+  turnId?: string,
   receivedReactionEmoji?: string,
 ): Promise<void> {
   // Replaces the old 「处理中」 placeholder card. That card existed only to be
@@ -3145,10 +3145,10 @@ export async function noteTurnReceived(
   // fresh message (deliverFinalOutput / `botmux send`).
   //
   // This call site is the per-message acceptance point, so it also drives the
-  // two-phase turn reaction. It's auto-enabled exactly for card-off sessions
-  // (streaming card disabled): those have no live status card, so the ✋→✅ on
-  // the user's message is the only lightweight progress signal. Bots can opt
-  // out via silentTurnReactions for low-noise observer scenarios.
+  // turn reaction. Card-off sessions retain the existing received→DONE flow.
+  // Thread sessions also react while their stable status card is running, then
+  // remove that reaction after the reply lands so a reused card never makes a
+  // newly accepted turn feel silent. Bots can opt out via silentTurnReactions.
   // React 冲! on the triggering message the instant it's accepted. Binding to the
   // message — not a worker status edge — means type-ahead / busy-batched messages
   // each get their own ✋. `finishTurnReactions` flips every pending ✋ to ✅ when
@@ -3156,7 +3156,9 @@ export async function noteTurnReceived(
   if (ds.session.vcMeetingReceiver) return;
   // Turn-exact card-off check: the reaction ack belongs to THIS message's turn,
   // not to whichever turn most recently overwrote currentReplyTarget.
-  if (!streamingCardDisabledFor(ds, triggerMessageId)) return;
+  const cardDisabled = streamingCardDisabledFor(ds, turnId ?? triggerMessageId);
+  const clearOnReply = ds.scope === 'thread' && !cardDisabled;
+  if (!cardDisabled && !clearOnReply) return;
   if (silentTurnReactionsFor(ds)) return;
   // Only Lark messages carry reactions — doc-comment ids / chat anchors can't.
   if (!triggerMessageId.startsWith('om_')) return;
@@ -3174,7 +3176,31 @@ export async function noteTurnReceived(
     logger.debug(`[reaction] received add failed for ${triggerMessageId}: ${err instanceof Error ? err.message : String(err)}`);
     return;
   }
-  (ds.pendingAckReactions ??= []).push({ messageId: triggerMessageId, reactionId });
+  (ds.pendingAckReactions ??= []).push({
+    messageId: triggerMessageId,
+    reactionId,
+    turnId: turnId ?? triggerMessageId,
+    ...(clearOnReply ? { clearOnReply: true } : {}),
+  });
+}
+
+/** Undo the progress reaction when a turn never reaches durable worker
+ * ownership. Detach the exact turn before awaiting Lark so a concurrent reply
+ * signal cannot remove the same reaction twice. */
+async function discardTurnReceivedReaction(ds: DaemonSession, turnId: string): Promise<void> {
+  const list = ds.pendingAckReactions;
+  if (!list || list.length === 0) return;
+  const discarded = list.filter(ack => (ack.turnId ?? ack.messageId) === turnId);
+  if (discarded.length === 0) return;
+  ds.pendingAckReactions = list.filter(ack => !discarded.includes(ack));
+  for (const ack of discarded) {
+    if (!ack.reactionId) continue;
+    try {
+      await removeReaction(ds.larkAppId, ack.messageId, ack.reactionId);
+    } catch (err) {
+      logger.debug(`[reaction] failed to clear unaccepted reaction ${ack.reactionId}: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
 }
 
 async function sessionReply(
@@ -4314,12 +4340,10 @@ function getActiveCount(): number {
 }
 
 /**
- * Freeze the previous turn's streaming card at "idle" and mark a new turn so the
- * next screen_update from the worker POSTs a fresh streaming card instead of
- * PATCH-ing the previous one. Shared by the normal-message path and the
- * passthrough slash-command path (/model, /clear, /compact, etc.) — without
- * this, passthrough commands silently PATCH the previous card and the user
- * sees no visible response.
+ * Start a new streaming-card turn. Thread sessions PATCH their existing status
+ * card in place; flat chat sessions freeze the previous card and POST a fresh
+ * one so the new activity remains visible in the main timeline. Shared by the
+ * normal-message and passthrough slash-command paths.
  */
 function beginNewTurn(ds: DaemonSession, title: string, turnId: string): void {
   // docCommentTargets 改为 per-turn map（按 turnId 索引），不再需要每轮清空：
@@ -4329,6 +4353,13 @@ function beginNewTurn(ds: DaemonSession, title: string, turnId: string): void {
   // in. A new turn returns to the config default (noCardChats / disableStreamingCard).
   // Use `/card on` to persistently restore cards for the chat.
   ds.streamingCardForced = undefined;
+  if (reuseThreadStreamingCardForTurn(ds, title, turnId)) return;
+  if (ds.scope === 'thread') {
+    // Card-off turns have no visual surface to own. Leaving an exact turn fence
+    // here would make an older turn's idle look visually superseded and skip
+    // its dashboard/reaction settlement.
+    ds.streamCardVisualTurnId = streamingCardDisabledFor(ds, turnId) ? undefined : turnId;
+  }
   const previousUsageLimit = ds.usageLimit;
   const previousStatus = ds.lastScreenStatus === 'limited' && previousUsageLimit ? 'limited' : 'idle';
   if (ds.streamCardId && workerHasInitialized(ds)) {
@@ -4417,7 +4448,6 @@ async function prewarmDocCommentSession(ds: DaemonSession, sub: DocSubscription)
     );
   }
 
-  beginNewTurn(ds, title, turnId);
   ds.lastMessageAt = Date.now();
   ds.session.lastMessageAt = new Date(ds.lastMessageAt).toISOString();
   if (sub.workingDir && (!ds.worker || ds.worker.killed)) {
@@ -4439,11 +4469,11 @@ async function prewarmDocCommentSession(ds: DaemonSession, sub: DocSubscription)
       mode: 'live',
       turnId,
     });
-    rememberLastCliInput(ds, promptContent, cliInput);
-    sessionStore.updateSession(ds.session);
     if (!sendWorkerInput(ds, cliInput, turnId)) {
       throw new Error('doc-watch warmup worker input was not accepted');
     }
+    rememberLastCliInput(ds, promptContent, cliInput);
+    beginNewTurn(ds, title, turnId);
     markSessionActivity(ds);
   } else {
     ensureSessionWhiteboard(ds);
@@ -4457,9 +4487,11 @@ async function prewarmDocCommentSession(ds: DaemonSession, sub: DocSubscription)
       mode: 'refork',
       turnId,
     });
+    if (!forkWorker(ds, wrappedInput, ds.hasHistory)) {
+      throw new Error('doc-watch warmup worker fork was not accepted');
+    }
     rememberLastCliInput(ds, promptContent, wrappedInput);
-    sessionStore.updateSession(ds.session);
-    forkWorker(ds, wrappedInput, ds.hasHistory);
+    beginNewTurn(ds, title, turnId);
   }
   logger.info(`[${tag(ds)}] doc-comment watch prewarm injected file=${sub.fileToken.slice(0, 12)}`);
 }
@@ -16472,12 +16504,12 @@ export const __testOnly_onQueuedActivationSubmitted = onQueuedActivationSubmitte
  * deliberately no await between the final buffered-input snapshot, fork, and
  * release: a later handler either buffers before this block or observes the
  * live worker after it. */
-function forkReservedInitialSession(ds: DaemonSession, availableBots: AvailableBot[]): void {
+function forkReservedInitialSession(ds: DaemonSession, availableBots: AvailableBot[]): boolean {
   const userPrompt = ds.pendingPrompt ?? '';
   const input = buildReservedInitialInput(ds, availableBots);
   rememberLastCliInput(ds, userPrompt, input);
   const turnId = ds.pendingTurnId ?? ds.session.pendingRepoSetup?.turnId;
-  forkWorker(ds, input, turnId ? { turnId } : false);
+  if (!forkWorker(ds, input, turnId ? { turnId } : false)) return false;
   ds.pendingTurnId = undefined;
   // A no-project pendingRepo fallback enters forkWorker with `session.queued`
   // still set. forkWorker materializes the exact opening as a tokened
@@ -16492,6 +16524,24 @@ function forkReservedInitialSession(ds: DaemonSession, availableBots: AvailableB
     // A follower may have reserved FIFO order while the opening prompt was
     // still being built. Hand off now, or defer until its reservation settles.
     void releaseQueuedActivationReservation(ds);
+  }
+  return true;
+}
+
+/** A pinned initial session has no durable pending-repo journal. If its fork
+ * fails, undo the reaction registered immediately before admission. */
+async function forkPinnedInitialSession(
+  ds: DaemonSession,
+  availableBots: AvailableBot[],
+  turnId: string,
+): Promise<void> {
+  try {
+    if (!forkReservedInitialSession(ds, availableBots)) {
+      throw new Error(`Worker refused pinned initial turn ${turnId}`);
+    }
+  } catch (err) {
+    await discardTurnReceivedReaction(ds, turnId);
+    throw err;
   }
 }
 
@@ -16703,13 +16753,22 @@ function deliverPassthroughToExistingSession(
     // clearing the marker would lose the opening for the next real turn.
     // `/model` on an empty-started session therefore stays literal and the
     // FOLLOWING business message still opens as a new topic.
-    beginNewTurn(ds, commandContent, turn.messageId);
-    sendWorkerSessionInput(ds, {
+    const accepted = sendWorkerSessionInput(ds, {
       type: 'raw_input',
       content: commandContent,
       turnId: turn.messageId,
     });
+    if (!accepted) {
+      void sessionReply(
+        anchor,
+        tr('daemon.cmd_needs_active_cli', { cmd }, localeForBot(larkAppId)),
+        'text',
+        larkAppId,
+      );
+      return;
+    }
     turn.onDelivered?.();
+    beginNewTurn(ds, commandContent, turn.messageId);
     markSessionActivity(ds);
     logger.info(`[${anchor.substring(0, 12)}] Passthrough ${cmd} → worker`);
     return;
@@ -17731,7 +17790,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     });
     const availableBots = await getAvailableBots(larkAppId, chatId);
     await noteTurnReceived(ds, messageId, content, newTopicSender, messageId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
-    forkReservedInitialSession(ds, availableBots);
+    await forkPinnedInitialSession(ds, availableBots, messageId);
     // fork 成功即开场已交给 CLI；fork 抛错则开场只存在于内存，保持重发提示。
     markIngressAdmitted(ctx);
     const reason = oncallEntry
@@ -18204,11 +18263,12 @@ async function handleBotAdded(
       }
       await noteTurnReceived(ds, anchor, promptBody);
       if (joinBootstrapWasTakenOver()) {
+        await discardTurnReceivedReaction(ds, anchor);
         withdrawSharedReplySeed();
         return;
       }
       armSharedReplyTarget();
-      forkReservedInitialSession(ds, availableBots);
+      await forkPinnedInitialSession(ds, availableBots, anchor);
       ds.pendingTurnId = undefined;
       ds.pendingChatContext = undefined;
       logger.info(`[auto-start:入群] ${chatId.substring(0, 12)} 自动开工（${mode}/${scope}），workingDir=${pinnedWorkingDir}`);
@@ -18253,6 +18313,7 @@ async function handleBotAdded(
       }
       await noteTurnReceived(ds, anchor, promptBody);
       if (joinBootstrapWasTakenOver()) {
+        await discardTurnReceivedReaction(ds, anchor);
         withdrawSharedReplySeed();
         return;
       }
@@ -19423,7 +19484,7 @@ async function handleThreadReplyAdmitted(
       ensureSessionWhiteboard(newDs);
       const availableBots = await getAvailableBots(larkAppId, autoCreateChatId);
       await noteTurnReceived(newDs, parsed.messageId, parsed.content, autoCreateSender, parsed.messageId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
-      forkReservedInitialSession(newDs, availableBots);
+      await forkPinnedInitialSession(newDs, availableBots, parsed.messageId);
       // fork 成功即开场已交给 CLI；fork 抛错则开场只存在于内存，保持重发提示。
       markIngressAdmitted(ctx);
       const reason = oncallEntry
@@ -19550,7 +19611,6 @@ async function handleThreadReplyAdmitted(
         sessionBackendType: ds.session.backendType,
         turnId: parsed.messageId,
         });
-    beginNewTurn(ds, parsed.content, parsed.messageId);
     await noteTurnReceived(ds, parsed.messageId, parsed.content, turnSender, parsed.messageId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
     // Codex App steer authorization was computed ONCE before the branch split
     // above (R4-B1); reuse the same frozen value here for the live-worker path.
@@ -19568,45 +19628,25 @@ async function handleThreadReplyAdmitted(
         // 消息已实际送入 live worker——之后的收尾失败不得再诱导重发。
         markIngressAdmitted(ctx);
         rememberLastCliInput(ds, promptContent, cliInput);
+        // A stable thread card represents work that the CLI actually accepted.
+        // Keep the previous completed card intact when the live worker refuses
+        // or throws before admission.
+        beginNewTurn(ds, parsed.content, parsed.messageId);
       }
       else logger.warn(`[${tag(ds)}] Inbound ${parsed.messageId} was not accepted by the live worker`);
     } finally {
       // The opening is one-shot: give it back when the worker died / refused,
       // so the next message re-opens instead of silently losing the context.
       if (openingTurn && !accepted) releaseInitialUserTurn(ds);
+      if (!accepted) await discardTurnReceivedReaction(ds, parsed.messageId);
     }
   } else {
-    // Worker not running — re-fork with resume. This is a NEW turn, so drop
-    // any restored streaming-card reference; worker_ready will POST a fresh
-    // card instead of PATCHing the previous turn's card in place.
+    // Worker not running — re-fork with resume. Thread sessions keep their
+    // stable status card for worker_ready to PATCH; flat chats retain the
+    // fresh-card handoff so new activity appears in the main timeline.
     logger.info(`[${tag(ds)}] Worker not running, re-forking...`);
     // 飞书消息轮（非文档评论轮）：docCommentTargets 是 per-turn map，本轮 turnId
     // 不会命中文档评论的 key，无需显式清盘。
-    if (ds.usageLimitRetryTimer) {
-      clearTimeout(ds.usageLimitRetryTimer);
-      ds.usageLimitRetryTimer = undefined;
-    }
-    ds.usageLimit = undefined;
-    ds.currentTurnTitle = parsed.content.substring(0, 50);
-    // The cosmetic freeze step (above) is gated on a live worker. With no
-    // worker we just park the current card in frozenCards — the upcoming
-    // new POST will recall it. Parking instead of deleting preserves the
-    // "old card stays until a new one is live" invariant: if fork /
-    // worker_ready / POST fails, the user still sees the previous card.
-    parkStreamCard(ds);
-    ds.streamCardId = undefined;
-    ds.streamCardNonce = undefined;
-    // This is a new turn even though the worker is currently down. Force the
-    // first screen_update from the re-forked worker to POST a fresh card and
-    // drop any persisted screenshot from the previous turn. Otherwise a stale
-    // image_key (for example an old Claude Code frame) can be reused on the
-    // new Worker card until the next screenshot upload, which makes a fresh
-    // @mention appear to resurrect the wrong CLI UI.
-    ds.streamCardPending = true;
-    ds.streamCardPendingTurnId = parsed.messageId;
-    ds.streamCardTurnGeneration = (ds.streamCardTurnGeneration ?? 0) + 1;
-    ds.currentImageKey = undefined;
-    persistStreamCardState(ds);
     // Wrap the user message in the same `<user_message>` / `<session_id>` /
     // `<botmux_reminder>` envelope as live-worker turns. Without this, the
     // initial prompt that worker queues for the freshly-spawned CLI is the
@@ -19675,7 +19715,7 @@ async function handleThreadReplyAdmitted(
       await stageCurrentBehindQueuedActivation();
       try {
         const recoverThroughCodexLedger = (ds.session.cliId ?? dsBotCfgForFork.cliId) === 'codex-app';
-        forkWorker(
+        const recoveryAccepted = forkWorker(
           ds,
           recoverThroughCodexLedger ? '' : (ds.session.queuedActivationInput ?? ''),
           {
@@ -19684,6 +19724,7 @@ async function handleThreadReplyAdmitted(
             dispatchAttempt: ds.session.queuedActivationDispatchAttempt,
           },
         );
+        if (recoveryAccepted) beginNewTurn(ds, parsed.content, parsed.messageId);
         if (ownsInitialStartClaim()) retainInitialStartClaim = true;
       } catch (err) {
         ds.initialStartPending = false;
@@ -19702,11 +19743,12 @@ async function handleThreadReplyAdmitted(
     if (retainedQueuedActivation) {
       await stageCurrentBehindQueuedActivation();
       try {
-        forkWorker(ds, retainedQueuedActivation, {
+        const recoveryAccepted = forkWorker(ds, retainedQueuedActivation, {
           resume: ds.hasHistory,
           turnId: ds.session.queuedActivationTurnId,
           dispatchAttempt: ds.session.queuedActivationDispatchAttempt,
         });
+        if (recoveryAccepted) beginNewTurn(ds, parsed.content, parsed.messageId);
         if (ownsInitialStartClaim()) retainInitialStartClaim = true;
       } catch (err) {
         // Keep the staged tail for a later activation attempt, but release the
@@ -19847,12 +19889,22 @@ async function handleThreadReplyAdmitted(
       }
     } catch (e) {
       if (openingTurn) releaseInitialUserTurn(ds);
+      if (!queuedHasDurableTail) await discardTurnReceivedReaction(ds, parsed.messageId);
       throw e;
     }
     // refork 成功才算本轮已交给 CLI。fork 抛错（rethrow）或返回 false（quarantine /
     // 会话已非 active 的不抛错拒绝腿）时，本轮只存在于内存、无 durable 兜底，
     // 必须保持「请重发」提示——与 live 分支按 accepted 打标对称。
-    if (reforkAccepted) markIngressAdmitted(ctx);
+    if (reforkAccepted) {
+      markIngressAdmitted(ctx);
+      // The stable card changes owner only after the replacement worker has
+      // accepted this turn. beginNewTurn also binds fresh-card reforks where no
+      // reusable message id exists, so their worker events cannot inherit the
+      // previous turn's visual fence.
+      beginNewTurn(ds, parsed.content, parsed.messageId);
+    } else if (!queuedHasDurableTail) {
+      await discardTurnReceivedReaction(ds, parsed.messageId);
+    }
     // Record the input as the session's last real CLI turn ONLY after the fork
     // succeeded. Recording before the fork (the old order) persisted lastCliInput
     // for a turn that never launched when forkWorker threw; the retry then read
@@ -20204,7 +20256,6 @@ async function handleDocCommentAdmitted(ctx: DocCommentContext): Promise<boolean
           mode: 'live',
           turnId,
         });
-        beginNewTurn(ds, text, turnId);
         (ds.session.docCommentTargets ??= {})[turnId] = docTarget; // per-turn map，不覆盖其他并发轮
         // rememberLastCliInput persists both the exact comment target and the
         // structured sidecar before any worker-visible delivery can occur.
@@ -20217,23 +20268,13 @@ async function handleDocCommentAdmitted(ctx: DocCommentContext): Promise<boolean
         if (!sendWorkerInput(ds, cliInput, turnId)) {
           throw new Error('worker became unavailable during comment:live-send');
         }
+        beginNewTurn(ds, text, turnId);
         logger.info(`[${tag(ds)}] doc-comment turn injected (turn ${turnId.slice(0, 8)})`);
         return;
       }
 
       // Worker 挂起 / 已退出 —— resume 重 fork（与 handleThreadReply 同路）。
       logger.info(`[${tag(ds)}] Worker not running for doc-comment, re-forking...`);
-      if (ds.usageLimitRetryTimer) { clearTimeout(ds.usageLimitRetryTimer); ds.usageLimitRetryTimer = undefined; }
-      ds.usageLimit = undefined;
-      ds.currentTurnTitle = text.substring(0, 50);
-      parkStreamCard(ds);
-      ds.streamCardId = undefined;
-      ds.streamCardNonce = undefined;
-      ds.streamCardPending = true;
-      ds.streamCardPendingTurnId = turnId;
-      ds.streamCardTurnGeneration = (ds.streamCardTurnGeneration ?? 0) + 1;
-      ds.currentImageKey = undefined;
-      persistStreamCardState(ds);
       // Skip whiteboard ensure for adopted (bridge) sessions on re-fork — mirrors
       // the live-worker branch above (if (!isBridge) ensure…).
       if (!ds.adoptedFrom) ensureSessionWhiteboard(ds);
@@ -20258,8 +20299,11 @@ async function handleDocCommentAdmitted(ctx: DocCommentContext): Promise<boolean
       if (ds.adoptedFrom) {
         forkAdoptWorker(ds, { prompt: wrappedInput.content, turnId });
       } else {
-        forkWorker(ds, wrappedInput, { resume: ds.hasHistory, turnId });
+        if (!forkWorker(ds, wrappedInput, { resume: ds.hasHistory, turnId })) {
+          throw new Error('doc-comment refork was not accepted');
+        }
       }
+      beginNewTurn(ds, text, turnId);
     }, cleanupFailedDelivery);
   } catch (err) {
     if (err instanceof DocCommentDeferredError) {

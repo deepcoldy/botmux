@@ -615,6 +615,31 @@ describe('daemon-session wrappers', () => {
     });
   });
 
+  it('attributes a late settlement to its exact turn caller', () => {
+    vi.mocked(getSessionTokenUsage).mockReturnValue(cumulative(100, 10));
+    const exactDs = {
+      ...ds,
+      session: {
+        ...ds.session,
+        lastCallerOpenId: 'ou_newer_turn',
+        replyTargets: {
+          om_older_turn: {
+            updatedAt: '2026-06-10T11:59:00Z',
+            senderOpenId: 'ou_older_turn',
+          },
+        },
+      },
+    } as any;
+
+    const rec = recordUsageForDaemonSession(exactDs, {
+      ledgerDir: dir,
+      now: new Date('2026-06-10T12:00:00Z'),
+      turnId: 'om_older_turn',
+    });
+
+    expect(rec?.callerOpenId).toBe('ou_older_turn');
+  });
+
   it('does nothing when the transcript has no usage', () => {
     vi.mocked(getSessionTokenUsage).mockReturnValue(null);
 

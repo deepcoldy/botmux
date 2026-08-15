@@ -221,6 +221,9 @@ export interface DaemonSession {
   streamCardTurnGeneration?: number;
   /** Exact newest turn awaiting its own streaming card. In-memory only. */
   streamCardPendingTurnId?: string;
+  /** Exact accepted turn whose visual events may mutate the stable thread card.
+   * Older worker screen/screenshot events are ignored after type-ahead. */
+  streamCardVisualTurnId?: string;
   pendingLocalCliButtonRefresh?: boolean; // true when cli_session_id arrived while the streaming card POST was in flight
   pendingRiffUrlCardRefresh?: boolean; // true when riff_access_url arrived while the streaming card POST was in flight
   /** Set on sessions restored after a daemon restart: suppresses the automatic
@@ -246,13 +249,16 @@ export interface DaemonSession {
    *  command so a user can manually summon a live card in an otherwise-quiet
    *  session. In-memory only (resets on daemon restart). */
   streamingCardForced?: boolean;
-  /** Two-phase turn reactions (auto-on for card-off sessions, i.e. streaming
-   *  card disabled). The bot reacts 冲! on each user message the moment it's accepted for the session
-   *  (bound to the message, NOT a worker status edge — so type-ahead / busy-
-   *  batched messages each get their own reaction). Every pending ✋ here is
-   *  flipped to ✅ when the turn returns to idle. In-memory only (a daemon
-   *  restart mid-turn just leaves a stale ✋ — purely cosmetic). */
-  pendingAckReactions?: Array<{ messageId: string; reactionId?: string }>;
+  /** Turn progress reactions bound to the triggering user message. Card-off
+   *  turns flip the received reaction to DONE at idle; thread turns with a
+   *  live status card remove it only once the reply is delivered. In-memory
+   *  only. */
+  pendingAckReactions?: Array<{
+    messageId: string;
+    reactionId?: string;
+    turnId?: string;
+    clearOnReply?: boolean;
+  }>;
   /** Card body display mode. Default 'hidden'. When user clicks 显示输出, defaults to 'screenshot'. */
   displayMode?: DisplayMode;
   /** Latest uploaded screenshot image_key for the streaming card. */
@@ -328,6 +334,11 @@ export interface DaemonSession {
   cardPatchInFlight?: boolean;    // true while a card PATCH is in-flight
   pendingCardJson?: string;       // queued card JSON — flushed when in-flight PATCH completes (latest wins)
   pendingCardId?: string;         // card message_id captured at schedule time — prevents stale reads when streamCardId changes between schedule and flush
+  pendingCardTurnId?: string;     // exact turn that produced pendingCardJson; undefined for predecessor/auxiliary snapshots
+  /** Exact reused-card turn that should fall back to POST if any same-turn
+   *  PATCH fails. Kept across successful PATCHes for the active generation;
+   *  in-memory only. */
+  pendingCardWithdrawFallback?: { turnId: string; generation: number };
   frozenCards?: Map<string, FrozenCard>;  // nonce → FrozenCard (historical cards' cached state for toggle)
   /** Wait Mode / HTTP Sync integration: pending Promise handlers for synchronous
    *  webhook triggers waiting for a response in this session. Key is turnId. */

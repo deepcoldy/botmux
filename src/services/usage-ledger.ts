@@ -429,6 +429,12 @@ interface DaemonSessionLedgerOpts {
   ledgerDir?: string;
 }
 
+interface DaemonSessionUsageRecordOpts extends DaemonSessionLedgerOpts {
+  /** Exact settled turn. Used only by recordUsageForDaemonSession so a late
+   *  turn boundary cannot borrow a newer turn's caller attribution. */
+  turnId?: string;
+}
+
 /** The CLI-native session id a ledger record should carry. coco is spawned
  *  with `--session-id <botmux sessionId>` and the worker never sets a separate
  *  cliSessionId (there is nothing to adopt) — but the botmux session id IS
@@ -441,9 +447,16 @@ function ledgerCliSessionId(s: { cliId?: string; sessionId: string; cliSessionId
   return s.cliId === 'coco' ? s.sessionId : undefined;
 }
 
-function ledgerArgsForDaemonSession(ds: DaemonSession): Omit<RecordSessionUsageArgs, 'usage'> & { usage: SessionTokenUsage | null } {
+function ledgerArgsForDaemonSession(
+  ds: DaemonSession,
+  turnId?: string,
+): Omit<RecordSessionUsageArgs, 'usage'> & { usage: SessionTokenUsage | null } {
   const s = ds.session;
   const workingDir = ds.workingDir ?? s.workingDir;
+  const exactCallerOpenId = turnId
+    ? (s.replyTargets?.[turnId]?.senderOpenId
+      ?? (s.quoteTargetId === turnId ? s.quoteTargetSenderOpenId : undefined))
+    : undefined;
   // fresh: ledger snapshots are turn-boundary exact — bypass the dashboard
   // read throttle (incremental folding keeps this cheap).
   const usage = getSessionTokenUsage({
@@ -463,16 +476,19 @@ function ledgerArgsForDaemonSession(ds: DaemonSession): Omit<RecordSessionUsageA
     chatId: s.chatId,
     title: s.title,
     workingDir,
-    callerOpenId: s.lastCallerOpenId ?? s.creatorOpenId ?? s.ownerOpenId,
+    callerOpenId: turnId
+      ? (exactCallerOpenId ?? s.creatorOpenId ?? s.ownerOpenId)
+      : (s.lastCallerOpenId ?? s.creatorOpenId ?? s.ownerOpenId),
   };
 }
 
 /** Turn boundary (idle/limited edge, session close): append the delta. */
-export function recordUsageForDaemonSession(ds: DaemonSession, opts?: DaemonSessionLedgerOpts): UsageLedgerRecord | null {
+export function recordUsageForDaemonSession(ds: DaemonSession, opts?: DaemonSessionUsageRecordOpts): UsageLedgerRecord | null {
   try {
-    const args = ledgerArgsForDaemonSession(ds);
+    const { turnId, ...recordOpts } = opts ?? {};
+    const args = ledgerArgsForDaemonSession(ds, turnId);
     if (!args.usage) return null;
-    return recordSessionUsage({ ...args, usage: args.usage, ...opts });
+    return recordSessionUsage({ ...args, usage: args.usage, ...recordOpts });
   } catch (err: any) {
     logger.error(`usage-ledger: failed to record daemon session usage: ${err?.message ?? err}`);
     return null;

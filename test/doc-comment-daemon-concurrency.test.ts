@@ -409,8 +409,12 @@ describe('document-comment routing integration', () => {
     expect(region).toMatch(/const generation = captureRoutingGeneration\(ds\);[\s\S]*await resolveSender[\s\S]*ensureCurrentRoutingGeneration\(generation, 'prewarm:sender'\)/);
     const guard = region.indexOf("ensureCurrentRoutingGeneration(generation, 'prewarm:sender')");
     expect(guard).toBeGreaterThanOrEqual(0);
-    expect(region.indexOf('beginNewTurn(ds, title, turnId)')).toBeGreaterThan(guard);
-    expect(region.indexOf('sendWorkerInput(ds, cliInput', guard)).toBeGreaterThan(guard);
+    const liveSend = region.indexOf('sendWorkerInput(ds, cliInput', guard);
+    expect(liveSend).toBeGreaterThan(guard);
+    const remember = region.indexOf('rememberLastCliInput(ds, promptContent, cliInput)');
+    const begin = region.indexOf('beginNewTurn(ds, title, turnId)');
+    expect(remember).toBeGreaterThan(liveSend);
+    expect(begin).toBeGreaterThan(remember);
     expect(region.indexOf('forkWorker(ds, wrappedInput', guard)).toBeGreaterThan(guard);
   });
 
@@ -420,7 +424,9 @@ describe('document-comment routing integration', () => {
     expect(region).toMatch(/await addCommentReaction[\s\S]*ensureCurrentRoutingGeneration\(generation, 'comment:reaction'\)/);
     expect(region).toMatch(/await resolveSender[\s\S]*ensureCurrentRoutingGeneration\(generation, 'comment:sender'\)/);
     expect(region).toMatch(/await noteTurnReceived[\s\S]*ensureCurrentRoutingGeneration\(generation, 'comment:live-note'\)[\s\S]*sendWorkerInput/);
+    expect(region).toMatch(/sendWorkerInput\(ds, cliInput, turnId\)[\s\S]*beginNewTurn\(ds, text, turnId\)/);
     expect(region).toMatch(/await noteTurnReceived[\s\S]*ensureCurrentRoutingGeneration\(generation, 'comment:refork-note'\)[\s\S]*forkWorker/);
+    expect(region).toMatch(/forkWorker\(ds, wrappedInput, \{ resume: ds\.hasHistory, turnId \}\)[\s\S]*beginNewTurn\(ds, text, turnId\)/);
   });
 
   it('rolls back only this turn target and an already-landed Typing reaction before releasing the claim', () => {

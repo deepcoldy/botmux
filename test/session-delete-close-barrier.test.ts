@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { config } from '../src/config.js';
 import { dashboardEventBus, type DashboardEvent } from '../src/core/dashboard-events.js';
 import * as docComment from '../src/im/lark/doc-comment.js';
+import * as larkClient from '../src/im/lark/client.js';
 import * as workerPool from '../src/core/worker-pool.js';
 import { activeSessionKey } from '../src/core/types.js';
 import * as docSubsStore from '../src/services/doc-subs-store.js';
@@ -23,6 +24,64 @@ afterEach(() => {
 });
 
 describe('daemon close barrier used by botmux delete', () => {
+  it('removes pending progress reactions when the session closes', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-close-reaction-'));
+    tempDirs.push(dataDir);
+    const previousDataDir = config.session.dataDir;
+    config.session.dataDir = dataDir;
+    sessionStore.init('app-close-reaction');
+    const removeReaction = vi.spyOn(larkClient, 'removeReaction').mockResolvedValue(undefined);
+
+    try {
+      const session = sessionStore.createSession(
+        'oc_close_reaction',
+        'om_close_reaction',
+        'close reaction',
+        'group',
+      );
+      session.larkAppId = 'app-close-reaction';
+      sessionStore.updateSession(session);
+      const ds = {
+        session,
+        worker: null,
+        workerPort: null,
+        workerToken: null,
+        workerViewToken: null,
+        larkAppId: 'app-close-reaction',
+        chatId: session.chatId,
+        chatType: 'group',
+        scope: 'thread',
+        spawnedAt: Date.now(),
+        cliVersion: 'test',
+        lastMessageAt: Date.now(),
+        hasHistory: true,
+        adoptedFrom: { source: 'tmux', tmuxTarget: 'user:1.0', cwd: '/repo' },
+        pendingAckReactions: [{
+          messageId: 'om_turn_in_progress',
+          reactionId: 'reaction_in_progress',
+          turnId: 'om_turn_in_progress',
+          clearOnReply: true,
+        }],
+      } as any;
+      workerPool.setActiveSessionsRegistry(new Map([[activeSessionKey(ds), ds]]));
+
+      await expect(workerPool.closeSession(session.sessionId)).resolves.toEqual({
+        ok: true,
+        alreadyClosed: false,
+        known: true,
+      });
+
+      expect(ds.pendingAckReactions).toEqual([]);
+      expect(removeReaction).toHaveBeenCalledWith(
+        'app-close-reaction',
+        'om_turn_in_progress',
+        'reaction_in_progress',
+      );
+    } finally {
+      config.session.dataDir = previousDataDir;
+    }
+  });
+
   it('evicts activeSessions and persists closed before awaited doc cleanup', async () => {
     const dataDir = mkdtempSync(join(tmpdir(), 'botmux-delete-barrier-'));
     tempDirs.push(dataDir);

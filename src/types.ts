@@ -1030,7 +1030,7 @@ export type WorkerToDaemon =
   | { type: 'stuck_warning_expired'; nonce: number; turnId?: string; dispatchAttempt?: number }
   | { type: 'tui_keys_delivered'; nonce: number; turnId?: string; dispatchAttempt?: number }
   | { type: 'screenshot_uploaded'; imageKey: string; status: ScreenStatus; usageLimit?: CliUsageLimitState; turnId?: string; dispatchAttempt?: number }
-  | { type: 'user_notify'; message: string; turnId?: string; dispatchAttempt?: number }
+  | { type: 'user_notify'; message: string; turnId?: string; dispatchAttempt?: number; settlesTurn?: true }
   /** A normal success acknowledgement for one app-server accepted steer.
    * `appTurnId` is diagnostic/protocol identity; `turnId` is the immutable
    * botmux/Lark reply route. This must never enter the attention path. */

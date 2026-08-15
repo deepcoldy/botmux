@@ -19,6 +19,7 @@ const updateMessageMock = vi.fn(async (_appId: string, _messageId: string, _json
 const saveFrozenCardsMock = vi.fn();
 const loadFrozenCardsMock = vi.fn(() => new Map<string, FrozenCard>());
 const persistStreamCardStateMock = vi.fn();
+const sessionReplyMock = vi.fn(async () => 'om_replacement');
 
 vi.mock('../src/im/lark/client.js', () => {
   class MessageWithdrawnError extends Error {
@@ -115,6 +116,8 @@ import {
   parkStreamCard,
   postFreshStreamingCard,
   postTurnStartingCard,
+  reuseThreadStreamingCardForTurn,
+  initWorkerPool,
   setActiveSessionsRegistry,
   restoreUsageLimitRuntimeState,
   scheduleCardPatch,
@@ -122,6 +125,7 @@ import {
   refreshStreamingCardUsage,
   syncUsageRefreshTimer,
   USAGE_REFRESH_INTERVAL_MS,
+  CARD_POSTING_SENTINEL,
 } from '../src/core/worker-pool.js';
 import { MessageWithdrawnError } from '../src/im/lark/client.js';
 import { buildStreamingCard } from '../src/im/lark/card-builder.js';
@@ -161,6 +165,7 @@ function makeDs(frozenCards?: Map<string, FrozenCard>): DaemonSession {
     larkAppId: APP_ID,
     chatId: 'oc_chat',
     chatType: 'group',
+    scope: 'thread',
     spawnedAt: Date.now(),
     cliVersion: '1.0',
     lastMessageAt: Date.now(),
@@ -177,6 +182,14 @@ beforeEach(() => {
   loadFrozenCardsMock.mockReset();
   loadFrozenCardsMock.mockReturnValue(new Map());
   persistStreamCardStateMock.mockClear();
+  sessionReplyMock.mockReset();
+  sessionReplyMock.mockResolvedValue('om_replacement');
+  initWorkerPool({
+    sessionReply: sessionReplyMock,
+    getSessionWorkingDir: () => '/repo',
+    getActiveCount: () => 1,
+    closeSession: vi.fn(),
+  });
   vi.mocked(buildStreamingCard).mockClear();
   setTerminalProxyPort(8800);
 });
@@ -434,6 +447,177 @@ describe('restoreUsageLimitRuntimeState', () => {
   });
 });
 
+describe('reuseThreadStreamingCardForTurn', () => {
+  it('PATCHes the existing thread card instead of withdrawing and posting another', async () => {
+    vi.useFakeTimers();
+    const ds = makeDs();
+    ds.workerReady = true;
+    ds.streamCardId = 'om_stable';
+    ds.streamCardNonce = 'nonce_stable';
+    ds.streamCardPending = true;
+    ds.streamCardPendingTurnId = 'om_old_turn';
+    ds.streamCardTurnGeneration = 3;
+    ds.currentImageKey = 'img_previous';
+    ds.lastScreenStatus = 'working';
+    ds.usageLimit = { limited: true, kind: 'usage', retryReady: false };
+    ds.usageLimitRetryTimer = setTimeout(() => {}, 60_000);
+    ds.usageRefreshTimer = setInterval(() => {}, 60_000);
+
+    expect(reuseThreadStreamingCardForTurn(ds, 'next question', 'om_next_turn')).toBe(true);
+
+    expect(ds.streamCardId).toBe('om_stable');
+    expect(ds.streamCardNonce).toBe('nonce_stable');
+    expect(ds.streamCardPending).toBe(false);
+    expect(ds.streamCardPendingTurnId).toBeUndefined();
+    expect(ds.streamCardTurnGeneration).toBe(4);
+    expect(ds.streamCardVisualTurnId).toBe('om_next_turn');
+    expect(ds.currentTurnTitle).toBe('next question');
+    expect(ds.currentImageKey).toBeUndefined();
+    expect(ds.lastScreenStatus).toBe('starting');
+    expect(ds.usageLimit).toBeUndefined();
+    expect(ds.usageLimitRetryTimer).toBeUndefined();
+    expect(ds.usageRefreshTimer).toBeUndefined();
+    expect(updateMessageMock).toHaveBeenCalledWith(APP_ID, 'om_stable', '{}');
+    expect(deleteMessageMock).not.toHaveBeenCalled();
+    expect(saveFrozenCardsMock).not.toHaveBeenCalled();
+  });
+
+  it('also preserves the stable thread card while a stopped worker is re-forked', () => {
+    const ds = makeDs();
+    ds.worker = null;
+    ds.workerReady = false;
+    ds.streamCardId = 'om_stable';
+    ds.streamCardNonce = 'nonce_stable';
+
+    expect(reuseThreadStreamingCardForTurn(ds, 'resume question', 'om_resume_turn')).toBe(true);
+
+    expect(ds.streamCardId).toBe('om_stable');
+    expect(ds.streamCardPending).toBe(false);
+    expect(updateMessageMock).not.toHaveBeenCalled();
+    expect(deleteMessageMock).not.toHaveBeenCalled();
+  });
+
+  it('POSTs a replacement when the reused thread card was withdrawn', async () => {
+    const ds = makeDs();
+    ds.workerReady = true;
+    ds.streamCardId = 'om_withdrawn';
+    ds.streamCardNonce = 'nonce_withdrawn';
+    updateMessageMock.mockRejectedValueOnce(new MessageWithdrawnError('om_withdrawn'));
+
+    expect(reuseThreadStreamingCardForTurn(ds, 'next question', 'om_next_turn')).toBe(true);
+    await flush();
+    await flush();
+
+    expect(sessionReplyMock).toHaveBeenCalledTimes(1);
+    expect(sessionReplyMock.mock.calls[0][4]).toBe('om_next_turn');
+    expect(ds.streamCardId).toBe('om_replacement');
+    expect(ds.streamCardPending).toBe(false);
+    expect(ds.streamCardPendingTurnId).toBeUndefined();
+  });
+
+  it('keeps the withdrawal fallback when a same-card PATCH supersedes the queued payload', async () => {
+    let rejectFirstPatch!: (error: Error) => void;
+    updateMessageMock
+      .mockImplementationOnce(() => new Promise<void>((_resolve, reject) => { rejectFirstPatch = reject; }))
+      .mockRejectedValueOnce(new MessageWithdrawnError('om_withdrawn'));
+    const ds = makeDs();
+    ds.workerReady = true;
+    ds.streamCardId = 'om_withdrawn';
+    ds.streamCardNonce = 'nonce_withdrawn';
+
+    scheduleCardPatch(ds, 'older payload');
+    expect(reuseThreadStreamingCardForTurn(ds, 'next question', 'om_next_turn')).toBe(true);
+    scheduleCardPatch(ds, 'latest payload', 'om_next_turn');
+    rejectFirstPatch(new MessageWithdrawnError('om_withdrawn'));
+    await flush();
+    await flush();
+    await flush();
+
+    expect(updateMessageMock).toHaveBeenNthCalledWith(2, APP_ID, 'om_withdrawn', 'latest payload');
+    expect(sessionReplyMock).toHaveBeenCalledTimes(1);
+    expect(sessionReplyMock.mock.calls[0][4]).toBe('om_next_turn');
+    expect(ds.streamCardId).toBe('om_replacement');
+  });
+
+  it('keeps the withdrawal fallback after the initial reuse PATCH succeeds', async () => {
+    updateMessageMock
+      .mockResolvedValueOnce(undefined)
+      .mockRejectedValueOnce(new MessageWithdrawnError('om_withdrawn'));
+    const ds = makeDs();
+    ds.workerReady = true;
+    ds.streamCardId = 'om_withdrawn';
+    ds.streamCardNonce = 'nonce_withdrawn';
+
+    expect(reuseThreadStreamingCardForTurn(ds, 'next question', 'om_next_turn')).toBe(true);
+    await flush();
+    expect(updateMessageMock).toHaveBeenCalledTimes(1);
+
+    scheduleCardPatch(ds, 'working payload', 'om_next_turn');
+    await flush();
+    await flush();
+    await flush();
+
+    expect(updateMessageMock).toHaveBeenNthCalledWith(
+      2, APP_ID, 'om_withdrawn', 'working payload',
+    );
+    expect(sessionReplyMock).toHaveBeenCalledTimes(1);
+    expect(sessionReplyMock.mock.calls[0][4]).toBe('om_next_turn');
+    expect(ds.streamCardId).toBe('om_replacement');
+    expect(updateMessageMock).toHaveBeenNthCalledWith(
+      3, APP_ID, 'om_replacement', 'working payload',
+    );
+    expect(ds.pendingCardJson).toBeUndefined();
+  });
+
+  it('replays the latest queued status onto the withdrawn-card replacement', async () => {
+    let rejectReusePatch!: (error: Error) => void;
+    updateMessageMock.mockImplementationOnce(
+      () => new Promise<void>((_resolve, reject) => { rejectReusePatch = reject; }),
+    );
+    let resolveReplacementPost!: (messageId: string) => void;
+    sessionReplyMock.mockImplementationOnce(
+      () => new Promise<string>((resolve) => { resolveReplacementPost = resolve; }),
+    );
+    const ds = makeDs();
+    ds.workerReady = true;
+    ds.streamCardId = 'om_withdrawn';
+    ds.streamCardNonce = 'nonce_withdrawn';
+
+    expect(reuseThreadStreamingCardForTurn(ds, 'next question', 'om_next_turn')).toBe(true);
+    scheduleCardPatch(ds, 'completed payload', 'om_next_turn');
+    rejectReusePatch(new MessageWithdrawnError('om_withdrawn'));
+    await flush();
+    await flush();
+
+    expect(sessionReplyMock).toHaveBeenCalledTimes(1);
+    expect(updateMessageMock).toHaveBeenCalledTimes(1);
+    expect(ds.pendingCardJson).toBe('completed payload');
+
+    resolveReplacementPost('om_replacement');
+    await flush();
+    await flush();
+
+    expect(updateMessageMock).toHaveBeenNthCalledWith(
+      2, APP_ID, 'om_replacement', 'completed payload',
+    );
+    expect(ds.pendingCardJson).toBeUndefined();
+  });
+
+  it('keeps the fresh-card flow for flat chat sessions', () => {
+    const ds = makeDs();
+    ds.scope = 'chat';
+    ds.workerReady = true;
+    ds.streamCardId = 'om_previous';
+    ds.streamCardNonce = 'nonce_previous';
+
+    expect(reuseThreadStreamingCardForTurn(ds, 'next question', 'om_next_turn')).toBe(false);
+
+    expect(ds.streamCardId).toBe('om_previous');
+    expect(ds.streamCardTurnGeneration).toBeUndefined();
+    expect(updateMessageMock).not.toHaveBeenCalled();
+  });
+});
+
 describe('receiver streaming card boundary', () => {
   it('refuses a fresh group-visible streaming card for a dedicated receiver', async () => {
     const ds = makeDs();
@@ -487,11 +671,27 @@ describe('postTurnStartingCard', () => {
     expect(ds.streamCardPendingTurnId).toBeUndefined();
   });
 
-  it('posts the newest queued turn after an older card POST finishes', async () => {
+  it('still recalls the previous card after posting in a chat-scoped session', async () => {
+    const ds = makeDs();
+    ds.scope = 'chat';
+    ds.workerReady = true;
+    ds.streamCardId = 'om_previous';
+    ds.streamCardNonce = 'nonce_previous';
+    ds.streamCardPending = true;
+    ds.streamCardTurnGeneration = 1;
+    ds.streamCardPendingTurnId = 'om_turn_1';
+    const sessionReply = vi.fn(async () => 'om_turn_card_1');
+
+    await expect(postTurnStartingCard(ds, sessionReply, 'om_turn_1')).resolves.toBe(true);
+
+    expect(deleteMessageMock).toHaveBeenCalledWith(APP_ID, 'om_previous');
+    expect(ds.frozenCards?.size).toBe(0);
+  });
+
+  it('retargets a newly-landed thread card when a newer turn supersedes its POST', async () => {
     let resolveFirst!: (messageId: string) => void;
     const sessionReply = vi.fn()
-      .mockImplementationOnce(() => new Promise<string>(resolve => { resolveFirst = resolve; }))
-      .mockResolvedValueOnce('om_turn_card_2');
+      .mockImplementationOnce(() => new Promise<string>(resolve => { resolveFirst = resolve; }));
     const ds = makeDs();
     ds.workerReady = true;
     ds.streamCardId = 'om_previous';
@@ -508,18 +708,62 @@ describe('postTurnStartingCard', () => {
     ds.streamCardPendingTurnId = 'om_turn_2';
     ds.currentTurnTitle = 'second turn';
     await expect(postTurnStartingCard(ds, sessionReply, 'om_turn_2')).resolves.toBe(false);
+    // Simulate the newest turn reaching working while the original POST still
+    // owns the sentinel. Retargeting must not overwrite this fresher payload
+    // with another synthetic starting state.
+    ds.pendingCardJson = '{"status":"working"}';
+    ds.pendingCardId = CARD_POSTING_SENTINEL;
+    ds.pendingCardTurnId = 'om_turn_2';
 
     resolveFirst('om_turn_card_1');
     await firstPost;
     await flush();
     await flush();
 
-    expect(sessionReply).toHaveBeenCalledTimes(2);
-    expect(sessionReply.mock.calls[1][4]).toBe('om_turn_2');
-    expect(ds.streamCardId).toBe('om_turn_card_2');
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+    expect(updateMessageMock).toHaveBeenCalledWith(
+      APP_ID,
+      'om_turn_card_1',
+      '{"status":"working"}',
+    );
+    expect(ds.streamCardId).toBe('om_turn_card_1');
     expect(ds.streamCardPending).toBe(false);
     expect(ds.streamCardPendingTurnId).toBeUndefined();
-    expect(deleteMessageMock).toHaveBeenCalledWith(APP_ID, 'om_turn_card_1');
+    expect(deleteMessageMock).toHaveBeenCalledWith(APP_ID, 'om_previous');
+    expect(deleteMessageMock).not.toHaveBeenCalledWith(APP_ID, 'om_turn_card_1');
+  });
+
+  it('replaces a predecessor snapshot queued during a superseded thread POST', async () => {
+    let resolveFirst!: (messageId: string) => void;
+    const sessionReply = vi.fn()
+      .mockImplementationOnce(() => new Promise<string>(resolve => { resolveFirst = resolve; }));
+    const ds = makeDs();
+    ds.workerReady = true;
+    ds.streamCardPending = true;
+    ds.streamCardTurnGeneration = 1;
+    ds.streamCardPendingTurnId = 'om_turn_1';
+    ds.currentTurnTitle = 'first turn';
+
+    const firstPost = postTurnStartingCard(ds, sessionReply, 'om_turn_1');
+    ds.streamCardTurnGeneration = 2;
+    ds.streamCardPendingTurnId = 'om_turn_2';
+    ds.currentTurnTitle = 'second turn';
+    // beginNewTurn freezes N without assigning N+1 as the payload owner.
+    ds.pendingCardJson = '{"status":"idle","title":"first turn"}';
+    ds.pendingCardId = CARD_POSTING_SENTINEL;
+
+    resolveFirst('om_turn_card_1');
+    await firstPost;
+    await flush();
+
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+    expect(updateMessageMock).toHaveBeenCalledWith(APP_ID, 'om_turn_card_1', '{}');
+    expect(updateMessageMock).not.toHaveBeenCalledWith(
+      APP_ID,
+      'om_turn_card_1',
+      '{"status":"idle","title":"first turn"}',
+    );
+    expect(ds.streamCardVisualTurnId).toBe('om_turn_2');
   });
 
   it('restores the previous live card when the starting-card POST fails', async () => {

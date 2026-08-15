@@ -56,6 +56,70 @@ import { sessionKey } from '../src/core/types.js';
 import type { DaemonSession } from '../src/core/types.js';
 
 describe('mid-transfer literal passthrough', () => {
+  it('does not mutate the reused card when raw IPC rejects before acceptance', () => {
+    const ds = {
+      session: {
+        sessionId: 'session-disconnected-passthrough',
+        chatId: 'oc_source',
+        rootMessageId: 'om_source',
+        title: 'disconnected passthrough',
+        status: 'active',
+        createdAt: new Date().toISOString(),
+        scope: 'thread',
+        chatType: 'group',
+        larkAppId: 'app-transfer-passthrough',
+        ownerOpenId: 'ou_owner',
+        workingDir: '/tmp',
+        cliId: 'claude-code',
+      },
+      worker: Object.assign(new EventEmitter(), {
+        killed: false,
+        connected: false,
+        send: vi.fn(() => { throw new Error('IPC channel is closed'); }),
+      }),
+      workerPort: null,
+      workerToken: null,
+      larkAppId: 'app-transfer-passthrough',
+      chatId: 'oc_source',
+      chatType: 'group',
+      scope: 'thread',
+      spawnedAt: Date.now(),
+      cliVersion: '1.0.0',
+      lastMessageAt: Date.now(),
+      hasHistory: true,
+      workingDir: '/tmp',
+      lastScreenStatus: 'idle',
+      streamingCardForced: true,
+      streamCardId: 'om_stable_card',
+      streamCardNonce: 'stable-nonce',
+      streamCardTurnGeneration: 7,
+      currentTurnTitle: 'previous completed turn',
+    } as unknown as DaemonSession;
+    const onDelivered = vi.fn();
+
+    expect(() => deliverPassthrough(
+      ds,
+      '/model',
+      '/model opus',
+      'om_source',
+      ds.larkAppId,
+      {
+        messageId: 'om_rejected_passthrough',
+        senderOpenId: 'ou_owner',
+        senderIsBot: false,
+        substitute: false,
+        onDelivered,
+      },
+    )).toThrow('IPC channel is closed');
+
+    expect(onDelivered).not.toHaveBeenCalled();
+    expect(ds.streamingCardForced).toBe(true);
+    expect(ds.streamCardId).toBe('om_stable_card');
+    expect(ds.streamCardTurnGeneration).toBe(7);
+    expect(ds.currentTurnTitle).toBe('previous completed turn');
+    expect(ds.streamCardPendingTurnId).toBeUndefined();
+  });
+
   it('buffers raw input while worker=null and replays it on the target replacement', async () => {
     const ds = {
       session: {

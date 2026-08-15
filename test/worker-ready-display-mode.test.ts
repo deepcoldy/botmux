@@ -19,7 +19,12 @@ import { EventEmitter } from 'node:events';
 // ─── Mocks ─────────────────────────────────────────────────────────────────
 
 const updateMessageMock = vi.fn(async () => {});
-const { loggerInfoMock } = vi.hoisted(() => ({ loggerInfoMock: vi.fn() }));
+const { loggerInfoMock, recordUsageMock, dashboardPublishMock, transitionHookMock } = vi.hoisted(() => ({
+  loggerInfoMock: vi.fn(),
+  recordUsageMock: vi.fn(),
+  dashboardPublishMock: vi.fn(),
+  transitionHookMock: vi.fn(),
+}));
 
 vi.mock('../src/im/lark/client.js', () => {
   class MessageWithdrawnError extends Error {
@@ -85,11 +90,21 @@ vi.mock('../src/core/session-manager.js', () => ({
 }));
 
 vi.mock('../src/core/dashboard-events.js', () => ({
-  dashboardEventBus: { publish: vi.fn() },
+  dashboardEventBus: { publish: (...args: any[]) => dashboardPublishMock(...args) },
 }));
 
 vi.mock('../src/core/dashboard-rows.js', () => ({
   composeRowFromActive: vi.fn(() => ({ tokenUsage: undefined })),
+}));
+
+vi.mock('../src/services/usage-ledger.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../src/services/usage-ledger.js')>()),
+  recordUsageForDaemonSession: (...args: any[]) => recordUsageMock(...args),
+}));
+
+vi.mock('../src/services/session-lifecycle-hooks.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../src/services/session-lifecycle-hooks.js')>()),
+  emitSessionStateTransitionHook: (...args: any[]) => transitionHookMock(...args),
 }));
 
 vi.mock('../src/skills/installer.js', () => ({
@@ -133,7 +148,13 @@ vi.mock('@larksuiteoapi/node-sdk', () => ({
 
 // ─── Imports under test ────────────────────────────────────────────────────
 
-import { CARD_POSTING_SENTINEL, initWorkerPool, __testOnly_setupWorkerHandlers } from '../src/core/worker-pool.js';
+import {
+  CARD_POSTING_SENTINEL,
+  initWorkerPool,
+  reuseThreadStreamingCardForTurn,
+  scheduleCardPatch,
+  __testOnly_setupWorkerHandlers,
+} from '../src/core/worker-pool.js';
 import { MessageWithdrawnError } from '../src/im/lark/client.js';
 import type { DaemonSession } from '../src/core/types.js';
 import { getBot } from '../src/bot-registry.js';
@@ -389,6 +410,112 @@ describe('Worker ready: set_display_mode re-sync', () => {
     expect(ds.currentImageKey).toBe('img_zmx_history');
   });
 
+  it('ignores prior-turn visual events after a stable thread card changes owner', async () => {
+    const fakeWorker = makeFakeWorker();
+    const ds = makeDs({
+      scope: 'thread',
+      worker: fakeWorker,
+      workerReady: true,
+      workerPort: 9999,
+      streamCardId: 'om_stable_card',
+      streamCardNonce: 'stable-nonce',
+      streamCardVisualTurnId: 'om_turn_n_plus_1',
+      currentTurnTitle: 'turn n+1',
+      lastScreenContent: 'turn n+1 running',
+      lastScreenStatus: 'working',
+      currentImageKey: undefined,
+      displayMode: 'screenshot',
+    });
+
+    __testOnly_setupWorkerHandlers(ds, fakeWorker);
+    fakeWorker.emit('message', {
+      type: 'screen_update',
+      content: 'turn n completed',
+      status: 'idle',
+      turnId: 'om_turn_n',
+    });
+    fakeWorker.emit('message', {
+      type: 'screenshot_uploaded',
+      imageKey: 'img_turn_n',
+      status: 'idle',
+      turnId: 'om_turn_n',
+    });
+    await flush();
+
+    expect(ds.lastScreenContent).toBe('turn n+1 running');
+    expect(ds.lastScreenStatus).toBe('working');
+    expect(ds.currentImageKey).toBeUndefined();
+    expect(recordUsageMock).toHaveBeenCalledWith(ds, { turnId: 'om_turn_n' });
+    expect(dashboardPublishMock).not.toHaveBeenCalled();
+    expect(transitionHookMock).not.toHaveBeenCalled();
+
+    fakeWorker.emit('message', {
+      type: 'screen_update',
+      content: 'turn n+1 completed',
+      status: 'idle',
+      turnId: 'om_turn_n_plus_1',
+    });
+    fakeWorker.emit('message', {
+      type: 'screenshot_uploaded',
+      imageKey: 'img_turn_n_plus_1',
+      status: 'idle',
+      turnId: 'om_turn_n_plus_1',
+    });
+    await flush();
+
+    expect(ds.lastScreenContent).toBe('turn n+1 completed');
+    expect(ds.lastScreenStatus).toBe('idle');
+    expect(ds.currentImageKey).toBe('img_turn_n_plus_1');
+  });
+
+  it('preserves a prior-turn usage limit after the thread card changes owner', async () => {
+    const fakeWorker = makeFakeWorker();
+    const retryAtMs = Date.now() + 60_000;
+    const ds = makeDs({
+      scope: 'thread',
+      worker: fakeWorker,
+      workerReady: true,
+      workerPort: 9999,
+      streamCardId: 'om_stable_card',
+      streamCardNonce: 'stable-nonce',
+      streamCardVisualTurnId: 'om_turn_n_plus_1',
+      currentTurnTitle: 'turn n+1',
+      lastScreenContent: 'turn n+1 starting',
+      lastScreenStatus: 'starting',
+      currentImageKey: undefined,
+      displayMode: 'screenshot',
+    });
+
+    __testOnly_setupWorkerHandlers(ds, fakeWorker);
+    fakeWorker.emit('message', {
+      type: 'screen_update',
+      content: 'turn n reached its usage limit',
+      status: 'limited',
+      turnId: 'om_turn_n',
+      usageLimit: {
+        limited: true,
+        kind: 'usage',
+        retryAtMs,
+        retryLabel: '10:36 PM',
+        retryReady: false,
+      },
+    });
+    await flush();
+
+    expect(ds.usageLimit).toMatchObject({ retryAtMs, retryReady: false });
+    expect(ds.usageLimitRetryTimer).toBeDefined();
+    expect(ds.lastScreenContent).toBe('turn n+1 starting');
+    expect(ds.lastScreenStatus).toBe('starting');
+    expect(ds.currentImageKey).toBeUndefined();
+    expect(recordUsageMock).toHaveBeenCalledWith(ds, { turnId: 'om_turn_n' });
+    expect(dashboardPublishMock).not.toHaveBeenCalled();
+    expect(transitionHookMock).not.toHaveBeenCalled();
+    expect(updateMessageMock).not.toHaveBeenCalled();
+
+    clearTimeout(ds.usageLimitRetryTimer);
+    ds.usageLimitRetryTimer = undefined;
+  });
+
   it('ignores every message from a replaced worker generation', async () => {
     const staleWorker = makeFakeWorker();
     const currentWorker = makeFakeWorker();
@@ -563,6 +690,110 @@ describe('Worker ready: set_display_mode re-sync', () => {
     );
   });
 
+  it('serializes refork readiness behind an older PATCH and recovers withdrawal for the new turn', async () => {
+    let rejectOldPatch!: (error: Error) => void;
+    updateMessageMock
+      .mockImplementationOnce(() => new Promise<void>((_resolve, reject) => {
+        rejectOldPatch = reject;
+      }))
+      .mockRejectedValueOnce(new MessageWithdrawnError('om_existing_card'));
+    const fakeWorker = makeFakeWorker();
+    const ds = makeDs({
+      scope: 'thread',
+      worker: fakeWorker,
+      workerReady: false,
+      streamCardPending: false,
+      streamCardId: 'om_existing_card',
+      streamCardNonce: 'stable-nonce',
+      streamCardTurnGeneration: 4,
+      streamCardVisualTurnId: 'om_previous_turn',
+    });
+
+    scheduleCardPatch(ds, 'previous-generation payload');
+    expect(reuseThreadStreamingCardForTurn(ds, 'new turn', 'om_new_turn')).toBe(true);
+    __testOnly_setupWorkerHandlers(ds, fakeWorker);
+    fakeWorker.emit('message', {
+      type: 'ready', port: 9999, token: 'tok_abc', turnId: 'om_new_turn',
+    });
+    await flush();
+
+    // ready must queue behind the prior generation instead of issuing a
+    // concurrent direct PATCH that the old request could overwrite later.
+    expect(updateMessageMock).toHaveBeenCalledTimes(1);
+
+    rejectOldPatch(new MessageWithdrawnError('om_existing_card'));
+    await flush();
+    await flush();
+    await flush();
+
+    expect(updateMessageMock).toHaveBeenCalledTimes(3);
+    expect(updateMessageMock.mock.calls[2][1]).toBe('om_new_card');
+    expect(sessionReplyMock).toHaveBeenCalledTimes(1);
+    expect(sessionReplyMock.mock.calls[0][4]).toBe('om_new_turn');
+    expect(ds.streamCardId).toBe('om_new_card');
+  });
+
+  it('posts a replacement when a reused-card ready PATCH fails', async () => {
+    updateMessageMock.mockRejectedValueOnce(new Error('temporary Lark failure'));
+    const fakeWorker = makeFakeWorker();
+    const ds = makeDs({
+      scope: 'thread',
+      worker: fakeWorker,
+      workerReady: false,
+      streamCardPending: false,
+      streamCardId: 'om_existing_card',
+      streamCardNonce: 'stable-nonce',
+      streamCardTurnGeneration: 4,
+      streamCardVisualTurnId: 'om_previous_turn',
+    });
+
+    expect(reuseThreadStreamingCardForTurn(ds, 'new turn', 'om_new_turn')).toBe(true);
+    __testOnly_setupWorkerHandlers(ds, fakeWorker);
+    fakeWorker.emit('message', {
+      type: 'ready', port: 9999, token: 'tok_abc', turnId: 'om_new_turn',
+    });
+    await flush();
+    await flush();
+
+    expect(updateMessageMock).toHaveBeenCalledTimes(2);
+    expect(sessionReplyMock).toHaveBeenCalledTimes(1);
+    expect(sessionReplyMock.mock.calls[0][4]).toBe('om_new_turn');
+    expect(ds.streamCardId).toBe('om_new_card');
+    expect(ds.streamCardPending).toBe(false);
+    expect(ds.pendingCardJson).toBeUndefined();
+  });
+
+  it('bounds replacement to one POST when reused-card PATCHes keep failing', async () => {
+    updateMessageMock.mockRejectedValue(new Error('persistent Lark failure'));
+    const fakeWorker = makeFakeWorker();
+    const ds = makeDs({
+      scope: 'thread',
+      worker: fakeWorker,
+      workerReady: false,
+      streamCardPending: false,
+      streamCardId: 'om_existing_card',
+      streamCardNonce: 'stable-nonce',
+      streamCardTurnGeneration: 4,
+      streamCardVisualTurnId: 'om_previous_turn',
+    });
+
+    expect(reuseThreadStreamingCardForTurn(ds, 'new turn', 'om_new_turn')).toBe(true);
+    __testOnly_setupWorkerHandlers(ds, fakeWorker);
+    fakeWorker.emit('message', {
+      type: 'ready', port: 9999, token: 'tok_abc', turnId: 'om_new_turn',
+    });
+    await flush();
+    await flush();
+    await flush();
+    await flush();
+
+    expect(updateMessageMock).toHaveBeenCalledTimes(2);
+    expect(sessionReplyMock).toHaveBeenCalledTimes(1);
+    expect(ds.streamCardId).toBe('om_new_card');
+    expect(ds.pendingCardWithdrawFallback).toBeUndefined();
+    expect(ds.pendingCardJson).toBeUndefined();
+  });
+
   it('silent recovery restores screenshot mode without touching the streaming card', async () => {
     const fakeWorker = makeFakeWorker();
     const ds = makeDs({
@@ -609,14 +840,13 @@ describe('Worker ready: set_display_mode re-sync', () => {
 
     fakeWorker.emit('message', { type: 'cli_session_id', cliSessionId: 'trae-native-ready' });
     await flush();
-    expect(updateMessageMock).toHaveBeenCalledTimes(2);
-    expect(JSON.parse(updateMessageMock.mock.calls[1][2])).toMatchObject({ localCliReady: true });
+    expect(updateMessageMock).toHaveBeenCalledTimes(1);
 
     resolveRestorePatch();
     await flush();
     await flush();
 
-    expect(updateMessageMock).toHaveBeenCalledTimes(3);
+    expect(updateMessageMock).toHaveBeenCalledTimes(2);
     expect(JSON.parse(updateMessageMock.mock.calls.at(-1)![2])).toMatchObject({ localCliReady: true });
   });
 

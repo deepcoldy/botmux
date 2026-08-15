@@ -19,6 +19,8 @@ describe('transfer input gate wiring', () => {
     const passthrough = daemonSource.slice(passthroughStart, passthroughEnd);
     expect(passthrough).toContain('sendWorkerSessionInput(ds, {');
     expect(passthrough).toContain("type: 'raw_input'");
+    expect(passthrough.indexOf('beginNewTurn(ds, commandContent, turn.messageId)'))
+      .toBeGreaterThan(passthrough.indexOf('sendWorkerSessionInput(ds, {'));
     expect(passthrough).not.toContain("ds.worker.send({\n      type: 'raw_input'");
 
     const promptReadyStart = workerPoolSource.indexOf("case 'prompt_ready':");

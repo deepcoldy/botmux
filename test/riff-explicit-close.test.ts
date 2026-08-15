@@ -5,9 +5,10 @@ import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { activeSessionKey, type DaemonSession } from '../src/core/types.js';
 
-const { getBotMock, cancelRiffTaskMock } = vi.hoisted(() => ({
+const { getBotMock, cancelRiffTaskMock, removeReactionMock } = vi.hoisted(() => ({
   getBotMock: vi.fn(),
   cancelRiffTaskMock: vi.fn(async () => true),
+  removeReactionMock: vi.fn(async () => undefined),
 }));
 
 vi.mock('../src/bot-registry.js', () => ({
@@ -29,7 +30,7 @@ vi.mock('../src/im/lark/client.js', () => ({
   sendEphemeralCard: vi.fn(),
   sendUserMessage: vi.fn(),
   addReaction: vi.fn(),
-  removeReaction: vi.fn(),
+  removeReaction: removeReactionMock,
   getMessageChatId: vi.fn(),
   MessageWithdrawnError: class extends Error {},
 }));
@@ -221,6 +222,33 @@ describe('Riff explicit close', () => {
       riffParentTaskId: 'task-riff-123',
     });
     expect(fixture.ds.riffCloseState).toBeUndefined();
+  });
+
+  it('retains pending reactions when the durable close fails after prepare', async () => {
+    const fixture = createFixture({ liveWorker: true });
+    const pendingReaction = {
+      messageId: 'om_riff_turn',
+      reactionId: 'reaction_riff_turn',
+      turnId: 'om_riff_turn',
+      clearOnReply: true,
+    };
+    fixture.ds.pendingAckReactions = [pendingReaction];
+    vi.spyOn(sessionStore, 'closeSession').mockImplementationOnce(() => {
+      throw new Error('disk full');
+    });
+
+    expect(await closeSession(fixture.session.sessionId)).toEqual({
+      ok: false,
+      alreadyClosed: false,
+      error: 'riff_durable_close_failed',
+      retryable: true,
+      taskId: 'task-riff-123',
+    });
+
+    expect(fixture.ds.pendingAckReactions).toEqual([pendingReaction]);
+    expect(removeReactionMock).not.toHaveBeenCalled();
+    expect(fixture.registry.get(activeSessionKey(fixture.ds))).toBe(fixture.ds);
+    expect(fixture.session.status).toBe('active');
   });
 
   it('refuses an unprepared generic retirement of a live Riff worker', () => {

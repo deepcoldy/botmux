@@ -15,13 +15,14 @@ import { normalizeFeedbackPolicy } from '../src/services/feedback-policy.js';
 
 const updateMessageMock = vi.fn(async () => {});
 const addReactionMock = vi.fn(async () => 'reaction_id');
+const removeReactionMock = vi.fn(async () => {});
 const replyToDocCommentMock = vi.fn(async () => {});
 const removeCommentReactionMock = vi.fn(async () => {});
 const updateSessionMock = vi.fn();
 vi.mock('../src/im/lark/client.js', () => ({
   updateMessage: (...args: any[]) => updateMessageMock(...args),
   addReaction: (...args: any[]) => addReactionMock(...args),
-  removeReaction: vi.fn(async () => {}),
+  removeReaction: (...args: any[]) => removeReactionMock(...args),
   sendUserMessage: vi.fn(async () => {}),
   deleteMessage: vi.fn(async () => {}),
   getChatInfo: vi.fn(),
@@ -636,6 +637,10 @@ describe('Bridge final_output delivery (P2 retry)', () => {
       { dispatchId: 'dispatch-ok-head', turnId: 'turn-ok-head', state: 'prepared', content: 'superseded', deliverySink: 'lark', codexAppSteerable: true },
       { dispatchId: 'dispatch-ok-next', turnId: 'turn-ok-next', state: 'accepted', content: 'real', deliverySink: 'lark', codexAppSteerable: true },
     ];
+    ds.pendingAckReactions = [
+      { messageId: 'om_superseded', reactionId: 'reaction_superseded', turnId: 'turn-ok-head', clearOnReply: true },
+      { messageId: 'om_next', reactionId: 'reaction_next', turnId: 'turn-ok-next', clearOnReply: true },
+    ];
     __testOnly_setupWorkerHandlers(ds, ds.worker as any);
 
     (ds.worker as any).emit('message', {
@@ -657,6 +662,12 @@ describe('Bridge final_output delivery (P2 retry)', () => {
       }),
     ));
     expect(sessionReply).not.toHaveBeenCalled();
+    expect(removeReactionMock).toHaveBeenCalledWith(
+      'app_test', 'om_superseded', 'reaction_superseded',
+    );
+    expect(ds.pendingAckReactions).toEqual([{
+      messageId: 'om_next', reactionId: 'reaction_next', turnId: 'turn-ok-next', clearOnReply: true,
+    }]);
     await vi.waitFor(() => expect(ds.session.codexAppDispatchLedger?.length).toBe(1));
     expect(ds.session.codexAppDispatchLedger?.[0]?.dispatchId).toBe('dispatch-ok-next');
   });
@@ -1496,6 +1507,9 @@ describe('Bridge final_output delivery (P2 retry)', () => {
 
     const ds = makeDs();
     ds.session.quoteTargetId = 'om_user';
+    ds.pendingAckReactions = [{
+      messageId: 'om_user', reactionId: 'reaction_progress', turnId: 'turn-1', clearOnReply: true,
+    }];
 
     const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
     __testOnly_deliverFinalOutput(ds, finalOutputMsg(), 'tag', 0);
@@ -1504,9 +1518,9 @@ describe('Bridge final_output delivery (P2 retry)', () => {
 
     expect(sessionReply).toHaveBeenCalledTimes(1);
     expect(updateMessageMock).not.toHaveBeenCalled();
-    // Turn reactions are driven off message acceptance (noteTurnReceived) and
-    // the idle edge (finishTurnReactions), not the bridge final-output path.
+    expect(removeReactionMock).toHaveBeenCalledWith('app_test', 'om_user', 'reaction_progress');
     expect(addReactionMock).not.toHaveBeenCalled();
+    expect(ds.pendingAckReactions).toEqual([]);
     expect(ds.lastBridgeEmittedUuid).toBe(SCOPED_DEDUPE_KEY);
   });
 
@@ -2616,8 +2630,12 @@ describe('Worker turn_terminal routing', () => {
   it('reports a managed CLI exit even when the Node worker stays alive', async () => {
     const ds = makeDs();
     const onCliExit = vi.fn(async () => {});
+    const sessionReply = vi.fn(async () => 'om_reply');
+    ds.pendingAckReactions = [{
+      messageId: 'om_live', reactionId: 'reaction_live', turnId: 'om_live', clearOnReply: true,
+    }];
     initWorkerPool({
-      sessionReply: vi.fn(async () => 'om_reply'),
+      sessionReply,
       getSessionWorkingDir: () => '/tmp',
       getActiveCount: () => 1,
       closeSession: vi.fn(),
@@ -2637,9 +2655,11 @@ describe('Worker turn_terminal routing', () => {
     });
 
     (ds.worker as any).emit('message', {
-      type: 'claude_exit', code: 9, signal: 'SIGKILL',
+      type: 'claude_exit', code: 9, signal: 'SIGKILL', turnId: 'om_live',
     } satisfies Extract<WorkerToDaemon, { type: 'claude_exit' }>);
-    await Promise.resolve();
+    await vi.waitFor(() => expect(removeReactionMock).toHaveBeenCalledWith(
+      'app_test', 'om_live', 'reaction_live',
+    ));
 
     expect(onCliExit).toHaveBeenCalledWith(ds, {
       sessionId: ds.session.sessionId,
@@ -2648,6 +2668,7 @@ describe('Worker turn_terminal routing', () => {
       signal: 'SIGKILL',
     });
     expect(ds.managedTurnOrigin).toBeUndefined();
+    expect(ds.pendingAckReactions).toEqual([]);
   });
 
   it('ignores stale-worker CLI exit authority changes after replacement', async () => {

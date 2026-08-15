@@ -44,6 +44,7 @@ const mocks = vi.hoisted(() => {
     sendMessage: vi.fn(async () => 'om_top'),
     sendEphemeralCard: vi.fn(async () => 'om_ephemeral'),
     addReaction: vi.fn(async () => 'reaction_received'),
+    removeReaction: vi.fn(async () => undefined),
     getChatMode: vi.fn(async () => 'group' as 'group' | 'topic' | 'p2p'),
     getChatNameAndMode: vi.fn(async () => ({ name: null, mode: 'group' as const })),
     resolveSender: vi.fn(async (_appId: string, openId: string | undefined, senderType: string | undefined) => (
@@ -73,6 +74,7 @@ const mocks = vi.hoisted(() => {
     }),
     forkWorker: vi.fn((ds: any) => {
       ds.worker = { killed: false, send: vi.fn() };
+      return true;
     }),
     closeWorkerPoolSession: vi.fn(async () => undefined),
     discoverAdoptableSessions: vi.fn(() => [] as any[]),
@@ -109,6 +111,7 @@ vi.mock('../src/im/lark/client.js', async () => {
     sendMessage: mocks.sendMessage,
     sendEphemeralCard: mocks.sendEphemeralCard,
     addReaction: mocks.addReaction,
+    removeReaction: mocks.removeReaction,
     getChatMode: mocks.getChatMode,
     getChatNameAndMode: mocks.getChatNameAndMode,
   };
@@ -527,6 +530,7 @@ describe('/rename production routing — must not pre-create a session (review P
     mocks.sessions.clear();
     mocks.forkWorker.mockImplementation((ds: any) => {
       ds.worker = { killed: false, send: vi.fn() };
+      return true;
     });
     mocks.closeWorkerPoolSession.mockImplementation(async (sessionId: string) => {
       for (const [key, candidate] of activeSessions) {
@@ -719,6 +723,32 @@ describe('/rename production routing — must not pre-create a session (review P
     expect(JSON.stringify(mocks.forkWorker.mock.calls[0]?.[1])).toContain('om_distinct_quoted_message');
     expect(mocks.createSession).toHaveBeenCalledTimes(1);
     expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not establish a visual turn fence for a card-off thread turn', async () => {
+    const bot = registerBot({
+      larkAppId: APP,
+      larkAppSecret: 's',
+      cliId: 'codex',
+      allowedUsers: [OWNER],
+      disableStreamingCard: true,
+    });
+    bot.resolvedAllowedUsers = [OWNER];
+    const ds = seedThreadSession('om_card_off_root', 'card off');
+    ds.streamCardVisualTurnId = 'om_previous_turn';
+    const send = vi.fn();
+    ds.worker = { killed: false, send } as any;
+
+    await handleThreadReply(
+      makeEventData('om_card_off_next', 'next task', 'om_card_off_root'),
+      makeCtx('om_card_off_root', 'om_card_off_next'),
+    );
+
+    expect(send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'message',
+      turnId: 'om_card_off_next',
+    }));
+    expect(ds.streamCardVisualTurnId).toBeUndefined();
   });
 
   it('`/t <content>` preserves a paired forward seed in the first worker input', async () => {
@@ -1308,6 +1338,34 @@ describe('/rename production routing — must not pre-create a session (review P
       'om_force_topic_with_content',
       expect.any(String),
     );
+  });
+
+  it('treats a refused pinned initial fork as unaccepted and removes its reaction', async () => {
+    const bot = registerBot({
+      larkAppId: APP,
+      larkAppSecret: 's',
+      cliId: 'codex',
+      allowedUsers: [OWNER],
+      defaultWorkingDir: '/tmp',
+    });
+    bot.resolvedAllowedUsers = [OWNER];
+    mocks.forkWorker.mockReturnValueOnce(false);
+    const ctx = makeCtx('om_refused_pinned', 'om_refused_pinned');
+
+    await expect(handleNewTopic(
+      makeEventData('om_refused_pinned', 'start work'),
+      ctx,
+    )).rejects.toThrow('Worker refused pinned initial turn');
+
+    expect(ctx.ingressAdmission).toEqual({ admitted: false });
+    expect(mocks.removeReaction).toHaveBeenCalledWith(
+      APP,
+      'om_refused_pinned',
+      'reaction_received',
+    );
+    const ds = activeSessions.get(sessionKey('om_refused_pinned', APP));
+    expect(ds?.worker).toBeNull();
+    expect(ds?.pendingAckReactions).toEqual([]);
   });
 
   it('routes a colliding daemon command to the canonical pending owner and closes only the loser', async () => {
@@ -2636,6 +2694,7 @@ describe('document comment canonical ownership and single-flight delivery', () =
     mocks.sessions.clear();
     mocks.forkWorker.mockImplementation((ds: any) => {
       ds.worker = { killed: false, send: vi.fn() };
+      return true;
     });
     mocks.getAvailableBots.mockResolvedValue([]);
     activeSessions.clear();
@@ -2763,6 +2822,30 @@ describe('document comment canonical ownership and single-flight delivery', () =
     removeDocSubscription(config.session.dataDir, APP, sub.fileToken);
   });
 
+  it.each(['live', 'refork'] as const)(
+    'persists accepted %s doc-watch input before card-state persistence fails',
+    async (mode) => {
+      const sub = docSub(`doc-prewarm-${mode}-persist-${Date.now()}`);
+      const ds = seedThreadSession(sub.sessionAnchor, `prewarm ${mode} persist`);
+      const liveSend = vi.fn();
+      if (mode === 'live') ds.worker = { killed: false, send: liveSend } as any;
+      mocks.updateSession
+        .mockImplementationOnce((session: any) => { mocks.sessions.set(session.sessionId, session); })
+        .mockImplementationOnce(() => { throw new Error('card state persistence failed'); });
+
+      await expect(prewarmDocCommentSession(ds, sub)).rejects.toThrow('card state persistence failed');
+
+      if (mode === 'live') expect(liveSend).toHaveBeenCalledTimes(1);
+      else expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
+      expect(ds.lastUserPrompt).toContain(sub.fileToken);
+      expect(ds.lastCliInput).toContain(sub.fileToken);
+      expect(ds.session.lastUserPrompt).toContain(sub.fileToken);
+      expect(ds.session.lastCliInput).toContain(sub.fileToken);
+      expect(mocks.updateSession).toHaveBeenCalledTimes(2);
+      removeDocSubscription(config.session.dataDir, APP, sub.fileToken);
+    },
+  );
+
   it('serializes concurrent get-or-create, merges targets, and reuses canonical state after restart', async () => {
     const fileToken = `doc-concurrent-${Date.now()}`;
     const sub = docSub(fileToken);
@@ -2824,6 +2907,7 @@ describe('document comment canonical ownership and single-flight delivery', () =
     // Failure was not recorded as completed: a later poll retry can deliver.
     mocks.forkWorker.mockImplementation((ds: any) => {
       ds.worker = { killed: false, send: vi.fn() };
+      return true;
     });
     await expect(handleDocComment(ctx)).resolves.toBe(true);
     expect(mocks.forkWorker).toHaveBeenCalledTimes(2);

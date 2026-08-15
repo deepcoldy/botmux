@@ -34,6 +34,7 @@ const mocks = vi.hoisted(() => {
     replyMessage: vi.fn(async () => 'om_reply'),
     sendMessage: vi.fn(async () => 'om_top'),
     addReaction: vi.fn(async () => 'reaction_received'),
+    removeReaction: vi.fn(async () => undefined),
     getChatMode: vi.fn(async () => 'group' as 'group' | 'topic' | 'p2p'),
     getChatNameAndMode: vi.fn(async () => ({ name: null, mode: 'group' as const })),
     resolveSender: vi.fn(async (_appId: string, openId: string | undefined, senderType: string | undefined) => (
@@ -63,7 +64,9 @@ const mocks = vi.hoisted(() => {
     }),
     forkWorker: vi.fn((ds: any) => {
       ds.worker = { killed: false, send: vi.fn() };
+      return true;
     }),
+    sendWorkerInput: vi.fn(() => true),
     scanMultipleProjects: vi.fn(() => [] as any[]),
     getAvailableBots: vi.fn(async () => [] as any[]),
     downloadResources: vi.fn(async () => ({ attachments: [], needLogin: false })),
@@ -92,6 +95,7 @@ vi.mock('../src/im/lark/client.js', async () => {
     replyMessage: mocks.replyMessage,
     sendMessage: mocks.sendMessage,
     addReaction: mocks.addReaction,
+    removeReaction: mocks.removeReaction,
     getChatMode: mocks.getChatMode,
     getChatNameAndMode: mocks.getChatNameAndMode,
   };
@@ -110,7 +114,11 @@ vi.mock('../src/services/session-store.js', async () => {
 
 vi.mock('../src/core/worker-pool.js', async () => {
   const actual = await vi.importActual<any>('../src/core/worker-pool.js');
-  return { ...actual, forkWorker: mocks.forkWorker };
+  return {
+    ...actual,
+    forkWorker: mocks.forkWorker,
+    sendWorkerInput: mocks.sendWorkerInput,
+  };
 });
 
 vi.mock('../src/core/session-manager.js', async () => {
@@ -224,7 +232,9 @@ describe('ordinary ingress terminal failure → actionable notice', () => {
     mocks.sessions.clear();
     mocks.forkWorker.mockImplementation((ds: any) => {
       ds.worker = { killed: false, send: vi.fn() };
+      return true;
     });
+    mocks.sendWorkerInput.mockReturnValue(true);
     mocks.scanMultipleProjects.mockReturnValue([]);
     mocks.getAvailableBots.mockResolvedValue([]);
     mocks.downloadResources.mockResolvedValue({ attachments: [], needLogin: false });
@@ -272,6 +282,62 @@ describe('ordinary ingress terminal failure → actionable notice', () => {
     expect(repliedText()).toContain(expectedNotice());
   });
 
+  it('pinned new-topic fork failure removes its thread progress reaction', async () => {
+    mkdirSync(mocks.dataDir, { recursive: true });
+    const bot = registerBot({
+      larkAppId: APP,
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      allowedUsers: [OWNER],
+      defaultWorkingDir: mocks.dataDir,
+    });
+    bot.resolvedAllowedUsers = [OWNER];
+    mocks.forkWorker.mockImplementation(() => {
+      throw new Error('new topic fork failed: EAGAIN');
+    });
+
+    await expect(
+      handleNewTopic(
+        makeEventData('om_msg_new_pinned', 'start pinned task'),
+        makeCtx('om_msg_new_pinned', 'om_msg_new_pinned'),
+      ),
+    ).rejects.toThrow('new topic fork failed: EAGAIN');
+
+    expect(mocks.removeReaction).toHaveBeenCalledWith(
+      APP,
+      'om_msg_new_pinned',
+      'reaction_received',
+    );
+  });
+
+  it('pinned thread auto-create fork failure removes its progress reaction', async () => {
+    mkdirSync(mocks.dataDir, { recursive: true });
+    const bot = registerBot({
+      larkAppId: APP,
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      allowedUsers: [OWNER],
+      defaultWorkingDir: mocks.dataDir,
+    });
+    bot.resolvedAllowedUsers = [OWNER];
+    mocks.forkWorker.mockImplementation(() => {
+      throw new Error('auto-create fork failed: EAGAIN');
+    });
+
+    await expect(
+      handleThreadReply(
+        makeEventData('om_msg_auto_pinned', 'continue pinned task', 'om_auto_root'),
+        makeCtx('om_auto_root', 'om_msg_auto_pinned'),
+      ),
+    ).rejects.toThrow('auto-create fork failed: EAGAIN');
+
+    expect(mocks.removeReaction).toHaveBeenCalledWith(
+      APP,
+      'om_msg_auto_pinned',
+      'reaction_received',
+    );
+  });
+
   it('successful delivery sends no failure notice', async () => {
     const anchor = 'om_thread_root_3';
     const ds = seedThreadSession(anchor, 'seeded');
@@ -280,6 +346,31 @@ describe('ordinary ingress terminal failure → actionable notice', () => {
     await handleThreadReply(makeEventData('om_msg_4', 'all good'), makeCtx(anchor, 'om_msg_4'));
 
     expect(repliedText()).not.toContain(expectedNotice());
+  });
+
+  it('live worker rejection removes the exact thread progress reaction', async () => {
+    const anchor = 'om_thread_live_reject';
+    const ds = seedThreadSession(anchor, 'seeded');
+    (ds as any).worker = { killed: false, send: vi.fn() };
+    ds.streamCardId = 'om_stable_status';
+    ds.currentTurnTitle = 'previous completed turn';
+    ds.lastScreenStatus = 'idle';
+    mocks.sendWorkerInput.mockReturnValueOnce(false);
+
+    await handleThreadReply(
+      makeEventData('om_msg_live_reject', 'please retry', anchor),
+      makeCtx(anchor, 'om_msg_live_reject'),
+    );
+
+    expect(mocks.removeReaction).toHaveBeenCalledWith(
+      APP,
+      'om_msg_live_reject',
+      'reaction_received',
+    );
+    expect(ds.pendingAckReactions ?? []).toEqual([]);
+    expect(ds.streamCardId).toBe('om_stable_status');
+    expect(ds.currentTurnTitle).toBe('previous completed turn');
+    expect(ds.lastScreenStatus).toBe('idle');
   });
 });
 
@@ -310,7 +401,9 @@ describe('durable admission then failing status reply → no resend advice (PR #
     mocks.sessions.clear();
     mocks.forkWorker.mockImplementation((ds: any) => {
       ds.worker = { killed: false, send: vi.fn() };
+      return true;
     });
+    mocks.sendWorkerInput.mockReturnValue(true);
     mocks.scanMultipleProjects.mockReturnValue([]);
     mocks.getAvailableBots.mockResolvedValue([]);
     mocks.downloadResources.mockResolvedValue({ attachments: [], needLogin: false });
@@ -416,6 +509,13 @@ describe('durable admission then failing status reply → no resend advice (PR #
     const anchor = 'om_thread_refork_fail';
     const ds = seedThreadSession(anchor, 'seeded') as any;
     ds.hasHistory = true;
+    ds.streamCardId = 'om_stable_status';
+    ds.streamCardNonce = 'stable-nonce';
+    ds.streamCardVisualTurnId = 'om_previous_turn';
+    ds.streamCardTurnGeneration = 7;
+    ds.currentTurnTitle = 'previous completed turn';
+    ds.currentImageKey = 'img_previous';
+    ds.lastScreenStatus = 'idle';
     mocks.forkWorker.mockImplementation(() => {
       throw new Error('fork failed: EAGAIN');
     });
@@ -426,6 +526,33 @@ describe('durable admission then failing status reply → no resend advice (PR #
 
     expect(repliedText()).toContain(resendNotice());
     expect(repliedText()).not.toContain(admittedNotice());
+    expect(mocks.removeReaction).toHaveBeenCalledWith(
+      APP,
+      'om_msg_refork',
+      'reaction_received',
+    );
+    expect(ds.pendingAckReactions ?? []).toEqual([]);
+    expect(ds.streamCardId).toBe('om_stable_status');
+    expect(ds.streamCardVisualTurnId).toBe('om_previous_turn');
+    expect(ds.streamCardTurnGeneration).toBe(7);
+    expect(ds.currentTurnTitle).toBe('previous completed turn');
+    expect(ds.currentImageKey).toBe('img_previous');
+    expect(ds.lastScreenStatus).toBe('idle');
+  });
+
+  it('binds a successful fresh-card refork to the accepted turn', async () => {
+    const anchor = 'om_thread_refork_fresh';
+    const ds = seedThreadSession(anchor, 'seeded') as any;
+    ds.hasHistory = true;
+    ds.streamCardVisualTurnId = 'om_previous_turn';
+
+    await handleThreadReply(
+      makeEventData('om_msg_refork_fresh', 'run the fresh task', anchor),
+      makeCtx(anchor, 'om_msg_refork_fresh'),
+    );
+
+    expect(ds.streamCardVisualTurnId).toBe('om_msg_refork_fresh');
+    expect(ds.streamCardPendingTurnId).toBe('om_msg_refork_fresh');
   });
 
   it('a rejected /vc-auth (pure-reply branch, no side effect) still advises a resend', async () => {

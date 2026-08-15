@@ -602,6 +602,7 @@ function notifyRpcTeardownBeforeActivation(
   const completedBeforeActivation = terminalStatus === 'completed';
   send({
     type: 'user_notify',
+    settlesTurn: true,
     message: completedBeforeActivation
       ? 'Codex RPC 消息已执行完成，但会话在本地完成生命周期登记前重启，兜底输出可能未被捕获；原消息未自动重发，如未看到回复请先查看终端结果再人工跟进。'
       : 'Codex RPC 消息已写出，但会话在取得 turn/start 归属前重启；为避免重复执行未自动重发，请按需人工确认结果。',
@@ -7070,6 +7071,7 @@ async function writeAdoptMessage(
       send({
         type: 'user_notify',
         turnId,
+        settlesTurn: true,
         message: 'Adopt input could not be reconciled because the CLI backend changed while it was being written. Please verify the terminal before retrying.',
       });
     }
@@ -9612,6 +9614,7 @@ function scheduleSubmitFailureNotify(
       send({
         type: 'user_notify',
         turnId: turnIdentity?.turnId ?? currentBotmuxTurnId,
+        settlesTurn: true,
         message: t('worker.submit_impossible', { cliName: cliName(), reason, preview }),
       });
     }
@@ -9701,6 +9704,7 @@ function scheduleSubmitFailureNotify(
       send({
         type: 'user_notify',
         turnId: turnIdentity?.turnId ?? currentBotmuxTurnId,
+        settlesTurn: true,
         message: t(
           effectiveBackendType === 'zmx'
             ? 'worker.submit_unconfirmed_zmx'

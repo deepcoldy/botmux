@@ -1,9 +1,9 @@
 /**
- * Two-phase turn reactions (auto-on for card-off sessions, i.e. streaming card disabled):
+ * Turn progress reactions:
  *   - noteTurnReceived(ds, msgId): react 冲! (GoGoGo) the instant a user message
  *     is accepted for the session, tracked per-message in ds.pendingAckReactions.
- *   - finishTurnReactions(ds): when the worker next goes idle, flip every pending
- *     ✋ to ✅ (DONE) and clear the list.
+ *   - card-off turns flip pending reactions to DONE at idle.
+ *   - stable-card thread turns clear the reaction after reply delivery.
  *
  * Binding the "received" reaction to the message (not a worker status edge) is
  * what makes type-ahead / busy-batched messages each get their own reaction —
@@ -20,6 +20,7 @@ import { join } from 'path';
 const mocks = vi.hoisted(() => ({
   addReaction: vi.fn(),
   removeReaction: vi.fn(),
+  sessionReply: vi.fn(),
 }));
 
 vi.mock('@larksuiteoapi/node-sdk', () => {
@@ -91,6 +92,21 @@ describe('two-phase turn reactions', () => {
     await noteTurnReceived(ds, 'om_a');
     expect(mocks.addReaction).not.toHaveBeenCalled();
     expect(ds.pendingAckReactions ?? []).toEqual([]);
+  });
+
+  it('stable-card thread turns react on receipt and mark the reaction clear-on-reply', async () => {
+    registerWith(false);
+    const ds = makeDs({ scope: 'thread' });
+
+    await noteTurnReceived(ds, 'om_a', undefined, undefined, 'om_a');
+
+    expect(mocks.addReaction).toHaveBeenCalledWith(APP, 'om_a', 'GoGoGo');
+    expect(ds.pendingAckReactions).toEqual([{
+      messageId: 'om_a',
+      reactionId: 'rid_om_a',
+      turnId: 'om_a',
+      clearOnReply: true,
+    }]);
   });
 
   it('dedicated VC receivers never add or finish progress reactions', async () => {
@@ -392,9 +408,10 @@ describe('turn reaction screen_update behavioral gate', () => {
     process.env.SESSION_DATA_DIR = mkdtempSync(join(tmpdir(), 'botmux-react-behav-'));
     mocks.addReaction.mockImplementation(async (_app: string, msgId: string) => `rid_${msgId}`);
     mocks.removeReaction.mockResolvedValue(undefined);
+    mocks.sessionReply.mockResolvedValue('om_reply');
     registerWith(true);
     initWorkerPool({
-      sessionReply: vi.fn(async () => 'om_reply'),
+      sessionReply: mocks.sessionReply,
       getSessionWorkingDir: () => '/repo',
       getActiveCount: () => 1,
       closeSession: vi.fn(),
@@ -438,6 +455,272 @@ describe('turn reaction screen_update behavioral gate', () => {
     expect(mocks.removeReaction).toHaveBeenCalledWith(APP, 'om_a', 'rid_om_a');
     expect(mocks.addReaction).toHaveBeenCalledWith(APP, 'om_a', 'DONE');
     expect(ds.pendingAckReactions).toEqual([]);
+  });
+
+  it('explicit reply delivery removes the exact thread reaction without adding DONE', async () => {
+    registerWith(false);
+    const worker = makeFakeWorker();
+    const ds = makeDs({
+      scope: 'thread',
+      worker,
+      workerPort: 9999,
+      pendingAckReactions: [{
+        messageId: 'om_a', reactionId: 'rid_om_a', turnId: 'om_a', clearOnReply: true,
+      }],
+    });
+    __testOnly_setupWorkerHandlers(ds, worker);
+
+    worker.emit('message', {
+      type: 'explicit_reply_observed', turnId: 'om_a', messageId: 'om_reply',
+    });
+    await flush();
+
+    expect(mocks.removeReaction).toHaveBeenCalledWith(APP, 'om_a', 'rid_om_a');
+    expect(mocks.addReaction).not.toHaveBeenCalledWith(APP, 'om_a', 'DONE');
+    expect(ds.pendingAckReactions).toEqual([]);
+  });
+
+  it('reply delivery clears only its exact turn and leaves a newer turn pending', async () => {
+    registerWith(false);
+    const worker = makeFakeWorker();
+    const ds = makeDs({
+      scope: 'thread',
+      worker,
+      workerPort: 9999,
+      pendingAckReactions: [
+        { messageId: 'om_a', reactionId: 'rid_om_a', turnId: 'om_a', clearOnReply: true },
+        { messageId: 'om_b', reactionId: 'rid_om_b', turnId: 'om_b', clearOnReply: true },
+      ],
+    });
+    __testOnly_setupWorkerHandlers(ds, worker);
+
+    worker.emit('message', {
+      type: 'explicit_reply_observed', turnId: 'om_a', messageId: 'om_reply_a',
+    });
+    await flush();
+
+    expect(mocks.removeReaction).toHaveBeenCalledWith(APP, 'om_a', 'rid_om_a');
+    expect(mocks.removeReaction).not.toHaveBeenCalledWith(APP, 'om_b', 'rid_om_b');
+    expect(ds.pendingAckReactions).toEqual([{
+      messageId: 'om_b', reactionId: 'rid_om_b', turnId: 'om_b', clearOnReply: true,
+    }]);
+  });
+
+  it('nothing-to-send terminal clears the exact thread reaction without a reply event', async () => {
+    registerWith(false);
+    const worker = makeFakeWorker();
+    const ds = makeDs({
+      scope: 'thread',
+      worker,
+      workerPort: 9999,
+      pendingAckReactions: [
+        { messageId: 'om_a', reactionId: 'rid_om_a', turnId: 'om_a', clearOnReply: true },
+        { messageId: 'om_b', reactionId: 'rid_om_b', turnId: 'om_b', clearOnReply: true },
+      ],
+    });
+    __testOnly_setupWorkerHandlers(ds, worker);
+
+    worker.emit('message', {
+      type: 'turn_terminal',
+      sessionId: ds.session.sessionId,
+      turnId: 'om_a',
+      status: 'completed',
+      outputDisposition: 'nothing_to_send',
+    });
+    await flush();
+
+    expect(mocks.removeReaction).toHaveBeenCalledWith(APP, 'om_a', 'rid_om_a');
+    expect(mocks.removeReaction).not.toHaveBeenCalledWith(APP, 'om_b', 'rid_om_b');
+    expect(ds.pendingAckReactions).toEqual([{
+      messageId: 'om_b', reactionId: 'rid_om_b', turnId: 'om_b', clearOnReply: true,
+    }]);
+  });
+
+  it('terminal worker notice clears the exact reaction only after its reply is delivered', async () => {
+    registerWith(false);
+    const worker = makeFakeWorker();
+    const ds = makeDs({
+      scope: 'thread',
+      worker,
+      workerPort: 9999,
+      pendingAckReactions: [
+        { messageId: 'om_a', reactionId: 'rid_om_a', turnId: 'om_a', clearOnReply: true },
+        { messageId: 'om_b', reactionId: 'rid_om_b', turnId: 'om_b', clearOnReply: true },
+      ],
+    });
+    __testOnly_setupWorkerHandlers(ds, worker);
+
+    worker.emit('message', {
+      type: 'user_notify',
+      turnId: 'om_a',
+      settlesTurn: true,
+      message: 'CLI did not accept this message.',
+    });
+    await flush();
+
+    expect(mocks.sessionReply).toHaveBeenCalledWith(
+      'om_root', 'CLI did not accept this message.', 'text', APP, 'om_a', undefined,
+    );
+    expect(mocks.removeReaction).toHaveBeenCalledWith(APP, 'om_a', 'rid_om_a');
+    expect(mocks.sessionReply.mock.invocationCallOrder[0]).toBeLessThan(
+      mocks.removeReaction.mock.invocationCallOrder[0],
+    );
+    expect(ds.pendingAckReactions).toEqual([{
+      messageId: 'om_b', reactionId: 'rid_om_b', turnId: 'om_b', clearOnReply: true,
+    }]);
+  });
+
+  it('informational worker notice does not settle a pending thread reaction', async () => {
+    registerWith(false);
+    const worker = makeFakeWorker();
+    const ds = makeDs({
+      scope: 'thread',
+      worker,
+      workerPort: 9999,
+      pendingAckReactions: [{
+        messageId: 'om_a', reactionId: 'rid_om_a', turnId: 'om_a', clearOnReply: true,
+      }],
+    });
+    __testOnly_setupWorkerHandlers(ds, worker);
+
+    worker.emit('message', {
+      type: 'user_notify', turnId: 'om_a', message: 'Informational notice.',
+    });
+    await flush();
+
+    expect(mocks.sessionReply).toHaveBeenCalledWith(
+      'om_root', 'Informational notice.', 'text', APP, 'om_a', undefined,
+    );
+    expect(mocks.removeReaction).not.toHaveBeenCalled();
+    expect(ds.pendingAckReactions).toEqual([{
+      messageId: 'om_a', reactionId: 'rid_om_a', turnId: 'om_a', clearOnReply: true,
+    }]);
+  });
+
+  it('failed terminal-notice delivery keeps the reaction pending', async () => {
+    registerWith(false);
+    mocks.sessionReply.mockRejectedValueOnce(new Error('Lark unavailable'));
+    const worker = makeFakeWorker();
+    const ds = makeDs({
+      scope: 'thread',
+      worker,
+      workerPort: 9999,
+      pendingAckReactions: [{
+        messageId: 'om_a', reactionId: 'rid_om_a', turnId: 'om_a', clearOnReply: true,
+      }],
+    });
+    __testOnly_setupWorkerHandlers(ds, worker);
+
+    worker.emit('message', {
+      type: 'user_notify', turnId: 'om_a', settlesTurn: true, message: 'Submit failed.',
+    });
+    await flush();
+
+    expect(mocks.removeReaction).not.toHaveBeenCalled();
+    expect(ds.pendingAckReactions).toEqual([{
+      messageId: 'om_a', reactionId: 'rid_om_a', turnId: 'om_a', clearOnReply: true,
+    }]);
+  });
+
+  it('startup-failure reply clears the exact thread reaction after delivery', async () => {
+    registerWith(false);
+    const worker = makeFakeWorker();
+    const ds = makeDs({
+      scope: 'thread',
+      worker,
+      workerPort: 9999,
+      pendingAckReactions: [
+        { messageId: 'om_a', reactionId: 'rid_om_a', turnId: 'om_a', clearOnReply: true },
+        { messageId: 'om_b', reactionId: 'rid_om_b', turnId: 'om_b', clearOnReply: true },
+      ],
+    });
+    __testOnly_setupWorkerHandlers(ds, worker);
+
+    worker.emit('message', {
+      type: 'error', turnId: 'om_a', message: 'CLI startup failed.',
+    });
+    await flush();
+
+    expect(mocks.sessionReply).toHaveBeenCalledWith(
+      'om_root', expect.stringContaining('CLI startup failed.'), 'text', APP, 'om_a', undefined,
+    );
+    expect(mocks.removeReaction).toHaveBeenCalledWith(APP, 'om_a', 'rid_om_a');
+    expect(mocks.sessionReply.mock.invocationCallOrder[0]).toBeLessThan(
+      mocks.removeReaction.mock.invocationCallOrder[0],
+    );
+    expect(ds.pendingAckReactions).toEqual([{
+      messageId: 'om_b', reactionId: 'rid_om_b', turnId: 'om_b', clearOnReply: true,
+    }]);
+  });
+
+  it('failed startup-failure reply keeps the reaction pending', async () => {
+    registerWith(false);
+    mocks.sessionReply.mockRejectedValueOnce(new Error('Lark unavailable'));
+    const worker = makeFakeWorker();
+    const ds = makeDs({
+      scope: 'thread',
+      worker,
+      workerPort: 9999,
+      pendingAckReactions: [{
+        messageId: 'om_a', reactionId: 'rid_om_a', turnId: 'om_a', clearOnReply: true,
+      }],
+    });
+    __testOnly_setupWorkerHandlers(ds, worker);
+
+    worker.emit('message', {
+      type: 'error', turnId: 'om_a', message: 'CLI startup failed.',
+    });
+    await flush();
+
+    expect(mocks.removeReaction).not.toHaveBeenCalled();
+    expect(ds.pendingAckReactions).toEqual([{
+      messageId: 'om_a', reactionId: 'rid_om_a', turnId: 'om_a', clearOnReply: true,
+    }]);
+  });
+
+  it('bare completed terminal does not clear a thread reaction before a trailing reply', async () => {
+    registerWith(false);
+    const worker = makeFakeWorker();
+    const ds = makeDs({
+      scope: 'thread',
+      worker,
+      workerPort: 9999,
+      pendingAckReactions: [{
+        messageId: 'om_a', reactionId: 'rid_om_a', turnId: 'om_a', clearOnReply: true,
+      }],
+    });
+    __testOnly_setupWorkerHandlers(ds, worker);
+
+    worker.emit('message', {
+      type: 'turn_terminal',
+      sessionId: ds.session.sessionId,
+      turnId: 'om_a',
+      status: 'completed',
+    });
+    await flush();
+
+    expect(mocks.removeReaction).not.toHaveBeenCalled();
+    expect(ds.pendingAckReactions).toEqual([{
+      messageId: 'om_a', reactionId: 'rid_om_a', turnId: 'om_a', clearOnReply: true,
+    }]);
+  });
+
+  it('idle does not clear a stable-card thread reaction before reply delivery', async () => {
+    registerWith(false);
+    const ds = makeDs({
+      scope: 'thread',
+      pendingAckReactions: [{
+        messageId: 'om_a', reactionId: 'rid_om_a', turnId: 'om_a', clearOnReply: true,
+      }],
+    });
+
+    await finishTurnReactions(ds);
+
+    expect(mocks.removeReaction).not.toHaveBeenCalled();
+    expect(mocks.addReaction).not.toHaveBeenCalledWith(APP, 'om_a', 'DONE');
+    expect(ds.pendingAckReactions).toEqual([{
+      messageId: 'om_a', reactionId: 'rid_om_a', turnId: 'om_a', clearOnReply: true,
+    }]);
   });
 
   it('working→limited flips DONE (rate-limit banner on settle; synthetic working must not be rewritten)', async () => {
@@ -508,5 +791,3 @@ describe('turn reaction screen_update behavioral gate', () => {
     expect(ds.pendingAckReactions?.map(a => a.messageId)).toEqual(['om_a']);
   });
 });
-
-
