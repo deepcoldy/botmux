@@ -239,6 +239,7 @@ export function buildCloseResultMessage(
   error?: string;
   recovery?: 'retryable' | 'uncertain' | 'irreversible';
   admission?: 'restorable' | 'fenced';
+  residual?: 'local_subtree_unprovable_on_platform' | 'local_subtree_boundary_unproven';
 } {
   return {
     type: 'close_result',
@@ -251,5 +252,13 @@ export function buildCloseResultMessage(
     // does: dropping it here would let the daemon re-derive "retryable ⇒ writes
     // are fine" and undo a fence the backend deliberately kept.
     ...(result.admission ? { admission: result.admission } : {}),
+    // `residual` must cross too, and dropping it was NOT symmetric with dropping
+    // `recovery`: an ok:true close whose local subtree was never proven gone would
+    // arrive as a bare success, so the daemon published an ORDINARY closed row.
+    // That is the fail-open this round exists to remove -- the backend kept the
+    // containment handle, the row said the session was fully gone, and the two
+    // disagreed about a still-credentialed process. The daemon cannot re-derive
+    // this: only the backend saw the evidence grade.
+    ...(result.residual ? { residual: result.residual } : {}),
   };
 }

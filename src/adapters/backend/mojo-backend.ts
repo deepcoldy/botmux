@@ -56,6 +56,7 @@ import {
     recordContainmentHandle,
     releaseContainmentHandle,
     containedProvenQuiescence,
+    containmentQuiescence,
     type ContainmentReleaseDecision,
     weakHandleRootStillOriginal,
 } from '../../core/mojo-containment.js';
@@ -908,7 +909,20 @@ export class MojoBackend implements SessionBackend {
                     + `proven quiescent (${verdict.reason}); refusing the close so the `
                     + 'device-isolation blocker is retained',
                 );
-                return { kind: 'unscannable', boundaryProof: false, reason: verdict.reason };
+                // Do NOT hand-roll the projection here. `unscannable` routes to a
+                // FENCE, which latches write admission and fails the close; that is
+                // right when a retry might still produce proof, and permanently wrong
+                // on a host that can never enumerate at all. An INHERITED unprovable
+                // handle is exactly that host: every /close after a worker generation
+                // replacement re-derived `unscannable`, so admission stayed latched and
+                // the session could never be closed -- the same permanent wedge C-7
+                // fixed on the primary path, still reachable through this one.
+                // `containmentQuiescence` owns the grading and maps an unprovable
+                // handle to `unsupported-platform`, which routes to a RESIDUAL CLOSE:
+                // the row closes, the blocker stays on the handle that was never
+                // released. Grading belongs to the containment module, not to a
+                // second copy of its rules living here.
+                return containmentQuiescence(verdict);
             }
             // The decision is the containment module's to make, not ours: it says
             // whether the handle was actually discharged and whether a residual

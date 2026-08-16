@@ -1258,6 +1258,17 @@ export type WorkerToDaemon =
       taskId?: string;
       error?: string;
       /**
+       * The LOCAL subtree could not be proven gone, even though the close itself
+       * succeeded. Distinct from a remote lineage residual: that one names a
+       * surviving remote task id, this one names a still-unproven process tree on
+       * THIS host whose containment handle was deliberately not released.
+       *
+       * On the wire because the daemon cannot re-derive it. Without it an ok:true
+       * close arrived as a bare success and was published as an ordinary closed
+       * row, contradicting the retained device-isolation blocker.
+       */
+      residual?: 'local_subtree_unprovable_on_platform' | 'local_subtree_boundary_unproven';
+      /**
        * May the daemon roll this failed prepare back?
        *
        * Without it on the wire the tri-state existed only inside the worker: the

@@ -167,6 +167,7 @@ interface CloseResultWire {
   error?: string;
   recovery?: 'retryable' | 'uncertain' | 'irreversible';
   admission?: 'restorable' | 'fenced';
+  residual?: 'local_subtree_unprovable_on_platform' | 'local_subtree_boundary_unproven';
 }
 /**
  * Every close_result the WORKER put on the real IPC channel.
@@ -196,19 +197,28 @@ async function waitFor(
  */
 async function bootRealWorker(opts: {
   /** Injected trigger, or `none` for a 100% production verdict. */
-  mode: 'throw' | 'hang' | 'exit' | 'none';
+  mode: 'throw' | 'hang' | 'exit' | 'none' | 'localResidual';
   /**
    * `false` makes the fake mojo accept the turn and exit WITHOUT emitting
    * `system/init`, which is the real `mojo_lineage_not_materialized` state: a
    * remote session may exist under an id we never learned.
    */
   lineage?: boolean;
+  /**
+   * Make the fake mojo's `session` subcommand emit a real JSON envelope, so the
+   * REMOTE cancel actually SUCCEEDS. Default false keeps every existing case on
+   * its current path (cancel fails, ok:false); only the local-residual probe
+   * needs a successful remote cancel, because the bug it covers lives on the
+   * ok:true branch.
+   */
+  cancellable?: boolean;
 }): Promise<{
   ds: DaemonSession;
   registry: Map<string, DaemonSession>;
   sessionId: string;
 }> {
   const withLineage = opts.lineage ?? true;
+  const cancellable = opts.cancellable ?? false;
   const started = join(workerRoot, 'started');
   const botsPath = join(workerRoot, 'bots.json');
   writeFileSync(botsPath, JSON.stringify([{
@@ -224,7 +234,7 @@ async function bootRealWorker(opts: {
   const bin = join(workerRoot, 'mojo');
   writeFileSync(bin, withLineage
     ? `#!/usr/bin/env bash
-if [ "$1" = "session" ]; then exit 0; fi
+if [ "$1" = "session" ]; then ${cancellable ? `echo '{"ok":true}'; ` : ''}exit 0; fi
 : > "${started}"
 echo '{"type":"system","subtype":"init","session_id":"mojo-sid-e2e"}'
 sleep 30
@@ -407,6 +417,55 @@ afterEach(() => {
   sessionStore.init();
   rmSync(dataDir, { recursive: true, force: true });
   rmSync(workerRoot, { recursive: true, force: true });
+});
+
+describe('mojo close: a local residual must survive the worker IPC boundary', () => {
+  /**
+   * The seam the final review rejected 2e3732be for.
+   *
+   * The backend already graded this close correctly: remote lineage cancelled,
+   * local subtree NOT proven gone, so the containment handle stays and with it the
+   * device-isolation blocker. Every layer after that dropped the grade --
+   * buildCloseResultMessage did not put `residual` on the wire, close_result had no
+   * such field, RemoteWorkerCloseResult had none, and the daemon's success path
+   * returned a bare `{ ok: true }`. The row was therefore published as an ORDINARY
+   * closed session while a credentialed process tree may still have been running,
+   * and the blocker the backend had deliberately kept was invisible to whoever read
+   * the close response.
+   *
+   * Asserted at BOTH ends on purpose, because the two failures need different
+   * fixes and a single assertion cannot tell them apart:
+   *   - on the raw wire  => the producer (worker + payload builder) kept the field
+   *   - on the daemon's return value => the consumer did not flatten it
+   */
+  it('carries residual across real IPC and publishes a residual close, not a plain one', async () => {
+    const { sessionId } = await bootRealWorker({ mode: 'localResidual', cancellable: true });
+
+    const result = await closeSession(sessionId);
+
+    // 1. The producer side: the field crossed the process boundary at all.
+    const wire = closeResults.at(-1);
+    expect(wire).toBeDefined();
+    expect(wire?.ok).toBe(true);
+    expect(wire?.residual).toBe('local_subtree_boundary_unproven');
+
+    // 2. The consumer side: the close succeeded but is NOT an ordinary success.
+    //    `ok:true` alone was the whole bug, so asserting it is not enough.
+    expect(result.ok).toBe(true);
+    const residual = (result as { residual?: { reason?: string; taskId?: string } }).residual;
+    expect(residual).toBeDefined();
+    expect(residual?.reason).toBe('local_subtree_boundary_unproven');
+
+    // 3. A LOCAL residual must not masquerade as a remote one: the remote lineage
+    //    really was cancelled, and offering a taskId here would send an operator
+    //    chasing cleanup on the wrong system.
+    expect(residual?.taskId).toBeUndefined();
+
+    // 4. The close is a real close, not a fence: no rollback, no re-opened
+    //    admission. A fence here would be the permanent wedge this round removed.
+    expect(sentToWorker).toContain('close');
+    expect(sentToWorker).not.toContain('close_abort');
+  }, 30_000);
 });
 
 describe('mojo close: real worker -> IPC -> daemon -> durable journal', () => {

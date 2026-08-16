@@ -36,6 +36,7 @@ import {
   MojoBackend,
   proveWorkerlessLocalSubtree,
 } from '../src/adapters/backend/mojo-backend.js';
+import { classifyUnprovenTermination } from '../src/adapters/backend/destroy-result.js';
 import { isLinux, syntheticProcRoot } from './helpers/synthetic-proc.js';
 import {
   containmentHandles,
@@ -729,3 +730,82 @@ function spawnSleeper(): { pid: number } {
   if (typeof child.pid !== 'number') throw new Error('could not spawn a sleeper');
   return { pid: child.pid };
 }
+
+describe('inherited unprovable handle: a replacement generation must not wedge off Linux', () => {
+  /**
+   * The second P1 in the final review of 2e3732be.
+   *
+   * C-7 made the non-Linux refusal reachable on the PRIMARY path, but this one
+   * stayed broken: dischargeContainment() hand-rolled its own projection and
+   * returned `unscannable` for ANY unproven handle, including an inherited
+   * `unprovable` one. `unscannable` routes to a FENCE -- write admission latches and
+   * the close fails -- which is right only when a retry might still produce proof.
+   * On a host that can never enumerate, no retry ever will, so every /close after a
+   * worker generation replacement re-derived the same refusal: a permanent wedge,
+   * the exact failure C-7 was supposed to have removed.
+   *
+   * Verdict is NOT mocked. A real `unprovable` handle is recorded, a real backend
+   * inherits it with rootPid still null (no turn in this generation), and the real
+   * proof/projection chain runs. Asserting on a hand-made
+   * `{ kind: 'unsupported-platform' }` would only have tested the assertion.
+   */
+  function inheritedUnprovable(sessionId: string): void {
+    recordContainmentHandle({
+      kind: 'unprovable',
+      sessionId,
+      generation: 0,
+      nonce: 'botmux-mojo-inherited-unprovable',
+      platform: 'darwin',
+      reason: 'no cgroup v2 and no readable boot id',
+    });
+  }
+
+  it('grades an inherited unprovable handle as unsupported-platform, not unscannable', async () => {
+    const sessionId = 'sess-inherited-unprovable';
+    inheritedUnprovable(sessionId);
+    const backend = backendFor(sessionId);
+    // No turn ran in this generation: rootPid is null, which is precisely the
+    // replacement-generation shape. The handle is the only thing that knows a tree
+    // was ever created.
+    expect(backend['lastTurnPid']).toBeNull();
+
+    const outcome = await backend['terminateChildProven']();
+
+    // The grade must come from the containment module, which is the only place that
+    // knows an unprovable handle means "this host cannot answer" rather than "the
+    // scan failed this time".
+    expect(backend['lastTurnQuiescence']?.kind).toBe('unsupported-platform');
+    expect(outcome.boundaryProven).toBe(false);
+    // A terminal platform limit is not a fence: the row must be closeable.
+    expect(classifyUnprovenTermination('unsupported-platform').outcome).toBe('residual-close');
+    // And the wedge shape must NOT be what we produced.
+    expect(backend['lastTurnQuiescence']?.kind).not.toBe('unscannable');
+    // The handle stays: the blocker is the handle, and nothing proved the tree gone.
+    expect(containmentHandles(sessionId)).toHaveLength(1);
+  });
+
+  // Linux-only, and the reason is the point of the whole charge: off Linux this
+  // handle grades to `unsupported-platform` too, because the host cannot enumerate
+  // whatever the handle kind is. Asserting `unscannable` here would be asserting
+  // Linux semantics on every platform -- precisely the unstated assumption charge D
+  // was raised about. The non-Linux side of this behaviour is the case above.
+  it.runIf(isLinux)('keeps refusing when the unproven handle is a weak one, which CAN become provable', () => {
+    // The counter-case that stops the fix from becoming "never fence again": a weak
+    // handle whose scan failed may succeed on retry, so a fence is still correct.
+    // Without this, deleting the platform distinction entirely would pass.
+    const sessionId = 'sess-inherited-weak-unscannable';
+    recordContainmentHandle(liveWeakHandle(sessionId, process.pid, 'nonce-inherited-weak'));
+    const backend = backendFor(sessionId);
+    Object.defineProperty(backend, 'procRoot', {
+      get() { return join(dataDir, 'no-such-proc'); },
+      configurable: true,
+    });
+
+    return (backend['terminateChildProven']() as Promise<{ boundaryProven: boolean }>).then(outcome => {
+      expect(outcome.boundaryProven).toBe(false);
+      expect(backend['lastTurnQuiescence']?.kind).toBe('unscannable');
+      expect(classifyUnprovenTermination('unscannable').outcome).toBe('fence');
+      expect(containmentHandles(sessionId)).toHaveLength(1);
+    });
+  });
+});

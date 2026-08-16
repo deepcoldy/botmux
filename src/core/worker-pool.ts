@@ -603,6 +603,9 @@ type RemoteWorkerCloseResult = {
   recovery?: 'retryable' | 'uncertain' | 'irreversible';
   /** Absent means: derive from `recovery`. See mayRestoreWriteAdmission. */
   admission?: 'restorable' | 'fenced';
+  /** Local subtree left unproven by an otherwise successful close. Never
+   *  re-derivable here: only the backend saw the evidence grade. */
+  residual?: 'local_subtree_unprovable_on_platform' | 'local_subtree_boundary_unproven';
 };
 
 const pendingRemoteWorkerCloses = new Map<string, {
@@ -3403,6 +3406,29 @@ async function prepareLiveRemoteWorkerClose(
         ...(taskId ? { taskId } : {}),
       };
       logger.info(`[${tag(ds)}] mojo worker close prepared and remote cancellation confirmed`);
+      // The remote lineage is confirmed cancelled, but that says nothing about the
+      // LOCAL process tree. When the backend could not prove its subtree gone it
+      // kept the containment handle, so this row must NOT be published as an
+      // ordinary closed one: the device-isolation blocker is still live and an
+      // operator reading "closed" would believe a credentialed process was gone.
+      //
+      // Kept distinct from the remote lineage residual on purpose. That one names a
+      // surviving remote task id and asks for remote cleanup; this one names a host
+      // subtree and asks for local cleanup, and collapsing them would send the
+      // operator after the wrong thing. Hence no taskId here even when one exists —
+      // the remote side really was cancelled.
+      if (result.residual) {
+        logger.warn(
+          `[${tag(ds)}] mojo remote cancellation confirmed, but the LOCAL subtree was not `
+          + `proven gone (${result.residual}); publishing a residual close so the `
+          + 'device-isolation blocker stays visible',
+        );
+        return {
+          ok: true,
+          ...(taskId ? { taskId } : {}),
+          residual: { reason: result.residual },
+        };
+      }
       return { ok: true, ...(taskId ? { taskId } : {}) };
     }
 
@@ -4521,17 +4547,32 @@ export function teardownAuthoritativePersistentBackingBeforeClose(
  * whose worker died asynchronously must still resolve with `{ ok: true }`.
  */
 /**
- * Why a close left a remote session behind even though the local row closed.
+ * Why a close left something behind even though the local row closed.
  *
- * Only ONE cause qualifies: a quarantined lineage, where nothing records which
- * control plane holds the remote session, so cancelling could reach a different
- * tenant. Refusing forever would strand the row (no retry can ever make an
- * unverifiable control plane verifiable), so the row closes — but the caller must
- * SAY so rather than showing the ordinary "closed" confirmation.
+ * Two causes qualify, and they are deliberately NOT merged, because they send the
+ * operator to different places:
+ *
+ *  - `mojo_lineage_quarantined` — REMOTE residual. Nothing records which control
+ *    plane holds the remote session, so cancelling could reach a different tenant.
+ *    Carries the surviving remote `taskId`; cleanup is remote.
+ *  - `local_subtree_*` — LOCAL residual. The remote lineage really was cancelled,
+ *    but the backend could not prove its own process subtree on THIS host was gone,
+ *    so it kept the containment handle and the device-isolation blocker with it.
+ *    No `taskId`: there is no surviving remote id to chase, and offering one would
+ *    point cleanup at the wrong system.
+ *
+ * In both cases refusing forever would strand the row (no retry can make an
+ * unverifiable control plane verifiable, nor make an unenumerable host
+ * enumerable), so the row closes — but the caller must SAY so rather than showing
+ * the ordinary "closed" confirmation.
  */
 export interface CloseResidual {
-  reason: 'mojo_lineage_quarantined';
-  taskId: string;
+  reason:
+    | 'mojo_lineage_quarantined'
+    | 'local_subtree_unprovable_on_platform'
+    | 'local_subtree_boundary_unproven';
+  /** Present only for a REMOTE residual; a local one has no remote id to name. */
+  taskId?: string;
 }
 
 /**
@@ -10410,6 +10451,11 @@ function setupWorkerHandlers(
           // Forwarded, never re-derived: the backend may keep writes fenced on a
           // close that is otherwise retryable, and only it knows that.
           ...(msg.admission ? { admission: msg.admission } : {}),
+          // Same reason, and this one was the leak: an ok:true close carrying a
+          // local residual arrived here, lost the field, and was published as an
+          // ordinary closed row while the backend still held the containment
+          // handle for a subtree it could not prove gone.
+          ...(msg.residual ? { residual: msg.residual } : {}),
         });
         break;
       }

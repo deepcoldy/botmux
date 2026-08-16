@@ -286,3 +286,36 @@ but was obtained at vitest's default parallelism. A reviewer running at a differ
 may see these two cases fail. Treat that as a known, unexplained observation on the C-7
 acceptance tests, not as a fresh regression, and not as evidence that C-7 itself is unsound --
 the C-7 production-path assertions and the M6 mutation kill are reported separately above.
+
+## Final-review follow-up (the two P1s)
+
+Measured on the follow-up head, Linux x86_64, `tsc --noEmit` clean, `npm run build` clean.
+
+| Suite | Result |
+| --- | --- |
+| Linux mojo domain, run 1 | 575 passed / 0 failed |
+| Linux mojo domain, run 2 | 575 passed / 0 failed |
+| Non-Linux simulation | 546 passed / 29 skipped / **0 failed** |
+
+Three new cases (+3 over the 572 of the previous head): one live-worker end-to-end case for
+the IPC residual, and two for the inherited-handle grading (the fix plus its counter-case).
+
+Mutations, each reverted and re-verified green afterwards:
+
+| Mutation | Result |
+| --- | --- |
+| `buildCloseResultMessage()` drops `residual` | KILLED |
+| daemon `close_result` receiver drops `residual` | KILLED |
+| `dischargeContainment()` restores the hand-rolled `unscannable` | KILLED |
+
+One note worth keeping, because it repeats this round's lesson. The counter-case
+(an unproven **weak** handle must still fence) initially failed under the non-Linux
+simulation, and it was right to fail: off Linux that handle grades to
+`unsupported-platform` as well, because the host cannot enumerate whatever the handle kind
+is. The assertion had quietly assumed Linux semantics on every platform — the same unstated
+assumption charge D was raised about, reintroduced by the fix for a different charge. It is
+now explicitly gated to Linux, and the non-Linux side of the behaviour is covered by the
+case above it.
+
+Non-Linux remains simulation only: `platform` mock plus `vi.mock('node:fs')`, **no Darwin
+hardware**. Nothing here should be read as macOS having been verified on a real machine.

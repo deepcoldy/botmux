@@ -33,6 +33,16 @@
  * Plus one mode that injects NO behaviour at all, only a path:
  *   unscannable  procRoot -> a missing dir, so the REAL scan cannot prove the
  *                subtree is gone and the REAL verdict is retryable + fenced
+ *
+ * Plus one that injects an EVIDENCE GRADE and nothing else:
+ *   localResidual  terminateChildProven() reports the Linux-normal weak-handle
+ *                  outcome (ok, but boundary NOT proven). Everything downstream --
+ *                  the two-level gate in destroySession, buildCloseResultMessage,
+ *                  the IPC hop, the daemon's publish decision -- stays production
+ *                  code. That is deliberate: whether this grade is computed
+ *                  correctly is charge A's question and is covered elsewhere; the
+ *                  question HERE is whether the grade survives the wire, which is
+ *                  exactly what it did not.
  */
 import { MojoBackend } from '../../src/adapters/backend/mojo-backend.js';
 
@@ -78,4 +88,32 @@ if (mode === 'throw') {
   MojoBackend.prototype.destroySession = (function destroySessionKillsWorker(): never {
     process.exit(7);
   }) as unknown as Destroy;
+}
+
+if (mode === 'localResidual') {
+  // ok:true with boundaryProven:false is not a contrived state -- it is the
+  // ordinary Linux weak-handle outcome: the turn's child is gone and signalling
+  // succeeded, but a /proc scan is not an unforgeable boundary proof, so the
+  // containment handle is kept. Reaching it through a real scan would need a
+  // synthetic /proc tree in the child; the grade itself is asserted directly in
+  // test/mojo-termination-outcome.test.ts, so injecting it here keeps this probe
+  // aimed at the seam that actually broke.
+  //
+  // Injected on the protected method rather than on destroySession(), so the
+  // branch that turns this grade into a residual close still runs for real. A
+  // stub of destroySession() would have concealed the bug: the payload builder
+  // and the daemon are the parts that dropped the field.
+  Object.defineProperty(MojoBackend.prototype, 'terminateChildProven', {
+    value: async function terminateChildProvenLocalResidual() {
+      return {
+        ok: true,
+        boundaryProven: false,
+        evidence: 'diagnostic-clean',
+        residual: { deviceIsolation: true, reason: 'e2e injected weak-handle grade' },
+        signalsStopped: true,
+      };
+    },
+    configurable: true,
+    writable: true,
+  });
 }

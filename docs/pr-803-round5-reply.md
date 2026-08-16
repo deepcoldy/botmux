@@ -45,19 +45,95 @@ the write-up, not the fix.
 
 ---
 
+## Final review of 2e3732be: the two P1s and what they had in common
+
+The final review passed the design and rejected the delivery: no P0, two P1s, both at a
+production boundary rather than in the logic they guard. Both are fixed here.
+
+### P1 — a local residual was dropped at the worker IPC boundary
+
+The backend graded the close correctly and every layer after it discarded the grade.
+`buildCloseResultMessage()` did not put `residual` on the wire, `close_result` had no such
+field, `RemoteWorkerCloseResult` had none, and the daemon's success path returned a bare
+`{ ok: true }`. A live-worker `/close` was therefore published as an **ordinary** closed
+row while the backend still held the containment handle for a subtree it could not prove
+gone — the row said the session was over, the blocker said a credentialed process might
+still be running, and nothing reconciled them.
+
+Fixed along the whole chain, and the two residual kinds are kept apart on purpose:
+
+| | Remote residual | Local residual |
+|---|---|---|
+| reason | `mojo_lineage_quarantined` | `local_subtree_*` |
+| what survived | a remote session under an unverifiable control plane | a process tree on this host |
+| `taskId` | present, names the survivor | **absent** — the remote side really was cancelled |
+| cleanup | remote | local |
+
+Collapsing them would have sent an operator to the wrong system, so `CloseResidual.taskId`
+is now optional rather than reused.
+
+Covered by a live-worker end-to-end case asserting at **both** ends, because the producer
+and consumer failures need different fixes and one assertion cannot tell them apart: the
+raw `close_result` on the wire still carries `residual`, and the daemon's return value is a
+residual close with no `taskId`. Two mutations, each KILLED: dropping the field at the
+payload builder, and dropping it at the daemon receiver.
+
+### P1 — an inherited unprovable handle still wedged off Linux
+
+C-7 made the non-Linux refusal reachable on the primary path, but `dischargeContainment()`
+kept a second copy of the grading rules and hand-rolled `unscannable` for any unproven
+handle. `unscannable` routes to a **fence**, which latches write admission and fails the
+close; that is correct when a retry might still produce proof and permanently wrong on a
+host that can never enumerate. So after a worker generation replacement, every `/close`
+re-derived the same refusal and the session could never be closed — the same permanent
+wedge C-7 removed, still reachable through another door.
+
+Fixed by deleting the second copy: the method now defers to `containmentQuiescence()`,
+which maps an unprovable handle to `unsupported-platform` and therefore to a residual
+close. Grading belongs to the containment module; this layer decides only whether it
+applies.
+
+Verified through the real path, not a mocked verdict: a real `unprovable` handle is
+recorded, a real backend inherits it with `rootPid` still `null` (the replacement-generation
+shape), and the real proof chain runs. A counter-case pins the other direction — an
+unproven **weak** handle must still fence, because its scan may succeed on retry — so
+deleting the platform distinction outright does not pass. Mutation: restoring the
+hand-rolled `unscannable` is KILLED.
+
+### What the two had in common
+
+Neither was a wrong decision. Both were correct decisions that stopped being observable
+one layer out: one crossed a process boundary and lost a field, the other met a second
+copy of a rule it had already satisfied. The audit that found the round-5 charges asked
+"does anything read this field?"; it did not ask "does the value survive the seam?" or
+"is this rule implemented once?". Those are the two questions this round adds.
+
+---
+
 ## Status of each charge
 
-| Charge | Severity | Owner | Status in this reply |
-|---|---|---|---|
-| A — `boundaryProof` never reached a production decision point | P1 | BoundaryProof | Accepted. Fix in progress; see note below. |
-| B — weak handle released on a clean scan | P1 | WeakHandle | Accepted. Fix in progress; see note below. |
-| C — overstated delivery claims | P0.5 | Claims (this document) | **Corrections published below.** |
-| D — tests not cross-platform | P0.5 | CrossPlatform | Accepted. Fix in progress; see note below. |
+> **Reading order.** This table is the CURRENT state of the delivered head. Sections
+> further down were written while the work was still in flight and describe how each
+> conclusion was reached, including conclusions that were later superseded. Where a
+> section says something is unfixed or in progress, it is a record of that moment, not
+> a statement about the head; every such place now carries a pointer forward. The
+> distinction matters because the retrospective is the evidence that the self-checks
+> worked, and deleting it would leave only the claims.
 
-To keep this reply honest about its own scope: sections C and the reverse audit are
-complete and are this document's own work. **Charges A, B and D are being fixed by
-other contributors in this round, and this document deliberately does not report them
-as landed.** Their verification numbers will be added by their owners before the round
+| Charge | Severity | Status at the delivered head |
+|---|---|---|
+| A — `boundaryProof` never reached a production decision point | P1 | **Fixed.** `terminateChildProven()` returns a structured `TerminationOutcome`; the gate is `mojo-backend.ts` `else if (!termination.boundaryProven)`. Production reads of the field: 0 before, 4 now. |
+| B — weak handle released on a clean scan | P1 | **Fixed.** `scan-clean` yields `boundaryProof:false`, keeps the handle, sets a residual, and only stops repeat signalling. The row may close; the blocker stays. |
+| C — overstated delivery claims | P0.5 | **Fixed.** Corrections published below; all round-5 documents are inside the repository under `docs/`. |
+| D — tests not cross-platform | P0.5 | **Fixed.** Fixtures go through the `procRoot` seam, Linux-only cases are explicitly gated, and the earlier 135/135 and 558/558 figures are restated as Linux-only. |
+| C-7 — non-Linux refusal unreachable from production (found by us) | P1 | **Fixed** on the primary path (`DEFAULT_PROC_ROOT` + `isProcRootOverridden`) and on the inherited-handle path (see below). |
+| Final-review P1 — local residual dropped at the worker IPC boundary | P1 | **Fixed.** `residual` now crosses `close_result` / `RemoteWorkerCloseResult`, and a successful close carrying one publishes a residual close rather than a plain one. |
+| Final-review P1 — inherited unprovable handle still wedged off Linux | P1 | **Fixed.** `dischargeContainment()` no longer hand-rolls `unscannable`; it defers to `containmentQuiescence()`, so an unprovable handle grades to `unsupported-platform` and routes to a residual close. |
+
+To keep this reply honest about its own scope: sections C and the reverse audit are this
+document's own work. **A, B and D were fixed by other contributors and have since
+landed; the sentences below that describe them as in flight are from before that, and
+are kept because the reasoning is still what a reviewer needs to check.** Their verification numbers will be added by their owners before the round
 is submitted. Nothing here should be read as a claim that A, B or D is finished.
 
 ---
@@ -228,14 +304,18 @@ non-property the first four did.
 The only non-Linux figure this reply stands behind is the one it measured itself at the
 delivered tip, with the corrected probe in the tree: **540 passed / 28 skipped / 0 failed**.
 
-**And that 0 must not be read as macOS being fixed.** C-7 is still unfixed at the delivered
-sha, verified directly: the criterion remains `opts.procRootOverridden`, both call sites
-still pass `procRoot !== undefined`, no `DEFAULT_PROC_ROOT` or `isProcRootOverridden` exists
-in `src/`, and the `never set in production` comment is unchanged. The four close-path
-failures that previously demonstrated the defect no longer reproduce, and no C-7 repair
-landed, so **the defect is now unguarded: nothing in the suite fails because of it.**
-Details in the audit. **No claim is made anywhere in this round that cross-platform
-behaviour is fixed or that the macOS failures are at zero.**
+**And that 0 must not be read as macOS being fixed.** That still holds: the figure comes
+from a simulation, and no Darwin hardware was involved anywhere in this round.
+
+What has changed since this paragraph was written is C-7 itself. At the time it was
+verified as unfixed at the then-current sha, while the four close-path failures that had
+demonstrated it no longer reproduced — a defect with no test failing because of it, which
+is worse than a visible one. **C-7 is now fixed on both paths**: `DEFAULT_PROC_ROOT` plus
+`isProcRootOverridden` on the primary path, and `dischargeContainment()` deferring to
+`containmentQuiescence()` on the inherited-handle path, each with a mutation that dies
+when the criterion is reverted. The paragraph above is kept because the reasoning it
+records is the reason the guard exists: a probe turning green is not evidence, because it
+was already green while the defect was live.
 
 **No Linux full-suite figure is offered for this branch.** The charge-D work only ran the
 targeted mojo suites; the full suite was not re-run on that branch, so no whole-repo
