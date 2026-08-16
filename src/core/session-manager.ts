@@ -187,8 +187,8 @@ async function resumeRestoredPendingRepoSetup(
     const input = buildNewTopicCliInput(
       setup.prompt,
       ds.session.sessionId,
-      ds.session.cliId ?? bot.config.cliId,
-      ds.session.cliPathOverride ?? bot.config.cliPathOverride,
+      ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? bot.config.cliId,
+      ds.session.cliLaunchSnapshot?.cliPathOverride ?? ds.session.cliPathOverride ?? bot.config.cliPathOverride,
       ds.pendingAttachments,
       ds.pendingMentions,
       availableBots,
@@ -3457,7 +3457,7 @@ export async function executeScheduledTask(
       sessionStore.updateSession(ds.session);
     }
     ensureSessionWhiteboard(ds);
-    const prompt = buildNewTopicCliInput(firePrompt, session.sessionId, bot.config.cliId, bot.config.cliPathOverride, undefined, undefined, undefined, undefined, { name: bot.botName, openId: bot.botOpenId }, localeForBot(larkAppId), undefined, { larkAppId, chatId: task.chatId, whiteboardId: ds.session.whiteboardId });
+    const prompt = buildNewTopicCliInput(firePrompt, session.sessionId, ds.session.cliLaunchSnapshot?.cliId ?? session.cliId ?? bot.config.cliId, ds.session.cliLaunchSnapshot?.cliPathOverride ?? session.cliPathOverride ?? bot.config.cliPathOverride, undefined, undefined, undefined, undefined, { name: bot.botName, openId: bot.botOpenId }, localeForBot(larkAppId), undefined, { larkAppId, chatId: task.chatId, whiteboardId: ds.session.whiteboardId });
     // Compare-and-set registration (master): a concurrent creator/restore may
     // have claimed this anchor between the scratch cleanup above and here.
     // Refuse to overwrite the live occupant, retire THIS rejected candidate's
@@ -3555,7 +3555,7 @@ async function forkOrShowRepoCard(
   }
 
   const buildPrompt = () => buildNewTopicCliInput(
-    userContent, ds.session.sessionId, bot.config.cliId, bot.config.cliPathOverride,
+    userContent, ds.session.sessionId, ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? bot.config.cliId, ds.session.cliLaunchSnapshot?.cliPathOverride ?? ds.session.cliPathOverride ?? bot.config.cliPathOverride,
     ds.pendingAttachments, ds.pendingMentions, undefined, ds.pendingFollowUps,
     { name: bot.botName, openId: bot.botOpenId }, locale, ds.pendingSender,
     {

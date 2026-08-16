@@ -4991,7 +4991,7 @@ export async function startForkSubtopicSession(
       parentRootId: parentSession.rootMessageId,
     }, loc);
     const availableBots = await getAvailableBots(appId, chatId);
-    const childCliId = parentSession.cliId ?? botCfg.cliId;
+    const childCliId = parentSession.cliLaunchSnapshot?.cliId ?? parentSession.cliId ?? botCfg.cliId;
     const { forkSession } = await import('./worker-pool.js');
     const forkResult = await forkSession(
       parentSession.sessionId,
@@ -5010,7 +5010,7 @@ export async function startForkSubtopicSession(
           `${childIntro}\n\n${taskText}`,
           childSessionId,
           childCliId,
-          botCfg.cliPathOverride,
+          parentSession.cliLaunchSnapshot?.cliPathOverride ?? parentSession.cliPathOverride ?? botCfg.cliPathOverride,
           undefined,
           undefined,
           availableBots,
