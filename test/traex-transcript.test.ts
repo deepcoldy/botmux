@@ -3,7 +3,7 @@ import { appendFileSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { CodexBridgeQueue } from '../src/services/codex-bridge-queue.js';
-import { CODEX_CONNECTION_ERROR_CODE } from '../src/services/codex-transcript.js';
+import { CODEX_CONNECTION_ERROR_CODE, CODEX_RATE_LIMIT_ERROR_CODE } from '../src/services/codex-transcript.js';
 import {
   isBridgeNothingToSendFinal,
   shouldEmitEmptyCompletedBridgeFallback,
@@ -483,6 +483,62 @@ describe('drainTraexRollout', () => {
       [],
       false,
     )).toBe(false);
+  });
+
+  it('does not synthesise a bare sentinel in adopt mode (verbatim contract)', () => {
+    // adopt posts transcript text verbatim, so a synthesised token would leak
+    // the literal sentinel into Lark. Keep the empty final; no alert fires in
+    // adopt either (shouldEmitEmptyCompletedBridgeFallback is adopt-gated).
+    writeFileSync(path, [
+      line(user('do the work')),
+      line(agentMessage('已回报。BOTMUX_NO_REPLY', 'commentary')),
+      line(taskComplete()),
+    ].join(''));
+
+    expect(drainTraexRollout(path, 0, { adoptMode: true }).events.at(-1)).toEqual(expect.objectContaining({
+      kind: 'assistant_final',
+      text: '',
+    }));
+    // Non-adopt still synthesises (existing behaviour).
+    expect(drainTraexRollout(path, 0).events.at(-1)).toEqual(expect.objectContaining({
+      kind: 'assistant_final',
+      text: 'BOTMUX_NO_REPLY',
+    }));
+  });
+
+  it('a probe re-drain mid-turn does not clear the production pending state', () => {
+    // traexRolloutHasUserInputSince re-drains the same live rollout; its
+    // user_message processing must not delete the commentary the production
+    // drainer is holding for the still-open turn.
+    const firstBatch = line(user('long turn'))
+      + line(agentMessage('已回报。BOTMUX_NO_REPLY', 'commentary'));
+    writeFileSync(path, firstBatch);
+    const first = drainTraexRollout(path, 0);
+    expect(first.events.map(event => event.kind)).toEqual(['user']);
+
+    // Submit-confirmation probe re-drains the same rollout.
+    expect(traexRolloutHasUserInputSince(path, 0, 'long turn')).toBe(true);
+
+    // Turn completes; the production drain must still see the cached commentary.
+    appendFileSync(path, line(taskComplete()));
+    const second = drainTraexRollout(path, first.newOffset);
+    expect(second.events).toEqual([
+      expect.objectContaining({ kind: 'assistant_final', text: 'BOTMUX_NO_REPLY' }),
+    ]);
+  });
+
+  it('maps a 429 task_complete error to the rate-limit failure code', () => {
+    writeFileSync(path, [
+      line(user('hit the limit')),
+      line(taskCompleteWithError({ message: '429 Too Many Requests' })),
+    ].join(''));
+
+    expect(drainTraexRollout(path, 0).events.at(-1)).toMatchObject({
+      kind: 'assistant_final',
+      text: '',
+      terminalStatus: 'failed',
+      terminalErrorCode: CODEX_RATE_LIMIT_ERROR_CODE,
+    });
   });
 });
 

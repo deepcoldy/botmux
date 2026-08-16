@@ -64,6 +64,20 @@ export interface TraexDrainResult extends CodexDrainResult {
   latestReasoningEffort?: string;
 }
 
+export interface TraexDrainOptions {
+  /** Adopt mode: the adopted CLI is botmux-unaware, so the drainer must NOT
+   *  synthesise a bare nothing-to-send sentinel for an empty final — the emit
+   *  layer posts transcript text verbatim in adopt mode and the literal token
+   *  would leak into Lark. Default false (synthesise, matching the non-adopt
+   *  genuine-silence contract). */
+  adoptMode?: boolean;
+  /** Read-only probe: skip the per-turn agent_message cache mutations. Used by
+   *  submit-confirmation probes that re-drain the same live rollout at a
+   *  different offset and must not disturb the production drainer's pending
+   *  turn state. */
+  probe?: boolean;
+}
+
 export interface TraexRuntimeSnapshot {
   model?: string;
   reasoningEffort?: string;
@@ -186,8 +200,16 @@ function runtimeFromTraexEntry(entry: any): TraexRuntimeSnapshot | undefined {
  *     failure must not be read as a silent success;
  *   - otherwise the turn's agent_message records (tracked across drain calls)
  *     recover a dropped final_answer or recognise a trailing
- *     nothing-to-send sentinel as deliberate silence. */
-export function drainTraexRollout(path: string, fromOffset: number): TraexDrainResult {
+ *     nothing-to-send sentinel as deliberate silence. The sentinel synthesis
+ *     runs only in non-adopt mode: adopt posts transcript text verbatim, so a
+ *     synthesised bare token would leak into Lark. */
+export function drainTraexRollout(
+  path: string,
+  fromOffset: number,
+  opts?: TraexDrainOptions,
+): TraexDrainResult {
+  const adoptMode = opts?.adoptMode === true;
+  const probe = opts?.probe === true;
   if (!existsSync(path)) return { events: [], newOffset: 0, pendingTail: '' };
   let size: number;
   try { size = statSync(path).size; } catch { return { events: [], newOffset: fromOffset, pendingTail: '' }; }
@@ -236,7 +258,7 @@ export function drainTraexRollout(path: string, fromOffset: number): TraexDrainR
         events.push({ ...base, kind: 'user', text: userText });
         // New turn: drop any agent_message state an unterminated predecessor
         // left behind so it can't be attributed to this turn.
-        traexPendingAgentCache.delete(path);
+        if (!probe) traexPendingAgentCache.delete(path);
       }
       continue;
     }
@@ -244,7 +266,8 @@ export function drainTraexRollout(path: string, fromOffset: number): TraexDrainR
     // (final_answer). They are NOT turn boundaries — only task_complete is —
     // so they are tracked per turn and consulted when the terminal arrives
     // with an empty/missing last_agent_message.
-    if (obj.type === 'event_msg'
+    if (!probe
+      && obj.type === 'event_msg'
       && payload.type === 'agent_message'
       && typeof payload.message === 'string'
       && payload.message.length > 0) {
@@ -263,7 +286,10 @@ export function drainTraexRollout(path: string, fromOffset: number): TraexDrainR
         ? payload.last_agent_message
         : '';
       let text = rawFinal;
-      if (!failed && rawFinal.trim().length === 0) {
+      // Synthesis is non-adopt only: adopt posts transcript text verbatim, so
+      // a synthesised bare sentinel would leak the literal token into Lark.
+      // In adopt an empty final stays empty (no alert fires there either).
+      if (!adoptMode && !failed && rawFinal.trim().length === 0) {
         // TRAE wrote no final for a successful turn. Recover, in order:
         //   1. a final_answer-phase agent_message — TRAE dropped the final it
         //      actually produced (the phase field guarantees it is an answer,
@@ -277,7 +303,7 @@ export function drainTraexRollout(path: string, fromOffset: number): TraexDrainR
           ? pending.lastFinalAnswer
           : traexTrailingSentinel(pending?.lastCommentary ?? '') ?? '';
       }
-      traexPendingAgentCache.delete(path);
+      if (!probe) traexPendingAgentCache.delete(path);
       events.push({
         ...base,
         kind: 'assistant_final',
@@ -302,7 +328,7 @@ export function drainTraexRollout(path: string, fromOffset: number): TraexDrainR
       && payload.type === 'turn_aborted'
       && typeof payload.turn_id === 'string'
       && payload.turn_id.length > 0) {
-      traexPendingAgentCache.delete(path);
+      if (!probe) traexPendingAgentCache.delete(path);
       events.push({
         ...base,
         kind: 'assistant_final',
@@ -403,15 +429,19 @@ function normaliseInputText(text: string): string {
   return text.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
 }
 
-/** Authoritative submit confirmation used by the adapter. Only a complete
- * event_msg/user_message record appended after `fromOffset` can match. */
+/** Submit-confirmation probe: only a complete event_msg/user_message record
+ * appended after `fromOffset` can match. Read-only — drains with `probe` so
+ * it never mutates the per-turn agent_message cache the production drainer
+ * relies on (a re-drain of the same live rollout at a different offset must
+ * not clear pending turn state). Not currently wired into the production
+ * submit-confirmation path; kept as a tested probe. */
 export function traexRolloutHasUserInputSince(
   path: string,
   fromOffset: number,
   expectedText: string,
 ): boolean {
   const expected = normaliseInputText(expectedText);
-  return drainTraexRollout(path, fromOffset).events.some(event =>
+  return drainTraexRollout(path, fromOffset, { probe: true }).events.some(event =>
     event.kind === 'user' && normaliseInputText(event.text) === expected,
   );
 }

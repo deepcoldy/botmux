@@ -44,7 +44,7 @@ import { readProcessStartIdentity } from './core/session-marker.js';
 import { roleLibraryRoot, roleLibrarySubtree } from './core/role-library.js';
 import { drainTranscript, joinAssistantText, trailingAssistantText, findJsonlContainingFingerprint, findJsonlsContainingExactContent, findLatestJsonl, extractLastAssistantTurn, stringifyUserContent, extractTurnStartText, splitTranscriptEventsByCutoff, isTranscriptRateLimitEvent, apiErrorMessageText, type TranscriptEvent } from './services/claude-transcript.js';
 import { BridgeTurnQueue, makeFingerprint, normaliseForFingerprint } from './services/bridge-turn-queue.js';
-import { bridgePostText, isBridgeNothingToSendFinal, shouldEmitEmptyCompletedBridgeFallback, shouldEmitFailedBridgeFallback, shouldSuppressBridgeEmit, stripTrailingBridgeSentinelLine, type BridgeSendMarker } from './services/bridge-fallback-gate.js';
+import { bridgePostText, isBridgeNothingToSendFinal, shouldEmitEmptyCompletedBridgeFallback, shouldSuppressBridgeEmit, structuredFallbackKind, stripTrailingBridgeSentinelLine, type BridgeSendMarker } from './services/bridge-fallback-gate.js';
 import { buildSubmitMessagePreview } from './services/submit-notification.js';
 import {
   decideHardTimeoutAction,
@@ -143,7 +143,7 @@ import {
   setCodexAppThreadName,
 } from './services/codex-app-threads.js';
 import { buildBotmuxLarkNativeSessionTitle } from './core/session-title.js';
-import { CODEX_AUTH_ERROR_CODE, CODEX_CONNECTION_ERROR_CODE, CODEX_INVALID_REQUEST_ERROR_CODE, CODEX_RATE_LIMIT_ERROR_CODE, drainCodexRollout, findCodexRolloutBySessionId, findCodexRolloutByPid, findCodexRolloutSetByPid, codexHistorySidIsOwned, splitCodexEventsByCutoff, extractLastCodexTurn, codexSessionIdFromRolloutPath, isCodexRateLimitEvent, scanCodexThreadSettings, readLatestCodexRuntime, type CodexBridgeEvent, type CodexDrainResult } from './services/codex-transcript.js';
+import { CODEX_AUTH_ERROR_CODE, CODEX_CONNECTION_ERROR_CODE, CODEX_INVALID_REQUEST_ERROR_CODE, drainCodexRollout, findCodexRolloutBySessionId, findCodexRolloutByPid, findCodexRolloutSetByPid, codexHistorySidIsOwned, splitCodexEventsByCutoff, extractLastCodexTurn, codexSessionIdFromRolloutPath, isCodexRateLimitEvent, scanCodexThreadSettings, readLatestCodexRuntime, type CodexBridgeEvent, type CodexDrainResult } from './services/codex-transcript.js';
 import { CodexServiceTierTracker, resolveCodexServiceTierSnapshot } from './services/codex-service-tier.js';
 import { WORKER_IPC_HANDLER_READY_EVENT } from './worker-ipc-preload.js';
 import { drainTraexRollout, findTraexRolloutBySessionId, findTraexRolloutByPid, findTraexRolloutSetByPid, readLatestTraexRuntime, traexHistorySidIsOwned, type TraexDrainResult, type TraexRuntimeSnapshot } from './services/traex-transcript.js';
@@ -5273,7 +5273,11 @@ function currentHermesBridgeDbPath(): string {
 
 function structuredBridgeIngestPath(path: string, offset: number) {
   if (structuredBridgeIsCodex()) return drainCodexRollout(path, offset);
-  if (structuredBridgeIsTraex()) return drainTraexRollout(path, offset);
+  // adoptMode gates the drainer's bare-sentinel synthesis: adopt posts
+  // transcript text verbatim, so a synthesised token would leak into Lark.
+  if (structuredBridgeIsTraex()) {
+    return drainTraexRollout(path, offset, { adoptMode: lastInitConfig?.adoptMode === true });
+  }
   if (codexBridgeIsCursor()) return drainCursorTranscript(path, offset);
   if (structuredBridgeIsPi()) return drainPiTranscript(path, offset);
   if (structuredBridgeIsGrok()) return drainGrokUpdates(path, offset);
@@ -6517,13 +6521,19 @@ function emitReadyCodexTurns(): void {
       isLocal: turn.isLocal,
       finalText: turn.finalText,
       terminalStatus: turn.terminalStatus,
+      terminalErrorCode: turn.terminalErrorCode,
     };
-    const content = turn.terminalErrorCode !== CODEX_RATE_LIMIT_ERROR_CODE
-      && shouldEmitFailedBridgeFallback(gateInput, nextBoundaryMs, markers, adoptMode)
+    // The rate-limit skip is narrowed to CLIs with a dedicated structured
+    // rate-limit chain (Codex): TRAE 429 has no such chain, so skipping the
+    // generic failed fallback would post nothing at all.
+    const fallbackKind = structuredFallbackKind(
+      gateInput, nextBoundaryMs, markers, adoptMode, structuredBridgeIsCodex(),
+    );
+    const content = fallbackKind === 'failed'
       ? failedBridgeFallbackContent(turn.terminalErrorCode, turn.terminalErrorSummary, turn.finalText)
-      : turn.finalText && turn.finalText.trim()
-        ? turn.finalText
-        : shouldEmitEmptyCompletedBridgeFallback(gateInput, nextBoundaryMs, markers, adoptMode)
+      : fallbackKind === 'final'
+        ? turn.finalText ?? ''
+        : fallbackKind === 'empty_completed'
           ? emptyCompletedBridgeFallbackContent()
           : '';
     if (!content) continue;

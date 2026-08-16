@@ -50,6 +50,7 @@
  *     for turn N+1 could leak a send credit into turn N's window.
  */
 import { normaliseForFingerprint } from './bridge-turn-queue.js';
+import { CODEX_RATE_LIMIT_ERROR_CODE } from './codex-transcript.js';
 
 const MATERIAL_FINAL_LENGTH_RATIO = 2;
 const MATERIAL_FINAL_MIN_EXTRA_CHARS = 120;
@@ -351,4 +352,36 @@ export function shouldEmitFailedBridgeFallback(
   if (turn.isLocal) return false;
   if (turn.terminalStatus !== 'failed') return false;
   return !shouldSuppressBridgeEmit(turn, nextBoundaryMs, markers, adoptMode);
+}
+
+/** Which fallback content the worker should post for a ready structured turn.
+ *  Extracted from emitReadyCodexTurns so the rate-limit skip — which depends
+ *  on whether the CLI owns a dedicated structured rate-limit notification
+ *  chain (Codex only today) — is testable without a live worker.
+ *
+ *  Rate-limit contract: a `codex_rate_limited` terminal is handed to the
+ *  CLI's dedicated chain when one exists, so the generic failed fallback is
+ *  skipped to avoid double-posting. A CLI WITHOUT the chain (e.g. TRAE) must
+ *  fall through to the generic failed fallback — otherwise a 429 turn posts
+ *  nothing at all, regressing "misleading but visible" into "silent". */
+export type StructuredFallbackKind = 'failed' | 'final' | 'empty_completed' | 'none';
+
+export function structuredFallbackKind(
+  turn: BridgeGateInput & { terminalErrorCode?: string },
+  nextBoundaryMs: number | undefined,
+  markers: readonly BridgeSendMarker[],
+  adoptMode: boolean,
+  hasDedicatedRateLimitChain: boolean,
+): StructuredFallbackKind {
+  const rateLimitHandled = hasDedicatedRateLimitChain
+    && turn.terminalErrorCode === CODEX_RATE_LIMIT_ERROR_CODE;
+  if (!rateLimitHandled
+    && shouldEmitFailedBridgeFallback(turn, nextBoundaryMs, markers, adoptMode)) {
+    return 'failed';
+  }
+  if (turn.finalText && turn.finalText.trim()) return 'final';
+  if (shouldEmitEmptyCompletedBridgeFallback(turn, nextBoundaryMs, markers, adoptMode)) {
+    return 'empty_completed';
+  }
+  return 'none';
 }
