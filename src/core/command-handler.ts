@@ -3812,7 +3812,12 @@ export async function handleCommand(
         // is empty by construction, so no target-anchor conflict. Source is
         // never touched.
         const { forkSession } = await import('./worker-pool.js');
-        const forkResult = await forkSession(ds.session.sessionId, forkChatId, forkChatId, 'group', 'chat');
+        // forkTaskText = the group name (the human-readable intent for this
+        // fork), so /forklist can label the child row instead of falling back to
+        // the raw session title.
+        const forkResult = await forkSession(ds.session.sessionId, forkChatId, forkChatId, 'group', 'chat', {
+          forkTaskText: forkGroupName,
+        });
         if (!forkResult.ok) {
           // Residual-orphan cleanup: the front guards already ran before
           // createGroupWithBots, so this only fires on a narrow TOCTOU race
@@ -3850,6 +3855,32 @@ export async function handleCommand(
         }
 
         await sessionReply(rootId, t('cmd.fork.created', { name: forkGroupName, link: forkInviteLink }, loc));
+        // Record the child on the SOURCE session's lineage so /forklist can list
+        // it. The sub-topic fork path does this too; the --create (new-group)
+        // path historically skipped it, leaving forkChildSessionIds permanently
+        // empty and /forklist always reporting "no forks" even after many forks.
+        if (!ds.session.forkChildSessionIds?.includes(forkResult.childSessionId)) {
+          ds.session.forkChildSessionIds = [
+            ...(ds.session.forkChildSessionIds ?? []),
+            forkResult.childSessionId,
+          ];
+          try {
+            sessionStore.updateSession(ds.session);
+          } catch (err) {
+            logger.warn(
+              `[${logTag}] /fork --create parent lineage update failed: `
+              + `${err instanceof Error ? err.message : String(err)}`,
+            );
+          }
+          try {
+            await upsertForkPanelCard(ds, loc);
+          } catch (err) {
+            logger.warn(
+              `[${logTag}] /fork --create panel refresh failed: `
+              + `${err instanceof Error ? err.message : String(err)}`,
+            );
+          }
+        }
         logger.info(`[${logTag}] /fork --create completed: chat=${forkChatId} child=${forkResult.childSessionId.substring(0, 8)} bot=${targetBotAppId} (source ${ds.session.sessionId.substring(0, 8)} untouched)`);
         break;
       }
@@ -4619,9 +4650,13 @@ async function upsertForkPanelCard(
     .map(session => ({
       instruction: session.forkTaskText ?? session.title,
       status: (session.status === 'active' ? 'active' : 'closed') as 'active' | 'closed',
+      // Link to the child's OWN chat: a sub-topic fork shares the parent chat and
+      // carries a larkThreadId (deep-link into that topic); a --create fork lives
+      // in its own new group (different chatId, no thread) so the link must use
+      // the child's chatId, not the parent's, or it would point back here.
       link: session.larkThreadId
-        ? threadAppLink(chatId, session.larkThreadId, brand)
-        : chatAppLink(chatId, brand),
+        ? threadAppLink(session.chatId ?? chatId, session.larkThreadId, brand)
+        : chatAppLink(session.chatId ?? chatId, brand),
     }));
   if (children.length === 0 && !opts?.allowEmpty) return;
 
