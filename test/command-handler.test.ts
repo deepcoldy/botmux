@@ -1516,6 +1516,54 @@ describe('handleCommand', () => {
     });
   });
 
+  describe('/fork --create lineage durability', () => {
+    it('persists parent lineage even when the created-notice reply fails (expired root → 400)', async () => {
+      // Regression for the ordering blocker: the "created" notice is a reply to
+      // the parent session's root message — the same message whose expiry this
+      // PR's other fix addresses. If that notice throws, control must NOT skip
+      // the lineage write, or /forklist stays empty in the exact "root expired"
+      // scenario the PR targets. We assert lineage is durable BEFORE the notice.
+      vi.mocked(forkSession).mockResolvedValueOnce({ ok: true, childSessionId: 'child-create-1' });
+      const ds = makeDaemonSession({
+        scope: 'chat',
+        lastScreenStatus: 'idle',
+        session: makeSession({ ownerOpenId: 'ou_sender', scope: 'chat', cliId: 'codex' }),
+      });
+      const deps = makeDeps(ds);
+      // First sessionReply (the created notice) rejects like a 400 on the
+      // expired root; later calls (if any) resolve.
+      let replyCall = 0;
+      (deps.sessionReply as any).mockImplementation(async () => {
+        replyCall += 1;
+        if (replyCall === 1) throw new Error('Request failed with status code 400');
+        return 'reply-msg-id';
+      });
+
+      await handleCommand(
+        '/fork',
+        ROOT_ID,
+        makeLarkMessage('/fork --create 直播开发备份'),
+        deps,
+        LARK_APP_ID,
+      );
+
+      // forkSession ran for the new group and carried the group name as task text.
+      expect(forkSession).toHaveBeenCalledWith(
+        'sess-001',
+        expect.any(String),
+        expect.any(String),
+        'group',
+        'chat',
+        expect.objectContaining({ forkTaskText: '直播开发备份' }),
+      );
+      // The load-bearing assertion: lineage persisted despite the notice throwing.
+      expect(ds.session.forkChildSessionIds).toEqual(['child-create-1']);
+      expect(sessionStore.updateSession).toHaveBeenCalledWith(
+        expect.objectContaining({ forkChildSessionIds: ['child-create-1'] }),
+      );
+    });
+  });
+
   describe('doc comment commands', () => {
     it('/subscribe-lark-doc keeps the original doc-scoped OAuth requirement', async () => {
       const ds = makeDaemonSession();

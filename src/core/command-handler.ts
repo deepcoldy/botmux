@@ -3854,11 +3854,20 @@ export async function handleCommand(
           break;
         }
 
-        await sessionReply(rootId, t('cmd.fork.created', { name: forkGroupName, link: forkInviteLink }, loc));
-        // Record the child on the SOURCE session's lineage so /forklist can list
-        // it. The sub-topic fork path does this too; the --create (new-group)
-        // path historically skipped it, leaving forkChildSessionIds permanently
-        // empty and /forklist always reporting "no forks" even after many forks.
+        // Persist the child on the SOURCE session's lineage BEFORE any
+        // user-visible send. The sub-topic fork path also records lineage; the
+        // --create (new-group) path historically skipped it entirely, leaving
+        // forkChildSessionIds permanently empty and /forklist always reporting
+        // "no forks".
+        //
+        // Ordering is load-bearing: the "created" notice below is a reply to the
+        // parent session's root message, i.e. the SAME message whose expiry
+        // (HTTP 400) this PR's other fix addresses. If that reply threw while it
+        // still ran first, control would unwind to handleCommand's outer catch
+        // (log-only) and the lineage write would be skipped — so in the very
+        // "root expired" scenario this change targets, /forklist would stay
+        // empty. Writing lineage first makes it independent of the notify path;
+        // the notice and panel refresh are best-effort afterwards.
         if (!ds.session.forkChildSessionIds?.includes(forkResult.childSessionId)) {
           ds.session.forkChildSessionIds = [
             ...(ds.session.forkChildSessionIds ?? []),
@@ -3872,16 +3881,28 @@ export async function handleCommand(
               + `${err instanceof Error ? err.message : String(err)}`,
             );
           }
-          try {
-            await upsertForkPanelCard(ds, loc);
-          } catch (err) {
-            logger.warn(
-              `[${logTag}] /fork --create panel refresh failed: `
-              + `${err instanceof Error ? err.message : String(err)}`,
-            );
-          }
         }
         logger.info(`[${logTag}] /fork --create completed: chat=${forkChatId} child=${forkResult.childSessionId.substring(0, 8)} bot=${targetBotAppId} (source ${ds.session.sessionId.substring(0, 8)} untouched)`);
+        // User-visible notice + panel refresh: best-effort, AFTER lineage is
+        // durable. A failure here (e.g. the root-message 400) must not undo the
+        // lineage write, so swallow locally instead of letting it reach the
+        // outer catch.
+        try {
+          await sessionReply(rootId, t('cmd.fork.created', { name: forkGroupName, link: forkInviteLink }, loc));
+        } catch (err) {
+          logger.warn(
+            `[${logTag}] /fork --create created-notice send failed: `
+            + `${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+        try {
+          await upsertForkPanelCard(ds, loc, { preferredReplyToMessageId: message.messageId });
+        } catch (err) {
+          logger.warn(
+            `[${logTag}] /fork --create panel refresh failed: `
+            + `${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
         break;
       }
 
@@ -3890,7 +3911,7 @@ export async function handleCommand(
           await sessionReply(rootId, t('cmd.fork.no_session', undefined, loc));
           break;
         }
-        await upsertForkPanelCard(ds, loc, { allowEmpty: true });
+        await upsertForkPanelCard(ds, loc, { allowEmpty: true, preferredReplyToMessageId: message.messageId });
         break;
       }
 
@@ -4639,7 +4660,7 @@ export async function startForkSubtopicSession(
 async function upsertForkPanelCard(
   parentDs: DaemonSession,
   loc: Locale,
-  opts?: { allowEmpty?: boolean },
+  opts?: { allowEmpty?: boolean; preferredReplyToMessageId?: string },
 ): Promise<void> {
   const appId = parentDs.larkAppId;
   const chatId = parentDs.chatId;
@@ -4678,21 +4699,35 @@ async function upsertForkPanelCard(
   // swallowed failure looks like the command silently did nothing; the flat send
   // keeps it visible. Only if BOTH transports fail do we give up (and warn).
   const cardBody = buildForkPanelCard(children, loc);
+  // Reply targets are tried in order, then a flat send as the last resort:
+  //   1) the FRESH triggering command message (when /forklist or /fork passes
+  //      it) — a just-arrived message is never past Lark's reply window, and in
+  //      a 话题群 it keeps the panel inside the current topic;
+  //   2) the session root message — the historical target, but it can age past
+  //      the reply window (HTTP 400) or be withdrawn;
+  //   3) a flat chat sendMessage — always delivers, though in a 话题群 it starts
+  //      a new sibling topic rather than threading. The panel is the user-visible
+  //      output of /forklist, so a visible-but-flat panel beats silent nothing.
+  const replyTargets: string[] = [];
+  if (opts?.preferredReplyToMessageId) replyTargets.push(opts.preferredReplyToMessageId);
+  if (parentDs.session.rootMessageId
+    && parentDs.session.rootMessageId !== opts?.preferredReplyToMessageId) {
+    replyTargets.push(parentDs.session.rootMessageId);
+  }
   let cardId: string | undefined;
-  try {
-    cardId = await replyMessage(
-      appId,
-      parentDs.session.rootMessageId,
-      cardBody,
-      'interactive',
-      true,
-    );
-  } catch (replyErr) {
-    logger.warn(
-      `[fork-panel] reply to root ${parentDs.session.rootMessageId} failed `
-      + `(${replyErr instanceof Error ? replyErr.message : replyErr}); `
-      + 'falling back to a flat chat message',
-    );
+  for (const target of replyTargets) {
+    try {
+      cardId = await replyMessage(appId, target, cardBody, 'interactive', true);
+      break;
+    } catch (replyErr) {
+      logger.warn(
+        `[fork-panel] reply to ${target} failed `
+        + `(${replyErr instanceof Error ? replyErr.message : replyErr})`,
+      );
+    }
+  }
+  if (!cardId) {
+    logger.warn('[fork-panel] all reply targets failed; falling back to a flat chat message');
     try {
       cardId = await sendMessage(appId, chatId, cardBody, 'interactive');
     } catch (sendErr) {
@@ -4703,7 +4738,18 @@ async function upsertForkPanelCard(
     }
   }
   if (cardId) {
+    // Local guard: a write-store failure here must not bubble to /forklist's
+    // outer catch (which would look like the command errored even though the
+    // panel already posted). Losing only the stale-card id just means the next
+    // /forklist can't delete the previous panel — a benign duplicate at worst.
     parentDs.session.forkPanelCardId = cardId;
-    sessionStore.updateSession(parentDs.session);
+    try {
+      sessionStore.updateSession(parentDs.session);
+    } catch (err) {
+      logger.warn(
+        `[fork-panel] persist forkPanelCardId failed: `
+        + `${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
   }
 }
