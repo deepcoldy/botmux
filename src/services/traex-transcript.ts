@@ -10,6 +10,13 @@
  *     times during tool use, so none of them is a safe turn boundary;
  *   - event_msg `task_complete` is the durable end-of-turn marker and carries
  *     the final visible text in `last_agent_message` (which may be empty).
+ *     When it is empty the drainer consults the turn's `agent_message`
+ *     records: a `final_answer`-phase message reconstructs a dropped final,
+ *     and a commentary message ending in the nothing-to-send sentinel marks
+ *     deliberate silence. A non-null `error` payload maps the terminal to
+ *     `failed` (mirroring the Codex drainer) so a model-endpoint failure
+ *     surfaces its real reason instead of the misleading "completed but
+ *     empty" diagnostic.
  *   - Directory layout differs: sessions live under
  *     ~/.trae/cli/sessions/<YYYY>/<MM>/<DD>/rollout-<ts>-<uuid>.jsonl
  *     (note the extra `cli/` level vs Codex's ~/.codex/sessions/...).
@@ -35,7 +42,13 @@ import {
   type CodexBridgeEvent,
   type CodexDrainResult,
   codexSessionIdFromRolloutPath,
+  codexTaskFailureCode,
+  safeFailureSummary,
 } from './codex-transcript.js';
+import {
+  BRIDGE_NOTHING_TO_SEND_SENTINEL,
+  BRIDGE_NO_REPLY_SENTINEL_LEGACY,
+} from './bridge-fallback-gate.js';
 import { isInternalCodexSessionMeta } from './codex-session-meta.js';
 import { baselineJsonlCursor } from './jsonl-cursor.js';
 import { traeSessionsRoot } from './traex-paths.js';
@@ -72,6 +85,53 @@ const traexRolloutMetaCache = new Map<string, {
   kind: TraexRolloutKind;
   startedAtMs?: number;
 }>();
+
+/** Per-rollout `agent_message` state for the CURRENTLY OPEN turn, retained
+ *  across drain calls. A turn's commentary/final_answer records are almost
+ *  always drained in earlier polls than its `task_complete` (turns run for
+ *  minutes while the poller runs on the second scale), so same-batch state
+ *  would never see them. Reset on every `user_message` (turn start) and
+ *  consumed/cleared by `task_complete`/`turn_aborted` (turn end); a turn that
+ *  terminates without either leaves at most one stale entry, bounded by the
+ *  same cap/eviction as traexRolloutMetaCache. */
+interface TraexPendingAgentMessages {
+  /** Last commentary-phase `agent_message` since the turn's user_message.
+   *  Its trailing sentinel is the deliberate-silence signal. */
+  lastCommentary?: string;
+  /** Last final_answer-phase `agent_message` since the turn's user_message.
+   *  Defensive reconstruction source when task_complete drops the final it
+   *  actually produced. */
+  lastFinalAnswer?: string;
+}
+
+const traexPendingAgentCache = new Map<string, TraexPendingAgentMessages>();
+const TRAEX_PENDING_AGENT_CACHE_MAX = 512;
+
+function traexPendingAgentState(path: string): TraexPendingAgentMessages {
+  let state = traexPendingAgentCache.get(path);
+  if (!state) {
+    state = {};
+    traexPendingAgentCache.set(path, state);
+    if (traexPendingAgentCache.size > TRAEX_PENDING_AGENT_CACHE_MAX) {
+      const oldest = traexPendingAgentCache.keys().next().value;
+      if (oldest) traexPendingAgentCache.delete(oldest);
+    }
+  }
+  return state;
+}
+
+/** Matches a commentary message that ENDS with a nothing-to-send sentinel
+ *  (current or legacy token), optionally glued to trailing prose — the shape
+ *  TRAE writes when the model replied via `botmux send` and kept only
+ *  narration in the commentary phase. Captures the exact token so the
+ *  synthesised final carries the same one the gate recognises. */
+const TRAEX_TRAILING_SENTINEL_RE = new RegExp(
+  `(${BRIDGE_NOTHING_TO_SEND_SENTINEL}|${BRIDGE_NO_REPLY_SENTINEL_LEGACY})\\s*$`,
+);
+
+function traexTrailingSentinel(message: string): string | undefined {
+  return TRAEX_TRAILING_SENTINEL_RE.exec(message)?.[1];
+}
 
 /** Upper bound on how far back readLatestTraexRuntime scans for the newest
  * model/effort. The newest turn_context sits near the tail, so this is only a
@@ -117,7 +177,16 @@ function runtimeFromTraexEntry(entry: any): TraexRuntimeSnapshot | undefined {
  * `task_complete` is intentionally emitted even when last_agent_message is
  * missing/empty: a silent successful turn still has to release a durable
  * delivery. A non-newline-terminated tail is never parsed, so a process crash
- * halfway through the terminal JSON object cannot manufacture completion. */
+ * halfway through the terminal JSON object cannot manufacture completion.
+ *
+ * Terminal refinement on an empty `last_agent_message`:
+ *   - a non-null `error` payload maps the event to `failed` (same shape as the
+ *     Codex drainer) — traecli writes task_complete with
+ *     last_agent_message=null AND error when the model endpoint fails, so the
+ *     failure must not be read as a silent success;
+ *   - otherwise the turn's agent_message records (tracked across drain calls)
+ *     recover a dropped final_answer or recognise a trailing
+ *     nothing-to-send sentinel as deliberate silence. */
 export function drainTraexRollout(path: string, fromOffset: number): TraexDrainResult {
   if (!existsSync(path)) return { events: [], newOffset: 0, pendingTail: '' };
   let size: number;
@@ -163,17 +232,65 @@ export function drainTraexRollout(path: string, fromOffset: number): TraexDrainR
       && payload.type === 'user_message'
       && typeof payload.message === 'string') {
       const userText = payload.message;
-      if (userText) events.push({ ...base, kind: 'user', text: userText });
+      if (userText) {
+        events.push({ ...base, kind: 'user', text: userText });
+        // New turn: drop any agent_message state an unterminated predecessor
+        // left behind so it can't be attributed to this turn.
+        traexPendingAgentCache.delete(path);
+      }
+      continue;
+    }
+    // agent_message records are narration (commentary) or the produced final
+    // (final_answer). They are NOT turn boundaries — only task_complete is —
+    // so they are tracked per turn and consulted when the terminal arrives
+    // with an empty/missing last_agent_message.
+    if (obj.type === 'event_msg'
+      && payload.type === 'agent_message'
+      && typeof payload.message === 'string'
+      && payload.message.length > 0) {
+      const pending = traexPendingAgentState(path);
+      if (payload.phase === 'final_answer') pending.lastFinalAnswer = payload.message;
+      else pending.lastCommentary = payload.message;
       continue;
     }
     if (obj.type === 'event_msg'
       && payload.type === 'task_complete'
       && typeof payload.turn_id === 'string'
       && payload.turn_id.length > 0) {
+      const pending = traexPendingAgentCache.get(path);
+      const failed = payload.error !== null && payload.error !== undefined;
+      const rawFinal = typeof payload.last_agent_message === 'string'
+        ? payload.last_agent_message
+        : '';
+      let text = rawFinal;
+      if (!failed && rawFinal.trim().length === 0) {
+        // TRAE wrote no final for a successful turn. Recover, in order:
+        //   1. a final_answer-phase agent_message — TRAE dropped the final it
+        //      actually produced (the phase field guarantees it is an answer,
+        //      not tool narration);
+        //   2. a commentary message ending in the nothing-to-send sentinel —
+        //      the model deliberately stayed silent (it replied via
+        //      `botmux send`), so synthesise the bare sentinel the fallback
+        //      gate already treats as genuine silence instead of tripping the
+        //      misleading "completed but empty" diagnostic.
+        text = pending?.lastFinalAnswer && pending.lastFinalAnswer.trim().length > 0
+          ? pending.lastFinalAnswer
+          : traexTrailingSentinel(pending?.lastCommentary ?? '') ?? '';
+      }
+      traexPendingAgentCache.delete(path);
       events.push({
         ...base,
         kind: 'assistant_final',
-        text: typeof payload.last_agent_message === 'string' ? payload.last_agent_message : '',
+        text,
+        // A non-null error means the turn FAILED (e.g. the model endpoint
+        // connection failed before any response). Mirror the Codex drainer:
+        // classify as failed with a safe code/summary so the worker surfaces
+        // the real reason instead of an empty-final alert.
+        ...(failed ? {
+          terminalStatus: 'failed' as const,
+          terminalErrorCode: codexTaskFailureCode(payload.error),
+          terminalErrorSummary: safeFailureSummary(payload.error),
+        } : {}),
       });
       continue;
     }
@@ -185,6 +302,7 @@ export function drainTraexRollout(path: string, fromOffset: number): TraexDrainR
       && payload.type === 'turn_aborted'
       && typeof payload.turn_id === 'string'
       && payload.turn_id.length > 0) {
+      traexPendingAgentCache.delete(path);
       events.push({
         ...base,
         kind: 'assistant_final',
