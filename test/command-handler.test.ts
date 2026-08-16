@@ -717,6 +717,25 @@ describe('/cli session selection', () => {
     expect(ds.session.cliLaunchSnapshot).toBeUndefined();
     expect(deps.sessionReply).toHaveBeenLastCalledWith(ROOT_ID, 'Usage: /cli <cliId>\nUnknown or invalid CLI.', undefined, LARK_APP_ID, 'msg_001');
   });
+
+  it('rejects riff because it requires bot-level backend configuration', async () => {
+    const ds = makeDaemonSession({
+      hasHistory: false,
+      session: makeSession({ cliId: undefined }),
+    });
+    const deps = makeDeps(ds);
+
+    await handleCommand('/cli', ROOT_ID, makeLarkMessage('/cli riff'), deps, LARK_APP_ID);
+
+    expect(ds.session.cliLaunchSnapshot).toBeUndefined();
+    expect(deps.sessionReply).toHaveBeenLastCalledWith(
+      ROOT_ID,
+      'CLI selection rejected: Riff requires bot-level backend configuration and cannot be selected per session',
+      undefined,
+      LARK_APP_ID,
+      'msg_001',
+    );
+  });
 });
 
 describe('/list-slash-command discovery', () => {
@@ -3585,6 +3604,33 @@ describe('handleCommand', () => {
       expect(ds.pendingChatContext).toBeUndefined();
       // The buffered message IS the first real user turn — nothing is pending.
       expect(ds.session.initialUserTurnPending).toBeUndefined();
+    });
+
+    it('uses the selected CLI snapshot when pendingRepo is submitted with /repo', async () => {
+      const ds = makeDaemonSession({
+        pendingRepo: true,
+        pendingPrompt: '帮我看看这个 bug',
+        session: makeSession({
+          cliId: undefined,
+          cliLaunchSnapshot: {
+            version: 1,
+            state: 'pending',
+            entryId: 'codex',
+            cliId: 'codex',
+            cliRuntime: null,
+            cliPathOverride: null,
+            wrapperCli: null,
+            model: null,
+            reasoningEffort: null,
+            launchShell: null,
+            startupCommands: [],
+          },
+        }),
+      });
+
+      await handleCommand('/repo', ROOT_ID, makeLarkMessage('/repo'), makeDeps(ds), LARK_APP_ID);
+
+      expect(vi.mocked(buildNewTopicCliInput).mock.calls[0]?.[2]).toBe('codex');
     });
 
     it('submits chat context when bare /repo follows an empty group-join prompt', async () => {
