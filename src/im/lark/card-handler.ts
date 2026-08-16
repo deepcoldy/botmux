@@ -300,7 +300,7 @@ function getSessionByActionValue(
 }
 
 function sessionCliId(ds: DaemonSession) {
-  return ds.session.cliId ?? getBot(ds.larkAppId).config.cliId;
+  return ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? getBot(ds.larkAppId).config.cliId;
 }
 
 /** A session's configured distribution name is frozen with its launch config.

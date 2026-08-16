@@ -179,6 +179,7 @@ function cliSelectionSnapshot(cliId: CliId): SessionCliLaunchSnapshotV1 {
 }
 
 function cliSelectionSecurityError(botCfg: { env?: Record<string, string>; backendType?: string; riff?: unknown; codexRpcInput?: boolean }, cliId: string): string | undefined {
+  if (cliId === 'riff') return 'Riff requires bot-level backend configuration and cannot be selected per session';
   if (botCfg.env && Object.keys(botCfg.env).length > 0) return 'CLI-selected sessions cannot use bot env';
   if (botCfg.backendType === 'riff' || botCfg.riff !== undefined) return 'CLI-selected sessions cannot use Riff';
   if (botCfg.codexRpcInput === true && !RPC_CAPABLE_CLIS.has(cliId)) return 'selected CLI cannot use codexRpcInput';
@@ -1965,6 +1966,7 @@ export async function handleCommand(
             }
             const selfBot = getBot(current.larkAppId);
             const botCfg = selfBot.config;
+            const effectiveCliId = current.session.cliLaunchSnapshot?.cliId ?? current.session.cliId ?? botCfg.cliId;
             const pendingPrompt = current.pendingPrompt ?? '';
             const pendingRawInput = current.pendingRawInput;
             const hasBufferedInput = pendingPrompt.trim().length > 0
@@ -1985,7 +1987,7 @@ export async function handleCommand(
               wrappedInput = buildInput(
                 pendingPrompt,
                 current.session.sessionId,
-                current.session.cliId ?? botCfg.cliId,
+                effectiveCliId,
                 current.session.cliPathOverride ?? botCfg.cliPathOverride,
                 current.pendingAttachments,
                 current.pendingMentions,
@@ -2017,7 +2019,7 @@ export async function handleCommand(
                 ...((current.pendingFollowUpTurnIds?.at(-1) ?? current.pendingFollowUpTurnId)
                   ? { turnId: current.pendingFollowUpTurnIds?.at(-1) ?? current.pendingFollowUpTurnId }
                   : {}),
-                ...((current.session.cliId ?? botCfg.cliId) === 'codex-app' && botCfg.codexAppCleanInput === true && wrappedInput.codexAppInput
+                ...(effectiveCliId === 'codex-app' && botCfg.codexAppCleanInput === true && wrappedInput.codexAppInput
                   ? { codexAppInput: wrappedInput.codexAppInput }
                   : {}),
                 codexAppInputGateFrozen: true,
