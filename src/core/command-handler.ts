@@ -1488,8 +1488,7 @@ export async function handleCommand(
         let selectedCliId: CliId | undefined;
         if (args.length === 1) {
           try {
-            createCliAdapterSync(requestedId as CliId);
-            selectedCliId = requestedId as CliId;
+            selectedCliId = createCliAdapterSync(requestedId as CliId).id as CliId;
           } catch {
             // Keep the normal invalid-CLI response below.
           }

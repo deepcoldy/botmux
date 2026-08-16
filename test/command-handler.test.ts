@@ -756,6 +756,37 @@ describe('/cli session selection', () => {
       'msg_001',
     );
   });
+
+  it('canonicalizes accepted CLI ids before persisting the selection', async () => {
+    const ds = makeDaemonSession({
+      hasHistory: false,
+      session: makeSession({ cliId: undefined }),
+    });
+
+    await handleCommand('/cli', ROOT_ID, makeLarkMessage('/cli CODEX'), makeDeps(ds), LARK_APP_ID);
+
+    expect(ds.session.cliLaunchSnapshot?.cliId).toBe('codex');
+    expect(ds.session.cliLaunchSnapshot?.entryId).toBe('codex');
+  });
+
+  it('rejects mixed-case Riff before persisting the selection', async () => {
+    const ds = makeDaemonSession({
+      hasHistory: false,
+      session: makeSession({ cliId: undefined }),
+    });
+    const deps = makeDeps(ds);
+
+    await handleCommand('/cli', ROOT_ID, makeLarkMessage('/cli RIFF'), deps, LARK_APP_ID);
+
+    expect(ds.session.cliLaunchSnapshot).toBeUndefined();
+    expect(deps.sessionReply).toHaveBeenLastCalledWith(
+      ROOT_ID,
+      'CLI selection rejected: Riff requires bot-level backend configuration and cannot be selected per session',
+      undefined,
+      LARK_APP_ID,
+      'msg_001',
+    );
+  });
 });
 
 describe('/list-slash-command discovery', () => {
