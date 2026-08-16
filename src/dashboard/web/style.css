@@ -24532,6 +24532,16 @@ button.ui-refresh-button.is-loading .ui-action-icon {
   overflow: hidden;
 }
 
+/* #root inherits the Dashboard route padding (12px 32px 24px 0) plus a -32px
+   right margin, which inset the Workbench and left it short of the viewport.
+   The Workbench draws its own edges, so clear both inside this host only. */
+.workbench-route-host > #root,
+.workbench-route-host .agent-workbench-page,
+.workbench-route-host .agent-workbench-dock {
+  padding: 0;
+  margin: 0;
+}
+
 .agent-workbench-page,
 .agent-workbench-dock {
   --wb-bg: #080b10;
@@ -24622,49 +24632,17 @@ button.ui-refresh-button.is-loading .ui-action-icon {
   border: 0;
 }
 
+/* The page is a single full-height region: the brand/status bar that used to
+   own the first row is gone, and the live/offline dot moved into the session
+   list heading. */
 .agent-workbench-page {
   display: grid;
-  grid-template-rows: 44px minmax(0, 1fr);
+  grid-template-rows: minmax(0, 1fr);
   width: 100%;
   height: 100%;
   min-height: 0;
   overflow: hidden;
 }
-
-.wb-app-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  min-width: 0;
-  padding: 0 12px;
-  border-bottom: 1px solid var(--wb-border-strong);
-  background: var(--wb-surface);
-}
-
-.wb-brand {
-  display: inline-flex;
-  align-items: center;
-  gap: 7px;
-  color: var(--wb-text);
-  text-decoration: none;
-  letter-spacing: .08em;
-}
-
-.wb-brand > span { color: var(--wb-accent); font-size: 18px; }
-.wb-brand strong { font-size: 13px; }
-.wb-brand em { color: var(--wb-muted); font-style: normal; }
-
-.wb-app-status {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  color: var(--wb-muted);
-  white-space: nowrap;
-}
-
-.wb-app-status .is-online { color: var(--wb-success); }
-.wb-app-status .is-offline { color: var(--wb-danger); }
-.wb-degrade-state { padding-left: 8px; border-left: 1px solid var(--wb-border); color: var(--wb-faint); }
 
 .wb-desktop-layout {
   display: grid;
@@ -24679,7 +24657,7 @@ button.ui-refresh-button.is-loading .ui-action-icon {
 
 .wb-session-rail {
   display: grid;
-  grid-template-rows: 38px 38px 24px minmax(0, 1fr);
+  grid-template-rows: 38px 38px minmax(0, 1fr);
   min-width: 0;
   min-height: 0;
   border-right: 1px solid var(--wb-border);
@@ -24733,6 +24711,10 @@ button.ui-refresh-button.is-loading .ui-action-icon {
 
 .wb-rail-heading > div { display: flex; align-items: center; gap: 7px; letter-spacing: .08em; }
 .wb-rail-heading > div > span { color: var(--wb-faint); }
+/* Live/last-snapshot state now rides the list heading instead of a page-wide
+   status bar. */
+.wb-rail-heading .is-online { color: var(--wb-success); }
+.wb-rail-heading .is-offline { color: var(--wb-danger); }
 .wb-rail-heading button,
 .wb-session-search button {
   width: 24px;
@@ -24770,23 +24752,6 @@ button.ui-refresh-button.is-loading .ui-action-icon {
   background: transparent;
 }
 .wb-session-search input::placeholder { color: var(--wb-faint); }
-
-.wb-rail-key-hint {
-  display: flex;
-  align-items: center;
-  gap: 4px;
-  padding: 0 9px;
-  color: var(--wb-faint);
-  font-size: 10px;
-}
-.wb-rail-key-hint kbd {
-  min-width: 15px;
-  padding: 0 3px;
-  border: 1px solid var(--wb-border);
-  border-radius: 2px;
-  color: var(--wb-muted);
-  text-align: center;
-}
 
 .wb-session-list {
   position: relative;
@@ -24826,12 +24791,35 @@ button.ui-refresh-button.is-loading .ui-action-icon {
   text-align: left;
   cursor: pointer;
 }
-.wb-session-row:hover { background: var(--wb-surface-2); }
+/* Hover is the row's only affordance now that the title no longer underlines,
+   so it has to be legible on its own: surface-3 is a clear step up from the
+   rail's own surface, where surface-2 was almost invisible against it. Hover
+   stays neutral grey and selection stays the accent blue plus the left bar, so
+   the two states never read as the same thing. */
+.wb-session-row:hover { background: var(--wb-surface-3); }
 .wb-session-row.is-selected { border-left-color: var(--wb-accent); background: var(--wb-accent-soft); }
 .wb-session-row-needs-you .wb-session-state-mark { color: var(--wb-danger); }
 .wb-session-row-active .wb-session-state-mark { color: var(--wb-success); }
 .wb-session-row-recent .wb-session-state-mark { color: var(--wb-faint); }
 .wb-session-copy { display: grid; min-width: 0; gap: 4px; }
+/* Row-as-link: same cell, but a real anchor so chat-follow opens on the
+   user's own trusted click instead of a scripted one. The ::after overlay
+   stretches the anchor's hit area across the whole row (state dot and blank
+   space included); the action buttons sit above it and keep working.
+   The row reads as a list item, not as body copy with a hyperlink in it, so it
+   never underlines: hover is carried entirely by .wb-session-row:hover's
+   background. Keep the anchor undecorated in every state — the UA underlines
+   a[href] by default, and the Dashboard's global chrome adds `… a:hover`
+   rules that would otherwise reach in here. */
+.wb-session-copy-link { color: inherit; text-decoration: none; cursor: pointer; }
+.wb-session-copy-link::after { content: ''; position: absolute; inset: 0; }
+.wb-session-copy-link:link,
+.wb-session-copy-link:visited,
+.wb-session-copy-link:hover,
+.wb-session-copy-link:focus,
+.wb-session-copy-link:active,
+.wb-session-copy-link * { text-decoration: none; }
+.wb-session-copy-link:focus-visible { outline: 1px solid currentColor; outline-offset: -1px; }
 .wb-session-title { overflow: hidden; color: var(--wb-text); font-weight: 700; text-overflow: ellipsis; white-space: nowrap; }
 .wb-session-meta { display: flex; justify-content: space-between; gap: 6px; min-width: 0; color: var(--wb-faint); font-size: 10px; }
 .wb-session-meta > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -24854,10 +24842,13 @@ button.ui-refresh-button.is-loading .ui-action-icon {
 .wb-rail-separator:hover,
 .wb-rail-separator:focus-visible { color: var(--wb-text); background: var(--wb-accent); }
 
+/* Two children, two rows: the header and the pane stack. Leaving the old
+   toolbar/chat-contract rows in place pushed the stack into an `auto` track,
+   which is why the terminal iframe collapsed to its 150px intrinsic height. */
 .wb-workspace {
   position: relative;
   display: grid;
-  grid-template-rows: 46px 35px 25px minmax(0, 1fr);
+  grid-template-rows: 46px minmax(0, 1fr);
   min-width: 0;
   min-height: 0;
   overflow: hidden;
@@ -25024,6 +25015,13 @@ button.ui-refresh-button.is-loading .ui-action-icon {
 }
 .wb-pane-frame-shell { min-height: 0; background: #05070a; overflow: hidden; }
 .wb-pane-frame { display: block; width: 100%; height: 100%; border: 0; background: #05070a; }
+/* 手机端缩放内嵌终端的定位容器：iframe 按 720px 虚拟宽度布局后整体 transform: scale
+   缩小，缩放前的盒子比容器大，靠这里的 overflow: hidden 裁掉。 */
+.wb-pane-frame-fit { position: relative; width: 100%; height: 100%; overflow: hidden; background: #05070a; }
+/* 该 iframe 的宽高由 React 内联 style 给（虚拟宽 + 反算高）。内联样式优先级高于上面
+   .wb-pane-frame 的 width/height: 100%，所以那条规则不会覆盖它，也不需要 !important；
+   这里只补盒子表现，切勿再写 width/height。 */
+.wb-pane-frame-fit > iframe.wb-pane-frame { display: block; border: 0; }
 .wb-pane-empty {
   display: grid;
   place-content: center;
@@ -25082,12 +25080,17 @@ button.ui-refresh-button.is-loading .ui-action-icon {
 .wb-no-selection h2 { margin: 8px 0 3px; color: var(--wb-text); font-size: 15px; }
 .wb-no-selection p { margin: 0; color: var(--wb-faint); }
 
-.wb-mobile-stack { display: grid; grid-template-rows: 38px minmax(0, 1fr); min-height: 0; overflow: hidden; }
+/* Drill-down, not tabs: the stack renders exactly one in-flow child — the session
+   list at the home level, or .wb-mobile-detail once a session is pushed.
+   .wb-mobile-nav was removed from the component, so the old 38px nav row had no
+   owner and would have parked that single child on it, leaving the 1fr row
+   empty. One row, and the child gets the full height. */
+.wb-mobile-stack { display: grid; grid-template-rows: minmax(0, 1fr); min-height: 0; overflow: hidden; }
 .wb-mobile-nav { display: grid; grid-template-columns: repeat(3, 1fr); border-bottom: 1px solid var(--wb-border); background: var(--wb-surface); }
 .wb-mobile-nav button { border: 0; border-right: 1px solid var(--wb-border); color: var(--wb-muted); background: transparent; }
 .wb-mobile-nav button[aria-current="page"] { color: var(--wb-accent); background: var(--wb-accent-soft); }
 .wb-mobile-stack .wb-session-rail { width: 100%; border-right: 0; }
-.wb-mobile-stack .wb-workspace { grid-template-rows: 46px 35px 25px minmax(0, 1fr); }
+.wb-mobile-stack .wb-workspace { grid-template-rows: 46px minmax(0, 1fr); }
 .wb-mobile-info { overflow: auto; }
 
 .agent-workbench-dock {
@@ -25124,10 +25127,10 @@ button.ui-refresh-button.is-loading .ui-action-icon {
 .agent-workbench-dock > footer { padding: 5px 8px; border-top: 1px solid var(--wb-border); color: var(--wb-faint); font-size: 9px; text-align: center; }
 
 @media (max-width: 767px) {
-  .agent-workbench-page { min-width: 320px; }
-  .wb-app-header { padding: 0 8px; }
-  .wb-brand em,
-  .wb-degrade-state { display: none; }
+  /* No hard floor: a Feishu side panel can be narrower than 320px, and forcing
+     a minimum here just pushed the row's right edge (and its actions) out of
+     view instead of letting the layout compress. */
+  .agent-workbench-page { min-width: 0; }
   .wb-workspace-title strong { max-width: 62vw; }
   .wb-pane-toolbar { gap: 3px; }
   .wb-pane-toolbar button { padding-inline: 5px; }
@@ -25141,3 +25144,441 @@ button.ui-refresh-button.is-loading .ui-action-icon {
   .agent-workbench-page *,
   .agent-workbench-dock * { scroll-behavior: auto !important; transition: none !important; animation: none !important; }
 }
+
+/* Row-level surface shortcuts. The actions are an overlay rather than a column,
+   so the row itself stays two cells: state mark + copy. Kept alongside the base
+   rule as the appended section's record of that layout. */
+.wb-session-row { grid-template-columns: 14px minmax(0, 1fr); }
+.wb-session-row-action {
+  width: 20px;
+  height: 18px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: 1px solid var(--wb-border);
+  border-radius: 3px;
+  color: var(--wb-muted);
+  background: var(--wb-surface-1);
+  font-size: 10px;
+  line-height: 1;
+  cursor: pointer;
+}
+.wb-session-row-action:hover { border-color: var(--wb-accent); color: var(--wb-accent); }
+.wb-session-row-action:focus-visible { outline: 1px solid var(--wb-accent); outline-offset: 1px; }
+
+/* The Dashboard's global control rule is `input:not(...)` seven times over,
+   which outranks any plain `.wb-… input` selector and was re-skinning the
+   Workbench search box into a 34px pill with its own background — the floating
+   overlay reported from the Feishu client. Match that specificity inside the
+   Workbench scope so the flat terminal styling wins without !important. */
+.agent-workbench-page input:not([type=checkbox]):not([type=radio]):not([type=range]):not([type=color]):not([type=file]):not([type=submit]):not([type=button]),
+.agent-workbench-dock input:not([type=checkbox]):not([type=radio]):not([type=range]):not([type=color]):not([type=file]):not([type=submit]):not([type=button]) {
+  min-height: 0;
+  height: 24px;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  color: var(--wb-text);
+  font: inherit;
+  font-size: 12px;
+  line-height: 1.4;
+  box-shadow: none;
+}
+
+/* Panes accumulate left-to-right; each keeps its own scroll and close control. */
+.wb-pane-stack {
+  display: flex;
+  min-width: 0;
+  min-height: 0;
+  overflow-x: auto;
+  overflow-y: hidden;
+}
+.wb-stacked-pane {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 0;
+  min-width: 320px;
+  min-height: 0;
+  border-left: 1px solid var(--wb-border);
+}
+.wb-stacked-pane:first-child { border-left: 0; }
+.wb-stacked-pane > .wb-pane { flex: 1; min-height: 0; }
+.wb-pane-close {
+  position: absolute;
+  top: 4px;
+  right: 6px;
+  z-index: 2;
+  width: 20px;
+  height: 18px;
+  padding: 0;
+  border: 1px solid var(--wb-border);
+  border-radius: 3px;
+  color: var(--wb-muted);
+  background: var(--wb-surface);
+  font-size: 10px;
+  line-height: 1;
+  cursor: pointer;
+}
+.wb-pane-close:hover { border-color: var(--wb-danger, #e0af68); color: var(--wb-text); }
+.wb-pane-placeholder {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  color: var(--wb-faint);
+  font-size: 12px;
+}
+.wb-pane-placeholder span { font-size: 20px; }
+
+/* The toolbar and chat-contract rows were removed; the workspace is exactly a
+   header plus the pane stack, and the stack must land on the 1fr track or the
+   terminal iframe falls back to its 150px intrinsic height. */
+.wb-workspace { grid-template-rows: 46px minmax(0, 1fr); }
+.wb-mobile-stack .wb-workspace { grid-template-rows: 46px minmax(0, 1fr); }
+
+/* The close control floats over the pane's own titlebar; reserve room so it
+   never lands on top of the Take control / Open tab actions. */
+.wb-stacked-pane .wb-pane-titlebar { padding-right: 32px; }
+
+/* Single terminal fills the workspace: the row button is a toggle, and Feishu —
+   not this document — owns any multi-column arrangement. */
+.wb-pane-stack { display: flex; flex-direction: column; min-width: 0; min-height: 0; overflow: hidden; }
+.wb-pane-stack > .wb-pane { flex: 1; min-height: 0; }
+.wb-terminal-toggle {
+  border: 1px solid var(--wb-border-strong);
+  border-radius: 3px;
+  color: var(--wb-muted);
+  background: var(--wb-surface-2);
+  cursor: pointer;
+}
+.wb-terminal-toggle:hover { border-color: var(--wb-accent); color: var(--wb-text); }
+
+/* Terminal closed: the rail is the whole product surface, so it takes the full
+   width and the workspace column disappears entirely. In the Feishu side panel
+   this is the "session list + native chat" arrangement — chat lives in Feishu's
+   own column, so we simply stop reserving space we are not drawing into. */
+.wb-desktop-layout.is-terminal-closed { grid-template-columns: minmax(0, 1fr); }
+.wb-desktop-layout.is-terminal-closed > .wb-rail-separator,
+.wb-desktop-layout.is-terminal-closed > .wb-workspace { display: none; }
+/* With the terminal closed the rail is the only thing we draw. Cap it so the
+   page stops claiming width it does not need — in a Feishu column that surplus
+   is what squeezes the native chat next to it. */
+.wb-desktop-layout.is-terminal-closed .wb-session-rail {
+  width: 100%;
+  max-width: var(--wb-rail-width);
+}
+
+/* The chat control is an anchor so the client receives a genuine link
+   activation; it still has to read as one of the row buttons. */
+a.wb-session-row-action { text-decoration: none; }
+
+/* Virtualisation positions every row from a fixed 54px estimate (see
+   workbenchListItemHeight in agent-workbench-model.ts — the two numbers must
+   move together), so a row that grows — a wrapping title, or action buttons
+   pushed to a second line in a narrow rail — desynchronises the scroll model
+   from what is painted. That drift is what let the list keep scrolling past its
+   own top. Pin the height and let the contents clip instead.
+   54 = 6px + 6px padding + 1px bottom border + 41px content, and the content is
+   one 15.6px title line + 4px gap + a 14px meta line = 33.6px. Touch layouts
+   keep their taller rows; see the 620px block above. */
+.wb-session-row {
+  height: 54px;
+  overflow: hidden;
+}
+.wb-session-row .wb-session-copy { min-width: 0; overflow: hidden; }
+
+/* Keep wheel momentum inside the list: at the boundary it would otherwise chain
+   to the host document, which in the Feishu WebView reads as endless scrolling. */
+.wb-session-list { overscroll-behavior: contain; }
+
+/* Terminal closed: use the whole column we were given rather than leaving a
+   dead band beside a 300px rail — the session list is the entire product here. */
+.wb-desktop-layout.is-terminal-closed .wb-session-rail {
+  width: 100%;
+  max-width: none;
+}
+
+/* Fit the row's contents inside that fixed height: one title line plus one meta
+   line; the actions float above them rather than taking a column.
+   The title is a single ellipsised line — the base .wb-session-title sets
+   white-space: nowrap, and the -webkit-line-clamp:2 that used to sit here was
+   inert anyway (clamping needs display:-webkit-box, which was never set), so the
+   row has always painted one line. Keep it that way at 54px and let the full
+   name come from the element's own title= tooltip. line-height stays 1.3 (15.6px
+   at the rail's 12px base) — that number is part of the height budget above. */
+.wb-session-row .wb-session-title {
+  line-height: 1.3;
+}
+.wb-session-row .wb-session-meta {
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+/* Row actions are secondary to the title: in a ~600px column three bordered
+   boxes read as the loudest thing in the row. Drop to bare labels inside the
+   overlay and let each button's own surface appear only on hover/focus, so they
+   stay reachable without competing with the session name. Each label is two
+   characters of text, so the width follows the copy instead of a fixed square. */
+.wb-session-row-action {
+  width: auto;
+  height: 20px;
+  /* The Dashboard's global `button, .btn-link { min-height: 32px }` outranks a
+     bare `height` (min-height wins over height in the used-value calculation),
+     so the three <button> actions inflated to 32px while the <a> "chat" action
+     stayed at 20px — the row's actions rendered top-aligned and bottom-ragged.
+     Zero the floor here so `height` is what actually decides the box. */
+  min-height: 0;
+  padding: 0 6px;
+  border-color: transparent;
+  background: transparent;
+  font-size: 11px;
+  line-height: 1;
+  white-space: nowrap;
+}
+.wb-session-row-action:hover,
+.wb-session-row-action:focus-visible {
+  border-color: var(--wb-border);
+  background: var(--wb-surface-2);
+}
+
+.wb-workspace-controls { display: flex; align-items: center; gap: 6px; }
+
+/* The rail must never push the row wider than the column it was given. */
+.wb-session-rail, .wb-session-list { max-width: 100%; overflow-x: hidden; }
+
+/* The Dashboard sets body { min-width: 320px } for its own multi-column pages.
+   A Feishu side panel can be narrower than that, and the floor made the whole
+   document overflow rather than letting the rail compress. Lift it only while a
+   Workbench surface is mounted. */
+body:has(.workbench-route-host) { min-width: 0; }
+
+/* Mobile workspace header: title and the terminal toggle cannot always sit on
+   one 390px line. Let it wrap and keep the controls reachable. */
+@media (max-width: 620px) {
+  .wb-workspace-header { flex-wrap: wrap; gap: 4px; padding: 6px 8px; height: auto; }
+  .wb-workspace-controls { flex-wrap: wrap; }
+  .wb-workspace-title { min-width: 0; flex: 1 1 100%; }
+  .wb-layout-level { font-size: 10px; padding: 2px 6px; }
+}
+
+/* Mobile: the page switcher belongs under the thumb, not at the top of a phone
+   held one-handed. Content first, nav last, and the bar keeps clear of the home
+   indicator. Targets go to 44px — the row actions are 20px tall on desktop,
+   fine for a mouse and too small for a fingertip. */
+@media (max-width: 620px) {
+  .wb-mobile-stack {
+    grid-template-rows: minmax(0, 1fr) auto;
+    grid-template-areas: "content" "nav";
+  }
+  .wb-mobile-stack > .wb-mobile-nav {
+    grid-area: nav;
+    border-top: 1px solid var(--wb-border-strong);
+    border-bottom: 0;
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+  }
+  .wb-mobile-stack > :not(.wb-mobile-nav) { grid-area: content; min-height: 0; }
+  .wb-mobile-nav button { min-height: 44px; font-size: 12px; }
+
+  .wb-session-row-action { height: 34px; padding: 0 8px; font-size: 12px; }
+  .wb-session-row { height: 72px; }
+  .wb-session-search input { height: 34px; font-size: 13px; }
+}
+
+/* Mobile drill-down chrome: back control, session name, and a compact segment
+   for the surfaces inside one session. */
+.wb-mobile-detail { display: grid; grid-template-rows: auto minmax(0, 1fr); min-height: 0; overflow: hidden; }
+.wb-mobile-detail-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--wb-border);
+  background: var(--wb-surface);
+}
+.wb-mobile-back {
+  min-height: 44px;
+  padding: 0 8px;
+  border: 0;
+  color: var(--wb-accent);
+  background: transparent;
+  font-size: 13px;
+  cursor: pointer;
+}
+.wb-mobile-detail-title {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  color: var(--wb-text);
+  font-size: 12px;
+}
+.wb-mobile-detail-seg { display: flex; flex: 0 0 auto; border: 1px solid var(--wb-border); border-radius: 4px; overflow: hidden; }
+.wb-mobile-detail-seg button {
+  min-height: 36px;
+  padding: 0 10px;
+  border: 0;
+  color: var(--wb-muted);
+  background: transparent;
+  font-size: 11px;
+  cursor: pointer;
+}
+.wb-mobile-detail-seg button[aria-current="page"] { color: var(--wb-accent); background: var(--wb-accent-soft); }
+
+/* Fingertip targets for the row actions on touch layouts. */
+@media (max-width: 620px) {
+  .wb-session-row-action { height: 44px; padding: 0 10px; font-size: 13px; }
+  .wb-session-row { height: 84px; }
+}
+
+/* Mobile detail already shows the session name and its surface switcher, so the
+   workspace's own header would repeat both and cost ~46px of the little height
+   a phone terminal has. One bar, not two.
+
+   The header is display:none at this breakpoint, so it is out of flow and takes
+   no grid cell at all — .wb-pane-stack is the workspace's only in-flow child.
+   The template therefore has to be a single row. A leading auto row would eat
+   the stack (it lands on row 1, ~61px) and leave the 1fr row empty, which
+   collapses .wb-pane-frame-shell → .wb-pane-frame-fit to 0 height and renders
+   no terminal on a phone. */
+@media (max-width: 620px) {
+  .wb-mobile-detail .wb-workspace-header { display: none; }
+  .wb-mobile-detail .wb-workspace { grid-template-rows: minmax(0, 1fr); }
+  .wb-mobile-detail-bar { padding: 4px 8px; gap: 6px; }
+  .wb-mobile-back { min-height: 40px; padding: 0 6px; }
+}
+
+.wb-mobile-preview { display: flex; min-height: 0; overflow: hidden; }
+.wb-mobile-preview > .wb-pane { flex: 1; min-height: 0; }
+
+/* 行操作浮层：平时隐藏，悬停/聚焦出现，垂直居中不与时间戳抢位 */
+.wb-session-row-actions {
+  position: absolute;
+  top: 50%;
+  right: 8px;
+  z-index: 2;
+  display: flex;
+  gap: 3px;
+  padding: 2px 3px;
+  border: 1px solid var(--wb-border);
+  border-radius: 4px;
+  background: var(--wb-surface-2);
+  transform: translateY(-50%);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity .12s ease;
+}
+.wb-session-row:hover .wb-session-row-actions,
+.wb-session-row:focus-within .wb-session-row-actions {
+  opacity: 1;
+  pointer-events: auto;
+}
+/* 触屏无 hover：点选中的行显示浮层 */
+@media (hover: none) {
+  .wb-session-row.is-selected .wb-session-row-actions { opacity: 1; pointer-events: auto; }
+}
+
+/* 会话类型徽标（话题 / 群 / 单聊）。挤在 meta 行里，所以行高由 line-height 锁死，
+   总高 16px < meta 行本身的高度，不会把虚拟滚动算好的行高撑开。 */
+.wb-session-kind {
+  flex: none;
+  padding: 0 3px;
+  border: 1px solid var(--wb-border);
+  border-radius: 2px;
+  color: var(--wb-faint);
+  font-size: 9px;
+  line-height: 14px;
+}
+/* meta 行是 space-between 的两栏（描述 | 时间）。插进徽标就变成三栏，自由空间
+   会被均分到徽标和描述之间。让描述吃掉剩余空间，恢复「左对齐 + 时间靠右」。 */
+.wb-session-kind + span { margin-right: auto; }
+
+/* 定位成功后的短暂确认态 */
+.wb-session-row-action.is-locate.is-located { color: var(--wb-success); border-color: var(--wb-success); }
+
+/* 未读点：时间戳左边一颗 8px 实心圆，accent 蓝在深浅两套主题下都够显眼。
+   flex:none 保证 meta 行被挤窄时它不会被压扁成一条线。
+   标题颜色刻意不动：标题本来就是 --wb-text + 700，两套主题里都没有「更重」的余地，
+   未读全靠这颗点 + 进「待你处理」组 + 行内「有新回复」三件事表达。 */
+.wb-unread-dot {
+  width: 8px;
+  height: 8px;
+  flex: none;
+  border-radius: 50%;
+  background: var(--wb-accent);
+}
+/* meta 行原本靠 space-between 撑成「描述 | 时间」两栏，插进未读点就成了三栏，
+   没有类型徽标的行会把点甩到行中间。让第一栏（没有徽标时就是描述本身）吃掉
+   剩余空间，点和时间就永远贴在右边。有徽标的行由上面的 .wb-session-kind + span
+   规则负责，两条规则互斥，任何一行都只会有一个 auto 外边距。 */
+.wb-session-meta > span:first-child:not(.wb-session-kind) { margin-right: auto; }
+
+/* 分组维度下拉：和栏头的收起按钮同一套线条语言（透明底 + 1px 描边 + 24px 高）。
+   全站的 select 基线规则（min-height 34px / padding 7px 11px / 右侧 30px 留给箭头）
+   特异性只有 0,0,1，这里逐条压掉；箭头沿用那条规则里的默认 SVG，不自绘。
+   margin-left:auto 把它推到收起按钮旁边，栏头保持「左标题 · 右控件」。 */
+.wb-group-dim {
+  height: 24px;
+  min-height: 0;
+  max-width: 96px;
+  padding: 0 16px 0 4px;
+  margin-left: auto;
+  border: 1px solid var(--wb-border);
+  border-radius: 2px;
+  color: var(--wb-muted);
+  background-color: transparent;
+  background-position: right 3px center;
+  font: inherit;
+  font-size: 11px;
+  line-height: 22px;
+  cursor: pointer;
+}
+.wb-group-dim:hover { border-color: var(--wb-border-strong); color: var(--wb-text); }
+/* 展开的选项列表由浏览器绘制，只保证它跟随当前主题的底色和字色。 */
+.wb-group-dim option { color: var(--wb-text); background: var(--wb-surface-2); }
+
+/* 分组组头 = 折叠开关。它就是原来那个 .wb-session-group 元素本身，只是标签换成了
+   <button>，于是全站的按钮基线（min-height 32px / 1px 描边 / raised 底色 / 居中
+   文字）会突然罩进来。组头高度是虚拟滚动算好后写死在 style 上的 30px，min-height
+   在 used value 上压过 height，不清零就会撑成 32px、和滚动模型差 2px 一路累积。
+   选择器故意用两个类：全局的 `.agent-workbench-page button { font: inherit }`
+   特异性是 (0,1,1)，单靠 .wb-session-group 的 font-size:10px (0,1,0) 压不住，
+   组头字号会被顶回 12px。
+   这里一个字都不提 color —— 待你处理的红、进行中的绿由 .wb-session-group-needs-you
+   / -active 负责，写了 color 就会被这条更特异的规则洗掉。 */
+.wb-session-group.wb-session-group-toggle {
+  width: 100%;
+  min-height: 0;
+  /* 多一列放折叠箭头；icon / 标签 / 计数三格的相对排布不变，只是整体右移 8px，
+     箭头落在最左边——这是折叠列表的通行手势位置。 */
+  grid-template-columns: 11px 14px minmax(0, 1fr) auto;
+  padding: 5px 9px 3px 2px;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  font-size: 10px;
+  line-height: 1.4;
+  letter-spacing: .09em;
+  text-align: left;
+  white-space: nowrap;
+  overflow: hidden;
+  cursor: pointer;
+}
+.wb-session-group-caret { text-align: center; }
+/* 长组名（会话名、仓库名都是自由文本）截断，别压到右边的计数上。 */
+.wb-session-group-toggle > strong { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+/* hover：中性组提亮文字；语义色的两组只加底色，一 hover 就把红/绿洗成前景色会丢语义。 */
+.wb-session-group-toggle:hover { color: var(--wb-text); background: var(--wb-surface-2); }
+.wb-session-group-toggle.wb-session-group-needs-you:hover { color: var(--wb-danger); }
+.wb-session-group-toggle.wb-session-group-active:hover { color: var(--wb-success); }
+
+/* 拖动会话栏宽度期间：iframe 不抢指针事件，页面不选中文字 */
+.agent-workbench-page.is-rail-dragging { user-select: none; }
+.agent-workbench-page.is-rail-dragging iframe { pointer-events: none; }

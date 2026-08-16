@@ -238,6 +238,14 @@ export function workbenchH5Capability(method: string, pathname: string): Workben
     return 'workbench.view';
   }
 
+  // Read-only terminal capability URL. A viewToken cannot send input, so
+  // observing identities may fetch it; the writable twin (write-link) stays
+  // behind the local management cookie.
+  if ((normalizedMethod === 'GET' || normalizedMethod === 'HEAD')
+    && /^\/api\/sessions\/[^/]+\/(view-link|preview)$/.test(pathname)) {
+    return 'terminal.view';
+  }
+
   const terminal = pathname.match(/^\/api\/sessions\/[^/]+\/control(?:\/(takeover|release))?$/);
   if (terminal) {
     if (normalizedMethod === 'GET' && !terminal[1]) return 'terminal.view';
@@ -327,6 +335,10 @@ export function decideDashboardAuth(opts: {
       pathname === '/favicon.ico' ||
       pathname === '/favicon.png' ||
       pathname === '/apple-touch-icon.png' ||
+      // The install manifest is fetched by the OS, not the signed-in page, so a
+      // gated response silently disables "add to home screen". It names icons
+      // and a start URL — no session data.
+      pathname === '/workbench.webmanifest' ||
       pathname.startsWith('/assets/') ||
       pathname.startsWith('/game/')
     );
@@ -351,7 +363,15 @@ export function decideDashboardAuth(opts: {
     return {
       kind: 'allow+set-cookie',
       token: presentedToken,
-      redirectTo: pathname || '/',
+      // The fragment-free Workbench entries are redirects themselves. Sending
+      // the cleaned URL back to the same path would bounce between "strip the
+      // token" and "redirect again", so resolve them to their real destination
+      // in this one hop.
+      redirectTo: pathname === '/workbench'
+        ? '/#/agent-workbench'
+        : pathname === '/workbench/dock'
+          ? '/#/agent-workbench-dock'
+          : pathname || '/',
     };
   }
 

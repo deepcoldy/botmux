@@ -12,8 +12,6 @@ import {
   buildChatAppLink,
   buildWorkbenchLoginUrl,
   buildWorkbenchWebAppLink,
-  ensureFeishuJsApi,
-  openWorkbenchChat,
   type FeishuJsApi,
   type WorkbenchH5Context,
 } from './agent-workbench-chat.js';
@@ -44,8 +42,6 @@ export function AgentWorkbenchDockView(props: AgentWorkbenchDockViewProps): JSX.
   const api = useMemo(() => props.api ?? createWorkbenchApi(), [props.api]);
   const [selectedId, setSelectedId] = useState(props.initialSessionId ?? firstSessionId(props.sessions));
   const [h5, setH5] = useState<WorkbenchH5Context | null>(props.h5Context ?? null);
-  const [sdk, setSdk] = useState<FeishuJsApi | null>(props.sdk ?? null);
-  const [feedback, setFeedback] = useState('Dock is ready.');
   const selected = props.sessions.find(session => session.sessionId === selectedId) ?? null;
   const targetOrigin = props.targetOrigin ?? (typeof window === 'undefined' ? 'https://dashboard.invalid' : window.location.origin);
   const location = props.location ?? (typeof window === 'undefined' ? null : window.location);
@@ -56,13 +52,6 @@ export function AgentWorkbenchDockView(props: AgentWorkbenchDockViewProps): JSX.
     void api.getH5Context(controller.signal).then(setH5);
     return () => controller.abort();
   }, [api, props.h5Context]);
-
-  useEffect(() => {
-    if (props.sdk !== undefined) return undefined;
-    let live = true;
-    void ensureFeishuJsApi().then(value => { if (live) setSdk(value); });
-    return () => { live = false; };
-  }, [props.sdk]);
 
   const select = (sessionId: string) => {
     setSelectedId(sessionId);
@@ -83,29 +72,18 @@ export function AgentWorkbenchDockView(props: AgentWorkbenchDockViewProps): JSX.
   const terminalLink = selected ? workbenchTerminalHref(selected, location) : null;
   const previewLink = selected ? workbenchPreviewHref(selected) : null;
 
-  const openChat = async () => {
-    if (!selected?.chatId) return;
-    const result = await openWorkbenchChat({
-      chatId: selected.chatId,
-      appLink: selected.feishuChatLink || buildChatAppLink(selected.chatId, h5?.brand),
-      preferSplit: false,
-      sdk,
-      openExternal: url => { if (typeof window !== 'undefined') window.location.assign(url); },
-    });
-    setFeedback(result.kind === 'native-jump' ? 'Chat opened in Feishu.' : 'Chat opened with AppLink fallback.');
-  };
-
   return (
     <main className="agent-workbench-dock" data-surface="sidebar" style={{ minWidth: 350 }}>
       <header className="wb-dock-header">
-        <div><span aria-hidden="true">◖</span><strong>ORCA DOCK</strong></div>
-        <span className={props.online ? 'is-online' : 'is-offline'}>{props.online ? '● LIVE' : '○ OFFLINE'}</span>
+        <div><span aria-hidden="true">◖</span><strong>会话坞</strong></div>
+        <span className={props.online ? 'is-online' : 'is-offline'}>{props.online ? '● 在线' : '○ 离线'}</span>
       </header>
       <WorkbenchSessionList
         sessions={props.sessions}
         selectedSessionId={selectedId}
         locale={props.locale}
         now={props.now}
+        online={props.online}
         onSelect={select}
       />
       <section className="wb-dock-actions" aria-live="polite">
@@ -117,25 +95,36 @@ export function AgentWorkbenchDockView(props: AgentWorkbenchDockViewProps): JSX.
             </div>
             {!props.authenticated ? (
               <a className="wb-primary-action" href={buildWorkbenchLoginUrl(h5?.entryPath ?? '/auth/feishu', 'dock', selected.sessionId)}>
-                Sign in to continue
+                登录后继续
               </a>
             ) : appCenterLink ? (
-              <a className="wb-primary-action" href={appCenterLink}>Open full Workbench in appCenter</a>
+              <a className="wb-primary-action" href={appCenterLink}>打开完整工作台</a>
             ) : (
               <a className="wb-primary-action" href={buildWorkbenchHash('main', selected.sessionId)} target="_top">
-                Open full Workbench
+                打开完整工作台
               </a>
             )}
             <div className="wb-dock-action-grid">
-              <button type="button" disabled={!selected.chatId} onClick={() => void openChat()}>Open chat</button>
-              {terminalLink ? <a href={terminalLink} target="_blank" rel="noopener noreferrer">Terminal fallback</a> : <span aria-disabled="true">No terminal</span>}
-              {previewLink ? <a href={previewLink} target="_blank" rel="noopener noreferrer">Web fallback</a> : <span aria-disabled="true">No Web preview</span>}
+              {/* Same contract as the Dashboard's own chat control: a real link
+                  the client can claim. Scripting this open (window.open, or
+                  location.assign as a "fallback") navigates the Dock away
+                  instead of letting Feishu place the chat beside it. */}
+              {selected.chatId
+                ? (
+                  <a
+                    href={selected.feishuChatLink || buildChatAppLink(selected.chatId, h5?.brand)}
+                    target="_blank"
+                    rel="noopener"
+                  >打开聊天</a>
+                )
+                : <span aria-disabled="true">无聊天</span>}
+              {terminalLink ? <a href={terminalLink} target="_blank" rel="noopener noreferrer">终端链接</a> : <span aria-disabled="true">无终端</span>}
+              {previewLink ? <a href={previewLink} target="_blank" rel="noopener noreferrer">网页链接</a> : <span aria-disabled="true">无网页预览</span>}
             </div>
-            <p role="status">{feedback}</p>
           </>
-        ) : <p>Select a session.</p>}
+        ) : <p>请选择一个会话。</p>}
       </section>
-      <footer>Quick Dock only · Terminal/Web panes live in appCenter · Chat stays native</footer>
+      <footer>轻量会话坞 · 终端/网页请在完整工作台查看 · 聊天使用飞书原生窗口</footer>
     </main>
   );
 }

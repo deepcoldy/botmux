@@ -2928,6 +2928,45 @@ const server = createServer(async (req, res) => {
       res.writeHead(404); res.end(); return;
     }
 
+    // Fragment-free entry points. The card's terminal AppLink works with a plain
+    // `/s/<id>?token=` URL; ours carried `#/agent-workbench`, and a fragment is
+    // the one structural difference between the two. Clients that re-encode or
+    // truncate an AppLink's `url` lose it and land on the Dashboard home, so
+    // offer a path that survives regardless.
+    if ((req.method === 'GET' || req.method === 'HEAD')
+      && (url.pathname === '/workbench' || url.pathname === '/workbench/dock')) {
+      const target = url.pathname === '/workbench/dock' ? '#/agent-workbench-dock' : '#/agent-workbench';
+      const token = url.searchParams.get('t');
+      const query = token ? `?t=${encodeURIComponent(token)}` : '';
+      res.writeHead(302, { location: `/${query}${target}`, 'cache-control': 'no-store' });
+      res.end();
+      return;
+    }
+
+    // Installable Workbench: Feishu has no way to pin a custom app into its
+    // mobile tab bar, so the closest thing to a permanent entry is the phone's
+    // own home screen. A manifest makes "add to home screen" launch straight
+    // into the session list, standalone and chrome-less.
+    if ((req.method === 'GET' || req.method === 'HEAD') && url.pathname === '/workbench.webmanifest') {
+      const manifest = {
+        name: 'Botmux Workbench',
+        short_name: 'Workbench',
+        start_url: '/#/agent-workbench',
+        scope: '/',
+        display: 'standalone',
+        orientation: 'any',
+        background_color: '#080b10',
+        theme_color: '#080b10',
+        icons: [
+          { src: '/apple-touch-icon.png', sizes: '180x180', type: 'image/png' },
+          { src: '/favicon.png', sizes: '512x512', type: 'image/png', purpose: 'any' },
+        ],
+      };
+      res.writeHead(200, { 'content-type': 'application/manifest+json', 'cache-control': 'no-cache' });
+      res.end(JSON.stringify(manifest));
+      return;
+    }
+
     // ─── Static frontend (index.html + /assets/* + /game/* + root icons) ───
     if (
       (req.method === 'GET' || req.method === 'HEAD') &&
@@ -4134,6 +4173,23 @@ const server = createServer(async (req, res) => {
       const owner = aggregator.ownerOf(sid);
       if (!owner) return jsonRes(res, 404, { ok: false, error: 'unknown_session' });
       const upstream = await proxyToDaemon(owner, `/api/sessions/${sid}/write-link`, { method: 'GET' });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+
+    // Read-only web-terminal link (viewToken-bearing) — the same capability the
+    // Feishu card's 「打开 Web 终端」 button already publishes. The Workbench
+    // terminal pane uses it so the frame authenticates by capability instead of
+    // by Dashboard cookie, which a Feishu WebView does not carry. A viewToken can
+    // never send input, so this is safe for any identity allowed to observe the
+    // session; unauthenticated callers were already rejected by the auth decision
+    // above (this path is in no public allow-list).
+    if (req.method === 'GET' && (m = url.pathname.match(/^\/api\/sessions\/([^/]+)\/view-link$/))) {
+      const sid = decodeURIComponent(m[1]);
+      const owner = aggregator.ownerOf(sid);
+      if (!owner) return jsonRes(res, 404, { ok: false, error: 'unknown_session' });
+      const upstream = await proxyToDaemon(owner, `/api/sessions/${sid}/view-link`, { method: 'GET' });
       res.writeHead(upstream.status, { 'content-type': 'application/json' });
       res.end(await upstream.text());
       return;

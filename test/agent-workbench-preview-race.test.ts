@@ -53,9 +53,9 @@ describe('Agent Workbench preview request ordering', () => {
     });
     expect(renderer.root.findAll(node => String(node.props.className).includes('is-interactive'))).toHaveLength(1);
 
-    const pane = renderer.root.findByProps({ 'aria-label': 'Web preview pane' });
+    const pane = renderer.root.findByProps({ 'aria-label': '网页预览面板' });
     await act(async () => { pane.props.onPointerDown({ target: null }); });
-    const lock = renderer.root.findAllByType('button').find(button => button.children.includes('Lock now'))!;
+    const lock = renderer.root.findAllByType('button').find(button => button.children.includes('立即锁定'))!;
     await act(async () => { await lock.props.onClick(); });
     lateActivity.resolve(interactive());
     await act(async () => { await lateActivity.promise; });

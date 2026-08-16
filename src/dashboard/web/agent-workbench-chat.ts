@@ -26,6 +26,12 @@ export interface OpenWorkbenchChatOptions {
   chatId: string;
   appLink?: string;
   preferSplit: boolean;
+  /** JSAPI is only attempted when this is not false. An unsigned page gets
+   *  refused anyway (errno=105) — but only after an async round-trip, and that
+   *  await is what strips user activation off the AppLink fallback, which the
+   *  client then demotes to a page-initiated open. False keeps the dispatch
+   *  inside the click's own task, like the Dashboard's plain anchor. */
+  nativeEnabled?: boolean;
   sdk?: FeishuJsApi | null;
   timeoutMs?: number;
   openExternal?: (url: string) => void;
@@ -34,7 +40,9 @@ export interface OpenWorkbenchChatOptions {
 export type OpenWorkbenchChatResult =
   | { kind: 'native-split'; method: 'toggleChat' }
   | { kind: 'native-jump'; method: 'enterChat' }
-  | { kind: 'applink'; method: 'AppLink'; url: string };
+  /** `rejectedBecause` is the client's own reason the native path failed,
+   *  when it gave one. Absent means the SDK was simply not present. */
+  | { kind: 'applink'; method: 'AppLink'; url: string; rejectedBecause?: string };
 
 declare global {
   interface Window {
@@ -47,6 +55,10 @@ function appLinkHost(brand: WorkbenchBrand): string {
   return brand === 'lark' ? 'https://applink.larksuite.com' : 'https://applink.feishu.cn';
 }
 
+/** chat/open must stay a bare link: sidebar-semi/width params are a web_url
+ *  container contract, and a chat/open carrying them makes the client abandon
+ *  in-place placement and navigate — the exact jump this module exists to
+ *  avoid. Chat-panel width is client-owned; do not try to smuggle it in here. */
 export function buildChatAppLink(chatId: string, brand: WorkbenchBrand = 'feishu'): string {
   const url = new URL('/client/chat/open', appLinkHost(brand));
   url.searchParams.set('openChatId', chatId);
@@ -89,34 +101,66 @@ export function buildWorkbenchLoginUrl(
   return `${path}?returnTo=${encodeURIComponent(`/${buildWorkbenchHash(surface, sessionId)}`)}`;
 }
 
+/**
+ * Three-state on purpose. Opening a chat is a side effect that has already
+ * happened by the time we are waiting: a client that performs the action but
+ * never invokes `success` is not the same as one that reports `fail`. Collapsing
+ * both into false made the caller run its fallback on top of a chat the client
+ * had already opened — the visible double navigation.
+ */
+type JsApiOutcome = 'ok' | 'failed' | 'no-response';
+
+/** Why the call ended that way. `detail` carries the client's own error (errno
+ *  and message) so a rejection can be reported as observed rather than guessed
+ *  at — "unauthorised JSAPI" is a diagnosis that has to come from the client. */
+export interface JsApiResult {
+  outcome: JsApiOutcome;
+  detail?: string;
+}
+
+function describeJsApiError(error: unknown): string | undefined {
+  if (!error || typeof error !== 'object') return typeof error === 'string' ? error.slice(0, 120) : undefined;
+  const record = error as Record<string, unknown>;
+  const errno = record.errno ?? record.errCode ?? record.code;
+  const message = record.errString ?? record.errMsg ?? record.message;
+  const parts = [
+    errno === undefined ? '' : `errno=${String(errno).slice(0, 40)}`,
+    typeof message === 'string' ? message.slice(0, 90) : '',
+  ].filter(Boolean);
+  return parts.length ? parts.join(' ') : undefined;
+}
+
 function invokeJsApi(
   method: ((options: FeishuJsApiOptions) => unknown) | undefined,
   receiver: FeishuJsApi,
   chatId: string,
   timeoutMs: number,
-): Promise<boolean> {
-  if (typeof method !== 'function') return Promise.resolve(false);
+): Promise<JsApiResult> {
+  if (typeof method !== 'function') return Promise.resolve({ outcome: 'failed', detail: 'method unavailable' });
   return new Promise(resolve => {
     let settled = false;
-    const finish = (ok: boolean) => {
+    const finish = (outcome: JsApiOutcome, detail?: string) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      resolve(ok);
+      resolve(detail === undefined ? { outcome } : { outcome, detail });
     };
-    const timer = setTimeout(() => finish(false), timeoutMs);
+    const timer = setTimeout(() => finish('no-response'), timeoutMs);
     try {
       const returned = method.call(receiver, {
         openChatId: chatId,
         needBadge: true,
-        success: () => finish(true),
-        fail: () => finish(false),
+        success: () => finish('ok'),
+        fail: error => finish('failed', describeJsApiError(error)),
       });
       if (returned && typeof (returned as PromiseLike<unknown>).then === 'function') {
-        void Promise.resolve(returned).then(() => finish(true), () => finish(false));
+        void Promise.resolve(returned).then(
+          () => finish('ok'),
+          error => finish('failed', describeJsApiError(error)),
+        );
       }
-    } catch {
-      finish(false);
+    } catch (error) {
+      finish('failed', describeJsApiError(error));
     }
   });
 }
@@ -125,11 +169,23 @@ function invokeJsApi(
 export async function openWorkbenchChat(options: OpenWorkbenchChatOptions): Promise<OpenWorkbenchChatResult> {
   const sdk = options.sdk ?? (typeof window !== 'undefined' ? window.tt ?? null : null);
   const timeoutMs = Math.max(250, options.timeoutMs ?? 1_500);
-  if (sdk && options.preferSplit && await invokeJsApi(sdk.toggleChat, sdk, options.chatId, timeoutMs)) {
-    return { kind: 'native-split', method: 'toggleChat' };
-  }
-  if (sdk && await invokeJsApi(sdk.enterChat, sdk, options.chatId, timeoutMs)) {
-    return { kind: 'native-jump', method: 'enterChat' };
+  // Only an explicit `fail` justifies trying the next mechanism. Silence means
+  // the client most likely acted without reporting back, and stacking enterChat
+  // (a full-page jump) on top of an already-open side panel is worse than
+  // stopping here.
+  let rejection: string | undefined;
+  const native = options.nativeEnabled !== false;
+  if (sdk && native && options.preferSplit) {
+    const result = await invokeJsApi(sdk.toggleChat, sdk, options.chatId, timeoutMs);
+    if (result.outcome !== 'failed') return { kind: 'native-split', method: 'toggleChat' };
+    rejection = result.detail;
+    // toggleChat was rejected. enterChat needs the same JSAPI authorisation, so
+    // it would fail identically while additionally navigating the whole page —
+    // go straight to the AppLink and let the client place the chat instead.
+  } else if (sdk && native) {
+    const result = await invokeJsApi(sdk.enterChat, sdk, options.chatId, timeoutMs);
+    if (result.outcome !== 'failed') return { kind: 'native-jump', method: 'enterChat' };
+    rejection = result.detail;
   }
   let url = buildChatAppLink(options.chatId);
   if (options.appLink) {
@@ -146,7 +202,9 @@ export async function openWorkbenchChat(options: OpenWorkbenchChatOptions): Prom
     }
   }
   options.openExternal?.(url);
-  return { kind: 'applink', method: 'AppLink', url };
+  return rejection === undefined
+    ? { kind: 'applink', method: 'AppLink', url }
+    : { kind: 'applink', method: 'AppLink', url, rejectedBecause: rejection };
 }
 
 let sdkLoad: Promise<FeishuJsApi | null> | null = null;

@@ -25,20 +25,47 @@ export interface WorkbenchApi {
   touchPreview(sessionId: string, signal?: AbortSignal): Promise<PreviewInteractionState>;
   lockPreview(sessionId: string, signal?: AbortSignal): Promise<PreviewInteractionState>;
   getH5Context(signal?: AbortSignal): Promise<WorkbenchH5Context | null>;
+  /** Capability URL for the read-only terminal (viewToken-bearing). The frame
+   *  authenticates by this capability, so it also works where no Dashboard
+   *  cookie exists — a Feishu WebView being the case that motivated it. */
+  getTerminalViewLink(sessionId: string, signal?: AbortSignal): Promise<string | null>;
+  /** 让 bot 在会话原话题里发一条 @ 拥有者的定位标记。服务端对每个会话有 30s
+   *  限流，超了返回 429 + `retry-after`（见 WorkbenchApiError.retryAfterSeconds）。 */
+  locateSession(sessionId: string, signal?: AbortSignal): Promise<void>;
 }
 
 export class WorkbenchApiError extends Error {
-  constructor(public readonly status: number, public readonly code: string) {
+  constructor(
+    public readonly status: number,
+    public readonly code: string,
+    /** 仅 429 有值：还要等多少秒才能重试。调用方据此显示冷却而不是报错。 */
+    public readonly retryAfterSeconds?: number,
+  ) {
     super(code);
     this.name = 'WorkbenchApiError';
   }
+}
+
+/** 限流响应把等待时长放在 `retry-after` 头（秒）里，body 另带 `retryAfterMs`。
+ *  取头优先、body 兜底，两者都没有就返回 undefined（调用方退化成普通错误）。 */
+function parseRetryAfter(response: Response, body: Record<string, unknown> | null): number | undefined {
+  if (response.status !== 429) return undefined;
+  const header = Number(response.headers?.get?.('retry-after'));
+  if (Number.isFinite(header) && header > 0) return Math.ceil(header);
+  const ms = Number(body?.retryAfterMs);
+  if (Number.isFinite(ms) && ms > 0) return Math.ceil(ms / 1000);
+  return undefined;
 }
 
 async function jsonRequest<T>(fetchImpl: typeof fetch, path: string, init: RequestInit = {}): Promise<T> {
   const response = await fetchImpl(path, { cache: 'no-store', ...init });
   const body = await response.json().catch(() => null) as Record<string, unknown> | null;
   if (!response.ok || !body || body.ok === false) {
-    throw new WorkbenchApiError(response.status, String(body?.error ?? `http_${response.status}`));
+    throw new WorkbenchApiError(
+      response.status,
+      String(body?.error ?? `http_${response.status}`),
+      parseRetryAfter(response, body),
+    );
   }
   return body as T;
 }
@@ -145,6 +172,37 @@ export function createWorkbenchApi(fetchImpl: typeof fetch = fetch): WorkbenchAp
     lockPreview: async (sessionId, signal) => previewInteractionState(
       await jsonRequest(fetchImpl, previewPath(sessionId, 'lock'), { method: 'POST', signal }),
     ),
+    async locateSession(sessionId, signal) {
+      await jsonRequest(
+        fetchImpl,
+        `/api/sessions/${encodeURIComponent(sessionId)}/locate`,
+        { method: 'POST', signal },
+      );
+    },
+    async getTerminalViewLink(sessionId, signal) {
+      try {
+        const body = responseObject(
+          await jsonRequest<unknown>(
+            fetchImpl,
+            `/api/sessions/${encodeURIComponent(sessionId)}/view-link`,
+            { signal },
+          ),
+          'invalid_view_link_response',
+        );
+        // Same untrusted-URL discipline the pane applies to riffAccessUrl: the
+        // link is built by another daemon, so only http(s) without embedded
+        // credentials may reach the DOM.
+        if (typeof body.url !== 'string' || body.url.length > 2_048) return null;
+        const parsed = new URL(body.url);
+        if ((parsed.protocol !== 'http:' && parsed.protocol !== 'https:')
+          || parsed.username || parsed.password) {
+          return null;
+        }
+        return parsed.toString();
+      } catch {
+        return null;
+      }
+    },
     async getH5Context(signal) {
       try {
         const body = responseObject(

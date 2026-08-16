@@ -1357,6 +1357,23 @@ ipcRoute('GET', '/api/sessions/:sessionId/write-link', (req, res, params) => {
 });
 
 /**
+ * Read-only twin of write-link: the same capability URL the Feishu card's
+ * 「打开 Web 终端」button already hands out (viewToken, never the write token).
+ * The Workbench embeds this so its terminal pane works in containers that carry
+ * no Dashboard cookie — a Feishu WebView being the motivating case. Knowing a
+ * viewToken never grants terminal input, so this stays read-only by construction
+ * rather than by UI convention.
+ */
+ipcRoute('GET', '/api/sessions/:sessionId/view-link', (req, res, params) => {
+  if (!ipcHmacAuthorized(req)) return jsonRes(res, 401, { ok: false, error: 'unauthorized' });
+  const ds = findActiveBySessionId(params.sessionId);
+  if (!ds) return jsonRes(res, 404, { ok: false, error: 'session_not_active' });
+  const port = ds.workerPort ?? ds.session.webPort;
+  if (!port) return jsonRes(res, 409, { ok: false, error: 'terminal_unavailable' });
+  jsonRes(res, 200, { ok: true, url: buildTerminalUrl(ds) });
+});
+
+/**
  * Dashboard「复现命令」：返回该 active session 本次冷启的**近似**可复现 CLI 调用
  * （bin + argv + cwd + 权威注入 env），供用户粘到调试终端改参数复现。命令原样保留
  * （含 write token / --append-system-prompt / 凭证 env），与 write-link 同一把
