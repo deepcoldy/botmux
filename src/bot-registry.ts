@@ -1139,13 +1139,13 @@ export interface SessionGroupConfig {
   onClose?: 'keep' | 'disband' | 'archive';
   /**
    * Session-group tagging.
-   * 'chat-tag' (default) — tenant chat tags (企业自定义群标签): a property of
-   *   the GROUP itself, applied with the bot's own tenant token. Zero user
-   *   OAuth; needs the im:tag:write + im:biz_entity_tag_relation:write tenant
-   *   scopes enabled for the app.
-   * 'feed-group' — the owner's personal sidebar 消息分组 (feed group). Needs a
-   *   one-time user OAuth (im:feed_group_v1) — kept as an opt-in because it
-   *   touches the user's personal sidebar data.
+   * 'feed-group' (default) — the owner's personal sidebar 消息分组 (feed
+   *   group). Needs a one-time user OAuth (im:feed_group_v1), auto-refreshed
+   *   afterwards; works on any tenant — no tenant scope catalog involved.
+   * 'chat-tag' — tenant chat tags (企业自定义群标签): a property of the GROUP
+   *   itself, applied with the bot's own tenant token. Zero user OAuth; needs
+   *   the im:tag:write + im:biz_entity_tag_relation:write tenant scopes, which
+   *   some tenants' scope catalogs don't offer at all (hence not the default).
    * 'off' — no tagging.
    */
   tag?: {
