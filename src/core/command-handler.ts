@@ -4635,17 +4635,40 @@ async function upsertForkPanelCard(
     }
   }
 
+  // Post the panel. Primary: reply-in-thread to the session's root message so
+  // the panel anchors to this conversation. Fallback: if that reply fails (the
+  // most common cause is the root message aging past Lark's reply window —
+  // surfaces as HTTP 400 — but also covers a withdrawn root), post the card flat
+  // to the chat instead. The panel IS the user-visible output of /forklist, so a
+  // swallowed failure looks like the command silently did nothing; the flat send
+  // keeps it visible. Only if BOTH transports fail do we give up (and warn).
+  const cardBody = buildForkPanelCard(children, loc);
+  let cardId: string | undefined;
   try {
-    const cardId = await replyMessage(
+    cardId = await replyMessage(
       appId,
       parentDs.session.rootMessageId,
-      buildForkPanelCard(children, loc),
+      cardBody,
       'interactive',
       true,
     );
+  } catch (replyErr) {
+    logger.warn(
+      `[fork-panel] reply to root ${parentDs.session.rootMessageId} failed `
+      + `(${replyErr instanceof Error ? replyErr.message : replyErr}); `
+      + 'falling back to a flat chat message',
+    );
+    try {
+      cardId = await sendMessage(appId, chatId, cardBody, 'interactive');
+    } catch (sendErr) {
+      logger.warn(
+        `[fork-panel] failed to post panel card via both reply and flat send: `
+        + `${sendErr instanceof Error ? sendErr.message : sendErr}`,
+      );
+    }
+  }
+  if (cardId) {
     parentDs.session.forkPanelCardId = cardId;
     sessionStore.updateSession(parentDs.session);
-  } catch (err) {
-    logger.warn(`[fork-panel] failed to post panel card: ${err instanceof Error ? err.message : err}`);
   }
 }
