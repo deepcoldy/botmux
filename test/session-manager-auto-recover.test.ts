@@ -30,10 +30,11 @@ import { shouldAutoForkOnRestore, staggeredRecoveryFork } from '../src/core/sess
 import type { DaemonSession } from '../src/core/types.js';
 
 describe('shouldAutoForkOnRestore', () => {
-  it('eagerly re-forks every persistent backend (tmux/herdr/zellij)', () => {
+  it('eagerly re-forks every persistent backend (tmux/herdr/zellij/zmx)', () => {
     expect(shouldAutoForkOnRestore('tmux')).toBe(true);
     expect(shouldAutoForkOnRestore('herdr')).toBe(true);
     expect(shouldAutoForkOnRestore('zellij')).toBe(true);
+    expect(shouldAutoForkOnRestore('zmx')).toBe(true);
   });
 
   it('never eagerly forks the pty backend — it has no pane to re-attach', () => {
@@ -43,7 +44,7 @@ describe('shouldAutoForkOnRestore', () => {
 
 describe('staggeredRecoveryFork', () => {
   const ds = (id: string, worker: unknown = null) =>
-    ({ worker, session: { sessionId: id } } as unknown as DaemonSession);
+    ({ worker, session: { sessionId: id, status: 'active' } } as unknown as DaemonSession);
 
   it('re-forks every queued session', async () => {
     const forked: string[] = [];
@@ -67,6 +68,20 @@ describe('staggeredRecoveryFork', () => {
     expect(forked).toEqual(['a', 'c']); // 'live' already has a worker — not clobbered
   });
 
+  it('isolates a synchronous recovery fork failure and continues with later owners', async () => {
+    const forked: string[] = [];
+    await expect(staggeredRecoveryFork(
+      [ds('broken'), ds('healthy')],
+      current => {
+        if (current.session.sessionId === 'broken') throw new Error('init IPC rejected');
+        forked.push(current.session.sessionId);
+      },
+      5,
+      0,
+    )).resolves.toBeUndefined();
+    expect(forked).toEqual(['healthy']);
+  });
+
   it('staggers in batches (delay only kicks in between batches)', async () => {
     const sessions = Array.from({ length: 5 }, (_, i) => ds(`s${i}`));
     const forked: string[] = [];
@@ -75,5 +90,26 @@ describe('staggeredRecoveryFork', () => {
     // 5 sessions / batch 2 ⇒ pauses after #2 and #4 ⇒ 2 delays of 20ms.
     expect(forked).toHaveLength(5);
     expect(Date.now() - start).toBeGreaterThanOrEqual(30);
+  });
+
+  it('rechecks exact ownership after a batch delay and never forks a replaced session', async () => {
+    const a = ds('a');
+    const b = ds('b');
+    const owned = new Set([a, b]);
+    const forked: string[] = [];
+    setTimeout(() => {
+      owned.delete(b);
+      b.session.status = 'closed';
+    }, 5);
+
+    await staggeredRecoveryFork(
+      [a, b],
+      current => forked.push(current.session.sessionId),
+      1,
+      20,
+      current => owned.has(current),
+    );
+
+    expect(forked).toEqual(['a']);
   });
 });

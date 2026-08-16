@@ -55,7 +55,8 @@ function requiredCommand(input: CliAvailabilityInput): string | undefined {
 /**
  * Check launch availability with the same shell-aware resolution used by the
  * worker.  The fast PATH check avoids shell startup in the common case; the
- * fallback still finds nvm/fnm/rc-only installs and the macOS Codex.app binary.
+ * fallback still finds nvm/fnm/rc-only installs and the macOS ChatGPT/Codex
+ * desktop app binary.
  */
 export function checkCliAvailability(
   input: CliAvailabilityInput,

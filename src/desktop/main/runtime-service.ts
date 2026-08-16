@@ -420,8 +420,8 @@ export function createRuntimeService(deps: RuntimeServiceDeps) {
       const runtime = activeRuntime();
       if (!runtime) return rejectedCliRequired();
       // Desktop embeds the existing authenticated dashboard session by default.
-      // Falling back to rotation is decided by the IPC locator only when the
-      // dashboard explicitly reports that no active token exists yet.
+      // The IPC locator falls back to the get-or-create command only when the
+      // read-only probe reports that no active token exists yet.
       const result = deps.dashboardEndpoint
         ? await deps.dashboardEndpoint('/__cli/current')
         : await callDashboard({

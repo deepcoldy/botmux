@@ -14,6 +14,9 @@ const mockFindByChat = vi.fn();
 const mockLoggerWarn = vi.hoisted(() => vi.fn());
 
 vi.mock('../src/services/session-store.js', () => ({
+  registerSessionBridgeSendMarkerCleanupFence: vi.fn(),
+  cleanupSessionBridgeSendMarkers: vi.fn(),
+  cleanupSessionBridgeSendMarkersNow: vi.fn(),
   findActiveSessionsByRoot: (...args: unknown[]) => mockFindByRoot(...args),
   findActiveChatScopeSessionsByChat: (...args: unknown[]) => mockFindByChat(...args),
 }));

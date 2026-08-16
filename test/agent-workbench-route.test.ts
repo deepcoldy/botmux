@@ -41,7 +41,9 @@ describe('Agent Workbench route and surface integration', () => {
 
   it('does not reinterpret a Workbench-only platform cookie as legacy owner authority', () => {
     const dashboard = readFileSync(join(process.cwd(), 'src/dashboard.ts'), 'utf8');
-    expect(dashboard).toContain('const presentedToken = workbenchOnlyIdentity ? undefined : authedToken(req, url)');
+    // authedToken now takes the persisted active token explicitly (the module-level
+    // `activeToken` mirror is gone); the guard under test is the ternary itself.
+    expect(dashboard).toContain('const presentedToken = workbenchOnlyIdentity ? undefined : authedToken(req, url, activeToken)');
     expect(dashboard).toContain('decideWorkbenchH5Auth');
     expect(dashboard).toContain("requestIdentity.terminalCapability === 'readonly'");
     expect(dashboard).toContain("requestIdentity.previewCapability === 'readonly'");

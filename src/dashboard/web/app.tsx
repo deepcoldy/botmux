@@ -1,4 +1,6 @@
 // Dashboard SPA entry: React chrome + lazy route host + SSE bootstrap.
+import type React from 'react';
+import { createPortal } from 'react-dom';
 import { createRoot } from 'react-dom/client';
 import { useEffect, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
@@ -35,6 +37,7 @@ import {
   dashboardClientShellRedirect,
   readDashboardClientShell,
 } from './client-shell.js';
+import { dashboardLoginHref } from './auth-login.js';
 
 type OwnerAvatar = { avatarUrl: string; name?: string };
 type TopbarAttentionNotice = { count: number; time: string; bot: string; reason: string };
@@ -84,6 +87,7 @@ const MANAGE_ROUTES = [
   'team',
   'connectors',
   'insights',
+  'feedback',
   'whiteboards',
 ];
 
@@ -127,6 +131,7 @@ const NAV_ITEMS: NavItem[] = [
     ),
   },
   { id: 'insights', href: '#/insights', labelKey: 'nav.insights', manage: true, icon: <><path d="M2 2v12h12M5 11V7M8.5 11V4.5M12 11V8.5" /></> },
+  { id: 'feedback', href: '#/feedback', labelKey: 'nav.feedback', manage: true, icon: <><path d="M2.2 3.2h11.6v8H8l-3.2 2.6v-2.6H2.2z" /><path d="M5 6.2h6M5 8.3h4" /></> },
   {
     id: 'workflows',
     href: '#/workflows',
@@ -159,7 +164,7 @@ let activeHash = location.hash || '#/';
 let ownerAvatar: OwnerAvatar | null = null;
 let updateBehind = false;
 let latestVersion: string | null = null;
-let updateBadgeKind: 'botmux' | 'codex' | null = null;
+let updateBadgeKind: 'botmux' | 'runtime' | null = null;
 let botmuxUpdateStatus: BotmuxUpdateStatus | null = null;
 let routeRoot: HTMLElement | null = null;
 let appRoot: ReturnType<typeof createRoot> | null = null;
@@ -168,6 +173,7 @@ const routeState = createDashboardRouteState();
 const OWNER_AVATAR_KEY = 'botmux.ownerAvatar.v1';
 const BUSY_STATUSES = new Set(['working', 'analyzing', 'active', 'starting']);
 const AUTH_EXPIRED_EVENT = 'botmux:auth-expired';
+let authLoginBaseUrl: string | undefined;
 
 function icon(children: ReactNode): ReactNode {
   return <svg viewBox="0 0 16 16" aria-hidden="true">{children}</svg>;
@@ -268,7 +274,7 @@ function consumeDesktopShellRouteAction(): boolean {
 
 function updateBadgeTitle(): string {
   const version = latestVersion ? `v${latestVersion}` : '';
-  return updateBadgeKind === 'codex'
+  return updateBadgeKind === 'runtime'
     ? t('update.navRuntimeBadgeTitle', { version })
     : t('update.navBadgeTitle', { version });
 }
@@ -285,7 +291,7 @@ function getRouteRoot(): HTMLElement {
   return el;
 }
 
-function ThemeMenuSlot(): JSX.Element {
+function ThemeMenuSlot(): React.JSX.Element {
   useEffect(() => {
     initThemeMenu();
   }, []);
@@ -352,7 +358,7 @@ function dashboardStatusSummary(): TopbarStatusSummary {
   };
 }
 
-function TopbarStatusRow(props: { label: string; value: number; hot?: boolean }): JSX.Element {
+function TopbarStatusRow(props: { label: string; value: number; hot?: boolean }): React.JSX.Element {
   return (
     <div className={`topbar-status-row${props.hot ? ' topbar-status-row-hot' : ''}`}>
       <span>{props.label}</span>
@@ -361,7 +367,7 @@ function TopbarStatusRow(props: { label: string; value: number; hot?: boolean })
   );
 }
 
-function TopbarStatusDonut(props: { summary: TopbarStatusSummary }): JSX.Element {
+function TopbarStatusDonut(props: { summary: TopbarStatusSummary }): React.JSX.Element {
   const { attention, idle, working } = props.summary;
   const total = working + attention + idle;
   const background = total === 0
@@ -386,7 +392,7 @@ function closeThemeMenuFromStatus(): void {
   window.dispatchEvent(new Event(CLOSE_THEME_MENU_EVENT));
 }
 
-function TopbarStatusMenu(props: { summary: TopbarStatusSummary; autoOpen?: boolean }): JSX.Element {
+function TopbarStatusMenu(props: { summary: TopbarStatusSummary; autoOpen?: boolean }): React.JSX.Element {
   const { autoOpen = false, summary } = props;
   const [open, setOpen] = useState(false);
   const [autoDismissed, setAutoDismissed] = useState(false);
@@ -479,8 +485,13 @@ function TopbarStatusMenu(props: { summary: TopbarStatusSummary; autoOpen?: bool
   );
 }
 
-function AuthExpiredOverlay(props: { open: boolean; onClose(): void }): JSX.Element | null {
+function AuthExpiredOverlay(props: {
+  open: boolean;
+  loginUrl?: string;
+  onClose(): void;
+}): React.JSX.Element | null {
   if (!props.open) return null;
+  const canLogin = !!props.loginUrl;
   return (
     <div
       id="auth-expired-overlay"
@@ -489,9 +500,31 @@ function AuthExpiredOverlay(props: { open: boolean; onClose(): void }): JSX.Elem
       onClick={event => { if (event.target === event.currentTarget) props.onClose(); }}
     >
       <div className="auth-expired-dialog" role="dialog" aria-modal="true" aria-labelledby="auth-expired-title">
-        <h2 id="auth-expired-title">访问链接已失效</h2>
-        <p>当前链接/访问已失效，请使用最新授权链接重新进入（运行 botmux dashboard 获取）。</p>
-        <button id="auth-expired-dismiss" type="button" className="primary" onClick={props.onClose}>知道了</button>
+        <h2 id="auth-expired-title">{canLogin ? '登录 Dashboard' : '访问链接已失效'}</h2>
+        <p>{canLogin
+          ? '当前浏览器尚未登录。点击后将通过 Botmux 平台校验机器 owner 权限，并返回当前页面；无权限账号仍会被拒绝。'
+          : '当前链接/访问已失效，请使用最新授权链接重新进入（运行 botmux dashboard 获取）。'}</p>
+        <div className="auth-expired-actions">
+          {props.loginUrl ? (
+            <a
+              id="dashboard-one-click-login"
+              className="auth-login-link primary"
+              href={props.loginUrl}
+              target="_top"
+              rel="noopener"
+            >
+              一键登录
+            </a>
+          ) : null}
+          <button
+            id="auth-expired-dismiss"
+            type="button"
+            className={canLogin ? 'secondary' : 'primary'}
+            onClick={props.onClose}
+          >
+            {canLogin ? '暂不登录' : '知道了'}
+          </button>
+        </div>
       </div>
     </div>
   );
@@ -530,10 +563,11 @@ async function dashboardInstance(): Promise<string> {
 function TopbarVersionControl(props: {
   status: BotmuxUpdateStatus | null;
   onRefresh(): Promise<boolean>;
-}): JSX.Element | null {
+}): React.JSX.Element | null {
   const { status } = props;
   const [open, setOpen] = useState(false);
   const [phase, setPhase] = useState<TopbarUpdatePhase>('idle');
+  const [progress, setProgress] = useState(0);
   const [refreshing, setRefreshing] = useState(false);
   const [refreshFailed, setRefreshFailed] = useState(false);
   const [errorDetail, setErrorDetail] = useState('');
@@ -546,8 +580,11 @@ function TopbarVersionControl(props: {
   const [activeRollback, setActiveRollback] = useState<string | null>(null);
   const actionInFlightRef = useRef(false);
   const reconnectTimerRef = useRef<number | null>(null);
+  const progressTimerRef = useRef<number | null>(null);
   const rootRef = useRef<HTMLDivElement>(null);
   const triggerRef = useRef<HTMLButtonElement>(null);
+  const popoverRef = useRef<HTMLElement>(null);
+  const [popoverPosition, setPopoverPosition] = useState<{ top: number; left: number } | null>(null);
 
   const clearReconnectTimer = () => {
     if (reconnectTimerRef.current === null) return;
@@ -555,9 +592,16 @@ function TopbarVersionControl(props: {
     reconnectTimerRef.current = null;
   };
 
+  const clearProgressTimer = () => {
+    if (progressTimerRef.current === null) return;
+    window.clearInterval(progressTimerRef.current);
+    progressTimerRef.current = null;
+  };
+
   useEffect(() => {
     actionInFlightRef.current = false;
     setPhase('idle');
+    setProgress(0);
     setRefreshing(false);
     setRefreshFailed(false);
     setErrorDetail('');
@@ -570,6 +614,25 @@ function TopbarVersionControl(props: {
     setActiveRollback(null);
   }, [status?.current, status?.latest]);
 
+  // Faux progress bar. npm install gives no reliable percentage, so we creep a
+  // deliberately-capped bar per phase: install climbs toward 50% (the real
+  // install ends there), restart+reconnect climbs toward ~95%; the actual
+  // reconnect reload finishes the job, so we never fake a 100%. Reset to 0 on
+  // idle/error clears it.
+  useEffect(() => {
+    clearProgressTimer();
+    if (phase === 'idle' || phase === 'error') {
+      setProgress(0);
+      return;
+    }
+    const cap = phase === 'updating' ? 50 : 95;
+    if (phase === 'restarting') setProgress(value => Math.max(value, 50));
+    progressTimerRef.current = window.setInterval(() => {
+      setProgress(value => (value >= cap ? cap : value + Math.max(0.5, (cap - value) * 0.08)));
+    }, 400);
+    return () => clearProgressTimer();
+  }, [phase]);
+
   useEffect(() => {
     if (status) setRefreshFailed(status.versionLookupOk === false);
   }, [status]);
@@ -578,12 +641,54 @@ function TopbarVersionControl(props: {
     if (!open) setRollbackOpen(false);
   }, [open]);
 
-  useEffect(() => () => clearReconnectTimer(), []);
+  // A portaled dialog is no longer the next DOM sibling of the trigger. Move
+  // focus into it once after mounting so keyboard users do not skip the whole
+  // dialog when pressing Tab. Do not depend on the actual coordinates: scroll
+  // updates must never steal focus from a user interacting with the popover.
+  useEffect(() => {
+    if (!open || !popoverPosition) return;
+    const frame = window.requestAnimationFrame(() => {
+      const firstFocusable = popoverRef.current?.querySelector<HTMLElement>(
+        'button:not([disabled]), a[href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
+      );
+      firstFocusable?.focus();
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [open, popoverPosition !== null]);
+
+  useEffect(() => {
+    if (!open) {
+      setPopoverPosition(null);
+      return;
+    }
+
+    const updatePopoverPosition = () => {
+      const trigger = triggerRef.current;
+      if (!trigger) return;
+      const rect = trigger.getBoundingClientRect();
+      const maxWidth = Math.min(340, Math.max(0, window.innerWidth - 32));
+      const left = Math.max(16, Math.min(rect.left, window.innerWidth - maxWidth - 16));
+      setPopoverPosition({ top: rect.bottom + 8, left });
+    };
+
+    updatePopoverPosition();
+    window.addEventListener('resize', updatePopoverPosition);
+    // The trigger can move when any ancestor scrolls, not just the window.
+    document.addEventListener('scroll', updatePopoverPosition, true);
+    return () => {
+      window.removeEventListener('resize', updatePopoverPosition);
+      document.removeEventListener('scroll', updatePopoverPosition, true);
+    };
+  }, [open]);
+
+  useEffect(() => () => { clearReconnectTimer(); clearProgressTimer(); }, []);
 
   useEffect(() => {
     if (!open) return;
     const closeOnPointerDown = (event: PointerEvent) => {
-      if (!rootRef.current?.contains(event.target as Node)) setOpen(false);
+      const target = event.target as Node;
+      if (rootRef.current?.contains(target) || popoverRef.current?.contains(target)) return;
+      setOpen(false);
     };
     const closeOnEscape = (event: KeyboardEvent) => {
       if (event.key !== 'Escape') return;
@@ -605,6 +710,11 @@ function TopbarVersionControl(props: {
   const automatic = behind && status.updateSupported && !status.localDevInstall && status.node.ok;
   const rollbackSupported = status.updateSupported && !status.localDevInstall && status.node.ok;
   const busy = phase === 'updating' || phase === 'restarting';
+  // Progress-ring geometry. R=20 → circumference C; the arc fills clockwise
+  // from 12 o'clock for `progress`%.
+  const RING_R = 20;
+  const RING_C = 2 * Math.PI * RING_R;
+  const ringDashoffset = RING_C * (1 - Math.max(2, Math.round(progress)) / 100);
   const command = status.updateCommand ?? 'botmux update';
   const currentVersion = `v${status.current}`;
   const latestVersion = status.latest ? `v${status.latest}` : '';
@@ -781,19 +891,19 @@ function TopbarVersionControl(props: {
         onClick={() => setOpen(value => !value)}
       >
         <span>{currentVersion}</span>
-        {busy
-          ? <span className="dashboard-update-spinner" aria-hidden="true" />
-          : <span
-              className={`dashboard-version-state ${versionSignal.className}`}
-              aria-hidden="true"
-            >{versionSignal.symbol}</span>}
+        <span
+          className={`dashboard-version-state ${versionSignal.className}`}
+          aria-hidden="true"
+        >{versionSignal.symbol}</span>
       </button>
-      {open ? (
+      {open && popoverPosition && typeof document !== 'undefined' ? createPortal((
         <section
+          ref={popoverRef}
           className="dashboard-version-popover"
           role="dialog"
           aria-modal="false"
           aria-labelledby="dashboard-version-title"
+          style={{ top: popoverPosition.top, left: popoverPosition.left }}
         >
           <header className="dashboard-version-popover-head">
             <strong id="dashboard-version-title">{t('update.current')}</strong>
@@ -822,9 +932,35 @@ function TopbarVersionControl(props: {
           <div className="dashboard-version-popover-body">
             <div className="dashboard-version-current">
               <strong>{currentVersion}</strong>
-              <span className={versionSignal.className} aria-hidden="true">
-                {busy ? <span className="dashboard-update-spinner" /> : versionSignal.symbol}
-              </span>
+              {busy ? (
+                <span
+                  className="dashboard-version-ring"
+                  role="progressbar"
+                  aria-valuemin={0}
+                  aria-valuemax={100}
+                  aria-valuenow={Math.round(progress)}
+                  aria-label={message}
+                >
+                  <svg viewBox="0 0 44 44" width="44" height="44" aria-hidden="true">
+                    <defs>
+                      <linearGradient id="dvr-grad" x1="0%" y1="100%" x2="100%" y2="0%">
+                        <stop offset="0%" stopColor="var(--brand-accent-cyan)" />
+                        <stop offset="55%" stopColor="var(--accent)" />
+                        <stop offset="100%" stopColor="var(--brand-accent-pink)" />
+                      </linearGradient>
+                    </defs>
+                    <circle className="dvr-track" cx="22" cy="22" r="20" />
+                    <circle
+                      className="dvr-arc"
+                      cx="22" cy="22" r="20"
+                      style={{ strokeDasharray: RING_C, strokeDashoffset: ringDashoffset }}
+                    />
+                  </svg>
+                  <span className="dvr-pct">{Math.round(progress)}%</span>
+                </span>
+              ) : (
+                <span className={versionSignal.className} aria-hidden="true">{versionSignal.symbol}</span>
+              )}
             </div>
             <p
               className={`dashboard-version-message${phase === 'error' || refreshFailed ? ' is-error' : ''}`}
@@ -958,18 +1094,17 @@ function TopbarVersionControl(props: {
                 disabled={busy}
                 onClick={() => void run()}
               >
-                {busy ? <span className="dashboard-update-spinner" aria-hidden="true" /> : null}
                 {action}
               </button>
             </footer>
           ) : null}
         </section>
-      ) : null}
+      ), document.body) : null}
     </div>
   );
 }
 
-function DashboardShell(): JSX.Element {
+function DashboardShell(): React.JSX.Element {
   const statusSummary = dashboardStatusSummary();
   const [botOnboardingOpen, setBotOnboardingOpen] = useState(false);
   const [authExpiredOpen, setAuthExpiredOpen] = useState(false);
@@ -1142,7 +1277,11 @@ function DashboardShell(): JSX.Element {
           </div>
         </div>
       </div>
-      <AuthExpiredOverlay open={authExpiredOpen} onClose={closeAuthExpired} />
+      <AuthExpiredOverlay
+        open={authExpiredOpen}
+        loginUrl={dashboardLoginHref(authLoginBaseUrl, location.hash)}
+        onClose={closeAuthExpired}
+      />
     </>
   );
 }
@@ -1158,7 +1297,11 @@ function setLocale(locale: DashboardLocale): void {
 
 // ── Auth-expiry overlay ──────────────────────────────────────────────────────
 let expiredShown = false;
-export function showAuthExpiredOverlay(): void {
+export function showAuthExpiredOverlay(loginUrl?: string): void {
+  const hasLoginUrl = !!dashboardLoginHref(loginUrl, location.hash);
+  const loginUrlChanged = hasLoginUrl && authLoginBaseUrl !== loginUrl;
+  if (hasLoginUrl) authLoginBaseUrl = loginUrl;
+  if (expiredShown && loginUrlChanged) renderShell();
   if (expiredShown) return;
   expiredShown = true;
   window.dispatchEvent(new Event(AUTH_EXPIRED_EVENT));
@@ -1188,9 +1331,10 @@ window.fetch = async function patchedFetch(
 ): ReturnType<typeof fetch> {
   const res = await origFetch(...args);
   if (res.status === 401) {
+    const loginUrl = res.headers.get('x-botmux-login-url') ?? undefined;
     const method = (args[1]?.method ?? 'GET').toUpperCase();
     const isRead = method === 'GET' || method === 'HEAD';
-    if (isRead && !publicReadOnly) showAuthExpiredOverlay();
+    if (loginUrl || (isRead && !publicReadOnly)) showAuthExpiredOverlay(loginUrl);
     else showReadOnlyToast();
   }
   return res;
@@ -1260,7 +1404,7 @@ async function checkUpdateBadge(force = false): Promise<boolean> {
       latestVersion = String(j.latest);
     } else if (runtime) {
       updateBehind = true;
-      updateBadgeKind = 'codex';
+      updateBadgeKind = 'runtime';
       latestVersion = String(runtime.latest);
     } else {
       updateBehind = false;

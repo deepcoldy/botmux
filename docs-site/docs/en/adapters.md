@@ -3,7 +3,7 @@
 botmux bridges different CLIs / agents through adapters, selected via `cliId` in `bots.json` — one-click switching. **Local adapters each run as their own process** (under the default tmux backend you can `tmux attach` into the real process; explicit pty/zellij/herdr backends differ); a few are integrated over API / remotely (e.g. Mira, riff) and are not local processes.
 
 **Applies to**: when you want to switch the underlying CLI, or wire up a new tool, and need its `cliId` and whether it takes a `model` param.
-**Doesn't apply**: wrappers / gateways (ccr, aiden x claude, …) don't need a new adapter — see [Wrapper / gateway integration](#wrapper--gateway-integration) below.
+**Doesn't apply**: strict Codex-compatible distributions and wrappers / gateways (ccr, aiden x claude, …) do not need new adapters — see [Codex-compatible distributions](#codex-compatible-distributions) and [Wrapper / gateway integration](#wrapper--gateway-integration) below.
 
 ## Supported CLIs / Agents
 
@@ -17,6 +17,7 @@ The table lists the current built-in adapters (the **authoritative source** for 
 | `gemini` | Gemini | local process | ✅ |
 | `cursor` | Cursor (cursor-agent) | local process | ✅ |
 | `opencode` | OpenCode | local process | ✅ |
+| `opencode2` | OpenCode 2 (beta, `opencode2`) | local process | |
 | `antigravity` | Antigravity (agy) | local process | |
 | `copilot` | GitHub Copilot | local process | ✅ |
 | `grok` | Grok (grok-cli) | local process | ✅ |
@@ -35,8 +36,18 @@ The table lists the current built-in adapters (the **authoritative source** for 
 | `mira` | Mira APP | API / remote | |
 | `mir` | Mir CLI (local mircli + MCP bridge) | local process | |
 | `riff` | riff | cloud agent (API) | |
+| `dsh` | DeepSeek Harness (dsh-jsonrpc-agent) | local process (SDK JSON-RPC) | ✅ |
 
 > The `model` field only takes effect for adapters that support a model parameter; others ignore it. Mir CLI's extra prerequisites (login / miramcp) are in the section below.
+
+## DeepSeek Harness (dsh)
+
+`cliId: "dsh"` drives a local `dsh-jsonrpc-agent` (the packaged runtime of [deepseek-harness](https://github.com/deepseekai/deepseek-harness)) through the bundled runner over the SDK JSON-RPC protocol. Prerequisites:
+
+1. `dsh-jsonrpc-agent` on PATH (or point `cliPathOverride` at it).
+2. Set `DEEPSEEK_API_KEY` in the bot's `env`.
+
+Session JSONL lives under `~/.botmux/dsh/sessions/`. Turns are multi-turn within one runner connection; a daemon restart starts a fresh session (no context resume).
 
 ## Mir CLI and MCP Bridge
 
@@ -71,6 +82,14 @@ or disable it only for BotMux:
 ```bash
 MIRCLI_AUTO_START_MIRAMCP=0 botmux start
 ```
+
+## Codex-compatible distributions
+
+BotMux separates protocol capability from distribution identity: `cliId: "codex"` selects the Codex protocol adapter, while `cliRuntime` selects the independently released executable that actually runs. A compatible fork can therefore reuse model arguments, resume, idle detection, and gated RPC without being checked against the official Codex version stream.
+
+Use `cliRuntime` only for a **strictly compatible fork**: it must accept the arguments BotMux sends to Codex, preserve the same interaction state and rollout / resume semantics, and use a compatible authentication / home layout. If it changes arguments, the TUI state machine, session storage, or protocol, it needs a real adapter instead of a compatibility declaration.
+
+See the [`bots.json` Codex-compatible distributions section](/en/bots-json#codex-compatible-distributions) for the complete config and update-provider behavior. The Dashboard Bot Defaults page can also configure and preflight a runtime. Existing `cliPathOverride` configs remain supported, but do not automatically enable Codex RPC features that require an explicit compatibility declaration.
 
 ## Wrapper / gateway integration
 

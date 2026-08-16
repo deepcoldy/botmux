@@ -22,7 +22,14 @@ export async function updateBotSubstituteMode(
   const chats = Array.isArray(rec.chats)
     ? [...new Set(rec.chats.map(String).map(s => s.trim()).filter(Boolean))]
     : [];
-  const normalized = normalizeSubstituteMode({ ...rec, chats: chats.length ? chats : undefined });
+  const excludedChats = Array.isArray(rec.excludedChats)
+    ? [...new Set(rec.excludedChats.map(String).map(s => s.trim()).filter(Boolean))]
+    : [];
+  const normalized = normalizeSubstituteMode({
+    ...rec,
+    chats: chats.length ? chats : undefined,
+    excludedChats: excludedChats.length ? excludedChats : undefined,
+  });
   if (rec.enabled === true && (!Array.isArray(rec.targets) || rec.targets.length === 0 || !normalized)) {
     return { ok: false, reason: 'targets_required' };
   }

@@ -22,11 +22,14 @@ function relayCapabilityDir(): string {
   const relayDir = mkdtempSync(join(tmpdir(), 'botmux-preview-relay-'));
   tempDirs.push(relayDir);
   mkdirSync(relayDir, { recursive: true });
+  // readManagedOriginAuthorityFile only accepts an owner-private 0600 regular
+  // file — a capability readable by anyone else is not authority. Real writers
+  // create it that way; the fixture must match or the claim is silently dropped.
   writeFileSync(join(relayDir, RELAY_ORIGIN_CAPABILITY_BASENAME), JSON.stringify({
     token: CAPABILITY,
     turnId: 'turn-preview',
     dispatchAttempt: 4,
-  }));
+  }), { mode: 0o600 });
   return relayDir;
 }
 

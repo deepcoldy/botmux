@@ -7,15 +7,23 @@
  * invoked with resume=true so the surviving tmux session is re-attached
  * rather than recreated.
  *
- * The CLI process and tmux session are external resources; we stub
- * forkWorker / killWorker so the test exercises the *routing* logic in
- * isolation. ds.worker is set to null to avoid actually killing anything.
+ * The CLI process and tmux session are external resources; most tests stub
+ * forkWorker / detachWorker so they exercise the *routing* logic in isolation.
+ * Dedicated lifecycle cases below use a fake child process to cover the real
+ * daemon-side detach fence.
  */
 import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { EventEmitter } from 'node:events';
 
 vi.mock('../src/services/session-store.js', () => ({
+  registerSessionBridgeSendMarkerCleanupFence: vi.fn(),
+  cleanupSessionBridgeSendMarkers: vi.fn(),
+  cleanupSessionBridgeSendMarkersNow: vi.fn(),
   updateSession: vi.fn(),
+  updateSessionPid: vi.fn(),
   getSession: vi.fn(),
+  getOwnedSession: vi.fn(),
+  listSessions: vi.fn(() => []),
   closeSession: vi.fn(),
 }));
 
@@ -42,17 +50,60 @@ vi.mock('../src/im/lark/client.js', () => ({
   MessageWithdrawnError: class extends Error {},
 }));
 
-// transferSession accepts forkWorker/killWorker overrides for testability —
+const unsubscribeDocFileMock = vi.fn();
+const removeCommentReactionMock = vi.fn();
+vi.mock('../src/im/lark/doc-comment.js', () => ({
+  replyToDocComment: vi.fn(),
+  chunkCommentText: vi.fn(() => []),
+  unsubscribeDocFile: (...a: any[]) => unsubscribeDocFileMock(...a),
+  removeCommentReaction: (...a: any[]) => removeCommentReactionMock(...a),
+}));
+
+const listDocSubscriptionsMock = vi.fn(() => [] as Array<{ fileToken: string; fileType: string }>);
+const removeDocSubscriptionMock = vi.fn();
+vi.mock('../src/services/doc-subs-store.js', () => ({
+  listDocSubscriptionsForSession: (...a: any[]) => listDocSubscriptionsMock(...a),
+  removeDocSubscription: (...a: any[]) => removeDocSubscriptionMock(...a),
+}));
+
+// transferSession accepts forkWorker/detachWorker overrides for testability —
 // real forkWorker would actually spawn a child process and attach tmux.
 const forkWorkerSpy = vi.fn();
-const killWorkerSpy = vi.fn();
+const detachWorkerSpy = vi.fn();
 
-import { transferSession, setActiveSessionsRegistry, setActiveSessionSafe } from '../src/core/worker-pool.js';
+import {
+  closeSession,
+  detachWorkerForTransfer,
+  destroyUnregisteredPersistentBacking,
+  forkAdoptWorker,
+  forkWorker,
+  initWorkerPool,
+  isSessionTransferring,
+  requestSessionRestart,
+  suspendWorker,
+  transferSession,
+  __testOnly_setupWorkerHandlers,
+  setActiveSessionsRegistry,
+  setActiveSessionIfActive,
+  setActiveSessionSafe,
+  rollbackRejectedSessionAndGetWinner,
+  sendWorkerInput,
+  sendWorkerSessionInput,
+} from '../src/core/worker-pool.js';
+import {
+  acquireDeviceIsolationFreeze,
+  releaseDeviceIsolationFreeze,
+  resetDeviceIsolationActivationForTest,
+} from '../src/core/device-isolation-activation.js';
 import * as sessionStore from '../src/services/session-store.js';
 import { dashboardEventBus } from '../src/core/dashboard-events.js';
 import { sessionKey } from '../src/core/types.js';
 import type { DaemonSession } from '../src/core/types.js';
 import type { Session } from '../src/types.js';
+import {
+  __testOnly_resetBotTurnMutationGates,
+  withBotTurnAdmission,
+} from '../src/core/bot-turn-mutation-gate.js';
 
 function makeDs(overrides: Partial<DaemonSession> = {}): DaemonSession {
   const session: Session = {
@@ -94,6 +145,13 @@ function makeDs(overrides: Partial<DaemonSession> = {}): DaemonSession {
   } as DaemonSession;
 }
 
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((res, rej) => { resolve = res; reject = rej; });
+  return { promise, resolve, reject };
+}
+
 describe('transferSession', () => {
   let registry: Map<string, DaemonSession>;
 
@@ -107,11 +165,14 @@ describe('transferSession', () => {
     targetScope: 'thread' | 'chat' = 'chat',
   ) => transferSession(sessionId, targetChatId, targetRootMessageId, targetChatType, targetScope, {
     forkWorkerImpl: forkWorkerSpy as any,
-    killWorkerImpl: killWorkerSpy as any,
+    detachWorkerImpl: detachWorkerSpy as any,
   });
 
   beforeEach(() => {
     vi.clearAllMocks();
+    __testOnly_resetBotTurnMutationGates();
+    vi.mocked(sessionStore.listSessions).mockReturnValue([]);
+    resetDeviceIsolationActivationForTest();
     registry = new Map();
     setActiveSessionsRegistry(registry);
   });
@@ -175,6 +236,77 @@ describe('transferSession', () => {
     expect(forkWorkerSpy).not.toHaveBeenCalled();
     // Adopt session must remain in source chat untouched.
     expect(adoptDs.chatId).toBe('oc_source');
+  });
+
+  it('refuses transfer while the durable Codex App dispatch ledger is non-empty', async () => {
+    const ds = makeDs();
+    ds.session.codexAppDispatchLedger = [
+      { dispatchId: 'd-1', turnId: 't-1', state: 'prepared', content: 'owned' },
+    ];
+    registry.set(sessionKey('om_source_root', 'cli_app_test'), ds);
+
+    const result = await callTransfer(ds.session.sessionId, 'oc_target', 'om_target_root');
+
+    expect(result).toEqual({ ok: false, error: 'codex_app_dispatch_pending' });
+    expect(forkWorkerSpy).not.toHaveBeenCalled();
+    expect(detachWorkerSpy).not.toHaveBeenCalled();
+    expect(sessionStore.updateSession).not.toHaveBeenCalled();
+    expect(ds.chatId).toBe('oc_source');
+    expect(ds.session.rootMessageId).toBe('om_source_root');
+    expect(registry.get(sessionKey('om_source_root', 'cli_app_test'))).toBe(ds);
+  });
+
+  it('drains a pre-accept turn and rechecks durable ownership before transfer', async () => {
+    const ds = makeDs();
+    registry.set(sessionKey('om_source_root', 'cli_app_test'), ds);
+    let release!: () => void;
+    let markStarted!: () => void;
+    const paused = new Promise<void>(resolve => { release = resolve; });
+    const started = new Promise<void>(resolve => { markStarted = resolve; });
+    const inbound = withBotTurnAdmission(ds.larkAppId, async () => {
+      markStarted();
+      await paused;
+      ds.session.codexAppDispatchLedger = [{
+        dispatchId: 'd-raced',
+        turnId: 't-raced',
+        state: 'accepted',
+        content: 'accepted before transfer',
+      }];
+    });
+    await started;
+
+    const transfer = callTransfer(ds.session.sessionId, 'oc_target', 'om_target_root');
+    await Promise.resolve();
+    expect(detachWorkerSpy).not.toHaveBeenCalled();
+    release();
+    await inbound;
+
+    expect(await transfer).toEqual({ ok: false, error: 'codex_app_dispatch_pending' });
+    expect(detachWorkerSpy).not.toHaveBeenCalled();
+    expect(forkWorkerSpy).not.toHaveBeenCalled();
+    expect(registry.get(sessionKey('om_source_root', ds.larkAppId))).toBe(ds);
+  });
+
+  it('does not kill or overwrite a source successor discovered after cleanup awaits', async () => {
+    const ds = makeDs();
+    const sourceKey = sessionKey('om_source_root', 'cli_app_test');
+    registry.set(sourceKey, ds);
+    const successor = makeDs({
+      session: { ...ds.session, sessionId: 'source-successor' },
+    });
+    vi.mocked(sessionStore.listSessions).mockImplementationOnce(() => {
+      ds.session.status = 'closed';
+      registry.set(sourceKey, successor);
+      return [];
+    });
+
+    const result = await callTransfer(ds.session.sessionId, 'oc_target', 'om_target_root');
+
+    expect(result).toEqual({ ok: false, error: 'session_not_active' });
+    expect(registry.get(sourceKey)).toBe(successor);
+    expect(detachWorkerSpy).not.toHaveBeenCalled();
+    expect(forkWorkerSpy).not.toHaveBeenCalled();
+    expect(ds.chatId).toBe('oc_source');
   });
 
   it('returns same_anchor when a chat-scope source targets its own chat (chat→chat)', async () => {
@@ -345,6 +477,708 @@ describe('transferSession', () => {
     expect(resume).toBe(true);
   });
 
+  it('waits for detach ACK+exit and buffers new input for the replacement worker', async () => {
+    const lifecycle: string[] = [];
+    let detachMessage: { type: string; requestId?: string } | undefined;
+    const send = vi.fn((
+      message: { type: string; requestId?: string },
+      callback?: (error: Error | null) => void,
+    ) => {
+      if (message.type === 'detach_for_transfer') detachMessage = message;
+      lifecycle.push(`old:${message.type}`);
+      callback?.(null);
+    });
+    const oldWorker = Object.assign(new EventEmitter(), {
+      killed: false,
+      connected: true,
+      exitCode: null,
+      signalCode: null,
+      send,
+      kill: vi.fn(),
+    }) as any;
+    const ds = makeDs({
+      worker: oldWorker,
+      lastScreenStatus: 'idle',
+      session: {
+        ...makeDs().session,
+        backendType: 'zmx',
+        persistentBackendTarget: {
+          backendType: 'zmx',
+          sessionName: 'bmx-sess-abc',
+        },
+      },
+    });
+    registry.set(sessionKey('om_source_root', 'cli_app_test'), ds);
+
+    const replacementSend = vi.fn((message: { type: string }) => {
+      lifecycle.push(`replacement:${message.type}`);
+    });
+    const replacementWorker = Object.assign(new EventEmitter(), {
+      killed: false,
+      connected: true,
+      exitCode: null,
+      signalCode: null,
+      send: replacementSend,
+      kill: vi.fn(),
+    }) as any;
+    const replacementFork = vi.fn((...args: Parameters<typeof forkWorker>) => {
+      lifecycle.push('replacement:fork');
+      ds.worker = replacementWorker;
+      ds.workerGeneration = 2;
+      ds.session.workerGeneration = 2;
+      return forkWorkerSpy(...args);
+    });
+    const moving = transferSession(
+      ds.session.sessionId,
+      'oc_target',
+      'om_M1_target',
+      'group',
+      'chat',
+      { forkWorkerImpl: replacementFork as typeof forkWorker },
+    );
+
+    await vi.waitFor(() => expect(send).toHaveBeenCalledTimes(1));
+    expect(detachMessage).toMatchObject({
+      type: 'detach_for_transfer',
+      requestId: expect.any(String),
+    });
+    expect(send).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'close' }));
+    // The replacement must not install its observer while the old worker can
+    // still run a late name-scoped tmux pipe-pane detach.
+    expect(replacementFork).not.toHaveBeenCalled();
+
+    expect(sendWorkerInput(
+      ds,
+      'arrived during transfer',
+      'turn-late',
+      { dispatchAttempt: 7 },
+    )).toBe(true);
+    expect(sendWorkerInput(
+      ds,
+      'ordinary message during transfer',
+      'om_transfer_late',
+    )).toBe(true);
+    const rawDuringTransfer = {
+      type: 'raw_input' as const,
+      content: '/model opus',
+      turnId: 'turn-raw',
+      followUpContent: 'follow-up payload',
+      followUpTurnId: 'turn-follow-up',
+      followUpCodexAppInput: {
+        text: 'clean follow-up',
+        additionalContext: {
+          quoted: { kind: 'untrusted' as const, value: 'quoted context' },
+        },
+      },
+    };
+    expect(sendWorkerSessionInput(ds, rawDuringTransfer)).toBe(true);
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(replacementSend).not.toHaveBeenCalled();
+
+    lifecycle.push('old:transfer_detached');
+    oldWorker.emit('message', {
+      type: 'transfer_detached',
+      requestId: detachMessage!.requestId,
+    });
+    await Promise.resolve();
+    expect(replacementFork).not.toHaveBeenCalled();
+
+    lifecycle.push('old:exit');
+    oldWorker.exitCode = 0;
+    oldWorker.emit('exit', 0, null);
+    const result = await moving;
+
+    expect(result).toEqual({ ok: true });
+    expect(lifecycle).toEqual([
+      'old:detach_for_transfer',
+      'old:transfer_detached',
+      'old:exit',
+      'replacement:fork',
+      'replacement:message',
+      'replacement:message',
+      'replacement:raw_input',
+    ]);
+    expect(replacementFork).toHaveBeenCalledWith(ds, '', true);
+    expect(replacementSend).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'message',
+      content: 'arrived during transfer',
+      turnId: 'turn-late',
+      dispatchAttempt: 7,
+    }));
+    expect(replacementSend).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({
+        type: 'message',
+        content: 'ordinary message during transfer',
+        turnId: 'om_transfer_late',
+      }),
+      expect.any(Function),
+    );
+    expect(replacementSend).toHaveBeenNthCalledWith(3, rawDuringTransfer);
+  });
+
+  it('fails safe on detach timeout using hard retirement without ordinary close cleanup', async () => {
+    const send = vi.fn((
+      _message: { type: string; requestId?: string },
+      callback?: (error: Error | null) => void,
+    ) => callback?.(null));
+    let oldWorker: any;
+    const kill = vi.fn((signal: NodeJS.Signals) => {
+      oldWorker.signalCode = signal;
+      oldWorker.emit('exit', null, signal);
+      return true;
+    });
+    oldWorker = Object.assign(new EventEmitter(), {
+      killed: false,
+      connected: true,
+      exitCode: null,
+      signalCode: null,
+      send,
+      kill,
+    }) as any;
+    const ds = makeDs({ worker: oldWorker, lastScreenStatus: 'idle' });
+    registry.set(sessionKey('om_source_root', 'cli_app_test'), ds);
+
+    const completed = await detachWorkerForTransfer(ds, { timeoutMs: 1 });
+
+    expect(completed).toBe(false);
+    expect(send).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: 'detach_for_transfer',
+        requestId: expect.any(String),
+      }),
+      expect.any(Function),
+    );
+    expect(oldWorker.kill).toHaveBeenCalledWith('SIGKILL');
+    expect(send).not.toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'close' }),
+      expect.anything(),
+    );
+    expect(ds.worker).toBeNull();
+    expect(ds.chatId).toBe('oc_source');
+    expect(ds.session.rootMessageId).toBe('om_source_root');
+  });
+
+  it('force-kills a worker that ACKs the detach but never self-exits (node-pty exit wedge), completing the transfer', async () => {
+    // The production bug: the worker runs killCli + sends transfer_detached in
+    // ~9ms, then process.exit(0) wedges in node-pty's native teardown (an open
+    // web-terminal client PTY blocks the reader-thread join; the JS loop is
+    // already stopped so the worker cannot self-kill). The daemon must not sit
+    // out the whole fence waiting for an exit that never comes on its own — once
+    // the ACK proves the observer detached, it force-kills the disposable
+    // process. Here the worker ACKs but ONLY exits when SIGKILLed by the daemon.
+    let oldWorker: any;
+    const send = vi.fn((
+      message: { type: string; requestId?: string },
+      callback?: (error: Error | null) => void,
+    ) => {
+      callback?.(null);
+      // ACK the detach on the next tick, but deliberately do NOT emit 'exit' —
+      // simulate the wedged process.exit(0). Only the daemon's SIGKILL ends it.
+      if (message.type === 'detach_for_transfer') {
+        queueMicrotask(() => oldWorker.emit('message', {
+          type: 'transfer_detached',
+          requestId: message.requestId,
+        }));
+      }
+    });
+    const kill = vi.fn((signal: NodeJS.Signals) => {
+      oldWorker.signalCode = signal;
+      oldWorker.emit('exit', null, signal);
+      return true;
+    });
+    oldWorker = Object.assign(new EventEmitter(), {
+      killed: false,
+      connected: true,
+      exitCode: null,
+      signalCode: null,
+      send,
+      kill,
+    }) as any;
+    const ds = makeDs({ worker: oldWorker, lastScreenStatus: 'idle' });
+    registry.set(sessionKey('om_source_root', 'cli_app_test'), ds);
+
+    // No manual exit emission — the daemon's post-ACK kill is the ONLY thing
+    // that can end this worker. If the fix regressed, this would hang until the
+    // full fence and return false.
+    const completed = await detachWorkerForTransfer(ds);
+
+    expect(completed).toBe(true);
+    expect(kill).toHaveBeenCalledWith('SIGKILL');
+    expect(ds.worker).toBeNull();
+    // Source routing untouched by the detach itself (transferSession rewrites it).
+    expect(ds.chatId).toBe('oc_source');
+    expect(ds.session.rootMessageId).toBe('om_source_root');
+  });
+
+  it('keeps detach timeout bounded when the child IPC send callback never fires', async () => {
+    const send = vi.fn(() => undefined);
+    let oldWorker: any;
+    const kill = vi.fn((signal: NodeJS.Signals) => {
+      oldWorker.signalCode = signal;
+      oldWorker.emit('exit', null, signal);
+      return true;
+    });
+    oldWorker = Object.assign(new EventEmitter(), {
+      killed: false,
+      connected: true,
+      exitCode: null,
+      signalCode: null,
+      send,
+      kill,
+    }) as any;
+    const ds = makeDs({ worker: oldWorker, lastScreenStatus: 'idle' });
+    registry.set(sessionKey('om_source_root', 'cli_app_test'), ds);
+
+    const outcome = await Promise.race([
+      detachWorkerForTransfer(ds, { timeoutMs: 1 }).then(result => ({
+        kind: 'returned' as const,
+        result,
+      })),
+      new Promise<{ kind: 'hung' }>((resolve) => {
+        setTimeout(() => resolve({ kind: 'hung' }), 50);
+      }),
+    ]);
+
+    expect(outcome).toEqual({ kind: 'returned', result: false });
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(oldWorker.kill).toHaveBeenCalledWith('SIGKILL');
+    expect(ds.worker).toBeNull();
+    expect(ds.chatId).toBe('oc_source');
+    expect(ds.session.rootMessageId).toBe('om_source_root');
+  });
+
+  it('cold-reattaches the unchanged source after a real detach timeout with no buffered input', async () => {
+    const send = vi.fn((
+      _message: { type: string; requestId?: string },
+      callback?: (error: Error | null) => void,
+    ) => callback?.(null));
+    let oldWorker: any;
+    const kill = vi.fn((signal: NodeJS.Signals) => {
+      oldWorker.signalCode = signal;
+      oldWorker.emit('exit', null, signal);
+      return true;
+    });
+    oldWorker = Object.assign(new EventEmitter(), {
+      killed: false,
+      connected: true,
+      exitCode: null,
+      signalCode: null,
+      send,
+      kill,
+    });
+    const ds = makeDs({ worker: oldWorker, lastScreenStatus: 'idle' });
+    registry.set(sessionKey('om_source_root', 'cli_app_test'), ds);
+    const sourceFork = vi.fn();
+
+    const result = await transferSession(
+      ds.session.sessionId,
+      'oc_target',
+      'om_M1_target',
+      'group',
+      'chat',
+      {
+        forkWorkerImpl: sourceFork as any,
+        detachWorkerImpl: current => detachWorkerForTransfer(current, { timeoutMs: 1 }),
+      },
+    );
+
+    expect(result).toEqual({ ok: false, error: 'worker_detach_timeout' });
+    expect(kill).toHaveBeenCalledWith('SIGKILL');
+    expect(sourceFork).toHaveBeenCalledWith(ds, '', true);
+    expect(ds.chatId).toBe('oc_source');
+    expect(registry.get(sessionKey('om_source_root', 'cli_app_test'))).toBe(ds);
+  });
+
+  it('keeps source routing and cold-reattaches when the transfer detach fence fails', async () => {
+    const ds = makeDs();
+    registry.set(sessionKey('om_source_root', 'cli_app_test'), ds);
+    updateMessageMock.mockClear();
+
+    const result = await transferSession(
+      ds.session.sessionId,
+      'oc_target',
+      'om_M1_target',
+      'group',
+      'chat',
+      {
+        forkWorkerImpl: forkWorkerSpy as any,
+        detachWorkerImpl: vi.fn(() => false),
+      },
+    );
+
+    expect(result).toEqual({ ok: false, error: 'worker_detach_timeout' });
+    expect(forkWorkerSpy).toHaveBeenCalledWith(ds, '', true);
+    expect(ds.chatId).toBe('oc_source');
+    expect(ds.session.rootMessageId).toBe('om_source_root');
+    expect(registry.get(sessionKey('om_source_root', 'cli_app_test'))).toBe(ds);
+    expect(registry.has(sessionKey('oc_target', 'cli_app_test'))).toBe(false);
+    expect(updateMessageMock).not.toHaveBeenCalled();
+  });
+
+  it('restarts on the source route and replays buffered input after detach timeout', async () => {
+    let oldWorker: any;
+    const send = vi.fn((
+      _message: { type: string; requestId?: string },
+      callback?: (error: Error | null) => void,
+    ) => callback?.(null));
+    const kill = vi.fn((signal: NodeJS.Signals) => {
+      oldWorker.signalCode = signal;
+      oldWorker.emit('exit', null, signal);
+      return true;
+    });
+    oldWorker = Object.assign(new EventEmitter(), {
+      killed: false,
+      connected: true,
+      exitCode: null,
+      signalCode: null,
+      send,
+      kill,
+    });
+    const ds = makeDs({ worker: oldWorker, lastScreenStatus: 'idle' });
+    registry.set(sessionKey('om_source_root', 'cli_app_test'), ds);
+
+    const replacementSend = vi.fn();
+    const replacementWorker = Object.assign(new EventEmitter(), {
+      killed: false,
+      connected: true,
+      exitCode: null,
+      signalCode: null,
+      send: replacementSend,
+      kill: vi.fn(),
+    }) as any;
+    const sourceFork = vi.fn(() => {
+      ds.worker = replacementWorker;
+    });
+    const moving = transferSession(
+      ds.session.sessionId,
+      'oc_target',
+      'om_M1_target',
+      'group',
+      'chat',
+      {
+        forkWorkerImpl: sourceFork as any,
+        detachWorkerImpl: current => detachWorkerForTransfer(current, { timeoutMs: 1 }),
+      },
+    );
+
+    await vi.waitFor(() => expect(send).toHaveBeenCalledTimes(1));
+    const rawDuringTimeout = {
+      type: 'raw_input' as const,
+      content: '/effort high',
+      turnId: 'turn-timeout-raw',
+      followUpContent: 'source follow-up',
+      followUpTurnId: 'turn-timeout-follow-up',
+      followUpCodexAppInput: {
+        text: 'source clean follow-up',
+        additionalContext: {
+          attachment: { kind: 'untrusted' as const, value: '/tmp/a.png' },
+        },
+      },
+    };
+    expect(sendWorkerSessionInput(ds, rawDuringTimeout)).toBe(true);
+    expect(sendWorkerInput(ds, 'keep this turn', 'turn-timeout')).toBe(true);
+    const result = await moving;
+
+    expect(result).toEqual({ ok: false, error: 'worker_detach_timeout' });
+    expect(kill).toHaveBeenCalledWith('SIGKILL');
+    expect(ds.chatId).toBe('oc_source');
+    expect(ds.session.rootMessageId).toBe('om_source_root');
+    expect(sourceFork).toHaveBeenCalledWith(ds, '', true);
+    expect(replacementSend).toHaveBeenNthCalledWith(1, rawDuringTimeout);
+    expect(replacementSend).toHaveBeenNthCalledWith(2, expect.objectContaining({
+      type: 'message',
+      content: 'keep this turn',
+      turnId: 'turn-timeout',
+    }));
+    expect(updateMessageMock).not.toHaveBeenCalled();
+  });
+
+  it('refuses transfer while a live worker generation has not reached ready', async () => {
+    const worker = Object.assign(new EventEmitter(), {
+      killed: false,
+      connected: true,
+      exitCode: null,
+      signalCode: null,
+      send: vi.fn(),
+      kill: vi.fn(),
+    }) as any;
+    const ds = makeDs({
+      worker,
+      workerReady: false,
+      lastScreenStatus: 'idle',
+    });
+    registry.set(sessionKey('om_source_root', 'cli_app_test'), ds);
+
+    const result = await callTransfer(ds.session.sessionId, 'oc_target', 'om_M1_target');
+
+    expect(result).toEqual({ ok: false, error: 'worker_busy' });
+    expect(detachWorkerSpy).not.toHaveBeenCalled();
+    expect(forkWorkerSpy).not.toHaveBeenCalled();
+  });
+
+  it('refuses transfer until a previously suspended worker actually exits', async () => {
+    const worker = Object.assign(new EventEmitter(), {
+      killed: false,
+      connected: true,
+      exitCode: null,
+      signalCode: null,
+      send: vi.fn(),
+      kill: vi.fn(),
+    }) as any;
+    const ds = makeDs({
+      worker,
+      workerReady: true,
+      lastScreenStatus: 'idle',
+      initConfig: { backendType: 'tmux' } as any,
+    });
+    registry.set(sessionKey('om_source_root', 'cli_app_test'), ds);
+
+    expect(suspendWorker(ds, 'test')).toBe(true);
+    expect(ds.worker).toBeNull();
+    const result = await callTransfer(ds.session.sessionId, 'oc_target', 'om_M1_target');
+
+    expect(result).toEqual({ ok: false, error: 'worker_busy' });
+    expect(detachWorkerSpy).not.toHaveBeenCalled();
+
+    worker.exitCode = 0;
+    worker.emit('exit', 0, null);
+  });
+
+  it('blocks restart and suspend requests while the transfer gate is active', async () => {
+    const worker = Object.assign(new EventEmitter(), {
+      killed: false,
+      connected: true,
+      exitCode: null,
+      signalCode: null,
+      send: vi.fn(),
+      kill: vi.fn(),
+    }) as any;
+    const ds = makeDs({
+      worker,
+      workerReady: true,
+      lastScreenStatus: 'idle',
+      initConfig: { backendType: 'tmux' } as any,
+    });
+    registry.set(sessionKey('om_source_root', 'cli_app_test'), ds);
+
+    let releaseDetach!: (completed: boolean) => void;
+    const detach = vi.fn(() => new Promise<boolean>((resolve) => {
+      releaseDetach = resolve;
+    }));
+    const moving = transferSession(
+      ds.session.sessionId,
+      'oc_target',
+      'om_M1_target',
+      'group',
+      'chat',
+      {
+        detachWorkerImpl: detach,
+        forkWorkerImpl: forkWorkerSpy as any,
+      },
+    );
+    await vi.waitFor(() => expect(detach).toHaveBeenCalledOnce());
+    expect(isSessionTransferring(ds)).toBe(true);
+
+    expect(requestSessionRestart(ds, {
+      source: 'slash',
+      notify: vi.fn(),
+    })).toBeUndefined();
+    expect(suspendWorker(ds, 'test')).toBe(false);
+    expect(worker.send).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'restart' }));
+    expect(worker.send).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'suspend' }));
+
+    releaseDetach(true);
+    await moving;
+  });
+
+  it('defers source reattach behind a device-isolation freeze that arrives during detach', async () => {
+    const ds = makeDs({ worker: null, lastScreenStatus: 'idle' });
+    registry.set(sessionKey('om_source_root', 'cli_app_test'), ds);
+    updateMessageMock.mockClear();
+
+    let releaseDetach!: (completed: boolean) => void;
+    const detach = vi.fn(() => new Promise<boolean>((resolve) => {
+      releaseDetach = resolve;
+    }));
+    const sourceFork = vi.fn();
+    const moving = transferSession(
+      ds.session.sessionId,
+      'oc_target',
+      'om_M1_target',
+      'group',
+      'chat',
+      {
+        detachWorkerImpl: detach,
+        forkWorkerImpl: sourceFork as any,
+      },
+    );
+    await vi.waitFor(() => expect(detach).toHaveBeenCalledOnce());
+
+    const acquired = acquireDeviceIsolationFreeze({
+      nonce: 'transfer-freeze',
+      inventoryGeneration: 'generation-1',
+      leaseIdFactory: () => 'lease-transfer',
+    });
+    expect(acquired.ok).toBe(true);
+    releaseDetach(true);
+
+    const result = await moving;
+    expect(result).toEqual({ ok: false, error: 'worker_busy' });
+    expect(sourceFork).not.toHaveBeenCalled();
+    expect(updateMessageMock).not.toHaveBeenCalled();
+    expect(ds.chatId).toBe('oc_source');
+
+    if (!acquired.ok) throw new Error('freeze acquisition unexpectedly failed');
+    expect(releaseDeviceIsolationFreeze({
+      nonce: acquired.lease.nonce,
+      leaseId: acquired.lease.leaseId,
+    })).toBe(true);
+    await vi.waitFor(() => expect(sourceFork).toHaveBeenCalledWith(ds, '', true));
+  });
+
+  it('lets explicit close win while detach is in flight and never revives the source', async () => {
+    const ds = makeDs({
+      worker: null,
+      lastScreenStatus: 'idle',
+      session: {
+        ...makeDs().session,
+        backendType: 'pty',
+      },
+    });
+    const sourceKey = sessionKey('om_source_root', 'cli_app_test');
+    registry.set(sourceKey, ds);
+
+    let releaseDetach!: (completed: boolean) => void;
+    const detach = vi.fn(() => new Promise<boolean>((resolve) => {
+      releaseDetach = resolve;
+    }));
+    const replacementFork = vi.fn();
+    const moving = transferSession(
+      ds.session.sessionId,
+      'oc_target',
+      'om_M1_target',
+      'group',
+      'chat',
+      {
+        detachWorkerImpl: detach,
+        forkWorkerImpl: replacementFork as any,
+      },
+    );
+    await vi.waitFor(() => expect(detach).toHaveBeenCalledOnce());
+
+    await closeSession(ds.session.sessionId);
+    releaseDetach(true);
+    const result = await moving;
+
+    expect(result).toEqual({ ok: false, error: 'session_not_active' });
+    expect(ds.session.status).toBe('closed');
+    expect(registry.has(sourceKey)).toBe(false);
+    expect(replacementFork).not.toHaveBeenCalled();
+    expect(updateMessageMock).not.toHaveBeenCalled();
+  });
+
+  it('keeps a committed transfer successful when replacement fork and replay throw', async () => {
+    const ds = makeDs({ worker: null, lastScreenStatus: 'idle' });
+    registry.set(sessionKey('om_source_root', 'cli_app_test'), ds);
+
+    let releaseDetach!: (completed: boolean) => void;
+    const detach = vi.fn(() => new Promise<boolean>((resolve) => {
+      releaseDetach = resolve;
+    }));
+    const throwingFork = vi.fn(() => {
+      throw new Error('fork exploded');
+    });
+    const moving = transferSession(
+      ds.session.sessionId,
+      'oc_target',
+      'om_M1_target',
+      'group',
+      'chat',
+      {
+        detachWorkerImpl: detach,
+        forkWorkerImpl: throwingFork as any,
+      },
+    );
+    await vi.waitFor(() => expect(detach).toHaveBeenCalledOnce());
+    expect(sendWorkerInput(ds, 'preserve me', 'turn-preserve')).toBe(true);
+    releaseDetach(true);
+
+    await expect(moving).resolves.toEqual({ ok: true });
+    expect(ds.chatId).toBe('oc_target');
+    expect(throwingFork).toHaveBeenCalled();
+    expect(isSessionTransferring(ds)).toBe(true);
+  });
+
+  it('preserves pending raw input through an empty refork requested during transfer', async () => {
+    initWorkerPool({
+      sessionReply: vi.fn(async () => 'om_reply'),
+      getSessionWorkingDir: () => '/tmp/project',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const ds = makeDs({
+      worker: null,
+      lastScreenStatus: 'idle',
+      pendingRawInput: '/goal ship it',
+      pendingRawTurnId: 'turn-goal',
+      streamCardId: undefined,
+      session: {
+        ...makeDs().session,
+        streamCardId: undefined,
+      },
+    });
+    registry.set(sessionKey('om_source_root', 'cli_app_test'), ds);
+
+    let releaseDetach!: (completed: boolean) => void;
+    const detach = vi.fn(() => new Promise<boolean>((resolve) => {
+      releaseDetach = resolve;
+    }));
+    const replacement = Object.assign(new EventEmitter(), {
+      killed: false,
+      connected: true,
+      exitCode: null,
+      signalCode: null,
+      send: vi.fn(),
+      kill: vi.fn(),
+      stdout: new EventEmitter(),
+      stderr: new EventEmitter(),
+    }) as any;
+    const replacementFork = vi.fn(() => {
+      ds.worker = replacement;
+    });
+    const moving = transferSession(
+      ds.session.sessionId,
+      'oc_target',
+      'om_M1_target',
+      'group',
+      'chat',
+      {
+        detachWorkerImpl: detach,
+        forkWorkerImpl: replacementFork as any,
+      },
+    );
+    await vi.waitFor(() => expect(detach).toHaveBeenCalledOnce());
+
+    forkWorker(ds, '', true);
+    expect(replacementFork).not.toHaveBeenCalled();
+    releaseDetach(true);
+    await expect(moving).resolves.toEqual({ ok: true });
+    expect(replacementFork).toHaveBeenCalledTimes(1);
+
+    __testOnly_setupWorkerHandlers(ds, replacement);
+    replacement.emit('message', { type: 'prompt_ready' });
+    await Promise.resolve();
+
+    expect(replacement.send).toHaveBeenCalledWith({
+      type: 'raw_input',
+      content: '/goal ship it',
+      turnId: 'turn-goal',
+    });
+    expect(ds.pendingRawInput).toBeUndefined();
+    expect(ds.pendingRawTurnId).toBeUndefined();
+  });
+
   it('returns worker_busy immediately when worker is mid-turn (no idle-wait loop)', async () => {
     // Source worker is alive and not in idle/limited → refuse on first check.
     // This is the design contract change: previously transferSession waited
@@ -407,6 +1241,77 @@ describe('transferSession', () => {
     expect(registry.get(sessionKey('oc_target', 'cli_app_test'))).toBe(existingDs);
   });
 
+  it('refuses a disk-only legacy target owner with an unsettled Codex App dispatch', async () => {
+    const movingDs = makeDs();
+    registry.set(sessionKey('om_source_root', 'cli_app_test'), movingDs);
+    const legacyConflict: Session = {
+      ...movingDs.session,
+      sessionId: 'legacy-disk-only-owner',
+      chatId: 'oc_target',
+      rootMessageId: 'om_legacy_target',
+      scope: 'chat',
+      larkAppId: undefined,
+      codexAppDispatchLedger: [{
+        dispatchId: 'legacy-dispatch',
+        turnId: 'legacy-turn',
+        state: 'prepared',
+        content: 'owned output',
+        deliverySink: 'lark',
+      }],
+    };
+    vi.mocked(sessionStore.listSessions).mockReturnValue([legacyConflict]);
+
+    const result = await callTransfer(
+      movingDs.session.sessionId,
+      'oc_target',
+      'om_M1_target',
+    );
+
+    expect(result).toEqual({ ok: false, error: 'target_chat_has_session' });
+    expect(sessionStore.closeSession).not.toHaveBeenCalled();
+    expect(detachWorkerSpy).not.toHaveBeenCalled();
+    expect(forkWorkerSpy).not.toHaveBeenCalled();
+    expect(movingDs.chatId).toBe('oc_source');
+    expect(registry.get(sessionKey('om_source_root', 'cli_app_test'))).toBe(movingDs);
+  });
+
+  it('retires a disk-only legacy scratch before claiming the target anchor', async () => {
+    const movingDs = makeDs();
+    registry.set(sessionKey('om_source_root', 'cli_app_test'), movingDs);
+    const legacyScratch: Session = {
+      ...movingDs.session,
+      sessionId: 'legacy-disk-only-scratch',
+      chatId: 'oc_target',
+      rootMessageId: 'om_legacy_scratch',
+      scope: 'chat',
+      larkAppId: undefined,
+      cliId: undefined,
+      lastCliInput: undefined,
+      queued: false,
+      codexAppDispatchLedger: [],
+    };
+    vi.mocked(sessionStore.listSessions).mockReturnValue([legacyScratch]);
+    // closeSession() consults getOwnedSession (owner-scoped) to decide whether
+    // to persist the close — getSession's cross-file read-only fallback must
+    // never authorize a close, so the merged worker-pool uses getOwnedSession.
+    vi.mocked(sessionStore.getOwnedSession).mockImplementation((sid: string) =>
+      sid === legacyScratch.sessionId ? legacyScratch : undefined,
+    );
+
+    const result = await callTransfer(
+      movingDs.session.sessionId,
+      'oc_target',
+      'om_M1_target',
+    );
+
+    expect(result).toEqual({ ok: true });
+    // Disk-only scratch has no live worker, so closeSession cleans up bridge
+    // markers on the persisted close.
+    expect(sessionStore.closeSession).toHaveBeenCalledWith(legacyScratch.sessionId, { cleanupBridgeMarkers: true });
+    expect(registry.get(sessionKey('oc_target', 'cli_app_test'))).toBe(movingDs);
+    expect(forkWorkerSpy).toHaveBeenCalledTimes(1);
+  });
+
   it('closes the daemon-command scratch session occupying the target chat slot', async () => {
     // Regression: a /relay command in the target chat creates a placeholder
     // session record with `worker: null`. Previously the pre-flight scan
@@ -427,26 +1332,62 @@ describe('transferSession', () => {
         rootMessageId: 'om_relay_cmd_msg',
         scope: 'chat',
         title: '/relay',
+        cliId: undefined,
+        lastCliInput: undefined,
       },
       worker: null, // command-time placeholder, no real worker
       chatId: 'oc_target',
       scope: 'chat',
     });
     registry.set(sessionKey('oc_target', 'cli_app_test'), scratchDs);
-    // getSession is consulted by closeSession to decide whether to mark
+    // getOwnedSession is consulted by closeSession to decide whether to mark
     // the store row closed — return a status='active' record so the store
     // close path fires.
-    vi.mocked(sessionStore.getSession).mockImplementation((sid: string) =>
+    vi.mocked(sessionStore.getOwnedSession).mockImplementation((sid: string) =>
       sid === 'scratch-relay-cmd' ? ({ ...scratchDs.session, status: 'active' }) as any : undefined,
     );
 
     const r = await callTransfer(movingDs.session.sessionId, 'oc_target', 'om_M1_target');
     expect(r.ok).toBe(true);
     // Scratch must be marked closed in the store, not silently orphaned.
-    expect(sessionStore.closeSession).toHaveBeenCalledWith('scratch-relay-cmd');
+    expect(sessionStore.closeSession).toHaveBeenCalledWith('scratch-relay-cmd', { cleanupBridgeMarkers: true });
     // The target-chat Map slot now holds the relayed session, not the scratch.
     expect(registry.get(sessionKey('oc_target', 'cli_app_test'))).toBe(movingDs);
   });
+
+  it.each(['dormant-real', 'pending-repo', 'queued', 'deferred-prompt'] as const)(
+    'never evicts a worker-less %s target as disposable scratch',
+    async (kind) => {
+      const movingDs = makeDs();
+      registry.set(sessionKey('om_source_root', 'cli_app_test'), movingDs);
+
+      const target = makeDs({
+        worker: null,
+        pendingRepo: kind === 'pending-repo',
+        pendingPrompt: kind === 'deferred-prompt' ? '' : undefined,
+        session: {
+          ...movingDs.session,
+          sessionId: `protected-${kind}`,
+          chatId: 'oc_target',
+          rootMessageId: 'om_target_protected',
+          scope: 'chat',
+          cliId: kind === 'dormant-real' ? 'claude-code' : undefined,
+          lastCliInput: undefined,
+          queued: kind === 'queued',
+        },
+        chatId: 'oc_target',
+        scope: 'chat',
+      });
+      registry.set(sessionKey('oc_target', 'cli_app_test'), target);
+
+      expect(await callTransfer(movingDs.session.sessionId, 'oc_target', 'om_M1_target')).toEqual({
+        ok: false,
+        error: 'target_chat_has_session',
+      });
+      expect(sessionStore.closeSession).not.toHaveBeenCalled();
+      expect(registry.get(sessionKey('oc_target', 'cli_app_test'))).toBe(target);
+    },
+  );
 
   it('allows transfer when target chat has only thread-scope sessions (no chat-scope collision)', async () => {
     const movingDs = makeDs();
@@ -500,6 +1441,28 @@ describe('transferSession', () => {
     expect(body).toMatch(/"img_key":\s*"old_image_key"/);
   });
 
+  it('reattaches at the routing commit before awaiting the source-card patch', async () => {
+    const ds = makeDs();
+    registry.set(sessionKey('om_source_root', 'cli_app_test'), ds);
+    const patch = deferred<void>();
+    updateMessageMock.mockImplementationOnce(() => patch.promise);
+
+    const transferring = callTransfer(ds.session.sessionId, 'oc_target', 'om_M1_target');
+    await vi.waitFor(() => expect(updateMessageMock).toHaveBeenCalledTimes(1));
+
+    // The target owner is already runnable before the best-effort Lark PATCH.
+    // A close that wins during that await must not be followed by a stale fork.
+    expect(forkWorkerSpy).toHaveBeenCalledTimes(1);
+    expect(registry.get(sessionKey('oc_target', 'cli_app_test'))).toBe(ds);
+    registry.delete(sessionKey('oc_target', 'cli_app_test'));
+    ds.session.status = 'closed';
+
+    patch.resolve();
+    await expect(transferring).resolves.toEqual({ ok: true });
+    expect(forkWorkerSpy).toHaveBeenCalledTimes(1);
+    expect(registry.has(sessionKey('oc_target', 'cli_app_test'))).toBe(false);
+  });
+
   it('frozen card renders no extra element when no currentImageKey is set (hidden mode)', async () => {
     // Sessions in hidden / collapsed display mode never produced a server-
     // rendered screenshot, so currentImageKey is undefined. We deliberately
@@ -534,6 +1497,133 @@ describe('transferSession', () => {
     expect(ds.session.chatId).toBe('oc_target');
   });
 
+  it('does not hold the committed move or replacement startup behind the source-card PATCH', async () => {
+    const ds = makeDs();
+    const sourceKey = sessionKey('om_source_root', 'cli_app_test');
+    registry.set(sourceKey, ds);
+
+    let releaseFreeze!: () => void;
+    updateMessageMock.mockImplementationOnce(() => new Promise<void>((resolve) => {
+      releaseFreeze = resolve;
+    }));
+
+    const moving = callTransfer(ds.session.sessionId, 'oc_target', 'om_M1_target');
+    await vi.waitFor(() => expect(updateMessageMock).toHaveBeenCalledTimes(1));
+
+    const r = await moving;
+    expect(r).toEqual({ ok: true });
+    expect(detachWorkerSpy).toHaveBeenCalledWith(ds);
+    expect(forkWorkerSpy).toHaveBeenCalledWith(ds, '', true);
+    expect(ds.chatId).toBe('oc_target');
+    expect(registry.get(sessionKey('oc_target', 'cli_app_test'))).toBe(ds);
+    expect(registry.has(sourceKey)).toBe(false);
+
+    // Settle the deliberately slow best-effort PATCH so the test leaves no
+    // unresolved work behind.
+    releaseFreeze();
+  });
+
+  it('reattaches on the source and leaves its card live when a target appears during detach', async () => {
+    const ds = makeDs();
+    const sourceKey = sessionKey('om_source_root', 'cli_app_test');
+    registry.set(sourceKey, ds);
+
+    let releaseDetach!: (completed: boolean) => void;
+    const detach = vi.fn(() => new Promise<boolean>((resolve) => {
+      releaseDetach = resolve;
+    }));
+    const sourceFork = vi.fn();
+    const moving = transferSession(
+      ds.session.sessionId,
+      'oc_target',
+      'om_M1_target',
+      'group',
+      'chat',
+      {
+        detachWorkerImpl: detach,
+        forkWorkerImpl: sourceFork as any,
+      },
+    );
+    await vi.waitFor(() => expect(detach).toHaveBeenCalledOnce());
+
+    const target = makeDs({
+      worker: { killed: false } as any,
+      session: {
+        ...makeDs().session,
+        sessionId: 'target-created-during-freeze',
+        chatId: 'oc_target',
+        rootMessageId: 'om_target_existing',
+        scope: 'chat',
+      },
+      chatId: 'oc_target',
+      scope: 'chat',
+    });
+    registry.set(sessionKey('oc_target', 'cli_app_test'), target);
+    releaseDetach(true);
+
+    const r = await moving;
+    expect(r).toEqual({ ok: false, error: 'target_chat_has_session' });
+    expect(sourceFork).toHaveBeenCalledWith(ds, '', true);
+    expect(registry.get(sessionKey('oc_target', 'cli_app_test'))).toBe(target);
+    expect(registry.get(sourceKey)).toBe(ds);
+    expect(ds.chatId).toBe('oc_source');
+    expect(updateMessageMock).not.toHaveBeenCalled();
+  });
+
+  it('defers a worker-null refork that arrives while detach is pending', async () => {
+    const ds = makeDs({ worker: null, lastScreenStatus: 'idle' });
+    registry.set(sessionKey('om_source_root', 'cli_app_test'), ds);
+
+    let releaseDetach!: (completed: boolean) => void;
+    const detach = vi.fn(() => new Promise<boolean>((resolve) => {
+      releaseDetach = resolve;
+    }));
+    const replacementSend = vi.fn();
+    const replacementWorker = Object.assign(new EventEmitter(), {
+      killed: false,
+      connected: true,
+      exitCode: null,
+      signalCode: null,
+      send: replacementSend,
+      kill: vi.fn(),
+    }) as any;
+    const replacementFork = vi.fn(() => {
+      ds.worker = replacementWorker;
+    });
+    const moving = transferSession(
+      ds.session.sessionId,
+      'oc_target',
+      'om_M1_target',
+      'group',
+      'chat',
+      {
+        forkWorkerImpl: replacementFork as any,
+        detachWorkerImpl: detach,
+      },
+    );
+    await vi.waitFor(() => expect(detach).toHaveBeenCalledOnce());
+
+    forkWorker(
+      ds,
+      { content: 'arrived while detach was pending' },
+      { resume: true, turnId: 'turn-detach', dispatchAttempt: 11 },
+    );
+    expect(replacementFork).not.toHaveBeenCalled();
+
+    releaseDetach(true);
+    const result = await moving;
+
+    expect(result).toEqual({ ok: true });
+    expect(replacementFork).toHaveBeenCalledTimes(1);
+    expect(replacementFork).toHaveBeenCalledWith(ds, '', true);
+    expect(replacementSend).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'message',
+      content: 'arrived while detach was pending',
+      turnId: 'turn-detach',
+      dispatchAttempt: 11,
+    }));
+  });
+
   it('does not call updateMessage when there is no source-chat card to freeze', async () => {
     const ds = makeDs({ streamCardId: undefined, session: {
       ...makeDs().session, streamCardId: undefined,
@@ -553,7 +1643,7 @@ describe('transferSession', () => {
 
     const r = await callTransfer(ds.session.sessionId, 'oc_target', 'om_M1_target');
     expect(r.ok).toBe(true);
-    expect(killWorkerSpy).toHaveBeenCalledWith(ds);
+    expect(detachWorkerSpy).toHaveBeenCalledWith(ds);
     expect(forkWorkerSpy).toHaveBeenCalledTimes(1);
   });
 });
@@ -604,7 +1694,10 @@ describe('setActiveSessionSafe', () => {
     // restoreActiveSessions iterates two on-disk active sessions resolving
     // to the same chat-scope key. Bare Map.set silently drops the loser;
     // setActiveSessionSafe closes it instead so its store row doesn't stay
-    // status='active' as a ghost.
+    // status='active' as a ghost. (setActiveSessionSafe = PR #597's
+    // object-returning registrar; the take-over path closes a ledger-empty
+    // occupant. The boolean preserve-occupant CAS lives in
+    // setActiveSessionIfActive — covered separately below.)
     const prevDs = makeSimpleDs('prev-sess');
     const newDs = makeSimpleDs('new-sess');
     vi.mocked(sessionStore.getSession).mockImplementation((sid: string) =>
@@ -614,10 +1707,29 @@ describe('setActiveSessionSafe', () => {
     const key = sessionKey('oc_c', 'cli_app_test');
     registry.set(key, prevDs);
 
-    await setActiveSessionSafe(registry, key, newDs);
+    const result = await setActiveSessionSafe(registry, key, newDs);
 
+    expect(result).toEqual({ accepted: true, closedSessionId: 'prev-sess' });
     expect(registry.get(key)).toBe(newDs);
     expect(sessionStore.closeSession).toHaveBeenCalledWith('prev-sess');
+  });
+
+  it('preserves the current occupant when a different session tries to register (setActiveSessionIfActive CAS)', () => {
+    // Master's compare-and-set gate: setActiveSessionIfActive refuses to
+    // overwrite a live routing occupant and returns false (no close). The
+    // merge relocated this preserve-occupant semantics from setActiveSessionSafe
+    // to setActiveSessionIfActive, so assert it against the function that owns
+    // the behavior now.
+    const prevDs = makeSimpleDs('prev-sess');
+    const newDs = makeSimpleDs('new-sess');
+
+    const key = sessionKey('oc_c', 'cli_app_test');
+    registry.set(key, prevDs);
+
+    expect(setActiveSessionIfActive(registry, key, newDs)).toBe(false);
+
+    expect(registry.get(key)).toBe(prevDs);
+    expect(sessionStore.closeSession).not.toHaveBeenCalled();
   });
 
   it('is a no-op when the key already holds the same session instance', async () => {
@@ -639,5 +1751,364 @@ describe('setActiveSessionSafe', () => {
 
     expect(registry.get(key)).toBe(ds);
     expect(sessionStore.closeSession).not.toHaveBeenCalled();
+  });
+
+  it('keeps an unsettled incumbent and closes a ledger-empty incoming collision', async () => {
+    const incumbent = makeSimpleDs('pending-incumbent');
+    incumbent.session.codexAppDispatchLedger = [{
+      dispatchId: 'dispatch-incumbent',
+      turnId: 'turn-incumbent',
+      state: 'prepared',
+      content: 'owned',
+      deliverySink: 'lark',
+    }];
+    const incoming = makeSimpleDs('ledger-empty-incoming');
+    vi.mocked(sessionStore.getSession).mockImplementation((sid: string) =>
+      sid === incoming.session.sessionId ? incoming.session : undefined,
+    );
+    const key = sessionKey('oc_c', 'cli_app_test');
+    registry.set(key, incumbent);
+
+    const result = await setActiveSessionSafe(registry, key, incoming);
+
+    expect(result).toEqual({
+      accepted: false,
+      reason: 'kept_pending_owner',
+      keptSessionId: incumbent.session.sessionId,
+      closedIncomingSessionId: incoming.session.sessionId,
+    });
+    expect(registry.get(key)).toBe(incumbent);
+    expect(sessionStore.closeSession).toHaveBeenCalledWith(incoming.session.sessionId);
+  });
+
+  it('fails closed and preserves both rows when both colliding owners are unsettled', async () => {
+    const incumbent = makeSimpleDs('pending-incumbent');
+    incumbent.session.codexAppDispatchLedger = [{
+      dispatchId: 'dispatch-incumbent',
+      turnId: 'turn-incumbent',
+      state: 'prepared',
+      content: 'owned incumbent',
+      deliverySink: 'lark',
+    }];
+    const incoming = makeSimpleDs('pending-incoming');
+    incoming.session.codexAppDispatchLedger = [{
+      dispatchId: 'dispatch-incoming',
+      turnId: 'turn-incoming',
+      state: 'prepared',
+      content: 'owned incoming',
+      deliverySink: 'lark',
+    }];
+    const key = sessionKey('oc_c', 'cli_app_test');
+    registry.set(key, incumbent);
+
+    const result = await setActiveSessionSafe(registry, key, incoming);
+
+    expect(result).toEqual({
+      accepted: false,
+      reason: 'both_pending',
+      keptSessionId: incumbent.session.sessionId,
+      preservedIncomingSessionId: incoming.session.sessionId,
+    });
+    expect(registry.get(key)).toBe(incumbent);
+    expect(sessionStore.closeSession).not.toHaveBeenCalled();
+  });
+
+  it('reserves an empty runtime key for a quarantined active persisted row', () => {
+    const quarantined = makeSimpleDs('quarantined-sess');
+    quarantined.session.restoreQuarantinedAt = '2026-07-31T00:00:00.000Z';
+    const fresh = makeSimpleDs('fresh-sess');
+    const key = sessionKey('oc_c', 'cli_app_test');
+    vi.mocked(sessionStore.listSessions).mockReturnValueOnce([quarantined.session]);
+
+    expect(setActiveSessionIfActive(registry, key, fresh)).toBe(false);
+    expect(registry.has(key)).toBe(false);
+  });
+
+  it('lets the quarantined row itself reclaim the route and clears its marker', () => {
+    const quarantined = makeSimpleDs('quarantined-sess');
+    quarantined.session.restoreQuarantinedAt = '2026-07-31T00:00:00.000Z';
+    const key = sessionKey('oc_c', 'cli_app_test');
+    vi.mocked(sessionStore.listSessions).mockReturnValueOnce([quarantined.session]);
+
+    expect(setActiveSessionIfActive(registry, key, quarantined)).toBe(true);
+    expect(registry.get(key)).toBe(quarantined);
+    expect(quarantined.session.restoreQuarantinedAt).toBeUndefined();
+    expect(sessionStore.updateSession).toHaveBeenCalledWith(quarantined.session);
+  });
+
+  it('refuses to register a session closed while its creator was awaiting', () => {
+    const ds = makeSimpleDs('closed-before-register');
+    ds.session.status = 'closed';
+    const key = sessionKey('oc_c', 'cli_app_test');
+
+    expect(setActiveSessionIfActive(registry, key, ds)).toBe(false);
+    expect(registry.has(key)).toBe(false);
+  });
+
+  it('rolls back a rejected row before returning the latest active routing winner', async () => {
+    const rejected = makeSimpleDs('rejected-sess');
+    const staleWinner = makeSimpleDs('stale-winner');
+    const latestWinner = makeSimpleDs('latest-winner');
+    const key = sessionKey('oc_c', 'cli_app_test');
+    registry.set(key, staleWinner);
+    const rollback = vi.fn(async (sessionId: string) => {
+      expect(sessionId).toBe(rejected.session.sessionId);
+      // Simulate another creator replacing the key while close cleanup yields.
+      registry.set(key, latestWinner);
+    });
+
+    await expect(
+      rollbackRejectedSessionAndGetWinner(registry, key, rejected, rollback),
+    ).resolves.toBe(latestWinner);
+    expect(rollback).toHaveBeenCalledOnce();
+  });
+
+  it('does not reroute an inbound event to a winner that closed during rollback', async () => {
+    const rejected = makeSimpleDs('rejected-sess');
+    const closedWinner = makeSimpleDs('closed-winner');
+    const key = sessionKey('oc_c', 'cli_app_test');
+    registry.set(key, closedWinner);
+
+    const winner = await rollbackRejectedSessionAndGetWinner(
+      registry,
+      key,
+      rejected,
+      async () => { closedWinner.session.status = 'closed'; },
+    );
+
+    expect(winner).toBeUndefined();
+  });
+
+});
+
+describe('closeSession concurrency', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    listDocSubscriptionsMock.mockReturnValue([]);
+    unsubscribeDocFileMock.mockResolvedValue(undefined);
+    removeCommentReactionMock.mockResolvedValue(undefined);
+  });
+
+  it('commits closed state before a slow document unsubscribe can yield', async () => {
+    const registry = new Map<string, DaemonSession>();
+    const ds = makeDs({
+      worker: {
+        killed: false,
+        exitCode: null,
+        signalCode: null,
+        send: vi.fn(),
+        once: vi.fn((_event: string, listener: () => void) => {
+          queueMicrotask(listener);
+        }),
+        off: vi.fn(),
+        kill: vi.fn(),
+      } as any,
+    });
+    registry.set(sessionKey('om_source_root', 'cli_app_test'), ds);
+    setActiveSessionsRegistry(registry);
+
+    let stored = { ...ds.session } as Session;
+    vi.mocked(sessionStore.getOwnedSession).mockImplementation((sid: string) =>
+      sid === ds.session.sessionId ? stored : undefined,
+    );
+    vi.mocked(sessionStore.closeSession).mockImplementation(() => {
+      stored = { ...stored, status: 'closed', closedAt: new Date().toISOString() };
+    });
+    listDocSubscriptionsMock.mockReturnValue([{ fileToken: 'doc-token', fileType: 'docx' }]);
+
+    let releaseUnsubscribe!: () => void;
+    unsubscribeDocFileMock.mockImplementation(() => new Promise<void>((resolve) => {
+      releaseUnsubscribe = resolve;
+    }));
+
+    const closing = closeSession(ds.session.sessionId);
+
+    // closeSession has reached its first await, but all authoritative state is
+    // already closed. A continuation that captured `ds` cannot resurrect it.
+    expect(ds.session.status).toBe('closed');
+    expect(registry.has(sessionKey('om_source_root', 'cli_app_test'))).toBe(false);
+    expect(sessionStore.closeSession).toHaveBeenCalledWith(ds.session.sessionId, {
+      cleanupBridgeMarkers: false,
+    });
+    const key = sessionKey('om_source_root', 'cli_app_test');
+    registry.set(key, ds); // stale async continuation re-published the same object
+    expect(() => forkWorker(ds, 'late message')).not.toThrow();
+    expect(registry.has(key)).toBe(false);
+
+    ds.adoptedFrom = {
+      source: 'tmux',
+      tmuxTarget: '0:0.0',
+      originalCliPid: 42,
+      cwd: '/tmp/project',
+    };
+    registry.set(key, ds);
+    expect(() => forkAdoptWorker(ds)).not.toThrow();
+    expect(registry.has(key)).toBe(false);
+
+    await vi.waitFor(() => expect(unsubscribeDocFileMock).toHaveBeenCalledTimes(1));
+    releaseUnsubscribe();
+    await closing;
+    expect(removeDocSubscriptionMock).toHaveBeenCalledWith(
+      expect.any(String),
+      'cli_app_test',
+      'doc-token',
+    );
+  });
+
+  it('tears down only explicitly stamped bot-owned persistent backings', () => {
+    const kill = vi.fn();
+    const base = makeDs().session;
+    const zmx = { ...base, backendType: 'zmx' as const };
+    expect(destroyUnregisteredPersistentBacking(zmx, kill)).toBe(true);
+    expect(kill).toHaveBeenCalledWith(
+      { backendType: 'zmx', sessionName: 'bmx-sess-abc' },
+      'sess-abc-123',
+    );
+
+    kill.mockClear();
+    expect(destroyUnregisteredPersistentBacking({ ...zmx, adoptedFrom: {
+      source: 'tmux', tmuxTarget: '0:0.0', originalCliPid: 42, cwd: '/tmp',
+    } }, kill)).toBe(false);
+    expect(destroyUnregisteredPersistentBacking({ ...zmx, queued: true }, kill)).toBe(false);
+    expect(destroyUnregisteredPersistentBacking({ ...zmx, backendType: 'pty' }, kill)).toBe(false);
+    expect(kill).not.toHaveBeenCalled();
+  });
+
+  it('tears down an unregistered backing through its exact persisted target', () => {
+    const killTarget = vi.fn();
+    const base = makeDs().session;
+    const herdr = {
+      ...base,
+      backendType: 'herdr' as const,
+      persistentBackendTarget: {
+        backendType: 'herdr' as const,
+        sessionName: 'botmux',
+        agentName: 'botmux-sess-abc',
+      },
+    };
+
+    expect(destroyUnregisteredPersistentBacking(herdr, killTarget)).toBe(true);
+    expect(killTarget).toHaveBeenCalledWith(
+      herdr.persistentBackendTarget,
+      herdr.sessionId,
+    );
+  });
+
+  it('removes every binding while only remotely unsubscribing legacy/API-managed records', async () => {
+    const registry = new Map<string, DaemonSession>();
+    const ds = makeDs();
+    registry.set(sessionKey('om_source_root', 'cli_app_test'), ds);
+    setActiveSessionsRegistry(registry);
+    vi.mocked(sessionStore.getOwnedSession).mockReturnValue(ds.session);
+    listDocSubscriptionsMock.mockReturnValue([
+      { fileToken: 'legacy-doc', fileType: 'docx' },
+      { fileToken: 'api-doc', fileType: 'docx', managedBy: 'subscribe-lark-doc' },
+      { fileToken: 'watch-doc', fileType: 'docx', managedBy: 'watch-comment' },
+    ] as any);
+    // A remote API failure must not retain the local binding or stop cleanup
+    // of the other records.
+    unsubscribeDocFileMock.mockRejectedValueOnce(new Error('remote unavailable'));
+
+    await closeSession(ds.session.sessionId);
+
+    expect(unsubscribeDocFileMock.mock.calls.map(call => call[1].fileToken)).toEqual([
+      'legacy-doc',
+      'api-doc',
+    ]);
+    expect(removeDocSubscriptionMock.mock.calls.map(call => call[2])).toEqual([
+      'legacy-doc',
+      'api-doc',
+      'watch-doc',
+    ]);
+  });
+
+  it('clears every per-turn doc target before awaiting reaction cleanup', async () => {
+    const registry = new Map<string, DaemonSession>();
+    const ds = makeDs();
+    const target = {
+      fileToken: 'doc-token',
+      fileType: 'docx',
+      commentId: 'comment-1',
+      turnId: 'turn-1',
+      replyId: 'reply-1',
+      reactionId: 'reaction-1',
+    };
+    ds.docCommentTurns = new Map([['turn-1', target]]);
+    ds.session.docCommentTargets = { 'turn-1': target };
+    registry.set(sessionKey('om_source_root', 'cli_app_test'), ds);
+    setActiveSessionsRegistry(registry);
+    vi.mocked(sessionStore.getOwnedSession).mockReturnValue(ds.session);
+
+    let releaseReaction!: () => void;
+    removeCommentReactionMock.mockImplementation(() => new Promise<void>((resolve) => {
+      releaseReaction = resolve;
+    }));
+
+    const closing = closeSession(ds.session.sessionId);
+
+    expect(ds.session.status).toBe('closed');
+    expect(registry.size).toBe(0);
+    expect(ds.docCommentTurns).toBeUndefined();
+    expect(ds.session.docCommentTargets).toBeUndefined();
+    expect(sessionStore.closeSession).toHaveBeenCalledWith(ds.session.sessionId, {
+      cleanupBridgeMarkers: true,
+    });
+    expect(dashboardEventBus.publish).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'session.update',
+    }));
+
+    releaseReaction();
+    await closing;
+    expect(removeCommentReactionMock).toHaveBeenCalledWith(
+      'cli_app_test',
+      { fileToken: 'doc-token', fileType: 'docx' },
+      'comment-1',
+      'reply-1',
+      'reaction-1',
+    );
+  });
+
+  it('persists stale per-turn cleanup when re-closing an already-closed owned row', async () => {
+    setActiveSessionsRegistry(new Map());
+    const stored = makeDs().session;
+    stored.status = 'closed';
+    stored.docCommentTargets = {
+      'turn-stale': {
+        fileToken: 'doc-token',
+        fileType: 'docx',
+        commentId: 'comment-1',
+        turnId: 'turn-stale',
+        replyId: 'reply-1',
+        reactionId: 'reaction-1',
+      },
+    };
+    vi.mocked(sessionStore.getOwnedSession).mockReturnValue(stored);
+
+    await closeSession(stored.sessionId);
+
+    expect(stored.docCommentTargets).toBeUndefined();
+    expect(sessionStore.updateSession).toHaveBeenCalledWith(stored);
+    expect(sessionStore.closeSession).not.toHaveBeenCalled();
+    expect(removeCommentReactionMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not treat another bot file found by read-only lookup as owned close state', async () => {
+    setActiveSessionsRegistry(new Map());
+    vi.mocked(sessionStore.getOwnedSession).mockReturnValue(undefined);
+    vi.mocked(sessionStore.getSession).mockReturnValue({
+      ...makeDs().session,
+      sessionId: 'foreign-session',
+      larkAppId: 'other_app',
+    });
+
+    await expect(closeSession('foreign-session')).resolves.toEqual({
+      ok: true,
+      alreadyClosed: true,
+      known: false,
+    });
+
+    expect(sessionStore.getSession).not.toHaveBeenCalled();
+    expect(sessionStore.closeSession).not.toHaveBeenCalled();
+    expect(dashboardEventBus.publish).not.toHaveBeenCalled();
   });
 });

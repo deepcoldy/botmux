@@ -64,6 +64,8 @@ function openPlatformSubscriptionMock(appId: string, opts: {
   /** event/update 中包含这些事件时整批被拒(逐个重试时对应单个失败)。 */
   rejectEventNames?: string[];
   initial?: { appEvents?: string[]; userEvents?: string[]; callbacks?: string[]; callbackMode?: number; eventMode?: number };
+  /** visible/online 响应体（不给时用「全员可见」的现行契约形态）。 */
+  visibleOnline?: unknown;
 } = {}) {
   const state = {
     eventMode: opts.initial?.eventMode ?? 4,
@@ -111,6 +113,15 @@ function openPlatformSubscriptionMock(appId: string, opts: {
     }
     if (href.endsWith(`/developers/v1/callback/${appId}`)) {
       return Response.json({ code: 0, data: { callbackMode: state.callbackMode, callbacks: [...state.callbacks] } });
+    }
+    if (href.endsWith(`/developers/v1/visible/online/${appId}`)) {
+      return Response.json(opts.visibleOnline ?? {
+        code: 0,
+        data: {
+          whiteList: { departments: [], members: [], groups: [], isAll: 1 },
+          blackList: { departments: [], members: [], groups: [], isAll: 0 },
+        },
+      });
     }
     return null;
   };
@@ -829,7 +840,7 @@ describe('automateOpenPlatformSetup', () => {
       '/developers/v1/callback/update/cli_x',
       '/developers/v1/callback/cli_x',
       '/developers/v1/safe_setting/update/cli_x',
-      '/developers/v1/contact_range/cli_x',
+      '/developers/v1/visible/online/cli_x',
       '/developers/v1/app_version/list/cli_x',
       '/developers/v1/app_version/create/cli_x',
       '/developers/v1/publish/commit/cli_x/v1',
@@ -904,7 +915,7 @@ describe('automateOpenPlatformSetup', () => {
       '/developers/v1/callback/update/cli_x',
       '/developers/v1/callback/cli_x',
       '/developers/v1/safe_setting/update/cli_x',
-      '/developers/v1/contact_range/cli_x',
+      '/developers/v1/visible/online/cli_x',
       '/developers/v1/app_version/list/cli_x',
       '/developers/v1/app_version/create/cli_x',
       '/developers/v1/publish/commit/cli_x/v1',
@@ -1102,6 +1113,8 @@ describe('automateOpenPlatformSetup', () => {
           'drive.notice.comment_add_v1',
           'im.message.reaction.created_v1',
           'im.message.reaction.deleted_v1',
+          'im.chat.member.user.added_v1',
+          'im.chat.member.user.deleted_v1',
           'vc.bot.meeting_invited_v1',
           'vc.bot.meeting_activity_v1',
           'vc.bot.meeting_ended_v1',
@@ -1129,8 +1142,8 @@ describe('automateOpenPlatformSetup', () => {
       expect(result.message).toContain('im.message.receive_v1');
       expect(result.eventWarning).toBeTruthy();
     }
-    // 批量失败后逐个重试过:baseline 6 + VC app 3 + VC user 1 = 批量 1 次 + 单个 10 次
-    expect(sub.updateBodies.filter(body => Array.isArray(body.appEvents)).length).toBe(11);
+    // 批量失败后逐个重试过:baseline 6 + 可选 user 事件 2 + VC app 3 + VC user 1 = 批量 1 次 + 单个 12 次
+    expect(sub.updateBodies.filter(body => Array.isArray(body.appEvents)).length).toBe(13);
     // 核心事件缺失时不再继续发版,避免发布一个收不到消息的版本
     expect(calls.some(u => u.includes('/publish/commit/'))).toBe(false);
   });
@@ -1188,7 +1201,7 @@ describe('automateOpenPlatformSetup', () => {
     expect(calls.some(u => u.includes('/publish/commit/'))).toBe(true);
     if (result.ok) {
       expect(result.missingVcEvents).toEqual(vcEvents);
-      expect(result.subscribedEventCount).toBe(7); // 6 baseline 事件 + 1 回调
+      expect(result.subscribedEventCount).toBe(9); // 6 baseline 事件 + 2 可选 user 事件 + 1 回调
       expect(result.eventWarning).toContain('VC 会议事件未确认订阅');
       // VC listener 保存门必须拦下这种结果(dashboard 两条分支都走这个门)
       expect(vcListenerEventGateError(result)).toContain('vc.bot.meeting_invited_v1');
@@ -1240,5 +1253,111 @@ describe('automateOpenPlatformSetup', () => {
       .toContain('长连接');
     // 走不到订阅阶段的早期失败(missingVcEvents/eventModeReady 均 undefined)保持原 best-effort 语义
     expect(vcListenerEventGateError({})).toBeNull();
+  });
+});
+
+/**
+ * 回归：自动发版必须原样镜像线上可见范围。
+ *
+ * 历史 bug —— 这里读的是 `contact_range`（通讯录权限范围）且只取 members，
+ * `departments` / `groups` / `isAll` 在版本 payload 里写死空值。由于
+ * `app_version/create` 的 visibleSuggest 是**全量覆写**语义，每次权限自愈自动
+ * 发版都把「全员可见 / 按部门授权 / 按用户组授权」静默清成「仅少数个人可见」，
+ * 升级次日大量用户访问不了应用。
+ */
+describe('automateOpenPlatformSetup 版本可见范围', () => {
+  const visibilityFetch = (appId: string, sub: ReturnType<typeof openPlatformSubscriptionMock>, calls: string[]) =>
+    (async (url: string | URL | Request, init?: RequestInit) => {
+      const href = String(url);
+      if (href === 'https://ask.feishu.cn/') return new Response('ask home', { status: 200 });
+      if (href === `https://open.feishu.cn/app/${appId}/auth`) {
+        return new Response('<script>window.csrfToken="csrf_auto"</script>', { status: 200 });
+      }
+      const path = new URL(href).pathname;
+      calls.push(path);
+      if (path.includes('/scope/all/')) {
+        return Response.json({ code: 0, data: { appScopeList: [{ id: 'tenant-1', name: 'im:message' }], userScopeList: [] } });
+      }
+      if (path.includes('/app_version/create/')) return Response.json({ code: 0, data: { versionId: 'v1' } });
+      return sub.handle(href, init) ?? Response.json({ code: 0 });
+    }) as typeof fetch;
+
+  const runWith = async (visibleOnline: unknown) => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-visibility-'));
+    const sessionFile = join(dir, 'feishu-session.json');
+    writeStoredCookiesToSessionFile(sessionFile, [cookie()]);
+    const sub = openPlatformSubscriptionMock('cli_x', { visibleOnline });
+    const calls: string[] = [];
+    const bodies: Array<Record<string, unknown>> = [];
+    const inner = visibilityFetch('cli_x', sub, calls);
+    const fetchImpl = (async (url: string | URL | Request, init?: RequestInit) => {
+      const href = String(url);
+      if (href.includes('/app_version/create/')) bodies.push(JSON.parse(String(init?.body)));
+      return inner(url, init);
+    }) as typeof fetch;
+    const result = await automateOpenPlatformSetup({
+      appId: 'cli_x',
+      sessionFilePath: sessionFile,
+      fetchImpl,
+      scopeManifest: { scopes: { tenant: ['im:message'], user: [] } },
+    });
+    return { result, calls, versionBody: bodies[0] };
+  };
+
+  it('把线上的全员可见 / 部门 / 用户组原样镜像进新版本，而不是清空', async () => {
+    const { result, versionBody } = await runWith({
+      code: 0,
+      data: {
+        whiteList: {
+          departments: [{ id: 'od_sales' }, { id: 'od_eng' }],
+          members: [{ id: 'ou_alice' }],
+          groups: [{ id: 'g_oncall' }],
+          isAll: 1,
+        },
+        blackList: { departments: [], members: [{ id: 'ou_banned' }], groups: [], isAll: 0 },
+      },
+    });
+
+    expect(result.ok).toBe(true);
+    // 四个集合一个都不能丢：isAll=1 掉成 0 就是「全员可见」被撤销，
+    // departments/groups 清空就是按部门/用户组授权的人全部失去访问。
+    expect(versionBody.visibleSuggest).toEqual({
+      departments: ['od_sales', 'od_eng'],
+      members: ['ou_alice'],
+      groups: ['g_oncall'],
+      isAll: 1,
+    });
+    // 黑名单同样要镜像：丢了就把被拉黑的人重新放进来。
+    expect(versionBody.blackVisibleSuggest).toEqual({
+      departments: [], members: ['ou_banned'], groups: [], isAll: 0,
+    });
+  });
+
+  it('读的是 visible/online（应用可见范围），不再读 contact_range（通讯录权限范围）', async () => {
+    const { calls } = await runWith(undefined);
+    expect(calls).toContain('/developers/v1/visible/online/cli_x');
+    expect(calls).not.toContain('/developers/v1/contact_range/cli_x');
+  });
+
+  it('可见范围响应形态不认识时 fail closed：不建版、不发布', async () => {
+    // isAll 是字符串 '1' —— 猜错方向就会把全员可见发布成不可见，宁可不发版。
+    const { result, calls } = await runWith({
+      code: 0,
+      data: {
+        whiteList: { departments: [], members: [], groups: [], isAll: '1' },
+        blackList: { departments: [], members: [], groups: [], isAll: 0 },
+      },
+    });
+
+    expect(result).toMatchObject({ ok: false, reason: 'visibility_unreadable' });
+    expect(calls.some(path => path.includes('/app_version/create/'))).toBe(false);
+    expect(calls.some(path => path.includes('/publish/commit/'))).toBe(false);
+  });
+
+  it('可见范围块缺键时同样 fail closed（残缺响应不得当成空可见范围）', async () => {
+    const { result, calls } = await runWith({ code: 0, data: { whiteList: {}, blackList: {} } });
+
+    expect(result).toMatchObject({ ok: false, reason: 'visibility_unreadable' });
+    expect(calls.some(path => path.includes('/app_version/create/'))).toBe(false);
   });
 });

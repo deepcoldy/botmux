@@ -2,7 +2,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { dispatchDeferredTopicSend } from '../src/cli/deferred-topic-send.js';
+import { dispatchDeferredTopicSend, reusableDeferredTopicRoot } from '../src/cli/deferred-topic-send.js';
 import {
   deferredTopicBindingPath,
   readDeferredTopicBinding,
@@ -92,6 +92,13 @@ describe('deferred fresh-topic botmux send routing', () => {
 
   it('reuses the materialized topic for later turns while explicit top-level remains an escape hatch', async () => {
     await dispatchDeferredTopicSend(makeOptions());
+    const binding = readDeferredTopicBinding(dataDir, SESSION_ID)!;
+    expect(reusableDeferredTopicRoot({
+      session: makeOptions().session,
+      binding,
+      explicitTopLevel: false,
+    })).toBe('om_alert_root');
+
     const followUp = makeOptions({ currentTurnId: 'human-turn-2', content: 'more detail' });
     const result = await dispatchDeferredTopicSend(followUp);
 
@@ -100,6 +107,11 @@ describe('deferred fresh-topic botmux send routing', () => {
     expect(result).toMatchObject({ handled: true, rootMessageId: 'om_alert_root', materializedNow: false });
 
     const topLevel = makeOptions({ currentTurnId: 'human-turn-3', explicitTopLevel: true });
+    expect(reusableDeferredTopicRoot({
+      session: topLevel.session,
+      binding,
+      explicitTopLevel: true,
+    })).toBeUndefined();
     expect(await dispatchDeferredTopicSend(topLevel)).toEqual({ handled: false });
     expect(topLevel.replyRoot).not.toHaveBeenCalled();
   });

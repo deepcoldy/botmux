@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import { existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, rmSync } from 'node:fs';
 import { dirname, isAbsolute, resolve } from 'node:path';
 import { config } from '../../config.js';
+import { formatUrlHost } from '../dashboard-url.js';
 import { atomicWriteFileSync } from '../../utils/atomic-write.js';
 import { withFileLock, withFileLockSync } from '../../utils/file-lock.js';
 import { readPluginRegistry } from '../../services/plugin-registry-store.js';
@@ -229,24 +230,29 @@ function isLoopbackHost(hostname: string): boolean {
   return hostname === '127.0.0.1' || hostname === 'localhost' || hostname === '::1' || hostname === '[::1]';
 }
 
-function rewriteLoopbackServiceUrl(rawUrl: string | undefined): string | undefined {
+export function rewriteLoopbackServiceUrl(rawUrl: string | undefined): string | undefined {
   if (!rawUrl) return undefined;
   try {
     const url = new URL(rawUrl);
-    if (isLoopbackHost(url.hostname)) url.hostname = config.dashboard.externalHost;
+    // The WHATWG hostname setter silently drops a bare IPv6 literal (`::1`), so
+    // pass the bracketed form or the loopback rewrite would no-op.
+    if (isLoopbackHost(url.hostname)) {
+      url.hostname = formatUrlHost(config.dashboard.externalHost);
+    }
     return url.toString();
   } catch {
     return rawUrl;
   }
 }
 
-function serviceUrls(record: InstalledPluginRecord, definition: PluginServiceDefinition): Pick<PluginServiceState, 'port' | 'openUrl' | 'healthUrl'> {
+export function serviceUrls(record: InstalledPluginRecord, definition: PluginServiceDefinition): Pick<PluginServiceState, 'port' | 'openUrl' | 'healthUrl'> {
   const env = definitionEnv(record, definition);
   const port = definition.port ?? (env.PORT ? Number(env.PORT) : undefined);
-  const urls = definition.urls?.({ host: config.dashboard.externalHost, env, ...(Number.isFinite(port) ? { port } : {}) }) ?? {};
+  const host = formatUrlHost(config.dashboard.externalHost);
+  const urls = definition.urls?.({ host, env, ...(Number.isFinite(port) ? { port } : {}) }) ?? {};
   return {
     ...(Number.isFinite(port) ? { port } : {}),
-    ...(urls.openUrl ? { openUrl: rewriteLoopbackServiceUrl(urls.openUrl) } : Number.isFinite(port) ? { openUrl: `http://${config.dashboard.externalHost}:${port}/` } : {}),
+    ...(urls.openUrl ? { openUrl: rewriteLoopbackServiceUrl(urls.openUrl) } : Number.isFinite(port) ? { openUrl: `http://${host}:${port}/` } : {}),
     ...(urls.healthUrl ? { healthUrl: rewriteLoopbackServiceUrl(urls.healthUrl) } : {}),
   };
 }

@@ -35,6 +35,7 @@ function makeDeps(over: Partial<DaemonInternalApiDeps> = {}): DaemonInternalApiD
     proxyToDaemon: vi.fn(async () => makeUpstream(200, { ok: true })),
     closeSessionsMatching: vi.fn(async () => []),
     fetch: vi.fn(async () => makeUpstream(200, { inChat: true })),
+    invalidateGroups: vi.fn(),
   };
   const settingsApplierDeps = {
     readGlobalConfig: vi.fn(() => ({})),
@@ -538,6 +539,8 @@ describe('dispatch: groups write', () => {
       '/api/roles/oc_x',
       expect.objectContaining({ method: 'GET' }),
     );
+    // Reads never mutate hasRole → must not bust the 30s snapshot.
+    expect(deps.groupsActionDeps.invalidateGroups).not.toHaveBeenCalled();
   });
 
   it('PUT /groups/:id/roles/:appId proxies role body to internal /api/roles/:chatId PUT', async () => {
@@ -552,6 +555,20 @@ describe('dispatch: groups write', () => {
       '/api/roles/oc_x',
       expect.objectContaining({ method: 'PUT', body }),
     );
+    // Writing a role flips hasRole → snapshot must be invalidated so the
+    // roles-page badge / groups card don't stay stale for up to 30s.
+    expect(deps.groupsActionDeps.invalidateGroups).toHaveBeenCalledOnce();
+  });
+
+  it('PUT /groups/:id/roles/:appId does NOT invalidate when the daemon write fails', async () => {
+    const proxySpy = vi.fn(async () => makeUpstream(500, { ok: false, error: 'disk_full' }));
+    const deps = makeDeps({ proxyToDaemon: proxySpy });
+    const api = createDaemonInternalApi(deps);
+    const r = await api.dispatchForTest(
+      'PUT', url('/__daemon/groups/oc_x/roles/cli_owner'), JSON.stringify({ content: 'x' }),
+    );
+    expect(r.status).toBe(500);
+    expect(deps.groupsActionDeps.invalidateGroups).not.toHaveBeenCalled();
   });
 
   it('DELETE /groups/:id/roles/:appId proxies to internal /api/roles/:chatId DELETE', async () => {
@@ -565,6 +582,8 @@ describe('dispatch: groups write', () => {
       '/api/roles/oc_x',
       expect.objectContaining({ method: 'DELETE' }),
     );
+    // Deleting a role flips hasRole back to false → same invalidation.
+    expect(deps.groupsActionDeps.invalidateGroups).toHaveBeenCalledOnce();
   });
 });
 

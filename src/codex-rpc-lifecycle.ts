@@ -2,7 +2,12 @@
 // out of worker.ts (which auto-registers process handlers on import) so the gate
 // and the pane-ownership detection can be unit-tested with injected probes.
 import { execFileSync } from 'node:child_process';
-import { readCmdline, readComm, getChildPids } from './core/session-discovery.js';
+import {
+  getChildPids,
+  processExecutableArgvSlots,
+  readCmdline,
+  readComm,
+} from './core/session-discovery.js';
 import type { DaemonToWorker } from './types.js';
 
 type InitCfg = Extract<DaemonToWorker, { type: 'init' }>;
@@ -11,6 +16,80 @@ type InitCfg = Extract<DaemonToWorker, { type: 'init' }>;
  *  protocol the RPC engine drives. codex + traex are verified identical; coco
  *  diverges (--resume flag) and needs its own verification before inclusion. */
 export const RPC_CAPABLE_CLIS = new Set(['codex', 'traex']);
+
+/** Retry cadence for native turn/completed → rollout visibility hydration.
+ *  Total window is 11.55s: bounded, but intentionally aligned with the 12s
+ *  first-turn persistence probe so a fast terminal does not discard fallback
+ *  output merely because the rollout filesystem is a few seconds behind. */
+export const CODEX_RPC_TERMINAL_HYDRATION_DELAYS_MS = [
+  50,
+  100,
+  200,
+  400,
+  800,
+  1_600,
+  2_400,
+  3_000,
+  3_000,
+] as const;
+
+/** Ordinary transcript ingest must not advance past a turn/start ACK that has
+ *  not installed its exact bridge mark yet. Native-terminal hydration for an
+ *  older owner is different: it must keep draining that owner's final output
+ *  even while a successor waits for ACK. Any successor events reached by that
+ *  drain stay in CodexBridgeQueue's unmatched replay buffer until activation.
+ *
+ *  A matching awaiting owner still blocks hydration, because consuming its
+ *  transcript before the exact mark exists would retire the same logical
+ *  delivery against incomplete local ownership. */
+export function rpcTranscriptIngestBlockedByAwaitingActivation(
+  awaitingOwnerKeys: Iterable<string>,
+  hydrationOwnerKey?: string,
+): boolean {
+  for (const ownerKey of awaitingOwnerKeys) {
+    if (hydrationOwnerKey === undefined || ownerKey === hydrationOwnerKey) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/** Monotonic fence for async app-server engagement. Worker IPC handlers are not
+ *  serialized, so restart/close can invalidate an engage while it is awaiting
+ *  /readyz, thread creation, or first-turn rollout evidence. Only the lease
+ *  returned by the latest begin() may publish process-global engine state. */
+export class RpcEngagementFence {
+  private epoch = 0;
+  private deadEpoch: number | undefined;
+
+  begin(): number {
+    this.epoch += 1;
+    this.deadEpoch = undefined;
+    return this.epoch;
+  }
+
+  invalidate(): void {
+    this.epoch += 1;
+    this.deadEpoch = undefined;
+  }
+
+  isCurrent(lease: number): boolean {
+    return lease === this.epoch;
+  }
+
+  /** Record an app-server death only for the engagement that owns it. A late
+   *  callback from an older engine must not poison a replacement generation. */
+  markDead(lease: number): void {
+    if (this.isCurrent(lease)) this.deadEpoch = lease;
+  }
+
+  /** Publication requires both generation ownership and a live app-server.
+   *  `onDead` can run after the last awaited RPC response but before the worker
+   *  stores the engine globally, so generation freshness alone is insufficient. */
+  isLive(lease: number): boolean {
+    return this.isCurrent(lease) && this.deadEpoch !== lease;
+  }
+}
 
 /** All fail-closed gates for codex-family RPC input in ONE place so the worker's
  *  pane-branching and engageCodexRpc agree. Every excluded case degrades to the
@@ -21,10 +100,10 @@ export const RPC_CAPABLE_CLIS = new Set(['codex', 'traex']);
  *   - startupCommands: /effort etc. must run in the TUI before the first turn,
  *     but the fresh first turn is sent pre-spawn to persist the rollout — RPC
  *     can't honor that ordering, so fail-closed (P1-4).
- *   - wrapperCli / cliPathOverride: the app-server is launched as `<bin>
- *     app-server`, which a wrapper/alternate launcher won't satisfy the same way
- *     the TUI's buildArgs does — two launchers would diverge, so fail-closed
- *     (P1-2).
+ *   - wrapperCli / legacy cliPathOverride: the app-server is launched as `<bin>
+ *     app-server`, which an ambiguous wrapper/alternate launcher won't satisfy
+ *     the same way the TUI's buildArgs does. A structured compatible runtime is
+ *     the only path override allowed through this gate (P1-2).
  *   - backendType !== 'tmux': the pane-ownership detection + controlled respawn
  *     are only wired for tmux. On herdr/zellij a surviving dead `--remote` pane
  *     would be misjudged as native and reattached, and pty has no persistent
@@ -37,15 +116,32 @@ export interface CodexRpcRuntimeGates {
   sandboxForced?: boolean;
 }
 
+function executableName(value: string): string {
+  const normalized = value.replace(/\\/g, '/').replace(/\/+$/, '');
+  return normalized.slice(normalized.lastIndexOf('/') + 1).toLowerCase();
+}
+
 export function codexRpcEligible(cfg: InitCfg, runtime: CodexRpcRuntimeGates = {}): boolean {
   const wantResume = cfg.resume === true && !!cfg.cliSessionId;
+  // A structured runtime is an explicit declaration that this executable
+  // implements the Codex adapter contract. Legacy path overrides remain
+  // ambiguous wrappers/routers and therefore keep the historical fail-closed
+  // paste behavior.
+  const compatibleRuntimePath = cfg.cliRuntime?.source === 'configured'
+    && typeof cfg.cliPathOverride === 'string'
+    && cfg.cliPathOverride === cfg.cliRuntime.executable;
+  const runtimeExecutableEligible = cfg.cliRuntime?.source === 'configured'
+    ? compatibleRuntimePath
+    : cfg.cliRuntime?.source === 'legacy-path'
+      ? false
+      : !cfg.cliPathOverride;
   return (
     cfg.codexRpcInput === true && RPC_CAPABLE_CLIS.has(cfg.cliId) &&
     cfg.backendType === 'tmux' &&
     cfg.adoptMode !== true && cfg.readIsolation !== true && cfg.sandbox !== true && runtime.sandboxForced !== true &&
     cfg.disableCliBypass !== true &&
     !cfg.startupCommands?.length &&
-    !cfg.wrapperCli && !cfg.cliPathOverride &&
+    !cfg.wrapperCli && runtimeExecutableEligible &&
     (!!cfg.prompt || wantResume)
   );
 }
@@ -99,13 +195,15 @@ export interface PaneProbes {
  *   - 'not-engaged' — setup failed OR fresh frame never dispatched → paste. */
 export type EngageOutcome = 'accepted' | 'ambiguous' | 'resumed' | 'not-engaged';
 
-/** Whether the FRESH first turn should PRE-mark the codex bridge (so the reply is
- *  attributed even if the model skips `botmux send`). ONLY 'accepted' — a
- *  confirmed turn whose prompt is not re-queued, so exactly one mark exists and
- *  the reply consumes it. NOT 'ambiguous' (no positive evidence the turn ran → an
- *  unstarted queue head would wedge every later turn's drain — Codex P1) and NOT
- *  'not-sent'/'resumed' (those never reach the pre-mark; not-sent's paste flush
- *  marks once, resume flushes its queued prompt). */
+/** Whether the FRESH first turn should use the normal confirmed pre-mark path
+ *  (so the reply is attributed even if the model skips `botmux send`). ONLY
+ *  'accepted' — a confirmed turn whose prompt is not re-queued. The worker also
+ *  gives 'ambiguous' its own attribution-only mark plus a fail-closed owner:
+ *  structured terminal retires it when visible, while exact engine teardown is
+ *  the intentional fallback when no native owner can ever be mapped. That
+ *  separate path never resends the prompt and prevents a permanent queue head.
+ *  'not-sent'/'resumed' never reach either pre-mark path; not-sent's paste flush
+ *  marks once, and resume flushes its queued prompt. */
 export function shouldPreMarkFirstTurn(outcome: EngageOutcome): boolean {
   return outcome === 'accepted';
 }
@@ -228,14 +326,26 @@ export async function orchestrateCodexRpcInit(
 
 export interface PersistentPaneKillEffects {
   kill: (sessionName: string) => void;
-  isLive: (sessionName: string) => boolean;
+  /** Tri-state on purpose. A boolean cannot distinguish "the pane is gone" from
+   *  "the liveness probe got no answer", and this function's return value is
+   *  read as PROOF of absence. `hasSession()`-style helpers collapse a probe
+   *  timeout into `false`, which is exactly the wrong direction here. */
+  probeLive: (sessionName: string) => 'live' | 'gone' | 'unknown';
   wait: (ms: number) => Promise<void>;
 }
 
 /** Kill a resolved persistent-session name and verify that exact name is gone.
  *  Keeping the resolved name opaque avoids accidentally applying sessionName()
  *  twice (`bmx-1234` -> `bmx-bmx-`), which would turn every failed kill into a
- *  false success and reattach the stale RPC pane. */
+ *  false success and reattach the stale RPC pane.
+ *
+ *  Returns true ONLY on an authoritative 'gone'. An indeterminate probe is not
+ *  proof: under host load even a cheap `has-session` (~20ms healthy) can be
+ *  killed by its own timeout, and reporting that as a verified kill lets a
+ *  surviving dead-`--remote` pane be reattached to the fresh-port engine — the
+ *  exact P0 freeze this verification layer exists to prevent. When every
+ *  attempt comes back 'unknown' we fail closed: the caller then aborts init
+ *  and tells the user, instead of silently proceeding on an unproven kill. */
 export async function killAndVerifyPersistentPane(
   sessionName: string,
   fx: PersistentPaneKillEffects,
@@ -244,10 +354,12 @@ export async function killAndVerifyPersistentPane(
 ): Promise<boolean> {
   for (let attempt = 0; attempt < attempts; attempt++) {
     try { fx.kill(sessionName); } catch { /* verify below */ }
-    if (!fx.isLive(sessionName)) return true;
+    // Retry on 'unknown' as well as 'live': an unanswered probe is a reason to
+    // look again, never a reason to declare success.
+    if (fx.probeLive(sessionName) === 'gone') return true;
     if (attempt + 1 < attempts) await fx.wait(retryMs);
   }
-  return !fx.isLive(sessionName);
+  return fx.probeLive(sessionName) === 'gone';
 }
 
 function tmuxPanePid(sessionName: string): number | undefined {
@@ -268,13 +380,20 @@ function tmuxPanePid(sessionName: string): number | undefined {
  *  daemon-restart resume never force-respawns a possibly-mid-turn native pane.
  *  This is a live-argv check, not a persisted marker, so there is no stale-marker
  *  hazard. Probes are injectable for tests (defaults hit the real OS/tmux). */
-export function paneRunsRemoteTui(persistentSessionName: string, probes: PaneProbes = {}): boolean {
+export function paneRunsRemoteTui(
+  persistentSessionName: string,
+  probes: PaneProbes = {},
+  expectedExecutable?: string,
+): boolean {
   const panePidOf = probes.panePidOf ?? tmuxPanePid;
   const argvOf = probes.argvOf ?? readCmdline;
   const commOf = probes.commOf ?? readComm;
   const childrenOf = probes.childrenOf ?? getChildPids;
   const panePid = panePidOf(persistentSessionName);
   if (panePid === undefined || !Number.isInteger(panePid) || panePid <= 0) return false;
+  const expectedNames = expectedExecutable
+    ? new Set([executableName(expectedExecutable)])
+    : new Set(['codex', 'traex']);
   let frontier = [panePid];
   const seen = new Set<number>();
   for (let depth = 0; depth <= 4 && frontier.length; depth++) {
@@ -284,8 +403,17 @@ export function paneRunsRemoteTui(persistentSessionName: string, probes: PanePro
       seen.add(pid);
       const argv = argvOf(pid);
       if (argv.length) {
-        const comm = commOf(pid) ?? '';
-        const isCodexFamily = /^(codex|traex)/i.test(comm) || argv.some(a => /(?:^|\/)(codex|traex)$/i.test(a));
+        // Probe each process once: /proc can disappear between reads, and
+        // injected probes are allowed to be stateful in tests.
+        const rawComm = commOf(pid) ?? '';
+        const comm = executableName(rawComm);
+        const isCodexFamily = expectedNames.has(comm)
+          // npm-installed CLIs commonly appear behind node flags. Reuse adopt
+          // discovery's constrained executable-slot parser so a known launcher
+          // shape is recognized without letting arbitrary later arguments
+          // establish pane ownership.
+          || processExecutableArgvSlots(rawComm, argv)
+            .some((arg) => expectedNames.has(executableName(arg)));
         if (isCodexFamily && argv.includes('--remote')) return true;
       }
       next.push(...childrenOf(pid));

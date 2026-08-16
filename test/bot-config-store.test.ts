@@ -87,6 +87,41 @@ describe('bot-config store', () => {
     expect(keys).toContain('skills');
     expect(keys).toContain('silentTurnReactions');
     expect(keys).toContain('codexAppCleanInput');
+    expect(keys).toContain('feedback');
+  });
+
+  it('strictly normalizes feedback JSON through the shared config field', async () => {
+    const { store } = await loaded();
+    const spec = store.findConfigField('feedback')!;
+    expect(store.coerceConfigValue(spec, '{"enabled":true}')).toMatchObject({
+      ok: true,
+      value: { enabled: true, audience: 'requester' },
+    });
+    expect(store.coerceConfigValue(spec, '{"enabled":true,"audience":"all"}')).toEqual({ ok: false, reason: 'invalid_json' });
+  });
+
+  it('persists bot and per-chat feedback layers and updates the live registry', async () => {
+    const { registry, store } = await loaded();
+    expect(await store.setBotFeedbackPolicy('app_default', { enabled: true, allowReselect: true })).toMatchObject({ ok: true });
+    expect(readConfig().feedback).toMatchObject({ enabled: true, allowReselect: true });
+    expect(registry.getBot('app_default').config.feedback).toMatchObject({ enabled: true, allowReselect: true });
+
+    expect(await store.setChatFeedbackPolicy('app_default', 'oc_chat', { enabled: false })).toMatchObject({ ok: true });
+    expect(readConfig().chatFeedbackPolicies.oc_chat).toEqual({ enabled: false });
+    expect(registry.getBot('app_default').config.chatFeedbackPolicies?.oc_chat).toEqual({ enabled: false });
+
+    expect(await store.setChatFeedbackPolicy('app_default', 'oc_chat', null)).toMatchObject({ ok: true });
+    expect(readConfig().chatFeedbackPolicies).toBeUndefined();
+    expect(registry.getBot('app_default').config.chatFeedbackPolicies).toBeUndefined();
+  });
+
+  it('rejects invalid feedback layers without changing disk or live memory', async () => {
+    const { registry, store } = await loaded({ feedback: { enabled: true } });
+    const beforeDisk = readConfig();
+    const beforeMemory = structuredClone(registry.getBot('app_default').config);
+    expect(await store.setChatFeedbackPolicy('app_default', 'oc_chat', { buttons: {} } as any)).toMatchObject({ ok: false, reason: 'invalid_policy' });
+    expect(readConfig()).toEqual(beforeDisk);
+    expect(registry.getBot('app_default').config).toEqual(beforeMemory);
   });
 
   it('parseBooleanValue accepts on/off variants and rejects junk', async () => {
@@ -388,6 +423,33 @@ describe('bot-config store', () => {
     await store.applyConfigField('app_default', spec, false);
     expect(readConfig().disableStreamingCard).toBeUndefined();
     expect(registry.getBot('app_default').config.disableStreamingCard).toBeUndefined();
+  });
+
+  it('usageDisplay is an immediate three-state enum persisted verbatim, cleared via unset', async () => {
+    const { registry, store } = await loaded();
+    const spec = store.findConfigField('usageDisplay')!;
+    expect(spec.effect).toBe('immediate');
+    expect(spec.kind).toBe('enum');
+    expect(spec.clearable).toBe(true);
+    expect(spec.enumValues).toEqual(['streaming', 'footer', 'off']);
+
+    // coerce validates the enum (case-insensitive) and rejects nonsense.
+    expect(store.coerceConfigValue(spec, 'footer')).toEqual({ ok: true, value: 'footer' });
+    expect(store.coerceConfigValue(spec, 'nonsense')).toEqual({ ok: false, reason: 'invalid_enum' });
+
+    const toFooter = await store.applyConfigField('app_default', spec, 'footer');
+    expect(toFooter).toMatchObject({ ok: true, newText: 'footer', effect: 'immediate' });
+    expect(readConfig().usageDisplay).toBe('footer');
+    expect(registry.getBot('app_default').config.usageDisplay).toBe('footer');
+
+    const toOff = await store.applyConfigField('app_default', spec, 'off');
+    expect(toOff).toMatchObject({ ok: true, newText: 'off' });
+    expect(readConfig().usageDisplay).toBe('off');
+
+    // Clearing (unset) drops the key → back to the default 'streaming'.
+    await store.applyConfigField('app_default', spec, null);
+    expect(readConfig().usageDisplay).toBeUndefined();
+    expect(registry.getBot('app_default').config.usageDisplay).toBeUndefined();
   });
 
   it('codexAppCleanInput is immediate, default-off, and deletes its key when disabled', async () => {

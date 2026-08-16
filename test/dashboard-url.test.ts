@@ -9,21 +9,36 @@ vi.mock('../src/global-config.js', () => ({
 vi.mock('../src/platform/binding.js', () => ({
   platformMachineBaseUrl: vi.fn(() => null),
   publicReverseProxyBaseUrl: vi.fn(() => null),
+  readPlatformBinding: vi.fn(() => null),
 }));
 
-import { buildDashboardUrl, buildDashboardUrls } from '../src/core/dashboard-url.js';
+import {
+  buildDashboardUrl,
+  buildDashboardUrls,
+  buildPlatformDashboardLoginUrl,
+  buildV3RunDetailUrl,
+  formatUrlHost,
+} from '../src/core/dashboard-url.js';
 import { isRemoteAccessEnabled } from '../src/global-config.js';
-import { platformMachineBaseUrl, publicReverseProxyBaseUrl } from '../src/platform/binding.js';
+import {
+  platformMachineBaseUrl,
+  publicReverseProxyBaseUrl,
+  readPlatformBinding,
+} from '../src/platform/binding.js';
 
 const setRemote = (on: boolean) => vi.mocked(isRemoteAccessEnabled).mockReturnValue(on);
 const setPlatform = (base: string | null) => vi.mocked(platformMachineBaseUrl).mockReturnValue(base);
 const setPublic = (base: string | null) => vi.mocked(publicReverseProxyBaseUrl).mockReturnValue(base);
+const setBinding = (binding: ReturnType<typeof readPlatformBinding>) => (
+  vi.mocked(readPlatformBinding).mockReturnValue(binding)
+);
 
 describe('buildDashboardUrl', () => {
   beforeEach(() => {
     setRemote(false);
     setPlatform(null);
     setPublic(null);
+    setBinding(null);
   });
 
   it('builds a local host:port URL with token when remote access is off', () => {
@@ -132,5 +147,141 @@ describe('buildDashboardUrls', () => {
       url: 'https://botmux.example.com/?t=abc',
       localUrl: 'http://1.2.3.4:7891/?t=abc',
     });
+  });
+
+  it('brackets an IPv6 literal host so the URL is valid', () => {
+    const { url } = buildDashboardUrls({ host: '::1', port: 7891, token: 'abc' });
+    expect(url).toBe('http://[::1]:7891/?t=abc');
+    expect(() => new URL(url)).not.toThrow();
+  });
+});
+
+describe('formatUrlHost', () => {
+  it('brackets a bare IPv6 literal', () => {
+    expect(formatUrlHost('::1')).toBe('[::1]');
+    expect(formatUrlHost('fe80::1')).toBe('[fe80::1]');
+    expect(formatUrlHost('::ffff:1.2.3.4')).toBe('[::ffff:1.2.3.4]');
+    expect(formatUrlHost('FE80::1')).toBe('[FE80::1]');
+  });
+
+  it('leaves IPv4, hostnames, and already-bracketed literals unchanged', () => {
+    expect(formatUrlHost('127.0.0.1')).toBe('127.0.0.1');
+    expect(formatUrlHost('dash.example.com')).toBe('dash.example.com');
+    expect(formatUrlHost('[::1]')).toBe('[::1]');
+  });
+
+  // The invariant every host→URL exit site shares (dashboard link, v3 cards,
+  // federation, web terminal): a formatted host interpolated into a URL must
+  // always parse. Guards copy-paste exits that forget to wrap.
+  it('any formatted host interpolates into a parseable URL', () => {
+    for (const host of ['::1', 'fe80::1', '::ffff:1.2.3.4', '127.0.0.1', 'dash.example.com']) {
+      const h = formatUrlHost(host);
+      expect(() => new URL(`http://${h}:7891/#/v3/run-1`)).not.toThrow();
+    }
+  });
+});
+
+describe('buildPlatformDashboardLoginUrl', () => {
+  beforeEach(() => {
+    setRemote(false);
+    setBinding(null);
+  });
+
+  it('builds a token-free platform owner-login URL with a safe root fallback', () => {
+    setRemote(true);
+    setBinding({
+      platformUrl: 'https://platform.example',
+      machineId: 'm-1',
+      machineToken: 'machine-secret',
+    });
+    expect(buildPlatformDashboardLoginUrl()).toBe(
+      'https://platform.example/open/m-1?next=%2F%23%2F',
+    );
+    expect(buildPlatformDashboardLoginUrl()).not.toContain('machine-secret');
+  });
+
+  it('is unavailable unless remote access and a platform binding are both present', () => {
+    setBinding({ platformUrl: 'https://platform.example', machineId: 'm-1', machineToken: 'secret' });
+    expect(buildPlatformDashboardLoginUrl()).toBeUndefined();
+    setRemote(true);
+    setBinding(null);
+    expect(buildPlatformDashboardLoginUrl()).toBeUndefined();
+  });
+
+  it('rejects a non-http platform binding and safely encodes the machine id path segment', () => {
+    setRemote(true);
+    setBinding({ platformUrl: 'file:///tmp/platform', machineId: 'm/1', machineToken: 'secret' });
+    expect(buildPlatformDashboardLoginUrl()).toBeUndefined();
+    setBinding({ platformUrl: 'https://platform.example/base', machineId: 'm/1', machineToken: 'secret' });
+    expect(buildPlatformDashboardLoginUrl()).toContain('/open/m%2F1?');
+  });
+});
+
+describe('buildV3RunDetailUrl', () => {
+  // Mirrors the buildDashboardUrls flip so a REMOTE recipient tapping a v3
+  // card's「Web 详情」can actually reach the SPA (→ 401 → one-click login),
+  // instead of the old always-LAN link that was unreachable off-LAN.
+  beforeEach(() => {
+    setRemote(false);
+    setPlatform(null);
+    setPublic(null);
+  });
+
+  const opts = { host: '1.2.3.4', port: 7891 };
+
+  it('stays local host:port when remote access is off', () => {
+    expect(buildV3RunDetailUrl('run-1', opts)).toBe('http://1.2.3.4:7891/#/v3/run-1');
+  });
+
+  it('stays local when remote access is on but the host is not bound', () => {
+    setRemote(true);
+    setPlatform(null);
+    expect(buildV3RunDetailUrl('run-1', opts)).toBe('http://1.2.3.4:7891/#/v3/run-1');
+  });
+
+  it('stays local when bound but remote access is off (switch gates it)', () => {
+    setRemote(false);
+    setPlatform('https://m-deadbeef.botmux.example');
+    expect(buildV3RunDetailUrl('run-1', opts)).toBe('http://1.2.3.4:7891/#/v3/run-1');
+  });
+
+  it('routes through the platform machine subdomain when remote access is on and bound', () => {
+    setRemote(true);
+    setPlatform('https://m-deadbeef.botmux.example');
+    expect(buildV3RunDetailUrl('run-1', opts)).toBe(
+      'https://m-deadbeef.botmux.example/#/v3/run-1',
+    );
+  });
+
+  it('routes through BOTMUX_PUBLIC_URL when set and no platform (self-hosted nginx)', () => {
+    setPublic('https://botmux.example.com');
+    expect(buildV3RunDetailUrl('run-1', opts)).toBe('https://botmux.example.com/#/v3/run-1');
+  });
+
+  it('lets the platform subdomain win over BOTMUX_PUBLIC_URL when both apply', () => {
+    setRemote(true);
+    setPlatform('https://m-deadbeef.botmux.example');
+    setPublic('https://botmux.example.com');
+    expect(buildV3RunDetailUrl('run-1', opts)).toBe(
+      'https://m-deadbeef.botmux.example/#/v3/run-1',
+    );
+  });
+
+  it('never appends a token and URL-encodes the runId (both local and platform)', () => {
+    expect(buildV3RunDetailUrl('run with space', opts)).toBe(
+      'http://1.2.3.4:7891/#/v3/run%20with%20space',
+    );
+    setRemote(true);
+    setPlatform('https://m-deadbeef.botmux.example');
+    const url = buildV3RunDetailUrl('run with space', opts);
+    expect(url).toBe('https://m-deadbeef.botmux.example/#/v3/run%20with%20space');
+    expect(url).not.toContain('?t=');
+    expect(url).not.toContain('token');
+  });
+
+  it('brackets an IPv6 literal host in the local form', () => {
+    expect(buildV3RunDetailUrl('run-1', { host: '::1', port: 7891 })).toBe(
+      'http://[::1]:7891/#/v3/run-1',
+    );
   });
 });

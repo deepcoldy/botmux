@@ -3,15 +3,18 @@ import { createHmac } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
 import {
-  mkdirSync, mkdtempSync, rmSync, writeFileSync, existsSync, statSync,
+  chmodSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync,
+  symlinkSync, writeFileSync, existsSync, statSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   verifyHmac, generateToken, parseCookie, decideDashboardAuth,
   decideWorkbenchH5Auth, workbenchH5Capability,
-  loadPersistedToken, persistToken, loadDashboardSecret, loadOrCreateDashboardSecret,
+  loadPersistedToken, loadOrCreatePersistedToken, persistToken, rotatePersistedToken,
+  loadDashboardSecret, loadOrCreateDashboardSecret, describeDashboardTokenError,
 } from '../src/dashboard/auth.js';
+import { UnsafeHostAuthorityFileError } from '../src/platform/secure-host-file.js';
 
 const SECRET = 'a'.repeat(43); // base64url 32 bytes
 
@@ -64,7 +67,142 @@ describe('generateToken', () => {
   });
 });
 
-describe('token persistence (survives restart, rotates only on `botmux dashboard`)', () => {
+describe('describeDashboardTokenError', () => {
+  const TP = '/home/u/.botmux/.dashboard-token';
+
+  // The function branches on process.platform (POSIX command vs prose). Default
+  // the whole block to a POSIX view so the common-case assertions are stable on
+  // any host; the win32 cases override it explicitly and restore after.
+  let platformSpy: ReturnType<typeof vi.spyOn> | undefined;
+  const asPlatform = (p: NodeJS.Platform) => {
+    platformSpy?.mockRestore();
+    platformSpy = vi.spyOn(process, 'platform', 'get').mockReturnValue(p);
+  };
+  beforeEach(() => asPlatform('linux'));
+  afterEach(() => { platformSpy?.mockRestore(); platformSpy = undefined; });
+
+  it('keeps the bare stable code for non-credential errors', () => {
+    expect(describeDashboardTokenError('token_unavailable', new Error('boom'), TP))
+      .toEqual({ error: 'token_unavailable' });
+    // Preserve the machine code so programmatic callers are unaffected.
+    expect(describeDashboardTokenError('token_persist_failed', undefined, TP))
+      .toEqual({ error: 'token_persist_failed' });
+  });
+
+  it('surfaces a group/other-writable dir reason with a chmod 700 (dir) hint', () => {
+    const out = describeDashboardTokenError(
+      'token_unavailable',
+      new UnsafeHostAuthorityFileError('宿主凭证目录可被组内或其它用户写入'),
+      TP,
+    );
+    expect(out.error).toBe('token_unavailable'); // stable code preserved
+    expect(out.reason).toBe('宿主凭证目录可被组内或其它用户写入');
+    expect(out.hint).toContain('chmod 700 /home/u/.botmux');
+  });
+
+  it('a wrong-owner DIRECTORY gets the chmod 700 dir hint', () => {
+    const out = describeDashboardTokenError(
+      'token_unavailable',
+      new UnsafeHostAuthorityFileError('宿主凭证目录 不属于当前用户'),
+      TP,
+    );
+    expect(out.hint).toContain('chmod 700 /home/u/.botmux');
+  });
+
+  it('a wrong-owner FILE does NOT get a chmod hint (chmod cannot fix ownership) but an rm-to-regenerate hint', () => {
+    const out = describeDashboardTokenError(
+      'token_persist_failed',
+      // secure-host-file throws `${label} 不属于当前用户` with label 宿主凭证文件.
+      new UnsafeHostAuthorityFileError('宿主凭证文件 不属于当前用户'),
+      TP,
+    );
+    expect(out.reason).toBe('宿主凭证文件 不属于当前用户');
+    expect(out.hint).not.toContain('chmod'); // the pre-fix bug: told user to chmod the dir
+    expect(out.hint).toContain(`rm -f ${TP}`);
+  });
+
+  it('surfaces a wrong-mode token reason with a chmod 600 hint', () => {
+    const out = describeDashboardTokenError(
+      'token_persist_failed',
+      new UnsafeHostAuthorityFileError('宿主凭证文件权限必须严格为 0600'),
+      TP,
+    );
+    expect(out.reason).toBe('宿主凭证文件权限必须严格为 0600');
+    expect(out.hint).toContain(`chmod 600 ${TP}`);
+  });
+
+  it('a symlink (ELOOP) gets a definite rm -f hint', () => {
+    const out = describeDashboardTokenError(
+      'token_persist_failed',
+      new UnsafeHostAuthorityFileError('宿主凭证拒绝符号链接'),
+      TP,
+    );
+    expect(out.hint).toContain(`rm -f ${TP}`);
+  });
+
+  it('a non-regular file of unknown kind degrades to an inspection step, NOT a blind rm -f (a dir leaf would fail "Is a directory")', () => {
+    const out = describeDashboardTokenError(
+      'token_persist_failed',
+      new UnsafeHostAuthorityFileError('宿主凭证必须是普通文件'),
+      TP,
+    );
+    expect(out.reason).toBe('宿主凭证必须是普通文件');
+    expect(out.hint).not.toContain('rm -f'); // the pre-fix bug: `rm -f` on a dir leaf
+    expect(out.hint).toContain(`ls -ld ${TP}`);
+  });
+
+  it('surfaces an unsafe-ancestor reason without inventing a chmod on the leaf', () => {
+    const out = describeDashboardTokenError(
+      'token_persist_failed',
+      new UnsafeHostAuthorityFileError('宿主凭证目录可被不可信祖先目录替换'),
+      TP,
+    );
+    expect(out.reason).toBe('宿主凭证目录可被不可信祖先目录替换');
+    expect(out.hint).toContain('祖先');
+  });
+
+  it('shell-quotes paths with spaces/metacharacters in the copy-paste command', () => {
+    const spaced = '/home/u/My Botmux/.dashboard-token';
+    const out = describeDashboardTokenError(
+      'token_persist_failed',
+      new UnsafeHostAuthorityFileError('宿主凭证文件权限必须严格为 0600'),
+      spaced,
+    );
+    // Quoted so the command survives a copy-paste; the raw path may still appear
+    // in prose, but the command token itself must be the quoted form.
+    expect(out.hint).toContain(`chmod 600 '${spaced}'`);
+  });
+
+  it('on win32 emits prose, never an unusable chmod/rm one-liner', () => {
+    asPlatform('win32');
+    const chmodCase = describeDashboardTokenError(
+      'token_unavailable',
+      new UnsafeHostAuthorityFileError('宿主凭证目录可被组内或其它用户写入'),
+      'C:\\Users\\u\\.botmux\\.dashboard-token',
+    );
+    expect(chmodCase.hint).toBeTruthy();
+    expect(chmodCase.hint).not.toMatch(/chmod|rm -f/);
+    const rmCase = describeDashboardTokenError(
+      'token_persist_failed',
+      new UnsafeHostAuthorityFileError('宿主凭证拒绝符号链接'),
+      'C:\\Users\\u\\.botmux\\.dashboard-token',
+    );
+    expect(rmCase.hint).toBeTruthy();
+    expect(rmCase.hint).not.toMatch(/chmod|rm -f/);
+  });
+
+  it('an unmapped credential reason still surfaces the reason verbatim with no hint', () => {
+    const out = describeDashboardTokenError(
+      'token_persist_failed',
+      new UnsafeHostAuthorityFileError('宿主凭证文件大小异常'),
+      TP,
+    );
+    expect(out.reason).toBe('宿主凭证文件大小异常');
+    expect(out.hint).toBeUndefined();
+  });
+});
+
+describe('token persistence (survives restart, rotates only on `botmux dashboard rotate`)', () => {
   let dir: string;
   let tokenPath: string;
 
@@ -84,6 +222,67 @@ describe('token persistence (survives restart, rotates only on `botmux dashboard
     expect(loadPersistedToken(tokenPath)).toBe(tok);
   });
 
+  it('loadOrCreatePersistedToken creates and persists a missing token', () => {
+    const tok = loadOrCreatePersistedToken(tokenPath);
+    expect(tok).toMatch(/^[A-Za-z0-9_-]{43}$/);
+    expect(loadPersistedToken(tokenPath)).toBe(tok);
+    expect(statSync(tokenPath).mode & 0o777).toBe(0o600);
+  });
+
+  it('loadOrCreatePersistedToken reuses an existing token without rotating it', () => {
+    persistToken(tokenPath, 'existing-token');
+    expect(loadOrCreatePersistedToken(tokenPath)).toBe('existing-token');
+    expect(loadPersistedToken(tokenPath)).toBe('existing-token');
+  });
+
+  it('concurrent processes creating the first token all return the persisted winner', async () => {
+    const goPath = join(dir, 'go');
+    const authModuleUrl = new URL('../src/dashboard/auth.ts', import.meta.url).href;
+    const childSource = `
+      import { existsSync, writeFileSync } from 'node:fs';
+      const [tokenPath, readyPath, goPath] = process.argv.slice(1);
+      const { loadOrCreatePersistedToken } = await import(${JSON.stringify(authModuleUrl)});
+      writeFileSync(readyPath, 'ready');
+      while (!existsSync(goPath)) await new Promise(resolve => setTimeout(resolve, 5));
+      process.stdout.write(loadOrCreatePersistedToken(tokenPath));
+    `;
+    const children = Array.from({ length: 12 }, (_, index) => {
+      const readyPath = join(dir, `token-ready-${index}`);
+      const child = spawn(process.execPath, [
+        '--import', 'tsx', '--input-type=module', '-e', childSource,
+        tokenPath, readyPath, goPath,
+      ], { stdio: ['ignore', 'pipe', 'pipe'] });
+      let stdout = '';
+      let stderr = '';
+      child.stdout.on('data', chunk => { stdout += String(chunk); });
+      child.stderr.on('data', chunk => { stderr += String(chunk); });
+      return { child, readyPath, stdout: () => stdout, stderr: () => stderr };
+    });
+
+    try {
+      const deadline = Date.now() + 10_000;
+      while (!children.every(entry => existsSync(entry.readyPath))) {
+        if (Date.now() >= deadline) throw new Error('token children did not reach barrier');
+        await new Promise(resolve => setTimeout(resolve, 10));
+      }
+      writeFileSync(goPath, 'go');
+      const exits = await Promise.all(children.map(async entry => {
+        const [code, signal] = await once(entry.child, 'close');
+        return { code, signal, stdout: entry.stdout(), stderr: entry.stderr() };
+      }));
+      for (const result of exits) {
+        expect(result, result.stderr).toMatchObject({ code: 0, signal: null });
+      }
+      const tokens = exits.map(result => result.stdout);
+      expect(new Set(tokens).size).toBe(1);
+      expect(tokens[0]).toBe(loadPersistedToken(tokenPath));
+    } finally {
+      for (const { child } of children) {
+        if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+      }
+    }
+  }, 20_000);
+
   it('persisted token survives a simulated restart (same file, new process)', () => {
     const tok = generateToken();
     persistToken(tokenPath, tok);
@@ -91,11 +290,10 @@ describe('token persistence (survives restart, rotates only on `botmux dashboard
     expect(loadPersistedToken(tokenPath)).toBe(tok);
   });
 
-  it('re-running `botmux dashboard` overwrites the old token (old link invalidated)', () => {
+  it('running `botmux dashboard rotate` overwrites the old token (old link invalidated)', () => {
     const first = generateToken();
     persistToken(tokenPath, first);
-    const second = generateToken();
-    persistToken(tokenPath, second);
+    const second = rotatePersistedToken(tokenPath);
     expect(second).not.toBe(first);
     expect(loadPersistedToken(tokenPath)).toBe(second);
   });
@@ -105,23 +303,195 @@ describe('token persistence (survives restart, rotates only on `botmux dashboard
     expect(statSync(tokenPath).mode & 0o777).toBe(0o600);
   });
 
+  it('refuses rotation through a token leaf symlink without modifying its target', () => {
+    if (process.platform === 'win32') return;
+    mkdirSync(join(dir, 'nested'));
+    const victim = join(dir, 'victim');
+    writeFileSync(victim, 'keep-me', { mode: 0o600 });
+    symlinkSync(victim, tokenPath);
+
+    expect(() => rotatePersistedToken(tokenPath)).toThrow();
+    expect(readFileSync(victim, 'utf8')).toBe('keep-me');
+  });
+
   it('loadPersistedToken trims surrounding whitespace/newlines', () => {
     const p = join(dir, 'spaced-token');
-    writeFileSync(p, '  tok-with-space\n');
+    writeFileSync(p, '  tok-with-space\n', { mode: 0o600 });
     expect(loadPersistedToken(p)).toBe('tok-with-space');
   });
 
   it('loadPersistedToken returns null for an empty file', () => {
     const p = join(dir, 'empty-token');
-    writeFileSync(p, '   \n');
+    writeFileSync(p, '   \n', { mode: 0o600 });
     expect(loadPersistedToken(p)).toBeNull();
     expect(existsSync(p)).toBe(true);
   });
 
-  it('loadPersistedToken returns null when path is a directory (unreadable)', () => {
-    // dir itself exists but is not a file — read throws, helper swallows.
-    expect(loadPersistedToken(dir)).toBeNull();
+  it('loadPersistedToken fails closed when the credential path is not a regular file', () => {
+    expect(() => loadPersistedToken(dir)).toThrow();
   });
+});
+
+/**
+ * Regression: dashboard token ensure/rotate on a Linux dev box whose HOME is a
+ * symlink resolving onto a shared drive / 0777 ancestor. Before the FD-anchored
+ * fix, loadOrCreatePersistedToken()/rotatePersistedToken() ran the strict
+ * ancestor-chain assertion (via secureHostFilePath) before reaching the Linux
+ * FD-pinning path, so a single writable ancestor made `botmux dashboard` fail
+ * with `500 token_persist_failed` even though the direct write path succeeded.
+ */
+describe('token persistence under a symlinked HOME on a shared drive (Linux FD-pinning)', () => {
+  let base: string;
+
+  beforeEach(() => { base = mkdtempSync(join(tmpdir(), 'botmux-token-shared-')); });
+  afterEach(() => { rmSync(base, { recursive: true, force: true }); });
+
+  /**
+   * Build `<shared 0777>/real-home/.botmux` (0700, current user) and a HOME
+   * symlink pointing at real-home. Returns the token path as seen through the
+   * symlinked HOME plus the canonical (post-realpath) leaf path.
+   */
+  function sharedDriveHome(): { tokenPath: string; canonicalLeaf: string; botmux: string } {
+    const shared = join(base, 'shared');
+    mkdirSync(shared, { recursive: true });
+    chmodSync(shared, 0o777); // shared drive / group+other-writable ancestor
+    const realHome = join(shared, 'real-home');
+    mkdirSync(realHome, { recursive: true });
+    const botmux = join(realHome, '.botmux');
+    mkdirSync(botmux, { mode: 0o700 });
+    chmodSync(botmux, 0o700); // defeat umask so the dir is exactly 0700
+    const homeLink = join(base, 'home-link');
+    symlinkSync(realHome, homeLink);
+    return {
+      tokenPath: join(homeLink, '.botmux', '.dashboard-token'),
+      canonicalLeaf: join(realHome, '.botmux', '.dashboard-token'),
+      botmux,
+    };
+  }
+
+  it('ensures a token under a 0777 ancestor; leaf lands in the real dir at 0600', () => {
+    if (process.platform !== 'linux') return;
+    const { tokenPath, canonicalLeaf } = sharedDriveHome();
+
+    const token = loadOrCreatePersistedToken(tokenPath);
+    expect(token).toMatch(/^[A-Za-z0-9_-]{43}$/);
+    // Persisted through the symlink into the real (canonical) directory.
+    expect(readFileSync(canonicalLeaf, 'utf8').trim()).toBe(token);
+    expect(lstatSync(canonicalLeaf).mode & 0o777).toBe(0o600);
+    // Re-ensure reuses the same durable token instead of minting a new one.
+    expect(loadOrCreatePersistedToken(tokenPath)).toBe(token);
+    expect(loadPersistedToken(tokenPath)).toBe(token);
+  });
+
+  it('rotates the token under the same shared-drive path', () => {
+    if (process.platform !== 'linux') return;
+    const { tokenPath, canonicalLeaf } = sharedDriveHome();
+
+    const first = loadOrCreatePersistedToken(tokenPath);
+    const rotated = rotatePersistedToken(tokenPath);
+    expect(rotated).not.toBe(first);
+    expect(rotated).toMatch(/^[A-Za-z0-9_-]{43}$/);
+    expect(readFileSync(canonicalLeaf, 'utf8').trim()).toBe(rotated);
+    expect(lstatSync(canonicalLeaf).mode & 0o777).toBe(0o600);
+    expect(loadPersistedToken(tokenPath)).toBe(rotated);
+  });
+
+  it('ensures a token through a HOME symlink to a permission-safe plain dir', () => {
+    if (process.platform === 'win32') return;
+    // Safe layout: no writable ancestor, HOME is just a symlink indirection.
+    const realHome = join(base, 'real-home');
+    mkdirSync(join(realHome, '.botmux'), { recursive: true, mode: 0o700 });
+    chmodSync(join(realHome, '.botmux'), 0o700);
+    const homeLink = join(base, 'home-link');
+    symlinkSync(realHome, homeLink);
+    const tokenPath = join(homeLink, '.botmux', '.dashboard-token');
+
+    const token = loadOrCreatePersistedToken(tokenPath);
+    expect(token).toMatch(/^[A-Za-z0-9_-]{43}$/);
+    expect(readFileSync(join(realHome, '.botmux', '.dashboard-token'), 'utf8').trim()).toBe(token);
+    expect(rotatePersistedToken(tokenPath)).not.toBe(token);
+  });
+
+  it('still refuses a token leaf symlink under a shared-drive HOME (target untouched)', () => {
+    if (process.platform === 'win32') return;
+    const { tokenPath, botmux } = sharedDriveHome();
+    const victim = join(botmux, 'victim');
+    writeFileSync(victim, 'keep-me', { mode: 0o600 });
+    symlinkSync(victim, realpathSync(botmux) + '/.dashboard-token');
+
+    expect(() => rotatePersistedToken(tokenPath)).toThrow();
+    expect(() => loadOrCreatePersistedToken(tokenPath)).toThrow();
+    expect(readFileSync(victim, 'utf8')).toBe('keep-me');
+  });
+
+  it('still refuses when ~/.botmux itself is group/other-writable', () => {
+    if (process.platform === 'win32') return;
+    const shared = join(base, 'shared');
+    mkdirSync(shared, { recursive: true });
+    chmodSync(shared, 0o777);
+    const realHome = join(shared, 'real-home');
+    const botmux = join(realHome, '.botmux');
+    mkdirSync(botmux, { recursive: true });
+    chmodSync(botmux, 0o770); // the credential dir itself is group-writable → unsafe
+    const homeLink = join(base, 'home-link');
+    symlinkSync(realHome, homeLink);
+    const tokenPath = join(homeLink, '.botmux', '.dashboard-token');
+
+    expect(() => loadOrCreatePersistedToken(tokenPath)).toThrow(/组内|其它用户写入/);
+    expect(() => rotatePersistedToken(tokenPath)).toThrow(/组内|其它用户写入/);
+  });
+
+  it('concurrent processes under a shared-drive symlinked HOME all return one token', async () => {
+    if (process.platform !== 'linux') return;
+    const { tokenPath, canonicalLeaf } = sharedDriveHome();
+    const goPath = join(base, 'go');
+    const authModuleUrl = new URL('../src/dashboard/auth.ts', import.meta.url).href;
+    const childSource = `
+      import { existsSync, writeFileSync } from 'node:fs';
+      const [tokenPath, readyPath, goPath] = process.argv.slice(1);
+      const { loadOrCreatePersistedToken } = await import(${JSON.stringify(authModuleUrl)});
+      writeFileSync(readyPath, 'ready');
+      while (!existsSync(goPath)) await new Promise(resolve => setTimeout(resolve, 5));
+      process.stdout.write(loadOrCreatePersistedToken(tokenPath));
+    `;
+    const children = Array.from({ length: 12 }, (_, index) => {
+      const readyPath = join(base, `ready-${index}`);
+      const child = spawn(process.execPath, [
+        '--import', 'tsx', '--input-type=module', '-e', childSource,
+        tokenPath, readyPath, goPath,
+      ], { stdio: ['ignore', 'pipe', 'pipe'] });
+      let stdout = '';
+      let stderr = '';
+      child.stdout.on('data', chunk => { stdout += String(chunk); });
+      child.stderr.on('data', chunk => { stderr += String(chunk); });
+      return { child, readyPath, stdout: () => stdout, stderr: () => stderr };
+    });
+
+    try {
+      const deadline = Date.now() + 10_000;
+      while (!children.every(entry => existsSync(entry.readyPath))) {
+        if (Date.now() >= deadline) throw new Error('token children did not reach barrier');
+        await new Promise(resolve => setTimeout(resolve, 10));
+      }
+      writeFileSync(goPath, 'go');
+      const exits = await Promise.all(children.map(async entry => {
+        const [code, signal] = await once(entry.child, 'close');
+        return { code, signal, stdout: entry.stdout(), stderr: entry.stderr() };
+      }));
+      for (const result of exits) {
+        expect(result, result.stderr).toMatchObject({ code: 0, signal: null });
+      }
+      const tokens = exits.map(result => result.stdout);
+      expect(new Set(tokens).size).toBe(1);
+      expect(tokens[0]).toMatch(/^[A-Za-z0-9_-]{43}$/);
+      // The single durable winner is what the real (canonical) leaf holds.
+      expect(readFileSync(canonicalLeaf, 'utf8').trim()).toBe(tokens[0]);
+    } finally {
+      for (const { child } of children) {
+        if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+      }
+    }
+  }, 20_000);
 });
 
 describe('dashboard secret persistence', () => {
@@ -518,7 +888,7 @@ describe('decideDashboardAuth — ?t=<token> cookie set redirect', () => {
     expect(d.kind).toBe('allow');
   });
 
-  it('empty active token never authenticates (server not yet rotated)', () => {
+  it('empty active token never authenticates (server has not created one yet)', () => {
     const d = decideDashboardAuth({
       method: 'POST',
       pathname: '/api/workflows/run-1/cancel',
@@ -573,6 +943,14 @@ describe('decideDashboardAuth — publicReadOnly mode', () => {
     expect(d.kind).toBe('deny401');
   });
 
+  it('publicReadOnly off → tokenless dashboard summary stays private', () => {
+    const d = decideDashboardAuth({
+      method: 'GET', pathname: '/api/dashboard/v1/summary', hasTokenParam: false,
+      presentedToken: undefined, activeToken: TOK, publicReadOnly: false,
+    });
+    expect(d.kind).toBe('deny401');
+  });
+
   it('stale token GET behaves like tokenless read-only (no 401 wall)', () => {
     const d = decideDashboardAuth({
       method: 'GET', pathname: '/api/schedules', hasTokenParam: false,
@@ -588,6 +966,10 @@ describe('decideDashboardAuth — publicReadOnly mode', () => {
       '/api/webhook-secrets',
       '/api/trigger-logs',
       '/api/trigger-logs/summary',
+      '/api/feedback/analytics/summary',
+      '/api/feedback/analytics/trend',
+      '/api/feedback/analytics/reasons',
+      '/api/feedback/analytics/deliveries',
       '/api/bot-onboarding/ob-1',
       // Allow-list is fail-closed: these read endpoints are NOT public-readable
       // (role/persona content, per-bot oncall config, CLI option metadata).
@@ -621,7 +1003,7 @@ describe('decideDashboardAuth — publicReadOnly mode', () => {
   });
 
   it('allow-listed watch-work reads are public in publicReadOnly', () => {
-    for (const pathname of ['/api/sessions', '/api/schedules', '/api/settings', '/api/groups', '/events']) {
+    for (const pathname of ['/api/dashboard/v1/summary', '/api/sessions', '/api/schedules', '/api/settings', '/api/groups', '/events']) {
       const d = decideDashboardAuth({
         method: 'GET', pathname, hasTokenParam: false,
         presentedToken: undefined, activeToken: TOK, publicReadOnly: true,

@@ -36,6 +36,7 @@ import {
   type GroupsActionDeps,
   type HandlerResult,
 } from './groups-action-helpers.js';
+import { roleWriteShouldInvalidate } from './groups-matrix-snapshot.js';
 import {
   applySettingsWrite,
   type ResolvedDashboardSettingsView,
@@ -458,7 +459,10 @@ const ROUTES: RouteDef[] = [
           body: ctx.bodyRaw.length > 0 ? ctx.bodyRaw : '{}',
         },
       );
-      return { status: upstream.status, body: await readUpstream(upstream) };
+      const body = await readUpstream(upstream);
+      // 写角色翻转 hasRole → 失效群矩阵快照（对齐同文件的 oncall bind/unbind）。
+      if (roleWriteShouldInvalidate(upstream.ok, body)) deps.groupsActionDeps.invalidateGroups?.();
+      return { status: upstream.status, body };
     },
   },
   {
@@ -472,7 +476,10 @@ const ROUTES: RouteDef[] = [
         `/api/roles/${encodeURIComponent(chatId)}`,
         { method: 'DELETE' },
       );
-      return { status: upstream.status, body: await readUpstream(upstream) };
+      const body = await readUpstream(upstream);
+      // 删角色把 hasRole 翻回 false → 同样失效快照。
+      if (roleWriteShouldInvalidate(upstream.ok, body)) deps.groupsActionDeps.invalidateGroups?.();
+      return { status: upstream.status, body };
     },
   },
 

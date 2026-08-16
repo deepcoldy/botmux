@@ -9,6 +9,7 @@ import { readdirSync, readFileSync, readlinkSync, realpathSync } from 'node:fs';
 import { homedir, platform } from 'node:os';
 import { basename, join } from 'node:path';
 import type { CliId } from '../adapters/cli/types.js';
+import { executableBasename } from '../adapters/cli/runtime.js';
 import { findCodexRolloutByPid } from '../services/codex-transcript.js';
 import { findCocoSessionByPid } from '../services/coco-transcript.js';
 import { findTraexRolloutByPid } from '../services/traex-transcript.js';
@@ -63,6 +64,7 @@ const CLI_COMM_MAP: Record<string, CliId> = {
   traex: 'traex',
   gemini: 'gemini',
   opencode: 'opencode',
+  opencode2: 'opencode2',
   mtr: 'mtr',
   hermes: 'hermes',
   pi: 'pi',
@@ -72,13 +74,16 @@ const CLI_COMM_MAP: Record<string, CliId> = {
   // grok adopt 分支（transcript bridge / by-pid 绑定都依赖这个入口）。
   grok: 'grok',
   'kiro-cli': 'kiro-cli',
+  // The npm launcher appears as node/reasonix.js before its native child starts.
+  reasonix: 'reasonix',
+  'reasonix.js': 'reasonix',
 };
 
 /** Interpreters and native launchers that may hide the CLI identity in argv.
  *  Cursor Agent is one example on Linux: /proc/<pid>/comm can be `MainThread`
  *  while argv[0] is `/.../cursor-agent` or `/.../agent`. */
 const COMM_ARGV_LAUNCHERS = new Set([
-  'node', 'nodejs', 'bun', 'deno', 'python', 'python2', 'python3', 'ruby', 'npx', 'tsx',
+  'node', 'node.exe', 'nodejs', 'bun', 'deno', 'python', 'python2', 'python3', 'ruby', 'npx', 'tsx',
   'MainThread',
 ]);
 
@@ -136,8 +141,104 @@ export function bareShellLaunchKind(leafComm: string, expectedShell: string): 't
   return expectedShell && leafComm !== expectedShell ? 'trampoline' : 'stuck';
 }
 
-export function cliIdForComm(comm: string, filterCliId?: CliId): CliId | undefined {
+export interface BareShellLaunchGuidance {
+  rcFileHint: string;
+  manualTerminalGuard: string;
+}
+
+export function bareShellLaunchGuidance(leafComm: string, expectedShell: string): BareShellLaunchGuidance {
+  if (expectedShell === 'fish') {
+    return {
+      rcFileHint: '~/.config/fish/config.fish',
+      manualTerminalGuard: `status is-interactive; and isatty stdout; and not set -q BOTMUX_MANAGED_SHELL; and exec ${leafComm}`,
+    };
+  }
+  return {
+    rcFileHint: expectedShell ? `~/.${expectedShell}rc` : 'shell rc file',
+    manualTerminalGuard: `[ -z "$BASH_EXECUTION_STRING" ] && [ -t 1 ] && exec ${leafComm}`,
+  };
+}
+
+/** A configured Codex-compatible runtime opts discovery into an exact binary
+ * identity. Without one, callers stay on the legacy static comm map. */
+function customCodexExecutableName(filterCliId?: CliId, filterExecutable?: string): string | undefined {
+  if (filterCliId !== 'codex' || !filterExecutable?.trim()) return undefined;
+  // Preserve an empty basename (for example an invalid directory-only path) as
+  // an active-but-unmatchable custom identity. Falling back to the static map
+  // here could surface official Codex for a misconfigured custom runtime.
+  const name = executableBasename(filterExecutable);
+  // Structured config rejects this collision before discovery. Keep the matcher
+  // defensive for direct/internal callers: returning an active but impossible
+  // name fails closed instead of falling back to the static official map.
+  return /^(?:codex|codex\.exe)$/i.test(name) ? '' : name;
+}
+
+/** Executable-bearing argv positions for an interpreter/native launcher.
+ *
+ * argv[0] is always executable identity. For generic launchers, the first
+ * non-option token after launcher flags is the script/program slot; every later
+ * token belongs to that program and must never establish CLI identity. This
+ * intentionally accepts common shapes such as
+ * `node --enable-source-maps /path/vendor-codex`, while refusing
+ * `node /srv/unrelated.js vendor-codex`.
+ *
+ * Options that take a separate value may make the script slot ambiguous. In
+ * that case this conservative parser can produce a false negative, which is the
+ * required fail-closed direction for adopt discovery. */
+function launcherExecutableSlots(argv: string[]): string[] {
+  if (argv.length === 0) return [];
+  const slots = [argv[0]!];
+  for (let index = 1; index < argv.length; index++) {
+    const arg = argv[index]!;
+    if (arg === '--') {
+      if (index + 1 < argv.length) slots.push(argv[index + 1]!);
+      break;
+    }
+    if (arg.startsWith('-')) {
+      // Only skip flags whose arity is unambiguous here. An unknown flag may
+      // consume the next token (`node --require value script`); treating that
+      // value as the script would recreate the arbitrary-argv false positive.
+      // `--foo=value` carries its own value. Keep this allow-list deliberately
+      // tiny and grow it only with a verified launcher shape.
+      if (arg.includes('=') || arg === '--enable-source-maps') continue;
+      break;
+    }
+    slots.push(arg);
+    break;
+  }
+  return slots;
+}
+
+/** Return only argv positions that can establish executable identity for this
+ * process. Generic launchers may carry the script/program after a small,
+ * explicitly understood flag prefix; ordinary processes are limited to
+ * argv[0]. Never scan arbitrary program arguments. Shared with Codex RPC pane
+ * ownership so adopt discovery and stale-remote detection fail closed in the
+ * same direction. */
+export function processExecutableArgvSlots(
+  comm: string | undefined,
+  argv: string[],
+): string[] {
+  const normalizedComm = comm?.startsWith('.') ? comm.slice(1) : comm;
+  return normalizedComm && COMM_ARGV_LAUNCHERS.has(normalizedComm)
+    ? launcherExecutableSlots(argv)
+    : argv.slice(0, 1);
+}
+
+export function cliIdForComm(
+  comm: string,
+  filterCliId?: CliId,
+  filterExecutable?: string,
+): CliId | undefined {
   const normalizedComm = comm.startsWith('.') ? comm.slice(1) : comm;
+  const customCodexName = customCodexExecutableName(filterCliId, filterExecutable);
+  if (customCodexName !== undefined) {
+    // `node`, `python`, etc. are launchers, not proof that every process using
+    // that interpreter is the configured Codex-compatible runtime. Their script
+    // identity is checked from constrained argv slots below.
+    if (COMM_ARGV_LAUNCHERS.has(normalizedComm)) return undefined;
+    return normalizedComm === customCodexName ? 'codex' : undefined;
+  }
   const direct = CLI_COMM_MAP[comm] ?? CLI_COMM_MAP[normalizedComm];
   // Cursor's agent binary may be installed as the generic name `agent`. Only
   // accept that alias when a Cursor bot is explicitly asking, otherwise a broad
@@ -166,10 +267,26 @@ export function readCmdline(pid: number): string[] {
  * Resolve a CliId from a process's comm + argv. Checks comm first; if the comm
  * belongs to a generic launcher, scan argv for the CLI executable basename.
  */
-export function cliIdFromCommArgv(comm: string | undefined, argv: string[], filterCliId?: CliId): CliId | undefined {
+export function cliIdFromCommArgv(
+  comm: string | undefined,
+  argv: string[],
+  filterCliId?: CliId,
+  filterExecutable?: string,
+): CliId | undefined {
   if (!comm) return undefined;
-  let detected = cliIdForComm(comm, filterCliId);
-  if (!detected && COMM_ARGV_LAUNCHERS.has(comm)) {
+  const normalizedComm = comm.startsWith('.') ? comm.slice(1) : comm;
+  const customCodexName = customCodexExecutableName(filterCliId, filterExecutable);
+  let detected = cliIdForComm(comm, filterCliId, filterExecutable);
+  if (!detected && customCodexName !== undefined) {
+    // Native processes expose the executable as argv[0]. Generic launchers
+    // (node/npx/python/...) may instead carry it deeper in argv. Never scan all
+    // argv for an ordinary process: a prompt/argument named like the CLI is not
+    // executable identity.
+    const candidates = processExecutableArgvSlots(normalizedComm, argv);
+    if (candidates.some(arg => !arg.startsWith('-') && executableBasename(arg) === customCodexName)) {
+      detected = 'codex';
+    }
+  } else if (!detected && COMM_ARGV_LAUNCHERS.has(comm)) {
     for (const arg of argv) {
       if (arg.startsWith('-')) continue;
       const id = cliIdForComm(basename(arg), filterCliId);
@@ -365,6 +482,7 @@ function findCliProcess(
   rootPid: number,
   maxDepth: number,
   filterCliId?: CliId,
+  filterExecutable?: string,
 ): { pid: number; cliId: CliId; matchedByComm: boolean } | undefined {
   // BFS through the process tree
   let current = [rootPid];
@@ -375,8 +493,8 @@ function findCliProcess(
     for (const pid of current) {
       const comm = readComm(pid);
       if (comm) {
-        const commCliId = cliIdForComm(comm, filterCliId);
-        const cliId = cliIdFromCommArgv(comm, readCmdline(pid), filterCliId);
+        const commCliId = cliIdForComm(comm, filterCliId, filterExecutable);
+        const cliId = cliIdFromCommArgv(comm, readCmdline(pid), filterCliId, filterExecutable);
         if (cliId) return { pid, cliId, matchedByComm: commCliId === cliId };
       }
       next.push(...getChildPids(pid));
@@ -395,6 +513,7 @@ function hasCliProcess(
   expectedPid: number,
   maxDepth: number,
   filterCliId?: CliId,
+  filterExecutable?: string,
 ): boolean {
   let frontier = [rootPid];
   const seen = new Set<number>();
@@ -407,7 +526,7 @@ function hasCliProcess(
       if (pid === expectedPid) {
         const comm = readComm(pid);
         return comm !== undefined
-          && cliIdFromCommArgv(comm, readCmdline(pid), filterCliId) !== undefined;
+          && cliIdFromCommArgv(comm, readCmdline(pid), filterCliId, filterExecutable) !== undefined;
       }
       next.push(...getChildPids(pid));
     }
@@ -443,6 +562,7 @@ export function findLaunchedCliPid(
   maxDepth = 6,
   // Injectable process probes (defaults hit the real OS); tests pass fakes.
   probes: { childrenOf?: (pid: number) => number[]; commOf?: (pid: number) => string | undefined } = {},
+  filterExecutable?: string,
 ): number | null {
   const childrenOf = probes.childrenOf ?? getChildPids;
   const commOf = probes.commOf ?? readComm;
@@ -454,7 +574,7 @@ export function findLaunchedCliPid(
       if (seen.has(pid)) continue;
       seen.add(pid);
       const comm = commOf(pid);
-      if (comm && cliIdForComm(comm, targetCliId) === targetCliId) return pid;
+      if (comm && cliIdForComm(comm, targetCliId, filterExecutable) === targetCliId) return pid;
       next.push(...childrenOf(pid));
     }
     frontier = next;
@@ -646,6 +766,7 @@ function herdrPaneCliProcess(
   raw: any,
   filterCliId?: CliId,
   expectedPid?: number,
+  filterExecutable?: string,
 ): { pid: number; cliId: CliId; cwd?: string } | undefined {
   const info = raw?.result?.process_info;
   const processes = Array.isArray(info?.foreground_processes) ? info.foreground_processes : [];
@@ -657,18 +778,39 @@ function herdrPaneCliProcess(
     // reporting a live Pi pane as exited.
     const argv0 = typeof proc?.argv0 === 'string' ? proc.argv0 : undefined;
     const effectiveArgv = argv.length > 0 ? argv : argv0 ? [argv0] : [];
-    const cliId = cliIdFromCommArgv(typeof proc?.name === 'string' ? proc.name : undefined, effectiveArgv, filterCliId);
     const pid = Number(proc?.pid);
-    if (cliId && Number.isInteger(pid) && pid > 0 && (!expectedPid || pid === expectedPid)) {
+    const pidMatches = Number.isInteger(pid) && pid > 0 && (!expectedPid || pid === expectedPid);
+    let cliId = cliIdFromCommArgv(
+      typeof proc?.name === 'string' ? proc.name : undefined,
+      effectiveArgv,
+      filterCliId,
+      filterExecutable,
+    );
+    // Herdr's `name` is the basename of the RESOLVED executable, so a CLI shipped
+    // as a version-named binary behind a stable symlink reports the version, not
+    // the CLI name — Claude Code 2.x installs `~/.local/bin/claude` as a symlink
+    // to `~/.local/share/claude/versions/2.1.224`, and herdr reports
+    // `name:"2.1.224"` for it. No CLI_COMM_MAP entry matches that, and the argv
+    // fallback only fires for COMM_ARGV_LAUNCHERS (node/python/…), so the
+    // `argv:["claude"]` sitting right beside it is never consulted. Discovery
+    // still lists the pane (agent-list reports `agent:"claude"`) while adopt
+    // revalidation resolves nothing → the pane is wrongly reported as exited.
+    // Our own readComm goes through /proc/<pid>/comm (Linux) or `ps -o comm=`
+    // (macOS), both of which keep the symlink name, so retry with it.
+    if (!cliId && pidMatches) {
+      const comm = readComm(pid);
+      if (comm) cliId = cliIdFromCommArgv(comm, effectiveArgv, filterCliId, filterExecutable);
+    }
+    if (cliId && pidMatches) {
       return { pid, cliId, cwd: typeof proc?.cwd === 'string' ? proc.cwd : undefined };
     }
   }
   return undefined;
 }
 
-function herdrAgentCliId(agent: any, filterCliId?: CliId): CliId | undefined {
+function herdrAgentCliId(agent: any, filterCliId?: CliId, filterExecutable?: string): CliId | undefined {
   const name = typeof agent?.agent === 'string' ? basename(agent.agent) : '';
-  return name ? cliIdForComm(name, filterCliId) : undefined;
+  return name ? cliIdForComm(name, filterCliId, filterExecutable) : undefined;
 }
 
 const HERDR_SESSION_UUID_RE = /(?:^|_)([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?:\.jsonl)?$/i;
@@ -684,7 +826,7 @@ function herdrAgentSessionId(agent: any): string | undefined {
   return HERDR_SESSION_UUID_RE.exec(value)?.[1];
 }
 
-function discoverHerdrAdoptableSessions(filterCliId?: CliId): AdoptableSession[] {
+function discoverHerdrAdoptableSessions(filterCliId?: CliId, filterExecutable?: string): AdoptableSession[] {
   const rawSessions = herdrJson(['session', 'list', '--json']);
   const sessions = extractHerdrSessions(rawSessions).filter((s: any) => {
     const name = typeof s?.name === 'string' ? s.name : '';
@@ -696,7 +838,7 @@ function discoverHerdrAdoptableSessions(filterCliId?: CliId): AdoptableSession[]
     const rawAgents = herdrJson(['--session', sessionName, 'agent', 'list']);
     const discoveredPaneIds = new Set<string>();
     for (const agent of extractHerdrAgents(rawAgents)) {
-      const cliId = herdrAgentCliId(agent, filterCliId);
+      const cliId = herdrAgentCliId(agent, filterCliId, filterExecutable);
       if (!cliId) continue;
       if (filterCliId && cliId !== filterCliId) continue;
       const cwd = typeof agent?.cwd === 'string' ? agent.cwd : undefined;
@@ -712,7 +854,7 @@ function discoverHerdrAdoptableSessions(filterCliId?: CliId): AdoptableSession[]
       // `working`, yet no final reply is emitted because the worker has no
       // session id or pid from which to resolve the JSONL.
       const rawInfo = herdrJson(['--session', sessionName, 'pane', 'process-info', '--pane', paneId]);
-      const process = herdrPaneCliProcess(rawInfo, cliId);
+      const process = herdrPaneCliProcess(rawInfo, cliId, undefined, filterExecutable);
       const cliPid = process?.pid;
       let sessionId = herdrAgentSessionId(agent);
       if (!sessionId && cliPid) {
@@ -750,7 +892,7 @@ function discoverHerdrAdoptableSessions(filterCliId?: CliId): AdoptableSession[]
       const paneId = typeof pane?.pane_id === 'string' ? pane.pane_id : undefined;
       if (!paneId || discoveredPaneIds.has(paneId)) continue;
       const rawInfo = herdrJson(['--session', sessionName, 'pane', 'process-info', '--pane', paneId]);
-      const process = herdrPaneCliProcess(rawInfo, filterCliId);
+      const process = herdrPaneCliProcess(rawInfo, filterCliId, undefined, filterExecutable);
       if (!process) continue;
       const cwd = process.cwd
         ?? (typeof pane?.foreground_cwd === 'string' ? pane.foreground_cwd : undefined)
@@ -825,13 +967,14 @@ function resolveAdoptableSessionForPane(
   tmuxTarget: string,
   panePid: number,
   filterCliId?: CliId,
+  filterExecutable?: string,
 ): AdoptableSession | undefined {
   // 2. Filter out bmx-* sessions
   const sessionName = tmuxTarget.split(':')[0];
   if (sessionName?.startsWith('bmx-')) return undefined;
 
   // 3. Recursively search process tree for known CLI binaries (up to 3 levels)
-  const match = findCliProcess(panePid, 3, filterCliId);
+  const match = findCliProcess(panePid, 3, filterCliId, filterExecutable);
   if (!match) return undefined;
 
   // 3b. Filter by CLI type if requested
@@ -853,7 +996,7 @@ function resolveAdoptableSessionForPane(
   // — that process IS the selected CLI and may legitimately have another
   // instance of the same CLI deeper in its tree, so never follow it.
   const cliPid = !match.matchedByComm
-    ? (findLaunchedCliPid(match.pid, match.cliId) ?? match.pid)
+    ? (findLaunchedCliPid(match.pid, match.cliId, 6, {}, filterExecutable) ?? match.pid)
     : match.pid;
 
   // 4. Read CLI working directory (Linux: /proc; macOS: lsof)
@@ -942,6 +1085,7 @@ function resolveAdoptableSessionForPane(
 export function discoverAdoptableSessionByTarget(
   tmuxTarget: string,
   filterCliId?: CliId,
+  filterExecutable?: string,
 ): AdoptableSession | undefined {
   let canonicalTarget: string;
   let panePid: number;
@@ -967,7 +1111,7 @@ export function discoverAdoptableSessionByTarget(
   // 每个节点再 fork 一次全量 `ps`，实测 >45s 同步冻结（比它要优化掉的 5.4s 更糟，
   // 且直接冻住 daemon 事件循环、波及所有 bot）。
   if (!Number.isInteger(panePid) || panePid <= 0) return undefined;
-  return resolveAdoptableSessionForPane(tmuxTarget, panePid, filterCliId);
+  return resolveAdoptableSessionForPane(tmuxTarget, panePid, filterCliId, filterExecutable);
 }
 
 /**
@@ -978,8 +1122,9 @@ export function discoverAdoptableSessionByTarget(
  * for known CLI binaries.
  *
  * @param filterCliId - If provided, only return sessions matching this CLI type.
+ * @param filterExecutable - For a custom Codex runtime, require this executable's basename exactly.
  */
-export function discoverAdoptableSessions(filterCliId?: CliId): AdoptableSession[] {
+export function discoverAdoptableSessions(filterCliId?: CliId, filterExecutable?: string): AdoptableSession[] {
   const results: AdoptableSession[] = [];
 
   // 1. List all tmux panes
@@ -1009,12 +1154,12 @@ export function discoverAdoptableSessions(filterCliId?: CliId): AdoptableSession
       if (isNaN(panePid)) continue;
 
       // 2-6 与单 pane 快路径共用同一份判定，见 resolveAdoptableSessionForPane。
-      const session = resolveAdoptableSessionForPane(tmuxTarget, panePid, filterCliId);
+      const session = resolveAdoptableSessionForPane(tmuxTarget, panePid, filterCliId, filterExecutable);
       if (session) results.push(session);
     }
   }
 
-  results.push(...discoverHerdrAdoptableSessions(filterCliId));
+  results.push(...discoverHerdrAdoptableSessions(filterCliId, filterExecutable));
   return results;
 }
 
@@ -1027,7 +1172,12 @@ export function discoverAdoptableSessions(filterCliId?: CliId): AdoptableSession
  * 'cursor' (see cliIdForComm); without the same filter here, discovery surfaces
  * the session but validation re-identifies nothing and wrongly reports it exited.
  */
-export function validateTmuxAdoptTarget(tmuxTarget: string, expectedPid: number, filterCliId?: CliId): boolean {
+export function validateTmuxAdoptTarget(
+  tmuxTarget: string,
+  expectedPid: number,
+  filterCliId?: CliId,
+  filterExecutable?: string,
+): boolean {
   // Verify the tmux pane still exists and get its shell PID
   let panePid: number;
   try {
@@ -1051,7 +1201,7 @@ export function validateTmuxAdoptTarget(tmuxTarget: string, expectedPid: number,
   // Search for the expected PID itself. A Codex Node launcher can match by
   // argv before the native Codex child, so validating only the first generic
   // match would reject the native pid returned by discovery.
-  return hasCliProcess(panePid, expectedPid, 6, filterCliId);
+  return hasCliProcess(panePid, expectedPid, 6, filterCliId, filterExecutable);
 }
 
 
@@ -1062,6 +1212,7 @@ export function validateHerdrAdoptTarget(
   paneId: string | undefined,
   expectedPid?: number,
   expectedCliId?: CliId,
+  filterExecutable?: string,
 ): AdoptValidationResult {
   if (!sessionName || !paneId) return 'missing';
   const rawAgents = tryHerdrJson(['--session', sessionName, 'agent', 'list']);
@@ -1076,28 +1227,40 @@ export function validateHerdrAdoptTarget(
   // TraeX before its first lifecycle hook), against the live foreground process.
   const rawInfo = tryHerdrJson(['--session', sessionName, 'pane', 'process-info', '--pane', paneId]);
   if (!rawInfo.ok) return 'unknown';
-  const process = herdrPaneCliProcess(rawInfo.value, expectedCliId, expectedPid);
+  const process = herdrPaneCliProcess(rawInfo.value, expectedCliId, expectedPid, filterExecutable);
   if (!process) return 'missing';
   if (expectedPid && process.pid !== expectedPid) return 'missing';
   return 'alive';
 }
 
-export function validateAdoptTarget(target: AdoptableSession | NonNullable<import('./types.js').DaemonSession['adoptedFrom']>): boolean {
-  return validateAdoptTargetState(target) === 'alive';
+export function validateAdoptTarget(
+  target: AdoptableSession | NonNullable<import('./types.js').DaemonSession['adoptedFrom']>,
+  filterExecutable?: string,
+): boolean {
+  return validateAdoptTargetState(target, filterExecutable) === 'alive';
 }
 
-export function validateAdoptTargetState(target: AdoptableSession | NonNullable<import('./types.js').DaemonSession['adoptedFrom']>): AdoptValidationResult {
+export function validateAdoptTargetState(
+  target: AdoptableSession | NonNullable<import('./types.js').DaemonSession['adoptedFrom']>,
+  filterExecutable?: string,
+): AdoptValidationResult {
   if (target.source === 'herdr') {
     const pid = 'originalCliPid' in target
       ? target.originalCliPid
       : ('cliPid' in target ? target.cliPid : undefined);
-    return validateHerdrAdoptTarget(target.herdrSessionName, target.herdrPaneId ?? target.herdrTarget, pid, target.cliId);
+    return validateHerdrAdoptTarget(
+      target.herdrSessionName,
+      target.herdrPaneId ?? target.herdrTarget,
+      pid,
+      target.cliId,
+      filterExecutable,
+    );
   }
   const pid = 'originalCliPid' in target
     ? target.originalCliPid
     : ('cliPid' in target ? target.cliPid : undefined);
   if (!target.tmuxTarget || !pid) return 'missing';
-  return validateTmuxAdoptTarget(target.tmuxTarget, pid, target.cliId) ? 'alive' : 'missing';
+  return validateTmuxAdoptTarget(target.tmuxTarget, pid, target.cliId, filterExecutable) ? 'alive' : 'missing';
 }
 
 // 仅供单测使用 —— 暴露内部 helper，方便覆盖跨平台 (Linux /proc vs macOS ps/lsof/pgrep)

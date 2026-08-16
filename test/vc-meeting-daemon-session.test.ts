@@ -18,6 +18,8 @@ const sendHolds = vi.hoisted(() => ({
 }));
 const joinCalls = vi.hoisted(() => [] as Array<{ meetingNumber: string; profile?: string }>);
 const joinMeetingIdOverrides = vi.hoisted(() => [] as string[]);
+const profileProvisionCalls = vi.hoisted(() => [] as Array<{ profileName: string }>);
+const profileProvisionResults = vi.hoisted(() => [] as any[]);
 const meetingEventFetchCalls = vi.hoisted(() => [] as Array<{
   meetingId: string;
   profile?: string;
@@ -173,6 +175,13 @@ vi.mock('../src/vc-agent/polling-source.js', () => ({
       meetingId: joinMeetingIdOverrides.shift()
         ?? (input.meetingNumber === '123456789' ? 'm_invite' : `m_joined_${input.meetingNumber}`),
     };
+  }),
+  // Join profile is auto-provisioned before join; default to "already present"
+  // so existing join assertions are unaffected. profileProvisionResults lets a
+  // test force a failure to exercise the fail-closed / owner-notify path.
+  ensureLarkCliBotProfile: vi.fn((opts: { profileName: string }) => {
+    profileProvisionCalls.push(opts);
+    return profileProvisionResults.shift() ?? { ok: true, created: false };
   }),
   fetchMeetingEventsAsBot: vi.fn((input: { meetingId: string; profile?: string; start?: string }) => {
     meetingEventFetchCalls.push(input);
@@ -625,20 +634,25 @@ async function waitForConsumerApplyFinalCard(afterIndex = patchedMessages.length
 }
 
 /** 新交互流程：下拉选 agent 只暂存，点"确认"才生效。返回确认后的卡片响应。 */
-async function selectConsumerAgentViaCard(label: string, operatorOpenId = TARGET_OPEN_ID): Promise<any> {
-  await __vcMeetingAgentTest.handleCardAction({
-    operator: { open_id: operatorOpenId },
-    action: lastInteractiveCardSelectOption(label),
-  }, APP_ID);
+async function confirmLatestConsumerCard(operatorOpenId = TARGET_OPEN_ID): Promise<any> {
   const patchIndex = patchedMessages.length;
   const result = await __vcMeetingAgentTest.handleCardAction({
     operator: { open_id: operatorOpenId },
     action: { value: lastInteractiveCardButton('确认') },
   }, APP_ID);
-  if (result?.header?.title?.content === '会议处理设置中') {
+  if (result?.header?.title?.content === '会议处理设置中'
+    || result?.toast?.content === '会议 agent 选择正在处理中') {
     return (await waitForConsumerApplyFinalCard(patchIndex)) ?? result;
   }
   return result;
+}
+
+async function selectConsumerAgentViaCard(label: string, operatorOpenId = TARGET_OPEN_ID): Promise<any> {
+  await __vcMeetingAgentTest.handleCardAction({
+    operator: { open_id: operatorOpenId },
+    action: lastInteractiveCardSelectOption(label),
+  }, APP_ID);
+  return confirmLatestConsumerCard(operatorOpenId);
 }
 
 async function selectConsumerProfilesViaCard(
@@ -817,6 +831,8 @@ describe('VC meeting daemon session lifecycle', () => {
     sendHolds.resolvers.length = 0;
     joinCalls.length = 0;
     joinMeetingIdOverrides.length = 0;
+    profileProvisionCalls.length = 0;
+    profileProvisionResults.length = 0;
     meetingEventFetchCalls.length = 0;
     meetingEventFetchResults.length = 0;
     groupCreateCalls.length = 0;
@@ -864,6 +880,8 @@ describe('VC meeting daemon session lifecycle', () => {
     sendHolds.resolvers.length = 0;
     joinCalls.length = 0;
     joinMeetingIdOverrides.length = 0;
+    profileProvisionCalls.length = 0;
+    profileProvisionResults.length = 0;
     meetingEventFetchCalls.length = 0;
     meetingEventFetchResults.length = 0;
     groupCreateCalls.length = 0;
@@ -2029,6 +2047,118 @@ describe('VC meeting daemon session lifecycle', () => {
     expect(joinCalls).toHaveLength(1);
     expect(groupCreateCalls).toHaveLength(1);
     expect(sentMessages).toHaveLength(1);
+  });
+
+  it('skips join and DMs the owner when the lark-cli join profile cannot be provisioned', async () => {
+    registerBot({
+      larkAppId: APP_ID,
+      larkAppSecret: 'secret',
+      name: 'Meeting Bot',
+      cliId: 'claude-code',
+      sandbox: true,
+      backendType: 'pty',
+      workingDir: process.cwd(),
+      vcMeetingAgent: {
+        enabled: true,
+        larkCliProfile: APP_ID,
+        attentionTargetOpenId: TARGET_OPEN_ID,
+      },
+    });
+    // Force auto-provision to fail (e.g. wrong/rotated appSecret).
+    profileProvisionResults.push({ ok: false, reason: 'add_failed', error: 'invalid app secret' });
+
+    await __vcMeetingAgentTest.handlePush({
+      larkAppId: APP_ID,
+      kind: 'meeting_invited',
+      eventType: 'vc.bot.meeting_invited_v1',
+      eventId: 'evt_invite_provision_fail',
+      meeting: { id: 'm_provision_fail', meetingNo: '767676767', topic: 'Provision failure' },
+      raw: { event: { meeting: { id: 'm_provision_fail', meeting_no: '767676767' } } },
+    });
+
+    // Provision was attempted; join was NOT called; the meeting owner got a DM.
+    expect(profileProvisionCalls).toHaveLength(1);
+    expect(profileProvisionCalls[0]?.profileName).toBe(APP_ID);
+    expect(joinCalls).toHaveLength(0);
+    const ownerDm = sentMessages.find(msg => msg.receiveId === TARGET_OPEN_ID);
+    expect(ownerDm).toBeDefined();
+    expect(JSON.parse(ownerDm!.content).text).toContain('invalid app secret');
+  });
+
+  it('DMs the owner when the EAGER join (invite has meeting_no but no meeting.id) cannot provision the profile', async () => {
+    // Regression: an invite carrying only a meeting_no is joined eagerly BEFORE
+    // any session exists, to learn the meeting.id. A provision/join failure there
+    // used to only WARN and then hit the silent "no meeting id yet" return — the
+    // exact shape of the original "profile not found → bot rings forever" bug,
+    // with zero user-visible signal. The eager path must DM the owner too.
+    registerBot({
+      larkAppId: APP_ID,
+      larkAppSecret: 'secret',
+      name: 'Meeting Bot',
+      cliId: 'claude-code',
+      sandbox: true,
+      backendType: 'pty',
+      workingDir: process.cwd(),
+      vcMeetingAgent: {
+        enabled: true,
+        larkCliProfile: APP_ID,
+        attentionTargetOpenId: TARGET_OPEN_ID,
+      },
+    });
+    profileProvisionResults.push({ ok: false, reason: 'add_failed', error: 'eager rotated secret' });
+
+    await __vcMeetingAgentTest.handlePush({
+      larkAppId: APP_ID,
+      kind: 'meeting_invited',
+      eventType: 'vc.bot.meeting_invited_v1',
+      eventId: 'evt_invite_eager_no_id',
+      // NB: NO meeting.id — only meeting_no. This forces the eager-join branch.
+      meeting: { meetingNo: '868686868', topic: 'Eager provision failure' },
+      raw: { event: { meeting: { meeting_no: '868686868' } } },
+    });
+
+    // Provision attempted, join never reached (id never resolved), owner DMed.
+    expect(profileProvisionCalls).toHaveLength(1);
+    expect(joinCalls).toHaveLength(0);
+    const ownerDm = sentMessages.find(msg => msg.receiveId === TARGET_OPEN_ID);
+    expect(ownerDm).toBeDefined();
+    expect(JSON.parse(ownerDm!.content).text).toContain('eager rotated secret');
+  });
+
+  it('de-dupes the eager-join failure DM across a redelivered invite for the same meeting_no', async () => {
+    registerBot({
+      larkAppId: APP_ID,
+      larkAppSecret: 'secret',
+      name: 'Meeting Bot',
+      cliId: 'claude-code',
+      sandbox: true,
+      backendType: 'pty',
+      workingDir: process.cwd(),
+      vcMeetingAgent: {
+        enabled: true,
+        larkCliProfile: APP_ID,
+        attentionTargetOpenId: TARGET_OPEN_ID,
+      },
+    });
+    // Both deliveries fail to provision.
+    profileProvisionResults.push({ ok: false, reason: 'add_failed', error: 'still bad' });
+    profileProvisionResults.push({ ok: false, reason: 'add_failed', error: 'still bad' });
+
+    const eagerPush = {
+      larkAppId: APP_ID,
+      kind: 'meeting_invited' as const,
+      eventType: 'vc.bot.meeting_invited_v1',
+      eventId: 'evt_invite_eager_dupe',
+      meeting: { meetingNo: '959595959', topic: 'Eager dupe' },
+      raw: { event: { meeting: { meeting_no: '959595959' } } },
+    };
+    await __vcMeetingAgentTest.handlePush(eagerPush);
+    await __vcMeetingAgentTest.handlePush({ ...eagerPush, eventId: 'evt_invite_eager_dupe_2' });
+
+    // Provision attempted twice, but the owner is DMed only once (deduped).
+    expect(profileProvisionCalls).toHaveLength(2);
+    const ownerDms = sentMessages.filter(msg => msg.receiveId === TARGET_OPEN_ID);
+    expect(ownerDms).toHaveLength(1);
   });
 
   it('durably fences its own removal and lets only an authorized card rejoin once after restart', async () => {
@@ -5632,11 +5762,11 @@ describe('VC meeting daemon session lifecycle', () => {
     expect(stored?.selectedAgentAppId).toBeUndefined();
   });
 
-  it('fails selection closed before creating a receiver for an unsandboxed agent', async () => {
+  it('accepts an unsandboxed consumer agent (plan B: operator owns the sandbox choice)', async () => {
     registerBot({
       larkAppId: AGENT_APP_ID,
       larkAppSecret: 'agent-secret',
-      name: 'Unisolated Claude',
+      name: 'Unsandboxed Claude',
       cliId: 'claude-code',
       backendType: 'pty',
       workingDir: process.cwd(),
@@ -5653,7 +5783,7 @@ describe('VC meeting daemon session lifecycle', () => {
         meetingConsumer: {
           enabled: true,
           defaultMode: 'listenOnly',
-          agentCandidates: [{ larkAppId: AGENT_APP_ID, label: 'Unisolated Claude' }],
+          agentCandidates: [{ larkAppId: AGENT_APP_ID, label: 'Unsandboxed Claude' }],
         },
       },
     });
@@ -5661,20 +5791,32 @@ describe('VC meeting daemon session lifecycle', () => {
       larkAppId: APP_ID,
       kind: 'meeting_invited',
       eventType: 'vc.bot.meeting_invited_v1',
-      eventId: 'evt_invite_unisolated_consumer',
-      meeting: { id: 'm_unisolated_consumer', meetingNo: '454545455', topic: 'Unisolated consumer' },
-      raw: { event: { meeting: { id: 'm_unisolated_consumer', meeting_no: '454545455' } } },
+      eventId: 'evt_invite_unsandboxed_consumer',
+      meeting: { id: 'm_unsandboxed_consumer', meetingNo: '454545455', topic: 'Unsandboxed consumer' },
+      raw: { event: { meeting: { id: 'm_unsandboxed_consumer', meeting_no: '454545455' } } },
     });
 
-    const result = await selectConsumerAgentViaCard('Unisolated Claude');
-    expect(result.header.title.content).toBe('仅同步会议消息');
-    expect(interactiveCardMarkdownContent(result)).toContain('选择 agent 失败，已回退只监听');
-    expect(interactiveCardMarkdownContent(result)).toContain('managed side-effect isolation');
-    expect(addBotToChatCalls).toHaveLength(0);
-    expect(__vcMeetingAgentTest.receiverSessionSnapshot('m_unisolated_consumer')).toBeUndefined();
+    const result = await selectConsumerAgentViaCard('Unsandboxed Claude');
+    expect(result.header.title.content).toBe('会议 agent 已启用');
+    expect(addBotToChatCalls).toEqual([{
+      proxyLarkAppId: APP_ID,
+      chatId: 'oc_listener_1',
+      targetLarkAppIds: [AGENT_APP_ID],
+    }]);
     const stored = runtimeStoreRecords.find(record => record.meeting.id === 'm_joined_454545455');
-    expect(stored?.consumerMode).toBe('listenOnly');
-    expect(stored?.selectedAgentAppId).toBeUndefined();
+    expect(stored?.consumerMode).toBe('agent');
+    expect(stored?.selectedAgentAppId).toBe(AGENT_APP_ID);
+
+    // Regression: the receiver session must spawn UNSANDBOXED (plan B opt-out).
+    // A hardcoded sandbox=true here confined a bot never set up for bwrap → the
+    // CLI failed to work and the meeting "joined but never replied".
+    const member = listVcMeetingHubMembers(config.session.dataDir, {
+      listenerAppId: APP_ID,
+      meetingId: 'm_joined_454545455',
+    }).find(candidate => candidate.agentAppId === AGENT_APP_ID);
+    expect(member?.receiverSessionId).toBeTruthy();
+    const receiver = __vcMeetingAgentTest.receiverSessionSnapshot(member!.receiverSessionId);
+    expect(receiver?.sandbox).toBe(false);
   });
 
   it('pauses visibly, retains later bodies, and resumes an overflowing consumer feed without a hole', async () => {
@@ -5753,7 +5895,14 @@ describe('VC meeting daemon session lifecycle', () => {
     expect(triggerSessionCalls).toHaveLength(0);
 
     __vcMeetingAgentTest.setConsumerPendingItemLimitForTest(undefined);
-    await selectConsumerAgentViaCard('Claude Loopy');
+    for (let i = 0; i < 20
+      && sentMessages.filter(message => message.msgType === 'interactive').length < 2;
+      i += 1) await Promise.resolve();
+    expect(sentMessages.filter(message => message.msgType === 'interactive')).toHaveLength(2);
+    // The overflow recovery card already stages the current agent; confirming
+    // it resumes the same durable member/cursor without starting a second
+    // dropdown apply in parallel.
+    await confirmLatestConsumerCard();
     await __vcMeetingAgentTest.injectConsumer(APP_ID, 'm_joined_464646464', { force: true });
     expect(triggerSessionCalls).toHaveLength(1);
     expect(triggerSessionCalls[0].req.envelope.payload.entries.filter((entry: any) => entry.kind === 'item'))

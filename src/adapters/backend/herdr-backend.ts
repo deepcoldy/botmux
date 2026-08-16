@@ -79,6 +79,7 @@ const PANE_AGENT_KIND_BY_EXECUTABLE: Readonly<Record<string, string>> = {
   agy: 'agy',
   omp: 'omp',
   opencode: 'opencode',
+  opencode2: 'opencode2',
   copilot: 'copilot',
   kimi: 'kimi',
   'kiro-cli': 'kiro',
@@ -353,6 +354,7 @@ export class HerdrBackend implements SessionBackend {
   private lastText = '';
   private exited = false;
   private started = false;
+  private actuallyReattached = false;
   private cols = 200;
   private rows = 50;
   private agentProbeFailures = 0;
@@ -454,20 +456,43 @@ export class HerdrBackend implements SessionBackend {
     return agent && !agentRowExited(agent) ? 'exists' : 'missing';
   }
 
-  /** Close only the managed pane, never the surrounding user-owned session. */
-  static killAgent(sessionName: string, agentName: string): void {
+  /**
+   * Close selected managed panes after one agent-list snapshot.
+   *
+   * Startup cleanup can discover many historical rows for the same shared
+   * Herdr host. Listing the host once keeps that sweep proportional to live
+   * hosts + live matching panes instead of issuing one probe/list command per
+   * persisted row.
+   */
+  static killAgents(sessionName: string, agentNames: Iterable<string>): void {
+    const names = new Set(agentNames);
+    if (names.size === 0) return;
     const raw = jsonCommand(
       herdrSessionArgs(sessionName, ['agent', 'list']),
       { timeout: 5000 },
     );
-    const paneId = extractAgents(raw).find((row: any) => row?.name === agentName)?.pane_id;
-    if (typeof paneId === 'string' && paneId) {
+    const paneIds = new Set(
+      extractAgents(raw)
+        .filter((row: any) =>
+          typeof row?.name === 'string'
+          && names.has(row.name)
+          && !agentRowExited(row),
+        )
+        .map((row: any) => row?.pane_id)
+        .filter((paneId: unknown): paneId is string => typeof paneId === 'string' && paneId.length > 0),
+    );
+    for (const paneId of paneIds) {
       runHerdr(herdrSessionArgs(sessionName, ['pane', 'close', paneId]), { timeout: 5000 });
     }
   }
 
+  /** Close only the managed pane, never the surrounding user-owned session. */
+  static killAgent(sessionName: string, agentName: string): void {
+    HerdrBackend.killAgents(sessionName, [agentName]);
+  }
+
   get isReattach(): boolean {
-    return this.opts.isReattach ?? false;
+    return this.actuallyReattached;
   }
 
   spawn(bin: string, args: string[], opts: SpawnOpts): void {
@@ -497,6 +522,7 @@ export class HerdrBackend implements SessionBackend {
 
     const external = this.opts.externalTarget;
     if (external) {
+      this.actuallyReattached = false;
       this.paneId = external.paneId ?? external.target;
     } else {
       // Reuse an existing `botmux` agent ONLY when we're genuinely re-attaching
@@ -507,8 +533,9 @@ export class HerdrBackend implements SessionBackend {
       // row from persisted metadata, and reuse would skip `agent start` so the
       // new command never ran. killSession() now deletes that metadata, but we
       // also gate reuse on isReattach so a stale row can never be adopted.
-      const existing = this.isReattach ? this.getAgent() : undefined;
+      const existing = this.opts.isReattach ? this.getAgent() : undefined;
       if (existing) {
+        this.actuallyReattached = true;
         this.paneId = existing.pane_id;
       } else if (herdrUsesPaneAgentStart()) {
         this.paneId = this.startPaneAgent(bin, args, opts);
@@ -540,29 +567,35 @@ export class HerdrBackend implements SessionBackend {
     //   - Re-attach / external adopt: snapshot the current screen so we only
     //     stream new deltas. Worker.ts explicitly seeds the initial screen
     //     via captureCurrentScreen() in those paths.
-    this.lastText = (this.isReattach || this.opts.externalTarget) ? this.readRecentAnsi() : '';
+    this.lastText = (this.actuallyReattached || this.opts.externalTarget) ? this.readRecentAnsi() : '';
     this.startPolling();
     this.startStatusWatcher();
   }
 
-  write(data: string): void {
-    if (this.exited) return;
+  write(data: string): boolean {
+    if (this.exited) return false;
     const target = this.paneId ?? this.agentName;
-    runHerdr(herdrSessionArgs(this.sessionName, ['pane', 'send-text', target, data]), { timeout: 5000 });
+    return runHerdr(
+      herdrSessionArgs(this.sessionName, ['pane', 'send-text', target, data]),
+      { timeout: 5000 },
+    );
   }
 
-  sendText(text: string): void {
-    this.write(text);
+  sendText(text: string): boolean {
+    return this.write(text);
   }
 
-  sendSpecialKeys(...keys: string[]): void {
-    if (this.exited) return;
+  sendSpecialKeys(...keys: string[]): boolean {
+    if (this.exited) return false;
     const target = this.paneId ?? this.agentName;
-    runHerdr(herdrSessionArgs(this.sessionName, ['pane', 'send-keys', target, ...keys]), { timeout: 5000 });
+    return runHerdr(
+      herdrSessionArgs(this.sessionName, ['pane', 'send-keys', target, ...keys]),
+      { timeout: 5000 },
+    );
   }
 
-  pasteText(text: string): void {
-    this.write(text);
+  pasteText(text: string): boolean {
+    return this.write(text);
   }
 
   resize(cols: number, rows: number): void {

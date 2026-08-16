@@ -84,6 +84,15 @@ const TRAE_COCO: CliSelectOption = { key: 'coco', label: 'TRAE CLI（CoCo）', c
 const TRAE_X: CliSelectOption = { key: 'traex', label: 'traex', cliId: 'traex' };
 const TRAE_VARIANTS: ReadonlyArray<CliSelectOption> = [TRAE_COCO, TRAE_X];
 
+// ─── OpenCode 选项 ──────────────────────────────────────────────────────────
+// OpenCode 与 OpenCode 2 合并成一个「OpenCode」二级菜单（都是原生 cliId，无
+// wrapperCli）：
+//   - OpenCode     → cliId `opencode`  ：OpenCode 1.x
+//   - OpenCode 2   → cliId `opencode2` ：OpenCode 2.0（beta，二进制 opencode2）
+const OPENCODE_NATIVE: CliSelectOption = { key: 'opencode', label: 'OpenCode', cliId: 'opencode' };
+const OPENCODE2_OPTION: CliSelectOption = { key: 'opencode2', label: 'OpenCode 2（beta）', cliId: 'opencode2' };
+const OPENCODE_VARIANTS: ReadonlyArray<CliSelectOption> = [OPENCODE_NATIVE, OPENCODE2_OPTION];
+
 // ─── Pi 选项 ─────────────────────────────────────────────────────────────────
 // Pi 与 Oh My Pi 不合并，但在菜单里相邻摆放（在 Pi 的位置成对发出）。
 const PI_OPTION: CliSelectOption = { key: 'pi', label: 'Pi', cliId: 'pi' };
@@ -169,6 +178,9 @@ export const CLI_SELECT_TREE: ReadonlyArray<CliSelectGroup> = [
       { key: 'oh-my-pi', label: 'Oh My Pi', option: OHMYPI_OPTION },
     ];
     if (o.id === 'oh-my-pi') return [];
+    // opencode + opencode2 collapse into one「OpenCode」二级菜单 at opencode's position.
+    if (o.id === 'opencode') return [{ key: 'opencode', label: 'OpenCode', children: OPENCODE_VARIANTS }];
+    if (o.id === 'opencode2') return [];
     return [{ key: o.id, label: o.label, option: { key: o.id, label: o.label, cliId: o.id } }];
   }),
   ...EXTRA_GATEWAY_GROUPS,
@@ -189,6 +201,8 @@ export const CLI_SELECT_OPTIONS: ReadonlyArray<CliSelectOption> = [
     if (o.id === 'traex') return [];
     if (o.id === 'pi') return [PI_OPTION, OHMYPI_OPTION];  // Pi + Oh My Pi adjacent
     if (o.id === 'oh-my-pi') return [];
+    if (o.id === 'opencode') return OPENCODE_VARIANTS;    // expands to OpenCode + OpenCode 2
+    if (o.id === 'opencode2') return [];
     return [{ key: o.id, label: o.label, cliId: o.id }];
   }),
   ...CJADK_VARIANTS,
@@ -235,7 +249,9 @@ export function parseWrapperCli(wrapperCli: string): string[] {
 
 /** wrapper 前缀首 token 是否为 aiden 网关（`aiden x <cli>`）。aiden 会拦截底层 CLI
  *  的 config 透传参数——`aiden x claude` 拒收 `--settings`、`aiden x codex` 自 1.8.38
- *  起直接报错拒收 `-c`——故转发前要剥掉 botmux 注入的那部分（见 {@link stripWrapperUnsafeArgs}）。 */
+ *  起直接报错拒收 `-c`；此外 aiden 自身已注入 codex 的 `--dangerously-bypass-hook-trust`，
+ *  botmux 再透传一份会让 codex 收到两次而报错——故转发前要剥掉这几项 botmux 注入的参数
+ *  （见 {@link stripWrapperUnsafeArgs}）。 */
 function isAidenWrapper(tokens: ReadonlyArray<string>): boolean {
   return tokens[0] === 'aiden';
 }
@@ -278,6 +294,11 @@ export function stripSettingsArgs(args: ReadonlyArray<string>): string[] {
  *   - `--settings <v>` / `--settings=<v>`（claude 携带 hook/bypass，aiden x claude 历来就剥）
  *   - botmux 自己注入的 Codex `-c`（session 环境，以及关闭启动更新选择器）；
  *     aiden 1.8.38+ 会直接报错拒收 `aiden x codex` 透传的 `-c`/`--config`。
+ *   - `--dangerously-bypass-hook-trust`（codex 家族的 hook-trust 绕过 flag）：aiden 网关
+ *     自身已管理底层 codex 的 hook-trust，botmux 再透传一份会让 codex 收到两次 →
+ *     `error: the argument '--dangerously-bypass-hook-trust' cannot be used multiple times`
+ *     直接启动失败。故经 aiden 网关时一律剥掉这份冗余副本（bare flag，无值）；aiden x claude
+ *     路径底层 claude 从不注入此 flag，剥除是 no-op。
  * 这些参数承载的 session 环境已在进程级 env（BOTMUX_SESSION_ID 等）注入、并被 wrapper
  * 子进程继承（见 worker.ts childEnv），故剥掉只是去掉一条冗余的 belt-and-suspenders
  * 通道，不丢功能。关闭启动更新的覆盖在 aiden 路径无法传递（launcher 本身禁止 config）；
@@ -301,6 +322,9 @@ export function stripWrapperUnsafeArgs(args: ReadonlyArray<string>): string[] {
   for (let i = 0; i < afterSettings.length; i++) {
     const a = afterSettings[i]!;
     if (a === '-c' && isBotmuxCodexConfigValue(afterSettings[i + 1])) { i++; continue; }
+    // aiden 网关自身已管理底层 codex 的 hook-trust；再透传 botmux 注入的这份
+    // 会让 codex 收到两次 → clap 报 "cannot be used multiple times" 启动失败。
+    if (a === '--dangerously-bypass-hook-trust') continue;
     out.push(a);
   }
   return out;
@@ -412,6 +436,19 @@ export function ttadkConfigModelChoices(wrapperCli: string | undefined): string[
  *   - ttadk 网关走专门分支注入 `-m <model> --skip-check`（见 {@link buildTtadkLaunch}）
  * 前缀为空时返回 `{ bin: '', args }`，调用方据此跳过（不改写 spawn）。
  */
+/**
+ * Wrapper-specific launch ENVIRONMENT — the single source of truth shared by
+ * the worker spawn branch and one-shot child processes (session-group AI
+ * titling). cjadk launches its agent inside an interactive wrapper (startup
+ * selector + terminal quirks) unless CJADK_INTERACTIVE=0; without it a
+ * non-TTY one-shot call can hang on the selector.
+ */
+export function wrapperLaunchEnv(wrapperCli: string | undefined): Record<string, string> | undefined {
+  if (!wrapperCli?.trim()) return undefined;
+  if (parseWrapperCli(wrapperCli)[0] === 'cjadk') return { CJADK_INTERACTIVE: '0' };
+  return undefined;
+}
+
 export function buildWrappedLaunch(
   wrapperCli: string,
   cliArgs: ReadonlyArray<string>,

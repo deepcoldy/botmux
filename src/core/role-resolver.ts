@@ -231,20 +231,60 @@ export function resolveRole(larkAppId: string, chatId: string): { content: strin
 
 export type RoleInjectMode = 'every' | 'once';
 
+interface RoleMeta {
+  inject?: 'once';
+  dispatchCompletionEnabled?: true;
+}
+
 /** Absolute path to the per-chat role metadata sidecar. */
 function roleMetaFilePath(larkAppId: string, chatId: string): string {
   assertRoleChatId(chatId);
   return join(config.session.dataDir, 'roles', larkAppId, `${chatId}.meta.json`);
 }
 
-/**
- * Read the injection mode for a (bot, chat). Defaults to 'every' when no
- * sidecar exists or it can't be parsed — i.e. legacy behavior is the default.
- */
-export function readRoleInjectMode(larkAppId: string, chatId: string): RoleInjectMode {
-  if (!larkAppId || !chatId || !isValidRoleChatId(chatId)) return 'every';
+function readRoleMeta(larkAppId: string, chatId: string): RoleMeta {
   try {
     const fp = roleMetaFilePath(larkAppId, chatId);
+    if (!existsSync(fp)) return {};
+    const meta: unknown = JSON.parse(readFileSync(fp, 'utf-8'));
+    if (meta === null || typeof meta !== 'object' || Array.isArray(meta)) return {};
+    const raw = meta as Record<string, unknown>;
+    return {
+      ...(raw.inject === 'once' ? { inject: 'once' as const } : {}),
+      ...(raw.dispatchCompletionEnabled === true ? { dispatchCompletionEnabled: true as const } : {}),
+    };
+  } catch {
+    return {};
+  }
+}
+
+function writeRoleMeta(larkAppId: string, chatId: string, meta: RoleMeta): void {
+  const fp = roleMetaFilePath(larkAppId, chatId);
+  if (Object.keys(meta).length === 0) {
+    try { unlinkSync(fp); } catch { /* already absent */ }
+    return;
+  }
+  mkdirSync(dirname(fp), { recursive: true });
+  atomicWriteFileSync(fp, JSON.stringify(meta));
+}
+
+/** Absolute path to the bot-level default role metadata sidecar (sits next to
+ *  the team role .md, keyed by app only — no chat). */
+function teamRoleMetaFilePath(larkAppId: string): string {
+  return join(config.session.dataDir, 'team-roles', `${larkAppId}.meta.json`);
+}
+
+/**
+ * Read the bot-level DEFAULT injection mode (applies to any chat that hasn't set
+ * its own). Defaults to 'every' (legacy) when unset/unparseable. This is the
+ * fallback consulted by readRoleInjectMode — it lets an operator make the bot's
+ * default role inject-once across all its chats from the Bot config page,
+ * without touching each chat individually.
+ */
+export function readTeamRoleInjectMode(larkAppId: string): RoleInjectMode {
+  if (!larkAppId) return 'every';
+  try {
+    const fp = teamRoleMetaFilePath(larkAppId);
     if (!existsSync(fp)) return 'every';
     const meta = JSON.parse(readFileSync(fp, 'utf-8')) as { inject?: unknown };
     return meta?.inject === 'once' ? 'once' : 'every';
@@ -253,23 +293,62 @@ export function readRoleInjectMode(larkAppId: string, chatId: string): RoleInjec
   }
 }
 
-/**
- * Persist the injection mode. 'every' (the default) removes the sidecar so the
- * on-disk state stays clean; 'once' writes it.
- */
-export function writeRoleInjectMode(larkAppId: string, chatId: string, mode: RoleInjectMode): void {
-  const fp = roleMetaFilePath(larkAppId, chatId);
+/** Persist the bot-level default injection mode. 'every' removes the sidecar. */
+export function writeTeamRoleInjectMode(larkAppId: string, mode: RoleInjectMode): void {
+  const fp = teamRoleMetaFilePath(larkAppId);
   if (mode === 'once') {
     mkdirSync(dirname(fp), { recursive: true });
     atomicWriteFileSync(fp, JSON.stringify({ inject: 'once' }));
   } else {
     try { unlinkSync(fp); } catch { /* already absent */ }
   }
+  logger.info(`[role] team inject mode app=${larkAppId} => ${mode}`);
+}
+
+/**
+ * Read the injection mode for a (bot, chat). A chat that set its own mode via
+ * 角色管理 wins (sidecar present ⇒ 'once'); otherwise we fall back to the
+ * bot-level default (readTeamRoleInjectMode), which itself defaults to 'every'
+ * — so legacy behavior is unchanged until an operator opts a bot into 'once'.
+ */
+export function readRoleInjectMode(larkAppId: string, chatId: string): RoleInjectMode {
+  if (!larkAppId || !chatId || !isValidRoleChatId(chatId)) return 'every';
+  const meta = readRoleMeta(larkAppId, chatId);
+  return meta.inject === 'once' ? 'once' : readTeamRoleInjectMode(larkAppId);
+}
+
+/**
+ * Persist the injection mode. 'every' (the default) removes the sidecar so the
+ * on-disk state stays clean; 'once' writes it.
+ */
+export function writeRoleInjectMode(larkAppId: string, chatId: string, mode: RoleInjectMode): void {
+  const meta = readRoleMeta(larkAppId, chatId);
+  if (mode === 'once') meta.inject = 'once';
+  else delete meta.inject;
+  writeRoleMeta(larkAppId, chatId, meta);
   logger.info(`[role] inject mode chat=${chatId} app=${larkAppId} => ${mode}`);
 }
 
-/** Remove the injection-mode sidecar (used when a chat role is deleted). */
-export function deleteRoleInjectMode(larkAppId: string, chatId: string): void {
+/** Whether dispatch completion additionally leaves a same-topic send copy after report. */
+export function readRoleDispatchCompletionEnabled(larkAppId: string, chatId: string): boolean {
+  if (!larkAppId || !chatId || !isValidRoleChatId(chatId)) return false;
+  return readRoleMeta(larkAppId, chatId).dispatchCompletionEnabled === true;
+}
+
+export function writeRoleDispatchCompletionEnabled(
+  larkAppId: string,
+  chatId: string,
+  enabled: boolean,
+): void {
+  const meta = readRoleMeta(larkAppId, chatId);
+  if (enabled) meta.dispatchCompletionEnabled = true;
+  else delete meta.dispatchCompletionEnabled;
+  writeRoleMeta(larkAppId, chatId, meta);
+  logger.info(`[role] dispatch completion chat=${chatId} app=${larkAppId} => ${enabled}`);
+}
+
+/** Remove all per-chat role metadata when the chat role is deleted. */
+export function deleteRoleMeta(larkAppId: string, chatId: string): void {
   if (!isValidRoleChatId(chatId)) return;
   try { unlinkSync(roleMetaFilePath(larkAppId, chatId)); } catch { /* already absent */ }
 }

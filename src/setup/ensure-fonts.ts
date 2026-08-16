@@ -15,6 +15,7 @@ import { existsSync, mkdirSync, createWriteStream, statSync, unlinkSync, renameS
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { get as httpsGet } from 'node:https';
+import { ProxyAgent } from 'proxy-agent';
 import { detectPlatform, type PlatformInfo } from './detect-platform.js';
 
 export interface FontResult {
@@ -27,6 +28,25 @@ export interface FontResult {
 }
 
 const FONT_DIR = join(homedir(), '.botmux', 'fonts');
+
+const FONT_PROXY_ENV_KEYS = [
+  'npm_config_https_proxy',
+  'NPM_CONFIG_HTTPS_PROXY',
+  'https_proxy',
+  'HTTPS_PROXY',
+  'npm_config_proxy',
+  'NPM_CONFIG_PROXY',
+  'all_proxy',
+  'ALL_PROXY',
+] as const;
+
+/** Build an env-aware agent only when a proxy is configured. ProxyAgent also
+ * applies NO_PROXY per redirect target, so GitHub and its CDN can make the
+ * proxy/direct decision independently. Exported for the env contract test. */
+export function createFontDownloadAgent(): ProxyAgent | undefined {
+  if (!FONT_PROXY_ENV_KEYS.some(key => process.env[key]?.trim())) return undefined;
+  return new ProxyAgent();
+}
 
 interface FontSpec {
   /** Friendly category label for log lines. */
@@ -135,6 +155,7 @@ function downloadFile(url: string, destPath: string, timeoutMs = 60_000): Promis
     const tmp = destPath + '.part';
     let settled = false;
     let activeReq: ReturnType<typeof httpsGet> | null = null;
+    const agent = createFontDownloadAgent();
 
     const cleanup = () => {
       try { unlinkSync(tmp); } catch { /* may not exist */ }
@@ -144,6 +165,7 @@ function downloadFile(url: string, destPath: string, timeoutMs = 60_000): Promis
       settled = true;
       clearTimeout(timer);
       if (activeReq) try { activeReq.destroy(); } catch { /* ignore */ }
+      if (agent) try { agent.destroy(); } catch { /* ignore */ }
       if (err) { cleanup(); reject(err); }
       else resolve();
     };
@@ -154,7 +176,7 @@ function downloadFile(url: string, destPath: string, timeoutMs = 60_000): Promis
       const u = new URL(current);
       if (u.protocol !== 'https:') return finish(new Error(`仅支持 https://, got ${u.protocol} for ${current}`));
 
-      activeReq = httpsGet(u, { headers: { 'user-agent': 'botmux-font-installer' } }, (res) => {
+      activeReq = httpsGet(u, { agent, headers: { 'user-agent': 'botmux-font-installer' } }, (res) => {
         if (res.statusCode && res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
           res.resume();
           followRedirect(new URL(res.headers.location, u).toString(), hops + 1);

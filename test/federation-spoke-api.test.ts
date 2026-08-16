@@ -18,7 +18,7 @@ import { handleFederationSpokeApi, resolveOwnerCandidatesFromAllowedUsers, autoB
 import { listMemberships, addMembership } from '../src/services/federation-membership-store.js';
 import { getDeploymentIdentity } from '../src/services/deployment-identity.js';
 import { consumeInvite } from '../src/services/invite-store.js';
-import { DEFAULT_TEAM_ID } from '../src/services/team-store.js';
+import { DEFAULT_TEAM_ID, getTeam } from '../src/services/team-store.js';
 import { registerDeployment, listFederatedDeployments } from '../src/services/federation-store.js';
 import { setBotOwner, getBotOwner } from '../src/services/bot-owner-store.js';
 import { claimPairing } from '../src/services/pairing-store.js';
@@ -45,6 +45,24 @@ const json = (res: any) => JSON.parse(res._body);
 const jsonResp = (status: number, body: any) => ({ ok: status >= 200 && status < 300, status, json: async () => body } as any);
 
 describe('handleFederationSpokeApi', () => {
+  it('hosted feedback: exposes and updates only local team policy without mutating on invalid input', async () => {
+    writeBots([]);
+    let res = makeRes();
+    await handleFederationSpokeApi(makeReq('GET', '/api/team/hosted'), res, url('/api/team/hosted'), { dataDir });
+    expect(json(res).teams[0].feedback).toBeNull();
+    res = makeRes();
+    await handleFederationSpokeApi(makeReq('PUT', `/api/team/hosted/${DEFAULT_TEAM_ID}/feedback`, { feedback: { enabled: true } }), res, url(`/api/team/hosted/${DEFAULT_TEAM_ID}/feedback`), { dataDir });
+    expect(res.statusCode).toBe(200);
+    expect(json(res).feedback).toMatchObject({ enabled: true });
+    const before = getTeam(dataDir, DEFAULT_TEAM_ID);
+    res = makeRes();
+    await handleFederationSpokeApi(makeReq('PUT', `/api/team/hosted/${DEFAULT_TEAM_ID}/feedback`, { feedback: { enabled: 'yes' } }), res, url(`/api/team/hosted/${DEFAULT_TEAM_ID}/feedback`), { dataDir });
+    expect(res.statusCode).toBe(400);
+    expect(getTeam(dataDir, DEFAULT_TEAM_ID)).toEqual(before);
+    res = makeRes();
+    await handleFederationSpokeApi(makeReq('PUT', '/api/team/hosted/missing/feedback', { feedback: null }), res, url('/api/team/hosted/missing/feedback'), { dataDir });
+    expect(res.statusCode).toBe(404);
+  });
   it('local: GET /api/team/local returns this deployment + own roster + suggested hub url', async () => {
     writeBots([{ larkAppId: 'cli_me1', botOpenId: null, botName: '我的Bot', cliId: 'claude' }]);
     const res = makeRes();

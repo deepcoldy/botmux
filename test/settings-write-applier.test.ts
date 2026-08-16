@@ -34,6 +34,12 @@ function makeDeps(overrides: Partial<SettingsWriteApplierDeps> = {}): SettingsWr
       platformSupported: true,
       hookInstalled: false,
     },
+    hostOverloadAlert: {
+      enabled: false,
+      targetBotAppId: null,
+      enterLoadRatio: 1.5,
+      enterMemUsedFrac: 0.92,
+    },
     vcMeetingAgent: { enabled: true },
     maintenance: {},
     localDevInstall: false,
@@ -49,6 +55,9 @@ function makeDeps(overrides: Partial<SettingsWriteApplierDeps> = {}): SettingsWr
     }),
     writeCodexNotifierConfig: vi.fn((config) => {
       storedGlobal.codexNotifier = config;
+    }),
+    writeHostOverloadAlertConfig: vi.fn((config) => {
+      storedGlobal.hostOverloadAlert = config;
     }),
     mergeMaintenanceConfig: vi.fn((patch) => {
       Object.assign(storedMaintenance, patch);
@@ -66,6 +75,7 @@ function makeDeps(overrides: Partial<SettingsWriteApplierDeps> = {}): SettingsWr
     syncVcMeetingListenerBotConfig: vi.fn(async () => ({ ok: true as const })),
     validateVcMeetingListenerBotAppId: vi.fn(async () => ({ ok: true as const })),
     validateCodexNotifierTargetBotAppId: vi.fn(async () => ({ ok: true as const })),
+    validateHostOverloadAlertTargetBotAppId: vi.fn(async () => ({ ok: true as const })),
     installCodexNotifierHook: vi.fn(),
     isCodexNotifierPlatformSupported: vi.fn(() => true),
     ...overrides,
@@ -159,6 +169,28 @@ describe('applySettingsWrite happy paths', () => {
     const r = await applySettingsWrite({ chatBotDiscovery: false }, deps);
     expect(r.ok).toBe(true);
     expect(deps.mergeDashboardConfig).toHaveBeenCalledWith({ chatBotDiscovery: false });
+  });
+
+  it('writes noVisibleOutputHint toggle (on) through the dashboard segment', async () => {
+    const deps = makeDeps();
+    const r = await applySettingsWrite({ noVisibleOutputHint: true }, deps);
+    expect(r.ok).toBe(true);
+    expect(deps.mergeDashboardConfig).toHaveBeenCalledWith({ noVisibleOutputHint: true });
+  });
+
+  it('writes bypassCodexHookTrust=false (the disable path — the whole point of a default-ON toggle)', async () => {
+    const deps = makeDeps();
+    const r = await applySettingsWrite({ bypassCodexHookTrust: false }, deps);
+    expect(r.ok).toBe(true);
+    // Must persist the explicit false so the default-ON getter (`!== false`) sees it.
+    expect(deps.mergeDashboardConfig).toHaveBeenCalledWith({ bypassCodexHookTrust: false });
+  });
+
+  it('writes bypassCodexHookTrust=true (re-enable) through the dashboard segment', async () => {
+    const deps = makeDeps();
+    const r = await applySettingsWrite({ bypassCodexHookTrust: true }, deps);
+    expect(r.ok).toBe(true);
+    expect(deps.mergeDashboardConfig).toHaveBeenCalledWith({ bypassCodexHookTrust: true });
   });
 
   it('writes herdrTraexPlugin opt-in and trims source/ref through the dashboard segment', async () => {
@@ -390,6 +422,24 @@ describe('applySettingsWrite — validation errors', () => {
     expect(r.ok).toBe(false);
     if (r.ok) throw new Error('expected failure');
     expect(r.error).toBe('invalid_chatBotDiscovery');
+  });
+
+  it('rejects non-boolean noVisibleOutputHint → invalid_noVisibleOutputHint', async () => {
+    const deps = makeDeps();
+    const r = await applySettingsWrite({ noVisibleOutputHint: 'yes' }, deps);
+    expect(r.ok).toBe(false);
+    if (r.ok) throw new Error('expected failure');
+    expect(r.error).toBe('invalid_noVisibleOutputHint');
+    expect(deps.mergeDashboardConfig).not.toHaveBeenCalled();
+  });
+
+  it('rejects non-boolean bypassCodexHookTrust → invalid_bypassCodexHookTrust', async () => {
+    const deps = makeDeps();
+    const r = await applySettingsWrite({ bypassCodexHookTrust: 'no' }, deps);
+    expect(r.ok).toBe(false);
+    if (r.ok) throw new Error('expected failure');
+    expect(r.error).toBe('invalid_bypassCodexHookTrust');
+    expect(deps.mergeDashboardConfig).not.toHaveBeenCalled();
   });
 
   it('rejects invalid herdrTraexPlugin payloads', async () => {
@@ -828,5 +878,104 @@ describe('applySettingsWrite — IO surface', () => {
     const deps = makeDeps();
     await applySettingsWrite({ publicReadOnly: true }, deps);
     expect(deps.readGlobalConfig).not.toHaveBeenCalled(); // only called for autoUpdate cross-check
+  });
+});
+
+describe('applySettingsWrite — hostOverloadAlert', () => {
+  it('validates the target (requireReady) and persists on enable', async () => {
+    const deps = makeDeps();
+    const r = await applySettingsWrite({
+      hostOverloadAlert: { enabled: true, targetBotAppId: ' cli_notify ' },
+    }, deps);
+
+    expect(r.ok).toBe(true);
+    // Trimmed + validated with requireReady=true (must be online to deliver).
+    expect(deps.validateHostOverloadAlertTargetBotAppId).toHaveBeenCalledWith('cli_notify', { requireReady: true });
+    expect(deps.writeHostOverloadAlertConfig).toHaveBeenCalledWith({
+      enabled: true,
+      targetBotAppId: 'cli_notify',
+    });
+  });
+
+  it('validates a target-only change with requireReady=false (not enabling yet)', async () => {
+    const deps = makeDeps();
+    const r = await applySettingsWrite({
+      hostOverloadAlert: { targetBotAppId: 'cli_notify' },
+    }, deps);
+
+    expect(r.ok).toBe(true);
+    expect(deps.validateHostOverloadAlertTargetBotAppId).toHaveBeenCalledWith('cli_notify', { requireReady: false });
+    expect(deps.writeHostOverloadAlertConfig).toHaveBeenCalledWith({ targetBotAppId: 'cli_notify' });
+  });
+
+  it('rejects enabling with no target selected', async () => {
+    const deps = makeDeps();
+    const r = await applySettingsWrite({ hostOverloadAlert: { enabled: true } }, deps);
+    expect(r).toEqual({ ok: false, error: 'hostOverloadAlert_target_required' });
+    expect(deps.writeHostOverloadAlertConfig).not.toHaveBeenCalled();
+  });
+
+  it('surfaces the validator error for an illegal target (apiOnly / unknown / offline)', async () => {
+    const validate = vi.fn(async () => ({ ok: false as const, error: 'hostOverloadAlert_target_apiOnly' }));
+    const deps = makeDeps({ validateHostOverloadAlertTargetBotAppId: validate });
+    const r = await applySettingsWrite({
+      hostOverloadAlert: { enabled: true, targetBotAppId: 'cli_api_only' },
+    }, deps);
+    expect(r).toEqual({ ok: false, error: 'hostOverloadAlert_target_apiOnly' });
+    expect(deps.writeHostOverloadAlertConfig).not.toHaveBeenCalled();
+  });
+
+  it('rejects a non-boolean enabled', async () => {
+    const deps = makeDeps();
+    const r = await applySettingsWrite({ hostOverloadAlert: { enabled: 'yes' } } as any, deps);
+    expect(r).toEqual({ ok: false, error: 'invalid_hostOverloadAlert_enabled' });
+  });
+
+  it('rejects a non-positive enterLoadRatio and out-of-range enterMemUsedFrac', async () => {
+    const deps = makeDeps();
+    expect(await applySettingsWrite({ hostOverloadAlert: { enterLoadRatio: 0 } }, deps))
+      .toEqual({ ok: false, error: 'invalid_hostOverloadAlert_enterLoadRatio' });
+    expect(await applySettingsWrite({ hostOverloadAlert: { enterMemUsedFrac: 1.5 } }, deps))
+      .toEqual({ ok: false, error: 'invalid_hostOverloadAlert_enterMemUsedFrac' });
+    expect(deps.writeHostOverloadAlertConfig).not.toHaveBeenCalled();
+  });
+
+  it('rejects a non-object / empty patch', async () => {
+    const deps = makeDeps();
+    expect(await applySettingsWrite({ hostOverloadAlert: null } as any, deps))
+      .toEqual({ ok: false, error: 'invalid_hostOverloadAlert' });
+    expect(await applySettingsWrite({ hostOverloadAlert: {} }, deps))
+      .toEqual({ ok: false, error: 'invalid_hostOverloadAlert' });
+  });
+
+  it('merges a threshold-only change onto the persisted config without revalidating an unchanged target', async () => {
+    const deps = makeDeps({
+      readGlobalConfig: vi.fn(() => ({
+        hostOverloadAlert: { enabled: true, targetBotAppId: 'cli_notify', enterLoadRatio: 1.5 },
+      })) as any,
+    });
+    const r = await applySettingsWrite({ hostOverloadAlert: { enterLoadRatio: 2.0 } }, deps);
+    expect(r.ok).toBe(true);
+    // Neither enabling nor changing target → no target revalidation.
+    expect(deps.validateHostOverloadAlertTargetBotAppId).not.toHaveBeenCalled();
+    // The persisted enabled/target survive; only the threshold changes.
+    expect(deps.writeHostOverloadAlertConfig).toHaveBeenCalledWith({
+      enabled: true,
+      targetBotAppId: 'cli_notify',
+      enterLoadRatio: 2.0,
+    });
+  });
+
+  it('can clear the target (null) and disable without requiring a target', async () => {
+    const deps = makeDeps({
+      readGlobalConfig: vi.fn(() => ({
+        hostOverloadAlert: { enabled: false, targetBotAppId: 'cli_notify' },
+      })) as any,
+    });
+    const r = await applySettingsWrite({
+      hostOverloadAlert: { enabled: false, targetBotAppId: null },
+    }, deps);
+    expect(r.ok).toBe(true);
+    expect(deps.writeHostOverloadAlertConfig).toHaveBeenCalledWith({ enabled: false });
   });
 });

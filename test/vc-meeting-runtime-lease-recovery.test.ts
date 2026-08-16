@@ -10,7 +10,7 @@ vi.mock('@larksuiteoapi/node-sdk', () => {
 
 import { __testOnly_createVcMeetingRuntimeLeaseRecovery as createRecovery } from '../src/daemon.js';
 
-type FakeSession = DaemonSession & { testPersistentScope?: 'tmux' | 'herdr' | 'zellij' | 'none' | 'unknown' };
+type FakeSession = DaemonSession & { testPersistentScope?: 'tmux' | 'herdr' | 'zellij' | 'zmx' | 'none' | 'unknown' };
 
 function ref(overrides: Partial<VcMeetingAmbiguousReceiptRef> = {}): VcMeetingAmbiguousReceiptRef {
   return {
@@ -83,17 +83,20 @@ function fakeSession(options: {
 
 function harness(input: {
   sessions?: FakeSession[];
-  probe?: (backend: 'tmux' | 'herdr' | 'zellij', sessionName: string) => 'exists' | 'missing' | 'unknown';
+  probe?: (backend: 'tmux' | 'herdr' | 'zellij' | 'zmx', sessionName: string) => 'exists' | 'missing' | 'unknown';
   missingPersistentScope?: FakeSession['testPersistentScope'];
-  backendAvailable?: (backend: 'tmux' | 'herdr' | 'zellij') => boolean;
+  backendAvailable?: (backend: 'tmux' | 'herdr' | 'zellij' | 'zmx') => boolean;
+  retireDispatch?: (sessionId: string, turnId: string, dispatchAttempt: number) => boolean;
 } = {}) {
   const sessions = new Map((input.sessions ?? []).map(ds => [ds.session.sessionId, ds]));
   const sent: Array<{ sessionId: string; turnId: string; dispatchAttempt: number }> = [];
   const killed: string[] = [];
   const backingKills: string[] = [];
+  const backingKillCalls: Array<{ backend: string; sessionName: string; sessionId: string }> = [];
   const probes: string[] = [];
   const warnings: string[] = [];
   const errors: string[] = [];
+  const retired: Array<{ sessionId: string; turnId: string; dispatchAttempt: number }> = [];
   const recovery = createRecovery({
     findSession: (sessionId: string) => sessions.get(sessionId),
     sendExpiry: (ds: FakeSession, message: { turnId: string; dispatchAttempt: number }) => {
@@ -109,18 +112,23 @@ function harness(input: {
     },
     resolvePersistentScope: (ds: FakeSession) => ds.testPersistentScope ?? 'unknown',
     resolveMissingPersistentScope: () => input.missingPersistentScope ?? 'unknown',
-    backendAvailable: (backend: 'tmux' | 'herdr' | 'zellij') => input.backendAvailable?.(backend) ?? true,
-    killPersistent: (backend: string, sessionName: string) => {
+    backendAvailable: (backend: 'tmux' | 'herdr' | 'zellij' | 'zmx') => input.backendAvailable?.(backend) ?? true,
+    killPersistent: (backend: string, sessionName: string, sessionId: string) => {
       backingKills.push(`${backend}:${sessionName}`);
+      backingKillCalls.push({ backend, sessionName, sessionId });
     },
-    probePersistent: (backend: 'tmux' | 'herdr' | 'zellij', sessionName: string) => {
+    probePersistent: (backend: 'tmux' | 'herdr' | 'zellij' | 'zmx', sessionName: string) => {
       probes.push(`${backend}:${sessionName}`);
       return input.probe?.(backend, sessionName) ?? 'missing';
+    },
+    retireDispatch: (sessionId: string, turnId: string, dispatchAttempt: number) => {
+      retired.push({ sessionId, turnId, dispatchAttempt });
+      return input.retireDispatch?.(sessionId, turnId, dispatchAttempt) ?? true;
     },
     warn: (message: string) => warnings.push(message),
     error: (message: string) => errors.push(message),
   } as any);
-  return { recovery, sessions, sent, killed, backingKills, probes, warnings, errors };
+  return { recovery, sessions, sent, killed, backingKills, backingKillCalls, probes, retired, warnings, errors };
 }
 
 describe('VC meeting runtime lease recovery', () => {
@@ -196,6 +204,41 @@ describe('VC meeting runtime lease recovery', () => {
     expect(h.killed).toEqual(['session_a']);
     expect(h.backingKills).toEqual(['tmux:bmx-session_']);
     expect(h.probes).toEqual(['tmux:bmx-session_']);
+    expect(h.retired).toEqual([{
+      sessionId: 'session_a', turnId: 'delivery_a', dispatchAttempt: 1,
+    }]);
+    expect(h.recovery.snapshot()).toEqual([]);
+  });
+
+  it('keeps a workerless receiver fenced when exact ledger retirement cannot persist', async () => {
+    let retirementWorks = false;
+    const h = harness({
+      sessions: [fakeSession({ worker: false, persistentScope: 'tmux' })],
+      retireDispatch: () => retirementWorks,
+    });
+    h.recovery.arm(ref(), 'agent_test');
+
+    expect(h.recovery.snapshot()).toMatchObject([{ phase: 'blocked', timerArmed: true }]);
+    expect(h.errors.some(message => message.includes('dispatch retirement failed'))).toBe(true);
+
+    retirementWorks = true;
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(h.retired).toHaveLength(2);
+    expect(h.recovery.snapshot()).toEqual([]);
+  });
+
+  it('passes the full receiver session id to ZMX teardown', () => {
+    const h = harness({
+      sessions: [fakeSession({ worker: false, persistentScope: 'zmx' })],
+    });
+    h.recovery.arm(ref(), 'agent_test');
+
+    expect(h.backingKillCalls).toEqual([{
+      backend: 'zmx',
+      sessionName: 'bmx-session_',
+      sessionId: 'session_a',
+    }]);
+    expect(h.probes).toEqual(['zmx:bmx-session_']);
     expect(h.recovery.snapshot()).toEqual([]);
   });
 
@@ -224,8 +267,8 @@ describe('VC meeting runtime lease recovery', () => {
     });
     h.recovery.arm(ref(), 'agent_test');
 
-    expect(h.backingKills.map(value => value.split(':')[0])).toEqual(['tmux', 'herdr', 'zellij']);
-    expect(h.probes.map(value => value.split(':')[0])).toEqual(['tmux', 'herdr', 'zellij']);
+    expect(h.backingKills.map(value => value.split(':')[0])).toEqual(['tmux', 'herdr', 'zellij', 'zmx']);
+    expect(h.probes.map(value => value.split(':')[0])).toEqual(['tmux', 'herdr', 'zellij', 'zmx']);
     expect(h.recovery.snapshot()).toMatchObject([{
       receiverSessionId: 'session_a',
       deliveryKey: 'delivery_a',

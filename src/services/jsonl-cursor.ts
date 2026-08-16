@@ -1,5 +1,12 @@
-import { closeSync, existsSync, openSync, readSync, statSync } from 'node:fs';
-import { StringDecoder } from 'node:string_decoder';
+import {
+  closeSync,
+  constants,
+  existsSync,
+  fstatSync,
+  openSync,
+  readSync,
+  statSync,
+} from 'node:fs';
 
 export interface JsonlCursor {
   newOffset: number;
@@ -16,23 +23,16 @@ export interface JsonlScanOptions {
 const TAIL_PROBE_BYTES = 64 * 1024;
 const JSONL_SCAN_CHUNK_BYTES = 64 * 1024;
 
-/**
- * Scan an append-only JSONL file from `fromOffset` using bounded-memory chunked
- * reads. Calls `onLine` for each COMPLETE line, and returns the durable byte
- * frontier plus any trailing partial line text left after the last newline.
- */
-export function scanJsonlFromOffset(path: string, fromOffset: number, opts: JsonlScanOptions = {}): JsonlCursor | null {
+function scanJsonlFromOpenFd(fd: number, fromOffset: number, opts: JsonlScanOptions = {}): JsonlCursor | null {
   const endOffset = opts.endOffset;
   const chunkSize = Math.max(1, opts.chunkSize ?? JSONL_SCAN_CHUNK_BYTES);
-  let fd: number | null = null;
   let nextReadOffset = Math.max(0, fromOffset);
   let lineStartOffset = nextReadOffset;
-  let carry = '';
-  const decoder = new StringDecoder('utf8');
+  let lineBuffers: Buffer[] = [];
+  let lineBytes = 0;
   const buf = Buffer.alloc(chunkSize);
 
   try {
-    fd = openSync(path, 'r');
     while (true) {
       const remaining = endOffset === undefined ? chunkSize : endOffset - nextReadOffset;
       if (remaining <= 0) break;
@@ -41,28 +41,66 @@ export function scanJsonlFromOffset(path: string, fromOffset: number, opts: Json
       if (bytesRead <= 0) break;
       nextReadOffset += bytesRead;
 
-      const decoded = decoder.write(buf.subarray(0, bytesRead));
-      const text = carry + decoded;
       let searchFrom = 0;
-      let currentLineStart = lineStartOffset;
-      // carry never contains '\n', so newlines can only appear at or after
-      // carry.length — starting there avoids re-scanning a growing carry on
-      // every chunk when a single record spans many chunks.
-      let nl = text.indexOf('\n', carry.length);
+      let nl = buf.subarray(0, bytesRead).indexOf(0x0a);
       while (nl >= 0) {
-        const line = text.slice(searchFrom, nl);
-        opts.onLine?.(line, currentLineStart);
-        currentLineStart += Buffer.byteLength(line, 'utf8') + 1;
+        const segment = Buffer.from(buf.subarray(searchFrom, nl));
+        if (segment.length > 0) {
+          lineBuffers.push(segment);
+          lineBytes += segment.length;
+        }
+        const line = lineBuffers.length === 1
+          ? lineBuffers[0]
+          : Buffer.concat(lineBuffers, lineBytes);
+        opts.onLine?.(line.toString('utf8'), lineStartOffset);
         searchFrom = nl + 1;
-        nl = text.indexOf('\n', searchFrom);
+        lineStartOffset += lineBytes + 1;
+        lineBuffers = [];
+        lineBytes = 0;
+        nl = buf.subarray(searchFrom, bytesRead).indexOf(0x0a);
+        if (nl >= 0) nl += searchFrom;
       }
-      carry = text.slice(searchFrom);
-      lineStartOffset = currentLineStart;
+      if (searchFrom < bytesRead) {
+        const segment = Buffer.from(buf.subarray(searchFrom, bytesRead));
+        lineBuffers.push(segment);
+        lineBytes += segment.length;
+      }
     }
     return {
       newOffset: lineStartOffset,
-      pendingTail: carry + decoder.end(),
+      pendingTail: lineBuffers.length === 0
+        ? ''
+        : (lineBuffers.length === 1 ? lineBuffers[0] : Buffer.concat(lineBuffers, lineBytes)).toString('utf8'),
     };
+  } catch (error) {
+    opts.onError?.(error);
+    return null;
+  }
+}
+
+/** Scan a JSONL stream from a caller-owned regular file descriptor. The fd is
+ *  never closed here; ownership stays with the caller. */
+export function scanJsonlFromFd(fd: number, fromOffset: number, opts: JsonlScanOptions = {}): JsonlCursor | null {
+  return scanJsonlFromOpenFd(fd, fromOffset, opts);
+}
+
+/**
+ * Scan an append-only JSONL file from `fromOffset` using chunked reads. Calls
+ * `onLine` for each COMPLETE line, and returns the durable byte frontier plus
+ * any trailing partial line text left after the last newline. One logical line
+ * is accumulated linearly, so memory remains proportional to that line length.
+ */
+export function scanJsonlFromOffset(path: string, fromOffset: number, opts: JsonlScanOptions = {}): JsonlCursor | null {
+  let fd: number | null = null;
+  try {
+    // O_NONBLOCK prevents an untrusted transcript path swapped to a FIFO from
+    // hanging the daemon. Validate the opened fd (rather than only the path)
+    // so directories/devices and the stat→open replacement window fail closed.
+    fd = openSync(path, constants.O_RDONLY | (constants.O_NONBLOCK ?? 0));
+    if (!fstatSync(fd).isFile()) {
+      throw new Error(`JSONL source is not a regular file: ${path}`);
+    }
+    return scanJsonlFromOpenFd(fd, fromOffset, opts);
   } catch (error) {
     opts.onError?.(error);
     return null;

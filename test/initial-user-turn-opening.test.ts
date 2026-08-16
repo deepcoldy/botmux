@@ -23,7 +23,7 @@
  * Run:  pnpm vitest run test/initial-user-turn-opening.test.ts
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 
@@ -107,6 +107,12 @@ vi.mock('../src/core/worker-pool.js', async () => {
   };
 });
 
+// hook 注入的 preflight：默认 false（不影响现有 codex 测试），特定用例置 true。
+const preflightMock = vi.fn(() => false);
+vi.mock('../src/adapters/hook-installer.js', () => ({
+  hasInstalledPromptHookCached: (...args: any[]) => preflightMock(...args),
+}));
+
 import { registerBot } from '../src/bot-registry.js';
 import { sessionKey } from '../src/core/types.js';
 import type { DaemonSession } from '../src/core/types.js';
@@ -116,6 +122,7 @@ import { globalConfigPath, invalidateGlobalConfigCache } from '../src/global-con
 import {
   __testOnly_activeSessions as activeSessions,
   __testOnly_handleThreadReply as handleThreadReply,
+  __testOnly_computeCodexAppSteerable as computeCodexAppSteerable,
 } from '../src/daemon.js';
 
 const APP = 'initial_turn_app';
@@ -377,6 +384,53 @@ describe('empty-started session — first real business turn must use the new-to
       .toContain('ou_owner');
   });
 
+  it('live worker: a plain human Codex App turn is admitted as steerable (R4-B1 production wiring, not hand-injected)', async () => {
+    const anchor = 'om_steer_live_root';
+    registerBot({
+      larkAppId: APP,
+      larkAppSecret: 's',
+      cliId: 'codex-app',
+      allowedUsers: [OWNER],
+      oncallChats: [{ chatId: CHAT, workingDir: '/tmp' }],
+    }).resolvedAllowedUsers = [OWNER];
+    seedEmptyStarted(anchor, { cliId: 'codex-app' });
+
+    await handleThreadReply(
+      makeEventData('om_steer_live_msg', '第一条真实交互消息', anchor),
+      makeCtx(anchor, 'om_steer_live_msg'),
+    );
+
+    // The daemon computes codexAppSteerable and passes it as sendWorkerInput's
+    // 4th arg (opts) — this is the production path the worker init COPY depends
+    // on. The test does NOT hand-inject the flag anywhere.
+    const opts = mocks.sendWorkerInput.mock.calls[0]?.[3];
+    expect(opts?.codexAppSteerable).toBe(true);
+  });
+
+  it('worker-null refork: a plain human Codex App opening carries the frozen steerable flag on the fork payload (R4-B1)', async () => {
+    const anchor = 'om_steer_cold_root';
+    registerBot({
+      larkAppId: APP,
+      larkAppSecret: 's',
+      cliId: 'codex-app',
+      allowedUsers: [OWNER],
+      oncallChats: [{ chatId: CHAT, workingDir: '/tmp' }],
+    }).resolvedAllowedUsers = [OWNER];
+    seedEmptyStarted(anchor, { live: false, hasHistory: true, cliId: 'codex-app' });
+
+    await handleThreadReply(
+      makeEventData('om_steer_cold_msg', '冷启后的第一条真实交互消息', anchor),
+      makeCtx(anchor, 'om_steer_cold_msg'),
+    );
+
+    // The worker-null re-fork opening must carry the frozen steer authorization
+    // on the CliTurnPayload handed to forkWorker (the gap codex flagged: the
+    // production init path never set it, only the hand-injected test did).
+    expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
+    const openingPayload = mocks.forkWorker.mock.calls[0]?.[1] as any;
+    expect(openingPayload?.codexAppSteerable).toBe(true);
+  });
+
   // ─── worker-null / refork ───────────────────────────────────────────────────
 
   it('worker-null refork: opens with new-topic context and does NOT resume a never-used CLI', async () => {
@@ -397,6 +451,42 @@ describe('empty-started session — first real business turn must use the new-to
     expect(opening).not.toContain('<botmux_reminder>');
     expect(mocks.forkWorker.mock.calls[0]?.[2]).toEqual({ resume: false, turnId: 'om_cold_first' });
     expect(ds.session.initialUserTurnPending).toBeUndefined();
+  });
+
+  it('worker-null refork + auto hook: opening 轮不写 speculative sidecar（review 三审 HIGH-3）', async () => {
+    // 三审发现：opening 分支曾无条件先跑 buildReforkCliInput（有写 sidecar 的副作用），
+    // 结果被 buildNewTopicCliInput 覆盖丢弃，但 sidecar 已写入 opening 的 turnId，
+    // opening 的 hook 会领到这份没发出去的 speculative reminder → 双注入。
+    // 修复后 opening 分支直接用 buildNewTopicCliInput（不写 sidecar）。
+    const anchor = 'om_hook_opening_root';
+    const ds = seedEmptyStarted(anchor, { live: false, hasHistory: true, cliId: 'claude-code' });
+    ds.session.backendType = 'pty';
+    // 切到 claude-code + auto hook + preflight 通过
+    const bot = registerBot({
+      larkAppId: APP,
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      allowedUsers: [OWNER],
+      oncallChats: [{ chatId: CHAT, workingDir: '/tmp' }],
+      envelopeInjection: 'auto' as const,
+    });
+    bot.resolvedAllowedUsers = [OWNER];
+    bot.botName = 'TestBot';
+    bot.botOpenId = 'ou_selfbot';
+    preflightMock.mockReturnValue(true);
+
+    await handleThreadReply(
+      makeEventData('om_hook_first', '第一条消息', anchor),
+      makeCtx(anchor, 'om_hook_first'),
+    );
+
+    // opening 用 new-topic 构造，不应有 sidecar 写入
+    const sidecarDir = join(process.env.SESSION_DATA_DIR!, 'prompt-ctx', ds.session.sessionId);
+    expect(existsSync(sidecarDir)).toBe(false);
+    // opening 内容应包含 user_message（new-topic 开场）；claude 系列不内联 routing 块
+    const opening = forkInputs()[0]!.content;
+    expect(opening).toContain('<user_message>');
+    expect(opening).not.toContain('<botmux_reminder>');
   });
 
   it('worker-null refork keeps --resume when a non-IM path already fed the CLI', async () => {
@@ -689,5 +779,48 @@ describe('empty-started session — first real business turn must use the new-to
     expect(mocks.forkWorker.mock.calls[mocks.forkWorker.mock.calls.length - 1]?.[2])
       .toEqual({ resume: false, turnId: 'om_after_death' });
     expect(ds.session.initialUserTurnPending).toBeUndefined();
+  });
+});
+
+describe('computeCodexAppSteerable — fail-closed positive-human gate (R7-B1)', () => {
+  const humanFacts = {
+    humanSender: true,
+    adopted: false,
+    isForeignBot: false,
+    isBotSenderType: false,
+    substituteTrigger: false,
+    controlRewrite: false,
+    messageListener: false,
+    vcMeetingReceiver: false,
+    vcMeetingImTurnOrigin: false,
+  };
+
+  it('authorizes ONLY a positive human sender with no special semantics', () => {
+    expect(computeCodexAppSteerable({ ...humanFacts })).toBe(true);
+  });
+
+  it('is fail-closed: NO humanSender ⇒ serial even when every exclusion is absent (the fail-open root)', () => {
+    // The bug codex caught: excluding a list of known non-human sources is not
+    // enough — an un-enumerated non-user source (humanSender:false) must still be
+    // denied. This is the core positive-assert guarantee.
+    expect(computeCodexAppSteerable({ ...humanFacts, humanSender: false })).toBe(false);
+  });
+
+  it('each special-source fact independently forces serial', () => {
+    for (const key of [
+      'adopted', 'isForeignBot', 'isBotSenderType', 'substituteTrigger',
+      'controlRewrite', 'messageListener', 'vcMeetingReceiver', 'vcMeetingImTurnOrigin',
+    ] as const) {
+      expect(computeCodexAppSteerable({ ...humanFacts, [key]: true })).toBe(false);
+    }
+  });
+
+  it('a known peer bot (isForeignBot true / humanSender false) stays serial even if sender_type looked user-like', () => {
+    // The known-peer fallback: an anomalous sender_type from a known peer must
+    // NOT be authorized. Both the humanSender=false and isForeignBot=true facts
+    // (which the daemon derives via isKnownPeerBot) independently deny it.
+    expect(computeCodexAppSteerable({
+      ...humanFacts, humanSender: false, isForeignBot: true,
+    })).toBe(false);
   });
 });

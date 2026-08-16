@@ -138,3 +138,34 @@ describe('parseAskBody — questions[] 多问多选', () => {
     expect('error' in body).toBe(true);
   });
 });
+
+describe('parseAskBody — requestId / originKind (invocation identity)', () => {
+  it('接受并透传合法 requestId + originKind', () => {
+    const out = parseAskBody(validBody({ requestId: 'req-abc', originKind: 'hook' }));
+    expect('error' in out).toBe(false);
+    if (!('error' in out)) {
+      expect(out.requestId).toBe('req-abc');
+      expect(out.originKind).toBe('hook');
+    }
+  });
+
+  it('缺省时 requestId/originKind 为 undefined（旧调用方兼容）', () => {
+    const out = parseAskBody(validBody());
+    if (!('error' in out)) {
+      expect(out.requestId).toBeUndefined();
+      expect(out.originKind).toBeUndefined();
+    }
+  });
+
+  it('非法 requestId（空 / 超 128 / 非字符串）报错', () => {
+    expect('error' in parseAskBody(validBody({ requestId: '' }))).toBe(true);
+    expect('error' in parseAskBody(validBody({ requestId: 'x'.repeat(129) }))).toBe(true);
+    expect('error' in parseAskBody(validBody({ requestId: 123 }))).toBe(true);
+  });
+
+  it('非法 originKind（空 / 超 32 / 非字符串）报错', () => {
+    expect('error' in parseAskBody(validBody({ originKind: '' }))).toBe(true);
+    expect('error' in parseAskBody(validBody({ originKind: 'x'.repeat(33) }))).toBe(true);
+    expect('error' in parseAskBody(validBody({ originKind: {} }))).toBe(true);
+  });
+});

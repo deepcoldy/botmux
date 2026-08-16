@@ -28,7 +28,7 @@ vi.mock('node:child_process', () => ({
 }));
 
 // Import after mock setup
-import { scanProjects, scanMultipleProjects, type ProjectInfo } from '../src/services/project-scanner.js';
+import { scanProjects, scanMultipleProjects, DEFAULT_MAX_SCAN_DIRS, DEFAULT_MAX_SCAN_MS, type ProjectInfo } from '../src/services/project-scanner.js';
 import { execSync } from 'node:child_process';
 
 const mockedExecSync = vi.mocked(execSync);
@@ -837,5 +837,105 @@ describe('scanMultipleProjects', () => {
   it('should handle empty baseDirs array', () => {
     const results = scanMultipleProjects([]);
     expect(results).toEqual([]);
+  });
+});
+
+// ─── maxScanDirs budget guard ──────────────────────────────────────────────
+// A misconfigured scan root (e.g. `~`) must not turn the synchronous walk into
+// a minutes-long event-loop stall. The guard caps directories visited.
+
+describe('scanProjects — maxScanDirs budget', () => {
+  it('does not discover a repo that sits beyond the directory budget', () => {
+    // Single deterministic chain: tempRoot → a → b → c → d → e → repo.
+    // With maxScanDirs:5 the walk visits tempRoot(1) a(2) b(3) c(4) d(5), trips
+    // the budget at d, and never descends into e/ — so the repo is unreachable.
+    // Order-independent: there's only one path, so this doesn't depend on which
+    // sibling readdir returns first. A weaker `toBeLessThanOrEqual(1)` would pass
+    // even if the whole dir guard were deleted; `toEqual([])` catches that.
+    mkRepo('a/b/c/d/e/repo');
+
+    const results = scanProjects(tempRoot, 10, { maxScanDirs: 5 });
+
+    expect(results).toEqual([]);
+  });
+
+  it('discovers that same repo when the budget is large (positive control)', () => {
+    // Same fixture as above, but a huge budget proves the chain IS fully
+    // scannable — so the empty result above is caused by the budget, not by
+    // an unreachable/mis-built fixture.
+    mkRepo('a/b/c/d/e/repo');
+
+    const results = scanProjects(tempRoot, 10, { maxScanDirs: 999999 });
+
+    expect(results).toHaveLength(1);
+    expect(results[0]!.name).toBe('repo');
+  });
+
+  it('finds repos normally when the tree fits within budget', () => {
+    mkRepo('a/proj-1');
+    mkRepo('b/proj-2');
+
+    const results = scanProjects(tempRoot, 3, { maxScanDirs: DEFAULT_MAX_SCAN_DIRS });
+
+    expect(results.map(r => r.name).sort()).toEqual(['proj-1', 'proj-2']);
+  });
+
+  it('defaults to DEFAULT_MAX_SCAN_DIRS when no budget is given', () => {
+    mkRepo('proj');
+    const results = scanProjects(tempRoot);
+    expect(results.map(r => r.name)).toEqual(['proj']);
+    expect(DEFAULT_MAX_SCAN_DIRS).toBeGreaterThan(0);
+  });
+
+  it('stops walking once the wall-clock budget is spent', () => {
+    // A deep chain of dirs; a 0ms budget trips on the very first overBudget()
+    // check so almost nothing is traversed. Proves the time guard is wired in
+    // independently of the dir-count cap.
+    mkRepo('a/b/c/d/e/repo');
+    const results = scanProjects(tempRoot, 10, { maxScanMs: 0, maxScanDirs: 999999 });
+    expect(results).toEqual([]);
+    expect(DEFAULT_MAX_SCAN_MS).toBeGreaterThan(0);
+  });
+
+  it('invokes onBudgetExceeded with reason "dirs" when the dir cap trips', () => {
+    // Same single-chain fixture as the false-green test: the repo sits behind
+    // the budget, so the walk bails and the callback must fire so a caller can
+    // warn the user the list is incomplete.
+    mkRepo('a/b/c/d/e/repo');
+    const calls: Array<{ reason: string; dirsVisited: number }> = [];
+    scanProjects(tempRoot, 10, {
+      maxScanDirs: 5,
+      onBudgetExceeded: (info) => calls.push({ reason: info.reason, dirsVisited: info.dirsVisited }),
+    });
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.reason).toBe('dirs');
+    expect(calls[0]!.dirsVisited).toBeGreaterThanOrEqual(5);
+  });
+
+  it('invokes onBudgetExceeded with reason "time" when the wall-clock cap trips', () => {
+    mkRepo('a/b/c/d/e/repo');
+    const calls: Array<{ reason: string }> = [];
+    scanProjects(tempRoot, 10, {
+      maxScanMs: 0,
+      maxScanDirs: 999999,
+      onBudgetExceeded: (info) => calls.push({ reason: info.reason }),
+    });
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.reason).toBe('time');
+  });
+
+  it('does NOT invoke onBudgetExceeded when the scan completes within budget', () => {
+    // Deleting the guard entirely would still pass this (it never trips), but
+    // paired with the "dirs"/"time" tests above it pins the callback to fire
+    // exactly on budget-hit and never on a clean scan — so a caller never shows
+    // a spurious "incomplete" warning.
+    mkRepo('proj');
+    let called = false;
+    const results = scanProjects(tempRoot, 3, {
+      maxScanDirs: DEFAULT_MAX_SCAN_DIRS,
+      onBudgetExceeded: () => { called = true; },
+    });
+    expect(results.map(r => r.name)).toEqual(['proj']);
+    expect(called).toBe(false);
   });
 });

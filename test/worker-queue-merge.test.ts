@@ -1,8 +1,10 @@
 import { describe, expect, it } from 'vitest';
 import {
+  handoffQueuedDurableInputsOnBackendExit,
   mergeQueuedCliInput,
   pendingInputMayFlush,
   pendingInputAllowsTypeAhead,
+  resetPreservingPendingCliInputs,
   shouldDeferArgsBakedDurablePrompt,
   shouldDeferInitialPromptForArgLimit,
   shouldStopPendingBatch,
@@ -73,6 +75,38 @@ describe('mergeQueuedCliInput', () => {
       turnId: 'im-2',
       vcMeetingImTurnOrigin: { ...imOrigin, larkMessageId: 'im-2' },
     })).toBe(true);
+  });
+});
+
+describe('handoffQueuedDurableInputsOnBackendExit', () => {
+  it('hands off every queued durable generation while preserving ordinary input order', () => {
+    const ordinaryBefore = { content: 'ordinary before', turnId: 'im-1' };
+    const durableOne = { content: 'delivery one', turnId: 'delivery-1', dispatchAttempt: 1 };
+    const ordinaryAfter = { content: 'ordinary after', turnId: 'im-2' };
+    const durableTwo = { content: 'delivery two', turnId: 'delivery-2', dispatchAttempt: 4 };
+    const pending = [ordinaryBefore, durableOne, ordinaryAfter, durableTwo];
+
+    const handedOff = handoffQueuedDurableInputsOnBackendExit(
+      pending,
+      { intentionalRestart: false },
+    );
+
+    expect(handedOff).toEqual([durableOne, durableTwo]);
+    expect(pending).toEqual([ordinaryBefore, ordinaryAfter]);
+  });
+
+  it('preserves the complete queue for an intentional in-worker restart', () => {
+    const pending = [
+      { content: 'ordinary', turnId: 'im-1' },
+      { content: 'delivery', turnId: 'delivery-1', dispatchAttempt: 2 },
+    ];
+    const snapshot = [...pending];
+
+    expect(handoffQueuedDurableInputsOnBackendExit(
+      pending,
+      { intentionalRestart: true },
+    )).toEqual([]);
+    expect(pending).toEqual(snapshot);
   });
 });
 
@@ -238,5 +272,34 @@ describe('durable turn queue boundary', () => {
       codexAppInput: { text: 'clean-2' },
     })).toBe(false);
     expect(ordinaryTail).toEqual([{ content: 'legacy-1', turnId: 't1' }]);
+  });
+});
+
+describe('resetPreservingPendingCliInputs', () => {
+  it('restores unwritten prompts after a reset clears the live queue', () => {
+    const pending = [
+      { content: 'initial hello', turnId: 't1' },
+      { content: 'follow-up', turnId: 't2' },
+    ];
+
+    resetPreservingPendingCliInputs(pending, () => {
+      pending.length = 0;
+    });
+
+    expect(pending).toEqual([
+      { content: 'initial hello', turnId: 't1' },
+      { content: 'follow-up', turnId: 't2' },
+    ]);
+  });
+
+  it('keeps the snapshot ahead of items produced during reset and restores on throw', () => {
+    const pending = [{ content: 'queued' }];
+
+    expect(() => resetPreservingPendingCliInputs(pending, () => {
+      pending.push({ content: 'reset-added' });
+      throw new Error('reset failed');
+    })).toThrow('reset failed');
+
+    expect(pending.map(item => item.content)).toEqual(['queued', 'reset-added']);
   });
 });

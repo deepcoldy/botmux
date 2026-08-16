@@ -8,6 +8,8 @@ const mocks = vi.hoisted(() => ({
   consumeQuota: vi.fn(),
   removeChatGrant: vi.fn(),
   removeGlobalGrant: vi.fn(),
+  getGrantExpiresAt: vi.fn(),
+  removeExpiredGrant: vi.fn(),
   beginCharge: vi.fn(),
   commitCharge: vi.fn(),
   abortCharge: vi.fn(),
@@ -24,6 +26,7 @@ vi.mock('@larksuiteoapi/node-sdk', () => {
 vi.mock('../src/services/grant-store.js', () => ({
   chatQuotaKey: (chatId: string, openId: string) => `chat:${chatId}:${openId}`,
   globalQuotaKey: (openId: string) => `global:${openId}`,
+  getGrantExpiresAt: mocks.getGrantExpiresAt,
   addAllowedChatGroup: vi.fn(),
   addChatGrant: vi.fn(),
   addGlobalGrant: vi.fn(),
@@ -31,6 +34,7 @@ vi.mock('../src/services/grant-store.js', () => ({
   removeAllowedChatGroup: vi.fn(),
   removeChatGrant: mocks.removeChatGrant,
   removeGlobalGrant: mocks.removeGlobalGrant,
+  removeExpiredGrant: mocks.removeExpiredGrant,
   revokeGrant: vi.fn(),
 }));
 
@@ -60,7 +64,13 @@ vi.mock('../src/im/lark/client.js', async () => {
   };
 });
 
-import { registerBot } from '../src/bot-registry.js';
+// 团队拉群（bot 免 /grant 的信任根）。只把 oc_team_group 标成拉群，其余不变。
+vi.mock('../src/services/team-groups-store.js', async () => {
+  const actual = await vi.importActual<any>('../src/services/team-groups-store.js');
+  return { ...actual, isTeamGroupChat: (_dataDir: string, chatId?: string) => chatId === 'oc_team_group' };
+});
+
+import { registerBot, getBot } from '../src/bot-registry.js';
 import { parseSlashCommandInvocation } from '../src/core/command-handler.js';
 import { enforceMessageQuotaForCliInput, grantRestrictedCommandText, grantRestrictedSlashCommandText } from '../src/daemon.js';
 
@@ -83,6 +93,8 @@ describe('message quota enforcement', () => {
     mocks.consumeQuota.mockResolvedValue({ tracked: true, allow: true });
     mocks.removeChatGrant.mockResolvedValue({ ok: true, removed: true });
     mocks.removeGlobalGrant.mockResolvedValue({ ok: true, removed: true });
+    mocks.getGrantExpiresAt.mockReturnValue(undefined);
+    mocks.removeExpiredGrant.mockResolvedValue({ ok: true, removed: true });
     mocks.buildQuotaExhaustedCard.mockReturnValue('quota-card');
     mocks.replyMessage.mockResolvedValue('om_reply');
     mocks.sendMessage.mockResolvedValue('om_send');
@@ -94,6 +106,44 @@ describe('message quota enforcement', () => {
       .resolves.toBe(true);
     expect(mocks.beginCharge).not.toHaveBeenCalled();
     expect(mocks.consumeQuota).not.toHaveBeenCalled();
+  });
+
+  it('checks talk permission but does not charge a setup-only message', async () => {
+    await expect(enforceMessageQuotaForCliInput(
+      'quota_app', 'oc_1', 'ou_chat', 'om_setup', 'om_anchor',
+      undefined, undefined, 'group', false, { skipCharge: true },
+    )).resolves.toBe(true);
+    expect(mocks.beginCharge).not.toHaveBeenCalled();
+    expect(mocks.consumeQuota).not.toHaveBeenCalled();
+
+    await expect(enforceMessageQuotaForCliInput(
+      'quota_app', 'oc_1', 'ou_stranger', 'om_setup_denied', 'om_anchor',
+      undefined, undefined, 'group', false, { skipCharge: true },
+    )).resolves.toBe(false);
+    expect(mocks.beginCharge).not.toHaveBeenCalled();
+  });
+
+  it('bot 发送方走 evaluateBotTalk：团队拉群里没带 union_id 也不被这道复查丢掉', async () => {
+    // 端到端断点（#332 同款的最后一截）：dispatcher 外层用 evaluateBotTalk 放行了
+    // 「团队拉群 + sender 没带 union_id」的 bot，这里若仍用 evaluateTalk 就会静默丢弃
+    // ——比弹授权卡更糟，owner 以为放行了、消息凭空消失。两道闸必须同一个谓词。
+    await expect(
+      enforceMessageQuotaForCliInput(
+        'quota_app', 'oc_team_group', 'ou_foreign_bot', 'om_bot_no_union', 'om_anchor',
+        undefined, undefined, 'group', true,
+      ),
+    ).resolves.toBe(true);
+  });
+
+  it('同一条消息不标 bot（人的路径）仍按 evaluateTalk 拦下——团队拉群不放行真人', async () => {
+    // 反向锁：证明放行来自 botSender 这一腿，而不是把闸门整体放宽了。
+    // 团队拉群对真人不是 talk 来源（真人走 teamMember 腿，要 union 在团队成员名单里）。
+    await expect(
+      enforceMessageQuotaForCliInput(
+        'quota_app', 'oc_team_group', 'ou_human', 'om_human_no_union', 'om_anchor',
+        undefined, undefined, 'group',
+      ),
+    ).resolves.toBe(false);
   });
 
   it('renders grant restriction text only for restricted per-user grantees', () => {
@@ -151,13 +201,46 @@ describe('message quota enforcement', () => {
     expect(mocks.consumeQuota).not.toHaveBeenCalled();
   });
 
+  it('rejects an expired grant before quota charging and schedules conditional cleanup', async () => {
+    const expiredAt = Date.now() - 1;
+    mocks.getGrantExpiresAt.mockReturnValue(expiredAt);
+    await expect(enforceMessageQuotaForCliInput('quota_app', 'oc_1', 'ou_chat', 'om_expired', 'om_anchor'))
+      .resolves.toBe(false);
+    expect(mocks.beginCharge).not.toHaveBeenCalled();
+    expect(mocks.consumeQuota).not.toHaveBeenCalled();
+    expect(mocks.removeExpiredGrant).toHaveBeenCalledWith(
+      'quota_app',
+      'chat',
+      'oc_1',
+      'ou_chat',
+      expiredAt,
+    );
+  });
+
+  it('allows a sender already authorized by a message listener match', async () => {
+    await expect(enforceMessageQuotaForCliInput(
+      'quota_app',
+      'oc_1',
+      undefined,
+      'om_listener',
+      'om_anchor',
+      undefined,
+      undefined,
+      'group',
+      undefined,
+      { listenerAuthorized: true },
+    )).resolves.toBe(true);
+    expect(mocks.beginCharge).not.toHaveBeenCalled();
+    expect(mocks.consumeQuota).not.toHaveBeenCalled();
+  });
+
   it('allows the exhausting chat-grant message but defers revoke/notify to the next message', async () => {
     // exhausted=true 表示「本条刚好用完额度」——依旧放行给 AI 处理，但不在此时 revoke/notify
     // （避免给用户「本条已被拒绝」的错觉）；revoke + 通知推迟到下一条被 allow=false 拦截时再做。
     mocks.consumeQuota.mockResolvedValue({ tracked: true, allow: true, exhausted: true, used: 5, limit: 5 });
     await expect(enforceMessageQuotaForCliInput('quota_app', 'oc_1', 'ou_chat', 'om_2', 'om_anchor'))
       .resolves.toBe(true);
-    expect(mocks.consumeQuota).toHaveBeenCalledWith('quota_app', 'chat:oc_1:ou_chat', undefined);
+    expect(mocks.consumeQuota).toHaveBeenCalledWith('quota_app', 'chat:oc_1:ou_chat', undefined, undefined);
     expect(mocks.commitCharge).toHaveBeenCalledWith('quota_app', 'om_2');
     // 延迟通知：耗尽这一条不再立即 revoke / 发卡 / 通知
     expect(mocks.removeChatGrant).not.toHaveBeenCalled();
@@ -170,9 +253,110 @@ describe('message quota enforcement', () => {
     mocks.consumeQuota.mockResolvedValue({ tracked: true, allow: false, used: 5, limit: 5 });
     await expect(enforceMessageQuotaForCliInput('quota_app', 'oc_9', 'ou_global', 'om_3', 'om_anchor'))
       .resolves.toBe(false);
-    expect(mocks.consumeQuota).toHaveBeenCalledWith('quota_app', 'global:ou_global', undefined);
+    expect(mocks.consumeQuota).toHaveBeenCalledWith('quota_app', 'global:ou_global', undefined, undefined);
     expect(mocks.removeGlobalGrant).toHaveBeenCalledWith('quota_app', 'ou_global');
     expect(mocks.replyMessage).toHaveBeenCalled();
+  });
+
+  it('P1: explicit-unlimited grant is NOT re-capped by messageQuota.defaultLimit', async () => {
+    // 复现 codex 抓的回归：配了默认额度时，卡片选「不限」/裸 /grant 授的授权在磁盘上无
+    // quota 记录（= 显式不限）。enforce 绝不能把 defaultLimit 传给 consumeQuota，否则首条
+    // 消息会 lazy-init 出 {limit:def} 把「不限」静默限成 def 条。断言：grant 路径下 def=undefined。
+    getBot('quota_app').config.messageQuota = { defaultLimit: 7 };
+    mocks.consumeQuota.mockResolvedValue({ tracked: false, allow: true }); // 无记录 → 不限放行
+    await expect(enforceMessageQuotaForCliInput('quota_app', 'oc_1', 'ou_chat', 'om_unlim', 'om_anchor'))
+      .resolves.toBe(true);
+    // 关键断言：即便配了 defaultLimit=7，grant 路径仍传 undefined（不 lazy-init）
+    expect(mocks.consumeQuota).toHaveBeenCalledWith('quota_app', 'chat:oc_1:ou_chat', undefined, undefined);
+  });
+
+  it('oncall still lazy-inits with messageQuota.defaultLimit (fix does not touch oncall)', async () => {
+    // 反向保护：oncall 命中时没有预落库的额度记录，defaultLimit 的 lazy-init 必须仍然生效，
+    // 否则本次 P1 修复会误伤 oncall 默认额度。断言：oncall 路径把 def=7 传给 consumeQuota。
+    const oncall = registerBot({
+      larkAppId: 'oncall_app',
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      allowedUsers: ['ou_owner'],
+      oncallChats: [{ chatId: 'oc_oncall', workingDir: '/tmp' }],
+      messageQuota: { defaultLimit: 7 },
+    });
+    oncall.resolvedAllowedUsers = ['ou_owner'];
+    mocks.consumeQuota.mockResolvedValue({ tracked: true, allow: true });
+    await expect(enforceMessageQuotaForCliInput('oncall_app', 'oc_oncall', 'ou_visitor', 'om_oncall', 'om_anchor'))
+      .resolves.toBe(true);
+    expect(mocks.consumeQuota).toHaveBeenCalledWith('oncall_app', 'chat:oc_oncall:ou_visitor', 7, undefined);
+  });
+
+  it('P1 intersection: oncall ∩ explicit-unlimited chatGrant is NOT re-capped by defaultLimit', async () => {
+    // codex delta round-2 抓的交集角落：群同时是 oncallChat + 配了 defaultLimit，且用户还持有
+    // 一条显式不限 chatGrant。evaluateTalk 先命中 oncall（reason='oncall'），与 chatGrant 共用
+    // 同一把 chat quotaKey。只看 reason 的 gate 会误传 def → 把「显式不限」lazy-init 回 default。
+    // 断言：explicitGrantOverride 令交集也传 def=undefined。
+    const bot = registerBot({
+      larkAppId: 'isect_app',
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      allowedUsers: ['ou_owner'],
+      oncallChats: [{ chatId: 'oc_isect', workingDir: '/tmp' }],
+      messageQuota: { defaultLimit: 7 },
+    });
+    bot.resolvedAllowedUsers = ['ou_owner'];
+    // 显式不限 chatGrant：有 chatGrants 成员但无 quotaState 记录
+    bot.config.chatGrants = { oc_isect: ['ou_x'] };
+    mocks.consumeQuota.mockResolvedValue({ tracked: false, allow: true });
+    await expect(enforceMessageQuotaForCliInput('isect_app', 'oc_isect', 'ou_x', 'om_isect', 'om_anchor'))
+      .resolves.toBe(true);
+    // 关键断言：交集下也不兜 default（否则「显式不限」被套回 7）
+    expect(mocks.consumeQuota).toHaveBeenCalledWith('isect_app', 'chat:oc_isect:ou_x', undefined, undefined);
+  });
+
+  it('P1 expired intersection: oncall ∩ EXPIRED chatGrant passes expiredGrant descriptor + default into consumeQuota (one atomic call)', async () => {
+    // 清理+额度决策收口进 consumeQuota 同一把锁。daemon 不单独 await removeExpiredGrant，
+    // 而是把 expiredGrant 描述符 + 拟回落 def 一起传给 consumeQuota，由它锁内以当前 expiry 定夺。
+    // 断言：consume 收到 (quotaKey, def=7, expiredGrant{scope,chatId,openId})。
+    const bot = registerBot({
+      larkAppId: 'exp_app',
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      allowedUsers: ['ou_owner'],
+      oncallChats: [{ chatId: 'oc_exp', workingDir: '/tmp' }],
+      messageQuota: { defaultLimit: 7 },
+    });
+    bot.resolvedAllowedUsers = ['ou_owner'];
+    bot.config.chatGrants = { oc_exp: ['ou_x'] };            // 成员仍在
+    const expiredAt = Date.now() - 1;
+    mocks.getGrantExpiresAt.mockReturnValue(expiredAt);       // evaluateTalk 观察到过期
+    mocks.consumeQuota.mockResolvedValue({ tracked: true, allow: true, used: 1, limit: 7 });
+
+    await expect(enforceMessageQuotaForCliInput('exp_app', 'oc_exp', 'ou_x', 'om_exp', 'om_anchor'))
+      .resolves.toBe(true);
+    // 不再单独调 removeExpiredGrant；清理描述符随 consumeQuota 一把锁传入
+    expect(mocks.removeExpiredGrant).not.toHaveBeenCalled();
+    expect(mocks.consumeQuota).toHaveBeenCalledWith(
+      'exp_app', 'chat:oc_exp:ou_x', 7,
+      { scope: 'chat', chatId: 'oc_exp', openId: 'ou_x' },
+    );
+  });
+
+  it('P1 fail-closed: consumeQuota throwing (RMW/cleanup infra failure) drops the message + aborts charge', async () => {
+    // codex delta round-5：清理+扣费收口进 consumeQuota，其 RMW 失败会 throw；enforce 必须
+    // catch→abortCharge→返回 false（fail-closed），绝不因基础设施失败继续放行。
+    const bot = registerBot({
+      larkAppId: 'fc_app',
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      allowedUsers: ['ou_owner'],
+      oncallChats: [{ chatId: 'oc_fc', workingDir: '/tmp' }],
+      messageQuota: { defaultLimit: 7 },
+    });
+    bot.resolvedAllowedUsers = ['ou_owner'];
+    bot.config.chatGrants = { oc_fc: ['ou_x'] };
+    mocks.getGrantExpiresAt.mockReturnValue(Date.now() - 1);   // 过期 → 走 expiredGrant 路径
+    mocks.consumeQuota.mockRejectedValue(new Error('RMW failed'));
+    await expect(enforceMessageQuotaForCliInput('fc_app', 'oc_fc', 'ou_x', 'om_fc', 'om_anchor'))
+      .resolves.toBe(false);
+    expect(mocks.abortCharge).toHaveBeenCalledWith('fc_app', 'om_fc');
   });
 
   // Regression (codex round-2 blocker): a denied (allow=false) message must ABORT the dedup

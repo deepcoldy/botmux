@@ -9,6 +9,7 @@
  *   - validateMentionDecision: the @ hard-gate — every model-initiated reply
  *     must explicitly choose --mention / --mention-back / --no-mention.
  */
+import type { TurnParticipant } from '../types.js';
 
 export interface QuoteTargetArgs {
   /** session.scope === 'chat' */
@@ -175,6 +176,74 @@ export function validateMentionDecision(args: MentionDecisionArgs): MentionDecis
     ok: false,
     error: '本条需显式 @ 决策（别把 --no-mention 当默认）：有实质结论、要对方继续看/确认/决策 → --mention-back（或 --mention <ou:Name> 点名）；纯记录/低优先级进度/简短确认 → --no-mention；若只是没信息量的"收到"，不如不发，等有内容再回。',
   };
+}
+
+export interface MentionBackAmbiguityArgs {
+  /** Session chat type — a p2p DM is inherently 1v1, never ambiguous. */
+  chatType?: 'group' | 'p2p';
+  /** Turn-window counterparts (executable open_id candidates; sender + @-mentions
+   *  across folded/type-ahead messages, self bot already excluded, deduped). */
+  participants: TurnParticipant[];
+  /** True when the window may be under-counted (an unresolved non-open_id @, a
+   *  pruned sibling, or no window at all). Forces ambiguous regardless of count
+   *  so the model must make an explicit decision. */
+  incomplete?: boolean;
+}
+
+export interface MentionBackAmbiguityResult {
+  /** True when --mention-back is ambiguous and must be replaced by an explicit
+   *  --mention / --no-mention (2+ distinct counterparts, or an incomplete
+   *  window that could hide additional counterparts). */
+  ambiguous: boolean;
+  /** The known distinct counterparts to offer as explicit --mention candidates.
+   *  May be shorter than the true set when `incomplete` is true. */
+  candidates: TurnParticipant[];
+  /** Propagated from args: the candidate list is known-incomplete. */
+  incomplete: boolean;
+}
+
+/**
+ * Is `--mention-back` ambiguous for THIS turn? --mention-back means "@ back the
+ * one counterpart who triggered this turn". That is unambiguous only when the
+ * turn's window provably had a single counterpart. It becomes ambiguous when:
+ *   - two or more distinct people/bots took part (a human + a peer bot, two
+ *     humans, the triggerer plus someone they @-ed, a type-ahead follow-up from
+ *     a third party, …); OR
+ *   - the window is INCOMPLETE (an @ we couldn't resolve to an open_id, a
+ *     pruned sibling, or no window record at all) — a hidden counterpart may
+ *     exist, so we must not assume the lone visible one is the only target.
+ * In either case we ask the model to pick an explicit `--mention <open_id>`
+ * (from the known candidates) or `--no-mention`, rather than auto-@-ing.
+ *
+ * NOT symmetric on human-vs-bot: a bot→bot handoff in a provably 1v1 window
+ * stays unambiguous (allowed); a lone human likewise. p2p short-circuits to
+ * not-ambiguous. Fail-safe: uncertainty always resolves to ambiguous.
+ */
+export function mentionBackAmbiguity(args: MentionBackAmbiguityArgs): MentionBackAmbiguityResult {
+  if (args.chatType === 'p2p') return { ambiguous: false, candidates: [], incomplete: false };
+  const distinct = args.participants.filter(p => !!p.openId);
+  const incomplete = !!args.incomplete;
+  if (!incomplete && distinct.length <= 1) return { ambiguous: false, candidates: [], incomplete: false };
+  return { ambiguous: true, candidates: distinct, incomplete };
+}
+
+/** Render the blocked-`--mention-back` error: explains the ambiguity and lists
+ *  every KNOWN candidate's open_id + name + person/bot/unknown so the model can
+ *  `--mention <open_id>` the right one instead of guessing. When the window is
+ *  incomplete, says so (there may be participants without a listable open_id). */
+export function mentionBackAmbiguityError(candidates: TurnParticipant[], incomplete = false): string {
+  const kindLabel = (p: TurnParticipant): string => (p.isBot === true ? 'bot' : p.isBot === false ? '人' : '未知');
+  const lines = candidates.map((p) => {
+    const name = p.name ? ` ${p.name}` : '';
+    return `  • ${p.openId}（${kindLabel(p)}${name}）`;
+  });
+  const head = incomplete
+    ? '--mention-back 本轮无法确定唯一 @ 对象（本轮参与者可能不止下列这些，或有无法解析的 @）：'
+    : '--mention-back 在本轮有多个参与者时不可用："回复触发这轮的人" 在多方场景可能 @ 错对象。';
+  const listIntro = candidates.length
+    ? '请改用 --mention <open_id> 显式点名下列已知本轮参与者之一（可重复 --mention 点多个），或 --no-mention 不 @：'
+    : '请改用 --mention <open_id> 显式点名，或 --no-mention 不 @。';
+  return [head, listIntro, ...(lines.length ? [lines.join('\n')] : [])].join('\n');
 }
 
 /**

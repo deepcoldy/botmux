@@ -16,6 +16,9 @@ import { describe, it, expect, beforeAll, afterAll, beforeEach, vi } from 'vites
 
 // Stub sessionStore writes so transferSession's persist call is a no-op.
 vi.mock('../src/services/session-store.js', () => ({
+  registerSessionBridgeSendMarkerCleanupFence: vi.fn(),
+  cleanupSessionBridgeSendMarkers: vi.fn(),
+  cleanupSessionBridgeSendMarkersNow: vi.fn(),
   updateSession: vi.fn(),
   getSession: vi.fn(),
   listSessions: vi.fn(() => []),
@@ -193,7 +196,7 @@ describe('POST /api/sessions/migrate-to-chat', () => {
   // doesn't intercept the internal closure). Exercising forkWorker means
   // actually spawning a child process and attaching tmux — explicitly out
   // of scope for unit tests. transferSession's behaviour is covered in
-  // `transfer-session.test.ts` (via its forkWorkerImpl / killWorkerImpl DI
+  // `transfer-session.test.ts` (via its forkWorkerImpl / detachWorkerImpl DI
   // overrides), and the integration of the two layers is covered at E2E.
 
   it('404 when sourceAnchor matches a session owned by a different daemon', async () => {

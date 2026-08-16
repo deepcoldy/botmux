@@ -51,6 +51,10 @@ function makeFetch(ports: Record<number, PortBehaviour>): typeof fetch {
     if (path === '/__cli/rotate') {
       return new Response(JSON.stringify({ url: `http://host:${port}/?t=fresh` }), { status: 200 });
     }
+    if (path === '/__cli/ensure') {
+      const token = b.hasToken ? 'current' : 'created';
+      return new Response(JSON.stringify({ url: `http://host:${port}/?t=${token}` }), { status: 200 });
+    }
     // /__cli/current
     if (!b.hasToken) return new Response(JSON.stringify({ error: 'no_active_token' }), { status: 404 });
     return new Response(JSON.stringify({ url: `http://host:${port}/?t=current` }), { status: 200 });
@@ -125,6 +129,18 @@ describe('callDashboard', () => {
       fetchImpl: makeFetch({ 7891: { kind: 'dashboard', hasToken: false } }),
     });
     expect(r).toEqual({ ok: true, url: 'http://host:7891/?t=fresh' });
+  });
+
+  it.each([
+    { hasToken: false, token: 'created' },
+    { hasToken: true, token: 'current' },
+  ])('ensure gets a usable URL without replacing an existing token: $hasToken', async ({ hasToken, token }) => {
+    setPort(7891);
+    const r = await callDashboard({
+      configDir: dir, defaultPort: 7891, path: '/__cli/ensure',
+      fetchImpl: makeFetch({ 7891: { kind: 'dashboard', hasToken } }),
+    });
+    expect(r).toEqual({ ok: true, url: `http://host:7891/?t=${token}` });
   });
 
   it('surfaces the dashboard-provided localUrl fallback (platform link case)', async () => {
@@ -259,12 +275,16 @@ describe('discovery credential binding (anti-forward)', () => {
     // → escalate to the token-minting route: rejected (path + port differ).
     expect(verifyHmac(SECRET, captured, LOOPBACK,
       cliAuthBind('POST', '/__cli/rotate', REAL_PORT)).ok).toBe(false);
+    expect(verifyHmac(SECRET, captured, LOOPBACK,
+      cliAuthBind('POST', '/__cli/ensure', REAL_PORT)).ok).toBe(false);
   });
 
-  it('a current-route credential cannot be replayed onto the rotate route (same port)', () => {
+  it('a current-route credential cannot be replayed onto a token-writing route (same port)', () => {
     const cur = signCliAuth(SECRET, cliAuthBind('POST', '/__cli/current', REAL_PORT));
     expect(verifyHmac(SECRET, cur, LOOPBACK,
       cliAuthBind('POST', '/__cli/rotate', REAL_PORT)).ok).toBe(false);
+    expect(verifyHmac(SECRET, cur, LOOPBACK,
+      cliAuthBind('POST', '/__cli/ensure', REAL_PORT)).ok).toBe(false);
   });
 
   it('a correctly-addressed request still verifies (positive control)', () => {

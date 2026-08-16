@@ -1,10 +1,12 @@
-import { readFileSync, writeFileSync, mkdirSync, existsSync, renameSync, readdirSync } from 'node:fs';
+import { readFileSync, writeFileSync, mkdirSync, existsSync, renameSync, readdirSync, unlinkSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { config } from '../config.js';
 import { logger } from '../utils/logger.js';
+import { withFileLockSync } from '../utils/file-lock.js';
 import { cleanupMaterializedDashboardImages } from '../core/dashboard-images.js';
 import { deleteFrozenCards } from './frozen-card-store.js';
+import { removePromptContextDir } from './prompt-context-store.js';
 import type { Session } from '../types.js';
 
 let sessions: Map<string, Session> = new Map();
@@ -18,6 +20,64 @@ let currentAppId: string | undefined;
 const LEGACY_PENDING_CARD_FIELDS = ['pendingResponseCardId', 'pendingResponseCardState', 'lastPatchedResponseCardId'] as const;
 export function stripLegacyPendingCardFields(session: Record<string, unknown>): void {
   for (const f of LEGACY_PENDING_CARD_FIELDS) delete session[f];
+}
+
+/** The active row no longer has the lineage/ownership sampled by the caller. */
+export class RiffLineageOwnershipError extends Error {
+  override readonly name = 'RiffLineageOwnershipError';
+}
+
+export type RiffDurableOwner = {
+  pid: number | null;
+  larkAppId: string | null;
+  backendType: string | null;
+};
+
+export type ActiveRiffShutdownSnapshot = {
+  sessionId: string;
+  taskId: string | null;
+  owner: RiffDurableOwner;
+};
+
+export type ActiveRiffLineageBatchUpdate = ActiveRiffShutdownSnapshot & {
+  targetTaskId: string | null;
+  expectedCurrentTaskIds: readonly (string | null)[];
+};
+
+export type RiffLineageBatchFailureStage =
+  | 'prewrite_ownership'
+  | 'prewrite_io'
+  | 'postrename_ambiguity';
+
+export class RiffLineageBatchError extends Error {
+  override readonly name = 'RiffLineageBatchError';
+
+  constructor(
+    readonly stage: RiffLineageBatchFailureStage,
+    readonly sessionIds: readonly string[],
+    message: string,
+  ) {
+    super(message);
+  }
+}
+
+function riffDurableOwner(session: Session): RiffDurableOwner {
+  return {
+    pid: session.pid ?? null,
+    larkAppId: session.larkAppId ?? null,
+    backendType: session.backendType ?? null,
+  };
+}
+
+function riffOwnersEqual(left: RiffDurableOwner, right: RiffDurableOwner): boolean {
+  return left.pid === right.pid
+    && left.larkAppId === right.larkAppId
+    && left.backendType === right.backendType;
+}
+
+let testOnlyAfterRiffBatchRename: (() => void) | undefined;
+export function __testOnly_setAfterRiffBatchRename(hook: (() => void) | undefined): void {
+  testOnlyAfterRiffBatchRename = hook;
 }
 
 /**
@@ -78,54 +138,58 @@ function load(): void {
   if (loaded) return;
   ensureDir();
   const fp = getFilePath();
-  if (existsSync(fp)) {
-    try {
-      const data = JSON.parse(readFileSync(fp, 'utf-8'));
-      sessions = new Map(Object.entries(data));
-    } catch (err) {
-      logger.error(`Failed to load sessions: ${err}`);
-      sessions = new Map();
-      loaded = true;
-      return;
-    }
-    const repaired = repairMissingChatScopes();
-    if (repaired > 0) {
+  withFileLockSync(fp, () => {
+    if (existsSync(fp)) {
       try {
-        save();
-        logger.info(`Repaired ${repaired} scope-less chat session(s) in ${fp}`);
-      } catch (err) {
-        // Loading succeeded, so keep the in-memory sessions available even if
-        // this best-effort migration cannot be persisted yet (ENOSPC/EACCES).
-        logger.error(`Failed to persist repaired chat session scopes: ${err}`);
-      }
-    }
-    logger.info(`Loaded ${sessions.size} sessions from ${fp}`);
-  } else if (currentAppId) {
-    // Per-bot file doesn't exist — migrate matching sessions from legacy sessions.json
-    const legacyFp = join(config.session.dataDir, 'sessions.json');
-    if (existsSync(legacyFp)) {
-      try {
-        const data: Record<string, Session> = JSON.parse(readFileSync(legacyFp, 'utf-8'));
-        sessions = new Map();
-        for (const [k, v] of Object.entries(data)) {
-          if (v.larkAppId === currentAppId) {
-            sessions.set(k, v);
+        const data = JSON.parse(readFileSync(fp, 'utf-8'));
+        sessions = new Map(Object.entries(data));
+        const repaired = repairMissingChatScopes();
+        if (repaired > 0) {
+          try {
+            const tmpFp = `${fp}.${process.pid}.${randomUUID()}.tmp`;
+            writeFileSync(tmpFp, JSON.stringify(Object.fromEntries(sessions), null, 2), 'utf-8');
+            renameSync(tmpFp, fp);
+            logger.info(`Repaired ${repaired} scope-less chat session(s) in ${fp}`);
+          } catch (err) {
+            // Loading succeeded, so keep the in-memory sessions available even
+            // if the best-effort repair cannot be persisted yet.
+            logger.error(`Failed to persist repaired chat session scopes: ${err}`);
           }
         }
-        if (sessions.size > 0) {
-          const repaired = repairMissingChatScopes();
-          save();
-          logger.info(`Migrated ${sessions.size} sessions from sessions.json to ${fp}`);
-          if (repaired > 0) {
-            logger.info(`Repaired ${repaired} scope-less chat session(s) during migration`);
-          }
-        }
+        logger.info(`Loaded ${sessions.size} sessions from ${fp}`);
       } catch (err) {
-        logger.error(`Failed to migrate sessions from legacy file: ${err}`);
+        logger.error(`Failed to load sessions: ${err}`);
         sessions = new Map();
       }
+    } else if (currentAppId) {
+      // Per-bot file doesn't exist — migrate matching legacy rows while still
+      // holding the same lock used by daemon saves and offline CLI mutations.
+      const legacyFp = join(config.session.dataDir, 'sessions.json');
+      if (existsSync(legacyFp)) {
+        try {
+          const data: Record<string, Session> = JSON.parse(readFileSync(legacyFp, 'utf-8'));
+          sessions = new Map();
+          for (const [k, v] of Object.entries(data)) {
+            if (v.larkAppId === currentAppId) sessions.set(k, v);
+          }
+          if (sessions.size > 0) {
+            const repaired = repairMissingChatScopes();
+            const obj = Object.fromEntries(sessions);
+            const tmpFp = `${fp}.${process.pid}.${randomUUID()}.tmp`;
+            writeFileSync(tmpFp, JSON.stringify(obj, null, 2), 'utf-8');
+            renameSync(tmpFp, fp);
+            logger.info(`Migrated ${sessions.size} sessions from sessions.json to ${fp}`);
+            if (repaired > 0) {
+              logger.info(`Repaired ${repaired} scope-less chat session(s) during migration`);
+            }
+          }
+        } catch (err) {
+          logger.error(`Failed to migrate sessions from legacy file: ${err}`);
+          sessions = new Map();
+        }
+      }
     }
-  }
+  });
   loaded = true;
 }
 
@@ -139,26 +203,218 @@ function readExistingSessionsFromDisk(fp: string): { raw: string; parsed: Record
   }
 }
 
+function readSessionsProjectionStrict(fp: string): { raw: string; parsed: Record<string, Session> } {
+  if (!existsSync(fp)) return { raw: '', parsed: {} };
+  const raw = readFileSync(fp, 'utf-8');
+  const value = JSON.parse(raw) as unknown;
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error(`invalid sessions projection at ${fp}`);
+  }
+  return { raw, parsed: value as Record<string, Session> };
+}
+
+function duplicateIds(ids: readonly string[]): string[] {
+  const seen = new Set<string>();
+  const duplicates = new Set<string>();
+  for (const id of ids) {
+    if (seen.has(id)) duplicates.add(id);
+    else seen.add(id);
+  }
+  return [...duplicates];
+}
+
+/**
+ * Sample every active Riff participant from one fresh sessions projection.
+ * Fleet shutdown takes this snapshot before fencing any worker.
+ */
+export function getActiveRiffShutdownSnapshotsBatch(
+  sessionIds: readonly string[],
+  options: { maxWaitMs?: number } = {},
+): ActiveRiffShutdownSnapshot[] {
+  if (sessionIds.length === 0) return [];
+  const duplicates = duplicateIds(sessionIds);
+  if (duplicates.length > 0) {
+    throw new RiffLineageBatchError(
+      'prewrite_ownership',
+      duplicates,
+      `duplicate Riff shutdown session ids: ${duplicates.join(', ')}`,
+    );
+  }
+
+  ensureDir();
+  const fp = getFilePath();
+  try {
+    return withFileLockSync(fp, () => {
+      const { parsed } = readSessionsProjectionStrict(fp);
+      const invalid = sessionIds.filter((sessionId) => {
+        const session = parsed[sessionId];
+        return !session || session.status !== 'active';
+      });
+      if (invalid.length > 0) {
+        throw new RiffLineageBatchError(
+          'prewrite_ownership',
+          invalid,
+          `cannot snapshot non-active Riff sessions: ${invalid.join(', ')}`,
+        );
+      }
+      return sessionIds.map((sessionId) => {
+        const session = parsed[sessionId]!;
+        return {
+          sessionId,
+          taskId: session.riffParentTaskId ?? null,
+          owner: riffDurableOwner(session),
+        };
+      });
+    }, { maxWaitMs: options.maxWaitMs });
+  } catch (error) {
+    if (error instanceof RiffLineageBatchError) throw error;
+    throw new RiffLineageBatchError(
+      'prewrite_io',
+      [...sessionIds],
+      `failed to snapshot active Riff sessions: ${String(error)}`,
+    );
+  }
+}
+
+/**
+ * Commit every prepared Riff lineage as one compare-and-set transaction.
+ * The published projection is read back under the same lock before workers
+ * are allowed to exit.
+ */
+export function persistActiveRiffLineagesExactBatch(
+  updates: readonly ActiveRiffLineageBatchUpdate[],
+  options: { maxWaitMs?: number } = {},
+): ActiveRiffShutdownSnapshot[] {
+  if (updates.length === 0) return [];
+  const sessionIds = updates.map(update => update.sessionId);
+  const duplicates = duplicateIds(sessionIds);
+  if (duplicates.length > 0) {
+    throw new RiffLineageBatchError(
+      'prewrite_ownership',
+      duplicates,
+      `duplicate Riff lineage batch session ids: ${duplicates.join(', ')}`,
+    );
+  }
+
+  ensureDir();
+  const fp = getFilePath();
+  let published = false;
+  let tmpFp: string | undefined;
+  try {
+    return withFileLockSync(fp, () => {
+      const { raw, parsed } = readSessionsProjectionStrict(fp);
+      const conflicts: string[] = [];
+      for (const update of updates) {
+        const durable = parsed[update.sessionId];
+        const durableTaskId = durable?.riffParentTaskId ?? null;
+        if (!durable
+            || durable.status !== 'active'
+            || !update.expectedCurrentTaskIds.some(candidate => candidate === durableTaskId)
+            || !riffOwnersEqual(riffDurableOwner(durable), update.owner)) {
+          conflicts.push(update.sessionId);
+        }
+      }
+      if (conflicts.length > 0) {
+        throw new RiffLineageBatchError(
+          'prewrite_ownership',
+          conflicts,
+          `Riff lineage batch compare-and-set failed for: ${conflicts.join(', ')}`,
+        );
+      }
+
+      for (const update of updates) {
+        const durable = parsed[update.sessionId]!;
+        const next: Session = {
+          ...durable,
+          riffParentTaskId: update.targetTaskId ?? undefined,
+        };
+        stripLegacyPendingCardFields(next as unknown as Record<string, unknown>);
+        parsed[update.sessionId] = next;
+      }
+
+      const json = JSON.stringify(parsed, null, 2);
+      if (json !== raw) {
+        tmpFp = `${fp}.${process.pid}.${randomUUID()}.tmp`;
+        writeFileSync(tmpFp, json, 'utf-8');
+        renameSync(tmpFp, fp);
+        tmpFp = undefined;
+        published = true;
+        testOnlyAfterRiffBatchRename?.();
+      }
+
+      let verifiedProjection: Record<string, Session>;
+      try {
+        verifiedProjection = readSessionsProjectionStrict(fp).parsed;
+      } catch (error) {
+        throw new RiffLineageBatchError(
+          published ? 'postrename_ambiguity' : 'prewrite_io',
+          [...sessionIds],
+          `failed to read back Riff lineage batch: ${String(error)}`,
+        );
+      }
+
+      const ambiguous = updates.filter((update) => {
+        const durable = verifiedProjection[update.sessionId];
+        return !durable
+          || durable.status !== 'active'
+          || (durable.riffParentTaskId ?? null) !== update.targetTaskId
+          || !riffOwnersEqual(riffDurableOwner(durable), update.owner);
+      }).map(update => update.sessionId);
+      if (ambiguous.length > 0) {
+        throw new RiffLineageBatchError(
+          published ? 'postrename_ambiguity' : 'prewrite_ownership',
+          ambiguous,
+          `Riff lineage batch readback mismatch for: ${ambiguous.join(', ')}`,
+        );
+      }
+
+      const verified = updates.map((update) => ({
+        sessionId: update.sessionId,
+        taskId: update.targetTaskId,
+        owner: riffDurableOwner(verifiedProjection[update.sessionId]!),
+      }));
+      if (loaded) {
+        for (const update of updates) {
+          const cached = sessions.get(update.sessionId);
+          if (cached) cached.riffParentTaskId = update.targetTaskId ?? undefined;
+        }
+      }
+      return verified;
+    }, { maxWaitMs: options.maxWaitMs });
+  } catch (error) {
+    if (error instanceof RiffLineageBatchError) throw error;
+    throw new RiffLineageBatchError(
+      published ? 'postrename_ambiguity' : 'prewrite_io',
+      [...sessionIds],
+      `failed to persist Riff lineage batch: ${String(error)}`,
+    );
+  } finally {
+    if (tmpFp) {
+      try { unlinkSync(tmpFp); } catch { /* best-effort orphan cleanup */ }
+    }
+  }
+}
+
 function save(): void {
   ensureDir();
   const fp = getFilePath();
-  const { raw: existingRaw } = readExistingSessionsFromDisk(fp);
-  const obj: Record<string, Session> = {};
-  for (const [k, v] of sessions) {
-    stripLegacyPendingCardFields(v as unknown as Record<string, unknown>);
-    obj[k] = v;
-  }
-  const json = JSON.stringify(obj, null, 2);
-  // The daemon fires several updateSession()/save() calls per inbound message
-  // (activity bump, pid, stream-card state, …) and many leave the serialized
-  // file byte-identical. Skipping the temp-file write + rename in that case
-  // elides the bulk of the redundant disk I/O — and writing identical bytes is
-  // a guaranteed no-op, so this can't drop state or race a concurrent writer
-  // (we compare against what's actually on disk right now).
-  if (json === existingRaw) return;
-  const tmpFp = `${fp}.${process.pid}.${randomUUID()}.tmp`;
-  writeFileSync(tmpFp, json, 'utf-8');
-  renameSync(tmpFp, fp);
+  withFileLockSync(fp, () => {
+    const { raw: existingRaw } = readExistingSessionsFromDisk(fp);
+    const obj: Record<string, Session> = {};
+    for (const [k, v] of sessions) {
+      stripLegacyPendingCardFields(v as unknown as Record<string, unknown>);
+      obj[k] = v;
+    }
+    const json = JSON.stringify(obj, null, 2);
+    // The daemon fires several updateSession()/save() calls per inbound message
+    // (activity bump, pid, stream-card state, …) and many leave the serialized
+    // file byte-identical. Skipping the temp-file write + rename in that case
+    // elides the bulk of the redundant disk I/O.
+    if (json === existingRaw) return;
+    const tmpFp = `${fp}.${process.pid}.${randomUUID()}.tmp`;
+    writeFileSync(tmpFp, json, 'utf-8');
+    renameSync(tmpFp, fp);
+  });
 }
 
 export function createSession(
@@ -190,6 +446,52 @@ export function getSession(sessionId: string): Session | undefined {
   return sessions.get(sessionId) ?? findInOtherFiles(sessionId);
 }
 
+const bridgeMarkerCleanupFences = new Map<string, Promise<void>>();
+
+export function registerSessionBridgeSendMarkerCleanupFence(
+  sessionId: string,
+  fence: Promise<void>,
+): void {
+  bridgeMarkerCleanupFences.set(sessionId, fence);
+  void fence.then(
+    () => {
+      if (bridgeMarkerCleanupFences.get(sessionId) === fence) {
+        bridgeMarkerCleanupFences.delete(sessionId);
+      }
+    },
+    () => {
+      if (bridgeMarkerCleanupFences.get(sessionId) === fence) {
+        bridgeMarkerCleanupFences.delete(sessionId);
+      }
+    },
+  );
+}
+
+/**
+ * Return a row only when it belongs to this process's currently-initialised
+ * bot store. Mutating daemon endpoints must use this instead of getSession(),
+ * whose cross-file fallback is intentionally read-only discovery.
+ */
+export function getOwnedSession(sessionId: string): Session | undefined {
+  load();
+  return sessions.get(sessionId);
+}
+
+/** Cross-process fresh read ordered after daemon/CLI writes by the shared lock. */
+export function getSessionFresh(sessionId: string): Session | undefined {
+  ensureDir();
+  const fp = getFilePath();
+  return withFileLockSync(fp, () => {
+    if (!existsSync(fp)) return undefined;
+    try {
+      const data = JSON.parse(readFileSync(fp, 'utf-8')) as Record<string, Session>;
+      return data[sessionId];
+    } catch {
+      return undefined;
+    }
+  });
+}
+
 /**
  * Search all session files for a session not found in the current file.
  *
@@ -215,25 +517,134 @@ function findInOtherFiles(sessionId: string): Session | undefined {
   return undefined;
 }
 
-export function closeSession(sessionId: string): void {
+export function cleanupSessionBridgeSendMarkersNow(sessionId: string): void {
+  try { unlinkSync(join(config.session.dataDir, 'turn-sends', `${sessionId}.jsonl`)); } catch { /* absent/best effort */ }
+}
+
+export function cleanupSessionBridgeSendMarkers(sessionId: string): void {
+  const fence = bridgeMarkerCleanupFences.get(sessionId);
+  if (fence) {
+    void fence.then(
+      () => cleanupSessionBridgeSendMarkersNow(sessionId),
+      () => cleanupSessionBridgeSendMarkersNow(sessionId),
+    );
+    return;
+  }
+  cleanupSessionBridgeSendMarkersNow(sessionId);
+}
+
+export function closeSession(
+  sessionId: string,
+  opts: { cleanupBridgeMarkers?: boolean; clearRiffParentTaskId?: boolean } = {},
+): void {
   load();
   const session = sessions.get(sessionId);
   if (session) {
-    if (session.larkAppId && session.dashboardAttachments?.length) {
+    const priorStatus = session.status;
+    const priorClosedAt = session.closedAt;
+    const priorRiffParentTaskId = session.riffParentTaskId;
+    const priorDashboardAttachments = session.dashboardAttachments;
+    const priorQueuedAttachments = session.queuedAttachments;
+    session.status = 'closed';
+    session.closedAt = new Date().toISOString();
+    session.dashboardAttachments = undefined;
+    session.queuedAttachments = undefined;
+    // Riff cancellation has already completed before this durable transition.
+    // Clear its retry handle in the same atomic save as status='closed'.
+    if (opts.clearRiffParentTaskId) session.riffParentTaskId = undefined;
+    try {
+      save();
+    } catch (err) {
+      session.status = priorStatus;
+      session.closedAt = priorClosedAt;
+      session.riffParentTaskId = priorRiffParentTaskId;
+      session.dashboardAttachments = priorDashboardAttachments;
+      session.queuedAttachments = priorQueuedAttachments;
+      throw err;
+    }
+    if (session.larkAppId && priorDashboardAttachments?.length) {
       try {
-        cleanupMaterializedDashboardImages(session.larkAppId, session.dashboardAttachments);
-        session.dashboardAttachments = undefined;
-        session.queuedAttachments = undefined;
+        cleanupMaterializedDashboardImages(session.larkAppId, priorDashboardAttachments);
       } catch (error: any) {
         logger.warn(`Failed to clean Dashboard images for session ${sessionId}: ${error?.message ?? error}`);
       }
     }
-    session.status = 'closed';
-    session.closedAt = new Date().toISOString();
-    save();
+    // turn-sends was originally a transient bridge-dedup file cleaned by a
+    // live worker's close handler. Message previews now make its bounded tail
+    // user-visible, so workerless/forced closes must apply the same cleanup;
+    // otherwise closed sessions retain private reply text indefinitely.
+    if (opts.cleanupBridgeMarkers !== false) cleanupSessionBridgeSendMarkers(sessionId);
+    // #794: per-turn hook sidecar 与 turn-sends 同生命周期，关会话一并清掉，
+    // 否则 prompt-ctx/<sid>/ 成为孤儿目录（24h TTL 兜底但 daemon 长命会累积）。
+    removePromptContextDir(sessionId);
     deleteFrozenCards(sessionId);
     logger.info(`Closed session ${sessionId}`);
   }
+}
+
+/**
+ * Reactivate one explicitly closed row and discard every queued/setup owner in
+ * the same durable file replacement.  The close path has cleared these fields
+ * since 2026-07, but older closed rows can still contain prepared input.  A
+ * generic resume is an explicit new lifecycle and must never revive that
+ * abandoned FIFO.
+ */
+export function reactivateClosedSession(
+  sessionId: string,
+): { ok: true; session: Session }
+| { ok: false; error: 'not_found' | 'not_closed' } {
+  load();
+  const session = sessions.get(sessionId);
+  if (!session) return { ok: false, error: 'not_found' };
+  if (session.status !== 'closed') return { ok: false, error: 'not_closed' };
+
+  const prior = {
+    status: session.status,
+    closedAt: session.closedAt,
+    lastMessageAt: session.lastMessageAt,
+    codexAppDispatchLedger: session.codexAppDispatchLedger,
+    codexAppGenerationCommits: session.codexAppGenerationCommits,
+    queued: session.queued,
+    queuedPrompt: session.queuedPrompt,
+    queuedCodexAppText: session.queuedCodexAppText,
+    queuedCodexAppMessageContext: session.queuedCodexAppMessageContext,
+    queuedActivationPending: session.queuedActivationPending,
+    queuedActivationToken: session.queuedActivationToken,
+    queuedActivationInput: session.queuedActivationInput,
+    queuedActivationTurnId: session.queuedActivationTurnId,
+    queuedActivationDispatchAttempt: session.queuedActivationDispatchAttempt,
+    queuedActivationResume: session.queuedActivationResume,
+    queuedActivationTail: session.queuedActivationTail,
+    queuedActivationTailNextOrder: session.queuedActivationTailNextOrder,
+    pendingRepoSetup: session.pendingRepoSetup,
+  };
+
+  session.status = 'active';
+  session.closedAt = undefined;
+  session.lastMessageAt = new Date().toISOString();
+  session.codexAppDispatchLedger = undefined;
+  session.codexAppGenerationCommits = undefined;
+  session.queued = undefined;
+  session.queuedPrompt = undefined;
+  session.queuedCodexAppText = undefined;
+  session.queuedCodexAppMessageContext = undefined;
+  session.queuedActivationPending = undefined;
+  session.queuedActivationToken = undefined;
+  session.queuedActivationInput = undefined;
+  session.queuedActivationTurnId = undefined;
+  session.queuedActivationDispatchAttempt = undefined;
+  session.queuedActivationResume = undefined;
+  session.queuedActivationTail = undefined;
+  session.queuedActivationTailNextOrder = undefined;
+  session.pendingRepoSetup = undefined;
+
+  try {
+    save();
+  } catch (err) {
+    Object.assign(session, prior);
+    throw err;
+  }
+  return { ok: true, session };
 }
 
 export function updateSessionPid(sessionId: string, pid: number | null): void {
@@ -249,6 +660,68 @@ export function updateSession(session: Session): void {
   load();
   sessions.set(session.sessionId, session);
   save();
+}
+
+/**
+ * Persist one exact Riff follow-up lineage for an active durable owner.
+ * The process cache changes only after the atomic file replacement succeeds.
+ */
+export function persistActiveRiffLineageExact(
+  sessionId: string,
+  taskId: string | null,
+  options: {
+    expectedCurrentTaskIds?: readonly (string | null)[];
+    expectedOwner?: RiffDurableOwner;
+  } = {},
+): Session {
+  load();
+  ensureDir();
+  const fp = getFilePath();
+  return withFileLockSync(fp, () => {
+    const { raw, parsed } = readExistingSessionsFromDisk(fp);
+    const durable = parsed[sessionId];
+    if (!durable || durable.status !== 'active') {
+      throw new RiffLineageOwnershipError(
+        `cannot persist Riff lineage for non-active session ${sessionId}`,
+      );
+    }
+    const durableTaskId = durable.riffParentTaskId ?? null;
+    const expected = options.expectedCurrentTaskIds;
+    if (expected && !expected.some(candidate => candidate === durableTaskId)) {
+      throw new RiffLineageOwnershipError(
+        `Riff lineage compare-and-set failed for ${sessionId} `
+        + `(current=${durableTaskId ?? 'none'}, expected=${expected.map(id => id ?? 'none').join('|')})`,
+      );
+    }
+    if (options.expectedOwner && !riffOwnersEqual(riffDurableOwner(durable), options.expectedOwner)) {
+      throw new RiffLineageOwnershipError(
+        `Riff owner compare-and-set failed for ${sessionId} `
+        + `(current=${JSON.stringify(riffDurableOwner(durable))}, `
+        + `expected=${JSON.stringify(options.expectedOwner)})`,
+      );
+    }
+
+    const next: Session = {
+      ...durable,
+      riffParentTaskId: taskId ?? undefined,
+    };
+    stripLegacyPendingCardFields(next as unknown as Record<string, unknown>);
+    parsed[sessionId] = next;
+    const json = JSON.stringify(parsed, null, 2);
+    if (json !== raw) {
+      const tmpFp = `${fp}.${process.pid}.${randomUUID()}.tmp`;
+      writeFileSync(tmpFp, json, 'utf-8');
+      renameSync(tmpFp, fp);
+    }
+
+    const cached = sessions.get(sessionId);
+    if (cached) {
+      cached.riffParentTaskId = taskId ?? undefined;
+      return cached;
+    }
+    sessions.set(sessionId, next);
+    return next;
+  });
 }
 
 export function listSessions(): Session[] {
@@ -336,6 +809,178 @@ export function collectBotmuxSessionIdentities(dataDir: string = config.session.
     }
   } catch { /* missing dir → in-memory only */ }
   return ids;
+}
+
+// ─── Cross-process offline access ───────────────────────────────────────────
+// The only sanctioned ways to touch session rows from OUTSIDE the owning
+// daemon process (agent-facing CLI subcommands, caller-identity proofs). Until
+// 2026-08 the CLI kept its own parallel copies of these (loadSessions /
+// saveSession / mutateSessionOffline in cli.ts) — one of which wrote the whole
+// file WITHOUT the lock; they were absorbed here so persistence mechanics
+// (file layout, lock, tmp+rename, legacy-field strip) stay private to this
+// module.
+
+/**
+ * Read-only snapshot of every session row across the legacy `sessions.json`
+ * and all per-bot `sessions-<appId>.json` files. Per-bot rows win duplicate
+ * sessionIds and get `larkAppId` stamped from their filename so a later
+ * offline mutation resolves the owning file. Deliberately lock-free: atomic
+ * tmp+rename publication keeps each file self-consistent, and snapshot
+ * composition must stay a pure reader (an older CLI opportunistically migrated
+ * legacy rows here, which made even `botmux list` a whole-file writer able to
+ * race a daemon save).
+ */
+export function loadAllSessionsSnapshot(options: {
+  dataDir?: string;
+  /** Per-bot fallback when the data dir cannot be enumerated (the CLI file
+   *  sandbox exposes sessions-<self>.json but NOT a listing of data/). */
+  fallbackAppId?: string;
+} = {}): Map<string, Session> {
+  const dataDir = options.dataDir ?? config.session.dataDir;
+  const out = new Map<string, Session>();
+  const readInto = (file: string, stampAppId?: string): void => {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(readFileSync(join(dataDir, file), 'utf-8'));
+    } catch { return; /* missing or corrupt file → skip */ }
+    // Arrays are deliberately tolerated (Object.values yields their rows):
+    // the historical CLI loader accepted array-shaped files and existing
+    // fixtures/tools rely on that.
+    if (!parsed || typeof parsed !== 'object') return;
+    for (const value of Object.values(parsed as Record<string, unknown>)) {
+      const session = value as Session;
+      if (!session || typeof session !== 'object' || !session.sessionId) continue;
+      repairMissingChatScope(session);
+      if (stampAppId && !session.larkAppId) session.larkAppId = stampAppId;
+      out.set(session.sessionId, session);
+    }
+  };
+  readInto('sessions.json');
+  try {
+    for (const file of readdirSync(dataDir)) {
+      if (file.startsWith('sessions-') && file.endsWith('.json')) {
+        readInto(file, file.slice('sessions-'.length, -'.json'.length));
+      }
+    }
+  } catch {
+    if (options.fallbackAppId) {
+      readInto(`sessions-${options.fallbackAppId}.json`, options.fallbackAppId);
+    }
+  }
+  return out;
+}
+
+/**
+ * Unlocked point-read of one row straight from disk, bypassing this process's
+ * in-memory cache: the owning per-bot file first, then the legacy
+ * `sessions.json`. Atomic tmp+rename publication keeps each file
+ * self-consistent, so this never blocks on (or throws from) the store lock —
+ * safe on hot paths that only need a freshness hint.
+ */
+export function readSessionRowFromDisk(
+  sessionId: string,
+  larkAppId?: string,
+  dataDir: string = config.session.dataDir,
+): Session | undefined {
+  const files = larkAppId
+    ? [`sessions-${larkAppId}.json`, 'sessions.json']
+    : ['sessions.json'];
+  for (const file of files) {
+    const fp = join(dataDir, file);
+    if (!existsSync(fp)) continue;
+    try {
+      const data = JSON.parse(readFileSync(fp, 'utf-8')) as Record<string, Session>;
+      if (data[sessionId]) return data[sessionId];
+    } catch { /* ignore corrupt/racing session file */ }
+  }
+  return undefined;
+}
+
+/**
+ * Fail-closed identity scan: every file's copy of one session row across the
+ * legacy and all per-bot files — one entry per file that holds the id. An
+ * unlistable data dir THROWS: a caller proving "this row resolves exactly
+ * once" must not mistake an unreadable store for an empty one. A corrupt
+ * individual file is skipped: an unrelated bot's bad file must neither block
+ * nor impersonate a valid record; the target row still has to resolve from a
+ * readable file.
+ */
+export function readSessionRowCopiesAcrossStores(
+  sessionId: string,
+  dataDir: string = config.session.dataDir,
+): Session[] {
+  const files = readdirSync(dataDir).filter((name) => (
+    name === 'sessions.json'
+    || (name.startsWith('sessions-') && name.endsWith('.json'))
+  ));
+  const matches: Session[] = [];
+  for (const file of files) {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(readFileSync(join(dataDir, file), 'utf-8')) as unknown;
+    } catch { continue; }
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) continue;
+    const keyed = (parsed as Record<string, unknown>)[sessionId];
+    if (!keyed || typeof keyed !== 'object' || Array.isArray(keyed)) continue;
+    const session = keyed as Session;
+    if (session.sessionId !== sessionId) continue;
+    matches.push(session);
+  }
+  return matches;
+}
+
+/**
+ * Locked offline mutation of one exact row in its owning file (per-bot when
+ * the caller-observed row carries `larkAppId`, legacy `sessions.json`
+ * otherwise). Re-reads the row under the SAME lock the owning daemon uses for
+ * every save and hands the FRESH copy to `mutate` — never publishing the
+ * caller's possibly-stale snapshot — then republishes with the daemon's own
+ * tmp+rename / mismatched-key cleanup / legacy-field strip.
+ *
+ * `abortIf` is evaluated under the lock at entry and re-evaluated immediately
+ * before publication; returning true abandons the mutation with `undefined`
+ * (callers pass a daemon-liveness probe so an owning daemon that appears
+ * mid-flight stays authoritative and the file is left untouched).
+ *
+ * Returns the fresh row — mutated when `mutate` returned true, otherwise
+ * unmodified (so `() => false` is a locked fresh read) — or undefined when
+ * the row is absent or `abortIf` aborted.
+ */
+export function mutateSessionRowOffline(
+  target: { sessionId: string; larkAppId?: string },
+  mutate: (current: Session) => boolean,
+  options: { dataDir?: string; abortIf?: () => boolean } = {},
+): Session | undefined {
+  const dataDir = options.dataDir ?? config.session.dataDir;
+  const fileName = target.larkAppId ? `sessions-${target.larkAppId}.json` : 'sessions.json';
+  const fp = join(dataDir, fileName);
+  return withFileLockSync(fp, () => {
+    if (options.abortIf?.()) return undefined;
+    let data: Record<string, Session> = {};
+    if (existsSync(fp)) {
+      try { data = JSON.parse(readFileSync(fp, 'utf-8')); } catch { /* start fresh */ }
+    }
+    const current = data[target.sessionId];
+    if (!current || !mutate(current)) return current;
+    data[target.sessionId] = current;
+
+    // Clean up entries where the file key doesn't match the entry's sessionId
+    // (data corruption), and strip removed placeholder-card fields — the same
+    // convergence the daemon's save() applies.
+    for (const [key, val] of Object.entries(data)) {
+      if (val && typeof val === 'object' && 'sessionId' in val && (val as Session).sessionId !== key) {
+        delete data[key];
+        continue;
+      }
+      if (val && typeof val === 'object') stripLegacyPendingCardFields(val as unknown as Record<string, unknown>);
+    }
+
+    if (options.abortIf?.()) return undefined;
+    const tmpFp = `${fp}.${process.pid}.${randomUUID()}.tmp`;
+    writeFileSync(tmpFp, JSON.stringify(data, null, 2), 'utf-8');
+    renameSync(tmpFp, fp);
+    return current;
+  });
 }
 
 function findActiveSessionsMatching(predicate: (s: Session) => boolean): Session[] {

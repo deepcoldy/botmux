@@ -62,6 +62,13 @@ export function decideAsyncOwnership(inp: OwnershipInputs): OwnershipDecision {
 }
 
 
+export interface TurnUsageBuckets {
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheCreateTokens: number;
+}
+
 export interface AsyncStateInputs {
   sessionId: string;
   /** Whether a live DaemonSession is currently registered for this id. */
@@ -69,13 +76,23 @@ export interface AsyncStateInputs {
   /** chatId from the live session or the stored record, if known. */
   chatId?: string;
   /** In-memory async result for the resolved trigger, if the session is live. */
-  memResult?: { status: 'pending' | 'completed'; content?: string; completedAt?: number };
+  memResult?: { status: 'pending' | 'completed'; content?: string; completedAt?: number; usage?: TurnUsageBuckets };
   /** triggerId the in-memory result is keyed under (latest or explicit). */
   memTriggerId?: string;
   /** Durable persisted result (survives restart), if any. */
   persisted?: {
     triggerId: string;
-    result: { status: 'pending' | 'completed'; content?: string; completedAt?: number };
+    result: {
+      status: 'pending' | 'completed' | 'failed';
+      content?: string;
+      completedAt?: number;
+      usage?: TurnUsageBuckets;
+      /** Present when status==='failed' — the authoritative dispatch outcome
+       *  (e.g. `dispatch_unknown` for an at-most-once ambiguous crash). */
+      failedAt?: number;
+      errorCode?: 'no_output';
+      reason?: 'dispatch_unknown';
+    };
   };
   /** On-disk session record status: 'open' (active), 'closed', or absent. */
   storedStatus?: 'open' | 'closed';
@@ -112,10 +129,10 @@ export function resolveAsyncTriggerState(inp: AsyncStateInputs): TriggerResponse
 
   const completed =
     (inp.memResult?.status === 'completed' && inp.memTriggerId
-      ? { triggerId: inp.memTriggerId, content: inp.memResult.content, completedAt: inp.memResult.completedAt }
+      ? { triggerId: inp.memTriggerId, content: inp.memResult.content, completedAt: inp.memResult.completedAt, usage: inp.memResult.usage }
       : undefined) ??
     (inp.persisted?.result.status === 'completed'
-      ? { triggerId: inp.persisted.triggerId, content: inp.persisted.result.content, completedAt: inp.persisted.result.completedAt }
+      ? { triggerId: inp.persisted.triggerId, content: inp.persisted.result.content, completedAt: inp.persisted.result.completedAt, usage: inp.persisted.result.usage }
       : undefined);
 
   if (completed) {
@@ -127,9 +144,32 @@ export function resolveAsyncTriggerState(inp: AsyncStateInputs): TriggerResponse
       action: 'completed',
       target: { kind: 'turn', sessionId, chatId },
       output: completed.content !== undefined ? { content: completed.content } : undefined,
+      ...(completed.usage ? { usage: completed.usage } : {}),
       finishedAt,
       async: { status: 'completed', sessionId, completedAt: finishedAt },
       message: 'async trigger completed',
+    };
+  }
+
+  // Durable failed evidence (e.g. idempotency `dispatch_unknown`) — authoritative
+  // terminal, checked BEFORE closed/pending. This is what converges an
+  // at-most-once ambiguous-crash turn to `failed` even if its session row stays
+  // `open` (the reconcile's session close is best-effort and must not be relied
+  // on to terminate polling). Ranked below `completed`: a turn that provably
+  // finished always wins over a dispatch-unknown.
+  if (inp.persisted?.result.status === 'failed') {
+    const failedAt = inp.persisted.result.failedAt;
+    return {
+      ok: true,
+      state: 'failed',
+      triggerId: inp.persisted.triggerId,
+      target: { kind: 'turn', sessionId, chatId },
+      errorCode: inp.persisted.result.errorCode ?? 'no_output',
+      error: inp.persisted.result.reason === 'dispatch_unknown'
+        ? '上一次派发结果未知（歧义崩溃），按至多一次语义不重跑'
+        : '会话未捕获最终产出',
+      finishedAt: failedAt ? new Date(failedAt).toISOString() : undefined,
+      message: 'async trigger failed (durable outcome)',
     };
   }
 

@@ -110,6 +110,90 @@ describe('local-cli-opener', () => {
     });
   });
 
+  it('uses the frozen configured Codex executable for local resume', () => {
+    const result = buildLocalCliOpenCommand(ds({
+      session: {
+        ...ds().session,
+        cliRuntime: {
+          id: 'vendor-codex',
+          displayName: 'Vendor Codex',
+          executable: "/opt/Vendor Codex/vendor'codex",
+          source: 'configured',
+          update: { provider: 'none' },
+        },
+      },
+    }), { mode: 'resume' });
+
+    expect(result).toEqual({
+      ok: true,
+      command: "cd '/tmp/project'\\''s dir' && '/opt/Vendor Codex/vendor'\\''codex' resume 'native'\\''id'",
+    });
+  });
+
+  it('uses the frozen legacy-path Codex executable instead of the official command', () => {
+    const result = buildLocalCliOpenCommand(ds({
+      session: {
+        ...ds().session,
+        cliPathOverride: '/opt/legacy/vendor-codex',
+        cliRuntime: {
+          id: 'vendor-codex',
+          displayName: 'vendor-codex',
+          executable: '/opt/legacy/vendor-codex',
+          source: 'legacy-path',
+          update: { provider: 'auto' },
+        },
+      },
+    }), { mode: 'resume' });
+
+    expect(result).toEqual({
+      ok: true,
+      command: "cd '/tmp/project'\\''s dir' && '/opt/legacy/vendor-codex' resume 'native'\\''id'",
+    });
+    expect(result.ok && result.command).not.toContain("&& codex resume");
+  });
+
+  it('uses cliPathOverride from a path-only legacy Codex session', () => {
+    const result = buildLocalCliOpenCommand(ds({
+      session: {
+        ...ds().session,
+        agentFrozen: true,
+        // A trailing space is a valid POSIX filename byte. Use trim only to
+        // reject blank values; the frozen executable itself must stay exact.
+        cliPathOverride: '/opt/legacy/path-only-codex ',
+      },
+    }), { mode: 'resume' });
+
+    expect(result).toEqual({
+      ok: true,
+      command: "cd '/tmp/project'\\''s dir' && '/opt/legacy/path-only-codex ' resume 'native'\\''id'",
+    });
+  });
+
+  it('does not apply a legacy runtime executable to another CLI adapter', () => {
+    const adapterFactory = vi.fn(() => ({ buildResumeCommand: () => 'traex resume native-id' }));
+    const result = buildLocalCliOpenCommand(ds({
+      session: {
+        ...ds().session,
+        cliId: 'traex',
+        cliSessionId: 'native-id',
+        cliPathOverride: '/opt/legacy/custom-traex',
+        cliRuntime: {
+          id: 'custom-traex',
+          displayName: 'custom-traex',
+          executable: '/opt/legacy/custom-traex',
+          source: 'legacy-path',
+          update: { provider: 'auto' },
+        },
+      },
+    }), { mode: 'resume', adapterFactory });
+
+    expect(result).toEqual({
+      ok: true,
+      command: "cd '/tmp/project'\\''s dir' && traex resume 'native-id'",
+    });
+    expect(result.ok && result.command).not.toContain('/opt/legacy/custom-traex');
+  });
+
   it('attach mode opens a managed tmux session with exact target syntax', () => {
     const adapterFactory = vi.fn(() => ({ buildResumeCommand: () => 'codex resume should-not-run' }));
     const result = buildLocalCliOpenCommand(ds({
@@ -159,6 +243,37 @@ describe('local-cli-opener', () => {
       ok: true,
       command: "herdr --session 'work' agent attach 'botmux-abcdef12'",
     });
+  });
+
+  it('attach mode delegates ZMX to the identity-verifying CLI helper with the complete session id', () => {
+    vi.stubEnv('ZMX_DIR', '/tmp/zmx socket');
+    vi.stubEnv('ZMX_SESSION', 'outer');
+    const adapterFactory = vi.fn(() => ({ buildResumeCommand: () => 'codex resume should-not-run' }));
+    const result = buildLocalCliOpenCommand(ds({
+      session: {
+        ...ds().session,
+        sessionId: 'abcdef123456',
+        backendType: 'zmx',
+        persistentBackendTarget: {
+          backendType: 'zmx',
+          sessionName: 'managed-zmx-target',
+        },
+        cliSessionId: undefined,
+      },
+    }), { mode: 'attach', adapterFactory });
+
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.command).toContain('unset ZMX_SESSION ZMX_SESSION_PREFIX');
+      expect(result.command).toContain("export ZMX_DIR='/tmp/zmx socket'");
+      expect(result.command).toContain('/dist/cli.js');
+      expect(result.command).toContain("__zmx-attach-managed 'managed-zmx-target' 'abcdef123456'");
+      expect(result.command).not.toContain('bmx-abcdef12');
+      expect(result.command).not.toContain('grep ');
+      expect(result.command).not.toContain('exec zmx attach');
+    }
+    expect(adapterFactory).not.toHaveBeenCalled();
+    vi.unstubAllEnvs();
   });
 
   it('attach mode opens adopted Herdr by exact scoped terminal id when available', () => {

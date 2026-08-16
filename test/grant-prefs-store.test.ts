@@ -53,7 +53,7 @@ describe('grant-prefs store', () => {
     return JSON.parse(readFileSync(configPath, 'utf-8'))[0];
   }
 
-  it('defaults to restrict=false / quota=null when unset', async () => {
+  it('defaults to restrict=false / quota=null / duration=null when unset', async () => {
     writeConfig();
     const { registry, store } = await freshModules();
     registry.loadBotConfigs().forEach(c => registry.registerBot(c));
@@ -61,9 +61,10 @@ describe('grant-prefs store', () => {
     const prefs = store.getBotGrantPrefs('app_default');
     expect(prefs.restrictGrantCommands).toBe(false);
     expect(prefs.messageQuotaDefaultLimit).toBeNull();
+    expect(prefs.grantDefaultDurationMs).toBeNull();
   });
 
-  it('persists restrictGrantCommands + defaultLimit and syncs in-memory config', async () => {
+  it('persists restrictGrantCommands + defaultLimit + duration and syncs in-memory config', async () => {
     writeConfig();
     const { registry, store } = await freshModules();
     registry.loadBotConfigs().forEach(c => registry.registerBot(c));
@@ -71,20 +72,24 @@ describe('grant-prefs store', () => {
     const r = await store.updateBotGrantPrefs('app_default', {
       restrictGrantCommands: true,
       messageQuotaDefaultLimit: 20,
+      grantDefaultDurationMs: 8 * 60 * 60 * 1000,
     });
     expect(r.ok).toBe(true);
     if (r.ok) {
       expect(r.prefs.restrictGrantCommands).toBe(true);
       expect(r.prefs.messageQuotaDefaultLimit).toBe(20);
+      expect(r.prefs.grantDefaultDurationMs).toBe(8 * 60 * 60 * 1000);
     }
 
     const disk = readConfig();
     expect(disk.restrictGrantCommands).toBe(true);
     expect(disk.messageQuota).toEqual({ defaultLimit: 20 });
+    expect(disk.grantDefaultDurationMs).toBe(8 * 60 * 60 * 1000);
 
     const cfg = registry.getBot('app_default').config;
     expect(cfg.restrictGrantCommands).toBe(true);
     expect(cfg.messageQuota).toEqual({ defaultLimit: 20 });
+    expect(cfg.grantDefaultDurationMs).toBe(8 * 60 * 60 * 1000);
   });
 
   it('removes restrictGrantCommands key when toggled off (keeps bots.json tidy)', async () => {
@@ -157,8 +162,61 @@ describe('grant-prefs store', () => {
     expect(store.getBotGrantPrefs('app_missing')).toEqual({
       restrictGrantCommands: false,
       autoGrantRequestCards: true,
+      p2pOpen: false,
       messageQuotaDefaultLimit: null,
+      grantDefaultDurationMs: null,
     });
+  });
+
+  it('defaults p2pOpen to false when unset', async () => {
+    writeConfig();
+    const { registry, store } = await freshModules();
+    registry.loadBotConfigs().forEach(c => registry.registerBot(c));
+
+    expect(store.getBotGrantPrefs('app_default').p2pOpen).toBe(false);
+  });
+
+  it('persists p2pOpen=true and syncs in-memory config (talk gate needs no restart)', async () => {
+    writeConfig({ allowedUsers: ['ou_owner'] });
+    const { registry, store } = await freshModules();
+    registry.loadBotConfigs().forEach(c => registry.registerBot(c));
+
+    const r = await store.updateBotGrantPrefs('app_default', { p2pOpen: true });
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.prefs.p2pOpen).toBe(true);
+
+    expect(readConfig().p2pOpen).toBe(true);
+    // evaluateTalk 读的是内存 config：不同步这里，开关要等 daemon 重启才生效。
+    expect(registry.getBot('app_default').config.p2pOpen).toBe(true);
+  });
+
+  it('removes the p2pOpen key when toggled off (keeps bots.json tidy)', async () => {
+    writeConfig({ p2pOpen: true });
+    const { registry, store } = await freshModules();
+    registry.loadBotConfigs().forEach(c => registry.registerBot(c));
+    // Sanity: the explicit opt-in is parsed before we flip it back off.
+    expect(store.getBotGrantPrefs('app_default').p2pOpen).toBe(true);
+
+    const r = await store.updateBotGrantPrefs('app_default', { p2pOpen: false });
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.prefs.p2pOpen).toBe(false);
+
+    expect(readConfig().p2pOpen).toBeUndefined();
+    expect(registry.getBot('app_default').config.p2pOpen).toBeUndefined();
+  });
+
+  it('partial patch preserves an explicit p2pOpen=true', async () => {
+    writeConfig({ p2pOpen: true });
+    const { registry, store } = await freshModules();
+    registry.loadBotConfigs().forEach(c => registry.registerBot(c));
+
+    // Flip only restrict; the DM opt-in must survive the read-modify-write.
+    await store.updateBotGrantPrefs('app_default', { restrictGrantCommands: true });
+
+    const disk = readConfig();
+    expect(disk.restrictGrantCommands).toBe(true);
+    expect(disk.p2pOpen).toBe(true);
+    expect(registry.getBot('app_default').config.p2pOpen).toBe(true);
   });
 
   it('null defaultLimit deletes messageQuota but preserves quotaState counters', async () => {
@@ -183,7 +241,7 @@ describe('grant-prefs store', () => {
     const { registry, store } = await freshModules();
     registry.loadBotConfigs().forEach(c => registry.registerBot(c));
 
-    for (const bad of [0, -3, 2.5]) {
+    for (const bad of [0, -3, 2.5, 1001]) {
       const r = await store.updateBotGrantPrefs('app_default', { messageQuotaDefaultLimit: bad });
       expect(r.ok).toBe(false);
       if (!r.ok) expect(r.reason).toBe('bad_quota');
@@ -192,8 +250,39 @@ describe('grant-prefs store', () => {
     expect(readConfig().messageQuota).toEqual({ defaultLimit: 7 });
   });
 
+  it('resets grantDefaultDurationMs to the product default without changing existing grant expiry state', async () => {
+    writeConfig({
+      grantDefaultDurationMs: 8 * 60 * 60 * 1000,
+      grantExpiryState: { 'chat:oc_1:ou_a': { expiresAt: 1_900_000_000_000 } },
+    });
+    const { registry, store } = await freshModules();
+    registry.loadBotConfigs().forEach(c => registry.registerBot(c));
+
+    const r = await store.updateBotGrantPrefs('app_default', { grantDefaultDurationMs: null });
+
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.prefs.grantDefaultDurationMs).toBeNull();
+    expect(readConfig().grantDefaultDurationMs).toBeUndefined();
+    expect(readConfig().grantExpiryState).toEqual({ 'chat:oc_1:ou_a': { expiresAt: 1_900_000_000_000 } });
+    expect(registry.getBot('app_default').config.grantDefaultDurationMs).toBeUndefined();
+  });
+
+  it('rejects unsupported grant durations without writing', async () => {
+    writeConfig({ grantDefaultDurationMs: 8 * 60 * 60 * 1000 });
+    const { registry, store } = await freshModules();
+    registry.loadBotConfigs().forEach(c => registry.registerBot(c));
+
+    for (const bad of [0, -1, 2.5, 2 * 60 * 60 * 1000]) {
+      const r = await store.updateBotGrantPrefs('app_default', { grantDefaultDurationMs: bad });
+      expect(r.ok).toBe(false);
+      if (!r.ok) expect(r.reason).toBe('bad_duration');
+    }
+    expect(readConfig().grantDefaultDurationMs).toBe(8 * 60 * 60 * 1000);
+    expect(registry.getBot('app_default').config.grantDefaultDurationMs).toBe(8 * 60 * 60 * 1000);
+  });
+
   it('partial patch leaves the untouched field intact', async () => {
-    writeConfig({ messageQuota: { defaultLimit: 9 } });
+    writeConfig({ messageQuota: { defaultLimit: 9 }, grantDefaultDurationMs: 24 * 60 * 60 * 1000 });
     const { registry, store } = await freshModules();
     registry.loadBotConfigs().forEach(c => registry.registerBot(c));
 
@@ -203,6 +292,7 @@ describe('grant-prefs store', () => {
     const disk = readConfig();
     expect(disk.restrictGrantCommands).toBe(true);
     expect(disk.messageQuota).toEqual({ defaultLimit: 9 });
+    expect(disk.grantDefaultDurationMs).toBe(24 * 60 * 60 * 1000);
   });
 
   it('returns bot_not_registered for an unknown bot', async () => {

@@ -72,8 +72,9 @@ describe('P1 requestSessionRestart wiring', () => {
     expect(fn).toBeGreaterThanOrEqual(0);
     const body = workerPoolSource.slice(fn, workerPoolSource.indexOf('\n}', fn) + 2);
 
-    // Live-worker branch still sends the in-worker restart IPC (unchanged).
-    expect(body).toContain("ds.worker.send({ type: 'restart', attemptId }");
+    // Live-worker branch still sends the in-worker restart IPC — now also
+    // carrying the latest per-bot env (dashboard edits apply on /restart).
+    expect(body).toContain("ds.worker.send({ type: 'restart', attemptId, env: latestPerBotEnvForRestart(ds) }");
 
     // No-worker branch: pane teardown MUST precede forkWorker.
     const destroy = body.indexOf('destroyLivePaneBeforeRestart(ds)');
@@ -88,7 +89,7 @@ describe('P1 requestSessionRestart wiring', () => {
     const body = workerPoolSource.slice(fn, fn + 2800);
     expect(body).toContain('shouldDestroyPaneBeforeRestart(ds)');
     expect(body).toContain('persistentBackendTargetForSession(ds)');
-    expect(body).toContain('killPersistentBackendTarget(target)');
+    expect(body).toContain('killPersistentBackendTarget(target, ds.session.sessionId)');
     // No target (e.g. PTY/riff/legacy-unstamped) → no-op, never throws.
     expect(body).toContain('if (!target) return;');
 
@@ -233,7 +234,12 @@ describe('P2 worker onTaskDone generation fence', () => {
     // replacement. Anchored on the setupBackendHandlers occurrences (the adopt
     // observe-paths use a different, non-fenced onExit by design).
     const setup = workerSource.indexOf('const observedBackend = backend;');
+    const handlersStart = workerSource.indexOf(
+      'observedBackend.onData((data) =>',
+      setup,
+    );
     expect(setup).toBeGreaterThanOrEqual(0);
+    expect(handlersStart).toBeGreaterThan(setup);
     const region = workerSource.slice(setup, setup + 6000);
 
     const agentStatus = region.indexOf('.onAgentStatus((status)');
@@ -248,7 +254,11 @@ describe('P2 worker onTaskDone generation fence', () => {
       ['onTaskDone', taskDone],
       ['onExit', onExit],
     ] as const) {
-      expect(region.slice(start, start + 700), name)
+      // 900-char window (matches the sibling onTaskDone test above): the merged
+      // onTaskDone body keeps BOTH the fatalWorkerErrorPending guard and the
+      // 8-line generation-fence rationale comment, so the fence sits ~684 chars
+      // in — just past the old 700 window.
+      expect(region.slice(start, start + 900), name)
         .toContain('backend !== observedBackend');
     }
   });

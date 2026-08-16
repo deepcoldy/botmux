@@ -7,6 +7,12 @@
 //
 // 用法：给按钮加 `data-tip="重启 CLI"`（配合已有的 aria-label 做无障碍）。无需每个
 // 组件各自接一套 React 状态——一处初始化，全站图标按钮通用。
+//
+// 例外：原生 modal <dialog>（showModal）活在浏览器 top layer，任何 z-index 都盖不过它。
+// 触发按钮在 open dialog 里时，气泡若挂在 document.body 会被 dialog 遮住/跑到下面，所以
+// 改挂到最近的 `dialog[open]`（进 top layer）。复用 React InfoTip 同款 floatingPortalHost。
+
+import { floatingPortalHost } from './dashboard-components.js';
 
 let initialized = false;
 let tipEl: HTMLDivElement | null = null;
@@ -21,6 +27,15 @@ function ensureTipEl(): HTMLDivElement {
   el.style.display = 'none';
   document.body.appendChild(el);
   tipEl = el;
+  return el;
+}
+
+// 把气泡挂到「离触发按钮最近的 open dialog」（top layer）或回落 document.body。定位仍是
+// position:fixed + 视口坐标，宿主变化不影响定位数学（#drawer 等 dialog 无 transform/filter）。
+function attachTo(target: Element): HTMLDivElement {
+  const el = ensureTipEl();
+  const host = floatingPortalHost(target, document.body);
+  if (el.parentNode !== host) host.appendChild(el);
   return el;
 }
 
@@ -51,7 +66,8 @@ function showFor(target: Element): void {
   const label = target.getAttribute('data-tip');
   if (!label) return;
   currentTarget = target;
-  const el = ensureTipEl();
+  // 挂到离触发按钮最近的 open dialog（top layer）或回落 body，避免被 modal dialog 遮住。
+  const el = attachTo(target);
   el.textContent = label;
   el.style.display = 'block';
   el.classList.remove('show');

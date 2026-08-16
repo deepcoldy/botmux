@@ -13,7 +13,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
-import { prepareDirectSandbox } from '../src/adapters/backend/sandbox.js';
+import { prepareDirectSandbox, probeHostCredentialIsolationMechanism } from '../src/adapters/backend/sandbox.js';
 import { buildFsPolicy } from '../src/adapters/cli/fs-policy.js';
 import { installLocalPlugin } from '../src/core/plugins/install.js';
 import { ensureGatewayEntry } from '../src/core/plugins/mcp/gateway-installer.js';
@@ -35,13 +35,20 @@ import {
 
 const builtCli = resolve('dist/cli.js');
 
+// bwrap being installed is not enough: unprivileged user-namespace creation is
+// disabled on many CI runners (GitHub Actions), where bwrap dies with
+// "setting up uid map: Permission denied". Gate on the SAME runtime probe the
+// worker uses so these real-sandbox specs skip (not fail) where the kernel
+// won't let bwrap establish namespaces, while still running on capable hosts.
+const bwrapUsable = probeHostCredentialIsolationMechanism().mechanism === 'bwrap';
+
 function codexForwardedEnvKeys(configPath: string): string[] {
   const match = readFileSync(configPath, 'utf8').match(/^env_vars = (\[[^\n]+])$/m);
   if (!match) throw new Error('generated Codex Gateway entry has no env_vars');
   return JSON.parse(match[1]) as string[];
 }
 
-describe.skipIf(process.platform !== 'linux' || !existsSync(builtCli))('plugin MCP Gateway sandbox integration', () => {
+describe.skipIf(process.platform !== 'linux' || !existsSync(builtCli) || !bwrapUsable)('plugin MCP Gateway sandbox integration', () => {
   let root: string;
   let home: string;
   let dataDir: string;

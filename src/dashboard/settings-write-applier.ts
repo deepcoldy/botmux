@@ -24,6 +24,7 @@ import {
   readGlobalConfig,
   setGlobalLocale,
   writeCodexNotifierConfig,
+  writeHostOverloadAlertConfig,
 } from '../global-config.js';
 import {
   installCodexNotifierHook,
@@ -49,6 +50,7 @@ export interface ResolvedDashboardSettingsView {
   chatBotDiscovery: boolean;
   herdrTraexPlugin: { enabled: boolean; source: string; ref: string; recommendedSource: string; recommendedRef: string };
   codexRpcInput: boolean;
+  bypassCodexHookTrust: boolean;
   codexNotifier: {
     enabled: boolean;
     targetBotAppId: string | null;
@@ -68,6 +70,27 @@ export interface ResolvedDashboardSettingsView {
     workerOnline?: boolean;
     lastError?: { at: string; message: string; retryAt: string } | null;
   };
+  hostOverloadAlert: {
+    enabled: boolean;
+    targetBotAppId: string | null;
+    enterLoadRatio: number;
+    enterMemUsedFrac: number;
+    /** Bots eligible as the overload notifier (any non-apiOnly bot with a
+     *  resolvable admin recipient). Unlike codexNotifier this is NOT codex-only. */
+    botOptions?: Array<{
+      larkAppId: string;
+      botName: string | null;
+      cliId: string;
+      apiOnly: boolean;
+      recipientConfigured: boolean;
+      recipientVerified: boolean;
+      recipientHint: string | null;
+    }>;
+    /** Whether the selected target bot's daemon is currently online (else the
+     *  alert can't be delivered — the UI surfaces this). */
+    targetDaemonOnline?: boolean;
+  };
+  noVisibleOutputHint: boolean;
   vcMeetingAgent: {
     enabled: boolean;
     listenerBotAppId?: string | null;
@@ -111,6 +134,8 @@ export interface SettingsWriteApplierDeps {
   mergeGlobalConfig: (patch: Partial<Record<keyof GlobalConfig, GlobalConfig[keyof GlobalConfig] | null>>) => void;
   /** Replace known notifier fields while preserving future sibling keys on disk. */
   writeCodexNotifierConfig: (config: import('../global-config.js').CodexNotifierGlobalConfig) => void;
+  /** Replace known host-overload-alert fields while preserving future sibling keys. */
+  writeHostOverloadAlertConfig: (config: import('../global-config.js').HostOverloadAlertGlobalConfig) => void;
   /** Atomic write of maintenance-level fields (autoUpdate / autoRestart). */
   mergeMaintenanceConfig: (patch: MaintenanceConfig) => MaintenanceConfig;
   /** Set global UI locale (null = clear). Fans out to daemons via IPC. */
@@ -136,6 +161,12 @@ export interface SettingsWriteApplierDeps {
     appId: string,
     options?: { requireReady?: boolean },
   ) => Promise<{ ok: true } | { ok: false; error: string }>;
+  /** 校验过载告警通知 Bot：拒 unknown / apiOnly / 无可解析管理员收件人；启用时
+   *  额外要求目标 daemon 在线(否则告警发不出)。复用管理员解析但无 codex-only 约束。 */
+  validateHostOverloadAlertTargetBotAppId?: (
+    appId: string,
+    options?: { requireReady?: boolean },
+  ) => Promise<{ ok: true } | { ok: false; error: string }>;
   /** Reconcile the stable core Hook command before enabling notification. */
   installCodexNotifierHook?: () => void;
   /** locked_only currently depends on macOS IORegistry. */
@@ -152,6 +183,7 @@ export function defaultSettingsWriteApplierDeps(
     mergeDashboardConfig,
     mergeGlobalConfig,
     writeCodexNotifierConfig,
+    writeHostOverloadAlertConfig,
     mergeMaintenanceConfig,
     setGlobalLocale,
     parseMaintenancePatch,
@@ -189,6 +221,7 @@ export type ApplySettingsWriteError =
   | 'invalid_herdrTraexPlugin_source'
   | 'invalid_herdrTraexPlugin_ref'
   | 'invalid_codexRpcInput'
+  | 'invalid_bypassCodexHookTrust'
   | 'invalid_codexNotifier'
   | 'invalid_codexNotifier_enabled'
   | 'invalid_codexNotifier_targetBotAppId'
@@ -199,6 +232,17 @@ export type ApplySettingsWriteError =
   | 'codexNotifier_platform_unsupported'
   | 'codexNotifier_hook_install_failed'
   | 'codexNotifier_mixed_patch_unsupported'
+  | 'invalid_hostOverloadAlert'
+  | 'invalid_hostOverloadAlert_enabled'
+  | 'invalid_hostOverloadAlert_targetBotAppId'
+  | 'invalid_hostOverloadAlert_enterLoadRatio'
+  | 'invalid_hostOverloadAlert_enterMemUsedFrac'
+  | 'hostOverloadAlert_target_required'
+  | 'hostOverloadAlert_target_unknown'
+  | 'hostOverloadAlert_target_apiOnly'
+  | 'hostOverloadAlert_target_owner_missing'
+  | 'hostOverloadAlert_target_offline'
+  | 'invalid_noVisibleOutputHint'
   | 'invalid_repoPickerMode'
   | 'invalid_remoteAccess'
   | 'invalid_vcMeetingAgent'
@@ -360,6 +404,18 @@ export async function applySettingsWrite(
     }
     patch.codexRpcInput = obj.codexRpcInput;
   }
+  if ('bypassCodexHookTrust' in obj) {
+    if (typeof obj.bypassCodexHookTrust !== 'boolean') {
+      return { ok: false, error: 'invalid_bypassCodexHookTrust' };
+    }
+    patch.bypassCodexHookTrust = obj.bypassCodexHookTrust;
+  }
+  if ('noVisibleOutputHint' in obj) {
+    if (typeof obj.noVisibleOutputHint !== 'boolean') {
+      return { ok: false, error: 'invalid_noVisibleOutputHint' };
+    }
+    patch.noVisibleOutputHint = obj.noVisibleOutputHint;
+  }
 
   let codexNotifierPatch: import('../global-config.js').CodexNotifierGlobalConfig | undefined;
   if ('codexNotifier' in obj) {
@@ -409,6 +465,72 @@ export async function applySettingsWrite(
       }
     }
     codexNotifierPatch = next;
+  }
+
+  let hostOverloadAlertPatch: import('../global-config.js').HostOverloadAlertGlobalConfig | undefined;
+  if ('hostOverloadAlert' in obj) {
+    const raw = obj.hostOverloadAlert;
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+      return { ok: false, error: 'invalid_hostOverloadAlert' };
+    }
+    const incoming = raw as Record<string, unknown>;
+    const next = { ...(deps.readGlobalConfig().hostOverloadAlert ?? {}) };
+    if ('enabled' in incoming) {
+      if (typeof incoming.enabled !== 'boolean') {
+        return { ok: false, error: 'invalid_hostOverloadAlert_enabled' };
+      }
+      next.enabled = incoming.enabled;
+    }
+    if ('targetBotAppId' in incoming) {
+      if (incoming.targetBotAppId === null || incoming.targetBotAppId === '') {
+        delete next.targetBotAppId;
+      } else if (typeof incoming.targetBotAppId === 'string' && incoming.targetBotAppId.trim()) {
+        next.targetBotAppId = incoming.targetBotAppId.trim();
+      } else {
+        return { ok: false, error: 'invalid_hostOverloadAlert_targetBotAppId' };
+      }
+    }
+    if ('enterLoadRatio' in incoming) {
+      if (incoming.enterLoadRatio === null || incoming.enterLoadRatio === undefined) {
+        delete next.enterLoadRatio;
+      } else if (typeof incoming.enterLoadRatio === 'number' && Number.isFinite(incoming.enterLoadRatio) && incoming.enterLoadRatio > 0) {
+        next.enterLoadRatio = incoming.enterLoadRatio;
+      } else {
+        return { ok: false, error: 'invalid_hostOverloadAlert_enterLoadRatio' };
+      }
+    }
+    if ('enterMemUsedFrac' in incoming) {
+      if (incoming.enterMemUsedFrac === null || incoming.enterMemUsedFrac === undefined) {
+        delete next.enterMemUsedFrac;
+      } else if (
+        typeof incoming.enterMemUsedFrac === 'number'
+        && Number.isFinite(incoming.enterMemUsedFrac)
+        && incoming.enterMemUsedFrac > 0
+        && incoming.enterMemUsedFrac <= 1
+      ) {
+        next.enterMemUsedFrac = incoming.enterMemUsedFrac;
+      } else {
+        return { ok: false, error: 'invalid_hostOverloadAlert_enterMemUsedFrac' };
+      }
+    }
+    if (!('enabled' in incoming) && !('targetBotAppId' in incoming)
+      && !('enterLoadRatio' in incoming) && !('enterMemUsedFrac' in incoming)) {
+      return { ok: false, error: 'invalid_hostOverloadAlert' };
+    }
+    // Validate the target when it's being set OR when enabling. On enable the
+    // target daemon must be online (requireReady) or the alert can't be sent.
+    const shouldValidateTarget = 'targetBotAppId' in incoming
+      || ('enabled' in incoming && incoming.enabled === true);
+    if (next.targetBotAppId && shouldValidateTarget && deps.validateHostOverloadAlertTargetBotAppId) {
+      const validation = await deps.validateHostOverloadAlertTargetBotAppId(next.targetBotAppId, {
+        requireReady: next.enabled === true,
+      });
+      if (!validation.ok) return { ok: false, error: (validation.error as ApplySettingsWriteError) || 'hostOverloadAlert_target_unknown' };
+    }
+    if (next.enabled === true && !next.targetBotAppId) {
+      return { ok: false, error: 'hostOverloadAlert_target_required' };
+    }
+    hostOverloadAlertPatch = next;
   }
 
   let touched = false;
@@ -555,6 +677,11 @@ export async function applySettingsWrite(
       }
     }
     deps.writeCodexNotifierConfig(codexNotifierPatch);
+    touched = true;
+  }
+
+  if (hostOverloadAlertPatch) {
+    deps.writeHostOverloadAlertConfig(hostOverloadAlertPatch);
     touched = true;
   }
 

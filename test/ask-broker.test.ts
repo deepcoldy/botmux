@@ -19,6 +19,7 @@ import {
   setCardDispatcher,
   setCanTalkChecker,
   submitAsk,
+  submitAskFromDesktop,
   submitCustomReply,
   toggleAsk,
   tryResolveAsk,
@@ -164,7 +165,10 @@ describe('tryResolveAsk gating', () => {
       by: 'ou_p2p_user',
     })).toBe('accepted');
     await expect(pending).resolves.toMatchObject({ kind: 'answered', by: 'ou_p2p_user' });
-    expect(checker).toHaveBeenCalledWith('cli_app', 'oc_chat', 'ou_p2p_user', 'p2p');
+    // 卡片点击路径不传 actor（Lark card-action 回调无 sender union/bot 标记）→ 第 5 参恒
+    // undefined，checker 退化为纯 evaluateTalk(openId, chatType)。本用例只关心 chatType
+    // 被转发；显式带上末尾 undefined 以对齐当前签名，而非锁死参数列表。
+    expect(checker).toHaveBeenCalledWith('cli_app', 'oc_chat', 'ou_p2p_user', 'p2p', undefined);
   });
 
   it('returns "stale" for unknown askId', () => {
@@ -562,6 +566,135 @@ describe('toggleAsk + submitAsk', () => {
     expect(_pendingCount()).toBe(1);
   });
 
+  it('submitAsk 全多选 + 全空 + 无 confirmEmpty → needs_empty_confirm（不 settle）', async () => {
+    _resetForTest();
+    setCanTalkChecker((_app, _chat, openId) => DEFAULT_TALKERS.has(openId));
+    setCardDispatcher({ send: async () => ({ messageId: 'm1' }) });
+    registerAsk({
+      larkAppId: 'a', chatId: 'c', rootMessageId: null, sessionId: 's',
+      questions: [{ prompt: 'pick', options: [{ key: 'a', label: 'A' }, { key: 'b', label: 'B' }], multiSelect: true }],
+      timeoutMs: 60_000,
+    });
+    const askId = _allAskIds()[0]!;
+    const nonce = _getPending(askId)!.nonce;
+    // 一个都没勾直接 submit：全多选 → 空是合法答案，但先要二次确认
+    expect(submitAsk({ askId, nonce, by: 'ou_u' })).toBe('needs_empty_confirm');
+    expect(_getPending(askId)?.settled).toBe(false); // 不 settle
+  });
+
+  it('submitAsk 全多选 + 全空 + confirmEmpty:true → accepted（settle 空答案）', async () => {
+    _resetForTest();
+    setCanTalkChecker((_app, _chat, openId) => DEFAULT_TALKERS.has(openId));
+    setCardDispatcher({ send: async () => ({ messageId: 'm1' }) });
+    const p = registerAsk({
+      larkAppId: 'a', chatId: 'c', rootMessageId: null, sessionId: 's',
+      questions: [{ prompt: 'pick', options: [{ key: 'a', label: 'A' }, { key: 'b', label: 'B' }], multiSelect: true }],
+      timeoutMs: 60_000,
+    });
+    const askId = _allAskIds()[0]!;
+    const nonce = _getPending(askId)!.nonce;
+    expect(submitAsk({ askId, nonce, by: 'ou_u', confirmEmpty: true })).toBe('accepted');
+    const r = await p;
+    if (r.kind === 'answered') expect(r.answers).toEqual([[]]); // 空答案
+  });
+
+  it('submitAsk 混合 [单选,多选] 全空 → stale（不进 needs_empty_confirm）', async () => {
+    _resetForTest();
+    setCanTalkChecker((_app, _chat, openId) => DEFAULT_TALKERS.has(openId));
+    setCardDispatcher({ send: async () => ({ messageId: 'm1' }) });
+    registerAsk({
+      larkAppId: 'a', chatId: 'c', rootMessageId: null, sessionId: 's',
+      questions: [
+        { prompt: 'q1', options: [{ key: 'y', label: 'Y' }, { key: 'n', label: 'N' }], multiSelect: false },
+        { prompt: 'q2', options: [{ key: 'a', label: 'A' }, { key: 'b', label: 'B' }], multiSelect: true },
+      ],
+      timeoutMs: 60_000,
+    });
+    const askId = _allAskIds()[0]!;
+    const nonce = _getPending(askId)!.nonce;
+    // 有单选未选 → 空非有效答案，单选约束先判 stale，绝不 arm（否则二次确认死路）
+    expect(submitAsk({ askId, nonce, by: 'ou_u' })).toBe('stale');
+    // confirmEmpty:true 也一样 stale（单选约束不因确认而放宽）
+    expect(submitAsk({ askId, nonce, by: 'ou_u', confirmEmpty: true })).toBe('stale');
+    expect(_getPending(askId)?.settled).toBe(false);
+  });
+
+  it('submitAsk 全多选全空：坏 nonce / 未授权 优先于 needs_empty_confirm', async () => {
+    _resetForTest();
+    setCanTalkChecker((_app, _chat, openId) => DEFAULT_TALKERS.has(openId));
+    setCardDispatcher({ send: async () => ({ messageId: 'm1' }) });
+    registerAsk({
+      larkAppId: 'a', chatId: 'c', rootMessageId: null, sessionId: 's',
+      questions: [{ prompt: 'pick', options: [{ key: 'a', label: 'A' }, { key: 'b', label: 'B' }], multiSelect: true }],
+      timeoutMs: 60_000,
+    });
+    const askId = _allAskIds()[0]!;
+    const nonce = _getPending(askId)!.nonce;
+    // 坏 nonce → stale（不 arm）
+    expect(submitAsk({ askId, nonce: 'wrong', by: 'ou_u' })).toBe('stale');
+    // 未授权 → unauthorized（不 arm）
+    expect(submitAsk({ askId, nonce, by: 'ou_other' })).toBe('unauthorized');
+    expect(_getPending(askId)?.settled).toBe(false);
+  });
+
+  it('submitAsk 拒绝超出真实问题数的 selections（额外槽不绕过确认、不进结果）', async () => {
+    _resetForTest();
+    setCanTalkChecker((_app, _chat, openId) => DEFAULT_TALKERS.has(openId));
+    setCardDispatcher({ send: async () => ({ messageId: 'm1' }) });
+    const p = registerAsk({
+      larkAppId: 'a', chatId: 'c', rootMessageId: null, sessionId: 's',
+      questions: [{ prompt: 'pick', options: [{ key: 'a', label: 'A' }, { key: 'b', label: 'B' }], multiSelect: true }],
+      timeoutMs: 60_000,
+    });
+    const askId = _allAskIds()[0]!;
+    const nonce = _getPending(askId)!.nonce;
+    // 单问 ask 却传 2 槽（q0 空 + 伪造 q1 非空）：额外槽不得让 needs_empty_confirm 被绕过，
+    // 也不得混进结果。规范化后长度 > questions.length → 直接 stale。
+    expect(submitAsk({ askId, nonce, by: 'ou_u', selections: [[], ['bogus']] })).toBe('stale');
+    expect(_getPending(askId)?.settled).toBe(false);
+    // 真正的全空提交仍走二次确认（证明上面的 stale 来自「超长」而非误伤空提交）
+    expect(submitAsk({ askId, nonce, by: 'ou_u', selections: [[]] })).toBe('needs_empty_confirm');
+    expect(_getPending(askId)?.settled).toBe(false);
+    // confirmEmpty 落地空答案，结果恰好 1 槽、无越界内容
+    expect(submitAsk({ askId, nonce, by: 'ou_u', selections: [[]], confirmEmpty: true })).toBe('accepted');
+    const r = await p;
+    if (r.kind === 'answered') expect(r.answers).toEqual([[]]);
+  });
+
+  it('submitAsk 缺失尾部 selections 按空集补齐（兼容旧 form 只回前 N 问）', async () => {
+    _resetForTest();
+    setCanTalkChecker((_app, _chat, openId) => DEFAULT_TALKERS.has(openId));
+    setCardDispatcher({ send: async () => ({ messageId: 'm1' }) });
+    const p = registerAsk({
+      larkAppId: 'a', chatId: 'c', rootMessageId: null, sessionId: 's',
+      questions: [
+        { prompt: 'q1', options: [{ key: 'y', label: 'Y' }, { key: 'n', label: 'N' }], multiSelect: false },
+        { prompt: 'q2', options: [{ key: 'a', label: 'A' }, { key: 'b', label: 'B' }], multiSelect: true },
+      ],
+      timeoutMs: 60_000,
+    });
+    const askId = _allAskIds()[0]!;
+    const nonce = _getPending(askId)!.nonce;
+    // 只传 q0（单选选 y），省略尾部多选 q1 → 规范化补 [] → 合法 settle 为 [['y'],[]]
+    expect(submitAsk({ askId, nonce, by: 'ou_u', selections: [['y']] })).toBe('accepted');
+    const r = await p;
+    if (r.kind === 'answered') expect(r.answers).toEqual([['y'], []]);
+  });
+
+  it('submitAskFromDesktop 同样拒绝超长 selections', async () => {
+    _resetForTest();
+    setCanTalkChecker((_app, _chat, openId) => DEFAULT_TALKERS.has(openId));
+    setCardDispatcher({ send: async () => ({ messageId: 'm1' }) });
+    registerAsk({
+      larkAppId: 'a', chatId: 'c', rootMessageId: null, sessionId: 's',
+      questions: [{ prompt: 'pick', options: [{ key: 'a', label: 'A' }, { key: 'b', label: 'B' }], multiSelect: true }],
+      timeoutMs: 60_000,
+    });
+    const askId = _allAskIds()[0]!;
+    expect(submitAskFromDesktop({ askId, selections: [[], ['bogus']], by: 'ou_desk' })).toBe('stale');
+    expect(_getPending(askId)?.settled).toBe(false);
+  });
+
   it('_allAskIds 返回所有未 settle 及已 settle(retention 内)的 askId', async () => {
     _resetForTest();
     setCanTalkChecker((_app, _chat, openId) => DEFAULT_TALKERS.has(openId));
@@ -699,5 +832,107 @@ describe('自定义回复 findPendingAskByAnchor + submitCustomReply', () => {
     tryResolveAsk({ askId, nonce, selected: 'yes', by: 'ou_owner' });
     await p;
     expect(submitCustomReply({ askId, by: 'ou_owner', text: 'late' })).toBe('already_settled');
+  });
+});
+
+describe('submitCustomReply actor context — bot / union 身份透传给 checker', () => {
+  // 回归 PR #685 复审的同型残留：ask-broker 的 canTalkChecker 被卡片点击和文字作答
+  // 共用，但只拿 open_id/chatType，拿不到 bot/union 身份。文字作答路径（daemon 有完整
+  // 消息事件）必须透传 actor，让 checker 与 dispatcher 外层闸 / quota 复查同源：
+  //   - bot 发送方 → evaluateBotTalk（覆盖团队拉群没带 union_id 的场景）
+  //   - 平台 teamMember 真人 → evaluateTalk 的 memberUnionId 腿
+  // 否则跨部署 team bot / teamMember 真人的文字作答会被 checker 拒。
+
+  it('submitCustomReply 把 actor 原样透传给 checker（卡片点击路径不传，退化为纯 openId）', async () => {
+    const seen: Array<{ openId: string; actor: unknown }> = [];
+    // 模拟真实 daemon checker 的分派：actor.botSender → 只认 union 团队 bot；
+    // 否则认 memberUnionId 团队成员真人。裸 openId（无 actor）→ 谁都不放行。
+    setCanTalkChecker((_app, _chat, openId, _chatType, actor) => {
+      seen.push({ openId, actor });
+      if (actor?.botSender) return actor.senderUnionId === 'on_teambot';
+      return actor?.memberUnionId === 'on_teammember';
+    });
+    const d = mockDispatcher();
+    setCardDispatcher(d);
+    registerAsk(makeInput());
+    await Promise.resolve();
+    await Promise.resolve();
+    const { askId } = d.sendCalls[0]!;
+
+    submitCustomReply({
+      askId, by: 'ou_bot', text: 'x',
+      actor: { botSender: true, senderUnionId: 'on_teambot', memberUnionId: undefined },
+    });
+    expect(seen.at(-1)).toEqual({
+      openId: 'ou_bot',
+      actor: { botSender: true, senderUnionId: 'on_teambot', memberUnionId: undefined },
+    });
+  });
+
+  it('对照①：团队拉群里无 union 的 bot（botSender=true, 无 union）→ 由 checker 的 bot 腿放行', async () => {
+    // 模拟 evaluateBotTalk：botSender 且落在团队拉群（这里用 chatId 判定）→ 放行，不看 union。
+    setCanTalkChecker((_app, chatId, _openId, _chatType, actor) =>
+      actor?.botSender ? chatId === 'oc_chat' : actor?.memberUnionId === 'on_teammember');
+    const d = mockDispatcher();
+    setCardDispatcher(d);
+    const p = registerAsk(makeInput());
+    await Promise.resolve();
+    await Promise.resolve();
+    const { askId } = d.sendCalls[0]!;
+    expect(submitCustomReply({
+      askId, by: 'ou_bot_no_union', text: '拉群里打字答',
+      actor: { botSender: true, senderUnionId: undefined, memberUnionId: undefined },
+    })).toBe('accepted');
+    const r = await p;
+    expect(r.kind).toBe('answered');
+  });
+
+  it('对照②：跨部署 union team bot（botSender=true, 带 union）→ 放行', async () => {
+    setCanTalkChecker((_app, _chat, _openId, _chatType, actor) =>
+      actor?.botSender ? actor.senderUnionId === 'on_teambot' : false);
+    const d = mockDispatcher();
+    setCardDispatcher(d);
+    const p = registerAsk(makeInput());
+    await Promise.resolve();
+    await Promise.resolve();
+    const { askId } = d.sendCalls[0]!;
+    expect(submitCustomReply({
+      askId, by: 'ou_teambot', text: 'union bot 答',
+      actor: { botSender: true, senderUnionId: 'on_teambot', memberUnionId: undefined },
+    })).toBe('accepted');
+    await p;
+  });
+
+  it('对照③：平台 teamMember 真人（botSender=false, 带 memberUnionId）→ 放行（不能被当 bot）', async () => {
+    // 关键：真人走 memberUnionId 腿，不是 senderUnionId（bot 腿）。checker 若丢掉
+    // memberUnionId 就会误拒 teamMember 真人的文字作答。
+    setCanTalkChecker((_app, _chat, _openId, _chatType, actor) =>
+      actor?.botSender ? false : actor?.memberUnionId === 'on_teammember');
+    const d = mockDispatcher();
+    setCardDispatcher(d);
+    const p = registerAsk(makeInput());
+    await Promise.resolve();
+    await Promise.resolve();
+    const { askId } = d.sendCalls[0]!;
+    expect(submitCustomReply({
+      askId, by: 'ou_member', text: 'teamMember 真人答',
+      actor: { botSender: false, senderUnionId: undefined, memberUnionId: 'on_teammember' },
+    })).toBe('accepted');
+    await p;
+  });
+
+  it('对照④（负向）：普通未授权人（无 union / 非成员）→ 仍拒', async () => {
+    setCanTalkChecker((_app, _chat, _openId, _chatType, actor) =>
+      actor?.botSender ? actor.senderUnionId === 'on_teambot' : actor?.memberUnionId === 'on_teammember');
+    const d = mockDispatcher();
+    setCardDispatcher(d);
+    registerAsk(makeInput());
+    await Promise.resolve();
+    await Promise.resolve();
+    const { askId } = d.sendCalls[0]!;
+    expect(submitCustomReply({
+      askId, by: 'ou_stranger', text: '未授权乱答',
+      actor: { botSender: false, senderUnionId: undefined, memberUnionId: undefined },
+    })).toBe('unauthorized');
   });
 });

@@ -11,6 +11,8 @@ export interface SummaryCommandMatch {
   triggerText: string;
   range: SummaryRangePrefs;
   prompt: string;
+  summaryMemory: boolean;
+  summaryMemoryPath: string;
 }
 
 export interface SummaryCommandRuntimeContext {
@@ -18,7 +20,7 @@ export interface SummaryCommandRuntimeContext {
   chatKind: SummaryChatKind;
 }
 
-type SummaryHistoryWindow = 'since-last-summary' | 'configured-range';
+type SummaryHistoryWindow = 'since-last-summary' | 'configured-range' | 'explicit-boundary';
 
 const SUMMARY_COMMAND_RE = /^\/summary(?:\s|$)/i;
 
@@ -152,6 +154,12 @@ function isPreviousSummaryForThisBot(message: any, botOpenId: string | undefined
   return !mentions && /(?:^|\s)\/summary(?:\s|$)/i.test(text);
 }
 
+function matchesExplicitBoundary(message: any, explicitBoundary: string | undefined): boolean {
+  if (!explicitBoundary) return false;
+  const text = stripHistoryLeadingMentions(historyTextOf(message), normalizeRawMentions(message));
+  return text.includes(explicitBoundary);
+}
+
 function findPreviousSummaryBoundaryMs(messages: any[], triggerMessage: any, botOpenId: string | undefined): number | undefined {
   const triggerMs = createdMsOf(triggerMessage);
   if (triggerMs === undefined) return undefined;
@@ -170,8 +178,28 @@ function filterHistoryWindow(
   range: SummaryRangePrefs,
   triggerMessage: any,
   botOpenId: string | undefined,
-): { messages: any[]; window: SummaryHistoryWindow; boundaryMs?: number } {
+  explicitBoundary?: string,
+): { messages: any[]; window: SummaryHistoryWindow; boundaryMs?: number; historyError?: string } {
   let out = filterMessagesAtOrBeforeTrigger(messages, triggerMessage);
+  if (explicitBoundary) {
+    let boundaryIndex = -1;
+    for (let i = 0; i < out.length; i += 1) {
+      if (matchesExplicitBoundary(out[i], explicitBoundary)) boundaryIndex = i;
+    }
+    if (boundaryIndex < 0) {
+      return {
+        messages: [],
+        window: 'explicit-boundary',
+        historyError: `explicit boundary not found: ${explicitBoundary}`,
+      };
+    }
+    const boundaryMs = createdMsOf(out[boundaryIndex]);
+    return {
+      messages: out.slice(boundaryIndex),
+      window: 'explicit-boundary',
+      boundaryMs,
+    };
+  }
   const boundaryMs = findPreviousSummaryBoundaryMs(out, triggerMessage, botOpenId);
   if (boundaryMs !== undefined) {
     out = out.filter((m) => {
@@ -191,6 +219,7 @@ function makeRegularGroupStopper(input: {
   range: SummaryRangePrefs;
   triggerMessage: any;
   botOpenId: string | undefined;
+  explicitBoundary?: string;
 }): (message: any, seenCount: number) => boolean {
   const triggerMs = createdMsOf(input.triggerMessage);
   const triggerId = input.triggerMessage?.message_id;
@@ -210,6 +239,7 @@ function makeRegularGroupStopper(input: {
     // to just the command. Mirrors findPreviousSummaryBoundaryMs's `ms >= triggerMs`.
     if (triggerId && message?.message_id === triggerId) return false;
     if (ms !== undefined && triggerMs !== undefined && ms >= triggerMs) return false;
+    if (matchesExplicitBoundary(message, input.explicitBoundary)) return true;
     if (isPreviousSummaryForThisBot(message, input.botOpenId)) return true;
     kept += 1;
     if (input.range.limit > 0 && kept >= input.range.limit) return true;
@@ -231,6 +261,32 @@ function renderHistory(messages: any[]): string {
   }).join('\n');
 }
 
+function explicitBoundaryFromTrigger(triggerText: string): string | undefined {
+  const rest = triggerText.replace(/^\/summary(?:\s|$)/i, '').trim();
+  return rest.length > 0 ? rest : undefined;
+}
+
+function summaryInstruction(match: SummaryCommandMatch, explicitBoundary: string | undefined): string {
+  const base = match.prompt || DEFAULT_SUMMARY_PROMPT;
+  const boundaryRule = explicitBoundary
+    ? '\n如果 /summary 命令后带了文字，那段文字就是用户指定的总结边界；只能在这个边界内总结，不能擅自扩展范围或补写边界外内容。'
+    : '';
+  if (!match.summaryMemory) return `${base}${boundaryRule}`;
+  const memoryPath = match.summaryMemoryPath || 'summary.md';
+  return [
+    `请基于提供的历史生成中文问题解决记录，并追加写入配置的记忆文件路径：${memoryPath}。`,
+    '必须遵守：',
+    `1. 只允许创建或追加 ${memoryPath}；如果它是相对路径，按当前项目根目录解析；如果它是绝对路径，按原样使用。不要写入、修改任何其他记忆文件或长期记忆位置。`,
+    '2. 不要改业务代码，不要写 AGENTS.md、CLAUDE.md、~/.trae/cli/memories 或其他 memory 文件。',
+    '3. 写入的 Markdown 必须包含：总结内容、问题、解决方案、可复用条件。可复用条件里尽量保留 PSM、环境、任务 ID、节点、错误现象等必要匹配条件。',
+    '4. 如果 /summary 命令后带了文字，那段文字就是用户指定的总结边界；只能在这个边界内总结，不能擅自扩展范围或补写边界外内容。',
+    `5. 写入后，把实际追加到 ${memoryPath} 的 Markdown 原样发给用户确认，不要只说已写入。`,
+    '6. 这不是通用长期记忆，而是一个由用户显式触发、写在项目目录里、严格按条件匹配复用的问题解决记录本。',
+    '',
+    `原始总结要求：${base}`,
+  ].join('\n');
+}
+
 function buildPromptBody(input: {
   match: SummaryCommandMatch;
   historyText: string;
@@ -241,13 +297,15 @@ function buildPromptBody(input: {
 }): string {
   const { match, historyText, historyCount, historyWindow, boundaryMs, historyError } = input;
   const scope = match.chatKind === 'topic' ? 'current-thread' : 'regular-group';
+  const explicitBoundary = match.summaryMemory ? explicitBoundaryFromTrigger(match.triggerText) : undefined;
   const lines = [
-    `<summary_command scope="${scope}">`,
+    `<summary_command scope="${scope}" summary_memory="${match.summaryMemory ? 'true' : 'false'}" summary_memory_path="${xmlEscape(match.summaryMemoryPath || 'summary.md')}">`,
     '<command_message>',
     xmlEscape(match.triggerText),
     '</command_message>',
+    ...(explicitBoundary ? ['<explicit_boundary>', xmlEscape(explicitBoundary), '</explicit_boundary>'] : []),
     '<instruction>',
-    xmlEscape(match.prompt || DEFAULT_SUMMARY_PROMPT),
+    xmlEscape(summaryInstruction(match, explicitBoundary)),
     '</instruction>',
   ];
   if (historyError) {
@@ -285,26 +343,30 @@ export async function buildSummaryCommandPrompt(input: {
         });
       }
       const raw = await listThreadMessages(larkAppId, chatId, rootMessageId, 0);
-      const history = filterHistoryWindow(raw, match.range, message, botOpenId);
+      const explicitBoundary = match.summaryMemory ? explicitBoundaryFromTrigger(match.triggerText) : undefined;
+      const history = filterHistoryWindow(raw, match.range, message, botOpenId, explicitBoundary);
       return buildPromptBody({
         match,
         historyText: renderHistory(history.messages),
         historyCount: history.messages.length,
         historyWindow: history.window,
         boundaryMs: history.boundaryMs,
+        historyError: history.historyError,
       });
     }
 
+    const explicitBoundary = match.summaryMemory ? explicitBoundaryFromTrigger(match.triggerText) : undefined;
     const raw = await listChatMessagesUntil(larkAppId, chatId, {
-      stopAfter: makeRegularGroupStopper({ range: match.range, triggerMessage: message, botOpenId }),
+      stopAfter: makeRegularGroupStopper({ range: match.range, triggerMessage: message, botOpenId, explicitBoundary }),
     });
-    const history = filterHistoryWindow(raw, match.range, message, botOpenId);
+    const history = filterHistoryWindow(raw, match.range, message, botOpenId, explicitBoundary);
     return buildPromptBody({
       match,
       historyText: renderHistory(history.messages),
       historyCount: history.messages.length,
       historyWindow: history.window,
       boundaryMs: history.boundaryMs,
+      historyError: history.historyError,
     });
   } catch (err) {
     const reason = err instanceof Error ? err.message : String(err);

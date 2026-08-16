@@ -35,12 +35,13 @@ import {
   isSessionGroup,
   getSessionGroup,
   touchSessionGroup,
-  markSessionGroupTitleFailed,
   markSessionGroupTitled,
+  markSessionGroupTitleFailed,
   removeSessionGroup,
   listSessionGroups,
 } from '../src/services/session-groups-store.js';
 import { sanitizeTitleOutput, buildTitlePrompt, buildOneShotEnv, resolveOneShotCommand } from '../src/services/session-group-title.js';
+import { resolveTagMode } from '../src/services/feed-group-tagger.js';
 
 beforeEach(() => {
   tempDir = mkdtempSync(join(tmpdir(), 'session-groups-store-test-'));
@@ -190,26 +191,41 @@ describe('buildOneShotEnv (PR review P2: child-env security boundary)', () => {
   });
 });
 
-describe('resolveOneShotCommand (PR review: launcher precedence parity)', () => {
+describe('resolveOneShotCommand (PR review: full buildWrappedLaunch parity)', () => {
   const template = ['claude', '-p'] as const;
 
-  it('wrapperCli replaces the default bin and keeps template mode args', () => {
+  it('wrapperCli goes through buildWrappedLaunch and keeps template mode args', () => {
     expect(resolveOneShotCommand({ wrapperCli: 'aiden x claude' }, template))
-      .toEqual(['aiden', 'x', 'claude', '-p']);
+      .toEqual({ argv: ['aiden', 'x', 'claude', '-p'], env: undefined });
+  });
+
+  it('ttadk wrapper injects -m <model> --skip-check like the formal spawn path', () => {
+    const { argv } = resolveOneShotCommand({ wrapperCli: 'ttadk claude', model: 'glm-5.1' }, template);
+    expect(argv[0]).toBe('ttadk');
+    expect(argv).toContain('-m');
+    expect(argv[argv.indexOf('-m') + 1]).toBe('glm-5.1');
+    expect(argv).toContain('--skip-check');
+    expect(argv[argv.length - 1]).toBe('-p');
+  });
+
+  it('cjadk wrapper carries CJADK_INTERACTIVE=0 (no startup selector in non-TTY)', () => {
+    const { argv, env } = resolveOneShotCommand({ wrapperCli: 'cjadk claude' }, template);
+    expect(argv[0]).toBe('cjadk');
+    expect(env).toEqual({ CJADK_INTERACTIVE: '0' });
   });
 
   it('wrapperCli wins over cliPathOverride (same as the formal spawn path)', () => {
-    expect(resolveOneShotCommand({ wrapperCli: 'ccr code', cliPathOverride: '/opt/claude' }, template))
+    expect(resolveOneShotCommand({ wrapperCli: 'ccr code', cliPathOverride: '/opt/claude' }, template).argv)
       .toEqual(['ccr', 'code', '-p']);
   });
 
   it('cliPathOverride replaces the bin when no wrapper is set', () => {
-    expect(resolveOneShotCommand({ cliPathOverride: '/usr/local/bin/traex' }, ['traex', 'exec', '--skip-git-repo-check']))
+    expect(resolveOneShotCommand({ cliPathOverride: '/usr/local/bin/traex' }, ['traex', 'exec', '--skip-git-repo-check']).argv)
       .toEqual(['/usr/local/bin/traex', 'exec', '--skip-git-repo-check']);
   });
 
   it('falls back to the template verbatim', () => {
-    expect(resolveOneShotCommand({}, template)).toEqual(['claude', '-p']);
+    expect(resolveOneShotCommand({}, template)).toEqual({ argv: ['claude', '-p'] });
   });
 });
 
@@ -223,5 +239,20 @@ describe('buildTitlePrompt', () => {
   it('caps the excerpt at 500 chars', () => {
     const p = buildTitlePrompt('y'.repeat(2000), 12, 'en');
     expect(p.length).toBeLessThan(700);
+  });
+});
+
+describe('resolveTagMode', () => {
+  it('defaults to feed-group when tag.mode is unset', () => {
+    // feed-group 不依赖租户权限目录（chat-tag 的 im:tag scope 部分租户根本
+    // 没有），任何用户 OAuth 一次即可用 —— 因此是未配置时的默认模式。
+    expect(resolveTagMode(undefined)).toBe('feed-group');
+    expect(resolveTagMode({})).toBe('feed-group');
+  });
+
+  it('honours an explicitly configured mode', () => {
+    expect(resolveTagMode({ mode: 'chat-tag' })).toBe('chat-tag');
+    expect(resolveTagMode({ mode: 'feed-group' })).toBe('feed-group');
+    expect(resolveTagMode({ mode: 'off' })).toBe('off');
   });
 });

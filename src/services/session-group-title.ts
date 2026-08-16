@@ -16,7 +16,8 @@ import { tmpdir } from 'node:os';
 import { getBot } from '../bot-registry.js';
 import { redactChildEnv } from '../utils/child-env.js';
 import { sanitizePerBotEnv } from '../core/per-bot-env.js';
-import { updateChatName } from './groups-store.js';
+import { buildWrappedLaunch, wrapperLaunchEnv } from '../setup/cli-selection.js';
+import { renameChat } from './groups-store.js';
 import {
   getSessionGroup,
   markSessionGroupTitleFailed,
@@ -59,25 +60,30 @@ const inFlightTitles = new Set<string>();
  * env-boundary regression tests.
  */
 /**
- * Resolve the one-shot argv with the SAME launcher precedence as the formal
- * CLI spawn path (PR review): `wrapperCli` (space-split tokens whose first
- * token replaces the default bin — enterprise gateways like `aiden x claude`)
- * wins over `cliPathOverride` (which registerBot enforces as an exact shadow
- * of cliRuntime.executable, so runtime configs are covered transitively), and
- * the template's default bin is the fallback. The template's own flags/mode
- * args are preserved in every branch; a wrapper that cannot run the CLI's
- * print mode fails the exec and degrades to the placeholder title like any
- * other one-shot failure. Exported for tests.
+ * Resolve the one-shot launch with the SAME launcher semantics as the formal
+ * CLI spawn path (PR review): `wrapperCli` goes through buildWrappedLaunch —
+ * the shared builder that knows the gateway specifics (ttadk needs
+ * `-m <model> --skip-check` or it opens an interactive model selector /
+ * preflight and a non-TTY execFile hangs to timeout; aiden strips args it
+ * rejects; cjadk rewrites codex config args) — plus wrapperLaunchEnv for the
+ * wrapper's non-interactive env knobs (CJADK_INTERACTIVE=0). Without a
+ * wrapper, `cliPathOverride` (registerBot enforces it as an exact shadow of
+ * cliRuntime.executable, so runtime configs are covered transitively)
+ * replaces the template bin; otherwise the template runs verbatim. Exported
+ * for tests.
  */
 export function resolveOneShotCommand(
-  cfg: { wrapperCli?: string; cliPathOverride?: string },
+  cfg: { wrapperCli?: string; cliPathOverride?: string; model?: string },
   template: readonly string[],
-): string[] {
+): { argv: string[]; env?: Record<string, string> } {
   const wrapper = cfg.wrapperCli?.trim();
-  if (wrapper) return [...wrapper.split(/\s+/), ...template.slice(1)];
+  if (wrapper) {
+    const { bin, args } = buildWrappedLaunch(wrapper, template.slice(1), b => b, { ttadkModel: cfg.model });
+    return { argv: [bin, ...args], env: wrapperLaunchEnv(wrapper) };
+  }
   const override = cfg.cliPathOverride?.trim();
-  if (override) return [override, ...template.slice(1)];
-  return [...template];
+  if (override) return { argv: [override, ...template.slice(1)] };
+  return { argv: [...template] };
 }
 
 export function buildOneShotEnv(botEnv: unknown): NodeJS.ProcessEnv {
@@ -149,6 +155,9 @@ export function scheduleSessionGroupTitle(opts: {
 }): void {
   const { larkAppId, chatId, userText } = opts;
   if (inFlightTitles.has(chatId)) return;
+  // Bounded healing: a group whose title never lands must not let every later
+  // message spawn another one-shot CLI. Rounds are capped and spaced by the
+  // persisted backoff deadline (survives daemon restarts).
   const current = getSessionGroup(chatId);
   if (!current || current.titled) return;
   if ((current.titleAttempts ?? 0) >= MAX_SESSION_GROUP_TITLE_ROUNDS) return;
@@ -168,11 +177,11 @@ export function scheduleSessionGroupTitle(opts: {
         logger.info(`[session-group] no one-shot template for cliId=${cfg.cliId}; keeping placeholder title`);
         return;
       }
-      const argv = resolveOneShotCommand(cfg, template);
+      const { argv, env: wrapperEnv } = resolveOneShotCommand(cfg, template);
       const prompt = buildTitlePrompt(userText, maxLen, localeForBot(larkAppId));
 
       const runOnce = () => new Promise<string>((resolve, reject) => {
-        const env = buildOneShotEnv(cfg.env);
+        const env = { ...buildOneShotEnv(cfg.env), ...wrapperEnv };
         const child = execFile(argv[0], [...argv.slice(1), prompt], {
           timeout: TITLE_TIMEOUT_MS,
           maxBuffer: 1024 * 1024,
@@ -215,9 +224,11 @@ export function scheduleSessionGroupTitle(opts: {
       }
       const prefix = sg.namePrefix ?? '';
       const finalName = `${prefix}${title}`;
-      const r = await updateChatName(larkAppId, chatId, finalName);
+      // Reuse the shared renameChat wrapper (membership precheck + error
+      // classification) instead of a bespoke chat.update call.
+      const r = await renameChat(larkAppId, chatId, finalName);
       if (!r.ok) {
-        logger.warn(`[session-group] rename chat=${chatId.substring(0, 12)} failed: ${r.error}`);
+        logger.warn(`[session-group] rename chat=${chatId.substring(0, 12)} failed: ${r.error}${r.detail ? ` (${r.detail})` : ''}`);
         return;
       }
       markSessionGroupTitled(chatId);
@@ -227,7 +238,7 @@ export function scheduleSessionGroupTitle(opts: {
       const entry = getSessionGroup(chatId);
       if (entry?.lastSessionId) {
         const session = sessionStore.getSession(entry.lastSessionId);
-        if (session) updateSessionTitle(session, title);
+        if (session) updateSessionTitle(session, title, 'system');
         touchSessionGroup(chatId);
       }
       logger.info(`[session-group] titled chat=${chatId.substring(0, 12)} "${finalName}"`);

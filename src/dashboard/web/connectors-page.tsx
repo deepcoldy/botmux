@@ -1,9 +1,11 @@
+import type React from 'react';
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { CreateActionButton, DropdownMenu, FieldTitle, LoadingState, dropdownLabel } from './dashboard-components.js';
 import { jget, jsend } from './dashboard-api.js';
 import { mountReactPage, type PageDisposer } from './react-mount.js';
 import { useT } from './react-hooks.js';
 import { WebhookLogsContent } from './webhook-logs-page.js';
+import { copyText } from './clipboard.js';
 
 interface Connector {
   id: string;
@@ -19,10 +21,21 @@ interface Connector {
     workflowId?: string;
   };
   promptEnvelope: { sourceName: string; instruction?: string };
-  topicMessage?: { mode: 'default' | 'custom' | 'none'; text?: string };
+  topicMessage?: {
+    mode: 'default' | 'custom' | 'template' | 'none';
+    text?: string;
+    extractors?: Record<string, ConnectorTopicMessageExtractor>;
+  };
   suppressFinalOutput?: boolean;
   loggingPolicy?: { storePayload: boolean; storeHeaders: boolean; retentionDays: number };
   lifecycleExtractors?: { dedupKey: string } | null;
+}
+
+interface ConnectorTopicMessageExtractor {
+  path: string;
+  kind: 'text' | 'mention';
+  identityPath?: string;
+  namePath?: string;
 }
 
 interface BotOpt {
@@ -49,8 +62,9 @@ interface CreateForm {
   deduplicate: boolean;
   dedup: string;
   instruction: string;
-  topicMessageMode: 'default' | 'custom' | 'none';
+  topicMessageMode: 'default' | 'custom' | 'template' | 'none';
   topicMessageText: string;
+  topicMessageExtractors: string;
   suppressFinalOutput: boolean;
   verify: 'token' | 'hmac-sha256';
   secret: string;
@@ -66,6 +80,7 @@ interface CreatedConnector {
   isToken: boolean;
   isDynamic: boolean;
   exampleChat: string;
+  rotated?: boolean;
 }
 
 type ConnectorsTab = 'webhooks' | 'logs';
@@ -89,6 +104,7 @@ const emptyForm: CreateForm = {
   instruction: '',
   topicMessageMode: 'default',
   topicMessageText: '',
+  topicMessageExtractors: '{}',
   suppressFinalOutput: false,
   verify: 'token',
   secret: '',
@@ -105,6 +121,33 @@ export function buildConnectorInstructionUpdateBody(
       instruction,
     },
   };
+}
+
+export function buildConnectorTopicMessageConfig(
+  mode: CreateForm['topicMessageMode'],
+  rawText: string,
+  rawExtractors: string,
+):
+  | { ok: true; value: NonNullable<Connector['topicMessage']> }
+  | { ok: false; error: 'connectors.errTopicExtractors' } {
+  const text = rawText.trim();
+  if (mode !== 'template') {
+    return {
+      ok: true,
+      value: mode === 'custom' ? { mode, text } : { mode },
+    };
+  }
+
+  try {
+    const parsed = JSON.parse(rawExtractors) as unknown;
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      return { ok: false, error: 'connectors.errTopicExtractors' };
+    }
+    const extractors = parsed as Record<string, ConnectorTopicMessageExtractor>;
+    return { ok: true, value: { mode, text, extractors } };
+  } catch {
+    return { ok: false, error: 'connectors.errTopicExtractors' };
+  }
 }
 
 export function buildConnectorKindOptions(
@@ -130,7 +173,7 @@ function ConnectorDropdown<T extends string>(props: {
   value: T;
   options: Array<{ value: T; label: ReactNode; disabled?: boolean }>;
   onChange(value: T): void;
-}): JSX.Element {
+}): React.JSX.Element {
   return (
     <DropdownMenu
       id={props.id}
@@ -156,7 +199,7 @@ function SearchableGroupPicker(props: {
   emptyLabel: string;
   selectedCountLabel(count: number): string;
   onChange(value: string | string[]): void;
-}): JSX.Element {
+}): React.JSX.Element {
   const rootRef = useRef<HTMLDivElement | null>(null);
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState('');
@@ -283,6 +326,7 @@ function formFromConnector(connector: Connector, groups: GroupOpt[]): CreateForm
     instruction: connector.promptEnvelope?.instruction || '',
     topicMessageMode: connector.topicMessage?.mode || 'default',
     topicMessageText: connector.topicMessage?.text || '',
+    topicMessageExtractors: JSON.stringify(connector.topicMessage?.extractors || {}, null, 2),
     suppressFinalOutput: connector.suppressFinalOutput === true,
     verify: connector.verify?.type || 'token',
     secret: '',
@@ -290,7 +334,7 @@ function formFromConnector(connector: Connector, groups: GroupOpt[]): CreateForm
   };
 }
 
-function ConnectorsSubNav(props: { active: ConnectorsTab }): JSX.Element {
+function ConnectorsSubNav(props: { active: ConnectorsTab }): React.JSX.Element {
   const tr = useT();
   const isWebhooks = props.active === 'webhooks';
   const isLogs = props.active === 'logs';
@@ -482,8 +526,17 @@ function ConnectorsPage(props: { tab: ConnectorsTab }) {
       return;
     }
     const topicMessageText = form.topicMessageText.trim();
-    if (form.topicMessageMode === 'custom' && !topicMessageText) {
+    if ((form.topicMessageMode === 'custom' || form.topicMessageMode === 'template') && !topicMessageText) {
       setCreateMsg({ text: tr('connectors.errTopicMessage'), error: true });
+      return;
+    }
+    const topicMessage = buildConnectorTopicMessageConfig(
+      form.topicMessageMode,
+      topicMessageText,
+      form.topicMessageExtractors,
+    );
+    if (!topicMessage.ok) {
+      setCreateMsg({ text: tr(topicMessage.error), error: true });
       return;
     }
 
@@ -492,10 +545,7 @@ function ConnectorsPage(props: { tab: ConnectorsTab }) {
       enabled: editingConnector?.enabled ?? true,
       target: { kind: form.kind, mode: form.mode, botId },
       promptEnvelope: { sourceName: name, instruction: form.instruction.trim() },
-      topicMessage: {
-        mode: form.topicMessageMode,
-        ...(form.topicMessageMode === 'custom' ? { text: topicMessageText } : {}),
-      },
+      topicMessage: topicMessage.value,
       suppressFinalOutput: form.suppressFinalOutput,
       verify: { type: form.verify },
       loggingPolicy: { storePayload: form.storePayload, storeHeaders: true, retentionDays: 14 },
@@ -528,7 +578,38 @@ function ConnectorsPage(props: { tab: ConnectorsTab }) {
       if ((r.status === 201 || r.status === 200) && r.body?.ok) {
         if (editingConnector) {
           const editedId = editingConnector.id;
-          setConnectors(current => replaceConnectorById(current, r.body.connector as Connector));
+          const updated = r.body.connector as Connector;
+          setConnectors(current => replaceConnectorById(current, updated));
+          // A changed secret/token is shown only once. `body.secret` holds the
+          // value the user typed this edit; `r.body.secret` is present when the
+          // server auto-generated one. Either way, surface it in the same
+          // one-time panel new connectors use — otherwise the new token is lost
+          // and a token-mode connector can never be triggered again.
+          const rotatedSecret = r.body.secret ?? body.secret;
+          if (rotatedSecret) {
+            const editUrl = r.body.webhookUrl || webhookUrl(updated.id);
+            const editIsToken = (updated.verify?.type ?? 'token') === 'token';
+            const editIsDynamic = updated.target.mode === 'dynamic';
+            const editExampleChat = editIsDynamic
+              ? (updated.target.allowChats?.[0] || '<chatId>')
+              : '';
+            setCreateMsg(null);
+            setCreated({
+              name,
+              mode: updated.target.mode,
+              chatId: updated.target.chatId,
+              url: editUrl,
+              secret: rotatedSecret,
+              isToken: editIsToken,
+              isDynamic: editIsDynamic,
+              exampleChat: editExampleChat,
+              rotated: true,
+            });
+            // Keep editingConnector set so the modal header still reads "edit";
+            // closeCreateModal clears it when the user dismisses the panel.
+            await load();
+            return;
+          }
           setEditMsg({ id: editedId, text: tr('connectors.updated') });
           setCreateOpen(false);
           setEditingConnector(null);
@@ -559,6 +640,7 @@ function ConnectorsPage(props: { tab: ConnectorsTab }) {
           instruction: '',
           topicMessageMode: 'default',
           topicMessageText: '',
+          topicMessageExtractors: '{}',
           suppressFinalOutput: false,
           allowChats: [],
           storePayload: true,
@@ -621,12 +703,14 @@ function ConnectorsPage(props: { tab: ConnectorsTab }) {
   }
 
   function copyConnectorUrl(connector: Connector): void {
-    void navigator.clipboard?.writeText(webhookUrl(connector.id));
-    setCopiedId(connector.id);
-    if (copyTimerRef.current) clearTimeout(copyTimerRef.current);
-    copyTimerRef.current = setTimeout(() => {
-      if (mountedRef.current) setCopiedId(null);
-    }, 1200);
+    void copyText(webhookUrl(connector.id), tr('connectors.copy')).then(copied => {
+      if (!copied || !mountedRef.current) return;
+      setCopiedId(connector.id);
+      if (copyTimerRef.current) clearTimeout(copyTimerRef.current);
+      copyTimerRef.current = setTimeout(() => {
+        if (mountedRef.current) setCopiedId(null);
+      }, 1200);
+    });
   }
 
   return (
@@ -842,35 +926,68 @@ function ConnectorsPage(props: { tab: ConnectorsTab }) {
           <div className="cn-field cn-field-wide connector-topic-message-config">
             <FieldTitle help={tr('connectors.topicMessageHint')}>{tr('connectors.topicMessage')}</FieldTitle>
             <div className="connector-topic-message-options" role="radiogroup" aria-label={tr('connectors.topicMessage')}>
-              {(['default', 'custom', 'none'] as const).map(mode => (
-                <button
-                  key={mode}
-                  type="button"
-                  role="radio"
-                  aria-checked={form.topicMessageMode === mode}
-                  className={`connector-topic-message-option${form.topicMessageMode === mode ? ' selected' : ''}`}
-                  onClick={() => patchForm({ topicMessageMode: mode })}
-                >
-                  <span className="connector-strategy-radio" aria-hidden="true" />
-                  <span>
-                    <b>{tr(`connectors.topicMessage${mode === 'default' ? 'Default' : mode === 'custom' ? 'Custom' : 'None'}`)}</b>
-                    <small>{tr(`connectors.topicMessage${mode === 'default' ? 'DefaultHint' : mode === 'custom' ? 'CustomHint' : 'NoneHint'}`)}</small>
-                  </span>
-                </button>
-              ))}
+              {(['default', 'custom', 'template', 'none'] as const).map(mode => {
+                const labelSuffix = mode === 'default'
+                  ? 'Default'
+                  : mode === 'custom'
+                    ? 'Custom'
+                    : mode === 'template'
+                      ? 'Template'
+                      : 'None';
+                return (
+                  <button
+                    key={mode}
+                    type="button"
+                    role="radio"
+                    aria-checked={form.topicMessageMode === mode}
+                    className={`connector-topic-message-option${form.topicMessageMode === mode ? ' selected' : ''}`}
+                    onClick={() => patchForm({ topicMessageMode: mode })}
+                  >
+                    <span className="connector-strategy-radio" aria-hidden="true" />
+                    <span>
+                      <b>{tr(`connectors.topicMessage${labelSuffix}`)}</b>
+                      <small>{tr(`connectors.topicMessage${labelSuffix}Hint`)}</small>
+                    </span>
+                  </button>
+                );
+              })}
             </div>
-            {form.topicMessageMode === 'custom' ? (
-              <label className="connector-topic-message-input" htmlFor="cn-topic-message">
+            {form.topicMessageMode === 'custom' || form.topicMessageMode === 'template' ? (
+              <div className="connector-topic-message-input">
                 <input
                   id="cn-topic-message"
                   type="text"
                   maxLength={200}
                   value={form.topicMessageText}
                   onChange={event => patchForm({ topicMessageText: event.currentTarget.value })}
-                  placeholder={tr('connectors.topicMessageCustomPh')}
+                  aria-label={tr(form.topicMessageMode === 'template'
+                    ? 'connectors.topicMessageTemplate'
+                    : 'connectors.topicMessageCustom')}
+                  placeholder={tr(form.topicMessageMode === 'template'
+                    ? 'connectors.topicMessageTemplatePh'
+                    : 'connectors.topicMessageCustomPh')}
                 />
-                <small>{tr('connectors.topicMessageCustomHelp')}<span>{Array.from(form.topicMessageText).length}/200</span></small>
-              </label>
+                <small>
+                  {tr(form.topicMessageMode === 'template'
+                    ? 'connectors.topicMessageTemplateHelp'
+                    : 'connectors.topicMessageCustomHelp')}
+                  <span>{Array.from(form.topicMessageText).length}/200</span>
+                </small>
+                {form.topicMessageMode === 'template' ? (
+                  <>
+                    <textarea
+                      id="cn-topic-message-extractors"
+                      className="connector-topic-message-extractors"
+                      rows={8}
+                      value={form.topicMessageExtractors}
+                      onChange={event => patchForm({ topicMessageExtractors: event.currentTarget.value })}
+                      placeholder={tr('connectors.topicMessageExtractorsPh')}
+                      aria-label={tr('connectors.topicMessageExtractors')}
+                    />
+                    <small>{tr('connectors.topicMessageExtractorsHelp')}</small>
+                  </>
+                ) : null}
+              </div>
             ) : (
               <p className={`connector-topic-message-preview${form.topicMessageMode === 'none' ? ' muted' : ''}`}>
                 {form.topicMessageMode === 'none'
@@ -917,15 +1034,22 @@ function ConnectorsPage(props: { tab: ConnectorsTab }) {
           )}
               </div>
               <footer className="connector-modal-actions">
-                <button type="button" disabled={creating} onClick={closeCreateModal}>
-                  {tr('connectors.cancel')}
-                </button>
                 {created ? (
+                  // The one-time credential panel commits server-side before it
+                  // shows. A "cancel" here would not roll anything back — it would
+                  // only dismiss the shown-once token and lose it. Offer just
+                  // "close" so the credential can't be discarded by a misleading
+                  // button. This footer is shared by create + edit success paths.
                   <button type="button" className="primary" onClick={closeCreateModal}>{tr('connectors.close')}</button>
                 ) : (
-                  <button id="cn-create" type="button" className="primary" disabled={creating} onClick={() => void submitConnector()}>
-                    {tr(editingConnector ? 'connectors.btnSave' : 'connectors.btnCreate')}
-                  </button>
+                  <>
+                    <button type="button" disabled={creating} onClick={closeCreateModal}>
+                      {tr('connectors.cancel')}
+                    </button>
+                    <button id="cn-create" type="button" className="primary" disabled={creating} onClick={() => void submitConnector()}>
+                      {tr(editingConnector ? 'connectors.btnSave' : 'connectors.btnCreate')}
+                    </button>
+                  </>
                 )}
               </footer>
             </article>
@@ -969,7 +1093,7 @@ function CreatedPanel(props: { created: CreatedConnector; groupName(chatId: stri
     <div className="connector-created-wrap">
       <div className="card connector-created-card">
         <p className="connector-created-title ok">
-          {tr('connectors.createdPrefix', { name: c.name })}
+          {tr(c.rotated ? 'connectors.rotatedPrefix' : 'connectors.createdPrefix', { name: c.name })}
           {c.mode === 'fixed' && c.chatId ? (
             <span className="muted"> · {tr('connectors.createdDest', { name: props.groupName(c.chatId) })}</span>
           ) : null}
@@ -1057,7 +1181,7 @@ function ConnectorList(props: {
             <div className="muted connector-item-note">
               {c.topicMessage?.mode === 'none'
                 ? tr('connectors.topicMessageListNone')
-                : c.topicMessage?.mode === 'custom'
+                : c.topicMessage?.mode === 'custom' || c.topicMessage?.mode === 'template'
                   ? tr('connectors.topicMessageListCustom', { text: c.topicMessage.text || '' })
                   : tr('connectors.topicMessageListDefault')}
             </div>

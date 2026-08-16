@@ -23,13 +23,13 @@ Both modes open a "virtual session" (when no `chatId` is given) that **never ent
 
 ## 2. Authentication
 
-Calls go through the dashboard (default `http://<daemon-host>:7891`). Auth currently uses a short-lived dashboard token:
+Calls go through the dashboard (default `http://<daemon-host>:7891`). Auth currently uses the rotating dashboard token:
 
 - **Programmatic calls MUST send the token as a Cookie header**: `Cookie: botmux_dashboard_token=<TOKEN>`
 - ⚠️ Do NOT use `?t=<TOKEN>` query: that's for browser login; a `POST` carrying it returns a **302 redirect** (set-cookie) and the call fails.
-- Getting a token: run `botmux dashboard` to print the login URL — the part after `?t=` is the token. Each run rotates it (the old token is invalidated).
+- Getting a token: run `botmux dashboard` to get the current login URL — the part after `?t=` is the token. The command creates the first token when absent; use `botmux dashboard rotate` only when you intend to invalidate an existing token.
 
-> The token is short-lived. Long-lived API-key auth (e.g. `X-Botmux-Api-Key`) is planned; this doc will be updated when it lands.
+> The token persists until explicit rotation. Dedicated API-key auth (e.g. `X-Botmux-Api-Key`) is planned; this doc will be updated when it lands.
 
 ---
 
@@ -56,6 +56,10 @@ Hard constraints (all validated; violations return 400):
 - **`envelope.trusted` must be `false`**. This is an injection-defense design: `trusted:false` declares "the envelope content is untrusted external data", so the daemon wraps it as an untrusted event and does not execute instructions embedded inside it. Put what you actually want the bot to do in the top-level `instruction` (the trusted directive), not in the envelope.
 - **Omitting `chatId`** requires `options` to contain either `waitForFinalOutput` or `asyncReturnSessionId`, else `target_required`.
 - **`options.timeoutMs` range `[1000, 300000]`** (1s–5min); out of range returns 400. Defaults to 120000.
+- **`options.model`** / **`options.reasoningEffort`** (optional, **codex / codex-app bots only**): override the model and reasoning level for this trigger.
+  - `model`: a codex model id (≤200 chars); `reasoningEffort`: `low` / `medium` / `high` / `xhigh` (passed to codex verbatim — no downgrade).
+  - **Fresh-session only**: frozen only when this trigger **creates a new session**; a fold-in to an existing worker does not rewrite it.
+  - **Scoped to the codex family**: ignored when the target bot is not codex/codex-app (never changes a Claude/Gemini/CoCo bot's model).
 
 ### Sync mode (waitForFinalOutput)
 
@@ -115,6 +119,60 @@ Response (HTTP 200, returns immediately — **keep `target.sessionId` as the cor
 }
 ```
 
+### Idempotency key (`options.idempotencyKey`) — prevent a retry from running twice
+
+**Problem**: if the HTTP response to an async trigger is lost in transit (the daemon already created the session and the task is running), your retry builds a **brand-new session** and runs the same task a **second time** (duplicate external side effects: two messages sent, a migration run twice…). Your own dedup can't stop this — the first session is genuinely already executing.
+
+**Fix**: pass a stable key in `options.idempotencyKey` that you **persist before issuing the trigger**. On a same-key retry the daemon returns the **same session/triggerId — no new session, no re-dispatch**:
+
+```bash
+curl -X POST "http://<host>:7891/api/trigger" -H 'content-type: application/json' \
+  -H "Cookie: botmux_dashboard_token=$TOKEN" \
+  -d '{
+    "source":{"type":"webhook"},
+    "target":{"kind":"turn","botId":"cli_xxx"},
+    "instruction":"...",
+    "envelope":{"format":"json","sourceName":"demo","trusted":false},
+    "options":{"asyncReturnSessionId":true, "idempotencyKey":"my-task-42"}
+  }'
+```
+
+A hit carries `idempotent:true` (reused, no new dispatch); the first create carries `idempotent:false`. Poll `trigger-result` with the (reused or new) `sessionId` as usual — **no extra lookup endpoint needed**.
+
+**Scope (important)**: `idempotencyKey` is supported only for a **fresh async virtual** trigger — `target.kind:'turn'` + `options.asyncReturnSessionId:true`, with **no** `target.sessionId` / `rootMessageId` / `chatId`, and no `waitForFinalOutput` / `dryRun`. Any other combination carrying a key returns **400** (the lease is implemented only on this seam, so the contract does not advertise it elsewhere).
+
+**Same key, different payload → 409 `idempotency_conflict`**: the key is bound to its business payload (`instruction` / `envelope` / execution-affecting `options`); reusing a key with a changed payload is a caller bug and the daemon returns 409 rather than silently joining the old task. Retry with the **same key AND the same payload**.
+
+**Crash semantics (at-most-once)**: before dispatching, the daemon durably marks the key's lease `attempting` (a commit-unknown barrier). If the daemon crashes between "dispatch started" and "completion proven", it will **not** blindly re-dispatch on restart (`forkWorker` returning is not proof the model didn't start). The key converges to a terminal state and `trigger-result` reports `failed` (errorCode `no_output`, meaning "previous dispatch outcome unknown; not re-run under at-most-once"). Treat it as **Failed** in your recovery (better a visible failure you retry as a new task than a double run).
+
+**Retention**: the key→session mapping is append-only (same policy as async results), so a late retry after completion still reuses the same session instead of rebuilding it.
+
+---
+
+### Turn idempotency key (`options.turnIdempotencyKey`) — same guarantee for a follow-up turn
+
+`idempotencyKey` above only covers a **fresh** session. When you append a **follow-up turn to an existing session** (`target.sessionId` set), use `options.turnIdempotencyKey` instead — a lost HTTP response on the append otherwise can't tell you whether the daemon already accepted that turn, so a retry risks injecting it **twice**.
+
+Pass a stable key you **persist before issuing the follow-up**. On a same-key retry to the same session, the daemon resolves to the **same turn (same `triggerId`) — no second injection**:
+
+```bash
+curl -X POST "http://<host>:7891/api/trigger" -H 'content-type: application/json' \
+  -H "Cookie: botmux_dashboard_token=$TOKEN" \
+  -d '{
+    "source":{"type":"webhook"},
+    "target":{"kind":"turn","botId":"cli_xxx","sessionId":"<existing session>"},
+    "instruction":"...",
+    "envelope":{"format":"json","sourceName":"demo","trusted":false},
+    "options":{"asyncReturnSessionId":true, "turnIdempotencyKey":"my-followup-7"}
+  }'
+```
+
+A hit carries `idempotent:true`; poll `trigger-result` by `sessionId`/`triggerId` as usual.
+
+**Scope**: `turnIdempotencyKey` is supported only for a **follow-up async turn on an existing session** — `target.kind:'turn'` + `target.sessionId` set + `options.asyncReturnSessionId:true`, no `waitForFinalOutput` / `dryRun`. It is **mutually exclusive** with `idempotencyKey` (a request carrying both returns **400**), and the two live in separate, non-collidable key spaces — a `turnIdempotencyKey` and an `idempotencyKey` with the same string never share a lease.
+
+**Same key, different payload → 409 `idempotency_conflict`**; **crash semantics (at-most-once)** and **retention** are identical to `idempotencyKey` above (a follow-up whose dispatch outcome is unknown converges to `failed` / `no_output` and is never blindly re-run). One extra transient case: if the target session is still finishing its **opening activation**, the follow-up is refused **retryably** (errorCode `trigger_failed`, message mentions "session activation in progress") — retry shortly.
+
 ---
 
 ## 4. Polling for the result (four-state contract)
@@ -131,11 +189,11 @@ GET /api/sessions/:sessionId/trigger-result
 | `state` | Meaning | What to do | Key fields |
 |---------|---------|-----------|-----------|
 | `running` | still running | keep polling | — |
-| `completed` | final output ready | terminal; read `output.content` | `output.content`, `finishedAt` |
+| `completed` | final output ready | terminal; read `output.content` (codex-app also brings `usage`) | `output.content`, `finishedAt`, `usage?` |
 | `failed` | session terminated with no captured output (soft terminal) | see below | `errorCode:"no_output"`, `error`, `finishedAt` |
 | `not_found` | no such session (never existed / invalid id) | see two physical forms below | `errorCode:"session_not_found"` |
 
-`completed` example:
+`completed` example (`usage` present only for codex-app, and only when captured):
 
 ```json
 {
@@ -143,11 +201,19 @@ GET /api/sessions/:sessionId/trigger-result
   "state": "completed",
   "triggerId": "trg_87e7b415-...",
   "output": { "content": "ASYNC_DEMO_OK" },
+  "usage": { "inputTokens": 60, "outputTokens": 30, "cacheReadTokens": 40, "cacheCreateTokens": 0 },
   "finishedAt": "2026-07-24T08:43:17.126Z",
   "target": { "kind": "turn", "sessionId": "2eed60c4-...", "chatId": "http_async_..." },
   "async": { "status": "completed", "sessionId": "2eed60c4-...", "completedAt": "..." }
 }
 ```
+
+About `usage` (this turn's token usage, four mutually-exclusive buckets):
+- Present only for **codex-app tasks** and only when the turn's usage was captured; **omitted entirely** for other CLIs (including plain codex) or when not captured.
+- **omit ≠ 0**: no usage means no `usage` field, not four zeros — treat "field absent = unknown", don't read a missing field as a real 0.
+- Buckets: `inputTokens` (fresh input, cache read/write already subtracted), `outputTokens`, `cacheReadTokens`, `cacheCreateTokens`, all per-turn deltas (not session totals).
+- **Survives restart**: after a daemon restart, re-querying a completed session restores `usage` alongside `output` from disk.
+
 
 ### `failed` is a soft terminal — don't kill immediately
 
@@ -295,4 +361,4 @@ Robustness notes (all from the tested contract):
 | `/api/sessions/:id` | GET | session metadata (status/title/etc.) |
 | `/api/sessions/:id/close` | POST | cancel/close a session |
 
-Key `errorCode`s: `target_required`, `bad_request` (incl. `trusted` check, `timeoutMs` out of range), `bot_not_found`, `bot_not_in_chat`, `wait_timeout`, `no_output`, `session_not_found`.
+Key `errorCode`s: `target_required`, `bad_request` (incl. `trusted` check, `timeoutMs` out of range, `idempotencyKey` out of scope), `idempotency_conflict` (same key, different payload), `bot_not_found`, `bot_not_in_chat`, `wait_timeout`, `no_output`, `session_not_found`.

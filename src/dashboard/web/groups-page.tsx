@@ -12,6 +12,9 @@ import {
 import { mountReactPage, type PageDisposer } from './react-mount.js';
 import { useT } from './react-hooks.js';
 import { botOrbStyle, chatAvatarUrlFor } from './ui.js';
+import { copyText } from './clipboard.js';
+import { FeedGroupPicker } from './feed-group-picker.js';
+import { BotMultiSelect } from './bot-multi-select.js';
 import {
   CreateActionButton,
   DropdownMenu,
@@ -62,6 +65,7 @@ type DialogState =
   | { type: 'manage'; chat: GroupChat };
 
 type DialogErrorState = { title: string; reason: unknown };
+type FeedGroupOption = { groupId: string; name: string; type: string };
 
 function emptyRoleContext(): RoleProfileContext {
   return {
@@ -122,19 +126,25 @@ function DialogError(props: DialogErrorState) {
   );
 }
 
-function BotCheckboxes(props: { bots: GroupBot[]; excludeIds?: Set<string> }) {
+function BotCheckboxes(props: {
+  bots: GroupBot[];
+  excludeIds?: Set<string>;
+  tr: Translator;
+  selected: Set<string>;
+  onToggle(larkAppId: string, checked: boolean): void;
+}) {
+  const options = availableBotsForPicker(props.bots, props.excludeIds);
+  const tr = props.tr;
   return (
-    <>
-      {availableBotsForPicker(props.bots, props.excludeIds).map(bot => (
-        <label className="checkbox-row" key={bot.larkAppId}>
-          <input type="checkbox" name="bot" value={bot.larkAppId} />
-          <span className="checkbox-row-main">
-            <strong>{bot.botName ?? bot.larkAppId}</strong>
-            <small>({bot.larkAppId})</small>
-          </span>
-        </label>
-      ))}
-    </>
+    <BotMultiSelect
+      bots={options}
+      selected={props.selected}
+      onToggle={props.onToggle}
+      searchPlaceholder={tr('botPicker.searchPlaceholder')}
+      noMatchLabel={tr('botPicker.noMatch')}
+      emptyLabel={tr('botPicker.empty')}
+      selectedCountLabel={n => tr('botPicker.selectedCount', { n: String(n) })}
+    />
   );
 }
 
@@ -302,7 +312,88 @@ function CreateDialog(props: {
   const [error, setError] = useState<DialogErrorState | null>(null);
   const [success, setSuccess] = useState<any | null>(null);
   const [copied, setCopied] = useState(false);
+  const [selectedBots, setSelectedBots] = useState<Set<string>>(new Set());
   const [roleProfileId, setRoleProfileId] = useState('');
+  const [feedGroups, setFeedGroups] = useState<FeedGroupOption[]>([]);
+  const [feedGroupAppId, setFeedGroupAppId] = useState('');
+  const [feedGroupId, setFeedGroupId] = useState('');
+  const [newFeedGroupName, setNewFeedGroupName] = useState('');
+  const [feedGroupsLoading, setFeedGroupsLoading] = useState(true);
+  const [feedGroupsError, setFeedGroupsError] = useState('');
+  const [feedGroupAuthSubmitting, setFeedGroupAuthSubmitting] = useState(false);
+  const [feedGroupAuthUrl, setFeedGroupAuthUrl] = useState('');
+  const [feedGroupCallbackUrl, setFeedGroupCallbackUrl] = useState('');
+
+  useEffect(() => {
+    let alive = true;
+    void fetch('/api/feed-groups')
+      .then(async response => {
+        const body = await response.json().catch(() => ({}));
+        if (!response.ok || !body.ok) throw new Error(body.message ?? body.error ?? `HTTP ${response.status}`);
+        if (!alive) return;
+        setFeedGroups(Array.isArray(body.groups) ? body.groups : []);
+        setFeedGroupAppId(typeof body.larkAppId === 'string' ? body.larkAppId : '');
+      })
+      .catch(error => { if (alive) setFeedGroupsError(error instanceof Error ? error.message : String(error)); })
+      .finally(() => { if (alive) setFeedGroupsLoading(false); });
+    return () => { alive = false; };
+  }, []);
+
+  useEffect(() => {
+    if (!feedGroupAuthUrl) return;
+    let alive = true;
+    const timer = window.setInterval(() => {
+      void fetch('/api/feed-groups')
+        .then(async response => {
+          const body = await response.json().catch(() => ({}));
+          if (!response.ok || !body.ok || !alive) return;
+          setFeedGroups(Array.isArray(body.groups) ? body.groups : []);
+          setFeedGroupAppId(typeof body.larkAppId === 'string' ? body.larkAppId : '');
+          setFeedGroupsError('');
+          setFeedGroupAuthUrl('');
+          setFeedGroupCallbackUrl('');
+        })
+        .catch(() => { /* remote/manual fallback remains visible */ });
+    }, 1_000);
+    return () => { alive = false; window.clearInterval(timer); };
+  }, [feedGroupAuthUrl]);
+
+  async function openFeedGroupLogin(): Promise<void> {
+    const query = feedGroupAppId ? `?larkAppId=${encodeURIComponent(feedGroupAppId)}` : '';
+    const response = await fetch(`/api/feed-groups/auth-url${query}`);
+    const body = await response.json().catch(() => ({}));
+    if (!response.ok || !body.authUrl) {
+      setError({ title: '无法发起标签授权', reason: body.error ?? `HTTP ${response.status}` });
+      return;
+    }
+    setFeedGroupAuthUrl(String(body.authUrl));
+    setFeedGroupCallbackUrl('');
+  }
+
+  async function completeFeedGroupLogin(callbackUrl: string): Promise<void> {
+    setFeedGroupAuthSubmitting(true);
+    try {
+      const response = await fetch('/api/feed-groups/oauth-callback', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ callbackUrl: callbackUrl.trim() }),
+      });
+      const body = await response.json().catch(() => ({}));
+      if (!response.ok || !body.ok) throw new Error(body.message ?? body.error ?? `HTTP ${response.status}`);
+      const groupsResponse = await fetch('/api/feed-groups');
+      const groupsBody = await groupsResponse.json().catch(() => ({}));
+      if (!groupsResponse.ok || !groupsBody.ok) throw new Error(groupsBody.message ?? groupsBody.error ?? `HTTP ${groupsResponse.status}`);
+      setFeedGroups(Array.isArray(groupsBody.groups) ? groupsBody.groups : []);
+      setFeedGroupAppId(typeof groupsBody.larkAppId === 'string' ? groupsBody.larkAppId : '');
+      setFeedGroupsError('');
+      setFeedGroupAuthUrl('');
+      setFeedGroupCallbackUrl('');
+    } catch (error) {
+      setError({ title: '标签授权失败', reason: error instanceof Error ? error.message : String(error) });
+    } finally {
+      setFeedGroupAuthSubmitting(false);
+    }
+  }
 
   async function submit(ev: FormEvent<HTMLFormElement>): Promise<void> {
     ev.preventDefault();
@@ -310,7 +401,7 @@ function CreateDialog(props: {
     const name = String(fd.get('name') ?? '').trim();
     const bindWorkingDir = String(fd.get('bindWorkingDir') ?? '').trim();
     const roleProfileId = String(fd.get('roleProfileId') ?? '').trim();
-    const ids = fd.getAll('bot') as string[];
+    const ids = [...selectedBots];
     if (ids.length === 0) {
       setError({ title: '请选择 bot', reason: '至少选择一个 bot 后再创建群聊。' });
       return;
@@ -327,6 +418,9 @@ function CreateDialog(props: {
           larkAppIds: ids,
           bindWorkingDir: bindWorkingDir || undefined,
           roleProfileId: roleProfileId || undefined,
+          feedGroupId: feedGroupId || undefined,
+          newFeedGroupName: newFeedGroupName || undefined,
+          feedGroupAppId: (feedGroupId || newFeedGroupName) ? feedGroupAppId : undefined,
         }),
       });
       const respBody = await r.json().catch(() => ({ ok: false, error: `HTTP ${r.status}` }));
@@ -368,15 +462,19 @@ function CreateDialog(props: {
             type="button"
             data-copy={chatId}
             onClick={() => {
-              void navigator.clipboard.writeText(chatId);
-              setCopied(true);
-              props.setTimer(() => setCopied(false), 800);
+              void copyText(chatId, tr('sessions.copy')).then(didCopy => {
+                if (!didCopy) return;
+                setCopied(true);
+                props.setTimer(() => setCopied(false), 800);
+              });
             }}
           >
             {copied ? tr('sessions.copied') : tr('sessions.copy')}
           </button>
         </p>
         <p><b>创建者:</b> <code>{String(success.creator ?? '?')}</code></p>
+        {success.feedGroupId ? <p className="hint-ok">已加入飞书标签{success.feedGroupName ? `「${String(success.feedGroupName)}」` : ''}。</p> : null}
+        {success.feedGroupError ? <p className="hint-warn">群聊已创建，但标签设置失败：{String(success.feedGroupError)}</p> : null}
         <CreateInviteNote resp={success} />
         {binds.length > 0 ? (
           bindFailed.length === 0 ? (
@@ -417,7 +515,16 @@ function CreateDialog(props: {
         <fieldset className="g-modal-field g-create-bots">
           <legend>{tr('groups.botPicker')}</legend>
           <div className="g-bot-picker">
-            <BotCheckboxes bots={props.bots} />
+            <BotCheckboxes
+              bots={props.bots}
+              tr={tr}
+              selected={selectedBots}
+              onToggle={(id, checked) => setSelectedBots(prev => {
+                const next = new Set(prev);
+                if (checked) next.add(id); else next.delete(id);
+                return next;
+              })}
+            />
           </div>
         </fieldset>
 
@@ -447,7 +554,50 @@ function CreateDialog(props: {
             />
             <small>{tr('groups.roleProfileHelp')}</small>
           </fieldset>
+          <fieldset className="g-modal-field g-feed-group-field">
+            <legend>飞书标签（可选）</legend>
+            <input type="hidden" name="feedGroupId" value={feedGroupId} />
+            <FeedGroupPicker
+              groups={feedGroups}
+              selectedId={feedGroupId}
+              newName={newFeedGroupName}
+              disabled={feedGroupsLoading || !!feedGroupsError}
+              onChange={(selectedId, newName) => { setFeedGroupId(selectedId); setNewFeedGroupName(newName); }}
+            />
+            <small>展开后可在第一行输入新标签名称，或选择下方已有标签。</small>
+            {feedGroupsLoading ? <small>正在读取飞书标签…</small> : null}
+            {feedGroupsError ? (
+              <div className="hint-warn-inline">
+                <small>{feedGroupsError}</small>{' '}
+                <button type="button" disabled={feedGroupAuthSubmitting} onClick={() => void openFeedGroupLogin()}>
+                  {feedGroupAuthSubmitting ? '正在完成授权…' : '立即授权'}
+                </button>
+                <small> 授权后会弹窗提示你粘贴回调地址。</small>
+              </div>
+            ) : null}
+            {!feedGroupsLoading && !feedGroupsError && feedGroups.length === 0 ? <small>当前没有标签，可直接创建一个。</small> : null}
+          </fieldset>
         </div>
+
+        {feedGroupAuthUrl ? (
+          <div className="feed-group-auth-overlay">
+            <section className="feed-group-auth-card" role="dialog" aria-modal="true" aria-labelledby="feed-group-auth-title">
+              <h3 id="feed-group-auth-title">授权飞书标签</h3>
+              <p>点击下面的按钮，在飞书页面确认授权。如果 BotMux 与浏览器在同一台电脑，确认后会自动完成授权。如果 BotMux 运行在远程虚拟机上，浏览器会因无法访问本机地址 <code>127.0.0.1:9768</code> 而显示“无法访问”；此时请复制地址栏中的完整链接并粘贴到下方。</p>
+              <button type="button" className="primary feed-group-auth-open" onClick={() => window.open(feedGroupAuthUrl, '_blank', 'noopener')}>跳转飞书授权</button>
+              <label>
+                <span>请把点击授权后的完整链接粘贴在这里</span>
+                <input type="url" value={feedGroupCallbackUrl} placeholder="http://127.0.0.1:9768/callback?code=…&state=…" onChange={event => setFeedGroupCallbackUrl(event.currentTarget.value)} />
+              </label>
+              <div className="actions">
+                <button type="button" onClick={() => { setFeedGroupAuthUrl(''); setFeedGroupCallbackUrl(''); }}>取消</button>
+                <button type="button" className="primary" disabled={!feedGroupCallbackUrl.trim() || feedGroupAuthSubmitting} onClick={() => void completeFeedGroupLogin(feedGroupCallbackUrl)}>
+                  {feedGroupAuthSubmitting ? '正在完成授权…' : '完成授权'}
+                </button>
+              </div>
+            </section>
+          </div>
+        ) : null}
 
         <div className="g-create-status" data-create-status aria-live="polite">{error ? <DialogError {...error} /> : null}</div>
         <div className="actions g-create-actions">
@@ -495,7 +645,7 @@ function CreateInviteNote(props: { resp: any }) {
   );
 }
 
-function AddBotsDialog(props: {
+export function AddBotsDialog(props: {
   chat: GroupChat;
   bots: GroupBot[];
   tr: Translator;
@@ -506,6 +656,7 @@ function AddBotsDialog(props: {
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<DialogErrorState | null>(null);
   const [summary, setSummary] = useState<{ result: AddBotsSummary; refreshError?: unknown } | null>(null);
+  const [selectedBots, setSelectedBots] = useState<Set<string>>(new Set());
   const inChatSet = useMemo(
     () => new Set((chat.memberBots ?? []).filter(member => member.inChat).map(member => member.larkAppId)),
     [chat],
@@ -513,8 +664,7 @@ function AddBotsDialog(props: {
 
   async function submit(ev: FormEvent<HTMLFormElement>): Promise<void> {
     ev.preventDefault();
-    const fd = new FormData(ev.currentTarget);
-    const ids = fd.getAll('bot') as string[];
+    const ids = [...selectedBots];
     if (ids.length === 0) {
       setError({ title: '请选择 bot', reason: '至少选择一个 bot 后再添加。' });
       setSummary(null);
@@ -559,7 +709,17 @@ function AddBotsDialog(props: {
       <header><h3>{tr('groups.addBots')} · {chat.name ?? chat.chatId}</h3></header>
       <p>{tr('groups.createHelp')}</p>
       <form id="g-addform" onSubmit={ev => void submit(ev)}>
-        <BotCheckboxes bots={props.bots} excludeIds={inChatSet} />
+        <BotCheckboxes
+          bots={props.bots}
+          excludeIds={inChatSet}
+          tr={tr}
+          selected={selectedBots}
+          onToggle={(id, checked) => setSelectedBots(prev => {
+            const next = new Set(prev);
+            if (checked) next.add(id); else next.delete(id);
+            return next;
+          })}
+        />
         <div data-add-status aria-live="polite">
           {error ? <DialogError {...error} /> : null}
           {summary ? (

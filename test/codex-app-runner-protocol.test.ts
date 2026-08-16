@@ -115,6 +115,26 @@ describe('app runner final marker normalization', () => {
     expect(normalizeAppRunnerFinalMarker({ content: 42, appTurnId: 'x' })).toBeUndefined();
     expect(normalizeAppRunnerFinalMarker(null)).toBeUndefined();
   });
+
+  it('passes through a well-formed usage object', () => {
+    const usage = { inputTokens: 60, outputTokens: 30, cacheReadTokens: 40, cacheCreateTokens: 0 };
+    expect(normalizeAppRunnerFinalMarker({ content: 'done', usage }).usage).toEqual(usage);
+  });
+
+  it('drops a malformed usage object (missing/non-numeric field) rather than persist partial', () => {
+    // missing cacheCreateTokens
+    expect(normalizeAppRunnerFinalMarker({ content: 'done', usage: { inputTokens: 1, outputTokens: 1, cacheReadTokens: 1 } }).usage).toBeUndefined();
+    // non-numeric
+    expect(normalizeAppRunnerFinalMarker({ content: 'done', usage: { inputTokens: 'x', outputTokens: 1, cacheReadTokens: 1, cacheCreateTokens: 1 } }).usage).toBeUndefined();
+    // not an object
+    expect(normalizeAppRunnerFinalMarker({ content: 'done', usage: 42 }).usage).toBeUndefined();
+  });
+
+  it('drops usage with a negative or fractional token count (boundary at the marker layer)', () => {
+    const base = { inputTokens: 10, outputTokens: 5, cacheReadTokens: 2, cacheCreateTokens: 0 };
+    expect(normalizeAppRunnerFinalMarker({ content: 'done', usage: { ...base, inputTokens: -1 } }).usage).toBeUndefined();
+    expect(normalizeAppRunnerFinalMarker({ content: 'done', usage: { ...base, outputTokens: 2.5 } }).usage).toBeUndefined();
+  });
 });
 
 describe('Codex App lifecycle event normalization', () => {

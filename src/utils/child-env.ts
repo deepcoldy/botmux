@@ -26,6 +26,38 @@ export const CLAUDE_SESSION_MARKER_ENV_KEYS = [
   'CLAUDE_PID',
 ] as const;
 
+/**
+ * Runtime markers that belong only to a v3 workflow/goal worker.
+ *
+ * A workflow worker may invoke `botmux restart`; PM2 persists that caller env
+ * into the long-lived daemons. If these keys survive, every ordinary worker
+ * forked by those daemons mistakes itself for a workflow worker: it skips
+ * screen/status updates and goal-only CLI restrictions leak into chat
+ * sessions. Keep the complete file-backed goal contract together with the
+ * workflow identity fields so a partial scrub cannot leave a normal worker in
+ * a hybrid mode.
+ *
+ * Do not apply this scrub at worker.ts boot: real workflow workers share that
+ * entry point and receive these keys explicitly from the ephemeral pool.
+ */
+export const WORKFLOW_WORKER_ENV_KEYS = [
+  'BOTMUX_WORKFLOW',
+  'BOTMUX_WORKFLOW_PTY_LOG_PATH',
+  'BOTMUX_WORKFLOW_RUN_ID',
+  'BOTMUX_WORKFLOW_NODE_ID',
+  'BOTMUX_GOAL_PATH',
+  'BOTMUX_GOAL_INPUTS_PATH',
+  'BOTMUX_GOAL_OUTPUT_DIR',
+  'BOTMUX_GOAL_MANIFEST_PATH',
+  'BOTMUX_GOAL_ATTEMPT_DIR',
+  'BOTMUX_V3_GOAL',
+] as const;
+
+/** Remove workflow-only identity from a non-workflow process boundary. */
+export function scrubWorkflowWorkerEnv(env: NodeJS.ProcessEnv): void {
+  for (const key of WORKFLOW_WORKER_ENV_KEYS) delete env[key];
+}
+
 /** Boundary-only companion to the markers. A CLAUDE_EFFORT inherited THROUGH
  *  pm2 → daemon → worker is indistinguishable from the issuing Claude
  *  session's own override and would silently pin that session's
@@ -84,6 +116,19 @@ export const REDACTED_CHILD_ENV_KEYS = [
   // the source. Non-tmux CLIs are unaffected (they don't read TMUX).
   'TMUX',
   'TMUX_PANE',
+  // PM2 graceful-exit sentinel (BOTMUX_PM2_GRACEFUL_EXIT_CODE, defined as
+  // PM2_GRACEFUL_EXIT_CODE_ENV in pm2-graceful-exit.ts). pm2 bakes it into the
+  // daemon/dashboard env so ONLY those two managed cores exit with the sentinel
+  // code (90) on graceful stop instead of 0 — otherwise a signal-killed daemon's
+  // null→0 code would match stop_exit_codes and suppress crash-autorestart. But
+  // it must never reach a session's CLI child: a foreground `botmux serve
+  // --api-only` / `daemon` / `dashboard` launched from inside a bot session would
+  // inherit the marker and, per gracefulProcessExitCode(), exit 90 on a clean
+  // Ctrl+C — a supervisor/launcher then misreads that non-zero code as a crash.
+  // Only daemon.ts + dashboard.ts read this key, so stripping it at the child
+  // boundary is safe. Kept as a string literal (like the keys above) with a
+  // drift-guard test pinning it to PM2_GRACEFUL_EXIT_CODE_ENV.
+  'BOTMUX_PM2_GRACEFUL_EXIT_CODE',
 ] as const;
 
 /**
@@ -120,6 +165,26 @@ export const REDACTED_CHILD_ENV_KEYS = [
  * configuration channel.
  */
 export const SESSION_CLI_HOME_ENV_KEYS = ['CLAUDE_CONFIG_DIR', 'CODEX_HOME'] as const;
+
+/**
+ * Pin the daemon-selected session owner under the public BOTMUX_* contract and
+ * the legacy private name used by older wrappers. ownerOpenId is the only
+ * authority: every worker backend must call this after config-controlled env
+ * merges, and an ownerless session must delete both keys. Otherwise a managed
+ * CLI can observe a stale/different app-scoped owner across backends.
+ */
+export function applySessionOwnerEnv(
+  env: NodeJS.ProcessEnv,
+  ownerOpenId: string | undefined,
+): void {
+  if (ownerOpenId) {
+    env.BOTMUX_OWNER_OPEN_ID = ownerOpenId;
+    env.__OWNER_OPEN_ID = ownerOpenId;
+    return;
+  }
+  delete env.BOTMUX_OWNER_OPEN_ID;
+  delete env.__OWNER_OPEN_ID;
+}
 
 /** Delete inherited session-level CLI data-root pointers from `env` in place
  *  (see SESSION_CLI_HOME_ENV_KEYS). Values a session actually needs are
@@ -166,6 +231,24 @@ export const BOTMUX_INJECTED_ENV_KEYS = [
   // v3 host effects / schedule delivery need chatType inside the pane.
   'BOTMUX_CHAT_TYPE',
   'BOTMUX_LARK_APP_ID',
+  // The EXACT bots.json the daemon loaded (getLoadedConfigPath, frozen host-side
+  // and pinned by spawnCli). Injected so a CLI child reads the SAME registry even
+  // when the daemon runs under a non-default HOME (`HOME=~/alt botmux start`): the
+  // child inherits cwd and the BOTMUX_* family but never HOME, so without this it
+  // resolves the *default* ~/.botmux, misses its own appId, and every `botmux
+  // send` from inside that session fails "Bot not registered". A path, not a
+  // credential (the file it names holds secrets; the name does not).
+  //
+  // Being on THIS list is load-bearing in three separate ways, so do not move it:
+  //  · buildBotmuxEnvAssignments forwards it into tmux/zellij panes (without it,
+  //    only the pty backend would be fixed);
+  //  · isBotmuxManagedTmuxEnvKey strips it from the tmux CLIENT env, so botmux
+  //    never seeds a shared server's GLOBAL env with a fleet's registry path;
+  //  · PANE_ENV_UNSET_CLAUSE unsets it in the pane wrapper, so a stale value
+  //    already in a co-tenant server's global env cannot outrank the pinned one
+  //    (BOTS_CONFIG is the TOP of the registry precedence chain — a stale value
+  //    silently redirects the child to a foreign registry).
+  'BOTS_CONFIG',
   'BOTMUX_ROOT_MESSAGE_ID',
   // Session owner (standard name; `__OWNER_OPEN_ID` above is the legacy
   // channel). Custom CLI wrappers read it for per-user permission isolation.
@@ -175,6 +258,19 @@ export const BOTMUX_INJECTED_ENV_KEYS = [
   // Resolved display footer for sandboxed `botmux send`; avoids reading the
   // credential-bearing bots.json from inside the child.
   'BOTMUX_BRAND_LABEL',
+  // Read-isolation marker + host-owned apiOnly verdict. Both are decided by the
+  // worker (gated on sandboxRequested / cfg.apiOnly) and MUST reach the child:
+  // inside the sandbox bots.json is denied, so the CLI has no other way to tell
+  // "denied because I'm sandboxed (expected)" from "unreadable (real fault)", nor
+  // to know its own apiOnly (a no-transport bot's send-cred.json is denied too).
+  // Being on this list also means tmuxEnv()/scrubTmuxServerGlobalEnv() strip them
+  // when unset — so a stale value cannot leak into a NON-sandboxed pane.
+  'BOTMUX_READ_ISOLATION',
+  'BOTMUX_API_ONLY',
+  // Per-bot display preference for Context / Token usage
+  // ('streaming' | 'footer' | 'off'). Injected explicitly so sandboxed offline
+  // fallback cannot drift to the default when bots.json is unreadable.
+  'BOTMUX_USAGE_DISPLAY',
   // Pi deferred long-first-prompt extension reads one exact per-session file.
   'BOTMUX_PI_INITIAL_PROMPT_FILE',
   // Loopback port of the owning daemon's agent-facing IPC. Read-isolated CLIs
@@ -182,10 +278,19 @@ export const BOTMUX_INJECTED_ENV_KEYS = [
   // session-scoped, capability-gated routes (v3 workflow relay, vc-agent).
   // A port marker, not a credential — every route authenticates independently.
   'BOTMUX_DAEMON_IPC_PORT',
+  // Fail-closed classification hint for macOS read isolation. This is never
+  // authority; cmdSend also checks the host-owned marker + live challenge.
+  'BOTMUX_READ_ISOLATED',
+  // Unguessable pane/profile authority channel. It selects an exact read carve
+  // but is not sufficient without the daemon-rotated capability inside it.
+  'BOTMUX_ORIGIN_CHANNEL_ID',
   // Keep `botmux bots list` and ready-gated CLIs aligned with daemon config.
   'BOTMUX_LARK_LIST_BOTS_API_ENABLED',
   'BOTMUX_LARK_LIST_BOTS_API_TIMEOUT_MS',
   'BOTMUX_READY_COMMAND',
+  // Path to a one-shot 0600 Codex App control bootstrap. Only the path reaches
+  // the pane; the runner consumes+unlinks the file before app-server starts.
+  'BOTMUX_CODEX_APP_CONTROL_BOOTSTRAP',
   // Hermes profile roots must match the worker-side transcript reader.
   'HERMES_HOME',
   'HERMES_BOTMUX_SOURCE_HOME',

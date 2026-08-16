@@ -221,6 +221,35 @@ describe('HerdrBackend connection surface', () => {
     expect(herdrCall('session', 'delete', 'work')).toBeUndefined();
   });
 
+  it('killAgents() lists a shared host once and closes only selected live panes', () => {
+    setHerdrResponses([{
+      match: a => a.includes('agent') && a.includes('list'),
+      reply: () => JSON.stringify({ result: { agents: [
+        { name: 'botmux-one', pane_id: '4-1' },
+        { name: 'botmux-two', pane_id: '4-2' },
+        { name: 'botmux-exited', pane_id: '4-4', running: false },
+        { name: 'user-sibling', pane_id: '4-3' },
+      ] } }),
+    }]);
+
+    HerdrBackend.killAgents(
+      'work',
+      new Set(['botmux-one', 'botmux-two', 'botmux-exited', 'already-gone']),
+    );
+
+    const listCalls = mockedExecFileSync.mock.calls.filter(call => {
+      const args = (call[1] as string[]) ?? [];
+      return args.includes('agent') && args.includes('list');
+    });
+    expect(listCalls).toHaveLength(1);
+    expect(herdrCall('--session', 'work', 'pane', 'close', '4-1')).toBeDefined();
+    expect(herdrCall('--session', 'work', 'pane', 'close', '4-2')).toBeDefined();
+    expect(herdrCall('--session', 'work', 'pane', 'close', '4-3')).toBeUndefined();
+    expect(herdrCall('--session', 'work', 'pane', 'close', '4-4')).toBeUndefined();
+    expect(herdrCall('session', 'stop', 'work')).toBeUndefined();
+    expect(herdrCall('session', 'delete', 'work')).toBeUndefined();
+  });
+
   it('ensureServer skips boot poll when session already exists (no spawn, no sleep)', () => {
     setHerdrResponses([
       { match: a => a[0] === 'session' && a[1] === 'list', reply: () => EXISTING_SESSION_REPLY },
@@ -547,6 +576,21 @@ describe('HerdrBackend.spawn', () => {
     const be = new HerdrBackend(SESSION, { isReattach: true });
     be.spawn('claude', [], { cwd: '/work', cols: 80, rows: 24, env: {} });
     expect(herdrCall('agent', 'start', 'botmux')).toBeUndefined();
+    expect(be.isReattach).toBe(true);
+    be.kill();
+  });
+
+  it('reports actual fresh start when a predicted reattach has no reusable agent', () => {
+    setHerdrResponses([
+      { match: a => a[0] === 'session' && a[1] === 'list', reply: () => EXISTING_SESSION_REPLY },
+      { match: a => a.includes('agent') && a.includes('get'), reply: () => JSON.stringify({ result: {} }) },
+      { match: a => a.includes('agent') && a.includes('start'), reply: () => AGENT_GET_REPLY('fresh-2') },
+      { match: a => a.includes('read') && (a.includes('agent') || a.includes('pane')), reply: () => PANE_READ_REPLY('') },
+    ]);
+    const be = new HerdrBackend(SESSION, { isReattach: true });
+    be.spawn('claude', [], { cwd: '/work', cols: 80, rows: 24, env: {} });
+    expect(herdrCall('agent', 'start', 'botmux')).toBeDefined();
+    expect(be.isReattach).toBe(false);
     be.kill();
   });
 
@@ -898,11 +942,22 @@ describe('HerdrBackend message writing', () => {
     be.kill();
   });
 
+  it('reports a rejected pane command instead of claiming raw input acceptance', () => {
+    const be = spawnBackend('5-5');
+    mockedExecFileSync.mockImplementation(() => {
+      throw new Error('pane disappeared');
+    });
+    expect(be.sendText('/goal x')).toBe(false);
+    expect(be.sendSpecialKeys('Enter')).toBe(false);
+    expect(be.pasteText('/goal x')).toBe(false);
+    be.kill();
+  });
+
   it('write() is a no-op after kill()', () => {
     const be = spawnBackend('5-5');
     be.kill();
     mockedExecFileSync.mockClear();
-    be.sendText('after-exit');
+    expect(be.sendText('after-exit')).toBe(false);
     const call = herdrCall('pane', 'send-text');
     expect(call).toBeUndefined();
   });

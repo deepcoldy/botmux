@@ -1,10 +1,14 @@
 import * as Lark from '@larksuiteoapi/node-sdk';
 import { readFileSync, existsSync, statSync } from 'node:fs';
 import { resolve } from 'node:path';
-import { homedir } from 'node:os';
+import { underReadIsolation } from './adapters/cli/read-isolation.js';
 import type { BackendType } from './adapters/backend/types.js';
 import type { RiffBackendConfig } from './adapters/backend/riff-backend.js';
 import type { CliId } from './adapters/cli/types.js';
+import {
+  normalizeCliRuntimeConfig,
+  type CliRuntimeConfig,
+} from './adapters/cli/runtime.js';
 import { logger } from './utils/logger.js';
 import { isLocale, setBotLookup, type Locale } from './i18n/index.js';
 import type { VoiceConfig } from './services/voice/types.js';
@@ -13,9 +17,15 @@ import type { BotSkillPolicy, SkillSelector } from './core/skills/types.js';
 import { normalizeStartupCommandList } from './core/startup-commands.js';
 import { DAEMON_COMMANDS } from './core/passthrough-commands.js';
 import { sanitizePerBotEnv } from './core/per-bot-env.js';
+import { resolveBotmuxConfigDir, resolveBotsConfigFile, type BotsConfigProvenance } from './core/config-dir.js';
 import { normalizeSubstituteMode } from './services/substitute-mode-normalize.js';
 import { normalizePluginIdList } from './core/plugins/ids.js';
 import { normalizeVcMeetingProfileInstructions } from './services/vc-meeting-profile-instructions.js';
+import { isGrantDurationOption } from './services/grant-policy.js';
+import type { FeedbackPolicy, FeedbackPolicyInput } from './services/feedback-policy.js';
+import { normalizeFeedbackPolicyLayer } from './services/feedback-policy-resolver.js';
+import type { FeedbackWebhookDestination } from './services/feedback-outbox.js';
+import { codexModelSupportsReasoningEffort, isCodexReasoningCliId, isCodexReasoningEffort } from './services/codex-reasoning-effort.js';
 import type {
   VcMeetingConsumerAgentConfig,
   VcMeetingConsumerConfig,
@@ -24,6 +34,20 @@ import type {
 } from './types.js';
 import type { VcMeetingActivityType } from './vc-agent/types.js';
 
+/**
+ * Thrown when any Feishu client is requested for a core-only (`apiOnly`) bot.
+ * Defined here (the lowest-level module that owns bot config + client) so both
+ * `getBotClient` and higher layers (im/lark/client.ts primitives, doc-comment)
+ * throw the SAME typed error without an import cycle. apiOnly = zero Feishu
+ * network (reads AND writes); reaching a client request is genuine misuse.
+ */
+export class LarkTransportDisabledError extends Error {
+  constructor(larkAppId: string, op: string) {
+    super(`Feishu transport is disabled for core-only bot ${larkAppId} (attempted: ${op})`);
+    this.name = 'LarkTransportDisabledError';
+  }
+}
+
 export type {
   VcMeetingConsumerAgentConfig,
   VcMeetingConsumerConfig,
@@ -31,10 +55,121 @@ export type {
   VcMeetingConsumerProfileConfig,
 } from './types.js';
 
+/** Bound every official-SDK HTTP call so one stalled provider request cannot
+ * hold a bot-turn admission or maintenance mutation indefinitely. */
+export const LARK_REQUEST_TIMEOUT_MS = 15_000;
+
+/** Media uploads (image/file) ride the same official-SDK path but move real
+ * bytes: a 30 MB video on a modest uplink legitimately exceeds the interactive
+ * request bound. They also run in the `botmux send` CLI subprocess, which holds
+ * no daemon admission/mutation lock, so the interactive timeout's protective
+ * purpose does not apply to them. Give uploads a far looser ceiling. */
+export const LARK_UPLOAD_TIMEOUT_MS = 120_000;
+
+export function configureLarkClientHttpTimeout(client: unknown): void {
+  const defaults = (client as { httpInstance?: { defaults?: { timeout?: number } } } | null)
+    ?.httpInstance?.defaults;
+  if (defaults) defaults.timeout = LARK_REQUEST_TIMEOUT_MS;
+}
+
+/**
+ * A dedicated SDK http instance for media uploads. The official SDK shares ONE
+ * module-level axios singleton across every `Client` (verified: two clients
+ * report the same `httpInstance`), and its typed `image.create`/`file.create`
+ * expose no per-request timeout hook — so the only knob for uploads is a
+ * separate instance. `defaultHttpInstance.create()` yields an independent axios
+ * (its own `defaults`, not the shared one); we copy the SDK's own request UA and
+ * response-unwrap interceptors so upload responses (`res.data` → `image_key`)
+ * behave identically. Falls back to leaving the client on the shared instance
+ * if the SDK ever stops exporting `defaultHttpInstance`, so a future SDK bump
+ * degrades to "uploads keep the interactive timeout" rather than breaking.
+ */
+let cachedLarkUploadHttpInstance: unknown;
+export function larkUploadHttpInstance(): unknown {
+  if (cachedLarkUploadHttpInstance !== undefined) return cachedLarkUploadHttpInstance;
+  let base: any;
+  try {
+    base = (Lark as unknown as { defaultHttpInstance?: any }).defaultHttpInstance;
+  } catch {
+    // A stripped/mocked SDK namespace may throw on accessing an absent export.
+    base = undefined;
+  }
+  if (!base || typeof base.create !== 'function') {
+    cachedLarkUploadHttpInstance = null;
+    return cachedLarkUploadHttpInstance;
+  }
+  const instance = base.create({ timeout: LARK_UPLOAD_TIMEOUT_MS });
+  try {
+    for (const handler of base.interceptors?.request?.handlers ?? []) {
+      if (handler) {
+        instance.interceptors.request.use(handler.fulfilled, handler.rejected, {
+          synchronous: handler.synchronous,
+        });
+      }
+    }
+    for (const handler of base.interceptors?.response?.handlers ?? []) {
+      if (handler) instance.interceptors.response.use(handler.fulfilled, handler.rejected);
+    }
+  } catch {
+    // A shape change in the SDK's interceptor registry must not brick uploads;
+    // an instance without the response-unwrap interceptor would misread
+    // responses, so fall back to the shared instance (interactive timeout).
+    cachedLarkUploadHttpInstance = null;
+    return cachedLarkUploadHttpInstance;
+  }
+  cachedLarkUploadHttpInstance = instance;
+  return cachedLarkUploadHttpInstance;
+}
+
 export type ChatReplyMode = 'chat' | 'new-topic' | 'shared' | 'chat-topic';
+/** Where a bot shows native Context / Token usage on its Session cards. */
+export type UsageDisplayMode = 'streaming' | 'footer' | 'off';
+/** Default when a bot sets nothing: usage rides the live streaming card. */
+export const DEFAULT_USAGE_DISPLAY: UsageDisplayMode = 'streaming';
 export type ContentTriggerScope = 'topic' | 'regularGroup' | 'both';
 export type ContentTriggerMatchType = 'keyword' | 'regex';
 export type ContentTriggerActionType = 'start-or-wake-session';
+export type MessageListenerSenderType = 'user' | 'bot';
+
+export interface MessageListenerConfig {
+  enabled: boolean;
+  name?: string;
+  replyCardTitle?: string;
+  workingDir?: string;
+  prompt: string;
+  senderPolicy?: {
+    /**
+     * all_except_excluded: listen to all matching sender types except excluded ids.
+     * include_only: listen only to includeSenderOpenIds; empty include means none.
+     */
+    mode?: 'all_except_excluded' | 'include_only';
+    includeSenderOpenIds?: string[];
+    excludeSenderOpenIds?: string[];
+    /**
+     * Persisted sender KIND for each exclude id (open_id → 'user' | 'bot'), so
+     * the runtime fail-close decision (all_except_excluded + unverified bot
+     * sender) can tell a muted human from a muted bot WITHOUT guessing by id
+     * prefix. Absent entries fall back to a conservative "maybe a bot".
+     */
+    excludeSenderKinds?: Record<string, 'user' | 'bot'>;
+    includeSenderTypes?: MessageListenerSenderType[];
+    excludeSenderTypes?: MessageListenerSenderType[];
+    /** Default true. */
+    excludeSelf?: boolean;
+  };
+  messagePolicy?: {
+    /** Defaults to text + post. */
+    includeMsgTypes?: string[];
+    /** V1 only supports top-level group messages. */
+    scope?: 'top_level';
+  };
+  replyPolicy?: {
+    /** V1 always replies under the triggering message. */
+    mode?: 'thread';
+    /** V1 starts one session per matched message. */
+    sessionMode?: 'per_message';
+  };
+}
 
 export interface SummaryRangeConfig {
   /** 0 means no count limit; omitted defaults to 50. */
@@ -75,6 +210,26 @@ export interface ContentTriggerConfig {
   };
 }
 
+function normalizeFeedbackWebhookConfig(raw: unknown): { destinations: FeedbackWebhookDestination[] } | undefined {
+  if (!raw || typeof raw !== 'object' || !Array.isArray((raw as any).destinations)) return undefined;
+  const seen = new Set<string>();
+  const destinations: FeedbackWebhookDestination[] = [];
+  for (const item of (raw as any).destinations) {
+    if (!item || typeof item !== 'object') continue;
+    const id = typeof item.id === 'string' ? item.id.trim() : '';
+    const url = typeof item.url === 'string' ? item.url.trim() : '';
+    const secretRef = typeof item.secretRef === 'string' ? item.secretRef.trim() : '';
+    const eventTypes = Array.isArray(item.eventTypes)
+      ? [...new Set(item.eventTypes.filter((type: unknown) => type === 'turn.completed' || type === 'feedback.revised'))] as Array<'turn.completed' | 'feedback.revised'>
+      : [];
+    if (!id || seen.has(id) || !url || !secretRef || eventTypes.length === 0) continue;
+    seen.add(id);
+    destinations.push({ id, enabled: item.enabled !== false, url, eventTypes, secretRef,
+      ...(Number.isInteger(item.timeoutMs) && item.timeoutMs > 0 ? { timeoutMs: Math.min(item.timeoutMs, 30_000) } : {}) });
+  }
+  return destinations.length ? { destinations } : undefined;
+}
+
 function normalizeChatReplyModeConfig(raw: unknown): ChatReplyMode | undefined {
   if (typeof raw !== 'string') return undefined;
   const v = raw.trim().toLowerCase();
@@ -91,6 +246,12 @@ function normalizeContentTriggerScope(raw: unknown): ContentTriggerScope | undef
   if (v === 'both' || v === 'all') return 'both';
   if (v === 'topic' || v === 'thread' || v === 'topic-group' || v === 'topic_group') return 'topic';
   if (v === 'regulargroup' || v === 'regular-group' || v === 'regular_group' || v === 'group') return 'regularGroup';
+  return undefined;
+}
+
+function normalizeMessageListenerSenderType(raw: unknown): MessageListenerSenderType | undefined {
+  if (raw === 'user' || raw === 'human') return 'user';
+  if (raw === 'bot' || raw === 'app') return 'bot';
   return undefined;
 }
 
@@ -750,6 +911,92 @@ function normalizeContentTriggers(raw: unknown, botIndex: number): ContentTrigge
   return out.length > 0 ? out : undefined;
 }
 
+function normalizeMessageListenerStringList(raw: unknown): string[] | undefined {
+  const values = normalizeStringList(raw);
+  return values.length > 0 ? [...new Set(values)] : undefined;
+}
+
+function normalizeMessageListenerSenderKinds(
+  raw: unknown,
+  excludeSenderOpenIds: string[] | undefined,
+): Record<string, 'user' | 'bot'> | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const allowed = excludeSenderOpenIds ? new Set(excludeSenderOpenIds) : undefined;
+  const out: Record<string, 'user' | 'bot'> = {};
+  for (const [key, value] of Object.entries(raw as Record<string, unknown>)) {
+    if (!key || (allowed && !allowed.has(key))) continue;
+    if (value === 'user' || value === 'bot') out[key] = value;
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
+function normalizeMessageListenerSenderTypes(raw: unknown): MessageListenerSenderType[] | undefined {
+  if (!Array.isArray(raw)) return undefined;
+  const values = raw
+    .map(normalizeMessageListenerSenderType)
+    .filter((value): value is MessageListenerSenderType => !!value);
+  return values.length > 0 ? [...new Set(values)] : undefined;
+}
+
+function normalizeMessageListenerConfig(raw: unknown, botIndex: number, chatId: string): MessageListenerConfig | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const entry = raw as Record<string, unknown>;
+  const prompt = normalizeNonEmptyString(entry.prompt);
+  const enabled = entry.enabled === true;
+  if (enabled && !prompt) {
+    logger.warn(`Bot config [${botIndex}] messageListeners[${chatId}] ignored: enabled listener requires prompt`);
+    return undefined;
+  }
+
+  const senderRaw = entry.senderPolicy && typeof entry.senderPolicy === 'object' && !Array.isArray(entry.senderPolicy)
+    ? entry.senderPolicy as Record<string, unknown>
+    : {};
+  const senderPolicy: NonNullable<MessageListenerConfig['senderPolicy']> = {};
+  const mode = senderRaw.mode === 'include_only' ? 'include_only' : 'all_except_excluded';
+  const includeSenderOpenIds = normalizeMessageListenerStringList(senderRaw.includeSenderOpenIds);
+  const excludeSenderOpenIds = normalizeMessageListenerStringList(senderRaw.excludeSenderOpenIds);
+  const excludeSenderKinds = normalizeMessageListenerSenderKinds(senderRaw.excludeSenderKinds, excludeSenderOpenIds);
+  const includeSenderTypes = normalizeMessageListenerSenderTypes(senderRaw.includeSenderTypes);
+  const excludeSenderTypes = normalizeMessageListenerSenderTypes(senderRaw.excludeSenderTypes);
+  if (mode !== 'all_except_excluded') senderPolicy.mode = mode;
+  if (includeSenderOpenIds) senderPolicy.includeSenderOpenIds = includeSenderOpenIds;
+  if (excludeSenderOpenIds) senderPolicy.excludeSenderOpenIds = excludeSenderOpenIds;
+  if (excludeSenderKinds) senderPolicy.excludeSenderKinds = excludeSenderKinds;
+  if (includeSenderTypes) senderPolicy.includeSenderTypes = includeSenderTypes;
+  if (excludeSenderTypes) senderPolicy.excludeSenderTypes = excludeSenderTypes;
+  if (senderRaw.excludeSelf === false) senderPolicy.excludeSelf = false;
+
+  const messageRaw = entry.messagePolicy && typeof entry.messagePolicy === 'object' && !Array.isArray(entry.messagePolicy)
+    ? entry.messagePolicy as Record<string, unknown>
+    : {};
+  const messagePolicy: NonNullable<MessageListenerConfig['messagePolicy']> = {};
+  const includeMsgTypes = normalizeMessageListenerStringList(messageRaw.includeMsgTypes);
+  if (includeMsgTypes) messagePolicy.includeMsgTypes = includeMsgTypes;
+  messagePolicy.scope = 'top_level';
+
+  return {
+    enabled,
+    ...(normalizeNonEmptyString(entry.name) ? { name: normalizeNonEmptyString(entry.name) } : {}),
+    ...(normalizeNonEmptyString(entry.replyCardTitle) ? { replyCardTitle: normalizeNonEmptyString(entry.replyCardTitle) } : {}),
+    ...(normalizeNonEmptyString(entry.workingDir) ? { workingDir: normalizeNonEmptyString(entry.workingDir) } : {}),
+    prompt: prompt ?? '',
+    ...(Object.keys(senderPolicy).length > 0 ? { senderPolicy } : {}),
+    ...(Object.keys(messagePolicy).length > 0 ? { messagePolicy } : {}),
+    replyPolicy: { mode: 'thread', sessionMode: 'per_message' },
+  };
+}
+
+function normalizeMessageListeners(raw: unknown, botIndex: number): Record<string, MessageListenerConfig> | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const out: Record<string, MessageListenerConfig> = {};
+  for (const [chatId, listenerRaw] of Object.entries(raw as Record<string, unknown>)) {
+    if (typeof chatId !== 'string' || !chatId.trim()) continue;
+    const listener = normalizeMessageListenerConfig(listenerRaw, botIndex, chatId.trim());
+    if (listener) out[chatId.trim()] = listener;
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
 export interface OncallChat {
   /** Lark chat_id (oc_xxx) the bot was pulled into. */
   chatId: string;
@@ -796,6 +1043,11 @@ export interface SubstituteModeConfig {
   disclosure?: 'prefix' | 'none';
   /** Optional allow-list of chat IDs. When provided, substitute trigger only fires in these chats. */
   chats?: string[];
+  /** Optional block-list of chat IDs (黑名单). When a chat is listed here the substitute
+   *  trigger never fires there — deny-wins over {@link chats} (a chat in both is blocked)
+   *  and hard (cannot be re-enabled by the per-chat `/substitute on` runtime toggle).
+   *  Applies to regular and topic groups alike. Direct @bot mentions are unaffected. */
+  excludedChats?: string[];
   /** When true, do not automatically DM the owner a control card for substitute-mode sessions. */
   disableControlCard?: boolean;
   /** How the bot replies to a substitute-mode trigger:
@@ -887,13 +1139,13 @@ export interface SessionGroupConfig {
   onClose?: 'keep' | 'disband' | 'archive';
   /**
    * Session-group tagging.
-   * 'chat-tag' (default) — tenant chat tags (企业自定义群标签): a property of
-   *   the GROUP itself, applied with the bot's own tenant token. Zero user
-   *   OAuth; needs the im:tag:write + im:biz_entity_tag_relation:write tenant
-   *   scopes enabled for the app.
-   * 'feed-group' — the owner's personal sidebar 消息分组 (feed group). Needs a
-   *   one-time user OAuth (im:feed_group_v1) — kept as an opt-in because it
-   *   touches the user's personal sidebar data.
+   * 'feed-group' (default) — the owner's personal sidebar 消息分组 (feed
+   *   group). Needs a one-time user OAuth (im:feed_group_v1), auto-refreshed
+   *   afterwards; works on any tenant — no tenant scope catalog involved.
+   * 'chat-tag' — tenant chat tags (企业自定义群标签): a property of the GROUP
+   *   itself, applied with the bot's own tenant token. Zero user OAuth; needs
+   *   the im:tag:write + im:biz_entity_tag_relation:write tenant scopes, which
+   *   some tenants' scope catalogs don't offer at all (hence not the default).
    * 'off' — no tagging.
    */
   tag?: {
@@ -915,6 +1167,22 @@ export interface BotConfig {
   larkAppId: string;
   larkAppSecret: string;
   /**
+   * Core-only / headless 模式：该 bot 纯 HTTP 控制 API 驱动（trigger →
+   * spawn → CLI → trigger-result），**不连接任何飞书**——boot 时跳过
+   * open_id 探测、required-scope 校验、WSClient 事件订阅，也不投递飞书消息
+   * （异步控制回路本就在 `deliverFinalOutput` 的 async 分支 early-return，
+   * 运行时不触达飞书）。`larkAppId` 仍必填但用合成本地身份（如
+   * `local_<slug>`，非 `cli_` 前缀）作为 daemon 标识 + dashboard 路由 key +
+   * `/api/trigger` 的 cachedLarkAppId gate；`larkAppSecret` 在此模式下可缺省。
+   * 缺省 / false 保持原有飞书 bot 行为字节不变。
+   */
+  apiOnly?: boolean;
+  /** Final-answer feedback policy. Missing/disabled is intentionally inert. */
+  feedback?: FeedbackPolicyInput | FeedbackPolicy;
+  /** Per-chat final-answer feedback overrides, scoped to this bot app id. */
+  chatFeedbackPolicies?: Record<string, FeedbackPolicyInput>;
+  feedbackWebhooks?: { destinations: FeedbackWebhookDestination[] };
+  /**
    * 租户品牌：`'feishu'`（中国版，open.feishu.cn）或 `'lark'`（国际版，
    * open.larksuite.com）。缺省 / 旧 bots.json 无此字段 → 视为 `'feishu'`
    * （见 {@link normalizeBrand}），向后兼容。决定 SDK Client / WSClient 的
@@ -934,6 +1202,19 @@ export interface BotConfig {
    */
   displayName?: string;
   cliId: CliId;
+  /**
+   * Optional distribution identity for a CLI that is protocol-compatible with
+   * {@link cliId} but ships as an independent executable/release stream (for
+   * example a Codex-compatible fork). The adapter remains selected by cliId;
+   * this descriptor owns product identity, executable and update provenance.
+   *
+   * `cliPathOverride` remains readable for legacy configs. A configured runtime
+   * is exposed through cliPathOverride in memory as a compatibility shadow so
+   * existing adapter call sites keep launching the selected executable while
+   * the runtime rollout migrates them to the structured descriptor.
+   */
+  cliRuntime?: CliRuntimeConfig;
+  /** @deprecated Prefer cliRuntime.executable for newly configured runtimes. */
   cliPathOverride?: string;
   /**
    * 通用启动前缀（按空格拆 token）：worker spawn 时把启动命令拼成
@@ -946,16 +1227,16 @@ export interface BotConfig {
    */
   wrapperCli?: string;
   /**
-   * Per-bot launch-shell override for the persistent backends (tmux/zellij).
+   * Per-bot launch-shell override for the persistent backends (tmux/zellij/zmx).
    * When set, botmux launches the CLI under this shell instead of the daemon's
-   * `$SHELL`. Accepts a bare name (`zsh`/`bash`/`sh`) or an absolute path
-   * (`/usr/bin/zsh`). The escape hatch for a login `$SHELL` (e.g. bash) whose
+   * `$SHELL`. Accepts a bare name (`zsh`/`bash`/`fish`/`sh`) or an absolute path
+   * (`/usr/bin/fish`). The escape hatch for a login `$SHELL` (e.g. bash) whose
    * rcfile `exec`-trampolines into another shell: that trampoline replaces the
    * launch shell before it can `exec` the CLI, leaving a bare shell the first
-   * prompt gets typed into (`zsh: parse error`). Pinning `launchShell: zsh`
-   * launches under zsh directly and bypasses the bash `.bashrc`. CAVEAT:
-   * PATH/nvm/pnpm shims must then live in the pinned shell's rcfiles (e.g.
-   * `.zshrc`/`.zprofile`), not the bypassed one. Ignored by the pty backend
+   * prompt gets typed into (`zsh: parse error`). Pinning `launchShell: fish`
+   * launches under fish directly and bypasses the bash `.bashrc`. CAVEAT:
+   * PATH/nvm/pnpm shims must then live in the pinned shell's rcfiles (for
+   * example `.zshrc`/`.zprofile` or `~/.config/fish/config.fish`), not the bypassed one. Ignored by the pty backend
    * (which `exec`s the CLI directly, no shell wrapper, so it's trampoline-immune).
    */
   launchShell?: string;
@@ -968,6 +1249,8 @@ export interface BotConfig {
    * `modelChoices` for the curated candidates surfaced in `botmux setup`.
    */
   model?: string;
+  /** Default Codex reasoning effort for newly created sessions. */
+  reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
   /**
    * If true, botmux does not add CLI-default approval/sandbox bypass flags
    * such as --yolo or --dangerously-*. Missing/false preserves legacy behavior.
@@ -978,6 +1261,13 @@ export interface BotConfig {
    * `additionalContext`, so the desktop user bubble stays clean. Missing/false
    * preserves the legacy XML-ish prompt byte-for-byte. Codex App only. */
   codexAppCleanInput?: boolean;
+  /**
+   * Per-turn 上下文注入方式（#794）。`auto`：对支持的 CLI（目前仅 claude-code），
+   * 把 reminder/whiteboard 从 user turn 文本挪到 UserPromptSubmit hook 注入的
+   * system-reminder，终端输入框只保留消息本身；不支持的 CLI 自动回退内联。
+   * 缺省/`off`：保持内联 envelope（历史行为）。从下一个 follow-up turn 生效。
+   */
+  envelopeInjection?: 'auto' | 'off';
   /**
    * Codex only (opt-in, experimental): deliver user input via the app-server
    * JSON-RPC channel instead of a tmux paste. The pane runs `codex --remote`
@@ -1143,13 +1433,32 @@ export interface BotConfig {
    */
   p2pOpen?: boolean;
   /**
-   * 消息额度机制（默认关闭）。`defaultLimit` 的"是否配置"本身就是开关：
-   *   • 未配置（undefined）→ 关闭：无显式数字的 /grant 仍是"无限授权"（当前行为）。
-   *   • 配置正整数 D    → 开启默认额度：`/grant @x`（不带数字）套用 D 条额度。
+   * 是否接受**其他 bot** 通过 `botmux send --slash` 发来的原生斜杠命令
+   * （/clear、/model、/close…）。默认开（undefined = 开）；只有显式 false 才关。
+   *
+   * 关掉后，来自 bot 发送方的 slash 命令不进 passthrough / daemon-command 路由，
+   * 退化为普通消息（与任何非 bot-slash 消息一样按 talk 门处理）——给 owner 一个
+   * 「不让别的 bot 清我上下文 / 敲我 CLI」的逃生阀。对**真人**发送方无影响
+   * （真人在飞书直接打字发 /clear 仍照常）。
+   *
+   * 安全边界不变：daemon 管理命令（/close /restart 等）从 bot 来**仍只认
+   * allowedUsers**（canOperate），本开关只控制「是否接受 bot 的 slash 进入路由」，
+   * 不放宽任何 operate 权限。
+   */
+  acceptSlashFromBots?: boolean;
+  /**
+   * 消息额度覆盖配置：
+   *   • 未配置（undefined）→ 卡片使用产品默认 3 条；oncall 不自动计数。
+   *   • 配置正整数 D    → 卡片默认 D 条，同时作为 oncall 默认额度。
    * 显式 `/grant @x N` 的 N **恒生效**，与本字段是否配置无关（见 {@link quotaState}）。
    * 仅约束 chatGrants / globalGrants 这类 per-user talk 授权，绝不影响 canOperate。
    */
   messageQuota?: { defaultLimit?: number };
+  /**
+   * 新建 per-user 授权卡的默认有限时长（毫秒）。缺省使用产品默认 1 小时；
+   * 已存在授权和已经生成的 pending 卡不受后续配置变更影响。
+   */
+  grantDefaultDurationMs?: number;
   /**
    * scope-aware 消息额度计数（运行时状态，随授权一起持久化进 bots.json）。
    * key = `chat:${chatId}:${openId}` | `global:${openId}`，value = { limit, used }。
@@ -1157,6 +1466,11 @@ export interface BotConfig {
    * used 达到 limit 后自动收回**对应 scope** 的授权并删除本记录。纯 talk-only。
    */
   quotaState?: { [quotaKey: string]: { limit: number; used: number } };
+  /**
+   * scope-aware 授权绝对过期时间。缺少对应记录表示永久授权；旧配置因此保持兼容。
+   * key 与 quotaState 相同，便于授权、撤销和到期回收在同一 scope 上原子处理。
+   */
+  grantExpiryState?: { [grantKey: string]: { expiresAt: number } };
   /**
    * 开启后：仅靠 per-user 授权（chatGrants / globalGrants）放行的发送者，禁止使用**任何
    * 斜杠命令**——botmux 自身的 DAEMON 命令、透传（PASSTHROUGH）命令、全部 `/workflow`
@@ -1185,7 +1499,7 @@ export interface BotConfig {
    * canTalk（oncall 群成员 / allowedChatGroups / chatGrant / globalGrant / p2pOpen 私聊
    * 等对话放行腿）。与 passthrough 无关——命令仍由 daemon 自己处理，只是准入门槛不同。
    * 解析时归一化（转小写、自动补 `/`、去重），且**只接受 DAEMON_COMMANDS 内的命令**，
-   * 其余条目丢弃并 warn。带 handler 内部第二道 owner 闸的命令（/card /term /insight /land）
+   * 其余条目丢弃并 warn。带 handler 内部第二道 owner 闸的命令（/card /term /insight）
    * 即使列入也仍会被内部闸拒绝（fail-closed，不视为本字段的适用对象）。
    * ⚠️ 与 `restrictGrantCommands` 的组合：那个开关在路由里先于本名单生效——开着时
    * chatGrant/globalGrant 被授权人发任何 slash 命令都被更早的限制闸挡下，本名单
@@ -1229,9 +1543,16 @@ export interface BotConfig {
    */
   brandLabel?: string;
   /**
-   * botmux slash 可注入的 CLI 原生斜杠命令 allowlist（如 ["/compact","/model"]）。
-   * 缺省/空 = 通用注入关闭。/cd 永远被拒（见 core/slash-inject.ts）。
+   * Where to show native Context / Token usage for this bot's Session cards:
+   *   • `'streaming'` (default / unset) → in the live streaming card body
+   *   • `'footer'`                      → in the ordinary reply-card footer
+   *   • `'off'`                         → nowhere
+   * A missing individual metric is still omitted independently, and this only
+   * controls DISPLAY — Usage Ledger accounting and other consumers are
+   * unaffected. Backward compat: a legacy `showUsageInCardFooter: false` with no
+   * `usageDisplay` set is read as `'off'` (see {@link resolveUsageDisplay}).
    */
+  usageDisplay?: UsageDisplayMode;
   tuiSlashAllow?: string[];
   /**
    * When true, suppress the live streaming session card entirely. The web
@@ -1332,12 +1653,27 @@ export interface BotConfig {
    */
   autoStartOnGroupJoinPrompt?: string;
   /**
+   * 进群自动拉 owner。Default (undefined) = ON：本 bot 被加进任何群时，自动把
+   * 自己的 owner（resolvedAllowedUsers 首个 ou_ 用户）拉进群——bot 应始终处于
+   *  owner 可见的群里（不打黑工）。显式 false 关闭（如告警/oncall 类 bot 被
+   * 平台批量拉进大量事件群、不想打扰 owner 的场景）。仅 bots.json 文件配置。
+   */
+  autoInviteOwnerOnGroupAdd?: boolean;
+  /**
    * 主动开工 — 场景②. When true, in a 话题群 (topic mode) every new topic's first
    * message auto-starts a session even without an @mention (the default role +
    * the user's first message form the prompt). No effect in regular groups.
    * Default (undefined) = passive.
    */
   autoStartOnNewTopic?: boolean;
+  /**
+   * Per-chat group message listener. Keyed by chat_id and bot-scoped so the
+   * dashboard can configure it from the Roles page's natural group × bot
+   * matrix. When enabled, the bot may react to non-@ top-level group messages
+   * after deterministic sender/msgType filtering. V1 always replies in a
+   * fresh thread under the triggering message.
+   */
+  messageListeners?: Record<string, MessageListenerConfig>;
   /**
    * Worktree picker mode on the repo-select card. When true, the worktree
    * control renders the multi-repo selector (pick N repos + branch) instead of
@@ -1402,6 +1738,10 @@ export interface BotConfig {
   docRepoMap?: Record<string, string>;
   /** Per-bot range for explicit `@bot /summary`; defaults to 50 messages / 24h. */
   summaryRange?: SummaryRangeConfig;
+  /** When true, explicit `@bot /summary` records a conservative project-local summary.md. */
+  summaryMemory?: boolean;
+  /** Optional target path for summary memory. Relative paths are resolved by the agent against the current project root; absolute paths are used as configured. */
+  summaryMemoryPath?: string;
   /**
    * Legacy content/keyword trigger config. Kept parseable for config
    * compatibility, but message routing no longer fires non-@ content triggers.
@@ -1418,7 +1758,19 @@ export interface BotConfig {
 
 export interface BotState {
   config: BotConfig;
-  client: Lark.Client;
+  /** The Lark SDK client — NULL for apiOnly (core-only) bots: they have no
+   *  Feishu credential (empty appSecret), and the SDK's Client ctor throws
+   *  "appSecret or clientAssertionProvider is required" on an empty secret. An
+   *  apiOnly bot never needs it (getBotClient throws LarkTransportDisabledError
+   *  before returning it), so we skip construction entirely rather than feed the
+   *  SDK a placeholder. Every consumer reaches it via getBotClient (which gates
+   *  apiOnly) or getAllBotClients (which filters apiOnly), so the null is unreachable. */
+  client: Lark.Client | null;
+  /** Same credentials/domain as `client`, but bound to a dedicated http
+   * instance with the looser upload timeout. Only media uploads use it. NULL for
+   * apiOnly bots for the same reason as `client` (no credential to construct one);
+   * getBotUploadClient gates apiOnly before returning it, so the null is unreachable. */
+  uploadClient: Lark.Client | null;
   botOpenId?: string;
   botName?: string;       // Lark app display name (from /bot/v3/info)
   botAvatarUrl?: string;  // Lark app avatar URL (from /bot/v3/info)
@@ -1432,8 +1784,11 @@ const bots = new Map<string, BotState>();
 export function __testOnly_resetBotRegistry(): void {
   bots.clear();
   loadedConfigPath = undefined;
+  loadedConfigProvenance = undefined;
   oncallChatCache = null;
   brandLabelCache = null;
+  cachedLarkUploadHttpInstance = undefined;
+  usageDisplayCache = null;
 }
 
 // Wire the i18n lookup so `localeForBot()` can resolve per-bot locale without
@@ -1442,8 +1797,25 @@ setBotLookup((id) => bots.get(id));
 
 /** Path of the bot config file we loaded (so `/oncall` can persist bindings back). */
 let loadedConfigPath: string | undefined;
+/**
+ * PROVENANCE of {@link loadedConfigPath} — whether that path was actually PARSED
+ * (`'loaded'`) or is only a synthetic placeholder (`'synthetic'`, core-only).
+ * Tracked as its own fact because it is NOT recoverable later: the path alone
+ * cannot say whether it was read, and probing the filesystem answers a different
+ * question (existence), which is wrong in both directions. See
+ * `core/config-dir.ts` BotsConfigProvenance for the full rationale.
+ */
+let loadedConfigProvenance: BotsConfigProvenance | undefined;
 export function getLoadedConfigPath(): string | undefined {
   return loadedConfigPath;
+}
+/**
+ * Provenance of `getLoadedConfigPath()`. `undefined` when nothing has been
+ * resolved yet. Consumed by the worker to decide whether the path is a real
+ * registry authority worth pinning onto a CLI child's `BOTS_CONFIG`.
+ */
+export function getLoadedConfigProvenance(): BotsConfigProvenance | undefined {
+  return loadedConfigProvenance;
 }
 
 // Route Lark SDK output through our logger so it inherits the same sink
@@ -1519,18 +1891,62 @@ const larkLogger = {
   trace: (..._msg: any[]) => { /* SDK trace dropped entirely — uninteresting per-byte WS frames */ },
 };
 
+/**
+ * Pure predicate: is this bot's VC-meeting-agent config ACTIVE (should the daemon
+ * attend meetings / restore VC runtime sessions / poll `lark-cli vc` for it)?
+ *
+ * Returns the config only when it is `enabled` AND the bot is NOT apiOnly. An
+ * apiOnly (core-only) bot has no Feishu connection — attending a VC meeting drives
+ * `lark-cli vc +meeting-events --as bot`, which categorically violates the
+ * zero-Feishu-network contract. Gating here (rather than only at each call site)
+ * means the daemon's central `effectiveVcMeetingAgentConfig` accessor — and every
+ * one of its ~24 consumers, including the boot-time `restoreVcMeetingRuntimeSessions`
+ * path that runs OUTSIDE the `!cfg.apiOnly` boot block — fail-closes for apiOnly by
+ * construction. The dashboard already refuses to SET an apiOnly listener; this also
+ * covers a hand-edited / migrated bots.json (a normal VC bot flipped to apiOnly with
+ * `vcMeetingAgent.enabled:true` + a stale on-disk runtime record).
+ */
+export function vcMeetingAgentConfigActive(
+  cfg: Pick<BotConfig, 'apiOnly' | 'vcMeetingAgent'> | undefined,
+): VcMeetingAgentConfig | undefined {
+  if (!cfg) return undefined;
+  if (cfg.apiOnly === true) return undefined;
+  return cfg.vcMeetingAgent?.enabled === true ? cfg.vcMeetingAgent : undefined;
+}
+
 export function registerBot(cfg: BotConfig): BotState {
-  const client = new Lark.Client({
-    appId: cfg.larkAppId,
-    appSecret: cfg.larkAppSecret,
-    // brand → SDK domain。缺省走 feishu，国际版租户走 larksuite.com。
-    // 这一行同时修好了所有经由 SDK 的调用（发消息 / 文件 / contact 等）。
-    domain: sdkDomain(normalizeBrand(cfg.brand)),
-    logger: larkLogger,
-  });
+  // apiOnly (core-only) bots have NO Feishu credential (empty appSecret). The Lark
+  // SDK Client ctor throws "appSecret or clientAssertionProvider is required" on an
+  // empty secret, so constructing it would fatal the whole daemon at boot — the
+  // exact failure riff hit in a clean sandbox. An apiOnly bot never uses the client
+  // (getBotClient throws LarkTransportDisabledError first; getAllBotClients filters
+  // apiOnly), so leave both client and uploadClient null. Zero Feishu transport is
+  // the whole contract.
+  let client: Lark.Client | null = null;
+  let uploadClient: Lark.Client | null = null;
+  if (cfg.apiOnly !== true) {
+    const clientParams = {
+      appId: cfg.larkAppId,
+      appSecret: cfg.larkAppSecret,
+      // brand → SDK domain。缺省走 feishu，国际版租户走 larksuite.com。
+      // 这一行同时修好了所有经由 SDK 的调用（发消息 / 文件 / contact 等）。
+      domain: sdkDomain(normalizeBrand(cfg.brand)),
+      logger: larkLogger,
+    };
+    client = new Lark.Client(clientParams);
+    configureLarkClientHttpTimeout(client);
+    // Media uploads reuse the same credentials/domain but ride a dedicated http
+    // instance with the looser upload timeout. When the SDK no longer exposes a
+    // separable instance, fall back to the interactive client (uploads keep 15s).
+    const uploadHttpInstance = larkUploadHttpInstance();
+    uploadClient = uploadHttpInstance
+      ? new Lark.Client({ ...clientParams, httpInstance: uploadHttpInstance as any })
+      : client;
+  }
   const state: BotState = {
     config: cfg,
     client,
+    uploadClient,
     resolvedAllowedUsers: [...(cfg.allowedUsers ?? [])],
     rawAllowedUserResolution: new Map(),
   };
@@ -1553,7 +1969,44 @@ export function getBot(larkAppId: string): BotState {
 }
 
 export function getBotClient(larkAppId: string): Lark.Client {
-  return getBot(larkAppId).client;
+  const bot = getBot(larkAppId);
+  // Bot-level transport boundary at the TRUE shared base. `apiOnly` (core-only)
+  // means zero Feishu network — reads AND writes — not merely "no sends". Every
+  // Feishu call in the codebase resolves its client here (client.ts primitives,
+  // doc-comment drive API, open-platform rename/avatar, identity cache…), so
+  // throwing here is the single authoritative gate no caller can bypass. A
+  // correctly-built apiOnly flow never reaches this (session/CLI gates fire
+  // first); reaching it is genuine misuse and must fail loud, not silently.
+  if (bot.config.apiOnly === true) {
+    throw new LarkTransportDisabledError(larkAppId, 'getBotClient');
+  }
+  // Non-apiOnly bots always have a constructed client (registerBot builds one for
+  // every non-apiOnly config). The null-guard is defensive — a null here would mean
+  // a misconfigured bot slipped the apiOnly gate, which must fail loud, not NPE deep
+  // in an SDK call.
+  if (!bot.client) {
+    throw new Error(`Bot ${larkAppId} has no Lark client (apiOnly misconfiguration)`);
+  }
+  return bot.client;
+}
+
+/** Client bound to the looser upload timeout. Use only for media uploads
+ * (image/file); every other call uses `getBotClient` and its interactive bound. */
+export function getBotUploadClient(larkAppId: string): Lark.Client {
+  const bot = getBot(larkAppId);
+  // Same bot-level transport boundary as getBotClient: apiOnly (core-only) bots
+  // make zero Feishu network calls, so they never have an upload client. Fail
+  // loud rather than NPE deep in an SDK upload call.
+  if (bot.config.apiOnly === true) {
+    throw new LarkTransportDisabledError(larkAppId, 'getBotUploadClient');
+  }
+  // Non-apiOnly bots always have a constructed upload client (registerBot builds
+  // one — the dedicated-instance path or the interactive-client fallback). The
+  // null-guard is defensive against an apiOnly misconfiguration slipping the gate.
+  if (!bot.uploadClient) {
+    throw new Error(`Bot ${larkAppId} has no Lark upload client (apiOnly misconfiguration)`);
+  }
+  return bot.uploadClient;
 }
 
 /** Owner = bot 首个已授权 open_id，与「缺权限警告私信对象」同口径（见 admin 解析）。 */
@@ -1706,15 +2159,30 @@ export function isChatOncallBoundForAnyBot(chatId: string): boolean {
 // Per-bot brand label, mtime-cached for the disk fallback. Keyed by larkAppId →
 // the configured value (undefined when the bot has no brandLabel key).
 let brandLabelCache: { mtimeMs: number; map: Map<string, string | undefined> } | null = null;
+let usageDisplayCache: { mtimeMs: number; map: Map<string, UsageDisplayMode> } | null = null;
+
+/** Normalize a raw bots.json entry's usage-display intent to the enum, applying
+ *  backward compat: an explicit `usageDisplay` wins; otherwise a legacy
+ *  `showUsageInCardFooter: false` maps to `'off'`; everything else is the
+ *  default (`'streaming'`). Single source of truth for both the in-memory parse
+ *  and the disk-fallback resolver so they cannot drift. */
+export function normalizeUsageDisplay(entry: {
+  usageDisplay?: unknown;
+  showUsageInCardFooter?: unknown;
+}): UsageDisplayMode {
+  if (entry.usageDisplay === 'streaming' || entry.usageDisplay === 'footer' || entry.usageDisplay === 'off') {
+    return entry.usageDisplay;
+  }
+  if (entry.showUsageInCardFooter === false) return 'off';
+  return DEFAULT_USAGE_DISPLAY;
+}
 
 /** Resolve the bots.json path the same way loadBotConfigs does, without
  *  requiring the registry to have been loaded (works in one-shot CLI processes
  *  like `botmux send`). Returns null when no config file exists. */
 function botsConfigDiskPath(): string | null {
-  const env = process.env.BOTS_CONFIG;
-  if (env) { const r = resolve(env); return existsSync(r) ? r : null; }
-  const d = resolve(homedir(), '.botmux', 'bots.json');
-  return existsSync(d) ? d : null;
+  const r = resolveBotsConfigFile();
+  return existsSync(r) ? r : null;
 }
 
 /**
@@ -1759,6 +2227,43 @@ export function resolveBrandLabel(larkAppId: string): string | undefined {
 }
 
 /**
+ * Resolve the per-bot usage-display mode (default `'streaming'`). A freshly
+ * loaded registry wins over the spawn-time env so long-lived panes observe
+ * `/botconfig` hot updates; sandboxed/env-only processes carry the value in
+ * their synthetic registered bot and otherwise fall back to the injected env.
+ */
+export function resolveUsageDisplay(larkAppId: string): UsageDisplayMode {
+  const inMem = bots.get(larkAppId);
+  if (inMem) return normalizeUsageDisplay(inMem.config);
+  if (process.env.BOTMUX_LARK_APP_ID === larkAppId
+    && 'BOTMUX_USAGE_DISPLAY' in process.env) {
+    const env = process.env.BOTMUX_USAGE_DISPLAY;
+    if (env === 'streaming' || env === 'footer' || env === 'off') return env;
+    return DEFAULT_USAGE_DISPLAY;
+  }
+  const path = loadedConfigPath ?? botsConfigDiskPath();
+  if (!path) return DEFAULT_USAGE_DISPLAY;
+  try {
+    const stat = statSync(path);
+    if (!usageDisplayCache || usageDisplayCache.mtimeMs !== stat.mtimeMs) {
+      const raw = JSON.parse(readFileSync(path, 'utf-8'));
+      const map = new Map<string, UsageDisplayMode>();
+      if (Array.isArray(raw)) {
+        for (const entry of raw) {
+          if (entry && typeof entry.larkAppId === 'string') {
+            map.set(entry.larkAppId, normalizeUsageDisplay(entry));
+          }
+        }
+      }
+      usageDisplayCache = { mtimeMs: stat.mtimeMs, map };
+    }
+    return usageDisplayCache.map.get(larkAppId) ?? DEFAULT_USAGE_DISPLAY;
+  } catch {
+    return DEFAULT_USAGE_DISPLAY;
+  }
+}
+
+/**
  * 只读 accessor：该 bot 配置的 tuiSlashAllow allowlist（TUI 通用 slash 注入用）。
  * 仅读内存态注册表，daemon 进程内使用；无需 bots.json 磁盘回退（不同于
  * resolveBrandLabel——`botmux send` 等一次性 CLI 进程不消费此 accessor）。
@@ -1768,30 +2273,106 @@ export function getBotTuiSlashAllow(larkAppId: string): string[] | undefined {
 }
 
 /**
+ * 该 bot 是否接受**其他 bot** 发来的原生斜杠命令（--slash）。默认开：只有
+ * 配置里显式 `acceptSlashFromBots: false` 才关。未知 bot（无注册项）→ 默认开
+ * （与其它 default-on 开关一致，缺配置不 fail-closed 成"全拒"）。
+ */
+export function botAcceptsSlashFromBots(larkAppId: string): boolean {
+  return bots.get(larkAppId)?.config.acceptSlashFromBots !== false;
+}
+
+/**
  * Load bot configurations from one of (in priority order):
  * 1. BOTS_CONFIG env var — path to a JSON file
  * 2. ~/.botmux/bots.json — default config path
+ * 3. Core-only (BOTMUX_CORE_ONLY=1) with NEITHER of the above present:
+ *    synthesize a single apiOnly bot from env — no bots.json / no Feishu creds
+ *    (riff's in-sandbox headless service).
  */
 export function loadBotConfigs(): BotConfig[] {
+  const synthetic = maybeSynthesizeCoreOnlyConfig();
+  if (synthetic) return synthetic;
   return parseBotConfigFile(resolveBotConfigPath());
 }
 
+/**
+ * Core-only headless config: when BOTMUX_CORE_ONLY=1, synthesize ONE apiOnly bot
+ * from env so the daemon boots with zero Feishu credentials and no on-disk config.
+ *
+ * Core-only is AUTHORITATIVE about identity and IGNORES all ambient config inputs
+ * — both ~/.botmux/bots.json AND the BOTS_CONFIG env (codex P1-2). Otherwise a
+ * core-only service started on a host that happens to have a real fleet config —
+ * or with an inherited/leaked BOTS_CONFIG — would silently boot a REAL,
+ * transport-enabled Feishu bot (WSClient, real credentials, `--bot` ignored)
+ * instead of the headless apiOnly one, the exact opposite of "no Feishu". There
+ * is deliberately NO file-based override in this mode: the identity is exactly the
+ * one synthesized here (frozen: apiOnly, `local_<slug>`, no secret). Returns null
+ * only when not in core-only mode.
+ *
+ * The synthesized `loadedConfigPath` is pinned to the DEFAULT ~/.botmux/bots.json
+ * path (even though the file is absent/ignored) so the no-transport fs-policy sees
+ * the config as living INSIDE the default botmux authority root — never an external
+ * path or a carve-out, which would trip buildFsPolicy's fail-closed checks.
+ */
+function maybeSynthesizeCoreOnlyConfig(): BotConfig[] | null {
+  if (process.env.BOTMUX_CORE_ONLY !== '1') return null;
+
+  const larkAppId = process.env.BOTMUX_API_ONLY_BOT || 'local_riff';
+  if (!/^local_[A-Za-z0-9._-]+$/.test(larkAppId)) {
+    throw new Error(
+      `Core-only BOTMUX_API_ONLY_BOT must match local_<slug> (letters/digits/._-), got: ${larkAppId}`,
+    );
+  }
+  const cliId = process.env.BOTMUX_CORE_CLI || 'codex-app';
+  const entry: Record<string, unknown> = { larkAppId, apiOnly: true, cliId };
+  if (process.env.BOTMUX_CORE_WORKING_DIR) entry.workingDir = process.env.BOTMUX_CORE_WORKING_DIR;
+  if (process.env.BOTMUX_CORE_MODEL) entry.model = process.env.BOTMUX_CORE_MODEL;
+  // Route through the normal parser so the synthesized entry gets identical
+  // validation + normalization as a file-loaded one (apiOnly secret exemption,
+  // cliId check, defaults). Pin loadedConfigPath to the default in-root path.
+  const configs = parseBotConfigsFromText(JSON.stringify([entry]));
+  loadedConfigPath = resolve(resolveBotmuxConfigDir(), 'bots.json');
+  // SYNTHETIC, emphatically not 'loaded': nothing was parsed from that path (it
+  // is ignored by design here and may not exist). Recording this keeps the
+  // placeholder from being propagated to CLI children as a registry authority —
+  // the fs-policy still gets the in-root path it needs.
+  loadedConfigProvenance = 'synthetic';
+  return configs;
+}
+
 function resolveBotConfigPath(): string {
-  // 1. BOTS_CONFIG env var
+  // 1. BOTS_CONFIG env var — an EXACT file, and the top of the chain. For a
+  //    daemon-spawned CLI child this is the path the daemon pinned (its own
+  //    getLoadedConfigPath), which is what makes child and daemon agree under a
+  //    non-default HOME. See core/config-dir.ts for the full rationale.
   const botsConfigPath = process.env.BOTS_CONFIG;
   if (botsConfigPath) {
     const resolved = resolve(botsConfigPath);
     if (!existsSync(resolved)) {
-      throw new Error(`BOTS_CONFIG file not found: ${resolved}`);
+      // FAIL CLOSED, and deliberately so. For a daemon-spawned CLI child this
+      // path is the registry the daemon actually parsed (pinned by spawnCli), so
+      // "it is gone now" must NOT degrade into "resolve my own HOME's default
+      // bots.json" — under a multi-fleet non-default HOME that default is a
+      // DIFFERENT fleet's registry, and quietly switching authority would run
+      // this bot against another fleet's secret and routing. Losing the file is
+      // an operator-visible fault; changing registries behind their back is worse.
+      throw new Error(
+        `BOTS_CONFIG file not found: ${resolved}`
+        + ` — refusing to fall back to a different registry.`
+        + ` (For a botmux-spawned CLI this is the exact bots.json the daemon loaded;`
+        + ` if it was moved or unmounted, restore it or restart the daemon.)`,
+      );
     }
     loadedConfigPath = resolved;
+    loadedConfigProvenance = 'loaded';
     return resolved;
   }
 
-  // 2. ~/.botmux/bots.json
-  const defaultPath = resolve(homedir(), '.botmux', 'bots.json');
+  // 2. <config dir>/bots.json (i.e. os.homedir()/.botmux/bots.json)
+  const defaultPath = resolveBotsConfigFile();
   if (existsSync(defaultPath)) {
     loadedConfigPath = defaultPath;
+    loadedConfigProvenance = 'loaded';
     return defaultPath;
   }
 
@@ -1914,7 +2495,27 @@ export function isManagedActivationStartingAtIndex(
 }
 
 function parseBotConfigFile(filePath: string): BotConfig[] {
-  const raw = readFileSync(filePath, 'utf-8');
+  let raw: string;
+  try {
+    raw = readFileSync(filePath, 'utf-8');
+  } catch (err: any) {
+    // A sandboxed CLI is denied bots.json ON PURPOSE (it holds every sibling's
+    // secret). Seatbelt allows the METADATA read but denies the CONTENT read, so
+    // resolveBotConfigPath()'s existsSync() passes and we land here with
+    // EPERM/EACCES — the "no config file" branch that would have degraded
+    // gracefully is never reached. Callers then die with a raw
+    // `EPERM … open '~/.botmux/bots.json'`, which is why EVERY botmux subcommand
+    // (not just send) breaks inside the sandbox.
+    //
+    // Under isolation the bot's identity comes from registerSelfFromCredFile()
+    // instead, so "disk gave us nothing" is the correct, complete answer here.
+    //
+    // Outside isolation an unreadable bots.json is a REAL fault and must still
+    // throw: swallowing it would silently boot a zero-bot process (no bots
+    // respond, no error anywhere) — strictly worse than crashing loudly.
+    if ((err?.code === 'EPERM' || err?.code === 'EACCES') && underReadIsolation()) return [];
+    throw err;
+  }
   try {
     return parseBotConfigsFromText(raw);
   } catch (err: any) {
@@ -1942,7 +2543,18 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
     if (!entry.larkAppId || typeof entry.larkAppId !== 'string') {
       throw new Error(`Bot config [${i}]: larkAppId is required and must be a string`);
     }
-    if (!entry.larkAppSecret || typeof entry.larkAppSecret !== 'string') {
+    // apiOnly (core-only) bots drive purely over the HTTP control API and never
+    // connect to Feishu, so a real app secret is not required. larkAppId is still
+    // mandatory (daemon identity + dashboard routing + cachedLarkAppId gate); use
+    // a synthetic local id like `local_<slug>`. Normal Feishu bots keep the hard
+    // requirement — a missing secret there is a misconfig, not a headless bot.
+    // The rule for apiOnly is "may be omitted; if present it must still be a
+    // string" — a number/object/array/false must NOT slip into a string field.
+    if (entry.apiOnly === true) {
+      if (entry.larkAppSecret !== undefined && typeof entry.larkAppSecret !== 'string') {
+        throw new Error(`Bot config [${i}]: larkAppSecret must be a string when provided (apiOnly bots may omit it)`);
+      }
+    } else if (!entry.larkAppSecret || typeof entry.larkAppSecret !== 'string') {
       throw new Error(`Bot config [${i}]: larkAppSecret is required and must be a string`);
     }
     // MOSA-managed onboarding persists the exact App/secret/owner binding so
@@ -1955,6 +2567,27 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       || entry.activationCommitted !== undefined
     ) {
       continue;
+    }
+
+    // cliRuntime is the canonical successor to cliPathOverride. New writers
+    // also persist an exactly-equal path shadow so a rollback to an older
+    // BotMux still launches the same distribution. Any unequal pair would make
+    // old and new versions disagree, so it fails closed below.
+    const entryCliId = entry.cliId ?? 'claude-code';
+    if (entry.cliRuntime !== undefined && entryCliId !== 'codex') {
+      throw new Error(`Bot config [${i}]: cliRuntime is currently supported only for cliId "codex"`);
+    }
+    if (entry.cliRuntime !== undefined && typeof entry.wrapperCli === 'string' && entry.wrapperCli.trim()) {
+      throw new Error(`Bot config [${i}]: cliRuntime cannot be combined with wrapperCli`);
+    }
+    const cliRuntime = entry.cliRuntime === undefined
+      ? undefined
+      : normalizeCliRuntimeConfig(entry.cliRuntime, `Bot config [${i}].cliRuntime`);
+    if (cliRuntime && entry.cliPathOverride === undefined) {
+      throw new Error(`Bot config [${i}]: cliPathOverride is required as an exact downgrade shadow of cliRuntime.executable`);
+    }
+    if (cliRuntime && entry.cliPathOverride !== cliRuntime.executable) {
+      throw new Error(`Bot config [${i}]: cliPathOverride must exactly match cliRuntime.executable`);
     }
 
     // Parse workingDirs from comma-separated workingDir if workingDirs not explicitly set
@@ -2041,13 +2674,18 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       if (ids.length > 0) globalGrants = ids;
     }
 
-    // messageQuota.defaultLimit：仅保留正整数；非法/缺省 → undefined（= 默认额度关闭）。
+    // messageQuota.defaultLimit：仅保留正整数；非法/缺省 → undefined（卡片用产品默认 3 条）。
     let messageQuota: { defaultLimit?: number } | undefined;
     const rawMq = entry.messageQuota;
     if (rawMq && typeof rawMq === 'object' && !Array.isArray(rawMq)) {
       const d = rawMq.defaultLimit;
       if (typeof d === 'number' && Number.isInteger(d) && d > 0) messageQuota = { defaultLimit: d };
     }
+
+    // 新授权默认有效期：只接受授权卡已有的四个有限选项；非法/缺省回落产品默认 1 小时。
+    const grantDefaultDurationMs = isGrantDurationOption(entry.grantDefaultDurationMs)
+      ? entry.grantDefaultDurationMs
+      : undefined;
 
     // quotaState：scope-aware 计数。逐项校验 key 形如 `chat:*:*` / `global:*`，
     // value 为 { limit, used } 正整数（used 允许 0）。非法项丢弃；全空 → undefined。
@@ -2063,6 +2701,19 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         out[k] = { limit, used };
       }
       if (Object.keys(out).length > 0) quotaState = out;
+    }
+
+    let grantExpiryState: { [k: string]: { expiresAt: number } } | undefined;
+    if (entry.grantExpiryState && typeof entry.grantExpiryState === 'object' && !Array.isArray(entry.grantExpiryState)) {
+      const out: { [k: string]: { expiresAt: number } } = {};
+      for (const [k, v] of Object.entries(entry.grantExpiryState)) {
+        if (!/^(chat:.+:.+|global:.+)$/.test(k)) continue;
+        if (!v || typeof v !== 'object') continue;
+        const expiresAt = (v as any).expiresAt;
+        if (typeof expiresAt !== 'number' || !Number.isFinite(expiresAt) || expiresAt <= 0) continue;
+        out[k] = { expiresAt };
+      }
+      if (Object.keys(out).length > 0) grantExpiryState = out;
     }
 
     // customPassthroughCommands：用户额外放行透传的 slash 命令。归一化：转小写、
@@ -2134,7 +2785,10 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       ? normalizePluginIdList(entry.plugins) ?? []
       : undefined;
     const summaryRange = normalizeSummaryRange(entry.summaryRange ?? entry.summary);
+    const summaryMemory = entry.summaryMemory === true ? true : undefined;
+    const summaryMemoryPath = normalizeNonEmptyString(entry.summaryMemoryPath);
     const contentTriggers = normalizeContentTriggers(entry.contentTriggers, i);
+    const messageListeners = normalizeMessageListeners(entry.messageListeners, i);
     const vcMeetingAgent = normalizeVcMeetingAgentConfig(entry.vcMeetingAgent);
 
     // voice：per-bot 语音引擎覆盖。结构化保留（engine ∈ sami|openai，sami/openai
@@ -2159,13 +2813,27 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
 
     configs.push({
       larkAppId: entry.larkAppId,
-      larkAppSecret: entry.larkAppSecret,
+      // apiOnly bots may omit the secret (never used — no Feishu connection);
+      // fall back to '' so downstream env plumbing stays a string. Feishu image
+      // upload etc. already degrade gracefully on an empty secret.
+      larkAppSecret: entry.larkAppSecret ?? '',
+      apiOnly: entry.apiOnly === true || undefined,
+      feedback: entry.feedback === undefined
+        ? undefined
+        : normalizeFeedbackPolicyLayer(entry.feedback),
+      chatFeedbackPolicies: entry.chatFeedbackPolicies && typeof entry.chatFeedbackPolicies === 'object' && !Array.isArray(entry.chatFeedbackPolicies)
+        ? Object.fromEntries(Object.entries(entry.chatFeedbackPolicies).map(([chatId, layer]) => [chatId, normalizeFeedbackPolicyLayer(layer)]))
+        : undefined,
+      feedbackWebhooks: normalizeFeedbackWebhookConfig(entry.feedbackWebhooks),
       // brand：只认精确的 'lark'，其余 → undefined（下游 normalizeBrand 当
       // feishu）。feishu 故意存成 undefined，保持旧 bots.json 干净、不写死字段。
       brand: entry.brand === 'lark' ? 'lark' : undefined,
       name: typeof entry.name === 'string' && entry.name.trim() ? entry.name.trim() : undefined,
       displayName: typeof entry.displayName === 'string' && entry.displayName.trim() ? entry.displayName.trim() : undefined,
-      cliId: entry.cliId ?? 'claude-code',
+      cliId: entryCliId,
+      cliRuntime,
+      // Compatibility shadow: writers persist it for downgrade safety and the
+      // loader requires an exact match so every accepted config is rollback-safe.
       cliPathOverride: entry.cliPathOverride,
       wrapperCli: typeof entry.wrapperCli === 'string' && entry.wrapperCli.trim()
         ? entry.wrapperCli.trim()
@@ -2176,6 +2844,13 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       model: typeof entry.model === 'string' && entry.model.trim()
         ? entry.model.trim()
         : undefined,
+      reasoningEffort: isCodexReasoningCliId(entryCliId)
+        && isCodexReasoningEffort(entry.reasoningEffort)
+        && codexModelSupportsReasoningEffort(
+          typeof entry.model === 'string' ? entry.model : undefined,
+          entry.reasoningEffort,
+        )
+        ? entry.reasoningEffort : undefined,
       disableCliBypass: entry.disableCliBypass === true,
       codexAppCleanInput: entry.codexAppCleanInput === true || undefined,
       codexRpcInput: entry.codexRpcInput === true,
@@ -2227,10 +2902,14 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       // 只落显式 true（undefined = 关），与 restrictGrantCommands 同款，保持 bots.json 干净。
       p2pOpen: entry.p2pOpen === true || undefined,
       messageQuota,
+      grantDefaultDurationMs,
       quotaState,
+      grantExpiryState,
       restrictGrantCommands: entry.restrictGrantCommands === true || undefined,
       // Default is ON, so only explicit false is meaningful/persisted.
       autoGrantRequestCards: entry.autoGrantRequestCards === false ? false : undefined,
+      // Default is ON (accept bot-sent slash), so only explicit false persists.
+      acceptSlashFromBots: entry.acceptSlashFromBots === false ? false : undefined,
       customPassthroughCommands,
       canTalkDaemonCommands,
       tuiSlashAllow,
@@ -2244,6 +2923,12 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       // Preserve '' distinctly from undefined: '' means "brand off", undefined
       // means "use default botmux brand". Don't trim-to-undefined here.
       brandLabel: typeof entry.brandLabel === 'string' ? entry.brandLabel : undefined,
+      // Persist only a non-default usage-display mode; 'streaming' (default) and
+      // an absent key both mean streaming. Legacy showUsageInCardFooter:false is
+      // still honored on read (see normalizeUsageDisplay) but never re-emitted.
+      usageDisplay: normalizeUsageDisplay(entry) === DEFAULT_USAGE_DISPLAY
+        ? undefined
+        : normalizeUsageDisplay(entry),
       disableStreamingCard: entry.disableStreamingCard === true || undefined,
       silentTurnReactions: entry.silentTurnReactions === true || undefined,
       receivedReactionEmoji: typeof entry.receivedReactionEmoji === 'string' && entry.receivedReactionEmoji.trim()
@@ -2267,12 +2952,15 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       // 平台团队展示默认 ON：只有显式 false 有意义/落盘（undefined = 展示）。
       showInTeam: entry.showInTeam === false ? false : undefined,
       autoStartOnGroupJoin: entry.autoStartOnGroupJoin === true || undefined,
+      // Default ON: only an explicit false is meaningful/persisted (undefined = on).
+      autoInviteOwnerOnGroupAdd: entry.autoInviteOwnerOnGroupAdd === false ? false : undefined,
       // Preserve the configured prompt verbatim; trim-to-undefined when blank
       // so an empty string doesn't linger in bots.json.
       autoStartOnGroupJoinPrompt: typeof entry.autoStartOnGroupJoinPrompt === 'string' && entry.autoStartOnGroupJoinPrompt.trim()
         ? entry.autoStartOnGroupJoinPrompt
         : undefined,
       autoStartOnNewTopic: entry.autoStartOnNewTopic === true || undefined,
+      messageListeners,
       worktreeMultiPicker: entry.worktreeMultiPicker === true || undefined,
       // Per-bot regular-group default mode. Default is 'chat-topic' (顶层平铺
       // 连续会话；群内原生话题各自独立会话), so only the NON-default modes
@@ -2303,6 +2991,8 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
           )
         : undefined,
       summaryRange,
+      summaryMemory,
+      summaryMemoryPath,
       contentTriggers,
       voice,
     });
@@ -2322,7 +3012,10 @@ function readStringArray(raw: unknown): string[] | undefined {
 function readDirectSkillSelectors(raw: unknown): SkillSelector[] | undefined {
   const values = readStringArray(raw);
   if (!values) return undefined;
-  const selectors = values.filter((value): value is SkillSelector => /^skill:.+$/.test(value));
+  // Accept both `skill:<name>` and `pack:<id>` selectors. Malformed values
+  // (e.g. `skill:` with an empty body, or unknown prefixes) are dropped so a
+  // bot config never carries garbage into the resolver.
+  const selectors = values.filter((value): value is SkillSelector => /^(skill|pack):.+$/.test(value));
   return selectors.length > 0 ? selectors : undefined;
 }
 

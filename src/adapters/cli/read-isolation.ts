@@ -20,6 +20,7 @@
  * plaintext). See the design doc for the two-layer rationale.
  */
 
+import { createHash } from 'node:crypto';
 import {
   DEVICE_AUTHORITY_DIRECTORY,
   DEVICE_CREDENTIAL_FILE,
@@ -306,7 +307,27 @@ export function buildSeatbeltProfile(
 
 // A marker records which confinement capabilities are attached to the live
 // process. Credential-only panes must cold-spawn when a full sandbox is enabled.
-export const ISOLATION_PANE_MARKER_VERSION = 7;
+//
+// BUMP THIS whenever the START-TIME sandbox contract of an isolated CLI changes
+// in a way a still-running process cannot satisfy — warm reattach preserves the
+// live process + its original bwrap mounts/env untouched, so a new mount/env the
+// reattach path relies on but the old process lacks makes reattach unsafe.
+//   · 7 → 8 (#709): isolated CLIs must carry host-injected BOTMUX_READ_ISOLATION
+//     / BOTMUX_API_ONLY env (bots.json EPERM fix). Panes spawned by v3.8.0 have a
+//     v7 marker but a process with NEITHER key, so `botmux` inside them dies on
+//     the denied bots.json read; reattaching leaves the regression unfixed after
+//     a plain `daemon:restart`.
+//   · 8 → 9 (#714): traex/coco now bind ~/.trae migration done-markers read-only
+//     (sandboxReadonlyPaths) so goal-mode stops wedging on the TRAE first-run
+//     migration prompt. That is a new spawn-time mount; a pane predating it warm-
+//     reattaches with the old mount set and still wedges, so it must cold-spawn.
+//   · 9 → 10: credential-only Seatbelt/bwrap panes receive a private rotating
+//     managed-origin channel for capability-gated daemon IPC. A warm pane with
+//     the v9 marker lacks both the env and the private read carve-out.
+// #709 (→8) merged first; this PR (#714) rebased on top and takes 9. Numbers stay
+// strictly monotonic — a pane at any intermediate version must be rejected so it
+// cold-spawns under the current contract rather than bypassing a migration.
+export const ISOLATION_PANE_MARKER_VERSION = 10;
 
 export type IsolationCapability = 'credential' | 'read' | 'write';
 
@@ -323,15 +344,97 @@ function normalizeIsolationCapabilities(
   return ALL_ISOLATION_CAPABILITIES.filter(capability => requested.has(capability));
 }
 
+export interface IsolationPanePolicyInput {
+  readIsolation: boolean;
+  writeSandbox: boolean;
+  readDenyExtraPaths?: readonly string[];
+  writeAllowExtraPaths?: readonly string[];
+  readOnlyExtraPaths?: readonly string[];
+  readWriteExtraPaths?: readonly string[];
+  workingDir?: string;
+  homeDir?: string;
+  osUserHomeDir?: string;
+  botmuxHome?: string;
+  sessionDataDir?: string;
+  currentAppId?: string;
+  cliId?: string;
+  resolvedBin?: string;
+}
+
+/** Deterministic fingerprint of effective Darwin Seatbelt inputs that can
+ * change between worker forks while the pane survives. Arrays are normalized
+ * as sets because rule order does not change their final deny semantics. */
+export function isolationPanePolicyDigest(input: IsolationPanePolicyInput): string {
+  const normalizedExtra = (input.readDenyExtraPaths ?? [])
+    .map(normalizeIsolationPath)
+    .filter((value): value is string => !!value)
+    .sort();
+  const normalizedWriteExtra = (input.writeAllowExtraPaths ?? [])
+    .map(normalizeIsolationPath)
+    .filter((value): value is string => !!value)
+    .sort();
+  const normalizedReadOnlyExtra = (input.readOnlyExtraPaths ?? [])
+    .map(normalizeIsolationPath)
+    .filter((value): value is string => !!value)
+    .sort();
+  const normalizedReadWriteExtra = (input.readWriteExtraPaths ?? [])
+    .map(normalizeIsolationPath)
+    .filter((value): value is string => !!value)
+    .sort();
+  return createHash('sha256').update(JSON.stringify({
+    domain: 'botmux.darwin-seatbelt-policy.v7',
+    readIsolation: input.readIsolation,
+    writeSandbox: input.writeSandbox,
+    readDenyExtraPaths: normalizedExtra,
+    writeAllowExtraPaths: normalizedWriteExtra,
+    readOnlyExtraPaths: normalizedReadOnlyExtra,
+    readWriteExtraPaths: normalizedReadWriteExtra,
+    workingDir: input.workingDir ?? '',
+    homeDir: input.homeDir ?? '',
+    osUserHomeDir: input.osUserHomeDir ?? '',
+    botmuxHome: input.botmuxHome ?? '',
+    sessionDataDir: input.sessionDataDir ?? '',
+    currentAppId: input.currentAppId ?? '',
+    cliId: input.cliId ?? '',
+    resolvedBin: input.resolvedBin ?? '',
+  })).digest('hex');
+}
+
 export function isolationPaneMarkerContent(
   bootId: string,
   capabilities: readonly IsolationCapability[],
+  policy?: {
+    originChannelId: string;
+    readIsolation: boolean;
+    writeSandbox: boolean;
+    policyDigest: string;
+  },
 ): string {
+  if (policy
+    && (!/^[a-f0-9]{64}$/.test(policy.originChannelId)
+      || !/^[a-f0-9]{64}$/.test(policy.policyDigest))) {
+    throw new Error('invalid isolation marker policy');
+  }
   return JSON.stringify({
     version: ISOLATION_PANE_MARKER_VERSION,
     bootId,
     capabilities: normalizeIsolationCapabilities(capabilities),
+    ...(policy ?? {}),
   });
+}
+
+export function isolatedPaneOriginChannel(
+  markerContent: string | null | undefined,
+): string | undefined {
+  try {
+    const parsed = JSON.parse(markerContent ?? '') as { originChannelId?: unknown };
+    return typeof parsed.originChannelId === 'string'
+      && /^[a-f0-9]{64}$/.test(parsed.originChannelId)
+      ? parsed.originChannelId
+      : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 /**
@@ -349,25 +452,61 @@ export function isolationPaneMarkerContent(
  */
 export function isolatedPaneReattachSafe(
   markerContent: string | null | undefined,
-  requiredCapabilities: readonly IsolationCapability[] = [],
+  expected: readonly IsolationCapability[] | {
+    requiredCapabilities: readonly IsolationCapability[];
+    exactCapabilities?: boolean;
+    readIsolation?: boolean;
+    writeSandbox?: boolean;
+    requireOriginChannel?: boolean;
+    policyDigest?: string;
+  } = [],
 ): boolean {
   try {
     const parsed = JSON.parse(markerContent ?? '') as {
       version?: unknown;
       bootId?: unknown;
       capabilities?: unknown;
+      readIsolation?: unknown;
+      writeSandbox?: unknown;
+      originChannelId?: unknown;
+      policyDigest?: unknown;
     };
-    if (!Array.isArray(parsed.capabilities)
+    if (parsed.version !== ISOLATION_PANE_MARKER_VERSION
+      || typeof parsed.bootId !== 'string'
+      || parsed.bootId.trim().length === 0
+      || !Array.isArray(parsed.capabilities)
       || parsed.capabilities.some(capability =>
         typeof capability !== 'string'
         || !ALL_ISOLATION_CAPABILITIES.includes(capability as IsolationCapability))) {
       return false;
     }
+    const expectedPolicy = Array.isArray(expected)
+      ? undefined
+      : expected as {
+          requiredCapabilities: readonly IsolationCapability[];
+          exactCapabilities?: boolean;
+          readIsolation?: boolean;
+          writeSandbox?: boolean;
+          requireOriginChannel?: boolean;
+          policyDigest?: string;
+        };
+    const requiredCapabilities: readonly IsolationCapability[] = expectedPolicy
+      ? expectedPolicy.requiredCapabilities
+      : expected as readonly IsolationCapability[];
     const actual = new Set(parsed.capabilities as IsolationCapability[]);
-    return parsed.version === ISOLATION_PANE_MARKER_VERSION
-      && typeof parsed.bootId === 'string'
-      && parsed.bootId.trim().length > 0
-      && requiredCapabilities.every(capability => actual.has(capability));
+    if (!requiredCapabilities.every(capability => actual.has(capability))) return false;
+    if (expectedPolicy?.exactCapabilities
+      && actual.size !== new Set(requiredCapabilities).size) return false;
+    if (!expectedPolicy) return true;
+    if (expectedPolicy.readIsolation !== undefined
+      && parsed.readIsolation !== expectedPolicy.readIsolation) return false;
+    if (expectedPolicy.writeSandbox !== undefined
+      && parsed.writeSandbox !== expectedPolicy.writeSandbox) return false;
+    if (expectedPolicy.policyDigest !== undefined
+      && parsed.policyDigest !== expectedPolicy.policyDigest) return false;
+    return !expectedPolicy.requireOriginChannel
+      || (typeof parsed.originChannelId === 'string'
+        && /^[a-f0-9]{64}$/.test(parsed.originChannelId));
   } catch {
     return false;
   }
@@ -375,4 +514,32 @@ export function isolatedPaneReattachSafe(
 
 function dedupe(xs: string[]): string[] {
   return Array.from(new Set(xs));
+}
+
+/**
+ * True when this process is a CLI the worker spawned for a bot under READ
+ * ISOLATION (the sandbox), where `~/.botmux/bots.json` is denied ON PURPOSE (it
+ * holds every sibling bot's app secret). Callers use it to tell that EXPECTED
+ * denial apart from a genuine unreadable-config fault.
+ *
+ * The signal is `BOTMUX_READ_ISOLATION`, which the worker sets (and otherwise
+ * explicitly DELETES) on the child env, gated on `sandboxRequested`. It has to
+ * come from the host; two CLI-side guesses were tried and are both wrong:
+ *
+ *   · `SESSION_DATA_DIR` + `BOTMUX_LARK_APP_ID` — injected for EVERY
+ *     worker-spawned CLI, sandboxed or not. Matches ordinary bots, so a real
+ *     "bots.json is unreadable" fault would be silently downgraded to "there are
+ *     no bots" on a normal host.
+ *   · existence of `<BOT_HOME>/send-cred.json` — wrong in BOTH directions: a
+ *     no-transport (apiOnly) bot has its own copy denied by fs-policy
+ *     (`push([`${ctx.botHome}/send-cred.json`], 'deny', 'mandatory')` in the
+ *     `!larkTransport` branch), so a genuinely sandboxed bot reads as
+ *     not-isolated; and the file is never cleaned up, so flipping a bot from
+ *     `sandbox: true` back to `false` leaves a stale one behind that makes an
+ *     ordinary CLI look isolated.
+ *
+ * (Both caught in review, 2026-08-03. Do not "simplify" this back to either.)
+ */
+export function underReadIsolation(): boolean {
+  return process.env.BOTMUX_READ_ISOLATION === '1';
 }

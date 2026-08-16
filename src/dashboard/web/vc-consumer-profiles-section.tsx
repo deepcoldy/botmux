@@ -7,6 +7,7 @@
  * permissionPreset 是 UI 概念：custom 只对「已保存的同 id 预设」可选（服务端
  * 只允许沿用既有 policy），新预设必须先选一个模板档。
  */
+import type React from 'react';
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { DropdownMenu, FieldTitle, InfoTip, dropdownLabel } from './dashboard-components.js';
 import { useDashboardLocale, useT } from './react-hooks.js';
@@ -80,10 +81,33 @@ function toDto(draft: DraftProfile): VcMeetingConsumerProfileDto {
   return dto;
 }
 
+/**
+ * A meeting-consumer agent is SELECTABLE only when it can actually spawn and
+ * reply: it needs a working dir, reliable turn receipts, and (plan B) must not
+ * be a bot whose explicit sandbox request is undeliverable. Offline is transient
+ * and unsandboxed is an informed opt-out, so neither blocks selection. This is
+ * the single source of truth shared by the dropdown's `disabled` flag and the
+ * new-profile default seeder, so the two can never drift apart. Anything else —
+ * including seeding agentOptions[0] blindly — can silently persist an agent that
+ * joins meetings but never replies (the server PUT only checks the id is a
+ * non-empty string, not that it is eligible).
+ */
+function isAgentSelectable(agent: VcMeetingAgentOptionDto): boolean {
+  return agent.workingDirReady
+    && agent.reliableTurnTerminal
+    && agent.managedSideEffectEligible;
+}
+
+/** appId of the first selectable agent (see {@link isAgentSelectable}), or ''
+ *  when none qualifies — callers must not seed a disabled agent as the default. */
+function firstSelectableAgentAppId(agents: readonly VcMeetingAgentOptionDto[]): string {
+  return agents.find(isAgentSelectable)?.appId ?? '';
+}
+
 /** settings 页挂载门：预设 API 是私有端点，公共只读访客请求必 401——
  * canWrite=false 时完全不挂载编辑器（一次 GET 都不发），只显示提示。 */
 /** 字段标题 + hover 帮助气泡：把配置语义讲清，避免用户对着裸表单猜。 */
-function FieldHead(props: { title: string; help: string }): JSX.Element {
+function FieldHead(props: { title: string; help: string }): React.JSX.Element {
   return (
     <span className="vc-profile-field-head">
       {props.title}
@@ -100,7 +124,7 @@ function VcProfileDialog(props: {
   children: ReactNode;
   onClose(): void;
   className?: string;
-}): JSX.Element {
+}): React.JSX.Element {
   const tr = useT();
   const ref = useRef<HTMLDialogElement | null>(null);
   useEffect(() => {
@@ -359,10 +383,23 @@ export function VcConsumerProfilesSection(props: {
         agent.online ? undefined : tr('settings.vcProfiles.agentOffline'),
         agent.workingDirReady ? undefined : tr('settings.vcProfiles.agentNoWorkingDir'),
         agent.reliableTurnTerminal ? undefined : tr('settings.vcProfiles.agentNoReliableTerminal'),
-        agent.managedSideEffectIsolation ? undefined : tr('settings.vcProfiles.agentNoManagedIsolation'),
+        agent.managedSideEffectEligible ? undefined : tr('settings.vcProfiles.agentNoManagedIsolation'),
+        // Plan B: unsandboxed is allowed but the bot credential is exposed to
+        // untrusted meeting input — surface it as an informational note, not a
+        // blocking warning (the agent stays selectable).
+        agent.managedSideEffectEligible && !agent.sandboxIsolated
+          ? tr('settings.vcProfiles.agentUnsandboxedRisk')
+          : undefined,
       ].filter(Boolean);
+      // Hard blockers make the consumer un-spawnable, so disable selection
+      // outright rather than let the user pick a bot that will silently never
+      // reply. Offline is transient (a daemon may come back) and unsandboxed is
+      // an informed opt-out, so neither disables. Shares isAgentSelectable with
+      // the default seeder so a disabled bot can never sneak in as the default.
+      const blocked = !isAgentSelectable(agent);
       return {
         value: agent.appId,
+        disabled: blocked,
         label: (
           <span className="vc-agent-option">
             <span className="vc-agent-option-name">
@@ -385,7 +422,8 @@ export function VcConsumerProfilesSection(props: {
     const warn = !agent.online
       || !agent.workingDirReady
       || !agent.reliableTurnTerminal
-      || !agent.managedSideEffectIsolation;
+      || !agent.managedSideEffectEligible
+      || !agent.sandboxIsolated;
     return warn ? `⚠ ${agent.label}` : agent.label;
   };
 
@@ -409,7 +447,12 @@ export function VcConsumerProfilesSection(props: {
         uiKey,
         isNew: true,
         id: '',
-        agentAppId: state.agentOptions[0]?.appId ?? '',
+        // Seed the first SELECTABLE agent, not agentOptions[0]. The [0] entry is
+        // the appId-sorted first bot, which may be a disabled (un-spawnable) one
+        // — a hardcoded [0] default silently bypasses the dropdown disable and
+        // saves an agent that will never reply (server PUT only checks the id is
+        // a non-empty string). '' when none is eligible → validation catches it.
+        agentAppId: firstSelectableAgentAppId(state.agentOptions),
         responseMode: 'silent',
         listenerPlacement: 'auto',
         permissionPreset: 'observe_only',
@@ -433,7 +476,8 @@ export function VcConsumerProfilesSection(props: {
           isNew: true,
           id,
           label: template.profileLabel[locale],
-          agentAppId: state.agentOptions[0]?.appId ?? '',
+          // Same as addProfile: first selectable agent, never the disabled [0].
+          agentAppId: firstSelectableAgentAppId(state.agentOptions),
           instructions: template.instructions[locale],
           activityTypes: [...template.activityTypes],
           responseMode: template.responseMode,
@@ -463,11 +507,7 @@ export function VcConsumerProfilesSection(props: {
   // setCatalog + 清 dirty——若允许 pending 窗口内继续编辑，这些修改会被
   // 服务端回包静默覆盖。
   const frozen = !props.canWrite || saving || loading;
-  const hasStructurallyEligibleAgent = catalog?.agentOptions.some(
-    agent => agent.workingDirReady
-      && agent.reliableTurnTerminal
-      && agent.managedSideEffectIsolation,
-  ) ?? false;
+  const hasStructurallyEligibleAgent = catalog?.agentOptions.some(isAgentSelectable) ?? false;
   const selectedProfileIndex = catalog?.profiles.findIndex(profile => profile.uiKey === selectedProfileKey) ?? -1;
   const selectedProfile = selectedProfileIndex >= 0 ? catalog?.profiles[selectedProfileIndex] ?? null : null;
   const selectedTemplate = catalog?.templateCatalog.templates.find(template => template.templateId === selectedTemplateId) ?? null;
@@ -574,7 +614,18 @@ export function VcConsumerProfilesSection(props: {
                 <p>{tr('settings.vcProfiles.list.help')}</p>
               </div>
               {props.canWrite ? (
-                <button type="button" className="vc-profiles-link vc-profile-add" disabled={saving || loading} onClick={addProfile}>
+                <button
+                  type="button"
+                  className="vc-profiles-link vc-profile-add"
+                  // No selectable agent ⇒ a new profile could only be seeded with
+                  // '' (or, before the fix, a disabled bot). Disable adding rather
+                  // than create a profile that can never spawn a replying consumer.
+                  disabled={saving || loading || !hasStructurallyEligibleAgent}
+                  title={!hasStructurallyEligibleAgent
+                    ? tr('settings.vcProfiles.noEligibleDefaultAgent')
+                    : undefined}
+                  onClick={addProfile}
+                >
                   {tr('settings.vcProfiles.add')}
                 </button>
               ) : null}
@@ -718,7 +769,10 @@ export function VcConsumerProfilesSection(props: {
             <TemplateDetailsDialog
               template={selectedTemplate}
               locale={locale}
-              disabled={frozen || catalog.agentOptions.length === 0}
+              // Applying a template also seeds an agent; gate it on a selectable
+              // agent existing, not merely a non-empty (possibly all-disabled)
+              // agent list, so it can't seed '' / a disabled bot either.
+              disabled={frozen || !hasStructurallyEligibleAgent}
               onClose={() => setSelectedTemplateId(null)}
               onUse={() => addProfileFromTemplate(selectedTemplate)}
             />
@@ -742,7 +796,7 @@ function ProfileEditorDialog(props: {
   onUpdate(patch: Partial<DraftProfile>): void;
   onIdChange(value: string): void;
   onRemove(): void;
-}): JSX.Element {
+}): React.JSX.Element {
   const tr = useT();
   const { profile, index } = props;
   return (
@@ -886,7 +940,7 @@ function TemplateDetailsDialog(props: {
   disabled: boolean;
   onClose(): void;
   onUse(): void;
-}): JSX.Element {
+}): React.JSX.Element {
   const tr = useT();
   const template = props.template;
   return (

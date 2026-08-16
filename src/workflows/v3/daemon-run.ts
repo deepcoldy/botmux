@@ -23,7 +23,8 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync,
 import { loadBotConfigs, type BotConfig } from '../../bot-registry.js';
 import { atomicWriteFileSync } from '../../utils/atomic-write.js';
 import { withFileLock, withFileLockSync } from '../../utils/file-lock.js';
-import { isHostNode, isLoopNode, loadDag, type V3Dag } from './dag.js';
+import { isHostNode, isLoopNode, type V3Dag } from './dag.js';
+import { loadDag } from './dag-loader.js';
 import {
   runWorkflow,
   nextAttemptIdFor,

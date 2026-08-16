@@ -23,13 +23,13 @@
 
 ## 2. 鉴权
 
-调用走 dashboard（默认 `http://<daemon-host>:7891`）。当前用 dashboard 短期 token 鉴权：
+调用走 dashboard（默认 `http://<daemon-host>:7891`）。当前用 dashboard 轮换式 token 鉴权：
 
 - **程序化调用必须把 token 放在 Cookie 头**：`Cookie: botmux_dashboard_token=<TOKEN>`
 - ⚠️ 不要用 `?t=<TOKEN>` query：那是给浏览器登录用的，`POST` 带它会返回 **302 重定向**（set-cookie），程序化调用会失败。
-- token 获取：运行 `botmux dashboard` 打印登录 URL，其中 `?t=` 后面那段就是 token。每次运行会 rotate（旧 token 失效）。
+- token 获取：运行 `botmux dashboard` 获取当前登录 URL，其中 `?t=` 后面那段就是 token。尚无 token 时命令会创建第一个；仅在确实要让已有 token 失效时才运行 `botmux dashboard rotate`。
 
-> token 是短期凭证。长期稳定的 API Key 认证（如 `X-Botmux-Api-Key`）在规划中，届时本文更新。
+> token 会一直保留到显式轮换。独立 API Key 认证（如 `X-Botmux-Api-Key`）在规划中，届时本文更新。
 
 ---
 
@@ -56,6 +56,10 @@
 - **`envelope.trusted` 必须是 `false`**。这是防注入设计：`trusted:false` 声明「以下 envelope 内容是不可信外部数据」，daemon 才会把它包成 untrusted event、不执行里面夹带的指令。你要机器人真正执行的东西放在顶层 `instruction`（可信指令），不要放进 envelope。
 - **不传 `chatId`** 时，`options` 必须含 `waitForFinalOutput` 或 `asyncReturnSessionId` 之一，否则报 `target_required`。
 - **`options.timeoutMs` 范围 `[1000, 300000]`**（1 秒 ~ 5 分钟），越界报 400。不传默认 120000。
+- **`options.model`** / **`options.reasoningEffort`**（可选，**仅对 codex / codex-app 机器人生效**）：按本次触发覆盖模型与推理档位。
+  - `model`：codex 模型 id（≤200 字符）；`reasoningEffort`：`low` / `medium` / `high` / `xhigh`（原样透传给 codex，不做降级）。
+  - **仅新建会话生效**：只在这次触发**创建新会话**时冻结；折叠进已有 worker 的续轮不改写。
+  - **作用域收窄到 codex 家族**：目标机器人不是 codex/codex-app 时，这两个字段被忽略（不会改动 Claude/Gemini/CoCo 等的模型）。
 
 ### 同步模式（waitForFinalOutput）
 
@@ -115,6 +119,60 @@ curl -X POST "http://<host>:7891/api/trigger" \
 }
 ```
 
+### 幂等键（`options.idempotencyKey`）—— 防止重试重复执行
+
+**问题**：异步触发后如果 HTTP 响应在网络中丢了（daemon 其实已建 session、任务已在跑），你的重试会建一个**全新 session**、把同一个任务**跑第二遍**（重复的外部副作用：发两次消息、迁移跑两遍……）。你自己的去重挡不住——第一个 session 是真的在执行。
+
+**解法**：在 `options.idempotencyKey` 传一个你侧稳定生成、且**在发起 trigger 之前就持久化**的键。同键重试时 daemon 返回**同一个 session/triggerId、不新建也不重派**：
+
+```bash
+curl -X POST "http://<host>:7891/api/trigger" -H 'content-type: application/json' \
+  -H "Cookie: botmux_dashboard_token=$TOKEN" \
+  -d '{
+    "source":{"type":"webhook"},
+    "target":{"kind":"turn","botId":"cli_xxx"},
+    "instruction":"...",
+    "envelope":{"format":"json","sourceName":"demo","trusted":false},
+    "options":{"asyncReturnSessionId":true, "idempotencyKey":"my-task-42"}
+  }'
+```
+
+命中已有键时响应带 `idempotent:true`（复用，无新派发）；首次创建时带 `idempotent:false`。拿到（复用或新建的）`sessionId` 后照常轮询 `trigger-result`——**不需要额外的反查端点**。
+
+**适用范围（重要）**：`idempotencyKey` 仅支持 **fresh async virtual** 触发，即 `target.kind:'turn'` + `options.asyncReturnSessionId:true`，且**不带** `target.sessionId` / `rootMessageId` / `chatId`、不带 `waitForFinalOutput` / `dryRun`。任何其它组合带 key 会 **400**（其它派发路径本 PR 未接入 lease，故契约不对外开放，以免误判为幂等）。
+
+**同键、不同 payload → 409 `idempotency_conflict`**：键与其业务 payload（`instruction`/`envelope`/影响执行的 `options`）绑定；同键换了 payload 是调用方 bug，daemon 明确报 409，**绝不**把新请求静默串进旧任务。所以重试务必用**同键配同 payload**。
+
+**崩溃语义（at-most-once）**：daemon 在真正派发前会把该键的 lease durable 标记为 `attempting`（commit-unknown 屏障）。若 daemon 恰好在「已开始派发」与「拿到完成证据」之间崩溃，重启后**不会盲目重派**（`forkWorker` 返回并不证明模型没开始跑）——该键会收敛到终态、`trigger-result` 报 `failed`（错误码 `no_output`，语义为「上次派发结果未知、按至多一次不重跑」）。你的 recovery 把它当 **Failed** 处理即可（宁可让你看到明确失败去新建重试，也不双跑）。
+
+**保留**：键→session 映射只增不删（与异步结果同策略，保证完成后的迟到重试仍复用同一 session、不重建）。
+
+---
+
+### 续会话轮幂等键（`options.turnIdempotencyKey`）—— 给追问轮同样的保证
+
+上面的 `idempotencyKey` 只覆盖 **fresh 新会话**。当你往**已存在的会话追加一轮追问**（带 `target.sessionId`）时，改用 `options.turnIdempotencyKey`——追加轮的 HTTP 回包一旦丢失，你无法判断 daemon 是否已受理该轮，重试就可能**重复注入两次**。
+
+传一个**在发起前就持久化**的稳定键。同键重试到同一会话时，daemon 解析到**同一轮（同 `triggerId`）、不二次注入**：
+
+```bash
+curl -X POST "http://<host>:7891/api/trigger" -H 'content-type: application/json' \
+  -H "Cookie: botmux_dashboard_token=$TOKEN" \
+  -d '{
+    "source":{"type":"webhook"},
+    "target":{"kind":"turn","botId":"cli_xxx","sessionId":"<已存在会话>"},
+    "instruction":"...",
+    "envelope":{"format":"json","sourceName":"demo","trusted":false},
+    "options":{"asyncReturnSessionId":true, "turnIdempotencyKey":"my-followup-7"}
+  }'
+```
+
+命中带 `idempotent:true`；照常用 `sessionId`/`triggerId` 轮询 `trigger-result`。
+
+**适用范围**：`turnIdempotencyKey` 仅支持**已存在会话上的续会话异步轮**——`target.kind:'turn'` + 带 `target.sessionId` + `options.asyncReturnSessionId:true`，不带 `waitForFinalOutput` / `dryRun`。它与 `idempotencyKey` **互斥**（同时传返回 **400**），且两者位于**互不碰撞的独立键空间**——即便 `turnIdempotencyKey` 和 `idempotencyKey` 取相同字符串也绝不会共用同一 lease。
+
+**同键异 payload → 409 `idempotency_conflict`**；**崩溃语义（at-most-once）**与**保留**策略与上面的 `idempotencyKey` 完全一致（派发结果未知的追问轮收敛为 `failed` / `no_output`，绝不盲目重跑）。另有一个瞬时情况：若目标会话仍在完成其**开场激活**，该追问轮会被**可重试地**拒绝（errorCode `trigger_failed`，提示含 “session activation in progress”）——稍后重试即可。
+
 ---
 
 ## 4. 轮询结果（四态契约）
@@ -131,11 +189,11 @@ GET /api/sessions/:sessionId/trigger-result
 | `state` | 含义 | 你该做什么 | 关键字段 |
 |---------|------|-----------|---------|
 | `running` | 任务还在跑 | 继续轮询 | — |
-| `completed` | 有最终产出 | 落终态，读 `output.content` | `output.content`、`finishedAt` |
+| `completed` | 有最终产出 | 落终态，读 `output.content`（codex-app 还会带 `usage`） | `output.content`、`finishedAt`、`usage?` |
 | `failed` | 会话已终止但没捕获到产出（软终态） | 见下方说明 | `errorCode:"no_output"`、`error`、`finishedAt` |
 | `not_found` | 查无此会话（从未存在/非法 id） | 见下方两种物理表现 | `errorCode:"session_not_found"` |
 
-`completed` 响应示例：
+`completed` 响应示例（`usage` 仅 codex-app、且成功采集到时出现）：
 
 ```json
 {
@@ -143,11 +201,19 @@ GET /api/sessions/:sessionId/trigger-result
   "state": "completed",
   "triggerId": "trg_87e7b415-...",
   "output": { "content": "ASYNC_DEMO_OK" },
+  "usage": { "inputTokens": 60, "outputTokens": 30, "cacheReadTokens": 40, "cacheCreateTokens": 0 },
   "finishedAt": "2026-07-24T08:43:17.126Z",
   "target": { "kind": "turn", "sessionId": "2eed60c4-...", "chatId": "http_async_..." },
   "async": { "status": "completed", "sessionId": "2eed60c4-...", "completedAt": "..." }
 }
 ```
+
+关于 `usage`（本轮 token 用量，四桶互斥）：
+- **仅 codex-app 任务**、且本轮成功采集到用量时出现；其它 CLI（含纯 codex）或未采集到时**整段省略**。
+- **omit ≠ 0**：拿不到用量就没有 `usage` 字段，而不是四个 0——请按"字段缺失=未知"处理，不要把缺失当成真实 0 用量。
+- 四桶：`inputTokens`（纯新增输入，已扣除缓存读/写）、`outputTokens`、`cacheReadTokens`、`cacheCreateTokens`，均为本轮增量（非会话累计）。
+- **随重启持久化**：daemon 重启后再查该已完成会话，`usage` 与 `output` 一并从磁盘恢复。
+
 
 ### `failed` 是软终态，不要立即判死
 
@@ -293,4 +359,4 @@ async function getTriggerResult(sessionId: string) {
 | `/api/sessions/:id` | GET | 查会话元信息（状态/标题等） |
 | `/api/sessions/:id/close` | POST | 取消/关闭会话 |
 
-关键 `errorCode`：`target_required`、`bad_request`（含 `trusted` 校验、`timeoutMs` 越界）、`bot_not_found`、`bot_not_in_chat`、`wait_timeout`、`no_output`、`session_not_found`。
+关键 `errorCode`：`target_required`、`bad_request`（含 `trusted` 校验、`timeoutMs` 越界、`idempotencyKey` 超范围）、`idempotency_conflict`（同键异 payload）、`bot_not_found`、`bot_not_in_chat`、`wait_timeout`、`no_output`、`session_not_found`。

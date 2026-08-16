@@ -43,6 +43,22 @@ export interface TriggerRequest {
   options?: {
     dryRun?: boolean;
     dedupKey?: string;
+    /** Caller-provided idempotency key (scoped per bot). A retried /api/trigger
+     *  with the same key returns the SAME session + triggerId instead of
+     *  creating a new one and re-dispatching — so a lost HTTP response can't make
+     *  the turn run twice. Distinct from `dedupKey` (webhook-lifecycle alert
+     *  grouping). Non-empty, ≤200 chars. FRESH async virtual only — mutually
+     *  exclusive with `turnIdempotencyKey` (which is for follow-up turns). */
+    idempotencyKey?: string;
+    /** Caller-provided idempotency key for a FOLLOW-UP turn on an existing
+     *  session (requires `target.sessionId`). Same at-most-once dispatch lease as
+     *  `idempotencyKey`, but scoped to (sessionId, turnIdempotencyKey): a retried
+     *  /api/trigger appending to the same session with the same key resolves to
+     *  the SAME turn instead of injecting a second time — so a lost HTTP response
+     *  on an existing-session append can't double-run. Mutually exclusive with
+     *  `idempotencyKey`; only valid with `target.sessionId` + asyncReturnSessionId
+     *  (no wait/dryRun). Non-empty, ≤200 chars. */
+    turnIdempotencyKey?: string;
     status?: 'firing' | 'resolved' | string;
     waitForFinalOutput?: boolean;
     asyncReturnSessionId?: boolean;
@@ -51,6 +67,13 @@ export interface TriggerRequest {
      * this loud trigger's turn. The streaming card / start notice still show;
      * only the trailing transcript-driven summary is suppressed. */
     suppressFinalOutput?: boolean;
+    /** Per-turn CLI model override (e.g. a codex model id). Applies only to a
+     *  freshly-spawned session; ignored when folding into an existing worker.
+     *  Empty/omitted → the bot's configured default. */
+    model?: string;
+    /** Per-turn reasoning effort (codex `model_reasoning_effort`). Same
+     *  fresh-spawn-only semantics as `model`. */
+    reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
   };
 }
 
@@ -61,6 +84,7 @@ export type TriggerErrorCode =
   | 'bot_not_in_chat'
   | 'daemon_offline'
   | 'dry_run'
+  | 'idempotency_conflict'
   | 'invalid_signature'
   | 'chat_not_allowed'
   | 'legacy_workflow_retired'
@@ -110,11 +134,39 @@ export interface TriggerResponse {
   output?: {
     content: string;
   };
+  /** Per-turn token usage for a completed async turn (codex-app). Present on
+   *  `state:'completed'` when captured; omitted otherwise. Field names mirror the
+   *  caller's TaskTokenUsage. */
+  usage?: {
+    inputTokens: number;
+    outputTokens: number;
+    cacheReadTokens: number;
+    cacheCreateTokens: number;
+  };
   async?: {
     status: TriggerAsyncStatus;
     sessionId?: string;
     completedAt?: string;
   };
+  /** Echo of the caller's `options.idempotencyKey`, when one was supplied. */
+  idempotencyKey?: string;
+  /** Echo of the caller's `options.turnIdempotencyKey`, when one was supplied
+   *  (follow-up async turn on an existing session). */
+  turnIdempotencyKey?: string;
+  /** True when this response reused an EXISTING session for the idempotency key
+   *  (no new session created, no re-dispatch) instead of creating a fresh one.
+   *  Absent/false on the first (creating) call and on non-idempotent triggers. */
+  idempotent?: boolean;
+  /** Read-only web-terminal URL for the live session's CLI pane, present only
+   *  while a worker web server is up (typically `state:'running'` and at
+   *  `'completed'` before the session closes). Lets an async caller (e.g. riff's
+   *  in-sandbox task-runner) open a live view of the visible CLI TUI — form C.
+   *  Carries the `?viewToken=` read capability inline; knowing it grants read
+   *  only, never terminal input. Omitted when no live worker terminal exists. */
+  readOnlyUrl?: string;
+  /** The bare read capability behind `readOnlyUrl`'s `?viewToken=`, exposed
+   *  separately for callers that build their own URL. Omitted with readOnlyUrl. */
+  viewToken?: string;
 }
 
 export function isRecord(v: unknown): v is Record<string, unknown> {
@@ -135,6 +187,17 @@ export function validateTriggerRequest(raw: unknown): { ok: true; request: Trigg
     return { ok: false, status: 400, body: { ok: false, errorCode: 'target_required', error: 'target.kind must be turn or workflow' } };
   }
   const options = isRecord(raw.options) ? raw.options : {};
+  // Strict boolean typing for the mode/gate flags. The validator derives these
+  // with `=== true` but triggerSessionTurn consumes some with truthiness; a
+  // non-boolean (e.g. "false" / 1) would pass a scope gate here yet take a
+  // different runtime branch — which, for an idempotency turn, could skip the
+  // reserved→attempting barrier and break at-most-once. Reject non-booleans so
+  // the two layers can never diverge (codex #776 round-4).
+  for (const flag of ['waitForFinalOutput', 'asyncReturnSessionId', 'dryRun'] as const) {
+    if (options[flag] !== undefined && typeof options[flag] !== 'boolean') {
+      return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: `options.${flag} must be a boolean` } };
+    }
+  }
   const waitForFinalOutput = options.waitForFinalOutput === true;
   const asyncReturnSessionId = options.asyncReturnSessionId === true;
   const hasChatId = typeof target.chatId === 'string' && target.chatId.trim().length > 0;
@@ -180,6 +243,79 @@ export function validateTriggerRequest(raw: unknown): { ok: true; request: Trigg
   }
   if (options.suppressFinalOutput !== undefined && typeof options.suppressFinalOutput !== 'boolean') {
     return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: 'options.suppressFinalOutput must be a boolean' } };
+  }
+  if (options.model !== undefined && (typeof options.model !== 'string' || options.model.length > 200)) {
+    return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: 'options.model must be a string (<=200 chars)' } };
+  }
+  if (options.reasoningEffort !== undefined && !['low', 'medium', 'high', 'xhigh', 'max', 'ultra'].includes(options.reasoningEffort as string)) {
+    return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: 'options.reasoningEffort must be one of low|medium|high|xhigh|max|ultra' } };
+  }
+  // Mutual exclusion FIRST, before either key's scope-lock: the two keys have
+  // different scopes (fresh-session vs follow-up) with opposite target shapes, so
+  // whichever scope check ran first would otherwise mask the "both present" case
+  // with its own scope message (e.g. a request carrying BOTH + target.sessionId
+  // trips idempotencyKey's no-sessionId scope-lock before reaching this check).
+  // Hoisting it makes the precise mutual-exclusion 400 always reachable when both
+  // are supplied, regardless of target shape (riff #818 canary validation).
+  if (options.idempotencyKey !== undefined && options.turnIdempotencyKey !== undefined) {
+    return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: 'options.turnIdempotencyKey and options.idempotencyKey are mutually exclusive' } };
+  }
+  if (options.idempotencyKey !== undefined) {
+    if (typeof options.idempotencyKey !== 'string' || options.idempotencyKey.trim().length === 0 || options.idempotencyKey.length > 200) {
+      return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: 'options.idempotencyKey must be a non-empty string (<=200 chars)' } };
+    }
+    // Scope lock (fresh async virtual only): the dispatch lease is implemented
+    // solely on the fresh-session async-return seam, so the public contract must
+    // not advertise it anywhere else — an existing-session / wait / plain / dryRun
+    // retry would silently bypass the lease and double-run. Require the exact
+    // intersection: turn + asyncReturnSessionId, no wait/dryRun, and NO target
+    // that could resolve to an existing/real session (sessionId/rootMessageId/
+    // chatId — including a caller-forged http_async_*). Widen only via a new PR
+    // that extends the lease to those seams.
+    if (
+      target.kind !== 'turn'
+      || !asyncReturnSessionId
+      || waitForFinalOutput
+      || options.dryRun === true
+      || hasSessionId
+      || hasRootMessageId
+      || hasChatId
+    ) {
+      return {
+        ok: false, status: 400,
+        body: {
+          ok: false, errorCode: 'bad_request',
+          error: 'options.idempotencyKey is only supported for a fresh async virtual trigger (target.kind=turn, options.asyncReturnSessionId=true, no waitForFinalOutput/dryRun, and no target.sessionId/rootMessageId/chatId)',
+        },
+      };
+    }
+  }
+  if (options.turnIdempotencyKey !== undefined) {
+    if (typeof options.turnIdempotencyKey !== 'string' || options.turnIdempotencyKey.trim().length === 0 || options.turnIdempotencyKey.length > 200) {
+      return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: 'options.turnIdempotencyKey must be a non-empty string (<=200 chars)' } };
+    }
+    // (Mutual exclusion with idempotencyKey is checked up-front, above.)
+    // Scope lock (follow-up turn only): the turn-level lease is implemented solely
+    // on the existing-session async-return append seam. It REQUIRES target.sessionId
+    // (that is the session whose turn is keyed) and asyncReturnSessionId, and must
+    // not be combined with wait/dryRun or a fresh-session target
+    // (rootMessageId/chatId without sessionId), which take other dispatch paths
+    // that don't hold this lease and would double-run on retry.
+    if (
+      target.kind !== 'turn'
+      || !hasSessionId
+      || !asyncReturnSessionId
+      || waitForFinalOutput
+      || options.dryRun === true
+    ) {
+      return {
+        ok: false, status: 400,
+        body: {
+          ok: false, errorCode: 'bad_request',
+          error: 'options.turnIdempotencyKey is only supported for a follow-up async turn on an existing session (target.kind=turn, target.sessionId set, options.asyncReturnSessionId=true, no waitForFinalOutput/dryRun)',
+        },
+      };
+    }
   }
   return { ok: true, request: raw as unknown as TriggerRequest };
 }

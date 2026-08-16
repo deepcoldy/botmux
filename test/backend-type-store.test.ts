@@ -40,11 +40,12 @@ describe('backend-type store', () => {
     return { registry, store };
   }
 
-  it('isEditableBackendType accepts the four backends and rejects junk', async () => {
+  it('isEditableBackendType accepts all five backends and rejects junk', async () => {
     const { store } = await freshModules();
-    for (const v of ['pty', 'tmux', 'herdr', 'zellij']) expect(store.isEditableBackendType(v)).toBe(true);
+    for (const v of ['pty', 'tmux', 'herdr', 'zellij', 'zmx']) expect(store.isEditableBackendType(v)).toBe(true);
     for (const v of ['auto', '', 'foo', null, 3, undefined]) expect(store.isEditableBackendType(v)).toBe(false);
     expect(store.EDITABLE_BACKEND_TYPES).toContain('herdr');
+    expect(store.EDITABLE_BACKEND_TYPES).toContain('zmx');
   });
 
   it('sets a per-bot backend override, round-tripping to disk and registry', async () => {

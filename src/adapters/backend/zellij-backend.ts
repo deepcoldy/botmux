@@ -6,7 +6,8 @@ import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { SessionBackend, SpawnOpts, SessionProbe } from './types.js';
 import { zellijEnv, probeZellijFunctional } from '../../setup/ensure-zellij.js';
-import { resolveUserShell, buildBotmuxEnvAssignments, SHELL_WRAPPER_SCRIPT, shellLaunchArgv } from './tmux-backend.js';
+import { resolveUserShell, buildBotmuxEnvAssignments, shellWrapperScript, shellCommandArgv, shellKindForPath } from './tmux-backend.js';
+import { resolveBotmuxWrapperBinDir } from '../../core/botmux-wrapper.js';
 import { logger } from '../../utils/logger.js';
 
 /**
@@ -120,22 +121,6 @@ export class ZellijBackend implements SessionBackend {
     return probe.sessions.includes(name) ? 'exists' : 'missing';
   }
 
-  /**
-   * Tri-state liveness of the zellij SERVER (not a specific session). Mirrors
-   * TmuxBackend.serverState — see that doc for why 'missing' must be
-   * disambiguated before driving a destructive restore-time close.
-   *
-   *   - 'running' — list-sessions succeeded with ≥1 live session.
-   *   - 'down'    — list-sessions succeeded with ZERO live sessions, i.e. nothing
-   *                 survives (a machine reboot wipes every session at once).
-   *   - 'unknown' — list-sessions failed/timed out (can't tell).
-   */
-  static serverState(): 'running' | 'down' | 'unknown' {
-    const probe = ZellijBackend.probeLiveSessions();
-    if (!probe.ok) return 'unknown';
-    return probe.sessions.length > 0 ? 'running' : 'down';
-  }
-
   /** Kill + purge a session (so no resurrectable corpse accumulates). */
   static killSession(name: string): void {
     try {
@@ -201,20 +186,24 @@ export class ZellijBackend implements SessionBackend {
   // are forwarded verbatim to the focused pane — so every input path collapses
   // to pty.write(), exactly like TmuxBackend.write().
 
-  write(data: string): void {
-    this.process?.write(data);
+  write(data: string): boolean {
+    if (!this.process) return false;
+    this.process.write(data);
+    return true;
   }
 
   /** Literal text, no Enter. */
-  sendText(text: string): void {
-    this.process?.write(text);
+  sendText(text: string): boolean {
+    return this.write(text);
   }
 
   /** Special keys by tmux-style name (Enter, Escape, C-c, M-Enter, …). */
-  sendSpecialKeys(...keys: string[]): void {
+  sendSpecialKeys(...keys: string[]): boolean {
+    if (!this.process) return false;
     for (const key of keys) {
-      this.process?.write(tmuxKeyToBytes(key));
+      this.process.write(tmuxKeyToBytes(key));
     }
+    return true;
   }
 
   /** Bracketed paste: wrap with \e[200~ … \e[201~ so TUIs (CoCo/Ink/Codex)
@@ -309,25 +298,18 @@ export function kdlString(s: string): string {
  * / mise shims load from rcfiles). Command + args go in via execvp semantics —
  * no shell-quoting needed (KDL strings carry spaces/quotes), only KDL escaping.
  *
- *   pane command="<shell>" close_on_exit=true {
- *       args "<flag>"… "-c" "<script>" "_" "<cwd>" "KEY=VAL"… "<bin>" "<arg>"…
- *   }
+ * POSIX shell layouts keep the `-c <script> _ <cwd>...` contract; fish
+ * layouts omit the `_` sentinel because fish exposes post-script args as $argv.
  */
 export function buildLayoutString(bin: string, args: string[], opts: SpawnOpts): string {
   const shellSpec = resolveUserShell(process.env, opts.launchShell);
   const envAssignments = buildBotmuxEnvAssignments(opts.env, opts.injectEnv);
-  // shellLaunchArgv() returns ['/usr/bin/env', 'DISABLE_AUTO_UPDATE=true',
-  // shell, ...flags] — the env(1) prefix sets the startup-only override BEFORE
-  // rcfile load so oh-my-zsh update prompts don't block shell startup. The
-  // wrapper removes it before execing the CLI. The first element is the pane
-  // command; the rest are leading args before the wrapper script flags.
-  const [cmd, ...launchArgs] = shellLaunchArgv(shellSpec.shell, shellSpec.flags);
-  const paneArgs = [
-    ...launchArgs, '-c', SHELL_WRAPPER_SCRIPT, '_',
+  const kind = shellKindForPath(shellSpec.shell);
+  const [cmd, ...paneArgs] = shellCommandArgv(shellSpec, shellWrapperScript(resolveBotmuxWrapperBinDir(opts.env ?? process.env), kind), [
     opts.cwd,
     ...envAssignments,
     bin, ...args,
-  ];
+  ]);
   const argsKdl = paneArgs.map(kdlString).join(' ');
   return [
     'layout {',

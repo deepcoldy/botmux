@@ -6,6 +6,7 @@ import { getBot } from '../bot-registry.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import type { CliId } from '../adapters/cli/types.js';
 import { buildWrappedLaunch, decorateResumeForWrapper, parseWrapperCli } from '../setup/cli-selection.js';
+import { stripPm2GracefulExitMarker } from '../pm2-graceful-exit.js';
 
 type LocalTerminalBackend = 'cli' | 'app';
 
@@ -67,7 +68,7 @@ function isCodexFamily(cliId: string): boolean {
 function defaultLocalExecutable(cliId: CliId, adapterResolvedBin: string, cliPathOverride?: string): string | null {
   if (cliPathOverride?.trim()) return cliPathOverride.trim();
   if (cliId === 'codex-app') return 'codex';
-  if (cliId === 'mira') return null;
+  if (cliId === 'mira' || cliId === 'dsh') return null;
   if (cliId === 'mir') return 'mircli';
   return adapterResolvedBin;
 }
@@ -146,7 +147,15 @@ export function localCliCommandForSession(ds: DaemonSession): LocalCliCommandRes
 
 function spawnDetached(command: string, args: string[]): { ok: true } | { ok: false; error: string } {
   try {
-    const child = spawn(command, args, { detached: true, stdio: 'ignore' });
+    // Strip the daemon's graceful-exit sentinel: the launched terminal runs a
+    // login shell → local AI CLI that could itself start a foreground botmux,
+    // which would then exit 90 on a clean stop (a supervisor reads that as a
+    // crash). Only the PM2-managed cores may carry the marker.
+    const child = spawn(command, args, {
+      detached: true,
+      stdio: 'ignore',
+      env: stripPm2GracefulExitMarker(process.env),
+    });
     child.unref();
     return { ok: true };
   } catch (err) {

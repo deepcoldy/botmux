@@ -1,12 +1,40 @@
 import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
 import {
+  applySessionOwnerEnv,
+  BOTMUX_INJECTED_ENV_KEYS,
   CLAUDE_SESSION_MARKER_ENV_KEYS,
   redactChildEnv,
+  REDACTED_CHILD_ENV_KEYS,
   scrubClaudeSessionMarkerEnv,
   scrubSessionCliHomeEnv,
+  scrubWorkflowWorkerEnv,
   SESSION_CLI_HOME_ENV_KEYS,
+  WORKFLOW_WORKER_ENV_KEYS,
 } from '../src/utils/child-env.js';
+import { PM2_GRACEFUL_EXIT_CODE_ENV } from '../src/pm2-graceful-exit.js';
+import { GOAL_ENV } from '../src/workflows/v3/contract.js';
+
+describe('applySessionOwnerEnv()', () => {
+  it('injects both the public contract and legacy owner names', () => {
+    const env: NodeJS.ProcessEnv = {};
+    applySessionOwnerEnv(env, 'ou_owner');
+    expect(env).toMatchObject({
+      BOTMUX_OWNER_OPEN_ID: 'ou_owner',
+      __OWNER_OPEN_ID: 'ou_owner',
+    });
+  });
+
+  it('removes inherited owner names when the session has no owner', () => {
+    const env: NodeJS.ProcessEnv = {
+      BOTMUX_OWNER_OPEN_ID: 'ou_stale',
+      __OWNER_OPEN_ID: 'ou_stale',
+    };
+    applySessionOwnerEnv(env, undefined);
+    expect(env).not.toHaveProperty('BOTMUX_OWNER_OPEN_ID');
+    expect(env).not.toHaveProperty('__OWNER_OPEN_ID');
+  });
+});
 
 describe('redactChildEnv()', () => {
   it('truly removes leaked keys — absent, not present-with-"undefined"', () => {
@@ -63,6 +91,28 @@ describe('redactChildEnv()', () => {
     expect(out.KEEP).toBe('v');
   });
 
+  it('removes the PM2 graceful-exit sentinel so a foreground CLI child exits 0, not 90', () => {
+    // pm2 bakes BOTMUX_PM2_GRACEFUL_EXIT_CODE=90 into the daemon env so ONLY the
+    // daemon/dashboard cores exit with the sentinel on graceful stop. Left in a
+    // session's CLI-child env, a foreground `botmux serve --api-only` / `daemon`
+    // launched from inside that session would exit 90 on a clean Ctrl+C
+    // (gracefulProcessExitCode reads this key) — a supervisor reads non-zero as
+    // a crash. redactChildEnv must strip it at the child boundary.
+    const out = redactChildEnv({
+      [PM2_GRACEFUL_EXIT_CODE_ENV]: '90',
+      KEEP: 'v',
+    });
+    expect(PM2_GRACEFUL_EXIT_CODE_ENV in out).toBe(false);
+    expect(out.KEEP).toBe('v');
+  });
+
+  it('pins the redacted sentinel key to PM2_GRACEFUL_EXIT_CODE_ENV (drift guard)', () => {
+    // The key is a string literal in REDACTED_CHILD_ENV_KEYS (matching its
+    // neighbors) rather than an import, so guard against the two definitions
+    // drifting apart if the env var is ever renamed.
+    expect(REDACTED_CHILD_ENV_KEYS).toContain(PM2_GRACEFUL_EXIT_CODE_ENV);
+  });
+
   it('real node-pty child does NOT inherit a redacted var (not the string "undefined")', async () => {
     // End-to-end guard for the actual leak vector Codex found: a spawned child
     // must see the redacted var as genuinely UNSET. `${VAR+x}` expands to empty
@@ -70,11 +120,16 @@ describe('redactChildEnv()', () => {
     // 'undefined'". Run against the real bundled node-pty + /bin/sh.
     const pty = await import('node-pty');
     const prev = process.env.LARK_APP_ID;
+    const prevSentinel = process.env[PM2_GRACEFUL_EXIT_CODE_ENV];
     process.env.LARK_APP_ID = 'cli_parent_must_not_leak';
+    // Simulate a PM2-managed daemon's env carrying the graceful-exit sentinel,
+    // which must not survive into the forked CLI child.
+    process.env[PM2_GRACEFUL_EXIT_CODE_ENV] = '90';
     try {
       const env = redactChildEnv(process.env) as { [k: string]: string };
       const script =
-        'if [ -z "${LARK_APP_ID+x}" ]; then echo "R=UNSET"; else echo "R=SET[$LARK_APP_ID]"; fi';
+        'if [ -z "${LARK_APP_ID+x}" ]; then echo "R=UNSET"; else echo "R=SET[$LARK_APP_ID]"; fi; ' +
+        `if [ -z "\${${PM2_GRACEFUL_EXIT_CODE_ENV}+x}" ]; then echo "S=UNSET"; else echo "S=SET[\$${PM2_GRACEFUL_EXIT_CODE_ENV}]"; fi`;
       const out: string = await new Promise((resolve) => {
         const p = pty.spawn('/bin/sh', ['-c', script], {
           name: 'xterm-256color', cols: 80, rows: 24, cwd: '/tmp', env,
@@ -84,10 +139,13 @@ describe('redactChildEnv()', () => {
         p.onExit(() => resolve(buf));
       });
       expect(out).toContain('R=UNSET');
+      expect(out).toContain('S=UNSET');
       expect(out).not.toContain('undefined');
     } finally {
       if (prev === undefined) delete process.env.LARK_APP_ID;
       else process.env.LARK_APP_ID = prev;
+      if (prevSentinel === undefined) delete process.env[PM2_GRACEFUL_EXIT_CODE_ENV];
+      else process.env[PM2_GRACEFUL_EXIT_CODE_ENV] = prevSentinel;
     }
   });
 });
@@ -151,6 +209,31 @@ describe('scrubClaudeSessionMarkerEnv()', () => {
   });
 });
 
+describe('scrubWorkflowWorkerEnv()', () => {
+  it('removes the complete workflow and goal identity in place', () => {
+    const env: NodeJS.ProcessEnv = {
+      ...Object.fromEntries(WORKFLOW_WORKER_ENV_KEYS.map((key) => [key, 'leaked'])),
+      BOTMUX_WORKFLOW_RUNS_DIR: '/shared/workflow-runs',
+      KEEP: 'v',
+    };
+
+    scrubWorkflowWorkerEnv(env);
+
+    for (const key of WORKFLOW_WORKER_ENV_KEYS) {
+      expect(key in env, key).toBe(false);
+    }
+    // Global workflow storage configuration is not a node-worker identity.
+    expect(env.BOTMUX_WORKFLOW_RUNS_DIR).toBe('/shared/workflow-runs');
+    expect(env.KEEP).toBe('v');
+  });
+
+  it('covers the canonical goal contract without drifting', () => {
+    for (const key of Object.values(GOAL_ENV)) {
+      expect(WORKFLOW_WORKER_ENV_KEYS).toContain(key);
+    }
+  });
+});
+
 describe('session CLI home scrub call sites', () => {
   // The scrub only works if every process boundary actually invokes it. These
   // source-level pins keep a refactor from silently dropping a boundary:
@@ -183,5 +266,53 @@ describe('session CLI home scrub call sites', () => {
     expect(fn.slice(0, fn.indexOf('\n}'))).toContain('scrubClaudeSessionMarkerEnv(');
     expect(read('index-daemon.ts')).toContain('scrubClaudeSessionMarkerEnv(process.env)');
     expect(read('worker.ts')).toContain('scrubClaudeSessionMarkerEnv(process.env)');
+  });
+
+  it('injects the canonical session owner at every worker execution boundary', () => {
+    const worker = read('worker.ts');
+    expect(worker).toContain('applySessionOwnerEnv(process.env, msg.ownerOpenId)');
+    expect(worker).toContain('applySessionOwnerEnv(childEnv, cfg.ownerOpenId)');
+    expect(worker).toContain('applySessionOwnerEnv(engineEnv, cfg.ownerOpenId)');
+    expect(worker).toContain('applySessionOwnerEnv(mergedEnv, cfg.ownerOpenId)');
+  });
+
+  it('pm2, daemon, and dashboard boot scrub workflow identity without scrubbing real worker boot', () => {
+    const cli = read('cli.ts');
+    const fn = cli.slice(cli.indexOf('function pm2Env('));
+    expect(fn.slice(0, fn.indexOf('\n}'))).toContain('scrubWorkflowWorkerEnv(');
+    expect(read('index-daemon.ts')).toContain('scrubWorkflowWorkerEnv(process.env)');
+    const dashboard = read('dashboard.ts');
+    const scrubAt = dashboard.indexOf('scrubWorkflowWorkerEnv(process.env)');
+    expect(scrubAt).toBeGreaterThan(-1);
+    expect(scrubAt).toBeLessThan(dashboard.indexOf('function spawnStartBotLive('));
+    expect(scrubAt).toBeLessThan(dashboard.indexOf('function spawnStopBotLive('));
+    expect(read('worker.ts')).not.toContain('scrubWorkflowWorkerEnv(process.env)');
+  });
+
+  it('worker-pool strips the PM2 sentinel when forking a worker (source pin)', () => {
+    // WORKER_REDACTED_ENV_KEYS is a private const in worker-pool.ts (worker fork
+    // boundary, not importable without side effects), so pin at the source that
+    // the sentinel is in the strip list. redactChildEnv covers the CLI child;
+    // this covers the worker process itself so it also never exits 90.
+    const src = read('core/worker-pool.ts');
+    const decl = src.slice(src.indexOf('const WORKER_REDACTED_ENV_KEYS'));
+    expect(decl.slice(0, decl.indexOf('\n'))).toContain(PM2_GRACEFUL_EXIT_CODE_ENV);
+  });
+});
+
+// ─── read-isolation markers must reach the child ──────────────────────────
+
+/**
+ * Regression guard (2026-08-03): the sandbox bots.json fix hinges on the worker
+ * telling the CLI it is isolated. buildBotmuxEnvAssignments() forwards ONLY the
+ * keys in BOTMUX_INJECTED_ENV_KEYS, so leaving these out silently strips them on
+ * the tmux backend — the fix would compile, pass every unit test, and do nothing
+ * on a real machine. (Three review rounds did not catch this; the allowlist is
+ * the kind of coupling that is invisible from the call site.)
+ */
+describe('BOTMUX_INJECTED_ENV_KEYS carries the read-isolation markers', () => {
+  it('includes BOTMUX_READ_ISOLATION and BOTMUX_API_ONLY', () => {
+    expect(BOTMUX_INJECTED_ENV_KEYS).toContain('BOTMUX_READ_ISOLATION');
+    expect(BOTMUX_INJECTED_ENV_KEYS).toContain('BOTMUX_API_ONLY');
   });
 });

@@ -10,7 +10,7 @@
  * chat) rather than relayed to the CLI. Used both for routing and to reject
  * `customPassthroughCommands` entries that would shadow a daemon command.
  */
-export const DAEMON_COMMANDS = new Set(['/close', '/restart', '/status', '/help', '/cd', '/repo', '/rename', '/schedule', '/role', '/botconfig', '/skills', '/pair', '/login', '/adopt', '/detach', '/disconnect', '/oncall', '/group', '/g', '/relay', '/card', '/term', '/list-slash-command', '/slash', '/subscribe-lark-doc', '/watch-comment', '/vc', '/insight', '/dashboard', '/vc-auth']);
+export const DAEMON_COMMANDS = new Set(['/close', '/restart', '/status', '/help', '/cd', '/repo', '/rename', '/schedule', '/role', '/botconfig', '/skills', '/pair', '/login', '/adopt', '/detach', '/disconnect', '/oncall', '/group', '/g', '/relay', '/fork', '/forklist', '/card', '/term', '/list-slash-command', '/slash', '/subscribe-lark-doc', '/watch-comment', '/vc', '/insight', '/dashboard', '/vc-auth', '/issue']);
 
 /**
  * Slash commands that are forwarded verbatim to the underlying CLI (e.g.
@@ -27,6 +27,31 @@ export const PASSTHROUGH_COMMANDS = new Set([
   '/code-review', '/security-review', '/review',
   // Codex：/btw 向当前会话追加一条旁注/引导消息
   '/btw',
+  // 推理强度调档。放全局（而非某个 adapter 的 defaultPassthroughCommands）是刻意的：
+  //   ① 这里的命令本就是「尽力透传」——/plugin /mcp /btw 也并非所有 CLI 都支持，
+  //      CLI 认得就生效、认不得顶多回一句 unknown-command（不崩溃 / 不损坏 / 不泄露）。
+  //      Claude Code(2.1.220+) / Seed / Relay 原生支持 /effort。Codex 的 effort
+  //      通过 model_reasoning_effort / 原生模型菜单设置，不依赖此命令；误透传只会
+  //      得到 unknown-command，不会改写 Codex 配置。
+  //   ② 全局集合刻意不带「空 topic 冷启动」能力（那只认 adapter 层的
+  //      defaultPassthroughCommands，见 isInitialSessionPassthrough）——/effort 是
+  //      「调档」而非「开一段工作」的命令，空话题里单发 /effort 不应凭空拉起会话。
+  //      对照 /goal（开启目标工作）仍留在 adapter 层，保留其冷启动语义。
+  '/effort',
+  // Codex 原生 /fast 切换 service_tier。放全局 passthrough（同 /effort，非 adapter
+  // 冷启动层）：botmux 不接管,只把命令透传给 Codex 让它自己切档,卡片只读展示当前
+  // 档位徽标。刻意不进 adapter defaultPassthroughCommands —— owner 政策是空话题里
+  // 单发 /fast 不该凭空拉起会话（它是「调档」非「开一段工作」）。别的 CLI 认不得
+  // 顶多回 unknown-command,不崩溃 / 不泄露。
+  //
+  // ⚠️ 能力边界（只对原生 paste TUI 成立）：passthrough 是往 CLI 敲字（PTY write）。
+  // Codex RPC 模式的 pane 是纯 viewer、无 terminal input（turn 走 JSON-RPC）,
+  // /fast 敲进去到不了 app-server;codex+Riff 后端把文本+回车当两次远端 task。这两
+  // 种形态下 /fast 不会真正切档,徽标也只反映 rollout 实际记录（RPC app-server 仍写
+  // rollout;Riff 无 rollout/tier 概念,tracker 只在 structuredBridgeIsCodex 且有
+  // rollout 时 bind,天然 fail-closed 不显示徽标）。此处仅登记 passthrough 语义,不
+  // 声称在非 paste 形态下能切档。
+  '/fast',
 ]);
 
 /**

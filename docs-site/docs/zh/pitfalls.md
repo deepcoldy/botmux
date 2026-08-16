@@ -13,8 +13,8 @@
 
 ## 环境变量丢失（高频）
 
-- **bash 用户把变量写在 `.bash_profile` 拿不到**：新 worker 用 `bash -i` 启动，`bash -i` 只读 `.bashrc`。→ 在 `.bashrc` 里 `source ~/.bash_profile`，或直接把变量写进 `.bashrc`（zsh 用户写 `.zshrc`）。这是 `API Error 403` / 网关 token 报错的常见根因。
-- **root 下 Claude 拒绝 `--dangerously-skip-permissions`**：报 "cannot be used with root/sudo privileges"。→ `export IS_SANDBOX=1`（zsh 写 `.zshrc`、bash 写 `.bashrc`；PM2 / systemd / Docker 场景配在对应启动环境）。新版已自动对 root 场景注入。
+- **bash 用户把变量写在 `.bash_profile` 拿不到**：新 worker 用 `bash -i` 启动，`bash -i` 只读 `.bashrc`。→ 在 `.bashrc` 里 `source ~/.bash_profile`，或直接把变量写进 `.bashrc`（zsh 用户写 `.zshrc`，fish 用户写 `~/.config/fish/config.fish`）。这是 `API Error 403` / 网关 token 报错的常见根因。
+- **root 下 Claude 拒绝 `--dangerously-skip-permissions`**：报 "cannot be used with root/sudo privileges"。→ `export IS_SANDBOX=1`（zsh 写 `.zshrc`、bash 写 `.bashrc`、fish 写 `~/.config/fish/config.fish`；PM2 / systemd / Docker 场景配在对应启动环境）。新版已自动对 root 场景注入。
 
 ## 自定义 wrapper / 网关接入
 
@@ -47,7 +47,7 @@
 
 ## Dashboard / 安全
 
-- **别把带 token 的 dashboard URL 发到群里**（等于公开临时访问凭证）。安全敏感场景把 host 绑本机：`BOTMUX_DASHBOARD_HOST=127.0.0.1`。token 一次性，每跑一次 `botmux dashboard` 重新生成、旧链接立即失效。
+- **别把带 token 的 dashboard URL 发到群里**（等于公开临时访问凭证）。安全敏感场景把 host 绑本机：`BOTMUX_DASHBOARD_HOST=127.0.0.1`。token 是轮换式而非单次消费：轮换前同一 URL 可重复使用；只有 `botmux dashboard rotate` 会生成新 token、让旧链接立即失效，裸命令和 `botmux dashboard current` 都不会轮换。
 - **dashboard 打不开**：先 `curl http://<host>:<port>/__health`，返回 `{"ok":true}` 说明服务正常；问题多在浏览器代理 / host 不对（mac 连内网 IP 会变）/ 打开了旧 token 链接。
 
 ## 排查通用手法

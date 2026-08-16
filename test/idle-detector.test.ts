@@ -10,12 +10,17 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { IdleDetector } from '../src/utils/idle-detector.js';
 import type { CliAdapter } from '../src/adapters/cli/types.js';
 import { createCocoAdapter } from '../src/adapters/cli/coco.js';
+import { createGeniusAdapter } from '../src/adapters/cli/genius.js';
+import { createGrokAdapter } from '../src/adapters/cli/grok.js';
+import { createPiAdapter } from '../src/adapters/cli/pi.js';
 
 // ─── Helpers ──────────────────────────────────────────────────────────────
 
 /** Build a minimal CliAdapter stub with the given patterns. */
 function makeCli(opts: {
   completionPattern?: RegExp;
+  busyPattern?: RegExp;
+  idleToBusyPattern?: RegExp;
   readyPattern?: RegExp;
 } = {}): CliAdapter {
   return {
@@ -24,6 +29,8 @@ function makeCli(opts: {
     buildArgs: () => [],
     writeInput: async () => {},
     completionPattern: opts.completionPattern,
+    busyPattern: opts.busyPattern,
+    idleToBusyPattern: opts.idleToBusyPattern,
     readyPattern: opts.readyPattern,
     systemHints: [],
     altScreen: false,
@@ -82,6 +89,88 @@ describe('IdleDetector: onIdle()', () => {
     // No callback registered, should not throw
     detector.feed('some output');
     vi.advanceTimersByTime(10000);
+    detector.dispose();
+  });
+});
+
+// ─── onBusy callback ──────────────────────────────────────────────────────
+
+describe('IdleDetector: onBusy()', () => {
+  const idleToBusyPattern = /Working[^\r\n]{0,160}esc to interrupt/i;
+
+  it('fires once when an explicit busy marker follows idle, but ignores an ordinary redraw', () => {
+    const detector = new IdleDetector(makeCli({ idleToBusyPattern }));
+    const cb = vi.fn();
+    detector.onBusy(cb);
+
+    detector.fireIdle();
+    detector.feed('\x1b[2K› Ask anything');
+    expect(cb).not.toHaveBeenCalled();
+
+    detector.feed('\x1b[2K• Working (3s • esc to interrupt)');
+    detector.feed('• Working (4s • esc to interrupt)');
+    expect(cb).toHaveBeenCalledTimes(1);
+    detector.dispose();
+  });
+
+  it('matches a busy marker split across chunks and re-arms after the next idle', () => {
+    const detector = new IdleDetector(makeCli({ idleToBusyPattern }));
+    const cb = vi.fn();
+    detector.onBusy(cb);
+
+    detector.fireIdle();
+    detector.feed('Wor');
+    detector.feed('king (12s • esc to inter');
+    detector.feed('rupt)');
+    expect(cb).toHaveBeenCalledTimes(1);
+
+    detector.fireIdle();
+    detector.feed('• Working (1s • esc to interrupt)');
+    expect(cb).toHaveBeenCalledTimes(2);
+    detector.dispose();
+  });
+
+  it.each(['reset', 'resetReadyEvidence'] as const)(
+    'does not report busy after %s without a new idle',
+    (method) => {
+      const detector = new IdleDetector(makeCli({ idleToBusyPattern }));
+      const cb = vi.fn();
+      detector.onBusy(cb);
+
+      detector.fireIdle();
+      detector[method]();
+      detector.feed('• Working (1s • esc to interrupt)');
+      expect(cb).not.toHaveBeenCalled();
+      detector.dispose();
+    },
+  );
+
+  it.each([
+    {
+      name: 'Pi',
+      cli: createPiAdapter('/bin/pi'),
+      redraw: '\x1b[2JWorking... on it',
+    },
+    {
+      name: 'Genius',
+      cli: createGeniusAdapter('/bin/genius'),
+      redraw: '\x1b[2JThe previous screen said esc to interrupt while it was running.',
+    },
+    {
+      name: 'Grok',
+      cli: createGrokAdapter('/bin/grok'),
+      redraw: '\x1b[2JThe previous help bar showed Ctrl+c: cancel.',
+    },
+  ])('does not promote a $name transcript redraw through legacy busyPattern', ({ cli, redraw }) => {
+    expect(cli.busyPattern?.test(redraw)).toBe(true);
+
+    const detector = new IdleDetector(cli);
+    const cb = vi.fn();
+    detector.onBusy(cb);
+
+    detector.fireIdle();
+    detector.feed(redraw);
+    expect(cb).not.toHaveBeenCalled();
     detector.dispose();
   });
 });
@@ -180,6 +269,18 @@ describe('IdleDetector: quiescence detection', () => {
 
     // Advance past spinner guard (3000ms) + buffer (200ms)
     vi.advanceTimersByTime(3500);
+    expect(cb).toHaveBeenCalledTimes(1);
+    detector.dispose();
+  });
+
+  it('still reports quiescence after static busy output', () => {
+    const detector = new IdleDetector(makeCli({ busyPattern: /Working\.\.\./ }));
+    const cb = vi.fn();
+    detector.onIdle(cb);
+
+    detector.feed('Tool 3.3s\nWorking...');
+    vi.advanceTimersByTime(10_000);
+
     expect(cb).toHaveBeenCalledTimes(1);
     detector.dispose();
   });

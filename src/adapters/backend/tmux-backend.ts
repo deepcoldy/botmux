@@ -8,6 +8,7 @@ import { BOTMUX_INJECTED_ENV_KEYS, PROXY_ENV_KEYS, REDACTED_CHILD_ENV_KEYS } fro
 import { sanitizePerBotEnv } from '../../core/per-bot-env.js';
 import { logger } from '../../utils/logger.js';
 import { isExecutable } from '../../utils/executable.js';
+import { resolveBotmuxWrapperBinDir } from '../../core/botmux-wrapper.js';
 
 /**
  * `unset KEY KEY ...` clause spliced into the shell wrapper before exec. The
@@ -23,6 +24,7 @@ const PANE_ENV_UNSET_KEYS = [...new Set([
   ...BOTMUX_INJECTED_ENV_KEYS,
 ])];
 const PANE_ENV_UNSET_CLAUSE = `unset ${PANE_ENV_UNSET_KEYS.join(' ')}`;
+const FISH_PANE_ENV_UNSET_CLAUSE = `set -e ${PANE_ENV_UNSET_KEYS.join(' ')}`;
 
 /** Guard so the fallback self-heal runs at most once in this worker process. */
 let serverGlobalEnvScrubbed = false;
@@ -98,20 +100,19 @@ export class TmuxBackend implements SessionBackend {
    * Tri-state existence probe. `tmux has-session` exits 0 when the session
    * exists and exits 1 (clean status, no signal) when the server answered but
    * the session is absent — INCLUDING "no server running". Both collapse to
-   * 'missing' here. The caller MUST disambiguate before treating 'missing' as a
-   * destructive signal: a single gone pane (server still up) is a true zombie,
-   * but "no server running" means the *whole* server died (e.g. machine reboot)
-   * and every pane vanished at once — those sessions are still resumable from
-   * the CLI transcript on disk. Use `serverState()` to tell the two apart (the
-   * restore path does exactly this). Anything else — a timeout (signal/killed)
-   * or a spawn failure (binary not on PATH → ENOENT, not executable → EACCES;
-   * neither carries a numeric exit status) — means we never got an answer →
-   * 'unknown', so a flaky/unavailable tmux can't be mistaken for a gone session.
+   * 'missing' here. 'missing' is NOT a destructive signal on restore: whether a
+   * single pane died (solo crash) or the whole server is gone (machine reboot),
+   * the CLI transcript on disk is still resumable, so restore keeps the session
+   * active and cold-resumes it on the next message (see restoreActiveSessions).
+   * Anything else — a timeout (signal/killed) or a spawn failure (binary not on
+   * PATH → ENOENT, not executable → EACCES; neither carries a numeric exit
+   * status) — means we never got an answer → 'unknown', so a flaky/unavailable
+   * tmux can't be mistaken for a gone session either.
    *
    * Uses execFileSync (NOT a shell string): running tmux directly keeps a
    * missing/unrunnable binary as ENOENT/EACCES. A shell would instead surface
    * those as its own clean exits 127/126, which this classifier would wrongly
-   * read as 'missing' and then drive a destructive restore-time close.
+   * read as 'missing'.
    */
   static probeSession(name: string): SessionProbe {
     try {
@@ -119,35 +120,6 @@ export class TmuxBackend implements SessionBackend {
       return 'exists';
     } catch (e: any) {
       if (e && typeof e.status === 'number' && !e.signal) return 'missing';
-      return 'unknown';
-    }
-  }
-
-  /**
-   * Tri-state liveness of the tmux SERVER itself (not a specific session).
-   *
-   *   - 'running' — `tmux list-sessions` exited 0, so the server is up with ≥1
-   *                 session. (A tmux server with zero sessions doesn't exist —
-   *                 it self-terminates when its last session closes — so exit 0
-   *                 is an authoritative "server alive".)
-   *   - 'down'    — clean non-zero exit (no signal): "no server running on …".
-   *                 Every pane the server held is gone *at once*.
-   *   - 'unknown' — timeout / signal / spawn failure (ENOENT/EACCES): no answer.
-   *
-   * Why this matters: `probeSession` returns 'missing' BOTH when the server is
-   * up but one session is gone AND when the whole server is down (machine
-   * reboot). Those are very different — a reboot wipes every bmx-* pane
-   * simultaneously, but the CLI transcripts on disk are still resumable. The
-   * restore path uses this to avoid mass-closing every session on the first
-   * boot after a reboot (which would otherwise read each pane as an
-   * authoritative 'missing' zombie and tear it down).
-   */
-  static serverState(): 'running' | 'down' | 'unknown' {
-    try {
-      execFileSync('tmux', ['list-sessions'], { stdio: 'ignore', env: tmuxEnv(), timeout: 3000 });
-      return 'running';
-    } catch (e: any) {
-      if (e && typeof e.status === 'number' && !e.signal) return 'down';
       return 'unknown';
     }
   }
@@ -216,6 +188,7 @@ export class TmuxBackend implements SessionBackend {
     try {
       TmuxBackend.killSession(name);
       const shellSpec = resolveUserShell();
+      const shellKind = shellKindForPath(shellSpec.shell);
       execFileSync('tmux', [
         'new-session',
         '-d',
@@ -223,10 +196,11 @@ export class TmuxBackend implements SessionBackend {
         '-x', String(opts.cols),
         '-y', String(opts.rows),
         '--',
-        shellSpec.shell, ...shellSpec.flags, '-c', DIAGNOSTIC_SHELL_SCRIPT, '_',
-        opts.cwd,
-        opts.contentPath,
-        shellSpec.shell,
+        ...shellCommandArgv(shellSpec, diagnosticShellScript(shellKind), [
+          opts.cwd,
+          opts.contentPath,
+          shellSpec.shell,
+        ]),
       ], {
         stdio: 'ignore',
         cwd: opts.cwd,
@@ -277,32 +251,25 @@ export class TmuxBackend implements SessionBackend {
       //
       // Shape:
       //   tmux new-session -- /usr/bin/env DISABLE_AUTO_UPDATE=true
-      //     <shell> <shellFlags> -c <SCRIPT> _ <cwd> KEY=VAL... bin args...
+      //     <shell> <shellFlags> -c <SCRIPT> [POSIX: _] <cwd> KEY=VAL... bin args...
       //
       //   - The env(1) prefix makes DISABLE_AUTO_UPDATE visible while the
       //     shell loads its rcfile, then SCRIPT unsets it before execing the
       //     CLI. This prevents oh-my-zsh's update prompt without changing the
       //     final CLI environment or running an unattended update.
       //   - <shell> + <shellFlags> come from resolveUserShell() and are
-      //     bash/zsh/sh-specific (bash needs `-i` for .bashrc; zsh needs
-      //     `-l -i` for .zprofile + .zshrc). fish/csh/nu are remapped to a
-      //     POSIX fallback because our SCRIPT is POSIX-syntax.
-      //   - SCRIPT = `cd -- "$1" && shift && unset <managed> && exec /usr/bin/env "$@"`:
-      //       * `cd -- "$1"` returns to the session's intended cwd even if
-      //         the rcfile changed directory mid-load (.zshrc/.bashrc with
-      //         a `cd ~/work` left in by mistake stays in opts.cwd).
-      //       * `unset <managed>`: the new pane inherits the tmux *server's*
-      //         global env, which the client env can't override. Clear every
-      //         botmux-owned key before this pane's values are re-injected.
-      //       * `exec /usr/bin/env "$@"`: env(1) parses the leading KEY=VAL
-      //         pairs in argv as overrides for the child process. This lands
-      //         AFTER rcfile load, so botmux's per-session values (e.g.
-      //         BOTMUX_LARK_APP_ID, SESSION_DATA_DIR) win over same-named
-      //         exports left in the user's .zshrc. Bare LARK_APP_* are NOT in
-      //         the inject list — they're unset above, never re-added.
-      //   - `_` is the $0 placeholder; the remaining argv items are seen as
-      //     "$@" by the shell, so spaces / quotes / `$` / newlines in cwd,
-      //     env values, or args never need shell-escaping.
+      //     shell-kind-specific (bash needs `-i`; zsh needs `-l -i`;
+      //     fish needs `-i`; POSIX sh uses no flags).
+      //   - SCRIPT is shell-kind-aware:
+      //       * POSIX: `cd -- "$1" && shift && unset <managed> && exec /usr/bin/env "$@"`.
+      //       * fish: `cd -- $argv[1]; set -e argv[1]; set -e <managed>; exec /usr/bin/env $argv`.
+      //     Both return to the session's intended cwd even if the rcfile changed
+      //     directory mid-load, clear inherited tmux server-global botmux keys,
+      //     and inject this pane's KEY=VAL values only after rcfile startup.
+      //   - POSIX shells require `_` as the $0 placeholder before cwd; fish sees
+      //     argv directly and must omit that sentinel. In both contracts, spaces /
+      //     quotes / `$` / newlines in cwd, env values, or args never need shell
+      //     escaping because they travel as argv elements.
       //   - tmux's own `-e KEY=VAL` is deliberately NOT used: it sets the
       //     session env (visible to the shell), which means the user's rcfile
       //     could `unset` or `export` over it before the CLI sees it. env(1)
@@ -316,9 +283,15 @@ export class TmuxBackend implements SessionBackend {
       // can't see the child-vs-exec distinction), so don't send messages
       // through the bot while in this mode — type into the web terminal directly.
       const debugKeepShell = process.env.BOTMUX_DEBUG_KEEP_SHELL === '1';
+      // Host-resolve the wrapper bin dir from opts.env (BOTMUX_CORE_ONLY /
+      // SESSION_DATA_DIR are scrubbed inside the pane before the script runs, so it
+      // MUST be baked in host-side — codex P1). opts.env is the authoritative
+      // per-session env the daemon assembled, not the scrubbed pane env.
+      const wrapperBinDir = resolveBotmuxWrapperBinDir(opts.env ?? process.env);
+      const shellKind = shellKindForPath(shellSpec.shell);
       const script = debugKeepShell
-        ? buildDebugKeepShellScript(shellSpec.shell)
-        : SHELL_WRAPPER_SCRIPT;
+        ? buildDebugKeepShellScript(shellSpec.shell, wrapperBinDir, shellKind)
+        : shellWrapperScript(wrapperBinDir, shellKind);
       if (debugKeepShell) {
         logger.info(
           `[tmux:${this.sessionName}] BOTMUX_DEBUG_KEEP_SHELL=1 — CLI exit will drop ` +
@@ -332,10 +305,11 @@ export class TmuxBackend implements SessionBackend {
         '-x', String(opts.cols),
         '-y', String(opts.rows),
         '--',
-        ...shellLaunchArgv(shellSpec.shell, shellSpec.flags), '-c', script, '_',
-        opts.cwd,
-        ...envAssignments,
-        bin, ...args,
+        ...shellCommandArgv(shellSpec, script, [
+          opts.cwd,
+          ...envAssignments,
+          bin, ...args,
+        ]),
       ];
       this.process = pty.spawn('tmux', tmuxArgs, {
         name: 'xterm-256color',
@@ -370,8 +344,10 @@ export class TmuxBackend implements SessionBackend {
    *  file's cwd field so a recycled PID can't mislead the resolver. */
   cliCwd?: string;
 
-  write(data: string): void {
-    this.process?.write(data);
+  write(data: string): boolean {
+    if (!this.process) return false;
+    this.process.write(data);
+    return true;
   }
 
   /**
@@ -616,11 +592,14 @@ export class TmuxBackend implements SessionBackend {
  */
 export const NON_INTERACTIVE_SHELL_ENV = [
   'DISABLE_AUTO_UPDATE=true',
+  'BOTMUX_MANAGED_SHELL=1',
 ] as const;
 
 /** Remove rcfile-only launch overrides before the managed CLI is exec'd. */
 const NON_INTERACTIVE_SHELL_ENV_UNSET_CLAUSE =
   `unset ${NON_INTERACTIVE_SHELL_ENV.map(assignment => assignment.split('=', 1)[0]).join(' ')}`;
+const FISH_NON_INTERACTIVE_SHELL_ENV_UNSET_CLAUSE =
+  `set -e ${NON_INTERACTIVE_SHELL_ENV.map(assignment => assignment.split('=', 1)[0]).join(' ')}`;
 
 /**
  * Build the argv prefix that launches the user's shell with non-interactive
@@ -637,6 +616,16 @@ const NON_INTERACTIVE_SHELL_ENV_UNSET_CLAUSE =
  */
 export function shellLaunchArgv(shell: string, flags: string[]): string[] {
   return ['/usr/bin/env', ...NON_INTERACTIVE_SHELL_ENV, shell, ...flags];
+}
+
+export function shellCommandArgv(shell: ShellSpec, script: string, argv: readonly string[]): string[] {
+  const kind = shellKindForPath(shell.shell);
+  return [
+    ...shellLaunchArgv(shell.shell, shell.flags),
+    '-c',
+    script,
+    ...(kind === 'fish' ? argv : ['_', ...argv]),
+  ];
 }
 
 /**
@@ -698,10 +687,32 @@ export function buildBotmuxEnvAssignments(
  * The `exec /usr/bin/env` step injects botmux's per-bot/per-session overrides
  * AFTER rcfile load so they can't be shadowed by leftover exports.
  *
- * POSIX-syntax (works in bash/zsh/sh); fish/csh/nu users get remapped to
- * bash/zsh/sh by resolveUserShell() so they hit the same SCRIPT path.
+ * POSIX-syntax by default (works in bash/zsh/sh). Pass `kind: "fish"` for the
+ * fish-native argv/env variant.
+ *
+ * The wrapper bin dir is baked in as a HOST-RESOLVED LITERAL (codex P1): the pane
+ * cannot resolve it at runtime because tmuxEnv + PANE_ENV_UNSET_CLAUSE scrub
+ * BOTMUX_CORE_ONLY / SESSION_DATA_DIR BEFORE this script runs (and the argv env
+ * assignments only land at the final `exec /usr/bin/env`, too late). So the daemon
+ * computes it from opts.env via resolveBotmuxWrapperBinDir and single-quotes it in.
  */
-export const SHELL_WRAPPER_SCRIPT = `cd -- "$1" && shift && ${PANE_ENV_UNSET_CLAUSE} && ${NON_INTERACTIVE_SHELL_ENV_UNSET_CLAUSE} && export PATH="$HOME/.botmux/bin:$PATH" && exec /usr/bin/env "$@"`;
+export function shellWrapperScript(binDir: string, kind: ShellKind = 'sh'): string {
+  if (kind === 'fish') return fishShellWrapperScript(binDir);
+  const q = `'${binDir.replace(/'/g, `'\\''`)}'`;
+  return `cd -- "$1" && shift && ${PANE_ENV_UNSET_CLAUSE} && ${NON_INTERACTIVE_SHELL_ENV_UNSET_CLAUSE} && export PATH=${q}:"$PATH" && exec /usr/bin/env "$@"`;
+}
+
+function fishShellWrapperScript(binDir: string): string {
+  const q = fishSingleQuote(binDir);
+  return [
+    'cd -- $argv[1]; or exit',
+    'set -e argv[1]',
+    FISH_PANE_ENV_UNSET_CLAUSE,
+    FISH_NON_INTERACTIVE_SHELL_ENV_UNSET_CLAUSE,
+    `set -gx PATH ${q} $PATH`,
+    'exec /usr/bin/env $argv',
+  ].join('; ');
+}
 
 export const DIAGNOSTIC_SHELL_SCRIPT = [
   'cd -- "$1" 2>/dev/null || cd "$HOME" 2>/dev/null || cd /',
@@ -712,6 +723,20 @@ export const DIAGNOSTIC_SHELL_SCRIPT = [
   `printf '\\n\\033[1;33m[botmux] Fix the startup error, then send a new message to retry. Type exit to close this diagnostic shell.\\033[0m\\n'`,
   'exec "$3" -i',
 ].join('; ');
+
+export function diagnosticShellScript(kind: ShellKind = 'sh'): string {
+  if (kind !== 'fish') return DIAGNOSTIC_SHELL_SCRIPT;
+  return [
+    'cd -- $argv[1] 2>/dev/null; or cd $HOME 2>/dev/null; or cd /',
+    FISH_PANE_ENV_UNSET_CLAUSE,
+    FISH_NON_INTERACTIVE_SHELL_ENV_UNSET_CLAUSE,
+    'clear',
+    `printf '\\033[1;31m[botmux] Agent CLI exited. Auto-restart is paused and the last terminal output is preserved below.\\033[0m\\n\\n'`,
+    'cat -- $argv[2] 2>/dev/null; or true',
+    `printf '\\n\\033[1;33m[botmux] Fix the startup error, then send a new message to retry. Type exit to close this diagnostic shell.\\033[0m\\n'`,
+    'exec $argv[3] -i',
+  ].join('; ');
+}
 
 /**
  * Debug variant of the wrapper script — same prelude, but the CLI runs as
@@ -724,32 +749,55 @@ export const DIAGNOSTIC_SHELL_SCRIPT = [
  *
  * `shellPath` is single-quoted into the script with `'` escaped, so it's
  * safe for paths containing spaces or quotes. Caller has already verified
- * it via accessSync().
+ * it via accessSync(). `binDir` is the HOST-RESOLVED wrapper bin dir (same
+ * literal-baking rationale as shellWrapperScript — pane can't resolve it).
  */
-export function buildDebugKeepShellScript(shellPath: string): string {
+export function buildDebugKeepShellScript(shellPath: string, binDir: string, kind: ShellKind = 'sh'): string {
+  if (kind === 'fish') return buildFishDebugKeepShellScript(shellPath, binDir);
   const safeShell = shellPath.replace(/'/g, `'\\''`);
+  const qBin = `'${binDir.replace(/'/g, `'\\''`)}'`;
   return [
     'cd -- "$1" && shift',
-    // Same managed-env cleanup as SHELL_WRAPPER_SCRIPT — so neither the CLI nor
+    // Same managed-env cleanup as shellWrapperScript — so neither the CLI nor
     // the interactive debug shell sees stale server/rcfile-owned values.
     PANE_ENV_UNSET_CLAUSE,
     // The pre-rcfile launch override must not reach the CLI or debug shell.
     NON_INTERACTIVE_SHELL_ENV_UNSET_CLAUSE,
-    // Same PATH prepend as SHELL_WRAPPER_SCRIPT (wrapper build wins over stale npm-global).
-    'export PATH="$HOME/.botmux/bin:$PATH"',
+    // Same PATH prepend as shellWrapperScript (wrapper build wins over stale npm-global).
+    `export PATH=${qBin}:"$PATH"`,
     '/usr/bin/env "$@"',
     `printf '\\n[botmux debug] CLI exited (status %d) — interactive shell active. Type exit to close the session.\\n' "$?" >&2`,
     `exec '${safeShell}' -i`,
   ].join('; ');
 }
 
-export type ShellKind = 'bash' | 'zsh' | 'sh';
+function buildFishDebugKeepShellScript(shellPath: string, binDir: string): string {
+  const safeShell = fishSingleQuote(shellPath);
+  const qBin = fishSingleQuote(binDir);
+  return [
+    'cd -- $argv[1]; or exit',
+    'set -e argv[1]',
+    FISH_PANE_ENV_UNSET_CLAUSE,
+    FISH_NON_INTERACTIVE_SHELL_ENV_UNSET_CLAUSE,
+    `set -gx PATH ${qBin} $PATH`,
+    '/usr/bin/env $argv',
+    'set -l botmux_cli_status $status',
+    `printf '\\n[botmux debug] CLI exited (status %d) — interactive shell active. Type exit to close the session.\\n' $botmux_cli_status >&2`,
+    `exec ${safeShell} -i`,
+  ].join('; ');
+}
+
+function fishSingleQuote(value: string): string {
+  return `'${value.replace(/\\/g, '\\\\').replace(/'/g, "\\'")}'`;
+}
+
+export type ShellKind = 'bash' | 'zsh' | 'sh' | 'fish';
 
 export interface ShellSpec {
   /** Absolute path to the shell binary. */
   shell: string;
   /** Rcfile-loading flags (`-i`, `-l -i`, or empty) — caller appends
-   *  `-c <SCRIPT> _ <cwd> KEY=VAL... bin args...` after these. */
+ *  `-c <SCRIPT> ... <cwd> KEY=VAL... bin args...` after these. */
   flags: string[];
 }
 
@@ -760,13 +808,19 @@ export interface ShellSpec {
  *     Plain `-i` loads .bashrc, which is what we want.
  *   - zsh interactive shell loads .zshrc; login loads .zprofile + .zlogin.
  *     Combine `-l -i` so installs in either location surface.
+ *   - fish interactive shell loads config.fish; use `-i`.
  *   - sh has no rcfile we can rely on portably; skip rcfile flags. */
 function specForKind(shell: string, kind: ShellKind): ShellSpec {
-  const flags: string[] = [];
-  if (kind === 'bash') flags.push('-i');
-  else if (kind === 'zsh') flags.push('-l', '-i');
-  // 'sh' adds nothing — POSIX sh has no portable interactive rcfile.
-  return { shell, flags };
+  switch (kind) {
+    case 'bash':
+      return { shell, flags: ['-i'] };
+    case 'zsh':
+      return { shell, flags: ['-l', '-i'] };
+    case 'fish':
+      return { shell, flags: ['-i'] };
+    case 'sh':
+      return { shell, flags: [] };
+  }
 }
 
 function configureTmuxSessionOptions(sessionName: string): void {
@@ -791,13 +845,18 @@ function configureTmuxSessionOptions(sessionName: string): void {
 }
 
 /** Classify a shell binary path by basename. Returns null for shells whose
- *  syntax we don't support (fish, nu, csh, tcsh, ...). */
+ *  syntax we don't support (nu, csh, tcsh, ...). */
 function classifyShell(path: string): ShellKind | null {
   const base = basename(path);
   if (base === 'bash') return 'bash';
   if (base === 'zsh') return 'zsh';
+  if (base === 'fish') return 'fish';
   if (base === 'sh' || base === 'dash' || base === 'ash') return 'sh';
   return null;
+}
+
+export function shellKindForPath(path: string): ShellKind {
+  return classifyShell(path) ?? 'sh';
 }
 
 /**
@@ -805,7 +864,7 @@ function classifyShell(path: string): ShellKind | null {
  * absolute, executable, classifiable shell path. Accepts either an absolute
  * path (`/usr/bin/zsh`) or a bare name (`zsh`) — the latter is searched in the
  * conventional shell locations. Returns null when the override can't be honored
- * (not found / not executable / unsupported syntax like fish), so the caller
+ * (not found / not executable / unsupported syntax like nu/csh/tcsh), so the caller
  * falls back to the normal `$SHELL` resolution with a warning.
  *
  * The override is the escape hatch for users whose login `$SHELL` (e.g. bash)
@@ -825,8 +884,8 @@ export function resolveShellOverride(override: string): ShellSpec | null {
     const kind = classifyShell(candidate);
     if (!kind) {
       logger.warn(
-        `[tmux-backend] launchShell=${override} resolved to ${candidate} which is not bash/zsh/sh; ` +
-        `ignoring override (our POSIX wrapper would break under it).`,
+        `[tmux-backend] launchShell=${override} resolved to ${candidate} which is not bash/zsh/fish/sh; ` +
+        `ignoring override (our wrapper would break under it).`,
       );
       return null;
     }
@@ -842,11 +901,7 @@ export function resolveShellOverride(override: string): ShellSpec | null {
  * override wins when it resolves; otherwise tries `$SHELL` first, then
  * `/bin/zsh` → `/bin/bash` → `/bin/sh`.
  *
- * If `$SHELL` is fish/nu/csh/etc., emits a warning and falls back to a POSIX
- * shell — our wrapper SCRIPT is POSIX-syntax and would break under fish. The
- * user can still configure their CLI's PATH/etc. inside the fallback shell's
- * rcfile if needed; the alternative (run their fish rcfile under a POSIX
- * harness) does not work.
+ * If `$SHELL` is nu/csh/etc., emits a warning and falls back to a POSIX shell.
  *
  * Always returns a usable ShellSpec — the last-resort `/bin/sh` fallback is
  * close enough to universal that surfacing an error here would do more harm
@@ -864,9 +919,8 @@ export function resolveUserShell(env: NodeJS.ProcessEnv = process.env, override?
     const kind = classifyShell(userShell);
     if (kind) return specForKind(userShell, kind);
     logger.warn(
-      `[tmux-backend] $SHELL=${userShell} is not bash/zsh/sh; ` +
-      `falling back to a POSIX shell for the wrapper. ` +
-      `Configure CLI PATH/env in the fallback shell's rcfile if needed.`,
+      `[tmux-backend] $SHELL=${userShell} is not bash/zsh/fish/sh; ` +
+      `falling back to a POSIX shell for the wrapper.`,
     );
   }
   for (const candidate of ['/bin/zsh', '/bin/bash', '/bin/sh'] as const) {

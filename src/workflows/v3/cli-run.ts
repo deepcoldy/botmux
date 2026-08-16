@@ -23,7 +23,8 @@ import { homedir } from 'node:os';
 import { existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { createInterface } from 'node:readline';
 
-import { loadDag, type V3Dag } from './dag.js';
+import type { V3Dag } from './dag.js';
+import { loadDag } from './dag-loader.js';
 import { runWorkflow, type V3RuntimeDeps, type V3RuntimeOptions } from './runtime.js';
 import { createEphemeralPool } from './ephemeral-pool.js';
 import { readAndValidateManifest, ManifestValidationError } from './manifest.js';

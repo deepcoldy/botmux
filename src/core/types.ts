@@ -1,6 +1,8 @@
 import type { ChildProcess } from 'node:child_process';
 import type {
   CodexAppTurnInput,
+  CliTurnPayload,
+  ChatContext,
   Session,
   DaemonToWorker,
   LarkAttachment,
@@ -10,6 +12,7 @@ import type {
   VcMeetingImTurnOrigin,
 } from '../types.js';
 import type { CliUsageLimitState } from '../utils/cli-usage-limit.js';
+import type { CodexServiceTierSnapshot } from '../services/codex-service-tier.js';
 
 /** Frozen card state — cached content for historical streaming cards that can still be toggled. */
 export interface FrozenCard {
@@ -22,6 +25,10 @@ export interface FrozenCard {
   displayMode?: DisplayMode;
   /** Latest uploaded image_key for the frozen card (only when displayMode === 'screenshot'). */
   imageKey?: string;
+  /** Rendered service-tier badge (`⚡ priority`) captured at freeze time so a
+   *  recalled Codex card keeps its per-turn tier instead of being re-decorated
+   *  with the session's current tier. Absent = no badge. */
+  codexServiceTierBadge?: string;
 }
 
 /** Resolve effective display mode for a frozen card.
@@ -39,6 +46,10 @@ export function frozenDisplayMode(fc: FrozenCard): DisplayMode {
 export interface DaemonSession {
   session: Session;
   worker: ChildProcess | null;   // fork'd worker process
+  /** True after the current worker generation has completed init. Kept
+   * separate from workerPort because backends without a Web Terminal still
+   * emit screen/idle/screenshot updates and support native local attach. */
+  workerReady?: boolean;
   workerPort: number | null;     // HTTP port for xterm.js
   workerToken: string | null;    // write token for xterm.js
   /** Independent read-only xterm capability. Optional for hydrated/legacy
@@ -72,6 +83,9 @@ export interface DaemonSession {
   hasHistory: boolean;   // true after CLI has run at least once for this session
   workingDir?: string;
   initConfig?: Extract<DaemonToWorker, { type: 'init' }>;   // stored for restart
+  /** Per-session snapshot of the final-answer feedback policy. New config takes
+   * effect on the next new/restarted session, matching sandbox send-cred state. */
+  feedbackPolicy?: import('../services/feedback-policy.js').FeedbackPolicy;
   /** Dashboard「复现命令」：worker 在 `ready` 时上报的、该 session 本次冷启的近似
    *  可复现 CLI 调用（bin + argv + cwd + 权威注入 env）。**只驻内存、绝不落盘**
    *  ——命令含 provider token / 凭证 env，写进默认 0644 的 sessions-*.json 会让同机
@@ -83,6 +97,32 @@ export interface DaemonSession {
    *  separate from worktreeCreating because plain select, skip, and /repo can
    *  also await prompt context before the fork. */
   pendingRepoCommitInFlight?: boolean;
+  /** A fresh live-route owner has been published but its opening input has not
+   * reached the first fork yet. Same-anchor turns must buffer into the opening
+   * input instead of reforking worker:null and overtaking it. In-memory only. */
+  initialStartPending?: boolean;
+  /** Restore quarantine: a durable activation-tail promotion failed transiently
+   * during restoreActiveSessions, so the row was registered with its tail
+   * un-promoted. The next fork boundary (toReattach blank fork / daemon inbound
+   * refork) must retry the promotion BEFORE forking and skip a blank fork if it
+   * still fails — never leave a live worker beside an unpromoted tail. Cleared
+   * once promotion succeeds. In-memory only. */
+  quarantinedActivationTailPromotion?: boolean;
+  /** Generation token for the handler that atomically reserved a worker:null
+   * refork. Later same-anchor handlers may prepare concurrently, but only this
+   * owner may cross the fork boundary; followers buffer behind its gate. */
+  initialStartClaimToken?: string;
+  /** Number of activation-tail arrivals that reserved FIFO order before an
+   * asynchronous prompt/sender build and have not yet durably admitted or
+   * failed. An opening ACK must not clear the route while this is non-zero. */
+  queuedActivationTailAdmissionsOutstanding?: number;
+  /** An opening ACK (or ordinary cold-start handoff) observed while an
+   * asynchronous tail admission was outstanding. The final settler replays
+   * this release so a late durable successor cannot be stranded. */
+  queuedActivationTailReleasePending?: { acknowledgedToken?: string };
+  /** Retry timer for an ordinary cold-start handoff whose durable promotion
+   * failed after all asynchronous admissions had settled. */
+  queuedActivationTailReleaseRetryTimer?: ReturnType<typeof setTimeout>;
   repoCardMessageId?: string;    // message_id of the repo selection card — for withdrawal
   /**
    * Repo-select card message ids already consumed by a successful pending→worker
@@ -107,6 +147,8 @@ export interface DaemonSession {
    * user message while the first turn waits for repo selection/worktree setup. */
   pendingCodexAppApplicationContext?: string;
   pendingCodexAppMessageContext?: string;
+  /** 入群自动开工首轮使用的群元数据；repo 选择或 auto-worktree 延迟启动时保留。 */
+  pendingChatContext?: ChatContext;
   /** One-shot CLI slash command to send literally after the worker reports
    *  prompt_ready. Used when a new topic starts with an adapter-default
    *  passthrough command such as `/goal`: the CLI must see raw `/...`, not a
@@ -140,16 +182,45 @@ export interface DaemonSession {
    *  so the deferred spawn after repo-selection still injects a <sender> tag
    *  matching the original caller, not the user who clicked the card. */
   pendingSender?: import('../im/lark/identity-cache.js').ResolvedSender;
+  /** Frozen plain-human steer authorization for a NEW-TOPIC opening (R5-B1-1).
+   * Set by the auto-create admission; buildReservedInitialInput COPIES it onto
+   * the opening CliTurnPayload. Only `true`; forkReservedInitialSession (shared by
+   * bot-added / scheduler / system bootstrap) never infers it. */
+  pendingCodexAppSteerable?: true;
   pendingFollowUps?: string[];         // buffered follow-up messages (enriched) sent while waiting for repo selection
   /** Exact turn for a same-caller pendingRawInput follow-up batch. Cleared on
    *  mixed callers so the combined prompt fails closed instead of borrowing. */
   pendingFollowUpTurnId?: string;
+  pendingFollowUpTurnIds?: string[];   // matching inbound ids; last id attributes a folded buffered batch
   pendingCodexAppFollowUps?: string[]; // matching raw user texts for clean Codex App materialization
   pendingCodexAppFollowUpContexts?: string[]; // matching metadata-only context; never duplicates the raw follow-up text
-  ownerOpenId?: string;          // topic creator's open_id — receives write-enabled terminal link via DM
+  /** Arrival-time clean-input decisions matching pendingCodexAppFollowUps.
+   * Used only when a literal raw cold start must fold followers onto the same
+   * text→Enter IPC boundary. */
+  pendingCodexAppFollowUpGateAccepted?: boolean[];
+  /** Exact turns that arrived while a previously attempted queued activation
+   * was re-parked. They remain separate FIFO items behind the retained opening
+   * payload and advance only after worker acceptance. In-memory only. */
+  pendingQueuedActivationFollowUps?: Array<{
+    userPrompt: string;
+    cliInput: CliTurnPayload;
+    turnId: string;
+    dispatchAttempt?: number;
+    /** Legacy volatile entries already crossed the clean-input gate when they
+     * were staged. Migration must preserve that exact sidecar decision. */
+    codexAppInputGateFrozen?: true;
+  }>;
+  /** Daemon-selected, app-scoped session owner. Frozen for the worker lifetime;
+   *  not the current-turn sender. Absent for ownerless/foreign-bot sessions. */
+  ownerOpenId?: string;          // receives owner-only links and controls write-enabled access
   streamCardId?: string;         // message_id of the streaming card in group (PATCHed with live output)
   streamCardNonce?: string;       // unique nonce for the current streaming card — embedded in button values to distinguish old vs current card
-  streamCardPending?: boolean;    // true when a new turn started, next screen_update creates a new card
+  streamCardPending?: boolean;    // true while the newest turn still needs its own streaming card
+  /** Monotonic in-memory generation for accepted user turns. Card POST
+   * completions use it to avoid clearing a newer turn's pending state. */
+  streamCardTurnGeneration?: number;
+  /** Exact newest turn awaiting its own streaming card. In-memory only. */
+  streamCardPendingTurnId?: string;
   pendingLocalCliButtonRefresh?: boolean; // true when cli_session_id arrived while the streaming card POST was in flight
   pendingRiffUrlCardRefresh?: boolean; // true when riff_access_url arrived while the streaming card POST was in flight
   /** Set on sessions restored after a daemon restart: suppresses the automatic
@@ -188,13 +259,60 @@ export interface DaemonSession {
   currentImageKey?: string;
   lastScreenContent?: string;    // last screen_update content — used to freeze card at idle
   lastScreenStatus?: StreamStatus;  // last screen_update status
+  /** Latest model reported by the live executor. In-memory and rehydrated from
+   *  the CLI transcript after worker restart; unlike Session.model it follows
+   *  in-session `/model` switches. */
+  activeModel?: string;
+  /** Latest reasoning effort reported by the live executor. */
+  activeReasoningEffort?: string;
+  /** Runtime change arrived while a streaming-card POST was in flight. */
+  pendingActiveRuntimeCardRefresh?: boolean;
+  /** Queued suspend: the request arrived while the session was producing
+   *  (working/analyzing), where killing the worker would drop that turn's reply.
+   *  Record the reason instead and cash it in once screen_update settles into
+   *  idle/limited (see worker-pool.ts runPendingSuspendIfSettled). In-memory
+   *  only: lost on daemon restart, and the next `suspend all` cycle re-queues
+   *  it — the cost is one cycle of delay, not a missed session. */
+  pendingSuspendReason?: string;
+  /** Worker generation that owned the queued suspend above. A claim is only
+   *  ever about the generation that was producing when the request arrived, so
+   *  it must not outlive it: once that worker is suspended (by ANY path) or
+   *  exits, the goal state is reached and the claim is consumed. Without this,
+   *  a claim whose fulfilment checkpoint never ran (worker crashed, or `/cd` /
+   *  read-isolation switch suspended first) survives into the NEXT generation
+   *  and suspends it on its first idle. See clearPendingSuspendClaim. */
+  pendingSuspendGeneration?: number;
+  /** Executor-observed Codex settings for this worker/rollout generation. */
+  codexServiceTier?: CodexServiceTierSnapshot;
+  /** Tier change arrived while a card POST was in-flight. */
+  pendingCodexTierCardRefresh?: boolean;
+  /** The currently referenced card has been frozen/parked for handoff. Tier
+   * updates belong to the successor card and must not rewrite this snapshot. */
+  parkedStreamCardNonce?: string;
   /** Riff AIO Sandbox web terminal link. When set, buildTerminalUrl returns
    *  this URL directly (bypassing the local terminal proxy) so the dashboard
    *  "Web终端" button opens the riff sandbox. In-memory only — re-sent by the
    *  worker on each task. */
   riffAccessUrl?: string;
+  /** Explicit-close transaction: while present, no new Riff input may be
+   * admitted until cancellation commits or admission restoration is ACKed. */
+  riffCloseState?: {
+    phase: 'preparing' | 'prepared' | 'uncertain';
+    requestId: string;
+    taskId?: string;
+  };
+  /** Graceful-shutdown transaction for the exact Riff worker generation. */
+  riffShutdownState?: {
+    phase: 'preparing' | 'prepared';
+    requestId: string;
+    taskId?: string | null;
+  };
   usageLimit?: CliUsageLimitState;
   usageLimitRetryTimer?: NodeJS.Timeout;
+  /** Interval that re-PATCHes the live streaming card with fresh Context/Token
+   *  usage while a turn is executing (streaming display mode). Armed on the
+   *  working edge, cleared on idle/turn-end/card removal. */
+  usageRefreshTimer?: NodeJS.Timeout;
   lastUserPrompt?: string;
   lastCliInput?: string;
   lastCodexAppInput?: CodexAppTurnInput;
@@ -222,8 +340,43 @@ export interface DaemonSession {
     createdAt: number;
     completedAt?: number;
     content?: string;
+    usage?: { inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheCreateTokens: number };
   }>;
   latestAsyncTriggerId?: string;
+  /** Set on a fresh async virtual turn dispatched under an at-most-once
+   *  idempotency lease (options.idempotencyKey). Lets the worker-exit handler
+   *  converge an INCOMPLETE idempotent async turn to a durable
+   *  `dispatch_unknown` terminal: a worker that dies with no final_output leaves
+   *  ds.worker=null but keeps the session in activeSessions + the async record
+   *  `pending`, which would otherwise poll `running` forever and let a same-key
+   *  retry reuse the dead session until the next daemon reconcile (codex #776
+   *  round-6 finding #1). Keyed by triggerId so MULTIPLE concurrent keyed turns
+   *  on ONE shared session each get their own convergence stamp — a single slot
+   *  let a later turn's stamp clobber an earlier turn's, stranding the earlier
+   *  turn `pending` forever on worker exit (codex #818 P1-1). Each entry is
+   *  removed once its OWN turn completes (final_output / nothing-to-send) or is
+   *  converged on worker exit; a fresh-session turn is just the 1-entry case. */
+  idempotentAsyncTurns?: Map<string, {
+    ownerLarkAppId: string;
+    key: string;
+    /** Store domain of the lease key (fresh async-virtual vs follow-up turn) so
+     *  convergence looks the lease up under the correct unforgeable namespace. */
+    kind: 'fresh' | 'turn';
+    /** The worker generation this turn was dispatched on. The exit handler only
+     *  converges when the DYING generation is this one (a later generation that
+     *  completed and moved on must not be retro-failed). */
+    workerGeneration: number;
+    /** Set when a post-barrier fault occurred (a throw between the
+     *  reserved→attempting barrier and a proven dispatch) AND the durable
+     *  terminalize write itself then failed — so the lease is `attempting`, no
+     *  durable async result exists, and NOTHING actually dispatched. For a LIVE
+     *  shared-session turn the worker never exits, so worker-exit convergence
+     *  never fires; the ONLY recovery is a same-key retry (or poll) re-attempting
+     *  the strict terminalize. Marks this entry as "terminal write owed" so the
+     *  retry pre-check reruns recordFailedStrict instead of `reuse`-ing forever
+     *  (codex #818 P1-8). Absent = a normally-dispatched turn (converge on exit). */
+    postBarrierFault?: true;
+  }>;
   /** Stable turn ids whose automatic transcript fallback is capture/discard.
    *  turn_terminal clears the entry; bounded in trigger-session for crash
    *  paths that never produce a terminal. */
@@ -232,6 +385,8 @@ export interface DaemonSession {
    * (ask/relay) that cannot trust a long-lived CLI's spawn-time env. */
   managedTurnOrigin?: {
     capability: string;
+    /** Unguessable Seatbelt pane/profile authority channel. */
+    originChannelId?: string;
     turnId?: string;
     dispatchAttempt?: number;
   };
@@ -240,6 +395,10 @@ export interface DaemonSession {
   vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin;
   /** message_id of the TUI prompt interactive card (if active) */
   tuiPromptCardId?: string;
+  /** A final ScreenAnalyzer TUI answer has been dispatched and is waiting for
+   * the worker's resolved/failed ACK. Claimed synchronously by card-handler so
+   * duplicate clicks cannot inject a second key sequence into the same CLI. */
+  tuiPromptProcessing?: boolean;
   /** turnId of the last stuck_warning posted — dedup so we don't spam the
    *  thread with repeated warnings for the same unresolved turn. */
   stuckWarningTurnId?: string;
@@ -320,6 +479,14 @@ export interface DaemonSession {
     paneCols?: number;        // pane width at adopt time
     paneRows?: number;        // pane height at adopt time
   };
+}
+
+/** A non-null value means this Riff generation is deliberately rejecting new
+ * input until a close/shutdown commit or an ACKed admission restore. */
+export function riffRetirementAdmissionPhase(ds: DaemonSession): string | null {
+  if (ds.riffShutdownState) return `shutdown-${ds.riffShutdownState.phase}`;
+  if (ds.riffCloseState) return `close-${ds.riffCloseState.phase}`;
+  return null;
 }
 
 /** Composite key for activeSessions — allows multiple bots to have independent
@@ -421,4 +588,29 @@ export function activeSessionKey(ds: DaemonSession): string {
  * cards and other chat API calls must never target it. */
 export function isDocNativeSession(ds: Pick<DaemonSession, 'scope' | 'chatId'>): boolean {
   return ds.scope === 'chat' && ds.chatId.startsWith('doc:');
+}
+
+/** A session created by the HTTP control API (`waitForFinalOutput` /
+ * `asyncReturnSessionId`) whose `chatId` is a synthetic `http_async_*` /
+ * `http_wait_*` address, NOT a real Lark chat. Any Feishu chat API call
+ * targeting it (sendMessage / card / reply / roster probe) would fail — these
+ * sessions are request/response only and must never touch Lark transport. */
+export function isHttpVirtualSession(chatId: string): boolean {
+  return chatId.startsWith('http_async_') || chatId.startsWith('http_wait_');
+}
+
+/** Central Lark-transport capability gate for a live session. Returns false —
+ * meaning "no Feishu side effects are permitted for this session" — when either
+ * the owning bot is core-only (`apiOnly`, never connected to Feishu) OR the
+ * session's surface is a synthetic HTTP virtual chat. Every auxiliary-UI /
+ * reply / card / roster seam should fail-closed on `!larkTransportEnabled(...)`
+ * instead of re-deriving the condition, so a new no-Feishu surface is covered
+ * everywhere by construction. `doc:` sessions keep their own dedicated routing
+ * (comment API), so they are intentionally NOT folded in here. */
+export function larkTransportEnabled(
+  ds: Pick<DaemonSession, 'chatId'> & { apiOnly?: boolean },
+): boolean {
+  if (ds.apiOnly === true) return false;
+  if (isHttpVirtualSession(ds.chatId)) return false;
+  return true;
 }

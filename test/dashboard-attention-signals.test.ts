@@ -7,14 +7,23 @@
 //     no worker yet, so the normal spawn-time announce never fires) and
 //     no-ops for non-pending sessions
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { readFileSync } from 'fs';
-import { composeRowFromActive } from '../src/core/dashboard-rows.js';
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { config } from '../src/config.js';
+import {
+  composeRowFromActive,
+  composeRowFromClosed,
+  composeRowFromPersistedActive,
+} from '../src/core/dashboard-rows.js';
 import {
   announcePendingRepoSession,
   announceSessionRow,
   clearAgentAttention,
   publishAttentionPatch,
+  publishClosedSessionPatch,
   publishLastInputFromBotPatch,
+  publishSessionMessagePreviewPatch,
 } from '../src/core/session-activity.js';
 import { dashboardEventBus, type DashboardEvent } from '../src/core/dashboard-events.js';
 import { attentionWaitSince } from '../src/dashboard/web/ui.js';
@@ -72,6 +81,32 @@ describe('attention signals', () => {
     const quiet = composeRowFromActive(makeDs());
     expect(quiet.pendingRepo).toBe(false);
     expect(quiet.tuiPromptActive).toBe(false);
+  });
+
+  it('projects the frozen runtime identity without changing the adapter id', () => {
+    const ds = makeDs();
+    ds.session.cliId = 'codex';
+    ds.session.cliRuntime = {
+      id: 'vendor-codex',
+      displayName: 'Vendor Codex',
+      executable: '/opt/vendor-codex',
+      source: 'configured',
+      update: { provider: 'none' },
+    };
+    expect(composeRowFromActive(ds)).toMatchObject({
+      cliId: 'codex',
+      runtimeId: 'vendor-codex',
+      runtimeDisplayName: 'Vendor Codex',
+    });
+
+    const legacy = structuredClone(ds.session);
+    delete legacy.cliRuntime;
+    legacy.cliPathOverride = 'C:\\tools\\legacy-codex.exe';
+    expect(composeRowFromClosed(legacy)).toMatchObject({
+      cliId: 'codex',
+      runtimeId: 'legacy-codex.exe',
+      runtimeDisplayName: 'legacy-codex.exe',
+    });
   });
 
   it('composeRowFromActive marks restored workerless active sessions as dormant', () => {
@@ -139,6 +174,137 @@ describe('attention signals', () => {
         body: { sessionId: 'sess-1', patch: { lastInputFromBot: false } },
       },
     ]);
+  });
+
+  it('publishSessionMessagePreviewPatch refreshes the exchange after queue append', () => {
+    const previousDataDir = process.env.SESSION_DATA_DIR;
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-preview-patch-'));
+    config.session.dataDir = dataDir;
+    try {
+      mkdirSync(join(dataDir, 'queues'), { recursive: true });
+      writeFileSync(join(dataDir, 'queues', 'om_root.jsonl'), `${JSON.stringify({
+        senderType: 'user',
+        content: 'latest question',
+        createTime: '2000',
+      })}\n`);
+      const seen = collectEvents();
+
+      publishSessionMessagePreviewPatch(makeDs());
+
+      expect(seen).toEqual([{
+        type: 'session.update',
+        body: {
+          sessionId: 'sess-1',
+          patch: expect.objectContaining({
+            previewUserText: 'latest question',
+            previewUserAt: 2_000,
+            previewBotState: 'waiting',
+          }),
+        },
+      }]);
+    } finally {
+      rmSync(dataDir, { recursive: true, force: true });
+      if (previousDataDir === undefined) delete process.env.SESSION_DATA_DIR;
+      else process.env.SESSION_DATA_DIR = previousDataDir;
+    }
+  });
+
+  it('publishClosedSessionPatch clears every merged preview field', () => {
+    const seen = collectEvents();
+
+    publishClosedSessionPatch('sess-1', 2_000, { tokenUsage: null });
+
+    expect(seen).toEqual([{
+      type: 'session.update',
+      body: {
+        sessionId: 'sess-1',
+        patch: {
+          status: 'closed',
+          closedAt: 2_000,
+          tokenUsage: null,
+          previewUserText: null,
+          previewBotText: null,
+          previewUserFullText: null,
+          previewBotFullText: null,
+          previewUserAt: null,
+          previewBotAt: null,
+          previewBotState: null,
+        },
+      },
+    }]);
+  });
+
+  it('composeRowFromActive exposes backend metadata for external session bridges', () => {
+    const zmx = makeDs();
+    zmx.session.backendType = 'zmx';
+    zmx.session.titleUpdatedAt = '2026-07-13T10:00:00.000Z';
+    zmx.session.titleSource = 'agent';
+    expect(composeRowFromActive(zmx)).toMatchObject({
+      backendType: 'zmx',
+      backendSessionName: 'bmx-sess-1',
+      titleUpdatedAt: '2026-07-13T10:00:00.000Z',
+      titleSource: 'agent',
+    });
+
+    const herdr = makeDs();
+    herdr.session.backendType = 'herdr';
+    herdr.session.persistentBackendTarget = {
+      backendType: 'herdr',
+      sessionName: 'botmux',
+      agentName: 'botmux-sess-1',
+    };
+    expect(composeRowFromActive(herdr)).toMatchObject({
+      backendType: 'herdr',
+      backendSessionName: 'botmux',
+    });
+
+    const adopted = makeDs();
+    adopted.session.backendType = 'zmx';
+    adopted.session.adoptedFrom = { source: 'tmux', tmuxTarget: 'user:1.0', cwd: '/repo' };
+    expect(composeRowFromActive(adopted).backendSessionName).toBeUndefined();
+
+    const closed = { ...zmx.session, status: 'closed' as const, closedAt: '2026-07-13T11:00:00.000Z' };
+    expect(composeRowFromClosed(closed)).toMatchObject({
+      status: 'closed',
+      backendType: 'zmx',
+      backendSessionName: 'bmx-sess-1',
+    });
+
+    const legacy = { ...closed, backendType: undefined };
+    expect(composeRowFromClosed(legacy).backendSessionName).toBeUndefined();
+  });
+
+  it('composeRowFromPersistedActive keeps quarantined backend metadata and previews', () => {
+    const previousDataDir = process.env.SESSION_DATA_DIR;
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-persisted-row-'));
+    config.session.dataDir = dataDir;
+    try {
+      mkdirSync(join(dataDir, 'queues'), { recursive: true });
+      writeFileSync(join(dataDir, 'queues', 'om_root.jsonl'), `${JSON.stringify({
+        senderType: 'user',
+        content: 'pending recovery question',
+        createTime: '3000',
+      })}\n`);
+
+      const ds = makeDs();
+      ds.session.backendType = 'zmx';
+      ds.session.restoreQuarantinedAt = '2026-07-31T00:00:00.000Z';
+      const row = composeRowFromPersistedActive(ds.session);
+
+      expect(row).toMatchObject({
+        status: 'dormant',
+        backendType: 'zmx',
+        backendSessionName: 'bmx-sess-1',
+        quarantined: true,
+        previewUserText: 'pending recovery question',
+        previewUserAt: 3_000,
+        previewBotState: 'waiting',
+      });
+    } finally {
+      rmSync(dataDir, { recursive: true, force: true });
+      if (previousDataDir === undefined) delete process.env.SESSION_DATA_DIR;
+      else process.env.SESSION_DATA_DIR = previousDataDir;
+    }
   });
 
   it('publishAttentionPatch emits session.update derived from session state', () => {
@@ -218,10 +384,14 @@ describe('attention signals', () => {
     const src = readFileSync(new URL('../src/daemon.ts', import.meta.url), 'utf-8');
     const start = src.indexOf('async function handleThreadReply(');
     expect(start).toBeGreaterThanOrEqual(0);
-    // 20000：窗口需罩住函数头到最后一个拦截点 (findPendingAskByAnchor) 的全部
-    // 源码——passthrough 冷启动等合法插入会把后续 marker 往后推，窗口太紧会误报。
-    // 语义断言不变：clear 在所有拦截点之前。
-    const region = src.slice(start, start + 20000);
+    const end = src.indexOf('async function autoCreateDocSession(', start);
+    expect(end).toBeGreaterThan(start);
+    // Bound the source-order assertion by the next top-level sibling instead
+    // of a character count. Legitimate additions to handleThreadReply (for
+    // example master's CAS handoff paths or PR #597's admission and recovery
+    // guards) must not make this regression test silently inspect only the
+    // first part of the function.
+    const region = src.slice(start, end);
     const clearIdx = region.indexOf('clearAgentAttentionForHumanInbound();');
     expect(clearIdx).toBeGreaterThanOrEqual(0);
     for (const marker of [

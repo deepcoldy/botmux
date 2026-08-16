@@ -9,6 +9,7 @@
  */
 
 import { config } from '../../config.js';
+import { buildV3RunDetailUrl } from '../../core/dashboard-url.js';
 
 export const V3_BLOCKED_RETRY_ACTION = 'v3_blocked_retry';
 /** 运行时 human-ask 选项按钮的 action（与「重试」同卡不同 namespace）。 */
@@ -75,7 +76,7 @@ export function v3BlockedCardNonce(runId: string, nodeId: string, attemptId: str
 }
 
 function v3RunDetailUrl(runId: string): string {
-  return `http://${config.dashboard.externalHost}:${config.dashboard.port}/#/v3/${encodeURIComponent(runId)}`;
+  return buildV3RunDetailUrl(runId, { host: config.dashboard.externalHost, port: config.dashboard.port });
 }
 
 export function buildV3BlockedCard(input: V3BlockedCardInput): string {

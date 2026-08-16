@@ -93,6 +93,24 @@ export interface CreateAskInput {
   rootMessageId: string | null;
   /** Session that issued the ask — used for audit + future replay scoping. */
   sessionId: string;
+  /** Per-invocation identity: the hook generates this once and reuses it across
+   *  reconnect retries, so a re-POST after a daemon restart re-attaches to the
+   *  same ask instead of creating a duplicate. Unlike a questions hash it
+   *  distinguishes concurrent same-question asks. Optional for legacy/explicit
+   *  callers that don't need restart-resume; the broker synthesizes one. */
+  requestId?: string;
+  /** What kind of caller issued this ask ('hook' = AskUserQuestion PreToolUse,
+   *  'explicit' = `botmux ask buttons`, etc.). Namespaces the identity so an
+   *  explicit ask can never re-claim a hook ask's card. Defaults to 'hook'. */
+  originKind?: string;
+  /** DAEMON-COMPUTED authoritative persistence gate (codex P1-4): does the
+   *  authenticated issuing session's FROZEN backend survive a daemon restart
+   *  (tmux/herdr/zellij/zmx = yes; pty = no)? The broker persists + resumes ONLY
+   *  when this is true — it must NOT trust the client-supplied `originKind`
+   *  string, since a PTY-session hook could POST `originKind:'hook'` and orphan a
+   *  record that can never be re-claimed. Undefined → treated as false (fail
+   *  closed: don't persist when the backend is unknown). */
+  backendSurvivesRestart?: boolean;
   /** 问题列表，调用方保证每问 `options.length ≥ 2` 且 key 唯一。 */
   questions: ReadonlyArray<AskQuestion>;
   /** Absolute deadline; computed by caller from `--timeout`. Broker won't
@@ -130,6 +148,11 @@ export interface PendingAsk {
   cardMessageId?: string;
   /** Once true, subsequent click attempts return `already_settled`. */
   settled: boolean;
+  /** Stable Feishu IM dedupe token for the card send (≤50 chars, derived from
+   *  the ask's requestId). The dispatcher passes it as the message `uuid` so a
+   *  re-send after a daemon restart returns the ORIGINAL message_id instead of
+   *  posting a duplicate card. Absent for non-resumable asks. */
+  dispatchUuid?: string;
 }
 
 /** Outcome of a click-resolution attempt. Card click handler maps these to
@@ -145,7 +168,11 @@ export type AskClickOutcome =
   /** Ask already settled (race winner exists or timed out). */
   | 'already_settled'
   /** 多选累积：用户勾选/取消某项，尚未 submit——不触发 settle。 */
-  | 'toggled';
+  | 'toggled'
+  /** 空提交二次确认：鉴权 + nonce 校验都通过，但当前一个选项都没勾、且每个问题
+   *  都允许空集（全多选），提交极可能是手滑——先不 settle，要求带 confirmEmpty 再点
+   *  一次。仅当所有问题都可空时才可能返回；任一单选未选走 `stale`（空非有效答案）。 */
+  | 'needs_empty_confirm';
 
 /** 旧单选语义兼容：仅当"单问且恰好选 1 个"时返回该 key，否则 null。
  *  `botmux ask buttons` 子命令与其测试据此保持单选行为不变。 */
@@ -177,4 +204,72 @@ export interface AskCardDispatcher {
     ask: PendingAsk,
     result: AskResult,
   ): void | Promise<void>;
+}
+
+/**
+ * Typed dispatch failure the card dispatcher throws from `send`, so the broker
+ * can decide whether re-sending could help WITHOUT importing IM/HTTP types
+ * (codex P1-3). The IM side owns classification (it alone sees the AxiosError /
+ * Feishu code); the broker owns the bounded retry policy.
+ *
+ *   - `retryable: true`  → transient (5xx / 429 / network / no-response). The
+ *     broker re-sends with the SAME dispatchUuid, so a send that actually landed
+ *     server-side before the socket broke returns the original message_id (one
+ *     logical card) instead of duplicating.
+ *   - `retryable: false` → deterministic (4xx bad request / permission /
+ *     withdrawn / malformed). Retrying can't help; the broker invalidates now.
+ *
+ * A plain (untyped) error thrown from `send` is treated as NOT retryable — fail
+ * closed, since we can't prove a re-send is safe/idempotent.
+ */
+export class AskDispatchError extends Error {
+  readonly retryable: boolean;
+  constructor(message: string, retryable: boolean) {
+    super(message);
+    this.name = 'AskDispatchError';
+    this.retryable = retryable;
+  }
+}
+
+/**
+ * Whether a daemon `/api/asks` HTTP status is worth the hook retrying (codex
+ * P1-3, executable decision seam). PURE + exported so cli.ts's `postAsk` AND its
+ * unit test call the SAME function — the retry contract is exercised by real
+ * calls, not asserted against source text.
+ *
+ * Retryable = the daemon is up but transiently unready: 502/503/504 (e.g. the
+ * startup readiness window returns 503 `startup_not_ready`). Everything else is
+ * deterministic — a 4xx (bad body / capability denied / unsupported chat) fails
+ * identically forever, so the hook should stop retrying and passthrough. The
+ * no-daemon and network-failure legs are classified retryable separately at
+ * their throw sites (there is no HTTP status there).
+ */
+export function isRetryableAskHttpStatus(status: number): boolean {
+  return status === 502 || status === 503 || status === 504;
+}
+
+/**
+ * Whether the daemon's `/api/asks` handler must answer a RETRYABLE 503
+ * `startup_not_ready` instead of proceeding (codex P1-2/P1-4, executable
+ * decision seam). PURE + exported so daemon.ts and its unit test share the SAME
+ * predicate rather than asserting against source regex.
+ *
+ * True iff an unknown session hits the route while restore is still in flight —
+ * regardless of how the caller authenticated. The earlier `trustedHost` escape
+ * was WRONG (codex P1-2): a normal unsandbox hook IS the trusted-host path
+ * (`postAsk` loads the host secret and calls the HMAC `fetchDaemonIpc` when
+ * there's no relay), so exempting trusted callers let exactly the reconnecting
+ * hook we must protect slip through during the descriptor-published-but-sessions-
+ * not-yet-restored window — it would then register a NEW ask computed as
+ * `backendSurvivesRestart:false` (session unknown) and be lost on the next
+ * restart. Every `POST /api/asks` caller is a session-scoped ask registration
+ * (the desktop/dashboard ANSWER path is a different route), so gating all
+ * unknown sessions here is safe: once `sessionsRestored` flips true the gate
+ * lifts and unknown sessions fall through to normal authorization.
+ */
+export function shouldReturnAskStartupNotReady(args: {
+  hasSession: boolean;
+  sessionsRestored: boolean;
+}): boolean {
+  return !args.hasSession && !args.sessionsRestored;
 }

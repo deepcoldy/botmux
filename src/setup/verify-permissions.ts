@@ -76,6 +76,20 @@ export const BOTMUX_REQUIRED_SCOPES: RequiredScope[] = [
   // 协作收不到事件"），等价于 critical 处理；保留 critical 标记是为了让启动
   // 时的统一巡检循环也覆盖它。
   { name: 'im:message.group_at_msg.include_bot:readonly', desc: '跨 bot @ 事件', critical: true },
+  // 「话题群新话题自动开工」(autoStartOnNewTopic) 要覆盖到「其他机器人开的新话题」时，
+  // 飞书只有开了这个 scope 才会把「其他用户和机器人发送的、未 @ 本 bot 的群消息」推到
+  // WSClient（官方 im.message.receive_v1 文档：「接收群聊中所有用户和其他机器人发送的
+  // 消息」= im:message.group_msg.include_bot:read；im:message.group_msg 只含用户、不含
+  // 机器人）。它是 opt-in 特性专用，故标 non-critical：没开该功能的 bot 缺它不该被启动
+  // 自检 DM 打扰；只有当同时缺别的 critical 项时才顺带在提示里列出。开了功能却缺它 →
+  // bot 开的新话题收不到事件、自动开工静默不触发（预期降级，非崩溃）。
+  { name: 'im:message.group_msg.include_bot:read', desc: '接收群聊中所有用户和其他机器人发送的消息（「其他机器人开的新话题也自动开工」需要）', critical: false },
+  // Dashboard 建群/创建会话的原生飞书标签功能。标签 API 只接受用户身份，
+  // 这里检测的是应用是否已经声明对应 user scope；真正使用时仍需用户做一次 OAuth。
+  // 标 non-critical：不用标签的部署不应因它阻塞 daemon 启动；有缓存的开放平台
+  // Web session 时，event-dispatcher 会在启动阶段静默补权限并发布新版本。
+  { name: 'im:feed_group_v1:read', desc: '读取飞书会话标签（Dashboard 建群分类）', critical: false },
+  { name: 'im:feed_group_v1:write', desc: '创建飞书会话标签并将新群加入标签', critical: false },
   { name: 'application:application:self_manage', desc: '应用自查 (免审批)', critical: false },
 ];
 

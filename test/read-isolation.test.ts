@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, afterEach } from 'vitest';
 import { readFileSync } from 'node:fs';
 import {
   evaluateReadIsolationGate,
@@ -7,14 +7,24 @@ import {
   deviceCredentialIsolationMarkerPath,
   isCredentialIsolationReservedBasename,
   buildCredentialIsolationRules,
+  isolatedPaneOriginChannel,
   isolatedPaneReattachSafe,
   isolationPaneMarkerContent,
+  ISOLATION_PANE_MARKER_VERSION,
+  isolationPanePolicyDigest,
   botHomePath,
   buildCliExecutableReadCarveOuts,
   sendCredFilePath,
   assertSafeAppId,
   normalizeIsolationPath,
 } from '../src/adapters/cli/read-isolation.js';
+
+const G1 = '11'.repeat(32);
+const POLICY1 = isolationPanePolicyDigest({
+  readIsolation: true,
+  writeSandbox: false,
+  readDenyExtraPaths: ['/private/a'],
+});
 
 describe('normalizeIsolationPath (path hardening)', () => {
   it('drops relative / traversal paths instead of silently keeping them', () => {
@@ -186,15 +196,191 @@ describe('isolatedPaneReattachSafe', () => {
     expect(isolatedPaneReattachSafe(JSON.stringify({ version: 1, bootId: 'old' }))).toBe(false);
     expect(isolatedPaneReattachSafe(JSON.stringify({ version: 2, bootId: 'old-mcp-policy' }))).toBe(false);
     expect(isolatedPaneReattachSafe(JSON.stringify({ version: 5, bootId: 'pre-device-policy' }))).toBe(false);
-    expect(isolatedPaneReattachSafe(JSON.stringify({ version: 7, bootId: 'missing-capabilities' }))).toBe(false);
     expect(isolatedPaneReattachSafe(JSON.stringify({
-      version: 7, bootId: 'unknown-capability', capabilities: ['credential', 'network'],
+      version: ISOLATION_PANE_MARKER_VERSION, bootId: 'missing-capabilities',
+    }))).toBe(false);
+    expect(isolatedPaneReattachSafe(JSON.stringify({
+      version: ISOLATION_PANE_MARKER_VERSION, bootId: 'unknown-capability', capabilities: ['credential', 'network'],
     }))).toBe(false);
     // No / blank marker → pane was NOT spawned isolated → unsafe (kill + cold-spawn).
     expect(isolatedPaneReattachSafe(null)).toBe(false);
     expect(isolatedPaneReattachSafe(undefined)).toBe(false);
     expect(isolatedPaneReattachSafe('')).toBe(false);
     expect(isolatedPaneReattachSafe('   ')).toBe(false);
+  });
+
+  it('binds Darwin warm reattach to the pane channel and exact read/write policy', () => {
+    const marker = isolationPaneMarkerContent(
+      'boot-new',
+      ['credential', 'read'],
+      {
+        originChannelId: G1,
+        readIsolation: true,
+        writeSandbox: false,
+        policyDigest: POLICY1,
+      },
+    );
+    expect(isolatedPaneOriginChannel(marker)).toBe(G1);
+    expect(isolatedPaneReattachSafe(marker, {
+      requiredCapabilities: ['credential', 'read'],
+      readIsolation: true, writeSandbox: false, requireOriginChannel: true,
+      policyDigest: POLICY1,
+    })).toBe(true);
+    expect(isolatedPaneReattachSafe(marker, {
+      requiredCapabilities: ['credential', 'read'],
+      readIsolation: false, writeSandbox: false, requireOriginChannel: true,
+      policyDigest: POLICY1,
+    })).toBe(false);
+    const broadTmpDigest = isolationPanePolicyDigest({
+      readIsolation: true,
+      writeSandbox: true,
+      writeAllowExtraPaths: ['/custom/broad-tmp'],
+    });
+    const narrowTmpDigest = isolationPanePolicyDigest({
+      readIsolation: true,
+      writeSandbox: true,
+      writeAllowExtraPaths: ['/private/var/folders/narrow'],
+    });
+    const broadTmpMarker = isolationPaneMarkerContent('boot-old', ['credential', 'read', 'write'], {
+      originChannelId: G1,
+      readIsolation: true,
+      writeSandbox: true,
+      policyDigest: broadTmpDigest,
+    });
+    expect(isolatedPaneReattachSafe(broadTmpMarker, {
+      requiredCapabilities: ['credential', 'read', 'write'],
+      readIsolation: true,
+      writeSandbox: true,
+      requireOriginChannel: true,
+      policyDigest: narrowTmpDigest,
+    })).toBe(false);
+    expect(isolatedPaneReattachSafe(marker, {
+      requiredCapabilities: ['credential', 'read', 'write'],
+      readIsolation: true, writeSandbox: true, requireOriginChannel: true,
+      policyDigest: POLICY1,
+    })).toBe(false);
+    expect(isolatedPaneReattachSafe(marker, {
+      requiredCapabilities: ['credential', 'read'],
+      readIsolation: true,
+      writeSandbox: false,
+      requireOriginChannel: true,
+      policyDigest: isolationPanePolicyDigest({
+        readIsolation: true,
+        writeSandbox: false,
+        readDenyExtraPaths: ['/private/b'],
+      }),
+    })).toBe(false);
+    expect(isolatedPaneReattachSafe(JSON.stringify({
+      version: 4,
+      bootId: 'legacy-v4',
+      readIsolation: true,
+      writeSandbox: false,
+      originChannelId: G1,
+    }), {
+      requiredCapabilities: ['credential', 'read'],
+      readIsolation: true,
+      writeSandbox: false,
+      requireOriginChannel: true,
+      policyDigest: POLICY1,
+    })).toBe(false);
+    expect(isolatedPaneReattachSafe(isolationPaneMarkerContent(
+      'linux-v7', ['credential', 'read'],
+    ), {
+      requiredCapabilities: ['credential', 'read'],
+      requireOriginChannel: false,
+    })).toBe(true);
+    expect(isolatedPaneReattachSafe(isolationPaneMarkerContent(
+      'credential-only-v7', ['credential'],
+    ), {
+      requiredCapabilities: ['credential'],
+      exactCapabilities: true,
+      requireOriginChannel: false,
+    })).toBe(true);
+    expect(isolatedPaneReattachSafe(isolationPaneMarkerContent(
+      'old-broader-policy-v7', ['credential', 'read', 'write'],
+    ), {
+      requiredCapabilities: ['credential'],
+      exactCapabilities: true,
+      requireOriginChannel: false,
+    })).toBe(false);
+    expect(isolatedPaneReattachSafe(isolationPaneMarkerContent(
+      'linux-v7', ['credential', 'read'],
+    ), {
+      requiredCapabilities: ['credential', 'read'],
+      requireOriginChannel: true,
+    })).toBe(false);
+  });
+});
+
+// ─── cold-start migration: START-TIME env contract (bots.json EPERM fix) ──────
+
+/**
+ * Regression guard (2026-08-03). The bots.json-EPERM fix injects a NEW start-time
+ * env contract (BOTMUX_READ_ISOLATION / BOTMUX_API_ONLY) that only reaches a CLI
+ * at spawn. A warm reattach preserves the live process untouched, so a pane that
+ * was spawned by v3.8.0 — v7 marker, full capabilities, but a process carrying
+ * NEITHER env key — would be judged reattach-safe and keep crashing on the denied
+ * bots.json read after a plain `daemon:restart`. The marker version is the ONLY
+ * lever that turns such a pane from "warm reattach (keep old process)" into
+ * "kill + cold-spawn (inject the markers)". So bumping it past 7 is load-bearing,
+ * not cosmetic. If someone reverts the bump, this test goes red.
+ */
+describe('isolatedPaneReattachSafe — start-time contract bump forces cold respawn', () => {
+  // Exactly the shape codex reproduced: a v3.8.0 sandbox pane's marker.
+  const legacyV7Full = JSON.stringify({
+    version: 7,
+    bootId: 'old-v3.8-pane',
+    capabilities: ['credential', 'read', 'write'],
+  });
+
+  it('rejects a v7 pane even with FULL valid capabilities (its process lacks the new env markers)', () => {
+    expect(isolatedPaneReattachSafe(legacyV7Full, ['read', 'write'])).toBe(false);
+    expect(isolatedPaneReattachSafe(legacyV7Full, ['credential', 'read', 'write'])).toBe(false);
+  });
+
+  it('accepts a pane stamped with the current version (cold-spawned under the new contract)', () => {
+    const current = isolationPaneMarkerContent('fresh-boot', ['credential', 'read', 'write']);
+    expect(isolatedPaneReattachSafe(current, ['read', 'write'])).toBe(true);
+  });
+
+  it('has moved the version past 7 — the release that shipped without the env contract', () => {
+    // Pins the intent: v7 was the last version whose isolated processes could
+    // lack BOTMUX_READ_ISOLATION. Anything ≥ 8 is fine; reverting to ≤ 7 would
+    // silently warm-reattach those broken panes.
+    expect(ISOLATION_PANE_MARKER_VERSION).toBeGreaterThan(7);
+  });
+});
+
+// ─── #714: new spawn-time sandbox mount (traex/coco migration markers) ────────
+
+/**
+ * Regression guard. #714 adds a new spawn-time bwrap mount (traex/coco's
+ * read-only migration done-markers via sandboxReadonlyPaths). A warm reattach
+ * keeps the live process + its ORIGINAL mount set, so a pane spawned before this
+ * change would reattach without the marker mount and keep wedging on the TRAE
+ * migration prompt. The marker version is the only lever that turns such a pane
+ * into kill + cold-spawn, so bumping past the pre-#714 versions is load-bearing.
+ *
+ * Ordering note: #709 took 8 (env contract); #714 takes 9. Both prior versions
+ * must be rejected. If the merge order flips, rebase so this stays monotonic.
+ */
+describe('isolatedPaneReattachSafe — #714 mount contract forces cold respawn of pre-9 panes', () => {
+  const full = ['credential', 'read', 'write'] as const;
+  for (const v of [7, 8]) {
+    it(`rejects a v${v} pane even with full capabilities (its bwrap lacks the marker mount)`, () => {
+      const marker = JSON.stringify({ version: v, bootId: `pre-714-v${v}`, capabilities: [...full] });
+      expect(isolatedPaneReattachSafe(marker, ['read', 'write'])).toBe(false);
+    });
+  }
+
+  it('accepts a pane stamped with the current version', () => {
+    expect(isolatedPaneReattachSafe(isolationPaneMarkerContent('fresh', [...full]), ['read', 'write'])).toBe(true);
+  });
+
+  it('has moved the version past 8 (the #709 env-contract version)', () => {
+    // Reverting below 9 would silently warm-reattach panes that predate the
+    // migration-marker mount. ≥ 9 is required.
+    expect(ISOLATION_PANE_MARKER_VERSION).toBeGreaterThan(8);
   });
 });
 
@@ -207,11 +393,26 @@ describe('worker capability carve-out ordering', () => {
       'publishSandboxRelayCapability({ failClosed: true })',
       macPathAt,
     );
-    const policyAt = source.indexOf('const policy = buildFsPolicy({', macPublishAt);
+    const policyAt = source.indexOf('const fsPolicyCtx = {', macPublishAt);
     expect(macPathAt).toBeGreaterThanOrEqual(0);
     expect(macPublishAt).toBeGreaterThan(macPathAt);
     expect(policyAt).toBeGreaterThan(macPublishAt);
-    expect(source).toContain('mandatoryReadOnlyPaths.push(readIsolationOriginCapabilityFile)');
+    expect(source).toContain('mandatoryReadOnlyPaths.push(managedOriginCapabilityDirectory(');
+
+    const credentialPathAt = source.indexOf(
+      'if (readIsolationOriginChannelId && !sandboxRequested)',
+    );
+    const credentialPublishAt = source.indexOf(
+      'publishSandboxRelayCapability({ failClosed: true })',
+      credentialPathAt,
+    );
+    const credentialWrapperAt = source.indexOf(
+      'if (!willReattachPersistent && credentialOnlyBwrap)',
+      credentialPublishAt,
+    );
+    expect(credentialPathAt).toBeGreaterThanOrEqual(0);
+    expect(credentialPublishAt).toBeGreaterThan(credentialPathAt);
+    expect(credentialWrapperAt).toBeGreaterThan(credentialPublishAt);
 
     const relayAt = source.indexOf('sandboxRelayOutbox = sbx.outbox');
     const relayPublishAt = source.indexOf('publishSandboxRelayCapability();', relayAt);
@@ -227,7 +428,7 @@ describe('worker capability carve-out ordering', () => {
       'mandatoryReadOnlyPaths.push(canonical(sessionMcpGatewayHost.socketDir))',
       regexAt,
     );
-    const profileAt = source.indexOf('const policy = buildFsPolicy({', allowAt);
+    const profileAt = source.indexOf('const fsPolicyCtx = {', allowAt);
     expect(regexAt).toBeGreaterThanOrEqual(0);
     expect(denyAt).toBeGreaterThanOrEqual(0);
     expect(denyAt).toBeLessThanOrEqual(regexAt);
@@ -244,6 +445,16 @@ describe('worker capability carve-out ordering', () => {
     );
   });
 
+  it('wires adapter sandboxReadonlyPaths() into the readonlyRoots channel (traex/coco migration markers)', () => {
+    // Guards a call-site blind spot: the adapter test only checks the method's
+    // RETURN value and the fs-policy test hand-feeds readonlyRoots, so if this
+    // spread were deleted the markers would silently stop reaching the sandbox
+    // and BOTH of those tests would stay green (goal-mode traex would wedge again
+    // on the migration prompt). Assert the worker actually threads the method
+    // output into readonlyRoots.
+    expect(source).toContain('...[...(cliAdapter.sandboxReadonlyPaths?.() ?? [])].map(expandTildeLexical),');
+  });
+
   it('enforces the mandatory credential gate before adopt and wraps wrapperCli from the outside', () => {
     const gateAt = source.indexOf('if (mandatoryCredentialIsolation && cfg.adoptMode)');
     const adoptAt = source.indexOf("if (cfg.adoptMode && cfg.adoptSource === 'herdr'");
@@ -256,7 +467,8 @@ describe('worker capability carve-out ordering', () => {
     expect(credentialWrapperAt).toBeLessThan(spawnAt);
     expect(source).toContain('if (!willReattachPersistent && credentialOnlyBwrap)');
     expect(source).toContain('isCredentialIsolationReservedBasename(name)');
-    expect(source).toContain('isolatedPaneReattachSafe(marker, appliedIsolationCapabilities)');
+    expect(source).toContain('requiredCapabilities: appliedIsolationCapabilities');
+    expect(source).toContain('exactCapabilities: true');
   });
 });
 
@@ -264,9 +476,15 @@ describe('CLI protected capability wiring', () => {
   const cliSource = readFileSync(new URL('../src/cli.ts', import.meta.url), 'utf8');
   const vcSource = readFileSync(new URL('../src/cli/vc-agent.ts', import.meta.url), 'utf8');
 
-  it('passes the session id when resolving protected turn snapshots', () => {
+  it('requires host-file attestation when the fixed sentinel is kernel-denied', () => {
     expect(cliSource).toContain(
-      'const liveMarkerCtx = resolveSessionContext(\n    resolveDataDir(),\n    process.env.BOTMUX_SESSION_ID,',
+      'let liveMarkerCtx = findLiveAncestorSessionContext(sendDataDir);',
+    );
+    expect(cliSource).toContain(
+      'managedOriginIsolationSentinelAccess(osUserHomeDir)',
+    );
+    expect(cliSource).toContain(
+      'if (!relayDir && isolatedSendRequired && !isolatedCapabilityCtx)',
     );
     expect(cliSource).toContain(
       'const liveOrigin = resolveSessionContext(resolveDataDir(), sessionId);',
@@ -274,5 +492,50 @@ describe('CLI protected capability wiring', () => {
     expect(vcSource).toContain(
       'const liveOrigin = resolveSessionContext(config.session.dataDir, receiverSessionId);',
     );
+  });
+});
+
+// ─── underReadIsolation ───────────────────────────────────────────────────
+
+/**
+ * Regression guard (2026-08-03 fleet P0, introduced by #668). Two earlier
+ * versions of this predicate were wrong and both are pinned here as negative
+ * cases, so a future "simplification" back to either one fails loudly.
+ */
+describe('underReadIsolation', () => {
+  const saved = { ...process.env };
+  afterEach(() => { process.env = { ...saved }; });
+
+  const load = async () => (await import('../src/adapters/cli/read-isolation.js')).underReadIsolation;
+
+  it('is true when the worker marked the child as sandboxed', async () => {
+    const underReadIsolation = await load();
+    process.env.BOTMUX_READ_ISOLATION = '1';
+    expect(underReadIsolation()).toBe(true);
+  });
+
+  it('is false on a plain host', async () => {
+    const underReadIsolation = await load();
+    delete process.env.BOTMUX_READ_ISOLATION;
+    expect(underReadIsolation()).toBe(false);
+  });
+
+  it('does NOT infer isolation from SESSION_DATA_DIR + BOTMUX_LARK_APP_ID', async () => {
+    // Rejected v1: the worker injects both of those for EVERY bot it spawns,
+    // sandboxed or not, so this shape is an ordinary CLI. Treating it as isolated
+    // would swallow a real unreadable-bots.json fault on a normal host.
+    const underReadIsolation = await load();
+    delete process.env.BOTMUX_READ_ISOLATION;
+    process.env.SESSION_DATA_DIR = '/h/.botmux/data';
+    process.env.BOTMUX_LARK_APP_ID = 'cli_plain';
+    expect(underReadIsolation()).toBe(false);
+  });
+
+  it('only accepts the exact marker value "1"', async () => {
+    const underReadIsolation = await load();
+    for (const v of ['0', 'true', 'yes', '']) {
+      process.env.BOTMUX_READ_ISOLATION = v;
+      expect(underReadIsolation()).toBe(false);
+    }
   });
 });

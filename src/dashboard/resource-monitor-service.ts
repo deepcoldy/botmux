@@ -229,9 +229,25 @@ function hostCurrent(sample: ProcfsSample, previousTotalCpuTicks: number | undef
   };
 }
 
+interface ProcessTickBaseline {
+  cpuTicks: number;
+  startTicks?: number | string;
+}
+
+/**
+ * Per-process CPU% for this interval, from the growth of each process's cumulative
+ * CPU time relative to the host's.
+ *
+ * The baseline is keyed by pid *and* the process's birth stamp: a recycled pid pairs
+ * a fresh process's lifetime CPU total against the previous occupant's, and the
+ * difference lands in one interval — a short-lived pid reuse could report hundreds of
+ * percent and poison the 1m/5m EMAs for minutes. Without a birth stamp on either
+ * side (platforms that do not supply one) the pid alone is all we have, so the pair
+ * is still used; a mismatch is only ever treated as a new process.
+ */
 function processCpuPct(
   processes: ProcessResourceSample[],
-  previousProcessTicks: Map<number, number>,
+  previousProcessTicks: Map<number, ProcessTickBaseline>,
   totalDelta: number,
 ): Map<number, number> {
   const out = new Map<number, number>();
@@ -239,14 +255,18 @@ function processCpuPct(
   for (const proc of processes) {
     const prev = previousProcessTicks.get(proc.pid);
     if (prev === undefined) continue;
-    const delta = Math.max(0, proc.cpuTicks - prev);
+    // Only refuse the pair when both sides carry an identity and they disagree; a
+    // platform that supplies no birth stamp keeps the old pid-only behaviour.
+    if (prev.startTicks !== undefined && proc.startTicks !== undefined
+      && String(prev.startTicks) !== String(proc.startTicks)) continue;
+    const delta = Math.max(0, proc.cpuTicks - prev.cpuTicks);
     out.set(proc.pid, (delta / totalDelta) * 100);
   }
   return out;
 }
 
-function snapshotProcessTicks(processes: ProcessResourceSample[]): Map<number, number> {
-  return new Map(processes.map(proc => [proc.pid, proc.cpuTicks]));
+function snapshotProcessTicks(processes: ProcessResourceSample[]): Map<number, ProcessTickBaseline> {
+  return new Map(processes.map(proc => [proc.pid, { cpuTicks: proc.cpuTicks, startTicks: proc.startTicks }]));
 }
 
 function markerFromRaw(raw: string): CliMarkerInfo | null {
@@ -304,7 +324,7 @@ export function createResourceMonitorService(deps: ResourceMonitorDeps): Resourc
   let currentSnapshot = emptyCurrent(nowMs(), intervalMs);
   let previousTotalCpuTicks: number | undefined;
   let previousIdleCpuTicks: number | undefined;
-  let previousProcessTicks = new Map<number, number>();
+  let previousProcessTicks = new Map<number, ProcessTickBaseline>();
   let previousSessionStats = new Map<string, PreviousSessionStat>();
   let trackedLastAt = new Map<string, number>();
 

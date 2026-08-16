@@ -53,6 +53,14 @@ describe('session-card-model · composeEntries / statusToDot', () => {
     const dot = statusToDot('dormant');
     expect(dot).toEqual({ tone: 'neutral', pulse: false, label: 'sessions.status.dormant' });
   });
+
+  it('maps stalled Codex App turns to a non-pulsing danger dot', () => {
+    expect(statusToDot('stalled')).toEqual({
+      tone: 'danger',
+      pulse: false,
+      label: 'sessions.status.stalled',
+    });
+  });
 });
 
 describe('session-card-model · filters', () => {
@@ -139,6 +147,13 @@ describe('session-card-model · composeDetail action matrix (M5 extended)', () =
     // webPort=null → openTerminal=false
     const noPort = composeDetail(makeRow({ status: 'working', webPort: null }));
     expect(noPort.actions.openTerminal.enabled).toBe(false);
+    expect(noPort.actions.openTerminal.reasonKey).toBe('sessions.action.terminal.noPort');
+
+    // ZMX intentionally has no Web Terminal. Even a stale persisted webPort
+    // must be classified as unsupported rather than temporarily unavailable.
+    const zmx = composeDetail(makeRow({ status: 'working', backendType: 'zmx', webPort: 7100 }));
+    expect(zmx.actions.openTerminal.enabled).toBe(false);
+    expect(zmx.actions.openTerminal.reasonKey).toBe('sessions.action.terminal.unsupported');
 
     // scope='chat' → locateMode='openChat'
     const chatScope = composeDetail(makeRow({ scope: 'chat' }));

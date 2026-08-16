@@ -5,7 +5,7 @@ import { cliAuthBind, loadDashboardSecret, signCliAuth } from '../dashboard/auth
 
 /**
  * Loopback HMAC client for the dashboard process's `/__cli/*` endpoints, used by
- * `botmux dashboard` (rotate) and the post-start/restart hint (current).
+ * `botmux dashboard [current|rotate]` and the post-start/restart hint.
  *
  * Two subtleties this module exists to handle correctly:
  *
@@ -29,7 +29,7 @@ import { cliAuthBind, loadDashboardSecret, signCliAuth } from '../dashboard/auth
  *    self-heal `.dashboard-port`.
  */
 
-export type DashboardEndpoint = '/__cli/rotate' | '/__cli/current' | '/__cli/reload-binding';
+export type DashboardEndpoint = '/__cli/rotate' | '/__cli/ensure' | '/__cli/current' | '/__cli/reload-binding';
 
 export type DashboardFailReason =
   | 'no-secret'
@@ -49,7 +49,7 @@ type FetchImpl = typeof fetch;
  * Classify a 404 from a `/__cli/*` request. A genuine "no token yet" only comes
  * from `/__cli/current` carrying `{ error: 'no_active_token' }`; everything else
  * means the port is answering for some other service (daemon IPC, a stray HTTP
- * server, …), not the dashboard rotate/current routes.
+ * server, …), not one of the dashboard CLI routes.
  */
 export function classifyDashboard404(path: DashboardEndpoint, bodyText: string): DashboardResult {
   let body: unknown = null;

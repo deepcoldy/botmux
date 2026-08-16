@@ -10,6 +10,7 @@ import { spawn } from 'node:child_process';
 import { createServer, type IncomingMessage } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import {
+  chmodSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -17,13 +18,17 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { RELAY_ORIGIN_CAPABILITY_BASENAME } from '../src/core/managed-origin-capability.js';
+import {
+  managedOriginCapabilityPath,
+  RELAY_ORIGIN_CAPABILITY_BASENAME,
+} from '../src/core/managed-origin-capability.js';
 
 const CLI_PATH = join(__dirname, '..', 'src', 'cli.ts');
 const APP_ID = 'cli_delete_test';
 const CAPABILITY = 'ab'.repeat(32);
+const ORIGIN_CHANNEL = 'cd'.repeat(32);
 const tempDirs: string[] = [];
 
 interface StoredSession {
@@ -83,10 +88,25 @@ function writeDaemonDescriptor(dataDir: string, port: number): void {
 
 function writeRelayCapability(relayDir: string): void {
   mkdirSync(relayDir, { recursive: true });
+  const path = join(relayDir, RELAY_ORIGIN_CAPABILITY_BASENAME);
   writeFileSync(
-    join(relayDir, RELAY_ORIGIN_CAPABILITY_BASENAME),
+    path,
     JSON.stringify({ token: CAPABILITY, turnId: 'turn-delete', dispatchAttempt: 3 }),
   );
+  chmodSync(path, 0o600);
+}
+
+function writeReadIsolatedCapability(dataDir: string, sessionId: string): void {
+  const path = managedOriginCapabilityPath(dataDir, sessionId, ORIGIN_CHANNEL);
+  mkdirSync(dirname(path), { recursive: true });
+  writeFileSync(path, JSON.stringify({
+    sessionId,
+    channelId: ORIGIN_CHANNEL,
+    capability: CAPABILITY,
+    turnId: 'turn-delete',
+    dispatchAttempt: 3,
+  }));
+  chmodSync(path, 0o600);
 }
 
 function runDelete(
@@ -134,11 +154,11 @@ function readRequestBody(req: IncomingMessage): Promise<Record<string, unknown>>
 describe('botmux delete — daemon-first close', () => {
   it('delegates a current-session close to the daemon with its rotating capability', async () => {
     const dataDir = mkdtempSync(join(tmpdir(), 'botmux-delete-data-'));
-    const relayDir = mkdtempSync(join(tmpdir(), 'botmux-delete-relay-'));
-    tempDirs.push(dataDir, relayDir);
+    const homeDir = mkdtempSync(join(tmpdir(), 'botmux-delete-home-'));
+    tempDirs.push(dataDir, homeDir);
     const session = makeSession('sess-delete-current');
     const sessionsPath = writeSessions(dataDir, [session]);
-    writeRelayCapability(relayDir);
+    writeReadIsolatedCapability(dataDir, session.sessionId);
 
     let requestUrl = '';
     let requestBody: Record<string, unknown> = {};
@@ -156,8 +176,10 @@ describe('botmux delete — daemon-first close', () => {
       const result = await runDelete(dataDir, [session.sessionId], {
         BOTMUX_SESSION_ID: session.sessionId,
         BOTMUX_LARK_APP_ID: APP_ID,
-        BOTMUX_SEND_RELAY: relayDir,
+        BOTMUX_SEND_RELAY: undefined,
+        BOTMUX_ORIGIN_CHANNEL_ID: ORIGIN_CHANNEL,
         BOTMUX_DAEMON_IPC_PORT: String(port),
+        HOME: homeDir,
       });
 
       expect(result.status).toBe(0);

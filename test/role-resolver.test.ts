@@ -6,7 +6,7 @@
  * buildNewTopicPrompt injects a <role> block when given { larkAppId, chatId }.
  * Run: pnpm vitest run test/role-resolver.test.ts
  */
-import { mkdtempSync, existsSync, readFileSync } from 'node:fs';
+import { mkdtempSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
@@ -95,8 +95,68 @@ describe('role injection mode', () => {
     expect(resolveRoleInjection('app1', 'oc_r')).toEqual({ content: 'CHAT', source: 'chat', injectMode: 'once' });
   });
 
-  it('buildFollowUpContent omits the <role> block when mode is "once", keeps it on "every"', async () => {
-    await fresh();
+  it('stores the dispatch completion switch per bot + chat without clobbering injection mode', async () => {
+    const {
+      deleteRoleMeta,
+      readRoleDispatchCompletionEnabled,
+      readRoleInjectMode,
+      writeRoleDispatchCompletionEnabled,
+      writeRoleInjectMode,
+    } = await fresh();
+    const metaPath = join(dataDir, 'roles', 'app1', 'oc_dispatch.meta.json');
+
+    expect(readRoleDispatchCompletionEnabled('app1', 'oc_dispatch')).toBe(false);
+    writeRoleInjectMode('app1', 'oc_dispatch', 'once');
+    writeRoleDispatchCompletionEnabled('app1', 'oc_dispatch', true);
+    expect(readRoleInjectMode('app1', 'oc_dispatch')).toBe('once');
+    expect(readRoleDispatchCompletionEnabled('app1', 'oc_dispatch')).toBe(true);
+
+    writeRoleDispatchCompletionEnabled('app1', 'oc_dispatch', false);
+    expect(readRoleInjectMode('app1', 'oc_dispatch')).toBe('once');
+    expect(readRoleDispatchCompletionEnabled('app1', 'oc_dispatch')).toBe(false);
+
+    writeRoleDispatchCompletionEnabled('app1', 'oc_dispatch', true);
+    deleteRoleMeta('app1', 'oc_dispatch');
+    expect(existsSync(metaPath)).toBe(false);
+    expect(readRoleInjectMode('app1', 'oc_dispatch')).toBe('every');
+    expect(readRoleDispatchCompletionEnabled('app1', 'oc_dispatch')).toBe(false);
+  });
+
+  it('treats damaged or non-object role metadata as empty', async () => {
+    const {
+      readRoleDispatchCompletionEnabled,
+      readRoleInjectMode,
+      writeRoleInjectMode,
+    } = await fresh();
+    const metaPath = join(dataDir, 'roles', 'app1', 'oc_invalid_meta.meta.json');
+    writeRoleInjectMode('app1', 'oc_invalid_meta', 'once');
+
+    for (const invalid of ['null', '[]', '{']) {
+      writeFileSync(metaPath, invalid);
+      expect(readRoleInjectMode('app1', 'oc_invalid_meta')).toBe('every');
+      expect(readRoleDispatchCompletionEnabled('app1', 'oc_invalid_meta')).toBe(false);
+    }
+  });
+
+  it('falls back to the bot-level default injection mode when a chat has none', async () => {
+    const { readRoleInjectMode, readTeamRoleInjectMode, writeTeamRoleInjectMode, writeRoleInjectMode } = await fresh();
+    // bot-level default itself defaults to 'every' (legacy).
+    expect(readTeamRoleInjectMode('appB')).toBe('every');
+    expect(readRoleInjectMode('appB', 'oc_x')).toBe('every');
+    // Opt the whole bot into 'once' → any chat without its own sidecar inherits it.
+    writeTeamRoleInjectMode('appB', 'once');
+    expect(readTeamRoleInjectMode('appB')).toBe('once');
+    expect(readRoleInjectMode('appB', 'oc_x')).toBe('once');
+    expect(readRoleInjectMode('appB', 'oc_y')).toBe('once');
+    // A per-chat sidecar still wins over the bot default.
+    writeRoleInjectMode('appB', 'oc_x', 'once');   // explicit once (same value)
+    expect(readRoleInjectMode('appB', 'oc_x')).toBe('once');
+    // Clearing the bot default returns unset chats to 'every'.
+    writeTeamRoleInjectMode('appB', 'every');       // removes the meta sidecar
+    expect(readRoleInjectMode('appB', 'oc_y')).toBe('every');
+  });
+
+  it('buildFollowUpContent omits the <role> block when mode is "once", keeps it on "every"', async () => {    await fresh();
     const { writeRoleFile, writeRoleInjectMode } = await import('../src/core/role-resolver.js');
     writeRoleFile('app1', 'oc_once', 'ONCE_PERSONA');
     const { buildNewTopicPrompt, buildFollowUpContent } = await import('../src/core/session-manager.js');

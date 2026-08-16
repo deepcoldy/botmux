@@ -20,7 +20,7 @@ import {
 import { homedir } from 'node:os';
 import { basename, dirname, isAbsolute, join, relative, sep } from 'node:path';
 import { resolveCommand } from './registry.js';
-import { sessionReadyHookCommand } from '../hook-command.js';
+import { sessionReadyHookCommand, userPromptHookCommand } from '../hook-command.js';
 import type { CliAdapter, CliId, PtyHandle } from './types.js';
 import { findJsonlContainingFingerprint, jsonlContainsFingerprint, normaliseForFingerprint } from '../../services/claude-transcript.js';
 import { GOAL_ENV } from '../../workflows/v3/contract.js';
@@ -828,10 +828,23 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
       return discoverClaudeFamilySessions(variant.dataDir, limit, exclude);
     },
 
-    buildArgs({ sessionId, resume, resumeSessionId, botName, botOpenId, locale, model, disableCliBypass, skillPluginDir }) {
+    buildArgs({ sessionId, resume, resumeSessionId, forkSession, botName, botOpenId, locale, model, disableCliBypass, skillPluginDir }) {
       const args: string[] = [];
       if (resume) {
         args.push('--resume', resumeSessionId ?? sessionId);
+        // Session fork: resume the source transcript but write forward into a
+        // fresh CLI-minted session id, leaving the source untouched. Claude's
+        // interactive `/fork` refuses when the session was launched with
+        // restriction flags (skip-permissions / custom system prompt / tool
+        // allowlist), but the cold-start `--fork-session` flag does NOT — botmux
+        // re-passes those same flags to the forked spawn, so the copy runs with
+        // identical restrictions and the anti-privilege-escalation guard never
+        // fires (verified 2026-08-02, claude 2.1.220). Claude mints the new id
+        // and rewrites the copy's internal per-line ids itself; botmux reads the
+        // new id back from the fresh transcript (resolveJsonlFromPid).
+        if (forkSession) {
+          args.push('--fork-session');
+        }
       } else {
         args.push('--session-id', sessionId);
       }
@@ -1149,6 +1162,9 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
     // `botmux session-ready` 给出启动 selector 边界。worker 收到后清掉旧
     // readyPattern 证据，并等待新 prompt 再投首条消息。
     injectsReadyHook: true,
+    // `/effort` 不在此处——它是全局 PASSTHROUGH_COMMANDS 的成员（所有 CLI 尽力透传，
+    // 且刻意不带冷启动语义）。这里只保留 `/goal`：它是「开启一段目标工作」的命令，需要
+    // 空 topic 冷启动能力（isInitialSessionPassthrough 只认 adapter 层的这个字段）。
     defaultPassthroughCommands: variant.id === 'claude-code' ? ['/goal'] : undefined,
     // Seed shares most of this adapter but has not been verified to expose the
     // same native session-rename command. Keep the capability exact to Claude.
@@ -1176,7 +1192,18 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
       // claude` 剥掉（aiden 硬拒 --settings），全局这条是它唯一能拿到就绪信号的渠道，
       // 避免首条 prompt 空等 45s；原生 Claude 也只从这一个来源读取 ready hook。
       sessionStartCommand: sessionReadyHookCommand(),
+      // UserPromptSubmit per-turn 上下文 hook（#794）：同样写全局 settings.json。
+      // 仅当 per-bot envelopeInjection=auto 时 daemon 才写 sidecar 走注入路径，
+      // 其余情况 hook 触发但读不到 sidecar，空输出 no-op。
+      // 仅 claude-code 安装 UserPromptSubmit hook；seed/relay 等共享 adapter 的
+      // variant 不装（supportsInvisiblePromptHook 也只对 claude-code 为 true，
+      // 装了也是每轮空跑一个子进程）。
+      userPromptSubmitCommand: variant.id === 'claude-code' ? userPromptHookCommand() : undefined,
     },
+    // Claude Code 把 UserPromptSubmit 的 additionalContext 注入为不可见的
+    // system-reminder（TUI transcript 不可见，仅落 JSONL）。codex 会渲染成可见的
+    // developer message，不适用本机制。
+    supportsInvisiblePromptHook: variant.id === 'claude-code',
     asksViaHook: true,
   };
 }

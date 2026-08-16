@@ -1,6 +1,9 @@
-import { describe, expect, it, vi } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('../src/services/session-store.js', () => ({
+  registerSessionBridgeSendMarkerCleanupFence: vi.fn(),
+  cleanupSessionBridgeSendMarkers: vi.fn(),
+  cleanupSessionBridgeSendMarkersNow: vi.fn(),
   updateSessionPid: vi.fn(),
   updateSession: vi.fn(),
 }));
@@ -16,7 +19,16 @@ vi.mock('../src/utils/logger.js', () => ({
   },
 }));
 
-import { sweepIdleWorkers, DEFAULT_MAX_LIVE_WORKERS } from '../src/core/idle-worker-sweeper.js';
+import {
+  sweepIdleWorkers,
+  sweepIdleWorkersAfterTurnDrain,
+  DEFAULT_MAX_LIVE_WORKERS,
+} from '../src/core/idle-worker-sweeper.js';
+import {
+  __testOnly_resetBotTurnMutationGates,
+  withBotTurnAdmission,
+  withBotTurnMutation,
+} from '../src/core/bot-turn-mutation-gate.js';
 
 function ds(sessionId: string, backendType: string, lastMessageAt: number, worker = {}) {
   return {
@@ -42,6 +54,10 @@ function ds(sessionId: string, backendType: string, lastMessageAt: number, worke
 const now = 1_000_000;
 
 describe('sweepIdleWorkers (per-bot count cap)', () => {
+  beforeEach(() => {
+    __testOnly_resetBotTurnMutationGates();
+  });
+
   it('falls back to the default cap (30) when the bot has no explicit value', () => {
     expect(DEFAULT_MAX_LIVE_WORKERS).toBe(30);
     // DEFAULT_MAX_LIVE_WORKERS + 2 sessions, oldest first by lastMessageAt.
@@ -100,6 +116,24 @@ describe('sweepIdleWorkers (per-bot count cap)', () => {
     expect(activeSessions.get('b').worker).toBe(null);
     expect(activeSessions.get('c').worker).not.toBe(null);
     expect(activeSessions.get('f').worker).not.toBe(null);
+  });
+
+  it('skips an idle session with durable Codex App dispatch ownership and suspends the next candidate', () => {
+    const owned = ds('a', 'tmux', now - 90 * 60_000);
+    owned.session.codexAppDispatchLedger = [
+      { dispatchId: 'd-1', turnId: 't-1', state: 'accepted', content: 'owned' },
+    ];
+    const activeSessions = new Map<string, any>([
+      ['a', owned],
+      ['b', ds('b', 'tmux', now - 80 * 60_000)],
+      ['c', ds('c', 'tmux', now - 70 * 60_000)],
+    ]);
+
+    const suspended = sweepIdleWorkers(activeSessions, { maxLiveWorkers: 2 });
+
+    expect(suspended.map(entry => entry.sessionId)).toEqual(['b']);
+    expect(activeSessions.get('a').worker).not.toBe(null);
+    expect(activeSessions.get('b').worker).toBe(null);
   });
 
   it('is purely count-based: suspends a recently-active session with NO idle-time threshold', () => {
@@ -187,5 +221,113 @@ describe('sweepIdleWorkers (per-bot count cap)', () => {
 
     expect(suspended).toEqual([]);
     expect(activeSessions.get('a').worker).not.toBe(null);
+  });
+
+  it('waits for pre-accept inbound turns before choosing an idle cap victim', async () => {
+    const appId = 'cli_a';
+    const a = ds('a', 'tmux', now - 90 * 60_000);
+    const b = ds('b', 'tmux', now - 10 * 60_000);
+    const activeSessions = new Map<string, any>([['a', a], ['b', b]]);
+    let releaseAdmission!: () => void;
+    const pausedBeforeAccept = new Promise<void>(resolve => { releaseAdmission = resolve; });
+    let admissionStarted!: () => void;
+    const started = new Promise<void>(resolve => { admissionStarted = resolve; });
+
+    // Session A has entered the existing-owner message path but is still
+    // waiting on sender/reaction work, so its old screen snapshot says idle and
+    // its durable dispatch ledger is not populated yet.
+    const inboundA = withBotTurnAdmission(appId, async () => {
+      admissionStarted();
+      await pausedBeforeAccept;
+      // Durable acceptance occurs before the admission is released.
+      a.session.codexAppDispatchLedger = [
+        { dispatchId: 'd-a', turnId: 't-a', state: 'accepted', content: 'message-a' },
+      ];
+    });
+    await started;
+
+    // Spawning B puts the bot over cap.  The cap sweep must drain A's
+    // admission rather than synchronously suspending A from its stale snapshot.
+    const sweep = sweepIdleWorkersAfterTurnDrain(appId, activeSessions, { maxLiveWorkers: 1 });
+    await Promise.resolve();
+    expect(a.worker).not.toBe(null);
+
+    releaseAdmission();
+    await inboundA;
+    const suspended = await sweep;
+
+    expect(suspended.map(entry => entry.sessionId)).toEqual(['b']);
+    expect(a.worker).not.toBe(null);
+    expect(b.worker).toBe(null);
+  });
+
+  it('queues a Codex App cap sweep behind a same-admission mutation and preserves its durable owner', async () => {
+    const appId = 'cli_same_admission';
+    const owned = ds('owned', 'tmux', now - 90 * 60_000);
+    owned.session.codexAppDispatchLedger = [
+      { dispatchId: 'd-owned', turnId: 't-owned', state: 'accepted', content: 'owned' },
+    ];
+    const next = ds('next', 'tmux', now - 80 * 60_000);
+    const newest = ds('newest', 'tmux', now - 10 * 60_000);
+    const activeSessions = new Map<string, any>([
+      ['owned', owned],
+      ['next', next],
+      ['newest', newest],
+    ]);
+    let releaseFirst!: () => void;
+    const holdFirst = new Promise<void>(resolve => { releaseFirst = resolve; });
+    let firstStarted!: () => void;
+    const started = new Promise<void>(resolve => { firstStarted = resolve; });
+
+    const admitted = withBotTurnAdmission(appId, async () => {
+      const firstMutation = withBotTurnMutation(appId, async () => {
+        firstStarted();
+        await holdFirst;
+      });
+      const sweep = sweepIdleWorkersAfterTurnDrain(appId, activeSessions, {
+        maxLiveWorkers: 2,
+        mutationAcquireTimeoutMs: 1_000,
+      });
+      const [, suspended] = await Promise.all([firstMutation, sweep]);
+      return suspended;
+    });
+
+    await started;
+    await Promise.resolve();
+    const stayedLiveWhileQueued = next.worker !== null;
+    releaseFirst();
+    expect(stayedLiveWhileQueued).toBe(true);
+
+    await expect(admitted).resolves.toEqual([
+      { sessionId: 'next', reason: 'live_worker_cap' },
+    ]);
+    expect(owned.worker).not.toBe(null);
+    expect(next.worker).toBe(null);
+  });
+
+  it('skips a sweep after a bounded wait instead of freezing the bot mutation gate', async () => {
+    const appId = 'cli_wedged';
+    const activeSessions = new Map<string, any>([
+      ['a', ds('a', 'tmux', now - 90 * 60_000)],
+      ['b', ds('b', 'tmux', now - 10 * 60_000)],
+    ]);
+    let releaseAdmission!: () => void;
+    let admissionStarted!: () => void;
+    const started = new Promise<void>(resolve => { admissionStarted = resolve; });
+    const admission = withBotTurnAdmission(appId, async () => {
+      admissionStarted();
+      await new Promise<void>(resolve => { releaseAdmission = resolve; });
+    });
+    await started;
+
+    await expect(sweepIdleWorkersAfterTurnDrain(appId, activeSessions, {
+      maxLiveWorkers: 1,
+      mutationAcquireTimeoutMs: 5,
+    })).resolves.toEqual([]);
+    expect(activeSessions.get('a').worker).not.toBe(null);
+
+    releaseAdmission();
+    await admission;
+    await expect(withBotTurnAdmission(appId, async () => 'open')).resolves.toBe('open');
   });
 });

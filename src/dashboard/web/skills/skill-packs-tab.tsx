@@ -1,0 +1,404 @@
+import { useEffect, useMemo, useRef, useState } from 'react';
+import { useT } from '../react-hooks.js';
+import { SectionHeader } from '../dashboard-components.js';
+import type { SkillPackRow, SkillRow, StatusMessage } from './types.js';
+
+interface SkillPacksTabProps {
+  skills: SkillRow[];
+  /** full pack rows owned by the page-level useSkillsData store */
+  packs: SkillPackRow[];
+  /** false = pack data never loaded successfully — show "unavailable", not "no packs" */
+  packsKnown?: boolean;
+  onRefresh: () => void;
+  /** cross-tab arrival: open this pack's editor once, then consume */
+  focusPackId?: string | null;
+  /** cross-tab arrival: highlight these pack cards (no editor), then consume */
+  focusPackIds?: string[] | null;
+  onFocusConsumed?: () => void;
+  /** chip click-throughs */
+  onOpenBot?: (larkAppId: string) => void;
+  /** redirect to the library install entry, prefilled — never auto-installs */
+  onInstallMissingSkill?: (name: string) => void;
+}
+
+type PackHealth = 'complete' | 'missing' | 'unassigned';
+
+function healthStatus(pack: SkillPackRow): PackHealth {
+  if ((pack.missingSkills?.length ?? 0) > 0) return 'missing';
+  if ((pack.references?.length ?? 0) === 0) return 'unassigned';
+  return 'complete';
+}
+
+export function SkillPacksTab(props: SkillPacksTabProps) {
+  const tr = useT();
+  // Defensive: page-level store may not have loaded packs yet (or tests may
+  // omit the prop). Fall back to an empty array so length/map never throw.
+  const packs = props.packs ?? [];
+  const skills = props.skills ?? [];
+  const [editorOpen, setEditorOpen] = useState(false);
+  const [editing, setEditing] = useState<SkillPackRow | null>(null);
+  const [status, setStatus] = useState<StatusMessage>(null);
+  const [deleteConfirm, setDeleteConfirm] = useState<{ pack: SkillPackRow; references: Array<{ larkAppId: string; botName: string }> } | null>(null);
+  const [deleteBusy, setDeleteBusy] = useState(false);
+
+  const openCreate = () => { setEditing(null); setEditorOpen(true); };
+  const openEdit = (pack: SkillPackRow) => { setEditing(pack); setEditorOpen(true); };
+
+  // Cross-tab arrival: a single focused pack (chip click) opens its editor; a
+  // focus set (overview badge / multi-pack skill) highlights the cards. Either
+  // way the intent is consumed once; highlights live in local state.
+  const [highlightPacks, setHighlightPacks] = useState<Set<string>>(() => new Set());
+  const { focusPackId, focusPackIds, onFocusConsumed } = props;
+  useEffect(() => {
+    if (!focusPackId && (focusPackIds?.length ?? 0) === 0) return;
+    if (focusPackId) {
+      const pack = packs.find(row => row.id === focusPackId);
+      if (pack) {
+        setEditing(pack);
+        setEditorOpen(true);
+      }
+      setHighlightPacks(new Set([focusPackId]));
+    } else if (focusPackIds) {
+      setHighlightPacks(new Set(focusPackIds));
+    }
+    onFocusConsumed?.();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [focusPackId, focusPackIds]);
+
+  const handleSaved = () => {
+    setEditorOpen(false);
+    setEditing(null);
+    setStatus({ text: tr('skills.saved'), ok: true });
+    props.onRefresh();
+  };
+
+  const handleDelete = async (pack: SkillPackRow) => {
+    // First attempt WITHOUT force: lets the backend enforce the in-use guard.
+    // If the pack is referenced by bots, the backend returns 409 IN_USE with the
+    // list of affected bots — we then surface an explicit confirmation before
+    // retrying with force=1. Never silently force-delete.
+    try {
+      const res = await fetch(`/api/skill-packs/${encodeURIComponent(pack.id)}`, { method: 'DELETE' });
+      const body = await res.json().catch(() => ({}));
+      if (res.ok) {
+        setStatus({ text: tr('skills.packDeleted', { name: pack.name }), ok: true });
+        props.onRefresh();
+        return;
+      }
+      if (res.status === 409 && body?.error === 'SKILL_PACK_IN_USE') {
+        const references = Array.isArray(body?.references) ? body.references : (pack.references ?? []);
+        setDeleteConfirm({ pack, references });
+        return;
+      }
+      throw new Error(body?.error ?? `HTTP ${res.status}`);
+    } catch (err: any) {
+      setStatus({ text: `${tr('skills.failed')}: ${err?.message ?? err}`, ok: false });
+    }
+  };
+
+  const confirmForceDelete = async () => {
+    if (!deleteConfirm) return;
+    setDeleteBusy(true);
+    try {
+      const res = await fetch(`/api/skill-packs/${encodeURIComponent(deleteConfirm.pack.id)}?force=1`, { method: 'DELETE' });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(body?.error ?? `HTTP ${res.status}`);
+      setStatus({ text: tr('skills.packDeleted', { name: deleteConfirm.pack.name }), ok: true });
+      setDeleteConfirm(null);
+      props.onRefresh();
+    } catch (err: any) {
+      setStatus({ text: `${tr('skills.failed')}: ${err?.message ?? err}`, ok: false });
+    } finally {
+      setDeleteBusy(false);
+    }
+  };
+
+  return (
+    <section className="skills-config-block">
+      <SectionHeader
+        title={tr('skills.packs')}
+        count={props.packsKnown === false ? '—' : tr('skills.packCount', { count: packs.length })}
+        hint={tr('skills.packsHelp')}
+      />
+      {status && <p className={`hint-${status.ok ? 'ok' : 'warn'}`}>{status.text}</p>}
+      {(
+        <div className="bd-card skills-config-card">
+          {props.packsKnown === false && packs.length === 0 ? (
+            <div className="skills-empty-state" data-packs-unknown>
+              <p className="hint-warn">{tr('skills.packsUnknown')}</p>
+              <button className="bd-button" onClick={() => props.onRefresh()}>{tr('skills.refresh')}</button>
+            </div>
+          ) : packs.length === 0 ? (
+            <div className="skills-empty-state">
+              <p>{tr('skills.packsEmpty')}</p>
+              <button className="bd-button primary" onClick={openCreate}>{tr('skills.packCreate')}</button>
+            </div>
+          ) : (
+            <div className="skills-pack-grid">
+              <button className="skills-pack-create-tile" onClick={openCreate}>
+                <span className="skills-pack-create-plus">+</span>
+                <span>{tr('skills.packCreate')}</span>
+              </button>
+              {packs.map(pack => {
+                const health = healthStatus(pack);
+                return (
+                  <div className={`skills-pack-card${highlightPacks.has(pack.id) ? ' skills-pack-card-focus' : ''}`} key={pack.id}>
+                    <div className="skills-pack-card-head">
+                      <div className="skills-pack-title">
+                        <strong>{pack.name}</strong>
+                        <code className="skills-pack-id">{pack.id}</code>
+                      </div>
+                      <span className={`skills-pack-health skills-pack-health-${health}`}>
+                        {health === 'complete' ? '✓' :
+                         health === 'missing' ? '!' : '○'}
+                      </span>
+                    </div>
+                    {pack.description && <p className="skills-pack-desc">{pack.description}</p>}
+                    <div className="skills-pack-meta">
+                      <span className="skills-pack-meta-item">{tr('skills.skillCount', { count: pack.include.length })}</span>
+                      <span className="skills-pack-meta-item">{tr('skills.packRefCount', { count: pack.references?.length ?? 0 })}</span>
+                    </div>
+                    {pack.tags && pack.tags.length > 0 && (
+                      <div className="skills-pack-tags">
+                        {pack.tags.map(tag => <span key={tag} className="skills-pack-tag">{tag}</span>)}
+                      </div>
+                    )}
+                    {(pack.references?.length ?? 0) > 0 && (
+                      <div className="skills-pack-refs">
+                        {pack.references!.map(r => (
+                          <button
+                            key={r.larkAppId}
+                            type="button"
+                            className="skills-pack-ref-chip"
+                            data-action="open-pack-bot"
+                            disabled={!props.onOpenBot}
+                            onClick={() => props.onOpenBot?.(r.larkAppId)}
+                          >{r.botName}</button>
+                        ))}
+                      </div>
+                    )}
+                    {(pack.missingSkills?.length ?? 0) > 0 && (
+                      <div className="skills-pack-missing">
+                        {tr('skills.packMissing')}:{' '}
+                        {pack.missingSkills!.map(name => (
+                          <button
+                            key={name}
+                            type="button"
+                            className="skills-missing-skill-chip"
+                            data-action="install-missing-skill"
+                            title={tr('skills.installMissingHint', { skill: name })}
+                            disabled={!props.onInstallMissingSkill}
+                            onClick={() => props.onInstallMissingSkill?.(name)}
+                          >{name}</button>
+                        ))}
+                      </div>
+                    )}
+                    <div className="skills-pack-actions">
+                      <button className="bd-button small" onClick={() => openEdit(pack)}>{tr('skills.packEdit')}</button>
+                      <button className="bd-button small danger" onClick={() => void handleDelete(pack)}>{tr('skills.remove')}</button>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </div>
+      )}
+      {editorOpen && (
+        <SkillPackEditor
+          pack={editing}
+          skills={skills}
+          onClose={() => { setEditorOpen(false); setEditing(null); }}
+          onSaved={handleSaved}
+        />
+      )}
+      {deleteConfirm && (
+        <dialog className="bd-dialog skills-pack-delete-confirm" open onClose={() => !deleteBusy && setDeleteConfirm(null)}>
+          <form method="dialog" onSubmit={e => { e.preventDefault(); void confirmForceDelete(); }}>
+            <h3>{tr('skills.packDeleteConfirmTitle')}</h3>
+            <p>{tr('skills.packDeleteConfirmBody', { name: deleteConfirm.pack.name })}</p>
+            {deleteConfirm.references.length > 0 && (
+              <div className="skills-pack-delete-refs">
+                <p><strong>{tr('skills.packDeleteAffectedBots')}:</strong></p>
+                <ul>
+                  {deleteConfirm.references.map(ref => (
+                    <li key={ref.larkAppId}>{ref.botName}</li>
+                  ))}
+                </ul>
+              </div>
+            )}
+            <p className="hint-warn">{tr('skills.packDeleteForceWarning')}</p>
+            <div className="skills-dialog-actions">
+              <button type="button" className="bd-button" onClick={() => setDeleteConfirm(null)} disabled={deleteBusy}>
+                {tr('skills.cancel')}
+              </button>
+              <button type="submit" className="bd-button danger" disabled={deleteBusy}>
+                {deleteBusy ? tr('skills.removing') : tr('skills.removeAnyway')}
+              </button>
+            </div>
+          </form>
+        </dialog>
+      )}
+    </section>
+  );
+}
+
+function SkillPackEditor(props: {
+  pack: SkillPackRow | null;
+  skills: SkillRow[];
+  onClose: () => void;
+  onSaved: () => void;
+}) {
+  const tr = useT();
+  const skills = props.skills ?? [];
+  const [id, setId] = useState(props.pack?.id ?? '');
+  const [name, setName] = useState(props.pack?.name ?? '');
+  const [description, setDescription] = useState(props.pack?.description ?? '');
+  const [tags, setTags] = useState((props.pack?.tags ?? []).join(', '));
+  const [selected, setSelected] = useState<Set<string>>(() => new Set(props.pack?.include.map(s => s.replace('skill:', '')) ?? []));
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [skillQuery, setSkillQuery] = useState('');
+  const dialogRef = useRef<HTMLDialogElement | null>(null);
+  const installedSkillNames = useMemo(() => new Set(skills.map(skill => skill.name)), [skills]);
+  const missingSelected = useMemo(
+    () => [...selected].filter(skillName => !installedSkillNames.has(skillName)).sort(),
+    [installedSkillNames, selected],
+  );
+
+  useEffect(() => {
+    const dlg = dialogRef.current;
+    if (dlg && !dlg.open) dlg.showModal();
+  }, []);
+
+  const filteredSkills = useMemo(() => {
+    const q = skillQuery.trim().toLowerCase();
+    if (!q) return skills;
+    return skills.filter(s => `${s.name} ${s.description ?? ''}`.toLowerCase().includes(q));
+  }, [skills, skillQuery]);
+
+  const allFilteredSelected = filteredSkills.length > 0 && filteredSkills.every(s => selected.has(s.name));
+
+  const toggleSkill = (skillName: string) => {
+    setSelected(prev => {
+      const next = new Set(prev);
+      if (next.has(skillName)) next.delete(skillName); else next.add(skillName);
+      return next;
+    });
+  };
+
+  const toggleAllFiltered = () => {
+    setSelected(prev => {
+      const next = new Set(prev);
+      if (allFilteredSelected) {
+        for (const s of filteredSkills) next.delete(s.name);
+      } else {
+        for (const s of filteredSkills) next.add(s.name);
+      }
+      return next;
+    });
+  };
+
+  const save = async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      const payload = {
+        id,
+        name,
+        description: description || undefined,
+        tags: tags.split(',').map(t => t.trim()).filter(Boolean),
+        include: [...selected].map(s => `skill:${s}`),
+        ...(props.pack ? { expectedRevision: props.pack.revision } : {}),
+      };
+      const url = props.pack ? `/api/skill-packs/${encodeURIComponent(props.pack.id)}` : '/api/skill-packs';
+      const res = await fetch(url, {
+        method: props.pack ? 'PUT' : 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(body?.error ?? body?.reason ?? `HTTP ${res.status}`);
+      props.onSaved();
+    } catch (err: any) {
+      setError(err?.message ?? String(err));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <dialog className="bd-dialog skills-pack-editor" ref={dialogRef} onClose={props.onClose}>
+      <form method="dialog" onSubmit={(e) => { e.preventDefault(); void save(); }}>
+        <h3>{props.pack ? tr('skills.packEdit') : tr('skills.packCreate')}</h3>
+        {error && <p className="hint-warn">{error}</p>}
+        <div className="skills-control-block">
+          <label>{tr('skills.packId')}</label>
+          <input value={id} onChange={e => setId(e.target.value)} disabled={!!props.pack} placeholder={tr('skills.packIdPlaceholder')} />
+        </div>
+        <div className="skills-control-block">
+          <label>{tr('skills.packName')}</label>
+          <input value={name} onChange={e => setName(e.target.value)} />
+        </div>
+        <div className="skills-control-block">
+          <label>{tr('skills.packDescription')}</label>
+          <textarea value={description} onChange={e => setDescription(e.target.value)} rows={2} />
+        </div>
+        <div className="skills-control-block">
+          <label>{tr('skills.packTags')}</label>
+          <input value={tags} onChange={e => setTags(e.target.value)} placeholder={tr('skills.packTagsPlaceholder')} />
+        </div>
+        <div className="skills-control-block">
+          <div className="skills-pack-include-head">
+            <label>{tr('skills.packInclude')} ({selected.size}/{skills.length + missingSelected.length})</label>
+            <input
+              className="skills-pack-skill-search"
+              type="text"
+              placeholder={tr('skills.searchPlaceholder')}
+              value={skillQuery}
+              onChange={e => setSkillQuery(e.target.value)}
+            />
+          </div>
+          {filteredSkills.length > 0 && (
+            <label className="skills-pack-select-all">
+              <input type="checkbox" checked={allFilteredSelected} onChange={toggleAllFiltered} />
+              {allFilteredSelected ? tr('skills.deselectAll') : tr('skills.selectAll')}
+            </label>
+          )}
+          {missingSelected.length > 0 && (
+            <div className="skills-pack-missing-editor">
+              <small className="muted">{tr('skills.packMissing')}</small>
+              {missingSelected.map(skillName => (
+                <label key={skillName} className="skills-pack-skill-item skills-pack-skill-missing" data-missing-skill={skillName}>
+                  <input type="checkbox" checked onChange={() => toggleSkill(skillName)} />
+                  <span className="skills-pack-skill-name">{skillName}</span>
+                  <small className="skills-pack-skill-desc">{tr('skills.packMissing')}</small>
+                </label>
+              ))}
+            </div>
+          )}
+          <div className="skills-pack-skill-list">
+            {filteredSkills.map(skill => (
+              <label key={skill.name} className="skills-pack-skill-item">
+                <input
+                  type="checkbox"
+                  checked={selected.has(skill.name)}
+                  onChange={() => toggleSkill(skill.name)}
+                />
+                <span className="skills-pack-skill-name">{skill.name}</span>
+                {skill.description && <small className="skills-pack-skill-desc">{skill.description}</small>}
+              </label>
+            ))}
+            {filteredSkills.length === 0 && <p className="muted">{tr('skills.noResults')}</p>}
+          </div>
+        </div>
+        <div className="skills-dialog-actions">
+          <button type="button" className="bd-button" onClick={props.onClose}>{tr('skills.cancel')}</button>
+          <button type="submit" className="bd-button primary" disabled={busy || selected.size === 0 || !name.trim()}>
+            {busy ? tr('skills.saving') : tr('skills.saveSelection')}
+          </button>
+        </div>
+      </form>
+    </dialog>
+  );
+}

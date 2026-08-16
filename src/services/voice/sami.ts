@@ -29,6 +29,10 @@ export interface SamiCreds {
   wsUrl?: string;
 }
 
+export interface VoiceProviderEffectOptions {
+  beforeProviderEffect?: () => void | Promise<void>;
+}
+
 const AUTH_VERSION = 'auth-v1';
 const OK = 20000000; // SAMI success status_code
 const SAMI_SR = 24000;
@@ -42,7 +46,11 @@ function samiEndpoint(fromConfig: string | undefined, envName: string, fallback:
 
 /** Mint a short-lived SAMI token (default 24h). Two-step HMAC: sign the
  *  canonical string with the SecretKey, then HMAC an empty body with that. */
-export async function mintSamiToken(creds: SamiCreds, expiration = 86400): Promise<string> {
+export async function mintSamiToken(
+  creds: SamiCreds,
+  expiration = 86400,
+  effects: VoiceProviderEffectOptions = {},
+): Promise<string> {
   if (!creds.accessKey || !creds.secretKey || !creds.appkey) {
     throw new Error('SAMI 凭证不完整（需要 accessKey / secretKey / appkey）。');
   }
@@ -60,6 +68,7 @@ export async function mintSamiToken(creds: SamiCreds, expiration = 86400): Promi
     signature,
   });
   const tokenUrl = samiEndpoint(creds.tokenUrl, 'SAMI_TOKEN_URL', DEFAULT_TOKEN_URL);
+  await effects.beforeProviderEffect?.();
   const res = await fetch(`${tokenUrl}?${qs.toString()}`, { cache: 'no-store' });
   const data = (await res.json()) as { token?: string; status_text?: string };
   if (!data.token) throw new Error(`SAMI token 签发失败：${data.status_text ?? JSON.stringify(data).slice(0, 160)}`);
@@ -74,10 +83,15 @@ export interface SamiSynthOpts {
 }
 
 /** Synthesize text → raw PCM (s16le mono, 24kHz) via the tts.sync WebSocket. */
-export async function samiSynthesizePcm(creds: SamiCreds, text: string, opts: SamiSynthOpts): Promise<Pcm> {
+export async function samiSynthesizePcm(
+  creds: SamiCreds,
+  text: string,
+  opts: SamiSynthOpts,
+  effects: VoiceProviderEffectOptions = {},
+): Promise<Pcm> {
   const clean = text.trim();
   if (!clean) throw new Error('没有要合成的文字');
-  const token = await mintSamiToken(creds);
+  const token = await mintSamiToken(creds, 86400, effects);
 
   const audio_config: Record<string, unknown> = { format: 'pcm', sample_rate: SAMI_SR };
   const config: Record<string, unknown> = { text: clean, speaker: opts.speaker, audio_config };
@@ -102,6 +116,7 @@ export async function samiSynthesizePcm(creds: SamiCreds, text: string, opts: Sa
   };
 
   const wsUrl = samiEndpoint(creds.wsUrl, 'SAMI_WS_URL', DEFAULT_WS_URL);
+  await effects.beforeProviderEffect?.();
   return await new Promise<Pcm>((resolve, reject) => {
     const ws = new WebSocket(wsUrl);
     const chunks: Buffer[] = [];
@@ -117,7 +132,18 @@ export async function samiSynthesizePcm(creds: SamiCreds, text: string, opts: Sa
     };
     const timer = setTimeout(() => finish(new Error('SAMI 合成超时')), opts.timeoutMs ?? 60000);
 
-    ws.on('open', () => ws.send(JSON.stringify(req)));
+    ws.on('open', async () => {
+      try {
+        // The socket may spend an arbitrary amount of time connecting after
+        // the pre-connect fence above. Revalidate at the last async boundary
+        // before the provider-visible request leaves this process.
+        await effects.beforeProviderEffect?.();
+        if (done) return;
+        ws.send(JSON.stringify(req));
+      } catch (e) {
+        finish(e instanceof Error ? e : new Error(String(e)));
+      }
+    });
     ws.on('message', (data: Buffer, isBinary: boolean) => {
       if (isBinary) { chunks.push(data); return; }
       let m: any;

@@ -34,6 +34,7 @@ const LIVENESS_MS = 1000;
 const CLEAR_HOME = '\x1b[H\x1b[2J';
 
 export class ZellijObserveBackend implements ObserveBackend {
+  readonly supportsRawCommandPasteLine = true;
   private readonly session: string;
   private readonly paneId: string;
   private readonly cliPid: number | null;
@@ -182,39 +183,44 @@ export class ZellijObserveBackend implements ObserveBackend {
 
   // ── Input: targeted `action` calls (focus-neutral, non-invasive) ──
 
-  write(data: string): void {
-    this.writeBytes(data);
+  write(data: string): boolean {
+    return this.writeBytes(data);
   }
 
   /** Literal text via write-chars (preserves UTF-8). */
-  sendText(text: string): void {
-    if (!text) return;
-    this.action(['write-chars', '--pane-id', this.paneId, '--', text]);
+  sendText(text: string): boolean {
+    if (!text) return true;
+    return this.action(['write-chars', '--pane-id', this.paneId, '--', text]) !== null;
   }
 
   /** Special keys by tmux-style name → raw bytes → `action write`. */
-  sendSpecialKeys(...keys: string[]): void {
-    for (const key of keys) this.writeBytes(tmuxKeyToBytes(key));
+  sendSpecialKeys(...keys: string[]): boolean {
+    for (const key of keys) {
+      if (!this.writeBytes(tmuxKeyToBytes(key))) return false;
+    }
+    return true;
   }
 
   /** Bracketed paste — wrap so TUIs detect the boundary (mirrors paste-buffer -p). */
-  pasteText(text: string): void {
-    this.writeBytes('\x1b[200~');
-    this.sendText(text);
-    this.writeBytes('\x1b[201~');
+  pasteText(text: string): boolean {
+    if (!this.writeBytes('\x1b[200~')) return false;
+    const bodyAccepted = this.sendText(text);
+    const closeAccepted = this.writeBytes('\x1b[201~');
+    return bodyAccepted && closeAccepted;
   }
 
   /** Write arbitrary bytes via `action write <decimal>…` (handles control/escape).
    *  Chunked so a large web-terminal paste can't blow the argv limit; zellij
    *  serialises the writes in arrival order. */
-  private writeBytes(data: string): void {
-    if (!data) return;
+  private writeBytes(data: string): boolean {
+    if (!data) return true;
     const buf = Buffer.from(data, 'utf-8');
     const CHUNK = 512;
     for (let i = 0; i < buf.length; i += CHUNK) {
       const bytes = Array.from(buf.subarray(i, i + CHUNK), b => String(b));
-      this.action(['write', '--pane-id', this.paneId, ...bytes]);
+      if (this.action(['write', '--pane-id', this.paneId, ...bytes]) === null) return false;
     }
+    return true;
   }
 
   /** Resize is a NO-OP in observe mode — the pane size is the user's, and

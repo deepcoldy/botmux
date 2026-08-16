@@ -40,4 +40,26 @@ describe('forward follow-up content', () => {
       { key: '@user', name: 'User B', openId: 'ou_b' },
     ]);
   });
+
+  it('does NOT merge same-named bots with different app_ids (fail-open guard)', () => {
+    // app_id-form @s have no open/user/union id; keys are re-numbered per message
+    // (@_user_1…), so keying on key+name would fold two distinct bots into one
+    // and silently drop the second (its participant vanishes from the turn).
+    const merged = mergeMessageMentions(
+      [{ key: '@_user_1', name: 'Codex', appId: 'cli_self' }],
+      [{ key: '@_user_1', name: 'Codex', appId: 'cli_other' }],
+    );
+    expect(merged).toHaveLength(2);
+    expect(merged!.map(m => m.appId).sort()).toEqual(['cli_other', 'cli_self']);
+  });
+
+  it('preserves appId when enriching an app_id-keyed mention across seed/follow-up', () => {
+    // Both key on app:cli_peer (no open/user/union id); the follow-up adds a name.
+    const merged = mergeMessageMentions(
+      [{ key: '@_user_1', name: '', appId: 'cli_peer' }],
+      [{ key: '@_user_2', name: 'Peer', appId: 'cli_peer' }],
+    );
+    expect(merged).toHaveLength(1);
+    expect(merged![0].appId).toBe('cli_peer');
+  });
 });

@@ -1,21 +1,26 @@
 /**
- * Restore-time zombie-close decision for persistent backends (tmux/zellij/herdr).
+ * Restore-time close decision for persistent backends (tmux/zellij/herdr/zmx).
  *
  * On daemon restart, restoreActiveSessions() re-registers every persisted active
  * session and then, for persistent backends, probes whether the backing
- * pane/agent survived. PR #98 made a *missing* backing session trigger a
- * permanent closeSession(). The hazard the gate caught: a transient probe
- * failure (herdr server slow-start / list timeout / CLI hiccup) used to fold
- * into the same `false` as "genuinely gone", so one flaky probe could close a
- * still-alive session for good (context lost, pane leaked, store row closed →
- * no lazy recovery).
+ * pane/agent survived. A *missing* backing is NEVER an auto-close trigger: the
+ * CLI transcript on disk is still resumable, so the row is kept worker-less and
+ * cold-resumes on the next message (mirrors pty, which has no backend to probe,
+ * and zmx). This is the fix for the host-reboot mass-close bug — botmux shares
+ * the default tmux socket with the operator's own terminal, so an earlier
+ * serverState()-based gate that tried to tell a solo zombie apart from a reboot
+ * was defeated by a co-tenant reviving the server, closing 239 live sessions
+ * after one reboot. Only three things leave the active set on restore:
  *
- * The fix upgrades the probe to tri-state (exists | missing | unknown). These
- * tests pin the decision boundary:
- *   - missing  → closeSession (Map eviction + store closed), no fork
- *   - unknown  → keep the active record (no close, no fork) for lazy recovery
+ *   - missing  → KEEP the active record (no close, no fork) for lazy cold-resume
+ *   - unknown  → KEEP the active record (no close, no fork) for lazy recovery
  *   - exists   → auto-fork to re-attach, no close
- *   - CLI mismatch → closeSession, so a worker-less old session cannot lazy-resume
+ *   - CLI mismatch → closeSession, so a worker-less old session cannot cold-resume
+ *                    the wrong (config-switched) CLI. Orthogonal to backing state.
+ *
+ * (A real `/close` marks the store row 'closed' up front, so it is never in this
+ * `active` restore set; a provably-exited adopt target is closed in the adopt
+ * branch. Neither is exercised here.)
  *
  * Heavy collaborators are mocked at the module boundary; the session-store runs
  * for real against a temp dir, and the worker-pool mock faithfully reproduces
@@ -33,13 +38,17 @@ let tempDir: string;
 
 // Mutable probe verdict the mocked TmuxBackend returns this test run.
 const probe = vi.hoisted(() => ({ result: 'exists' as 'exists' | 'missing' | 'unknown' }));
-// Mutable tmux-SERVER liveness the mocked TmuxBackend returns this test run.
-// Default 'running' so a bare 'missing' is read as a solo zombie (server up).
-const server = vi.hoisted(() => ({ state: 'running' as 'running' | 'down' | 'unknown' }));
+const zmxSnapshot = vi.hoisted(() => ({
+  ok: true,
+  sessions: [] as string[],
+  unhealthySessions: [] as string[],
+}));
 const herdrProbe = vi.hoisted(() => ({ result: 'exists' as 'exists' | 'missing' | 'unknown' }));
 // Mutable bot-side wrapperCli for the wrapper-axis mismatch tests.
 const bot = vi.hoisted(() => ({
   cliId: 'claude-code' as import('../src/adapters/cli/types.js').CliId,
+  cliRuntime: undefined as import('../src/adapters/cli/runtime.js').CliRuntimeConfig | undefined,
+  cliPathOverride: undefined as string | undefined,
   wrapperCli: undefined as string | undefined,
 }));
 
@@ -66,6 +75,10 @@ vi.mock('../src/services/frozen-card-store.js', () => ({
 // Map the test passes into restoreActiveSessions — production's closeSession
 // evicts from activeSessionsRegistry, which IS that Map.
 const wp = vi.hoisted(() => ({ registry: null as Map<string, any> | null }));
+const transferState = vi.hoisted(() => ({
+  active: new WeakSet<object>(),
+  callbacks: new WeakMap<object, Set<() => void>>(),
+}));
 
 vi.mock('../src/core/worker-pool.js', () => ({
   forkWorker: vi.fn(),
@@ -75,15 +88,72 @@ vi.mock('../src/core/worker-pool.js', () => ({
   adoptSandboxBlocked: vi.fn((botCfg: any, session?: any) =>
     botCfg?.sandbox === true || botCfg?.readIsolation === true || session?.sandbox === true || process.env.BOTMUX_SANDBOX === '1'),
   killStalePids: vi.fn(),
+  sweepDeadPidMarkers: vi.fn(),
   getActiveSessionsRegistry: vi.fn(() => wp.registry ?? undefined),
+  isSessionTransferring: vi.fn((ds: object) => transferState.active.has(ds)),
+  deferUntilSessionTransferSettled: vi.fn((ds: object, callback: () => void) => {
+    if (!transferState.active.has(ds)) return false;
+    const callbacks = transferState.callbacks.get(ds) ?? new Set<() => void>();
+    callbacks.add(callback);
+    transferState.callbacks.set(ds, callbacks);
+    return true;
+  }),
   getCurrentCliVersion: vi.fn(() => '1.0.0-test'),
   restoreUsageLimitRuntimeState: vi.fn(),
+  withActiveSessionKeyLock: vi.fn(async (_map: Map<string, any>, _key: string, action: () => any) => action()),
   setActiveSessionSafe: vi.fn(async (map: Map<string, any>, key: string, ds: any) => {
     const prev = map.get(key);
     if (prev && prev !== ds) {
-      for (const [k, v] of map) { if (v === prev) { map.delete(k); break; } }
+      const prevPending = (prev.session?.codexAppDispatchLedger?.length ?? 0) > 0;
+      const incomingPending = (ds.session?.codexAppDispatchLedger?.length ?? 0) > 0;
+      if (prevPending && incomingPending) {
+        return {
+          accepted: false,
+          reason: 'both_pending',
+          keptSessionId: prev.session.sessionId,
+          preservedIncomingSessionId: ds.session.sessionId,
+        };
+      }
+      const closeUnregistered = async (loser: any) => {
+        for (const [k, v] of map) {
+          if (v === loser) { map.delete(k); break; }
+        }
+        const store = await import('../src/services/session-store.js');
+        const persisted = store.getSession(loser.session.sessionId);
+        if (persisted && persisted.status !== 'closed') {
+          store.closeSession(loser.session.sessionId);
+        }
+      };
+      if (prevPending) {
+        await closeUnregistered(ds);
+        return {
+          accepted: false,
+          reason: 'kept_pending_owner',
+          keptSessionId: prev.session.sessionId,
+          closedIncomingSessionId: ds.session.sessionId,
+        };
+      }
+      await closeUnregistered(prev);
     }
     map.set(key, ds);
+    return {
+      accepted: true,
+      ...(prev && prev !== ds ? { closedSessionId: prev.session.sessionId } : {}),
+    };
+  }),
+  // Faithful SYNCHRONOUS compare-and-set (mirrors production setActiveSessionIfActive):
+  // resumeSession calls this inside withActiveSessionKeyLock, so it must not re-lock.
+  // Inactive incoming drops its own stale entry → false; a different live occupant
+  // wins → false; otherwise set → true.
+  setActiveSessionIfActive: vi.fn((map: Map<string, any>, key: string, ds: any) => {
+    if (ds?.session?.status !== 'active') {
+      if (map.get(key) === ds) map.delete(key);
+      return false;
+    }
+    const current = map.get(key);
+    if (current && current !== ds) return false;
+    map.set(key, ds);
+    return true;
   }),
   isRelayableRealSession: (ds: any) =>
     !!ds?.worker || !!ds?.session?.cliId || !!ds?.session?.lastCliInput,
@@ -105,7 +175,15 @@ vi.mock('../src/core/worker-pool.js', () => ({
 
 vi.mock('../src/bot-registry.js', () => ({
   getBot: vi.fn(() => ({
-    config: { larkAppId: 'app_test', cliId: bot.cliId, wrapperCli: bot.wrapperCli, workingDir: '~', workingDirs: ['~'] },
+    config: {
+      larkAppId: 'app_test',
+      cliId: bot.cliId,
+      cliRuntime: bot.cliRuntime,
+      cliPathOverride: bot.cliPathOverride,
+      wrapperCli: bot.wrapperCli,
+      workingDir: '~',
+      workingDirs: ['~'],
+    },
     botName: 'TestBot',
     botOpenId: 'ou_test',
     resolvedAllowedUsers: [],
@@ -116,6 +194,7 @@ vi.mock('../src/bot-registry.js', () => ({
     botOpenId: 'ou_test',
     resolvedAllowedUsers: [],
   }]),
+  getBotBrand: vi.fn(() => 'feishu'),
 }));
 
 vi.mock('../src/services/message-queue.js', () => ({
@@ -140,7 +219,6 @@ vi.mock('../src/adapters/backend/tmux-backend.js', () => ({
     sessionName: vi.fn((id: string) => `bmx-${id.slice(0, 8)}`),
     probeSession: vi.fn(() => probe.result),
     hasSession: vi.fn(() => probe.result === 'exists'),
-    serverState: vi.fn(() => server.state),
     killSession: vi.fn(),
   },
 }));
@@ -155,6 +233,22 @@ vi.mock('../src/adapters/backend/herdr-backend.js', () => ({
   },
 }));
 
+vi.mock('../src/adapters/backend/zmx-backend.js', () => ({
+  ZmxBackend: {
+    sessionName: vi.fn((id: string) => `bmx-${id.slice(0, 8)}`),
+    probeSession: vi.fn(() => probe.result),
+    probeSessions: vi.fn(() => zmxSnapshot.ok ? {
+      ok: true,
+      sessions: [...zmxSnapshot.sessions],
+      unhealthySessions: [...zmxSnapshot.unhealthySessions],
+      raw: '',
+    } : { ok: false }),
+    hasSession: vi.fn(() => probe.result === 'exists'),
+    killSession: vi.fn(),
+    killManagedSession: vi.fn(),
+  },
+}));
+
 vi.mock('../src/core/session-discovery.js', () => ({
   validateAdoptTarget: vi.fn(() => true),
   validateAdoptTargetState: vi.fn(() => 'alive'),
@@ -166,35 +260,50 @@ vi.mock('../src/core/session-activity.js', () => ({
   markSessionActivity: vi.fn(),
 }));
 
-import { restoreActiveSessions, closeCliMismatchedSessionsForBot } from '../src/core/session-manager.js';
+import { restoreActiveSessions, closeCliMismatchedSessionsForBot, resumeSession } from '../src/core/session-manager.js';
 import { TmuxBackend } from '../src/adapters/backend/tmux-backend.js';
 import { HerdrBackend } from '../src/adapters/backend/herdr-backend.js';
-import { forkWorker, closeSession } from '../src/core/worker-pool.js';
-import { forkAdoptWorker } from '../src/core/worker-pool.js';
+import { ZmxBackend } from '../src/adapters/backend/zmx-backend.js';
+import {
+  closeSession,
+  forkAdoptWorker,
+  forkWorker,
+  setActiveSessionSafe,
+} from '../src/core/worker-pool.js';
 import { announceSessionRow } from '../src/core/session-activity.js';
+import { dashboardEventBus } from '../src/core/dashboard-events.js';
 import * as sessionStore from '../src/services/session-store.js';
 import { sessionKey } from '../src/core/types.js';
 import type { DaemonSession } from '../src/core/types.js';
+import { logger } from '../src/utils/logger.js';
 
 beforeEach(() => {
   tempDir = mkdtempSync(join(tmpdir(), 'restore-zombie-test-'));
   sessionStore.init();
   wp.registry = null;
+  transferState.active = new WeakSet<object>();
+  transferState.callbacks = new WeakMap<object, Set<() => void>>();
   probe.result = 'exists';
-  server.state = 'running';
+  zmxSnapshot.ok = true;
+  zmxSnapshot.sessions = [];
+  zmxSnapshot.unhealthySessions = [];
   herdrProbe.result = 'exists';
   bot.cliId = 'claude-code';
+  bot.cliRuntime = undefined;
+  bot.cliPathOverride = undefined;
   bot.wrapperCli = undefined;
   vi.mocked(closeSession).mockClear();
   vi.mocked(forkWorker).mockClear();
   vi.mocked(announceSessionRow).mockClear();
+  vi.mocked(ZmxBackend.probeSessions).mockClear();
+  vi.mocked(ZmxBackend.killManagedSession).mockReset();
 });
 
 afterEach(() => {
   try { rmSync(tempDir, { recursive: true, force: true }); } catch { /* ignore */ }
 });
 
-function makeActivePersistentSession(rootMessageId: string) {
+function makeActivePersistentSession(rootMessageId: string, backendType: 'tmux' | 'zmx' = 'tmux') {
   const s = sessionStore.createSession('oc_chat1', rootMessageId, 'Topic', 'group');
   s.larkAppId = 'app_test';
   s.workingDir = '/tmp/proj';
@@ -204,7 +313,7 @@ function makeActivePersistentSession(rootMessageId: string) {
   // (Session.backendType); getSessionPersistentBackendType reads it back rather
   // than re-deriving from the daemon default. Stamp it so this fixture models a
   // genuine tmux-backed session.
-  s.backendType = 'tmux';
+  s.backendType = backendType;
   sessionStore.updateSession(s);
   return s; // left active
 }
@@ -233,7 +342,36 @@ describe('restoreActiveSessions — persistent-backend zombie-close decision', (
     expect(forkWorker).toHaveBeenCalledWith(expect.objectContaining({ session: s }), '', true);
   });
 
-  it('"missing" → closes the zombie (Map eviction + store closed), does not fork', async () => {
+  it('isolates a collision-loser close refusal and continues restoring later rows', async () => {
+    const blocked = makeActivePersistentSession('om_collision_blocked', 'zmx');
+    const survivor = makeActivePersistentSession('om_collision_survivor', 'tmux');
+    const map = new Map<string, DaemonSession>();
+    wp.registry = map;
+    vi.mocked(setActiveSessionSafe).mockResolvedValueOnce(false);
+    vi.mocked(closeSession).mockRejectedValueOnce(new Error('ownership probe unavailable'));
+
+    await expect(restoreActiveSessions(map)).resolves.toBeUndefined();
+
+    expect(closeSession).toHaveBeenCalledWith(blocked.sessionId);
+    expect(sessionStore.getSession(blocked.sessionId)?.status).toBe('active');
+    expect(sessionStore.getSession(blocked.sessionId)?.restoreQuarantinedAt).toEqual(expect.any(String));
+    expect(map.get(sessionKey('om_collision_blocked', 'app_test'))).toBeUndefined();
+    expect(map.get(sessionKey('om_collision_survivor', 'app_test'))?.session.sessionId).toBe(survivor.sessionId);
+    expect(forkWorker).toHaveBeenCalledWith(
+      expect.objectContaining({ session: expect.objectContaining({ sessionId: survivor.sessionId }) }),
+      '',
+      true,
+    );
+    expect(logger.error).toHaveBeenCalledWith(expect.stringContaining('ownership probe unavailable'));
+  });
+
+  it('"missing" → keeps the active record for lazy cold-resume, does NOT close', async () => {
+    // A missing backing pane is never an auto-close trigger for a managed
+    // session: whether one pane crashed or the whole server is gone, the CLI
+    // transcript on disk is still resumable, so the worker-less active record is
+    // kept and the next message cold-resumes it. Mirrors pty (never probed) and
+    // zmx (missing always kept). Only a real /close, a provably-exited adopt
+    // target, or a CLI-config mismatch leaves the active set.
     probe.result = 'missing';
     const s = makeActivePersistentSession('om_missing');
     const map = new Map<string, DaemonSession>();
@@ -245,19 +383,24 @@ describe('restoreActiveSessions — persistent-backend zombie-close decision', (
     expect(announceSessionRow).toHaveBeenCalledWith(expect.objectContaining({
       session: expect.objectContaining({ sessionId: s.sessionId }),
     }));
-    expect(closeSession).toHaveBeenCalledWith(s.sessionId);
-    expect([...map.values()].some(v => v.session.sessionId === s.sessionId)).toBe(false);
-    expect(sessionStore.getSession(s.sessionId)!.status).toBe('closed');
+    expect(closeSession).not.toHaveBeenCalled();
+    const ds = map.get(sessionKey('om_missing', 'app_test'));
+    expect(ds).toBeDefined();              // active record retained…
+    expect(ds!.worker).toBeNull();         // …worker-less, cold-resumes on next message
+    expect(sessionStore.getSession(s.sessionId)!.status).toBe('active'); // NOT closed
     expect(forkWorker).not.toHaveBeenCalled();
   });
 
-  it('"missing" + server DOWN (host reboot) → keeps the active record, does NOT close', async () => {
-    // The reboot bug: tmux server is gone, so every bmx-* pane probes 'missing'.
-    // Closing them all wiped a full dashboard. With the server-state gate, a
-    // down server means "keep for lazy resume" (CLI transcript on disk is still
-    // resumable), exactly like a pty session.
+  it('"missing" after a host reboot (server gone) → keeps the active record, does NOT close', async () => {
+    // The reboot bug this whole fix targets: a host reboot wipes the tmux
+    // server, so every bmx-* pane probes 'missing' at once. Because botmux
+    // shares the default tmux socket with the operator's own terminal, a
+    // co-tenant reviving the server before restore ran made the old
+    // serverState() gate read the reboot as N solo zombies → mass-close (239
+    // sessions after one reboot). Now 'missing' is never an auto-close: the
+    // CLI transcript on disk is still resumable, so the row is kept worker-less
+    // and cold-resumes on the next message, exactly like a pty session.
     probe.result = 'missing';
-    server.state = 'down';
     const s = makeActivePersistentSession('om_reboot');
     const map = new Map<string, DaemonSession>();
     wp.registry = map;
@@ -273,13 +416,43 @@ describe('restoreActiveSessions — persistent-backend zombie-close decision', (
     expect(forkWorker).not.toHaveBeenCalled();
   });
 
-  it('CLI mismatch on restore → closes the active record even when the backend server is down', async () => {
-    // This is the config-switch case: the bot now points at a different CLI,
-    // but an old active session still has its original cliId frozen. If restore
-    // kept it worker-less for lazy resume, the next @mention would resurrect the
-    // old CLI instead of creating a clean session with the current bot config.
+  it('missing ZMX session stays lazy-recoverable even when another ZMX daemon is running', async () => {
     probe.result = 'missing';
-    server.state = 'down';
+    const s = makeActivePersistentSession('om_zmx_missing', 'zmx');
+    const map = new Map<string, DaemonSession>();
+    wp.registry = map;
+
+    await restoreActiveSessions(map);
+
+    expect(closeSession).not.toHaveBeenCalled();
+    expect(map.get(sessionKey('om_zmx_missing', 'app_test'))).toBeDefined();
+    expect(sessionStore.getSession(s.sessionId)!.status).toBe('active');
+    expect(forkWorker).not.toHaveBeenCalled();
+  });
+
+  it('classifies multiple ZMX restore rows from one full-list snapshot', async () => {
+    const first = makeActivePersistentSession('om_zmx_batch_1', 'zmx');
+    const second = makeActivePersistentSession('om_zmx_batch_2', 'zmx');
+    const map = new Map<string, DaemonSession>();
+    wp.registry = map;
+
+    await restoreActiveSessions(map);
+
+    expect(ZmxBackend.probeSessions).toHaveBeenCalledTimes(1);
+    expect(sessionStore.getSession(first.sessionId)!.status).toBe('active');
+    expect(sessionStore.getSession(second.sessionId)!.status).toBe('active');
+    expect(closeSession).not.toHaveBeenCalled();
+    expect(forkWorker).not.toHaveBeenCalled();
+  });
+
+  it('CLI mismatch on restore → closes the active record even though a missing backing is normally kept', async () => {
+    // This is the config-switch case: the bot now points at a different CLI,
+    // but an old active session still has its original cliId frozen. A missing
+    // backing is normally kept for lazy resume, but a mismatch must still close:
+    // otherwise the next @mention would cold-resume the OLD CLI instead of
+    // creating a clean session with the current bot config. Mismatch-close is
+    // orthogonal to whether the backing pane survived.
+    probe.result = 'missing';
     const s = makeActivePersistentSession('om_cli_mismatch');
     s.cliId = 'codex';
     sessionStore.updateSession(s);
@@ -295,13 +468,118 @@ describe('restoreActiveSessions — persistent-backend zombie-close decision', (
     expect(forkWorker).not.toHaveBeenCalled();
   });
 
+  it('CLI mismatch on restore preserves and reattaches an unsettled Codex App ledger', async () => {
+    probe.result = 'exists';
+    const s = makeActivePersistentSession('om_cli_mismatch_pending');
+    s.cliId = 'codex-app';
+    s.codexAppDispatchLedger = [{
+      dispatchId: 'dispatch-pending',
+      turnId: 'turn-pending',
+      state: 'prepared',
+      content: 'prompt',
+      deliverySink: 'lark',
+    }];
+    sessionStore.updateSession(s);
+    const map = new Map<string, DaemonSession>();
+    wp.registry = map;
+
+    await restoreActiveSessions(map);
+
+    expect(closeSession).not.toHaveBeenCalled();
+    expect(sessionStore.getSession(s.sessionId)).toMatchObject({
+      status: 'active',
+      codexAppDispatchLedger: [{ dispatchId: 'dispatch-pending' }],
+    });
+    const restored = map.get(sessionKey('om_cli_mismatch_pending', 'app_test'));
+    expect(restored).toBeDefined();
+    expect(forkWorker).toHaveBeenCalledWith(restored, '', true);
+  });
+
+  it('isolates a failed ZMX mismatch teardown and continues closing later sessions', async () => {
+    const blocked = makeActivePersistentSession('om_zmx_mismatch_blocked', 'zmx');
+    blocked.cliId = 'codex';
+    sessionStore.updateSession(blocked);
+    const closable = makeActivePersistentSession('om_zmx_mismatch_closable', 'zmx');
+    closable.cliId = 'codex';
+    sessionStore.updateSession(closable);
+    vi.mocked(ZmxBackend.killManagedSession)
+      .mockImplementationOnce(() => { throw new Error('ownership probe unavailable'); })
+      .mockImplementationOnce(() => undefined);
+    const map = new Map<string, DaemonSession>();
+    wp.registry = map;
+    const events: any[] = [];
+    const off = dashboardEventBus.subscribe(event => events.push(event));
+
+    try {
+      await expect(restoreActiveSessions(map)).resolves.toBeUndefined();
+    } finally {
+      off();
+    }
+
+    expect(ZmxBackend.killManagedSession).toHaveBeenNthCalledWith(
+      1,
+      `bmx-${blocked.sessionId.slice(0, 8)}`,
+      blocked.sessionId,
+    );
+    expect(ZmxBackend.killManagedSession).toHaveBeenNthCalledWith(
+      2,
+      `bmx-${closable.sessionId.slice(0, 8)}`,
+      closable.sessionId,
+    );
+    expect(sessionStore.getSession(blocked.sessionId)?.status).toBe('active');
+    expect(sessionStore.getSession(blocked.sessionId)?.restoreQuarantinedAt).toEqual(expect.any(String));
+    expect(sessionStore.getSession(closable.sessionId)?.status).toBe('closed');
+    expect(closeSession).toHaveBeenCalledWith(closable.sessionId);
+    expect(closeSession).not.toHaveBeenCalledWith(blocked.sessionId);
+    expect(events).toContainEqual({
+      type: 'session.spawned',
+      body: {
+        session: expect.objectContaining({
+          sessionId: blocked.sessionId,
+          status: 'dormant',
+          quarantined: true,
+        }),
+      },
+    });
+    // The uncertain row remains retryable on disk but is not registered or
+    // reattached into the live map with its now-mismatched CLI.
+    expect(map.size).toBe(0);
+    expect(forkWorker).not.toHaveBeenCalled();
+  });
+
+  it('keeps a deferred ZMX row active when teardown is uncertain and restores later rows', async () => {
+    const hidden = makeActivePersistentSession('om_deferred_zmx_blocked', 'zmx');
+    hidden.deferredScheduleRun = {
+      taskId: 'task-hidden',
+      turnId: 'schedule:task-hidden:run-1',
+      routingAnchor: 'schedule-run:task-hidden:run-1',
+      createdAt: '2026-07-21T00:00:00.000Z',
+    };
+    sessionStore.updateSession(hidden);
+    const survivor = makeActivePersistentSession('om_restore_after_blocked');
+    sessionStore.updateSession(survivor);
+    vi.mocked(ZmxBackend.killManagedSession)
+      .mockImplementationOnce(() => { throw new Error('kill confirmation timed out'); });
+    const map = new Map<string, DaemonSession>();
+    wp.registry = map;
+
+    await expect(restoreActiveSessions(map)).resolves.toBeUndefined();
+
+    expect(sessionStore.getSession(hidden.sessionId)?.status).toBe('active');
+    expect(sessionStore.getSession(hidden.sessionId)?.restoreQuarantinedAt).toEqual(expect.any(String));
+    expect(closeSession).not.toHaveBeenCalledWith(hidden.sessionId);
+    expect(map.get(sessionKey('om_deferred_zmx_blocked', 'app_test'))).toBeUndefined();
+    expect(sessionStore.getSession(survivor.sessionId)?.status).toBe('active');
+    expect(map.get(sessionKey('om_restore_after_blocked', 'app_test'))?.session.sessionId).toBe(survivor.sessionId);
+    expect(forkWorker).toHaveBeenCalledTimes(1);
+  });
+
   it('wrapper mismatch on restore (same cliId) → closes the active record', async () => {
     // 'aiden x claude' and bare claude-code share cliId='claude-code' but are
     // distinct launch choices (selectionKeyForBot keys on cliId+wrapperCli).
     // A frozen wrapper snapshot that differs from the bot's current wrapper is
     // the same config-switch case as a cliId change and must close too.
     probe.result = 'missing';
-    server.state = 'down';
     const s = makeActivePersistentSession('om_wrapper_mismatch');
     s.wrapperCli = 'aiden x claude';
     s.agentFrozen = true;
@@ -320,7 +598,6 @@ describe('restoreActiveSessions — persistent-backend zombie-close decision', (
 
   it('frozen wrapper matching the bot wrapper → NOT a mismatch, session kept', async () => {
     probe.result = 'missing';
-    server.state = 'down';
     bot.wrapperCli = 'aiden x claude';
     const s = makeActivePersistentSession('om_wrapper_match');
     s.wrapperCli = 'aiden x claude';
@@ -342,7 +619,6 @@ describe('restoreActiveSessions — persistent-backend zombie-close decision', (
     // exactly what the bot is configured for — closing it would be a false
     // positive.
     probe.result = 'missing';
-    server.state = 'down';
     bot.wrapperCli = 'aiden x claude';
     const s = makeActivePersistentSession('om_wrapper_legacy');
     sessionStore.updateSession(s);
@@ -356,9 +632,8 @@ describe('restoreActiveSessions — persistent-backend zombie-close decision', (
     expect(sessionStore.getSession(s.sessionId)!.status).toBe('active');
   });
 
-  it('"missing" + server DOWN → keeps ALL sessions (no mass-close after reboot)', async () => {
+  it('"missing" for every session (host reboot) → keeps ALL of them (no mass-close)', async () => {
     probe.result = 'missing';
-    server.state = 'down';
     const a = makeActivePersistentSession('om_reboot_a');
     const b = makeActivePersistentSession('om_reboot_b');
     const c = makeActivePersistentSession('om_reboot_c');
@@ -376,14 +651,12 @@ describe('restoreActiveSessions — persistent-backend zombie-close decision', (
     expect(forkWorker).not.toHaveBeenCalled();
   });
 
-  it('"missing" + server UP but session was cap-suspended → keeps active for cold-resume (NOT a zombie)', async () => {
+  it('"missing" for a cap-suspended session → keeps active for cold-resume', async () => {
     // The idle-worker sweeper deliberately kills a session's backing pane + CLI
-    // over the per-bot cap. The server stays up (only one pane was killed), so
-    // without the suspend-intent marker this looks exactly like a solo zombie
-    // and would be wrongly closed — losing a session that should lazily
-    // cold-resume on the next message.
+    // over the per-bot cap, leaving suspendedColdResume set. Its backing probes
+    // 'missing' on restart; like every other missing managed backing it is kept
+    // worker-less and cold-resumes from the transcript on the next message.
     probe.result = 'missing';
-    server.state = 'running';
     const s = makeActivePersistentSession('om_cap_suspended');
     s.suspendedColdResume = true;
     sessionStore.updateSession(s);
@@ -397,20 +670,6 @@ describe('restoreActiveSessions — persistent-backend zombie-close decision', (
     expect(ds).toBeDefined();              // active record retained…
     expect(ds!.worker).toBeNull();         // …worker-less, cold-resumes on next message
     expect(sessionStore.getSession(s.sessionId)!.status).toBe('active'); // NOT closed
-    expect(forkWorker).not.toHaveBeenCalled();
-  });
-
-  it('"missing" + server state UNKNOWN → closes (conservative, server may be up)', async () => {
-    probe.result = 'missing';
-    server.state = 'unknown';
-    const s = makeActivePersistentSession('om_missing_unknown_server');
-    const map = new Map<string, DaemonSession>();
-    wp.registry = map;
-
-    await restoreActiveSessions(map);
-
-    expect(closeSession).toHaveBeenCalledWith(s.sessionId);
-    expect(sessionStore.getSession(s.sessionId)!.status).toBe('closed');
     expect(forkWorker).not.toHaveBeenCalled();
   });
 
@@ -516,6 +775,85 @@ describe('restoreActiveSessions — persistent-backend zombie-close decision', (
     expect(forkWorker).toHaveBeenCalledWith(restored, '', true);
     expect(sessionStore.getSession(s.sessionId)?.lastCodexAppInput).toEqual(expected);
   });
+
+  it('isolates a same-anchor pending collision without aborting startup and preserves both rows', async () => {
+    probe.result = 'exists';
+    bot.cliId = 'codex-app';
+    const first = makeActivePersistentSession('om_pending_collision');
+    first.codexAppDispatchLedger = [{
+      dispatchId: 'dispatch-first',
+      turnId: 'turn-first',
+      state: 'prepared',
+      content: 'first owned output',
+      deliverySink: 'lark',
+    }];
+    sessionStore.updateSession(first);
+    const second = makeActivePersistentSession('om_pending_collision');
+    second.codexAppDispatchLedger = [{
+      dispatchId: 'dispatch-second',
+      turnId: 'turn-second',
+      state: 'prepared',
+      content: 'second owned output',
+      deliverySink: 'lark',
+    }];
+    sessionStore.updateSession(second);
+    const map = new Map<string, DaemonSession>();
+    wp.registry = map;
+
+    await expect(restoreActiveSessions(map)).resolves.toBeUndefined();
+
+    expect(sessionStore.getSession(first.sessionId)?.status).toBe('active');
+    expect(sessionStore.getSession(second.sessionId)?.status).toBe('active');
+    expect(closeSession).not.toHaveBeenCalled();
+    const canonical = map.get(sessionKey('om_pending_collision', 'app_test'))!;
+    expect(canonical.session.sessionId).toBe(first.sessionId);
+    expect(forkWorker).toHaveBeenCalledTimes(1);
+    expect(forkWorker).toHaveBeenCalledWith(canonical, '', true);
+  });
+});
+
+describe('resumeSession — disk-only legacy anchor collision', () => {
+  it('refuses a legacy unscoped real owner instead of ghosting it', async () => {
+    const target = makeActivePersistentSession('om_resume_legacy_conflict');
+    sessionStore.closeSession(target.sessionId);
+    const legacyOwner = makeActivePersistentSession('om_resume_legacy_conflict');
+    legacyOwner.larkAppId = undefined;
+    legacyOwner.lastCliInput = 'existing conversation';
+    sessionStore.updateSession(legacyOwner);
+    const map = new Map<string, DaemonSession>();
+    wp.registry = map;
+
+    const result = await resumeSession(target.sessionId, map);
+
+    expect(result).toEqual({
+      ok: false,
+      error: 'anchor_occupied',
+      activeSessionId: legacyOwner.sessionId,
+    });
+    expect(sessionStore.getSession(target.sessionId)?.status).toBe('closed');
+    expect(sessionStore.getSession(legacyOwner.sessionId)?.status).toBe('active');
+    expect(map.size).toBe(0);
+  });
+
+  it('closes a disk-only legacy scratch before reactivating the requested session', async () => {
+    const target = makeActivePersistentSession('om_resume_legacy_scratch');
+    sessionStore.closeSession(target.sessionId);
+    const legacyScratch = makeActivePersistentSession('om_resume_legacy_scratch');
+    legacyScratch.larkAppId = undefined;
+    legacyScratch.cliId = undefined;
+    legacyScratch.lastCliInput = undefined;
+    sessionStore.updateSession(legacyScratch);
+    const map = new Map<string, DaemonSession>();
+    wp.registry = map;
+
+    const result = await resumeSession(target.sessionId, map);
+
+    expect(result.ok).toBe(true);
+    expect(sessionStore.getSession(legacyScratch.sessionId)?.status).toBe('closed');
+    expect(sessionStore.getSession(target.sessionId)?.status).toBe('active');
+    expect(map.get(sessionKey('om_resume_legacy_scratch', 'app_test'))?.session.sessionId)
+      .toBe(target.sessionId);
+  });
 });
 
 // ─── Runtime hot-switch sweep (closeCliMismatchedSessionsForBot) ─────────────
@@ -579,6 +917,110 @@ describe('closeCliMismatchedSessionsForBot — runtime CLI hot-switch sweep', ()
     expect(sessionStore.getSession(s.sessionId)!.status).toBe('closed');
   });
 
+  it('closes runtime identity mismatches and describes both distributions in the warning', async () => {
+    bot.cliId = 'codex';
+    bot.cliRuntime = {
+      id: 'current-codex',
+      displayName: 'Current Codex',
+      executable: '/opt/current-codex',
+      update: { provider: 'none' },
+    };
+    bot.cliPathOverride = '/opt/current-codex';
+    const s = makeActivePersistentSession('om_rt_runtime_mismatch');
+    s.agentFrozen = true;
+    s.cliRuntime = {
+      id: 'frozen-codex',
+      displayName: 'Frozen Codex',
+      executable: '/opt/frozen-codex',
+      source: 'configured',
+      update: { provider: 'self' },
+    };
+    s.cliPathOverride = '/opt/frozen-codex';
+    sessionStore.updateSession(s);
+    registerDs(s);
+
+    expect(await closeCliMismatchedSessionsForBot('app_test')).toBe(1);
+    expect(sessionStore.getSession(s.sessionId)!.status).toBe('closed');
+    const warnings = vi.mocked(logger.warn).mock.calls.flat().join('\n');
+    expect(warnings).toContain('session=Frozen Codex');
+    expect(warnings).toContain('bot=Current Codex');
+  });
+
+  it('closes an old frozen path when its source differs from a configured runtime with the same id', async () => {
+    bot.cliId = 'codex';
+    bot.cliRuntime = {
+      id: 'vendor-codex',
+      displayName: 'VendorCodex',
+      executable: '/opt/new-location/vendor-codex',
+      update: { provider: 'self' },
+    };
+    bot.cliPathOverride = '/opt/new-location/vendor-codex';
+    const s = makeActivePersistentSession('om_rt_legacy_runtime_match');
+    s.agentFrozen = true;
+    s.cliPathOverride = '/opt/old-location/vendor-codex';
+    sessionStore.updateSession(s);
+    registerDs(s);
+
+    expect(await closeCliMismatchedSessionsForBot('app_test')).toBe(1);
+    expect(closeSession).toHaveBeenCalledWith(s.sessionId);
+    expect(sessionStore.getSession(s.sessionId)!.status).toBe('closed');
+  });
+
+  it('does not treat a legacy executable named codex as the official runtime', async () => {
+    bot.cliId = 'codex';
+    bot.cliRuntime = undefined;
+    bot.cliPathOverride = undefined;
+    const s = makeActivePersistentSession('om_rt_legacy_codex');
+    s.agentFrozen = true;
+    s.cliPathOverride = 'codex';
+    sessionStore.updateSession(s);
+    registerDs(s);
+
+    expect(await closeCliMismatchedSessionsForBot('app_test')).toBe(1);
+    expect(closeSession).toHaveBeenCalledWith(s.sessionId);
+    expect(sessionStore.getSession(s.sessionId)!.status).toBe('closed');
+  });
+
+  it('does not compare runtime identity before a legacy session is agentFrozen', async () => {
+    bot.cliId = 'codex';
+    bot.cliRuntime = {
+      id: 'current-codex',
+      executable: '/opt/current-codex',
+      update: { provider: 'none' },
+    };
+    bot.cliPathOverride = '/opt/current-codex';
+    const s = makeActivePersistentSession('om_rt_unfrozen_runtime');
+    s.cliPathOverride = '/opt/legacy-codex';
+    sessionStore.updateSession(s);
+    registerDs(s);
+
+    expect(await closeCliMismatchedSessionsForBot('app_test')).toBe(0);
+    expect(closeSession).not.toHaveBeenCalledWith(s.sessionId);
+    expect(sessionStore.getSession(s.sessionId)!.status).toBe('active');
+  });
+
+  it('defers a CLI-mismatch close during relay and resweeps after the gate settles', async () => {
+    const s = makeActivePersistentSession('om_rt_transfer');
+    s.cliId = 'codex';
+    sessionStore.updateSession(s);
+    const ds = registerDs(s);
+    transferState.active.add(ds);
+
+    expect(await closeCliMismatchedSessionsForBot('app_test')).toBe(0);
+    expect(closeSession).not.toHaveBeenCalledWith(s.sessionId);
+    expect(sessionStore.getSession(s.sessionId)!.status).toBe('active');
+
+    const callbacks = [...(transferState.callbacks.get(ds) ?? [])];
+    expect(callbacks).toHaveLength(1);
+    transferState.active.delete(ds);
+    for (const callback of callbacks) callback();
+
+    await vi.waitFor(() => {
+      expect(closeSession).toHaveBeenCalledWith(s.sessionId);
+      expect(sessionStore.getSession(s.sessionId)!.status).toBe('closed');
+    });
+  });
+
   it('exempts queued and adopt sessions, and other bots\' sessions', async () => {
     const queued = makeActivePersistentSession('om_rt_queued');
     queued.cliId = 'codex';
@@ -620,6 +1062,29 @@ describe('closeCliMismatchedSessionsForBot — runtime CLI hot-switch sweep', ()
     expect(await closeCliMismatchedSessionsForBot('app_test')).toBe(1);
     expect(closeSession).toHaveBeenCalledWith(s.sessionId);
     expect(TmuxBackend.killSession).not.toHaveBeenCalled();
+  });
+
+  it('isolates a failed ZMX teardown during a runtime sweep and continues', async () => {
+    const blocked = makeActivePersistentSession('om_rt_zmx_blocked', 'zmx');
+    blocked.cliId = 'codex';
+    sessionStore.updateSession(blocked);
+    registerDs(blocked);
+    const closable = makeActivePersistentSession('om_rt_zmx_closable', 'zmx');
+    closable.cliId = 'codex';
+    sessionStore.updateSession(closable);
+    registerDs(closable);
+    vi.mocked(ZmxBackend.killManagedSession)
+      .mockImplementationOnce(() => { throw new Error('ownership probe unavailable'); })
+      .mockImplementationOnce(() => undefined);
+
+    await expect(closeCliMismatchedSessionsForBot('app_test')).resolves.toBe(1);
+
+    expect(sessionStore.getSession(blocked.sessionId)?.status).toBe('active');
+    expect(wp.registry!.get(sessionKey('om_rt_zmx_blocked', 'app_test'))?.session.sessionId).toBe(blocked.sessionId);
+    expect(sessionStore.getSession(closable.sessionId)?.status).toBe('closed');
+    expect(wp.registry!.get(sessionKey('om_rt_zmx_closable', 'app_test'))).toBeUndefined();
+    expect(closeSession).toHaveBeenCalledWith(closable.sessionId);
+    expect(closeSession).not.toHaveBeenCalledWith(blocked.sessionId);
   });
 
   it('returns 0 when the registry is not initialized', async () => {

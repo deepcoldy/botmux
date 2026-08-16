@@ -6,7 +6,7 @@ import { mkdtempSync, writeFileSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it, expect, beforeEach } from 'vitest';
-import { buildTeamRoster } from '../src/services/team-roster.js';
+import { buildTeamRoster, resolveLiveBotTransport } from '../src/services/team-roster.js';
 import { setBotCapability } from '../src/services/bot-profile-store.js';
 import { setBotOwner } from '../src/services/bot-owner-store.js';
 import { ensureDefaultTeam, addMember, DEFAULT_TEAM_ID } from '../src/services/team-store.js';
@@ -97,5 +97,31 @@ describe('buildTeamRoster', () => {
     expect(r.bots.map(b => b.larkAppId)).toEqual(['cli_a', 'cli_b', 'cli_c', 'cli_x']);
     // no configOrder → unchanged bots-info order
     expect(buildTeamRoster(dataDir).bots.map(b => b.larkAppId)).toEqual(['cli_c', 'cli_a', 'cli_x', 'cli_b']);
+  });
+});
+
+describe('resolveLiveBotTransport（federated 出站 transport 标注，config 不可读时 fail-closed）', () => {
+  const bots = [{ larkAppId: 'cli_normal' }, { larkAppId: 'cli_core' }];
+
+  it('healthy config: per-bot flag — apiOnly=false-transport, normal=true-transport', () => {
+    const out = resolveLiveBotTransport(bots, new Set(['cli_core']));
+    expect(out.find(b => b.larkAppId === 'cli_normal')!.larkTransportEnabled).toBe(true);
+    expect(out.find(b => b.larkAppId === 'cli_core')!.larkTransportEnabled).toBe(false);
+  });
+
+  it('no apiOnly bots → all transport=true', () => {
+    expect(resolveLiveBotTransport(bots, new Set()).every(b => b.larkTransportEnabled === true)).toBe(true);
+  });
+
+  it('FAIL-CLOSED: config unreadable (null) → EVERY bot transport=false (never fail-open to true)', () => {
+    const out = resolveLiveBotTransport(bots, null);
+    expect(out.every(b => b.larkTransportEnabled === false)).toBe(true);
+    // 关键安全属性：不能因为读不到 config 就把 core-only bot 当 normal 放行。
+    expect(out.find(b => b.larkAppId === 'cli_normal')!.larkTransportEnabled).toBe(false);
+  });
+
+  it('preserves other fields (spread), only adds larkTransportEnabled', () => {
+    const out = resolveLiveBotTransport([{ larkAppId: 'cli_x', botName: 'X', cliId: 'claude-code' }], new Set());
+    expect(out[0]).toEqual({ larkAppId: 'cli_x', botName: 'X', cliId: 'claude-code', larkTransportEnabled: true });
   });
 });

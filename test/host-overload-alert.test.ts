@@ -6,6 +6,11 @@ import {
   buildOverloadRecoveredCard,
   buildOverloadExpiredCard,
   initialOverloadCardState,
+  computeOverloadThresholds,
+  parseOverloadEnvFloat,
+  isValidEnterLoadRatio,
+  isValidEnterMemUsedFrac,
+  isOverloadAlertTarget,
   OVERLOAD_ACTION_CLEAN_STOPPED,
   OVERLOAD_ACTION_SUSPEND_IDLE,
   OVERLOAD_ACTION_NOOP,
@@ -253,5 +258,199 @@ describe('overload nonce (one-shot per action)', () => {
     expect(claimOverloadNonce('n1', OVERLOAD_ACTION_SUSPEND_IDLE)).toBe(true);
     // Release on an unknown nonce is a no-op (no throw).
     expect(() => releaseOverloadNonce('never-issued', OVERLOAD_ACTION_CLEAN_STOPPED)).not.toThrow();
+  });
+});
+
+describe('parseOverloadEnvFloat', () => {
+  it('parses a valid non-negative number (default predicate allows 0)', () => {
+    expect(parseOverloadEnvFloat('2.5', 1)).toBe(2.5);
+    expect(parseOverloadEnvFloat('0', 1)).toBe(0); // 0 is legal for exit lines / minReAlertMs
+  });
+  it('falls back on unset / blank / non-finite / negative', () => {
+    expect(parseOverloadEnvFloat(undefined, 1.5)).toBe(1.5);
+    expect(parseOverloadEnvFloat('   ', 1.5)).toBe(1.5);
+    expect(parseOverloadEnvFloat('abc', 1.5)).toBe(1.5);
+    expect(parseOverloadEnvFloat('-3', 1.5)).toBe(1.5);
+    expect(parseOverloadEnvFloat('NaN', 1.5)).toBe(1.5);
+  });
+  it('honours a stricter isValid predicate (enter thresholds reject 0 / out-of-range)', () => {
+    expect(parseOverloadEnvFloat('0', 1.5, isValidEnterLoadRatio)).toBe(1.5); // load must be > 0
+    expect(parseOverloadEnvFloat('2', 1.5, isValidEnterLoadRatio)).toBe(2);
+    expect(parseOverloadEnvFloat('0', 0.9, isValidEnterMemUsedFrac)).toBe(0.9); // mem must be > 0
+    expect(parseOverloadEnvFloat('1.5', 0.9, isValidEnterMemUsedFrac)).toBe(0.9); // mem must be <= 1
+    expect(parseOverloadEnvFloat('0.8', 0.9, isValidEnterMemUsedFrac)).toBe(0.8);
+  });
+});
+
+describe('computeOverloadThresholds — enter priority (env > config > default)', () => {
+  it('uses built-in defaults when neither env nor config is provided', () => {
+    const t = computeOverloadThresholds({ cpuCount: 8 });
+    expect(t.cpuCount).toBe(8);
+    expect(t.enterLoadRatio).toBe(DEFAULT_OVERLOAD_THRESHOLDS.enterLoadRatio);
+    expect(t.enterMemUsedFrac).toBe(DEFAULT_OVERLOAD_THRESHOLDS.enterMemUsedFrac);
+    expect(t.exitLoadRatio).toBe(DEFAULT_OVERLOAD_THRESHOLDS.exitLoadRatio);
+    expect(t.exitMemUsedFrac).toBe(DEFAULT_OVERLOAD_THRESHOLDS.exitMemUsedFrac);
+    expect(t.minReAlertMs).toBe(DEFAULT_OVERLOAD_THRESHOLDS.minReAlertMs);
+  });
+
+  it('config enter values override the defaults', () => {
+    const t = computeOverloadThresholds({
+      cpuCount: 8,
+      configEnterLoadRatio: 2.0,
+      configEnterMemUsedFrac: 0.8,
+    });
+    expect(t.enterLoadRatio).toBe(2.0);
+    expect(t.enterMemUsedFrac).toBe(0.8);
+  });
+
+  it('env enter values win over config', () => {
+    const t = computeOverloadThresholds({
+      cpuCount: 8,
+      configEnterLoadRatio: 2.0,
+      configEnterMemUsedFrac: 0.8,
+      env: { enterLoadRatio: '3.0', enterMemUsedFrac: '0.7' },
+    });
+    expect(t.enterLoadRatio).toBe(3.0);
+    expect(t.enterMemUsedFrac).toBe(0.7);
+  });
+
+  it('ignores garbage / out-of-range config enter values and falls back to default', () => {
+    const t = computeOverloadThresholds({
+      cpuCount: 8,
+      configEnterLoadRatio: -1, // not positive
+      configEnterMemUsedFrac: 1.5, // > 1
+    });
+    expect(t.enterLoadRatio).toBe(DEFAULT_OVERLOAD_THRESHOLDS.enterLoadRatio);
+    expect(t.enterMemUsedFrac).toBe(DEFAULT_OVERLOAD_THRESHOLDS.enterMemUsedFrac);
+  });
+
+  it('rejects a degenerate env enter=0 (would break hysteresis / flap) and falls back', () => {
+    // enter load 0 → 95% clamp is still 0, so "exit strictly below enter" is
+    // impossible; enter mem 0 additionally flaps entered/recovered every tick.
+    const t = computeOverloadThresholds({
+      cpuCount: 8,
+      configEnterLoadRatio: 2.0,
+      configEnterMemUsedFrac: 0.8,
+      env: { enterLoadRatio: '0', enterMemUsedFrac: '0' },
+    });
+    // env was invalid → fall back to the (valid) config values, NOT 0.
+    expect(t.enterLoadRatio).toBe(2.0);
+    expect(t.enterMemUsedFrac).toBe(0.8);
+  });
+
+  it('rejects an env enter mem > 1 (never triggers) and falls back to default', () => {
+    const t = computeOverloadThresholds({ cpuCount: 8, env: { enterMemUsedFrac: '1.5' } });
+    expect(t.enterMemUsedFrac).toBe(DEFAULT_OVERLOAD_THRESHOLDS.enterMemUsedFrac);
+  });
+
+  it('accepts a full-memory enter of exactly 1.0 (boundary)', () => {
+    const t = computeOverloadThresholds({ cpuCount: 8, env: { enterMemUsedFrac: '1' } });
+    expect(t.enterMemUsedFrac).toBe(1);
+  });
+
+  it('clamps cpuCount to at least 1', () => {
+    expect(computeOverloadThresholds({ cpuCount: 0 }).cpuCount).toBe(1);
+    expect(computeOverloadThresholds({ cpuCount: -4 }).cpuCount).toBe(1);
+    expect(computeOverloadThresholds({ cpuCount: Number.NaN }).cpuCount).toBe(1);
+  });
+});
+
+describe('computeOverloadThresholds — hysteresis (exit strictly below enter)', () => {
+  it('keeps a valid exit that already sits below enter', () => {
+    const t = computeOverloadThresholds({
+      cpuCount: 8,
+      env: { enterLoadRatio: '2.0', exitLoadRatio: '1.5', enterMemUsedFrac: '0.9', exitMemUsedFrac: '0.8' },
+    });
+    expect(t.enterLoadRatio).toBe(2.0);
+    expect(t.exitLoadRatio).toBe(1.5);
+    expect(t.enterMemUsedFrac).toBe(0.9);
+    expect(t.exitMemUsedFrac).toBe(0.8);
+  });
+
+  it('clamps a misconfigured exit >= enter down to 95% of enter and warns', () => {
+    const warnings: string[] = [];
+    const t = computeOverloadThresholds({
+      cpuCount: 8,
+      env: { enterLoadRatio: '1.0', exitLoadRatio: '2.0', enterMemUsedFrac: '0.5', exitMemUsedFrac: '0.9' },
+      warn: (m) => warnings.push(m),
+    });
+    // exit was >= enter for BOTH dimensions → both clamped to 0.95 * enter.
+    expect(t.exitLoadRatio).toBeCloseTo(0.95, 10);
+    expect(t.exitMemUsedFrac).toBeCloseTo(0.475, 10);
+    expect(t.exitLoadRatio).toBeLessThan(t.enterLoadRatio);
+    expect(t.exitMemUsedFrac).toBeLessThan(t.enterMemUsedFrac);
+    expect(warnings.length).toBe(2);
+    expect(warnings.some(w => w.includes('EXIT_LOAD_RATIO'))).toBe(true);
+    expect(warnings.some(w => w.includes('EXIT_MEM_FRAC'))).toBe(true);
+  });
+
+  it('clamps exit == enter (the flapping boundary) too, not just exit > enter', () => {
+    const t = computeOverloadThresholds({
+      cpuCount: 8,
+      env: { enterLoadRatio: '1.5', exitLoadRatio: '1.5', enterMemUsedFrac: '0.9', exitMemUsedFrac: '0.9' },
+    });
+    expect(t.exitLoadRatio).toBeLessThan(t.enterLoadRatio);
+    expect(t.exitMemUsedFrac).toBeLessThan(t.enterMemUsedFrac);
+  });
+
+  it('the clamped thresholds actually stop the state machine from flapping at the enter line', () => {
+    // Enter mem 0.9, exit misconfigured to 0.9 → clamp to 0.855. A reading pinned
+    // exactly at 0.9 must NOT recover on the next tick (the whole point of the gap).
+    const t = computeOverloadThresholds({
+      cpuCount: 10,
+      env: { enterMemUsedFrac: '0.9', exitMemUsedFrac: '0.9' },
+    });
+    const at90 = { load15: 1, memTotalBytes: 100, memFreeBytes: 10 }; // 90% used
+    const entered = evaluateOverload(INITIAL_OVERLOAD_STATE, at90, { cpuCount: 10, ...DEFAULT_OVERLOAD_THRESHOLDS, ...t }, 1_000);
+    expect(entered.nextState.overloaded).toBe(true);
+    const stillPinned = evaluateOverload(entered.nextState, at90, { cpuCount: 10, ...DEFAULT_OVERLOAD_THRESHOLDS, ...t }, 2_000);
+    expect(stillPinned.nextState.overloaded).toBe(true); // did not flap back to healthy
+    expect(stillPinned.action).toBeUndefined();
+  });
+
+  it('passes through minReAlertMs from env, else default', () => {
+    expect(computeOverloadThresholds({ cpuCount: 8, env: { minReAlertMs: '60000' } }).minReAlertMs).toBe(60000);
+    expect(computeOverloadThresholds({ cpuCount: 8 }).minReAlertMs).toBe(DEFAULT_OVERLOAD_THRESHOLDS.minReAlertMs);
+  });
+});
+
+describe('isOverloadAlertTarget — machine-level target gating', () => {
+  const SELF = 'cli_self';
+
+  it('true only when enabled AND this daemon is the named target', () => {
+    expect(isOverloadAlertTarget({ enabled: true, targetBotAppId: SELF }, SELF)).toBe(true);
+    expect(isOverloadAlertTarget({ enabled: true, targetBotAppId: SELF }, { larkAppId: SELF })).toBe(true);
+  });
+
+  it('false when disabled, even if this daemon is the target', () => {
+    expect(isOverloadAlertTarget({ enabled: false, targetBotAppId: SELF }, SELF)).toBe(false);
+  });
+
+  it('false when the target is a different bot (other daemons must no-op + reset)', () => {
+    expect(isOverloadAlertTarget({ enabled: true, targetBotAppId: 'cli_other' }, SELF)).toBe(false);
+  });
+
+  it('false when no target is set, or config is empty / undefined', () => {
+    expect(isOverloadAlertTarget({ enabled: true }, SELF)).toBe(false);
+    expect(isOverloadAlertTarget({}, SELF)).toBe(false);
+    expect(isOverloadAlertTarget(undefined, SELF)).toBe(false);
+  });
+
+  it('FAIL-CLOSED on apiOnly: an apiOnly bot never samples even if named as target', () => {
+    // A hand-edited config or pre-apiOnly-aware migration could name an apiOnly
+    // bot; it has no Feishu transport so it must not advance the state machine
+    // and then silently drop the DM.
+    expect(isOverloadAlertTarget({ enabled: true, targetBotAppId: SELF }, { larkAppId: SELF, apiOnly: true })).toBe(false);
+    // Non-apiOnly (explicit false / omitted) still samples.
+    expect(isOverloadAlertTarget({ enabled: true, targetBotAppId: SELF }, { larkAppId: SELF, apiOnly: false })).toBe(true);
+  });
+
+  it('models the target-switch → state-reset gate: non-target ticks are gated off', () => {
+    // The watcher resets local state whenever the gate is false, so a bot that
+    // was the target and then loses it stops sampling on the very next tick.
+    let cfg: { enabled?: boolean; targetBotAppId?: string } = { enabled: true, targetBotAppId: SELF };
+    expect(isOverloadAlertTarget(cfg, SELF)).toBe(true); // sampling
+    cfg = { enabled: true, targetBotAppId: 'cli_other' }; // target switched away
+    expect(isOverloadAlertTarget(cfg, SELF)).toBe(false); // → caller resets state, no stale edge
   });
 });

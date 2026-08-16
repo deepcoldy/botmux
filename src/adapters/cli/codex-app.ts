@@ -6,6 +6,14 @@ import type { CliAdapter, PtyHandle } from './types.js';
 import { writeRunnerInput } from './runner-input.js';
 
 function runnerPath(): string {
+  // Source-level worker integration tests execute through tsx and need the
+  // matching source runner rather than a possibly absent/stale ignored dist
+  // tree. Keep the override strictly test-scoped so production launch
+  // resolution remains canonical and cannot be redirected by ambient env.
+  const testOverride = process.env.NODE_ENV === 'test'
+    ? process.env.BOTMUX_TEST_CODEX_APP_RUNNER_PATH
+    : undefined;
+  if (testOverride) return resolve(testOverride);
   const here = dirname(fileURLToPath(import.meta.url));
   const compiledSibling = resolve(here, '..', '..', 'codex-app-runner.js');
   if (existsSync(compiledSibling)) return compiledSibling;
@@ -43,7 +51,7 @@ export function createCodexAppAdapter(pathOverride?: string): CliAdapter {
       return [(cachedCodexBin ??= resolveCommand(rawCodexBin))];
     },
 
-    buildArgs({ sessionId, resume, resumeSessionId, workingDir, botName, botOpenId, locale }) {
+    buildArgs({ sessionId, resume, resumeSessionId, workingDir, botName, botOpenId, locale, model, reasoningEffort }) {
       const args = [
         runnerPath(),
         '--session-id', sessionId,
@@ -54,6 +62,10 @@ export function createCodexAppAdapter(pathOverride?: string): CliAdapter {
       pushOpt(args, '--bot-name', botName);
       pushOpt(args, '--bot-open-id', botOpenId);
       pushOpt(args, '--locale', locale);
+      // Per-turn overrides (async trigger API). The runner injects them into the
+      // app-server thread/start (model + config.model_reasoning_effort).
+      pushOpt(args, '--model', model && model.trim() ? model.trim() : undefined);
+      pushOpt(args, '--reasoning-effort', reasoningEffort);
       return args;
     },
 
@@ -68,7 +80,14 @@ export function createCodexAppAdapter(pathOverride?: string): CliAdapter {
       // Chunked + throttled stdin injection — a single send-keys of the whole
       // (potentially ~20KB) control line overruns the pane pty input buffer and
       // gets dropped. See runner-input.ts.
-      return writeRunnerInput(pty, '::botmux-codex-app:', content, undefined, context?.turnId);
+      return writeRunnerInput(
+        pty,
+        '::botmux-codex-app:',
+        content,
+        undefined,
+        context?.turnId,
+        context?.codexAppSteerable,
+      );
     },
 
     async writeStructuredInput(pty, content, codexAppInput, context) {
@@ -81,6 +100,7 @@ export function createCodexAppAdapter(pathOverride?: string): CliAdapter {
         content,
         codexAppInput,
         context?.turnId,
+        context?.codexAppSteerable,
       );
     },
 

@@ -2,7 +2,8 @@
  * Integration tests for the stuck-warning state machine in worker-pool.ts.
  *
  * Exercises the REAL message handlers (stuck_warning / tui_keys_delivered /
- * stuck_warning_expired) via __testOnly_setupWorkerHandlers, with a deferred
+ * stuck_warning_expired / tui_prompt_submit_failed) via
+ * __testOnly_setupWorkerHandlers, with a deferred
  * sessionReply to simulate in-flight card POSTs.
  *
  * Covers (PR #559 review rounds 3-5):
@@ -19,7 +20,11 @@
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { EventEmitter } from 'node:events';
-import { initWorkerPool, __testOnly_setupWorkerHandlers } from '../src/core/worker-pool.js';
+import {
+  initWorkerPool,
+  __testOnly_reserveWorkerGeneration,
+  __testOnly_setupWorkerHandlers,
+} from '../src/core/worker-pool.js';
 import type { DaemonSession } from '../src/core/types.js';
 
 // ─── Mocks ─────────────────────────────────────────────────────────────────
@@ -37,6 +42,7 @@ vi.mock('../src/im/lark/client.js', () => ({
 vi.mock('../src/im/lark/card-builder.js', () => ({
   buildTuiPromptCard: vi.fn(() => '{"type":"tui_prompt"}'),
   buildTuiPromptResolvedCard: vi.fn((text: string) => JSON.stringify({ type: 'resolved', text })),
+  buildTuiPromptFailedCard: vi.fn((text: string) => JSON.stringify({ type: 'failed', text })),
   buildTuiPromptProcessingCard: vi.fn((text: string) => JSON.stringify({ type: 'processing', text })),
   buildStreamingCard: vi.fn(() => '{}'),
   buildSessionCard: vi.fn(() => '{}'),
@@ -62,6 +68,9 @@ vi.mock('../src/config.js', () => ({
 }));
 
 vi.mock('../src/services/session-store.js', () => ({
+  registerSessionBridgeSendMarkerCleanupFence: vi.fn(),
+  cleanupSessionBridgeSendMarkers: vi.fn(),
+  cleanupSessionBridgeSendMarkersNow: vi.fn(),
   closeSession: vi.fn(),
   updateSession: vi.fn(),
 }));
@@ -294,6 +303,281 @@ describe('stuck-warning state machine (integration)', () => {
     expect(updateMessageMock).toHaveBeenCalledTimes(1);
     expect(ds.stuckWarningCardId).toBeUndefined();
     expect(ds.stuckWarningNonce).toBeUndefined();
+  });
+
+  it('backend delivery failure renders a failure state and clears stuck-card authority', async () => {
+    const fakeWorker = makeFakeWorker();
+    const ds = makeDs({ worker: fakeWorker });
+    __testOnly_setupWorkerHandlers(ds, fakeWorker);
+
+    fakeWorker.emit('message', {
+      type: 'stuck_warning',
+      elapsedMs: 15000,
+      snapshot: '...',
+      matchedPattern: 'hook review level 1',
+      turnId: 'turn_1',
+      cliLifetime: 1,
+    });
+    await flush();
+    sessionReplyDeferred.resolve('om_card_1');
+    await flush();
+
+    fakeWorker.emit('message', {
+      type: 'tui_prompt_submit_failed',
+      stuckNonce: 1,
+      turnId: 'turn_1',
+    });
+    await flush();
+
+    expect(updateMessageMock).toHaveBeenCalledWith(
+      'app_test',
+      'om_card_1',
+      expect.stringContaining('"type":"failed"'),
+    );
+    expect(ds.stuckWarningCardId).toBeUndefined();
+    expect(ds.stuckWarningNonce).toBeUndefined();
+  });
+
+  it('normal TUI cards resolve only from a matching worker ACK', async () => {
+    const fakeWorker = makeFakeWorker();
+    const ds = makeDs({ worker: fakeWorker });
+    __testOnly_setupWorkerHandlers(ds, fakeWorker);
+    ds.tuiPromptCardId = 'om_tui_card';
+    ds.tuiPromptProcessing = true;
+    ds.tuiPromptOptions = [
+      { text: 'Approve', selected: false, type: 'select', keys: ['Enter'] },
+    ];
+
+    fakeWorker.emit('message', {
+      type: 'tui_prompt_resolved',
+      cardMessageId: 'om_old_card',
+      selectedText: 'stale',
+    });
+    await flush();
+    expect(updateMessageMock).not.toHaveBeenCalled();
+    expect(ds.tuiPromptCardId).toBe('om_tui_card');
+    expect(ds.tuiPromptProcessing).toBe(true);
+
+    fakeWorker.emit('message', {
+      type: 'tui_prompt_resolved',
+      cardMessageId: 'om_tui_card',
+      selectedText: 'Approve',
+    });
+    await flush();
+    expect(updateMessageMock).toHaveBeenCalledTimes(1);
+    expect(ds.tuiPromptCardId).toBeUndefined();
+    expect(ds.tuiPromptProcessing).toBe(false);
+  });
+
+  it('normal TUI backend failure renders failed instead of selected', async () => {
+    const fakeWorker = makeFakeWorker();
+    const ds = makeDs({ worker: fakeWorker });
+    __testOnly_setupWorkerHandlers(ds, fakeWorker);
+    ds.tuiPromptCardId = 'om_tui_card';
+    ds.tuiPromptProcessing = true;
+    ds.tuiPromptOptions = [
+      { text: 'Approve', selected: false, type: 'select', keys: ['Enter'] },
+    ];
+    sessionReplyDeferred.resolve('om_failure_notice');
+
+    fakeWorker.emit('message', {
+      type: 'tui_prompt_submit_failed',
+      cardMessageId: 'om_tui_card',
+    });
+    await flush();
+
+    expect(updateMessageMock).toHaveBeenCalledWith(
+      'app_test',
+      'om_tui_card',
+      expect.stringContaining('"type":"failed"'),
+    );
+    expect(ds.tuiPromptCardId).toBeUndefined();
+    expect(ds.tuiPromptProcessing).toBe(false);
+  });
+
+  it('stale worker generation cannot resolve the replacement TUI card', async () => {
+    const fakeWorker = makeFakeWorker();
+    const ds = makeDs({ worker: fakeWorker });
+    __testOnly_setupWorkerHandlers(ds, fakeWorker);
+    ds.tuiPromptCardId = 'om_replacement_card';
+    ds.tuiPromptProcessing = true;
+    ds.tuiPromptOptions = [
+      { text: 'Keep', selected: false, type: 'select', keys: ['Enter'] },
+    ];
+    ds.tuiPromptMultiSelect = true;
+    ds.tuiToggledIndices = [0];
+
+    const replacementGeneration = (ds.workerGeneration ?? 0) + 1;
+    ds.workerGeneration = replacementGeneration;
+    ds.session.workerGeneration = replacementGeneration;
+
+    fakeWorker.emit('message', {
+      type: 'tui_prompt_resolved',
+      cardMessageId: 'om_replacement_card',
+      selectedText: 'stale worker',
+    });
+    await flush();
+
+    expect(updateMessageMock).not.toHaveBeenCalled();
+    expect(ds.tuiPromptCardId).toBe('om_replacement_card');
+    expect(ds.tuiPromptProcessing).toBe(true);
+    expect(ds.tuiPromptOptions).toHaveLength(1);
+    expect(ds.tuiPromptMultiSelect).toBe(true);
+    expect(ds.tuiToggledIndices).toEqual([0]);
+  });
+
+  it('worker exit fails the active TUI card and clears its full dedupe state', async () => {
+    const fakeWorker = makeFakeWorker();
+    const ds = makeDs({ worker: fakeWorker });
+    __testOnly_setupWorkerHandlers(
+      ds,
+      fakeWorker,
+      { ready: true, failureNotified: false },
+    );
+    ds.tuiPromptCardId = 'om_tui_card';
+    ds.tuiPromptProcessing = true;
+    ds.tuiPromptOptions = [
+      { text: 'Approve', selected: false, type: 'select', keys: ['Enter'] },
+    ];
+    ds.tuiPromptMultiSelect = true;
+    ds.tuiToggledIndices = [0];
+
+    fakeWorker.emit('exit', 1, null);
+    await flush();
+
+    expect(updateMessageMock).toHaveBeenCalledWith(
+      'app_test',
+      'om_tui_card',
+      expect.stringContaining('"type":"failed"'),
+    );
+    expect(ds.tuiPromptCardId).toBeUndefined();
+    expect(ds.tuiPromptOptions).toBeUndefined();
+    expect(ds.tuiPromptMultiSelect).toBeUndefined();
+    expect(ds.tuiToggledIndices).toBeUndefined();
+    expect(ds.tuiPromptProcessing).toBe(false);
+  });
+
+  it('prompt_ready resolves an active TUI card after the CLI actually recovers', async () => {
+    const fakeWorker = makeFakeWorker();
+    const ds = makeDs({ worker: fakeWorker });
+    __testOnly_setupWorkerHandlers(ds, fakeWorker);
+    ds.tuiPromptCardId = 'om_tui_card';
+    ds.tuiPromptProcessing = true;
+    ds.tuiPromptOptions = [
+      { text: 'Approve', selected: false, type: 'select', keys: ['Enter'] },
+    ];
+    ds.tuiPromptMultiSelect = false;
+    ds.tuiToggledIndices = [];
+
+    fakeWorker.emit('message', { type: 'prompt_ready' });
+    await flush();
+
+    expect(updateMessageMock).toHaveBeenCalledWith(
+      'app_test',
+      'om_tui_card',
+      expect.stringContaining('"type":"resolved"'),
+    );
+    expect(ds.tuiPromptCardId).toBeUndefined();
+    expect(ds.tuiPromptOptions).toBeUndefined();
+    expect(ds.tuiPromptMultiSelect).toBeUndefined();
+    expect(ds.tuiToggledIndices).toBeUndefined();
+    expect(ds.tuiPromptProcessing).toBe(false);
+  });
+
+  it('late TUI card POST after worker exit is failed without reclaiming authority', async () => {
+    const fakeWorker = makeFakeWorker();
+    const ds = makeDs({ worker: fakeWorker });
+    __testOnly_setupWorkerHandlers(
+      ds,
+      fakeWorker,
+      { ready: true, failureNotified: false },
+    );
+
+    fakeWorker.emit('message', {
+      type: 'tui_prompt',
+      description: 'Choose one',
+      options: [
+        { text: 'Approve', selected: false, type: 'select', keys: ['Enter'] },
+      ],
+      multiSelect: false,
+    });
+    await flush();
+    expect(sessionReplyMock).toHaveBeenCalledTimes(1);
+
+    fakeWorker.emit('exit', 1, null);
+    await flush();
+    sessionReplyDeferred.resolve('om_tui_late');
+    await flush();
+
+    expect(updateMessageMock).toHaveBeenCalledWith(
+      'app_test',
+      'om_tui_late',
+      expect.stringContaining('"type":"failed"'),
+    );
+    expect(ds.tuiPromptCardId).toBeUndefined();
+    expect(ds.tuiPromptOptions).toBeUndefined();
+    expect(ds.tuiPromptMultiSelect).toBeUndefined();
+    expect(ds.tuiToggledIndices).toBeUndefined();
+    expect(ds.tuiPromptProcessing).toBe(false);
+  });
+
+  it('a silent cardless prompt does not suppress the next visible prompt', async () => {
+    const fakeWorker = makeFakeWorker();
+    const ds = makeDs({
+      worker: fakeWorker,
+      silentScheduledTurns: new Map([['silent-turn', Date.now()]]),
+    });
+    __testOnly_setupWorkerHandlers(ds, fakeWorker);
+
+    fakeWorker.emit('message', {
+      type: 'tui_prompt',
+      description: 'Silent approval',
+      options: [{ text: 'Allow silently', selected: false }],
+      turnId: 'silent-turn',
+    });
+    await flush();
+    expect(sessionReplyMock).not.toHaveBeenCalled();
+
+    fakeWorker.emit('message', {
+      type: 'tui_prompt',
+      description: 'Visible approval',
+      options: [{ text: 'Allow visibly', selected: false }],
+      turnId: 'visible-turn',
+    });
+    await flush();
+
+    expect(sessionReplyMock).toHaveBeenCalledTimes(1);
+    expect(sessionReplyMock.mock.calls[0]?.[4]).toBe('visible-turn');
+    sessionReplyDeferred.resolve('om_visible_prompt');
+    await flush();
+    expect(ds.tuiPromptCardId).toBe('om_visible_prompt');
+  });
+
+  it('generation reservation fails stale TUI authority before replacement setup can throw', async () => {
+    const fakeWorker = makeFakeWorker();
+    const ds = makeDs({ worker: fakeWorker });
+    __testOnly_setupWorkerHandlers(ds, fakeWorker);
+    ds.tuiPromptCardId = 'om_tui_card';
+    ds.tuiPromptProcessing = true;
+    ds.tuiPromptOptions = [
+      { text: 'Approve', selected: false, type: 'select', keys: ['Enter'] },
+    ];
+    ds.tuiPromptMultiSelect = false;
+    ds.tuiToggledIndices = [];
+
+    __testOnly_reserveWorkerGeneration(ds);
+    await flush();
+
+    expect(updateMessageMock).toHaveBeenCalledWith(
+      'app_test',
+      'om_tui_card',
+      expect.stringContaining('"type":"failed"'),
+    );
+    expect(ds.tuiPromptCardId).toBeUndefined();
+    expect(ds.tuiPromptOptions).toBeUndefined();
+    expect(ds.tuiPromptMultiSelect).toBeUndefined();
+    expect(ds.tuiToggledIndices).toBeUndefined();
+    expect(ds.tuiPromptProcessing).toBe(false);
   });
 
   it('old ACK (nonce=1) after new warning (nonce=2) does not affect new authority', async () => {

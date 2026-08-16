@@ -7,6 +7,7 @@ import {
 } from './ui.js';
 import { CLI_OPTIONS } from '../../setup/bot-config-editor.js';
 import { sessionTerminalHref } from './session-terminal.js';
+import { copyText } from './clipboard.js';
 
 export function tokenCount(value: unknown): number | null {
   return typeof value === 'number' && Number.isFinite(value) ? value : null;
@@ -17,17 +18,102 @@ export function formatTokenCount(value: unknown): string {
   return n === null ? '-' : n.toLocaleString('en-US');
 }
 
+export interface SessionExchangePreview {
+  userText: string;
+  userFullText: string;
+  botText: string;
+  botFullText: string;
+}
+
+function compactPreviewText(value: unknown, limit: number): string {
+  const text = String(value ?? '').replace(/\s+/g, ' ').trim();
+  if (!text) return '';
+  return text.length > limit ? `${text.slice(0, limit - 1)}…` : text;
+}
+
+/** Length-bound while preserving newlines — feeds the overlay, which renders
+ * Markdown. The single-line card summary keeps using compactPreviewText(). */
+function compactMultilinePreview(value: unknown, limit: number): string {
+  const text = String(value ?? '')
+    .replace(/\r\n?/g, '\n')
+    .replace(/[^\S\n]+\n/g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .replace(/^\n+/, '')
+    .replace(/\s+$/, '');
+  if (!text) return '';
+  return text.length > limit ? `${text.slice(0, limit - 1)}…` : text;
+}
+
+/** Latest user/bot exchange for a session card. A bot preview is shown only
+ * when it is newer than the latest user input; otherwise the card communicates
+ * the still-waiting state with the user line alone. */
+export function sessionExchangePreview(row: Record<string, any>): SessionExchangePreview {
+  const userFullText = compactMultilinePreview(
+    row.previewUserFullText
+      ?? row.previewUserText
+      ?? '',
+    4_000,
+  );
+  const botFullText = row.previewBotState === 'replied'
+    ? compactMultilinePreview(row.previewBotFullText ?? row.previewBotText ?? '', 4_000)
+    : '';
+  return {
+    userText: compactPreviewText(userFullText, 120),
+    userFullText,
+    botText: compactPreviewText(botFullText, 220),
+    botFullText,
+  };
+}
+
+/** Reducer backing the session-card preview overlay's open/focus state. The
+ * component drives its `useReducer` with these exact actions (not a parallel
+ * mirror), so this unit-tests the real transitions — in particular the
+ * Escape→refocus race: Escape closes the overlay AND returns focus to the
+ * trigger, whose `focus` action would otherwise reopen it in the same event, so
+ * `escape-refocus` arms a one-shot `suppressFocusOpen` that the immediately
+ * following `focus` consumes instead of opening. */
+export interface PreviewOverlayState {
+  open: boolean;
+  /** One-shot: the next trigger `focus` must NOT open (set by escape-refocus). */
+  suppressFocusOpen: boolean;
+}
+
+export type PreviewOverlayAction = 'open' | 'close' | 'focus' | 'escape-refocus' | 'toggle';
+
+export const previewOverlayInitialState: PreviewOverlayState = { open: false, suppressFocusOpen: false };
+
+export function previewOverlayReducer(state: PreviewOverlayState, action: PreviewOverlayAction): PreviewOverlayState {
+  switch (action) {
+    case 'open':
+      return { open: true, suppressFocusOpen: false };
+    case 'close':
+      return { open: false, suppressFocusOpen: false };
+    case 'toggle':
+      return { open: !state.open, suppressFocusOpen: false };
+    case 'focus':
+      // Consume the one-shot: a refocus armed by Escape does NOT reopen.
+      if (state.suppressFocusOpen) return { open: state.open, suppressFocusOpen: false };
+      return { open: true, suppressFocusOpen: false };
+    case 'escape-refocus':
+      return { open: false, suppressFocusOpen: true };
+    default:
+      return state;
+  }
+}
+
 // CLI 过滤选项从 setup 的单一事实源 CLI_OPTIONS 派生，新增 CLI 自动跟随，
 // 不再手抄一份（手抄版曾漏 antigravity/traex/mir/kimi/genius）。
 // 'unknown' 兜底：没有 cliId 的会话在 filtered() 里按 'unknown' 归类。
 export const CLI_FILTER_OPTIONS = [...CLI_OPTIONS.map(o => o.id), 'unknown'];
 
-export type BoardColumnId = 'needs-you' | 'starting' | 'working' | 'idle';
+// 状态列收敛：「启动中」并入「进行中」（starting 归到 working 列）；「待办」重定义为
+// 任务态（有未完成 TODO），不再拿 idle 冒充——idle 且无未完成 todo 才是真「空闲」。
+export type BoardColumnId = 'needs-you' | 'working' | 'todo' | 'idle';
 
 export const BOARD_COLUMNS: Array<{ id: BoardColumnId; labelKey: string; hintKey: string }> = [
   { id: 'needs-you', labelKey: 'sessions.board.needsYou', hintKey: 'sessions.board.needsYouHint' },
-  { id: 'starting', labelKey: 'sessions.board.starting', hintKey: 'sessions.board.startingHint' },
   { id: 'working', labelKey: 'sessions.board.working', hintKey: 'sessions.board.workingHint' },
+  { id: 'todo', labelKey: 'sessions.board.todo', hintKey: 'sessions.board.todoHint' },
   { id: 'idle', labelKey: 'sessions.board.idle', hintKey: 'sessions.board.idleHint' },
 ];
 
@@ -41,6 +127,7 @@ export const SESSION_STATUS_OPTIONS = [
   'idle',
   'dormant',
   'analyzing',
+  'stalled',
   'active',
   'limited',
   'closed',
@@ -113,6 +200,32 @@ export function isUnknownChatSession(
 ): boolean {
   const chatId = String(s?.chatId ?? '').trim();
   return !!chatId && !resolveTitle(s);
+}
+
+/** True when a chat-filter label still falls back to the raw `chatId` (no
+ * human-readable name resolved). Used to demote unresolved labels during
+ * option dedup so a named session always wins over an id-only one. */
+export function chatFilterLabelIsUnresolved(label: string, chatId: string): boolean {
+  const id = String(chatId ?? '').trim();
+  return !!id && String(label ?? '').includes(id);
+}
+
+/** Pick the better of two chat-filter labels for the same `chatId`. A label
+ * that resolved to a real name beats one that still shows the raw id; when both
+ * are equally (un)resolved, fall back to a deterministic lexicographic pick so
+ * option ordering stays stable across renders.
+ *
+ * Fixes the dedup bug where `label < existing` alone let a raw-id label
+ * (ASCII `oc_…`, which sorts before CJK names) mask an already-resolved name
+ * such as `单聊 · 韩毅 - Nil-RD`. */
+export function preferChatFilterLabel(existing: string | undefined, candidate: string, chatId: string): string {
+  if (existing === undefined) return candidate;
+  const existingUnresolved = chatFilterLabelIsUnresolved(existing, chatId);
+  const candidateUnresolved = chatFilterLabelIsUnresolved(candidate, chatId);
+  if (existingUnresolved !== candidateUnresolved) {
+    return existingUnresolved ? candidate : existing;
+  }
+  return candidate < existing ? candidate : existing;
 }
 
 export function sessionLocationTitle(s: any): string {
@@ -302,17 +415,12 @@ export async function copySpawnCommand(s: any, btn?: HTMLButtonElement): Promise
       if (r.status !== 401) alert(`${t('sessions.copyCommandFail')}: ${body?.error ?? r.status}`);
       return;
     }
-    try {
-      await navigator.clipboard.writeText(body.command);
+    if (await copyText(body.command, t('sessions.copyCommand'))) {
       if (btn) {
         const prev = btn.textContent;
         btn.textContent = t('sessions.copyCommandDone');
         setTimeout(() => { if (prev !== null) btn.textContent = prev; }, 1500);
       }
-    } catch {
-      // Clipboard API unavailable (non-secure context) — fall back to a prompt
-      // so the user can still select + copy the command manually.
-      window.prompt(t('sessions.copyCommand'), body.command);
     }
   } catch (e) {
     alert(`${t('sessions.copyCommandFail')}: ${e}`);
@@ -331,11 +439,20 @@ export function historySenderKey(message: any): string {
 
 export function deriveSessionBoardColumn(s: any): BoardColumnId | null {
   if (s.status === 'closed') return null;
-  if (s.pendingRepo || s.tuiPromptActive || s.agentAttention || s.status === 'limited') return 'needs-you';
-  if (s.status === 'starting') return 'starting';
-  if (s.status === 'working' || s.status === 'analyzing' || s.status === 'active') return 'working';
-  if (s.status === 'dormant') return 'idle';
+  // needs-you 保留 master 新增的 stalled 触发；starting 并入「进行中」(P1 命名收敛)。
+  if (s.pendingRepo || s.tuiPromptActive || s.agentAttention || s.status === 'limited' || s.status === 'stalled') return 'needs-you';
+  // 「启动中」并入「进行中」：starting / working / analyzing / active 同列。
+  if (s.status === 'starting' || s.status === 'working' || s.status === 'analyzing' || s.status === 'active') return 'working';
+  // 任务态优先于「空闲」：机器停了但还有未完成 TODO → 待办（真），正是要抓的
+  // 「活没干完」。读不到 todo（其它 CLI / 无 transcript）时退回空闲，不硬判。
+  if (hasOpenTodos(s)) return 'todo';
   return 'idle';
+}
+
+/** 会话是否有未完成 TODO（任务态）。openTodos 缺失 = 未知/不支持 → 视为无。 */
+export function hasOpenTodos(s: any): boolean {
+  const t = s?.openTodos;
+  return !!t && typeof t.remaining === 'number' && t.remaining > 0;
 }
 
 export function restartConfirmMessage(s: any): string {
@@ -353,7 +470,7 @@ export function restartConfirmMessage(s: any): string {
 }
 
 export function canRestartSession(s: any): boolean {
-  return s.status !== 'closed' && !s.adopt && !s.pendingRepo;
+  return s.status !== 'closed' && !s.adopt && !s.pendingRepo && s.cliId !== 'riff';
 }
 
 export interface PickerBot { larkAppId: string; botName: string; }

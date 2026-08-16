@@ -49,6 +49,32 @@ describe('dashboard schedules React page helpers', () => {
     expect(page).not.toContain('setDeliver(');
   });
 
+  it('shows the target chat in both the schedule row and edit dialog', () => {
+    const page = readFileSync(new URL('../src/dashboard/web/schedules-page.tsx', import.meta.url), 'utf8');
+    expect(page).toContain("import { chatDisplayTitle, loadNameMaps } from './ui.js';");
+    // Row chip: dedicated class so a long (Chinese) chat name can be width-capped
+    // + ellipsised instead of overrunning into the action buttons.
+    expect(page).toContain('className="schedule-chat-chip"');
+    expect(page).toContain("{tr('schedules.form.chat')}: {chatTitle ?? s.chatId}");
+    // Tooltip keeps the full name AND the raw chatId so truncation loses nothing.
+    expect(page).toContain('title={chatTitle ? `${chatTitle} · ${String(s.chatId)}` : String(s.chatId)}');
+    expect(page).toContain("<code title={chatId}>{chatDisplayTitle(editing) ?? chatId}</code>");
+  });
+
+  it('caps the target-chat chip width so a long name cannot overrun the row', () => {
+    const css = readFileSync(new URL('../src/dashboard/web/style.css', import.meta.url), 'utf8');
+    // The chip must have its own bounded rule (base .schedule-chip-strip span is
+    // flex:none + nowrap with no max-width — a long name would push past the
+    // main column into the Run/Edit/Delete actions).
+    expect(css).toMatch(
+      /\.schedule-chip-strip span\.schedule-chat-chip \{[\s\S]*?max-width:[\s\S]*?overflow:\s*hidden[\s\S]*?text-overflow:\s*ellipsis/,
+    );
+    // inline-block (not the base inline-flex) is what actually renders the … glyph.
+    expect(css).toMatch(
+      /\.schedule-chip-strip span\.schedule-chat-chip \{[\s\S]*?display:\s*inline-block/,
+    );
+  });
+
   it('offers three execution positions and allows lazy silent fresh topics', () => {
     const page = readFileSync(new URL('../src/dashboard/web/schedules-page.tsx', import.meta.url), 'utf8');
     expect(page).toContain('onChange={e => setSilent(e.target.checked)}');

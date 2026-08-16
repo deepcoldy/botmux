@@ -23,10 +23,12 @@
  * before launching the CLI, preserving the CLI's normal environment.
  */
 import { describe, it, expect, afterEach } from 'vitest';
-import { existsSync, mkdtempSync, writeFileSync, chmodSync, rmSync, readFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, writeFileSync, chmodSync, rmSync, readFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import * as tmuxBackend from '../src/adapters/backend/tmux-backend.js';
+import { PtyBackend } from '../src/adapters/backend/pty-backend.js';
 import {
   buildBotmuxEnvAssignments,
   buildDebugKeepShellScript,
@@ -34,9 +36,43 @@ import {
   NON_INTERACTIVE_SHELL_ENV,
   resolveUserShell,
   resolveShellOverride,
-  SHELL_WRAPPER_SCRIPT,
+  shellWrapperScript,
   shellLaunchArgv,
+  shellCommandArgv,
 } from '../src/adapters/backend/tmux-backend.js';
+
+type ShellKindUnderTest = 'bash' | 'zsh' | 'sh' | 'fish';
+type ShellWrapperScriptForKind = (binDir: string, kind?: ShellKindUnderTest) => string;
+type DebugKeepShellScriptForKind = (shellPath: string, binDir: string, kind?: ShellKindUnderTest) => string;
+
+const shellWrapperScriptForKind: ShellWrapperScriptForKind = shellWrapperScript;
+const buildDebugKeepShellScriptForKind: DebugKeepShellScriptForKind = buildDebugKeepShellScript;
+
+function exportedScriptFactoryResult(exportNames: readonly string[], kind: ShellKindUnderTest): string | undefined {
+  for (const [name, candidate] of Object.entries(tmuxBackend)) {
+    if (!exportNames.includes(name)) continue;
+    if (typeof candidate !== 'function') continue;
+    const script = candidate(kind);
+    if (typeof script === 'string') return script;
+  }
+  return undefined;
+}
+
+function diagnosticShellScriptForKind(kind: ShellKindUnderTest): string {
+  return exportedScriptFactoryResult([
+    'diagnosticShellScript',
+    'buildDiagnosticShellScript',
+    'shellDiagnosticScript',
+  ], kind) ?? DIAGNOSTIC_SHELL_SCRIPT;
+}
+
+function firstExistingPath(paths: readonly string[]): string | undefined {
+  return paths.find(path => existsSync(path));
+}
+
+function shellSingleQuote(value: string): string {
+  return `'${value.replace(/'/g, `'\\''`)}'`;
+}
 
 describe('buildBotmuxEnvAssignments()', () => {
   it('forwards only the daemon-side keys; bare LARK_APP_* are NOT forwarded', () => {
@@ -51,6 +87,7 @@ describe('buildBotmuxEnvAssignments()', () => {
       IS_SANDBOX: '1',
       BOTMUX_LARK_APP_ID: 'cli_namespaced',
       BOTMUX_TURN_ID: 'om_turn',
+      BOTMUX_ORIGIN_CHANNEL_ID: 'ab'.repeat(32),
       // None of the rest should appear — those come from rcfile.
       PATH: '/usr/bin',
       HOME: '/home/u',
@@ -64,6 +101,7 @@ describe('buildBotmuxEnvAssignments()', () => {
       'IS_SANDBOX=1',
       'BOTMUX_LARK_APP_ID=cli_namespaced',
       'BOTMUX_TURN_ID=om_turn',
+      `BOTMUX_ORIGIN_CHANNEL_ID=${'ab'.repeat(32)}`,
     ]);
     expect(out.some(s => s.startsWith('LARK_APP_ID='))).toBe(false);
     expect(out.some(s => s.startsWith('LARK_APP_SECRET='))).toBe(false);
@@ -81,6 +119,16 @@ describe('buildBotmuxEnvAssignments()', () => {
     expect(out).toContain('BOTMUX_OWNER_OPEN_ID=ou_owner');
     // Ownerless sessions (foreign-bot auto-create) don't set it → absent.
     expect(buildBotmuxEnvAssignments({ BOTMUX: '1' }).some(s => s.startsWith('BOTMUX_OWNER_OPEN_ID='))).toBe(false);
+  });
+
+  it('forwards the reply-card usage visibility into persistent CLI panes', () => {
+    const out = buildBotmuxEnvAssignments({
+      BOTMUX: '1',
+      BOTMUX_USAGE_DISPLAY: 'footer',
+      PATH: '/usr/bin',
+    });
+    expect(out).toContain('BOTMUX_USAGE_DISPLAY=footer');
+    expect(out).not.toContain('PATH=/usr/bin');
   });
 
   it('forwards CLAUDE_CODE_RESUME_TOKEN_THRESHOLD so the resume-summary bypass reaches the tmux pane (issue #62)', () => {
@@ -133,14 +181,17 @@ describe('buildBotmuxEnvAssignments()', () => {
     expect(out).not.toContain('PATH=/usr/bin');
   });
 
-  it('forwards the worker-owned MCP relay capability into the CLI pane', () => {
+  it('forwards only a Codex App bootstrap path and strips the retired shared-secret env', () => {
+    const retiredSharedSecret = 'A'.repeat(43);
+    const bootstrapPath = '/private/bot-home/control.bootstrap';
     const out = buildBotmuxEnvAssignments({
       BOTMUX: '1',
-      BOTMUX_MCP_GATEWAY_SOCKET: '/tmp/botmux-mcp/session/gateway.sock',
-      BOTMUX_MCP_GATEWAY_REQUIRED: '1',
+      BOTMUX_CODEX_APP_CONTROL_NONCE: retiredSharedSecret,
+      BOTMUX_CODEX_APP_CONTROL_BOOTSTRAP: bootstrapPath,
     });
-    expect(out).toContain('BOTMUX_MCP_GATEWAY_SOCKET=/tmp/botmux-mcp/session/gateway.sock');
-    expect(out).toContain('BOTMUX_MCP_GATEWAY_REQUIRED=1');
+    expect(out).toContain(`BOTMUX_CODEX_APP_CONTROL_BOOTSTRAP=${bootstrapPath}`);
+    expect(out.join(' ')).not.toContain(retiredSharedSecret);
+    expect(out.some(value => value.startsWith('BOTMUX_CODEX_APP_CONTROL_NONCE='))).toBe(false);
   });
 
   it('forwards Hermes profile paths so the pane and transcript reader use the same state DB', () => {
@@ -336,7 +387,7 @@ describe('shellLaunchArgv()', () => {
     const argv = shellLaunchArgv('/bin/zsh', ['-l', '-i']);
     expect(argv).toEqual([
       '/usr/bin/env',
-      'DISABLE_AUTO_UPDATE=true',
+      ...NON_INTERACTIVE_SHELL_ENV,
       '/bin/zsh',
       '-l',
       '-i',
@@ -347,7 +398,7 @@ describe('shellLaunchArgv()', () => {
     const argv = shellLaunchArgv('/bin/sh', []);
     expect(argv).toEqual([
       '/usr/bin/env',
-      'DISABLE_AUTO_UPDATE=true',
+      ...NON_INTERACTIVE_SHELL_ENV,
       '/bin/sh',
     ]);
   });
@@ -356,10 +407,85 @@ describe('shellLaunchArgv()', () => {
     const argv = shellLaunchArgv('/bin/bash', ['-i']);
     expect(argv).toEqual([
       '/usr/bin/env',
-      'DISABLE_AUTO_UPDATE=true',
+      ...NON_INTERACTIVE_SHELL_ENV,
       '/bin/bash',
       '-i',
     ]);
+  });
+
+  it('keeps bash/zsh/sh rcfile flags unchanged while adding fish as an interactive launch shell', () => {
+    expect(shellLaunchArgv('/bin/bash', ['-i'])).toEqual([
+      '/usr/bin/env',
+      ...NON_INTERACTIVE_SHELL_ENV,
+      '/bin/bash',
+      '-i',
+    ]);
+    expect(shellLaunchArgv('/bin/zsh', ['-l', '-i'])).toEqual([
+      '/usr/bin/env',
+      ...NON_INTERACTIVE_SHELL_ENV,
+      '/bin/zsh',
+      '-l',
+      '-i',
+    ]);
+    expect(shellLaunchArgv('/bin/sh', [])).toEqual([
+      '/usr/bin/env',
+      ...NON_INTERACTIVE_SHELL_ENV,
+      '/bin/sh',
+    ]);
+    expect(shellLaunchArgv('/bin/fish', ['-i'])).toEqual([
+      '/usr/bin/env',
+      ...NON_INTERACTIVE_SHELL_ENV,
+      '/bin/fish',
+      '-i',
+    ]);
+  });
+
+  it('builds POSIX command argv with the _ sentinel and fish argv without it', () => {
+    const posix = shellCommandArgv({ shell: '/bin/bash', flags: ['-i'] }, 'SCRIPT', ['/work', 'BOTMUX=1', 'bin']);
+    expect(posix).toEqual([
+      '/usr/bin/env',
+      ...NON_INTERACTIVE_SHELL_ENV,
+      '/bin/bash',
+      '-i',
+      '-c',
+      'SCRIPT',
+      '_',
+      '/work',
+      'BOTMUX=1',
+      'bin',
+    ]);
+    const fish = shellCommandArgv({ shell: '/bin/fish', flags: ['-i'] }, 'SCRIPT', ['/work', 'BOTMUX=1', 'bin']);
+    expect(fish).toEqual([
+      '/usr/bin/env',
+      ...NON_INTERACTIVE_SHELL_ENV,
+      '/bin/fish',
+      '-i',
+      '-c',
+      'SCRIPT',
+      '/work',
+      'BOTMUX=1',
+      'bin',
+    ]);
+  });
+});
+
+describe('PtyBackend launchShell boundary', () => {
+  it('passes the requested CLI directly and ignores launchShell wrapping', async () => {
+    const backend = new PtyBackend();
+    const output = await new Promise<string>((resolve) => {
+      let buffer = '';
+      backend.spawn('/bin/sh', ['-c', 'printf "DIRECT:%s:%s\\n" "$0" "$1"', 'cli-zero', 'arg-one'], {
+        cwd: tmpdir(),
+        cols: 80,
+        rows: 24,
+        env: { PATH: '/usr/bin:/bin' },
+        injectEnv: { BOTMUX: '1' },
+        launchShell: '/bin/fish',
+      });
+      backend.onData((data) => { buffer += data; });
+      backend.onExit(() => resolve(buffer));
+    });
+    expect(output).toContain('DIRECT:cli-zero:arg-one');
   });
 });
 
@@ -386,7 +512,7 @@ describe('shellLaunchArgv end-to-end (startup-only env lifecycle)', () => {
         const argv = shellLaunchArgv('/bin/bash', ['-i']);
         const result = spawnSync(
           argv[0],
-          [...argv.slice(1), '-c', SHELL_WRAPPER_SCRIPT, '_', dir, '/usr/bin/env'],
+          [...argv.slice(1), '-c', shellWrapperScript(join(dir, '.botmux', 'bin')), '_', dir, '/usr/bin/env'],
           { encoding: 'utf-8', env: { HOME: dir, PATH: '/usr/bin:/bin' } },
         );
         expect(result.status).toBe(0);
@@ -447,19 +573,29 @@ describe('resolveUserShell()', () => {
     expect(spec.flags).toEqual([]);
   });
 
-  it('Codex Blocker 2: falls back to a POSIX shell when $SHELL is fish', () => {
-    // Our SCRIPT is POSIX-syntax. fish/nu/csh would mis-parse `cd -- "$1"`
-    // and `exec /usr/bin/env "$@"` and break the launch. Detect non-POSIX
-    // shells and fall back so fish/nu users don't get a totally dead session.
+  it('keeps dash/ash on the sh contract with no rcfile flags', () => {
+    tmpDir = mkdtempSync(join(tmpdir(), 'bmx-shell-'));
+    const dash = join(tmpDir, 'dash');
+    const ash = join(tmpDir, 'ash');
+    writeFileSync(dash, '#!/bin/sh\nexec "$@"\n'); chmodSync(dash, 0o755);
+    writeFileSync(ash, '#!/bin/sh\nexec "$@"\n'); chmodSync(ash, 0o755);
+    expect(resolveUserShell({ SHELL: dash })).toEqual({ shell: dash, flags: [] });
+    expect(resolveUserShell({ SHELL: ash })).toEqual({ shell: ash, flags: [] });
+  });
+
+  it.skipIf(!existsSync('/bin/fish'))('classifies /bin/fish through the shell-selection seam', () => {
+    const spec = resolveUserShell({ SHELL: '/bin/fish' });
+    expect(spec).toEqual({ shell: '/bin/fish', flags: ['-i'] });
+  });
+
+  it('classifies fish and returns fish-flavoured spec (-i only) when $SHELL is fish', () => {
     tmpDir = mkdtempSync(join(tmpdir(), 'bmx-shell-'));
     const fakeFish = join(tmpDir, 'fish');
     writeFileSync(fakeFish, '#!/bin/sh\nexec "$@"\n');
     chmodSync(fakeFish, 0o755);
     const spec = resolveUserShell({ SHELL: fakeFish });
-    expect(spec.shell).not.toBe(fakeFish);
-    // Whatever we picked must be a known POSIX shell that exists.
-    expect(['/bin/zsh', '/bin/bash', '/bin/sh']).toContain(spec.shell);
-    expect(existsSync(spec.shell)).toBe(true);
+    expect(spec.shell).toBe(fakeFish);
+    expect(spec.flags).toEqual(['-i']);
   });
 
   it('falls back through /bin/zsh → /bin/bash → /bin/sh when $SHELL is unset', () => {
@@ -533,17 +669,25 @@ describe('resolveShellOverride()', () => {
     expect(resolveShellOverride('   ')).toBeNull();
   });
 
-  it('returns null (ignored) for an unsupported shell like fish', () => {
+  it('resolves an absolute fish override and classifies its flags', () => {
     tmpDir = mkdtempSync(join(tmpdir(), 'bmx-shell-'));
     const fish = join(tmpDir, 'fish');
     writeFileSync(fish, '#!/bin/sh\nexec "$@"\n'); chmodSync(fish, 0o755);
-    expect(resolveShellOverride(fish)).toBeNull();
+    const spec = resolveShellOverride(fish);
+    expect(spec?.shell).toBe(fish);
+    expect(spec?.flags).toEqual(['-i']);
+  });
+
+  it.skipIf(!existsSync('/bin/fish'))('resolves the bare fish override from conventional locations', () => {
+    const spec = resolveShellOverride('fish');
+    expect(spec?.shell).toBe('/bin/fish');
+    expect(spec?.flags).toEqual(['-i']);
   });
 });
 
 describe('buildDebugKeepShellScript()', () => {
   it('keeps the wrapper alive after the CLI exits (no `exec` on env)', () => {
-    const s = buildDebugKeepShellScript('/bin/zsh');
+    const s = buildDebugKeepShellScript('/bin/zsh', '/home/u/.botmux/bin');
     // Critical: there must NOT be `exec /usr/bin/env` in the debug variant —
     // otherwise the CLI would replace the shell process and the user would
     // lose the prompt we promised them.
@@ -554,13 +698,13 @@ describe('buildDebugKeepShellScript()', () => {
   });
 
   it('preserves the cd-back-to-cwd guard from the normal script', () => {
-    const s = buildDebugKeepShellScript('/bin/bash');
+    const s = buildDebugKeepShellScript('/bin/bash', '/home/u/.botmux/bin');
     expect(s).toMatch(/^cd -- "\$1" && shift/);
     expect(s).toContain('unset DISABLE_AUTO_UPDATE');
   });
 
   it('emits a clear banner so the user knows the CLI exited, not crashed', () => {
-    const s = buildDebugKeepShellScript('/bin/sh');
+    const s = buildDebugKeepShellScript('/bin/sh', '/home/u/.botmux/bin');
     expect(s).toContain('[botmux debug]');
     expect(s).toContain('Type exit to close the session');
     // status code should be surfaced so a non-zero exit is obvious.
@@ -573,8 +717,20 @@ describe('buildDebugKeepShellScript()', () => {
     // a malformed single-quote in the embedded SCRIPT would make the wrapper
     // line desync. The escape pattern `'\\''` (close-quote, escaped quote,
     // reopen-quote) is the standard POSIX way to embed a single quote.
-    const s = buildDebugKeepShellScript(`/weird/shell/with'apostrophe`);
+    const s = buildDebugKeepShellScript(`/weird/shell/with'apostrophe`, '/home/u/.botmux/bin');
     expect(s).toContain(`'/weird/shell/with'\\''apostrophe'`);
+  });
+
+  it('generates fish debug keep-shell script using fish argv and env syntax', () => {
+    const script = buildDebugKeepShellScriptForKind('/bin/fish', '/home/u/.botmux/bin', 'fish');
+    expect(script).toContain('cd -- $argv[1]');
+    expect(script).toContain('set -e argv[1]');
+    expect(script).toContain('set -e DISABLE_AUTO_UPDATE');
+    expect(script).toContain('set -gx PATH');
+    expect(script).toContain('/usr/bin/env $argv');
+    expect(script).not.toContain('cd -- "$1" && shift');
+    expect(script).not.toMatch(/\bunset\s+/);
+    expect(script).toMatch(/exec '\/bin\/fish' -i$/);
   });
 });
 
@@ -591,7 +747,7 @@ describe('debug keep-shell wrapper end-to-end', () => {
       // We can't easily verify a true interactive shell from spawnSync (it
       // needs a tty), but we CAN verify the script structure with `sh -n`
       // (syntax-check) and that the CLI-stage portion runs to completion.
-      const script = buildDebugKeepShellScript('/bin/sh');
+      const script = buildDebugKeepShellScript('/bin/sh', '/home/u/.botmux/bin');
       // Syntax-check the script in /bin/sh — guards against typos in the
       // template that no test of buildDebugKeepShellScript alone would catch.
       const syntaxCheck = spawnSync('/bin/sh', ['-n', '-c', script], {
@@ -651,6 +807,17 @@ describe('diagnostic shell wrapper', () => {
       }
     },
   );
+
+  it('generates fish diagnostic script using fish argv and env syntax', () => {
+    const script = diagnosticShellScriptForKind('fish');
+    expect(script).toContain('cd -- $argv[1]');
+    expect(script).toContain('set -e DISABLE_AUTO_UPDATE');
+    expect(script).toContain('cat -- $argv[2]');
+    expect(script).toContain('exec $argv[3] -i');
+    expect(script).not.toContain('cd -- "$1"');
+    expect(script).not.toMatch(/\bunset\s+/);
+    expect(script).not.toContain('exec "$3" -i');
+  });
 });
 
 describe('shell wrapper end-to-end (the contract spawn() builds)', () => {
@@ -661,7 +828,13 @@ describe('shell wrapper end-to-end (the contract spawn() builds)', () => {
   const envBin = '/usr/bin/env';
   const hasEnvBin = existsSync(envBin);
   const hasBash = existsSync('/bin/bash');
-  const SCRIPT = SHELL_WRAPPER_SCRIPT;
+  const fishPath = firstExistingPath(['/bin/fish', '/usr/bin/fish', '/usr/local/bin/fish', '/opt/homebrew/bin/fish']);
+  const hasScript = spawnSync('script', ['-qec', 'true', '/dev/null']).status === 0;
+  // These tests exercise the wrapper's env-inject / unset / cd contract; the exact
+  // bin dir is irrelevant to them, so bake a fixed placeholder. (Core-only vs shared
+  // bin-dir RESOLUTION is covered by the dedicated scrub-order describe below.)
+  const SCRIPT = shellWrapperScript('/home/u/.botmux/bin');
+  const FISH_SCRIPT = shellWrapperScriptForKind('/home/u/.botmux/bin', 'fish');
 
   let tmpDir: string | undefined;
   afterEach(() => {
@@ -669,6 +842,28 @@ describe('shell wrapper end-to-end (the contract spawn() builds)', () => {
       rmSync(tmpDir, { recursive: true, force: true });
       tmpDir = undefined;
     }
+  });
+
+  it('keeps the POSIX wrapper unchanged for bash/zsh/sh', () => {
+    const posixScript = shellWrapperScript('/home/u/.botmux/bin');
+    expect(shellWrapperScriptForKind('/home/u/.botmux/bin', 'bash')).toBe(posixScript);
+    expect(shellWrapperScriptForKind('/home/u/.botmux/bin', 'zsh')).toBe(posixScript);
+    expect(shellWrapperScriptForKind('/home/u/.botmux/bin', 'sh')).toBe(posixScript);
+    expect(posixScript).toContain('cd -- "$1" && shift');
+    expect(posixScript).toContain('unset DISABLE_AUTO_UPDATE');
+    expect(posixScript).toContain('export PATH=');
+    expect(posixScript).toContain('exec /usr/bin/env "$@"');
+  });
+
+  it('generates fish wrapper script using fish argv and env syntax', () => {
+    expect(FISH_SCRIPT).toContain('cd -- $argv[1]');
+    expect(FISH_SCRIPT).toContain('set -e argv[1]');
+    expect(FISH_SCRIPT).toContain('set -e DISABLE_AUTO_UPDATE');
+    expect(FISH_SCRIPT).toContain('set -gx PATH');
+    expect(FISH_SCRIPT).toContain('exec /usr/bin/env $argv');
+    expect(FISH_SCRIPT).not.toContain('cd -- "$1" && shift');
+    expect(FISH_SCRIPT).not.toMatch(/\bunset\s+/);
+    expect(FISH_SCRIPT).not.toContain('"$@"');
   });
 
   it.skipIf(!hasEnvBin)(
@@ -888,6 +1083,88 @@ describe('shell wrapper end-to-end (the contract spawn() builds)', () => {
     },
   );
 
+  it.skipIf(!fishPath || !hasEnvBin)(
+    'fish wrapper uses $argv[1] as cwd and omits the POSIX _ $0 sentinel',
+    () => {
+      tmpDir = mkdtempSync(join(tmpdir(), 'botmux-fish-wrapper-'));
+      const cwd = join(tmpDir, 'cwd with spaces');
+      mkdirSync(cwd);
+      const result = spawnSync(
+        fishPath ?? '/bin/fish',
+        [
+          '-i',
+          '-c',
+          FISH_SCRIPT,
+          cwd,
+          'BOTMUX_OWNER_OPEN_ID=ou_test value',
+          '/bin/sh',
+          '-c',
+          'printf "CWD=%s\n" "$PWD"; printf "OWNER=%s\n" "$BOTMUX_OWNER_OPEN_ID"; i=0; for arg in "$@"; do i=$((i+1)); printf "ARG%d=%s\n" "$i" "$arg"; done',
+          '_',
+          'ARG WITH SPACE',
+          'DOLLAR=$x',
+        ],
+        { encoding: 'utf-8', env: { PATH: '/usr/bin:/bin' } },
+      );
+      expect(result.status).toBe(0);
+      expect(result.stdout).toContain(`CWD=${cwd}`);
+      expect(result.stdout).toContain('OWNER=ou_test value');
+      expect(result.stdout).toContain('ARG1=ARG WITH SPACE');
+      expect(result.stdout).toContain('ARG2=DOLLAR=$x');
+    },
+  );
+
+  it.skipIf(!fishPath || !hasEnvBin || !hasScript)(
+    'fish config.fish manual-terminal guard does not exec under managed PTY launch',
+    () => {
+      tmpDir = mkdtempSync(join(tmpdir(), 'botmux-fish-config-'));
+      const fishConfigDir = join(tmpDir, '.config', 'fish');
+      mkdirSync(fishConfigDir, { recursive: true });
+      writeFileSync(
+        join(fishConfigDir, 'config.fish'),
+        'echo CONFIG-SEEN\nstatus is-interactive; and isatty stdout; and not set -q BOTMUX_MANAGED_SHELL; and exec /bin/sh -c "echo TRAMPOLINED"\n',
+      );
+      const cwd = join(tmpDir, 'cwd');
+      mkdirSync(cwd);
+      const command = [
+        ...shellLaunchArgv(fishPath ?? '/bin/fish', ['-i']).map(shellSingleQuote),
+        '-c',
+        shellSingleQuote(FISH_SCRIPT),
+        shellSingleQuote(cwd),
+        '/bin/sh',
+        '-c',
+        shellSingleQuote('printf "CLI-RAN\\n"; printf "SENTINEL=%s\\n" "$BOTMUX_MANAGED_SHELL"'),
+      ].join(' ');
+
+      const result = spawnSync('script', ['-qec', command, '/dev/null'], {
+        encoding: 'utf-8',
+        env: { HOME: tmpDir, PATH: '/usr/bin:/bin' },
+      });
+
+      expect(result.status).toBe(0);
+      expect(result.stdout).toContain('CONFIG-SEEN');
+      expect(result.stdout).toContain('CLI-RAN');
+      expect(result.stdout).toContain('SENTINEL=');
+      expect(result.stdout).not.toContain('TRAMPOLINED');
+    },
+  );
+
+  it.skipIf(!fishPath || !hasEnvBin)(
+    'fish wrapper rejects the old POSIX _ sentinel shape because cwd must be argv[1]',
+    () => {
+      tmpDir = mkdtempSync(join(tmpdir(), 'botmux-fish-wrapper-'));
+      const cwd = join(tmpDir, 'cwd');
+      mkdirSync(cwd);
+      const result = spawnSync(
+        fishPath ?? '/bin/fish',
+        ['-i', '-c', FISH_SCRIPT, '_', cwd, '/bin/sh', '-c', 'pwd'],
+        { encoding: 'utf-8', env: { PATH: '/usr/bin:/bin' } },
+      );
+      expect(result.status).not.toBe(0);
+      expect(result.stdout).not.toContain(cwd);
+    },
+  );
+
   it.skipIf(!hasEnvBin)(
     'Codex non-blocker: rcfile that cd\'s away does NOT change the CLI\'s final cwd',
     () => {
@@ -919,4 +1196,56 @@ describe('shell wrapper end-to-end (the contract spawn() builds)', () => {
       }
     },
   );
+});
+
+describe('shellWrapperScript — host-resolved bin dir survives pane env scrub (codex P1)', () => {
+  const hasSh = existsSync('/bin/sh');
+  let tmp: string | undefined;
+  afterEach(() => { if (tmp) { rmSync(tmp, { recursive: true, force: true }); tmp = undefined; } });
+
+  it.skipIf(!hasSh)('bakes the dedicated bin dir as a literal — hits it even when BOTMUX_CORE_ONLY/SESSION_DATA_DIR are scrubbed AND a hostile shared wrapper is on PATH', () => {
+    tmp = mkdtempSync(join(tmpdir(), 'wrapper-scrub-'));
+    // Hostile shared wrapper (what a same-HOME fleet would have) — prints a sentinel.
+    const sharedBin = join(tmp, '.botmux', 'bin');
+    mkdirSync(sharedBin, { recursive: true });
+    writeFileSync(join(sharedBin, 'botmux'), '#!/bin/sh\necho HOST_WRAPPER_SENTINEL\n', { mode: 0o755 });
+    // Dedicated core-only wrapper (what the daemon writes) — prints a different marker.
+    const dedicatedBin = join(tmp, 'core-only', 'data', 'bin');
+    mkdirSync(dedicatedBin, { recursive: true });
+    writeFileSync(join(dedicatedBin, 'botmux'), '#!/bin/sh\necho DEDICATED_WRAPPER\n', { mode: 0o755 });
+
+    // Host resolves the dedicated dir and bakes it into the script as a literal.
+    const script = shellWrapperScript(dedicatedBin);
+    // Run the pane script exactly as the backend does: argv = [_, cwd, CMD...].
+    // The pane env HAS the hostile shared bin on PATH; even if BOTMUX_CORE_ONLY /
+    // SESSION_DATA_DIR were present they get scrubbed by the script's unset clause —
+    // the baked literal is what matters. We resolve `botmux` via `command -v`.
+    const result = spawnSync('/bin/sh', ['-c', script, '_', tmp, 'sh', '-c', 'command -v botmux; botmux'], {
+      encoding: 'utf-8',
+      env: {
+        HOME: tmp,
+        PATH: `${sharedBin}:/usr/bin:/bin`, // hostile shared wrapper FIRST in inherited PATH
+        BOTMUX_CORE_ONLY: '1',              // present but scrubbed by the script
+        SESSION_DATA_DIR: join(tmp, 'core-only', 'data'),
+      },
+    });
+    const out = `${result.stdout ?? ''}`;
+    // Must resolve + run the DEDICATED wrapper, never the hostile shared sentinel.
+    expect(out).toContain(join(dedicatedBin, 'botmux'));
+    expect(out).toContain('DEDICATED_WRAPPER');
+    expect(out).not.toContain('HOST_WRAPPER_SENTINEL');
+  });
+
+  it.skipIf(!hasSh)('normal fleet: bakes ~/.botmux/bin and resolves it', () => {
+    tmp = mkdtempSync(join(tmpdir(), 'wrapper-normal-'));
+    const sharedBin = join(tmp, '.botmux', 'bin');
+    mkdirSync(sharedBin, { recursive: true });
+    writeFileSync(join(sharedBin, 'botmux'), '#!/bin/sh\necho FLEET_WRAPPER\n', { mode: 0o755 });
+    const script = shellWrapperScript(sharedBin); // normal daemon resolves this
+    const result = spawnSync('/bin/sh', ['-c', script, '_', tmp, 'sh', '-c', 'botmux'], {
+      encoding: 'utf-8',
+      env: { HOME: tmp, PATH: '/usr/bin:/bin' },
+    });
+    expect(`${result.stdout ?? ''}`).toContain('FLEET_WRAPPER');
+  });
 });

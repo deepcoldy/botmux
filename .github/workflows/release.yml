@@ -128,6 +128,12 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      # pull-requests: write —— 发版后给本版本包含的 PR 逐条留「Released in vX.Y.Z」
+      # 评论(见下方 Comment "Released in" 步骤)。GitHub 原生那个侧栏 released 徽标
+      # 判定用的是 PR 分支的原始 head commit,squash 合并会把它变成孤儿 commit → 徽标
+      # 永远不显示(即便 squash 出的新 commit 能从 tag 到达也不行)。此权限用于发一条
+      # 可见的时间线评论作为 squash 兼容的替代。
+      pull-requests: write
     steps:
       - uses: actions/checkout@v6
         with:
@@ -143,6 +149,9 @@ jobs:
 
       - name: Sync version from git tag to package.json
         run: npm version "${GITHUB_REF_NAME#v}" --no-git-tag-version --allow-same-version
+
+      - name: Sync workflow core version from git tag
+        run: npm version "${GITHUB_REF_NAME#v}" --no-git-tag-version --allow-same-version --prefix packages/workflow-core
 
       - name: Resolve npm dist-tag + prerelease flag
         id: dist_tag
@@ -228,8 +237,15 @@ jobs:
 
       - run: pnpm build
 
-      - name: Publish to npm
-        run: npm publish --tag "${{ steps.dist_tag.outputs.tag }}"
+      - run: pnpm workflow-core:test
+
+      - name: Publish workflow core to npm
+        run: node scripts/publish-npm-if-missing.mjs ./packages/workflow-core "${{ steps.dist_tag.outputs.tag }}"
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_ACCESS_TOKEN }}
+
+      - name: Publish botmux to npm
+        run: node scripts/publish-npm-if-missing.mjs . "${{ steps.dist_tag.outputs.tag }}"
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_ACCESS_TOKEN }}
 
@@ -287,6 +303,13 @@ jobs:
           done
           SECTIONS=$(node .github/scripts/changelog-sections.mjs < "$RAW")
 
+          # 复用上面已算好的 PR 列表(不再多打一次 API),抽出本版本包含的**去重** PR
+          # 号,持久化到 $RUNNER_TEMP,交给后面的「Comment "Released in"」步骤逐个留言。
+          # 从 $RAW 里 type=='pr' 的行取第 2 列(PR number),排序去重。可能为空(纯直推
+          # commit、无关联 PR)——那样评论步骤自然什么都不做。
+          awk -F'\t' '$1=="pr"{print $2}' "$RAW" | sort -un > "$RUNNER_TEMP/released_prs.txt"
+          echo "PRs in this release: $(paste -sd' ' "$RUNNER_TEMP/released_prs.txt")"
+
           {
             echo 'body<<CHANGELOG_EOF'
             # TAG_MSG 后必须空一行再接自动段落：分隔线 '---' 紧贴正文末行会被 markdown
@@ -313,6 +336,53 @@ jobs:
         with:
           body: ${{ steps.changelog.outputs.body }}
           prerelease: ${{ steps.dist_tag.outputs.prerelease == 'true' }}
+
+      - name: Comment "Released in" on included PRs
+        # squash 兼容的「已发布」标记:GitHub 原生侧栏 released 徽标只认 PR 分支的原始
+        # head commit,squash 会把它变成孤儿 commit → 徽标永不显示。这里改为在本版本
+        # 包含的每个 PR 上留一条**可见、可点**的时间线评论作为等效替代。PR 列表来自上面
+        # changelog 步骤已算好的 released_prs.txt(不额外打 API 拉取)。
+        #
+        # 只在 stable(latest)发版时评论:canary/beta/rc/next 是分支灰度,常不从 master
+        # 出、也不是用户装到的正式版;若也评论,PR 会先被刷「Released in v3.7.0-canary.0」
+        # 再来一条「v3.7.0」,既噪又易误导。对齐原生徽标只关心正式 Release 的语义。
+        if: steps.dist_tag.outputs.tag == 'latest'
+        # 设计要点:
+        # - fail-soft:npm + Release 此时已经发布,评论失败绝不能让本 job 失败 →
+        #   continue-on-error + 每个 PR 内部 || true,单个 PR 评论失败不影响其它。
+        # - 幂等:workflow 重跑(如签名恢复 re-run)时不重复刷评论——先查该 PR 是否已
+        #   有带本版本隐藏标记 `<!-- released-in:vX.Y.Z -->` 的评论,有就跳过。
+        # - 只在有 PR 时动作;纯直推(released_prs.txt 为空)自然 no-op。
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          PR_FILE="$RUNNER_TEMP/released_prs.txt"
+          if [ ! -s "$PR_FILE" ]; then
+            echo "No PRs associated with this release; nothing to comment."
+            exit 0
+          fi
+          RELEASE_URL="https://github.com/${GITHUB_REPOSITORY}/releases/tag/${RELEASE_TAG}"
+          MARKER="<!-- released-in:${RELEASE_TAG} -->"
+          # 从 FD 3 读 PR 列表(而非 stdin),避免循环体内的 gh 子进程吃掉 stdin 里剩余的
+          # PR 行导致漏评论。
+          while read -r pr <&3; do
+            [ -n "$pr" ] || continue
+            # 幂等检查:该 PR 是否已有本版本的「已发布」评论
+            if gh api "repos/${GITHUB_REPOSITORY}/issues/${pr}/comments" \
+                 --jq '.[].body' 2>/dev/null | grep -qF "$MARKER"; then
+              echo "PR #${pr}: already has released-in ${RELEASE_TAG} comment, skipping."
+              continue
+            fi
+            BODY="${MARKER}
+          🚀 Released in [**${RELEASE_TAG}**](${RELEASE_URL})"
+            if gh pr comment "$pr" --repo "$GITHUB_REPOSITORY" --body "$BODY" 2>/dev/null; then
+              echo "PR #${pr}: commented released-in ${RELEASE_TAG}."
+            else
+              echo "PR #${pr}: comment failed (non-fatal), continuing." >&2
+            fi
+          done 3< "$PR_FILE"
 
       - name: Note — desktop assets pending
         # Make the npm-first window visible in the run log: npm + Release are

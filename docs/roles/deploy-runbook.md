@@ -4,7 +4,7 @@
 `botmux slash` / `botmux role switch`）已合入并部署（`pnpm switch:here && botmux restart`）。
 
 > 命名：角色切换命令为 `botmux role switch <目录>`（曾用名 `botmux cd`，已移除）。
-> ⚠️ 存量部署的 `~/botmux-roles/<bot>/_role-protocol.md`（及各角色目录内的副本）里的
+> ⚠️ 存量部署的 `~/botmux-roles/<appId>/_role-protocol.md`（及各角色目录内的副本）里的
 > 命令名需刷新为 `botmux role switch` 并重新分发到各角色目录，否则模型发的旧命令会失败。
 
 ## 1. 选定目标 bot
@@ -17,26 +17,43 @@
 
 ## 2. 建角色库骨架
 
+⚠️ **每-bot 目录名必须 = 该 bot 的 `larkAppId`**（`cli_xxxxxxxx`），不是人类可读名。
+
 ```bash
-mkdir -p ~/botmux-roles/<bot>/shared/default/knowledge
+mkdir -p ~/botmux-roles/<appId>/shared/default/knowledge
 ```
+
+原因：这一层是**沙盒的 per-bot scoping key**。`buildFsPolicy()` 只把
+`<角色库根>/<larkAppId>` 纳入白名单（`src/adapters/cli/fs-policy.ts`），`botmux role switch`
+的越界校验也按它收窄到本 bot 自己的子树（`validateRoleLibraryPath()` 的 `ownAppId`）。
+目录名换成别的，开了 `sandbox: true` 的 bot 角色系统会**整体 EPERM**（列/切/新建角色、
+切换后写 knowledge 全部失败），且 `botmux role switch` 对这个 bot **fail-closed 拒绝**
+（`own_role_library_missing`，不会误切进别的 bot 的目录）——迁移后恢复，见第 8 节。appId
+同时是 botmux 其余每-bot 资源的统一 key（`~/.botmux/bots/<appId>`、
+`data/sessions-<appId>.json`、`data/attachments/<appId>`、`~/.lark-cli-bots/<appId>`），
+角色库对齐它而非另起一套命名。
+
+人类可读名不写在目录名里——写在各角色目录 `.botmux-dir.json` 的 `name`（卡片脚注与
+「切到XX」匹配都读它）。同理下一层角色目录名也必须是 ASCII slug，见下。
+
+存量部署若这一层用的是人类 slug：见文末「8. 迁移」。
 
 ⚠️ **角色目录名必须是 ASCII slug**（`default` / `pm` / `after-sales`），中文名写在该目录
 `.botmux-dir.json` 的 `name` 字段：Claude Code 的记忆桶按 cwd 路径 slug 分桶且把非 ASCII 字符
 统一替换成 `-`，两个同长度的中文目录名会 slug 成同一个桶导致**记忆串台**。默认角色：
 
 ```bash
-echo '{"name": "默认助理"}' > ~/botmux-roles/<bot>/shared/default/.botmux-dir.json
+echo '{"name": "默认助理"}' > ~/botmux-roles/<appId>/shared/default/.botmux-dir.json
 ```
 
-- 按 `docs/roles/role-protocol-template.md` 写 `~/botmux-roles/<bot>/_role-protocol.md`
-  （替换 `<ROLES_ROOT>` 为 `~/botmux-roles/<bot>`）。
+- 按 `docs/roles/role-protocol-template.md` 写 `~/botmux-roles/<appId>/_role-protocol.md`
+  （替换 `<ROLES_ROOT>` 为 `~/botmux-roles/<appId>`）。
 - 按 `docs/roles/role-claude-md-template.md` 写
-  `~/botmux-roles/<bot>/shared/default/CLAUDE.md`（人设段用模板里给的零人设一行：
+  `~/botmux-roles/<appId>/shared/default/CLAUDE.md`（人设段用模板里给的零人设一行：
   「你是通用助理，未设定特定角色人设。」）。
 - **把 `_role-protocol.md` 复制一份进默认角色目录**（每个角色目录都要有自己的副本）：
   ```bash
-  cp ~/botmux-roles/<bot>/_role-protocol.md ~/botmux-roles/<bot>/shared/default/
+  cp ~/botmux-roles/<appId>/_role-protocol.md ~/botmux-roles/<appId>/shared/default/
   ```
   原因：角色 CLAUDE.md 的 `@import` 若指向角色目录之外的文件，Claude Code 会判为
   「外部 include」并弹出交互式批准框（`hasClaudeMdExternalIncludesApproved`），而 botmux
@@ -45,15 +62,24 @@ echo '{"name": "默认助理"}' > ~/botmux-roles/<bot>/shared/default/.botmux-di
   「新建角色」流程同样会复制一份（见协议模板）；协议更新后需扫描各角色目录重新分发。
 
 角色库根目录固定为 `~/botmux-roles`（`src/core/role-library.ts` 的 `roleLibraryRoot()`，
-v0 硬编码约定、不接受配置），每个 bot 在其下各占一个子目录；`botmux role switch` 的越界校验
-（`validateRoleLibraryPath()`）也是对着这个全局根做包含性判断，而不是单独按 bot 子目录收紧——
-纯信息，不影响本 runbook 操作，仅供理解「角色库外」的确切边界。
+v0 硬编码约定、不接受配置），每个 bot 在其下各占一个以自己 `larkAppId` 命名的子目录。
+`botmux role switch` 的越界校验（`validateRoleLibraryPath()`）**按 `<根>/<appId>` 收窄到该
+bot 自己的子树**：切到别的 bot 的角色目录会被拒（`outside_own_role_library`，403）。
+存量部署若这一层不是 appId 命名，`botmux role switch` **fail-closed 直接拒绝**
+（`own_role_library_missing`，409）并在 daemon 日志打一行迁移指引 —— 不回落全局根
+（回落是 fail-open：会让存量部署继续能跨 bot 切并经 workingDir 拿 rw）。沙盒下角色系统
+本就整体 EPERM 不可用，fail-closed 不额外损失可用功能；非沙盒部署迁移一次（见第 8 节）
+即恢复。
+
+> 注意：飞书 IM 里人工敲的 `/cd` 走的是通用工作目录校验（`validateWorkingDir`，允许任意
+> 已存在目录、可自动创建），**不经**角色库校验 —— 它的信任契约是「运营自己输入的目录」。
+> 收窄只作用于模型驱动的 `botmux role switch`。
 
 ## 3. bots.json 配置该 bot
 
 ```jsonc
 {
-  "defaultWorkingDir": "~/botmux-roles/<bot>/shared/default",
+  "defaultWorkingDir": "~/botmux-roles/<appId>/shared/default",
   "brandLabel": "[{cwdName}]({cwdUrl})",
   "tuiSlashAllow": ["/compact"]   // 可选，默认空＝通用 slash 注入通道关闭
 }
@@ -149,5 +175,54 @@ pnpm switch:here && botmux restart
 ## 7. 回滚
 
 `bots.json` 还原 `defaultWorkingDir` / `brandLabel` 即回到无角色状态；角色库目录
-（`~/botmux-roles/<bot>/`）与记忆桶（`projects/<slug>/memory/`）原样保留，不影响其它功能，
+（`~/botmux-roles/<appId>/`）与记忆桶（`projects/<slug>/memory/`）原样保留，不影响其它功能，
 可安全留存以便下次重新启用。
+
+## 8. 迁移：每-bot 目录名改为 appId
+
+存量部署（这一层曾用人类可读名）按下面改。**迁移前**：daemon 不会崩，但该 bot 的
+**角色系统不可用**——沙盒下整体 EPERM，且 `botmux role switch` 会 **fail-closed 拒绝**
+（不会误切进别的 bot 的角色目录，这正是 fail-closed 相对旧「回落全局根」的安全改进）：
+
+- 沙盒会话启动时 worker 日志会打 `[sandbox] role library dir mismatch: … is not a real directory`；
+- `botmux role switch` 会返回 `own_role_library_missing`（409），daemon 日志打
+  `[role] 角色库每-bot 目录名不是 appId（期望 ~/botmux-roles/<appId>）——role switch 已 fail-closed 拒绝`。
+
+```bash
+APP=cli_xxxxxxxx            # 目标 bot 的 larkAppId
+OLD=~/botmux-roles/<旧目录名>
+botmux stop                  # 或至少确保该 bot 无活跃会话
+mv "$OLD" ~/botmux-roles/$APP
+```
+
+然后逐项跟着改（漏一项就是半迁移状态）：
+
+1. `bots.json` 的 `defaultWorkingDir` → `~/botmux-roles/<appId>/shared/default`。
+2. `~/botmux-roles/<appId>/_role-protocol.md` 里的 `<ROLES_ROOT>` 实际值 → 新路径；
+   **并重新分发到每个角色目录**（每个角色目录都有自己的副本）：
+   ```bash
+   for d in ~/botmux-roles/$APP/shared/*/ ~/botmux-roles/$APP/users/*/*/; do
+     [ -d "$d" ] && cp ~/botmux-roles/$APP/_role-protocol.md "$d"
+   done
+   ```
+3. 各角色目录 `CLAUDE.md` 里若硬写了旧绝对路径，一并替换。
+4. **存量会话的 cwd**：`defaultWorkingDir` 只影响**新话题**；已存在的会话把 cwd 记在
+   session store 里（`~/.botmux/data/sessions-<appId>.json`），`mv` 之后它们仍指向旧路径
+   —— `botmux stop` 只是停 daemon，不等于关掉或重钉这些会话。迁移前先关掉相关活跃/可恢复
+   会话（或迁移后逐个 `botmux role switch` 重钉到新路径），重启后确认旧话题恢复时进的是
+   新目录，而不是已被移走的旧路径。
+5. `botmux start` 后自查：新话题进入默认角色、`botmux role switch` 可切换、
+   开了沙盒的 bot 能读到 `~/botmux-roles/<appId>/` 下的兄弟角色目录、
+   切别的 bot 的角色目录被拒（403 `outside_own_role_library`）。
+
+**记忆桶会换**：记忆按 cwd 路径 slug 分桶（`~/.claude/projects/<slug>/` 或
+`~/.botmux/bots/<appId>/claude/projects/<slug>/`），目录一改 slug 就变，旧桶里的
+`MEMORY.md` 与记忆文件不会自动跟过来。迁移前若有需要保留的记忆，把旧桶的
+`memory/` 整个拷进新桶：
+
+```bash
+# <OLDSLUG>/<NEWSLUG> = 旧/新 cwd 的 slug（绝对路径里非字母数字全换成 -，含前导 -）
+cp -R <projects>/<OLDSLUG>/memory <projects>/<NEWSLUG>/memory
+```
+
+角色目录名（下一层，如 `default`/`pm`）**不受本次迁移影响**，仍是 ASCII slug 约定。

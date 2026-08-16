@@ -4,6 +4,12 @@ import {
 } from 'node:fs';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { dirname } from 'node:path';
+import {
+  readSecureHostFileSync,
+  UnsafeHostAuthorityFileError,
+  withSecureHostParentSync,
+  writeSecureHostFileSync,
+} from '../platform/secure-host-file.js';
 
 const NONCE_TTL_MS = 60_000;
 const TS_WINDOW_S = 30;
@@ -18,11 +24,13 @@ export interface HmacAttempt { ts: string; nonce: string; sig: string; }
  * single set of `X-Botmux-Cli-*` headers signed only over `ts:nonce` is valid
  * for ANY `/__cli/*` route on ANY dashboard — which lets a malicious local
  * server, handed a discovery probe, forward the headers to the real dashboard
- * (e.g. a `/__cli/current` probe relayed to `/__cli/rotate` to mint a token).
+ * (e.g. a `/__cli/current` probe relayed to `/__cli/ensure` or `/__cli/rotate`
+ * to mint a token).
  * Binding `method + path + bound-port` makes the credential single-purpose:
  *  - the verifier uses the port IT actually bound (not the attacker-controlled
  *    Host header), so a forward from port X to the dashboard on port Y mismatches;
- *  - a `/__cli/current` capture can't be replayed to `/__cli/rotate` (path differs).
+ *  - a `/__cli/current` capture can't be replayed to either token-writing route
+ *    (path differs).
  */
 export function cliAuthBind(method: string, path: string, port: number | string): string {
   return `${String(method).toUpperCase()} ${path} ${port}`;
@@ -150,26 +158,141 @@ export function loadOrCreateDashboardSecret(secretPath: string): string {
 
 /**
  * Load the persisted active dashboard token from `tokenPath`, or `null` when
- * the file is absent / empty / unreadable.
+ * the file is genuinely absent or empty. Unsafe credential-file shapes fail
+ * closed instead of being treated as a missing token.
  *
  * Persisting the active token lets a previously-issued dashboard URL survive a
- * `botmux restart`: on startup the dashboard hydrates `activeToken` from this
- * file instead of starting blank.  Only `botmux dashboard` rotates the token
- * (via `persistToken` with a fresh value), which is what invalidates the old
- * link.
+ * `botmux restart` and keeps multiple dashboard processes on one authority.
+ * Only `botmux dashboard rotate` replaces the file, which invalidates the old
+ * link for every process on its next request.
  */
 export function loadPersistedToken(tokenPath: string): string | null {
-  try {
-    if (existsSync(tokenPath)) return readFileSync(tokenPath, 'utf8').trim() || null;
-  } catch { /* unreadable token file → behave as if none persisted */ }
-  return null;
+  return readSecureHostFileSync(tokenPath, 256)?.trim() || null;
 }
 
-/** Persist the active dashboard token to `tokenPath` with 0600 perms. */
+/** Durably persist the active dashboard token without following a leaf symlink. */
 export function persistToken(tokenPath: string, token: string): void {
-  mkdirSync(dirname(tokenPath), { recursive: true });
-  atomicWriteFileSync(tokenPath, token, { mode: 0o600 });
-  chmodSync(tokenPath, 0o600);
+  writeSecureHostFileSync(tokenPath, token);
+}
+
+/**
+ * Load the active token, creating and persisting the first one when absent.
+ * The file lock makes get-or-create linearizable across dashboard processes:
+ * every concurrent caller returns the same durable token.
+ *
+ * The credential directory is pinned once (Linux: via an open directory
+ * descriptor) and the lock, the read, and the write all resolve through that
+ * same anchor. This keeps the whole critical section on one directory inode —
+ * so a symlinked HOME whose target sits under a shared-drive / 0777 ancestor
+ * still succeeds, while an ancestor rename mid-section cannot redirect the lock
+ * or the token write into a substituted directory. `~/.botmux` itself must
+ * still be 0700 and owned by the current user; a leaf symlink is still refused.
+ */
+export function loadOrCreatePersistedToken(tokenPath: string): string {
+  return withSecureHostParentSync(tokenPath, (parent) =>
+    parent.withLeafLock(() => {
+      const existing = parent.readLeaf(256)?.trim() || null;
+      if (existing) return existing;
+      const token = generateToken();
+      parent.writeLeaf(token);
+      return token;
+    }),
+  );
+}
+
+/** Generate and durably replace the token while serialized with first creation. */
+export function rotatePersistedToken(tokenPath: string): string {
+  return withSecureHostParentSync(tokenPath, (parent) =>
+    parent.withLeafLock(() => {
+      const token = generateToken();
+      parent.writeLeaf(token);
+      return token;
+    }),
+  );
+}
+
+/**
+ * POSIX-single-quote a path for safe copy-paste into a shell, but only when it
+ * contains characters a shell treats specially — a clean path stays unquoted so
+ * the common-case hint reads naturally. Only ever used to build a POSIX command
+ * (never on win32, where we emit prose, not a command).
+ */
+function shellQuoteIfNeeded(p: string): string {
+  if (/^[A-Za-z0-9_./-]+$/.test(p)) return p;
+  return `'${p.replace(/'/g, `'\\''`)}'`;
+}
+
+/**
+ * Diagnostic body for a dashboard token 500. The `/__cli/*` HTTP layer used to
+ * return a bare `{ error: 'token_persist_failed' | 'token_unavailable' }`, which
+ * the CLI printed verbatim — so a user whose `~/.botmux` (or `.dashboard-token`)
+ * has loose perms only saw an opaque code and had to be diagnosed remotely. The
+ * real, actionable cause is already on the thrown {@link
+ * UnsafeHostAuthorityFileError} (`message` is a precise reason like
+ * "宿主凭证目录可被组内或其它用户写入" / "宿主凭证文件权限必须严格为 0600" /
+ * "宿主凭证拒绝符号链接"). This surfaces that reason plus a one-line remediation
+ * hint WITHOUT changing any validation — every fail-closed check still fails
+ * closed; we only make the failure legible.
+ *
+ * `error` keeps the stable machine code (unchanged for programmatic callers);
+ * `reason`/`hint` are additive human-facing fields.
+ */
+export function describeDashboardTokenError(
+  code: 'token_persist_failed' | 'token_unavailable',
+  err: unknown,
+  tokenPath: string,
+): { error: string; reason?: string; hint?: string } {
+  if (!(err instanceof UnsafeHostAuthorityFileError)) return { error: code };
+  const reason = err.message;
+  // Map the credential-shape reason to a concrete fix. Remediations are
+  // intentionally NOT auto-applied: a group/other-writable (or wrongly-owned)
+  // credential dir may already be compromised, so tightening it is the user's
+  // explicit decision, not a silent self-heal — we only make the failure
+  // legible. Guard rails for the hint (the reason itself is always surfaced):
+  //   - Owner errors carry the failing node in their label ("宿主凭证目录" vs
+  //     "宿主凭证文件"); branch on it so we never tell someone to chmod the dir
+  //     when the *file* is the wrong owner (chmod can't fix ownership anyway).
+  //   - Never hand a single destructive command when the node kind is unknown:
+  //     a directory leaf makes a blind `rm -f` fail with "Is a directory", so
+  //     the generic non-regular-file case degrades to an inspection step.
+  //   - On non-POSIX hosts a chmod/rm one-liner is unusable, so degrade to prose
+  //     and quote paths (spaces / shell metacharacters) on POSIX.
+  const dir = dirname(tokenPath);
+  const posix = process.platform !== 'win32';
+  const qDir = shellQuoteIfNeeded(dir);
+  const qFile = shellQuoteIfNeeded(tokenPath);
+  const ownerErr = reason.includes('不属于当前用户');
+  let hint: string | undefined;
+  if (reason.includes('组内或其它用户写入') || (ownerErr && reason.includes('宿主凭证目录'))) {
+    hint = posix
+      ? `凭证目录权限过松或属主不对。请确认 ${dir} 归当前用户所有,并执行 chmod 700 ${qDir} 后重试。`
+      : `凭证目录权限过松或属主不对。请确认 ${dir} 归当前用户所有、且未对其他用户开放写权限后重试。`;
+  } else if (ownerErr && reason.includes('宿主凭证文件')) {
+    // Wrong-owner file: chmod can't change ownership; removing it lets ensure/
+    // rotate regenerate it as the current user (the dir is 0700-owned, so the
+    // unlink is permitted).
+    hint = posix
+      ? `凭证文件不属于当前用户。请执行 rm -f ${qFile} 让其以当前用户身份重新生成后重试。`
+      : `凭证文件不属于当前用户。请删除 ${tokenPath} 让其以当前用户身份重新生成后重试。`;
+  } else if (reason.includes('权限必须严格为 0600')) {
+    hint = posix
+      ? `凭证文件权限过松。请执行 chmod 600 ${qFile} 后重试。`
+      : `凭证文件权限过松。请将 ${tokenPath} 收紧为仅当前用户可读写后重试。`;
+  } else if (reason.includes('拒绝符号链接')) {
+    // ELOOP — definitely a symlink; `rm -f` removes a symlink safely.
+    hint = posix
+      ? `凭证文件是符号链接。请执行 rm -f ${qFile} 让其重新生成后重试。`
+      : `凭证文件是符号链接。请删除 ${tokenPath} 让其重新生成后重试。`;
+  } else if (reason.includes('必须是普通文件')) {
+    // Non-regular file of unknown kind (possibly a directory): give an
+    // inspection step, not a blind `rm -f` that could fail or over-delete.
+    hint = posix
+      ? `凭证路径不是普通文件(可能是目录/管道/设备等)。请先 ls -ld ${qFile} 查看,再手动移除该节点后重试。`
+      : `凭证路径不是普通文件(可能是目录等)。请检查并手动移除 ${tokenPath} 后重试。`;
+  } else if (reason.includes('祖先') || reason.includes('句柄')) {
+    hint = `凭证目录的某级祖先不安全或运行期被改动。请确认 ${dir} 及其上级目录属可信用户后重试。`;
+  }
+  return { error: code, reason, ...(hint ? { hint } : {}) };
 }
 
 /** Extract `botmux_dashboard_token` value from a Cookie header. */
@@ -206,8 +329,10 @@ export function buildSetCookie(token: string): string {
  *   - `GET /api/workflows/*`                   — zero-I/O legacy retirement
  *                                                tombstone (HTTP 410).
  *
- * Anything else (sessions, schedules, dashboard rotate, etc.) requires the active session token, matching the
- * "get_write_link" pattern that the chat web terminal already uses.
+ * Outside those always-public surfaces, the explicit `publicReadOnly`
+ * allow-list controls tokenless observation. Mutations and private reads still
+ * require the active session token, matching the chat web terminal's
+ * capability boundary.
  */
 export type AuthDecision =
   | { kind: 'allow' }
@@ -293,8 +418,9 @@ export function decideWorkbenchH5Auth(opts: {
  *  workflow tombstone are handled separately in decideDashboardAuth. Full v3
  *  workflow projections stay private because goals, node ids, and run ids can
  *  contain project or personal information.
- *  口径：公开 = 会话板 / 排程(脱敏) / 设置(只读) / 群名册 / 事件流。 */
+ *  口径：公开 = 运行摘要 / 会话板 / 排程(脱敏) / 设置(只读) / 群名册 / 事件流。 */
 const PUBLIC_READ_PATHS: ReadonlySet<string> = new Set([
+  '/api/dashboard/v1/summary', // strongly-redacted dashboard aggregate
   '/api/sessions',    // session board
   '/api/schedules',   // schedules page — task prompt redacted for anon upstream
   '/api/settings',    // read-only settings — only public flags + authed:false

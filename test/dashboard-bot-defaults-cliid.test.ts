@@ -2,10 +2,61 @@ import React from 'react';
 import TestRenderer, { act } from 'react-test-renderer';
 import { describe, expect, it, vi } from 'vitest';
 import { displayCliId } from '../src/dashboard/web/bot-defaults.js';
-import { BotAgentSection, CodexAppDisplaySection } from '../src/dashboard/web/bot-defaults-page.js';
+import {
+  BOT_DEFAULTS_TABS,
+  BotAgentSection,
+  BotDefaultsTabs,
+  CardBehaviorSection,
+  CodexAppDisplaySection,
+  type BotDefaultsTab,
+} from '../src/dashboard/web/bot-defaults-page.js';
 import { isOnboardingSubmitDisabled } from '../src/dashboard/web/bot-onboarding.js';
 
 (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
+
+describe('bot defaults task tabs', () => {
+  it('renders five accessible categories and supports pointer selection', () => {
+    const onChange = vi.fn();
+    let renderer!: TestRenderer.ReactTestRenderer;
+    act(() => {
+      renderer = TestRenderer.create(React.createElement(BotDefaultsTabs, {
+        active: 'common' satisfies BotDefaultsTab,
+        onChange,
+      }));
+    });
+
+    const tabs = renderer.root.findAllByProps({ role: 'tab' });
+    expect(BOT_DEFAULTS_TABS).toEqual(['common', 'sessions', 'security', 'cards', 'advanced']);
+    expect(tabs).toHaveLength(5);
+    expect(tabs[0]!.props['aria-selected']).toBe(true);
+    expect(tabs[1]!.props.tabIndex).toBe(-1);
+
+    act(() => tabs[2]!.props.onClick());
+    expect(onChange).toHaveBeenCalledWith('security');
+  });
+
+  it('wraps arrow-key navigation and supports Home / End', () => {
+    const onChange = vi.fn();
+    let renderer!: TestRenderer.ReactTestRenderer;
+    act(() => {
+      renderer = TestRenderer.create(React.createElement(BotDefaultsTabs, {
+        active: 'common' satisfies BotDefaultsTab,
+        onChange,
+      }));
+    });
+    const tabs = renderer.root.findAllByProps({ role: 'tab' });
+    const event = (key: string) => ({ key, preventDefault: vi.fn() });
+
+    act(() => tabs[0]!.props.onKeyDown(event('ArrowLeft')));
+    expect(onChange).toHaveBeenLastCalledWith('advanced');
+    act(() => tabs[4]!.props.onKeyDown(event('ArrowRight')));
+    expect(onChange).toHaveBeenLastCalledWith('common');
+    act(() => tabs[2]!.props.onKeyDown(event('Home')));
+    expect(onChange).toHaveBeenLastCalledWith('common');
+    act(() => tabs[2]!.props.onKeyDown(event('End')));
+    expect(onChange).toHaveBeenLastCalledWith('advanced');
+  });
+});
 
 describe('bot defaults cli label', () => {
   it('prefers /api/bots cliId before session fallback', () => {
@@ -58,6 +109,391 @@ describe('bot defaults cli label', () => {
     const dropdown = root.findByProps({ dataInput: 'agentCliId' });
     expect(dropdown.props.options[0].label).toContain('未安装');
     expect(root.findByProps({ className: 'hint-warn' }).children.join('')).toContain('codex');
+  });
+});
+
+describe('Codex-compatible runtime editor', () => {
+  const cliState = {
+    options: [
+      { id: 'claude-code', label: 'Claude' },
+      { id: 'codex', label: 'Codex' },
+      { id: 'traex', label: 'traex' },
+      { id: 'ttadk-x-codex', label: 'Codex via TTADK' },
+    ],
+    ttadkModelDefault: 'glm-5.1',
+    ttadkModelSuggestions: [],
+  };
+
+  function renderAgent(bot: Record<string, any>, patchBot = vi.fn()) {
+    let renderer!: TestRenderer.ReactTestRenderer;
+    act(() => {
+      renderer = TestRenderer.create(React.createElement(BotAgentSection, {
+        bot: { larkAppId: 'cli_runtime', model: '', ...bot },
+        sessionFallback: 'codex',
+        cliState,
+        patchBot,
+      }));
+    });
+    return { renderer, root: renderer.root, patchBot };
+  }
+
+  it('defaults old payloads to Official Codex and keeps wrapper or non-Codex selections unchanged', () => {
+    const official = renderAgent({ cliId: 'codex' });
+    expect(official.root.findByProps({ 'data-input': 'agentRuntimeMode' }).props.value).toBe('official');
+    expect(official.root.findByProps({ dataInput: 'agentReasoningEffort' }).props.value).toBe('');
+    expect(official.root.findAllByProps({ 'data-input': 'agentRuntimeId' })).toHaveLength(0);
+
+    const otherCli = renderAgent({ cliId: 'traex', agentSelectionKey: 'traex' });
+    expect(otherCli.root.findAllByProps({ 'data-codex-runtime': '' })).toHaveLength(0);
+
+    const wrapper = renderAgent({
+      cliId: 'codex',
+      wrapperCli: 'ttadk codex',
+      agentSelectionKey: 'ttadk-x-codex',
+    });
+    expect(wrapper.root.findAllByProps({ 'data-codex-runtime': '' })).toHaveLength(0);
+
+    const oldWrapperPayload = renderAgent({ cliId: 'codex', wrapperCli: 'custom-launcher codex' });
+    expect(oldWrapperPayload.root.findAllByProps({ 'data-codex-runtime': '' })).toHaveLength(0);
+  });
+
+  it('shows and saves the configured Codex reasoning effort', async () => {
+    const previousFetch = globalThis.fetch;
+    const requests: any[] = [];
+    (globalThis as any).fetch = vi.fn(async (_url: string, init?: any) => {
+      const body = JSON.parse(init?.body ?? '{}');
+      requests.push(body);
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ ok: true, cliId: 'codex', model: '', reasoningEffort: body.reasoningEffort, selectionKey: 'codex' }),
+      } as any;
+    });
+    try {
+      const { root } = renderAgent({ cliId: 'codex', model: 'gpt-5.6-sol', reasoningEffort: 'high' });
+      const picker = root.findByProps({ dataInput: 'agentReasoningEffort' });
+      expect(picker.props.value).toBe('high');
+      act(() => picker.props.onChange('ultra'));
+      await act(async () => {
+        root.findByProps({ 'data-action': 'save-agent' }).props.onClick();
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+      expect(requests).toEqual([{ cliId: 'codex', model: 'gpt-5.6-sol', reasoningEffort: 'ultra' }]);
+    } finally {
+      (globalThis as any).fetch = previousFetch;
+    }
+  });
+
+  it('shows a legacy path as read-only and omits cliRuntime on a model-only save', async () => {
+    const previousFetch = globalThis.fetch;
+    const requests: any[] = [];
+    const legacyPath = '/opt/legacy/bin/legacy-codex';
+    (globalThis as any).fetch = vi.fn(async (_url: string, init?: any) => {
+      requests.push(JSON.parse(init?.body ?? '{}'));
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          ok: true,
+          cliId: 'codex',
+          cliRuntime: null,
+          cliPathOverride: legacyPath,
+          wrapperCli: null,
+          model: 'new-model',
+          selectionKey: 'codex',
+          closedMismatchedSessions: 0,
+        }),
+      } as any;
+    });
+
+    try {
+      const patchBot = vi.fn();
+      const { root } = renderAgent({
+        cliId: 'codex',
+        cliPathOverride: legacyPath,
+        model: 'old-model',
+      }, patchBot);
+      expect(root.findByProps({ 'data-input': 'agentRuntimeMode' }).props.value).toBe('legacy');
+      expect(root.findByProps({ 'data-runtime-legacy': '' })).toBeTruthy();
+      const legacyInput = root.findByProps({ 'data-input': 'agentRuntimeLegacyPath' });
+      expect(legacyInput.props.value).toBe(legacyPath);
+      expect(legacyInput.props.readOnly).toBe(true);
+
+      act(() => root.findByProps({ 'data-input': 'agentModel' }).props.onChange({ currentTarget: { value: 'new-model' } }));
+      await act(async () => {
+        root.findByProps({ 'data-action': 'save-agent' }).props.onClick();
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+
+      expect(requests).toEqual([{ cliId: 'codex', model: 'new-model', reasoningEffort: '' }]);
+      expect(patchBot).toHaveBeenCalledWith('cli_runtime', expect.objectContaining({
+        cliRuntime: null,
+        cliPathOverride: legacyPath,
+      }));
+    } finally {
+      (globalThis as any).fetch = previousFetch;
+    }
+  });
+
+  it('explicitly clears a legacy path and reports sessions closed by the runtime switch', async () => {
+    const previousFetch = globalThis.fetch;
+    const requests: any[] = [];
+    (globalThis as any).fetch = vi.fn(async (_url: string, init?: any) => {
+      requests.push(JSON.parse(init?.body ?? '{}'));
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          ok: true,
+          cliId: 'codex',
+          cliRuntime: null,
+          cliPathOverride: null,
+          wrapperCli: null,
+          model: '',
+          selectionKey: 'codex',
+          closedMismatchedSessions: 2,
+        }),
+      } as any;
+    });
+
+    try {
+      const { root } = renderAgent({
+        cliId: 'codex',
+        cliPathOverride: '/opt/legacy/bin/legacy-codex',
+      });
+      act(() => root.findByProps({ 'data-action': 'runtime-official' }).props.onClick());
+      await act(async () => {
+        root.findByProps({ 'data-action': 'save-agent' }).props.onClick();
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+
+      expect(requests).toEqual([{ cliId: 'codex', model: '', reasoningEffort: '', cliRuntime: null }]);
+      expect(root.findByProps({ 'data-agent-status': '' }).children.join('')).toContain('2');
+    } finally {
+      (globalThis as any).fetch = previousFetch;
+    }
+  });
+
+  it('migrates a legacy path into a structured custom runtime without retyping the executable', async () => {
+    const previousFetch = globalThis.fetch;
+    const requests: any[] = [];
+    const legacyPath = '/opt/legacy/bin/legacy-codex';
+    const savedRuntime = {
+      id: 'legacy-codex',
+      executable: legacyPath,
+      update: { provider: 'none' },
+    };
+    (globalThis as any).fetch = vi.fn(async (_url: string, init?: any) => {
+      requests.push(JSON.parse(init?.body ?? '{}'));
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          ok: true,
+          cliId: 'codex',
+          cliRuntime: savedRuntime,
+          cliPathOverride: null,
+          wrapperCli: null,
+          model: '',
+          selectionKey: 'codex',
+          closedMismatchedSessions: 0,
+          runtimeProbe: { version: '1.2.3', updateProvider: 'none' },
+        }),
+      } as any;
+    });
+
+    try {
+      const { root } = renderAgent({ cliId: 'codex', cliPathOverride: legacyPath });
+      act(() => root.findByProps({ 'data-action': 'runtime-custom' }).props.onClick());
+      expect(root.findByProps({ 'data-input': 'agentRuntimeExecutable' }).props.value).toBe(legacyPath);
+      act(() => root.findByProps({ 'data-input': 'agentRuntimeId' }).props.onChange({ currentTarget: { value: 'legacy-codex' } }));
+      act(() => root.findByProps({ dataInput: 'agentRuntimeUpdateProvider' }).props.onChange('none'));
+      await act(async () => {
+        root.findByProps({ 'data-action': 'save-agent' }).props.onClick();
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+
+      expect(requests).toEqual([{ cliId: 'codex', model: '', reasoningEffort: '', cliRuntime: savedRuntime }]);
+    } finally {
+      (globalThis as any).fetch = previousFetch;
+    }
+  });
+
+  it('hydrates every custom runtime field, including an npm update source', () => {
+    const { root } = renderAgent({
+      cliId: 'codex',
+      cliRuntime: {
+        id: 'forge-codex',
+        displayName: 'Forge Codex',
+        executable: '/opt/forge/bin/forge-codex',
+        update: { provider: 'npm', packageName: '@forge/codex' },
+      },
+    });
+
+    expect(root.findByProps({ 'data-input': 'agentRuntimeMode' }).props.value).toBe('custom');
+    expect(root.findByProps({ 'data-input': 'agentRuntimeId' }).props.value).toBe('forge-codex');
+    expect(root.findByProps({ 'data-input': 'agentRuntimeDisplayName' }).props.value).toBe('Forge Codex');
+    expect(root.findByProps({ 'data-input': 'agentRuntimeExecutable' }).props.value).toBe('/opt/forge/bin/forge-codex');
+    expect(root.findByProps({ 'data-input': 'agentRuntimeUpdateProvider' }).props.value).toBe('npm');
+    expect(root.findByProps({ 'data-input': 'agentRuntimePackageName' }).props.value).toBe('@forge/codex');
+  });
+
+  it('omits cliRuntime when only the model changes on an existing structured runtime', async () => {
+    const previousFetch = globalThis.fetch;
+    const requests: any[] = [];
+    const runtime = { id: 'forge-codex', executable: 'forge-codex', update: { provider: 'none' } };
+    (globalThis as any).fetch = vi.fn(async (_url: string, init?: any) => {
+      requests.push(JSON.parse(init?.body ?? '{}'));
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          ok: true,
+          cliId: 'codex',
+          cliRuntime: runtime,
+          cliPathOverride: null,
+          wrapperCli: null,
+          model: 'gpt-next',
+          selectionKey: 'codex',
+          closedMismatchedSessions: 0,
+        }),
+      } as any;
+    });
+
+    try {
+      const { root } = renderAgent({ cliId: 'codex', cliRuntime: runtime, model: 'gpt-old' });
+      act(() => root.findByProps({ 'data-input': 'agentModel' }).props.onChange({ currentTarget: { value: 'gpt-next' } }));
+      await act(async () => {
+        root.findByProps({ 'data-action': 'save-agent' }).props.onClick();
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+      expect(requests).toEqual([{ cliId: 'codex', model: 'gpt-next', reasoningEffort: '' }]);
+    } finally {
+      (globalThis as any).fetch = previousFetch;
+    }
+  });
+
+  it('PUTs a structured custom runtime and surfaces the backend probe', async () => {
+    const previousFetch = globalThis.fetch;
+    const requests: Array<{ url: string; body: any }> = [];
+    const savedRuntime = {
+      id: 'forge-codex',
+      displayName: 'Forge Codex',
+      executable: 'forge-codex',
+      update: { provider: 'npm', packageName: '@forge/codex' },
+    };
+    (globalThis as any).fetch = vi.fn(async (url: string, init?: any) => {
+      requests.push({ url: String(url), body: JSON.parse(init?.body ?? '{}') });
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          ok: true,
+          cliId: 'codex',
+          cliRuntime: savedRuntime,
+          wrapperCli: null,
+          model: '',
+          selectionKey: 'codex',
+          runtimeProbe: { version: '1.4.2', updateProvider: 'npm' },
+        }),
+      } as any;
+    });
+
+    try {
+      const patchBot = vi.fn();
+      const { root } = renderAgent({ cliId: 'codex' }, patchBot);
+      act(() => root.findByProps({ 'data-action': 'runtime-custom' }).props.onClick());
+      act(() => root.findByProps({ 'data-input': 'agentRuntimeId' }).props.onChange({ currentTarget: { value: ' forge-codex ' } }));
+      act(() => root.findByProps({ 'data-input': 'agentRuntimeDisplayName' }).props.onChange({ currentTarget: { value: ' Forge Codex ' } }));
+      act(() => root.findByProps({ 'data-input': 'agentRuntimeExecutable' }).props.onChange({ currentTarget: { value: ' forge-codex ' } }));
+      act(() => root.findByProps({ dataInput: 'agentRuntimeUpdateProvider' }).props.onChange('npm'));
+      act(() => root.findByProps({ 'data-input': 'agentRuntimePackageName' }).props.onChange({ currentTarget: { value: ' @forge/codex ' } }));
+      await act(async () => {
+        root.findByProps({ 'data-action': 'save-agent' }).props.onClick();
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+
+      expect(requests).toEqual([{
+        url: '/api/bots/cli_runtime/agent',
+        body: { cliId: 'codex', model: '', reasoningEffort: '', cliRuntime: savedRuntime },
+      }]);
+      expect(patchBot).toHaveBeenCalledWith('cli_runtime', expect.objectContaining({ cliRuntime: savedRuntime }));
+      const probeText = root.findByProps({ 'data-runtime-status': '' }).children.join('');
+      expect(probeText).toContain('1.4.2');
+      expect(probeText).toContain('npm');
+    } finally {
+      (globalThis as any).fetch = previousFetch;
+    }
+  });
+
+  it('clears the draft after leaving Codex and PUTs null when switching back to official', async () => {
+    const previousFetch = globalThis.fetch;
+    const requests: any[] = [];
+    (globalThis as any).fetch = vi.fn(async (_url: string, init?: any) => {
+      requests.push(JSON.parse(init?.body ?? '{}'));
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ ok: true, cliId: 'codex', cliRuntime: null, wrapperCli: null, model: '', selectionKey: 'codex' }),
+      } as any;
+    });
+
+    try {
+      const { root } = renderAgent({
+        cliId: 'codex',
+        cliRuntime: { id: 'forge-codex', executable: 'forge-codex', update: { provider: 'none' } },
+      });
+      act(() => root.findByProps({ dataInput: 'agentCliId' }).props.onChange('traex'));
+      expect(root.findAllByProps({ 'data-codex-runtime': '' })).toHaveLength(0);
+      act(() => root.findByProps({ dataInput: 'agentCliId' }).props.onChange('codex'));
+      expect(root.findByProps({ 'data-input': 'agentRuntimeMode' }).props.value).toBe('official');
+      expect(root.findAllByProps({ 'data-input': 'agentRuntimeId' })).toHaveLength(0);
+
+      await act(async () => {
+        root.findByProps({ 'data-action': 'save-agent' }).props.onClick();
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+      expect(requests[requests.length - 1]).toEqual({ cliId: 'codex', model: '', reasoningEffort: '', cliRuntime: null });
+    } finally {
+      (globalThis as any).fetch = previousFetch;
+    }
+  });
+
+  it('shows backend runtime probe errors instead of the generic error code', async () => {
+    const previousFetch = globalThis.fetch;
+    (globalThis as any).fetch = vi.fn(async () => ({
+      ok: false,
+      status: 400,
+      json: async () => ({
+        ok: false,
+        error: 'runtime_unavailable',
+        message: 'daemon PATH 找不到 forge-codex',
+      }),
+    }) as any);
+
+    try {
+      const { root } = renderAgent({
+        cliId: 'codex',
+        cliRuntime: { id: 'forge-codex', executable: 'forge-codex', update: { provider: 'none' } },
+      });
+      await act(async () => {
+        root.findByProps({ 'data-action': 'save-agent' }).props.onClick();
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+      const runtimeError = root.findByProps({ 'data-runtime-status': '' }).children.join('');
+      expect(runtimeError).toContain('daemon PATH 找不到 forge-codex');
+      expect(runtimeError).not.toContain('runtime_unavailable');
+    } finally {
+      (globalThis as any).fetch = previousFetch;
+    }
   });
 });
 
@@ -201,5 +637,197 @@ describe('Codex App history switch', () => {
     expect(renderer.root.findByProps({ 'data-action': 'toggle-codex-app-clean-input' }).props.checked).toBe(false);
     expect(renderer.root.findByProps({ 'data-codex-app-clean-input-status': '' }).children.join(''))
       .toContain('write_failed');
+  });
+});
+
+describe('reply-card usage display mode', () => {
+  it('defaults to streaming and persists explicit footer/off changes', async () => {
+    const putCardPref = vi.fn(async (patch: Record<string, string>) => ({
+      ok: true,
+      status: 200,
+      body: { ok: true, ...patch },
+    }));
+    let renderer!: TestRenderer.ReactTestRenderer;
+    act(() => {
+      renderer = TestRenderer.create(React.createElement(CardBehaviorSection, {
+        bot: { larkAppId: 'cli_usage', usageSupported: true },
+        putCardPref,
+      }));
+    });
+
+    const menu = () => renderer.root.findByProps({ id: 'bd-menu-usageDisplay' });
+    expect(menu().props.value).toBe('streaming');
+
+    await act(async () => {
+      menu().props.onChange('footer');
+      await Promise.resolve();
+    });
+    expect(putCardPref).toHaveBeenLastCalledWith({ usageDisplay: 'footer' });
+    expect(menu().props.value).toBe('footer');
+
+    await act(async () => {
+      menu().props.onChange('off');
+      await Promise.resolve();
+    });
+    expect(putCardPref).toHaveBeenLastCalledWith({ usageDisplay: 'off' });
+    expect(menu().props.value).toBe('off');
+  });
+
+  it('rolls back when persistence fails', async () => {
+    const putCardPref = vi.fn(async () => ({
+      ok: false,
+      status: 500,
+      body: { error: 'write_failed' },
+    }));
+    let renderer!: TestRenderer.ReactTestRenderer;
+    act(() => {
+      renderer = TestRenderer.create(React.createElement(CardBehaviorSection, {
+        bot: { larkAppId: 'cli_usage', usageSupported: true },
+        putCardPref,
+      }));
+    });
+
+    const menu = () => renderer.root.findByProps({ id: 'bd-menu-usageDisplay' });
+    await act(async () => {
+      menu().props.onChange('off');
+      await Promise.resolve();
+    });
+
+    expect(menu().props.value).toBe('streaming');
+    expect(renderer.root.findByProps({ 'data-card-pref-status': '' }).children.join(''))
+      .toContain('write_failed');
+  });
+});
+
+describe('card behavior defaults', () => {
+  it('defaults to automatic cards while keeping explicit card-off controls usable', () => {
+    let existing!: TestRenderer.ReactTestRenderer;
+    let cardOff!: TestRenderer.ReactTestRenderer;
+    const putCardPref = vi.fn(async () => ({ ok: true, status: 200, body: { ok: true } }));
+
+    act(() => {
+      existing = TestRenderer.create(React.createElement(CardBehaviorSection, {
+        bot: { larkAppId: 'cli_existing' },
+        putCardPref,
+      }));
+      cardOff = TestRenderer.create(React.createElement(CardBehaviorSection, {
+        bot: { larkAppId: 'cli_new', disableStreamingCard: true },
+        putCardPref,
+      }));
+    });
+
+    expect(existing.root.findByProps({ 'data-action': 'toggle-disable-streaming' }).props.checked).toBe(true);
+    expect(existing.root.findByProps({ 'data-card-off-options': true }).props.hidden).toBe(true);
+    expect(cardOff.root.findByProps({ 'data-action': 'toggle-disable-streaming' }).props.checked).toBe(false);
+    expect(cardOff.root.findByProps({ 'data-card-off-options': true }).props.hidden).toBe(false);
+    expect(cardOff.root.findByProps({ 'data-action': 'toggle-silent-reactions' }).props.checked).toBe(true);
+    expect(cardOff.root.findByProps({ 'data-action': 'toggle-silent-reactions' }).props.disabled).toBe(false);
+    expect(cardOff.root.findByProps({ 'data-action': 'toggle-writable-link' }).props.disabled).toBe(false);
+    expect(cardOff.root.findByProps({ 'data-card-pref-status': '' }).props).toMatchObject({
+      role: 'status',
+      'aria-live': 'polite',
+    });
+  });
+
+  it('enabling automatic cards persists disableStreamingCard=false', async () => {
+    const putCardPref = vi.fn(async (patch: Record<string, boolean>) => ({
+      ok: true,
+      status: 200,
+      body: { ok: true, ...patch },
+    }));
+    let renderer!: TestRenderer.ReactTestRenderer;
+    act(() => {
+      renderer = TestRenderer.create(React.createElement(CardBehaviorSection, {
+        bot: { larkAppId: 'cli_new', disableStreamingCard: true },
+        putCardPref,
+      }));
+    });
+
+    const toggle = renderer.root.findByProps({ 'data-action': 'toggle-disable-streaming' });
+    await act(async () => {
+      toggle.props.onChange({ currentTarget: { checked: true } });
+      await Promise.resolve();
+    });
+
+    expect(putCardPref).toHaveBeenCalledWith({ disableStreamingCard: false });
+    expect(renderer.root.findByProps({ 'data-action': 'toggle-disable-streaming' }).props.checked).toBe(true);
+  });
+
+  it('maps the no-card processing-status switch to the inverse storage field', async () => {
+    const putCardPref = vi.fn(async (patch: Record<string, boolean>) => ({
+      ok: true,
+      status: 200,
+      body: { ok: true, ...patch },
+    }));
+    let renderer!: TestRenderer.ReactTestRenderer;
+    act(() => {
+      renderer = TestRenderer.create(React.createElement(CardBehaviorSection, {
+        bot: { larkAppId: 'cli_no_card', disableStreamingCard: true },
+        putCardPref,
+      }));
+    });
+
+    const toggle = renderer.root.findByProps({ 'data-action': 'toggle-silent-reactions' });
+    expect(toggle.props.checked).toBe(true);
+    await act(async () => {
+      toggle.props.onChange({ currentTarget: { checked: false } });
+      await Promise.resolve();
+    });
+
+    expect(putCardPref).toHaveBeenCalledWith({ silentTurnReactions: true });
+    expect(renderer.root.findByProps({ 'data-action': 'toggle-silent-reactions' }).props.checked).toBe(false);
+  });
+
+  it('rolls every card toggle back when persistence fails', async () => {
+    const putCardPref = vi.fn(async () => ({
+      ok: false,
+      status: 500,
+      body: { error: 'write_failed' },
+    }));
+    let renderer!: TestRenderer.ReactTestRenderer;
+    act(() => {
+      renderer = TestRenderer.create(React.createElement(CardBehaviorSection, {
+        bot: { larkAppId: 'cli_card_fail', disableStreamingCard: true },
+        putCardPref,
+      }));
+    });
+
+    for (const action of ['toggle-disable-streaming', 'toggle-silent-reactions', 'toggle-writable-link', 'toggle-private-card']) {
+      const before = renderer.root.findByProps({ 'data-action': action }).props.checked;
+      await act(async () => {
+        renderer.root.findByProps({ 'data-action': action }).props.onChange({ currentTarget: { checked: !before } });
+        await Promise.resolve();
+      });
+      expect(renderer.root.findByProps({ 'data-action': action }).props.checked).toBe(before);
+    }
+    expect(renderer.root.findByProps({ 'data-card-pref-status': '' }).children.join('')).toContain('write_failed');
+  });
+
+  it('uses a single-flight save so another card setting cannot race it', async () => {
+    let finish!: (value: { ok: true; status: 200; body: { ok: true } }) => void;
+    const pending = new Promise<{ ok: true; status: 200; body: { ok: true } }>(resolve => { finish = resolve; });
+    const putCardPref = vi.fn(() => pending);
+    let renderer!: TestRenderer.ReactTestRenderer;
+    act(() => {
+      renderer = TestRenderer.create(React.createElement(CardBehaviorSection, {
+        bot: { larkAppId: 'cli_card_busy', disableStreamingCard: true, usageSupported: true },
+        putCardPref,
+      }));
+    });
+
+    act(() => {
+      renderer.root.findByProps({ 'data-action': 'toggle-disable-streaming' }).props.onChange({ currentTarget: { checked: true } });
+    });
+
+    for (const action of ['toggle-disable-streaming', 'toggle-silent-reactions', 'toggle-writable-link', 'toggle-private-card']) {
+      expect(renderer.root.findByProps({ 'data-action': action }).props.disabled).toBe(true);
+    }
+    expect(renderer.root.findByProps({ id: 'bd-menu-usageDisplay' }).props.disabled).toBe(true);
+
+    await act(async () => {
+      finish({ ok: true, status: 200, body: { ok: true } });
+      await pending;
+    });
+    expect(renderer.root.findByProps({ 'data-action': 'toggle-private-card' }).props.disabled).toBe(false);
   });
 });

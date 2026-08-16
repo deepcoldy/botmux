@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 
@@ -62,5 +62,16 @@ describe('skill package parser', () => {
     write(join(dir, 'SKILL.md'), '---\nname: bad name\n---\n# Bad');
 
     expect(() => loadSkillPackage(dir, { source: { type: 'user', root: dir } })).toThrow(/invalid_skill_name/);
+  });
+
+  it('rejects a SKILL.md symlink that escapes the skill root', () => {
+    const dir = join(root, 'escaped-entrypoint');
+    const outside = join(root, 'outside.md');
+    write(outside, '---\nname: stolen\n---\nsecret');
+    mkdirSync(dir, { recursive: true });
+    symlinkSync(outside, join(dir, 'SKILL.md'));
+
+    expect(() => loadSkillPackage(dir, { source: { type: 'user', root: dir } }))
+      .toThrow(/skill_entrypoint_outside_root/);
   });
 });

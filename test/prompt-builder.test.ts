@@ -58,6 +58,9 @@ vi.mock('../src/bot-registry.js', () => ({
 }));
 
 vi.mock('../src/services/session-store.js', () => ({
+  registerSessionBridgeSendMarkerCleanupFence: vi.fn(),
+  cleanupSessionBridgeSendMarkers: vi.fn(),
+  cleanupSessionBridgeSendMarkersNow: vi.fn(),
   createSession: vi.fn(),
   updateSession: vi.fn(),
 }));
@@ -78,6 +81,7 @@ vi.mock('../src/services/whiteboard-store.js', () => ({
 vi.mock('../src/core/worker-pool.js', () => ({
   forkWorker: vi.fn(),
   killStalePids: vi.fn(),
+  sweepDeadPidMarkers: vi.fn(),
   getActiveSessionsRegistry: vi.fn(() => undefined),
   getCurrentCliVersion: vi.fn(() => '1.0.0'),
 }));
@@ -85,6 +89,8 @@ vi.mock('../src/core/worker-pool.js', () => ({
 // ─── Imports ──────────────────────────────────────────────────────────────
 
 import { buildNewTopicPrompt, buildFollowUpContent, buildReforkPrompt, renderSenderTag, renderCursorSenderNote, renderBufferedSenderBlock } from '../src/core/session-manager.js';
+import { config } from '../src/config.js';
+import { BOTMUX_SHELL_HINTS, buildBotmuxShellHints, buildBotmuxSystemPromptText } from '../src/adapters/cli/shared-hints.js';
 import type { DaemonSession } from '../src/core/types.js';
 
 // ─── Tests ────────────────────────────────────────────────────────────────
@@ -105,6 +111,7 @@ describe('buildNewTopicPrompt', () => {
   it('should include heredoc guidance for non-Claude CLIs', () => {
     const prompt = buildNewTopicPrompt('hello', SESSION_ID, 'codex');
     expect(prompt).toContain("botmux send <<'EOF'");
+    expect(prompt).not.toContain("botmux send &lt;&lt;'EOF'");
     expect(prompt).toContain('第一行');
     expect(prompt).toContain('第二行');
     expect(prompt).toContain('botmux send "第一行\\n第二行"');
@@ -124,14 +131,19 @@ describe('buildNewTopicPrompt', () => {
     expect(routing).toContain('不要回复、不要确认');
     expect(routing).toContain('已了解/已补充/已记录');
     expect(routing).toContain('只处理 `&lt;user_message&gt;` 中的真实用户请求');
+    expect(routing).not.toContain('&amp;lt;');
   });
 
-  it('uses final-output routing hints for Hermes instead of normal botmux send guidance', () => {
+  it('gives Hermes the standard botmux-send routing hints like other structured-bridge CLIs', () => {
+    // #365 previously steered Hermes AWAY from `botmux send` (reverse guidance)
+    // as a redundant belt-and-braces on top of the real dedup fix
+    // (preserveMarkTimeMs). That reverse hint weakened multi-agent collaboration
+    // (bridge-forwarded finals can't carry an @mention), so Hermes now uses the
+    // same send-first hints as codex/traex/grok.
     const prompt = buildNewTopicPrompt('hello', SESSION_ID, 'hermes');
-    expect(prompt).toContain('普通文字回复请直接写在 assistant final');
-    expect(prompt).toContain('普通文本答案不要调用 `botmux send`');
-    expect(prompt).not.toContain("botmux send <<'EOF'");
-    expect(prompt).not.toContain('回复必须 botmux send');
+    expect(prompt).toContain('把消息发给用户（唯一方式）');
+    expect(prompt).not.toContain('普通文本答案不要调用 `botmux send`');
+    expect(prompt).not.toContain('botmux 会自动把 final_output 转发到飞书');
   });
 
   it('should NOT embed <session_id> for CLIs with injectsSessionContext (claude-code)', () => {
@@ -181,6 +193,14 @@ describe('buildNewTopicPrompt', () => {
 
     expect(prompt).toContain('<whiteboard id="wb_test">');
     expect(prompt).toContain('读取：`botmux whiteboard read --id wb_test --json`');
+    expect(prompt).toContain('&lt;上次 read 的 updatedAt&gt;');
+    expect(prompt).toContain('&lt;内容&gt;');
+    const whiteboard = prompt.slice(
+      prompt.indexOf('<whiteboard '),
+      prompt.indexOf('</whiteboard>') + '</whiteboard>'.length,
+    );
+    const whiteboardProse = whiteboard.replace(/<\/?whiteboard(?:\s[^>]*)?>/g, '');
+    expect(whiteboardProse.match(/<[^<>\r\n]+>/g) ?? []).toEqual([]);
     // The CAS flow: update carries --expected-updated-at, and a mismatch tells
     // the agent to re-read. Pin both so the prompt keeps guiding agents to CAS.
     expect(prompt).toContain('update --id wb_test --expected-updated-at');
@@ -227,6 +247,29 @@ describe('buildNewTopicPrompt', () => {
     expect(prompt.indexOf(`<session_id>${SESSION_ID}</session_id>`)).toBeLessThan(prompt.indexOf('<user_message>'));
   });
 
+  it.each([
+    ['zh', '&lt;对方 open_id&gt;'],
+    ['en', '&lt;their open_id&gt;'],
+  ] as const)('escapes tag-like placeholders in the %s inline identity prose', (locale, expectedPlaceholder) => {
+    const prompt = buildNewTopicPrompt(
+      'hello',
+      SESSION_ID,
+      'codex',
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      { name: 'Codex Bot', openId: 'ou_bot' },
+      locale,
+    );
+    const identity = prompt.slice(prompt.indexOf('<identity>'), prompt.indexOf('</identity>') + '</identity>'.length);
+    const prose = identity.replace(/<\/?(?:identity|name|open_id|routing_rules)>/g, '');
+
+    expect(identity).toContain(expectedPlaceholder);
+    expect(prose.match(/<[^<>\r\n]+>/g) ?? []).toEqual([]);
+  });
+
   it('keeps per-turn sender and mentions after the first user message', () => {
     const prompt = buildNewTopicPrompt(
       'hello',
@@ -244,6 +287,52 @@ describe('buildNewTopicPrompt', () => {
 
     expect(prompt.indexOf('<sender ')).toBeGreaterThan(prompt.indexOf('<user_message>'));
     expect(prompt.indexOf('<mentions>')).toBeGreaterThan(prompt.indexOf('<user_message>'));
+  });
+});
+
+describe('botmux routing prose XML boundaries', () => {
+  it.each([
+    ['zh', '&lt;open_id:名字&gt;'],
+    ['en', '&lt;open_id:name&gt;'],
+  ] as const)('escapes tag-like placeholders in %s inline shell hints while preserving heredoc syntax', (locale, mentionPlaceholder) => {
+    const hints = buildBotmuxShellHints(locale).join('\n');
+
+    expect(hints).toContain('&lt;message_id&gt;');
+    expect(hints).toContain(mentionPlaceholder);
+    expect(hints).toContain('&lt;whiteboard&gt;');
+    expect(hints).toContain("botmux send <<'EOF'");
+    expect(hints).not.toContain("botmux send &lt;&lt;'EOF'");
+    expect(hints.match(/<[^<>\r\n]+>/g) ?? []).toEqual([]);
+  });
+
+  it('keeps the legacy static shell hints on the same selective-escaping boundary', () => {
+    const hints = BOTMUX_SHELL_HINTS.join('\n');
+
+    expect(hints).toContain('&lt;message_id&gt;');
+    expect(hints).toContain("botmux send <<'EOF'");
+    expect(hints).not.toContain("botmux send &lt;&lt;'EOF'");
+    expect(hints.match(/<[^<>\r\n]+>/g) ?? []).toEqual([]);
+  });
+
+  it.each([
+    ['zh', '&lt;对方 bot 的 open_id&gt;'],
+    ['en', '&lt;other-bot-open-id&gt;'],
+  ] as const)('escapes tag-like placeholders in the %s system-prompt prose while preserving real structure and heredoc syntax', (locale, mentionPlaceholder) => {
+    const prompt = buildBotmuxSystemPromptText({
+      locale,
+      botName: 'Codex Bot',
+      botOpenId: 'ou_bot',
+    });
+    const prose = prompt.replace(/<\/?(?:botmux_routing|identity|name|open_id|routing_rules)>/g, '');
+
+    expect(prompt).toContain('<botmux_routing>');
+    expect(prompt).toContain('<identity>');
+    expect(prompt).toContain(mentionPlaceholder);
+    expect(prompt).toContain('&lt;available_bots&gt;');
+    expect(prompt).toContain('&lt;whiteboard&gt;');
+    expect(prompt).toContain("botmux send <<'EOF'");
+    expect(prompt).not.toContain("botmux send &lt;&lt;'EOF'");
+    expect(prose.match(/<[^<>\r\n]+>/g) ?? []).toEqual([]);
   });
 });
 
@@ -320,18 +409,53 @@ describe('buildFollowUpContent', () => {
     expect(content.indexOf('<sender ')).toBeGreaterThan(content.indexOf('</user_message>'));
     expect(content.indexOf('<mentions>')).toBeGreaterThan(content.indexOf('</user_message>'));
     // Complex send guidance is discoverable once in the opening catalog; keep
-    // every follow-up reminder intentionally tiny.
-    expect(content).toContain('<botmux_reminder>回复必须 botmux send，终端输出用户看不到</botmux_reminder>');
+    // every follow-up reminder intentionally tiny. By default (experimental
+    // anti-resend toggle OFF) it is exactly #554's nothing-to-send sentinel
+    // baseline — no anti-resend clause appended.
+    expect(content).toContain('<botmux_reminder>发给你的消息至少 botmux send 回应一次,别沉默;发什么、发几条你自己判断。只有根本不是发给你的消息才让 final 只输出 BOTMUX_NOTHING_TO_SEND</botmux_reminder>');
+    expect(content).not.toContain('别因「无输出」提示重发');
     expect(content).not.toContain('JSON.stringify');
     expect(content).not.toContain('botmux skill show botmux-send');
   });
 
-  it('uses final-output reminder for Hermes follow-ups', () => {
+  it('carries the anti-resend reminder variant when config.noVisibleOutputHint is ON', () => {
+    (config as { noVisibleOutputHint?: boolean }).noVisibleOutputHint = true;
+    try {
+      const content = buildFollowUpContent('hello', SESSION_ID, { cliId: 'codex' });
+      // ON variant must inherit #554's sentinel semantics AND add anti-resend.
+      expect(content).toContain('final 只输出 BOTMUX_NOTHING_TO_SEND');
+      expect(content).toMatch(/<botmux_reminder>[^<]*别因「无输出」提示重发[^<]*<\/botmux_reminder>/);
+    } finally {
+      delete (config as { noVisibleOutputHint?: boolean }).noVisibleOutputHint;
+    }
+  });
+
+  it('gives Hermes the standard follow-up reminder like other CLIs (no reverse send guidance)', () => {
+    // #365 previously steered Hermes AWAY from `botmux send` (reverse guidance)
+    // as redundant belt-and-braces on top of the real dedup fix
+    // (preserveMarkTimeMs). That reverse hint weakened multi-agent collaboration
+    // (bridge-forwarded finals can't carry an @mention), so Hermes now shares
+    // the standard path. With the anti-resend toggle OFF (default) that is
+    // exactly #554's nothing-to-send sentinel baseline — same as codex/traex.
     const content = buildFollowUpContent('hello', SESSION_ID, { cliId: 'hermes' });
 
-    expect(content).toContain('普通文字回复不要调用 `botmux send`');
-    expect(content).toContain('直接把给用户看的答案写在 final');
-    expect(content).not.toContain('回复必须 botmux send');
+    expect(content).toContain('<botmux_reminder>发给你的消息至少 botmux send 回应一次,别沉默;发什么、发几条你自己判断。只有根本不是发给你的消息才让 final 只输出 BOTMUX_NOTHING_TO_SEND</botmux_reminder>');
+    expect(content).not.toContain('普通文字回复不要调用 `botmux send`');
+    expect(content).not.toContain('直接把给用户看的答案写在 final');
+  });
+
+  it('routes Hermes through the shared anti-resend branch when noVisibleOutputHint is ON', () => {
+    // Codex-review guard for #653: prove Hermes really lands in the shared
+    // noVisibleOutputHint branch (not a special-cased bypass), so the toggle
+    // reaches it just like every other non-Mira CLI.
+    (config as { noVisibleOutputHint?: boolean }).noVisibleOutputHint = true;
+    try {
+      const content = buildFollowUpContent('hello', SESSION_ID, { cliId: 'hermes' });
+      expect(content).toContain('final 只输出 BOTMUX_NOTHING_TO_SEND');
+      expect(content).toMatch(/<botmux_reminder>[^<]*别因「无输出」提示重发[^<]*<\/botmux_reminder>/);
+    } finally {
+      delete (config as { noVisibleOutputHint?: boolean }).noVisibleOutputHint;
+    }
   });
 
   it('places the short whiteboard hint before follow-up user content', () => {

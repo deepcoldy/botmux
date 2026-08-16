@@ -25,6 +25,24 @@ jobs:
         with:
           node-version: 22
 
+      # dsh 沙盒集成用例要在 runner 上真跑 bwrap:ubuntu-24.04 默认
+      # kernel.apparmor_restrict_unprivileged_userns=1 且 bubblewrap 包不带
+      # AppArmor profile,bwrap 一起 userns 就秒退("setting up uid map:
+      # Permission denied",exit 1)。这里放开限制并预装 bubblewrap,让沙盒
+      # 用例在 CI 上真正执行。整步 best-effort:哪一步失败都不阻塞——测试侧
+      # 有 bwrap 运行时探测 gate,跑不了会 loud skip 而不是超时挂掉。
+      - name: Enable bwrap sandbox for integration tests (best-effort)
+        run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          command -v bwrap >/dev/null || sudo apt-get install -y bubblewrap || true
+          if bwrap --bind / / --unshare-user -- /bin/true 2>/dev/null; then
+            echo "bwrap userns OK — sandbox integration tests will run for real"
+          else
+            echo "bwrap still unavailable — sandbox integration tests will skip (see test-side gate)"
+          fi
+
       - run: npm install -g pnpm@9.5.0
       - run: pnpm install --frozen-lockfile
       - run: pnpm build
+      - run: pnpm test
+      - run: pnpm workflow-core:test

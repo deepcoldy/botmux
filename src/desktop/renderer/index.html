@@ -40,6 +40,10 @@
           <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M2 2v12h12M5 11V7M8.5 11V4.5M12 11V8.5"/></svg>
           <span data-i18n="nav.insights">洞察</span>
         </a>
+        <a href="#/feedback" data-dashboard-route="#/feedback" data-route="feedback">
+          <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M2 2.5h12v8H7l-3.5 3v-3H2z"/><path d="M5 5.5h6M5 8h4"/></svg>
+          <span data-i18n="nav.feedback">反馈</span>
+        </a>
         <a href="#/workflows" data-dashboard-route="#/workflows" data-route="workflows">
           <svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="3.4" cy="3.6" r="1.9"/><circle cx="3.4" cy="12.4" r="1.9"/><circle cx="12.6" cy="8" r="1.9"/><path d="M5.2 4.4l5.6 2.8M5.2 11.6l5.6-2.8"/></svg>
           <span data-i18n="nav.workflows">工作流</span>
@@ -89,6 +93,11 @@
             <div id="runtime-status" class="runtime-status" data-i18n="runtime.checking">正在检查运行时</div>
             <div id="runtime-meta" class="runtime-meta" data-i18n="runtime.waitingBridge">等待桌面桥接</div>
           </div>
+          <label id="login-row" class="login-row">
+            <input id="login-toggle" type="checkbox" role="switch" disabled />
+            <span class="login-switch" aria-hidden="true"></span>
+            <span id="login-label" class="login-label">开机启动 App</span>
+          </label>
         </div>
         <div class="runtime-actions runtime-control-group" aria-label="CLI actions">
           <button id="start-btn" class="runtime-action runtime-action-primary" type="button" disabled>
@@ -110,10 +119,6 @@
         </div>
 
         <div class="footer-meta-row">
-          <label class="login-row">
-            <input id="login-toggle" type="checkbox" disabled />
-            <span data-i18n="login.launchAtLogin">开机启动 App</span>
-          </label>
           <div id="version-line" class="version-line" data-i18n="version.unavailable">版本信息不可用</div>
         </div>
       </div>

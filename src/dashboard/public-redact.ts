@@ -11,8 +11,8 @@
 //   - /api/groups   → memberBots[].oncallChat = { chatId, workingDir }
 //   - /api/schedules → row carries `prompt` (business instructions) + `workingDir`
 //   - /api/settings → notifier carries recipient / delivery diagnostics
-//   - /api/sessions + /events → session rows/patches may carry `gitBranch` or
-//                               authenticated preview metadata
+//   - /api/sessions + /events → session rows/patches may carry `gitBranch`
+//     and private message preview fields
 // The group/schedule `workingDir`s are repo / customer-project paths; stripping
 // them keeps the board functional (name-map, timing, status) while not leaking
 // bound dirs — and keeps the "/api/bots oncall config is private" boundary honest.
@@ -62,18 +62,45 @@ export function redactSchedulesForPublic(schedules: unknown[]): unknown[] {
   });
 }
 
-/** Branch names often carry issue/customer identifiers. `/api/sessions` and
+const PRIVATE_SESSION_FIELDS = new Set([
+  'gitBranch',
+  'riffAccessUrl',
+  // Concrete distribution identity is operator configuration, not anonymous
+  // watch-board data. Public rows retain protocol-level `cliId`, which is
+  // sufficient for the existing fallback label.
+  'runtimeId',
+  'runtimeDisplayName',
+  'previewUserText',
+  'previewBotText',
+  'previewUserFullText',
+  'previewBotFullText',
+  'previewUserAt',
+  'previewBotAt',
+  'previewBotState',
+  // openTodos.items[].text 是从 CLI transcript 读出的任务明文，等同 preview 内容，
+  // 匿名看板不得透传。整字段进黑名单（列归属靠运行态即可，匿名侧不显示 TODO 徽标）。
+  'openTodos',
+]);
+
+function omitPrivateSessionFields(record: Record<string, unknown>): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(record)) {
+    if (!PRIVATE_SESSION_FIELDS.has(key) && !key.startsWith('preview')) out[key] = value;
+  }
+  return out;
+}
+
+/** Branch names often carry issue/customer identifiers. `riffAccessUrl` is the
+ * Riff AIO Sandbox **write** capability — a bearer URL whose unique subdomain is
+ * itself the credential (riff-backend.ts:hashUrlForLog), so an anonymous read-only
+ * visitor must never receive it (they'd gain write access to the sandbox). Read
+ * access on the dashboard goes through the local worker log terminal (webPort),
+ * which stays; only the sandbox write URL is stripped. `/api/sessions` and
  * `/events` are both public-read surfaces, so keep one non-mutating projection
  * for their shared session row shape. */
 export function redactSessionForPublic(session: unknown): unknown {
   if (!session || typeof session !== 'object' || Array.isArray(session)) return session;
-  const {
-    gitBranch: _gitBranch,
-    preview: _preview,
-    previewTarget: _previewTarget,
-    ...rest
-  } = session as Record<string, unknown>;
-  return rest;
+  return omitPrivateSessionFields(session as Record<string, unknown>);
 }
 
 export function redactSessionsForPublic(sessions: unknown[]): unknown[] {
@@ -94,21 +121,19 @@ export function redactSessionEventForPublic(type: string, body: unknown): unknow
     && typeof eventBody.patch === 'object'
     && !Array.isArray(eventBody.patch)
   ) {
-    const {
-      gitBranch: _gitBranch,
-      preview: _preview,
-      previewTarget: _previewTarget,
-      ...patch
-    } = eventBody.patch as Record<string, unknown>;
-    return { ...eventBody, patch };
+    return {
+      ...eventBody,
+      patch: omitPrivateSessionFields(eventBody.patch as Record<string, unknown>),
+    };
   }
   return body;
 }
 
-/** 匿名只读面板不展示外部 Codex 活动、目标 Bot 或投递运行态。 */
+/** 匿名只读面板不展示外部 Codex 活动、目标 Bot 或投递运行态,也不展示过载
+ *  告警的目标 Bot / 收件人提示。 */
 export function redactSettingsForPublic(settings: unknown): unknown {
   if (!settings || typeof settings !== 'object' || Array.isArray(settings)) return settings;
   const source = settings as Record<string, unknown>;
-  const { codexNotifier: _privateNotifier, ...publicSettings } = source;
+  const { codexNotifier: _privateNotifier, hostOverloadAlert: _privateOverload, ...publicSettings } = source;
   return publicSettings;
 }

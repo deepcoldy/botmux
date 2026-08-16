@@ -49,6 +49,10 @@ vi.mock('../src/core/worker-pool.js', async (importOriginal) => {
 
 import { handleCardAction } from '../src/im/lark/card-handler.js';
 import { sessionKey } from '../src/core/types.js';
+// Real constant (the worker-pool mock spreads ...actual, so this is the live
+// value). The picker relay path passes it as transferSession's detach-fence
+// budget — generous because the in-process picker has no HTTP abort above it.
+import { TRANSFER_DETACH_FENCE_PICKER_MS } from '../src/core/worker-pool.js';
 import type { DaemonSession } from '../src/core/types.js';
 import type { Session } from '../src/types.js';
 
@@ -217,7 +221,7 @@ describe('relay_confirm button click', () => {
     expect(m1Payload).toContain('Friendly Source Chat Name');
     expect(m1Payload).not.toContain('oc_source');
 
-    expect(transferSessionMock).toHaveBeenCalledWith('sess-source-1', 'oc_target', 'om_M1', 'group', 'chat');
+    expect(transferSessionMock).toHaveBeenCalledWith('sess-source-1', 'oc_target', 'om_M1', 'group', 'chat', { detachTimeoutMs: TRANSFER_DETACH_FENCE_PICKER_MS });
     expect(deleteMessageMock).toHaveBeenCalledWith(LARK_APP_ID, 'om_picker_card');
     expect(r?.toast?.type).toBe('success');
   });
@@ -238,7 +242,7 @@ describe('relay_confirm button click', () => {
     expect(replyMessageMock).toHaveBeenCalledWith(LARK_APP_ID, 'om_topic_root', expect.any(String), 'text', true);
     expect(sendMessageMock).not.toHaveBeenCalled();
     // Session anchors on the 话题 root (NOT the M1 id), scope 'thread'.
-    expect(transferSessionMock).toHaveBeenCalledWith('sess-source-1', 'oc_target', 'om_topic_root', 'group', 'thread');
+    expect(transferSessionMock).toHaveBeenCalledWith('sess-source-1', 'oc_target', 'om_topic_root', 'group', 'thread', { detachTimeoutMs: TRANSFER_DETACH_FENCE_PICKER_MS });
     expect(r?.toast?.type).toBe('success');
   });
 
@@ -259,7 +263,7 @@ describe('relay_confirm button click', () => {
     expect(sendMessageMock.mock.calls[0][1]).toBe('oc_dm');
     expect(sendMessageMock.mock.calls[0][2]).toContain('直接发消息继续对话');
     // chatType flips to p2p; flat DM anchors chat-scope on the M1 id (audit-only).
-    expect(transferSessionMock).toHaveBeenCalledWith('sess-source-1', 'oc_dm', 'om_M1', 'p2p', 'chat');
+    expect(transferSessionMock).toHaveBeenCalledWith('sess-source-1', 'oc_dm', 'om_M1', 'p2p', 'chat', { detachTimeoutMs: TRANSFER_DETACH_FENCE_PICKER_MS });
     expect(r?.toast?.type).toBe('success');
   });
 
@@ -276,7 +280,7 @@ describe('relay_confirm button click', () => {
 
     expect(replyMessageMock).toHaveBeenCalledWith(LARK_APP_ID, 'om_dm_topic_root', expect.stringContaining('直接发消息继续对话'), 'text', true);
     expect(sendMessageMock).not.toHaveBeenCalled();
-    expect(transferSessionMock).toHaveBeenCalledWith('sess-source-1', 'oc_dm', 'om_dm_topic_root', 'p2p', 'thread');
+    expect(transferSessionMock).toHaveBeenCalledWith('sess-source-1', 'oc_dm', 'om_dm_topic_root', 'p2p', 'thread', { detachTimeoutMs: TRANSFER_DETACH_FENCE_PICKER_MS });
     expect(r?.toast?.type).toBe('success');
   });
 
@@ -305,7 +309,7 @@ describe('relay_confirm button click', () => {
       LARK_APP_ID,
     );
 
-    expect(transferSessionMock).toHaveBeenCalledWith('sess-source-1', 'oc_target', 'om_topic_root', 'group', 'thread');
+    expect(transferSessionMock).toHaveBeenCalledWith('sess-source-1', 'oc_target', 'om_topic_root', 'group', 'thread', { detachTimeoutMs: TRANSFER_DETACH_FENCE_PICKER_MS });
   });
 
   it('falls back to chatId in the M1 body when getChatName returns null', async () => {
@@ -320,7 +324,7 @@ describe('relay_confirm button click', () => {
     expect(m1Payload).toContain('oc_source');
   });
 
-  it('returns a friendly toast when transferSession reports adopt_not_relayable', async () => {
+  it('sends a VISIBLE message (not a toast) when transferSession reports adopt_not_relayable', async () => {
     const ds = makeDs();
     const map = new Map<string, DaemonSession>();
     map.set(sessionKey('om_source_root', LARK_APP_ID), ds);
@@ -329,9 +333,15 @@ describe('relay_confirm button click', () => {
 
     const r = await handleCardAction(actionData({ sessionId: 'sess-source-1' }), deps(map), LARK_APP_ID);
 
-    expect(r?.toast?.type).toBe('error');
-    expect(r?.toast?.content).toContain('/adopt');
-    expect(r?.toast?.content).not.toMatch(/adopt_not_relayable/);
+    // No toast — the confirm handler awaits the detach fence and always exceeds
+    // the 2.5s card-ACK window, so a toast would be dropped. Deliver a message.
+    expect(r).toBeUndefined();
+    // chat-scope target (actionData default) → sendMessage into the target chat.
+    // First call is the M1 announce; the failure notice is the last call.
+    const lastSend = sendMessageMock.mock.calls.at(-1)!;
+    expect(lastSend[1]).toBe('oc_target');
+    expect(lastSend[2]).toContain('/adopt');
+    expect(lastSend[2]).not.toMatch(/adopt_not_relayable/);
   });
 
   // Helper to construct a DaemonSession with explicit chatId / scope / worker —
@@ -413,6 +423,38 @@ describe('relay_confirm button click', () => {
     expect(r?.toast?.type).toBe('success');
   });
 
+  it.each([
+    ['persisted real session', (ds: DaemonSession) => { ds.session.cliId = 'claude-code'; }],
+    ['queued session', (ds: DaemonSession) => { ds.session.queued = true; }],
+    ['adopt session', (ds: DaemonSession) => {
+      ds.adoptedFrom = { source: 'tmux', tmuxTarget: 'ext:0.0', originalCliPid: 42, cwd: '/tmp' } as any;
+    }],
+    ['pending repository choice', (ds: DaemonSession) => { ds.pendingRepo = { prompt: 'pick' } as any; }],
+    ['deferred prompt', (ds: DaemonSession) => { ds.pendingPrompt = 'continue'; }],
+    ['deferred raw input', (ds: DaemonSession) => { ds.pendingRawInput = 'continue'; }],
+  ])('pre-flight blocks a worker-less %s before sending M1', async (_label, protect) => {
+    const sourceDs = makeDs();
+    const targetDs = makeDsInChat({
+      sessionId: 'sess-protected-target',
+      chatId: 'oc_target',
+      scope: 'chat',
+      worker: null,
+      title: 'protected target',
+    });
+    protect(targetDs);
+    const map = new Map<string, DaemonSession>([
+      [sessionKey('om_source_root', LARK_APP_ID), sourceDs],
+      [sessionKey('oc_target', LARK_APP_ID), targetDs],
+    ]);
+
+    const r = await handleCardAction(actionData({ sessionId: 'sess-source-1' }), deps(map), LARK_APP_ID);
+
+    expect(r).toBeUndefined();
+    expect(sendMessageMock).toHaveBeenCalledTimes(1);
+    expect(sendMessageMock.mock.calls[0]?.[2]).toContain('protected target');
+    expect(transferSessionMock).not.toHaveBeenCalled();
+  });
+
   it('cleans up the orphan M1 when transferSession fails after the M1 was sent (race fallback)', async () => {
     const ds = makeDs();
     const map = new Map<string, DaemonSession>();
@@ -429,7 +471,7 @@ describe('relay_confirm button click', () => {
     expect(deleteMessageMock).toHaveBeenCalledWith(LARK_APP_ID, 'om_M1');
   });
 
-  it('returns a friendly toast when transferSession reports worker_busy', async () => {
+  it('sends a VISIBLE message (not a toast) when transferSession reports worker_busy', async () => {
     const ds = makeDs();
     const map = new Map<string, DaemonSession>();
     map.set(sessionKey('om_source_root', LARK_APP_ID), ds);
@@ -438,13 +480,16 @@ describe('relay_confirm button click', () => {
 
     const r = await handleCardAction(actionData({ sessionId: 'sess-source-1' }), deps(map), LARK_APP_ID);
 
-    expect(r?.toast?.type).toBe('error');
-    // Specific toast string, not the raw error code via toast_failed.
-    expect(r?.toast?.content).not.toMatch(/worker_busy/);
-    expect(r?.toast?.content).toMatch(/正在处理|mid-turn|wait/i);
+    expect(r).toBeUndefined();
+    const lastSend = sendMessageMock.mock.calls.at(-1)!;
+    expect(lastSend[1]).toBe('oc_target');
+    // Human copy: not the raw error code; reassures the session is not lost.
+    expect(lastSend[2]).not.toMatch(/worker_busy/);
+    expect(lastSend[2]).toMatch(/正在处理|mid-turn/i);
+    expect(lastSend[2]).toMatch(/未丢失|not lost|still where/i);
   });
 
-  it('returns a friendly toast when transferSession reports not_started_yet', async () => {
+  it('sends a VISIBLE message (not a toast) when transferSession reports not_started_yet', async () => {
     const ds = makeDs();
     const map = new Map<string, DaemonSession>();
     map.set(sessionKey('om_source_root', LARK_APP_ID), ds);
@@ -453,8 +498,61 @@ describe('relay_confirm button click', () => {
 
     const r = await handleCardAction(actionData({ sessionId: 'sess-source-1' }), deps(map), LARK_APP_ID);
 
-    expect(r?.toast?.type).toBe('error');
-    expect(r?.toast?.content).not.toMatch(/not_started_yet/);
-    expect(r?.toast?.content).toMatch(/选仓库|pick a repo/i);
+    expect(r).toBeUndefined();
+    const lastSend = sendMessageMock.mock.calls.at(-1)!;
+    expect(lastSend[2]).not.toMatch(/not_started_yet/);
+    expect(lastSend[2]).toMatch(/选仓库|pick a repo/i);
+  });
+
+  // The exact bug 申晗 hit: transfer false-times-out (worker took ~3.5s to
+  // exit cleanly). Pre-fix this returned a toast that the ACK window dropped,
+  // leaving only a `not shown to user` log line — the user saw nothing and the
+  // follow-up spawned a fresh repo picker. Now it lands a visible message that
+  // says the session is intact and to retry.
+  it('sends a VISIBLE, reassuring message when transferSession reports worker_detach_timeout (the false-timeout bug)', async () => {
+    const ds = makeDs();
+    const map = new Map<string, DaemonSession>();
+    map.set(sessionKey('om_source_root', LARK_APP_ID), ds);
+
+    transferSessionMock.mockResolvedValueOnce({ ok: false, error: 'worker_detach_timeout' as any });
+
+    const r = await handleCardAction(actionData({ sessionId: 'sess-source-1' }), deps(map), LARK_APP_ID);
+
+    // Never a toast (it would be swallowed after the ACK window).
+    expect(r).toBeUndefined();
+    const lastSend = sendMessageMock.mock.calls.at(-1)!;
+    expect(lastSend[1]).toBe('oc_target');
+    expect(lastSend[2]).not.toMatch(/worker_detach_timeout/);
+    // "会话仍在原处、未丢失" + a concrete retry instruction.
+    expect(lastSend[2]).toMatch(/超时|timed out/i);
+    expect(lastSend[2]).toMatch(/未丢失|not lost|still where/i);
+    expect(lastSend[2]).toMatch(/重试|retry|再点/i);
+    // Orphan M1 cleaned up so no misleading "已接力" lingers.
+    expect(deleteMessageMock).toHaveBeenCalledWith(LARK_APP_ID, 'om_M1');
+  });
+
+  // Thread-scope failure lands the notice reply_in_thread into the 话题 (the
+  // invocation spot), mirroring the M1 delivery — not a top-level sendMessage.
+  it('thread-scope failure: notice goes reply_in_thread into the 话题 root', async () => {
+    const ds = makeDs();
+    const map = new Map<string, DaemonSession>();
+    map.set(sessionKey('om_source_root', LARK_APP_ID), ds);
+
+    transferSessionMock.mockResolvedValueOnce({ ok: false, error: 'worker_detach_timeout' as any });
+
+    const r = await handleCardAction(
+      actionData({ sessionId: 'sess-source-1', target_chat_id: 'oc_target', root_id: 'om_topic_root', target_scope: 'thread' }),
+      deps(map),
+      LARK_APP_ID,
+    );
+
+    expect(r).toBeUndefined();
+    // Last replyMessage call = the failure notice into the 话题 root, replyInThread=true.
+    const lastReply = replyMessageMock.mock.calls.at(-1)!;
+    expect(lastReply[0]).toBe(LARK_APP_ID);
+    expect(lastReply[1]).toBe('om_topic_root');
+    expect(lastReply[3]).toBe('text');
+    expect(lastReply[4]).toBe(true);
+    expect(lastReply[2]).toMatch(/超时|timed out/i);
   });
 });

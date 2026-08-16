@@ -9,6 +9,7 @@
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import type { DaemonSession, FrozenCard } from '../src/core/types.js';
+import { sessionKey } from '../src/core/types.js';
 import { setTerminalProxyPort } from '../src/core/terminal-url.js';
 
 // ─── Mocks ─────────────────────────────────────────────────────────────────
@@ -52,6 +53,9 @@ vi.mock('../src/bot-registry.js', () => ({
     config: { larkAppId: 'app_test', cliId: 'claude-code' },
   })),
   getAllBots: vi.fn(() => []),
+  // Streaming-card usage gate reads this; 'streaming' lets the snapshot flow
+  // (the reader then finds no transcript → empty snapshot, asserted below).
+  resolveUsageDisplay: vi.fn(() => 'streaming'),
 }));
 
 vi.mock('../src/config.js', () => ({
@@ -68,6 +72,9 @@ vi.mock('../src/platform/binding.js', () => ({
 }));
 
 vi.mock('../src/services/session-store.js', () => ({
+  registerSessionBridgeSendMarkerCleanupFence: vi.fn(),
+  cleanupSessionBridgeSendMarkers: vi.fn(),
+  cleanupSessionBridgeSendMarkersNow: vi.fn(),
   closeSession: vi.fn(),
   updateSession: vi.fn(),
 }));
@@ -107,11 +114,18 @@ import {
   recallFrozenCards,
   parkStreamCard,
   postFreshStreamingCard,
+  postTurnStartingCard,
+  setActiveSessionsRegistry,
   restoreUsageLimitRuntimeState,
   scheduleCardPatch,
+  usageRefreshShouldRun,
+  refreshStreamingCardUsage,
+  syncUsageRefreshTimer,
+  USAGE_REFRESH_INTERVAL_MS,
 } from '../src/core/worker-pool.js';
 import { MessageWithdrawnError } from '../src/im/lark/client.js';
 import { buildStreamingCard } from '../src/im/lark/card-builder.js';
+import { resolveUsageDisplay } from '../src/bot-registry.js';
 
 // ─── Helpers ───────────────────────────────────────────────────────────────
 
@@ -168,6 +182,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  setActiveSessionsRegistry(undefined as any);
   vi.clearAllTimers();
   vi.useRealTimers();
 });
@@ -358,6 +373,13 @@ describe('restoreUsageLimitRuntimeState', () => {
       ds.usageLimit,
       undefined,
       false,
+      // 17th arg: streaming-card usage snapshot (no transcript in this test →
+      // empty; turnTokens is always present, null when no turn delta is known).
+      { context: null, tokens: null, turnTokens: null },
+      // 18th arg: no configured runtime display name for this Claude fixture.
+      undefined,
+      // 19th arg: Codex Fast tier badge — undefined for this non-Codex fixture.
+      undefined,
     );
     expect(updateMessageMock).toHaveBeenCalledWith(APP_ID, 'om_live_limit', '{}');
   });
@@ -428,6 +450,307 @@ describe('receiver streaming card boundary', () => {
   });
 });
 
+describe('postTurnStartingCard', () => {
+  it('does not start a card POST while Riff retirement is already active', async () => {
+    const ds = makeDs();
+    ds.workerReady = true;
+    ds.streamCardPending = true;
+    ds.streamCardTurnGeneration = 1;
+    ds.streamCardPendingTurnId = 'om_turn_1';
+    ds.riffCloseState = { phase: 'preparing', requestId: 'close-before-post' };
+    const sessionReply = vi.fn(async () => 'om_forbidden');
+
+    await expect(postTurnStartingCard(ds, sessionReply, 'om_turn_1')).resolves.toBe(false);
+
+    expect(sessionReply).not.toHaveBeenCalled();
+    expect(ds.streamCardPending).toBe(true);
+    expect(ds.streamCardPendingTurnId).toBe('om_turn_1');
+  });
+
+  it('posts a new-turn card immediately without waiting for screen_update', async () => {
+    const ds = makeDs();
+    ds.workerReady = true;
+    ds.streamCardId = 'om_previous';
+    ds.streamCardNonce = 'nonce_previous';
+    ds.streamCardPending = true;
+    ds.streamCardTurnGeneration = 1;
+    ds.streamCardPendingTurnId = 'om_turn_1';
+    ds.currentTurnTitle = 'first turn';
+    const sessionReply = vi.fn(async () => 'om_turn_card_1');
+
+    await expect(postTurnStartingCard(ds, sessionReply, 'om_turn_1')).resolves.toBe(true);
+
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+    expect(sessionReply.mock.calls[0][4]).toBe('om_turn_1');
+    expect(ds.streamCardId).toBe('om_turn_card_1');
+    expect(ds.streamCardPending).toBe(false);
+    expect(ds.streamCardPendingTurnId).toBeUndefined();
+  });
+
+  it('posts the newest queued turn after an older card POST finishes', async () => {
+    let resolveFirst!: (messageId: string) => void;
+    const sessionReply = vi.fn()
+      .mockImplementationOnce(() => new Promise<string>(resolve => { resolveFirst = resolve; }))
+      .mockResolvedValueOnce('om_turn_card_2');
+    const ds = makeDs();
+    ds.workerReady = true;
+    ds.streamCardId = 'om_previous';
+    ds.streamCardNonce = 'nonce_previous';
+    ds.streamCardPending = true;
+    ds.streamCardTurnGeneration = 1;
+    ds.streamCardPendingTurnId = 'om_turn_1';
+    ds.currentTurnTitle = 'first turn';
+
+    const firstPost = postTurnStartingCard(ds, sessionReply, 'om_turn_1');
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+
+    ds.streamCardTurnGeneration = 2;
+    ds.streamCardPendingTurnId = 'om_turn_2';
+    ds.currentTurnTitle = 'second turn';
+    await expect(postTurnStartingCard(ds, sessionReply, 'om_turn_2')).resolves.toBe(false);
+
+    resolveFirst('om_turn_card_1');
+    await firstPost;
+    await flush();
+    await flush();
+
+    expect(sessionReply).toHaveBeenCalledTimes(2);
+    expect(sessionReply.mock.calls[1][4]).toBe('om_turn_2');
+    expect(ds.streamCardId).toBe('om_turn_card_2');
+    expect(ds.streamCardPending).toBe(false);
+    expect(ds.streamCardPendingTurnId).toBeUndefined();
+    expect(deleteMessageMock).toHaveBeenCalledWith(APP_ID, 'om_turn_card_1');
+  });
+
+  it('restores the previous live card when the starting-card POST fails', async () => {
+    const ds = makeDs();
+    ds.workerReady = true;
+    ds.streamCardId = 'om_previous';
+    ds.streamCardNonce = 'nonce_previous';
+    ds.streamCardPending = true;
+    ds.streamCardTurnGeneration = 1;
+    ds.streamCardPendingTurnId = 'om_turn_1';
+    ds.currentTurnTitle = 'first turn';
+    const sessionReply = vi.fn(async () => { throw new Error('network unavailable'); });
+
+    await expect(postTurnStartingCard(ds, sessionReply, 'om_turn_1')).resolves.toBe(false);
+
+    expect(ds.streamCardId).toBe('om_previous');
+    expect(ds.streamCardNonce).toBe('nonce_previous');
+    expect(ds.streamCardPending).toBe(true);
+    expect(ds.streamCardPendingTurnId).toBe('om_turn_1');
+    expect(deleteMessageMock).not.toHaveBeenCalled();
+  });
+
+  it('does not let an old POST overwrite a replacement session', async () => {
+    let resolvePost!: (messageId: string) => void;
+    const sessionReply = vi.fn(() => new Promise<string>(resolve => { resolvePost = resolve; }));
+    const ds = makeDs();
+    ds.workerReady = true;
+    ds.streamCardId = 'om_previous';
+    ds.streamCardNonce = 'nonce_previous';
+    ds.streamCardPending = true;
+    ds.streamCardTurnGeneration = 1;
+    ds.streamCardPendingTurnId = 'om_turn_1';
+
+    const post = postTurnStartingCard(ds, sessionReply, 'om_turn_1');
+    ds.session = {
+      ...ds.session,
+      sessionId: 'sess-replacement',
+      rootMessageId: 'om_replacement_root',
+    };
+    ds.streamCardId = undefined;
+    ds.streamCardNonce = undefined;
+    ds.streamCardPending = false;
+    ds.streamCardPendingTurnId = undefined;
+    persistStreamCardStateMock.mockClear();
+
+    resolvePost('om_stale_turn_card');
+    await expect(post).resolves.toBe(false);
+    await flush();
+
+    expect(ds.streamCardId).toBeUndefined();
+    expect(ds.streamCardNonce).toBeUndefined();
+    expect(persistStreamCardStateMock).not.toHaveBeenCalled();
+    expect(deleteMessageMock).toHaveBeenCalledWith(APP_ID, 'om_stale_turn_card');
+  });
+
+  it('deletes an orphan card when the session closes during POST', async () => {
+    let resolvePost!: (messageId: string) => void;
+    const sessionReply = vi.fn(() => new Promise<string>(resolve => { resolvePost = resolve; }));
+    const ds = makeDs();
+    ds.workerReady = true;
+    ds.streamCardPending = true;
+    ds.streamCardTurnGeneration = 1;
+    ds.streamCardPendingTurnId = 'om_turn_1';
+
+    const post = postTurnStartingCard(ds, sessionReply, 'om_turn_1');
+    ds.session.status = 'closed' as any;
+    ds.streamCardId = undefined;
+    ds.streamCardNonce = undefined;
+    persistStreamCardStateMock.mockClear();
+
+    resolvePost('om_orphan_card');
+    await expect(post).resolves.toBe(false);
+    await flush();
+
+    expect(ds.streamCardId).toBeUndefined();
+    expect(ds.streamCardNonce).toBeUndefined();
+    expect(persistStreamCardStateMock).not.toHaveBeenCalled();
+    expect(deleteMessageMock).toHaveBeenCalledWith(APP_ID, 'om_orphan_card');
+  });
+
+  it('does not adopt an old-route card after a completed transfer', async () => {
+    let resolvePost!: (messageId: string) => void;
+    const sessionReply = vi.fn(() => new Promise<string>(resolve => { resolvePost = resolve; }));
+    const ds = makeDs();
+    ds.workerReady = true;
+    ds.streamCardPending = true;
+    ds.streamCardTurnGeneration = 1;
+    ds.streamCardPendingTurnId = 'om_turn_1';
+
+    const post = postTurnStartingCard(ds, sessionReply, 'om_turn_1');
+    ds.session.rootMessageId = 'om_transferred_root';
+    ds.streamCardId = undefined;
+    ds.streamCardNonce = undefined;
+
+    resolvePost('om_old_route_card');
+    await expect(post).resolves.toBe(false);
+    await flush();
+
+    expect(ds.streamCardId).toBeUndefined();
+    expect(ds.streamCardNonce).toBeUndefined();
+    expect(deleteMessageMock).toHaveBeenCalledWith(APP_ID, 'om_old_route_card');
+  });
+
+  it('does not roll an old POST failure back into a replacement session', async () => {
+    let rejectPost!: (error: Error) => void;
+    const sessionReply = vi.fn(() => new Promise<string>((_resolve, reject) => { rejectPost = reject; }));
+    const ds = makeDs();
+    ds.workerReady = true;
+    ds.streamCardId = 'om_previous';
+    ds.streamCardNonce = 'nonce_previous';
+    ds.streamCardPending = true;
+    ds.streamCardTurnGeneration = 1;
+    ds.streamCardPendingTurnId = 'om_turn_1';
+
+    const post = postTurnStartingCard(ds, sessionReply, 'om_turn_1');
+    ds.session = {
+      ...ds.session,
+      sessionId: 'sess-replacement',
+      rootMessageId: 'om_replacement_root',
+    };
+    ds.streamCardId = undefined;
+    ds.streamCardNonce = undefined;
+    ds.streamCardPending = false;
+    ds.streamCardPendingTurnId = undefined;
+    persistStreamCardStateMock.mockClear();
+
+    rejectPost(new Error('old route failed'));
+    await expect(post).resolves.toBe(false);
+
+    expect(ds.streamCardId).toBeUndefined();
+    expect(ds.streamCardNonce).toBeUndefined();
+    expect(persistStreamCardStateMock).not.toHaveBeenCalled();
+  });
+
+  it('discards an in-flight card when Riff explicit close starts preparing', async () => {
+    let resolvePost!: (messageId: string) => void;
+    const sessionReply = vi.fn(() => new Promise<string>(resolve => { resolvePost = resolve; }));
+    const ds = makeDs();
+    ds.workerReady = true;
+    ds.streamCardId = 'om_previous';
+    ds.streamCardNonce = 'nonce_previous';
+    ds.streamCardPending = true;
+    ds.streamCardTurnGeneration = 1;
+    ds.streamCardPendingTurnId = 'om_turn_1';
+
+    const post = postTurnStartingCard(ds, sessionReply, 'om_turn_1');
+    ds.riffCloseState = { phase: 'preparing', requestId: 'close-1' };
+    resolvePost('om_riff_orphan_card');
+
+    await expect(post).resolves.toBe(false);
+    await flush();
+
+    expect(ds.streamCardId).toBe('om_previous');
+    expect(ds.streamCardNonce).toBe('nonce_previous');
+    expect(ds.streamCardPending).toBe(true);
+    expect(deleteMessageMock).toHaveBeenCalledWith(APP_ID, 'om_riff_orphan_card');
+  });
+
+  it('discards an in-flight card when Riff daemon shutdown starts preparing', async () => {
+    let resolvePost!: (messageId: string) => void;
+    const sessionReply = vi.fn(() => new Promise<string>(resolve => { resolvePost = resolve; }));
+    const ds = makeDs();
+    ds.workerReady = true;
+    ds.streamCardId = 'om_previous';
+    ds.streamCardNonce = 'nonce_previous';
+    ds.streamCardPending = true;
+    ds.streamCardTurnGeneration = 1;
+    ds.streamCardPendingTurnId = 'om_turn_1';
+
+    const post = postTurnStartingCard(ds, sessionReply, 'om_turn_1');
+    ds.riffShutdownState = { phase: 'preparing', requestId: 'shutdown-1' };
+    resolvePost('om_riff_shutdown_orphan_card');
+
+    await expect(post).resolves.toBe(false);
+    await flush();
+
+    expect(ds.streamCardId).toBe('om_previous');
+    expect(ds.streamCardNonce).toBe('nonce_previous');
+    expect(deleteMessageMock).toHaveBeenCalledWith(APP_ID, 'om_riff_shutdown_orphan_card');
+  });
+
+  it('can retry after Riff close preparation aborts without leaving the sentinel stuck', async () => {
+    let resolveFirst!: (messageId: string) => void;
+    const sessionReply = vi.fn()
+      .mockImplementationOnce(() => new Promise<string>(resolve => { resolveFirst = resolve; }))
+      .mockResolvedValueOnce('om_retry_card');
+    const ds = makeDs();
+    ds.workerReady = true;
+    ds.streamCardId = 'om_previous';
+    ds.streamCardNonce = 'nonce_previous';
+    ds.streamCardPending = true;
+    ds.streamCardTurnGeneration = 1;
+    ds.streamCardPendingTurnId = 'om_turn_1';
+
+    const firstPost = postTurnStartingCard(ds, sessionReply, 'om_turn_1');
+    ds.riffCloseState = { phase: 'preparing', requestId: 'close-abort' };
+    resolveFirst('om_aborted_close_orphan_card');
+    await expect(firstPost).resolves.toBe(false);
+
+    ds.riffCloseState = undefined;
+    await expect(postTurnStartingCard(ds, sessionReply, 'om_turn_1')).resolves.toBe(true);
+
+    expect(sessionReply).toHaveBeenCalledTimes(2);
+    expect(ds.streamCardId).toBe('om_retry_card');
+    expect(ds.streamCardPending).toBe(false);
+    expect(deleteMessageMock).toHaveBeenCalledWith(APP_ID, 'om_aborted_close_orphan_card');
+  });
+
+  it('rejects a POST whose active registry key was taken by another session', async () => {
+    let resolvePost!: (messageId: string) => void;
+    const sessionReply = vi.fn(() => new Promise<string>(resolve => { resolvePost = resolve; }));
+    const ds = makeDs();
+    ds.workerReady = true;
+    ds.streamCardPending = true;
+    ds.streamCardTurnGeneration = 1;
+    ds.streamCardPendingTurnId = 'om_turn_1';
+    const registry = new Map([[sessionKey('om_root', APP_ID), ds]]);
+    setActiveSessionsRegistry(registry);
+
+    const post = postTurnStartingCard(ds, sessionReply, 'om_turn_1');
+    registry.set(sessionKey('om_root', APP_ID), makeDs());
+    resolvePost('om_displaced_registry_card');
+
+    await expect(post).resolves.toBe(false);
+    await flush();
+
+    expect(ds.streamCardId).not.toBe('om_displaced_registry_card');
+    expect(deleteMessageMock).toHaveBeenCalledWith(APP_ID, 'om_displaced_registry_card');
+  });
+});
+
 // ─── P3 helper: parkStreamCard ─────────────────────────────────────────────
 
 describe('parkStreamCard', () => {
@@ -439,6 +762,10 @@ describe('parkStreamCard', () => {
     ds.currentTurnTitle = 'Some turn';
     ds.displayMode = 'screenshot';
     ds.currentImageKey = 'img_key_xyz';
+    ds.session.cliId = 'codex';
+    ds.codexServiceTier = {
+      model: 'gpt-5.6-sol', serviceTier: 'priority', nonDefault: true,
+    };
 
     parkStreamCard(ds);
 
@@ -449,8 +776,24 @@ describe('parkStreamCard', () => {
     expect(entry?.title).toBe('Some turn');
     expect(entry?.displayMode).toBe('screenshot');
     expect(entry?.imageKey).toBe('img_key_xyz');
+    expect(entry?.codexServiceTierBadge).toBe('⚡ priority');
+    expect(ds.parkedStreamCardNonce).toBe('nonce_live');
     expect(saveFrozenCardsMock).toHaveBeenCalledTimes(1);
     expect(saveFrozenCardsMock).toHaveBeenCalledWith(SESSION_ID, ds.frozenCards);
+  });
+
+  it('does not leak a stale Codex tier snapshot into a non-Codex frozen card', () => {
+    const ds = makeDs();
+    ds.streamCardId = 'om_live';
+    ds.streamCardNonce = 'nonce_live';
+    ds.session.cliId = 'claude-code';
+    ds.codexServiceTier = {
+      model: 'gpt-5.6-sol', serviceTier: 'priority', nonDefault: true,
+    };
+
+    parkStreamCard(ds);
+
+    expect(ds.frozenCards?.get('nonce_live')?.codexServiceTierBadge).toBeUndefined();
   });
 
   it('is a no-op when streamCardId is missing', () => {
@@ -573,5 +916,237 @@ describe('scheduleCardPatch withdrawn handling', () => {
 
     expect(ds.streamCardId).toBeUndefined();
     expect(persistStreamCardStateMock).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ─── Periodic usage refresh timer (PR #637 follow-up, codex review) ──────────
+//
+// The streaming card re-renders every USAGE_REFRESH_INTERVAL_MS while a turn is
+// working so the total/turn usage climbs live. codex flagged five reachability
+// gaps in the first cut; these lock the corrected contract:
+//   - the arm predicate must NOT depend on the Web Terminal port (ZMX ready with
+//     port=0 must still refresh), and must gate on native-usage CLI capability
+//     (gemini/opencode/… have no transcript → nothing to refresh) and on
+//     usageDisplay='streaming';
+//   - the tick reads fresh (breaks the 15s cost-reader throttle) and is
+//     self-correcting (clears its own timer when state no longer qualifies).
+describe('usageRefreshShouldRun (arm/clear predicate)', () => {
+  function workingDs(): DaemonSession {
+    const ds = makeDs();
+    ds.lastScreenStatus = 'working';
+    ds.streamCardId = 'om_live';
+    ds.workerReady = true; // worker initialized (ZMX reports ready with port=0)
+    ds.workerPort = null;  // ← no Web Terminal port on purpose
+    ds.session.cliId = 'claude-code';
+    return ds;
+  }
+
+  it('is true for a working, initialized, streaming, native-usage session even with no worker port (ZMX port=0)', () => {
+    const ds = workingDs();
+    expect(ds.workerPort).toBeNull();
+    expect(usageRefreshShouldRun(ds)).toBe(true);
+  });
+
+  it('is false once the turn leaves working (idle / limited)', () => {
+    const ds = workingDs();
+    ds.lastScreenStatus = 'idle';
+    expect(usageRefreshShouldRun(ds)).toBe(false);
+    ds.lastScreenStatus = 'limited';
+    expect(usageRefreshShouldRun(ds)).toBe(false);
+  });
+
+  it('is false with no live card or the POSTING sentinel', () => {
+    const ds = workingDs();
+    ds.streamCardId = undefined;
+    expect(usageRefreshShouldRun(ds)).toBe(false);
+    ds.streamCardId = '__posting__';
+    expect(usageRefreshShouldRun(ds)).toBe(false);
+  });
+
+  it('is false before the worker has initialized', () => {
+    const ds = workingDs();
+    ds.workerReady = false;
+    expect(usageRefreshShouldRun(ds)).toBe(false);
+  });
+
+  it('is false for a CLI without native usage (gemini/opencode/…)', () => {
+    const ds = workingDs();
+    ds.session.cliId = 'gemini' as any;
+    expect(usageRefreshShouldRun(ds)).toBe(false);
+  });
+
+  it('is false when usageDisplay is not streaming (footer / off)', () => {
+    const ds = workingDs();
+    vi.mocked(resolveUsageDisplay).mockReturnValue('footer' as any);
+    expect(usageRefreshShouldRun(ds)).toBe(false);
+    vi.mocked(resolveUsageDisplay).mockReturnValue('off' as any);
+    expect(usageRefreshShouldRun(ds)).toBe(false);
+    vi.mocked(resolveUsageDisplay).mockReturnValue('streaming' as any);
+  });
+});
+
+describe('refreshStreamingCardUsage (interval tick)', () => {
+  function workingDs(): DaemonSession {
+    const ds = makeDs();
+    ds.lastScreenStatus = 'working';
+    ds.streamCardId = 'om_live';
+    ds.workerReady = true;
+    ds.session.cliId = 'claude-code';
+    return ds;
+  }
+
+  it('re-renders and PATCHes the live card while working', () => {
+    const ds = workingDs();
+    refreshStreamingCardUsage(ds);
+    expect(buildStreamingCard).toHaveBeenCalledTimes(1);
+    expect(updateMessageMock).toHaveBeenCalledWith(APP_ID, 'om_live', expect.any(String));
+  });
+
+  it('reads usage fresh so the 12s tick beats the 15s cost-reader throttle', () => {
+    // The whole point of the tick is to break the reparse throttle. The 17th
+    // buildStreamingCard arg is the streaming usage snapshot; assert the tick
+    // asked for a fresh read (empty transcript here → concrete empty snapshot).
+    const ds = workingDs();
+    refreshStreamingCardUsage(ds);
+    const call = vi.mocked(buildStreamingCard).mock.calls[0]!;
+    // Snapshot present (17th positional arg) and interval < throttle by design.
+    expect(call[16]).toEqual({ context: null, tokens: null, turnTokens: null });
+    expect(USAGE_REFRESH_INTERVAL_MS).toBeLessThan(15_000);
+  });
+
+  it('renders an empty terminal URL for a port=0 backend (ZMX) — no fake `:undefined` link', () => {
+    // workingDs() has workerPort=null (ZMX reports ready without a Web Terminal).
+    // The tick must use readableTerminalUrlFor (→ '') not raw buildTerminalUrl.
+    const ds = workingDs();
+    expect(ds.workerPort ?? null).toBeNull();
+    refreshStreamingCardUsage(ds);
+    const call = vi.mocked(buildStreamingCard).mock.calls[0]!;
+    expect(call[2]).toBe(''); // 3rd positional arg = read-only terminal URL
+  });
+
+  it('renders the read-only terminal URL for a Web-Terminal backend (tmux/pty)', () => {
+    const ds = workingDs();
+    ds.workerPort = 9101; // a real Web Terminal port
+    refreshStreamingCardUsage(ds);
+    const call = vi.mocked(buildStreamingCard).mock.calls[0]!;
+    expect(typeof call[2]).toBe('string');
+    expect(call[2]).not.toBe('');
+    expect(call[2]).toContain(`/s/${SESSION_ID}`);
+  });
+
+  it('is self-correcting: a tick that no longer qualifies clears its own timer and does not PATCH', () => {
+    vi.useFakeTimers();
+    const ds = workingDs();
+    syncUsageRefreshTimer(ds);
+    expect(ds.usageRefreshTimer).toBeDefined();
+
+    // Turn settled between ticks without an explicit clear on this path.
+    ds.lastScreenStatus = 'idle';
+    vi.advanceTimersByTime(USAGE_REFRESH_INTERVAL_MS);
+
+    expect(updateMessageMock).not.toHaveBeenCalled();
+    expect(ds.usageRefreshTimer).toBeUndefined();
+  });
+
+  it('does not PATCH during the new-turn handoff window (streamCardPending=true, old card still live)', () => {
+    // beginNewTurn: live worker still `working`, OLD streamCardId still set, but
+    // streamCardPending=true and currentTurnTitle already swapped to the new
+    // turn. A stray tick here must NOT PATCH the previous card with the new
+    // turn's title — it self-clears instead.
+    vi.useFakeTimers();
+    const ds = workingDs();
+    syncUsageRefreshTimer(ds);
+    expect(ds.usageRefreshTimer).toBeDefined();
+
+    ds.streamCardPending = true;             // handoff opened; streamCardId unchanged
+    ds.currentTurnTitle = 'NEW TURN TITLE';
+    vi.advanceTimersByTime(USAGE_REFRESH_INTERVAL_MS);
+
+    expect(updateMessageMock).not.toHaveBeenCalled();
+    expect(ds.usageRefreshTimer).toBeUndefined();
+  });
+});
+
+describe('syncUsageRefreshTimer (state-boundary arm/clear)', () => {
+  function workingDs(): DaemonSession {
+    const ds = makeDs();
+    ds.lastScreenStatus = 'working';
+    ds.streamCardId = 'om_live';
+    ds.workerReady = true;
+    ds.session.cliId = 'claude-code';
+    return ds;
+  }
+
+  it('arms a repeating timer for a qualifying working turn and re-renders each interval with fresh usage', () => {
+    vi.useFakeTimers();
+    const ds = workingDs();
+    syncUsageRefreshTimer(ds);
+    expect(ds.usageRefreshTimer).toBeDefined();
+
+    // Re-render (buildStreamingCard) is the per-tick signal: scheduleCardPatch
+    // coalesces overlapping in-flight PATCHes, so updateMessage call count is not
+    // a reliable per-tick counter under fake timers (the mock never resolves).
+    vi.advanceTimersByTime(USAGE_REFRESH_INTERVAL_MS);
+    expect(buildStreamingCard).toHaveBeenCalledTimes(1);
+    vi.advanceTimersByTime(USAGE_REFRESH_INTERVAL_MS);
+    expect(buildStreamingCard).toHaveBeenCalledTimes(2);
+  });
+
+  it('clears the timer when the session no longer qualifies (idle)', () => {
+    vi.useFakeTimers();
+    const ds = workingDs();
+    syncUsageRefreshTimer(ds);
+    expect(ds.usageRefreshTimer).toBeDefined();
+
+    ds.lastScreenStatus = 'idle';
+    syncUsageRefreshTimer(ds);
+    expect(ds.usageRefreshTimer).toBeUndefined();
+  });
+
+  it('does not arm for an unsupported CLI (no group-visible empty-usage PATCH storm)', () => {
+    vi.useFakeTimers();
+    const ds = workingDs();
+    ds.session.cliId = 'gemini' as any;
+    syncUsageRefreshTimer(ds);
+    expect(ds.usageRefreshTimer).toBeUndefined();
+    vi.advanceTimersByTime(USAGE_REFRESH_INTERVAL_MS * 3);
+    expect(buildStreamingCard).not.toHaveBeenCalled();
+    expect(updateMessageMock).not.toHaveBeenCalled();
+  });
+
+  it('does not arm when usageDisplay is off', () => {
+    vi.useFakeTimers();
+    const ds = workingDs();
+    vi.mocked(resolveUsageDisplay).mockReturnValue('off' as any);
+    syncUsageRefreshTimer(ds);
+    expect(ds.usageRefreshTimer).toBeUndefined();
+    vi.mocked(resolveUsageDisplay).mockReturnValue('streaming' as any);
+  });
+
+  it('re-arms after a CLI auto-restart (working card survives, worker re-readies)', () => {
+    // Third authorized arm point: claude_exit rc<=3 sets workerReady=false and
+    // restarts; the tick self-clears while uninitialized; on `ready` the old
+    // still-working card is reused and syncUsageRefreshTimer must re-arm — the
+    // post-restart screen_update is working→working and would otherwise never
+    // reach the arm choke point.
+    vi.useFakeTimers();
+    const ds = workingDs();
+    syncUsageRefreshTimer(ds);
+    expect(ds.usageRefreshTimer).toBeDefined();
+
+    // Worker exits/restarts: not initialized → the next tick self-clears.
+    ds.workerReady = false;
+    vi.advanceTimersByTime(USAGE_REFRESH_INTERVAL_MS);
+    expect(ds.usageRefreshTimer).toBeUndefined();
+
+    // `ready` reuses the surviving working card and re-syncs.
+    ds.workerReady = true;
+    syncUsageRefreshTimer(ds);
+    expect(ds.usageRefreshTimer).toBeDefined();
+
+    // Now ticks resume even without a status edge (working→working).
+    const before = vi.mocked(buildStreamingCard).mock.calls.length;
+    vi.advanceTimersByTime(USAGE_REFRESH_INTERVAL_MS);
+    expect(vi.mocked(buildStreamingCard).mock.calls.length).toBe(before + 1);
   });
 });

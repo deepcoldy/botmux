@@ -4,7 +4,11 @@
  * in-memory registry sync so the daemon's own card builders pick up the change
  * without a restart.
  *
- * Three independent toggles:
+ * Per-bot card and related session preferences:
+ *   • usageDisplay              — where to show native Context / Token usage:
+ *                                  'streaming' (default) = live streaming card
+ *                                  body, 'footer' = ordinary reply-card footer,
+ *                                  'off' = nowhere
  *   • disableStreamingCard      — suppress the live streaming session card
  *   • silentTurnReactions       — in card-off sessions, also drop the ✋→✅
  *                                  lightweight status reactions on the trigger
@@ -19,10 +23,20 @@
  *                                  (see chat-reply-mode-store). Default 'chat'.
  */
 import { rmwBotEntry } from './config-store.js';
-import { getBot, type ChatReplyMode } from '../bot-registry.js';
+import {
+  getBot,
+  normalizeUsageDisplay,
+  DEFAULT_USAGE_DISPLAY,
+  type ChatReplyMode,
+  type UsageDisplayMode,
+} from '../bot-registry.js';
 import { logger } from '../utils/logger.js';
 
 export interface BotCardPrefs {
+  /** Where to show native Context / Token usage:
+   *  'streaming' (default) = live streaming card body, 'footer' = ordinary
+   *  reply-card footer, 'off' = nowhere. */
+  usageDisplay: UsageDisplayMode;
   disableStreamingCard: boolean;
   silentTurnReactions: boolean;
   /** Experimental Codex App presentation mode. Default false preserves the
@@ -51,13 +65,19 @@ export interface BotCardPrefs {
   regularGroupMentionMode: 'always' | 'topic' | 'never' | 'ambient';
   /** 文档订阅新订阅默认评论触发范围（default 'mention-only'）。 */
   docSubscribeDefaultMode: 'mention-only' | 'all';
+  /** Explicit /summary records a project-local summary.md when enabled. */
+  summaryMemory: boolean;
+  /** Target path for summary memory. Relative paths resolve against the current project root. */
+  summaryMemoryPath: string;
 }
 
-/** Current card prefs for a bot (booleans default false, prompt defaults '' when unset). */
+/** Current card prefs for a bot (`usageDisplay` defaults to 'streaming';
+ * `botToBotSameDir` defaults true; other booleans default false). */
 export function getBotCardPrefs(larkAppId: string): BotCardPrefs {
   try {
     const c = getBot(larkAppId).config;
     return {
+      usageDisplay: normalizeUsageDisplay(c),
       disableStreamingCard: c.disableStreamingCard === true,
       silentTurnReactions: c.silentTurnReactions === true,
       codexAppCleanInput: c.codexAppCleanInput === true,
@@ -72,9 +92,12 @@ export function getBotCardPrefs(larkAppId: string): BotCardPrefs {
       regularGroupMentionMode: c.regularGroupMentionMode === 'topic' || c.regularGroupMentionMode === 'never' || c.regularGroupMentionMode === 'ambient'
         ? c.regularGroupMentionMode : 'always',
       docSubscribeDefaultMode: c.docSubscribeDefaultMode === 'all' ? 'all' : 'mention-only',
+      summaryMemory: c.summaryMemory === true,
+      summaryMemoryPath: typeof c.summaryMemoryPath === 'string' && c.summaryMemoryPath.trim() ? c.summaryMemoryPath.trim() : 'summary.md',
     };
   } catch {
     return {
+      usageDisplay: DEFAULT_USAGE_DISPLAY,
       disableStreamingCard: false,
       silentTurnReactions: false,
       codexAppCleanInput: false,
@@ -88,6 +111,8 @@ export function getBotCardPrefs(larkAppId: string): BotCardPrefs {
       regularGroupReplyMode: 'chat-topic',
       regularGroupMentionMode: 'always',
       docSubscribeDefaultMode: 'mention-only',
+      summaryMemory: false,
+      summaryMemoryPath: 'summary.md',
     };
   }
 }
@@ -143,8 +168,16 @@ export async function updateBotCardPrefs(
     if (val === 'all') entry[key] = 'all';
     else delete entry[key];
   };
+  // 用量显示位置：只存非默认模式；'streaming'（默认）删键保持 bots.json 干净
+  // （absent === 'streaming'）。
+  const applyUsageDisplay = (entry: any, key: keyof BotCardPrefs, val: UsageDisplayMode | undefined) => {
+    if (val === undefined) return;
+    if (val === 'footer' || val === 'off') entry[key] = val;
+    else delete entry[key];
+  };
 
   const r = await rmwBotEntry<BotCardPrefs>(larkAppId, (entry) => {
+    applyUsageDisplay(entry, 'usageDisplay', patch.usageDisplay);
     apply(entry, 'disableStreamingCard', patch.disableStreamingCard);
     apply(entry, 'silentTurnReactions', patch.silentTurnReactions);
     apply(entry, 'codexAppCleanInput', patch.codexAppCleanInput);
@@ -158,9 +191,12 @@ export async function updateBotCardPrefs(
     applyMode(entry, 'regularGroupReplyMode', patch.regularGroupReplyMode);
     applyMention(entry, 'regularGroupMentionMode', patch.regularGroupMentionMode);
     applyDocMode(entry, 'docSubscribeDefaultMode', patch.docSubscribeDefaultMode);
+    apply(entry, 'summaryMemory', patch.summaryMemory);
+    applyStr(entry, 'summaryMemoryPath', patch.summaryMemoryPath);
     return {
       write: true,
       result: {
+        usageDisplay: normalizeUsageDisplay(entry),
         disableStreamingCard: entry.disableStreamingCard === true,
         silentTurnReactions: entry.silentTurnReactions === true,
         codexAppCleanInput: entry.codexAppCleanInput === true,
@@ -178,12 +214,20 @@ export async function updateBotCardPrefs(
           ? entry.regularGroupMentionMode
           : 'always',
         docSubscribeDefaultMode: entry.docSubscribeDefaultMode === 'all' ? 'all' : 'mention-only',
+        summaryMemory: entry.summaryMemory === true,
+        summaryMemoryPath: typeof entry.summaryMemoryPath === 'string' && entry.summaryMemoryPath.trim() ? entry.summaryMemoryPath.trim() : 'summary.md',
       },
     };
   });
   if (!r.ok) return { ok: false, reason: r.reason };
 
   // Sync in-memory config so live card builders / routing react without a restart.
+  if (patch.usageDisplay !== undefined) {
+    // Store only a non-default mode; 'streaming' (default) clears the key.
+    bot.config.usageDisplay = (patch.usageDisplay && patch.usageDisplay !== DEFAULT_USAGE_DISPLAY)
+      ? patch.usageDisplay
+      : undefined;
+  }
   if (patch.disableStreamingCard !== undefined) {
     bot.config.disableStreamingCard = patch.disableStreamingCard || undefined;
   }
@@ -228,8 +272,15 @@ export async function updateBotCardPrefs(
   if (patch.docSubscribeDefaultMode !== undefined) {
     bot.config.docSubscribeDefaultMode = patch.docSubscribeDefaultMode === 'all' ? 'all' : undefined;
   }
+  if (patch.summaryMemory !== undefined) {
+    bot.config.summaryMemory = patch.summaryMemory || undefined;
+  }
+  if (patch.summaryMemoryPath !== undefined) {
+    bot.config.summaryMemoryPath = patch.summaryMemoryPath.trim() ? patch.summaryMemoryPath.trim() : undefined;
+  }
   logger.info(
-    `[card-prefs:${larkAppId}] disableStreamingCard=${r.result.disableStreamingCard} ` +
+    `[card-prefs:${larkAppId}] usageDisplay=${r.result.usageDisplay} ` +
+    `disableStreamingCard=${r.result.disableStreamingCard} ` +
     `silentTurnReactions=${r.result.silentTurnReactions} ` +
     `codexAppCleanInput=${r.result.codexAppCleanInput} ` +
     `writableTerminalLinkInCard=${r.result.writableTerminalLinkInCard} privateCard=${r.result.privateCard} ` +
@@ -237,6 +288,7 @@ export async function updateBotCardPrefs(
     `autoStartOnGroupJoin=${r.result.autoStartOnGroupJoin} autoStartOnNewTopic=${r.result.autoStartOnNewTopic} ` +
     `regularGroupReplyMode=${r.result.regularGroupReplyMode} regularGroupMentionMode=${r.result.regularGroupMentionMode} ` +
     `botToBotSameDir=${r.result.botToBotSameDir} docSubscribeDefaultMode=${r.result.docSubscribeDefaultMode} ` +
+    `summaryMemory=${r.result.summaryMemory} summaryMemoryPath=${r.result.summaryMemoryPath} ` +
     `autoStartOnGroupJoinPrompt.len=${r.result.autoStartOnGroupJoinPrompt.length}`,
   );
   return { ok: true, prefs: r.result };

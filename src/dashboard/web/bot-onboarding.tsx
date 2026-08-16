@@ -1,3 +1,4 @@
+import type React from 'react';
 import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from 'react';
 import { DropdownMenu } from './dashboard-components.js';
 import { t } from './ui.js';
@@ -237,7 +238,7 @@ export async function openBotOnboarding(): Promise<void> {
   window.dispatchEvent(new Event(OPEN_BOT_ONBOARDING_EVENT));
 }
 
-function PermissionSummary(props: { job: OnboardingJob }): JSX.Element | null {
+function PermissionSummary(props: { job: OnboardingJob }): React.JSX.Element | null {
   const { job } = props;
   if ((job.status !== 'completed' && job.status !== 'needs_owner') || !job.permission) return null;
   const permission = job.permission;
@@ -274,7 +275,7 @@ function PermissionSummary(props: { job: OnboardingJob }): JSX.Element | null {
   );
 }
 
-function OnboardingMeta(props: { job: OnboardingJob }): JSX.Element | null {
+function OnboardingMeta(props: { job: OnboardingJob }): React.JSX.Element | null {
   const { job } = props;
   if (!job.appId) return null;
   return (
@@ -287,7 +288,7 @@ function OnboardingMeta(props: { job: OnboardingJob }): JSX.Element | null {
   );
 }
 
-function QrCard(props: { dataUrl: string; alt: string; link?: string }): JSX.Element {
+function QrCard(props: { dataUrl: string; alt: string; link?: string }): React.JSX.Element {
   return (
     <div className="qr-card">
       <img className="qr-image" src={props.dataUrl} alt={props.alt} />
@@ -316,7 +317,7 @@ function OnboardingJobView(props: {
   onSubmitOwner(job: OnboardingJob, owner: string, ownerId: string): void;
   onRetry(mode: 'web' | 'compat'): void;
   onClose(): void;
-}): JSX.Element {
+}): React.JSX.Element {
   const { job, ownerError } = props.view;
   return (
     <>
@@ -421,7 +422,7 @@ function OnboardingForm(props: {
   onSessionModeChange(mode: 'reuse' | 'qr'): void;
   onSubmit(event: FormEvent<HTMLFormElement>): void;
   onClose(): void;
-}): JSX.Element {
+}): React.JSX.Element {
   const selectedCli = props.cliState.options.find(option => option.id === props.form.cliId);
   const acceptsModel = selectedCli?.gateway === 'ttadk' && selectedCli.acceptsModel !== false;
   const modelDisabled = selectedCli?.gateway === 'ttadk' && selectedCli.acceptsModel === false;
@@ -586,7 +587,7 @@ function OnboardingForm(props: {
   );
 }
 
-export function BotOnboardingDialog(props: { open: boolean; onClose(): void }): JSX.Element {
+export function BotOnboardingDialog(props: { open: boolean; onClose(): void }): React.JSX.Element {
   const dialogRef = useRef<HTMLDialogElement | null>(null);
   const pollTimerRef = useRef<number | null>(null);
   const loadSeqRef = useRef(0);

@@ -76,10 +76,10 @@ describe('card-handler 部分授权失败', () => {
     };
   }
 
-  it('部分成功：失败 target 的 pending 被清（不再永久 throttle），owner 收到失败清单，成功 bot 仍登记+撤卡', async () => {
+  it('部分成功：失败 target 的 pending 被清（不再永久 throttle），owner 收到失败清单，成功 bot 仍登记，原卡就地更新为终态（不撤卡）', async () => {
     const { pending, handler } = await fresh();
     const nonce = pending.openPendingMulti('h1', 'oc_1', ['ou_ok', 'ou_fail']);
-    await handler.handleCardAction(multiAction(['ou_ok', 'ou_fail'], ['好机器人', '坏目标'], nonce), deps, 'h1');
+    const res = await handler.handleCardAction(multiAction(['ou_ok', 'ou_fail'], ['好机器人', '坏目标'], nonce), deps, 'h1');
 
     // 失败 target 的 pending 必须清掉：checkNonce/isThrottled 都不再挡它（同步发生，扣 pending 在落库阶段）
     expect(pending.checkNonce('h1', 'oc_1', 'ou_fail', nonce)).toBe(false);
@@ -87,7 +87,11 @@ describe('card-handler 部分授权失败', () => {
     // 成功 target 也清了
     expect(pending.checkNonce('h1', 'oc_1', 'ou_ok', nonce)).toBe(false);
 
-    await flushBackground();   // 通知 + 失败清单文字 + 撤卡走后台 fire-and-forget
+    // 授权成功就地 patch 原卡为终态（绿头 update_multi），同步返回该 body——不再撤卡（见 2d1faa4c）
+    expect(res?.config?.update_multi).toBe(true);
+    expect(res?.header?.template).toBe('green');
+
+    await flushBackground();   // 失败清单文字走后台 fire-and-forget
 
     // owner 收到失败清单（含失败目标名），且不是静默
     const partialReply = replyMock.mock.calls.find(c => typeof c[2] === 'string' && String(c[2]).includes('坏目标'));
@@ -98,8 +102,8 @@ describe('card-handler 部分授权失败', () => {
     const [, , , entries] = recordObservedMock.mock.calls.at(-1)!;
     expect(entries).toEqual([{ openId: 'ou_ok', name: '好机器人' }]);
 
-    // 卡仍撤回
-    expect(deleteMock).toHaveBeenCalledWith('h1', 'om_card');
+    // 原卡就地更新即完成，不再撤回（2d1faa4c：不发通知卡 + 不撤原卡）
+    expect(deleteMock).not.toHaveBeenCalled();
   });
 
   it('全部失败：保留 pending（owner 可点原卡重试）+ toast 报错，不撤卡', async () => {

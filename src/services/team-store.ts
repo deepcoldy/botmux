@@ -20,6 +20,8 @@
 import { readFileSync, writeFileSync, existsSync, mkdirSync, renameSync } from 'node:fs';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
+import type { FeedbackPolicyLayer } from './feedback-policy-resolver.js';
+import { normalizeFeedbackPolicyLayer } from './feedback-policy-resolver.js';
 
 export const DEFAULT_TEAM_ID = 'default';
 
@@ -38,6 +40,7 @@ export interface Team {
   members: TeamMember[];
   createdAt: number;
   updatedAt: number;
+  feedback?: FeedbackPolicyLayer;
 }
 
 interface FileShape {
@@ -123,6 +126,24 @@ export function deleteTeam(dataDir: string, teamId: string): boolean {
   if (data.teams.length === before) return false;
   writeFileAtomic(dataDir, data);
   return true;
+}
+
+/** Invalid policy layers are rejected before the local hosted-team file changes. */
+export function setTeamFeedbackPolicy(
+  dataDir: string,
+  teamId: string,
+  policy: FeedbackPolicyLayer | null,
+  now: number = Date.now(),
+): Team | null {
+  const normalized = policy === null ? undefined : normalizeFeedbackPolicyLayer(policy);
+  const data = readFile(dataDir);
+  const team = data.teams.find(t => t.id === teamId);
+  if (!team) return null;
+  if (normalized === undefined) delete team.feedback;
+  else team.feedback = normalized;
+  team.updatedAt = now;
+  writeFileAtomic(dataDir, data);
+  return team;
 }
 
 /** Create a new explicit team. */

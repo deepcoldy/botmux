@@ -13,8 +13,8 @@
 
 ## Lost environment variables (high frequency)
 
-- **bash users who put variables in `.bash_profile` don't get them**: A new worker starts with `bash -i`, and `bash -i` only reads `.bashrc`. → In `.bashrc`, run `source ~/.bash_profile`, or just put the variables directly in `.bashrc` (zsh users use `.zshrc`). This is a common root cause of `API Error 403` / gateway token errors.
-- **Claude refuses `--dangerously-skip-permissions` under root**: It reports "cannot be used with root/sudo privileges". → `export IS_SANDBOX=1` (zsh in `.zshrc`, bash in `.bashrc`; for PM2 / systemd / Docker scenarios, configure it in the corresponding startup environment). Newer versions already inject this automatically for the root scenario.
+- **bash users who put variables in `.bash_profile` don't get them**: A new worker starts with `bash -i`, and `bash -i` only reads `.bashrc`. → In `.bashrc`, run `source ~/.bash_profile`, or just put the variables directly in `.bashrc` (zsh users use `.zshrc`; fish users put them in `~/.config/fish/config.fish`). This is a common root cause of `API Error 403` / gateway token errors.
+- **Claude refuses `--dangerously-skip-permissions` under root**: It reports "cannot be used with root/sudo privileges". → `export IS_SANDBOX=1` (zsh in `.zshrc`, bash in `.bashrc`, fish in `~/.config/fish/config.fish`; for PM2 / systemd / Docker scenarios, configure it in the corresponding startup environment). Newer versions already inject this automatically for the root scenario.
 
 ## Custom wrapper / gateway integration
 
@@ -47,7 +47,7 @@
 
 ## Dashboard / Security
 
-- **Don't post a token-bearing dashboard URL into a group** (it's equivalent to publicly exposing a temporary access credential). For security-sensitive scenarios, bind the host to the local machine: `BOTMUX_DASHBOARD_HOST=127.0.0.1`. The token is single-use; each run of `botmux dashboard` regenerates it and the old link becomes invalid immediately.
+- **Don't post a token-bearing dashboard URL into a group** (it's equivalent to publicly exposing a temporary access credential). For security-sensitive scenarios, bind the host to the local machine: `BOTMUX_DASHBOARD_HOST=127.0.0.1`. The token rotates rather than being consumed: the same URL remains reusable until rotation; only `botmux dashboard rotate` generates a new token and immediately invalidates the old link. The bare command and `botmux dashboard current` do not rotate it.
 - **Dashboard won't open**: First run `curl http://<host>:<port>/__health`; a `{"ok":true}` response means the service is healthy. The problem is usually a browser proxy / wrong host (a Mac's intranet IP can change) / opening a link with an old token.
 
 ## General troubleshooting approach

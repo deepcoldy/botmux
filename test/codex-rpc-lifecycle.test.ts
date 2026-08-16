@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { codexRpcEligible, paneRunsRemoteTui, orchestrateCodexRpcInit, shouldQueueInitialPrompt, rolloutUserTurnMatches, decideStartupDialogAction, killAndVerifyPersistentPane, RPC_CAPABLE_CLIS, type PaneProbes, type RpcInitEffects } from '../src/codex-rpc-lifecycle.js';
+import { CODEX_RPC_TERMINAL_HYDRATION_DELAYS_MS, RpcEngagementFence, codexRpcEligible, paneRunsRemoteTui, orchestrateCodexRpcInit, shouldQueueInitialPrompt, rolloutUserTurnMatches, decideStartupDialogAction, killAndVerifyPersistentPane, rpcTranscriptIngestBlockedByAwaitingActivation, RPC_CAPABLE_CLIS, type PaneProbes, type RpcInitEffects } from '../src/codex-rpc-lifecycle.js';
 import type { DaemonToWorker } from '../src/types.js';
 
 type InitCfg = Extract<DaemonToWorker, { type: 'init' }>;
@@ -28,6 +28,96 @@ describe('codexRpcEligible — the eligible base case', () => {
   it('a resume (no prompt but resume + cliSessionId) is eligible', () => {
     expect(codexRpcEligible(baseCfg({ prompt: '', resume: true, cliSessionId: 'thread-1' }))).toBe(true);
   });
+  it('a declared Codex-compatible runtime remains eligible with its executable shadow', () => {
+    expect(codexRpcEligible(baseCfg({
+      cliRuntime: {
+        id: 'vendor-codex',
+        displayName: 'VendorCodex',
+        executable: '/opt/vendor-codex',
+        source: 'configured',
+        update: { provider: 'self' },
+      },
+      cliPathOverride: '/opt/vendor-codex',
+    }))).toBe(true);
+  });
+});
+
+describe('RPC terminal rollout hydration window', () => {
+  it('keeps polling through delayed 9s visibility and remains bounded near the 12s first-turn probe', () => {
+    const totalMs = CODEX_RPC_TERMINAL_HYDRATION_DELAYS_MS
+      .reduce((sum, delayMs) => sum + delayMs, 0);
+    expect(totalMs).toBeGreaterThanOrEqual(10_000);
+    expect(totalMs).toBeLessThanOrEqual(12_000);
+
+    // Model a rollout that becomes visible nine seconds after the native
+    // terminal. The retry sequence must still have a scheduled observation at
+    // or after visibility, rather than retiring the bridge mark early.
+    let elapsedMs = 0;
+    let observed = false;
+    for (const delayMs of CODEX_RPC_TERMINAL_HYDRATION_DELAYS_MS) {
+      elapsedMs += delayMs;
+      if (elapsedMs >= 9_000) {
+        observed = true;
+        break;
+      }
+    }
+    expect(observed).toBe(true);
+  });
+
+  it('lets an older terminal hydrate while a different successor awaits activation', () => {
+    expect(rpcTranscriptIngestBlockedByAwaitingActivation(
+      ['turn-n-plus-1'],
+      'turn-n',
+    )).toBe(false);
+    expect(rpcTranscriptIngestBlockedByAwaitingActivation(
+      ['turn-n-plus-1'],
+    )).toBe(true);
+    expect(rpcTranscriptIngestBlockedByAwaitingActivation(
+      ['turn-n', 'turn-n-plus-1'],
+      'turn-n',
+    )).toBe(true);
+  });
+});
+
+describe('RpcEngagementFence', () => {
+  it('rejects a delayed first-turn result after restart invalidates its lease', async () => {
+    const fence = new RpcEngagementFence();
+    const lease = fence.begin();
+    let resolveProbe!: (value: 'accepted') => void;
+    const probe = new Promise<'accepted'>(resolve => { resolveProbe = resolve; });
+    let published = false;
+    let requeued = false;
+    const engage = (async () => {
+      const outcome = await probe;
+      if (!fence.isCurrent(lease)) return 'superseded';
+      published = true;
+      if (outcome !== 'accepted') requeued = true;
+      return outcome;
+    })();
+
+    fence.invalidate();
+    resolveProbe('accepted');
+
+    await expect(engage).resolves.toBe('superseded');
+    expect(published).toBe(false);
+    expect(requeued).toBe(false);
+  });
+
+  it('rejects publication when the owned app-server dies after its last await', () => {
+    const fence = new RpcEngagementFence();
+    const lease = fence.begin();
+
+    expect(fence.isLive(lease)).toBe(true);
+    fence.markDead(lease);
+    expect(fence.isCurrent(lease)).toBe(true);
+    expect(fence.isLive(lease)).toBe(false);
+
+    // A delayed death callback from the retired engine must not poison the
+    // replacement engagement.
+    const replacementLease = fence.begin();
+    fence.markDead(lease);
+    expect(fence.isLive(replacementLease)).toBe(true);
+  });
 });
 
 describe('codexRpcEligible — every fail-closed gate degrades to paste', () => {
@@ -53,6 +143,54 @@ describe('codexRpcEligible — every fail-closed gate degrades to paste', () => 
   }
   it('fails closed when BOTMUX_SANDBOX=1 forces sandbox outside InitCfg', () => {
     expect(codexRpcEligible(baseCfg(), { sandboxForced: true })).toBe(false);
+  });
+  it('fails closed for a migrated legacy-path snapshot even when the path shadow matches', () => {
+    expect(codexRpcEligible(baseCfg({
+      cliRuntime: {
+        id: 'vendor-codex',
+        displayName: 'vendor-codex',
+        executable: '/opt/vendor-codex',
+        source: 'legacy-path',
+        update: { provider: 'auto' },
+      },
+      cliPathOverride: '/opt/vendor-codex',
+    }))).toBe(false);
+  });
+  it('fails closed when the structured snapshot and executable shadow disagree', () => {
+    expect(codexRpcEligible(baseCfg({
+      cliRuntime: {
+        id: 'vendor-codex',
+        displayName: 'VendorCodex',
+        executable: '/opt/vendor-codex',
+        source: 'configured',
+        update: { provider: 'none' },
+      },
+      cliPathOverride: '/opt/not-vendor-codex',
+    }))).toBe(false);
+  });
+  it('fails closed when a structured snapshot has no executable shadow', () => {
+    expect(codexRpcEligible(baseCfg({
+      cliRuntime: {
+        id: 'vendor-codex',
+        displayName: 'VendorCodex',
+        executable: '/opt/vendor-codex',
+        source: 'configured',
+        update: { provider: 'none' },
+      },
+      cliPathOverride: undefined,
+    }))).toBe(false);
+  });
+  it('fails closed for a legacy snapshot even when its executable shadow is missing', () => {
+    expect(codexRpcEligible(baseCfg({
+      cliRuntime: {
+        id: 'vendor-codex',
+        displayName: 'vendor-codex',
+        executable: '/opt/vendor-codex',
+        source: 'legacy-path',
+        update: { provider: 'auto' },
+      },
+      cliPathOverride: undefined,
+    }))).toBe(false);
   });
 });
 
@@ -81,6 +219,53 @@ describe('paneRunsRemoteTui — RPC-owned detection via leaf argv (not pane_curr
     expect(paneRunsRemoteTui('bmx-1', probes({
       100: { comm: 'node', argv: ['node', '/n/bin/codex', '--remote', 'ws://x', 'resume', 'tid'] },
     }))).toBe(true);
+  });
+
+  it('matches a configured runtime executable exactly', () => {
+    const runtimeProbes = probes({
+      100: { comm: 'node', argv: ['node', '/opt/bin/vendor-codex', '--remote', 'ws://x', 'resume', 'tid'] },
+    });
+    expect(paneRunsRemoteTui('bmx-1', runtimeProbes, '/opt/bin/vendor-codex')).toBe(true);
+    expect(paneRunsRemoteTui('bmx-1', runtimeProbes, '/opt/bin/codex')).toBe(false);
+    expect(paneRunsRemoteTui('bmx-1', probes({
+      100: { comm: 'node.exe', argv: ['node.exe', 'C:\\tools\\vendor-codex.exe', '--remote'] },
+    }), 'C:\\tools\\vendor-codex.exe')).toBe(true);
+  });
+
+  it('matches a configured runtime in a known Node executable slot, but never in arbitrary program argv', () => {
+    expect(paneRunsRemoteTui('bmx-1', probes({
+      100: {
+        comm: 'node',
+        argv: ['node', '--enable-source-maps', '/opt/bin/vendor-codex', '--remote', 'ws://x', 'resume', 'tid'],
+      },
+    }), '/opt/bin/vendor-codex')).toBe(true);
+
+    // `/opt/bin/vendor-codex` is an argument to unrelated.js, not the program
+    // launched by Node. A broad argv scan would incorrectly claim this pane.
+    expect(paneRunsRemoteTui('bmx-1', probes({
+      100: {
+        comm: 'node',
+        argv: ['node', '/srv/unrelated.js', '/opt/bin/vendor-codex', '--remote'],
+      },
+    }), '/opt/bin/vendor-codex')).toBe(false);
+
+    // Unknown flags may consume the next token. Fail closed instead of guessing
+    // that their value is the executable slot.
+    expect(paneRunsRemoteTui('bmx-1', probes({
+      100: {
+        comm: 'node',
+        argv: ['node', '--require', '/opt/bin/vendor-codex', '/srv/unrelated.js', '--remote'],
+      },
+    }), '/opt/bin/vendor-codex')).toBe(false);
+  });
+
+  it('does not claim stock Codex or a prefix lookalike for a custom runtime', () => {
+    expect(paneRunsRemoteTui('bmx-1', probes({
+      100: { comm: 'codex', argv: ['codex', '--remote', 'ws://x', 'resume', 'tid'] },
+    }), '/opt/bin/vendor-codex')).toBe(false);
+    expect(paneRunsRemoteTui('bmx-1', probes({
+      100: { comm: 'vendor-codex-helper', argv: ['vendor-codex-helper', '--remote', 'ws://x', 'resume', 'tid'] },
+    }), '/opt/bin/vendor-codex')).toBe(false);
   });
 
   it('native paste codex (resume, NO --remote) → not RPC-owned (fail-closed, boundary #3)', () => {
@@ -209,7 +394,7 @@ describe('killAndVerifyPersistentPane — verifies the resolved name without re-
     const probed: string[] = [];
     const gone = await killAndVerifyPersistentPane('bmx-12345678', {
       kill: (name) => { killed.push(name); },
-      isLive: (name) => { probed.push(name); return true; },
+      probeLive: (name) => { probed.push(name); return 'live'; },
       wait: async () => {},
     }, 2, 0);
     expect(gone).toBe(false);
@@ -222,11 +407,43 @@ describe('killAndVerifyPersistentPane — verifies the resolved name without re-
     let kills = 0;
     const gone = await killAndVerifyPersistentPane('bmx-abcdef12', {
       kill: () => { kills += 1; if (kills === 2) live = false; },
-      isLive: () => live,
+      probeLive: () => (live ? 'live' : 'gone'),
       wait: async () => {},
     }, 4, 0);
     expect(gone).toBe(true);
     expect(kills).toBe(2);
+  });
+
+  /**
+   * Regression: an unanswered liveness probe must never be reported as a
+   * verified kill. `TmuxBackend.hasSession()` (and its zellij/herdr/zmx peers)
+   * return `false` for BOTH "session absent" and "probe timed out", because
+   * they collapse the tri-state `probeSession()` to `=== 'exists'`. Feeding
+   * that boolean into this function turned a load-induced timeout into proof of
+   * absence, letting a surviving dead-`--remote` pane be reattached to the
+   * fresh-port engine — the P0 freeze this layer exists to prevent.
+   */
+  it('does NOT report a verified kill when every probe is indeterminate', async () => {
+    let kills = 0;
+    const gone = await killAndVerifyPersistentPane('bmx-deadbeef', {
+      kill: () => { kills += 1; },
+      probeLive: () => 'unknown',
+      wait: async () => {},
+    }, 3, 0);
+    expect(gone).toBe(false);
+    // 'unknown' is a reason to look again, so the retries are still spent.
+    expect(kills).toBe(3);
+  });
+
+  it('accepts a later authoritative "gone" after earlier indeterminate probes', async () => {
+    const answers: Array<'unknown' | 'gone'> = ['unknown', 'unknown', 'gone'];
+    let i = 0;
+    const gone = await killAndVerifyPersistentPane('bmx-cafe1234', {
+      kill: () => {},
+      probeLive: () => answers[Math.min(i++, answers.length - 1)],
+      wait: async () => {},
+    }, 4, 0);
+    expect(gone).toBe(true);
   });
 });
 
