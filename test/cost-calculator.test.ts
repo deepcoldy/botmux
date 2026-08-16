@@ -906,6 +906,94 @@ describe('getSessionTokenUsage', () => {
     expect(findPiTranscriptBySessionId).toHaveBeenCalledWith('pi-sid', '/tmp');
   });
 
+  it('reports Pi context usage without window when models.json is unavailable', () => {
+    vi.mocked(findPiTranscriptBySessionId).mockReturnValue('/home/testuser/.pi/agent/sessions/--tmp/2026-08-03_pi-sid.jsonl');
+    setupJsonl(JSON.stringify({
+      type: 'message',
+      message: {
+        id: 'pi-msg-1',
+        role: 'assistant',
+        model: 'deepseek-v4-flash',
+        usage: { input: 100, output: 20, cacheRead: 30, cacheWrite: 10 },
+      },
+    }));
+
+    const snapshot = getSessionUsageSnapshot({
+      cliId: 'pi',
+      sessionId: 'botmux-sid',
+      cliSessionId: 'pi-sid',
+      cwd: '/tmp',
+    });
+    expect(snapshot.context).toEqual({ usedTokens: 140 });
+  });
+
+  it('reports Pi context usage with window and percent from models.json', () => {
+    vi.mocked(findPiTranscriptBySessionId).mockReturnValue('/home/testuser/.pi/agent/sessions/--tmp/2026-08-03_pi-sid.jsonl');
+    const transcript = JSON.stringify({
+      type: 'message',
+      message: {
+        id: 'pi-msg-1',
+        role: 'assistant',
+        model: 'deepseek-v4-flash',
+        usage: { input: 400, output: 20, cacheRead: 100, cacheWrite: 0 },
+      },
+    });
+    vi.mocked(existsSync).mockReturnValue(true);
+    vi.mocked(readFileSync).mockImplementation((path: unknown) => {
+      return String(path).endsWith('models.json')
+        ? JSON.stringify({
+            providers: {
+              'team-gateway': {
+                models: [{ id: 'deepseek-v4-flash', contextWindow: 1000 }],
+              },
+            },
+          })
+        : transcript;
+    });
+
+    const snapshot = getSessionUsageSnapshot({
+      cliId: 'pi',
+      sessionId: 'botmux-sid',
+      cliSessionId: 'pi-sid',
+      cwd: '/tmp',
+    });
+    // input 400 + cacheRead 100 = 500 used tokens over a 1000 window → 50%
+    expect(snapshot.context).toEqual({ usedTokens: 500, windowTokens: 1000, percentUsed: 50 });
+  });
+
+  it('resolves Pi models.json window for provider/variant model id shapes', () => {
+    vi.mocked(findPiTranscriptBySessionId).mockReturnValue('/home/testuser/.pi/agent/sessions/--tmp/2026-08-03_pi-sid.jsonl');
+    const transcript = JSON.stringify({
+      type: 'message',
+      message: {
+        id: 'pi-msg-1',
+        role: 'assistant',
+        model: 'team-gateway/deepseek-v4-flash:max',
+        usage: { input: 250, output: 20, cacheRead: 0, cacheWrite: 0 },
+      },
+    });
+    vi.mocked(existsSync).mockReturnValue(true);
+    vi.mocked(readFileSync).mockImplementation((path: unknown) => {
+      return String(path).endsWith('models.json')
+        ? JSON.stringify({
+            providers: {
+              'team-gateway': {
+                models: [{ id: 'deepseek-v4-flash', contextWindow: 1000 }],
+              },
+            },
+          })
+        : transcript;
+    });
+
+    const snapshot = getSessionUsageSnapshot({
+      cliId: 'pi',
+      sessionId: 'botmux-sid',
+      cliSessionId: 'pi-sid',
+      cwd: '/tmp',
+    });
+    expect(snapshot.context).toEqual({ usedTokens: 250, windowTokens: 1000, percentUsed: 25 });
+  });
+
   it('reports CoCo nested response_meta usage without counting agent_end duplicates', () => {
     setupJsonl([
       JSON.stringify({

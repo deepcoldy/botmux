@@ -2,6 +2,8 @@
  * Session cost calculator — computes token usage from JSONL logs.
  */
 import { closeSync, constants, existsSync, fstatSync, openSync, readFileSync, readSync, statSync, type Stats } from 'node:fs';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
 import { logger } from '../utils/logger.js';
 import type { CliId } from '../adapters/cli/types.js';
 import { findAidenLatestCheckpointByBotmuxSessionId, findAidenLatestCheckpointBySessionId } from '../services/aiden-checkpoints.js';
@@ -379,6 +381,70 @@ function foldCocoLine(agg: TokenUsageAggregate, entry: any): void {
   agg.turns++;
 }
 
+/** Pi transcripts carry per-turn usage but no context window of their own;
+ *  the window comes from ~/.pi/agent/models.json. Cache by mtime so the fold
+ *  never re-reads a stable file (models.json is edited rarely). */
+const PI_MODELS_JSON_PATH = join(homedir(), '.pi', 'agent', 'models.json');
+
+interface PiModelsCacheEntry {
+  mtimeMs: number;
+  size: number;
+  contextByModelId: Map<string, number>;
+}
+
+let piModelsCache: PiModelsCacheEntry | null = null;
+
+function readPiModelsContextWindows(): Map<string, number> | null {
+  try {
+    const st = statSync(PI_MODELS_JSON_PATH);
+    if (piModelsCache && piModelsCache.mtimeMs === st.mtimeMs && piModelsCache.size === st.size) return piModelsCache.contextByModelId;
+    const parsed = JSON.parse(readFileSync(PI_MODELS_JSON_PATH, 'utf-8')) as any;
+    const contextByModelId = new Map<string, number>();
+    const providers = parsed?.providers;
+    if (providers && typeof providers === 'object') {
+      for (const provider of Object.values<any>(providers)) {
+        if (!provider || typeof provider !== 'object') continue;
+        const models = provider.models;
+        if (!Array.isArray(models)) continue;
+        for (const model of models) {
+          if (model && typeof model.id === 'string' && typeof model.contextWindow === 'number' && model.contextWindow > 0) {
+            contextByModelId.set(model.id, model.contextWindow);
+          }
+        }
+      }
+    }
+    piModelsCache = { mtimeMs: st.mtimeMs, size: st.size, contextByModelId };
+    return contextByModelId;
+  } catch {
+    // models.json missing or unparseable: fall back to used-tokens-only context
+    // (no window, no percentage), same as Claude Code sessions.
+    return null;
+  }
+}
+
+/** Resolve a model's context window, tolerating pi's bare model ids as well as
+ *  the "provider/model" and "model:variant" shapes used in configs. */
+function piModelContextWindow(modelId: string): number | undefined {
+  const contextByModelId = readPiModelsContextWindows();
+  if (!contextByModelId) return undefined;
+  if (contextByModelId.has(modelId)) return contextByModelId.get(modelId);
+  const bare = modelId.includes('/') ? modelId.slice(modelId.lastIndexOf('/') + 1) : modelId;
+  if (contextByModelId.has(bare)) return contextByModelId.get(bare);
+  const withoutVariant = bare.includes(':') ? bare.slice(0, bare.indexOf(':')) : bare;
+  if (withoutVariant !== bare && contextByModelId.has(withoutVariant)) return contextByModelId.get(withoutVariant);
+  return undefined;
+}
+
+/** pi's usage is per-turn prompt-side totals; the latest measurement is the
+ *  context gauge. The window (and therefore the percentage) comes from
+ *  ~/.pi/agent/models.json when the model id can be resolved. */
+function buildPiContextUsage(usedTokens: number, modelId: string): SessionContextUsage {
+  const windowTokens = piModelContextWindow(modelId);
+  if (!windowTokens) return { usedTokens };
+  const percentUsed = Math.round(Math.max(0, Math.min(1, usedTokens / windowTokens)) * 100);
+  return { usedTokens, windowTokens, percentUsed };
+}
+
 function foldPiLine(agg: TokenUsageAggregate, seenMessageIds: Set<string>, entry: any): void {
   if (entry?.type !== 'message' || entry?.message?.role !== 'assistant') return;
   const msg = entry.message;
@@ -393,6 +459,12 @@ function foldPiLine(agg: TokenUsageAggregate, seenMessageIds: Set<string>, entry
   agg.outputTokens += num(u.output);
   agg.cacheReadTokens += num(u.cacheRead);
   agg.cacheCreateTokens += num(u.cacheWrite);
+  const contextTokens = num(u.input) + num(u.cacheRead) + num(u.cacheWrite);
+  // Synthetic/empty assistant records (e.g. around compaction) must not erase
+  // the last native context measurement.
+  if (contextTokens > 0) {
+    agg.latestContextUsage = buildPiContextUsage(contextTokens, typeof msg.model === 'string' ? msg.model : '');
+  }
   if (!agg.model && typeof msg.model === 'string') agg.model = msg.model;
   agg.turns++;
 }
@@ -544,6 +616,7 @@ const warnedOversizedUsageFiles = new Set<string>();
 export function __resetSessionUsageCachesForTest(): void {
   usageFileCache.clear();
   warnedOversizedUsageFiles.clear();
+  piModelsCache = null;
   __resetTranscriptResolverCacheForTest();
 }
 
