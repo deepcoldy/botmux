@@ -13204,6 +13204,13 @@ switch (command) {
     process.exitCode = await runDeviceCommand(process.argv.slice(3));
     break;
   }
+  case 'mojo-containment': {
+    // The auditable operator exit for fail-closed containment blockers that can
+    // never self-release (weak handles on non-cgroup hosts, unprovable handles).
+    const { runMojoContainmentCommand } = await import('./core/mojo-containment-command.js');
+    process.exitCode = runMojoContainmentCommand(process.argv.slice(3));
+    break;
+  }
   case 'list':
   case 'ls':      await cmdList(); break;
   case '__zmx-attach-managed': cmdManagedZmxAttach(process.argv.slice(3)); break;

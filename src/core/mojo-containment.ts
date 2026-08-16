@@ -911,6 +911,55 @@ export function releaseContainmentHandle(
 }
 
 /**
+ * OPERATOR OVERRIDE: drop handles without quiescence proof.
+ *
+ * releaseContainmentHandle is deliberately unreachable without a proven verdict,
+ * and on a non-cgroup host a weak handle's scan-clean is never a boundary proof
+ * — so after one mojo session runs and closes there, its handle (and with it the
+ * whole-machine device-isolation `activation_blocked` 409) persists FOREVER,
+ * with no operational path out short of hand-editing the ledger JSON. An
+ * `unprovable` handle is like that by design. Both are correct fail-closed
+ * defaults and both still need an explicit, auditable exit.
+ *
+ * This is that exit, and only for a human operator (the `botmux mojo-containment
+ * revoke` command): it removes the named handles while logging exactly what was
+ * dropped, so the decision that "these trees are acceptable to forget" is a
+ * recorded human judgement, never something the runtime can reach on its own.
+ * Nothing in daemon/worker code may call this.
+ */
+export function revokeContainmentHandles(
+    sessionId: string,
+    opts: { handleKey?: string; dataDir?: string } = {},
+): { removed: ContainmentHandle[]; remaining: ContainmentHandle[] } {
+    const path = filePath(opts.dataDir);
+    mkdirSync(dirname(path), { recursive: true });
+    let removed: ContainmentHandle[] = [];
+    let remaining: ContainmentHandle[] = [];
+    withFileLockSync(path, () => {
+        const data = readStrict(opts.dataDir);
+        const before = data.sessions[sessionId] ?? [];
+        removed = opts.handleKey === undefined
+            ? before
+            : before.filter(h => containmentHandleKey(h) === opts.handleKey);
+        remaining = opts.handleKey === undefined
+            ? []
+            : before.filter(h => containmentHandleKey(h) !== opts.handleKey);
+        if (removed.length === 0) return;
+        if (remaining.length === 0) delete data.sessions[sessionId];
+        else data.sessions[sessionId] = remaining;
+        writeStrict(data, opts.dataDir);
+    });
+    for (const handle of removed) {
+        logger.warn(
+            `[mojo] OPERATOR REVOCATION: containment handle ${containmentHandleKey(handle)} for `
+            + `session ${sessionId} was dropped WITHOUT quiescence proof. Any surviving subtree `
+            + 'of that turn is no longer tracked; its device-isolation blocker is gone.',
+        );
+    }
+    return { removed, remaining };
+}
+
+/**
  * Hand every outstanding handle of a session to a new worker generation.
  *
  * Inheritance is a UNION and it is unconditional: replacement does not prove

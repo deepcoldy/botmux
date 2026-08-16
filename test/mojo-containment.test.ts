@@ -150,6 +150,82 @@ describe('containment handle durability', () => {
     });
 });
 
+describe('operator revocation is the ONLY unproven exit (P1-3)', () => {
+    it('revokes every handle of a session and clears its ledger entry', async () => {
+        // A weak handle on a non-cgroup host never produces a boundary proof, and
+        // an unprovable handle never releases by design — so without this exit the
+        // device-isolation blocker (whole-machine activation_blocked 409) was
+        // permanent, with hand-editing the ledger JSON as the only way out.
+        const { revokeContainmentHandles } = await import('../src/core/mojo-containment.js');
+        const dataDir = freshDataDir();
+        recordContainmentHandle(weak(), dataDir);
+        recordContainmentHandle(weak({ rootPid: 5151, startTime: 1001 }), dataDir);
+
+        const { removed, remaining } = revokeContainmentHandles('sess-1', { dataDir });
+
+        expect(removed).toHaveLength(2);
+        expect(remaining).toHaveLength(0);
+        expect(hasUnprovenContainment('sess-1', dataDir)).toBe(false);
+        expect(containmentSessionIds(dataDir)).toEqual([]);
+    });
+
+    it('revokes only the named handle when a key is given', async () => {
+        const { revokeContainmentHandles } = await import('../src/core/mojo-containment.js');
+        const { containmentHandleKey } = await import('../src/core/mojo-containment.js');
+        const dataDir = freshDataDir();
+        const keep = weak();
+        const drop = weak({ rootPid: 5151, startTime: 1001 });
+        recordContainmentHandle(keep, dataDir);
+        recordContainmentHandle(drop, dataDir);
+
+        const { removed, remaining } = revokeContainmentHandles('sess-1', {
+            dataDir,
+            handleKey: containmentHandleKey(drop),
+        });
+
+        expect(removed.map(h => containmentHandleKey(h))).toEqual([containmentHandleKey(drop)]);
+        expect(remaining.map(h => containmentHandleKey(h))).toEqual([containmentHandleKey(keep)]);
+        expect(hasUnprovenContainment('sess-1', dataDir)).toBe(true);
+    });
+
+    it('is a no-op (and says so) for an unknown session or key', async () => {
+        const { revokeContainmentHandles } = await import('../src/core/mojo-containment.js');
+        const dataDir = freshDataDir();
+        recordContainmentHandle(weak(), dataDir);
+        expect(revokeContainmentHandles('sess-unknown', { dataDir }).removed).toHaveLength(0);
+        expect(revokeContainmentHandles('sess-1', { dataDir, handleKey: 'tree:no:such:key' }).removed)
+            .toHaveLength(0);
+        expect(hasUnprovenContainment('sess-1', dataDir)).toBe(true);
+    });
+
+    it('the command surface refuses without --yes and revokes with it', async () => {
+        const { runMojoContainmentCommand } = await import('../src/core/mojo-containment-command.js');
+        const dataDir = freshDataDir();
+        recordContainmentHandle(weak(), dataDir);
+        const out: string[] = [];
+        const err: string[] = [];
+        const deps = { dataDir, stdout: (l: string) => out.push(l), stderr: (l: string) => err.push(l) };
+
+        expect(runMojoContainmentCommand(['revoke', 'sess-1'], deps)).toBe(1);
+        expect(hasUnprovenContainment('sess-1', dataDir)).toBe(true);
+        expect(err.join('\n')).toMatch(/--yes/);
+
+        expect(runMojoContainmentCommand(['revoke', 'sess-1', '--yes'], deps)).toBe(0);
+        expect(hasUnprovenContainment('sess-1', dataDir)).toBe(false);
+        expect(out.join('\n')).toMatch(/已撤销/);
+    });
+
+    it('the list surface names every outstanding handle', async () => {
+        const { runMojoContainmentCommand } = await import('../src/core/mojo-containment-command.js');
+        const dataDir = freshDataDir();
+        recordContainmentHandle(weak(), dataDir);
+        const out: string[] = [];
+        expect(runMojoContainmentCommand(['list'], { dataDir, stdout: (l) => out.push(l) })).toBe(0);
+        expect(out.join('\n')).toContain('sess-1');
+        expect(out.join('\n')).toContain(`tree:${BOOT}:4242:999`);
+    });
+});
+
 describe('release requires proof', () => {
     it('refuses to release on an UNPROVEN verdict, keeping the session blocked', () => {
         const dataDir = freshDataDir();
