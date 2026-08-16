@@ -653,10 +653,11 @@ describe('inherited signalling is gated by what each fact licenses', () => {
       pid: 9100, name: 'escaped', state: 'S', pgid: 9100, startTime: 654,
       environ: 'PATH=/bin\0BOTMUX_MOJO_TREE_NONCE=nonce-escaped\0',
     });
-    recordContainmentHandle({
+    const handle = {
       kind: 'tree-identity', sessionId, generation: 0,
       rootPid: 9000, bootId: proc.bootId, startTime: 654, nonce: 'nonce-escaped',
-    });
+    } as const;
+    recordContainmentHandle(handle);
 
     const sent: number[] = [];
     const realKill = process.kill.bind(process);
@@ -670,7 +671,9 @@ describe('inherited signalling is gated by what each fact licenses', () => {
         protected get procRoot(): string { return proc.path; }
       }
       const backend = new FakeProc({ model: 'default' } as never, sessionId);
-      backend['signalInheritedTree'](9000, false);
+      // P0-3: the tree is addressed through ITS handle (recorded identity + own
+      // nonce), never through a bare pid and the backend's adopted nonce.
+      backend['signalInheritedTree'](handle, false);
       // The escapee must be signalled individually, which is the only way to reach it.
       expect(sent).toContain(9100);
     } finally {
@@ -684,7 +687,17 @@ describe('inherited signalling is gated by what each fact licenses', () => {
     // be sent ONLY when the recorded identity still verifies.
     const sessionId = 'sess-group-gate';
     const proc = syntheticProcRoot({ parent: dataDir, name: 'proc-group-gate' });
-    proc.addProcess({ pid: 8000, state: 'S', pgid: 8000, startTime: 321 });
+    // The live process wears the recorded pid but a DIFFERENT starttime — a
+    // recycled root. It still carries the tree nonce so per-member attribution
+    // (the only signal a failed identity leaves) can claim it.
+    proc.addProcess({
+      pid: 8000, state: 'S', pgid: 8000, startTime: 321,
+      environ: 'PATH=/bin\0BOTMUX_MOJO_TREE_NONCE=nonce-group-gate\0',
+    });
+    const handle = {
+      kind: 'tree-identity', sessionId, generation: 0,
+      rootPid: 8000, bootId: proc.bootId, startTime: 999, nonce: 'nonce-group-gate',
+    } as const;
 
     const sent: number[] = [];
     const realKill = process.kill.bind(process);
@@ -698,10 +711,11 @@ describe('inherited signalling is gated by what each fact licenses', () => {
         protected get procRoot(): string { return proc.path; }
       }
       const backend = new FakeProc({ model: 'default' } as never, sessionId);
-      backend['signalInheritedTree'](8000, false);
+      backend['signalInheritedTree'](handle, false);
       // No NEGATED target may appear: that would be the group kill.
       expect(sent.filter(p => p < 0)).toEqual([]);
-      // The member itself is still signalled individually.
+      // The member itself is still signalled individually — claimed by the env
+      // nonce, the one signal a recycled root pid cannot forge away.
       expect(sent).toContain(8000);
     } finally {
       spy.mockRestore();
