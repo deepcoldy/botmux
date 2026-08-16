@@ -77,6 +77,15 @@ echo '{"type":"result","status":"ok","result":"ok","session_id":"sid-residual","
     // The handover invariant. A residual close does not latch the fence, so this
     // must be refused by the teardown itself.
     expect(backend.write('a turn after a residual close')).toBe(false);
+    // The DISCRIMINATING assertion. The line above is satisfied by `closing`, which
+    // the residual path never resets, so it holds even if `killed` was never set --
+    // it cannot observe that guard at all. `killed`'s real job here is to make a
+    // later abort a NO-OP: abortDestroySession() returns early on `killed`, and the
+    // residual path deliberately does not latch `admissionFenced`, so without
+    // `killed` the abort falls through and clears `closing`, re-opening writes on a
+    // session that still has an unenumerable credentialed subtree.
+    await backend.abortDestroySession();
+    expect(backend.write('a turn after aborting a residual close')).toBe(false);
   }, 20_000);
 
   it('does not mark a normally-proven close as residual', async () => {
