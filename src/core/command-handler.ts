@@ -3234,12 +3234,14 @@ export async function handleCommand(
           const { buildRelayPickerCard } = await import('../im/lark/card-builder.js');
           // ── Ephemeral (仅邀请者可见) picker ────────────────────────────────
           // The picker exposes session metadata — title + source-chat name — to
-          // everyone who can see the message. When the bot runs in privateCard
-          // mode we hide it: send the picker as an ephemeral card visible only to
-          // the invoker.
+          // everyone who can see the message. There is NO benefit to showing it
+          // publicly: the invoker is always the owner (每张菜单 owner-only，别人点
+          // 会被拒), so a public picker only leaks his session list to the whole
+          // group. We therefore default it to private — decoupled from the
+          // `privateCard` config, which continues to gate ONLY /card & /close.
           //
-          // Gate on group + privateCard + **chat-scope**. The chat-scope clause
-          // is load-bearing: the ephemeral API (`ephemeral/v1/send`) takes a
+          // Gate on group + **chat-scope**. The chat-scope clause is
+          // load-bearing: the ephemeral API (`ephemeral/v1/send`) takes a
           // `chat_id` only — it has NO thread/root anchor — so a thread-scope
           // target (话题群 / 话题 inside a 普通群 / new-topic·shared) can't keep the
           // card in its 话题. A 话题群 rejects with 18053 (→ fall back below), but
@@ -3248,12 +3250,11 @@ export async function handleCommand(
           // guards against with a REGRESSION test; PR #164 was the original live
           // fix. Per 申晗 (2026-07-29): 话题内公开可接受 — so thread-scope pickers
           // stay on the visible in-thread reply (public card in the 话题), and
-          // ephemeral is scoped to flat 普通群 only, mirroring /card & /close
-          // private cards. p2p has no ephemeral option; an unexpected reject
-          // (18053 etc.) still falls back to the visible reply below.
+          // ephemeral is scoped to flat 普通群 only. p2p has no ephemeral option;
+          // an unexpected reject (18053 etc.) still falls back to the visible
+          // reply below.
           const privatePicker = targetChatType === 'group'
-            && targetScope === 'chat'
-            && getBot(myAppId).config.privateCard === true;
+            && targetScope === 'chat';
           const card = buildRelayPickerCard(
             entries, targetChatId, targetAnchor, operatorOpenId, loc, undefined,
             targetScope, targetChatType, privatePicker ? 'private' : 'public',
