@@ -33,6 +33,14 @@ let procRoot: string;
 const NONCE = 'botmux-mojo-deadbeef';
 const BOOT_ID = '11111111-2222-3333-4444-555555555555';
 
+/**
+ * The identity recorded for the fixture turn root (pid 100, starttime 1000).
+ * PGID-based claiming requires it since P0-3: a bare remembered pid must never
+ * pull a (possibly recycled) process group into a scan whose members get
+ * SIGKILLed by consumers.
+ */
+const ID100 = { pid: 100, bootId: BOOT_ID, starttime: 1000 };
+
 /** 18 leading fields then starttime, matching the real field-22 layout. */
 function statLine(
   pid: number, comm: string, ppid: number, pgid: number, starttime: number, state = 'S',
@@ -62,7 +70,12 @@ function writeBootId(value = BOOT_ID): void {
   writeFileSync(join(procRoot, 'sys', 'kernel', 'random', 'boot_id'), `${value}\n`);
 }
 
-beforeEach(() => { procRoot = mkdtempSync(join(tmpdir(), 'fake-proc-')); });
+beforeEach(() => {
+  procRoot = mkdtempSync(join(tmpdir(), 'fake-proc-'));
+  // Every fixture gets a boot id so ID100 can verify; individual tests overwrite
+  // it when exercising boot-id mismatches.
+  writeBootId();
+});
 afterEach(() => { rmSync(procRoot, { recursive: true, force: true }); });
 
 describe('scanMojoTree enumeration', () => {
@@ -73,7 +86,7 @@ describe('scanMojoTree enumeration', () => {
     proc(200, { ppid: 1, pgid: 200, env: `PATH=/bin\0${MOJO_TREE_NONCE_ENV}=${NONCE}\0` });
     proc(300, { ppid: 1, pgid: 300, env: 'PATH=/bin\0' });                      // unrelated
 
-    const scan = scanMojoTree(100, NONCE, { procRoot });
+    const scan = scanMojoTree(100, NONCE, { procRoot, rootIdentity: ID100 });
     expect(scan.ok).toBe(true);
     if (!scan.ok) return;
     expect(scan.members.map(m => m.pid).sort()).toEqual([100, 200]);
@@ -84,7 +97,7 @@ describe('scanMojoTree enumeration', () => {
     proc(100, { ppid: 1, pgid: 100 });
     proc(200, { ppid: 100, pgid: 200, env: '' });   // left the group, wiped its env
     proc(300, { ppid: 200, pgid: 300, env: '' });   // grandchild, same
-    const scan = scanMojoTree(100, NONCE, { procRoot });
+    const scan = scanMojoTree(100, NONCE, { procRoot, rootIdentity: ID100 });
     if (!scan.ok) throw new Error(`scan failed: ${scan.reason}`);
     expect(scan.members.map(m => m.pid).sort()).toEqual([100, 200, 300]);
   });
@@ -93,21 +106,79 @@ describe('scanMojoTree enumeration', () => {
     // The daemon must never be signalled, even if some other signal matched.
     proc(100, { ppid: 1, pgid: 100 });
     proc(999, { ppid: 100, pgid: 100, env: `${MOJO_TREE_NONCE_ENV}=${NONCE}\0` });
-    const scan = scanMojoTree(100, NONCE, { procRoot, excludePids: [999] });
+    const scan = scanMojoTree(100, NONCE, { procRoot, excludePids: [999], rootIdentity: ID100 });
     if (!scan.ok) throw new Error(`scan failed: ${scan.reason}`);
     expect(scan.members.map(m => m.pid)).not.toContain(999);
   });
 
   it('parses a comm containing spaces and a close paren', () => {
     proc(100, { ppid: 1, pgid: 100, comm: 'we ird) name' });
-    const scan = scanMojoTree(100, NONCE, { procRoot });
+    const scan = scanMojoTree(100, NONCE, { procRoot, rootIdentity: ID100 });
     if (!scan.ok) throw new Error(`scan failed: ${scan.reason}`);
     expect(scan.members.map(m => m.pid)).toEqual([100]);
   });
 
   it('reports an empty member list only when the subtree is genuinely gone', () => {
     proc(300, { ppid: 1, pgid: 300, env: 'PATH=/bin\0' });
+    const scan = scanMojoTree(100, NONCE, { procRoot, rootIdentity: ID100 });
+    if (!scan.ok) throw new Error(`scan failed: ${scan.reason}`);
+    expect(scan.members).toEqual([]);
+  });
+});
+
+describe('PGID claiming is gated on root identity (P0-3)', () => {
+  it('a recycled root pid never claims the stranger group wearing its number', () => {
+    // The turn root (pid 100, starttime 1000) was reaped; a NEW process now
+    // wears pid 100 (starttime 2000) and leads its own group with a child.
+    // Bare numeric pgid comparison used to claim both — and every consumer of
+    // this scan SIGKILLs the claimed members, so an unrelated external process
+    // group would have been taken down.
+    proc(100, { ppid: 1, pgid: 100, starttime: 2000 });
+    proc(200, { ppid: 100, pgid: 100, env: 'PATH=/bin\0' });
+    const scan = scanMojoTree(100, NONCE, { procRoot, rootIdentity: ID100 });
+    if (!scan.ok) throw new Error(`scan failed: ${scan.reason}`);
+    expect(scan.members).toEqual([]);
+  });
+
+  it('a recycled root still lets the env nonce claim true escapees', () => {
+    // Disabling pgid claims must not blind the scan to positive evidence: the
+    // nonce (and the ppid closure under it) is per-member attribution and stays.
+    proc(100, { ppid: 1, pgid: 100, starttime: 2000 });                              // stranger
+    proc(400, { ppid: 1, pgid: 400, env: `${MOJO_TREE_NONCE_ENV}=${NONCE}\0` });     // escapee
+    proc(500, { ppid: 400, pgid: 500, env: '' });                                    // scrubbed child
+    const scan = scanMojoTree(100, NONCE, { procRoot, rootIdentity: ID100 });
+    if (!scan.ok) throw new Error(`scan failed: ${scan.reason}`);
+    expect(scan.members.map(m => m.pid).sort()).toEqual([400, 500]);
+    expect(scan.members.find(m => m.pid === 400)?.via).toBe('env');
+    expect(scan.members.find(m => m.pid === 500)?.via).toBe('ppid');
+  });
+
+  it('a boot-id change disables pgid claiming even when pid and starttime match', () => {
+    writeBootId('99999999-8888-7777-6666-555555555555');
+    proc(100, { ppid: 1, pgid: 100 });
+    proc(200, { ppid: 100, pgid: 100, env: '' });
+    const scan = scanMojoTree(100, NONCE, { procRoot, rootIdentity: ID100 });
+    if (!scan.ok) throw new Error(`scan failed: ${scan.reason}`);
+    expect(scan.members).toEqual([]);
+  });
+
+  it('without a recorded identity, membership comes only from the env nonce', () => {
+    // No identity means the caller cannot prove the pid is still its process,
+    // so the scan must not trust group numbers at all.
+    proc(100, { ppid: 1, pgid: 100 });
+    proc(200, { ppid: 100, pgid: 100, env: '' });
+    proc(300, { ppid: 1, pgid: 300, env: `${MOJO_TREE_NONCE_ENV}=${NONCE}\0` });
     const scan = scanMojoTree(100, NONCE, { procRoot });
+    if (!scan.ok) throw new Error(`scan failed: ${scan.reason}`);
+    expect(scan.members.map(m => m.pid)).toEqual([300]);
+  });
+
+  it('an identity recorded for a DIFFERENT pid does not enable pgid claiming', () => {
+    proc(100, { ppid: 1, pgid: 100 });
+    const scan = scanMojoTree(100, NONCE, {
+      procRoot,
+      rootIdentity: { pid: 101, bootId: BOOT_ID, starttime: 1000 },
+    });
     if (!scan.ok) throw new Error(`scan failed: ${scan.reason}`);
     expect(scan.members).toEqual([]);
   });
@@ -128,7 +199,7 @@ describe('scanMojoTree is fail-closed', () => {
     // the member list, which is exactly how a live survivor could be missed.
     proc(100, { ppid: 1, pgid: 100 });
     proc(200, { ppid: 100, pgid: 200, stat: 'no-parens-here at all' });
-    const scan = scanMojoTree(100, NONCE, { procRoot });
+    const scan = scanMojoTree(100, NONCE, { procRoot, rootIdentity: ID100 });
     expect(scan.ok).toBe(false);
     if (scan.ok) return;
     expect(scan.failure.kind).toBe('proc-entry-unparsable');
@@ -138,7 +209,7 @@ describe('scanMojoTree is fail-closed', () => {
   it('fails the whole scan when stat has a non-numeric ppid/pgid', () => {
     proc(100, { ppid: 1, pgid: 100 });
     proc(200, { ppid: 100, pgid: 200, stat: '200 (mojo) S notanumber alsonot 0 0' });
-    const scan = scanMojoTree(100, NONCE, { procRoot });
+    const scan = scanMojoTree(100, NONCE, { procRoot, rootIdentity: ID100 });
     expect(scan.ok).toBe(false);
     if (scan.ok) return;
     expect(scan.failure.kind).toBe('proc-entry-unparsable');
@@ -153,7 +224,7 @@ describe('scanMojoTree is fail-closed', () => {
     let readable = true;
     try { readFileSync(join(procRoot, '200', 'stat'), 'utf-8'); } catch { readable = false; }
     if (readable) return;
-    const scan = scanMojoTree(100, NONCE, { procRoot });
+    const scan = scanMojoTree(100, NONCE, { procRoot, rootIdentity: ID100 });
     expect(scan.ok).toBe(false);
     if (scan.ok) return;
     expect(scan.failure.kind).toBe('proc-entry-unreadable');
@@ -165,7 +236,7 @@ describe('scanMojoTree is fail-closed', () => {
     proc(100, { ppid: 1, pgid: 100 });
     const ghost = join(procRoot, '200');
     mkdirSync(ghost, { recursive: true });   // directory with no stat/environ at all
-    const scan = scanMojoTree(100, NONCE, { procRoot });
+    const scan = scanMojoTree(100, NONCE, { procRoot, rootIdentity: ID100 });
     expect(scan.ok).toBe(true);
     if (!scan.ok) return;
     expect(scan.members.map(m => m.pid)).toEqual([100]);
@@ -175,7 +246,7 @@ describe('scanMojoTree is fail-closed', () => {
 describe('a clean scan is a diagnostic signal, not a credential boundary', () => {
   it('stamps a successful scan as diagnostic evidence', () => {
     proc(100, { ppid: 1, pgid: 100 });
-    const scan = scanMojoTree(100, NONCE, { procRoot });
+    const scan = scanMojoTree(100, NONCE, { procRoot, rootIdentity: ID100 });
     if (!scan.ok) throw new Error(`scan failed: ${scan.reason}`);
     expect(scan.evidence).toBe('diagnostic');
   });
@@ -185,14 +256,14 @@ describe('a clean scan is a diagnostic signal, not a credential boundary', () =>
     // setsid'd and scrubbed its environ, so "no members found" must not authorise
     // dropping the device-isolation blocker.
     proc(300, { ppid: 1, pgid: 300, env: 'PATH=/bin\0' });   // unrelated only
-    const q = quiescenceFromScan(scanMojoTree(100, NONCE, { procRoot }));
+    const q = quiescenceFromScan(scanMojoTree(100, NONCE, { procRoot, rootIdentity: ID100 }));
     expect(q.kind).toBe('diagnostic-clean');
     expect(q.boundaryProof).toBe(false);
   });
 
   it('reports survivors as alive without boundary proof', () => {
     proc(100, { ppid: 1, pgid: 100 });
-    const q = quiescenceFromScan(scanMojoTree(100, NONCE, { procRoot }));
+    const q = quiescenceFromScan(scanMojoTree(100, NONCE, { procRoot, rootIdentity: ID100 }));
     expect(q.kind).toBe('alive');
     expect(q.boundaryProof).toBe(false);
     if (q.kind !== 'alive') return;
@@ -216,7 +287,7 @@ describe('a clean scan is a diagnostic signal, not a credential boundary', () =>
     // not be able to reach a boundaryProof:true value by any path.
     proc(100, { ppid: 1, pgid: 100 });
     const verdicts = [
-      quiescenceFromScan(scanMojoTree(100, NONCE, { procRoot })),
+      quiescenceFromScan(scanMojoTree(100, NONCE, { procRoot, rootIdentity: ID100 })),
       quiescenceFromScan(scanMojoTree(999, NONCE, { procRoot })),
       quiescenceFromScan(scanMojoTree(100, NONCE, { procRoot: join(procRoot, 'missing') })),
       quiescenceFromScan(scanMojoTree(100, NONCE, { platform: 'darwin' })),
@@ -229,7 +300,7 @@ describe('zombies are discounted, but only a definite Z', () => {
   it('marks a Z-state member as a zombie and a live one as not', () => {
     proc(100, { ppid: 1, pgid: 100 });
     proc(200, { ppid: 100, pgid: 100, state: 'Z' });
-    const scan = scanMojoTree(100, NONCE, { procRoot });
+    const scan = scanMojoTree(100, NONCE, { procRoot, rootIdentity: ID100 });
     if (!scan.ok) throw new Error(`scan failed: ${scan.reason}`);
     expect(scan.members.find(m => m.pid === 200)?.zombie).toBe(true);
     expect(scan.members.find(m => m.pid === 100)?.zombie).toBe(false);
@@ -241,14 +312,14 @@ describe('zombies are discounted, but only a definite Z', () => {
     // blocked the close until the budget expired, every time, unrecoverably.
     proc(100, { ppid: 1, pgid: 100, state: 'Z' });
     proc(200, { ppid: 100, pgid: 100, state: 'Z' });
-    const q = quiescenceFromScan(scanMojoTree(100, NONCE, { procRoot }));
+    const q = quiescenceFromScan(scanMojoTree(100, NONCE, { procRoot, rootIdentity: ID100 }));
     expect(q.kind).toBe('diagnostic-clean');
   });
 
   it('still reports alive when one member of a mostly-zombie tree executes', () => {
     proc(100, { ppid: 1, pgid: 100, state: 'Z' });
     proc(200, { ppid: 100, pgid: 100, state: 'R' });
-    const q = quiescenceFromScan(scanMojoTree(100, NONCE, { procRoot }));
+    const q = quiescenceFromScan(scanMojoTree(100, NONCE, { procRoot, rootIdentity: ID100 }));
     expect(q.kind).toBe('alive');
     if (q.kind !== 'alive') return;
     // Only the executing pid is worth signalling; the zombie cannot act.
@@ -261,7 +332,7 @@ describe('zombies are discounted, but only a definite Z', () => {
     proc(100, { ppid: 1, pgid: 100 });
     // A stat line whose state field is empty-ish but ppid/pgid still parse.
     proc(200, { ppid: 100, pgid: 100, stat: '200 (mojo) ? 100 100 0 0' });
-    const scan = scanMojoTree(100, NONCE, { procRoot });
+    const scan = scanMojoTree(100, NONCE, { procRoot, rootIdentity: ID100 });
     if (!scan.ok) throw new Error(`scan failed: ${scan.reason}`);
     expect(scan.members.find(m => m.pid === 200)?.zombie).toBe(false);
     expect(quiescenceFromScan(scan).kind).toBe('alive');
@@ -269,7 +340,7 @@ describe('zombies are discounted, but only a definite Z', () => {
 
   it('does not treat a state merely CONTAINING Z as a zombie', () => {
     proc(100, { ppid: 1, pgid: 100, state: 'ZZ' });
-    const q = quiescenceFromScan(scanMojoTree(100, NONCE, { procRoot }));
+    const q = quiescenceFromScan(scanMojoTree(100, NONCE, { procRoot, rootIdentity: ID100 }));
     expect(q.kind).toBe('alive');
   });
 });
@@ -318,6 +389,7 @@ describe('pid identity is bound to boot id and starttime', () => {
   it('fails when the boot id is unavailable, rather than inventing one', () => {
     // Without a boot id, a persisted (pid, starttime) pair would silently survive
     // a reboot and compare equal against an unrelated process.
+    rmSync(join(procRoot, 'sys'), { recursive: true, force: true });
     proc(100, { ppid: 1, pgid: 100 });
     const read = readProcessIdentity(100, { procRoot });
     expect(read.ok).toBe(false);
@@ -410,6 +482,7 @@ describe('group signalling is gated on identity', () => {
   it('refuses to signal when the identity cannot be established at all', () => {
     // No boot id => unverifiable. Refusing is recoverable; killing the wrong
     // group is not, so the ambiguous case must not signal.
+    rmSync(join(procRoot, 'sys'), { recursive: true, force: true });
     proc(100, { ppid: 1, pgid: 100, starttime: 4242 });
     const sent: number[] = [];
     const out = signalTurnTreeGroup(

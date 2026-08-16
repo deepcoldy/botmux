@@ -536,6 +536,38 @@ describe('killWorker — with a live worker (unchanged path)', () => {
     expect(d.managedTurnOrigin).toBeUndefined();
   });
 
+  it('REFUSES unprepared live retirement for EVERY remote backend, not just riff (P0-2)', () => {
+    // The guard used to hard-code `closeFrozenType === 'riff'`, so a live Mojo
+    // worker hit the generic path: a request-less `close` IPC whose worker-side
+    // legacy handler answered with destroySession() — `mojo session cancel` —
+    // silently and irreversibly cancelling the remote session on /cd cold
+    // restarts, crash-loops, collision losers and restore/upgrade.
+    for (const remote of ['riff', 'mojo'] as const) {
+      vi.clearAllMocks();
+      const send = vi.fn();
+      const d = ds({ worker: { killed: false, send, once: vi.fn() } as any }, { backendType: remote });
+      killWorker(d);
+      expect(send, remote).not.toHaveBeenCalled();
+      // Worker and remote-task lineage are preserved for a prepared close.
+      expect(d.worker, remote).not.toBeNull();
+    }
+  });
+
+  it('still retires a live remote worker when the prepare/commit requestId is carried (P0-2)', () => {
+    for (const remote of ['riff', 'mojo'] as const) {
+      vi.clearAllMocks();
+      const send = vi.fn();
+      const d = ds({
+        worker: { killed: false, send, once: vi.fn() } as any,
+        remoteCloseState: { requestId: 'req-1' } as any,
+      }, { backendType: remote });
+      killWorker(d, { remoteCloseCommitRequestId: 'req-1' });
+      expect(send, remote).toHaveBeenCalledWith({ type: 'close_commit', requestId: 'req-1' });
+      expect(d.worker, remote).toBeNull();
+      expect(d.remoteCloseState, remote).toBeUndefined();
+    }
+  });
+
 });
 
 describe('teardownAuthoritativePersistentBackingBeforeClose', () => {

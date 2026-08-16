@@ -17040,11 +17040,13 @@ process.on('message', async (raw: unknown) => {
       // destroySession kills tmux session permanently; kill() only detaches.
       // Remote destroySession is an asynchronous cancellation. Explicit close
       // must therefore use prepare/commit: an immediate process.exit would cut
-      // off the request and leave the remote agent running. A request-less Mojo
-      // close is retained for non-explicit lifecycle teardown, whose legacy
-      // best-effort path below still owns the bounded destroy-and-exit behavior.
-      if (effectiveBackendType === 'riff'
-          || (effectiveBackendType === 'mojo' && msg.requestId)) {
+      // off the request and leave the remote agent running. A request-less
+      // close on ANY remote backend is refused outright: the legacy path below
+      // calls destroySession() — for Mojo that is `mojo session cancel` — so
+      // letting a generic lifecycle teardown fall through there irreversibly
+      // cancelled the remote session with no close_result to report ok:false
+      // or residuals. Remote retirement must always carry a requestId.
+      if (isRemoteBackendType(effectiveBackendType)) {
         if (!msg.requestId) {
           log(`Refused unsafe request-less ${effectiveBackendType} close; explicit close requires prepare/commit`);
           break;
@@ -17142,9 +17144,10 @@ process.on('message', async (raw: unknown) => {
       stopScreenshotLoop();
       stopBridgeWatcher();
       stopCodexBridge();
-      // Local close destroys persistent owned sessions. Request-less Mojo also
-      // enters here for non-explicit lifecycle teardown; Riff is always fenced
-      // by the remote branch above.
+      // Local close destroys persistent owned sessions. Remote backends never
+      // reach here: the branch above fences them all (request-less remote close
+      // is refused; with a requestId it goes through prepare/commit), so
+      // destroySession() below only ever tears down local backing sessions.
       const closeTeardown = backend?.destroySession?.();
       if (closeTeardown && typeof (closeTeardown as Promise<void>).then === 'function') {
         try { await Promise.race([closeTeardown, new Promise((r) => setTimeout(r, 22_000))]); }

@@ -2443,13 +2443,20 @@ export function killWorker(
 ): void {
   const closeFrozenType = ds.initConfig?.backendType ?? ds.session.backendType;
   if (ds.worker && !ds.worker.killed
-      && closeFrozenType === 'riff'
+      && closeFrozenType !== undefined
+      && isRemoteBackendType(closeFrozenType)
       && !opts.remoteCloseCommitRequestId) {
-    // A generic synchronous retirement cannot safely detach Riff. An accepted
-    // create/follow-up may still be waiting for the task id that becomes the
-    // only durable lineage anchor.
+    // A generic synchronous retirement cannot safely detach ANY remote backend,
+    // not just Riff. An accepted create/follow-up may still be waiting for the
+    // task id that becomes the only durable lineage anchor — and for Mojo the
+    // worker's legacy close path used to answer a request-less `close` with
+    // `mojo session cancel`, so every generic retirement (/cd cold restart,
+    // crash-loop, collision loser, restore/upgrade) silently and irreversibly
+    // cancelled the remote session with no close_result to carry the outcome.
+    // Only the prepare/commit flow (remoteCloseCommitRequestId) may retire a
+    // live remote worker.
     logger.error(
-      `[${tag(ds)}] Refused unprepared live Riff worker retirement; `
+      `[${tag(ds)}] Refused unprepared live ${closeFrozenType} worker retirement; `
       + 'preserving worker and remote-task lineage',
     );
     return;

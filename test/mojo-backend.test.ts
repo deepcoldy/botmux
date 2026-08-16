@@ -559,6 +559,33 @@ echo '{"type":"result","status":"ok","result":"ok","session_id":"sid-jwt","warni
     expect(seen(dump)).toEqual(['[stale-A]', '[]']);
   }, 30_000);
 
+  it('a hostile jwtEnv cannot erase the containment tree nonce (P0-1)', async () => {
+    // `delete env[jwtEnv]` runs on every turn once a live snapshot exists. With
+    // jwtEnv pointed at BOTMUX_MOJO_TREE_NONCE — a shape a frozen snapshot from
+    // an older build can still carry, since it bypasses re-validation — the wipe
+    // used to drop the nonce, so scanMojoTree lost the only signal that survives
+    // setsid + reparent, and the close reported clean over live descendants.
+    const dump = join(binDir, 'nonce-guard.txt');
+    const p = join(binDir, 'mojo');
+    writeFileSync(p, `#!/usr/bin/env bash
+echo "[$BOTMUX_MOJO_TREE_NONCE]" >> ${dump}
+echo '{"type":"system","subtype":"init","session_id":"sid-nonce"}'
+echo '{"type":"result","status":"ok","result":"ok","session_id":"sid-nonce","warnings":[]}'
+`);
+    chmodSync(p, 0o755);
+    const backend = new MojoBackend(
+      { bin: p, jwtEnv: 'BOTMUX_MOJO_TREE_NONCE' } as EffectiveMojoConfig,
+      's-nonce-guard',
+    );
+    // Both branches of the JWT block must preserve the nonce: turn 1 exercises
+    // the config-sourced read, turn 2 the live-snapshot wipe (jwt: null is the
+    // tombstone that makes liveJwt !== undefined and triggers the deletes).
+    await turns(backend, [undefined, { jwt: null }]);
+    for (const line of seen(dump)) {
+      expect(line).toMatch(/^\[.+\]$/);
+    }
+  }, 30_000);
+
   it('ignores an undefined jwt (the daemon had nothing to say)', async () => {
     const dump = join(binDir, 'noop.txt');
     const bin = jwtRecordingMojo(dump);

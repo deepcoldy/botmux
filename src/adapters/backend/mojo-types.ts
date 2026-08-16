@@ -763,7 +763,7 @@ const MOJO_FIELD_VALIDATORS: Readonly<Record<keyof MojoConfig, (v: unknown) => s
     stream: strictBoolean,
     systemPrompt: plainString,
     jwt: nonEmptyString,
-    jwtEnv: envVarName,
+    jwtEnv: jwtEnvVarName,
     baseUrl: httpUrl,
     localDaemon: strictBoolean,
     ppeEnv: nonEmptyString,
@@ -798,6 +798,29 @@ function envVarName(v: unknown): string | undefined {
     return /^[A-Za-z_][A-Za-z0-9_]*$/.test(v)
         ? undefined
         : 'must be a valid environment variable name';
+}
+
+/**
+ * `jwtEnv` is not just a name lookup: buildEnv() DELETES `env[jwtEnv]` before
+ * re-deriving the credential, so the name doubles as a deletion primitive. A
+ * shape-only check let `jwtEnv: "BOTMUX_MOJO_TREE_NONCE"` erase the containment
+ * tree nonce — the only signal that survives setsid + reparent — turning the
+ * termination proof blind while every gate still reported success. Reserved
+ * botmux keys and control-plane keys are therefore rejected by NAME, with the
+ * same delegation (not a copied list) the env-map validator uses.
+ */
+function jwtEnvVarName(v: unknown): string | undefined {
+    const shape = envVarName(v);
+    if (shape) return shape;
+    const key = v as string;
+    if (isReservedPerBotEnvKey(key)) {
+        return `must not name ${key} — botmux owns this variable (session identity, `
+            + 'CLI data root, or bot credential), and buildEnv() would delete it';
+    }
+    if ((MOJO_CONTROL_ENV_KEYS as readonly string[]).includes(key)) {
+        return `must not name ${key} — it is control-plane state frozen per session`;
+    }
+    return undefined;
 }
 
 function httpUrl(v: unknown): string | undefined {

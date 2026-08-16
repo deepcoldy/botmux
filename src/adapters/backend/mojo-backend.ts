@@ -60,7 +60,7 @@ import {
     type ContainmentReleaseDecision,
     weakHandleRootStillOriginal,
 } from '../../core/mojo-containment.js';
-import type { ContainmentHandle, QuiescenceVerdict } from '../../core/mojo-containment.js';
+import type { ContainmentHandle, QuiescenceVerdict, WeakContainmentHandle } from '../../core/mojo-containment.js';
 import {
     MOJO_TREE_NONCE_ENV,
     terminationOutcomeFromQuiescence,
@@ -715,7 +715,18 @@ export class MojoBackend implements SessionBackend {
         }
 
         const look = (): TurnQuiescence => quiescenceFromScan(
-            scanMojoTree(rootPid, this.treeNonce, { procRoot: this.procRoot, excludePids }),
+            // turnIdentity was bound at spawn, while the pid was guaranteed to be
+            // this child. It gates PGID-based claiming inside the scan: without a
+            // verified root, only the env nonce (positive evidence of membership)
+            // may claim, so a recycled root pid can never pull a stranger's
+            // process group into a scan whose members get SIGKILLed.
+            scanMojoTree(rootPid, this.treeNonce, {
+                procRoot: this.procRoot,
+                excludePids,
+                ...(this.turnIdentity && this.turnIdentity.pid === rootPid
+                    ? { rootIdentity: this.turnIdentity }
+                    : {}),
+            }),
         );
 
         const settle = async (deadlineMs: number): Promise<TurnQuiescence> => {
@@ -880,8 +891,9 @@ export class MojoBackend implements SessionBackend {
                         + 'signalled; enumerated members are still signalled individually',
                     );
                 }
-                this.signalInheritedTree(handle.rootPid, rootStillOriginal);
-            }            const verdict = proveContainmentQuiescent(handle, {
+                this.signalInheritedTree(handle, rootStillOriginal);
+            }
+            const verdict = proveContainmentQuiescent(handle, {
                 procRoot: this.procRoot,
                 // `scanned: false` must NEVER collapse into `pids: []`: an empty pid
                 // list reads as "nothing alive", which is precisely the fail-open the
@@ -890,6 +902,9 @@ export class MojoBackend implements SessionBackend {
                     const scan = scanMojoTree(weak.rootPid, weak.nonce, {
                         procRoot: this.procRoot,
                         excludePids: this.selfPids(),
+                        // The handle's RECORDED identity, so PGID claiming stays
+                        // disabled once the pid stops being the original process.
+                        rootIdentity: { pid: weak.rootPid, bootId: weak.bootId, starttime: weak.startTime },
                     });
                     return scan.ok
                         // Zombies are discounted here for the SAME reason the
@@ -971,35 +986,45 @@ export class MojoBackend implements SessionBackend {
      * Best effort by design: this only creates the CHANCE for the proof below to
      * succeed. If anything survives, the proof still refuses the close.
      */
-    private signalInheritedTree(rootPid: number, rootStillOriginal: boolean): void {
+    private signalInheritedTree(handle: WeakContainmentHandle, rootStillOriginal: boolean): void {
         logger.warn(
-            `[mojo] signalling inherited turn subtree rooted at ${rootPid}: this generation owns its `
-            + 'cleanup, and proving it without signalling would leave the session permanently unclosable',
+            `[mojo] signalling inherited turn subtree rooted at ${handle.rootPid}: this generation owns `
+            + 'its cleanup, and proving it without signalling would leave the session permanently unclosable',
         );
-        // The GROUP signal is the dangerous one: it is negated, so it reaches every
-        // process in the group. It therefore requires the recorded root identity to
-        // still verify, or a recycled pid would take down a stranger's whole group.
+        // The RECORDED identity, never a fresh read: re-reading the pid here and
+        // passing that as "expected" made signalTurnTreeGroup compare a value to
+        // itself, so the whole verification collapsed to a race — a pid recycled
+        // between the caller's gate and this signal would still have its (new)
+        // group taken down. signalTurnTreeGroup re-reads internally and refuses
+        // on mismatch against the identity recorded when the tree was spawned.
         if (rootStillOriginal) {
-            const identity = readProcessIdentity(rootPid, { procRoot: this.procRoot });
-            // Re-read immediately before the kill, so the pid cannot have been
-            // recycled between the caller's gate and this signal.
-            if (identity.ok) {
-                signalTurnTreeGroup(identity.identity, 'SIGKILL', { procRoot: this.procRoot });
-            }
+            signalTurnTreeGroup(
+                { pid: handle.rootPid, bootId: handle.bootId, starttime: handle.startTime },
+                'SIGKILL',
+                { procRoot: this.procRoot },
+            );
         }
         // Per-member signals stay safe even when the recorded root is long gone, and
         // this is the case that actually matters: a descendant that called setsid
-        // OUTLIVES its parent, so the root-identity gate can never pass for it. Each
-        // pid here was just enumerated as carrying THIS session's env nonce (or as a
-        // descendant of something that does), which is positive evidence of
-        // membership, and the target is a single positive pid rather than a negated
-        // group -- so even a raced pid cannot drag an unrelated group down with it.
+        // OUTLIVES its parent, so the root-identity gate can never pass for it.
+        //
+        // Two properties make each kill attributable:
+        //   * HANDLE nonce, not this.treeNonce: the constructor only adopts the
+        //     FIRST inherited handle's nonce, so scanning a later handle with the
+        //     adopted nonce found nothing by env at all — its tree was only ever
+        //     reachable through fragile pgid number collisions.
+        //   * the recorded root identity gates PGID claiming inside the scan, so
+        //     every member here was claimed via the env nonce (or as a descendant
+        //     of one), which is positive evidence of THIS tree's membership — and
+        //     the target is a single positive pid rather than a negated group, so
+        //     even a raced pid cannot drag an unrelated group down with it.
         //
         // Without this, an escaped survivor was re-proven alive on every retry and
         // never signalled, so the session could never be closed at all.
-        const scan = scanMojoTree(rootPid, this.treeNonce, {
+        const scan = scanMojoTree(handle.rootPid, handle.nonce, {
             procRoot: this.procRoot,
             excludePids: this.selfPids(),
+            rootIdentity: { pid: handle.rootPid, bootId: handle.bootId, starttime: handle.startTime },
         });
         if (!scan.ok) return;
         for (const member of scan.members) {
@@ -1775,11 +1800,6 @@ export class MojoBackend implements SessionBackend {
             botEnv: this.spawnOpts?.injectEnv,
             mojoEnv: this.config.env,
         });
-        // Termination authority, not configuration: this value is what makes the
-        // subtree enumerable in /proc after a descendant escapes the process group
-        // via setsid. It carries no privilege and is safe to expose to the child.
-        // Set LAST so neither bots.json `env` nor `mojo.env` can shadow it.
-        env[MOJO_TREE_NONCE_ENV] = this.treeNonce;
         // Prefer an injected JWT so the bot never depends on an interactive
         // `mojo auth login` on the host. Verified: X_JWT_TOKEN makes
         // `mojo auth status --json` report mode=jwt / source=env.
@@ -1833,6 +1853,17 @@ export class MojoBackend implements SessionBackend {
         env.AGENT_LOCAL_DAEMON = this.config.localDaemon === true ? '1' : '0';
         // Never let an interactive upgrade prompt pollute the NDJSON stream.
         env.MOJO_NO_UPDATE = '1';
+        // Termination authority, not configuration: this value is what makes the
+        // subtree enumerable in /proc after a descendant escapes the process group
+        // via setsid. It carries no privilege and is safe to expose to the child.
+        //
+        // Asserted LAST, as a hard invariant of this function: not only can no
+        // config layer shadow it, no DELETE above can erase it either. Config
+        // validation already rejects a `jwtEnv` naming a reserved key, but frozen
+        // snapshots written by older builds bypass re-validation, and a
+        // `delete env[jwtKey]` that hit this name would blind scanMojoTree to
+        // every escaped descendant while the close still reported clean.
+        env[MOJO_TREE_NONCE_ENV] = this.treeNonce;
         return env;
     }
 
@@ -2043,7 +2074,12 @@ export function proveWorkerlessLocalSubtree(
         const verdict: QuiescenceVerdict = proveContainmentQuiescent(handle, {
             procRoot,
             scan: weak => {
-                const scan = scanMojoTree(weak.rootPid, weak.nonce, { procRoot, excludePids });
+                const scan = scanMojoTree(weak.rootPid, weak.nonce, {
+                    procRoot,
+                    excludePids,
+                    // Recorded identity gates PGID claiming, as on the teardown path.
+                    rootIdentity: { pid: weak.rootPid, bootId: weak.bootId, starttime: weak.startTime },
+                });
                 // `scanned: false` must not collapse into `pids: []`: that reads as
                 // "nothing alive" and would hand back a proof we do not have.
                 return scan.ok

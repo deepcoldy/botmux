@@ -268,6 +268,7 @@ vi.mock('../src/core/session-activity.js', () => ({
 
 import { restoreActiveSessions, closeCliMismatchedSessionsForBot, resumeSession,
 } from '../src/core/session-manager.js';
+import { getAllBots, getBot } from '../src/bot-registry.js';
 import { TmuxBackend } from '../src/adapters/backend/tmux-backend.js';
 import { HerdrBackend } from '../src/adapters/backend/herdr-backend.js';
 import { ZmxBackend } from '../src/adapters/backend/zmx-backend.js';
@@ -324,6 +325,78 @@ function makeActivePersistentSession(rootMessageId: string, backendType: 'tmux' 
   sessionStore.updateSession(s);
   return s; // left active
 }
+
+describe('restoreActiveSessions — mojo identity freeze attribution (P0-4)', () => {
+  // The module-level bot-registry mock serves every other describe; stash its
+  // implementations so these tests can swap in their own without leaking.
+  let origGetAllBots: (() => unknown) | undefined;
+  let origGetBot: (() => unknown) | undefined;
+  beforeEach(() => {
+    origGetAllBots = vi.mocked(getAllBots).getMockImplementation();
+    origGetBot = vi.mocked(getBot).getMockImplementation();
+  });
+  afterEach(() => {
+    vi.mocked(getAllBots).mockImplementation(origGetAllBots as never);
+    vi.mocked(getBot).mockImplementation(origGetBot as never);
+  });
+
+  it('never guesses a tenant for a legacy row without larkAppId when several bots are registered', async () => {
+    // Pre-fix, restore fell back to getAllBots()[0]: with a mojo bot in slot 0,
+    // an unattributed legacy row (no backendType/cliId stamped) was classified
+    // mojo AGAINST THAT BOT — its riff lineage parked into
+    // mojoQuarantinedLineage and bot[0]'s tenant identity frozen on. The freeze
+    // is idempotent, so one wrong boot locked the misbinding in durably.
+    vi.mocked(getAllBots).mockReturnValue([
+      { config: { larkAppId: 'app_mojo', backendType: 'mojo', mojo: { cloud: true } } },
+      { config: { larkAppId: 'app_test', cliId: 'claude-code' } },
+    ] as never);
+    vi.mocked(getBot).mockReturnValue({
+      config: { larkAppId: 'app_mojo', backendType: 'mojo', mojo: { cloud: true } },
+      botName: 'MojoBot', botOpenId: 'ou_mojo', resolvedAllowedUsers: [],
+    } as never);
+    const s = sessionStore.createSession('oc_chat1', 'om_legacy_no_app', 'Topic', 'group');
+    // A pre-larkAppId row: nothing stamped, only a remote lineage left behind.
+    s.larkAppId = undefined;
+    s.backendType = undefined;
+    s.cliId = undefined;
+    s.riffParentTaskId = 'legacy-task-1';
+    sessionStore.updateSession(s);
+    sessionStore.init();
+    const map = new Map<string, DaemonSession>();
+    wp.registry = map;
+
+    await restoreActiveSessions(map);
+
+    const after = sessionStore.getSession(s.sessionId);
+    // Unfrozen (`undefined` keeps meaning "predates this field"), lineage kept.
+    expect(after?.mojoIdentity).toBeUndefined();
+    expect(after?.mojoQuarantinedLineage).toBeUndefined();
+    expect(after?.riffParentTaskId).toBe('legacy-task-1');
+  });
+
+  it('still freezes via the single registered bot when attribution is unambiguous', async () => {
+    vi.mocked(getAllBots).mockReturnValue([
+      { config: { larkAppId: 'app_mojo', backendType: 'mojo', mojo: { cloud: true } } },
+    ] as never);
+    vi.mocked(getBot).mockReturnValue({
+      config: { larkAppId: 'app_mojo', backendType: 'mojo', mojo: { cloud: true } },
+      botName: 'MojoBot', botOpenId: 'ou_mojo', resolvedAllowedUsers: [],
+    } as never);
+    const s = sessionStore.createSession('oc_chat1', 'om_legacy_single_bot', 'Topic', 'group');
+    s.larkAppId = undefined;
+    s.backendType = undefined;
+    s.cliId = undefined;
+    sessionStore.updateSession(s);
+    sessionStore.init();
+    const map = new Map<string, DaemonSession>();
+    wp.registry = map;
+
+    await restoreActiveSessions(map);
+
+    // One bot means the row can only belong to it: frozen, not left migratable.
+    expect(sessionStore.getSession(s.sessionId)?.mojoIdentity).toEqual({ cloud: true });
+  });
+});
 
 describe('restoreActiveSessions — persistent-backend zombie-close decision', () => {
   it('finishes a durable prepared Mojo close without registering or re-cancelling', async () => {

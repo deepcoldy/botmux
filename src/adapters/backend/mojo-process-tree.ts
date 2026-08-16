@@ -492,12 +492,29 @@ function readProcTable(
  * never be signalled): the daemon shares neither the nonce nor the group, but an
  * explicit guard is cheaper than trusting that invariant while sending SIGKILL.
  *
+ * PGID membership (`p.pid === rootPid || p.pgid === rootPid`) is a bare numeric
+ * comparison against a remembered pid, and this module's own identity primitive
+ * exists because bare pids are not stable handles: once the root is reaped, a
+ * recycled pid that becomes a new group leader wears the same number, and the
+ * ppid closure would then claim that stranger's whole subtree — consumers
+ * SIGKILL every claimed member. PGID claiming therefore requires
+ * `opts.rootIdentity` (the identity recorded when the root was spawned) to
+ * still verify against the live process. Without it — not passed, root gone, or
+ * recycled — only the env nonce plus its ppid closure claim members, both of
+ * which are positive evidence of THIS turn's membership.
+ *
  * A successful result is a diagnostic signal only; see `quiescenceFromScan`.
  */
 export function scanMojoTree(
   rootPid: number,
   nonce: string,
-  opts: { procRoot?: string; excludePids?: readonly number[]; platform?: string } = {},
+  opts: {
+    procRoot?: string;
+    excludePids?: readonly number[];
+    platform?: string;
+    /** Recorded identity of `rootPid` at spawn; gates PGID-based claiming. */
+    rootIdentity?: MojoProcessIdentity;
+  } = {},
 ): MojoTreeScan {
   const platform = opts.platform ?? process.platform;
   if (!mojoTreeScanSupported({ platform, procRootOverridden: isProcRootOverridden(opts.procRoot) })) {
@@ -506,6 +523,16 @@ export function scanMojoTree(
   const procRoot = opts.procRoot ?? '/proc';
   const read = readProcTable(procRoot, nonce);
   if (!read.ok) return read;
+
+  // Verified means: the caller recorded the root's identity at spawn, the pid it
+  // names is the pid being scanned, and the LIVE process still carries that
+  // identity. Anything less and group membership proves nothing.
+  const recorded = opts.rootIdentity;
+  let rootVerified = false;
+  if (recorded && recorded.pid === rootPid) {
+    const live = readProcessIdentity(rootPid, { procRoot, platform });
+    rootVerified = live.ok && sameProcessIdentity(recorded, live.identity);
+  }
 
   const excluded = new Set(opts.excludePids ?? []);
   const members = new Map<number, MojoTreeMember>();
@@ -516,7 +543,7 @@ export function scanMojoTree(
   };
 
   for (const p of read.table) {
-    if (p.pid === rootPid || p.pgid === rootPid) claim(p, 'pgid');
+    if (rootVerified && (p.pid === rootPid || p.pgid === rootPid)) claim(p, 'pgid');
     else if (p.hasNonce) claim(p, 'env');
   }
   // Transitive closure over parentage, so an env-scrubbed child of a known member

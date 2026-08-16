@@ -1817,7 +1817,31 @@ export async function restoreActiveSessions(
     // first could be woken — or `/close`d — while still reading live bot config,
     // pairing a lineage created on one tenant with another. Idempotent and cheap
     // for non-mojo rows.
-    freezeMojoIdentityForSession(session, session.larkAppId ?? getAllBots()[0]?.config.larkAppId ?? '');
+    //
+    // Attribution must never be guessed. Legacy rows can genuinely lack
+    // larkAppId (session-store keeps them for compatibility), and falling back
+    // to getAllBots()[0] classified such rows against an ARBITRARY bot: if
+    // bot[0] happened to be mojo, an unrelated old riff/remote row was frozen
+    // with bot[0]'s tenant identity and its lineage parked into
+    // mojoQuarantinedLineage — the exact cross-tenant misbinding the freeze
+    // exists to prevent, inverted, and idempotently locked in (an existing
+    // mojoIdentity short-circuits every later boot). A single registered bot is
+    // the one unambiguous fallback; with several, leave the row unfrozen so
+    // `mojoIdentity === undefined` keeps meaning "predates this field".
+    {
+      const allBots = getAllBots();
+      const freezeAppId = session.larkAppId
+        ?? (allBots.length === 1 ? allBots[0]?.config.larkAppId : undefined);
+      if (freezeAppId !== undefined) {
+        freezeMojoIdentityForSession(session, freezeAppId);
+      } else if (session.backendType === 'mojo' || session.cliId === 'mojo') {
+        logger.warn(
+          `[${session.sessionId.substring(0, 8)}] mojo row has no larkAppId and `
+          + `${allBots.length} bots are registered; refusing to guess its tenant — `
+          + 'identity stays unfrozen (no automatic resume or cancel)',
+        );
+      }
+    }
 
     if (session.mojoCloseJournal
         && !sessionStore.isValidMojoCloseJournal(session.mojoCloseJournal)) {

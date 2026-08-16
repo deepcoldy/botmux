@@ -124,6 +124,30 @@ describe('normalizeMojoConfig', () => {
     expect(normalizeMojoConfig({ jwtEnv: 'X_JWT_TOKEN' }).ok).toBe(true);
   });
 
+  it('rejects a jwtEnv naming a reserved or control-plane key (P0-1)', () => {
+    // buildEnv() deletes env[jwtEnv] before re-deriving the credential, so the
+    // name doubles as a deletion primitive. `BOTMUX_MOJO_TREE_NONCE` is the
+    // containment tree nonce — the only signal that survives setsid + reparent —
+    // and erasing it blinds the termination proof while every close still
+    // reports clean. Reserved botmux keys and frozen control-plane keys must
+    // therefore be rejected by name, exactly like `mojo.env` already does.
+    for (const bad of [
+      'BOTMUX_MOJO_TREE_NONCE',
+      'BOTMUX_SESSION_ID',
+      'LARK_APP_SECRET',
+      'AGENT_BASE_URL',
+      'AGENT_LOCAL_DAEMON',
+      'MOJO_PPE_ENV',
+    ]) {
+      const r = normalizeMojoConfig({ jwtEnv: bad });
+      expect(r.ok, bad).toBe(false);
+      if (!r.ok) expect(r.errors.join(' '), bad).toMatch(/must not name/);
+    }
+    // A custom credential variable stays allowed — the rule is about names
+    // botmux owns, not about custom names in general.
+    expect(normalizeMojoConfig({ jwtEnv: 'MY_COMPANY_JWT' }).ok).toBe(true);
+  });
+
   it('rejects a non-object block', () => {
     for (const bad of ['x', 5, true, ['a']]) {
       expect(normalizeMojoConfig(bad).ok, JSON.stringify(bad)).toBe(false);
