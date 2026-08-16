@@ -14,10 +14,32 @@
  * enumerate would be sharing a session with fresh work — which is the exact hazard
  * the fence exists to prevent, reached by a different route.
  *
- * It holds for a third reason: a successful close sets `killed`, and write()
- * refuses on `killed` before it ever consults the fence. That is a real guarantee,
- * but it is a DIFFERENT mechanism than the fence, so it deserves its own test
- * instead of being inferred from the fencing tests.
+ * WHICH GUARD DOES WHAT — measured, not inferred; read before editing asserts
+ * ---------------------------------------------------------------------------
+ * write() refuses on `killed || closing || shutdownDetaching`, and the residual
+ * close sets TWO of them. Measured flag matrix on this path:
+ *
+ *              AFTER CLOSE                  AFTER A LATER abortDestroySession()
+ *   clean      killed=1 closing=1 -> refused    killed=1 closing=1 -> refused
+ *   no killed  killed=0 closing=1 -> refused    killed=0 closing=0 -> ADMITTED
+ *   no closing killed=1 closing=0 -> refused    killed=1 closing=0 -> refused
+ *
+ * Two consequences that decide where the assertions go:
+ *
+ * 1. Straight after the close, BOTH flags are set and either alone refuses. So an
+ *    assertion at that moment cannot observe either flag individually — dropping
+ *    `killed` leaves it green. That is measured, not assumed, and it is why this
+ *    test asserts a SECOND time after an abort.
+ * 2. Only `killed` governs the post-abort moment: abortDestroySession() begins
+ *    with `if (this.killed) return;`, so without it the abort proceeds and clears
+ *    `closing`, admitting the next turn onto a subtree this platform cannot
+ *    enumerate. The post-abort assertion is the ONLY coverage of `killed` here;
+ *    remove it and that guarantee is unguarded again.
+ *
+ * Also recorded so nobody "adds coverage" for it and reports a kill: dropping
+ * `closing` alone is an EQUIVALENT mutation with respect to write admission,
+ * because `killed` already refuses at both moments. `closing` earns its keep
+ * elsewhere (it gates the window before the close completes), not here.
  *
  * Run:  pnpm vitest run test/mojo-residual-close-admission.test.ts
  */
@@ -74,16 +96,17 @@ echo '{"type":"result","status":"ok","result":"ok","session_id":"sid-residual","
     // The honest part of the verdict: it is NOT dressed up as a clean close.
     expect(result.admission).toBeUndefined();
 
-    // The handover invariant. A residual close does not latch the fence, so this
-    // must be refused by the teardown itself.
+    // The handover invariant. A residual close does not latch the fence, so the
+    // teardown itself must refuse. NOTE: at this moment both guards are set, so
+    // this assertion cannot observe either one alone — see the header matrix.
     expect(backend.write('a turn after a residual close')).toBe(false);
-    // The DISCRIMINATING assertion. The line above is satisfied by `closing`, which
-    // the residual path never resets, so it holds even if `killed` was never set --
-    // it cannot observe that guard at all. `killed`'s real job here is to make a
-    // later abort a NO-OP: abortDestroySession() returns early on `killed`, and the
-    // residual path deliberately does not latch `admissionFenced`, so without
-    // `killed` the abort falls through and clears `closing`, re-opening writes on a
-    // session that still has an unenumerable credentialed subtree.
+
+    // The second moment, and the only one sensitive to `killed`. A rollback of a
+    // residual close is meaningless — nothing was held back that could be given
+    // up — so the abort must be a no-op rather than a way back to a writable
+    // session. `killed` is what enforces that; without it the abort clears
+    // `closing` and the next turn is admitted on top of a subtree this platform
+    // cannot enumerate.
     await backend.abortDestroySession();
     expect(backend.write('a turn after aborting a residual close')).toBe(false);
   }, 20_000);
