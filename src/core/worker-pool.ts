@@ -273,6 +273,7 @@ import type {
   WorkerToDaemon,
   Session,
   DisplayMode,
+  StreamStatus,
   QueuedActivationTailEntry,
 } from '../types.js';
 import {
@@ -3302,6 +3303,37 @@ export function teardownAuthoritativePersistentBackingBeforeClose(
   teardownAuthoritativePersistentBackingBeforeCloseImpl(target, false);
 }
 
+/** Render the live streaming-card JSON for `ds` (🖥️ header + usage line +
+ *  显示输出/终端/关闭会话 buttons). Factored so callers outside the normal
+ *  screen-update flow — notably the Lark 恢复会话 button — can restore the SAME
+ *  card the session had while running, instead of a stripped-down variant.
+ *  `status` defaults to the session's last known screen status. */
+export function buildStreamingCardJson(ds: DaemonSession, status?: StreamStatus): string {
+  const botCfg = getBot(ds.larkAppId).config;
+  const effectiveCliId = sessionCliId(ds, botCfg);
+  return buildStreamingCard(
+    ds.session.sessionId,
+    sessionAnchorId(ds),
+    readableTerminalUrlFor(ds),
+    ds.currentTurnTitle || ds.session.title || sessionCliDisplayName(ds, botCfg),
+    ds.lastScreenContent ?? '',
+    status ?? ds.lastScreenStatus ?? 'starting',
+    effectiveCliId,
+    ds.displayMode ?? 'hidden',
+    ds.streamCardNonce,
+    ds.currentImageKey,
+    !!ds.adoptedFrom,
+    false,
+    localeForBot(ds.larkAppId),
+    cardUsageLimit(ds),
+    writableTerminalLinkFor(ds),
+    isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
+    getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId),
+    sessionRuntimeDisplayName(ds, botCfg),
+    codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
+  );
+}
+
 /**
  * Idempotent close: kill worker if alive, mark Session status='closed' + closedAt,
  * publish session.exited (if a live worker was killed) and session.update
@@ -3319,7 +3351,17 @@ export type CloseSessionResult =
 
 export async function closeSession(
   sessionId: string,
+  opts?: { awaitWorkerExit?: boolean },
 ): Promise<CloseSessionResult> {
+  // `awaitWorkerExit` (default true): whether to block on the worker process
+  // actually exiting before returning. A busy CLI wedges in node-pty teardown
+  // and only dies at the ~7s SIGKILL backstop, so callers behind a tight ACK
+  // window (the Lark card "关闭会话" button, whose callback must ACK inside ~3s
+  // or the client surfaces the "code: 300000" toast) pass false: the logical
+  // close below is fully synchronous, and killWorker already armed the kill
+  // backstop, so the worker WILL die in the background — the caller need not
+  // wait for it. Bridge-marker cleanup still runs, deferred behind the fence.
+  const awaitWorkerExit = opts?.awaitWorkerExit ?? true;
   const ds = findActiveBySessionId(sessionId);
   const stored = sessionStore.getOwnedSession(sessionId);
   // Prove fail-closed ZMX teardown before any registry/store mutation. Repo
@@ -3450,8 +3492,15 @@ export async function closeSession(
   }
 
   if (wasOpen && hadLiveWorker) {
-    await closeFenceFor(sessionId, closeWorkerGeneration);
-    sessionStore.cleanupSessionBridgeSendMarkersNow(sessionId);
+    if (awaitWorkerExit) {
+      await closeFenceFor(sessionId, closeWorkerGeneration);
+      sessionStore.cleanupSessionBridgeSendMarkersNow(sessionId);
+    } else {
+      // Don't block the caller on the worker exiting (killWorker already armed
+      // the SIGKILL backstop). Defer bridge-marker cleanup behind the same
+      // fence so a mid-flight send is still credited until the worker ACKs/exits.
+      sessionStore.cleanupSessionBridgeSendMarkers(sessionId);
+    }
   }
 
   // All authoritative map/status/store/event state above transitions
