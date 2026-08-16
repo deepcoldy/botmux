@@ -1119,7 +1119,7 @@ function tag(ds: DaemonSession): string {
 }
 
 function sessionCliId(ds: DaemonSession, botCfg: { cliId: CliId }): CliId {
-  return ds.session.cliId ?? botCfg.cliId;
+  return ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? botCfg.cliId;
 }
 
 function sessionRuntimeDisplayName(
