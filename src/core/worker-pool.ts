@@ -1315,10 +1315,10 @@ function sessionAgentConfig(
 ): { cliId: CliId; cliRuntime?: CliRuntimeSnapshot; cliPathOverride?: string; wrapperCli?: string; model?: string; reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra'; launchShell?: string; startupCommands?: string[] } {
   const selected = ds.session.cliLaunchSnapshot;
   if (selected) {
-    if (botCfg.env && Object.keys(botCfg.env).length > 0) throw new Error('entry-selected session rejected: bot env is configured');
-    if (botCfg.backendType === 'riff' || botCfg.riff !== undefined) throw new Error('entry-selected session rejected: Riff is configured');
+    if (botCfg.env && Object.keys(botCfg.env).length > 0) throw new Error('CLI selection rejected: bot env is configured');
+    if (botCfg.backendType === 'riff' || botCfg.riff !== undefined) throw new Error('CLI selection rejected: Riff is configured');
     if (botCfg.codexRpcInput === true && !RPC_CAPABLE_CLIS.has(selected.cliId)) {
-      throw new Error(`entry-selected session rejected: ${selected.cliId} cannot use codexRpcInput`);
+      throw new Error(`CLI selection rejected: ${selected.cliId} cannot use codexRpcInput`);
     }
     const runtime = selected.cliRuntime ?? undefined;
     const legacyPath = selected.cliPathOverride ?? undefined;
