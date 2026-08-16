@@ -286,22 +286,24 @@ export function drainTraexRollout(
         ? payload.last_agent_message
         : '';
       let text = rawFinal;
-      // Synthesis is non-adopt only: adopt posts transcript text verbatim, so
-      // a synthesised bare sentinel would leak the literal token into Lark.
-      // In adopt an empty final stays empty (no alert fires there either).
-      if (!adoptMode && !failed && rawFinal.trim().length === 0) {
+      if (!failed && rawFinal.trim().length === 0) {
         // TRAE wrote no final for a successful turn. Recover, in order:
         //   1. a final_answer-phase agent_message — TRAE dropped the final it
         //      actually produced (the phase field guarantees it is an answer,
-        //      not tool narration);
+        //      not tool narration). Safe in BOTH modes: it is the model's real
+        //      answer, and adopt posts transcript text verbatim anyway;
         //   2. a commentary message ending in the nothing-to-send sentinel —
         //      the model deliberately stayed silent (it replied via
         //      `botmux send`), so synthesise the bare sentinel the fallback
         //      gate already treats as genuine silence instead of tripping the
-        //      misleading "completed but empty" diagnostic.
-        text = pending?.lastFinalAnswer && pending.lastFinalAnswer.trim().length > 0
+        //      misleading "completed but empty" diagnostic. NON-ADOPT ONLY:
+        //      adopt posts transcript text verbatim, so a synthesised bare
+        //      token would leak the literal into Lark.
+        text = pending?.lastFinalAnswer?.trim()
           ? pending.lastFinalAnswer
-          : traexTrailingSentinel(pending?.lastCommentary ?? '') ?? '';
+          : !adoptMode
+            ? traexTrailingSentinel(pending?.lastCommentary ?? '') ?? ''
+            : '';
       }
       if (!probe) traexPendingAgentCache.delete(path);
       events.push({

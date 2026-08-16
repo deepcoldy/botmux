@@ -506,6 +506,30 @@ describe('drainTraexRollout', () => {
     }));
   });
 
+  it('reconstructs a final_answer-phase message in adopt mode (real answer, not synthesis)', () => {
+    // final_answer reconstruction is safe in BOTH modes: it is the model's
+    // real transcript answer (phase-guaranteed, not tool narration), and adopt
+    // posts transcript text verbatim anyway. Only the bare-sentinel synthesis
+    // is adopt-gated. adopt is in fact the mode where reconstruction matters
+    // most — drain is the only channel to Lark there.
+    writeFileSync(path, [
+      line(user('do the work')),
+      line(agentMessage('思考中', 'commentary')),
+      line(agentMessage('这是最终答案', 'final_answer')),
+      line(taskComplete()),
+    ].join(''));
+
+    expect(drainTraexRollout(path, 0, { adoptMode: true }).events.at(-1)).toEqual(expect.objectContaining({
+      kind: 'assistant_final',
+      text: '这是最终答案',
+    }));
+    // Non-adopt reconstructs identically.
+    expect(drainTraexRollout(path, 0).events.at(-1)).toEqual(expect.objectContaining({
+      kind: 'assistant_final',
+      text: '这是最终答案',
+    }));
+  });
+
   it('a probe re-drain mid-turn does not clear the production pending state', () => {
     // traexRolloutHasUserInputSince re-drains the same live rollout; its
     // user_message processing must not delete the commentary the production
