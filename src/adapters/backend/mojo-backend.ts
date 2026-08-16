@@ -47,7 +47,25 @@
  */
 import { randomBytes } from 'node:crypto';
 import { spawn as spawnProcess, type ChildProcessByStdio } from 'node:child_process';
-import { MOJO_TREE_NONCE_ENV, scanMojoTree } from './mojo-process-tree.js';
+import { classifyUnprovenTermination } from './destroy-result.js';
+import {
+    acquireContainmentHandle,
+    containmentHandleKey,
+    containmentHandles,
+    proveContainmentQuiescent,
+    recordContainmentHandle,
+    releaseContainmentHandle,
+    weakHandleRootStillOriginal,
+} from '../../core/mojo-containment.js';
+import type { ContainmentHandle, QuiescenceVerdict } from '../../core/mojo-containment.js';
+import {
+    MOJO_TREE_NONCE_ENV,
+    quiescenceFromScan,
+    readProcessIdentity,
+    scanMojoTree,
+    signalTurnTreeGroup,
+} from './mojo-process-tree.js';
+import type { MojoProcessIdentity, TurnQuiescence } from './mojo-process-tree.js';
 import { accessSync, constants as fsConstants } from 'node:fs';
 import { delimiter, join } from 'node:path';
 import type { Readable } from 'node:stream';
@@ -56,6 +74,7 @@ import { buildWrappedLaunch } from '../../setup/cli-selection.js';
 import { logger } from '../../utils/logger.js';
 import type {
     SessionBackend,
+    SessionAbortDestroyResult,
     SessionDestroyResult,
     SessionShutdownDetachResult,
     SpawnOpts,
@@ -68,7 +87,7 @@ import {
     MOJO_CANONICAL_JWT_ENV_KEY,
     MOJO_CONTROL_ENV_KEYS,
 } from './mojo-types.js';
-import type { MojoTreeScanOutcome,
+import type {
     MojoAuthStatus,
     MojoLivePatch,
     EffectiveMojoConfig,
@@ -136,6 +155,20 @@ export class MojoBackend implements SessionBackend {
     private child: MojoChild | null = null;
     private killed = false;
     private closing = false;
+    /** A close attempt observed evidence that something credentialed may still be
+     *  alive (an unproven local subtree, or a dispatched turn with no lineage).
+     *
+     *  ONE-WAY for the lifetime of this backend: nothing clears it. The CLOSE stays
+     *  retryable though — a later destroySession() whose terminateChildProven()
+     *  succeeds proceeds to the remote cancel and returns ok:true — and that
+     *  liveness property IS covered by a test, because a fence that also wedged the
+     *  close would be worse than the bug it fixes.
+     *
+     *  Honest scope note: the one-way lifetime itself is an implementation fact, not
+     *  a tested guarantee. Once a close succeeds `killed` refuses writes anyway, so
+     *  clearing this field at that point is an equivalent mutation (verified: it
+     *  survives). Do not read it as a proven invariant. */
+    private admissionFenced = false;
     /** Graceful daemon shutdown is a non-cancelling detach. Fence only writes
      * arriving after prepare, then wait just long enough for an already accepted
      * first turn to publish its `system/init` lineage. */
@@ -154,7 +187,22 @@ export class MojoBackend implements SessionBackend {
     /** Inherited by every descendant of every turn, so the subtree stays
      *  enumerable after setsid/reparenting. Per BACKEND, not per turn: a tool left
      *  behind by an earlier turn must still be found. */
-    private readonly treeNonce = `botmux-mojo-${randomBytes(12).toString('hex')}`;
+    /**
+     * Env nonce injected into the turn subtree, inherited by every descendant.
+     *
+     * NOT `readonly`, and NOT freshly random per instance: a replacement worker
+     * generation builds a NEW backend for the SAME session, and a new nonce would
+     * make the previous generation's tree unenumerable forever (the env signal is
+     * the only one that survives setsid + reparenting). So it is adopted from an
+     * inherited containment handle whenever one is outstanding.
+     */
+    private treeNonce = `botmux-mojo-${randomBytes(12).toString('hex')}`;
+    /**
+     * Worker generation, used only for operator-facing logs on the handle. Derived
+     * from how many handles this session already has outstanding, so a replacement
+     * generation is distinguishable from the first one.
+     */
+    private readonly containmentGeneration: number;
     /**
      * Root pid of the most recent turn, kept AFTER `this.child` is cleared.
      *
@@ -163,6 +211,22 @@ export class MojoBackend implements SessionBackend {
      * that let a survivor go unnoticed once its parent had exited.
      */
     private lastTurnPid: number | null = null;
+    /**
+     * Recycle-proof identity of `lastTurnPid`, captured AT SPAWN.
+     *
+     * The pid number alone is not a handle: by the time teardown runs, the kernel
+     * may have recycled it onto an unrelated process, and `kill(-pid)` would then
+     * signal a stranger's whole process group. Binding boot id + starttime at
+     * spawn is what lets the signal path prove it is still aiming at OUR child.
+     */
+    private turnIdentity: MojoProcessIdentity | null = null;
+    /**
+     * Evidence class of the last quiescence attempt.
+     *
+     * Exposed so the containment/blocker decision can require
+     * `boundaryProof === true` instead of treating a merely clean scan as proof.
+     */
+    private lastQuiescence: TurnQuiescence | null = null;
     /** True once the current turn has emitted its `result` event, so a late
      *  process exit cannot fire a second turn boundary. */
     private turnSettled = true;
@@ -223,6 +287,26 @@ export class MojoBackend implements SessionBackend {
     constructor(config: EffectiveMojoConfig, sessionId: string) {
         this.config = config;
         this.sessionId = sessionId;
+        // Adopt the nonce of any subtree this session already owns. A replacement
+        // generation MUST keep hunting the previous generation's tree, and the env
+        // nonce is the only signal that survives setsid + reparenting to init — a
+        // fresh random value here would strand that tree permanently.
+        //
+        // `containmentHandles` THROWS on an unreadable store rather than answering
+        // "none". Letting that escape the constructor is deliberate: a backend that
+        // cannot know what it inherited must not come up and start a turn it can
+        // never prove quiescent.
+        const inherited = containmentHandles(sessionId);
+        this.containmentGeneration = inherited.length;
+        const adopted = inherited[0]?.nonce;
+        if (adopted !== undefined) {
+            this.treeNonce = adopted;
+            logger.warn(
+                `[mojo] session ${sessionId}: adopting ${inherited.length} unproven turn `
+                + 'subtree(s) from a previous worker generation; the device-isolation blocker '
+                + 'stays until they are proven quiescent',
+            );
+        }
         // Daemon-restart resume: the persisted mojo session id restores the
         // lineage so the first write after a restart continues the conversation
         // instead of cold-booting a context-less session.
@@ -510,8 +594,16 @@ export class MojoBackend implements SessionBackend {
     protected get procRoot(): string { return '/proc'; }
 
     /**
-     * SIGTERM the whole turn SUBTREE, then PROVE nothing in it survives
-     * (escalating to SIGKILL).
+     * SIGTERM the whole turn SUBTREE, then gather the best evidence this host can
+     * give that nothing in it survives (escalating to SIGKILL).
+     *
+     * Read the return value precisely: `true` means "no executing member was
+     * found", NOT "the credential is now unreachable". Enumeration cannot see a
+     * descendant that both setsid'd and scrubbed its own environ, so a clean scan
+     * is a DIAGNOSTIC signal only — `lastTurnQuiescence.boundaryProof` is the field
+     * that says whether a real boundary was established, and only kernel-level
+     * containment (a per-session cgroup) can set it true. Callers that gate a
+     * credential blocker must consult that, not this boolean.
      *
      * Three fail-open paths are closed here.
      *
@@ -525,25 +617,56 @@ export class MojoBackend implements SessionBackend {
      *    setsid/detached. Enumeration therefore unions PGID, the inherited env
      *    nonce and the PPID chain — see mojo-process-tree.
      *
-     * Returns false when quiescence cannot be proven, INCLUDING when the scan
-     * itself fails: "cannot enumerate" must never read as "nothing is running".
-     * The caller then refuses the close, which keeps the row active and so keeps
-     * the device-isolation blocker in place.
+     * Returns false whenever no such evidence could be obtained, INCLUDING when the
+     * scan itself fails: "cannot enumerate" must never read as "nothing is
+     * running". The caller then refuses the close, which keeps the row active and
+     * so keeps the device-isolation blocker in place. (destroySession makes ONE
+     * exception, for a platform that can never enumerate at all — see the
+     * `unsupported-platform` branch there.)
      *
-     * A clean scan is deliberately NOT claimed to be absolute proof — see the
-     * trust-domain note in mojo-process-tree.
+     * Zombie members are discounted, because a reaped process executes nothing and
+     * cannot use the credential; only a definite `Z` state qualifies.
      */
     private async terminateChildProven(): Promise<boolean> {
+        const q = await this.proveTurnQuiescence();
+        // NOTE: `diagnostic-clean` is enough to stop signalling, but it is NOT
+        // credential-boundary proof. Whoever decides whether the session's
+        // device-isolation blocker may be dropped must consult
+        // `lastTurnQuiescence.boundaryProof`, which only kernel-level containment
+        // can set to true.
+        return q.kind === 'contained-proven' || q.kind === 'diagnostic-clean';
+    }
+
+    /** Evidence class of the last termination attempt; see TurnQuiescence. */
+    get lastTurnQuiescence(): TurnQuiescence | null {
+        return this.lastQuiescence;
+    }
+
+    /**
+     * SIGTERM the whole turn SUBTREE, then try to establish that nothing in it
+     * survives (escalating to SIGKILL), and report WHAT KIND of evidence we got.
+     */
+    protected async proveTurnQuiescence(): Promise<TurnQuiescence> {
+        const record = (q: TurnQuiescence): TurnQuiescence => { this.lastQuiescence = q; return q; };
         const child = this.child;
         // lastTurnPid, not just `child`: the child's own `close` handler clears
         // `this.child`, and an escaped descendant outlives its parent. Falling back
         // to the remembered root pid is what keeps the subtree checkable.
         const rootPid = (typeof child?.pid === 'number' && child.pid > 0) ? child.pid : this.lastTurnPid;
-        if (rootPid === null) {
-            // No turn ever spawned, so there is no subtree. (A spawn that failed
-            // outright leaves lastTurnPid null.)
+        // The DURABLE view of what this session still owns. In-memory state is not
+        // enough: on a replacement generation `lastTurnPid` is always null, and the
+        // old code concluded "no turn ever spawned, so there is no subtree" — which
+        // returned true for a session that may still have a live credentialed
+        // survivor from the previous generation. Only the store can retire that claim.
+        //
+        // A throw here (unreadable store) propagates and refuses the close, which is
+        // the correct fail-closed outcome.
+        const outstanding = containmentHandles(this.sessionId);
+        if (rootPid === null && outstanding.length === 0) {
+            // No in-memory root AND nothing outstanding in the store: genuinely
+            // nothing was ever credentialed under this session.
             this.child = null;
-            return true;
+            return record({ kind: 'diagnostic-clean', boundaryProof: false });
         }
 
         const exited = new Promise<void>(resolve => {
@@ -558,27 +681,44 @@ export class MojoBackend implements SessionBackend {
         const grace = Math.max(1, Math.floor(budget / 2));
         // Never signal ourselves: the daemon shares neither nonce nor group, but an
         // explicit guard is cheaper than trusting that while sending SIGKILL.
-        const excludePids = [process.pid, process.ppid].filter(pid => typeof pid === 'number' && pid > 0);
+        const excludePids = this.selfPids();
 
-        const survivors = (): MojoTreeScanOutcome => {
-            const scan = scanMojoTree(rootPid, this.treeNonce, { procRoot: this.procRoot, excludePids });
-            if (!scan.ok) return { scanned: false, pids: [], reason: scan.reason };
-            // A zombie is not executing and cannot use the credential; it only waits
-            // to be reaped, so it must not keep the close blocked forever.
-            return { scanned: true, pids: scan.members.map(m => m.pid) };
-        };
+        // rootPid may be null here while handles are still outstanding (a replacement
+        // generation inherited a tree it never spawned). There is no in-memory root to
+        // scan in that case, so the in-memory ladder is skipped and the inherited
+        // handles below become the ONLY thing that can retire the close.
+        if (rootPid === null) {
+            return record(this.dischargeContainment(
+                outstanding,
+                { kind: 'diagnostic-clean', boundaryProof: false },
+            ));
+        }
 
-        const proven = async (deadlineMs: number): Promise<'proven' | 'alive' | 'unscannable'> => {
+        const look = (): TurnQuiescence => quiescenceFromScan(
+            scanMojoTree(rootPid, this.treeNonce, { procRoot: this.procRoot, excludePids }),
+        );
+
+        const settle = async (deadlineMs: number): Promise<TurnQuiescence> => {
             const deadline = Date.now() + deadlineMs;
             for (;;) {
-                const now = survivors();
-                if (!now.scanned) {
-                    logger.error(`[mojo] cannot enumerate turn subtree: ${now.reason ?? 'unknown'}`);
-                    return 'unscannable';
+                const now = look();
+                // Fail-closed: an unscannable host or an unsupported platform can
+                // never be read as "nothing is running", and retrying will not turn
+                // either into knowledge, so stop immediately.
+                if (now.kind === 'unscannable') {
+                    logger.error(`[mojo] cannot enumerate turn subtree: ${now.reason}`);
+                    return now;
                 }
-                if (now.pids.length === 0) return 'proven';
-                if (Date.now() >= deadline) return 'alive';
-                // Plain sleep: racing an ALREADY-RESOLVED `exited` here span the
+                if (now.kind === 'unsupported-platform') {
+                    logger.error(
+                        `[mojo] cannot enumerate turn subtree on ${now.platform}: /proc is Linux-only, `
+                        + 'so quiescence cannot be established on this host',
+                    );
+                    return now;
+                }
+                if (now.kind !== 'alive') return now;
+                if (Date.now() >= deadline) return now;
+                // Plain sleep: racing an ALREADY-RESOLVED `exited` here spun the
                 // loop as fast as the event loop allowed (a busy loop until the
                 // deadline). The direct child's exit is not the condition anyway —
                 // the scan is.
@@ -588,39 +728,256 @@ export class MojoBackend implements SessionBackend {
 
         const signalTree = (signal: NodeJS.Signals): void => {
             // Group first: it reaches processes that /proc may not have listed yet.
-            try { process.kill(-rootPid, signal); } catch { /* group already gone */ }
-            const scan = survivors();
-            for (const pid of scan.pids) {
-                try { process.kill(pid, signal); } catch { /* raced us */ }
+            // But NEVER as a bare kill(-rootPid): the pid may have been recycled, so
+            // the identity captured at spawn is re-verified first and the signal is
+            // skipped entirely on mismatch, on failure to verify, or off-Linux.
+            if (this.turnIdentity === null) {
+                logger.error(
+                    '[mojo] refusing to signal the turn process group: no spawn-time identity was '
+                    + 'captured, so the pid cannot be proven to still be our child',
+                );
+            } else {
+                const sent = signalTurnTreeGroup(this.turnIdentity, signal, { procRoot: this.procRoot });
+                if (sent.kind === 'identity-mismatch') {
+                    logger.error(
+                        `[mojo] refusing to signal pid ${this.turnIdentity.pid}: it has been recycled `
+                        + `(starttime ${this.turnIdentity.starttime} -> ${sent.actual.starttime}); `
+                        + 'signalling it would hit an unrelated process group',
+                    );
+                } else if (sent.kind === 'unverifiable') {
+                    logger.error(`[mojo] refusing to signal the turn process group: ${sent.reason}`);
+                } else if (sent.kind === 'unsupported-platform') {
+                    logger.error(
+                        `[mojo] refusing to signal the turn process group on ${sent.platform}: `
+                        + 'pid identity cannot be verified without /proc',
+                    );
+                }
             }
-            if (!scan.scanned) { try { child?.kill(signal); } catch { /* gone */ } }
+            // Per-pid signals still go out: they come from an enumeration that just
+            // observed each pid, and they are positive (not group-negated) targets.
+            const scan = look();
+            if (scan.kind === 'alive') {
+                for (const pid of scan.pids) {
+                    try { process.kill(pid, signal); } catch { /* raced us */ }
+                }
+            } else if (scan.kind === 'unscannable' || scan.kind === 'unsupported-platform') {
+                // Cannot enumerate: fall back to the direct child handle, which is the
+                // only target we can name without /proc.
+                try { child?.kill(signal); } catch { /* gone */ }
+            }
         };
 
         signalTree('SIGTERM');
-        let verdict = await proven(grace);
-        if (verdict === 'proven') { this.child = null; await exited.catch?.(() => undefined); return true; }
+        let verdict = await settle(grace);
+        if (verdict.kind === 'diagnostic-clean') {
+            this.child = null;
+            await exited.catch?.(() => undefined);
+            return record(this.dischargeContainment(outstanding, verdict));
+        }
 
-        if (verdict === 'alive') {
+        if (verdict.kind === 'alive') {
             // Escalate. SIGKILL cannot be caught, so a survivor after this means we
             // genuinely cannot prove quiescence (e.g. uninterruptible state).
             signalTree('SIGKILL');
-            verdict = await proven(budget - grace);
-            if (verdict === 'proven') { this.child = null; return true; }
+            verdict = await settle(budget - grace);
+            if (verdict.kind === 'diagnostic-clean') {
+                this.child = null;
+                return record(this.dischargeContainment(outstanding, verdict));
+            }
         }
 
         logger.error(
-            `[mojo] turn subtree rooted at ${rootPid} could not be proven quiescent (${verdict}); `
-            + 'refusing to report the close as successful — the session row stays active so its '
-            + 'device-isolation blocker is retained',
+            `[mojo] turn subtree rooted at ${rootPid} could not be proven `
+            + `quiescent (${verdict.kind}); refusing to report the close as successful — the session `
+            + 'row stays active so its device-isolation blocker is retained',
         );
-        // Deliberately NOT clearing this.child / lastTurnPid: the close is refused,
-        // so a retry must be able to signal the same subtree again.
-        return false;
+        // Deliberately NOT clearing this.child / lastTurnPid / turnIdentity: the
+        // close is refused, so a retry must be able to signal the same subtree again.
+        return record(verdict);
+    }
+
+    /**
+     * Mint and PERSIST the containment handle for a freshly spawned turn root.
+     *
+     * Extracted so it can be exercised directly: doing this at close time would be
+     * too late, because a crash between spawn and record is exactly the window that
+     * loses the tree, and a lost tree can never be proven quiescent afterwards.
+     */
+    private recordTurnContainment(rootPid: number): void {
+        // acquireContainmentHandle cannot return null: on a host with neither cgroup
+        // v2 nor a readable boot id it mints an `unprovable` handle instead, which is
+        // persisted, can never be released, and reports unsupported-platform. That is
+        // what makes the residual-close path safe — there is always something durable
+        // holding the device-isolation blocker, so there is no "nothing was recorded"
+        // case left to handle here.
+        recordContainmentHandle(acquireContainmentHandle({
+            sessionId: this.sessionId,
+            generation: this.containmentGeneration,
+            rootPid,
+            nonce: this.treeNonce,
+        }));
+    }
+
+    /**
+     * Discharge every DURABLE handle this session owns, after the in-memory ladder
+     * believes its own root is gone.
+     *
+     * The in-memory verdict only ever speaks for the pid THIS backend spawned. A
+     * replacement generation inherits handles describing trees it never spawned, and
+     * those must be proven independently or the close stays refused. A handle leaves
+     * the store only against a `proven: true` verdict — `releaseContainmentHandle`
+     * takes the verdict itself and throws on anything else, so "clear the blocker
+     * without proof" is not representable here.
+     */
+    private dischargeContainment(
+        outstanding: readonly ContainmentHandle[],
+        cleanVerdict: TurnQuiescence,
+    ): TurnQuiescence {
+        for (const handle of outstanding) {
+            // An inherited handle means this generation TOOK OVER responsibility for
+            // cleaning that tree. Only proving it (never signalling it) left an
+            // escaped survivor that nothing would ever kill: every /close retry
+            // re-proved it alive and refused, so the session could never be closed
+            // while the credentialed process kept running. Proof alone turns the
+            // handle into a permanent tombstone, so signal first, then prove.
+            //
+            // Signalling is strictly GATED, because a pid is not an identity:
+            //   * weak handle   only when weakHandleRootStillOriginal confirms the
+            //                   recorded pid is still the same process (same boot id
+            //                   AND same starttime). Without that, the number may
+            //                   have been recycled onto a stranger and negating it
+            //                   would take down an unrelated process group.
+            //   * unprovable    never: it has no pid to signal at all.
+            // Failing the gate means "do not signal", NOT "the tree is gone" — the
+            // proof below still has to speak for the subtree.
+            if (handle.kind === 'tree-identity') {
+                const rootStillOriginal = weakHandleRootStillOriginal(handle, { procRoot: this.procRoot });
+                if (!rootStillOriginal) {
+                    logger.warn(
+                        `[mojo] inherited handle ${containmentHandleKey(handle)}: recorded root pid is no `
+                        + 'longer the original process (recycled or gone), so its GROUP will not be '
+                        + 'signalled; enumerated members are still signalled individually',
+                    );
+                }
+                this.signalInheritedTree(handle.rootPid, rootStillOriginal);
+            }            const verdict = proveContainmentQuiescent(handle, {
+                procRoot: this.procRoot,
+                // `scanned: false` must NEVER collapse into `pids: []`: an empty pid
+                // list reads as "nothing alive", which is precisely the fail-open the
+                // scanner's failure modes exist to prevent.
+                scan: weak => {
+                    const scan = scanMojoTree(weak.rootPid, weak.nonce, {
+                        procRoot: this.procRoot,
+                        excludePids: this.selfPids(),
+                    });
+                    return scan.ok
+                        // Zombies are discounted here for the SAME reason the
+                        // in-memory verdict discounts them: a reaped process
+                        // executes nothing and cannot use the credential. Passing
+                        // them through made the two paths disagree — the ladder
+                        // called the tree clean while the handle proof called the
+                        // very same tree alive, so a correct close was refused and
+                        // the handle could never be discharged.
+                        ? { scanned: true, pids: scan.members.filter(m => !m.zombie).map(m => m.pid) }
+                        : { scanned: false, pids: [], reason: scan.reason };
+                },
+            });
+            if (!verdict.proven) {
+                logger.error(
+                    `[mojo] inherited turn subtree (${containmentHandleKey(handle)}) could not be `
+                    + `proven quiescent (${verdict.reason}); refusing the close so the `
+                    + 'device-isolation blocker is retained',
+                );
+                return { kind: 'unscannable', boundaryProof: false, reason: verdict.reason };
+            }
+            releaseContainmentHandle(verdict);
+        }
+        // Every handle discharged. A cgroup-backed proof is a real kernel boundary,
+        // so it may upgrade the verdict; a weak (scan-only) proof may not, and stays
+        // `diagnostic-clean` with boundaryProof false.
+        if (outstanding.length > 0 && outstanding.every(h => h.kind === 'cgroup')) {
+            return { kind: 'contained-proven', boundaryProof: true };
+        }
+        return cleanVerdict;
+    }
+
+    /** Pids that must never be signalled, whatever a scan says. */
+    private selfPids(): number[] {
+        return [process.pid, process.ppid].filter(pid => typeof pid === 'number' && pid > 0);
+    }
+
+    /**
+     * SIGKILL an inherited tree whose recorded root identity has already been
+     * re-verified by the caller.
+     *
+     * SIGTERM is skipped deliberately: this tree belongs to a previous worker
+     * generation that is already gone, so nobody is waiting to shut it down
+     * gracefully, and the graceful attempt was made when that generation closed.
+     * Every enumerated member is signalled individually as well, because a
+     * descendant may have left the group via setsid and would survive the group
+     * signal alone.
+     *
+     * Best effort by design: this only creates the CHANCE for the proof below to
+     * succeed. If anything survives, the proof still refuses the close.
+     */
+    private signalInheritedTree(rootPid: number, rootStillOriginal: boolean): void {
+        logger.warn(
+            `[mojo] signalling inherited turn subtree rooted at ${rootPid}: this generation owns its `
+            + 'cleanup, and proving it without signalling would leave the session permanently unclosable',
+        );
+        // The GROUP signal is the dangerous one: it is negated, so it reaches every
+        // process in the group. It therefore requires the recorded root identity to
+        // still verify, or a recycled pid would take down a stranger's whole group.
+        if (rootStillOriginal) {
+            const identity = readProcessIdentity(rootPid, { procRoot: this.procRoot });
+            // Re-read immediately before the kill, so the pid cannot have been
+            // recycled between the caller's gate and this signal.
+            if (identity.ok) {
+                signalTurnTreeGroup(identity.identity, 'SIGKILL', { procRoot: this.procRoot });
+            }
+        }
+        // Per-member signals stay safe even when the recorded root is long gone, and
+        // this is the case that actually matters: a descendant that called setsid
+        // OUTLIVES its parent, so the root-identity gate can never pass for it. Each
+        // pid here was just enumerated as carrying THIS session's env nonce (or as a
+        // descendant of something that does), which is positive evidence of
+        // membership, and the target is a single positive pid rather than a negated
+        // group -- so even a raced pid cannot drag an unrelated group down with it.
+        //
+        // Without this, an escaped survivor was re-proven alive on every retry and
+        // never signalled, so the session could never be closed at all.
+        const scan = scanMojoTree(rootPid, this.treeNonce, {
+            procRoot: this.procRoot,
+            excludePids: this.selfPids(),
+        });
+        if (!scan.ok) return;
+        for (const member of scan.members) {
+            if (member.zombie) continue;   // already reaped; signalling it is pointless
+            try { process.kill(member.pid, 'SIGKILL'); } catch { /* raced us */ }
+        }
     }
 
     kill(): void {
         if (this.killed) return;
         this.killed = true;
+        // Daemon shutdown / worker teardown. SIGTERM is not proof of anything, and
+        // NOTHING is released here on purpose: the handles recorded at spawn are
+        // durable, so an unproven tree survives the restart as an explicit blocker
+        // instead of being silently forgotten. Calling releaseContainmentHandle on
+        // this path would be exactly the laundering this review exists to remove.
+        try {
+            const stillOwned = containmentHandles(this.sessionId).length;
+            if (stillOwned > 0) {
+                logger.warn(
+                    `[mojo] shutdown leaves ${stillOwned} unproven turn subtree(s) for `
+                    + `${this.sessionId}; the blocker will be reloaded on the next boot`,
+                );
+            }
+        } catch (err) {
+            // Never let an unreadable store turn shutdown into a crash; the store
+            // being unreadable already means the next boot fails closed.
+            logger.warn(`[mojo] cannot report outstanding turn subtrees at shutdown: ${String(err)}`);
+        }
         this.shutdownDetachWake?.();
         for (const wake of this.lineageWaiters) wake();
         this.child?.kill('SIGTERM');
@@ -641,6 +998,10 @@ export class MojoBackend implements SessionBackend {
     /** /close teardown — cancel the server-side session so it stops consuming
      *  cloud sandbox time after the IM session is gone. */
     async destroySession(): Promise<SessionDestroyResult> {
+        // Set when the local subtree is unprovable for a reason no retry can fix
+        // (a platform with no /proc). Carried onto the successful result as an
+        // explicit residual marker rather than silently dropped.
+        let residualOnPlatform = false;
         if (this.shutdownDetaching) {
             return {
                 ok: false,
@@ -685,15 +1046,61 @@ export class MojoBackend implements SessionBackend {
         // SIGTERM is not proof, and neither is the direct pid — see
         // terminateChildProven.
         if (!await this.terminateChildProven()) {
-            this.closing = false;
-            return {
-                ok: false,
-                ...(this.cliSessionId ? { taskId: this.cliSessionId } : {}),
-                error: 'mojo_local_child_termination_unproven',
-                // Nothing irreversible has happened yet (the cancel below has NOT
-                // run), so admission may be restored and the close retried.
-                recovery: 'retryable',
-            };
+            // Two very different facts reach this branch, and collapsing them is
+            // what wedged non-Linux hosts.
+            //
+            //  * "the instrument says something may still be running" — real
+            //    evidence of a possibly credentialed survivor. Admission must be
+            //    fenced, because admitting a new turn would layer it on top of a
+            //    live orphan.
+            //  * "this host has no instrument at all" — off Linux there is no
+            //    /proc, so no retry, no delay and no operator action can ever turn
+            //    this into a proof. Fencing it made /close fail forever AND
+            //    refused every rollback, so the session could neither be closed
+            //    nor written to again.
+            //
+            // classifyUnprovenTermination owns that split (see destroy-result.ts);
+            // anything it does not positively recognise as a terminal platform
+            // limit falls through to the fence, so the default stays fail-closed.
+            const verdict = classifyUnprovenTermination(this.lastTurnQuiescence?.kind);
+            if (verdict.outcome === 'residual-close') {
+                // Deliberately NOT setting admissionFenced: that latch is exactly
+                // the wedge. The credential boundary is carried instead by the
+                // containment handle recorded at spawn — on a host this branch can
+                // be reached from, that handle is `unprovable`, which can never be
+                // released, so the device-isolation blocker is retained.
+                //
+                // Execution deliberately CONTINUES into the remote cancel below: a
+                // residual local subtree is no reason to leak the remote session.
+                logger.warn(
+                    `[mojo] session ${this.sessionId}: local turn subtree cannot be proven gone on `
+                    + `this platform (${verdict.reason}); closing with a residual marker instead of `
+                    + 'fencing the session forever — the device-isolation blocker is retained by the '
+                    + 'durable containment handle',
+                );
+                residualOnPlatform = true;
+            } else {
+                // `closing` deliberately STAYS true, and the fence is latched. The
+                // close is retryable (the irreversible remote cancel below has NOT
+                // run), but a process that may still hold the injected credential is
+                // possibly alive — admitting a new turn would layer it on top of that
+                // live orphan. Clearing `closing` here is what made a post-abort
+                // write() succeed on exactly this state.
+                this.admissionFenced = true;
+                // A dispatched turn whose lineage never materialised is an UNCERTAIN
+                // outcome in its own right, and this earlier local failure must not
+                // launder it into `retryable`: the very next check below would have
+                // returned `uncertain` for the same session. Whichever step fails
+                // first, an unnamable remote session stays unnamable.
+                const unnamedRemotePossible = lineageExpected && !this.cliSessionId;
+                return {
+                    ok: false,
+                    ...(this.cliSessionId ? { taskId: this.cliSessionId } : {}),
+                    error: verdict.reason,
+                    recovery: unnamedRemotePossible ? 'uncertain' : 'retryable',
+                    admission: 'fenced',
+                };
+            }
         }
         // A turn was dispatched but its lineage never materialised: there may be a
         // remote session we have no id for, so it cannot be cancelled and cannot be
@@ -713,7 +1120,13 @@ export class MojoBackend implements SessionBackend {
             // admission must stay fenced instead of starting a fresh lineage on top
             // of a possible orphan. The row stays active, which keeps the
             // device-isolation blocker in place.
-            return { ok: false, error: 'mojo_lineage_not_materialized', recovery: 'uncertain' };
+            this.admissionFenced = true;
+            return {
+                ok: false,
+                error: 'mojo_lineage_not_materialized',
+                recovery: 'uncertain',
+                admission: 'fenced',
+            };
         }
         if (this.cliSessionId) {
             let outcome: MojoCancelOutcome;
@@ -740,11 +1153,18 @@ export class MojoBackend implements SessionBackend {
                     taskId: this.cliSessionId,
                     error: outcome.kind === 'failed' ? outcome.message : 'cancel not proven',
                     recovery: 'retryable',
+                    // The local subtree was PROVEN gone above and the remote session
+                    // is named, so there is no unnamed survivor to fence against.
+                    admission: 'restorable',
                 };
             }
         }
         this.killed = true;
-        return { ok: true, ...(this.cliSessionId ? { taskId: this.cliSessionId } : {}) };
+        return {
+            ok: true,
+            ...(this.cliSessionId ? { taskId: this.cliSessionId } : {}),
+            ...(residualOnPlatform ? { residual: 'local_subtree_unprovable_on_platform' as const } : {}),
+        };
     }
 
     /**
@@ -754,12 +1174,30 @@ export class MojoBackend implements SessionBackend {
      * the remote session is gone, so restoring admission would produce a session
      * that looks active but can never continue.
      */
-    abortDestroySession(): void {
+    abortDestroySession(): SessionAbortDestroyResult {
         if (this.killed) {
             logger.warn('[mojo] abortDestroySession ignored: session was already torn down');
-            return;
+            // The session is gone for good, so writes are not "restored" here
+            // either; saying otherwise would let the daemon clear a fence that the
+            // irreversible teardown owns.
+            return { admissionRestored: false, reason: 'session_already_torn_down' };
+        }
+        // A latched fence outranks the rollback. The daemon/worker may legitimately
+        // abort a close it could not commit, but "the close was abandoned" is not
+        // evidence that the possibly-live local subtree died, so restoring writes
+        // here would defeat the fence destroySession deliberately kept.
+        if (this.admissionFenced) {
+            logger.warn(
+                '[mojo] abortDestroySession did NOT restore write admission: a previous close '
+                + 'could not prove local termination (or the turn lineage never materialised). '
+                + 'This session will not accept writes again; retry the close instead',
+            );
+            // Reported, not swallowed: the daemon must persist "still fenced" rather
+            // than infer success from a call that did not throw.
+            return { admissionRestored: false, reason: 'local_termination_unproven' };
         }
         this.closing = false;
+        return { admissionRestored: true };
     }
 
     /**
@@ -957,7 +1395,26 @@ export class MojoBackend implements SessionBackend {
                 detached: true,
             });
             this.child = child;
-            if (typeof child.pid === 'number' && child.pid > 0) this.lastTurnPid = child.pid;
+            if (typeof child.pid === 'number' && child.pid > 0) {
+                this.lastTurnPid = child.pid;
+                // Bind the identity NOW, while the pid is guaranteed to still be
+                // this child: read later, it could already describe a recycled pid.
+                const id = readProcessIdentity(child.pid, { procRoot: this.procRoot });
+                this.turnIdentity = id.ok ? id.identity : null;
+                if (!id.ok) {
+                    // Without an identity the group signal must be refused later, so
+                    // say so once, loudly, rather than discovering it during teardown.
+                    logger.warn(
+                        `[mojo] cannot bind turn identity for pid ${child.pid} (${id.reason}); `
+                        + 'group signalling will be refused and quiescence cannot be proven',
+                    );
+                }
+                // Mint and PERSIST the containment handle before the child can act.
+                // Doing this at close time would be too late: a crash in between is
+                // exactly the window that loses the tree, and a lost tree is one the
+                // next generation can never prove quiescent.
+                this.recordTurnContainment(child.pid);
+            }
             let stderr = '';
 
             child.stdout.on('data', (chunk: Buffer) => this.consume(chunk.toString()));
@@ -1406,10 +1863,47 @@ export async function cancelMojoSessionById(
     // Reuse the instance's CLI plumbing (env layering, JSON envelope parsing,
     // timeout) rather than duplicating spawn logic here. The sentinel session id
     // is only used for logging.
-    const backend = new MojoBackend(config, 'orphan-cancel');
+    const backend = (() => {
+        try {
+            return new MojoBackend(config, 'orphan-cancel');
+        } catch {
+            return null;
+        }
+    })();
+    if (backend === null) {
+        // The constructor fails closed when the containment store is unreadable,
+        // which is correct — but this function DECLARES a structured outcome, and a
+        // throw here does not stay local. Its call site in worker-pool is a
+        // fire-and-forget `void cancelMojoSessionById(...).then(...)` with no
+        // .catch(), and the daemon installs no unhandledRejection handler, so on
+        // Node 22 an unreadable store would terminate the daemon and every session
+        // it serves. Fail-closed must not mean fail-crash.
+        //
+        // Reporting `failed` keeps the intended semantics and is strictly stronger:
+        // an unreadable store is not proof the remote session is gone, so the caller
+        // refuses the close and the device-isolation blocker is retained.
+        logger.error(
+            `[mojo] cannot construct a cancel backend for session ${sessionId}: the containment `
+            + 'store is unreadable, so the close is refused (the blocker is retained)',
+        );
+        return {
+            kind: 'failed',
+            message: `containment store unreadable for session ${sessionId}`,
+            retryable: true,
+        };
+    }
     const attempt = async (): Promise<void> => {
         await backend['runCliJson'](['session', 'cancel', sessionId]);
     };
+    // The LOCAL subtree first. "There is no worker" must never be read as "there is
+    // no local process": the worker dying is exactly what orphans a credentialed
+    // descendant. Cancelling the remote session says nothing about a local one, so
+    // without this check the daemon publishes the row `closed`, the row drops out of
+    // the device-isolation inventory, and the blocker disappears while a credentialed
+    // process is still executing.
+    const localUnproven = proveWorkerlessLocalSubtree(sessionId);
+    if (localUnproven) return localUnproven;
+
     try {
         await attempt();
         return { kind: 'cancelled' };
@@ -1425,4 +1919,61 @@ export async function cancelMojoSessionById(
             return outcome;
         }
     }
+}
+
+/**
+ * Prove (and discharge) the LOCAL subtree a dead worker may have left behind.
+ *
+ * Returns null when everything is proven gone, or when nothing was outstanding.
+ * Any non-proof returns a `failed` outcome so the caller refuses the close and the
+ * session's device-isolation blocker is retained.
+ */
+export function proveWorkerlessLocalSubtree(
+    sessionId: string,
+    opts: { procRoot?: string } = {},
+): MojoCancelOutcome | null {
+    const procRoot = opts.procRoot ?? '/proc';
+    const excludePids = [process.pid, process.ppid].filter(pid => typeof pid === 'number' && pid > 0);
+    let outstanding: ContainmentHandle[];
+    try {
+        outstanding = containmentHandles(sessionId);
+    } catch (err) {
+        // Unreadable store: we cannot know what is outstanding, so the close must not
+        // succeed. Retryable, because a later read may well work.
+        return {
+            kind: 'failed',
+            message: `cannot read containment store for ${sessionId}: ${String(err)}`,
+            retryable: true,
+        };
+    }
+
+    for (const handle of outstanding) {
+        const verdict: QuiescenceVerdict = proveContainmentQuiescent(handle, {
+            procRoot,
+            scan: weak => {
+                const scan = scanMojoTree(weak.rootPid, weak.nonce, { procRoot, excludePids });
+                // `scanned: false` must not collapse into `pids: []`: that reads as
+                // "nothing alive" and would hand back a proof we do not have.
+                return scan.ok
+                    // Same zombie discount as the teardown path, so the workerless
+                    // close cannot disagree with it about the same tree.
+                    ? { scanned: true, pids: scan.members.filter(m => !m.zombie).map(m => m.pid) }
+                    : { scanned: false, pids: [], reason: scan.reason };
+            },
+        });
+        if (!verdict.proven) {
+            logger.error(
+                `[mojo] workerless close for ${sessionId}: local subtree `
+                + `${containmentHandleKey(handle)} could not be proven quiescent (${verdict.reason}); `
+                + 'refusing to report the session closed so its device-isolation blocker is retained',
+            );
+            return {
+                kind: 'failed',
+                message: `local subtree unproven: ${verdict.reason}`,
+                retryable: true,
+            };
+        }
+        releaseContainmentHandle(verdict);
+    }
+    return null;
 }

@@ -1,6 +1,7 @@
 import { execFileSync, type ChildProcess } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { readFileSync, existsSync, mkdirSync, unlinkSync, watch, readdirSync } from 'node:fs';
+import { installDaemonRejectionGuard } from './utils/daemon-rejection-guard.js';
 import { atomicWriteFileSync } from './utils/atomic-write.js';
 import { readAllowedUsersResolveCache, writeAllowedUsersResolveCache } from './utils/allowed-users-cache.js';
 import { join, dirname } from 'node:path';
@@ -20689,6 +20690,18 @@ async function waitForManagedActivationCommit(index: number, appId: string): Pro
 }
 
 export async function startDaemon(botIndex?: number): Promise<void> {
+  // Survive a fire-and-forget rejection instead of dying from it. Installed here
+  // rather than in index-daemon.ts on purpose: startDaemon has TWO entry points
+  // (index-daemon.ts and index-core-only.ts), so guarding the entry file would
+  // leave the other one unprotected. Idempotent, so an entry point may also call
+  // it earlier without harm.
+  //
+  // Node's default is to terminate the process, which is right for a worker (it
+  // owns one session) and wrong for the daemon (it owns every session): one
+  // missed `.catch` on one session's teardown would otherwise end every other
+  // live Lark session too. The rejection is logged loudly at error level — this
+  // is a backstop for the next missed `.catch`, not permission to omit them.
+  installDaemonRejectionGuard(logger);
   // Repair a shared tmux server polluted by an older botmux immediately on
   // daemon startup. This must not depend on restoring/spawning a bmx-* session:
   // a user-held tmux server can outlive every botmux pane and still leak stale

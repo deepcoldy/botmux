@@ -1832,13 +1832,29 @@ export async function restoreActiveSessions(
       // to close that backend's row. Fence it for operator inspection; never let
       // an untyped JSON field become a cross-backend teardown primitive.
       session.mojoCloseJournal = {
-        ...session.mojoCloseJournal,
         phase: 'uncertain',
+        requestId: session.mojoCloseJournal.requestId,
+        ...(session.mojoCloseJournal.taskId
+          ? { taskId: session.mojoCloseJournal.taskId }
+          : {}),
+        // State the verdict rather than leaving a reader to infer it from the
+        // phase, and rebuild the row from scratch so a stale commit-only marker
+        // cannot survive as false proof of an irreversible teardown.
+        recovery: 'uncertain',
+        admission: 'fenced',
         updatedAt: new Date().toISOString(),
       };
       quarantineUnregisteredRestoreSession(session, 'mojo_close_journal_backend_mismatch');
       continue;
     }
+    // ORDER IS LOAD-BEARING: this branch must stay ABOVE the catch-all below,
+    // which rebuilds any remaining journal as `uncertain` + fenced. A commit-only
+    // `prepared` row means the remote teardown already happened and only the local
+    // commit is outstanding; downgrading it to `uncertain` would demand manual
+    // reconciliation for something no retry can resolve, wedging the session open
+    // forever with its device-isolation blocker held. Pinned by
+    // "does NOT downgrade a COMMIT-ONLY prepared close" in
+    // test/restore-zombie-close.test.ts, which goes red if these are reordered.
     if (session.mojoCloseJournal?.phase === 'prepared') {
       if (session.mojoQuarantinedLineage) {
         // The active lineage is proven gone, but an older PARKED lineage still
@@ -1879,8 +1895,16 @@ export async function restoreActiveSessions(
       // the durable intent into an explicit uncertainty fence and reserve the
       // routing anchor; never auto-cancel or launch a replacement generation.
       session.mojoCloseJournal = {
-        ...session.mojoCloseJournal,
         phase: 'uncertain',
+        requestId: session.mojoCloseJournal.requestId,
+        ...(session.mojoCloseJournal.taskId
+          ? { taskId: session.mojoCloseJournal.taskId }
+          : {}),
+        // State the verdict rather than leaving a reader to infer it from the
+        // phase, and rebuild the row from scratch so a stale commit-only marker
+        // cannot survive as false proof of an irreversible teardown.
+        recovery: 'uncertain',
+        admission: 'fenced',
         updatedAt: new Date().toISOString(),
       };
       quarantineUnregisteredRestoreSession(session, 'mojo_close_reconciliation_required');

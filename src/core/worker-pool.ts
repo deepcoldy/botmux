@@ -15,6 +15,7 @@ import { cliSupportsNativeUsage } from '../services/transcript-resolver.js';
 import { cleanupTraexAskHooks, installHook } from '../adapters/hook-installer.js';
 import { hookCommandFor } from '../adapters/hook-command.js';
 import { randomBytes, randomUUID } from 'node:crypto';
+import { mayRestoreWriteAdmission } from '../adapters/backend/destroy-result.js';
 import { config } from '../config.js';
 import { readGlobalConfig } from '../global-config.js';
 import * as sessionStore from '../services/session-store.js';
@@ -600,6 +601,8 @@ type RemoteWorkerCloseResult = {
   error?: string;
   /** Absent means `retryable`, the historical behaviour. See SessionDestroyResult. */
   recovery?: 'retryable' | 'uncertain' | 'irreversible';
+  /** Absent means: derive from `recovery`. See mayRestoreWriteAdmission. */
+  admission?: 'restorable' | 'fenced';
 };
 
 const pendingRemoteWorkerCloses = new Map<string, {
@@ -3006,6 +3009,25 @@ function destroyOrphanedBackingSession(
       logger.info(`[${tag(ds)}] killWorker: orphan mojo session ${remoteId} cancelled`);
       ds.session.riffParentTaskId = undefined;
       sessionStore.updateSession(ds.session);
+    }).catch((err: unknown) => {
+      // Defence in depth for a FIRE-AND-FORGET promise. This helper is
+      // synchronous, so there is no caller to reject to: an escaping rejection
+      // becomes an unhandledRejection, and the daemon installs no handler for
+      // those (only worker.ts does), so Node v22 terminates the process --
+      // taking down every OTHER session this daemon serves. The awaited call
+      // site already guards itself the same way; tmux-pipe-backend.ts documents
+      // a real incident of exactly this shape.
+      //
+      // Reachable, not theoretical: cancelMojoSessionById constructs a backend
+      // before its own try block, so an unreadable containment store throws out
+      // of it rather than returning the structured failure its type promises.
+      // sessionStore.updateSession above can throw for the same reason (a failed
+      // save). Both must degrade to a retained lineage, never to a crash.
+      logger.error(
+        `[${tag(ds)}] killWorker: orphan mojo cancel for ${remoteId} threw; `
+        + `retaining the lineage for explicit /close or manual cleanup: `
+        + `${err instanceof Error ? err.message : String(err)}`,
+      );
     });
     return;
   }
@@ -3048,8 +3070,29 @@ type RemoteClosePreparation =
         /** Bot deregistered — retryable once it is registered again. */
         | 'mojo_config_missing'
         /** Durable lineage with no active owner to cancel through. */
-        | 'mojo_close_identity_missing';
-      retryable: true;
+        | 'mojo_close_identity_missing'
+        /**
+         * The remote teardown already happened irreversibly, but the local close
+         * did not finish. ONLY the local commit may be retried.
+         */
+        | 'mojo_close_commit_required';
+      /**
+       * May the caller simply try the SAME close again?
+       *
+       * This was hardcoded `true`, which contradicted the tri-state it was
+       * reporting: an `uncertain` prepare needs explicit reconciliation (a blind
+       * retry cannot cancel a session nobody can name), and an `irreversible`
+       * one must never re-run the remote cancel. `false` means "do not loop on
+       * this; a human/reconciler decides".
+       */
+      retryable: boolean;
+      /**
+       * The exact worker verdict, when this refusal came from one. `retryable`
+       * appears here too: a close whose WRITES stay fenced may still itself be
+       * retryable, and flattening that into `uncertain` would demand manual
+       * reconciliation for a failure the retry can clear.
+       */
+      recovery?: 'retryable' | 'uncertain' | 'irreversible';
       taskId?: string;
     };
 
@@ -3069,9 +3112,19 @@ async function abortLiveRemoteWorkerClose(
     return false;
   }
 
-  const restored = await new Promise<{ ok: boolean; error?: string }>(resolve => {
+  const restored = await new Promise<{
+    ok: boolean;
+    admissionRestored?: boolean;
+    fenceReason?: string;
+    error?: string;
+  }>(resolve => {
     let settled = false;
-    const finish = (result: { ok: boolean; error?: string }): void => {
+    const finish = (result: {
+      ok: boolean;
+      admissionRestored?: boolean;
+      fenceReason?: string;
+      error?: string;
+    }): void => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
@@ -3086,7 +3139,17 @@ async function abortLiveRemoteWorkerClose(
         finish({ ok: false, error: 'stale_worker_generation' });
         return;
       }
-      finish({ ok: msg.ok, ...(msg.error ? { error: msg.error } : {}) });
+      // `ok` says the abort was HANDLED; `admissionRestored` says whether writes
+      // actually came back. A backend holding a latched fence answers ok:true /
+      // admissionRestored:false, and inferring restoration from `ok` journalled a
+      // cleared fence while write() kept returning false. Absent means `ok`
+      // (legacy backends, riff).
+      finish({
+        ok: msg.ok,
+        admissionRestored: msg.admissionRestored ?? msg.ok,
+        ...(msg.fenceReason ? { fenceReason: msg.fenceReason } : {}),
+        ...(msg.error ? { error: msg.error } : {}),
+      });
     };
     const onExit = (): void => finish({
       ok: false,
@@ -3106,11 +3169,17 @@ async function abortLiveRemoteWorkerClose(
     }
   });
 
-  if (restored.ok && ds.remoteCloseState?.requestId === requestId) {
+  // A handled-but-REFUSED abort must not clear the fence. `ok` alone did, which
+  // is the same laundering as before, one path over.
+  const admissionRestored = restored.ok && restored.admissionRestored !== false;
+  if (admissionRestored && ds.remoteCloseState?.requestId === requestId) {
     ds.remoteCloseState = undefined;
     return true;
   }
+  // A proven earlier restore excuses a MISSING ack, never a refused one: the
+  // backend just told us writes are still fenced.
   if (opts.allowAbsentAfterProvenRestore
+      && restored.admissionRestored !== false
       && ds.remoteCloseState?.requestId === requestId) {
     ds.remoteCloseState = undefined;
     return true;
@@ -3119,7 +3188,8 @@ async function abortLiveRemoteWorkerClose(
     ds.remoteCloseState = { ...ds.remoteCloseState, phase: 'uncertain' };
   }
   logger.warn(
-    `[${tag(ds)}] Remote close abort was not acknowledged (${restored.error ?? 'unknown'}); `
+    `[${tag(ds)}] Remote close abort did not restore write admission `
+    + `(${restored.fenceReason ?? restored.error ?? 'unknown'}); `
     + 'retaining admission fence pending explicit lineage reconciliation',
   );
   return false;
@@ -3201,6 +3271,18 @@ async function prepareLiveRemoteWorkerClose(
     };
   }
   if (ds.remoteCloseState) {
+    // An `uncertain` fence is NOT a retry candidate: nothing here can prove the
+    // remote session gone, so reporting it as retryable invited an infinite
+    // close loop that re-fenced the same unresolved state forever.
+    if (backendType === 'mojo' && ds.remoteCloseState.phase === 'uncertain') {
+      return {
+        ok: false,
+        error: 'mojo_close_reconciliation_required',
+        retryable: false,
+        recovery: 'uncertain',
+        ...(ds.remoteCloseState.taskId ? { taskId: ds.remoteCloseState.taskId } : {}),
+      };
+    }
     return {
       ok: false,
       error: backendType === 'riff' ? 'riff_worker_close_failed' : 'mojo_cancel_failed',
@@ -3329,33 +3411,122 @@ async function prepareLiveRemoteWorkerClose(
     // remote session may exist) and after an `irreversible` one (the remote side is
     // already gone), which laundered both back into `retryable` end to end.
     const recovery = result.recovery ?? 'retryable';
-    if (recovery !== 'retryable') {
-      // No abort, and no journal clear: the runtime fence and the durable row both
-      // stay as they are, so the session remains active and keeps its
-      // device-isolation blocker while the operator retries.
+    // Whether writes may be admitted is a DIFFERENT question from whether the
+    // close may be retried. Keying the rollback on `recovery` re-opened admission
+    // for an unproven local child termination (retryable, yet a credentialed
+    // process may still be alive); absent `admission` keeps the historical
+    // derivation so riff and older workers are unaffected.
+    // Delegated to the shared helper rather than re-implementing the derivation:
+    // two copies of this rule is how the daemon drifted back to reading
+    // `recovery` and re-opened admission on a latched fence.
+    const mayRestore = mayRestoreWriteAdmission({
+      ok: false,
+      ...(result.recovery ? { recovery: result.recovery } : {}),
+      ...(result.admission ? { admission: result.admission } : {}),
+    });
+    if (!mayRestore) {
+      // No abort: the runtime fence stays up, so the session remains active and
+      // keeps its device-isolation blocker. But the DURABLE row must also stop
+      // saying `preparing` with the pre-prepare task id -- a crash here left a
+      // journal that could not be told apart from an interrupted cancel, and
+      // silently discarded the exact lineage the worker just reported.
+      const irreversible = recovery === 'irreversible';
+      let journalled = false;
+      try {
+        const committed = sessionStore.markMojoCloseUnresolved(
+          ds.session.sessionId,
+          requestId,
+          {
+            recovery,
+            // The EXACT id from close_result (the pre-init window means the worker
+            // may be the first to know it), not the pre-prepare guess.
+            ...(taskId ? { taskId } : {}),
+            // Persisted verbatim and separately from `recovery`: no close_abort
+            // was sent, so writes are still fenced even when the close itself is
+            // retryable. Re-deriving this on restore is what re-opened admission.
+            admission: 'fenced',
+          },
+        );
+        ds.session.mojoCloseJournal = committed.mojoCloseJournal;
+        ds.session.riffParentTaskId = committed.riffParentTaskId;
+        journalled = true;
+      } catch (err) {
+        // Fail closed: keep the runtime fence exactly as strict as the disk state
+        // is ambiguous. Never fall back to a rollback.
+        logger.error(
+          `[${tag(ds)}] Mojo ${recovery} close verdict could not be journalled: `
+          + `${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+      // An irreversible teardown leaves ONLY the local commit outstanding, so the
+      // runtime state must be `prepared` -- parking it at `uncertain` made every
+      // retry bounce off the fence and the row could never be closed at all.
+      // NOTE: the runtime phase deliberately stays `uncertain` for everything
+      // that is not a journalled irreversible teardown. A retryable-but-fenced
+      // close is recorded as `preparing` in the DURABLE journal (a restart may
+      // retry the cancel), but within this process the reconciliation gate
+      // refuses a retry either way, so distinguishing the runtime phase here
+      // would be an untestable claim.
       ds.remoteCloseState = {
-        phase: 'uncertain',
+        phase: irreversible && journalled ? 'prepared' : 'uncertain',
         requestId,
         ...(taskId ? { taskId } : {}),
       };
       logger.error(
         `[${tag(ds)}] mojo worker close prepare failed as ${recovery} `
-        + `(${result.error ?? 'unknown'}); admission stays fenced and the session `
-        + 'remains active for retry',
+        + `(${result.error ?? 'unknown'}); admission stays fenced, `
+        + `journal=${journalled ? ds.session.mojoCloseJournal?.phase ?? 'unknown' : 'unwritten'}`,
       );
-      // Reuses the existing code: the caller-visible contract is unchanged (a
-      // failed, retryable close). What differs is that no rollback was attempted,
-      // which the log line above states explicitly.
-      return {
-        ok: false,
-        error: 'mojo_cancel_failed',
-        retryable: true,
-        ...(taskId ? { taskId } : {}),
-      };
+      if (!journalled) {
+        return {
+          ok: false,
+          error: 'mojo_durable_close_failed',
+          retryable: true,
+          recovery,
+          ...(taskId ? { taskId } : {}),
+        };
+      }
+      // Fenced but still retryable (an unproven LOCAL termination; the
+      // irreversible remote cancel never ran). The close may be retried as a
+      // close -- reporting it as `mojo_close_reconciliation_required` would
+      // strand a session a plain retry can still finish.
+      if (recovery === 'retryable') {
+        return {
+          ok: false,
+          error: 'mojo_cancel_failed',
+          retryable: true,
+          recovery,
+          ...(taskId ? { taskId } : {}),
+        };
+      }
+      return irreversible
+        // Retryable, but only as a LOCAL commit: the durable journal is now
+        // commit-only, so a retry can never issue a second cancel.
+        ? {
+            ok: false,
+            error: 'mojo_close_commit_required',
+            retryable: true,
+            recovery,
+            ...(taskId ? { taskId } : {}),
+          }
+        // Unknown outcome: a blind retry proves nothing. Demand reconciliation
+        // instead of advertising a retry that cannot succeed.
+        : {
+            ok: false,
+            error: 'mojo_close_reconciliation_required',
+            retryable: false,
+            recovery,
+            ...(taskId ? { taskId } : {}),
+          };
     }
     const admissionRestored = await abortLiveRemoteWorkerClose(ds, requestId, {
       allowAbsentAfterProvenRestore: matchedCloseResult,
     });
+    // NOTE: no separate "refused" branch here. finishMojoCloseAbort already keeps
+    // a durable fenced row when admissionRestored is false; the bug was never its
+    // behaviour but the CALLER inventing that flag from `close_abort_result.ok`.
+    // An extra branch differing only in which non-clearing row it writes was not
+    // distinguishable by any test, so it is not claimed as a fix.
     try {
       const committed = sessionStore.finishMojoCloseAbort(
         ds.session.sessionId,
@@ -10236,6 +10407,9 @@ function setupWorkerHandlers(
           ...(msg.taskId ? { taskId: msg.taskId } : {}),
           ...(msg.error ? { error: msg.error } : {}),
           ...(msg.recovery ? { recovery: msg.recovery } : {}),
+          // Forwarded, never re-derived: the backend may keep writes fenced on a
+          // close that is otherwise retryable, and only it knows that.
+          ...(msg.admission ? { admission: msg.admission } : {}),
         });
         break;
       }

@@ -578,6 +578,22 @@ export function isValidMojoCloseJournal(
       && journal.phase !== 'uncertain') return false;
   if (typeof journal.requestId !== 'string' || !journal.requestId.trim()) return false;
   if (typeof journal.updatedAt !== 'string' || !journal.updatedAt.trim()) return false;
+  if (journal.recovery !== undefined
+      && journal.recovery !== 'retryable'
+      && journal.recovery !== 'uncertain'
+      && journal.recovery !== 'irreversible') return false;
+  if (journal.admission !== undefined
+      && journal.admission !== 'restorable'
+      && journal.admission !== 'fenced') return false;
+  if (journal.commitOnly !== undefined && typeof journal.commitOnly !== 'boolean') return false;
+  // A retryable verdict never proves an irreversible teardown, so it must not
+  // arrive wearing the marker that suppresses further cancellation.
+  if (journal.recovery === 'retryable' && journal.commitOnly === true) return false;
+  // An irreversible verdict is only ever legal as a commit-only `prepared` row:
+  // the remote side is gone, so nothing may cancel or abort it again.
+  if (journal.recovery === 'irreversible'
+      && (journal.phase !== 'prepared' || journal.commitOnly !== true)) return false;
+  if (journal.commitOnly === true && journal.phase !== 'prepared') return false;
   return journal.taskId === undefined
     || (typeof journal.taskId === 'string' && !!journal.taskId.trim());
 }
@@ -626,6 +642,12 @@ export function beginMojoCloseJournal(
     if (existing) {
       if (existing.requestId !== requestId) {
         throw new Error(`another Mojo close journal already owns ${sessionId}`);
+      }
+      if (existing.commitOnly) {
+        // The remote teardown already completed irreversibly; only the local
+        // commit may be retried. Starting a second cancel here is exactly the
+        // double teardown this journal exists to prevent.
+        throw new Error(`cannot re-cancel commit-only Mojo close journal for ${sessionId}`);
       }
       if (existing.phase !== 'preparing') {
         throw new Error(`cannot restart ${existing.phase} Mojo close journal for ${sessionId}`);
@@ -691,6 +713,13 @@ export function finishMojoCloseAbort(
     if (!existing || existing.requestId !== requestId) {
       throw new Error(`stale Mojo close abort for ${sessionId}`);
     }
+    if (existing.commitOnly || existing.recovery === 'irreversible') {
+      // Checked BEFORE the generic prepared guard so the refusal names the reason:
+      // rolling this back would re-open write admission on a lineage whose remote
+      // side is already gone, leaving a session that looks writable and can never
+      // continue.
+      throw new Error(`cannot abort irreversible Mojo close journal for ${sessionId}`);
+    }
     if (existing.phase === 'prepared') {
       throw new Error(`cannot abort prepared Mojo close proof for ${sessionId}`);
     }
@@ -711,6 +740,77 @@ export function finishMojoCloseAbort(
       phase: 'uncertain',
       requestId,
       ...(retainedTaskId ? { taskId: retainedTaskId } : {}),
+      recovery: 'uncertain',
+      admission: 'fenced',
+      updatedAt: new Date().toISOString(),
+    };
+  });
+}
+
+/**
+ * Persist a FAILED prepare that must NOT be rolled back, with its exact verdict.
+ *
+ * Such a prepare previously left the journal at `preparing` carrying the
+ * PRE-prepare task id: a restart could not tell "reconcile me" apart from "only
+ * the local commit is left", the lineage the worker actually reported was
+ * dropped, and nothing recorded that write admission was never re-opened.
+ *
+ * `irreversible` is stored as a commit-only `prepared` row on purpose - every
+ * existing recovery path (restore, retry, abort) then treats it as
+ * un-cancellable and finishes only the local close.
+ */
+export function markMojoCloseUnresolved(
+  sessionId: string,
+  requestId: string,
+  options: {
+    /**
+     * Whether the CLOSE may be retried. `retryable` is a legitimate value here:
+     * a close that keeps writes fenced is not automatically un-retryable, and
+     * forcing it into `uncertain` would forbid the retry that can still succeed.
+     */
+    recovery: 'retryable' | 'uncertain' | 'irreversible';
+    taskId?: string;
+    /** Whether a new WRITE may be admitted. Recorded verbatim, never derived. */
+    admission: 'restorable' | 'fenced';
+  },
+): Session {
+  return mutateMojoCloseJournal(sessionId, (session) => {
+    const existing = session.mojoCloseJournal;
+    if (existing && existing.requestId !== requestId) {
+      throw new Error(`stale Mojo close verdict for ${sessionId}`);
+    }
+    if (existing?.commitOnly && options.recovery !== 'irreversible') {
+      // Never downgrade a recorded irreversible teardown into something a later
+      // caller may cancel or abort again.
+      throw new Error(`cannot downgrade commit-only Mojo close journal for ${sessionId}`);
+    }
+    if (existing?.taskId && options.taskId && existing.taskId !== options.taskId) {
+      throw new Error(`Mojo close verdict changed journal lineage for ${sessionId}`);
+    }
+    const exactTaskId = options.taskId ?? existing?.taskId;
+    if (exactTaskId && session.riffParentTaskId
+        && session.riffParentTaskId !== exactTaskId) {
+      throw new Error(`Mojo close verdict lineage changed for ${sessionId}`);
+    }
+    // The worker may have learned the lineage only DURING the prepare (the
+    // pre-init window), so persist that exact id: a retry or a manual
+    // reconciliation must address the real remote session, not the stale guess.
+    if (exactTaskId) session.riffParentTaskId = exactTaskId;
+    const irreversible = options.recovery === 'irreversible';
+    // A still-retryable close keeps its `preparing` intent: a retry SHOULD re-run
+    // the cancel. Promoting it to `uncertain` would demand manual reconciliation
+    // for a failure the retry can clear on its own -- while `admission: 'fenced'`
+    // independently keeps writes out.
+    const phase = irreversible
+      ? 'prepared'
+      : options.recovery === 'retryable' ? 'preparing' : 'uncertain';
+    session.mojoCloseJournal = {
+      phase,
+      requestId,
+      ...(exactTaskId ? { taskId: exactTaskId } : {}),
+      recovery: options.recovery,
+      admission: options.admission,
+      ...(irreversible ? { commitOnly: true } : {}),
       updatedAt: new Date().toISOString(),
     };
   });

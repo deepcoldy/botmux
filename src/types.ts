@@ -325,6 +325,33 @@ export interface Session {
     requestId: string;
     taskId?: string;
     updatedAt: string;
+    /**
+     * The EXACT verdict the worker returned for a failed prepare.
+     *
+     * Without it the journal collapsed two different states into one row: an
+     * `uncertain` prepare (a remote session may exist and must be reconciled)
+     * and an `irreversible` one (the remote side is provably gone, only the
+     * local commit is outstanding). A restart then could not tell whether
+     * re-cancelling was required, forbidden, or merely useless.
+     */
+    recovery?: 'retryable' | 'uncertain' | 'irreversible';
+    /**
+     * May a new write be admitted? Stored SEPARATELY from `recovery` on purpose.
+     *
+     * The two answers legitimately disagree: an unproven local child termination
+     * is `retryable` (the irreversible remote cancel never ran, so the close may
+     * be retried) while a credentialed process may still be alive, so writes must
+     * stay fenced. Collapsing them into one durable field is exactly how a
+     * `fenced` state got re-derived as `retryable` on restore and re-opened
+     * admission on a live orphan.
+     */
+    admission?: 'restorable' | 'fenced';
+    /**
+     * Irreversible: the remote teardown already happened. A retry may only
+     * re-run the LOCAL commit — issuing another cancel, or an abort that
+     * re-opens admission on a dead lineage, is forbidden.
+     */
+    commitOnly?: boolean;
   };
   /** riff 多仓 stamp：多仓 worktree 流按用户选择顺序创建的 worktree 目录列表。
    *  仅该 stamp 存在时 riff 才做多仓推导（首仓=primary）；普通非 git 工作目录
@@ -1209,6 +1236,19 @@ export type WorkerToDaemon =
       type: 'close_abort_result';
       requestId: string;
       ok: boolean;
+      /**
+       * Did the backend ACTUALLY restore write admission?
+       *
+       * Distinct from `ok` on purpose. A rollback can be handled successfully and
+       * still be REFUSED, because the backend holds a latched fence (an unproven
+       * local subtree, an unnamed remote session): "the close was abandoned" is not
+       * evidence that the survivor died. The daemon inferred restoration from `ok`
+       * alone, so a refused rollback was journalled as `admissionRestored: true`
+       * while write() kept returning false. Absent means `ok` (legacy behaviour).
+       */
+      admissionRestored?: boolean;
+      /** Why admission is still fenced, for logs and the durable journal. */
+      fenceReason?: string;
       error?: string;
     }
   | {
@@ -1225,4 +1265,13 @@ export type WorkerToDaemon =
        * laundered `uncertain` back into `retryable`. See SessionDestroyResult.
        */
       recovery?: 'retryable' | 'uncertain' | 'irreversible';
+      /**
+       * May write admission be restored? SEPARATE from `recovery`, which answers
+       * whether the CLOSE may be retried. They disagree on a real state: an
+       * unproven local child termination is retryable (nothing irreversible ran)
+       * while a process holding the injected credential may still be alive.
+       * Deriving one from the other is what re-opened writes onto a live orphan.
+       * Absent is derived from `recovery`. See SessionDestroyResult.
+       */
+      admission?: 'restorable' | 'fenced';
     };

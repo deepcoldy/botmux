@@ -16,6 +16,7 @@ import type {
 import { deviceCredentialIsolationMarkerPath } from '../adapters/cli/read-isolation.js';
 import { getBot } from '../bot-registry.js';
 import { quarantinedLauncherEnvKeys, quarantinedSessionIds } from './mojo-launcher-env-quarantine.js';
+import { containmentSessionIds, hasUnprovenContainment } from './mojo-containment.js';
 import { config } from '../config.js';
 import { isMojoFullyRemote } from '../adapters/backend/sandbox.js';
 import { readSecureHostFileSync } from '../platform/secure-host-file.js';
@@ -65,6 +66,16 @@ export type DeviceIsolationBlocker =
    */
   | 'mojo_launcher_env_residual'
   /**
+   * An outstanding containment handle: a turn subtree nobody proved quiescent.
+   *
+   * Same residual problem as the launcher-env record, different evidence. The
+   * handle outlives the worker generation AND the session row, so an explicit
+   * `/close` (which deletes the row) must not be able to make an unproven
+   * credentialed subtree vanish from the inventory. Only
+   * releaseContainmentHandle, which demands a `proven` verdict, removes it.
+   */
+  | 'mojo_containment_unproven'
+  /**
    * A mojo session, unconditionally.
    *
    * Unlike riff (pure HTTP, nothing executes here), MojoBackend.runTurn() calls
@@ -94,6 +105,9 @@ export interface DeviceIsolationRuntimeSession {
   /** Present only for a session re-admitted from the durable quarantine record
    *  because no row survives (see appendResidualMojoLauncherEnvSessions). */
   mojoLauncherEnvResidual?: boolean;
+  /** Re-admitted from a durable containment handle with no surviving row
+   *  (see appendResidualContainmentSessions). */
+  containmentResidual?: boolean;
   /** Backend stamped by daemon-owned state, if this session predates no stamp. */
   frozenBackend?: BackendType;
   /** Exact worker-selected persistent resource. Shared Herdr carries both the
@@ -485,7 +499,7 @@ function defaultRuntimeSessions(): DeviceIsolationRuntimeSession[] {
   // QUARANTINE_UNREADABLE_SENTINEL: unreadable durable state must fail CLOSED,
   // because "cannot read" is not "nothing there".
   const merged = mergePersistedDeviceIsolationSessions(runtime, sessionStore.listSessionsStrict());
-  return appendResidualMojoLauncherEnvSessions(merged);
+  return appendResidualContainmentSessions(appendResidualMojoLauncherEnvSessions(merged));
 }
 
 /**
@@ -501,6 +515,64 @@ function safeQuarantinedSessionIds(): string[] {
       + `(${err instanceof Error ? err.message : String(err)})`,
     );
   }
+}
+
+/**
+ * Containment ids, or a hard failure.
+ *
+ * Mirrors safeQuarantinedSessionIds: an unreadable handle store must not become
+ * "no residual sessions", because that is precisely the state in which an
+ * unproven credentialed subtree would stop blocking activation.
+ */
+function safeContainmentSessionIds(): string[] {
+  try {
+    return containmentSessionIds();
+  } catch (err) {
+    throw new Error(
+      'refusing device-isolation activation: mojo containment handles are unreadable '
+      + `(${err instanceof Error ? err.message : String(err)})`,
+    );
+  }
+}
+
+/** Does this session still own a containment handle? Unreadable fails CLOSED. */
+function hasDurableContainmentHandle(sessionId: string): boolean {
+  try {
+    return hasUnprovenContainment(sessionId);
+  } catch {
+    return true;
+  }
+}
+
+/**
+ * Re-admit sessions that exist ONLY as a durable containment handle.
+ *
+ * An explicit `/close` deletes the row and the worker generation is long gone,
+ * yet the handle says a turn subtree was never proven quiescent — so the session
+ * must keep blocking credential activation instead of disappearing.
+ *
+ * Exported for tests: the whole point is a session with no row anywhere.
+ */
+export function appendResidualContainmentSessions(
+  sessions: readonly DeviceIsolationRuntimeSession[],
+  containedIds: readonly string[] = safeContainmentSessionIds(),
+): DeviceIsolationRuntimeSession[] {
+  const out = [...sessions];
+  const known = new Set(sessions.map((session) => session.sessionId));
+  for (const sessionId of containedIds) {
+    if (known.has(sessionId)) continue;   // already represented, keeps its own classification
+    out.push({
+      sessionId,
+      adopted: false,
+      frozenBackend: 'mojo',
+      // Unprovable by construction: a handle exists precisely because nothing
+      // proved the subtree gone.
+      remoteExecutionProven: false,
+      workerPresent: false,
+      containmentResidual: true,
+    });
+  }
+  return out;
 }
 
 /**
@@ -606,6 +678,12 @@ function classifySession(session: DeviceIsolationRuntimeSession): DeviceIsolatio
   // as nothing-to-tear-down.
   if (session.mojoLauncherEnvResidual || hasDurableMojoQuarantine(session.sessionId)) {
     return blockerEntry(session, backendType, 'mojo_launcher_env_residual');
+  }
+  // Same reasoning for an outstanding containment handle, and checked just as
+  // early: a row that still exists must not reach a branch that could grant it
+  // `quiescent` while a subtree nobody proved gone still holds the credential.
+  if (session.containmentResidual || hasDurableContainmentHandle(session.sessionId)) {
+    return blockerEntry(session, backendType, 'mojo_containment_unproven');
   }
 
   // mojo, unconditionally: every turn spawns a credentialed local CLI child and no

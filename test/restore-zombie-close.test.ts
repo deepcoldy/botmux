@@ -352,6 +352,45 @@ describe('restoreActiveSessions — persistent-backend zombie-close decision', (
     expect(sessionStore.getSession(s.sessionId)?.mojoCloseJournal).toBeUndefined();
   });
 
+  it('does NOT downgrade a COMMIT-ONLY prepared close into an uncertain fence', async () => {
+    // Liveness guard for a load-bearing branch ORDER. The `phase === 'prepared'`
+    // branch must run BEFORE the catch-all that rebuilds any remaining journal as
+    // `uncertain` + fenced. If the two are ever reordered, an irreversible
+    // teardown (remote side already gone, only the local commit outstanding) is
+    // rewritten as "needs manual reconciliation" and its local commit can never
+    // complete again -- the session is wedged open forever, still holding its
+    // device-isolation blocker.
+    const s = makeActivePersistentSession('om_mojo_commit_only_recovery');
+    s.backendType = 'mojo';
+    s.riffParentTaskId = 'mojo-commit-only-id';
+    s.mojoIdentity = { cloud: true };
+    s.mojoCloseJournal = {
+      phase: 'prepared',
+      requestId: 'close-before-crash',
+      taskId: 'mojo-commit-only-id',
+      recovery: 'irreversible',
+      admission: 'fenced',
+      commitOnly: true,
+      updatedAt: new Date().toISOString(),
+    };
+    sessionStore.updateSession(s);
+    sessionStore.init();
+    const map = new Map<string, DaemonSession>();
+    wp.registry = map;
+
+    await restoreActiveSessions(map);
+
+    // The local commit ran: row closed, journal cleared, nothing re-cancelled.
+    expect(closeSession).toHaveBeenCalledWith(s.sessionId);
+    expect(sessionStore.getSession(s.sessionId)).toMatchObject({ status: 'closed' });
+    const after = sessionStore.getSession(s.sessionId);
+    expect(after?.mojoCloseJournal).toBeUndefined();
+    // And specifically NOT the downgrade the catch-all would have written.
+    expect(after?.mojoCloseJournal?.phase).not.toBe('uncertain');
+    expect(map.size).toBe(0);
+    expect(forkWorker).not.toHaveBeenCalled();
+  });
+
   it('keeps a prepared close quarantined when a parked residual still needs a user surface', async () => {
     const s = makeActivePersistentSession('om_mojo_prepared_residual');
     s.backendType = 'mojo';

@@ -36,7 +36,7 @@ import {
   type IsolationCapability,
 } from './adapters/cli/read-isolation.js';
 import { buildFsPolicy, compileToSeatbelt, migrateLegacySandboxFields, resolveRedirectedAdapterAuthPaths, FsPolicyConfigError } from './adapters/cli/fs-policy.js';
-import { buildCloseResultMessage, normalizeDestroyResult, mayRestoreWriteAdmission } from './adapters/backend/destroy-result.js';
+import { buildCloseResultMessage, normalizeDestroyResult, mayRestoreWriteAdmission, interpretAbortOutcome, classifyRestartTeardown, type RestartTeardownOutcome } from './adapters/backend/destroy-result.js';
 import { isRemoteBackendType, killPersistentBackendTarget, killPersistentSession, probePersistentBackendTarget, probePersistentSession, shouldRejectPersistentPostKillProbe, type PersistentBackendType } from './core/persistent-backend.js';
 import { finalizeRawCommandDelivery, writeRawCommandLine } from './core/raw-command-writer.js';
 import { rawCommandWriteOptionsFor } from './core/raw-command-write-options.js';
@@ -14561,13 +14561,47 @@ async function restartCliProcess(
       const restartingBackend = backend;
       if (restartingBackend) intentionalRestartBackend = restartingBackend;
       const teardown = restartingBackend?.destroySession?.();
+      let teardownOutcome: RestartTeardownOutcome = { kind: 'absent' };
       if (teardown && typeof (teardown as Promise<void>).then === 'function') {
-        try {
-          await Promise.race([
-            teardown as Promise<void>,
-            new Promise<void>(resolve => setTimeout(resolve, 22_000)),
-          ]);
-        } catch { /* destroySession logs its own failure details */ }
+        // Every branch is CAPTURED rather than discarded. The old code raced the
+        // promise against a 22s sleep inside `try { } catch {}`, so a resolved
+        // ok:false, a won timeout and a rejection were all indistinguishable from a
+        // clean teardown — and all three fell through to killCli() + respawn.
+        teardownOutcome = await Promise.race([
+          Promise.resolve(teardown).then(
+            (raw): RestartTeardownOutcome => ({ kind: 'settled', raw }),
+            (error: unknown): RestartTeardownOutcome => ({ kind: 'rejected', error }),
+          ),
+          new Promise<RestartTeardownOutcome>(resolve =>
+            setTimeout(() => resolve({ kind: 'timeout' }), 22_000)),
+        ]);
+      }
+      const teardownVerdict = classifyRestartTeardown(teardownOutcome, {
+        remote: isRemoteBackendType(effectiveBackendType),
+      });
+      if (!teardownVerdict.mayRespawn) {
+        // Fail closed instead of respawning. The old subtree may still hold the
+        // injected credential, so a replacement lineage must not be layered on top
+        // of it: that is exactly how a second credentialed tree used to appear
+        // while the first became unenumerable under a fresh nonce.
+        //
+        // Deliberately NOT calling abortDestroySession(): rollback is not the
+        // legitimate exit from an uncertain teardown (see destroy-result.ts), and
+        // for a latched fence the backend would refuse anyway. Admission therefore
+        // stays fenced, and the persisted containment handle keeps the
+        // device-isolation blocker in place for the next generation to resolve.
+        log(
+          `Restart ABORTED (${reason}): teardown not proven `
+          + `(${teardownVerdict.reason ?? 'unknown'}, `
+          + `${teardownVerdict.recovery ?? 'retryable'}); refusing to respawn a second `
+          + 'lineage over a possibly-live credentialed subtree',
+        );
+        // cliRestartInProgress / rawInputRestartGate deliberately stay armed so no
+        // input is accepted while the outcome is unknown.
+        await sendFatalWorkerErrorAndExit(new Error(
+          `restart teardown not proven: ${teardownVerdict.reason ?? 'unknown'}`,
+        ));
+        return;
       }
       killCli({ preservePending: opts.preservePending });
       awaitingFirstPrompt = true;
@@ -17055,25 +17089,30 @@ process.on('message', async (raw: unknown) => {
               ok: false,
               error: err instanceof Error ? err.message : String(err),
               recovery: 'uncertain',
+              // Stated explicitly: an unknown outcome must fence writes even if a
+              // later reader decides the close itself may be retried.
+              admission: 'fenced',
             };
           }
         }
         if (result.ok) {
           preparedCloseRequestId = msg.requestId;
         } else if (attemptedPrepare) {
-          // Only a REVERSIBLE failure may restore write admission. Aborting on
-          // every ok:false re-opened writes on a lineage that had already been
-          // cancelled remotely (a session that looks writable but can never
-          // continue), and it also started a fresh lineage on top of a possible
-          // unnamed orphan when the outcome was merely unknown. Absent recovery
-          // keeps the historical rollback behaviour.
+          // Two separate questions, deliberately not collapsed: `recovery` says
+          // whether the CLOSE may be retried, `admission` says whether WRITES may
+          // be admitted again — mayRestoreWriteAdmission answers only the second.
+          // Keying this on `recovery` re-opened writes on an unproven-local-child
+          // close (retryable, yet a credentialed process may still be alive), and
+          // aborting on every ok:false additionally re-opened writes on a lineage
+          // already cancelled remotely.
           if (mayRestoreWriteAdmission(result)) {
             await backend?.abortDestroySession?.();
             lastAbortedCloseRequestId = msg.requestId;
           } else {
             log(
               `${effectiveBackendType} close prepare failed as `
-              + `${result.recovery ?? 'retryable'}; write admission stays fenced `
+              + `${result.recovery ?? 'retryable'}/`
+              + `${result.admission ?? 'derived'}; write admission stays fenced `
               + '(session remains active for retry)',
             );
           }
@@ -17307,13 +17346,33 @@ process.on('message', async (raw: unknown) => {
         });
         break;
       }
-      log(`Close aborted (${msg.requestId}); remote admission restored`);
+      log(`Close aborted (${msg.requestId}); remote admission restore requested`);
       let abortError: string | null = null;
+      // A REFUSED rollback is not an error, and it is not a success either. The
+      // backend may be holding a latched fence (an unproven local subtree, an
+      // unnamed remote session), and the daemon used to infer "admission restored"
+      // from a call that merely did not throw — persisting a cleared fence while
+      // write() kept returning false.
+      let admissionRestored = true;
+      let fenceReason: string | undefined;
       if (!alreadyRestored) {
-        try { await backend?.abortDestroySession?.(); }
+        try {
+          const outcome = interpretAbortOutcome(await backend?.abortDestroySession?.());
+          admissionRestored = outcome.admissionRestored;
+          fenceReason = outcome.reason;
+        }
         catch (err) { abortError = err instanceof Error ? err.message : String(err); }
       }
-      if (!abortError) {
+      if (!abortError && !admissionRestored) {
+        log(
+          `Close abort ${msg.requestId} did NOT restore write admission `
+          + `(${fenceReason ?? 'still fenced'}); this session will not accept writes again \u2014 retry the close`,
+        );
+      }
+      // Only clear the close bookkeeping when admission really came back. Leaving
+      // it set on a still-fenced session keeps a later close_abort from being
+      // rejected as stale while the fence is what actually needs resolving.
+      if (!abortError && admissionRestored) {
         preparedCloseRequestId = null;
         closeRequestInFlightId = null;
         lastAbortedCloseRequestId = null;
@@ -17322,6 +17381,10 @@ process.on('message', async (raw: unknown) => {
         type: 'close_abort_result',
         requestId: msg.requestId,
         ok: abortError === null,
+        // Distinct from `ok`: the abort was handled, but writes may still be
+        // fenced. The daemon must persist THIS, not `ok`.
+        admissionRestored: abortError === null && admissionRestored,
+        ...(fenceReason ? { fenceReason } : {}),
         ...(abortError ? { error: abortError } : {}),
       });
       break;

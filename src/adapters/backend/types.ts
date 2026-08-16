@@ -155,8 +155,13 @@ export interface SessionBackend {
   destroySession?(): void | Promise<void | SessionDestroyResult>;
   /** Roll back a successful remote prepare when the daemon could not commit
    * the durable closed row. The backend must restore write admission without
-   * discarding the last task lineage. */
-  abortDestroySession?(): void | Promise<void>;
+   * discarding the last task lineage.
+   *
+   * Returns whether admission was ACTUALLY restored. A backend that is holding a
+   * latched fence (an unproven local subtree, an unnamed remote session) must
+   * refuse and say so: "the close was abandoned" is not evidence that the
+   * survivor died. Legacy backends return void, which means "restored". */
+  abortDestroySession?(): void | Promise<void> | SessionAbortDestroyResult | Promise<SessionAbortDestroyResult>;
   /** Finalize a successful prepare after the durable row is closed. */
   commitDestroySession?(): void;
   /** Graceful daemon shutdown for a remote-task backend. Fence only NEW
@@ -196,6 +201,57 @@ export interface SessionDestroyResult {
    * Absent means `retryable`, which is the historical behaviour.
    */
   recovery?: 'retryable' | 'uncertain' | 'irreversible';
+  /**
+   * May write admission be RESTORED after this failed prepare?
+   *
+   * This is a SEPARATE question from `recovery`, and collapsing the two is a
+   * fencing bug. `recovery` answers "may the close be retried / did anything
+   * irreversible happen?"; `admission` answers "is it safe to accept a new turn
+   * on this session again?". They genuinely disagree in at least one real state:
+   * a local child that could not be proven terminated leaves the close fully
+   * retryable (the irreversible remote cancel has NOT run) while a process that
+   * still holds the injected credential may be alive — so admitting a new write
+   * would layer a fresh turn on top of a live orphan.
+   *
+   *  - `restorable`  no live-side effect can be holding the session; the backend
+   *                  may re-open writes (abortDestroySession).
+   *  - `fenced`      a possibly-live local child or unnamed remote session may
+   *                  exist. Writes must stay refused even if the close itself is
+   *                  retried, and abortDestroySession must NOT re-open them.
+   *
+   * Absent is derived from `recovery` (retryable → restorable, uncertain /
+   * irreversible → fenced), which preserves the historical behaviour for every
+   * result that predates this field.
+   */
+  admission?: 'restorable' | 'fenced';
+  /**
+   * Set when the close SUCCEEDED but a local subtree could not be proven gone for
+   * a reason no retry can change — today only "this host cannot enumerate
+   * processes at all" (a non-Linux platform, where /proc does not exist).
+   *
+   * Deliberately NOT a failure. "The platform has no instrument" is a different
+   * fact from "the instrument says something may still be running": the latter is
+   * evidence of a possible credentialed survivor and must fence write admission,
+   * while the former would fence every session on that platform forever with no
+   * possible recovery. The credential boundary is carried instead by the durable
+   * containment handle, which on such a host is `unprovable` and can never be
+   * released, so the device-isolation blocker is retained.
+   */
+  residual?: 'local_subtree_unprovable_on_platform';
+}
+
+/**
+ * Outcome of abortDestroySession().
+ *
+ * `admissionRestored: false` is NOT an error: the rollback was legitimately
+ * refused because the backend is still fencing writes. The daemon must persist
+ * that as "still fenced" instead of clearing its journal, or the durable state
+ * would claim admission was restored while write() keeps returning false.
+ */
+export interface SessionAbortDestroyResult {
+  admissionRestored: boolean;
+  /** Why admission is still fenced, for logs/journal. */
+  reason?: string;
 }
 
 export interface SessionShutdownDetachResult {
